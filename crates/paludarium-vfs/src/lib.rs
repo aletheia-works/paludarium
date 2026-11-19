@@ -5,7 +5,7 @@ use paludarium_types::Errno;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 mod contents;
-use contents::Contents;
+use contents::{Contents, Usage};
 pub const PATH_MAX: usize = 4096;
 pub const NAME_MAX: usize = 255;
 pub const DEFAULT_MODE: u32 = 0o755;
@@ -337,6 +337,55 @@ struct Node {
     locks: BTreeMap<u64, u32>,
     mtime_ns: i128,
     clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>,
+    /// The inode and the page of a long symbolic link it takes of its
+    /// file system's [`Usage`], until it goes (`shmem_free_inode`); only
+    /// its `Drop` reads it.
+    _charge: Charge,
+}
+/// `SHORT_SYMLINK_LEN`: a symbolic link whose target and NUL are no longer
+/// is kept in its inode, a longer one in a page.
+const SHORT_SYMLINK_LEN: usize = 128;
+/// An inode's part of its file system's [`Usage`], given back when it goes.
+struct Charge {
+    usage: Arc<Usage>,
+    pages: u64,
+}
+impl Charge {
+    /// An inode, with `pages` more for a long symbolic link (one whose
+    /// target and NUL go past `SHORT_SYMLINK_LEN`, 128): `ENOSPC` past the
+    /// inodes or the size, with nothing taken.
+    fn take(usage: &Arc<Usage>, pages: u64) -> Result<Self, Errno> {
+        usage.take_inode()?;
+        if let Err(e) = usage.take_pages(pages) {
+            usage.free_inode();
+            return Err(e);
+        }
+        Ok(Self {
+            usage: Arc::clone(usage),
+            pages,
+        })
+    }
+    /// The root's inode, which a new file system, without limits yet, has.
+    fn root(usage: &Arc<Usage>) -> Self {
+        usage.add_inode();
+        Self {
+            usage: Arc::clone(usage),
+            pages: 0,
+        }
+    }
+    /// The pages `kind` takes of its own, besides a file's contents.
+    fn pages_of(kind: &Kind) -> u64 {
+        match kind {
+            Kind::Symlink(target) if target.len() + 1 > SHORT_SYMLINK_LEN => 1,
+            _ => 0,
+        }
+    }
+}
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.usage.free_inode();
+        self.usage.free_pages(self.pages);
+    }
 }
 impl Node {
     fn stat(&self, id: u64) -> FileStat {
@@ -388,8 +437,9 @@ fn set_node_mtime(node: &mut Node, mtime: Option<i128>) {
 }
 struct Tree {
     nodes: BTreeMap<u64, Arc<Mutex<Node>>>,
-    /// The pages of every file, also of one unlinked but still open.
-    usage: Arc<std::sync::atomic::AtomicU64>,
+    /// The pages and inodes the files take, also those of one unlinked but
+    /// still open.
+    usage: Arc<Usage>,
     next: u64,
     owner: u64,
     clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>,
@@ -397,17 +447,10 @@ struct Tree {
 impl Tree {
     /// The 4 KiB blocks the files and symbolic links hold, as `statfs`
     /// reports them used: every file's pages, also those of a file unlinked
-    /// but still open, as tmpfs frees them only with the file.
+    /// but still open, as tmpfs frees them only with the file, and a page
+    /// for each long symbolic link (a short one is kept in its inode).
     fn used_blocks(&self) -> u64 {
-        let links: u64 = self
-            .nodes
-            .values()
-            .map(|node| match &lock(node).kind {
-                Kind::Symlink(b) => (b.len() as u64).div_ceil(BLOCK),
-                _ => 0,
-            })
-            .sum();
-        self.usage.load(std::sync::atomic::Ordering::SeqCst) + links
+        self.usage.pages()
     }
     fn require_trailing_directory(&self, path: &[u8]) -> Result<(), Errno> {
         if path.last() == Some(&b'/') {
@@ -444,8 +487,11 @@ impl Tree {
     fn node(&self, id: u64) -> Result<Arc<Mutex<Node>>, Errno> {
         self.nodes.get(&id).cloned().ok_or(Errno::ENOENT)
     }
+    /// A new inode of `kind`, `ENOSPC` when the file system has no inode
+    /// or (for a long symbolic link) page left (`shmem_get_inode`).
     fn allocate(&mut self, kind: Kind, mode: u32) -> Result<u64, Errno> {
         let mtime_ns = i128::from((self.clock)()?);
+        let charge = Charge::take(&self.usage, Charge::pages_of(&kind))?;
         let links = if matches!(kind, Kind::Dir(_)) { 2 } else { 1 };
         let id = self.next;
         self.next += 1;
@@ -461,6 +507,7 @@ impl Tree {
                 locks: BTreeMap::new(),
                 mtime_ns,
                 clock: self.clock.clone(),
+                _charge: charge,
             })),
         );
         Ok(id)
@@ -587,7 +634,10 @@ impl MemFs {
     /// Typed realtime clock used for created and modified files. The default
     /// preserves deterministic epoch metadata for existing standalone callers.
     pub fn with_clock(clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>) -> Self {
+        let usage = Arc::<Usage>::default();
+        let charge = Charge::root(&usage);
         let root = Node {
+            _charge: charge,
             kind: Kind::Dir(BTreeMap::new()),
             mode: 0o040755,
             owner: (0, 0),
@@ -601,7 +651,7 @@ impl MemFs {
         Self {
             tree: Arc::new(Mutex::new(Tree {
                 nodes: BTreeMap::from([(1, Arc::new(Mutex::new(root)))]),
-                usage: Arc::default(),
+                usage,
                 next: 2,
                 owner: 1,
                 clock,
@@ -610,6 +660,10 @@ impl MemFs {
     }
 }
 impl MemFs {
+    /// What its files take, against the limits a mount sets.
+    pub(crate) fn usage(&self) -> Arc<Usage> {
+        Arc::clone(&lock(&self.tree).usage)
+    }
     pub fn new() -> Self {
         Self::default()
     }

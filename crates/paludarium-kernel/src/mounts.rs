@@ -3,23 +3,23 @@
 //! ([`paludarium_vfs::MountTable`]).
 //!
 //! `mount` makes new tmpfs mounts (`shmem_parse_one`'s options, sizes and
-//! modes as `statfs` and `stat` report them, with nothing enforced), bind
-//! mounts (`MS_BIND`, with `MS_REC` the mounts below too), remounts a
-//! superblock (`MS_REMOUNT`) or a mount's flags alone (`MS_REMOUNT |
-//! MS_BIND`), and changes a mount's propagation type (`MS_SHARED`,
-//! `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`, with `MS_REC` the mounts on
-//! it too), which mountinfo shows; a mount or an unmount under a shared
-//! mount reaches its peers and slaves, in every namespace. It
-//! moves a mount and those on it (`MS_MOVE`), and `pivot_root` puts the
-//! old root under a new one; both take the roots and working directories
-//! of the processes along. Read-only mounts and superblocks refuse writes
-//! (`EROFS`, in the calls that write). What it does not do yet gives
-//! `EOPNOTSUPP` once Linux's checks before it have passed: `MS_NOSYMFOLLOW`
-//! on a tmpfs or set by a remount, a mount on or a move of `/proc` or
-//! `/dev`, which the kernel generates (a bind mount of a file or a
-//! directory there shows it), and a move of a mount from start-up that the
-//! lower filesystem shows. Any other file system
-//! type is `ENODEV`, as from a kernel without it.
+//! modes as `statfs` and `stat` report them, the size and inodes holding
+//! its files to them with `ENOSPC`), bind mounts (`MS_BIND`, with `MS_REC`
+//! the mounts below too), remounts a superblock (`MS_REMOUNT`) or a mount's
+//! flags alone (`MS_REMOUNT | MS_BIND`), and changes a mount's propagation
+//! type (`MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`, with
+//! `MS_REC` the mounts on it too), which mountinfo shows; a mount or an
+//! unmount under a shared mount reaches its peers and slaves, in every
+//! namespace. It moves a mount and those on it (`MS_MOVE`), and
+//! `pivot_root` puts the old root under a new one; both take the roots and
+//! working directories of the processes along. Read-only mounts and
+//! superblocks refuse writes (`EROFS`, in the calls that write). What it
+//! does not do yet gives `EOPNOTSUPP` once Linux's checks before it have
+//! passed: `MS_NOSYMFOLLOW` on a tmpfs or set by a remount, a mount on or a
+//! move of `/proc` or `/dev`, which the kernel generates (a bind mount of a
+//! file or a directory there shows it), and a move of a mount from start-up
+//! that the lower filesystem shows. Any other file system type is `ENODEV`,
+//! as from a kernel without it.
 //!
 //! `umount2` unmounts the mounts `mount` made, and the old root after a
 //! `pivot_root`; a mount from start-up (the root, a `--mount` directory)

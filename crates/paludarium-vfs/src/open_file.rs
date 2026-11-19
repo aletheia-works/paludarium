@@ -101,16 +101,15 @@ impl FileHandle for MemFile {
         if s.1 & 1024 != 0 {
             s.0 = contents.len()
         }
-        let end =
-            s.0.checked_add(b.len() as u64)
-                .filter(|&end| end <= i64::MAX as u64)
-                .ok_or(Errno::EINVAL)?;
-        contents.write(s.0, b);
-        s.0 = end;
-        if !b.is_empty() {
+        s.0.checked_add(b.len() as u64)
+            .filter(|&end| end <= i64::MAX as u64)
+            .ok_or(Errno::EINVAL)?;
+        let written = contents.write(s.0, b)?;
+        s.0 += written as u64;
+        if written != 0 {
             n.mtime_ns = i128::from(modified);
         }
-        Ok(b.len())
+        Ok(written)
     }
     /// `lseek`, with `SEEK_DATA` and `SEEK_HOLE` as tmpfs answers them:
     /// `ENXIO` for a negative offset or one at or past the end.
@@ -149,7 +148,7 @@ impl FileHandle for MemFile {
         let room = usize::try_from(contents.len().saturating_sub(offset)).unwrap_or(usize::MAX);
         let b = &b[..b.len().min(room)];
         if !b.is_empty() {
-            contents.write(offset, b);
+            contents.write_unlimited(offset, b);
             n.mtime_ns = i128::from(modified);
         }
         Ok(())
@@ -168,20 +167,26 @@ impl FileHandle for MemFile {
         Ok(())
     }
     /// Allocates the pages of the range, or none with `ENOSPC` when they
-    /// would take the file system past its size (`MEMORY_BYTES`), as tmpfs
-    /// refuses to go past its size.
+    /// would take the file system past its size (the size it was mounted
+    /// with, else `MEMORY_BYTES`), as tmpfs refuses to go past its size.
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         let t = lock(&self.tree);
         let used = t.used_blocks();
+        let size = match t.usage.max_pages() {
+            0 => MEMORY_BYTES / BLOCK,
+            max => max,
+        };
         let mut n = lock(&self.node);
         let Kind::File(contents) = &mut n.kind else {
             return Err(Errno::EISDIR);
         };
-        if used.saturating_add(contents.missing(offset, len)) > MEMORY_BYTES / BLOCK {
+        // A file system without a size (`size=0`, or none mounted) still
+        // ends at the memory; `Contents::allocate` takes the pages against
+        // a mount's size, which this check has already let through.
+        if used.saturating_add(contents.missing(offset, len)) > size {
             return Err(Errno(28));
         }
-        contents.allocate(offset, len);
-        Ok(())
+        contents.allocate(offset, len)
     }
     fn truncate(&self, size: u64) -> Result<(), Errno> {
         if self.flags() & 3 == 0 {
@@ -280,10 +285,10 @@ impl MemFile {
         pos.checked_add(b.len() as u64)
             .filter(|&end| end <= i64::MAX as u64)
             .ok_or(Errno::EINVAL)?;
-        contents.write(pos, b);
-        if !b.is_empty() {
+        let written = contents.write(pos, b)?;
+        if written != 0 {
             n.mtime_ns = i128::from(modified);
         }
-        Ok(b.len())
+        Ok(written)
     }
 }

@@ -8467,6 +8467,138 @@ fn a_tmpfs_mount_and_its_umount() {
     assert_eq!(f.ret(166, &[target, 4]), 0);
 }
 
+/// A tmpfs mount's size and inodes hold its files: a write stops at the
+/// size (`ENOSPC` once nothing fits), `fallocate` allocates all or none,
+/// each new inode and name takes one of the inodes, a long symbolic link a
+/// page, and a remount to a larger size lets writes go on.
+#[test]
+fn a_tmpfs_mount_holds_its_files_to_its_size_and_inodes() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let target = put(&mut f, 0x40, b"/tmp/m");
+    assert_eq!(f.ret(83, &[target, 0o755]), 0);
+    let data = put(&mut f, 0x80, b"size=8k,nr_inodes=4,huge=never");
+    assert_eq!(f.ret(165, &[none, target, tmpfs, 0, data]), 0);
+    let stat = DATA + 0x400;
+    let statfs = |f: &mut Fixture| {
+        assert_eq!(f.ret(137, &[target, stat]), 0);
+        let at = |i: u64| f.mem.read_u64(GuestAddr(stat + 8 * i)).unwrap();
+        (at(2), at(3), at(4), at(5), at(6))
+    };
+    assert_eq!(statfs(&mut f), (2, 2, 2, 4, 3));
+    let (a, b) = (
+        put(&mut f, 0xc0, b"/tmp/m/a"),
+        put(&mut f, 0xe0, b"/tmp/m/b"),
+    );
+    let fd = f.ret(2, &[a, 0o102, 0o600]);
+    assert_eq!(f.ret(1, &[fd, DATA, 4096]), 4096);
+    // Of two more pages one fits: a short write, then ENOSPC.
+    assert_eq!(f.ret(1, &[fd, DATA, 8192]), 4096);
+    assert_eq!(f.ret(1, &[fd, DATA, 1]), errno(Errno(28)));
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(stat + 48)).unwrap(), 8192);
+    assert_eq!(statfs(&mut f), (2, 0, 0, 4, 2));
+    // A page it has takes no more.
+    assert_eq!(f.ret(18, &[fd, DATA, 4096, 0]), 4096);
+    // fallocate: none of the range when it does not all fit.
+    assert_eq!(f.ret(77, &[fd, 4096]), 0);
+    assert_eq!(f.ret(285, &[fd, 0, 0, 12288]), errno(Errno(28)));
+    assert_eq!(statfs(&mut f), (2, 1, 1, 4, 2));
+    assert_eq!(f.ret(285, &[fd, 0, 4096, 4096]), 0);
+    assert_eq!(statfs(&mut f).1, 0);
+    // Inodes: a directory and a short link take the last two.
+    let (d, s) = (
+        put(&mut f, 0x100, b"/tmp/m/d"),
+        put(&mut f, 0x120, b"/tmp/m/s"),
+    );
+    assert_eq!(f.ret(83, &[d, 0o755]), 0);
+    assert_eq!(f.ret(88, &[a, s]), 0);
+    assert_eq!(statfs(&mut f), (2, 0, 0, 4, 0));
+    assert_eq!(f.ret(2, &[b, 0o102, 0o600]), errno(Errno(28)));
+    assert_eq!(f.ret(83, &[b, 0o755]), errno(Errno(28)));
+    assert_eq!(f.ret(86, &[a, b]), errno(Errno(28)));
+    // An existing name is still EEXIST.
+    assert_eq!(f.ret(83, &[d, 0o755]), errno(Errno::EEXIST));
+    // A second name takes an inode, and gives it back.
+    assert_eq!(f.ret(87, &[s]), 0);
+    assert_eq!(f.ret(86, &[a, b]), 0);
+    assert_eq!(statfs(&mut f).4, 0);
+    // A rename between two names of one file does nothing.
+    assert_eq!(f.ret(82, &[a, b]), 0);
+    assert_eq!(statfs(&mut f).4, 0);
+    assert_eq!(f.ret(87, &[b]), 0);
+    assert_eq!(statfs(&mut f).4, 1);
+    // A long symbolic link needs a page, which there is not.
+    let long = put(&mut f, 0x200, &[b'x'; 200]);
+    assert_eq!(f.ret(88, &[long, s]), errno(Errno(28)));
+    assert_eq!(f.ret(6, &[s, stat]), errno(Errno::ENOENT));
+    assert_eq!(statfs(&mut f), (2, 0, 0, 4, 1));
+    // An unlinked file keeps its pages and inode while it is open.
+    assert_eq!(f.ret(87, &[a]), 0);
+    assert_eq!(statfs(&mut f), (2, 0, 0, 4, 1));
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(statfs(&mut f), (2, 2, 2, 4, 2));
+    // A remount to more room: the long link fits, and a write goes on.
+    let more = put(&mut f, 0x80, b"size=16k");
+    assert_eq!(f.ret(165, &[none, target, 0, 32, more]), 0);
+    assert_eq!(f.ret(88, &[long, s]), 0);
+    assert_eq!(statfs(&mut f), (4, 3, 3, 4, 1));
+    let fd = f.ret(2, &[a, 0o102, 0o600]);
+    assert_eq!(f.ret(1, &[fd, DATA, 8192]), 8192);
+    assert_eq!(statfs(&mut f), (4, 1, 1, 4, 0));
+    // A remount below what the files use is EINVAL (`shmem_reconfigure`).
+    let small = put(&mut f, 0x80, b"size=8k");
+    assert_eq!(
+        f.ret(165, &[none, target, 0, 32, small]),
+        errno(Errno::EINVAL)
+    );
+    let few = put(&mut f, 0x80, b"nr_inodes=3");
+    assert_eq!(
+        f.ret(165, &[none, target, 0, 32, few]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(statfs(&mut f), (4, 1, 1, 4, 0));
+}
+
+/// `statfs`'s `f_flags` for the kernel's own mounts are those Linux mounts
+/// them with; a link in `/proc/self/fd` gives its file's, and a pipe's
+/// internal mount `ST_VALID` alone.
+#[test]
+fn the_kernels_own_mounts_give_their_statfs_flags() {
+    let mut f = fixture();
+    let out = DATA + 0x400;
+    let flags = |f: &mut Fixture, path: &[u8]| {
+        let p = put(f, 0, path);
+        assert_eq!(
+            f.ret(137, &[p, out]),
+            0,
+            "{}",
+            String::from_utf8_lossy(path)
+        );
+        f.mem.read_u64(GuestAddr(out + 80)).unwrap()
+    };
+    assert_eq!(flags(&mut f, b"/proc"), 0x102e);
+    assert_eq!(flags(&mut f, b"/proc/self/status"), 0x102e);
+    assert_eq!(flags(&mut f, b"/dev/pts"), 0x102a);
+    assert_eq!(flags(&mut f, b"/dev/mqueue"), 0x102e);
+    assert_eq!(flags(&mut f, b"/dev/null"), 0x102a);
+    assert_eq!(flags(&mut f, b"/dev"), 0x102a);
+    let tmp = flags(&mut f, b"/tmp");
+    assert_eq!(f.ret(22, &[DATA + 0x300]), 0);
+    let read = f.mem.read_u64(GuestAddr(DATA + 0x300)).unwrap() as u32;
+    assert_eq!(
+        flags(&mut f, format!("/proc/self/fd/{read}").as_bytes()),
+        0x20
+    );
+    let file = put(&mut f, 0x200, b"/tmp/f");
+    let fd = f.ret(2, &[file, 0o102, 0o600]);
+    assert_eq!(flags(&mut f, format!("/proc/self/fd/{fd}").as_bytes()), tmp);
+    let status = put(&mut f, 0x200, b"/proc/self/status");
+    let fd = f.ret(2, &[status, 0, 0]);
+    assert_eq!(f.ret(138, &[fd, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 80)).unwrap(), 0x102e);
+}
+
 /// A read-only mount refuses what writes, in Linux's order; remounts and
 /// propagation types show in mountinfo.
 #[test]

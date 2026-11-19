@@ -150,6 +150,10 @@ const WORD: u64 = HEAP + 0x800;
 /// How long a test waits for a task to reach a state before it fails, so
 /// that a tracee that went wrong fails the test instead of hanging it.
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a whole test may take. A wait that never ends, such as a
+/// tracer's blocking `wait4` for a stop that never comes, ends the test
+/// binary after it, so that the run fails instead of hanging.
+const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn neg(r: u64) -> i64 {
     r as i64
@@ -169,7 +173,13 @@ struct Tracer {
     t: Thread,
     m: AddressSpace,
     lines: Vec<String>,
+    /// Dropped with the tracer, which tells its watchdog the test ended.
+    _watchdog: std::sync::mpsc::Sender<()>,
 }
+
+/// The calls a tracee has gone into that its tracer waits for it to sleep
+/// in, which the tracee counts just before it makes each.
+type Entered = std::sync::atomic::AtomicU64;
 
 /// A tracee on a thread of its own, as the runtime runs a guest task.
 struct Tracee {
@@ -393,11 +403,20 @@ impl Tracer {
         )
         .unwrap();
         m.write_u64(GuestAddr(WORD), 0x1122_3344_5566_7788).unwrap();
+        let (watchdog, ended) = std::sync::mpsc::channel::<()>();
+        let test = std::thread::current().name().unwrap_or("?").to_owned();
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(WATCHDOG) {
+                eprintln!("{test} did not end in {WATCHDOG:?}");
+                std::process::abort();
+            }
+        });
         Self {
             k,
             t,
             m,
             lines: Vec::new(),
+            _watchdog: watchdog,
         }
     }
     fn call(&mut self, n: u64, a: [u64; 6]) -> u64 {
@@ -514,9 +533,25 @@ impl Tracer {
         )
     }
     /// The guest's wait for its child's byte on the ready pipe, and then for
-    /// it to sleep in the call after.
-    fn ready(&mut self, pid: u64, fd: u64) {
+    /// it to sleep in the call after, which `entered` counts.
+    fn ready(&mut self, pid: u64, fd: u64, entered: &Entered) {
         assert_eq!(self.call(READ, [fd, HEAP + 0x790, 1, 0, 0, 0]), 1);
+        self.sleeping_in(pid, entered, 1);
+    }
+    /// Waits until `pid` sleeps in the `nth` call `entered` counts. In
+    /// /proc a task sleeps in every call it is in, also one that does not
+    /// block, such as the write of the ready byte, an rt_sigreturn or a
+    /// call restarted after a handler; a signal sent there would stop it
+    /// before the call the test means.
+    fn sleeping_in(&mut self, pid: u64, entered: &Entered, nth: u64) {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while entered.load(std::sync::atomic::Ordering::SeqCst) < nth {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{pid} made no call {nth}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         self.until_sleeping(pid);
     }
     /// Waits until `pid` sleeps, as the guest does before it attaches.
@@ -680,16 +715,19 @@ no-tracee=-3",
 fn attach() {
     let mut g = Tracer::new();
     let (ready, told) = g.pipe();
+    let paused = Arc::new(Entered::new(0));
+    let pausing = Arc::clone(&paused);
     let (child, thread) = g.fork(move |c| {
         c.catch(SIGUSR1, 0);
         c.sys(WRITE, [told, HEAP + 0x790, 1, 0, 0, 0]).unwrap();
+        pausing.store(1, std::sync::atomic::Ordering::SeqCst);
         loop {
             if let Err(status) = c.call(PAUSE, [0; 6], &mut |_, _, _| None) {
                 return status;
             }
         }
     });
-    g.ready(child, ready);
+    g.ready(child, ready, &paused);
     let r = g.pt(CONT, child, 0, 0);
     g.say("untraced", r);
     let r = g.pt(ATTACH, 1, 0, 0);
@@ -1794,15 +1832,18 @@ fn hex(value: u64) -> String {
 fn listen() {
     let mut g = Tracer::new();
     let (ready, told) = g.pipe();
+    let paused = Arc::new(Entered::new(0));
+    let pausing = Arc::clone(&paused);
     let (child, thread) = g.fork(move |c| {
         c.sys(WRITE, [told, HEAP + 0x790, 1, 0, 0, 0]).unwrap();
+        pausing.store(1, std::sync::atomic::Ordering::SeqCst);
         loop {
             if let Err(status) = c.sys(PAUSE, [0; 6]) {
                 return status;
             }
         }
     });
-    g.ready(child, ready);
+    g.ready(child, ready, &paused);
     let r = g.pt(SEIZE, child, 0, 0);
     g.say("seize", r);
     let kill = |g: &mut Tracer, signal: u64| g.call(KILL, [child, signal, 0, 0, 0, 0]);
@@ -2472,6 +2513,9 @@ fn restart_codes() {
     let mut g = Tracer::new();
     let (pipe_read, pipe_write) = g.pipe();
     let (lines, rx) = std::sync::mpsc::channel();
+    // The reads the child has gone into: each signal waits for the next.
+    let reads = Arc::new(Entered::new(0));
+    let entered = Arc::clone(&reads);
     let (child, thread) = g.fork(move |c| {
         c.catch(SIGUSR1, 0);
         c.catch(SIGUSR2, SA_RESTART);
@@ -2479,6 +2523,7 @@ fn restart_codes() {
         let tid = u64::from(c.t.tid);
         c.sys(TKILL, [tid, SIGSTOP, 0, 0, 0, 0]).unwrap();
         let mut read = || {
+            entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             neg(c
                 .call(
                     READ,
@@ -2497,8 +2542,10 @@ fn restart_codes() {
     });
     g.wait(child, 0);
     g.pt(CONT, child, 0, 0);
-    let interrupt = |g: &mut Tracer, signal: u64, rax: i64, orig: i64, resume: u64| {
-        g.until_sleeping(child);
+    let mut nth = 0;
+    let mut interrupt = |g: &mut Tracer, signal: u64, rax: i64, orig: i64, resume: u64| {
+        nth += 1;
+        g.sleeping_in(child, &reads, nth);
         g.call(KILL, [child, signal, 0, 0, 0, 0]);
         let status = g.wait(child, 0);
         let (_, regs) = g.regs(child);

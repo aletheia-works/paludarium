@@ -31,7 +31,8 @@
    the machine move, the memory of a preallocated hash, which counts the
    possible CPUs, but for its difference between sizes, and the size Linux
    knows of its union are not printed. Programs, BTF and links are not
-   used. The cases run as root, as the guest does. */
+   used, but for BPF_PROG_LOAD's checks of its arguments. The cases run as
+   root, as the guest does. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <sched.h>
@@ -854,8 +855,8 @@ static int case_queue(void) {
 
 /* bpf-prog-load: BPF_PROG_LOAD's checks of its arguments, each case wrong
    in one way only, so that Linux and the emulator stop at the same check.
-   Only the errors are compared: a program Linux would verify and load is
-   never made here, as the emulator loads none. */
+   Only the errors are compared; the programs the verifier takes and
+   refuses are bpf-prog's. */
 #define PROG_LOAD 5
 #define PROG_SOCKET_FILTER 1
 #define PROG_TOKEN_FD (1 << 16)

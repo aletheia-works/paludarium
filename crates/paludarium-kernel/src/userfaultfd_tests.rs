@@ -998,3 +998,117 @@ fn a_fork_hands_the_child_a_context_of_its_own() {
         queued.finish();
     }
 }
+
+const PAGEMAP_SCAN: u64 = 0xc060_6610;
+const VEC: u64 = DATA + 0x1000;
+const IS_WRITTEN: u64 = 1 << 1;
+const IS_PRESENT: u64 = 1 << 3;
+const IS_ACCESSED: u64 = 1 << 9;
+
+impl Fixture {
+    /// `/proc/self/pagemap`, opened for reading.
+    fn pagemap(&mut self) -> u64 {
+        self.mem
+            .write(GuestAddr(DATA), b"/proc/self/pagemap\0")
+            .unwrap();
+        let fd = self.ret(2, &[DATA, 0, 0]);
+        assert!((fd as i64) >= 0, "{fd:#x}");
+        fd
+    }
+    /// `PAGEMAP_SCAN` of the 8 pages at [`AREA`] for 4 regions at [`VEC`]
+    /// with `flags` and the masks; its result, `walk_end` and the regions.
+    fn scan(&mut self, fd: u64, flags: u64, required: u64, returned: u64) -> (u64, u64, Vec<u64>) {
+        let words = [
+            96,
+            flags,
+            AREA,
+            AREA + 8 * PAGE,
+            0,
+            VEC,
+            4,
+            0,
+            0,
+            required,
+            0,
+            returned,
+        ];
+        let (ret, out) = self.ioctl(fd, PAGEMAP_SCAN, &words);
+        let mut regions = vec![0; 4 * 24];
+        self.mem.read(GuestAddr(VEC), &mut regions).unwrap();
+        self.mem.write(GuestAddr(VEC), &[0; 4 * 24]).unwrap();
+        let regions = regions
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
+            .take(ret.min(4) as usize * 3)
+            .collect();
+        (ret, out[4], regions)
+    }
+}
+
+#[test]
+fn pagemap_scan_checks_its_request_and_reports_regions() {
+    let mut f = fixture();
+    let pm = f.pagemap();
+    f.mem.write(GuestAddr(AREA), b"a").unwrap();
+    let end = AREA + 8 * PAGE;
+    // Linux master takes `PAGE_IS_ACCESSED`, which no page has here.
+    assert_eq!(
+        f.scan(pm, 0, IS_PRESENT, IS_PRESENT | IS_ACCESSED),
+        (1, end, vec![AREA, AREA + PAGE, IS_PRESENT])
+    );
+    let einval = errno(Errno::EINVAL);
+    assert_eq!(f.scan(pm, 4, 0, 0).0, einval);
+    assert_eq!(f.scan(pm, 0, 1 << 10, 0).0, einval);
+    let base = [96, 0, AREA, end, 0, VEC, 4, 0, 0, 0, 0, 0];
+    let with = |i: usize, value: u64| {
+        let mut words = base;
+        words[i] = value;
+        words
+    };
+    assert_eq!(f.ioctl(pm, PAGEMAP_SCAN, &with(0, 88)).0, einval);
+    assert_eq!(f.ioctl(pm, PAGEMAP_SCAN, &with(2, AREA + 1)).0, einval);
+    assert_eq!(f.ioctl(pm, PAGEMAP_SCAN, &with(5, 0)).0, einval);
+    let efault = errno(Errno::EFAULT);
+    assert_eq!(f.ioctl(pm, PAGEMAP_SCAN, &with(3, AREA - PAGE)).0, efault);
+    assert_eq!(
+        f.ioctl(pm, PAGEMAP_SCAN, &with(5, 0u64.wrapping_sub(4096)))
+            .0,
+        efault
+    );
+    // As Linux master's `-ENOIOCTLCMD`, any other request is `ENOTTY`.
+    assert_eq!(f.ioctl(pm, PAGEMAP_SCAN + 1, &base).0, errno(Errno::ENOTTY));
+    // A pagemap of a space that is gone is `ESRCH`, as master's
+    // `mmget_not_zero` fails.
+    let gone = AddressSpace::new();
+    let file = Arc::new(crate::proc::PagemapFile::open(
+        gone.view(),
+        0,
+        Arc::default(),
+    ));
+    drop(gone);
+    let fd = u64::from(f.kernel.files.install(file, false, 1024).unwrap());
+    assert_eq!(f.ioctl(fd, PAGEMAP_SCAN, &base).0, errno(Errno(3)));
+
+    // With WP_ASYNC, the written pages, which it can protect.
+    let ufd = f.ready(NONBLOCK, WP_ASYNC | WP_UNPOPULATED);
+    assert_eq!(f.ioctl(ufd, REGISTER, &[AREA, 8 * PAGE, 2, 0]).0, 0);
+    assert_eq!(f.ioctl(ufd, WRITEPROTECT, &[AREA, 8 * PAGE, 1]).0, 0);
+    assert_eq!(f.scan(pm, 0, IS_WRITTEN, IS_WRITTEN), (0, end, vec![]));
+    f.mem.write(GuestAddr(AREA + 2 * PAGE), b"b").unwrap();
+    f.mem.write(GuestAddr(AREA + 5 * PAGE), b"c").unwrap();
+    let written = vec![
+        AREA + 2 * PAGE,
+        AREA + 3 * PAGE,
+        IS_WRITTEN,
+        AREA + 5 * PAGE,
+        AREA + 6 * PAGE,
+        IS_WRITTEN,
+    ];
+    assert_eq!(f.scan(pm, 3, IS_WRITTEN, IS_WRITTEN), (2, end, written));
+    assert_eq!(f.scan(pm, 0, IS_WRITTEN, IS_WRITTEN), (0, end, vec![]));
+    // A VMA it may not protect stops `PM_SCAN_CHECK_WPASYNC`.
+    assert_eq!(f.ioctl(ufd, UNREGISTER, &[AREA + 4 * PAGE, PAGE]).0, 0);
+    assert_eq!(f.scan(pm, 2, IS_WRITTEN, IS_WRITTEN).0, errno(Errno::EPERM));
+}

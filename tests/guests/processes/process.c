@@ -25,6 +25,7 @@
 #include <sys/sendfile.h>
 #include <sys/resource.h>
 #include <sys/vfs.h>
+#include <sys/statvfs.h>
 #include <sys/xattr.h>
 #include <sys/prctl.h>
 #include <sys/time.h>
@@ -11238,6 +11239,159 @@ static int generated_binds_case(void) {
     return 0;
 }
 
+/* The tmpfs-limits case: a tmpfs mount's size and inodes hold its files,
+   in a mount namespace of a user namespace of its own, and the statfs
+   flags of /proc and /dev. Only errno values, counts and flags are
+   printed. */
+static char tl_base[] = "/tmp/paludarium-tmpfs-limits-XXXXXX";
+static int tl_err(long r) { return r < 0 ? -errno : (int)r; }
+static void tl_statfs(const char *what, const char *m) {
+    struct statfs fs;
+    if (statfs(m, &fs)) {
+        printf("%s statfs=%d\n", what, -errno);
+        return;
+    }
+    printf("%s blocks=%ld free=%ld avail=%ld files=%ld ffree=%ld\n", what, (long)fs.f_blocks, (long)fs.f_bfree,
+           (long)fs.f_bavail, (long)fs.f_files, (long)fs.f_ffree);
+}
+static int tl_inner(const char *m) {
+    char a[320], b[320], d[320], s[320];
+    snprintf(a, sizeof a, "%s/a", m);
+    snprintf(b, sizeof b, "%s/b", m);
+    snprintf(d, sizeof d, "%s/d", m);
+    snprintf(s, sizeof s, "%s/s", m);
+    printf("mount=%d\n", tl_err(mount("none", m, "tmpfs", 0, "size=8k,nr_inodes=4,huge=never")));
+    tl_statfs("fresh", m);
+    static char page[8192];
+    memset(page, 'p', sizeof page);
+    int fd = open(a, O_RDWR | O_CREAT, 0600);
+    int first = tl_err(write(fd, page, 4096));
+    int part = tl_err(write(fd, page, 8192));
+    printf("write=%d short=%d full=%d\n", first, part, tl_err(write(fd, page, 1)));
+    struct stat st;
+    fstat(fd, &st);
+    printf("size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
+    tl_statfs("full", m);
+    int over = tl_err(pwrite(fd, page, 4096, 0));
+    printf("overwrite=%d append=%d\n", over, tl_err(pwrite(fd, page, 1, 8192)));
+    printf("truncate=%d\n", tl_err(ftruncate(fd, 4096)));
+    printf("fallocate big=%d\n", tl_err(fallocate(fd, 0, 0, 12288)));
+    tl_statfs("after big", m);
+    printf("fallocate=%d\n", tl_err(fallocate(fd, 0, 4096, 4096)));
+    tl_statfs("allocated", m);
+    int made = tl_err(mkdir(d, 0755));
+    printf("mkdir=%d symlink=%d\n", made, tl_err(symlink("a", s)));
+    tl_statfs("inodes", m);
+    printf("no inode: create=%d", tl_err(open(b, O_RDWR | O_CREAT, 0600)));
+    printf(" mkdir=%d", tl_err(mkdir(b, 0755)));
+    printf(" link=%d", tl_err(link(a, b)));
+    printf(" symlink=%d", tl_err(symlink("a", b)));
+    printf(" mknod=%d", tl_err(mknod(b, S_IFIFO | 0600, 0)));
+    printf(" exists=%d\n", tl_err(mkdir(d, 0755)));
+    int gone = tl_err(unlink(s));
+    printf("unlink=%d link=%d\n", gone, tl_err(link(a, b)));
+    tl_statfs("linked", m);
+    printf("rename same=%d\n", tl_err(rename(a, b)));
+    tl_statfs("renamed", m);
+    printf("unlink second=%d\n", tl_err(unlink(b)));
+    tl_statfs("unlinked", m);
+    char longer[201];
+    memset(longer, 'x', 200);
+    longer[200] = 0;
+    int linked = tl_err(symlink(longer, s));
+    printf("long symlink=%d there=%d\n", linked, tl_err(lstat(s, &st)));
+    tl_statfs("no page", m);
+    printf("unlink open=%d\n", tl_err(unlink(a)));
+    tl_statfs("open", m);
+    close(fd);
+    tl_statfs("closed", m);
+    printf("remount=%d\n", tl_err(mount(NULL, m, NULL, MS_REMOUNT, "size=16k")));
+    printf("long symlink=%d\n", tl_err(symlink(longer, s)));
+    tl_statfs("remounted", m);
+    fd = open(a, O_RDWR | O_CREAT | O_APPEND, 0600);
+    first = tl_err(write(fd, page, 8192));
+    printf("write=%d more=%d\n", first, tl_err(write(fd, page, 8192)));
+    tl_statfs("again", m);
+    int smaller = tl_err(mount(NULL, m, NULL, MS_REMOUNT, "size=8k"));
+    printf("remount under use: size=%d inodes=%d\n", smaller,
+           tl_err(mount(NULL, m, NULL, MS_REMOUNT, "nr_inodes=1")));
+    tl_statfs("kept", m);
+    close(fd);
+    unlink(a);
+    unlink(s);
+    rmdir(d);
+    printf("umount=%d\n", tl_err(umount2(m, 0)));
+    return 0;
+}
+/* statfs's f_flags of a file of the kernel's own mounts: ST_NOSUID,
+   ST_NODEV and ST_RDONLY, with ST_NOEXEC and ST_RELATIME where `all` is
+   asked for (the machine's init mounts /dev, which a container's tmpfs or
+   another image's systemd may mount without them). */
+static void tl_flags(const char *what, const char *path, int all) {
+    struct statfs fs;
+    long mask = ST_NOSUID | ST_NODEV | ST_RDONLY | (all ? ST_NOEXEC | ST_RELATIME : 0);
+    if (statfs(path, &fs)) {
+        printf("%s=%d", what, -errno);
+        return;
+    }
+    printf("%s=%#lx", what, (long)fs.f_flags & mask);
+}
+static int tmpfs_limits_case(void) {
+    printf("flags");
+    tl_flags(" proc", "/proc", 1);
+    tl_flags(" status", "/proc/self/status", 1);
+    tl_flags(" pts", "/dev/pts", 1);
+    tl_flags(" ptmx", "/dev/pts/ptmx", 1);
+    tl_flags(" mqueue", "/dev/mqueue", 1);
+    tl_flags(" null", "/dev/null", 0);
+    tl_flags(" dev", "/dev", 0);
+    int pipes[2];
+    char link[64];
+    if (pipe(pipes)) return 91;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", pipes[0]);
+    tl_flags(" pipe-link", link, 1);
+    struct statfs fs, tmp;
+    int fd = open("/proc/self/status", O_RDONLY);
+    printf(" fd-status=%#lx", fstatfs(fd, &fs) ? -1L : (long)fs.f_flags & (ST_NOSUID | ST_NODEV | ST_NOEXEC | ST_RELATIME));
+    close(fd);
+    if (!mkdtemp(tl_base)) return 93;
+    char file[300];
+    snprintf(file, sizeof file, "%s/f", tl_base);
+    fd = open(file, O_RDWR | O_CREAT, 0600);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    printf(" file-link=%d\n", !statfs(link, &fs) && !statfs(tl_base, &tmp) && fs.f_flags == tmp.f_flags);
+    close(fd);
+    unlink(file);
+    close(pipes[0]);
+    close(pipes[1]);
+    chmod(tl_base, 0755);
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", tl_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(tl_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(tl_base) == 0);
+    return 0;
+}
+
 /* The generated-changes case: the path calls that change or go to a file
    the kernel generates in /dev or /proc, by its own path. chdir and fchdir
    make a directory there the working directory, which relative paths and
@@ -16952,6 +17106,42 @@ static void shm_show_user(const char *label, int id, pid_t other) {
     printf("%s lpid-own=%d lpid-other=%d nattch=%lu\n", label, s.lpid == getpid(), s.lpid == other, s.nattch);
 }
 
+/* What a child in its parent's space (CLONE_VM, not a thread) does to an
+   attachment: 0 unmaps the tail page, 1 locks the middle one, 2 nothing, 3
+   detaches it, 4 waits for its parent's exit (EOF on `shm_vm_hold`). */
+static char *shm_vm_at;
+static long shm_vm_page;
+static int shm_vm_hold[2];
+static int shm_vm_child(void *what) {
+    switch ((int)(intptr_t)what) {
+    case 0: munmap(shm_vm_at + 3 * shm_vm_page, shm_vm_page); break;
+    case 1: mlock(shm_vm_at + shm_vm_page, shm_vm_page); break;
+    case 3: syscall(SYS_shmdt, shm_vm_at); break;
+    case 4: {
+        char byte;
+        close(shm_vm_hold[1]);
+        while (read(shm_vm_hold[0], &byte, 1) > 0) {}
+        break;
+    }
+    }
+    _exit(0);
+}
+static char shm_vm_stack[65536] __attribute__((aligned(16)));
+/* Runs `shm_vm_child(what)` in this space and reaps it. Its PID. */
+static pid_t shm_vm_run(int what) {
+    fflush(stdout);
+    pid_t pid = clone(shm_vm_child, shm_vm_stack + sizeof shm_vm_stack, CLONE_VM | SIGCHLD, (void *)(intptr_t)what);
+    if (pid > 0) waitpid(pid, NULL, 0);
+    return pid;
+}
+static const char *shm_vm_self;
+static int shm_vm_exec(void *unused) {
+    (void)unused;
+    char *arguments[] = {(char *)shm_vm_self, "shm-vm-exec", (char *)shm_vm_self, NULL};
+    execv(shm_vm_self, arguments);
+    _exit(2);
+}
+
 static int shm_case(const char *self) {
     long page = sysconf(_SC_PAGESIZE);
     struct shm_status s;
@@ -17185,6 +17375,60 @@ static int shm_case(const char *self) {
     printf("stamps detach=%ld", syscall(SYS_shmdt, c));
     shm_show_user("", st, child);
     printf("stamps removed=%ld\n", syscall(SYS_shmctl, st, SHMX_RMID, 0));
+
+    /* A child in this space (CLONE_VM, not a thread) stamps what it does
+       as itself, as Linux's `current`; its exit or exec, while this
+       process still uses the space, closes nothing (`mmput` is not the
+       last). */
+    int vm = (int)syscall(SYS_shmget, 0, 4 * page, SHMX_CREAT | 0600);
+    if (vm < 0) return 31;
+    shm_vm_page = page;
+    shm_vm_at = (char *)syscall(SYS_shmat, vm, 0, 0);
+    if (shm_vm_at == (char *)-1) return 32;
+    shm_last_used_by_child();
+    shm_show_user("stamps vm-unmap-tail", vm, shm_vm_run(0));
+    shm_last_used_by_child();
+    shm_show_user("stamps vm-mlock", vm, shm_vm_run(1));
+    other = shm_last_used_by_child();
+    shm_vm_run(2);
+    shm_show_user("stamps vm-exit", vm, other);
+    other = shm_last_used_by_child();
+    shm_vm_self = self;
+    fflush(stdout);
+    child = clone(shm_vm_exec, shm_vm_stack + sizeof shm_vm_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
+    if (child < 0 || waitpid(child, &status, 0) != child) return 33;
+    printf("stamps vm-exec=%d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    shm_show_user("", vm, other);
+    shm_show_user("stamps vm-detach", vm, shm_vm_run(3));
+    errno = 0;
+    printf("stamps vm-detached-here=%ld errno=%d\n", syscall(SYS_shmdt, shm_vm_at), errno);
+    /* The last of the processes in a space to let it go closes what it
+       still has as itself (`exit_mmap`): a child attaches, starts one in
+       its space and exits first; this process adopts that one and reaps
+       it. */
+    int fd[2];
+    if (pipe(fd) || prctl(PR_SET_CHILD_SUBREAPER, 1)) return 34;
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 35;
+    if (child == 0) {
+        close(fd[0]);
+        if (pipe(shm_vm_hold)) _exit(1);
+        if (syscall(SYS_shmat, vm, 0, 0) == -1) _exit(2);
+        pid_t last = clone(shm_vm_child, shm_vm_stack + sizeof shm_vm_stack, CLONE_VM | SIGCHLD, (void *)(intptr_t)4);
+        if (last < 0 || write(fd[1], &last, sizeof last) != sizeof last) _exit(3);
+        _exit(0);
+    }
+    close(fd[1]);
+    pid_t last = 0;
+    if (read(fd[0], &last, sizeof last) != sizeof last) return 36;
+    close(fd[0]);
+    if (waitpid(child, &status, 0) != child) return 37;
+    if (waitpid(last, NULL, 0) != last) return 38;
+    prctl(PR_SET_CHILD_SUBREAPER, 0);
+    shm_status_of(vm, SHMX_STAT, &s);
+    printf("stamps vm-last lpid-last=%d lpid-first=%d nattch=%lu\n", s.lpid == last, s.lpid == child, s.nattch);
+    printf("stamps vm-removed=%ld\n", syscall(SYS_shmctl, vm, SHMX_RMID, 0));
     return 0;
 }
 
@@ -31327,6 +31571,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "shm")) return shm_case(self);
     if (!strcmp(mode, "shm-after-exec") && argc > 3) return shm_after_exec(atoi(argv[3]));
+    if (!strcmp(mode, "shm-vm-exec")) return 0;
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
@@ -31389,6 +31634,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
+    if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "propagation")) return propagation_case();
     if (!strcmp(mode, "mount-flags-id")) {

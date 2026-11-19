@@ -85,8 +85,8 @@ runs:
         # each attempt is bounded. apt-get update exits 0 when a source is unreachable, so an
         # attempt also fails when a package has no candidate in the lists it left. This looks
         # only at the lists, not at dependencies or what is installed; a misspelled package
-        # fails it too and costs the three attempts. A later attempt goes without the Azure
-        # mirror when others are listed. Without lists nothing installs, so the last failure
+        # fails it too and costs the three attempts. A later attempt goes without the cloud's
+        # own mirror when others are listed. Without lists nothing installs, so the last failure
         # fails the job.
         candidates() {
           local package policy
@@ -100,6 +100,14 @@ runs:
             fi
           done
         }
+        # The mirror of the cloud the runner is in: Azure's, or the one in the runner's AWS region
+        # (us-east-2.ec2.archive.ubuntu.com served one job at 100 kB/s, 2026-11-18). It is
+        # dropped once it fails, as long as the list keeps other mirrors.
+        cloud='(azure|[a-z0-9-]+\.ec2)\.archive\.ubuntu\.com'
+        drop_cloud_mirror() {
+          [ -f "$mirrors" ] && grep -qE "$cloud" "$mirrors" && grep -qvE "$cloud" "$mirrors" &&
+            sudo sed -i -E "/$cloud/d" "$mirrors"
+        }
         refresh() {
           local attempt
           for attempt in 1 2 3; do
@@ -110,10 +118,7 @@ runs:
             if [ "$attempt" -eq 3 ]; then
               return 1
             fi
-            if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors" &&
-              grep -qv 'azure\.archive\.ubuntu\.com' "$mirrors"; then
-              sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
-            fi
+            drop_cloud_mirror || true
             sleep 15
           done
         }
@@ -124,10 +129,11 @@ runs:
           fi
         }
         # The Azure mirror sometimes serves one job at 40 kB/s while another job of the same run
-        # gets 45 MB/s from it, and apt stays on it until the job times out. So bound the download
-        # (not the install: stopping dpkg would leave packages half installed) and fall back to
-        # the other mirrors. Each attempt goes on from the files the previous one left, and all
-        # downloads share one deadline, which leaves line coverage the time it needs.
+        # gets 45 MB/s from it, and apt stays on it until the job times out; AWS's has done the
+        # same. So bound the download (not the install: stopping dpkg would leave packages half
+        # installed) and fall back to the other mirrors. Each attempt goes on from the files the
+        # previous one left, and all downloads share one deadline, which leaves line coverage the
+        # time it needs.
         deadline=$((SECONDS + 720))
         download() {
           local limit
@@ -157,9 +163,7 @@ runs:
               return 0
             fi
             echo "apt download failed or hit its limit of $limit seconds" >&2
-            if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors" &&
-              grep -qv 'azure\.archive\.ubuntu\.com' "$mirrors"; then
-              sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
+            if drop_cloud_mirror; then
               # The lists came from the mirror just dropped, and the others may differ from it.
               sudo timeout --kill-after=10 120 apt-get update || echo "apt-get update failed" >&2
             fi

@@ -235,6 +235,8 @@ pub struct Processes {
     pub(crate) traces: crate::ptrace::Traces,
     /// The machine's BPF maps by ID.
     pub(crate) bpf_maps: Arc<crate::bpf::Ids>,
+    /// The machine's BPF programs by ID.
+    pub(crate) bpf_progs: Arc<crate::bpf_prog::Ids>,
     /// The machine's perf events by the thread that opened them, and those
     /// that wait for an `execve`.
     pub(crate) perf_events: crate::perf::Events,
@@ -265,6 +267,7 @@ impl Processes {
             sysctls: Arc::default(),
             traces: crate::ptrace::Traces::default(),
             bpf_maps: Arc::default(),
+            bpf_progs: Arc::default(),
             perf_events: crate::perf::Events::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
@@ -3312,11 +3315,6 @@ impl Kernel {
         let pid = self
             .processes
             .allocate_in(&space, &set_tid, &parent.state.credentials)?;
-        // The child acts on its own space from now on: its attachments of
-        // System V shared memory close as it, at its exit or exec.
-        if let Some(child_mem) = &child_mem {
-            crate::shm::act(child_mem, &space, pid, &self.host);
-        }
         let group = Arc::new(self.group.fork(flags & 0x800 != 0));
         if !space.is_first() && space.init() == Some(pid) {
             group.set_unkillable();

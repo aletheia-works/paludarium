@@ -236,6 +236,7 @@ mod linux {
                     | "userfaultfd-wp-shmem"
                     | "userfaultfd-wp-async"
                     | "userfaultfd-events"
+                    | "userfaultfd-scan"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -255,6 +256,7 @@ mod linux {
                     | "bpf-lpm"
                     | "bpf-maps"
                     | "bpf-prog-load"
+                    | "bpf-prog-verify"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -572,6 +574,7 @@ mod linux {
         bpf_lpm => ("bpf-lpm","bpf"),
         bpf_maps => ("bpf-maps","bpf"),
         bpf_prog_load => ("bpf-prog-load","bpf"),
+        bpf_prog_verify => ("bpf-prog-verify","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -617,6 +620,7 @@ mod linux {
         userfaultfd_wp_shmem => ("userfaultfd-wp-shmem","userfaultfd"),
         userfaultfd_wp_async => ("userfaultfd-wp-async","userfaultfd"),
         userfaultfd_events => ("userfaultfd-events","userfaultfd"),
+        userfaultfd_scan => ("userfaultfd-scan","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -834,6 +838,7 @@ mod linux {
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_changes => ("generated-changes","process"),
+        processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_beneath => ("beneath","process"),
         processes_propagation => ("propagation","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),

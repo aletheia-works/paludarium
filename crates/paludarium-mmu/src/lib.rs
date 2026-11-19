@@ -350,6 +350,176 @@ pub mod pagemap {
     pub const PRESENT: u64 = 1 << 63;
 }
 
+/// The categories of a page that `PAGEMAP_SCAN` matches and reports
+/// ([`Scan`]), as Linux's `include/uapi/linux/fs.h` numbers them.
+pub mod scan {
+    /// Its VMA may be write-protected by the scan: registered for
+    /// `UFFDIO_REGISTER_MODE_WP` with `UFFD_FEATURE_WP_ASYNC`, and either
+    /// not anonymous or with `UFFD_FEATURE_WP_UNPOPULATED`.
+    pub const WPALLOWED: u64 = 1 << 0;
+    /// In a VMA registered for write protection, the page is not
+    /// write-protected.
+    pub const WRITTEN: u64 = 1 << 1;
+    /// A file's page or shared memory's.
+    pub const FILE: u64 = 1 << 2;
+    /// The page is present.
+    pub const PRESENT: u64 = 1 << 3;
+    /// A swap entry: a guard, poison or uffd-wp marker.
+    pub const SWAPPED: u64 = 1 << 4;
+    /// The zero page.
+    pub const PFNZERO: u64 = 1 << 5;
+    /// A huge page, which there are none of.
+    pub const HUGE: u64 = 1 << 6;
+    /// The page or its VMA is soft-dirty.
+    pub const SOFT_DIRTY: u64 = 1 << 7;
+    /// A guard region's page.
+    pub const GUARD: u64 = 1 << 8;
+    /// Linux master's: the page was not read-protected by a `userfaultfd`
+    /// registered for read-write protection, which there is none of.
+    pub const ACCESSED: u64 = 1 << 9;
+    /// Every category a request may name (Linux master's
+    /// `PM_SCAN_CATEGORIES`).
+    pub const ALL: u64 = (1 << 10) - 1;
+}
+
+/// A `PAGEMAP_SCAN` request as Linux's `do_pagemap_scan` keeps it through
+/// its walks ([`AddressSpaceData::pagemap_scan`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scan {
+    /// Where the scan ends, page-aligned.
+    pub end: u64,
+    /// `PM_SCAN_WP_MATCHING`: write-protect the pages it matches.
+    pub write_protect: bool,
+    /// `PM_SCAN_CHECK_WPASYNC`: stop at a VMA it may not write-protect.
+    pub check_wp_async: bool,
+    /// `category_inverted`: the categories that match when a page lacks them.
+    pub inverted: u64,
+    /// `category_mask`: the categories a page must all have.
+    pub required: u64,
+    /// `category_anyof_mask`: the categories a page must have one of, if any.
+    pub any_of: u64,
+    /// `return_mask`: the categories a region reports.
+    pub returned: u64,
+    /// `max_pages`: how many pages it may report at most.
+    pub max_pages: u64,
+    /// How many pages it reported so far.
+    pub found: u64,
+    /// `walk_end`: where a walk stopped for want of room, or 0.
+    pub walk_end: u64,
+}
+
+impl Scan {
+    /// Whether a page of `categories` matches (`pagemap_scan_is_interesting_page`).
+    fn matches(&self, categories: u64) -> bool {
+        let categories = categories ^ self.inverted;
+        categories & self.required == self.required
+            && (self.any_of == 0 || categories & self.any_of != 0)
+    }
+    /// Whether a VMA of `categories` is walked (`pagemap_scan_is_interesting_vma`).
+    fn matches_vma(&self, categories: u64) -> bool {
+        let required = self.required & scan::WPALLOWED;
+        (categories ^ self.inverted) & required == required
+    }
+}
+
+/// Why a walk of [`AddressSpaceData::pagemap_scan`] stopped early.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanStop {
+    /// Its regions or its pages ran out (`ENOSPC`), at [`Scan::walk_end`].
+    Full,
+    /// `PM_SCAN_CHECK_WPASYNC` met a VMA it may not write-protect (`EPERM`).
+    Refused,
+}
+
+/// What one walk of [`AddressSpaceData::pagemap_scan`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanWalk {
+    /// The regions it reports: start, end and categories.
+    pub regions: Vec<[u64; 3]>,
+    /// Why it stopped before the end, if it did.
+    pub stop: Option<ScanStop>,
+}
+
+/// The bytes of address space one page table maps (Linux's `PMD_SIZE`).
+const BLOCK_SIZE: u64 = ENTRIES_PER_TABLE * PAGE_SIZE;
+
+/// Adds `[from, to)` to `ranges`, joining it to the last one it continues.
+fn add_range(ranges: &mut Vec<(u64, u64)>, from: u64, to: u64) {
+    match ranges.last_mut() {
+        Some((_, end)) if *end == from => *end = to,
+        _ => ranges.push((from, to)),
+    }
+}
+
+/// The regions a walk reports, as Linux's bounce buffer holds them: at most
+/// `capacity`, or none kept without one.
+struct ScanOutput {
+    regions: Vec<[u64; 3]>,
+    capacity: Option<usize>,
+}
+
+impl ScanOutput {
+    /// Reports `[addr, *end)` with `categories` (`pagemap_scan_output`): as
+    /// many of its pages as `max_pages` leaves room for, in the last region
+    /// if it continues it, else in a new one if there is room; `*end` is
+    /// moved back to what was reported.
+    fn output(
+        &mut self,
+        scan: &mut Scan,
+        categories: u64,
+        addr: u64,
+        end: &mut u64,
+    ) -> Result<(), ScanStop> {
+        let Some(capacity) = self.capacity else {
+            return Ok(());
+        };
+        let categories = categories & scan.returned;
+        let mut pages = (*end - addr) / PAGE_SIZE;
+        let mut result = Ok(());
+        if scan
+            .found
+            .checked_add(pages)
+            .is_none_or(|total| total > scan.max_pages)
+        {
+            let excess = scan.found.wrapping_add(pages).wrapping_sub(scan.max_pages);
+            *end = end.saturating_sub(excess.saturating_mul(PAGE_SIZE));
+            pages = pages.saturating_sub(excess);
+            result = Err(ScanStop::Full);
+        }
+        if !self.push(categories, addr, *end, capacity) {
+            *end = addr;
+            pages = 0;
+            result = Err(ScanStop::Full);
+        }
+        scan.found += pages;
+        if result.is_err() {
+            scan.walk_end = *end;
+        }
+        result
+    }
+    /// `pagemap_scan_push_range`.
+    fn push(&mut self, categories: u64, addr: u64, end: u64, capacity: usize) -> bool {
+        let count = self.regions.len();
+        let Some(last) = self.regions.last_mut() else {
+            self.regions.push([addr, end, categories]);
+            return true;
+        };
+        if addr == last[1] && categories == last[2] {
+            last[1] = end;
+            return true;
+        }
+        if last[1] != 0 {
+            if count >= capacity {
+                return false;
+            }
+            self.regions.push([addr, end, categories]);
+        } else {
+            *last = [addr, end, categories];
+        }
+        true
+    }
+}
+
 /// What a page table holds for a mapped page, as Linux's `folio_walk`
 /// finds it for `move_pages` ([`AddressSpace::page_state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1592,7 +1762,7 @@ pub trait PageSource: Send + Sync {
     }
     /// A VMA of a shared mapping of the file came to be, by a split, a
     /// `fork` or a move by `mremap`, as Linux's `vm_ops->open` is told;
-    /// `by` is the actor of the space it is in ([`AddressSpace::set_actor`]).
+    /// `by` is the actor of the thread that did it ([`set_current_actor`]).
     fn opened(&self, by: &Actor) {
         let _ = by;
     }
@@ -1603,20 +1773,49 @@ pub trait PageSource: Send + Sync {
     }
 }
 
-/// Who acts on an address space for the kernel, as Linux's `current` in a
-/// VMA's `open` and `close`: the files of its shared mappings are told it
+/// Who acts for the kernel, as Linux's `current` in a VMA's `open` and
+/// `close`: the files of shared mappings are told it
 /// ([`PageSource::opened`], [`PageSource::closed`]).
 pub type Actor = dyn std::any::Any + Send + Sync;
 
+thread_local! {
+    /// The actor of the task this thread runs ([`set_current_actor`]).
+    static CURRENT_ACTOR: RefCell<Option<Arc<Actor>>> = const { RefCell::new(None) };
+}
+
+/// Says who acts on any space from this thread from now on, as Linux's
+/// `current` is the task a CPU runs: what it maps, unmaps, splits or
+/// forks, and a space whose last holder it lets go of (`exit_mmap`), tells
+/// the files of the shared mappings it is. With none, they are told
+/// nothing.
+pub fn set_current_actor(actor: Option<Arc<Actor>>) {
+    CURRENT_ACTOR.with(|current| *current.borrow_mut() = actor);
+}
+
+/// Runs `f` with no actor on this thread, so that what it opens and closes
+/// is told no one.
+fn untold<R>(f: impl FnOnce() -> R) -> R {
+    let actor = CURRENT_ACTOR.with(|current| current.borrow_mut().take());
+    let result = f();
+    CURRENT_ACTOR.with(|current| *current.borrow_mut() = actor);
+    result
+}
+
 /// Tells the file of `shared`, if it has one, that one of its VMAs opened
-/// or closed, in a space with an `actor`.
-fn tell(actor: Option<&Arc<Actor>>, shared: &SharedMapping, opened: bool) {
-    if let (Some(actor), Some(source)) = (actor, shared.pages.source.as_ref()) {
-        if opened {
-            source.opened(actor.as_ref());
-        } else {
-            source.closed(actor.as_ref());
-        }
+/// or closed, when this thread has an actor.
+fn tell(shared: &SharedMapping, opened: bool) {
+    let Some(source) = shared.pages.source.as_ref() else {
+        return;
+    };
+    // The actor is taken out before the file is told, so that what the
+    // file does cannot find this borrowed.
+    let Some(actor) = CURRENT_ACTOR.with(|current| current.borrow().clone()) else {
+        return;
+    };
+    if opened {
+        source.opened(actor.as_ref());
+    } else {
+        source.closed(actor.as_ref());
     }
 }
 /// The shared memory `MADV_REMOVE` frees in one VMA of its range
@@ -2220,9 +2419,6 @@ struct AddressSpaceData {
     /// [`AddressSpace::take_out_of_memory`], which reads it without the
     /// locks.
     out_of_memory: Arc<AtomicBool>,
-    /// Who acts on the space ([`AddressSpace::set_actor`]), which the files
-    /// of its shared mappings are told as their VMAs open and close.
-    actor: Option<Arc<Actor>>,
     /// How many pages it holds, Linux's `get_mm_rss`: the entries
     /// [`Self::counts`] takes, kept as they change, which a store without
     /// the write lock may raise ([`Self::store_with`]).
@@ -2239,7 +2435,7 @@ impl Drop for AddressSpaceData {
     /// `exit_mmap` closes them.
     fn drop(&mut self) {
         for shared in self.shared.values() {
-            tell(self.actor.as_ref(), shared, false);
+            tell(shared, false);
         }
         // A debug build checks the count of the pages held once more.
         if cfg!(debug_assertions) && !std::thread::panicking() {
@@ -2333,7 +2529,6 @@ impl AddressSpaceData {
             bottom_up: None,
             meter: None,
             out_of_memory: Arc::default(),
-            actor: None,
             resident: AtomicU64::new(0),
             peak_resident: 0,
         }
@@ -2889,49 +3084,207 @@ impl AddressSpaceData {
     fn pagemap(&self, start: u64, count: u64) -> Vec<u64> {
         let directory = self.read_directory();
         (0..count)
-            .map(|i| {
-                let page = start + i * PAGE_SIZE;
-                let Some(mapping) = self.mapping_at(page) else {
-                    return 0;
-                };
-                let mut entry = if mapping.soft_dirty {
-                    pagemap::SOFT_DIRTY
-                } else {
-                    0
-                };
-                if self.guarded(page) {
-                    return entry | pagemap::SWAP | pagemap::GUARD_REGION;
-                }
-                let Some(pte) = lookup(&directory, page) else {
-                    // A poison or a uffd-wp marker is a swap entry too.
-                    if self.uffd_markers.contains(page) {
-                        return entry | pagemap::SWAP | pagemap::UFFD_WP;
-                    }
-                    if self.poisoned(page) {
-                        return entry | pagemap::SWAP;
-                    }
-                    return entry;
-                };
-                entry |= pagemap::PRESENT;
-                if pte.soft_dirty {
-                    entry |= pagemap::SOFT_DIRTY;
-                }
-                if pte.uffd_wp {
-                    entry |= pagemap::UFFD_WP;
-                }
-                let shared = self.shared_at(page).is_some();
-                if pte.frame.get().is_none() && !pte.file && !shared {
-                    return entry;
-                }
-                if shared || pte.cache || (pte.file && !mapping.written) {
-                    entry |= pagemap::FILE;
-                }
-                if pte.frame.maps() == 1 {
-                    entry |= pagemap::EXCLUSIVE;
-                }
-                entry
-            })
+            .map(|i| self.pagemap_entry(&directory, start + i * PAGE_SIZE).0)
             .collect()
+    }
+    /// The [`Self::pagemap`] entry of the page at `page`, and whether it
+    /// shows the zero page.
+    fn pagemap_entry(&self, directory: &Directory, page: u64) -> (u64, bool) {
+        let Some(mapping) = self.mapping_at(page) else {
+            return (0, false);
+        };
+        let mut entry = if mapping.soft_dirty {
+            pagemap::SOFT_DIRTY
+        } else {
+            0
+        };
+        if self.guarded(page) {
+            return (entry | pagemap::SWAP | pagemap::GUARD_REGION, false);
+        }
+        let Some(pte) = lookup(directory, page) else {
+            // A poison or a uffd-wp marker is a swap entry too.
+            if self.uffd_markers.contains(page) {
+                return (entry | pagemap::SWAP | pagemap::UFFD_WP, false);
+            }
+            if self.poisoned(page) {
+                return (entry | pagemap::SWAP, false);
+            }
+            return (entry, false);
+        };
+        entry |= pagemap::PRESENT;
+        if pte.soft_dirty {
+            entry |= pagemap::SOFT_DIRTY;
+        }
+        if pte.uffd_wp {
+            entry |= pagemap::UFFD_WP;
+        }
+        let shared = self.shared_at(page).is_some();
+        if pte.frame.get().is_none() && !pte.file && !shared {
+            return (entry, true);
+        }
+        if shared || pte.cache || (pte.file && !mapping.written) {
+            entry |= pagemap::FILE;
+        }
+        if pte.frame.maps() == 1 {
+            entry |= pagemap::EXCLUSIVE;
+        }
+        (entry, false)
+    }
+    /// The categories of the page at `page` in a VMA registered for write
+    /// protection or not (`wp`), as Linux master's `pagemap_page_category`
+    /// gives them, its VMA's aside: an empty entry is only written in such
+    /// a VMA; a present page and a marker are written there unless
+    /// write-protected, a present page is a file's as [`Self::pagemap`]
+    /// says, and a guard marker is a guard's.
+    fn scan_category(&self, directory: &Directory, page: u64, wp: bool) -> u64 {
+        let (entry, zero) = self.pagemap_entry(directory, page);
+        let mut categories = 0;
+        if entry & (pagemap::PRESENT | pagemap::SWAP) == 0 {
+            return if wp { scan::WRITTEN } else { 0 };
+        }
+        if wp && entry & pagemap::UFFD_WP == 0 {
+            categories |= scan::WRITTEN;
+        }
+        if entry & pagemap::SOFT_DIRTY != 0 {
+            categories |= scan::SOFT_DIRTY;
+        }
+        if entry & pagemap::PRESENT != 0 {
+            categories |= scan::PRESENT;
+            if entry & pagemap::FILE != 0 {
+                categories |= scan::FILE;
+            }
+            if zero {
+                categories |= scan::PFNZERO;
+            }
+        } else {
+            categories |= scan::SWAPPED;
+            if entry & pagemap::GUARD_REGION != 0 {
+                categories |= scan::GUARD;
+            }
+        }
+        categories
+    }
+    /// Whether the 2 MiB block of `page` would have a page table in Linux:
+    /// one of its pages has an entry or a marker.
+    fn scan_has_table(&self, directory: &Directory, page: u64) -> bool {
+        let block = page / BLOCK_SIZE;
+        let (start, end) = (block * BLOCK_SIZE, (block + 1) * BLOCK_SIZE);
+        directory.contains_key(&block)
+            || self.uffd_markers.overlaps(start, end)
+            || self.guards.overlaps(start, end)
+            || self.poisons.overlaps(start, end)
+    }
+    /// One walk of `PAGEMAP_SCAN` from `start` to [`Scan::end`], as Linux
+    /// master's `walk_page_range` with `pagemap_scan_ops` makes it: the
+    /// regions it reports, at most `capacity` of them (`None`: no buffer),
+    /// and the ranges whose pages it write-protects, which
+    /// [`MemoryView::pagemap_scan`] then protects.
+    ///
+    /// VMA by VMA (`pagemap_scan_test_walk`), one that may not be
+    /// write-protected stops it with [`Scan::check_wp_async`] and is
+    /// passed over with [`Scan::write_protect`]; one that does not match
+    /// [`Scan::matches_vma`] is passed over. Then each page of it that
+    /// [`Scan::matches`] with its VMA's categories is reported, and, with
+    /// [`Scan::write_protect`], protected if written. A 2 MiB block with
+    /// no entry and no marker is Linux's hole with no page table
+    /// (`pagemap_scan_pte_hole`), which is empty, so written in a VMA
+    /// registered for write protection. Without a buffer,
+    /// [`Scan::write_protect`] protects every page not yet protected in a
+    /// block that has a page table, matching or not, as the fast path of
+    /// `pagemap_scan_pmd_entry` does.
+    pub fn pagemap_scan(
+        &self,
+        start: u64,
+        scan: &mut Scan,
+        capacity: Option<usize>,
+    ) -> (ScanWalk, Vec<(u64, u64)>) {
+        let mut output = ScanOutput {
+            regions: vec![[0; 3]],
+            capacity,
+        };
+        let mut protect: Vec<(u64, u64)> = Vec::new();
+        let directory = self.read_directory();
+        let mut stop = None;
+        'walk: for m in self.mappings_in(start, scan.end) {
+            let (from, to) = (m.start.0.max(start), m.end().min(scan.end));
+            let modes = m.userfault.map_or(0, |u| u.modes);
+            let wp = modes & Userfault::WP != 0;
+            // `userfaultfd_wp_async` and `userfaultfd_wp_use_markers`.
+            let allowed = self.wp_async(from)
+                && (!self.anonymous_at(from) || modes & Userfault::WP_UNPOPULATED != 0);
+            if !allowed {
+                if scan.check_wp_async {
+                    stop = Some(ScanStop::Refused);
+                    break;
+                }
+                if scan.write_protect {
+                    continue;
+                }
+            }
+            let mut vma = 0;
+            if allowed {
+                vma |= scan::WPALLOWED;
+            }
+            if m.soft_dirty {
+                vma |= scan::SOFT_DIRTY;
+            }
+            if !scan.matches_vma(vma) {
+                continue;
+            }
+            let mut block = from;
+            while block < to {
+                let block_end = ((block / BLOCK_SIZE + 1) * BLOCK_SIZE).min(to);
+                if !self.scan_has_table(&directory, block) {
+                    // `pagemap_scan_pte_hole`: in a VMA registered for
+                    // write protection, written.
+                    let categories = vma | if wp { scan::WRITTEN } else { 0 };
+                    if scan.matches(categories) {
+                        let mut end = block_end;
+                        let result = output.output(scan, categories, block, &mut end);
+                        if end != block && scan.write_protect {
+                            add_range(&mut protect, block, end);
+                        }
+                        if result.is_err() {
+                            stop = result.err();
+                            break 'walk;
+                        }
+                    }
+                    block = block_end;
+                    continue;
+                }
+                let mut page = block;
+                while page < block_end {
+                    let next_page = page + PAGE_SIZE;
+                    if scan.write_protect && capacity.is_none() {
+                        // The fast path: every page not yet protected.
+                        if self.pagemap_entry(&directory, page).0 & pagemap::UFFD_WP == 0 {
+                            add_range(&mut protect, page, next_page);
+                        }
+                        page = next_page;
+                        continue;
+                    }
+                    let categories = vma | self.scan_category(&directory, page, wp);
+                    if scan.matches(categories) {
+                        let mut next = next_page;
+                        let result = output.output(scan, categories, page, &mut next);
+                        if next == page {
+                            stop = result.err();
+                            break 'walk;
+                        }
+                        if scan.write_protect && categories & scan::WRITTEN != 0 {
+                            add_range(&mut protect, page, next_page);
+                        }
+                    }
+                    page = next_page;
+                }
+                block = block_end;
+            }
+        }
+        let mut regions = output.regions;
+        if regions.last().is_some_and(|r| r[0] == r[1]) {
+            regions.pop();
+        }
+        (ScanWalk { regions, stop }, protect)
     }
     /// Whether the file mapping page at `page` lies wholly past the end of
     /// its file.
@@ -3080,7 +3433,9 @@ impl AddressSpaceData {
             .collect();
         for m in advised {
             if m.dont_fork {
-                copy.remove(m.start.0, m.end());
+                // `dup_mmap` skips it: the child's VMA never opened, so it
+                // does not close either.
+                untold(|| copy.remove(m.start.0, m.end()));
             } else {
                 copy.clear_populated(m.start.0, m.end());
                 copy.clear_guards(m.start.0, m.end());
@@ -3091,12 +3446,10 @@ impl AddressSpaceData {
                 }
             }
         }
-        // Each VMA the child gets is opened by the parent (`dup_mmap`), and
-        // the child's space acts for it until the kernel says who the child
-        // is: a fork that fails after this closes them as the parent.
-        copy.actor = self.actor.clone();
+        // Each VMA the child gets is opened by the parent (`dup_mmap`), as
+        // the thread that forks.
         for shared in copy.shared.values() {
-            tell(copy.actor.as_ref(), shared, true);
+            tell(shared, true);
         }
         // The child's peak is what it holds (`dup_mm`).
         copy.peak_resident = copy.resident_pages();
@@ -4133,7 +4486,7 @@ impl AddressSpaceData {
         };
         let tail = shared.clone();
         shared.end = at;
-        tell(self.actor.as_ref(), &tail, true);
+        tell(&tail, true);
         self.shared.insert(at, tail);
     }
     /// The shared mappings, by address.
@@ -4203,9 +4556,9 @@ impl AddressSpaceData {
             // (`__split_vma` opens the new one), and the part unmapped is
             // closed.
             if start < addr.0 || mapping.end > end {
-                tell(self.actor.as_ref(), &mapping, true);
+                tell(&mapping, true);
             }
-            tell(self.actor.as_ref(), &mapping, false);
+            tell(&mapping, false);
             if start < addr.0 {
                 self.shared.insert(
                     start,
@@ -4439,7 +4792,7 @@ impl AddressSpaceData {
                 ..shared
             };
             // The VMA at its new place is a copy, opened (`copy_vma`).
-            tell(self.actor.as_ref(), &moved, true);
+            tell(&moved, true);
             self.shared.insert(to, moved);
         }
         self.mappings.insert(
@@ -6420,6 +6773,27 @@ impl MemoryView {
     pub fn pagemap(&self, start: u64, count: u64) -> Option<Vec<u64>> {
         self.with_data(|data| data.pagemap(start, count))
     }
+    /// One walk of `PAGEMAP_SCAN` ([`AddressSpaceData::pagemap_scan`]),
+    /// which write-protects the pages it says to as `UFFDIO_WRITEPROTECT`
+    /// does, with uffd-wp markers on the pages that have no entry; `None`
+    /// once the space is gone.
+    pub fn pagemap_scan(
+        &self,
+        start: u64,
+        scan: &mut Scan,
+        capacity: Option<usize>,
+    ) -> Option<ScanWalk> {
+        if !scan.write_protect {
+            return self.with_data(|data| data.pagemap_scan(start, scan, capacity).0);
+        }
+        self.with_data_mut(|data| {
+            let (walk, protect) = data.pagemap_scan(start, scan, capacity);
+            for (from, to) in protect {
+                data.userfault_mark(from, to, true, true);
+            }
+            walk
+        })
+    }
     /// What the pages of `[start, end)` hold ([`Usage`]), or `None` once
     /// the space is gone.
     #[must_use]
@@ -6703,13 +7077,6 @@ impl AddressSpace {
     #[must_use]
     pub fn memory_meter(&self) -> Option<Arc<MemoryMeter>> {
         self.locked().meter.clone()
-    }
-    /// Says who acts on this space from now on, which the files of its
-    /// shared mappings are told as their VMAs open and close
-    /// ([`PageSource::opened`], [`PageSource::closed`]); a space without
-    /// one tells them nothing.
-    pub fn set_actor(&self, actor: Arc<Actor>) {
-        self.locked().actor = Some(actor);
     }
     /// Whether a write found no room under the meter since the last call.
     pub fn take_out_of_memory(&self) -> bool {

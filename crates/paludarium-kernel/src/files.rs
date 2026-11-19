@@ -1437,6 +1437,8 @@ pub(crate) fn mount_target(
 pub(crate) const ST_NOSUID: u64 = 0x2;
 pub(crate) const ST_NODEV: u64 = 0x4;
 pub(crate) const ST_NOEXEC: u64 = 0x8;
+/// `statfs`'s `ST_RELATIME`.
+const ST_RELATIME: u64 = 0x1000;
 /// Whether the mount of the file at `path`, its links followed, has the
 /// `statfs` flag `flag` (`MNT_NOEXEC` for `path_noexec`, `MNT_NODEV` for
 /// `may_open_dev`, `MNT_NOSUID` for `mnt_may_suid`). `/proc` and `/dev`,
@@ -1469,7 +1471,6 @@ pub(crate) fn generated_source(
     c: &Context<'_>,
     raw: Vec<u8>,
 ) -> Result<paludarium_vfs::GeneratedSource, Errno> {
-    use paludarium_vfs::mount_flags as mnt;
     let p = lookup(c, (-100i32) as u64, raw, true)?.0;
     let p = match followed(c, &p, true)? {
         Some(Followed::Path { path, .. }) => path,
@@ -1489,16 +1490,7 @@ pub(crate) fn generated_source(
                 }
             })
     };
-    let quiet = mnt::NOSUID | mnt::NOEXEC | mnt::RELATIME;
-    let (kind, base, flags) = [
-        ("proc", &b"/proc"[..], quiet | mnt::NODEV),
-        ("devpts", b"/dev/pts", quiet),
-        ("mqueue", b"/dev/mqueue", quiet | mnt::NODEV),
-        ("devtmpfs", b"/dev", mnt::NOSUID | mnt::RELATIME),
-    ]
-    .into_iter()
-    .find(|(_, base, _)| under(base).is_some())
-    .ok_or(Errno::ENOENT)?;
+    let (kind, base, flags) = generated_mount(&p).ok_or(Errno::ENOENT)?;
     Ok(paludarium_vfs::GeneratedSource {
         kind,
         device,
@@ -1506,6 +1498,27 @@ pub(crate) fn generated_source(
         path: under(base).unwrap_or_default(),
         stat,
         flags,
+    })
+}
+/// The mount of the kernel's own that holds the normalized path `p`, as
+/// Linux mounts each: its type, where it is, and its flags
+/// ([`paludarium_vfs::mount_flags`]), `/proc` and `/dev/mqueue` `nosuid`,
+/// `nodev`, `noexec` and `relatime`, `/dev/pts` `nosuid`, `noexec` and
+/// `relatime`, and `/dev` (a devtmpfs) `nosuid`, `noexec` and `relatime`,
+/// as systemd mounts it.
+fn generated_mount(p: &[u8]) -> Option<(&'static str, &'static [u8], u32)> {
+    use paludarium_vfs::mount_flags as mnt;
+    let quiet = mnt::NOSUID | mnt::NOEXEC | mnt::RELATIME;
+    [
+        ("proc", &b"/proc"[..], quiet | mnt::NODEV),
+        ("devpts", b"/dev/pts", quiet),
+        ("mqueue", b"/dev/mqueue", quiet | mnt::NODEV),
+        ("devtmpfs", b"/dev", quiet),
+    ]
+    .into_iter()
+    .find(|(_, base, _)| {
+        p.strip_prefix(*base)
+            .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
     })
 }
 /// The normalized path `p` with `/proc/self` and `/proc/thread-self`
@@ -1895,22 +1908,57 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
 }
 /// `statfs`'s `f_flags` for `path`, whose file system `stats` describes:
 /// the mount's ([`paludarium_vfs::FileSystem::statfs_flags`]) for one a
-/// mount here holds, `ST_VALID` alone for the kernel's own.
+/// mount here holds; for `/proc`, `/dev` and the mounts on it the flags
+/// Linux mounts them with ([`generated_mount`]); and `ST_VALID` alone for
+/// the kernel's internal mounts (pipes, sockets, anonymous inodes, pidfs,
+/// secretmem, a queue `mq_open` opened), which `kern_mount` makes with
+/// no flag.
 fn mount_statfs_flags(c: &Context<'_>, stats: &paludarium_host::FsStats, path: &[u8]) -> u64 {
-    let own = [
-        PROC_SUPER_MAGIC,
-        DEVPTS_SUPER_MAGIC,
-        MQUEUE_MAGIC,
+    let internal = [
         PID_FS_MAGIC,
+        ANON_INODE_FS_MAGIC,
+        crate::memfd::SECRETMEM_MAGIC,
     ]
     .contains(&stats.kind)
-        || stats.kind == ANON_INODE_FS_MAGIC
-        || stats.kind == crate::memfd::SECRETMEM_MAGIC
         || [0x5049_5045, 0x534F_434B].contains(&stats.kind);
-    if own || !path.starts_with(b"/") || generated(path) {
+    if internal || !path.starts_with(b"/") {
         return 0x20;
     }
+    let own = [PROC_SUPER_MAGIC, DEVPTS_SUPER_MAGIC, MQUEUE_MAGIC].contains(&stats.kind);
+    if own || generated(path) {
+        let Some((_, _, flags)) = generated_mount(path) else {
+            return 0x20;
+        };
+        use paludarium_vfs::mount_flags as mnt;
+        return [
+            (mnt::NOSUID, ST_NOSUID),
+            (mnt::NODEV, ST_NODEV),
+            (mnt::NOEXEC, ST_NOEXEC),
+            (mnt::RELATIME, ST_RELATIME),
+        ]
+        .into_iter()
+        .filter(|(flag, _)| flags & flag != 0)
+        .fold(0x20, |out, (_, bit)| out | bit);
+    }
     c.files.fs().statfs_flags(path)
+}
+/// `fstatfs`'s `f_flags` for `d`, whose file system `stats` describes: a
+/// memfd is on the kernel's own tmpfs mount, else [`mount_statfs_flags`]
+/// of its path.
+fn descriptor_statfs_flags(
+    c: &Context<'_>,
+    d: &Descriptor,
+    stats: &paludarium_host::FsStats,
+) -> u64 {
+    let memfd = d
+        .file
+        .as_any()
+        .is_some_and(|v| v.is::<crate::memfd::Memfd>());
+    if memfd {
+        0x20
+    } else {
+        mount_statfs_flags(c, stats, &d.path)
+    }
 }
 /// Linux's 120-byte `struct statfs` of the file system on `device`, with
 /// `f_flags` and `f_fsid` [`crate::fanotify::fsid`]'s.
@@ -5679,22 +5727,24 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         137 => {
             let (p, _) = looked_up_linked(c, (-100i32) as u64, a[0], true)?;
             let stats = path_statfs(c, &p)?;
-            let flags = mount_statfs_flags(c, &stats, &p);
+            // A link in `/proc/self/fd` leads to its descriptor's file, on
+            // that file's mount.
+            let flags = match crate::proc::own_entry(&p, c.process.pid) {
+                Some(crate::proc::OwnEntry::Descriptor(n)) => {
+                    let d = c
+                        .files
+                        .descriptor(u64::from(n))
+                        .map_err(|_| Errno::ENOENT)?;
+                    descriptor_statfs_flags(c, &d, &stats)
+                }
+                _ => mount_statfs_flags(c, &stats, &p),
+            };
             write_statfs(c, a[1], stats, watched_device(c, &p, true), flags)
         }
         138 => {
             let d = c.files.descriptor(a[0])?;
             let stats = descriptor_statfs(c, &d)?;
-            // A memfd is on the kernel's own tmpfs mount.
-            let memfd = d
-                .file
-                .as_any()
-                .is_some_and(|v| v.is::<crate::memfd::Memfd>());
-            let flags = if memfd {
-                0x20
-            } else {
-                mount_statfs_flags(c, &stats, &d.path)
-            };
+            let flags = descriptor_statfs_flags(c, &d, &stats);
             write_statfs(c, a[1], stats, descriptor_device(c, &d), flags)
         }
         // access, faccessat, faccessat2
@@ -8129,6 +8179,10 @@ fn named_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::bpf::MapFile>()) {
         return Ok(b"anon_inode:bpf-map".to_vec());
     }
+    // A BPF program's, `anon_inode_getfd("bpf-prog", ...)`.
+    if any.is_some_and(|v| v.is::<crate::bpf_prog::ProgFile>()) {
+        return Ok(b"anon_inode:bpf-prog".to_vec());
+    }
     // So is a seccomp listener: "seccomp notify".
     if crate::seccomp::is_listener(&d.file) {
         return Ok(b"anon_inode:seccomp notify".to_vec());
@@ -8625,6 +8679,8 @@ fn fdinfo(c: &Context<'_>, h: &Holder, d: &Descriptor, descriptors: &[Descriptor
     } else if let Some(epoll) = any.and_then(|a| a.downcast_ref::<crate::epoll::EpollInstance>()) {
         out.extend(epoll_fdinfo(&*h.fs, epoll, descriptors));
     } else if let Some(lines) = crate::bpf::fdinfo(&d.file) {
+        out.extend(lines);
+    } else if let Some(lines) = crate::bpf_prog::fdinfo(&d.file) {
         out.extend(lines);
     }
     out

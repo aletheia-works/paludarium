@@ -22,7 +22,10 @@ pub use inbox::SignalInbox;
 mod aio;
 mod bpf;
 mod bpf_prog;
+#[cfg(test)]
+mod bpf_tests;
 mod bpf_trie;
+mod bpf_verifier;
 mod devices;
 mod epoll;
 mod events;
@@ -53,6 +56,7 @@ mod mqueue;
 mod msg;
 mod namespaces;
 mod page_cache;
+mod pagemap_scan;
 mod perf;
 mod proc;
 mod process_vm;

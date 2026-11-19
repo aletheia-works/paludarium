@@ -3872,6 +3872,10 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if let Some(result) = crate::userfaultfd::ioctl(c, &file, a[1], a[2]) {
             return result;
         }
+        // A `pagemap` file's.
+        if let Some(result) = crate::pagemap_scan::ioctl(c, &file, a[1], a[2]) {
+            return result;
+        }
         // A perf event's.
         if let Some(result) = crate::perf::ioctl(c, &file, a[1], a[2]) {
             return result;

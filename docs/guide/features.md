@@ -90,7 +90,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps, and `BPF_PROG_LOAD`'s argument checks (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -1025,7 +1025,8 @@ kernel.
   to a write-protected page, an instruction's or a system call's, does not
   fault: it clears the page's protection and goes on, as `do_wp_page`
   does, so that bit 57 of `/proc/<pid>/pagemap` tells which pages were
-  written since `UFFDIO_WRITEPROTECT`. `MADV_DONTNEED` of a file's private
+  written since `UFFDIO_WRITEPROTECT`, and `PAGEMAP_SCAN` (below) finds
+  and protects them again. `MADV_DONTNEED` of a file's private
   mapping leaves a marker for each page still protected, as for shmem; a
   fill there is `EINVAL`, as the memory is neither anonymous nor shmem's.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
@@ -1131,7 +1132,11 @@ kernel.
   opens (a split, a `fork`'s copy, a move by `mremap`) sets the segment's
   `shm_atime` and `shm_lpid`, and each one that closes (an unmap, `shmdt`,
   an exit, an `exec`) its `shm_dtime` and `shm_lpid`, as Linux's
-  `shm_open` and `shm_close` do. `shmdt` takes every piece of the
+  `shm_open` and `shm_close` do. `shm_lpid` is the process that acts, as
+  Linux's `current`: a child that shares its parent's memory without being
+  a thread of it (`CLONE_VM`, `vfork`) stamps what it maps and unmaps as
+  itself, and an exit or `exec` closes the VMAs only when no other process
+  uses the space, as the last of them. `shmdt` takes every piece of the
   attachment that `munmap` and the others left. A segment removed with `IPC_RMID` while attached keeps its ID, is
   found by no key, and goes at its last detach. `SHM_LOCK` checks the owner
   and `RLIMIT_MEMLOCK` as Linux does, and `SHM_HUGETLB` gives `ENOSYS`, as
@@ -1610,7 +1615,15 @@ kernel.
   its root is a directory of mode 01777 owned by the caller's filesystem
   IDs, unless `mode`, `uid` and `gid` say otherwise. `statfs` gives it
   `TMPFS_MAGIC` and the size and inodes it was mounted with (half the
-  memory `sysinfo` reports by default, 0 for no limit), and
+  memory `sysinfo` reports by default, 0 for no limit), against what its
+  files take, which they are held to as tmpfs holds them: a write stops
+  at the first page past the size (a short write, `ENOSPC` when nothing
+  fits), `fallocate` allocates all of its range or none (`ENOSPC`), a
+  long symbolic link (past 127 bytes) takes a page, and each new inode and
+  each further name of a file (`link`) takes one of the inodes (`ENOSPC`
+  for none left), which an unlinked file still open keeps until its last
+  close; a remount changes the limits. The files are held as `shmem`
+  counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,
   and tmpfs's options as Linux's `shmem_show_options` prints them. A path
@@ -1711,7 +1724,13 @@ kernel.
   writing a regular file, a directory or a symbolic link before its
   permission is checked (`sb_permission`). `statfs`'s `f_flags` gives the
   mount's flags (`ST_RDONLY`, `ST_NOSUID`, `ST_NODEV`, `ST_NOEXEC`,
-  `ST_NOATIME`, `ST_NODIRATIME`, `ST_RELATIME`), as `flags_by_mnt` does.
+  `ST_NOATIME`, `ST_NODIRATIME`, `ST_RELATIME`), as `flags_by_mnt` does;
+  for `/proc` and `/dev` those Linux mounts them with: `/proc` and
+  `/dev/mqueue` `nosuid`, `nodev`, `noexec` and `relatime`, `/dev/pts`
+  `nosuid`, `noexec` and `relatime`, and the rest of `/dev` (a devtmpfs)
+  `nosuid`, `noexec` and `relatime`, as systemd mounts it. A link in `/proc/self/fd` gives its file's, and
+  the kernel's internal mounts (pipes, sockets, anonymous inodes, pidfs,
+  memfd, secretmem, a queue `mq_open` opened) `ST_VALID` alone.
 - `mount` with `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` or `MS_UNBINDABLE` (and
   `MS_REC` for the mounts on the target too) changes a mount's propagation
   type, after `do_change_type`'s checks: the root of a mount (`EINVAL`),
@@ -3372,6 +3391,33 @@ kernel.
   as Linux's `mem_lseek`, a negative one too, from which a read is `EINVAL`;
   from the end it is `EINVAL`. It cannot be written (`EINVAL`, `EBADF` on a
   descriptor open only for reading).
+  Its ioctl `PAGEMAP_SCAN` finds the pages of a range by their categories, as
+  Linux master's `do_pagemap_scan` does:
+  - The categories are `PAGE_IS_WPALLOWED`, `WRITTEN`, `FILE`, `PRESENT`,
+    `SWAPPED` (a guard, poison or uffd-wp marker), `PFNZERO`, `SOFT_DIRTY`
+    and `GUARD`, from the same state as the entries.
+    - `PAGE_IS_WPALLOWED`: the VMA is registered for write protection by a
+      `userfaultfd` with `UFFD_FEATURE_WP_ASYNC`, and is not private
+      anonymous memory or has `UFFD_FEATURE_WP_UNPOPULATED`.
+    - `PAGE_IS_WRITTEN`: in a VMA registered for write protection, a page
+      that is not write-protected, an empty one too.
+  - A page is matched by `category_mask`, `category_anyof_mask` and
+    `category_inverted`, and reported with the categories of `return_mask`.
+    Pages that meet with the same categories are joined into one region.
+  - The scan stops early for `vec_len` regions or `max_pages` pages.
+    `walk_end` tells where it stopped, and the result is the number of
+    regions.
+  - With `PM_SCAN_WP_MATCHING`, the written pages it matches are
+    write-protected again, as `UFFDIO_WRITEPROTECT` does, and VMAs that
+    cannot be protected are passed over. Without a buffer, every page
+    where Linux would have a page table is protected.
+  - With `PM_SCAN_CHECK_WPASYNC`, such a VMA stops the scan (`EPERM`).
+  - The request is checked as `pagemap_scan_get_args` does: its size, flags
+    and categories (`EINVAL`), a start on a page boundary (`EINVAL`), the
+    range and the buffer in user space (`EFAULT`), and a buffer for a
+    length (`EINVAL`).
+  - Any other ioctl is `ENOTTY`, and a scan once the address space is gone
+    is `ESRCH`.
 - `/proc/<pid>/clear_refs` (mode 0200, size 0, a thread's too), as Linux's
   `clear_refs_write`: a write's first 12 bytes at most, which is what it
   returns, are a number as `kstrtoint` reads one in base 10 (spaces
@@ -3931,20 +3977,64 @@ kernel.
   descriptor's, not the map's: `map_flags` (in fdinfo, `bpf_map_info` and a
   template) leaves them out, as Linux's `bpf_map_flags_retain_permanent`
   does. See [limitations](./limitations) for what is not there.
-- `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
-  its order and with its errors, which are the same in the test machines'
-  kernel (Ubuntu's Linux 7.0) and in master: the fields past the command
-  (`EINVAL`), the program flags (`EINVAL`), a token descriptor (`EBADF` for
-  none, `EINVAL` for another file, as there are no tokens here),
+- `BPF_PROG_LOAD` loads socket filters (`BPF_PROG_TYPE_SOCKET_FILTER`),
+  which a verifier checks as Linux's does; nothing runs them yet. It checks
+  its arguments as Linux's `bpf_prog_load` does, in master's order and with
+  its errors: the log's arguments first (a buffer without a size or a size
+  without a buffer, a buffer without a level, an unknown level, `EINVAL`;
+  the test machines' kernel, Ubuntu's Linux 7.0, checks them as its
+  verifier starts), the fields past the command (`EINVAL`), the program
+  flags (`EINVAL`), a token descriptor (`EBADF` for none, `EINVAL` for
+  another file, as there are no tokens here),
   `kernel.unprivileged_bpf_disabled` without `CAP_BPF` (`EPERM`), the count
   of instructions (0, or more than 4096 without `CAP_BPF` and 1,000,000
   with it, `E2BIG`), `CAP_BPF` for a type other than a socket filter or a
   cgroup skb program, `CAP_NET_ADMIN` and `CAP_PERFMON` for the types that
   need them (`EPERM`; `CAP_SYS_ADMIN` stands in for each), an attach
-  program or BTF ID (`EINVAL` for every type here), and the copies of the
-  instructions and the license (`EFAULT`). A load that passes all of them
-  is `EINVAL`, as on a kernel built without the program's type: no
-  program is ever loaded (see [Limitations](./limitations)).
+  program or BTF ID, or one of master's multi-function attach types
+  (`EINVAL` for every type here), the copies of the instructions and the
+  license (`EFAULT`), a device to bind to (`EINVAL`), and the type: any but
+  a socket filter is `EINVAL`, as on a kernel built without it. The name
+  comes last, as a map's (`EINVAL`).
+- The verifier (`kernel/bpf/verifier.c`) takes a program only if both of
+  the kernels the tests know take it, master and 7.0, and rejects what
+  either rejects. It checks the structure first, in master's order, all
+  `EINVAL`: the last instruction is not half of a `BPF_LD_IMM64`, the
+  jumps stay in the program ("jump out of range from insn %d to %d") and
+  the last instruction is an exit or a jump, each instruction's
+  registers, opcode ("unknown opcode %02x") and reserved fields (each
+  class's "... uses reserved fields"), a `BPF_LD_IMM64`'s second half,
+  and then the edges between instructions: every one reachable
+  ("unreachable insn %d") and no jump into a `BPF_LD_IMM64`. Then it walks
+  every path from the first instruction, with what each register holds
+  (R1 the context, R10 the frame pointer, the others nothing yet) and the
+  512 bytes of stack: a register read before it is written ("R%d
+  !read_ok", `EACCES`), the frame pointer written, a division by a 0
+  immediate and a shift past the width (`EINVAL`), pointer arithmetic as
+  Linux allows it (an offset added to the stack or context pointer, a
+  pointer less a pointer, a 32-bit difference; no subtraction from the
+  stack pointer, no other operator, no 32-bit addition, `EACCES`; an
+  offset past 2^29, `EINVAL`), the stack's loads and stores (aligned to
+  their size, within the 512 bytes, `EACCES`), pointers spilled to the
+  stack whole and filled whole, a load through a scalar ("R%d invalid mem
+  access 'scalar'", `EACCES`) and the exit's R0, which may be any value.
+  A conditional jump whose operands it knows goes one way; any other is
+  walked both ways. It gives up as Linux does after 1,000,000 instructions
+  or 8,192 jumps waiting to be walked (`E2BIG`).
+- The log (`log_level`, `log_buf`, `log_size`) gets the line that says
+  why a program was refused, in 7.0's words where the two kernels word it
+  differently, and the "processed %d insns" line, in a fixed
+  (`BPF_LOG_FIXED`) or rotating buffer; a log too small is `ENOSPC` and one
+  that cannot be written `EFAULT`, in place of the load's result, and
+  `log_true_size` gives its length. A program loaded is a descriptor,
+  close-on-exec, of `anon_inode:bpf-prog`, whose fdinfo gives its type,
+  its tag (the first 8 bytes of the SHA-256 of its instructions, with
+  maps' descriptors taken out, as Linux's `bpf_prog_calc_tag`), its memory
+  (its 96-byte header and instructions, in pages), its ID (from IDs of
+  programs, apart from the maps') and the instructions the verifier went
+  through; `prog_jited` and the run statistics are 0. See
+  [Limitations](./limitations) for what the verifier refuses that Linux
+  takes.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

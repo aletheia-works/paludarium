@@ -70,6 +70,26 @@ verified.
   none, or a uffd-wp marker, until an access. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
+- **`PAGEMAP_SCAN`, in part**:
+  - It follows Linux master where the CI runners' Linux 7.0 differs:
+    - A page is written (`PAGE_IS_WRITTEN`) only in a VMA registered for
+      write protection, where an empty page is written too. Linux 7.0
+      calls every present page and marker that is not write-protected
+      written, and no empty one.
+    - `PAGE_IS_ACCESSED` is taken. No page has it, as there is no read
+      protection.
+    - An unknown ioctl is `ENOTTY`, where Linux 7.0 gives `EINVAL`.
+    - A scan once the address space is gone is `ESRCH`, where Linux 7.0
+      finds no pages.
+  - No page is `PAGE_IS_HUGE`, as there are no huge pages.
+  - Protecting a guard or poison marker's page leaves it written. Linux
+    sets the marker's uffd-wp bit.
+  - A 2 MiB block has a page table while one of its pages has an entry or
+    a marker. Linux keeps page tables otherwise. This matters only for
+    `PM_SCAN_WP_MATCHING` without a buffer, which protects every page
+    where there is a page table.
+  - User space ends at 2^47 bytes for its checks, as with 4-level page
+    tables.
 - **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) and 5 (the
   peak resident size) change anything. 1, 2 and 3 are taken, but no
   referenced bits are kept, so `smaps`' `Referenced` stays the resident
@@ -290,22 +310,44 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes,
-  longest-prefix-match tries, queues, stacks, bloom filters, and arrays
-  and hashes of maps, and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
-  `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
-  every program with `EINVAL`, as a kernel built without the program's
-  type does; a program Linux would load, or reject in its verifier with
-  another error (most often `EACCES`), gets that `EINVAL`, and no log is
-  written. The other program commands (`BPF_PROG_TEST_RUN` and the rest),
-  BTF (`BPF_BTF_LOAD`), links, attachment, pins (`BPF_OBJ_PIN`,
-  `BPF_OBJ_GET`), the IDs of programs, BTF and links
+- **BPF, maps and socket filters that do not run**: `bpf` makes arrays,
+  hashes, LRU hashes, longest-prefix-match tries, queues, stacks, bloom
+  filters, and arrays and hashes of maps, and loads socket filters, and
+  nothing else. No program runs: nothing attaches one (`SO_ATTACH_BPF` and
+  the rest) and there is no interpreter yet. Every other program type is
+  `EINVAL`, as on a kernel built without it. The verifier refuses, where
+  Linux may take them, with a log line of its own ("paludarium: ... are
+  not verified yet", `EINVAL`; a helper call's starts "unknown func #%d",
+  so that libbpf and bpftool take the helper as missing): helper calls, bpf-to-bpf calls and
+  kfuncs, the context's fields (`struct __sk_buff`), `BPF_LD_IMM64` of
+  maps, of BTF IDs and of functions, `BPF_LD_ABS` and `BPF_LD_IND`,
+  atomics, `may_goto`, indirect jumps, a pointer with a variable offset,
+  and `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
+  Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
+  takes a bounded loop from a privileged loader). A scalar is a value the
+  verifier knows or nothing at all, where Linux keeps its bounds, so it
+  walks both ways of a jump Linux knows goes one way, and it prunes no
+  states, so a program with many branches may reach the limits sooner.
+  Where master and the test machines' Linux 7.0 decide differently, it
+  refuses: master takes a larger stack where its JIT can, makes a number
+  of a pointer that any operator is applied to, and takes an exit for
+  unwinding, and 7.0 takes a `BPF_LD_IMM64` with a non-zero `off`. It has
+  only a privileged loader's rules (pointers may leak, the stack may be
+  read before it is written, no Spectre sanitizing), so a loader without
+  `CAP_PERFMON` gets `EPERM` once the type is known. With no BTF objects
+  or keys here, func and line info, CO-RE relocations, `fd_array_cnt` and
+  a signature are refused. The log has no trace of each instruction or
+  state, which Linux writes at levels 1 and 2, and master's diagnostics
+  after an error are not written, so its size (`log_true_size`) is
+  smaller than Linux's. The other program commands (`BPF_PROG_TEST_RUN`
+  and the rest), BTF (`BPF_BTF_LOAD`), links, attachment, pins
+  (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of programs, BTF and links
   (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID` and the rest), tokens,
   iterators and statistics are `ENOSYS`, as each command Linux has that is
   not here; a number Linux has no command for is `EINVAL`, as there. So
-  libbpf's trivial-program probe fails with `EINVAL` and it finds no
-  program type it can load, and `bpftool feature` finds the `bpf()` system
-  call but no program types. The other map types are `EINVAL`,
+  libbpf's trivial-program probe loads a socket filter and finds no other
+  program type, and `bpftool feature` finds socket filters but no
+  helpers. The other map types are `EINVAL`,
   as on a kernel built without them; the per-CPU ones
   (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
   be compared with Linux anyway, as their values are one per possible CPU,
@@ -569,11 +611,6 @@ verified.
     attachment back the flags of the piece next to it makes a piece of its
     own, which counts as an attachment, where recent Linux moves the
     boundary between the two.
-  - A segment's `shm_lpid` is that of the process that last attached a
-    segment in the address space, or the one a `fork` made it for: a child
-    that shares its parent's memory without being a thread of it
-    (`CLONE_VM`, `vfork`) stamps the segment as that process, where Linux
-    stamps it as the process that acts.
 - **Extended attributes**: a mounted host directory behaves as a file system
   without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
   In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), so it
@@ -632,10 +669,14 @@ verified.
   count from 1 among this machine's mounts alone, where Linux's are
   shared with the host's. `propagate_from:` is found from the namespace's
   root, not the reader's after `chroot`. `MS_RDONLY` (`EROFS`), `noexec`,
-  `nodev` and `nosuid` are enforced, but a tmpfs mount's `size`,
-  `nr_blocks` and `nr_inodes` are reported and not enforced (it fills up
-  only as the in-memory filesystem does, never `ENOSPC` at its size), nor
-  are the atime flags, `sync`, `dirsync` and `mand`; no mount here holds a
+  `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
+  `nr_blocks` and `nr_inodes`, but not for what a mapping writes (a write
+  fault past the size is no `SIGBUS`, and the pages go back to the file
+  whatever its size), and its extended attributes take none of the inodes'
+  room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
+  counts them, does not happen); the root from start-up has no limit but
+  `fallocate`'s, the memory reported. Not enforced either are the atime
+  flags, `sync`, `dirsync` and `mand`; no mount here holds a
   device node but a host directory's (`mknod` of one is `EPERM`), so
   `nodev` only refuses those;
   `huge`, `mpol`, `noswap` and the quota options are taken, checked as
@@ -766,10 +807,7 @@ verified.
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages, write protection and the minor
-  faults of shmem are registered. Not offered is `PAGEMAP_SCAN`, the
-  `/proc/<pid>/pagemap` ioctl that finds and protects again the pages
-  `UFFD_FEATURE_WP_ASYNC` saw written; their bit 57 in
-  `/proc/<pid>/pagemap` tells them. A discard tells of all its ranges
+  faults of shmem are registered. A discard tells of all its ranges
   before it drops the pages of any, where Linux tells and drops VMA by VMA,
   and registered mappings of one `userfaultfd` that meet are one range of
   `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of

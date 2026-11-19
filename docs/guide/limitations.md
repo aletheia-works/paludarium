@@ -57,7 +57,8 @@ verified.
   those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
+  `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`). A page of a host file
+  that `write` filled is clean (see "Pages `write` filled" below).
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
@@ -230,6 +231,11 @@ verified.
   open with `O_APPEND` do not reach the file. The end of a mapped file, past
   which a page raises `SIGBUS`, is the size the guest's own file operations
   give it, so a host program changing the size does not move it.
+- **Pages `write` filled**: a page of a host file that `write` (or another
+  system call) filled is clean at once, as the data goes straight to the
+  file on the host, so a mapping of it counts it among the clean pages in
+  `smaps`. On Linux it stays dirty in the page cache until writeback, and
+  `smaps` counts it among the dirty ones until then.
 - **Mappings that grow down**: such a mapping grows when the guest's own
   code touches a page below it or a signal frame is written there
   ([features](./features#system-calls)), but not when a system call reads or

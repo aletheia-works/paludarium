@@ -38,8 +38,11 @@ pub trait CompiledBlock: Send + Sync {
     /// before an instruction whose form would fail, changing nothing for
     /// it, so that the interpreter runs it again and reports the fault; it
     /// stops after a branch that leaves the instructions, and after a load
-    /// or store after which [`AddressSpace::code_generation_cached`] is not
-    /// `generation`.
+    /// or store through `mem` after which
+    /// [`AddressSpace::code_generation_cached`] is not `generation`. A load
+    /// or store that touches a page's bytes itself, which the native JIT's
+    /// do where the MMU allows, never moves the generation; one that
+    /// another thread moves meanwhile shows after it returns.
     fn run(&self, state: &mut CpuState, mem: &AddressSpace, generation: u64) -> usize;
 
     /// The number of instructions it holds; [`CompiledBlock::run`] runs

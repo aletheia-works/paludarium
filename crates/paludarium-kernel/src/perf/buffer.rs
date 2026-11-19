@@ -407,7 +407,8 @@ pub(super) fn set_output(event: &Arc<Event>, output: Option<&Arc<Event>>) -> Res
         if lock(&event.mapped).upgrade().is_some() {
             return Err(Errno::EINVAL);
         }
-        attach(event, None);
+        let old = lock(&event.rb).take();
+        leave(event, old);
         return Ok(());
     };
     let same_task = || match (&event.target, &output.target) {
@@ -436,26 +437,30 @@ pub(super) fn set_output(event: &Arc<Event>, output: Option<&Arc<Event>>) -> Res
         return Err(Errno::EINVAL);
     }
     let rb = lock(&output.rb).clone().ok_or(Errno::EINVAL)?;
-    // A buffer whose last mapping went as this began takes no event.
-    let mut events = lock(&rb.events);
-    let Some(list) = events.as_mut() else {
-        return Err(Errno::EINVAL);
-    };
-    let already = lock(&event.rb)
-        .as_ref()
-        .is_some_and(|old| Arc::ptr_eq(old, &rb));
-    if !already {
+    // `ring_buffer_attach`: the event joins the buffer's list and writes
+    // to it under the list's lock, so that a last unmapping either finds
+    // it there writing to the buffer, or has already left the buffer
+    // taking no more events (`EINVAL`).
+    let old = {
+        let mut events = lock(&rb.events);
+        let Some(list) = events.as_mut() else {
+            return Err(Errno::EINVAL);
+        };
+        let mut current = lock(&event.rb);
+        if current.as_ref().is_some_and(|old| Arc::ptr_eq(old, &rb)) {
+            return Ok(());
+        }
         list.push(erase(event));
-        drop(events);
-        attach(event, Some(rb));
-    }
+        current.replace(Arc::clone(&rb))
+    };
+    leave(event, old);
     Ok(())
 }
 
-/// `ring_buffer_attach`: `event` leaves the buffer it wrote to and writes
-/// to `rb`, which already lists it.
-fn attach(event: &Arc<Event>, rb: Option<Arc<Buffer>>) {
-    let old = std::mem::replace(&mut *lock(&event.rb), rb);
+/// Takes `event` off the list of `old`, the buffer it wrote to, with no
+/// other lock held: two events that change places between two buffers
+/// would otherwise take the two lists' locks in opposite orders.
+fn leave(event: &Arc<Event>, old: Option<Arc<Buffer>>) {
     if let Some(old) = old
         && let Some(list) = lock(&old.events).as_mut()
     {

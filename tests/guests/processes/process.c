@@ -12006,6 +12006,141 @@ static int dev_shm_case(void) {
     return 0;
 }
 
+/* The tree-namespace case: open_tree's OPEN_TREE_NAMESPACE (Linux 7.0's
+   and master's create_new_namespace) in a mount namespace of a user
+   namespace of its own: a descriptor of a new mount namespace whose root
+   is a copy of a tmpfs mount, without and with AT_RECURSIVE, which setns
+   enters, and the locked copies a nested user namespace's makes. In the
+   new namespace mountinfo is read from a /proc descriptor opened before,
+   as no /proc is mounted there. */
+static char tn_base[] = "/tmp/paludarium-treens-XXXXXX";
+#define TN_NAMESPACE 2
+#define TN_RECURSIVE 0x8000
+static long tn_tree(const char *path, unsigned flags) { return syscall(428, AT_FDCWD, path, flags); }
+static int tn_proc = -1;
+/* Each mount's root, mount point and type, then whether the first's
+   parent is listed and each other's parent is the first. */
+static void tn_mounts(const char *label) {
+    long ids[64], parents[64];
+    char roots[64][128], points[64][128], types[64][32], line[4096];
+    int n = 0;
+    int fd = openat(tn_proc, "mountinfo", O_RDONLY);
+    FILE *f = fd < 0 ? NULL : fdopen(fd, "r");
+    while (f && n < 64 && fgets(line, sizeof line, f)) {
+        char *dash = strstr(line, " - ");
+        if (dash && sscanf(line, "%ld %ld %*s %127s %127s", &ids[n], &parents[n], roots[n], points[n]) == 4 &&
+            sscanf(dash, " - %31s", types[n]) == 1)
+            n++;
+    }
+    if (f) fclose(f);
+    printf("%s n=%d", label, n);
+    for (int i = 0; i < n; i++) {
+        int listed = 0;
+        for (int j = 0; j < n; j++) listed |= ids[j] == parents[i];
+        printf(" [%s %s %s %s]", roots[i], points[i], types[i],
+               i == 0 ? (listed ? "parent-listed" : "parent-hidden") : (parents[i] == ids[0] ? "on-root" : "elsewhere"));
+    }
+    printf("\n");
+}
+static int tn_inner(void) {
+    char a[256], path[512], link[256], own[256];
+    snprintf(a, sizeof a, "%s/a", tn_base);
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/x", a);
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    snprintf(path, sizeof path, "%s/in", a);
+    mkdir(path, 0755);
+    RM("in", mount("none", path, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/in/y", a);
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    printf("\n");
+    tn_proc = open("/proc/self", O_RDONLY | O_DIRECTORY);
+    struct stat at, st;
+    stat(a, &at);
+    printf("open_tree");
+    RM("both", tn_tree(a, TN_NAMESPACE | 1));
+    long flat = tn_tree(a, TN_NAMESPACE);
+    long deep = tn_tree(a, TN_NAMESPACE | TN_RECURSIVE | O_CLOEXEC);
+    printf(" flat=%d deep=%d", flat >= 0 ? 1 : errno, deep >= 0 ? 1 : errno);
+    if (flat < 0 || deep < 0) {
+        printf("\n");
+        return 1;
+    }
+    printf(" flat-cloexec=%d deep-cloexec=%d", fcntl((int)flat, F_GETFD), fcntl((int)deep, F_GETFD));
+    snprintf(path, sizeof path, "/proc/self/fd/%ld", flat);
+    ssize_t n = readlink(path, link, sizeof link - 1);
+    link[n < 0 ? 0 : n] = 0;
+    n = readlink("/proc/self/ns/mnt", own, sizeof own - 1);
+    own[n < 0 ? 0 : n] = 0;
+    printf(" link-mnt=%d other=%d\n", !strncmp(link, "mnt:[", 5), strcmp(link, own) != 0);
+    printf("flat setns=%d", mt_result(syscall(SYS_setns, (int)flat, CLONE_NEWNS)));
+    n = readlink("/proc/self/ns/mnt", own, sizeof own - 1);
+    own[n < 0 ? 0 : n] = 0;
+    fstat((int)flat, &st);
+    struct stat ns;
+    fstatat(tn_proc, "ns/mnt", &ns, 0);
+    char cwd[256];
+    printf(" entered=%d same-ino=%d cwd=%s", !strcmp(link, own), st.st_ino == ns.st_ino,
+           getcwd(cwd, sizeof cwd) ? cwd : "-");
+    stat("/", &st);
+    printf(" root-dev=%d", st.st_dev == at.st_dev);
+    RM("x", access("/x", F_OK));
+    RM("in", access("/in", F_OK));
+    RM("in-y", access("/in/y", F_OK));
+    printf("\n");
+    tn_mounts("flat");
+    printf("deep setns=%d", mt_result(syscall(SYS_setns, (int)deep, CLONE_NEWNS)));
+    RM("in-y", access("/in/y", F_OK));
+    printf("\n");
+    tn_mounts("deep");
+    close((int)flat);
+    close((int)deep);
+    /* From a nested user namespace the copies are locked. */
+    printf("nested unshare=%d", mt_result(syscall(SYS_unshare, CLONE_NEWUSER)));
+    long locked = tn_tree("/", TN_NAMESPACE | TN_RECURSIVE);
+    printf(" locked=%d", locked >= 0 ? 1 : errno);
+    if (locked >= 0) {
+        printf(" setns=%d", mt_result(syscall(SYS_setns, (int)locked, CLONE_NEWNS)));
+        RM("umount-in", umount2("/in", 0));
+        RM("in-y", access("/in/y", F_OK));
+        close((int)locked);
+    }
+    printf("\n");
+    tn_mounts("locked");
+    return 0;
+}
+static int tree_namespace_case(void) {
+    if (!mkdtemp(tn_base)) return 93;
+    chmod(tn_base, 0755);
+    char path[256];
+    snprintf(path, sizeof path, "%s/a", tn_base);
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(tn_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(tn_base) == 0);
+    return 0;
+}
+
 /* The tmpfs-limits case: a tmpfs mount's size and inodes hold its files,
    in a mount namespace of a user namespace of its own, and the statfs
    flags of /proc and /dev. Only errno values, counts and flags are
@@ -32837,6 +32972,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
+    if (!strcmp(mode, "tree-namespace")) return tree_namespace_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "propagation")) return propagation_case();
     if (!strcmp(mode, "mount-flags-id")) {

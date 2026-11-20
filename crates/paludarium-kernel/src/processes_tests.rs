@@ -2758,6 +2758,113 @@ mod namespaces {
             Errno(87).to_syscall_return()
         );
     }
+    /// `open_tree` with `OPEN_TREE_NAMESPACE` gives a new mount namespace
+    /// whose root is a copy of the mount at the path, with `AT_RECURSIVE`
+    /// the mounts below it too, which `setns` enters; of another user
+    /// namespace's mount namespace, the copies are locked.
+    #[test]
+    fn open_tree_namespace_makes_a_namespace_of_a_copy() {
+        let (mut k, mut t, m) = setup();
+        let put = |m: &AddressSpace, at: u64, text: &str| {
+            m.write(GuestAddr(DATA + at), format!("{text}\0").as_bytes())
+                .unwrap();
+            DATA + at
+        };
+        let (none, tmpfs) = (put(&m, 0, "none"), put(&m, 0x10, "tmpfs"));
+        let (tree, inner) = (put(&m, 0x20, "/tree"), put(&m, 0x40, "/tree/in"));
+        let (file, deep) = (put(&m, 0x60, "/tree/f"), put(&m, 0x80, "/tree/in/y"));
+        let call = |k: &mut Kernel, t: &mut Thread, n: u64, a: &[u64]| {
+            let mut all = [0; 6];
+            all[..a.len()].copy_from_slice(a);
+            syscall(k, t, &m, n, all)
+        };
+        assert_eq!(call(&mut k, &mut t, 83, &[tree, 0o755]), 0);
+        assert_eq!(call(&mut k, &mut t, 165, &[none, tree, tmpfs, 0, 0]), 0);
+        assert_eq!(call(&mut k, &mut t, 83, &[inner, 0o755]), 0);
+        assert_eq!(call(&mut k, &mut t, 165, &[none, inner, tmpfs, 0, 0]), 0);
+        for path in [file, deep] {
+            let fd = call(&mut k, &mut t, 2, &[path, 0o101, 0o644]);
+            assert!(fd < 1024);
+            assert_eq!(call(&mut k, &mut t, 3, &[fd]), 0);
+        }
+        let fdcwd = (-100i64) as u64;
+        let (namespace, recursive, cloexec) = (2, 0x8000, 0o2_000_000);
+        // A file is ENOTDIR (Linux master's create_new_namespace), the
+        // generated /proc not supported.
+        assert_eq!(
+            call(&mut k, &mut t, 428, &[fdcwd, file, namespace]),
+            Errno::ENOTDIR.to_syscall_return()
+        );
+        let proc = put(&m, 0xa0, "/proc");
+        assert_eq!(
+            call(&mut k, &mut t, 428, &[fdcwd, proc, namespace]),
+            Errno::EOPNOTSUPP.to_syscall_return()
+        );
+        let alone = call(&mut k, &mut t, 428, &[fdcwd, tree, namespace]);
+        assert!(alone < 1024, "{}", alone as i64);
+        let all = call(
+            &mut k,
+            &mut t,
+            428,
+            &[fdcwd, tree, namespace | recursive | cloexec],
+        );
+        assert!(all < 1024, "{}", all as i64);
+        assert_eq!(call(&mut k, &mut t, 72, &[alone, 1]), 0);
+        assert_eq!(call(&mut k, &mut t, 72, &[all, 1]), 1);
+        let first = link(&mut k, &mut t, &m, "/proc/self/ns/mnt");
+        let theirs = link(&mut k, &mut t, &m, &format!("/proc/self/fd/{alone}"));
+        assert!(theirs.starts_with(b"mnt:[") && theirs != first);
+        let mountinfo = |k: &mut Kernel, t: &mut Thread| {
+            let path = put(&m, 0x100, "/proc/self/mountinfo");
+            let fd = syscall(k, t, &m, 2, [path, 0, 0, 0, 0, 0]);
+            let n = syscall(k, t, &m, 0, [fd, DATA + 0x400, 0xc00, 0, 0, 0]);
+            assert_eq!(syscall(k, t, &m, 3, [fd, 0, 0, 0, 0, 0]), 0);
+            let mut bytes = vec![0; n as usize];
+            m.read(GuestAddr(DATA + 0x400), &mut bytes).unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        // The first namespace is as it was.
+        assert_eq!(mountinfo(&mut k, &mut t).lines().count(), 5);
+        // In the copy without recursion, the tmpfs is the root, and the
+        // mount below is not there.
+        let (top, below) = (put(&m, 0xc0, "/f"), put(&m, 0xe0, "/in/y"));
+        let stat = DATA + 0x200;
+        assert_eq!(call(&mut k, &mut t, 308, &[alone, NEWNS]), 0);
+        assert_eq!(link(&mut k, &mut t, &m, "/proc/self/ns/mnt"), theirs);
+        assert_eq!(call(&mut k, &mut t, 4, &[top, stat]), 0);
+        assert_eq!(
+            call(&mut k, &mut t, 4, &[below, stat]),
+            Errno::ENOENT.to_syscall_return()
+        );
+        let (procs, null) = (put(&m, 0x160, "/proc/self"), put(&m, 0x180, "/dev/null"));
+        // The generated /proc and /dev stay at its /proc and /dev, where
+        // Linux has them only where the copy mounts them (a limitation).
+        assert_eq!(call(&mut k, &mut t, 4, &[procs, stat]), 0);
+        assert_eq!(call(&mut k, &mut t, 4, &[null, stat]), 0);
+        let info = mountinfo(&mut k, &mut t);
+        assert_eq!(info.lines().count(), 1, "{info}");
+        assert!(info.contains(" / / rw,relatime - tmpfs none "), "{info}");
+        // With it, the mount below comes along.
+        assert_eq!(call(&mut k, &mut t, 308, &[all, 0]), 0);
+        assert_eq!(call(&mut k, &mut t, 4, &[below, stat]), 0);
+        let info = mountinfo(&mut k, &mut t);
+        assert_eq!(info.lines().count(), 2, "{info}");
+        assert!(info.contains(" / /in rw,relatime - tmpfs none "), "{info}");
+        // From a new user namespace, a copy of a mount with one below it
+        // needs AT_RECURSIVE (EINVAL), and its copies are locked.
+        assert_eq!(call(&mut k, &mut t, 272, &[NEWUSER]), 0);
+        let root = put(&m, 0x120, "/");
+        assert_eq!(
+            call(&mut k, &mut t, 428, &[fdcwd, root, namespace]),
+            einval()
+        );
+        let locked = call(&mut k, &mut t, 428, &[fdcwd, root, namespace | recursive]);
+        assert!(locked < 1024, "{}", locked as i64);
+        assert_eq!(call(&mut k, &mut t, 308, &[locked, NEWNS]), 0);
+        let inside = put(&m, 0x140, "/in");
+        assert_eq!(call(&mut k, &mut t, 166, &[inside, 0]), einval());
+        assert_eq!(call(&mut k, &mut t, 4, &[below, stat]), 0);
+    }
     #[test]
     fn clone_ignores_the_upper_half_of_its_flags() {
         // sys_clone keeps the low 32 bits: the bit clone3's CLONE_NEWTIME

@@ -625,6 +625,18 @@ impl Namespaces {
             Some(Arc::clone(owner)),
         )
     }
+    /// A new mount namespace that `owner` owns, with `table`'s mounts, as
+    /// `open_tree`'s `OPEN_TREE_NAMESPACE` makes one (`alloc_mnt_ns`).
+    pub(crate) fn new_mount(
+        &self,
+        owner: &Arc<Namespace>,
+        table: Arc<paludarium_vfs::MountTable>,
+    ) -> Arc<Namespace> {
+        let new = self.fresh(&self.mnt, owner);
+        table.set_owner(Arc::clone(owner) as Arc<dyn std::any::Any + Send + Sync>);
+        let _ = new.mounts.set(table);
+        new
+    }
     /// The next inode number, for a new user namespace.
     pub(crate) fn next_inode(&self) -> u32 {
         self.inodes.fetch_add(1, Ordering::SeqCst)

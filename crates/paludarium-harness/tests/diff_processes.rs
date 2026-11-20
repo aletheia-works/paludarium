@@ -881,6 +881,7 @@ mod linux {
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_dev_shm => ("dev-shm","process"),
+        processes_tree_namespace => ("tree-namespace","process"),
         processes_beneath => ("beneath","process"),
         processes_propagation => ("propagation","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),

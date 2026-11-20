@@ -572,8 +572,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   tmpfs の `MS_NOSYMFOLLOW` とマウントし直しで付ける `MS_NOSYMFOLLOW`、生成される
   `/proc` や `/dev`（とその中のファイル。`/dev/shm` とその下を除く）へのマウントやその移動、パスのないファイルへの
   ディスクリプタのリンクのバインドマウントは
-  `EOPNOTSUPP` で、プログラムはできないことを知れます。`open_tree` の
-  `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）、`fsmount` の
+  `EOPNOTSUPP` で、プログラムはできないことを知れます。`fsmount` の
   `FSMOUNT_NAMESPACE`（Linux master で新しいもの）と
   tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick`、ID を
   マップしたマウント（`mount_setattr` と `open_tree_attr` の `MOUNT_ATTR_IDMAP`。その
@@ -649,7 +648,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   下の `--mount` は外せないままです。新しいルートが `--mount` なら、`put_old` の下の元の
   場所にもそのファイルが見えます。Linux はそれが覆っていたディレクトリーを見せます。
   生成される `/proc` と `/dev` は、`pivot_root` のあともルートの `/proc` と `/dev` に
-  あります。Linux では古いルートとともに `put_old` に行きます。移動と `pivot_root` は
+  あります。Linux では古いルートとともに `put_old` に行きます。`open_tree` の
+  `OPEN_TREE_NAMESPACE` で作った名前空間でも `/proc` と `/dev` にあります。Linux では
+  写しにそれらのマウントがあるところにだけあります。移動と `pivot_root` は
   ルートと作業ディレクトリーを一緒に動かしますが、開いたディスクリプタは、パスで行う
   こと（`fchdir`、そこからの探索）には開いたときのパスを使います。マウントは
   マウントポイントのパスで持つので、名前の変更がディレクトリの下のマウントを動かすのは

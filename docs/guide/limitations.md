@@ -675,8 +675,7 @@ verified.
   remount, a mount on or a move of the generated `/proc` or `/dev` (or a
   file in them, but for `/dev/shm` and what is below it), and a bind mount of a descriptor's link to a file no path
   names, give `EOPNOTSUPP`, so a program
-  learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
-  (new in Linux master), `fsmount`'s
+  learns they are not supported, as do `fsmount`'s
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
   a tmpfs, `fspick` of `/proc` or `/dev`, and an idmapped mount
   (`mount_setattr`'s and `open_tree_attr`'s `MOUNT_ATTR_IDMAP`, after the
@@ -762,7 +761,9 @@ verified.
   its files at its old place under `put_old` too, where Linux shows
   the directory it covered. The generated `/proc` and `/dev` stay at the
   root's `/proc` and `/dev` after `pivot_root`, where Linux's go to
-  `put_old` with the old root. A move or a `pivot_root` takes the roots
+  `put_old` with the old root, and at `/proc` and `/dev` in a namespace
+  from `open_tree`'s `OPEN_TREE_NAMESPACE`, where Linux has them only
+  where the copy has their mounts. A move or a `pivot_root` takes the roots
   and working directories along, but an open descriptor keeps the path it
   was opened at for what it does by path (`fchdir`, a lookup from it).
   Mounts are kept by their mount

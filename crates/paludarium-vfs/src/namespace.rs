@@ -1493,7 +1493,10 @@ impl NamespacedFs {
     /// (`copy_tree`) the mounts below it too, each still locked if it
     /// was, but for unbindable ones and what is on them (`EPERM` for a
     /// locked one). An unbindable mount is `EINVAL`, and without `recurse`
-    /// a locked one below it too (`has_locked_children`).
+    /// a locked one below it too (`has_locked_children`). With `foreign`
+    /// (`CL_SLAVE | CL_COPY_UNBINDABLE`, for a namespace of another user
+    /// namespace) each copy is a slave of its peer group instead of a peer,
+    /// and the unbindable mounts below come along too.
     fn copies(
         &self,
         entries: &[Entry],
@@ -1501,6 +1504,7 @@ impl NamespacedFs {
         parent: u64,
         at: &[u8],
         recurse: bool,
+        foreign: bool,
     ) -> Result<Vec<Entry>, Errno> {
         let old = self.entry(entries, from);
         if old.unbindable {
@@ -1517,7 +1521,7 @@ impl NamespacedFs {
             self.backing(entries, from).1,
             parent,
             at.to_vec(),
-            false,
+            foreign,
         );
         let mut new = vec![Entry {
             locked: false,
@@ -1530,14 +1534,14 @@ impl NamespacedFs {
             let mut copies = BTreeMap::from([(old.id(), new[0].id())]);
             let mut queue: Vec<&Entry> = entries.iter().filter(|e| below(e)).rev().collect();
             while let Some(e) = queue.pop() {
-                if e.unbindable {
+                if e.unbindable && !foreign {
                     if e.locked {
                         return Err(Errno::EPERM);
                     }
                     continue;
                 }
                 let point = joined(at, &relative(&from.path, &e.point));
-                let copy = e.cloned(numbers, e.root.clone(), copies[&e.parent], point, false);
+                let copy = e.cloned(numbers, e.root.clone(), copies[&e.parent], point, foreign);
                 copies.insert(e.id(), copy.id());
                 new.push(copy);
                 queue.extend(
@@ -1567,7 +1571,7 @@ impl NamespacedFs {
         let from = self.walk(&entries, source, true, false, true)?;
         let to = self.walk(&entries, target, true, false, true)?;
         let parent = self.entry(&entries, &to);
-        let mut new = self.copies(&entries, &from, parent.id(), &to.path, recurse)?;
+        let mut new = self.copies(&entries, &from, parent.id(), &to.path, recurse, false)?;
         let directory = |loc: &Loc| -> Result<bool, Errno> {
             Ok(self.lstat(&entries, loc)?.mode & S_IFMT == S_IFDIR)
         };
@@ -1619,7 +1623,7 @@ impl NamespacedFs {
         self.swept();
         let entries = self.table.snapshot();
         let from = self.walk(&entries, source, follow, false, true)?;
-        let mut new = self.copies(&entries, &from, 0, b"/", recurse)?;
+        let mut new = self.copies(&entries, &from, 0, b"/", recurse, false)?;
         let id = new[0].id();
         let point = [&b"/\0"[..], id.to_string().as_bytes()].concat();
         for e in &mut new {
@@ -1632,6 +1636,94 @@ impl NamespacedFs {
             Ok(())
         })?;
         Ok((point, pin))
+    }
+    /// `open_tree` with `OPEN_TREE_NAMESPACE` (`create_new_namespace`): a
+    /// new namespace's table, whose root is a copy of the mount at the
+    /// resolved `source` (its last link followed with `follow`), rooted
+    /// there, with `recurse` (`AT_RECURSIVE`) the mounts below it too, as
+    /// `__do_loopback` makes for a bind mount, on a mount below it that no
+    /// list shows (Linux's copy of its nullfs). A source that is not a
+    /// directory is `ENOTDIR`. With `foreign` (the caller's user namespace
+    /// is not the one that owns this namespace) the copies are slaves, the
+    /// unbindable mounts below come along, a copy without `recurse` of a
+    /// mount with mounts below the source is `EINVAL`, as it would show
+    /// what they cover, and each copy is locked with its flags
+    /// (`lock_mnt_tree`). The root is locked too when this namespace's
+    /// root is.
+    pub fn new_namespace(
+        &self,
+        source: &[u8],
+        follow: bool,
+        recurse: bool,
+        foreign: bool,
+    ) -> Result<Arc<MountTable>, Errno> {
+        self.swept();
+        let entries = self.table.snapshot();
+        let from = self.walk(&entries, source, follow, false, true)?;
+        if self.lstat(&entries, &from)?.mode & S_IFMT != S_IFDIR {
+            return Err(Errno::ENOTDIR);
+        }
+        let numbers = &self.table.numbers;
+        let namespace = numbers.namespace_id();
+        let below = numbers.unique();
+        let root = &entries[Self::root_index(&entries)];
+        let old = self.entry(&entries, &from);
+        if foreign
+            && !recurse
+            && entries
+                .iter()
+                .any(|e| e.parent == old.id() && e.id() != old.id() && within(&e.point, &from.path))
+        {
+            return Err(Errno::EINVAL);
+        }
+        let mut new = self.copies(&entries, &from, root.parent, b"/", recurse, foreign)?;
+        new[0].locked |= root.locked;
+        if foreign {
+            for e in &mut new {
+                e.locked = true;
+                e.locks = lock_flags(e.flags, e.locks);
+            }
+        }
+        let (kind, device) = entries
+            .iter()
+            .find_map(|e| match e.backing {
+                Backing::Boot { kind, device } => Some((kind, device)),
+                _ => None,
+            })
+            .unwrap_or(("rootfs", 0));
+        let hidden = Entry {
+            token: Token::numbered(root.parent, below, numbers, None, Arc::default()),
+            parent: root.parent,
+            point: b"/".to_vec(),
+            backing: Backing::Boot { kind, device },
+            root: b"/".to_vec(),
+            flags: mount_flags::RELATIME,
+            locks: 0,
+            locked: false,
+            source: Vec::new(),
+            group: 0,
+            master: 0,
+            unbindable: false,
+            hidden: true,
+        };
+        new.insert(0, hidden);
+        let table = MountTable::registered(MountTable {
+            entries: RwLock::new(Arc::new(Vec::new())),
+            boot_only: AtomicBool::new(false),
+            generated: AtomicBool::new(false),
+            devices_only: AtomicBool::new(false),
+            lower_points: Arc::clone(&self.table.lower_points),
+            unmount_hook: Mutex::default(),
+            below,
+            namespace,
+            owner: Mutex::default(),
+            numbers: Arc::clone(numbers),
+        });
+        table.update(|entries| {
+            *entries = new;
+            Ok(())
+        })?;
+        Ok(table)
     }
     /// `move_mount` with `MOVE_MOUNT_SET_GROUP` (`do_set_group`): the
     /// mount at the resolved `to` joins the peer group, and takes the

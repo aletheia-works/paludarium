@@ -380,8 +380,11 @@ fn maybe_empty(c: &Context<'_>, ptr: u64, empty: bool) -> Result<Vec<u8>, Errno>
 /// copy of its mount, with `AT_RECURSIVE` of the mounts below it too, in a
 /// tree of its own ([`paludarium_vfs::NamespacedFs::clone_tree`]) that
 /// goes with the descriptor's last close unless `move_mount` attached it.
-/// `OPEN_TREE_NAMESPACE`, new in Linux master, and a copy of `/proc` or
-/// `/dev`, which the kernel generates, are not supported (`EOPNOTSUPP`).
+/// With `OPEN_TREE_NAMESPACE` it gives a descriptor of a new mount
+/// namespace of the caller's user namespace, whose root is such a copy
+/// ([`paludarium_vfs::NamespacedFs::new_namespace`], `open_new_namespace`),
+/// which `setns` enters. A copy of `/proc` or `/dev`, which the kernel
+/// generates, is not supported (`EOPNOTSUPP`).
 fn open_tree(c: &mut Context<'_>, dfd: u64, ptr: u64, flags: u64) -> Result<u64, Errno> {
     let known = AT_EMPTY_PATH
         | AT_NO_AUTOMOUNT
@@ -413,10 +416,24 @@ fn open_tree(c: &mut Context<'_>, dfd: u64, ptr: u64, flags: u64) -> Result<u64,
     let empty = flags & AT_EMPTY_PATH != 0;
     let raw = maybe_empty(c, ptr, empty)?;
     let found = crate::files::mount_at(c, dfd, raw.clone(), follow, empty)?;
-    if flags & OPEN_TREE_NAMESPACE != 0 {
-        return Err(Errno::EOPNOTSUPP);
-    }
     let cloexec = flags & O_CLOEXEC;
+    if flags & OPEN_TREE_NAMESPACE != 0 {
+        let found = found.ok_or(Errno::EOPNOTSUPP)?;
+        let owner = Arc::clone(&c.process.credentials.user.0);
+        let foreign = !std::ptr::eq(namespaces.mnt.owner(), &*owner);
+        let table = c.files.namespaced().new_namespace(
+            &found,
+            follow,
+            flags & AT_RECURSIVE != 0,
+            foreign,
+        )?;
+        let namespace = namespaces.new_mount(&owner, table);
+        let file = crate::namespaces::NamespaceFile::new(namespace, 0);
+        return c
+            .files
+            .install(Arc::new(file), cloexec != 0, c.group.nofile())
+            .map(u64::from);
+    }
     if flags & OPEN_TREE_CLONE == 0 {
         // The file itself, as an `O_PATH` open of it.
         let (dir, raw) = match (raw.is_empty(), dfd == AT_FDCWD) {

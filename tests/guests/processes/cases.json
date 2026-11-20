@@ -399,6 +399,7 @@
     {"name":"tmpfs-limits","binary":"process"},
     {"name":"generated-noexec","binary":"process"},
     {"name":"dev-shm","binary":"process"},
+    {"name":"tree-namespace","binary":"process"},
     {"name":"beneath","binary":"process"},
     {"name":"propagation","binary":"process"},
     {"name":"proc-other-mounts","binary":"process"},

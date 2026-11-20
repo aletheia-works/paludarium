@@ -1914,7 +1914,19 @@ kernel.
   bind mount copies them) in a tree of its own, which no path and no
   mountinfo reaches, and which goes with the descriptor's last close
   unless `move_mount` attached it. A path from the descriptor goes into
-  the copy, and `..` stays at its root.
+  the copy, and `..` stays at its root. With `OPEN_TREE_NAMESPACE`, which
+  needs `CAP_SYS_ADMIN` in the caller's user namespace (`EPERM`, before
+  the lookup), it gives a descriptor of a new mount namespace that user
+  namespace owns (Linux master's `create_new_namespace`), as
+  `/proc/<pid>/ns/mnt` opens one (`mnt:[...]`), which `setns` enters: its
+  root is a copy of the mount, rooted at the directory named (a file is
+  `ENOTDIR`), with `AT_RECURSIVE` the mounts below it too, on a mount below
+  it that no mountinfo shows (Linux's copy of its nullfs). The root is
+  locked when the caller's namespace's root is. From a mount namespace
+  another user namespace owns, the copies are slaves instead of peers,
+  unbindable mounts below come along, each copy is locked with its flags
+  (`lock_mnt_tree`), and a copy without `AT_RECURSIVE` of a mount with
+  mounts below the directory is `EINVAL`.
 
 - `move_mount` (Linux master's) needs `CAP_SYS_ADMIN` over the mount
   namespace (`EPERM`) and known flags (`EINVAL`, also for

@@ -8704,6 +8704,10 @@ fn dev_shm_is_a_tmpfs_from_start_up() {
     let linked = put(&mut f, 0xc0, b"/tmp/shm/sem.x");
     assert_eq!(f.ret(4, &[linked, out]), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(out)).unwrap(), device);
+    // Extended attributes through the link reach the file too.
+    let (key, value) = (put(&mut f, 0x100, b"user.k"), put(&mut f, 0x120, b"v"));
+    assert_eq!(f.ret(188, &[linked, key, value, 1, 0]), 0);
+    assert_eq!(f.ret(191, &[file, key, out, 16]), 1);
     assert_eq!(f.ret(87, &[file]), 0);
     assert_eq!(f.ret(4, &[file, out]), ENOENT);
     // Another name in `/dev` is still not there.

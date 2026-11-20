@@ -3148,7 +3148,9 @@ impl HostFs for NamespacedFs {
         follow: bool,
         f: &mut dyn FnMut(&mut paludarium_host::Xattrs),
     ) -> Result<(), Errno> {
-        if self.fast_for(path) {
+        // `f` may have run once the file was found, so no second try: only
+        // a file the lower filesystem finds goes straight through.
+        if self.fast_found(path, follow) {
             return self.view.with_xattrs(path, follow, f);
         }
         let entries = self.table.snapshot();
@@ -3162,7 +3164,7 @@ impl HostFs for NamespacedFs {
         follow: bool,
         f: &mut dyn FnMut(&mut u32),
     ) -> Result<(), Errno> {
-        if self.fast_for(path) {
+        if self.fast_found(path, follow) {
             return self.view.with_attributes(path, follow, f);
         }
         let entries = self.table.snapshot();

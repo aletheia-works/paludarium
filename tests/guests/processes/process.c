@@ -12076,7 +12076,8 @@ static int tn_inner(void) {
     own[n < 0 ? 0 : n] = 0;
     printf(" link-mnt=%d other=%d\n", !strncmp(link, "mnt:[", 5), strcmp(link, own) != 0);
     printf("flat setns=%d", mt_result(syscall(SYS_setns, (int)flat, CLONE_NEWNS)));
-    n = readlink("/proc/self/ns/mnt", own, sizeof own - 1);
+    /* The new namespace has no /proc: the link is read from before. */
+    n = readlinkat(tn_proc, "ns/mnt", own, sizeof own - 1);
     own[n < 0 ? 0 : n] = 0;
     fstat((int)flat, &st);
     struct stat ns;

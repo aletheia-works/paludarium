@@ -934,11 +934,10 @@ impl Kernel {
                         continue;
                     }
                 }
-                // A temporary wait mask (rt_sigsuspend, epoll_pwait) ends here
-                // too, so a restarted call sees the original mask again.
-                if let Some(mask) = thread.state.wait_restore_mask.take() {
-                    thread.state.signal_mask = mask;
-                }
+                // A temporary wait mask (rt_sigsuspend, epoll_pwait) stays
+                // through the stop, as Linux puts the saved mask back only
+                // as the signal work ends: a signal it unblocks, sent while
+                // the thread is stopped, is taken as the stop ends.
                 Self::stop_rewind(thread, &restart, rewound);
                 return Next::Stopped;
             }
@@ -1024,7 +1023,11 @@ impl Kernel {
             }
             return Next::Resume;
         }
-        if let Some(mask) = thread.state.wait_restore_mask.take() {
+        // The temporary wait mask ends with no handler run, unless the
+        // thread is still stopped (above).
+        if !thread.state.stopped
+            && let Some(mask) = thread.state.wait_restore_mask.take()
+        {
             thread.state.signal_mask = mask;
         }
         // A call a ptrace stop interrupted runs again when no handler

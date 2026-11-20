@@ -5256,7 +5256,8 @@ one only with an `--allow-net`.
   `epoll_wait`, `epoll_pwait`, `epoll_pwait2` and `rt_sigtimedwait` give
   `EINTR`, as on Linux. `rt_sigsuspend` waits with its mask in place of the signal mask until a
   handler has run, which runs with that mask; the original mask is back after
-  it.
+  it. The mask stays through a stop, as on Linux, so a signal that only it
+  unblocks, sent while the thread is stopped, is taken as the stop ends.
 - A `sigaction` that makes a signal ignored (`SIG_IGN`, or `SIG_DFL` for
   `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH`, which are ignored by
   default) discards its pending instances in the process and in every thread,

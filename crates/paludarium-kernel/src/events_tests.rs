@@ -127,16 +127,14 @@ fn sigsuspend_and_pause_wait_for_a_handler() {
     }
 }
 
-#[test]
-fn sigsuspend_stopped_restores_the_mask_and_restarts() {
+/// Stops a thread inside rt_sigsuspend, whose mask (blocking only signal 4)
+/// lets through SIGALRM, which `original` blocks.
+fn stopped_in_sigsuspend(original: u64) -> Fixture {
     let mut f = Fixture::new();
-    let original = (1 << 13) | (1 << 9);
     f.thread.state.signal_mask = original;
     f.mem.write_u64(GuestAddr(DATA + 128), 1 << 3).unwrap();
     f.kernel.queue_signal(&mut f.thread, 19).unwrap();
     f.thread.cpu.rip = GuestAddr(0x40_1002);
-    // Stopped inside rt_sigsuspend: the original mask is back, and the call
-    // is rewound to run again with its own mask after the continue.
     f.thread.cpu.gpr[reg::RAX] = 130;
     f.thread.cpu.gpr[reg::RDI] = DATA + 128;
     f.thread.cpu.gpr[reg::RSI] = 8;
@@ -147,12 +145,70 @@ fn sigsuspend_stopped_restores_the_mask_and_restarts() {
             rip: GuestAddr(0x40_1002),
         },
     );
+    // The call is rewound, and the suspend mask stays through the stop, as
+    // Linux puts the saved mask back only as the signal work ends.
     assert_eq!(next, Next::Stopped);
     assert_eq!(f.thread.cpu.gpr[reg::RAX], 130);
     assert_eq!(f.thread.cpu.rip, GuestAddr(0x40_1000));
     assert!(f.thread.state.stopped);
+    assert_eq!(f.thread.state.signal_mask, 1 << 3);
+    assert_eq!(f.thread.state.wait_restore_mask, Some(original));
+    f
+}
+
+#[test]
+fn sigsuspend_stopped_keeps_its_mask_and_restarts() {
+    let original = (1 << 13) | (1 << 9);
+    let mut f = stopped_in_sigsuspend(original);
+    // Still stopped: nothing changes.
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Stopped);
+    assert_eq!(f.thread.state.signal_mask, 1 << 3);
+    assert_eq!(f.thread.state.wait_restore_mask, Some(original));
+    // A continue with no signal puts the original mask back, and the call
+    // runs again with its own mask.
+    f.kernel.queue_signal(&mut f.thread, 18).unwrap();
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    assert!(!f.thread.state.stopped);
     assert_eq!(f.thread.state.signal_mask, original);
     assert_eq!(f.thread.state.wait_restore_mask, None);
+    assert_eq!(f.thread.cpu.gpr[reg::RAX], 130);
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x40_1000));
+}
+
+#[test]
+fn sigsuspend_takes_a_signal_its_mask_lets_through_as_the_stop_ends() {
+    for restart in [false, true] {
+        let original = (1 << 13) | (1 << 9);
+        let mut f = stopped_in_sigsuspend(original);
+        f.thread.cpu.gpr[reg::RSP] = DATA + 0x4000;
+        f.thread.state.signal_actions.insert(
+            14,
+            SignalAction {
+                handler: DATA + 0x1000,
+                restorer: DATA + 0x1010,
+                flags: 0x4000000 | if restart { signals::SA_RESTART } else { 0 },
+                mask: 0,
+            },
+        );
+        // SIGALRM comes while the thread is stopped, then the continue.
+        f.kernel.queue_signal(&mut f.thread, 14).unwrap();
+        assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Stopped);
+        f.kernel.queue_signal(&mut f.thread, 18).unwrap();
+        assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+        // The handler runs with the suspend mask and the signal itself; its
+        // frame returns past the call with EINTR and the original mask, even
+        // with SA_RESTART, which does not run rt_sigsuspend again.
+        assert_eq!(f.thread.cpu.rip, GuestAddr(DATA + 0x1000));
+        assert_eq!(f.thread.state.wait_restore_mask, None);
+        assert_eq!(f.thread.state.signal_mask, (1 << 3) | (1 << 13));
+        let frame = f.thread.cpu.gpr[reg::RSP];
+        assert_eq!(f.mem.read_u64(GuestAddr(frame + 304)).unwrap(), original);
+        f.thread.cpu.gpr[reg::RSP] += 8;
+        f.ret(15, [0; 6]);
+        assert_eq!(f.thread.state.signal_mask, original);
+        assert_eq!(f.thread.cpu.rip, GuestAddr(0x40_1002));
+        assert_eq!(f.thread.cpu.gpr[reg::RAX], Errno(4).to_syscall_return());
+    }
 }
 
 #[test]

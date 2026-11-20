@@ -4564,7 +4564,8 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   従って終わり、`pause` は `EINTR` を返します。
   `epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。
-  ハンドラはそのマスクで動き、終わると元のマスクに戻ります。
+  ハンドラはそのマスクで動き、終わると元のマスクに戻ります。Linux と同じく、そのマスクは停止の間も
+  残るので、停止中に送られた、そのマスクだけが通すシグナルは、停止が終わるときに受け取ります。
 - シグナルを無視にする `sigaction`（`SIG_IGN` か、既定で無視される `SIGCHLD`、`SIGCONT`、
   `SIGURG`、`SIGWINCH` への `SIG_DFL`）は、Linux の `do_sigaction` と同じく、プロセスと
   すべてのスレッドで保留中のそのシグナルを捨てます。その後に送られたブロック中の

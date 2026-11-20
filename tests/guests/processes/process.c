@@ -6681,16 +6681,17 @@ static void sch_on_usr2(int sig) {
     (void)sig;
     sch_handled++;
 }
-/* Waits until `pid` is in pause() (call 34 in its syscall file); false
-   when it is not after 5 s. */
-static int sch_pausing(pid_t pid) {
+/* Waits until `pid` is in pause() (call 34 in its syscall file), or the
+   call `call` names ("130 " for rt_sigsuspend); false when it is not after
+   5 s. */
+static int sch_in_call(pid_t pid, const char *call) {
     char path[64], text[64];
     snprintf(path, sizeof path, "/proc/%d/syscall", pid);
     for (int i = 0; i < 5000; i++) {
         int fd = open(path, O_RDONLY);
         ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
         if (fd >= 0) close(fd);
-        if (n > 3 && !memcmp(text, "34 ", 3)) return 1;
+        if (n > (ssize_t)strlen(call) && !memcmp(text, call, strlen(call))) return 1;
         usleep(1000);
     }
     return 0;
@@ -6735,7 +6736,7 @@ static int stop_cont_handler_case(void) {
         char byte;
         if (read(ready[0], &byte, 1) != 1) return 3;
         close(ready[0]);
-        if (!sch_pausing(pid)) printf("%s: not in pause after 5 s\n", name);
+        if (!sch_in_call(pid, "34 ")) printf("%s: not in pause after 5 s\n", name);
         int status;
         if (part == 2) {
             /* PTRACE_SEIZE, the SIGSTOP given back with PTRACE_CONT, the
@@ -6759,6 +6760,59 @@ static int stop_cont_handler_case(void) {
         if (kill(pid, SIGCONT) || kill(pid, SIGUSR2)) return 6;
         printf("%s-exit=%d\n", name, sch_reap(pid));
     }
+    return 0;
+}
+/* A child blocks SIGUSR2 and waits in rt_sigsuspend with a mask that lets
+   it through. The parent stops it, reads its SigBlk (the suspend mask, as
+   Linux keeps it through the stop), sends SIGUSR2 while it is stopped, then
+   SIGCONT: the handler runs as the stop ends, sigsuspend gives EINTR, and
+   SIGUSR2 is blocked again. The child exits 0 for that. */
+static int sigsuspend_stop_case(void) {
+    int ready[2];
+    if (pipe(ready)) return 1;
+    pid_t pid = child();
+    if (pid < 0) return 2;
+    if (pid == 0) {
+        close(ready[0]);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = sch_on_usr2;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGUSR2, &sa, NULL)) _exit(90);
+        sigset_t usr2, none, now;
+        sigemptyset(&usr2);
+        sigaddset(&usr2, SIGUSR2);
+        sigemptyset(&none);
+        if (sigprocmask(SIG_BLOCK, &usr2, NULL)) _exit(91);
+        if (write(ready[1], "r", 1) != 1) _exit(92);
+        long r = syscall(SYS_rt_sigsuspend, &none, 8);
+        int error = errno;
+        if (r != -1) _exit(93);
+        if (error != EINTR) _exit(94);
+        if (sch_handled != 1) _exit(95);
+        if (sigprocmask(SIG_BLOCK, NULL, &now) || !sigismember(&now, SIGUSR2)) _exit(96);
+        _exit(0);
+    }
+    close(ready[1]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 3;
+    close(ready[0]);
+    if (!sch_in_call(pid, "130 ")) printf("not in rt_sigsuspend after 5 s\n");
+    int status;
+    if (kill(pid, SIGSTOP)) return 4;
+    if (waitpid(pid, &status, WUNTRACED) != pid) return 5;
+    printf("stopped=%d\n", WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
+    char path[64], text[4096];
+    snprintf(path, sizeof path, "/proc/%d/status", pid);
+    int fd = open(path, O_RDONLY);
+    ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+    if (fd >= 0) close(fd);
+    text[n > 0 ? n : 0] = 0;
+    char *blocked = strstr(text, "SigBlk:");
+    printf("stopped-%.24s\n", blocked ? blocked : "SigBlk: missing");
+    if (kill(pid, SIGUSR2)) return 6;
+    if (kill(pid, SIGCONT)) return 7;
+    printf("exit=%d\n", sch_reap(pid));
     return 0;
 }
 static int maxrss_exec(const char *start, const char *children) {
@@ -33122,6 +33176,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();
     if (!strcmp(mode, "stop-cont-handler")) return stop_cont_handler_case();
+    if (!strcmp(mode, "sigsuspend-stop")) return sigsuspend_stop_case();
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();

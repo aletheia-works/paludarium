@@ -382,13 +382,13 @@ verified.
   (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of programs, BTF and links
   (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID` and the rest), tokens,
   iterators and statistics are `ENOSYS`, as each command Linux has that is
-  not here; a number Linux has no command for is `EINVAL`, as there. So is
-  a command with master's `BPF_COMMON_ATTRS` (bit 16), which reads a
-  `struct bpf_common_attr` from the fourth and fifth arguments, as the test
-  machines' Linux 7.0 has no such flag: master would run the command. So
+  not here; a number Linux has no command for is `EINVAL`, as there. So
   libbpf's trivial-program probe loads a socket filter and finds no other
   program type, and `bpftool feature` finds socket filters and only the
-  helpers the verifier checks. The other map types are `EINVAL`,
+  helpers the verifier checks. A command with master's `BPF_COMMON_ATTRS`
+  (bit 16) is `EINVAL` too: the test machines' Linux 7.0 has no such flag,
+  though master would read a `struct bpf_common_attr` from the fourth and
+  fifth arguments and run the command. The other map types are `EINVAL`,
   as on a kernel built without them; the per-CPU ones
   (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
   be compared with Linux anyway, as their values are one per possible CPU,

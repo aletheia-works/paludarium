@@ -333,14 +333,17 @@ verified.
   the rest) and there is no interpreter yet. Every other program type is
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are
-  not verified yet", `EINVAL`; a helper call's starts "unknown func #%d",
-  so that libbpf and bpftool take the helper as missing): helpers other
-  than `bpf_map_lookup_elem`, `bpf_map_update_elem` and
-  `bpf_map_delete_elem`, and those for maps of maps, queues, stacks and
-  bloom filters, a helper's argument that is neither on the stack nor in
-  a map's value, bpf-to-bpf calls and kfuncs, the context's fields
-  (`struct __sk_buff`) and a map's own (`struct bpf_map`), maps from
-  `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF IDs
+  not verified yet", `EINVAL`; a helper call's starts "unknown func %s#%d",
+  so that libbpf and bpftool take the helper as missing): the helpers
+  Linux gives a socket filter other than those
+  [Features](./features) lists (`bpf_tail_call`, `bpf_perf_event_output`,
+  `bpf_trace_printk`, the ring buffer, spin locks and the rest), the map
+  helpers of maps of maps, queues, stacks and bloom filters, a helper's
+  size whose value the verifier does not know, `bpf_get_netns_cookie` of
+  a scalar it does not know is 0, bpf-to-bpf calls and kfuncs, the
+  context's socket (`__sk_buff.sk`) and a map's own fields (`struct
+  bpf_map`), maps from `fd_array` and maps made with `excl_prog_hash`,
+  `BPF_LD_IMM64` of BTF IDs
   and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`,
   indirect jumps, a pointer with a variable offset, and
   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
@@ -370,8 +373,8 @@ verified.
   iterators and statistics are `ENOSYS`, as each command Linux has that is
   not here; a number Linux has no command for is `EINVAL`, as there. So
   libbpf's trivial-program probe loads a socket filter and finds no other
-  program type, and `bpftool feature` finds socket filters but no
-  helpers. The other map types are `EINVAL`,
+  program type, and `bpftool feature` finds socket filters and only the
+  helpers the verifier checks. The other map types are `EINVAL`,
   as on a kernel built without them; the per-CPU ones
   (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
   be compared with Linux anyway, as their values are one per possible CPU,

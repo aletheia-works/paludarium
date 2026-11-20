@@ -4345,6 +4345,34 @@ kernel.
   map has `BPF_F_RDONLY_PROG` and not read when it has
   `BPF_F_WRONLY_PROG` (`EACCES`). The program keeps the maps it uses.
 
+- The context, R1 as a program starts, is the packet's `struct
+  __sk_buff`, read and written as Linux lets a socket filter: its 4-byte
+  fields read whole or narrower, at an offset that is a multiple of the
+  read's size, `cb[0]` to
+  `cb[4]` read and written at any size within them, and nothing else
+  written; `data`, `data_end`, `data_meta`, `tc_classid`, the socket's
+  addresses and ports, `tstamp`, `wire_len`, `hwtstamp` and `flow_keys`
+  are not a socket filter's ("invalid bpf_context access off=%d size=%d",
+  `EACCES`). Only the context as it came may be read through or passed to
+  a helper ("dereference of modified ctx ptr R%d off=%d disallowed",
+  `EACCES`), and an instruction that loads or stores through the context
+  on one path may not through another pointer on another ("same insn
+  cannot be used with different pointers", `EINVAL`). Besides the map
+  helpers, a program may call `bpf_skb_load_bytes` and
+  `bpf_skb_load_bytes_relative`, with the context, an offset, a buffer on
+  the stack or in a writable map value and its size, a constant from 1 to
+  2^29 within the buffer (each with Linux's line, `EACCES`, or `EINVAL`
+  for a buffer past the frame); `bpf_get_socket_cookie` and
+  `bpf_get_socket_uid` of the context, `bpf_get_netns_cookie` of the
+  context or 0 ("R1 type=%s expected=ctx", `EACCES`); and the helpers of
+  no arguments: `bpf_ktime_get_ns`, `bpf_ktime_get_boot_ns`,
+  `bpf_ktime_get_coarse_ns`, `bpf_ktime_get_tai_ns`,
+  `bpf_get_prandom_u32`, `bpf_get_smp_processor_id`,
+  `bpf_get_numa_node_id`, `bpf_get_current_pid_tgid` and
+  `bpf_get_current_uid_gid`. A helper a socket filter may not call is
+  "program of this type cannot use helper %s#%d" and a number that is no
+  helper "invalid func %s#%d" (`EINVAL`).
+
 - The log (`log_level`, `log_buf`, `log_size`) gets the line that says
   why a program was refused, in 7.0's words where the two kernels word it
   differently, and the "processed %d insns" line, in a fixed

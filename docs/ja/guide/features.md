@@ -3775,6 +3775,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   収まり（"invalid access to map value"、`EACCES`）、マップが `BPF_F_RDONLY_PROG` なら書けず、
   `BPF_F_WRONLY_PROG` なら読めません（`EACCES`）。プログラムは使うマップを持ち続けます。
 
+- コンテキストは、プログラムが始まるときの R1 で、パケットの `struct __sk_buff` です。
+  Linux がソケットフィルターに許すとおりに読み書きできます。4 バイトのフィールドは、
+  まるごとか、その大きさの倍数のオフセットでより狭く読めます。`cb[0]` から `cb[4]` は、
+  その中に収まればどの大きさでも読み書きでき、ほかは書けません。`data`、`data_end`、
+  `data_meta`、`tc_classid`、ソケットのアドレスとポート、`tstamp`、`wire_len`、`hwtstamp`、
+  `flow_keys` はソケットフィルターのものではありません（"invalid bpf_context access off=%d
+  size=%d"、`EACCES`）。読み書きやヘルパーへの受け渡しに使えるのは、受け取ったままの
+  コンテキストだけです（"dereference of modified ctx ptr R%d off=%d disallowed"、`EACCES`）。
+  ある経路でコンテキストを通して読み書きする命令は、別の経路でほかのポインタを通しては
+  使えません（"same insn cannot be used with different pointers"、`EINVAL`）。マップの
+  ヘルパーのほかに呼べるのは次のものです。`bpf_skb_load_bytes` と
+  `bpf_skb_load_bytes_relative` には、コンテキスト、オフセット、スタックか書き込めるマップの
+  値にあるバッファ、そしてその大きさを渡します。大きさは 1 から 2^29 の定数で、バッファに
+  収まらなければなりません（どれも Linux の行で `EACCES`、フレームの先に出るバッファは
+  `EINVAL`）。`bpf_get_socket_cookie` と `bpf_get_socket_uid` にはコンテキストを、
+  `bpf_get_netns_cookie` にはコンテキストか 0 を渡します（"R1 type=%s expected=ctx"、
+  `EACCES`）。引数のないヘルパーは、`bpf_ktime_get_ns`、`bpf_ktime_get_boot_ns`、
+  `bpf_ktime_get_coarse_ns`、`bpf_ktime_get_tai_ns`、`bpf_get_prandom_u32`、
+  `bpf_get_smp_processor_id`、`bpf_get_numa_node_id`、`bpf_get_current_pid_tgid`、
+  `bpf_get_current_uid_gid` です。ソケットフィルターが呼べないヘルパーは "program of this
+  type cannot use helper %s#%d"、ヘルパーでない番号は "invalid func %s#%d" です（`EINVAL`）。
+
 - ログ（`log_level`、`log_buf`、`log_size`）には、プログラムを断った理由の行（二つの
   カーネルで言い方が違うときは 7.0 の言い方）と "processed %d insns" の行を、固定
   （`BPF_LOG_FIXED`）か回転するバッファに書きます。小さすぎるログは `ENOSPC`、書けないログは

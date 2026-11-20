@@ -15,6 +15,13 @@
    and bpf_map_delete_elem with keys and values on the stack or in a
    value, the null check of a lookup's result, and the bounds and access
    (BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG) of a value.
+   bpf-prog-context: the context, struct __sk_buff, read and written
+   (cb[]) at the offsets and sizes a socket filter may use, and the
+   helpers of a socket filter: bpf_skb_load_bytes and its relative form,
+   the socket's cookie and owner, the network namespace's cookie, and
+   those of no arguments; then helpers a socket filter may not call, and
+   an instruction reached through the context on one path and the stack
+   on another.
 
    Each program refused is wrong in one way only, which both kernels the
    tests know (Linux 7.0, the CI machines', and master) find first, with
@@ -91,6 +98,12 @@ struct insn {
 #define LOOKUP 1
 #define UPDATE 2
 #define DELETE 3
+#define LDX_H(dst, src, off) I(0x69, dst, src, off, 0)
+#define LOAD_BYTES 26
+#define LOAD_BYTES_RELATIVE 68
+#define SOCKET_COOKIE 46
+#define SOCKET_UID 47
+#define NETNS_COOKIE 122
 
 static char log_text[65536];
 
@@ -337,10 +350,64 @@ static int case_maps(void) {
     return 0;
 }
 
+static int case_context(void) {
+    int array = map(2, 4, 8, 1, 0);
+    int rdonly = map(2, 4, 8, 1, 1 << 7);
+    say("maps %d", array > 0 && rdonly > 0);
+
+    /* Programs it takes. R1 is the context as a program starts. */
+    LOAD_MAPS("read len", LDX_W(0, 1, 0), EXIT());
+    LOAD_MAPS("narrow reads", LDX_H(0, 1, 6), LDX_B(2, 1, 11), EXIT());
+    LOAD_MAPS("write and read cb", ST_W(1, 48, 7), MOV(2, 1), STX_W(1, 2, 64), LDX_W(0, 1, 48), EXIT());
+    LOAD_MAPS("cb as 8 bytes", MOV(2, 1), STX_DW(1, 2, 56), LDX_DW(0, 1, 56), EXIT());
+    LOAD_MAPS("context spilled", STX_DW(10, 1, -8), LDX_DW(2, 10, -8), LDX_W(0, 2, 0), EXIT());
+    LOAD_MAPS("context moved and back", ADD(1, 4), ADD(1, -4), LDX_W(0, 1, 0), EXIT());
+    LOAD_MAPS("load bytes to the stack", MOV(2, 0), MOV_REG(3, 10), ADD(3, -16), MOV(4, 16),
+              CALL(LOAD_BYTES), LDX_DW(0, 10, -16), EXIT());
+    LOAD_MAPS("load bytes into a value", MOV_REG(6, 1), KEY4(array), CALL(LOOKUP), JEQ(0, 0, 5),
+              MOV_REG(3, 0), MOV_REG(1, 6), MOV(2, 0), MOV(4, 8), CALL(LOAD_BYTES), MOV(0, 0), EXIT());
+    LOAD_MAPS("load bytes relative", MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV(4, 8), MOV(5, 1),
+              CALL(LOAD_BYTES_RELATIVE), EXIT());
+    LOAD_MAPS("socket cookie and uid", MOV_REG(6, 1), CALL(SOCKET_COOKIE), MOV_REG(1, 6),
+              CALL(SOCKET_UID), EXIT());
+    LOAD_MAPS("netns cookie", CALL(NETNS_COOKIE), MOV(1, 0), CALL(NETNS_COOKIE), EXIT());
+    LOAD_MAPS("helpers of no arguments", CALL(5), CALL(7), CALL(8), CALL(14), CALL(15), CALL(42),
+              CALL(125), CALL(160), CALL(208), EXIT());
+
+    /* Programs it refuses. */
+    LOAD_MAPS("past the context", LDX_W(0, 1, 192), EXIT());
+    LOAD_MAPS("read data", LDX_W(0, 1, 76), EXIT());
+    LOAD_MAPS("8 bytes of len", LDX_DW(0, 1, 0), EXIT());
+    LOAD_MAPS("misaligned field", LDX_W(0, 1, 2), EXIT());
+    LOAD_MAPS("read tstamp_type", LDX_B(0, 1, 180), EXIT());
+    LOAD_MAPS("read flow_keys", LDX_DW(0, 1, 144), EXIT());
+    LOAD_MAPS("write len", MOV(2, 1), STX_W(1, 2, 0), MOV(0, 0), EXIT());
+    LOAD_MAPS("write past cb", MOV(2, 1), STX_DW(1, 2, 64), MOV(0, 0), EXIT());
+    LOAD_MAPS("read through a moved context", ADD(1, 4), LDX_W(0, 1, 0), EXIT());
+    LOAD_MAPS("helper of another type", CALL(9), EXIT());
+    LOAD_MAPS("no such helper", CALL(212), EXIT());
+    LOAD_MAPS("cookie of a scalar", MOV(1, 0), CALL(SOCKET_COOKIE), EXIT());
+    LOAD_MAPS("cookie of a moved context", ADD(1, 8), CALL(SOCKET_COOKIE), EXIT());
+    LOAD_MAPS("load no bytes", MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV(4, 0), CALL(LOAD_BYTES),
+              EXIT());
+    LOAD_MAPS("load bytes past the frame", MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV(4, 16),
+              CALL(LOAD_BYTES), EXIT());
+    LOAD_MAPS("load bytes to a scalar", MOV(2, 0), MOV(3, 0), MOV(4, 8), CALL(LOAD_BYTES), EXIT());
+    LOAD_MAPS("size not a scalar", MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV_REG(4, 10),
+              CALL(LOAD_BYTES), EXIT());
+    LOAD_MAPS("load bytes into a read-only value", MOV_REG(6, 1), KEY4(rdonly), CALL(LOOKUP),
+              JEQ(0, 0, 5), MOV_REG(3, 0), MOV_REG(1, 6), MOV(2, 0), MOV(4, 8), CALL(LOAD_BYTES),
+              MOV(0, 0), EXIT());
+    LOAD_MAPS("context and stack in one load", MOV_REG(2, 1), LDX_DW(0, 10, -8), JEQ(0, 0, 2),
+              MOV_REG(2, 10), ADD(2, -16), LDX_W(0, 2, 0), EXIT());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
     if (!strcmp(mode, "bpf-prog-verify")) return case_verify();
     if (!strcmp(mode, "bpf-prog-maps")) return case_maps();
+    if (!strcmp(mode, "bpf-prog-context")) return case_context();
     return 2;
 }

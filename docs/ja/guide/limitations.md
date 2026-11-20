@@ -291,11 +291,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   アタッチするもの（`SO_ATTACH_BPF` など）も、インタープリタもまだありません。ほかの
   プログラムの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。検証器は、
   Linux が受け入れるかもしれない次のものを、自分の行（"paludarium: ... are not verified
-  yet"、`EINVAL`。ヘルパーの呼び出しの行は "unknown func #%d" で始まり、libbpf と bpftool は
-  そのヘルパーがないと判断します）で断ります。`bpf_map_lookup_elem`、`bpf_map_update_elem`、
-  `bpf_map_delete_elem` 以外のヘルパーと、マップのマップ、キュー、スタック、ブルームフィルタの
-  ためのヘルパー、スタックにもマップの値にもないヘルパーの引数、bpf から bpf への呼び出しと
-  kfunc、コンテキストのフィールド（`struct __sk_buff`）とマップ自身のフィールド
+  yet"、`EINVAL`。ヘルパーの呼び出しの行は "unknown func %s#%d" で始まり、libbpf と
+  bpftool はそのヘルパーがないと判断します）で断ります。Linux がソケットフィルターに与える
+  ヘルパーのうち [機能](./features) に挙げたもの以外（`bpf_tail_call`、
+  `bpf_perf_event_output`、`bpf_trace_printk`、リングバッファ、スピンロックなど）、マップの
+  マップ、キュー、スタック、ブルームフィルタのためのマップのヘルパー、検証器が値を知らない
+  ヘルパーの大きさ、0 とわからないスカラーを渡す `bpf_get_netns_cookie`、bpf から bpf への
+  呼び出しと kfunc、コンテキストのソケット（`__sk_buff.sk`）とマップ自身のフィールド
   （`struct bpf_map`）、`fd_array` からのマップと `excl_prog_hash` を付けて作ったマップ、BTF ID と
   関数の `BPF_LD_IMM64`、`BPF_LD_ABS` と `BPF_LD_IND`、アトミック演算、`may_goto`、間接ジャンプ、
   オフセットの決まらないポインタ、条件ジャンプのあるプログラムの
@@ -318,8 +320,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （`BPF_PROG_GET_NEXT_ID`、`BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、
   Linux にあってここにないコマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と
   同じく `EINVAL` です。そのため libbpf の最小のプログラムでの確認はソケットフィルターを
-  読み込み、ほかのプログラムの型は見つけません。`bpftool feature` はソケットフィルターを
-  見つけますが、ヘルパーは見つけません。ほかのマップの型は、それを組み込まずにビルドした
+  読み込み、ほかのプログラムの型は見つけません。`bpftool feature` はソケットフィルターと、
+  検証器が確かめるヘルパーだけを見つけます。ほかのマップの型は、それを組み込まずにビルドした
   カーネルと同じく `EINVAL` です。
   CPU ごとの型（`BPF_MAP_TYPE_PERCPU_ARRAY`、`PERCPU_HASH`、`LRU_PERCPU_HASH`）は、
   値が使いうる CPU ごとに一つあり、テストのマシンとエミュレータで CPU の数え方が違うので、

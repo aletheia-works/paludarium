@@ -263,6 +263,7 @@ mod linux {
                     | "bpf-prog-load"
                     | "bpf-prog-verify"
                     | "bpf-prog-maps"
+                    | "bpf-prog-context"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -596,6 +597,7 @@ mod linux {
         bpf_prog_load => ("bpf-prog-load","bpf"),
         bpf_prog_verify => ("bpf-prog-verify","bpf-prog"),
         bpf_prog_maps => ("bpf-prog-maps","bpf-prog"),
+        bpf_prog_context => ("bpf-prog-context","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),

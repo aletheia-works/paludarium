@@ -37,12 +37,17 @@
 //!   pointers.
 //! - Rejected outright, with a line of the emulator's own ("paludarium:
 //!   ..."; a helper call's starts "unknown func", which tells libbpf and
-//!   bpftool the helper is not there): helpers other than
-//!   `bpf_map_lookup_elem`, `bpf_map_update_elem` and `bpf_map_delete_elem`,
-//!   those of maps of maps, queues, stacks and bloom filters, a helper's
-//!   argument other than the stack or a map's value, bpf-to-bpf calls and
-//!   kfuncs, the context's fields (`struct __sk_buff`) and a map's own
-//!   (`struct bpf_map`), maps from `fd_array` and maps made with
+//!   bpftool the helper is not there): the helpers a socket filter may
+//!   call other than the map helpers, `bpf_skb_load_bytes`,
+//!   `bpf_skb_load_bytes_relative`, `bpf_get_socket_cookie`,
+//!   `bpf_get_socket_uid`, `bpf_get_netns_cookie` and those of no
+//!   arguments (the clocks, `bpf_get_prandom_u32`, the processor and NUMA
+//!   node, the current task's IDs), the map helpers of maps of maps,
+//!   queues, stacks and bloom filters, a helper's size argument whose value
+//!   is not known here, `bpf_get_netns_cookie` of a scalar not known to be
+//!   0, bpf-to-bpf calls and kfuncs, the context's socket pointer
+//!   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
+//!   `fd_array` and maps made with
 //!   `excl_prog_hash`, BTF IDs and functions in `BPF_LD_IMM64`,
 //!   `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`, indirect jumps, a
 //!   back-edge (Linux takes a bounded loop from a privileged loader), a
@@ -67,6 +72,8 @@ const COMPLEXITY_LIMIT_JMP_SEQ: usize = 8192;
 const MAX_STACK: i64 = 512;
 /// `BPF_MAX_VAR_OFF`.
 const MAX_VAR_OFF: i64 = 1 << 29;
+/// `BPF_MAX_VAR_SIZ`.
+const MAX_VAR_SIZE: u64 = 1 << 29;
 /// The largest number `tnum_strn` writes in decimal (`U16_MAX`).
 const UNUM_MAX_DECIMAL: u64 = 0xffff;
 /// `MAX_BPF_REG`: R0 to R10.
@@ -265,6 +272,144 @@ mod func {
     pub const MAP_LOOKUP_ELEM: i32 = 1;
     pub const MAP_UPDATE_ELEM: i32 = 2;
     pub const MAP_DELETE_ELEM: i32 = 3;
+    pub const KTIME_GET_NS: i32 = 5;
+    pub const GET_PRANDOM_U32: i32 = 7;
+    pub const GET_SMP_PROCESSOR_ID: i32 = 8;
+    pub const GET_CURRENT_PID_TGID: i32 = 14;
+    pub const GET_CURRENT_UID_GID: i32 = 15;
+    pub const SKB_LOAD_BYTES: i32 = 26;
+    pub const GET_NUMA_NODE_ID: i32 = 42;
+    pub const GET_SOCKET_COOKIE: i32 = 46;
+    pub const GET_SOCKET_UID: i32 = 47;
+    pub const SKB_LOAD_BYTES_RELATIVE: i32 = 68;
+    pub const GET_NETNS_COOKIE: i32 = 122;
+    pub const KTIME_GET_BOOT_NS: i32 = 125;
+    pub const KTIME_GET_COARSE_NS: i32 = 160;
+    pub const KTIME_GET_TAI_NS: i32 = 208;
+}
+
+/// The names of `enum bpf_func_id`, by ID, without the `bpf_` that
+/// `func_id_name` puts before each: the helpers Linux 7.0 knows
+/// (`__BPF_FUNC_MAX_ID` is 212).
+const HELPER_NAMES: &str = "\
+    unspec map_lookup_elem map_update_elem map_delete_elem probe_read ktime_get_ns \
+    trace_printk get_prandom_u32 get_smp_processor_id skb_store_bytes \
+    l3_csum_replace l4_csum_replace tail_call clone_redirect get_current_pid_tgid \
+    get_current_uid_gid get_current_comm get_cgroup_classid skb_vlan_push \
+    skb_vlan_pop skb_get_tunnel_key skb_set_tunnel_key perf_event_read redirect \
+    get_route_realm perf_event_output skb_load_bytes get_stackid csum_diff \
+    skb_get_tunnel_opt skb_set_tunnel_opt skb_change_proto skb_change_type \
+    skb_under_cgroup get_hash_recalc get_current_task probe_write_user \
+    current_task_under_cgroup skb_change_tail skb_pull_data csum_update \
+    set_hash_invalid get_numa_node_id skb_change_head xdp_adjust_head probe_read_str \
+    get_socket_cookie get_socket_uid set_hash setsockopt skb_adjust_room \
+    redirect_map sk_redirect_map sock_map_update xdp_adjust_meta \
+    perf_event_read_value perf_prog_read_value getsockopt override_return \
+    sock_ops_cb_flags_set msg_redirect_map msg_apply_bytes msg_cork_bytes \
+    msg_pull_data bind xdp_adjust_tail skb_get_xfrm_state get_stack \
+    skb_load_bytes_relative fib_lookup sock_hash_update msg_redirect_hash \
+    sk_redirect_hash lwt_push_encap lwt_seg6_store_bytes lwt_seg6_adjust_srh \
+    lwt_seg6_action rc_repeat rc_keydown skb_cgroup_id get_current_cgroup_id \
+    get_local_storage sk_select_reuseport skb_ancestor_cgroup_id sk_lookup_tcp \
+    sk_lookup_udp sk_release map_push_elem map_pop_elem map_peek_elem msg_push_data \
+    msg_pop_data rc_pointer_rel spin_lock spin_unlock sk_fullsock tcp_sock \
+    skb_ecn_set_ce get_listener_sock skc_lookup_tcp tcp_check_syncookie \
+    sysctl_get_name sysctl_get_current_value sysctl_get_new_value \
+    sysctl_set_new_value strtol strtoul sk_storage_get sk_storage_delete send_signal \
+    tcp_gen_syncookie skb_output probe_read_user probe_read_kernel \
+    probe_read_user_str probe_read_kernel_str tcp_send_ack send_signal_thread \
+    jiffies64 read_branch_records get_ns_current_pid_tgid xdp_output \
+    get_netns_cookie get_current_ancestor_cgroup_id sk_assign ktime_get_boot_ns \
+    seq_printf seq_write sk_cgroup_id sk_ancestor_cgroup_id ringbuf_output \
+    ringbuf_reserve ringbuf_submit ringbuf_discard ringbuf_query csum_level \
+    skc_to_tcp6_sock skc_to_tcp_sock skc_to_tcp_timewait_sock \
+    skc_to_tcp_request_sock skc_to_udp6_sock get_task_stack load_hdr_opt \
+    store_hdr_opt reserve_hdr_opt inode_storage_get inode_storage_delete d_path \
+    copy_from_user snprintf_btf seq_printf_btf skb_cgroup_classid redirect_neigh \
+    per_cpu_ptr this_cpu_ptr redirect_peer task_storage_get task_storage_delete \
+    get_current_task_btf bprm_opts_set ktime_get_coarse_ns ima_inode_hash \
+    sock_from_file check_mtu for_each_map_elem snprintf sys_bpf \
+    btf_find_by_name_kind sys_close timer_init timer_set_callback timer_start \
+    timer_cancel get_func_ip get_attach_cookie task_pt_regs get_branch_snapshot \
+    trace_vprintk skc_to_unix_sock kallsyms_lookup_name find_vma loop strncmp \
+    get_func_arg get_func_ret get_func_arg_cnt get_retval set_retval \
+    xdp_get_buff_len xdp_load_bytes xdp_store_bytes copy_from_user_task \
+    skb_set_tstamp ima_file_hash kptr_xchg map_lookup_percpu_elem skc_to_mptcp_sock \
+    dynptr_from_mem ringbuf_reserve_dynptr ringbuf_submit_dynptr \
+    ringbuf_discard_dynptr dynptr_read dynptr_write dynptr_data \
+    tcp_raw_gen_syncookie_ipv4 tcp_raw_gen_syncookie_ipv6 \
+    tcp_raw_check_syncookie_ipv4 tcp_raw_check_syncookie_ipv6 ktime_get_tai_ns \
+    user_ringbuf_drain cgrp_storage_get cgrp_storage_delete";
+
+/// `func_id_name`, or `None` for an ID out of range.
+fn helper_name(id: i32) -> Option<&'static str> {
+    HELPER_NAMES
+        .split_whitespace()
+        .nth(usize::try_from(id).ok()?)
+}
+
+/// Whether `sk_filter_func_proto` gives a helper to a loader with
+/// `CAP_BPF` and `CAP_PERFMON`: its own, then `bpf_sk_base_func_proto`'s
+/// and `bpf_base_func_proto`'s (the same in master).
+fn socket_filter_helper(id: i32) -> bool {
+    matches!(
+        id,
+        // sk_filter_func_proto.
+        25 | 26 | 46 | 47 | 68 | 122
+        // bpf_sk_base_func_proto.
+        | 136..=140 | 160 | 178 | 196
+        // bpf_base_func_proto, for every loader.
+        | 1..=3 | 5 | 7 | 8 | 12 | 14 | 15 | 42 | 87..=89 | 105 | 106 | 120 | 125
+        | 130..=134 | 182 | 195 | 208
+        // With CAP_BPF.
+        | 17 | 37 | 80 | 93 | 94 | 118 | 123 | 153 | 154 | 156 | 157 | 164 | 169..=172
+        | 181 | 194 | 197..=203 | 209..=211
+        // With CAP_PERFMON.
+        | 6 | 16 | 22 | 35 | 55 | 109 | 112..=115 | 117 | 141 | 148 | 149 | 158 | 165
+        | 175..=177 | 180 | 191
+    )
+}
+
+/// The offsets in `struct __sk_buff` that a socket filter's access to it
+/// depends on.
+mod skb {
+    pub const SIZE: i64 = 192;
+    /// `cb[0]` to the end of `cb[4]`.
+    pub const CB: std::ops::Range<i64> = 48..68;
+    /// `sk`, a pointer.
+    pub const SK: std::ops::Range<i64> = 168..176;
+}
+
+/// What a valid access to the context gives.
+enum Field {
+    Scalar,
+    /// `__sk_buff.sk`, `PTR_TO_SOCK_COMMON_OR_NULL`.
+    Socket,
+}
+
+/// `sk_filter_is_valid_access` and `bpf_skb_is_valid_access` (the same in
+/// master) of `size` bytes at `off`.
+fn context_field(off: i64, size: i64, write: bool) -> Option<Field> {
+    // A socket filter's own refusals: tc_classid, data, data_end, family
+    // to local_port, data_meta, tstamp, wire_len and hwtstamp.
+    if matches!(off, 72..=83 | 88..=143 | 152..=163 | 184..=191) {
+        return None;
+    }
+    if write && !skb::CB.contains(&off) {
+        return None;
+    }
+    if !(0..skb::SIZE).contains(&off) || off % size != 0 {
+        return None;
+    }
+    match off {
+        _ if skb::CB.contains(&off) => (off + size <= skb::CB.end).then_some(Field::Scalar),
+        // flow_keys, tstamp_type and the padding after it.
+        144..=151 | 180..=183 => None,
+        _ if skb::SK.contains(&off) => (size == 8).then_some(Field::Socket),
+        // The rest are 4-byte fields that may be read narrower
+        // (bpf_ctx_narrow_access_ok).
+        _ => (size <= 4).then_some(Field::Scalar),
+    }
 }
 
 /// A program that passed.
@@ -900,6 +1045,9 @@ struct Walk {
     loads: std::collections::BTreeMap<usize, (u8, Option<u32>)>,
     /// `id_gen`.
     ids: u32,
+    /// Each load or store reached so far, and whether through the context
+    /// (`insn_aux_data`'s `ptr_type`, which tells only that apart).
+    through_ctx: std::collections::BTreeMap<usize, bool>,
 }
 
 impl Walk {
@@ -1013,8 +1161,10 @@ impl Walk {
             class::LDX => {
                 read_ok(s, insn.src)?;
                 write_ok(insn.dst)?;
+                let pointer = s.regs[usize::from(insn.src)];
                 let value = self.access(s, insn.src, insn.off, insn.size(), None, options)?;
                 s.regs[usize::from(insn.dst)] = value;
+                self.same_pointers(i, pointer)?;
                 Ok(next)
             }
             class::STX => {
@@ -1024,13 +1174,17 @@ impl Walk {
                 read_ok(s, insn.src)?;
                 read_ok(s, insn.dst)?;
                 let value = Store::Reg(s.regs[usize::from(insn.src)]);
+                let pointer = s.regs[usize::from(insn.dst)];
                 self.access(s, insn.dst, insn.off, insn.size(), Some(value), options)?;
+                self.same_pointers(i, pointer)?;
                 Ok(next)
             }
             class::ST => {
                 read_ok(s, insn.dst)?;
                 let value = Store::Imm(insn.imm);
+                let pointer = s.regs[usize::from(insn.dst)];
                 self.access(s, insn.dst, insn.off, insn.size(), Some(value), options)?;
+                self.same_pointers(i, pointer)?;
                 Ok(next)
             }
             class::JMP | class::JMP32 => self.jmp_op(s, insn, i),
@@ -1108,7 +1262,26 @@ impl Walk {
                     None => stack_read(s, slot, bytes),
                 }
             }
-            Reg::Ptr(Ptr::Ctx, _) => gap("the context's fields"),
+            Reg::Ptr(Ptr::Ctx, base) => {
+                // check_ptr_alignment, check_ptr_off_reg, check_ctx_access.
+                let total = i64::from(base) + i64::from(off);
+                if options.strict_alignment && bytes > 1 && total % bytes != 0 {
+                    return refuse(
+                        EACCES,
+                        format!("misaligned context access off 0+{base}+{off} size {bytes}"),
+                    );
+                }
+                ctx_offset(ptr, base)?;
+                match context_field(total, bytes, value.is_some()) {
+                    None => refuse(
+                        EACCES,
+                        format!("invalid bpf_context access off={total} size={bytes}"),
+                    ),
+                    Some(Field::Socket) => gap("the context's socket pointers"),
+                    Some(Field::Scalar) if value.is_some() => Ok(Reg::NotInit),
+                    Some(Field::Scalar) => Ok(Reg::Scalar(None)),
+                }
+            }
             Reg::Ptr(Ptr::Map(_), _) => gap("the fields of struct bpf_map"),
             Reg::Ptr(p @ Ptr::MaybeNull(..), _) => {
                 refuse(EACCES, format!("R{ptr} invalid mem access '{}'", p.name()))
@@ -1214,25 +1387,68 @@ impl Walk {
             Reg::Ptr(Ptr::Value(map), base) => {
                 self.value_access(r, map, i64::from(base), bytes, false)
             }
-            _ => gap("helper arguments of other types"),
+            reg => memory_type(r, reg),
         }
     }
 
-    /// `check_helper_call` of the map helpers in range.
+    /// `check_helper_call` of a helper in range: its arguments, then R1 to
+    /// R5 are gone and R0 is the result.
     fn helper(&mut self, s: &mut State, id: i32) -> Checked<()> {
-        if !matches!(
-            id,
-            func::MAP_LOOKUP_ELEM | func::MAP_UPDATE_ELEM | func::MAP_DELETE_ELEM
-        ) {
+        let Some(name) = helper_name(id) else {
+            return refuse(Errno::EINVAL, format!("invalid func unknown#{id}"));
+        };
+        let result = match id {
+            func::MAP_LOOKUP_ELEM | func::MAP_UPDATE_ELEM | func::MAP_DELETE_ELEM => {
+                self.map_helper(s, id)?
+            }
+            func::SKB_LOAD_BYTES | func::SKB_LOAD_BYTES_RELATIVE => {
+                self.load_bytes(s, id == func::SKB_LOAD_BYTES_RELATIVE)?;
+                Reg::Scalar(None)
+            }
+            func::GET_SOCKET_COOKIE | func::GET_SOCKET_UID => {
+                ctx_arg(s, 1, false)?;
+                Reg::Scalar(None)
+            }
+            func::GET_NETNS_COOKIE => {
+                ctx_arg(s, 1, true)?;
+                Reg::Scalar(None)
+            }
+            func::KTIME_GET_NS
+            | func::GET_PRANDOM_U32
+            | func::GET_SMP_PROCESSOR_ID
+            | func::GET_CURRENT_PID_TGID
+            | func::GET_CURRENT_UID_GID
+            | func::GET_NUMA_NODE_ID
+            | func::KTIME_GET_BOOT_NS
+            | func::KTIME_GET_COARSE_NS
+            | func::KTIME_GET_TAI_NS => Reg::Scalar(None),
             // libbpf and bpftool take a helper as there unless the log
             // says "unknown func" (or Linux's other words for one a type
             // cannot use), so the line starts with Linux's for an unknown
             // helper.
-            return refuse(
-                Errno::EINVAL,
-                format!("unknown func #{id} (paludarium: helper calls are not verified yet)"),
-            );
-        }
+            _ if socket_filter_helper(id) => {
+                return refuse(
+                    Errno::EINVAL,
+                    format!(
+                        "unknown func bpf_{name}#{id} (paludarium: this helper is not verified yet)"
+                    ),
+                );
+            }
+            _ => {
+                return refuse(
+                    Errno::EINVAL,
+                    format!("program of this type cannot use helper bpf_{name}#{id}"),
+                );
+            }
+        };
+        // The caller-saved registers.
+        s.regs[1..=5].fill(Reg::NotInit);
+        s.regs[0] = result;
+        Ok(())
+    }
+
+    /// The map helpers' arguments, and the lookup's result.
+    fn map_helper(&mut self, s: &mut State, id: i32) -> Checked<Reg> {
         // check_func_arg of ARG_CONST_MAP_PTR.
         read_ok(s, 1)?;
         let map = match s.regs[1] {
@@ -1261,15 +1477,102 @@ impl Walk {
         if id != func::MAP_LOOKUP_ELEM && shape.flags & F_RDONLY_PROG != 0 {
             return refuse(EACCES, "write into map forbidden");
         }
-        // The caller-saved registers.
-        s.regs[1..=5].fill(Reg::NotInit);
-        s.regs[0] = if id == func::MAP_LOOKUP_ELEM {
+        Ok(if id == func::MAP_LOOKUP_ELEM {
             self.ids += 1;
             Reg::Ptr(Ptr::MaybeNull(map, self.ids), 0)
         } else {
             Reg::Scalar(None)
+        })
+    }
+
+    /// The arguments of `bpf_skb_load_bytes(ctx, offset, to, len)` and of
+    /// `bpf_skb_load_bytes_relative`, which adds `start_header`: `to` is
+    /// `ARG_PTR_TO_UNINIT_MEM` and `len` its `ARG_CONST_SIZE`, whose bytes
+    /// the helper writes.
+    fn load_bytes(&mut self, s: &mut State, relative: bool) -> Checked<()> {
+        ctx_arg(s, 1, false)?;
+        read_ok(s, 2)?;
+        read_ok(s, 3)?;
+        let to = s.regs[3];
+        if !matches!(to, Reg::Ptr(Ptr::Stack | Ptr::Value(_), _)) {
+            return memory_type(3, to);
+        }
+        // check_reg_type and check_mem_size_reg of the size.
+        read_ok(s, 4)?;
+        let len = match s.regs[4] {
+            Reg::Scalar(Some(len)) => len,
+            Reg::Scalar(None) => return gap("helper sizes the verifier does not know"),
+            reg => {
+                return refuse(EACCES, format!("R4 type={} expected=scalar", reg_name(reg)));
+            }
         };
+        if (len as i64) < 0 {
+            return refuse(
+                EACCES,
+                "R4 min value is negative, either use unsigned or 'var &= const'",
+            );
+        }
+        if len == 0 {
+            return refuse(EACCES, "R4 invalid zero-sized read: u64=[0,0]");
+        }
+        if len >= MAX_VAR_SIZE {
+            return refuse(
+                EACCES,
+                "R4 unbounded memory access, use 'var &= const' or 'if (var < const)'",
+            );
+        }
+        let len = len as i64;
+        // check_helper_mem_access of a write.
+        let written = match to {
+            Reg::Ptr(Ptr::Stack, base) => {
+                // check_stack_access_within_bounds.
+                let base = i64::from(base);
+                if !(-MAX_STACK..=-1).contains(&base) {
+                    return refuse(
+                        EACCES,
+                        format!("invalid write to stack R3 off={base} size={len}"),
+                    );
+                }
+                if base + len > 0 {
+                    return refuse(
+                        Errno::EINVAL,
+                        format!("invalid write to stack R3 off={base} size={len}"),
+                    );
+                }
+                Some(base)
+            }
+            Reg::Ptr(Ptr::Value(map), base) => {
+                self.value_access(3, map, i64::from(base), len, true)?;
+                None
+            }
+            _ => unreachable!("the type is checked above"),
+        };
+        if relative {
+            read_ok(s, 5)?;
+        }
+        // The raw mode's writes, a byte at a time, after every argument:
+        // the bytes are bytes the program may read.
+        if let Some(base) = written {
+            self.depth = self.depth.max((-base) as u32);
+            for at in base..base + len {
+                s.stack[((-at - 1) / 8) as usize] = Slot::Bytes;
+            }
+        }
         Ok(())
+    }
+
+    /// `save_aux_ptr_type` of the pointer a load or store at `i` went
+    /// through: an instruction may not go through the context on one path
+    /// and another pointer on another.
+    fn same_pointers(&mut self, i: usize, pointer: Reg) -> Checked<()> {
+        let ctx = matches!(pointer, Reg::Ptr(Ptr::Ctx, _));
+        match self.through_ctx.insert(i, ctx) {
+            Some(before) if before != ctx => refuse(
+                Errno::EINVAL,
+                "same insn cannot be used with different pointers",
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// The jumps: `BPF_JA`, `BPF_EXIT`, a call, and `check_cond_jmp_op`.
@@ -1291,6 +1594,49 @@ fn known_value(v: u64) -> String {
     } else {
         format!("{v:#x}")
     }
+}
+
+/// `__check_ptr_off_reg` of the context in `r`, whose offset must be 0.
+fn ctx_offset(r: u8, off: i32) -> Checked<()> {
+    if off < 0 {
+        return refuse(
+            EACCES,
+            format!("negative offset ctx ptr R{r} off={off} disallowed"),
+        );
+    }
+    if off > 0 {
+        return refuse(
+            EACCES,
+            format!("dereference of modified ctx ptr R{r} off={off} disallowed"),
+        );
+    }
+    Ok(())
+}
+
+/// `check_func_arg` of `ARG_PTR_TO_CTX` in `r`, or of
+/// `ARG_PTR_TO_CTX_OR_NULL` when `nullable`, which takes 0 too.
+fn ctx_arg(s: &State, r: u8, nullable: bool) -> Checked<()> {
+    read_ok(s, r)?;
+    match s.regs[usize::from(r)] {
+        Reg::Scalar(Some(0)) if nullable => Ok(()),
+        // Linux may know it is 0.
+        Reg::Scalar(None) if nullable => gap("helper arguments the verifier does not know are 0"),
+        Reg::Ptr(Ptr::Ctx, off) => ctx_offset(r, off),
+        reg => refuse(EACCES, format!("R{r} type={} expected=ctx", reg_name(reg))),
+    }
+}
+
+/// `check_reg_type` of a memory argument in `r` that is none of the types
+/// in range (`mem_types`): 7.0's line, which master's list (that takes the
+/// context as well) only lengthens.
+fn memory_type(r: u8, reg: Reg) -> Checked<()> {
+    refuse(
+        EACCES,
+        format!(
+            "R{r} type={} expected=fp, pkt, pkt_meta, map_key, map_value, mem, ringbuf_mem, buf, trusted_ptr_",
+            reg_name(reg)
+        ),
+    )
 }
 
 /// `check_reg_arg` of a source: the register has been written.
@@ -1998,9 +2344,11 @@ mod tests {
             assert_eq!(errno, Errno::EINVAL);
             assert!(line.contains("paludarium: "), "{line}");
         };
-        gap(&[i(0x85, 0, 0, 0, 7), exit()]);
+        // bpf_tail_call, which Linux gives a socket filter.
+        gap(&[i(0x85, 0, 0, 0, 12), exit()]);
         gap(&[i(0x85, 0, 1, 0, 1), exit(), mov(0, 0), exit()]);
-        gap(&[ldx(0x10, 0, 1, 0), exit()]);
+        // The context's socket.
+        gap(&[ldx(0x18, 0, 1, 168), exit()]);
         // A queue's helpers are push, pop and peek.
         gap(&[
             i(0x18, 1, 1, 0, 6),
@@ -2219,5 +2567,226 @@ mod tests {
         p.extend(ld_map(1, 5));
         p.extend([mov_reg(2, 10), i(0x07, 2, 0, 0, -4), call(3), exit()]);
         assert_eq!(refused(&p), (EACCES, "write into map forbidden".into()));
+    }
+
+    #[test]
+    fn the_context_is_a_socket_filters_sk_buff() {
+        let invalid = |off: i64, size: i64| {
+            (
+                EACCES,
+                format!("invalid bpf_context access off={off} size={size}"),
+            )
+        };
+        ok(&[ldx(size::W, 0, 1, 0), exit()]);
+        ok(&[ldx(size::H, 0, 1, 6), ldx(size::B, 2, 1, 11), exit()]);
+        ok(&[i(0x62, 1, 0, 48, 7), ldx(size::DW, 0, 1, 56), exit()]);
+        ok(&[mov(2, 1), stx_dw(1, 2, 56), ldx(size::W, 0, 1, 64), exit()]);
+        ok(&[ldx(size::W, 0, 1, 176), exit()]);
+        assert_eq!(refused(&[ldx(size::W, 0, 1, 192), exit()]), invalid(192, 4));
+        assert_eq!(refused(&[ldx(size::W, 0, 1, 76), exit()]), invalid(76, 4));
+        assert_eq!(refused(&[ldx(size::DW, 0, 1, 0), exit()]), invalid(0, 8));
+        assert_eq!(refused(&[ldx(size::W, 0, 1, 2), exit()]), invalid(2, 4));
+        assert_eq!(refused(&[ldx(size::B, 0, 1, 180), exit()]), invalid(180, 1));
+        assert_eq!(
+            refused(&[ldx(size::DW, 0, 1, 144), exit()]),
+            invalid(144, 8)
+        );
+        assert_eq!(refused(&[ldx(size::W, 0, 1, 92), exit()]), invalid(92, 4));
+        assert_eq!(
+            refused(&[mov(2, 1), i(0x63, 1, 2, 0, 0), mov(0, 0), exit()]),
+            invalid(0, 4)
+        );
+        assert_eq!(
+            refused(&[mov(2, 1), stx_dw(1, 2, 64), mov(0, 0), exit()]),
+            invalid(64, 8)
+        );
+        // Only the context as it came may be read through.
+        assert_eq!(
+            refused(&[i(0x07, 1, 0, 0, 4), ldx(size::W, 0, 1, 0), exit()]),
+            (
+                EACCES,
+                "dereference of modified ctx ptr R1 off=4 disallowed".into()
+            )
+        );
+        assert_eq!(
+            refused(&[i(0x07, 1, 0, 0, -4), ldx(size::W, 0, 1, 4), exit()]),
+            (
+                EACCES,
+                "negative offset ctx ptr R1 off=-4 disallowed".into()
+            )
+        );
+        ok(&[
+            i(0x07, 1, 0, 0, 4),
+            i(0x07, 1, 0, 0, -4),
+            ldx(size::W, 0, 1, 0),
+            exit(),
+        ]);
+        // One load through the context on a path and the stack on another.
+        assert_eq!(
+            refused(&[
+                mov_reg(2, 1),
+                ldx(size::DW, 0, 10, -8),
+                i(0x15, 0, 0, 2, 0),
+                mov_reg(2, 10),
+                i(0x07, 2, 0, 0, -16),
+                ldx(size::W, 0, 2, 0),
+                exit(),
+            ]),
+            (
+                Errno::EINVAL,
+                "same insn cannot be used with different pointers".into()
+            )
+        );
+        let strict = Options {
+            strict_alignment: true,
+            ..Options::default()
+        };
+        let r = verify(&[ldx(size::H, 0, 1, 5), exit()], strict).expect_err("accepted");
+        assert_eq!(r.line, "misaligned context access off 0+0+5 size 2");
+    }
+
+    #[test]
+    fn the_socket_filter_helpers_check_their_arguments() {
+        // The helpers of no arguments.
+        ok(&[
+            call(5),
+            call(7),
+            call(8),
+            call(14),
+            call(15),
+            call(42),
+            call(125),
+            call(160),
+            call(208),
+            exit(),
+        ]);
+        ok(&[mov_reg(6, 1), call(46), mov_reg(1, 6), call(47), exit()]);
+        ok(&[call(122), mov(1, 0), call(122), exit()]);
+        assert_eq!(
+            refused(&[mov(1, 0), call(46), exit()]),
+            (EACCES, "R1 type=scalar expected=ctx".into())
+        );
+        assert_eq!(
+            refused(&[i(0x07, 1, 0, 0, 8), call(46), exit()]),
+            (
+                EACCES,
+                "dereference of modified ctx ptr R1 off=8 disallowed".into()
+            )
+        );
+        assert_eq!(
+            refused(&[call(9), exit()]),
+            (
+                Errno::EINVAL,
+                "program of this type cannot use helper bpf_skb_store_bytes#9".into()
+            )
+        );
+        assert_eq!(
+            refused(&[call(212), exit()]),
+            (Errno::EINVAL, "invalid func unknown#212".into())
+        );
+        assert_eq!(
+            refused(&[call(-1), exit()]),
+            (Errno::EINVAL, "invalid func unknown#-1".into())
+        );
+        // bpf_skb_load_bytes(ctx, offset, to, len).
+        let load = |to: &[Insn], len: Insn| {
+            let mut p = vec![mov(2, 0)];
+            p.extend_from_slice(to);
+            p.extend([len, call(26), ldx(size::DW, 0, 10, -16), exit()]);
+            p
+        };
+        let fp = |off| [mov_reg(3, 10), i(0x07, 3, 0, 0, off)];
+        ok(&load(&fp(-16), mov(4, 16)));
+        ok(&load(&fp(-512), mov(4, 512)));
+        assert_eq!(
+            refused(&load(&fp(-8), mov(4, 16))),
+            (
+                Errno::EINVAL,
+                "invalid write to stack R3 off=-8 size=16".into()
+            )
+        );
+        assert_eq!(
+            refused(&load(&fp(-520), mov(4, 8))),
+            (EACCES, "invalid write to stack R3 off=-520 size=8".into())
+        );
+        assert_eq!(
+            refused(&load(&fp(-16), mov(4, 0))),
+            (EACCES, "R4 invalid zero-sized read: u64=[0,0]".into())
+        );
+        assert_eq!(
+            refused(&load(&fp(-16), mov(4, -1))),
+            (
+                EACCES,
+                "R4 min value is negative, either use unsigned or 'var &= const'".into()
+            )
+        );
+        assert_eq!(
+            refused(&load(&fp(-16), mov(4, 1 << 29))),
+            (
+                EACCES,
+                "R4 unbounded memory access, use 'var &= const' or 'if (var < const)'".into()
+            )
+        );
+        assert_eq!(
+            refused(&load(&fp(-16), mov_reg(4, 10))),
+            (EACCES, "R4 type=fp expected=scalar".into())
+        );
+        assert_eq!(
+            refused(&load(&[mov(3, 8)], mov(4, 8))),
+            (
+                EACCES,
+                "R3 type=scalar expected=fp, pkt, pkt_meta, map_key, map_value, mem, ringbuf_mem, buf, trusted_ptr_".into()
+            )
+        );
+        // A map's key may not be the context either.
+        let mut p = ld_map(1, 4).to_vec();
+        p.extend([mov_reg(2, 1), call(1), mov(0, 0), exit()]);
+        let mut q = vec![mov_reg(6, 1)];
+        q.extend(p);
+        q[3] = mov_reg(2, 6);
+        assert_eq!(
+            refused(&q),
+            (
+                EACCES,
+                "R2 type=ctx expected=fp, pkt, pkt_meta, map_key, map_value, mem, ringbuf_mem, buf, trusted_ptr_".into()
+            )
+        );
+        // Into a value, which must be writable; the relative form takes a
+        // fifth argument.
+        let mut p = vec![mov_reg(6, 1), i(0x62, 10, 0, -4, 0)];
+        p.extend(ld_map(1, 5));
+        p.extend([
+            mov_reg(2, 10),
+            i(0x07, 2, 0, 0, -4),
+            call(1),
+            i(0x15, 0, 0, 5, 0),
+            mov_reg(3, 0),
+            mov_reg(1, 6),
+            mov(2, 0),
+            mov(4, 8),
+            call(26),
+            mov(0, 0),
+            exit(),
+        ]);
+        assert_eq!(
+            refused(&p),
+            (
+                EACCES,
+                "write into map forbidden, value_size=8 off=0 size=8".into()
+            )
+        );
+        p[2] = i(0x18, 1, 1, 0, 3);
+        ok(&p);
+        assert_eq!(
+            refused(&[
+                mov(2, 0),
+                mov_reg(3, 10),
+                i(0x07, 3, 0, 0, -8),
+                mov(4, 8),
+                call(68),
+                exit(),
+            ]),
+            (EACCES, "R5 !read_ok".into())
+        );
     }
 }

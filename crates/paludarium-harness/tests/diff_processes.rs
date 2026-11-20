@@ -864,6 +864,7 @@ mod linux {
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_generated_noexec => ("generated-noexec","process"),
+        processes_dev_shm => ("dev-shm","process"),
         processes_beneath => ("beneath","process"),
         processes_propagation => ("propagation","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),

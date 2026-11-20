@@ -368,6 +368,7 @@ fn null() -> GeneratedSource {
             ..FileStat::default()
         },
         flags: mount_flags::NOSUID | mount_flags::RELATIME,
+        shallow: false,
     }
 }
 

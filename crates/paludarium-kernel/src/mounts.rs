@@ -1527,6 +1527,43 @@ fn new_tmpfs(
     }
     built_tmpfs(c, options, sb_flags, mount_flags)
 }
+/// The tmpfs on `/dev/shm` from start-up, as systemd mounts it
+/// (`mount_setup`): `mode=01777`, `nosuid`, `nodev` and `strictatime`, its
+/// root owned by root, with the size and inodes a tmpfs has by default, its
+/// files' times from `clock`. The first user namespace owns it.
+pub(crate) fn device_shm(clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>) -> NewTmpfs {
+    let options = Tmpfs {
+        blocks: None,
+        inodes: None,
+        mode: 0o1777,
+        uid: 0,
+        gid: 0,
+        inode32: false,
+        inums_seen: false,
+        huge: None,
+        mpol: None,
+        noswap: false,
+        quota: (false, false),
+        limits: [None; 4],
+        sb_set: 0,
+        sb_clear: 0,
+        source: None,
+        sb_flags: 0,
+    };
+    let now = clock().unwrap_or(0);
+    let fs = MemFs::with_clock(clock);
+    // A new tree's root, which takes any mode and times.
+    let _ = fs.set_mode(b"/", options.mode);
+    let _ = fs.set_times(b"/", true, Some(i128::from(now)), Some(i128::from(now)));
+    NewTmpfs {
+        fs,
+        settings: options.settings(),
+        read_only: false,
+        flags: mnt::NOSUID | mnt::NODEV,
+        source: b"tmpfs".to_vec(),
+        owner: None,
+    }
+}
 /// The new tmpfs `shmem_fill_super` makes of `options`, with the
 /// superblock flags `sb_flags` and those they set, and the mount flags
 /// `mount_flags`.

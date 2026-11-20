@@ -1835,7 +1835,11 @@ kernel.
   for `/proc` and `/dev` those Linux mounts them with: `/proc` and
   `/dev/mqueue` `nosuid`, `nodev`, `noexec` and `relatime`, `/dev/pts`
   `nosuid`, `noexec` and `relatime`, and the rest of `/dev` (a devtmpfs)
-  `nosuid`, `noexec` and `relatime`, as systemd mounts it. A link in `/proc/self/fd` gives its file's, and
+  `nosuid`, `noexec` and `relatime`, as systemd mounts it. `/dev/shm` is a
+  tmpfs from start-up on `/dev`, as systemd mounts it (`mode=01777`,
+  `nosuid`, `nodev`), where a C library's POSIX shared memory and
+  semaphores make their files, and which can be unmounted or mounted
+  over. A link in `/proc/self/fd` gives its file's, and
   the kernel's internal mounts (pipes, sockets, anonymous inodes, pidfs,
   memfd, secretmem, a queue `mq_open` opened) `ST_VALID` alone.
 
@@ -3086,6 +3090,7 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts of the caller's mount namespace
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
+  `devtmpfs` for `/dev` and the tmpfs on `/dev/shm` from start-up,
   and the tmpfs and bind mounts `mount` made, with their sources and, in
   `mountinfo`, the directory each shows as its root, whether the mount
   and its superblock are read-only, and its propagation). After `chroot` they show each mount point

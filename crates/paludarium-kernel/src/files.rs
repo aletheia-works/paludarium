@@ -143,6 +143,40 @@ pub struct Files {
     /// The page caches of the files mapped shared, which `fs` keeps its
     /// files in step with; one for the whole machine.
     pub(crate) caches: Arc<crate::page_cache::PageCaches>,
+    /// The host whose realtime clock times the files of the tmpfs on
+    /// `/dev/shm`; none for the epoch.
+    host: Option<Arc<dyn paludarium_host::Host>>,
+}
+/// The first mount namespace's table on `lower`: its mounts, then the
+/// kernel's own `/dev` (a devtmpfs, which the lower filesystem need not
+/// have) and the tmpfs on `/dev/shm`, as Linux has them from start-up,
+/// whose files take their times from `host`'s realtime clock.
+fn first_table(
+    lower: &Arc<dyn FileSystem>,
+    host: Option<&Arc<dyn paludarium_host::Host>>,
+) -> Arc<paludarium_vfs::MountTable> {
+    let table = paludarium_vfs::MountTable::new(&**lower);
+    let clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync> = match host {
+        Some(host) => {
+            let host = Arc::clone(host);
+            Arc::new(move || host.clock(paludarium_host::ClockId::Realtime))
+        }
+        None => Arc::new(|| Ok(0)),
+    };
+    let flags = generated_mount(b"/dev").map_or(0, |(_, _, flags)| flags);
+    let devices = paludarium_vfs::GeneratedSource {
+        kind: "devtmpfs",
+        device: lower.device(b"/dev"),
+        base: b"/dev".to_vec(),
+        path: b"/".to_vec(),
+        stat: crate::devices::directory_stat(),
+        flags,
+        shallow: true,
+    };
+    // A new table has no mount yet that would refuse these.
+    let _ = paludarium_vfs::NamespacedFs::new(Arc::clone(lower), Arc::clone(&table))
+        .mount_devices(devices, crate::mounts::device_shm(clock));
+    table
 }
 /// The machine's filesystem as a mount namespace's table shows it: the
 /// lower filesystem (its mounts from start-up), the table's view of it, and
@@ -191,7 +225,7 @@ impl Default for Files {
         let _ = fs.mkdir(b"/tmp", 0o1777);
         let caches = Arc::default();
         let lower: Arc<dyn FileSystem> = Arc::new(fs);
-        let first_mounts = paludarium_vfs::MountTable::new(&*lower);
+        let first_mounts = first_table(&lower, None);
         released_to_fanotify(&first_mounts, &caches);
         Self {
             readiness: Arc::default(),
@@ -214,6 +248,7 @@ impl Default for Files {
             root: Arc::default(),
             root_pin: Arc::default(),
             caches,
+            host: None,
         }
     }
 }
@@ -463,7 +498,7 @@ impl Files {
     /// filesystem would keep showing it.
     /// Its mounts are the first mount namespace's.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
-        self.first_mounts = paludarium_vfs::MountTable::new(&*fs);
+        self.first_mounts = first_table(&fs, self.host.as_ref());
         released_to_fanotify(&self.first_mounts, &self.caches);
         *self.space.lock().unwrap_or_else(PoisonError::into_inner) =
             Space::new(fs, Arc::clone(&self.first_mounts), &self.caches);
@@ -810,7 +845,18 @@ impl Files {
         Ok(fds.insert(n, d))
     }
     pub fn with_host(host: Arc<dyn paludarium_host::Host>) -> Self {
-        let files = Self::default();
+        let mut files = Self {
+            host: Some(Arc::clone(&host)),
+            ..Self::default()
+        };
+        let lower = Arc::clone(
+            &files
+                .space
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lower,
+        );
+        files.set_file_system(lower);
         for channel in 0..3 {
             files
                 .fds
@@ -1511,6 +1557,7 @@ pub(crate) fn generated_source(
         path: under(base).unwrap_or_default(),
         stat,
         flags,
+        shallow: false,
     })
 }
 /// The mount of the kernel's own that holds the normalized path `p`, as
@@ -6797,6 +6844,8 @@ fn mount_of(c: &Context<'_>, path: &[u8]) -> u64 {
     };
     if under(b"/proc") {
         u64::MAX
+    } else if in_shm(path) {
+        device(c, path)
     } else if under(b"/dev/pts") {
         u64::MAX - 1
     } else if under(b"/dev") {
@@ -7657,6 +7706,12 @@ pub(crate) fn rule_object(
 pub(crate) fn generated(path: &[u8]) -> bool {
     crate::devices::entry(path).is_some() || path.starts_with(b"/proc/")
 }
+/// Whether the path `p` is `/dev/shm` or below it, which the mount table
+/// holds (a tmpfs from start-up), not the kernel.
+pub(crate) fn in_shm(p: &[u8]) -> bool {
+    p.strip_prefix(b"/dev/shm")
+        .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
+}
 /// `path` as `realpath` gives it: absolute, with `.`, `..` and every
 /// symbolic link resolved one component at a time (at most 40 links, as
 /// Linux follows), or `None` when a component is missing.
@@ -7764,7 +7819,7 @@ fn into_generated(fs: &dyn HostFs, path: &[u8], follow: bool) -> Option<Vec<u8>>
     if fs.root() != b"/" {
         return None;
     }
-    let inside = |p: &[u8]| generated(p) || p == b"/proc" || p.starts_with(b"/dev/");
+    let inside = |p: &[u8]| generated(p) || p == b"/proc" || p.starts_with(b"/dev/") && !in_shm(p);
     let trailing = path.ends_with(b"/");
     let mut pending: Vec<Vec<u8>> = path
         .split(|&b| b == b'/')

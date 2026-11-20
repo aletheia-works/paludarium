@@ -25,14 +25,14 @@ const SYMLINK: u32 = 0o120000;
 const TYPE: u32 = 0o170000;
 const EROFS: Errno = Errno(30);
 
-/// Whether `path` is in `/proc` or `/dev`, which the kernel makes and no
-/// mount here holds: Linux's are mounts of their own, written to whatever
-/// the root's flags.
+/// Whether `path` is in `/proc` or `/dev`, which the kernel makes: Linux's
+/// are mounts of their own, written to whatever the root's flags. Not
+/// `/dev/shm`, a tmpfs the mount table holds.
 fn generated(path: &[u8]) -> bool {
     let path = paludarium_vfs::normalize_path(path).unwrap_or_else(|_| path.to_vec());
     let under =
         |dir: &[u8]| path == dir || path.starts_with(dir) && path.get(dir.len()) == Some(&b'/');
-    under(b"/proc") || under(b"/dev")
+    under(b"/proc") || under(b"/dev") && !crate::files::in_shm(&path)
 }
 /// `raw` without the slashes it ends in, but for a root.
 fn trimmed(raw: &[u8]) -> &[u8] {

@@ -1628,7 +1628,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ST_NODIRATIME`、`ST_RELATIME`）を返します。`/proc` と `/dev` では Linux がそれを
   マウントするときのフラグです。`/proc` と `/dev/mqueue` は `nosuid`・`nodev`・
   `noexec`・`relatime`、`/dev/pts` は `nosuid`・`noexec`・`relatime`、ほかの `/dev`
-  （devtmpfs）は systemd がマウントするのと同じく `nosuid`・`noexec`・`relatime` です。`/proc/self/fd` のリンクはそのファイルの
+  （devtmpfs）は systemd がマウントするのと同じく `nosuid`・`noexec`・`relatime` です。
+  `/dev/shm` は、systemd がマウントするのと同じく、起動したときから `/dev` の上にある
+  tmpfs です（`mode=01777`、`nosuid`、`nodev`）。C ライブラリの POSIX 共有メモリと
+  セマフォはここにファイルを作ります。アンマウントも、上へのマウントもできます。`/proc/self/fd` のリンクはそのファイルの
   ものを返し、カーネルの内部のマウント（パイプ、ソケット、匿名 inode、pidfs、memfd、
   secretmem、`mq_open` で開いたキュー）は `ST_VALID` だけです。
 
@@ -2697,7 +2700,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` は呼び出し元のマウント名前空間のマウントの一覧です（ルートは `tmpfs`、
-  `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs とバインドの
+  `--mount` ごとに `hostfs`。ホストのパスは見せません。起動したときからの `/dev` は
+  `devtmpfs`、`/dev/shm` は tmpfs です。`mount` が作った tmpfs とバインドの
   マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリ、マウントと
   スーパーブロックが読み出し専用かどうか、伝播の種類とともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。

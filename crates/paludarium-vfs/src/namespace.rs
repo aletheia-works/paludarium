@@ -594,6 +594,11 @@ pub struct MountTable {
     /// Whether a mount is a bind mount of a file the kernel generates, so
     /// the kernel asks where its paths lead ([`NamespacedFs::generated`]).
     generated: AtomicBool,
+    /// Whether every mount but the boot ones is at `/dev` or below it, as
+    /// from start-up (the kernel's `/dev` and the tmpfs on `/dev/shm`), so
+    /// a call on a path elsewhere still goes straight through
+    /// ([`NamespacedFs::fast_for`]).
+    devices_only: AtomicBool,
     /// Where the lower filesystem has its mounts, which it shows itself.
     lower_points: Arc<Vec<Vec<u8>>>,
     /// What is told of mounts that leave the namespace ([`UnmountHook`]).
@@ -650,6 +655,7 @@ impl MountTable {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(true),
             generated: AtomicBool::new(false),
+            devices_only: AtomicBool::new(false),
             lower_points: Arc::new(mounts.iter().map(|m| m.path.clone()).collect()),
             unmount_hook: Mutex::default(),
             below,
@@ -745,6 +751,7 @@ impl MountTable {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(self.boot_only.load(Ordering::SeqCst)),
             generated: AtomicBool::new(self.generated.load(Ordering::SeqCst)),
+            devices_only: AtomicBool::new(self.devices_only.load(Ordering::SeqCst)),
             lower_points: Arc::clone(&self.lower_points),
             unmount_hook: Mutex::default(),
             below,
@@ -796,10 +803,20 @@ impl MountTable {
         let out = f(&mut entries)?;
         self.boot_only
             .store(entries.iter().all(|e| !e.runtime()), Ordering::SeqCst);
+        // The kernel's own `/dev` where it is shows each file at its own
+        // path, so the kernel need not ask.
         self.generated.store(
+            entries.iter().any(|e| match &e.backing {
+                Backing::Generated(fs) => fs.0.machine_path(b"/") != e.point,
+                _ => false,
+            }),
+            Ordering::SeqCst,
+        );
+        self.devices_only.store(
             entries
                 .iter()
-                .any(|e| matches!(e.backing, Backing::Generated(_))),
+                .filter(|e| e.runtime())
+                .all(|e| !e.hidden && within(&e.point, DEVICES) && e.point != b"/"),
             Ordering::SeqCst,
         );
         *guard = Arc::new(entries);
@@ -925,12 +942,19 @@ pub struct NamespacedFs {
     view: Arc<dyn FileSystem>,
     table: Arc<MountTable>,
     root: Vec<u8>,
+    /// Whether the lower filesystem has a `/dev` of its own, where a link
+    /// into `/dev` would lead a call that went straight through.
+    lower_devices: bool,
 }
+/// Where the kernel's devices are, the only place mounts from start-up
+/// other than the lower filesystem's are.
+const DEVICES: &[u8] = b"/dev";
 impl NamespacedFs {
     #[must_use]
     pub fn new(lower: Arc<dyn FileSystem>, table: Arc<MountTable>) -> Self {
         Self {
             view: Arc::clone(&lower),
+            lower_devices: lower.metadata(DEVICES, false).is_ok(),
             lower,
             table,
             root: b"/".to_vec(),
@@ -942,6 +966,51 @@ impl NamespacedFs {
     }
     fn fast(&self) -> bool {
         self.table.boot_only.load(Ordering::SeqCst)
+    }
+    /// Whether a call on `path` goes straight through: with boot mounts
+    /// alone, or with mounts only in `/dev` (as from start-up) for a path
+    /// that names no `dev` and no `..`, under a root outside `/dev`, where
+    /// the lower filesystem has no `/dev` a link could lead into (a link
+    /// into the kernel's then fails there, and [`Self::quick`] walks it).
+    fn fast_for(&self, path: &[u8]) -> bool {
+        if self.fast() {
+            return true;
+        }
+        if !self.table.devices_only.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.root != b"/" {
+            return !within(&self.root, DEVICES);
+        }
+        !self.lower_devices
+            && !path
+                .split(|b| *b == b'/')
+                .any(|name| name == b"dev" || name == b"..")
+    }
+    /// Whether a call that cannot fail (a device, a mount's ID) on `path`
+    /// goes straight through: as [`Self::fast_for`], where the lower
+    /// filesystem finds the file, so no link on the way went into `/dev`.
+    fn fast_found(&self, path: &[u8], follow: bool) -> bool {
+        self.fast()
+            || self.fast_for(path)
+                && (self.root != b"/" || self.lower.metadata(path, follow).is_ok())
+    }
+    /// `call` straight through when [`Self::fast_for`] `paths`: its result,
+    /// but for a missing file (`ENOENT`, `ENOTDIR`) with mounts in `/dev`,
+    /// which a link may lead into, so the call walks again (`None`).
+    fn quick<T>(
+        &self,
+        paths: &[&[u8]],
+        call: impl FnOnce() -> Result<T, Errno>,
+    ) -> Option<Result<T, Errno>> {
+        if !paths.iter().all(|p| self.fast_for(p)) {
+            return None;
+        }
+        let out = call();
+        match out {
+            Err(e) if (e == Errno::ENOENT || e == Errno::ENOTDIR) && !self.fast() => None,
+            out => Some(out),
+        }
     }
     /// The index of the mount numbered `id` that `mount` made, none for a
     /// boot one.
@@ -1114,6 +1183,16 @@ impl NamespacedFs {
             };
             let stat = match self.lstat(entries, &next) {
                 Ok(stat) => stat,
+                // A mount on a name the file system below has not (`/dev`
+                // from start-up, on a root with none) is gone into.
+                Err(e)
+                    if e == Errno::ENOENT
+                        && (cross || !queue.is_empty())
+                        && self.covering(entries, &next).is_some() =>
+                {
+                    current = self.cross(entries, next);
+                    continue;
+                }
                 Err(e) if e == Errno::ENOENT && queue.is_empty() && missing => return Ok(next),
                 Err(e) => return Err(e),
             };
@@ -2652,6 +2731,7 @@ impl FileSystem for NamespacedFs {
             view,
             table: Arc::clone(&self.table),
             root: root.to_vec(),
+            lower_devices: self.lower_devices,
         }))
     }
     fn mounts(&self) -> Vec<MountPoint> {
@@ -2744,7 +2824,7 @@ impl FileSystem for NamespacedFs {
             .collect()
     }
     fn device(&self, path: &[u8]) -> u64 {
-        if self.fast() {
+        if self.fast_found(path, true) {
             return self.lower.device(path);
         }
         let entries = self.table.snapshot();
@@ -2758,7 +2838,7 @@ impl FileSystem for NamespacedFs {
     }
     fn mount_id(&self, path: &[u8]) -> u64 {
         let entries = self.table.snapshot();
-        if self.fast() {
+        if self.fast_found(path, true) {
             return entries[self.table.boot_index(&entries, path)].id();
         }
         let loc = self.locate(&entries, path);
@@ -2766,14 +2846,14 @@ impl FileSystem for NamespacedFs {
     }
     fn mount_root(&self, path: &[u8]) -> Vec<u8> {
         let entries = self.table.snapshot();
-        if self.fast() {
+        if self.fast_found(path, true) {
             return entries[self.table.boot_index(&entries, path)].point.clone();
         }
         let loc = self.locate(&entries, path);
         self.entry(&entries, &loc).point.clone()
     }
     fn mount_pin(&self, path: &[u8]) -> Option<MountPin> {
-        if self.fast() {
+        if self.fast_found(path, true) {
             return None;
         }
         let entries = self.table.snapshot();
@@ -2785,7 +2865,7 @@ impl FileSystem for NamespacedFs {
     /// path is under, its links not followed.
     fn mount_writer(&self, path: &[u8], follow: bool) -> Option<MountPin> {
         let entries = self.table.snapshot();
-        let token = if self.fast() {
+        let token = if self.fast_found(path, follow) {
             &entries[self.table.boot_index(&entries, path)].token
         } else {
             let loc = self.walk(&entries, path, follow, false, true).ok()?;
@@ -2836,7 +2916,7 @@ impl FileSystem for NamespacedFs {
         }
     }
     fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
-        if self.fast() {
+        if self.fast_found(anchor, true) {
             return self.view.memory_path(anchor, inode);
         }
         let entries = self.table.snapshot();
@@ -2859,8 +2939,8 @@ impl HostFs for NamespacedFs {
         &self.root
     }
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
-        if self.fast() {
-            return self.view.open(path, flags, mode);
+        if let Some(out) = self.quick(&[path], || self.view.open(path, flags, mode)) {
+            return out;
         }
         const O_CREAT: u32 = 0o100;
         const O_EXCL: u32 = 0o200;
@@ -2886,16 +2966,16 @@ impl HostFs for NamespacedFs {
         fs.open(&at, flags, mode)
     }
     fn metadata(&self, path: &[u8], follow: bool) -> Result<FileStat, Errno> {
-        if self.fast() {
-            return self.view.metadata(path, follow);
+        if let Some(out) = self.quick(&[path], || self.view.metadata(path, follow)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, follow, false, true)?;
         self.lstat(&entries, &loc)
     }
     fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.mkdir(path, mode);
+        if let Some(out) = self.quick(&[path], || self.view.mkdir(path, mode)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, false, true, false)?;
@@ -2903,8 +2983,8 @@ impl HostFs for NamespacedFs {
         fs.mkdir(&at, mode)
     }
     fn make_socket(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
-        if self.fast() {
-            return self.view.make_socket(path, mode);
+        if let Some(out) = self.quick(&[path], || self.view.make_socket(path, mode)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, false, true, false)?;
@@ -2912,8 +2992,8 @@ impl HostFs for NamespacedFs {
         fs.make_socket(&at, mode)
     }
     fn make_fifo(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
-        if self.fast() {
-            return self.view.make_fifo(path, mode);
+        if let Some(out) = self.quick(&[path], || self.view.make_fifo(path, mode)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, false, true, false)?;
@@ -2924,8 +3004,8 @@ impl HostFs for NamespacedFs {
     /// as Linux's `vfs_rmdir` and `vfs_unlink` find it
     /// `is_local_mountpoint`.
     fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.unlink(path, directory);
+        if let Some(out) = self.quick(&[path], || self.view.unlink(path, directory)) {
+            return out;
         }
         let entries = self.table.snapshot();
         self.trailing_directory(&entries, path)?;
@@ -2937,8 +3017,8 @@ impl HostFs for NamespacedFs {
         fs.unlink(&at, directory)
     }
     fn link(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.link(old, new);
+        if let Some(out) = self.quick(&[old, new], || self.view.link(old, new)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let from = self.walk(&entries, old, false, false, true)?;
@@ -2951,8 +3031,8 @@ impl HostFs for NamespacedFs {
         fs.link(&a, &b)
     }
     fn symlink(&self, target: &[u8], path: &[u8]) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.symlink(target, path);
+        if let Some(out) = self.quick(&[path], || self.view.symlink(target, path)) {
+            return out;
         }
         validate(target)?;
         let entries = self.table.snapshot();
@@ -2961,8 +3041,8 @@ impl HostFs for NamespacedFs {
         fs.symlink(target, &at)
     }
     fn readlink(&self, path: &[u8]) -> Result<Vec<u8>, Errno> {
-        if self.fast() {
-            return self.view.readlink(path);
+        if let Some(out) = self.quick(&[path], || self.view.readlink(path)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, false, false, true)?;
@@ -2977,8 +3057,8 @@ impl HostFs for NamespacedFs {
     /// directory move with it, and a bind mount of a file it renames
     /// keeps showing that file, as a mount holds its root's dentry.
     fn rename_with(&self, old: &[u8], new: &[u8], flags: u32) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.rename_with(old, new, flags);
+        if let Some(out) = self.quick(&[old, new], || self.view.rename_with(old, new, flags)) {
+            return out;
         }
         const EXCHANGE: u32 = 2;
         let entries = self.table.snapshot();
@@ -3032,8 +3112,8 @@ impl HostFs for NamespacedFs {
         Ok(())
     }
     fn read_dir(&self, path: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
-        if self.fast() {
-            return self.view.read_dir(path);
+        if let Some(out) = self.quick(&[path], || self.view.read_dir(path)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, true, false, true)?;
@@ -3043,8 +3123,8 @@ impl HostFs for NamespacedFs {
     /// A tmpfs mount's: what it holds, against the size and inodes it
     /// was mounted with (`shmem_statfs`), 0 for those without a limit.
     fn statfs(&self, path: &[u8]) -> Result<FsStats, Errno> {
-        if self.fast() {
-            return self.view.statfs(path);
+        if let Some(out) = self.quick(&[path], || self.view.statfs(path)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, true, false, true)?;
@@ -3068,7 +3148,7 @@ impl HostFs for NamespacedFs {
         follow: bool,
         f: &mut dyn FnMut(&mut paludarium_host::Xattrs),
     ) -> Result<(), Errno> {
-        if self.fast() {
+        if self.fast_for(path) {
             return self.view.with_xattrs(path, follow, f);
         }
         let entries = self.table.snapshot();
@@ -3082,7 +3162,7 @@ impl HostFs for NamespacedFs {
         follow: bool,
         f: &mut dyn FnMut(&mut u32),
     ) -> Result<(), Errno> {
-        if self.fast() {
+        if self.fast_for(path) {
             return self.view.with_attributes(path, follow, f);
         }
         let entries = self.table.snapshot();
@@ -3091,8 +3171,8 @@ impl HostFs for NamespacedFs {
         fs.with_attributes(&at, false, f)
     }
     fn set_mode(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.set_mode(path, mode);
+        if let Some(out) = self.quick(&[path], || self.view.set_mode(path, mode)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, true, false, true)?;
@@ -3106,8 +3186,8 @@ impl HostFs for NamespacedFs {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.set_owner(path, follow, uid, gid);
+        if let Some(out) = self.quick(&[path], || self.view.set_owner(path, follow, uid, gid)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, follow, false, true)?;
@@ -3121,8 +3201,8 @@ impl HostFs for NamespacedFs {
         atime: Option<i128>,
         mtime: Option<i128>,
     ) -> Result<(), Errno> {
-        if self.fast() {
-            return self.view.set_times(path, follow, atime, mtime);
+        if let Some(out) = self.quick(&[path], || self.view.set_times(path, follow, atime, mtime)) {
+            return out;
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, follow, false, true)?;

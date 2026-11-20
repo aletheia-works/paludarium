@@ -11664,6 +11664,76 @@ static int generated_noexec_case(void) {
     return 0;
 }
 
+/* The dev-shm case: /dev/shm is a tmpfs on /dev from start-up, nosuid and
+   nodev, where files are made, mapped and removed, reached through a link
+   too. Only flags, modes, errno values and agreements are printed. */
+static int ds_err(long r) { return r < 0 ? -errno : (int)r; }
+static int dev_shm_case(void) {
+    struct statfs fs;
+    if (statfs("/dev/shm", &fs)) return 91;
+    printf("tmpfs=%d flags=%#lx\n", fs.f_type == 0x01021994,
+           (unsigned long)(fs.f_flags & (ST_RDONLY | ST_NOSUID | ST_NODEV | ST_NOEXEC | ST_RELATIME | ST_NOATIME)));
+    struct stat shm, root, st;
+    if (stat("/dev/shm", &shm) || stat("/", &root)) return 92;
+    printf("mode=%o own device=%d\n", (unsigned)shm.st_mode, shm.st_dev != root.st_dev);
+    char name[64];
+    snprintf(name, sizeof name, "/dev/shm/paludarium-%d", (int)getpid());
+    int fd = open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return 93;
+    static char page[4096];
+    memset(page, 's', sizeof page);
+    printf("write=%d\n", ds_err(write(fd, page, sizeof page)));
+    char *m = mmap(NULL, sizeof page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) return 94;
+    m[0] = 'x';
+    char c = 0;
+    printf("shared=%d\n", ds_err(pread(fd, &c, 1, 0)) == 1 && c == 'x');
+    munmap(m, sizeof page);
+    m = mmap(NULL, sizeof page, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    int exec = m == MAP_FAILED ? -errno : 0;
+    if (m != MAP_FAILED) munmap(m, sizeof page);
+    printf("exec agrees=%d\n", exec == ((fs.f_flags & ST_NOEXEC) ? -EPERM : 0));
+    fstat(fd, &st);
+    printf("file on it=%d size=%ld\n", st.st_dev == shm.st_dev, (long)st.st_size);
+    close(fd);
+    char link[96], through[160];
+    snprintf(link, sizeof link, "/tmp/paludarium-shm-%d", (int)getpid());
+    snprintf(through, sizeof through, "%s/paludarium-%d", link, (int)getpid());
+    printf("symlink=%d\n", ds_err(symlink("/dev/shm", link)));
+    int reached = ds_err(stat(through, &st));
+    printf("through link=%d same=%d\n", reached, !reached && st.st_dev == shm.st_dev);
+    unlink(link);
+    DIR *d = opendir("/dev");
+    int listed = 0;
+    for (struct dirent *e; d && (e = readdir(d));)
+        if (!strcmp(e->d_name, "shm")) listed = e->d_type == DT_DIR;
+    if (d) closedir(d);
+    printf("listed=%d\n", listed);
+    int removed = ds_err(unlink(name));
+    printf("unlink=%d gone=%d\n", removed, ds_err(stat(name, &st)));
+    FILE *info = fopen("/proc/self/mountinfo", "r");
+    if (!info) return 95;
+    char line[1024], type[64] = "", shm_parent[32] = "", parent_point[256] = "";
+    char ids[64][32], points[64][256];
+    int n = 0;
+    while (fgets(line, sizeof line, info) && n < 64) {
+        char id[32], parent[32], point[256], *dash = strstr(line, " - ");
+        if (sscanf(line, "%31s %31s %*s %*s %255s", id, parent, point) != 3) continue;
+        snprintf(ids[n], sizeof ids[n], "%s", id);
+        snprintf(points[n], sizeof points[n], "%s", point);
+        n++;
+        if (!strcmp(point, "/dev/shm")) {
+            snprintf(shm_parent, sizeof shm_parent, "%s", parent);
+            if (dash) sscanf(dash + 3, "%63s", type);
+        }
+    }
+    fclose(info);
+    for (int i = 0; i < n; i++)
+        if (!strcmp(ids[i], shm_parent)) snprintf(parent_point, sizeof parent_point, "%s", points[i]);
+    printf("mountinfo type=%s on=%s\n", type, parent_point);
+    return 0;
+}
+
 /* The tmpfs-limits case: a tmpfs mount's size and inodes hold its files,
    in a mount namespace of a user namespace of its own, and the statfs
    flags of /proc and /dev. Only errno values, counts and flags are
@@ -32385,6 +32455,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
+    if (!strcmp(mode, "dev-shm")) return dev_shm_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "propagation")) return propagation_case();
     if (!strcmp(mode, "mount-flags-id")) {

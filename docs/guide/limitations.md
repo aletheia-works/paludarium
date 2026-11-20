@@ -652,7 +652,7 @@ verified.
   any other type is `ENODEV`, as from a kernel without it. Once Linux's
   checks before them pass, `MS_NOSYMFOLLOW` on a tmpfs or set by a
   remount, a mount on or a move of the generated `/proc` or `/dev` (or a
-  file in them), and a bind mount of a descriptor's link to a file no path
+  file in them, but for `/dev/shm` and what is below it), and a bind mount of a descriptor's link to a file no path
   names, give `EOPNOTSUPP`, so a program
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
   (new in Linux master), `fsmount`'s
@@ -670,13 +670,18 @@ verified.
   file's own mount (one opened before a `setns` is looked for in the
   namespace the caller is in now). A file a bind mount of a generated
   file shows has, in `statx` and `/proc/self/fdinfo`, the mount ID of
-  `/dev` or `/proc`, not the bind mount's. Under `/proc` and `/dev` the
-  table has none of the mounts Linux has there (`/dev/pts`, `/dev/shm`,
-  `/dev/mqueue`, `/proc/sys/fs/binfmt_misc`): a bind mount of either
-  without `MS_REC` still shows what is generated in those directories,
-  where Linux shows their empty mount points, and in a namespace of a less
-  privileged owner it is made, where Linux refuses it for its locked
-  mounts below (`EINVAL`). A file system context makes
+  `/dev` or `/proc`, not the bind mount's. Of the mounts Linux has under
+  `/proc` and `/dev`, the table has only `/dev` itself and the tmpfs on
+  `/dev/shm`, not `/proc`, `/dev/pts`, `/dev/mqueue` or
+  `/proc/sys/fs/binfmt_misc`: a bind mount of `/proc` or `/dev` (or a
+  directory in them) still shows what is generated in those directories,
+  and what is in `/dev/shm`, where Linux shows their empty mount points,
+  and with `MS_REC` takes no mount along. In a namespace of a less
+  privileged owner a bind mount of `/dev` is `EINVAL`, as Linux refuses
+  it for its locked `/dev/shm`, but one of `/proc` or `/dev/pts` is made,
+  where Linux refuses it for its locked mounts below (`EINVAL`). Once
+  `/dev/shm` is unmounted, its name is not found there (`ENOENT`), where
+  Linux shows devtmpfs's empty directory. A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
   parameters and of a reconfiguration; one of a superblock from start-up
   takes only the common flags (`ro`, `sync`, ...). A context keeps its

@@ -158,6 +158,11 @@ pub(crate) fn entries(root: u64) -> Vec<DirectoryEntry> {
         };
         (name, inode(entry), kind)
     });
+    // `shm`, which the tmpfs on `/dev/shm` is mounted on: a directory of
+    // the kernel's own, past its devices' inodes.
+    let shm = (&b"shm"[..], NAMES.len() as u64 + 2, DT_DIR);
+    let mut named: Vec<_> = named.chain([shm]).collect();
+    named.sort_by_key(|&(name, ..)| name);
     [(&b"."[..], DIRECTORY_INODE, DT_DIR), (b"..", root, DT_DIR)]
         .into_iter()
         .chain(named)
@@ -335,11 +340,14 @@ mod device_tests {
         // Each entry's inode is the one its stat reports.
         assert_eq!(listed[1].inode, 7);
         assert_eq!(listed[0].inode, directory_stat().inode);
-        // But `pts` and `mqueue`, which devpts and the mqueue filesystem are
-        // mounted on, as on Linux, whose `stat` gives the mounted root.
+        // But `pts`, `mqueue` and `shm`, which devpts, the mqueue
+        // filesystem and a tmpfs are mounted on, as on Linux, whose `stat`
+        // gives the mounted root.
+        assert!(listed.iter().any(|e| e.name == b"shm" && e.kind == 4));
+        assert_eq!(entry(b"/dev/shm"), None);
         for e in listed[2..]
             .iter()
-            .filter(|e| e.name != b"pts" && e.name != b"mqueue")
+            .filter(|e| e.name != b"pts" && e.name != b"mqueue" && e.name != b"shm")
         {
             let path = [&b"/dev/"[..], &e.name].concat();
             assert_eq!(stat(entry(&path).unwrap()).inode, e.inode);

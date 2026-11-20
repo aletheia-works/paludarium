@@ -20,10 +20,15 @@ pub struct GeneratedSource {
     pub stat: FileStat,
     /// Its mount's flags ([`mount_flags`]), which the new mount takes.
     pub flags: u32,
+    /// Whether a walk finds only its root, not a directory at each name
+    /// below: the kernel's own `/dev` where it is, whose names the kernel
+    /// finds by their paths, and below which a walk goes only into the
+    /// mounts on it (`/dev/shm`).
+    pub shallow: bool,
 }
 impl GeneratedSource {
     /// Its path from the machine's root, where the kernel finds it.
-    fn machine_path(&self, rest: &[u8]) -> Vec<u8> {
+    pub(super) fn machine_path(&self, rest: &[u8]) -> Vec<u8> {
         joined(&self.base, &joined(&self.path, rest))
     }
 }
@@ -41,7 +46,10 @@ impl HostFs for GeneratedFs {
     fn metadata(&self, path: &[u8], _follow: bool) -> Result<FileStat, Errno> {
         if path == self.0.path.as_slice() {
             Ok(self.0.stat)
-        } else if self.0.stat.mode & S_IFMT == S_IFDIR && within(path, &self.0.path) {
+        } else if !self.0.shallow
+            && self.0.stat.mode & S_IFMT == S_IFDIR
+            && within(path, &self.0.path)
+        {
             Ok(FileStat {
                 mode: S_IFDIR | 0o555,
                 links: 2,
@@ -79,9 +87,9 @@ impl NamespacedFs {
     /// `do_loopback` of a file the kernel generates onto the resolved
     /// `target`: the new mount shows `source`, a file on a file and a
     /// directory on a directory (`graft_tree`, `ENOTDIR`), and on a shared
-    /// mount it is shared too, in a new peer group. No table here holds a
-    /// mount below a generated directory, so none is locked
-    /// (`has_locked_children`) or comes along with `MS_REC`.
+    /// mount it is shared too, in a new peer group. A mount below the
+    /// directory (`/dev/shm` of `/dev`) does not come along, even with
+    /// `MS_REC`, and when locked it is refused (`has_locked_children`).
     pub fn bind_generated(&self, source: GeneratedSource, target: &[u8]) -> Result<(), Errno> {
         self.swept();
         let entries = self.table.snapshot();
@@ -90,6 +98,18 @@ impl NamespacedFs {
         let directory = source.stat.mode & S_IFMT == S_IFDIR;
         if directory != (self.lstat(&entries, &to)?.mode & S_IFMT == S_IFDIR) {
             return Err(Errno::ENOTDIR);
+        }
+        // `has_locked_children`: what is mounted below a directory, locked
+        // in a namespace of a less privileged owner, stays covered (`EINVAL`
+        // without `MS_REC`, which takes nothing along here).
+        if directory {
+            let base = source.machine_path(b"/");
+            if entries
+                .iter()
+                .any(|e| e.locked && e.point != base && within(&e.point, &base))
+            {
+                return Err(Errno::EINVAL);
+            }
         }
         // `clone_mnt` keeps the flags' locks of the mount it copies, the
         // one of `/dev` or `/proc` from start-up, which a namespace of a
@@ -109,33 +129,65 @@ impl NamespacedFs {
                 }
             }
         }
+        let group = if parent.group == 0 {
+            0
+        } else {
+            self.table.new_group()
+        };
+        let entry = self.generated_entry(source, parent.id(), to.path, locks, group);
+        self.table.update(|entries| {
+            entries.push(entry);
+            Ok(())
+        })
+    }
+    /// The mount of the generated file `source` on mount `parent` at
+    /// `point`, with the flags' locks `locks`, in peer group `group`.
+    fn generated_entry(
+        &self,
+        source: GeneratedSource,
+        parent: u64,
+        point: Vec<u8>,
+        locks: u32,
+        group: u64,
+    ) -> Entry {
         let numbers = &self.table.numbers;
-        let entry = Entry {
+        Entry {
             token: Token::new(
                 Numbers::take(&numbers.ids, 21),
                 numbers,
                 None,
                 Arc::new(SuperState::default()),
             ),
-            parent: parent.id(),
-            point: to.path,
+            parent,
+            point,
             root: source.path.clone(),
             flags: source.flags,
             locks,
             locked: false,
             source: source.kind.as_bytes().to_vec(),
-            group: if parent.group == 0 {
-                0
-            } else {
-                self.table.new_group()
-            },
+            group,
             master: 0,
             unbindable: false,
             hidden: false,
             backing: Backing::Generated(Arc::new(GeneratedFs(source))),
-        };
+        }
+    }
+    /// The mounts Linux has from start-up in the kernel's own `/dev`: that
+    /// directory itself, `devices` (a stand-in, [`GeneratedSource::shallow`],
+    /// the lower filesystem need have no `/dev`), and the tmpfs `shm` on
+    /// its `/shm`, as systemd mounts `/dev/shm`. Before any other mount.
+    pub fn mount_devices(&self, devices: GeneratedSource, shm: NewTmpfs) -> Result<(), Errno> {
+        let entries = self.table.snapshot();
+        if entries.iter().any(Entry::runtime) {
+            return Err(Errno(16)); // EBUSY
+        }
+        let point = devices.machine_path(b"/");
+        let parent = entries[self.table.boot_index(&entries, &point)].id();
+        let devices = self.generated_entry(devices, parent, point.clone(), 0, 0);
+        let shm = self.new_entry(shm, devices.id(), joined(&point, b"/shm"));
         self.table.update(|entries| {
-            entries.push(entry);
+            entries.push(devices);
+            entries.push(shm);
             Ok(())
         })
     }

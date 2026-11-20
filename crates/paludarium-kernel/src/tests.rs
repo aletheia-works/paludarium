@@ -2276,8 +2276,8 @@ fn dev_reports_its_devices_and_lists_them() {
     assert_eq!(
         names,
         [
-            ".", "..", "fd", "full", "mqueue", "null", "ptmx", "pts", "random", "stderr", "stdin",
-            "stdout", "urandom", "zero"
+            ".", "..", "fd", "full", "mqueue", "null", "ptmx", "pts", "random", "shm", "stderr",
+            "stdin", "stdout", "urandom", "zero"
         ]
     );
     assert_eq!(f.ret(217, &[dir, out, 0x1000]), 0); // the end
@@ -2629,7 +2629,9 @@ fn statfs_and_the_generated_mount_table() {
     assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 0x5049_5045); // PIPEFS_MAGIC
     assert_eq!(f.ret(138, &[99, buf]), errno(Errno::EBADF));
     // The mount table: readable whole, a regular 0444 file, never writable.
-    let table = b"21 1 0:1 / / rw,relatime - tmpfs tmpfs rw\n";
+    let table = b"21 1 0:1 / / rw,relatime - tmpfs tmpfs rw\n\
+22 21 0:1 / /dev rw,nosuid,noexec,relatime - devtmpfs devtmpfs rw\n\
+23 22 0:2 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw,inode64\n";
     let fd = f.ret(2, &[mounts, 0, 0]);
     assert_eq!(f.ret(0, &[fd, buf, 0x100]), table.len() as u64);
     let mut read = vec![0; table.len()];
@@ -5388,9 +5390,9 @@ mod old_forms {
         assert_eq!(word(&f, out) & 0xffff_ffff, free & 0xffff_ffff);
         assert_eq!(word(&f, out + 8), word(&f, fs + 48));
         assert_eq!([word(&f, out + 16), word(&f, out + 24)], [0, 0]);
-        // No mount is 0:0 or 0:2, nor 1:1; the minor's high bits are above
-        // the major's.
-        for dev in [0, 2, 0x101, 1 << 20 | 1] {
+        // No mount is 0:0 or 0:3 (`/dev/shm` is 0:2), nor 1:1; the minor's
+        // high bits are above the major's.
+        for dev in [0, 3, 0x101, 1 << 20 | 1] {
             assert_eq!(f.ret(136, &[dev, out]), errno(Errno::EINVAL));
         }
         // The register's upper half is not the device's.
@@ -8665,6 +8667,69 @@ fn the_kernels_own_mounts_give_their_statfs_flags() {
     assert_eq!(f.mem.read_u64(GuestAddr(out + 80)).unwrap(), 0x102e);
 }
 
+/// `/dev/shm` is a tmpfs from start-up, as systemd mounts it (`mode=01777`,
+/// `nosuid`, `nodev`), on a device of its own: files are made, written and
+/// removed there, `/dev` lists it, and mountinfo shows it on `/dev`.
+#[test]
+fn dev_shm_is_a_tmpfs_from_start_up() {
+    const ENOENT: u64 = -2i64 as u64;
+    let mut f = fixture();
+    let out = DATA + 0x400;
+    let shm = put(&mut f, 0, b"/dev/shm");
+    assert_eq!(f.ret(137, &[shm, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out)).unwrap(), 0x0102_1994);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 80)).unwrap(), 0x26);
+    assert_eq!(f.ret(4, &[shm, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 24)).unwrap() as u32, 0o41777);
+    let device = f.mem.read_u64(GuestAddr(out)).unwrap();
+    let root = put(&mut f, 0x10, b"/tmp");
+    assert_eq!(f.ret(4, &[root, out]), 0);
+    assert_ne!(f.mem.read_u64(GuestAddr(out)).unwrap(), device);
+    let file = put(&mut f, 0x20, b"/dev/shm/sem.x");
+    let fd = f.ret(2, &[file, 0o102, 0o600]);
+    assert!(fd < 1024, "{fd:#x}");
+    let data = put(&mut f, 0x40, b"hi");
+    assert_eq!(f.ret(1, &[fd, data, 2]), 2);
+    assert_eq!(f.ret(4, &[file, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out)).unwrap(), device);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 48)).unwrap(), 2);
+    // The same file through `..` and a link from elsewhere.
+    let back = put(&mut f, 0x60, b"/dev/shm/../shm/sem.x");
+    assert_eq!(f.ret(4, &[back, out]), 0);
+    let (target, link) = (
+        put(&mut f, 0x80, b"/dev/shm"),
+        put(&mut f, 0xa0, b"/tmp/shm"),
+    );
+    assert_eq!(f.ret(88, &[target, link]), 0);
+    let linked = put(&mut f, 0xc0, b"/tmp/shm/sem.x");
+    assert_eq!(f.ret(4, &[linked, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out)).unwrap(), device);
+    assert_eq!(f.ret(87, &[file]), 0);
+    assert_eq!(f.ret(4, &[file, out]), ENOENT);
+    // Another name in `/dev` is still not there.
+    let other = put(&mut f, 0xe0, b"/dev/nothing/x");
+    assert_eq!(f.ret(4, &[other, out]), ENOENT);
+    let listed = String::from_utf8_lossy(&whole(&mut f, b"/proc/self/mountinfo")).into_owned();
+    let line = |point: &str| {
+        listed
+            .lines()
+            .find(|l| l.split(' ').nth(4) == Some(point))
+            .unwrap_or_else(|| panic!("{point} in {listed}"))
+            .to_owned()
+    };
+    let (dev, shm) = (line("/dev"), line("/dev/shm"));
+    assert!(
+        dev.contains(" rw,nosuid,noexec,relatime ") && dev.contains(" - devtmpfs "),
+        "{dev}"
+    );
+    assert!(
+        shm.contains(" rw,nosuid,nodev ") && shm.contains(" - tmpfs tmpfs rw"),
+        "{shm}"
+    );
+    // `/dev/shm`'s parent is `/dev`.
+    assert_eq!(shm.split(' ').nth(1), dev.split(' ').next());
+}
+
 /// A read-only mount refuses what writes, in Linux's order; remounts and
 /// propagation types show in mountinfo.
 #[test]
@@ -9094,17 +9159,19 @@ fn statmount_and_listmount_by_unique_ids() {
             .map(|i| f.mem.read_u64(GuestAddr(ids + 8 * i)).unwrap())
             .collect()
     };
-    // From the root: the root and both, in order.
+    // From the root: the root, `/dev` and `/dev/shm` from start-up, and
+    // both, in order.
     let all = req(&mut f, 0x100, [32, u64::MAX, 0, 0]);
-    assert_eq!(f.ret(458, &[all, ids, 10, 0]), 3);
-    let listed = read_ids(&mut f, 3);
-    assert!(listed.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(f.ret(458, &[all, ids, 10, 0]), 5);
+    let every = read_ids(&mut f, 5);
+    assert!(every.windows(2).all(|w| w[0] < w[1]));
+    let listed = [every[0], every[3], every[4]];
     assert_eq!(listed[0], paludarium_vfs::UNIQUE_OFFSET + 2);
-    assert_eq!(f.ret(458, &[all, ids, 10, 1]), 3);
+    assert_eq!(f.ret(458, &[all, ids, 10, 1]), 5);
     assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
     // After the last one given, and from a mount.
     let after = req(&mut f, 0x120, [32, u64::MAX, listed[0], 0]);
-    assert_eq!(f.ret(458, &[after, ids, 10, 0]), 2);
+    assert_eq!(f.ret(458, &[after, ids, 10, 0]), 4);
     let below = req(&mut f, 0x140, [32, listed[1], 0, 0]);
     assert_eq!(f.ret(458, &[below, ids, 10, 0]), 1);
     assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
@@ -9265,11 +9332,11 @@ fn unshare_newns_copies_the_mounts() {
     let fd = f.ret(2, &[inside, 0o102, 0o600]);
     assert_eq!(f.ret(3, &[fd]), 0);
     let first = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
-    assert!(first.starts_with("21 1 0:1 / / ") && first.contains("\n22 21 0:2 / /tmp/m "));
+    assert!(first.starts_with("21 1 0:1 / / ") && first.contains("\n24 21 0:3 / /tmp/m "));
     assert_eq!(f.ret(272, &[0x2_0000]), 0);
     let copy = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
     assert!(
-        copy.starts_with("23 1 0:1 / / ") && copy.contains("\n24 23 0:2 / /tmp/m "),
+        copy.starts_with("25 1 0:1 / / ") && copy.contains("\n28 25 0:3 / /tmp/m "),
         "{copy}"
     );
     let stat = DATA + 0x400;
@@ -9281,7 +9348,7 @@ fn unshare_newns_copies_the_mounts() {
     assert!(!Arc::ptr_eq(&first_table, &f.kernel.files.mount_table()));
     let lower =
         paludarium_vfs::NamespacedFs::new(Arc::new(paludarium_vfs::MemFs::new()), first_table);
-    assert_eq!(paludarium_vfs::FileSystem::mounts(&lower).len(), 2);
+    assert_eq!(paludarium_vfs::FileSystem::mounts(&lower).len(), 4);
 }
 
 /// chroot keeps absolute paths, links and `..` inside the new root, and

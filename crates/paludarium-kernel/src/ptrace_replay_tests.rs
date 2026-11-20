@@ -3099,9 +3099,10 @@ fn detach() {
         g.wait(tracer, 0);
         tracer_thread.join().unwrap();
         g.lines.extend(rx.try_iter());
-        // SIGUSR2 once the child sleeps again, as the guest sends it until
-        // the emulator keeps a signal sent while a task comes out of a stop
-        // (shared notes' sigcont-sigusr2-hang.md).
+        // SIGUSR2 once the child sleeps again, as the guest sends it: a
+        // workaround for an emulator bug that Linux does not have, a signal
+        // sent while a task comes out of a stop can be lost. Remove the wait
+        // here and in the guest once the emulator keeps such a signal.
         g.until_sleeping(child);
         g.call(KILL, [child, SIGUSR2, 0, 0, 0, 0]);
         let status = g.wait(child, 0);
@@ -3181,7 +3182,7 @@ fn detach() {
     let continued = g.wait(child, WCONTINUED) == 0xffff;
     g.say("continued", i64::from(continued));
     // SIGKILL, as the guest sends it until the emulator keeps a SIGUSR2
-    // sent right after SIGCONT (shared notes' sigcont-sigusr2-hang.md).
+    // sent right after SIGCONT, as the task comes out of its stop.
     g.call(KILL, [child, SIGKILL, 0, 0, 0, 0]);
     let status = g.wait(child, 0);
     thread.join().unwrap();

@@ -827,9 +827,11 @@ static int detach_exit_stopped(int ready[2]) {
             _exit(0);
         }
         wait_status(tracer, 0);
-        /* SIGUSR2 once the child sleeps again: the emulator loses a signal
-         * sent while a task comes out of a stop (shared notes'
-         * sigcont-sigusr2-hang.md). Not needed once that is fixed. */
+        /* SIGUSR2 once the child sleeps again. A workaround for an emulator
+         * bug that Linux does not have: a signal sent while a task comes out
+         * of a stop, here the one its tracer's exit lets go, can be lost,
+         * and the child sleeps in pause for good. Remove the wait once the
+         * emulator keeps such a signal. */
         char state = 0;
         for (int i = 0; i < 2000 && (tracer_pid_of(child, &state) < 0 || state != 'S'); i++)
             usleep(1000);
@@ -899,9 +901,10 @@ static int detach_group_stop(int ready[2]) {
     stop("parent", wait_status(child, WNOHANG | WUNTRACED));
     kill(child, SIGCONT);
     result("continued", WIFCONTINUED(wait_status(child, WCONTINUED)));
-    /* SIGKILL, not the SIGUSR2 the child waits for: the emulator loses a
-     * SIGUSR2 sent right after SIGCONT (shared notes'
-     * sigcont-sigusr2-hang.md). Back to SIGUSR2 once that is fixed. */
+    /* SIGKILL, not the SIGUSR2 the child waits for. A workaround for the
+     * emulator bug above: a SIGUSR2 sent right after SIGCONT, as the task
+     * comes out of its stop, can be lost. Back to SIGUSR2, and the exit
+     * code it gives, once the emulator keeps such a signal. */
     kill(child, SIGKILL);
     int status = wait_status(child, 0);
     result("group-killed", WIFSIGNALED(status) ? WTERMSIG(status) : -1);

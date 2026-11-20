@@ -1148,6 +1148,110 @@ static void each_record(void *page, uint64_t *tail, void (*seen)(const uint64_t 
     PAGE_U64(page, 1032) = *tail;
 }
 
+#define RECORD_THROTTLE 5
+#define RECORD_UNTHROTTLE 6
+
+static const char RATE[] = "/proc/sys/kernel/perf_event_max_sample_rate";
+static const char PERCENT[] = "/proc/sys/kernel/perf_cpu_time_max_percent";
+
+/* What writing `text` to the sysctl at `path` gives: 0 or -errno. */
+static int write_sysctl(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -errno;
+    int result = write(fd, text, strlen(text)) < 0 ? -errno : 0;
+    close(fd);
+    return result;
+}
+
+/* The records of a throttled clock, which should come as THROTTLE, the
+   sample it was throttled at, and UNTHROTTLE at the next tick. */
+struct throttled {
+    uint64_t id;
+    pid_t pid, tid;
+    int records, in_order, ids;
+    char first[16];
+};
+
+static void see_throttled(const uint64_t *record, void *with) {
+    struct throttled *t = with;
+    static const uint32_t cycle[3] = {RECORD_THROTTLE, RECORD_SAMPLE, RECORD_UNTHROTTLE};
+    uint32_t type = (uint32_t)record[0];
+    uint64_t size = record[0] >> 48;
+    if (type != cycle[t->records % 3]) t->in_order = 0;
+    if (t->records < (int)sizeof t->first - 1)
+        t->first[t->records] = type == RECORD_THROTTLE ? 'T' : type == RECORD_UNTHROTTLE ? 'U' : type == RECORD_SAMPLE ? 'S' : '?';
+    if (type == RECORD_THROTTLE || type == RECORD_UNTHROTTLE) {
+        /* time, id, stream_id, then the writer's IDs (sample_id_all). */
+        const uint32_t *writer = (const uint32_t *)((const char *)record + size - 8);
+        if (size != 40 || record[2] != t->id || record[3] != t->id || writer[0] != (uint32_t)t->pid ||
+            writer[1] != (uint32_t)t->tid)
+            t->ids = 0;
+    }
+    t->records++;
+}
+
+/* Throttling, with kernel.perf_event_max_sample_rate at 1: one interrupt
+   of an event a tick throttles it. Only the harness runs this case on
+   Linux, and only where it is allowed to change the sysctl (CI); the case
+   puts the value back, and the harness does if the case cannot. */
+static int case_throttle(void) {
+    char saved[32] = {0};
+    int fd = open(RATE, O_RDONLY);
+    if (fd < 0 || read(fd, saved, sizeof saved - 1) <= 0) {
+        say("rate unread %d", errno);
+        return 1;
+    }
+    close(fd);
+    /* Values Linux refuses leave the sysctls as they are. */
+    say("rate 0 %d", write_sysctl(RATE, "0"));
+    say("percent 101 %d", write_sysctl(PERCENT, "101"));
+    int set = write_sysctl(RATE, "1");
+    say("rate 1 %d", set);
+    if (set) return 1;
+    cpu_set_t first;
+    CPU_ZERO(&first);
+    CPU_SET(0, &first);
+    sched_setaffinity(0, sizeof first, &first);
+    /* A frequency above the rate is refused, at open and as a period, of
+       page faults: a clock's frequency is a period once it is open. */
+    struct attr f = software(2);
+    f.flags |= FREQ;
+    f.sample_period = 2;
+    attempt("freq 2", f, 0, -1, -1, 0);
+    f.sample_period = 1;
+    fd = (int)open_event(&f, 0, -1, -1, 0);
+    uint64_t two = 2;
+    say("freq 1 %d period 2 %ld", fd >= 0, fd >= 0 ? TRY(ioctl(fd, IOC_PERIOD, &two)) : 0L);
+    if (fd >= 0) close(fd);
+    /* cpu-clock every 100 us, for 20 ms of the thread's time. */
+    struct attr a = software(0);
+    a.sample_period = 100000;
+    a.sample_type = SAMPLE_TID;
+    a.flags |= DISABLED | SAMPLE_ID_ALL;
+    void *page;
+    fd = (int)open_event(&a, 0, -1, -1, 0);
+    struct throttled t = {.pid = getpid(), .tid = (pid_t)syscall(SYS_gettid), .in_order = 1, .ids = 1};
+    int mapped = fd >= 0 && map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page) == 0;
+    if (mapped) {
+        ioctl(fd, IOC_ID, &t.id);
+        ioctl(fd, IOC_ENABLE, 0);
+        struct timespec from, now;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &from);
+        do {
+            spin();
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+        } while ((now.tv_sec - from.tv_sec) * 1000000000L + now.tv_nsec - from.tv_nsec < 20000000L);
+        ioctl(fd, IOC_DISABLE, 0);
+    }
+    say("restored %d", write_sysctl(RATE, saved));
+    say("mapped %d", mapped);
+    if (!mapped) return 1;
+    uint64_t tail = 0;
+    each_record(page, &tail, see_throttled, &t);
+    say("first %.6s in order %d ids %d cycles %d", t.first, t.in_order, t.ids, t.records >= 9);
+    return 0;
+}
+
 /* What the cases compare the records with. */
 struct expected {
     pid_t pid, tid, child, parent;
@@ -1324,6 +1428,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-sample")) return case_sample();
     if (!strcmp(mode, "perf-wakeup")) return case_wakeup();
     if (!strcmp(mode, "perf-side-band")) return case_side_band();
+    if (!strcmp(mode, "perf-throttle")) return case_throttle();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {

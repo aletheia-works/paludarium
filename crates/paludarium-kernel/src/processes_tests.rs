@@ -4564,6 +4564,8 @@ mod shm {
             ("msgmnb", "16384\n"),
             ("msgmni", "32000\n"),
             ("sem", "32000\t1024000000\t500\t32000\n"),
+            ("perf_cpu_time_max_percent", "25\n"),
+            ("perf_event_max_sample_rate", "100000\n"),
             ("perf_event_mlock_kb", "516\n"),
             ("perf_event_paranoid", "2\n"),
             ("unprivileged_bpf_disabled", "2\n"),
@@ -4840,6 +4842,61 @@ mod shm {
         m.read(GuestAddr(DATA + 0xa00), &mut text).unwrap();
         assert_eq!(&text, b"8192\n");
         assert_eq!(syscall(&mut k, &mut t, &m, 8, [source, 0, 2, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn the_perf_sample_rate_takes_linux_s_values_and_bounds_a_frequency() {
+        let (mut k, mut t, m) = setup();
+        let read = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str| {
+            read_proc(k, t, m, &format!("/proc/sys/kernel/{name}"))
+        };
+        let einval = e(Errno::EINVAL);
+        for (name, value) in [
+            ("perf_event_max_sample_rate", &b"0"[..]),
+            ("perf_cpu_time_max_percent", b"101"),
+            ("perf_cpu_time_max_percent", b"-1"),
+        ] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, name, value),
+                einval,
+                "{name}"
+            );
+        }
+        // 0 and 100 turn the lowering off, and the rate cannot be set then.
+        for off in [&b"0"[..], b"100"] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, "perf_cpu_time_max_percent", off),
+                off.len() as u64
+            );
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, "perf_event_max_sample_rate", b"1000"),
+                einval
+            );
+        }
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "perf_cpu_time_max_percent", b"25"),
+            2
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "perf_event_max_sample_rate", b"1"),
+            1
+        );
+        assert_eq!(
+            read(&mut k, &mut t, &m, "perf_event_max_sample_rate"),
+            "1\n"
+        );
+        assert_eq!(k.processes().sysctls.perf_max_samples_per_tick(), 1);
+        // A software clock with `freq`: above the rate is refused.
+        const ATTR: u64 = DATA + 0x400;
+        const FREQ: u64 = 1 << 10;
+        m.write(GuestAddr(ATTR), &[0; 64]).unwrap();
+        m.write(GuestAddr(ATTR), &1u32.to_le_bytes()).unwrap();
+        m.write(GuestAddr(ATTR + 40), &FREQ.to_le_bytes()).unwrap();
+        let open = [ATTR, 0, u64::MAX, u64::MAX, 0, 0];
+        m.write(GuestAddr(ATTR + 16), &2u64.to_le_bytes()).unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 298, open), einval);
+        m.write(GuestAddr(ATTR + 16), &1u64.to_le_bytes()).unwrap();
+        assert!(syscall(&mut k, &mut t, &m, 298, open) < 1 << 31);
     }
 
     #[test]

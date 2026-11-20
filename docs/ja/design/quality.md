@@ -49,6 +49,13 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   `sysctl` で設定します（コンテナ自身のネットワークの名前空間ではこの値です）。それ以外の
   環境では、そう伝えて止まります。
 
+- perf の抑制のケースでは、Linux がティックのどの割り込みでも抑えるよう
+  `kernel.perf_event_max_sample_rate` を 1 にし、あとで値を戻します。ケースが戻せない
+  ときはハーネスも戻します。この sysctl はカーネル全体のものなので、ケースを動かせるのは
+  CI のワークフローが許すとき（`PALUDARIUM_PERF_SAMPLE_RATE_WRITES=1`）だけです。CI では
+  ケースを一つずつ動かすので、ほかの perf のケースがこの値を見ることはありません。それ以外の
+  環境では、ホストの値に触れず、そう伝えて止まります。
+
 - `chroot` のケースは、自分のユーザー名前空間で `CAP_SYS_CHROOT` を使います。Linux は
   これを許します。Ubuntu の AppArmor は、`kernel.apparmor_restrict_unprivileged_userns`
   が 1 のあいだ、そこでのケーパビリティをすべて拒みます（`unprivileged_userns` の

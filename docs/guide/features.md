@@ -3439,12 +3439,16 @@ kernel.
   vector: a bad one is `EINVAL` and leaves the ones before it set, and
   `semmni` goes back to what it was unless it ends from 0 to 32768
   (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them are the machine's
+  `perf_cpu_time_max_percent`, `perf_event_max_sample_rate`,
   `perf_event_mlock_kb`, `perf_event_paranoid` and
   `unprivileged_bpf_disabled`, one each for the whole emulated machine and
-  at Linux's defaults at first (516, 2 and 2): root's files of mode 0644,
-  which only root (user ID 0 outside any user namespace) may open to write
-  (`EACCES`). `perf_event_mlock_kb` and `perf_event_paranoid` take any
-  `int` (`proc_dointvec`); `unprivileged_bpf_disabled` takes 0 to 2 (`EINVAL`)
+  at Linux's defaults at first (25, 100000, 516, 2 and 2): root's files of
+  mode 0644, which only root (user ID 0 outside any user namespace) may
+  open to write (`EACCES`). `perf_event_mlock_kb` and `perf_event_paranoid`
+  take any `int` (`proc_dointvec`); `perf_cpu_time_max_percent` takes 0 to
+  100 and `perf_event_max_sample_rate` 1 or more (`EINVAL`), the latter
+  refused (`EINVAL`) while the former is 0 or 100, as Linux's
+  `perf_event_max_sample_rate_handler`; `unprivileged_bpf_disabled` takes 0 to 2 (`EINVAL`)
   from a writer with `CAP_SYS_ADMIN` (`EPERM`), and once 1 it takes no
   other value (`EPERM`), as Linux's `bpf_unpriv_handler`; `perf_event_open`
   and `bpf` check what they are now. `shm_rmid_forced` (0 or 1, owned and
@@ -4075,7 +4079,7 @@ kernel.
   CPU, need `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`); `namespaces`
   always does. Then a
   period with bit 63 or a frequency above `perf_event_max_sample_rate`
-  (100000) is `EINVAL`, `PERF_FLAG_PID_CGROUP` without a CPU and a task
+  (100000 at first) is `EINVAL`, `PERF_FLAG_PID_CGROUP` without a CPU and a task
   `EINVAL`, a group descriptor that is no event `EBADF`, a task that is not
   there `ESRCH`, no task and no CPU or a CPU past the last `EINVAL`, and an
   unknown `clockid` `EINVAL`. The events that count are the software
@@ -4213,7 +4217,11 @@ kernel.
   (`comm`) of `PR_SET_NAME` and of `execve` (`PERF_RECORD_MISC_COMM_EXEC`),
   which then writes the new program's stack and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
-  that is made or ends. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  that is made or ends. A `cpu-clock` or `task-clock` event whose
+  interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
+  throttled until the next tick, its count stopped meanwhile, with
+  `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,
+  ID and `stream_id`). The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 

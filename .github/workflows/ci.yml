@@ -337,6 +337,10 @@ jobs:
       # net.unix.max_dgram_qlen, which the runner's systemd raises.
       - name: Keep the default AF_UNIX datagram queue length
         run: sudo sysctl -w net.unix.max_dgram_qlen=10
+      # The perf-throttle case sets kernel.perf_event_max_sample_rate, the
+      # whole kernel's, to 1 while it runs, and only where this allows it.
+      - name: Let the perf-throttle case set the perf sample rate
+        run: echo PALUDARIUM_PERF_SAMPLE_RATE_WRITES=1 >> "$GITHUB_ENV"
       # The chroot case takes CAP_SYS_CHROOT in a user namespace of its own,
       # which Linux grants but Ubuntu's AppArmor refuses there
       # (unprivileged_userns).
@@ -389,6 +393,10 @@ jobs:
         run: test "$(ulimit -Sc)" = 0
       - name: Keep the default AF_UNIX datagram queue length
         run: sudo sysctl -w net.unix.max_dgram_qlen=10
+      # The perf-throttle case sets kernel.perf_event_max_sample_rate, the
+      # whole kernel's, to 1 while it runs, and only where this allows it.
+      - name: Let the perf-throttle case set the perf sample rate
+        run: echo PALUDARIUM_PERF_SAMPLE_RATE_WRITES=1 >> "$GITHUB_ENV"
       # The chroot case takes CAP_SYS_CHROOT in a user namespace of its own,
       # which Linux grants but Ubuntu's AppArmor refuses there
       # (unprivileged_userns).
@@ -445,6 +453,10 @@ jobs:
       # net.unix.max_dgram_qlen, which the runner's systemd raises.
       - name: Keep the default AF_UNIX datagram queue length
         run: sudo sysctl -w net.unix.max_dgram_qlen=10
+      # The perf-throttle case sets kernel.perf_event_max_sample_rate, the
+      # whole kernel's, to 1 while it runs, and only where this allows it.
+      - name: Let the perf-throttle case set the perf sample rate
+        run: echo PALUDARIUM_PERF_SAMPLE_RATE_WRITES=1 >> "$GITHUB_ENV"
       # The chroot case takes CAP_SYS_CHROOT in a user namespace of its own,
       # which Linux grants but Ubuntu's AppArmor refuses there
       # (unprivileged_userns).

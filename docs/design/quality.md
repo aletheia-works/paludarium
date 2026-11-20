@@ -52,6 +52,14 @@ CI run produces them afresh on an x86-64 Linux runner.
   sets it with `sysctl` (a container's own network namespace has it);
   elsewhere the case stops and says so.
 
+- The perf throttle case sets `kernel.perf_event_max_sample_rate` to 1, so
+  that Linux throttles each interrupt of a tick, and puts the value back
+  after; the harness puts it back too should the case not. The sysctl is
+  the whole kernel's, so only CI's workflow lets the case run
+  (`PALUDARIUM_PERF_SAMPLE_RATE_WRITES=1`), the cases running one at a time
+  there so that no other perf case sees it; elsewhere the case stops and
+  says so, leaving the host's value alone.
+
 - The `chroot` case takes `CAP_SYS_CHROOT` in a user namespace of its own,
   which Linux grants. Ubuntu's AppArmor refuses every capability there
   (the `unprivileged_userns` profile) while

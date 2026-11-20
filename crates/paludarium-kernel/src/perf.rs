@@ -42,9 +42,12 @@ pub(crate) const MLOCK_KB: i32 = 512 + 4;
 /// `kernel.perf_event_paranoid`'s default, Linux's, which the machine's
 /// starts with ([`crate::sysctl::Machine`]).
 pub(crate) const PARANOID: i32 = 2;
-/// `kernel.perf_event_max_sample_rate`, Linux's default
-/// (`DEFAULT_MAX_SAMPLE_RATE`).
-const MAX_SAMPLE_RATE: u64 = 100_000;
+/// `kernel.perf_event_max_sample_rate`'s default, Linux's
+/// (`DEFAULT_MAX_SAMPLE_RATE`), which the machine's starts with.
+pub(crate) const MAX_SAMPLE_RATE: i32 = 100_000;
+/// `kernel.perf_cpu_time_max_percent`'s default, Linux's
+/// (`DEFAULT_CPU_TIME_MAX_PERCENT`).
+pub(crate) const CPU_TIME_MAX_PERCENT: i32 = 25;
 
 const CAP_PERFMON: u64 = 1 << 38;
 const EACCES: Errno = Errno::EACCES;
@@ -735,7 +738,12 @@ impl Event {
             if state.removed {
                 return;
             }
-            state.enabled = enabled;
+            let was = std::mem::replace(&mut state.enabled, enabled);
+            drop(state);
+            // `event_sched_in` unthrottles an event it takes in.
+            if enabled && !was {
+                lock(&self.sampler).scheduled_in();
+            }
         }
         // A leader takes its group in and out with it.
         if lock(&self.leader).is_none() {
@@ -1051,7 +1059,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(EACCES);
     }
     if attr.flag(bit::FREQ) {
-        if attr.period > MAX_SAMPLE_RATE {
+        if attr.period > c.processes.sysctls.perf_event_max_sample_rate() {
             return Err(Errno::EINVAL);
         }
     } else if attr.period >> 63 != 0 {
@@ -1583,12 +1591,16 @@ pub(crate) fn ioctl(
             if !event.attr.sampling() || value == 0 {
                 return Err(Errno::EINVAL);
             }
+            let enabled = lock(&event.state).enabled;
             // A clock's `freq` is a period from its start.
             let mut sampler = lock(&event.sampler);
-            if sampler.freq() && value > MAX_SAMPLE_RATE || !sampler.freq() && value >> 63 != 0 {
+            let rate = c.processes.sysctls.perf_event_max_sample_rate();
+            if sampler.freq() && value > rate || !sampler.freq() && value >> 63 != 0 {
                 return Err(Errno::EINVAL);
             }
-            sampler.set_period(value, event.counter);
+            // A period that starts over unthrottles the event, while it is
+            // enabled (`__perf_event_period`).
+            sampler.set_period(value, event.counter, enabled);
             Ok(0)
         })(),
         IOC_SET_OUTPUT => (|| {

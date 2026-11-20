@@ -61,6 +61,8 @@ pub(super) const CODE_PAGE_SIZE: u64 = 1 << 23;
 pub(super) const WEIGHT_STRUCT: u64 = 1 << 24;
 
 const RECORD_LOST: u32 = 2;
+const RECORD_THROTTLE: u32 = 5;
+const RECORD_UNTHROTTLE: u32 = 6;
 const RECORD_SAMPLE: u32 = 9;
 const MISC_KERNEL: u16 = 1;
 const MISC_USER: u16 = 2;
@@ -82,6 +84,8 @@ const TASK_SIZE: u64 = USER_ADDRESS_LIMIT - 4096;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// The shortest period of a clock's hrtimer.
 const HRTIMER_MIN: u64 = 10_000;
+/// Linux's `TICK_NSEC` on the CI runners' kernels (`CONFIG_HZ=1000`).
+const TICK_NSEC: u64 = crate::threads::TICK_NSEC;
 const PAGE: u64 = 4096;
 
 /// What Linux's `struct hw_perf_event` keeps for sampling.
@@ -105,6 +109,27 @@ pub(super) struct Sampler {
     freq_time: u64,
     /// `lost_samples`: the samples that found no room in the buffer.
     pub(super) lost: u64,
+    /// For a clock, the nanoseconds of its count its hrtimer has gone
+    /// through, the tick of them its last interrupt came in
+    /// (`interrupts_seq`, a tick being `TICK_NSEC` of them) and the
+    /// interrupts in that tick (`interrupts`); whether that throttled it
+    /// (`interrupts` at `MAX_INTERRUPTS`), its hrtimer stopped until the
+    /// next tick; and whether it was unthrottled outside a tick, its
+    /// `PERF_RECORD_UNTHROTTLE` yet to be written.
+    at: u64,
+    seq: u64,
+    interrupts: u64,
+    throttled: bool,
+    unthrottled: bool,
+}
+
+/// What a clock's hrtimer gives as its count goes on ([`Sampler::ticks`]):
+/// samples of a period, and its throttling and unthrottling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Fire {
+    Samples(u64, u64),
+    Throttle,
+    Unthrottle,
 }
 
 impl Sampler {
@@ -156,8 +181,12 @@ impl Sampler {
         }
     }
     /// `PERF_EVENT_IOC_PERIOD` (`__perf_event_period`): the period, or
-    /// with `freq` the frequency, which starts over (`period_left` 0).
-    pub(super) fn set_period(&mut self, value: u64, counter: Counter) {
+    /// with `freq` the frequency, which starts over (`period_left` 0); an
+    /// event that is `enabled` is unthrottled by it.
+    pub(super) fn set_period(&mut self, value: u64, counter: Counter, enabled: bool) {
+        if enabled {
+            self.scheduled_in();
+        }
         if self.freq() {
             self.frequency = value;
         } else {
@@ -169,6 +198,18 @@ impl Sampler {
         } else {
             0
         };
+    }
+    /// `perf_event_unthrottle` of a throttled event that is scheduled in
+    /// (`event_sched_in`) or whose period starts over: its record is
+    /// written with its next samples, and its hrtimer starts again with a
+    /// whole period.
+    pub(super) fn scheduled_in(&mut self) {
+        if self.throttled {
+            self.throttled = false;
+            self.interrupts = 0;
+            self.unthrottled = true;
+            self.left = self.period.max(HRTIMER_MIN) as i64;
+        }
     }
     /// The overflows of `n` more occurrences of a software event:
     /// `perf_swevent_event`, one at a time, with `perf_swevent_overflow`
@@ -206,17 +247,86 @@ impl Sampler {
         }
     }
     /// The times a clock's hrtimer fires in `ns` more nanoseconds of its
-    /// count, each a sample of the last period.
-    fn ticks(&mut self, ns: u64, out: &mut Runs) {
-        let left = self.left.max(0) as u64;
-        if left > ns {
-            self.left = (left - ns) as i64;
-            return;
+    /// count, each a sample of the last period, as `perf_swevent_hrtimer`
+    /// and `__perf_event_account_interrupt` take them: the interrupt that
+    /// brings those of one tick to `per_tick` (`max_samples_per_tick`)
+    /// throttles the event before its sample is written, its hrtimer
+    /// stopped, and the next tick unthrottles it (`perf_event_task_tick`),
+    /// its hrtimer started with a whole period. With an UNTHROTTLE that is
+    /// to be written first ([`Self::scheduled_in`]), into `out`; the
+    /// nanoseconds the event was throttled in, which its count leaves out,
+    /// as `cpu_clock_event_stop` stops it.
+    fn ticks(&mut self, ns: u64, per_tick: u64, out: &mut Vec<Fire>) -> u64 {
+        if std::mem::take(&mut self.unthrottled) {
+            out.push(Fire::Unthrottle);
         }
+        let end = self.at.saturating_add(ns);
         let step = self.period.max(HRTIMER_MIN);
-        let more = (ns - left) / step;
-        run(out, self.last_period, 1 + more);
-        self.left = (step - (ns - left) % step) as i64;
+        let per_tick = per_tick.max(1);
+        // No tick can hold that many: none throttles.
+        let never = TICK_NSEC.div_ceil(step) < per_tick;
+        let mut stopped = 0;
+        loop {
+            if self.throttled {
+                let tick = self.seq.saturating_add(1).saturating_mul(TICK_NSEC);
+                if tick > end {
+                    stopped += end - self.at;
+                    break;
+                }
+                stopped += tick - self.at;
+                self.at = tick;
+                self.throttled = false;
+                self.interrupts = 0;
+                self.left = step as i64;
+                out.push(Fire::Unthrottle);
+                continue;
+            }
+            let first = self.at + self.left.max(0) as u64;
+            if first > end {
+                self.left = (first - end) as i64;
+                break;
+            }
+            let jiffy = first / TICK_NSEC;
+            let before = if jiffy == self.seq {
+                self.interrupts
+            } else {
+                0
+            };
+            let until_end = (end - first) / step + 1;
+            let n = if never {
+                until_end
+            } else {
+                // Up to the end of this tick, and up to the one that
+                // throttles the event.
+                let in_tick = ((jiffy + 1) * TICK_NSEC - first - 1) / step + 1;
+                until_end
+                    .min(in_tick)
+                    .min(per_tick.saturating_sub(before).max(1))
+            };
+            let last = first + (n - 1) * step;
+            let last_jiffy = last / TICK_NSEC;
+            self.interrupts = if last_jiffy == jiffy {
+                before + n
+            } else {
+                (last - last_jiffy * TICK_NSEC) / step + 1
+            };
+            self.seq = last_jiffy;
+            self.at = last;
+            if !never && self.interrupts >= per_tick {
+                if n > 1 {
+                    push(out, Fire::Samples(self.last_period, n - 1));
+                }
+                out.push(Fire::Throttle);
+                push(out, Fire::Samples(self.last_period, 1));
+                self.throttled = true;
+                self.left = 0;
+                continue;
+            }
+            push(out, Fire::Samples(self.last_period, n));
+            self.left = step as i64;
+        }
+        self.at = end;
+        stopped
     }
     /// `perf_adjust_period`: the period moves an eighth of the way to the
     /// one that gives the frequency, at `count` occurrences in `nsec`.
@@ -243,6 +353,18 @@ impl Sampler {
 
 /// Samples as runs of a period and how many have it.
 type Runs = Vec<(u64, u64)>;
+
+/// `fire` after the others, samples of the period of the last ones with
+/// them.
+fn push(out: &mut Vec<Fire>, fire: Fire) {
+    if let (Some(Fire::Samples(last, count)), Fire::Samples(period, n)) = (out.last_mut(), fire)
+        && *last == period
+    {
+        *count += n;
+        return;
+    }
+    out.push(fire);
+}
 
 fn run(out: &mut Runs, period: u64, n: u64) {
     if n == 0 {
@@ -305,10 +427,14 @@ impl Task<'_> {
 /// The samples the events that count thread `task` of `group` have to
 /// take as of now, which its system call brought its counts up to, and the
 /// signals of `sigtrap` the thread is to get.
+///
+/// A clock is throttled at `per_tick` interrupts in a tick
+/// ([`crate::sysctl::Machine::perf_max_samples_per_tick`]).
 pub(crate) fn overflow(
     events: &Events,
     group: &crate::ThreadGroup,
     task: &Task<'_>,
+    per_tick: u64,
 ) -> Vec<PendingSignal> {
     if !events.sampling.load(Ordering::Relaxed) {
         return Vec::new();
@@ -321,7 +447,7 @@ pub(crate) fn overflow(
         .collect();
     sampling
         .into_iter()
-        .filter_map(|event| event.take_samples(task))
+        .filter_map(|event| event.take_samples(task, per_tick))
         .collect()
 }
 
@@ -342,7 +468,7 @@ impl Event {
     }
     /// Its overflows since they were last taken, their samples and the
     /// signals they send, and its `sigtrap`.
-    fn take_samples(self: &Arc<Self>, task: &Task<'_>) -> Option<PendingSignal> {
+    fn take_samples(self: &Arc<Self>, task: &Task<'_>, per_tick: u64) -> Option<PendingSignal> {
         let occurred = {
             let state = self.settle();
             if state.removed {
@@ -351,9 +477,9 @@ impl Event {
             state.occurred
         };
         let period_field = self.attr.sample_type & PERIOD != 0;
-        let mut user = Runs::new();
-        let mut kernel = Runs::new();
-        {
+        // What it gives in order, each in user mode or in the kernel.
+        let mut fires: Vec<(Fire, bool)> = Vec::new();
+        let stopped = {
             let mut sampler = lock(&self.sampler);
             let freq = sampler.freq();
             let new = [
@@ -361,17 +487,22 @@ impl Event {
                 occurred[1].saturating_sub(sampler.seen[1]),
             ];
             sampler.seen = occurred;
-            if new == [0, 0] {
+            if new == [0, 0] && !sampler.unthrottled {
                 return None;
             }
             if self.counter == Counter::Clock {
                 // The hrtimer interrupts the thread's own code: a sample of
-                // user mode, which `exclude_user` leaves out.
-                let mut ticks = Runs::new();
-                sampler.ticks(new[0] + new[1], &mut ticks);
-                if !self.attr.flag(bit::EXCLUDE_USER) {
-                    user = ticks;
+                // user mode, which `exclude_user` leaves out with the
+                // interrupt itself (`perf_exclude_event`), which then
+                // throttles nothing.
+                let exclude = self.attr.flag(bit::EXCLUDE_USER);
+                let mut ticks = Vec::new();
+                let per_tick = if exclude { u64::MAX } else { per_tick };
+                let stopped = sampler.ticks(new[0] + new[1], per_tick, &mut ticks);
+                if !exclude {
+                    fires.extend(ticks.into_iter().map(|fire| (fire, true)));
                 }
+                stopped
             } else {
                 if freq {
                     let now = self.clock_now();
@@ -384,9 +515,24 @@ impl Event {
                     sampler.freq_time = now;
                     sampler.freq_count = count;
                 }
+                let mut user = Runs::new();
+                let mut kernel = Runs::new();
                 sampler.occurrences(new[0], period_field, freq, &mut user);
                 sampler.occurrences(new[1], period_field, freq, &mut kernel);
+                let samples = |runs: Runs, user_mode| {
+                    runs.into_iter()
+                        .map(move |(period, n)| (Fire::Samples(period, n), user_mode))
+                };
+                fires.extend(samples(user, true).chain(samples(kernel, false)));
+                0
             }
+        };
+        if stopped > 0 {
+            let mut state = lock(&self.state);
+            state.count = state.count.saturating_sub(stopped);
+        }
+        if fires.is_empty() {
+            return None;
         }
         let top = self.top()?;
         let rb = lock(&top.rb).clone();
@@ -399,28 +545,33 @@ impl Event {
         let mut hung_up = false;
         let mut woken = false;
         // The samples of one period are alike: written together.
-        'runs: for (runs, user_mode) in [(user, true), (kernel, false)] {
-            for (period, mut copies) in runs {
-                // `event_limit`: the overflow that brings it to 0 is the
-                // last, and disables the event (`POLL_HUP`).
-                let limit = self.event_limit.load(Ordering::Relaxed);
-                if limit > 0 && copies >= limit as u64 {
-                    copies = limit as u64;
-                    self.event_limit.store(0, Ordering::Relaxed);
-                    hung_up = true;
-                } else if limit != 0 {
-                    self.event_limit
-                        .store(limit.wrapping_sub(copies as i32), Ordering::Relaxed);
+        'runs: for (fire, user_mode) in fires {
+            let (period, mut copies) = match fire {
+                Fire::Samples(period, copies) => (period, copies),
+                Fire::Throttle | Fire::Unthrottle => {
+                    self.log_throttle(fire == Fire::Unthrottle, &task.who());
+                    continue;
                 }
-                overflows += copies;
-                if let Some(rb) = &rb {
-                    let (record, spill) = self.sample(task, user_mode, period);
-                    let trailer = top.id_sample(task);
-                    woken |= rb.output(&top, &record, &spill, copies, &trailer, wakeup_events);
-                }
-                if hung_up {
-                    break 'runs;
-                }
+            };
+            // `event_limit`: the overflow that brings it to 0 is the
+            // last, and disables the event (`POLL_HUP`).
+            let limit = self.event_limit.load(Ordering::Relaxed);
+            if limit > 0 && copies >= limit as u64 {
+                copies = limit as u64;
+                self.event_limit.store(0, Ordering::Relaxed);
+                hung_up = true;
+            } else if limit != 0 {
+                self.event_limit
+                    .store(limit.wrapping_sub(copies as i32), Ordering::Relaxed);
+            }
+            overflows += copies;
+            if let Some(rb) = &rb {
+                let (record, spill) = self.sample(task, user_mode, period);
+                let trailer = top.id_sample(task);
+                woken |= rb.output(&top, &record, &spill, copies, &trailer, wakeup_events);
+            }
+            if hung_up {
+                break 'runs;
             }
         }
         if overflows == 0 {
@@ -434,6 +585,25 @@ impl Event {
         let extra = woken && self.parent.is_some();
         top.signal_owner(overflows, hung_up, extra);
         self.attr.flag(bit::SIGTRAP).then(|| self.sigtrap(task))
+    }
+    /// `perf_log_throttle`: `PERF_RECORD_THROTTLE`, or `UNTHROTTLE`, of the
+    /// group's leader, which throttles and unthrottles with its group
+    /// (`perf_event_throttle_group`), written by thread `who`: the
+    /// leader's time, its ID and its own (`stream_id`).
+    fn log_throttle(self: &Arc<Self>, unthrottle: bool, who: &Who) {
+        let leader = lock(&self.leader)
+            .clone()
+            .unwrap_or_else(|| Arc::clone(self));
+        let mut body = Vec::with_capacity(24);
+        body.extend(leader.clock_now().to_le_bytes());
+        body.extend(leader.id.to_le_bytes());
+        body.extend(leader.stream_id.to_le_bytes());
+        let kind = if unthrottle {
+            RECORD_UNTHROTTLE
+        } else {
+            RECORD_THROTTLE
+        };
+        leader.side_band(kind, 0, &body, who);
     }
     /// `kill_fasync` for `overflows`, each `POLL_IN` but the last that
     /// hung the event up (`POLL_HUP`), and one more `POLL_IN` for `extra`:
@@ -952,7 +1122,7 @@ mod tests {
     #[test]
     fn a_new_period_overflows_at_the_next_occurrence() {
         let mut sampler = Sampler::of_period(4, Counter::Faults);
-        sampler.set_period(4, Counter::Faults);
+        sampler.set_period(4, Counter::Faults, true);
         let mut out = Runs::new();
         sampler.occurrences(1, false, false, &mut out);
         assert_eq!(out, [(4, 1)]);
@@ -963,17 +1133,98 @@ mod tests {
         assert_eq!(out, [(4, 2)]);
     }
 
+    /// Linux's default `max_samples_per_tick` (100000 a second at
+    /// `HZ` 1000).
+    const PER_TICK: u64 = 100;
+    const MS: u64 = 1_000_000;
+
     #[test]
     fn a_clock_fires_first_after_its_period_then_every_10_us_at_least() {
         let mut sampler = Sampler::of_period(1000, Counter::Clock);
-        let mut out = Runs::new();
-        sampler.ticks(999, &mut out);
+        let mut out = Vec::new();
+        assert_eq!(sampler.ticks(999, PER_TICK, &mut out), 0);
         assert!(out.is_empty());
-        sampler.ticks(1, &mut out);
-        assert_eq!(out, [(1000, 1)]);
-        sampler.ticks(25_000, &mut out);
-        assert_eq!(out, [(1000, 3)]);
+        sampler.ticks(1, PER_TICK, &mut out);
+        assert_eq!(out, [Fire::Samples(1000, 1)]);
+        sampler.ticks(25_000, PER_TICK, &mut out);
+        assert_eq!(out, [Fire::Samples(1000, 3)]);
         assert_eq!(sampler.left, 5000);
+    }
+
+    #[test]
+    fn the_interrupt_that_fills_a_tick_throttles_a_clock_until_the_next() {
+        // Every 10 us from 10 us: 99 in the first tick, then 100 in the
+        // second, the last of which throttles it before its sample.
+        let mut sampler = Sampler::of_period(10_000, Counter::Clock);
+        let mut out = Vec::new();
+        // Its count stops from that interrupt, at 1990 us.
+        assert_eq!(sampler.ticks(2 * MS - 1, PER_TICK, &mut out), 9999);
+        assert_eq!(
+            out,
+            [
+                Fire::Samples(10_000, 198),
+                Fire::Throttle,
+                Fire::Samples(10_000, 1)
+            ]
+        );
+        // The third tick unthrottles it, its hrtimer started again then.
+        out.clear();
+        assert_eq!(sampler.ticks(1, PER_TICK, &mut out), 1);
+        assert_eq!(out, [Fire::Unthrottle]);
+        out.clear();
+        sampler.ticks(10_000, PER_TICK, &mut out);
+        assert_eq!(out, [Fire::Samples(10_000, 1)]);
+    }
+
+    #[test]
+    fn one_interrupt_a_tick_throttles_each_sample_and_stops_the_count() {
+        // `perf_event_max_sample_rate` 1: one interrupt a tick at most.
+        let mut sampler = Sampler::of_period(100_000, Counter::Clock);
+        let mut out = Vec::new();
+        let stopped = sampler.ticks(3 * MS + MS / 2, 1, &mut out);
+        let once = [Fire::Throttle, Fire::Samples(100_000, 1)];
+        let mut wanted = Vec::new();
+        for _ in 0..3 {
+            wanted.extend(once);
+            wanted.push(Fire::Unthrottle);
+        }
+        wanted.extend(once);
+        assert_eq!(out, wanted);
+        // From each interrupt, 100 us into its tick, to the next tick, and
+        // to the end in the last.
+        assert_eq!(stopped, 3 * (MS - 100_000) + MS / 2 - 100_000);
+    }
+
+    #[test]
+    fn a_clock_that_no_tick_can_fill_is_never_throttled() {
+        let mut sampler = Sampler::of_period(100_000, Counter::Clock);
+        let mut out = Vec::new();
+        assert_eq!(sampler.ticks(1000 * MS, PER_TICK, &mut out), 0);
+        assert_eq!(out, [Fire::Samples(100_000, 10_000)]);
+    }
+
+    #[test]
+    fn a_throttled_clock_taken_in_again_is_unthrottled_with_a_whole_period() {
+        let mut sampler = Sampler::of_period(100_000, Counter::Clock);
+        let mut out = Vec::new();
+        sampler.ticks(200_000, 1, &mut out);
+        assert_eq!(out, [Fire::Throttle, Fire::Samples(100_000, 1)]);
+        // Enabled again, or its period set, before the next tick.
+        sampler.scheduled_in();
+        out.clear();
+        sampler.ticks(100_000, 1, &mut out);
+        // Its next interrupt is in the same tick as the one that throttled
+        // it: the second in it, which throttles it again.
+        assert_eq!(
+            out,
+            [Fire::Unthrottle, Fire::Throttle, Fire::Samples(100_000, 1)]
+        );
+        // Not throttled, it is not unthrottled either.
+        let mut free = Sampler::of_period(100_000, Counter::Clock);
+        free.scheduled_in();
+        out.clear();
+        free.ticks(1, 1, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

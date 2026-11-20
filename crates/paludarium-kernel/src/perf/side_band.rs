@@ -79,7 +79,7 @@ impl Event {
     /// and the `sample_id` of `who` after that, to the buffer the event
     /// writes to; a wakeup it makes signals for `O_ASYNC` as one of a
     /// sample does (`perf_output_wakeup`'s `pending_kill`).
-    fn side_band(self: &Arc<Self>, kind: u32, misc: u16, body: &[u8], who: &Who) {
+    pub(super) fn side_band(self: &Arc<Self>, kind: u32, misc: u16, body: &[u8], who: &Who) {
         let Some(top) = self.top() else {
             return;
         };

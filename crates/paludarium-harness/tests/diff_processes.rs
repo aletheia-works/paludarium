@@ -77,6 +77,39 @@ mod linux {
         std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
     }
 
+    /// The host's `kernel.perf_event_max_sample_rate` before the throttle
+    /// case, written back when dropped if the case left another.
+    struct SampleRate(String);
+
+    impl SampleRate {
+        const PATH: &str = "/proc/sys/kernel/perf_event_max_sample_rate";
+        fn save() -> Self {
+            Self(std::fs::read_to_string(Self::PATH).unwrap())
+        }
+    }
+
+    impl Drop for SampleRate {
+        fn drop(&mut self) {
+            if std::fs::read_to_string(Self::PATH).is_ok_and(|now| now == self.0) {
+                return;
+            }
+            let value = self.0.trim();
+            let restored = if running_as_root() {
+                std::fs::write(Self::PATH, value).is_ok()
+            } else {
+                std::process::Command::new("/usr/bin/sudo")
+                    .args(["-n", "sysctl", "-q", "-w"])
+                    .arg(format!("kernel.perf_event_max_sample_rate={value}"))
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            assert!(
+                restored || std::thread::panicking(),
+                "kernel.perf_event_max_sample_rate could not be put back to {value}"
+            );
+        }
+    }
+
     fn case(test: &str, mode: &str, binary: &str) {
         static FIXTURE: Mutex<()> = Mutex::new(());
         let _fixture = FIXTURE
@@ -122,6 +155,20 @@ mod linux {
                 "the unix-datagram case needs `sysctl net.unix.max_dgram_qlen=10`"
             );
         }
+        // The throttle case sets kernel.perf_event_max_sample_rate, which
+        // is the whole kernel's, to 1 while it runs: only where the
+        // workflow lets it (CI). The cases run one at a time (`FIXTURE`),
+        // so no other perf case sees that value, and it is put back after
+        // the case, should the case not have.
+        let _sample_rate = (mode == "perf-throttle").then(|| {
+            assert!(
+                std::env::var_os("PALUDARIUM_PERF_SAMPLE_RATE_WRITES").is_some(),
+                "the perf-throttle case sets the host's kernel.perf_event_max_sample_rate to 1 \
+                 while it runs; it runs only where PALUDARIUM_PERF_SAMPLE_RATE_WRITES=1 lets \
+                 it, as CI does"
+            );
+            SampleRate::save()
+        });
         let watchdog = if mode == "neighbour-ageing" { 150 } else { 60 };
         support::bounded(test, watchdog, || {
             let program = dir.join(binary);
@@ -140,7 +187,8 @@ mod linux {
             // for its IDs and PIDs), the fanotify cases, whose groups and
             // marks need CAP_SYS_ADMIN, the userfaultfd cases, whose files take
             // the kernel's faults too (CAP_SYS_PTRACE), the perf cases, whose
-            // events of the kernel and of CPUs need CAP_PERFMON, the bpf cases, whose
+            // events of the kernel and of CPUs need CAP_PERFMON (and the
+            // throttle case writes a sysctl), the bpf cases, whose
             // maps need CAP_BPF, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
@@ -251,6 +299,7 @@ mod linux {
                     | "perf-sample"
                     | "perf-wakeup"
                     | "perf-side-band"
+                    | "perf-throttle"
                     | "perf-side-band-exec"
                     | "bpf-calls"
                     | "bpf-elements"
@@ -428,6 +477,7 @@ mod linux {
                     | "perf-exec"
                     | "perf-prctl"
                     | "perf-inherit"
+                    | "perf-throttle"
             ) {
                 host.measure_cpu_time();
             }
@@ -589,6 +639,7 @@ mod linux {
         perf_sample => ("perf-sample","perf"),
         perf_wakeup => ("perf-wakeup","perf"),
         perf_side_band => ("perf-side-band","perf"),
+        perf_throttle => ("perf-throttle","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),

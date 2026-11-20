@@ -2992,11 +2992,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `proc_dointvec` がベクトルを読むのと同じく、与えた数だけを設定します。不正な値は
   `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
   なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに、マシンの
-  `perf_event_mlock_kb`、`perf_event_paranoid`、`unprivileged_bpf_disabled` があります。
-  エミュレートするマシン全体に 1 つずつで、最初は Linux の既定値（516、2、2）です。
+  `perf_cpu_time_max_percent`、`perf_event_max_sample_rate`、`perf_event_mlock_kb`、
+  `perf_event_paranoid`、`unprivileged_bpf_disabled` があります。
+  エミュレートするマシン全体に 1 つずつで、最初は Linux の既定値（25、100000、516、2、2）です。
   root の持つモード 0644 のファイルで、書くために開けるのは root（どのユーザー名前空間の
   外でもユーザー ID 0）だけです（`EACCES`）。`perf_event_mlock_kb` と
-  `perf_event_paranoid` は任意の `int` を取ります（`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
+  `perf_event_paranoid` は任意の `int` を取ります（`proc_dointvec`）。
+  `perf_cpu_time_max_percent` は 0 から 100 まで、`perf_event_max_sample_rate` は 1 以上を
+  取ります（`EINVAL`）。後者は、Linux の `perf_event_max_sample_rate_handler` と同じく、
+  前者が 0 か 100 のあいだは拒まれます（`EINVAL`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
   と同じく、`CAP_SYS_ADMIN` のある書き手から（`EPERM`）0 から 2 まで（`EINVAL`）を
   取り、いったん 1 になるとほかの値を取りません（`EPERM`）。`perf_event_open` と `bpf` は
   そのときの値を確かめます。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
@@ -3549,7 +3553,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `text_poke`、カーネルのコールチェーン、物理アドレス、カーネルかハイパーバイザーの
   分岐）に、0 より大きければ CPU のイベントに、`CAP_PERFMON` か `CAP_SYS_ADMIN` が要ります
   （`EACCES`）。`namespaces` にはいつも要ります。そのあと、
-  ビット 63 の立った周期や `perf_event_max_sample_rate`（100000）を超える周波数は `EINVAL`、
+  ビット 63 の立った周期や `perf_event_max_sample_rate`（最初は 100000）を超える周波数は `EINVAL`、
   CPU とタスクのない `PERF_FLAG_PID_CGROUP` は `EINVAL`、イベントでないグループの
   ディスクリプタは `EBADF`、ないタスクは `ESRCH`、タスクも CPU もないときや最後より先の
   CPU は `EINVAL`、知らない `clockid` は `EINVAL` です。数えるイベントは、ソフトウェアの
@@ -3667,6 +3671,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `execve`（`PERF_RECORD_MISC_COMM_EXEC`）で書き、`execve` はそのあと新しい
   プログラムのスタックとマッピングを書きます。`PERF_RECORD_FORK` と `EXIT`
   （`task`、またはほかのどれか）は、スレッドが作られたときと終わったときに書きます。
+  `cpu-clock` と `task-clock` のイベントは、ティックの割り込みが
+  `perf_event_max_sample_rate` を `HZ` で割った数に届くと次のティックまで抑えられ、
+  そのあいだは数えません。グループのリーダーの `PERF_RECORD_THROTTLE` と `UNTHROTTLE`
+  （時刻、ID、`stream_id`）を書きます。
   ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。

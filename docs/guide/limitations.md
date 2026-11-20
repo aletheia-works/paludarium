@@ -280,9 +280,17 @@ verified.
   registers, stack and frames as of then, a fault's address is 0, and one
   of the kernel (a fault in a system call, a switch or a migration) has the
   address 0 and no kernel frames. `freq` follows the rate at those points,
-  not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
-  or `UNTHROTTLE`), and an event of a CPU takes none, nor any side-band
-  record. Of those, an `execve` writes the new program's mappings once it
+  not at each tick. A `cpu-clock` or `task-clock` event is throttled at
+  `perf_event_max_sample_rate` over `HZ` (1000) interrupts in a tick, as
+  Linux's hrtimer events are, the ticks being those of its own count, and
+  is unthrottled at the next one, when it is enabled again or when its
+  period is set: the `PERF_RECORD_UNTHROTTLE` of the latter two is written
+  with its next samples, by the thread it counts. Only the throttled event
+  stops, where Linux stops its whole group; the sample rate is not lowered
+  for samples that take too long (`perf_sample_event_took`), which
+  `perf_cpu_time_max_percent` sets the limit of; and no other event is
+  throttled, as no other event here is an hrtimer's or the hardware's. An
+  event of a CPU takes no samples, nor any side-band record. Of those, an `execve` writes the new program's mappings once it
   has loaded it, the stack's two first and the rest by address: the
   temporary stack's is placed at the top of 4-level user space with the
   length of the arguments' pages, where Linux gives where it was. Linux

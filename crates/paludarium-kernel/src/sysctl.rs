@@ -29,11 +29,15 @@
 //! takes, -1 for none, which a write from 0 sets: mode 0444, which
 //! `ipc_permissions` makes 0666 for whoever has `CAP_CHECKPOINT_RESTORE` or
 //! `CAP_SYS_ADMIN` over the namespace's user namespace. Beside them are the
-//! machine's `perf_event_mlock_kb`, `perf_event_paranoid` and
+//! machine's `perf_cpu_time_max_percent`, `perf_event_max_sample_rate`,
+//! `perf_event_mlock_kb`, `perf_event_paranoid` and
 //! `unprivileged_bpf_disabled` ([`Machine`]), which [`crate::perf`] and
 //! [`crate::bpf`] check: root's files of mode 0644, which only root opens to
 //! write. `perf_event_mlock_kb` and `perf_event_paranoid` take any `int`
-//! (`proc_dointvec`);
+//! (`proc_dointvec`); `perf_cpu_time_max_percent` 0 to 100, and
+//! `perf_event_max_sample_rate` 1 or more, refused (`EINVAL`) while
+//! `perf_cpu_time_max_percent` is 0 or 100, as Linux's
+//! `perf_event_max_sample_rate_handler`;
 //! `unprivileged_bpf_disabled` takes 0 to 2 from a writer with
 //! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
 //! `bpf_unpriv_handler`.
@@ -221,6 +225,8 @@ pub(crate) enum Kernel {
     Msgmax,
     Msgmnb,
     Msgmni,
+    PerfCpuTimeMaxPercent,
+    PerfEventMaxSampleRate,
     PerfEventMlockKb,
     PerfEventParanoid,
     Sem,
@@ -235,12 +241,17 @@ pub(crate) enum Kernel {
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
 /// name).
-const KERNEL: [(&[u8], Kernel); 15] = [
+const KERNEL: [(&[u8], Kernel); 17] = [
     (b"auto_msgmni", Kernel::AutoMsgmni),
     (b"msg_next_id", Kernel::MsgNextId),
     (b"msgmax", Kernel::Msgmax),
     (b"msgmnb", Kernel::Msgmnb),
     (b"msgmni", Kernel::Msgmni),
+    (b"perf_cpu_time_max_percent", Kernel::PerfCpuTimeMaxPercent),
+    (
+        b"perf_event_max_sample_rate",
+        Kernel::PerfEventMaxSampleRate,
+    ),
     (b"perf_event_mlock_kb", Kernel::PerfEventMlockKb),
     (b"perf_event_paranoid", Kernel::PerfEventParanoid),
     (b"sem", Kernel::Sem),
@@ -262,7 +273,11 @@ impl Kernel {
     fn ipc(self) -> bool {
         !matches!(
             self,
-            Self::PerfEventMlockKb | Self::PerfEventParanoid | Self::UnprivilegedBpfDisabled
+            Self::PerfCpuTimeMaxPercent
+                | Self::PerfEventMaxSampleRate
+                | Self::PerfEventMlockKb
+                | Self::PerfEventParanoid
+                | Self::UnprivilegedBpfDisabled
         )
     }
     /// Whether it is one of the IPC namespace's next IDs.
@@ -271,11 +286,14 @@ impl Kernel {
     }
 }
 
-/// The machine's `kernel.perf_event_mlock_kb`, `kernel.perf_event_paranoid`
-/// and `kernel.unprivileged_bpf_disabled`, one each for the whole emulated
-/// machine as Linux's are for the whole kernel, at Linux's defaults at
-/// first.
+/// The machine's `kernel.perf_cpu_time_max_percent`,
+/// `kernel.perf_event_max_sample_rate`, `kernel.perf_event_mlock_kb`,
+/// `kernel.perf_event_paranoid` and `kernel.unprivileged_bpf_disabled`, one
+/// each for the whole emulated machine as Linux's are for the whole kernel,
+/// at Linux's defaults at first.
 pub(crate) struct Machine {
+    perf_cpu_time_max_percent: AtomicI32,
+    perf_event_max_sample_rate: AtomicI32,
     perf_event_mlock_kb: AtomicI32,
     perf_event_paranoid: AtomicI32,
     unprivileged_bpf_disabled: AtomicI32,
@@ -284,6 +302,8 @@ pub(crate) struct Machine {
 impl Default for Machine {
     fn default() -> Self {
         Self {
+            perf_cpu_time_max_percent: AtomicI32::new(crate::perf::CPU_TIME_MAX_PERCENT),
+            perf_event_max_sample_rate: AtomicI32::new(crate::perf::MAX_SAMPLE_RATE),
             perf_event_mlock_kb: AtomicI32::new(crate::perf::MLOCK_KB),
             perf_event_paranoid: AtomicI32::new(crate::perf::PARANOID),
             unprivileged_bpf_disabled: AtomicI32::new(crate::bpf::UNPRIVILEGED_DISABLED),
@@ -301,12 +321,27 @@ impl Machine {
     pub(crate) fn perf_event_mlock_kb(&self) -> i32 {
         self.perf_event_mlock_kb.load(Ordering::SeqCst)
     }
+    /// The highest frequency a sampling event may ask for
+    /// (`sysctl_perf_event_sample_rate`).
+    pub(crate) fn perf_event_max_sample_rate(&self) -> u64 {
+        self.perf_event_max_sample_rate.load(Ordering::SeqCst) as u64
+    }
+    /// The interrupts of an event in one tick that throttle it
+    /// (`max_samples_per_tick`): the sample rate over `HZ`, rounded up.
+    pub(crate) fn perf_max_samples_per_tick(&self) -> u64 {
+        const HZ: u64 = 1_000_000_000 / crate::threads::TICK_NSEC;
+        self.perf_event_max_sample_rate().div_ceil(HZ)
+    }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
         self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
     }
     fn line(&self, file: Kernel) -> Vec<u8> {
         line(match file {
+            Kernel::PerfCpuTimeMaxPercent => self.perf_cpu_time_max_percent.load(Ordering::SeqCst),
+            Kernel::PerfEventMaxSampleRate => {
+                self.perf_event_max_sample_rate.load(Ordering::SeqCst)
+            }
             Kernel::PerfEventMlockKb => self.perf_event_mlock_kb(),
             Kernel::PerfEventParanoid => self.perf_event_paranoid(),
             _ => self.unprivileged_bpf_disabled(),
@@ -324,6 +359,32 @@ impl Machine {
             let (value, consumed) = parse(buf, None)?;
             sysctl.store(value, Ordering::SeqCst);
             return Ok(consumed);
+        }
+        match file {
+            // `perf_cpu_time_max_percent_handler`: 0 to 100, where 0 and
+            // 100 turn off the lowering of the sample rate that the
+            // emulator does not do (`perf_sample_event_took`).
+            Kernel::PerfCpuTimeMaxPercent => {
+                let (value, consumed) = parse(buf, Some((0, 100)))?;
+                self.perf_cpu_time_max_percent
+                    .store(value, Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            // `perf_event_max_sample_rate_handler`: refused before it is
+            // read while that lowering is off, then 1 or more.
+            Kernel::PerfEventMaxSampleRate => {
+                if matches!(
+                    self.perf_cpu_time_max_percent.load(Ordering::SeqCst),
+                    0 | 100
+                ) {
+                    return Err(Errno::EINVAL);
+                }
+                let (value, consumed) = parse(buf, Some((1, i32::MAX)))?;
+                self.perf_event_max_sample_rate
+                    .store(value, Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            _ => {}
         }
         // `bpf_unpriv_handler`.
         if !admin {
@@ -644,9 +705,11 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         Kernel::SemNextId => line(ipc.sem.with_ids(|ids| ids.next_id())),
         Kernel::MsgNextId => line(ipc.msg.with_ids(|ids| ids.next_id())),
         // The machine's ([`Machine`]), which are not the namespace's.
-        Kernel::PerfEventMlockKb | Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => {
-            Vec::new()
-        }
+        Kernel::PerfCpuTimeMaxPercent
+        | Kernel::PerfEventMaxSampleRate
+        | Kernel::PerfEventMlockKb
+        | Kernel::PerfEventParanoid
+        | Kernel::UnprivilegedBpfDisabled => Vec::new(),
     }
 }
 
@@ -720,9 +783,11 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
             }
             written
         }),
-        Kernel::PerfEventMlockKb | Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => {
-            Err(Errno::EINVAL)
-        }
+        Kernel::PerfCpuTimeMaxPercent
+        | Kernel::PerfEventMaxSampleRate
+        | Kernel::PerfEventMlockKb
+        | Kernel::PerfEventParanoid
+        | Kernel::UnprivilegedBpfDisabled => Err(Errno::EINVAL),
     }
 }
 
@@ -1562,7 +1627,7 @@ mod tests {
         );
         assert_eq!(lookup(b"/proc/sys/kernel/other", None), None);
         assert_eq!(entries_of(Directory::Sys, None).len(), 5);
-        assert_eq!(entries_of(Directory::Kernel, None).len(), 17);
+        assert_eq!(entries_of(Directory::Kernel, None).len(), 19);
         assert_eq!(lookup(b"/proc/system", None), None);
         assert_eq!(entries_of(Directory::Mqueue, None).len(), 7);
     }

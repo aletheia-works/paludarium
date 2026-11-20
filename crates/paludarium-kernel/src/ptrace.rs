@@ -1014,7 +1014,7 @@ impl Kernel {
         self.processes.changed().notify();
         // A signal sent while the thread was stopped is pending as it goes
         // on, as Linux queues it on the task, so the checkpoint takes it
-        // before it runs again a call the stop interrupted (`get_signal`
+        // before the call the stop interrupted runs again (`get_signal`
         // goes on past `ptrace_stop`).
         self.group.drain_process(&mut thread.state);
         self.inbox.drain(&mut thread.state);

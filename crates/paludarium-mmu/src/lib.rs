@@ -3340,9 +3340,9 @@ impl AddressSpaceData {
         }
     }
     /// After a read fault on `page`, which had no entry (an access's, or a
-    /// read through `get_user_pages`: a core dump's, `ptrace`'s, a lock's
-    /// population), gives entries to the pages around it that its file's
-    /// page cache holds, as Linux's
+    /// read through `get_user_pages`: a core dump's, `ptrace`'s), gives
+    /// entries to the pages around it that its file's page cache holds, as
+    /// Linux's
     /// `do_fault_around` maps them with `filemap_map_pages`: up to
     /// [`FAULT_AROUND_PAGES`] pages from `page`'s aligned block, or from the
     /// VMA's start if that is later, within the VMA and the page table. A
@@ -3885,9 +3885,13 @@ impl AddressSpaceData {
                         faults::count();
                     }
                     self.refresh(entry, page, prot, false);
-                    // A core dump's or `ptrace`'s read, and a lock's
-                    // population, fault in through `get_user_pages`, whose
-                    // `handle_mm_fault` maps around as an access does.
+                    // A core dump's or `ptrace`'s read faults in through
+                    // `get_user_pages`, whose `handle_mm_fault` maps around
+                    // as an access does. A lock's population reads here too,
+                    // but every page of its own VMA (`mlock` splits it), so
+                    // what this maps it would have anyway; Linux writes a
+                    // private writable one (`FOLL_WRITE`, `do_cow_fault`),
+                    // which maps nothing around.
                     if missing && matches!(access, Access::Read | Access::Fetch | Access::Dump) {
                         self.fault_around(&mut directory, page);
                     }

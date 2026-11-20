@@ -73,15 +73,19 @@ fn fixture_mode(_path: &Path) -> u32 {
 pub fn operation() {
     let directory = PathBuf::from(std::env::var_os("PALUDARIUM_PROGRAMS_OPERATION").unwrap());
     let binary = PathBuf::from(std::env::var_os("PALUDARIUM_PROGRAMS_BINARY").unwrap());
-    let mut args = vec![b"/program".to_vec()];
+    // The guest path of the program, which is also its argv[0]: a multicall
+    // binary such as coreutils picks its behaviour by that name.
+    let program = std::fs::read_to_string(directory.join("program"))
+        .map_or_else(|_| "/program".to_owned(), |path| path.trim_end().to_owned());
+    let mut args = vec![program.as_bytes().to_vec()];
     args.extend(
         std::fs::read_to_string(directory.join("args"))
             .unwrap()
             .lines()
             .map(|s| s.as_bytes().to_vec()),
     );
-    let mut config = Config::new("/program", args)
-        .with_file("/program", std::fs::read(binary).unwrap())
+    let mut config = Config::new(program.as_str(), args)
+        .with_file(program.as_str(), std::fs::read(binary).unwrap())
         .with_file("/tmp/.u10", Vec::new())
         .with_file("/home/guest/.guest", Vec::new());
     for line in std::fs::read_to_string(directory.join("environment"))
@@ -109,7 +113,11 @@ pub fn operation() {
             fixture_files(&mut config, &fixture.join("outside"), "/outside");
         }
     }
-    let host = Arc::new(CaptureHost(RecordingHost::new()));
+    // A case's stdin, when it has one; otherwise stdin is empty.
+    let host = Arc::new(CaptureHost(match std::fs::read(directory.join("stdin")) {
+        Ok(input) => RecordingHost::with_stdin(&input),
+        Err(_) => RecordingHost::new(),
+    }));
     std::fs::write(
         directory.join("fixture-modes"),
         config

@@ -6,7 +6,7 @@ import struct
 
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 # The guest binaries every build produces.
-GUESTS = ("probe", "aube", "ripgrep")
+GUESTS = ("probe", "aube", "ripgrep", "coreutils")
 # Guest-only license exceptions for the fixed aube source. Each crate's full
 # license text is retained from its crates.io package: (file, required text).
 LICENSE_EXCEPTIONS = [
@@ -16,7 +16,18 @@ LICENSE_EXCEPTIONS = [
 LICENSE_TEXTS = {
     "webpki-root-certs@1.0.10": ("LICENSE", (b"Community Data License Agreement", b"2.1.")),
     "option-ext@0.2.0": ("LICENSE.txt", (b"Mozilla Public License Version 2.0",)),
+    "notify@8.2.2": (
+        "LICENSE-CC0",
+        (b"Creative Commons CC0 1.0 Universal", b"Statement of Purpose"),
+    ),
 }
+# The coreutils guest's only license exception, which the user allowed on
+# 2026-10-22 for coreutils alone: notify, which uu_tail uses, is CC0-1.0.
+# The coreutils audit uses the root policy with this one exception added.
+COREUTILS_LICENSE_EXCEPTIONS = [{"crate": "notify@8.2.2", "allow": ["CC0-1.0"]}]
+COREUTILS_LICENSE_SUFFIX = (
+    b'\n[[licenses.exceptions]]\ncrate = "notify@8.2.2"\nallow = ["CC0-1.0"]\n'
+)
 # RustSec advisories aube's audit ignores for now: the zstd 0.13 ones, which
 # aube gets through decmpfs's exact `zstd = "=0.13.3"` pin and cannot update.
 # Remove them once a decmpfs release takes zstd 0.14 (SocketDev/decmpfs#16).
@@ -54,6 +65,15 @@ def guest_policy(root_bytes, exceptions, advisories):
     return root_bytes.replace(ROOT_IGNORE, advisory_ignore(advisories)) + LICENSE_SUFFIX
 
 
+def coreutils_policy(root_bytes, exceptions):
+    """The root policy with coreutils' approved license exception, and nothing else."""
+    if exceptions != COREUTILS_LICENSE_EXCEPTIONS:
+        raise ValueError("unapproved coreutils license exception")
+    if root_bytes.count(ROOT_IGNORE) != 1:
+        raise ValueError("root policy lacks one empty advisory ignore list")
+    return root_bytes + COREUTILS_LICENSE_SUFFIX
+
+
 def license_file_name(exception):
     name, version = exception["crate"].split("@")
     return f"{name}-{version}-{exception['allow'][0]}.txt"
@@ -80,7 +100,23 @@ def policy_receipt_valid(directory, receipt, root_bytes):
             raise ValueError("license text hash differs")
         if retained["source"] != REGISTRY:
             raise ValueError("license exception crate is not from crates.io")
-    if receipt["audits"] != {"probe": 0, "aube": 0, "ripgrep": 0}:
+    coreutils = receipt["coreutils_license_policy"]
+    if coreutils["exceptions"] != COREUTILS_LICENSE_EXCEPTIONS:
+        raise ValueError("unapproved coreutils license exception")
+    config = directory / "coreutils-deny.toml"
+    if config.read_bytes() != coreutils_policy(root_bytes, coreutils["exceptions"]):
+        raise ValueError("coreutils config does not inherit exact root policy")
+    if digest(config) != coreutils["guest_config_sha256"]:
+        raise ValueError("coreutils config hash differs")
+    if set(coreutils["licenses"]) != {e["crate"] for e in COREUTILS_LICENSE_EXCEPTIONS}:
+        raise ValueError("coreutils license text set differs")
+    for exception in COREUTILS_LICENSE_EXCEPTIONS:
+        retained = coreutils["licenses"][exception["crate"]]
+        if digest(directory / "licenses" / license_file_name(exception)) != retained["sha256"]:
+            raise ValueError("license text hash differs")
+        if retained["source"] != REGISTRY:
+            raise ValueError("license exception crate is not from crates.io")
+    if receipt["audits"] != {"probe": 0, "aube": 0, "ripgrep": 0, "coreutils": 0}:
         raise ValueError("full guest dependency audits did not pass")
 
 

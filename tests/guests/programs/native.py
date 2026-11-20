@@ -8,6 +8,7 @@ import shutil
 import tempfile
 
 from comparison import probe_pass
+from coreutils import observe_coreutils
 from evidence import digest, snapshot, validate
 from metadata import fixture_inputs
 from runner import run
@@ -68,6 +69,7 @@ def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None
         app = root / "fixture/app"
         observations["fixture_input_modes"] = fixture_inputs(root / "fixture")
         observations["ripgrep"] = observe_ripgrep(guests, app, env)
+        observations["coreutils"] = observe_coreutils(guests, root / "coreutils", env)
         (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
         for case in config["aube"]:
             if case.get("before") == "remove-node-modules":
@@ -83,5 +85,6 @@ def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None
         observations["native_complete"] = True
         (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
     print(
-        "fixed guest programs native: probe eight items + standard run; aube four commands; node ENOENT"
+        "fixed guest programs native: probe eight items + standard run; aube four commands; node ENOENT;"
+        " ripgrep and coreutils cases"
     )

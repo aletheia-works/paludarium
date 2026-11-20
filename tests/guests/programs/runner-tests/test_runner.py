@@ -23,6 +23,13 @@ class RunnerTests(unittest.TestCase):
         row = self.execute('import sys; print("out"); print("err", file=sys.stderr)')
         self.assertEqual((row["stdout"], row["stderr"], row["exit"]), ("out\n", "err\n", 0))
 
+    def test_stdin_bytes_reach_the_child(self):
+        row = self.execute("import sys; print(sys.stdin.read().upper())", stdin=b"in\n")
+        self.assertEqual((row["stdout"], row["exit"]), ("IN\n\n", 0))
+        self.assertEqual(
+            self.execute("import sys; print(repr(sys.stdin.read()))")["stdout"], "''\n"
+        )
+
     def test_nonzero_preserved(self):
         self.assertEqual(self.execute("raise SystemExit(7)")["exit"], 7)
 

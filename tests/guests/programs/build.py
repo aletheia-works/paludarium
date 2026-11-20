@@ -12,6 +12,7 @@ import urllib.request
 from evidence import (
     LICENSE_TEXTS,
     REGISTRY,
+    coreutils_policy,
     digest,
     guest_policy,
     license_file_name,
@@ -83,6 +84,7 @@ def build(directory):
         "target": lock["target"],
         "aube": lock["aube"],
         "ripgrep": lock["ripgrep"],
+        "coreutils": lock["coreutils"],
         "binaries": {},
         "audits": {},
     }
@@ -91,6 +93,7 @@ def build(directory):
     source.mkdir(exist_ok=True)
     upstream = source / "aube"
     ripgrep = source / "ripgrep"
+    coreutils = source / "coreutils"
     try:
         # cargo-deny 0.20.2 graph/config arguments are top-level options,
         # before `check`. Validate parsing before downloading/building guests.
@@ -115,8 +118,12 @@ def build(directory):
         fetch(source, "ripgrep", "BurntSushi/ripgrep", lock["ripgrep"]["revision"], directory)
         if digest(ripgrep / "Cargo.lock") != lock["ripgrep"]["lock_sha256"]:
             raise ValueError("fixed ripgrep Cargo.lock mismatch")
+        fetch(source, "coreutils", "uutils/coreutils", lock["coreutils"]["revision"], directory)
+        if digest(coreutils / "Cargo.lock") != lock["coreutils"]["lock_sha256"]:
+            raise ValueError("fixed coreutils Cargo.lock mismatch")
         receipt["source_before"] = snapshot(upstream)
         receipt["ripgrep_source_before"] = snapshot(ripgrep)
+        receipt["coreutils_source_before"] = snapshot(coreutils)
         root_policy = (ROOT / "deny.toml").read_bytes()
         guest_config = directory / "aube-deny.toml"
         guest_config.write_bytes(
@@ -151,6 +158,35 @@ def build(directory):
             "guest_config_sha256": digest(guest_config),
             "licenses": retain_licenses(metadata, lock["guest_license_exceptions"], directory),
         }
+        # coreutils keeps its own config: the root policy with only its
+        # approved license exception, and the root's advisory rules.
+        coreutils_config = directory / "coreutils-deny.toml"
+        coreutils_config.write_bytes(
+            coreutils_policy(root_policy, lock["coreutils_license_exceptions"])
+        )
+        coreutils_metadata = json.loads(
+            subprocess.check_output(
+                [
+                    "cargo",
+                    "+" + lock["toolchain"],
+                    "metadata",
+                    "--locked",
+                    "--all-features",
+                    "--manifest-path",
+                    str(coreutils / "Cargo.toml"),
+                    "--format-version",
+                    "1",
+                ],
+                text=True,
+            )
+        )
+        receipt["coreutils_license_policy"] = {
+            "exceptions": lock["coreutils_license_exceptions"],
+            "guest_config_sha256": digest(coreutils_config),
+            "licenses": retain_licenses(
+                coreutils_metadata, lock["coreutils_license_exceptions"], directory
+            ),
+        }
         primer = directory / "empty-primer.rkyv.zst"
         primer.write_bytes(b"")
         cargo = ["cargo", "+" + lock["toolchain"]]
@@ -166,6 +202,7 @@ def build(directory):
             ("probe", HERE / "probe/Cargo.toml", ROOT / "deny.toml"),
             ("aube", upstream / "Cargo.toml", guest_config),
             ("ripgrep", ripgrep / "Cargo.toml", ROOT / "deny.toml"),
+            ("coreutils", coreutils / "Cargo.toml", coreutils_config),
         ]:
             command(
                 [
@@ -186,6 +223,22 @@ def build(directory):
             ("probe", HERE / "probe/Cargo.toml", [], "paludarium-probe"),
             ("aube", upstream / "Cargo.toml", ["-p", "aube", "--bin", "aube"], "aube"),
             ("ripgrep", ripgrep / "Cargo.toml", ["-p", "ripgrep", "--bin", "rg"], "rg"),
+            # The multicall binary, run as `coreutils <utility> ...`. stdbuf's
+            # cdylib cannot be built for musl, so the musl feature set is used.
+            (
+                "coreutils",
+                coreutils / "Cargo.toml",
+                [
+                    "-p",
+                    "coreutils",
+                    "--bin",
+                    "coreutils",
+                    "--no-default-features",
+                    "--features",
+                    "feat_os_unix_musl",
+                ],
+                "coreutils",
+            ),
         ]:
             args = [
                 *cargo,
@@ -222,6 +275,7 @@ def build(directory):
         try:
             record_source_after(upstream, receipt)
             record_source_after(ripgrep, receipt, "ripgrep_source")
+            record_source_after(coreutils, receipt, "coreutils_source")
         except Exception as error:
             receipt["exit"] = 1
             receipt["source_unchanged"] = False

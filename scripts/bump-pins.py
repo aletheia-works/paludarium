@@ -5,6 +5,7 @@
     bump-pins.py rust-version --body body.md   # Cargo.toml: the latest stable Rust
     bump-pins.py aube --body body.md           # source-lock.json, the feature pages
     bump-pins.py ripgrep --body body.md        # the same for ripgrep
+    bump-pins.py coreutils --body body.md      # the same for uutils coreutils
     bump-pins.py --self-test
 
 When the pin moves, the pull request title goes to stdout and its body to
@@ -30,7 +31,21 @@ SOURCE_LOCK = "tests/guests/programs/source-lock.json"
 FEATURE_PAGES = ("docs/guide/features.md", "docs/ja/guide/features.md")
 DIST = "https://static.rust-lang.org/dist"
 # The guests built from a fixed release: their GitHub repositories.
-GUESTS = {"aube": "aubepkg/aube", "ripgrep": "BurntSushi/ripgrep"}
+GUESTS = {
+    "aube": "aubepkg/aube",
+    "ripgrep": "BurntSushi/ripgrep",
+    "coreutils": "uutils/coreutils",
+}
+# What a guest's bump must also check, beyond its build, audit and tests.
+GUEST_NOTES = {
+    "coreutils": [
+        "",
+        "coreutils_license_exceptions in source-lock.json names notify by its exact",
+        "version (CC0-1.0, allowed for coreutils only). If the release moves notify,",
+        "the build stops there: update the version in source-lock.json and",
+        "tests/guests/programs/evidence.py, and only for the same license.",
+    ],
+}
 # The hosts CI and contributors build on; each needs the whole toolchain.
 HOSTS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc")
 # A nightly with a missing component is skipped; give up after this many days.
@@ -185,6 +200,7 @@ def bump_guest(name, get=fetch):
             "",
             "If the guest build, its audit or the differential tests fail, fix the cause",
             f"in {name} itself rather than adding an exception here.",
+            *GUEST_NOTES.get(name, []),
         ]
     )
     return f"chore(guests): bump {name} to {tag}", body
@@ -323,6 +339,8 @@ def self_test():
             + guest_line("aube", "v2.8.1", "a" * 40, "b" * 64)
             + ",\n"
             + guest_line("ripgrep", "15.2.0", "d" * 40, "e" * 64)
+            + ",\n"
+            + guest_line("coreutils", "0.13.0", "f" * 40, "0" * 64)
             + "\n}\n"
         )
         for page in FEATURE_PAGES:
@@ -330,6 +348,7 @@ def self_test():
             (ROOT / page).write_text(
                 "- **probe**: x\n- **aube**: a package manager (v2.8.1).\n"
                 "- **ripgrep**: a search tool (15.2.0).\n"
+                "- **coreutils**: the uutils utilities (0.13.0).\n"
             )
 
         def aube_get(tag):
@@ -363,6 +382,13 @@ def self_test():
         for page in FEATURE_PAGES:
             text = (ROOT / page).read_text()
             assert "(15.10.0)" in text and "(v2.10.0)" in text, text
+        title, body = bump_guest("coreutils", aube_get("0.14.0"))
+        assert title == "chore(guests): bump coreutils to 0.14.0", title
+        assert "notify" in body, body
+        locks = json.loads((ROOT / SOURCE_LOCK).read_text())
+        assert locks["coreutils"]["tag"] == "0.14.0" and locks["ripgrep"]["tag"] == "15.10.0"
+        for page in FEATURE_PAGES:
+            assert "(0.14.0)" in (ROOT / page).read_text()
 
         # A value that is not there exactly once stops the bump.
         try:

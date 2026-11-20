@@ -9,6 +9,7 @@ import tempfile
 
 from comparison import compare, probe_pass
 from comparison_args import compare_original, comparison_config
+from coreutils import compare_coreutils, environment, fresh_fixture, inputs, stdin_of
 from evidence import snapshot
 from metadata import fixture_inputs
 from native import observe
@@ -19,8 +20,24 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 
 
-def operation(executable, binary, args, directory, environment, fixture=None, mounted=False):
+def operation(
+    executable,
+    binary,
+    args,
+    directory,
+    environment,
+    fixture=None,
+    mounted=False,
+    *,
+    stdin=None,
+    inputs=fixture_inputs,
+    program=None,
+):
     directory.mkdir(parents=True)
+    if program is not None:
+        (directory / "program").write_text(program + "\n")
+    if stdin is not None:
+        (directory / "stdin").write_bytes(stdin)
     (directory / "args").write_text("\n".join(args) + ("\n" if args else ""))
     (directory / "environment").write_text(
         "".join(k + "=" + v + "\n" for k, v in environment.items())
@@ -58,11 +75,11 @@ def operation(executable, binary, args, directory, environment, fixture=None, mo
         row["filesystem"] = snapshot(fixture)
         recorded = (directory / "fixture-modes").read_text()
         row["fixture_input_modes"] = (
-            fixture_inputs(fixture)
+            inputs(fixture)
             if mounted
             else {line.split("\t")[0]: int(line.split("\t")[1]) for line in recorded.splitlines()}
         )
-        if not mounted and row["fixture_input_modes"] != fixture_inputs(fixture):
+        if not mounted and row["fixture_input_modes"] != inputs(fixture):
             raise ValueError("private VFS fixture metadata differs from native input")
     return row
 
@@ -149,6 +166,33 @@ def differential(executable, *, original_argv=False):
             ),
             record_ripgrep,
         )
+        observations["coreutils"] = {}
+
+        def record_coreutils(name, row):
+            observations["coreutils"][name] = row
+            (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
+
+        def run_coreutils(case):
+            # A fresh copy per case; one that writes runs on the copy mounted
+            # at /, so its files can be compared with Linux's afterwards.
+            copy = fresh_fixture(scratch / "coreutils" / case["name"])
+            if case.get("writes"):
+                (copy / "app/tmp").mkdir()
+                (copy / "app/home/guest").mkdir(parents=True)
+            return operation(
+                executable,
+                guests / "coreutils",
+                case["args"],
+                operations / ("coreutils-" + case["name"]),
+                environment(config["environment"], case),
+                copy,
+                mounted=bool(case.get("writes")),
+                stdin=stdin_of(case, copy),
+                inputs=inputs,
+                program="/coreutils",
+            )
+
+        compare_coreutils(native, guests, run_coreutils, record_coreutils)
         for case in config["aube"][:2]:
             name = "default-" + case["name"]
             row = operation(
@@ -195,7 +239,7 @@ def differential(executable, *, original_argv=False):
         (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
     print(
         "fixed guest programs differential: eight probe items, four aube commands"
-        " and the ripgrep searches passed"
+        ", the ripgrep searches and the coreutils cases passed"
     )
 
 

@@ -13,3 +13,13 @@ Compare exit and complete stdout and stderr; never remove FAIL lines, missing ch
 Fixture package manifests are regular files with mode 0644, observed by the native Linux metadata oracle. C10's optional initial file_modes preserve those permissions; existing with_file and program placement retain 0755. Both input modes and original outputs are recorded. The bounded mounted fixture prepares tmp and home/u10 directories before guest operations; the default VFS install remains a required comparison.
 
 Node absence is observed independently using the probe's environment diagnostic, with ENOENT required. Native network namespace identity and empty routing are recorded; namespace failure is infrastructure failure, not a guest PASS. Every operation has a 30-second outer deadline and child process-group cleanup/reaping, even after nominal success. Expected outputs are generated in each CI run and are never checked in as golden files.
+
+## ripgrep and coreutils
+
+ripgrep and uutils coreutils are built from the fixed releases in source-lock.json, audited before any guest is compiled, and compared on x86-64 Linux with fresh native rows from the same bytes. Their rows are compared exactly: exit, stdout, stderr and that the guest exited by itself. No normalization is applied, because both print only the relative paths they are given.
+
+ripgrep runs the searches in ripgrep-cases.json in fixture/app, before aube changes it.
+
+coreutils is one multicall binary, run as `coreutils <utility> ...`; the emulator gives it the guest path /coreutils, which is also its argv[0], because the binary chooses the utility by that name. Each case in coreutils-cases.json starts from a fresh copy of coreutils-fixture, whose files are 0644. A case marked writes runs on the copy mounted at the guest's /, and the copy's file contents afterwards are compared too. The other cases run on the emulator's own file system. A case with stdin gives a fixture file's bytes on a pipe natively and as the emulator's stdin. TZ=UTC comes from cases.json; the one case with its own TZ uses the POSIX string JST-9, which needs no time zone files. Usage errors are left out, because they name the binary by argv[0]. id, uname, pwd and env are left out, because they print the host's identity, path and environment, which differ by design. Every coreutils case runs before a mismatch is raised, so one run lists every difference.
+
+coreutils' audit uses the root deny.toml with one license exception, for coreutils alone: notify 8.2.2 (CC0-1.0, through uu_tail), whose full license text the build keeps. It is built with `--no-default-features --features feat_os_unix_musl`, because stdbuf's cdylib cannot be built for musl.

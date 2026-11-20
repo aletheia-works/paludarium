@@ -36,7 +36,8 @@ def reap_group(pid):
             time.sleep(0.005)
 
 
-def run(command, *, cwd, env, timeout=30):
+def run(command, *, cwd, env, timeout=30, stdin=None):
+    """Runs `command` with `stdin`'s bytes on a pipe, or with /dev/null."""
     if not 0 < timeout <= 30:
         raise ValueError("guest deadline must be at most 30 seconds")
     enable_reaping()
@@ -46,13 +47,13 @@ def run(command, *, cwd, env, timeout=30):
         cwd=cwd,
         env=env,
         start_new_session=True,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     timed_out = False
     try:
-        stdout, stderr = child.communicate(timeout=timeout)
+        stdout, stderr = child.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         cleanup_group(child.pid)

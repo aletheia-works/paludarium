@@ -108,7 +108,7 @@ or run a task.
 - `ci.yml` (every pull request): unit tests on three OSes, rustfmt, clippy
   (`-D warnings`, also with the stable Rust that `rust-version` names for the
   Linux, macOS and Windows targets), the wasm32 build, cargo-deny, differential tests, 80 %
-  coverage, probe, aube and ripgrep differential tests, the WebAssembly acceptance
+  coverage, probe, aube, ripgrep and coreutils differential tests, the WebAssembly acceptance
   tests, polyglot lint, the documentation build and the release package
   check. A pull request runs the jobs its changed files need
   (`scripts/ci-changes.py`); the expensive jobs start once lint, clippy,
@@ -120,7 +120,7 @@ or run a task.
   passing night closes it.
 - `bump-pins.yml` (every Monday): moves the nightly pinned in
   `rust-toolchain.toml`, the workspace's `rust-version` (the latest stable
-  Rust) and the aube and ripgrep guests in
+  Rust) and the aube, ripgrep and coreutils guests in
   `tests/guests/programs/source-lock.json` to their latest releases
   (`scripts/bump-pins.py`), one pull request each from aletheia-works-bot that
   merges itself once `ci-ok` passes. Workflows name the toolchain through

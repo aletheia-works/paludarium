@@ -11,11 +11,14 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from evidence import (
     ADVISORY_EXCEPTIONS,
+    COREUTILS_LICENSE_EXCEPTIONS,
+    COREUTILS_LICENSE_SUFFIX,
     LICENSE_EXCEPTIONS,
     LICENSE_SUFFIX,
     REGISTRY,
     ROOT_IGNORE,
     advisory_ignore,
+    coreutils_policy,
     digest,
     guest_policy,
     json_source_lock,
@@ -58,6 +61,26 @@ class PolicyTests(unittest.TestCase):
             [entry["id"] for entry in config["advisories"]["ignore"]],
             [a["id"] for a in ADVISORY_EXCEPTIONS],
         )
+
+    def test_coreutils_policy_adds_only_its_license_exception(self):
+        self.assertEqual(
+            json_source_lock()["coreutils_license_exceptions"], COREUTILS_LICENSE_EXCEPTIONS
+        )
+        config = coreutils_policy(EMPTY, COREUTILS_LICENSE_EXCEPTIONS)
+        self.assertEqual(config, EMPTY + COREUTILS_LICENSE_SUFFIX)
+        parsed = tomllib.loads(config.decode())
+        self.assertEqual(parsed["licenses"]["exceptions"], COREUTILS_LICENSE_EXCEPTIONS)
+        self.assertEqual(parsed["advisories"]["ignore"], [])
+        for exceptions in (
+            [],
+            [{"crate": "notify@8.2.3", "allow": ["CC0-1.0"]}],
+            [{"crate": "notify@8.2.2", "allow": ["CC0-1.0", "MIT"]}],
+            [*COREUTILS_LICENSE_EXCEPTIONS, *LICENSE_EXCEPTIONS[:1]],
+        ):
+            with self.subTest(exceptions=exceptions), self.assertRaises(ValueError):
+                coreutils_policy(EMPTY, exceptions)
+        with self.assertRaises(ValueError):
+            coreutils_policy(b"", COREUTILS_LICENSE_EXCEPTIONS)
 
     def test_root_policy_lacking_one_empty_ignore_list_rejected(self):
         for root in (b"", EMPTY + EMPTY, b'[advisories]\nignore = ["RUSTSEC-0000-0000"]\n'):
@@ -111,8 +134,23 @@ class PolicyTests(unittest.TestCase):
                 license_file = directory / "licenses" / license_file_name(exception)
                 license_file.write_bytes(b"complete test license fixture\n")
                 licenses[exception["crate"]] = {"source": REGISTRY, "sha256": digest(license_file)}
+            coreutils_config = directory / "coreutils-deny.toml"
+            coreutils_config.write_bytes(coreutils_policy(root, COREUTILS_LICENSE_EXCEPTIONS))
+            coreutils_licenses = {}
+            for exception in COREUTILS_LICENSE_EXCEPTIONS:
+                license_file = directory / "licenses" / license_file_name(exception)
+                license_file.write_bytes(b"complete test license fixture\n")
+                coreutils_licenses[exception["crate"]] = {
+                    "source": REGISTRY,
+                    "sha256": digest(license_file),
+                }
             receipt = {
-                "audits": {"probe": 0, "aube": 0, "ripgrep": 0},
+                "audits": {"probe": 0, "aube": 0, "ripgrep": 0, "coreutils": 0},
+                "coreutils_license_policy": {
+                    "exceptions": copy.deepcopy(COREUTILS_LICENSE_EXCEPTIONS),
+                    "guest_config_sha256": digest(coreutils_config),
+                    "licenses": coreutils_licenses,
+                },
                 "license_policy": {
                     "exceptions": copy.deepcopy(LICENSE_EXCEPTIONS),
                     "advisories": copy.deepcopy(ADVISORY_EXCEPTIONS),
@@ -155,6 +193,29 @@ class PolicyTests(unittest.TestCase):
             receipt["license_policy"]["advisories"] = copy.deepcopy(ADVISORY_EXCEPTIONS)
             policy_receipt_valid(directory, receipt, root)
             receipt["audits"]["aube"] = 4
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            receipt["audits"]["aube"] = 0
+            coreutils = receipt["coreutils_license_policy"]
+            coreutils_config.write_bytes(root)
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            coreutils_config.write_bytes(coreutils_policy(root, COREUTILS_LICENSE_EXCEPTIONS))
+            cc0 = directory / "licenses/notify-8.2.2-CC0-1.0.txt"
+            cc0.write_bytes(b"truncated")
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            cc0.write_bytes(b"complete test license fixture\n")
+            coreutils["exceptions"] = []
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            coreutils["exceptions"] = copy.deepcopy(COREUTILS_LICENSE_EXCEPTIONS)
+            coreutils["licenses"]["notify@8.2.2"]["source"] = "git+https://example.invalid"
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            coreutils["licenses"]["notify@8.2.2"]["source"] = REGISTRY
+            policy_receipt_valid(directory, receipt, root)
+            receipt["audits"]["coreutils"] = 4
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
 

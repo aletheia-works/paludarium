@@ -1,0 +1,8 @@
+pear
+apple
+fig
+apple
+banana
+cherry
+fig
+kiwi

@@ -5414,6 +5414,15 @@ one only with an `--allow-net`.
   errors, give the same output and exit status as on real Linux. `--version`
   is not compared, because it reports the SIMD features `CPUID` shows, which
   paludarium limits on purpose.
+- **coreutils**: uutils coreutils (0.13.0), the GNU utilities rewritten in
+  Rust, built as one multicall binary. 68 cases of 47 utilities give the
+  same output, exit status and, for the 15 that change files, the same files
+  as on real Linux. They read, sort, cut and count text, hash and encode it,
+  list and stat files, print dates in two time zones, and copy, move, link,
+  split and remove files, with errors such as a missing file or a directory
+  that is not empty. `id`, `uname`, `pwd` and `env` are not compared, because
+  they print the host's identity, path and environment.
 
-All of them give the same results as a real x86-64 Linux on Linux, macOS and
-Windows, and on Node.js, Chromium, Firefox and Safari.
+All of them except coreutils give the same results as a real x86-64 Linux on
+Linux, macOS and Windows, and on Node.js, Chromium, Firefox and Safari.
+coreutils is compared on x86-64 Linux so far.

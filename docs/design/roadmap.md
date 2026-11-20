@@ -12,16 +12,18 @@ paludarium was built from the ground up in these stages.
 | Release | Publish to crates.io, npm and JSR | crates.io and npm since 0.1.0, JSR from the first release after 0.15.0 ([releases](https://github.com/aletheia-works/paludarium/releases)) |
 
 Each stage moved on only after differential tests showed that its programs give
-the same results as a real x86-64 Linux. ripgrep has since joined probe and
-aube as a verified program ([Supported features](../guide/features#programs-verified)).
+the same results as a real x86-64 Linux. ripgrep and uutils coreutils have
+since joined probe and aube as verified programs ([Supported features](../guide/features#programs-verified)).
 
 ## Next
 
 Nothing here is a promise, but these are on the table:
 
-- Two more verified programs, uutils coreutils and the brush shell, once
-  their next releases pass the guest audit (the current ones are held back
-  by yanked crates and security advisories in their dependencies).
+- One more verified program, the brush shell, once its next release passes
+  the guest audit (the current one is held back by yanked crates and
+  security advisories in its dependencies).
+- coreutils on the other hosts: macOS, Windows and the WebAssembly
+  environments, where ripgrep already runs.
 - More system calls and instructions (see [Limitations](../guide/limitations)).
 - The native JIT (`--jit`, experimental on Linux x86-64): turning it on by
   default once the criteria in [Decisions](decisions#when-the-native-jit-is-turned-on-by-default)

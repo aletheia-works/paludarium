@@ -250,6 +250,19 @@ const FORMS: &[&[u8]] = &[
     &[0x66, 0xf7, 0xee],
     &[0x48, 0x0f, 0xaf, 0xc3],
     &[0x0f, 0xaf, 0xc1],
+    // string moves, once and repeated (repne repeats as rep), forward or,
+    // with DF set, back; fs adds its base to rsi
+    &[0xa4],
+    &[0x66, 0xa5],
+    &[0xa5],
+    &[0x48, 0xa5],
+    &[0x64, 0xa4],
+    &[0xf3, 0xa4],
+    &[0xf3, 0x66, 0xa5],
+    &[0xf3, 0xa5],
+    &[0xf3, 0x48, 0xa5],
+    &[0xf2, 0xa4],
+    &[0x64, 0xf3, 0x48, 0xa5],
     // div and idiv of a register
     &[0x48, 0xf7, 0xf3],
     &[0xf7, 0xf1],
@@ -399,6 +412,11 @@ const FORMS: &[&[u8]] = &[
 
 /// Instructions that must keep running in [`exec::execute`].
 const OTHERS: &[&[u8]] = &[
+    // A string move with 32-bit addresses, and the other repeated strings.
+    &[0x67, 0xf3, 0xa4],
+    &[0xf3, 0x48, 0xab],
+    &[0x48, 0xab],
+    &[0xf3, 0xa6],
     &[0xf0, 0x48, 0x01, 0x03],
     &[0x48, 0x0f, 0xa3, 0x03],
     &[0xf3, 0x48, 0x0f, 0xbc, 0x03],
@@ -507,7 +525,8 @@ fn state(random: &mut Random) -> CpuState {
     }
     // The index registers are small, so that scaled addresses stay near.
     s.gpr[reg::RCX] = random.next() % 64;
-    s.rflags = (random.next() & flag::STATUS) | flag::RESERVED1;
+    // DF too, so that string moves also step back.
+    s.rflags = (random.next() & (flag::STATUS | flag::DF)) | flag::RESERVED1;
     s.fs_base = random.next() % 0x100;
     for x in &mut s.xmm {
         *x = u128::from(random.next()) | (u128::from(random.next()) << 64);

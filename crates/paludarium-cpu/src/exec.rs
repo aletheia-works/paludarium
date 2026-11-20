@@ -64,7 +64,7 @@ fn atomic_width(size: u8) -> Result<AtomicWidth> {
 /// Upper bound of `rep` iterations per step, so that a huge `rcx` cannot
 /// keep one step running forever (the instruction is resumed next step, as
 /// on hardware where `rep` is interruptible).
-const REP_CHUNK: u64 = 4096;
+pub const REP_CHUNK: u64 = 4096;
 
 thread_local! {
     /// The iterations a repeated string instruction runs in one step: one
@@ -1054,6 +1054,7 @@ impl Exec<'_> {
             u64::MAX
         };
         let mut budget = REP_ITERATIONS.with(std::cell::Cell::get);
+        let mut ran = false;
         loop {
             if repeat {
                 if self.s.gpr[reg::RCX] & address_mask == 0 {
@@ -1091,17 +1092,39 @@ impl Exec<'_> {
                 m,
                 Mnemonic::Lodsb | Mnemonic::Lodsw | Mnemonic::Lodsd | Mnemonic::Lodsq
             );
+            // A fault after an iteration of this step ends the step there,
+            // with the iterations it made; the next step gives the fault,
+            // as the native JIT's code for a string move does. Only a
+            // comparison keeps going to the fault: its flags at the fault
+            // depend on where it started (`rep_fault_flags`).
+            let early = |stop: Stop| {
+                if ran && matches!(stop, Stop::Fault(_)) {
+                    Ok(false)
+                } else {
+                    Err(stop)
+                }
+            };
             match m {
                 Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd | Mnemonic::Movsq => {
-                    let v = self.load(source, size)?;
-                    self.store(rdi, size, v)?;
+                    let v = match self.load(source, size) {
+                        Ok(v) => v,
+                        Err(stop) => return early(stop),
+                    };
+                    if let Err(stop) = self.store(rdi, size, v) {
+                        return early(stop);
+                    }
                 }
                 Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => {
                     let v = self.s.gpr[reg::RAX] & size_mask(size);
-                    self.store(rdi, size, v)?;
+                    if let Err(stop) = self.store(rdi, size, v) {
+                        return early(stop);
+                    }
                 }
                 Mnemonic::Lodsb | Mnemonic::Lodsw | Mnemonic::Lodsd | Mnemonic::Lodsq => {
-                    let value = self.load(source, size)?;
+                    let value = match self.load(source, size) {
+                        Ok(v) => v,
+                        Err(stop) => return early(stop),
+                    };
                     self.write_reg(Register::Gpr { index: 0, size }, value);
                 }
                 _ => {
@@ -1124,6 +1147,7 @@ impl Exec<'_> {
             if !repeat {
                 return Ok(true);
             }
+            ran = true;
             self.s.gpr[reg::RCX] = self.s.gpr[reg::RCX].wrapping_sub(1) & address_mask;
             if is_comparison_string(m)
                 && ((self.i.rep == RepPrefix::Rep && !self.s.flag(flag::ZF))

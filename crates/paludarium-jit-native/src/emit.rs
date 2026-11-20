@@ -16,7 +16,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use paludarium_cpu::compile::{Address, Alu, Count, Fast, Form, Shift, Source, Unary};
+use paludarium_cpu::compile::{Address, Alu, Count, Fast, Form, REP_CHUNK, Shift, Source, Unary};
 use paludarium_cpu::{CpuState, flag};
 use paludarium_decoder::{Condition, Mnemonic, Register, Segment};
 use paludarium_mmu::{
@@ -1389,6 +1389,135 @@ impl Emitter<'_, '_> {
         }
     }
 
+    /// One element of a string move ([`Fast::MoveString`]) of `size` bytes:
+    /// from `[rsi]` at the base of `segment` to `[rdi]`, both then moved on
+    /// by `step`. Goes to `failed` when the load or the store fails, before
+    /// any register changes; otherwise gives 1 when either saw the code
+    /// change, else 0.
+    fn move_element(
+        &mut self,
+        size: u8,
+        segment: Segment,
+        step: Value,
+        failed: cranelift_codegen::ir::Block,
+    ) -> Value {
+        let rsi = self.gpr(6);
+        let rdi = self.gpr(7);
+        let source = match segment {
+            Segment::Fs => self.b.ins().iadd(rsi, self.fs_base),
+            Segment::Gs => self.b.ins().iadd(rsi, self.gs_base),
+            Segment::None => rsi,
+        };
+        let (v, loaded) = self.load(source, size);
+        let stored_block = self.b.create_block();
+        let is_failed = self.b.ins().icmp_imm_s(IntCC::Equal, loaded, FAILED);
+        self.b.ins().brif(is_failed, failed, &[], stored_block, &[]);
+        self.b.switch_to_block(stored_block);
+        let stored = self.store(rdi, size, v);
+        let moved = self.b.create_block();
+        let is_failed = self.b.ins().icmp_imm_s(IntCC::Equal, stored, FAILED);
+        self.b.ins().brif(is_failed, failed, &[], moved, &[]);
+        self.b.switch_to_block(moved);
+        let rsi = self.b.ins().iadd(rsi, step);
+        self.set_gpr(6, rsi);
+        let rdi = self.b.ins().iadd(rdi, step);
+        self.set_gpr(7, rdi);
+        let a = self.b.ins().icmp_imm_s(IntCC::Equal, loaded, CODE_CHANGED);
+        let b = self.b.ins().icmp_imm_s(IntCC::Equal, stored, CODE_CHANGED);
+        let either = self.b.ins().bor(a, b);
+        self.b.ins().uextend(I64, either)
+    }
+
+    /// [`Fast::MoveString`], the `n`th instruction, at `rip`, with `next`
+    /// after it. Repeated, it runs as the interpreter's `string` does: it
+    /// ends when RCX is 0, and otherwise leaves at `rip` after
+    /// [`REP_CHUNK`] iterations, or when an iteration after the first
+    /// fails, counting the instruction as run; when the first fails, it
+    /// leaves before the instruction, which then gives the fault. The code
+    /// may change under it: it then goes on to the end of the instruction,
+    /// as the interpreter does, and leaves after it.
+    fn move_string(
+        &mut self,
+        size: u8,
+        repeat: bool,
+        segment: Segment,
+        n: usize,
+        rip: u64,
+        next: u64,
+    ) {
+        let flags = self.word(RFLAGS);
+        let df = self.b.ins().band_imm_u(flags, flag::DF as i64);
+        let down = self.b.ins().icmp_imm_u(IntCC::NotEqual, df, 0);
+        let forward = self.constant(i64::from(size));
+        let back = self.constant(-i64::from(size));
+        let step = self.b.ins().select(down, back, forward);
+        if !repeat {
+            let failed = self.b.create_block();
+            let changed = self.move_element(size, segment, step, failed);
+            let done = self.b.create_block();
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(failed);
+            self.leave_at(n, rip);
+            self.b.switch_to_block(done);
+            let changed = self.b.ins().icmp_imm_u(IntCC::NotEqual, changed, 0);
+            self.leave_if(changed, n + 1, next);
+            return;
+        }
+        let head = self.b.create_block();
+        let budget = self.b.append_block_param(head, I64);
+        let changed = self.b.append_block_param(head, I64);
+        let check_budget = self.b.create_block();
+        let body = self.b.create_block();
+        let finished = self.b.create_block();
+        let failed = self.b.create_block();
+        let chunk = self.constant(REP_CHUNK as i64);
+        let none = self.constant(0);
+        self.b.ins().jump(head, &[chunk.into(), none.into()]);
+
+        self.b.switch_to_block(head);
+        let rcx = self.gpr(1);
+        let no_more = self.b.ins().icmp_imm_u(IntCC::Equal, rcx, 0);
+        self.b.ins().brif(no_more, finished, &[], check_budget, &[]);
+
+        // Out of iterations for this step: the instruction runs again.
+        self.b.switch_to_block(check_budget);
+        let spent = self.b.ins().icmp_imm_u(IntCC::Equal, budget, 0);
+        self.leave_if(spent, n + 1, rip);
+        self.b.ins().jump(body, &[]);
+
+        self.b.switch_to_block(body);
+        let moved = self.move_element(size, segment, step, failed);
+        let rcx = self.gpr(1);
+        let rcx = self.b.ins().iadd_imm_s(rcx, -1);
+        self.set_gpr(1, rcx);
+        let budget_left = self.b.ins().iadd_imm_s(budget, -1);
+        let changed_now = self.b.ins().bor(changed, moved);
+        self.b
+            .ins()
+            .jump(head, &[budget_left.into(), changed_now.into()]);
+
+        // The first iteration of the step changed nothing; a later one
+        // ends the step after the iterations made.
+        self.b.switch_to_block(failed);
+        let first = self
+            .b
+            .ins()
+            .icmp_imm_u(IntCC::Equal, budget, REP_CHUNK as i64);
+        let first_failed = self.b.create_block();
+        let later_failed = self.b.create_block();
+        self.b
+            .ins()
+            .brif(first, first_failed, &[], later_failed, &[]);
+        self.b.switch_to_block(first_failed);
+        self.leave_at(n, rip);
+        self.b.switch_to_block(later_failed);
+        self.leave_at(n + 1, rip);
+
+        self.b.switch_to_block(finished);
+        let changed = self.b.ins().icmp_imm_u(IntCC::NotEqual, changed, 0);
+        self.leave_if(changed, n + 1, next);
+    }
+
     /// Emits the `n`th form (from 0). Returns false when it ends the code:
     /// it always leaves.
     fn form(&mut self, n: usize, form: &Form) -> bool {
@@ -1709,6 +1838,11 @@ impl Emitter<'_, '_> {
                 self.set_flags(flag::CF, cf);
             }
             Fast::Divide { src, signed } => self.divide(src, signed, n, rip),
+            Fast::MoveString {
+                size,
+                repeat,
+                segment,
+            } => self.move_string(size, repeat, segment, n, rip, next),
             Fast::Bswap(dst) => {
                 let v = self.read(dst);
                 let r = if dst.size() == 8 {

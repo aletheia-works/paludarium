@@ -1,6 +1,6 @@
 //! Compiled code does what the interpreter does: each form, and runs of
 //! forms, from random states, compared with `paludarium_cpu::step`.
-use paludarium_cpu::compile::{Compiler, Fast, Form};
+use paludarium_cpu::compile::{Compiler, Fast, Form, REP_CHUNK};
 use paludarium_cpu::{CpuState, flag, reg, step};
 use paludarium_decoder::decode;
 use paludarium_mmu::{AddressSpace, MappingKind, Prot, Userfault};
@@ -403,6 +403,19 @@ const FORMS: &[&[u8]] = &[
     &[0x31, 0xdb, 0x66, 0x0f, 0xbd, 0xc3],
     &[0x31, 0xdb, 0xf3, 0x0f, 0xbc, 0xc3],
     &[0x31, 0xdb, 0xf3, 0x48, 0x0f, 0xbd, 0xc3],
+    // string moves, once and repeated (repne repeats as rep), forward or,
+    // with DF set, back; fs adds its base to rsi
+    &[0xa4],
+    &[0x66, 0xa5],
+    &[0xa5],
+    &[0x48, 0xa5],
+    &[0x64, 0xa4],
+    &[0xf3, 0xa4],
+    &[0xf3, 0x66, 0xa5],
+    &[0xf3, 0xa5],
+    &[0xf3, 0x48, 0xa5],
+    &[0xf2, 0xa4],
+    &[0x64, 0xf3, 0x48, 0xa5],
     // div and idiv of a register
     &[0x48, 0xf7, 0xf3],
     &[0xf7, 0xf1],
@@ -502,7 +515,8 @@ fn state(random: &mut Random) -> CpuState {
         *gpr = value(random);
     }
     s.gpr[reg::RCX] = random.next() % 64;
-    s.rflags = (random.next() & flag::STATUS) | flag::RESERVED1;
+    // DF too, so that string moves also step back.
+    s.rflags = (random.next() & (flag::STATUS | flag::DF)) | flag::RESERVED1;
     s.fs_base = random.next() % 0x100;
     for x in &mut s.xmm {
         *x = u128::from(random.next()) | (u128::from(random.next()) << 64);
@@ -615,6 +629,70 @@ fn runs_of_forms_do_what_the_interpreter_does() {
         }
         compare(&compiler, &code, &mut random, 20);
     }
+}
+
+/// Runs `code`, one string move, compiled from `state` and steps the
+/// interpreter once from the same state, and checks that both ran it once
+/// to the same state and memory. Returns the state.
+fn one_step_of(
+    code: &[u8],
+    state: &CpuState,
+    fast: &AddressSpace,
+    slow: &AddressSpace,
+) -> CpuState {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let compiled = compiler.compile(&forms(code)).unwrap();
+    let mut compiled_state = state.clone();
+    let ran = compiled.run(&mut compiled_state, fast, fast.code_generation_cached());
+    let mut stepped = state.clone();
+    step(&mut stepped, slow).unwrap();
+    assert_eq!(ran, 1, "{code:02x?}");
+    assert_eq!(compiled_state, stepped, "{code:02x?}");
+    assert_eq!(contents(fast), contents(slow), "{code:02x?}");
+    compiled_state
+}
+
+#[test]
+fn a_repeated_move_runs_its_iterations_of_a_step_then_runs_again() {
+    // rep movsb, from the data to the stack.
+    let code = [0xf3, 0xa4];
+    let data: Vec<u8> = (0..DATA_LEN).map(|n| n as u8).collect();
+    let (fast, slow) = (space(&code, &data), space(&code, &data));
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    state.gpr[reg::RSI] = DATA;
+    state.gpr[reg::RDI] = STACK - STACK_LEN as u64;
+    state.gpr[reg::RCX] = REP_CHUNK + 100;
+    let state = one_step_of(&code, &state, &fast, &slow);
+    assert_eq!(state.rip, GuestAddr(CODE));
+    assert_eq!(state.gpr[reg::RCX], 100);
+    let state = one_step_of(&code, &state, &fast, &slow);
+    assert_eq!(state.rip, GuestAddr(CODE + 2));
+    assert_eq!(state.gpr[reg::RCX], 0);
+}
+
+#[test]
+fn a_repeated_move_that_faults_after_an_iteration_ends_its_step_there() {
+    // rep movsq to the last 16 bytes of the data and on.
+    let code = [0xf3, 0x48, 0xa5];
+    let (fast, slow) = (space(&code, &[7; DATA_LEN]), space(&code, &[7; DATA_LEN]));
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    state.gpr[reg::RSI] = STACK - STACK_LEN as u64;
+    state.gpr[reg::RDI] = DATA + DATA_LEN as u64 - 16;
+    state.gpr[reg::RCX] = 4;
+    let state = one_step_of(&code, &state, &fast, &slow);
+    assert_eq!(state.rip, GuestAddr(CODE));
+    assert_eq!(state.gpr[reg::RCX], 2);
+    assert_eq!(state.gpr[reg::RDI], DATA + DATA_LEN as u64);
+    // The next iteration faults at once: the code runs nothing.
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let compiled = compiler.compile(&forms(&code)).unwrap();
+    let mut again = state.clone();
+    assert_eq!(
+        compiled.run(&mut again, &fast, fast.code_generation_cached()),
+        0
+    );
+    assert_eq!(again, state);
+    assert!(step(&mut state.clone(), &slow).is_err());
 }
 
 #[test]

@@ -159,6 +159,39 @@ extern "sysv64" fn atomic(
     }
 }
 
+/// `div` (`signed` 0) or `idiv` of rdx:rax by `divisor`, as the
+/// interpreter's `Exec::divide` has it: the quotient into rax and the
+/// remainder into rdx, or [`FAILED`] with both as they were when the
+/// division faults (#DE): `divisor` is 0 or the quotient does not fit.
+extern "sysv64" fn divide(registers: *mut u64, divisor: u64, signed: u64) -> i64 {
+    // SAFETY: compiled code passes the address of the general registers
+    // (rax, then rcx and rdx) in the `CpuState` it was given.
+    let (low, high) = unsafe { (registers.read(), registers.add(2).read()) };
+    let dividend = (u128::from(high) << 64) | u128::from(low);
+    let result = if signed == 0 {
+        let d = u128::from(divisor);
+        dividend
+            .checked_div(d)
+            .and_then(|q| u64::try_from(q).ok())
+            .map(|q| (q, (dividend % d) as u64))
+    } else {
+        let n = dividend as i128;
+        let d = i128::from(divisor as i64);
+        n.checked_div(d)
+            .and_then(|q| i64::try_from(q).ok())
+            .map(|q| (q as u64, (n % d) as u64))
+    };
+    let Some((q, r)) = result else {
+        return FAILED;
+    };
+    // SAFETY: as above.
+    unsafe {
+        registers.write(q);
+        registers.add(2).write(r);
+    }
+    DONE
+}
+
 /// The helpers' addresses, for [`crate::emit::function`].
 pub(crate) fn helpers() -> Helpers {
     type Load = extern "sysv64" fn(*const Context<'static>, u64, u64) -> Loaded;
@@ -166,12 +199,14 @@ pub(crate) fn helpers() -> Helpers {
     type Load128 = extern "sysv64" fn(*const Context<'static>, u64, *mut u64) -> i64;
     type Atomic = extern "sysv64" fn(*const Context<'static>, u64, u64, u64, u64, u64) -> Loaded;
     type Store128 = extern "sysv64" fn(*const Context<'static>, u64, *const u64) -> i64;
+    type Divide = extern "sysv64" fn(*mut u64, u64, u64) -> i64;
     Helpers {
         load: load as Load as usize as u64,
         store: store as Store as usize as u64,
         load128: load128 as Load128 as usize as u64,
         store128: store128 as Store128 as usize as u64,
         atomic: atomic as Atomic as usize as u64,
+        divide: divide as Divide as usize as u64,
     }
 }
 

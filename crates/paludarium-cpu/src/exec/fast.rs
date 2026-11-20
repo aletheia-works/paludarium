@@ -517,6 +517,13 @@ pub enum Fast {
     },
     /// `bswap r32` or `bswap r64`.
     Bswap(Register),
+    /// `div r` or `idiv r`: rdx:rax (ax for a byte) by `src`, the quotient
+    /// into rax (al) and the remainder into rdx (ah). It faults (#DE) when
+    /// `src` is 0 or the quotient does not fit.
+    Divide {
+        src: Register,
+        signed: bool,
+    },
 }
 
 /// A general register, or one of the high-byte registers ah, ch, dh and bh.
@@ -727,6 +734,10 @@ impl Fast {
             Mnemonic::Mul | Mnemonic::Imul if b.is_none() => Self::MulWide {
                 src: gpr(a)?,
                 signed: i.mnemonic == Mnemonic::Imul,
+            },
+            Mnemonic::Div | Mnemonic::Idiv if b.is_none() => Self::Divide {
+                src: gpr(a)?,
+                signed: i.mnemonic == Mnemonic::Idiv,
             },
             Mnemonic::Nop | Mnemonic::Endbr64 => Self::Nop,
             Mnemonic::Mov => {
@@ -1338,6 +1349,10 @@ pub(crate) fn execute(
             bswap(&mut x, dst);
             next
         }
+        Fast::Divide { signed, .. } => {
+            divide(&mut x, signed)?;
+            next
+        }
     };
     x.s.rip = GuestAddr(target);
     Ok(())
@@ -1392,4 +1407,11 @@ fn bswap(x: &mut Exec<'_>, dst: Register) {
         u64::from((v as u32).swap_bytes())
     };
     x.write_reg(dst, r);
+}
+
+/// [`Fast::Divide`], which [`Exec::divide`] runs: it reads the instruction's
+/// register.
+#[inline(never)]
+fn divide(x: &mut Exec<'_>, signed: bool) -> Result<()> {
+    x.divide(signed)
 }

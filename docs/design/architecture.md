@@ -128,8 +128,8 @@ out:
 - `tzcnt`, `lzcnt`, `popcnt`, `bsf` and `bsr` of a register into one of its
   size, `bt` of a register by a register or an immediate, and `bswap` of a
   32- or 64-bit register;
-- `mul` and `imul` of a register into rdx:rax, and `imul` of two registers or of
-  a register and an immediate;
+- `mul` and `imul` of a register into rdx:rax, `div` and `idiv` of rdx:rax by a
+  register, and `imul` of two registers or of a register and an immediate;
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
   registers and memory, `pxor` and `xorps` of xmm registers, and `movd` and
   `movq` between xmm registers and general ones;
@@ -179,7 +179,8 @@ does not allow, such as a write to a page that `mprotect`,
 own loads and stores, with their checks, which fill the slot again. It stops
 before an instruction whose load or store fails, having changed nothing for
 it, so that the interpreter runs it again and reports the fault, and after a
-call into the MMU that finds the code generation moved on. An access to a
+call into the MMU that finds the code generation moved on. It stops the same
+way before a `div` or `idiv` that faults (#DE). An access to a
 page's bytes never moves it: a slot never allows a write to a page an
 instruction was fetched from, nor to a shared or file page, whose stores the
 MMU counts as code changes for the mappings and page caches it watches. A

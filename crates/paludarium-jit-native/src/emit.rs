@@ -72,6 +72,10 @@ pub(crate) struct Helpers {
     /// `(context, address, size, kind, a, b) -> (old, status)`: a locked
     /// exchange (`kind` 0) or compare and exchange.
     pub atomic: u64,
+    /// `(registers, divisor, signed) -> status`: `div` or `idiv` of
+    /// rdx:rax by a 64-bit divisor, on the general registers at
+    /// `registers`, which it leaves alone when it fails (#DE).
+    pub divide: u64,
 }
 
 /// Where a field of the [`Context`] is, in bytes.
@@ -153,6 +157,17 @@ impl Emitter<'_, '_> {
         let is_failed = self.b.ins().icmp_imm_s(IntCC::Equal, status, FAILED);
         self.b.ins().brif(is_failed, failed, &[], go_on, &[]);
         self.b.switch_to_block(failed);
+        self.leave_at(count, rip);
+        self.b.switch_to_block(go_on);
+    }
+
+    /// Goes on in a new block when `condition` (an `i8` truth value) is
+    /// false, and leaves with `count` run at `rip` otherwise.
+    fn leave_if(&mut self, condition: Value, count: usize, rip: u64) {
+        let leave = self.b.create_block();
+        let go_on = self.b.create_block();
+        self.b.ins().brif(condition, leave, &[], go_on, &[]);
+        self.b.switch_to_block(leave);
         self.leave_at(count, rip);
         self.b.switch_to_block(go_on);
     }
@@ -1031,6 +1046,132 @@ impl Emitter<'_, '_> {
         (low, high, overflow)
     }
 
+    /// `div` or `idiv` of rdx:rax (ax for a byte) by `src`, as
+    /// `Exec::divide` has it: the quotient into rax (al), the remainder into
+    /// rdx (ah), and the flags as they were. A division that faults (#DE)
+    /// leaves at `rip` before it, for the interpreter to report.
+    fn divide(&mut self, src: Register, signed: bool, count: usize, rip: u64) {
+        let size = src.size();
+        let divisor = self.read(src);
+        if size == 8 {
+            self.divide_wide(divisor, signed, count, rip);
+            return;
+        }
+        // The dividend has at most 64 bits, so 64-bit division gives the
+        // quotient and remainder, which only need to fit.
+        let bits = i64::from(size) * 8;
+        let rax = self.gpr(0);
+        let dividend = if size == 1 {
+            self.b.ins().band_imm_s(rax, 0xffff)
+        } else {
+            let low = self.masked(rax, size);
+            let rdx = self.gpr(2);
+            let high = self.masked(rdx, size);
+            let up = self.b.ins().ishl_imm_s(high, bits);
+            self.b.ins().bor(up, low)
+        };
+        let (q, r) = if signed {
+            let n = if size == 4 {
+                dividend
+            } else {
+                self.sign_extended(dividend, size * 2)
+            };
+            let d = self.sign_extended(divisor, size);
+            // 0, and i64::MIN by -1, which only a 32-bit division can
+            // have and which overflows, fault before the division traps.
+            let zero = self.b.ins().icmp_imm_s(IntCC::Equal, d, 0);
+            let minus_one = self.b.ins().icmp_imm_s(IntCC::Equal, d, -1);
+            let min = self.b.ins().icmp_imm_s(IntCC::Equal, n, i64::MIN);
+            let both = self.b.ins().band(minus_one, min);
+            let fault = self.b.ins().bor(zero, both);
+            self.leave_if(fault, count, rip);
+            let q = self.b.ins().sdiv(n, d);
+            let r = self.b.ins().srem(n, d);
+            let fits = self.sign_extended(q, size);
+            let overflow = self.b.ins().icmp(IntCC::NotEqual, fits, q);
+            self.leave_if(overflow, count, rip);
+            (q, r)
+        } else {
+            let zero = self.b.ins().icmp_imm_s(IntCC::Equal, divisor, 0);
+            self.leave_if(zero, count, rip);
+            let q = self.b.ins().udiv(dividend, divisor);
+            let r = self.b.ins().urem(dividend, divisor);
+            let up = self.b.ins().ushr_imm_s(q, bits);
+            let overflow = self.b.ins().icmp_imm_s(IntCC::NotEqual, up, 0);
+            self.leave_if(overflow, count, rip);
+            (q, r)
+        };
+        if size == 1 {
+            let q = self.b.ins().band_imm_s(q, 0xff);
+            let r = self.b.ins().band_imm_s(r, 0xff);
+            let up = self.b.ins().ishl_imm_s(r, 8);
+            let ax = self.b.ins().bor(up, q);
+            self.write(Register::Gpr { index: 0, size: 2 }, ax);
+        } else {
+            self.write(Register::Gpr { index: 0, size }, q);
+            self.write(Register::Gpr { index: 2, size }, r);
+        }
+    }
+
+    /// [`Self::divide`] of rdx:rax by a 64-bit `divisor`. A dividend that
+    /// fits in rax (rdx 0, or rax's sign for `idiv`) is divided here, by a
+    /// divisor that cannot fault or overflow (not 0, nor -1 for `idiv`);
+    /// any other division is the `divide` helper's.
+    fn divide_wide(&mut self, divisor: Value, signed: bool, count: usize, rip: u64) {
+        let rax = self.gpr(0);
+        let rdx = self.gpr(2);
+        let extension = if signed {
+            self.b.ins().sshr_imm_s(rax, 63)
+        } else {
+            self.constant(0)
+        };
+        let narrow = self.b.ins().icmp(IntCC::Equal, rdx, extension);
+        let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, divisor, 0);
+        let mut here = self.b.ins().band(narrow, nonzero);
+        if signed {
+            let not_minus_one = self.b.ins().icmp_imm_s(IntCC::NotEqual, divisor, -1);
+            here = self.b.ins().band(here, not_minus_one);
+        }
+        let inline = self.b.create_block();
+        let call = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(here, inline, &[], call, &[]);
+
+        self.b.switch_to_block(inline);
+        let (q, r) = if signed {
+            (
+                self.b.ins().sdiv(rax, divisor),
+                self.b.ins().srem(rax, divisor),
+            )
+        } else {
+            (
+                self.b.ins().udiv(rax, divisor),
+                self.b.ins().urem(rax, divisor),
+            )
+        };
+        self.set_gpr(0, q);
+        self.set_gpr(2, r);
+        self.b.ins().jump(done, &[]);
+
+        self.b.switch_to_block(call);
+        let registers = self
+            .b
+            .ins()
+            .iadd_imm_s(self.registers, i64::from(offset(0)));
+        let signed = self.constant(i64::from(signed));
+        let callee = self.constant(self.helpers.divide as i64);
+        // The helper takes three words and gives one, as `load128` does.
+        let called =
+            self.b
+                .ins()
+                .call_indirect(self.move128_sig, callee, &[registers, divisor, signed]);
+        let status = self.b.inst_results(called)[0];
+        self.unless_failed(status, count, rip);
+        self.b.ins().jump(done, &[]);
+
+        self.b.switch_to_block(done);
+    }
+
     /// Sets CF and OF to `overflow` (an `i8` truth value).
     fn set_carry_overflow(&mut self, overflow: Value) {
         let cf = self.bit(overflow, flag::CF);
@@ -1567,6 +1708,7 @@ impl Emitter<'_, '_> {
                 let cf = self.b.ins().band_imm_s(down, 1);
                 self.set_flags(flag::CF, cf);
             }
+            Fast::Divide { src, signed } => self.divide(src, signed, n, rip),
             Fast::Bswap(dst) => {
                 let v = self.read(dst);
                 let r = if dst.size() == 8 {

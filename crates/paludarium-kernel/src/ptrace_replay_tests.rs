@@ -3235,12 +3235,20 @@ fn thread_exec() {
         assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
         c.raise(SIGSTOP, &mut |_, _, _| None).unwrap();
         let ctid = HEAP + 0xf00;
-        c.thread(ctid, |t| {
+        // Tracee::thread's clone, without its unwrap: the thread's exec can
+        // retire the leader before its clone returns, as it may on Linux.
+        c.forked = Some(Box::new(|t| {
             if let Err(status) = t.exec() {
                 return status;
             }
             t.exit(7)
-        });
+        }));
+        // CLONE_VM | FS | FILES | SIGHAND | THREAD | PARENT_SETTID |
+        // CHILD_CLEARTID.
+        let flags = 0x10f00 | 0x10_0000 | 0x20_0000;
+        if let Err(status) = c.sys(CLONE, [flags, 0, ctid, ctid, 0, 0]) {
+            return status;
+        }
         loop {
             if let Err(status) = c.sys(PAUSE, [0; 6]) {
                 return status;

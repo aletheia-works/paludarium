@@ -823,6 +823,7 @@ mod linux {
         processes_execveat => ("execveat","process"),
         processes_etxtbsy => ("etxtbsy","process"),
         processes_shm => ("shm","process"),
+        processes_ptrace_stop_signal => ("ptrace-stop-signal","process"),
         processes_traced_rusage => ("traced-rusage","process"),
         processes_stop_cont_handler => ("stop-cont-handler","process"),
         processes_sem => ("sem","process"),

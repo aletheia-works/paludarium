@@ -6579,6 +6579,79 @@ static pid_t mr_child(long mib, int nested, long *start) {
     close(pipes[0]);
     return pid;
 }
+/* The ptrace-stop-signal case: a signal sent to a tracee in a ptrace stop
+   is taken as the stop ends, before the call the stop interrupted runs
+   again (kernel/signal.c get_signal goes on past ptrace_stop). The child
+   waits in pause; its tracer attaches, sends SIGUSR1 while it is stopped
+   for the attach's SIGSTOP, then lets it go on with no signal. The child
+   stops for SIGUSR1 with the restart code still in rax, and the SIGUSR1 the
+   tracer gives back ends pause with EINTR. The child exits 0 for that. */
+static volatile sig_atomic_t pss_handled;
+static void pss_on_usr1(int sig) {
+    (void)sig;
+    pss_handled++;
+}
+static int ptrace_stop_signal_case(void) {
+    int ready[2];
+    if (pipe(ready)) return 1;
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0) return 2;
+    if (pid == 0) {
+        close(ready[0]);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = pss_on_usr1;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGUSR1, &sa, NULL)) _exit(90);
+        if (write(ready[1], "r", 1) != 1) _exit(91);
+        long r = syscall(SYS_pause);
+        int error = errno;
+        if (r != -1) _exit(92);
+        if (error != EINTR) _exit(93);
+        _exit(pss_handled == 1 ? 0 : 94);
+    }
+    close(ready[1]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 3;
+    close(ready[0]);
+    /* In pause: call 34 in its syscall file. */
+    char path[64], text[64];
+    snprintf(path, sizeof path, "/proc/%d/syscall", pid);
+    int in_pause = 0;
+    for (int i = 0; i < 5000 && !in_pause; i++) {
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+        if (fd >= 0) close(fd);
+        in_pause = n > 3 && !memcmp(text, "34 ", 3);
+        if (!in_pause) usleep(1000);
+    }
+    if (!in_pause) printf("not in pause after 5 s\n");
+    int status;
+    if (syscall(SYS_ptrace, 16 /* PTRACE_ATTACH */, pid, 0, 0)) return 4;
+    if (waitpid(pid, &status, __WALL) != pid) return 5;
+    printf("attach-signal=%d\n", WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
+    if (kill(pid, SIGUSR1)) return 6;
+    if (syscall(SYS_ptrace, 7 /* PTRACE_CONT */, pid, 0, 0)) return 7;
+    if (waitpid(pid, &status, __WALL) != pid) return 8;
+    printf("usr1-signal=%d\n", WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
+    long rax = 0, orig = 0;
+    /* PTRACE_PEEKUSER of rax and orig_rax, which the raw call stores. */
+    if (syscall(SYS_ptrace, 3, pid, 80, &rax) || syscall(SYS_ptrace, 3, pid, 120, &orig)) return 9;
+    printf("usr1-rax=%ld orig-rax=%ld\n", rax, orig);
+    /* A call already made to run again would sleep for good after the
+       handler. */
+    if (rax != -514) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, __WALL);
+        printf("exit=killed\n");
+        return 0;
+    }
+    if (syscall(SYS_ptrace, 7 /* PTRACE_CONT */, pid, 0, SIGUSR1)) return 10;
+    if (waitpid(pid, &status, __WALL) != pid) return 11;
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status));
+    return 0;
+}
 /* The traced-rusage case: a tracer's wait reports the tracee's resource
    usage as its parent's wait does, `getrusage(RUSAGE_BOTH)`, with the CPU
    time of the children it reaped (kernel/exit.c wait_task_stopped,
@@ -33120,6 +33193,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "hiwater")) return hiwater_case();
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
+    if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();
     if (!strcmp(mode, "stop-cont-handler")) return stop_cont_handler_case();
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);

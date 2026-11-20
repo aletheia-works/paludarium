@@ -346,6 +346,7 @@
     {"name":"execveat","binary":"process"},
     {"name":"etxtbsy","binary":"process"},
     {"name":"shm","binary":"process"},
+    {"name":"ptrace-stop-signal","binary":"process"},
     {"name":"traced-rusage","binary":"process"},
     {"name":"stop-cont-handler","binary":"process"},
     {"name":"sem","binary":"process"},

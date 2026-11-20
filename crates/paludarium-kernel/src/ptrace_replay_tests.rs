@@ -2793,3 +2793,61 @@ delivery signal=10 si-code=0x80 si-pid=0
 exit=0",
     );
 }
+
+/// `ptrace-stop-signal`: a signal sent to a tracee in a stop is taken as
+/// the stop ends, before the call the stop interrupted runs again, as
+/// Linux's `get_signal` goes on past `ptrace_stop`: the tracer sees its
+/// stop with the restart code still in rax, and the handler it gives
+/// ends pause with EINTR.
+#[test]
+fn stop_signal() {
+    let mut g = Tracer::new();
+    let (ready, told) = g.pipe();
+    let paused = Arc::new(Entered::new(0));
+    let pausing = Arc::clone(&paused);
+    let (child, thread) = g.fork(move |c| {
+        c.catch(SIGUSR1, 0);
+        c.sys(WRITE, [told, HEAP + 0x790, 1, 0, 0, 0]).unwrap();
+        pausing.store(1, std::sync::atomic::Ordering::SeqCst);
+        let mut handled = 0;
+        let r = c.call(PAUSE, [0; 6], &mut |_, _, _| {
+            handled += 1;
+            None
+        });
+        match r {
+            Ok(r) => c.exit(i32::from(neg(r) != -4) + 2 * i32::from(handled != 1)),
+            Err(status) => status,
+        }
+    });
+    g.ready(child, ready, &paused);
+    g.pt(ATTACH, child, 0, 0);
+    let status = g.wait(child, WALL);
+    g.stop("attach", status);
+    // SIGUSR1 while the tracee is stopped, then on with no signal.
+    g.call(KILL, [child, SIGUSR1, 0, 0, 0, 0]);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, WALL);
+    g.stop("usr1", status);
+    let (_, regs) = g.regs(child);
+    let rax = g.reg(regs, RAX) as i64;
+    g.say("rax", rax);
+    g.say("orig-rax", g.reg(regs, ORIG_RAX) as i64);
+    // A call already made to run again (rax 34) would sleep for good after
+    // the handler, and the test with it.
+    assert_eq!(rax, -514, "pause was rewound before SIGUSR1: {:?}", g.lines);
+    g.pt(CONT, child, 0, SIGUSR1);
+    let status = g.wait(child, 0);
+    thread.join().unwrap();
+    g.say("exit", Tracer::code(status));
+    g.check(
+        "attach-stopped=1
+attach-signal=19
+attach-event=0
+usr1-stopped=1
+usr1-signal=10
+usr1-event=0
+rax=-514
+orig-rax=34
+exit=0",
+    );
+}

@@ -4487,7 +4487,9 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   そこに残したコードで再実行が決まり（別の再実行のコードならそのとおりに、
   `-ERESTART_RESTARTBLOCK` は `restart_syscall` として）、ほかの値や、`orig_rax` を -1 に
   したときは再実行せず、コードがそのまま戻り値になります。`orig_rax` を変えると、そのシステム
-  コールが実行されます。`PTRACE_O_SUSPEND_SECCOMP` は、トレース対象のシステムコールを
+  コールが実行されます。停止中にトレース対象へ送られたシグナルは、Linux の `get_signal` が停止の後も
+  続けるのと同じく、停止が終わるときに再実行より先に受け取り、トレース対象は `rax` に再実行の
+  コードを残したままそのシグナルで止まります。`PTRACE_O_SUSPEND_SECCOMP` は、トレース対象のシステムコールを
   seccomp のフィルターと strict モードに通さず、checkpoint／restore のある Linux と同じく、
   設定には `CAP_SYS_ADMIN` と、seccomp のないトレーサーが要ります（`EPERM`）。
 - `PTRACE_SYSCALL` で再開したトレース対象は、システムコールの入口と出口ごとに止まります

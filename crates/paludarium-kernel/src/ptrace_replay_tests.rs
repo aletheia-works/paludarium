@@ -47,6 +47,7 @@ const FUTEX: u64 = 202;
 const EXIT_GROUP: u64 = 231;
 const TGKILL: u64 = 234;
 const RT_SIGQUEUEINFO: u64 = 129;
+const RT_SIGSUSPEND: u64 = 130;
 const PRCTL: u64 = 157;
 const SECCOMP: u64 = 317;
 const RSEQ: u64 = 334;
@@ -3039,16 +3040,24 @@ fn detach() {
     let traceable = move |c: &mut Tracee| {
         c.catch(SIGUSR1, 0);
         c.catch(SIGUSR2, 0);
+        // SIGUSR2 blocked outside rt_sigsuspend, as the guest has it.
+        let usr2 = HEAP + 0x7a0;
+        let none = HEAP + 0x7a8;
+        c.m.write_u64(GuestAddr(usr2), 1 << (SIGUSR2 - 1)).unwrap();
+        c.m.write_u64(GuestAddr(none), 0).unwrap();
+        c.sys(RT_SIGPROCMASK, [0, usr2, 0, 8, 0, 0]).unwrap();
         // PR_SET_PTRACER, PR_SET_PTRACER_ANY.
         c.sys(PRCTL, [0x5961_6d61, u64::MAX, 0, 0, 0, 0]).unwrap();
         c.sys(WRITE, [ready_write, HEAP + 0x790, 1, 0, 0, 0])
             .unwrap();
         let mut got = [false; 2];
         while !got[1] {
-            if let Err(status) = c.call(PAUSE, [0; 6], &mut |_, signal, _| {
-                got[usize::from(signal == SIGUSR2)] = true;
-                None
-            }) {
+            if let Err(status) =
+                c.call(RT_SIGSUSPEND, [none, 8, 0, 0, 0, 0], &mut |_, signal, _| {
+                    got[usize::from(signal == SIGUSR2)] = true;
+                    None
+                })
+            {
                 return status;
             }
         }
@@ -3099,11 +3108,6 @@ fn detach() {
         g.wait(tracer, 0);
         tracer_thread.join().unwrap();
         g.lines.extend(rx.try_iter());
-        // SIGUSR2 once the child sleeps again, as the guest sends it: a
-        // workaround for an emulator bug that Linux does not have, a signal
-        // sent while a task comes out of a stop can be lost. Remove the wait
-        // here and in the guest once the emulator keeps such a signal.
-        g.until_sleeping(child);
         g.call(KILL, [child, SIGUSR2, 0, 0, 0, 0]);
         let status = g.wait(child, 0);
         thread.join().unwrap();
@@ -3181,12 +3185,10 @@ fn detach() {
     g.call(KILL, [child, SIGCONT, 0, 0, 0, 0]);
     let continued = g.wait(child, WCONTINUED) == 0xffff;
     g.say("continued", i64::from(continued));
-    // SIGKILL, as the guest sends it until the emulator keeps a SIGUSR2
-    // sent right after SIGCONT, as the task comes out of its stop.
-    g.call(KILL, [child, SIGKILL, 0, 0, 0, 0]);
+    g.call(KILL, [child, SIGUSR2, 0, 0, 0, 0]);
     let status = g.wait(child, 0);
     thread.join().unwrap();
-    g.say("group-killed", status & 0x7f);
+    g.say("group-exit", Tracer::code(status));
     g.check(
         "usr1-stopped=1
 usr1-signal=10
@@ -3218,7 +3220,7 @@ parent-stopped=1
 parent-signal=19
 parent-event=0
 continued=1
-group-killed=9",
+group-exit=0",
     );
 }
 

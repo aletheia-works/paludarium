@@ -777,17 +777,23 @@ static int detach_signal(void) {
     return 0;
 }
 
-/* A child that lets any task trace it, then waits in pause until SIGUSR2:
- * its exit code is whether SIGUSR1 came. */
+/* A child that lets any task trace it, then waits until SIGUSR2: its exit
+ * code is whether SIGUSR1 came. SIGUSR2 stays blocked outside sigsuspend,
+ * so one that comes between the check and the wait is not missed. */
 static pid_t traceable(int ready) {
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
         signal(SIGUSR1, on_usr);
         signal(SIGUSR2, on_usr);
+        sigset_t usr2, none;
+        sigemptyset(&usr2);
+        sigaddset(&usr2, SIGUSR2);
+        sigemptyset(&none);
+        sigprocmask(SIG_BLOCK, &usr2, NULL);
         prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
         write(ready, "x", 1);
-        while (!got_usr2) pause();
+        while (!got_usr2) sigsuspend(&none);
         _exit(got_usr1);
     }
     return child;
@@ -827,14 +833,6 @@ static int detach_exit_stopped(int ready[2]) {
             _exit(0);
         }
         wait_status(tracer, 0);
-        /* SIGUSR2 once the child sleeps again. A workaround for an emulator
-         * bug that Linux does not have: a signal sent while a task comes out
-         * of a stop, here the one its tracer's exit lets go, can be lost,
-         * and the child sleeps in pause for good. Remove the wait once the
-         * emulator keeps such a signal. */
-        char state = 0;
-        for (int i = 0; i < 2000 && (tracer_pid_of(child, &state) < 0 || state != 'S'); i++)
-            usleep(1000);
         kill(child, SIGUSR2);
         int status = wait_status(child, 0);
         snprintf(line, sizeof line, "%s-got-usr1", name);
@@ -901,13 +899,9 @@ static int detach_group_stop(int ready[2]) {
     stop("parent", wait_status(child, WNOHANG | WUNTRACED));
     kill(child, SIGCONT);
     result("continued", WIFCONTINUED(wait_status(child, WCONTINUED)));
-    /* SIGKILL, not the SIGUSR2 the child waits for. A workaround for the
-     * emulator bug above: a SIGUSR2 sent right after SIGCONT, as the task
-     * comes out of its stop, can be lost. Back to SIGUSR2, and the exit
-     * code it gives, once the emulator keeps such a signal. */
-    kill(child, SIGKILL);
+    kill(child, SIGUSR2);
     int status = wait_status(child, 0);
-    result("group-killed", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    result("group-exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
 

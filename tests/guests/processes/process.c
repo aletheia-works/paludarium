@@ -6676,26 +6676,28 @@ static int traced_rusage_case(void) {
    third the child enters the stop as a seized tracee, which is detached
    while it stays stopped. The child exits 0 for EINTR with the handler run
    once. */
-static volatile sig_atomic_t sc_handled;
-static void sc_on_usr2(int sig) {
+static volatile sig_atomic_t sch_handled;
+static void sch_on_usr2(int sig) {
     (void)sig;
-    sc_handled++;
+    sch_handled++;
 }
-/* Waits until `pid` is in pause() (call 34 in its syscall file). */
-static void sc_pausing(pid_t pid) {
+/* Waits until `pid` is in pause() (call 34 in its syscall file); false
+   when it is not after 5 s. */
+static int sch_pausing(pid_t pid) {
     char path[64], text[64];
     snprintf(path, sizeof path, "/proc/%d/syscall", pid);
     for (int i = 0; i < 5000; i++) {
         int fd = open(path, O_RDONLY);
         ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
         if (fd >= 0) close(fd);
-        if (n > 3 && !memcmp(text, "34 ", 3)) return;
+        if (n > 3 && !memcmp(text, "34 ", 3)) return 1;
         usleep(1000);
     }
+    return 0;
 }
 /* The exit code of `pid`, 100 + the signal that ended it, or -1 when it has
    not ended within 5 s (it is killed then). */
-static int sc_reap(pid_t pid) {
+static int sch_reap(pid_t pid) {
     int status;
     for (int i = 0; i < 5000; i++) {
         pid_t r = waitpid(pid, &status, WNOHANG);
@@ -6719,7 +6721,7 @@ static int stop_cont_handler_case(void) {
             close(ready[0]);
             struct sigaction sa;
             memset(&sa, 0, sizeof sa);
-            sa.sa_handler = sc_on_usr2;
+            sa.sa_handler = sch_on_usr2;
             sigemptyset(&sa.sa_mask);
             if (sigaction(SIGUSR2, &sa, NULL)) _exit(90);
             if (write(ready[1], "r", 1) != 1) _exit(91);
@@ -6727,13 +6729,13 @@ static int stop_cont_handler_case(void) {
             int error = errno;
             if (r != -1) _exit(92);
             if (error != EINTR) _exit(93);
-            _exit(sc_handled == 1 ? 0 : 94);
+            _exit(sch_handled == 1 ? 0 : 94);
         }
         close(ready[1]);
         char byte;
         if (read(ready[0], &byte, 1) != 1) return 3;
         close(ready[0]);
-        sc_pausing(pid);
+        if (!sch_pausing(pid)) printf("%s: not in pause after 5 s\n", name);
         int status;
         if (part == 2) {
             /* PTRACE_SEIZE, the SIGSTOP given back with PTRACE_CONT, the
@@ -6755,7 +6757,7 @@ static int stop_cont_handler_case(void) {
             }
         }
         if (kill(pid, SIGCONT) || kill(pid, SIGUSR2)) return 6;
-        printf("%s-exit=%d\n", name, sc_reap(pid));
+        printf("%s-exit=%d\n", name, sch_reap(pid));
     }
     return 0;
 }

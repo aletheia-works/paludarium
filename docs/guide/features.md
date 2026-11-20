@@ -2362,8 +2362,16 @@ kernel.
     second apart, `mcast_probes`), as ICMP's host unreachable tells it
     over the loopback (with `ETIMEDOUT` after the handshake's tries where
     the loopback is down, and where answers come back to no one), and a
-    datagram is dropped. A connection or datagram from a loopback address
-    out through an end is `EINVAL` (`__mkroute_output`).
+    datagram is dropped, as is one to a loopback address, which
+    `arp_process` takes no request for. A connection or datagram from a
+    loopback address out through an end is `EINVAL`
+    (`__mkroute_output`); where no address of a scope to fit is there
+    (`inet_select_addr`), it leaves from 0.0.0.0, which ARP asks from too
+    and the peer answers, and the peer drops what comes as a martian, so
+    a connection times out (`ETIMEDOUT`) and a datagram is lost. TCP
+    takes no broadcast or multicast route (`ENETUNREACH`), and UDP no
+    broadcast one, to an address a broadcast route has or the limited
+    broadcast one, without `SO_BROADCAST` (`EACCES`).
   - **Netconf of veth ends:** each end's settings
     are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
     `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their
@@ -2579,30 +2587,32 @@ kernel.
     route (`ENETUNREACH`) without a source, or to a loopback, link-local
     or multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
     and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
-    not. With `RTA_IIF` of `lo`, a route is looked up as a packet coming in
-    on it would take it (`ip_route_input_slow`, `ip6_route_input_lookup`),
-    and the answer names `lo` as `RTA_IIF`. IPv4 drops martians
+    not. With `RTA_IIF` of `lo`, or for IPv4 of a veth end, a route is
+    looked up as a packet coming in on that device would take it
+    (`ip_route_input_slow`, `ip6_route_input_lookup`), and the answer names
+    the device as `RTA_IIF`. IPv4 drops martians
     (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
-    source, a loopback or 0.0.0.0 destination, a group `lo` has not
-    joined, and a source of the namespace's own, or with a local route a
+    source, a loopback or 0.0.0.0 destination, a group the device has not
+    joined (224.0.0.1 is joined while it is up), and a source of the namespace's own, or with a local route a
     request added, one a lookup finds a route to that is not unicast
     (`fib_validate_source`). A local, broadcast or multicast destination
     gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,
     `RTCF_MULTICAST`), of the TOS of the route that matched and without a
-    preferred source. Anything else would be forwarded: with `lo`'s
-    `forwarding` off (`/proc/sys/net`), it is `EHOSTUNREACH`; on, a
+    preferred source; it goes out through `lo` (`RTA_OIF`). Anything else
+    would be forwarded: with the device's `forwarding` off (`/proc/sys/net`), it is `EHOSTUNREACH`; on, a
     destination no route takes gives the lookup's error, a route of a
     kind other than unicast `EINVAL`, and a unicast one the route it is
     forwarded on (`__mkroute_input`): unicast, out through the route's
     device (`RTA_OIF`), with the route's gateway and metrics, and, out
-    through `lo`, `RTCF_DOREDIRECT` where the source's own route is a
-    unicast one through `lo` without a gateway, as a packet that goes out
-    where it came in asks to redirect. Reverse path
-    filtering (`rp_filter`, `all`'s or `lo`'s, the larger) checks every
+    through the device it came in on, `RTCF_DOREDIRECT` where the source's
+    own route is a unicast one through that device without a gateway, as a
+    packet that goes out where it came in asks to redirect. Reverse path
+    filtering (`rp_filter`, `all`'s or the device's, the larger) checks every
     source by a lookup of it (`__fib_validate_source`): with it on, a
     source no route takes is dropped too, and so, strictly, is one whose
-    route goes through another device than `lo` while `lo` has an address;
-    loosely, a lookup of it through `lo` decides. IPv6 gives the route the
+    route goes through another device than the one it came in on while
+    that has an address; loosely, a lookup of it through that device
+    decides. IPv6 gives the route the
     tables do, whatever its source and its `forwarding`. The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they
     change nothing.

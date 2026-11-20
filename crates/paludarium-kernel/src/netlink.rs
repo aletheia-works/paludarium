@@ -4005,9 +4005,10 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// `ERANGE`), and a longer one counts as its first bytes; `EOPNOTSUPP` for
 /// an `RTA_IP_PROTO` but TCP, UDP and the family's ICMP
 /// (`rtm_getroute_parse_ip_proto`); then `ENODEV` for an input route
-/// (`RTA_IIF`) of a device there is not, `EOPNOTSUPP` for one of a veth
-/// end, and one of `lo` is looked up as a packet coming in on it would be
-/// ([`input4`], [`input6`]).
+/// (`RTA_IIF`) of a device there is not, `EOPNOTSUPP` for an IPv6 one of
+/// a veth end (which has no IPv6 here), and one of `lo`, or an IPv4 one of
+/// an end, is looked up as a packet coming in on it would be ([`input4`],
+/// [`input6`]).
 ///
 /// IPv4, as `ip_route_output_key_hash_rcu`: a source (`RTA_SRC`) is
 /// `EINVAL` when multicast or the limited broadcast address and
@@ -4109,31 +4110,36 @@ fn lookup(
     if iif != 0 && !network.has_device(iif) {
         return Err(ENODEV);
     }
-    // Input lookups come in only through `lo` here: nothing comes in through a veth end yet.
-    if iif != 0 && iif != LOOPBACK_OIF {
+    // A veth end has no IPv6 here, so nothing comes in on one.
+    if v6 && iif != 0 && iif != LOOPBACK_OIF {
         return Err(EOPNOTSUPP);
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
-    // The devices alone, before the addresses.
-    let (forwarding, rp_filter) = {
+    // The device it comes in on alone, before the addresses: whether it
+    // is up, its forwarding, and the reverse path filtering that counts.
+    let device = {
         let devices = network.devices();
-        devices
-            .by_index(crate::netdev::LOOPBACK_INDEX)
-            .map_or((false, 0), |lo| {
-                (
-                    lo.conf4.forwarding != 0,
-                    lo.conf4.rp_filter.max(devices.all4.rp_filter),
-                )
-            })
+        let index = i32::try_from(iif).unwrap_or(0);
+        devices.by_index(index).map(|d| {
+            let up = d.veth.as_ref().map_or_else(|| network.is_up(), |v| v.up);
+            (
+                index,
+                up,
+                d.conf4.forwarding != 0,
+                d.conf4.rp_filter.max(devices.all4.rp_filter),
+            )
+        })
     };
     let addresses = network.addresses();
-    if iif == LOOPBACK_OIF {
+    if let Some((index, up, forwarding, rp_filter)) = device.filter(|_| iif != 0) {
         let input = Input {
             tos,
             flags: request_flags,
             mark,
             uid: asked_uid,
             reply: (seq, port),
+            iif: index,
+            up,
             forwarding,
             rp_filter,
         };
@@ -4143,7 +4149,7 @@ fn lookup(
             let four = |value: Option<&[u8]>| -> Result<[u8; 4], Errno> {
                 value.map_or(Ok([0; 4]), |v| v.first_chunk().copied().ok_or(ERANGE))
             };
-            input4(network, &addresses, four(dst)?, four(src)?, &input)
+            input4(&addresses, four(dst)?, four(src)?, &input)
         };
     }
     if v6 {
@@ -4405,19 +4411,24 @@ struct Input {
     mark: u32,
     uid: Option<u32>,
     reply: (u32, u32),
-    /// `lo`'s `forwarding` (`IN_DEV_FORWARD`), and the reverse path
-    /// filtering that counts, `all`'s or `lo`'s, the larger
+    /// The device it comes in on (`RTA_IIF`), `lo` or a veth end, and
+    /// whether that is up.
+    iif: i32,
+    up: bool,
+    /// That device's `forwarding` (`IN_DEV_FORWARD`), and the reverse path
+    /// filtering that counts, `all`'s or the device's, the larger
     /// (`IN_DEV_RPFILTER`), as `/proc/sys/net` sets them.
     forwarding: bool,
     rp_filter: i32,
 }
-/// An IPv4 route lookup for a packet in on `lo` to `address` from
-/// `source` (`RTA_IIF`), as `inet_rtm_getroute` takes it through
-/// `ip_route_input_rcu`, with `lo`'s forwarding and reverse path filtering
-/// as `/proc/sys/net` sets them, each source checked as
-/// [`Addresses::validate_source4`] checks it. `EINVAL` for what `ip_route_input_slow` drops,
-/// in its order: a multicast destination of a group `lo` has not joined
-/// (only 224.0.0.1, while it is up), or from a multicast, limited
+/// An IPv4 route lookup for a packet in on `lo` or a veth end (`RTA_IIF`)
+/// to `address` from `source`, as `inet_rtm_getroute` takes it through
+/// `ip_route_input_rcu`, with that device's forwarding and reverse path
+/// filtering as `/proc/sys/net` sets them, each source checked as
+/// [`Addresses::validate_source4_on`] checks it on that device. `EINVAL`
+/// for what `ip_route_input_slow` drops, in its order: a multicast
+/// destination of a group the device has not joined
+/// (only 224.0.0.1, while the device is up), or from a multicast, limited
 /// broadcast or loopback source, from none but to a group of the local
 /// net, or from a source of the namespace ([`Addresses::valid_source4`]);
 /// a multicast or limited broadcast source; then, but to the limited
@@ -4430,21 +4441,21 @@ struct Input {
 /// unicast one is forwarded (`__mkroute_input`), checked by its source as
 /// it goes out through the route's device: the answer is a unicast route
 /// of no local flag, out through that device, with `RTCF_DOREDIRECT` where
-/// it is `lo` again and the source's route is one of host scope, the route's gateway as `RTA_GATEWAY` where it uses one, and
-/// its metrics. The answer, as
+/// it is the device it came in on and the source's route through that is
+/// one of host scope, the route's gateway as `RTA_GATEWAY` where it uses
+/// one, and its metrics. The answer, as
 /// `rt_fill_info` gives an input route: of the route's type (or broadcast
 /// or multicast), with `RTCF_LOCAL` and `RTCF_BROADCAST` or
 /// `RTCF_MULTICAST`, of the TOS of the route that matched, the source as
-/// `RTA_SRC` where there is one, `lo` as `RTA_IIF` and, but for one
-/// forwarded, as `RTA_OIF`, no
+/// `RTA_SRC` where there is one, the device as `RTA_IIF`, `lo` as
+/// `RTA_OIF` but for one forwarded, no
 /// metrics, and the mark and user ID it names. With `RTM_F_LOOKUP_TABLE`
 /// it names the table the route came from, 0 for none; with
 /// `RTM_F_FIB_MATCH` it is the route that matched, of the type made, and
 /// `EHOSTUNREACH` where no table gave one.
 ///
-/// [`Addresses::validate_source4`]: crate::interface::Addresses::validate_source4
+/// [`Addresses::validate_source4_on`]: crate::interface::Addresses::validate_source4_on
 fn input4(
-    network: &Network,
     addresses: &crate::interface::Addresses,
     address: [u8; 4],
     asked_source: [u8; 4],
@@ -4457,14 +4468,15 @@ fn input4(
     // `fib_validate_source` of a packet that is not forwarded.
     let valid = |src: Ipv4Addr| {
         addresses
-            .validate_source4(src, input.tos, 0, input.rp_filter)
+            .validate_source4_on(src, input.tos, 0, input.rp_filter, input.iif)
             .is_ok()
     };
+    let iif = u32::try_from(input.iif).unwrap_or(0);
     // The route's type and flags, and the table entry it came from.
     let (code, flags, route) = if ip.is_multicast() {
-        // `ip_route_input_mc`, for a group `lo` has joined
+        // `ip_route_input_mc`, for a group the device has joined
         // (`ip_check_mc_rcu`), after `ip_mc_validate_source`.
-        if ip != ALL_HOSTS || !network.is_up() || martian(src) || src.is_loopback() {
+        if ip != ALL_HOSTS || !input.up || martian(src) || src.is_loopback() {
             return Err(Errno::EINVAL);
         }
         let local_group = u32::from(ip) & 0xffff_ff00 == 0xe000_0000;
@@ -4505,12 +4517,12 @@ fn input4(
             // `martian_destination`.
             kind if kind != Kind::Unicast => return Err(Errno::EINVAL),
             // `__mkroute_input`, out through the route's device: a redirect
-            // is asked only out through `lo`, where it came in.
+            // is asked only out through the device it came in on.
             _ => {
                 let redirect = addresses
-                    .validate_source4(src, input.tos, route.oif, input.rp_filter)
+                    .validate_source4_on(src, input.tos, route.oif, input.rp_filter, input.iif)
                     .map_err(|()| Errno::EINVAL)?;
-                let flags = if redirect && route.oif == LOOPBACK_OIF {
+                let flags = if redirect && route.oif == iif {
                     RTCF_DOREDIRECT
                 } else {
                     0
@@ -4580,7 +4592,7 @@ fn input4(
     if let Some(uid) = input.uid.filter(|&uid| uid != u32::MAX) {
         attribute(&mut body, RTA_UID, &uid.to_le_bytes());
     }
-    attribute(&mut body, RTA_IIF, &LOOPBACK_OIF.to_le_bytes());
+    attribute(&mut body, RTA_IIF, &iif.to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
@@ -8161,6 +8173,113 @@ mod tests {
         // Gone: its address and local route are told of.
         assert_eq!(addresses_gone(&network, 1000).len(), 2);
         assert!(network.addresses().v4.is_empty());
+    }
+    #[test]
+    fn a_lookup_in_on_a_veth_end_is_checked_and_answered_as_that_ends() {
+        let network = Network::isolated(crate::users::first());
+        network.devices().add(
+            crate::netdev::Device::veth(
+                1000,
+                b"va".to_vec(),
+                [2, 0, 0, 0, 0, 10],
+                1500,
+                Default::default(),
+            ),
+            true,
+        );
+        let mut payload = vec![AF_INET, 24, 0, 0];
+        payload.extend_from_slice(&1000u32.to_le_bytes());
+        attribute(&mut payload, IFA_LOCAL, &[10, 77, 0, 1]);
+        let header = Header {
+            len: 0,
+            kind: RTM_NEWADDR,
+            flags: NLM_F_CREATE | NLM_F_EXCL,
+            seq: 3,
+        };
+        change_address(&network, &header, &payload, 0).unwrap();
+        set_veth_up(&network, true);
+        device_up4(&network, 1000, true);
+        let ask = |family: u8, src: [u8; 4], dst: [u8; 4]| {
+            let mut ask = vec![family, 32, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            attribute(&mut ask, RTA_DST, &dst);
+            attribute(&mut ask, RTA_SRC, &src);
+            attribute(&mut ask, RTA_IIF, &1000u32.to_le_bytes());
+            lookup(&network, &ask, 1, 7, 0, 0)
+        };
+        let shown = |answer: &[u8]| {
+            let found = attributes(&answer[28..]);
+            let get = |kind| {
+                found
+                    .iter()
+                    .find(|(k, _)| *k == kind)
+                    .map(|(_, v)| s32_value(v))
+            };
+            let flags = u32::from_le_bytes(answer[24..28].try_into().unwrap());
+            (answer[23], flags, get(RTA_IIF), get(RTA_OIF))
+        };
+        // Its own address: local, in on it, out through lo.
+        let local = ask(AF_INET, [10, 77, 0, 2], [10, 77, 0, 1]).unwrap();
+        assert_eq!(
+            shown(&local),
+            (
+                crate::interface::Kind::Local.code(),
+                RTM_F_CLONED | RTCF_LOCAL,
+                Some(1000),
+                Some(1)
+            )
+        );
+        // Martians, and what would be forwarded with forwarding off.
+        assert_eq!(
+            ask(AF_INET, [10, 77, 0, 1], [10, 77, 0, 1]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            ask(AF_INET, [10, 77, 0, 2], [10, 77, 0, 9]),
+            Err(EHOSTUNREACH)
+        );
+        // 224.0.0.1, which it has joined while up.
+        let group = ask(AF_INET, [10, 77, 0, 2], [224, 0, 0, 1]).unwrap();
+        assert_eq!(group[23], RTN_MULTICAST);
+        // Its forwarding on (lo's stays off): back out where it came in,
+        // asking to redirect.
+        network
+            .devices()
+            .by_index_mut(1000)
+            .unwrap()
+            .conf4
+            .forwarding = 1;
+        let forwarded = ask(AF_INET, [10, 77, 0, 2], [10, 77, 0, 9]).unwrap();
+        assert_eq!(
+            shown(&forwarded),
+            (
+                crate::interface::Kind::Unicast.code(),
+                RTM_F_CLONED | RTCF_DOREDIRECT,
+                Some(1000),
+                Some(1000)
+            )
+        );
+        // Strict reverse path filtering on it: a source no route takes.
+        network
+            .devices()
+            .by_index_mut(1000)
+            .unwrap()
+            .conf4
+            .rp_filter = 1;
+        assert_eq!(
+            ask(AF_INET, [10, 99, 0, 2], [10, 77, 0, 1]),
+            Err(Errno::EINVAL)
+        );
+        // IPv6 does not come in on an end.
+        let mut six = vec![AF_INET6, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attribute(&mut six, RTA_DST, &[0; 16]);
+        attribute(&mut six, RTA_IIF, &1000u32.to_le_bytes());
+        assert_eq!(lookup(&network, &six, 1, 7, 0, 0), Err(EOPNOTSUPP));
+        // Down, it leaves 224.0.0.1.
+        set_veth_up(&network, false);
+        assert_eq!(
+            ask(AF_INET, [10, 77, 0, 2], [224, 0, 0, 1]),
+            Err(Errno::EINVAL)
+        );
     }
     #[test]
     fn addresses_take_lifetimes_and_a_priority_and_show_them() {

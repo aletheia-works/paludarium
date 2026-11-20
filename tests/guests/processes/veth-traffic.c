@@ -8,7 +8,11 @@
    connection from a loopback address is EINVAL. UDP datagrams go both
    ways; one to a port nobody has comes back as ICMP's port unreachable,
    which a connected socket learns of; one to an address nobody has is
-   dropped. The two processes take turns through pipes, so their lines
+   dropped. Before A has an address, a route through va leaves from
+   0.0.0.0, as no address of a scope to fit is there: ARP is answered,
+   and B drops what comes as a martian. TCP takes no broadcast or
+   multicast route (ENETUNREACH), and UDP no broadcast one without
+   SO_BROADCAST (EACCES). The two processes take turns through pipes, so their lines
    come in one order; the carrier, which Linux's link watch may change a
    little later, is waited for on RTNLGRP_LINK. */
 #define _GNU_SOURCE
@@ -30,6 +34,10 @@
 #define NETLINK_ROUTE_ 0
 #define RTM_NEWLINK 16
 #define RTM_NEWADDR 20
+#define RTM_NEWROUTE 24
+#define RTM_DELROUTE 25
+#define RTA_DST 1
+#define RTA_OIF 4
 #define NLM_F_REQUEST 1
 #define NLM_F_ACK 4
 #define NLM_F_EXCL 0x200
@@ -149,6 +157,18 @@ static void address(int fd, int index, const char *ip, const char *label) {
     put(&b, IFA_LOCAL, &in, 4);
     put(&b, IFA_ADDRESS, &in, 4);
     request(fd, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &b, label);
+}
+/* Adds or removes a route to `dst`/`prefix` on link through the device
+   of `index`, of the main table. */
+static void route(int fd, unsigned short type, const char *dst, int prefix, int index, const char *label) {
+    struct body b = {0};
+    const unsigned char rtm[12] = {AF_INET, (unsigned char)prefix, 0, 0, 254, 3, 253, 1};
+    struct in_addr in;
+    inet_pton(AF_INET, dst, &in);
+    raw(&b, rtm, sizeof rtm);
+    put(&b, RTA_DST, &in, 4);
+    put32(&b, RTA_OIF, (unsigned)index);
+    request(fd, type, type == RTM_NEWROUTE ? NLM_F_CREATE | NLM_F_EXCL : 0, &b, label);
 }
 /* Waits, up to 5 s, until the member links hears that the device of
    `index` has its carrier. */
@@ -314,14 +334,32 @@ int main(int argc, char **argv) {
     end(&m, link);
     request(ctl, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &m, "make");
     set_up(ctl, 1, "up lo");
-    address(ctl, A_INDEX, "10.77.0.1", "add 10.77.0.1/24");
     set_up(ctl, A_INDEX, "up va");
     B_DOES("u");
     carrier(links, A_INDEX);
 
+    /* No address yet: a route through va leaves from 0.0.0.0. */
+    route(ctl, RTM_NEWROUTE, "10.77.0.0", 24, A_INDEX, "route through va");
+    int zero = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in to = at("10.77.0.2", 6000);
+    printf("A: udp connect from none=%ld\n", result(connect(zero, (void *)&to, sizeof to)));
+    show_name(zero, 0, 0, "udp connected from none");
+    printf("A: udp send from none=%ld\n", result(send(zero, "zero", 4, 0)));
+    close(zero);
+    B_DOES("n");
+    zero = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    to = at("10.77.0.2", 5000);
+    printf("A: connect from none=%ld\n", result(connect(zero, (void *)&to, sizeof to)));
+    struct pollfd waiting = {.fd = zero, .events = POLLIN | POLLOUT};
+    printf("A: poll for 4 s=%d\n", poll(&waiting, 1, 4000));
+    show_name(zero, 0, 0, "connecting from");
+    close(zero);
+    route(ctl, RTM_DELROUTE, "10.77.0.0", 24, A_INDEX, "route gone");
+    address(ctl, A_INDEX, "10.77.0.1", "add 10.77.0.1/24");
+
     /* A connection to B's listener, and a few bytes each way. */
     int c = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in to = at("10.77.0.2", 5000);
+    to = at("10.77.0.2", 5000);
     printf("A: connect=%ld\n", result(connect(c, (void *)&to, sizeof to)));
     show_name(c, 0, 0, "connected from");
     show_name(c, 1, 1, "connected to");
@@ -387,6 +425,33 @@ int main(int argc, char **argv) {
     /* To an address nobody has: sent, and dropped. */
     to = at("10.77.0.3", 6000);
     printf("A: udp sendto nobody=%ld\n", result(sendto(u, "lost", 4, 0, (void *)&to, sizeof to)));
+    B_DOES("n");
+
+    /* Broadcast and multicast: TCP takes neither; UDP a broadcast one
+       only with SO_BROADCAST. Nobody listens on 6002. */
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    to = at("10.77.0.255", 5000);
+    printf("A: connect to broadcast=%ld\n", result(connect(c, (void *)&to, sizeof to)));
+    close(c);
+    to = at("10.77.0.255", 6002);
+    printf("A: udp sendto broadcast=%ld\n", result(sendto(u, "all", 3, 0, (void *)&to, sizeof to)));
+    cu = socket(AF_INET, SOCK_DGRAM, 0);
+    printf("A: udp connect broadcast=%ld\n", result(connect(cu, (void *)&to, sizeof to)));
+    int on = 1;
+    setsockopt(u, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+    setsockopt(cu, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+    printf("A: udp sendto broadcast, allowed=%ld\n", result(sendto(u, "all", 3, 0, (void *)&to, sizeof to)));
+    printf("A: udp connect broadcast, allowed=%ld\n", result(connect(cu, (void *)&to, sizeof to)));
+    close(cu);
+    to = at("255.255.255.255", 6002);
+    printf("A: udp sendto limited broadcast=%ld\n", result(sendto(u, "all", 3, 0, (void *)&to, sizeof to)));
+    route(ctl, RTM_NEWROUTE, "224.0.0.0", 4, A_INDEX, "multicast through va");
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    to = at("224.1.2.3", 5000);
+    printf("A: connect to a group=%ld\n", result(connect(c, (void *)&to, sizeof to)));
+    close(c);
+    to = at("224.1.2.3", 6002);
+    printf("A: udp sendto a group=%ld\n", result(sendto(u, "some", 4, 0, (void *)&to, sizeof to)));
     B_DOES("n");
     close(u);
 

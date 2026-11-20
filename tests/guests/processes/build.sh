@@ -23,6 +23,7 @@ musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie 
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth" "$here/veth.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv4" "$here/veth-ipv4.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-traffic" "$here/veth-traffic.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-iif" "$here/veth-iif.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/x87" "$here/x87.c" -lm
 # The same on musl's dynamic linker by a name exec finds in the working
 # directory, where inotify-interpreter puts a copy of it.

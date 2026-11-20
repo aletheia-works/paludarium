@@ -903,11 +903,15 @@ verified.
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
   across a pair to an address of the peer's namespace, but no IPv6
   address (it makes no link-local one as it comes up, where Linux does),
-  no neighbour, no route through a gateway and no route lookup in through
-  it (`RTA_IIF`), each `EOPNOTSUPP`. Traffic through an end makes no
+  no neighbour, no route through a gateway and no IPv6 route lookup in
+  through it (`RTA_IIF`), each `EOPNOTSUPP`. Traffic through an end makes no
   neighbour entries and moves no counters; a namespace forwards nothing
   on to another; and a broadcast or multicast destination through an end
-  reaches no one. A connection to an address nobody answers ARP for fails
+  reaches no one. ICMP's port unreachable is not rate limited
+  (`icmpv4_xrlim_allow`), so every datagram to a closed port of the
+  peer's makes a connected socket's next send `ECONNREFUSED`; and a
+  connection across a pair goes on after an end goes down, goes or moves,
+  or the address or route it took goes, where Linux's packets stop. A connection to an address nobody answers ARP for fails
   3 seconds after each connect, where Linux's attempts made while the
   neighbour is resolving fail together. The addresses of an end that goes tell
   their lifetimes as of the last netlink request, read or poll in its
@@ -994,7 +998,8 @@ verified.
   not a point-to-point one, and an IPv6 address is never tentative, where
   Linux's is until its duplicate address detection work, which ends at
   once on a loopback, has run. A connection or datagram to an address of
-  `lo` while it is down is `ENETUNREACH`, where Linux's goes out and is
+  the namespace's own, of `lo` or a veth end, while `lo` is down is
+  `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
   lookup while `lo` is down is `ENETUNREACH` too. A route lookup's answer

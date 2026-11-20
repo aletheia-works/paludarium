@@ -2412,19 +2412,6 @@ impl Addresses {
             .ok()
             .is_none_or(|route| route.kind == Kind::Unicast)
     }
-    /// `fib_validate_source` for a packet in on `lo` from `src` of `tos`,
-    /// whose route goes out through `oif` (0 for one that is not
-    /// forwarded), with reverse path filtering `rpf` (`IN_DEV_RPFILTER`):
-    /// [`Self::validate_source4_on`] of `lo`.
-    pub(crate) fn validate_source4(
-        &self,
-        src: Ipv4Addr,
-        tos: u8,
-        oif: u32,
-        rpf: i32,
-    ) -> Result<bool, ()> {
-        self.validate_source4_on(src, tos, oif, rpf, LOOPBACK_INDEX)
-    }
     /// `fib_validate_source` for a packet in on device `dev` from `src` of
     /// `tos`, whose route goes out through `oif` (0 for one that is not
     /// forwarded), with reverse path filtering `rpf` (`IN_DEV_RPFILTER`):
@@ -2625,17 +2612,22 @@ impl Addresses {
     pub(crate) fn local6(&self, ip: Ipv6Addr) -> bool {
         self.v6.iter().any(|a| a.address == ip)
     }
-    /// The address a connection to `to` on the loopback leaves from: its
-    /// route's ([`Self::source4`], [`Self::source6`]), `127.0.0.1` or `::1`
-    /// where there is none.
+    /// The address a connection to `to` leaves from: its route's
+    /// ([`Self::source4`], [`Self::source6`]); where that has none,
+    /// 0.0.0.0 out through a veth end (`inet_select_addr` finding no
+    /// address of a scope to fit), else `127.0.0.1` or `::1`.
     pub(crate) fn source(&self, to: IpAddr, order: &[i32]) -> IpAddr {
         match to {
-            IpAddr::V4(ip) => IpAddr::V4(
-                self.lookup4(ip)
-                    .ok()
-                    .and_then(|r| self.source4(&r, ip, order))
-                    .unwrap_or(Ipv4Addr::LOCALHOST),
-            ),
+            IpAddr::V4(ip) => IpAddr::V4(match self.lookup4(ip) {
+                Ok(r) => self
+                    .source4(&r, ip, order)
+                    .unwrap_or(if r.oif == LOOPBACK_OIF {
+                        Ipv4Addr::LOCALHOST
+                    } else {
+                        Ipv4Addr::UNSPECIFIED
+                    }),
+                Err(_) => Ipv4Addr::LOCALHOST,
+            }),
             IpAddr::V6(ip) => IpAddr::V6(
                 self.lookup6(ip)
                     .ok()

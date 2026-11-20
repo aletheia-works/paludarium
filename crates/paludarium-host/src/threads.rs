@@ -86,6 +86,7 @@ pub fn wait<H: Host + ?Sized>(
     deadline: Option<(ClockId, u64)>,
     cancel: &AtomicBool,
 ) -> Result<WaitOutcome, Errno> {
+    let _waiting = crate::blocked::Waiting::start();
     let mut slept = false;
     #[cfg(target_arch = "wasm32")]
     {

@@ -3243,8 +3243,10 @@ kernel.
   `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
-  reaped, `S (sleeping)` while its thread is in a system call, where it waits
-  if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
+  reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
+  a futex, a timer or anything else it sleeps on), as Linux shows a task
+  that is not running, and `R` otherwise, also while it runs in a system
+  call that does not wait. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
   `maps` and `smaps` are empty, and open for any reader their mode lets,
   as Linux's `proc_mem_open` checks the reader only of a process with
@@ -3268,13 +3270,14 @@ kernel.
 - `syscall` of a process or of a thread, 0400 and of size 0, is what
   Linux's `proc_pid_syscall` writes when it is read, for a reader that may
   attach to the task, as for `personality` (`EPERM`). The reading thread's
-  own is the call it reads with. Another thread that is running (in no
-  system call and not stopped) is `running`; one asleep in a call or
-  stopped shows the registers of its last entry into the kernel, as Linux's
+  own is the call it reads with. Another thread that is running (blocked
+  in no wait and not stopped, in a system call or not) is `running`; one
+  asleep in a call or stopped shows the registers of its last entry into the kernel, as Linux's
   `pt_regs` keeps them: the call's number and its six arguments, then the
   stack pointer and the instruction pointer (past the `syscall`
   instruction), in hex, or `-1` and the two pointers for an entry that was
-  no call (a stop from user code). A thread that has ended has no kernel
+  no call (a stop from user code, or a fault that waits for its
+  `userfaultfd`, asleep as Linux's `handle_userfault` leaves it). A thread that has ended has no kernel
   stack left: `-1 0x0 0x0`. Each thread records the registers as it enters
   the kernel, with a few plain stores that another reads whole; a new
   thread or child starts with its parent's in the call that made it, as

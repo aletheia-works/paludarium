@@ -48,6 +48,56 @@ pub mod testing;
 pub mod wasm_net;
 pub use clock::{ClockId, WaitOutcome};
 
+/// Whether the guest thread a host thread runs is blocked in a wait of the
+/// host ([`Host::wait_on`], [`Host::wait_until`]): what `/proc` shows as
+/// sleeping, as Linux shows a task that is not running. The kernel gives
+/// each host thread its guest thread's flag ([`blocked::attach`]), and
+/// every wait sets it for as long as it lasts ([`blocked::Waiting`]).
+pub mod blocked {
+    use core::cell::RefCell;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    std::thread_local! {
+        static FLAG: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    /// Makes `flag` the one this host thread's waits set, unless it already
+    /// is.
+    pub fn attach(flag: &Arc<AtomicBool>) {
+        FLAG.with(|current| {
+            let mut current = current.borrow_mut();
+            if !current.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag)) {
+                *current = Some(Arc::clone(flag));
+            }
+        });
+    }
+
+    /// A wait of the host: the attached flag is set while it lives, and
+    /// back as it was once it ends, so a wait within another keeps it set.
+    #[must_use]
+    pub struct Waiting(Option<(Arc<AtomicBool>, bool)>);
+    impl Waiting {
+        /// The thread starts to wait.
+        pub fn start() -> Self {
+            Self(FLAG.with(|current| {
+                let flag = current.borrow().clone()?;
+                let was = flag.swap(true, Ordering::SeqCst);
+                Some((flag, was))
+            }))
+        }
+    }
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            if let Some((flag, was)) = &self.0 {
+                flag.store(*was, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 /// The times the calling host thread went to sleep in a wait of the host
 /// ([`Host::wait_on`], [`Host::wait_until`]), each wait once however often
 /// it wakes to look at its cancellation: what the kernel adds to its guest

@@ -162,6 +162,7 @@ impl Host for WasmHost {
         deadline: u64,
         cancel: &AtomicBool,
     ) -> Result<WaitOutcome, Errno> {
+        let _waiting = crate::blocked::Waiting::start();
         let mut slept = false;
         loop {
             if cancel.load(Ordering::SeqCst) {

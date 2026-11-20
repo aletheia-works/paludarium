@@ -6609,9 +6609,11 @@ mod proc_other {
         // The program the child keeps from its parent at the fork.
         k.group.set_program(&program());
         let (child, ct, _cm) = fork(&mut k, &mut t, &m);
-        // In a system call, where it waits: `wchan` is 1 for a reader that
-        // may see it.
-        child.inbox.set_in_call(true);
+        // Blocked in a wait: `wchan` is 1 for a reader that may see it.
+        child
+            .inbox
+            .blocked_flag()
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let path = format!("/proc/{}/stat", ct.tid);
         let line = read(&mut k, &mut t, &m, &path).unwrap();
         assert!(line.starts_with(format!("{} (", ct.tid).as_bytes()));
@@ -6642,6 +6644,30 @@ mod proc_other {
         // What does not tell where its memory is stays.
         assert_eq!(hidden[1], seen[1]);
         assert_eq!(hidden[20], seen[20]);
+    }
+    /// Another thread shows asleep only while it is blocked in a wait of
+    /// the host, which a system call that does not wait never is; the
+    /// stops a thread handles hand the host its flag.
+    #[test]
+    fn a_thread_shows_asleep_only_while_it_is_blocked() {
+        let (mut k, mut t, m) = setup();
+        let (child, ct, _cm) = fork(&mut k, &mut t, &m);
+        let state = |k: &mut Kernel, t: &mut Thread| {
+            let line = read(k, t, &m, &format!("/proc/{}/stat", ct.tid)).unwrap();
+            fields(&line)[0].clone()
+        };
+        assert_eq!(state(&mut k, &mut t), "R");
+        let flag = child.inbox.blocked_flag();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(state(&mut k, &mut t), "S");
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        // This thread handled its calls above: a wait of the host marks it
+        // blocked while it lasts.
+        assert!(!k.inbox.blocked());
+        let waiting = paludarium_host::blocked::Waiting::start();
+        assert!(k.inbox.blocked());
+        drop(waiting);
+        assert!(!k.inbox.blocked());
     }
     #[test]
     fn a_parent_reads_its_child_s_maps_as_the_child_does_and_another_user_may_not() {

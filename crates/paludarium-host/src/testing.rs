@@ -228,6 +228,7 @@ impl Host for RecordingHost {
         deadline: u64,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<WaitOutcome, Errno> {
+        let _waiting = crate::blocked::Waiting::start();
         let remaining = {
             let mut s = self.lock();
             if s.interrupt_wait {
@@ -257,6 +258,7 @@ impl Host for RecordingHost {
         deadline: Option<(ClockId, u64)>,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<WaitOutcome, Errno> {
+        let _waiting = crate::blocked::Waiting::start();
         let Some((clock, end)) = deadline else {
             return crate::threads::wait(self, token, expected, None, cancel);
         };

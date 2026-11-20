@@ -1015,9 +1015,14 @@ impl Kernel {
         // A signal sent while the thread was stopped is pending as it goes
         // on, as Linux queues it on the task, so the checkpoint takes it
         // before the call the stop interrupted runs again (`get_signal`
-        // goes on past `ptrace_stop`).
-        self.group.drain_process(&mut thread.state);
-        self.inbox.drain(&mut thread.state);
+        // goes on past `ptrace_stop`). Not while its group is stopped: a
+        // thread let go there stops again and takes its signals once the
+        // group continues, as Linux's `__ptrace_unlink` puts it back in
+        // the group stop until SIGCONT wakes it.
+        if !self.group.is_stopped() {
+            self.group.drain_process(&mut thread.state);
+            self.inbox.drain(&mut thread.state);
+        }
         match resumed {
             None => Resumed::Not,
             Some((signal, Some(stop))) => {

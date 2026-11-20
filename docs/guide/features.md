@@ -5161,7 +5161,9 @@ one only with an `--allow-net`.
   is what the call returns, and another `orig_rax` is the call that runs.
   A signal sent to the tracee while it is stopped is taken as the stop ends,
   before the call runs again, as Linux's `get_signal` goes on past the stop:
-  the tracee stops for it with the restart code still in `rax`.
+  the tracee stops for it with the restart code still in `rax`. A tracee let
+  go while its group is stopped stays stopped and takes its signals once
+  the group continues.
   `PTRACE_O_SUSPEND_SECCOMP` lets the tracee's calls past its seccomp
   filters and strict mode; setting it needs `CAP_SYS_ADMIN` and a tracer
   under no seccomp mode (`EPERM`), as on a Linux with checkpoint and

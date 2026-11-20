@@ -192,8 +192,10 @@ impl Mapping {
     /// for `heap` (`vma_is_initial_heap`).
     fn of(vma: &Vma, start_stack: u64, root: &[u8], heap: bool) -> Self {
         let (device, inode) = vma.identity;
-        let major = ((device >> 8) & 0xfff) as u32;
-        let mut minor = ((device & 0xff) | ((device >> 12) & !0xff)) as u32;
+        // `MAJOR` and `MINOR` of the device `stat` encodes, as glibc's
+        // `major` and `minor` take them apart.
+        let major = (((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000)) as u32;
+        let mut minor = ((device & 0xff) | ((device >> 12) & 0xffff_ff00)) as u32;
         let name: Vec<u8> = match &vma.file {
             Some(file) if file.source => {
                 let name = file.name.as_deref().unwrap_or_default();
@@ -505,6 +507,14 @@ mod tests {
         );
         assert_eq!(m.pgoff, 0x2000);
         assert_eq!((m.major, m.minor, m.inode), (8, 3, 42));
+        let big = Vma {
+            identity: (0x0000_1234_5678_9abc, 1),
+            ..vma(0, 0x1000, vm::READ, None)
+        };
+        let wide = Mapping::of(&big, 0, b"/", false);
+        // glibc's `major` (bits 8 to 19 and 44 up) and `minor` (bits 0 to 7
+        // and 20 to 43).
+        assert_eq!((wide.major, wide.minor), (0x189a, 0x2345_67bc));
         assert_eq!(
             (m.prot, m.flags, m.exec),
             (PROT_READ | PROT_EXEC, MAP_SHARED | MAP_LOCKED, true)

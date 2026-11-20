@@ -1411,13 +1411,6 @@ impl ThreadGroup {
             .cloned()
             .unwrap_or_else(|| own.clone())
     }
-    /// The seccomp mode and the number of filters of thread `tid`, or of
-    /// `own` when the group has not recorded it.
-    pub(crate) fn seccomp_of(&self, tid: u32, own: &crate::seccomp::Seccomp) -> (u8, u32) {
-        let threads = self.seccomp_threads();
-        let state = threads.get(tid).unwrap_or(own);
-        (state.mode, state.filters())
-    }
     /// Thread `tid` is gone, unless it led process `pid`.
     fn forget_task_ids(&self, pid: u32, tid: u32) {
         if tid != pid {

@@ -7875,10 +7875,8 @@ fn seccomp_filters_refuse_calls_by_their_action() {
     seccomp_program(&f, &[(0x06, 0, 0, 0x7ffc_0000)]);
     assert_eq!(f.ret(157, &[22, 2, DATA]), 0);
     assert_eq!(f.ret(39, &[]), errno(Errno::EACCES));
-    assert_eq!(
-        f.kernel.group.seccomp_of(1, &f.thread.state.seccomp),
-        (2, 2)
-    );
+    let state = f.kernel.group.seccomp_of_state(1, &f.thread.state.seccomp);
+    assert_eq!((state.mode, state.filters()), (2, 2));
     // gettid: SIGSYS, which ends the process as nothing handles it.
     assert_eq!(f.call(186, &[]), Next::Exit(ExitStatus::Signaled(31)));
 }

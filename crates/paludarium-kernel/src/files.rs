@@ -8513,17 +8513,30 @@ fn other_generated_stat(
             c.files.descriptor(u64::from(n)).ok()?;
             crate::proc::stat(0)
         }
-        crate::proc::OwnEntry::Status => crate::proc::stat(status(c).len()),
-        crate::proc::OwnEntry::Stat | crate::proc::OwnEntry::Cmdline => {
-            crate::proc::stat(own_file(c, entry).map_or(0, |content| content.len()))
-        }
-        // 0644, which its owner may open for writing, as Linux's.
-        crate::proc::OwnEntry::Comm => FileStat {
-            mode: 0o100_644,
-            ..crate::proc::stat(own_file(c, entry).map_or(0, |content| content.len()))
-        },
-        crate::proc::OwnEntry::Environ => {
-            crate::proc::private_stat(own_file(c, entry).map_or(0, |content| content.len()))
+        // Sized as another process's are, from what its threads published
+        // ([`tasks::content`]), as their reads are made.
+        crate::proc::OwnEntry::Status
+        | crate::proc::OwnEntry::Stat
+        | crate::proc::OwnEntry::Cmdline
+        | crate::proc::OwnEntry::Environ
+        | crate::proc::OwnEntry::Comm => {
+            let task_entry = own_at_read(entry)?;
+            let path = crate::proc::TaskPath {
+                pid: c.process.pid,
+                tid: None,
+                entry: task_entry,
+            };
+            let task = tasks::find(c, &path).ok()?;
+            let length = tasks::content(c, &task, task_entry).map_or(0, |content| content.len());
+            match task_entry {
+                // 0644, which its owner may open for writing, as Linux's.
+                crate::proc::TaskEntry::Comm => FileStat {
+                    mode: 0o100_644,
+                    ..crate::proc::stat(length)
+                },
+                crate::proc::TaskEntry::Environ => crate::proc::private_stat(length),
+                _ => crate::proc::stat(length),
+            }
         }
         crate::proc::OwnEntry::Exe | crate::proc::OwnEntry::Cwd | crate::proc::OwnEntry::Root => {
             return None;
@@ -8587,8 +8600,6 @@ fn own_link(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
         _ => None,
     }
 }
-/// The contents of this process's `stat`, `cmdline` or `comm`; `None` for
-/// any other entry.
 /// The entry of a process's directory that this process's own `entry` is,
 /// for those an open makes at each read as another process's
 /// ([`tasks::at_read_file`]).
@@ -8603,78 +8614,13 @@ fn own_at_read(entry: crate::proc::OwnEntry) -> Option<crate::proc::TaskEntry> {
         _ => return None,
     })
 }
+/// The contents of this process's `fdinfo/<n>` while descriptor `n` is
+/// open; `None` for any other entry.
 fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
-    let start_stack = c.group.start_stack();
-    let (arguments, environment) = crate::coredump::string_ranges(c.mem, start_stack);
-    Some(match entry {
-        crate::proc::OwnEntry::Comm => crate::proc::render_comm(&c.process.name),
-        // The argument or environment strings as they are in memory now, as
-        // Linux reads them.
-        crate::proc::OwnEntry::Cmdline | crate::proc::OwnEntry::Environ => {
-            let (start, end) = if entry == crate::proc::OwnEntry::Cmdline {
-                arguments
-            } else {
-                environment
-            };
-            let length = usize::try_from(end - start).unwrap_or(0);
-            let mut bytes = vec![0; length];
-            if c.mem.read(GuestAddr(start), &mut bytes).is_err() {
-                bytes.clear();
-            }
-            bytes
-        }
-        crate::proc::OwnEntry::Stat => {
-            let (parent, group, session, children_cpu, rss_limit) =
-                c.processes.stat_of(c.process.pid);
-            let mask = |handled: &dyn Fn(u64) -> bool| {
-                c.process
-                    .signal_actions
-                    .iter()
-                    .filter(|(n, a)| (1..=64).contains(*n) && handled(a.handler))
-                    .fold(0u64, |mask, (&n, _)| mask | 1 << (n - 1))
-            };
-            crate::proc::render_stat(&crate::proc::ProcessStat {
-                pid: c.process.pid,
-                name: &c.process.name,
-                // Running, reading this.
-                state: 'R',
-                waiting: false,
-                exit_signal: 17,
-                parent,
-                group,
-                session,
-                terminal: crate::pty::stat_fields(c.processes.terminal(c.process.pid).as_deref()),
-                cpu: c.group.process_cpu(),
-                children_cpu,
-                nice: c.group.nice(c.process.pid).unwrap_or(0),
-                threads: c.group.active_threads(),
-                virtual_size: c.mem.mappings().map(|m| m.length).sum(),
-                rss_limit,
-                // Its own: `ptrace_may_access` lets a thread group see itself.
-                memory: true,
-                permitted: true,
-                code: c.group.code(),
-                data: c.group.data(),
-                start_stack,
-                start_brk: c.mem.initial_break().0,
-                arguments,
-                environment,
-                pending: c
-                    .process
-                    .pending
-                    .iter()
-                    .filter(|s| (1..=64).contains(&s.number))
-                    .fold(0, |mask, s| mask | 1 << (s.number - 1)),
-                blocked: c.process.signal_mask,
-                ignored: mask(&|handler| handler == 1),
-                caught: mask(&|handler| handler > 1),
-                // Running, it has neither ended nor stopped.
-                exit_code: 0,
-            })
-        }
-        crate::proc::OwnEntry::DescriptorInfo(n) => descriptor_info(c, n)?,
-        _ => return None,
-    })
+    match entry {
+        crate::proc::OwnEntry::DescriptorInfo(n) => descriptor_info(c, n),
+        _ => None,
+    }
 }
 /// `/proc/self/fdinfo/<n>` while descriptor `n` is open, as Linux's
 /// `seq_show` writes it: the description's position, its flags in octal
@@ -8876,62 +8822,4 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         crate::permissions::own(c.files, &c.process.credentials, &p, false, &parent);
     }
     Ok(())
-}
-/// This process's `/proc/self/status`.
-fn status(c: &Context<'_>) -> Vec<u8> {
-    let (parent, queue_limit, no_new_privs) = c.processes.status_of(c.process.pid);
-    let (group_id, session, space) = c.processes.view(c.process.pid).map_or_else(
-        || (0, 0, c.group.namespaces(c.tid).pid.clone()),
-        |view| (view.group_id, view.session, view.space),
-    );
-    let mask = |numbers: &mut dyn Iterator<Item = i32>| {
-        numbers
-            .filter(|n| (1..=64).contains(n))
-            .fold(0u64, |mask, n| mask | 1 << (n - 1))
-    };
-    let actions = &c.process.signal_actions;
-    let descriptors = c
-        .files
-        .fds
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .keys()
-        .next_back()
-        .map_or(0, |&fd| fd as usize + 1);
-    crate::proc::render_status(&crate::proc::Status {
-        name: &c.process.name,
-        umask: Some(c.files.umask()),
-        state: "R (running)",
-        tgid: c.process.pid,
-        pid: c.process.pid,
-        parent,
-        tracer: c.processes.traces.tracer_of(c.tid).unwrap_or(0),
-        group_id,
-        session,
-        space: &space,
-        descriptors: Some(descriptors),
-        locked: Some(c.mem.locked_pages()),
-        resident: Some(c.mem.resident_pages()),
-        threads: c.group.active_threads(),
-        queued: c.process.pending.len(),
-        queue_limit,
-        pending: mask(&mut c.process.pending.iter().map(|s| s.number)),
-        blocked: c.process.signal_mask,
-        ignored: mask(
-            &mut actions
-                .iter()
-                .filter(|(_, a)| a.handler == 1)
-                .map(|(&n, _)| n),
-        ),
-        caught: mask(
-            &mut actions
-                .iter()
-                .filter(|(_, a)| a.handler > 1)
-                .map(|(&n, _)| n),
-        ),
-        no_new_privs,
-        seccomp: c.group.seccomp_of(c.process.pid, &c.process.seccomp),
-        credentials: &c.process.credentials,
-        reader: &c.process.credentials.user,
-    })
 }

@@ -373,15 +373,8 @@ fn prpsinfo(who: &Identity, thread: &ThreadCore, mem: &AddressSpace) -> [u8; 136
 /// Where the arguments and the environment strings lie, as Linux's
 /// `arg_start`..`arg_end` and `env_start`..`env_end`: from the first string's
 /// address to past the last one's NUL, read from the vectors the initial
-/// stack at `start_stack` holds. Empty ranges at 0 when they cannot be read.
-pub(crate) fn string_ranges(mem: &AddressSpace, start_stack: u64) -> ((u64, u64), (u64, u64)) {
-    string_ranges_in(
-        &|at, buf: &mut [u8]| mem.read(GuestAddr(at), buf).is_ok(),
-        start_stack,
-    )
-}
-/// [`string_ranges`] of a space that `read` reads, which tells whether it
-/// could.
+/// stack at `start_stack` holds, in a space that `memory` reads, which tells
+/// whether it could. Empty ranges at 0 when they cannot be read.
 pub(crate) fn string_ranges_in(
     memory: &dyn Fn(u64, &mut [u8]) -> bool,
     start_stack: u64,

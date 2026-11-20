@@ -68,24 +68,36 @@ pub mod blocked {
     }
 
     /// Makes `flag` the one this host thread's waits set until the guard
-    /// it returns is dropped.
+    /// it returns is dropped. The flag stays cached after that, unmarked by
+    /// any wait, so attaching it again costs no reference count.
     pub fn attach(flag: &Arc<AtomicBool>) -> Attached {
-        FLAG.with(|current| {
+        let replaced = FLAG.with(|current| {
             let mut current = current.borrow_mut();
-            if !current.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag)) {
-                *current = Some(Arc::clone(flag));
+            if current.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag)) {
+                None
+            } else {
+                current.replace(Arc::clone(flag))
             }
         });
-        Attached(ACTIVE.with(|active| active.replace(true)))
+        Attached {
+            active: ACTIVE.with(|active| active.replace(true)),
+            replaced,
+        }
     }
 
-    /// The time a flag is attached ([`attach`]); within another, it ends
-    /// with the outer one.
+    /// The time a flag is attached ([`attach`]). Within another attachment,
+    /// it gives the outer one back its flag and its state as it ends.
     #[must_use]
-    pub struct Attached(bool);
+    pub struct Attached {
+        active: bool,
+        replaced: Option<Arc<AtomicBool>>,
+    }
     impl Drop for Attached {
         fn drop(&mut self) {
-            ACTIVE.with(|active| active.set(self.0));
+            if let Some(outer) = self.replaced.take() {
+                FLAG.with(|current| *current.borrow_mut() = Some(outer));
+            }
+            ACTIVE.with(|active| active.set(self.active));
         }
     }
 

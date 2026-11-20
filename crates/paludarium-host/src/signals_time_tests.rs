@@ -165,12 +165,19 @@ fn waits_mark_the_attached_flag_while_they_sleep() {
         after.sleep();
         assert!(!flag.load(Ordering::SeqCst));
         drop(after);
-        // Attaching another replaces it.
+        // An attachment within another, of another flag, marks that one
+        // and gives the outer one back its own as it ends.
+        let _outer = blocked::attach(&flag);
         let other = Arc::new(AtomicBool::new(false));
-        let _attached = blocked::attach(&other);
+        let inner = blocked::attach(&other);
         let mut marked = blocked::Waiting::new();
         marked.sleep();
         assert!(other.load(Ordering::SeqCst) && !flag.load(Ordering::SeqCst));
+        drop(marked);
+        drop(inner);
+        let mut marked = blocked::Waiting::new();
+        marked.sleep();
+        assert!(flag.load(Ordering::SeqCst) && !other.load(Ordering::SeqCst));
     })
     .join()
     .unwrap();

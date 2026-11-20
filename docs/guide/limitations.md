@@ -128,8 +128,8 @@ verified.
   resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
-  another process's state is taken from where its thread is (in a system
-  call or not), not from whether it waits. A thread shows another process
+  another process's thread is `S (sleeping)` in every wait, where Linux
+  shows some waits it cannot interrupt as `D (disk sleep)`. A thread shows another process
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
   seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing

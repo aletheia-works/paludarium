@@ -272,8 +272,8 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
         TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),
         TaskEntry::Setgroups => public.credentials.user.setgroups_text().to_vec(),
         // Nothing once it has ended, whose open is `EINVAL` ([`mounts`]).
-        TaskEntry::Mounts(mountinfo) => mounts(task).map_or_else(Vec::new, |(mounts, root)| {
-            crate::proc::render(&mounts, mountinfo, &root)
+        TaskEntry::Mounts(mountinfo) => mounts(task).map_or_else(Vec::new, |(fs, root)| {
+            crate::proc::render(&fs.mounts(), mountinfo, &root)
         }),
         // The argument or environment strings as they are in its memory now;
         // nothing for a zombie.
@@ -382,11 +382,13 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
 /// `mountinfo` and `mounts` show; `None` for a task that has ended, whose
 /// open Linux's `mounts_open_common` refuses (`EINVAL`) as it has no
 /// `nsproxy`, the leader of live threads too.
-pub(super) fn mounts(task: &Task) -> Option<(Vec<paludarium_vfs::MountPoint>, Vec<u8>)> {
+pub(super) fn mounts(
+    task: &Task,
+) -> Option<(std::sync::Arc<dyn paludarium_vfs::FileSystem>, Vec<u8>)> {
     if task.state.0 == 'Z' {
         return None;
     }
-    task.public.files.mounts()
+    task.public.files.mount_view()
 }
 
 /// `maps` or `smaps` (`smaps` set) of the task, opened with `flags`, its
@@ -766,13 +768,35 @@ pub(super) fn stat_file(
     std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
 }
 /// Whether `entry` is one [`text_file`] makes at each read: `status`,
-/// `statm`, `limits` and `cmdline`, which Linux's `proc_single_show` and
-/// `proc_pid_cmdline_read` make from the task as it is then.
+/// `statm`, `limits`, `cmdline` and `comm`, which Linux's
+/// `proc_single_show`, `proc_pid_cmdline_read` and `comm_show` make from
+/// the task as it is then.
 pub(super) fn made_at_read(entry: TaskEntry) -> bool {
     matches!(
         entry,
-        TaskEntry::Status | TaskEntry::Statm | TaskEntry::Limits | TaskEntry::Cmdline
+        TaskEntry::Status
+            | TaskEntry::Statm
+            | TaskEntry::Limits
+            | TaskEntry::Cmdline
+            | TaskEntry::Comm
     )
+}
+/// `entry` of the task opened with `flags`, for one Linux makes at each
+/// read or reads from what its open took: `stat` ([`stat_file`]),
+/// `environ` ([`environ_file`]) and those [`made_at_read`]; `None` for any
+/// other.
+pub(super) fn at_read_file(
+    c: &Context<'_>,
+    task: &Task,
+    entry: TaskEntry,
+    (flags, stat, owner): (u32, FileStat, crate::proc::Owner),
+) -> Option<std::sync::Arc<dyn paludarium_host::FileHandle>> {
+    Some(match entry {
+        TaskEntry::Stat => stat_file(c.processes, task, flags, stat, owner),
+        TaskEntry::Environ => environ_file(task, flags, stat, owner),
+        _ if made_at_read(entry) => text_file(c, task, entry, flags, stat, owner),
+        _ => return None,
+    })
 }
 /// `entry` of the task (one [`made_at_read`]), opened with `flags`: made
 /// at each read from its start of the task as it is then, the IDs in it as
@@ -797,7 +821,17 @@ pub(super) fn text_file(
         let task = shown(&processes, view, which, reader).ok_or(Errno(3))?;
         Ok(text(&task, entry, &opener).unwrap_or_default())
     });
-    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
+    let file = crate::proc::single_file(text, flags, stat, owner);
+    // `comm` renames its thread when written, as Linux's `comm_write`;
+    // `cmdline` has a read operation of its own, `proc_pid_cmdline_read`.
+    std::sync::Arc::new(match entry {
+        TaskEntry::Comm => {
+            let (group, pid, tid) = comm(task);
+            file.writing(crate::proc::comm_writer(group, pid, tid))
+        }
+        TaskEntry::Cmdline => file.not_seq_opened(),
+        _ => file,
+    })
 }
 /// `environ` of the task, opened with `flags`: the environment strings,
 /// read at each read from the address space it had when opened, as Linux's
@@ -823,7 +857,7 @@ pub(super) fn environ_file(
         }
         Ok(bytes)
     });
-    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
+    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner).not_seq_opened())
 }
 /// The group of the task and the thread a write to its `comm` renames.
 pub(super) fn comm(task: &Task) -> (std::sync::Arc<crate::threads::ThreadGroup>, u32, u32) {

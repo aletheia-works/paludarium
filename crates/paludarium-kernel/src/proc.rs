@@ -1099,14 +1099,46 @@ pub(crate) struct GeneratedFile {
     stat: Option<FileStat>,
     /// The owner its inode has now ([`Owners`]), over `stat`'s.
     owner: Option<Owner>,
-    /// The thread a write renames, for `comm` ([`Self::renaming`]).
-    comm: Option<Comm>,
 }
-/// The thread whose `comm` a file is.
-struct Comm {
+/// The write operation of `comm` of thread `tid` of process `pid`, of
+/// `group`, as Linux's `comm_write`: it renames the thread to the first 15
+/// bytes, up to a NUL, when the writer is of the thread's process, `EINVAL`
+/// from any other and `ESRCH` once the thread is gone; the whole count is
+/// taken, and the file position stays where it was.
+pub(crate) fn comm_writer(
     group: Arc<crate::threads::ThreadGroup>,
     pid: u32,
     tid: u32,
+) -> crate::seq::Writer {
+    Box::new(move |b, position| {
+        if !group.threads().iter().any(|&(t, _)| t == tid) {
+            return Err(Errno(3)); // ESRCH
+        }
+        if caller().0 != pid {
+            return Err(Errno::EINVAL);
+        }
+        let mut name = [0; 16];
+        for (to, &from) in name
+            .iter_mut()
+            .zip(b.iter().take(15).take_while(|&&byte| byte != 0))
+        {
+            *to = from;
+        }
+        group.rename(tid, name);
+        Ok((b.len(), position))
+    })
+}
+/// `mountinfo` (`mountinfo` set) or `mounts` of the mount namespace whose
+/// filesystem is `fs`, as `root` sees it, opened with `flags`: a line for
+/// each mount there is at each read, as Linux's `m_start` and
+/// `show_mountinfo` walk the namespace its open took.
+pub(crate) fn mounts_file(
+    (fs, root): (Arc<dyn paludarium_vfs::FileSystem>, Vec<u8>),
+    mountinfo: bool,
+    (flags, stat, owner): (u32, FileStat, Owner),
+) -> crate::seq::SeqFile {
+    let text = move || render(&fs.mounts(), mountinfo, &root);
+    crate::seq::SeqFile::of_task(Box::new(crate::seq::Lines(text)), flags, stat, owner)
 }
 impl GeneratedFile {
     /// The files are 0444, but the guest is root, which may open them for
@@ -1129,26 +1161,12 @@ impl GeneratedFile {
             entry,
             stat: None,
             owner: None,
-            comm: None,
         }
     }
     /// The same, owned by whom its inode's `owner` says when `fstat` asks.
     pub(crate) fn with_owner(self, owner: Owner) -> Self {
         Self {
             owner: Some(owner),
-            ..self
-        }
-    }
-    /// `comm` of thread `tid` of process `pid`, of `group`: a write renames
-    /// that thread, as Linux's `comm_write`.
-    pub(crate) fn renaming(
-        self,
-        group: Arc<crate::threads::ThreadGroup>,
-        pid: u32,
-        tid: u32,
-    ) -> Self {
-        Self {
-            comm: Some(Comm { group, pid, tid }),
             ..self
         }
     }
@@ -1180,30 +1198,8 @@ impl FileHandle for GeneratedFile {
     }
     /// These files cannot be written: their error, or EBADF on a
     /// descriptor opened read-only.
-    /// `comm` opened for writing renames its thread as Linux's `comm_write`
-    /// does: to the first 15 bytes, up to a NUL, when the writer is of the
-    /// thread's process, `EINVAL` from any other and `ESRCH` once the thread
-    /// is gone; the whole count is taken.
-    fn write(&self, b: &[u8]) -> Result<usize, Errno> {
-        let error = self.write_error.ok_or(Errno::EBADF)?;
-        let Some(comm) = &self.comm else {
-            return Err(error);
-        };
-        if !comm.group.threads().iter().any(|&(tid, _)| tid == comm.tid) {
-            return Err(Errno(3)); // ESRCH
-        }
-        if caller().0 != comm.pid {
-            return Err(Errno::EINVAL);
-        }
-        let mut name = [0; 16];
-        for (to, &from) in name
-            .iter_mut()
-            .zip(b.iter().take(15).take_while(|&&byte| byte != 0))
-        {
-            *to = from;
-        }
-        comm.group.rename(comm.tid, name);
-        Ok(b.len())
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(self.write_error.ok_or(Errno::EBADF)?)
     }
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
         let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);

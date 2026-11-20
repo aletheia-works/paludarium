@@ -274,18 +274,20 @@ impl FilesView {
                 .map_or_else(|| b"/".to_vec(), |root| root.path.clone()),
         )
     }
-    /// The mounts of its mount namespace, as its root sees the filesystem,
-    /// with that root, for `/proc/<pid>/mountinfo` and `mounts`.
-    pub(crate) fn mounts(&self) -> Option<(Vec<paludarium_vfs::MountPoint>, Vec<u8>)> {
+    /// The filesystem of its mount namespace and its root in it, for
+    /// `/proc/<pid>/mountinfo` and `mounts`, which an open keeps to list
+    /// the mounts of at each read as that root sees them (Linux's
+    /// `mounts_open_common` takes the `mnt_namespace` and the root).
+    pub(crate) fn mount_view(&self) -> Option<(Arc<dyn FileSystem>, Vec<u8>)> {
         let space = self.space.upgrade()?;
         let root = self.root.upgrade()?;
         let root = root.lock().unwrap_or_else(PoisonError::into_inner).clone();
         Some(match root {
-            Some(root) => (root.fs.mounts(), root.path),
+            Some(root) => (root.fs, root.path),
             None => {
                 let machine =
                     Arc::clone(&space.lock().unwrap_or_else(PoisonError::into_inner).machine);
-                (machine.mounts(), b"/".to_vec())
+                (machine, b"/".to_vec())
             }
         })
     }
@@ -7079,9 +7081,14 @@ fn open_path(
         }
     } else if let Some(mountinfo) = crate::proc::mount_table(p) {
         own_open_check(c, p, flags)?;
-        let content = crate::proc::render(&c.files.fs().mounts(), mountinfo, &c.files.root());
+        // The mounts at each read of the namespace and root it has now.
         let stat = own_stat(c, crate::proc::stat(0));
-        Arc::new(crate::proc::GeneratedFile::open(content, flags).with_stat(stat))
+        let owner = Arc::new(Mutex::new((stat.uid, stat.gid)));
+        Arc::new(crate::proc::mounts_file(
+            (c.files.fs(), c.files.root()),
+            mountinfo,
+            (flags, stat, owner),
+        ))
     } else if tasks::is_root(p) {
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
@@ -7130,37 +7137,50 @@ fn open_path(
         // `proc_uid_map_write` and `proc_setgroups_write`: opened for writing
         // by whom their mode lets, and `setgroups` only with CAP_SYS_ADMIN
         // in the namespace (`proc_setgroups_open`'s `EACCES`).
-        if let crate::proc::TaskEntry::IdMap(_) | crate::proc::TaskEntry::Setgroups = path.entry {
-            let content = tasks::content(c, &task, path.entry).unwrap_or_default();
-            let creds = &c.process.credentials;
-            let user = task.user();
-            if flags & 3 != 0 {
-                let (stat, ..) = tasks::stat(c, p, &task, path.entry, false)?;
-                crate::permissions::permission(creds, &stat, crate::permissions::MAY_WRITE)?;
-                if path.entry == crate::proc::TaskEntry::Setgroups
-                    && !creds.capable_in(crate::credentials::CAP_SYS_ADMIN, &user)
-                {
-                    return Err(Errno::EACCES);
-                }
-            }
-            let ids = match path.entry {
-                crate::proc::TaskEntry::IdMap(ids) => Some(ids),
-                _ => None,
-            };
-            let file = crate::users::MapFile::open(user, ids, content, creds.clone(), flags);
-            return Ok((Arc::new(file), p.to_vec()));
-        }
-        if let crate::proc::TaskEntry::Mounts(_) = path.entry
-            && tasks::mounts(&task).is_none()
+        let creds = &c.process.credentials;
+        if let crate::proc::TaskEntry::IdMap(_) | crate::proc::TaskEntry::Setgroups = path.entry
+            && flags & 3 != 0
         {
-            return Err(Errno::EINVAL);
+            let (stat, ..) = tasks::stat(c, p, &task, path.entry, false)?;
+            crate::permissions::permission(creds, &stat, crate::permissions::MAY_WRITE)?;
+            if path.entry == crate::proc::TaskEntry::Setgroups
+                && !creds.capable_in(crate::credentials::CAP_SYS_ADMIN, &task.user())
+            {
+                return Err(Errno::EACCES);
+            }
         }
+        // The mount namespace and root the open takes, which an ended task
+        // no longer has (`EINVAL`).
+        let mount_view = match path.entry {
+            crate::proc::TaskEntry::Mounts(_) => Some(tasks::mounts(&task).ok_or(Errno::EINVAL)?),
+            _ => None,
+        };
         // The inode an open file holds, whose owner each later lookup of
         // its path gives it (`pid_revalidate`).
         let owner = file_stat
             .as_ref()
             .and_then(|stat| proc_lookup(c, p, stat))
             .unwrap_or_default();
+        let at_read = (
+            flags,
+            file_stat.unwrap_or_else(|| crate::proc::stat(0)),
+            Arc::clone(&owner),
+        );
+        // The user namespace's files take one write, as Linux's
+        // `proc_uid_map_write` and `proc_setgroups_write`, and read the
+        // namespace the task was in at the open.
+        if let crate::proc::TaskEntry::IdMap(_) | crate::proc::TaskEntry::Setgroups = path.entry {
+            let ids = match path.entry {
+                crate::proc::TaskEntry::IdMap(ids) => Some(ids),
+                _ => None,
+            };
+            let file = crate::users::map_file(task.user(), ids, creds.clone(), at_read);
+            return Ok((Arc::new(file), p.to_vec()));
+        }
+        if let (crate::proc::TaskEntry::Mounts(mountinfo), Some(view)) = (path.entry, mount_view) {
+            let file = crate::proc::mounts_file(view, mountinfo, at_read);
+            return Ok((Arc::new(file), p.to_vec()));
+        }
         if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
             return Ok((
                 tasks::maps(&task, smaps, flags, c.files.root(), owner),
@@ -7185,23 +7205,8 @@ fn open_path(
         if path.entry == crate::proc::TaskEntry::Wchan {
             return Ok((tasks::wchan(c.processes, &task, flags, owner), p.to_vec()));
         }
-        if path.entry == crate::proc::TaskEntry::Stat {
-            let stat = file_stat.unwrap_or_else(|| crate::proc::stat(0));
-            return Ok((
-                tasks::stat_file(c.processes, &task, flags, stat, owner),
-                p.to_vec(),
-            ));
-        }
-        if tasks::made_at_read(path.entry) {
-            let stat = file_stat.unwrap_or_else(|| crate::proc::stat(0));
-            return Ok((
-                tasks::text_file(c, &task, path.entry, flags, stat, owner),
-                p.to_vec(),
-            ));
-        }
-        if path.entry == crate::proc::TaskEntry::Environ {
-            let stat = file_stat.unwrap_or_else(|| crate::proc::stat(0));
-            return Ok((tasks::environ_file(&task, flags, stat, owner), p.to_vec()));
+        if let Some(file) = tasks::at_read_file(c, &task, path.entry, at_read) {
+            return Ok((file, p.to_vec()));
         }
         if path.entry == crate::proc::TaskEntry::ClearRefs {
             return Ok((
@@ -7240,11 +7245,7 @@ fn open_path(
             ));
         }
         if let Some(content) = tasks::content(c, &task, path.entry) {
-            let mut file = crate::proc::GeneratedFile::open(content, flags);
-            if path.entry == crate::proc::TaskEntry::Comm {
-                let (group, pid, tid) = tasks::comm(&task);
-                file = file.renaming(group, pid, tid);
-            }
+            let file = crate::proc::GeneratedFile::open(content, flags);
             Arc::new(match file_stat {
                 Some(stat) => file.with_stat(stat).with_owner(owner),
                 None => file,
@@ -7303,13 +7304,25 @@ fn open_path(
             .as_ref()
             .and_then(|stat| proc_lookup(c, p, stat))
             .unwrap_or_default();
-        if let Some(content) = own_file(c, entry) {
-            let mut file = crate::proc::GeneratedFile::open(content, flags);
-            if entry == crate::proc::OwnEntry::Comm
-                && let Some(view) = c.processes.view(c.process.pid)
+        // Its `status`, `stat`, `cmdline`, `environ` and `comm` are made at
+        // each read as another process's are, from what it has published
+        // of itself by then.
+        if let Some(task_entry) = own_at_read(entry) {
+            let path = crate::proc::TaskPath {
+                pid: c.process.pid,
+                tid: None,
+                entry: task_entry,
+            };
+            let task = tasks::find(c, &path)?;
+            let shown = stat.unwrap_or_else(|| own_stat(c, crate::proc::stat(0)));
+            if let Some(file) =
+                tasks::at_read_file(c, &task, task_entry, (flags, shown, Arc::clone(&owner)))
             {
-                file = file.renaming(view.group, c.process.pid, c.process.pid);
+                return Ok((file, p.to_vec()));
             }
+        }
+        if let Some(content) = own_file(c, entry) {
+            let file = crate::proc::GeneratedFile::open(content, flags);
             return Ok((
                 Arc::new(match stat {
                     Some(stat) => file.with_stat(stat).with_owner(owner),
@@ -7354,13 +7367,9 @@ fn open_path(
             ),
             // Opened above while the descriptor is open.
             crate::proc::OwnEntry::DescriptorInfo(_) => return Err(Errno::ENOENT),
-            crate::proc::OwnEntry::Status => Arc::new(
-                crate::proc::GeneratedFile::open(status(c), flags)
-                    .with_stat(own_stat(c, crate::proc::stat(0)))
-                    .with_owner(owner),
-            ),
             // Opened above.
-            crate::proc::OwnEntry::Stat
+            crate::proc::OwnEntry::Status
+            | crate::proc::OwnEntry::Stat
             | crate::proc::OwnEntry::Cmdline
             | crate::proc::OwnEntry::Environ
             | crate::proc::OwnEntry::Comm
@@ -8580,6 +8589,20 @@ fn own_link(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
 }
 /// The contents of this process's `stat`, `cmdline` or `comm`; `None` for
 /// any other entry.
+/// The entry of a process's directory that this process's own `entry` is,
+/// for those an open makes at each read as another process's
+/// ([`tasks::at_read_file`]).
+fn own_at_read(entry: crate::proc::OwnEntry) -> Option<crate::proc::TaskEntry> {
+    use crate::proc::{OwnEntry, TaskEntry};
+    Some(match entry {
+        OwnEntry::Status => TaskEntry::Status,
+        OwnEntry::Stat => TaskEntry::Stat,
+        OwnEntry::Cmdline => TaskEntry::Cmdline,
+        OwnEntry::Environ => TaskEntry::Environ,
+        OwnEntry::Comm => TaskEntry::Comm,
+        _ => return None,
+    })
+}
 fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
     let start_stack = c.group.start_stack();
     let (arguments, environment) = crate::coredump::string_ranges(c.mem, start_stack);

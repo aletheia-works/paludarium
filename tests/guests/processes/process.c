@@ -12513,6 +12513,115 @@ static int proc_at_read_case(const char *self) {
     return 0;
 }
 
+/* The proc-own-at-read case: this process's own comm, status, stat,
+   cmdline and environ, and its uid_map, setgroups and mountinfo, each read
+   again from its start through the descriptor opened first, as Linux makes
+   them at each read (comm_show, proc_single_show, proc_pid_cmdline_read,
+   environ_read, uid_m_show, proc_setgroups_show, show_mountinfo): what the
+   process is then. The maps and mounts are those of the namespaces the
+   open took; a write to uid_map leaves the position after it. */
+static void poar_name(int fd, const char *label) {
+    char buffer[4096], a[64];
+    int n = par_reads(fd, buffer, sizeof buffer);
+    if (n < 0) {
+        printf(" %s errno=%d", label, -n);
+        return;
+    }
+    if (!strcmp(label, "stat")) {
+        char *open = strchr(buffer, '('), *close = strrchr(buffer, ')');
+        if (!open || !close) return;
+        *close = 0;
+        printf(" stat=%s", open + 1);
+    } else if (!strcmp(label, "status")) {
+        par_line(buffer, "Name:", a, sizeof a);
+        printf(" status=%s", a);
+    } else {
+        buffer[strcspn(buffer, "\n")] = 0;
+        printf(" %s=%s", label, buffer);
+    }
+}
+static int poar_count(int fd, const char *needle) {
+    static char buffer[65536];
+    int n = par_reads(fd, buffer, sizeof buffer);
+    if (n < 0) return -1;
+    int count = 0;
+    for (char *at = buffer; (at = strstr(at, needle)); at++) count++;
+    return count;
+}
+static void poar_show(const char *label, const int *fds, const char *dir) {
+    char buffer[4096];
+    printf("%s", label);
+    poar_name(fds[0], "comm");
+    poar_name(fds[1], "status");
+    poar_name(fds[2], "stat");
+    int n = par_reads(fds[3], buffer, sizeof buffer);
+    printf(" cmdline=%c", n > 0 ? buffer[0] : '-');
+    n = par_reads(fds[4], buffer, sizeof buffer);
+    printf(" environ=%c", n > 0 ? buffer[0] : '-');
+    n = par_reads(fds[5], buffer, sizeof buffer);
+    printf(" uid_map lines=%d", n < 0 ? n : poar_count(fds[5], "\n"));
+    n = par_reads(fds[6], buffer, sizeof buffer);
+    buffer[n > 0 ? strcspn(buffer, "\n") : 0] = 0;
+    printf(" setgroups=%s", buffer);
+    printf(" mounted=%d\n", poar_count(fds[7], dir));
+}
+static int proc_own_at_read_case(char **argv) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 80;
+    if (child) {
+        printf("status=%d\n", reaped(child));
+        return 0;
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    char dir[] = "/tmp/poar-XXXXXX";
+    if (!mkdtemp(dir)) _exit(81);
+    if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+        printf("unshare errno=%d\n", errno);
+        rmdir(dir);
+        _exit(82);
+    }
+    static const char *const names[] = {"comm", "status", "stat", "cmdline",
+                                        "environ", "uid_map", "setgroups", "mountinfo"};
+    int fds[8];
+    char path[64];
+    for (int i = 0; i < 8; i++) {
+        snprintf(path, sizeof path, "/proc/self/%s", names[i]);
+        fds[i] = open(path, i == 0 || i == 5 || i == 6 ? O_RDWR : O_RDONLY);
+        if (fds[i] < 0) {
+            printf("open %s errno=%d\n", names[i], errno);
+            _exit(83);
+        }
+    }
+    poar_show("opened", fds, dir);
+    prctl(PR_SET_NAME, "own-renamed", 0, 0, 0);
+    argv[0][0] = 'Q';
+    if (environ[0]) environ[0][0] = 'Z';
+    printf("setgroups write=%ld\n", (long)write(fds[6], "deny", 4));
+    char map[64];
+    snprintf(map, sizeof map, "0 %d 1", (int)uid);
+    long written = write(fds[5], map, strlen(map));
+    printf("uid_map write=%s", written == (long)strlen(map) ? "whole" : "short");
+    /* After the write the position is past it: the rest of the line. */
+    char buffer[256];
+    long rest = read(fds[5], buffer, sizeof buffer);
+    printf(" rest+written=%ld again=%ld\n", rest + written, (long)write(fds[5], map, strlen(map)));
+    snprintf(map, sizeof map, "0 %d 1", (int)gid);
+    printf("gid_map=%d\n", mt_write("/proc/self/gid_map", map));
+    int mounted = mount("tmpfs", dir, "tmpfs", 0, NULL);
+    printf("mount=%d\n", mounted ? errno : 0);
+    poar_show("changed", fds, dir);
+    printf("comm write=%ld\n", (long)write(fds[0], "written", 7));
+    poar_show("written", fds, dir);
+    if (!mounted) umount(dir);
+    poar_show("unmounted", fds, dir);
+    for (int i = 0; i < 8; i++) close(fds[i]);
+    rmdir(dir);
+    _exit(0);
+}
+
 /* The proc-stat-exit-code case: exit_code, the last field of another
    process's stat, as Linux's do_task_stat gives it to a reader that
    ptrace_may_access lets see it: the process's group_exit_code in its own
@@ -32402,6 +32511,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-personality-wchan")) return proc_personality_wchan_case();
     if (!strcmp(mode, "proc-syscall")) return proc_syscall_case();
     if (!strcmp(mode, "proc-at-read")) return proc_at_read_case(self);
+    if (!strcmp(mode, "proc-own-at-read")) return proc_own_at_read_case(argv);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

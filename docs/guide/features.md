@@ -2088,7 +2088,11 @@ kernel.
   `CAP_SETUID` or `CAP_SETGID` in the parent; mapping the parent's root needs
   `CAP_SETFCAP`. `/proc/<pid>/setgroups` reads `allow` or `deny`, which
   may be written before the gid map; `setgroups` needs it allowed and the
-  gid map written.
+  gid map written. Each of these files reads the user namespace the task
+  was in when it was opened (`proc_id_map_open`), as that namespace is at
+  each read from its start, one line for each extent; a write must be at
+  the start and leaves the file position after it, so a read then goes on
+  from there.
 
 - A new PID namespace, as Linux's, is the one the thread's children are
   numbered in; the thread stays in its own, and its `pid_for_children` link
@@ -3093,7 +3097,8 @@ kernel.
   `seq_path_root` does. `/proc/<pid>/mountinfo` and `mounts` (and those of
   `/proc/thread-self` and `/proc/<pid>/task/<tid>`) are those of that task,
   as Linux's `mounts_open_common` makes them: the mounts of its mount
-  namespace, from its root, for any reader; a process that has ended,
+  namespace, from its root, for any reader, of the namespace and root the
+  open took, as they are at each read; a process that has ended,
   until it is reaped, has them, but they open as `EINVAL`, and so do a
   process's when its leader ended before its other threads, whose own
   under `task/<tid>` still open. Each file system has its own `st_dev`, as
@@ -3316,7 +3321,7 @@ kernel.
   the file of its executable `PT_LOAD` segments; 0 for a zombie), the start
   of the stack and of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
   waits, as Linux shows root, though not for a process of more than one thread
-  as a whole), `exit_signal` (17 for the reader's own), the start and end
+  as a whole), `exit_signal`, the start and end
   of the program's data (Linux's `start_data` and `end_data`, as
   `load_elf_binary` finds them: the highest address and the highest end in
   the file of all its `PT_LOAD` segments), and where
@@ -3333,12 +3338,16 @@ kernel.
   `stat` is made at each read from its start, as Linux's is, so a descriptor
   shows what the task and the reader are then: one that drops its rights
   sees the addresses hidden, and a task that has been reaped is `ESRCH`.
-  Another process's `status`, `statm`, `limits` and `cmdline` are made at
-  each read the same way, as Linux's `proc_single_show` and
-  `proc_pid_cmdline_read` make them, with the IDs in `status` as the
-  opener's user namespace sees them; `environ` reads the address space it
-  was opened on, as Linux's `environ_read` reads the `mm` its open took, so
-  nothing after the process's `execve` or exit.
+  `status`, `statm`, `limits`, `cmdline` and `comm` are made at each read
+  the same way, as Linux's `proc_single_show`, `proc_pid_cmdline_read` and
+  `comm_show` make them, with the IDs in `status` as the opener's user
+  namespace sees them; `environ` reads the address space it was opened on,
+  as Linux's `environ_read` reads the `mm` its open took, so nothing after
+  the process's `execve` or exit, and `auxv` what the `execve` of that
+  address space saved (`auxv_read`). This process's own are made so too,
+  from what its threads published at their last system call, as another
+  process's are. A `pwrite` to any but `cmdline` and `environ` is `ESPIPE`,
+  as to every file Linux makes through `seq_open`.
   `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.

@@ -21,6 +21,25 @@ pub(crate) trait Records: Send + Sync {
     fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno>;
 }
 
+/// Records that are the lines of a text made again for each record, as
+/// a file whose `show` writes one line for each thing there is then:
+/// the mounts of a mount namespace, the extents of an ID map.
+pub(crate) struct Lines<F>(pub F);
+impl<F: Fn() -> Vec<u8> + Send + Sync> Records for Lines<F> {
+    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
+        let text = (self.0)();
+        let line = usize::try_from(index)
+            .ok()
+            .and_then(|index| text.split_inclusive(|&b| b == b'\n').nth(index));
+        Ok(line.map(|line| (line.to_vec(), index + 1)))
+    }
+}
+
+/// The write operation of a file of a process's `/proc` directory that has
+/// one, as a `proc_write` handler: given the bytes and the file position,
+/// the count it took and the position it leaves (Linux's `*ppos`).
+pub(crate) type Writer = Box<dyn Fn(&[u8], u64) -> Result<(usize, u64), Errno> + Send + Sync>;
+
 /// Where a reader has got to, as Linux's `struct seq_file` keeps it.
 struct State {
     /// The bytes gathered but not yet read (`buf`, `count`).
@@ -33,6 +52,9 @@ struct State {
     position: u64,
     /// The size of the buffer, which a long record doubles (`size`).
     buffer: usize,
+    /// A write moved the position away from where reading had got to, so
+    /// the next read walks there first (`read_pos` apart from `ki_pos`).
+    moved: bool,
 }
 
 /// A file served from its [`Records`] as it is read, of size 0. A
@@ -41,9 +63,18 @@ struct State {
 /// directory ([`Self::of_task`]) has no write operation at all (`EINVAL`).
 pub(crate) struct SeqFile {
     records: Box<dyn Records>,
+    /// The access mode it was opened with (`O_RDONLY`, `O_WRONLY` or
+    /// `O_RDWR`), which `F_GETFL` shows and a read or write checks.
+    access: u32,
     writable: bool,
+    /// Its write operation, if it has one ([`Self::writing`]).
+    writer: Option<Writer>,
     /// What a write on a descriptor open for writing gives.
     unwritable: Errno,
+    /// Whether Linux makes it with `seq_open`, which clears `FMODE_PWRITE`
+    /// so that a `pwrite` is `ESPIPE`; `cmdline` and `environ` have read
+    /// operations of their own instead ([`Self::not_seq_opened`]).
+    seq_opened: bool,
     /// What `fstat` shows but the owner.
     stat: FileStat,
     /// Its inode's owner, for a file of a process's `/proc` directory
@@ -55,8 +86,11 @@ impl SeqFile {
     pub(crate) fn open(records: Box<dyn Records>, flags: u32) -> Self {
         Self {
             records,
+            access: flags & 3,
             writable: flags & 3 != 0,
+            writer: None,
             unwritable: Errno::EIO,
+            seq_opened: true,
             stat: crate::proc::entry_stat(),
             owner: None,
             state: Mutex::new(State {
@@ -65,6 +99,7 @@ impl SeqFile {
                 next: 0,
                 position: 0,
                 buffer: BUFFER,
+                moved: false,
             }),
         }
     }
@@ -81,6 +116,23 @@ impl SeqFile {
             stat,
             owner: Some(owner),
             ..Self::open(records, flags)
+        }
+    }
+    /// The same, with `writer` as its write operation, as `comm`,
+    /// `uid_map`, `gid_map` and `setgroups` have one.
+    pub(crate) fn writing(self, writer: Writer) -> Self {
+        Self {
+            writer: Some(writer),
+            ..self
+        }
+    }
+    /// The same, for a file Linux does not open with `seq_open`, whose
+    /// `pwrite` checks its access mode and write operation as a `write`
+    /// does.
+    pub(crate) fn not_seq_opened(self) -> Self {
+        Self {
+            seq_opened: false,
+            ..self
         }
     }
     /// Gathers whole records until `wanted` bytes are there or one more
@@ -152,6 +204,16 @@ impl FileHandle for SeqFile {
         }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state;
+        // Where a write left the position, the records are walked to it
+        // first, as `seq_read_iter` does `traverse` when `ki_pos` is not
+        // `read_pos`; a walk that fails starts over and fails the read.
+        if std::mem::take(&mut state.moved)
+            && let Err(e) = self.walk_to(state, state.position)
+        {
+            self.walk_to(state, 0)?;
+            state.position = 0;
+            return Err(e);
+        }
         // A read from the start starts the records over.
         if state.position == 0 {
             state.pending.clear();
@@ -183,13 +245,32 @@ impl FileHandle for SeqFile {
         state.position += copied as u64;
         Ok(copied)
     }
-    /// It has no `proc_write` (`EIO`) or no write operation (`EINVAL`), or
-    /// `EBADF` on a descriptor opened read-only.
-    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
-        Err(if self.writable {
-            self.unwritable
+    /// Its write operation, from the file position; otherwise it has no
+    /// `proc_write` (`EIO`) or no write operation (`EINVAL`), or `EBADF` on
+    /// a descriptor opened read-only.
+    fn write(&self, b: &[u8]) -> Result<usize, Errno> {
+        if !self.writable {
+            return Err(Errno::EBADF);
+        }
+        let Some(writer) = &self.writer else {
+            return Err(self.unwritable);
+        };
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (count, position) = writer(b, state.position)?;
+        if position != state.position {
+            state.position = position;
+            state.moved = true;
+        }
+        Ok(count)
+    }
+    /// `ESPIPE`, whatever the access mode, as `seq_open` clears the file's
+    /// `FMODE_PWRITE`, which `pwrite64` checks before anything else; one not
+    /// so opened writes through its position (`ENODEV`).
+    fn write_at(&self, _: u64, _: &[u8]) -> Result<usize, Errno> {
+        Err(if self.seq_opened {
+            Errno::ESPIPE
         } else {
-            Errno::EBADF
+            Errno::ENODEV
         })
     }
     /// As Linux's `seq_lseek`: from the start or the current position,
@@ -230,7 +311,7 @@ impl FileHandle for SeqFile {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        0
+        self.access
     }
     fn set_flags(&self, _: u32) -> Result<(), Errno> {
         Ok(())
@@ -355,5 +436,36 @@ mod tests {
         assert_eq!((shown.uid, shown.gid, shown.mode), (7, 8, stat.mode));
         assert_eq!(file.write(b"x"), Err(Errno::EINVAL));
         assert_eq!(read(&file, 10), b"1\n");
+        assert_eq!(file.flags(), 2);
+    }
+
+    #[test]
+    fn a_write_operation_moves_the_position_the_next_read_walks_to() {
+        let numbers = Arc::new(Mutex::new(vec![10, 20]));
+        let shared = numbers.clone();
+        let stat = crate::proc::private_stat(0);
+        let file = SeqFile::of_task(Box::new(Numbers(numbers)), 2, stat, Default::default())
+            .writing(Box::new(move |b, at| {
+                if at != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                shared.lock().unwrap().push(b.len() as u32);
+                Ok((b.len(), b.len() as u64))
+            }));
+        assert_eq!(file.write(b"abc"), Ok(3));
+        // Three bytes in, among the records as they are now.
+        assert_eq!(read(&file, 100), b"20\n3\n");
+        assert_eq!(file.write(b"x"), Err(Errno::EINVAL));
+        assert_eq!(file.write_at(0, b"x"), Err(Errno::ESPIPE));
+        assert_eq!(file.seek(0, 0), Ok(0));
+        assert_eq!(read(&file, 100), b"10\n20\n3\n");
+        // `cmdline` and `environ` write through the position instead.
+        let other = SeqFile::of_task(
+            Box::new(Numbers(Default::default())),
+            2,
+            stat,
+            Default::default(),
+        );
+        assert_eq!(other.not_seq_opened().write_at(0, b"x"), Err(Errno::ENODEV));
     }
 }

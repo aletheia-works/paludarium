@@ -491,108 +491,39 @@ impl std::ops::Deref for UserNs {
 }
 
 /// An open `/proc/<pid>/uid_map`, `gid_map` (`ids`) or `setgroups` (no
-/// `ids`) of user namespace `namespace`: what it read when it was opened,
-/// and one write at its start, checked with the credentials of the thread
-/// that opened it, as Linux's `file->f_cred`.
-pub(crate) struct MapFile {
+/// `ids`) of user namespace `namespace`, the one the task was in when it
+/// was opened (Linux's `proc_id_map_open`), opened with `flags`. Each read
+/// shows the namespace as it is then, one line for each extent, its IDs as
+/// the opener's namespace sees them (`seq_user_ns`); it takes one write at
+/// its start, checked with the opener's credentials, as Linux's
+/// `file->f_cred`.
+pub(crate) fn map_file(
     namespace: Arc<Namespace>,
     ids: Option<Ids>,
-    content: Vec<u8>,
     opener: Credentials,
-    position: Mutex<u64>,
-    flags: u32,
-}
-impl MapFile {
-    pub(crate) fn open(
-        namespace: Arc<Namespace>,
-        ids: Option<Ids>,
-        content: Vec<u8>,
-        opener: Credentials,
-        flags: u32,
-    ) -> Self {
-        Self {
-            namespace,
-            ids,
-            content,
-            opener,
-            position: Mutex::new(0),
-            flags,
-        }
-    }
-    fn position(&self) -> MutexGuard<'_, u64> {
-        self.position.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-impl paludarium_host::FileHandle for MapFile {
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-    fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        if self.flags & 3 == 1 {
-            return Err(Errno::EBADF);
-        }
-        let mut position = self.position();
-        let at = usize::try_from(*position).unwrap_or(usize::MAX);
-        let rest = self.content.get(at..).unwrap_or(&[]);
-        let count = buf.len().min(rest.len());
-        buf[..count].copy_from_slice(&rest[..count]);
-        *position += count as u64;
-        Ok(count)
-    }
-    /// One write of the whole text at the file's start, under a page (a
-    /// map) or shorter than `deny` with its NUL (`setgroups`), else
-    /// `EINVAL`.
-    fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
-        if self.flags & 3 == 0 {
-            return Err(Errno::EBADF);
-        }
-        let mut position = self.position();
-        let limit = if self.ids.is_some() { 4096 } else { 8 };
-        if *position != 0 || buf.len() >= limit {
-            return Err(Errno::EINVAL);
-        }
-        match self.ids {
-            Some(ids) => self
-                .namespace
-                .write_map(ids, buf, &self.opener, &self.opener)?,
-            None => self.namespace.write_setgroups(buf)?,
-        }
-        *position = buf.len() as u64;
-        Ok(buf.len())
-    }
-    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
-        let mut position = self.position();
-        let base = match whence {
-            0 => 0,
-            1 => *position as i64,
-            2 => self.content.len() as i64,
-            _ => return Err(Errno::EINVAL),
-        };
-        let target = base
-            .checked_add(offset)
-            .filter(|&t| t >= 0)
-            .ok_or(Errno::EINVAL)?;
-        *position = target as u64;
-        Ok(target as u64)
-    }
-    fn stat(&self) -> Result<paludarium_host::FileStat, Errno> {
-        Ok(paludarium_host::FileStat {
-            mode: 0o100_644,
-            ..crate::proc::stat(self.content.len())
-        })
-    }
-    fn truncate(&self, _: u64) -> Result<(), Errno> {
-        Err(Errno::EINVAL)
-    }
-    fn flock(&self, _: u32) -> Result<(), Errno> {
-        Ok(())
-    }
-    fn flags(&self) -> u32 {
-        self.flags
-    }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
-        Ok(())
-    }
+    (flags, stat, owner): (u32, paludarium_host::FileStat, crate::proc::Owner),
+) -> crate::seq::SeqFile {
+    let (shown, reader) = (Arc::clone(&namespace), opener.user.clone());
+    let text = move || match ids {
+        Some(ids) => shown.map_text(ids, &reader),
+        None => shown.setgroups_text().to_vec(),
+    };
+    let records = Box::new(crate::seq::Lines(text));
+    crate::seq::SeqFile::of_task(records, flags, stat, owner).writing(Box::new(
+        move |buf, position| {
+            // A whole text at the start, under a page (a map) or shorter
+            // than `deny` with its NUL (`setgroups`), else `EINVAL`.
+            let limit = if ids.is_some() { 4096 } else { 8 };
+            if position != 0 || buf.len() >= limit {
+                return Err(Errno::EINVAL);
+            }
+            match ids {
+                Some(ids) => namespace.write_map(ids, buf, &opener, &opener)?,
+                None => namespace.write_setgroups(buf)?,
+            }
+            Ok((buf.len(), buf.len() as u64))
+        },
+    ))
 }
 
 #[cfg(test)]

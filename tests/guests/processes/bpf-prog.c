@@ -392,6 +392,8 @@ static int case_context(void) {
               EXIT());
     LOAD_MAPS("load bytes past the frame", MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV(4, 16),
               CALL(LOAD_BYTES), EXIT());
+    LOAD_MAPS("load 2^29 bytes", MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV(4, 1 << 29),
+              CALL(LOAD_BYTES), EXIT());
     LOAD_MAPS("load bytes to a scalar", MOV(2, 0), MOV(3, 0), MOV(4, 8), CALL(LOAD_BYTES), EXIT());
     LOAD_MAPS("size not a scalar", MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV_REG(4, 10),
               CALL(LOAD_BYTES), EXIT());

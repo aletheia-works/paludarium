@@ -3787,7 +3787,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   使えません（"same insn cannot be used with different pointers"、`EINVAL`）。マップの
   ヘルパーのほかに呼べるのは次のものです。`bpf_skb_load_bytes` と
   `bpf_skb_load_bytes_relative` には、コンテキスト、オフセット、スタックか書き込めるマップの
-  値にあるバッファ、そしてその大きさを渡します。大きさは 1 から 2^29 の定数で、バッファに
+  値にあるバッファ、そしてその大きさを渡します。大きさは 1 から 2^29 - 1 の定数で、バッファに
   収まらなければなりません（どれも Linux の行で `EACCES`、フレームの先に出るバッファは
   `EINVAL`）。`bpf_get_socket_cookie` と `bpf_get_socket_uid` にはコンテキストを、
   `bpf_get_netns_cookie` にはコンテキストか 0 を渡します（"R1 type=%s expected=ctx"、

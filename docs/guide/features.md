@@ -4361,7 +4361,7 @@ kernel.
   helpers, a program may call `bpf_skb_load_bytes` and
   `bpf_skb_load_bytes_relative`, with the context, an offset, a buffer on
   the stack or in a writable map value and its size, a constant from 1 to
-  2^29 within the buffer (each with Linux's line, `EACCES`, or `EINVAL`
+  2^29 - 1 within the buffer (each with Linux's line, `EACCES`, or `EINVAL`
   for a buffer past the frame); `bpf_get_socket_cookie` and
   `bpf_get_socket_uid` of the context, `bpf_get_netns_cookie` of the
   context or 0 ("R1 type=%s expected=ctx", `EACCES`); and the helpers of

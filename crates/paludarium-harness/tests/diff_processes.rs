@@ -299,6 +299,7 @@ mod linux {
                     | "perf-sample"
                     | "perf-wakeup"
                     | "perf-side-band"
+                    | "perf-side-band-comm"
                     | "perf-throttle"
                     | "perf-side-band-exec"
                     | "bpf-calls"
@@ -639,6 +640,7 @@ mod linux {
         perf_sample => ("perf-sample","perf"),
         perf_wakeup => ("perf-wakeup","perf"),
         perf_side_band => ("perf-side-band","perf"),
+        perf_side_band_comm => ("perf-side-band-comm","perf"),
         perf_throttle => ("perf-throttle","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
         bpf_calls => ("bpf-calls","bpf"),

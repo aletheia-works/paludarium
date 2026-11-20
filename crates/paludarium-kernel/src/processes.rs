@@ -3283,12 +3283,16 @@ impl Kernel {
             | 0x200
             | 0x400
             | 0x800
+            // CLONE_PTRACE, which ptrace_cloned follows.
+            | 0x2000
             | 0x4000
             | 0x40000
             | 0x80000
             | 0x100000
             | 0x200000
             | 0x400000
+            // CLONE_UNTRACED.
+            | 0x800000
             | 0x1000000
             | CLONE_CLEAR_SIGHAND
             | crate::namespaces::ALL & !crate::namespaces::CLONE_NEWTIME

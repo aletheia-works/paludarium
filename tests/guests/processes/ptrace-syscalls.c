@@ -401,6 +401,136 @@ static int clone_case(void) {
     return 0;
 }
 
+/* --- ptrace-held ------------------------------------------------------ */
+
+/* The tasks a tracee's clone holds for its tracer, and those it does not:
+ * CLONE_PTRACE traces the child with no event asked for, which starts
+ * with SIGSTOP from no one; CLONE_UNTRACED makes no event and an untraced
+ * child; a clone that fails makes no event either. A held child refuses
+ * PTRACE_INTERRUPT, as it was not seized, and is let go with
+ * PTRACE_DETACH. A zombie may not be attached to. */
+#define CLONE_PTRACE_FLAG 0x2000
+#define CLONE_UNTRACED_FLAG 0x800000
+#define CLONE_THREAD_FLAG 0x10000
+
+static int reaped(pid_t pid) {
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int held_child(void) {
+    sigset_t chld;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &chld, NULL);
+    if (pt(PTRACE_TRACEME, 0, 0, 0)) return 90;
+    raise(SIGSTOP);
+    int code = 0;
+    pid_t made = syscall(SYS_clone, CLONE_PTRACE_FLAG | SIGCHLD, 0, 0, 0, 0);
+    if (made == 0) _exit(3);
+    if (reaped(made) == 3) code |= 1;
+    raise(SIGSTOP);
+    made = syscall(SYS_clone, CLONE_UNTRACED_FLAG | SIGCHLD, 0, 0, 0, 0);
+    if (made == 0) _exit(4);
+    if (reaped(made) == 4) code |= 2;
+    if (syscall(SYS_clone, CLONE_THREAD_FLAG | SIGCHLD, 0, 0, 0, 0) == -1 && errno == EINVAL)
+        code |= 4;
+    made = syscall(SYS_fork);
+    if (made == 0) _exit(5);
+    if (reaped(made) == 5) code |= 8;
+    return code;
+}
+
+static int held_case(void) {
+    fflush(stdout);
+    pid_t zombie = fork();
+    if (zombie == 0) _exit(0);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    waitid(P_PID, zombie, &si, WEXITED | WNOWAIT);
+    printf("attach-zombie=%ld\n", pt(PTRACE_ATTACH, zombie, 0, 0));
+    printf("seize-zombie=%ld\n", pt(REQ_SEIZE, zombie, 0, 0));
+    wait_status(zombie, 0);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(held_child());
+    named[0] = child;
+    expect(child, "start");
+    pt(PTRACE_CONT, child, 0, 0);
+    /* The child CLONE_PTRACE made, which its parent waits for: no event. */
+    int status = 0;
+    pid_t held = waitpid(-1, &status, __WALL);
+    named[1] = held;
+    printf("ptraced: %s signal=%d event=%d\n", who(held), WSTOPSIG(status), status >> 16);
+    memset(&si, 0, sizeof si);
+    pt(PTRACE_GETSIGINFO, held, 0, (unsigned long)&si);
+    printf("ptraced si-code=%d si-pid=%d\n", si.si_code, si.si_pid);
+    pt(PTRACE_CONT, held, 0, 0);
+    expect(held, "ptraced-gone");
+    expect(child, "options-stop");
+    printf("options=%ld\n", pt(PTRACE_SETOPTIONS, child, 0, O_TRACEFORK | O_TRACECLONE));
+    pt(PTRACE_CONT, child, 0, 0);
+    /* The untraced child and the clone that fails make no stop: the next
+     * is the fork's. */
+    status = wait_status(child, __WALL);
+    unsigned long message = 0;
+    pt(REQ_GETEVENTMSG, child, 0, (unsigned long)&message);
+    named[2] = message;
+    printf("fork signal=%d event=%d\n", WSTOPSIG(status), status >> 16);
+    expect(named[2], "forked");
+    printf("interrupt-held=%ld\n", pt(0x4207, named[2], 0, 0));
+    printf("detach-held=%ld\n", pt(PTRACE_DETACH, named[2], 0, 0));
+    printf("detached=%ld\n", pt(PTRACE_CONT, named[2], 0, 0));
+    pt(PTRACE_CONT, child, 0, 0);
+    expect(child, "exit");
+    return 0;
+}
+
+/* --- ptrace-thread-exec ----------------------------------------------- */
+
+/* A thread other than the leader execs: its tracer sees the exec event
+ * from the leader's ID, the thread's own ID as the event's message, and
+ * nothing left of the thread's old ID. */
+static const char *exec_self;
+
+static void *exec_thread(void *arg) {
+    (void)arg;
+    execl(exec_self, exec_self, "exec-child", exec_self, (char *)NULL);
+    return NULL;
+}
+
+static int thread_exec_case(const char *self) {
+    exec_self = self;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        raise(SIGSTOP);
+        pthread_t thread;
+        pthread_create(&thread, NULL, exec_thread, NULL);
+        for (;;) pause();
+    }
+    named[0] = child;
+    expect(child, "start");
+    printf("options=%ld\n", pt(PTRACE_SETOPTIONS, child, 0, O_TRACECLONE | O_TRACEEXEC));
+    pt(PTRACE_CONT, child, 0, 0);
+    int status = wait_status(child, __WALL);
+    unsigned long message = 0;
+    pt(REQ_GETEVENTMSG, child, 0, (unsigned long)&message);
+    named[1] = message;
+    printf("clone event=%d\n", status >> 16);
+    expect(named[1], "thread");
+    pt(PTRACE_CONT, named[1], 0, 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    expect(child, "exec");
+    printf("old-thread=%d\n", wait_status(named[1], WNOHANG | __WALL));
+    pt(PTRACE_CONT, child, 0, 0);
+    expect(child, "exit");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 99;
     const char *mode = argv[1], *self = argv[2];
@@ -411,6 +541,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-sysemu")) code = sysemu_case();
     if (!strcmp(mode, "ptrace-events")) code = events_case(self);
     if (!strcmp(mode, "ptrace-clone")) code = clone_case();
+    if (!strcmp(mode, "ptrace-held")) code = held_case();
+    if (!strcmp(mode, "ptrace-thread-exec")) code = thread_exec_case(self);
     fflush(stdout);
     return code;
 }

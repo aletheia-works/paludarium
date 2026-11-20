@@ -3308,7 +3308,8 @@ impl AddressSpaceData {
     }
     /// Reads its file into the new file mapping page `entry` at `page`, which
     /// has no contents yet: one past the end of the file when the mapping
-    /// was made, or one `mremap` added. What lies past the end stays zero.
+    /// was made, one `mremap` added, or one `MADV_DONTNEED` dropped, a
+    /// loaded program's segment's too. What lies past the end stays zero.
     fn fill_from_file(&self, page: u64, entry: &Page) {
         if !self.try_fill_from_file(page, entry) {
             self.out_of_memory.store(true, Ordering::SeqCst);
@@ -3317,7 +3318,7 @@ impl AddressSpaceData {
     /// [`Self::fill_from_file`], but `false` when the meter has no room for
     /// the bytes, which are then not read.
     fn try_fill_from_file(&self, page: u64, entry: &Page) -> bool {
-        if !entry.file || entry.frame.get().is_some() {
+        if !(entry.file || self.segment_with_file(page)) || entry.frame.get().is_some() {
             return true;
         }
         let Some((source, offset)) = self.file_at(page) else {
@@ -3339,8 +3340,10 @@ impl AddressSpaceData {
             None => false,
         }
     }
-    /// After a read fault on `page`, which had no entry, gives entries to
-    /// the pages around it that its file's page cache holds, as Linux's
+    /// After a read fault on `page`, which had no entry (an access's, or a
+    /// read through `get_user_pages`: a core dump's, `ptrace`'s), gives
+    /// entries to the pages around it that its file's page cache holds, as
+    /// Linux's
     /// `do_fault_around` maps them with `filemap_map_pages`: up to
     /// [`FAULT_AROUND_PAGES`] pages from `page`'s aligned block, or from the
     /// VMA's start if that is later, within the VMA and the page table. A
@@ -3351,11 +3354,12 @@ impl AddressSpaceData {
     /// room for, as nothing faults for it. Nothing is mapped around in a
     /// VMA that `userfaultfd` watches for writes or minor faults
     /// (`uffd_disable_fault_around`), nor in one whose memory has no
-    /// `map_pages`: anonymous private memory, a loaded program's segments (made
-    /// whole at load), System V shared memory ([`PageSource::merges`], as
-    /// `shm_vm_ops` has neither `map_pages` nor merging) and secret memory.
-    /// Like `mincore` here, every page of a file within its size is taken
-    /// to be in the page cache.
+    /// `map_pages`: anonymous private memory, System V shared memory
+    /// ([`PageSource::merges`], as `shm_vm_ops` has neither `map_pages` nor
+    /// merging) and secret memory. A loaded program's segment is mapped
+    /// around as a file's private mapping is, which only matters once
+    /// `MADV_DONTNEED` dropped its pages. Like `mincore` here, every page of
+    /// a file within its size is taken to be in the page cache.
     fn fault_around(&self, directory: &mut Directory, page: u64) {
         let watched = Userfault::WP | Userfault::MINOR;
         if self
@@ -3389,12 +3393,23 @@ impl AddressSpaceData {
             // A page of the file whose bytes could not be read is not up
             // to date in the cache, which `filemap_map_pages` leaves out.
             let new = self.page(around, prot);
-            if !self.try_fill_from_file(around, &new) || new.file && new.frame.get().is_none() {
+            if !self.try_fill_from_file(around, &new)
+                || (new.file || self.segment_with_file(around)) && new.frame.get().is_none()
+            {
                 continue;
             }
             self.recount(around, None, Some(&new));
             *entry = Some(new);
         }
+    }
+    /// Whether `page` lies in a loaded program's segment that keeps its file
+    /// to read again ([`Self::back_with_file`]). Its pages are made at load,
+    /// before the file is recorded, so only a page `MADV_DONTNEED` dropped
+    /// is read from it.
+    fn segment_with_file(&self, page: u64) -> bool {
+        self.mapping_at(page)
+            .is_some_and(|m| m.kind == MappingKind::ElfSegment)
+            && self.backing_at(page).is_some()
     }
     /// Whether the page cache of the memory mapped at `page` holds that
     /// page, for [`Self::fault_around`]; `false` for memory that has no
@@ -3407,6 +3422,7 @@ impl AddressSpaceData {
         match self.file_at(page) {
             Some((source, offset)) => {
                 (shared.is_some()
+                    || self.segment_with_file(page)
                     || self
                         .mapping_at(page)
                         .is_some_and(|m| m.kind == MappingKind::File))
@@ -3878,12 +3894,19 @@ impl AddressSpaceData {
                 let (dir, slot) = page_index(page);
                 let table = directory.entry(dir).or_insert_with(PageTable::new);
                 if let Some(entry) = table.pages.get_mut(slot) {
-                    let fault = entry.is_none() && matches!(access, Access::Read | Access::Fetch);
-                    if fault {
+                    let missing = entry.is_none();
+                    if missing && matches!(access, Access::Read | Access::Fetch) {
                         faults::count();
                     }
                     self.refresh(entry, page, prot, false);
-                    if fault {
+                    // A core dump's or `ptrace`'s read faults in through
+                    // `get_user_pages`, whose `handle_mm_fault` maps around
+                    // as an access does. A lock's population reads here too,
+                    // but every page of its own VMA (`mlock` splits it), so
+                    // what this maps it would have anyway; Linux writes a
+                    // private writable one (`FOLL_WRITE`, `do_cow_fault`),
+                    // which maps nothing around.
+                    if missing && matches!(access, Access::Read | Access::Fetch | Access::Dump) {
                         self.fault_around(&mut directory, page);
                     }
                 }
@@ -6433,17 +6456,18 @@ impl AddressSpaceData {
     }
 
     /// Drops the contents of the private pages in `[addr, addr+len)`
-    /// (`MADV_DONTNEED`): anonymous ones read as zeros again, and those of a
-    /// file mapping or an ELF segment read their file again
-    /// ([`Self::back_with_file`]), as Linux faults them in from the file.
-    /// The ones without a recorded file keep theirs, as there is nothing to
-    /// read again. Shared pages keep their contents, as their memory
-    /// outlives the mapping, and lose their entries, which an access makes
-    /// again from the shared memory: shmem's, System V shared memory's and
-    /// a file's alike, as Linux's `zap_pte_range` clears every entry and
-    /// the page cache keeps the pages. A write-protected entry of memory
-    /// that is not anonymous leaves a uffd-wp marker
-    /// ([`Self::keep_uffd_markers`]).
+    /// (`MADV_DONTNEED`) with their entries, as Linux's `zap_pte_range`
+    /// does: anonymous ones read as zeros again, and those of a file
+    /// mapping or an ELF segment read their file again
+    /// ([`Self::back_with_file`]) at their next access, as Linux faults
+    /// them in from the file. The ones without a recorded file keep theirs,
+    /// as there is nothing to read again. Shared pages keep their contents,
+    /// as their memory outlives the mapping, and lose their entries, which
+    /// an access makes again from the shared memory: shmem's, System V
+    /// shared memory's and a file's alike, as Linux's `zap_pte_range`
+    /// clears every entry and the page cache keeps the pages. A
+    /// write-protected entry of memory that is not anonymous leaves a
+    /// uffd-wp marker ([`Self::keep_uffd_markers`]).
     /// Applies the mapped parts and returns `ENOMEM` when the range has a
     /// hole, as Linux does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -6499,7 +6523,6 @@ impl AddressSpaceData {
         for (start, end) in private {
             self.keep_uffd_markers(start, end);
             self.clear_populated(start, end);
-            self.refill(start, end);
         }
         if sealed {
             Err(Errno::EPERM)
@@ -9066,6 +9089,33 @@ mod tests {
     }
 
     #[test]
+    fn a_read_for_a_dump_or_a_tracer_maps_the_pages_around_it_too() {
+        let source: Arc<dyn PageSource> =
+            Arc::new(Resizable(Arc::new(AtomicU64::new(32 * PAGE_SIZE))));
+        let mut space = AddressSpace::new();
+        let base = GuestAddr(0x4000_0000);
+        let file = space
+            .map(Some(base), 32 * PAGE_SIZE, Prot::NONE, MappingKind::File)
+            .unwrap();
+        space
+            .back_with_file(file, 32 * PAGE_SIZE, Arc::clone(&source), 0)
+            .unwrap();
+        let _ = faults::take();
+        // Whatever the protection, as `FOLL_FORCE` reads, and counting no
+        // fault of the caller's.
+        let mut byte = [0u8];
+        space
+            .read_for_dump(GuestAddr(base.0 + 20 * PAGE_SIZE + 3), &mut byte)
+            .unwrap();
+        assert_eq!(byte[0], pattern(20 * PAGE_SIZE + 3));
+        assert_eq!(faults::take(), 0);
+        assert_eq!(space.resident_pages().1, 16);
+        let forced = space.view().read_forced(base.0 + 2 * PAGE_SIZE, &mut byte);
+        assert_eq!(forced, Some(1));
+        assert_eq!(space.resident_pages().1, 32);
+    }
+
+    #[test]
     fn a_read_fault_maps_the_pages_around_it_that_the_file_holds() {
         let size = Arc::new(AtomicU64::new(20 * PAGE_SIZE + 100));
         let source: Arc<dyn PageSource> = Arc::new(Resizable(Arc::clone(&size)));
@@ -9119,6 +9169,63 @@ mod tests {
             pattern(15 * PAGE_SIZE + 9)
         );
         assert_eq!(resident(&space), 21 + 16);
+    }
+
+    #[test]
+    fn a_discard_leaves_a_segments_pages_to_be_read_from_its_file_at_an_access() {
+        let source: Arc<dyn PageSource> = Arc::new(Pattern(20 * PAGE_SIZE));
+        let mut space = AddressSpace::new();
+        // A loaded program's segment of 20 pages, made whole at load before
+        // its file is recorded.
+        let base = GuestAddr(0x4000_0000);
+        let segment = space
+            .map(
+                Some(base),
+                20 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::ElfSegment,
+            )
+            .unwrap();
+        let image: Vec<u8> = (0..20 * PAGE_SIZE).map(pattern).collect();
+        space.write_initial(segment, &image).unwrap();
+        space
+            .back_with_file(segment, 20 * PAGE_SIZE, Arc::clone(&source), 0)
+            .unwrap();
+        space
+            .write(GuestAddr(base.0 + 3 * PAGE_SIZE + 1), b"x")
+            .unwrap();
+        let resident = |space: &AddressSpace| space.resident_pages().1;
+        assert_eq!(resident(&space), 20);
+        space.discard_shared(segment, 20 * PAGE_SIZE).unwrap();
+        // No entry is left until an access, as Linux's zap leaves none.
+        assert_eq!(resident(&space), 0);
+        let view = space.view();
+        assert!(
+            view.pagemap(base.0, 20)
+                .unwrap()
+                .iter()
+                .all(|&entry| entry & pagemap::PRESENT == 0)
+        );
+        // A read fault reads the file again, the write gone, and maps the
+        // aligned block of 16 pages around it.
+        assert_eq!(
+            byte(&space, base.0 + 3 * PAGE_SIZE + 1),
+            pattern(3 * PAGE_SIZE + 1)
+        );
+        assert_eq!(resident(&space), 16);
+        assert_eq!(
+            byte(&space, base.0 + 15 * PAGE_SIZE),
+            pattern(15 * PAGE_SIZE)
+        );
+        // A write fault reads the file into its page alone.
+        space
+            .write(GuestAddr(base.0 + 17 * PAGE_SIZE), b"y")
+            .unwrap();
+        assert_eq!(resident(&space), 17);
+        assert_eq!(
+            byte(&space, base.0 + 17 * PAGE_SIZE + 1),
+            pattern(17 * PAGE_SIZE + 1)
+        );
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub fn wait<H: Host + ?Sized>(
     deadline: Option<(ClockId, u64)>,
     cancel: &AtomicBool,
 ) -> Result<WaitOutcome, Errno> {
+    let mut waiting = crate::blocked::Waiting::new();
     let mut slept = false;
     #[cfg(target_arch = "wasm32")]
     {
@@ -106,6 +107,7 @@ pub fn wait<H: Host + ?Sized>(
                 }
                 None => 10_000_000,
             };
+            waiting.sleep();
             crate::switches::sleep(&mut slept);
             // SAFETY: borrowed WaitToken pins its host-owned aligned AtomicU32.
             // No Rust lock is held during the bounded wait. Only atomics
@@ -140,6 +142,7 @@ pub fn wait<H: Host + ?Sized>(
                 None => 10_000_000,
             };
             // Bounded polling also observes signal/kill cancellation without a ticket wake.
+            waiting.sleep();
             crate::switches::sleep(&mut slept);
             gate = token
                 .changed

@@ -228,6 +228,7 @@ impl Host for RecordingHost {
         deadline: u64,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<WaitOutcome, Errno> {
+        let mut waiting = crate::blocked::Waiting::new();
         let remaining = {
             let mut s = self.lock();
             if s.interrupt_wait {
@@ -237,6 +238,7 @@ impl Host for RecordingHost {
             deadline.saturating_sub(s.now(clock))
         };
         if remaining > 0 {
+            waiting.sleep();
             crate::switches::sleep(&mut false);
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -257,10 +259,12 @@ impl Host for RecordingHost {
         deadline: Option<(ClockId, u64)>,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<WaitOutcome, Errno> {
+        let mut waiting = crate::blocked::Waiting::new();
         let Some((clock, end)) = deadline else {
             return crate::threads::wait(self, token, expected, None, cancel);
         };
         if token.value() == expected && !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            waiting.sleep();
             crate::switches::sleep(&mut false);
             crate::threads::wait_briefly(token, expected, GRACE);
         }

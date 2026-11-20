@@ -162,6 +162,7 @@ impl Host for WasmHost {
         deadline: u64,
         cancel: &AtomicBool,
     ) -> Result<WaitOutcome, Errno> {
+        let mut waiting = crate::blocked::Waiting::new();
         let mut slept = false;
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -171,6 +172,7 @@ impl Host for WasmHost {
             if now >= deadline {
                 return Ok(WaitOutcome::Complete);
             }
+            waiting.sleep();
             crate::switches::sleep(&mut slept);
             // SAFETY: bounded scalar sleep outside every Rust/guest memory lock. Cancellation polled at most every 10ms.
             unsafe { sleep_ms(((deadline - now).min(10_000_000) as f64) / 1_000_000.0) };

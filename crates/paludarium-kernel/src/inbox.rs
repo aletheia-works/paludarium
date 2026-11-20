@@ -25,9 +25,10 @@ pub struct SignalInbox {
     arrivals: Mutex<Option<Arc<AtomicU64>>>,
     published: AtomicU64,
     contributed: AtomicU64,
-    /// Whether the thread is in a system call, where it waits if it waits,
-    /// which `/proc` shows other processes as sleeping.
-    in_call: AtomicBool,
+    /// Whether the thread is blocked in a wait of the host, which `/proc`
+    /// shows as sleeping, as Linux shows a task that is not running; the
+    /// host's waits set it ([`paludarium_host::blocked`]).
+    blocked: Arc<AtomicBool>,
     /// The registers of its last entry into the kernel
     /// ([`Self::enter_kernel`]).
     entry: Entry,
@@ -60,11 +61,13 @@ pub(crate) struct WakeReceipt {
     pub interrupted: bool,
 }
 impl SignalInbox {
-    pub(crate) fn set_in_call(&self, in_call: bool) {
-        self.in_call.store(in_call, Ordering::Relaxed);
+    /// The flag its thread's waits set ([`paludarium_host::blocked::attach`]).
+    pub(crate) fn blocked_flag(&self) -> &Arc<AtomicBool> {
+        &self.blocked
     }
-    pub(crate) fn in_call(&self) -> bool {
-        self.in_call.load(Ordering::Relaxed)
+    /// Whether its thread is blocked in a wait.
+    pub(crate) fn blocked(&self) -> bool {
+        self.blocked.load(Ordering::SeqCst)
     }
     /// Records, as its thread enters the kernel, the registers of the entry
     /// (`/proc/<pid>/syscall`). Only that thread calls it.

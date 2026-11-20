@@ -66,15 +66,16 @@ fn shown(
         .public(tid)
         .or_else(|| view.group.public(pid))
         .unwrap_or_default();
-    // A thread is shown asleep while it is in a system call, where it waits
-    // if it waits, and running otherwise; the reader is running, reading.
+    // A thread is shown asleep while it is blocked in a wait, as Linux shows
+    // a task that is not running, and running otherwise, in a system call
+    // or not; the reader is running, reading.
     let state = match member {
         _ if view.zombie => ('Z', "Z (zombie)"),
         // A leader that ended before its other threads.
         None => ('Z', "Z (zombie)"),
         Some(_) if processes.traces.in_stop(tid) => ('t', "t (tracing stop)"),
         Some(_) if view.group.is_stopped() => ('T', "T (stopped)"),
-        Some((_, in_call)) if in_call && tid != reader => ('S', "S (sleeping)"),
+        Some((_, blocked)) if blocked && tid != reader => ('S', "S (sleeping)"),
         Some(_) => ('R', "R (running)"),
     };
     Some(Task {
@@ -678,10 +679,10 @@ pub(super) fn syscall(
         let threads = now.view.group.threads();
         let entry = match threads.iter().find(|&&(t, _)| t == tid) {
             None => None,
-            Some(&(_, in_call)) => {
+            Some(&(_, blocked)) => {
                 let (_, reader) = crate::proc::caller();
                 let waits = reader == tid
-                    || in_call
+                    || blocked
                     || now.view.group.is_stopped()
                     || now.processes.traces.in_stop(tid);
                 if !waits {

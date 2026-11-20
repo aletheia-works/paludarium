@@ -116,3 +116,69 @@ fn recorded_ntp_state_overrides_the_machines() {
     h.set_ntp_state(None);
     assert_eq!(h.ntp_state(), None);
 }
+/// A wait marks the attached flag from when it goes to sleep until it ends,
+/// a wait within another keeps it marked, and a wait with no flag attached,
+/// or after the attachment ended, marks nothing.
+#[test]
+fn waits_mark_the_attached_flag_while_they_sleep() {
+    use std::sync::Arc;
+    std::thread::spawn(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut early = blocked::Waiting::new();
+        early.sleep();
+        drop(early);
+        let attached = blocked::attach(&flag);
+        // Not asleep yet: not marked.
+        let mut outer = blocked::Waiting::new();
+        assert!(!flag.load(Ordering::SeqCst));
+        outer.sleep();
+        assert!(flag.load(Ordering::SeqCst));
+        let mut inner = blocked::Waiting::new();
+        inner.sleep();
+        drop(inner);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "an inner wait leaves it marked"
+        );
+        drop(outer);
+        assert!(!flag.load(Ordering::SeqCst));
+        // A host's own wait marks it while it sleeps: another thread sees
+        // the mark, and only then ends the wait.
+        let h = Arc::new(RecordingHost::new());
+        let token = Arc::new(WaitToken::default());
+        let watcher = {
+            let (flag, token, h) = (Arc::clone(&flag), Arc::clone(&token), Arc::clone(&h));
+            std::thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                h.wake(&token);
+            })
+        };
+        let outcome = h.wait_on(&token, 0, None, &AtomicBool::new(false));
+        assert_eq!(outcome, Ok(WaitOutcome::Complete));
+        watcher.join().unwrap();
+        assert!(!flag.load(Ordering::SeqCst));
+        // Once the attachment ends, a wait marks nothing.
+        drop(attached);
+        let mut after = blocked::Waiting::new();
+        after.sleep();
+        assert!(!flag.load(Ordering::SeqCst));
+        drop(after);
+        // An attachment within another, of another flag, marks that one
+        // and gives the outer one back its own as it ends.
+        let _outer = blocked::attach(&flag);
+        let other = Arc::new(AtomicBool::new(false));
+        let inner = blocked::attach(&other);
+        let mut marked = blocked::Waiting::new();
+        marked.sleep();
+        assert!(other.load(Ordering::SeqCst) && !flag.load(Ordering::SeqCst));
+        drop(marked);
+        drop(inner);
+        let mut marked = blocked::Waiting::new();
+        marked.sleep();
+        assert!(flag.load(Ordering::SeqCst) && !other.load(Ordering::SeqCst));
+    })
+    .join()
+    .unwrap();
+}

@@ -104,6 +104,17 @@ __asm__(".text\n"
         "  nop\n"
         "seq_trace_end:\n"
         "  ret\n"
+        /* kill(rdi, SIGSTOP), then a fork for a tracer to step over: it
+         * returns what the fork gives. */
+        ".globl seq_fork, seq_fork_end\n"
+        "seq_fork:\n"
+        "  movl $19, %esi\n"
+        "  movl $62, %eax\n"
+        "  syscall\n"
+        "  movl $57, %eax\n"
+        "  syscall\n"
+        "seq_fork_end:\n"
+        "  ret\n"
         /* kill(rdi, SIGSTOP), then kill(rdi, SIGUSR1) for a tracer to step
          * into the handler, and the rest stepped by the flag the frame
          * gives back. */
@@ -216,6 +227,8 @@ void seq_flag(void), seq_syscall(void), seq_signal(int), seq_int3(void), seq_tra
     seq_frame(int), seq_hw(int);
 extern char seq_hw_exec[], seq_hw_end[], seq_hw2_end[], fxarea[], table[], leaveslot[];
 void seq_hw2(int);
+long seq_fork(int);
+extern char seq_fork_end[];
 extern uint64_t watched;
 extern char seq_flag_end[], seq_syscall_end[], seq_signal_end[], seq_int3_end[], seq_trace_from[],
     seq_trace_end[], seq_frame_end[];
@@ -439,6 +452,89 @@ static int forced_frame_case(void) {
     return 0;
 }
 
+/* The trap flag a tracer forced, at its edges: a fork stepped over leaves
+ * the child without it, and the flags a tracer writes keep it while they
+ * have none, but a trap flag written in them is the tracee's own, which
+ * PTRACE_CONT leaves, until the tracer writes the flags without it. */
+static void step_stop(pid_t child, const char *name, uint64_t start, uint64_t end) {
+    int status = wait_status(child);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("%s: signal=%d code=%#x at=", name, WIFSTOPPED(status) ? WSTOPSIG(status) : -1,
+           info.si_code);
+    if (regs.rip >= start && regs.rip <= end)
+        printf("%llu", (unsigned long long)(regs.rip - start));
+    else
+        printf("outside");
+    printf(" tf-shown=%d\n", (regs.eflags & TF) != 0);
+}
+
+static long peek_flags(pid_t child) {
+    long flags = 0;
+    pt(PTRACE_PEEKUSER, child, offsetof(struct user_regs_struct, eflags), (unsigned long)&flags);
+    return flags;
+}
+
+static int forced_edges_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        long made = seq_fork(getpid());
+        if (made == 0) _exit((flags_now() & TF) ? 1 : 0);
+        int status = 0;
+        while (waitpid(made, &status, 0) < 0 && errno == EINTR) {
+        }
+        /* The fork's child: its exit code, or 100 and the signal that
+         * killed it. */
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status);
+        seq_trace(getpid());
+        _exit(code * 2 + ((flags_now() & TF) ? 1 : 0));
+    }
+    uint64_t start = (uint64_t)(uintptr_t)seq_fork, end = (uint64_t)(uintptr_t)seq_fork_end;
+    wait_status(child);
+    for (int i = 0; i < 2; i++) {
+        pt(PTRACE_SINGLESTEP, child, 0, 0);
+        step_stop(child, "fork-step", start, end);
+    }
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("fork-made=%d\n", (long)regs.rax > 0);
+    /* The SIGCHLD of the fork's exit stops a traced task too, ignored or
+     * not; it goes on without it, to the SIGSTOP of seq_trace. */
+    int status;
+    do {
+        pt(PTRACE_CONT, child, 0, 0);
+        status = wait_status(child);
+    } while (WIFSTOPPED(status) && WSTOPSIG(status) == SIGCHLD);
+    printf("next-stop=%d\n", WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
+    start = (uint64_t)(uintptr_t)seq_trace;
+    end = (uint64_t)(uintptr_t)seq_trace_end;
+    pt(PTRACE_SINGLESTEP, child, 0, 0);
+    step_stop(child, "step", start, end);
+    long flags = peek_flags(child);
+    printf("peek-forced: tf=%d\n", (flags & TF) != 0);
+    printf("poke-no-tf=%ld\n", pt(PTRACE_POKEUSER, child, offsetof(struct user_regs_struct, eflags),
+                                  flags & ~TF));
+    printf("peek-kept: tf=%d\n", (peek_flags(child) & TF) != 0);
+    pt(PTRACE_SINGLESTEP, child, 0, 0);
+    step_stop(child, "still-stepped", start, end);
+    printf("poke-tf=%ld\n", pt(PTRACE_POKEUSER, child, offsetof(struct user_regs_struct, eflags),
+                               peek_flags(child) | TF));
+    printf("peek-own: tf=%d\n", (peek_flags(child) & TF) != 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    step_stop(child, "own-trap", start, end);
+    pt(PTRACE_POKEUSER, child, offsetof(struct user_regs_struct, eflags), peek_flags(child) & ~TF);
+    printf("peek-cleared: tf=%d\n", (peek_flags(child) & TF) != 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    status = wait_status(child);
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
 /* --- hardware breakpoints ------------------------------------------------ */
 
 #define DEBUGREG(n) (offsetof(struct user, u_debugreg) + (n) * 8)
@@ -642,6 +738,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "trap-flag-rep")) code = rep_case();
     if (!strcmp(mode, "ptrace-singlestep")) code = ptrace_case();
     if (!strcmp(mode, "ptrace-forced-frame")) code = forced_frame_case();
+    if (!strcmp(mode, "ptrace-forced-edges")) code = forced_edges_case();
     if (!strcmp(mode, "ptrace-hw-breakpoint")) code = hw_breakpoint_case();
     if (!strcmp(mode, "ptrace-hw-implicit")) code = hw_implicit_case();
     if (!strcmp(mode, "hw-probe-fxsave")) code = probe_fxsave_case();

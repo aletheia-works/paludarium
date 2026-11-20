@@ -1620,13 +1620,13 @@ impl ThreadGroup {
             .get(&tid)
             .map(|inbox| inbox.entry())
     }
-    /// The live threads, in order, and whether each is in a system call.
+    /// The live threads, in order, and whether each is blocked in a wait.
     pub(crate) fn threads(&self) -> Vec<(u32, bool)> {
         self.members
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|(&tid, inbox)| (tid, inbox.in_call()))
+            .map(|(&tid, inbox)| (tid, inbox.blocked()))
             .collect()
     }
     /// Whether a thread of this group runs in `space`, as it last published.

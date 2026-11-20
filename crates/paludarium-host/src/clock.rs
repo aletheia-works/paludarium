@@ -152,6 +152,7 @@ pub(crate) fn native_wait(
     deadline: u64,
     cancel: &AtomicBool,
 ) -> Result<WaitOutcome, Errno> {
+    let mut waiting = crate::blocked::Waiting::new();
     let mut slept = false;
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -161,6 +162,7 @@ pub(crate) fn native_wait(
         if now >= deadline {
             return Ok(WaitOutcome::Complete);
         }
+        waiting.sleep();
         crate::switches::sleep(&mut slept);
         std::thread::sleep(Duration::from_nanos((deadline - now).min(10_000_000)));
     }

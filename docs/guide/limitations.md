@@ -67,10 +67,7 @@ verified.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
-  written, not until the page was. A page of a file's private mapping that
-  `MADV_DONTNEED` dropped is read from the file again at once, so it has
-  an entry (bit 63, and bit 57 if it was write-protected) where Linux has
-  none, or a uffd-wp marker, until an access. The frame number is 0 for every reader, also one
+  written, not until the page was. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
 - **`PAGEMAP_SCAN`, in part**:
@@ -128,8 +125,8 @@ verified.
   resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
-  another process's state is taken from where its thread is (in a system
-  call or not), not from whether it waits. A thread shows another process
+  another process's thread is `S (sleeping)` in every wait, where Linux
+  shows some waits it cannot interrupt as `D (disk sleep)`. A thread shows another process
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
   seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing

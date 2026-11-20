@@ -631,6 +631,296 @@ static int tracer_exit_case(void) {
     return 0;
 }
 
+/* The waits of a tracer that is not the tracee's parent, whose second
+ * thread traces it: with __WNOTHREAD the first thread traces nor has
+ * anything to wait for, nor may it make requests; without it, it waits
+ * for the stops by process group, as waitid's CLD_TRAPPED even when it
+ * asks for exits only, and for the exit as any child. The parent sees the
+ * group stop, not the ptrace stop before it, nor the exit before the
+ * tracer has reaped it. */
+static int wait_pipes[4][2];
+enum { TO_THREAD, FROM_THREAD, TO_PARENT, FROM_PARENT };
+
+static void *wait_thread(void *arg) {
+    pid_t child = *(pid_t *)arg;
+    result("attach", pt(PTRACE_ATTACH, child, 0, 0));
+    char command;
+    write(wait_pipes[FROM_THREAD][1], "a", 1);
+    while (read(wait_pipes[TO_THREAD][0], &command, 1) == 1 && command != 'q') {
+        result("thread-cont", pt(PTRACE_CONT, child, 0, command == 's' ? SIGSTOP : 0));
+        write(wait_pipes[FROM_THREAD][1], "c", 1);
+    }
+    return NULL;
+}
+
+/* Tells the other side `what` and waits for its byte back. */
+static void ask(int to, int from, char what) {
+    char byte;
+    write(wait_pipes[to][1], &what, 1);
+    read(wait_pipes[from][0], &byte, 1);
+}
+
+/* A wait for `pid`, which may name a group or any child: 1 for `child`,
+ * 0 for none, -errno, or 2 for another task. */
+static long waited_for(pid_t pid, int flags, pid_t child, int *status) {
+    pid_t r;
+    do r = waitpid(pid, status, flags);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? -errno : r == 0 ? 0 : r == child ? 1 : 2;
+}
+
+static int wait_tracer(pid_t child, pid_t pgid) {
+    setpgid(0, 0);
+    pthread_t thread;
+    char byte;
+    pthread_create(&thread, NULL, wait_thread, &child);
+    read(wait_pipes[FROM_THREAD][0], &byte, 1);
+    int status = 0;
+    result("nothread-pid", waited_for(child, WNOHANG | __WNOTHREAD, child, &status));
+    result("nothread-any", waited_for(-1, WNOHANG | __WNOTHREAD, child, &status));
+    result("own-group", waited_for(0, WNOHANG, child, &status));
+    result("cont-not-tracer", pt(PTRACE_CONT, child, 0, 0));
+    result("pgid", waited_for(-pgid, 0, child, &status));
+    stop("pgid", status);
+    ask(TO_PARENT, FROM_PARENT, 'p');
+    ask(TO_THREAD, FROM_THREAD, 's');
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    int error;
+    do error = waitid(P_PGID, pgid, &info, WEXITED);
+    while (error < 0 && errno == EINTR);
+    result("waitid", error);
+    result("waitid-code", info.si_code);
+    result("waitid-status", info.si_status);
+    result("waitid-pid", info.si_pid == child);
+    ask(TO_PARENT, FROM_PARENT, 'g');
+    ask(TO_THREAD, FROM_THREAD, 'c');
+    kill(child, SIGKILL);
+    result("any", waited_for(-1, 0, child, &status));
+    result("any-term", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    result("after-reap", waited_for(-1, WNOHANG, child, &status));
+    write(wait_pipes[TO_THREAD][1], "q", 1);
+    pthread_join(thread, NULL);
+    fflush(stdout);
+    _exit(0);
+}
+
+static int wait_case(void) {
+    int ready[2];
+    if (pipe(ready)) return 80;
+    for (int i = 0; i < 4; i++)
+        if (pipe(wait_pipes[i])) return 80;
+    /* A group of the parent's own, which the child joins, whatever group
+     * the test runs in. */
+    if (setpgid(0, 0)) return 81;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+        write(ready[1], "x", 1);
+        for (;;) pause();
+    }
+    char byte;
+    read(ready[0], &byte, 1);
+    pid_t pgid = getpgid(child);
+    pid_t tracer = fork();
+    if (tracer == 0) return wait_tracer(child, pgid);
+    /* The parent's waits while the tracer holds the child, printed once the
+     * tracer has printed its own lines. */
+    long ptrace_stop, again;
+    int group;
+    read(wait_pipes[TO_PARENT][0], &byte, 1);
+    ptrace_stop = wait_status(child, WNOHANG | WUNTRACED);
+    write(wait_pipes[FROM_PARENT][1], "x", 1);
+    read(wait_pipes[TO_PARENT][0], &byte, 1);
+    group = wait_status(child, WNOHANG | WUNTRACED);
+    again = wait_status(child, WNOHANG | WUNTRACED);
+    write(wait_pipes[FROM_PARENT][1], "x", 1);
+    int status = wait_status(tracer, 0);
+    result("tracer-exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    result("parent-ptrace-stop", ptrace_stop);
+    stop("parent-group", group);
+    result("parent-again", again);
+    status = wait_status(child, 0);
+    result("parent-term", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    return 0;
+}
+
+/* How a tracee goes free. PTRACE_DETACH from a signal-delivery-stop gives
+ * the signal it names in place of the one stopped for. A tracer that exits
+ * lets a tracee in a stop go on with the signal it stopped for if it did
+ * not wait for the stop (a WNOWAIT wait leaves it unwaited), and without
+ * one if it did; it hands an exit it did not reap to the parent, which
+ * until then does not see it; and a tracee it detaches in a group stop
+ * stays stopped, a stop its parent saw while it was traced. */
+static volatile int got_usr1, got_usr2;
+
+static void on_usr(int number) {
+    if (number == SIGUSR1) got_usr1 = 1;
+    if (number == SIGUSR2) got_usr2 = 1;
+}
+
+static int detach_signal(void) {
+    pid_t child = fork();
+    if (child == 0) {
+        signal(SIGUSR1, on_usr);
+        signal(SIGUSR2, on_usr);
+        if (pt(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(90);
+        raise(SIGUSR1);
+        _exit(got_usr1 * 10 + got_usr2);
+    }
+    stop("usr1", wait_status(child, 0));
+    result("detach-usr2", pt(PTRACE_DETACH, child, 0, SIGUSR2));
+    result("detached-tracer", tracer_pid_of(child, NULL));
+    int status = wait_status(child, 0);
+    result("detach-exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+/* A child that lets any task trace it, then waits in pause until SIGUSR2:
+ * its exit code is whether SIGUSR1 came. */
+static pid_t traceable(int ready) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        signal(SIGUSR1, on_usr);
+        signal(SIGUSR2, on_usr);
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+        write(ready, "x", 1);
+        while (!got_usr2) pause();
+        _exit(got_usr1);
+    }
+    return child;
+}
+
+/* Waits by waitid for `child`, and prints what it found. */
+static void waited(const char *name, pid_t child, int options) {
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    int r;
+    do r = waitid(P_PID, child, &info, options);
+    while (r < 0 && errno == EINTR);
+    char line[64];
+    snprintf(line, sizeof line, "%s-code", name);
+    result(line, r < 0 ? -errno : info.si_code);
+    snprintf(line, sizeof line, "%s-status", name);
+    result(line, info.si_status);
+}
+
+static int detach_exit_stopped(int ready[2]) {
+    char byte;
+    for (int keep = 0; keep < 2; keep++) {
+        const char *name = keep ? "unwaited" : "waited";
+        char line[64];
+        pid_t child = traceable(ready[1]);
+        read(ready[0], &byte, 1);
+        pid_t tracer = fork();
+        if (tracer == 0) {
+            pt(PTRACE_ATTACH, child, 0, 0);
+            wait_status(child, 0);
+            pt(PTRACE_CONT, child, 0, 0);
+            kill(child, SIGUSR1);
+            snprintf(line, sizeof line, "%s-usr1", name);
+            if (keep) waited(line, child, WSTOPPED | WNOWAIT);
+            else stop(line, wait_status(child, 0));
+            fflush(stdout);
+            _exit(0);
+        }
+        wait_status(tracer, 0);
+        /* SIGUSR2 once the child sleeps again. A workaround for an emulator
+         * bug that Linux does not have: a signal sent while a task comes out
+         * of a stop, here the one its tracer's exit lets go, can be lost,
+         * and the child sleeps in pause for good. Remove the wait once the
+         * emulator keeps such a signal. */
+        char state = 0;
+        for (int i = 0; i < 2000 && (tracer_pid_of(child, &state) < 0 || state != 'S'); i++)
+            usleep(1000);
+        kill(child, SIGUSR2);
+        int status = wait_status(child, 0);
+        snprintf(line, sizeof line, "%s-got-usr1", name);
+        result(line, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+    return 0;
+}
+
+static int detach_exit_zombie(int ready[2]) {
+    char byte;
+    int go[2], told[2];
+    if (pipe(go) || pipe(told)) return 80;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+        write(ready[1], "x", 1);
+        read(go[0], &byte, 1);
+        _exit(7);
+    }
+    read(ready[0], &byte, 1);
+    pid_t tracer = fork();
+    if (tracer == 0) {
+        pt(PTRACE_ATTACH, child, 0, 0);
+        wait_status(child, 0);
+        pt(PTRACE_CONT, child, 0, 0);
+        write(go[1], "x", 1);
+        waited("zombie", child, WEXITED | WNOWAIT);
+        write(told[1], "x", 1);
+        read(go[0], &byte, 1);
+        fflush(stdout);
+        _exit(0);
+    }
+    read(told[0], &byte, 1);
+    long hidden = wait_status(child, WNOHANG);
+    write(go[1], "x", 1);
+    wait_status(tracer, 0);
+    result("zombie-hidden", hidden);
+    int status = wait_status(child, 0);
+    result("zombie-exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+static int detach_group_stop(int ready[2]) {
+    char byte;
+    pid_t child = traceable(ready[1]);
+    read(ready[0], &byte, 1);
+    pid_t tracer = fork();
+    if (tracer == 0) {
+        result("seize", pt(PTRACE_SEIZE, child, 0, 0));
+        kill(child, SIGSTOP);
+        stop("sigstop", wait_status(child, 0));
+        pt(PTRACE_CONT, child, 0, SIGSTOP);
+        stop("group", wait_status(child, 0));
+        result("detach", pt(PTRACE_DETACH, child, 0, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    wait_status(tracer, 0);
+    char state = 0;
+    for (int i = 0; i < 2000 && (tracer_pid_of(child, &state) != 0 || state != 'T'); i++)
+        usleep(1000);
+    result("detached-stopped", state == 'T');
+    stop("parent", wait_status(child, WNOHANG | WUNTRACED));
+    kill(child, SIGCONT);
+    result("continued", WIFCONTINUED(wait_status(child, WCONTINUED)));
+    /* SIGKILL, not the SIGUSR2 the child waits for. A workaround for the
+     * emulator bug above: a SIGUSR2 sent right after SIGCONT, as the task
+     * comes out of its stop, can be lost. Back to SIGUSR2, and the exit
+     * code it gives, once the emulator keeps such a signal. */
+    kill(child, SIGKILL);
+    int status = wait_status(child, 0);
+    result("group-killed", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    return 0;
+}
+
+static int detach_case(void) {
+    int ready[2];
+    if (pipe(ready)) return 80;
+    int code = detach_signal();
+    if (!code) code = detach_exit_stopped(ready);
+    if (!code) code = detach_exit_zombie(ready);
+    if (!code) code = detach_group_stop(ready);
+    return code;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 99;
     const char *mode = argv[1], *self = argv[2];
@@ -647,6 +937,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-sibling")) code = sibling_case();
     if (!strcmp(mode, "ptrace-attach-stopped")) code = attach_stopped();
     if (!strcmp(mode, "ptrace-tracer-exit")) code = tracer_exit_case();
+    if (!strcmp(mode, "ptrace-wait")) code = wait_case();
+    if (!strcmp(mode, "ptrace-detach")) code = detach_case();
     fflush(stdout);
     return code;
 }

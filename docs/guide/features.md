@@ -925,9 +925,10 @@ kernel.
   `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
   memory stays in place without more being done.
 
-- `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
-  as zeros, and those of a file mapping read the file again, as it is then,
-  as Linux faults them in from the file; this holds
+- `madvise`: `MADV_DONTNEED` empties private pages and drops their entries.
+  Anonymous ones then read as zeros, and those of a file mapping read the
+  file again at their next access, as it is then, as Linux faults them in
+  from the file; this holds
   after `mremap` moves the mapping and in a `fork`ed child. The program's own
   segments are laid out as Linux lays them out: the pages that hold file
   data are a file mapping and read the executable again, also those of a
@@ -3272,8 +3273,10 @@ kernel.
   `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
-  reaped, `S (sleeping)` while its thread is in a system call, where it waits
-  if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
+  reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
+  a futex, a timer or anything else it sleeps on), as Linux shows a task
+  that is not running, and `R` otherwise, also while it runs in a system
+  call that does not wait. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
   `maps` and `smaps` are empty, and open for any reader their mode lets,
   as Linux's `proc_mem_open` checks the reader only of a process with
@@ -3297,13 +3300,14 @@ kernel.
 - `syscall` of a process or of a thread, 0400 and of size 0, is what
   Linux's `proc_pid_syscall` writes when it is read, for a reader that may
   attach to the task, as for `personality` (`EPERM`). The reading thread's
-  own is the call it reads with. Another thread that is running (in no
-  system call and not stopped) is `running`; one asleep in a call or
-  stopped shows the registers of its last entry into the kernel, as Linux's
+  own is the call it reads with. Another thread that is running (blocked
+  in no wait and not stopped, in a system call or not) is `running`; one
+  asleep in a call or stopped shows the registers of its last entry into the kernel, as Linux's
   `pt_regs` keeps them: the call's number and its six arguments, then the
   stack pointer and the instruction pointer (past the `syscall`
   instruction), in hex, or `-1` and the two pointers for an entry that was
-  no call (a stop from user code). A thread that has ended has no kernel
+  no call (a stop from user code, or a fault that waits for its
+  `userfaultfd`, asleep as Linux's `handle_userfault` leaves it). A thread that has ended has no kernel
   stack left: `-1 0x0 0x0`. Each thread records the registers as it enters
   the kernel, with a few plain stores that another reads whole; a new
   thread or child starts with its parent's in the call that made it, as
@@ -3608,12 +3612,16 @@ kernel.
   written, a file's page two mappings show), is shared, with its size
   divided by that count in `Pss`, as Linux's `smaps_account` takes the
   precise map count. A read fault in a file's mapping gives entries to
-  the pages around it too, as Linux's `do_fault_around` maps them: up to
+  the pages around it too, as Linux's `do_fault_around` maps them, and so
+  does a read that faults in through `get_user_pages` (a core dump's, a
+  tracer's `PTRACE_PEEKDATA`): up to
   16 (the default `fault_around_bytes`, 64 KiB) from the faulting page's
   aligned block of 16, or from the VMA's start if that is later, within
   the VMA, its page table and the file, and only pages the page cache
   holds: a memfd's written pages, shared memory's that any process
-  touched, and every page of another file within its size. A page that
+  touched, and every page of another file within its size. A loaded
+  program's segments, whose pages are all there from the load, are mapped
+  around too once `MADV_DONTNEED` dropped their pages. A page that
   has an entry or a marker keeps it. System V shared memory and secret
   memory map none around, as Linux's have no `map_pages`, nor does a VMA
   that `userfaultfd` watches for writes or minor faults. The present bits of `pagemap`

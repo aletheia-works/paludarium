@@ -21,7 +21,7 @@ export function createJitHandler({ root, modulePath, page, encoded, oracle, onRo
         }
         const { mode, name, row, group = "rows" } = JSON.parse(Buffer.concat(chunks));
         // A restored row reruns an aube step, so it names a row of the oracle.
-        const known = group === "ripgrep" ? oracle.ripgrep?.rows ?? {} : group === "rows" || group === "restored" ? oracle.rows : {};
+        const known = group === "ripgrep" || group === "coreutils" ? oracle[group]?.rows ?? {} : group === "rows" || group === "restored" ? oracle.rows : {};
         if (!["interpreter", "jit"].includes(mode) || !Object.hasOwn(known, name)) throw Error("Unknown evidence row");
         await onRow(mode, name, row, group);
         send(200);

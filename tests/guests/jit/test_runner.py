@@ -34,6 +34,12 @@ RIPGREP = [
         (Path(__file__).resolve().parents[1] / "programs/ripgrep-cases.json").read_text()
     )["cases"]
 ]
+COREUTILS = [
+    case["name"]
+    for case in json.loads(
+        (Path(__file__).resolve().parents[1] / "programs/coreutils-cases.json").read_text()
+    )["cases"]
+]
 
 
 def valid():
@@ -56,6 +62,13 @@ def valid():
         ripgrep={
             mode: {
                 name: dict(copy.deepcopy(row), exit=index % 3) for index, name in enumerate(RIPGREP)
+            }
+            for mode in ("interpreter", "jit")
+        },
+        coreutils={
+            mode: {
+                name: dict(copy.deepcopy(row), exit=index % 3)
+                for index, name in enumerate(COREUTILS)
             }
             for mode in ("interpreter", "jit")
         },
@@ -154,6 +167,26 @@ class RunnerTests(unittest.TestCase):
             lambda r: r["ripgrep"]["interpreter"][first].update(timed_out=True),
             lambda r: r["ripgrep"]["interpreter"][first].update(seconds=31),
             lambda r: r["ripgrep"]["jit"][first]["jit"].update(executedBlocks="0"),
+        ):
+            with self.subTest():
+                self.rejected(change)
+
+    def test_coreutils(self):
+        # Any key order is accepted, as Safari's WebDriver returns.
+        report = valid()
+        report["coreutils"]["jit"] = dict(reversed(list(report["coreutils"]["jit"].items())))
+        runner.validate(report)
+        first = COREUTILS[0]
+        for change in (
+            lambda r: r.pop("coreutils"),
+            lambda r: r["coreutils"].pop("jit"),
+            lambda r: r["coreutils"]["interpreter"].pop(first),
+            lambda r: r["coreutils"]["jit"].update(extra=r["coreutils"]["jit"][first]),
+            lambda r: r["coreutils"]["interpreter"][first].update(exit=3),
+            lambda r: r["coreutils"]["interpreter"][first].update({"pass": False}),
+            lambda r: r["coreutils"]["interpreter"][first].update(timed_out=True),
+            lambda r: r["coreutils"]["interpreter"][first].update(seconds=31),
+            lambda r: r["coreutils"]["jit"][first]["jit"].update(executedBlocks="0"),
         ):
             with self.subTest():
                 self.rejected(change)

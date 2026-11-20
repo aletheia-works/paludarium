@@ -95,6 +95,18 @@ def validate(report):
             finished(row, lambda code: code in (0, 1, 2))
             if mode == "jit":
                 translated(row)
+    # The coreutils cases, also kept apart; the failing ones end with 1 or 2.
+    cases = json.loads((ROOT / "tests/guests/programs/coreutils-cases.json").read_text())["cases"]
+    if set(report.get("coreutils", {})) != {"interpreter", "jit"}:
+        raise ValueError("JIT coreutils mode inventory changed")
+    for mode in ("interpreter", "jit"):
+        rows = report["coreutils"][mode]
+        if sorted(rows) != sorted(case["name"] for case in cases):
+            raise ValueError("JIT coreutils case inventory changed")
+        for row in rows.values():
+            finished(row, lambda code: code in (0, 1, 2))
+            if mode == "jit":
+                translated(row)
 
 
 def main():

@@ -8,6 +8,7 @@ import tempfile
 
 from comparison import compare, probe_pass
 from comparison_args import compare_original
+from coreutils import compare_coreutils, runner
 from fixture import fixture_inputs
 from operation import operation as guest_operation
 from oracle import load
@@ -98,6 +99,25 @@ def observe(executable, guests, native_path, output, root, *, original=False):
                 ),
                 record_ripgrep,
             )
+            data["coreutils"] = {}
+
+            def record_coreutils(name, row):
+                data["coreutils"][name] = row
+                (output / "observations.json").write_text(json.dumps(data, indent=2) + "\n")
+
+            compare_coreutils(
+                native,
+                guests,
+                runner(
+                    guest_operation,
+                    executable,
+                    guests,
+                    pathlib.Path(scratch),
+                    operations,
+                    config["environment"],
+                ),
+                record_coreutils,
+            )
         for case in config["aube"][:2]:
             row = guest_operation(
                 executable,
@@ -129,6 +149,6 @@ def observe(executable, guests, native_path, output, root, *, original=False):
     (output / "observations.json").write_text(json.dumps(data, indent=2) + "\n")
     print(
         "Windows native host: fourteen Linux comparisons, two default VFS cases"
-        + ("" if original else " and the ripgrep searches")
+        + ("" if original else ", the ripgrep searches and the coreutils cases")
         + " passed"
     )

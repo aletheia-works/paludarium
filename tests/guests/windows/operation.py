@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 
+from coreutils import fixture_files
 from evidence import digest
 from fixture import fixture_inputs
 from runner import run
@@ -11,8 +12,31 @@ from runner import run
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
-def operation(executable, binary, args, directory, environment, fixture=None, mounted=False):
+def operation(
+    executable,
+    binary,
+    args,
+    directory,
+    environment,
+    fixture=None,
+    mounted=False,
+    *,
+    stdin=None,
+    inputs=fixture_inputs,
+    program=None,
+):
     directory.mkdir(parents=True)
+    if program is not None:
+        (directory / "program").write_text(program + "\n", encoding="utf-8")
+    if stdin is not None:
+        (directory / "stdin").write_bytes(stdin)
+    if fixture is not None and mounted and inputs is not fixture_inputs:
+        # The files whose modes the Rust side reads back on a mounted fixture;
+        # without this list it reads aube's three package.json files.
+        (directory / "fixture-files").write_text(
+            "".join(source + "\t" + guest + "\n" for source, guest in fixture_files(fixture)),
+            encoding="utf-8",
+        )
     (directory / "args").write_text("\n".join(args) + ("\n" if args else ""), encoding="utf-8")
     (directory / "environment").write_text(
         "".join(k + "=" + v + "\n" for k, v in environment.items()), encoding="utf-8"
@@ -57,7 +81,7 @@ def operation(executable, binary, args, directory, environment, fixture=None, mo
         recorded = (directory / "fixture-modes").read_text(encoding="utf-8")
         pairs = [line.split("\t") for line in recorded.splitlines()]
         modes = {path: int(mode) for path, mode in pairs}
-        if len(pairs) != len(modes) or modes != fixture_inputs(fixture):
+        if len(pairs) != len(modes) or modes != inputs(fixture):
             raise ValueError("Rust Host/private VFS fixture metadata differs from Linux inputs")
         row["fixture_input_modes"] = modes
     return row

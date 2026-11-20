@@ -4739,6 +4739,5 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   エラーも含めて比べます。`id`、`uname`、`pwd`、`env` は比べていません。ホストの
   ユーザー、パス、環境を表示するためです。
 
-coreutils を除くこれらは、Linux・macOS・Windows と、Node.js・Chromium・Firefox・Safari
-のすべてで、本物の x86-64 Linux と同じ結果になることを確かめています。coreutils は、
-今のところ x86-64 Linux で比べています。
+これらはすべて、Linux・macOS・Windows と、Node.js・Chromium・Firefox・Safari
+のすべてで、本物の x86-64 Linux と同じ結果になることを確かめています。

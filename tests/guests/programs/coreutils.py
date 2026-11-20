@@ -1,6 +1,7 @@
 """uutils coreutils' utilities, compared exactly with fresh Linux rows on x86-64 Linux."""
 
 import json
+import os
 import pathlib
 import shutil
 import stat
@@ -29,12 +30,35 @@ def inputs(directory):
     for part, guest in (("app", ""), ("outside", "/outside")):
         for path in sorted((directory / part).rglob("*")):
             if path.is_file() and not path.is_symlink():
-                result[guest + "/" + path.relative_to(directory / part).as_posix()] = stat.S_IMODE(
-                    path.stat().st_mode
-                )
+                result[guest + "/" + path.relative_to(directory / part).as_posix()] = mode(path)
     if any(mode != 0o644 for mode in result.values()):
         raise ValueError("coreutils fixture files are not 0644")
     return result
+
+
+def mode(path):
+    info = path.stat()
+    if os.name != "nt":
+        return stat.S_IMODE(info.st_mode)
+    if not info.st_mode & stat.S_IWRITE:
+        raise ValueError("Windows coreutils fixture file is read-only")
+    # The Windows host shows a writable regular file as 0644; the Rust side
+    # checks that it does.
+    return 0o644
+
+
+def fixture_files(directory):
+    """Each fixture file's path under `directory` and guest path, for a host
+    that reads the modes back itself."""
+    return [
+        (
+            (part + "/" + path.relative_to(directory / part).as_posix()),
+            guest + "/" + path.relative_to(directory / part).as_posix(),
+        )
+        for part, guest in (("app", ""), ("outside", "/outside"))
+        for path in sorted((directory / part).rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    ]
 
 
 def stdin_of(case, directory):
@@ -44,6 +68,32 @@ def stdin_of(case, directory):
 
 def environment(base, case):
     return dict(base, **case.get("env", {}))
+
+
+def runner(operation, executable, guests, scratch, operations, base):
+    """`run_case(case)` for compare_coreutils, through a host's `operation`:
+    a fresh fixture copy per case, and one that writes runs on the copy
+    mounted at /, so its files can be compared with Linux's afterwards."""
+
+    def run_case(case):
+        copy = fresh_fixture(scratch / "coreutils" / case["name"])
+        if case.get("writes"):
+            (copy / "app/tmp").mkdir()
+            (copy / "app/home/guest").mkdir(parents=True)
+        return operation(
+            executable,
+            guests / "coreutils",
+            case["args"],
+            operations / ("coreutils-" + case["name"]),
+            environment(base, case),
+            copy,
+            mounted=bool(case.get("writes")),
+            stdin=stdin_of(case, copy),
+            inputs=inputs,
+            program="/coreutils",
+        )
+
+    return run_case
 
 
 def observe_coreutils(guests, root, env):

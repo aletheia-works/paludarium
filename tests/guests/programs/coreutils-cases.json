@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "note": "Each case runs `coreutils <utility> ...` in a fresh copy of coreutils-fixture/app, with ../outside beside it. Cases marked writes run on the copy mounted at the guest's /, and the copy's files are compared afterwards too; the rest run on the emulator's own file system. Usage errors are left out: they name the multicall binary by argv[0], which is the harness's /program in the emulator. id, uname, pwd and env are left out: they print the host's identity, path and environment, which differ by design.",
+  "note": "Each case runs `coreutils <utility> ...` in a fresh copy of coreutils-fixture/app, with ../outside beside it. Cases marked writes run on the copy mounted at the guest's /, and the copy's files are compared afterwards too; the rest run on the emulator's own file system. Usage errors are left out: they name the multicall binary by argv[0], which is its host path natively and /coreutils in the emulator. id, uname, pwd and env are left out: they print the host's identity, path and environment, which differ by design.",
   "cases": [
     {"name": "cat-number", "args": ["cat", "-n", "fruits.txt", "docs/short.txt"]},
     {"name": "cat-show-all", "args": ["cat", "-A", "docs/notes.txt"]},

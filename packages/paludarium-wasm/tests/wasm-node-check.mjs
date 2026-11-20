@@ -4,7 +4,8 @@ import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
-import { compare, observeProgram, observeRipgrep, probeCases } from "./wasm-programs.mjs";
+import { compare, observeCoreutils, observeProgram, observeRipgrep, probeCases } from "./wasm-programs.mjs";
+import { readCoreutilsFixture } from "./coreutils-fixture.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
 import { observeRestoredAube } from "./wasm-entries.mjs";
 const [modulePath, oraclePath, guestDirectory = "target/guests/programs", outputDirectory = "target/wasm/node", slice] = process.argv.slice(2);
@@ -39,6 +40,13 @@ if (slice !== "--probe-only") {
     report.ripgrep = { ...report.ripgrep, [name]: row }; await persist(); console.log(JSON.stringify({ name: "ripgrep-" + name, exit: row.exit, pass: row.pass, timed_out: row.timed_out, errors: row.errors }));
   } });
   failed ||= Object.values(report.ripgrep).some(row => !row.pass) || Object.keys(report.ripgrep).length !== ripgrepCases.length;
+  const coreutils = new Uint8Array(await readFile(resolve(guestDirectory, "coreutils")));
+  if (hash(coreutils) !== oracle.coreutils?.binary_sha256) throw new Error("coreutils differs from fresh native binary");
+  const coreutilsCases = JSON.parse(await readFile("tests/guests/programs/coreutils-cases.json", "utf8")).cases;
+  report.coreutils = await observeCoreutils(() => createPaludarium({ wasmUrl: pathToFileURL(resolve(modulePath)) }), { coreutils, cases: coreutilsCases, oracle, fixture: await readCoreutilsFixture(), onRow: async (name, row) => {
+    report.coreutils = { ...report.coreutils, [name]: row }; await persist(); console.log(JSON.stringify({ name: "coreutils-" + name, exit: row.exit, pass: row.pass, timed_out: row.timed_out, errors: row.errors, comparison_error: row.comparison_error }));
+  } });
+  failed ||= Object.values(report.coreutils).some(row => !row.pass) || Object.keys(report.coreutils).length !== coreutilsCases.length;
   const files = { "/aube": aube }, fileModes = {};
   const environment = oracle.guest_environment ?? config.environment;
   const fixtureRoot = oracle.fixture_root + "/fixture", cwd = fixtureRoot + "/app";

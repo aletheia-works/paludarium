@@ -5437,6 +5437,5 @@ one only with an `--allow-net`.
   that is not empty. `id`, `uname`, `pwd` and `env` are not compared, because
   they print the host's identity, path and environment.
 
-All of them except coreutils give the same results as a real x86-64 Linux on
-Linux, macOS and Windows, and on Node.js, Chromium, Firefox and Safari.
-coreutils is compared on x86-64 Linux so far.
+All of them give the same results as a real x86-64 Linux on Linux, macOS and
+Windows, and on Node.js, Chromium, Firefox and Safari.

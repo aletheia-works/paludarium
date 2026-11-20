@@ -9,7 +9,7 @@ import tempfile
 
 from comparison import compare, probe_pass
 from comparison_args import compare_original, comparison_config
-from coreutils import compare_coreutils, environment, fresh_fixture, inputs, stdin_of
+from coreutils import compare_coreutils, runner
 from evidence import snapshot
 from metadata import fixture_inputs
 from native import observe
@@ -172,27 +172,12 @@ def differential(executable, *, original_argv=False):
             observations["coreutils"][name] = row
             (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
 
-        def run_coreutils(case):
-            # A fresh copy per case; one that writes runs on the copy mounted
-            # at /, so its files can be compared with Linux's afterwards.
-            copy = fresh_fixture(scratch / "coreutils" / case["name"])
-            if case.get("writes"):
-                (copy / "app/tmp").mkdir()
-                (copy / "app/home/guest").mkdir(parents=True)
-            return operation(
-                executable,
-                guests / "coreutils",
-                case["args"],
-                operations / ("coreutils-" + case["name"]),
-                environment(config["environment"], case),
-                copy,
-                mounted=bool(case.get("writes")),
-                stdin=stdin_of(case, copy),
-                inputs=inputs,
-                program="/coreutils",
-            )
-
-        compare_coreutils(native, guests, run_coreutils, record_coreutils)
+        compare_coreutils(
+            native,
+            guests,
+            runner(operation, executable, guests, scratch, operations, config["environment"]),
+            record_coreutils,
+        )
         for case in config["aube"][:2]:
             name = "default-" + case["name"]
             row = operation(

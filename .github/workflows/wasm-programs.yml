@@ -131,7 +131,7 @@ jobs:
         env:
           WASM_ENVIRONMENT: ${{ matrix.environment }}
         run: node packages/paludarium-wasm/tests/wasm-browser-network.mjs "$WASM_ENVIRONMENT" packages/paludarium-wasm/paludarium.wasm
-      - name: Compare fourteen actual guest executions, the ripgrep searches and the aube steps on rebuilt filesystems with fresh Linux
+      - name: Compare fourteen actual guest executions, the ripgrep searches, the coreutils cases and the aube steps on rebuilt filesystems with fresh Linux
         env:
           WASM_ENVIRONMENT: ${{ matrix.environment }}
         run: |
@@ -159,6 +159,9 @@ jobs:
           # Safari's WebDriver returns the report without its key order.
           assert sorted(report['ripgrep']) == sorted(case['name'] for case in cases)
           assert all(row['pass'] and not row['timed_out'] for row in report['ripgrep'].values())
+          cases = json.loads(pathlib.Path('tests/guests/programs/coreutils-cases.json').read_text())['cases']
+          assert sorted(report['coreutils']) == sorted(case['name'] for case in cases)
+          assert all(row['pass'] and not row['timed_out'] for row in report['coreutils'].values())
           # The aube steps again, each on a filesystem rebuilt from the previous snapshot.
           steps = json.loads(pathlib.Path('tests/guests/programs/cases.json').read_text())['aube']
           assert sorted(report['restored']) == sorted(step['name'] for step in steps)

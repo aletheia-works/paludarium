@@ -336,8 +336,9 @@ these, or nothing is published ([Release process](../release)):
 The JIT must mean exactly what the interpreter means. It has no semantics of
 its own: the same differential tests run with and without it. Instructions the
 JIT cannot translate run in the interpreter, and such runs do not count as JIT
-successes. In the four WebAssembly environments, probe, aube and the ripgrep
-searches all run in both modes, and each JIT run must execute translated code.
+successes. In the four WebAssembly environments, probe, aube, the ripgrep
+searches and the coreutils cases all run in both modes, and each JIT run must
+execute translated code.
 
 ### The native JIT
 

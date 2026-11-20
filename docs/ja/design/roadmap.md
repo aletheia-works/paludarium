@@ -21,8 +21,6 @@ uutils の coreutils も確かめたプログラムになりました（[対応�
 
 - 確かめるプログラムに、brush シェルを加える。今のリリースは、依存先の取り下げられた
   クレートやセキュリティのアドバイザリのためにゲストの監査を通らないので、次のリリースを待っています。
-- coreutils を、ripgrep がすでに動いているほかのホスト（macOS、Windows、WebAssembly の
-  環境）でも比べる。
 - 対応するシステムコールと命令を増やす（[制限](../guide/limitations) を参照）。
 - ネイティブの JIT（`--jit`、x86-64 の Linux で試験的）：[決定事項](decisions#when-the-native-jit-is-turned-on-by-default)の条件がそろったら既定で有効にすること、ほかの
   ホスト（Arm64、macOS、Windows）、ブロックのより多くをコンパイルすること（命令を増やす、

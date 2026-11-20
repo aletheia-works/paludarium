@@ -6,27 +6,29 @@ import { createHash } from "node:crypto";
 import { runBrowser } from "./wasm-browser-driver.mjs";
 import { runJitSuite } from "./jit-suite.mjs";
 import { createJitHandler } from "./jit-http.mjs";
+import { readCoreutilsFixture } from "./coreutils-fixture.mjs";
 
 const [environment, modulePath, oraclePath, guestDirectory, outputDirectory] = process.argv.slice(2);
 if (!outputDirectory || !["node", "chromium", "firefox", "safari", "webkit"].includes(environment)) throw new Error("usage: jit-check.mjs node|chromium|firefox|safari|webkit module oracle guests output");
 const root = resolve("."), hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const rawOracle = await readFile(oraclePath, "utf8"), oracle = JSON.parse(rawOracle.replace(/("mtime_ns"\s*:\s*)(\d+)/g, '$1"$2"'));
-const probe = await readFile(resolve(guestDirectory, "probe")), aube = await readFile(resolve(guestDirectory, "aube")), ripgrep = await readFile(resolve(guestDirectory, "ripgrep"));
-if (hash(probe) !== oracle.binary_hashes.probe || hash(aube) !== oracle.binary_hashes.aube || hash(ripgrep) !== oracle.ripgrep?.binary_sha256) throw new Error("Guest differs from fresh native binary");
+const probe = await readFile(resolve(guestDirectory, "probe")), aube = await readFile(resolve(guestDirectory, "aube")), ripgrep = await readFile(resolve(guestDirectory, "ripgrep")), coreutils = await readFile(resolve(guestDirectory, "coreutils"));
+if (hash(probe) !== oracle.binary_hashes.probe || hash(aube) !== oracle.binary_hashes.aube || hash(ripgrep) !== oracle.ripgrep?.binary_sha256 || hash(coreutils) !== oracle.coreutils?.binary_sha256) throw new Error("Guest differs from fresh native binary");
+const coreutilsCases = JSON.parse(await readFile("tests/guests/programs/coreutils-cases.json", "utf8")).cases, coreutilsFixture = await readCoreutilsFixture();
 const ripgrepCases = JSON.parse(await readFile("tests/guests/programs/ripgrep-cases.json", "utf8")).cases;
 const fixtures = {};
 for (const name of ["app/package.json", "app/filedep/package.json", "outside/linked/package.json"]) fixtures[name] = new Uint8Array(await readFile("tests/guests/programs/fixtures/" + name));
-const input = { oracle, config: oracle.case_config, probe: new Uint8Array(probe), aube: new Uint8Array(aube), ripgrep: new Uint8Array(ripgrep), ripgrepCases, fixtures };
+const input = { oracle, config: oracle.case_config, probe: new Uint8Array(probe), aube: new Uint8Array(aube), ripgrep: new Uint8Array(ripgrep), ripgrepCases, coreutils: new Uint8Array(coreutils), coreutilsCases, coreutilsFixture, fixtures };
 if (!input.config) throw new Error("Exact fresh native case config missing");
 const report = { schema: 1, environment, module_sha256: hash(await readFile(modulePath)), oracle_sha256: hash(rawOracle),
-                 guest_hashes: oracle.binary_hashes, rows: { interpreter: {}, jit: {} }, ripgrep: { interpreter: {}, jit: {} }, restored: { interpreter: {}, jit: {} }, complete: false };
+                 guest_hashes: oracle.binary_hashes, rows: { interpreter: {}, jit: {} }, ripgrep: { interpreter: {}, jit: {} }, coreutils: { interpreter: {}, jit: {} }, restored: { interpreter: {}, jit: {} }, complete: false };
 await mkdir(outputDirectory, { recursive: true });
 const persist = () => writeFile(resolve(outputDirectory, "observations.json"), JSON.stringify(report, null, 2) + "\n");
 await persist();
 const onRow = async (mode, name, row, group = "rows") => {
   // The aube steps rerun on a filesystem rebuilt from its snapshot are kept
   // apart from the first ones, which they would otherwise overwrite.
-  const key = group === "ripgrep" || group === "restored" ? group : "rows";
+  const key = ["ripgrep", "coreutils", "restored"].includes(group) ? group : "rows";
   report[key][mode][name] = row; await persist();
   console.log(JSON.stringify({ environment, mode, name: (key === "rows" ? "" : key + "-") + name, pass: row.pass, seconds: row.seconds, jit: row.jit, error: row.comparison_error ?? row.jit_error }));
 };
@@ -37,11 +39,12 @@ try {
     report.version = process.version;
     result = await runJitSuite({ ...input, wasmUrl: pathToFileURL(resolve(modulePath)), onRow });
   } else {
-    const encoded = { ...input, probe: probe.toString("base64"), aube: aube.toString("base64"), ripgrep: ripgrep.toString("base64"),
+    const encoded = { ...input, probe: probe.toString("base64"), aube: aube.toString("base64"), ripgrep: ripgrep.toString("base64"), coreutils: coreutils.toString("base64"),
+      coreutilsFixture: Object.fromEntries(Object.entries(coreutilsFixture).map(([name, bytes]) => [name, Buffer.from(bytes).toString("base64")])),
       fixtures: Object.fromEntries(Object.entries(fixtures).map(([name, bytes]) => [name, Buffer.from(bytes).toString("base64")])) };
     const page = `<!doctype html><script type="module">
 import{runJitSuite}from'/packages/paludarium-wasm/tests/jit-suite.mjs';
-try{if(!crossOriginIsolated)throw Error('Shared memory unavailable');const input=await(await fetch('/input.json')).json();const decode=text=>Uint8Array.from(atob(text),c=>c.charCodeAt(0));input.probe=decode(input.probe);input.aube=decode(input.aube);input.ripgrep=decode(input.ripgrep);for(const name of Object.keys(input.fixtures))input.fixtures[name]=decode(input.fixtures[name]);window.__wasmReport=await runJitSuite({...input,wasmUrl:'/production.wasm',onRow:async(mode,name,row,group)=>{await fetch('/row',{method:'POST',body:JSON.stringify({mode,name,row,group})});}});}catch(error){window.__wasmReport={complete:false,passed:false,error:String(error)};}</script>`;
+try{if(!crossOriginIsolated)throw Error('Shared memory unavailable');const input=await(await fetch('/input.json')).json();const decode=text=>Uint8Array.from(atob(text),c=>c.charCodeAt(0));input.probe=decode(input.probe);input.aube=decode(input.aube);input.ripgrep=decode(input.ripgrep);input.coreutils=decode(input.coreutils);for(const name of Object.keys(input.fixtures))input.fixtures[name]=decode(input.fixtures[name]);for(const name of Object.keys(input.coreutilsFixture))input.coreutilsFixture[name]=decode(input.coreutilsFixture[name]);window.__wasmReport=await runJitSuite({...input,wasmUrl:'/production.wasm',onRow:async(mode,name,row,group)=>{await fetch('/row',{method:'POST',body:JSON.stringify({mode,name,row,group})});}});}catch(error){window.__wasmReport={complete:false,passed:false,error:String(error)};}</script>`;
     server = createServer(createJitHandler({ root, modulePath, page, encoded, oracle, onRow }));
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     result = await runBrowser(environment, `http://127.0.0.1:${server.address().port}/`, 1200000);

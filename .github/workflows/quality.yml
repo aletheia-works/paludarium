@@ -67,6 +67,8 @@ jobs:
           import hashlib, json, pathlib, subprocess
           root = pathlib.Path('target/windows/windows-byte-audit')
           names = ['deny.toml', 'Cargo.lock', 'fuzz/Cargo.lock', 'rust-toolchain.toml', 'tests/guests/programs/fixtures/outside/linked/package.json', 'tests/guests/programs/fixtures/app/package.json', 'tests/guests/programs/fixtures/app/filedep/package.json']
+          # coreutils compares its fixture's bytes too, so they must be the signed bytes.
+          names += sorted(path.as_posix() for path in pathlib.Path('tests/guests/programs/coreutils-fixture').rglob('*') if path.is_file())
           rows = []
           for name in names:
               actual = pathlib.Path(name).read_bytes()

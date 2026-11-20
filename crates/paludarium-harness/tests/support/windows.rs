@@ -79,15 +79,19 @@ fn fixture_mode(path: &Path) -> u32 {
 pub fn operation() {
     let directory = PathBuf::from(std::env::var_os("PALUDARIUM_WINDOWS_OPERATION").unwrap());
     let binary = PathBuf::from(std::env::var_os("PALUDARIUM_WINDOWS_BINARY").unwrap());
-    let mut args = vec![b"/program".to_vec()];
+    // The guest path of the program, which is also its argv[0]: a multicall
+    // binary such as coreutils picks its behaviour by that name.
+    let program = std::fs::read_to_string(directory.join("program"))
+        .map_or_else(|_| "/program".to_owned(), |path| path.trim_end().to_owned());
+    let mut args = vec![program.as_bytes().to_vec()];
     args.extend(
         std::fs::read_to_string(directory.join("args"))
             .unwrap()
             .lines()
             .map(|s| s.as_bytes().to_vec()),
     );
-    let mut config = Config::new("/program", args)
-        .with_file("/program", std::fs::read(binary).unwrap())
+    let mut config = Config::new(program.as_str(), args)
+        .with_file(program.as_str(), std::fs::read(binary).unwrap())
         .with_file("/tmp/.u10", Vec::new())
         .with_file("/home/guest/.guest", Vec::new());
     for line in std::fs::read_to_string(directory.join("environment"))
@@ -115,20 +119,28 @@ pub fn operation() {
             fixture_files(&mut config, &fixture.join("outside"), "/outside");
         }
     }
-    let host = Arc::new(CaptureHost(RecordingHost::new()));
+    // A case's stdin, when it has one; otherwise stdin is empty.
+    let host = Arc::new(CaptureHost(match std::fs::read(directory.join("stdin")) {
+        Ok(input) => RecordingHost::with_stdin(&input),
+        Err(_) => RecordingHost::new(),
+    }));
     let fixture_modes = if std::env::var_os("PALUDARIUM_WINDOWS_MOUNTED").is_some() {
         let fixture = PathBuf::from(std::env::var_os("PALUDARIUM_WINDOWS_FIXTURE").unwrap());
-        [
-            ("app/package.json", "/package.json"),
-            ("app/filedep/package.json", "/filedep/package.json"),
-            (
-                "outside/linked/package.json",
-                "/outside/linked/package.json",
-            ),
-        ]
-        .iter()
-        .map(|(source, guest)| format!("{guest}\t{}\n", fixture_mode(&fixture.join(source))))
-        .collect::<String>()
+        // The files the operation lists, or else aube's three package.json files.
+        let listed =
+            std::fs::read_to_string(directory.join("fixture-files")).unwrap_or_else(|_| {
+                "app/package.json\t/package.json\n\
+             app/filedep/package.json\t/filedep/package.json\n\
+             outside/linked/package.json\t/outside/linked/package.json\n"
+                    .to_owned()
+            });
+        listed
+            .lines()
+            .map(|line| {
+                let (source, guest) = line.split_once('\t').unwrap();
+                format!("{guest}\t{}\n", fixture_mode(&fixture.join(source)))
+            })
+            .collect::<String>()
     } else {
         config
             .file_modes

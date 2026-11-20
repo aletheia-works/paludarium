@@ -7,8 +7,9 @@ export function requireJitProof(row) {
   return row;
 }
 
-// Identical 14 cases and ripgrep searches, fixture state, masks and deadline
-// for both execution modes. The ripgrep rows are kept apart from the 28 cases.
+// Identical 14 cases, ripgrep searches and coreutils cases, fixture state,
+// masks and deadline for both execution modes. The ripgrep and coreutils rows
+// are kept apart from the 28 cases.
 export async function runJitSuite(input) {
   const modes = {};
   for (const jit of [false, true]) {

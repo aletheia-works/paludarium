@@ -3,17 +3,20 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { runBrowser } from "./wasm-browser-driver.mjs";
+import { readCoreutilsFixture } from "./coreutils-fixture.mjs";
 const [browser, modulePath, oraclePath, guestDirectory, outputDirectory] = process.argv.slice(2);
 if (!outputDirectory) throw new Error("usage: wasm-browser-check.mjs browser module oracle guests output");
 const root = resolve("."), hash = bytes => createHash("sha256").update(bytes).digest("hex"), encode = bytes => Buffer.from(bytes).toString("base64");
 const rawOracle = await readFile(oraclePath, "utf8"), oracle = JSON.parse(rawOracle.replace(/("mtime_ns"\s*:\s*)(\d+)/g, '$1"$2"'));
-const probe = await readFile(resolve(guestDirectory, "probe")), aube = await readFile(resolve(guestDirectory, "aube")), ripgrep = await readFile(resolve(guestDirectory, "ripgrep"));
-if (hash(probe) !== oracle.binary_hashes.probe || hash(aube) !== oracle.binary_hashes.aube || hash(ripgrep) !== oracle.ripgrep?.binary_sha256) throw new Error("Guest hash mismatch");
+const probe = await readFile(resolve(guestDirectory, "probe")), aube = await readFile(resolve(guestDirectory, "aube")), ripgrep = await readFile(resolve(guestDirectory, "ripgrep")), coreutils = await readFile(resolve(guestDirectory, "coreutils"));
+if (hash(probe) !== oracle.binary_hashes.probe || hash(aube) !== oracle.binary_hashes.aube || hash(ripgrep) !== oracle.ripgrep?.binary_sha256 || hash(coreutils) !== oracle.coreutils?.binary_sha256) throw new Error("Guest hash mismatch");
+const coreutilsCases = JSON.parse(await readFile("tests/guests/programs/coreutils-cases.json", "utf8")).cases;
+const coreutilsFixture = Object.fromEntries(Object.entries(await readCoreutilsFixture()).map(([path, bytes]) => [path, encode(bytes)]));
 const ripgrepCases = JSON.parse(await readFile("tests/guests/programs/ripgrep-cases.json", "utf8")).cases;
 const fixtures = {};
 for (const path of ["app/package.json", "app/filedep/package.json", "outside/linked/package.json"]) fixtures[path] = encode(await readFile("tests/guests/programs/fixtures/" + path));
-const input = { oracle, config: oracle.case_config ?? JSON.parse(await readFile("tests/guests/programs/cases.json", "utf8")), probe: encode(probe), aube: encode(aube), ripgrep: encode(ripgrep), ripgrepCases, fixtures };
-const report = { schema: 1, environment: browser, module_sha256: hash(await readFile(modulePath)), oracle_sha256: hash(rawOracle), guest_hashes: oracle.binary_hashes, rows: {}, ripgrep: {}, restored: {}, complete: false };
+const input = { oracle, config: oracle.case_config ?? JSON.parse(await readFile("tests/guests/programs/cases.json", "utf8")), probe: encode(probe), aube: encode(aube), ripgrep: encode(ripgrep), ripgrepCases, coreutils: encode(coreutils), coreutilsCases, coreutilsFixture, fixtures };
+const report = { schema: 1, environment: browser, module_sha256: hash(await readFile(modulePath)), oracle_sha256: hash(rawOracle), guest_hashes: oracle.binary_hashes, rows: {}, ripgrep: {}, coreutils: {}, restored: {}, complete: false };
 await mkdir(outputDirectory, { recursive: true });
 const persist = () => writeFile(resolve(outputDirectory, "observations.json"), JSON.stringify(report, null, 2) + "\n"); await persist();
 const page = `<!doctype html><script type="module">
@@ -31,7 +34,7 @@ globalThis.fetch = async (resource, options) => {
 try {
  if (!crossOriginIsolated) throw new Error('Shared memory unavailable');
  const input = await (await fetch('/input.json')).json(), decode = text => Uint8Array.from(atob(text), char => char.charCodeAt(0));
- input.probe=decode(input.probe); input.aube=decode(input.aube); input.ripgrep=decode(input.ripgrep); for(const key of Object.keys(input.fixtures)) input.fixtures[key]=decode(input.fixtures[key]);
+ input.probe=decode(input.probe); input.aube=decode(input.aube); input.ripgrep=decode(input.ripgrep); input.coreutils=decode(input.coreutils); for(const key of Object.keys(input.fixtures)) input.fixtures[key]=decode(input.fixtures[key]); for(const key of Object.keys(input.coreutilsFixture)) input.coreutilsFixture[key]=decode(input.coreutilsFixture[key]);
  window.__wasmReport = await runSuite({...input,wasmUrl:'/production.wasm',onRow: async(name,row,group='rows')=>{await fetch('/row',{method:'POST',body:JSON.stringify({name,row,group})});}});
 } catch(error) {window.__wasmReport={passed:false,complete:false,error:String(error)};}
 </script>`;
@@ -46,7 +49,7 @@ const server = createServer(async (request, response) => {
     else if (request.url === "/input.json") response.writeHead(200, { ...headers, "Content-Type": "application/json" }).end(JSON.stringify(input));
     else if (request.url === "/row" && request.method === "POST") {
       const chunks = []; let size = 0; for await (const chunk of request) { size += chunk.length; if (size > 16 * 1024 * 1024) throw new Error("row evidence too large"); chunks.push(chunk); }
-      const { name, row, group } = JSON.parse(Buffer.concat(chunks)); report[group === "ripgrep" || group === "restored" ? group : "rows"][name] = row; await persist(); response.writeHead(200, headers).end();
+      const { name, row, group } = JSON.parse(Buffer.concat(chunks)); report[["ripgrep", "coreutils", "restored"].includes(group) ? group : "rows"][name] = row; await persist(); response.writeHead(200, headers).end();
     } else {
       const path = request.url === "/production.wasm" ? resolve(modulePath) : resolve(root, "." + new URL(request.url, "http://localhost").pathname);
       if (request.url !== "/production.wasm" && !path.startsWith(root + sep)) throw new Error("invalid path");

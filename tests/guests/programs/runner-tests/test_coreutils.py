@@ -7,9 +7,20 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from coreutils import cases, compare_coreutils, environment, fresh_fixture, inputs, stdin_of
+import coreutils
+from coreutils import (
+    cases,
+    compare_coreutils,
+    environment,
+    fixture_files,
+    fresh_fixture,
+    inputs,
+    runner,
+    stdin_of,
+)
 from evidence import digest
 
 
@@ -137,6 +148,69 @@ class CoreutilsTests(unittest.TestCase):
         base = {"TZ": "UTC", "LANG": "C"}
         self.assertEqual(environment(base, {"env": {"TZ": "JST-9"}}), {"TZ": "JST-9", "LANG": "C"})
         self.assertEqual(environment(base, {}), base)
+
+    def test_runner_gives_each_case_a_fresh_copy_through_the_host_operation(self):
+        calls = []
+
+        def operation(executable, binary, args, directory, env, fixture, mounted, **options):
+            # A case that writes changes only its own copy.
+            (fixture / "app/fruits.txt").write_text("changed")
+            calls.append((executable, binary, args, directory, env, fixture, mounted, options))
+            return {"ran": len(calls)}
+
+        scratch = self.guests / "scratch"
+        run_case = runner(
+            operation, "emulator", self.guests, scratch, self.guests / "ops", {"A": "1"}
+        )
+        writes = {"name": "w", "args": ["touch", "x"], "writes": True}
+        reads = {
+            "name": "r",
+            "args": ["tr", "a", "b"],
+            "stdin": "fruits.txt",
+            "env": {"TZ": "JST-9"},
+        }
+        self.assertEqual(run_case(writes), {"ran": 1})
+        self.assertEqual(run_case(reads), {"ran": 2})
+        first, second = calls
+        self.assertEqual(
+            first[:4],
+            (
+                "emulator",
+                self.guests / "coreutils",
+                ["touch", "x"],
+                self.guests / "ops/coreutils-w",
+            ),
+        )
+        self.assertEqual(first[5], scratch / "coreutils/w")
+        self.assertTrue(first[6])
+        self.assertTrue((scratch / "coreutils/w/app/tmp").is_dir())
+        self.assertTrue((scratch / "coreutils/w/app/home/guest").is_dir())
+        self.assertEqual(first[7], {"stdin": None, "inputs": inputs, "program": "/coreutils"})
+        self.assertFalse(second[6])
+        self.assertEqual(second[4], {"A": "1", "TZ": "JST-9"})
+        self.assertFalse((scratch / "coreutils/r/app/tmp").exists())
+        # Read before the operation ran, from the case's untouched copy.
+        self.assertEqual(second[7]["stdin"], (coreutils.FIXTURE / "app/fruits.txt").read_bytes())
+
+    def test_fixture_files_name_each_file_with_its_guest_path(self):
+        copy_ = fresh_fixture(self.guests / "copy")
+        listed = fixture_files(copy_)
+        self.assertIn(("app/docs/notes.txt", "/docs/notes.txt"), listed)
+        self.assertIn(("outside/far.txt", "/outside/far.txt"), listed)
+        self.assertEqual([guest for _, guest in listed], list(inputs(copy_)))
+
+    def test_windows_modes_are_the_hosts_0644_for_writable_files(self):
+        copy_ = fresh_fixture(self.guests / "copy")
+        path = copy_ / "app/fruits.txt"
+        with mock.patch.object(coreutils.os, "name", "nt"):
+            path.chmod(0o666)
+            self.assertEqual(coreutils.mode(path), 0o644)
+            path.chmod(0o444)
+            with self.assertRaises(ValueError):
+                coreutils.mode(path)
+        path.chmod(0o666)
+        with self.assertRaises(ValueError):
+            inputs(copy_)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,6 @@ Nothing here is a promise, but these are on the table:
 - One more verified program, the brush shell, once its next release passes
   the guest audit (the current one is held back by yanked crates and
   security advisories in its dependencies).
-- coreutils on the other hosts: macOS, Windows and the WebAssembly
-  environments, where ripgrep already runs.
 - More system calls and instructions (see [Limitations](../guide/limitations)).
 - The native JIT (`--jit`, experimental on Linux x86-64): turning it on by
   default once the criteria in [Decisions](decisions#when-the-native-jit-is-turned-on-by-default)

@@ -50,11 +50,13 @@ pub use clock::{ClockId, WaitOutcome};
 
 /// Whether the guest thread a host thread runs is blocked in a wait of the
 /// host ([`Host::wait_on`], [`Host::wait_until`]): what `/proc` shows as
-/// sleeping, as Linux shows a task that is not running. The kernel gives
-/// each host thread its guest thread's flag ([`blocked::attach`]), and
-/// every wait sets it for as long as it lasts ([`blocked::Waiting`]).
+/// sleeping, as Linux shows a task that is not running. While the kernel
+/// handles a stop of a guest thread, it gives the host thread that thread's
+/// flag ([`blocked::attach`]), and a wait sets it from the moment it goes
+/// to sleep until it ends ([`blocked::Waiting`]). A wait outside that
+/// (a worker's, or the runtime's) sets nothing.
 pub mod blocked {
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -62,31 +64,52 @@ pub mod blocked {
 
     std::thread_local! {
         static FLAG: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Makes `flag` the one this host thread's waits set, unless it already
-    /// is.
-    pub fn attach(flag: &Arc<AtomicBool>) {
+    /// Makes `flag` the one this host thread's waits set until the guard
+    /// it returns is dropped.
+    pub fn attach(flag: &Arc<AtomicBool>) -> Attached {
         FLAG.with(|current| {
             let mut current = current.borrow_mut();
             if !current.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag)) {
                 *current = Some(Arc::clone(flag));
             }
         });
+        Attached(ACTIVE.with(|active| active.replace(true)))
     }
 
-    /// A wait of the host: the attached flag is set while it lives, and
-    /// back as it was once it ends, so a wait within another keeps it set.
+    /// The time a flag is attached ([`attach`]); within another, it ends
+    /// with the outer one.
     #[must_use]
+    pub struct Attached(bool);
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.set(self.0));
+        }
+    }
+
+    /// A wait of the host: from [`Self::sleep`] the attached flag is set,
+    /// and once it ends it is back as it was, so a wait within another
+    /// keeps it set.
+    #[must_use]
+    #[derive(Default)]
     pub struct Waiting(Option<(Arc<AtomicBool>, bool)>);
     impl Waiting {
-        /// The thread starts to wait.
-        pub fn start() -> Self {
-            Self(FLAG.with(|current| {
+        /// A wait that has not gone to sleep yet.
+        pub fn new() -> Self {
+            Self::default()
+        }
+        /// The wait goes to sleep, as it is about to block.
+        pub fn sleep(&mut self) {
+            if self.0.is_some() || !ACTIVE.with(Cell::get) {
+                return;
+            }
+            self.0 = FLAG.with(|current| {
                 let flag = current.borrow().clone()?;
                 let was = flag.swap(true, Ordering::SeqCst);
                 Some((flag, was))
-            }))
+            });
         }
     }
     impl Drop for Waiting {

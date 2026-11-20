@@ -6661,13 +6661,67 @@ mod proc_other {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(state(&mut k, &mut t), "S");
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
-        // This thread handled its calls above: a wait of the host marks it
-        // blocked while it lasts.
+        // Outside its stops, a wait of this host thread marks nothing.
+        let mut waiting = paludarium_host::blocked::Waiting::new();
+        waiting.sleep();
         assert!(!k.inbox.blocked());
-        let waiting = paludarium_host::blocked::Waiting::start();
-        assert!(k.inbox.blocked());
-        drop(waiting);
+    }
+    /// A thread blocked in a read of an empty pipe is marked blocked while
+    /// it waits: the child writes the byte only once it has seen the mark.
+    #[test]
+    fn a_read_that_waits_marks_its_thread_blocked() {
+        use std::sync::atomic::Ordering;
+        let (mut k, mut t, m) = setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 22, [DATA + 3500, 0, 0, 0, 0, 0]),
+            0
+        );
+        let mut fds = [0u8; 8];
+        m.read(GuestAddr(DATA + 3500), &mut fds).unwrap();
+        let read_end = u64::from(u32::from_le_bytes(fds[..4].try_into().unwrap()));
+        let write_end = u64::from(u32::from_le_bytes(fds[4..].try_into().unwrap()));
+        let (mut child, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let flag = std::sync::Arc::clone(k.inbox.blocked_flag());
+        let writer = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            cm.write(GuestAddr(DATA + 3600), b"x").unwrap();
+            syscall(
+                &mut child,
+                &mut ct,
+                &cm,
+                1,
+                [write_end, DATA + 3600, 1, 0, 0, 0],
+            )
+        });
+        let read = syscall(&mut k, &mut t, &m, 0, [read_end, DATA + 3700, 1, 0, 0, 0]);
+        assert_eq!(writer.join().unwrap(), 1);
+        assert_eq!(read, 1);
         assert!(!k.inbox.blocked());
+    }
+    /// A thread blocked after an entry that was no call (a fault it waits
+    /// in, for a userfaultfd) shows `-1` and its two pointers in `syscall`,
+    /// and `running` once it is not blocked.
+    #[test]
+    fn a_thread_blocked_in_a_fault_shows_no_call() {
+        let (mut k, mut t, m) = setup();
+        let (child, ct, _cm) = fork(&mut k, &mut t, &m);
+        child.inbox.enter_kernel(crate::inbox::KernelEntry {
+            number: u64::MAX,
+            arguments: [0; 6],
+            stack_pointer: 0x7ff0,
+            instruction_pointer: 0x40_1000,
+        });
+        let path = format!("/proc/{}/syscall", ct.tid);
+        let flag = child.inbox.blocked_flag();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            read(&mut k, &mut t, &m, &path).unwrap(),
+            b"-1 0x7ff0 0x401000\n"
+        );
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(read(&mut k, &mut t, &m, &path).unwrap(), b"running\n");
     }
     #[test]
     fn a_parent_reads_its_child_s_maps_as_the_child_does_and_another_user_may_not() {

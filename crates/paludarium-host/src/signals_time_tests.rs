@@ -116,50 +116,61 @@ fn recorded_ntp_state_overrides_the_machines() {
     h.set_ntp_state(None);
     assert_eq!(h.ntp_state(), None);
 }
-/// A wait marks the attached flag while it lasts, a wait within another
-/// keeps it marked, and a thread with no flag attached marks nothing.
+/// A wait marks the attached flag from when it goes to sleep until it ends,
+/// a wait within another keeps it marked, and a wait with no flag attached,
+/// or after the attachment ended, marks nothing.
 #[test]
-fn waits_mark_the_attached_flag_while_they_last() {
+fn waits_mark_the_attached_flag_while_they_sleep() {
     use std::sync::Arc;
     std::thread::spawn(|| {
-        drop(blocked::Waiting::start());
         let flag = Arc::new(AtomicBool::new(false));
-        blocked::attach(&flag);
-        let outer = blocked::Waiting::start();
+        let mut early = blocked::Waiting::new();
+        early.sleep();
+        drop(early);
+        let attached = blocked::attach(&flag);
+        // Not asleep yet: not marked.
+        let mut outer = blocked::Waiting::new();
+        assert!(!flag.load(Ordering::SeqCst));
+        outer.sleep();
         assert!(flag.load(Ordering::SeqCst));
-        drop(blocked::Waiting::start());
+        let mut inner = blocked::Waiting::new();
+        inner.sleep();
+        drop(inner);
         assert!(
             flag.load(Ordering::SeqCst),
             "an inner wait leaves it marked"
         );
         drop(outer);
         assert!(!flag.load(Ordering::SeqCst));
-        // The host's own waits mark it, and not after they end.
-        let h = RecordingHost::new();
-        let seen = Arc::new(AtomicBool::new(false));
+        // A host's own wait marks it while it sleeps: another thread sees
+        // the mark, and only then ends the wait.
+        let h = Arc::new(RecordingHost::new());
+        let token = Arc::new(WaitToken::default());
         let watcher = {
-            let (flag, seen) = (Arc::clone(&flag), Arc::clone(&seen));
+            let (flag, token, h) = (Arc::clone(&flag), Arc::clone(&token), Arc::clone(&h));
             std::thread::spawn(move || {
-                for _ in 0..10_000 {
-                    if flag.load(Ordering::SeqCst) {
-                        seen.store(true, Ordering::SeqCst);
-                        return;
-                    }
+                while !flag.load(Ordering::SeqCst) {
                     std::thread::yield_now();
                 }
+                h.wake(&token);
             })
         };
-        let _ = h.wait_until(ClockId::Monotonic, 1_000_000_000, &AtomicBool::new(false));
+        let outcome = h.wait_on(&token, 0, None, &AtomicBool::new(false));
+        assert_eq!(outcome, Ok(WaitOutcome::Complete));
         watcher.join().unwrap();
-        assert!(seen.load(Ordering::SeqCst));
         assert!(!flag.load(Ordering::SeqCst));
+        // Once the attachment ends, a wait marks nothing.
+        drop(attached);
+        let mut after = blocked::Waiting::new();
+        after.sleep();
+        assert!(!flag.load(Ordering::SeqCst));
+        drop(after);
         // Attaching another replaces it.
         let other = Arc::new(AtomicBool::new(false));
-        blocked::attach(&other);
-        drop(blocked::Waiting::start());
-        let marked = blocked::Waiting::start();
+        let _attached = blocked::attach(&other);
+        let mut marked = blocked::Waiting::new();
+        marked.sleep();
         assert!(other.load(Ordering::SeqCst) && !flag.load(Ordering::SeqCst));
-        drop(marked);
     })
     .join()
     .unwrap();

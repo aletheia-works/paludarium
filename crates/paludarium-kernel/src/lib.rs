@@ -825,7 +825,7 @@ impl Kernel {
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // As in `handle`: a wait here shows the thread asleep.
-        paludarium_host::blocked::attach(self.inbox.blocked_flag());
+        let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         // A traced thread's clone goes on once the new task has started.
         if thread.state.ptrace.hold {
             return Next::Resume;
@@ -1072,7 +1072,7 @@ impl Kernel {
     pub fn handle(&mut self, thread: &mut Thread, mem: &AddressSpace, reason: ExitReason) -> Next {
         // What it waits for in the host while it handles the stop shows it
         // as sleeping (`/proc/<pid>/stat`), and nothing else does.
-        paludarium_host::blocked::attach(self.inbox.blocked_flag());
+        let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         // `orig_rax`: the call it enters, as it entered it, or -1.
         let orig_rax = if matches!(reason, ExitReason::Syscall { .. }) {
             thread.cpu.gpr[reg::RAX]

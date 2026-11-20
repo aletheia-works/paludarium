@@ -3035,8 +3035,8 @@ fn detach() {
     thread.join().unwrap();
     g.say("detach-exit", Tracer::code(status));
     let (ready_read, ready_write) = g.pipe();
-    // A child any task may trace, which waits in pause until SIGUSR2: its
-    // exit code is whether SIGUSR1 came.
+    // A child any task may trace, which waits in rt_sigsuspend until
+    // SIGUSR2, blocked outside it: its exit code is whether SIGUSR1 came.
     let traceable = move |c: &mut Tracee| {
         c.catch(SIGUSR1, 0);
         c.catch(SIGUSR2, 0);

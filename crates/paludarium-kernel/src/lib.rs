@@ -300,6 +300,13 @@ pub struct ThreadState {
     /// The syscall now returning, when Linux would run it again (rather than
     /// fail it with EINTR) if the signal that interrupted it runs no handler.
     pub(crate) restart: Option<u64>,
+    /// The call a group stop rewound to run again, with its
+    /// `seccomp_restart` and whether a tracer left it no restart after a
+    /// handler (`ERESTARTNOHAND`), until the stop ends: a handler that runs
+    /// as it ends makes the call fail with EINTR instead, unless the handler
+    /// runs it again, as Linux decides the restart only once `get_signal`
+    /// has gone on past the stop ([`Kernel::checkpoint`]).
+    pub(crate) stop_rewound: Option<(u64, Option<bool>, bool)>,
     /// `rax` as the syscall now returning found it, upper half and all:
     /// Linux's `orig_ax`, which a restart of that same call puts back.
     pub(crate) syscall_rax: u64,
@@ -835,6 +842,7 @@ impl Kernel {
             no_handler: false,
             traced: false,
         };
+        let mut rewound = thread.state.stop_rewound.take();
         if self.group.retired(thread.tid) {
             return Next::Exit(ExitStatus::Exited(0));
         }
@@ -924,7 +932,7 @@ impl Kernel {
                 if let Some(mask) = thread.state.wait_restore_mask.take() {
                     thread.state.signal_mask = mask;
                 }
-                Self::rewind_restart(thread, restart.number);
+                Self::stop_rewind(thread, &restart, rewound);
                 return Next::Stopped;
             }
             if action.handler == 0 || signal.number == 9 {
@@ -934,6 +942,18 @@ impl Kernel {
             // A handler ends any restart, as Linux's signal frame setup sets
             // restart_block to do_no_restart_syscall.
             thread.state.restart_block = None;
+            // A call the stop that just ended rewound fails with EINTR when
+            // the handler would not run it again, as below.
+            if let Some((number, seccomp, no_handler)) = rewound.take()
+                && !restart.traced
+                && (no_handler
+                    || seccomp != Some(true)
+                        && (action.flags & signals::SA_RESTART == 0
+                            || seccomp.is_none() && !signals::restarts_with_handler(number)))
+            {
+                thread.cpu.rip = paludarium_types::GuestAddr(thread.cpu.rip.0 + 2);
+                thread.cpu.gpr[reg::RAX] = paludarium_types::Errno(4).to_syscall_return();
+            }
             // With SA_RESTART the frame resumes at the syscall instruction,
             // so the call runs again when the handler returns.
             if !restart.no_handler
@@ -1002,7 +1022,9 @@ impl Kernel {
         }
         // A call a ptrace stop interrupted runs again when no handler
         // runs, as after any stop.
-        if thread.state.stopped || restart.traced {
+        if thread.state.stopped {
+            Self::stop_rewind(thread, &restart, rewound);
+        } else if restart.traced {
             Self::rewind_restart(thread, restart.number);
         }
         if thread.state.stopped {
@@ -1012,11 +1034,32 @@ impl Kernel {
         }
     }
 
+    /// Rewinds the call a group stop interrupted ([`Self::rewind_restart`])
+    /// and keeps it, or the one an earlier checkpoint of the same stop
+    /// rewound, in `stop_rewound` for the checkpoint that ends the stop:
+    /// the restart as the call left it or a tracer that stopped the thread
+    /// first left it. Not once a tracer has seen the rewound registers.
+    fn stop_rewind(
+        thread: &mut Thread,
+        restart: &ptrace::Restart,
+        rewound: Option<(u64, Option<bool>, bool)>,
+    ) {
+        thread.state.stop_rewound = if Self::rewind_restart(thread, restart.number) {
+            restart
+                .number
+                .map(|number| (number, restart.seccomp, restart.no_handler))
+        } else if restart.traced {
+            None
+        } else {
+            rewound
+        };
+    }
+
     /// Runs a syscall interrupted with EINTR again, as Linux restarts
     /// ERESTARTSYS and ERESTARTNOHAND after a stop (which runs no handler)
     /// and ERESTARTSYS after a SA_RESTART handler: the syscall instruction
     /// is re-executed, from the handler's frame in the second case.
-    fn rewind_restart(thread: &mut Thread, restart: Option<u64>) {
+    fn rewind_restart(thread: &mut Thread, restart: Option<u64>) -> bool {
         if let Some(number) = restart
             && thread.cpu.gpr[reg::RAX] == paludarium_types::Errno(4).to_syscall_return()
             && let Some(rip) = thread.cpu.rip.0.checked_sub(2)
@@ -1030,7 +1073,9 @@ impl Kernel {
             } else {
                 number
             };
+            return true;
         }
+        false
     }
 
     /// Whether the access a fault stopped can be made now.

@@ -5173,7 +5173,10 @@ one only with an `--allow-net`.
   it returns, as on Linux, except `pause`, `rt_sigsuspend`, `msgsnd`,
   `msgrcv`, `poll`, `ppoll`, `select`, `pselect6` and a socket call, or a
   `sendfile` into a socket, whose wait `SO_RCVTIMEO` or `SO_SNDTIMEO` limits,
-  which give `EINTR`.
+  which give `EINTR`. A signal with a handler that is pending as the stop ends,
+  such as one sent right after the `SIGCONT`, is taken then, as Linux's
+  `get_signal` goes on past the stop: the call ends as that handler decides,
+  `pause` with `EINTR`.
   `epoll_wait`, `epoll_pwait`, `epoll_pwait2` and `rt_sigtimedwait` give
   `EINTR`, as on Linux. `rt_sigsuspend` waits with its mask in place of the signal mask until a
   handler has run, which runs with that mask; the original mask is back after

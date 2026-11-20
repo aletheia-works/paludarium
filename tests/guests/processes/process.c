@@ -6666,6 +6666,99 @@ static int traced_rusage_case(void) {
     result("parent-reaped", WIFEXITED(status) && WEXITSTATUS(status) == 0);
     return 0;
 }
+
+/* The stop-cont-handler case: a child in pause() is stopped, then gets
+   SIGCONT and SIGUSR2, which it has a handler for, back to back. Linux's
+   get_signal goes on past the stop and takes SIGUSR2, so pause fails with
+   EINTR once the handler has run, wherever SIGUSR2 lands, rather than
+   running again. The first part sends SIGCONT and SIGUSR2 once the stop is
+   reported; the second sends SIGSTOP, SIGCONT and SIGUSR2 at once; in the
+   third the child enters the stop as a seized tracee, which is detached
+   while it stays stopped. The child exits 0 for EINTR with the handler run
+   once. */
+static volatile sig_atomic_t sc_handled;
+static void sc_on_usr2(int sig) {
+    (void)sig;
+    sc_handled++;
+}
+/* Waits until `pid` is in pause() (call 34 in its syscall file). */
+static void sc_pausing(pid_t pid) {
+    char path[64], text[64];
+    snprintf(path, sizeof path, "/proc/%d/syscall", pid);
+    for (int i = 0; i < 5000; i++) {
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (n > 3 && !memcmp(text, "34 ", 3)) return;
+        usleep(1000);
+    }
+}
+/* The exit code of `pid`, 100 + the signal that ended it, or -1 when it has
+   not ended within 5 s (it is killed then). */
+static int sc_reap(pid_t pid) {
+    int status;
+    for (int i = 0; i < 5000; i++) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r < 0) return -2;
+        if (r == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status);
+        usleep(1000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    return -1;
+}
+static int stop_cont_handler_case(void) {
+    static const char *const names[] = {"after-stop", "back-to-back", "after-detach"};
+    for (int part = 0; part < 3; part++) {
+        const char *name = names[part];
+        int ready[2];
+        if (pipe(ready)) return 1;
+        pid_t pid = child();
+        if (pid < 0) return 2;
+        if (pid == 0) {
+            close(ready[0]);
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_handler = sc_on_usr2;
+            sigemptyset(&sa.sa_mask);
+            if (sigaction(SIGUSR2, &sa, NULL)) _exit(90);
+            if (write(ready[1], "r", 1) != 1) _exit(91);
+            long r = syscall(SYS_pause);
+            int error = errno;
+            if (r != -1) _exit(92);
+            if (error != EINTR) _exit(93);
+            _exit(sc_handled == 1 ? 0 : 94);
+        }
+        close(ready[1]);
+        char byte;
+        if (read(ready[0], &byte, 1) != 1) return 3;
+        close(ready[0]);
+        sc_pausing(pid);
+        int status;
+        if (part == 2) {
+            /* PTRACE_SEIZE, the SIGSTOP given back with PTRACE_CONT, the
+               group stop (PTRACE_EVENT_STOP), then PTRACE_DETACH. */
+            if (syscall(SYS_ptrace, 0x4206, pid, 0, 0)) return 7;
+            if (kill(pid, SIGSTOP)) return 4;
+            if (waitpid(pid, &status, 0) != pid) return 8;
+            printf("%s-signal=%d\n", name, WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
+            if (syscall(SYS_ptrace, 7 /* PTRACE_CONT */, pid, 0, SIGSTOP)) return 9;
+            if (waitpid(pid, &status, 0) != pid) return 10;
+            printf("%s-group-stop=%d event=%d\n", name, WIFSTOPPED(status) ? WSTOPSIG(status) : -1,
+                   status >> 16);
+            if (syscall(SYS_ptrace, 17 /* PTRACE_DETACH */, pid, 0, 0)) return 11;
+        } else {
+            if (kill(pid, SIGSTOP)) return 4;
+            if (!part) {
+                if (waitpid(pid, &status, WUNTRACED) != pid) return 5;
+                printf("%s-stopped=%d\n", name, WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
+            }
+        }
+        if (kill(pid, SIGCONT) || kill(pid, SIGUSR2)) return 6;
+        printf("%s-exit=%d\n", name, sc_reap(pid));
+    }
+    return 0;
+}
 static int maxrss_exec(const char *start, const char *children) {
     long kept = mr_get(RUSAGE_SELF);
     printf("after exec: self+%ld children-same=%d\n", hw_mib(kept - atol(start)),
@@ -32845,6 +32938,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();
+    if (!strcmp(mode, "stop-cont-handler")) return stop_cont_handler_case();
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();

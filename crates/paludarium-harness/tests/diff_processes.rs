@@ -816,6 +816,7 @@ mod linux {
         processes_etxtbsy => ("etxtbsy","process"),
         processes_shm => ("shm","process"),
         processes_traced_rusage => ("traced-rusage","process"),
+        processes_stop_cont_handler => ("stop-cont-handler","process"),
         processes_sem => ("sem","process"),
         processes_msg => ("msg","process"),
         processes_ipc_sysctl => ("ipc-sysctl","process"),

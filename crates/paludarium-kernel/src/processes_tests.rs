@@ -1015,6 +1015,87 @@ mod process {
         );
     }
     #[test]
+    fn a_handler_as_a_stop_ends_decides_the_restart() {
+        // A call a stop interrupted is rewound to run again, but a signal
+        // with a handler that comes with the SIGCONT is taken as the stop
+        // ends, as Linux's get_signal goes on past do_signal_stop: pause,
+        // and read with a handler that lacks SA_RESTART, return EINTR; read
+        // with SA_RESTART runs again.
+        for (number, restart, restarted) in [
+            (34, false, false),
+            (34, true, false),
+            (0, false, false),
+            (0, true, true),
+        ] {
+            let (mut k, mut t, m) = setup();
+            let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+            assert_eq!(syscall(&mut c, &mut ct, &cm, 293, [DATA, 0, 0, 0, 0, 0]), 0);
+            let fd = cm.read_u64(GuestAddr(DATA)).unwrap() & 0xffff_ffff;
+            let pid = u64::from(ct.tid);
+            ct.state.signal_actions.insert(
+                10,
+                crate::SignalAction {
+                    handler: 0x40_2000,
+                    flags: 0x0400_0000 | if restart { 0x1000_0000 } else { 0 },
+                    restorer: 0x40_3000,
+                    mask: 0,
+                },
+            );
+            assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 19, 0, 0, 0, 0]), 0);
+            ct.cpu.rip = GuestAddr(0x40_1002);
+            syscall(&mut c, &mut ct, &cm, number, [fd, DATA + 64, 1, 0, 0, 0]);
+            assert_eq!(ct.cpu.rip, GuestAddr(0x40_1000), "{number} {restart}");
+            assert!(c.group.is_stopped());
+            // Still stopped: a checkpoint keeps the call rewound.
+            assert_eq!(c.checkpoint(&mut ct, &cm), Next::Stopped);
+            assert_eq!(ct.cpu.rip, GuestAddr(0x40_1000));
+            assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+            assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 10, 0, 0, 0, 0]), 0);
+            assert_eq!(c.checkpoint(&mut ct, &cm), Next::Resume);
+            assert_eq!(ct.cpu.rip, GuestAddr(0x40_2000), "{number} {restart}");
+            let saved = &ct.state.frames.last().unwrap().cpu;
+            assert_eq!(
+                (saved.rip, saved.gpr[reg::RAX]),
+                if restarted {
+                    (GuestAddr(0x40_1000), number)
+                } else {
+                    (GuestAddr(0x40_1002), Errno(4).to_syscall_return())
+                },
+                "{number} {restart}"
+            );
+        }
+    }
+    #[test]
+    fn a_stop_that_ends_with_no_handler_runs_the_call_again() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let pid = u64::from(ct.tid);
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 19, 0, 0, 0, 0]), 0);
+        ct.cpu.rip = GuestAddr(0x40_1002);
+        syscall(&mut c, &mut ct, &cm, 34, [0; 6]);
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+        assert_eq!(c.checkpoint(&mut ct, &cm), Next::Resume);
+        assert_eq!(
+            (ct.cpu.rip, ct.cpu.gpr[reg::RAX]),
+            (GuestAddr(0x40_1000), 34)
+        );
+        assert_eq!(ct.state.stop_rewound, None);
+        // A handler later finds nothing to undo: it runs from the call.
+        ct.state.signal_actions.insert(
+            10,
+            crate::SignalAction {
+                handler: 0x40_2000,
+                flags: 0x0400_0000,
+                restorer: 0x40_3000,
+                mask: 0,
+            },
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 10, 0, 0, 0, 0]), 0);
+        assert_eq!(c.checkpoint(&mut ct, &cm), Next::Resume);
+        let saved = &ct.state.frames.last().unwrap().cpu;
+        assert_eq!((saved.rip, saved.gpr[reg::RAX]), (GuestAddr(0x40_1000), 34));
+    }
+    #[test]
     fn sa_restart_handler_restarts_only_errestartsys_calls() {
         // A handler with SA_RESTART leaves a frame that runs read and recv
         // again (rax back to the number, rip at the syscall instruction),

@@ -4498,6 +4498,9 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `SA_RESTART` を付けたハンドラが動いたときは、Linux と同じく、ハンドラから戻った後に、停止の後にやり直す呼び出し（`read` から時間制限なしの `futex` の待ちまで）をやり直します。
   ただし `pause`、`rt_sigsuspend`、`msgsnd`、`msgrcv`、`poll`、`ppoll`、`select`、`pselect6` と、`SO_RCVTIMEO` や `SO_SNDTIMEO`
   で待ちに時間制限のあるソケットの呼び出しと、そうしたソケットへの `sendfile` は、`EINTR` を返します。
+  停止が終わるときに保留中の、ハンドラのあるシグナル（`SIGCONT` のすぐ後に送られたものなど）は、
+  Linux の `get_signal` が停止の後も続けるのと同じく、そのときに受け取ります。呼び出しはそのハンドラに
+  従って終わり、`pause` は `EINTR` を返します。
   `epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。
   ハンドラはそのマスクで動き、終わると元のマスクに戻ります。

@@ -8676,6 +8676,7 @@ fn dev_shm_is_a_tmpfs_from_start_up() {
     let mut f = fixture();
     let out = DATA + 0x400;
     let shm = put(&mut f, 0, b"/dev/shm");
+    let shm_path = put(&mut f, 0x180, b"/dev/shm");
     assert_eq!(f.ret(137, &[shm, out]), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(out)).unwrap(), 0x0102_1994);
     assert_eq!(f.mem.read_u64(GuestAddr(out + 80)).unwrap(), 0x26);
@@ -8732,6 +8733,23 @@ fn dev_shm_is_a_tmpfs_from_start_up() {
     );
     // `/dev/shm`'s parent is `/dev`.
     assert_eq!(shm.split(' ').nth(1), dev.split(' ').next());
+    // Once unmounted, it is neither there nor listed.
+    let listed = |f: &mut Fixture| {
+        let dev = put(f, 0x140, b"/dev");
+        let dir = f.ret(2, &[dev, 0o200000]);
+        let n = f.ret(217, &[dir, DATA + 0x1000, 0x1000]);
+        let mut b = vec![0; usize::try_from(n).unwrap()];
+        f.mem.read(GuestAddr(DATA + 0x1000), &mut b).unwrap();
+        assert_eq!(f.ret(3, &[dir]), 0);
+        b.windows(4).any(|w| w == b"shm\0")
+    };
+    assert!(listed(&mut f));
+    // Busy while a file on it is open, as on Linux.
+    assert_eq!(f.ret(166, &[shm_path, 0]), -16i64 as u64);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(166, &[shm_path, 0]), 0);
+    assert_eq!(f.ret(4, &[shm_path, out]), ENOENT);
+    assert!(!listed(&mut f));
 }
 
 /// A read-only mount refuses what writes, in Linux's order; remounts and

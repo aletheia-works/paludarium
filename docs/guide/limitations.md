@@ -680,8 +680,8 @@ verified.
   privileged owner a bind mount of `/dev` is `EINVAL`, as Linux refuses
   it for its locked `/dev/shm`, but one of `/proc` or `/dev/pts` is made,
   where Linux refuses it for its locked mounts below (`EINVAL`). Once
-  `/dev/shm` is unmounted, its name is not found there (`ENOENT`), where
-  Linux shows devtmpfs's empty directory. A file system context makes
+  `/dev/shm` is unmounted, its name is not found there (`ENOENT`) nor
+  listed in `/dev`, where Linux shows devtmpfs's empty directory. A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
   parameters and of a reconfiguration; one of a superblock from start-up
   takes only the common flags (`ro`, `sync`, ...). A context keeps its

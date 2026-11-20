@@ -2520,7 +2520,9 @@ fn directory_entries(
         Some(crate::proc::OwnEntry::DescriptorInfos) => descriptor_entries(c, true),
         Some(crate::proc::OwnEntry::Directory) => own_entries(),
         _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Directory) => {
-            crate::devices::entries(c.files.fs().metadata(b"/", true)?.inode)
+            // `shm` while the mount table has it (none once unmounted).
+            let shm = c.files.namespaced().metadata(b"/dev/shm", true).is_ok();
+            crate::devices::entries(c.files.fs().metadata(b"/", true)?.inode, shm)
         }
         _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Mqueue) => {
             crate::mqueue::mounted_entries(c, crate::devices::directory_stat().inode)

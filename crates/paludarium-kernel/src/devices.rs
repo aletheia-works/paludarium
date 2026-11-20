@@ -145,8 +145,8 @@ pub(crate) fn stat(entry: Entry) -> FileStat {
     }
 }
 /// `/dev`'s entries: `.`, `..` (the root, with inode `root`), then the
-/// devices and links by name.
-pub(crate) fn entries(root: u64) -> Vec<DirectoryEntry> {
+/// devices and links by name, with `shm` while a mount is there (`shm`).
+pub(crate) fn entries(root: u64, shm: bool) -> Vec<DirectoryEntry> {
     const DT_CHR: u8 = 2;
     const DT_DIR: u8 = 4;
     const DT_LNK: u8 = 10;
@@ -160,8 +160,8 @@ pub(crate) fn entries(root: u64) -> Vec<DirectoryEntry> {
     });
     // `shm`, which the tmpfs on `/dev/shm` is mounted on: a directory of
     // the kernel's own, past its devices' inodes.
-    let shm = (&b"shm"[..], NAMES.len() as u64 + 2, DT_DIR);
-    let mut named: Vec<_> = named.chain([shm]).collect();
+    let shm = shm.then_some((&b"shm"[..], NAMES.len() as u64 + 2, DT_DIR));
+    let mut named: Vec<_> = named.chain(shm).collect();
     named.sort_by_key(|&(name, ..)| name);
     [(&b"."[..], DIRECTORY_INODE, DT_DIR), (b"..", root, DT_DIR)]
         .into_iter()
@@ -326,7 +326,8 @@ mod device_tests {
         );
         assert_eq!(through_link(b"/dev/fd"), None);
         assert_eq!(through_link(b"/dev/fdx/3"), None);
-        let listed = entries(7);
+        assert!(!entries(7, false).iter().any(|e| e.name == b"shm"));
+        let listed = entries(7, true);
         let names: Vec<_> = listed.iter().map(|e| e.name.clone()).collect();
         assert_eq!(
             names[..4],

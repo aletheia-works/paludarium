@@ -484,6 +484,11 @@ pub(crate) fn sys_bpf(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// Linux's `__sys_bpf`: the size (`bpf_check_uarg_tail_zero`: more than a
 /// page, or bytes past the union that are not 0, `E2BIG`), the copy
 /// (`EFAULT`), then the command.
+///
+/// A command with master's `BPF_COMMON_ATTRS` (bit 16), whose `struct
+/// bpf_common_attr` comes in the fourth and fifth arguments, is a number
+/// with no command, `EINVAL`, as on the test machines' Linux 7.0, which
+/// has no such flag; master would run the command.
 fn dispatch(c: &mut Context<'_>, command: u32, at: u64, size: u32) -> Result<u64, Errno> {
     let size = size as usize;
     if size > PAGE_SIZE as usize {

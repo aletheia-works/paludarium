@@ -60,6 +60,7 @@
 #define MAP_LOOKUP_AND_DELETE_BATCH 25
 #define MAP_UPDATE_BATCH 26
 #define MAP_DELETE_BATCH 27
+#define COMMON_ATTRS (1 << 16)
 
 #define TYPE_HASH 1
 #define TYPE_ARRAY 2
@@ -141,6 +142,11 @@ static long bpf(int cmd, void *attr, unsigned size) {
     return result < 0 ? -errno : result;
 }
 
+static long bpf_common(int cmd, void *attr, unsigned size, void *common, unsigned common_size) {
+    long result = syscall(SYS_bpf, cmd, attr, size, common, common_size);
+    return result < 0 ? -errno : result;
+}
+
 static union attr map_attr(uint32_t type, uint32_t key, uint32_t value, uint32_t entries, uint32_t flags) {
     union attr a;
     memset(&a, 0, sizeof a);
@@ -219,6 +225,20 @@ static int case_calls(void) {
     big[199] = 1;
     say("size 200 tail %ld", bpf(MAP_CREATE, big, 200));
     say("size 4 %ld", bpf(MAP_CREATE, &a, 4));
+
+    /* Master's BPF_COMMON_ATTRS (1 << 16): a struct bpf_common_attr
+       (log_buf, log_size, log_level, log_true_size) in the fourth and
+       fifth arguments. Linux 7.0 has no such flag, so the command is a
+       number with no command, after the size and the copy. */
+    uint64_t common[3] = {0, 0, 0};
+    say("common attrs none %ld", bpf_common(MAP_CREATE | COMMON_ATTRS, &a, sizeof a, NULL, 0));
+    say("common attrs given %ld",
+        bpf_common(MAP_CREATE | COMMON_ATTRS, &a, sizeof a, common, sizeof common));
+    say("common attrs fault %ld",
+        bpf_common(MAP_CREATE | COMMON_ATTRS, NULL, sizeof a, common, sizeof common));
+    say("common attrs past a page %ld", bpf_common(MAP_CREATE | COMMON_ATTRS, &a, 4097, NULL, 0));
+    say("common attrs get next id %ld",
+        bpf_common(MAP_GET_NEXT_ID | COMMON_ATTRS, &a, sizeof a, NULL, 0));
 
     create("unspecified type", map_attr(0, 4, 8, 4, 0));
     create("unknown type", map_attr(1000, 4, 8, 4, 0));

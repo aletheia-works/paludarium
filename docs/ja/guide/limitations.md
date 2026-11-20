@@ -328,7 +328,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   link、アタッチ、ピン（`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID
   （`BPF_PROG_GET_NEXT_ID`、`BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、
   Linux にあってここにないコマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と
-  同じく `EINVAL` です。そのため libbpf の最小のプログラムでの確認はソケットフィルターを
+  同じく `EINVAL` です。master の `BPF_COMMON_ATTRS`（ビット 16）を立てたコマンドも、試験機の
+  Linux 7.0 にはこのフラグがないので `EINVAL` です。master は 4 番目と 5 番目の引数から
+  `struct bpf_common_attr` を読み、コマンドを実行します。そのため libbpf の最小のプログラムでの確認はソケットフィルターを
   読み込み、ほかのプログラムの型は見つけません。`bpftool feature` はソケットフィルターと、
   検証器が確かめるヘルパーだけを見つけます。ほかのマップの型は、それを組み込まずにビルドした
   カーネルと同じく `EINVAL` です。

@@ -247,6 +247,51 @@ fn id(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fd: u64) -> u32 {
 }
 
 #[test]
+fn a_command_with_master_s_common_attributes_is_no_command() {
+    // BPF_COMMON_ATTRS (1 << 16) is master's; Linux 7.0 has no such flag,
+    // so the command is a number with no command, even with a struct
+    // bpf_common_attr in the fourth and fifth arguments.
+    let (mut k, mut t, m) = setup();
+    let einval = errno(Errno::EINVAL);
+    let attr = map(ARRAY, 4, 8, 4, 0);
+    assert_eq!(bpf(&mut k, &mut t, &m, MAP_CREATE | 1 << 16, &attr), einval);
+    m.write(GuestAddr(ATTR), &[0; 168]).unwrap();
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            BPF,
+            [MAP_CREATE | 1 << 16, ATTR, 168, ATTR, 24, 0]
+        ),
+        einval
+    );
+    // The size and the copy still come first.
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            BPF,
+            [MAP_CREATE | 1 << 16, ATTR, 4097, 0, 0, 0]
+        ),
+        errno(E2BIG)
+    );
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            BPF,
+            [MAP_CREATE | 1 << 16, 0, 168, 0, 0, 0]
+        ),
+        errno(Errno::EFAULT)
+    );
+    // Without the flag, the same attribute makes the map.
+    assert!(create(&mut k, &mut t, &m, attr) < 1 << 31);
+}
+
+#[test]
 fn map_create_refuses_each_attribute_linux_refuses() {
     let (mut k, mut t, m) = setup();
     let einval = errno(Errno::EINVAL);

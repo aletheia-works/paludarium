@@ -925,9 +925,10 @@ kernel.
   `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
   memory stays in place without more being done.
 
-- `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
-  as zeros, and those of a file mapping read the file again, as it is then,
-  as Linux faults them in from the file; this holds
+- `madvise`: `MADV_DONTNEED` empties private pages and drops their entries.
+  Anonymous ones then read as zeros, and those of a file mapping read the
+  file again at their next access, as it is then, as Linux faults them in
+  from the file; this holds
   after `mremap` moves the mapping and in a `fork`ed child. The program's own
   segments are laid out as Linux lays them out: the pages that hold file
   data are a file mapping and read the executable again, also those of a
@@ -3580,7 +3581,9 @@ kernel.
   aligned block of 16, or from the VMA's start if that is later, within
   the VMA, its page table and the file, and only pages the page cache
   holds: a memfd's written pages, shared memory's that any process
-  touched, and every page of another file within its size. A page that
+  touched, and every page of another file within its size. A loaded
+  program's segments, whose pages are all there from the load, are mapped
+  around too once `MADV_DONTNEED` dropped their pages. A page that
   has an entry or a marker keeps it. System V shared memory and secret
   memory map none around, as Linux's have no `map_pages`, nor does a VMA
   that `userfaultfd` watches for writes or minor faults. The present bits of `pagemap`

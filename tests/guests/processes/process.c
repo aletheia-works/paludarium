@@ -6145,11 +6145,20 @@ static void pm_show(int fd, const char *label, void *at, int pages) {
     printf("\n");
 }
 
+/* Whether each of `pages` pages from `at` is present (bit 63). */
+static void pm_present(int fd, const char *label, const void *at, int pages) {
+    uint64_t entries[16] = {0};
+    ssize_t n = pread(fd, entries, (size_t)pages * 8, (off_t)((uintptr_t)at / 4096 * 8));
+    printf("%s:", label);
+    for (int i = 0; n > 0 && i < n / 8; i++) printf(" %d", (int)(entries[i] >> 63));
+    printf("\n");
+}
+
 /* /proc/self/pagemap: what each page table entry holds, as one 64-bit
    entry a page (present, swapped or a guard, file or anonymous, mapped
    only here, soft-dirty), and how it is read, and what MADV_DONTNEED does
-   to the entries of a shared file mapping and System V shared memory. The
-   frame numbers are 0, as for any reader without CAP_SYS_ADMIN. */
+   to the entries of a shared file mapping, System V shared memory and a
+   loaded program's segment. The frame numbers are 0, as for any reader without CAP_SYS_ADMIN. */
 static int pagemap_case(void) {
     long page = 4096;
     /* Run as root, it becomes an unprivileged user first, so that Linux and
@@ -6263,6 +6272,18 @@ static int pagemap_case(void) {
     printf("sysv-kept=%c\n", segment[0]);
     shmdt(segment);
     close(file);
+
+    /* MADV_DONTNEED of a loaded program's pages, here of its read-only
+       data, leaves no entry until an access reads the file again. Only
+       whether each page is present is shown. */
+    static const char rodata[3 * 4096] __attribute__((aligned(4096))) = {1, [4096] = 2, [8192] = 3};
+    volatile const char *ro = rodata;
+    seen = (char)(ro[0] + ro[page] + ro[2 * page]);
+    pm_present(fd, "segment", rodata, 3);
+    printf("segment-dontneed=%d\n", madvise((void *)(rodata + page), (size_t)page, MADV_DONTNEED));
+    pm_present(fd, "segment-dropped", rodata, 3);
+    printf("segment-read=%d\n", ro[page]);
+    pm_present(fd, "segment-again", rodata, 3);
 
     /* Whole entries only, from any position; a read past its end is 0. */
     uint64_t entry = 0;

@@ -1459,15 +1459,19 @@ fn wp_async_writes_clear_the_protection_of_any_memory() {
     m.read(page(2), &mut b).unwrap();
     assert_eq!(b, *b"f");
     assert_eq!(state(2), pagemap::PRESENT | pagemap::UFFD_WP);
-    // A discard keeps the protection of the protected pages only, whose
-    // file it reads again (`Self::refill`), as Linux's markers fault in.
+    // A discard drops every entry and keeps the protection of the
+    // protected pages only, as markers (`zap_install_uffd_wp_if_needed`).
+    // An access reads the file again.
     m.discard_shared(GuestAddr(at), 4 * PAGE_SIZE).unwrap();
-    assert_eq!(state(0), pagemap::PRESENT);
-    assert_eq!(state(1), pagemap::PRESENT);
-    assert_eq!(state(2), pagemap::PRESENT | pagemap::UFFD_WP);
-    assert_eq!(state(3), pagemap::PRESENT | pagemap::UFFD_WP);
+    assert_eq!(state(0), 0);
+    assert_eq!(state(1), 0);
+    assert_eq!(state(2), pagemap::SWAP | pagemap::UFFD_WP);
+    assert_eq!(state(3), pagemap::SWAP | pagemap::UFFD_WP);
     m.read(page(0), &mut b).unwrap();
     assert_eq!(b, *b"f");
+    assert_eq!(state(0), pagemap::PRESENT);
+    m.read(page(3), &mut b).unwrap();
+    assert_eq!(state(3), pagemap::PRESENT | pagemap::UFFD_WP);
     m.write(page(2), b"c").unwrap();
     assert_eq!(state(2), pagemap::PRESENT);
     // A fill is not for a file's memory.

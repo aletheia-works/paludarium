@@ -67,10 +67,7 @@ verified.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
-  written, not until the page was. A page of a file's private mapping that
-  `MADV_DONTNEED` dropped is read from the file again at once, so it has
-  an entry (bit 63, and bit 57 if it was write-protected) where Linux has
-  none, or a uffd-wp marker, until an access. The frame number is 0 for every reader, also one
+  written, not until the page was. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
 - **`PAGEMAP_SCAN`, in part**:

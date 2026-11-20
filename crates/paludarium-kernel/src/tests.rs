@@ -8711,6 +8711,14 @@ fn dev_shm_is_a_tmpfs_from_start_up() {
     assert_eq!(f.ret(191, &[file, key, out, 16]), 1);
     assert_eq!(f.ret(87, &[file]), 0);
     assert_eq!(f.ret(4, &[file, out]), ENOENT);
+    // A link to `/dev` itself leads to the kernel's: a descriptor of it
+    // reads the links there.
+    let (to_dev, dev_link) = (put(&mut f, 0x1a0, b"/dev"), put(&mut f, 0x1c0, b"/tmp/d"));
+    assert_eq!(f.ret(88, &[to_dev, dev_link]), 0);
+    let dfd = f.ret(2, &[dev_link, 0o10_200_000, 0]);
+    assert!(dfd < 1024, "{dfd:#x}");
+    let fd_name = put(&mut f, 0x1e0, b"fd");
+    assert_eq!(f.ret(267, &[dfd, fd_name, out, 64]), 13);
     // Another name in `/dev` is still not there.
     let other = put(&mut f, 0xe0, b"/dev/nothing/x");
     assert_eq!(f.ret(4, &[other, out]), ENOENT);

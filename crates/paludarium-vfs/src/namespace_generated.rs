@@ -36,12 +36,20 @@ impl GeneratedSource {
 /// The stand-in a walk sees for a bind mount of a generated file: its root
 /// with the file's `stat` and, below a directory's, a directory at each
 /// name, so a walk goes through by the names alone and the kernel finds
-/// what is there; every other call on it is the kernel's.
+/// what is there; every other call on it is the kernel's. The kernel's own
+/// `/dev` ([`GeneratedSource::shallow`]) has nothing there at all
+/// (`ENOENT`), so a call reached through a link is the kernel's as before.
 #[derive(Debug)]
 pub(super) struct GeneratedFs(pub(super) GeneratedSource);
+impl GeneratedFs {
+    /// `error`, or `ENOENT` for the kernel's own `/dev`.
+    fn refused<T>(&self, error: Errno) -> Result<T, Errno> {
+        Err(if self.0.shallow { Errno::ENOENT } else { error })
+    }
+}
 impl HostFs for GeneratedFs {
     fn open(&self, _path: &[u8], _flags: u32, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
-        Err(Errno::EOPNOTSUPP)
+        self.refused(Errno::EOPNOTSUPP)
     }
     fn metadata(&self, path: &[u8], _follow: bool) -> Result<FileStat, Errno> {
         if path == self.0.path.as_slice() {
@@ -60,25 +68,78 @@ impl HostFs for GeneratedFs {
         }
     }
     fn mkdir(&self, _path: &[u8], _mode: u32) -> Result<(), Errno> {
-        Err(Errno::EOPNOTSUPP)
+        self.refused(Errno::EOPNOTSUPP)
     }
     fn unlink(&self, _path: &[u8], _directory: bool) -> Result<(), Errno> {
-        Err(Errno::EOPNOTSUPP)
+        self.refused(Errno::EOPNOTSUPP)
     }
     fn link(&self, _old: &[u8], _new: &[u8]) -> Result<(), Errno> {
-        Err(Errno::EOPNOTSUPP)
+        self.refused(Errno::EOPNOTSUPP)
     }
     fn symlink(&self, _target: &[u8], _path: &[u8]) -> Result<(), Errno> {
-        Err(Errno::EOPNOTSUPP)
+        self.refused(Errno::EOPNOTSUPP)
     }
     fn readlink(&self, _path: &[u8]) -> Result<Vec<u8>, Errno> {
-        Err(Errno::EINVAL)
+        self.refused(Errno::EINVAL)
     }
     fn rename(&self, _old: &[u8], _new: &[u8]) -> Result<(), Errno> {
-        Err(Errno::EOPNOTSUPP)
+        self.refused(Errno::EOPNOTSUPP)
+    }
+    fn rename_with(&self, _old: &[u8], _new: &[u8], flags: u32) -> Result<(), Errno> {
+        self.refused(if flags == 0 {
+            Errno::EOPNOTSUPP
+        } else {
+            Errno::EINVAL
+        })
     }
     fn read_dir(&self, _path: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
-        Err(Errno::ENOTDIR)
+        self.refused(Errno::ENOTDIR)
+    }
+    fn statfs(&self, _path: &[u8]) -> Result<FsStats, Errno> {
+        self.refused(Errno::ENOSYS)
+    }
+    fn make_socket(&self, _path: &[u8], _mode: u32) -> Result<FileStat, Errno> {
+        self.refused(Errno::EPERM)
+    }
+    fn make_fifo(&self, _path: &[u8], _mode: u32) -> Result<FileStat, Errno> {
+        self.refused(Errno::EPERM)
+    }
+    fn with_xattrs(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _f: &mut dyn FnMut(&mut paludarium_host::Xattrs),
+    ) -> Result<(), Errno> {
+        self.refused(Errno::EOPNOTSUPP)
+    }
+    fn with_attributes(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _f: &mut dyn FnMut(&mut u32),
+    ) -> Result<(), Errno> {
+        self.refused(Errno::EOPNOTSUPP)
+    }
+    fn set_mode(&self, _path: &[u8], _mode: u32) -> Result<(), Errno> {
+        self.refused(Errno::EPERM)
+    }
+    fn set_owner(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+    ) -> Result<(), Errno> {
+        self.refused(Errno::EPERM)
+    }
+    fn set_times(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _atime: Option<i128>,
+        _mtime: Option<i128>,
+    ) -> Result<(), Errno> {
+        self.refused(Errno::EPERM)
     }
 }
 impl FileSystem for GeneratedFs {}

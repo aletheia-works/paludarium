@@ -3663,8 +3663,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   VMA について書きます。アドレス、長さ、オフセット（ファイルのもの、プライベートな
   無名メモリーではアドレス）を、`MMAP2` ではさらにファイルのデバイスと inode、保護と
   共有、`d_path` が与える名前（`[heap]`、`[stack]`、`//anon`、共有の無名メモリーでは
-  `/dev/zero (deleted)`）を持ちます。`PERF_RECORD_COMM`（`comm`）は `PR_SET_NAME` と
-  `execve`（`PERF_RECORD_MISC_COMM_EXEC`）で書き、`execve` はそのあと新しい
+  `/dev/zero (deleted)`）を持ちます。`PERF_RECORD_COMM`（`comm`）は `PR_SET_NAME`、
+  `/proc/<pid>/comm` への書き込み（書き込んだスレッドを数えるイベントへ、名前を変えた
+  スレッドのものを）、`execve`（`PERF_RECORD_MISC_COMM_EXEC`）で書き、`execve` はそのあと新しい
   プログラムのスタックとマッピングを書きます。`PERF_RECORD_FORK` と `EXIT`
   （`task`、またはほかのどれか）は、スレッドが作られたときと終わったときに書きます。
   ディスクリプタのリンクは

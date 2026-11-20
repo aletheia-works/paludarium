@@ -4210,8 +4210,10 @@ kernel.
   memory), and for `MMAP2` its file's device and inode, its protection and
   sharing, and the name `d_path` gives (`[heap]`, `[stack]`, `//anon`,
   `/dev/zero (deleted)` for shared anonymous memory); `PERF_RECORD_COMM`
-  (`comm`) of `PR_SET_NAME` and of `execve` (`PERF_RECORD_MISC_COMM_EXEC`),
-  which then writes the new program's stack and mappings; and
+  (`comm`) of `PR_SET_NAME`, of a write to `/proc/<pid>/comm` (to the events
+  that count the writer, of the thread it renames) and of `execve`
+  (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
+  and mappings; and
   `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
   that is made or ends. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)

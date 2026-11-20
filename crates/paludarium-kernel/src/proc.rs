@@ -1069,19 +1069,25 @@ pub(crate) fn dentry(path: &[u8], own: u32, own_tid: u32) -> Option<Dentry> {
 }
 
 thread_local! {
-    /// The process and thread whose system call runs on this host thread,
-    /// which a write to `comm` and a read of `io` ask of their caller
-    /// (Linux's `current`).
-    static CALLER: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    /// The process, thread and CPU whose system call runs on this host
+    /// thread, which a write to `comm` and a read of `io` ask of their
+    /// caller (Linux's `current`, and `smp_processor_id` for the records a
+    /// write to `comm` gives perf events).
+    static CALLER: std::cell::Cell<(u32, u32, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
-/// Records, as a system call starts, the process `pid` and thread `tid` it
-/// is of.
-pub(crate) fn enter(pid: u32, tid: u32) {
-    CALLER.with(|caller| caller.set((pid, tid)));
+/// Records, as a system call starts, the process `pid`, thread `tid` and
+/// CPU `cpu` it is of.
+pub(crate) fn enter(pid: u32, tid: u32, cpu: u32) {
+    CALLER.with(|caller| caller.set((pid, tid, cpu)));
 }
 /// The process and thread of the system call running ([`enter`]).
 pub(crate) fn caller() -> (u32, u32) {
-    CALLER.with(std::cell::Cell::get)
+    let (pid, tid, _) = CALLER.with(std::cell::Cell::get);
+    (pid, tid)
+}
+/// The CPU of the system call running ([`enter`]).
+fn caller_cpu() -> u32 {
+    CALLER.with(std::cell::Cell::get).2
 }
 
 /// A file whose contents were fixed when it was opened.
@@ -1104,8 +1110,11 @@ pub(crate) struct GeneratedFile {
 /// `group`, as Linux's `comm_write`: it renames the thread to the first 15
 /// bytes, up to a NUL, when the writer is of the thread's process, `EINVAL`
 /// from any other and `ESRCH` once the thread is gone; the whole count is
-/// taken, and the file position stays where it was.
+/// taken, and the file position stays where it was. The rename then gives
+/// the perf events that count the writer a `PERF_RECORD_COMM` of the
+/// thread, as `__set_task_comm`'s `perf_event_comm` does.
 pub(crate) fn comm_writer(
+    processes: std::sync::Weak<crate::processes::Processes>,
     group: Arc<crate::threads::ThreadGroup>,
     pid: u32,
     tid: u32,
@@ -1125,6 +1134,24 @@ pub(crate) fn comm_writer(
             *to = from;
         }
         group.rename(tid, name);
+        if let Some(processes) = processes.upgrade()
+            && crate::perf::wanted(&processes.perf_events)
+        {
+            let (_, writer) = caller();
+            let who = crate::perf::Who {
+                pid,
+                tid: writer,
+                cpu: caller_cpu(),
+            };
+            crate::perf::comm(
+                &processes.perf_events,
+                &group,
+                &who,
+                (pid, tid),
+                &name,
+                false,
+            );
+        }
         Ok((b.len(), position))
     })
 }

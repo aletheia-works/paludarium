@@ -828,7 +828,12 @@ pub(super) fn text_file(
     std::sync::Arc::new(match entry {
         TaskEntry::Comm => {
             let (group, pid, tid) = comm(task);
-            file.writing(crate::proc::comm_writer(group, pid, tid))
+            file.writing(crate::proc::comm_writer(
+                std::sync::Arc::downgrade(c.processes),
+                group,
+                pid,
+                tid,
+            ))
         }
         TaskEntry::Cmdline => file.not_seq_opened(),
         _ => file,

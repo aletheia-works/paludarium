@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sched.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -1273,6 +1274,80 @@ static int case_side_band(void) {
     return 0;
 }
 
+/* The thread that writes the leader's `comm` in case_side_band_comm. */
+static void *rename_leader(void *with) {
+    const pid_t *ids = with;
+    char at[64];
+    snprintf(at, sizeof at, "/proc/%d/task/%d/comm", ids[0], ids[1]);
+    int to = open(at, O_WRONLY);
+    say("thread write %zd", write(to, "by-thread", 9));
+    close(to);
+    return NULL;
+}
+
+/* A COMM record of each write to `comm`: what was renamed in the record,
+   who wrote it after (sample_id_all), and which events it reached. */
+static void say_comm(const uint64_t *record, void *with) {
+    const pid_t *ids = with;
+    if ((uint32_t)record[0] != RECORD_COMM) {
+        say("record %u", (uint32_t)record[0]);
+        return;
+    }
+    unsigned misc = (unsigned)(record[0] >> 32) & 0xffff;
+    uint64_t size = record[0] >> 48;
+    const uint32_t *renamed = (const uint32_t *)(record + 1);
+    const uint32_t *writer = (const uint32_t *)((const char *)record + size - 8);
+    say("comm exec %d leader %d name %s by %s", !!(misc & MISC_DATA),
+        renamed[0] == (uint32_t)ids[0] && renamed[1] == (uint32_t)ids[1], (const char *)(record + 2),
+        writer[0] != (uint32_t)ids[0] ? "other" : writer[1] == (uint32_t)ids[1] ? "leader" : "thread");
+}
+
+static int case_side_band_comm(void) {
+    pid_t ids[2] = {getpid(), (pid_t)syscall(SYS_gettid)};
+    /* Pinned to CPU 0, as the inherited event is of that CPU only. */
+    cpu_set_t first;
+    CPU_ZERO(&first);
+    CPU_SET(0, &first);
+    sched_setaffinity(0, sizeof first, &first);
+    void *all, *leader;
+    int fd = open_side_band(0, 0, ATTR_COMM | INHERIT, &all);
+    int leader_fd = open_side_band(0, -1, ATTR_COMM, &leader);
+    say("open %d %d", fd >= 0, leader_fd >= 0);
+    if (fd < 0 || leader_fd < 0) return 1;
+    ioctl(fd, IOC_ENABLE, 0);
+    ioctl(leader_fd, IOC_ENABLE, 0);
+    int own = open("/proc/self/comm", O_WRONLY);
+    say("leader write %zd", write(own, "by-proc", 7));
+    close(own);
+    pthread_t thread;
+    pthread_create(&thread, NULL, rename_leader, ids);
+    pthread_join(thread, NULL);
+    /* Another process may not rename this one's threads: no record. */
+    pid_t child = fork();
+    if (child == 0) {
+        char at[64];
+        snprintf(at, sizeof at, "/proc/%d/comm", ids[0]);
+        int to = open(at, O_WRONLY);
+        ssize_t wrote = write(to, "by-child", 8);
+        _exit(wrote < 0 && errno == EINVAL ? 0 : 1);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    say("child status %d", status);
+    ioctl(fd, IOC_DISABLE, 0);
+    ioctl(leader_fd, IOC_DISABLE, 0);
+    char name[16] = {0};
+    prctl(PR_GET_NAME, name, 0, 0, 0);
+    say("name %s", name);
+    uint64_t tail = 0;
+    say("all:");
+    each_record(all, &tail, say_comm, ids);
+    say("leader only:");
+    tail = 0;
+    each_record(leader, &tail, say_comm, ids);
+    return 0;
+}
+
 static int case_side_band_exec(const char *self) {
     struct expected e;
     memset(&e, 0, sizeof e);
@@ -1324,6 +1399,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-sample")) return case_sample();
     if (!strcmp(mode, "perf-wakeup")) return case_wakeup();
     if (!strcmp(mode, "perf-side-band")) return case_side_band();
+    if (!strcmp(mode, "perf-side-band-comm")) return case_side_band_comm();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {

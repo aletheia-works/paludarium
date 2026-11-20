@@ -258,7 +258,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ごとに記録を一つ書きます。Linux は VMA を変えるたびに、そこまで合わさった VMA を
   書きます。ホストが始められなかったスレッドには `FORK` と `EXIT` の記録を書き、
   `EXIT` は CPU 0 のものとします。Linux の失敗した `clone` はどちらも書きません。
-  `/proc/<pid>/comm` への書き込みは、まだ `COMM` の記録を書きません。
   `NAMESPACES`、`CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
   `AUX` の記録は書かず、vDSO もないのでその記録もありません。そうしたときのオーバーフローは、
   `sigtrap` では SIGTRAP を一つ送ります。Linux はスレッドが自分のコードへ戻るたびに

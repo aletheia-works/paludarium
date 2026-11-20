@@ -21,6 +21,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1272,16 +1273,14 @@ static int case_side_band(void) {
     return 0;
 }
 
-static void readlink_self(char *out, size_t size) {
-    ssize_t n = readlink("/proc/self/exe", out, size - 1);
-    out[n < 0 ? 0 : n] = 0;
-}
-
 static int case_side_band_exec(const char *self) {
     struct expected e;
     memset(&e, 0, sizeof e);
-    char exe[4096];
-    readlink_self(exe, sizeof exe);
+    /* The program the child runs, by the path the kernel names it: the
+       emulator starts this one under another name than it gives the
+       child to run. */
+    char exe[PATH_MAX];
+    if (!realpath(self, exe)) snprintf(exe, sizeof exe, "%s", self);
     const char *base = strrchr(self, '/');
     e.self = base ? base + 1 : self;
     e.path = exe;

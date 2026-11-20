@@ -53,6 +53,8 @@ mod memfd;
 mod mempolicy;
 mod mounts;
 mod mqueue;
+#[cfg(test)]
+mod mqueue_tests;
 mod msg;
 mod namespaces;
 mod page_cache;

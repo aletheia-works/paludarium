@@ -6763,14 +6763,19 @@ static int traced_rusage_case(void) {
 }
 
 /* The stop-cont-handler case: a child in pause() is stopped, then gets
-   SIGCONT and SIGUSR2, which it has a handler for, back to back. Linux's
-   get_signal goes on past the stop and takes SIGUSR2, so pause fails with
-   EINTR once the handler has run, wherever SIGUSR2 lands, rather than
-   running again. The first part sends SIGCONT and SIGUSR2 once the stop is
-   reported; the second sends SIGSTOP, SIGCONT and SIGUSR2 at once; in the
-   third the child enters the stop as a seized tracee, which is detached
-   while it stays stopped. The child exits 0 for EINTR with the handler run
-   once. */
+   SIGUSR2, which it has a handler for, and SIGCONT, back to back. SIGUSR2
+   is pending as SIGCONT ends the stop, and Linux's get_signal goes on past
+   the stop and takes it, so pause fails with EINTR once the handler has
+   run, rather than running again. The first part sends SIGUSR2 and SIGCONT
+   once the stop is reported; the second sends SIGSTOP, SIGUSR2 and SIGCONT
+   at once; in the third the child enters the stop as a seized tracee, which
+   is detached while it stays stopped. The child exits 0 for EINTR with the
+   handler run once.
+   SIGUSR2 goes before SIGCONT: sent after it, SIGUSR2 may come once
+   get_signal has found nothing pending. arch/x86/kernel/signal.c
+   arch_do_signal_or_restart then rewinds pause (ERESTARTNOHAND with no
+   handler), and kernel/entry/common.c exit_to_user_mode_loop, seeing
+   SIGUSR2, runs its handler at the rewound pause, which sleeps again. */
 static volatile sig_atomic_t sch_handled;
 static void sch_on_usr2(int sig) {
     (void)sig;
@@ -6852,7 +6857,7 @@ static int stop_cont_handler_case(void) {
                 printf("%s-stopped=%d\n", name, WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
             }
         }
-        if (kill(pid, SIGCONT) || kill(pid, SIGUSR2)) return 6;
+        if (kill(pid, SIGUSR2) || kill(pid, SIGCONT)) return 6;
         printf("%s-exit=%d\n", name, sch_reap(pid));
     }
     return 0;

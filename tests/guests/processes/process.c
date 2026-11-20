@@ -6984,6 +6984,140 @@ static int maxrss_case(const char *self) {
     _exit(0);
 }
 
+/* The page-faults case: getrusage's and wait4's ru_minflt count the
+   faults a task took (mm/memory.c mm_account_fault, current->min_flt),
+   its own accesses' and those of get_user_pages for it: mlock's
+   population and a tracer's PTRACE_PEEKDATA, which counts to the tracer.
+   A wait adds the child's and its children's to RUSAGE_CHILDREN
+   (kernel/exit.c wait_task_zombie), and an execve keeps them. How many
+   faults Linux takes besides is not fixed, so the case prints only what it
+   guarantees. It runs in a forked child, which starts from none. */
+static long pf_get(int who) {
+    struct rusage usage;
+    if (getrusage(who, &usage)) return -1;
+    return usage.ru_minflt;
+}
+/* Maps `pages` pages and writes each: a fault for each page. */
+static void pf_touch(long pages) {
+    const long page = sysconf(_SC_PAGESIZE);
+    char *map = mmap(NULL, (size_t)(pages * page), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return;
+    for (long i = 0; i < pages; i++) map[i * page] = 1;
+    munmap(map, (size_t)(pages * page));
+}
+static int page_faults_exec(const char *before) {
+    printf("after exec: kept=%d\n", pf_get(RUSAGE_SELF) >= atol(before));
+    return 0;
+}
+static int page_faults_case(const char *self) {
+    fflush(stdout);
+    pid_t measuring = fork();
+    if (measuring != 0) {
+        int status;
+        waitpid(measuring, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    printf("children at first: %ld\n", pf_get(RUSAGE_CHILDREN));
+    long before = pf_get(RUSAGE_SELF);
+    pf_touch(64);
+    long after = pf_get(RUSAGE_SELF);
+    long thread = pf_get(RUSAGE_THREAD);
+    printf("touched: at-least-64=%d thread-counted=%d thread-within=%d\n", after - before >= 64,
+           thread >= 64, thread <= pf_get(RUSAGE_SELF));
+
+    /* mlock populates through get_user_pages, which faults for each page
+       of fresh private anonymous memory (FOLL_WRITE). */
+    char *locked = mmap(NULL, (size_t)(32 * page), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (locked == MAP_FAILED) return 2;
+    before = pf_get(RUSAGE_SELF);
+    int r = mlock(locked, (size_t)(32 * page));
+    printf("mlock: r=%d at-least-32=%d\n", r, pf_get(RUSAGE_SELF) - before >= 32);
+    munlock(locked, (size_t)(32 * page));
+    munmap(locked, (size_t)(32 * page));
+
+    /* A child's faults reach its parent's wait and RUSAGE_CHILDREN, and a
+       grandchild's through the child that waited for it. */
+    long children = pf_get(RUSAGE_CHILDREN);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        pf_touch(64);
+        _exit(0);
+    }
+    struct rusage usage;
+    siginfo_t info;
+    memset(&usage, 0, sizeof usage);
+    syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, &usage);
+    long zombie = usage.ru_minflt;
+    memset(&usage, 0, sizeof usage);
+    wait4(child, NULL, 0, &usage);
+    printf("child: at-least-64=%d zombie-same=%d children-grew-by-it=%d\n",
+           usage.ru_minflt >= 64, zombie == usage.ru_minflt,
+           pf_get(RUSAGE_CHILDREN) - children == usage.ru_minflt);
+    children = pf_get(RUSAGE_CHILDREN);
+    child = fork();
+    if (child == 0) {
+        pid_t inner = fork();
+        if (inner == 0) {
+            pf_touch(128);
+            _exit(0);
+        }
+        waitpid(inner, NULL, 0);
+        _exit(0);
+    }
+    memset(&usage, 0, sizeof usage);
+    wait4(child, NULL, 0, &usage);
+    printf("nested: at-least-128=%d children-grew-by-it=%d\n", usage.ru_minflt >= 128,
+           pf_get(RUSAGE_CHILDREN) - children == usage.ru_minflt);
+
+    /* A tracer's read of a page its tracee has not touched faults in the
+       tracee's memory and counts to the tracer; a read of one it holds
+       does not fault. */
+    char *untouched = mmap(NULL, (size_t)(2 * page), PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (untouched == MAP_FAILED) return 3;
+    fflush(stdout);
+    pid_t traced = fork();
+    if (traced < 0) return 4;
+    if (traced == 0) {
+        if (syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0)) _exit(1);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(traced, &status, WUNTRACED) != traced) return 5;
+    long word = 0;
+    before = pf_get(RUSAGE_THREAD);
+    long peeked = syscall(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, traced, untouched, &word);
+    long first = pf_get(RUSAGE_THREAD) - before;
+    before = pf_get(RUSAGE_THREAD);
+    syscall(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, traced, untouched, &word);
+    long again = pf_get(RUSAGE_THREAD) - before;
+    printf("peek: r=%ld counted=%d again-none=%d\n", peeked, first >= 1, again == 0);
+    kill(traced, SIGKILL);
+    waitpid(traced, NULL, 0);
+    munmap(untouched, (size_t)(2 * page));
+
+    /* An execve keeps the count. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        pf_touch(64);
+        char text[24];
+        snprintf(text, sizeof text, "%ld", pf_get(RUSAGE_SELF));
+        char *arguments[] = {(char *)self, "page-faults-exec", text, NULL};
+        execv(self, arguments);
+        _exit(71);
+    }
+    waitpid(child, &status, 0);
+    printf("exec child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    fflush(stdout);
+    _exit(0);
+}
+
 /* The fault-around case: a read fault in a file's mapping maps up to 16
    pages around it that the page cache holds (mm/memory.c do_fault_around,
    mm/filemap.c filemap_map_pages): within an aligned block of 16, the VMA,
@@ -33297,11 +33431,13 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "hiwater")) return hiwater_case();
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
+    if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();
     if (!strcmp(mode, "stop-cont-handler")) return stop_cont_handler_case();
     if (!strcmp(mode, "sigsuspend-stop")) return sigsuspend_stop_case();
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
+    if (!strcmp(mode, "page-faults-exec")) return argc < 3 ? 98 : page_faults_exec(argv[2]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

@@ -168,7 +168,7 @@ pub(crate) fn write(
             // a page that still cannot be read is written as zeros, as Linux
             // skips it in the file.
             page[..size].fill(0);
-            let _ = mem.read_for_dump(GuestAddr(mapping.start.0 + at), &mut page[..size]);
+            let _ = mem.read_for_core(GuestAddr(mapping.start.0 + at), &mut page[..size]);
             if !put(&page[..size]) {
                 return false;
             }

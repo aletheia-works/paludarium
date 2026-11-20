@@ -238,23 +238,41 @@ pub enum ReadHint {
 /// read or fetch of a page that had no entry yet (Linux maps the zero page
 /// or the file's), and a write to a page with no frame of its own yet (its
 /// first write, the copy of a page-cache page of a private mapping or of a
-/// frame `fork` shared). A core dump's or `ptrace`'s access through
-/// `FOLL_FORCE` counts none, as Linux's `get_user_pages` passes no registers.
+/// frame `fork` shared). A core dump's, `ptrace`'s or a lock's population's
+/// access through `get_user_pages` is not among them, as it passes no
+/// registers and so no `perf` event; its faults are kept apart
+/// ([`faults::take_forced`]), for the thread's `min_flt` alone.
 pub mod faults {
     use core::cell::Cell;
 
     std::thread_local! {
         static TAKEN: Cell<u64> = const { Cell::new(0) };
+        static FORCED: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(crate) fn count() {
         TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
     }
 
+    pub(crate) fn count_forced() {
+        FORCED.with(|forced| forced.set(forced.get().wrapping_add(1)));
+    }
+
     /// The faults taken since the last call, on this host thread.
     #[must_use]
     pub fn take() -> u64 {
         TAKEN.with(|taken| taken.replace(0))
+    }
+
+    /// The faults that reads and writes through `get_user_pages` took
+    /// since the last call, on this host thread: a read of a page that had
+    /// no entry (a core dump's, `PTRACE_PEEKDATA`'s, a lock's population's)
+    /// and a forced write that needs a frame of its own
+    /// (`PTRACE_POKEDATA`'s). Linux's `mm_account_fault` adds them to the
+    /// calling task's `min_flt` with no `perf` event.
+    #[must_use]
+    pub fn take_forced() -> u64 {
+        FORCED.with(|forced| forced.replace(0))
     }
 }
 
@@ -3897,6 +3915,8 @@ impl AddressSpaceData {
                     let missing = entry.is_none();
                     if missing && matches!(access, Access::Read | Access::Fetch) {
                         faults::count();
+                    } else if missing && access == Access::Dump {
+                        faults::count_forced();
                     }
                     self.refresh(entry, page, prot, false);
                     // A core dump's or `ptrace`'s read faults in through
@@ -4068,14 +4088,18 @@ impl AddressSpaceData {
             };
             let (dir, slot) = page_index(page);
             let table = directory.entry(dir).or_insert_with(PageTable::new);
-            if access == Access::Write
+            if matches!(access, Access::Write | Access::ForceWrite)
                 && table.pages.get(slot).is_some_and(|entry| {
                     entry
                         .as_ref()
                         .is_none_or(|p| p.cow || !p.soft_dirty || p.frame.get().is_none())
                 })
             {
-                faults::count();
+                if access == Access::Write {
+                    faults::count();
+                } else {
+                    faults::count_forced();
+                }
             }
             // A write with `WP_ASYNC` clears the protection; the loader's and
             // a refill's are not writes. An entry loses it first, as Linux's
@@ -4310,9 +4334,28 @@ impl AddressSpaceData {
         self.read_with(addr, buf, Access::Read)
     }
 
-    /// Reads guest memory whatever its protection, for a core dump.
+    /// Reads guest memory whatever its protection, as `get_user_pages`
+    /// with `FOLL_FORCE` does (a lock's population).
     pub fn read_for_dump(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.read_with(addr, buf, Access::Dump)
+    }
+
+    /// Reads guest memory for a core dump, as Linux's `get_dump_page`
+    /// does with `FOLL_DUMP`: as [`Self::read_for_dump`], except that a
+    /// page of anonymous private memory that has no entry reads as zeros
+    /// and takes no fault, as `no_page_table` leaves it a hole in the file
+    /// rather than fault it in. `buf` lies in one page.
+    pub fn read_for_core(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
+        let page = addr.0 & !(PAGE_SIZE - 1);
+        let hole = self.mapping_at(page).is_some()
+            && self.shared_at(page).is_none()
+            && self.backing_at(page).is_none()
+            && lookup(&self.read_directory(), page).is_none();
+        if hole {
+            buf.fill(0);
+            return Ok(());
+        }
+        self.read_for_dump(addr, buf)
     }
 
     /// Fetches instruction bytes; requires `PROT_EXEC`.
@@ -7539,6 +7582,11 @@ impl AddressSpace {
     pub fn read_for_dump(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().read_for_dump(addr, buf)
     }
+    /// Reads guest memory for a core dump, leaving the holes Linux's
+    /// `FOLL_DUMP` leaves ([`AddressSpaceData::read_for_core`]).
+    pub fn read_for_core(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
+        self.locked().read_for_core(addr, buf)
+    }
     pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
         if self.write_unlocked(addr, buf) {
             return Ok(());
@@ -9101,18 +9149,79 @@ mod tests {
             .back_with_file(file, 32 * PAGE_SIZE, Arc::clone(&source), 0)
             .unwrap();
         let _ = faults::take();
-        // Whatever the protection, as `FOLL_FORCE` reads, and counting no
-        // fault of the caller's.
+        let _ = faults::take_forced();
+        // Whatever the protection, as `FOLL_FORCE` reads, and counting the
+        // fault apart, with no `perf` event.
         let mut byte = [0u8];
         space
             .read_for_dump(GuestAddr(base.0 + 20 * PAGE_SIZE + 3), &mut byte)
             .unwrap();
         assert_eq!(byte[0], pattern(20 * PAGE_SIZE + 3));
-        assert_eq!(faults::take(), 0);
+        assert_eq!((faults::take(), faults::take_forced()), (0, 1));
         assert_eq!(space.resident_pages().1, 16);
         let forced = space.view().read_forced(base.0 + 2 * PAGE_SIZE, &mut byte);
         assert_eq!(forced, Some(1));
         assert_eq!(space.resident_pages().1, 32);
+        assert_eq!((faults::take(), faults::take_forced()), (0, 1));
+        // A page that has its entry, as fault-around gave it, takes none.
+        let again = space.view().read_forced(base.0 + 3 * PAGE_SIZE, &mut byte);
+        assert_eq!(again, Some(1));
+        assert_eq!((faults::take(), faults::take_forced()), (0, 0));
+    }
+
+    #[test]
+    fn a_core_dump_leaves_untouched_anonymous_memory_a_hole_with_no_fault() {
+        let mut space = AddressSpace::new();
+        let base = GuestAddr(0x4000_0000);
+        space
+            .map(
+                Some(base),
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write(base, &[5]).unwrap();
+        let _ = faults::take();
+        let _ = faults::take_forced();
+        let mut byte = [9u8];
+        space
+            .read_for_core(GuestAddr(base.0 + PAGE_SIZE), &mut byte)
+            .unwrap();
+        assert_eq!(byte[0], 0);
+        assert_eq!((faults::take(), faults::take_forced()), (0, 0));
+        assert_eq!(space.resident_pages().1, 1);
+        // A page it holds reads as it is.
+        space.read_for_core(base, &mut byte).unwrap();
+        assert_eq!(byte[0], 5);
+        // `ptrace`'s read faults the hole in, as `access_remote_vm` has no
+        // `FOLL_DUMP`.
+        assert_eq!(
+            space.view().read_forced(base.0 + PAGE_SIZE, &mut byte),
+            Some(1)
+        );
+        assert_eq!((faults::take(), faults::take_forced()), (0, 1));
+    }
+
+    #[test]
+    fn a_forced_write_counts_a_fault_apart_when_the_page_needs_a_frame() {
+        let mut space = AddressSpace::new();
+        let base = GuestAddr(0x4000_0000);
+        space
+            .map(
+                Some(base),
+                2 * PAGE_SIZE,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let _ = faults::take();
+        let _ = faults::take_forced();
+        assert_eq!(space.view().write_forced(base.0, &[7]), Some(1));
+        assert_eq!((faults::take(), faults::take_forced()), (0, 1));
+        // Its frame is its own now.
+        assert_eq!(space.view().write_forced(base.0 + 1, &[8]), Some(1));
+        assert_eq!((faults::take(), faults::take_forced()), (0, 0));
     }
 
     #[test]

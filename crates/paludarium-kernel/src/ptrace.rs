@@ -629,12 +629,13 @@ impl crate::Processes {
     }
     /// What a tracer's wait reports of a tracee's process, as Linux's
     /// `getrusage(RUSAGE_BOTH)` gives, the same as its parent's wait: its
-    /// CPU time and that of the children it reaped (`children_cpu`), and
-    /// the largest peak resident size among them.
+    /// CPU time and that of the children it reaped (`children_cpu`), the
+    /// largest peak resident size among them, and their minor faults.
     fn usage(group: &crate::ThreadGroup, children_cpu: u64) -> crate::syscalls::ResourceUsage {
         crate::syscalls::ResourceUsage {
             cpu: group.process_cpu().saturating_add(children_cpu),
             peak: group.waited_peak(),
+            minor_faults: group.waited_faults(),
         }
     }
     /// The ptrace stop or exit of a task traced by `waiter` that a wait

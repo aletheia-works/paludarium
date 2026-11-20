@@ -4271,23 +4271,27 @@ fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
 /// Memory a guest is told it has; like `uname`, the host's is not revealed.
 pub(crate) const SYSINFO_RAM: u64 = 4 << 30;
 
-/// What a `struct rusage` tells: CPU time in nanoseconds and the peak
-/// resident size in pages.
+/// What a `struct rusage` tells: CPU time in nanoseconds, the peak
+/// resident size in pages and the minor faults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourceUsage {
     pub cpu: u64,
     pub peak: u64,
+    pub minor_faults: u64,
 }
 
-/// A `struct rusage` with `usage.cpu` nanoseconds as user time and
-/// `usage.peak` pages as `ru_maxrss` in KiB. The emulator's own work for the
-/// guest's system calls happens in user space on the host, so the system
-/// time is 0, and the other counts are not kept.
+/// A `struct rusage` with `usage.cpu` nanoseconds as user time,
+/// `usage.peak` pages as `ru_maxrss` in KiB and `usage.minor_faults` as
+/// `ru_minflt`. The emulator's own work for the guest's system calls
+/// happens in user space on the host, so the system time is 0; every page
+/// a file's mapping reads is taken to be in the page cache, so no fault is
+/// major (`ru_majflt` is 0); and the other counts are not kept.
 pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
     let mut bytes = [0u8; 144];
     bytes[..8].copy_from_slice(&(usage.cpu / 1_000_000_000).to_le_bytes());
     bytes[8..16].copy_from_slice(&(usage.cpu % 1_000_000_000 / 1000).to_le_bytes());
     bytes[32..40].copy_from_slice(&(usage.peak * 4).to_le_bytes());
+    bytes[64..72].copy_from_slice(&usage.minor_faults.to_le_bytes());
     bytes
 }
 
@@ -4296,7 +4300,10 @@ pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
 /// [`rusage`] lays it out; any other `who` is `EINVAL`. `ru_maxrss` is the
 /// process's peak resident size for the first two, as Linux takes
 /// `signal->maxrss` and the address space's high-water mark for both, and
-/// the largest of the reaped children's for RUSAGE_CHILDREN.
+/// the largest of the reaped children's for RUSAGE_CHILDREN. The minor
+/// faults are the process's threads' (`signal->min_flt` and each thread's
+/// `min_flt`), the thread's, or the reaped children's (`cmin_flt`), as of
+/// each thread's latest system call.
 fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
     let own = || c.group.peak(c.mem.resident_pages().0);
@@ -4304,14 +4311,17 @@ fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         0 => ResourceUsage {
             cpu: c.group.process_cpu(),
             peak: own(),
+            minor_faults: c.group.process_faults(),
         },
         1 => ResourceUsage {
             cpu: thread,
             peak: own(),
+            minor_faults: c.process.cpu.used.minor_faults(),
         },
         -1 => ResourceUsage {
             cpu: c.processes.children_cpu(c.process.pid),
             peak: c.group.children_peak(),
+            minor_faults: c.group.children_faults(),
         },
         _ => return err(Errno::EINVAL),
     };

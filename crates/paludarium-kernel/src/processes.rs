@@ -1524,10 +1524,12 @@ impl Processes {
                 },
             }?;
             // What `getrusage(RUSAGE_BOTH)` gives of the child: its CPU time
-            // and its children's, and the largest peak among them.
+            // and its children's, the largest peak among them, and their
+            // minor faults.
             let usage = crate::syscalls::ResourceUsage {
                 cpu: entry.group.process_cpu().saturating_add(entry.children_cpu),
                 peak: entry.group.waited_peak(),
+                minor_faults: entry.group.waited_faults(),
             };
             Some((pid, event, usage, entry.group.task_ids(pid, pid).uid))
         });
@@ -1536,16 +1538,17 @@ impl Processes {
             && !wait.keep
         {
             match event {
-                // A reaped child's CPU time joins its parent's children's,
-                // and its peak (its own or its children's) is kept as theirs
-                // if it is the largest. So do its read and write counts join
-                // its parent's process's.
+                // A reaped child's CPU time and minor faults join its
+                // parent's children's, and its peak (its own or its
+                // children's) is kept as theirs if it is the largest. So do
+                // its read and write counts join its parent's process's.
                 ChildEvent::Exited(_) | ChildEvent::Dumped(_) => {
                     let io = entries.get(&pid).map(|child| child.group.io(None));
                     self.release(&mut entries, pid);
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(usage.cpu);
                         parent.group.reaped_peak(usage.peak);
+                        parent.group.reaped_faults(usage.minor_faults);
                         if let Some(io) = io {
                             parent.group.reaped_io(io);
                         }

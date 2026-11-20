@@ -263,6 +263,15 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
+- **Page-fault counts**: `ru_minflt` counts the faults as of each
+  thread's latest system call, and none of the loader's work for `execve`,
+  where Linux counts the faults of its copies of the arguments and of the
+  program's pages. No fault is major (`ru_majflt` is 0), as every page of a
+  file is taken to be in the page cache. A core dump's faults count to the
+  last thread to exit, where Linux counts them to the thread that dumps.
+  `process_vm_readv`, `process_vm_writev`, `MADV_POPULATE_READ` and
+  `MADV_POPULATE_WRITE` count their faults in `perf`'s `page-faults` too,
+  where Linux's `get_user_pages` gives no `perf` event. `/proc/<pid>/stat`'s fault counts are 0.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
   are hardware events even on a host with a PMU. A thread's CPU time, page

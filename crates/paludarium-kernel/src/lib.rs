@@ -199,14 +199,31 @@ impl Eq for CpuAccount {}
 /// time in nanoseconds, the page faults its accesses took
 /// ([`paludarium_mmu::faults`]) in its own code and in system calls, the
 /// times it went to sleep ([`paludarium_host::switches`]) and the times it
-/// moved to another CPU. The software events of `perf` count these.
+/// moved to another CPU. The software events of `perf` count these. The
+/// faults of its reads and writes through `get_user_pages`
+/// ([`paludarium_mmu::faults::take_forced`]) are kept apart
+/// (`forced_faults`), as they count to its `min_flt` but are no `perf`
+/// event.
 #[derive(Debug, Default)]
 pub(crate) struct Usage {
     pub(crate) cpu: std::sync::atomic::AtomicU64,
     pub(crate) faults: std::sync::atomic::AtomicU64,
     pub(crate) kernel_faults: std::sync::atomic::AtomicU64,
+    pub(crate) forced_faults: std::sync::atomic::AtomicU64,
     pub(crate) switches: std::sync::atomic::AtomicU64,
     pub(crate) migrations: std::sync::atomic::AtomicU64,
+}
+
+impl Usage {
+    /// Its minor faults (Linux's `min_flt`): every fault it took, its own
+    /// code's, its system calls' and those through `get_user_pages`.
+    pub(crate) fn minor_faults(&self) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.faults
+            .load(SeqCst)
+            .saturating_add(self.kernel_faults.load(SeqCst))
+            .saturating_add(self.forced_faults.load(SeqCst))
+    }
 }
 
 /// Adds the page faults taken since the last call to the thread's
@@ -214,6 +231,14 @@ pub(crate) struct Usage {
 /// the call (`kernel`) as it leaves it, as Linux tells a fault of user mode
 /// from one of the kernel's accesses to user memory.
 pub(crate) fn account_faults(state: &ThreadState, kernel: bool) {
+    let forced = paludarium_mmu::faults::take_forced();
+    if forced != 0 {
+        state
+            .cpu
+            .used
+            .forced_faults
+            .fetch_add(forced, std::sync::atomic::Ordering::SeqCst);
+    }
     let faults = paludarium_mmu::faults::take();
     if faults != 0 {
         let usage = &state.cpu.used;

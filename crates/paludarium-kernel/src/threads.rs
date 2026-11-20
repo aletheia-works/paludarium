@@ -149,6 +149,9 @@ pub struct ThreadGroup {
     /// largest of its reaped children's (`signal->cmaxrss`).
     peak: AtomicU64,
     children_peak: AtomicU64,
+    /// The minor faults of its reaped children and theirs (Linux's
+    /// `signal->cmin_flt`).
+    children_faults: AtomicU64,
     /// The process is the init of a nested PID namespace, which takes only
     /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
     /// SIGNAL_UNKILLABLE), until a fault ends it.
@@ -274,6 +277,7 @@ impl Default for ThreadGroup {
             io: Mutex::default(),
             peak: AtomicU64::new(0),
             children_peak: AtomicU64::new(0),
+            children_faults: AtomicU64::new(0),
             unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
@@ -1561,6 +1565,31 @@ impl ThreadGroup {
             .unwrap_or(0);
         self.peak(live).max(self.children_peak())
     }
+    /// The process's minor faults (`RUSAGE_SELF`): the sum of its threads'
+    /// latest accounts, live or not, from before an `execve` too.
+    pub(crate) fn process_faults(&self) -> u64 {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, used)| used.minor_faults())
+            .fold(0u64, u64::saturating_add)
+    }
+    /// The minor faults of its reaped children and theirs
+    /// (`RUSAGE_CHILDREN`).
+    pub(crate) fn children_faults(&self) -> u64 {
+        self.children_faults.load(Ordering::Relaxed)
+    }
+    /// What a wait reports of its minor faults (`RUSAGE_BOTH`): its own and
+    /// its reaped children's.
+    pub(crate) fn waited_faults(&self) -> u64 {
+        self.process_faults().saturating_add(self.children_faults())
+    }
+    /// Takes a reaped child's minor faults, its own and its children's
+    /// (`wait_task_zombie`'s `cmin_flt`).
+    pub(crate) fn reaped_faults(&self, faults: u64) {
+        self.children_faults.fetch_add(faults, Ordering::Relaxed);
+    }
     /// Takes a reaped child's peak, its own or its children's
     /// (`wait_task_zombie`'s `cmaxrss`).
     pub(crate) fn reaped_peak(&self, pages: u64) {
@@ -2075,6 +2104,8 @@ impl Kernel {
         };
         if last && let Some(dump) = core.take() {
             self.write_core(&dump, mem);
+            // Its reads' faults count to the thread that dumped.
+            crate::account_faults(&thread.state, true);
             for (tid, head) in dump.robust_lists {
                 crate::futex::exit_robust_list(&self.group.futexes, mem, tid, head);
             }
@@ -2938,5 +2969,42 @@ mod exec_thread_tests {
         group.members.lock().unwrap().remove(&2);
         group.end_exec(1, 1, Arc::default());
         assert_eq!(group.begin_exec(1), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod fault_count_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    #[test]
+    fn a_process_counts_its_threads_faults_and_its_reaped_childrens() {
+        let group = ThreadGroup::default();
+        let first = Arc::new(crate::Usage::default());
+        first.faults.store(3, SeqCst);
+        first.kernel_faults.store(2, SeqCst);
+        first.forced_faults.store(1, SeqCst);
+        let second = Arc::new(crate::Usage::default());
+        second.forced_faults.store(4, SeqCst);
+        group.register_cpu(1, Arc::clone(&first));
+        group.register_cpu(2, second);
+        assert_eq!(first.minor_faults(), 6);
+        assert_eq!(group.process_faults(), 10);
+        assert_eq!(group.children_faults(), 0);
+        group.reaped_faults(7);
+        group.reaped_faults(5);
+        assert_eq!(group.children_faults(), 12);
+        assert_eq!(group.waited_faults(), 22);
+    }
+
+    #[test]
+    fn a_rusage_gives_the_minor_faults_as_ru_minflt() {
+        let bytes = crate::syscalls::rusage(crate::syscalls::ResourceUsage {
+            cpu: 0,
+            peak: 0,
+            minor_faults: 41,
+        });
+        assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 41);
+        assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 0);
     }
 }

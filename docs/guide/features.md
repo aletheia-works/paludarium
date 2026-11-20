@@ -3863,8 +3863,19 @@ kernel.
   children waited for and of their own children; and a wait's rusage gives
   the child's and its children's together, as Linux's `RUSAGE_BOTH`, the
   CPU time as well as `ru_maxrss`, a tracer's wait for a tracee too. A
-  forked child starts from zero, and an `execve` keeps both. The other
-  counts (faults, context switches, blocks) are 0.
+  forked child starts from zero, and an `execve` keeps both. Their
+  `ru_minflt` counts the minor faults, as Linux's `mm_account_fault` adds
+  them to the task: a thread's first read or write of a page and its write
+  to a page `fork` shares or of a private mapping of a file (in its own code
+  and in its system calls' copies), and the faults of the reads and writes
+  through `get_user_pages` made for it, which `perf` does not count:
+  `mlock`'s population, a tracer's `PTRACE_PEEKDATA` and `PTRACE_POKEDATA`
+  (counted to the tracer) and a core dump's (which leaves anonymous memory
+  never touched a hole, with no fault). `RUSAGE_SELF` gives the sum of the
+  process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
+  a wait those of the children as with the CPU time; a forked child starts
+  from none, and an `execve` keeps them. The other counts (major faults,
+  context switches, blocks) are 0.
 
 - A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
   takes it apart: the task's number in the caller's PID namespace

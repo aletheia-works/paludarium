@@ -2830,6 +2830,62 @@ fn private_file_mappings_show_the_file_until_they_write_it() {
     assert_eq!(f.ret(11, &[at, 2 * 4096]), 0);
 }
 #[test]
+fn populating_a_writable_private_file_mapping_copies_its_pages() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0hello").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[fd, DATA + 6, 5]), 5);
+    assert_eq!(f.ret(77, &[fd, 4096]), 0);
+    f.mem.write(GuestAddr(DATA), b"HELLO").unwrap();
+    // Whether the page at `at` still shows the file: a write to the file
+    // after the call is seen only by a page the call did not copy.
+    let shows_the_file = |f: &mut Fixture, at: u64| {
+        assert_eq!(f.ret(18, &[fd, DATA, 5, 0]), 5);
+        let seen = memory_bytes(f, at, 5) == b"HELLO";
+        f.mem.write(GuestAddr(DATA + 16), b"hello").unwrap();
+        assert_eq!(f.ret(18, &[fd, DATA + 16, 5, 0]), 5);
+        seen
+    };
+    // `mlock` writes a writable private page in (`FOLL_WRITE`).
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2, fd, 0]);
+    assert_eq!(f.ret(149, &[at, 4096]), 0);
+    assert!(!shows_the_file(&mut f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    // Not one that is only readable, nor with MLOCK_ONFAULT.
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 2, fd, 0]);
+    assert_eq!(f.ret(149, &[at, 4096]), 0);
+    assert!(shows_the_file(&mut f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2, fd, 0]);
+    assert_eq!(f.ret(325, &[at, 4096, 1]), 0);
+    assert!(shows_the_file(&mut f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    // `mlockall(MCL_CURRENT)` populates as `mlock` does.
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2, fd, 0]);
+    assert_eq!(f.ret(151, &[1]), 0);
+    assert_eq!(f.ret(152, &[]), 0);
+    assert!(!shows_the_file(&mut f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    // So do MAP_POPULATE and MAP_LOCKED.
+    for flag in [0x8000, 0x2000] {
+        let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2 | flag, fd, 0]);
+        assert!(!shows_the_file(&mut f, at), "{flag:#x}");
+        assert_eq!(f.ret(11, &[at, 4096]), 0);
+    }
+    // A locked private mapping made writable is written in
+    // (`mprotect_fixup`), unless it is locked on fault.
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 2, fd, 0]);
+    assert_eq!(f.ret(149, &[at, 4096]), 0);
+    assert_eq!(f.ret(10, &[at, 4096, 3]), 0);
+    assert!(!shows_the_file(&mut f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 2, fd, 0]);
+    assert_eq!(f.ret(325, &[at, 4096, 1]), 0);
+    assert_eq!(f.ret(10, &[at, 4096, 3]), 0);
+    assert!(shows_the_file(&mut f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+}
+#[test]
 fn memory_file_shared_mapping_needs_a_writable_file() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();

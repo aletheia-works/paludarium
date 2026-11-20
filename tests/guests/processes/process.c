@@ -18047,6 +18047,61 @@ static int memfd_secret_memlock_case(void) {
     setrlimit(RLIMIT_MEMLOCK, &old);
     return 0;
 }
+/* The mlock-private-copy case: populating a writable private file mapping
+   brings its pages in by writing them (mm/gup.c populate_vma_page_range,
+   FOLL_WRITE), so each becomes a copy of its own and no longer shows the
+   file's later writes. mlock, MAP_POPULATE and MAP_LOCKED populate; so
+   does mprotect making a locked private mapping writable (mm/mprotect.c
+   mprotect_fixup). A read-only mapping, or a lock on fault, leaves the
+   page cache's page mapped. mlockall(MCL_CURRENT) populates too, but
+   whether it may lock all that is mapped depends on the user's
+   RLIMIT_MEMLOCK (see lock_all_show), so a unit test holds it. */
+static int lpc_shows_the_file(int fd, const char *at) {
+    if (pwrite(fd, "HELLO", 5, 0) != 5) return -1;
+    int shows = !memcmp(at, "HELLO", 5);
+    if (pwrite(fd, "hello", 5, 0) != 5) return -1;
+    return shows;
+}
+enum { LPC_NONE, LPC_MLOCK, LPC_ONFAULT };
+/* Maps the file's first page with `prot` and `flags`, locks it as `lock`
+   says, then gives it `then` as its protection if that is not -1. */
+static void lpc_show(const char *name, int fd, int prot, int flags, int lock, int then) {
+    long page = sysconf(_SC_PAGESIZE);
+    char *at = mmap(NULL, (size_t)page, prot, MAP_PRIVATE | flags, fd, 0);
+    if (at == MAP_FAILED) {
+        printf("%s: mmap errno=%d\n", name, errno);
+        return;
+    }
+    long locked = 0;
+    if (lock == LPC_MLOCK) locked = mlock(at, (size_t)page);
+    if (lock == LPC_ONFAULT) locked = syscall(SYS_mlock2, at, (size_t)page, 1L);
+    if (locked) locked = -errno;
+    long protected = then == -1 ? 0 : mprotect(at, (size_t)page, then) ? -errno : 0;
+    printf("%s: lock=%ld mprotect=%ld bytes=%.5s shows-the-file=%d\n", name, locked, protected,
+           at, lpc_shows_the_file(fd, at));
+    munmap(at, (size_t)page);
+}
+static int mlock_private_copy_case(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-lock-copy-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || pwrite(fd, "hello", 5, 0) != 5 || ftruncate(fd, page)) return 81;
+    int rw = PROT_READ | PROT_WRITE;
+    lpc_show("none", fd, rw, 0, LPC_NONE, -1);
+    lpc_show("mlock", fd, rw, 0, LPC_MLOCK, -1);
+    lpc_show("mlock-read-only", fd, PROT_READ, 0, LPC_MLOCK, -1);
+    lpc_show("mlock2-onfault", fd, rw, 0, LPC_ONFAULT, -1);
+    lpc_show("map-populate", fd, rw, MAP_POPULATE, LPC_NONE, -1);
+    lpc_show("map-populate-read-only", fd, PROT_READ, MAP_POPULATE, LPC_NONE, -1);
+    lpc_show("map-locked", fd, rw, MAP_LOCKED, LPC_NONE, -1);
+    lpc_show("mprotect-locked", fd, PROT_READ, 0, LPC_MLOCK, rw);
+    lpc_show("mprotect-onfault", fd, PROT_READ, 0, LPC_ONFAULT, rw);
+    lpc_show("mprotect-unlocked", fd, PROT_READ, 0, LPC_NONE, rw);
+    close(fd);
+    return 0;
+}
 static int pkey_case(void) {
     long page = 4096;
     char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -32791,6 +32846,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
     if (!strcmp(mode, "memfd-secret-memlock")) return memfd_secret_memlock_case();
+    if (!strcmp(mode, "mlock-private-copy")) return mlock_private_copy_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();

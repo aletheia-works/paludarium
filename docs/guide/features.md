@@ -912,7 +912,13 @@ kernel.
   pages not locked yet (`ENOMEM`), unless the caller has `CAP_IPC_LOCK`.
   `mlock` and `mlock2` without `MLOCK_ONFAULT` then bring the pages in, and
   give `ENOMEM` for one that cannot be (`PROT_NONE`, a guard page, past the
-  end of its file). `mlockall` locks every mapping with `MCL_CURRENT`
+  end of its file). A writable private mapping's pages are brought in by
+  writing them, as Linux's `populate_vma_page_range` does (`FOLL_WRITE`):
+  a page of a file there becomes a copy of its own, which no longer shows
+  the file's later writes. `MAP_POPULATE`, `MAP_LOCKED`, `mlockall` with
+  `MCL_CURRENT` and an `mprotect` that makes a locked private mapping
+  writable do the same; a lock with `MLOCK_ONFAULT` or `MCL_ONFAULT` brings
+  nothing in. `mlockall` locks every mapping with `MCL_CURRENT`
   (`ENOMEM` when all that is mapped does not fit) and every new one with
   `MCL_FUTURE`, which `mmap`, `brk` and a growing `mremap` then need room
   for (`EAGAIN`; `brk` keeps the break), as `MAP_LOCKED` does; `munlockall`
@@ -4801,8 +4807,8 @@ kernel.
     chosen as Linux's `vma_dump_size` chooses it with the default
     `coredump_filter`: a private mapping is there whole once a page of its VMA
     was written (Linux's `anon_vma`, which a split, `MADV_DONTNEED` and `fork`
-    keep, a mapping merging with the VMA shares, and `MAP_POPULATE` or
-    `MAP_LOCKED` gives a writable one), and nothing of it otherwise, but the
+    keep, a mapping merging with the VMA shares, and bringing a writable one's
+    pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault), and nothing of it otherwise, but the
     first page of a file mapping from the start of an ELF file; a shared
     mapping is there whole when no name links its file (an anonymous one, a
     memfd, a file unlinked since), and nothing of it otherwise. Whether a

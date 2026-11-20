@@ -2535,14 +2535,12 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             c.mem.mapped(a, end);
             // `perf_event_mmap` of it.
             crate::perf::mapped(c, a.0);
-            // Linux populates a writable private mapping by writing it, which
-            // gives it an anon_vma (a core then writes it whole), with
-            // MAP_POPULATE or a lock that is not on fault.
-            if (flags & MAP_POPULATE != 0 || lock == Some(paludarium_mmu::Lock::Populated))
-                && flags & MAP_SHARED == 0
-                && prot.contains(Prot::WRITE)
-            {
-                c.mem.mark_written(a, len);
+            // Linux populates a writable private mapping by writing it, with
+            // MAP_POPULATE or a lock that is not on fault (`mm_populate`):
+            // each page becomes a copy of its own, and the mapping gets an
+            // anon_vma (a core then writes it whole).
+            if flags & MAP_POPULATE != 0 || lock == Some(paludarium_mmu::Lock::Populated) {
+                write_range_in(c.mem, a.0, end);
             }
             // A new VMA has no memory policy.
             c.group.numa().forget(a.0, len);
@@ -2815,7 +2813,8 @@ pub(crate) fn lock_fits(c: &Context<'_>, pages: u64) -> bool {
 /// `can_do_mlock` (`EPERM`) and room under RLIMIT_MEMLOCK for the pages
 /// not locked yet (`ENOMEM`), unless the caller has `CAP_IPC_LOCK`. The
 /// VMAs from `addr` take the new state up to a hole (`ENOMEM`). A lock that
-/// is not `MLOCK_ONFAULT` then brings each page in (`__mm_populate`), and a
+/// is not `MLOCK_ONFAULT` then brings each page in (`__mm_populate`), a
+/// writable private one by writing it ([`writes_in`]), and a
 /// page that cannot be (no access, a guard page, past the end of its file)
 /// gives `ENOMEM`, the VMAs locked.
 fn lock_range(c: &Context<'_>, addr: u64, len: u64, lock: Option<paludarium_mmu::Lock>) -> Outcome {
@@ -2861,9 +2860,15 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, lock: Option<paludarium_mmu:
             if m.prot == Prot::NONE {
                 return err(Errno::ENOMEM);
             }
+            let write = writes_in(c.mem, &m);
             let mut page = m.start.0.max(start);
             while page < m.end().min(end) {
-                if c.mem.read_for_dump(GuestAddr(page), &mut [0]).is_err() {
+                let faulted = if write {
+                    write_in(c.mem, page).is_err()
+                } else {
+                    c.mem.read_for_dump(GuestAddr(page), &mut [0]).is_err()
+                };
+                if faulted {
                     return err(Errno::ENOMEM);
                 }
                 page += 4096;
@@ -2938,6 +2943,11 @@ fn sys_mlockall(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         (flags & MCL_CURRENT != 0).then_some(Some(lock)),
         (flags & MCL_FUTURE != 0).then_some(lock),
     );
+    // `mm_populate(0, TASK_SIZE)`, which brings the writable private
+    // pages in by writing them.
+    if flags & MCL_CURRENT != 0 && lock == paludarium_mmu::Lock::Populated {
+        write_range_in(c.mem, 0, u64::MAX);
+    }
     ok(0)
 }
 
@@ -3157,6 +3167,46 @@ fn remove(
     Err(Errno::EOPNOTSUPP)
 }
 
+/// Whether Linux's `populate_vma_page_range` brings the pages of `m` in by
+/// writing them (`FOLL_WRITE`): a private mapping that may be written,
+/// whose file pages then become copies of their own, as a write fault
+/// breaks COW. Any other is brought in by reading.
+fn writes_in(mem: &AddressSpace, m: &paludarium_mmu::Mapping) -> bool {
+    m.prot.contains(Prot::WRITE) && mem.shared_offset(m.start).is_none()
+}
+
+/// Brings the pages of `[start, end)` in by writing them ([`write_in`]),
+/// in each private mapping there that may be written ([`writes_in`]), as
+/// Linux's `populate_vma_page_range` does with `FOLL_WRITE`, and leaves
+/// the others: a page that cannot be written in (past the end of its file)
+/// is passed over, as `mm_populate` ignores the errors.
+fn write_range_in(mem: &AddressSpace, start: u64, end: u64) {
+    let mappings: Vec<_> = mem
+        .mappings()
+        .filter(|m| m.start.0 < end && m.end() > start && writes_in(mem, m))
+        .collect();
+    for m in mappings {
+        let mut page = m.start.0.max(start);
+        while page < m.end().min(end) {
+            let _ = write_in(mem, page);
+            page += 4096;
+        }
+    }
+}
+
+/// Brings the page at `page` in by writing it, as a write fault does,
+/// leaving its bytes as they were: a private page gets a copy of its own,
+/// and its mapping an `anon_vma`.
+fn write_in(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> {
+    mem.atomic(
+        GuestAddr(page),
+        paludarium_mmu::AtomicWidth::W8,
+        paludarium_mmu::AtomicOp::Add(0),
+    )?;
+    mem.mark_written(GuestAddr(page), 1);
+    Ok(())
+}
+
 /// `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` of `[addr, end)`, as
 /// Linux's `madvise_populate` faults the pages in a page at a time: a page
 /// no mapping holds ends it with `ENOMEM`, one whose mapping may not be read
@@ -3179,12 +3229,7 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
         }
         while at < stop {
             let faulted = if write {
-                mem.atomic(
-                    GuestAddr(at),
-                    paludarium_mmu::AtomicWidth::W8,
-                    paludarium_mmu::AtomicOp::Add(0),
-                )
-                .err()
+                write_in(mem, at).err()
             } else {
                 mem.read(GuestAddr(at), &mut [0]).err()
             };
@@ -3193,9 +3238,6 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
                 Some(fault) if fault.poison => return Err(Errno(133)),
                 Some(_) => return Err(Errno::EFAULT),
                 None => {}
-            }
-            if write {
-                mem.mark_written(GuestAddr(at), 1);
             }
             at += 4096;
         }
@@ -3304,9 +3346,29 @@ fn mprotect_with_key(c: &mut Context<'_>, a: [u64; 6], allocated: bool) -> Outco
     }
     // `mprotect_fixup`'s `perf_event_mmap` of each VMA it changes.
     let before = crate::perf::protections(c, start, end);
+    // A locked private mapping made writable is written in, so that its
+    // first write takes no fault (`mprotect_fixup`'s "trigger COW"), unless
+    // it is locked on fault (`populate_vma_page_range` does nothing then).
+    let copied: Vec<(u64, u64)> = c
+        .mem
+        .mappings()
+        .filter(|m| {
+            m.start.0 < end
+                && m.end() > start
+                && m.locked == Some(paludarium_mmu::Lock::Populated)
+                && !m.prot.contains(Prot::WRITE)
+                && c.mem.shared_offset(m.start).is_none()
+        })
+        .map(|m| (m.start.0.max(start), m.end().min(end)))
+        .collect();
     match c.mem.protect_shared(GuestAddr(start), end - start, prot) {
         Ok(()) => {
             crate::perf::reprotected(c, start, end, before);
+            if prot.contains(Prot::WRITE) {
+                for (from, to) in copied {
+                    write_range_in(c.mem, from, to);
+                }
+            }
             ok(0)
         }
         Err(e) => err(e),

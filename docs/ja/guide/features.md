@@ -821,7 +821,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ロックしていないページの分の空き（`ENOMEM`）が要ります。`CAP_IPC_LOCK` があれば
   要りません。`mlock` と、`MLOCK_ONFAULT` なしの `mlock2` は、そのあとページを
   割り当て、割り当てられないページ（`PROT_NONE`、ガードページ、ファイルの終わりより
-  先）があれば `ENOMEM` を返します。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
+  先）があれば `ENOMEM` を返します。書き込めるプライベートなマッピングのページは、
+  Linux の `populate_vma_page_range` と同じく書き込んで取り込みます（`FOLL_WRITE`）。
+  そこにあるファイルのページは自分だけのコピーになり、そのあとのファイルへの書き込みは
+  見えなくなります。`MAP_POPULATE`、`MAP_LOCKED`、`MCL_CURRENT` の `mlockall`、
+  ロックしたプライベートなマッピングを書き込めるようにする `mprotect` も同じです。
+  `MLOCK_ONFAULT` や `MCL_ONFAULT` のロックは何も取り込みません。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
   （マップしているもの全部が収まらなければ `ENOMEM`）、`MCL_FUTURE` で新しいマッピングを
   ロックします。そのあとの `mmap`、`brk`、広がる `mremap` には、`MAP_LOCKED` と同じく
   空きが要ります（`EAGAIN`。`brk` は区切りを変えません）。`munlockall` はどちらも
@@ -4170,8 +4175,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     Linux の `vma_dump_size` が既定の `coredump_filter` で選ぶのと同じように
     選びます。private なマッピングは、その VMA の
     ページが一度でも書かれていれば（Linux の `anon_vma`。分割、`MADV_DONTNEED`、`fork`
-    の後も残り、VMA に併合されたマッピングも共有し、書き込める `MAP_POPULATE` や
-    `MAP_LOCKED` のマッピングにも付きます）丸ごと入り、そうでなければ入りません。
+    の後も残り、VMA に併合されたマッピングも共有し、書き込めるマッピングのページを
+    取り込むと付きます。`MAP_POPULATE`、`MAP_LOCKED`、フォールト時でないロックです）丸ごと入り、そうでなければ入りません。
     ただし、ELF のファイルの先頭からのファイルのマッピングは最初のページが入ります。
     共有のマッピングは、そのファイルをどの名前もリンクしていなければ（無名のもの、
     memfd、後から unlink したファイル）丸ごと入り、そうでなければ入りません。

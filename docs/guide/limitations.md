@@ -52,8 +52,9 @@ verified.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. The
-  pages that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in of a
-  file are counted only once touched. A read fault in a file's mapping
+  pages that `MAP_POPULATE`, `MAP_LOCKED` or a lock would read in of a
+  file (a mapping not both private and writable) are counted only once
+  touched. A read fault in a file's mapping
   maps no more than the 16 pages around it
   ([features](./features#system-calls)), where Linux maps a large folio
   of its page cache whole when the folio lies within the file, the VMA
@@ -634,7 +635,8 @@ verified.
     would run it in that segment or fault.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
-    `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
+    `MAP_POPULATE`, `MAP_LOCKED` or a memory lock read in (a mapping not both
+    private and writable) until it is touched.
   - Adjacent private VMAs merge once their flags agree again (after
     `munlock`, for one), whatever their `anon_vma`s. Linux merges them only
     when they share one. A VMA gets its `anon_vma` on its first write, and

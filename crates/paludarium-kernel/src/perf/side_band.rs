@@ -151,8 +151,9 @@ pub(super) fn fork(
     child_tid: u32,
 ) {
     for event in receivers(events, group, who.tid, who, asks) {
-        let mut body = event.pid_tid_of(child_pid, child_tid).to_vec();
-        body.extend_from_slice(&event.pid_tid_of(who.pid, who.tid));
+        // `pid`, `ppid`, `tid`, `ptid`.
+        let mut body = event.pid_tid_of(child_pid, who.pid).to_vec();
+        body.extend_from_slice(&event.pid_tid_of(child_tid, who.tid));
         put(&mut body, event.clock_now());
         event.side_band(RECORD_FORK, 0, &body, who);
     }
@@ -163,8 +164,9 @@ pub(super) fn fork(
 /// gives as both the parent process and thread (`real_parent`).
 pub(super) fn exit(events: &Events, group: &ThreadGroup, who: &Who, ppid: u32) {
     for event in receivers(events, group, who.tid, who, asks) {
-        let mut body = event.pid_tid_of(who.pid, who.tid).to_vec();
-        body.extend_from_slice(&event.pid_tid_of(ppid, ppid));
+        // `pid`, `ppid`, `tid`, `ptid`.
+        let mut body = event.pid_tid_of(who.pid, ppid).to_vec();
+        body.extend_from_slice(&event.pid_tid_of(who.tid, ppid));
         put(&mut body, event.clock_now());
         event.side_band(RECORD_EXIT, 0, &body, who);
     }
@@ -186,8 +188,9 @@ struct Mapping {
 
 impl Mapping {
     /// `vma` of an address space whose stack starts at `start_stack`,
-    /// its file named as `d_path` gives it from `root`.
-    fn of(vma: &Vma, start_stack: u64, root: &[u8]) -> Self {
+    /// its file named as `d_path` gives it from `root`, and named the heap
+    /// for `heap` (`vma_is_initial_heap`).
+    fn of(vma: &Vma, start_stack: u64, root: &[u8], heap: bool) -> Self {
         let (device, inode) = vma.identity;
         let major = ((device >> 8) & 0xfff) as u32;
         let mut minor = ((device & 0xff) | ((device >> 12) & !0xff)) as u32;
@@ -201,7 +204,7 @@ impl Mapping {
                 minor = 1;
                 b"/dev/zero (deleted)".to_vec()
             }
-            None if vma.heap => b"[heap]".to_vec(),
+            None if heap => b"[heap]".to_vec(),
             None if vma.start <= start_stack && vma.end >= start_stack => b"[stack]".to_vec(),
             None => b"//anon".to_vec(),
         };
@@ -288,14 +291,25 @@ impl Space<'_> {
         let events = receivers(events, self.group, self.who.tid, &self.who, wants);
         (!events.is_empty()).then_some(events)
     }
-    /// The records of `vmas` to `events`, each to those that want it.
-    fn write(&self, events: &[Arc<Event>], vmas: impl IntoIterator<Item = Vma>) {
+    /// The records of `vmas` to `events`, each to those that want it; with
+    /// `old_break`, the break was there when they were written, as `brk`
+    /// sets the new one only after `do_brk_flags`.
+    fn write(
+        &self,
+        events: &[Arc<Event>],
+        vmas: impl IntoIterator<Item = Vma>,
+        old_break: Option<u64>,
+    ) {
         let start_stack = self.group.start_stack();
         for vma in vmas {
-            let mapping = Mapping::of(&vma, start_stack, self.root);
-            for event in events.iter().filter(|event| mapping.wanted_by(&event.attr)) {
-                mapping.write(event, &self.who);
-            }
+            let heap = vma.heap && old_break.is_none_or(|old| vma.start < old);
+            let mapping = Mapping::of(&vma, start_stack, self.root, heap);
+            Self::write_one(events, &mapping, &self.who);
+        }
+    }
+    fn write_one(events: &[Arc<Event>], mapping: &Mapping, who: &Who) {
+        for event in events.iter().filter(|event| mapping.wanted_by(&event.attr)) {
+            mapping.write(event, who);
         }
     }
     /// The VMAs that cover any of `start..end`, in order.
@@ -318,9 +332,9 @@ impl Space<'_> {
 }
 
 /// `perf_event_mmap` of the VMA that now holds `addr`, as `mmap`, `brk`'s
-/// growth, `shmat` and `remap_file_pages` make it: the whole VMA, as it
-/// merged with its neighbours.
-pub(crate) fn mapped(events: &Events, space: &Space<'_>, addr: u64) {
+/// growth (from `old_break`), `shmat` and `remap_file_pages` make it: the
+/// whole VMA, as it merged with its neighbours.
+pub(crate) fn mapped(events: &Events, space: &Space<'_>, addr: u64, old_break: Option<u64>) {
     let Some(receivers) = space.receivers(events) else {
         return;
     };
@@ -329,7 +343,7 @@ pub(crate) fn mapped(events: &Events, space: &Space<'_>, addr: u64) {
         .view()
         .vma_from(addr)
         .filter(|vma| vma.start <= addr);
-    space.write(&receivers, vma);
+    space.write(&receivers, vma, old_break);
 }
 
 /// The protections of the VMAs over `start..end` before `mprotect`
@@ -379,13 +393,16 @@ pub(crate) fn reprotected(
             from < vma.end && to > vma.start && flags != vma.flags & PROTECTION
         })
     });
-    space.write(&receivers, changed);
+    space.write(&receivers, changed, None);
 }
 
 /// What an `execve` writes once it has loaded the program: `COMM` of the
-/// program's name, and then the new address space's mappings, as
-/// `setup_arg_pages` grows the stack first and the loader maps the rest
-/// in the order of their addresses.
+/// program's name, and then the new address space's mappings. First come
+/// the stack's two of `setup_arg_pages`: its `mprotect_fixup` of the
+/// temporary stack, at the top of user space and holding the arguments,
+/// before the stack has a name (`//anon`), and its growth to where it is
+/// (`[stack]`). The loader's mappings follow in the order of their
+/// addresses.
 pub(super) fn exec(events: &Events, space: &Space<'_>, counted: u32, name: &[u8]) {
     let who = space.who;
     comm_from(
@@ -409,7 +426,22 @@ pub(super) fn exec(events: &Events, space: &Space<'_>, counted: u32, name: &[u8]
         .vmas(0, u64::MAX)
         .into_iter()
         .partition(|vma| vma.file.is_none() && vma.start <= start_stack && vma.end >= start_stack);
-    space.write(&receivers, stack.into_iter().chain(rest));
+    for vma in &stack {
+        // Linux's `STACK_TOP_MAX` with 4-level page tables.
+        const TOP: u64 = 0x7fff_ffff_f000;
+        let len = vma
+            .end
+            .saturating_sub(start_stack & !0xfff)
+            .clamp(4096, TOP);
+        let temporary = Vma {
+            start: TOP - len,
+            end: TOP,
+            ..vma.clone()
+        };
+        let mapping = Mapping::of(&temporary, 0, space.root, false);
+        Space::write_one(&receivers, &mapping, &who);
+    }
+    space.write(&receivers, stack.into_iter().chain(rest), None);
 }
 
 #[cfg(test)]
@@ -441,14 +473,19 @@ mod tests {
 
     #[test]
     fn private_anonymous_memory_is_at_its_own_address_and_named_anon() {
-        let m = Mapping::of(&vma(0x10000, 0x13000, vm::READ | vm::WRITE, None), 0, b"/");
+        let m = Mapping::of(
+            &vma(0x10000, 0x13000, vm::READ | vm::WRITE, None),
+            0,
+            b"/",
+            false,
+        );
         assert_eq!((m.start, m.len, m.pgoff), (0x10000, 0x3000, 0x10000));
         assert_eq!(
             (m.prot, m.flags, m.exec),
             (PROT_READ | PROT_WRITE, MAP_PRIVATE, false)
         );
         assert_eq!(m.name, padded(b"//anon"));
-        let stack = Mapping::of(&vma(0x10000, 0x13000, vm::READ, None), 0x12000, b"/");
+        let stack = Mapping::of(&vma(0x10000, 0x13000, vm::READ, None), 0x12000, b"/", false);
         assert_eq!(stack.name, padded(b"[stack]"));
     }
 
@@ -460,7 +497,12 @@ mod tests {
             offset: 0x2000,
         };
         let flags = vm::READ | vm::EXEC | vm::MAYSHARE | vm::LOCKED;
-        let m = Mapping::of(&vma(0x40_0000, 0x40_1000, flags, Some(file)), 0, b"/jail");
+        let m = Mapping::of(
+            &vma(0x40_0000, 0x40_1000, flags, Some(file)),
+            0,
+            b"/jail",
+            false,
+        );
         assert_eq!(m.pgoff, 0x2000);
         assert_eq!((m.major, m.minor, m.inode), (8, 3, 42));
         assert_eq!(
@@ -477,6 +519,7 @@ mod tests {
             &vma(0, 0x1000, vm::READ | vm::MAYSHARE, Some(shared)),
             0,
             b"/",
+            false,
         );
         assert_eq!(
             (m.minor, &m.name[..]),

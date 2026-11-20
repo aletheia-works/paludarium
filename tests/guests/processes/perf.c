@@ -1171,6 +1171,9 @@ static void say_record(const uint64_t *record, void *with) {
         int mmap2 = type == RECORD_MMAP2;
         uint64_t start = record[2], len = record[3], pgoff = record[4];
         const char *name = mapping_name(record, mmap2);
+        /* The emulator has no vDSO (see the limitations): Linux's records
+           of its mappings at exec are not compared. */
+        if (!strcmp(name, "[vdso]") || !strncmp(name, "[vvar", 5)) return;
         const uint32_t *words = (const uint32_t *)(record + 5);
         char *at = (char *)start;
         const char *what = "other";
@@ -1201,10 +1204,11 @@ static void say_record(const uint64_t *record, void *with) {
     } else if (type == RECORD_FORK || type == RECORD_EXIT) {
         const uint32_t *parent = (const uint32_t *)(record + 2);
         const uint32_t *trailer = (const uint32_t *)(record + 4);
+        /* pid, ppid, tid, ptid */
         say("%s child %d parent %d by %s", type == RECORD_FORK ? "fork" : "exit",
-            ids[0] == (uint32_t)e->child && ids[1] == (uint32_t)e->child,
-            type == RECORD_FORK ? parent[0] == (uint32_t)e->pid && parent[1] == (uint32_t)e->tid
-                                : parent[0] == (uint32_t)e->parent && parent[1] == (uint32_t)e->parent,
+            ids[0] == (uint32_t)e->child && parent[0] == (uint32_t)e->child,
+            type == RECORD_FORK ? ids[1] == (uint32_t)e->pid && parent[1] == (uint32_t)e->tid
+                                : ids[1] == (uint32_t)e->parent && parent[1] == (uint32_t)e->parent,
             trailer[1] == (uint32_t)e->child ? "child" : trailer[1] == (uint32_t)e->tid ? "parent" : "other");
     } else {
         say("record %u", type);

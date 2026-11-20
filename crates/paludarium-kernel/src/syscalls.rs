@@ -3658,7 +3658,7 @@ fn sys_brk(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
     // `do_brk_flags`' `perf_event_mmap` of the VMA it grew or made.
     if up(new) > up(old) {
-        crate::perf::mapped(c, up(old));
+        crate::perf::grew_break(c, up(old), old);
     }
     ok(new)
 }

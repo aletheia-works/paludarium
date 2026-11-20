@@ -286,7 +286,9 @@ verified.
   not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
   or `UNTHROTTLE`), and an event of a CPU takes none, nor any side-band
   record. Of those, an `execve` writes the new program's mappings once it
-  has loaded it, the stack first and the rest by address, where Linux
+  has loaded it, the stack's two first and the rest by address: the
+  temporary stack's is placed at the top of 4-level user space with the
+  length of the arguments' pages, where Linux gives where it was. Linux
   first writes a position-independent program's or interpreter's first
   segment as long as the whole image, before it trims it; a stack that
   grows down as the program touches it writes none; a mapping's inode

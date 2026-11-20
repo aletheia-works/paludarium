@@ -1480,7 +1480,15 @@ fn with_space<T>(c: &Context<'_>, f: impl FnOnce(&Space<'_>) -> T) -> Option<T> 
 /// mapped it (`mmap`, `brk`, `shmat`, `remap_file_pages`).
 pub(crate) fn mapped(c: &Context<'_>, addr: u64) {
     with_space(c, |space| {
-        side_band::mapped(&c.processes.perf_events, space, addr)
+        side_band::mapped(&c.processes.perf_events, space, addr, None);
+    });
+}
+
+/// The same for `brk`'s growth from `old_break`, which is still the break
+/// when Linux writes the record.
+pub(crate) fn grew_break(c: &Context<'_>, addr: u64, old_break: u64) {
+    with_space(c, |space| {
+        side_band::mapped(&c.processes.perf_events, space, addr, Some(old_break));
     });
 }
 

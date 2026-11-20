@@ -6786,7 +6786,7 @@ static int fault_around_case(void) {
     const size_t block = (size_t)2 << 20;
     int pagemap = open("/proc/self/pagemap", O_RDONLY);
     if (pagemap < 0) return 80;
-    char *reserve = mmap(NULL, 8 * block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    char *reserve = mmap(NULL, 9 * block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (reserve == MAP_FAILED) return 81;
     char *base = (char *)(((uintptr_t)reserve + block - 1) & ~(uintptr_t)(block - 1));
     /* A file of 40 pages and 100 bytes, all in the page cache. It is
@@ -6868,6 +6868,34 @@ static int fault_around_case(void) {
     fa_show(pagemap, "System V", g, 16);
     shmdt(f);
     shmdt(g);
+
+    /* A tracer's read faults in as Linux's get_user_pages does (FOLL_FORCE,
+       handle_mm_fault), and so maps the pages around it too. */
+    char *h = mmap(base + 7 * block, (size_t)(32 * page), PROT_READ, fixed, fd, 0);
+    if (h == MAP_FAILED) return 94;
+    fflush(stdout);
+    pid_t traced = fork();
+    if (traced < 0) return 95;
+    if (traced == 0) {
+        if (syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0)) _exit(1);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(traced, &status, WUNTRACED) != traced) return 96;
+    long word = 0;
+    long peeked = syscall(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, traced, h + 5 * page, &word);
+    char other[64];
+    snprintf(other, sizeof other, "/proc/%d/pagemap", (int)traced);
+    int theirs = open(other, O_RDONLY);
+    printf("peek: %ld word=%lx\n", peeked, (unsigned long)word);
+    if (theirs >= 0) {
+        fa_show(theirs, "traced", h, 32);
+        close(theirs);
+    }
+    fa_show(pagemap, "tracer", h, 32);
+    kill(traced, SIGKILL);
+    waitpid(traced, NULL, 0);
     return 0;
 }
 

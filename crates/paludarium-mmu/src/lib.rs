@@ -3339,8 +3339,10 @@ impl AddressSpaceData {
             None => false,
         }
     }
-    /// After a read fault on `page`, which had no entry, gives entries to
-    /// the pages around it that its file's page cache holds, as Linux's
+    /// After a read fault on `page`, which had no entry (an access's, or a
+    /// read through `get_user_pages`: a core dump's, `ptrace`'s, a lock's
+    /// population), gives entries to the pages around it that its file's
+    /// page cache holds, as Linux's
     /// `do_fault_around` maps them with `filemap_map_pages`: up to
     /// [`FAULT_AROUND_PAGES`] pages from `page`'s aligned block, or from the
     /// VMA's start if that is later, within the VMA and the page table. A
@@ -3878,12 +3880,15 @@ impl AddressSpaceData {
                 let (dir, slot) = page_index(page);
                 let table = directory.entry(dir).or_insert_with(PageTable::new);
                 if let Some(entry) = table.pages.get_mut(slot) {
-                    let fault = entry.is_none() && matches!(access, Access::Read | Access::Fetch);
-                    if fault {
+                    let missing = entry.is_none();
+                    if missing && matches!(access, Access::Read | Access::Fetch) {
                         faults::count();
                     }
                     self.refresh(entry, page, prot, false);
-                    if fault {
+                    // A core dump's or `ptrace`'s read, and a lock's
+                    // population, fault in through `get_user_pages`, whose
+                    // `handle_mm_fault` maps around as an access does.
+                    if missing && matches!(access, Access::Read | Access::Fetch | Access::Dump) {
                         self.fault_around(&mut directory, page);
                     }
                 }
@@ -9063,6 +9068,33 @@ mod tests {
     }
     fn pattern(offset: u64) -> u8 {
         (offset % 251) as u8
+    }
+
+    #[test]
+    fn a_read_for_a_dump_or_a_tracer_maps_the_pages_around_it_too() {
+        let source: Arc<dyn PageSource> =
+            Arc::new(Resizable(Arc::new(AtomicU64::new(32 * PAGE_SIZE))));
+        let mut space = AddressSpace::new();
+        let base = GuestAddr(0x4000_0000);
+        let file = space
+            .map(Some(base), 32 * PAGE_SIZE, Prot::NONE, MappingKind::File)
+            .unwrap();
+        space
+            .back_with_file(file, 32 * PAGE_SIZE, Arc::clone(&source), 0)
+            .unwrap();
+        let _ = faults::take();
+        // Whatever the protection, as `FOLL_FORCE` reads, and counting no
+        // fault of the caller's.
+        let mut byte = [0u8];
+        space
+            .read_for_dump(GuestAddr(base.0 + 20 * PAGE_SIZE + 3), &mut byte)
+            .unwrap();
+        assert_eq!(byte[0], pattern(20 * PAGE_SIZE + 3));
+        assert_eq!(faults::take(), 0);
+        assert_eq!(space.resident_pages().1, 16);
+        let forced = space.view().read_forced(base.0 + 2 * PAGE_SIZE, &mut byte);
+        assert_eq!(forced, Some(1));
+        assert_eq!(space.resident_pages().1, 32);
     }
 
     #[test]

@@ -3575,7 +3575,9 @@ kernel.
   written, a file's page two mappings show), is shared, with its size
   divided by that count in `Pss`, as Linux's `smaps_account` takes the
   precise map count. A read fault in a file's mapping gives entries to
-  the pages around it too, as Linux's `do_fault_around` maps them: up to
+  the pages around it too, as Linux's `do_fault_around` maps them, and so
+  does a read that faults in through `get_user_pages` (a core dump's, a
+  tracer's `PTRACE_PEEKDATA`, `mlock`'s population): up to
   16 (the default `fault_around_bytes`, 64 KiB) from the faulting page's
   aligned block of 16, or from the VMA's start if that is later, within
   the VMA, its page table and the file, and only pages the page cache

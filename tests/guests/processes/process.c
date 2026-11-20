@@ -6158,7 +6158,8 @@ static void pm_present(int fd, const char *label, const void *at, int pages) {
    entry a page (present, swapped or a guard, file or anonymous, mapped
    only here, soft-dirty), and how it is read, and what MADV_DONTNEED does
    to the entries of a shared file mapping, System V shared memory and a
-   loaded program's segment. The frame numbers are 0, as for any reader without CAP_SYS_ADMIN. */
+   loaded program's segment. The frame numbers are 0, as for any reader
+   without CAP_SYS_ADMIN. */
 static int pagemap_case(void) {
     long page = 4096;
     /* Run as root, it becomes an unprivileged user first, so that Linux and

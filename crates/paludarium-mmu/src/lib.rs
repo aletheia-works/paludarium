@@ -6452,13 +6452,13 @@ impl AddressSpaceData {
     /// mapping or an ELF segment read their file again
     /// ([`Self::back_with_file`]) at their next access, as Linux faults
     /// them in from the file. The ones without a recorded file keep theirs,
-    /// as there is nothing to read again. Shared pages keep their contents, as their memory
-    /// outlives the mapping, and lose their entries, which an access makes
-    /// again from the shared memory: shmem's, System V shared memory's and
-    /// a file's alike, as Linux's `zap_pte_range` clears every entry and
-    /// the page cache keeps the pages. A write-protected entry of memory
-    /// that is not anonymous leaves a uffd-wp marker
-    /// ([`Self::keep_uffd_markers`]).
+    /// as there is nothing to read again. Shared pages keep their contents,
+    /// as their memory outlives the mapping, and lose their entries, which
+    /// an access makes again from the shared memory: shmem's, System V
+    /// shared memory's and a file's alike, as Linux's `zap_pte_range`
+    /// clears every entry and the page cache keeps the pages. A
+    /// write-protected entry of memory that is not anonymous leaves a
+    /// uffd-wp marker ([`Self::keep_uffd_markers`]).
     /// Applies the mapped parts and returns `ENOMEM` when the range has a
     /// hole, as Linux does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {

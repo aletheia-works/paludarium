@@ -2884,6 +2884,23 @@ fn populating_a_writable_private_file_mapping_copies_its_pages() {
     assert_eq!(f.ret(10, &[at, 4096, 3]), 0);
     assert!(shows_the_file(&mut f, at));
     assert_eq!(f.ret(11, &[at, 4096]), 0);
+    // A page past the end of the file cannot be brought in (`ENOMEM`), but
+    // its write fault gave the mapping an `anon_vma` first
+    // (`vmf_anon_prepare` in `do_cow_fault`), as MAP_POPULATE's does.
+    let written = |f: &Fixture, at: u64| {
+        f.mem
+            .mappings()
+            .find(|m| m.start.0 == at)
+            .is_some_and(|m| m.written)
+    };
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2, fd, 4096]);
+    assert!(!written(&f, at));
+    assert_eq!(f.ret(149, &[at, 4096]), errno(Errno::ENOMEM));
+    assert!(written(&f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2 | 0x8000, fd, 4096]);
+    assert!(written(&f, at));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
 }
 #[test]
 fn memory_file_shared_mapping_needs_a_writable_file() {

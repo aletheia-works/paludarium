@@ -2862,6 +2862,9 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, lock: Option<paludarium_mmu:
             }
             let write = writes_in(c.mem, &m);
             let mut page = m.start.0.max(start);
+            if write {
+                mark_written_for(c.mem, page);
+            }
             while page < m.end().min(end) {
                 let faulted = if write {
                     write_in(c.mem, page).is_err()
@@ -3179,7 +3182,8 @@ fn writes_in(mem: &AddressSpace, m: &paludarium_mmu::Mapping) -> bool {
 /// in each private mapping there that may be written ([`writes_in`]), as
 /// Linux's `populate_vma_page_range` does with `FOLL_WRITE`, and leaves
 /// the others: a page that cannot be written in (past the end of its file)
-/// is passed over, as `mm_populate` ignores the errors.
+/// is passed over, as `mm_populate` ignores the errors. Each such mapping
+/// is marked written first ([`mark_written_for`]).
 fn write_range_in(mem: &AddressSpace, start: u64, end: u64) {
     let mappings: Vec<_> = mem
         .mappings()
@@ -3187,6 +3191,7 @@ fn write_range_in(mem: &AddressSpace, start: u64, end: u64) {
         .collect();
     for m in mappings {
         let mut page = m.start.0.max(start);
+        mark_written_for(mem, page);
         while page < m.end().min(end) {
             let _ = write_in(mem, page);
             page += 4096;
@@ -3194,17 +3199,25 @@ fn write_range_in(mem: &AddressSpace, start: u64, end: u64) {
     }
 }
 
+/// Gives the mapping at `page` its `anon_vma`, as the write fault that
+/// brings a page of it in does before anything else (`do_cow_fault` and
+/// `wp_page_copy` call `vmf_anon_prepare` first): it has one even when
+/// the page then cannot be brought in. Done once per mapping, before its
+/// first [`write_in`].
+fn mark_written_for(mem: &AddressSpace, page: u64) {
+    mem.mark_written(GuestAddr(page), 1);
+}
+
 /// Brings the page at `page` in by writing it, as a write fault does,
-/// leaving its bytes as they were: a private page gets a copy of its own,
-/// and its mapping an `anon_vma`.
+/// leaving its bytes as they were: a private page gets a copy of its own.
+/// The caller has marked its mapping written ([`mark_written_for`]).
 fn write_in(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> {
     mem.atomic(
         GuestAddr(page),
         paludarium_mmu::AtomicWidth::W8,
         paludarium_mmu::AtomicOp::Add(0),
-    )?;
-    mem.mark_written(GuestAddr(page), 1);
-    Ok(())
+    )
+    .map(drop)
 }
 
 /// `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` of `[addr, end)`, as
@@ -3226,6 +3239,9 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
         let stop = mapping.end().min(end);
         if !mapping.prot.contains(needed) || maps_secret(mem, at, stop) {
             return Err(Errno::EINVAL);
+        }
+        if write {
+            mark_written_for(mem, at);
         }
         while at < stop {
             let faulted = if write {

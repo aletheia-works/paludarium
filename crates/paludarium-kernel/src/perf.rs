@@ -24,8 +24,10 @@
 //! ([`buffer::set_output`]).
 mod buffer;
 mod sample;
+mod side_band;
 
-pub(crate) use sample::{Task, overflow, sampling};
+pub(crate) use sample::{Task, Who, overflow, sampling};
+pub(crate) use side_band::{Space, comm, wanted};
 
 use crate::ThreadGroup;
 use crate::syscalls::{Context, Outcome};
@@ -130,8 +132,13 @@ mod bit {
     pub const EXCLUSIVE: u32 = 3;
     pub const EXCLUDE_USER: u32 = 4;
     pub const EXCLUDE_KERNEL: u32 = 5;
+    pub const MMAP: u32 = 8;
+    pub const COMM: u32 = 9;
     pub const FREQ: u32 = 10;
+    pub const TASK: u32 = 13;
     pub const WATERMARK: u32 = 14;
+    pub const MMAP_DATA: u32 = 17;
+    pub const MMAP2: u32 = 23;
     pub const SAMPLE_ID_ALL: u32 = 18;
     pub const ENABLE_ON_EXEC: u32 = 12;
     pub const EXCLUDE_CALLCHAIN_KERNEL: u32 = 21;
@@ -521,6 +528,9 @@ pub(crate) struct Events {
     /// Whether an event of a task has sampled, so that the system calls
     /// look for samples to take ([`sample::overflow`]) only then.
     sampling: std::sync::atomic::AtomicBool,
+    /// Whether an event of a task has asked for side-band records, so that
+    /// the hooks look for those that take them only then ([`side_band`]).
+    side_band: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -573,6 +583,9 @@ impl Events {
             lists.counting.push(erase(event));
             if event.attr.sampling() {
                 self.sampling.store(true, Ordering::Relaxed);
+            }
+            if side_band::asks(&event.attr) {
+                self.side_band.store(true, Ordering::Relaxed);
             }
         }
         lists.owned.push(Owned {
@@ -1243,8 +1256,12 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
 /// number do not reach them, and those that count it go to Linux's `EXIT`
 /// state (`perf_event_exit_task_context`, `DETACH_EXIT`): they count no
 /// more, keep their last count and times to be read, stay in their group,
-/// are not enabled again and lead no new group (`ENODEV`).
-pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, tid: u32) {
+/// are not enabled again and lead no new group (`ENODEV`). First the
+/// events that count it take `PERF_RECORD_EXIT` of it, a thread of a
+/// process whose parent is `ppid` (`perf_event_exit_task_context`).
+pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, who: &Who, ppid: u32) {
+    side_band::exit(events, group, who, ppid);
+    let tid = who.tid;
     let counting: Vec<Arc<Event>> = {
         let mut lists = lock(&events.lists);
         lists
@@ -1293,8 +1310,26 @@ const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
 /// `CLONE_CLEAR_SIGHAND`): each event of them gets one of its own, of the
 /// opened event's attributes, enabled as the one it is made from is
 /// (`inherit_event`). An event `remove_on_exec` or the end of its task took
-/// out is not inherited.
+/// out is not inherited. Then the events that count the thread `who`
+/// take `PERF_RECORD_FORK` of the new one (`perf_event_fork`).
 pub(crate) fn clone(
+    events: &Events,
+    group: &ThreadGroup,
+    who: &Who,
+    child_group: &Arc<ThreadGroup>,
+    child_tid: u32,
+    flags: u64,
+) {
+    inherit(events, group, who.tid, child_group, child_tid, flags);
+    let child_pid = if std::ptr::eq(Arc::as_ptr(child_group), group) {
+        who.pid
+    } else {
+        child_tid
+    };
+    side_band::fork(events, group, who, child_pid, child_tid);
+}
+
+fn inherit(
     events: &Events,
     group: &ThreadGroup,
     tid: u32,
@@ -1351,7 +1386,23 @@ pub(crate) fn clone(
 /// good (`perf_event_remove_on_exec`); the events the thread opened stay
 /// its own under its new number, and those the group's other threads, which
 /// the exec ends, opened have no owner any more (`perf_event_exit_task`).
-pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32) {
+/// Then the events that count the thread take the side-band records of the
+/// new program (`PERF_RECORD_COMM` of its `name` and its mappings) from
+/// `image`, as `begin_new_exec` and the loader write them.
+pub(crate) fn exec(
+    events: &Events,
+    group: &ThreadGroup,
+    tid: u32,
+    new_tid: u32,
+    image: Option<(&Space<'_>, &[u8])>,
+) {
+    exec_events(events, group, tid, new_tid);
+    if let Some((space, name)) = image {
+        side_band::exec(events, space, tid, name);
+    }
+}
+
+fn exec_events(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32) {
     let mut lists = lock(&events.lists);
     lists
         .owned
@@ -1399,6 +1450,62 @@ pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32)
             .iter()
             .any(|&gone| std::ptr::addr_eq(owned.event.as_ptr(), gone))
     });
+}
+
+/// The thread of system call `c` that writes a record.
+fn who(c: &Context<'_>) -> Who {
+    Who {
+        pid: c.process.pid,
+        tid: c.tid,
+        cpu: c.process.cpu.on.map_or(0, |(cpu, _)| cpu),
+    }
+}
+
+/// Runs `f` with the address space, root and thread of system call `c`
+/// once an event wants side-band records, and does nothing otherwise.
+fn with_space<T>(c: &Context<'_>, f: impl FnOnce(&Space<'_>) -> T) -> Option<T> {
+    if !wanted(&c.processes.perf_events) {
+        return None;
+    }
+    let root = c.files.root();
+    Some(f(&Space {
+        group: c.group,
+        who: who(c),
+        mem: c.mem,
+        root: &root,
+    }))
+}
+
+/// `perf_event_mmap` of the VMA that holds `addr` after system call `c`
+/// mapped it (`mmap`, `brk`, `shmat`, `remap_file_pages`).
+pub(crate) fn mapped(c: &Context<'_>, addr: u64) {
+    with_space(c, |space| {
+        side_band::mapped(&c.processes.perf_events, space, addr)
+    });
+}
+
+/// What `mprotect` of `start..end` by system call `c` changes, taken
+/// before it does ([`reprotected`]).
+pub(crate) fn protections(c: &Context<'_>, start: u64, end: u64) -> Option<Vec<(u64, u64, u64)>> {
+    with_space(c, |space| {
+        side_band::protections(&c.processes.perf_events, space, start, end)
+    })
+    .flatten()
+}
+
+/// `mprotect_fixup`'s records of the VMAs over `start..end` that system
+/// call `c` gave another protection than `before`.
+pub(crate) fn reprotected(
+    c: &Context<'_>,
+    start: u64,
+    end: u64,
+    before: Option<Vec<(u64, u64, u64)>>,
+) {
+    if before.is_some() {
+        with_space(c, |space| {
+            side_band::reprotected(&c.processes.perf_events, space, start, end, before);
+        });
+    }
 }
 
 const IOC_ENABLE: u64 = 0x2400;
@@ -1582,6 +1689,15 @@ impl FileHandle for EventFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Thread `tid` of a process of its own number, on CPU 0.
+    fn thread_on(tid: u32) -> Who {
+        Who {
+            pid: tid,
+            tid,
+            cpu: 0,
+        }
+    }
 
     #[test]
     fn the_requests_are_linuxs_numbers() {
@@ -1820,7 +1936,7 @@ mod tests {
             events.add(event, &group, 5);
         }
         leader.enable();
-        clone(&events, &group, 5, &child_group, 9, 0);
+        clone(&events, &group, &thread_on(5), &child_group, 9, 0);
         assert_eq!(leader.children().len(), 1);
         assert_eq!(member.children().len(), 1);
         assert!(alone.children().is_empty());
@@ -1838,7 +1954,7 @@ mod tests {
         lock(&child_leader.state).count = 7;
         lock(&child_member.state).count = 3;
         assert_eq!(leader.totals().0, 7);
-        exit_thread(&events, &child_group, 9);
+        exit_thread(&events, &child_group, &thread_on(9), 1);
         assert!(leader.children().is_empty() && member.children().is_empty());
         assert_eq!((leader.totals().0, member.totals().0), (7, 3));
         // A reset leaves what ended children gave back.
@@ -1859,9 +1975,16 @@ mod tests {
             1 << bit::INHERIT | 1 << bit::INHERIT_THREAD,
         );
         events.add(&event, &group, 5);
-        clone(&events, &group, 5, &Arc::new(ThreadGroup::default()), 9, 0);
+        clone(
+            &events,
+            &group,
+            &thread_on(5),
+            &Arc::new(ThreadGroup::default()),
+            9,
+            0,
+        );
         assert!(event.children().is_empty());
-        clone(&events, &group, 5, &group, 6, CLONE_THREAD);
+        clone(&events, &group, &thread_on(5), &group, 6, CLONE_THREAD);
         assert_eq!(event.children().len(), 1);
     }
 
@@ -1881,7 +2004,7 @@ mod tests {
         let leader = with_attr(None, on(), attr);
         events.add(&leader, &group, 5);
         assert!(leader.read_values().is_ok());
-        clone(&events, &group, 5, &group, 6, CLONE_THREAD);
+        clone(&events, &group, &thread_on(5), &group, 6, CLONE_THREAD);
         assert!(leader.read_values().is_ok());
         let _late = with_attr(Some(&leader), on(), attr);
         assert_eq!(leader.read_values(), Err(ECHILD));
@@ -1919,7 +2042,7 @@ mod tests {
         let (mine, other) = (event(None), event(None));
         events.add(&mine, &group, 5);
         events.add(&other, &group, 6);
-        exit_thread(&events, &group, 5);
+        exit_thread(&events, &group, &thread_on(5), 1);
         assert!(events.owned_by(&group, 5).is_empty());
         assert_eq!(ids(&events.owned_by(&group, 6)), ids(&[other]));
     }
@@ -1939,7 +2062,7 @@ mod tests {
             event.enable();
             events.add(event, &group, 1);
         }
-        exit_thread(&events, &group, 5);
+        exit_thread(&events, &group, &thread_on(5), 1);
         for event in [&leader, &member] {
             let state = lock(&event.state);
             assert!(state.removed && !state.enabled);

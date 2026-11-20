@@ -250,6 +250,8 @@ mod linux {
                     | "perf-output"
                     | "perf-sample"
                     | "perf-wakeup"
+                    | "perf-side-band"
+                    | "perf-side-band-exec"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -583,6 +585,8 @@ mod linux {
         perf_output => ("perf-output","perf"),
         perf_sample => ("perf-sample","perf"),
         perf_wakeup => ("perf-wakeup","perf"),
+        perf_side_band => ("perf-side-band","perf"),
+        perf_side_band_exec => ("perf-side-band-exec","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),

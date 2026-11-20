@@ -284,8 +284,18 @@ verified.
   of the kernel (a fault in a system call, a switch or a migration) has the
   address 0 and no kernel frames. `freq` follows the rate at those points,
   not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
-  or `UNTHROTTLE`), an event of a CPU takes none, and no other record
-  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. The overflows
+  or `UNTHROTTLE`), and an event of a CPU takes none, nor any side-band
+  record. Of those, an `execve` writes the new program's mappings once it
+  has loaded it, the stack first and the rest by address, where Linux
+  first writes a position-independent program's or interpreter's first
+  segment as long as the whole image, before it trims it; a stack that
+  grows down as the program touches it writes none; a mapping's inode
+  generation is 0 and no build ID is given (`build_id`); `mprotect` writes
+  one record of each VMA as it ends up, where Linux writes one each time it
+  changes one, of the VMA as merged so far; a write to
+  `/proc/<pid>/comm` writes no `COMM` record yet; and `NAMESPACES`, `CGROUP`,
+  `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
+  written. With no vDSO, no record of one is written either. The overflows
   of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
   each time the thread returns to its code, and its `si_addr` is 0, where
   Linux gives a fault's address. When `REFRESH`'s last overflow disables

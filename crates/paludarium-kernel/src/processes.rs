@@ -2405,13 +2405,28 @@ impl Kernel {
                         self.close_on_exec(thread, mem, closed);
                         // The events that wait for it start counting, as
                         // `begin_new_exec` runs `perf_event_exec` before the
-                        // tracer's exec stop.
-                        crate::perf::exec(
-                            &self.processes.perf_events,
-                            &self.group,
-                            tid,
-                            thread.tid,
-                        );
+                        // tracer's exec stop; then they take the new
+                        // program's name and mappings.
+                        let events = &self.processes.perf_events;
+                        let memory = self
+                            .exec_memory
+                            .clone()
+                            .filter(|_| crate::perf::wanted(events));
+                        let root = memory.as_ref().map(|_| self.files.root());
+                        let space = memory.as_deref().zip(root.as_deref()).map(|(mem, root)| {
+                            crate::perf::Space {
+                                group: &self.group,
+                                who: crate::perf::Who {
+                                    pid: thread.state.pid,
+                                    tid: thread.tid,
+                                    cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+                                },
+                                mem,
+                                root,
+                            }
+                        });
+                        let image = space.as_ref().map(|space| (space, &thread.state.name[..]));
+                        crate::perf::exec(events, &self.group, tid, thread.tid, image);
                         self.ptrace_exec(thread);
                         return Some(Next::Resume);
                     }
@@ -2556,6 +2571,22 @@ impl Kernel {
                     *byte = b[0];
                 }
                 thread.state.name = name;
+                // `perf_event_comm` of the new name.
+                if crate::perf::wanted(&self.processes.perf_events) {
+                    let who = crate::perf::Who {
+                        pid: thread.state.pid,
+                        tid: thread.tid,
+                        cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+                    };
+                    crate::perf::comm(
+                        &self.processes.perf_events,
+                        &self.group,
+                        &who,
+                        (who.pid, who.tid),
+                        &name,
+                        false,
+                    );
+                }
                 return Ok(0);
             }
             // PR_GET_NAME: all 16 bytes.
@@ -3478,7 +3509,11 @@ impl Kernel {
         crate::perf::clone(
             &self.processes.perf_events,
             &self.group,
-            parent.tid,
+            &crate::perf::Who {
+                pid: self.process.pid,
+                tid: parent.tid,
+                cpu: parent.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+            },
             &child.group,
             pid,
             flags,

@@ -9,7 +9,9 @@
    its user page, the sizes and mappings it takes, its AUX area, a fork's
    child, which has none of it, and the pages a user may lock; and
    output to another event's buffer, with PERF_EVENT_IOC_SET_OUTPUT and
-   PERF_FLAG_FD_OUTPUT.
+   PERF_FLAG_FD_OUTPUT; and the side-band records an event asks for:
+   MMAP and MMAP2 of mmap, mprotect, brk and shmat, COMM of
+   PR_SET_NAME and of an execve, and FORK and EXIT of a child.
 
    Counts and times are given as whether they are 0, grew or stayed,
    never as values, and IDs as whether they match. Hardware events are not
@@ -30,6 +32,9 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -1100,6 +1105,209 @@ static int case_wakeup(void) {
     return 0;
 }
 
+#define ATTR_MMAP (1ULL << 8)
+#define ATTR_COMM (1ULL << 9)
+#define ATTR_TASK (1ULL << 13)
+#define ATTR_MMAP_DATA (1ULL << 17)
+#define ATTR_MMAP2 (1ULL << 23)
+#define RECORD_MMAP 1
+#define RECORD_COMM 3
+#define RECORD_EXIT 4
+#define RECORD_FORK 7
+#define RECORD_MMAP2 10
+#define MISC_DATA (1 << 13)
+
+/* A dummy event of `pid` on `cpu` that takes the side-band records of
+   `flags`, with the thread's IDs after each (sample_id_all), and its
+   buffer of 8 data pages. */
+static int open_side_band(int pid, int cpu, uint64_t flags, void **page) {
+    struct attr a = software(9);
+    a.sample_type = SAMPLE_TID;
+    a.flags |= DISABLED | SAMPLE_ID_ALL | flags;
+    int fd = (int)open_event(&a, pid, cpu, -1, 0);
+    if (fd < 0 || map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, page) < 0) return -1;
+    return fd;
+}
+
+/* The records in a buffer of 8 data pages, from where the reader left off
+   (`tail`), each passed to `seen` and then consumed. */
+static void each_record(void *page, uint64_t *tail, void (*seen)(const uint64_t *record, void *with), void *with) {
+    uint64_t head = PAGE_U64(page, 1024);
+    __sync_synchronize();
+    while (*tail < head) {
+        uint64_t first;
+        copy_record(page, 8 * 4096, *tail, &first, 1);
+        uint64_t size = first >> 48;
+        if (size < 8 || size > 4096) break;
+        uint64_t record[512];
+        copy_record(page, 8 * 4096, *tail, record, size / 8);
+        seen(record, with);
+        *tail += size;
+    }
+    PAGE_U64(page, 1032) = *tail;
+}
+
+/* What the cases compare the records with. */
+struct expected {
+    pid_t pid, tid, child, parent;
+    char *anon, *exec_at, *shm, *heap;
+    size_t anon_len;
+    const char *path, *self;
+    struct stat file;
+    int mmap_records;
+};
+
+/* An MMAP or MMAP2 record's name, at `words` 64-bit words in. */
+static const char *mapping_name(const uint64_t *record, int mmap2) {
+    return (const char *)(record + (mmap2 ? 9 : 5));
+}
+
+static void say_record(const uint64_t *record, void *with) {
+    struct expected *e = with;
+    uint32_t type = (uint32_t)record[0];
+    unsigned misc = (unsigned)(record[0] >> 32) & 0xffff;
+    const uint32_t *ids = (const uint32_t *)(record + 1);
+    if (type == RECORD_MMAP || type == RECORD_MMAP2) {
+        int mmap2 = type == RECORD_MMAP2;
+        uint64_t start = record[2], len = record[3], pgoff = record[4];
+        const char *name = mapping_name(record, mmap2);
+        const uint32_t *words = (const uint32_t *)(record + 5);
+        char *at = (char *)start;
+        const char *what = "other";
+        if (e->path && !strcmp(name, e->path)) what = "file";
+        else if (!strcmp(name, "//anon")) what = "anon";
+        else if (!strncmp(name, "/SYSV", 5)) what = name;
+        else if (name[0] == '[') what = name;
+        say("%s %s data %d ids %d", mmap2 ? "mmap2" : "mmap", what, !!(misc & MISC_DATA),
+            ids[0] == (uint32_t)e->pid && ids[1] == (uint32_t)e->tid);
+        if (at <= e->anon && at + len > e->anon)
+            say("  anon covers %d offset is address %d len %d", at + len >= e->anon + e->anon_len,
+                pgoff == start, len == 4096 || len >= e->anon_len);
+        if (at == e->exec_at)
+            say("  exec offset %llu len %llu", (unsigned long long)pgoff, (unsigned long long)len);
+        if (e->heap && at <= e->heap && at + len > e->heap)
+            say("  heap covers the new break");
+        if (mmap2) {
+            say("  prot %u flags %u", words[6], words[7]);
+            if (at == e->exec_at)
+                say("  device %d inode %d", words[0] == major(e->file.st_dev) && words[1] == minor(e->file.st_dev),
+                    *(const uint64_t *)(words + 2) == (uint64_t)e->file.st_ino);
+        }
+        e->mmap_records++;
+    } else if (type == RECORD_COMM) {
+        const char *name = (const char *)(record + 2);
+        say("comm exec %d ids %d name %s", !!(misc & MISC_DATA), ids[0] == (uint32_t)e->pid && ids[1] == (uint32_t)e->tid,
+            e->self && !strncmp(name, e->self, 15) ? "self" : name);
+    } else if (type == RECORD_FORK || type == RECORD_EXIT) {
+        const uint32_t *parent = (const uint32_t *)(record + 2);
+        const uint32_t *trailer = (const uint32_t *)(record + 4);
+        say("%s child %d parent %d by %s", type == RECORD_FORK ? "fork" : "exit",
+            ids[0] == (uint32_t)e->child && ids[1] == (uint32_t)e->child,
+            type == RECORD_FORK ? parent[0] == (uint32_t)e->pid && parent[1] == (uint32_t)e->tid
+                                : parent[0] == (uint32_t)e->parent && parent[1] == (uint32_t)e->parent,
+            trailer[1] == (uint32_t)e->child ? "child" : trailer[1] == (uint32_t)e->tid ? "parent" : "other");
+    } else {
+        say("record %u", type);
+    }
+}
+
+static int case_side_band(void) {
+    struct expected e;
+    memset(&e, 0, sizeof e);
+    e.pid = e.parent = getpid();
+    e.tid = (pid_t)syscall(SYS_gettid);
+    char path[] = "/tmp/perf-side-band-XXXXXX";
+    int file = mkstemp(path);
+    static char zeros[2 * 4096];
+    write(file, zeros, sizeof zeros);
+    fstat(file, &e.file);
+    e.path = path;
+    /* Linux maps no buffer of an inherited event of every CPU: this one
+       is of CPU 0, where the process and its child run, so that the
+       child's exit is written too. */
+    cpu_set_t first;
+    CPU_ZERO(&first);
+    CPU_SET(0, &first);
+    sched_setaffinity(0, sizeof first, &first);
+    void *all, *exec_only;
+    int fd = open_side_band(0, 0, ATTR_MMAP2 | ATTR_MMAP_DATA | ATTR_COMM | ATTR_TASK | INHERIT, &all);
+    int exec_fd = open_side_band(0, -1, ATTR_MMAP, &exec_only);
+    say("open %d %d", fd >= 0, exec_fd >= 0);
+    if (fd < 0 || exec_fd < 0) return 1;
+    int id = shmget(IPC_PRIVATE, 8192, IPC_CREAT | 0600);
+    char *old_break = (char *)syscall(SYS_brk, 0);
+    ioctl(fd, IOC_ENABLE, 0);
+    ioctl(exec_fd, IOC_ENABLE, 0);
+    e.anon_len = 3 * 4096;
+    e.anon = mmap(NULL, e.anon_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    e.exec_at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 4096);
+    mprotect(e.anon, 4096, PROT_READ);
+    mprotect(e.anon, 4096, PROT_READ);
+    char *new_break = old_break + 3 * 4096;
+    e.heap = (char *)syscall(SYS_brk, new_break) == new_break ? new_break - 1 : NULL;
+    e.shm = shmat(id, NULL, 0);
+    prctl(PR_SET_NAME, "side-band", 0, 0, 0);
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    int status;
+    waitpid(child, &status, 0);
+    e.child = child;
+    ioctl(fd, IOC_DISABLE, 0);
+    ioctl(exec_fd, IOC_DISABLE, 0);
+    shmdt(e.shm);
+    shmctl(id, IPC_RMID, NULL);
+    unlink(path);
+    uint64_t tail = 0;
+    say("all:");
+    each_record(all, &tail, say_record, &e);
+    say("exec only:");
+    tail = 0;
+    e.mmap_records = 0;
+    each_record(exec_only, &tail, say_record, &e);
+    say("exec only records %d", e.mmap_records);
+    return 0;
+}
+
+static void readlink_self(char *out, size_t size) {
+    ssize_t n = readlink("/proc/self/exe", out, size - 1);
+    out[n < 0 ? 0 : n] = 0;
+}
+
+static int case_side_band_exec(const char *self) {
+    struct expected e;
+    memset(&e, 0, sizeof e);
+    char exe[4096];
+    readlink_self(exe, sizeof exe);
+    const char *base = strrchr(self, '/');
+    e.self = base ? base + 1 : self;
+    e.path = exe;
+    int pipes[2];
+    pipe(pipes);
+    pid_t child = fork();
+    if (child == 0) {
+        char go;
+        close(pipes[1]);
+        read(pipes[0], &go, 1);
+        execl(self, self, "perf-spin", (char *)NULL);
+        _exit(127);
+    }
+    close(pipes[0]);
+    e.pid = e.tid = e.child = child;
+    e.parent = getpid();
+    void *page;
+    int fd = open_side_band(child, -1, ATTR_MMAP2 | ATTR_MMAP_DATA | ATTR_COMM | ENABLE_ON_EXEC, &page);
+    say("open %d", fd >= 0);
+    if (fd < 0) return 1;
+    write(pipes[1], "g", 1);
+    close(pipes[1]);
+    int status;
+    waitpid(child, &status, 0);
+    say("child status %d", status);
+    uint64_t tail = 0;
+    each_record(page, &tail, say_record, &e);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1112,6 +1320,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-output")) return case_output();
     if (!strcmp(mode, "perf-sample")) return case_sample();
     if (!strcmp(mode, "perf-wakeup")) return case_wakeup();
+    if (!strcmp(mode, "perf-side-band")) return case_side_band();
+    if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

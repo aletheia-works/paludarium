@@ -283,6 +283,25 @@ pub(crate) struct Task<'a> {
     pub(crate) blocks_sigtrap: bool,
 }
 
+/// The thread that writes a record: its process, its own ID and its CPU,
+/// by their numbers in the emulator.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Who {
+    pub(crate) pid: u32,
+    pub(crate) tid: u32,
+    pub(crate) cpu: u32,
+}
+
+impl Task<'_> {
+    fn who(&self) -> Who {
+        Who {
+            pid: self.pid,
+            tid: self.tid,
+            cpu: self.cpu,
+        }
+    }
+}
+
 /// The samples the events that count thread `task` of `group` have to
 /// take as of now, which its system call brought its counts up to, and the
 /// signals of `sigtrap` the thread is to get.
@@ -315,7 +334,7 @@ pub(crate) fn sampling(events: &Events) -> bool {
 impl Event {
     /// The event whose buffer it writes to and which counts what is lost:
     /// for an inherited one, the one it comes from.
-    fn top(self: &Arc<Self>) -> Option<Arc<Event>> {
+    pub(super) fn top(self: &Arc<Self>) -> Option<Arc<Event>> {
         match &self.parent {
             Some(parent) => parent.upgrade(),
             None => Some(Arc::clone(self)),
@@ -420,7 +439,7 @@ impl Event {
     /// hung the event up (`POLL_HUP`), and one more `POLL_IN` for `extra`:
     /// to the owner of the event's file once `O_ASYNC` registered it. Plain
     /// SIGIO, not queued, is sent once.
-    fn signal_owner(&self, overflows: u64, hung_up: bool, extra: bool) {
+    pub(super) fn signal_owner(&self, overflows: u64, hung_up: bool, extra: bool) {
         let Some(fasync) = lock(&self.fasync).clone() else {
             return;
         };
@@ -503,10 +522,15 @@ impl Event {
     }
     /// The PID namespace's numbers of `task`'s process and thread.
     fn pid_tid(&self, task: &Task<'_>) -> [u8; 8] {
+        self.pid_tid_of(task.pid, task.tid)
+    }
+    /// The PID namespace's numbers of process `pid` and thread `tid`
+    /// (`perf_event_pid` and `perf_event_tid`).
+    pub(super) fn pid_tid_of(&self, pid: u32, tid: u32) -> [u8; 8] {
         let ns: &Namespace = &self.ns;
         let mut bytes = [0; 8];
-        bytes[..4].copy_from_slice(&ns.number(task.pid).to_le_bytes());
-        bytes[4..].copy_from_slice(&ns.number(task.tid).to_le_bytes());
+        bytes[..4].copy_from_slice(&ns.number(pid).to_le_bytes());
+        bytes[4..].copy_from_slice(&ns.number(tid).to_le_bytes());
         bytes
     }
     /// `perf_event__id_header_size`.
@@ -521,13 +545,17 @@ impl Event {
     /// The `sample_id` that `sample_id_all` puts after a record but a
     /// sample (`__perf_event__output_id_sample`), empty without it.
     pub(super) fn id_sample(&self, task: &Task<'_>) -> Vec<u8> {
+        self.id_sample_of(&task.who())
+    }
+    /// The same, of the thread `who` that writes the record.
+    pub(super) fn id_sample_of(&self, who: &Who) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.attr.flag(bit::SAMPLE_ID_ALL) {
             return out;
         }
         let st = self.attr.sample_type;
         if st & TID != 0 {
-            out.extend(self.pid_tid(task));
+            out.extend(self.pid_tid_of(who.pid, who.tid));
         }
         if st & TIME != 0 {
             put(&mut out, self.clock_now());
@@ -539,7 +567,7 @@ impl Event {
             put(&mut out, self.stream_id);
         }
         if st & CPU != 0 {
-            put(&mut out, u64::from(task.cpu));
+            put(&mut out, u64::from(who.cpu));
         }
         if st & IDENTIFIER != 0 {
             put(&mut out, self.id);
@@ -885,12 +913,12 @@ fn read_user(mem: &AddressSpace, at: u64, len: usize) -> Vec<u8> {
     out
 }
 
-fn put(out: &mut Vec<u8>, value: u64) {
+pub(super) fn put(out: &mut Vec<u8>, value: u64) {
     out.extend(value.to_le_bytes());
 }
 
 /// `struct perf_event_header`.
-fn header(out: &mut Vec<u8>, kind: u32, misc: u16, size: usize) {
+pub(super) fn header(out: &mut Vec<u8>, kind: u32, misc: u16, size: usize) {
     out.extend(kind.to_le_bytes());
     out.extend(misc.to_le_bytes());
     out.extend((size as u16).to_le_bytes());

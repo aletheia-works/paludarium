@@ -3615,7 +3615,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `si_code`、`si_band`、`si_fd` を持ちます。`sigtrap` では、オーバーフローはスレッドに
   `TRAP_PERF` の SIGTRAP を送り、`si_perf_data` と `si_perf_type` に `sig_data` と
   イベントの型を、スレッドがそれをブロックしていれば `TRAP_PERF_FLAG_ASYNC` を
-  持たせます。ディスクリプタのリンクは
+  持たせます。それを求めるタスクのイベントは、`perf_iterate_sb` が記録を作るスレッドを
+  数える有効なイベントへ渡すように、サイドバンドの記録を、そのスレッドの `sample_id` を
+  付けて受け取ります。実行できるマッピングの `PERF_RECORD_MMAP`（`mmap`）か
+  `MMAP2`（`mmap2`）と、`mmap_data` ではほかのマッピングのもの
+  （`PERF_RECORD_MISC_MMAP_DATA`）を、`mmap`、`brk` が伸ばしたとき、`shmat`、
+  `remap_file_pages`、`mprotect`（保護を変えた VMA ごと）が残した、隣と合わさった
+  VMA について書きます。アドレス、長さ、オフセット（ファイルのもの、プライベートな
+  無名メモリーではアドレス）を、`MMAP2` ではさらにファイルのデバイスと inode、保護と
+  共有、`d_path` が与える名前（`[heap]`、`[stack]`、`//anon`、共有の無名メモリーでは
+  `/dev/zero (deleted)`）を持ちます。`PERF_RECORD_COMM`（`comm`）は `PR_SET_NAME` と
+  `execve`（`PERF_RECORD_MISC_COMM_EXEC`）で書き、`execve` はそのあと新しい
+  プログラムのスタックとマッピングを書きます。`PERF_RECORD_FORK` と `EXIT`
+  （`task`、またはほかのどれか）は、スレッドが作られたときと終わったときに書きます。
+  ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 

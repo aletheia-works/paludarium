@@ -1978,7 +1978,13 @@ impl Kernel {
         // perf_event_exit_task, while the thread is still a member: an
         // `execve` that waits for it gives its number to the thread that
         // runs it only afterwards.
-        crate::perf::exit_thread(&self.processes.perf_events, &self.group, tid);
+        let who = crate::perf::Who {
+            pid: self.process.pid,
+            tid,
+            cpu: 0,
+        };
+        let ppid = self.processes.parent_of(self.process.pid);
+        crate::perf::exit_thread(&self.processes.perf_events, &self.group, &who, ppid);
         let alone = {
             let mut members = self
                 .group
@@ -2087,7 +2093,13 @@ impl Kernel {
         // exit_shm: the segments it made are orphans now.
         self.group.leave_shm(thread.tid);
         // perf_event_exit_task: the events it opened have no owner.
-        crate::perf::exit_thread(&self.processes.perf_events, &self.group, thread.tid);
+        let who = crate::perf::Who {
+            pid: self.process.pid,
+            tid: thread.tid,
+            cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+        };
+        let ppid = self.processes.parent_of(self.process.pid);
+        crate::perf::exit_thread(&self.processes.perf_events, &self.group, &who, ppid);
         // The group's exit keeps the peak its address space reached
         // (`do_exit`'s `setmax_mm_hiwater_rss` once the group is dead), under
         // the members' lock, so that no wait sees the exit before it.
@@ -2481,7 +2493,11 @@ impl Kernel {
         crate::perf::clone(
             &self.processes.perf_events,
             &self.group,
-            parent.tid,
+            &crate::perf::Who {
+                pid: self.process.pid,
+                tid: parent.tid,
+                cpu: parent.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+            },
             &self.group,
             tid,
             flags,

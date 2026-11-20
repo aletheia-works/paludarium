@@ -573,6 +573,8 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
     // makes them (`__mmap_complete`).
     c.mem
         .mapped(at, at.0.saturating_add(len.next_multiple_of(4096)));
+    // `perf_event_mmap` of it.
+    crate::perf::mapped(c, at.0);
     c.group.numa().forget(at.0, len);
     drop(memory);
     let shm = segments(c);

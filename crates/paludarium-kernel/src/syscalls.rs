@@ -2350,7 +2350,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             flags & MAP_SHARED != 0,
             offset,
         ) {
-            Ok(at) => ok(at),
+            Ok(at) => {
+                // `perf_event_mmap` of the new VMA.
+                crate::perf::mapped(c, at);
+                ok(at)
+            }
             Err(e) => err(e),
         };
     }
@@ -2425,7 +2429,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         )
     {
         return match result {
-            Ok(at) => ok(at),
+            Ok(at) => {
+                // `perf_event_mmap` of the new VMA.
+                crate::perf::mapped(c, at);
+                ok(at)
+            }
             Err(e) => err(e),
         };
     }
@@ -2503,6 +2511,8 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             // A new VMA is soft-dirty, and so is the one it merged with
             // (`__mmap_complete`).
             c.mem.mapped(a, end);
+            // `perf_event_mmap` of it.
+            crate::perf::mapped(c, a.0);
             // Linux populates a writable private mapping by writing it, which
             // gives it an anon_vma (a core then writes it whole), with
             // MAP_POPULATE or a lock that is not on fault.
@@ -2547,6 +2557,8 @@ fn sys_remap_file_pages(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Ok(()) => {
             // A new VMA has no memory policy.
             c.group.numa().forget(start, size);
+            // `perf_event_mmap` of it, as `do_mmap` makes it.
+            crate::perf::mapped(c, start);
             ok(0)
         }
         Err(e) => err(e),
@@ -3268,8 +3280,13 @@ fn mprotect_with_key(c: &mut Context<'_>, a: [u64; 6], allocated: bool) -> Outco
             .vma_at(first.start)
             .map_or(first.start.0, |(at, _)| at.0);
     }
+    // `mprotect_fixup`'s `perf_event_mmap` of each VMA it changes.
+    let before = crate::perf::protections(c, start, end);
     match c.mem.protect_shared(GuestAddr(start), end - start, prot) {
-        Ok(()) => ok(0),
+        Ok(()) => {
+            crate::perf::reprotected(c, start, end, before);
+            ok(0)
+        }
         Err(e) => err(e),
     }
 }
@@ -3638,6 +3655,10 @@ fn sys_brk(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (low, high) = (up(old.min(new)), up(old.max(new)));
     if high > low {
         c.group.numa().forget(low, high - low);
+    }
+    // `do_brk_flags`' `perf_event_mmap` of the VMA it grew or made.
+    if up(new) > up(old) {
+        crate::perf::mapped(c, up(old));
     }
     ok(new)
 }

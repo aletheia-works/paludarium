@@ -4152,7 +4152,22 @@ kernel.
   `si_code`, `si_band` and `si_fd`, with or without a buffer; and with
   `sigtrap`, an overflow sends the thread SIGTRAP of `TRAP_PERF` with
   `sig_data` and the event's type in `si_perf_data` and `si_perf_type`,
-  and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event of a task
+  that asks for them takes side-band records, as `perf_iterate_sb` gives
+  them to the enabled events that count the thread that makes them, each
+  with that thread's `sample_id`: `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
+  (`mmap2`) of an executable mapping, and with `mmap_data` of any other
+  (`PERF_RECORD_MISC_MMAP_DATA`), as `mmap`, `brk`'s growth, `shmat`,
+  `remap_file_pages` and `mprotect` (of each VMA whose protection it
+  changed) leave the VMA, merged with its neighbours, with its address,
+  length and offset (a file's, and the address of private anonymous
+  memory), and for `MMAP2` its file's device and inode, its protection and
+  sharing, and the name `d_path` gives (`[heap]`, `[stack]`, `//anon`,
+  `/dev/zero (deleted)` for shared anonymous memory); `PERF_RECORD_COMM`
+  (`comm`) of `PR_SET_NAME` and of `execve` (`PERF_RECORD_MISC_COMM_EXEC`),
+  which then writes the new program's stack and mappings; and
+  `PERF_RECORD_FORK` and `EXIT` (`task`, or any of the others) of a thread
+  that is made or ends. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 

@@ -2592,6 +2592,10 @@ mod tests {
             invalid(144, 8)
         );
         assert_eq!(refused(&[ldx(size::W, 0, 1, 92), exit()]), invalid(92, 4));
+        // bpf_ctx_range_ptr: every offset of sk is sk, which is read whole.
+        assert_eq!(refused(&[ldx(size::W, 0, 1, 168), exit()]), invalid(168, 4));
+        assert_eq!(refused(&[ldx(size::W, 0, 1, 172), exit()]), invalid(172, 4));
+        assert_eq!(refused(&[ldx(size::B, 0, 1, 175), exit()]), invalid(175, 1));
         assert_eq!(
             refused(&[mov(2, 1), i(0x63, 1, 2, 0, 0), mov(0, 0), exit()]),
             invalid(0, 4)

@@ -381,6 +381,9 @@ static int case_context(void) {
     LOAD_MAPS("misaligned field", LDX_W(0, 1, 2), EXIT());
     LOAD_MAPS("read tstamp_type", LDX_B(0, 1, 180), EXIT());
     LOAD_MAPS("read flow_keys", LDX_DW(0, 1, 144), EXIT());
+    /* sk is a pointer, read whole only: Linux matches all its 8 bytes. */
+    LOAD_MAPS("4 bytes of sk", LDX_W(0, 1, 168), EXIT());
+    LOAD_MAPS("4 bytes inside sk", LDX_W(0, 1, 172), EXIT());
     LOAD_MAPS("write len", MOV(2, 1), STX_W(1, 2, 0), MOV(0, 0), EXIT());
     LOAD_MAPS("write past cb", MOV(2, 1), STX_DW(1, 2, 64), MOV(0, 0), EXIT());
     LOAD_MAPS("read through a moved context", ADD(1, 4), LDX_W(0, 1, 0), EXIT());

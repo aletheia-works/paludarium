@@ -874,11 +874,16 @@ verified.
   of a process that is not dumpable belong to root of the first namespace,
   where Linux gives them to root of the process's own when it maps one. A network
   namespace has no interface but its loopback and the veth ends requests
-  make, and nothing goes through a pair yet. A veth end takes IPv4
-  addresses and routes, but no IPv6 address (it makes no link-local one
-  as it comes up, where Linux does), no neighbour, no route through a
-  gateway and no route lookup in through it (`RTA_IIF`), each
-  `EOPNOTSUPP`, and no traffic. The addresses of an end that goes tell
+  make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
+  across a pair to an address of the peer's namespace, but no IPv6
+  address (it makes no link-local one as it comes up, where Linux does),
+  no neighbour, no route through a gateway and no route lookup in through
+  it (`RTA_IIF`), each `EOPNOTSUPP`. Traffic through an end makes no
+  neighbour entries and moves no counters; a namespace forwards nothing
+  on to another; and a broadcast or multicast destination through an end
+  reaches no one. A connection to an address nobody answers ARP for fails
+  3 seconds after each connect, where Linux's attempts made while the
+  neighbour is resolving fail together. The addresses of an end that goes tell
   their lifetimes as of the last netlink request, read or poll in its
   namespace, where Linux takes the time it goes. Making one takes
   only a name, an address and an MTU for each end (`EOPNOTSUPP` for the

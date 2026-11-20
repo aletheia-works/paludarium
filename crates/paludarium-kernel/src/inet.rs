@@ -56,6 +56,13 @@ const EALREADY: Errno = Errno(114);
 const EINPROGRESS: Errno = Errno(115);
 const ECONNREFUSED: Errno = Errno(111);
 const ETIMEDOUT: Errno = Errno(110);
+const EHOSTUNREACH: Errno = Errno(113);
+/// When a connection out through a veth end to an address nobody there
+/// answers ARP for gives up, in seconds: the neighbour's three probes, a
+/// second apart (`mcast_probes` with `retrans_time`), fail, and the
+/// handshake waiting on it learns of it from ICMP's host unreachable
+/// (`arp_error_report`, `tcp_v4_err`).
+const ARP_TIMEOUT: u64 = 3;
 /// When a client sends a dropped handshake again, in seconds after its
 /// first: Linux's 1-second `TCP_TIMEOUT_INIT`, the first four times as it
 /// is (`tcp_syn_linear_timeouts`), then doubled each time.
@@ -293,8 +300,12 @@ pub(crate) struct Network {
     /// The loopback connections whose handshake a full queue dropped, to be
     /// tried again. Taken out before any socket's state is locked.
     syns: Mutex<Vec<Syn>>,
+    /// The connections out through a veth end that no answer comes to,
+    /// each with when it fails, and with what. Taken out before any
+    /// socket's state is locked.
+    fails: Mutex<Vec<(Weak<Stream>, u64, Errno)>>,
     /// A nested network namespace's, which has nothing but its loopback
-    /// and veth ends that carry nothing yet: no route to the host, and no
+    /// and veth ends: no route to the host, and no
     /// DNS stub.
     isolated: bool,
     /// Whether its loopback interface is up.
@@ -340,6 +351,7 @@ impl Network {
             tcp_ports: Mutex::default(),
             udp_ports: Mutex::default(),
             syns: Mutex::default(),
+            fails: Mutex::default(),
             isolated: false,
             up: AtomicBool::new(true),
             ever_up: AtomicBool::new(true),
@@ -370,9 +382,11 @@ impl Network {
     /// Where a connection or datagram to `to` goes: on the loopback, while
     /// it is up, to an address its local routes have, or the unspecified
     /// one, which goes to `127.0.0.1` or `::1`
-    /// ([`crate::loopback::destination`]); `None` off it, which only the
-    /// first namespace has a route to. `ENETUNREACH` where no route goes.
-    fn route(&self, to: SocketAddr, now: Option<u64>) -> Result<Option<SocketAddr>, Errno> {
+    /// ([`crate::loopback::destination`]); else out through a veth end
+    /// that a unicast route of IPv4 goes through; else off the guest's
+    /// networks, which only the first namespace has a route to.
+    /// `ENETUNREACH` where no route goes.
+    fn route(&self, to: SocketAddr, now: Option<u64>) -> Result<Dest, Errno> {
         let up = self.is_up();
         let local = match to.ip() {
             ip if ip.is_unspecified() => crate::loopback::destination(to),
@@ -381,8 +395,89 @@ impl Network {
         };
         match local {
             Some(_) if !up => Err(ENETUNREACH),
-            None if self.isolated => Err(ENETUNREACH),
-            to => Ok(to),
+            Some(to) => Ok(Dest::Here(to)),
+            None => {
+                if let IpAddr::V4(ip) = to.ip()
+                    && let Ok(route) = self.addresses_at(now).lookup4(ip)
+                    && route.kind == crate::interface::Kind::Unicast
+                    && route.oif != crate::netdev::LOOPBACK_OIF
+                    && let Ok(index) = i32::try_from(route.oif)
+                {
+                    return Ok(Dest::Veth(index));
+                }
+                if self.isolated {
+                    Err(ENETUNREACH)
+                } else {
+                    Ok(Dest::Away)
+                }
+            }
+        }
+    }
+    /// What a packet from `from` to `to` out through this namespace's veth
+    /// end `index` finds at `now`:
+    /// - Nothing answers, as nobody answers ARP for `to`
+    ///   ([`Reach::Unanswered`]), unless the end has its carrier, so that
+    ///   its peer is up (`veth_xmit`), `to` is an address of the peer's
+    ///   namespace (`arp_process`: its local routes have it), and the peer
+    ///   takes a packet from `from` in on it, as `ip_route_input` checks
+    ///   the source with its reverse path filtering
+    ///   ([`crate::interface::Addresses::validate_source4_on`]).
+    /// - The packet comes there, and the answer back ([`Reach::Answered`])
+    ///   only when the peer's namespace routes `from` back out through its
+    ///   end, without a gateway, and this namespace takes the answer from
+    ///   `to` in on its end, at its address `from`; else that answer goes
+    ///   nowhere ([`Reach::OneWay`]).
+    fn reach(&self, index: i32, from: IpAddr, to: IpAddr, now: Option<u64>) -> Reach {
+        let (IpAddr::V4(from), IpAddr::V4(to)) = (plain(from), plain(to)) else {
+            return Reach::Unanswered;
+        };
+        let rpf = |devices: &crate::netdev::Devices, index: i32| {
+            devices
+                .by_index(index)
+                .map_or(0, |d| d.conf4.rp_filter)
+                .max(devices.all4.rp_filter)
+        };
+        let (peer, own_rpf) = {
+            let devices = self.devices();
+            let Some(veth) = devices.by_index(index).and_then(|d| d.veth.as_ref()) else {
+                return Reach::Unanswered;
+            };
+            let Some(peer) = veth.peer.clone().filter(|_| veth.carrier) else {
+                return Reach::Unanswered;
+            };
+            (peer, rpf(&devices, index))
+        };
+        let Some(there) = peer.network.upgrade() else {
+            return Reach::Unanswered;
+        };
+        let their_rpf = rpf(&there.devices(), peer.index);
+        let (arrives, back) = {
+            let addresses = there.addresses_at(now);
+            let arrives = addresses.local4(to)
+                && addresses
+                    .validate_source4_on(from, 0, 0, their_rpf, peer.index)
+                    .is_ok();
+            let back = addresses.lookup4(from).is_ok_and(|r| {
+                r.kind == crate::interface::Kind::Unicast
+                    && i64::from(r.oif) == i64::from(peer.index)
+                    && r.gateway.is_none()
+            });
+            (arrives, back)
+        };
+        if !arrives {
+            return Reach::Unanswered;
+        }
+        let back = back && {
+            let addresses = self.addresses_at(now);
+            addresses.local4(from)
+                && addresses
+                    .validate_source4_on(to, 0, 0, own_rpf, index)
+                    .is_ok()
+        };
+        if back {
+            Reach::Answered(there)
+        } else {
+            Reach::OneWay(there)
         }
     }
     /// A packet goes out through the loopback to `to` at the host's
@@ -861,6 +956,9 @@ struct Listen {
 /// [`SYN_RETRIES`] after `start`, to whatever listens at `to` then.
 struct Syn {
     stream: Weak<Stream>,
+    /// The namespace whose listener it knocks at: this one's, or that of
+    /// a veth end's peer.
+    there: Weak<Network>,
     link: Arc<OnceLock<Arc<Link>>>,
     /// What tells the client of an urgent byte.
     notify: crate::loopback::Notify,
@@ -882,6 +980,24 @@ impl Syn {
         let seconds = SYN_RETRIES.get(self.tries).copied().unwrap_or(SYN_TIMEOUT);
         self.start.saturating_add(seconds * 1_000_000_000)
     }
+}
+/// Where a connection or datagram goes ([`Network::route`]).
+enum Dest {
+    /// To an address of its own namespace, through the loopback.
+    Here(SocketAddr),
+    /// Off the guest's networks, to the host's.
+    Away,
+    /// Out through the namespace's veth end of this index.
+    Veth(i32),
+}
+/// What a packet out through a veth end finds ([`Network::reach`]).
+enum Reach {
+    /// It comes to this namespace, and its answers come back.
+    Answered(Arc<Network>),
+    /// It comes to this namespace, and its answers go nowhere.
+    OneWay(Arc<Network>),
+    /// Nobody answers ARP for its destination.
+    Unanswered,
 }
 /// What a handshake found.
 enum Knock {
@@ -1421,18 +1537,27 @@ impl InetSocket {
                 Connection::Connected => return Err(EISCONN),
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
-                    let to = self.network.route(
-                        SocketAddr::new(plain(address.ip()), address.port()),
-                        self.now(),
-                    )?;
+                    let plain_to = SocketAddr::new(plain(address.ip()), address.port());
+                    let dest = self.network.route(plain_to, self.now())?;
+                    let to = match dest {
+                        Dest::Here(to) => Some(to),
+                        Dest::Away | Dest::Veth(_) => None,
+                    };
                     // The handshake's first segment goes out through the
                     // loopback, whatever answers it.
                     if let Some(to) = to {
                         self.network.output(to.ip(), self.now());
                     }
-                    let opened = match to {
-                        Some(to) => self.open_loopback(&mut s, to, &options)?,
-                        None => None,
+                    let opened = match dest {
+                        Dest::Here(to) => self.open_loopback(&mut s, to, &options)?,
+                        Dest::Away => None,
+                        Dest::Veth(index) => {
+                            match self.open_veth(&mut s, index, plain_to, &options)? {
+                                Some(stream) => Some(stream),
+                                // The far namespace answers with a reset.
+                                None => return self.refused(&mut s, address),
+                            }
+                        }
                     };
                     let loopback = opened.is_some();
                     let stream = match opened {
@@ -1626,13 +1751,25 @@ impl InetSocket {
             return Err(ENETUNREACH);
         }
         match self.network.route(to, self.now())? {
-            Some(to) => {
+            Dest::Here(to) => {
                 let from = self.datagram_source(&mut s, to, &options)?;
                 self.ports().connect(&self.this, from, Some(to));
                 s.bound = Some(from);
                 s.peer = Some(to);
             }
-            None => {
+            // Out through a veth end, from the address its route leaves
+            // from, which Linux's `__mkroute_output` takes from no
+            // loopback address (`EINVAL`).
+            Dest::Veth(_) => {
+                let from = self.datagram_source(&mut s, to, &options)?;
+                if plain(from.ip()).is_loopback() {
+                    return Err(Errno::EINVAL);
+                }
+                self.ports().connect(&self.this, from, Some(to));
+                s.bound = Some(from);
+                s.peer = Some(to);
+            }
+            Dest::Away => {
                 // Off the loopback the port moves to the host's address the
                 // route leaves from (`ip_route_connect`), unless the guest
                 // bound an address. Only for a peer the policy allows, so
@@ -1708,7 +1845,43 @@ impl InetSocket {
             None => Ok(()),
         };
         let plain_to = SocketAddr::new(plain(to.ip()), to.port());
-        if let Some(dest) = self.network.route(plain_to, self.now())? {
+        let route = self.network.route(plain_to, self.now())?;
+        if let Dest::Veth(index) = route {
+            if self.family == Family::V6 && options.v6_only {
+                return Err(ENETUNREACH);
+            }
+            if bytes.len() > 65_507 {
+                return Err(EMSGSIZE);
+            }
+            sendable(&mut s)?;
+            let from = self.datagram_source(&mut s, plain_to, &options)?;
+            if plain(from.ip()).is_loopback() {
+                return Err(Errno::EINVAL);
+            }
+            let to_peer = s.peer == Some(plain_to);
+            drop(s);
+            let (there, answered) = match self.network.reach(index, from.ip(), to.ip(), self.now())
+            {
+                Reach::Answered(there) => (there, true),
+                Reach::OneWay(there) => (there, false),
+                // Dropped once ARP gives up; ICMP's host unreachable that
+                // tells of it is no hard error (`__udp4_lib_err`).
+                Reach::Unanswered => return Ok(bytes.len()),
+            };
+            let receiver = there.ports(true).receiver(plain_to, from);
+            match receiver {
+                Some(receiver) => receiver.deliver(from, bytes),
+                // ICMP's port unreachable comes back, where answers come.
+                None if answered && to_peer => {
+                    self.lock().error = Some(ECONNREFUSED);
+                    self.signals.send(Reason::Error);
+                    self.hub.changed();
+                }
+                None => {}
+            }
+            return Ok(bytes.len());
+        }
+        if let Dest::Here(dest) = route {
             if self.family == Family::V6 && options.v6_only && dest.is_ipv4() {
                 return Err(ENETUNREACH);
             }
@@ -2086,6 +2259,25 @@ impl InetSocket {
     /// Called with no socket's state locked.
     fn retry_syns(&self) {
         let Some(now) = self.now() else { return };
+        let failing: Vec<(Weak<Stream>, u64, Errno)> = self
+            .network
+            .fails
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extract_if(.., |(stream, at, _)| {
+                *at <= now
+                    || stream
+                        .upgrade()
+                        .is_none_or(|s| s.phase() != Phase::Connecting)
+            })
+            .collect();
+        for (stream, _, error) in failing {
+            if let Some(stream) = stream.upgrade()
+                && stream.phase() == Phase::Connecting
+            {
+                stream.fail(error);
+            }
+        }
         let due = |syn: &Syn| syn.next() <= now;
         let mut syns: Vec<Syn> = {
             let mut syns = self
@@ -2116,7 +2308,14 @@ impl InetSocket {
                 continue;
             }
             syn.tries += 1;
-            match self.knock(&stream, (&syn.link, &syn.notify), syn.from, syn.to) {
+            // Its namespace gone, the veth end it went through has gone
+            // too: nothing answers again.
+            let Some(there) = syn.there.upgrade() else {
+                stream.fail(ETIMEDOUT);
+                syns.swap_remove(i);
+                continue;
+            };
+            match self.knock(&there, &stream, (&syn.link, &syn.notify), syn.from, syn.to) {
                 Knock::Full => {}
                 Knock::Taken => {
                     syns.swap_remove(i);
@@ -2136,16 +2335,18 @@ impl InetSocket {
             kept.extend(syns);
         }
     }
-    /// A handshake from `stream` at `from` to `to` on the loopback: the
-    /// listener there takes it into its queue when it has room.
+    /// A handshake from `stream` at `from` to `to` on the loopback, or out
+    /// through a veth end to the namespace `there`: the listener there
+    /// takes it into its queue when it has room.
     fn knock(
         &self,
+        there: &Network,
         stream: &Arc<Stream>,
         link: (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
         from: SocketAddr,
         to: SocketAddr,
     ) -> Knock {
-        let Some(listener) = self.ports().listener(from, to) else {
+        let Some(listener) = there.ports(false).listener(from, to) else {
             return Knock::Refused;
         };
         let theirs = *listener.options();
@@ -2241,22 +2442,97 @@ impl InetSocket {
         // the connection leaves from.
         let bound = s.bound;
         let from = self.loopback_source(s, to, options)?;
-        let Some(listener) = self.ports().listener(from, to) else {
-            // The listener closed meanwhile: the refused connect gives back
-            // the port it took, as Linux's `tcp_done` (`inet_put_port`).
-            match bound {
-                None => self.ports().unbind(&self.this),
-                Some(bound) => self.ports().rebind(&self.this, bound),
+        Ok(self.join(&self.network, s, (bound, from), to, options, true))
+    }
+    /// A connection to `to` out through the veth end `index`, from the
+    /// address its route leaves from on a port bound now, as on the
+    /// loopback ([`Self::loopback_source`]); `EINVAL` from a loopback
+    /// address, which Linux's `__mkroute_output` sends out of no other
+    /// device. Where it comes and its answers come back, it is the
+    /// listener's there, as on the loopback, or `None` when nothing
+    /// listens there, which answers with a reset. Else it fails in time:
+    /// unanswered, with `EHOSTUNREACH` once ARP gives up, as ICMP's host
+    /// unreachable tells it over the loopback, or with `ETIMEDOUT` once
+    /// the handshake's tries are over where that loopback is down; one
+    /// whose answers go nowhere with `ETIMEDOUT` too.
+    fn open_veth(
+        &self,
+        s: &mut State,
+        index: i32,
+        to: SocketAddr,
+        options: &Options,
+    ) -> Result<Option<Arc<Stream>>, Errno> {
+        if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
+            return Err(ENETUNREACH);
+        }
+        let bound = s.bound;
+        let from = self.loopback_source(s, to, options)?;
+        if plain(from.ip()).is_loopback() {
+            self.give_back(s, bound);
+            return Err(Errno::EINVAL);
+        }
+        let failing = match self.network.reach(index, from.ip(), to.ip(), self.now()) {
+            Reach::Answered(there) => {
+                return Ok(self.join(&there, s, (bound, from), to, options, false));
             }
-            s.bound = bound;
-            return Ok(None);
+            Reach::OneWay(_) => (SYN_TIMEOUT, ETIMEDOUT),
+            Reach::Unanswered if self.network.is_up() => (ARP_TIMEOUT, EHOSTUNREACH),
+            Reach::Unanswered => (SYN_TIMEOUT, ETIMEDOUT),
+        };
+        let stream = Stream::new(to);
+        stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+        stream.set_clock(realtime(&self.host));
+        size_buffers(&stream, options);
+        match self.now() {
+            Some(now) => self
+                .network
+                .fails
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((
+                    Arc::downgrade(&stream),
+                    now.saturating_add(failing.0 * 1_000_000_000),
+                    failing.1,
+                )),
+            // Without the host's clock no time passes: it fails at once.
+            None => stream.fail(failing.1),
+        }
+        Ok(Some(stream))
+    }
+    /// Gives back the port a connection bound for itself, keeping the
+    /// binding `bound` it had before, as Linux's `tcp_done` does
+    /// (`inet_put_port`).
+    fn give_back(&self, s: &mut State, bound: Option<SocketAddr>) {
+        match bound {
+            None => self.ports().unbind(&self.this),
+            Some(bound) => self.ports().rebind(&self.this, bound),
+        }
+        s.bound = bound;
+    }
+    /// A connection from `from` to `to`, at the listener there in
+    /// `there`'s namespace: in its queue, or, when that is full, to be
+    /// tried again ([`InetSocket::retry_syns`]). `None`, with the port
+    /// given back to the binding `bound` had, when none listens there.
+    /// On the `loopback`, the answer goes out through it.
+    fn join(
+        &self,
+        there: &Arc<Network>,
+        s: &mut State,
+        (bound, from): (Option<SocketAddr>, SocketAddr),
+        to: SocketAddr,
+        options: &Options,
+        loopback: bool,
+    ) -> Option<Arc<Stream>> {
+        let Some(listener) = there.ports(false).listener(from, to) else {
+            // The listener closed meanwhile, or none was there: the
+            // refused connect gives back the port it took.
+            self.give_back(s, bound);
+            return None;
         };
         let theirs = *listener.options();
         let mut state = listener.lock();
         let locked = state.port_locked;
-        let Some(listen) = state.listen.as_mut() else {
-            return Ok(None);
-        };
+        let listen = state.listen.as_mut()?;
         let stream = Stream::new(to);
         stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
         stream.set_clock(realtime(&self.host));
@@ -2267,7 +2543,9 @@ impl InetSocket {
         let arrived = listen.has_room();
         if arrived {
             // The listener's answer goes back out through the loopback.
-            self.network.output(from.ip(), self.now());
+            if loopback {
+                self.network.output(from.ip(), self.now());
+            }
             let notify = self.urgent_notify();
             let child = listener.child((theirs, locked), &stream, (&link, &notify), from, to);
             listen.ready.push_back(child);
@@ -2286,6 +2564,7 @@ impl InetSocket {
                 .unwrap_or_else(PoisonError::into_inner);
             syns.push(Syn {
                 stream: Arc::downgrade(&stream),
+                there: Arc::downgrade(there),
                 link,
                 notify: self.urgent_notify(),
                 from,
@@ -2298,7 +2577,7 @@ impl InetSocket {
             // at once, rather than wait for ever.
             stream.fail(ETIMEDOUT);
         }
-        Ok(Some(stream))
+        Some(stream)
     }
     /// The address a connection to `to` on the loopback leaves from: the
     /// one this socket is bound to, its port with the loopback's source

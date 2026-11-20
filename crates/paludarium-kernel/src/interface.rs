@@ -2415,20 +2415,7 @@ impl Addresses {
     /// `fib_validate_source` for a packet in on `lo` from `src` of `tos`,
     /// whose route goes out through `oif` (0 for one that is not
     /// forwarded), with reverse path filtering `rpf` (`IN_DEV_RPFILTER`):
-    /// `Err` for a source it drops; `Ok(true)` where the reverse route is
-    /// one through `lo` of host scope or narrower, as a forwarded one that
-    /// goes out where it came in asks to redirect.
-    /// - With `rpf` 0 and a route that is not out through `lo`, as
-    ///   [`Self::valid_source4`].
-    /// - Else as `__fib_validate_source`, looking `src` up. None found is
-    ///   dropped with `rpf`, and taken without; a local one is dropped
-    ///   (`accept_local` is 0), as is one of another kind than unicast. A
-    ///   unicast one through `lo` is taken, `true` but for one through a
-    ///   gateway, whose next hop is of link scope. One through another
-    ///   device is taken without `rpf`, or loosely (2), when `lo` has no
-    ///   address, else dropped strictly (1); loosely, a lookup through `lo`
-    ///   decides, as the first one did, and gives `false` where it finds
-    ///   no unicast route.
+    /// [`Self::validate_source4_on`] of `lo`.
     pub(crate) fn validate_source4(
         &self,
         src: Ipv4Addr,
@@ -2436,7 +2423,35 @@ impl Addresses {
         oif: u32,
         rpf: i32,
     ) -> Result<bool, ()> {
-        if rpf == 0 && oif != LOOPBACK_OIF {
+        self.validate_source4_on(src, tos, oif, rpf, LOOPBACK_INDEX)
+    }
+    /// `fib_validate_source` for a packet in on device `dev` from `src` of
+    /// `tos`, whose route goes out through `oif` (0 for one that is not
+    /// forwarded), with reverse path filtering `rpf` (`IN_DEV_RPFILTER`):
+    /// `Err` for a source it drops; `Ok(true)` where the reverse route is
+    /// one through `dev` of host scope or narrower, as a forwarded one that
+    /// goes out where it came in asks to redirect.
+    /// - With `rpf` 0 and a route that is not out through `dev`, as
+    ///   [`Self::valid_source4`].
+    /// - Else as `__fib_validate_source`, looking `src` up. None found is
+    ///   dropped with `rpf`, and taken without; a local one is dropped
+    ///   (`accept_local` is 0), as is one of another kind than unicast. A
+    ///   unicast one through `dev` is taken, `true` but for one through a
+    ///   gateway, whose next hop is of link scope. One through another
+    ///   device is taken without `rpf`, or loosely (2), when `dev` has no
+    ///   address, else dropped strictly (1); loosely, a lookup through
+    ///   `dev` decides, as the first one did, and gives `false` where it
+    ///   finds no unicast route.
+    pub(crate) fn validate_source4_on(
+        &self,
+        src: Ipv4Addr,
+        tos: u8,
+        oif: u32,
+        rpf: i32,
+        dev: i32,
+    ) -> Result<bool, ()> {
+        let dev_oif = u32::try_from(dev).unwrap_or(0);
+        if rpf == 0 && oif != dev_oif {
             return if self.valid_source4(src) {
                 Ok(false)
             } else {
@@ -2447,11 +2462,11 @@ impl Addresses {
         match self.lookup4_flow(src, tos, 0) {
             Err(_) => last_resort,
             Ok(route) if route.kind != Kind::Unicast => Err(()),
-            Ok(route) if route.oif == LOOPBACK_OIF => Ok(route.gateway.is_none()),
-            Ok(_) if !self.v4.iter().any(|a| a.index == LOOPBACK_INDEX) => last_resort,
+            Ok(route) if route.oif == dev_oif => Ok(route.gateway.is_none()),
+            Ok(_) if !self.v4.iter().any(|a| a.index == dev) => last_resort,
             Ok(_) if rpf == 1 => Err(()),
             Ok(_) => Ok(self
-                .lookup4_flow(src, tos, LOOPBACK_OIF)
+                .lookup4_flow(src, tos, dev_oif)
                 .is_ok_and(|r| r.kind == Kind::Unicast && r.gateway.is_none())),
         }
     }

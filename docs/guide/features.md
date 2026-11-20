@@ -2336,6 +2336,25 @@ kernel.
     of its addresses and their local routes going, as `inetdev_destroy`
     does, before its `RTM_DELLINK`. Address and route dumps take an end's
     index (the `ifaddrmsg`'s, `RTA_OIF`).
+  - **TCP and UDP across a pair:** a connection or datagram whose route
+    goes out through an end, from the address that route leaves from,
+    comes to the peer's namespace when the end has its carrier, the
+    destination is one of that namespace's addresses (its local routes
+    have it, as `arp_process` answers for any), and the peer takes the
+    source in on its end (`fib_validate_source`, with its reverse path
+    filtering). There it is a connection to the listener of that address
+    and port, or a datagram for its socket, as on the loopback; a port
+    nobody listens on answers with a reset (`ECONNREFUSED`), and a UDP
+    port nobody has with ICMP's port unreachable, which a connected socket
+    learns of. Answers come back only where the peer's namespace routes
+    the source back out through its end and this one takes them in on its
+    own. To a destination nobody answers ARP for, a connection fails with
+    `EHOSTUNREACH` once ARP gives up, 3 seconds later (three probes a
+    second apart, `mcast_probes`), as ICMP's host unreachable tells it
+    over the loopback (with `ETIMEDOUT` after the handshake's tries where
+    the loopback is down, and where answers come back to no one), and a
+    datagram is dropped. A connection or datagram from a loopback address
+    out through an end is `EINVAL` (`__mkroute_output`).
   - **Netconf of veth ends:** each end's settings
     are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
     `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their

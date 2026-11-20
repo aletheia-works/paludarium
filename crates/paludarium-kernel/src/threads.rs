@@ -1978,6 +1978,8 @@ impl Kernel {
         // perf_event_exit_task, while the thread is still a member: an
         // `execve` that waits for it gives its number to the thread that
         // runs it only afterwards.
+        // The thread is one the host could not start (`abandon_child`), whose
+        // state went with it: its CPU is not known here, and is taken as 0.
         let who = crate::perf::Who {
             pid: self.process.pid,
             tid,

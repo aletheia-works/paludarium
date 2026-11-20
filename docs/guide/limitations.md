@@ -292,7 +292,9 @@ verified.
   grows down as the program touches it writes none; a mapping's inode
   generation is 0 and no build ID is given (`build_id`); `mprotect` writes
   one record of each VMA as it ends up, where Linux writes one each time it
-  changes one, of the VMA as merged so far; a write to
+  changes one, of the VMA as merged so far; a thread the host cannot
+  start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
+  failed `clone` writes neither; a write to
   `/proc/<pid>/comm` writes no `COMM` record yet; and `NAMESPACES`, `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
   written. With no vDSO, no record of one is written either. The overflows

@@ -466,8 +466,9 @@ static void through(const char *name, int a, int b, size_t len) {
     unsigned char out[64], in[64];
     for (size_t i = 0; i < sizeof out; i++) out[i] = (unsigned char)i;
     long sent = send(a, out, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sent < 0) sent = -errno;
     long got = recv(b, in, sizeof in, MSG_DONTWAIT);
-    printf("%s sent %ld", name, sent < 0 ? -errno : sent);
+    printf("%s sent %ld", name, sent);
     if (got < 0) {
         printf(" received %d\n", -errno);
     } else {

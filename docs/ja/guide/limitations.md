@@ -236,7 +236,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   コアダンプのフォールトは最後に終了するスレッドに数えます。Linux はダンプするスレッドに
   数えます。`process_vm_readv`、`process_vm_writev`、`MADV_POPULATE_READ`、
   `MADV_POPULATE_WRITE` は、フォールトを `perf` の `page-faults` にも数えます。Linux の
-  `get_user_pages` は `perf` のイベントにしません。
+  `get_user_pages` は `perf` のイベントにしません。`/proc/<pid>/stat` の `minflt` と
+  `cminflt` も同じ数を読むので、同じ制限があります。
 - **perf のイベントの一部**：数えるのはソフトウェアのイベントだけです。cgroup の切り替え、
   トレースポイント、ブレークポイント、kprobe、uprobe は `ENOENT` で、ハードウェアの
   イベントも、PMU のあるホストでも `ENOENT` です。スレッドの CPU 時間、ページフォルト、

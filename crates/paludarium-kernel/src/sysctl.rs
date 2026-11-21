@@ -117,7 +117,7 @@ impl Directory {
 /// A file of `/proc/sys/net`, of the caller's network namespace
 /// ([`crate::netconf`]): `ipv4/ip_forward` (`all`'s forwarding),
 /// `ipv4/conf/<device>/forwarding` and `rp_filter`, and
-/// `ipv6/conf/<device>/disable_ipv6` and `forwarding`.
+/// `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Net {
     IpForward,
@@ -125,6 +125,7 @@ pub(crate) enum Net {
     RpFilter(Target),
     DisableIpv6(Target),
     Forwarding6(Target),
+    AcceptDad(Target),
 }
 
 /// A file of a device's directory, by name, and what it is for a device.
@@ -135,7 +136,8 @@ const CONF4: [DeviceFile; 2] = [
     (b"forwarding", Net::Forwarding),
     (b"rp_filter", Net::RpFilter),
 ];
-const CONF6: [DeviceFile; 2] = [
+const CONF6: [DeviceFile; 3] = [
+    (b"accept_dad", Net::AcceptDad),
     (b"disable_ipv6", Net::DisableIpv6),
     (b"forwarding", Net::Forwarding6),
 ];
@@ -923,7 +925,8 @@ fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
         Net::Forwarding(target)
         | Net::RpFilter(target)
         | Net::DisableIpv6(target)
-        | Net::Forwarding6(target) => target,
+        | Net::Forwarding6(target)
+        | Net::AcceptDad(target) => target,
     };
     let Some((conf4, conf6)) = crate::netconf::get(&network.devices(), target) else {
         return 0;
@@ -933,6 +936,7 @@ fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
         Net::RpFilter(_) => conf4.rp_filter,
         Net::DisableIpv6(_) => conf6.disable_ipv6,
         Net::Forwarding6(_) => conf6.forwarding,
+        Net::AcceptDad(_) => conf6.accept_dad,
     }
 }
 
@@ -1162,7 +1166,7 @@ impl NetFile {
                     Err(false) => Err(Errno::EINVAL),
                 }
             }
-            Net::DisableIpv6(target) | Net::Forwarding6(target) => {
+            Net::DisableIpv6(target) | Net::Forwarding6(target) | Net::AcceptDad(target) => {
                 // `proc_dointvec`'s error first, as Linux master's handlers
                 // (and the CI kernel's) return it; past the start, the value
                 // as it was.
@@ -1171,7 +1175,9 @@ impl NetFile {
                     Err(true) => (net_value(&self.network, self.file), buf.len()),
                     Err(false) => return Err(Errno::EINVAL),
                 };
-                if let Net::Forwarding6(_) = self.file {
+                if let Net::AcceptDad(_) = self.file {
+                    crate::netconf::set_accept_dad(&mut self.network.devices(), target, value);
+                } else if let Net::Forwarding6(_) = self.file {
                     let told =
                         crate::netconf::set_forwarding6(&mut self.network.devices(), target, value);
                     crate::netlink::devconf::tell(&self.network, told);
@@ -1189,6 +1195,16 @@ impl NetFile {
                         if index == crate::netdev::LOOPBACK_INDEX {
                             crate::netlink::set_ipv6(
                                 &self.network,
+                                change == crate::netconf::Change::On,
+                                now,
+                            );
+                        } else {
+                            // A veth end's, as `dev_disable_change` calls
+                            // `addrconf_notify` with `NETDEV_DOWN` or
+                            // `NETDEV_UP`.
+                            crate::netlink::set_ipv6_on(
+                                &self.network,
+                                index,
                                 change == crate::netconf::Change::On,
                                 now,
                             );
@@ -1678,7 +1694,13 @@ mod tests {
         );
         assert_eq!(
             names(Directory::Device6(lo)),
-            [&b"."[..], b"..", b"disable_ipv6", b"forwarding"]
+            [
+                &b"."[..],
+                b"..",
+                b"accept_dad",
+                b"disable_ipv6",
+                b"forwarding"
+            ]
         );
     }
 

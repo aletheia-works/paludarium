@@ -254,6 +254,19 @@ pub(crate) fn set_forwarding6(devices: &mut Devices, target: Target, value: i32)
     told
 }
 
+/// A write of `accept_dad` of `target`, which only the next duplicate
+/// address detection reads.
+pub(crate) fn set_accept_dad(devices: &mut Devices, target: Target, value: i32) {
+    match target {
+        Target::Default => devices.default6.accept_dad = value,
+        Target::All => devices.all6.accept_dad = value,
+        Target::Device(index) => {
+            if let Some(device) = devices.by_index_mut(index) {
+                device.conf6.accept_dad = value;
+            }
+        }
+    }
+}
 /// A write of `disable_ipv6` of `target`: the devices whose IPv6 it turns
 /// off or on, by index.
 pub(crate) fn set_disable_ipv6(
@@ -365,19 +378,21 @@ mod tests {
         assert!(set_forwarding(&mut devices, Target::All, 1).is_empty());
         assert!(set_forwarding(&mut devices, Target::Device(LO), 1).is_empty());
         // IPv6's: `default`'s, the devices', `all`'s; from 2 to 1, nothing.
-        let v6 = |index| {
+        // Each with its own `accept_dad`: `default`'s 1, `lo`'s -1, `all`'s 0.
+        let v6 = |index, accept_dad| {
             Told::Ipv6(
                 index,
                 What::Forwarding,
                 Conf6 {
                     forwarding: 2,
+                    accept_dad,
                     ..Conf6::default()
                 },
             )
         };
         assert_eq!(
             set_forwarding6(&mut devices, Target::All, 2),
-            [v6(INDEX_DEFAULT), v6(LO), v6(INDEX_ALL)]
+            [v6(INDEX_DEFAULT, 1), v6(LO, -1), v6(INDEX_ALL, 0)]
         );
         assert!(set_forwarding6(&mut devices, Target::All, 1).is_empty());
         assert_eq!(devices.by_index(LO).unwrap().conf6.forwarding, 1);

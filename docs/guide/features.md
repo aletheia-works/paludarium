@@ -2394,6 +2394,30 @@ kernel.
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).
+  - **IPv6 of veth ends:** an end up with its carrier is made ready as
+    `addrconf_dev_config` does, once until it goes down: the multicast
+    route `ff00::/8` (local table, metric 256), then the prefix route
+    `fe80::/64` and its link-local address from its Ethernet address
+    (EUI-64, `IFAPROT_KERNEL_LL`). Coming up, it first gives the prefix
+    route of each permanent address it has. `RTM_NEWADDR` and
+    `RTM_DELADDR` add and remove an end's addresses as `lo`'s (below),
+    with its prefix route while it is up. A new address is tentative while
+    duplicate address detection checks it (unless `IFA_F_NODAD`, or the
+    end's and `all`'s `accept_dad` are below 1), which begins once the
+    end is up with its carrier and ends 1.5 seconds on; then it is told of
+    again, as it is, with its local route; a change while it is checked is
+    not told of (`inet6_addr_modify`). A link-local one is told of
+    only then. An end with IPv6 off (`disable_ipv6`) or an MTU below 1280
+    has none. An end's IPv6 routes but its local ones are
+    `RTNH_F_LINKDOWN` while it is up without its carrier, as IPv4's are.
+    `RTM_NEWROUTE` adds an IPv6 route through an end without a gateway
+    (`fib6_nh_init`: `ENODEV` for one without IPv6, an MTU below 1280,
+    `EACCES` for one with it off, then `ENETDOWN` while it is down), which
+    goes with it as it goes down. Turning `disable_ipv6` on for an end
+    takes its IPv6 routes and addresses as going down does; off again,
+    while it is up, makes them as coming up does (`dev_disable_change`).
+    Going down, or away, it loses its IPv6 routes, told of in the order of
+    a dump, then its addresses (`addrconf_ifdown`).
   - **Netconf of veth ends:** each end's settings
     are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
     `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their
@@ -2661,9 +2685,9 @@ kernel.
     makes) every address of its prefix; IPv6 binds only to its addresses.
     Before IPv4 has a local table, a socket binds to any IPv4 address, as
     Linux's `inet_addr_type` takes each as broadcast then.
-  - **Neighbours:** `RTM_GETNEIGH` dumps the loopback's neighbours (those
-    its traffic makes, as the notifications below tell, and those requests
-    add) as
+  - **Neighbours:** `RTM_GETNEIGH` dumps the neighbours of the loopback
+    and the veth ends (those traffic makes, as the notifications and the
+    veth ends' neighbours below tell, and those requests add) as
     `neigh_dump_info` does, each an `RTM_NEWNEIGH` like the `RTM_DELNEIGH`
     that tells of it as it goes: ARP's (IPv4's) and then neighbour
     discovery's (IPv6's) for `AF_UNSPEC`, the one family's for `AF_INET`
@@ -2671,30 +2695,34 @@ kernel.
     are `NTF_PROXY` asks for the proxy entries instead, in the order of
     their hash's buckets (`pneigh_hash`), the newest first in each.
     `NDA_IFINDEX` and `NDA_MASTER` narrow a dump, and mark each message
-    `NLM_F_DUMP_FILTERED`: `lo`'s index, 1, and a master of -1 (no master)
-    keep the neighbours (and of the proxy entries, `lo`'s alone for the
-    index), and any other shows none. Strictly, as
+    `NLM_F_DUMP_FILTERED`: a device's index keeps its neighbours alone, a
+    master of -1 (no master) keeps them all (and of the proxy entries,
+    `lo`'s alone for its index), and any other master shows none. Strictly, as
     `neigh_valid_dump_req` checks, an `ndmsg` that is short or has
     padding, an index, a state, a type or a flag but `NTF_PROXY`, and any
     other attribute, are `EINVAL`; unchecked, a dump whose attributes
     break `nda_policy` is not narrowed. An `AF_MCTP` dump shows no
     neighbours (`EINVAL` for a short `ndmsg`, as `mctp_rtm_getneigh`).
     Without a dump, as `neigh_get`, the request names one neighbour by its
-    family, key (`NDA_DST`) and `lo`'s index, and the answer counts the
+    family, key (`NDA_DST`) and its device's index, and the answer counts the
     reference the lookup holds. It is `EINVAL` without the key (told of
     with `NLMSGERR_ATTR_MISS_TYPE`), with another attribute, a key of
     another length, no device, or padding, a state, a type or a flag but
     `NTF_PROXY`; `EAFNOSUPPORT` for a family but IPv4's and IPv6's;
-    `ENODEV` for another device; and `ENOENT` for a neighbour `lo` has
-    not, and for a proxy entry neither for the device asked nor for none.
-  - **Neighbour changes:** `RTM_NEWNEIGH` adds or changes one of `lo`'s
-    neighbours and `RTM_DELNEIGH` removes one, as `neigh_add` and
+    `ENODEV` for a device the namespace has not; `EOPNOTSUPP` for an IPv6
+    neighbour or a proxy entry of a veth end; and `ENOENT` for a neighbour
+    the device has not, and for a proxy entry neither for the device asked
+    nor for none.
+  - **Neighbour changes:** `RTM_NEWNEIGH` adds or changes one of the
+    neighbours of `lo` or of a veth end (below) and `RTM_DELNEIGH` removes
+    one, as `neigh_add` and
     `neigh_delete` do, with `CAP_NET_ADMIN`. They check in Linux's order:
     `nda_policy`, not strictly, for an addition, and a short `ndmsg`; no
-    `NDA_DST` (`EINVAL`); another device (`ENODEV`), and to add, a
-    link-layer address shorter than `lo`'s six bytes (`EINVAL`); a family
-    but IPv4's and IPv6's (`EAFNOSUPPORT`); a key shorter than the family's
-    (`EINVAL`). IPv4's neighbour of a loopback is keyed by `0.0.0.0`
+    `NDA_DST` (`EINVAL`); a device the namespace has not (`ENODEV`), and
+    to add, a link-layer address shorter than the device's six bytes
+    (`EINVAL`); a family but IPv4's and IPv6's (`EAFNOSUPPORT`); a key
+    shorter than the family's (`EINVAL`); and for a veth end, an IPv6
+    neighbour or a proxy entry (`EOPNOTSUPP`). IPv4's neighbour of a loopback is keyed by `0.0.0.0`
     whatever is asked, as `arp_constructor` keys it: a request for another
     key makes or changes that one with `NLM_F_CREATE` (`ENOENT` without),
     and removing it is `ENOENT`. An existing one with `NLM_F_EXCL` is
@@ -2721,12 +2749,39 @@ kernel.
     for its own device to remove (`ENOENT`). Without `NTF_PROXY`, a request
     without a device is `EINVAL`. `lo` going down takes its neighbours and
     proxy entries, as `neigh_ifdown` does, but not those of no device.
+  - **Neighbours of veth ends:** a veth end has IPv4's neighbours,
+    resolved by ARP as `arp_constructor`, `neigh_event_send`,
+    `arp_process` and `neigh_timer_handler` do. Each is keyed by the
+    address asked, of the type `inet_addr_type` gives that address as it
+    is made (`RTN_BROADCAST` while the namespace has no local table): a
+    group's is `NUD_NOARP` with the group's Ethernet address
+    (`ip_eth_mc_map`), a broadcast address's `NUD_NOARP` with the
+    broadcast one, and any other `NUD_NONE`, as a request that then fails
+    leaves it. A packet out through an end, of TCP's handshake, UDP or
+    ICMP's port unreachable back, takes its next hop's neighbour: a valid
+    one's address, which the peer takes only if it is its own; a stale one
+    delays; any other asks ARP, its unicast probes (3) and first probe
+    counted, and is reachable at once at the peer's address when the
+    peer answers, while the peer learns the sender, stale at its address
+    (`neigh_event_ns`); unanswered, it is incomplete and fails 3 seconds
+    later, its 6 probes sent. A delaying one probes 5 seconds on
+    (`NUD_PROBE`) and is reachable once the peer answers, or fails after 3
+    probes. Each of these changes but to incomplete and to delaying is
+    told to `RTNLGRP_NEIGH`, the timers' as a netlink socket of the
+    namespace next reads, polls or writes. A request with `NTF_USE` or
+    `NTF_MANAGED` asks ARP as a packet does, from the address
+    `inet_select_addr` picks on the end (`arp_solicit`). An end going down takes its
+    neighbours, each told of with `RTM_DELNEIGH` after its
+    `RTM_NEWLINK`; its peer losing its carrier, all but the permanent
+    ones (`neigh_carrier_down`); and an end that goes or moves away, all.
   - **Neighbour tables:** an `RTM_GETNEIGHTBL` dump, as
     `neightbl_dump_info`, gives each table the family names (ARP's and
     neighbour discovery's for `AF_UNSPEC`, none for another family) with
     its name, garbage collection's interval and thresholds, its
-    configuration, statistics and default parameters, then `lo`'s
-    parameters, which count its neighbours' references. Strictly, an
+    configuration, statistics and default parameters, then each device's
+    parameters, the newest first, which count its neighbours' references:
+    ARP's of the veth ends and `lo` (`inetdev_init`), neighbour
+    discovery's of `lo`. Strictly, an
     `ndtmsg` short, with padding or with attributes after it is `EINVAL`
     (`neightbl_valid_dump_info`).
   - **Notifications:** a socket is a member of the groups `bind` names
@@ -3508,7 +3563,7 @@ kernel.
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
-  `ipv6/conf/<device>/disable_ipv6` and `forwarding`. They and their
+  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write

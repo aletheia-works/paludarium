@@ -2105,6 +2105,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     取りません（`EACCES`）。端のアドレスにバインドしたソケット
     からのグループや限定ブロードキャストのアドレスへのものは、経路がなくてもその端から
     出ます（`ip_route_output_key_hash_rcu`）。
+  - **veth の端の IPv6:** キャリアのある上がった端は、`addrconf_dev_config` と同じく、
+    落ちるまでに一度だけ準備されます。マルチキャストの経路 `ff00::/8`（ローカルの表、
+    メトリック 256）、続けて接頭辞の経路 `fe80::/64` と、Ethernet のアドレスから作る
+    リンクローカルのアドレス（EUI-64、`IFAPROT_KERNEL_LL`）です。上がるときには、まず
+    持っている永続のアドレスそれぞれの接頭辞の経路を作ります。`RTM_NEWADDR` と
+    `RTM_DELADDR` は `lo` のもの（下）と同じく端のアドレスを足し、消し、端が上がって
+    いる間は接頭辞の経路も作ります。新しいアドレスは、重複アドレス検出が調べる間は仮
+    （tentative）です（`IFA_F_NODAD` のものと、端と `all` の `accept_dad` がどちらも 1
+    より小さいときは除きます）。検出は端がキャリアとともに上がってから始まり、1.5 秒後に
+    終わります。そのとき改めてそのままのアドレスと、ローカルの経路を伝えます。調べている
+    間の変更は伝えません（`inet6_addr_modify`）。リンク
+    ローカルのものは、そのときだけ伝えます。IPv6 を切った（`disable_ipv6`）端と MTU が
+    1280 より小さい端には、どれもありません。端の IPv6 の経路は、ローカルのもの以外、
+    端がキャリアなしで上がっている間は IPv4 のものと同じく `RTNH_F_LINKDOWN` です。
+    `RTM_NEWROUTE` は、ゲートウェイなしで端を通る IPv6 の経路を足し（`fib6_nh_init`：
+    IPv6 のない端（MTU が 1280 より小さいもの）は `ENODEV`、IPv6 を切った端は
+    `EACCES`、続けて端が落ちている間は `ENETDOWN`）、その経路は端が落ちるとなくなります。
+    端の `disable_ipv6` を 1 にすると、落ちるときと同じく IPv6 の経路とアドレスを失い、
+    上がっている間に 0 に戻すと、上がるときと同じくそれらを作ります
+    （`dev_disable_change`）。
+    落ちるかなくなると、IPv6 の経路をダンプの
+    順に伝えて失い、続けてアドレスを失います（`addrconf_ifdown`）。
   - **veth の端の netconf:** それぞれの端の設定は、その名前空間に伝えます（`RTNLGRP_IPV4_NETCONF`、
     `RTNLGRP_IPV6_NETCONF`。`inetdev_init`、`ipv6_add_dev` とその後始末が伝えるのと
     同じです）。増えるときは IPv4 の、それから IPv6 の設定のすべての `RTM_NEWNETCONF` を
@@ -2324,33 +2346,35 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     IPv6 は自分のアドレスにだけ bind できます。IPv4 にまだローカルの表がなければ、Linux の
     `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
     どの IPv4 のアドレスにも bind できます。
-  - **近隣:** `RTM_GETNEIGH` のダンプは、`neigh_dump_info` と同じくループバックの近隣
-    （下の通知の項のとおり通信が作るものと、リクエストが足したもの）を返します。それぞれは、消えるときに伝える
+  - **近隣:** `RTM_GETNEIGH` のダンプは、`neigh_dump_info` と同じくループバックと veth の
+    端の近隣（下の通知の項と veth の端の近隣の項のとおり通信が作るものと、リクエストが
+    足したもの）を返します。それぞれは、消えるときに伝える
     `RTM_DELNEIGH` と同じ形の `RTM_NEWNEIGH` です。`AF_UNSPEC` では ARP（IPv4）の
     ものに続けて近隣探索（IPv6）のものを、`AF_INET` と `AF_INET6` ではそのファミリーの
     ものを返し、ほかのファミリーでは何も返しません。フラグが `NTF_PROXY` の `ndmsg` は
     代わりに代理のエントリを求め、ハッシュ（`pneigh_hash`）のバケットの順に、それぞれの
     中では新しいものから返します。`NDA_IFINDEX` と `NDA_MASTER` は
-    ダンプを絞り、どのメッセージにも `NLM_F_DUMP_FILTERED` を付けます。`lo` の番号の 1
-    と、マスターの -1（マスターなし）なら近隣を残し（代理のエントリは、番号で絞ると `lo`
-    のものだけを残します）、ほかの値では何も返しません。
+    ダンプを絞り、どのメッセージにも `NLM_F_DUMP_FILTERED` を付けます。デバイスの番号は
+    そのデバイスの近隣だけを、マスターの -1（マスターなし）はすべてを残し（代理のエントリは、
+    番号で絞ると `lo` の番号で `lo` のものだけを残します）、ほかのマスターでは何も返しません。
     厳しく調べるときは、`neigh_valid_dump_req` と同じく、短い `ndmsg`、詰め物・番号・
     状態・型・`NTF_PROXY` 以外のフラグを持つ `ndmsg`、ほかの属性は `EINVAL` です。
     調べないときは、属性が `nda_policy` に合わないダンプは絞りません。`AF_MCTP` の
     ダンプは近隣を返しません（`mctp_rtm_getneigh` と同じく、短い `ndmsg` は `EINVAL`）。
     ダンプでないリクエストは、`neigh_get` と同じく、ファミリーとキー（`NDA_DST`）と
-    `lo` の番号で 1 つの近隣を指し、答えは引き当てが持つ参照も数えます。キーがない
+    デバイスの番号で 1 つの近隣を指し、答えは引き当てが持つ参照も数えます。キーがない
     （`NLMSGERR_ATTR_MISS_TYPE` で伝えます）、ほかの属性がある、キーの長さが違う、
     デバイスがない、詰め物・状態・型・`NTF_PROXY` 以外のフラグがあるものは `EINVAL`、
-    IPv4 と IPv6 以外のファミリーは `EAFNOSUPPORT`、ほかのデバイスは `ENODEV`、`lo` に
-    ない近隣と、指したデバイスのものもデバイスのないものもない代理のエントリは
-    `ENOENT` です。
-  - **近隣の変更:** `RTM_NEWNEIGH` は `lo` の近隣を足すか変え、`RTM_DELNEIGH` は
-    消します。`neigh_add` と `neigh_delete` と同じで、`CAP_NET_ADMIN` が要ります。調べる
+    IPv4 と IPv6 以外のファミリーは `EAFNOSUPPORT`、名前空間にないデバイスは `ENODEV`、
+    veth の端の IPv6 の近隣と代理のエントリは `EOPNOTSUPP`、デバイスにない近隣と、
+    指したデバイスのものもデバイスのないものもない代理のエントリは `ENOENT` です。
+  - **近隣の変更:** `RTM_NEWNEIGH` は `lo` か veth の端（下）の近隣を足すか変え、
+    `RTM_DELNEIGH` は消します。`neigh_add` と `neigh_delete` と同じで、`CAP_NET_ADMIN` が要ります。調べる
     のは Linux の順です。追加では厳しくない `nda_policy`、それと短い `ndmsg`、
-    `NDA_DST` がないもの（`EINVAL`）、ほかのデバイス（`ENODEV`）、追加では `lo` の
-    6 バイトより短いリンク層のアドレス（`EINVAL`）、IPv4 と IPv6 以外のファミリー
-    （`EAFNOSUPPORT`）、ファミリーのものより短いキー（`EINVAL`）です。ループバックの
+    `NDA_DST` がないもの（`EINVAL`）、名前空間にないデバイス（`ENODEV`）、追加では
+    デバイスの 6 バイトより短いリンク層のアドレス（`EINVAL`）、IPv4 と IPv6 以外の
+    ファミリー（`EAFNOSUPPORT`）、ファミリーのものより短いキー（`EINVAL`）、veth の端
+    では IPv6 の近隣と代理のエントリ（`EOPNOTSUPP`）です。ループバックの
     IPv4 の近隣は、`arp_constructor` と同じく、何を求めても `0.0.0.0` をキーにします。
     ほかのキーのリクエストは、`NLM_F_CREATE` があればそれを作るか変え（なければ
     `ENOENT`）、そのキーで消すと `ENOENT` です。あるものに `NLM_F_EXCL` を付けると
@@ -2374,11 +2398,33 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     デバイスのものだけを探します（`ENOENT`）。`NTF_PROXY` のないリクエストは、デバイスが
     なければ `EINVAL` です。`lo` を落とすと、`neigh_ifdown` と同じくその近隣と代理の
     エントリが消えますが、デバイスのないものは残ります。
+  - **veth の端の近隣:** veth の端は IPv4 の近隣を持ち、`arp_constructor`、
+    `neigh_event_send`、`arp_process`、`neigh_timer_handler` と同じく ARP で解決します。
+    それぞれは求めたアドレスをキーにし、作るときに `inet_addr_type` がそのアドレスに
+    与える型を持ちます（名前空間にローカルの表がないうちは `RTN_BROADCAST`）。グループの
+    ものはグループの Ethernet のアドレス（`ip_eth_mc_map`）を、ブロードキャストの
+    アドレスのものはブロードキャストのアドレスを持つ `NUD_NOARP`、ほかは `NUD_NONE` で、
+    失敗したリクエストもそのまま残します。端を通るパケット（TCP のハンドシェイク、UDP、
+    返る ICMP の port unreachable）は、次のホップの近隣を使います。有効なものはその
+    アドレスへ送り、相手は自分のアドレスへのものだけを受け取ります。古いものは遅延中に
+    なります。ほかのものは ARP で問い合わせ、ユニキャストの問い合わせの数（3）と最初の
+    問い合わせを数えます。相手が答えればすぐに相手のアドレスで到達可能になり、相手は
+    送り手を、そのアドレスの古いものとして覚えます（`neigh_event_ns`）。答えがなければ
+    未完了になり、6 回の問い合わせを送った 3 秒後に失敗します。遅延中のものは 5 秒後に
+    問い合わせ（`NUD_PROBE`）、相手が答えれば到達可能になり、3 回の問い合わせの後に
+    失敗します。未完了と遅延中になるとき以外の変化はそれぞれ `RTNLGRP_NEIGH` に伝え、
+    タイマーによるものは名前空間の netlink ソケットが次に読み、poll し、書くときに
+    伝えます。`NTF_USE` や `NTF_MANAGED` のリクエストは、パケットと同じく、端で
+    `inet_select_addr` が選ぶアドレスから ARP で問い合わせます（`arp_solicit`）。
+    端を下げると、その `RTM_NEWLINK` の後に、端の近隣がそれぞれ
+    `RTM_DELNEIGH` を伝えて消えます。相手がキャリアを失うと永続のもの以外が
+    （`neigh_carrier_down`）、端がなくなるか別の名前空間に移るとすべてが消えます。
   - **近隣の表:** `RTM_GETNEIGHTBL` のダンプは、`neightbl_dump_info` と同じく、
     ファミリーが指す表（`AF_UNSPEC` では ARP と近隣探索の表、ほかのファミリーでは
     なし）を、名前、ガベージコレクションの間隔としきい値、構成、統計、既定の
-    パラメーターとともに返し、続けて `lo` のパラメーターを返します。`lo` のものは、
-    その近隣が持つ参照を数えます。厳しく調べるときは、短い `ndtmsg`、詰め物のある
+    パラメーターとともに返し、続けてデバイスごとのパラメーターを新しいものから返します。
+    ARP では veth の端と `lo` のもの（`inetdev_init`）、近隣探索では `lo` のものです。
+    それぞれ、その近隣が持つ参照を数えます。厳しく調べるときは、短い `ndtmsg`、詰め物のある
     もの、後ろに属性のあるものは `EINVAL` です（`neightbl_valid_dump_info`）。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
@@ -3052,7 +3098,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
   `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
-  `ipv6/conf/<デバイス>/disable_ipv6` と `forwarding` です。ファイルとディレクトリは、
+  `ipv6/conf/<デバイス>/accept_dad`、`disable_ipv6`、`forwarding` です。ファイルとディレクトリは、
   ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
   書き込みで開けるのは、root と、その名前空間への `CAP_NET_ADMIN` を持つものです
   （`net_ctl_permissions`。開けなければ `EACCES`、書き込みのときに書けなければ

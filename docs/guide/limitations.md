@@ -938,11 +938,18 @@ verified.
   where Linux gives them to root of the process's own when it maps one. A network
   namespace has no interface but its loopback and the veth ends requests
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
-  across a pair to an address of the peer's namespace, but no IPv6
-  address (it makes no link-local one as it comes up, where Linux does),
-  no neighbour, no route through a gateway and no IPv6 route lookup in
-  through it (`RTA_IIF`), each `EOPNOTSUPP`. Traffic through an end makes no
-  neighbour entries and moves no counters; a namespace forwards nothing
+  across a pair to an address of the peer's namespace; it takes IPv6
+  addresses, makes its link-local one and its routes, and takes IPv6
+  routes a request adds without a gateway, but no IPv6 neighbour or proxy
+  entry, no route through a gateway and no IPv6 route lookup in through
+  it (`RTA_IIF`), each `EOPNOTSUPP`; and no IPv6 traffic goes through it
+  (`ENETUNREACH`). Its duplicate address detection sends no probe, finds
+  no duplicate and ends 1.5 seconds after it begins (half of
+  `rtr_solicit_delay`, then a probe and a retransmit time), where Linux's
+  ends 1 to 2 seconds on after a random delay; its link-local address is always made from its
+  Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
+  solicitation nor MLD report. Traffic through
+  an end moves no counters; a namespace forwards nothing
   on to another; and a broadcast or multicast destination through an end
   reaches no one. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`), so every datagram to a closed port of the
@@ -950,7 +957,13 @@ verified.
   connection across a pair goes on after an end goes down, goes or moves,
   or the address or route it took goes, where Linux's packets stop. A connection to an address nobody answers ARP for fails
   3 seconds after each connect, where Linux's attempts made while the
-  neighbour is resolving fail together. The addresses of an end that goes tell
+  neighbour is resolving fail together. An end's neighbour is answered or
+  not as the peer would answer when it begins to resolve or to delay,
+  where Linux asks again with each probe, and so a packet waiting for one
+  never goes once it is answered later; `NTF_MANAGED` ones are never
+  probed again; no traffic confirms one (`dst_confirm`, `MSG_CONFIRM`), so
+  a delaying one is always probed; and the neighbour table dump gives no
+  veth end's IPv6 parameters. The addresses of an end that goes tell
   their lifetimes as of the last netlink request, read or poll in its
   namespace, where Linux takes the time it goes. Making one takes
   only a name, an address and an MTU for each end (`EOPNOTSUPP` for the
@@ -1003,9 +1016,10 @@ verified.
   the settings that have no file (proxy ARP and NDP, multicast and
   broadcast forwarding, ignoring routes with their link down) as 0, as
   Linux is built. A veth end whose MTU is below 1280 still has the files
-  of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6.
+  of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
+  (it makes no IPv6 address, as Linux's does not).
   A
-  route goes through `lo`, a veth end (IPv4, without a gateway) or rejects: IPv6 gateways, multipath routes,
+  route goes through `lo`, a veth end (without a gateway) or rejects: IPv6 gateways, multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
@@ -1032,9 +1046,9 @@ verified.
   Linux does from 7.3; before it, one that has already run out. No
   temporary addresses are made for `IFA_F_MANAGETEMPADDR`, and
   `IFA_F_MCAUTOJOIN` joins no group. A peer address is
-  not a point-to-point one, and an IPv6 address is never tentative, where
-  Linux's is until its duplicate address detection work, which ends at
-  once on a loopback, has run. A connection or datagram to an address of
+  not a point-to-point one, and an IPv6 address of `lo` is never
+  tentative, where Linux's is until its duplicate address detection work,
+  which ends at once on a loopback, has run. A connection or datagram to an address of
   the namespace's own, of `lo` or a veth end, while `lo` is down is
   `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
@@ -1050,9 +1064,10 @@ verified.
   Notifications go out for the link, its IPv6 information, addresses,
   routes, neighbours and namespace IDs alone, not for the other groups;
   IPv4's routes through `lo` go without one when it goes down, as on
-  Linux. Traffic makes a neighbour through UDP and TCP's handshakes alone,
-  which are the only packets paludarium sends through `lo` (a TCP handshake
-  retried into a full backlog makes none of its answer), and none times
+  Linux. Traffic makes a neighbour through UDP, TCP's handshakes and ICMP's
+  port unreachable back alone, which are the only packets paludarium sends
+  through `lo` or a veth end (a TCP handshake retried into a full backlog
+  makes none of its answer), and none times
   out (`gc_thresh1` is never reached). A dump gives a family's neighbours
   the newest first, where Linux gives them in the order of its hash
   table, which a random key sets. Proxy entries of one hash bucket come
@@ -1060,7 +1075,7 @@ verified.
   x86-64 runner's Linux gave two of them the other way. One without a
   device goes with its namespace, where Linux 7.0, whose proxy table is
   every namespace's, keeps it, for a namespace made later where that one
-  was to see (Linux's master gives each namespace its own). Of a neighbour's
+  was to see (Linux's master gives each namespace its own). Of a loopback neighbour's
   timers only a reachable one's runs: once its reachable time since it
   was confirmed has passed, it goes stale, or delays if it was used
   within the delay before a probe (5 seconds), and its going stale is
@@ -1069,8 +1084,8 @@ verified.
   probes nor becomes reachable or failed, and one `NTF_USE` or
   `NTF_MANAGED` makes incomplete counts its first probe but never sends
   another nor fails;
-  `NTF_EXT_MANAGED` ones are not probed from time to time. A neighbour's
-  state and link-layer address change nothing traffic does, where Linux's
+  `NTF_EXT_MANAGED` ones are not probed from time to time. A loopback
+  neighbour's state and link-layer address change nothing traffic does, where Linux's
   `lo` holds a packet for one that is not valid until it resolves. Its
   references count only those of the request and of its timer. An IPv6
   proxy entry joins no solicited-node group (`pndisc_constructor`), and

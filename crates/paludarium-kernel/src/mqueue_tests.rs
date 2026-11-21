@@ -2,12 +2,15 @@
 //! `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify` and
 //! `mq_getsetattr`, their checks in Linux's order, priorities, the queue's
 //! file, the limits and `/proc/sys/fs/mqueue`, poll, select and epoll on a
-//! queue, a `SIGEV_SIGNAL` notification, and `/dev/mqueue`'s paths. The
-//! expected values are Linux's (`ipc/mqueue.c`): they are the lines of the
-//! cases of `tests/guests/processes/mqueue.c` that run in one thread without
+//! queue, a `SIGEV_SIGNAL` notification, and `/dev/mqueue`: its paths, the
+//! calls on a queue's path and on the root, the names it makes and moves,
+//! and a queue opened again by its link. The expected values are Linux's
+//! (`ipc/mqueue.c`): they are the lines of the cases of
+//! `tests/guests/processes/mqueue.c` that run in one thread without
 //! waiting, which the differential tests compare with Linux. The rest (the
-//! waits, other processes, `SIGEV_THREAD`'s cookies, user namespaces and
-//! the times) stay with the differential tests.
+//! waits, other processes and users, `SIGEV_THREAD`'s cookies, user
+//! namespaces and the fields that compare a time with the clock's) stay
+//! with the differential tests.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use paludarium_mmu::{MappingKind, Prot};
@@ -1212,6 +1215,691 @@ fn dev_mqueue_s_paths_reach_the_namespace_s_queues() {
             "made: mq_open=1",
             "unlink: made=0 again=-2 mq_open-after=-2 rmdir=-20 rmdir-missing=-2 unlink-missing=-2 queue=0",
             "unlinked: readlink [/dev/mqueue/paludarium-mqueue-dev (deleted)]",
+        ],
+    );
+}
+
+/// The calls of `/dev/mqueue`'s files and names in the next tests.
+mod dev {
+    pub(super) const STAT: u64 = 4;
+    pub(super) const TRUNCATE: u64 = 76;
+    pub(super) const FTRUNCATE: u64 = 77;
+    pub(super) const RENAME: u64 = 82;
+    pub(super) const MKDIR: u64 = 83;
+    pub(super) const LINK: u64 = 86;
+    pub(super) const UNLINK: u64 = 87;
+    pub(super) const SYMLINK: u64 = 88;
+    pub(super) const CHMOD: u64 = 90;
+    pub(super) const CHOWN: u64 = 92;
+    pub(super) const LCHOWN: u64 = 94;
+    pub(super) const MKNOD: u64 = 133;
+    pub(super) const STATFS: u64 = 137;
+    pub(super) const FSTATFS: u64 = 138;
+    pub(super) const PRCTL: u64 = 157;
+    pub(super) const GETDENTS64: u64 = 217;
+    pub(super) const UTIMES: u64 = 235;
+    pub(super) const FCHOWNAT: u64 = 260;
+    pub(super) const LINKAT: u64 = 265;
+    pub(super) const FCHMODAT: u64 = 268;
+    pub(super) const UTIMENSAT: u64 = 280;
+    pub(super) const RENAMEAT2: u64 = 316;
+    pub(super) const LANDLOCK_CREATE_RULESET: u64 = 444;
+    pub(super) const LANDLOCK_RESTRICT_SELF: u64 = 446;
+    pub(super) const AT_FDCWD: u64 = -100i64 as u64;
+    pub(super) const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    pub(super) const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    pub(super) const AT_EMPTY_PATH: u64 = 0x1000;
+    pub(super) const O_TRUNC: u64 = 0o1000;
+    pub(super) const O_DIRECTORY: u64 = 0o200000;
+    pub(super) const UTIME_OMIT: i64 = (1 << 30) - 2;
+    pub(super) const NAME: &str = "paludarium-mqueue-dev";
+    /// A second path, and the buffer `getdents64` fills.
+    pub(super) const OTHER: u64 = super::DATA + 0x100;
+    pub(super) const ENTRIES: u64 = super::DATA + PAGE_SIZE;
+    use super::PAGE_SIZE;
+}
+
+impl Env {
+    /// `/dev/mqueue/<NAME><suffix>`.
+    fn dev_path(suffix: &str) -> Vec<u8> {
+        format!("/dev/mqueue/{}{suffix}", dev::NAME).into_bytes()
+    }
+
+    /// Puts `path` and its NUL at `dev::OTHER`, for a call of two paths.
+    fn other(&self, path: &[u8]) -> u64 {
+        let mut bytes = path.to_vec();
+        bytes.push(0);
+        self.put(dev::OTHER, &bytes);
+        dev::OTHER
+    }
+
+    /// A call of one path and five more arguments.
+    fn on_path(&mut self, n: u64, path: &[u8], rest: [u64; 5]) -> i64 {
+        let at = self.name(path);
+        self.call(n, [at, rest[0], rest[1], rest[2], rest[3], rest[4]])
+    }
+
+    /// A call of two paths, as `link` and `rename` take them.
+    fn on_paths(&mut self, n: u64, from: &[u8], to: &[u8]) -> i64 {
+        let (from, to) = (self.name(from), self.other(to));
+        self.call(n, [from, to, 0, 0, 0, 0])
+    }
+
+    /// A call of two paths each relative to a directory, as `linkat` and
+    /// `renameat2` take them.
+    fn on_paths_at(&mut self, n: u64, from: (u64, &[u8]), to: &[u8], flags: u64) -> i64 {
+        let (path, other) = (self.name(from.1), self.other(to));
+        self.call(n, [from.0, path, dev::AT_FDCWD, other, flags, 0])
+    }
+
+    /// `stat` of `path`: its result, and the mode, user, group, size and
+    /// modification time in nanoseconds.
+    fn stat_path(&mut self, path: &[u8]) -> (i64, u32, u32, u32, i64, i64) {
+        self.put(STAT, &[0; 144]);
+        let r = self.on_path(dev::STAT, path, [STAT, 0, 0, 0, 0]);
+        self.stat_fields(r)
+    }
+
+    /// `fstat`'s result and fields, as [`Env::stat_path`] gives them.
+    fn stat_fd(&mut self, fd: i64) -> (i64, u32, u32, u32, i64, i64) {
+        self.put(STAT, &[0; 144]);
+        let r = self.call(FSTAT, [fd as u64, STAT, 0, 0, 0, 0]);
+        self.stat_fields(r)
+    }
+
+    fn stat_fields(&self, r: i64) -> (i64, u32, u32, u32, i64, i64) {
+        let word = |at: u64| u32::from_le_bytes(self.get(STAT + at, 4).try_into().unwrap());
+        let mtime = self.long(STAT + 88) * 1_000_000_000 + self.long(STAT + 96);
+        (r, word(24), word(28), word(32), self.long(STAT + 48), mtime)
+    }
+
+    /// `show_file`'s line.
+    fn show_file(&mut self, label: &str, path: &[u8]) -> String {
+        let (r, mode, uid, gid, size, _) = self.stat_path(path);
+        format!("{label}: stat={r} mode={mode:o} uid={uid} gid={gid} size={size}")
+    }
+
+    /// `show_statfs`'s line, for the `statfs` (`fstatfs`) call `n` of `at`.
+    fn show_statfs(&mut self, label: &str, n: u64, at: u64) -> String {
+        const FS: u64 = BUF;
+        self.put(FS, &[0; 120]);
+        let r = self.call(n, [at, FS, 0, 0, 0, 0]);
+        let field = |i: u64| self.long(FS + 8 * i);
+        format!(
+            "{label}: statfs={r} type={:x} bsize={} namelen={} frsize={} blocks={} bfree={} files={}",
+            field(0),
+            field(1),
+            field(8),
+            field(9),
+            field(2),
+            field(3),
+            field(5)
+        )
+    }
+
+    /// Two `struct timespec`s at `TIME`, as `utimensat` takes them.
+    fn times(&self, atime: (i64, i64), mtime: (i64, i64)) -> u64 {
+        for (i, v) in [atime.0, atime.1, mtime.0, mtime.1].into_iter().enumerate() {
+            self.put(TIME + 8 * i as u64, &v.to_le_bytes());
+        }
+        TIME
+    }
+
+    /// `utimensat(AT_FDCWD, path, times, flags)`.
+    fn utimensat(
+        &mut self,
+        path: &[u8],
+        times: Option<((i64, i64), (i64, i64))>,
+        flags: u64,
+    ) -> i64 {
+        let times = times.map_or(0, |(a, m)| self.times(a, m));
+        let at = self.name(path);
+        self.call(dev::UTIMENSAT, [dev::AT_FDCWD, at, times, flags, 0, 0])
+    }
+
+    /// `listed_type`: the type `/dev/mqueue`'s entry `name` has, or 0.
+    fn listed_type(&mut self, name: &str) -> i64 {
+        let path = self.name(b"/dev/mqueue");
+        let d = self.call(
+            OPEN,
+            [path, O_RDONLY | dev::O_DIRECTORY | O_CLOEXEC, 0, 0, 0, 0],
+        );
+        if d < 0 {
+            return d;
+        }
+        let mut found = 0;
+        loop {
+            let n = self.call(dev::GETDENTS64, [d as u64, dev::ENTRIES, 2048, 0, 0, 0]);
+            if n <= 0 {
+                break;
+            }
+            let bytes = self.get(dev::ENTRIES, n as usize);
+            let mut at = 0;
+            while at < bytes.len() {
+                let len = u16::from_le_bytes([bytes[at + 16], bytes[at + 17]]) as usize;
+                let kind = bytes[at + 18];
+                let entry = &bytes[at + 19..at + len];
+                let entry = &entry[..entry.iter().position(|&b| b == 0).unwrap()];
+                if entry == name.as_bytes() {
+                    found = i64::from(kind);
+                }
+                at += len;
+            }
+        }
+        self.close(d);
+        found
+    }
+
+    /// `show_link`'s line.
+    fn show_link(&mut self, label: &str, fd: i64) -> String {
+        let target = self.link(fd);
+        format!("{label}: readlink={} [{target}]", target.len())
+    }
+}
+
+/// `dev_paths`: the calls on a queue's path in `/dev/mqueue`, which change
+/// its file as `simple_setattr` does, a truncate, `O_TRUNC`, `statfs` and
+/// the root's size, with the lines of `tests/guests/processes/mqueue.c`'s
+/// `mqueue-dev` case. A field that compares a time with the clock's
+/// (`*-stamped`) is left out, and so are the other users' lines, which
+/// need processes of their own.
+#[test]
+fn dev_mqueue_s_paths_change_a_queue_s_file_as_simple_setattr_does() {
+    let mut e = Env::new();
+    let mut out = Vec::new();
+    let attrs = format!("{}-attrs", dev::NAME);
+    let path = Env::dev_path("-attrs");
+    let none = Env::dev_path("-attrs-none");
+    let root = b"/dev/mqueue".as_slice();
+    let base = e.stat_path(root).4;
+    let q = e.open(attrs.as_bytes(), O_RDWR | O_CREAT | O_EXCL, 0o640, 0);
+    assert!(q >= 0);
+    let grown = e.stat_path(root).4 - base;
+    let made = e.stat_path(root).5;
+    let again = e.open(attrs.as_bytes(), O_RDWR, 0, 0);
+    out.push(format!(
+        "root: made-grows={grown} open-keeps={} size-kept={}",
+        u8::from(e.stat_path(root).5 == made),
+        e.stat_path(root).4 - base
+    ));
+    e.close(again);
+
+    let long = format!("/dev/mqueue/{}", "a".repeat(258));
+    out.push(format!(
+        "chmod: path={} missing={} long={}",
+        e.on_path(dev::CHMOD, &path, [0o4750, 0, 0, 0, 0]),
+        e.on_path(dev::CHMOD, &none, [0o600, 0, 0, 0, 0]),
+        e.on_path(dev::CHMOD, long.as_bytes(), [0o600, 0, 0, 0, 0]),
+    ));
+    out.push(e.show_file("chmod", &path));
+    out.push(format!(
+        "chown: path={}",
+        e.on_path(dev::CHOWN, &path, [2000, 3000, 0, 0, 0])
+    ));
+    out.push(e.show_file("chown", &path));
+    let at = |e: &mut Env, n: u64, rest: [u64; 3]| {
+        let at = e.name(&Env::dev_path("-attrs"));
+        e.call(n, [dev::AT_FDCWD, at, rest[0], rest[1], rest[2], 0])
+    };
+    let lchown = e.on_path(dev::LCHOWN, &path, [u32::MAX as u64, 3001, 0, 0, 0]);
+    let fchownat = at(
+        &mut e,
+        dev::FCHOWNAT,
+        [2001, u32::MAX as u64, dev::AT_SYMLINK_NOFOLLOW],
+    );
+    let fchmodat = at(&mut e, dev::FCHMODAT, [0o640, 0, 0]);
+    let missing = e.on_path(dev::CHOWN, &none, [0, 0, 0, 0, 0]);
+    out.push(format!(
+        "chown: lchown={lchown} fchownat={fchownat} fchmodat={fchmodat} missing={missing}"
+    ));
+    out.push(e.show_file("owned", &path));
+
+    let mut times = Vec::new();
+    let set = e.utimensat(&path, Some(((1000, 0), (1_234_567, 890))), 0);
+    let mtime = e.stat_path(&path).5;
+    times.push(format!(
+        "utimensat={set} mtime-s={} mtime-ns={}",
+        mtime / 1_000_000_000,
+        mtime % 1_000_000_000
+    ));
+    let omit = e.utimensat(
+        &path,
+        Some(((5, 0), (0, dev::UTIME_OMIT))),
+        dev::AT_SYMLINK_NOFOLLOW,
+    );
+    times.push(format!(
+        "omit={omit} omit-keeps={}",
+        u8::from(e.stat_path(&path).5 == 1_234_567_000_000_000)
+    ));
+    let by_fd = e.times((0, dev::UTIME_OMIT), (2_000_000, 5));
+    let futimens = e.call(dev::UTIMENSAT, [q as u64, 0, by_fd, 0, 0, 0]);
+    times.push(format!(
+        "futimens={futimens} futimens-s={}",
+        e.stat_fd(q).5 / 1_000_000_000
+    ));
+    // Two `struct timeval`s.
+    e.times((1, 0), (3_000_000, 999_999));
+    let utimes = e.on_path(dev::UTIMES, &path, [TIME, 0, 0, 0, 0]);
+    let mtime = e.stat_path(&path).5;
+    times.push(format!(
+        "utimes={utimes} utimes-s={} utimes-ns={}",
+        mtime / 1_000_000_000,
+        mtime % 1_000_000_000
+    ));
+    times.push(format!("missing={}", e.utimensat(&none, None, 0)));
+    times.push(format!("now={}", e.utimensat(&path, None, 0)));
+    out.push(format!("times: {}", times.join(" ")));
+
+    let touched = e.stat_path(&path).5;
+    let truncate = |e: &mut Env, path: &[u8], size: i64| {
+        e.on_path(dev::TRUNCATE, path, [size as u64, 0, 0, 0, 0])
+    };
+    let sized = truncate(&mut e, &path, 1000);
+    let size = e.stat_path(&path).4;
+    let keeps = u8::from(e.stat_path(&path).5 == touched);
+    let past = truncate(&mut e, &path, 1 << 31);
+    let lfs = truncate(&mut e, &path, (1 << 31) - 1);
+    let lfs_size = e.stat_path(&path).4;
+    let negative = truncate(&mut e, &path, -1);
+    let missing = truncate(&mut e, &none, 0);
+    out.push(format!(
+        "truncate: path={sized} size={size} path-keeps-mtime={keeps} past-lfs={past} lfs={lfs} \
+         lfs-size={lfs_size} negative={negative} missing={missing}"
+    ));
+    let ftruncate =
+        |e: &mut Env, fd: i64, size: u64| e.call(dev::FTRUNCATE, [fd as u64, size, 0, 0, 0, 0]);
+    let by_mq_open = ftruncate(&mut e, q, 500);
+    let size = e.stat_fd(q).4;
+    let past = ftruncate(&mut e, q, 1 << 31);
+    let ro = e.open(attrs.as_bytes(), O_RDONLY, 0, 0);
+    let read_only = ftruncate(&mut e, ro, 0);
+    let at = e.name(&path);
+    let d = e.call(OPEN, [at, O_RDWR | O_CLOEXEC, 0, 0, 0, 0]);
+    let opened_past = ftruncate(&mut e, d, 1 << 31);
+    let end = e.call(LSEEK, [d as u64, 0, 2, 0, 0, 0]);
+    e.call(LSEEK, [d as u64, 0, 0, 0, 0, 0]);
+    let read = e.call(READ, [d as u64, BUF, 100, 0, 0, 0]);
+    out.push(format!(
+        "ftruncate: mq_open={by_mq_open} size={size} past-lfs={past} read-only={read_only} \
+         opened-past-lfs={opened_past} seek-end={end} read={read}"
+    ));
+    let t = e.on_path(
+        OPEN,
+        &path,
+        [O_RDONLY | dev::O_TRUNC | O_CLOEXEC, 0, 0, 0, 0],
+    );
+    let opened = u8::from(t >= 0);
+    let size = e.stat_path(&path).4;
+    e.close(t);
+    ftruncate(&mut e, q, 300);
+    let trunc = Env::dev_path("-attrs-trunc");
+    let made = e.on_path(
+        OPEN,
+        &trunc,
+        [
+            O_WRONLY | O_CREAT | dev::O_TRUNC | O_CLOEXEC,
+            0o600,
+            0,
+            0,
+            0,
+        ],
+    );
+    out.push(format!(
+        "o_trunc: open={opened} size={size} made={} made-size={} other-kept={}",
+        u8::from(made >= 0),
+        e.stat_path(&trunc).4,
+        e.stat_path(&path).4
+    ));
+    e.close(made);
+    assert_eq!(e.on_path(dev::UNLINK, &trunc, [0; 5]), 0);
+
+    let at = e.name(root);
+    out.push(e.show_statfs("statfs-root", dev::STATFS, at));
+    let at = e.name(&path);
+    out.push(e.show_statfs("statfs-queue", dev::STATFS, at));
+    out.push(e.show_statfs("fstatfs-mq_open", dev::FSTATFS, q as u64));
+    out.push(e.show_statfs("fstatfs-opened", dev::FSTATFS, d as u64));
+    let missing = e.on_path(dev::STATFS, &none, [BUF, 0, 0, 0, 0]);
+    out.push(format!("statfs-missing: statfs={missing}"));
+    e.close(ro);
+    e.close(d);
+    e.close(q);
+    let base = e.stat_path(root).4;
+    let unlinked = e.on_path(dev::UNLINK, &path, [0; 5]);
+    out.push(format!(
+        "root: unlink={unlinked} unlinked-shrinks={}",
+        base - e.stat_path(root).4
+    ));
+    check(
+        &out,
+        &[
+            "root: made-grows=20 open-keeps=1 size-kept=20",
+            "chmod: path=0 missing=-2 long=-36",
+            "chmod: stat=0 mode=104750 uid=0 gid=0 size=80",
+            "chown: path=0",
+            "chown: stat=0 mode=100750 uid=2000 gid=3000 size=80",
+            "chown: lchown=0 fchownat=0 fchmodat=0 missing=-2",
+            "owned: stat=0 mode=100640 uid=2001 gid=3001 size=80",
+            "times: utimensat=0 mtime-s=1234567 mtime-ns=0 omit=0 omit-keeps=1 futimens=0 \
+             futimens-s=2000000 utimes=0 utimes-s=3000000 utimes-ns=0 missing=-2 now=0",
+            "truncate: path=0 size=1000 path-keeps-mtime=1 past-lfs=-27 lfs=0 lfs-size=2147483647 \
+             negative=-22 missing=-2",
+            "ftruncate: mq_open=0 size=500 past-lfs=-22 read-only=-22 opened-past-lfs=-27 \
+             seek-end=500 read=60",
+            "o_trunc: open=1 size=0 made=1 made-size=80 other-kept=300",
+            "statfs-root: statfs=0 type=19800202 bsize=4096 namelen=255 frsize=4096 blocks=0 bfree=0 files=0",
+            "statfs-queue: statfs=0 type=19800202 bsize=4096 namelen=255 frsize=4096 blocks=0 bfree=0 files=0",
+            "fstatfs-mq_open: statfs=0 type=19800202 bsize=4096 namelen=255 frsize=4096 blocks=0 bfree=0 files=0",
+            "fstatfs-opened: statfs=0 type=19800202 bsize=4096 namelen=255 frsize=4096 blocks=0 bfree=0 files=0",
+            "statfs-missing: statfs=-2",
+            "root: unlink=0 unlinked-shrinks=20",
+        ],
+    );
+}
+
+/// `dev_names`: making and moving names in `/dev/mqueue`, whose root
+/// makes only queues: `mkdir`, `symlink` and `mknod` of anything but a
+/// regular file are `EPERM` once the name is free, `mknod` of a regular
+/// file makes a queue, and `link` and `rename` are `EXDEV` across mounts
+/// and `EPERM` within it; then Landlock's `EACCES` before the root's
+/// `EPERM`. The Landlock domain comes last here, where the guest makes it
+/// in a child, as a domain cannot be left.
+#[test]
+fn dev_mqueue_makes_only_queues_and_moves_no_names() {
+    const S_IFREG: u64 = 0o100000;
+    const S_IFDIR: u64 = 0o040000;
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFIFO: u64 = 0o010000;
+    let mut e = Env::new();
+    let mut out = Vec::new();
+    let attrs = format!("{}-attrs", dev::NAME);
+    let q = e.open(attrs.as_bytes(), O_RDWR | O_CREAT | O_EXCL, 0o640, 0);
+    assert!(q >= 0);
+    let p = Env::dev_path;
+    let root = b"/dev/mqueue".as_slice();
+    let there = p("-attrs");
+    let mknod = |e: &mut Env, path: &[u8], mode: u64, dev: u64| {
+        e.on_path(dev::MKNOD, path, [mode, dev, 0, 0, 0])
+    };
+    let symlink = |e: &mut Env, to: &[u8]| e.on_paths(dev::SYMLINK, b"target", to);
+    let mut make = vec![
+        (
+            "mkdir",
+            e.on_path(dev::MKDIR, &p("-dir"), [0o700, 0, 0, 0, 0]),
+        ),
+        (
+            "mkdir-there",
+            e.on_path(dev::MKDIR, &there, [0o700, 0, 0, 0, 0]),
+        ),
+        (
+            "mkdir-root",
+            e.on_path(dev::MKDIR, root, [0o700, 0, 0, 0, 0]),
+        ),
+        ("symlink-root", symlink(&mut e, root)),
+        ("mknod-root", mknod(&mut e, root, S_IFREG | 0o600, 0)),
+        ("symlink", symlink(&mut e, &p("-sym"))),
+        ("symlink-there", symlink(&mut e, &there)),
+        ("fifo", mknod(&mut e, &p("-fifo"), S_IFIFO | 0o600, 0)),
+        (
+            "chr",
+            mknod(&mut e, &p("-chr"), S_IFCHR | 0o600, (1 << 8) | 3),
+        ),
+        ("dir", mknod(&mut e, &p("-dir"), S_IFDIR | 0o700, 0)),
+        ("bad-type", mknod(&mut e, &p("-dir"), 0o170000 | 0o700, 0)),
+        ("fifo-there", mknod(&mut e, &there, S_IFIFO | 0o600, 0)),
+    ];
+    let listed = ["-dir", "-sym", "-fifo", "-chr"]
+        .iter()
+        .map(|suffix| e.listed_type(&format!("{}{suffix}", dev::NAME)))
+        .sum::<i64>();
+    make.push(("listed", listed));
+    let line = |label: &str, fields: &[(&str, i64)]| {
+        let fields: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        format!("{label}: {}", fields.join(" "))
+    };
+    out.push(line("make", &make));
+
+    let node = format!("{}-node", dev::NAME);
+    e.call(UMASK, [0o027, 0, 0, 0, 0, 0]);
+    let regular = mknod(&mut e, &p("-node"), S_IFREG | 0o666, 0);
+    let kind = e.listed_type(&node);
+    let (stated, mode, ..) = e.stat_path(&p("-node"));
+    let zero = mknod(&mut e, &p("-zero"), 0o600, 0);
+    let again = mknod(&mut e, &p("-node"), S_IFREG | 0o600, 0);
+    out.push(format!(
+        "mknod: regular={regular} type={kind} stat={stated} mode={mode:o} zero-type={zero} again={again}"
+    ));
+    e.call(UMASK, [0o022, 0, 0, 0, 0, 0]);
+    let by_name = e.open(node.as_bytes(), O_RDONLY, 0, 0);
+    out.push(format!("node: {}", e.getattr(by_name)));
+    e.close(by_name);
+
+    // A directory of the root filesystem, and a file in it.
+    let dir = b"/tmp/mqueue-dev".as_slice();
+    assert_eq!(e.on_path(dev::MKDIR, dir, [0o700, 0, 0, 0, 0]), 0);
+    let file = b"/tmp/mqueue-dev/file".as_slice();
+    let other = b"/tmp/mqueue-dev/other".as_slice();
+    let fd = e.on_path(
+        OPEN,
+        file,
+        [O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600, 0, 0, 0],
+    );
+    e.close(fd);
+    let link = |e: &mut Env, from: &[u8], to: &[u8]| e.on_paths(dev::LINK, from, to);
+    let mut links = vec![
+        ("inside", link(&mut e, &there, &p("-link"))),
+        ("onto", link(&mut e, &there, &p("-node"))),
+        ("missing", link(&mut e, &p("-none"), &p("-link"))),
+        (
+            "follow",
+            e.on_paths_at(
+                dev::LINKAT,
+                (dev::AT_FDCWD, &there),
+                &p("-link"),
+                dev::AT_SYMLINK_FOLLOW,
+            ),
+        ),
+        ("out", link(&mut e, &there, other)),
+        ("out-onto", link(&mut e, &there, file)),
+        ("in", link(&mut e, file, &p("-in"))),
+        ("in-missing", link(&mut e, other, &p("-in"))),
+        ("in-onto", link(&mut e, file, &there)),
+    ];
+    let by_name = e.open(attrs.as_bytes(), O_RDONLY, 0, 0);
+    let by_path = e.on_path(OPEN, &there, [O_RDONLY | O_CLOEXEC, 0, 0, 0, 0]);
+    let empty = |e: &mut Env, fd: i64, to: &[u8]| {
+        e.on_paths_at(dev::LINKAT, (fd as u64, b""), to, dev::AT_EMPTY_PATH)
+    };
+    links.push(("empty-mq_open", empty(&mut e, by_name, &p("-link"))));
+    links.push(("empty-opened", empty(&mut e, by_path, &p("-link"))));
+    links.push(("empty-onto", empty(&mut e, by_path, &p("-node"))));
+    e.close(by_name);
+    e.close(by_path);
+    let listed =
+        e.listed_type(&format!("{}-link", dev::NAME)) + e.listed_type(&format!("{}-in", dev::NAME));
+    links.push(("listed", listed));
+    out.push(line("link", &links));
+
+    let rename = |e: &mut Env, from: &[u8], to: &[u8]| e.on_paths(dev::RENAME, from, to);
+    let rename2 = |e: &mut Env, from: &[u8], to: &[u8], flags: u64| {
+        e.on_paths_at(dev::RENAMEAT2, (dev::AT_FDCWD, from), to, flags)
+    };
+    let mut renames = vec![
+        ("inside", rename(&mut e, &there, &p("-moved"))),
+        ("onto", rename(&mut e, &there, &p("-node"))),
+        ("itself", rename(&mut e, &there, &there)),
+        ("missing", rename(&mut e, &p("-none"), &p("-moved"))),
+        ("noreplace", rename2(&mut e, &there, &p("-node"), 1)),
+        ("noreplace-itself", rename2(&mut e, &there, &there, 1)),
+        ("exchange-missing", rename2(&mut e, &there, &p("-none"), 2)),
+        ("exchange", rename2(&mut e, &there, &p("-node"), 2)),
+        ("out", rename(&mut e, &there, other)),
+        ("out-missing", rename(&mut e, &p("-none"), other)),
+        ("in", rename(&mut e, file, &p("-in"))),
+        (
+            "in-no-directory",
+            rename(&mut e, b"/tmp/mqueue-dev/none/x", &p("-in")),
+        ),
+    ];
+    let listed = e.listed_type(&format!("{}-moved", dev::NAME))
+        + e.listed_type(&format!("{}-in", dev::NAME));
+    renames.push(("listed", listed));
+    renames.push(("kept", e.listed_type(&attrs)));
+    out.push(line("rename", &renames));
+
+    // A domain that handles making and removing regular files
+    // (`LANDLOCK_ACCESS_FS_MAKE_REG` and `REMOVE_FILE`) and allows them
+    // nowhere.
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    let handled: u64 = (1 << 8) | (1 << 5);
+    e.put(LIMIT, &handled.to_le_bytes());
+    let ruleset = e.call(dev::LANDLOCK_CREATE_RULESET, [LIMIT, 8, 0, 0, 0, 0]);
+    assert!(ruleset >= 0);
+    assert_eq!(e.call(dev::PRCTL, [PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        e.call(dev::LANDLOCK_RESTRICT_SELF, [ruleset as u64, 0, 0, 0, 0, 0]),
+        0
+    );
+    let landlock = [
+        ("link", link(&mut e, &there, &p("-link"))),
+        ("rename", rename(&mut e, &there, &p("-moved"))),
+        ("rename-itself", rename(&mut e, &there, &there)),
+        ("link-out", link(&mut e, &there, other)),
+        (
+            "mkdir",
+            e.on_path(dev::MKDIR, &p("-dir"), [0o700, 0, 0, 0, 0]),
+        ),
+        ("mknod", mknod(&mut e, &p("-fresh"), S_IFREG | 0o600, 0)),
+        ("unlink", e.on_path(dev::UNLINK, &p("-node"), [0; 5])),
+    ];
+    out.push(line("landlock", &landlock));
+    e.close(q);
+    check(
+        &out,
+        &[
+            "make: mkdir=-1 mkdir-there=-17 mkdir-root=-17 symlink-root=-17 mknod-root=-17 \
+             symlink=-1 symlink-there=-17 fifo=-1 chr=-1 dir=-1 bad-type=-22 fifo-there=-17 listed=0",
+            "mknod: regular=0 type=8 stat=0 mode=100640 zero-type=0 again=-17",
+            "node: getattr=0 flags=0 maxmsg=10 msgsize=8192 curmsgs=0 reserved=0",
+            "link: inside=-1 onto=-17 missing=-2 follow=-1 out=-18 out-onto=-17 in=-18 \
+             in-missing=-2 in-onto=-17 empty-mq_open=-18 empty-opened=-1 empty-onto=-17 listed=0",
+            "rename: inside=-1 onto=-1 itself=0 missing=-2 noreplace=-17 noreplace-itself=-17 \
+             exchange-missing=-2 exchange=-1 out=-18 out-missing=-18 in=-18 in-no-directory=-2 \
+             listed=0 kept=8",
+            "landlock: link=-13 rename=-13 rename-itself=-13 link-out=-18 mkdir=-1 mknod=-13 unlink=-13",
+        ],
+    );
+}
+
+/// `dev_root`: `/dev/mqueue` itself, whose `chmod`, `fchmod` of an open of
+/// it, `chown`, `fchown` and times change it, and which a truncate finds a
+/// directory; then a queue opened again through its link in
+/// `/proc/self/fd`. The other users' lines, which need processes of their
+/// own, are left out.
+#[test]
+fn dev_mqueue_s_root_and_a_queue_reopened_by_its_link() {
+    let mut e = Env::new();
+    let mut out = Vec::new();
+    let root = b"/dev/mqueue".as_slice();
+    let (_, mode, uid, gid, _, mtime) = e.stat_path(root);
+    let q = e.open(
+        format!("{}-root", dev::NAME).as_bytes(),
+        O_RDWR | O_CREAT,
+        0o644,
+        0,
+    );
+    assert!(q >= 0);
+    let chmod = |e: &mut Env, mode: u64| e.on_path(dev::CHMOD, root, [mode, 0, 0, 0, 0]);
+    let changed = chmod(&mut e, 0o755);
+    out.push(format!(
+        "root-chmod: 0755={changed} mode={:o}",
+        e.stat_path(root).1
+    ));
+    let d = e.on_path(
+        OPEN,
+        root,
+        [O_RDONLY | dev::O_DIRECTORY | O_CLOEXEC, 0, 0, 0, 0],
+    );
+    let fchmod = e.call(FCHMOD, [d as u64, 0o777, 0, 0, 0, 0]);
+    out.push(format!(
+        "root-fd: fchmod={fchmod} mode={:o}",
+        e.stat_path(root).1
+    ));
+    let chown = e.on_path(dev::CHOWN, root, [2000, 3000, 0, 0, 0]);
+    let (_, _, new_uid, new_gid, ..) = e.stat_path(root);
+    let fchown = e.call(FCHOWN, [d as u64, u64::from(uid), u64::from(gid), 0, 0, 0]);
+    let times = e.utimensat(root, Some(((0, dev::UTIME_OMIT), (1_234_567, 5))), 0);
+    let set = e.stat_path(root).5;
+    let truncate = e.on_path(dev::TRUNCATE, root, [0; 5]);
+    let back = chmod(&mut e, u64::from(mode & 0o7777));
+    let times_back = e.utimensat(
+        root,
+        Some((
+            (0, dev::UTIME_OMIT),
+            (
+                mtime.div_euclid(1_000_000_000),
+                mtime.rem_euclid(1_000_000_000),
+            ),
+        )),
+        0,
+    );
+    let (_, now_mode, now_uid, now_gid, ..) = e.stat_path(root);
+    out.push(format!(
+        "root-owner: chown={chown} uid={new_uid} gid={new_gid} fchown={fchown} utimensat={times} \
+         mtime-s={} mtime-ns={} truncate={truncate} chmod-back={back} times-back={times_back} \
+         mode-back={} owner-back={}",
+        set / 1_000_000_000,
+        set % 1_000_000_000,
+        u8::from(now_mode & 0o7777 == mode & 0o7777),
+        u8::from(now_uid == uid && now_gid == gid),
+    ));
+    e.close(d);
+    e.close(q);
+
+    let q = e.open_with(
+        format!("{}-reopen", dev::NAME).as_bytes(),
+        O_RDWR | O_CREAT,
+        0o600,
+        2,
+        8,
+    );
+    assert!(q >= 0);
+    e.call(dev::FTRUNCATE, [q as u64, 100, 0, 0, 0, 0]);
+    let link = format!("/proc/self/fd/{q}").into_bytes();
+    let again = e.on_path(OPEN, &link, [O_RDWR | O_CLOEXEC, 0, 0, 0, 0]);
+    let sent = e.send(again, b"hi", 1, 0);
+    out.push(format!("reopen: open={} send={sent}", u8::from(again >= 0)));
+    out.push(format!("reopen: {}", e.getattr(again)));
+    out.push(e.show_link("reopen", again));
+    let directory = e.on_path(
+        OPEN,
+        &link,
+        [O_RDONLY | dev::O_DIRECTORY | O_CLOEXEC, 0, 0, 0, 0],
+    );
+    let trunc = e.on_path(
+        OPEN,
+        &link,
+        [O_RDONLY | dev::O_TRUNC | O_CLOEXEC, 0, 0, 0, 0],
+    );
+    out.push(format!(
+        "reopen: directory={directory} o_trunc={} size={}",
+        u8::from(trunc >= 0),
+        e.stat_fd(q).4
+    ));
+    e.close(trunc);
+    e.close(again);
+    e.close(q);
+    check(
+        &out,
+        &[
+            "root-chmod: 0755=0 mode=40755",
+            "root-fd: fchmod=0 mode=40777",
+            "root-owner: chown=0 uid=2000 gid=3000 fchown=0 utimensat=0 mtime-s=1234567 mtime-ns=0 \
+             truncate=-21 chmod-back=0 times-back=0 mode-back=1 owner-back=1",
+            "reopen: open=1 send=0",
+            "reopen: getattr=0 flags=0 maxmsg=2 msgsize=8 curmsgs=1 reserved=0",
+            "reopen: readlink=29 [/paludarium-mqueue-dev-reopen]",
+            "reopen: directory=-20 o_trunc=1 size=0",
         ],
     );
 }

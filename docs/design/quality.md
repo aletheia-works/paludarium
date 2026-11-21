@@ -87,6 +87,10 @@ CI run produces them afresh on an x86-64 Linux runner.
   slower native side can time out. The container's musl is Debian's (1.2.5
   in Debian 13), not the runner's (1.2.4), so where musl's wrapper changed
   (`accept4`) a guest checks the kernel through the system call itself.
+  Docker mounts `/proc/sys` read-only. `mise run linux-dev` makes writable
+  only the sysctls of the container's own namespaces (`net.*`,
+  `fs.mqueue.*` and the IPC and UTS keys of `kernel.*`), so a native run can
+  set those; the rest, the Docker host's own, stays read-only.
   `mise run linux-dev-compare` runs the tests there for a checkout and for
   main, each in the image its own `ci/linux-dev/Dockerfile` makes (so a
   checkout that changes the image shows that change too), and lists only

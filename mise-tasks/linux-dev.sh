@@ -57,9 +57,30 @@ common=(--rm --platform linux/amd64
   -v paludarium-cargo-registry:/usr/local/cargo/registry
   -e CARGO_TERM_COLOR=never -w /work)
 
+# Docker mounts /proc/sys read-only, so a native sysctl write in a reference
+# run gets EROFS. Make writable only the sysctls that belong to the
+# container's own namespaces, the ones runc accepts as namespaced: net.* (its
+# network namespace; Linux makes the shared entries read-only there),
+# fs.mqueue.* and the IPC and UTS keys of kernel.*. Each is bind-mounted onto
+# itself and that bind remounted read-write, so the rest of /proc/sys, which
+# is the Docker host's kernel, stays read-only. Where a mount is refused (an
+# AppArmor profile, say) the run goes on with that entry read-only.
+# shellcheck disable=SC2016 # expanded by the container's bash
+sysctls='for p in net fs/mqueue kernel/hostname kernel/domainname \
+    kernel/msgmax kernel/msgmnb kernel/msgmni kernel/sem kernel/shmall \
+    kernel/shmmax kernel/shmmni kernel/shm_rmid_forced; do
+  [ -e "/proc/sys/$p" ] || continue
+  { mount --bind "/proc/sys/$p" "/proc/sys/$p" &&
+    mount -o remount,bind,rw "/proc/sys/$p"; } 2>/dev/null ||
+    echo "linux-dev: /proc/sys/$p stays read-only" >&2
+done
+[ "$#" -gt 0 ] || set -- bash
+exec "$@"'
+command=(bash -c "$sysctls" linux-dev "$@")
+
 if [ "$mode" = bind ]; then
   exec "$docker_bin" run "${common[@]}" -v "$host_root:/work" \
-    -v "paludarium-target-$key:/work/target" "$image" "$@"
+    -v "paludarium-target-$key:/work/target" "$image" "${command[@]}"
 fi
 
 # Copy the working tree (without build output and VCS data) into the volume,
@@ -73,4 +94,4 @@ tar -C "$root" \
   | "$docker_bin" run -i "${common[@]}" -v "paludarium-work-$key:/work" "$image" \
       bash -c 'find /work -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar -C /work -xf - && find /work -path /work/target -prune -o -name "*.sh" -exec sed -i "s/\r$//" {} +'
 
-exec "$docker_bin" run "${common[@]}" -v "paludarium-work-$key:/work" "$image" "$@"
+exec "$docker_bin" run "${common[@]}" -v "paludarium-work-$key:/work" "$image" "${command[@]}"

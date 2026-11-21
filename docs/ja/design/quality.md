@@ -82,6 +82,10 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   時間切れになることがあります。コンテナの musl は Debian のもの（Debian 13 の
   1.2.5）で、ランナーのもの（1.2.4）とは違うので、musl のラッパーが変わったところ
   （`accept4`）では、ゲストはシステムコールを直接呼んでカーネルを確かめます。
+  Docker は `/proc/sys` を読み取り専用でマウントします。`mise run linux-dev` は、
+  コンテナ自身の名前空間に属する sysctl（`net.*`、`fs.mqueue.*`、`kernel.*` の
+  うち IPC と UTS のもの）だけを書き込めるようにするので、native の実行はそれらを
+  設定できます。残りの、Docker のホスト自身のものは読み取り専用のままです。
   `mise run linux-dev-compare` は、そこでテストをチェックアウトと main の両方で、
   それぞれ自分の `ci/linux-dev/Dockerfile` が作るイメージの中で動かし（イメージを
   変えるチェックアウトでは、その変化も結果に出ます）、結果の違うケースだけを

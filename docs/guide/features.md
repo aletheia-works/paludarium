@@ -2506,7 +2506,17 @@ kernel.
     a connection times out (`ETIMEDOUT`) and a datagram is lost. TCP
     takes no broadcast or multicast route (`ENETUNREACH`), and UDP no
     broadcast one, to an address a broadcast route has or the limited
-    broadcast one, without `SO_BROADCAST` (`EACCES`). A group or the
+    broadcast one, without `SO_BROADCAST` (`EACCES`). With it, a broadcast
+    datagram reaches each UDP socket of its port that takes it, a copy
+    each (`__udp4_lib_mcast_deliver`): one bound to the unspecified
+    address or to the datagram's, not connected or connected to its
+    sender, and not `IPV6_V6ONLY`, in the sending namespace, as
+    `ip_mc_output` loops a broadcast back even without a carrier, and,
+    while the end has its carrier, in the peer's, if it takes the
+    address as a broadcast one (the limited one, or one its routes make
+    so) from a source its reverse path filtering takes
+    (`ip_route_input_slow`). A socket connected from the unspecified
+    address has taken its route's source, and takes none. A group or the
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).

@@ -178,7 +178,8 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Multicast and broadcast datagrams reach no one. A datagram is always
+    Multicast datagrams reach no one, nor do broadcast ones but through a
+    veth end (below). A datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
     `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer
@@ -1002,8 +1003,8 @@ verified.
   Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
   solicitation nor MLD report. Traffic through
   an end moves no counters; a namespace forwards nothing
-  on to another; and a broadcast or multicast destination through an end
-  reaches no one. ICMP's port unreachable is not rate limited
+  on to another; and a multicast destination through an end reaches no
+  one, as no socket joins a group (`IP_ADD_MEMBERSHIP`, `IPV6_ADD_MEMBERSHIP`). ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,

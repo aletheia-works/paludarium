@@ -839,6 +839,64 @@ impl Network {
                 .neigh_output(index, plain(to), None, now.unwrap_or(0));
         self.later(events);
     }
+    /// The UDP sockets a broadcast datagram from `from` to `to`, out
+    /// through this namespace's veth end `index` at `now`, reaches
+    /// ([`Ports::broadcast_receivers`]): this namespace's own, as
+    /// `ip_mc_output` loops a broadcast back whether or not it goes out;
+    /// then, if the end has its carrier, the peer's namespace's, where
+    /// `ip_route_input_slow` takes it as a broadcast: to the limited
+    /// broadcast address, or to one its routes make a broadcast one, from
+    /// a source its reverse path filtering takes, which it does not check
+    /// for 0.0.0.0, a source only the limited one takes.
+    fn broadcast(
+        &self,
+        index: i32,
+        from: SocketAddr,
+        to: SocketAddr,
+        now: Option<u64>,
+    ) -> Vec<Arc<InetSocket>> {
+        let mut receivers = self.ports(true).broadcast_receivers(to, from);
+        let (IpAddr::V4(src), IpAddr::V4(dst)) = (from.ip(), to.ip()) else {
+            return receivers;
+        };
+        let peer = {
+            let devices = self.devices();
+            devices
+                .by_index(index)
+                .and_then(|d| d.veth.as_ref())
+                .filter(|v| v.carrier)
+                .and_then(|v| v.peer.clone())
+        };
+        let Some((there, at)) = peer.and_then(|p| p.network.upgrade().map(|n| (n, p.index))) else {
+            return receivers;
+        };
+        let rpf = {
+            let devices = there.devices();
+            devices
+                .by_index(at)
+                .map_or(0, |d| d.conf4.rp_filter)
+                .max(devices.all4.rp_filter)
+        };
+        let arrives = {
+            let addresses = there.addresses_at(now);
+            let broadcast = dst.is_broadcast()
+                || (!src.is_unspecified()
+                    && !dst.is_unspecified()
+                    && !dst.is_loopback()
+                    && addresses
+                        .lookup4(dst)
+                        .is_ok_and(|r| r.kind == crate::interface::Kind::Broadcast));
+            broadcast
+                && !src.is_multicast()
+                && !src.is_broadcast()
+                && (src.is_unspecified()
+                    || addresses.validate_source4_on(src, 0, 0, rpf, at).is_ok())
+        };
+        if arrives {
+            receivers.extend(there.ports(true).broadcast_receivers(to, from));
+        }
+        receivers
+    }
     /// Keeps what a packet changed for netlink to tell of, as what runs
     /// out is ([`Self::addresses_at`]).
     fn later(&self, events: Vec<crate::interface::Event>) {
@@ -2303,9 +2361,23 @@ impl InetSocket {
                 return Err(EMSGSIZE);
             }
             sendable(&mut s)?;
-            // A broadcast or multicast one reaches no one here.
+            // A broadcast one reaches each socket that takes it, here and
+            // across the pair, before `sendto` returns, as both copies go
+            // through the backlog of the sending CPU; a multicast one no
+            // one, as no socket joins a group here.
             if cast != Cast::Unicast {
-                self.network.noarp(index, plain_to.ip(), self.now());
+                let now = self.now();
+                let receivers = if cast == Cast::Broadcast {
+                    let from = SocketAddr::new(plain(from.ip()), from.port());
+                    self.network.broadcast(index, from, plain_to, now)
+                } else {
+                    Vec::new()
+                };
+                self.network.noarp(index, plain_to.ip(), now);
+                drop(s);
+                for receiver in receivers {
+                    receiver.deliver(from, bytes);
+                }
                 return Ok(bytes.len());
             }
             let to_peer = s.peer == Some(plain_to);

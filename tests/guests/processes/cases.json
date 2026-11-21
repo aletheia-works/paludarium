@@ -66,6 +66,7 @@
     {"name":"veth-ipv4","binary":"veth-ipv4"},
     {"name":"veth-traffic","binary":"veth-traffic"},
     {"name":"veth-iif","binary":"veth-iif"},
+    {"name":"veth-broadcast","binary":"veth-broadcast"},
     {"name":"veth-neigh","binary":"veth-neigh"},
     {"name":"veth-ipv6","binary":"veth-ipv6"},
     {"name":"veth-ipv6-traffic","binary":"veth-ipv6-traffic"},

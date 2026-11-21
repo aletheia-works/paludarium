@@ -849,6 +849,30 @@ impl Ports {
             .owner
             .upgrade()
     }
+    /// Every UDP socket a broadcast datagram from `from` to `to` reaches,
+    /// each taking a copy, as Linux's `__udp4_lib_mcast_deliver` finds
+    /// them (`__udp_is_mcast_sock`): of `to`'s port, bound to the
+    /// unspecified address or to `to`, connected to none or to `from`,
+    /// and not `IPV6_V6ONLY`. A connected one bound to the unspecified
+    /// address has taken its route's source by then, so takes none.
+    pub(crate) fn broadcast_receivers(
+        &mut self,
+        to: SocketAddr,
+        from: SocketAddr,
+    ) -> Vec<Arc<InetSocket>> {
+        self.live();
+        let ip = to.ip();
+        self.bindings
+            .iter()
+            .filter(|binding| {
+                binding.address.port() == to.port()
+                    && binding.carries(ip)
+                    && (binding.address.ip().is_unspecified() || binding.address.ip() == ip)
+                    && binding.peer.is_none_or(|peer| peer == from)
+            })
+            .filter_map(|binding| binding.owner.upgrade())
+            .collect()
+    }
 }
 
 /// Where a connection to `to` goes on the guest's own loopback: an address

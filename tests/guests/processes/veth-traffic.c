@@ -10,7 +10,8 @@
    which a connected socket learns of; one to an address nobody has is
    dropped. Before A has an address, a route through va leaves from
    0.0.0.0, as no address of a scope to fit is there: ARP is answered,
-   and B drops what comes as a martian. TCP takes no broadcast or
+   and B drops what comes as a martian; with a global address on lo, it
+   leaves from that one, which B takes. TCP takes no broadcast or
    multicast route (ENETUNREACH), and UDP no broadcast one without
    SO_BROADCAST (EACCES). The two processes take turns through pipes, so their lines
    come in one order; the carrier, which Linux's link watch may change a
@@ -34,6 +35,7 @@
 #define NETLINK_ROUTE_ 0
 #define RTM_NEWLINK 16
 #define RTM_NEWADDR 20
+#define RTM_DELADDR 21
 #define RTM_NEWROUTE 24
 #define RTM_DELROUTE 25
 #define RTA_DST 1
@@ -148,15 +150,20 @@ static void set_up(int fd, int index, const char *label) {
     info(&b, index, IFF_UP, IFF_UP);
     request(fd, RTM_NEWLINK, 0, &b, label);
 }
-static void address(int fd, int index, const char *ip, const char *label) {
+/* Adds, or removes with RTM_DELADDR, `ip`/`prefix` on the device of
+   `index`. */
+static void address_of(int fd, unsigned short type, int index, const char *ip, int prefix, const char *label) {
     struct body b = {0};
-    struct ifaddrmsg_ a = {.family = AF_INET, .prefix = 24, .index = index};
+    struct ifaddrmsg_ a = {.family = AF_INET, .prefix = (unsigned char)prefix, .index = index};
     struct in_addr in;
     inet_pton(AF_INET, ip, &in);
     raw(&b, &a, sizeof a);
     put(&b, IFA_LOCAL, &in, 4);
     put(&b, IFA_ADDRESS, &in, 4);
-    request(fd, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &b, label);
+    request(fd, type, type == RTM_NEWADDR ? NLM_F_CREATE | NLM_F_EXCL : 0, &b, label);
+}
+static void address(int fd, int index, const char *ip, const char *label) {
+    address_of(fd, RTM_NEWADDR, index, ip, 24, label);
 }
 /* Adds or removes a route to `dst`/`prefix` on link through the device
    of `index`, of the main table. */
@@ -280,6 +287,8 @@ static void child(int in, int out) {
             receive(udp, "udp recvfrom");
             struct sockaddr_in back = at("10.77.0.1", 6100);
             printf("B: udp reply=%ld\n", result(sendto(udp, "back", 4, 0, (void *)&back, sizeof back)));
+        } else if (command == 'g') {
+            receive(udp, "udp recvfrom");
         } else if (command == 'n') {
             /* Nothing more came. */
             int none = (int)result(recv(udp, (char[8]){0}, 8, MSG_DONTWAIT));
@@ -365,6 +374,23 @@ int main(int argc, char **argv) {
     getsockopt(zero, SOL_SOCKET, SO_ERROR, &lost, &size);
     printf("A: SO_ERROR from none=%d\n", lost);
     close(zero);
+    /* With a global address on lo, the route leaves from it, as
+       inet_select_addr takes another device's address of a scope to fit
+       where the end has none; B takes what comes from it. */
+    address_of(ctl, RTM_NEWADDR, 1, "10.9.9.9", 32, "add 10.9.9.9/32 on lo");
+    zero = socket(AF_INET, SOCK_DGRAM, 0);
+    to = at("10.77.0.2", 6000);
+    printf("A: udp connect from lo's=%ld\n", result(connect(zero, (void *)&to, sizeof to)));
+    show_name(zero, 0, 0, "udp connected from lo's");
+    printf("A: udp send from lo's=%ld\n", result(send(zero, "lo's", 4, 0)));
+    close(zero);
+    B_DOES("g");
+    zero = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    to = at("10.77.0.2", 5000);
+    printf("A: connect from lo's=%ld\n", result(connect(zero, (void *)&to, sizeof to)));
+    show_name(zero, 0, 0, "connecting from lo's");
+    close(zero);
+    address_of(ctl, RTM_DELADDR, 1, "10.9.9.9", 32, "remove 10.9.9.9/32");
     route(ctl, RTM_DELROUTE, "10.77.0.0", 24, A_INDEX, "route gone");
     address(ctl, A_INDEX, "10.77.0.1", "add 10.77.0.1/24");
 

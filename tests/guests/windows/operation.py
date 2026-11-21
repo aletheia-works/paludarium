@@ -52,6 +52,9 @@ def operation(
         env["PALUDARIUM_WINDOWS_FIXTURE"] = str(fixture)
     if mounted:
         env["PALUDARIUM_WINDOWS_MOUNTED"] = "1"
+    # The inputs as the guest is given them: the Rust side reads the modes
+    # back before the run, and a run that writes may add or move files.
+    given = None if fixture is None else inputs(fixture)
     child = run(
         [str(executable), "--exact", "windows_guest_operation", "--nocapture"], cwd=ROOT, env=env
     )
@@ -81,7 +84,7 @@ def operation(
         recorded = (directory / "fixture-modes").read_text(encoding="utf-8")
         pairs = [line.split("\t") for line in recorded.splitlines()]
         modes = {path: int(mode) for path, mode in pairs}
-        if len(pairs) != len(modes) or modes != inputs(fixture):
+        if len(pairs) != len(modes) or modes != given:
             raise ValueError("Rust Host/private VFS fixture metadata differs from Linux inputs")
         row["fixture_input_modes"] = modes
     return row

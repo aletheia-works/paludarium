@@ -21322,9 +21322,15 @@ int main(int argc, char **argv) {
             connect(closer, (void *)&to, sizeof to);
             inet_add("closer", closer);
             inet_add("closer-peer", accept(listener, NULL, NULL));
+            /* Its FIN goes first and it closes once in FIN_WAIT2: Linux's
+               tcp_close then always makes it a TIME_WAIT socket, where a
+               close in FIN_WAIT1 leaves it to the peer's ACK, which keeps
+               the full socket if it comes while close still owns it
+               (tcp_rcv_state_process). */
+            shutdown(closer, SHUT_WR);
+            inet_settle(d, inet_find("closer")->port, port);
             close(closer);
             inet_find("closer")->fd = -1;
-            inet_settle(d, inet_find("closer")->port, port);
             struct sockaddr_in6 mapped_to = {.sin6_family = AF_INET6, .sin6_port = htons(port)};
             inet_pton(AF_INET6, "::ffff:127.0.0.1", &mapped_to.sin6_addr);
             int mapped = socket(AF_INET6, SOCK_STREAM, 0);

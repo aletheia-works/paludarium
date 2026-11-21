@@ -30,6 +30,7 @@ use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, GuestAddr};
 
 use crate::ThreadState;
+use crate::bpf_classic::{self, SockFilter};
 use crate::events::{IN, NONBLOCK, OUT, ReadinessHub};
 use crate::files::{Descriptor, Files};
 use crate::syscalls::{Context, Outcome};
@@ -61,25 +62,12 @@ const FLAG_MASK: u32 = 127;
 const ARCH: u32 = 0xc000_003e;
 /// `sizeof(struct seccomp_data)`.
 const DATA_SIZE: u32 = 64;
-/// `BPF_MAXINSNS`.
-const MAX_INSNS: usize = 4096;
 /// `MAX_INSNS_PER_PATH`: what all of a thread's filters may add up to, each
 /// counted with 4 more.
 const MAX_INSNS_PER_PATH: usize = (1 << 18) / 8;
-/// `BPF_MEMWORDS`.
-const MEMWORDS: u32 = 16;
 const SIGSYS: i32 = 31;
 /// `SYS_SECCOMP`, the `si_code` of the SIGSYS.
 const SYS_SECCOMP: i32 = 1;
-
-/// A classic BPF instruction (`struct sock_filter`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Insn {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
-}
 
 /// The source of an ALU or jump operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,7 +388,7 @@ pub(crate) fn siginfo(number: u32, value: u32, rip: u64) -> [u8; 48] {
 /// 0, every jump goes forward and the last instruction returns.
 fn execute(program: &[Op], data: &[u8; 64]) -> u32 {
     let (mut a, mut x) = (0u32, 0u32);
-    let mut mem = [0u32; MEMWORDS as usize];
+    let mut mem = [0u32; bpf_classic::MEMWORDS as usize];
     let mut pc = 0;
     loop {
         let op = program[pc];
@@ -460,57 +448,12 @@ fn execute(program: &[Op], data: &[u8; 64]) -> u32 {
     }
 }
 
-/// Whether Linux's `chk_code_allowed` knows `code`.
-fn known(code: u16) -> bool {
-    matches!(
-        code,
-        // ALU with K or X: add, sub, mul, div, mod, and, or, xor, lsh, rsh
-        0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c | 0x94 | 0x9c
-            | 0x54 | 0x5c | 0x44 | 0x4c | 0xa4 | 0xac | 0x64 | 0x6c | 0x74 | 0x7c
-            // neg
-            | 0x84
-            // ld w/h/b abs, ld w len, ld w/h/b ind, ld imm, ld mem
-            | 0x20 | 0x28 | 0x30 | 0x80 | 0x40 | 0x48 | 0x50 | 0x00 | 0x60
-            // ldx w len, ldx b msh, ldx imm, ldx mem
-            | 0x81 | 0xb1 | 0x01 | 0x61
-            // st, stx, tax, txa, ret k, ret a
-            | 0x02 | 0x03 | 0x07 | 0x87 | 0x06 | 0x16
-            // ja, jeq, jgt, jge, jset with K or X
-            | 0x05 | 0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d | 0x45 | 0x4d
-    )
-}
-
-/// Linux's `bpf_check_classic` and then `seccomp_check_filter`: EINVAL for
-/// an instruction either refuses, a jump past the end, a scratch word read
-/// before it is written on some path, or a last instruction that does not
-/// return. Gives the program as it runs.
-fn prepare(insns: &[Insn]) -> Result<Box<[Op]>, Errno> {
-    let len = insns.len();
-    for (pc, insn) in insns.iter().enumerate() {
-        if !known(insn.code) {
-            return Err(Errno::EINVAL);
-        }
-        let k = insn.k;
-        let bad = match insn.code {
-            // div, mod by a K of 0
-            0x34 | 0x94 => k == 0,
-            // lsh, rsh by a K of 32 or more
-            0x64 | 0x74 => k >= 32,
-            0x60 | 0x61 | 0x02 | 0x03 => k >= MEMWORDS,
-            0x05 => k as usize >= len - pc - 1,
-            0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d | 0x45 | 0x4d => {
-                pc + usize::from(insn.jt) + 1 >= len || pc + usize::from(insn.jf) + 1 >= len
-            }
-            _ => false,
-        };
-        if bad {
-            return Err(Errno::EINVAL);
-        }
-    }
-    if !matches!(insns[len - 1].code, 0x06 | 0x16) {
-        return Err(Errno::EINVAL);
-    }
-    loads_after_stores(insns)?;
+/// Linux's `bpf_check_classic` ([`bpf_classic::check`]) and then
+/// `seccomp_check_filter`, which takes only 32-bit loads of the data and
+/// no `mod`: EINVAL for an instruction either refuses. Gives the program as
+/// it runs.
+fn prepare(insns: &[SockFilter]) -> Result<Box<[Op]>, Errno> {
+    bpf_classic::check(insns)?;
     insns
         .iter()
         .map(|insn| {
@@ -546,31 +489,6 @@ fn prepare(insns: &[Insn]) -> Result<Box<[Op]>, Errno> {
             })
         })
         .collect()
-}
-
-/// Linux's `check_load_and_stores`: a scratch word is read only where every
-/// path to the read has written it.
-fn loads_after_stores(insns: &[Insn]) -> Result<(), Errno> {
-    let mut masks = vec![u16::MAX; insns.len()];
-    let mut valid: u16 = 0;
-    for (pc, insn) in insns.iter().enumerate() {
-        valid &= masks[pc];
-        match insn.code {
-            0x02 | 0x03 => valid |= 1 << insn.k,
-            0x60 | 0x61 if valid & (1 << insn.k) == 0 => return Err(Errno::EINVAL),
-            0x05 => {
-                masks[pc + 1 + insn.k as usize] &= valid;
-                valid = u16::MAX;
-            }
-            0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d | 0x45 | 0x4d => {
-                masks[pc + 1 + usize::from(insn.jt)] &= valid;
-                masks[pc + 1 + usize::from(insn.jf)] &= valid;
-                valid = u16::MAX;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 /// `seccomp(op, flags, args)`.
@@ -685,7 +603,7 @@ fn set_filter(c: &mut Caller<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     let len = usize::from(u16::from_le_bytes([fprog[0], fprog[1]]));
     let at = u64::from_le_bytes(fprog[8..16].try_into().unwrap_or_default());
-    if len == 0 || len > MAX_INSNS {
+    if len == 0 || len > bpf_classic::MAX_INSNS {
         return Err(Errno::EINVAL);
     }
     let no_new_privs = c.processes.status_of(c.state.pid).2;
@@ -699,16 +617,11 @@ fn set_filter(c: &mut Caller<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     c.mem
         .read(GuestAddr(at), &mut raw)
         .map_err(|_| Errno::EFAULT)?;
-    let insns: Vec<Insn> = raw
+    let insns: Vec<SockFilter> = raw
         .as_chunks::<8>()
         .0
         .iter()
-        .map(|b| Insn {
-            code: u16::from_le_bytes([b[0], b[1]]),
-            jt: b[2],
-            jf: b[3],
-            k: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-        })
+        .map(|b| SockFilter::decode(*b))
         .collect();
     let program = prepare(&insns)?;
     // The listener's descriptor, close-on-exec, is taken before the
@@ -1492,11 +1405,11 @@ pub(crate) fn mode(state: &ThreadState) -> u64 {
 mod tests {
     use super::*;
 
-    fn insn(code: u16, jt: u8, jf: u8, k: u32) -> Insn {
-        Insn { code, jt, jf, k }
+    fn insn(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
+        SockFilter { code, jt, jf, k }
     }
 
-    fn run(insns: &[Insn], number: u32, args: [u64; 6]) -> Result<u32, Errno> {
+    fn run(insns: &[SockFilter], number: u32, args: [u64; 6]) -> Result<u32, Errno> {
         let program = prepare(insns)?;
         let state = Seccomp {
             mode: MODE_FILTER,
@@ -1562,7 +1475,7 @@ mod tests {
     #[test]
     fn programs_linux_refuses_are_einval() {
         let ret = insn(0x06, 0, 0, RET_ALLOW);
-        let refused: [&[Insn]; 10] = [
+        let refused: [&[SockFilter]; 12] = [
             // No return at the end.
             &[insn(0x00, 0, 0, 0)],
             // A jump past the end.
@@ -1577,6 +1490,10 @@ mod tests {
             &[insn(0x28, 0, 0, 0), ret],
             &[insn(0x20, 0, 0, 2), ret],
             &[insn(0x20, 0, 0, 64), ret],
+            // An ancillary load, which bpf_check_classic takes and seccomp
+            // does not, and one it does not know.
+            &[insn(0x20, 0, 0, 0xffff_f000), ret],
+            &[insn(0x20, 0, 0, 0xffff_f040), ret],
             // A scratch word read before any write.
             &[insn(0x60, 0, 0, 0), ret],
         ];

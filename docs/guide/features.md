@@ -5627,12 +5627,14 @@ one only with an `--allow-net`.
   `PR_SET_SECCOMP` with 1) allows `read`, `write`, `exit` and `rt_sigreturn`;
   any other call ends the thread by `SIGKILL`, `exit_group` too. Filter mode
   (`SECCOMP_SET_MODE_FILTER`, which needs `no_new_privs` or `CAP_SYS_ADMIN`)
-  adds a classic BPF program, checked as Linux checks one: up to 4096
-  instructions, only the ones seccomp takes (32-bit loads of
-  `struct seccomp_data`, no `mod`), forward jumps inside the program, scratch
-  words written before they are read on every path, and a return at the end,
-  else `EINVAL`; all of a thread's filters may hold 32768 instructions, each
-  counting 4 more (`ENOMEM`). Before each call every filter runs over the
+  adds a classic BPF program, checked as Linux checks one: first as a
+  socket's classic filter is (`bpf_check_classic`), then for the
+  instructions seccomp takes (`seccomp_check_filter`). It has up to 4096
+  instructions, only 32-bit loads of `struct seccomp_data` and no `mod`,
+  forward jumps inside the program, scratch words written before they are
+  read on every path, and a return at the end, else `EINVAL`. All of a
+  thread's filters may hold 32768 instructions, each counting 4 more
+  (`ENOMEM`). Before each call every filter runs over the
   call's number, `AUDIT_ARCH_X86_64`, the address after its `syscall`
   instruction and its six argument registers, whole, and the lowest action
   decides. `SECCOMP_RET_KILL_PROCESS` ends the process by `SIGSYS`, and

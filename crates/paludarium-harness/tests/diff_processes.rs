@@ -272,6 +272,7 @@ mod linux {
                     | "fanotify-unprivileged"
                     | "fanotify-mounts"
                     | "fanotify-mount-events"
+                    | "fanotify-mount-moves"
                     | "inotify-unmount"
                     | "fanotify-perm"
                     | "fanotify-access-perm"
@@ -704,6 +705,7 @@ mod linux {
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         fanotify_mounts => ("fanotify-mounts","fanotify"),
         fanotify_mount_events => ("fanotify-mount-events","fanotify"),
+        fanotify_mount_moves => ("fanotify-mount-moves","fanotify"),
         fanotify_perm => ("fanotify-perm","fanotify"),
         fanotify_access_perm => ("fanotify-access-perm","fanotify"),
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),

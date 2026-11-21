@@ -667,7 +667,11 @@ impl Program {
             loads: &self.loads,
         };
         let result = crate::bpf_interp::run(&program, packet, kernel);
-        debug_assert!(result.is_ok(), "a verified program faulted");
+        // The fuzz targets build without debug assertions.
+        assert!(
+            !cfg!(any(debug_assertions, feature = "fuzzing")) || result.is_ok(),
+            "a verified program faulted"
+        );
         result.map_or(0, |r0| r0 as u32)
     }
 }

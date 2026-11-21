@@ -11,9 +11,10 @@
 //! lets a program move a pointer only by constants, so an address keeps its
 //! region; a load or store is checked against its region all the same, and
 //! one outside it stops the program ([`Fault`]), which the verifier should
-//! make impossible. Nothing checks that yet beyond the unit tests and a
-//! `debug_assert!` in [`crate::bpf_prog::Program::run`]; a fuzz target of
-//! the verifier and the interpreter together is the next PR's.
+//! make impossible. [`crate::bpf_prog::Program::run`] panics on one in a
+//! debug build and with the `fuzzing` feature, so the unit test
+//! `programs_the_verifier_takes_never_fault` and the `kernel_bpf` fuzz
+//! target check the verifier and the interpreter together.
 //!
 //! What Linux's rewrites decide, the interpreter does as they do:
 //! - a division by a register that is 0 gives 0, and a remainder by one
@@ -898,5 +899,100 @@ mod tests {
             ),
             Ok(1)
         );
+    }
+
+    /// The soundness the verifier gives the interpreter: random programs
+    /// near what it takes, of registers, the stack, the context, jumps and
+    /// the helpers without maps, and every one it takes runs on packets of
+    /// a few lengths without a load or store outside what it points to.
+    #[test]
+    fn programs_the_verifier_takes_never_fault() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        const EDGES: [i32; 12] = [0, 1, -1, 7, 8, 16, 31, 32, 63, 64, i32::MIN, i32::MAX];
+        let mut taken = 0;
+        for _ in 0..100_000 {
+            let mut p = vec![i(0xbf, 6, 1, 0, 0)];
+            for _ in 0..1 + next(12) {
+                let dst = next(10) as u8;
+                let src = next(11) as u8;
+                let imm = if next(2) == 0 {
+                    EDGES[next(12) as usize]
+                } else {
+                    next(200) as i32 - 100
+                };
+                let size = [0x18, 0x00, 0x08, 0x10][next(4) as usize];
+                let at = -8 * (1 + next(64) as i16) + next(8) as i16;
+                let alu = (next(14) as u8) << 4;
+                let insn = match next(12) {
+                    0 => i(0xb7, dst, 0, 0, imm),
+                    1 => i(0x07 | alu, dst, 0, next(2) as i16, imm),
+                    2 => i(0x04 | alu, dst, 0, 0, imm),
+                    3 => i(0x0f | alu, dst, src, next(2) as i16, 0),
+                    4 => i(0x63 | size, 10, src, at, 0),
+                    5 => i(0x61 | size, dst, 10, at, 0),
+                    6 => i(0x62 | size, 10, 0, at, imm),
+                    7 => i(
+                        0x61 | size,
+                        dst,
+                        6,
+                        [0, 4, 48, 52, 64, 66, 67][next(7) as usize],
+                        0,
+                    ),
+                    8 => i(0x63 | size, 6, src, [48, 52, 64, 66][next(4) as usize], 0),
+                    9 => i(
+                        [0x15, 0x25, 0x35, 0x45, 0x55, 0xa5, 0xc5][next(7) as usize],
+                        dst,
+                        0,
+                        next(4) as i16,
+                        imm,
+                    ),
+                    10 => {
+                        // bpf_skb_load_bytes of the context to the stack.
+                        p.push(i(0xbf, 1, 6, 0, 0));
+                        p.push(i(0xb7, 2, 0, 0, [0, 1, 7, 60, -1][next(5) as usize]));
+                        p.push(i(0xbf, 3, 10, 0, 0));
+                        p.push(i(0x07, 3, 0, 0, -16));
+                        p.push(i(0xb7, 4, 0, 0, [1, 4, 8, 16][next(4) as usize]));
+                        i(0x85, 0, 0, 0, 26)
+                    }
+                    _ => i(0x85, 0, 0, 0, [5, 7, 8, 14, 15, 46, 47][next(7) as usize]),
+                };
+                p.push(insn);
+            }
+            p.push(i(0xb7, 0, 0, 0, 1));
+            p.push(exit());
+            let Ok(verified) = crate::bpf_verifier::check(
+                &p,
+                crate::bpf_verifier::Options::default(),
+                &mut |_| Err(Errno::EBADF),
+            ) else {
+                continue;
+            };
+            taken += 1;
+            for len in [0, 1, 7, 64] {
+                let data = vec![0x5a; len];
+                let program = Program {
+                    insns: &p,
+                    maps: &[],
+                    loads: &verified.loads,
+                };
+                let packet = Packet {
+                    data: &data,
+                    linear: data.len(),
+                };
+                assert!(
+                    run(&program, &packet, &mut Quiet).is_ok(),
+                    "{p:?} faulted on {len} bytes"
+                );
+            }
+        }
+        // Enough of them load for the check to mean something.
+        assert!(taken > 5_000, "only {taken} programs loaded");
     }
 }

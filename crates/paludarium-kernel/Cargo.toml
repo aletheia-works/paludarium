@@ -8,6 +8,11 @@ readme.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+# Fuzz targets: a verified BPF program that faults in the interpreter
+# panics, as it does in a debug build.
+fuzzing = []
+
 [dependencies]
 paludarium-cpu.workspace = true
 paludarium-host.workspace = true

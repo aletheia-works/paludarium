@@ -157,16 +157,17 @@ CI run produces them afresh on an x86-64 Linux runner.
 
 ## Fuzzing
 
-Fourteen targets (decoding, ELF loading, system call arguments, filesystem
-paths, MMU operations, the CPU, threads, futexes, events, sockets and the two
-JITs)
+Fifteen targets (decoding, ELF loading, system call arguments, filesystem
+paths, MMU operations, the CPU, threads, futexes, events, sockets, BPF socket
+filters and the two JITs)
 each run for 600 seconds with AddressSanitizer and LeakSanitizer, every night.
 
 Fuzzing for a fixed time does not prove that every input is safe, but it keeps
 checking that no guest input makes the emulator panic.
 
 A pull request also fuzzes seven of them (`vfs_paths`, `load_elf`,
-`syscall_args` and the four `kernel_*`), for the same 600 seconds with the
+`syscall_args`, `kernel_threads`, `kernel_futex`, `kernel_events` and
+`kernel_sockets`), for the same 600 seconds with the
 same sanitizers, from `-seed=1` and an empty corpus. As the seed and corpus
 are fixed, a target that does not link the changed code repeats main's search,
 so only the targets that can see the change run. A target links the
@@ -176,7 +177,7 @@ workspace packages its source names (with the modules it includes by
 change to a manifest, `Cargo.lock`, `rust-toolchain.toml`, `fuzz/`,
 `fuzz-pr.yml`, the selection script or anything else the fuzz group needs,
 and every push to main, run all seven. When no target can see the change,
-the fuzz job is skipped; a separate job still checks that all fourteen
+the fuzz job is skipped; a separate job still checks that all fifteen
 targets build whenever the change could affect them.
 
 ## Memory order
@@ -262,7 +263,7 @@ every test passing.
 | When | What |
 |---|---|
 | Every pull request | unit tests on Linux, macOS and Windows (when the change can reach them, below); lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube, ripgrep and coreutils differential tests; acceptance tests in the four WebAssembly environments (Safari when the change can reach the Wasm module, below) and in WebKit on x86-64 Linux, which include the x87 process cases compared byte for byte with x86-64 Linux; fuzzing of the seven pull-request targets the change can affect (above) |
-| Every night | fuzzing of the 14 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux, with and without the native JIT; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
+| Every night | fuzzing of the 15 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux, with and without the native JIT; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
 | Every week | the pinned nightly Rust, the workspace's `rust-version` (the latest stable Rust) and the aube, ripgrep and coreutils guests move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |

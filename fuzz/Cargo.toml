@@ -104,6 +104,13 @@ test = false
 [[bin]]
 bench = false
 doc = false
+name = "kernel_bpf"
+path = "fuzz_targets/kernel_bpf.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
 name = "kernel_sockets"
 path = "fuzz_targets/kernel_sockets.rs"
 test = false
@@ -115,7 +122,7 @@ paludarium-decoder = { path = "../crates/paludarium-decoder" }
 paludarium-host = { path = "../crates/paludarium-host" }
 paludarium-jit = { path = "../crates/paludarium-jit", features = ["fuzzing"] }
 paludarium-jit-native = { path = "../crates/paludarium-jit-native" }
-paludarium-kernel = { path = "../crates/paludarium-kernel" }
+paludarium-kernel = { path = "../crates/paludarium-kernel", features = ["fuzzing"] }
 paludarium-loader = { path = "../crates/paludarium-loader" }
 paludarium-mmu = { path = "../crates/paludarium-mmu" }
 paludarium-types = { path = "../crates/paludarium-types" }

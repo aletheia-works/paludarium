@@ -90,7 +90,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX sockets (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -4453,6 +4453,31 @@ kernel.
   `bpf_get_current_uid_gid`. A helper a socket filter may not call is
   "program of this type cannot use helper %s#%d" and a number that is no
   helper "invalid func %s#%d" (`EINVAL`).
+
+- A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
+  socket with `SO_ATTACH_BPF` and runs on each message sent to it, as
+  Linux's `sk_filter` and `unix_dgram_sendmsg`. Before the receiver's
+  checks, but after the sender's own shutdown and send buffer, it decides
+  the message's fate: 0 drops it, and the send still gives its length;
+  any other value keeps that many bytes. The interpreter runs the program
+  as Linux's `___bpf_prog_run` does after the verifier's rewrites. A
+  division by a register that is 0 gives 0, and a remainder by it keeps
+  the dividend. A signed division by -1 negates, and a signed remainder by
+  -1 gives 0. The context is the message's `__sk_buff`: its `len`, `cb[]`
+  from 0 and 0 for the fields an AF_UNIX message does not set.
+  `bpf_skb_load_bytes` reads the message, and its relative form reads it
+  from the network header, its start, where there is no MAC header
+  (`EFAULT`). The maps a program updates are the ones user space reads.
+  - `SO_ATTACH_BPF` takes a 4-byte descriptor (`EINVAL` for any other
+    size). It is `EBADF` for no descriptor and `EINVAL` for one that is no
+    socket filter. A new filter replaces the old.
+  - `SO_DETACH_FILTER` (`SO_DETACH_BPF`) takes the filter away, or gives
+    `ENOENT` when there is none.
+  - `SO_LOCK_FILTER` keeps the filter as it is (`EPERM`) until the socket
+    goes, and it cannot be unlocked.
+  - `SO_GET_FILTER` gives 0 blocks with no filter and `EACCES` for one
+    attached with `SO_ATTACH_BPF`.
+  - `SO_BPF_EXTENSIONS` gives 64 (`SKF_AD_MAX`).
 
 - The log (`log_level`, `log_buf`, `log_size`) gets the line that says
   why a program was refused, in 7.0's words where the two kernels word it

@@ -10,7 +10,9 @@
 //! kernel built without it refuses it (`find_prog_type` finds no ops),
 //! after the checks of its arguments that come before.
 //!
-//! A program is loaded but never run: nothing attaches one yet.
+//! A socket filter runs once `SO_ATTACH_BPF` attaches it to an AF_UNIX
+//! datagram or packet socket ([`sk_filter`]), in the interpreter
+//! ([`crate::bpf_interp`]).
 //!
 //! Where the emulator refuses what Linux takes (the safe direction):
 //! - a loader without `CAP_PERFMON` gets `EPERM` once its program's type
@@ -395,6 +397,7 @@ pub(crate) fn load(c: &mut Context<'_>, attr: &[u8], at: u64, size: u32) -> Resu
         name,
         insns,
         maps,
+        loads: verified.loads,
         ids: Arc::clone(&c.processes.bpf_progs),
     })?;
     // bpf_prog_new_fd: read and write, close-on-exec.
@@ -626,12 +629,152 @@ pub(crate) struct Program {
     #[allow(dead_code)]
     name: [u8; 16],
     /// The instructions, for the interpreter.
-    #[allow(dead_code)]
     insns: Vec<Insn>,
     /// `aux->used_maps`, which the program keeps while it is there.
-    #[allow(dead_code)]
     maps: Vec<Arc<crate::bpf::Map>>,
+    /// Each `BPF_LD_IMM64` of a map, as the verifier resolved it: the map's
+    /// index in `maps`, and the offset of a `BPF_PSEUDO_MAP_VALUE`.
+    loads: BTreeMap<usize, (u8, Option<u32>)>,
     ids: Arc<Ids>,
+}
+
+/// How many instructions Linux's rewrites may make of one, at most, as the
+/// verifier patches a signed division (`do_misc_fixups`, nine for a 32-bit
+/// remainder) and a context access (`convert_ctx_accesses`): a bound above
+/// what they do, so that a program is charged no less than on Linux.
+const REWRITTEN: u64 = 16;
+
+impl Program {
+    /// `bpf_prog_size` of the program as `sk_attach_bpf` charges it to the
+    /// socket, of the instructions after Linux's rewrites, which are not
+    /// made here: [`REWRITTEN`] times as many, so that where Linux has room
+    /// for it this may not, and never the other way round.
+    pub(crate) fn filter_size(&self) -> u64 {
+        PROG_HEADER + INSN_SIZE * REWRITTEN * self.insns.len() as u64
+    }
+
+    /// Runs the socket filter on `packet`: the bytes to keep (`R0`, as
+    /// `bpf_prog_run` gives it, 32 bits). A load or store the verifier
+    /// should have refused stops it, which drops the packet.
+    pub(crate) fn run(
+        &self,
+        packet: &crate::bpf_interp::Packet<'_>,
+        kernel: &mut dyn crate::bpf_interp::Kernel,
+    ) -> u32 {
+        let program = crate::bpf_interp::Program {
+            insns: &self.insns,
+            maps: &self.maps,
+            loads: &self.loads,
+        };
+        let result = crate::bpf_interp::run(&program, packet, kernel);
+        debug_assert!(result.is_ok(), "a verified program faulted");
+        result.map_or(0, |r0| r0 as u32)
+    }
+}
+
+/// `SKB_MAX_ALLOC` on x86-64: four pages less `skb_shared_info`, the most
+/// an AF_UNIX datagram keeps in its linear part.
+const SKB_MAX_ALLOC: usize = 4 * 4096 - 320;
+/// `MAX_SKB_FRAGS` pages, the most of a datagram in pages.
+const MAX_SKB_FRAGS_SIZE: usize = 17 * 4096;
+
+/// How many of an AF_UNIX message's `len` bytes are in its linear part, as
+/// `unix_dgram_sendmsg` sizes it: all of them up to [`SKB_MAX_ALLOC`], else
+/// the rest after whole pages.
+fn unix_linear(len: usize) -> usize {
+    if len <= SKB_MAX_ALLOC {
+        return len;
+    }
+    let paged = (len - SKB_MAX_ALLOC)
+        .min(MAX_SKB_FRAGS_SIZE)
+        .next_multiple_of(4096);
+    len.saturating_sub(paged)
+}
+
+/// The kernel around a socket filter as an AF_UNIX send runs it
+/// (`sk_filter_trim_cap`): the sending task, and the receiving socket as
+/// `skb->sk`.
+pub(crate) struct Receiving<'a> {
+    pub(crate) host: Option<&'a Arc<dyn paludarium_host::Host>>,
+    /// The sending task's real user and group IDs.
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// The socket the message is for, and its owner (`sk_uid`).
+    pub(crate) socket: Option<Arc<crate::unix::UnixSocket>>,
+    pub(crate) owner: u32,
+}
+
+impl crate::bpf_interp::Kernel for Receiving<'_> {
+    /// The emulator's boot time runs as its monotonic clock, `CLOCK_TAI` as
+    /// its real time, and the coarse clock as the fine one.
+    fn clock(&mut self, clock: crate::bpf_interp::Clock) -> u64 {
+        use crate::bpf_interp::Clock;
+        let id = match clock {
+            Clock::Monotonic | Clock::Boot | Clock::MonotonicCoarse => {
+                paludarium_host::ClockId::Monotonic
+            }
+            Clock::Tai => paludarium_host::ClockId::Realtime,
+        };
+        self.host.and_then(|h| h.clock(id).ok()).unwrap_or(0)
+    }
+    fn random(&mut self) -> u32 {
+        let mut b = [0; 4];
+        if let Some(h) = self.host {
+            let _ = h.random_bytes(&mut b);
+        }
+        u32::from_le_bytes(b)
+    }
+    /// The emulator runs on one processor.
+    fn processor(&mut self) -> u32 {
+        0
+    }
+    fn pid_tgid(&mut self) -> u64 {
+        let (pid, tid) = crate::proc::caller();
+        u64::from(pid) << 32 | u64::from(tid)
+    }
+    fn uid_gid(&mut self) -> u64 {
+        u64::from(self.gid) << 32 | u64::from(self.uid)
+    }
+    fn socket_cookie(&mut self) -> u64 {
+        self.socket.as_ref().map_or(0, |s| s.cookie())
+    }
+    fn socket_uid(&mut self) -> u32 {
+        self.owner
+    }
+    /// The emulator's network namespaces have no cookies: each is the
+    /// initial one's, 1.
+    fn netns_cookie(&mut self, _: bool) -> u64 {
+        1
+    }
+}
+
+/// `sk_filter` of an AF_UNIX message, `sk_filter_trim_cap` with a cap of 1:
+/// how many of its bytes the receiving socket keeps, or `None` when the
+/// filter drops it.
+pub(crate) fn sk_filter(
+    program: &Program,
+    buf: &[u8],
+    kernel: &mut Receiving<'_>,
+) -> Option<usize> {
+    let packet = crate::bpf_interp::Packet {
+        data: buf,
+        linear: unix_linear(buf.len()),
+    };
+    match program.run(&packet, kernel) {
+        0 => None,
+        keep => Some(buf.len().min(keep as usize)),
+    }
+}
+
+/// `bpf_prog_get_type(fd, BPF_PROG_TYPE_SOCKET_FILTER)`, as `SO_ATTACH_BPF`
+/// takes it: `EBADF` for no descriptor, `EINVAL` for a file that is no
+/// program or a program of another type.
+pub(crate) fn socket_filter(c: &Context<'_>, fd: u32) -> Result<Arc<Program>, Errno> {
+    let file = c.files.descriptor(u64::from(fd))?.file;
+    match of(&file) {
+        Some(p) if p.program.kind == kind::SOCKET_FILTER => Ok(Arc::clone(&p.program)),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 /// The machine's programs by ID: Linux's `prog_idr`, which shares nothing

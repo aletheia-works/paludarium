@@ -77,7 +77,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`（下を参照） |
+| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX のソケットにアタッチします（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -3865,6 +3865,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `bpf_get_smp_processor_id`、`bpf_get_numa_node_id`、`bpf_get_current_pid_tgid`、
   `bpf_get_current_uid_gid` です。ソケットフィルターが呼べないヘルパーは "program of this
   type cannot use helper %s#%d"、ヘルパーでない番号は "invalid func %s#%d" です（`EINVAL`）。
+
+- ソケットフィルターは `SO_ATTACH_BPF` で AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の
+  ソケットにアタッチし、送られてくるメッセージごとに、Linux の `sk_filter` と
+  `unix_dgram_sendmsg` と同じく動きます。送り手自身のシャットダウンと送信バッファの確認の
+  後、受け手の確認の前に、メッセージをどうするか決めます。0 なら捨て、それでも送信は長さを
+  返します。それ以外の値なら、その数のバイトを残します。インタープリタは、Linux の
+  `___bpf_prog_run` が検証器の書き換えの後に動かすのと同じくプログラムを動かします。0 の
+  レジスタによる除算は 0 で、剰余は被除数のままです。-1 による符号付き除算は符号を反転し、
+  符号付き剰余は 0 です。コンテキストはメッセージの `__sk_buff` です。`len`、0 から始まる
+  `cb[]` があり、AF_UNIX のメッセージが設定しないフィールドは 0 です。
+  `bpf_skb_load_bytes` はメッセージを読み、相対形はネットワークヘッダ（メッセージの先頭）
+  から読みます。MAC ヘッダはありません（`EFAULT`）。プログラムが更新するマップは、
+  ユーザー空間が読むものと同じです。
+  - `SO_ATTACH_BPF` は 4 バイトの記述子を取ります（ほかの大きさは `EINVAL`）。記述子が
+    なければ `EBADF`、ソケットフィルターでなければ `EINVAL` です。新しいフィルターは古い
+    ものに置き換わります。
+  - `SO_DETACH_FILTER`（`SO_DETACH_BPF`）はフィルターを外します。ないときは `ENOENT` です。
+  - `SO_LOCK_FILTER` は、ソケットがなくなるまでフィルターを今のままにします（`EPERM`）。
+    ロックは外せません。
+  - `SO_GET_FILTER` は、フィルターがなければ 0 ブロック、`SO_ATTACH_BPF` でアタッチした
+    ものには `EACCES` を返します。
+  - `SO_BPF_EXTENSIONS` は 64（`SKF_AD_MAX`）を返します。
 
 - ログ（`log_level`、`log_buf`、`log_size`）には、プログラムを断った理由の行（二つの
   カーネルで言い方が違うときは 7.0 の言い方）と "processed %d insns" の行を、固定

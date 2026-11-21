@@ -1575,10 +1575,6 @@ impl Map {
 /// A value a program's `bpf_map_lookup_elem` points at, which it reads and
 /// writes in place; the verifier keeps its accesses within the value, and
 /// one outside it is `EFAULT`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "BPF programs use it once they run")
-)]
 pub(crate) struct ValueRef(Cell);
 
 #[cfg_attr(
@@ -1609,6 +1605,10 @@ impl ValueRef {
     /// The value's size, the map's `value_size`.
     pub(crate) fn len(&self) -> usize {
         lock(&self.0).len()
+    }
+    /// Whether both are the same element's value.
+    pub(crate) fn same(&self, other: &ValueRef) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 

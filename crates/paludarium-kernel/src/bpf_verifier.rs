@@ -421,6 +421,9 @@ pub(crate) struct Verified {
     pub(crate) stack_depth: u32,
     /// The maps the program uses (`used_maps`), by ID.
     pub(crate) maps: Vec<u32>,
+    /// Each `BPF_LD_IMM64` of a map: the map's index in `maps`, and the
+    /// offset in the value of a `BPF_PSEUDO_MAP_VALUE`.
+    pub(crate) loads: std::collections::BTreeMap<usize, (u8, Option<u32>)>,
 }
 
 /// Why a program is refused: the error and the line the log gets.
@@ -471,6 +474,7 @@ pub(crate) fn check(
             processed: walk.processed,
             stack_depth,
             maps: walk.maps.iter().map(|m| m.id).collect(),
+            loads: std::mem::take(&mut walk.loads),
         }),
         Err((errno, line)) => Err(Rejection {
             errno,

@@ -856,6 +856,11 @@ impl UnixSocket {
         passed: &mut crate::sockets::Passed,
         from: crate::sockets::Sender,
     ) -> Result<usize, Errno> {
+        // sk_filter, before the checks of this socket: a datagram it drops
+        // is sent as far as the sender knows.
+        let Some(keep) = self.end.filtered(buf, from) else {
+            return Ok(buf.len());
+        };
         let own = sender.unix();
         let own = own.as_deref().map_or(std::ptr::null(), std::ptr::from_ref);
         let free = {
@@ -868,7 +873,7 @@ impl UnixSocket {
             std::ptr::eq(self, own) || s.to.is_some()
         };
         let limit = (!free).then_some(MAX_DGRAM_QLEN);
-        self.end.enqueue(sender, buf, passed, from, limit)
+        self.end.enqueue(sender, buf, keep, passed, from, limit)
     }
     /// What `sock_diag` tells of this socket, as Linux's `sk_diag_fill`
     /// finds it, or nothing for a connection a listener has not accepted

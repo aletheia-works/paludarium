@@ -22,6 +22,18 @@
    those of no arguments; then helpers a socket filter may not call, and
    an instruction reached through the context on one path and the stack
    on another.
+   bpf-prog-attach: socket filters attached to AF_UNIX sockets with
+   SO_ATTACH_BPF and run on what they receive: the options' errors
+   (SO_ATTACH_BPF, SO_DETACH_FILTER, SO_LOCK_FILTER, SO_GET_FILTER,
+   SO_BPF_EXTENSIONS); a filter that drops a message (the send still
+   gives its length), keeps part of it, or reads it with
+   bpf_skb_load_bytes and its relative form; one that counts messages in
+   a map, which the case reads back; the results of division and
+   remainder by 0 and by -1, which the bytes kept show; and where the
+   filter runs among the send's checks: before the receiver's shutdown
+   (EPIPE) of a datagram socket, after the sender's own shutdown of a
+   SOCK_SEQPACKET pair, and before a datagram socket
+   connected elsewhere refuses the sender (EPERM).
 
    Each program refused is wrong in one way only, which both kernels the
    tests know (Linux 7.0, the CI machines', and master) find first, with
@@ -39,7 +51,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define PROG_LOAD 5
@@ -408,11 +422,251 @@ static int case_context(void) {
     return 0;
 }
 
+#ifndef SO_ATTACH_BPF
+#define SO_ATTACH_BPF 50
+#endif
+#ifndef SO_BPF_EXTENSIONS
+#define SO_BPF_EXTENSIONS 48
+#endif
+#ifndef SO_LOCK_FILTER
+#define SO_LOCK_FILTER 44
+#endif
+#define LD64(dst, v) I(0x18, dst, 0, 0, (int32_t)(uint32_t)(v)), I(0, 0, 0, 0, (int32_t)((uint64_t)(v) >> 32))
+
+/* A program's descriptor, or the error. */
+static int load(const struct insn *insns, unsigned count) {
+    struct prog_attr p = attr(insns, count);
+    return (int)bpf(PROG_LOAD, &p, sizeof p);
+}
+#define PROGRAM(...)                                            \
+    ({                                                          \
+        struct insn insns_[] = {__VA_ARGS__};                   \
+        load(insns_, COUNT(insns_));                            \
+    })
+
+static int attach(int sock, int prog) {
+    return setsockopt(sock, SOL_SOCKET, SO_ATTACH_BPF, &prog, sizeof prog) ? -errno : 0;
+}
+static int option(int sock, int name, int value) {
+    return setsockopt(sock, SOL_SOCKET, name, &value, sizeof value) ? -errno : 0;
+}
+static void get(const char *name, int sock, int option) {
+    int value = -1;
+    socklen_t len = sizeof value;
+    if (getsockopt(sock, SOL_SOCKET, option, &value, &len))
+        say("%s %d", name, -errno);
+    else
+        say("%s value %d len %u", name, value, len);
+}
+
+/* Sends `len` bytes (0, 1, 2, ...) from a to b, and says what b receives:
+   the bytes, or that nothing came. */
+static void through(const char *name, int a, int b, size_t len) {
+    unsigned char out[64], in[64];
+    for (size_t i = 0; i < sizeof out; i++) out[i] = (unsigned char)i;
+    long sent = send(a, out, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    long got = recv(b, in, sizeof in, MSG_DONTWAIT);
+    printf("%s sent %ld", name, sent < 0 ? -errno : sent);
+    if (got < 0) {
+        printf(" received %d\n", -errno);
+    } else {
+        printf(" received %ld:", got);
+        for (long i = 0; i < got; i++) printf(" %u", in[i]);
+        putchar('\n');
+    }
+    fflush(stdout);
+}
+
+/* The filter that keeps R0 bytes, R0 the result of `op` of a and b in 64
+   or 32 bits. */
+static int arithmetic(uint8_t op, int16_t off, int64_t a, int64_t b) {
+    return PROGRAM(LD64(0, a), LD64(2, b), I(op, 0, 2, off, 0), EXIT());
+}
+
+static int case_attach(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    int drop = PROGRAM(MOV(0, 0), EXIT());
+    int keep3 = PROGRAM(MOV(0, 3), EXIT());
+    int all = PROGRAM(MOV(0, -1), EXIT());
+    say("loaded %d", drop >= 0 && keep3 >= 0 && all >= 0);
+    int m = map(2, 4, 8, 1, 0);
+    int fds[2];
+    if (pipe(fds)) return 1;
+
+    say("attach len 8 %d", setsockopt(pair[1], SOL_SOCKET, SO_ATTACH_BPF, (uint64_t[]){(uint64_t)drop}, 8) ? -errno : 0);
+    say("attach len 2 %d", setsockopt(pair[1], SOL_SOCKET, SO_ATTACH_BPF, &drop, 2) ? -errno : 0);
+    say("attach no fd %d", attach(pair[1], 1000));
+    say("attach -1 %d", attach(pair[1], -1));
+    say("attach map %d", attach(pair[1], m));
+    say("attach pipe %d", attach(pair[1], fds[0]));
+    say("detach none %d", option(pair[1], SO_DETACH_FILTER, 0));
+    get("get filter none", pair[1], SO_GET_FILTER);
+    get("lock filter", pair[1], SO_LOCK_FILTER);
+    get("bpf extensions", pair[1], SO_BPF_EXTENSIONS);
+
+    through("no filter", pair[0], pair[1], 5);
+    say("attach drop %d", attach(pair[1], drop));
+    get("get filter bpf", pair[1], SO_GET_FILTER);
+    through("drop", pair[0], pair[1], 5);
+    through("drop empty", pair[0], pair[1], 0);
+    through("other way", pair[1], pair[0], 5);
+    say("attach keep 3 %d", attach(pair[1], keep3));
+    through("keep 3", pair[0], pair[1], 5);
+    through("keep 3 of 2", pair[0], pair[1], 2);
+    say("attach all %d", attach(pair[1], all));
+    through("keep all", pair[0], pair[1], 5);
+    /* The descriptor may go: the socket keeps the program. */
+    close(all);
+    through("closed program", pair[0], pair[1], 4);
+
+    say("lock %d", option(pair[1], SO_LOCK_FILTER, 1));
+    get("lock filter locked", pair[1], SO_LOCK_FILTER);
+    say("attach locked %d", attach(pair[1], drop));
+    say("detach locked %d", option(pair[1], SO_DETACH_FILTER, 0));
+    say("unlock locked %d", option(pair[1], SO_LOCK_FILTER, 0));
+    say("lock again %d", option(pair[1], SO_LOCK_FILTER, 1));
+    through("still all", pair[0], pair[1], 4);
+
+    int b[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, b)) return 1;
+    say("detach %d", (attach(b[1], keep3), option(b[1], SO_DETACH_FILTER, 0)));
+    say("detach twice %d", option(b[1], SO_DETACH_FILTER, 0));
+    through("detached", b[0], b[1], 5);
+
+    /* R0 = the first byte of the message: its length kept. */
+    int first = PROGRAM(MOV_REG(6, 1), MOV(2, 0), MOV_REG(3, 10), ADD(3, -8), MOV(4, 1), CALL(LOAD_BYTES),
+                        JEQ(0, 0, 2), MOV(0, 1), EXIT(), LDX_B(0, 10, -8), EXIT());
+    say("attach first byte %d", attach(b[1], first));
+    {
+        unsigned char msg[6] = {4, 9, 8, 7, 6, 5}, in[8];
+        long sent = send(b[0], msg, sizeof msg, 0);
+        long got = recv(b[1], in, sizeof in, MSG_DONTWAIT);
+        say("first byte sent %ld received %ld", sent, got);
+    }
+    /* Past the end: EFAULT, and 1 byte kept. */
+    int past = PROGRAM(MOV_REG(6, 1), MOV(2, 4), MOV_REG(3, 10), ADD(3, -8), MOV(4, 4), CALL(LOAD_BYTES),
+                       JEQ(0, 0, 2), MOV(0, 1), EXIT(), MOV(0, 2), EXIT());
+    say("attach past %d", attach(b[1], past));
+    through("past the end", b[0], b[1], 6);
+    through("not past the end", b[0], b[1], 8);
+    /* The relative form: from the network header, the message's start; the
+       MAC header is not set, EFAULT. R0 = the byte at 2, or 1. */
+    int net = PROGRAM(MOV(2, 2), MOV_REG(3, 10), ADD(3, -8), MOV(4, 1), MOV(5, 1), CALL(LOAD_BYTES_RELATIVE),
+                      JEQ(0, 0, 2), MOV(0, 1), EXIT(), LDX_B(0, 10, -8), EXIT());
+    int mac = PROGRAM(MOV(2, 2), MOV_REG(3, 10), ADD(3, -8), MOV(4, 1), MOV(5, 0), CALL(LOAD_BYTES_RELATIVE),
+                      JEQ(0, 0, 2), MOV(0, 1), EXIT(), LDX_B(0, 10, -8), EXIT());
+    say("attach net %d", attach(b[1], net));
+    through("network header", b[0], b[1], 6);
+    say("attach mac %d", attach(b[1], mac));
+    through("mac header", b[0], b[1], 6);
+    /* The context: len, and cb[0] written then read. */
+    int len = PROGRAM(LDX_W(0, 1, 0), ADD(0, -1), EXIT());
+    say("attach len %d", attach(b[1], len));
+    through("len less 1", b[0], b[1], 6);
+    int cb = PROGRAM(ST_W(1, 48, 2), LDX_W(0, 1, 48), EXIT());
+    say("attach cb %d", attach(b[1], cb));
+    through("cb", b[0], b[1], 6);
+
+    /* A map counts the messages: value[0] += 1 each time; keep all. */
+    int counter = map(2, 4, 8, 1, 0);
+    int count = PROGRAM(KEY4(counter), CALL(LOOKUP), JEQ(0, 0, 3), LDX_DW(1, 0, 0), ADD(1, 1), STX_DW(0, 1, 0),
+                        MOV(0, -1), EXIT());
+    say("attach count %d", attach(b[1], count));
+    for (int i = 0; i < 3; i++) through("counted", b[0], b[1], 1);
+    {
+        uint32_t key = 0;
+        uint64_t value = 0;
+        struct {
+            uint32_t map_fd, pad;
+            uint64_t key, value, flags;
+        } a = {(uint32_t)counter, 0, (uintptr_t)&key, (uintptr_t)&value, 0};
+        long r = bpf(1, &a, sizeof a);
+        say("count lookup %ld value %llu", r, (unsigned long long)value);
+    }
+
+    /* Division and remainder, as the bytes kept (of 64) show. */
+    struct {
+        const char *name;
+        uint8_t op;
+        int16_t off;
+        int64_t a, b;
+    } ops[] = {
+        {"div 0", 0x3f, 0, 7, 0},          {"mod 0", 0x9f, 0, 7, 0},
+        {"div32 0", 0x3c, 0, 7, 0},        {"mod32 0", 0x9c, 0, 0x100000007, 0},
+        {"sdiv -1", 0x3f, 1, -7, -1},      {"smod -1", 0x9f, 1, 7, -1},
+        {"sdiv 0", 0x3f, 1, 7, 0},         {"smod 0", 0x9f, 1, 7, 0},
+        {"sdiv32 -7 2", 0x3c, 1, -7, 2},   {"smod32 -7 -2", 0x9c, 1, 7, -2},
+        {"sdiv32 -1", 0x3c, 1, -9, -1},    {"smod32 0", 0x9c, 1, 0x100000009, 0},
+        {"div large", 0x3f, 0, -1, 0x10000000000}, {"lsh 65", 0x6f, 0, 1, 65},
+    };
+    for (size_t i = 0; i < COUNT(ops); i++) {
+        int c[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, c)) return 1;
+        int prog = arithmetic(ops[i].op, ops[i].off, ops[i].a, ops[i].b);
+        if (prog < 0) {
+            say("%s load %d", ops[i].name, prog);
+            continue;
+        }
+        attach(c[1], prog);
+        unsigned char out[64] = {0}, in[64];
+        send(c[0], out, sizeof out, 0);
+        long got = recv(c[1], in, sizeof in, MSG_DONTWAIT);
+        say("%s kept %ld", ops[i].name, got < 0 ? -errno : got);
+        close(prog);
+        close(c[0]);
+        close(c[1]);
+    }
+
+    /* SOCK_DGRAM: the filter runs before the receiver's shutdown is seen,
+       so a dropped datagram is sent where one kept is EPIPE. */
+    int d[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, d)) return 1;
+    shutdown(d[1], SHUT_RD);
+    through("datagram shut", d[0], d[1], 5);
+    say("attach datagram shut keep 3 %d", attach(d[1], keep3));
+    through("datagram shut kept", d[0], d[1], 5);
+    say("attach datagram shut drop %d", attach(d[1], drop));
+    through("datagram shut dropped", d[0], d[1], 5);
+
+    /* SOCK_SEQPACKET: a filter trims and drops as for datagrams; the
+       receiver's shutdown of reading shuts the sender's writing too, which
+       the send finds before the filter runs (EPIPE). */
+    int s[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, s)) return 1;
+    through("seqpacket", s[0], s[1], 5);
+    say("attach seqpacket keep 3 %d", attach(s[1], keep3));
+    through("seqpacket keep 3", s[0], s[1], 5);
+    shutdown(s[1], SHUT_RD);
+    through("seqpacket shut kept", s[0], s[1], 5);
+    say("attach seqpacket drop %d", attach(s[1], drop));
+    through("seqpacket shut dropped", s[0], s[1], 5);
+    shutdown(s[0], SHUT_WR);
+    through("seqpacket own shutdown", s[0], s[1], 5);
+
+    /* A datagram socket connected to another refuses a third (EPERM), but
+       its filter runs first. */
+    int x = socket(AF_UNIX, SOCK_DGRAM, 0), y = socket(AF_UNIX, SOCK_DGRAM, 0), z = socket(AF_UNIX, SOCK_DGRAM, 0);
+    struct sockaddr_un ax = {.sun_family = AF_UNIX, .sun_path = "\0bpf-prog-x"},
+                       ay = {.sun_family = AF_UNIX, .sun_path = "\0bpf-prog-y"};
+    socklen_t lx = sizeof(sa_family_t) + 11, ly = sizeof(sa_family_t) + 11;
+    bind(x, (struct sockaddr *)&ax, lx);
+    bind(y, (struct sockaddr *)&ay, ly);
+    connect(x, (struct sockaddr *)&ay, ly);
+    say("third %ld", sendto(z, "abc", 3, MSG_DONTWAIT, (struct sockaddr *)&ax, lx) < 0 ? -errno : 3L);
+    say("attach x drop %d", attach(x, drop));
+    say("third dropped %ld", sendto(z, "abc", 3, MSG_DONTWAIT, (struct sockaddr *)&ax, lx) < 0 ? -errno : 3L);
+    char in[8];
+    say("x received %ld", recv(x, in, sizeof in, MSG_DONTWAIT) < 0 ? -errno : 0L);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
     if (!strcmp(mode, "bpf-prog-verify")) return case_verify();
     if (!strcmp(mode, "bpf-prog-maps")) return case_maps();
     if (!strcmp(mode, "bpf-prog-context")) return case_context();
+    if (!strcmp(mode, "bpf-prog-attach")) return case_attach();
     return 2;
 }

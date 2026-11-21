@@ -18,7 +18,9 @@
    with the links' and addresses' as the peer's carrier goes and as the
    pair goes. Only IPv4's are shown, as the
    ends make IPv6's of their own as they come up. The two processes take
-   turns through pipes, so their lines come in one order. */
+   turns through pipes, so their lines come in one order; the peer's
+   carrier going, which Linux's link watch may tell of a second later, is
+   waited for on RTNLGRP_LINK. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -175,13 +177,14 @@ static void address(int fd, int index, const char *ip, const char *label) {
     request(fd, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &b, label);
 }
 /* Waits, up to 5 s, until the member links hears that the device of
-   `index` has its carrier. */
-static void carrier(int links, int index) {
+   `index` has its carrier, or with `gone` has lost it, as Linux's link
+   watch may tell of it a second later. */
+static void carrier_is(int links, int index, int gone) {
     static unsigned char buf[65536];
     for (;;) {
         struct pollfd ready = {.fd = links, .events = POLLIN};
         if (poll(&ready, 1, 5000) <= 0) {
-            printf("%s: no carrier on %d\n", side, index);
+            printf("%s: %s on %d\n", side, gone ? "carrier not lost" : "no carrier", index);
             return;
         }
         long n = recv(links, buf, sizeof buf, MSG_DONTWAIT);
@@ -199,7 +202,7 @@ static void carrier(int links, int index) {
                     memcpy(&alen, body + a, 2);
                     memcpy(&kind, body + a + 2, 2);
                     if (alen < 4 || a + alen > body_len) break;
-                    if ((kind & 0x3fff) == IFLA_CARRIER && alen >= 5 && body[a + 4] == 1) return;
+                    if ((kind & 0x3fff) == IFLA_CARRIER && alen >= 5 && body[a + 4] == !gone) return;
                     a += (alen + 3) & ~3;
                 }
             }
@@ -207,6 +210,8 @@ static void carrier(int links, int index) {
         }
     }
 }
+
+static void carrier(int links, int index) { carrier_is(links, index, 0); }
 
 static struct sockaddr_in at(const char *ip, int port) {
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((unsigned short)port)};
@@ -492,10 +497,12 @@ static void child(int in, int out) {
         } else if (command == 'z') {
             sequence(order, "order", 1);
         } else if (command == 'q') {
-            sleep(2);
             sequence(order, "order", 0);
         } else if (command == 'c') {
             carrier(links, B_INDEX);
+        } else if (command == 'k') {
+            /* vb has lost its carrier, and so its neighbours. */
+            carrier_is(links, B_INDEX, 1);
         } else if (command == 'l') {
             listener = socket(AF_INET, SOCK_STREAM, 0);
             struct sockaddr_in any = at("0.0.0.0", 5000);
@@ -525,7 +532,7 @@ static void child(int in, int out) {
             neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, B_INDEX, "10.77.0.71", NUD_STALE, 0x71,
                       "add stale 10.77.0.71");
         } else if (command == 'o') {
-            sleep(2);
+            carrier_is(links, B_INDEX, 1);
             dump(ctl, B_INDEX, "vb's, va down");
             heard(watch, "heard");
         }
@@ -731,6 +738,7 @@ int main(int argc, char **argv) {
     request(ctl, RTM_NEWLINK, 0, &down, "down va again");
     neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, A_INDEX, "10.77.0.50", NUD_PERMANENT, 0x50,
               "add while down again");
+    B_DOES("k");
     B_DOES("z");
     sequence(order, "order", 1);
     struct body gone = {0};

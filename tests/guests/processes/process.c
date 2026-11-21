@@ -2455,15 +2455,22 @@ static void diag_ask(int fd, const char *label, unsigned short type, unsigned sh
     printf("%s: unknown=%d\n", label, unknown);
 }
 /* The inet-diag case's TCP and UDP sockets: a label, the descriptor (-1
-   once closed), its inode, its type, its local port and its peer's port (0
-   for none yet). */
+   once closed), its inode, its type, its local address (IPv4 as IPv4-mapped
+   IPv6), its local port and its peer's port (0 for none yet). */
 struct inet_socket {
     const char *label;
     int fd;
     unsigned ino;
     int type;
+    unsigned char address[16];
     unsigned short port, peer;
 };
+/* `v4`, four bytes, as an IPv4-mapped IPv6 address into `out`. */
+static void inet_mapped(unsigned char out[16], const unsigned char *v4) {
+    memset(out, 0, 10);
+    out[10] = out[11] = 0xff;
+    memcpy(out + 12, v4, 4);
+}
 static struct inet_socket inet_sockets[32];
 static int inet_count;
 static void inet_add(const char *label, int fd) {
@@ -2478,8 +2485,12 @@ static void inet_add(const char *label, int fd) {
     struct sockaddr_in6 peer = {0};
     len = sizeof peer;
     getpeername(fd, (void *)&peer, &len);
-    inet_sockets[inet_count++] =
-        (struct inet_socket){label, fd, (unsigned)st.st_ino, type, ntohs(at.sin6_port), ntohs(peer.sin6_port)};
+    struct inet_socket *s = &inet_sockets[inet_count++];
+    *s = (struct inet_socket){label, fd, (unsigned)st.st_ino, type, {0}, ntohs(at.sin6_port), ntohs(peer.sin6_port)};
+    if (at.sin6_family == AF_INET)
+        inet_mapped(s->address, (const unsigned char *)&((struct sockaddr_in *)&at)->sin_addr);
+    else
+        memcpy(s->address, &at.sin6_addr, 16);
 }
 static struct inet_socket *inet_find(const char *label) {
     for (int i = 0; i < inet_count; i++)
@@ -2493,16 +2504,18 @@ static const char *inet_label(unsigned ino) {
         if (inet_sockets[i].ino == ino) return inet_sockets[i].label;
     return "?";
 }
-/* The label of the first socket of `type` on local port `port` that has no
-   peer or has `other`, the other end's port, as its peer; "0" for 0, "?"
-   for none: TCP and UDP ports are apart. Linux gives sockets that connect
-   to different ports the same local port when its hash of each destination
-   happens to choose it, so the port alone may name two of them. Every
-   socket that connects has its peer, whatever the order they came in. */
-static const char *inet_port_label(unsigned short port, unsigned short other, int type) {
+/* The label of the first socket of `type` on local address `address`
+   (IPv4-mapped for IPv4) and port `port` that has no peer or has `other`,
+   the other end's port, as its peer; "0" for 0, "?" for none: TCP and UDP
+   ports are apart. Linux gives sockets that connect to different ports the
+   same local port when its hash of each destination happens to choose it,
+   and sockets on different addresses, such as 127.0.0.1 and ::1, the same
+   port, so the port alone may name two of them. Every socket that connects
+   has its peer, whatever the order they came in. */
+static const char *inet_port_label(const unsigned char address[16], unsigned short port, unsigned short other, int type) {
     if (port == 0) return "0";
     for (int i = 0; i < inet_count; i++)
-        if (inet_sockets[i].port == port && inet_sockets[i].type == type &&
+        if (inet_sockets[i].port == port && inet_sockets[i].type == type && !memcmp(inet_sockets[i].address, address, 16) &&
             (inet_sockets[i].peer == 0 || inet_sockets[i].peer == other))
             return inet_sockets[i].label;
     return "?";
@@ -2533,14 +2546,22 @@ static void inet_line(char *out, size_t size, const char *label, unsigned short 
         static const unsigned char zero[12];
         if (memcmp(b + 12, zero, 12) || memcmp(b + 28, zero, 12)) strcat(src, "+junk");
     }
+    unsigned char src_address[16], dst_address[16];
+    if (b[0] == AF_INET6) {
+        memcpy(src_address, b + 8, 16);
+        memcpy(dst_address, b + 24, 16);
+    } else {
+        inet_mapped(src_address, b + 8);
+        inet_mapped(dst_address, b + 24);
+    }
     unsigned interface, cookie[2];
     memcpy(&interface, b + 40, 4);
     memcpy(cookie, b + 44, 8);
     int n = snprintf(out, size,
                      "%s: %s type=%u family=%u state=%u timer=%u retrans=%u sport=%s dport=%s src=%s dst=%s if=%u cookie=%d "
                      "expires=%s rqueue=%u wqueue=%u uid=%u",
-                     label, inet_label(words[4]), type, b[0], b[1], b[2], b[3], inet_port_label(ntohs(sport), ntohs(dport), inet_type(words[4])),
-                     inet_port_label(ntohs(dport), ntohs(sport), inet_type(words[4])), src, dst, interface, cookie[0] || cookie[1],
+                     label, inet_label(words[4]), type, b[0], b[1], b[2], b[3], inet_port_label(src_address, ntohs(sport), ntohs(dport), inet_type(words[4])),
+                     inet_port_label(dst_address, ntohs(dport), ntohs(sport), inet_type(words[4])), src, dst, interface, cookie[0] || cookie[1],
                      words[0] == 0 ? "0" : words[0] <= 7200000 ? "+" : "big", words[1], words[2], words[3]);
     const unsigned char *at = b + 72;
     len -= 72;

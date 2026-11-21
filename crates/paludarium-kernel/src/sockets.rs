@@ -1587,7 +1587,7 @@ fn receive_with(
     // SO_RCVTIMEO bounds the whole call, its later waits too.
     let wait = deadline(c, file, true)?;
     let mut received = crate::files::wait_for_read_until(c, file, dontwait, wait, || {
-        socket.receive(bytes, message, peek)
+        socket.receive_dontwait(bytes, message, peek, dontwait)
     })?;
     // A peek returns what it found, as unix_stream_read_generic does.
     let target = if flags & MSG_WAITALL != 0 {
@@ -3185,6 +3185,17 @@ impl SocketPairEnd {
         message: bool,
         peek: bool,
     ) -> Result<Received, Errno> {
+        self.receive_dontwait(buf, message, peek, false)
+    }
+    /// [`Self::receive`], with `MSG_DONTWAIT` (`dontwait`), which a
+    /// datagram socket's read tells apart from one that waits.
+    pub(crate) fn receive_dontwait(
+        &self,
+        buf: &mut [u8],
+        message: bool,
+        peek: bool,
+        dontwait: bool,
+    ) -> Result<Received, Errno> {
         // An unconnected AF_UNIX socket reads nothing: a stream's
         // `unix_stream_read_generic` is EINVAL, a packet socket's
         // `unix_seqpacket_recvmsg` ENOTCONN.
@@ -3216,7 +3227,7 @@ impl SocketPairEnd {
             return Ok(Received::default());
         }
         let result = if self.pair.messages() {
-            self.read_message(buf, peek)
+            self.read_message(buf, peek, dontwait)
         } else {
             self.read_stream(buf, peek, None)
         };
@@ -3436,8 +3447,8 @@ impl SocketPairEnd {
     /// Linux's `scm_fp_dup`; from `SO_PEEK_OFF` it starts that far in,
     /// past whole messages, as `__skb_try_recv_from_queue`, and the length
     /// it gives is what is left of the message from there.
-    fn read_message(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
-        let nonblocking = self.flags() & NONBLOCK != 0;
+    fn read_message(&self, buf: &mut [u8], peek: bool, dontwait: bool) -> Result<Received, Errno> {
+        let nonblocking = dontwait || self.flags() & NONBLOCK != 0;
         let mut sides = self
             .pair
             .sides
@@ -3490,8 +3501,12 @@ impl SocketPairEnd {
         let message = if peek { None } else { own.writes.pop_front() };
         let Some(message) = message else {
             // A datagram socket has no end of file from its peer: only its
-            // own SHUT_RD ends a blocking read, and a nonblocking one still
-            // finds nothing.
+            // own SHUT_RD ends a blocking read, as __skb_wait_for_more_packets
+            // stops waiting at RCV_SHUTDOWN with no error. A read that does
+            // not wait (O_NONBLOCK or MSG_DONTWAIT: no timeout) still finds
+            // nothing, EAGAIN from __skb_try_recv_datagram, which
+            // unix_dgram_recvmsg turns into an end of file only for
+            // SOCK_SEQPACKET.
             return if datagram {
                 if own.read_shutdown && !nonblocking {
                     Ok(Received::default())

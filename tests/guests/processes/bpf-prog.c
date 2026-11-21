@@ -630,6 +630,13 @@ static int case_attach(void) {
     through("datagram shut kept", d[0], d[1], 5);
     say("attach datagram shut drop %d", attach(d[1], drop));
     through("datagram shut dropped", d[0], d[1], 5);
+    /* A blocking read of a datagram socket that has shut reading down ends
+       (0), where one that does not wait finds nothing (EAGAIN). */
+    {
+        char in[8];
+        long got = recv(d[1], in, sizeof in, 0);
+        say("datagram shut blocking read %ld", got < 0 ? -errno : got);
+    }
 
     /* SOCK_SEQPACKET: a filter trims and drops as for datagrams; the
        receiver's shutdown of reading shuts the sender's writing too, which

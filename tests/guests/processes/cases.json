@@ -66,6 +66,7 @@
     {"name":"veth-ipv4","binary":"veth-ipv4"},
     {"name":"veth-traffic","binary":"veth-traffic"},
     {"name":"veth-iif","binary":"veth-iif"},
+    {"name":"veth-neigh","binary":"veth-neigh"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

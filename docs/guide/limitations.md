@@ -940,9 +940,9 @@ verified.
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
   across a pair to an address of the peer's namespace, but no IPv6
   address (it makes no link-local one as it comes up, where Linux does),
-  no neighbour, no route through a gateway and no IPv6 route lookup in
-  through it (`RTA_IIF`), each `EOPNOTSUPP`. Traffic through an end makes no
-  neighbour entries and moves no counters; a namespace forwards nothing
+  no IPv6 neighbour or proxy entry, no route through a gateway and no IPv6
+  route lookup in through it (`RTA_IIF`), each `EOPNOTSUPP`. Traffic through
+  an end moves no counters; a namespace forwards nothing
   on to another; and a broadcast or multicast destination through an end
   reaches no one. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`), so every datagram to a closed port of the
@@ -950,7 +950,13 @@ verified.
   connection across a pair goes on after an end goes down, goes or moves,
   or the address or route it took goes, where Linux's packets stop. A connection to an address nobody answers ARP for fails
   3 seconds after each connect, where Linux's attempts made while the
-  neighbour is resolving fail together. The addresses of an end that goes tell
+  neighbour is resolving fail together. An end's neighbour is answered or
+  not as the peer would answer when it begins to resolve or to delay,
+  where Linux asks again with each probe, and so a packet waiting for one
+  never goes once it is answered later; `NTF_MANAGED` ones are never
+  probed again; no traffic confirms one (`dst_confirm`, `MSG_CONFIRM`), so
+  a delaying one is always probed; and the neighbour table dump gives no
+  veth end's IPv6 parameters. The addresses of an end that goes tell
   their lifetimes as of the last netlink request, read or poll in its
   namespace, where Linux takes the time it goes. Making one takes
   only a name, an address and an MTU for each end (`EOPNOTSUPP` for the
@@ -1050,9 +1056,10 @@ verified.
   Notifications go out for the link, its IPv6 information, addresses,
   routes, neighbours and namespace IDs alone, not for the other groups;
   IPv4's routes through `lo` go without one when it goes down, as on
-  Linux. Traffic makes a neighbour through UDP and TCP's handshakes alone,
-  which are the only packets paludarium sends through `lo` (a TCP handshake
-  retried into a full backlog makes none of its answer), and none times
+  Linux. Traffic makes a neighbour through UDP, TCP's handshakes and ICMP's
+  port unreachable back alone, which are the only packets paludarium sends
+  through `lo` or a veth end (a TCP handshake retried into a full backlog
+  makes none of its answer), and none times
   out (`gc_thresh1` is never reached). A dump gives a family's neighbours
   the newest first, where Linux gives them in the order of its hash
   table, which a random key sets. Proxy entries of one hash bucket come
@@ -1060,7 +1067,7 @@ verified.
   x86-64 runner's Linux gave two of them the other way. One without a
   device goes with its namespace, where Linux 7.0, whose proxy table is
   every namespace's, keeps it, for a namespace made later where that one
-  was to see (Linux's master gives each namespace its own). Of a neighbour's
+  was to see (Linux's master gives each namespace its own). Of a loopback neighbour's
   timers only a reachable one's runs: once its reachable time since it
   was confirmed has passed, it goes stale, or delays if it was used
   within the delay before a probe (5 seconds), and its going stale is
@@ -1069,8 +1076,8 @@ verified.
   probes nor becomes reachable or failed, and one `NTF_USE` or
   `NTF_MANAGED` makes incomplete counts its first probe but never sends
   another nor fails;
-  `NTF_EXT_MANAGED` ones are not probed from time to time. A neighbour's
-  state and link-layer address change nothing traffic does, where Linux's
+  `NTF_EXT_MANAGED` ones are not probed from time to time. A loopback
+  neighbour's state and link-layer address change nothing traffic does, where Linux's
   `lo` holds a packet for one that is not valid until it resolves. Its
   references count only those of the request and of its timer. An IPv6
   proxy entry joins no solicited-node group (`pndisc_constructor`), and

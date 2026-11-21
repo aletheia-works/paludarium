@@ -26,7 +26,7 @@ use core::cmp::{Ordering, Reverse};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use paludarium_types::Errno;
 
-/// The `RTN_*` types of the loopback's neighbours.
+/// The `RTN_*` types of neighbours.
 const RTN_LOCAL: u8 = 2;
 const RTN_BROADCAST: u8 = 3;
 const RTN_MULTICAST: u8 = 5;
@@ -580,16 +580,19 @@ pub(crate) enum Event {
     NewNeighbour(Neighbour),
     DelNeighbour(Neighbour),
 }
-/// A neighbour of the loopback, as `___neigh_create` makes one for the
-/// next hop of a packet out through it, or for a request
-/// (`RTM_NEWNEIGH`). On a loopback each is made `NUD_NOARP` with the
-/// device's address, all zeros: IPv4's one entry is keyed by `0.0.0.0`
-/// (`arp_constructor` keys a loopback's so, whatever is asked), of type
-/// `RTN_BROADCAST` (`inet_addr_type` of it); IPv6's are keyed by each next
-/// hop, of type `RTN_LOCAL`, or `RTN_MULTICAST` for a multicast one
-/// (`ndisc_constructor`).
+/// A neighbour of the loopback or of a veth end, as `___neigh_create`
+/// makes one for the next hop of a packet out through it, or for a
+/// request (`RTM_NEWNEIGH`). On a loopback each is made `NUD_NOARP` with
+/// the device's address, all zeros: IPv4's one entry is keyed by
+/// `0.0.0.0` (`arp_constructor` keys a loopback's so, whatever is asked),
+/// of type `RTN_BROADCAST` (`inet_addr_type` of it); IPv6's are keyed by
+/// each next hop, of type `RTN_LOCAL`, or `RTN_MULTICAST` for a multicast
+/// one (`ndisc_constructor`). A veth end's, of IPv4 alone, are keyed by
+/// the address asked and resolved by ARP ([`Neighbour::arp`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Neighbour {
+    /// The index of its device.
+    pub index: i32,
     pub ip: IpAddr,
     /// The `RTN_*` type.
     pub kind: u8,
@@ -618,8 +621,11 @@ pub(crate) struct Neighbour {
     /// Whether its timer is pending, which holds a reference to it
     /// (`neigh_add_timer`): one that a state of `NUD_REACHABLE`,
     /// `NUD_DELAY` or `NUD_PROBE` sets. Only a reachable one's runs here
-    /// ([`Self::age`]).
+    /// ([`Self::age`]); a veth end's all run ([`Self::arp_timer`]).
     pub timer: bool,
+    /// Whether the peer answers the probe a veth end's neighbour sends
+    /// once its delay is over, as found when it began to delay.
+    pub answers: bool,
 }
 /// The `NUD_*` states.
 pub(crate) const NUD_INCOMPLETE: u8 = 0x01;
@@ -715,6 +721,7 @@ impl Neighbour {
             IpAddr::V6(_) => RTN_LOCAL,
         };
         Self {
+            index: LOOPBACK_INDEX,
             ip,
             kind,
             made: now,
@@ -728,6 +735,28 @@ impl Neighbour {
             confirmed: now,
             unconfirmed: true,
             timer: false,
+            answers: false,
+        }
+    }
+    /// A neighbour of the veth end `index` keyed by `ip`, of the `RTN_*`
+    /// type `kind` (`inet_addr_type_dev_table`), as `arp_constructor`
+    /// makes it at `now` with `flags`: a multicast one `NUD_NOARP` with its
+    /// group's Ethernet address (`ip_eth_mc_map`), a broadcast one
+    /// `NUD_NOARP` with the broadcast address, any other `NUD_NONE` for
+    /// ARP to resolve.
+    fn arp(index: i32, ip: Ipv4Addr, kind: u8, flags: u32, now: u64) -> Self {
+        let o = ip.octets();
+        let (state, lladdr) = match kind {
+            RTN_MULTICAST => (NUD_NOARP, [0x01, 0x00, 0x5e, o[1] & 0x7f, o[2], o[3]]),
+            RTN_BROADCAST => (NUD_NOARP, [0xff; 6]),
+            _ => (0, [0; 6]),
+        };
+        Self {
+            index,
+            kind,
+            state,
+            lladdr,
+            ..Self::new(IpAddr::V4(ip), flags, now)
         }
     }
     /// `__neigh_update` with `lladdr` (or none) to state `new` at `now`:
@@ -837,6 +866,8 @@ impl Neighbour {
         self.updated = at;
         if at <= self.used + DELAY_PROBE_TIME {
             self.state = NUD_DELAY;
+            // A veth end's peer answered while it was reachable.
+            self.answers = true;
             return None;
         }
         self.state = NUD_STALE;
@@ -864,6 +895,74 @@ impl Neighbour {
             self.updated = now;
             self.timer = true;
         }
+    }
+    /// `neigh_timer_handler` for a veth end's neighbour by `now`, which
+    /// probes once a second (`retrans_time`): an incomplete one, its
+    /// unicast and multicast probes (6) sent, fails 3 seconds after its
+    /// first; a delaying one, 5 seconds on (`delay_probe_time`), is
+    /// reachable if it was confirmed meanwhile, else probes: its unicast
+    /// probe is answered, and it is reachable, or it fails after 3 of them
+    /// (one `NTF_EXT_VALIDATED` is stale instead).
+    /// Each change but to an incomplete one is told of, with its time; the
+    /// probes sent so far count meanwhile.
+    fn arp_timer(&mut self, now: u64) -> Vec<(u64, Self)> {
+        let mut told = Vec::new();
+        if !self.timer || self.index == LOOPBACK_INDEX {
+            return told;
+        }
+        let sent =
+            |since: u64| u32::try_from(now.saturating_sub(since) / SECOND).unwrap_or(u32::MAX);
+        if self.state & NUD_DELAY != 0 {
+            let at = self.updated + DELAY_PROBE_TIME;
+            if now < at {
+                return told;
+            }
+            self.updated = at;
+            if !self.unconfirmed && at <= self.confirmed + DELAY_PROBE_TIME {
+                self.state = NUD_REACHABLE;
+                told.push((at, *self));
+                return told;
+            }
+            self.state = NUD_PROBE;
+            self.probes = 0;
+            told.push((at, *self));
+            self.probes = 1;
+            if self.answers {
+                self.state = NUD_REACHABLE;
+                self.confirmed = at;
+                self.unconfirmed = false;
+                told.push((at, *self));
+                return told;
+            }
+        }
+        if self.state & NUD_PROBE != 0 {
+            let at = self.updated + 3 * SECOND;
+            if now < at {
+                self.probes = 1 + sent(self.updated).min(2);
+                return told;
+            }
+            self.probes = 3;
+            self.state = if self.flags & NTF_EXT_VALIDATED != 0 {
+                NUD_STALE
+            } else {
+                NUD_FAILED
+            };
+            self.timer = false;
+            self.updated = at;
+            told.push((at, *self));
+        } else if self.state & NUD_INCOMPLETE != 0 {
+            let at = self.updated + 3 * SECOND;
+            if now < at {
+                self.probes = 4 + sent(self.updated).min(2);
+                return told;
+            }
+            self.probes = 6;
+            self.state = NUD_FAILED;
+            self.timer = false;
+            self.updated = at;
+            told.push((at, *self));
+        }
+        told
     }
 }
 
@@ -966,7 +1065,7 @@ pub(crate) struct Addresses {
     /// the monotonic clock: a netlink request's, which a device going
     /// tells its addresses' lifetimes by.
     seen: u64,
-    /// The loopback's neighbours, the oldest first.
+    /// The neighbours of the loopback and of each veth end, the oldest first.
     neighbours: Vec<Neighbour>,
     /// The proxy entries of the namespace, the oldest first.
     proxies: Vec<Proxy>,
@@ -1026,24 +1125,32 @@ impl Addresses {
             IpAddr::V6(ip) if ip.is_multicast() => (next, RTN_MULTICAST),
             IpAddr::V6(_) => (next, RTN_LOCAL),
         };
-        if !self.neighbours.iter().any(|n| n.ip == ip) {
+        if !self
+            .neighbours
+            .iter()
+            .any(|n| n.index == LOOPBACK_INDEX && n.ip == ip)
+        {
             let mut neighbour = Neighbour::new(ip, 0, now);
             neighbour.kind = kind;
             self.neighbours.push(neighbour);
         }
     }
-    /// Adds or changes a neighbour of `lo` at `now`, as `neigh_add` does
-    /// once it has found the device and table and checked the key: what is
-    /// told of, and the error. One is looked up by the key asked, which for
-    /// IPv4 finds only `0.0.0.0`'s; `EEXIST` for it with `NLM_F_EXCL`, and
-    /// without `NLM_F_REPLACE` a new address changes nothing. Else
-    /// `NLM_F_CREATE` makes one (`ENOENT` without), and IPv4's is
-    /// `0.0.0.0`'s, which may be there already; `EINVAL` for a permanent
-    /// one `NTF_MANAGED`. `NTF_EXT_VALIDATED` needs a valid state, the
+    /// Adds or changes a neighbour of the device of `index`, `lo` or a veth
+    /// end, at `now`, as `neigh_add` does once it has found the device and
+    /// table and checked the key: what is told of, and the error. One is
+    /// looked up by the key asked, which for IPv4 on `lo` finds only
+    /// `0.0.0.0`'s; `EEXIST` for it with `NLM_F_EXCL`, and without
+    /// `NLM_F_REPLACE` a new address changes nothing. Else `NLM_F_CREATE`
+    /// makes one (`ENOENT` without): on `lo` IPv4's is `0.0.0.0`'s, which
+    /// may be there already, and on a veth end it is made as ARP's
+    /// ([`Neighbour::arp`]), of the type its key has
+    /// ([`Self::inet_addr_type4`]); `EINVAL` for a permanent one
+    /// `NTF_MANAGED`. One made stays when the change then fails. `NTF_EXT_VALIDATED` needs a valid state, the
     /// one it has for `NTF_USE` and `NTF_MANAGED` (`EINVAL`). Then
     /// [`Neighbour::update`], and for those two, [`Neighbour::event`].
     pub(crate) fn add_neighbour(
         &mut self,
+        index: i32,
         ask: NeighbourAsk,
         now: u64,
     ) -> (Vec<Event>, Result<(), Errno>) {
@@ -1058,7 +1165,12 @@ impl Addresses {
             use_: flags & NTF_USE != 0,
             validated: flags & NTF_EXT_VALIDATED != 0,
         };
-        let index = if let Some(i) = self.neighbours.iter().position(|n| n.ip == ask.ip) {
+        let device = index;
+        let index = if let Some(i) = self
+            .neighbours
+            .iter()
+            .position(|n| n.index == device && n.ip == ask.ip)
+        {
             if ask.request & NLM_F_EXCL != 0 {
                 return (Vec::new(), Err(Errno::EEXIST));
             }
@@ -1108,16 +1220,30 @@ impl Addresses {
                     );
                 }
             }
-            let ip = match ask.ip {
-                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                ip => ip,
-            };
-            match self.neighbours.iter().position(|n| n.ip == ip) {
-                Some(i) => i,
-                None => {
-                    let kept = flags & (NTF_EXT_LEARNED | NTF_MANAGED | NTF_EXT_VALIDATED);
-                    self.neighbours.push(Neighbour::new(ip, kept, now));
+            let kept = flags & (NTF_EXT_LEARNED | NTF_MANAGED | NTF_EXT_VALIDATED);
+            match ask.ip {
+                IpAddr::V4(ip) if device != LOOPBACK_INDEX => {
+                    let kind = self.inet_addr_type4(ip);
+                    self.neighbours
+                        .push(Neighbour::arp(device, ip, kind, kept, now));
                     self.neighbours.len() - 1
+                }
+                _ => {
+                    let ip = match ask.ip {
+                        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        ip => ip,
+                    };
+                    match self
+                        .neighbours
+                        .iter()
+                        .position(|n| n.index == device && n.ip == ip)
+                    {
+                        Some(i) => i,
+                        None => {
+                            self.neighbours.push(Neighbour::new(ip, kept, now));
+                            self.neighbours.len() - 1
+                        }
+                    }
                 }
             }
         };
@@ -1136,12 +1262,21 @@ impl Addresses {
         }
         (events, result)
     }
-    /// Removes the neighbour of `lo` keyed by `ip`, as `neigh_delete`
-    /// does: `ENOENT` for none (IPv4's only by `0.0.0.0`). It fails first
-    /// (`NUD_FAILED`, told of if it was valid), then goes, told of with
-    /// `RTM_DELNEIGH` (`neigh_remove_one`).
-    pub(crate) fn delete_neighbour(&mut self, ip: IpAddr, now: u64) -> Result<Vec<Event>, Errno> {
-        let Some(index) = self.neighbours.iter().position(|n| n.ip == ip) else {
+    /// Removes the neighbour of the device of `index` keyed by `ip`, as
+    /// `neigh_delete` does: `ENOENT` for none (on `lo`, IPv4's only by
+    /// `0.0.0.0`). It fails first (`NUD_FAILED`, told of if it was valid),
+    /// then goes, told of with `RTM_DELNEIGH` (`neigh_remove_one`).
+    pub(crate) fn delete_neighbour(
+        &mut self,
+        index: i32,
+        ip: IpAddr,
+        now: u64,
+    ) -> Result<Vec<Event>, Errno> {
+        let Some(index) = self
+            .neighbours
+            .iter()
+            .position(|n| n.index == index && n.ip == ip)
+        else {
             return Err(Errno::ENOENT);
         };
         let mut n = self.neighbours.remove(index);
@@ -1216,18 +1351,150 @@ impl Addresses {
             .into_iter()
             .find(|p| p.ip == ip && (p.device == device || !p.device))
     }
-    /// The loopback's neighbours, the oldest first.
+    /// The neighbours of every device, the oldest first.
     pub(crate) fn neighbours(&self) -> &[Neighbour] {
         &self.neighbours
     }
-    /// The neighbours of one family flushed (`neigh_flush_dev`), told of
-    /// with `RTM_DELNEIGH`, the newest first, as each was put at the head
-    /// of the device's list.
+    /// What `inet_addr_type` makes of `ip`: broadcast for `0.0.0.0` and
+    /// the limited broadcast address, multicast for a group, else the type
+    /// of what the local table has for it ([`Self::addr_type4`]).
+    pub(crate) fn inet_addr_type4(&self, ip: Ipv4Addr) -> u8 {
+        if ip.is_unspecified() || ip.is_broadcast() {
+            RTN_BROADCAST
+        } else if ip.is_multicast() {
+            RTN_MULTICAST
+        } else {
+            self.addr_type4(ip, TABLE_LOCAL).code()
+        }
+    }
+    /// A packet goes out through the veth end `index` to `ip` at `now`,
+    /// as `ip_finish_output2` takes its neighbour, made if there is none
+    /// ([`Neighbour::arp`]), and `neigh_event_send` resolves it: the
+    /// link-layer address it goes to, if any, whether ARP asked, and what
+    /// is told of. A valid
+    /// one is used, and a stale one delays, its probe to be answered as
+    /// `answer` says (some address) now. Any other asks ARP: answered with
+    /// `answer`, it is reachable at that address (`arp_process`'s reply,
+    /// told of); unanswered, it is incomplete, its first probe sent, and
+    /// the packet waits for what never comes ([`Neighbour::arp_timer`]).
+    pub(crate) fn arp_output(
+        &mut self,
+        index: i32,
+        ip: Ipv4Addr,
+        answer: Option<[u8; 6]>,
+        now: u64,
+    ) -> (Option<[u8; 6]>, bool, Vec<Event>) {
+        let key = IpAddr::V4(ip);
+        let i = match self
+            .neighbours
+            .iter()
+            .position(|n| n.index == index && n.ip == key)
+        {
+            Some(i) => i,
+            None => {
+                let kind = self.inet_addr_type4(ip);
+                self.neighbours
+                    .push(Neighbour::arp(index, ip, kind, 0, now));
+                self.neighbours.len() - 1
+            }
+        };
+        let n = &mut self.neighbours[i];
+        n.used = now;
+        if n.state & NUD_STALE != 0 {
+            n.state = NUD_DELAY;
+            n.updated = now;
+            n.timer = true;
+            n.answers = answer.is_some();
+        }
+        if n.state & NUD_VALID != 0 {
+            return (Some(n.lladdr), false, Vec::new());
+        }
+        if n.state & NUD_INCOMPLETE == 0 {
+            n.probes = 4;
+            n.state = NUD_INCOMPLETE;
+            n.updated = now;
+            n.timer = true;
+        }
+        let Some(lladdr) = answer else {
+            return (None, true, Vec::new());
+        };
+        n.state = NUD_REACHABLE;
+        n.lladdr = lladdr;
+        n.updated = now;
+        n.confirmed = now;
+        n.unconfirmed = false;
+        (Some(lladdr), true, vec![Event::NewNeighbour(*n)])
+    }
+    /// An ARP request from `ip` at `lladdr` comes in on the veth end
+    /// `index` at `now` for an address of this namespace's, as
+    /// `arp_process` learns of its sender (`neigh_event_ns`): one there is
+    /// not is made stale with that address; a permanent or `NUD_NOARP` one
+    /// stays; a valid one at that address stays as it is; any other is
+    /// stale at it. What is told of.
+    pub(crate) fn arp_learn(
+        &mut self,
+        index: i32,
+        ip: Ipv4Addr,
+        lladdr: [u8; 6],
+        now: u64,
+    ) -> Vec<Event> {
+        let key = IpAddr::V4(ip);
+        let i = match self
+            .neighbours
+            .iter()
+            .position(|n| n.index == index && n.ip == key)
+        {
+            Some(i) => i,
+            None => {
+                let kind = self.inet_addr_type4(ip);
+                self.neighbours
+                    .push(Neighbour::arp(index, ip, kind, 0, now));
+                self.neighbours.len() - 1
+            }
+        };
+        let n = &mut self.neighbours[i];
+        if n.state & (NUD_NOARP | NUD_PERMANENT) != 0
+            || (n.state & NUD_VALID != 0 && n.lladdr == lladdr)
+        {
+            return Vec::new();
+        }
+        n.state = NUD_STALE;
+        n.lladdr = lladdr;
+        n.updated = now;
+        n.confirmed = now;
+        n.unconfirmed = true;
+        n.timer = false;
+        vec![Event::NewNeighbour(*n)]
+    }
+    /// The neighbours of the device of `index` flushed, as `neigh_ifdown`
+    /// does when it goes down or away, or, `keep_permanent`, as
+    /// `neigh_carrier_down` does when it loses its carrier, keeping the
+    /// permanent ones and those `NTF_EXT_VALIDATED`: told of with
+    /// `RTM_DELNEIGH`, the newest first, as each was put at the head of the
+    /// device's list.
+    pub(crate) fn flush_device(&mut self, index: i32, keep_permanent: bool) -> Vec<Event> {
+        let (gone, kept) = self.neighbours.drain(..).partition::<Vec<_>, _>(|n| {
+            n.index == index
+                && !(keep_permanent
+                    && (n.state & NUD_PERMANENT != 0 || n.flags & NTF_EXT_VALIDATED != 0))
+        });
+        self.neighbours = kept;
+        gone.into_iter()
+            .rev()
+            .map(|mut n| {
+                n.timer = false;
+                Event::DelNeighbour(n)
+            })
+            .collect()
+    }
+    /// The loopback's neighbours of one family flushed
+    /// (`neigh_flush_dev`), told of with `RTM_DELNEIGH`, the newest first,
+    /// as each was put at the head of the device's list.
     fn flush(&mut self, v6: bool, events: &mut Vec<Event>) {
         let (gone, kept) = self
             .neighbours
             .drain(..)
-            .partition::<Vec<_>, _>(|n| n.ip.is_ipv6() == v6);
+            .partition::<Vec<_>, _>(|n| n.index == LOOPBACK_INDEX && n.ip.is_ipv6() == v6);
         self.neighbours = kept;
         events.extend(gone.into_iter().rev().map(|mut n| {
             // `neigh_flush_one` stops its timer.
@@ -1781,7 +2048,12 @@ impl Addresses {
         let mut stale: Vec<(u64, Neighbour)> = self
             .neighbours
             .iter_mut()
-            .filter_map(|n| n.age(now).map(|at| (at, *n)))
+            .flat_map(|n| {
+                let mut told: Vec<(u64, Neighbour)> =
+                    n.age(now).map(|at| (at, *n)).into_iter().collect();
+                told.extend(n.arp_timer(now));
+                told
+            })
             .collect();
         stale.sort_by_key(|&(at, _)| at);
         events.extend(stale.into_iter().map(|(_, n)| Event::NewNeighbour(n)));
@@ -3494,14 +3766,26 @@ mod tests {
             request: NLM_F_CREATE,
         };
         let start = 100 * SECOND;
-        let _ = a.add_neighbour(ask("2001:db8::1", NUD_REACHABLE, 0), start);
-        let _ = a.add_neighbour(ask("2001:db8::2", NUD_REACHABLE, 0), start + SECOND);
-        let _ = a.add_neighbour(ask("2001:db8::3", NUD_PERMANENT, 0), start);
+        let _ = a.add_neighbour(LOOPBACK_INDEX, ask("2001:db8::1", NUD_REACHABLE, 0), start);
+        let _ = a.add_neighbour(
+            LOOPBACK_INDEX,
+            ask("2001:db8::2", NUD_REACHABLE, 0),
+            start + SECOND,
+        );
+        let _ = a.add_neighbour(LOOPBACK_INDEX, ask("2001:db8::3", NUD_PERMANENT, 0), start);
         // Confirmed again: its time starts over.
-        let _ = a.add_neighbour(ask("2001:db8::1", NUD_REACHABLE, 0), start + 2 * SECOND);
+        let _ = a.add_neighbour(
+            LOOPBACK_INDEX,
+            ask("2001:db8::1", NUD_REACHABLE, 0),
+            start + 2 * SECOND,
+        );
         // Used just before its time is out: it delays.
-        let _ = a.add_neighbour(ask("2001:db8::4", NUD_REACHABLE, 0), start);
-        let _ = a.add_neighbour(ask("2001:db8::4", 0, NTF_USE), start + 26 * SECOND);
+        let _ = a.add_neighbour(LOOPBACK_INDEX, ask("2001:db8::4", NUD_REACHABLE, 0), start);
+        let _ = a.add_neighbour(
+            LOOPBACK_INDEX,
+            ask("2001:db8::4", 0, NTF_USE),
+            start + 26 * SECOND,
+        );
         let stale = |events: &[Event]| -> Vec<String> {
             events
                 .iter()
@@ -3537,6 +3821,100 @@ mod tests {
         assert!(a.expire(start + 100 * REACHABLE_TIME).is_empty());
     }
 
+    #[test]
+    fn a_veth_ends_neighbours_are_resolved_learned_timed_and_flushed_as_arps() {
+        let ip4 = |ip: &str| ip.parse::<Ipv4Addr>().unwrap();
+        let mut a = Addresses::first();
+        let start = 100 * SECOND;
+        let peer = [2, 0, 0, 0, 0, 0x0b];
+        let find = |a: &Addresses, ip: &str| {
+            *a.neighbours()
+                .iter()
+                .find(|n| n.index == 1000 && n.ip == ip.parse::<IpAddr>().unwrap())
+                .unwrap()
+        };
+        let told = |events: &[Event]| -> Vec<String> {
+            events
+                .iter()
+                .map(|e| match e {
+                    Event::NewNeighbour(n) => format!("+{} {:#x} {}", n.ip, n.state, n.probes),
+                    Event::DelNeighbour(n) => format!("-{} {:#x}", n.ip, n.state),
+                    _ => panic!("{e:?}"),
+                })
+                .collect()
+        };
+        // Answered at once: reachable, its first probe counted.
+        let (lladdr, asked, events) = a.arp_output(1000, ip4("10.77.0.2"), Some(peer), start);
+        assert_eq!((lladdr, asked), (Some(peer), true));
+        assert_eq!(told(&events), ["+10.77.0.2 0x2 4"]);
+        // Valid now: no ARP.
+        assert!(!a.arp_output(1000, ip4("10.77.0.2"), None, start).1);
+        // Unanswered: incomplete, failed 3 seconds on, told of.
+        let (lladdr, asked, events) = a.arp_output(1000, ip4("10.77.0.9"), None, start);
+        assert_eq!((lladdr, asked, events.len()), (None, true, 0));
+        assert!(a.expire(start + SECOND).is_empty());
+        assert_eq!(find(&a, "10.77.0.9").probes, 5);
+        assert_eq!(told(&a.expire(start + 3 * SECOND)), ["+10.77.0.9 0x20 6"]);
+        // Broadcast and multicast need no ARP.
+        let (lladdr, asked, _) = a.arp_output(1000, Ipv4Addr::BROADCAST, None, start);
+        assert_eq!((lladdr, asked), (Some([0xff; 6]), false));
+        let (lladdr, _, _) = a.arp_output(1000, ip4("224.1.130.3"), None, start);
+        assert_eq!(lladdr, Some([0x01, 0x00, 0x5e, 0x01, 0x82, 0x03]));
+        assert_eq!(find(&a, "224.1.130.3").kind, RTN_MULTICAST);
+        // Learned from a request: stale, then delaying once used, then
+        // probed 5 seconds on and reachable.
+        let host = [2, 0, 0, 0, 0, 0x0a];
+        assert_eq!(
+            told(&a.arp_learn(1000, ip4("10.77.0.3"), host, start)),
+            ["+10.77.0.3 0x4 0"]
+        );
+        assert!(a.arp_learn(1000, ip4("10.77.0.3"), host, start).is_empty());
+        let (lladdr, asked, _) = a.arp_output(1000, ip4("10.77.0.3"), Some(host), start + SECOND);
+        assert_eq!((lladdr, asked), (Some(host), false));
+        assert_eq!(find(&a, "10.77.0.3").state, NUD_DELAY);
+        assert!(a.expire(start + 5 * SECOND).is_empty());
+        assert_eq!(
+            told(&a.expire(start + 6 * SECOND)),
+            ["+10.77.0.3 0x10 0", "+10.77.0.3 0x2 1"]
+        );
+        // One that delays unanswered fails after its 3 probes.
+        let _ = a.arp_learn(1000, ip4("10.77.0.4"), host, start);
+        let _ = a.arp_output(1000, ip4("10.77.0.4"), None, start);
+        assert_eq!(told(&a.expire(start + 5 * SECOND)), ["+10.77.0.4 0x10 0"]);
+        assert_eq!(find(&a, "10.77.0.4").probes, 1);
+        assert_eq!(told(&a.expire(start + 8 * SECOND)), ["+10.77.0.4 0x20 3"]);
+        // A permanent one takes nothing learned.
+        let ask = NeighbourAsk {
+            ip: "10.77.0.5".parse().unwrap(),
+            state: NUD_PERMANENT,
+            flags: 0,
+            lladdr: Some([2, 0, 0, 0, 0, 5]),
+            protocol: 0,
+            request: NLM_F_CREATE,
+        };
+        let (events, result) = a.add_neighbour(1000, ask, start);
+        assert_eq!(
+            (told(&events), result),
+            (vec!["+10.77.0.5 0x80 0".to_owned()], Ok(()))
+        );
+        assert_eq!(find(&a, "10.77.0.5").kind, Kind::Unicast.code());
+        assert!(a.arp_learn(1000, ip4("10.77.0.5"), host, start).is_empty());
+        // The carrier going takes all but the permanent ones, the newest
+        // first; going down takes that too.
+        assert_eq!(
+            told(&a.flush_device(1000, true)),
+            [
+                "-10.77.0.4 0x20",
+                "-10.77.0.3 0x2",
+                "-224.1.130.3 0x40",
+                "-255.255.255.255 0x40",
+                "-10.77.0.9 0x20",
+                "-10.77.0.2 0x2"
+            ]
+        );
+        assert_eq!(told(&a.flush_device(1000, false)), ["-10.77.0.5 0x80"]);
+        assert!(a.neighbours().is_empty());
+    }
     #[test]
     fn neighbours_go_with_the_loopback_and_its_last_ipv4_address() {
         let mut a = Addresses::first();

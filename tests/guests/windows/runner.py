@@ -6,7 +6,9 @@ import pathlib
 import sys
 
 
-def run(command, *, cwd, env, timeout=30):
+def run(command, *, cwd, env, timeout=30, stdin=None):
+    """Runs `command` with `stdin`'s bytes on a pipe, or with no input, as
+    the programs runner does."""
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
         raise ValueError("guest deadline must be finite and at most thirty seconds")
     if sys.platform == "win32":
@@ -17,4 +19,4 @@ def run(command, *, cwd, env, timeout=30):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         supervise = module.run
-    return supervise(command, cwd=cwd, env=env, timeout=timeout)
+    return supervise(command, cwd=cwd, env=env, timeout=timeout, stdin=stdin)

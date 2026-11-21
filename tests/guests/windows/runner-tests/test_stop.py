@@ -31,6 +31,14 @@ class StopTests(unittest.TestCase):
         row = self.child('import sys;sys.stdout.buffer.write("日本語".encode())')
         self.assertEqual(row["stdout"], "日本語")
 
+    def test_stdin(self):
+        # coreutils' native rows give some cases stdin, through this runner
+        # when windows-run.py puts it first on the path.
+        code = "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read()[::-1])"
+        row = run([sys.executable, "-c", code], cwd=ROOT, env=dict(os.environ), stdin=b"abc\n")
+        self.assertEqual((row["exit"], row["stdout"]), (0, "\ncba"))
+        self.assertEqual(self.child(code)["stdout"], "")
+
     def test_invalid_deadlines(self):
         for value in (0, -1, 31, float("nan"), float("inf"), True):
             with self.subTest(value=value), self.assertRaises(ValueError):

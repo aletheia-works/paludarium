@@ -144,7 +144,7 @@ def drain_job(kernel, job):
         time.sleep(0.005)
 
 
-def run(command, *, cwd, env, timeout=30):
+def run(command, *, cwd, env, timeout=30, stdin=None):
     if type(timeout) not in (int, float) or not 0 < timeout <= 30:
         raise ValueError("guest deadline must be at most thirty seconds")
     started = time.monotonic()
@@ -170,7 +170,7 @@ def run(command, *, cwd, env, timeout=30):
             cwd=cwd,
             env=environment,
             creationflags=4,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -181,7 +181,7 @@ def run(command, *, cwd, env, timeout=30):
         if remaining <= 0:
             raise subprocess.TimeoutExpired(command, timeout)
         try:
-            stdout, stderr = child.communicate(timeout=remaining)
+            stdout, stderr = child.communicate(stdin, timeout=remaining)
         except subprocess.TimeoutExpired:
             timed_out = True
             drain_job(kernel, job)

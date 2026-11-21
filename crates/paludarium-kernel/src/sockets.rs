@@ -2051,9 +2051,15 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             if socket.lock_sides()[socket.side].filter_locked {
                 return Err(Errno::EPERM);
             }
+            // The descriptor is looked up outside the sides' lock, which is
+            // then checked again: sk_setsockopt holds the socket's lock
+            // throughout, so no SO_LOCK_FILTER comes in between.
             let program = crate::bpf_prog::socket_filter(c, value.cast_unsigned())?;
             let mut sides = socket.lock_sides();
             let own = &mut sides[socket.side];
+            if own.filter_locked {
+                return Err(Errno::EPERM);
+            }
             // __sk_filter_charge: the new filter is charged before the old
             // is given back, against net.core.optmem_max.
             let held = own.filter.as_ref().map_or(0, |f| f.program.filter_size());

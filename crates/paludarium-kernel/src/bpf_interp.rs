@@ -11,7 +11,9 @@
 //! lets a program move a pointer only by constants, so an address keeps its
 //! region; a load or store is checked against its region all the same, and
 //! one outside it stops the program ([`Fault`]), which the verifier should
-//! make impossible (the fuzz target checks it).
+//! make impossible. Nothing checks that yet beyond the unit tests and a
+//! `debug_assert!` in [`crate::bpf_prog::Program::run`]; a fuzz target of
+//! the verifier and the interpreter together is the next PR's.
 //!
 //! What Linux's rewrites decide, the interpreter does as they do:
 //! - a division by a register that is 0 gives 0, and a remainder by one
@@ -559,7 +561,7 @@ impl Machine<'_, '_> {
                 // No MAC header is set; the network header is where the
                 // data starts; anything else is EFAULT.
                 let bytes = (offset <= 0xffff && r5 as u32 == 1)
-                    .then(|| linear.get(offset as usize..offset as usize + len))
+                    .then(|| linear.get(offset as usize..(offset as usize).checked_add(len)?))
                     .flatten();
                 self.give(r3, len, bytes)?
             }

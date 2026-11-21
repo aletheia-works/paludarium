@@ -32,7 +32,8 @@
    remainder by 0 and by -1, which the bytes kept show; and where the
    filter runs among the send's checks: before the receiver's shutdown
    (EPIPE) of a datagram socket, after the sender's own shutdown of a
-   SOCK_SEQPACKET pair, and before a datagram socket
+   SOCK_SEQPACKET pair, not at all for a stream socket, and before a
+   datagram socket
    connected elsewhere refuses the sender (EPERM).
 
    Each program refused is wrong in one way only, which both kernels the
@@ -643,6 +644,13 @@ static int case_attach(void) {
     through("seqpacket shut dropped", s[0], s[1], 5);
     shutdown(s[0], SHUT_WR);
     through("seqpacket own shutdown", s[0], s[1], 5);
+
+    /* A stream socket takes a filter, which unix_stream_sendmsg never
+       runs. */
+    int t[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, t)) return 1;
+    say("attach stream drop %d", attach(t[1], drop));
+    through("stream", t[0], t[1], 5);
 
     /* A datagram socket connected to another refuses a third (EPERM), but
        its filter runs first. */

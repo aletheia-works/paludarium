@@ -1674,6 +1674,8 @@ mod fanotify_tests;
 #[cfg(test)]
 mod keys_tests;
 #[cfg(test)]
+mod perf_sample_tests;
+#[cfg(test)]
 mod perf_tests;
 #[cfg(test)]
 mod processes_tests;

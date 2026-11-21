@@ -7522,18 +7522,185 @@ mod madvise_advice {
             assert_eq!(f.ret(28, &[AREA, 2 * PAGE, advice]), 0, "{advice}");
             assert_eq!(f.ret(28, &[AREA, 3 * PAGE, advice]), errno(Errno::ENOMEM));
         }
-        // Still refused: MADV_COLLAPSE, the memory failure advice, and
-        // unknown ones.
-        for advice in [25, 100, 101, 26, 104] {
+        // MADV_COLLAPSE refuses a VMA with no room for a 2 MiB extent.
+        assert_eq!(f.ret(28, &[AREA, PAGE, 25]), errno(Errno::EINVAL));
+        // Unknown advice is refused.
+        for advice in [26, 104] {
             assert_eq!(
                 f.ret(28, &[AREA, PAGE, advice]),
                 errno(Errno::EINVAL),
                 "{advice}"
             );
         }
+        // The memory failure advice checks the range's arguments, then
+        // CAP_SYS_ADMIN (EPERM) before the address limit or any mapping.
+        let root = f.thread.state.credentials.clone();
+        f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+        for advice in [100, 101] {
+            assert_eq!(f.ret(28, &[AREA + 1, PAGE, advice]), errno(Errno::EINVAL));
+            assert_eq!(f.ret(28, &[AREA, u64::MAX, advice]), errno(Errno::EINVAL));
+            assert_eq!(f.ret(28, &[!4095, 2 * PAGE, advice]), errno(Errno::EINVAL));
+            assert_eq!(f.ret(28, &[AREA, 0, advice]), 0);
+            for addr in [AREA, AREA + 64 * PAGE, 1 << 47] {
+                assert_eq!(f.ret(28, &[addr, PAGE, advice]), errno(Errno::EPERM));
+            }
+        }
+        f.thread.state.credentials = root;
+        let mut byte = [0];
+        f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+        assert_eq!(byte, [7]);
         // MADV_DONTNEED_LOCKED discards.
         assert_eq!(f.ret(28, &[AREA, PAGE, 24]), 0);
         assert_eq!(status(&mut f, AREA), -2);
+    }
+    #[test]
+    fn collapse_takes_written_private_anonymous_memory_an_extent_at_a_time() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        const HUGE: u64 = 2 << 20;
+        const BASE: u64 = 0x4000_0000;
+        // Private anonymous memory, fixed: four extents.
+        assert_eq!(f.ret(mmap, &[BASE, 4 * HUGE, 3, 0x32, u64::MAX, 0]), BASE);
+        // No page of it was written: no anon_vma.
+        assert_eq!(f.ret(28, &[BASE, HUGE, 25]), errno(Errno::EINVAL));
+        f.mem.write(GuestAddr(BASE + HUGE + 5), &[9]).unwrap();
+        // No whole extent in the range: nothing to do.
+        assert_eq!(f.ret(28, &[BASE + PAGE, HUGE, 25]), 0);
+        assert_eq!(f.mem.resident(GuestAddr(BASE + 2 * PAGE)), Some(false));
+        // The second extent has a page table and is collapsed whole; the
+        // first has none (EINVAL), which does not stop the third.
+        f.mem.read(GuestAddr(BASE + 2 * HUGE), &mut [0]).unwrap();
+        assert_eq!(f.ret(28, &[BASE, 3 * HUGE, 25]), errno(Errno::EINVAL));
+        assert_eq!(f.mem.resident(GuestAddr(BASE)), Some(false));
+        for at in [
+            BASE + HUGE,
+            BASE + 2 * HUGE - PAGE,
+            BASE + 2 * HUGE,
+            BASE + 3 * HUGE - PAGE,
+        ] {
+            assert_eq!(f.mem.resident(GuestAddr(at)), Some(true), "{at:#x}");
+        }
+        assert_eq!(memory_bytes(&f, BASE + HUGE + 5, 1), [9]);
+        assert_eq!(f.mem.resident(GuestAddr(BASE + 3 * HUGE)), Some(false));
+        // Both done, again: 0.
+        assert_eq!(f.ret(28, &[BASE + HUGE, 2 * HUGE, 25]), 0);
+        // A poisoned page (an injected memory failure) fails its extent.
+        f.mem
+            .write(GuestAddr(BASE + 3 * HUGE + PAGE), &[1])
+            .unwrap();
+        assert_eq!(
+            inject(&f, BASE + 3 * HUGE + PAGE, PAGE, 100),
+            (Ok(()), Some(BASE + 3 * HUGE + PAGE))
+        );
+        assert_eq!(
+            f.ret(28, &[BASE + 3 * HUGE, HUGE, 25]),
+            errno(Errno::EINVAL)
+        );
+        // A hole after the VMA is ENOMEM once the walk is done.
+        assert_eq!(
+            f.ret(28, &[BASE + HUGE, 4 * HUGE, 25]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(28, &[BASE + 4 * HUGE - PAGE, 2 * PAGE, 25]),
+            errno(Errno::ENOMEM)
+        );
+        // MADV_NOHUGEPAGE refuses its VMA, which it splits off.
+        assert_eq!(f.ret(28, &[BASE, HUGE, 15]), 0);
+        assert_eq!(f.ret(28, &[BASE, PAGE, 25]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(28, &[BASE + HUGE, PAGE, 25]), 0);
+        // Too small a VMA, shared memory and a file's are refused.
+        let small = f.ret(mmap, &[0, HUGE, 3, 0x22, u64::MAX, 0]);
+        f.mem.write(GuestAddr(small), &[1]).unwrap();
+        let aligned = small & (HUGE - 1) == 0;
+        assert_eq!(
+            f.ret(28, &[small, PAGE, 25]),
+            if aligned { 0 } else { errno(Errno::EINVAL) }
+        );
+        let shared = f.ret(mmap, &[0, 2 * HUGE, 3, 0x21, u64::MAX, 0]);
+        f.mem.write(GuestAddr(shared), &[1]).unwrap();
+        assert_eq!(f.ret(28, &[shared, PAGE, 25]), errno(Errno::EINVAL));
+    }
+    #[test]
+    fn collapse_of_a_registered_range_wants_every_page() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        const HUGE: u64 = 2 << 20;
+        const BASE: u64 = 0x4000_0000;
+        assert_eq!(f.ret(mmap, &[BASE, HUGE, 3, 0x32, u64::MAX, 0]), BASE);
+        f.mem.write(GuestAddr(BASE), &[1]).unwrap();
+        let uffd = f.ret(323, &[0]);
+        f.mem.write_u64(GuestAddr(DATA), 0xAA).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), 0).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 16), 0).unwrap();
+        assert_eq!(f.ret(16, &[uffd, 0xC018_AA3F, DATA]), 0);
+        f.mem.write_u64(GuestAddr(DATA), BASE).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), HUGE).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 16), 1).unwrap();
+        assert_eq!(f.ret(16, &[uffd, 0xC020_AA00, DATA]), 0);
+        assert_eq!(f.ret(28, &[BASE, HUGE, 25]), errno(Errno(16)));
+        assert_eq!(f.mem.resident(GuestAddr(BASE + PAGE)), Some(false));
+    }
+    /// `madvise(addr, len, advice)` of the fixture's memory as root, and the
+    /// page whose poisoning would SIGBUS the caller.
+    fn inject(f: &Fixture, addr: u64, len: u64, advice: u64) -> (Result<(), Errno>, Option<u64>) {
+        let mut poisoned = None;
+        let result = syscalls::advise(
+            &f.mem,
+            &f.thread.state.credentials,
+            addr,
+            len,
+            advice,
+            &mut |_, _| {},
+            &mut poisoned,
+        );
+        (result, poisoned)
+    }
+    #[test]
+    fn memory_failure_advice_poisons_or_offlines_with_cap_sys_admin() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        let p = f.ret(mmap, &[0, 4 * PAGE, 3, 0x22, u64::MAX, 0]);
+        f.mem.write(GuestAddr(p), b"a").unwrap();
+        f.mem.write(GuestAddr(p + PAGE), b"b").unwrap();
+        // MADV_SOFT_OFFLINE moves a page: its contents stay. The zero page
+        // is the kernel's (ENOTRECOVERABLE), after the pages before it.
+        assert_eq!(f.ret(28, &[p, 2 * PAGE, 101]), 0);
+        assert_eq!(memory_bytes(&f, p, 1), b"a");
+        assert_eq!(f.ret(28, &[p, 3 * PAGE, 101]), errno(Errno(131)));
+        // MADV_HWPOISON poisons each page; the first is where the caller's
+        // SIGBUS points, and each access faults on it (BUS_MCEERR_AR) until
+        // a discard drops it.
+        assert_eq!(inject(&f, p + 1 - 1, 2 * PAGE - 1, 100), (Ok(()), Some(p)));
+        for at in [p, p + PAGE] {
+            let fault = f.mem.read(GuestAddr(at), &mut [0]).unwrap_err();
+            assert!(fault.poison && fault.bus, "{at:#x}");
+        }
+        // Again: the page cannot be brought in (EHWPOISON).
+        assert_eq!(inject(&f, p, PAGE, 100), (Err(Errno(133)), None));
+        assert_eq!(inject(&f, p, PAGE, 101), (Err(Errno(133)), None));
+        // The zero page is the kernel's (EBUSY); a hole, a page that may not
+        // be read and shared memory's are not poisoned.
+        assert_eq!(inject(&f, p + 2 * PAGE, PAGE, 100), (Err(Errno(16)), None));
+        assert_eq!(
+            inject(&f, p + 4 * PAGE, PAGE, 100),
+            (Err(Errno::EFAULT), None)
+        );
+        let none = f.ret(mmap, &[0, PAGE, 0, 0x22, u64::MAX, 0]);
+        assert_eq!(inject(&f, none, PAGE, 100), (Err(Errno::EFAULT), None));
+        let shared = f.ret(mmap, &[0, PAGE, 3, 0x21, u64::MAX, 0]);
+        f.mem.write(GuestAddr(shared), b"s").unwrap();
+        assert_eq!(inject(&f, shared, PAGE, 100), (Err(Errno::EIO), None));
+        assert_eq!(memory_bytes(&f, shared, 1), b"s");
+        // MADV_DONTNEED drops the poison: zeros again.
+        assert_eq!(f.ret(28, &[p, 2 * PAGE, 4]), 0);
+        assert_eq!(memory_bytes(&f, p + PAGE, 1), b"\0");
+        // The SIGBUS is forced on the caller at once: by default it ends it.
+        f.mem.write(GuestAddr(p + 3 * PAGE), b"c").unwrap();
+        assert_eq!(
+            f.call(28, &[p + 3 * PAGE, PAGE, 100]),
+            Next::Exit(ExitStatus::Signaled(7))
+        );
     }
     #[test]
     fn populate_faults_pages_in_until_one_cannot_be() {

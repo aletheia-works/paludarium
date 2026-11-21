@@ -211,3 +211,44 @@ fn shared_offset_names_the_memory_not_the_address() {
     );
     assert_ne!(Some(memory), inherited.map(|(memory, _)| memory));
 }
+#[test]
+fn collapse_gives_the_parent_its_own_pages_and_leaves_a_forked_child_its_own() {
+    const AT: u64 = 0x4000_0000;
+    const HUGE: u64 = 2 << 20;
+    let mut p = AddressSpace::new();
+    p.map(
+        Some(GuestAddr(AT)),
+        HUGE,
+        Prot::READ_WRITE,
+        MappingKind::Anonymous,
+    )
+    .unwrap();
+    p.write(GuestAddr(AT), &[1]).unwrap();
+    p.write(GuestAddr(AT + PAGE_SIZE), &[2]).unwrap();
+    let c = p.fork();
+    let exclusive = |space: &AddressSpace, at: u64| {
+        space.view().pagemap(at, 1).unwrap()[0] & pagemap::EXCLUSIVE != 0
+    };
+    assert!(!exclusive(&p, AT) && !exclusive(&c, AT));
+    p.collapse(GuestAddr(AT), AT + HUGE).unwrap();
+    // The parent's huge page holds copies of every page; the child keeps
+    // the pages it shared, now its own, and no others.
+    for at in [
+        AT,
+        AT + PAGE_SIZE,
+        AT + 2 * PAGE_SIZE,
+        AT + HUGE - PAGE_SIZE,
+    ] {
+        assert_eq!(p.resident(GuestAddr(at)), Some(true), "{at:#x}");
+        assert!(exclusive(&p, at), "{at:#x}");
+    }
+    assert!(exclusive(&c, AT) && exclusive(&c, AT + PAGE_SIZE));
+    assert_eq!(c.resident(GuestAddr(AT + 2 * PAGE_SIZE)), Some(false));
+    let mut bytes = [0; 2];
+    p.read(GuestAddr(AT), &mut bytes[..1]).unwrap();
+    p.read(GuestAddr(AT + PAGE_SIZE), &mut bytes[1..]).unwrap();
+    assert_eq!(bytes, [1, 2]);
+    c.write(GuestAddr(AT), &[5]).unwrap();
+    p.read(GuestAddr(AT), &mut bytes[..1]).unwrap();
+    assert_eq!(bytes[0], 1);
+}

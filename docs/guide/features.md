@@ -982,7 +982,27 @@ kernel.
   `mremap`, and go with `munmap`. `MADV_GUARD_REMOVE` takes them out,
   leaving pages without contents. Sealed memory whose pages may not be
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
-  which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`). Other
+  which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`).
+  `MADV_COLLAPSE` collapses private anonymous memory as Linux's
+  `madvise_collapse` does, VMA by VMA: a VMA no page of which was written,
+  one with `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent,
+  and shared memory and file mappings refuse it (`EINVAL`), and a range
+  with no whole aligned extent then succeeds. Each whole extent becomes a
+  huge page that holds every page of it, so `mincore` and the resident
+  counts show all 2 MiB, unless no page of it was touched (no page table)
+  or it has a guard, a poison or a uffd-wp marker (`EINVAL`, once the other
+  extents are done), or it lies in a range a `userfaultfd` registered and
+  has an empty page (`EBUSY`, at once). `MADV_HWPOISON` and
+  `MADV_SOFT_OFFLINE` check the range's arguments, then `CAP_SYS_ADMIN`
+  (`EPERM`), before the address limit or any mapping. With it each page in
+  turn is brought in by reading it: `EFAULT` for a page no mapping holds,
+  that may not be read or that cannot be brought in, `EHWPOISON` for a
+  poisoned one. `MADV_SOFT_OFFLINE` then leaves the page as it is, as
+  moving it to another shows nothing, but the zero page gives
+  `ENOTRECOVERABLE`. `MADV_HWPOISON` poisons a private page of the
+  process's own: its contents go, the caller gets SIGBUS (`BUS_MCEERR_AR`,
+  at the first page) at once, and the page is then poisoned as
+  `UFFDIO_POISON` poisons one (below). The zero page gives `EBUSY`. Other
   advice gives `EINVAL`.
 
 - `process_madvise` advises each range of its iovecs in turn, of the caller's
@@ -991,7 +1011,8 @@ kernel.
   bytes of the ranges before the first that fails, or that one's error.
   Another process's memory takes only `MADV_COLD`, `MADV_PAGEOUT`,
   `MADV_WILLNEED` and `MADV_COLLAPSE` (`EINVAL`), with `CAP_SYS_NICE`
-  (`EPERM`), and its ranges need only be mapped (`ENOMEM`). The checks come
+  (`EPERM`), and its ranges need only be mapped (`ENOMEM`), but
+  `MADV_COLLAPSE` collapses them as `madvise` would. The checks come
   in Linux's order: `flags`, the iovecs, the pidfd (`EBADF`, `ESRCH`), the
   caller's right to read the process (`EACCES`), then the advice.
 

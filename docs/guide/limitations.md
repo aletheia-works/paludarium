@@ -504,13 +504,26 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes.
+  - `MADV_COLLAPSE` refuses shmem's and files' mappings (`EINVAL`), which
+    Linux collapses by the rules of shmem and of read-only files, and a
+    collapsed extent stays 512 ordinary pages, so `/proc/<pid>/smaps` shows
+    no `AnonHugePages` for it. Whether an extent has a page table is taken
+    as whether a page of it has an entry or a marker. Linux can also fail a
+    collapse for want of a free huge page (`ENOMEM`) or for a page in use
+    (`EAGAIN`), which never happens here.
+  - With `CAP_SYS_ADMIN`, `MADV_HWPOISON` refuses (`EIO`) a page of a file
+    or of shared memory, which Linux poisons in the page cache, for every
+    mapping and for the file. Of a page `fork` shares it poisons only the
+    caller's entry, where Linux unmaps it from every process. The zero page
+    gives `EBUSY` each time, where Linux marks the machine's zero page
+    poisoned at the first. Nothing of the advice with `CAP_SYS_ADMIN` is
+    differentially tested, as natively it would poison the host's memory.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
-    mapped. It refuses advice Linux does not know before any range
-    (`EINVAL`), as Linux master does; the CI's kernel checks it with each
-    range, so with no ranges, or only empty ones, it gives 0 there.
+    mapped, but for `MADV_COLLAPSE`. It refuses advice Linux does not know
+    before any range (`EINVAL`), as Linux master does; the CI's kernel
+    checks it with each range, so with no ranges, or only empty ones, it
+    gives 0 there.
   - A fatal signal other than SIGKILL marks a process as dying for
     `process_mrelease` as it is sent even when the only thread that does
     not block it already has a signal pending and is not running, or is

@@ -8314,6 +8314,95 @@ static int madvise_advice_case(void) {
     r = advice_errno(madvise(p + 2 * page, page, 24));
     int status = advice_status(p + 2 * page);
     printf("dontneed-locked=%ld status=%d bytes=%d\n", r, status, p[2 * page]);
+    /* MADV_HWPOISON (100) and MADV_SOFT_OFFLINE (101) check the range's
+     * arguments, then CAP_SYS_ADMIN (EPERM), before the address limit or any
+     * mapping. In a child without root's capabilities: with them Linux
+     * would poison the host's own memory. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 83;
+    if (!child) {
+        if (geteuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(90);
+        for (int advice = 100; advice <= 101; advice++) {
+            long unaligned = advice_errno(madvise(p + 1, page, advice));
+            long wraps = advice_errno(syscall(SYS_madvise, p, -1L, advice));
+            long past = advice_errno(syscall(SYS_madvise, -4096L, 2 * page, advice));
+            long empty = advice_errno(madvise(p, 0, advice));
+            long mapped = advice_errno(madvise(p, page, advice));
+            long hole = advice_errno(madvise(gap + page, page, advice));
+            long beyond = advice_errno(syscall(SYS_madvise, 1L << 56, page, advice));
+            printf("memory-failure %d: unaligned=%ld wraps=%ld past=%ld empty=%ld mapped=%ld "
+                   "hole=%ld beyond=%ld byte=%d\n",
+                   advice, unaligned, wraps, past, empty, mapped, hole, beyond, p[3 * page]);
+        }
+        fflush(stdout);
+        _exit(0);
+    }
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child) return 84;
+    printf("memory-failure child=%d\n", WIFEXITED(child_status) ? WEXITSTATUS(child_status) : -1);
+    return 0;
+}
+/* MADV_COLLAPSE (25) of private anonymous memory: refused (EINVAL) by a VMA
+ * no page of which was written, with MADV_NOHUGEPAGE or too small for an
+ * aligned 2 MiB extent; nothing to do for a range with no whole extent;
+ * EINVAL for an extent no page of which was touched (no page table); and
+ * otherwise the extent collapses into a huge page that holds every page of
+ * it, which mincore then shows resident. A hole is ENOMEM once the walk is
+ * done; a userfaultfd-registered range wants every page (EBUSY). */
+static int collapse_resident(char *at) {
+    unsigned char vec[512];
+    if (mincore(at, 2 << 20, vec)) return -errno;
+    int resident = 0;
+    for (int i = 0; i < 512; i++) resident += vec[i] & 1;
+    return resident;
+}
+static int madvise_collapse_case(void) {
+    long page = 4096, huge = 2 << 20;
+    char *map = mmap(NULL, 9 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return 80;
+    /* Four aligned extents, and no mapping right after them. */
+    char *base = (char *)(((unsigned long)map + huge - 1) & ~(huge - 1));
+    char *end = base + 4 * huge;
+    if (base > map) munmap(map, base - map);
+    munmap(end, map + 9 * huge - end);
+    printf("unwritten=%ld\n", advice_errno(madvise(base, huge, 25)));
+    base[huge + 5] = 9;
+    long partial = advice_errno(madvise(base + page, huge, 25));
+    printf("no-whole-extent=%ld resident=%d\n", partial, collapse_resident(base));
+    /* The second extent was written, the third only read. */
+    volatile char sink = base[2 * huge];
+    (void)sink;
+    long three = advice_errno(madvise(base, 3 * huge, 25));
+    printf("three=%ld resident=%d %d %d byte=%d\n", three, collapse_resident(base),
+           collapse_resident(base + huge), collapse_resident(base + 2 * huge), base[huge + 5]);
+    printf("again=%ld\n", advice_errno(madvise(base + huge, 2 * huge, 25)));
+    long hole = advice_errno(madvise(end - page, 2 * page, 25));
+    printf("hole=%ld\n", hole);
+    /* MADV_NOHUGEPAGE refuses the VMA it splits off. */
+    long nohuge = advice_errno(madvise(base + 3 * huge, huge, MADV_NOHUGEPAGE));
+    base[3 * huge] = 1;
+    printf("nohugepage=%ld collapse=%ld\n", nohuge, advice_errno(madvise(base + 3 * huge, huge, 25)));
+    char *small = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (small == MAP_FAILED) return 81;
+    small[0] = 1;
+    printf("small=%ld\n", advice_errno(madvise(small, page, 25)));
+    /* A range a userfaultfd is registered for may have no empty page: the
+     * first extent has a page table now, and 511 empty pages. */
+    base[0] = 1;
+    long uffd = syscall(SYS_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
+    if (uffd < 0) {
+        printf("userfaultfd=%d\n", -errno);
+        return 0;
+    }
+    unsigned long long api[3] = {0xAA, 0, 0};
+    unsigned long long reg[4] = {(unsigned long)base, (unsigned long)huge, 1, 0};
+    if (ioctl((int)uffd, 0xC018AA3F, api) || ioctl((int)uffd, 0xC020AA00, reg)) return 82;
+    long registered = advice_errno(madvise(base, huge, 25));
+    printf("registered=%ld resident=%d\n", registered, collapse_resident(base));
+    close((int)uffd);
     return 0;
 }
 /* The VMAs of [start, end) /proc/self/maps lists. It allocates nothing, so
@@ -33203,6 +33292,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "memfd-secret-memlock")) return memfd_secret_memlock_case();
     if (!strcmp(mode, "mlock-private-copy")) return mlock_private_copy_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
+    if (!strcmp(mode, "madvise-collapse")) return madvise_collapse_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();

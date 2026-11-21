@@ -885,8 +885,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `mremap` でページと一緒に移り、`munmap` でなくなります。`MADV_GUARD_REMOVE` は
   ガードを外し、内容のないページを残します。ページを捨てられない封印したメモリには
   ガードを置けません（`EPERM`）。Linux が `VM_DONTEXPAND` でマップする AIO と
-  `io_uring` のリングは、どちらの指定も受け付けません（`EINVAL`）。ほかの指定には
-  `EINVAL` を返します。
+  `io_uring` のリングは、どちらの指定も受け付けません（`EINVAL`）。
+  `MADV_COLLAPSE` は、Linux の `madvise_collapse` と同じく VMA ごとにプライベートな
+  anonymous メモリをまとめます。どのページも書かれていない VMA、`MADV_NOHUGEPAGE` の
+  VMA、揃った 2 MiB の区間が入らない VMA、共有メモリとファイルのマッピングは断り
+  （`EINVAL`）、そのうえで揃った区間をまるごと含まない範囲は成功します。まるごとの
+  区間はそれぞれ、そのすべてのページを持つ huge page になるので、`mincore` と常駐の
+  数は 2 MiB すべてを示します。ただし、区間のどのページにも触れていない（ページ
+  テーブルがない）か、ガード、毒、uffd-wp のマーカーがあれば `EINVAL`（ほかの区間を
+  済ませてから）、`userfaultfd` が登録した範囲にあって空のページがあれば `EBUSY`
+  （すぐに）です。`MADV_HWPOISON` と `MADV_SOFT_OFFLINE` は、範囲の引数を確かめ、
+  次に `CAP_SYS_ADMIN` を確かめます（`EPERM`）。アドレスの上限やマッピングより先です。
+  `CAP_SYS_ADMIN` があれば、ページを順に読んで持ち込みます。どのマッピングにもない
+  ページ、読めないページ、持ち込めないページは `EFAULT`、毒のあるページは
+  `EHWPOISON` です。`MADV_SOFT_OFFLINE` は、ページをほかのページへ移しても何も
+  見えないのでそのままにしますが、ゼロページには `ENOTRECOVERABLE` を返します。
+  `MADV_HWPOISON` は、プロセス自身のプライベートなページに毒を入れます。内容は
+  なくなり、呼んだ側はすぐに SIGBUS（`BUS_MCEERR_AR`、最初のページ）を受け、その
+  ページは `UFFDIO_POISON` が毒を入れたページと同じになります（下を参照）。ゼロ
+  ページには `EBUSY` を返します。ほかの指定には `EINVAL` を返します。
 
 - `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
   メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
@@ -894,7 +911,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   前の範囲のバイト数で、それがなければその失敗のエラーです。ほかのプロセスのメモリに
   使えるのは `MADV_COLD`、`MADV_PAGEOUT`、`MADV_WILLNEED`、`MADV_COLLAPSE` だけで
   （`EINVAL`）、`CAP_SYS_NICE` が要ります（`EPERM`）。その範囲は、マップされていれば
-  足ります（`ENOMEM`）。確かめる順は Linux と同じで、`flags`、iovec、pidfd（`EBADF`、
+  足ります（`ENOMEM`）が、`MADV_COLLAPSE` は `madvise` と同じくまとめます。確かめる順は Linux と同じで、`flags`、iovec、pidfd（`EBADF`、
   `ESRCH`）、プロセスを読む権利（`EACCES`）、指定の順です。
 
 - `process_mrelease` は、`process_madvise` と同じようにプロセスを探します（`flags` は

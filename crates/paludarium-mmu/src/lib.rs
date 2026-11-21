@@ -6364,6 +6364,177 @@ impl AddressSpaceData {
         self.poisons.contains(page)
     }
 
+    /// `MADV_COLLAPSE` of `[addr, end)`, as Linux's `madvise_walk_vmas`
+    /// calls `madvise_collapse` with each VMA's part of it: the first VMA
+    /// that refuses ends it with its error, and a hole is `ENOMEM` once the
+    /// walk is done ([`Self::collapse_vma`]).
+    pub fn collapse(&mut self, addr: u64, end: u64) -> Result<(), Errno> {
+        let mut at = addr;
+        let mut hole = false;
+        while at < end {
+            let next = self
+                .mapping_at(at)
+                .or_else(|| self.mappings.range(at..).next().map(|(_, m)| m))
+                .map(|m| m.start.0.max(at))
+                .filter(|&start| start < end);
+            let Some(start) = next else {
+                hole = true;
+                break;
+            };
+            hole |= start > at;
+            let Some((vma_start, vma_end)) = self.region_at(start) else {
+                break;
+            };
+            self.collapse_vma(vma_start, vma_end, start, vma_end.min(end))?;
+            at = vma_end;
+        }
+        if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+    }
+
+    /// Linux's `madvise_collapse` of `[start, end)` in the VMA
+    /// `[vma_start, vma_end)`: the VMA must be one that may hold a
+    /// transparent huge page (`thp_vma_allowable_order` with
+    /// `TVA_FORCED_COLLAPSE`, `EINVAL`): private anonymous memory (shmem's
+    /// and files' are refused here, which Linux takes by their own rules),
+    /// without `MADV_NOHUGEPAGE`, with an `anon_vma` (a page of it was
+    /// written, [`Mapping::written`]) and room for an aligned 2 MiB extent.
+    /// Then each whole aligned extent of the range is collapsed
+    /// ([`Self::collapse_extent`]): `EBUSY` ends it at once; the failures
+    /// Linux goes on past (`EINVAL` here) are the result once the others
+    /// are done; a range with no whole extent succeeds.
+    fn collapse_vma(
+        &mut self,
+        vma_start: u64,
+        vma_end: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Errno> {
+        const HUGE: u64 = 2 << 20;
+        let Some(&mapping) = self.mapping_at(vma_start) else {
+            return Err(Errno::EINVAL);
+        };
+        let anonymous = matches!(
+            mapping.kind,
+            MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
+        ) && self.shared_at(vma_start).is_none()
+            && self.backing_at(vma_start).is_none();
+        let room = vma_end >= HUGE && (vma_end - HUGE) & !(HUGE - 1) >= vma_start;
+        let written = self
+            .mappings
+            .range(vma_start..vma_end)
+            .any(|(_, m)| m.written);
+        if !anonymous || mapping.huge_pages == Some(false) || !room || !written {
+            return Err(Errno::EINVAL);
+        }
+        let first = start.next_multiple_of(HUGE);
+        let last = end & !(HUGE - 1);
+        let mut failed = None;
+        let mut extent = first;
+        while extent < last {
+            match self.collapse_extent(extent, extent + HUGE, mapping.userfault.is_some()) {
+                Ok(()) => {}
+                Err(e) if e == Errno::EINVAL => failed = Some(e),
+                Err(e) => return Err(e),
+            }
+            extent += HUGE;
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// One aligned 2 MiB extent of `MADV_COLLAPSE`, as Linux's
+    /// `collapse_single_pmd` scans its page table and collapses it: with no
+    /// page table, which here is no page entry or marker in the extent
+    /// (`SCAN_NO_PTE_TABLE`), a uffd-wp marker or entry (`SCAN_PTE_UFFD`),
+    /// or another marker, a guard or a poison (`SCAN_PTE_NON_PRESENT`), it
+    /// fails with `EINVAL`; in a VMA a `userfaultfd` has registered (`armed`)
+    /// an empty page or the zero page is `EBUSY` (`SCAN_EXCEED_NONE_PTE`, no
+    /// empty entry being allowed there). Otherwise the extent becomes one
+    /// huge page, which holds every page of it: each page gets a frame of its
+    /// own, zeros where it had none, so that `mincore` and the resident
+    /// counts see the 2 MiB a native collapse makes resident. The huge page
+    /// itself is not kept: its 512 pages stay ordinary ones.
+    fn collapse_extent(&mut self, start: u64, end: u64, armed: bool) -> Result<(), Errno> {
+        let directory = self.read_directory();
+        let mut table = false;
+        let mut marker = false;
+        let mut empty = false;
+        let mut page = start;
+        while page < end {
+            if self.uffd_markers.contains(page) {
+                return Err(Errno::EINVAL);
+            }
+            if self.guarded(page) || self.poisoned(page) {
+                table = true;
+                marker = true;
+            } else if let Some(pte) = lookup(&directory, page) {
+                table = true;
+                if pte.uffd_wp {
+                    return Err(Errno::EINVAL);
+                }
+                empty |= pte.frame.get().is_none() && !pte.file && self.shared_at(page).is_none();
+            } else {
+                empty = true;
+            }
+            page += PAGE_SIZE;
+        }
+        drop(directory);
+        if !table {
+            return Err(Errno::EINVAL);
+        }
+        if armed && empty {
+            return Err(Errno(16)); // EBUSY
+        }
+        if marker {
+            return Err(Errno::EINVAL);
+        }
+        let mut page = start;
+        while page < end {
+            let mut byte = [0];
+            if self
+                .read_with(GuestAddr(page), &mut byte, Access::Setup)
+                .is_ok()
+            {
+                let _ = self.write_with(GuestAddr(page), &byte, Access::ForceWrite);
+            }
+            page += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Poisons the page at `page` as Linux's `memory_failure` does a page
+    /// `MADV_HWPOISON` names, once the caller has brought it in by reading
+    /// it (`get_user_pages_fast`): a page of the space's own, private and
+    /// anonymous as `pagemap` counts it, loses its contents and its entry
+    /// to a poison marker, which an access then faults on with SIGBUS
+    /// (`BUS_MCEERR_AR`) until a discard or an unmap drops it. The zero page
+    /// is a kernel page `memory_failure` ignores (`EBUSY`). A file's or
+    /// shared memory's page is refused (`EIO`): Linux poisons the page
+    /// cache's page itself, for every mapping and the file, which the
+    /// emulator does not. Only this space's entry goes, where Linux unmaps
+    /// a page `fork` shares from every space.
+    pub fn hw_poison(&mut self, page: u64) -> Result<(), Errno> {
+        const EBUSY: Errno = Errno(16);
+        let Some(&mapping) = self.mapping_at(page) else {
+            return Err(Errno::EFAULT);
+        };
+        let directory = self.read_directory();
+        let Some(pte) = lookup(&directory, page) else {
+            return Err(EBUSY);
+        };
+        let shared = self.shared_at(page).is_some();
+        if pte.frame.get().is_none() && !pte.file && !shared {
+            return Err(EBUSY);
+        }
+        if shared || pte.cache || (pte.file && !mapping.written) {
+            return Err(Errno::EIO);
+        }
+        drop(directory);
+        self.bump_code_generation();
+        self.clear_populated(page, page + PAGE_SIZE);
+        self.poisons.add(page, page + PAGE_SIZE);
+        Ok(())
+    }
+
     /// Drops the poison of `[addr, addr+len)`, as `MADV_FREE` drops the
     /// poison markers of the private anonymous memory it frees
     /// (`madvise_free_pte_range`).
@@ -7070,6 +7241,11 @@ impl MemoryView {
         protect: bool,
     ) -> Result<(), Errno> {
         self.with_data_mut(|data| data.userfault_fill(start, end, page, bytes, protect))
+            .unwrap_or(Err(Errno(3))) // ESRCH
+    }
+    /// See [`AddressSpaceData::collapse`]; `ESRCH` once the space is gone.
+    pub fn collapse(&self, addr: u64, end: u64) -> Result<(), Errno> {
+        self.with_data_mut(|data| data.collapse(addr, end))
             .unwrap_or(Err(Errno(3))) // ESRCH
     }
     /// See [`AddressSpaceData::userfault_poison`]; `ESRCH` once the space
@@ -7995,6 +8171,14 @@ impl AddressSpace {
     /// See [`AddressSpaceData::discard`].
     pub fn discard_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().discard(addr, len)
+    }
+    /// See [`AddressSpaceData::collapse`].
+    pub fn collapse(&self, addr: GuestAddr, end: u64) -> Result<(), Errno> {
+        self.locked().collapse(addr.0, end)
+    }
+    /// See [`AddressSpaceData::hw_poison`].
+    pub fn hw_poison(&self, addr: GuestAddr) -> Result<(), Errno> {
+        self.locked().hw_poison(addr.page_align_down().0)
     }
     /// See [`AddressSpaceData::clear_poisons`].
     pub fn clear_poisons(&self, addr: GuestAddr, len: u64) {

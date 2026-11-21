@@ -2734,6 +2734,9 @@ const MADV_POPULATE_WRITE: u64 = 23;
 const MADV_DONTNEED_LOCKED: u64 = 24;
 const MADV_COLD: u64 = 20;
 const MADV_PAGEOUT: u64 = 21;
+const MADV_COLLAPSE: u64 = 25;
+const MADV_HWPOISON: u64 = 100;
+const MADV_SOFT_OFFLINE: u64 = 101;
 
 /// `mincore(addr, length, vec)`, as Linux's: each byte of `vec` says whether
 /// its page is in memory, up to the first page that is not mapped, which is
@@ -2972,7 +2975,20 @@ fn sys_set_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (mem, credentials) = (c.mem, c.process.credentials.clone());
     let mut removing = |from, to| crate::userfaultfd::remove(c, from, to);
-    match advise(mem, &credentials, a[0], a[1], a[2], &mut removing) {
+    let mut poisoned = None;
+    let result = advise(
+        mem,
+        &credentials,
+        a[0],
+        a[1],
+        a[2],
+        &mut removing,
+        &mut poisoned,
+    );
+    if let Some(page) = poisoned {
+        signals::queue(c.process, poisoned_sigbus(page));
+    }
+    match result {
         Ok(()) => ok(0),
         Err(e) => err(e),
     }
@@ -2986,14 +3002,17 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// which change only the flags of the VMAs (`/proc/<pid>/smaps` shows
 /// them), as no page here depends on them; the discards `MADV_DONTNEED`,
 /// `MADV_DONTNEED_LOCKED` (which takes locked VMAs too) and `MADV_FREE`;
-/// and `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
-/// dumps look at, `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
-/// `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`
+/// and `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` ([`populate`]); and
+/// the flags `fork` and core dumps look at, `MADV_DONTFORK`, `MADV_DOFORK`,
+/// `MADV_WIPEONFORK`, `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`
 /// ([`AddressSpace::advise_flags`]); and `MADV_REMOVE`, which frees shared
-/// memory as a hole punched in its file ([`remove`]). The others are
-/// rejected rather than ignored, so that a guest relying on one of them
-/// notices. Before a discard drops pages, `removing` is told its range,
-/// for the `userfaultfd` events (`userfaultfd_remove`).
+/// memory as a hole punched in its file ([`remove`]); `MADV_COLLAPSE`,
+/// which collapses private anonymous memory as Linux does, but for the huge
+/// page itself ([`AddressSpace::collapse`]); and `MADV_HWPOISON` and
+/// `MADV_SOFT_OFFLINE` ([`inject_error`]), whose SIGBUS is left in
+/// `poisoned`. The others are rejected rather than ignored, so that a guest
+/// relying on one of them notices. Before a discard drops pages, `removing`
+/// is told its range, for the `userfaultfd` events (`userfaultfd_remove`).
 pub(crate) fn advise(
     mem: &AddressSpace,
     credentials: &credentials::Credentials,
@@ -3001,8 +3020,17 @@ pub(crate) fn advise(
     len: u64,
     advice: u64,
     removing: &mut dyn FnMut(u64, u64),
+    poisoned: &mut Option<u64>,
 ) -> Result<(), Errno> {
-    if !matches!(advice, 0..=4 | 8..=24 | MADV_GUARD_INSTALL | MADV_GUARD_REMOVE) {
+    if !matches!(
+        advice,
+        0..=4
+            | 8..=MADV_COLLAPSE
+            | MADV_HWPOISON
+            | MADV_SOFT_OFFLINE
+            | MADV_GUARD_INSTALL
+            | MADV_GUARD_REMOVE
+    ) {
         return Err(Errno::EINVAL);
     }
     if addr & 4095 != 0 {
@@ -3017,6 +3045,9 @@ pub(crate) fn advise(
     let Some(end) = addr.checked_add(length) else {
         return Err(Errno::EINVAL);
     };
+    if advice == MADV_HWPOISON || advice == MADV_SOFT_OFFLINE {
+        return inject_error(mem, credentials, addr, len, advice, poisoned);
+    }
     if end > USER_ADDRESS_LIMIT {
         return Err(Errno::ENOMEM);
     }
@@ -3050,6 +3081,9 @@ pub(crate) fn advise(
     }
     if advice == MADV_GUARD_REMOVE {
         return mem.guard(GuestAddr(addr), end, false);
+    }
+    if advice == MADV_COLLAPSE {
+        return mem.collapse(GuestAddr(addr), end);
     }
     let flag = match advice {
         0 => Some(paludarium_mmu::FlagAdvice::Read(None)),
@@ -3095,6 +3129,74 @@ pub(crate) fn advise(
         return short_of_locked(mem, addr, end, false, |to| covered(mem, addr, to));
     }
     covered(mem, addr, end)
+}
+
+/// `MADV_HWPOISON` and `MADV_SOFT_OFFLINE` of `[addr, addr+len)`, which
+/// Linux's `do_madvise` hands to `madvise_inject_error` once the range's
+/// arguments are checked, before the address limit or any VMA: without
+/// `CAP_SYS_ADMIN` over the machine they are `EPERM`. With it each page in
+/// turn is brought in by reading it, as `get_user_pages_fast` does: one no
+/// mapping holds, that may not be read, that maps a `memfd_secret` file or
+/// that cannot be brought in is `EFAULT`, a poisoned one `EHWPOISON`,
+/// after the pages before it. `MADV_SOFT_OFFLINE` then moves the page's
+/// contents to another page, which nothing here can tell from staying, but
+/// the zero page is a kernel page Linux master's `soft_offline_page`
+/// refuses (`ENOTRECOVERABLE`). `MADV_HWPOISON` poisons the page as
+/// `memory_failure` does ([`AddressSpace::hw_poison`]), and the first page
+/// poisoned is the address of the SIGBUS (`BUS_MCEERR_AR`) the caller gets
+/// at once, `kill_proc` forcing it on the current task; `poisoned` is
+/// given it.
+fn inject_error(
+    mem: &AddressSpace,
+    credentials: &credentials::Credentials,
+    addr: u64,
+    len: u64,
+    advice: u64,
+    poisoned: &mut Option<u64>,
+) -> Result<(), Errno> {
+    if !credentials.capable(credentials::CAP_SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    // `start + len_in`, which the checks before kept from wrapping.
+    let end = addr + len;
+    let mut page = addr;
+    while page < end {
+        let readable = mem
+            .mappings()
+            .find(|m| m.start.0 <= page && page < m.end())
+            .is_some_and(|m| m.prot.contains(Prot::READ));
+        if !readable || maps_secret(mem, page, page + 4096) {
+            return Err(Errno::EFAULT);
+        }
+        match mem.read(GuestAddr(page), &mut [0]) {
+            // `VM_FAULT_HWPOISON` is `EHWPOISON`.
+            Err(fault) if fault.poison => return Err(Errno(133)),
+            Err(_) => return Err(Errno::EFAULT),
+            Ok(()) => {}
+        }
+        if advice == MADV_SOFT_OFFLINE {
+            if mem.page_state(GuestAddr(page)) == Some(paludarium_mmu::PageState::Zero) {
+                return Err(Errno(131)); // ENOTRECOVERABLE
+            }
+        } else {
+            mem.hw_poison(GuestAddr(page))?;
+            poisoned.get_or_insert(page);
+        }
+        page += 4096;
+    }
+    Ok(())
+}
+
+/// The SIGBUS Linux's `kill_proc` forces on the task whose
+/// `MADV_HWPOISON` poisoned the page at `addr` (`force_sig_mceerr` with
+/// `BUS_MCEERR_AR`), which no mask or `SIG_IGN` keeps back.
+pub(crate) fn poisoned_sigbus(addr: u64) -> signals::PendingSignal {
+    signals::PendingSignal {
+        number: paludarium_types::signal::SIGBUS,
+        code: signals::BUS_MCEERR_AR,
+        addr,
+        ..crate::rseq::forced_sigsegv()
+    }
 }
 
 /// Whether `[addr, end)` is mapped through (`ENOMEM` for a hole).

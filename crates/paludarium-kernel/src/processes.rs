@@ -3980,8 +3980,10 @@ impl Kernel {
     /// process's memory only `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and `MADV_COLLAPSE`
     /// (`EINVAL`), and with `CAP_SYS_NICE` (`EPERM`). Each range is then
     /// advised in turn, as `madvise` would advise the caller's memory
-    /// ([`crate::syscalls::advise`]); another process's only needs to be
-    /// mapped (`ENOMEM`), as the four only hint at how pages will be used.
+    /// ([`crate::syscalls::advise`]); another process's is collapsed by
+    /// `MADV_COLLAPSE` ([`paludarium_mmu::MemoryView::collapse`]) and
+    /// otherwise only needs to be mapped (`ENOMEM`), as the other three only
+    /// hint at how pages will be used.
     /// The bytes of the ranges before the first that fails are the result,
     /// or its error when there are none.
     fn process_madvise(
@@ -4059,6 +4061,15 @@ impl Kernel {
                 } else {
                     match &target {
                         None => self.advise_own(thread, mem, start, len, advice as u64),
+                        // MADV_COLLAPSE collapses the other process's memory.
+                        Some(memory) if advice == 25 => {
+                            let end = start.saturating_add(len.next_multiple_of(4096));
+                            if end > paludarium_types::USER_ADDRESS_LIMIT {
+                                Err(Errno::ENOMEM)
+                            } else {
+                                memory.collapse(start, end)
+                            }
+                        }
                         Some(memory) => Self::mapped_whole(memory, start, len),
                     }
                 };
@@ -4096,7 +4107,20 @@ impl Kernel {
             processes: &self.processes,
         };
         let mut removing = |from, to| crate::userfaultfd::remove(&mut c, from, to);
-        crate::syscalls::advise(mem, &credentials, start, len, advice, &mut removing)
+        let mut poisoned = None;
+        let result = crate::syscalls::advise(
+            mem,
+            &credentials,
+            start,
+            len,
+            advice,
+            &mut removing,
+            &mut poisoned,
+        );
+        if let Some(page) = poisoned {
+            crate::signals::queue(c.process, crate::syscalls::poisoned_sigbus(page));
+        }
+        result
     }
     /// `process_mrelease(pidfd, flags)`, as Linux master's: `flags` must be
     /// 0 (`EINVAL`); then the task, `PIDFD_SELF_THREAD` or

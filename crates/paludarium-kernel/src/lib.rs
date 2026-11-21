@@ -66,6 +66,8 @@ mod process_vm;
 mod processes;
 mod ptrace;
 mod pty;
+#[cfg(test)]
+mod pty_tests;
 mod record_locks;
 mod rseq;
 mod scheduling;

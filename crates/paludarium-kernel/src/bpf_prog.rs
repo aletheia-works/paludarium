@@ -925,6 +925,7 @@ mod tests {
             assert_eq!(unix_linear(len), linear, "{len} bytes");
         }
     }
+
     #[test]
     fn the_known_flags_are_linuxs() {
         assert_eq!(flag::KNOWN, 0x1_00ff);

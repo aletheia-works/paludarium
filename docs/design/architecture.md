@@ -133,10 +133,10 @@ out:
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
   registers and memory, `pxor` and `xorps` of xmm registers, and `movd` and
   `movq` between xmm registers and general ones;
-- `pshufd`, the `punpckl` and `punpckh` unpacks, `packuswb`, `packsswb`,
-  `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`, `pmuludq`, `pand`, `por` and
-  `pandn` of xmm registers, `pslld` and `psrld` of one by an immediate, and
-  `pmovmskb`;
+- `pshufd`, `pshuflw`, `pshufhw`, the `punpckl` and `punpckh` unpacks,
+  `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`,
+  `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` and `pcmpeqd` of xmm
+  registers, `pslld` and `psrld` of one by an immediate, and `pmovmskb`;
 - `movsb`, `movsw`, `movsd` and `movsq`, with `rep` or without, of 64-bit
   addresses;
 - `cmpxchg` (with `lock` or without) and `xchg` between memory and a register,

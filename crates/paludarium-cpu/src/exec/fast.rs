@@ -351,9 +351,10 @@ pub enum Fast {
     },
     /// `punpckl` or `punpckh` of bytes, words, dwords or quadwords,
     /// `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`,
-    /// `psubq`, `pmuludq`, `pand`, `por` or `pandn` of xmm register `src`
-    /// into `dst`, `pshufd` of `src` into `dst` by `imm`, or `pslld` or `psrld`
-    /// of `dst` by `imm` (`src` is `dst`), as [`crate::sse::packed`] has
+    /// `psubq`, `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` or
+    /// `pcmpeqd` of xmm register `src` into `dst`, `pshufd`, `pshuflw` or
+    /// `pshufhw` of `src` into `dst` by `imm`, or `pslld` or `psrld` of
+    /// `dst` by `imm` (`src` is `dst`), as [`crate::sse::packed`] has
     /// them.
     XmmPacked {
         op: Mnemonic,
@@ -624,7 +625,10 @@ impl Fast {
             };
             return Some(Self::Imul { dst, a, b });
         }
-        if i.mnemonic == Mnemonic::Pshufd {
+        if matches!(
+            i.mnemonic,
+            Mnemonic::Pshufd | Mnemonic::Pshuflw | Mnemonic::Pshufhw
+        ) {
             let Some(Operand::Immediate(imm)) = i.operand(2) else {
                 return None;
             };
@@ -657,7 +661,10 @@ impl Fast {
             | Mnemonic::Pmuludq
             | Mnemonic::Pand
             | Mnemonic::Por
-            | Mnemonic::Pandn => Self::XmmPacked {
+            | Mnemonic::Pandn
+            | Mnemonic::Pcmpeqb
+            | Mnemonic::Pcmpeqw
+            | Mnemonic::Pcmpeqd => Self::XmmPacked {
                 op: i.mnemonic,
                 dst: xmm(a)?,
                 src: xmm(b)?,

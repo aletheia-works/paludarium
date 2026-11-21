@@ -623,6 +623,43 @@ impl Emitter<'_, '_> {
         self.b.ins().ushr_imm_s(t, 56)
     }
 
+    /// The four 16-bit lanes of `v`, lane `n` taken from the lane that
+    /// bits `2n` and `2n + 1` of `imm` name.
+    fn shuffle_words(&mut self, v: Value, imm: u8) -> Value {
+        let mut out = self.constant(0);
+        for n in 0..4 {
+            let k = i64::from((imm >> (n * 2)) & 3);
+            let lane = self.b.ins().ushr_imm_s(v, k * 16);
+            let lane = self.b.ins().band_imm_s(lane, 0xffff);
+            let lane = self.b.ins().ishl_imm_s(lane, i64::from(n) * 16);
+            out = self.b.ins().bor(out, lane);
+        }
+        out
+    }
+
+    /// Each `bits`-wide lane of `a` and `b`: all ones where they are
+    /// equal, 0 where they differ.
+    fn equal_lanes(&mut self, a: Value, b: Value, bits: u32) -> Value {
+        // A lane of `a ^ b` is 0 only where they are equal. Its top bit is
+        // set when the lane is not 0: from the lane itself, or from the
+        // carry of adding all ones but the top bit to its lower bits.
+        let lane = u64::MAX >> (64 - bits);
+        // Bit 0 of every lane, then the top bit and the lower bits.
+        let ones = u64::MAX / lane;
+        let top = ones << (bits - 1);
+        let low = ones * (lane >> 1);
+        let x = self.b.ins().bxor(a, b);
+        let t = self.b.ins().band_imm_s(x, low as i64);
+        let t = self.b.ins().iadd_imm_s(t, low as i64);
+        let t = self.b.ins().bor(t, x);
+        // The top bit of each equal lane, moved down to its bottom bit.
+        let t = self.b.ins().bnot(t);
+        let t = self.b.ins().band_imm_s(t, top as i64);
+        let t = self.b.ins().ushr_imm_s(t, i64::from(bits - 1));
+        // Times all ones of a lane, which cannot carry into the next.
+        self.b.ins().imul_imm_s(t, lane as i64)
+    }
+
     /// The two words of xmm register `n`.
     fn xmm_words(&mut self, n: u8) -> (Value, Value) {
         let w = XMM + 2 * usize::from(n & 15);
@@ -745,6 +782,19 @@ impl Emitter<'_, '_> {
                 let low = self.b.ins().bor(dwords[0], up);
                 let up = self.b.ins().ishl_imm_s(dwords[3], 32);
                 (low, self.b.ins().bor(dwords[2], up))
+            }
+            Mnemonic::Pshuflw => (self.shuffle_words(b0, imm), b1),
+            Mnemonic::Pshufhw => (b0, self.shuffle_words(b1, imm)),
+            Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd => {
+                let bits = match op {
+                    Mnemonic::Pcmpeqb => 8,
+                    Mnemonic::Pcmpeqw => 16,
+                    _ => 32,
+                };
+                (
+                    self.equal_lanes(a0, b0, bits),
+                    self.equal_lanes(a1, b1, bits),
+                )
             }
             Mnemonic::Pslld | Mnemonic::Psrld => {
                 if imm >= 32 {

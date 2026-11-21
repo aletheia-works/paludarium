@@ -35,6 +35,20 @@
    SOCK_SEQPACKET pair, not at all for a stream socket, and before a
    datagram socket
    connected elsewhere refuses the sender (EPERM).
+   bpf-prog-corpus: 400 programs from a seeded generator, near the edges
+   of what the verifier takes: registers read before they are written,
+   the stack and a map's value read and written at their bounds, a
+   lookup's result used before and after its null check, pointers moved by
+   constants, the context's fields, helpers' arguments, 32-bit and signed
+   arithmetic and jumps. For each, the load's result and the log's reason,
+   and for one loaded whose run depends only on its input, what it keeps of
+   a datagram and leaves in its maps. The generator tracks what both
+   kernels know of each register on every path, so that the emulator's
+   verifier, which knows less of a number than Linux's, decides as both
+   kernels do: it compares a register only where both know its value or
+   neither knows anything of it, and moves a pointer only by a number both
+   know. The rule this guards is that the emulator accepts no program
+   Linux refuses.
 
    Each program refused is wrong in one way only, which both kernels the
    tests know (Linux 7.0, the CI machines', and master) find first, with
@@ -677,6 +691,688 @@ static int case_attach(void) {
     return 0;
 }
 
+/* bpf-prog-corpus: programs made by a seeded generator. */
+
+/* What both kernels know of a register on every path to an instruction,
+   as the generator tracks it. */
+enum kind {
+    UNINIT,   /* not written on some path */
+    EXACT,    /* a value both know */
+    FRESH,    /* a 64-bit value neither knows anything of, not yet compared */
+    SCALAR,   /* a number Linux may know more of than the emulator */
+    CTX,      /* the context, at off */
+    FP,       /* the stack, at off from the frame pointer */
+    VALUE,    /* a map's value, at off */
+    NULLABLE, /* a lookup's result not yet checked; off is its ID */
+    MAPPTR,   /* a map */
+    ANY,      /* any of these */
+};
+struct reg {
+    uint8_t kind;
+    uint8_t has; /* whether off (or v) is known */
+    int64_t v;   /* EXACT's value, or a pointer's offset */
+};
+struct gstate {
+    int live;
+    struct reg r[11];
+    uint8_t init[512]; /* the stack's bytes written on every path, fp-512 first */
+    struct reg slot[64]; /* what an 8-byte slot holds, filled as a whole */
+};
+
+#define MAXINSNS 96
+#define MAXACTIONS 14
+static struct gen {
+    uint64_t seed;
+    struct insn p[MAXINSNS];
+    int n;
+    int nondet; /* whether running it gives what only the kernel decides */
+    int hash, array;
+    int ids;
+    struct gstate cur, pending[MAXACTIONS + 2];
+    int start[MAXACTIONS + 2];
+    struct { int at, to; } jumps[MAXACTIONS * 2];
+    int njumps;
+} g;
+
+static uint32_t rnd(uint32_t n) {
+    g.seed ^= g.seed << 13;
+    g.seed ^= g.seed >> 7;
+    g.seed ^= g.seed << 17;
+    return n ? (uint32_t)(g.seed % n) : 0;
+}
+static int chance(int percent) { return (int)rnd(100) < percent; }
+
+static int scalarish(const struct reg *r) { return r->kind == EXACT || r->kind == FRESH || r->kind == SCALAR; }
+static int pointer(const struct reg *r) {
+    return r->kind == CTX || r->kind == FP || r->kind == VALUE || r->kind == NULLABLE || r->kind == MAPPTR;
+}
+
+static struct reg mk(uint8_t kind, int has, int64_t v) { return (struct reg){kind, (uint8_t)has, v}; }
+
+static struct reg merge_reg(struct reg a, struct reg b) {
+    if (a.kind == b.kind && a.has == b.has && (!a.has || a.v == b.v)) return a;
+    if (a.kind == UNINIT || b.kind == UNINIT) return mk(UNINIT, 0, 0);
+    if (scalarish(&a) && scalarish(&b)) return mk(SCALAR, 0, 0);
+    if (a.kind == b.kind && a.kind != NULLABLE) return mk(a.kind, 0, 0);
+    return mk(ANY, 0, 0);
+}
+
+static void merge_into(struct gstate *into, const struct gstate *from) {
+    if (!from->live) return;
+    if (!into->live) {
+        *into = *from;
+        return;
+    }
+    for (int i = 0; i < 11; i++) into->r[i] = merge_reg(into->r[i], from->r[i]);
+    for (int i = 0; i < 512; i++) into->init[i] &= from->init[i];
+    for (int i = 0; i < 64; i++) into->slot[i] = merge_reg(into->slot[i], from->slot[i]);
+}
+
+#define EMIT(...) emit((struct insn)__VA_ARGS__)
+static void emit(struct insn i) {
+    if (g.n < MAXINSNS) g.p[g.n++] = i;
+}
+static void emit2(struct insn a, struct insn b) {
+    EMIT(a);
+    EMIT(b);
+}
+
+static int reg_pick(void) { return (int)rnd(10); }
+/* A register to read: mostly one written on every path. */
+static int read_pick(void) {
+    int found[10], n = 0;
+    for (int i = 0; i < 10; i++)
+        if (g.cur.r[i].kind != UNINIT && g.cur.r[i].kind != ANY) found[n++] = i;
+    return n && chance(92) ? found[rnd((uint32_t)n)] : reg_pick();
+}
+
+/* A number to compute with: mostly one in a register already, else one
+   moved there first. */
+static void emit(struct insn i);
+static int scalar_pick(void) {
+    int found[10], n = 0;
+    for (int i = 0; i < 10; i++)
+        if (scalarish(&g.cur.r[i])) found[n++] = i;
+    if (!chance(88)) return read_pick();
+    if (n && chance(80)) return found[rnd((uint32_t)n)];
+    int r = (int)rnd(10);
+    int32_t v = (int32_t)rnd(64) - 8;
+    emit((struct insn)MOV(r, v));
+    g.cur.r[r] = mk(EXACT, 1, v);
+    return r;
+}
+
+/* A register of a kind, if one has it, else -1. */
+static int find(uint8_t kind) {
+    int found[11], n = 0;
+    for (int i = 0; i < 10; i++)
+        if (g.cur.r[i].kind == kind) found[n++] = i;
+    return n ? found[rnd((uint32_t)n)] : -1;
+}
+
+static const int32_t edges[] = {0, 1, -1, 2, 3, 7, 8, 16, 31, 32, 63, 64, 255, 0x7fffffff,
+                                INT32_MIN, -8, -512, 0x10000, 100};
+static int32_t edge(void) {
+    if (chance(15)) return (int32_t)(rnd(0xffffffff) - 0x80000000u);
+    return edges[rnd(COUNT(edges))];
+}
+
+/* The stack's bytes [off, off + size) from the frame pointer, if all are
+   in it. */
+static int stack_range(int64_t off, int size, int *lo) {
+    if (off < -512 || off + size > 0) return 0;
+    *lo = (int)(off + 512);
+    return 1;
+}
+static void stack_written(int64_t off, int size) {
+    int lo;
+    if (!stack_range(off, size, &lo)) return;
+    for (int i = 0; i < size; i++) g.cur.init[lo + i] = 1;
+    for (int s = lo / 8; s <= (lo + size - 1) / 8; s++) g.cur.slot[s] = mk(ANY, 0, 0);
+}
+static int stack_known(int64_t off, int size) {
+    int lo;
+    if (!stack_range(off, size, &lo)) return 1; /* refused anyway */
+    for (int i = 0; i < size; i++)
+        if (!g.cur.init[lo + i]) return 0;
+    return 1;
+}
+
+/* The value of op on known values, as both kernels compute it, or 0 when
+   the emulator does not know it (scalar_math). */
+static int fold(uint8_t op, int wide, uint64_t a, uint64_t b, uint64_t *out) {
+    unsigned bits = wide ? 64 : 32;
+    if ((op == 0x60 || op == 0x70 || op == 0xc0) && b >= bits) return 0;
+    if (!wide) {
+        uint32_t x = (uint32_t)a, y = (uint32_t)b, r;
+        switch (op) {
+        case 0x00: r = x + y; break;
+        case 0x10: r = x - y; break;
+        case 0x20: r = x * y; break;
+        case 0x40: r = x | y; break;
+        case 0x50: r = x & y; break;
+        case 0x60: r = x << y; break;
+        case 0x70: r = x >> y; break;
+        case 0xa0: r = x ^ y; break;
+        case 0xc0: r = (uint32_t)((int32_t)x >> y); break;
+        default: return 0;
+        }
+        *out = r;
+        return 1;
+    }
+    switch (op) {
+    case 0x00: *out = a + b; break;
+    case 0x10: *out = a - b; break;
+    case 0x20: *out = a * b; break;
+    case 0x40: *out = a | b; break;
+    case 0x50: *out = a & b; break;
+    case 0x60: *out = a << b; break;
+    case 0x70: *out = a >> b; break;
+    case 0xa0: *out = a ^ b; break;
+    case 0xc0: *out = (uint64_t)((int64_t)a >> b); break;
+    default: return 0;
+    }
+    return 1;
+}
+
+static const uint8_t alu_ops[] = {0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
+                                  0x90, 0xa0, 0xc0, 0x80, 0xd0};
+
+/* An ALU instruction with an immediate. */
+static void alu_imm(void) {
+    int dst = scalar_pick();
+    int wide = chance(70);
+    uint8_t op = alu_ops[rnd(COUNT(alu_ops))];
+    int32_t imm = edge();
+    int16_t off = 0;
+    if ((op == 0x30 || op == 0x90) && chance(30)) off = 1; /* sdiv, smod */
+    if (op == 0x80 && chance(95)) imm = 0;                 /* neg has none */
+    if ((op == 0x60 || op == 0x70 || op == 0xc0) && chance(85)) imm = (int32_t)rnd(wide ? 64 : 32);
+    if (op == 0xd0) {                                      /* bswap or to_le/to_be */
+        static const int32_t widths[] = {16, 32, 64, 8};
+        imm = widths[rnd(4)];
+        wide = chance(40);
+    }
+    uint8_t code = (uint8_t)((wide ? 0x07 : 0x04) | op);
+    if (op == 0xd0 && !wide && chance(50)) code |= 0x08; /* to_be */
+    EMIT(I(code, dst, 0, off, imm));
+    struct reg *d = &g.cur.r[dst];
+    uint64_t v;
+    if (d->kind == EXACT && op != 0x80 && op != 0xd0 && fold(op, wide, (uint64_t)d->v, wide ? (uint64_t)(int64_t)imm : (uint32_t)imm, &v))
+        *d = mk(EXACT, 1, (int64_t)v);
+    else if (d->kind == EXACT && op == 0x80)
+        *d = mk(EXACT, 1, wide ? -(int64_t)d->v : (int64_t)(uint32_t)-(uint32_t)d->v);
+    else if (scalarish(d))
+        *d = mk(SCALAR, 0, 0);
+    else if ((d->kind == CTX || d->kind == FP || d->kind == VALUE) && wide && (op == 0x00 || op == 0x10))
+        *d = mk(d->kind, d->has, d->v + (op == 0x00 ? imm : -(int64_t)imm));
+    else {
+        if (d->kind != UNINIT) g.nondet = 1;
+        *d = mk(ANY, 0, 0);
+    }
+}
+
+/* An ALU instruction of two registers, which never adds a number the
+   kernels may know differently to a pointer. */
+static void alu_reg(void) {
+    int dst = scalar_pick(), src = chance(5) ? 10 : scalar_pick();
+    int wide = chance(75);
+    uint8_t op = alu_ops[rnd(COUNT(alu_ops) - 2)]; /* not neg or end */
+    if (chance(20)) op = 0xb0;                      /* mov */
+    struct reg *d = &g.cur.r[dst], s = g.cur.r[src];
+    int16_t off = 0;
+    if (op == 0xb0) {
+        if (chance(15)) off = (int16_t)(8 << rnd(3)); /* movsx 8, 16, 32 */
+        EMIT(I((uint8_t)((wide ? 0x0f : 0x0c) | op), dst, src, off, 0));
+        if (s.kind == UNINIT) {
+            *d = mk(UNINIT, 0, 0);
+            return;
+        }
+        if (wide && !off) {
+            if (s.kind == FRESH) s = mk(SCALAR, 0, 0);
+            if (src != 10 && g.cur.r[src].kind == FRESH) g.cur.r[src] = s;
+            *d = s;
+        } else if (s.kind == EXACT && !off) {
+            *d = mk(EXACT, 1, (int64_t)(uint32_t)s.v);
+        } else {
+            if (!scalarish(&s)) g.nondet = 1;
+            *d = mk(SCALAR, 0, 0);
+        }
+        return;
+    }
+    /* Two numbers, two pointers, or anything with a number both know:
+       never a pointer, or what may be one, with another number. */
+    int ok = (scalarish(d) && scalarish(&s)) || (pointer(d) && pointer(&s)) || d->kind == EXACT ||
+             s.kind == EXACT || d->kind == UNINIT || s.kind == UNINIT;
+    if (!ok) {
+        alu_imm();
+        return;
+    }
+    if ((op == 0x30 || op == 0x90) && chance(30)) off = 1;
+    EMIT(I((uint8_t)((wide ? 0x0f : 0x0c) | op), dst, src, off, 0));
+    uint64_t v;
+    if (d->kind == UNINIT || s.kind == UNINIT) {
+        *d = mk(ANY, 0, 0);
+    } else if (d->kind == EXACT && s.kind == EXACT) {
+        *d = fold(op, wide, (uint64_t)d->v, (uint64_t)s.v, &v) ? mk(EXACT, 1, (int64_t)v) : mk(SCALAR, 0, 0);
+    } else if (scalarish(d) && scalarish(&s)) {
+        *d = mk(SCALAR, 0, 0);
+    } else if (wide && op == 0x00 && (s.kind == EXACT) && (d->kind == CTX || d->kind == FP || d->kind == VALUE)) {
+        *d = mk(d->kind, d->has, d->v + s.v);
+    } else if (wide && op == 0x00 && d->kind == EXACT && (s.kind == CTX || s.kind == FP || s.kind == VALUE)) {
+        *d = mk(s.kind, s.has, s.v + d->v);
+    } else if (wide && op == 0x10 && s.kind == EXACT && (d->kind == CTX || d->kind == FP || d->kind == VALUE)) {
+        *d = mk(d->kind, d->has, d->v - s.v);
+    } else {
+        g.nondet = 1;
+        *d = mk(ANY, 0, 0);
+    }
+}
+
+/* The base of a load or store, and an offset near an edge of what it
+   points to. */
+static int base(int16_t *off, int size) {
+    int b;
+    switch (rnd(8)) {
+    case 0: case 1: case 2:
+        b = 10;
+        break;
+    case 3: case 4:
+        b = find(VALUE);
+        break;
+    case 5:
+        b = find(CTX);
+        break;
+    case 6:
+        b = find(FP);
+        break;
+    default:
+        b = read_pick();
+        break;
+    }
+    if (b < 0) b = 10;
+    struct reg r = g.cur.r[b];
+    int64_t at = r.has ? r.v : 0;
+    int64_t want;
+    switch (r.kind) {
+    case FP: {
+        static const int16_t near[] = {-8, -16, -4, -1, -512, -513, -504, 0, -2, -24};
+        want = chance(85) ? -8 * (int64_t)(1 + rnd(8)) + (int64_t)rnd(8 / size) * size
+                          : near[rnd(COUNT(near))];
+        break;
+    }
+    case VALUE: {
+        static const int16_t near[] = {0, 8, 15, 16, -1, 4, 12, 9};
+        want = chance(80) ? (int64_t)rnd(16 / size) * size : near[rnd(COUNT(near))];
+        break;
+    }
+    case CTX: {
+        static const int16_t near[] = {0, 0, 48, 52, 64, 68, 44, 2, 1, 76, 80, 4, 8, 72, 160, 192};
+        want = chance(70) ? (chance(40) ? 0 : 48 + 4 * (int64_t)rnd(5)) : near[rnd(COUNT(near))];
+        break;
+    }
+    default:
+        want = (int64_t)rnd(16) - 8;
+        break;
+    }
+    *off = (int16_t)(want - at);
+    return b;
+}
+
+static const uint8_t sizes[] = {0x18, 0x00, 0x08, 0x10}; /* dw, w, h, b */
+static int size_bytes(uint8_t s) { return s == 0x18 ? 8 : s == 0x00 ? 4 : s == 0x08 ? 2 : 1; }
+
+static void store(void) {
+    uint8_t sz = sizes[rnd(4)];
+    int size = size_bytes(sz);
+    int16_t off;
+    int b = base(&off, size);
+    struct reg r = g.cur.r[b];
+    int imm = chance(30), src = size == 8 ? read_pick() : scalar_pick();
+    if (imm)
+        EMIT(I((uint8_t)(0x62 | sz), b, 0, off, edge()));
+    else
+        EMIT(I((uint8_t)(0x63 | sz), b, src, off, 0));
+    struct reg s = imm ? mk(EXACT, 0, 0) : g.cur.r[src];
+    if (r.kind == FP && r.has) {
+        int64_t at = r.v + off;
+        int lo;
+        int spill = !imm && size == 8 && stack_range(at, 8, &lo) && lo % 8 == 0;
+        stack_written(at, size);
+        if (spill) g.cur.slot[lo / 8] = s.kind == FRESH ? mk(SCALAR, 0, 0) : s;
+        else if (!imm && !scalarish(&s)) g.nondet = 1;
+    } else {
+        if (!imm && !scalarish(&s)) g.nondet = 1;
+        /* It may have written any of the stack's slots. */
+        if (r.kind == FP || r.kind == ANY)
+            for (int i = 0; i < 64; i++) g.cur.slot[i] = mk(ANY, 0, 0);
+    }
+}
+
+static void load_mem(void) {
+    uint8_t sz = sizes[rnd(4)];
+    int size = size_bytes(sz);
+    int16_t off;
+    int b = base(&off, size);
+    int dst = reg_pick();
+    int sx = sz != 0x18 && chance(10);
+    struct reg r = g.cur.r[b];
+    EMIT(I((uint8_t)((sx ? 0x81 : 0x61) | sz), dst, b, off, 0));
+    struct reg got = mk(ANY, 0, 0);
+    if (r.kind == FP && r.has) {
+        int64_t at = r.v + off;
+        int lo;
+        if (!stack_known(at, size)) g.nondet = 1;
+        if (size == 8 && stack_range(at, 8, &lo) && lo % 8 == 0 && g.cur.init[lo]) got = g.cur.slot[lo / 8];
+        if (got.kind == EXACT) got = mk(SCALAR, 0, 0);
+    } else if (r.kind == VALUE) {
+        got = mk(size == 8 && !sx ? FRESH : SCALAR, 0, 0);
+    } else if (r.kind == CTX && r.has) {
+        int64_t at = r.v + off;
+        if (!(at == 0 && size == 4) && !(at >= 48 && at + size <= 68)) g.nondet = 1;
+        got = mk(SCALAR, 0, 0);
+    } else {
+        g.nondet = 1;
+    }
+    if (got.kind == ANY || !scalarish(&got)) {
+        if (!pointer(&got)) got = mk(ANY, 0, 0);
+    }
+    g.cur.r[dst] = got;
+}
+
+static void clobber(void) {
+    for (int i = 1; i <= 5; i++) g.cur.r[i] = mk(UNINIT, 0, 0);
+}
+
+/* R2 = the frame pointer at off, or an edge in its place. */
+static void stack_arg(int reg, int64_t off) {
+    EMIT(MOV_REG(reg, 10));
+    EMIT(ADD(reg, (int32_t)off));
+}
+
+static void call(void) {
+    switch (rnd(6)) {
+    case 0: { /* no arguments */
+        static const int32_t ids[] = {5, 7, 8, 14, 15};
+        int32_t id = ids[rnd(COUNT(ids))];
+        EMIT(CALL(id));
+        clobber();
+        g.cur.r[0] = mk(id == 5 || id == 7 ? FRESH : SCALAR, 0, 0);
+        g.nondet = 1; /* the time, a random number, the processor, the task */
+        break;
+    }
+    case 1: case 2: { /* lookup in the hash */
+        int64_t key = chance(85) ? -4 : (chance(50) ? -2 : 0);
+        if (chance(80)) {
+            EMIT(ST_W(10, -4, (int32_t)rnd(3)));
+            stack_written(-4, 4);
+        }
+        if (!stack_known(key, 4)) g.nondet = 1;
+        emit2((struct insn)I(0x18, 1, 1, 0, chance(95) ? g.hash : 77), (struct insn)I(0, 0, 0, 0, 0));
+        stack_arg(2, key);
+        EMIT(CALL(LOOKUP));
+        clobber();
+        g.cur.r[0] = mk(NULLABLE, 1, ++g.ids);
+        break;
+    }
+    case 3: { /* update or delete in the hash */
+        int del = chance(30);
+        EMIT(ST_W(10, -4, (int32_t)rnd(3)));
+        stack_written(-4, 4);
+        int64_t value = chance(80) ? -24 : (chance(50) ? -8 : -20);
+        int v = find(VALUE);
+        if (!del && v >= 0 && chance(30)) {
+            EMIT(MOV_REG(3, v));
+        } else if (!del) {
+            if (!stack_known(value, 16)) g.nondet = 1;
+            stack_arg(3, value);
+        }
+        emit2((struct insn)I(0x18, 1, 1, 0, g.hash), (struct insn)I(0, 0, 0, 0, 0));
+        stack_arg(2, -4);
+        if (!del) EMIT(MOV(4, (int32_t)rnd(4)));
+        EMIT(CALL(del ? DELETE : UPDATE));
+        clobber();
+        g.cur.r[0] = mk(SCALAR, 0, 0);
+        break;
+    }
+    case 4: { /* bpf_skb_load_bytes, from the context in R6 or R1 */
+        static const int32_t offs[] = {0, 1, 60, 63, 64, -1, 0x7fffffff, 8};
+        static const int32_t lens[] = {1, 4, 8, 16, 0, -1, 64, 3};
+        static const int16_t to[] = {-8, -16, -64, -4, -12, 0, -520};
+        int ctx = g.cur.r[6].kind == CTX && chance(90) ? 6 : 1;
+        if (ctx != 1) EMIT(MOV_REG(1, ctx));
+        if (g.cur.r[1].kind != CTX && ctx == 1) g.nondet = 1;
+        int32_t len = lens[rnd(COUNT(lens))];
+        int16_t at = to[rnd(COUNT(to))];
+        EMIT(MOV(2, offs[rnd(COUNT(offs))]));
+        stack_arg(3, at);
+        EMIT(MOV(4, len));
+        EMIT(CALL(LOAD_BYTES));
+        clobber();
+        if (len > 0) stack_written(at, len);
+        g.cur.r[0] = mk(SCALAR, 0, 0);
+        break;
+    }
+    default: { /* a value of the array by its address */
+        int dst = 6 + (int)rnd(4);
+        int32_t off = chance(85) ? 0 : (chance(50) ? 8 : 16);
+        emit2((struct insn)I(0x18, dst, 2, 0, g.array), (struct insn)I(0, 0, 0, 0, off));
+        g.cur.r[dst] = mk(VALUE, 1, off);
+        break;
+    }
+    }
+}
+
+static const uint8_t jmp_ops[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0xa0, 0xb0, 0xc0, 0xd0};
+
+/* A jump to a later action, recorded to be aimed when it starts. */
+static void jump(int action, int actions) {
+    int to = action + 1 + (int)rnd((uint32_t)(actions - action));
+    if (chance(3)) to = actions + 1; /* past the end */
+    int wide = chance(75);
+    uint8_t op = jmp_ops[rnd(COUNT(jmp_ops))];
+    int a = read_pick(), b = -1;
+    int32_t imm = 0;
+    struct reg *ra = &g.cur.r[a];
+    int nullcheck = 0;
+    int n = find(NULLABLE);
+    if (chance(3)) {
+        op = 0x00; /* ja */
+    } else if (n >= 0 && chance(60)) {
+        a = n;
+        ra = &g.cur.r[a];
+        op = chance(50) ? 0x10 : 0x50; /* jeq, jne */
+        wide = 1;
+        imm = 0;
+        nullcheck = 1;
+    } else if (ra->kind == EXACT) {
+        if (chance(50)) {
+            imm = edge();
+        } else {
+            b = find(EXACT);
+            if (b < 0) imm = edge();
+        }
+    } else if (ra->kind == FRESH) {
+        static const int32_t safe[] = {1, 5, 100, -5};
+        int f = find(FRESH);
+        if (f >= 0 && f != a && chance(30)) b = f;
+        else imm = safe[rnd(COUNT(safe))];
+    } else if (ra->kind == UNINIT && chance(30)) {
+        imm = 1; /* refused: not readable */
+    } else {
+        alu_imm(); /* no comparison both kernels decide alike */
+        return;
+    }
+    int at = g.n;
+    if (op == 0x00)
+        EMIT(I(0x05, 0, 0, 0, 0));
+    else
+        EMIT(I((uint8_t)((wide ? 0x05 : 0x06) | op | (b >= 0 ? 0x08 : 0)), a, b >= 0 ? b : 0, 0, imm));
+    if (g.njumps < (int)COUNT(g.jumps)) g.jumps[g.njumps++] = (typeof(g.jumps[0])){at, to};
+    struct gstate other = g.cur;
+    if (op != 0x00) {
+        if (nullcheck) {
+            int64_t id = ra->v;
+            for (int i = 0; i < 10; i++) {
+                if (g.cur.r[i].kind != NULLABLE || g.cur.r[i].v != id) continue;
+                /* jeq: the target has it null; jne: the next instruction. */
+                struct reg value = mk(VALUE, 1, 0), null = mk(SCALAR, 0, 0);
+                other.r[i] = op == 0x10 ? null : value;
+                g.cur.r[i] = op == 0x10 ? value : null;
+            }
+        } else {
+            for (int i = 0; i < 2; i++) {
+                int r = i ? b : a;
+                if (r < 0 || g.cur.r[r].kind != FRESH) continue;
+                g.cur.r[r] = mk(SCALAR, 0, 0);
+                other.r[r] = mk(SCALAR, 0, 0);
+            }
+        }
+    } else {
+        g.cur.live = 0;
+    }
+    if (to <= actions) merge_into(&g.pending[to], &other);
+}
+
+/* One program, written to g.p. */
+static void generate(void) {
+    g.n = 0;
+    g.nondet = 0;
+    g.njumps = 0;
+    g.ids = 0;
+    memset(&g.cur, 0, sizeof g.cur);
+    memset(g.pending, 0, sizeof g.pending);
+    g.cur.live = 1;
+    for (int i = 0; i < 11; i++) g.cur.r[i] = mk(UNINIT, 0, 0);
+    for (int i = 0; i < 64; i++) g.cur.slot[i] = mk(ANY, 0, 0);
+    g.cur.r[1] = mk(CTX, 1, 0);
+    g.cur.r[10] = mk(FP, 1, 0);
+    if (chance(85)) {
+        EMIT(MOV_REG(6, 1));
+        g.cur.r[6] = g.cur.r[1];
+    }
+    if (chance(60)) {
+        emit2((struct insn)I(0x18, 7, 2, 0, g.array), (struct insn)I(0, 0, 0, 0, 0));
+        g.cur.r[7] = mk(VALUE, 1, 0);
+    }
+    int actions = 1 + (int)rnd(8);
+    for (int k = 0; k <= actions; k++) {
+        g.start[k] = g.n;
+        if (g.pending[k].live) merge_into(&g.cur, &g.pending[k]);
+        if (!g.cur.live) { /* unreachable code, which both refuse */
+            g.cur.live = 1;
+        }
+        if (k == actions) break;
+        switch (rnd(12)) {
+        case 0: case 1:
+            alu_imm();
+            break;
+        case 2: case 3:
+            alu_reg();
+            break;
+        case 4:
+            EMIT(MOV(reg_pick(), edge()));
+            {
+                int d = g.p[g.n - 1].regs & 15;
+                g.cur.r[d] = mk(EXACT, 1, g.p[g.n - 1].imm);
+            }
+            break;
+        case 5: case 6:
+            store();
+            break;
+        case 7: case 8:
+            load_mem();
+            break;
+        case 9: case 10:
+            call();
+            break;
+        default:
+            jump(k, actions);
+            break;
+        }
+    }
+    /* The end: a result to keep in the array's value, R0, the exit. */
+    g.start[actions + 1] = -1;
+    if (g.cur.r[7].kind == VALUE && g.cur.r[7].has && g.cur.r[7].v == 0 && chance(70)) {
+        int s = read_pick();
+        if (!scalarish(&g.cur.r[s])) g.nondet = 1;
+        EMIT(STX_DW(7, s, 8));
+    }
+    if (g.cur.r[0].kind == UNINIT ? chance(95) : chance(50)) {
+        static const int32_t results[] = {0, 1, 3, 8, 64, -1, 17};
+        EMIT(MOV(0, results[rnd(COUNT(results))]));
+    } else if (!scalarish(&g.cur.r[0])) {
+        g.nondet = 1;
+    }
+    if (chance(99)) EMIT(EXIT());
+    for (int j = 0; j < g.njumps; j++) {
+        int target = g.jumps[j].to <= actions ? g.start[g.jumps[j].to] : g.n;
+        g.p[g.jumps[j].at].off = (int16_t)(target - g.jumps[j].at - 1);
+    }
+}
+
+/* Runs a program on a datagram of 64 bytes and says what it kept and what
+   it left in the maps. */
+static void filter_run(int prog) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return;
+    int err = attach(pair[1], prog);
+    if (err) {
+        say("  attach %d", err);
+    } else {
+        unsigned char out[64], in[64];
+        for (size_t i = 0; i < sizeof out; i++) out[i] = (unsigned char)(i * 7 + 3);
+        long sent = send(pair[0], out, sizeof out, MSG_DONTWAIT);
+        long got = recv(pair[1], in, sizeof in, MSG_DONTWAIT);
+        printf("  sent %ld received %ld", sent < 0 ? -errno : sent, got < 0 ? -errno : got);
+        for (int m = 0; m < 2; m++) {
+            uint32_t key = 0;
+            uint8_t value[16] = {0};
+            uint64_t a[16] = {(uint32_t)(m ? g.hash : g.array), (uintptr_t)&key, (uintptr_t)value};
+            long r = bpf(1, a, sizeof a);
+            printf(" %s", m ? "hash" : "array");
+            if (r < 0) printf(" %ld", r);
+            else
+                for (int i = 0; i < 16; i++) printf("%s%02x", i % 8 ? "" : " ", value[i]);
+        }
+        putchar('\n');
+        fflush(stdout);
+    }
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static int case_corpus(void) {
+    g.seed = 0x9e3779b97f4a7c15ull;
+    for (int k = 0; k < 400; k++) {
+        g.array = map(2, 4, 16, 1, 0);
+        g.hash = map(1, 4, 16, 4, 0);
+        uint32_t key = 0;
+        uint8_t value[16];
+        for (int i = 0; i < 16; i++) value[i] = (uint8_t)(0x10 + i);
+        uint64_t u[16] = {(uint32_t)g.hash, (uintptr_t)&key, (uintptr_t)value, 0};
+        if (g.array < 0 || g.hash < 0 || bpf(2, u, sizeof u)) return 1;
+        generate();
+        memset(log_text, 0, sizeof log_text);
+        struct prog_attr p = attr(g.p, (unsigned)g.n);
+        long fd = bpf(PROG_LOAD, &p, sizeof p);
+        if (fd < 0) {
+            say("corpus %d: %ld", k, fd);
+            reason();
+        } else if (g.nondet) {
+            say("corpus %d: loaded, not run", k);
+            close((int)fd);
+        } else {
+            say("corpus %d: loaded", k);
+            filter_run((int)fd);
+            close((int)fd);
+        }
+        close(g.array);
+        close(g.hash);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -684,5 +1380,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-maps")) return case_maps();
     if (!strcmp(mode, "bpf-prog-context")) return case_context();
     if (!strcmp(mode, "bpf-prog-attach")) return case_attach();
+    if (!strcmp(mode, "bpf-prog-corpus")) return case_corpus();
     return 2;
 }

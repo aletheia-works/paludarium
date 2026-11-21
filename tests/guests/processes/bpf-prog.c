@@ -47,8 +47,10 @@
    verifier, which knows less of a number than Linux's, decides as both
    kernels do: it compares a register only where both know its value or
    neither knows anything of it, and moves a pointer only by a number both
-   know. The rule this guards is that the emulator accepts no program
-   Linux refuses.
+   know. It writes no instruction with reserved fields set: master refuses
+   one before it walks any path (check_alu_fields), and 7.0 only when a
+   path reaches it, so the two may give another error first. The rule this
+   guards is that the emulator accepts no program Linux refuses.
 
    Each program refused is wrong in one way only, which both kernels the
    tests know (Linux 7.0, the CI machines', and master) find first, with
@@ -886,11 +888,11 @@ static void alu_imm(void) {
     int32_t imm = edge();
     int16_t off = 0;
     if ((op == 0x30 || op == 0x90) && chance(30)) off = 1; /* sdiv, smod */
-    if (op == 0x80 && chance(95)) imm = 0;                 /* neg has none */
+    if (op == 0x80) imm = 0; /* neg has none */
     if ((op == 0x60 || op == 0x70 || op == 0xc0) && chance(85)) imm = (int32_t)rnd(wide ? 64 : 32);
     if (op == 0xd0) {                                      /* bswap or to_le/to_be */
-        static const int32_t widths[] = {16, 32, 64, 8};
-        imm = widths[rnd(4)];
+        static const int32_t widths[] = {16, 32, 64};
+        imm = widths[rnd(3)];
         wide = chance(40);
     }
     uint8_t code = (uint8_t)((wide ? 0x07 : 0x04) | op);
@@ -922,7 +924,7 @@ static void alu_reg(void) {
     struct reg *d = &g.cur.r[dst], s = g.cur.r[src];
     int16_t off = 0;
     if (op == 0xb0) {
-        if (chance(15)) off = (int16_t)(8 << rnd(3)); /* movsx 8, 16, 32 */
+        if (chance(15)) off = (int16_t)(8 << rnd(wide ? 3 : 2)); /* movsx 8, 16 (, 32) */
         EMIT(I((uint8_t)((wide ? 0x0f : 0x0c) | op), dst, src, off, 0));
         if (s.kind == UNINIT) {
             *d = mk(UNINIT, 0, 0);

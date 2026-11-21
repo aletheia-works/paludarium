@@ -394,7 +394,10 @@ verified.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for
-  unwinding. It has
+  unwinding. It checks every instruction's fields (the "uses reserved
+  fields" errors) before it walks any path, in master's order; Linux 7.0
+  checks them only when a path reaches the instruction, so for a program
+  wrong in more than one way it may give another error first. It has
   only a privileged loader's rules (pointers may leak, the stack may be
   read before it is written, no Spectre sanitizing), so a loader without
   `CAP_PERFMON` gets `EPERM` once the type is known. With no BTF objects

@@ -818,6 +818,7 @@ mod linux {
         processes_proc_own_files => ("proc-own-files","process"),
         processes_proc_other_files => ("proc-other-files","process"),
         processes_page_faults => ("page-faults","process"),
+        processes_proc_stat_counts => ("proc-stat-counts","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),
         processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),

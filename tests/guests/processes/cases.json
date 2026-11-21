@@ -274,6 +274,7 @@
     {"name":"proc-own-files","binary":"process"},
     {"name":"proc-other-files","binary":"process"},
     {"name":"page-faults","binary":"process"},
+    {"name":"proc-stat-counts","binary":"process"},
     {"name":"script-exec","binary":"process"},
     {"name":"capabilities","binary":"process"},
     {"name":"file-capabilities","binary":"process"},

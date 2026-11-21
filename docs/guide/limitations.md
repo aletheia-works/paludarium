@@ -122,9 +122,7 @@ verified.
   `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
   Linux has the stop's signal until the tracer's wait, and a process whose
   leader ended with `exit` before the last of its threads shows the last
-  thread's status, where Linux shows the leader's. In `stat`, page faults,
-  resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
-  `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
+  thread's status, where Linux shows the leader's. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's thread is `S (sleeping)` in every wait, where Linux
   shows some waits it cannot interrupt as `D (disk sleep)`. A thread shows another process
@@ -272,7 +270,7 @@ verified.
   last thread to exit, where Linux counts them to the thread that dumps.
   `process_vm_readv`, `process_vm_writev`, `MADV_POPULATE_READ` and
   `MADV_POPULATE_WRITE` count their faults in `perf`'s `page-faults` too,
-  where Linux's `get_user_pages` gives no `perf` event. `/proc/<pid>/stat`'s fault counts are 0.
+  where Linux's `get_user_pages` gives no `perf` event.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
   are hardware events even on a host with a PMU. A thread's CPU time, page

@@ -3397,6 +3397,8 @@ impl Kernel {
         self.group
             .aio()
             .new_process(group.aio(), child_mem.as_deref(), group.numa());
+        // `copy_process` notes when the child was made (`start_boottime`).
+        group.set_started(pid, self.host.clock(ClockId::Monotonic).unwrap_or(0));
         group.register(pid, inbox.clone());
         // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
         // parent is given first if it has none.

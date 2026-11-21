@@ -7144,6 +7144,173 @@ static int page_faults_case(const char *self) {
     _exit(0);
 }
 
+/* The proc-stat-counts case: /proc/<pid>/stat's minflt and cminflt are
+   the faults getrusage counts (fs/proc/array.c do_task_stat: the process's
+   and its ended threads', the thread's own under task/, the reaped
+   children's), rss the pages its memory holds, and starttime when the task
+   was made, in clock ticks since boot, which an execve keeps. Only what
+   Linux guarantees is shown: counts grow and bound each other, and a
+   start time is between the parent's and the time it is read. */
+static long ps_field(const char *path, int n) {
+    char text[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t got = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (got <= 0) return -1;
+    text[got] = 0;
+    char *at = strrchr(text, ')');
+    if (!at) return -1;
+    at += 2; /* field 3, the state */
+    for (int i = 3; i < n; i++) {
+        at = strchr(at, ' ');
+        if (!at) return -1;
+        at++;
+    }
+    return atol(at);
+}
+/* /proc/uptime in clock ticks. */
+static long ps_uptime(void) {
+    char text[64];
+    int fd = open("/proc/uptime", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t got = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (got <= 0) return -1;
+    text[got] = 0;
+    return (long)(strtod(text, NULL) * 100);
+}
+/* Whether `start` is at most `now` and within 30 s of it (0 is a start
+   in the first tick since boot, as paludarium's is the emulator's start). */
+static int ps_recent(long start, long now) {
+    return start >= 0 && now >= 0 && start <= now && now - start <= 3000;
+}
+static long ps_process_start;
+static void *ps_thread(void *unused) {
+    (void)unused;
+    pf_touch(64);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)syscall(SYS_gettid));
+    long own = pf_get(RUSAGE_THREAD);
+    long task = ps_field(path, 10);
+    long whole = ps_field("/proc/self/stat", 10);
+    long start = ps_field(path, 22);
+    printf("thread: at-least-64=%d at-least-rusage=%d within-process=%d start-after-process=%d "
+           "start-recent=%d\n",
+           task >= 64, task >= own, task <= whole, start >= ps_process_start,
+           ps_recent(start, ps_uptime()));
+    return NULL;
+}
+/* A thread other than the leader runs execve: it takes the leader's ID and
+   start time (fs/exec.c de_thread) and keeps its own faults. */
+static const char *ps_self;
+static void *ps_exec_thread(void *unused) {
+    (void)unused;
+    pf_touch(64);
+    char path[64], own[24], leader[24], start[24];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)syscall(SYS_gettid));
+    snprintf(own, sizeof own, "%ld", ps_field(path, 10));
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)getpid());
+    snprintf(leader, sizeof leader, "%ld", ps_field(path, 10));
+    snprintf(start, sizeof start, "%ld", ps_field("/proc/self/stat", 22));
+    char *arguments[] = {(char *)ps_self, "proc-stat-thread-exec", own, leader, start, NULL};
+    execv(ps_self, arguments);
+    _exit(71);
+}
+static int proc_stat_thread_exec(const char *own, const char *leader, const char *start) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)getpid());
+    long now = ps_field(path, 10);
+    printf("after thread exec: own-kept=%d not-leaders=%d start-is-leaders=%d\n", now >= atol(own),
+           now < atol(leader), ps_field("/proc/self/stat", 22) == atol(start));
+    return 0;
+}
+static int proc_stat_exec(const char *start, const char *faults) {
+    printf("after exec: start-kept=%d minflt-kept=%d\n",
+           ps_field("/proc/self/stat", 22) == atol(start),
+           ps_field("/proc/self/stat", 10) >= atol(faults));
+    return 0;
+}
+static int proc_stat_counts_case(const char *self) {
+    fflush(stdout);
+    pid_t measuring = fork();
+    if (measuring != 0) {
+        int status;
+        waitpid(measuring, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    printf("children at first: %ld\n", ps_field("/proc/self/stat", 11));
+    ps_process_start = ps_field("/proc/self/stat", 22);
+    printf("start: recent=%d\n", ps_recent(ps_process_start, ps_uptime()));
+
+    long rusage = pf_get(RUSAGE_SELF);
+    long before = ps_field("/proc/self/stat", 10);
+    long rss = ps_field("/proc/self/stat", 24);
+    char *kept = mmap(NULL, (size_t)(64 * page), PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (kept == MAP_FAILED) return 2;
+    for (long i = 0; i < 64; i++) kept[i * page] = 1;
+    long after = ps_field("/proc/self/stat", 10);
+    long grown = ps_field("/proc/self/stat", 24);
+    printf("touched: at-least-rusage=%d at-least-64=%d rss-was=%d rss-grew-64=%d\n", before >= rusage,
+           after - before >= 64, rss > 0, grown - rss >= 64);
+    munmap(kept, (size_t)(64 * page));
+    printf("unmapped: rss-fell=%d\n", ps_field("/proc/self/stat", 24) < grown);
+
+    pthread_t thread;
+    fflush(stdout);
+    if (pthread_create(&thread, NULL, ps_thread, NULL)) return 3;
+    pthread_join(thread, NULL);
+    long whole = ps_field("/proc/self/stat", 10);
+    printf("after thread: kept-its-faults=%d\n", whole - after >= 64);
+
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        long start = ps_field("/proc/self/stat", 22);
+        printf("child: start-after-parent=%d start-recent=%d\n", start >= ps_process_start,
+               ps_recent(start, ps_uptime()));
+        pf_touch(64);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    long children = ps_field("/proc/self/stat", 11);
+    printf("reaped: cminflt-is-rusage=%d at-least-64=%d\n", children == pf_get(RUSAGE_CHILDREN),
+           children >= 64);
+
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        char start[24], faults[24];
+        snprintf(start, sizeof start, "%ld", ps_field("/proc/self/stat", 22));
+        snprintf(faults, sizeof faults, "%ld", ps_field("/proc/self/stat", 10));
+        char *arguments[] = {(char *)self, "proc-stat-exec", start, faults, NULL};
+        execv(self, arguments);
+        _exit(71);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("exec child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    /* The leader faults far more than the thread that runs execve. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        pf_touch(4096);
+        ps_self = self;
+        pthread_t execing;
+        if (pthread_create(&execing, NULL, ps_exec_thread, NULL)) _exit(72);
+        pthread_join(execing, NULL);
+        _exit(73);
+    }
+    waitpid(child, &status, 0);
+    printf("thread exec child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    fflush(stdout);
+    _exit(0);
+}
+
 /* The fault-around case: a read fault in a file's mapping maps up to 16
    pages around it that the page cache holds (mm/memory.c do_fault_around,
    mm/filemap.c filemap_map_pages): within an aligned block of 16, the VMA,
@@ -33717,6 +33884,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "sigsuspend-stop")) return sigsuspend_stop_case();
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "page-faults-exec")) return argc < 3 ? 98 : page_faults_exec(argv[2]);
+    if (!strcmp(mode, "proc-stat-counts")) return proc_stat_counts_case(self);
+    if (!strcmp(mode, "proc-stat-exec")) return argc < 4 ? 98 : proc_stat_exec(argv[2], argv[3]);
+    if (!strcmp(mode, "proc-stat-thread-exec"))
+        return argc < 5 ? 98 : proc_stat_thread_exec(argv[2], argv[3], argv[4]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

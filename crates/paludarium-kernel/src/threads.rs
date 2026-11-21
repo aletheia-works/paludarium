@@ -25,6 +25,11 @@ pub struct ThreadGroup {
     /// stays after it exits, as its zombie task does, until the process is
     /// reaped.
     nice: Mutex<BTreeMap<u32, i32>>,
+    /// When each thread was made, on the monotonic clock (Linux's
+    /// `start_boottime`, as this host never suspends), kept as its nice
+    /// value is; the leader's stays for the thread that ends its `execve`,
+    /// as Linux's `de_thread` gives it the leader's.
+    started: Mutex<BTreeMap<u32, u64>>,
     /// Each thread's scheduling attributes and I/O priority, kept as its
     /// nice value is; one without has the defaults.
     sched: Mutex<BTreeMap<u32, crate::scheduling::Sched>>,
@@ -229,6 +234,7 @@ impl Default for ThreadGroup {
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
             nice: Mutex::default(),
+            started: Mutex::default(),
             sched: Mutex::default(),
             affinity: Mutex::default(),
             affinity_changes: std::sync::atomic::AtomicU64::new(0),
@@ -551,6 +557,30 @@ impl ThreadGroup {
         // values, so only the PID's value is kept.
         nice.retain(|&tid, _| tid == pid);
         drop(nice);
+        let mut started = self.started.lock().unwrap_or_else(PoisonError::into_inner);
+        let own = started.remove(&old_tid);
+        if let Some(at) = own {
+            started.entry(pid).or_insert(at);
+        }
+        started.retain(|&tid, _| tid == pid);
+        drop(started);
+        // Its counts, which Linux's `de_thread` leaves with the thread as it
+        // takes the leader's ID: those the old leader kept stay the
+        // process's (`signal->min_flt` and the CPU time) under no thread's.
+        if old_tid != pid {
+            for (owner, _) in self
+                .cpu
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter_mut()
+            {
+                if *owner == pid {
+                    *owner = 0;
+                } else if *owner == old_tid {
+                    *owner = pid;
+                }
+            }
+        }
         let mut sched = self.sched.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(value) = sched.remove(&old_tid) {
             sched.insert(pid, value);
@@ -1174,6 +1204,24 @@ impl ThreadGroup {
             .get(&tid)
             .copied()
     }
+    /// Notes that thread `tid` was made at `at` nanoseconds of the
+    /// monotonic clock, unless it was noted already.
+    pub(crate) fn set_started(&self, tid: u32, at: u64) {
+        self.started
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(tid)
+            .or_insert(at);
+    }
+    /// When thread `tid` was made ([`Self::set_started`]), if it is a live
+    /// thread or the leader of an unreaped process.
+    pub(crate) fn started(&self, tid: u32) -> Option<u64> {
+        self.started
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .copied()
+    }
     /// The NUMA memory policies ([`crate::mempolicy`]).
     pub(crate) fn numa(&self) -> &crate::mempolicy::Numa {
         &self.numa
@@ -1486,6 +1534,10 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
+        self.started
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid);
         self.sched
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1574,6 +1626,17 @@ impl ThreadGroup {
             .iter()
             .map(|(_, used)| used.minor_faults())
             .fold(0u64, u64::saturating_add)
+    }
+    /// The minor faults of thread `tid` as of its latest account, live or
+    /// not (Linux's `task->min_flt`), 0 before its first.
+    pub(crate) fn thread_faults(&self, tid: u32) -> u64 {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|(owner, _)| *owner == tid)
+            .map_or(0, |(_, used)| used.minor_faults())
     }
     /// The minor faults of its reaped children and theirs
     /// (`RUSAGE_CHILDREN`).
@@ -2499,6 +2562,13 @@ impl Kernel {
         }
         // And its memory policy.
         self.group.numa().new_thread(parent.tid, tid);
+        // And when it was made (`start_boottime`).
+        self.group.set_started(
+            tid,
+            self.host
+                .clock(paludarium_host::ClockId::Monotonic)
+                .unwrap_or(0),
+        );
         self.group.register(tid, inbox);
         // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
         // creator is given first if it has none.
@@ -2995,6 +3065,31 @@ mod fault_count_tests {
         group.reaped_faults(5);
         assert_eq!(group.children_faults(), 12);
         assert_eq!(group.waited_faults(), 22);
+    }
+
+    #[test]
+    fn a_thread_counts_its_own_faults_and_keeps_when_it_was_made() {
+        let group = ThreadGroup::default();
+        let first = Arc::new(crate::Usage::default());
+        first.faults.store(3, SeqCst);
+        let second = Arc::new(crate::Usage::default());
+        second.faults.store(4, SeqCst);
+        group.register_cpu(1, first);
+        group.register_cpu(2, second);
+        assert_eq!(group.thread_faults(1), 3);
+        assert_eq!(group.thread_faults(2), 4);
+        assert_eq!(group.thread_faults(3), 0);
+        group.set_started(1, 100);
+        group.set_started(2, 200);
+        // Noted once, at the clone, not again at the first account.
+        group.set_started(2, 300);
+        assert_eq!((group.started(1), group.started(2)), (Some(100), Some(200)));
+        // Thread 2's `execve` gives it the leader's ID and start, and it
+        // keeps its own faults; the process's count keeps the old leader's.
+        group.end_exec(2, 1, Arc::default());
+        assert_eq!((group.started(1), group.started(2)), (Some(100), None));
+        assert_eq!((group.thread_faults(1), group.thread_faults(2)), (4, 0));
+        assert_eq!(group.process_faults(), 7);
     }
 
     #[test]

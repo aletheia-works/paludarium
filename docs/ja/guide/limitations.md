@@ -107,8 +107,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   スレッドが ptrace で止まっている間は 0 です（Linux ではトレーサーの wait までその停止の
   シグナルです）。また、リーダーが `exit` でほかのスレッドより先に終わったプロセスは、
   Linux ではリーダーのステータスを示すところ、最後のスレッドのステータスを示します。
-  `stat` のページフォールト、常駐メモリ、開始時刻は 0 なので、`ps` の `RSS` は出ず、`STIME` と `START` は
-  `/proc/stat` の起動時刻です。`/proc/stat` は CPU 時間、割り込み、コンテキストスイッチを
+  `/proc/stat` は CPU 時間、割り込み、コンテキストスイッチを
   数えず、割り込みの番号ごとの数も並べません。
   スレッドの `stat` の CPU 時間はプロセスのものです。ほかのプロセスのスレッドは、どの待ちでも
   `S (sleeping)` です。Linux は割り込めない待ちの一部を `D (disk sleep)` と見せます。スレッドが
@@ -238,7 +237,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   コアダンプのフォールトは最後に終了するスレッドに数えます。Linux はダンプするスレッドに
   数えます。`process_vm_readv`、`process_vm_writev`、`MADV_POPULATE_READ`、
   `MADV_POPULATE_WRITE` は、フォールトを `perf` の `page-faults` にも数えます。Linux の
-  `get_user_pages` は `perf` のイベントにしません。`/proc/<pid>/stat` のフォールトの数は 0 です。
+  `get_user_pages` は `perf` のイベントにしません。
 - **perf のイベントの一部**：数えるのはソフトウェアのイベントだけです。cgroup の切り替え、
   トレースポイント、ブレークポイント、kprobe、uprobe は `ENOENT` で、ハードウェアの
   イベントも、PMU のあるホストでも `ENOENT` です。スレッドの CPU 時間、ページフォルト、

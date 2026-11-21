@@ -507,6 +507,15 @@ pub(crate) struct ProcessStat<'a> {
     /// Process and waited-for children's CPU time, in nanoseconds.
     pub cpu: u64,
     pub children_cpu: u64,
+    /// `min_flt` and `cmin_flt`: the minor faults of the process (or of
+    /// the thread, for a path under `task`) and of its reaped children.
+    /// None is major, so `maj_flt` and `cmaj_flt` are 0.
+    pub minor_faults: u64,
+    pub children_minor_faults: u64,
+    /// When the task was made, in nanoseconds since boot (`start_time`).
+    pub started: u64,
+    /// The pages its memory holds (`get_mm_rss`).
+    pub resident: u64,
     pub nice: i32,
     pub threads: usize,
     /// The total size of the mappings, in bytes.
@@ -535,9 +544,8 @@ pub(crate) struct ProcessStat<'a> {
     pub exit_code: i32,
 }
 /// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, and
-/// 0 for what nothing measures (page faults, resident memory, start time
-/// and the scheduler's figures). A reader that may not see the task's
-/// memory gets 1 for `start_code` and `end_code` and 0 for `start_stack`,
+/// 0 for what nothing measures (major faults and the scheduler's figures).
+/// A reader that may not see the task's memory gets 1 for `start_code` and `end_code` and 0 for `start_stack`,
 /// `wchan`, the addresses from `start_data` on and `exit_code`, as Linux
 /// hides them; without memory the addresses are all 0.
 pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
@@ -561,10 +569,10 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         // PF_RANDOMIZE, as for a process that address space randomization
         // applies to.
         "4194304".into(),
-        "0".into(),
-        "0".into(),
-        "0".into(),
-        "0".into(),
+        s.minor_faults.to_string(),
+        s.children_minor_faults.to_string(),
+        "0".into(), // maj_flt
+        "0".into(), // cmaj_flt
         ticks(s.cpu).to_string(),
         "0".into(),
         ticks(s.children_cpu).to_string(),
@@ -573,9 +581,9 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         s.nice.to_string(),
         s.threads.to_string(),
         "0".into(), // itrealvalue
-        "0".into(), // starttime
+        ticks(s.started).to_string(),
         s.virtual_size.to_string(),
-        "0".into(), // rss
+        s.resident.to_string(),
         s.rss_limit.to_string(),
         code(s.code.0).to_string(),
         code(s.code.1).to_string(),
@@ -2525,6 +2533,10 @@ mod generated_tests {
             terminal: (0, -1),
             cpu: 1_230_000_000,
             children_cpu: 20_000_000,
+            minor_faults: 70,
+            children_minor_faults: 9,
+            started: 4_560_000_000,
+            resident: 3,
             nice: 3,
             threads: 2,
             virtual_size: 8192,
@@ -2551,10 +2563,14 @@ mod generated_tests {
         let rest = &line[line.rfind(')').unwrap() + 2..];
         let fields: Vec<&str> = rest.split_whitespace().collect();
         assert_eq!(fields.len() + 2, 52);
+        // minflt, cminflt, majflt and cmajflt.
+        assert_eq!(&fields[7..11], ["70", "9", "0", "0"]);
         // utime and cutime in USER_HZ ticks; priority, nice, threads.
         assert_eq!(fields[11], "123");
         assert_eq!(fields[13], "2");
         assert_eq!(&fields[15..18], ["23", "3", "2"]);
+        // starttime in ticks, vsize, rss in pages.
+        assert_eq!(&fields[19..22], ["456", "8192", "3"]);
         assert_eq!(fields[22], "18446744073709551615");
         assert_eq!(&fields[23..25], ["4198400", "4217532"]);
         assert_eq!(&fields[28..32], ["0", "512", "2048", "1"]);
@@ -2577,6 +2593,10 @@ mod generated_tests {
                 terminal: (0, -1),
                 cpu: 0,
                 children_cpu: 0,
+                minor_faults: 0,
+                children_minor_faults: 0,
+                started: 0,
+                resident: 0,
                 nice: 0,
                 threads: 1,
                 virtual_size: 8192,

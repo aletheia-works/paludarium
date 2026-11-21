@@ -347,6 +347,19 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
         terminal: crate::pty::stat_fields(task.view.terminal.as_deref()),
         cpu: task.view.group.process_cpu(),
         children_cpu: task.view.children_cpu,
+        // As `do_task_stat`: the process's, its ended threads' too, or for
+        // a path under `task` the thread's own.
+        minor_faults: if task.thread {
+            task.view.group.thread_faults(task.tid)
+        } else {
+            task.view.group.process_faults()
+        },
+        children_minor_faults: task.view.group.children_faults(),
+        started: task.view.group.started(task.tid).unwrap_or(0),
+        resident: task
+            .memory()
+            .and_then(paludarium_mmu::MemoryView::resident_pages)
+            .map_or(0, |(_, now)| now),
         nice: task.view.group.nice(task.tid).unwrap_or(0),
         threads,
         virtual_size,

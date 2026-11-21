@@ -271,6 +271,11 @@ pub(crate) fn account_cpu(
     let account = &mut state.cpu;
     let base = *account.base.get_or_insert_with(|| {
         group.register_cpu(tid, Arc::clone(&account.used));
+        // A thread no clone made, the first process's, was made about now.
+        group.set_started(
+            tid,
+            host.clock(paludarium_host::ClockId::Monotonic).unwrap_or(0),
+        );
         now
     });
     let used = now.saturating_sub(base);

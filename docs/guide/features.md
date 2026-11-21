@@ -3252,7 +3252,10 @@ kernel.
   counts: the size of the mappings, the resident pages, those of them a
   file's or shared memory's, the pages of the code range `stat` gives, 0,
   the private
-  writable mappings and the stack, and 0. `limits` lists the soft and hard
+  writable mappings and the stack, and 0. `stat` gives as `rss` the resident
+  pages `VmRSS` shows, and as `starttime` when the task was made, in clock
+  ticks since boot, which an `execve` keeps, so `ps` shows `RSS`, `STIME`
+  and `START`. `limits` lists the soft and hard
   resource limits as `prlimit` gives them, in Linux's columns. `auxv` (0400)
   is the auxiliary vector the program's `execve` wrote on its stack, kept
   as Linux keeps `saved_auxv`, whatever the program then does to its stack,
@@ -3385,8 +3388,9 @@ kernel.
   of the program's data (Linux's `start_data` and `end_data`, as
   `load_elf_binary` finds them: the highest address and the highest end in
   the file of all its `PT_LOAD` segments), and where
-  the argument and environment strings lie. What nothing measures is 0: page
-  faults, resident memory, the start time and the scheduler's figures.
+  the argument and environment strings lie, the minor faults, the resident
+  pages and the start time. What nothing measures
+  is 0: major faults and the scheduler's figures.
   A reader that may not see the task's memory, as Linux's
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
@@ -3914,7 +3918,9 @@ kernel.
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts
   from none, and an `execve` keeps them. The other counts (major faults,
-  context switches, blocks) are 0.
+  context switches, blocks) are 0. `/proc/<pid>/stat` gives the same counts
+  as `minflt` (a thread's own under `task`) and `cminflt`, and 0 as
+  `majflt` and `cmajflt`.
 
 - A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
   takes it apart: the task's number in the caller's PID namespace

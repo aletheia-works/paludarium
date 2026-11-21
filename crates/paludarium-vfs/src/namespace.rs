@@ -630,7 +630,8 @@ impl MountTable {
             .iter()
             .map(|m| {
                 lock(&numbers.ids).insert(m.id);
-                lock(&numbers.minors).insert(m.device & 0xff | (m.device >> 12) & !0xff);
+                lock(&numbers.minors)
+                    .insert(u64::from(paludarium_types::device_numbers(m.device).1));
                 Entry {
                     token: Token::new(m.id, &numbers, None, numbers.boot_state(m.device)),
                     parent: m.parent,

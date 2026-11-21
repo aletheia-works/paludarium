@@ -4532,10 +4532,10 @@ pub(crate) fn mount_id_in(fs: &dyn FileSystem, device: u64, path: &[u8]) -> u64 
     if path.first() == Some(&b'/') && !generated(path) && fs.device(path) == device {
         return fs.mount_id(path);
     }
-    fs.mounts()
-        .iter()
-        .find(|m| m.device == device)
-        .map_or(20 + (device & 0xff | (device >> 12) & !0xff), |m| m.id)
+    fs.mounts().iter().find(|m| m.device == device).map_or(
+        20 + u64::from(paludarium_types::device_numbers(device).1),
+        |m| m.id,
+    )
 }
 /// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic
 /// fields, no birth time, and the mount's number as the device minor.
@@ -4554,12 +4554,7 @@ fn encode_statx(s: FileStat, device: u64, block_size: u32) -> Result<[u8; 256], 
     b[112..120].copy_from_slice(&seconds.to_le_bytes());
     b[120..124].copy_from_slice(&(nanos as u32).to_le_bytes());
     // Linux's encoding of a device number into its major and minor.
-    let split = |device: u64| {
-        (
-            ((device >> 8) & 0xfff) as u32,
-            ((device & 0xff) | ((device >> 12) & !0xff)) as u32,
-        )
-    };
+    let split = paludarium_types::device_numbers;
     let (rdev_major, rdev_minor) = split(s.rdev);
     b[128..132].copy_from_slice(&rdev_major.to_le_bytes());
     b[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
@@ -8738,12 +8733,11 @@ fn epoll_fdinfo(
             .find(|d| Arc::ptr_eq(&d.file, &file))
             .map_or(0, |d| descriptor_device_in(fs, d));
         // `new_encode_dev` undone, then `MKDEV`.
-        let major = (device >> 8) & 0xfff;
-        let minor = (device & 0xff) | ((device >> 12) & !0xff);
+        let (major, minor) = paludarium_types::device_numbers(device);
         out.extend_from_slice(
             format!(
                 "tfd: {fd:8} events: {events:8x} data: {data:16x}  pos:{pos} ino:{ino:x} sdev:{:x}\n",
-                major << 20 | minor
+                u64::from(major) << 20 | u64::from(minor)
             )
             .as_bytes(),
         );

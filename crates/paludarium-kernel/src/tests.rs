@@ -5726,7 +5726,7 @@ mod inotify {
         assert_eq!(lock(&mut f, other, 37, 1, 100, 1), 0);
         let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
-        let (major, minor) = (device >> 8 & 0xfff, device & 0xff | (device >> 12) & !0xff);
+        let (major, minor) = paludarium_types::device_numbers(device);
         let ino = fs.metadata(b"/tmp/locked", true).unwrap().inode;
         let at = format!("{major:02x}:{minor:02x}:{ino}");
         assert_eq!(
@@ -5749,7 +5749,7 @@ mod inotify {
         let b = f.ret(2, &[path, 0o2, 0]);
         let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
-        let (major, minor) = (device >> 8 & 0xfff, device & 0xff | (device >> 12) & !0xff);
+        let (major, minor) = paludarium_types::device_numbers(device);
         let ino = fs.metadata(b"/tmp/flocked", true).unwrap().inode;
         let at = format!("{major:02x}:{minor:02x}:{ino}");
         let flock = |kind: &str| format!("lock:\t1: FLOCK  ADVISORY  {kind} 1 {at} 0 EOF");
@@ -5816,7 +5816,7 @@ mod inotify {
         };
         let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
-        let id = 20 + (device & 0xff | (device >> 12) & !0xff);
+        let id = 20 + u64::from(paludarium_types::device_numbers(device).1);
         let ino = fs.metadata(b"/tmp/handled", true).unwrap().inode;
         let link_ino = fs.metadata(b"/tmp/handled-link", false).unwrap().inode;
         let tmpfs = |ino: u64| {
@@ -6073,7 +6073,8 @@ mod inotify {
         assert_eq!(f.ret(ADD, &[fd, tmp, 0x0400_0300]), 1);
         let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
-        let sdev = (device >> 8 & 0xfff) << 20 | device & 0xff | (device >> 12) & !0xff;
+        let (major, minor) = paludarium_types::device_numbers(device);
+        let sdev = u64::from(major) << 20 | u64::from(minor);
         let ino = |path: &[u8]| fs.metadata(path, true).unwrap().inode;
         let (tmp_ino, a_ino) = (ino(b"/tmp"), ino(b"/tmp/a"));
         let path = format!("/proc/self/fdinfo/{fd}");

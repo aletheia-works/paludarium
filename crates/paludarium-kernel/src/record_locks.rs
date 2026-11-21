@@ -436,8 +436,7 @@ pub(crate) fn fdinfo(
     let key = (crate::files::descriptor_device_in(fs, d), inode);
     // `new_encode_dev` undone.
     let (device, inode) = key;
-    let major = (device >> 8) & 0xfff;
-    let minor = (device & 0xff) | ((device >> 12) & !0xff);
+    let (major, minor) = paludarium_types::device_numbers(device);
     let mut out = Vec::new();
     let mut id = 0;
     let mut line = |what: &str, kind: Kind, pid: i32, range: &str| {

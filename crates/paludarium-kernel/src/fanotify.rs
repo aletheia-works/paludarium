@@ -1603,9 +1603,8 @@ impl Group {
 /// A device as the kernel's `s_dev` prints it: `new_encode_dev` undone,
 /// then `MKDEV`.
 fn sdev(device: u64) -> u64 {
-    let major = (device >> 8) & 0xfff;
-    let minor = (device & 0xff) | ((device >> 12) & !0xff);
-    major << 20 | minor
+    let (major, minor) = paludarium_types::device_numbers(device);
+    u64::from(major) << 20 | u64::from(minor)
 }
 
 impl Drop for Group {

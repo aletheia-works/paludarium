@@ -994,7 +994,7 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
         let (common, fs) = (&mount.common_options, &mount.super_options);
         let state = |read_only: bool| if read_only { "ro" } else { "rw" };
         if mountinfo {
-            let (major, minor) = device_numbers(mount.device);
+            let (major, minor) = paludarium_types::device_numbers(mount.device);
             let (own, sb) = (state(mount.read_only), state(mount.super_read_only));
             let tags = &mount.tags;
             out.push_str(&format!(
@@ -1082,18 +1082,19 @@ pub(crate) fn caller() -> (u32, u32) {
     CALLER.with(std::cell::Cell::get)
 }
 
-/// A file whose contents were fixed when it was opened.
+/// A file of `/proc` whose contents were fixed when it was opened: of size
+/// 0, as Linux's are, and read to the end of its content.
 pub(crate) struct GeneratedFile {
     content: Vec<u8>,
     position: Mutex<usize>,
     /// What a write gives on a descriptor opened for writing.
     write_error: Option<Errno>,
-    /// A system-wide file, of size 0 as Linux's `proc_create` files are,
-    /// whose reads go to the end of its content.
+    /// A system-wide file, as Linux's `proc_create` makes one: its mode is
+    /// [`entry_stat`]'s, and a write gives `EIO`.
     entry: bool,
-    /// The mode and owner `fstat` gives with the content's size, those of
-    /// the file it was opened as ([`Self::with_stat`]); a plain 0444 file of
-    /// root's without.
+    /// The mode and owner `fstat` gives, with size 0, those of the file it
+    /// was opened as ([`Self::with_stat`]); a plain 0444 file of root's
+    /// without.
     stat: Option<FileStat>,
     /// The owner its inode has now ([`Owners`]), over `stat`'s.
     owner: Option<Owner>,
@@ -1139,14 +1140,15 @@ pub(crate) fn mounts_file(
     crate::seq::SeqFile::of_task(Box::new(crate::seq::Lines(text)), flags, stat, owner)
 }
 impl GeneratedFile {
-    /// The files are 0444, but the guest is root, which may open them for
-    /// writing anyway; the write itself then fails, as on Linux: `EINVAL`
-    /// for a process's own file, which has no write operation at all.
+    /// A file of a process's `/proc` directory. The files are 0444, but the
+    /// guest is root, which may open them for writing anyway; the write
+    /// itself then fails, as on Linux: `EINVAL`, as it has no write operation
+    /// at all.
     pub(crate) fn open(content: Vec<u8>, flags: u32) -> Self {
         Self::failing_writes(content, flags, Errno::EINVAL, false)
     }
-    /// A system-wide file, which Linux makes with `proc_create`: of size 0
-    /// ([`entry_stat`]), and its writes go through `proc_reg_write` to
+    /// A system-wide file, which Linux makes with `proc_create`
+    /// ([`entry_stat`]): its writes go through `proc_reg_write` to
     /// `pde_write`, `EIO` without a `proc_write`.
     pub(crate) fn open_entry(content: Vec<u8>, flags: u32) -> Self {
         Self::failing_writes(content, flags, Errno::EIO, true)
@@ -1168,8 +1170,9 @@ impl GeneratedFile {
             ..self
         }
     }
-    /// The same, with the mode and owner of `stat`, the file it is
-    /// (a process's own file is its owner's, as Linux's `task_dump_owner`).
+    /// The same, with the mode and owner of `stat`, the file it is (a
+    /// process's own file is its owner's, as Linux's `task_dump_owner`), and
+    /// size 0.
     pub(crate) fn with_stat(self, stat: FileStat) -> Self {
         Self {
             stat: Some(stat),
@@ -1236,15 +1239,6 @@ impl FileHandle for GeneratedFile {
     }
 }
 
-/// The major and minor numbers of `device`, as glibc's `major` and `minor`
-/// take them apart: the major from bits 8 to 19 and 44 up, the minor from
-/// bits 0 to 7 and 20 to 43.
-pub(crate) fn device_numbers(device: u64) -> (u32, u32) {
-    (
-        (((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000)) as u32,
-        ((device & 0xff) | ((device >> 12) & 0xffff_ff00)) as u32,
-    )
-}
 /// One line of `maps`, as Linux's `show_map_vma` writes it: the header with
 /// a space after the inode, then, for a VMA with a name, spaces up to column
 /// 72 and one more before it. A newline in a path is octal.
@@ -1253,7 +1247,7 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
         if vma.prot.contains(prot) { letter } else { '-' }
     };
     let (device, inode) = vma.identity;
-    let (major, minor) = device_numbers(device);
+    let (major, minor) = paludarium_types::device_numbers(device);
     // Shared anonymous memory's file lies on Linux's first device.
     let minor = match &vma.file {
         Some(file) if !file.source => 1,
@@ -2031,7 +2025,6 @@ mod tests {
         };
         let line = String::from_utf8(map_line(&wide, 0, b"/")).unwrap();
         assert!(line.starts_with("00001000-00002000 r--p 00003000 189a:234567bc 9 "));
-        assert_eq!(device_numbers(0x0812), (8, 0x12));
         // Under a root, from there; elsewhere, from the machine's root.
         assert!(map_line(&vma, 0, b"/a b").ends_with(b" /a b\\c\\012d\n"));
         let mut inside = vma.clone();

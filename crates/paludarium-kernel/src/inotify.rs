@@ -1291,15 +1291,14 @@ impl Instance {
         for (wd, watch) in watches {
             let (device, inode) = watch.key;
             // `new_encode_dev` undone, then `MKDEV`.
-            let major = (device >> 8) & 0xfff;
-            let minor = (device & 0xff) | ((device >> 12) & !0xff);
+            let (major, minor) = paludarium_types::device_numbers(device);
             let (kind, handle) = crate::files::file_handle(watch.file_system, device, inode);
             let bytes: String = handle.iter().map(|b| format!("{b:02x}")).collect();
             out.extend_from_slice(
                 format!(
                     "inotify wd:{wd:x} ino:{inode:x} sdev:{:x} mask:{:x} ignored_mask:0 \
                      fhandle-bytes:{:x} fhandle-type:{kind:x} f_handle:{bytes}\n",
-                    major << 20 | minor,
+                    u64::from(major) << 20 | u64::from(minor),
                     watch.mask,
                     handle.len(),
                 )

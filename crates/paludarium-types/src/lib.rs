@@ -415,9 +415,27 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The major and minor numbers of `device`, an `st_dev` or `st_rdev`, as
+/// glibc's `major` and `minor` take them apart: the major from bits 8 to 19
+/// and 44 up, the minor from bits 0 to 7 and 20 to 43. A device Linux
+/// encodes (`new_encode_dev`) splits so into its `MAJOR` and `MINOR`.
+pub const fn device_numbers(device: u64) -> (u32, u32) {
+    (
+        (((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000)) as u32,
+        ((device & 0xff) | ((device >> 12) & 0xffff_ff00)) as u32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_numbers_split_as_glibc_major_and_minor() {
+        assert_eq!(device_numbers(0x0812), (8, 0x12));
+        // glibc's `makedev(0x189a, 0x234567bc)`.
+        assert_eq!(device_numbers(0x1234_5678_9abc), (0x189a, 0x2345_67bc));
+    }
 
     mod signals_time_tests {
         use super::*;

@@ -3177,7 +3177,9 @@ kernel.
   for the rest,
   pipes, sockets, `memfd` and `/dev` included. `statfs` there gives
   procfs's, devpts's or (for the rest of `/dev`, a devtmpfs) tmpfs's type with a 4096 `f_bsize`, as Linux's
-  `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but a call
+  `simple_statfs` does. A namespace's link in `/proc/<pid>/ns` leads to its
+  nsfs file, which `statfs` and `fstatfs` give as nsfs's (`NSFS_MAGIC`).
+  A link in `/proc/self/fd` is procfs's, but a call
   that follows it reaches the descriptor's file, as Linux's magic link does,
   whatever its access (an `O_PATH` descriptor's too): `stat`, `statfs`,
   `open`, `access`, `chmod` and `fchmodat`, `chown` and `fchownat`,
@@ -4671,8 +4673,8 @@ kernel.
   descriptors and the IDs of no other process), the user's groups count
   (`EMFILE`), and the file is `anon_inode:[fanotify]`, read and written,
   with `O_NONBLOCK` and `O_CLOEXEC` as asked. `fanotify_mark` adds, removes
-  or flushes marks on a file, a mount or a file system (and takes a mount
-  namespace's); a mount's mark, by the mount's ID, hears only of the paths
+  or flushes marks on a file, a mount or a file system (and on a mount
+  namespace, by its file in `/proc/<pid>/ns`, for mount events); a mount's mark, by the mount's ID, hears only of the paths
   in that mount, not of a bind mount of the same file system, and fdinfo
   shows that ID; it goes when its mount is freed (`fsnotify_vfsmount_delete`),
   so a mount that takes the ID next is not marked. Exec's open of the
@@ -4692,7 +4694,8 @@ kernel.
   (`EINVAL`), the descriptor (`EBADF`, `EINVAL`), the group's class and
   modes, the path (`ENOENT`, `ENOTDIR`), the events the file system takes
   (`EINVAL` for permission events on /proc, and for mount and file system
-  marks on the kernel's own file systems; `ENOTDIR` for directory events of
+  marks on the kernel's own file systems, which nsfs is not, as `nsfs_init`
+  clears its `SB_NOUSER`; `ENOTDIR` for directory events of
   a file with the newer flags), read permission (`EACCES`), the file
   system's ID and handles in the FID modes (`ENODEV`, `EOPNOTSUPP`,
   `EXDEV`), the ignore masks' rules (`EISDIR`, `EEXIST`, and none for a
@@ -4717,7 +4720,19 @@ kernel.
   kind as one still queued merges into it, past `max_queued_events` there is
   one `FAN_Q_OVERFLOW`, and `FAN_REPORT_PIDFD` adds the process's pidfd
   (with `FAN_REPORT_TID` it is `EINVAL`, as on Linux 7.0, which the CI
-  runners have; master takes both and gives the thread's). A read takes whole events (`EINVAL`
+  runners have; master takes both and gives the thread's). A group with
+  `FAN_REPORT_MNT` hears of each mount that comes into a mount namespace it
+  marks (`FAN_MNT_ATTACH`), goes from it (`FAN_MNT_DETACH`) or moves within
+  it (both), once the change is made, in the order Linux's `mnt_notify_add`
+  queues them: a new mount, a bind and each copy a propagation makes, each
+  mount before those on it; an unmount, a propagated or lazy one too, each
+  mount before those on it, after the mounts it slides down onto their
+  parent move; `move_mount` and `MS_MOVE` the moved tree's root alone, or
+  each mount of a detached tree they attach; `pivot_root` the old root, then
+  the new one. A detached tree is in no namespace and tells nothing. Such an
+  event has no descriptor and, after any pidfd's, a record of the mount's
+  unique ID (`FAN_EVENT_INFO_TYPE_MNT`, the `statx` `STATX_MNT_ID_UNIQUE`
+  one), and is never merged. A read takes whole events (`EINVAL`
   for a buffer too small for the first), waits unless non-blocking, and
   `FIONREAD` gives the bytes queued; `/proc/self/fdinfo` shows the flags and
   each mark, the newest first, as `fanotify_show_fdinfo`. A write is a

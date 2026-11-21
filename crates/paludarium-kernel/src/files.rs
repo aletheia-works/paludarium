@@ -226,6 +226,23 @@ fn released_to_notifiers(
             notify.unmounted(device);
         }
     })));
+    mounts_to_fanotify(table, caches, crate::namespaces::FIRST_MOUNT_INODE);
+}
+/// Tells fanotify of the mounts that come into `table`, the mount
+/// namespace whose inode is `namespace`, go or move
+/// ([`crate::fanotify::Registry::mount_events`]), as Linux's `mnt_notify`
+/// does.
+pub(crate) fn mounts_to_fanotify(
+    table: &paludarium_vfs::MountTable,
+    caches: &Arc<crate::page_cache::PageCaches>,
+    namespace: u32,
+) {
+    let fan = Arc::downgrade(&caches.notify.fan);
+    table.set_mount_hook(Some(Arc::new(move |changes| {
+        if let Some(fan) = fan.upgrade() {
+            fan.mount_events(u64::from(namespace), changes);
+        }
+    })));
 }
 impl Default for Files {
     fn default() -> Self {
@@ -1937,10 +1954,14 @@ fn pseudo_fs(kind: u64) -> paludarium_host::FsStats {
     }
 }
 /// What `fstatfs` reports for the file `d` holds: an empty pseudo
-/// filesystem for a /proc file (procfs), a terminal (devpts), a pipe, a
-/// socket, a pidfd (pidfs) or another file of no type (Linux's anonymous
-/// inodes), else the statistics of the filesystem holding its path.
+/// filesystem for a namespace file (nsfs), a /proc file (procfs), a
+/// terminal (devpts), a pipe, a socket, a pidfd (pidfs) or another file of
+/// no type (Linux's anonymous inodes), else the statistics of the
+/// filesystem holding its path.
 fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host::FsStats, Errno> {
+    if is_namespace(d) {
+        return Ok(pseudo_fs(NSFS_MAGIC));
+    }
     if in_proc(&d.path) {
         return Ok(pseudo_fs(PROC_SUPER_MAGIC));
     }
@@ -4480,10 +4501,17 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
                 .map_err(|_| Errno::ENOENT)?;
             descriptor_statfs(c, &d)?
         } else {
-            if generated_stat(c, p, true)?.is_none() {
-                c.files.fs().metadata(p, true)?;
+            match generated_stat(c, p, true)? {
+                // A namespace's link leads to its nsfs file.
+                Some((_, device, _)) if device == crate::namespaces::DEVICE => {
+                    pseudo_fs(NSFS_MAGIC)
+                }
+                Some(_) => pseudo_fs(PROC_SUPER_MAGIC),
+                None => {
+                    c.files.fs().metadata(p, true)?;
+                    pseudo_fs(PROC_SUPER_MAGIC)
+                }
             }
-            pseudo_fs(PROC_SUPER_MAGIC)
         }
     } else if let Some(name) = paludarium_vfs::normalize_path(p)
         .ok()
@@ -4707,6 +4735,7 @@ const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
 const MQUEUE_MAGIC: u64 = 0x1980_0202;
 /// pidfs's `s_magic`, a pidfd's file system from Linux 6.9.
 const PID_FS_MAGIC: u64 = 0x5049_4446;
+const NSFS_MAGIC: u64 = 0x6e73_6673;
 /// The anonymous inodes' file system, which eventfds, epolls, timerfds,
 /// signalfds, inotify instances and the like are on.
 const ANON_INODE_FS_MAGIC: u64 = 0x0904_1934;

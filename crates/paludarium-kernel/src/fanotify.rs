@@ -20,6 +20,7 @@ use crate::page_cache::Key;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
+use paludarium_vfs::MountChange;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -154,6 +155,10 @@ const INFO_FID: u8 = 1;
 const INFO_DFID_NAME: u8 = 2;
 const INFO_DFID: u8 = 3;
 const INFO_PIDFD: u8 = 4;
+const INFO_MNT: u8 = 7;
+/// `struct fanotify_event_info_mnt`: its header, padding to 8 bytes, and
+/// the mount's unique ID.
+const MOUNT_INFO: usize = 16;
 const INFO_OLD_DFID_NAME: u8 = 10;
 const INFO_NEW_DFID_NAME: u8 = 12;
 /// `EXDEV`.
@@ -191,11 +196,13 @@ const MQUEUE_MAGIC: u64 = 0x1980_0202;
 const SECRETMEM_MAGIC: u64 = 0x5345_4d45;
 
 /// Whether the file system `kind` is one the kernel mounts only for itself
-/// (`SB_NOUSER`), which takes no mount or file system mark.
+/// (`SB_NOUSER`), which takes no mount or file system mark. nsfs is not
+/// one: `nsfs_init` clears the flag, so its files take any mark, as a mount
+/// namespace mark needs.
 fn internal(kind: u64) -> bool {
     matches!(
         kind,
-        PIPEFS_MAGIC | SOCKFS_MAGIC | ANON_INODE_FS_MAGIC | PID_FS_MAGIC | NSFS_MAGIC
+        PIPEFS_MAGIC | SOCKFS_MAGIC | ANON_INODE_FS_MAGIC | PID_FS_MAGIC
     )
 }
 
@@ -218,7 +225,7 @@ pub(crate) fn fsid(c: &Context<'_>, device: u64, kind: u64) -> [u32; 2] {
     if internal(kind)
         || matches!(
             kind,
-            PROC_SUPER_MAGIC | DEVPTS_SUPER_MAGIC | MQUEUE_MAGIC | SECRETMEM_MAGIC
+            NSFS_MAGIC | PROC_SUPER_MAGIC | DEVPTS_SUPER_MAGIC | MQUEUE_MAGIC | SECRETMEM_MAGIC
         )
     {
         return [device as u32, (device >> 32) as u32];
@@ -374,8 +381,7 @@ enum Target {
     /// A mount, by its ID (`mnt_id`), on the file system of the device.
     Mount(u64, u64),
     FileSystem(u64),
-    /// A mount namespace, by its inode, which only mount events (never
-    /// sent here) are of.
+    /// A mount namespace, by its inode, which only mount events are of.
     Namespace(u64),
 }
 
@@ -501,6 +507,9 @@ enum Body {
         name2: Vec<u8>,
         file: Option<Handle>,
     },
+    /// `fanotify_mnt_event`: the unique ID (`mnt_id_unique`) of the mount
+    /// that came in, went or moved.
+    Mount(u64),
     Overflow,
 }
 
@@ -598,6 +607,9 @@ impl Event {
         }
         if let Some(object) = self.object_handle() {
             len += fid_info_len(object.bytes.len(), dot);
+        }
+        if self.mask & MOUNT_EVENTS != 0 {
+            len += MOUNT_INFO;
         }
         if info_mode & REPORT_PIDFD != 0 {
             len += 8;
@@ -1089,6 +1101,56 @@ impl Registry {
             return;
         }
         self.fsnotify(&groups, mask, &data, Some(dir), Some(name), None);
+    }
+
+    /// `fsnotify_mnt`: the mounts of `changes` came into the mount namespace
+    /// whose inode is `namespace`, went or moved, in that order; each group
+    /// with `FAN_REPORT_MNT` and a mark on the namespace is told of each it
+    /// asked for (`fanotify_group_event_mask`), a move as both events. Mount
+    /// events are never merged.
+    pub(crate) fn mount_events(&self, namespace: u64, changes: &[(u64, MountChange)]) {
+        if !self.active() {
+            return;
+        }
+        let groups = self.groups();
+        let (pid, tid) = CURRENT.with(Cell::get);
+        for &(unique, change) in changes {
+            let mask = match change {
+                MountChange::Attach => MNT_ATTACH,
+                MountChange::Detach => MNT_DETACH,
+                MountChange::Move => MNT_ATTACH | MNT_DETACH,
+            };
+            for group in groups.iter().filter(|g| g.flags & REPORT_MNT != 0) {
+                let mut queue = group.queue();
+                let Some(mark) = queue
+                    .marks
+                    .iter()
+                    .find(|m| m.target == Target::Namespace(namespace))
+                else {
+                    continue;
+                };
+                let ignore = mark.effective_ignore(false, Iter::Inode);
+                let mask = mask & mark.mask & !ignore & OUTGOING_EVENTS & !EVENT_FLAGS;
+                if mask == 0 {
+                    continue;
+                }
+                let event = Event {
+                    mask,
+                    pid: if group.flags & REPORT_TID != 0 {
+                        tid
+                    } else {
+                        pid
+                    },
+                    body: Body::Mount(unique),
+                    perm: None,
+                };
+                let queued = Group::insert(&mut queue, event);
+                drop(queue);
+                if queued {
+                    group.hub.changed();
+                }
+            }
+        }
     }
 
     /// `fsnotify`: each group with a mark the event reaches, told of it with
@@ -2232,6 +2294,12 @@ fn copy_event(
         out.extend_from_slice(&[INFO_PIDFD, 0]);
         out.extend_from_slice(&8u16.to_le_bytes());
         out.extend_from_slice(&pidfd.to_le_bytes());
+    }
+    if let Body::Mount(unique) = event.body {
+        out.extend_from_slice(&[INFO_MNT, 0]);
+        out.extend_from_slice(&(MOUNT_INFO as u16).to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&unique.to_le_bytes());
     }
     debug_assert_eq!(out.len() - start, event_len);
     if out.len() > writable {

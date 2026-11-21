@@ -1,7 +1,8 @@
 /* fanotify, compared with Linux: the calls' errors and their order, the
    marks fdinfo shows, the events of files with the descriptors they give,
    their merging, the file handles and names of the FID modes, the pidfds
-   of FAN_REPORT_PIDFD, and what a group without CAP_SYS_ADMIN may do.
+   of FAN_REPORT_PIDFD, the mount events of FAN_REPORT_MNT, and what a
+   group without CAP_SYS_ADMIN may do.
 
    Each case works in a directory of its own under /tmp. A file system
    mark there hears of what other programs do in /tmp too, so only the
@@ -50,6 +51,7 @@
 #define FAN_OPEN_EXEC_PERM 0x40000
 #define FAN_PRE_ACCESS 0x100000
 #define FAN_MNT_ATTACH 0x1000000
+#define FAN_MNT_DETACH 0x2000000
 #define FAN_EVENT_ON_CHILD 0x8000000
 #define FAN_RENAME 0x10000000
 #define FAN_ONDIR 0x40000000
@@ -866,6 +868,135 @@ static int case_mounts(void) {
     return 0;
 }
 
+/* The unique mount ID statx gives for `path` (STATX_MNT_ID_UNIQUE), or 0. */
+static uint64_t unique_of(const char *path) {
+    unsigned char buf[256] = {0};
+    if (syscall(SYS_statx, AT_FDCWD, path, 0, 0x4000, buf) != 0) return 0;
+    uint32_t got;
+    memcpy(&got, buf, 4);
+    if (!(got & 0x4000)) return 0;
+    uint64_t id;
+    memcpy(&id, buf + 144, 8);
+    return id;
+}
+static struct {
+    const char *name;
+    uint64_t id;
+} seen_mounts[16];
+static int seen_count;
+static void name_mount(const char *name) {
+    if (seen_count == 16) return;
+    seen_mounts[seen_count].name = name;
+    seen_mounts[seen_count++].id = unique_of(at(name));
+}
+static const char *mount_name(uint64_t id) {
+    for (int i = 0; i < seen_count; i++)
+        if (seen_mounts[i].id && seen_mounts[i].id == id) return seen_mounts[i].name;
+    return "another";
+}
+/* Each mount event queued for `fan`: its mask, descriptor, pid, length,
+   and its info records, the mount's by the name it was mounted at. */
+static void show_mount_events(const char *label, int fan) {
+    printf("%s:\n", label);
+    char buf[4096] __attribute__((aligned(8)));
+    for (;;) {
+        ssize_t n = read(fan, buf, sizeof buf);
+        if (n <= 0) {
+            if (n < 0 && errno != EAGAIN) printf("  read=%d\n", -errno);
+            return;
+        }
+        for (ssize_t at_ = 0; at_ < n;) {
+            struct metadata m;
+            memcpy(&m, buf + at_, sizeof m);
+            printf("  mask=%llx fd=%d pid=%s len=%u", (unsigned long long)m.mask, m.fd,
+                   m.pid == getpid() ? "self" : "other", m.event_len);
+            for (uint32_t r = m.metadata_len; r + sizeof(struct info_header) <= m.event_len;) {
+                struct info_header h;
+                memcpy(&h, buf + at_ + r, sizeof h);
+                if (h.type == 7 && h.len == 16) {
+                    uint64_t id;
+                    memcpy(&id, buf + at_ + r + 8, 8);
+                    printf(" mount=%s", mount_name(id));
+                } else {
+                    printf(" info=%d/%d", h.type, h.len);
+                }
+                if (!h.len) break;
+                r += h.len;
+            }
+            printf("\n");
+            if (!m.event_len) return;
+            at_ += m.event_len;
+        }
+    }
+}
+
+/* FAN_MNT_ATTACH and FAN_MNT_DETACH: a group with FAN_REPORT_MNT and a
+   mark on the mount namespace hears of each mount that comes into it, goes
+   or moves (both bits), with no descriptor and a record of the mount's
+   unique ID. In a mount namespace of its own: tmpfs mounts, a recursive
+   bind, a move, a detached tree attached, a mount propagated to a peer and
+   its unmount, a lazy unmount of a tree, and a group that asked for
+   FAN_MNT_DETACH alone. Once the mark is removed nothing more comes. */
+static int case_mount_events(void) {
+    make_base("mount-events");
+    const char *dirs[] = {"a", "b", "c", "d", "e"};
+    for (int i = 0; i < 5; i++) mkdir(at(dirs[i]), 0755);
+    printf("unshare=%ld\n", e(unshare(CLONE_NEWNS)));
+    printf("private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    int fan = fan_init(FAN_REPORT_MNT | FAN_NONBLOCK, 0);
+    int detach = fan_init(FAN_REPORT_MNT | FAN_NONBLOCK, 0);
+    if (fan < 0 || detach < 0) return 80;
+    printf("mark=%ld detach only=%ld\n",
+           fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_MNT_ATTACH | FAN_MNT_DETACH, AT_FDCWD, "/proc/self/ns/mnt"),
+           fan_mark(detach, FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_MNT_DETACH, AT_FDCWD, "/proc/self/ns/mnt"));
+    printf("tmpfs a=%ld\n", e(mount("none", at("a"), "tmpfs", 0, NULL)));
+    name_mount("a");
+    mkdir(at("a/in"), 0755);
+    printf("tmpfs a/in=%ld\n", e(mount("none", at("a/in"), "tmpfs", 0, NULL)));
+    name_mount("a/in");
+    show_mount_events("mounted", fan);
+    show_mount_events("mounted, detach only", detach);
+    printf("bind a b=%ld\n", e(mount(at("a"), at("b"), NULL, MS_BIND | MS_REC, NULL)));
+    name_mount("b");
+    name_mount("b/in");
+    show_mount_events("bound", fan);
+    printf("move b c=%ld\n", e(mount(at("b"), at("c"), NULL, MS_MOVE, NULL)));
+    show_mount_events("moved", fan);
+    show_mount_events("moved, detach only", detach);
+    int tree = e(syscall(428 /* open_tree */, AT_FDCWD, at("a"), 1 | 0x8000));
+    printf("open_tree=%d\n", tree >= 0);
+    show_mount_events("cloned", fan);
+    printf("move_mount d=%ld\n", e(syscall(429 /* move_mount */, tree, "", AT_FDCWD, at("d"), 4)));
+    close(tree);
+    name_mount("d");
+    name_mount("d/in");
+    show_mount_events("attached", fan);
+    printf("shared a=%ld\n", e(mount(NULL, at("a"), NULL, MS_SHARED, NULL)));
+    printf("bind a e=%ld\n", e(mount(at("a"), at("e"), NULL, MS_BIND, NULL)));
+    name_mount("e");
+    show_mount_events("bound shared", fan);
+    mkdir(at("a/x"), 0755);
+    printf("tmpfs a/x=%ld\n", e(mount("none", at("a/x"), "tmpfs", 0, NULL)));
+    name_mount("a/x");
+    name_mount("e/x");
+    show_mount_events("propagated", fan);
+    printf("umount a/x=%ld\n", e(umount2(at("a/x"), 0)));
+    show_mount_events("propagated unmount", fan);
+    printf("umount c=%ld\n", e(umount2(at("c"), MNT_DETACH)));
+    show_mount_events("lazy unmount", fan);
+    show_mount_events("lazy unmount, detach only", detach);
+    printf("remove=%ld\n",
+           fan_mark(fan, FAN_MARK_REMOVE | FAN_MARK_MNTNS, FAN_MNT_ATTACH | FAN_MNT_DETACH, AT_FDCWD, "/proc/self/ns/mnt"));
+    printf("umount d=%ld\n", e(umount2(at("d"), MNT_DETACH)));
+    show_mount_events("unmarked", fan);
+    show_mount_events("unmarked, detach only", detach);
+    close(fan);
+    close(detach);
+    printf("umount=%ld %ld %ld\n", e(umount2(at("e"), 0)), e(umount2(at("a/in"), 0)), e(umount2(at("a"), 0)));
+    remove_base();
+    return 0;
+}
+
 /* FAN_OPEN_EXEC: exec's open of a program, a copy of this one under the
    base, is told as FAN_OPEN with FAN_OPEN_EXEC, as do_open_execat opens it
    with __FMODE_EXEC; a mark on FAN_OPEN_EXEC alone hears only that, and
@@ -1211,6 +1342,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-pidfd")) return case_pidfd();
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
+    if (!strcmp(mode, "fanotify-mount-events")) return case_mount_events();
     if (!strcmp(mode, "fanotify-open-exec")) return case_open_exec(argc > 2 ? argv[2] : "");
     if (!strcmp(mode, "fanotify-aio-perm")) return case_aio_perm();
     if (!strcmp(mode, "fanotify-exec-perm")) return case_exec_perm(argc > 2 ? argv[2] : "");

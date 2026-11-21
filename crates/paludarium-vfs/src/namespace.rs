@@ -579,12 +579,28 @@ pub enum Reach<'a> {
     Mount(u64),
 }
 
-/// What a table tells of the mounts an unmount takes out of its namespace
-/// (`umount_tree`): their IDs, each mount before those on it, after they
-/// went. A hook point for fanotify's mount events (`FAN_MNT_DETACH`, which
-/// Linux's `mnt_notify` sends). A detached tree that goes with its last
-/// descriptor is in no namespace and tells nothing, nor do moves.
-pub type UnmountHook = Arc<dyn Fn(&[u64]) + Send + Sync>;
+/// What a mount did to the namespace it is in, as Linux's `mnt_notify`
+/// tells fanotify of it: it came in (`FS_MNT_ATTACH`), went out
+/// (`FS_MNT_DETACH`), or was moved within it (`FS_MNT_MOVE`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MountChange {
+    Attach,
+    Detach,
+    Move,
+}
+
+/// What a table tells of the mounts a change took into its namespace, out
+/// of it or within it, after the change: each by its unique ID
+/// (`mnt_id_unique`), in the order Linux queues them on `notify_list`
+/// (`mnt_notify_add`). A new mount, a bind and a copy a propagation makes
+/// come in, each mount before those on it; an unmount, a propagated one
+/// too, takes each out, after the mounts it slides down onto their parent
+/// (`reparent`) move; `move_mount` moves the root of the tree it moves, or
+/// takes in each mount of a detached tree; `pivot_root` moves the old root,
+/// then the new one. A detached tree is in no namespace and tells nothing,
+/// and a copy of a namespace tells nothing of its first mounts. A hook
+/// point for fanotify's mount events.
+pub type MountHook = Arc<dyn Fn(&[(u64, MountChange)]) + Send + Sync>;
 
 /// What a machine's tables tell of a mount once it is freed, as Linux's
 /// last `mntput` does (`cleanup_mnt`, `fsnotify_vfsmount_delete`): its ID,
@@ -616,8 +632,8 @@ pub struct MountTable {
     devices_only: AtomicBool,
     /// Where the lower filesystem has its mounts, which it shows itself.
     lower_points: Arc<Vec<Vec<u8>>>,
-    /// What is told of mounts that leave the namespace ([`UnmountHook`]).
-    unmount_hook: Mutex<Option<UnmountHook>>,
+    /// What is told of mounts that come in, go or move ([`MountHook`]).
+    mount_hook: Mutex<Option<MountHook>>,
     /// The unique ID of the mount below its root (Linux's rootfs), and the
     /// namespace's ID (`ns_id`).
     below: u64,
@@ -673,7 +689,7 @@ impl MountTable {
             generated: AtomicBool::new(false),
             devices_only: AtomicBool::new(false),
             lower_points: Arc::new(mounts.iter().map(|m| m.path.clone()).collect()),
-            unmount_hook: Mutex::default(),
+            mount_hook: Mutex::default(),
             below,
             namespace,
             owner: Mutex::default(),
@@ -769,7 +785,7 @@ impl MountTable {
             generated: AtomicBool::new(self.generated.load(Ordering::SeqCst)),
             devices_only: AtomicBool::new(self.devices_only.load(Ordering::SeqCst)),
             lower_points: Arc::clone(&self.lower_points),
-            unmount_hook: Mutex::default(),
+            mount_hook: Mutex::default(),
             below,
             namespace,
             owner: Mutex::default(),
@@ -812,9 +828,20 @@ impl MountTable {
     pub fn set_superblock_hook(&self, hook: Option<SuperblockHook>) {
         *lock(&self.numbers.superblocks) = hook;
     }
-    /// Tells `hook` of each unmount from now on, in place of any hook before.
-    pub fn set_unmount_hook(&self, hook: Option<UnmountHook>) {
-        *lock(&self.unmount_hook) = hook;
+    /// Tells `hook` of the mounts that come into this namespace, go or
+    /// move from now on ([`MountHook`]), in place of any hook before.
+    pub fn set_mount_hook(&self, hook: Option<MountHook>) {
+        *lock(&self.mount_hook) = hook;
+    }
+    /// Tells the hook of `changes`, if there are any.
+    fn tell(&self, changes: &[(u64, MountChange)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let hook = lock(&self.mount_hook).clone();
+        if let Some(hook) = hook {
+            hook(changes);
+        }
     }
     fn snapshot(&self) -> Arc<Vec<Entry>> {
         Arc::clone(&self.entries.read().unwrap_or_else(PoisonError::into_inner))
@@ -1434,10 +1461,23 @@ impl NamespacedFs {
     }
     /// Adds `tree` to the table, and what [`Self::propagated`] gives to
     /// each table, this one first.
+    /// Each table is told of the mounts it takes in ([`MountHook`]) once
+    /// all are added.
     fn attached(&self, tree: Vec<Entry>, spreads: Vec<Spread>) -> Result<(), Errno> {
         let (own, others): (Vec<Spread>, Vec<Spread>) = spreads
             .into_iter()
             .partition(|s| Arc::ptr_eq(&s.table, &self.table));
+        let attach = |added: &[Entry]| -> Vec<(u64, MountChange)> {
+            added
+                .iter()
+                .filter(|e| !detached(&e.point))
+                .map(|e| (e.token.unique, MountChange::Attach))
+                .collect()
+        };
+        let mut told = attach(&tree);
+        for spread in &own {
+            told.extend(attach(&spread.added));
+        }
         self.table.update(|entries| {
             entries.extend(tree);
             for spread in own {
@@ -1445,12 +1485,18 @@ impl NamespacedFs {
             }
             Ok(())
         })?;
+        let mut tells = vec![(Arc::clone(&self.table), told)];
         for spread in others {
             let table = Arc::clone(&spread.table);
+            let told = attach(&spread.added);
             table.update(|entries| {
                 spread.apply(entries);
                 Ok(())
             })?;
+            tells.push((table, told));
+        }
+        for (table, told) in tells {
+            table.tell(&told);
         }
         Ok(())
     }
@@ -1735,7 +1781,7 @@ impl NamespacedFs {
             generated: AtomicBool::new(false),
             devices_only: AtomicBool::new(false),
             lower_points: Arc::clone(&self.table.lower_points),
-            unmount_hook: Mutex::default(),
+            mount_hook: Mutex::default(),
             below,
             namespace,
             owner: Mutex::default(),
@@ -2029,6 +2075,18 @@ impl NamespacedFs {
             return Err(Errno::EOPNOTSUPP);
         }
         let (id, point, parent) = (old.id(), old.point.clone(), dest.id());
+        // A detached tree's mounts come into the namespace (from Linux's
+        // anonymous one); a mount of the namespace moves, the tree's root
+        // alone (`mnt_notify_add(source_mnt)`).
+        let told: Vec<(u64, MountChange)> = if detached(&old.point) {
+            moving
+                .iter()
+                .filter_map(has)
+                .map(|e| (e.token.unique, MountChange::Attach))
+                .collect()
+        } else {
+            vec![(old.token.unique, MountChange::Move)]
+        };
         let (over, over_locked) = (beneath.then(|| top.id()), top.locked);
         let shared = dest.group != 0;
         let mut fresh = Vec::new();
@@ -2070,6 +2128,7 @@ impl NamespacedFs {
             }
             Ok(())
         })?;
+        self.table.tell(&told);
         // The moved tree propagates from its new parent as a new mount does.
         let moved = self.table.snapshot();
         let tree: Vec<Entry> = moving
@@ -2164,6 +2223,10 @@ impl NamespacedFs {
             })
             .collect();
         let (new_id, root_id, old_id) = (new_mnt.id(), root_mnt.id(), old_mnt.id());
+        let told = [
+            (root_mnt.token.unique, MountChange::Move),
+            (new_mnt.token.unique, MountChange::Move),
+        ];
         let (root_parent, root_locked) = (root_mnt.parent, root_mnt.locked);
         let numbers = Arc::clone(&self.table.numbers);
         let below = self.table.below;
@@ -2182,6 +2245,7 @@ impl NamespacedFs {
             }
             Ok(())
         })?;
+        self.table.tell(&told);
         Ok(placed)
     }
     /// Unmounts the tmpfs mount `id` (`umount_tree`): with `detach` it and
@@ -2238,22 +2302,34 @@ impl NamespacedFs {
                 .collect();
             let told: Vec<u64> = Self::tree(entries, id, true)
                 .into_iter()
-                .filter(|id| entries.iter().any(|e| e.id() == *id && !detached(&e.point)))
+                .filter_map(|id| Self::by_id(entries, id))
+                .filter(|e| !detached(&e.point))
+                .map(|e| e.token.unique)
                 .collect();
             entries.retain(|e| !gone.contains(&e.id()));
             Ok((left, told))
         })?;
         let (mut left, told) = gone;
-        let mut tells = vec![(Arc::clone(&self.table), told)];
+        // Each table's moves (`reparent`), then what goes from it.
+        let mut tells: Vec<(Arc<MountTable>, Vec<u64>, Vec<u64>)> =
+            vec![(Arc::clone(&self.table), Vec::new(), told)];
         for Unmounted {
-            table, gone, moved, ..
+            table,
+            entries: before,
+            gone,
+            moved,
         } in spread
         {
+            let slid: Vec<u64> = moved
+                .iter()
+                .filter_map(|(child, _)| Self::by_id(&before, *child))
+                .map(|e| e.token.unique)
+                .collect();
             let removed = table.update(|entries| {
                 let removed: Vec<(u64, u64, u64)> = entries
                     .iter()
                     .filter(|e| gone.contains(&e.id()))
-                    .map(|e| (e.id(), e.group, e.master))
+                    .map(|e| (e.token.unique, e.group, e.master))
                     .collect();
                 for e in entries.iter_mut() {
                     if let Some((_, to)) = moved.iter().find(|(child, _)| *child == e.id()) {
@@ -2264,22 +2340,25 @@ impl NamespacedFs {
                 Ok(removed)
             })?;
             left.extend(removed.iter().map(|(_, group, master)| (*group, *master)));
-            let ids: Vec<u64> = removed.iter().map(|(id, ..)| *id).collect();
-            match tells.iter_mut().find(|(t, _)| Arc::ptr_eq(t, &table)) {
-                Some((_, told)) => told.extend(ids),
-                None => tells.push((table, ids)),
+            let ids: Vec<u64> = removed.iter().map(|(unique, ..)| *unique).collect();
+            match tells.iter_mut().find(|(t, ..)| Arc::ptr_eq(t, &table)) {
+                Some((_, moves, told)) => {
+                    moves.extend(slid);
+                    told.extend(ids);
+                }
+                None => tells.push((table, slid, ids)),
             }
         }
         for (group, master) in left {
             self.table.numbers.left(group, master);
         }
-        for (table, told) in tells {
-            let hook = lock(&table.unmount_hook).clone();
-            if let Some(hook) = hook
-                && !told.is_empty()
-            {
-                hook(&told);
-            }
+        for (table, moves, told) in tells {
+            let changes: Vec<(u64, MountChange)> = moves
+                .into_iter()
+                .map(|unique| (unique, MountChange::Move))
+                .chain(told.into_iter().map(|unique| (unique, MountChange::Detach)))
+                .collect();
+            table.tell(&changes);
         }
         Ok(())
     }

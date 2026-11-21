@@ -920,8 +920,9 @@ verified.
 - **fanotify, in part**: `io_uring` has no read operation here to ask
   `FAN_ACCESS_PERM` for.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
-  and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
-  never come. An evictable mark is never evicted. A group merges an event
+  and `FAN_FS_ERROR` never comes. A mount namespace that ends takes its
+  mounts with it unannounced, where Linux's `put_mnt_ns` unmounts them, a
+  `FAN_MNT_DETACH` for each to a group that still marks it. An evictable mark is never evicted. A group merges an event
   into any like it still queued, where Linux looks only at the last 128 of
   its hash bucket. Whether a directory watches its children is judged by the
   fanotify marks alone, where Linux's counts inotify's too. A file a

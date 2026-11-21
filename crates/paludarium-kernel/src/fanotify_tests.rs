@@ -661,3 +661,92 @@ fn pidfds_overflow_and_responses() {
     f.close(small);
     assert_eq!(f.kernel.files.caches.notify.fan.marks_count(), marks - 2);
 }
+
+#[test]
+fn a_mount_namespace_mark_hears_mounts_come_go_and_move() {
+    const REPORT_MNT: u64 = 0x4000;
+    const MNTNS: u64 = 0x110;
+    const ATTACH: u64 = 0x100_0000;
+    const DETACH: u64 = 0x200_0000;
+    let mut f = fixture();
+    // A namespace's file is nsfs's, by its path or a descriptor, which a
+    // mount namespace mark needs.
+    let ns = f.put(b"/proc/self/ns/mnt");
+    assert_eq!(f.ret(137, &[ns, BUF]), 0);
+    let mut kind = [0; 8];
+    f.mem.read(GuestAddr(BUF), &mut kind).unwrap();
+    assert_eq!(u64::from_le_bytes(kind), 0x6e73_6673);
+    let fd = f.open("/proc/self/ns/mnt", 0);
+    assert_eq!(f.ret(138, &[fd, BUF]), 0);
+    f.mem.read(GuestAddr(BUF), &mut kind).unwrap();
+    assert_eq!(u64::from_le_bytes(kind), 0x6e73_6673);
+    f.close(fd);
+    let fan = f.init(REPORT_MNT | NONBLOCK, 0);
+    let pidfd = f.init(REPORT_MNT | REPORT_PIDFD | NONBLOCK, 0);
+    let detach = f.init(REPORT_MNT | NONBLOCK, 0);
+    for (group, mask) in [(fan, ATTACH | DETACH), (pidfd, ATTACH), (detach, DETACH)] {
+        assert_eq!(f.mark(group, ADD | MNTNS, mask, "/proc/self/ns/mnt"), 0);
+    }
+    f.mkdir("/tmp/m");
+    f.mkdir("/tmp/n");
+    let unique = |f: &mut Fixture, path: &str| {
+        let path = f.put(path.as_bytes());
+        assert_eq!(f.ret(332, &[AT_FDCWD, path, 0, 0x4000, BUF]), 0);
+        let mut id = [0; 8];
+        f.mem.read(GuestAddr(BUF + 144), &mut id).unwrap();
+        id.to_vec()
+    };
+    let mount = |f: &mut Fixture, source: &str, target: &str, kind: &str, flags: u64| {
+        let (source, target) = (f.put(source.as_bytes()), f.put(target.as_bytes()));
+        let kind = if kind.is_empty() {
+            0
+        } else {
+            f.put(kind.as_bytes())
+        };
+        f.ret(165, &[source, target, kind, flags, 0])
+    };
+    type Events = Vec<(u64, i32, i32, Vec<(u8, Vec<u8>)>)>;
+    let events = |f: &mut Fixture, group: u64| -> Events {
+        match f.read(group, 4096) {
+            Ok(seen) => seen
+                .into_iter()
+                .map(|s| (s.mask, s.fd, s.pid, s.records))
+                .collect(),
+            Err(e) => {
+                assert_eq!(e, errno(Errno::EAGAIN));
+                Vec::new()
+            }
+        }
+    };
+    let record = |id: &[u8]| (7u8, [&[0; 4][..], id].concat());
+    assert_eq!(mount(&mut f, "none", "/tmp/m", "tmpfs", 0), 0);
+    let m = unique(&mut f, "/tmp/m");
+    assert_eq!(events(&mut f, fan), [(ATTACH, -1, 1, vec![record(&m)])]);
+    // The pidfd record comes before the mount's.
+    let seen = events(&mut f, pidfd);
+    assert_eq!(seen.len(), 1);
+    assert_eq!((seen[0].0, seen[0].3.len()), (ATTACH, 2));
+    assert_eq!((seen[0].3[0].0, &seen[0].3[1]), (4, &record(&m)));
+    assert!(events(&mut f, detach).is_empty());
+    // A move is both events, each group taking those it asked for.
+    assert_eq!(mount(&mut f, "/tmp/m", "/tmp/n", "", 0x2000), 0);
+    assert_eq!(
+        events(&mut f, fan),
+        [(ATTACH | DETACH, -1, 1, vec![record(&m)])]
+    );
+    assert_eq!(events(&mut f, pidfd).len(), 1);
+    assert_eq!(events(&mut f, detach), [(DETACH, -1, 1, vec![record(&m)])]);
+    let path = f.put(b"/tmp/n");
+    assert_eq!(f.ret(166, &[path, 2]), 0);
+    assert_eq!(events(&mut f, fan), [(DETACH, -1, 1, vec![record(&m)])]);
+    assert!(events(&mut f, pidfd).is_empty());
+    assert_eq!(events(&mut f, detach).len(), 1);
+    // Once the mark goes, nothing more is told.
+    assert_eq!(
+        f.mark(fan, REMOVE | MNTNS, ATTACH | DETACH, "/proc/self/ns/mnt"),
+        0
+    );
+    assert_eq!(mount(&mut f, "none", "/tmp/m", "tmpfs", 0), 0);
+    assert!(events(&mut f, fan).is_empty());
+    assert_eq!(events(&mut f, pidfd).len(), 1);
+}

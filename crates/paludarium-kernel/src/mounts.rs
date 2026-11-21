@@ -427,7 +427,8 @@ fn open_tree(c: &mut Context<'_>, dfd: u64, ptr: u64, flags: u64) -> Result<u64,
             flags & AT_RECURSIVE != 0,
             foreign,
         )?;
-        let namespace = namespaces.new_mount(&owner, table);
+        let namespace = namespaces.new_mount(&owner, Arc::clone(&table));
+        crate::files::mounts_to_fanotify(&table, &c.files.caches, namespace.inode);
         let file = crate::namespaces::NamespaceFile::new(namespace, 0);
         return c
             .files

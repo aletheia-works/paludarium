@@ -186,8 +186,9 @@ mod linux {
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
             // marks need CAP_SYS_ADMIN, the inotify-unmount case, which mounts
-            // a tmpfs in a mount namespace of its own, the userfaultfd cases, whose files take
-            // the kernel's faults too (CAP_SYS_PTRACE), the perf cases, whose
+            // a tmpfs in a mount namespace of its own, the userfaultfd cases,
+            // whose files take the kernel's faults too (CAP_SYS_PTRACE), the
+            // perf cases, whose
             // events of the kernel and of CPUs need CAP_PERFMON (and the
             // throttle case writes a sysctl), the bpf cases, whose
             // maps need CAP_BPF, the keys cases, which set up keyrings as root
@@ -270,6 +271,7 @@ mod linux {
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
                     | "fanotify-mounts"
+                    | "fanotify-mount-events"
                     | "inotify-unmount"
                     | "fanotify-perm"
                     | "fanotify-access-perm"
@@ -694,6 +696,7 @@ mod linux {
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         fanotify_mounts => ("fanotify-mounts","fanotify"),
+        fanotify_mount_events => ("fanotify-mount-events","fanotify"),
         fanotify_perm => ("fanotify-perm","fanotify"),
         fanotify_access_perm => ("fanotify-access-perm","fanotify"),
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),

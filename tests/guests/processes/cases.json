@@ -186,6 +186,7 @@
     {"name":"fanotify-pidfd","binary":"fanotify"},
     {"name":"fanotify-unprivileged","binary":"fanotify"},
     {"name":"fanotify-mounts","binary":"fanotify"},
+    {"name":"fanotify-mount-events","binary":"fanotify"},
     {"name":"fanotify-perm","binary":"fanotify"},
     {"name":"fanotify-access-perm","binary":"fanotify"},
     {"name":"fanotify-open-exec","binary":"fanotify"},

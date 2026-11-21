@@ -79,6 +79,8 @@ const PID_INIT: u32 = 0xEFFF_FFFC;
 const CGROUP_INIT: u32 = 0xEFFF_FFFB;
 const TIME_INIT: u32 = 0xEFFF_FFFA;
 const DYNAMIC_FIRST: u32 = 0xF000_0000;
+/// The first mount namespace's inode.
+pub(crate) const FIRST_MOUNT_INODE: u32 = DYNAMIC_FIRST + 1;
 /// `MAX_PID_NS_LEVEL`: how many PID namespaces nest below the first, which
 /// is level 0, as Linux's `init_pid_ns`.
 const MAX_PID_LEVEL: u32 = 32;
@@ -145,6 +147,7 @@ pub(crate) fn copy_mounts(
 ) -> Arc<paludarium_vfs::MountTable> {
     let locked = !std::ptr::eq(old.owner(), owner);
     let table = mount_table(old, files).copy(locked);
+    crate::files::mounts_to_fanotify(&table, &files.caches, new.inode);
     if let Some(owner) = &new.owner {
         table.set_owner(Arc::clone(owner) as Arc<dyn std::any::Any + Send + Sync>);
     }
@@ -590,7 +593,7 @@ impl Default for Namespaces {
             pid_for_children: pid.clone(),
             pid,
             user: Arc::clone(crate::users::first()),
-            mnt: new(Kind::Mnt, DYNAMIC_FIRST + 1),
+            mnt: new(Kind::Mnt, FIRST_MOUNT_INODE),
             cgroup: new(Kind::Cgroup, CGROUP_INIT),
             time_for_children: time.clone(),
             time,

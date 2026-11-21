@@ -1066,27 +1066,53 @@ fn a_file_open_in_a_detached_tree_outlasts_the_tree() {
 }
 
 #[test]
-fn an_unmount_hook_hears_each_mount_that_leaves() {
+fn a_mount_hook_hears_each_mount_that_comes_goes_or_moves() {
+    use MountChange::{Attach, Detach, Move};
     let (_, fs) = machine();
     let heard = Arc::new(Mutex::new(Vec::new()));
     let hearing = Arc::clone(&heard);
     fs.table()
-        .set_unmount_hook(Some(Arc::new(move |ids: &[u64]| {
-            lock(&hearing).push(ids.to_vec());
+        .set_mount_hook(Some(Arc::new(move |changes: &[(u64, MountChange)]| {
+            lock(&hearing).push(changes.to_vec());
         })));
+    let unique = |path: &[u8]| {
+        fs.mounts()
+            .iter()
+            .find(|m| m.path == path)
+            .map(|m| m.unique)
+            .unwrap()
+    };
+    let take = || std::mem::take(&mut *lock(&heard));
     fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    let m = unique(b"/tmp/m");
     fs.mkdir(b"/tmp/m/in", 0o755).unwrap();
     fs.mount(b"/tmp/m/in", tmpfs(0)).unwrap();
-    let (m, inner) = (
-        fs.target(b"/tmp/m").unwrap().id,
-        fs.target(b"/tmp/m/in").unwrap().id,
-    );
-    // A detached tree that goes is in no namespace.
+    let inner = unique(b"/tmp/m/in");
+    assert_eq!(take(), [vec![(m, Attach)], vec![(inner, Attach)]]);
+    // A recursive bind takes in each copy, each before those on it.
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.bind(b"/tmp/m", b"/tmp/b", true).unwrap();
+    let (b, b_in) = (unique(b"/tmp/b"), unique(b"/tmp/b/in"));
+    assert_eq!(take(), [vec![(b, Attach), (b_in, Attach)]]);
+    // A move tells of the tree's root alone.
+    fs.mkdir(b"/tmp/n", 0o755).unwrap();
+    fs.move_mount(b"/tmp/b", b"/tmp/n", &[]).unwrap();
+    assert_eq!(take(), [vec![(b, Move)]]);
+    // A detached tree tells nothing until it is attached, and then each of
+    // its mounts comes in.
+    let (tree, pin) = fs.clone_tree(b"/tmp/m", true, true).unwrap();
+    assert!(take().is_empty());
+    fs.mkdir(b"/tmp/c", 0o755).unwrap();
+    fs.move_mount(&tree, b"/tmp/c", &[]).unwrap();
+    drop(pin);
+    let (c, c_in) = (unique(b"/tmp/c"), unique(b"/tmp/c/in"));
+    assert_eq!(take(), [vec![(c, Attach), (c_in, Attach)]]);
+    // One that goes before it is attached tells nothing.
     let (_, pin) = fs.clone_tree(b"/tmp/m", true, false).unwrap();
     drop(pin);
     let _ = fs.mounts();
-    fs.umount(m, true).unwrap();
-    assert_eq!(*lock(&heard), [vec![m, inner]]);
+    fs.umount(fs.target(b"/tmp/m").unwrap().id, true).unwrap();
+    assert_eq!(take(), [vec![(m, Detach), (inner, Detach)]]);
 }
 
 #[test]

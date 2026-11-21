@@ -258,7 +258,11 @@ every test passing.
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)
   for the Linux, macOS and Windows targets, so the native crates keep building
-  with stable; the tests use only the pinned nightly.
+  with stable; the tests use only the pinned nightly. Both clippy runs also
+  check the `fuzz/` crate, a workspace of its own (the stable one for Linux).
+  `mise run lint:all` runs the same clippy runs locally (`rust:check`), the
+  stable one through `scripts/stable-cargo.sh`; the CI workflows that run
+  `lint:all` leave the stable one to `stable-clippy`.
 - Every GitHub Actions action is pinned to a commit SHA.
 
 ## CI

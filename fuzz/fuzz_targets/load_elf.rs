@@ -16,7 +16,7 @@ fn input_file(data: &[u8]) -> Vec<u8> {
     match data.split_first() {
         Some((mode, rest)) if mode & 1 == 0 => {
             let mut file = tiny_exec(&[0x90; 32], b"data");
-            for patch in rest.chunks_exact(3) {
+            for patch in rest.as_chunks::<3>().0 {
                 let at = usize::from(u16::from_le_bytes([patch[0], patch[1]])) % file.len();
                 file[at] = patch[2];
             }

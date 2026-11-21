@@ -19,7 +19,7 @@ fn address(raw: u64) -> GuestAddr {
 fuzz_target!(|data: &[u8]| {
     let mut space = AddressSpace::new();
     let mut buf = vec![0u8; 0x3000];
-    for op in data.chunks_exact(18).take(256) {
+    for op in data.as_chunks::<18>().0.iter().take(256) {
         let raw = u64::from_le_bytes(op[1..9].try_into().unwrap_or([0; 8]));
         let len = u64::from_le_bytes(op[9..17].try_into().unwrap_or([0; 8]));
         let small_len = (len % 0x3000) as usize;

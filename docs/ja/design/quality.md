@@ -178,7 +178,7 @@ lock 付きの命令のフェンスを外しても、テストはすべて通り
 - `cargo fmt --check`、clippy（警告はエラー）、`cargo deny`（ライセンス、取得元、
   既知の脆弱性）を、プルリクエストごとに動かします。clippy は、`rust-version` が指す stable の Rust
   （最新の版で、毎週上げます）でも Linux・macOS・Windows のターゲットに動かし、ネイティブの crate が stable でもビルドできることを
-  保ちます。テストは、固定した nightly だけで動かします。
+  保ちます。テストは、固定した nightly だけで動かします。どちらの clippy も、それだけで workspace になっている `fuzz/` の crate も検査します（stable のほうは Linux のターゲット）。`mise run lint:all`（`rust:check`）は、同じ clippy を手元でも動かし、stable のほうは `scripts/stable-cargo.sh` を通します。`lint:all` を動かす CI のワークフローは、stable のほうを `stable-clippy` に任せます。
 - GitHub Actions の action は、すべてコミットの SHA で固定しています。
 
 ## CI

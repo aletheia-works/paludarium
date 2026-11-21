@@ -53,7 +53,7 @@ fuzz_target!(|data: &[u8]| {
             rip: GuestAddr(0x1000),
         },
     );
-    for call in data.chunks_exact(57).take(64) {
+    for call in data.as_chunks::<57>().0.iter().take(64) {
         let selector = call[0];
         let number = if selector < 200 {
             numbers[usize::from(selector) % numbers.len()]

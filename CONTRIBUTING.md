@@ -47,10 +47,17 @@ and any unverified behavior in the PR:
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
+scripts/stable-cargo.sh clippy --locked --workspace --all-targets -- -D warnings
 PALUDARIUM_TEST_NODE=<absolute path to node> cargo test --locked --workspace
 ```
 
-`mise run lint:all` runs the first two and `mise run test` the unit tests;
+`mise run lint:all` runs the first three, the third for the Linux, macOS and
+Windows targets as CI's `stable-clippy` does, and clippy of the `fuzz/` crate
+with both toolchains; `mise run test` runs the unit tests.
+`scripts/stable-cargo.sh` runs the cargo of the stable Rust that `rust-version`
+names, installing it when it is missing (mise's cargo is the pinned nightly's).
+`PALUDARIUM_SKIP_STABLE_CLIPPY=1` leaves its clippy out of `lint:all`, as the CI
+workflows that run `lint:all` do, since `stable-clippy` runs it;
 `mise tasks` lists the other checks (differential tests, coverage, fuzzing).
 On x86-64 Linux, `mise run test:diff` needs
 `sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0` for the

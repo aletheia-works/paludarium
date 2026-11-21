@@ -35,3 +35,7 @@ jobs:
           cache: false
       - name: Run polyglot lint
         run: mise run lint:all
+        env:
+          # ci.yml's stable-clippy job runs rust:check's clippy of the stable
+          # Rust of rust-version.
+          PALUDARIUM_SKIP_STABLE_CLIPPY: '1'

@@ -238,7 +238,10 @@ jobs:
           cargo fmt --check --manifest-path fuzz/Cargo.toml
           cargo fmt --check --manifest-path tests/guests/hello-rs/Cargo.toml
       - name: clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        # The fuzz crate is a separate workspace.
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - name: decoder builds for wasm32
         run: cargo build --locked -p paludarium-decoder -p paludarium-mmu -p paludarium-cpu --target wasm32-unknown-unknown
 
@@ -280,6 +283,9 @@ jobs:
             cargo clippy --locked --workspace --all-targets --target "$target" -- -D warnings
             echo "::endgroup::"
           done
+          # The fuzz crate, a separate workspace, which runs on Linux.
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets \
+            --target x86_64-unknown-linux-gnu -- -D warnings
 
   dependencies:
     needs: changes

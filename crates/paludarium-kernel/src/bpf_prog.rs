@@ -676,6 +676,61 @@ impl Program {
     }
 }
 
+/// `bpf_prog_size`: what a program of `insns` instructions takes, and what
+/// a socket is charged for it as its filter.
+pub(crate) fn prog_size(insns: usize) -> u64 {
+    PROG_HEADER + INSN_SIZE * insns as u64
+}
+
+/// A socket's filter (`sk_filter->prog`): a program `SO_ATTACH_BPF` gave,
+/// or a classic one `SO_ATTACH_FILTER` gave, converted.
+#[derive(Clone)]
+pub(crate) enum Attached {
+    Program(Arc<Program>),
+    Classic(Arc<crate::bpf_classic::Classic>),
+}
+
+impl Attached {
+    /// What the socket is charged for it (`sk_filter_charge`).
+    pub(crate) fn filter_size(&self) -> u64 {
+        match self {
+            Attached::Program(p) => p.filter_size(),
+            Attached::Classic(c) => c.filter_size(),
+        }
+    }
+
+    /// The classic program as given (`orig_prog`), which a program
+    /// `SO_ATTACH_BPF` gave has none of.
+    pub(crate) fn classic(&self) -> Option<&crate::bpf_classic::Classic> {
+        match self {
+            Attached::Program(_) => None,
+            Attached::Classic(c) => Some(c),
+        }
+    }
+
+    fn run(
+        &self,
+        packet: &crate::bpf_interp::Packet<'_>,
+        kernel: &mut dyn crate::bpf_interp::Kernel,
+    ) -> u32 {
+        let classic = match self {
+            Attached::Program(p) => return p.run(packet, kernel),
+            Attached::Classic(c) => c,
+        };
+        let program = crate::bpf_interp::Program {
+            insns: &classic.insns,
+            maps: &[],
+            loads: &BTreeMap::new(),
+        };
+        let result = crate::bpf_interp::run(&program, packet, kernel);
+        assert!(
+            !cfg!(any(debug_assertions, feature = "fuzzing")) || result.is_ok(),
+            "a converted classic program faulted"
+        );
+        result.map_or(0, |r0| r0 as u32)
+    }
+}
+
 /// `sizeof(struct skb_shared_info)` on x86-64, at the end of every skb head.
 pub(crate) const SKB_SHARED_INFO: usize = 320;
 /// `SKB_MAX_ALLOC` on x86-64: four pages less `skb_shared_info`, the most
@@ -763,7 +818,7 @@ impl crate::bpf_interp::Kernel for Receiving<'_> {
 /// how many of its bytes the receiving socket keeps, or `None` when the
 /// filter drops it.
 pub(crate) fn sk_filter(
-    program: &Program,
+    program: &Attached,
     buf: &[u8],
     kernel: &mut Receiving<'_>,
 ) -> Option<usize> {

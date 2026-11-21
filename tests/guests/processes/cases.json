@@ -158,6 +158,7 @@
     {"name":"bpf-prog-context","binary":"bpf-prog"},
     {"name":"bpf-prog-attach","binary":"bpf-prog"},
     {"name":"bpf-prog-corpus","binary":"bpf-prog"},
+    {"name":"bpf-prog-classic","binary":"bpf-prog"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},
     {"name":"inotify-files","binary":"inotify"},

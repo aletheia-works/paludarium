@@ -320,6 +320,7 @@ mod linux {
                     | "bpf-prog-context"
                     | "bpf-prog-attach"
                     | "bpf-prog-corpus"
+                    | "bpf-prog-classic"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -666,6 +667,7 @@ mod linux {
         bpf_prog_context => ("bpf-prog-context","bpf-prog"),
         bpf_prog_attach => ("bpf-prog-attach","bpf-prog"),
         bpf_prog_corpus => ("bpf-prog-corpus","bpf-prog"),
+        bpf_prog_classic => ("bpf-prog-classic","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),

@@ -357,15 +357,16 @@ verified.
 - **BPF, maps and socket filters on AF_UNIX sockets only**: `bpf` makes
   arrays, hashes, LRU hashes, longest-prefix-match tries, queues, stacks,
   bloom filters, and arrays and hashes of maps, and loads socket filters,
-  and nothing else. A socket filter runs only attached with
-  `SO_ATTACH_BPF` to an AF_UNIX datagram or packet socket. A classic
-  filter (`SO_ATTACH_FILTER`) and an internet socket are `ENOPROTOOPT`.
+  and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
+  classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
+  or packet socket; on an internet socket the options are `ENOPROTOOPT`.
   No JIT compiles a program: the interpreter runs it. Of the helpers'
   values, the processor is 0, a network namespace's cookie is 1 (the
   initial one's) in every namespace, the boot and coarse clocks are the
   monotonic one, and `CLOCK_TAI` is the real time. A program is charged to
   its socket as though Linux's rewrites made it 16 times longer, so
-  `SO_ATTACH_BPF` is `ENOMEM` sooner than on Linux for a long one.
+  `SO_ATTACH_BPF` is `ENOMEM` sooner than on Linux for a long one; a
+  classic filter is charged what Linux charges for it.
   Every other program type is
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are

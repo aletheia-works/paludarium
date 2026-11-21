@@ -4492,7 +4492,8 @@ kernel.
   helper "invalid func %s#%d" (`EINVAL`).
 
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
-  socket with `SO_ATTACH_BPF` and runs on each message sent to it, as
+  socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`
+  (below), and runs on each message sent to it, as
   Linux's `sk_filter` and `unix_dgram_sendmsg`. Before the receiver's
   checks, but after the sender's own shutdown and send buffer, it decides
   the message's fate: 0 drops it, and the send still gives its length;
@@ -4513,8 +4514,39 @@ kernel.
   - `SO_LOCK_FILTER` keeps the filter as it is (`EPERM`) until the socket
     goes, and it cannot be unlocked.
   - `SO_GET_FILTER` gives 0 blocks with no filter and `EACCES` for one
-    attached with `SO_ATTACH_BPF`.
+    attached with `SO_ATTACH_BPF`. For a classic one it gives the
+    instructions as attached and their number in `*len`, in blocks: a
+    `*len` of 0 only asks for it, and one short of it is `EINVAL`.
   - `SO_BPF_EXTENSIONS` gives 64 (`SKF_AD_MAX`).
+
+- A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
+  for another size) is checked as Linux's `bpf_check_classic` checks it
+  and converted as `bpf_convert_filter` converts it, instruction for
+  instruction, and the interpreter runs what it converts to.
+  - It is `EINVAL` for no instructions or more than 4096, a code Linux
+    does not know, a division or remainder by a constant 0, a constant
+    shift of 32 or more, a scratch word past the 16th or one read where
+    some path has not written it, a jump past the end, an ancillary load
+    Linux does not know, and a last instruction that does not return. It
+    is `EFAULT` for instructions that cannot be read, and `EPERM` on a
+    locked socket.
+  - The conversion is `EINVAL` for a jump that the converted program's
+    16-bit offset cannot hold, and for any jump placed past its 32,767th
+    instruction, as Linux's first pass, which takes every target to be at
+    0, refuses it. The socket is charged the converted program's size, as
+    on Linux (`ENOMEM`).
+  - The accumulator and X are 32 bits, and the jumps compare them
+    unsigned. A division or remainder by an X of 0 returns 0, and a shift
+    by X takes its count modulo 32.
+  - A load of the message gives its bytes big-endian, and returns 0 where
+    they are past its end. A negative offset from `SKF_NET_OFF` on reads
+    from the network header, the message's start; one from the MAC header
+    (`SKF_LL_OFF`), which an AF_UNIX message has not set, returns 0.
+  - The ancillary loads are those of an AF_UNIX message. The protocol,
+    packet type, mark, queue, hash, VLAN fields and payload offset are 0.
+    The interface index and hardware type return the accumulator as it
+    is, since there is no device. The netlink attribute searches are
+    Linux's `nla_find`, and give 0 for a message in pages.
 
 - The log (`log_level`, `log_buf`, `log_size`) gets the line that says
   why a program was refused, in 7.0's words where the two kernels word it

@@ -1829,8 +1829,10 @@ const SO_DOMAIN: u32 = 39;
 const SO_PEEK_OFF: u32 = 42;
 const SO_BUSY_POLL: u32 = 46;
 const SO_INCOMING_CPU: u32 = 49;
-/// `SO_GET_FILTER`, which is `SO_ATTACH_FILTER` when set.
-const SO_GET_FILTER: u32 = 26;
+/// `SO_ATTACH_FILTER`, a classic filter, and `SO_GET_FILTER`, which gets
+/// it: one number, set and got.
+const SO_ATTACH_FILTER: u32 = 26;
+const SO_GET_FILTER: u32 = SO_ATTACH_FILTER;
 /// `SO_DETACH_FILTER`, which is `SO_DETACH_BPF` too.
 const SO_DETACH_FILTER: u32 = 27;
 const SO_LOCK_FILTER: u32 = 44;
@@ -2043,6 +2045,9 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let on = value != 0;
     // The filter options, as `sk_setsockopt` and net/core/filter.c take
     // them: a lock that `SO_LOCK_FILTER` sets keeps the filter as it is.
+    // The program is found or made outside the sides' lock, which is then
+    // checked again: sk_setsockopt holds the socket's lock throughout, so
+    // no SO_LOCK_FILTER comes in between.
     match name {
         SO_ATTACH_BPF => {
             if len != 4 {
@@ -2051,28 +2056,30 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             if socket.lock_sides()[socket.side].filter_locked {
                 return Err(Errno::EPERM);
             }
-            // The descriptor is looked up outside the sides' lock, which is
-            // then checked again: sk_setsockopt holds the socket's lock
-            // throughout, so no SO_LOCK_FILTER comes in between.
             let program = crate::bpf_prog::socket_filter(c, value.cast_unsigned())?;
-            let mut sides = socket.lock_sides();
-            let own = &mut sides[socket.side];
-            if own.filter_locked {
+            return attach(socket, crate::bpf_prog::Attached::Program(program));
+        }
+        // SO_ATTACH_FILTER: copy_bpf_fprog_from_user takes a struct
+        // sock_fprog, a length and the instructions' address, and
+        // __get_filter copies them and converts them.
+        SO_ATTACH_FILTER => {
+            if len != 16 {
+                return Err(Errno::EINVAL);
+            }
+            let fprog = read_words(c, a[3], 16)?;
+            if socket.lock_sides()[socket.side].filter_locked {
                 return Err(Errno::EPERM);
             }
-            // __sk_filter_charge: the new filter is charged before the old
-            // is given back, against net.core.optmem_max.
-            let held = own.filter.as_ref().map_or(0, |f| f.program.filter_size());
-            let size = program.filter_size();
-            if size > MAX_CONTROL || held + size >= MAX_CONTROL {
-                return Err(Errno::ENOMEM);
+            let count = usize::from(u16::from_le_bytes([fprog[0], fprog[1]]));
+            let at = u64::from_le_bytes(fprog[8..16].try_into().map_err(|_| Errno::EFAULT)?);
+            if at == 0 || count == 0 || count > crate::bpf_classic::MAX_INSNS {
+                return Err(Errno::EINVAL);
             }
-            own.filter = Some(Filter {
-                program,
-                socket: socket.unix().map_or_else(Weak::new, |u| Arc::downgrade(&u)),
-                owner: socket.owner(),
-            });
-            return Ok(0);
+            let classic = crate::bpf_classic::prepare(read_words(c, at, count * 8)?)?;
+            return attach(
+                socket,
+                crate::bpf_prog::Attached::Classic(Arc::new(classic)),
+            );
         }
         SO_DETACH_FILTER => {
             let mut sides = socket.lock_sides();
@@ -2184,6 +2191,28 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     Ok(0)
 }
+/// `__sk_attach_prog`: `program` becomes the side's filter, unless the
+/// side is locked (`EPERM`) or has no room for it (`ENOMEM`): it is charged
+/// before the old one is given back, against `net.core.optmem_max`
+/// (`__sk_filter_charge`).
+fn attach(socket: &SocketPairEnd, program: crate::bpf_prog::Attached) -> Result<u64, Errno> {
+    let mut sides = socket.lock_sides();
+    let own = &mut sides[socket.side];
+    if own.filter_locked {
+        return Err(Errno::EPERM);
+    }
+    let held = own.filter.as_ref().map_or(0, |f| f.program.filter_size());
+    let size = program.filter_size();
+    if size > MAX_CONTROL || held + size >= MAX_CONTROL {
+        return Err(Errno::ENOMEM);
+    }
+    own.filter = Some(Filter {
+        program,
+        socket: socket.unix().map_or_else(Weak::new, |u| Arc::downgrade(&u)),
+        owner: socket.owner(),
+    });
+    Ok(0)
+}
 /// `getsockopt(fd, level, name, value, len)` on a socket pair, as Linux's
 /// `sk_getsockopt`: the value, cut to `*len` bytes, and its length back in
 /// `*len` (EFAULT when either cannot be read or written, EINVAL for a
@@ -2276,12 +2305,26 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_BUSY_POLL => int(options.busy_poll),
         SO_INCOMING_CPU => int(options.incoming_cpu),
         // sk_get_filter: no filter is 0 blocks; one attached with
-        // SO_ATTACH_BPF has no classic program to give (EACCES).
+        // SO_ATTACH_BPF has no classic program to give (EACCES); a classic
+        // one is its instructions, and its length in blocks, not bytes, in
+        // *len, which a *len of 0 only asks for, and one short of it is
+        // EINVAL.
         SO_GET_FILTER => {
-            if socket.lock_sides()[socket.side].filter.is_some() {
-                return Err(Errno::EACCES);
+            let filter = socket.lock_sides()[socket.side].filter.clone();
+            let Some(filter) = filter else {
+                return put_length(c, a[4], 0);
+            };
+            let classic = filter.program.classic().ok_or(Errno::EACCES)?;
+            let blocks = classic.blocks();
+            if len != 0 {
+                if (len.cast_unsigned() as usize) < blocks {
+                    return Err(Errno::EINVAL);
+                }
+                c.mem
+                    .write(GuestAddr(a[3]), &classic.original)
+                    .map_err(|_| Errno::EFAULT)?;
             }
-            Vec::new()
+            return put_length(c, a[4], blocks as u32);
         }
         SO_LOCK_FILTER => int(socket.lock_sides()[socket.side].filter_locked.into()),
         // bpf_tell_extensions: SKF_AD_MAX.
@@ -2294,6 +2337,13 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     c.mem
         .write(GuestAddr(a[4]), &(len as u32).to_le_bytes())
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(0)
+}
+/// `getsockopt`'s `*len` set to `len` (EFAULT).
+fn put_length(c: &Context<'_>, at: u64, len: u32) -> Result<u64, Errno> {
+    c.mem
+        .write(GuestAddr(at), &len.to_le_bytes())
         .map_err(|_| Errno::EFAULT)?;
     Ok(0)
 }
@@ -2483,11 +2533,11 @@ impl Received {
     }
 }
 /// A side's socket filter: the program, the socket it runs for
-/// (`skb->sk`) and that socket's owner (`sk_uid`), as `SO_ATTACH_BPF` found
-/// them.
+/// (`skb->sk`) and that socket's owner (`sk_uid`), as `SO_ATTACH_BPF` or
+/// `SO_ATTACH_FILTER` found them.
 #[derive(Clone)]
 struct Filter {
-    program: Arc<crate::bpf_prog::Program>,
+    program: crate::bpf_prog::Attached,
     socket: Weak<crate::unix::UnixSocket>,
     owner: u32,
 }
@@ -2516,7 +2566,7 @@ fn passes(side: &Side) -> bool {
 #[derive(Default)]
 struct Side {
     /// The socket filter attached to this side's socket (`sk_filter`,
-    /// `SO_ATTACH_BPF`).
+    /// `SO_ATTACH_BPF` or `SO_ATTACH_FILTER`).
     filter: Option<Filter>,
     /// `SOCK_FILTER_LOCKED` (`SO_LOCK_FILTER`).
     filter_locked: bool,

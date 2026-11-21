@@ -1375,6 +1375,451 @@ static int case_corpus(void) {
     return 0;
 }
 
+/* Classic filters: struct sock_filter and struct sock_fprog. */
+struct sf {
+    uint16_t code;
+    uint8_t jt, jf;
+    uint32_t k;
+};
+struct fprog {
+    uint16_t len;
+    const struct sf *filter;
+};
+#define S(code, k) ((struct sf){(code), 0, 0, (uint32_t)(k)})
+#define SJ(code, jt, jf, k) ((struct sf){(code), (jt), (jf), (uint32_t)(k)})
+#define C_RET_K 0x06
+#define C_RET_A 0x16
+#define C_LD_IMM 0x00
+#define C_LDX_IMM 0x01
+#define C_LD_W_ABS 0x20
+#define C_LD_H_ABS 0x28
+#define C_LD_B_ABS 0x30
+#define C_LD_W_IND 0x40
+#define C_LD_H_IND 0x48
+#define C_LD_B_IND 0x50
+#define C_LD_MEM 0x60
+#define C_LDX_MEM 0x61
+#define C_LD_LEN 0x80
+#define C_LDX_LEN 0x81
+#define C_LDX_MSH 0xb1
+#define C_ST 0x02
+#define C_STX 0x03
+#define C_TAX 0x07
+#define C_TXA 0x87
+#define C_JA 0x05
+#define C_JEQ_K 0x15
+#define C_JEQ_X 0x1d
+#define C_JGT_K 0x25
+#define C_JGT_X 0x2d
+#define C_JGE_K 0x35
+#define C_JSET_K 0x45
+#define C_JSET_X 0x4d
+#define C_ALU_K(op) (0x04 | (op))
+#define C_ALU_X(op) (0x0c | (op))
+#define C_ADD 0x00
+#define C_SUB 0x10
+#define C_MUL 0x20
+#define C_DIV 0x30
+#define C_OR 0x40
+#define C_AND 0x50
+#define C_LSH 0x60
+#define C_RSH 0x70
+#define C_NEG 0x84
+#define C_MOD 0x90
+#define C_XOR 0xa0
+#define AD(n) (-0x1000 + (n))
+#define NET(n) (-0x100000 + (n))
+#define LL(n) (-0x200000 + (n))
+
+static int attach_classic_len(int sock, const struct sf *filter, unsigned count, socklen_t len) {
+    struct fprog p = {(uint16_t)count, filter};
+    return setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &p, len) ? -errno : 0;
+}
+static int attach_classic(int sock, const struct sf *filter, unsigned count) {
+    return attach_classic_len(sock, filter, count, sizeof(struct fprog));
+}
+#define CLASSIC(sock, ...)                                      \
+    ({                                                          \
+        struct sf f_[] = {__VA_ARGS__};                         \
+        attach_classic((sock), f_, COUNT(f_));                  \
+    })
+
+static unsigned char pattern[300], netlink[300];
+static unsigned char *large;
+#define LARGE 20000
+
+/* What b receives of msg from a: its length, or -errno. */
+static long kept(int a, int b, const unsigned char *msg, size_t len) {
+    static unsigned char in[LARGE];
+    if (send(a, msg, len, MSG_DONTWAIT) < 0) return -1000 - errno;
+    long got = recv(b, in, sizeof in, MSG_DONTWAIT);
+    return got < 0 ? -errno : got;
+}
+
+/* The value `code` leaves in A, byte by byte: each run keeps one byte
+   more than the byte of A it shifts down, of a message longer than 256.
+   A filter that returns 0 before the end drops the message. */
+static void value(const char *name, const unsigned char *msg, size_t len, const struct sf *code, unsigned n) {
+    int p[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, p)) return;
+    int on = 1 << 20;
+    setsockopt(p[1], SOL_SOCKET, SO_RCVBUF, &on, sizeof on);
+    setsockopt(p[0], SOL_SOCKET, SO_SNDBUF, &on, sizeof on);
+    uint32_t v = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        struct sf f[64];
+        memcpy(f, code, n * sizeof *f);
+        f[n] = S(C_ALU_K(C_RSH), shift);
+        f[n + 1] = S(C_ALU_K(C_AND), 0xff);
+        f[n + 2] = S(C_ALU_K(C_ADD), 1);
+        f[n + 3] = S(C_RET_A, 0);
+        int r = attach_classic(p[1], f, n + 4);
+        if (r) {
+            say("%s attach %d", name, r);
+            goto out;
+        }
+        long got = kept(p[0], p[1], msg, len);
+        if (got <= 0) {
+            say("%s dropped %ld", name, got);
+            goto out;
+        }
+        v |= (uint32_t)(got - 1) << shift;
+    }
+    say("%s = %#x", name, v);
+out:
+    close(p[0]);
+    close(p[1]);
+}
+#define VALUE(name, msg, ...)                                   \
+    do {                                                        \
+        struct sf c_[] = {__VA_ARGS__};                         \
+        value((name), (msg), sizeof(msg), c_, COUNT(c_));       \
+    } while (0)
+#define LARGE_VALUE(name, ...)                                  \
+    do {                                                        \
+        struct sf c_[] = {__VA_ARGS__};                         \
+        value((name), large, LARGE, c_, COUNT(c_));             \
+    } while (0)
+
+/* What a filter of `count` copies of `one` and a return is refused with,
+   or 0. */
+static int many(int sock, struct sf one, unsigned count, struct sf last) {
+    static struct sf f[4097];
+    for (unsigned i = 0; i < count; i++) f[i] = one;
+    f[count] = last;
+    return attach_classic(sock, f, count + 1);
+}
+
+/* SO_GET_FILTER with *len of `len` blocks: the error, or *len and the
+   instructions given. */
+static void get_classic(const char *name, int sock, socklen_t len) {
+    struct sf out[16];
+    socklen_t asked = len;
+    memset(out, 0xee, sizeof out);
+    if (getsockopt(sock, SOL_SOCKET, SO_GET_FILTER, out, &len)) {
+        say("%s %d", name, -errno);
+        return;
+    }
+    printf("%s len %u:", name, len);
+    for (unsigned i = 0; asked && i < len && i < 16; i++)
+        printf(" %#x/%u/%u/%#x", out[i].code, out[i].jt, out[i].jf, out[i].k);
+    putchar('\n');
+    fflush(stdout);
+}
+
+static int case_classic(void) {
+    for (size_t i = 0; i < sizeof pattern; i++) pattern[i] = (unsigned char)(i * 7 + 3);
+    large = malloc(LARGE);
+    if (!large) return 1;
+    for (size_t i = 0; i < LARGE; i++) large[i] = (unsigned char)(i * 13 + i / 256);
+    /* Netlink attributes: type 1 of 4 bytes, a nested type 2 that holds
+       type 5, type 3 of 2 bytes (padded to 4), type 4 with
+       NLA_F_NET_BYTEORDER, then zeros, where the search stops. */
+    static const unsigned char attrs[] = {8, 0, 1, 0, 0xa, 0xb, 0xc, 0xd,
+                                          12, 0, 2, 0x80, 8, 0, 5, 0, 1, 2, 3, 4,
+                                          6, 0, 3, 0, 9, 9, 0, 0,
+                                          8, 0, 4, 0x40, 7, 7, 7, 7};
+    memcpy(netlink, attrs, sizeof attrs);
+
+    int p[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, p)) return 1;
+    struct sf ret = S(C_RET_K, 0xffff);
+
+    /* setsockopt's checks, in Linux's order. */
+    say("short len %d", attach_classic_len(p[1], &ret, 1, 2));
+    say("len 8 %d", attach_classic_len(p[1], &ret, 1, 8));
+    say("len 24 %d", attach_classic_len(p[1], &ret, 1, 24));
+    say("bad fprog %d", setsockopt(p[1], SOL_SOCKET, SO_ATTACH_FILTER, (void *)8, 16) ? -errno : 0);
+    say("null filter %d", attach_classic(p[1], NULL, 1));
+    say("no insns %d", attach_classic(p[1], &ret, 0));
+    say("bad filter %d", attach_classic(p[1], (void *)8, 1));
+    say("4097 insns %d", many(p[1], S(C_LD_IMM, 1), 4096, ret));
+    say("4096 insns %d", many(p[1], S(C_LD_IMM, 1), 4095, ret));
+
+    /* bpf_check_classic. */
+    say("unknown code %d", CLASSIC(p[1], S(0x08, 0), ret));
+    say("ret x %d", CLASSIC(p[1], S(0x0e, 0), ret));
+    say("seccomp load %d", CLASSIC(p[1], S(0x21, 0), ret));
+    say("div 0 %d", CLASSIC(p[1], S(C_ALU_K(C_DIV), 0), ret));
+    say("mod 0 %d", CLASSIC(p[1], S(C_ALU_K(C_MOD), 0), ret));
+    say("lsh 32 %d", CLASSIC(p[1], S(C_ALU_K(C_LSH), 32), ret));
+    say("rsh 31 %d", CLASSIC(p[1], S(C_ALU_K(C_RSH), 31), ret));
+    say("mem 16 %d", CLASSIC(p[1], S(C_ST, 16), ret));
+    say("ja past %d", CLASSIC(p[1], S(C_JA, 1), ret));
+    say("ja last %d", CLASSIC(p[1], S(C_JA, 0), ret));
+    say("jeq past %d", CLASSIC(p[1], SJ(C_JEQ_K, 0, 1, 0), ret));
+    say("ancillary 64 %d", CLASSIC(p[1], S(C_LD_W_ABS, AD(64)), ret));
+    say("ancillary 2 %d", CLASSIC(p[1], S(C_LD_B_ABS, AD(2)), ret));
+    say("below ancillary %d", CLASSIC(p[1], S(C_LD_B_ABS, AD(-1)), ret));
+    say("ind ancillary %d", CLASSIC(p[1], S(C_LD_W_IND, AD(64)), ret));
+    say("msh ancillary %d", CLASSIC(p[1], S(C_LDX_MSH, AD(64)), ret));
+    say("no ret %d", CLASSIC(p[1], ret, S(C_LD_IMM, 0)));
+    say("unwritten %d", CLASSIC(p[1], S(C_LD_MEM, 3), ret));
+    say("one path %d", CLASSIC(p[1], SJ(C_JEQ_K, 1, 0, 0), S(C_ST, 3), S(C_LDX_MEM, 3), ret));
+    say("both paths %d", CLASSIC(p[1], S(C_STX, 3), SJ(C_JEQ_K, 1, 0, 0), S(C_ST, 3), S(C_LDX_MEM, 3), ret));
+
+    /* bpf_convert_filter: ld [40000] is 16 instructions, and a jump placed
+       past 32,767 or going further is too far. */
+    struct sf far = S(C_LD_W_ABS, 40000);
+    {
+        /* A program that converts is too large to charge (ENOMEM). */
+        static struct sf f[2051];
+        for (int i = 0; i < 2048; i++) f[i] = far;
+        f[2048] = S(C_JA, 0);
+        f[2049] = ret;
+        say("jump at 32775 %d", attach_classic(p[1], f, 2050));
+        say("jump at 32759 %d", attach_classic(p[1], f + 1, 2049));
+        f[0] = S(C_JA, 2048);
+        for (int i = 1; i <= 2048; i++) f[i] = far;
+        f[2049] = ret;
+        say("jump of 32768 %d", attach_classic(p[1], f, 2050));
+        f[1] = S(C_JA, 2047);
+        say("jump of 32752 %d", attach_classic(p[1], f + 1, 2049));
+    }
+
+    /* The charge, of the converted program: 168 + 128 n bytes for n of
+       them, below net.core.optmem_max (131072) up to 1,022. */
+    {
+        int q[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, q)) return 1;
+        say("1023 far loads %d", many(q[1], far, 1023, ret));
+        say("1022 far loads %d", many(q[1], far, 1022, ret));
+        say("and 1 more %d", CLASSIC(q[1], ret));
+        say("detach %d", option(q[1], SO_DETACH_FILTER, 0));
+        say("600 far loads %d", many(q[1], far, 600, ret));
+        say("600 more %d", many(q[1], far, 600, ret));
+        say("replaced %d", many(q[1], far, 100, ret));
+        close(q[0]);
+        close(q[1]);
+    }
+
+    /* SO_GET_FILTER, SO_DETACH_FILTER and the lock. */
+    {
+        int q[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, q)) return 1;
+        get_classic("get none", q[1], 4);
+        say("attach %d", CLASSIC(q[1], SJ(C_JEQ_K, 0, 1, 0), S(C_LD_IMM, 0x1234), S(C_RET_A, 0)));
+        get_classic("get len 0", q[1], 0);
+        get_classic("get len 2", q[1], 2);
+        get_classic("get len 3", q[1], 3);
+        get_classic("get len 9", q[1], 9);
+        {
+            socklen_t len = 3;
+            say("get to nowhere %d", getsockopt(q[1], SOL_SOCKET, SO_GET_FILTER, (void *)8, &len) ? -errno : 0);
+            len = 0;
+            int r = getsockopt(q[1], SOL_SOCKET, SO_GET_FILTER, (void *)8, &len) ? -errno : 0;
+            say("get len 0 to nowhere %d len %u", r, len);
+        }
+        through("classic", q[0], q[1], 5);
+        int keep2 = PROGRAM(MOV(0, 2), EXIT());
+        say("attach bpf %d", attach(q[1], keep2));
+        get_classic("get bpf", q[1], 4);
+        through("bpf", q[0], q[1], 5);
+        say("back to classic %d", CLASSIC(q[1], S(C_RET_K, 1)));
+        through("classic 1", q[0], q[1], 5);
+        say("detach %d", option(q[1], SO_DETACH_FILTER, 0));
+        get_classic("get detached", q[1], 4);
+        say("lock %d", option(q[1], SO_LOCK_FILTER, 1));
+        say("locked %d", CLASSIC(q[1], ret));
+        say("locked len 8 %d", attach_classic_len(q[1], &ret, 1, 8));
+        say("locked null %d", attach_classic(q[1], NULL, 1));
+        say("locked bad fprog %d", setsockopt(q[1], SOL_SOCKET, SO_ATTACH_FILTER, (void *)8, 16) ? -errno : 0);
+        close(keep2);
+        close(q[0]);
+        close(q[1]);
+    }
+
+    /* What the filters compute. */
+    VALUE("len", pattern, S(C_LD_LEN, 0));
+    VALUE("ldx len", pattern, S(C_LDX_LEN, 0), S(C_TXA, 0));
+    VALUE("ld [0]", pattern, S(C_LD_W_ABS, 0));
+    VALUE("ldh [1]", pattern, S(C_LD_H_ABS, 1));
+    VALUE("ldb [2]", pattern, S(C_LD_B_ABS, 2));
+    VALUE("ld [296]", pattern, S(C_LD_W_ABS, 296));
+    VALUE("ld [297]", pattern, S(C_LD_W_ABS, 297));
+    VALUE("ldb [299]", pattern, S(C_LD_B_ABS, 299));
+    VALUE("ldb [300]", pattern, S(C_LD_B_ABS, 300));
+    VALUE("ldb [0x7fffffff]", pattern, S(C_LD_B_ABS, 0x7fffffff));
+    VALUE("ldb [0x80000000]", pattern, S(C_LD_B_ABS, 0x80000000u));
+    VALUE("ldh net 4", pattern, S(C_LD_H_ABS, NET(4)));
+    VALUE("ldb net 300", pattern, S(C_LD_B_ABS, NET(300)));
+    VALUE("ldb ll 0", pattern, S(C_LD_B_ABS, LL(0)));
+    VALUE("ldb below ll", pattern, S(C_LD_B_ABS, LL(-1)));
+    VALUE("ld [x + 4]", pattern, S(C_LDX_IMM, 10), S(C_LD_W_IND, 4));
+    VALUE("ldh [x - 1]", pattern, S(C_LDX_IMM, -1), S(C_LD_H_IND, 6));
+    VALUE("ldb [x + net]", pattern, S(C_LDX_IMM, 3), S(C_LD_B_IND, NET(1)));
+    VALUE("ldb [x + ancillary]", pattern, S(C_LDX_IMM, 0), S(C_LD_B_IND, AD(0)));
+    VALUE("ldb [x] past", pattern, S(C_LDX_IMM, 300), S(C_LD_B_IND, 0));
+    VALUE("msh", pattern, S(C_LD_IMM, 9), S(C_LDX_MSH, 3), S(C_TXA, 0));
+    VALUE("msh keeps a", pattern, S(C_LD_IMM, 9), S(C_LDX_MSH, 3));
+    VALUE("msh past", pattern, S(C_LDX_MSH, 300), S(C_TXA, 0));
+    VALUE("msh net", pattern, S(C_LDX_MSH, NET(5)), S(C_TXA, 0));
+    VALUE("imm", pattern, S(C_LD_IMM, 0xdeadbeef));
+    VALUE("mem", pattern, S(C_LD_IMM, 0x11223344), S(C_ST, 15), S(C_LD_IMM, 0), S(C_LDX_IMM, 5),
+          S(C_STX, 0), S(C_LD_MEM, 15), S(C_LDX_MEM, 0), S(C_ALU_X(C_ADD), 0));
+    VALUE("tax", pattern, S(C_LD_IMM, 77), S(C_TAX, 0), S(C_LD_IMM, 0), S(C_TXA, 0));
+
+    static const struct {
+        const char *name;
+        uint8_t op;
+        uint32_t a, b;
+    } alu[] = {
+        {"add", C_ADD, 0xfffffff0, 0x20},       {"sub", C_SUB, 5, 9},
+        {"mul", C_MUL, 0x10001, 0x10001},        {"div", C_DIV, 0xffffffff, 7},
+        {"mod", C_MOD, 0xffffffff, 7},           {"and", C_AND, 0xf0f0f0f0, 0x3c3c3c3c},
+        {"or", C_OR, 0xf0f0f0f0, 0x3c3c3c3c},    {"xor", C_XOR, 0xf0f0f0f0, 0x3c3c3c3c},
+        {"lsh", C_LSH, 0x80000001, 31},          {"rsh", C_RSH, 0x80000001, 31},
+        {"div 1", C_DIV, 0x80000000, 1},         {"mod big", C_MOD, 5, 0x80000000},
+    };
+    for (size_t i = 0; i < COUNT(alu); i++) {
+        char name[32];
+        snprintf(name, sizeof name, "%s k", alu[i].name);
+        VALUE(name, pattern, S(C_LD_IMM, alu[i].a), S(C_ALU_K(alu[i].op), alu[i].b));
+        snprintf(name, sizeof name, "%s x", alu[i].name);
+        VALUE(name, pattern, S(C_LD_IMM, alu[i].a), S(C_LDX_IMM, alu[i].b), S(C_ALU_X(alu[i].op), 0));
+    }
+    VALUE("neg", pattern, S(C_LD_IMM, 5), S(C_NEG, 0));
+    VALUE("div x 0", pattern, S(C_LD_IMM, 5), S(C_LDX_IMM, 0), S(C_ALU_X(C_DIV), 0));
+    VALUE("mod x 0", pattern, S(C_LD_IMM, 5), S(C_LDX_IMM, 0), S(C_ALU_X(C_MOD), 0));
+    VALUE("lsh x 33", pattern, S(C_LD_IMM, 3), S(C_LDX_IMM, 33), S(C_ALU_X(C_LSH), 0));
+    VALUE("rsh x 32", pattern, S(C_LD_IMM, 3), S(C_LDX_IMM, 32), S(C_ALU_X(C_RSH), 0));
+
+    /* Jumps: A = 1 when taken, else 2, for each way Linux converts one. */
+    static const struct {
+        const char *name;
+        uint16_t code;
+        uint32_t a, k;
+    } jumps[] = {
+        {"jeq", C_JEQ_K, 5, 5},          {"jeq not", C_JEQ_K, 5, 6},
+        {"jgt", C_JGT_K, 6, 5},          {"jgt equal", C_JGT_K, 5, 5},
+        {"jge equal", C_JGE_K, 5, 5},    {"jge less", C_JGE_K, 4, 5},
+        {"jset", C_JSET_K, 6, 4},        {"jset not", C_JSET_K, 6, 8},
+        {"jgt big", C_JGT_K, 0xffffffff, 0x80000000}, {"jgt big not", C_JGT_K, 0x7fffffff, 0x80000000},
+        {"jeq big", C_JEQ_K, 0xfffffffe, 0xfffffffe}, {"jge big", C_JGE_K, 1, 0xffffffff},
+    };
+    for (size_t i = 0; i < COUNT(jumps); i++) {
+        char name[48];
+        for (int form = 0; form < 3; form++) {
+            /* jt 0, jf 0, and neither 0. */
+            struct sf c[7];
+            int n = 0;
+            c[n++] = S(C_LD_IMM, jumps[i].a);
+            if (form == 0) {
+                c[n++] = SJ(jumps[i].code, 0, 2, jumps[i].k);
+                c[n++] = S(C_LD_IMM, 1), c[n++] = S(C_JA, 1), c[n++] = S(C_LD_IMM, 2);
+            } else if (form == 1) {
+                c[n++] = SJ(jumps[i].code, 2, 0, jumps[i].k);
+                c[n++] = S(C_LD_IMM, 2), c[n++] = S(C_JA, 1), c[n++] = S(C_LD_IMM, 1);
+            } else {
+                c[n++] = SJ(jumps[i].code, 1, 3, jumps[i].k);
+                c[n++] = S(C_LD_IMM, 99), c[n++] = S(C_LD_IMM, 1), c[n++] = S(C_JA, 1), c[n++] = S(C_LD_IMM, 2);
+            }
+            snprintf(name, sizeof name, "%s form %d", jumps[i].name, form);
+            value(name, pattern, sizeof pattern, c, (unsigned)n);
+            /* The same with X. */
+            for (int j = 0; j < n; j++)
+                if (c[j].code == jumps[i].code) {
+                    struct sf x[8];
+                    memcpy(x + 1, c, n * sizeof *c);
+                    x[0] = S(C_LDX_IMM, jumps[i].k);
+                    x[j + 1].code = (uint16_t)(jumps[i].code | 0x08);
+                    x[j + 1].k = 0;
+                    snprintf(name, sizeof name, "%s x form %d", jumps[i].name, form);
+                    value(name, pattern, sizeof pattern, x, (unsigned)n + 1);
+                }
+        }
+    }
+
+    /* The ancillary loads of an AF_UNIX datagram. */
+    static const struct {
+        const char *name;
+        int k;
+    } ancillary[] = {{"protocol", 0}, {"pkttype", 4}, {"mark", 20}, {"queue", 24}, {"rxhash", 32},
+                     {"vlan tag", 44}, {"vlan present", 48}, {"pay offset", 52}, {"vlan tpid", 60}};
+    for (size_t i = 0; i < COUNT(ancillary); i++)
+        VALUE(ancillary[i].name, pattern, S(C_LD_IMM, 0x55), S(C_LD_W_ABS, AD(ancillary[i].k)));
+    /* No device: the program returns A as it is, 0x99, and keeps that
+       many bytes, where it would go on to drop the message. */
+    {
+        int q[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, q)) return 1;
+        say("ifindex %d", CLASSIC(q[1], S(C_LD_IMM, 0x99), S(C_LD_W_ABS, AD(8)), S(C_RET_K, 0)));
+        say("ifindex keeps %ld", kept(q[0], q[1], pattern, sizeof pattern));
+        say("hatype %d", CLASSIC(q[1], S(C_LD_IMM, 0x98), S(C_LD_H_ABS, AD(28)), S(C_RET_K, 0)));
+        say("hatype keeps %ld", kept(q[0], q[1], pattern, sizeof pattern));
+        close(q[0]);
+        close(q[1]);
+    }
+    VALUE("xor x", pattern, S(C_LD_IMM, 0xff00), S(C_LDX_IMM, 0x0ff0), S(C_LD_B_ABS, AD(40)));
+    /* The processor and a random number differ from run to run: only
+       that the filter runs. */
+    VALUE("cpu", pattern, S(C_LD_W_ABS, AD(36)), S(C_LD_IMM, 1));
+    VALUE("random", pattern, S(C_LD_W_ABS, AD(56)), S(C_LD_IMM, 2));
+
+    static const struct {
+        const char *name;
+        uint32_t a, x;
+        int nested;
+    } attr[] = {
+        {"nlattr 1", 0, 1, 0},        {"nlattr 2", 0, 2, 0},       {"nlattr 3", 0, 3, 0},
+        {"nlattr 4", 0, 4, 0},        {"nlattr 5", 0, 5, 0},       {"nlattr 4 from 8", 8, 4, 0},
+        {"nlattr from 2", 2, 3, 0},   {"nlattr at 296", 296, 0, 0}, {"nlattr at 297", 297, 0, 0},
+        {"nest 5", 8, 5, 1},          {"nest 2", 8, 2, 1},         {"nest of 1", 0, 1, 1},
+        {"nest at 4", 4, 0, 1},       {"nest at 297", 297, 0, 1},  {"nlattr x big", 0, 0x10001, 0},
+    };
+    for (size_t i = 0; i < COUNT(attr); i++)
+        VALUE(attr[i].name, netlink, S(C_LD_IMM, attr[i].a), S(C_LDX_IMM, attr[i].x),
+              S(C_LD_W_ABS, AD(attr[i].nested ? 16 : 12)));
+
+    /* A datagram in pages: loads past its linear part, which nlattr does
+       not search. */
+    LARGE_VALUE("large len", S(C_LD_LEN, 0));
+    LARGE_VALUE("large ld [0]", S(C_LD_W_ABS, 0));
+    /* 15,904 bytes in the linear part: the rest in a page. */
+    LARGE_VALUE("large ld [15900]", S(C_LD_W_ABS, 15900));
+    LARGE_VALUE("large ld [15902]", S(C_LD_W_ABS, 15902));
+    LARGE_VALUE("large ld [19996]", S(C_LD_W_ABS, 19996));
+    LARGE_VALUE("large ld [19997]", S(C_LD_W_ABS, 19997));
+    LARGE_VALUE("large ldb [x + 18000]", S(C_LDX_IMM, 1000), S(C_LD_B_IND, 18000));
+    LARGE_VALUE("large ldh net 17000", S(C_LD_H_ABS, NET(17000)));
+    LARGE_VALUE("large msh 17001", S(C_LDX_MSH, 17001), S(C_TXA, 0));
+    LARGE_VALUE("large nlattr", S(C_LD_IMM, 0), S(C_LDX_IMM, 0), S(C_LD_W_ABS, AD(12)));
+
+    /* A SOCK_SEQPACKET pair runs the filter too. */
+    {
+        int q[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, q)) return 1;
+        say("seqpacket attach %d", CLASSIC(q[1], S(C_LD_B_ABS, 2), S(C_RET_A, 0)));
+        through("seqpacket", q[0], q[1], 5);
+        say("seqpacket drop %d", CLASSIC(q[1], S(C_RET_K, 0)));
+        through("seqpacket drop", q[0], q[1], 5);
+        close(q[0]);
+        close(q[1]);
+    }
+    free(large);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1383,5 +1828,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-context")) return case_context();
     if (!strcmp(mode, "bpf-prog-attach")) return case_attach();
     if (!strcmp(mode, "bpf-prog-corpus")) return case_corpus();
+    if (!strcmp(mode, "bpf-prog-classic")) return case_classic();
     return 2;
 }

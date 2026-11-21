@@ -2085,8 +2085,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     答えますが、相手は届いたものを martian として捨てるので、接続は時間切れ
     （`ETIMEDOUT`）になり、データグラムは失われます。TCP はブロードキャストとマルチ
     キャストの経路を取らず（`ENETUNREACH`）、UDP は、`SO_BROADCAST` がなければ、
-    ブロードキャストの経路が持つアドレスや限定ブロードキャストのアドレスへの
-    ブロードキャストの経路を取りません（`EACCES`）。
+    ブロードキャストの経路が持つアドレスや限定ブロードキャストのアドレスへの経路を
+    取りません（`EACCES`）。端のアドレスにバインドしたソケット
+    からのグループや限定ブロードキャストのアドレスへのものは、経路がなくてもその端から
+    出ます（`ip_route_output_key_hash_rcu`）。
   - **veth の端の netconf:** それぞれの端の設定は、その名前空間に伝えます（`RTNLGRP_IPV4_NETCONF`、
     `RTNLGRP_IPV6_NETCONF`。`inetdev_init`、`ipv6_add_dev` とその後始末が伝えるのと
     同じです）。増えるときは IPv4 の、それから IPv6 の設定のすべての `RTM_NEWNETCONF` を

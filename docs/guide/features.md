@@ -2371,7 +2371,10 @@ kernel.
     a connection times out (`ETIMEDOUT`) and a datagram is lost. TCP
     takes no broadcast or multicast route (`ENETUNREACH`), and UDP no
     broadcast one, to an address a broadcast route has or the limited
-    broadcast one, without `SO_BROADCAST` (`EACCES`).
+    broadcast one, without `SO_BROADCAST` (`EACCES`). A group or the
+    limited broadcast address from a socket bound to an end's address
+    needs no route: it goes out through that end
+    (`ip_route_output_key_hash_rcu`).
   - **Netconf of veth ends:** each end's settings
     are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
     `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their

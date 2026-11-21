@@ -2603,6 +2603,11 @@ impl Addresses {
             Kind::Local | Kind::Broadcast
         )
     }
+    /// The device that has the IPv4 address `ip` (`__ip_dev_find`, by its
+    /// addresses only), if any.
+    pub(crate) fn device_of4(&self, ip: Ipv4Addr) -> Option<i32> {
+        self.v4.iter().find(|a| a.local == ip).map(|a| a.index)
+    }
     /// Whether `ip` is an IPv4 address of the loopback's, as a local route
     /// gives it.
     pub(crate) fn local4(&self, ip: Ipv4Addr) -> bool {

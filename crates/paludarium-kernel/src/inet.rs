@@ -388,8 +388,24 @@ impl Network {
     /// broadcast route's address or the limited broadcast one, of the
     /// multicast type to a group ([`Cast`]); else off the guest's
     /// networks, which only the first namespace has a route to.
-    /// `ENETUNREACH` where no route goes.
-    fn route(&self, to: SocketAddr, now: Option<u64>) -> Result<Dest, Errno> {
+    /// `ENETUNREACH` where no route goes. Before all that, a group or the
+    /// limited broadcast address from a source `from` of a veth end's goes
+    /// out through that end without a route, as `ip_route_output_key_hash_rcu`
+    /// takes the source's device for them.
+    fn route(&self, to: SocketAddr, from: Option<IpAddr>, now: Option<u64>) -> Result<Dest, Errno> {
+        if let (Some(IpAddr::V4(src)), IpAddr::V4(ip)) = (from.map(plain), to.ip())
+            && !src.is_unspecified()
+            && (ip.is_multicast() || ip.is_broadcast())
+            && let Some(index) = self.addresses_at(now).device_of4(src)
+            && index != crate::netdev::LOOPBACK_INDEX
+        {
+            let cast = if ip.is_broadcast() {
+                Cast::Broadcast
+            } else {
+                Cast::Multicast
+            };
+            return Ok(Dest::Veth(index, cast));
+        }
         let up = self.is_up();
         let local = match to.ip() {
             ip if ip.is_unspecified() => crate::loopback::destination(to),
@@ -1574,7 +1590,9 @@ impl InetSocket {
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
                     let plain_to = SocketAddr::new(plain(address.ip()), address.port());
-                    let dest = self.network.route(plain_to, self.now())?;
+                    let dest = self
+                        .network
+                        .route(plain_to, s.bound.map(|b| b.ip()), self.now())?;
                     let to = match dest {
                         Dest::Here(to) => Some(to),
                         Dest::Away | Dest::Veth(..) => None,
@@ -1791,7 +1809,7 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        match self.network.route(to, self.now())? {
+        match self.network.route(to, Some(bound.ip()), self.now())? {
             Dest::Here(to) => {
                 let from = self.datagram_source(&mut s, to, &options)?;
                 self.ports().connect(&self.this, from, Some(to));
@@ -1890,7 +1908,9 @@ impl InetSocket {
             None => Ok(()),
         };
         let plain_to = SocketAddr::new(plain(to.ip()), to.port());
-        let route = self.network.route(plain_to, self.now())?;
+        let route = self
+            .network
+            .route(plain_to, s.bound.map(|b| b.ip()), self.now())?;
         if let Dest::Veth(index, cast) = route {
             if self.family == Family::V6 && options.v6_only {
                 return Err(ENETUNREACH);
@@ -4310,7 +4330,7 @@ mod tests {
         assert!(!at(2 * SECOND));
         assert!(
             network
-                .route(SocketAddr::new(IpAddr::V4(ip), 9), Some(3 * SECOND))
+                .route(SocketAddr::new(IpAddr::V4(ip), 9), None, Some(3 * SECOND))
                 .is_err()
         );
         // What the socket found goes to netlink first, in its order: the

@@ -354,6 +354,17 @@ int main(int argc, char **argv) {
     printf("A: poll for 4 s=%d\n", poll(&waiting, 1, 4000));
     show_name(zero, 0, 0, "connecting from");
     close(zero);
+    /* From 0.0.0.0 to an address nobody has: ARP goes unanswered. */
+    zero = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    to = at("10.77.0.9", 5000);
+    printf("A: connect from none to nobody=%ld\n", result(connect(zero, (void *)&to, sizeof to)));
+    waiting = (struct pollfd){.fd = zero, .events = POLLIN | POLLOUT};
+    printf("A: poll for 4 s=%d\n", poll(&waiting, 1, 4000));
+    int lost = 0;
+    socklen_t size = sizeof lost;
+    getsockopt(zero, SOL_SOCKET, SO_ERROR, &lost, &size);
+    printf("A: SO_ERROR from none=%d\n", lost);
+    close(zero);
     route(ctl, RTM_DELROUTE, "10.77.0.0", 24, A_INDEX, "route gone");
     address(ctl, A_INDEX, "10.77.0.1", "add 10.77.0.1/24");
 
@@ -445,6 +456,18 @@ int main(int argc, char **argv) {
     close(cu);
     to = at("255.255.255.255", 6002);
     printf("A: udp sendto limited broadcast=%ld\n", result(sendto(u, "all", 3, 0, (void *)&to, sizeof to)));
+    /* Bound to va's address, a limited broadcast or a group needs no route
+       (ip_route_output_key_hash_rcu takes the source's device). */
+    int bound = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in va = at("10.77.0.1", 6101);
+    printf("A: bind udp to va's=%ld\n", result(bind(bound, (void *)&va, sizeof va)));
+    setsockopt(bound, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+    printf("A: udp sendto limited broadcast from va's=%ld\n", result(sendto(bound, "all", 3, 0, (void *)&to, sizeof to)));
+    to = at("224.1.2.3", 6002);
+    printf("A: udp sendto a group, no route=%ld\n", result(sendto(u, "some", 4, 0, (void *)&to, sizeof to)));
+    printf("A: udp sendto a group from va's, no route=%ld\n", result(sendto(bound, "some", 4, 0, (void *)&to, sizeof to)));
+    printf("A: udp connect a group from va's, no route=%ld\n", result(connect(bound, (void *)&to, sizeof to)));
+    close(bound);
     route(ctl, RTM_NEWROUTE, "224.0.0.0", 4, A_INDEX, "multicast through va");
     c = socket(AF_INET, SOCK_STREAM, 0);
     to = at("224.1.2.3", 5000);

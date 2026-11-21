@@ -880,8 +880,10 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: `IN_UNMOUNT` is never sent, nor the `IN_IGNORED`
-  after it, when `umount2` takes away the mount of a watched file. `/proc/self/fdinfo` lists an epoll's files by
+- **inotify, in part**: when a superblock goes, an instance's watches
+  hear `IN_UNMOUNT` the newest watch first, where Linux takes the files the
+  newest first that any instance began to watch, so the orders can differ
+  when instances watch the same files. `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
@@ -922,7 +924,9 @@ verified.
   fanotify marks alone, where Linux's counts inotify's too. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
   it had, which fails once it is gone, and a FIFO's or device's read or
-  write is told of without its directory and name.
+  write is told of without its directory and name. A tmpfs superblock that
+  goes keeps the marks on its files and on itself, where Linux's
+  `fsnotify_sb_delete` removes them.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the

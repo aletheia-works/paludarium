@@ -207,8 +207,10 @@ impl Space {
 }
 /// Tells the machine's fanotify of each mount of `table`, and of every
 /// table copied from it, that is freed ([`crate::fanotify::Registry::unmounted`]),
-/// as Linux's `cleanup_mnt` calls `fsnotify_vfsmount_delete`.
-fn released_to_fanotify(
+/// as Linux's `cleanup_mnt` calls `fsnotify_vfsmount_delete`, and its
+/// inotify of each superblock that goes ([`crate::inotify::Notifier::unmounted`]),
+/// as `generic_shutdown_super` calls `fsnotify_sb_delete`.
+fn released_to_notifiers(
     table: &paludarium_vfs::MountTable,
     caches: &Arc<crate::page_cache::PageCaches>,
 ) {
@@ -216,6 +218,12 @@ fn released_to_fanotify(
     table.set_release_hook(Some(Arc::new(move |id| {
         if let Some(fan) = fan.upgrade() {
             fan.unmounted(id);
+        }
+    })));
+    let notify = Arc::downgrade(&caches.notify);
+    table.set_superblock_hook(Some(Arc::new(move |device| {
+        if let Some(notify) = notify.upgrade() {
+            notify.unmounted(device);
         }
     })));
 }
@@ -226,7 +234,7 @@ impl Default for Files {
         let caches = Arc::default();
         let lower: Arc<dyn FileSystem> = Arc::new(fs);
         let first_mounts = first_table(&lower, None);
-        released_to_fanotify(&first_mounts, &caches);
+        released_to_notifiers(&first_mounts, &caches);
         Self {
             readiness: Arc::default(),
             terminal_size: None,
@@ -501,7 +509,7 @@ impl Files {
     /// Its mounts are the first mount namespace's.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
         self.first_mounts = first_table(&fs, self.host.as_ref());
-        released_to_fanotify(&self.first_mounts, &self.caches);
+        released_to_notifiers(&self.first_mounts, &self.caches);
         *self.space.lock().unwrap_or_else(PoisonError::into_inner) =
             Space::new(fs, Arc::clone(&self.first_mounts), &self.caches);
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -1791,20 +1799,21 @@ fn looked_up(
 /// finds it: what the path at `ptr` names (the last symbolic link itself
 /// without `follow`), a directory with `directory` (ENOTDIR), and one the
 /// caller may read (EACCES); by its device and inode, with its file
-/// system (`f_type`).
+/// system (`f_type`) and whether it is a directory.
 pub(crate) fn watched(
     c: &Context<'_>,
     ptr: u64,
     follow: bool,
     directory: bool,
-) -> Result<(crate::page_cache::Key, u64), Errno> {
+) -> Result<(crate::page_cache::Key, u64, bool), Errno> {
     let (p, _) = looked_up(c, (-100i32) as u64, ptr, follow)?;
     let (stat, device, kind) = named(c, &p, follow)?;
-    if directory && stat.mode & 0o170000 != 0o040000 {
+    let is_directory = stat.mode & 0o170000 == 0o040000;
+    if directory && !is_directory {
         return Err(Errno::ENOTDIR);
     }
     crate::permissions::permission(&c.process.credentials, &stat, 4)?;
-    Ok(((device, stat.inode), kind))
+    Ok(((device, stat.inode), kind, is_directory))
 }
 /// What `fanotify_mark` marks (`fanotify_find_path`): the file the path at
 /// `ptr` names from `dir` (the last symbolic link itself without `follow`, a

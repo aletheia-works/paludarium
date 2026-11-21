@@ -177,6 +177,7 @@
     {"name":"inotify-exec-order","binary":"inotify"},
     {"name":"inotify-handles","binary":"inotify"},
     {"name":"inotify-open-handles","binary":"inotify"},
+    {"name":"inotify-unmount","binary":"inotify"},
     {"name":"fanotify-init","binary":"fanotify"},
     {"name":"fanotify-marks","binary":"fanotify"},
     {"name":"fanotify-events","binary":"fanotify"},

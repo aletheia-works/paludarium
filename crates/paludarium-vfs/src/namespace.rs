@@ -81,6 +81,8 @@ struct Numbers {
     tables: Mutex<Vec<std::sync::Weak<dyn Listed>>>,
     /// What is told of each mount ID once it is free ([`ReleaseHook`]).
     released: Mutex<Option<ReleaseHook>>,
+    /// What is told of each tmpfs superblock as it goes ([`SuperblockHook`]).
+    superblocks: Mutex<Option<SuperblockHook>>,
     /// The last unique mount ID handed out (`mnt_id_ctr`), from
     /// [`UNIQUE_OFFSET`], and the last mount namespace ID (`ns_id`), from
     /// the first namespace's.
@@ -360,7 +362,13 @@ impl std::fmt::Debug for Settings {
     }
 }
 impl Drop for Superblock {
+    /// Its last mount is freed (`deactivate_super`): the hook hears of it
+    /// before its device is free for another.
     fn drop(&mut self) {
+        let hook = lock(&self.numbers.superblocks).clone();
+        if let Some(hook) = hook {
+            hook(self.device());
+        }
         lock(&self.numbers.minors).remove(&self.minor);
     }
 }
@@ -586,6 +594,13 @@ pub type UnmountHook = Arc<dyn Fn(&[u64]) + Send + Sync>;
 /// It may run while a table is being changed, so it must not use one.
 pub type ReleaseHook = Arc<dyn Fn(u64) + Send + Sync>;
 
+/// What a machine's tables tell of a tmpfs superblock as it goes, as
+/// Linux's `generic_shutdown_super` calls `fsnotify_sb_delete`: its
+/// device, once its last mount is freed ([`ReleaseHook`]), before the
+/// device is free for another. A hook point for inotify's `IN_UNMOUNT`. It
+/// may run while a table is being changed, so it must not use one.
+pub type SuperblockHook = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// One mount namespace's mounts.
 pub struct MountTable {
     entries: RwLock<Arc<Vec<Entry>>>,
@@ -789,6 +804,12 @@ impl MountTable {
     /// made from it ([`ReleaseHook`]), in place of any hook before.
     pub fn set_release_hook(&self, hook: Option<ReleaseHook>) {
         *lock(&self.numbers.released) = hook;
+    }
+    /// Tells `hook` of each tmpfs superblock that goes from now on, in this
+    /// table or any made from it ([`SuperblockHook`]), in place of any hook
+    /// before.
+    pub fn set_superblock_hook(&self, hook: Option<SuperblockHook>) {
+        *lock(&self.numbers.superblocks) = hook;
     }
     /// Tells `hook` of each unmount from now on, in place of any hook before.
     pub fn set_unmount_hook(&self, hook: Option<UnmountHook>) {

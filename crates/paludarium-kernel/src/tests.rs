@@ -6583,6 +6583,67 @@ mod inotify {
             [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
         );
     }
+    /// The superblock's last mount going, as Linux's `fsnotify_sb_delete`:
+    /// each watch on its files hears `IN_UNMOUNT` (with `IN_ISDIR` for a
+    /// directory) whatever it asked for, then goes with `IN_IGNORED`. A
+    /// bind mount left keeps the superblock, and a detached mount goes
+    /// with its last open file.
+    #[test]
+    fn a_watch_hears_its_superblock_go() {
+        let mut f = fixture();
+        let none = put(&f, DATA, b"none");
+        let tmpfs = put(&f, DATA + 0x10, b"tmpfs");
+        let m = put(&f, DATA + 0x20, b"/tmp/m");
+        let b = put(&f, DATA + 0x40, b"/tmp/b");
+        let file = put(&f, DATA + 0x60, b"/tmp/m/f");
+        let other = put(&f, DATA + 0x80, b"/tmp/o");
+        assert_eq!(f.ret(83, &[m, 0o755]), 0);
+        assert_eq!(f.ret(83, &[b, 0o755]), 0);
+        assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+        let d = f.ret(2, &[file, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let d = f.ret(2, &[other, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(f.ret(165, &[m, b, 0, 0x1000, 0]), 0);
+        let one = f.ret(INIT1, &[IN_NONBLOCK]);
+        let two = f.ret(INIT1, &[IN_NONBLOCK]);
+        let root = f.ret(ADD, &[one, m, 0x2]) as i32;
+        let watched = f.ret(ADD, &[one, file, 0x2]) as i32;
+        let kept = f.ret(ADD, &[one, other, 0x2]) as i32;
+        let also = f.ret(ADD, &[two, file, 0x1]) as i32;
+        // The bind mount at b keeps the superblock.
+        assert_eq!(f.ret(166, &[m, 0]), 0);
+        assert_eq!(masks(&events(&mut f, one)), []);
+        assert_eq!(f.ret(166, &[b, 0]), 0);
+        assert_eq!(
+            masks(&events(&mut f, one)),
+            [
+                (watched, 0x2000, &b""[..]),
+                (watched, 0x8000, b""),
+                (root, 0x4000_2000, b""),
+                (root, 0x8000, b""),
+            ]
+        );
+        assert_eq!(
+            masks(&events(&mut f, two)),
+            [(also, 0x2000, &b""[..]), (also, 0x8000, b"")]
+        );
+        // Gone: removing them is EINVAL; the watch elsewhere stays.
+        assert_eq!(f.ret(RM, &[one, watched as u64]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(RM, &[one, kept as u64]), 0);
+        assert_eq!(masks(&events(&mut f, one)), [(kept, 0x8000, &b""[..])]);
+        // A detached mount goes with its last open file.
+        assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+        let held = f.ret(2, &[file, 0o101, 0o600]);
+        let wd = f.ret(ADD, &[one, file, 0x400]) as i32;
+        assert_eq!(f.ret(166, &[m, 2]), 0);
+        assert_eq!(masks(&events(&mut f, one)), []);
+        assert_eq!(f.ret(3, &[held]), 0);
+        assert_eq!(
+            masks(&events(&mut f, one)),
+            [(wd, 0x2000, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
     #[test]
     fn a_descriptor_is_heard_of_where_renames_took_its_file() {
         let mut f = fixture();

@@ -4635,7 +4635,12 @@ kernel.
   it, or the unlinked name it last had), and `IN_ISDIR` marks a
   directory's (not with `IN_DELETE_SELF` or `IN_MOVE_SELF`, as Linux
   leaves it out). `IN_ONESHOT` removes the watch after its first event, with
-  `IN_IGNORED`. Each instance queues its events, merging one into the same
+  `IN_IGNORED`. When a tmpfs's superblock goes with its last mount (a bind
+  mount left keeps it, and a detached one goes with the last file open on
+  it), each watch on one of its files hears `IN_UNMOUNT`, with `IN_ISDIR`
+  for a directory, whatever it asked for, then goes with `IN_IGNORED`, as
+  Linux's `fsnotify_sb_delete` ends them; an instance's watches go the
+  newest first. Each instance queues its events, merging one into the same
   event (descriptor, mask and name) just before it unless that one is
   `IN_IGNORED` or a move, and after 16384 queues one `IN_Q_OVERFLOW` (with
   descriptor -1) until it is read. A read gives as many whole

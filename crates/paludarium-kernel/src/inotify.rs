@@ -662,6 +662,17 @@ impl Notifier {
             self.fan.gone(key);
         }
     }
+    /// The superblock of `device` goes, as Linux's `fsnotify_sb_delete`
+    /// at its last mount: the watches on its files end ([`Instance::unmounted`]).
+    /// No removed file of it awaits its last close, which holds the mount.
+    pub(crate) fn unmounted(&self, device: u64) {
+        if self.watches.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        for instance in self.instances() {
+            instance.unmounted(device);
+        }
+    }
     /// A file no name ever linked (a memfd), which ends, as a removed one
     /// does, at its last close.
     pub(crate) fn unlinked_from_start(&self, key: Key) {
@@ -1007,6 +1018,8 @@ struct Watch {
     made: u64,
     /// The file system (`f_type`) of the file, for its handle.
     file_system: u64,
+    /// Whether the file is a directory, which its `IN_UNMOUNT` says.
+    directory: bool,
 }
 struct Event {
     wd: i32,
@@ -1220,6 +1233,38 @@ impl Instance {
         }
         self.queued(queued);
     }
+    /// The superblock of `device` goes: each watch on one of its files hears
+    /// `IN_UNMOUNT` (with `IN_ISDIR` for a directory) whatever it asked
+    /// for, as `inotify_arg_to_mask` gives every mark `FS_UNMOUNT`, then
+    /// goes with `IN_IGNORED`. Linux takes the files by their connectors,
+    /// the newest first (`fsnotify_unmount_inodes`); here the watches go
+    /// the newest first.
+    fn unmounted(&self, device: u64) {
+        let mut queue = self.queue();
+        let mut gone: Vec<_> = queue
+            .watches
+            .iter()
+            .filter(|(_, watch)| watch.key.0 == device)
+            .map(|(&wd, watch)| (watch.made, wd, watch.directory))
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        gone.sort_unstable_by_key(|&(made, ..)| std::cmp::Reverse(made));
+        let mut queued = 0;
+        for &(_, wd, directory) in &gone {
+            queued += usize::from(queue.push(Event {
+                wd,
+                mask: UNMOUNT | if directory { ISDIR } else { 0 },
+                cookie: 0,
+                name: Vec::new(),
+            }));
+            queued += usize::from(queue.unwatch(wd) == Some(true));
+        }
+        drop(queue);
+        self.notifier.release(self.owner, gone.len(), false);
+        self.queued(queued);
+    }
     /// Removes the watch on `key`, whose file is gone.
     fn forget(&self, key: Key) {
         let mut queue = self.queue();
@@ -1233,7 +1278,7 @@ impl Instance {
     }
     /// `inotify_update_watch`: the watch on `key` gets `mask` (or it is
     /// added with `IN_MASK_ADD`), or a new watch is made.
-    fn watch(&self, key: Key, file_system: u64, mask: u32) -> Result<i32, Errno> {
+    fn watch(&self, key: Key, file_system: u64, directory: bool, mask: u32) -> Result<i32, Errno> {
         let wanted = mask & (ALL_EVENTS | EXCL_UNLINK | ONESHOT);
         let mut queue = self.queue();
         if let Some(&wd) = queue.by_key.get(&key) {
@@ -1262,6 +1307,7 @@ impl Instance {
                 mask: wanted,
                 made,
                 file_system,
+                directory,
             },
         );
         queue.by_key.insert(key, wd);
@@ -1385,10 +1431,10 @@ fn add_watch(c: &mut Context<'_>, fd: u64, path: u64, mask: u32) -> Result<u64, 
         return Err(Errno::EINVAL);
     }
     let instance = of(&file).ok_or(Errno::EINVAL)?;
-    let (key, file_system) =
+    let (key, file_system, directory) =
         crate::files::watched(c, path, mask & DONT_FOLLOW == 0, mask & ONLYDIR != 0)?;
     instance
-        .watch(key, file_system, mask)
+        .watch(key, file_system, directory, mask)
         .map(|wd| wd as u32 as u64)
 }
 

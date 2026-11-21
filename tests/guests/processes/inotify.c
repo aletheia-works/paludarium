@@ -15,6 +15,7 @@
 #include <ftw.h>
 #include <limits.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -1483,6 +1485,51 @@ static int case_exec_order(void) {
     return 0;
 }
 
+/* A superblock going, as Linux's fsnotify_sb_delete: each watch on its
+   files hears IN_UNMOUNT (with IN_ISDIR for a directory), whatever it asked
+   for, then goes with IN_IGNORED. In a mount namespace of its own: a tmpfs
+   at m, bound at b too, so the superblock stays until both go; a watch on
+   a file elsewhere stays. Then a tmpfs detached while a file of it is
+   open, which goes with that file's last close. Each instance's files go
+   in one order on Linux v6.12 (newest inode first) and master (newest
+   watched first): here the root and then f, so both agree. */
+static int case_unmount(void) {
+    make_base("unmount");
+    mkdir(at("m"), 0755);
+    mkdir(at("b"), 0755);
+    touch(at("o"));
+    printf("unshare=%ld\n", e(unshare(CLONE_NEWNS)));
+    printf("private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("tmpfs=%ld\n", e(mount("none", at("m"), "tmpfs", 0, NULL)));
+    mkdir(at("m/d"), 0755);
+    touch(at("m/f"));
+    printf("bind=%ld\n", e(mount(at("m"), at("b"), NULL, MS_BIND, NULL)));
+    int one = inotify_init1(IN_NONBLOCK), two = inotify_init1(IN_NONBLOCK);
+    long root = e(inotify_add_watch(one, at("m"), IN_MODIFY));
+    long file = e(inotify_add_watch(one, at("m/f"), IN_MODIFY));
+    long other = e(inotify_add_watch(one, at("o"), IN_MODIFY));
+    long dir = e(inotify_add_watch(two, at("m/d"), IN_ACCESS));
+    printf("watches root=%ld file=%ld other=%ld dir=%ld\n", root, file, other, dir);
+    printf("umount m=%ld\n", e(umount2(at("m"), 0)));
+    drain(one, "bound still");
+    printf("umount b=%ld\n", e(umount2(at("b"), 0)));
+    drain(one, "one");
+    drain(two, "two");
+    printf("rm file=%ld other=%ld\n", e(inotify_rm_watch(one, file)), e(inotify_rm_watch(one, other)));
+    drain(one, "removed");
+    printf("tmpfs=%ld\n", e(mount("none", at("m"), "tmpfs", 0, NULL)));
+    int held = open(at("m/f"), O_RDWR | O_CREAT, 0600);
+    long wd = e(inotify_add_watch(one, at("m/f"), IN_DELETE_SELF));
+    printf("held=%d wd=%ld detach=%ld\n", held >= 0, wd, e(umount2(at("m"), MNT_DETACH)));
+    drain(one, "detached");
+    close(held);
+    drain(one, "closed");
+    close(one);
+    close(two);
+    remove_all();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1508,6 +1555,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-runner")) return case_runner();
     if (!strcmp(mode, "inotify-handles")) return case_handles();
     if (!strcmp(mode, "inotify-open-handles")) return case_open_handles();
+    if (!strcmp(mode, "inotify-unmount")) return case_unmount();
     /* What case_exec_order's dynamic program does: runs argv[2]. */
     if (!strcmp(mode, "inotify-then") && argc > 2) {
         char *const next[] = {argv[2], "inotify-quiet", NULL};

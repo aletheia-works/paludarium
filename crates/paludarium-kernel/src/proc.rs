@@ -12,9 +12,9 @@ use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// What `stat` reports for one of these files: a regular 0444 file. Linux's
-/// /proc reports size 0; this reports the real length, because reads of a
-/// regular file stop at its size.
+/// A regular 0444 file of size `length`. What `stat` and `fstat` report for
+/// every file of /proc is of size 0, as Linux's: `/proc/sys`'s, built with
+/// the length of their line, have it cleared ([`crate::sysctl::stat`]).
 pub(crate) fn stat(length: usize) -> FileStat {
     FileStat {
         size: length as u64,

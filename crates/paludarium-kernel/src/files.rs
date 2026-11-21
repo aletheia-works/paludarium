@@ -8490,10 +8490,10 @@ fn other_generated_stat(
     path: &[u8],
     follow: bool,
 ) -> Option<(FileStat, u64, u32)> {
-    if let Some(mountinfo) = crate::proc::mount_table(path) {
-        let length = crate::proc::render(&c.files.fs().mounts(), mountinfo, &c.files.root()).len();
+    // Of size 0, as Linux's seq files are, whatever their reads give.
+    if crate::proc::mount_table(path).is_some() {
         return Some((
-            own_stat(c, crate::proc::stat(length)),
+            own_stat(c, crate::proc::stat(0)),
             device(c, path),
             SMALL_BLOCK_SIZE,
         ));

@@ -163,7 +163,10 @@ filters and the two JITs)
 each run for 600 seconds with AddressSanitizer and LeakSanitizer, every night.
 
 Fuzzing for a fixed time does not prove that every input is safe, but it keeps
-checking that no guest input makes the emulator panic.
+checking that no guest input makes the emulator panic. Every target builds the
+kernel with its `fuzzing` feature, so a BPF program the verifier took that
+then reads or writes outside what it points to panics in any of them, as it
+does in a debug build.
 
 A pull request also fuzzes seven of them (`vfs_paths`, `load_elf`,
 `syscall_args`, `kernel_threads`, `kernel_futex`, `kernel_events` and

@@ -992,7 +992,9 @@ mod tests {
                 );
             }
         }
-        // Enough of them load for the check to mean something.
-        assert!(taken > 5_000, "only {taken} programs loaded");
+        // Enough of them load for the check to mean something: 6,093 with
+        // this seed and this verifier. A change to either that loads fewer
+        // than 6,000 should look again at what the programs cover.
+        assert!(taken >= 6_000, "only {taken} programs loaded");
     }
 }

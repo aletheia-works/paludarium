@@ -994,9 +994,7 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
         let (common, fs) = (&mount.common_options, &mount.super_options);
         let state = |read_only: bool| if read_only { "ro" } else { "rw" };
         if mountinfo {
-            let device = mount.device;
-            let major = (device >> 8) & 0xfff | (device >> 32) & !0xfff;
-            let minor = device & 0xff | (device >> 12) & !0xff;
+            let (major, minor) = device_numbers(mount.device);
             let (own, sb) = (state(mount.read_only), state(mount.super_read_only));
             let tags = &mount.tags;
             out.push_str(&format!(
@@ -1178,11 +1176,6 @@ impl GeneratedFile {
             ..self
         }
     }
-    /// Whether it is a system-wide file, which reads go to the end of
-    /// rather than to its size.
-    pub(crate) fn is_entry(&self) -> bool {
-        self.entry
-    }
 }
 impl FileHandle for GeneratedFile {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1218,12 +1211,11 @@ impl FileHandle for GeneratedFile {
     }
     fn stat(&self) -> Result<FileStat, Errno> {
         let stat = match self.stat {
-            Some(file) => FileStat {
-                size: self.content.len() as u64,
-                ..file
-            },
+            // Of size 0, as Linux's `/proc` files are: a reader goes by what
+            // `read` gives.
+            Some(file) => FileStat { size: 0, ..file },
             None if self.entry => entry_stat(),
-            None => stat(self.content.len()),
+            None => stat(0),
         };
         Ok(match &self.owner {
             Some(owner) => owned(stat, owner),
@@ -1244,6 +1236,15 @@ impl FileHandle for GeneratedFile {
     }
 }
 
+/// The major and minor numbers of `device`, as glibc's `major` and `minor`
+/// take them apart: the major from bits 8 to 19 and 44 up, the minor from
+/// bits 0 to 7 and 20 to 43.
+pub(crate) fn device_numbers(device: u64) -> (u32, u32) {
+    (
+        (((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000)) as u32,
+        ((device & 0xff) | ((device >> 12) & 0xffff_ff00)) as u32,
+    )
+}
 /// One line of `maps`, as Linux's `show_map_vma` writes it: the header with
 /// a space after the inode, then, for a VMA with a name, spaces up to column
 /// 72 and one more before it. A newline in a path is octal.
@@ -1252,10 +1253,7 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
         if vma.prot.contains(prot) { letter } else { '-' }
     };
     let (device, inode) = vma.identity;
-    let (major, minor) = (
-        (device >> 8) & 0xfff,
-        (device & 0xff) | ((device >> 12) & !0xff),
-    );
+    let (major, minor) = device_numbers(device);
     // Shared anonymous memory's file lies on Linux's first device.
     let minor = match &vma.file {
         Some(file) if !file.source => 1,
@@ -2025,6 +2023,15 @@ mod tests {
         assert!(text.starts_with("00001000-00002000 r--p 00003000 08:12 9 "));
         assert_eq!(text.find('/'), Some(MAPS_NAME_COLUMN + 1));
         assert!(text.ends_with("/a b\\c\\012d\n"));
+        // A device past 32 bits, as glibc's `makedev(0x189a, 0x234567bc)`
+        // encodes it, splits as its `major` and `minor` do.
+        let wide = Vma {
+            identity: (0x1234_5678_9abc, 9),
+            ..vma.clone()
+        };
+        let line = String::from_utf8(map_line(&wide, 0, b"/")).unwrap();
+        assert!(line.starts_with("00001000-00002000 r--p 00003000 189a:234567bc 9 "));
+        assert_eq!(device_numbers(0x0812), (8, 0x12));
         // Under a root, from there; elsewhere, from the machine's root.
         assert!(map_line(&vma, 0, b"/a b").ends_with(b" /a b\\c\\012d\n"));
         let mut inside = vma.clone();

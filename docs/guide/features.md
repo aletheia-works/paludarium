@@ -3581,7 +3581,9 @@ kernel.
 
 - These system files (`loadavg`, `meminfo`, `stat`, `uptime` and
   `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
-  read goes on to the end of what they hold.
+  read goes on to the end of what they hold. So is every file of a process's
+  or a thread's directory (`stat` and `fstat` alike), as Linux's
+  `proc_pid_make_inode` leaves it, whatever its reads give.
 
 - Root may open these system files for writing, but a write gives `EIO`,
   as Linux's `pde_write` gives for a file without a write operation. A
@@ -3589,7 +3591,8 @@ kernel.
 
 - `/proc/self/maps` lists the VMAs in Linux's format, with adjacent mappings
   merged and split as Linux does: the range, the protection, `s` or `p`, the
-  offset in the file, the file's device and inode as `stat` gives them, and
+  offset in the file, the file's device and inode as `stat` gives them (the
+  device as glibc's `major` and `minor` take it apart), and
   the name in Linux's column: the file's path, with a newline in it as
   `\012`, followed by a space and `(deleted)` once nothing names it, `/memfd:<name> (deleted)`,
   `/dev/zero (deleted)` for shared anonymous memory, `[heap]` or `[stack]`.

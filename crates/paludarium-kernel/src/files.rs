@@ -2706,17 +2706,14 @@ fn positioned(
     }
     Ok(file)
 }
-/// Where reads of a regular file stop: at its size, but for `maps`,
-/// `smaps`, `pagemap`, `io` and /proc's system-wide files, which say 0 as
-/// Linux's /proc does and end where their `read` does.
+/// Where reads of a regular file stop: at its size, but for /proc's files,
+/// which say 0 as Linux's do and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
         file.is::<crate::proc::PagemapFile>()
             || crate::sysctl::is_file(file)
             || crate::seq::is_file(file)
-            || file
-                .downcast_ref::<crate::proc::GeneratedFile>()
-                .is_some_and(crate::proc::GeneratedFile::is_entry)
+            || file.is::<crate::proc::GeneratedFile>()
     }) {
         u64::MAX
     } else {
@@ -8570,31 +8567,16 @@ fn other_generated_stat(
             c.files.descriptor(u64::from(n)).ok()?;
             crate::proc::stat(0)
         }
-        // Sized as another process's are, from what its threads published
-        // ([`tasks::content`]), as their reads are made.
+        // Of size 0, as another process's are and Linux's.
         crate::proc::OwnEntry::Status
         | crate::proc::OwnEntry::Stat
-        | crate::proc::OwnEntry::Cmdline
-        | crate::proc::OwnEntry::Environ
-        | crate::proc::OwnEntry::Comm => {
-            let task_entry = own_at_read(entry)?;
-            let path = crate::proc::TaskPath {
-                pid: c.process.pid,
-                tid: None,
-                entry: task_entry,
-            };
-            let task = tasks::find(c, &path).ok()?;
-            let length = tasks::content(c, &task, task_entry).map_or(0, |content| content.len());
-            match task_entry {
-                // 0644, which its owner may open for writing, as Linux's.
-                crate::proc::TaskEntry::Comm => FileStat {
-                    mode: 0o100_644,
-                    ..crate::proc::stat(length)
-                },
-                crate::proc::TaskEntry::Environ => crate::proc::private_stat(length),
-                _ => crate::proc::stat(length),
-            }
-        }
+        | crate::proc::OwnEntry::Cmdline => crate::proc::stat(0),
+        // 0644, which its owner may open for writing, as Linux's.
+        crate::proc::OwnEntry::Comm => FileStat {
+            mode: 0o100_644,
+            ..crate::proc::stat(0)
+        },
+        crate::proc::OwnEntry::Environ => crate::proc::private_stat(0),
         crate::proc::OwnEntry::Exe | crate::proc::OwnEntry::Cwd | crate::proc::OwnEntry::Root => {
             return None;
         }

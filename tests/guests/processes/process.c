@@ -12855,6 +12855,59 @@ static int proc_at_read_case(const char *self) {
     return 0;
 }
 
+/* The proc-sizes case: every file of a /proc/<pid> directory is of size 0,
+   as Linux's are, whatever its reads give: stat and fstat show 0 for
+   this process's own files, another process's and a thread's, and a read
+   still gives the text. */
+static const char *const ps_entries[] = {
+    "status", "stat", "statm", "limits", "cmdline", "environ", "comm", "auxv", "uid_map",
+    "gid_map", "setgroups", "mounts", "mountinfo", "io", "personality", "wchan", "maps",
+    "smaps", "fdinfo/0",
+};
+static void ps_show(const char *who, const char *dir) {
+    printf("%s:", who);
+    for (size_t i = 0; i < sizeof ps_entries / sizeof *ps_entries; i++) {
+        char path[96];
+        snprintf(path, sizeof path, "%s/%s", dir, ps_entries[i]);
+        struct stat st = {0}, open_st = {0};
+        int r = stat(path, &st) ? errno : 0;
+        int fd = open(path, O_RDONLY);
+        int f = fd < 0 ? errno : (fstat(fd, &open_st) ? errno : 0);
+        char buf[64];
+        long n = fd < 0 ? -1 : (long)read(fd, buf, sizeof buf);
+        if (fd >= 0) close(fd);
+        printf(" %s=%d/%ld,%d/%ld,%d", ps_entries[i], r, (long)st.st_size, f, (long)open_st.st_size,
+               n > 0);
+    }
+    printf("\n");
+}
+static int proc_sizes_case(void) {
+    int gate[2];
+    if (pipe(gate)) return 90;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 89;
+    if (kid == 0) {
+        char c;
+        close(gate[1]);
+        read(gate[0], &c, 1);
+        _exit(0);
+    }
+    close(gate[0]);
+    char dir[64];
+    ps_show("own", "/proc/self");
+    snprintf(dir, sizeof dir, "/proc/%d", (int)kid);
+    ps_show("child", dir);
+    snprintf(dir, sizeof dir, "/proc/self/task/%d", (int)syscall(SYS_gettid));
+    ps_show("thread", dir);
+    write(gate[1], "x", 1);
+    close(gate[1]);
+    int status;
+    waitpid(kid, &status, 0);
+    printf("status=%d\n", status);
+    return 0;
+}
+
 /* The proc-own-at-read case: this process's own comm, status, stat,
    cmdline and environ, and its uid_map, setgroups and mountinfo, each read
    again from its start through the descriptor opened first, as Linux makes
@@ -32855,6 +32908,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-syscall")) return proc_syscall_case();
     if (!strcmp(mode, "proc-at-read")) return proc_at_read_case(self);
     if (!strcmp(mode, "proc-own-at-read")) return proc_own_at_read_case(argv);
+    if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

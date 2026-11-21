@@ -3119,6 +3119,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - これらのシステムのファイル（`loadavg`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
   サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。
+  プロセスやスレッドのディレクトリのファイルも、Linux の `proc_pid_make_inode` が残すとおり、
+  読み込みが何を返しても（`stat` でも `fstat` でも）サイズは 0 です。
 
 - root はこれらのシステムのファイルを書き込み用に開けますが、書き込みは `EIO` です。書き込みの
   操作がないファイルに Linux の `pde_write` が返すのと同じです。プロセス自身のファイルへの書き込みは
@@ -3126,7 +3128,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `/proc/self/maps` は VMA を Linux の形式で並べます。隣り合うマッピングの併合と
   分割も Linux と同じです。項目は、範囲、保護、`s` か `p`、ファイル内のオフセット、
-  `stat` と同じファイルのデバイスと inode、Linux と同じ桁に置く名前です。名前は
+  `stat` と同じファイルのデバイス（glibc の `major` と `minor` と同じく分けます）と inode、
+  Linux と同じ桁に置く名前です。名前は
   ファイルのパス（中の改行は `\012` で、どこからも指されなくなれば空白と `(deleted)` が
   付きます）、`/memfd:<名前> (deleted)`、共有の無名メモリの `/dev/zero (deleted)`、
   `[heap]`、`[stack]` です。Linux の `seq_file` と同じく、読むときに内容を作ります。

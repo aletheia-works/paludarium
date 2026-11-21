@@ -2643,10 +2643,8 @@ fn statfs_and_the_generated_mount_table() {
         f.mem.read_u64(GuestAddr(buf + 24)).unwrap() as u32,
         0o100_444
     );
-    assert_eq!(
-        f.mem.read_u64(GuestAddr(buf + 48)).unwrap(),
-        table.len() as u64
-    );
+    // Of size 0, as Linux's, whatever a read gives.
+    assert_eq!(f.mem.read_u64(GuestAddr(buf + 48)).unwrap(), 0);
     // Root may open it for writing; the write itself is EINVAL.
     let fd = f.ret(2, &[mounts, 1, 0]);
     assert_eq!(f.ret(1, &[fd, buf, 1]), errno(Errno::EINVAL));

@@ -983,17 +983,14 @@ pub(super) fn stat(
         // 0200, as Linux's.
         TaskEntry::ClearRefs => crate::proc::write_only_stat(),
         // 0644, which their owner may write.
-        TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => {
-            let length = content(c, task, entry).map_or(0, |c| c.len());
-            FileStat {
-                mode: 0o100_644,
-                ..crate::proc::stat(length)
-            }
-        }
-        TaskEntry::Environ | TaskEntry::Auxv => {
-            crate::proc::private_stat(content(c, task, entry).map_or(0, |content| content.len()))
-        }
-        _ => crate::proc::stat(content(c, task, entry).map_or(0, |content| content.len())),
+        TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => FileStat {
+            mode: 0o100_644,
+            ..crate::proc::stat(0)
+        },
+        TaskEntry::Environ | TaskEntry::Auxv => crate::proc::private_stat(0),
+        // Of size 0 as every file of Linux's `/proc/<pid>` is, whatever its
+        // reads give.
+        _ => crate::proc::stat(0),
     };
     Ok((task.owned(stat), device(c, path), SMALL_BLOCK_SIZE))
 }

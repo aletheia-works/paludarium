@@ -690,6 +690,18 @@ impl ThreadGroup {
             .map(|(_, used)| used.cpu.load(Ordering::SeqCst))
             .fold(0u64, u64::saturating_add)
     }
+    /// Adds what the process's threads, live or exited, have used to
+    /// `times`, as of each one's latest account.
+    pub(crate) fn add_cpu_times(&self, times: &mut crate::proc::CpuTimes) {
+        for (_, used) in self
+            .cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            times.add(used);
+        }
+    }
     /// The CPU time of thread `tid` while it is live, as of its latest
     /// account (0 before its first).
     pub(crate) fn thread_cpu(&self, tid: u32) -> Option<u64> {

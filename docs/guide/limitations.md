@@ -124,16 +124,17 @@ verified.
   leader ended with `exit` before the last of its threads shows the last
   thread's status, where Linux shows the leader's. In `stat`, page faults,
   resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
-  `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
-  interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
+  `START` are the boot time in `/proc/stat`. `/proc/stat` counts all CPU time as
+  user time, as `getrusage` does, each thread's to the CPU it was on at its
+  system calls, and none as idle; it counts no interrupts or softirqs, and
+  as context switches only the times threads went to sleep, as nothing
+  preempts a guest thread. A thread's `stat` gives its process's CPU time, and
   another process's thread is `S (sleeping)` in every wait, where Linux
   shows some waits it cannot interrupt as `D (disk sleep)`. A thread shows another process
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
   only while the thread is stopped in it. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
-  used. A generated file's `stat` gives its length as its size
-  (`mountinfo`, `status`, `stat`, `loadavg` and the like), where Linux's
-  seq files are of size 0; `maps`, `smaps` and `fdinfo` are 0 as on Linux.
+  used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
   root. `mount` mounts no `proc` filesystem and nothing on `/proc` or

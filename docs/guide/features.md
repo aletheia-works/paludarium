@@ -3589,12 +3589,18 @@ kernel.
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
 
-- `/proc/stat` is in the format of Linux's `show_stat`: a `cpu` line and one
-  for each CPU `sched_getaffinity` reports, every time 0 as `/proc/uptime`
-  counts no idle time; `intr 0`, `ctxt 0`; `btime`, the real-time clock less
-  the monotonic one in seconds, so `ps` finds the boot time; `processes`, the
-  IDs handed out; `procs_running 1`, `procs_blocked 0`; and a `softirq` line
-  of zeros.
+- `/proc/stat` is in the format of Linux's `show_stat`.
+  - A `cpu` line and one for each CPU `sched_getaffinity` reports give, in
+    clock ticks, the CPU time every thread has run, the reaped processes'
+    included, so the counts only grow. A thread's time between two system
+    calls counts to the CPU it was on at the first. It is all user time, as
+    in `getrusage` and `times`, and the other times are 0, idle too, as
+    `/proc/uptime` counts no idle time.
+  - `intr 0`; `ctxt`, the times threads went to sleep; `btime`, the
+    real-time clock less the monotonic one in seconds, so `ps` finds the boot
+    time; `processes`, the IDs handed out; `procs_running`, the threads
+    running as `/proc/<pid>/stat` shows them (`R`), the reader included;
+    `procs_blocked 0`; and a `softirq` line of zeros.
 
 - `/proc/sysvipc` holds `msg`, `sem` and `shm`, listed in that order, each in
   the format of Linux's `sysvipc_*_proc_show` on a 64-bit kernel.

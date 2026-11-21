@@ -3124,11 +3124,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   使用はなく、スワップも huge page もありません。起動からの時間は単調時計の値で、アイドルの
   時間は数えません。
 
-- `/proc/stat` は Linux の `show_stat` と同じ形式です。`cpu` の行と、`sched_getaffinity` が
-  返す CPU ごとの行があり、`/proc/uptime` がアイドルの時間を数えないのと同じく、時間はどれも
-  0 です。続いて `intr 0`、`ctxt 0`、`btime`（実時間の時計から単調時計を引いた秒数で、`ps` は
-  これで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running 1`、
-  `procs_blocked 0`、0 が並ぶ `softirq` の行です。
+- `/proc/stat` は Linux の `show_stat` と同じ形式です。
+  - `cpu` の行と、`sched_getaffinity` が返す CPU ごとの行は、すべてのスレッドが使った CPU 時間を
+    クロックティックで示します。回収したプロセスの分も含むので、数は増えるだけです。
+    スレッドの 2 つのシステムコールの間の時間は、先のシステムコールのときにいた CPU の分になります。
+    `getrusage` や `times` と同じくすべてユーザー時間で、ほかの時間は 0 です。`/proc/uptime` が
+    アイドルの時間を数えないのと同じく、アイドルも 0 です。
+  - 続いて `intr 0`、`ctxt`（スレッドが眠った回数）、`btime`（実時間の時計から単調時計を引いた
+    秒数で、`ps` はこれで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running`
+    （`/proc/<pid>/stat` が `R` と示す実行中のスレッドの数で、読んでいるスレッドを含みます）、
+    `procs_blocked 0`、0 が並ぶ `softirq` の行です。
 
 - `/proc/sysvipc` には `msg`、`sem`、`shm` がこの順に並びます。どれも 64 ビットのカーネルでの
   Linux の `sysvipc_*_proc_show` と同じ形式です。

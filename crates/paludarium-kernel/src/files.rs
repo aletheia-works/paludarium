@@ -8778,7 +8778,8 @@ fn system_file(
                 cpus: crate::syscalls::active_cpus(c),
                 boot_time: boot / 1_000_000_000,
                 forks,
-                running: 1,
+                running: c.processes.running_tasks(c.tid),
+                times: c.processes.cpu_times(),
             })
         }
         crate::proc::SystemEntry::Uptime => crate::proc::render_uptime(

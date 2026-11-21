@@ -423,6 +423,7 @@
     {"name":"proc-at-read","binary":"process"},
     {"name":"proc-own-at-read","binary":"process"},
     {"name":"proc-sizes","binary":"process"},
+    {"name":"proc-stat-counters","binary":"process"},
     {"name":"proc-stat-exit-code","binary":"process"},
     {"name":"proc-fd-links","binary":"process"},
     {"name":"modify-ldt","binary":"process"},

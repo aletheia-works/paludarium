@@ -961,6 +961,7 @@ mod linux {
         processes_proc_at_read => ("proc-at-read","process"),
         processes_proc_own_at_read => ("proc-own-at-read","process"),
         processes_proc_sizes => ("proc-sizes","process"),
+        processes_proc_stat_counters => ("proc-stat-counters","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),

@@ -247,6 +247,9 @@ pub struct Processes {
     /// The machine's perf events by the thread that opened them, and those
     /// that wait for an `execve`.
     pub(crate) perf_events: crate::perf::Events,
+    /// What the processes that have been reaped used, which `/proc/stat`
+    /// goes on counting, as Linux's per-CPU counts keep a task's time.
+    reaped_times: Mutex<crate::proc::CpuTimes>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -276,6 +279,7 @@ impl Processes {
             bpf_maps: Arc::default(),
             bpf_progs: Arc::default(),
             perf_events: crate::perf::Events::default(),
+            reaped_times: Mutex::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -349,6 +353,34 @@ impl Processes {
             usize::try_from(live).unwrap_or(usize::MAX),
             next.saturating_sub(1),
         )
+    }
+    /// What every process has used, those reaped included, for
+    /// `/proc/stat`.
+    pub(crate) fn cpu_times(&self) -> crate::proc::CpuTimes {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut times = self
+            .reaped_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for entry in entries.values() {
+            entry.group.add_cpu_times(&mut times);
+        }
+        times
+    }
+    /// The live threads that are running, as `/proc/<pid>/stat` shows them
+    /// (`R`): neither asleep in a wait, other than `reader`, which is
+    /// running as it reads, nor stopped, by a signal or for a tracer. As
+    /// Linux's `nr_running`, at least the reader.
+    pub(crate) fn running_tasks(&self, reader: u32) -> usize {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .values()
+            .filter(|entry| entry.status.is_none() && !entry.group.is_stopped())
+            .flat_map(|entry| entry.group.threads())
+            .filter(|&(tid, blocked)| (!blocked || tid == reader) && !self.traces.in_stop(tid))
+            .count()
+            .max(1)
     }
     /// The next ID, which no task has had: the IDs of the first PID
     /// namespace are handed out once each, and those `set_tid` took are
@@ -1320,6 +1352,12 @@ impl Processes {
         let Some(entry) = entries.remove(&pid) else {
             return;
         };
+        entry.group.add_cpu_times(
+            &mut self
+                .reaped_times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         // Its tasks are no longer traced (`__ptrace_unlink`).
         self.traces.forget_process(pid);
         entry.space.leave(pid);

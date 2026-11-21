@@ -403,6 +403,31 @@ pub(crate) fn render_uptime(nanoseconds: u64) -> Vec<u8> {
     let hundredths = nanoseconds / 10_000_000;
     format!("{}.{:02} 0.00\n", hundredths / 100, hundredths % 100).into_bytes()
 }
+/// What the machine's threads have used, for `/proc/stat`: their CPU time
+/// in nanoseconds on each CPU, by its number, and the times they went to
+/// sleep.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CpuTimes {
+    pub(crate) per_cpu: Vec<u64>,
+    pub(crate) switches: u64,
+}
+impl CpuTimes {
+    /// Adds what one thread has used, as of its latest account.
+    pub(crate) fn add(&mut self, used: &crate::Usage) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let per_cpu = used
+            .per_cpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.per_cpu.len() < per_cpu.len() {
+            self.per_cpu.resize(per_cpu.len(), 0);
+        }
+        for (sum, &time) in self.per_cpu.iter_mut().zip(per_cpu.iter()) {
+            *sum = sum.saturating_add(time);
+        }
+        self.switches = self.switches.saturating_add(used.switches.load(SeqCst));
+    }
+}
 /// The figures `/proc/stat` reports.
 pub(crate) struct SystemStat {
     /// The CPUs, as `sched_getaffinity` counts them.
@@ -412,22 +437,35 @@ pub(crate) struct SystemStat {
     pub(crate) boot_time: u64,
     /// The process and thread IDs handed out so far.
     pub(crate) forks: u32,
+    /// The threads that are not asleep in a wait nor stopped.
     pub(crate) running: usize,
+    pub(crate) times: CpuTimes,
 }
-/// `/proc/stat` as Linux's `show_stat` prints it: the time every CPU spent
-/// in each state, all 0 as `/proc/uptime` counts no idle time, a line for
-/// each CPU, no interrupts, context switches or softirqs (a count of 0 with
-/// none listed after it, or all 10 kinds at 0), the boot time, the forks
-/// and the running tasks with none blocked.
+/// `/proc/stat` as Linux's `show_stat` prints it. Each CPU's line gives the
+/// CPU time the threads have run on it in clock ticks (USER_HZ is 100), all
+/// of it as user time, as `getrusage` and `times` count it, and the `cpu`
+/// line their sum over every CPU (`for_each_possible_cpu`); nothing is
+/// counted as idle, as `/proc/uptime` counts no idle time, nor as any other
+/// state. `ctxt` counts the times threads went to sleep, their voluntary
+/// switches, as nothing preempts a guest thread. There are no interrupts or
+/// softirqs (a count of 0 with none listed after it, or all 10 kinds at 0),
+/// and no task waits for I/O (`procs_blocked`).
 pub(crate) fn render_system_stat(stat: &SystemStat) -> Vec<u8> {
-    const TIMES: &str = " 0 0 0 0 0 0 0 0 0 0";
-    let mut out = format!("cpu {TIMES}\n");
+    const ZEROS: &str = " 0 0 0 0 0 0 0 0 0";
+    let ticks = |ns: u64| ns / 10_000_000;
+    let at = |cpu: usize| stat.times.per_cpu.get(cpu).copied().unwrap_or(0);
+    let total = stat
+        .times
+        .per_cpu
+        .iter()
+        .fold(0u64, |sum, &time| sum.saturating_add(time));
+    let mut out = format!("cpu  {}{ZEROS}\n", ticks(total));
     for cpu in 0..stat.cpus {
-        out.push_str(&format!("cpu{cpu}{TIMES}\n"));
+        out.push_str(&format!("cpu{cpu} {}{ZEROS}\n", ticks(at(cpu))));
     }
     out.push_str(&format!(
-        "intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked 0\nsoftirq 0{TIMES}\n",
-        stat.boot_time, stat.forks, stat.running
+        "intr 0\nctxt {}\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked 0\nsoftirq 0 0{ZEROS}\n",
+        stat.times.switches, stat.boot_time, stat.forks, stat.running
     ));
     out.into_bytes()
 }
@@ -2609,6 +2647,44 @@ mod generated_tests {
         assert_eq!(stat(false, true), "0 0 0 1 0 0 0 0 0 0 0 12");
     }
     #[test]
+    fn system_cpu_times_count_each_thread_s_time_on_the_cpu_it_ran_on() {
+        use paludarium_host::ClockId::Monotonic;
+        let host = paludarium_host::testing::RecordingHost::default();
+        let group = crate::ThreadGroup::default();
+        let mut state = crate::ThreadState::default();
+        let _ = paludarium_host::switches::take();
+        host.set_clock(Monotonic, 1_000);
+        crate::account_cpu(&host, &group, &mut state, 5);
+        // 50 ms on CPU 0 and two sleeps; then the thread moves to CPU 2,
+        // and the 30 ms since count to CPU 0, where it was seen to run.
+        host.set_clock(Monotonic, 1_000 + 50_000_000);
+        paludarium_host::switches::sleep(&mut false);
+        paludarium_host::switches::sleep(&mut false);
+        crate::account_cpu(&host, &group, &mut state, 5);
+        group.set_affinity(5, vec![0b100]);
+        host.set_clock(Monotonic, 1_000 + 80_000_000);
+        crate::account_cpu(&host, &group, &mut state, 5);
+        host.set_clock(Monotonic, 1_000 + 100_000_000);
+        crate::account_cpu(&host, &group, &mut state, 5);
+        let mut times = CpuTimes::default();
+        group.add_cpu_times(&mut times);
+        assert_eq!(
+            times,
+            CpuTimes {
+                per_cpu: vec![80_000_000, 0, 20_000_000],
+                switches: 2,
+            }
+        );
+        // Another thread's adds to them.
+        let other = crate::ThreadGroup::default();
+        let mut state = crate::ThreadState::default();
+        crate::account_cpu(&host, &other, &mut state, 6);
+        host.set_clock(Monotonic, 1_000 + 110_000_000);
+        crate::account_cpu(&host, &other, &mut state, 6);
+        other.add_cpu_times(&mut times);
+        assert_eq!(times.per_cpu, vec![90_000_000, 0, 20_000_000]);
+    }
+    #[test]
     fn system_files_have_linux_s_formats() {
         assert_eq!(render_loadavg(1, 4, 9), b"0.00 0.00 0.00 1/4 9\n");
         assert_eq!(render_uptime(1_234_567_891), b"1.23 0.00\n");
@@ -2626,14 +2702,19 @@ mod generated_tests {
             boot_time: 1_700_000_000,
             forks: 9,
             running: 1,
+            times: CpuTimes {
+                // Time on a CPU past those online counts to the total only.
+                per_cpu: vec![1_234_567_891, 5_000_000, 20_000_000],
+                switches: 42,
+            },
         });
         assert_eq!(
             String::from_utf8(stat).unwrap(),
-            "cpu  0 0 0 0 0 0 0 0 0 0\n\
-             cpu0 0 0 0 0 0 0 0 0 0 0\n\
+            "cpu  125 0 0 0 0 0 0 0 0 0\n\
+             cpu0 123 0 0 0 0 0 0 0 0 0\n\
              cpu1 0 0 0 0 0 0 0 0 0 0\n\
              intr 0\n\
-             ctxt 0\n\
+             ctxt 42\n\
              btime 1700000000\n\
              processes 9\n\
              procs_running 1\n\

@@ -13151,6 +13151,135 @@ static int proc_at_read_case(const char *self) {
     return 0;
 }
 
+/* The proc-stat-counters case: /proc/stat's lines have show_stat's shape
+   (ten times on the cpu line and each online CPU's, intr's total, ctxt,
+   processes, procs_running, procs_blocked, softirq's total and ten kinds),
+   and its counters only grow: the cumulative CPU times (all but idle and
+   iowait, which Linux may show going back), intr, ctxt, processes and the
+   softirqs. A reaped child's CPU time stays counted, sleeps count as
+   context switches and a fork as a process. The values themselves differ
+   from Linux's, so only whether each holds is printed. */
+#define PSC_LINES 1024
+struct psc_stat {
+    int shape;      /* every line as show_stat prints it, in its order */
+    int cpu_lines;  /* the cpuN lines, numbered from 0 */
+    unsigned long long total[10], per_cpu[PSC_LINES][10];
+    unsigned long long intr, ctxt, processes, running, blocked, softirq[11];
+};
+
+static int psc_numbers(char *text, unsigned long long *values, int most) {
+    int count = 0;
+    for (char *t = strtok(text, " "); t; t = strtok(NULL, " ")) {
+        char *end;
+        unsigned long long value = strtoull(t, &end, 10);
+        if (*end || count == most) return -1;
+        values[count++] = value;
+    }
+    return count;
+}
+
+static int psc_read(struct psc_stat *stat) {
+    static char buffer[1 << 16];
+    memset(stat, 0, sizeof *stat);
+    long n = proc_read("/proc/stat", buffer, sizeof buffer - 1);
+    if (n <= 0) return -1;
+    buffer[n] = 0;
+    const char *keys[] = {"intr ", "ctxt ", "btime ", "processes ", "procs_running ", "procs_blocked ", "softirq "};
+    int order = 0, shape = !strncmp(buffer, "cpu  ", 5);
+    for (char *line = buffer, *end; *line; line = end + 1) {
+        if (!(end = strchr(line, '\n'))) return -1;
+        *end = 0;
+        unsigned long long values[16];
+        if (!strncmp(line, "cpu  ", 5)) {
+            shape &= order == 0 && stat->cpu_lines == 0 && psc_numbers(line + 5, stat->total, 10) == 10;
+        } else if (!strncmp(line, "cpu", 3)) {
+            char *space = strchr(line, ' ');
+            int cpu = atoi(line + 3);
+            shape &= order == 0 && space && cpu == stat->cpu_lines && cpu < PSC_LINES &&
+                     psc_numbers(space + 1, stat->per_cpu[cpu < PSC_LINES ? cpu : 0], 10) == 10;
+            stat->cpu_lines++;
+        } else if (order < 7 && !strncmp(line, keys[order], strlen(keys[order]))) {
+            char *rest = line + strlen(keys[order]);
+            int count;
+            if (order == 0) {
+                /* The total, then a count for each interrupt. */
+                count = 0;
+                char *t = strtok(rest, " ");
+                char *end2;
+                stat->intr = t ? strtoull(t, &end2, 10) : 0;
+                shape &= t && !*end2;
+                for (; t; t = strtok(NULL, " ")) count++;
+                shape &= count >= 1;
+            } else if (order == 6) {
+                shape &= psc_numbers(rest, stat->softirq, 11) == 11;
+            } else {
+                shape &= psc_numbers(rest, values, 1) == 1;
+                unsigned long long *slots[] = {NULL, &stat->ctxt, NULL, &stat->processes, &stat->running,
+                                               &stat->blocked};
+                if (slots[order]) *slots[order] = values[0];
+            }
+            order++;
+        }
+    }
+    stat->shape = shape && order == 7;
+    return 0;
+}
+
+static int psc_grew(const unsigned long long *before, const unsigned long long *after, int count, int skip_idle) {
+    for (int i = 0; i < count; i++)
+        if (!(skip_idle && (i == 3 || i == 4)) && after[i] < before[i]) return 0;
+    return 1;
+}
+
+static int proc_stat_counters_case(void) {
+    static struct psc_stat before, after;
+    if (psc_read(&before)) {
+        printf("proc-stat read failed\n");
+        return 1;
+    }
+    /* A child burns 300 ms of CPU time and is reaped. */
+    pid_t child = fork();
+    if (child == 0) {
+        struct timespec start, now;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+        volatile unsigned long spin = 0;
+        do {
+            for (int i = 0; i < 100000; i++) spin++;
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now);
+        } while ((now.tv_sec - start.tv_sec) * 1000000000LL + (now.tv_nsec - start.tv_nsec) < 300000000LL);
+        _exit(0);
+    }
+    int status = -1;
+    waitpid(child, &status, 0);
+    /* 20 sleeps, each a context switch. */
+    for (int i = 0; i < 20; i++) nanosleep(&(struct timespec){0, 1000000}, NULL);
+    if (psc_read(&after)) {
+        printf("proc-stat read failed\n");
+        return 1;
+    }
+    cpu_set_t online;
+    int cpus = sched_getaffinity(0, sizeof online, &online) ? -1 : CPU_COUNT(&online);
+    int lines = after.cpu_lines < PSC_LINES ? after.cpu_lines : PSC_LINES;
+    int per_cpu = before.cpu_lines == after.cpu_lines;
+    unsigned long long lines_before = 0, lines_after = 0;
+    for (int cpu = 0; cpu < lines; cpu++) {
+        per_cpu &= psc_grew(before.per_cpu[cpu], after.per_cpu[cpu], 10, 1);
+        lines_before += before.per_cpu[cpu][0];
+        lines_after += after.per_cpu[cpu][0];
+    }
+    printf("proc-stat shape=%d/%d per-cpu-lines=%d child=%d\n", before.shape, after.shape,
+           after.cpu_lines == cpus, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("proc-stat never-back total=%d per-cpu=%d intr=%d ctxt=%d processes=%d softirq=%d\n",
+           psc_grew(before.total, after.total, 10, 1), per_cpu, after.intr >= before.intr,
+           after.ctxt >= before.ctxt, after.processes >= before.processes,
+           psc_grew(before.softirq, after.softirq, 11, 0));
+    printf("proc-stat counted user>=20=%d lines-user>=20=%d ctxt>=20=%d processes>=1=%d\n",
+           after.total[0] - before.total[0] >= 20, lines_after - lines_before >= 20,
+           after.ctxt - before.ctxt >= 20, after.processes - before.processes >= 1);
+    printf("proc-stat tasks running>=1=%d\n", after.running >= 1);
+    return 0;
+}
+
 /* The proc-sizes case: every file of a /proc/<pid> directory is of size 0,
    as Linux's are, whatever its reads give: stat and fstat show 0 for
    this process's own files, another process's and a thread's, and a read
@@ -33268,6 +33397,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-at-read")) return proc_at_read_case(self);
     if (!strcmp(mode, "proc-own-at-read")) return proc_own_at_read_case(argv);
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
+    if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

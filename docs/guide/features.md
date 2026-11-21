@@ -4393,7 +4393,8 @@ kernel.
   does. See [limitations](./limitations) for what is not there.
 
 - `BPF_PROG_LOAD` loads socket filters (`BPF_PROG_TYPE_SOCKET_FILTER`),
-  which a verifier checks as Linux's does; nothing runs them yet. It checks
+  which a verifier checks as Linux's does, and an interpreter runs them on
+  AF_UNIX sockets they are attached to (below). It checks
   its arguments as Linux's `bpf_prog_load` does, in master's order and with
   its errors: the log's arguments first (a buffer without a size or a size
   without a buffer, a buffer without a level, an unknown level, `EINVAL`;

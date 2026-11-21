@@ -45,6 +45,8 @@ mod keys;
 mod loopback;
 mod lsm;
 mod mctp;
+#[cfg(test)]
+mod mctp_tests;
 mod netconf;
 mod netdev;
 mod netlink;

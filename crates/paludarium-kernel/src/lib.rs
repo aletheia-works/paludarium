@@ -70,6 +70,8 @@ mod record_locks;
 mod rseq;
 mod scheduling;
 mod seccomp;
+#[cfg(test)]
+mod seccomp_tests;
 mod sem;
 mod seq;
 mod shm;

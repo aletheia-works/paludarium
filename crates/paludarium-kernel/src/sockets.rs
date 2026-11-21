@@ -4429,10 +4429,16 @@ impl SocketPairEnd {
         }
         if self.pair.messages() {
             // sock_alloc_send_pskb: this side's shutdown, then its send
-            // buffer. A message goes whole or not at all, and an empty one
-            // is a message too. It takes of the sender's send buffer what a
+            // buffer. The peer's shutdown of reading and its close are this
+            // side's shutdown of writing too, as unix_shutdown and
+            // unix_release_sock give a packet socket's peer SEND_SHUTDOWN.
+            // A message goes whole or not at all, and an empty one is a
+            // message too. It takes of the sender's send buffer what a
             // datagram does, which bounds it, not the peer's unread bytes.
-            if sides[self.side].write_shutdown {
+            if sides[self.side].write_shutdown
+                || sides[1 - self.side].closed
+                || sides[1 - self.side].read_shutdown
+            {
                 return Err(Errno(32));
             }
             let full = self.sent.load(Ordering::SeqCst) >= self.send_buffer();
@@ -4440,9 +4446,10 @@ impl SocketPairEnd {
             if full {
                 return Err(Errno::EAGAIN);
             }
-            // sk_filter, before the peer's checks: a message it drops is
-            // sent as far as the sender knows, and one it trims keeps the
-            // bytes it says. It runs outside the lock.
+            // sk_filter: a message it drops is sent as far as the sender
+            // knows, and one it trims keeps the bytes it says. It runs
+            // outside the lock, after which the peer is checked again, as
+            // unix_dgram_sendmsg checks `other` once it holds its lock.
             let filter = sides[1 - self.side].filter.clone();
             let mut keep = buf.len();
             if filter.is_some() {

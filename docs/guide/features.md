@@ -1589,15 +1589,51 @@ kernel.
     ignores its failed unmap.
   - A child of `fork` keeps the seals; `exec` starts without any.
 
-- io_uring is Linux 6.12's with two operations, `IORING_OP_NOP` and
-  `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with); the
-  other operations complete with `EOPNOTSUPP`, as on a Linux built without
-  them, and `IORING_REGISTER_PROBE` reports only those two. The rings are
-  the sizes, offsets and features Linux gives, and `mmap` of the descriptor
-  shows them. A request runs while `io_uring_enter` takes it, so its
-  completion is in the queue when the call returns; links, completions that
-  skip success, and completions kept while the queue is full
+- io_uring is Linux 6.12's with these operations: `IORING_OP_NOP`,
+  `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
+  the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
+  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  built without them, and `IORING_REGISTER_PROBE` reports only these. The
+  rings are the sizes, offsets and features Linux gives, and `mmap` of the
+  descriptor shows them. A request runs while `io_uring_enter` takes it, so
+  its completion is in the queue when the call returns; links, completions
+  that skip success, and completions kept while the queue is full
   (`IORING_FEAT_NODROP`) behave as on Linux.
+
+- A transfer is checked as Linux's `io_prep_rw` and `io_read` or
+  `io_write` check it, and fails at the same step. Its preparation takes the
+  priority, the attributes, and the buffer or vector, and an error there
+  ends the submission. Its issue completes with the error instead: the
+  descriptor (`EBADF`, also for `IOSQE_FIXED_FILE`), a provided buffer for
+  a read that selects one (`ENOBUFS`), the access mode, the `RWF_*` flags
+  (`RWF_HIPRI` is `EINVAL`), the range, a read's `FAN_ACCESS_PERM`, and a
+  file that cannot read or write (`EINVAL`, `EISDIR` for a directory). An
+  offset of -1 is the file's position, which moves past what was moved,
+  and a stream such as a pipe takes any offset. A read that did not fail
+  gives `IN_ACCESS`, and any write that reached the file `IN_MODIFY`, as
+  `io_req_io_end` tells them, even for no bytes. A buffered write with
+  `RWF_NOWAIT` that the file system cannot do without waiting is `EAGAIN`,
+  where AIO's is `EOPNOTSUPP`. The attributes are Linux 6.14's, which the
+  differential tests' kernel has: only protection information, which no
+  file here takes (`EINVAL`). `IORING_OP_FSYNC` takes only
+  `IORING_FSYNC_DATASYNC`.
+
+- `IORING_REGISTER_BUFFERS` registers a ring's buffers as Linux's
+  `io_sqe_buffers_register` does. It checks in this order:
+  - none registered yet (`EBUSY`), and 1 to 16384 of them (`EINVAL`);
+  - then each `iovec` (`EFAULT`, `EINVAL` for a negative length); a null
+    one with no length is an empty slot;
+  - a length of 1 byte to 1 GiB (`EFAULT`), and no end past the address
+    space (`EOVERFLOW`);
+  - writable pages (`EFAULT`);
+  - room under RLIMIT_MEMLOCK (`ENOMEM`), shared with the user's other
+    rings and `memfd_secret` pages, unless the ring's maker had
+    `CAP_IPC_LOCK`.
+
+  A failure registers none of them. `IORING_UNREGISTER_BUFFERS` takes no
+  argument (`EINVAL`) and needs buffers (`ENXIO`). `IORING_OP_READ_FIXED` and
+  `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
+  file is found: no buffer there, or a range that leaves it, is `EFAULT`.
 
 - Linux's native asynchronous I/O (the calls libaio wraps) is `fs/aio.c`'s.
   `io_setup` makes the number of events at least four for each CPU and

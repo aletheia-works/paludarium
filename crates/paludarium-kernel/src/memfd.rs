@@ -441,6 +441,28 @@ pub(crate) fn enter(memlock: &Arc<AtomicU64>) {
 #[derive(Default)]
 pub(crate) struct SecretPages(Mutex<std::collections::BTreeMap<u32, u64>>);
 
+impl SecretPages {
+    /// Charges `user` with `pages` more if that keeps it within `limit`
+    /// pages, as io_uring's `__io_account_mem` does for its registered
+    /// buffers.
+    pub(crate) fn charge(&self, user: u32, pages: u64, limit: u64) -> bool {
+        let mut users = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = users.entry(user).or_default();
+        if held.saturating_add(pages) > limit {
+            return false;
+        }
+        *held += pages;
+        true
+    }
+    /// Takes `pages` off what `user` is charged with.
+    pub(crate) fn release(&self, user: u32, pages: u64) {
+        let mut users = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = users.get_mut(&user) {
+            *held = held.saturating_sub(pages);
+        }
+    }
+}
+
 /// What a secret file's pages charge: the user who made it, for each page
 /// a fault brought in, until the file goes (Linux's
 /// `secretmem_inode_state`). A fault past the faulting process's

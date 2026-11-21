@@ -3557,6 +3557,109 @@ pub(crate) fn aio_transfer(
     result.map_or_else(|e| -i64::from(e.0), |count| count as i64)
 }
 
+/// An io_uring read or write of `segments` with the `RWF_*` `flags` that
+/// `kiocb_set_rw_flags` took, as Linux's `__io_read` and `io_write` go on
+/// from there. The outer error is one from before the file's `read_iter`
+/// or `write_iter`, the inner result what that gives.
+///
+/// - A buffered write the file system cannot do without waiting, with
+///   `RWF_NOWAIT`, is `EAGAIN` (no `FOP_BUFFER_WASYNC`, and the request
+///   may not wait).
+/// - An `offset` of -1 is the file's position, which moves past what was
+///   moved (an appending write's starts at the end), as
+///   `io_kiocb_update_pos` and `kiocb_done` do. A stream has none.
+/// - `rw_verify_area`: `EINVAL` for a negative offset, or an end past the
+///   largest. Then a read's `FAN_ACCESS_PERM`, for no bytes too.
+/// - The operation: a directory reads `EISDIR` (`generic_read_dir`), and a
+///   file with no read or write `EINVAL`.
+/// - A file that would wait (a pipe, a socket, an eventfd) does not:
+///   Linux keeps the request in flight until the file is ready, and the
+///   emulator completes it with `EAGAIN`.
+pub(crate) fn ring_transfer(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    write: bool,
+    segments: &[(u64, usize)],
+    offset: u64,
+    flags: u32,
+) -> Result<Result<u64, Errno>, Errno> {
+    if write && refuses_nowait_write(file, flags)? {
+        return Err(Errno::EAGAIN);
+    }
+    let positioned = aio_positioned(file);
+    let current = offset == u64::MAX;
+    let at = match (current, positioned) {
+        (true, true) => Some(file.seek(0, 1)?),
+        (true, false) => None,
+        (false, _) => Some(offset),
+    };
+    let total = segments
+        .iter()
+        .map(|&(_, length)| length as u64)
+        .sum::<u64>();
+    if let Some(at) = at
+        && ((at as i64) < 0 || (at as i64).checked_add(total as i64).is_none())
+    {
+        return Err(Errno::EINVAL);
+    }
+    if !write {
+        access_permission(c, file)?;
+    }
+    ring_operation(file, write)?;
+    let transfer = |c: &mut Context<'_>, at: u64, flags: u32| {
+        if write {
+            aio_write(c, file, segments, at, flags)
+        } else {
+            aio_read(c, file, segments, at, flags)
+        }
+    };
+    Ok(match at {
+        Some(at) if positioned && current => {
+            let metadata = file.stat()?;
+            let appends = (file.flags() & O_APPEND != 0 || flags & RWF_APPEND != 0)
+                && flags & RWF_NOAPPEND == 0
+                && metadata.mode & S_IFMT == S_IFREG;
+            let start = if write && appends { metadata.size } else { at };
+            let result = transfer(c, start, flags);
+            if let Ok(count) = result {
+                file.seek((start + count) as i64, 0)?;
+            }
+            result
+        }
+        Some(at) if positioned => transfer(c, at, flags),
+        _ => transfer(c, 0, flags | RWF_NOWAIT),
+    })
+}
+
+/// Whether `file` has the read (or with `write`, the write) an io_uring
+/// request needs, `read_iter` or `read` as Linux's `io_iter_do_read` and
+/// `io_write` look for them: a directory's `read` is `EISDIR`, and an
+/// epoll instance, an io_uring ring, a pidfd and a secret memfd have
+/// neither (`EINVAL`); an inotify instance, a signalfd and a timerfd only
+/// read.
+fn ring_operation(file: &Arc<dyn FileHandle>, write: bool) -> Result<(), Errno> {
+    if !write && file.stat()?.mode & S_IFMT == 0o040000 {
+        return Err(Errno::EISDIR);
+    }
+    if cannot_read_or_write(file) {
+        return Err(Errno::EINVAL);
+    }
+    let Some(any) = file.as_any() else {
+        return Ok(());
+    };
+    if any.is::<crate::epoll::EpollInstance>()
+        || any.is::<crate::io_uring::Ring>()
+        || any.is::<crate::processes::PidFd>()
+        || (write
+            && (any.is::<crate::inotify::Instance>()
+                || any.is::<crate::signalfd::SignalFile>()
+                || any.is::<crate::timerfd::TimerFile>()))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
 /// Checks that the first `len` bytes of `segments` can be written.
 fn writable_prefix(
     c: &Context<'_>,
@@ -4904,7 +5007,7 @@ fn accessed(c: &Context<'_>, n: u64, a: [u64; 6], result: &Result<u64, Errno>) {
 /// Tells the inotify watches of `mask` on the open file of descriptor `fd`
 /// (`fsnotify_file`). A pipe, a socket or another file no path opened has
 /// none, as Linux's pseudo files are `FMODE_NONOTIFY`.
-fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
+pub(crate) fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
     let Ok(d) = c.files.descriptor(fd) else {
         return;
     };

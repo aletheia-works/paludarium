@@ -192,10 +192,8 @@ impl Mapping {
     /// for `heap` (`vma_is_initial_heap`).
     fn of(vma: &Vma, start_stack: u64, root: &[u8], heap: bool) -> Self {
         let (device, inode) = vma.identity;
-        // `MAJOR` and `MINOR` of the device `stat` encodes, as glibc's
-        // `major` and `minor` take them apart.
-        let major = (((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000)) as u32;
-        let mut minor = ((device & 0xff) | ((device >> 12) & 0xffff_ff00)) as u32;
+        // `MAJOR` and `MINOR` of the device `stat` encodes.
+        let (major, mut minor) = paludarium_types::device_numbers(device);
         let name: Vec<u8> = match &vma.file {
             Some(file) if file.source => {
                 let name = file.name.as_deref().unwrap_or_default();
@@ -513,8 +511,12 @@ mod tests {
         };
         let wide = Mapping::of(&big, 0, b"/", false);
         // glibc's `major` (bits 8 to 19 and 44 up) and `minor` (bits 0 to 7
-        // and 20 to 43).
+        // and 20 to 43), the split `stat` and /proc/<pid>/maps give too.
         assert_eq!((wide.major, wide.minor), (0x189a, 0x2345_67bc));
+        assert_eq!(
+            (wide.major, wide.minor),
+            paludarium_types::device_numbers(big.identity.0)
+        );
         assert_eq!(
             (m.prot, m.flags, m.exec),
             (PROT_READ | PROT_EXEC, MAP_SHARED | MAP_LOCKED, true)
@@ -525,15 +527,17 @@ mod tests {
             source: false,
             offset: 0,
         };
-        let m = Mapping::of(
-            &vma(0, 0x1000, vm::READ | vm::MAYSHARE, Some(shared)),
-            0,
-            b"/",
-            false,
-        );
+        // Its file's device is 0, as the memory gives it.
+        let anonymous = Vma {
+            identity: (0, 7),
+            ..vma(0, 0x1000, vm::READ | vm::MAYSHARE, Some(shared))
+        };
+        let m = Mapping::of(&anonymous, 0, b"/", false);
+        // On the device /proc/<pid>/maps gives it: Linux's first unnamed
+        // one, of the tmpfs `shmem_zero_setup` puts its file on.
         assert_eq!(
-            (m.minor, &m.name[..]),
-            (1, &padded(b"/dev/zero (deleted)")[..])
+            (m.major, m.minor, m.inode, &m.name[..]),
+            (0, 1, 7, &padded(b"/dev/zero (deleted)")[..])
         );
     }
 }

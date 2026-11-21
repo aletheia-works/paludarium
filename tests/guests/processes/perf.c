@@ -1256,12 +1256,31 @@ static int case_throttle(void) {
 /* What the cases compare the records with. */
 struct expected {
     pid_t pid, tid, child, parent;
-    char *anon, *exec_at, *shm, *heap;
+    char *anon, *exec_at, *shm, *heap, *shared;
     size_t anon_len;
     const char *path, *self;
     struct stat file;
+    /* The device and inode /proc/self/maps gives the shared mapping. */
+    unsigned shared_major, shared_minor;
+    unsigned long shared_inode;
     int mmap_records;
 };
+
+/* The device and inode of the mapping at `at` in /proc/self/maps: 1 if
+   its line was found. */
+static int maps_identity(const char *at, unsigned *major_, unsigned *minor_, unsigned long *inode) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512];
+    int found = 0;
+    while (!found && fgets(line, sizeof line, maps)) {
+        unsigned long start;
+        found = sscanf(line, "%lx-%*x %*s %*x %x:%x %lu", &start, major_, minor_, inode) == 4 &&
+                start == (unsigned long)at;
+    }
+    fclose(maps);
+    return found;
+}
 
 /* An MMAP or MMAP2 record's name, at `words` 64-bit words in. */
 static const char *mapping_name(const uint64_t *record, int mmap2) {
@@ -1285,6 +1304,7 @@ static void say_record(const uint64_t *record, void *with) {
         const char *what = "other";
         if (e->path && !strcmp(name, e->path)) what = "file";
         else if (!strcmp(name, "//anon")) what = "anon";
+        else if (!strcmp(name, "/dev/zero (deleted)")) what = name;
         else if (!strncmp(name, "/SYSV", 5)) what = name;
         else if (name[0] == '[') what = name;
         say("%s %s data %d ids %d", mmap2 ? "mmap2" : "mmap", what, !!(misc & MISC_DATA),
@@ -1301,6 +1321,11 @@ static void say_record(const uint64_t *record, void *with) {
             if (at == e->exec_at)
                 say("  device %d inode %d", words[0] == major(e->file.st_dev) && words[1] == minor(e->file.st_dev),
                     *(const uint64_t *)(words + 2) == (uint64_t)e->file.st_ino);
+            /* Shared anonymous memory's file: the device and inode its
+               line in /proc/self/maps gives. */
+            if (e->shared && at == e->shared)
+                say("  shared device %d inode %d", words[0] == e->shared_major && words[1] == e->shared_minor,
+                    *(const uint64_t *)(words + 2) == (uint64_t)e->shared_inode);
         }
         e->mmap_records++;
     } else if (type == RECORD_COMM) {
@@ -1351,6 +1376,10 @@ static int case_side_band(void) {
     e.anon_len = 3 * 4096;
     e.anon = mmap(NULL, e.anon_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     e.exec_at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 4096);
+    e.shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (e.shared == MAP_FAILED) e.shared = NULL;
+    say("shared in maps %d",
+        e.shared && maps_identity(e.shared, &e.shared_major, &e.shared_minor, &e.shared_inode));
     mprotect(e.anon, 4096, PROT_READ);
     mprotect(e.anon, 4096, PROT_READ);
     char *new_break = old_break + 3 * 4096;

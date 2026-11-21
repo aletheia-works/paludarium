@@ -19,7 +19,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `int3` は、カーネルからの（`SI_KERNEL`、トラップ 3）`SIGTRAP` で、`rip` はその次です。
 - **SSE 系**：MMX レジスタを使うものを除く SSE と SSE2 のすべての命令（エンコーディング
   ごとにテストで動かしています。フェンスの `MFENCE`／`LFENCE`／`SFENCE` を含みます）。
-  それより後の命令セットは、実際のプログラム（probe、aube、pitchfork）が使う命令と、
+  それより後の命令セットは、実際のプログラム（probe、aube、pitchfork、ripgrep、coreutils）が使う命令と、
   AES・PCLMUL・SHA などの暗号の命令です。浮動小数点はソフトウェアで計算します。
 - 命令のデコードには [iced-x86](https://github.com/icedland/iced) を使っています。
 - `CPUID` はホストの値を見せません。glibc は知っているベンダーの機能しか読まないので、

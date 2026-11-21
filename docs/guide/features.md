@@ -24,8 +24,9 @@ Linux.
   past it.
 - **SSE**: every SSE and SSE2 instruction, except those that use MMX registers
   (a test runs each encoding), the `MFENCE`/`LFENCE`/`SFENCE` fences among them.
-  Of the later sets, the instructions real programs (probe, aube and pitchfork)
-  use, and cryptographic instructions such as AES, PCLMUL and SHA. Floating
+  Of the later sets, the instructions real programs (probe, aube, pitchfork,
+  ripgrep and coreutils) use, and cryptographic instructions such as AES, PCLMUL
+  and SHA. Floating
   point is computed in software.
 - Instructions are decoded with [iced-x86](https://github.com/icedland/iced).
 - `CPUID` does not reveal the host's values. It names AMD as the vendor, because

@@ -7236,6 +7236,100 @@ static int proc_stat_exec(const char *start, const char *faults) {
            ps_field("/proc/self/stat", 10) >= atol(faults));
     return 0;
 }
+/* The proc-stat-sched case: /proc/<pid>/stat's scheduling fields, as
+   fs/proc/array.c do_task_stat writes them: priority is task_prio (prio
+   less MAX_RT_PRIO: 20 + nice for a normal task, -1 - rt_priority for a
+   real-time one, -101 for a deadline one), then the nice value, the
+   threads, and later processor (task_cpu), rt_priority and policy. The
+   whole process's are its leader's, a path under task/ the thread's own.
+   Linux runs this case as root, as the guest is. */
+static void pss_show(const char *what, const char *path) {
+    printf("%s: priority=%ld nice=%ld threads=%ld rt_priority=%ld policy=%ld\n", what, ps_field(path, 18),
+           ps_field(path, 19), ps_field(path, 20), ps_field(path, 40), ps_field(path, 41));
+}
+/* Pins the calling thread to the highest CPU its mask allows; that CPU,
+   or -1. */
+static int pss_pin_high(void) {
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set)) return -1;
+    int high = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        if (CPU_ISSET(cpu, &set)) high = cpu;
+    if (high < 0) return -1;
+    CPU_ZERO(&set);
+    CPU_SET(high, &set);
+    return sched_setaffinity(0, sizeof set, &set) ? -1 : high;
+}
+static int pss_ready[2], pss_done[2];
+static void *pss_thread(void *unused) {
+    (void)unused;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)syscall(SYS_gettid));
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 7);
+    struct sched_param none = {0};
+    printf("thread batch: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &none));
+    pss_show("thread's own", path);
+    pss_show("thread sees the process", "/proc/self/stat");
+    int cpu = pss_pin_high();
+    printf("thread pinned: %d processor-is-getcpu=%d\n", cpu >= 0,
+           cpu >= 0 && sched_getcpu() == cpu && ps_field(path, 39) == cpu);
+    fflush(stdout);
+    char byte = (char)cpu;
+    if (write(pss_ready[1], &byte, 1) != 1) return NULL;
+    if (read(pss_done[0], &byte, 1) != 1) return NULL;
+    return NULL;
+}
+static int proc_stat_sched_case(void) {
+    const char *self = "/proc/self/stat";
+    struct sched_param param = {0};
+    printf("nice 5: %d\n", setpriority(PRIO_PROCESS, 0, 5));
+    pss_show("normal", self);
+    printf("batch: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &param));
+    pss_show("batch", self);
+    printf("idle: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_IDLE, &param));
+    pss_show("idle", self);
+    param.sched_priority = 1;
+    printf("fifo 1: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &param));
+    pss_show("fifo", self);
+    param.sched_priority = 99;
+    printf("rr 99: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_RR | 0x40000000, &param));
+    pss_show("rr", self);
+    struct {
+        uint32_t size, policy;
+        uint64_t flags;
+        int32_t nice;
+        uint32_t priority;
+        uint64_t runtime, deadline, period;
+    } attr = {.size = 48, .policy = 6, .runtime = 10000000, .deadline = 30000000, .period = 100000000};
+    printf("deadline: %ld\n", syscall(SYS_sched_setattr, 0, &attr, 0));
+    pss_show("deadline", self);
+    attr = (typeof(attr)){.size = 48, .policy = SCHED_OTHER, .nice = 0};
+    printf("other: %ld\n", syscall(SYS_sched_setattr, 0, &attr, 0));
+    pss_show("other", self);
+    fflush(stdout);
+    if (pipe(pss_ready) || pipe(pss_done)) return 1;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, pss_thread, NULL)) return 1;
+    char cpu;
+    if (read(pss_ready[0], &cpu, 1) != 1) return 1;
+    /* The thread now sleeps on the CPU it was pinned to. */
+    DIR *task = opendir("/proc/self/task");
+    char path[300] = "";
+    for (struct dirent *entry; task && (entry = readdir(task));)
+        if (atol(entry->d_name) > 0 && atol(entry->d_name) != getpid())
+            snprintf(path, sizeof path, "/proc/self/task/%s/stat", entry->d_name);
+    if (task) closedir(task);
+    pss_show("the thread from the leader", path);
+    printf("the thread from the leader: processor-kept=%d\n", cpu >= 0 && ps_field(path, 39) == cpu);
+    pss_show("with the thread", self);
+    if (write(pss_done[1], &cpu, 1) != 1) return 1;
+    pthread_join(thread, NULL);
+    int own = pss_pin_high();
+    printf("pinned: %d processor-is-getcpu=%d\n", own >= 0,
+           own >= 0 && sched_getcpu() == own && ps_field(self, 39) == own);
+    pss_show("after the thread", self);
+    return 0;
+}
 static int proc_stat_counts_case(const char *self) {
     fflush(stdout);
     pid_t measuring = fork();
@@ -34398,6 +34492,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "page-faults-exec")) return argc < 3 ? 98 : page_faults_exec(argv[2]);
     if (!strcmp(mode, "proc-stat-counts")) return proc_stat_counts_case(self);
+    if (!strcmp(mode, "proc-stat-sched")) return proc_stat_sched_case();
     if (!strcmp(mode, "proc-stat-exec")) return argc < 4 ? 98 : proc_stat_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-stat-thread-exec"))
         return argc < 5 ? 98 : proc_stat_thread_exec(argv[2], argv[3], argv[4]);

@@ -3491,7 +3491,10 @@ kernel.
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0
   and -1 without one), the CPU time of the process and of its waited-for
-  children in `USER_HZ` (100) ticks, the priority and nice value, the threads,
+  children in `USER_HZ` (100) ticks, the priority (Linux's `task_prio`: 20
+  more than the nice value, -1 less the real-time priority under
+  `SCHED_FIFO` and `SCHED_RR`, and -101 under `SCHED_DEADLINE`) and nice
+  value, the threads,
   the size of the mappings, the `RLIMIT_RSS` limit, the start and end of
   the program's code (Linux's `start_code` and `end_code`, as
   `load_elf_binary` finds them: the lowest address and the highest end in
@@ -3503,8 +3506,11 @@ kernel.
   `load_elf_binary` finds them: the highest address and the highest end in
   the file of all its `PT_LOAD` segments), and where
   the argument and environment strings lie, the minor faults, the resident
-  pages and the start time. What nothing measures
-  is 0: major faults and the scheduler's figures.
+  pages, the start time, the CPU the task was last seen on (the one
+  `getcpu` reports), and the real-time priority and policy. A path under
+  `task` gives the thread's own; the process's are its leader's. What
+  nothing measures is 0: major faults, and the system time, as all the CPU
+  time counts as the user's.
   A reader that may not see the task's memory, as Linux's
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and

@@ -333,6 +333,7 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
         .and_then(paludarium_mmu::MemoryView::size_and_break)
         .unwrap_or((0, 0));
     let threads = task.threads();
+    let sched = task.view.group.sched(task.tid);
     crate::proc::render_stat(&crate::proc::ProcessStat {
         pid: task.tid,
         name: &task.public.name,
@@ -361,6 +362,14 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
             .and_then(paludarium_mmu::MemoryView::resident_pages)
             .map_or(0, |(_, now)| now),
         nice: task.view.group.nice(task.tid).unwrap_or(0),
+        policy: sched.policy,
+        rt_priority: sched.priority,
+        // The CPU it was last seen on; before it was ever seen, the one it
+        // would report (`getcpu`).
+        processor: task.view.group.last_thread_usage(task.tid).map_or_else(
+            || task.view.group.lowest_cpu(task.tid),
+            |usage| usage.last_cpu.load(std::sync::atomic::Ordering::SeqCst),
+        ),
         threads,
         virtual_size,
         rss_limit: task.view.rss_limit,

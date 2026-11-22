@@ -2145,6 +2145,7 @@ impl Kernel {
         }
         crate::mqueue::exited(&closed, self.process.pid);
         drop(closed);
+        crate::aio::complete_ready(&self.processes.aio, &self.files.readiness);
         // Then `exit_fs`: the last task sharing the working directory lets
         // go of it.
         self.files.release_home();

@@ -835,8 +835,42 @@ static int case_reap(void) {
     int status = 0;
     waitpid(child, &status, 0);
     char c;
-    printf("child=%d read=%zd destroy=%ld\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, read(p[0], &c, 1),
-           destroy(ctx));
+    printf("child=%d read=%zd\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, read(p[0], &c, 1));
+    /* A child that holds the pipe's only write end ends: its exit closes
+       it, and the hang-up completes the poll (POLLHUP) with no call here. */
+    int q[2];
+    if (pipe(q)) return 5;
+    struct iocb hup = poll_of(q[0], POLLIN, 8);
+    printf("hang-up submit=%ld\n", submit1(ctx, &hup));
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        close(q[0]);
+        read(go[0], &c, 1);
+        _exit(0);
+    }
+    close(q[1]);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    end.tv_sec += 10;
+    write(go[1], "g", 1);
+    head = ring->head;
+    for (;;) {
+        tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+        if (tail != head) break;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > end.tv_sec || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec)) {
+            printf("hang-up never came\n");
+            break;
+        }
+    }
+    if (tail != head) {
+        struct io_event ev2 = events[head];
+        printf("hang-up reaped: data=%llu obj=%d res=%#llx\n", (unsigned long long)ev2.data,
+               ev2.obj == (uint64_t)(uintptr_t)&hup, (long long)ev2.res);
+        __atomic_store_n(&ring->head, (head + 1) % ring->nr, __ATOMIC_RELEASE);
+    }
+    waitpid(child, &status, 0);
+    printf("hang-up child=%d destroy=%ld\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, destroy(ctx));
     return 0;
 }
 

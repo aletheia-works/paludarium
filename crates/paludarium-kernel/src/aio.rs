@@ -562,7 +562,13 @@ fn lookup(c: &Context<'_>, ctx_id: u64) -> Option<Arc<Ring>> {
 /// that takes events from the ring without a call sees it there. Nothing
 /// while no poll waits anywhere.
 pub(crate) fn progress(c: &Context<'_>) {
-    let limits = &c.processes.aio;
+    complete_ready(&c.processes.aio, &c.files.readiness);
+}
+
+/// [`progress`] where no call runs: as a process's last thread ends, after
+/// it closed its files, whose close (a pipe's last writer) may be what a
+/// poll waits for. `hub` is woken if a poll completes.
+pub(crate) fn complete_ready(limits: &Limits, hub: &crate::events::ReadinessHub) {
     if limits.polls.load(Ordering::SeqCst) == 0 {
         return;
     }
@@ -574,7 +580,7 @@ pub(crate) fn progress(c: &Context<'_>) {
         }
     }
     if any {
-        c.files.readiness.changed();
+        hub.changed();
     }
 }
 

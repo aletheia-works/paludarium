@@ -218,6 +218,7 @@ impl PageCaches {
             resolved: false,
             unlinked: false,
         }));
+        let _use = self.notify.fan.using();
         self.kept
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -360,12 +361,14 @@ impl PageCaches {
         Some(hold)
     }
     fn hold_of(self: &Arc<Self>, key: Key) -> Hold {
+        let use_ = self.notify.fan.using();
         *self
             .holds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry(key)
             .or_default() += 1;
+        drop(use_);
         Hold {
             caches: Arc::clone(self),
             key,
@@ -421,6 +424,7 @@ impl PageCaches {
         self.count(key, -1)
     }
     fn count(self: &Arc<Self>, key: Key, change: i64) -> Result<WriteAccess, Errno> {
+        let _use = self.notify.fan.using();
         let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
         let count = writes.entry(key).or_insert(0);
         if *count * change < 0 {
@@ -913,6 +917,7 @@ impl CoherentFile {
     /// Lists this description among the open ones.
     fn list(&self) {
         let id = Arc::as_ptr(&self.inner).cast::<()>().addr();
+        let _use = self.caches.notify.fan.using();
         self.caches
             .opens
             .lock()

@@ -24,7 +24,7 @@ use paludarium_vfs::MountChange;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, Weak};
 
 // The events, as `include/uapi/linux/fanotify.h` numbers them (the same
 // bits as `fsnotify`'s).
@@ -341,6 +341,11 @@ pub(crate) struct Registry {
     /// The devices of the superblocks gone since then, whose marks go too
     /// ([`Registry::superblock_gone`]).
     superblocks: Mutex<Vec<u64>>,
+    /// Taken shared by each new use of a file ([`Registry::using`]) and
+    /// alone by an eviction's check and removal ([`Registry::evict_of`]),
+    /// as Linux's `evict` and a new reference meet at the inode's lock: a
+    /// use the check does not see comes after the eviction.
+    uses: RwLock<()>,
     /// The inodes of the mount namespaces, the only namespaces a mount
     /// namespace mark may be on (`mnt_ns_from_dentry`), each with its
     /// tables: the first namespace's table is replaced when the machine's
@@ -1119,9 +1124,23 @@ impl Registry {
         if !self.active() {
             return;
         }
-        let groups = self.groups();
+        let candidates = self.evictable();
+        self.evict_of(candidates, held);
+    }
+
+    /// Held while a file gets a new use (an open description, a hold, a
+    /// running program, a kernel open, an inotify watch or a mark), which
+    /// an eviction then either sees or comes before ([`Self::evict_of`]).
+    pub(crate) fn using(&self) -> RwLockReadGuard<'_, ()> {
+        self.uses.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The files [`Self::evict`] may evict as the marks are now: each once,
+    /// with an evictable mark, not on a tmpfs, not a directory, and with no
+    /// mark that holds it. Whether they are in use is checked as they go.
+    pub(crate) fn evictable(&self) -> Vec<Key> {
         let (mut candidates, mut pinned) = (Vec::new(), std::collections::HashSet::new());
-        for group in &groups {
+        for group in &self.groups() {
             for m in &group.queue().marks {
                 let Target::Inode(key) = m.target else {
                     continue;
@@ -1136,6 +1155,28 @@ impl Registry {
         candidates.retain(|key| !pinned.contains(key));
         candidates.sort_unstable();
         candidates.dedup();
+        candidates
+    }
+
+    /// Evicts those of `candidates` ([`Self::evictable`]) that are still
+    /// unused, with no other use made meanwhile: under [`Self::using`]'s
+    /// lock, a mark that holds the file since, or a use `held` sees, keeps
+    /// it, as Linux's `evict` passes over an inode that got a reference.
+    pub(crate) fn evict_of(&self, mut candidates: Vec<Key>, held: &dyn Fn(Key) -> bool) {
+        if candidates.is_empty() {
+            return;
+        }
+        let _uses = self.uses.write().unwrap_or_else(PoisonError::into_inner);
+        let groups = self.groups();
+        for group in &groups {
+            for m in &group.queue().marks {
+                if let Target::Inode(key) = m.target
+                    && m.flags & NO_IREF == 0
+                {
+                    candidates.retain(|&k| k != key);
+                }
+            }
+        }
         candidates.retain(|&key| !held(key));
         if candidates.is_empty() {
             return;
@@ -2193,6 +2234,7 @@ fn add_mark(
     mark_flags: u32,
     fsid: [u32; 2],
 ) -> Result<(), Errno> {
+    let _use = group.fan().using();
     let mut queue = group.queue();
     let at = match queue.marks.iter().position(|m| m.target == target) {
         Some(at) => at,

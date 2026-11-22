@@ -895,6 +895,51 @@ fn drop_caches_evicts_the_evictable_marks_of_files_nothing_holds() {
     let _ = std::fs::remove_dir_all(&host);
 }
 
+#[test]
+fn a_use_made_between_an_evictions_look_and_its_removal_keeps_the_mark() {
+    let mut f = fixture();
+    let host = std::env::temp_dir().join(format!("paludarium-evict-race-{}", std::process::id()));
+    std::fs::create_dir_all(&host).unwrap();
+    let base = paludarium_vfs::MemFs::new();
+    let _ = <paludarium_vfs::MemFs as paludarium_vfs::HostFs>::mkdir(&base, b"/tmp", 0o1777);
+    let mut mounted = paludarium_vfs::MountedFs::new(base);
+    mounted
+        .mount(
+            b"/data".to_vec(),
+            Arc::new(paludarium_host::NativeFs::new(&host).unwrap()),
+        )
+        .unwrap();
+    f.kernel.files.set_file_system(Arc::new(mounted));
+    let fan = f.init(NONBLOCK, 0);
+    let other = f.init(NONBLOCK, 0);
+    for name in ["/data/opened", "/data/marked", "/data/free"] {
+        f.touch(name);
+        assert_eq!(f.mark(fan, ADD | EVICTABLE, OPEN, name), 0);
+    }
+    let marks = |f: &mut Fixture| {
+        f.fdinfo(fan)
+            .lines()
+            .filter(|l| l.starts_with("fanotify ino:"))
+            .count()
+    };
+    let caches = Arc::clone(&f.kernel.files.caches);
+    let held = |key| caches.held(key) || caches.notify.watches_file(key);
+    // The eviction looks at the marks: all three files are unused.
+    let candidates = caches.notify.fan.evictable();
+    assert_eq!(candidates.len(), 3);
+    // Before it takes them, one file is opened and another gets a mark
+    // that holds it, as a new reference to an inode stops Linux's evict.
+    let opened = f.open("/data/opened", 0);
+    assert_eq!(f.mark(other, ADD, OPEN, "/data/marked"), 0);
+    caches.notify.fan.evict_of(candidates, &held);
+    assert_eq!(marks(&mut f), 2);
+    // Once closed, the opened file's goes; the held one's stays.
+    f.close(opened);
+    caches.notify.fan.evict(&held);
+    assert_eq!(marks(&mut f), 1);
+    let _ = std::fs::remove_dir_all(&host);
+}
+
 /// The names a read's events give, with their masks, from the first
 /// record of each (a directory and name).
 fn named(seen: &[Seen]) -> Vec<(u64, String)> {

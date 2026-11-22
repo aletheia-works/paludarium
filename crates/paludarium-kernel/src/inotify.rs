@@ -1289,6 +1289,7 @@ impl Instance {
     /// added with `IN_MASK_ADD`), or a new watch is made.
     fn watch(&self, key: Key, file_system: u64, directory: bool, mask: u32) -> Result<i32, Errno> {
         let wanted = mask & (ALL_EVENTS | EXCL_UNLINK | ONESHOT);
+        let _use = self.notifier.fan.using();
         let mut queue = self.queue();
         if let Some(&wd) = queue.by_key.get(&key) {
             if mask & MASK_CREATE != 0 {

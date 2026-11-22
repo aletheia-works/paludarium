@@ -7274,9 +7274,8 @@ static void *pss_thread(void *unused) {
     printf("thread pinned: %d processor-is-getcpu=%d\n", cpu >= 0,
            cpu >= 0 && sched_getcpu() == cpu && ps_field(path, 39) == cpu);
     fflush(stdout);
-    char byte = (char)cpu;
-    if (write(pss_ready[1], &byte, 1) != 1) return NULL;
-    if (read(pss_done[0], &byte, 1) != 1) return NULL;
+    if (write(pss_ready[1], &cpu, sizeof cpu) != sizeof cpu) return NULL;
+    if (read(pss_done[0], &cpu, sizeof cpu) != sizeof cpu) return NULL;
     return NULL;
 }
 static int proc_stat_sched_case(void) {
@@ -7310,8 +7309,8 @@ static int proc_stat_sched_case(void) {
     if (pipe(pss_ready) || pipe(pss_done)) return 1;
     pthread_t thread;
     if (pthread_create(&thread, NULL, pss_thread, NULL)) return 1;
-    char cpu;
-    if (read(pss_ready[0], &cpu, 1) != 1) return 1;
+    int cpu;
+    if (read(pss_ready[0], &cpu, sizeof cpu) != sizeof cpu) return 1;
     /* The thread now sleeps on the CPU it was pinned to. */
     DIR *task = opendir("/proc/self/task");
     char path[300] = "";
@@ -7322,7 +7321,7 @@ static int proc_stat_sched_case(void) {
     pss_show("the thread from the leader", path);
     printf("the thread from the leader: processor-kept=%d\n", cpu >= 0 && ps_field(path, 39) == cpu);
     pss_show("with the thread", self);
-    if (write(pss_done[1], &cpu, 1) != 1) return 1;
+    if (write(pss_done[1], &cpu, sizeof cpu) != sizeof cpu) return 1;
     pthread_join(thread, NULL);
     int own = pss_pin_high();
     printf("pinned: %d processor-is-getcpu=%d\n", own >= 0,

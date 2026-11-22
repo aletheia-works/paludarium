@@ -194,8 +194,9 @@ mod linux {
             // maps need CAP_BPF, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
-            // limits and become an unprivileged user, the scheduling-set case, which sets
-            // real-time and deadline policies, the admin case, which makes a
+            // limits and become an unprivileged user, the scheduling-set and
+            // proc-stat-sched cases, which set real-time and deadline
+            // policies, the admin case, which makes a
             // user namespace with its capabilities (Ubuntu's AppArmor gives none
             // to one an unprivileged user makes) before it becomes one,
             // the personality-layout case, which maps page 0, the
@@ -380,6 +381,7 @@ mod linux {
                     | "veth-ipv6"
                     | "user-namespaces"
                     | "scheduling-set"
+                    | "proc-stat-sched"
                     | "personality-layout"
                     | "pagemap"
                     | "clear-refs"

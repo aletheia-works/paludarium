@@ -3506,8 +3506,10 @@ kernel.
   `load_elf_binary` finds them: the highest address and the highest end in
   the file of all its `PT_LOAD` segments), and where
   the argument and environment strings lie, the minor faults, the resident
-  pages, the start time, the CPU the task was last seen on (the one
-  `getcpu` reports), and the real-time priority and policy. A path under
+  pages, the start time, the CPU the task was on at its latest system call
+  (as Linux's `task_cpu` is the one it last ran on; `getcpu` looks at the
+  mask again at once, so after `sched_setaffinity` `stat` follows from the
+  task's next system call), and the real-time priority and policy. A path under
   `task` gives the thread's own; the process's are its leader's. What
   nothing measures is 0: major faults, and the system time, as all the CPU
   time counts as the user's.

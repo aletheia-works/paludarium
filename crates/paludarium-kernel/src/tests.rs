@@ -702,6 +702,21 @@ fn guest_exceptions_end_the_process_with_signals() {
         handle(ExitReason::Halt { rip }),
         Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
     );
+    // A refused segment load: #GP is SIGSEGV, #NP and #SS SIGBUS.
+    for (trap, number) in [
+        (13, signal::SIGSEGV),
+        (11, signal::SIGBUS),
+        (12, signal::SIGBUS),
+    ] {
+        assert_eq!(
+            handle(ExitReason::SegmentFault {
+                rip,
+                trap,
+                error: 0x14
+            }),
+            Next::Exit(ExitStatus::Signaled(number))
+        );
+    }
     assert_eq!(
         handle(ExitReason::ArithmeticFault { rip }),
         Next::Exit(ExitStatus::Signaled(signal::SIGFPE))
@@ -859,8 +874,15 @@ fn memory_syscalls_map_protect_unmap_and_brk() {
 #[test]
 fn process_setup_syscalls() {
     let mut f = fixture();
+    // A selector loaded from the LDT is nulled, as Linux's loadseg(FS, 0).
+    f.thread.cpu.segments[paludarium_cpu::segments::FS] = 0xf;
+    f.thread.cpu.segments[paludarium_cpu::segments::GS] = 0xf;
     assert_eq!(f.ret(nr::ARCH_PRCTL, &[0x1002, 0x7000_0000]), 0);
     assert_eq!(f.thread.cpu.fs_base, 0x7000_0000);
+    assert_eq!(f.thread.cpu.segments[paludarium_cpu::segments::FS], 0);
+    assert_eq!(f.thread.cpu.segments[paludarium_cpu::segments::GS], 0xf);
+    assert_eq!(f.ret(nr::ARCH_PRCTL, &[0x1001, 0x7000_1000]), 0);
+    assert_eq!(f.thread.cpu.segments[paludarium_cpu::segments::GS], 0);
     assert_eq!(f.ret(nr::ARCH_PRCTL, &[0x1003, DATA]), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 0x7000_0000);
     assert_eq!(

@@ -3484,8 +3484,11 @@ impl Kernel {
         if a[1] != 0 {
             cpu.gpr[reg::RSP] = a[1];
         }
+        // CLONE_SETTLS: `do_arch_prctl_64`'s ARCH_SET_FS, which also nulls
+        // the fs selector.
         if flags & 0x80000 != 0 {
             cpu.fs_base = a[4];
+            cpu.segments[paludarium_cpu::segments::FS] = 0;
         }
         // The parent's word has the child as the parent's PID namespace
         // numbers it, which `clone` returns; the child's, as its own does.
@@ -5059,9 +5062,9 @@ impl Kernel {
             ptrace: std::mem::take(&mut thread.state.ptrace),
             ..ThreadState::default()
         };
-        // `start_thread` loads the selectors a new program starts with.
-        thread.state.ptrace.selectors = None;
-        // And `flush_thread` the hardware breakpoints.
+        // `start_thread` loaded the selectors a new program starts with, in
+        // the new CPU state above, and `flush_thread` clears the hardware
+        // breakpoints.
         thread.state.ptrace.debug = crate::ptrace::Debug::default();
         thread.state.name_after(&path);
         // Linux decides from the IDs before exec, then installs the new ones

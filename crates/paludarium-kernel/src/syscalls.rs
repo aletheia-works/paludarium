@@ -151,6 +151,8 @@ pub(crate) enum Outcome {
     Return(u64),
     Exit(i32),
     Restored,
+    /// `rt_sigreturn` restored a context whose return faults on its SS.
+    RestoredFault(paludarium_cpu::segments::SegmentFault),
     BadFrame,
 }
 
@@ -1777,10 +1779,10 @@ fn sys_clock_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     sleep(c, clock, a[1] & 1 != 0, a[2], a[3])
 }
 fn sys_rt_sigreturn(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
-    if signals::restore(c.process, c.cpu, c.mem).is_ok() {
-        Outcome::Restored
-    } else {
-        Outcome::BadFrame
+    match signals::restore(c.process, c.cpu, c.mem) {
+        Ok(None) => Outcome::Restored,
+        Ok(Some(fault)) => Outcome::RestoredFault(fault),
+        Err(()) => Outcome::BadFrame,
     }
 }
 impl Context<'_> {
@@ -3528,9 +3530,30 @@ fn sys_modify_ldt(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         0x11 => write_ldt(c.mem, ptr, bytecount, false),
         _ => Err(Errno::ENOSYS),
     };
+    if matches!(a[0] as u32, 1 | 0x11) && result.is_ok() {
+        refresh_ldt_segments(c.cpu, c.mem);
+    }
     ok(u64::from(
         result.unwrap_or_else(Errno::to_syscall_return) as u32
     ))
+}
+
+/// `refresh_ldt_segments`: once the table has changed, DS and ES load
+/// again if they name an LDT entry, and become null if it no longer loads
+/// (`loadsegment`'s fixup). Only the calling thread's are, where Linux's
+/// `flush_ldt` reloads them on every CPU that runs the address space.
+fn refresh_ldt_segments(cpu: &mut CpuState, mem: &AddressSpace) {
+    use paludarium_cpu::segments;
+    let ldt = mem
+        .ldt()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for sreg in [segments::DS, segments::ES] {
+        let selector = cpu.segments[sreg];
+        if selector & 4 != 0 && segments::check_data(selector, &ldt).is_err() {
+            cpu.segments[sreg] = 0;
+        }
+    }
 }
 
 /// Writes `len` zero bytes at `ptr` and gives `len` (`EFAULT` if it
@@ -4344,10 +4367,13 @@ fn sys_arch_prctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             if addr >= USER_ADDRESS_LIMIT {
                 return err(Errno::EPERM);
             }
+            // The selector becomes null, as Linux's `loadseg(FS, 0)`.
             if code == ARCH_SET_FS {
                 c.cpu.fs_base = addr;
+                c.cpu.segments[paludarium_cpu::segments::FS] = 0;
             } else {
                 c.cpu.gs_base = addr;
+                c.cpu.segments[paludarium_cpu::segments::GS] = 0;
             }
             ok(0)
         }

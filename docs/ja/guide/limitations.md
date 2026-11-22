@@ -393,10 +393,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **保護キー**：仮想 CPU には保護キーがありません（`CPUID` は PKU を報告しません）。そのため
   `pkey_alloc` は、そういう CPU での Linux と同じく `ENOSPC` を返し、プログラムは保護キーなしで
   続けます。`RDPKRU` と `WRPKRU` は、そういう CPU と同じく `SIGILL` でプログラムを止めます。
-- **セグメントレジスタ**：仮想 CPU はセグメントレジスタへの、またはそこからの移動ができません
-  （`%ds` や `%fs` などへの `mov` は `SIGILL` でプログラムを止めます）。そのため `modify_ldt`
-  が書いたエントリを読み込んで使うことはできません。Linux は読み込みます。テーブルそのものは
-  Linux と同じに読み返せます。
+- **セグメントレジスタの一部**：`lfs`、`lgs`、`lss`、`lar`、`lsl`、`verr`、`verw` と、far の
+  ジャンプ・コール・リターンは `SIGILL` でプログラムを止めます。CPU は `__USER_CS` でしか
+  動かないので、ほかの `cs` の `rt_sigreturn` のフレームは不正なフレームです。
+  `set_thread_area` は実装していないので、GDT のスレッドローカルのエントリは空のままで、CPU
+  番号のセグメントのリミットは 0 です。`%ss` への `mov` や `pop` は、CPU と違い、次の命令の
+  シングルステップのトラップを遅らせません。`modify_ldt` のあとに `%ds` と `%es` を読み込み
+  直すのは呼んだスレッドだけで、Linux はアドレス空間のすべてのスレッドで読み込み直します。
+  null のセレクタは `%fs` と `%gs` のベースを消しますが、Zen 2 より前の AMD の CPU は
+  ベースを残します。
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`
   だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、

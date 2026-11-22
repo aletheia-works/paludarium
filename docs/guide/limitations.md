@@ -559,10 +559,7 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`), a file
-    of the in-memory file system's tmpfs mounts too, which is not yet
-    taken for shmem's here (nor by `userfaultfd`), where Linux collapses
-    it as shmem. Linux's
+  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`). Linux's
     rules for them changed after v6.12, which collapses only a file nobody
     has open for writing (`READ_ONLY_THP_FOR_FS`), where later kernels take
     any file on a file system with large folios. The result also depends
@@ -837,14 +834,14 @@ verified.
   shared with the host's. `propagate_from:` is found from the namespace's
   root, not the reader's after `chroot`. `MS_RDONLY` (`EROFS`), `noexec`,
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
-  `nr_blocks` and `nr_inodes`, but not for what a mapping writes: a file
-  on such a mount is not yet taken for shmem's (nor by `userfaultfd`), so a
-  fault brings nothing into it, a write fault past the size is no
-  `SIGBUS`, and the pages go back to the file whatever its size, counting
-  in its blocks only then. A memfd's pages count once a fault brings them
-  in, as `shmem_fault` charges them, but those `MAP_POPULATE`,
-  `MAP_LOCKED` or a lock would bring into a shared mapping of one only
-  once touched. Its extended attributes take none of the inodes' room
+  `nr_blocks` and `nr_inodes`, and a page a fault brings into a file of a
+  tmpfs mount or a memfd counts in its blocks, as `shmem_fault` charges
+  it, one past the mount's size being a `SIGBUS`. Not yet charged that way
+  are the pages `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills, which go back to
+  the file whatever its size (no `ENOMEM` past it); a mount whose `huge=`
+  is not `never` charges a page at a time, where Linux takes a huge page
+  whole; and the pages `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring
+  into a shared mapping count only once touched. Its extended attributes take none of the inodes' room
   (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set` counts
   them, does not happen); the root from start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime
@@ -993,11 +990,12 @@ verified.
   `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in
   the marker's place, where Linux, whose zap keeps the marker, restarts
   the call until a signal comes.
-  Of shmem's files only a memfd is registered, but for write protection
-  alone with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a tmpfs file
-  is refused (`EINVAL`), where Linux takes it, as the in-memory file
-  system says it is a tmpfs but stands for the files a guest has on disk,
-  and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
+  Of shmem's files a memfd and a file of a tmpfs mount (one a guest
+  mounted, or `/dev/shm`) are registered, but for write protection alone
+  with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the
+  in-memory file system from start-up (`/tmp` among them) is refused
+  (`EINVAL`) though it says it is on a tmpfs, as it stands for the files a
+  guest has on disk, and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
   private mapping of a shmem file is a page of zeros of its own, which
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
   zero page. A system call's own

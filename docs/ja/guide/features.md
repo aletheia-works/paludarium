@@ -916,13 +916,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   示します。ただし、区間のどのページにも触れていない（ページテーブルがない）か、
   ガード、毒、uffd-wp のマーカーがあれば `EINVAL`（ほかの区間を済ませてから）、
   `userfaultfd` が登録した範囲にあって空のページがあれば `EBUSY`（すぐに）です。
-  shmem のページキャッシュは、ファイルのない共有メモリ、memfd、System V の共有
-  メモリのもので、共有でもプライベートでもマップできます。ページキャッシュが
-  どのページも持たない区間はまとめるのを終わらせ（`EINVAL`）、`userfaultfd` が
-  欠けたページについて登録した VMA で穴のある区間も同じです（`EBUSY`）。そうで
-  なければ区間のうちファイルの中にあるページはすべてページキャッシュに入り、穴は
-  ゼロになります。memfd は穴の分を割り当てられます。そのうえで区間はまとめられ
-  ます。ただし、VMA が書き込みの保護について登録されているかページに
+  shmem のページキャッシュは、ファイルのない共有メモリ、memfd、tmpfs マウント
+  （ゲストがマウントしたものか `/dev/shm`）のファイル、System V の共有メモリの
+  もので、共有でもプライベートでもマップできます。ページキャッシュがどのページも
+  持たない区間はまとめるのを終わらせ（`EINVAL`）、`userfaultfd` が欠けたページに
+  ついて登録した VMA で穴のある区間も同じです（`EBUSY`）。そうでなければ区間の
+  うちファイルの中にあるページはすべてページキャッシュに入り、穴はゼロになります。
+  memfd と tmpfs マウントのファイルは穴の分を割り当てられ、マウントの大きさを
+  超えれば `EINVAL`（すぐに）です。そのうえで区間はまとめられます。ただし、VMA が
+  書き込みの保護について登録されているかページに
   マーカーがあれば `EINVAL`（ほかの区間を済ませてから）、プライベートなマッピングが
   ページの自分のコピーを持っていれば `EINVAL`（すぐに）です。`MADV_HWPOISON` と
   `MADV_SOFT_OFFLINE` は、範囲の引数を確かめ、
@@ -992,11 +994,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ものは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
   登録する hugetlbfs のメモリはありません）、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
-  メモリ、共有の anonymous メモリ、shmem の memfd（Linux が VMA を shmem のものと
-  数えない System V の共有メモリは除きます）の共有または
+  メモリ、共有の anonymous メモリ、shmem の memfd と tmpfs マウントのファイル（Linux
+  が VMA を shmem のものと数えない System V の共有メモリは除きます）の共有または
   プライベートなマッピングを、ないページについて登録し
-  （`UFFDIO_REGISTER_MODE_MISSING`）、shmem（共有の anonymous メモリと memfd の
-  マッピング）をマイナーフォールトについて登録し（`UFFDIO_REGISTER_MODE_MINOR`。示す
+  （`UFFDIO_REGISTER_MODE_MISSING`）、shmem（共有の anonymous メモリとそれらの
+  ファイルのマッピング）をマイナーフォールトについて登録し（`UFFDIO_REGISTER_MODE_MINOR`。示す
   ioctl に `UFFDIO_CONTINUE` が、`smaps` に `ui` が加わります）、プライベートな anonymous メモリと shmem を書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
   が加わります）。`UFFD_FEATURE_WP_ASYNC` では、書き込み保護だけなら、
@@ -1689,7 +1691,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sysinfo` が返すメモリーの半分、0 は上限なし）と、ファイルが使っている分を返します。
   ファイルは tmpfs と同じくその大きさと inode の数に収めます。書き込みは大きさを
   超える最初のページで止まり（短い書き込み。何も入らなければ `ENOSPC`）、`fallocate` は
-  範囲をすべて割り当てるか何も割り当てません（`ENOSPC`）。長いシンボリックリンク
+  範囲をすべて割り当てるか何も割り当てません（`ENOSPC`）。そのファイルと `/dev/shm` の
+  ファイルは shmem のもので、マッピングのフォールトはページを持ち込み（大きさを超えれば
+  `SIGBUS`）、`userfaultfd` はそのマッピングを登録し、`MADV_COLLAPSE` はまとめます。
+  memfd と同じです。長いシンボリックリンク
   （127 バイトを超えるもの）は 1 ページを使い、新しい inode とファイルの 2 つめ以降の
   名前（`link`）はそれぞれ inode を 1 つ使います（残っていなければ `ENOSPC`）。消した
   けれどまだ開いているファイルは、最後に閉じるまでその分を持ちます。マウントし直すと

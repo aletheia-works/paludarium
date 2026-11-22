@@ -3797,9 +3797,8 @@ impl AddressSpaceData {
             .or_else(|| self.mapping_at(addr).map(|m| m.prot))
     }
 
-    /// Checks that `[addr, addr+len)` is accessible; returns the first
-    /// faulting address otherwise.
-    /// Checks that `[addr, addr+len)` may be accessed as `access`. With
+    /// Checks that `[addr, addr+len)` may be accessed as `access`, else the
+    /// fault at its first address that may not. With
     /// `creating`, the caller gives a page without an entry one next, so a
     /// page its memory has to take in is asked for then
     /// ([`PageSource::admit`]); a first look under the read lock, which

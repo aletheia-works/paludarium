@@ -1570,6 +1570,7 @@ pub(crate) fn device_shm(clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync
     };
     let now = clock().unwrap_or(0);
     let fs = MemFs::with_clock(clock);
+    fs.mark_shmem();
     // A new tree's root, which takes any mode and times.
     let _ = fs.set_mode(b"/", options.mode);
     let _ = fs.set_times(b"/", true, Some(i128::from(now)), Some(i128::from(now)));
@@ -1595,6 +1596,7 @@ fn built_tmpfs(
     options.sb_flags = (sb_flags | options.sb_set) & !options.sb_clear;
     let host = Arc::clone(c.shared_host);
     let fs = MemFs::with_clock(Arc::new(move || host.clock(ClockId::Realtime)));
+    fs.mark_shmem();
     fs.set_mode(b"/", options.mode)?;
     fs.set_owner(b"/", true, Some(options.uid), Some(options.gid))?;
     let now = c.host.clock(ClockId::Realtime)?;

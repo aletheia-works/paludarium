@@ -1018,13 +1018,15 @@ kernel.
   page table) or it has a guard, a poison or a uffd-wp marker (`EINVAL`,
   once the other extents are done), or it lies in a range a `userfaultfd`
   registered and has an empty page (`EBUSY`, at once). Shmem's page cache
-  is that of shared memory of no file, a memfd and System V shared memory,
-  mapped shared or private. An extent of it the page cache
+  is that of shared memory of no file, a memfd, a file of a tmpfs mount
+  (one a guest mounted, or `/dev/shm`) and System V shared memory, mapped
+  shared or private. An extent of it the page cache
   holds no page of ends the collapse (`EINVAL`), as does one with holes in
   a VMA a `userfaultfd` registered for missing pages (`EBUSY`). Otherwise
   every page of the extent within the file comes into the page cache,
-  zeros in a hole, which a memfd is charged for, and the extent is
-  collapsed, unless
+  zeros in a hole, which a memfd or a tmpfs mount's file is charged for
+  (`EINVAL`, at once, past its mount's size), and the extent is collapsed,
+  unless
   the VMA is registered for write protection or a page has a marker
   (`EINVAL`, once the other extents are done) or a private mapping has a
   copy of its own of a page (`EINVAL`, at once). `MADV_HWPOISON` and
@@ -1103,10 +1105,10 @@ kernel.
   `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory, shared anonymous memory and the shared or private mappings of a
-  memfd, which is shmem's (not System V shared memory, whose VMAs Linux
-  does not count as shmem's), for missing pages
-  (`UFFDIO_REGISTER_MODE_MISSING`), shmem (shared anonymous memory and a
-  memfd's mappings) for minor faults (`UFFDIO_REGISTER_MODE_MINOR`, which
+  memfd or a file of a tmpfs mount, which are shmem's (not System V shared
+  memory, whose VMAs Linux does not count as shmem's), for missing pages
+  (`UFFDIO_REGISTER_MODE_MISSING`), shmem (shared anonymous memory and
+  those files' mappings) for minor faults (`UFFDIO_REGISTER_MODE_MINOR`, which
   adds `UFFDIO_CONTINUE` to the ioctls it reports and `ui` to `smaps`), and
   private anonymous memory and shmem for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
@@ -1925,7 +1927,10 @@ kernel.
   long symbolic link (past 127 bytes) takes a page, and each new inode and
   each further name of a file (`link`) takes one of the inodes (`ENOSPC`
   for none left), which an unlinked file still open keeps until its last
-  close; a remount changes the limits. The files are held as `shmem`
+  close; a remount changes the limits. Its files, and those of `/dev/shm`,
+  are shmem's: a fault of a mapping of one brings its page in (a `SIGBUS`
+  past the size), `userfaultfd` registers their mappings and
+  `MADV_COLLAPSE` takes them, as for a memfd. The files are held as `shmem`
   counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,

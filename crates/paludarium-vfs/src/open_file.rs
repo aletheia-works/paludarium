@@ -232,6 +232,10 @@ impl FileHandle for MemFile {
     fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
         lock(&self.node).with_attributes(f)
     }
+    /// A file of a tmpfs mount ([`MemFs::mark_shmem`]).
+    fn shmem_pages(&self) -> bool {
+        lock(&self.tree).shmem
+    }
     fn cached_pages(&self, first: u64, last: u64) -> u64 {
         match &lock(&self.node).kind {
             Kind::File(contents) => contents.resident(first, last),

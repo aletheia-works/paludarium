@@ -98,9 +98,10 @@ pub trait FileHandle: Send + Sync {
     }
     /// Whether the file is shmem's (Linux's `vma_is_shmem` for a mapping
     /// of it), with its pages kept here, as [`Self::cached_pages`] counts
-    /// them: a memfd. A file of the in-memory file system says it is on a
-    /// tmpfs but is not taken for one here, as it stands for the files a
-    /// guest has on disk; nor is a host's file, on its tmpfs too.
+    /// them: a memfd, or a file of a tmpfs a guest mounted or of
+    /// `/dev/shm`. A file of the in-memory file system from start-up says
+    /// it is on a tmpfs but is not taken for one here, as it stands for the
+    /// files a guest has on disk; nor is a host's file, on its tmpfs too.
     fn shmem_pages(&self) -> bool {
         false
     }

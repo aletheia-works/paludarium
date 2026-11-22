@@ -9826,6 +9826,18 @@ static int madvise_collapse_shmem_case(void) {
     long copied = advice_errno(madvise(private + huge, huge, 25));
     printf("private=%ld copied=%ld\n", mapped, copied);
     close(fd);
+    /* A file of a tmpfs mount, /dev/shm, is shmem's too. */
+    char path[] = "/dev/shm/paludarium-collapse-XXXXXX";
+    int tmp = mkstemp(path);
+    if (tmp < 0 || unlink(path) || ftruncate(tmp, 2 * huge) || pwrite(tmp, "t", 1, 5 * page) != 1) return 92;
+    char *tmpfs = mmap(shared, 2 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, tmp, 0);
+    if (tmpfs == MAP_FAILED) return 93;
+    long collapsed = advice_errno(madvise(tmpfs, huge, 25));
+    long untouched = advice_errno(madvise(tmpfs + huge, huge, 25));
+    if (fstat(tmp, &st)) return 94;
+    printf("tmpfs=%ld rest=%ld blocks=%lld byte=%c %d\n", collapsed, untouched, (long long)st.st_blocks,
+           tmpfs[5 * page], tmpfs[6 * page]);
+    close(tmp);
     /* MADV_NOHUGEPAGE refuses shmem's VMAs too. */
     char *nohuge = mmap(base, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
                         -1, 0);
@@ -14111,10 +14123,40 @@ static int tmpfs_limits_case(void) {
    in its blocks, for a shared mapping's read and write faults and for a
    private mapping's read and copy-on-write faults, which bring the file's
    page in too; a pread of a hole brings nothing in, and a page the file
-   holds costs nothing more. */
+   holds costs nothing more. In a tmpfs mount of two pages, in a user and
+   mount namespace of its own, a fault the mount has no room for is a
+   SIGBUS, and MADV_POPULATE_WRITE of such a page is EFAULT. */
+static char sf_base[] = "/tmp/paludarium-shmem-fault-XXXXXX";
 static long sf_blocks(int fd) {
     struct stat st;
     return fstat(fd, &st) ? -errno : (long)st.st_blocks;
+}
+static int sf_inner(const char *m) {
+    printf("mount=%d\n", tl_err(mount("none", m, "tmpfs", 0, "size=8k,huge=never")));
+    char path[320];
+    snprintf(path, sizeof path, "%s/f", m);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return 80;
+    char *shared = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *private = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (shared == MAP_FAILED || private == MAP_FAILED) return 81;
+    touch("write", shared, 1);
+    touch("private-read", private + 4096, 0);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("full-write", shared + 2 * 4096, 1);
+    touch("full-read", shared + 3 * 4096, 0);
+    touch("full-private-read", private + 2 * 4096, 0);
+    touch("full-copy", private + 3 * 4096, 1);
+    printf("full-populate=%ld\n", advice_errno(madvise(shared + 2 * 4096, 4096, 23)));
+    touch("held", shared + 4096, 0);
+    touch("held-copy", private, 1);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    munmap(shared, 4 * 4096);
+    munmap(private, 4 * 4096);
+    close(fd);
+    unlink(path);
+    printf("umount=%d\n", tl_err(umount(m)));
+    return 0;
 }
 static int shmem_fault_charge_case(void) {
     struct sigaction action = {0};
@@ -14144,6 +14186,31 @@ static int shmem_fault_charge_case(void) {
     munmap(private, 4 * 4096);
     printf("unmapped blocks=%ld\n", sf_blocks(fd));
     close(fd);
+    if (!mkdtemp(sf_base)) return 85;
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", sf_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(sf_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(sf_base) == 0);
     return 0;
 }
 

@@ -1127,6 +1127,26 @@ static int case_shmem(void) {
     printf("register System V: %s\n", err(reg(fd, segment, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
     shmdt(segment);
     shmctl(id, IPC_RMID, NULL);
+
+    /* A file of a tmpfs mount, /dev/shm, is shmem's: its hole waits too. */
+    char tmpfs_path[] = "/dev/shm/uffd-shmem-XXXXXX";
+    int tmpfs = mkstemp(tmpfs_path);
+    unlink(tmpfs_path);
+    ftruncate(tmpfs, 2 * PAGE);
+    char *mapped = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, tmpfs, 0);
+    printf("register tmpfs: %s\n", err(reg(fd, mapped, 2 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    t = (struct toucher){mapped + 3, 0, 0, 0};
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("tmpfs hole", fd, mapped, 0);
+    printf("copy: %s\n", err(copy(fd, mapped, src, PAGE, 0, NULL)));
+    pthread_join(thread, NULL);
+    printf("seen: %c\n", t.seen);
+    byte = 0;
+    pread(tmpfs, &byte, 1, 3);
+    printf("the file has: %c\n", byte);
+    munmap(mapped, 2 * PAGE);
+    close(tmpfs);
     close(fd);
     return 0;
 }

@@ -443,6 +443,9 @@ struct Tree {
     next: u64,
     owner: u64,
     clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>,
+    /// Its files are shmem's (a tmpfs a guest mounted, `/dev/shm`), not
+    /// the files a guest has on disk, which the start-up tree stands for.
+    shmem: bool,
 }
 impl Tree {
     /// The 4 KiB blocks the files and symbolic links hold, as `statfs`
@@ -655,11 +658,17 @@ impl MemFs {
                 next: 2,
                 owner: 1,
                 clock,
+                shmem: false,
             })),
         }
     }
 }
 impl MemFs {
+    /// Makes its files shmem's, as those of a tmpfs mount are
+    /// ([`paludarium_host::FileHandle::shmem_pages`]).
+    pub fn mark_shmem(&self) {
+        lock(&self.tree).shmem = true;
+    }
     /// What its files take, against the limits a mount sets.
     pub(crate) fn usage(&self) -> Arc<Usage> {
         Arc::clone(&lock(&self.tree).usage)

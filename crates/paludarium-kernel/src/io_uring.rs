@@ -23,7 +23,7 @@
 //! link's next request and the rest of a failed link run after the
 //! submission's completions, when the thread returns to its program, waits
 //! or takes a signal, or with `IORING_SETUP_DEFER_TASKRUN` when it waits on
-//! the ring, as Linux 7.0's `tw.c` runs them. So no request waits for its
+//! the ring, as Linux master's `tw.c` runs them. So no request waits for its
 //! file: a wait for more completions than there will be ends only by a
 //! signal or a timeout. The setup flags that need a kernel thread, polled
 //! I/O or another layout of the rings give `EINVAL`.
@@ -2008,8 +2008,9 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// Linux's `io_cqring_wait`: it runs the ring's own task work and the
 /// thread's, then is done once the program has `min` completions to
 /// consume, else it waits, with the signal mask it was given, for a signal
-/// (`EINTR`) or the timeout (`ETIME`), running task work that comes. Completions in the queue by
-/// then make it succeed whatever ended the wait.
+/// (`EINTR`) or the timeout (`ETIME`), running task work that comes.
+/// Completions in the queue by then make it succeed whatever ended the
+/// wait.
 fn wait(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,

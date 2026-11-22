@@ -181,7 +181,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-neigh, veth-ipv6 and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-neigh, veth-ipv6, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -194,8 +194,9 @@ mod linux {
             // maps need CAP_BPF, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
-            // limits and become an unprivileged user, the scheduling-set case, which sets
-            // real-time and deadline policies, the admin case, which makes a
+            // limits and become an unprivileged user, the scheduling-set and
+            // proc-stat-sched cases, which set real-time and deadline
+            // policies, the admin case, which makes a
             // user namespace with its capabilities (Ubuntu's AppArmor gives none
             // to one an unprivileged user makes) before it becomes one,
             // the personality-layout case, which maps page 0, the
@@ -279,6 +280,8 @@ mod linux {
                     | "fanotify-open-exec"
                     | "fanotify-aio-perm"
                     | "fanotify-exec-perm"
+                    | "fanotify-merge-window"
+                    | "fanotify-superblock-marks"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -324,6 +327,8 @@ mod linux {
                     | "bpf-prog-attach"
                     | "bpf-prog-corpus"
                     | "bpf-prog-classic"
+                    | "bpf-prog-atomic"
+                    | "bpf-prog-acqrel"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -379,8 +384,10 @@ mod linux {
                     | "veth-iif"
                     | "veth-neigh"
                     | "veth-ipv6"
+                    | "veth-ipv6-traffic"
                     | "user-namespaces"
                     | "scheduling-set"
+                    | "proc-stat-sched"
                     | "personality-layout"
                     | "pagemap"
                     | "clear-refs"
@@ -582,12 +589,14 @@ mod linux {
         veth_iif => ("veth-iif","veth-iif"),
         veth_neigh => ("veth-neigh","veth-neigh"),
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),
+        veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
         processes_landlock => ("landlock","process"),
         processes_madvise_advice => ("madvise-advice","process"),
         processes_madvise_collapse => ("madvise-collapse","process"),
+        processes_madvise_collapse_shmem => ("madvise-collapse-shmem","process"),
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
@@ -645,6 +654,7 @@ mod linux {
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
         aio_mremap => ("aio-mremap","aio"),
+        aio_reap => ("aio-reap","aio"),
         perf_calls => ("perf-calls","perf"),
         perf_counts => ("perf-counts","perf"),
         perf_exec => ("perf-exec","perf"),
@@ -676,6 +686,8 @@ mod linux {
         bpf_prog_attach => ("bpf-prog-attach","bpf-prog"),
         bpf_prog_corpus => ("bpf-prog-corpus","bpf-prog"),
         bpf_prog_classic => ("bpf-prog-classic","bpf-prog"),
+        bpf_prog_atomic => ("bpf-prog-atomic","bpf-prog"),
+        bpf_prog_acqrel => ("bpf-prog-acqrel","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -711,6 +723,8 @@ mod linux {
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),
         fanotify_aio_perm => ("fanotify-aio-perm","fanotify"),
         fanotify_exec_perm => ("fanotify-exec-perm","fanotify"),
+        fanotify_merge_window => ("fanotify-merge-window","fanotify"),
+        fanotify_superblock_marks => ("fanotify-superblock-marks","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
@@ -831,6 +845,7 @@ mod linux {
         processes_proc_other_files => ("proc-other-files","process"),
         processes_page_faults => ("page-faults","process"),
         processes_proc_stat_counts => ("proc-stat-counts","process"),
+        processes_proc_stat_sched => ("proc-stat-sched","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),
         processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),
@@ -957,6 +972,7 @@ mod linux {
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_generated_noexec => ("generated-noexec","process"),
+        processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),
         processes_tree_namespace => ("tree-namespace","process"),
         processes_beneath => ("beneath","process"),
@@ -976,6 +992,7 @@ mod linux {
         processes_proc_sizes => ("proc-sizes","process"),
         processes_proc_stat_counters => ("proc-stat-counters","process"),
         processes_loadavg_running => ("loadavg-running","process"),
+        processes_leader_exit_status => ("leader-exit-status","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
@@ -988,6 +1005,7 @@ mod linux {
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         processes_io_uring_transfers => ("io-uring-transfers","process"),
+        processes_io_uring_files => ("io-uring-files","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

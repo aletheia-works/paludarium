@@ -113,7 +113,7 @@ out:
 
 - `nop` and `endbr64`;
 - moves between registers and memory, and `movzx` from memory;
-- `lea`, `push` of a register or an immediate, and `pop`;
+- `lea`, `push` of a register, an immediate or 8 bytes of memory, and `pop`;
 - direct branches, `call` and `ret`, and `jmp` and `call` through a 64-bit
   register or 8 bytes of memory;
 - `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test` between registers,

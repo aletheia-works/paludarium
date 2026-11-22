@@ -20,7 +20,8 @@
    ends make IPv6's of their own as they come up. The two processes take
    turns through pipes, so their lines come in one order; the peer's
    carrier going, which Linux's link watch may tell of a second later, is
-   waited for on RTNLGRP_LINK. */
+   waited for on RTNLGRP_LINK, and the ARP answer NTF_USE asks for on
+   RTNLGRP_NEIGH. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -476,6 +477,48 @@ static void tables(int fd, const char *label) {
 #define NUD_NOARP 0x40
 #define NUD_PERMANENT 0x80
 
+/* Waits, up to 5 s however much else comes, on `resolved` (a member of
+   RTNLGRP_NEIGH) for the neighbour `ip` of the device of `index` to be
+   reachable: Linux's ARP answer comes back through the peer's namespace
+   in its own time. */
+static void reachable(int resolved, int index, const char *ip) {
+    static unsigned char buf[65536];
+    unsigned char wanted[4];
+    inet_pton(AF_INET, ip, wanted);
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = 5000 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (left <= 0) break;
+        struct pollfd ready = {.fd = resolved, .events = POLLIN};
+        if (poll(&ready, 1, (int)left) <= 0) continue;
+        long n = recv(resolved, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0) continue;
+        for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
+            const struct nl_header *h = (const void *)(buf + at);
+            if (h->len < sizeof *h || at + h->len > n) break;
+            const unsigned char *body = (const unsigned char *)(h + 1);
+            int body_len = (int)(h->len - sizeof *h);
+            struct ndmsg_ m;
+            if (h->type == RTM_NEWNEIGH && body_len >= (int)sizeof m) {
+                memcpy(&m, body, sizeof m);
+                for (int a = (int)sizeof m; m.family == AF_INET && m.index == index && m.state == NUD_REACHABLE &&
+                                            a + 4 <= body_len;) {
+                    unsigned short alen, kind;
+                    memcpy(&alen, body + a, 2);
+                    memcpy(&kind, body + a + 2, 2);
+                    if (alen < 4 || a + alen > body_len) break;
+                    if (kind == NDA_DST && alen == 8 && !memcmp(body + a + 4, wanted, 4)) return;
+                    a += (alen + 3) & ~3;
+                }
+            }
+            at += (h->len + 3) & ~3u;
+        }
+    }
+    printf("%s: %s reachable: never came\n", side, ip);
+}
+
 /* B: makes its namespace, then does what A writes to `in`, one letter at
    a time, writing back to `out` when done. */
 static void child(int in, int out) {
@@ -567,6 +610,7 @@ int main(int argc, char **argv) {
     } while (0)
     printf("A: unshare=%ld\n", result(unshare(CLONE_NEWNET)));
     int ctl = route_socket(0), links = route_socket(1), watch = route_socket(4), order = route_socket(1 | 4 | 0x10);
+    int resolved = route_socket(4);
     struct body m = {0};
     const unsigned char mac_a[6] = {2, 0, 0, 0, 0, 0x0a}, mac_b[6] = {2, 0, 0, 0, 0, 0x0b};
     info(&m, A_INDEX, 0, 0);
@@ -692,8 +736,12 @@ int main(int argc, char **argv) {
     dump(ctl, A_INDEX, "va's, up again");
     heard(watch, "heard");
     B_DOES("s");
-    /* NTF_USE asks ARP, as a packet does. */
+    /* NTF_USE asks ARP, as a packet does; B's answer is waited for. */
+    static char unread[65536];
+    while (recv(resolved, unread, sizeof unread, MSG_DONTWAIT) > 0) {
+    }
     use(ctl, A_INDEX, "10.77.0.2", "use B's");
+    reachable(resolved, A_INDEX, "10.77.0.2");
     use(ctl, A_INDEX, "10.77.0.8", "use nobody's");
     get(ctl, A_INDEX, "10.77.0.2", "used B's");
     get(ctl, A_INDEX, "10.77.0.8", "used nobody's");

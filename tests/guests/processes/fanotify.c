@@ -1,6 +1,7 @@
 /* fanotify, compared with Linux: the calls' errors and their order, the
    marks fdinfo shows, the events of files with the descriptors they give,
-   their merging, the file handles and names of the FID modes, the pidfds
+   their merging (within the newest 128 of a bucket), the marks that go
+   with a superblock, the file handles and names of the FID modes, the pidfds
    of FAN_REPORT_PIDFD, the mount events of FAN_REPORT_MNT (moves too), and
    what a group without CAP_SYS_ADMIN may do.
 
@@ -1489,6 +1490,156 @@ static int case_exec_perm(const char *self) {
     return 0;
 }
 
+/* The hash Linux's full_name_hash gives on x86-64, whole little-endian
+   words first, then the bytes left over: what fanotify_alloc_name_event
+   mixes a name into an event's merge key with, salted with its length. */
+static uint32_t name_hash(const char *name) {
+    const uint64_t golden = 0x61C8864680B583EBull;
+    size_t len = strlen(name);
+    uint64_t x = 0, y = len;
+    for (; len >= 8; name += 8, len -= 8) {
+        uint64_t a;
+        memcpy(&a, name, 8);
+        x ^= a;
+        y ^= x;
+        x = x << 12 | x >> 52;
+        x += y;
+        y = y << 45 | y >> 19;
+        y *= 9;
+    }
+    if (len) {
+        uint64_t a = 0;
+        memcpy(&a, name, len);
+        x ^= a;
+    }
+    y ^= x * golden;
+    y *= golden;
+    return (uint32_t)(y >> 32);
+}
+
+/* The events of a directory and name a read gives: how many there are,
+   and the masks of those of `name`, in order. */
+static void show_name_events(const char *label, int fan, const char *name) {
+    static char buf[65536];
+    int count = 0;
+    printf("%s:", label);
+    struct pollfd p = {fan, POLLIN, 0};
+    while (poll(&p, 1, 0) == 1) {
+        long n = read(fan, buf, sizeof buf);
+        if (n <= 0) break;
+        for (char *q = buf; q < buf + n;) {
+            struct metadata m;
+            memcpy(&m, q, sizeof m);
+            count++;
+            struct info_header hdr;
+            memcpy(&hdr, q + m.metadata_len, sizeof hdr);
+            if (hdr.type == 2) {
+                const unsigned char *record = (unsigned char *)q + m.metadata_len + 12;
+                unsigned bytes;
+                memcpy(&bytes, record, 4);
+                if (!strcmp((const char *)record + 8 + bytes, name)) printf(" %#llx", (unsigned long long)m.mask);
+            }
+            if (m.event_len < sizeof m) break;
+            q += m.event_len;
+        }
+    }
+    printf(" (%d events)\n", count);
+}
+
+/* fanotify_merge looks for an event to merge into among the newest 128 of
+   its bucket of the group's merge hash (FANOTIFY_MAX_MERGE_EVENTS): the
+   events of names in one directory by one task share a bucket when the
+   low 7 bits of their names' hashes do. With 127 such events between a
+   name's creation and its removal, the removal merges; with 128 it is an
+   event of its own. Events of other buckets in between do not count. */
+static int case_merge_window(void) {
+    make_base("merge-window");
+    const char *first = "n00000";
+    static char alike[128][8], other[40][8];
+    int nalike = 0, nother = 0;
+    uint32_t bucket = name_hash(first) & 127;
+    for (int i = 1; i < 100000 && (nalike < 128 || nother < 40); i++) {
+        char name[8];
+        snprintf(name, sizeof name, "n%05d", i);
+        if ((name_hash(name) & 127) == bucket) {
+            if (nalike < 128) strcpy(alike[nalike++], name);
+        } else if (nother < 40) {
+            strcpy(other[nother++], name);
+        }
+    }
+    printf("names=%d %d\n", nalike, nother);
+    int fan = fan_init(FAN_REPORT_DFID_NAME | FAN_NONBLOCK, 0);
+    if (fan < 0) return 80;
+    const char *dirs[] = {"d", "e"};
+    for (int k = 0; k < 2; k++) {
+        int between = 127 + k;
+        char dir[128], path[160];
+        snprintf(dir, sizeof dir, "%s", at(dirs[k]));
+        mkdir(dir, 0755);
+        printf("mark %s=%ld\n", dirs[k], fan_mark(fan, FAN_MARK_ADD, FAN_CREATE | FAN_DELETE, AT_FDCWD, dir));
+        snprintf(path, sizeof path, "%s/%s", dir, first);
+        touch(path);
+        for (int i = 0; i < between; i++) {
+            snprintf(path, sizeof path, "%s/%s", dir, alike[i]);
+            touch(path);
+            if (i < nother) {
+                snprintf(path, sizeof path, "%s/%s", dir, other[i]);
+                touch(path);
+            }
+        }
+        snprintf(path, sizeof path, "%s/%s", dir, first);
+        printf("unlink=%ld\n", e(unlink(path)));
+        char label[32];
+        snprintf(label, sizeof label, "%d between", between);
+        show_name_events(label, fan, first);
+    }
+    close(fan);
+    remove_base();
+    return 0;
+}
+
+/* fsnotify_sb_delete: as a tmpfs's superblock goes with its last mount,
+   the marks on its files and on itself go, and a tmpfs that takes the
+   device next hears nothing of them. A mark on another file system stays. */
+static int marks_of(int fan) {
+    char path[64], line[512];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fan);
+    FILE *info = fopen(path, "r");
+    int count = 0;
+    while (info && fgets(line, sizeof line, info))
+        if (!strncmp(line, "fanotify ", 9) && strncmp(line, "fanotify flags:", 15)) count++;
+    if (info) fclose(info);
+    return count;
+}
+static int case_superblock_marks(void) {
+    make_base("superblock-marks");
+    long shared = e(unshare(CLONE_NEWNS));
+    printf("unshare=%ld\n", shared);
+    if (shared) return 81;
+    printf("private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    mkdir(at("m"), 0755);
+    printf("tmpfs=%ld\n", e(mount("none", at("m"), "tmpfs", 0, NULL)));
+    touch(at("m/f"));
+    int fan = fan_init(FAN_NONBLOCK, 0);
+    if (fan < 0) return 80;
+    printf("file=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, at("m/f")));
+    printf("filesystem=%ld\n", fan_mark(fan, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_OPEN, AT_FDCWD, at("m")));
+    printf("other=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, base));
+    printf("marks=%d\n", marks_of(fan));
+    printf("umount=%ld\n", e(umount2(at("m"), 0)));
+    printf("marks after=%d\n", marks_of(fan));
+    printf("tmpfs again=%ld\n", e(mount("none", at("m"), "tmpfs", 0, NULL)));
+    /* Linux's anonymous device may be the first's again, or not. */
+    touch(at("m/f"));
+    int fd = open(at("m/f"), O_RDONLY);
+    if (fd >= 0) close(fd);
+    printf("events=%d\n", drain(fan));
+    close(fan);
+    printf("umount again=%ld\n", e(umount2(at("m"), 0)));
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1508,6 +1659,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-noop")) return 0;
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();
+    if (!strcmp(mode, "fanotify-merge-window")) return case_merge_window();
+    if (!strcmp(mode, "fanotify-superblock-marks")) return case_superblock_marks();
     printf("unknown mode %s\n", mode);
     return 2;
 }

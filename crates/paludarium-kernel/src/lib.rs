@@ -220,6 +220,9 @@ pub(crate) struct Usage {
     pub(crate) forced_faults: std::sync::atomic::AtomicU64,
     pub(crate) switches: std::sync::atomic::AtomicU64,
     pub(crate) migrations: std::sync::atomic::AtomicU64,
+    /// The CPU it was last seen on (Linux's `task_cpu`), which
+    /// `/proc/<pid>/stat` gives as `processor`.
+    pub(crate) last_cpu: std::sync::atomic::AtomicU32,
     /// Its CPU time in nanoseconds on each CPU, by the CPU's number: what
     /// it ran between two accounts counts to the CPU it was seen on at the
     /// first, for `/proc/stat`'s `cpuN` lines.
@@ -305,6 +308,7 @@ pub(crate) fn account_cpu(
         (None, _) => (group.lowest_cpu(tid), Some(generation)),
     };
     let was = account.on.replace(seen).map(|(was, _)| was);
+    usage.last_cpu.store(seen.0, Ordering::SeqCst);
     if was.is_some_and(|was| was != seen.0) {
         usage.migrations.fetch_add(1, Ordering::SeqCst);
     }
@@ -1668,6 +1672,9 @@ impl Kernel {
         };
         aio::progress(&ctx);
         let outcome = handler(&mut ctx, args);
+        // What the call made ready completes the polls that wait for it,
+        // in any process, before the call returns.
+        aio::progress(&ctx);
         if number == syscalls::nr::RT_SIGACTION
             && args[1] != 0
             && let Some(action) = thread.state.signal_actions.get(&(args[0] as i32))

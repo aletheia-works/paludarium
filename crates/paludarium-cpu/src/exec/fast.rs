@@ -320,6 +320,8 @@ pub enum Fast {
     Push(u8),
     /// `push imm`, the immediate sign-extended to 64 bits.
     PushImmediate(u64),
+    /// `push [m]` of 8 bytes. The address is taken before rsp moves.
+    PushLoad(Address),
     /// `mul r` or `imul r`: rax times `src` into rdx:rax (ax for a byte).
     MulWide {
         src: Register,
@@ -837,6 +839,7 @@ impl Fast {
             },
             Mnemonic::Push if i.implicit_size == 8 && b.is_none() => match a {
                 Some(Operand::Immediate(v)) => Self::PushImmediate(v),
+                Some(Operand::Memory(_)) => Self::PushLoad(target(a)?),
                 _ => Self::Push(gpr64(a)?),
             },
             Mnemonic::Pop if i.implicit_size == 8 && b.is_none() => Self::Pop(gpr64(a)?),
@@ -1074,6 +1077,11 @@ pub(crate) fn execute(
             next
         }
         Fast::PushImmediate(v) => {
+            x.push(v, 8)?;
+            next
+        }
+        Fast::PushLoad(mem) => {
+            let v = x.load(x.fast_linear(&mem), 8)?;
             x.push(v, 8)?;
             next
         }

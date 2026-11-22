@@ -120,15 +120,71 @@ fn a_segment_of_bss_alone_may_name_an_offset_past_the_end_of_the_file() {
     let mut bss = [9u8; 4];
     mem.read(GuestAddr(0x410000), &mut bss).unwrap();
     assert_eq!(bss, [0; 4]);
-    // A segment that does take file bytes from there stays refused.
+    assert!(
+        !load_bytes(&elf, &start(&[], &[]), &mut AddressSpace::new())
+            .unwrap()
+            .fails
+    );
+    // One that does take a file byte from there loads too, as Linux maps it,
+    // but its bss starts in a page past the end, which `padzero` cannot
+    // clear in a writable segment: the exec then fails (SIGSEGV).
     elf[64 + 56 + 32..64 + 56 + 40].copy_from_slice(&1u64.to_le_bytes());
+    let mut mem = AddressSpace::new();
+    let image = load_bytes(&elf, &start(&[], &[]), &mut mem).unwrap();
+    assert!(image.fails);
+    assert!(mem.read(GuestAddr(0x410000), &mut bss).unwrap_err().bus);
+}
+
+/// The simple program of three pages: text in the first, at 0x401000, and a
+/// writable page of data with bss, at 0x403000, from offset 0x2000.
+fn three_pages(data_flags: u32) -> Vec<u8> {
+    build_elf(
+        elf::ET_EXEC,
+        0x401000,
+        &[
+            load_seg(elf::PF_R | elf::PF_X, 0x401000, &[0xf4; 0x1800], 0x1800),
+            load_seg(data_flags, 0x404010, &[5; 16], 0x2000),
+        ],
+    )
+}
+
+#[test]
+fn a_file_cut_short_maps_as_linux_maps_it() {
+    let full = three_pages(elf::PF_R | elf::PF_W);
+    let data_at = 0x4010;
+    assert_eq!(full.len(), data_at + 16);
+    let load = |bytes: &[u8]| {
+        let mut mem = AddressSpace::new();
+        let image = load_bytes(bytes, &start(&[], &[]), &mut mem).unwrap();
+        (mem, image.fails)
+    };
+    // Cut within the data's page: what is left reads as it was, the rest
+    // of the page as zero, and the bss is cleared.
+    let (mem, fails) = load(&full[..data_at + 8]);
+    assert!(!fails);
+    let mut data = [9u8; 20];
+    mem.read(GuestAddr(0x404010), &mut data).unwrap();
+    assert_eq!(data[..8], [5; 8]);
+    assert_eq!(data[8..], [0; 12]);
+    // Cut before the data's page: its writable bss cannot be cleared.
+    let (_, fails) = load(&full[..0x4000]);
+    assert!(fails);
+    // With the data read-only, that is no failure: the text's second page
+    // is past the end too, and raises SIGBUS when touched, while its first
+    // page still holds the code.
+    let read_only = three_pages(elf::PF_R);
+    let (mem, fails) = load(&read_only[..0x2000]);
+    assert!(!fails);
+    let mut code = [0u8; 4];
+    mem.fetch(GuestAddr(0x401000), &mut code).unwrap();
+    assert_eq!(code, [0xf4; 4]);
+    let fault = mem.fetch(GuestAddr(0x402000), &mut code).unwrap_err();
+    assert!(fault.bus && fault.fetch);
+    assert!(mem.read(GuestAddr(0x404010), &mut code).unwrap_err().bus);
+    // The program headers past the end are no program.
     assert!(matches!(
-        load_bytes(
-            &elf,
-            &start(&[b"prog".to_vec()], &[]),
-            &mut AddressSpace::new()
-        ),
-        Err(LoadError::Malformed("segment out of range"))
+        load_bytes(&full[..64 + 56], &start(&[], &[]), &mut AddressSpace::new()),
+        Err(LoadError::Malformed(_))
     ));
 }
 

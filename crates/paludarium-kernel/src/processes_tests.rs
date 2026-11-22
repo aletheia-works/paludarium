@@ -6846,6 +6846,7 @@ mod proc_other {
             auxv: [(0, 0); paludarium_loader::AUXV_ENTRIES],
             code: (0x40_1000, 0x40_2345),
             data: (0x40_3000, 0x40_3100),
+            fails: false,
         }
     }
     #[test]

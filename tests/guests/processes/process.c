@@ -7236,6 +7236,99 @@ static int proc_stat_exec(const char *start, const char *faults) {
            ps_field("/proc/self/stat", 10) >= atol(faults));
     return 0;
 }
+/* The proc-stat-sched case: /proc/<pid>/stat's scheduling fields, as
+   fs/proc/array.c do_task_stat writes them: priority is task_prio (prio
+   less MAX_RT_PRIO: 20 + nice for a normal task, -1 - rt_priority for a
+   real-time one, -101 for a deadline one), then the nice value, the
+   threads, and later processor (task_cpu), rt_priority and policy. The
+   whole process's are its leader's, a path under task/ the thread's own.
+   Linux runs this case as root, as the guest is. */
+static void pss_show(const char *what, const char *path) {
+    printf("%s: priority=%ld nice=%ld threads=%ld rt_priority=%ld policy=%ld\n", what, ps_field(path, 18),
+           ps_field(path, 19), ps_field(path, 20), ps_field(path, 40), ps_field(path, 41));
+}
+/* Pins the calling thread to the highest CPU its mask allows; that CPU,
+   or -1. */
+static int pss_pin_high(void) {
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set)) return -1;
+    int high = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        if (CPU_ISSET(cpu, &set)) high = cpu;
+    if (high < 0) return -1;
+    CPU_ZERO(&set);
+    CPU_SET(high, &set);
+    return sched_setaffinity(0, sizeof set, &set) ? -1 : high;
+}
+static int pss_ready[2], pss_done[2];
+static void *pss_thread(void *unused) {
+    (void)unused;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)syscall(SYS_gettid));
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 7);
+    struct sched_param none = {0};
+    printf("thread batch: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &none));
+    pss_show("thread's own", path);
+    pss_show("thread sees the process", "/proc/self/stat");
+    int cpu = pss_pin_high();
+    printf("thread pinned: %d processor-is-getcpu=%d\n", cpu >= 0,
+           cpu >= 0 && sched_getcpu() == cpu && ps_field(path, 39) == cpu);
+    fflush(stdout);
+    if (write(pss_ready[1], &cpu, sizeof cpu) != sizeof cpu) return NULL;
+    if (read(pss_done[0], &cpu, sizeof cpu) != sizeof cpu) return NULL;
+    return NULL;
+}
+static int proc_stat_sched_case(void) {
+    const char *self = "/proc/self/stat";
+    struct sched_param param = {0};
+    printf("nice 5: %d\n", setpriority(PRIO_PROCESS, 0, 5));
+    pss_show("normal", self);
+    printf("batch: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &param));
+    pss_show("batch", self);
+    printf("idle: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_IDLE, &param));
+    pss_show("idle", self);
+    param.sched_priority = 1;
+    printf("fifo 1: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &param));
+    pss_show("fifo", self);
+    param.sched_priority = 99;
+    printf("rr 99: %ld\n", syscall(SYS_sched_setscheduler, 0, SCHED_RR | 0x40000000, &param));
+    pss_show("rr", self);
+    struct {
+        uint32_t size, policy;
+        uint64_t flags;
+        int32_t nice;
+        uint32_t priority;
+        uint64_t runtime, deadline, period;
+    } attr = {.size = 48, .policy = 6, .runtime = 10000000, .deadline = 30000000, .period = 100000000};
+    printf("deadline: %ld\n", syscall(SYS_sched_setattr, 0, &attr, 0));
+    pss_show("deadline", self);
+    attr = (typeof(attr)){.size = 48, .policy = SCHED_OTHER, .nice = 0};
+    printf("other: %ld\n", syscall(SYS_sched_setattr, 0, &attr, 0));
+    pss_show("other", self);
+    fflush(stdout);
+    if (pipe(pss_ready) || pipe(pss_done)) return 1;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, pss_thread, NULL)) return 1;
+    int cpu;
+    if (read(pss_ready[0], &cpu, sizeof cpu) != sizeof cpu) return 1;
+    /* The thread now sleeps on the CPU it was pinned to. */
+    DIR *task = opendir("/proc/self/task");
+    char path[300] = "";
+    for (struct dirent *entry; task && (entry = readdir(task));)
+        if (atol(entry->d_name) > 0 && atol(entry->d_name) != getpid())
+            snprintf(path, sizeof path, "/proc/self/task/%s/stat", entry->d_name);
+    if (task) closedir(task);
+    pss_show("the thread from the leader", path);
+    printf("the thread from the leader: processor-kept=%d\n", cpu >= 0 && ps_field(path, 39) == cpu);
+    pss_show("with the thread", self);
+    if (write(pss_done[1], &cpu, sizeof cpu) != sizeof cpu) return 1;
+    pthread_join(thread, NULL);
+    int own = pss_pin_high();
+    printf("pinned: %d processor-is-getcpu=%d\n", own >= 0,
+           own >= 0 && sched_getcpu() == own && ps_field(self, 39) == own);
+    pss_show("after the thread", self);
+    return 0;
+}
 static int proc_stat_counts_case(const char *self) {
     fflush(stdout);
     pid_t measuring = fork();
@@ -8657,6 +8750,262 @@ static int io_uring_transfers_case(void) {
     return 0;
 }
 
+/* io_uring's registered files: IORING_REGISTER_FILES, _UNREGISTER_FILES,
+   _FILES_UPDATE and _FILE_ALLOC_RANGE, IORING_OP_FILES_UPDATE (at an offset,
+   or each file in a free slot), and the requests that name a registered
+   file by its slot with IOSQE_FIXED_FILE. A slot holds its file open once
+   the descriptor is closed: the file's watches hear of its close when the
+   slot lets go of it, and a pipe's write end keeps its reader from the end
+   of the file. */
+static unsigned char *uf_slot(unsigned char opcode, int slot, long offset, const void *addr,
+                              unsigned len) {
+    unsigned char *sqe = ut_entry(opcode, slot, offset, addr, len);
+    sqe[1] = 1;
+    return sqe;
+}
+
+struct uf_update {
+    unsigned offset, resv;
+    unsigned long data;
+};
+
+struct uf_range {
+    unsigned off, len;
+    unsigned long resv;
+};
+
+static void uf_list(int *list, int a, int b, int c) {
+    list[0] = a;
+    list[1] = b;
+    list[2] = c;
+}
+
+static int io_uring_files_case(void) {
+    char dir[] = "/tmp/io-uring-files-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    if (uring_open(&ut, 8)) return 81;
+    int fd = open("a", O_RDWR | O_CREAT, 0600);
+    int other = open("b", O_RDWR | O_CREAT, 0600);
+    int path = open("a", O_PATH);
+    int ifd = (int)syscall(294, 04000);
+    if (fd < 0 || other < 0 || path < 0 || ifd < 0) return 82;
+    if (syscall(254, ifd, "a", 0x1b) < 0) return 83;
+    char got[16];
+    int list[4];
+    memset(got, 0, sizeof got);
+
+    /* None registered. */
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("fixed-none");
+    uring_show("unregister-none", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("register-null", syscall(427, ut.fd, 2, NULL, 1));
+    uring_show("register-zero", syscall(427, ut.fd, 2, list, 0));
+    uring_show("register-too-many", syscall(427, ut.fd, 2, list, (1 << 20) + 1));
+    uring_show("register-unmapped", syscall(427, ut.fd, 2, (void *)8, 1));
+    const struct {
+        const char *label;
+        int fd;
+    } bad[] = {
+        {"register-unknown", 999},
+        {"register-minus-two", -2},
+        {"register-o-path", path},
+        {"register-ring", ut.fd},
+    };
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+        uf_list(list, fd, -1, bad[i].fd);
+        uring_show(bad[i].label, syscall(427, ut.fd, 2, list, 3));
+    }
+    uring_show("unregister-after-failure", syscall(427, ut.fd, 3, NULL, 0));
+    struct rlimit old, low;
+    if (getrlimit(RLIMIT_NOFILE, &old)) return 84;
+    low = old;
+    low.rlim_cur = 8;
+    if (setrlimit(RLIMIT_NOFILE, &low)) return 85;
+    uring_show("register-over-nofile", syscall(427, ut.fd, 2, list, 9));
+    if (setrlimit(RLIMIT_NOFILE, &old)) return 86;
+
+    /* Slot 0 holds the file, slot 1 nothing. */
+    uf_list(list, fd, -1, -1);
+    uring_show("register", syscall(427, ut.fd, 2, list, 2));
+    uring_show("register-again", syscall(427, ut.fd, 2, list, 2));
+    uf_slot(23, 0, 0, "hi", 2);
+    ut_run("write-slot");
+    close(fd);
+    ut_events(ifd, "events-closed");
+    uf_slot(22, 0, 0, got, sizeof got);
+    ut_run("read-slot");
+    printf("read: %.2s\n", got);
+    uf_slot(3, 0, 0, NULL, 0);
+    ut_run("fsync-slot");
+    ut_events(ifd, "events-transfers");
+    const int slots[] = {1, 2, -1};
+    for (unsigned i = 0; i < sizeof slots / sizeof *slots; i++) {
+        uf_slot(22, slots[i], 0, got, 1);
+        printf("slot %d: ", slots[i]);
+        fflush(stdout);
+        ut_run("read");
+    }
+
+    /* IORING_REGISTER_FILES_UPDATE. */
+    struct uf_update up = {1, 0, (unsigned long)list};
+    list[0] = other;
+    uring_show("update-zero", syscall(427, ut.fd, 6, &up, 0));
+    uring_show("update-null", syscall(427, ut.fd, 6, NULL, 1));
+    up.resv = 1;
+    uring_show("update-resv", syscall(427, ut.fd, 6, &up, 1));
+    up.resv = 0;
+    up.offset = 2;
+    uring_show("update-past-end", syscall(427, ut.fd, 6, &up, 1));
+    up.offset = 0xffffffff;
+    uring_show("update-wraps", syscall(427, ut.fd, 6, &up, 2));
+    up.offset = 1;
+    uring_show("update", syscall(427, ut.fd, 6, &up, 1));
+    uf_slot(22, 1, 0, got, 1);
+    ut_run("read-updated");
+    up.offset = 0;
+    uf_list(list, -2, -1, 0);
+    uring_show("update-skip-clear", syscall(427, ut.fd, 6, &up, 2));
+    uf_slot(22, 0, 0, got, 2);
+    ut_run("read-skipped");
+    uf_slot(22, 1, 0, got, 1);
+    ut_run("read-cleared");
+    uf_list(list, 999, 0, 0);
+    uring_show("update-unknown", syscall(427, ut.fd, 6, &up, 1));
+    ut_events(ifd, "events-let-go");
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("read-let-go");
+    uf_list(list, other, 999, 0);
+    uring_show("update-partly", syscall(427, ut.fd, 6, &up, 2));
+    uring_show("unregister-arg", syscall(427, ut.fd, 3, list, 0));
+    uring_show("unregister-count", syscall(427, ut.fd, 3, NULL, 1));
+    uring_show("unregister", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("unregister-again", syscall(427, ut.fd, 3, NULL, 0));
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("read-unregistered");
+
+    /* IORING_OP_FILES_UPDATE: its preparation, then none registered. */
+    fd = open("a", O_RDWR);
+    if (fd < 0) return 87;
+    list[0] = fd;
+    unsigned char *sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[1] = 1;
+    ut_run("op-fixed");
+    sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[28] = 1;
+    ut_run("op-flags");
+    sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[44] = 1;
+    ut_run("op-splice-fd");
+    ut_entry(20, 0, 0, list, 0);
+    ut_run("op-none");
+    ut_entry(20, 0, 0, list, 1);
+    ut_run("op-unregistered");
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-unregistered");
+
+    /* Three empty slots, filled from the first; a slot emptied is next. */
+    uf_list(list, -1, -1, -1);
+    uring_show("register-sparse", syscall(427, ut.fd, 2, list, 3));
+    uf_list(list, fd, fd, 0);
+    ut_entry(20, 0, 0xffffffff, list, 2);
+    ut_run("op-alloc");
+    printf("slots: %d %d\n", list[0], list[1]);
+    uf_list(list, fd, fd, 0);
+    ut_entry(20, 0, 0xffffffff, list, 2);
+    ut_run("op-alloc-full");
+    printf("slots: %d %d\n", list[0], list[1] == fd ? -1 : list[1]);
+    uf_list(list, fd, 0, 0);
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-none-free");
+    list[0] = -1;
+    ut_entry(20, 0, 1, list, 1);
+    ut_run("op-clear");
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-cleared");
+    printf("slot: %d\n", list[0]);
+    const struct {
+        const char *label;
+        int fd;
+    } refused[] = {{"op-alloc-ring", ut.fd}, {"op-alloc-unknown", 999}};
+    for (unsigned i = 0; i < 2; i++) {
+        list[0] = -1;
+        ut_entry(20, 0, 0, list, 1);
+        ut_run("op-clear-first");
+        list[0] = refused[i].fd;
+        ut_entry(20, 0, 0xffffffff, list, 1);
+        ut_run(refused[i].label);
+    }
+    ut_entry(20, 0, 3, list, 1);
+    ut_run("op-past-end");
+    ut_entry(20, 0, 0xfffffffe, list, 2);
+    ut_run("op-wraps");
+
+    /* IORING_REGISTER_FILE_ALLOC_RANGE: slot 2 only, which is taken. */
+    struct uf_range range = {0xffffffff, 2, 0};
+    uring_show("range-null", syscall(427, ut.fd, 25, NULL, 0));
+    uring_show("range-count", syscall(427, ut.fd, 25, &range, 1));
+    uring_show("range-unmapped", syscall(427, ut.fd, 25, (void *)8, 0));
+    uring_show("range-wraps", syscall(427, ut.fd, 25, &range, 0));
+    range = (struct uf_range){2, 2, 0};
+    uring_show("range-past-end", syscall(427, ut.fd, 25, &range, 0));
+    range = (struct uf_range){2, 1, 1};
+    uring_show("range-resv", syscall(427, ut.fd, 25, &range, 0));
+    range.resv = 0;
+    uring_show("range", syscall(427, ut.fd, 25, &range, 0));
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-range-full");
+    list[0] = -1;
+    ut_entry(20, 0, 2, list, 1);
+    ut_run("op-clear-2");
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-range");
+    printf("slot: %d\n", list[0]);
+    uring_show("unregister-range", syscall(427, ut.fd, 3, NULL, 0));
+    range = (struct uf_range){0, 0, 0};
+    uring_show("range-unregistered", syscall(427, ut.fd, 25, &range, 0));
+    range.len = 1;
+    uring_show("range-unregistered-past-end", syscall(427, ut.fd, 25, &range, 0));
+    uf_list(list, -1, -1, 0);
+    uring_show("register-two", syscall(427, ut.fd, 2, list, 2));
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-whole");
+    printf("slot: %d\n", list[0]);
+    uring_show("unregister-two", syscall(427, ut.fd, 3, NULL, 0));
+
+    /* A pipe's write end in a slot: its reader sees no end of file. */
+    int ends[2];
+    if (pipe2(ends, O_NONBLOCK)) return 88;
+    list[0] = ends[1];
+    uring_show("register-pipe", syscall(427, ut.fd, 2, list, 1));
+    close(ends[1]);
+    uring_show("pipe-read-held", read(ends[0], got, 1));
+    uf_slot(23, 0, -1, "x", 1);
+    ut_run("pipe-write-slot");
+    uring_show("pipe-read", read(ends[0], got, 4));
+    uring_show("unregister-pipe", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("pipe-read-end", read(ends[0], got, 1));
+
+    unsigned char probe[16 + 8 * 64];
+    memset(probe, 0, sizeof probe);
+    syscall(427, ut.fd, 8, probe, 64);
+    printf("probe: 20=%d\n", probe[16 + 8 * 20 + 2] & 1);
+    close(ends[0]);
+    close(ifd);
+    close(path);
+    close(other);
+    close(fd);
+    close(ut.fd);
+    unlink("a");
+    unlink("b");
+    if (chdir("/")) return 89;
+    rmdir(dir);
+    return 0;
+}
+
 /* mprotect's checks in Linux's order, and the grows flags: the main stack
    grows down (as a MAP_GROWSDOWN mapping does, see grows_down_case), and
    nothing grows up on x86-64. */
@@ -8861,6 +9210,85 @@ static int madvise_collapse_case(void) {
     if (ioctl((int)uffd, 0xC018AA3F, api) || ioctl((int)uffd, 0xC020AA00, reg)) return 82;
     long registered = advice_errno(madvise(base, huge, 25));
     printf("registered=%ld resident=%d\n", registered, collapse_resident(base));
+    close((int)uffd);
+    return 0;
+}
+/* MADV_COLLAPSE of shmem's page cache: shared anonymous memory, a memfd
+ * (shared and private mappings) and System V shared memory, each mapped
+ * where its addresses and file offsets are 2 MiB aligned to each other. */
+static int madvise_collapse_shmem_case(void) {
+    long page = 4096, huge = 2 << 20;
+    char *map = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return 80;
+    char *base = (char *)(((unsigned long)map + huge - 1) & ~(huge - 1));
+    char *shared = mmap(base, 2 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+                        -1, 0);
+    if (shared == MAP_FAILED) return 81;
+    /* No page of the page cache in an extent: it was truncated. */
+    printf("untouched=%ld\n", advice_errno(madvise(shared, 2 * huge, 25)));
+    shared[3 * page] = 7;
+    long first = advice_errno(madvise(shared, 2 * huge, 25));
+    long again = advice_errno(madvise(shared, huge, 25));
+    printf("first=%ld again=%ld resident=%d byte=%d %d\n", first, again, collapse_resident(shared),
+           shared[3 * page], shared[0]);
+    /* A memfd with a page written, mapped at a file offset out of step
+     * with the address, then in step. */
+    int fd = memfd_create("collapse", 0);
+    if (fd < 0 || ftruncate(fd, 2 * huge) || pwrite(fd, "x", 1, 5 * page) != 1) return 82;
+    char *offset = mmap(shared, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, page);
+    if (offset == MAP_FAILED) return 83;
+    printf("offset=%ld\n", advice_errno(madvise(offset, huge, 25)));
+    char *file = mmap(shared, 2 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (file == MAP_FAILED) return 84;
+    long memfd = advice_errno(madvise(file, huge, 25));
+    long rest = advice_errno(madvise(file + huge, huge, 25));
+    struct stat st;
+    if (fstat(fd, &st)) return 85;
+    printf("memfd=%ld rest=%ld blocks=%lld byte=%c %d\n", memfd, rest, (long long)st.st_blocks,
+           file[5 * page], file[6 * page]);
+    /* A private mapping of it: the collapsed extent maps, but an extent
+     * with a page of the mapping's own does not. */
+    char *private = mmap(shared, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if (private == MAP_FAILED) return 86;
+    volatile char sink = private[0];
+    (void)sink;
+    long mapped = advice_errno(madvise(private, huge, 25));
+    private[huge + page] = 1;
+    long copied = advice_errno(madvise(private + huge, huge, 25));
+    printf("private=%ld copied=%ld\n", mapped, copied);
+    close(fd);
+    /* MADV_NOHUGEPAGE refuses shmem's VMAs too. */
+    char *nohuge = mmap(base, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+                        -1, 0);
+    if (nohuge == MAP_FAILED) return 87;
+    nohuge[0] = 1;
+    long advised = advice_errno(madvise(nohuge, huge, MADV_NOHUGEPAGE));
+    printf("nohugepage=%ld collapse=%ld\n", advised, advice_errno(madvise(nohuge, huge, 25)));
+    /* System V shared memory, attached where the PROT_NONE mapping was. */
+    munmap(base, 2 * huge);
+    int id = shmget(IPC_PRIVATE, (size_t)(2 * huge), IPC_CREAT | 0600);
+    if (id < 0) return 88;
+    char *segment = shmat(id, base, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (segment == (void *)-1) return 89;
+    segment[page] = 3;
+    long sysv = advice_errno(madvise(segment, huge, 25));
+    long sysv_rest = advice_errno(madvise(segment + huge, huge, 25));
+    printf("sysv=%ld rest=%ld byte=%d\n", sysv, sysv_rest, segment[page]);
+    shmdt(segment);
+    /* Holes, with a userfaultfd registered for missing pages. */
+    char *armed = mmap(base, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (armed == MAP_FAILED) return 90;
+    armed[0] = 1;
+    long uffd = syscall(SYS_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
+    if (uffd < 0) {
+        printf("userfaultfd=%d\n", -errno);
+        return 0;
+    }
+    unsigned long long api[3] = {0xAA, 0, 0};
+    unsigned long long reg[4] = {(unsigned long)armed, (unsigned long)huge, 1, 0};
+    if (ioctl((int)uffd, 0xC018AA3F, api) || ioctl((int)uffd, 0xC020AA00, reg)) return 91;
+    printf("registered=%ld\n", advice_errno(madvise(armed, huge, 25)));
     close((int)uffd);
     return 0;
 }
@@ -10608,11 +11036,13 @@ static void mt_run_from(const char *self, const char *dir) {
     snprintf(copy, sizeof copy, "%s/self", dir);
     int in = open(self, O_RDONLY), out = open(copy, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     char chunk[65536];
-    ssize_t n;
+    ssize_t n = -1;
     while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
         if (write(out, chunk, n) != n) break;
     close(in);
     close(out);
+    /* A copy cut short (ENOSPC) shows here, not as the child's status. */
+    printf("exe copied=%d\n", n == 0);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -10636,7 +11066,8 @@ static int mt_inner(const char *self) {
     dev_t base = mt_dev(mt_base);
     /* Changing propagation, if this kernel can; not compared. */
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=1m,mode=0750")));
+    /* Room for a copy of this program, which mt_run_from runs from it. */
+    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=16m,mode=0750")));
     printf("own device=%d\n", mt_dev(m) != base && mt_dev(m) != (dev_t)-1);
     mt_mountinfo(m);
     struct statfs fs;
@@ -10650,11 +11081,13 @@ static int mt_inner(const char *self) {
     snprintf(dotdot, sizeof dotdot, "%s/..", m);
     printf("dotdot=%d\n", !stat(dotdot, &up) && !stat(mt_base, &outer) && up.st_ino == outer.st_ino &&
                               up.st_dev == outer.st_dev);
-    mt_run_from(self, m);
     /* The defaults: 01777, owned by the caller, and nr_inodes in statfs. */
     printf("default=%d\n", mt_result(mount("none", m2, "tmpfs", MS_NOSUID, "nr_inodes=100")));
     if (!stat(m2, &st)) printf("default mode=%o uid=%d gid=%d\n", st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid);
     if (!statfs(m2, &fs)) printf("default files=%ld free=%ld\n", (long)fs.f_files, (long)fs.f_ffree);
+    /* Run from the default tmpfs, which has no size limit: the binary can be
+       larger than the 1 MiB one above, which a copy there would cut short. */
+    mt_run_from(self, m2);
     printf("umount default=%d\n", mt_result(umount2(m2, 0)));
     /* mount's checks. */
     printf("null-type=%d unknown-type=%d bad-option=%d flag-value=%d missing=%d not-dir=%d nouser=%d\n",
@@ -12644,6 +13077,108 @@ static int generated_noexec_case(void) {
     return 0;
 }
 
+/* The exec-truncated case: execve of a small ELF program cut short at
+   chosen lengths, as Linux's binfmt_elf takes it. The program has a text
+   segment of two pages from offset 0 (its code in the first, a byte it
+   reads, 7, in the second) and a data segment of 16 bytes and bss from
+   offset 0x2000, writable or read-only. A short header or program headers
+   past the end are no program (ENOEXEC) and an interpreter path past it
+   EIO; segments past the end map, and a page wholly past it raises SIGBUS
+   when touched, unless a writable segment's bss starts in such a page,
+   which padzero cannot clear: the exec then fails after its point of no
+   return, SIGSEGV. Each runs in a child with no core dump; its status is
+   printed. */
+static void et_put16(unsigned char *b, int at, unsigned v) { b[at] = v; b[at + 1] = v >> 8; }
+static void et_put32(unsigned char *b, int at, unsigned v) {
+    for (int i = 0; i < 4; i++) b[at + i] = v >> (8 * i);
+}
+static void et_put64(unsigned char *b, int at, unsigned long long v) {
+    for (int i = 0; i < 8; i++) b[at + i] = v >> (8 * i);
+}
+static void et_phdr(unsigned char *b, int n, unsigned type, unsigned flags, unsigned long long off,
+                    unsigned long long vaddr, unsigned long long filesz, unsigned long long memsz) {
+    int at = 64 + 56 * n;
+    et_put32(b, at, type);
+    et_put32(b, at + 4, flags);
+    et_put64(b, at + 8, off);
+    et_put64(b, at + 16, vaddr);
+    et_put64(b, at + 24, vaddr);
+    et_put64(b, at + 32, filesz);
+    et_put64(b, at + 40, memsz);
+    et_put64(b, at + 48, 0x1000);
+}
+/* The program, 0x2010 bytes; with `interp` a PT_INTERP whose path lies
+   past the end of the file. */
+static size_t et_build(unsigned char *b, int data_writable, int interp) {
+    memset(b, 0, 0x2010);
+    memcpy(b, "\177ELF\2\1\1", 7);
+    et_put16(b, 16, 2);                  /* ET_EXEC */
+    et_put16(b, 18, 62);                 /* EM_X86_64 */
+    et_put32(b, 20, 1);
+    et_put64(b, 24, 0x400100);           /* e_entry */
+    et_put64(b, 32, 64);                 /* e_phoff */
+    et_put16(b, 52, 64);
+    et_put16(b, 54, 56);
+    et_put16(b, 56, interp ? 3 : 2);
+    et_phdr(b, 0, 1, 5, 0, 0x400000, 0x2000, 0x2000);
+    et_phdr(b, 1, 1, data_writable ? 6 : 4, 0x2000, 0x602000, 0x10, 0x1000);
+    if (interp) et_phdr(b, 2, 3, 4, 0x3000, 0, 16, 16);
+    /* movzbl 0x401000, %eax; mov %eax, %edi; mov $231, %eax; syscall */
+    static const unsigned char code[] = {0x0f, 0xb6, 0x04, 0x25, 0x00, 0x10, 0x40, 0x00, 0x89, 0xc7,
+                                         0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05};
+    memcpy(b + 0x100, code, sizeof code);
+    b[0x1000] = 7;
+    memset(b + 0x2000, 0x5a, 0x10);
+    return 0x2010;
+}
+static void et_run(const char *name, const unsigned char *b, size_t len) {
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-truncated-%d", (int)getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+    if (fd < 0 || (len && write(fd, b, len) != (ssize_t)len) || close(fd)) {
+        printf("%s: setup failed\n", name);
+        return;
+    }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit none = {0, 0};
+        setrlimit(RLIMIT_CORE, &none);
+        char *args[] = {"truncated", NULL};
+        char *env[] = {NULL};
+        syscall(SYS_execve, path, args, env);
+        _exit(100 + errno);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) >= 100)
+        printf("%s: errno=%d\n", name, WEXITSTATUS(status) - 100);
+    else if (WIFEXITED(status))
+        printf("%s: exit=%d\n", name, WEXITSTATUS(status));
+    else
+        printf("%s: signal=%d\n", name, WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    unlink(path);
+}
+static int exec_truncated_case(void) {
+    static unsigned char rw[0x2010], ro[0x2010], interp[0x2010];
+    size_t full = et_build(rw, 1, 0);
+    et_build(ro, 0, 0);
+    et_build(interp, 1, 1);
+    et_run("full", rw, full);
+    et_run("empty", rw, 0);
+    et_run("magic", rw, 3);
+    et_run("header", rw, 40);
+    et_run("one-phdr", rw, 64 + 56);
+    et_run("interp-past-end", interp, full);
+    et_run("data-half", rw, 0x2008);
+    et_run("data-page-rw", rw, 0x2000);
+    et_run("text-half-rw", rw, 0x1800);
+    et_run("text-half-ro", ro, 0x1800);
+    et_run("text-page-ro", ro, 0x1000);
+    et_run("text-page-rw", rw, 0x1000);
+    return 0;
+}
+
 /* The dev-shm case: /dev/shm is a tmpfs on /dev from start-up, nosuid and
    nodev, where files are made, mapped and removed, reached through a link
    too. Only flags, modes, errno values and agreements are printed. */
@@ -13696,6 +14231,83 @@ static int proc_at_read_case(const char *self) {
     printf("status=%d\n", reaped(kid));
     par_show("reaped", fds);
     for (int i = 0; i < 5; i++) close(fds[i]);
+    return 0;
+}
+
+/* The leader-exit-status case: a process whose leader ends with exit
+   before its other thread has, once that thread ends too, the status Linux's
+   synchronize_group_exit gives it: the last thread's own exit code, or the
+   group's for exit_group or a fatal signal. While the thread runs, its stat
+   shows the leader as a zombie with the leader's own exit_code (5 << 8),
+   and the zombie's stat and the wait show the process's status. */
+static int les_go[2], les_variant;
+static void *les_worker(void *unused) {
+    (void)unused;
+    char c;
+    if (read(les_go[0], &c, 1) != 1) syscall(SYS_exit, 99);
+    if (les_variant == 0) syscall(SYS_exit, 7);
+    if (les_variant == 1) syscall(SYS_exit_group, 9);
+    for (;;) pause();
+}
+
+/* The state and exit_code (field 52) of /proc/<pid>/stat, -1 if unread. */
+static int les_stat(pid_t pid, char *state) {
+    char path[64], buffer[4096];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    long n = proc_read(path, buffer, sizeof buffer - 1);
+    if (n <= 0) return -1;
+    buffer[n] = 0;
+    char *s = strrchr(buffer, ')');
+    if (!s || !s[1]) return -1;
+    s += 2;
+    *state = *s;
+    for (int i = 0; i < 49 && s; i++) {
+        s = strchr(s, ' ');
+        if (s) s++;
+    }
+    return s ? atoi(s) : -1;
+}
+
+static int leader_exit_status_case(void) {
+    static const char *names[] = {"exit", "exit_group", "sigkill"};
+    for (les_variant = 0; les_variant < 3; les_variant++) {
+        if (pipe(les_go) < 0) return 1;
+        fflush(stdout);
+        pid_t kid = fork();
+        if (kid < 0) return 2;
+        if (kid == 0) {
+            pthread_t worker;
+            if (pthread_create(&worker, NULL, les_worker, NULL)) _exit(98);
+            syscall(SYS_exit, 5);
+        }
+        /* Until the leader is a zombie, for at most 5 s. */
+        char state = '?';
+        int during = -1;
+        for (int i = 0; i < 500 && state != 'Z'; i++) {
+            during = les_stat(kid, &state);
+            if (state != 'Z') nanosleep(&(struct timespec){0, 10000000}, NULL);
+        }
+        if (state != 'Z') {
+            kill(kid, SIGKILL);
+            waitpid(kid, NULL, 0);
+            return 4;
+        }
+        if (les_variant == 2)
+            kill(kid, SIGKILL);
+        else if (write(les_go[1], "g", 1) != 1)
+            return 3;
+        siginfo_t info;
+        memset(&info, 0, sizeof info);
+        waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+        char zombie_state = '?';
+        int zombie = les_stat(kid, &zombie_state);
+        int status = 0;
+        waitpid(kid, &status, 0);
+        close(les_go[0]);
+        close(les_go[1]);
+        printf("%s: running state=%c exit_code=%d; zombie state=%c exit_code=%d; wait=%#x\n",
+               names[les_variant], state, during, zombie_state, zombie, status);
+    }
     return 0;
 }
 
@@ -34230,6 +34842,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mlock-private-copy")) return mlock_private_copy_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-collapse")) return madvise_collapse_case();
+    if (!strcmp(mode, "madvise-collapse-shmem")) return madvise_collapse_shmem_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
@@ -34274,6 +34887,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
+    if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
     if (!strcmp(mode, "tree-namespace")) return tree_namespace_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
@@ -34297,6 +34911,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
+    if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
@@ -34319,6 +34934,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "io-uring-transfers")) return io_uring_transfers_case();
+    if (!strcmp(mode, "io-uring-files")) return io_uring_files_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;
@@ -34749,6 +35365,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "page-faults-exec")) return argc < 3 ? 98 : page_faults_exec(argv[2]);
     if (!strcmp(mode, "proc-stat-counts")) return proc_stat_counts_case(self);
+    if (!strcmp(mode, "proc-stat-sched")) return proc_stat_sched_case();
     if (!strcmp(mode, "proc-stat-exec")) return argc < 4 ? 98 : proc_stat_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-stat-thread-exec"))
         return argc < 5 ? 98 : proc_stat_thread_exec(argv[2], argv[3], argv[4]);

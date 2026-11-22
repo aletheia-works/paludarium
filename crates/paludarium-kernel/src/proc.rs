@@ -557,6 +557,12 @@ pub(crate) struct ProcessStat<'a> {
     /// The pages its memory holds (`get_mm_rss`).
     pub resident: u64,
     pub nice: i32,
+    /// `policy` and `rt_priority`, which with the nice value give the
+    /// priority (`task_prio`).
+    pub policy: u32,
+    pub rt_priority: u32,
+    /// The CPU it last ran on (`task_cpu`).
+    pub processor: u32,
     pub threads: usize,
     /// The total size of the mappings, in bytes.
     pub virtual_size: u64,
@@ -618,7 +624,7 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         "0".into(),
         ticks(s.children_cpu).to_string(),
         "0".into(),
-        (20 + s.nice).to_string(),
+        priority(s.policy, s.rt_priority, s.nice).to_string(),
         s.nice.to_string(),
         s.threads.to_string(),
         "0".into(), // itrealvalue
@@ -639,9 +645,9 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         "0".into(),                                     // nswap
         "0".into(),                                     // cnswap
         s.exit_signal.to_string(),
-        "0".into(), // processor
-        "0".into(), // rt_priority
-        "0".into(), // policy: SCHED_OTHER
+        s.processor.to_string(),
+        s.rt_priority.to_string(),
+        s.policy.to_string(),
         "0".into(), // delayacct_blkio_ticks
         "0".into(), // guest_time
         "0".into(), // cguest_time
@@ -659,6 +665,21 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     line.extend(s.name.iter().take_while(|&&b| b != 0));
     line.extend(format!(") {}\n", fields.join(" ")).into_bytes());
     line
+}
+/// The priority `stat` gives, as Linux's `task_prio`: `prio` less
+/// `MAX_RT_PRIO`, where `__normal_prio` makes `prio` `MAX_DL_PRIO - 1` for a
+/// deadline task, `MAX_RT_PRIO - 1 - rt_priority` for a real-time one and
+/// `NICE_TO_PRIO(nice)` for the others. Nothing boosts a task's priority,
+/// so it is the normal one.
+fn priority(policy: u32, rt_priority: u32, nice: i32) -> i32 {
+    use crate::scheduling::{SCHED_DEADLINE, rt_policy};
+    if policy == SCHED_DEADLINE {
+        -101
+    } else if rt_policy(policy) {
+        -1 - rt_priority.cast_signed()
+    } else {
+        20 + nice
+    }
 }
 /// `/proc/<pid>/statm`, as Linux's `proc_pid_statm` writes `task_statm`'s
 /// counts, in pages: the size of the mappings, the resident pages, those of
@@ -2579,6 +2600,9 @@ mod generated_tests {
             started: 4_560_000_000,
             resident: 3,
             nice: 3,
+            policy: 0,
+            rt_priority: 0,
+            processor: 3,
             threads: 2,
             virtual_size: 8192,
             rss_limit: u64::MAX,
@@ -2615,9 +2639,20 @@ mod generated_tests {
         assert_eq!(fields[22], "18446744073709551615");
         assert_eq!(&fields[23..25], ["4198400", "4217532"]);
         assert_eq!(&fields[28..32], ["0", "512", "2048", "1"]);
-        assert_eq!(fields[35], "17");
+        // exit_signal, processor, rt_priority and policy.
+        assert_eq!(&fields[35..39], ["17", "3", "0", "0"]);
         assert_eq!(&fields[42..44], ["4218880", "4222992"]);
         assert_eq!(&fields[45..49], ["10", "20", "20", "30"]);
+    }
+    #[test]
+    fn stat_gives_the_priority_of_each_policy_as_task_prio() {
+        use crate::scheduling::{SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_RR};
+        assert_eq!(priority(0, 0, -20), 0);
+        assert_eq!(priority(SCHED_BATCH, 0, 19), 39);
+        assert_eq!(priority(SCHED_IDLE, 0, 5), 25);
+        assert_eq!(priority(SCHED_FIFO, 1, 7), -2);
+        assert_eq!(priority(SCHED_RR, 99, 0), -100);
+        assert_eq!(priority(SCHED_DEADLINE, 0, 3), -101);
     }
     #[test]
     fn stat_hides_where_the_memory_is_from_a_reader_that_may_not_see_it() {
@@ -2639,6 +2674,9 @@ mod generated_tests {
                 started: 0,
                 resident: 0,
                 nice: 0,
+                policy: 0,
+                rt_priority: 0,
+                processor: 0,
                 threads: 1,
                 virtual_size: 8192,
                 rss_limit: 0,

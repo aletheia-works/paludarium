@@ -247,6 +247,9 @@ pub struct Processes {
     /// The machine's perf events by the thread that opened them, and those
     /// that wait for an `execve`.
     pub(crate) perf_events: crate::perf::Events,
+    /// What the processes that have been reaped used, which `/proc/stat`
+    /// goes on counting, as Linux's per-CPU counts keep a task's time.
+    reaped_times: Mutex<crate::proc::CpuTimes>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -276,6 +279,7 @@ impl Processes {
             bpf_maps: Arc::default(),
             bpf_progs: Arc::default(),
             perf_events: crate::perf::Events::default(),
+            reaped_times: Mutex::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -349,6 +353,34 @@ impl Processes {
             usize::try_from(live).unwrap_or(usize::MAX),
             next.saturating_sub(1),
         )
+    }
+    /// What every process has used, those reaped included, for
+    /// `/proc/stat`.
+    pub(crate) fn cpu_times(&self) -> crate::proc::CpuTimes {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut times = self
+            .reaped_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for entry in entries.values() {
+            entry.group.add_cpu_times(&mut times);
+        }
+        times
+    }
+    /// The live threads that are running, as `/proc/<pid>/stat` shows them
+    /// (`R`): neither asleep in a wait, other than `reader`, which is
+    /// running as it reads, nor stopped, by a signal or for a tracer. As
+    /// Linux's `nr_running`, at least the reader.
+    pub(crate) fn running_tasks(&self, reader: u32) -> usize {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .values()
+            .filter(|entry| entry.status.is_none() && !entry.group.is_stopped())
+            .flat_map(|entry| entry.group.threads())
+            .filter(|&(tid, blocked)| (!blocked || tid == reader) && !self.traces.in_stop(tid))
+            .count()
+            .max(1)
     }
     /// The next ID, which no task has had: the IDs of the first PID
     /// namespace are handed out once each, and those `set_tid` took are
@@ -1320,6 +1352,12 @@ impl Processes {
         let Some(entry) = entries.remove(&pid) else {
             return;
         };
+        entry.group.add_cpu_times(
+            &mut self
+                .reaped_times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         // Its tasks are no longer traced (`__ptrace_unlink`).
         self.traces.forget_process(pid);
         entry.space.leave(pid);
@@ -3397,6 +3435,8 @@ impl Kernel {
         self.group
             .aio()
             .new_process(group.aio(), child_mem.as_deref(), group.numa());
+        // `copy_process` notes when the child was made (`start_boottime`).
+        group.set_started(pid, self.host.clock(ClockId::Monotonic).unwrap_or(0));
         group.register(pid, inbox.clone());
         // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
         // parent is given first if it has none.
@@ -3983,8 +4023,10 @@ impl Kernel {
     /// process's memory only `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and `MADV_COLLAPSE`
     /// (`EINVAL`), and with `CAP_SYS_NICE` (`EPERM`). Each range is then
     /// advised in turn, as `madvise` would advise the caller's memory
-    /// ([`crate::syscalls::advise`]); another process's only needs to be
-    /// mapped (`ENOMEM`), as the four only hint at how pages will be used.
+    /// ([`crate::syscalls::advise`]); another process's is collapsed by
+    /// `MADV_COLLAPSE` ([`paludarium_mmu::MemoryView::collapse`]) and
+    /// otherwise only needs to be mapped (`ENOMEM`), as the other three only
+    /// hint at how pages will be used.
     /// The bytes of the ranges before the first that fails are the result,
     /// or its error when there are none.
     fn process_madvise(
@@ -4062,6 +4104,15 @@ impl Kernel {
                 } else {
                     match &target {
                         None => self.advise_own(thread, mem, start, len, advice as u64),
+                        // MADV_COLLAPSE collapses the other process's memory.
+                        Some(memory) if advice == 25 => {
+                            let end = start.saturating_add(len.next_multiple_of(4096));
+                            if end > paludarium_types::USER_ADDRESS_LIMIT {
+                                Err(Errno::ENOMEM)
+                            } else {
+                                memory.collapse(start, end)
+                            }
+                        }
                         Some(memory) => Self::mapped_whole(memory, start, len),
                     }
                 };
@@ -4099,7 +4150,20 @@ impl Kernel {
             processes: &self.processes,
         };
         let mut removing = |from, to| crate::userfaultfd::remove(&mut c, from, to);
-        crate::syscalls::advise(mem, &credentials, start, len, advice, &mut removing)
+        let mut poisoned = None;
+        let result = crate::syscalls::advise(
+            mem,
+            &credentials,
+            start,
+            len,
+            advice,
+            &mut removing,
+            &mut poisoned,
+        );
+        if let Some(page) = poisoned {
+            crate::signals::queue(c.process, crate::syscalls::poisoned_sigbus(page));
+        }
+        result
     }
     /// `process_mrelease(pidfd, flags)`, as Linux master's: `flags` must be
     /// 0 (`EINVAL`); then the task, `PIDFD_SELF_THREAD` or

@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
         Prot::READ_WRITE,
         MappingKind::Anonymous,
     );
-    for bytes in data.chunks_exact(18).take(256) {
+    for bytes in data.as_chunks::<18>().0.iter().take(256) {
         let address =
             GuestAddr(0x10000 + u64::from(u16::from_le_bytes([bytes[1], bytes[2]])) % 0x3000);
         let value = u64::from_le_bytes(bytes[3..11].try_into().unwrap_or([0; 8]));

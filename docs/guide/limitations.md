@@ -122,18 +122,17 @@ verified.
   `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
   Linux has the stop's signal until the tracer's wait, and a process whose
   leader ended with `exit` before the last of its threads shows the last
-  thread's status, where Linux shows the leader's. In `stat`, page faults,
-  resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
-  `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
-  interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
+  thread's status, where Linux shows the leader's. `/proc/stat` counts all CPU time as
+  user time, as `getrusage` does, each thread's to the CPU it was on at its
+  system calls, and none as idle; it counts no interrupts or softirqs, and
+  as context switches only the times threads went to sleep, as nothing
+  preempts a guest thread. A thread's `stat` gives its process's CPU time, and
   another process's thread is `S (sleeping)` in every wait, where Linux
   shows some waits it cannot interrupt as `D (disk sleep)`. A thread shows another process
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
   only while the thread is stopped in it. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
-  used. A generated file's `stat` gives its length as its size
-  (`mountinfo`, `status`, `stat`, `loadavg` and the like), where Linux's
-  seq files are of size 0; `maps`, `smaps` and `fdinfo` are 0 as on Linux.
+  used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
   root. `mount` mounts no `proc` filesystem and nothing on `/proc` or
@@ -272,7 +271,8 @@ verified.
   last thread to exit, where Linux counts them to the thread that dumps.
   `process_vm_readv`, `process_vm_writev`, `MADV_POPULATE_READ` and
   `MADV_POPULATE_WRITE` count their faults in `perf`'s `page-faults` too,
-  where Linux's `get_user_pages` gives no `perf` event. `/proc/<pid>/stat`'s fault counts are 0.
+  where Linux's `get_user_pages` gives no `perf` event. `/proc/<pid>/stat`'s
+  `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
   are hardware events even on a host with a PMU. A thread's CPU time, page
@@ -357,15 +357,16 @@ verified.
 - **BPF, maps and socket filters on AF_UNIX sockets only**: `bpf` makes
   arrays, hashes, LRU hashes, longest-prefix-match tries, queues, stacks,
   bloom filters, and arrays and hashes of maps, and loads socket filters,
-  and nothing else. A socket filter runs only attached with
-  `SO_ATTACH_BPF` to an AF_UNIX datagram or packet socket. A classic
-  filter (`SO_ATTACH_FILTER`) and an internet socket are `ENOPROTOOPT`.
+  and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
+  classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
+  or packet socket; on an internet socket the options are `ENOPROTOOPT`.
   No JIT compiles a program: the interpreter runs it. Of the helpers'
   values, the processor is 0, a network namespace's cookie is 1 (the
   initial one's) in every namespace, the boot and coarse clocks are the
   monotonic one, and `CLOCK_TAI` is the real time. A program is charged to
   its socket as though Linux's rewrites made it 16 times longer, so
-  `SO_ATTACH_BPF` is `ENOMEM` sooner than on Linux for a long one.
+  `SO_ATTACH_BPF` is `ENOMEM` sooner than on Linux for a long one; a
+  classic filter is charged what Linux charges for it.
   Every other program type is
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are
@@ -475,19 +476,37 @@ verified.
   `modify_ldt` only the calling thread's `%ds` and `%es` load again, where
   Linux reloads them in every thread of the address space. A null selector
   clears the `%fs` or `%gs` base, where AMD's CPUs before Zen 2 keep it.
-- **io_uring, in part**: only `IORING_OP_NOP` and `IORING_OP_EPOLL_CTL`
-  run; the other operations complete with `EOPNOTSUPP`. The setup flags
+- **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
+  `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`
+  and `_WRITE_FIXED` run; the other operations complete with `EOPNOTSUPP`.
+  The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
-  and `io_uring_register` has only `IORING_REGISTER_PROBE` (the others give
-  `EINVAL`), so no ring descriptor, file, buffer or personality can be
-  registered. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`), and
+  and `io_uring_register` has only `IORING_REGISTER_PROBE`,
+  `IORING_REGISTER_BUFFERS` and `IORING_UNREGISTER_BUFFERS` (the others give
+  `EINVAL`), so no ring descriptor, file or personality can be registered,
+  and buffers cannot be updated or given tags. A registered buffer's pages
+  are not pinned: a fixed transfer moves the memory at its address as that
+  is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
+  made read-only, and a process that shares the ring moves its own memory.
+  Linux moves the pages it pinned. A shared mapping of a disk file can be
+  registered, where Linux's long-term pin refuses it (`EFAULT`), and a huge
+  page charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where Linux
+  charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`), and
   `poll` and `epoll` cannot watch its descriptor. As every request completes
   in `io_uring_enter`, a wait for more completions than there are ends only
   by a signal or its timeout. The features are Linux 6.12's, so
   `IORING_FEAT_REG_REG_RING` is reported though no ring descriptor can be
   registered, and `IORING_FEAT_MIN_TIMEOUT` though a wait's `min_wait_usec`
-  changes nothing (no request is ever in flight).
+  changes nothing (no request is ever in flight). A transfer that would
+  wait for its file does not: Linux keeps it in flight until the file is
+  ready (a pipe, a socket or an eventfd with nothing to read, or a full
+  pipe, even with `O_NONBLOCK`), and the emulator completes it with
+  `EAGAIN`. A
+  terminal's read waits in `io_uring_enter`. A file that is never read
+  (an epoll instance, a ring) fails with `EINVAL` at once, where Linux
+  first waits for it to be ready. As no buffer can be provided, a read with
+  `IOSQE_BUFFER_SELECT` completes with `ENOBUFS`.
 - **Native AIO, in part**: every read, write and sync runs as `io_submit`
   takes it, as Linux's buffered I/O does; one of a file opened with
   `O_DIRECT` does not run in the background as on Linux, and a sync's event
@@ -510,13 +529,26 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes.
+  - `MADV_COLLAPSE` refuses shmem's and files' mappings (`EINVAL`), which
+    Linux collapses by the rules of shmem and of read-only files, and a
+    collapsed extent stays 512 ordinary pages, so `/proc/<pid>/smaps` shows
+    no `AnonHugePages` for it. Whether an extent has a page table is taken
+    as whether a page of it has an entry or a marker. Linux can also fail a
+    collapse for want of a free huge page (`ENOMEM`) or for a page in use
+    (`EAGAIN`), which never happens here.
+  - With `CAP_SYS_ADMIN`, `MADV_HWPOISON` refuses (`EIO`) a page of a file
+    or of shared memory, which Linux poisons in the page cache, for every
+    mapping and for the file. Of a page `fork` shares it poisons only the
+    caller's entry, where Linux unmaps it from every process. The zero page
+    gives `EBUSY` each time, where Linux marks the machine's zero page
+    poisoned at the first. Nothing of the advice with `CAP_SYS_ADMIN` is
+    differentially tested, as natively it would poison the host's memory.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
-    mapped. It refuses advice Linux does not know before any range
-    (`EINVAL`), as Linux master does; the CI's kernel checks it with each
-    range, so with no ranges, or only empty ones, it gives 0 there.
+    mapped, but for `MADV_COLLAPSE`. It refuses advice Linux does not know
+    before any range (`EINVAL`), as Linux master does; the CI's kernel
+    checks it with each range, so with no ranges, or only empty ones, it
+    gives 0 there.
   - A fatal signal other than SIGKILL marks a process as dying for
     `process_mrelease` as it is sent even when the only thread that does
     not block it already has a signal pending and is not running, or is
@@ -529,8 +561,9 @@ verified.
     the only one the page has here.
   - A fault of a `memfd_secret` page takes the faulting process's
     `RLIMIT_MEMLOCK` as of its last system call (its creator's before
-    one), and the pages count only `memfd_secret` files, where Linux's
-    `locked_vm` of a user also counts its `io_uring` buffers and the like.
+    one), and the pages count only `memfd_secret` files and `io_uring`'s
+    registered buffers, where Linux's `locked_vm` of a user also counts
+    `perf`'s buffers and the like.
     Kernels without the change that counts them as they are faulted in
     (97d34aa65c29, "mm/secretmem: properly account locked pages") count
     its mappings as locked instead: `mmap` gives `EAGAIN` past the limit,
@@ -923,11 +956,9 @@ verified.
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
-- **fanotify, in part**: `io_uring` has no read operation here to ask
-  `FAN_ACCESS_PERM` for.
-  `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
-  and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
-  never come. An evictable mark is never evicted. A group merges an event
+- **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
+  allows it), and `FAN_FS_ERROR` never comes. An evictable mark is never
+  evicted. A group merges an event
   into any like it still queued, where Linux looks only at the last 128 of
   its hash bucket. Whether a directory watches its children is judged by the
   fanotify marks alone, where Linux's counts inotify's too. A file a
@@ -944,11 +975,18 @@ verified.
   where Linux gives them to root of the process's own when it maps one. A network
   namespace has no interface but its loopback and the veth ends requests
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
-  across a pair to an address of the peer's namespace, but no IPv6
-  address (it makes no link-local one as it comes up, where Linux does),
-  no neighbour, no route through a gateway and no IPv6 route lookup in
-  through it (`RTA_IIF`), each `EOPNOTSUPP`. Traffic through an end makes no
-  neighbour entries and moves no counters; a namespace forwards nothing
+  across a pair to an address of the peer's namespace; it takes IPv6
+  addresses, makes its link-local one and its routes, and takes IPv6
+  routes a request adds without a gateway, but no IPv6 neighbour or proxy
+  entry, no route through a gateway and no IPv6 route lookup in through
+  it (`RTA_IIF`), each `EOPNOTSUPP`; and no IPv6 traffic goes through it
+  (`ENETUNREACH`). Its duplicate address detection sends no probe, finds
+  no duplicate and ends 1.5 seconds after it begins (half of
+  `rtr_solicit_delay`, then a probe and a retransmit time), where Linux's
+  ends 1 to 2 seconds on after a random delay; its link-local address is always made from its
+  Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
+  solicitation nor MLD report. Traffic through
+  an end moves no counters; a namespace forwards nothing
   on to another; and a broadcast or multicast destination through an end
   reaches no one. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`), so every datagram to a closed port of the
@@ -956,7 +994,13 @@ verified.
   connection across a pair goes on after an end goes down, goes or moves,
   or the address or route it took goes, where Linux's packets stop. A connection to an address nobody answers ARP for fails
   3 seconds after each connect, where Linux's attempts made while the
-  neighbour is resolving fail together. The addresses of an end that goes tell
+  neighbour is resolving fail together. An end's neighbour is answered or
+  not as the peer would answer when it begins to resolve or to delay,
+  where Linux asks again with each probe, and so a packet waiting for one
+  never goes once it is answered later; `NTF_MANAGED` ones are never
+  probed again; no traffic confirms one (`dst_confirm`, `MSG_CONFIRM`), so
+  a delaying one is always probed; and the neighbour table dump gives no
+  veth end's IPv6 parameters. The addresses of an end that goes tell
   their lifetimes as of the last netlink request, read or poll in its
   namespace, where Linux takes the time it goes. Making one takes
   only a name, an address and an MTU for each end (`EOPNOTSUPP` for the
@@ -1009,9 +1053,10 @@ verified.
   the settings that have no file (proxy ARP and NDP, multicast and
   broadcast forwarding, ignoring routes with their link down) as 0, as
   Linux is built. A veth end whose MTU is below 1280 still has the files
-  of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6.
+  of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
+  (it makes no IPv6 address, as Linux's does not).
   A
-  route goes through `lo`, a veth end (IPv4, without a gateway) or rejects: IPv6 gateways, multipath routes,
+  route goes through `lo`, a veth end (without a gateway) or rejects: IPv6 gateways, multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
@@ -1038,9 +1083,9 @@ verified.
   Linux does from 7.3; before it, one that has already run out. No
   temporary addresses are made for `IFA_F_MANAGETEMPADDR`, and
   `IFA_F_MCAUTOJOIN` joins no group. A peer address is
-  not a point-to-point one, and an IPv6 address is never tentative, where
-  Linux's is until its duplicate address detection work, which ends at
-  once on a loopback, has run. A connection or datagram to an address of
+  not a point-to-point one, and an IPv6 address of `lo` is never
+  tentative, where Linux's is until its duplicate address detection work,
+  which ends at once on a loopback, has run. A connection or datagram to an address of
   the namespace's own, of `lo` or a veth end, while `lo` is down is
   `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
@@ -1056,9 +1101,10 @@ verified.
   Notifications go out for the link, its IPv6 information, addresses,
   routes, neighbours and namespace IDs alone, not for the other groups;
   IPv4's routes through `lo` go without one when it goes down, as on
-  Linux. Traffic makes a neighbour through UDP and TCP's handshakes alone,
-  which are the only packets paludarium sends through `lo` (a TCP handshake
-  retried into a full backlog makes none of its answer), and none times
+  Linux. Traffic makes a neighbour through UDP, TCP's handshakes and ICMP's
+  port unreachable back alone, which are the only packets paludarium sends
+  through `lo` or a veth end (a TCP handshake retried into a full backlog
+  makes none of its answer), and none times
   out (`gc_thresh1` is never reached). A dump gives a family's neighbours
   the newest first, where Linux gives them in the order of its hash
   table, which a random key sets. Proxy entries of one hash bucket come
@@ -1066,7 +1112,7 @@ verified.
   x86-64 runner's Linux gave two of them the other way. One without a
   device goes with its namespace, where Linux 7.0, whose proxy table is
   every namespace's, keeps it, for a namespace made later where that one
-  was to see (Linux's master gives each namespace its own). Of a neighbour's
+  was to see (Linux's master gives each namespace its own). Of a loopback neighbour's
   timers only a reachable one's runs: once its reachable time since it
   was confirmed has passed, it goes stale, or delays if it was used
   within the delay before a probe (5 seconds), and its going stale is
@@ -1075,8 +1121,8 @@ verified.
   probes nor becomes reachable or failed, and one `NTF_USE` or
   `NTF_MANAGED` makes incomplete counts its first probe but never sends
   another nor fails;
-  `NTF_EXT_MANAGED` ones are not probed from time to time. A neighbour's
-  state and link-layer address change nothing traffic does, where Linux's
+  `NTF_EXT_MANAGED` ones are not probed from time to time. A loopback
+  neighbour's state and link-layer address change nothing traffic does, where Linux's
   `lo` holds a packet for one that is not valid until it resolves. Its
   references count only those of the request and of its timer. An IPv6
   proxy entry joins no solicited-node group (`pndisc_constructor`), and

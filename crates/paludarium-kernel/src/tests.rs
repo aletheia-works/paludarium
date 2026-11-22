@@ -4600,7 +4600,7 @@ mod io_uring {
         // An operation 6.12 lacks, then one it has but is not implemented:
         // each ends the submission after itself.
         push(&mut f, &r, 0, &sqe(200, 1));
-        push(&mut f, &r, 1, &sqe(1, 2));
+        push(&mut f, &r, 1, &sqe(6, 2));
         push(&mut f, &r, 2, &sqe(0, 3));
         assert_eq!(f.ret(426, &[r.fd, 3, 0, 0]), 1);
         assert_eq!(f.ret(426, &[r.fd, 2, 0, 0]), 1);
@@ -4697,7 +4697,7 @@ mod io_uring {
             f.ret(426, &[r.fd, 0, 1, GETEVENTS | 1 << 3, arg, 16]),
             errno(Errno::EINVAL)
         );
-        // The probe: NOP and EPOLL_CTL only, of 58 operations.
+        // The probe: NOP, the transfers and EPOLL_CTL, of 58 operations.
         let probe = DATA + 0x400;
         f.mem.write(GuestAddr(probe), &[0; 16 + 8 * 64]).unwrap();
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 64]), 0);
@@ -4707,12 +4707,291 @@ mod io_uring {
         let supported: Vec<u64> = (0..58)
             .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
             .collect();
-        assert_eq!(supported, [0, 29]);
-        // A probe that is not zeroed, another operation, another file.
+        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 22, 23, 29]);
+        // A probe that is not zeroed, buffers without an argument, another
+        // operation, another file.
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 1]), errno(Errno::EINVAL));
-        assert_eq!(f.ret(427, &[r.fd, 0, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 0, 0, 0]), errno(Errno::EFAULT));
         assert_eq!(f.ret(427, &[r.fd, 31, 0, 0]), errno(Errno::EINVAL));
         assert_eq!(f.ret(427, &[0, 8, probe, 1]), errno(Errno(95)));
+    }
+
+    /// Submits one entry, waits for it, and gives its result.
+    fn one(f: &mut Fixture, r: &Ring, sqe: &[u8; 64]) -> i32 {
+        let slot = u32_at(f, r.rings + 4) & 3;
+        push(f, r, slot, sqe);
+        assert_eq!(f.ret(426, &[r.fd, 1, 1, GETEVENTS]), 1);
+        let done = reap(f, r);
+        assert_eq!(done.len(), 1, "{done:?}");
+        done[0].1
+    }
+
+    /// A transfer entry: `opcode` on `fd` at `offset`, `addr` and `len`.
+    fn rw(opcode: u8, fd: u64, offset: u64, addr: u64, len: u32) -> [u8; 64] {
+        let mut e = sqe(opcode, 1);
+        e[4..8].copy_from_slice(&(fd as i32).to_le_bytes());
+        e[8..16].copy_from_slice(&offset.to_le_bytes());
+        e[16..24].copy_from_slice(&addr.to_le_bytes());
+        e[24..28].copy_from_slice(&len.to_le_bytes());
+        e
+    }
+
+    fn bytes(f: &Fixture, at: u64, len: usize) -> Vec<u8> {
+        let mut b = vec![0; len];
+        f.mem.read(GuestAddr(at), &mut b).unwrap();
+        b
+    }
+
+    const READV: u8 = 1;
+    const WRITEV: u8 = 2;
+    const FSYNC: u8 = 3;
+    const READ: u8 = 22;
+    const WRITE: u8 = 23;
+    const HERE: u64 = u64::MAX;
+
+    #[test]
+    fn transfers_move_bytes_at_an_offset_or_the_position() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (put, got, iov) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        f.mem.write(GuestAddr(put), b"hello world").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        assert_eq!(f.ret(1, &[fd, put, 11]), 11);
+        // At an offset: the position stays.
+        f.mem.write(GuestAddr(put), b"HE").unwrap();
+        assert_eq!(one(&mut f, &r, &rw(WRITE, fd, 0, put, 2)), 2);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 11);
+        assert_eq!(one(&mut f, &r, &rw(READ, fd, 0, got, 5)), 5);
+        assert_eq!(bytes(&f, got, 5), b"HEllo");
+        // -1 is the position, which moves past what was read.
+        assert_eq!(f.ret(8, &[fd, 6, 0]), 6);
+        assert_eq!(one(&mut f, &r, &rw(READ, fd, HERE, got, 64)), 5);
+        assert_eq!(bytes(&f, got, 5), b"world");
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 11);
+        // Vectors: two buffers written at the position, read at an offset.
+        f.mem.write(GuestAddr(put), b"!?").unwrap();
+        for (i, (base, len)) in [(put, 1u64), (put + 1, 1)].iter().enumerate() {
+            f.mem
+                .write_u64(GuestAddr(iov + 16 * i as u64), *base)
+                .unwrap();
+            f.mem
+                .write_u64(GuestAddr(iov + 16 * i as u64 + 8), *len)
+                .unwrap();
+        }
+        assert_eq!(one(&mut f, &r, &rw(WRITEV, fd, HERE, iov, 2)), 2);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 13);
+        f.mem.write_u64(GuestAddr(iov), got).unwrap();
+        f.mem.write_u64(GuestAddr(iov + 16), got + 1).unwrap();
+        assert_eq!(one(&mut f, &r, &rw(READV, fd, 11, iov, 2)), 2);
+        assert_eq!(bytes(&f, got, 2), b"!?");
+        // Past the end, nothing; a negative offset but -1 is EINVAL.
+        assert_eq!(one(&mut f, &r, &rw(READ, fd, 100, got, 5)), 0);
+        assert_eq!(one(&mut f, &r, &rw(READ, fd, -2i64 as u64, got, 5)), -22);
+        // An O_APPEND file's write at the position starts at its end.
+        f.mem.write(GuestAddr(DATA), b"/b\0").unwrap();
+        let append = f.ret(2, &[DATA, 0o2102, 0o600]);
+        assert_eq!(f.ret(1, &[append, put, 2]), 2);
+        assert_eq!(f.ret(8, &[append, 0, 0]), 0);
+        assert_eq!(one(&mut f, &r, &rw(WRITE, append, HERE, put, 2)), 2);
+        assert_eq!(f.ret(8, &[append, 0, 1]), 4);
+        // FSYNC, whose only flag is IORING_FSYNC_DATASYNC.
+        let mut sync = rw(FSYNC, fd, 0, 0, 0);
+        assert_eq!(one(&mut f, &r, &sync), 0);
+        sync[28] = 1;
+        assert_eq!(one(&mut f, &r, &sync), 0);
+        sync[28] = 2;
+        assert_eq!(one(&mut f, &r, &sync), -22);
+    }
+
+    #[test]
+    fn transfers_fail_where_linux_does() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let buf = DATA + 0x100;
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o101, 0o600]);
+        // The file at issue: none, a registered one, the access mode.
+        assert_eq!(one(&mut f, &r, &rw(READ, 99, 0, buf, 1)), -9);
+        let mut fixed = rw(READ, fd, 0, buf, 1);
+        fixed[1] = 1;
+        assert_eq!(one(&mut f, &r, &fixed), -9);
+        assert_eq!(one(&mut f, &r, &rw(READ, fd, 0, buf, 1)), -9);
+        // No buffer is ever provided, which a read finds before its access
+        // mode; a write selects none.
+        let mut select = rw(READ, fd, 0, 0, 1);
+        select[1] = 1 << 5;
+        assert_eq!(one(&mut f, &r, &select), -105);
+        let mut select = rw(WRITE, fd, 0, 0, 1);
+        select[1] = 1 << 5;
+        assert_eq!(one(&mut f, &r, &select), -95);
+        // The flags: an unknown one, polled I/O.
+        let mut flags = rw(WRITE, fd, 0, buf, 1);
+        flags[28..32].copy_from_slice(&0x200u32.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &flags), -95);
+        flags[28..32].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &flags), -22);
+        // The preparation: a buffer or vector outside the user half, an
+        // unknown attribute, a priority of no class.
+        assert_eq!(one(&mut f, &r, &rw(WRITE, fd, 0, 1 << 63, 1)), -14);
+        assert_eq!(one(&mut f, &r, &rw(WRITEV, fd, 0, 8, 1)), -14);
+        assert_eq!(one(&mut f, &r, &rw(WRITEV, fd, 0, buf, 1025)), -22);
+        let mut attr = rw(WRITE, fd, 0, buf, 1);
+        attr[56] = 2;
+        assert_eq!(one(&mut f, &r, &attr), -22);
+        let mut prio = rw(WRITE, fd, 0, buf, 1);
+        prio[2..4].copy_from_slice(&(7u16 << 13).to_le_bytes());
+        assert_eq!(one(&mut f, &r, &prio), -22);
+        let mut prio = rw(FSYNC, fd, 0, 0, 0);
+        prio[2] = 1;
+        assert_eq!(one(&mut f, &r, &prio), -22);
+        // A directory reads EISDIR, an epoll instance nothing.
+        f.mem.write(GuestAddr(DATA), b"/\0").unwrap();
+        let dir = f.ret(2, &[DATA, 0o200000, 0]);
+        assert_eq!(one(&mut f, &r, &rw(READ, dir, 0, buf, 1)), -21);
+        let epfd = f.ret(291, &[0]);
+        assert_eq!(one(&mut f, &r, &rw(READ, epfd, 0, buf, 1)), -22);
+        // An empty pipe would wait: EAGAIN here.
+        assert_eq!(f.ret(22, &[DATA + 0x500]), 0);
+        let ends = bytes(&f, DATA + 0x500, 8);
+        let reader = u64::from(u32::from_le_bytes(ends[..4].try_into().unwrap()));
+        let writer = u64::from(u32::from_le_bytes(ends[4..].try_into().unwrap()));
+        assert_eq!(one(&mut f, &r, &rw(READ, reader, 0, buf, 4)), -11);
+        f.mem.write(GuestAddr(buf), b"pipe").unwrap();
+        assert_eq!(one(&mut f, &r, &rw(WRITE, writer, 5, buf, 4)), 4);
+        assert_eq!(one(&mut f, &r, &rw(READ, reader, HERE, buf + 8, 8)), 4);
+        assert_eq!(bytes(&f, buf + 8, 4), b"pipe");
+    }
+
+    const READ_FIXED: u8 = 4;
+    const WRITE_FIXED: u8 = 5;
+    const ENXIO: Errno = Errno(6);
+    const EBUSY: Errno = Errno(16);
+    const EOVERFLOW: Errno = Errno(75);
+
+    /// `iovec`s of `(base, len)` at `at`.
+    fn iovecs(f: &Fixture, at: u64, buffers: &[(u64, u64)]) {
+        for (i, &(base, len)) in buffers.iter().enumerate() {
+            let entry = at + 16 * i as u64;
+            f.mem.write_u64(GuestAddr(entry), base).unwrap();
+            f.mem.write_u64(GuestAddr(entry + 8), len).unwrap();
+        }
+    }
+
+    fn fixed(opcode: u8, fd: u64, offset: u64, addr: u64, len: u32, index: u16) -> [u8; 64] {
+        let mut e = rw(opcode, fd, offset, addr, len);
+        e[40..42].copy_from_slice(&index.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn registered_buffers_transfer_within_themselves() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (vec, buf) = (DATA + 0x100, DATA + 0x800);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        // Unregistered: a fixed transfer finds no buffer.
+        assert_eq!(one(&mut f, &r, &fixed(READ_FIXED, fd, 0, buf, 1, 0)), -14);
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), errno(ENXIO));
+        // The registration's own checks.
+        assert_eq!(f.ret(427, &[r.fd, 0, 0, 1]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 16385]), errno(Errno::EINVAL));
+        for (buffer, e) in [
+            ((0, 1), Errno::EFAULT),
+            ((buf, 0), Errno::EFAULT),
+            ((buf, (1 << 30) + 1), Errno::EFAULT),
+            ((buf, -1i64 as u64), Errno::EINVAL),
+            ((-4096i64 as u64, 4096), EOVERFLOW),
+            ((0x40_0000, 4096), Errno::EFAULT),
+        ] {
+            iovecs(&f, vec, &[buffer]);
+            assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), errno(e), "{buffer:x?}");
+        }
+        // A failure registers none; then one buffer and an empty slot.
+        iovecs(&f, vec, &[(buf, 0x100), (0x40_0000, 1)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 2]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), errno(ENXIO));
+        iovecs(&f, vec, &[(buf, 0x100), (0, 0)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 2]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 2]), errno(EBUSY));
+        // Within the buffer, at any address in it.
+        f.mem.write(GuestAddr(buf + 0x10), b"fixed").unwrap();
+        let w = fixed(WRITE_FIXED, fd, 0, buf + 0x10, 5, 0);
+        assert_eq!(one(&mut f, &r, &w), 5);
+        let rd = fixed(READ_FIXED, fd, 1, buf + 0x80, 4, 0);
+        assert_eq!(one(&mut f, &r, &rd), 4);
+        assert_eq!(bytes(&f, buf + 0x80, 4), b"ixed");
+        // Outside it, past its end, the empty slot, a slot past the last.
+        for (addr, len, index) in [
+            (buf - 1, 1, 0),
+            (buf + 0xff, 2, 0),
+            (buf, 0x101, 0),
+            (buf, 1, 1),
+            (buf, 1, 2),
+        ] {
+            let e = fixed(READ_FIXED, fd, 0, addr, len, index);
+            assert_eq!(one(&mut f, &r, &e), -14, "{addr:x} {len} {index}");
+        }
+        // The file comes first; no buffer is selected.
+        assert_eq!(one(&mut f, &r, &fixed(READ_FIXED, 99, 0, buf, 1, 5)), -9);
+        let mut select = fixed(READ_FIXED, fd, 0, buf, 1, 0);
+        select[1] = 1 << 5;
+        assert_eq!(one(&mut f, &r, &select), -95);
+        // Unregistering takes arguments of none, then they are gone.
+        assert_eq!(f.ret(427, &[r.fd, 1, vec, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        assert_eq!(one(&mut f, &r, &rd), -14);
+    }
+
+    #[test]
+    fn a_write_that_would_wait_is_heard_of_only_with_nowait() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        f.mem.write(GuestAddr(DATA), b"/tmp/q\0").unwrap();
+        assert_eq!(f.ret(133, &[DATA, 0o010644, 0]), 0);
+        // A FIFO of one page, full.
+        let fifo = f.ret(2, &[DATA, 0o4002, 0]);
+        assert_eq!(f.ret(72, &[fifo, 1031, 4096]), 4096);
+        assert_eq!(f.ret(1, &[fifo, DATA + 0x800, 4096]), 4096);
+        let ifd = f.ret(294, &[0o4000]);
+        assert!(f.ret(254, &[ifd, DATA, 2]) < 1024);
+        // Linux keeps it in flight: no event yet.
+        assert_eq!(one(&mut f, &r, &rw(WRITE, fifo, HERE, DATA, 1)), -11);
+        assert_eq!(f.ret(0, &[ifd, DATA + 0x100, 64]), errno(Errno::EAGAIN));
+        // With RWF_NOWAIT it ends, and IN_MODIFY says so.
+        let mut nowait = rw(WRITE, fifo, HERE, DATA, 1);
+        nowait[28] = 8;
+        assert_eq!(one(&mut f, &r, &nowait), -11);
+        assert_eq!(f.ret(0, &[ifd, DATA + 0x100, 64]), 16);
+        assert_eq!(u32_at(&f, DATA + 0x104), 2);
+    }
+
+    #[test]
+    fn registered_buffers_charge_memlock_until_they_go() {
+        let mut f = fixture();
+        // RLIMIT_MEMLOCK of one page, for a user without CAP_IPC_LOCK.
+        f.mem.write_u64(GuestAddr(DATA), 4096).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), 4096).unwrap();
+        assert_eq!(f.ret(160, &[8, DATA]), 0);
+        assert_eq!(f.ret(105, &[1000]), 0);
+        let r = ring(&mut f);
+        let (vec, buf) = (DATA + 0x100, DATA + 0x800);
+        // Two pages: past the limit.
+        iovecs(&f, vec, &[(buf + 0x7ff, 2)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), errno(Errno::ENOMEM));
+        iovecs(&f, vec, &[(buf, 0x10), (buf + 0x100, 0x10)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 2]), errno(Errno::ENOMEM));
+        iovecs(&f, vec, &[(buf, 0x10)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), 0);
+        // Another ring of the user finds the page taken until it goes.
+        let other = ring(&mut f);
+        assert_eq!(f.ret(427, &[other.fd, 0, vec, 1]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        assert_eq!(f.ret(427, &[other.fd, 0, vec, 1]), 0);
+        assert_eq!(f.ret(3, &[other.fd]), 0);
     }
 }
 
@@ -7544,18 +7823,185 @@ mod madvise_advice {
             assert_eq!(f.ret(28, &[AREA, 2 * PAGE, advice]), 0, "{advice}");
             assert_eq!(f.ret(28, &[AREA, 3 * PAGE, advice]), errno(Errno::ENOMEM));
         }
-        // Still refused: MADV_COLLAPSE, the memory failure advice, and
-        // unknown ones.
-        for advice in [25, 100, 101, 26, 104] {
+        // MADV_COLLAPSE refuses a VMA with no room for a 2 MiB extent.
+        assert_eq!(f.ret(28, &[AREA, PAGE, 25]), errno(Errno::EINVAL));
+        // Unknown advice is refused.
+        for advice in [26, 104] {
             assert_eq!(
                 f.ret(28, &[AREA, PAGE, advice]),
                 errno(Errno::EINVAL),
                 "{advice}"
             );
         }
+        // The memory failure advice checks the range's arguments, then
+        // CAP_SYS_ADMIN (EPERM) before the address limit or any mapping.
+        let root = f.thread.state.credentials.clone();
+        f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+        for advice in [100, 101] {
+            assert_eq!(f.ret(28, &[AREA + 1, PAGE, advice]), errno(Errno::EINVAL));
+            assert_eq!(f.ret(28, &[AREA, u64::MAX, advice]), errno(Errno::EINVAL));
+            assert_eq!(f.ret(28, &[!4095, 2 * PAGE, advice]), errno(Errno::EINVAL));
+            assert_eq!(f.ret(28, &[AREA, 0, advice]), 0);
+            for addr in [AREA, AREA + 64 * PAGE, 1 << 47] {
+                assert_eq!(f.ret(28, &[addr, PAGE, advice]), errno(Errno::EPERM));
+            }
+        }
+        f.thread.state.credentials = root;
+        let mut byte = [0];
+        f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+        assert_eq!(byte, [7]);
         // MADV_DONTNEED_LOCKED discards.
         assert_eq!(f.ret(28, &[AREA, PAGE, 24]), 0);
         assert_eq!(status(&mut f, AREA), -2);
+    }
+    #[test]
+    fn collapse_takes_written_private_anonymous_memory_an_extent_at_a_time() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        const HUGE: u64 = 2 << 20;
+        const BASE: u64 = 0x4000_0000;
+        // Private anonymous memory, fixed: four extents.
+        assert_eq!(f.ret(mmap, &[BASE, 4 * HUGE, 3, 0x32, u64::MAX, 0]), BASE);
+        // No page of it was written: no anon_vma.
+        assert_eq!(f.ret(28, &[BASE, HUGE, 25]), errno(Errno::EINVAL));
+        f.mem.write(GuestAddr(BASE + HUGE + 5), &[9]).unwrap();
+        // No whole extent in the range: nothing to do.
+        assert_eq!(f.ret(28, &[BASE + PAGE, HUGE, 25]), 0);
+        assert_eq!(f.mem.resident(GuestAddr(BASE + 2 * PAGE)), Some(false));
+        // The second extent has a page table and is collapsed whole; the
+        // first has none (EINVAL), which does not stop the third.
+        f.mem.read(GuestAddr(BASE + 2 * HUGE), &mut [0]).unwrap();
+        assert_eq!(f.ret(28, &[BASE, 3 * HUGE, 25]), errno(Errno::EINVAL));
+        assert_eq!(f.mem.resident(GuestAddr(BASE)), Some(false));
+        for at in [
+            BASE + HUGE,
+            BASE + 2 * HUGE - PAGE,
+            BASE + 2 * HUGE,
+            BASE + 3 * HUGE - PAGE,
+        ] {
+            assert_eq!(f.mem.resident(GuestAddr(at)), Some(true), "{at:#x}");
+        }
+        assert_eq!(memory_bytes(&f, BASE + HUGE + 5, 1), [9]);
+        assert_eq!(f.mem.resident(GuestAddr(BASE + 3 * HUGE)), Some(false));
+        // Both done, again: 0.
+        assert_eq!(f.ret(28, &[BASE + HUGE, 2 * HUGE, 25]), 0);
+        // A poisoned page (an injected memory failure) fails its extent.
+        f.mem
+            .write(GuestAddr(BASE + 3 * HUGE + PAGE), &[1])
+            .unwrap();
+        assert_eq!(
+            inject(&f, BASE + 3 * HUGE + PAGE, PAGE, 100),
+            (Ok(()), Some(BASE + 3 * HUGE + PAGE))
+        );
+        assert_eq!(
+            f.ret(28, &[BASE + 3 * HUGE, HUGE, 25]),
+            errno(Errno::EINVAL)
+        );
+        // A hole after the VMA is ENOMEM once the walk is done.
+        assert_eq!(
+            f.ret(28, &[BASE + HUGE, 4 * HUGE, 25]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(28, &[BASE + 4 * HUGE - PAGE, 2 * PAGE, 25]),
+            errno(Errno::ENOMEM)
+        );
+        // MADV_NOHUGEPAGE refuses its VMA, which it splits off.
+        assert_eq!(f.ret(28, &[BASE, HUGE, 15]), 0);
+        assert_eq!(f.ret(28, &[BASE, PAGE, 25]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(28, &[BASE + HUGE, PAGE, 25]), 0);
+        // Too small a VMA, shared memory and a file's are refused.
+        let small = f.ret(mmap, &[0, HUGE, 3, 0x22, u64::MAX, 0]);
+        f.mem.write(GuestAddr(small), &[1]).unwrap();
+        let aligned = small & (HUGE - 1) == 0;
+        assert_eq!(
+            f.ret(28, &[small, PAGE, 25]),
+            if aligned { 0 } else { errno(Errno::EINVAL) }
+        );
+        let shared = f.ret(mmap, &[0, 2 * HUGE, 3, 0x21, u64::MAX, 0]);
+        f.mem.write(GuestAddr(shared), &[1]).unwrap();
+        assert_eq!(f.ret(28, &[shared, PAGE, 25]), errno(Errno::EINVAL));
+    }
+    #[test]
+    fn collapse_of_a_registered_range_wants_every_page() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        const HUGE: u64 = 2 << 20;
+        const BASE: u64 = 0x4000_0000;
+        assert_eq!(f.ret(mmap, &[BASE, HUGE, 3, 0x32, u64::MAX, 0]), BASE);
+        f.mem.write(GuestAddr(BASE), &[1]).unwrap();
+        let uffd = f.ret(323, &[0]);
+        f.mem.write_u64(GuestAddr(DATA), 0xAA).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), 0).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 16), 0).unwrap();
+        assert_eq!(f.ret(16, &[uffd, 0xC018_AA3F, DATA]), 0);
+        f.mem.write_u64(GuestAddr(DATA), BASE).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), HUGE).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 16), 1).unwrap();
+        assert_eq!(f.ret(16, &[uffd, 0xC020_AA00, DATA]), 0);
+        assert_eq!(f.ret(28, &[BASE, HUGE, 25]), errno(Errno(16)));
+        assert_eq!(f.mem.resident(GuestAddr(BASE + PAGE)), Some(false));
+    }
+    /// `madvise(addr, len, advice)` of the fixture's memory as root, and the
+    /// page whose poisoning would SIGBUS the caller.
+    fn inject(f: &Fixture, addr: u64, len: u64, advice: u64) -> (Result<(), Errno>, Option<u64>) {
+        let mut poisoned = None;
+        let result = syscalls::advise(
+            &f.mem,
+            &f.thread.state.credentials,
+            addr,
+            len,
+            advice,
+            &mut |_, _| {},
+            &mut poisoned,
+        );
+        (result, poisoned)
+    }
+    #[test]
+    fn memory_failure_advice_poisons_or_offlines_with_cap_sys_admin() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        let p = f.ret(mmap, &[0, 4 * PAGE, 3, 0x22, u64::MAX, 0]);
+        f.mem.write(GuestAddr(p), b"a").unwrap();
+        f.mem.write(GuestAddr(p + PAGE), b"b").unwrap();
+        // MADV_SOFT_OFFLINE moves a page: its contents stay. The zero page
+        // is the kernel's (ENOTRECOVERABLE), after the pages before it.
+        assert_eq!(f.ret(28, &[p, 2 * PAGE, 101]), 0);
+        assert_eq!(memory_bytes(&f, p, 1), b"a");
+        assert_eq!(f.ret(28, &[p, 3 * PAGE, 101]), errno(Errno(131)));
+        // MADV_HWPOISON poisons each page; the first is where the caller's
+        // SIGBUS points, and each access faults on it (BUS_MCEERR_AR) until
+        // a discard drops it.
+        assert_eq!(inject(&f, p + 1 - 1, 2 * PAGE - 1, 100), (Ok(()), Some(p)));
+        for at in [p, p + PAGE] {
+            let fault = f.mem.read(GuestAddr(at), &mut [0]).unwrap_err();
+            assert!(fault.poison && fault.bus, "{at:#x}");
+        }
+        // Again: the page cannot be brought in (EHWPOISON).
+        assert_eq!(inject(&f, p, PAGE, 100), (Err(Errno(133)), None));
+        assert_eq!(inject(&f, p, PAGE, 101), (Err(Errno(133)), None));
+        // The zero page is the kernel's (EBUSY); a hole, a page that may not
+        // be read and shared memory's are not poisoned.
+        assert_eq!(inject(&f, p + 2 * PAGE, PAGE, 100), (Err(Errno(16)), None));
+        assert_eq!(
+            inject(&f, p + 4 * PAGE, PAGE, 100),
+            (Err(Errno::EFAULT), None)
+        );
+        let none = f.ret(mmap, &[0, PAGE, 0, 0x22, u64::MAX, 0]);
+        assert_eq!(inject(&f, none, PAGE, 100), (Err(Errno::EFAULT), None));
+        let shared = f.ret(mmap, &[0, PAGE, 3, 0x21, u64::MAX, 0]);
+        f.mem.write(GuestAddr(shared), b"s").unwrap();
+        assert_eq!(inject(&f, shared, PAGE, 100), (Err(Errno::EIO), None));
+        assert_eq!(memory_bytes(&f, shared, 1), b"s");
+        // MADV_DONTNEED drops the poison: zeros again.
+        assert_eq!(f.ret(28, &[p, 2 * PAGE, 4]), 0);
+        assert_eq!(memory_bytes(&f, p + PAGE, 1), b"\0");
+        // The SIGBUS is forced on the caller at once: by default it ends it.
+        f.mem.write(GuestAddr(p + 3 * PAGE), b"c").unwrap();
+        assert_eq!(
+            f.call(28, &[p + 3 * PAGE, PAGE, 100]),
+            Next::Exit(ExitStatus::Signaled(7))
+        );
     }
     #[test]
     fn populate_faults_pages_in_until_one_cannot_be() {

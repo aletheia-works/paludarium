@@ -232,8 +232,10 @@ every test passing.
   and the same rates, but for lines that depend on thread timing.
 - The terminal gate runs the libraries' unit tests, not the harness's
   differential tests. So that the system calls those check count there too,
-  some kernel unit tests (`replay_tests.rs` and `ptrace_replay_tests.rs`
-  in `crates/paludarium-kernel/src/`) make a differential guest's calls in
+  some kernel unit tests (`replay_tests.rs`, `ptrace_replay_tests.rs`,
+  `bpf_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`, `mctp_tests.rs`,
+  `seccomp_tests.rs` and `perf_sample_tests.rs` in
+  `crates/paludarium-kernel/src/`) make a differential guest's calls in
   the same order and compare its lines with what the guest prints on
   native Linux: as printed on Linux 7.0, or as printed under the emulator
   for a case whose differential test finds it equal to Linux's. The
@@ -258,7 +260,11 @@ every test passing.
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)
   for the Linux, macOS and Windows targets, so the native crates keep building
-  with stable; the tests use only the pinned nightly.
+  with stable; the tests use only the pinned nightly. Both clippy runs also
+  check the `fuzz/` crate, a workspace of its own (the stable one for Linux).
+  `mise run lint:all` runs the same clippy runs locally (`rust:check`), the
+  stable one through `scripts/stable-cargo.sh`; the CI workflows that run
+  `lint:all` leave the stable one to `stable-clippy`.
 - Every GitHub Actions action is pinned to a commit SHA.
 
 ## CI

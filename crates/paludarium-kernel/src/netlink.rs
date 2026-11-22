@@ -18,8 +18,10 @@
 //! without a dump answers for `lo` by index or name, an AF_INET6
 //! `RTM_GETADDR` without one with an address of it, and `RTM_GETROUTE`
 //! without one looks a route up; an `RTM_GETNEIGH` dump answers with the
-//! loopback's neighbours or the proxy entries, and one without a dump with
-//! one of them; `RTM_NEWNEIGH` and `RTM_DELNEIGH` add and remove them, and
+//! neighbours of the loopback and of the veth ends (IPv4's alone on an
+//! end), of one device for `NDA_IFINDEX`, or the proxy entries, and one
+//! without a dump with one of them; `RTM_NEWNEIGH` and `RTM_DELNEIGH` add
+//! and remove them, and
 //! an `RTM_GETNEIGHTBL` dump answers with the neighbour tables;
 //! `RTM_NEWADDR` and `RTM_DELADDR` add and
 //! remove the loopback's IPv4, IPv6 and MCTP addresses, and
@@ -1407,7 +1409,7 @@ impl NetlinkSocket {
                         } else {
                             now_up
                         };
-                        veth::set_up(&self.network, &network, index, up, notices);
+                        veth::set_up(&self.network, &network, index, up, now, notices);
                     }
                     return Ok(false);
                 }
@@ -2624,9 +2626,8 @@ fn address_dump(
     if family != AF_INET6 {
         messages.extend(ipv4_messages(of, only, seq, port, now));
     }
-    // Only `lo` has IPv6 addresses here.
-    if family != AF_INET && only <= LOOPBACK_OIF {
-        messages.extend(ipv6_message(of, seq, port, now));
+    if family != AF_INET {
+        messages.extend(ipv6_message(of, only, seq, port, now));
     }
     if let Some((id, _)) = shown {
         messages = messages
@@ -3333,6 +3334,49 @@ fn device_state(network: &Network, index: u32) -> Option<(Vec<u8>, bool)> {
     };
     Some((name, up.unwrap_or_else(|| network.is_up())))
 }
+/// What IPv6 needs of the device of `index` of `network`: whether it is
+/// up, has its carrier, has IPv6 off (`disable_ipv6`, or an MTU below
+/// 1280), checks its
+/// addresses for duplicates (`accept_dad` of it or `all` at least 1, never
+/// on a loopback), and its Ethernet address; `None` for none.
+pub(crate) struct Dev6 {
+    /// Whether it has IPv6 (`inet6_dev`) at all: not a veth end made with
+    /// an MTU below 1280.
+    pub has: bool,
+    /// Whether that is off (`disable_ipv6`).
+    pub disabled: bool,
+    pub up: bool,
+    pub carrier: bool,
+    pub off: bool,
+    pub dad: bool,
+    pub mac: [u8; 6],
+}
+pub(crate) fn ipv6_device(network: &Network, index: i32) -> Option<Dev6> {
+    let devices = network.devices();
+    let device = devices.by_index(index)?;
+    let Some(veth) = device.veth.as_ref() else {
+        return Some(Dev6 {
+            has: true,
+            disabled: device.conf6.disable_ipv6 != 0,
+            up: network.is_up(),
+            carrier: true,
+            off: device.conf6.disable_ipv6 != 0,
+            dad: false,
+            mac: [0; 6],
+        });
+    };
+    Some(Dev6 {
+        has: veth.mtu >= 1280,
+        disabled: device.conf6.disable_ipv6 != 0,
+        up: veth.up,
+        carrier: veth.carrier,
+        // One whose MTU is below IPv6's least (1280) has no IPv6
+        // (`ipv6_add_dev`).
+        off: device.conf6.disable_ipv6 != 0 || veth.mtu < 1280,
+        dad: device.conf6.accept_dad >= 1 || devices.all6.accept_dad >= 1,
+        mac: veth.mac,
+    })
+}
 /// The flags of `lo`, as `dev_get_flags`: `IFF_LOOPBACK`, with `IFF_UP`,
 /// `IFF_RUNNING` and `IFF_LOWER_UP` while it is up.
 fn link_flags(network: &Network) -> u32 {
@@ -3627,13 +3671,24 @@ fn ipv4_address(
         message(kind, flags, seq, port, &body)
     }
 }
-/// `RTM_NEWADDR` for each IPv6 address of `lo`, in its order, as
-/// `inet6_fill_ifaddr` gives them.
-fn ipv6_message(network: &Network, seq: u32, port: u32, now: u64) -> Vec<Vec<u8>> {
-    let addresses = network.addresses().v6.clone();
+/// `RTM_NEWADDR` for each IPv6 address, of the device of `index` or of
+/// every one for 0, as `inet6_fill_ifaddr` gives them: device by device,
+/// by index (`for_each_netdev_dump`), each's in its list's order.
+fn ipv6_message(network: &Network, index: u32, seq: u32, port: u32, now: u64) -> Vec<Vec<u8>> {
+    let mut addresses: Vec<_> = network
+        .addresses()
+        .v6
+        .iter()
+        .filter(|a| index == 0 || a.index.unsigned_abs() == index)
+        .cloned()
+        .collect();
+    addresses.sort_by_key(|a| a.index);
     addresses
         .iter()
-        .map(|address| ipv6_address(address, false, RTM_NEWADDR, NLM_F_MULTI, seq, port, now))
+        .map(|address| {
+            let tentative = address.dad.is_some();
+            ipv6_address(address, tentative, RTM_NEWADDR, NLM_F_MULTI, seq, port, now)
+        })
         .collect()
 }
 /// An IPv6 address's message of `kind`, with `flags`, `tentative` or not,
@@ -3655,7 +3710,7 @@ fn ipv6_address(
             address_flags as u8,
             address.scope(),
         ];
-        body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
+        body.extend_from_slice(&address.index.to_le_bytes());
         attribute(&mut body, IFA_ADDRESS, &address.address.octets());
         if address.priority != 0 {
             attribute(&mut body, IFA_RT_PRIORITY, &address.priority.to_le_bytes());
@@ -3823,11 +3878,9 @@ fn change_address(
         if !network.has_device(index) {
             return Err(no_device());
         }
-        // Only `lo` has IPv6 addresses here, not a veth end.
-        if index != LOOPBACK_OIF {
-            return Err(EOPNOTSUPP);
-        }
-        return network.addresses().del_v6(ip, prefix, now);
+        return network
+            .addresses()
+            .del_v6(i32::try_from(index).unwrap_or(0), ip, prefix, now);
     }
     if bad_lifetimes {
         return Err(extack::message(
@@ -3835,19 +3888,16 @@ fn change_address(
             "ipv6: address lifetime invalid",
         ));
     }
-    if !network.has_device(index) {
+    let device = i32::try_from(index).unwrap_or(0);
+    let Some(dev) = ipv6_device(network, device) else {
         return Err(no_device());
-    }
-    // Only `lo` has IPv6 addresses here, not a veth end.
-    if index != LOOPBACK_OIF {
-        return Err(EOPNOTSUPP);
-    }
+    };
     let flags = flags & crate::interface::V6_ASKED;
     let mut addresses = network.addresses();
     let exists = addresses
         .v6
         .iter()
-        .find(|a| a.address == ip)
+        .find(|a| a.index == device && a.address == ip)
         .map(|a| a.prefix);
     // `inet6_addr_add` checks the request's prefix, `inet6_addr_modify`
     // the address's.
@@ -3867,7 +3917,7 @@ fn change_address(
         }
     }
     // `addrconf_add_dev`: a device with `disable_ipv6` takes no new one.
-    if exists.is_none() && network.ipv6_off() {
+    if exists.is_none() && dev.off {
         return Err(extack::message(
             Errno::EACCES,
             "ipv6: IPv6 is disabled on this device",
@@ -3886,10 +3936,20 @@ fn change_address(
         }
     }
     let mut new = crate::interface::V6::new(ip, prefix);
+    new.index = device;
     new.flags = flags;
     new.proto = proto;
     new.priority = priority;
-    addresses.add_v6(new, lifetimes, replace, up, now)
+    // A veth end checks it from when it is up with its carrier.
+    let dad = dev.dad.then(|| {
+        if dev.up && dev.carrier {
+            now + crate::interface::DAD_TIME
+        } else {
+            u64::MAX
+        }
+    });
+    let up = if device == LOOPBACK_INDEX { up } else { dev.up };
+    addresses.add_v6(new, lifetimes, replace, up, dad, now)
 }
 /// A table as an `rtmsg` holds it: one past 255 is `RT_TABLE_COMPAT`.
 fn table_byte(table: u32) -> u8 {
@@ -3965,7 +4025,9 @@ fn ipv6_route_of(
         RT_SCOPE_UNIVERSE,
         route.kind.code(),
     ];
-    body.extend_from_slice(&0u32.to_le_bytes());
+    // `rtm_flags`: `RTNH_F_LINKDOWN` (`fib_nexthop_info`).
+    let link = if route.linkdown { RTNH_F_LINKDOWN } else { 0 };
+    body.extend_from_slice(&link.to_le_bytes());
     attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
     if route.len != 0 {
         attribute(&mut body, RTA_DST, &route.dst.octets());
@@ -3975,7 +4037,7 @@ fn ipv6_route_of(
     }
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &route.oif.to_le_bytes());
     let mut cache = [0; RTA_CACHEINFO_LEN];
     cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &cache);
@@ -4796,8 +4858,8 @@ fn change_route(
         return Err(EOPNOTSUPP);
     }
     // Whether the device named is up, or else `lo`, which IPv6's routes
-    // and the gateways go through.
-    let up = if !v6 && oif != 0 {
+    // without one and the gateways go through.
+    let up = if oif != 0 {
         device_state(network, oif).is_some_and(|(_, up)| up)
     } else {
         network.is_up()
@@ -4820,6 +4882,12 @@ fn change_route(
             metric: priority,
             prefsrc: ip(prefsrc),
             oif,
+            device: network.has_device(oif),
+            ipv6_off: i32::try_from(oif)
+                .ok()
+                .and_then(|i| ipv6_device(network, i))
+                .filter(|d| d.has)
+                .map(|d| d.disabled),
             request: header.flags,
             metrics: converted,
         };
@@ -5139,8 +5207,8 @@ fn key_bytes(ip: &core::net::IpAddr) -> Vec<u8> {
         core::net::IpAddr::V6(ip) => ip.octets().to_vec(),
     }
 }
-/// A neighbour of the loopback at `now` as `__neigh_fill_info` makes it,
-/// a message of `kind` with `flags`: an `ndmsg` for `lo` with its state,
+/// A neighbour at `now` as `__neigh_fill_info` makes it, a message of
+/// `kind` with `flags`: an `ndmsg` for its device with its state,
 /// flags and type, then its key, its link-layer address while its state
 /// is valid, its probes and `struct nda_cacheinfo`: the hundredths of a
 /// second since it was used, confirmed ([`Neighbour::unconfirmed`] counts
@@ -5159,7 +5227,7 @@ fn neighbour_message(
 ) -> Vec<u8> {
     let family = if n.ip.is_ipv6() { AF_INET6 } else { AF_INET };
     let mut body = vec![family, 0, 0, 0];
-    body.extend_from_slice(&LOOPBACK_INDEX.to_le_bytes());
+    body.extend_from_slice(&n.index.to_le_bytes());
     body.extend_from_slice(&u16::from(n.state).to_le_bytes());
     body.extend_from_slice(&[(n.flags & 0xff) as u8, n.kind]);
     attribute(&mut body, NDA_DST, &key_bytes(&n.ip));
@@ -5253,11 +5321,12 @@ fn neighbour_filter(payload: &[u8], strict: bool) -> Result<(u32, u32), Errno> {
 /// the family names, ARP's (IPv4's) and then neighbour discovery's
 /// (IPv6's) for `AF_UNSPEC`, none for any other family. An `ndmsg` whose
 /// flags are `NTF_PROXY` asks for the proxy entries instead, in the order
-/// of their hash's buckets. The filter ([`neighbour_filter`]) shows
-/// `lo`'s for its index, 1, and for a master of -1, which asks for the
-/// devices without one, and those of a proxy entry without a device only
-/// for no index (`neigh_ifindex_filtered` of no device); any other shows
-/// nothing, and either marks each message `NLM_F_DUMP_FILTERED`. Linux goes through each table's hash buckets in
+/// of their hash's buckets. The filter ([`neighbour_filter`]) shows a
+/// device's for its index, and every one for a master of -1, which asks
+/// for the devices without one, and those of a proxy entry without a
+/// device only for no index (`neigh_ifindex_filtered` of no device); any
+/// other master shows nothing, and either marks each message
+/// `NLM_F_DUMP_FILTERED`. Linux goes through each table's hash buckets in
 /// turn, in an order its random hash gives; the newest comes first here,
 /// as each is put at the head of its bucket.
 fn neighbour_dump(
@@ -5279,8 +5348,8 @@ fn neighbour_dump(
     } else {
         NLM_F_MULTI
     };
-    let shown = matches!(device, 0 | 1) && matches!(master, 0 | u32::MAX);
-    if !shown {
+    // No device has a master.
+    if !matches!(master, 0 | u32::MAX) {
         return Ok(Vec::new());
     }
     let addresses = network.addresses();
@@ -5296,7 +5365,13 @@ fn neighbour_dump(
                 addresses
                     .proxies(v6)
                     .iter()
-                    .filter(|p| p.device || device == 0)
+                    .filter(|p| {
+                        if p.device {
+                            matches!(device, 0 | 1)
+                        } else {
+                            device == 0
+                        }
+                    })
                     .map(|p| proxy_message(p, flags, (seq, port))),
             );
             continue;
@@ -5306,6 +5381,7 @@ fn neighbour_dump(
                 .iter()
                 .rev()
                 .filter(|n| n.ip.is_ipv6() == v6)
+                .filter(|n| device == 0 || u32::try_from(n.index).ok() == Some(device))
                 .map(|n| neighbour_message(n, RTM_NEWNEIGH, flags, (seq, port), 0, now)),
         );
     }
@@ -5317,8 +5393,9 @@ fn neighbour_dump(
 /// error, checked strictly throughout; `EINVAL` without `NDA_DST` and for
 /// any other attribute; `EAFNOSUPPORT` for a family but IPv4 and IPv6;
 /// `EINVAL` for a key of another length than the family's; `ENODEV` for a
-/// device but `lo`; `ENOENT` for a proxy entry there is not for that
-/// device or for none ([`Addresses::proxy`]), and for a neighbour `lo` has
+/// device the namespace has not, and `EOPNOTSUPP` for an IPv6 or proxy one
+/// of a veth end; `ENOENT` for a proxy entry there is not for that device
+/// or for none ([`Addresses::proxy`]), and for a neighbour the device has
 /// not. The answer counts the reference the lookup holds as it is made
 /// (`neigh_lookup`).
 ///
@@ -5382,8 +5459,8 @@ fn neighbour_get(
     if index != 0 && !network.has_device(index) {
         return Err(extack::message(ENODEV, "Unknown device ifindex"));
     }
-    // Only `lo` has neighbours here, not a veth end.
-    if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) {
+    // A veth end has IPv4's neighbours here alone, and no proxy entry.
+    if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) && (ip.is_ipv6() || proxy) {
         return Err(EOPNOTSUPP);
     }
     let addresses = network.addresses();
@@ -5396,28 +5473,32 @@ fn neighbour_get(
         };
         return Ok(proxy_message(&p, 0, (seq, port)));
     }
-    let Some(n) = addresses.neighbours().iter().find(|n| n.ip == ip) else {
+    let Some(n) = addresses
+        .neighbours()
+        .iter()
+        .find(|n| n.index == index && n.ip == ip)
+    else {
         return Err(extack::message(Errno::ENOENT, "Neighbour entry not found"));
     };
     Ok(neighbour_message(n, RTM_NEWNEIGH, 0, (seq, port), 1, now))
 }
 /// The parameters of a neighbour table (`struct neigh_parms`), as
-/// `neightbl_fill_parms` puts them in `NDTA_PARMS`: `lo`'s (`device`),
-/// which each of its neighbours of the family holds a reference to
-/// (`refs`), or the table's own. Each is the table's default, as Linux
+/// `neightbl_fill_parms` puts them in `NDTA_PARMS`: a device's (`lo` or a
+/// veth end, by its index), which each of its neighbours of the family
+/// holds a reference to (`refs`), or the table's own. Each is the table's default, as Linux
 /// starts them (`arp_tbl` and `nd_tbl`): their reachable time is the base
 /// one, where Linux's is a random one from half of it to one and a half
 /// times it (`neigh_rand_reach_time`); the queue's length in packets is
 /// its bytes over `SKB_TRUESIZE(ETH_FRAME_LEN)`, 2090 bytes on x86-64.
-fn neighbour_parms(body: &mut Vec<u8>, v6: bool, device: bool, refs: u32) {
+fn neighbour_parms(body: &mut Vec<u8>, v6: bool, device: Option<i32>, refs: u32) {
     const QUEUE_LEN_BYTES: u32 = 212_992;
     let mut nest = Vec::new();
     let u32_attribute =
         |nest: &mut Vec<u8>, kind: u16, value: u32| attribute(nest, kind, &value.to_le_bytes());
     let msecs =
         |nest: &mut Vec<u8>, kind: u16, value: u64| attribute(nest, kind, &value.to_le_bytes());
-    if device {
-        u32_attribute(&mut nest, 1, 1);
+    if let Some(index) = device {
+        attribute(&mut nest, 1, &index.to_le_bytes());
     }
     // NDTPA_REFCNT, NDTPA_QUEUE_LENBYTES, NDTPA_QUEUE_LEN,
     // NDTPA_PROXY_QLEN, NDTPA_APP_PROBES, NDTPA_UCAST_PROBES,
@@ -5457,8 +5538,9 @@ fn neighbour_parms(body: &mut Vec<u8>, v6: bool, device: bool, refs: u32) {
 /// A neighbour table dump (`RTM_GETNEIGHTBL`), as `neightbl_dump_info`:
 /// for each table the family names, ARP's (IPv4's) and then neighbour
 /// discovery's (IPv6's) for `AF_UNSPEC`, none for another family, the
-/// table (`neightbl_fill_info`) and then `lo`'s parameters
-/// (`neightbl_fill_param_info`), the device the namespace has. Strictly,
+/// table (`neightbl_fill_info`) and then each device's parameters
+/// (`neightbl_fill_param_info`), the newest first: for ARP's, the veth
+/// ends' and `lo`'s; for neighbour discovery's, `lo`'s alone. Strictly,
 /// `EINVAL` for an `ndtmsg` short, with padding, or with attributes
 /// (`neightbl_valid_dump_info`). A table counts the namespace's
 /// neighbours, and its statistics are all 0, where Linux counts every
@@ -5492,6 +5574,15 @@ fn neighbour_tables(
             ));
         }
     }
+    // The veth ends, in the order they came to the namespace.
+    let ends: Vec<i32> = {
+        let devices = network.devices();
+        devices
+            .order()
+            .into_iter()
+            .filter(|&i| devices.by_index(i).is_some_and(|d| d.veth.is_some()))
+            .collect()
+    };
     let addresses = network.addresses();
     let since = u32::try_from(now / 1_000_000).unwrap_or(u32::MAX);
     let mut messages = Vec::new();
@@ -5530,16 +5621,32 @@ fn neighbour_tables(
         attribute(&mut body, 5, &config);
         // `struct ndt_stats`.
         attribute(&mut body, 7, &[0; 88]);
-        neighbour_parms(&mut body, v6, false, 1);
+        neighbour_parms(&mut body, v6, None, 1);
         messages.push(message(RTM_NEWNEIGHTBL, NLM_F_MULTI, seq, port, &body));
-        let mut body = vec![family, 0, 0, 0];
-        attribute(
-            &mut body,
-            1,
-            if v6 { b"ndisc_cache\0" } else { b"arp_cache\0" },
-        );
-        neighbour_parms(&mut body, v6, true, 1 + refs);
-        messages.push(message(RTM_NEWNEIGHTBL, NLM_F_MULTI, seq, port, &body));
+        // Each device's, the newest first, as `neigh_parms_alloc` puts each
+        // right after the table's: IPv4's of the veth ends too
+        // (`inetdev_init`), IPv6's of `lo` alone here.
+        let devices: Vec<i32> = if v6 {
+            vec![LOOPBACK_INDEX]
+        } else {
+            ends.iter().rev().copied().chain([LOOPBACK_INDEX]).collect()
+        };
+        for index in devices {
+            let refs = addresses
+                .neighbours()
+                .iter()
+                .filter(|n| n.index == index && n.ip.is_ipv6() == v6)
+                .count();
+            let refs = u32::try_from(refs).unwrap_or(u32::MAX);
+            let mut body = vec![family, 0, 0, 0];
+            attribute(
+                &mut body,
+                1,
+                if v6 { b"ndisc_cache\0" } else { b"arp_cache\0" },
+            );
+            neighbour_parms(&mut body, v6, Some(index), 1 + refs);
+            messages.push(message(RTM_NEWNEIGHTBL, NLM_F_MULTI, seq, port, &body));
+        }
     }
     Ok(messages)
 }
@@ -5605,12 +5712,9 @@ fn change_neighbour(
         if index != 0 && !network.has_device(index) {
             return Err(ENODEV);
         }
-        // Only `lo` has neighbours here, not a veth end.
-        if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) {
-            return Err(EOPNOTSUPP);
-        }
+        let veth = index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF);
         if add
-            && index == 1
+            && index != 0
             && let Some(lladdr) = lladdr
             && lladdr.len() < 6
         {
@@ -5626,6 +5730,10 @@ fn change_neighbour(
             }
             _ => return Err(EAFNOSUPPORT),
         };
+        // A veth end has IPv4's neighbours here alone, and no proxy entry.
+        if veth && (ip.is_ipv6() || flags & u32::from(NTF_PROXY) != 0) {
+            return Err(EOPNOTSUPP);
+        }
         let state = u16::from_le_bytes([payload[8], payload[9]]);
         let mut addresses = network.addresses();
         if flags & u32::from(NTF_PROXY) != 0 {
@@ -5662,7 +5770,7 @@ fn change_neighbour(
         }
         if !add {
             return addresses
-                .delete_neighbour(ip, now)
+                .delete_neighbour(index, ip, now)
                 .map(|events| (events, Ok(())));
         }
         let ask = NeighbourAsk {
@@ -5674,7 +5782,18 @@ fn change_neighbour(
             request: header.flags,
         };
         // What a change tells goes even when it then fails.
-        Ok(addresses.add_neighbour(ask, now))
+        let (events, result) = addresses.add_neighbour(index, ask, now);
+        drop(addresses);
+        // On a veth end, one used is resolved by ARP.
+        let using = flags & (crate::interface::NTF_USE | crate::interface::NTF_MANAGED) != 0;
+        if veth
+            && using
+            && result.is_ok()
+            && let core::net::IpAddr::V4(to) = ip
+        {
+            network.arp_resolve(index, to, now);
+        }
+        Ok((events, result))
     })();
     result.unwrap_or_else(|e| (Vec::new(), Err(e)))
 }
@@ -5711,11 +5830,20 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
     notices
 }
 /// What `network` tells of IPv4 as its device of `index` goes, closed
-/// (`inetdev_event`'s `NETDEV_UNREGISTER`): each of its addresses removed,
-/// with its routes ([`crate::interface::Addresses::device_gone4`]), before
-/// the device's `RTM_DELLINK`.
+/// (`inetdev_event`'s `NETDEV_UNREGISTER`): each of its addresses
+/// removed, with its routes ([`crate::interface::Addresses::device_gone4`]),
+/// then its neighbours, if closing left any, as `inetdev_destroy` calls
+/// `arp_ifdown` once they have gone; all before the device's
+/// `RTM_DELLINK`.
 pub(crate) fn addresses_gone(network: &Network, index: i32) -> Vec<Notice> {
-    let (events, now) = network.addresses().device_gone4(index);
+    let (events, now) = {
+        let mut addresses = network.addresses();
+        let (mut events, now) = addresses.device_gone4(index);
+        events.extend(addresses.flush_device(index, false));
+        // IPv6's `NETDEV_UNREGISTER`: what a down end still has.
+        events.extend(addresses.device_down6(index));
+        (events, now)
+    };
     told(events, 0, 0, false, false, now)
 }
 /// What `network` tells of IPv4 as its device of `index` comes up
@@ -5730,17 +5858,82 @@ pub(crate) fn device_up4(network: &Network, index: i32, carrier: bool) -> Vec<No
     };
     told(events, 0, 0, false, false, 0)
 }
-/// `network`'s device of `index` goes down (`NETDEV_DOWN`), or, up, has
-/// its carrier or loses it (`NETDEV_CHANGE`): IPv4 tells nothing of it
-/// ([`crate::interface::Addresses::device_down4`],
-/// [`crate::interface::Addresses::set_carrier`]).
-pub(crate) fn device_changed4(network: &Network, index: i32, up: bool, carrier: bool) {
-    let mut addresses = network.addresses();
-    if up {
-        addresses.set_carrier(index, carrier);
+/// What `network` tells of IPv6 as its veth end `index` comes up at
+/// `now`, with or without its `carrier`
+/// ([`crate::interface::Addresses::device_up6`]): nothing with IPv6 off
+/// on it (`disable_ipv6`).
+pub(crate) fn device_up6(network: &Network, index: i32, carrier: bool, now: u64) -> Vec<Notice> {
+    let Some(dev) = ipv6_device(network, index).filter(|d| !d.off) else {
+        return Vec::new();
+    };
+    let events = network
+        .addresses()
+        .device_up6(index, carrier, (dev.mac, dev.dad), now);
+    told(events, 0, 0, false, false, now)
+}
+/// What `network` tells of IPv6 as its veth end `index`, up, has its
+/// carrier at `now` ([`crate::interface::Addresses::link_ready6`]).
+pub(crate) fn link_ready6(network: &Network, index: i32, now: u64) -> Vec<Notice> {
+    let Some(dev) = ipv6_device(network, index).filter(|d| !d.off && d.up) else {
+        return Vec::new();
+    };
+    let events = network
+        .addresses()
+        .link_ready6(index, (dev.mac, dev.dad), now);
+    told(events, 0, 0, false, false, now)
+}
+/// Turns IPv6 of `network`'s veth end `index` off or `on` at `now`, as a
+/// change of its `disable_ipv6` does (`dev_disable_change`): off, it loses
+/// its IPv6 routes and addresses as when it goes down; on, while it is up,
+/// it is made ready again as when it comes up; and tells netlink's members.
+pub(crate) fn set_ipv6_on(network: &Network, index: i32, on: bool, now: u64) {
+    let notices = if on {
+        match ipv6_device(network, index) {
+            Some(dev) if dev.up => device_up6(network, index, dev.carrier, now),
+            _ => Vec::new(),
+        }
     } else {
-        addresses.device_down4(index);
-    }
+        device_down6(network, index)
+    };
+    notify(network, notices, None);
+}
+/// What `network` tells of IPv6 as its veth end `index` goes down or
+/// away ([`crate::interface::Addresses::device_down6`]).
+pub(crate) fn device_down6(network: &Network, index: i32) -> Vec<Notice> {
+    let (events, now) = {
+        let mut addresses = network.addresses();
+        let events = addresses.device_down6(index);
+        (events, addresses.seen())
+    };
+    told(events, 0, 0, false, false, now)
+}
+/// `network`'s device of `index` goes down (`NETDEV_DOWN`), or, up, has
+/// its carrier or loses it (`NETDEV_CHANGE`): IPv4's routes tell nothing
+/// of it ([`crate::interface::Addresses::device_down4`],
+/// [`crate::interface::Addresses::set_carrier`]), but its neighbours go,
+/// each told of: all of them as it goes down (`neigh_ifdown`), all but the
+/// permanent ones as it loses its carrier (`neigh_carrier_down`).
+pub(crate) fn device_changed4(
+    network: &Network,
+    index: i32,
+    up: bool,
+    carrier: bool,
+) -> Vec<Notice> {
+    let events = {
+        let mut addresses = network.addresses();
+        if up {
+            addresses.set_carrier(index, carrier);
+            if carrier {
+                Vec::new()
+            } else {
+                addresses.flush_device(index, true)
+            }
+        } else {
+            addresses.device_down4(index);
+            addresses.flush_device(index, false)
+        }
+    };
+    told(events, 0, 0, false, false, 0)
 }
 /// Turns `network`'s loopback's IPv6 off or on at `now`, as a change of
 /// its `disable_ipv6` does ([`Network::set_ipv6`]), and tells netlink's
@@ -7236,7 +7429,7 @@ mod tests {
         let network = Network::isolated(crate::users::first());
         // Down, a new namespace's loopback has no address.
         assert!(ipv4_messages(&network, 0, 1, 7, 0).is_empty());
-        assert!(ipv6_message(&network, 1, 7, 0).is_empty());
+        assert!(ipv6_message(&network, 0, 1, 7, 0).is_empty());
         let link = link_message(&network, 1, 7, NLM_F_MULTI, 0);
         assert_eq!(link.len() % 4, 0);
         let header = Header::read(&link);
@@ -7286,7 +7479,7 @@ mod tests {
         network.set_up(true, 0);
         let v4 = ipv4_messages(&network, 0, 2, 7, 0).concat();
         assert_eq!(&v4[16..24], &[2, 8, 0x80, 254, 1, 0, 0, 0]);
-        let v6 = ipv6_message(&network, 2, 7, 0).concat();
+        let v6 = ipv6_message(&network, 0, 2, 7, 0).concat();
         assert_eq!(&v6[16..24], &[10, 128, 0x80, 254, 1, 0, 0, 0]);
         assert_eq!(
             attributes(&v6[24..])[0],
@@ -7297,7 +7490,7 @@ mod tests {
         );
         network.set_up(false, 0);
         assert!(!ipv4_messages(&network, 0, 3, 7, 0).is_empty());
-        assert!(ipv6_message(&network, 3, 7, 0).is_empty());
+        assert!(ipv6_message(&network, 0, 3, 7, 0).is_empty());
     }
 
     #[test]
@@ -7990,7 +8183,7 @@ mod tests {
             payload
         };
         // The dump's message, but for its flags; any index finds it.
-        let dumped = ipv6_message(&network, 3, 7, 0).remove(0);
+        let dumped = ipv6_message(&network, 0, 3, 7, 0).remove(0);
         for (index, strict) in [(0, true), (1, true), (9, true), (9, false)] {
             let got = address_get(
                 &network,
@@ -8396,7 +8589,7 @@ mod tests {
         shown[8..12].copy_from_slice(&300u32.to_le_bytes());
         shown[12..].copy_from_slice(&300u32.to_le_bytes());
         assert_eq!(found(ours, IFA_CACHEINFO), Some(shown));
-        let v6 = ipv6_message(&network, 1, 7, 0);
+        let v6 = ipv6_message(&network, 0, 1, 7, 0);
         let nodad = v6.iter().find(|m| m[17] == 64).unwrap();
         assert_eq!(
             found(nodad, IFA_FLAGS),

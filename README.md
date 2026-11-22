@@ -55,7 +55,7 @@ Within mise, `target/release` is on `PATH`.
 | `mise run coverage` | The core and workspace line-coverage gates of CI; each fails under 80 % (x86-64 Linux) |
 | `mise run fuzz <target> [--seconds N]` | One target in `fuzz/fuzz_targets/` with the nightly's settings (x86-64 Linux) |
 | `mise run deny` | `cargo deny --locked check` |
-| `mise run lint:all` | `rust:check` (rustfmt, clippy), `shell:check` (ShellCheck), `actions:check` (actionlint), `python:check` (Ruff), `toml:check` (Tombi) and `markdown:check` (rumdl) |
+| `mise run lint:all` | `rust:check` (rustfmt, and clippy of the pinned nightly and of the stable Rust of `rust-version`), `shell:check` (ShellCheck), `actions:check` (actionlint), `python:check` (Ruff), `toml:check` (Tombi) and `markdown:check` (rumdl) |
 | `mise run ci` | `lint:all`, `build`, `test` and `deny` |
 
 Each `<lang>:check` has a `<lang>:check:fix`, and CI runs `lint:all` on every

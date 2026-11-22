@@ -21,6 +21,7 @@ mod signals;
 pub use inbox::SignalInbox;
 mod aio;
 mod bpf;
+mod bpf_classic;
 mod bpf_interp;
 mod bpf_prog;
 #[cfg(test)]
@@ -45,6 +46,8 @@ mod keys;
 mod loopback;
 mod lsm;
 mod mctp;
+#[cfg(test)]
+mod mctp_tests;
 mod netconf;
 mod netdev;
 mod netlink;
@@ -66,10 +69,14 @@ mod process_vm;
 mod processes;
 mod ptrace;
 mod pty;
+#[cfg(test)]
+mod pty_tests;
 mod record_locks;
 mod rseq;
 mod scheduling;
 mod seccomp;
+#[cfg(test)]
+mod seccomp_tests;
 mod sem;
 mod seq;
 mod shm;
@@ -213,6 +220,10 @@ pub(crate) struct Usage {
     pub(crate) forced_faults: std::sync::atomic::AtomicU64,
     pub(crate) switches: std::sync::atomic::AtomicU64,
     pub(crate) migrations: std::sync::atomic::AtomicU64,
+    /// Its CPU time in nanoseconds on each CPU, by the CPU's number: what
+    /// it ran between two accounts counts to the CPU it was seen on at the
+    /// first, for `/proc/stat`'s `cpuN` lines.
+    pub(crate) per_cpu: std::sync::Mutex<Vec<u64>>,
 }
 
 impl Usage {
@@ -271,11 +282,16 @@ pub(crate) fn account_cpu(
     let account = &mut state.cpu;
     let base = *account.base.get_or_insert_with(|| {
         group.register_cpu(tid, Arc::clone(&account.used));
+        // A thread no clone made, the first process's, was made about now.
+        group.set_started(
+            tid,
+            host.clock(paludarium_host::ClockId::Monotonic).unwrap_or(0),
+        );
         now
     });
     let used = now.saturating_sub(base);
     let usage = &account.used;
-    usage.cpu.store(used, Ordering::SeqCst);
+    let ran = used.saturating_sub(usage.cpu.swap(used, Ordering::SeqCst));
     let switches = paludarium_host::switches::take();
     if switches != 0 {
         usage.switches.fetch_add(switches, Ordering::SeqCst);
@@ -288,12 +304,20 @@ pub(crate) fn account_cpu(
         (None, Some((cpu, Some(seen)))) if seen == generation => (cpu, Some(seen)),
         (None, _) => (group.lowest_cpu(tid), Some(generation)),
     };
-    if account
-        .on
-        .replace(seen)
-        .is_some_and(|(was, _)| was != seen.0)
-    {
+    let was = account.on.replace(seen).map(|(was, _)| was);
+    if was.is_some_and(|was| was != seen.0) {
         usage.migrations.fetch_add(1, Ordering::SeqCst);
+    }
+    if ran != 0 {
+        let cpu = was.unwrap_or(seen.0) as usize;
+        let mut per_cpu = usage
+            .per_cpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if per_cpu.len() <= cpu {
+            per_cpu.resize(cpu + 1, 0);
+        }
+        per_cpu[cpu] = per_cpu[cpu].saturating_add(ran);
     }
     used
 }
@@ -1695,6 +1719,8 @@ mod events_tests;
 mod fanotify_tests;
 #[cfg(test)]
 mod keys_tests;
+#[cfg(test)]
+mod perf_sample_tests;
 #[cfg(test)]
 mod perf_tests;
 #[cfg(test)]

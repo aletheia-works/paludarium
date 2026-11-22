@@ -103,7 +103,7 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 - レジスタから同じ大きさのレジスタへの `tzcnt`、`lzcnt`、`popcnt`、`bsf`、`bsr`、レジスタのレジスタか即値による `bt`、32 ビットか 64 ビットのレジスタの `bswap`
 - レジスタによる rdx:rax への `mul` と `imul`、rdx:rax のレジスタによる `div` と `idiv`、2 つのレジスタまたはレジスタと即値の `imul`
 - xmm レジスタとメモリの間の `movaps`、`movups`、`movdqa`、`movdqu`、`movapd`、`movupd`、xmm レジスタどうしの `pxor` と `xorps`、xmm レジスタと汎用レジスタの間の `movd` と `movq`
-- xmm レジスタどうしの `pshufd`、`punpckl` と `punpckh` の各アンパック、`packuswb`、`packsswb`、`packssdw`、`paddd`、`psubd`、`paddq`、`psubq`、`pmuludq`、`pand`、`por`、`pandn`、即値による `pslld` と `psrld`、`pmovmskb`
+- xmm レジスタどうしの `pshufd`、`pshuflw`、`pshufhw`、`punpckl` と `punpckh` の各アンパック、`packuswb`、`packsswb`、`packssdw`、`paddd`、`psubd`、`paddq`、`psubq`、`pmuludq`、`pand`、`por`、`pandn`、`pcmpeqb`、`pcmpeqw`、`pcmpeqd`、即値による `pslld` と `psrld`、`pmovmskb`
 - 64 ビットのアドレスの（`rep` ありまたはなしの）`movsb`、`movsw`、`movsd`、`movsq`
 - メモリとレジスタの間の（`lock` ありまたはなしの）`cmpxchg` と `xchg`。どちらも、インタプリタと同じ 1 回のアトミックなメモリアクセスです
 

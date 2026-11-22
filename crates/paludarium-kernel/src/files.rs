@@ -226,6 +226,28 @@ fn released_to_notifiers(
             notify.unmounted(device);
         }
     })));
+    mounts_to_fanotify(table, caches, crate::namespaces::FIRST_MOUNT_INODE);
+}
+
+/// Tells fanotify of the mounts that come into `table`, the mount
+/// namespace whose inode is `namespace`, go or move
+/// ([`crate::fanotify::Registry::mount_events`]), as Linux's `mnt_notify`
+/// does.
+pub(crate) fn mounts_to_fanotify(
+    table: &paludarium_vfs::MountTable,
+    caches: &Arc<crate::page_cache::PageCaches>,
+    namespace: u32,
+) {
+    caches.notify.fan.mount_namespace(u64::from(namespace));
+    let fan = Arc::downgrade(&caches.notify.fan);
+    table.set_mount_hook(Some(Arc::new(move |changes, ended| {
+        if let Some(fan) = fan.upgrade() {
+            fan.mount_events(u64::from(namespace), changes);
+            if ended {
+                fan.mount_namespace_ended(u64::from(namespace));
+            }
+        }
+    })));
 }
 impl Default for Files {
     fn default() -> Self {
@@ -508,8 +530,15 @@ impl Files {
     /// filesystem would keep showing it.
     /// Its mounts are the first mount namespace's.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
-        self.first_mounts = first_table(&fs, self.host.as_ref());
+        let old = std::mem::replace(&mut self.first_mounts, first_table(&fs, self.host.as_ref()));
         released_to_notifiers(&self.first_mounts, &self.caches);
+        // The first namespace goes on with the new table: the old one, as it
+        // goes, tells fanotify of nothing and does not end the namespace.
+        old.set_mount_hook(None);
+        self.caches
+            .notify
+            .fan
+            .mount_namespace_ended(u64::from(crate::namespaces::FIRST_MOUNT_INODE));
         *self.space.lock().unwrap_or_else(PoisonError::into_inner) =
             Space::new(fs, Arc::clone(&self.first_mounts), &self.caches);
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -646,6 +675,23 @@ impl Files {
     pub(crate) fn release_home(&mut self) {
         self.home = Arc::default();
         self.root_pin = Arc::default();
+    }
+    /// An exiting task's `exit_task_namespaces`: it no longer sees the
+    /// files through its mount namespace's table, which the tasks that
+    /// share its working directory keep; it is left the first one's.
+    pub(crate) fn leave_mount_namespace(&mut self) {
+        let lower = Arc::clone(
+            &self
+                .space
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lower,
+        );
+        self.space = Arc::new(Mutex::new(Space::new(
+            lower,
+            Arc::clone(&self.first_mounts),
+            &self.caches,
+        )));
     }
     /// Detaches this worker's table reference without closing a table still
     /// shared by live CLONE_FILES siblings; the last task to let go gets the
@@ -1937,10 +1983,14 @@ fn pseudo_fs(kind: u64) -> paludarium_host::FsStats {
     }
 }
 /// What `fstatfs` reports for the file `d` holds: an empty pseudo
-/// filesystem for a /proc file (procfs), a terminal (devpts), a pipe, a
-/// socket, a pidfd (pidfs) or another file of no type (Linux's anonymous
-/// inodes), else the statistics of the filesystem holding its path.
+/// filesystem for a namespace file (nsfs), a /proc file (procfs), a
+/// terminal (devpts), a pipe, a socket, a pidfd (pidfs) or another file of
+/// no type (Linux's anonymous inodes), else the statistics of the
+/// filesystem holding its path.
 fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host::FsStats, Errno> {
+    if is_namespace(d) {
+        return Ok(pseudo_fs(NSFS_MAGIC));
+    }
     if in_proc(&d.path) {
         return Ok(pseudo_fs(PROC_SUPER_MAGIC));
     }
@@ -3557,6 +3607,109 @@ pub(crate) fn aio_transfer(
     result.map_or_else(|e| -i64::from(e.0), |count| count as i64)
 }
 
+/// An io_uring read or write of `segments` with the `RWF_*` `flags` that
+/// `kiocb_set_rw_flags` took, as Linux's `__io_read` and `io_write` go on
+/// from there. The outer error is one from before the file's `read_iter`
+/// or `write_iter`, the inner result what that gives.
+///
+/// - A buffered write the file system cannot do without waiting, with
+///   `RWF_NOWAIT`, is `EAGAIN` (no `FOP_BUFFER_WASYNC`, and the request
+///   may not wait).
+/// - An `offset` of -1 is the file's position, which moves past what was
+///   moved (an appending write's starts at the end), as
+///   `io_kiocb_update_pos` and `kiocb_done` do. A stream has none.
+/// - `rw_verify_area`: `EINVAL` for a negative offset, or an end past the
+///   largest. Then a read's `FAN_ACCESS_PERM`, for no bytes too.
+/// - The operation: a directory reads `EISDIR` (`generic_read_dir`), and a
+///   file with no read or write `EINVAL`.
+/// - A file that would wait (a pipe, a socket, an eventfd) does not:
+///   Linux keeps the request in flight until the file is ready, and the
+///   emulator completes it with `EAGAIN`.
+pub(crate) fn ring_transfer(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    write: bool,
+    segments: &[(u64, usize)],
+    offset: u64,
+    flags: u32,
+) -> Result<Result<u64, Errno>, Errno> {
+    if write && refuses_nowait_write(file, flags)? {
+        return Err(Errno::EAGAIN);
+    }
+    let positioned = aio_positioned(file);
+    let current = offset == u64::MAX;
+    let at = match (current, positioned) {
+        (true, true) => Some(file.seek(0, 1)?),
+        (true, false) => None,
+        (false, _) => Some(offset),
+    };
+    let total = segments
+        .iter()
+        .map(|&(_, length)| length as u64)
+        .sum::<u64>();
+    if let Some(at) = at
+        && ((at as i64) < 0 || (at as i64).checked_add(total as i64).is_none())
+    {
+        return Err(Errno::EINVAL);
+    }
+    if !write {
+        access_permission(c, file)?;
+    }
+    ring_operation(file, write)?;
+    let transfer = |c: &mut Context<'_>, at: u64, flags: u32| {
+        if write {
+            aio_write(c, file, segments, at, flags)
+        } else {
+            aio_read(c, file, segments, at, flags)
+        }
+    };
+    Ok(match at {
+        Some(at) if positioned && current => {
+            let metadata = file.stat()?;
+            let appends = (file.flags() & O_APPEND != 0 || flags & RWF_APPEND != 0)
+                && flags & RWF_NOAPPEND == 0
+                && metadata.mode & S_IFMT == S_IFREG;
+            let start = if write && appends { metadata.size } else { at };
+            let result = transfer(c, start, flags);
+            if let Ok(count) = result {
+                file.seek((start + count) as i64, 0)?;
+            }
+            result
+        }
+        Some(at) if positioned => transfer(c, at, flags),
+        _ => transfer(c, 0, flags | RWF_NOWAIT),
+    })
+}
+
+/// Whether `file` has the read (or with `write`, the write) an io_uring
+/// request needs, `read_iter` or `read` as Linux's `io_iter_do_read` and
+/// `io_write` look for them: a directory's `read` is `EISDIR`, and an
+/// epoll instance, an io_uring ring, a pidfd and a secret memfd have
+/// neither (`EINVAL`); an inotify instance, a signalfd and a timerfd only
+/// read.
+fn ring_operation(file: &Arc<dyn FileHandle>, write: bool) -> Result<(), Errno> {
+    if !write && file.stat()?.mode & S_IFMT == 0o040000 {
+        return Err(Errno::EISDIR);
+    }
+    if cannot_read_or_write(file) {
+        return Err(Errno::EINVAL);
+    }
+    let Some(any) = file.as_any() else {
+        return Ok(());
+    };
+    if any.is::<crate::epoll::EpollInstance>()
+        || any.is::<crate::io_uring::Ring>()
+        || any.is::<crate::processes::PidFd>()
+        || (write
+            && (any.is::<crate::inotify::Instance>()
+                || any.is::<crate::signalfd::SignalFile>()
+                || any.is::<crate::timerfd::TimerFile>()))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
 /// Checks that the first `len` bytes of `segments` can be written.
 fn writable_prefix(
     c: &Context<'_>,
@@ -4480,10 +4633,17 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
                 .map_err(|_| Errno::ENOENT)?;
             descriptor_statfs(c, &d)?
         } else {
-            if generated_stat(c, p, true)?.is_none() {
-                c.files.fs().metadata(p, true)?;
+            match generated_stat(c, p, true)? {
+                // A namespace's link leads to its nsfs file.
+                Some((_, device, _)) if device == crate::namespaces::DEVICE => {
+                    pseudo_fs(NSFS_MAGIC)
+                }
+                Some(_) => pseudo_fs(PROC_SUPER_MAGIC),
+                None => {
+                    c.files.fs().metadata(p, true)?;
+                    pseudo_fs(PROC_SUPER_MAGIC)
+                }
             }
-            pseudo_fs(PROC_SUPER_MAGIC)
         }
     } else if let Some(name) = paludarium_vfs::normalize_path(p)
         .ok()
@@ -4707,6 +4867,7 @@ const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
 const MQUEUE_MAGIC: u64 = 0x1980_0202;
 /// pidfs's `s_magic`, a pidfd's file system from Linux 6.9.
 const PID_FS_MAGIC: u64 = 0x5049_4446;
+const NSFS_MAGIC: u64 = 0x6e73_6673;
 /// The anonymous inodes' file system, which eventfds, epolls, timerfds,
 /// signalfds, inotify instances and the like are on.
 const ANON_INODE_FS_MAGIC: u64 = 0x0904_1934;
@@ -4904,7 +5065,7 @@ fn accessed(c: &Context<'_>, n: u64, a: [u64; 6], result: &Result<u64, Errno>) {
 /// Tells the inotify watches of `mask` on the open file of descriptor `fd`
 /// (`fsnotify_file`). A pipe, a socket or another file no path opened has
 /// none, as Linux's pseudo files are `FMODE_NONOTIFY`.
-fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
+pub(crate) fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
     let Ok(d) = c.files.descriptor(fd) else {
         return;
     };
@@ -8778,7 +8939,8 @@ fn system_file(
                 cpus: crate::syscalls::active_cpus(c),
                 boot_time: boot / 1_000_000_000,
                 forks,
-                running: 1,
+                running: c.processes.running_tasks(c.tid),
+                times: c.processes.cpu_times(),
             })
         }
         crate::proc::SystemEntry::Uptime => crate::proc::render_uptime(

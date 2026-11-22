@@ -86,8 +86,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut before = CpuState::new(GuestAddr(CODE), GuestAddr(DATA + DATA_LEN as u64));
-    for (slot, bytes) in before.gpr.iter_mut().zip(registers.chunks_exact(8)) {
-        let value = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+    for (slot, bytes) in before.gpr.iter_mut().zip(registers.as_chunks::<8>().0) {
+        let value = u64::from_le_bytes(*bytes);
         // Half the registers point into the data page, so that loads and
         // stores mostly succeed.
         *slot = if value & 1 == 0 {

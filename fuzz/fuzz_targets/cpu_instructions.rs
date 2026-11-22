@@ -34,12 +34,12 @@ fuzz_target!(|data: &[u8]| {
     let end = data.len().min(4096);
     let _ = memory.write_initial(GuestAddr(0x10000), &data[..end]);
     let mut state = CpuState::new(GuestAddr(0x10000), GuestAddr(0x40002000));
-    for (slot, bytes) in state.gpr.iter_mut().zip(data.chunks_exact(8)) {
-        *slot = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+    for (slot, bytes) in state.gpr.iter_mut().zip(data.as_chunks::<8>().0) {
+        *slot = u64::from_le_bytes(*bytes);
     }
     state.rflags = u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8])) & 0xcd5 | 2;
-    for (slot, bytes) in state.xmm.iter_mut().zip(data.chunks_exact(16)) {
-        *slot = u128::from_le_bytes(bytes.try_into().unwrap_or([0; 16]));
+    for (slot, bytes) in state.xmm.iter_mut().zip(data.as_chunks::<16>().0) {
+        *slot = u128::from_le_bytes(*bytes);
     }
     // All architecturally valid rounding/mask/DAZ/FTZ combinations participate;
     // instruction bytes and XMM inputs remain arbitrary libFuzzer inputs.

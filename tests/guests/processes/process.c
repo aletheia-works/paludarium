@@ -7144,6 +7144,178 @@ static int page_faults_case(const char *self) {
     _exit(0);
 }
 
+/* The proc-stat-counts case: /proc/<pid>/stat's minflt and cminflt are
+   the faults getrusage counts (fs/proc/array.c do_task_stat: the process's
+   and its ended threads', the thread's own under task/, the reaped
+   children's), rss the pages its memory holds, and starttime when the task
+   was made, in clock ticks since boot, which an execve keeps. Only what
+   Linux guarantees is shown: counts grow and bound each other, and a
+   start time is between the parent's and the time it is read. */
+static long ps_field(const char *path, int n) {
+    char text[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t got = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (got <= 0) return -1;
+    text[got] = 0;
+    char *at = strrchr(text, ')');
+    if (!at) return -1;
+    at += 2; /* field 3, the state */
+    for (int i = 3; i < n; i++) {
+        at = strchr(at, ' ');
+        if (!at) return -1;
+        at++;
+    }
+    return atol(at);
+}
+/* /proc/uptime in clock ticks, from its seconds and hundredths as they
+   are written: no floating point, whose rounding could make it a tick
+   less than a start time read before it. */
+static long ps_uptime(void) {
+    char text[64];
+    int fd = open("/proc/uptime", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t got = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (got <= 0) return -1;
+    text[got] = 0;
+    char *dot;
+    long seconds = strtol(text, &dot, 10);
+    if (*dot != '.' || dot[1] < '0' || dot[1] > '9' || dot[2] < '0' || dot[2] > '9') return -1;
+    return seconds * 100 + (dot[1] - '0') * 10 + (dot[2] - '0');
+}
+/* Whether `start` is at most `now` and within 30 s of it (0 is a start
+   in the first tick since boot, as paludarium's is the emulator's start). */
+static int ps_recent(long start, long now) {
+    return start >= 0 && now >= 0 && start <= now && now - start <= 3000;
+}
+static long ps_process_start;
+static void *ps_thread(void *unused) {
+    (void)unused;
+    pf_touch(64);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)syscall(SYS_gettid));
+    long own = pf_get(RUSAGE_THREAD);
+    long task = ps_field(path, 10);
+    long whole = ps_field("/proc/self/stat", 10);
+    long start = ps_field(path, 22);
+    printf("thread: at-least-64=%d at-least-rusage=%d within-process=%d start-after-process=%d "
+           "start-recent=%d\n",
+           task >= 64, task >= own, task <= whole, start >= ps_process_start,
+           ps_recent(start, ps_uptime()));
+    return NULL;
+}
+/* A thread other than the leader runs execve: it takes the leader's ID and
+   start time (fs/exec.c de_thread) and keeps its own faults. */
+static const char *ps_self;
+static void *ps_exec_thread(void *unused) {
+    (void)unused;
+    pf_touch(64);
+    char path[64], own[24], leader[24], start[24];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)syscall(SYS_gettid));
+    snprintf(own, sizeof own, "%ld", ps_field(path, 10));
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)getpid());
+    snprintf(leader, sizeof leader, "%ld", ps_field(path, 10));
+    snprintf(start, sizeof start, "%ld", ps_field("/proc/self/stat", 22));
+    char *arguments[] = {(char *)ps_self, "proc-stat-thread-exec", own, leader, start, NULL};
+    execv(ps_self, arguments);
+    _exit(71);
+}
+static int proc_stat_thread_exec(const char *own, const char *leader, const char *start) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)getpid());
+    long now = ps_field(path, 10);
+    printf("after thread exec: own-kept=%d not-leaders=%d start-is-leaders=%d\n", now >= atol(own),
+           now < atol(leader), ps_field("/proc/self/stat", 22) == atol(start));
+    return 0;
+}
+static int proc_stat_exec(const char *start, const char *faults) {
+    printf("after exec: start-kept=%d minflt-kept=%d\n",
+           ps_field("/proc/self/stat", 22) == atol(start),
+           ps_field("/proc/self/stat", 10) >= atol(faults));
+    return 0;
+}
+static int proc_stat_counts_case(const char *self) {
+    fflush(stdout);
+    pid_t measuring = fork();
+    if (measuring != 0) {
+        int status;
+        waitpid(measuring, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    printf("children at first: %ld\n", ps_field("/proc/self/stat", 11));
+    ps_process_start = ps_field("/proc/self/stat", 22);
+    printf("start: recent=%d\n", ps_recent(ps_process_start, ps_uptime()));
+
+    long rusage = pf_get(RUSAGE_SELF);
+    long before = ps_field("/proc/self/stat", 10);
+    long rss = ps_field("/proc/self/stat", 24);
+    char *kept = mmap(NULL, (size_t)(64 * page), PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (kept == MAP_FAILED) return 2;
+    for (long i = 0; i < 64; i++) kept[i * page] = 1;
+    long after = ps_field("/proc/self/stat", 10);
+    long grown = ps_field("/proc/self/stat", 24);
+    printf("touched: at-least-rusage=%d at-least-64=%d rss-was=%d rss-grew-64=%d\n", before >= rusage,
+           after - before >= 64, rss > 0, grown - rss >= 64);
+    munmap(kept, (size_t)(64 * page));
+    printf("unmapped: rss-fell=%d\n", ps_field("/proc/self/stat", 24) < grown);
+
+    pthread_t thread;
+    fflush(stdout);
+    if (pthread_create(&thread, NULL, ps_thread, NULL)) return 3;
+    pthread_join(thread, NULL);
+    long whole = ps_field("/proc/self/stat", 10);
+    printf("after thread: kept-its-faults=%d\n", whole - after >= 64);
+
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        long start = ps_field("/proc/self/stat", 22);
+        printf("child: start-after-parent=%d start-recent=%d\n", start >= ps_process_start,
+               ps_recent(start, ps_uptime()));
+        pf_touch(64);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    long children = ps_field("/proc/self/stat", 11);
+    printf("reaped: cminflt-is-rusage=%d at-least-64=%d\n", children == pf_get(RUSAGE_CHILDREN),
+           children >= 64);
+
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        char start[24], faults[24];
+        snprintf(start, sizeof start, "%ld", ps_field("/proc/self/stat", 22));
+        snprintf(faults, sizeof faults, "%ld", ps_field("/proc/self/stat", 10));
+        char *arguments[] = {(char *)self, "proc-stat-exec", start, faults, NULL};
+        execv(self, arguments);
+        _exit(71);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("exec child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    /* The leader faults far more than the thread that runs execve. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        pf_touch(4096);
+        ps_self = self;
+        pthread_t execing;
+        if (pthread_create(&execing, NULL, ps_exec_thread, NULL)) _exit(72);
+        pthread_join(execing, NULL);
+        _exit(73);
+    }
+    waitpid(child, &status, 0);
+    printf("thread exec child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    fflush(stdout);
+    _exit(0);
+}
+
 /* The fault-around case: a read fault in a file's mapping maps up to 16
    pages around it that the page cache holds (mm/memory.c do_fault_around,
    mm/filemap.c filemap_map_pages): within an aligned block of 16, the VMA,
@@ -8198,6 +8370,293 @@ static int io_uring_case(void) {
     return 0;
 }
 
+/* io_uring's file transfers, READ, WRITE, READV, WRITEV and FSYNC: an
+   offset or the file's position (-1), the errors of preparation and of
+   issue in Linux's order, and the inotify events a transfer gives, for no
+   bytes too. Nothing here waits: Linux would keep a read of an empty pipe
+   in flight. */
+static struct uring ut;
+
+static unsigned char *ut_entry(unsigned char opcode, int fd, long offset, const void *addr,
+                               unsigned len) {
+    unsigned char *sqe = uring_push(&ut, opcode, 1);
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 8, &offset, 8);
+    unsigned long a = (unsigned long)addr;
+    memcpy(sqe + 16, &a, 8);
+    memcpy(sqe + 24, &len, 4);
+    return sqe;
+}
+
+/* Submits the entry pushed last and prints its result and flags. */
+static void ut_run(const char *label) {
+    long r = uring_enter(ut.fd, 1, 1, 1, NULL, 0);
+    unsigned head = *u32p(ut.rings, 8);
+    unsigned tail = __atomic_load_n(u32p(ut.rings, 12), __ATOMIC_ACQUIRE);
+    printf("%s: enter=%ld", label, r);
+    for (; head != tail; head++) {
+        unsigned char *cqe = ut.rings + 64 + 16 * (head & (ut.cq_entries - 1));
+        int res;
+        unsigned flags;
+        memcpy(&res, cqe + 8, 4);
+        memcpy(&flags, cqe + 12, 4);
+        printf(" res=%d flags=%u", res, flags);
+    }
+    printf("\n");
+    __atomic_store_n(u32p(ut.rings, 8), head, __ATOMIC_RELEASE);
+}
+
+static void ut_events(int ifd, const char *label) {
+    char buf[256];
+    long n = read(ifd, buf, sizeof buf);
+    printf("%s:", label);
+    for (long at = 0; at + 16 <= n;) {
+        unsigned mask, len;
+        memcpy(&mask, buf + at + 4, 4);
+        memcpy(&len, buf + at + 12, 4);
+        printf(" %#x", mask);
+        at += 16 + len;
+    }
+    printf("\n");
+}
+
+static int io_uring_transfers_case(void) {
+    char dir[] = "/tmp/io-uring-transfers-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    if (uring_open(&ut, 8)) return 81;
+    int fd = open("file", O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || write(fd, "hello world", 11) != 11) return 82;
+    char got[64];
+    memset(got, 0, sizeof got);
+
+    /* At an offset the position stays; at -1 it moves. */
+    ut_entry(23, fd, 0, "HE", 2);
+    ut_run("write-at-0");
+    printf("position: %ld\n", (long)lseek(fd, 0, SEEK_CUR));
+    ut_entry(22, fd, 0, got, 5);
+    ut_run("read-at-0");
+    printf("read: %.5s\n", got);
+    lseek(fd, 6, SEEK_SET);
+    ut_entry(22, fd, -1, got, sizeof got);
+    ut_run("read-here");
+    printf("read: %.5s position: %ld\n", got, (long)lseek(fd, 0, SEEK_CUR));
+    struct iovec iov[2] = {{"!", 1}, {"?", 1}};
+    ut_entry(2, fd, -1, iov, 2);
+    ut_run("writev-here");
+    printf("position: %ld\n", (long)lseek(fd, 0, SEEK_CUR));
+    struct iovec back[2] = {{got, 1}, {got + 1, 1}};
+    ut_entry(1, fd, 11, back, 2);
+    ut_run("readv-at-11");
+    printf("readv: %.2s\n", got);
+    ut_entry(22, fd, 100, got, 5);
+    ut_run("read-past-end");
+    ut_entry(22, fd, -2, got, 5);
+    ut_run("read-negative");
+    ut_entry(22, fd, 0, got, 0);
+    ut_run("read-nothing");
+
+    /* An O_APPEND file's write at -1 starts at the end. */
+    int append = open("append", O_RDWR | O_CREAT | O_APPEND, 0600);
+    if (append < 0 || write(append, "ab", 2) != 2) return 83;
+    lseek(append, 0, SEEK_SET);
+    ut_entry(23, append, -1, "cd", 2);
+    ut_run("append-here");
+    printf("position: %ld\n", (long)lseek(append, 0, SEEK_CUR));
+    ut_entry(23, append, 0, "ef", 2);
+    ut_run("append-at-0");
+    printf("size: %ld\n", (long)lseek(append, 0, SEEK_END));
+
+    /* FSYNC, whose only flag is IORING_FSYNC_DATASYNC. */
+    ut_entry(3, fd, 0, NULL, 0);
+    ut_run("fsync");
+    unsigned char *sqe = ut_entry(3, fd, 0, NULL, 0);
+    sqe[28] = 1;
+    ut_run("fdatasync");
+    sqe = ut_entry(3, fd, 0, NULL, 0);
+    sqe[28] = 2;
+    ut_run("fsync-flag");
+    ut_entry(3, fd, 0, got, 0);
+    ut_run("fsync-addr");
+    sqe = ut_entry(3, fd, 0, NULL, 0);
+    sqe[2] = 1;
+    ut_run("fsync-ioprio");
+
+    /* The file at issue: none, a registered one, the access mode. */
+    int wronly = open("file", O_WRONLY);
+    ut_entry(22, 999, 0, got, 1);
+    ut_run("read-badf");
+    sqe = ut_entry(22, fd, 0, got, 1);
+    sqe[1] = 1;
+    ut_run("read-fixed-file");
+    ut_entry(22, wronly, 0, got, 1);
+    ut_run("read-wronly");
+    /* No buffer is provided, which a read finds before its access mode; a
+       write selects none. */
+    sqe = ut_entry(22, wronly, 0, NULL, 1);
+    sqe[1] = 1 << 5;
+    ut_run("read-select");
+    sqe = ut_entry(1, fd, 0, iov, 2);
+    sqe[1] = 1 << 5;
+    ut_run("readv-select-two");
+    sqe = ut_entry(23, fd, 0, NULL, 1);
+    sqe[1] = 1 << 5;
+    ut_run("write-select");
+    /* The flags, then the preparation. */
+    sqe = ut_entry(23, fd, 0, "x", 1);
+    *u32p(sqe, 28) = 0x200;
+    ut_run("write-unknown-flag");
+    sqe = ut_entry(23, fd, 0, "x", 1);
+    *u32p(sqe, 28) = 1;
+    ut_run("write-hipri");
+    ut_entry(23, fd, 0, (void *)(1UL << 63), 1);
+    ut_run("write-kernel-buffer");
+    ut_entry(2, fd, 0, (void *)8, 1);
+    ut_run("writev-bad-vector");
+    ut_entry(2, fd, 0, iov, 1025);
+    ut_run("writev-too-many");
+    sqe = ut_entry(23, fd, 0, "x", 1);
+    sqe[3] = 7 << 5;
+    ut_run("write-bad-ioprio");
+    /* A directory reads EISDIR. (An epoll instance or a ring would wait
+       on Linux until it is ready, then fail.) */
+    int dfd = open(".", O_RDONLY | O_DIRECTORY);
+    ut_entry(22, dfd, 0, got, 1);
+    ut_run("read-directory");
+
+    /* A pipe with something in it, at any offset. */
+    int ends[2];
+    if (pipe(ends)) return 84;
+    ut_entry(23, ends[1], 5, "pipe", 4);
+    ut_run("pipe-write");
+    memset(got, 0, sizeof got);
+    ut_entry(22, ends[0], -1, got, sizeof got);
+    ut_run("pipe-read");
+    printf("pipe: %s\n", got);
+
+    /* inotify: IN_ACCESS for a read that did not fail, IN_MODIFY for a
+       write, no bytes too. */
+    int ifd = (int)syscall(294, 04000);
+    if (ifd < 0 || syscall(254, ifd, "file", 3) < 0) return 85;
+    ut_entry(22, fd, 0, got, 0);
+    ut_run("watched-read-nothing");
+    ut_entry(22, fd, -2, got, 1);
+    ut_run("watched-read-negative");
+    ut_entry(23, fd, 0, "x", 0);
+    ut_run("watched-write-nothing");
+    /* A write the file itself refuses (EFBIG past RLIMIT_FSIZE, with
+       SIGXFSZ ignored) still gives IN_MODIFY. */
+    struct rlimit fsize;
+    if (getrlimit(RLIMIT_FSIZE, &fsize)) return 86;
+    struct rlimit small = {50, fsize.rlim_max};
+    signal(SIGXFSZ, SIG_IGN);
+    if (setrlimit(RLIMIT_FSIZE, &small)) return 86;
+    ut_entry(23, fd, 100, "x", 1);
+    ut_run("watched-write-too-big");
+    if (setrlimit(RLIMIT_FSIZE, &fsize)) return 86;
+    signal(SIGXFSZ, SIG_DFL);
+    ut_events(ifd, "events");
+
+    /* Registered buffers: IORING_REGISTER_BUFFERS's checks, then
+       READ_FIXED and WRITE_FIXED within a buffer. */
+    char *page = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED || munmap(page + 2 * 4096, 4096) ||
+        mprotect(page + 4096, 4096, PROT_READ))
+        return 88;
+    int ffd = open("fixed", O_RDWR | O_CREAT, 0600);
+    if (ffd < 0) return 89;
+    sqe = ut_entry(4, ffd, 0, page, 1);
+    ut_run("read-fixed-unregistered");
+    uring_show("unregister-none", syscall(427, ut.fd, 1, NULL, 0));
+    struct iovec bufs[2];
+    uring_show("register-null", syscall(427, ut.fd, 0, NULL, 1));
+    uring_show("register-zero", syscall(427, ut.fd, 0, bufs, 0));
+    uring_show("register-too-many", syscall(427, ut.fd, 0, bufs, 16385));
+    struct {
+        const char *label;
+        void *base;
+        size_t len;
+    } bad[] = {
+        {"register-null-base", NULL, 1},
+        {"register-no-length", page, 0},
+        {"register-huge", page, (1UL << 30) + 1},
+        {"register-negative", page, (size_t)-1},
+        {"register-wraps", (void *)-4096L, 4096},
+        {"register-read-only", page + 4096, 4096},
+        {"register-unmapped", page + 2 * 4096, 4096},
+    };
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+        bufs[0] = (struct iovec){bad[i].base, bad[i].len};
+        uring_show(bad[i].label, syscall(427, ut.fd, 0, bufs, 1));
+    }
+    bufs[0] = (struct iovec){page, 4096};
+    bufs[1] = (struct iovec){page + 2 * 4096, 1};
+    uring_show("register-second-bad", syscall(427, ut.fd, 0, bufs, 2));
+    uring_show("unregister-after-failure", syscall(427, ut.fd, 1, NULL, 0));
+    bufs[1] = (struct iovec){NULL, 0};
+    uring_show("register", syscall(427, ut.fd, 0, bufs, 2));
+    uring_show("register-again", syscall(427, ut.fd, 0, bufs, 2));
+    memcpy(page + 16, "fixed", 5);
+    ut_entry(5, ffd, 0, page + 16, 5);
+    ut_run("write-fixed");
+    ut_entry(4, ffd, 1, page + 128, 4);
+    ut_run("read-fixed");
+    printf("read-fixed: %.4s\n", page + 128);
+    struct {
+        const char *label;
+        char *addr;
+        unsigned len;
+        unsigned short index;
+    } outside[] = {
+        {"fixed-before", page - 1, 1, 0},
+        {"fixed-past-end", page + 4095, 2, 0},
+        {"fixed-too-long", page, 4097, 0},
+        {"fixed-empty-slot", page, 1, 1},
+        {"fixed-no-slot", page, 1, 2},
+    };
+    for (unsigned i = 0; i < sizeof outside / sizeof *outside; i++) {
+        sqe = ut_entry(4, ffd, 0, outside[i].addr, outside[i].len);
+        memcpy(sqe + 40, &outside[i].index, 2);
+        ut_run(outside[i].label);
+    }
+    sqe = ut_entry(4, 999, 0, page, 1);
+    sqe[40] = 5;
+    ut_run("fixed-badf-first");
+    sqe = ut_entry(4, ffd, 0, page, 1);
+    sqe[1] = 1 << 5;
+    ut_run("fixed-select");
+    uring_show("unregister-arg", syscall(427, ut.fd, 1, bufs, 0));
+    uring_show("unregister-count", syscall(427, ut.fd, 1, NULL, 1));
+    uring_show("unregister", syscall(427, ut.fd, 1, NULL, 0));
+    uring_show("unregister-again", syscall(427, ut.fd, 1, NULL, 0));
+    ut_entry(4, ffd, 1, page + 128, 4);
+    ut_run("read-fixed-gone");
+    close(ffd);
+    unlink("fixed");
+    munmap(page, 2 * 4096);
+
+    /* The probe says which operations run. */
+    unsigned char probe[16 + 8 * 64];
+    memset(probe, 0, sizeof probe);
+    syscall(427, ut.fd, 8, probe, 64);
+    printf("probe:");
+    const int ops[] = {1, 2, 3, 4, 5, 22, 23};
+    for (unsigned i = 0; i < sizeof ops / sizeof *ops; i++)
+        printf(" %d=%d", ops[i], probe[16 + 8 * ops[i] + 2] & 1);
+    printf("\n");
+    close(ifd);
+    close(ends[0]);
+    close(ends[1]);
+    close(dfd);
+    close(wronly);
+    close(append);
+    close(fd);
+    unlink("file");
+    unlink("append");
+    if (chdir("/")) return 87;
+    rmdir(dir);
+    return 0;
+}
+
 /* mprotect's checks in Linux's order, and the grows flags: the main stack
    grows down (as a MAP_GROWSDOWN mapping does, see grows_down_case), and
    nothing grows up on x86-64. */
@@ -8314,6 +8773,95 @@ static int madvise_advice_case(void) {
     r = advice_errno(madvise(p + 2 * page, page, 24));
     int status = advice_status(p + 2 * page);
     printf("dontneed-locked=%ld status=%d bytes=%d\n", r, status, p[2 * page]);
+    /* MADV_HWPOISON (100) and MADV_SOFT_OFFLINE (101) check the range's
+     * arguments, then CAP_SYS_ADMIN (EPERM), before the address limit or any
+     * mapping. In a child without root's capabilities: with them Linux
+     * would poison the host's own memory. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 83;
+    if (!child) {
+        if (geteuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(90);
+        for (int advice = 100; advice <= 101; advice++) {
+            long unaligned = advice_errno(madvise(p + 1, page, advice));
+            long wraps = advice_errno(syscall(SYS_madvise, p, -1L, advice));
+            long past = advice_errno(syscall(SYS_madvise, -4096L, 2 * page, advice));
+            long empty = advice_errno(madvise(p, 0, advice));
+            long mapped = advice_errno(madvise(p, page, advice));
+            long hole = advice_errno(madvise(gap + page, page, advice));
+            long beyond = advice_errno(syscall(SYS_madvise, 1L << 56, page, advice));
+            printf("memory-failure %d: unaligned=%ld wraps=%ld past=%ld empty=%ld mapped=%ld "
+                   "hole=%ld beyond=%ld byte=%d\n",
+                   advice, unaligned, wraps, past, empty, mapped, hole, beyond, p[3 * page]);
+        }
+        fflush(stdout);
+        _exit(0);
+    }
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child) return 84;
+    printf("memory-failure child=%d\n", WIFEXITED(child_status) ? WEXITSTATUS(child_status) : -1);
+    return 0;
+}
+/* MADV_COLLAPSE (25) of private anonymous memory: refused (EINVAL) by a VMA
+ * no page of which was written, with MADV_NOHUGEPAGE or too small for an
+ * aligned 2 MiB extent; nothing to do for a range with no whole extent;
+ * EINVAL for an extent no page of which was touched (no page table); and
+ * otherwise the extent collapses into a huge page that holds every page of
+ * it, which mincore then shows resident. A hole is ENOMEM once the walk is
+ * done; a userfaultfd-registered range wants every page (EBUSY). */
+static int collapse_resident(char *at) {
+    unsigned char vec[512];
+    if (mincore(at, 2 << 20, vec)) return -errno;
+    int resident = 0;
+    for (int i = 0; i < 512; i++) resident += vec[i] & 1;
+    return resident;
+}
+static int madvise_collapse_case(void) {
+    long page = 4096, huge = 2 << 20;
+    char *map = mmap(NULL, 9 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return 80;
+    /* Four aligned extents, and no mapping right after them. */
+    char *base = (char *)(((unsigned long)map + huge - 1) & ~(huge - 1));
+    char *end = base + 4 * huge;
+    if (base > map) munmap(map, base - map);
+    munmap(end, map + 9 * huge - end);
+    printf("unwritten=%ld\n", advice_errno(madvise(base, huge, 25)));
+    base[huge + 5] = 9;
+    long partial = advice_errno(madvise(base + page, huge, 25));
+    printf("no-whole-extent=%ld resident=%d\n", partial, collapse_resident(base));
+    /* The second extent was written, the third only read. */
+    volatile char sink = base[2 * huge];
+    (void)sink;
+    long three = advice_errno(madvise(base, 3 * huge, 25));
+    printf("three=%ld resident=%d %d %d byte=%d\n", three, collapse_resident(base),
+           collapse_resident(base + huge), collapse_resident(base + 2 * huge), base[huge + 5]);
+    printf("again=%ld\n", advice_errno(madvise(base + huge, 2 * huge, 25)));
+    long hole = advice_errno(madvise(end - page, 2 * page, 25));
+    printf("hole=%ld\n", hole);
+    /* MADV_NOHUGEPAGE refuses the VMA it splits off. */
+    long nohuge = advice_errno(madvise(base + 3 * huge, huge, MADV_NOHUGEPAGE));
+    base[3 * huge] = 1;
+    printf("nohugepage=%ld collapse=%ld\n", nohuge, advice_errno(madvise(base + 3 * huge, huge, 25)));
+    char *small = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (small == MAP_FAILED) return 81;
+    small[0] = 1;
+    printf("small=%ld\n", advice_errno(madvise(small, page, 25)));
+    /* A range a userfaultfd is registered for may have no empty page: the
+     * first extent has a page table now, and 511 empty pages. */
+    base[0] = 1;
+    long uffd = syscall(SYS_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
+    if (uffd < 0) {
+        printf("userfaultfd=%d\n", -errno);
+        return 0;
+    }
+    unsigned long long api[3] = {0xAA, 0, 0};
+    unsigned long long reg[4] = {(unsigned long)base, (unsigned long)huge, 1, 0};
+    if (ioctl((int)uffd, 0xC018AA3F, api) || ioctl((int)uffd, 0xC020AA00, reg)) return 82;
+    long registered = advice_errno(madvise(base, huge, 25));
+    printf("registered=%ld resident=%d\n", registered, collapse_resident(base));
+    close((int)uffd);
     return 0;
 }
 /* The VMAs of [start, end) /proc/self/maps lists. It allocates nothing, so
@@ -13148,6 +13696,135 @@ static int proc_at_read_case(const char *self) {
     printf("status=%d\n", reaped(kid));
     par_show("reaped", fds);
     for (int i = 0; i < 5; i++) close(fds[i]);
+    return 0;
+}
+
+/* The proc-stat-counters case: /proc/stat's lines have show_stat's shape
+   (ten times on the cpu line and each online CPU's, intr's total, ctxt,
+   processes, procs_running, procs_blocked, softirq's total and ten kinds),
+   and its counters only grow: the cumulative CPU times (all but idle and
+   iowait, which Linux may show going back), intr, ctxt, processes and the
+   softirqs. A reaped child's CPU time stays counted, sleeps count as
+   context switches and a fork as a process. The values themselves differ
+   from Linux's, so only whether each holds is printed. */
+#define PSC_LINES 1024
+struct psc_stat {
+    int shape;      /* every line as show_stat prints it, in its order */
+    int cpu_lines;  /* the cpuN lines, numbered from 0 */
+    unsigned long long total[10], per_cpu[PSC_LINES][10];
+    unsigned long long intr, ctxt, processes, running, blocked, softirq[11];
+};
+
+static int psc_numbers(char *text, unsigned long long *values, int most) {
+    int count = 0;
+    for (char *t = strtok(text, " "); t; t = strtok(NULL, " ")) {
+        char *end;
+        unsigned long long value = strtoull(t, &end, 10);
+        if (*end || count == most) return -1;
+        values[count++] = value;
+    }
+    return count;
+}
+
+static int psc_read(struct psc_stat *stat) {
+    static char buffer[1 << 16];
+    memset(stat, 0, sizeof *stat);
+    long n = proc_read("/proc/stat", buffer, sizeof buffer - 1);
+    if (n <= 0) return -1;
+    buffer[n] = 0;
+    const char *keys[] = {"intr ", "ctxt ", "btime ", "processes ", "procs_running ", "procs_blocked ", "softirq "};
+    int order = 0, shape = !strncmp(buffer, "cpu  ", 5);
+    for (char *line = buffer, *end; *line; line = end + 1) {
+        if (!(end = strchr(line, '\n'))) return -1;
+        *end = 0;
+        unsigned long long values[16];
+        if (!strncmp(line, "cpu  ", 5)) {
+            shape &= order == 0 && stat->cpu_lines == 0 && psc_numbers(line + 5, stat->total, 10) == 10;
+        } else if (!strncmp(line, "cpu", 3)) {
+            char *space = strchr(line, ' ');
+            int cpu = atoi(line + 3);
+            shape &= order == 0 && space && cpu == stat->cpu_lines && cpu < PSC_LINES &&
+                     psc_numbers(space + 1, stat->per_cpu[cpu < PSC_LINES ? cpu : 0], 10) == 10;
+            stat->cpu_lines++;
+        } else if (order < 7 && !strncmp(line, keys[order], strlen(keys[order]))) {
+            char *rest = line + strlen(keys[order]);
+            int count;
+            if (order == 0) {
+                /* The total, then a count for each interrupt. */
+                count = 0;
+                char *t = strtok(rest, " ");
+                char *end2;
+                stat->intr = t ? strtoull(t, &end2, 10) : 0;
+                shape &= t && !*end2;
+                for (; t; t = strtok(NULL, " ")) count++;
+                shape &= count >= 1;
+            } else if (order == 6) {
+                shape &= psc_numbers(rest, stat->softirq, 11) == 11;
+            } else {
+                shape &= psc_numbers(rest, values, 1) == 1;
+                unsigned long long *slots[] = {NULL, &stat->ctxt, NULL, &stat->processes, &stat->running,
+                                               &stat->blocked};
+                if (slots[order]) *slots[order] = values[0];
+            }
+            order++;
+        }
+    }
+    stat->shape = shape && order == 7;
+    return 0;
+}
+
+static int psc_grew(const unsigned long long *before, const unsigned long long *after, int count, int skip_idle) {
+    for (int i = 0; i < count; i++)
+        if (!(skip_idle && (i == 3 || i == 4)) && after[i] < before[i]) return 0;
+    return 1;
+}
+
+static int proc_stat_counters_case(void) {
+    static struct psc_stat before, after;
+    if (psc_read(&before)) {
+        printf("proc-stat read failed\n");
+        return 1;
+    }
+    /* A child burns 300 ms of CPU time and is reaped. */
+    pid_t child = fork();
+    if (child == 0) {
+        struct timespec start, now;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+        volatile unsigned long spin = 0;
+        do {
+            for (int i = 0; i < 100000; i++) spin++;
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now);
+        } while ((now.tv_sec - start.tv_sec) * 1000000000LL + (now.tv_nsec - start.tv_nsec) < 300000000LL);
+        _exit(0);
+    }
+    int status = -1;
+    waitpid(child, &status, 0);
+    /* 20 sleeps, each a context switch. */
+    for (int i = 0; i < 20; i++) nanosleep(&(struct timespec){0, 1000000}, NULL);
+    if (psc_read(&after)) {
+        printf("proc-stat read failed\n");
+        return 1;
+    }
+    cpu_set_t online;
+    int cpus = sched_getaffinity(0, sizeof online, &online) ? -1 : CPU_COUNT(&online);
+    int lines = after.cpu_lines < PSC_LINES ? after.cpu_lines : PSC_LINES;
+    int per_cpu = before.cpu_lines == after.cpu_lines;
+    unsigned long long lines_before = 0, lines_after = 0;
+    for (int cpu = 0; cpu < lines; cpu++) {
+        per_cpu &= psc_grew(before.per_cpu[cpu], after.per_cpu[cpu], 10, 1);
+        lines_before += before.per_cpu[cpu][0];
+        lines_after += after.per_cpu[cpu][0];
+    }
+    printf("proc-stat shape=%d/%d per-cpu-lines=%d child=%d\n", before.shape, after.shape,
+           after.cpu_lines == cpus, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("proc-stat never-back total=%d per-cpu=%d intr=%d ctxt=%d processes=%d softirq=%d\n",
+           psc_grew(before.total, after.total, 10, 1), per_cpu, after.intr >= before.intr,
+           after.ctxt >= before.ctxt, after.processes >= before.processes,
+           psc_grew(before.softirq, after.softirq, 11, 0));
+    printf("proc-stat counted user>=20=%d lines-user>=20=%d ctxt>=20=%d processes>=1=%d\n",
+           after.total[0] - before.total[0] >= 20, lines_after - lines_before >= 20,
+           after.ctxt - before.ctxt >= 20, after.processes - before.processes >= 1);
+    printf("proc-stat tasks running>=1=%d\n", after.running >= 1);
     return 0;
 }
 
@@ -33417,6 +34094,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "memfd-secret-memlock")) return memfd_secret_memlock_case();
     if (!strcmp(mode, "mlock-private-copy")) return mlock_private_copy_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
+    if (!strcmp(mode, "madvise-collapse")) return madvise_collapse_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
@@ -33482,6 +34160,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-at-read")) return proc_at_read_case(self);
     if (!strcmp(mode, "proc-own-at-read")) return proc_own_at_read_case(argv);
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
+    if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
@@ -33503,6 +34182,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();
+    if (!strcmp(mode, "io-uring-transfers")) return io_uring_transfers_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;
@@ -33932,6 +34612,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "sigsuspend-stop")) return sigsuspend_stop_case();
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "page-faults-exec")) return argc < 3 ? 98 : page_faults_exec(argv[2]);
+    if (!strcmp(mode, "proc-stat-counts")) return proc_stat_counts_case(self);
+    if (!strcmp(mode, "proc-stat-exec")) return argc < 4 ? 98 : proc_stat_exec(argv[2], argv[3]);
+    if (!strcmp(mode, "proc-stat-thread-exec"))
+        return argc < 5 ? 98 : proc_stat_thread_exec(argv[2], argv[3], argv[4]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

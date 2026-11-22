@@ -92,11 +92,15 @@ pub(crate) struct Conf4 {
 }
 
 /// A device's IPv6 settings, or those of `all` or `default`
-/// (`struct ipv6_devconf`), as Linux is built: all 0.
+/// (`struct ipv6_devconf`), as Linux is built: all 0 but `accept_dad`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Conf6 {
     pub forwarding: i32,
     pub disable_ipv6: i32,
+    /// `DEVCONF_ACCEPT_DAD`: `default`'s 1, `all`'s 0, and the loopback's
+    /// -1 (`ipv6_add_dev`). An address of a device is checked for
+    /// duplicates unless both its and `all`'s are below 1.
+    pub accept_dad: i32,
 }
 
 /// One network device.
@@ -121,7 +125,10 @@ impl Device {
             name: b"lo".to_vec(),
             kind: DeviceKind::Loopback,
             conf4: Conf4::default(),
-            conf6: Conf6::default(),
+            conf6: Conf6 {
+                accept_dad: -1,
+                ..Conf6::default()
+            },
             veth: None,
         }
     }
@@ -193,7 +200,10 @@ impl Devices {
             all4: Conf4::default(),
             default4: Conf4::default(),
             all6: Conf6::default(),
-            default6: Conf6::default(),
+            default6: Conf6 {
+                accept_dad: 1,
+                ..Conf6::default()
+            },
         }
     }
     /// The device of `index` (`__dev_get_by_index`), if any.

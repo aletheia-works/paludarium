@@ -26,6 +26,11 @@
 //! The context's fields that a socket filter may read are those of an
 //! AF_UNIX datagram's `sk_buff`: its length, and 0 for the rest, which such
 //! a packet does not set; `cb[]` starts at 0 (`bpf_prog_run_save_cb`).
+//!
+//! It runs classic filters too, as [`crate::bpf_classic`] converts them,
+//! which read what the verifier keeps from eBPF programs: the packet's
+//! linear part, the fields after the context ([`classic::field`]), and
+//! Linux's internal helpers ([`classic`]).
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -36,6 +41,9 @@ use crate::bpf_verifier::Insn;
 
 /// `sizeof(struct __sk_buff)`.
 pub(crate) const CONTEXT_SIZE: usize = 192;
+/// The context with the `sk_buff` fields after it that only converted
+/// classic programs read.
+const CONTEXT_WITH_TAIL: usize = CONTEXT_SIZE + 24;
 /// `offsetof(struct __sk_buff, cb)` and its end.
 const CB: std::ops::Range<usize> = 48..68;
 /// `MAX_BPF_STACK`.
@@ -53,6 +61,9 @@ const VALUES: u64 = MAPS + 64;
 /// The regions an address can name: the bits between the top byte and the
 /// offset.
 const REGIONS: u64 = 1 << 24;
+/// The packet's linear part (`skb->data`), the last region, which only
+/// converted classic programs read.
+const PACKET: u64 = REGIONS - 1;
 
 const fn address(region: u64, offset: u64) -> u64 {
     SPACE | region << 32 | offset
@@ -83,6 +94,45 @@ mod func {
     pub const KTIME_GET_COARSE_NS: i32 = 160;
     pub const KTIME_GET_TAI_NS: i32 = 208;
 }
+
+/// What a classic program converts to and eBPF programs never reach.
+pub(crate) mod classic {
+    /// Linux's internal helpers of converted programs, by numbers no
+    /// helper of `enum bpf_func_id` has: `bpf_skb_load_helper_8`, `_16`
+    /// and `_32`, `bpf_skb_get_pay_offset`, `bpf_skb_get_nlattr`, its
+    /// `_nest`, `bpf_get_raw_cpu_id` and `bpf_user_rnd_u32`.
+    pub const LOAD_BYTE: i32 = -1;
+    pub const LOAD_HALF: i32 = -2;
+    pub const LOAD_WORD: i32 = -3;
+    pub const PAY_OFFSET: i32 = -4;
+    pub const NLATTR: i32 = -5;
+    pub const NLATTR_NEST: i32 = -6;
+    pub const CPU: i32 = -7;
+    pub const RANDOM: i32 = -8;
+
+    /// Where the `sk_buff` fields a converted program reads are: those
+    /// `struct __sk_buff` has, at its offsets, and after it the data's
+    /// address, `data_len` and `dev`.
+    pub mod field {
+        pub const LEN: i16 = 0;
+        pub const PKT_TYPE: i16 = 4;
+        pub const MARK: i16 = 8;
+        pub const QUEUE_MAPPING: i16 = 12;
+        pub const PROTOCOL: i16 = 16;
+        pub const VLAN_ALL: i16 = 20;
+        pub const VLAN_TCI: i16 = 24;
+        pub const VLAN_PROTO: i16 = 28;
+        pub const HASH: i16 = 68;
+        pub const DATA: i16 = 192;
+        pub const DATA_LEN: i16 = 200;
+        pub const DEV: i16 = 208;
+    }
+}
+
+/// `SKF_NET_OFF`, where a classic load's negative offsets from the network
+/// header start, and `SKF_LL_OFF`, from the MAC header, which an AF_UNIX
+/// message has not set.
+const NET_OFF: i32 = -0x10_0000;
 
 /// The clocks the `bpf_ktime_get_*` helpers read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +175,13 @@ pub(crate) struct Packet<'a> {
     pub(crate) linear: usize,
 }
 
+impl<'a> Packet<'a> {
+    /// The linear part.
+    fn head(&self) -> &'a [u8] {
+        &self.data[..self.linear.min(self.data.len())]
+    }
+}
+
 /// A verified program, with what the verifier resolved: the maps it uses
 /// and, for each `BPF_LD_IMM64` of a map, the map's index among them and
 /// the offset in a `BPF_PSEUDO_MAP_VALUE`'s value.
@@ -140,7 +197,7 @@ struct Machine<'a, 'k> {
     kernel: &'k mut dyn Kernel,
     regs: [u64; 11],
     stack: [u8; STACK_SIZE],
-    context: [u8; CONTEXT_SIZE],
+    context: [u8; CONTEXT_WITH_TAIL],
     values: Vec<ValueRef>,
 }
 
@@ -151,9 +208,15 @@ pub(crate) fn run(
     packet: &Packet<'_>,
     kernel: &mut dyn Kernel,
 ) -> Result<u64, Fault> {
-    let mut context = [0; CONTEXT_SIZE];
+    let mut context = [0; CONTEXT_WITH_TAIL];
     let len = u32::try_from(packet.data.len()).map_err(|_| Fault)?;
     context[0..4].copy_from_slice(&len.to_le_bytes());
+    let data = address(PACKET, 0).to_le_bytes();
+    let at = classic::field::DATA as usize;
+    context[at..at + 8].copy_from_slice(&data);
+    let paged = (packet.data.len() - packet.linear.min(packet.data.len())) as u32;
+    let at = classic::field::DATA_LEN as usize;
+    context[at..at + 4].copy_from_slice(&paged.to_le_bytes());
     let mut m = Machine {
         program,
         packet,
@@ -411,7 +474,7 @@ impl Machine<'_, '_> {
             }
         };
         let region = VALUES + i as u64;
-        if region >= REGIONS {
+        if region >= PACKET {
             return Err(Fault);
         }
         Ok(address(region, offset))
@@ -434,6 +497,7 @@ impl Machine<'_, '_> {
         match region {
             STACK => out.copy_from_slice(self.stack.get(offset..end).ok_or(Fault)?),
             CONTEXT => out.copy_from_slice(self.context.get(offset..end).ok_or(Fault)?),
+            PACKET => out.copy_from_slice(self.packet.head().get(offset..end).ok_or(Fault)?),
             r if r >= VALUES => {
                 let value = self.values.get((r - VALUES) as usize).ok_or(Fault)?;
                 value.read(offset, out).map_err(|_| Fault)?;
@@ -457,7 +521,7 @@ impl Machine<'_, '_> {
             CONTEXT if offset >= CB.start && end <= CB.end => {
                 self.context[offset..end].copy_from_slice(bytes)
             }
-            r if r >= VALUES => {
+            r if (VALUES..PACKET).contains(&r) => {
                 let value = self.values.get((r - VALUES) as usize).ok_or(Fault)?;
                 value.write(offset, bytes).map_err(|_| Fault)?;
             }
@@ -558,7 +622,7 @@ impl Machine<'_, '_> {
             func::SKB_LOAD_BYTES_RELATIVE => {
                 self.context_arg()?;
                 let (offset, len) = (r2 as u32, r4 as u32 as usize);
-                let linear = &self.packet.data[..self.packet.linear.min(self.packet.data.len())];
+                let linear = self.packet.head();
                 // No MAC header is set; the network header is where the
                 // data starts; anything else is EFAULT.
                 let bytes = (offset <= 0xffff && r5 as u32 == 1)
@@ -566,8 +630,83 @@ impl Machine<'_, '_> {
                     .flatten();
                 self.give(r3, len, bytes)?
             }
+            classic::LOAD_BYTE | classic::LOAD_HALF | classic::LOAD_WORD => {
+                self.context_arg()?;
+                let size = match id {
+                    classic::LOAD_BYTE => 1,
+                    classic::LOAD_HALF => 2,
+                    _ => 4,
+                };
+                self.load(r4 as i32, size)
+            }
+            classic::NLATTR | classic::NLATTR_NEST => {
+                self.context_arg()?;
+                self.nlattr(r2 as u32, r3 as u32, id == classic::NLATTR_NEST)
+            }
+            // The flow dissector knows no AF_UNIX message's protocol.
+            classic::PAY_OFFSET => {
+                self.context_arg()?;
+                0
+            }
+            classic::CPU => u64::from(self.kernel.processor()),
+            classic::RANDOM => u64::from(self.kernel.random()),
             _ => return Err(Fault),
         })
+    }
+
+    /// `bpf_skb_load_helper_8`, `_16` and `_32`: the packet's `size` bytes
+    /// at `offset`, big-endian, where a negative one is from the network
+    /// header (the data's start, `SKF_NET_OFF`) or the MAC header (not set,
+    /// `SKF_LL_OFF`); `-EFAULT` past the end, or for no header.
+    fn load(&self, offset: i32, size: usize) -> u64 {
+        let offset = match offset {
+            o if o >= 0 => Some(o),
+            o if o >= NET_OFF => Some(o - NET_OFF),
+            _ => None,
+        };
+        let bytes = offset.and_then(|o| {
+            let o = o as usize;
+            self.packet.data.get(o..o.checked_add(size)?)
+        });
+        match bytes {
+            Some(b) => b.iter().fold(0, |v, &b| v << 8 | u64::from(b)),
+            None => (-i64::from(Errno::EFAULT.0)) as u64,
+        }
+    }
+
+    /// `bpf_skb_get_nlattr` and `bpf_skb_get_nlattr_nest`: the offset of
+    /// the first netlink attribute of type `x` at `a` on, or among those
+    /// nested in the attribute at `a`; 0 for none, or for a packet in pages.
+    fn nlattr(&self, a: u32, x: u32, nested: bool) -> u64 {
+        let data = self.packet.data;
+        if self.packet.linear < data.len() || data.len() < 4 || a as usize > data.len() - 4 {
+            return 0;
+        }
+        let a = a as usize;
+        let length = |at: usize| usize::from(u16::from_le_bytes([data[at], data[at + 1]]));
+        // nla_ok: room for a header, and a length from it to what remains.
+        let ok = |at: usize, remaining: isize| {
+            remaining >= 4 && length(at) >= 4 && length(at) as isize <= remaining
+        };
+        let (mut at, mut remaining) = (a, (data.len() - a) as isize);
+        if nested {
+            if !ok(at, remaining) {
+                return 0;
+            }
+            remaining = length(at) as isize - 4;
+            at += 4;
+        }
+        // nla_find, with nla_type's mask of the nested and byte-order flags.
+        while ok(at, remaining) {
+            let kind = u16::from_le_bytes([data[at + 2], data[at + 3]]) & 0x3fff;
+            if i32::from(kind) == x as i32 {
+                return at as u64;
+            }
+            let total = length(at).next_multiple_of(4);
+            remaining -= total as isize;
+            at += total;
+        }
+        0
     }
 
     /// The end of `bpf_skb_load_bytes`: the bytes at `to`, or `len` zeros
@@ -647,10 +786,11 @@ fn truncate(v: u64, imm: i32) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    struct Quiet;
+    /// A kernel of fixed answers, which the classic filters' tests use too.
+    pub(crate) struct Quiet;
 
     impl Kernel for Quiet {
         fn clock(&mut self, clock: Clock) -> u64 {

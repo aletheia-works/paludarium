@@ -7026,3 +7026,72 @@ fn a_child_starts_with_the_entry_of_the_call_that_made_it() {
     assert_eq!(entry.number, 57);
     assert_eq!(entry, k.inbox.entry());
 }
+mod mount_namespace_end {
+    use super::*;
+    type Process = (Box<Kernel>, Thread, Arc<AddressSpace>);
+    fn spawn(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> Process {
+        let number = syscall(k, t, m, 57, [0; 6]);
+        assert!(number < 1 << 20, "{}", number as i64);
+        let (mut child, thread) = k.take_child().unwrap();
+        let memory = child.take_spawn_memory().unwrap();
+        (child, thread, memory)
+    }
+    /// The masks and pids of the events a read of `fan` gives.
+    fn events(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fan: u64) -> Vec<(u64, i32)> {
+        let n = syscall(k, t, m, 0, [fan, DATA + 1024, 2048, 0, 0, 0]);
+        if n as i64 <= 0 {
+            assert_eq!(n, Errno::EAGAIN.to_syscall_return());
+            return Vec::new();
+        }
+        let mut bytes = vec![0; n as usize];
+        m.read(GuestAddr(DATA + 1024), &mut bytes).unwrap();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let event = &bytes[at..];
+            let len = u32::from_le_bytes(event[..4].try_into().unwrap()) as usize;
+            out.push((
+                u64::from_le_bytes(event[8..16].try_into().unwrap()),
+                i32::from_le_bytes(event[20..24].try_into().unwrap()),
+            ));
+            at += len;
+        }
+        out
+    }
+    #[test]
+    fn a_namespace_that_ends_with_its_last_process_names_that_process() {
+        const DETACH: u64 = 0x200_0000;
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = spawn(&mut k, &mut t, &m);
+        // unshare(CLONE_NEWNS).
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 272, [0x2_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        let table = Arc::downgrade(&c.files.mount_table());
+        // FAN_REPORT_MNT | FAN_NONBLOCK, and FAN_MARK_ADD | FAN_MARK_MNTNS
+        // on the child's namespace.
+        let fan = syscall(&mut k, &mut t, &m, 300, [0x4002, 0, 0, 0, 0, 0]);
+        assert!((fan as i64) >= 0);
+        let path = format!("/proc/{}/ns/mnt\0", ct.tid);
+        m.write(GuestAddr(DATA), path.as_bytes()).unwrap();
+        let at = (-100i64) as u64;
+        let mark = syscall(&mut k, &mut t, &m, 301, [fan, 0x111, DETACH, at, DATA, 0]);
+        assert_eq!(mark, 0);
+        assert!(events(&mut k, &mut t, &m, fan).is_empty());
+        // The namespace ends as the child exits, before any wait, and each
+        // of its mounts goes as the child's doing.
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(table.strong_count(), 0);
+        let seen = events(&mut k, &mut t, &m, fan);
+        // The copy has the parent's mounts, and one below its root.
+        assert_eq!(seen.len(), 1 + k.files.fs().mounts().len(), "{seen:?}");
+        let child = i32::try_from(ct.tid).unwrap();
+        assert!(
+            seen.iter().all(|&event| event == (DETACH, child)),
+            "{seen:?}"
+        );
+        assert!(syscall(&mut k, &mut t, &m, 61, [u64::MAX, 0, 0, 0, 0, 0]) as i64 > 0);
+        assert!(events(&mut k, &mut t, &m, fan).is_empty());
+    }
+}

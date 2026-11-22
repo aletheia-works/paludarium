@@ -1066,27 +1066,53 @@ fn a_file_open_in_a_detached_tree_outlasts_the_tree() {
 }
 
 #[test]
-fn an_unmount_hook_hears_each_mount_that_leaves() {
+fn a_mount_hook_hears_each_mount_that_comes_goes_or_moves() {
+    use MountChange::{Attach, Detach, Move};
     let (_, fs) = machine();
     let heard = Arc::new(Mutex::new(Vec::new()));
     let hearing = Arc::clone(&heard);
     fs.table()
-        .set_unmount_hook(Some(Arc::new(move |ids: &[u64]| {
-            lock(&hearing).push(ids.to_vec());
+        .set_mount_hook(Some(Arc::new(move |changes: &[(u64, MountChange)], _| {
+            lock(&hearing).push(changes.to_vec());
         })));
+    let unique = |path: &[u8]| {
+        fs.mounts()
+            .iter()
+            .find(|m| m.path == path)
+            .map(|m| m.unique)
+            .unwrap()
+    };
+    let take = || std::mem::take(&mut *lock(&heard));
     fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    let m = unique(b"/tmp/m");
     fs.mkdir(b"/tmp/m/in", 0o755).unwrap();
     fs.mount(b"/tmp/m/in", tmpfs(0)).unwrap();
-    let (m, inner) = (
-        fs.target(b"/tmp/m").unwrap().id,
-        fs.target(b"/tmp/m/in").unwrap().id,
-    );
-    // A detached tree that goes is in no namespace.
+    let inner = unique(b"/tmp/m/in");
+    assert_eq!(take(), [vec![(m, Attach)], vec![(inner, Attach)]]);
+    // A recursive bind takes in each copy, each before those on it.
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.bind(b"/tmp/m", b"/tmp/b", true).unwrap();
+    let (b, b_in) = (unique(b"/tmp/b"), unique(b"/tmp/b/in"));
+    assert_eq!(take(), [vec![(b, Attach), (b_in, Attach)]]);
+    // A move tells of the tree's root alone.
+    fs.mkdir(b"/tmp/n", 0o755).unwrap();
+    fs.move_mount(b"/tmp/b", b"/tmp/n", &[]).unwrap();
+    assert_eq!(take(), [vec![(b, Move)]]);
+    // A detached tree tells nothing until it is attached, and then each of
+    // its mounts comes in.
+    let (tree, pin) = fs.clone_tree(b"/tmp/m", true, true).unwrap();
+    assert!(take().is_empty());
+    fs.mkdir(b"/tmp/c", 0o755).unwrap();
+    fs.move_mount(&tree, b"/tmp/c", &[]).unwrap();
+    drop(pin);
+    let (c, c_in) = (unique(b"/tmp/c"), unique(b"/tmp/c/in"));
+    assert_eq!(take(), [vec![(c, Attach), (c_in, Attach)]]);
+    // One that goes before it is attached tells nothing.
     let (_, pin) = fs.clone_tree(b"/tmp/m", true, false).unwrap();
     drop(pin);
     let _ = fs.mounts();
-    fs.umount(m, true).unwrap();
-    assert_eq!(*lock(&heard), [vec![m, inner]]);
+    fs.umount(fs.target(b"/tmp/m").unwrap().id, true).unwrap();
+    assert_eq!(take(), [vec![(m, Detach), (inner, Detach)]]);
 }
 
 #[test]
@@ -1361,4 +1387,93 @@ fn a_propagated_unmount_takes_a_locked_copy_only_with_its_parent() {
     let before = slave.mounts().len();
     fs.umount(d, true).unwrap();
     assert_eq!(slave.mounts().len(), before - 2);
+}
+
+/// A table whose hook keeps what it hears, and the unique ID of the
+/// topmost mount at a path.
+type Heard = Arc<Mutex<Vec<(Vec<(u64, MountChange)>, bool)>>>;
+fn hearing(fs: &NamespacedFs) -> Heard {
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let hearing = Arc::clone(&heard);
+    fs.table().set_mount_hook(Some(Arc::new(
+        move |changes: &[(u64, MountChange)], ended| {
+            lock(&hearing).push((changes.to_vec(), ended));
+        },
+    )));
+    heard
+}
+fn unique_at(fs: &NamespacedFs, path: &[u8]) -> u64 {
+    fs.mounts()
+        .iter()
+        .rfind(|m| m.path == path)
+        .map(|m| m.unique)
+        .unwrap()
+}
+
+#[test]
+fn pivot_root_moves_the_old_root_then_the_new_one() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/old", 0o755).unwrap();
+    let (root, new) = (unique_at(&fs, b"/"), unique_at(&fs, b"/tmp/m"));
+    let heard = hearing(&fs);
+    fs.pivot_root(b"/tmp/m", b"/tmp/m/old", b"/", &[]).unwrap();
+    assert_eq!(
+        *lock(&heard),
+        [(
+            vec![(root, MountChange::Move), (new, MountChange::Move)],
+            false
+        )]
+    );
+}
+
+#[test]
+fn a_propagated_unmount_moves_what_it_slides_down_first() {
+    use MountChange::{Detach, Move};
+    let (_, fs) = machine();
+    fs.mkdir(b"/tmp/a", 0o755).unwrap();
+    fs.mkdir(b"/tmp/e", 0o755).unwrap();
+    fs.mount(b"/tmp/a", tmpfs(0)).unwrap();
+    let a = fs.target(b"/tmp/a").unwrap().id;
+    fs.change_type(a, Propagation::Shared, false).unwrap();
+    fs.bind(b"/tmp/a", b"/tmp/e", false).unwrap();
+    fs.mkdir(b"/tmp/a/x", 0o755).unwrap();
+    // A mount at a/x and its copy at e/x, which a private mount covers.
+    fs.mount(b"/tmp/a/x", tmpfs(0)).unwrap();
+    let (p, q) = (unique_at(&fs, b"/tmp/a/x"), unique_at(&fs, b"/tmp/e/x"));
+    let copy = fs.target(b"/tmp/e/x").unwrap().id;
+    fs.change_type(copy, Propagation::Private, false).unwrap();
+    fs.mount(b"/tmp/e/x", tmpfs(0)).unwrap();
+    let top = unique_at(&fs, b"/tmp/e/x");
+    assert!(top != q);
+    let heard = hearing(&fs);
+    fs.umount(fs.target(b"/tmp/a/x").unwrap().id, true).unwrap();
+    // The cover slides down onto e, then both go.
+    assert_eq!(
+        *lock(&heard),
+        [(vec![(top, Move), (p, Detach), (q, Detach)], false)]
+    );
+    assert_eq!(unique_at(&fs, b"/tmp/e/x"), top);
+}
+
+#[test]
+fn a_table_that_goes_takes_out_every_mount() {
+    use MountChange::Detach;
+    let (lower, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    let copy = fs.table().copy(false);
+    let other = NamespacedFs::new(lower, Arc::clone(&copy));
+    let heard = hearing(&other);
+    let listed = other.mounts();
+    let below = listed[0].parent_unique;
+    drop(listed);
+    drop(other);
+    drop(copy);
+    let heard = lock(&heard).clone();
+    assert_eq!(heard.len(), 1);
+    let (changes, ended) = &heard[0];
+    assert!(ended);
+    assert_eq!(changes[0], (below, Detach));
+    assert!(changes.iter().all(|(_, change)| *change == Detach));
+    assert_eq!(changes.len(), 1 + fs.mounts().len());
 }

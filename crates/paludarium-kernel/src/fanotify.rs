@@ -998,6 +998,59 @@ impl Registry {
         }
     }
 
+    /// `drop_slab`'s end of the evictable marks (`FAN_MARK_EVICTABLE`,
+    /// which hold no reference to their inode) on the files whose inodes it
+    /// evicts: a file not on a tmpfs, whose dentries stay, and not a
+    /// directory (whose children's dentries may hold it, which are not
+    /// known here), that `held` does not keep in use (an open description,
+    /// a working directory, an inotify watch) and that no mark without
+    /// `FAN_MARK_EVICTABLE` holds (`fsnotify_update_iref`). As
+    /// `fsnotify_inode_delete` does, each of its marks goes then.
+    pub(crate) fn evict(&self, held: &dyn Fn(Key) -> bool) {
+        if !self.active() {
+            return;
+        }
+        let groups = self.groups();
+        let (mut candidates, mut pinned) = (Vec::new(), std::collections::HashSet::new());
+        for group in &groups {
+            for m in &group.queue().marks {
+                let Target::Inode(key) = m.target else {
+                    continue;
+                };
+                if m.flags & NO_IREF == 0 {
+                    pinned.insert(key);
+                } else if m.kind != paludarium_vfs::TMPFS_MAGIC && !m.directory {
+                    candidates.push(key);
+                }
+            }
+        }
+        candidates.retain(|key| !pinned.contains(key));
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|&key| !held(key));
+        if candidates.is_empty() {
+            return;
+        }
+        for group in groups {
+            let removed = {
+                let mut queue = group.queue();
+                let before = queue.marks.len();
+                queue.marks.retain(
+                    |m| !matches!(m.target, Target::Inode(key) if candidates.contains(&key)),
+                );
+                (before - queue.marks.len()) as u64
+            };
+            if removed > 0 {
+                self.release(
+                    group.owner,
+                    removed,
+                    group.flags & UNLIMITED_MARKS == 0,
+                    false,
+                );
+            }
+        }
+    }
+
     /// Whether the directory `dir` watches its children for `mask`, by
     /// any group's mark on it (`fsnotify_inode_watches_children`).
     fn watches_children(&self, groups: &[Arc<Group>], dir: Key, mask: u32) -> bool {

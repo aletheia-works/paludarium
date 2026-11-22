@@ -107,7 +107,7 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
-  `kernel` and `net` it has, ...) and the other names in
+  `kernel` and `net` it has and `vm/drop_caches`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `stack`
@@ -951,8 +951,10 @@ verified.
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
-  allows it), and `FAN_FS_ERROR` never comes. An evictable mark is never
-  evicted. A group merges an event
+  allows it), and `FAN_FS_ERROR` never comes. An evictable mark on a
+  directory is never evicted, where Linux's goes once none of the
+  directory's children's dentries is in use; one on a file Linux would
+  still write back, or one a mount is on, goes all the same. A group merges an event
   into any like it still queued, where Linux looks only at the last 128 of
   its hash bucket. Whether a directory watches its children is judged by the
   fanotify marks alone, where Linux's counts inotify's too. A file a

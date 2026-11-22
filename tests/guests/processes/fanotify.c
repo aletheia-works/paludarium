@@ -2,7 +2,8 @@
    marks fdinfo shows, the events of files with the descriptors they give,
    their merging, the file handles and names of the FID modes, the pidfds
    of FAN_REPORT_PIDFD, the mount events of FAN_REPORT_MNT, and what a
-   group without CAP_SYS_ADMIN may do.
+   group without CAP_SYS_ADMIN may do, and the evictable marks
+   /proc/sys/vm/drop_caches evicts.
 
    Each case works in a directory of its own under /tmp. A file system
    mark there hears of what other programs do in /tmp too, so only the
@@ -1416,6 +1417,76 @@ static int case_exec_perm(const char *self) {
     return 0;
 }
 
+/* Whether fdinfo shows a mark of `fan` on the inode `ino`. */
+static int marked(int fan, ino_t ino) {
+    char path[64], line[512], want[48];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fan);
+    snprintf(want, sizeof want, "ino:%lx ", (unsigned long)ino);
+    FILE *info = fopen(path, "r");
+    int found = 0;
+    while (info && fgets(line, sizeof line, info))
+        if (!strncmp(line, "fanotify ", 9) && strstr(line, want)) found = 1;
+    if (info) fclose(info);
+    return found;
+}
+static long drop_caches(const char *value) {
+    int fd = open("/proc/sys/vm/drop_caches", O_WRONLY);
+    if (fd < 0) return -errno;
+    long n = e(write(fd, value, strlen(value)));
+    close(fd);
+    return n;
+}
+
+/* /proc/sys/vm/drop_caches (fs/drop_caches.c): mode 0200, so not even
+   root may read it; proc_dointvec_minmax takes 1 to 4. 2 (drop_slab)
+   frees the inodes nothing uses, and with them their evictable marks
+   (FAN_MARK_EVICTABLE, which hold no reference): not those of an open
+   file, nor one another group's mark without FAN_MARK_EVICTABLE holds.
+   The dcache may keep a dentry it saw used through a pass, so 2 is
+   written until the mark goes, ten times at most. */
+static int case_drop_caches(void) {
+    make_base("drop-caches");
+    struct stat st;
+    long got = e(stat("/proc/sys/vm/drop_caches", &st));
+    printf("stat=%ld mode=%o\n", got, got ? 0 : st.st_mode & 07777);
+    printf("read open=%ld\n", e(open("/proc/sys/vm/drop_caches", O_RDONLY)));
+    printf("read-write open=%ld\n", e(open("/proc/sys/vm/drop_caches", O_RDWR)));
+    const char *values[] = {"0", "5", "x", "4\n"};
+    for (int i = 0; i < 4; i++) printf("write %.1s=%ld\n", values[i], drop_caches(values[i]));
+    const char *names[] = {"free", "open", "kept"};
+    ino_t inos[3];
+    for (int i = 0; i < 3; i++) {
+        touch(at(names[i]));
+        stat(at(names[i]), &st);
+        inos[i] = st.st_ino;
+    }
+    sync();
+    int fan = fan_init(FAN_NONBLOCK, 0), other = fan_init(FAN_NONBLOCK, 0);
+    if (fan < 0 || other < 0) return 80;
+    for (int i = 0; i < 3; i++)
+        printf("evictable %s=%ld\n", names[i],
+               fan_mark(fan, FAN_MARK_ADD | FAN_MARK_EVICTABLE, FAN_OPEN, AT_FDCWD, at(names[i])));
+    printf("other kept=%ld\n", fan_mark(other, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, at("kept")));
+    int held = open(at("open"), O_RDONLY);
+    int tries = 0;
+    long dropped = 0;
+    while (tries < 10 && marked(fan, inos[0])) {
+        dropped = drop_caches("2");
+        tries++;
+    }
+    printf("dropped=%ld gone=%d\n", dropped, !marked(fan, inos[0]));
+    for (int i = 1; i < 3; i++) printf("%s marked=%d\n", names[i], marked(fan, inos[i]));
+    /* The file's inode is a new one: nothing tells of its open. */
+    int fd = open(at("free"), O_RDONLY);
+    if (fd >= 0) close(fd);
+    printf("events=%d\n", drain(fan));
+    close(held);
+    close(fan);
+    close(other);
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1434,6 +1505,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-noop")) return 0;
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();
+    if (!strcmp(mode, "fanotify-drop-caches")) return case_drop_caches();
     printf("unknown mode %s\n", mode);
     return 2;
 }

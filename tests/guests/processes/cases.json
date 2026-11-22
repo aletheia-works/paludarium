@@ -196,6 +196,7 @@
     {"name":"fanotify-open-exec","binary":"fanotify"},
     {"name":"fanotify-aio-perm","binary":"fanotify"},
     {"name":"fanotify-exec-perm","binary":"fanotify"},
+    {"name":"fanotify-drop-caches","binary":"fanotify"},
     {"name":"userfaultfd-calls","binary":"userfaultfd"},
     {"name":"userfaultfd-faults","binary":"userfaultfd"},
     {"name":"userfaultfd-signals","binary":"userfaultfd"},

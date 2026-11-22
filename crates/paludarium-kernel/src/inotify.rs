@@ -526,6 +526,15 @@ impl Notifier {
     pub(crate) fn watching(&self) -> bool {
         (self.watches.load(Ordering::SeqCst) != 0 || self.fan.active()) && !QUIET.with(Cell::get)
     }
+    /// Whether an inotify watch is on file `key`, which keeps its inode in
+    /// the cache as an inotify mark's reference (`iref`) does.
+    pub(crate) fn watches_file(&self, key: Key) -> bool {
+        self.watches.load(Ordering::SeqCst) != 0
+            && self
+                .instances()
+                .iter()
+                .any(|instance| instance.queue().by_key.contains_key(&key))
+    }
     fn instances(&self) -> Vec<Arc<Instance>> {
         let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
         registry

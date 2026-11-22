@@ -3320,7 +3320,7 @@ kernel.
 
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
-  `fs`, `kernel` and `net` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -3621,6 +3621,18 @@ kernel.
   did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
+
+- `/proc/sys/vm` has `drop_caches` alone, so its listing differs from
+  Linux's, which has the rest of the `vm` sysctls too. As Linux's
+  `fs/drop_caches.c` has it, the file is root's, of mode 0200: no one may
+  open it to read, root included (`EACCES`, as `test_perm` gives root the
+  owner's bits), and only root may open it to write. A write takes one
+  `int` from 1 to 4 (`proc_dointvec_minmax`, else `EINVAL`). Each write
+  that goes through, one past the start too (with the value last written),
+  then drops as `drop_caches_sysctl_handler` does: 2 (`drop_slab`) evicts
+  the inodes nothing uses, and their evictable fanotify marks go (below);
+  1 drops the page cache, of which nothing here shows; 4 only quiets the
+  kernel log's line, which there is none of here.
 
 - `/proc/sys/net` has the settings of the opener's network namespace, as
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
@@ -4835,7 +4847,13 @@ kernel.
   `mnt_ns_from_dentry` finds none); a mount's mark, by the mount's ID, hears only of the paths
   in that mount, not of a bind mount of the same file system, and fdinfo
   shows that ID; it goes when its mount is freed (`fsnotify_vfsmount_delete`),
-  so a mount that takes the ID next is not marked. Exec's open of the
+  so a mount that takes the ID next is not marked. An evictable mark
+  (`FAN_MARK_EVICTABLE`) holds no reference to its inode: once
+  `/proc/sys/vm/drop_caches` evicts the inode, the mark goes, as
+  `fsnotify_inode_delete` takes off its marks. That is a file outside a
+  tmpfs (whose dentries stay) that no open description, working
+  directory, running program, inotify watch or mark without
+  `FAN_MARK_EVICTABLE` holds. Exec's open of the
   program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
   as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as
   `IN_OPEN`. Before that, each such open asks `FAN_OPEN_EXEC_PERM`, then

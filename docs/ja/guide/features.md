@@ -2890,7 +2890,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `execve`、Unix ソケットのアドレスは扱いません。
 
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
-  `fs`、`kernel`、`net` だけを持つ `/proc/sys`（後述）、
+  `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -3145,6 +3145,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
   `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+
+- `/proc/sys/vm` にあるのは `drop_caches` だけなので、ほかの `vm` の sysctl もある
+  Linux とは一覧が違います。Linux の `fs/drop_caches.c` と同じく、このファイルは root の
+  もので、モードは 0200 です。読むためには root でも開けず（`EACCES`。`test_perm` は root
+  に持ち主のビットを与えます）、書くために開けるのは root だけです。書き込みは 1 から 4 の
+  `int` を 1 つ受け取ります（`proc_dointvec_minmax`。ほかは `EINVAL`）。通った書き込みは、
+  先頭より後ろへの書き込みでも（最後に書かれた値で）、`drop_caches_sysctl_handler` と
+  同じく捨てます。2（`drop_slab`）は何にも使われていない inode を追い出し、その
+  追い出せる fanotify のマークもなくなります（後述）。1 はページキャッシュを捨てますが、
+  ここではそれが見えるものはありません。4 はカーネルログの行を止めるだけで、ここには
+  その行がありません。
 
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
   `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
@@ -4188,7 +4199,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   まとめて消します。マウントへのマークはマウントの ID で持ち、同じファイルシステムの
   バインドマウントではなくそのマウントの中のパスのイベントだけを受け、fdinfo はその ID を
   示します。マウントが解放されるとそのマークもなくなるので（`fsnotify_vfsmount_delete`）、
-  次にその ID を得たマウントにはマークがありません。exec がプログラムとそのインタープリターを
+  次にその ID を得たマウントにはマークがありません。追い出せるマーク
+  （`FAN_MARK_EVICTABLE`）は inode への参照を持たず、`/proc/sys/vm/drop_caches` が inode を
+  追い出すと、`fsnotify_inode_delete` がマークを外すのと同じくなくなります。対象は、
+  tmpfs（dentry が残ります）の外にあり、開いたファイル記述、作業ディレクトリ、動いている
+  プログラム、inotify のウォッチ、`FAN_MARK_EVICTABLE` のないマークのどれも持っていない
+  ファイルです。exec がプログラムとそのインタープリターを
   開くことは、`do_open_execat` が `__FMODE_EXEC` で開くのと同じく `FAN_OPEN_EXEC` 付きの
   `FAN_OPEN` として伝わり、inotify には `IN_OPEN` として伝わります。その前に、そうした
   オープンはそれぞれ `FAN_OPEN_EXEC_PERM`、`FAN_OPEN_PERM` を、exec によるそのファイルの

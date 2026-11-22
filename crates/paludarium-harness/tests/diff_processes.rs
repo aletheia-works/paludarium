@@ -278,6 +278,7 @@ mod linux {
                     | "fanotify-open-exec"
                     | "fanotify-aio-perm"
                     | "fanotify-exec-perm"
+                    | "fanotify-drop-caches"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -709,6 +710,7 @@ mod linux {
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),
         fanotify_aio_perm => ("fanotify-aio-perm","fanotify"),
         fanotify_exec_perm => ("fanotify-exec-perm","fanotify"),
+        fanotify_drop_caches => ("fanotify-drop-caches","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),

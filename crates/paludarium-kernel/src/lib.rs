@@ -17,6 +17,8 @@ mod inotify;
 mod landlock;
 mod permissions;
 mod signalfd;
+#[cfg(test)]
+mod signalfd_tests;
 mod signals;
 pub use inbox::SignalInbox;
 mod aio;

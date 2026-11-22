@@ -758,8 +758,9 @@ fn regs(stop: &Stop) -> [u64; 27] {
 /// Linux's `putreg`: register `index` of `user_regs_struct` takes `value`.
 /// A segment selector must be null or of user privilege, and `cs` and `ss`
 /// not null (`EIO`); it is taken as it is, without the descriptor checks
-/// of a load, and leaves the fs and gs bases as they are. The flags change only where a tracer may
-/// change them, and a segment base must be below `TASK_SIZE_MAX` (`EIO`).
+/// of a load, and leaves the fs and gs bases as they are. The flags change
+/// only where a tracer may change them, and a segment base must be below
+/// `TASK_SIZE_MAX` (`EIO`).
 fn putreg(stop: &mut Stop, index: u64, value: u64) -> Result<(), Errno> {
     let cpu = &mut stop.cpu;
     match index {

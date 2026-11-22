@@ -807,3 +807,107 @@ fn a_mount_namespace_that_ends_takes_out_each_mount_and_its_marks() {
         errno(Errno::ENOENT)
     );
 }
+
+/// The names a read's events give, with their masks, from the first
+/// record of each (a directory and name).
+fn named(seen: &[Seen]) -> Vec<(u64, String)> {
+    seen.iter()
+        .map(|s| {
+            let record = &s.records[0].1;
+            let bytes = u32::from_le_bytes(record[8..12].try_into().unwrap()) as usize;
+            let name = &record[16 + bytes..];
+            let end = name.iter().position(|&b| b == 0).unwrap();
+            (s.mask, String::from_utf8(name[..end].to_vec()).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn an_event_merges_only_into_the_newest_128_of_its_bucket() {
+    let mut f = fixture();
+    let bucket =
+        |name: &str| crate::fanotify::full_name_hash(name.len() as u64, name.as_bytes()) % 128;
+    let first = "n00000";
+    // Names whose events in one directory by one task share the first's
+    // bucket, as on Linux, and some that do not.
+    let names: Vec<String> = (1..20_000).map(|i| format!("n{i:05}")).collect();
+    let alike: Vec<&String> = names
+        .iter()
+        .filter(|n| bucket(n) == bucket(first))
+        .take(128)
+        .collect();
+    let other: Vec<&String> = names
+        .iter()
+        .filter(|n| bucket(n) != bucket(first))
+        .take(40)
+        .collect();
+    assert_eq!(alike.len(), 128);
+    let fan = f.init(NONBLOCK | REPORT_DIR_FID | REPORT_NAME, 0);
+    for (dir, before) in [("/tmp/d", 127), ("/tmp/e", 128)] {
+        f.next = DATA;
+        f.mkdir(dir);
+        assert_eq!(f.mark(fan, ADD, CREATE | DELETE, dir), 0);
+        f.touch(&format!("{dir}/{first}"));
+        for (i, name) in alike.iter().take(before).enumerate() {
+            f.next = DATA + 0x100;
+            f.touch(&format!("{dir}/{name}"));
+            if let Some(name) = other.get(i) {
+                f.touch(&format!("{dir}/{name}"));
+            }
+        }
+        let path = f.put(format!("{dir}/{first}").as_bytes());
+        assert_eq!(f.ret(87, &[path]), 0);
+        let mut seen = Vec::new();
+        while let Ok(more) = f.read(fan, 0x7000) {
+            seen.extend(named(&more));
+        }
+        let of_first: Vec<u64> = seen
+            .iter()
+            .filter(|(_, n)| n == first)
+            .map(|(m, _)| *m)
+            .collect();
+        if before == 127 {
+            // The removal is the same event as the creation, 127 events of
+            // its bucket later.
+            assert_eq!(of_first, [CREATE | DELETE]);
+        } else {
+            // With 128 between them, the creation is past the window.
+            assert_eq!(of_first, [CREATE, DELETE]);
+        }
+        assert_eq!(
+            seen.len(),
+            1 + before + other.len().min(before) + usize::from(before == 128)
+        );
+    }
+}
+
+#[test]
+fn a_superblock_that_goes_takes_the_marks_on_it_and_its_files() {
+    let mut f = fixture();
+    f.mkdir("/tmp/m");
+    let (source, target, kind) = (f.put(b"none"), f.put(b"/tmp/m"), f.put(b"tmpfs"));
+    assert_eq!(f.ret(165, &[source, target, kind, 0, 0]), 0);
+    f.touch("/tmp/m/f");
+    let fan = f.init(NONBLOCK, 0);
+    assert_eq!(f.mark(fan, ADD, OPEN, "/tmp/m/f"), 0);
+    assert_eq!(f.mark(fan, ADD | FILESYSTEM, OPEN, "/tmp/m"), 0);
+    assert_eq!(f.mark(fan, ADD, OPEN, "/tmp"), 0);
+    let marks = |f: &mut Fixture| {
+        f.fdinfo(fan)
+            .lines()
+            .filter(|l| l.starts_with("fanotify ") && !l.starts_with("fanotify flags:"))
+            .count()
+    };
+    assert_eq!(marks(&mut f), 3);
+    let target = f.put(b"/tmp/m");
+    assert_eq!(f.ret(166, &[target, 0]), 0);
+    // fsnotify_sb_delete: the file's and the file system's marks go; the
+    // other file system's stays.
+    assert_eq!(marks(&mut f), 1);
+    // A tmpfs that takes the device next hears nothing of them.
+    let (source, target, kind) = (f.put(b"none"), f.put(b"/tmp/m"), f.put(b"tmpfs"));
+    assert_eq!(f.ret(165, &[source, target, kind, 0, 0]), 0);
+    f.touch("/tmp/m/f");
+    assert_eq!(f.read(fan, 4096).unwrap_err(), errno(Errno::EAGAIN));
+    assert_eq!(f.kernel.files.caches.notify.fan.marks_count(), 1);
+}

@@ -280,6 +280,8 @@ mod linux {
                     | "fanotify-open-exec"
                     | "fanotify-aio-perm"
                     | "fanotify-exec-perm"
+                    | "fanotify-merge-window"
+                    | "fanotify-superblock-marks"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -326,6 +328,7 @@ mod linux {
                     | "bpf-prog-corpus"
                     | "bpf-prog-classic"
                     | "bpf-prog-atomic"
+                    | "bpf-prog-acqrel"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -593,6 +596,7 @@ mod linux {
         processes_landlock => ("landlock","process"),
         processes_madvise_advice => ("madvise-advice","process"),
         processes_madvise_collapse => ("madvise-collapse","process"),
+        processes_madvise_collapse_shmem => ("madvise-collapse-shmem","process"),
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
@@ -683,6 +687,7 @@ mod linux {
         bpf_prog_corpus => ("bpf-prog-corpus","bpf-prog"),
         bpf_prog_classic => ("bpf-prog-classic","bpf-prog"),
         bpf_prog_atomic => ("bpf-prog-atomic","bpf-prog"),
+        bpf_prog_acqrel => ("bpf-prog-acqrel","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -718,6 +723,8 @@ mod linux {
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),
         fanotify_aio_perm => ("fanotify-aio-perm","fanotify"),
         fanotify_exec_perm => ("fanotify-exec-perm","fanotify"),
+        fanotify_merge_window => ("fanotify-merge-window","fanotify"),
+        fanotify_superblock_marks => ("fanotify-superblock-marks","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
@@ -965,6 +972,7 @@ mod linux {
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_generated_noexec => ("generated-noexec","process"),
+        processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),
         processes_tree_namespace => ("tree-namespace","process"),
         processes_beneath => ("beneath","process"),

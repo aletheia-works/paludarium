@@ -11,7 +11,8 @@
    dropped. Before A has an address, a route through va leaves from
    0.0.0.0, as no address of a scope to fit is there: ARP is answered,
    and B drops what comes as a martian; with a global address on lo, it
-   leaves from that one, which B takes. TCP takes no broadcast or
+   leaves from that one, which B, with no route back, drops with loose
+   reverse path filtering and takes without it. TCP takes no broadcast or
    multicast route (ENETUNREACH), and UDP no broadcast one without
    SO_BROADCAST (EACCES). The two processes take turns through pipes, so their lines
    come in one order; the carrier, which Linux's link watch may change a
@@ -250,6 +251,15 @@ static void receive(int fd, const char *label) {
     printf("%s: %s=%ld \"%s\" from %s\n", side, label, n, n > 0 ? buf : "", ip);
 }
 
+/* Writes `value` to IPv4's `rp_filter` of `device` in this namespace. */
+static void rp_filter(const char *device, const char *value) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/sys/net/ipv4/conf/%s/rp_filter", device);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0 || write(fd, value, strlen(value)) < 0) printf("%s: %s=%d\n", side, path, -errno);
+    if (fd >= 0) close(fd);
+}
+
 /* B: makes its namespace, then does what A writes to `in`, one letter at
    a time, writing back to `out` when done. */
 static void child(int in, int out) {
@@ -289,6 +299,13 @@ static void child(int in, int out) {
             printf("B: udp reply=%ld\n", result(sendto(udp, "back", 4, 0, (void *)&back, sizeof back)));
         } else if (command == 'g') {
             receive(udp, "udp recvfrom");
+        } else if (command == 'L' || command == 'O') {
+            /* Reverse path filtering loose, or off, whatever a new
+               namespace took from the first one (devconf_inherit_init_net). */
+            const char *value = command == 'L' ? "2" : "0";
+            rp_filter("all", value);
+            rp_filter("vb", value);
+            printf("B: rp_filter %s\n", value);
         } else if (command == 'n') {
             /* Nothing more came. */
             int none = (int)result(recv(udp, (char[8]){0}, 8, MSG_DONTWAIT));
@@ -376,12 +393,18 @@ int main(int argc, char **argv) {
     close(zero);
     /* With a global address on lo, the route leaves from it, as
        inet_select_addr takes another device's address of a scope to fit
-       where the end has none; B takes what comes from it. */
+       where the end has none. B, which has no route back to it, drops
+       what comes from it with loose reverse path filtering and takes it
+       with none (fib_validate_source). */
     address_of(ctl, RTM_NEWADDR, 1, "10.9.9.9", 32, "add 10.9.9.9/32 on lo");
     zero = socket(AF_INET, SOCK_DGRAM, 0);
     to = at("10.77.0.2", 6000);
     printf("A: udp connect from lo's=%ld\n", result(connect(zero, (void *)&to, sizeof to)));
     show_name(zero, 0, 0, "udp connected from lo's");
+    B_DOES("L");
+    printf("A: udp send from lo's=%ld\n", result(send(zero, "loose", 5, 0)));
+    B_DOES("g");
+    B_DOES("O");
     printf("A: udp send from lo's=%ld\n", result(send(zero, "lo's", 4, 0)));
     close(zero);
     B_DOES("g");

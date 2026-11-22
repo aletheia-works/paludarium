@@ -875,48 +875,33 @@ static int case_reap(void) {
     return 0;
 }
 
-static volatile sig_atomic_t give_up;
-static void on_give_up(int sig) {
-    (void)sig;
-    give_up = 1;
-}
-
-/* A timerfd that expires while the program spins on the ring with no
-   system call: Linux's timer completes the poll from its wake-up, so the
-   event is in the ring before any call. A POSIX timer's signal ends the
-   spin if it never comes. */
+/* A timerfd that expires while the program spins on the ring: Linux's
+   timer completes the poll from its wake-up, so the event is in the ring
+   with no call. Each round spins with no system call and then sleeps 1 ms:
+   the test host's virtual clock passes only in a wait, so the sleep is what
+   lets the timer expire there, and the emulator's checkpoint or the sleep's
+   return completes the poll. 10000 rounds give up. */
 static int case_timer(void) {
     aio_context_t ctx = 0;
     printf("setup=%ld\n", setup(8, &ctx));
     if (!ctx) return 3;
     struct aio_ring *ring = (struct aio_ring *)ctx;
     struct io_event *events = (struct io_event *)(ring + 1);
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_give_up;
-    if (sigaction(SIGUSR1, &sa, NULL)) return 4;
-    struct sigevent sev;
-    memset(&sev, 0, sizeof sev);
-    sev.sigev_notify = SIGEV_SIGNAL;
-    sev.sigev_signo = SIGUSR1;
-    timer_t give;
-    if (timer_create(CLOCK_MONOTONIC, &sev, &give)) return 5;
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
-    if (tfd < 0) return 6;
+    if (tfd < 0) return 4;
     struct iocb cb = poll_of(tfd, POLLIN, 9);
     printf("submit=%ld in-ring=%u\n", submit1(ctx, &cb), (ring->tail - ring->head) % ring->nr);
-    struct itimerspec ten = {.it_value = {.tv_sec = 10}};
     struct itimerspec soon = {.it_value = {.tv_nsec = 20000000}};
+    struct timespec ms = {0, 1000000};
     unsigned head = ring->head, tail = head;
-    give_up = 0;
-    if (timer_settime(give, 0, &ten, NULL)) return 7;
-    if (timerfd_settime(tfd, 0, &soon, NULL)) return 8;
-    while (!give_up) {
-        tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
-        if (tail != head) break;
+    if (timerfd_settime(tfd, 0, &soon, NULL)) return 5;
+    for (int round = 0; round < 10000 && tail == head; round++) {
+        for (long spin = 0; spin < (1L << 14); spin++) {
+            tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+            if (tail != head) break;
+        }
+        if (tail == head) nanosleep(&ms, NULL);
     }
-    struct itimerspec off = {{0, 0}, {0, 0}};
-    timer_settime(give, 0, &off, NULL);
     if (tail == head) {
         printf("never came\n");
     } else {
@@ -926,10 +911,12 @@ static int case_timer(void) {
                (long long)ev.res2);
         __atomic_store_n(&ring->head, (head + 1) % ring->nr, __ATOMIC_RELEASE);
     }
-    uint64_t ticks = 0;
     struct io_event ev[8];
-    printf("after: getevents=%ld read=%zd ticks=%llu destroy=%ld\n", getevents(ctx, 0, 8, ev, &zero),
-           read(tfd, &ticks, sizeof ticks), (unsigned long long)ticks, destroy(ctx));
+    long got = getevents(ctx, 0, 8, ev, &zero);
+    uint64_t ticks = 0;
+    ssize_t n = read(tfd, &ticks, sizeof ticks);
+    printf("after: getevents=%ld read=%zd ticks=%llu\n", got, n, (unsigned long long)ticks);
+    printf("destroy=%ld\n", destroy(ctx));
     return 0;
 }
 

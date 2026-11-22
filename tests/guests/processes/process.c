@@ -242,8 +242,7 @@ static char ns_thread_link[64];
 static char ns_thread_name[65];
 static volatile int ns_thread_done;
 static long ns_thread_set;
-static int ns_thread(void *unused) {
-    (void)unused;
+static int ns_thread(void) {
     struct utsname names;
     ns_thread_set = syscall(SYS_sethostname, "thread-host", 11);
     syscall(SYS_uname, &names);
@@ -7257,8 +7256,10 @@ static int pfl_thread(void) {
     return 0;
 }
 /* clone(2) of a thread that runs fn on stack and then exits, with no
-   system call before fn; musl's clone() refuses CLONE_THREAD. */
-static long pfl_spawn(unsigned long flags, void *stack, int (*fn)(void)) {
+   system call before fn. musl's clone() refuses CLONE_THREAD with EINVAL,
+   so a case that needs a thread of its own flags makes it with this. The
+   thread shares the caller's TLS (no CLONE_SETTLS), errno included. */
+static long bare_thread(unsigned long flags, void *stack, int (*fn)(void)) {
     register int (*entry)(void) __asm__("r12") = fn;
     long r;
     __asm__ volatile("syscall\n\t"
@@ -7293,7 +7294,7 @@ static int page_faults_live_case(const char *self) {
     if (pfl_pages == MAP_FAILED) return 2;
     static char stack[64 * 1024] __attribute__((aligned(16)));
     long before = pf_get(RUSAGE_SELF);
-    int tid = (int)pfl_spawn(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
+    int tid = (int)bare_thread(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
                              stack + sizeof stack, pfl_thread);
     if (tid < 0) return 3;
     while (__atomic_load_n(&pfl_state, __ATOMIC_SEQ_CST) != 1) sched_yield();
@@ -26885,9 +26886,9 @@ int main(int argc, char **argv) {
         fflush(stdout);
         pid_t host = child();
         if (host == 0) {
-            int tid = clone(ns_thread, stack + 65536,
-                            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_NEWUTS,
-                            NULL);
+            int tid = (int)bare_thread(
+                CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_NEWUTS,
+                stack + 65536, ns_thread);
             while (tid > 0 && !ns_thread_done) sched_yield();
             printf("thread: cloned=%d set=%ld name=%s own=%d leader=%d\n", tid > 0, ns_thread_set, ns_thread_name,
                    ns_named(ns_thread_link, "uts") && strcmp(ns_thread_link, ns_link("self", "uts", buf, sizeof buf)),

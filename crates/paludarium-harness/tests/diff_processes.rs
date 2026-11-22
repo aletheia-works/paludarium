@@ -324,6 +324,7 @@ mod linux {
                     | "bpf-prog-attach"
                     | "bpf-prog-corpus"
                     | "bpf-prog-classic"
+                    | "bpf-prog-atomic"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -645,6 +646,7 @@ mod linux {
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
         aio_mremap => ("aio-mremap","aio"),
+        aio_reap => ("aio-reap","aio"),
         perf_calls => ("perf-calls","perf"),
         perf_counts => ("perf-counts","perf"),
         perf_exec => ("perf-exec","perf"),
@@ -676,6 +678,7 @@ mod linux {
         bpf_prog_attach => ("bpf-prog-attach","bpf-prog"),
         bpf_prog_corpus => ("bpf-prog-corpus","bpf-prog"),
         bpf_prog_classic => ("bpf-prog-classic","bpf-prog"),
+        bpf_prog_atomic => ("bpf-prog-atomic","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -976,6 +979,7 @@ mod linux {
         processes_proc_sizes => ("proc-sizes","process"),
         processes_proc_stat_counters => ("proc-stat-counters","process"),
         processes_loadavg_running => ("loadavg-running","process"),
+        processes_leader_exit_status => ("leader-exit-status","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
@@ -988,6 +992,7 @@ mod linux {
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         processes_io_uring_transfers => ("io-uring-transfers","process"),
+        processes_io_uring_files => ("io-uring-files","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

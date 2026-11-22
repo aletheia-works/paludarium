@@ -1602,6 +1602,24 @@ impl ValueRef {
         place.copy_from_slice(bytes);
         Ok(())
     }
+    /// The `len` bytes from `off` changed by `change` in one hold of the
+    /// value, as a `BPF_ATOMIC` changes them: no other reader or writer of
+    /// the value comes between. Gives what was there.
+    pub(crate) fn update(
+        &self,
+        off: usize,
+        len: usize,
+        change: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) -> Result<Vec<u8>, Errno> {
+        let mut value = lock(&self.0);
+        let place = off
+            .checked_add(len)
+            .and_then(|end| value.get_mut(off..end))
+            .ok_or(Errno::EFAULT)?;
+        let before = place.to_vec();
+        place.copy_from_slice(&change(&before));
+        Ok(before)
+    }
     /// The value's size, the map's `value_size`.
     pub(crate) fn len(&self) -> usize {
         lock(&self.0).len()

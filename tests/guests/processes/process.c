@@ -8657,6 +8657,262 @@ static int io_uring_transfers_case(void) {
     return 0;
 }
 
+/* io_uring's registered files: IORING_REGISTER_FILES, _UNREGISTER_FILES,
+   _FILES_UPDATE and _FILE_ALLOC_RANGE, IORING_OP_FILES_UPDATE (at an offset,
+   or each file in a free slot), and the requests that name a registered
+   file by its slot with IOSQE_FIXED_FILE. A slot holds its file open once
+   the descriptor is closed: the file's watches hear of its close when the
+   slot lets go of it, and a pipe's write end keeps its reader from the end
+   of the file. */
+static unsigned char *uf_slot(unsigned char opcode, int slot, long offset, const void *addr,
+                              unsigned len) {
+    unsigned char *sqe = ut_entry(opcode, slot, offset, addr, len);
+    sqe[1] = 1;
+    return sqe;
+}
+
+struct uf_update {
+    unsigned offset, resv;
+    unsigned long data;
+};
+
+struct uf_range {
+    unsigned off, len;
+    unsigned long resv;
+};
+
+static void uf_list(int *list, int a, int b, int c) {
+    list[0] = a;
+    list[1] = b;
+    list[2] = c;
+}
+
+static int io_uring_files_case(void) {
+    char dir[] = "/tmp/io-uring-files-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    if (uring_open(&ut, 8)) return 81;
+    int fd = open("a", O_RDWR | O_CREAT, 0600);
+    int other = open("b", O_RDWR | O_CREAT, 0600);
+    int path = open("a", O_PATH);
+    int ifd = (int)syscall(294, 04000);
+    if (fd < 0 || other < 0 || path < 0 || ifd < 0) return 82;
+    if (syscall(254, ifd, "a", 0x1b) < 0) return 83;
+    char got[16];
+    int list[4];
+    memset(got, 0, sizeof got);
+
+    /* None registered. */
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("fixed-none");
+    uring_show("unregister-none", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("register-null", syscall(427, ut.fd, 2, NULL, 1));
+    uring_show("register-zero", syscall(427, ut.fd, 2, list, 0));
+    uring_show("register-too-many", syscall(427, ut.fd, 2, list, (1 << 20) + 1));
+    uring_show("register-unmapped", syscall(427, ut.fd, 2, (void *)8, 1));
+    const struct {
+        const char *label;
+        int fd;
+    } bad[] = {
+        {"register-unknown", 999},
+        {"register-minus-two", -2},
+        {"register-o-path", path},
+        {"register-ring", ut.fd},
+    };
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+        uf_list(list, fd, -1, bad[i].fd);
+        uring_show(bad[i].label, syscall(427, ut.fd, 2, list, 3));
+    }
+    uring_show("unregister-after-failure", syscall(427, ut.fd, 3, NULL, 0));
+    struct rlimit old, low;
+    if (getrlimit(RLIMIT_NOFILE, &old)) return 84;
+    low = old;
+    low.rlim_cur = 8;
+    if (setrlimit(RLIMIT_NOFILE, &low)) return 85;
+    uring_show("register-over-nofile", syscall(427, ut.fd, 2, list, 9));
+    if (setrlimit(RLIMIT_NOFILE, &old)) return 86;
+
+    /* Slot 0 holds the file, slot 1 nothing. */
+    uf_list(list, fd, -1, -1);
+    uring_show("register", syscall(427, ut.fd, 2, list, 2));
+    uring_show("register-again", syscall(427, ut.fd, 2, list, 2));
+    uf_slot(23, 0, 0, "hi", 2);
+    ut_run("write-slot");
+    close(fd);
+    ut_events(ifd, "events-closed");
+    uf_slot(22, 0, 0, got, sizeof got);
+    ut_run("read-slot");
+    printf("read: %.2s\n", got);
+    uf_slot(3, 0, 0, NULL, 0);
+    ut_run("fsync-slot");
+    ut_events(ifd, "events-transfers");
+    const int slots[] = {1, 2, -1};
+    for (unsigned i = 0; i < sizeof slots / sizeof *slots; i++) {
+        uf_slot(22, slots[i], 0, got, 1);
+        printf("slot %d: ", slots[i]);
+        fflush(stdout);
+        ut_run("read");
+    }
+
+    /* IORING_REGISTER_FILES_UPDATE. */
+    struct uf_update up = {1, 0, (unsigned long)list};
+    list[0] = other;
+    uring_show("update-zero", syscall(427, ut.fd, 6, &up, 0));
+    uring_show("update-null", syscall(427, ut.fd, 6, NULL, 1));
+    up.resv = 1;
+    uring_show("update-resv", syscall(427, ut.fd, 6, &up, 1));
+    up.resv = 0;
+    up.offset = 2;
+    uring_show("update-past-end", syscall(427, ut.fd, 6, &up, 1));
+    up.offset = 0xffffffff;
+    uring_show("update-wraps", syscall(427, ut.fd, 6, &up, 2));
+    up.offset = 1;
+    uring_show("update", syscall(427, ut.fd, 6, &up, 1));
+    uf_slot(22, 1, 0, got, 1);
+    ut_run("read-updated");
+    up.offset = 0;
+    uf_list(list, -2, -1, 0);
+    uring_show("update-skip-clear", syscall(427, ut.fd, 6, &up, 2));
+    uf_slot(22, 0, 0, got, 2);
+    ut_run("read-skipped");
+    uf_slot(22, 1, 0, got, 1);
+    ut_run("read-cleared");
+    uf_list(list, 999, 0, 0);
+    uring_show("update-unknown", syscall(427, ut.fd, 6, &up, 1));
+    ut_events(ifd, "events-let-go");
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("read-let-go");
+    uf_list(list, other, 999, 0);
+    uring_show("update-partly", syscall(427, ut.fd, 6, &up, 2));
+    uring_show("unregister-arg", syscall(427, ut.fd, 3, list, 0));
+    uring_show("unregister-count", syscall(427, ut.fd, 3, NULL, 1));
+    uring_show("unregister", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("unregister-again", syscall(427, ut.fd, 3, NULL, 0));
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("read-unregistered");
+
+    /* IORING_OP_FILES_UPDATE: its preparation, then none registered. */
+    fd = open("a", O_RDWR);
+    if (fd < 0) return 87;
+    list[0] = fd;
+    unsigned char *sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[1] = 1;
+    ut_run("op-fixed");
+    sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[28] = 1;
+    ut_run("op-flags");
+    sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[44] = 1;
+    ut_run("op-splice-fd");
+    ut_entry(20, 0, 0, list, 0);
+    ut_run("op-none");
+    ut_entry(20, 0, 0, list, 1);
+    ut_run("op-unregistered");
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-unregistered");
+
+    /* Three empty slots, filled from the first; a slot emptied is next. */
+    uf_list(list, -1, -1, -1);
+    uring_show("register-sparse", syscall(427, ut.fd, 2, list, 3));
+    uf_list(list, fd, fd, 0);
+    ut_entry(20, 0, 0xffffffff, list, 2);
+    ut_run("op-alloc");
+    printf("slots: %d %d\n", list[0], list[1]);
+    uf_list(list, fd, fd, 0);
+    ut_entry(20, 0, 0xffffffff, list, 2);
+    ut_run("op-alloc-full");
+    printf("slots: %d %d\n", list[0], list[1] == fd ? -1 : list[1]);
+    uf_list(list, fd, 0, 0);
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-none-free");
+    list[0] = -1;
+    ut_entry(20, 0, 1, list, 1);
+    ut_run("op-clear");
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-cleared");
+    printf("slot: %d\n", list[0]);
+    const struct {
+        const char *label;
+        int fd;
+    } refused[] = {{"op-alloc-ring", ut.fd}, {"op-alloc-unknown", 999}};
+    for (unsigned i = 0; i < 2; i++) {
+        list[0] = -1;
+        ut_entry(20, 0, 0, list, 1);
+        ut_run("op-clear-first");
+        list[0] = refused[i].fd;
+        ut_entry(20, 0, 0xffffffff, list, 1);
+        ut_run(refused[i].label);
+    }
+    ut_entry(20, 0, 3, list, 1);
+    ut_run("op-past-end");
+    ut_entry(20, 0, 0xfffffffe, list, 2);
+    ut_run("op-wraps");
+
+    /* IORING_REGISTER_FILE_ALLOC_RANGE: slot 2 only, which is taken. */
+    struct uf_range range = {0xffffffff, 2, 0};
+    uring_show("range-null", syscall(427, ut.fd, 25, NULL, 0));
+    uring_show("range-count", syscall(427, ut.fd, 25, &range, 1));
+    uring_show("range-unmapped", syscall(427, ut.fd, 25, (void *)8, 0));
+    uring_show("range-wraps", syscall(427, ut.fd, 25, &range, 0));
+    range = (struct uf_range){2, 2, 0};
+    uring_show("range-past-end", syscall(427, ut.fd, 25, &range, 0));
+    range = (struct uf_range){2, 1, 1};
+    uring_show("range-resv", syscall(427, ut.fd, 25, &range, 0));
+    range.resv = 0;
+    uring_show("range", syscall(427, ut.fd, 25, &range, 0));
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-range-full");
+    list[0] = -1;
+    ut_entry(20, 0, 2, list, 1);
+    ut_run("op-clear-2");
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-range");
+    printf("slot: %d\n", list[0]);
+    uring_show("unregister-range", syscall(427, ut.fd, 3, NULL, 0));
+    range = (struct uf_range){0, 0, 0};
+    uring_show("range-unregistered", syscall(427, ut.fd, 25, &range, 0));
+    range.len = 1;
+    uring_show("range-unregistered-past-end", syscall(427, ut.fd, 25, &range, 0));
+    uf_list(list, -1, -1, 0);
+    uring_show("register-two", syscall(427, ut.fd, 2, list, 2));
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-whole");
+    printf("slot: %d\n", list[0]);
+    uring_show("unregister-two", syscall(427, ut.fd, 3, NULL, 0));
+
+    /* A pipe's write end in a slot: its reader sees no end of file. */
+    int ends[2];
+    if (pipe2(ends, O_NONBLOCK)) return 88;
+    list[0] = ends[1];
+    uring_show("register-pipe", syscall(427, ut.fd, 2, list, 1));
+    close(ends[1]);
+    uring_show("pipe-read-held", read(ends[0], got, 1));
+    uf_slot(23, 0, -1, "x", 1);
+    ut_run("pipe-write-slot");
+    uring_show("pipe-read", read(ends[0], got, 4));
+    uring_show("unregister-pipe", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("pipe-read-end", read(ends[0], got, 1));
+
+    unsigned char probe[16 + 8 * 64];
+    memset(probe, 0, sizeof probe);
+    syscall(427, ut.fd, 8, probe, 64);
+    printf("probe: 20=%d\n", probe[16 + 8 * 20 + 2] & 1);
+    close(ends[0]);
+    close(ifd);
+    close(path);
+    close(other);
+    close(fd);
+    close(ut.fd);
+    unlink("a");
+    unlink("b");
+    if (chdir("/")) return 89;
+    rmdir(dir);
+    return 0;
+}
+
 /* mprotect's checks in Linux's order, and the grows flags: the main stack
    grows down (as a MAP_GROWSDOWN mapping does, see grows_down_case), and
    nothing grows up on x86-64. */
@@ -10608,11 +10864,13 @@ static void mt_run_from(const char *self, const char *dir) {
     snprintf(copy, sizeof copy, "%s/self", dir);
     int in = open(self, O_RDONLY), out = open(copy, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     char chunk[65536];
-    ssize_t n;
+    ssize_t n = -1;
     while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
         if (write(out, chunk, n) != n) break;
     close(in);
     close(out);
+    /* A copy cut short (ENOSPC) shows here, not as the child's status. */
+    printf("exe copied=%d\n", n == 0);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -10636,7 +10894,8 @@ static int mt_inner(const char *self) {
     dev_t base = mt_dev(mt_base);
     /* Changing propagation, if this kernel can; not compared. */
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=1m,mode=0750")));
+    /* Room for a copy of this program, which mt_run_from runs from it. */
+    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=16m,mode=0750")));
     printf("own device=%d\n", mt_dev(m) != base && mt_dev(m) != (dev_t)-1);
     mt_mountinfo(m);
     struct statfs fs;
@@ -10650,11 +10909,13 @@ static int mt_inner(const char *self) {
     snprintf(dotdot, sizeof dotdot, "%s/..", m);
     printf("dotdot=%d\n", !stat(dotdot, &up) && !stat(mt_base, &outer) && up.st_ino == outer.st_ino &&
                               up.st_dev == outer.st_dev);
-    mt_run_from(self, m);
     /* The defaults: 01777, owned by the caller, and nr_inodes in statfs. */
     printf("default=%d\n", mt_result(mount("none", m2, "tmpfs", MS_NOSUID, "nr_inodes=100")));
     if (!stat(m2, &st)) printf("default mode=%o uid=%d gid=%d\n", st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid);
     if (!statfs(m2, &fs)) printf("default files=%ld free=%ld\n", (long)fs.f_files, (long)fs.f_ffree);
+    /* Run from the default tmpfs, which has no size limit: the binary can be
+       larger than the 1 MiB one above, which a copy there would cut short. */
+    mt_run_from(self, m2);
     printf("umount default=%d\n", mt_result(umount2(m2, 0)));
     /* mount's checks. */
     printf("null-type=%d unknown-type=%d bad-option=%d flag-value=%d missing=%d not-dir=%d nouser=%d\n",
@@ -13696,6 +13957,83 @@ static int proc_at_read_case(const char *self) {
     printf("status=%d\n", reaped(kid));
     par_show("reaped", fds);
     for (int i = 0; i < 5; i++) close(fds[i]);
+    return 0;
+}
+
+/* The leader-exit-status case: a process whose leader ends with exit
+   before its other thread has, once that thread ends too, the status Linux's
+   synchronize_group_exit gives it: the last thread's own exit code, or the
+   group's for exit_group or a fatal signal. While the thread runs, its stat
+   shows the leader as a zombie with the leader's own exit_code (5 << 8),
+   and the zombie's stat and the wait show the process's status. */
+static int les_go[2], les_variant;
+static void *les_worker(void *unused) {
+    (void)unused;
+    char c;
+    if (read(les_go[0], &c, 1) != 1) syscall(SYS_exit, 99);
+    if (les_variant == 0) syscall(SYS_exit, 7);
+    if (les_variant == 1) syscall(SYS_exit_group, 9);
+    for (;;) pause();
+}
+
+/* The state and exit_code (field 52) of /proc/<pid>/stat, -1 if unread. */
+static int les_stat(pid_t pid, char *state) {
+    char path[64], buffer[4096];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    long n = proc_read(path, buffer, sizeof buffer - 1);
+    if (n <= 0) return -1;
+    buffer[n] = 0;
+    char *s = strrchr(buffer, ')');
+    if (!s || !s[1]) return -1;
+    s += 2;
+    *state = *s;
+    for (int i = 0; i < 49 && s; i++) {
+        s = strchr(s, ' ');
+        if (s) s++;
+    }
+    return s ? atoi(s) : -1;
+}
+
+static int leader_exit_status_case(void) {
+    static const char *names[] = {"exit", "exit_group", "sigkill"};
+    for (les_variant = 0; les_variant < 3; les_variant++) {
+        if (pipe(les_go) < 0) return 1;
+        fflush(stdout);
+        pid_t kid = fork();
+        if (kid < 0) return 2;
+        if (kid == 0) {
+            pthread_t worker;
+            if (pthread_create(&worker, NULL, les_worker, NULL)) _exit(98);
+            syscall(SYS_exit, 5);
+        }
+        /* Until the leader is a zombie, for at most 5 s. */
+        char state = '?';
+        int during = -1;
+        for (int i = 0; i < 500 && state != 'Z'; i++) {
+            during = les_stat(kid, &state);
+            if (state != 'Z') nanosleep(&(struct timespec){0, 10000000}, NULL);
+        }
+        if (state != 'Z') {
+            kill(kid, SIGKILL);
+            waitpid(kid, NULL, 0);
+            return 4;
+        }
+        if (les_variant == 2)
+            kill(kid, SIGKILL);
+        else if (write(les_go[1], "g", 1) != 1)
+            return 3;
+        siginfo_t info;
+        memset(&info, 0, sizeof info);
+        waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+        char zombie_state = '?';
+        int zombie = les_stat(kid, &zombie_state);
+        int status = 0;
+        waitpid(kid, &status, 0);
+        close(les_go[0]);
+        close(les_go[1]);
+        printf("%s: running state=%c exit_code=%d; zombie state=%c exit_code=%d; wait=%#x\n",
+               names[les_variant], state, during, zombie_state, zombie, status);
+    }
     return 0;
 }
 
@@ -34196,6 +34534,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
+    if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
@@ -34218,6 +34557,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "io-uring-transfers")) return io_uring_transfers_case();
+    if (!strcmp(mode, "io-uring-files")) return io_uring_files_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

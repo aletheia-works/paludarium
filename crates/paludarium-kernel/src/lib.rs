@@ -1668,6 +1668,9 @@ impl Kernel {
         };
         aio::progress(&ctx);
         let outcome = handler(&mut ctx, args);
+        // What the call made ready completes the polls that wait for it,
+        // in any process, before the call returns.
+        aio::progress(&ctx);
         if number == syscalls::nr::RT_SIGACTION
             && args[1] != 0
             && let Some(action) = thread.state.signal_actions.get(&(args[0] as i32))

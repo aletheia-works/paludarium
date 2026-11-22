@@ -47,11 +47,10 @@
    aligned.
    bpf-prog-acqrel: BPF_ATOMIC's load-acquire and store-release in each
    size: programs it takes and refuses (the registers, the alignment on
-   the stack and in a value, a read-only value, the context after the
-   access, a spilled pointer's fill), and a filter that runs them on a
-   map's value and the stack, whose results the case reads back from the
-   map. Not here: a load-acquire through the context into the register it
-   loads from, which 7.0 takes and master refuses.
+   the stack and in a value, a read-only value, the context, before a
+   load's access and after a store's, a spilled pointer's fill), and a
+   filter that runs them on a map's value and the stack, whose results the
+   case reads back from the map.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -2025,6 +2024,7 @@ static int case_acqrel(void) {
               LOAD_ACQ(S_W, 2, 0, 2), MOV(0, 0), EXIT());
     LOAD("load from the context", LOAD_ACQ(S_W, 2, 1, 0), MOV(0, 0), EXIT());
     LOAD("load misaligned in the context", LOAD_ACQ(S_W, 2, 1, 2), MOV(0, 0), EXIT());
+    LOAD("load from the context into its own register", LOAD_ACQ(S_W, 1, 1, 0), MOV(0, 0), EXIT());
     LOAD("store into cb[]", MOV(2, 1), STORE_REL(S_W, 1, 2, 48), MOV(0, 0), EXIT());
     LOAD("store into len", MOV(2, 1), STORE_REL(S_W, 1, 2, 0), MOV(0, 0), EXIT());
     LOAD("32 bits of a stored pointer", STORE_REL(S_DW, 10, 10, -8), LOAD_ACQ(S_W, 2, 10, -8),

@@ -1246,8 +1246,9 @@ pub(crate) mod tests {
 
     /// The soundness the verifier gives the interpreter: random programs
     /// near what it takes, of registers, the stack, the context, jumps,
-    /// atomics, load-acquires, store-releases and the helpers without maps, and every one it takes runs on packets of
-    /// a few lengths without a load or store outside what it points to.
+    /// atomics, load-acquires, store-releases and the helpers without
+    /// maps, and every one it takes runs on packets of a few lengths
+    /// without a load or store outside what it points to.
     #[test]
     fn programs_the_verifier_takes_never_fault() {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;

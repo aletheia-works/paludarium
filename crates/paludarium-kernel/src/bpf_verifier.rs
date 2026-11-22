@@ -15,12 +15,9 @@
 //!   multiplication, a shift or a bitwise operation is applied to, where
 //!   7.0 refuses it;
 //! - master takes an exit whose `src_reg` is `BPF_UNWIND_EXIT`.
-//! - 7.0 takes a load-acquire through the context into the register it
-//!   loads from, which master refuses.
 //!
 //! The log lines are 7.0's where the two kernels word them differently
-//! (the misaligned stack access, a sleepable program) or check in another
-//! order (a load-acquire through the context), as the differential
+//! (the misaligned stack access, a sleepable program), as the differential
 //! tests compare them with it. Master also writes a diagnostic after some
 //! errors at log level 1 or more; that is not written here.
 //!
@@ -1254,12 +1251,12 @@ impl Walk {
     /// Master and 7.0 check it alike.
     ///
     /// A load-acquire or store-release, of any size, is checked as a load
-    /// or a store is, always aligned, and then may not have gone through
-    /// the context (`atomic_ptr_type_ok`). Master refuses the context
-    /// before the load, 7.0 after it, so the log line is 7.0's, except
-    /// that a load into the register it loads from, which 7.0 then no
-    /// longer sees is the context and takes, is refused as master does,
-    /// before the load.
+    /// or a store is, always aligned, and may not go through the context
+    /// (`atomic_ptr_type_ok`). Master refuses the context for a load once
+    /// the source is read, before the load, and the test machines' 7.0
+    /// does too; 7.0 as released refuses it after the load, which also
+    /// lets a load into the register it loads from through. A store is
+    /// refused after it is checked, in both.
     fn atomic(&mut self, s: &mut State, insn: Insn, i: usize, options: Options) -> Checked<()> {
         let aligned = Options {
             strict_alignment: true,
@@ -1275,16 +1272,10 @@ impl Walk {
         match insn.imm {
             atomic::LOAD_ACQ => {
                 read_ok(s, insn.src)?;
-                let through_ctx = ctx(s, insn.src);
-                if through_ctx && insn.src == insn.dst {
+                if ctx(s, insn.src) {
                     return not_allowed("loads from", insn.src);
                 }
-                self.load(s, insn, i, aligned)?;
-                return if through_ctx {
-                    not_allowed("loads from", insn.src)
-                } else {
-                    Ok(())
-                };
+                return self.load(s, insn, i, aligned);
             }
             atomic::STORE_REL => {
                 self.store(s, insn, i, aligned)?;
@@ -2748,15 +2739,14 @@ mod tests {
             refused(&p),
             eacces("write into map forbidden, value_size=8 off=0 size=8")
         );
-        // Not through the context, after the access as 7.0 checks...
-        assert_eq!(
-            refused(&[i(0xc3, 2, 1, 0, ACQ), mov(0, 0), exit()]),
-            eacces("BPF_ATOMIC loads from R1 ctx is not allowed")
-        );
-        assert_eq!(
-            refused(&[i(0xc3, 2, 1, 2, ACQ), mov(0, 0), exit()]),
-            eacces("misaligned context access off 0+0+2 size 4")
-        );
+        // Not through the context: a load is refused before the access,
+        // into the register it loads from too, and a store after it.
+        for (dst, off) in [(2, 0), (2, 2), (1, 0), (1, 2), (10, 0)] {
+            assert_eq!(
+                refused(&[i(0xc3, dst, 1, off, ACQ), mov(0, 0), exit()]),
+                eacces("BPF_ATOMIC loads from R1 ctx is not allowed")
+            );
+        }
         assert_eq!(
             refused(&[mov(2, 1), i(0xc3, 1, 2, 48, REL), mov(0, 0), exit()]),
             eacces("BPF_ATOMIC stores into R1 ctx is not allowed")
@@ -2765,14 +2755,6 @@ mod tests {
             refused(&[mov(2, 1), i(0xc3, 1, 2, 0, REL), mov(0, 0), exit()]),
             eacces("invalid bpf_context access off=0 size=4")
         );
-        // ...except into the register loaded from, which master refuses
-        // before the access and 7.0 takes.
-        for off in [0, 2] {
-            assert_eq!(
-                refused(&[i(0xc3, 1, 1, off, ACQ), mov(0, 0), exit()]),
-                eacces("BPF_ATOMIC loads from R1 ctx is not allowed")
-            );
-        }
         // A pointer stored is loaded back, whole only.
         let p = [
             i(0xdb, 10, 10, -8, REL),

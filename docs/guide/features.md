@@ -1630,7 +1630,10 @@ kernel.
     ignores its failed unmap.
   - A child of `fork` keeps the seals; `exec` starts without any.
 
-- io_uring is Linux 6.12's with these operations: `IORING_OP_NOP`,
+- io_uring is Linux 6.12's, but for its registered files, its groups of
+  buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
+  `kbuf.c` and `nop.c`), the kernel the differential tests run on. Its
+  operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
   `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, and

@@ -1448,7 +1448,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     成功してマップされたまま残します。
   - `fork` の子は封印を受け継ぎ、`exec` のあとは何も封印されていません。
 
-- io_uring は Linux 6.12 のもので、操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
+- io_uring は Linux 6.12 のものですが、登録したファイル、バッファーのグループ、NOP の
+  フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
+  `kbuf.c`、`nop.c`）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
   それに `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS` です。ほかの操作は、それらなしでビルドした Linux と同じく

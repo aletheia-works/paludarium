@@ -8913,6 +8913,298 @@ static int io_uring_files_case(void) {
     return 0;
 }
 
+/* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
+   _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
+   registers, in the program's memory or in the kernel's pages
+   (IOU_PBUF_RING_MMAP), used a part at a time with IOU_PBUF_RING_INC. A
+   read with IOSQE_BUFFER_SELECT takes one, and its completion names it. A
+   regular file cannot be polled, so its read uses a ring's buffer as it
+   chooses it, failing or not; a pipe's read uses it once the read is done,
+   and leaves it if the read fails. Nothing here waits: a read of an empty
+   pipe has RWF_NOWAIT. */
+static unsigned char *ub_provide(int count, void *addr, unsigned len, unsigned short bgid,
+                                 long bid) {
+    unsigned char *sqe = ut_entry(31, count, bid, addr, len);
+    memcpy(sqe + 40, &bgid, 2);
+    return sqe;
+}
+
+static unsigned char *ub_remove(int count, unsigned short bgid) {
+    unsigned char *sqe = ut_entry(32, count, 0, NULL, 0);
+    memcpy(sqe + 40, &bgid, 2);
+    return sqe;
+}
+
+static unsigned char *ub_select(unsigned char opcode, int fd, long offset, const void *addr,
+                                unsigned len, unsigned short bgid) {
+    unsigned char *sqe = ut_entry(opcode, fd, offset, addr, len);
+    sqe[1] = 1 << 5;
+    memcpy(sqe + 40, &bgid, 2);
+    return sqe;
+}
+
+struct ub_reg {
+    unsigned long ring_addr;
+    unsigned ring_entries;
+    unsigned short bgid, flags;
+    unsigned long resv[3];
+};
+
+static long ub_ring(unsigned opcode, void *addr, unsigned entries, unsigned short bgid,
+                    unsigned short flags) {
+    struct ub_reg reg = {(unsigned long)addr, entries, bgid, flags, {0, 0, 0}};
+    return syscall(427, ut.fd, opcode, &reg, 1);
+}
+
+static void ub_entry(unsigned char *ring, unsigned index, void *addr, unsigned len,
+                     unsigned short bid) {
+    unsigned char *e = ring + 16 * index;
+    unsigned long a = (unsigned long)addr;
+    memcpy(e, &a, 8);
+    memcpy(e + 8, &len, 4);
+    memcpy(e + 12, &bid, 2);
+}
+
+static void ub_tail(unsigned char *ring, unsigned short tail) {
+    __atomic_store_n((unsigned short *)(ring + 14), tail, __ATOMIC_RELEASE);
+}
+
+/* Prints entry 0 of a ring: how far into `base` it starts, and its length. */
+static void ub_show_entry(const char *label, const unsigned char *ring, const char *base) {
+    unsigned long a;
+    unsigned len;
+    memcpy(&a, ring, 8);
+    memcpy(&len, ring + 8, 4);
+    printf("%s: +%ld len=%u\n", label, (long)(a - (unsigned long)base), len);
+}
+
+static void ub_head(const char *label, unsigned bgid) {
+    unsigned status[10] = {bgid};
+    long r = syscall(427, ut.fd, 26, status, 1);
+    printf("%s: r=%ld errno=%d head=%u\n", label, r, r < 0 ? errno : 0, status[1]);
+    errno = 0;
+}
+
+static int io_uring_buffers_case(void) {
+    char dir[] = "/tmp/io-uring-buffers-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    if (uring_open(&ut, 8)) return 81;
+    int fd = open("a", O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || write(fd, "hello world", 11) != 11) return 82;
+    int wronly = open("a", O_WRONLY);
+    int ends[2];
+    if (wronly < 0 || pipe2(ends, O_NONBLOCK)) return 83;
+    /* A ring's page, a read-only page, the buffers, and a page let go. */
+    unsigned char *page = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 84;
+    unsigned char *ring = page, *gone = page + 3 * 4096;
+    char *buf = (char *)page + 2 * 4096;
+    if (mprotect(page + 4096, 4096, PROT_READ) || munmap(gone, 4096)) return 85;
+    unsigned nowait = 8;
+    unsigned char *sqe;
+
+    /* The preparation of PROVIDE_BUFFERS and REMOVE_BUFFERS. */
+    ub_provide(0, buf, 4, 7, 0);
+    ut_run("provide-none");
+    ub_provide(-1, buf, 4, 7, 0);
+    ut_run("provide-negative");
+    ub_provide(65537, buf, 4, 7, 0);
+    ut_run("provide-too-many");
+    ub_provide(1, buf, 0, 7, 0);
+    ut_run("provide-empty");
+    ub_provide(2, (void *)-4L, 4, 7, 0);
+    ut_run("provide-wraps");
+    ub_provide(1, (void *)(1UL << 63), 4, 7, 0);
+    ut_run("provide-kernel-half");
+    ub_provide(1, buf, 4, 7, 65536);
+    ut_run("provide-id-past");
+    ub_provide(2, buf, 4, 7, 65535);
+    ut_run("provide-ids-past");
+    sqe = ub_provide(1, buf, 4, 7, 0);
+    sqe[28] = 1;
+    ut_run("provide-flags");
+    sqe = ub_provide(1, buf, 4, 7, 0);
+    sqe[2] = 1;
+    ut_run("provide-ioprio");
+    ub_remove(0, 7);
+    ut_run("remove-none");
+    ub_remove(65537, 7);
+    ut_run("remove-too-many");
+    sqe = ub_remove(1, 7);
+    sqe[24] = 1;
+    ut_run("remove-len");
+    ub_remove(1, 7);
+    ut_run("remove-no-group");
+
+    /* Provided buffers, used first first; one that a read chose is used
+       though the read fails. */
+    memset(buf, '.', 16);
+    ub_provide(2, buf, 4, 7, 10);
+    ut_run("provide");
+    ub_select(22, fd, 0, NULL, 0, 7);
+    ut_run("read-any");
+    ub_select(22, fd, 4, NULL, 2, 7);
+    ut_run("read-two");
+    printf("buffers: %.8s\n", buf);
+    ub_select(22, fd, 0, NULL, 0, 7);
+    ut_run("read-none-left");
+    ub_select(22, fd, 0, NULL, 0, 8);
+    ut_run("read-no-group");
+    struct iovec iov = {NULL, 3};
+    ub_provide(1, buf, 4, 7, 3);
+    ut_run("provide-one");
+    ub_select(1, fd, 6, &iov, 1, 7);
+    ut_run("readv-select");
+    printf("buffers: %.8s\n", buf);
+    ub_provide(1, buf, 4, 7, 4);
+    ut_run("provide-four");
+    ub_select(22, wronly, 0, NULL, 0, 7);
+    ut_run("read-wronly");
+    ub_provide(1, buf, 4, 7, 5);
+    ut_run("provide-five");
+    sqe = ub_select(22, ends[0], -1, NULL, 0, 7);
+    memcpy(sqe + 28, &nowait, 4);
+    ut_run("pipe-read-nowait");
+    ub_provide(3, buf, 4, 7, 0);
+    ut_run("provide-three");
+    ub_remove(2, 7);
+    ut_run("remove-two");
+    ub_remove(5, 7);
+    ut_run("remove-rest");
+    ub_remove(5, 7);
+    ut_run("remove-empty");
+
+    /* Registering a ring. */
+    struct ub_reg reg = {(unsigned long)ring, 2, 1, 0, {0, 0, 0}};
+    uring_show("ring-null", syscall(427, ut.fd, 22, NULL, 1));
+    uring_show("ring-two-args", syscall(427, ut.fd, 22, &reg, 2));
+    uring_show("ring-unmapped-arg", syscall(427, ut.fd, 22, gone, 1));
+    reg.resv[2] = 1;
+    uring_show("ring-resv", syscall(427, ut.fd, 22, &reg, 1));
+    uring_show("ring-three", ub_ring(22, ring, 3, 1, 0));
+    uring_show("ring-none", ub_ring(22, ring, 0, 1, 0));
+    uring_show("ring-too-big", ub_ring(22, ring, 65536, 1, 0));
+    uring_show("ring-flag", ub_ring(22, ring, 2, 1, 4));
+    uring_show("ring-no-addr", ub_ring(22, NULL, 2, 1, 0));
+    uring_show("ring-unaligned", ub_ring(22, ring + 8, 2, 1, 0));
+    uring_show("ring-wraps", ub_ring(22, (void *)-4096L, 2, 1, 0));
+    uring_show("ring-read-only", ub_ring(22, page + 4096, 2, 1, 0));
+    uring_show("ring-let-go", ub_ring(22, gone, 2, 1, 0));
+    uring_show("ring", ub_ring(22, ring, 2, 1, 0));
+    uring_show("ring-again", ub_ring(22, ring, 2, 1, 0));
+
+    /* A regular file's read uses the buffer at the head as it takes it. */
+    memset(buf, '.', 16);
+    ub_select(22, fd, 0, NULL, 0, 1);
+    ut_run("ring-read-empty");
+    ub_entry(ring, 0, buf, 4, 5);
+    ub_entry(ring, 1, buf + 4, 4, 6);
+    ub_tail(ring, 2);
+    ub_select(22, fd, 0, NULL, 0, 1);
+    ut_run("ring-read");
+    ub_head("ring-head", 1);
+    ub_select(22, wronly, 0, NULL, 0, 1);
+    ut_run("ring-read-wronly");
+    ub_head("ring-head-used", 1);
+    ub_select(22, fd, 0, NULL, 0, 1);
+    ut_run("ring-read-none-left");
+    printf("buffers: %.8s\n", buf);
+    ub_provide(1, buf, 4, 1, 0);
+    ut_run("provide-to-ring");
+    ub_remove(1, 1);
+    ut_run("remove-from-ring");
+    void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, ut.fd, 0x80000000UL | 1UL << 16);
+    printf("mmap-program-ring: %s errno=%d\n", m == MAP_FAILED ? "failed" : "mapped",
+           m == MAP_FAILED ? errno : 0);
+    m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, ut.fd, 0x80000000UL | 9UL << 16);
+    printf("mmap-no-ring: %s errno=%d\n", m == MAP_FAILED ? "failed" : "mapped",
+           m == MAP_FAILED ? errno : 0);
+
+    /* The status, and unregistering. */
+    ub_head("status-no-group", 9);
+    ub_head("status-big-group", 65537);
+    unsigned status[10] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    uring_show("status-resv", syscall(427, ut.fd, 26, status, 1));
+    ub_provide(1, buf, 4, 4, 0);
+    ut_run("provide-group-4");
+    ub_head("status-provided", 4);
+    struct ub_reg unreg = {0, 0, 1, 1, {0, 0, 0}};
+    uring_show("unregister-flags", syscall(427, ut.fd, 23, &unreg, 1));
+    uring_show("unregister-null", syscall(427, ut.fd, 23, NULL, 1));
+    uring_show("unregister", ub_ring(23, NULL, 0, 1, 0));
+    uring_show("unregister-again", ub_ring(23, NULL, 0, 1, 0));
+    uring_show("unregister-provided", ub_ring(23, NULL, 0, 4, 0));
+
+    /* Provided buffers keep a ring out; their group once empty does not. */
+    memset(ring, 0, 4096);
+    uring_show("ring-over-provided", ub_ring(22, ring, 2, 4, 2));
+    ub_remove(1, 4);
+    ut_run("remove-group-4");
+    uring_show("ring-over-empty", ub_ring(22, ring, 2, 4, 2));
+
+    /* A pipe's read uses its buffer once it is done: the bytes it read,
+       with IOU_PBUF_RING_INC. One that fails leaves it. */
+    memset(buf, '.', 16);
+    ub_entry(ring, 0, buf, 8, 3);
+    ub_tail(ring, 1);
+    sqe = ub_select(22, ends[0], -1, NULL, 0, 4);
+    memcpy(sqe + 28, &nowait, 4);
+    ut_run("pipe-ring-nowait");
+    ub_head("pipe-head", 4);
+    if (write(ends[1], "xyz", 3) != 3) return 86;
+    ub_select(22, ends[0], -1, NULL, 0, 4);
+    ut_run("pipe-ring-read");
+    ub_show_entry("pipe-entry", ring, buf);
+    ub_head("pipe-head-part", 4);
+    if (write(ends[1], "1234567", 7) != 7) return 87;
+    ub_select(22, ends[0], -1, NULL, 0, 4);
+    ut_run("pipe-ring-read-rest");
+    ub_show_entry("pipe-entry-used", ring, buf);
+    ub_head("pipe-head-used", 4);
+    printf("buffers: %.10s\n", buf);
+    char rest[8];
+    printf("pipe-left: %ld\n", (long)read(ends[0], rest, sizeof rest));
+
+    /* The kernel's pages, mapped at the ring's offset, used a part at a
+       time: a regular file's read uses what it may take. */
+    uring_show("ring-mmap", ub_ring(22, (void *)8, 1, 2, 1 | 2));
+    unsigned char *kring = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, ut.fd,
+                                0x80000000UL | 2UL << 16);
+    if (kring == MAP_FAILED) return 88;
+    printf("kernel-ring-tail: %u\n", *(unsigned short *)(kring + 14));
+    memset(buf, '.', 16);
+    ub_entry(kring, 0, buf, 10, 9);
+    ub_tail(kring, 1);
+    ub_select(22, fd, 0, NULL, 4, 2);
+    ut_run("inc-read-part");
+    ub_show_entry("inc-entry", kring, buf);
+    ub_head("inc-head", 2);
+    ub_select(22, fd, 4, NULL, 0, 2);
+    ut_run("inc-read-rest");
+    ub_show_entry("inc-entry-used", kring, buf);
+    ub_head("inc-head-used", 2);
+    printf("buffers: %.10s\n", buf);
+    uring_show("unregister-mmap", ub_ring(23, NULL, 0, 2, 0));
+    printf("kernel-ring-kept: %u\n", *(unsigned short *)(kring + 14));
+    munmap(kring, 4096);
+
+    /* The probe says the two operations run. */
+    unsigned char probe[16 + 8 * 64];
+    memset(probe, 0, sizeof probe);
+    syscall(427, ut.fd, 8, probe, 64);
+    printf("probe: 31=%d 32=%d\n", probe[16 + 8 * 31 + 2] & 1, probe[16 + 8 * 32 + 2] & 1);
+    close(ends[0]);
+    close(ends[1]);
+    close(wronly);
+    close(fd);
+    munmap(page, 3 * 4096);
+    unlink("a");
+    if (chdir("/")) return 89;
+    rmdir(dir);
+    return 0;
+}
+
 /* mprotect's checks in Linux's order, and the grows flags: the main stack
    grows down (as a MAP_GROWSDOWN mapping does, see grows_down_case), and
    nothing grows up on x86-64. */
@@ -34558,6 +34850,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "io-uring-transfers")) return io_uring_transfers_case();
     if (!strcmp(mode, "io-uring-files")) return io_uring_files_case();
+    if (!strcmp(mode, "io-uring-buffers")) return io_uring_buffers_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

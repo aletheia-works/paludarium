@@ -4707,7 +4707,7 @@ mod io_uring {
         let supported: Vec<u64> = (0..58)
             .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
             .collect();
-        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 20, 22, 23, 29]);
+        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 20, 22, 23, 29, 31, 32]);
         // A probe that is not zeroed, buffers without an argument, another
         // operation, another file.
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 1]), errno(Errno::EINVAL));
@@ -4817,7 +4817,7 @@ mod io_uring {
         fixed[1] = 1;
         assert_eq!(one(&mut f, &r, &fixed), -9);
         assert_eq!(one(&mut f, &r, &rw(READ, fd, 0, buf, 1)), -9);
-        // No buffer is ever provided, which a read finds before its access
+        // No buffer is provided, which a read finds before its access
         // mode; a write selects none.
         let mut select = rw(READ, fd, 0, 0, 1);
         select[1] = 1 << 5;
@@ -5217,6 +5217,333 @@ mod io_uring {
         assert_eq!(f.ret(0, &[u64::from(read), DATA + 8, 4]), 1);
         assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
         assert_eq!(f.ret(0, &[u64::from(read), DATA, 1]), 0);
+    }
+
+    const PROVIDE_BUFFERS: u8 = 31;
+    const REMOVE_BUFFERS: u8 = 32;
+    const BUFFER: u32 = 1;
+    const BUF_MORE: u32 = 1 << 4;
+    const ENOBUFS: i32 = -105;
+
+    /// Submits one entry, waits for it, and gives its result and flags.
+    fn one_flags(f: &mut Fixture, r: &Ring, sqe: &[u8; 64]) -> (i32, u32) {
+        let slot = u32_at(f, r.rings + 4) & 3;
+        push(f, r, slot, sqe);
+        assert_eq!(f.ret(426, &[r.fd, 1, 1, GETEVENTS]), 1);
+        let head = u32_at(f, r.rings + 8);
+        let at = r.rings + 64 + 16 * u64::from(head & 7);
+        let done = (u32_at(f, at + 8) as i32, u32_at(f, at + 12));
+        assert_eq!(reap(f, r).len(), 1);
+        done
+    }
+
+    /// `count` buffers of `len` bytes at `addr` for group `bgid`, from ID
+    /// `bid`.
+    fn provide(count: i32, addr: u64, len: u32, bgid: u16, bid: u64) -> [u8; 64] {
+        let mut e = rw(PROVIDE_BUFFERS, count as u64, bid, addr, len);
+        e[40..42].copy_from_slice(&bgid.to_le_bytes());
+        e
+    }
+
+    /// The entry `e` as another operation.
+    fn as_op(mut e: [u8; 64], opcode: u8) -> [u8; 64] {
+        e[0] = opcode;
+        e
+    }
+
+    fn remove(count: i32, bgid: u16) -> [u8; 64] {
+        as_op(provide(count, 0, 0, bgid, 0), REMOVE_BUFFERS)
+    }
+
+    /// A read of `len` bytes at `offset` of `fd` into a buffer of group
+    /// `bgid`.
+    fn select(opcode: u8, fd: u64, offset: u64, len: u32, bgid: u16) -> [u8; 64] {
+        let mut e = rw(opcode, fd, offset, 0, len);
+        e[1] = 1 << 5;
+        e[40..42].copy_from_slice(&bgid.to_le_bytes());
+        e
+    }
+
+    /// A file holding `contents`, open for reading.
+    fn file(f: &mut Fixture, name: &[u8], contents: &[u8]) -> u64 {
+        f.mem.write(GuestAddr(DATA), name).unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        f.mem.write(GuestAddr(DATA + 0x700), contents).unwrap();
+        assert_eq!(
+            f.ret(1, &[fd, DATA + 0x700, contents.len() as u64]),
+            contents.len() as u64
+        );
+        fd
+    }
+
+    #[test]
+    fn provided_buffers_are_chosen_first_first() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let buf = DATA + 0x800;
+        let fd = file(&mut f, b"/b\0", b"hello world");
+        // The preparation.
+        for (e, res) in [
+            (provide(0, buf, 4, 7, 0), -7),
+            (provide(-1, buf, 4, 7, 0), -7),
+            (provide(65537, buf, 4, 7, 0), -7),
+            (provide(1, buf, 0, 7, 0), -22),
+            (provide(2, u64::MAX - 4, 4, 7, 0), -75),
+            (provide(1, 1 << 63, 4, 7, 0), -14),
+            (provide(1, buf, 4, 7, 65536), -7),
+            (provide(2, buf, 4, 7, 65535), -22),
+            (remove(0, 7), -22),
+            (remove(65537, 7), -22),
+            (as_op(provide(1, buf, 0, 7, 0), REMOVE_BUFFERS), -22),
+            (remove(1, 7), -2),
+        ] {
+            assert_eq!(one_flags(&mut f, &r, &e), (res, 0), "{:?}", &e[..30]);
+        }
+        let mut flagged = provide(1, buf, 4, 7, 0);
+        flagged[28] = 1;
+        assert_eq!(one(&mut f, &r, &flagged), -22);
+        // Two of 4 bytes, IDs 10 and 11, used first first.
+        assert_eq!(one(&mut f, &r, &provide(2, buf, 4, 7, 10)), 0);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 0, 0, 7)),
+            (4, BUFFER | 10 << 16)
+        );
+        assert_eq!(bytes(&f, buf, 4), b"hell");
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 4, 2, 7)),
+            (2, BUFFER | 11 << 16)
+        );
+        assert_eq!(bytes(&f, buf + 4, 2), b"o ");
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 0, 0, 7)),
+            (ENOBUFS, 0)
+        );
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 0, 0, 8)),
+            (ENOBUFS, 0)
+        );
+        // A read that fails once it chose one uses it.
+        let iov = DATA + 0x600;
+        assert_eq!(one(&mut f, &r, &provide(1, buf, 4, 7, 3)), 0);
+        f.mem.write_u64(GuestAddr(iov), 0).unwrap();
+        f.mem.write_u64(GuestAddr(iov + 8), 3).unwrap();
+        let mut vectored = select(READV, fd, 6, 1, 7);
+        vectored[16..24].copy_from_slice(&iov.to_le_bytes());
+        assert_eq!(
+            one_flags(&mut f, &r, &vectored),
+            (3, BUFFER | 3 << 16),
+            "the vector's length"
+        );
+        assert_eq!(bytes(&f, buf, 3), b"wor");
+        f.mem.write(GuestAddr(DATA), b"/b\0").unwrap();
+        let wronly = f.ret(2, &[DATA, 1]);
+        assert_eq!(one(&mut f, &r, &provide(1, buf, 4, 7, 4)), 0);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, wronly, 0, 0, 7)),
+            (-9, BUFFER | 4 << 16)
+        );
+        // Removing takes what there is, and the group stays.
+        assert_eq!(one(&mut f, &r, &provide(3, buf, 4, 7, 0)), 0);
+        assert_eq!(one(&mut f, &r, &remove(2, 7)), 2);
+        assert_eq!(one(&mut f, &r, &remove(5, 7)), 1);
+        assert_eq!(one(&mut f, &r, &remove(5, 7)), 0);
+    }
+
+    /// Registers a ring of `entries` buffers for group `bgid` at `addr`.
+    fn pbuf(f: &mut Fixture, r: &Ring, addr: u64, entries: u32, bgid: u16, flags: u16) -> u64 {
+        let reg = DATA + 0x500;
+        f.mem.write(GuestAddr(reg), &[0; 40]).unwrap();
+        f.mem.write_u64(GuestAddr(reg), addr).unwrap();
+        f.mem
+            .write(GuestAddr(reg + 8), &entries.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(reg + 12), &bgid.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(reg + 14), &flags.to_le_bytes())
+            .unwrap();
+        f.ret(427, &[r.fd, 22, reg, 1])
+    }
+
+    /// Puts buffer `bid` of `len` bytes at `addr` in entry `index` of the
+    /// ring at `ring`.
+    fn entry(f: &Fixture, ring: u64, index: u64, addr: u64, len: u32, bid: u16) {
+        let at = ring + 16 * index;
+        f.mem.write_u64(GuestAddr(at), addr).unwrap();
+        f.mem.write(GuestAddr(at + 8), &len.to_le_bytes()).unwrap();
+        f.mem.write(GuestAddr(at + 12), &bid.to_le_bytes()).unwrap();
+    }
+
+    fn tail(f: &Fixture, ring: u64, tail: u16) {
+        f.mem
+            .write(GuestAddr(ring + 14), &tail.to_le_bytes())
+            .unwrap();
+    }
+
+    fn head(f: &mut Fixture, r: &Ring, bgid: u32) -> u64 {
+        let status = DATA + 0x500;
+        f.mem.write(GuestAddr(status), &[0; 40]).unwrap();
+        f.mem.write(GuestAddr(status), &bgid.to_le_bytes()).unwrap();
+        let done = f.ret(427, &[r.fd, 26, status, 1]);
+        if done != 0 {
+            return done;
+        }
+        u64::from(u32_at(f, status + 4))
+    }
+
+    #[test]
+    fn buffer_rings_register_as_linux_checks_them() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let einval = errno(Errno::EINVAL);
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(f.ret(427, &[r.fd, 22, 0, 1]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 22, DATA, 2]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 26, 0, 1]), einval);
+        for (entries, flags) in [(3, 0), (0, 0), (65536, 0), (2, 4)] {
+            assert_eq!(pbuf(&mut f, &r, page, entries, 1, flags), einval);
+        }
+        assert_eq!(pbuf(&mut f, &r, 0, 2, 1, 0), errno(Errno::EFAULT));
+        assert_eq!(pbuf(&mut f, &r, page + 8, 2, 1, 0), einval);
+        assert_eq!(pbuf(&mut f, &r, 0x7000_0000, 2, 1, 0), errno(Errno::EFAULT));
+        assert_eq!(pbuf(&mut f, &r, page, 2, 1, 0), 0);
+        assert_eq!(pbuf(&mut f, &r, page, 2, 1, 0), errno(Errno(17)));
+        // The kernel's pages, whose address is not looked at, map at
+        // their offset; a ring in the program's memory does not.
+        assert_eq!(pbuf(&mut f, &r, 8, 1, 2, 1), 0);
+        let mapped = f.ret(9, &[0, 4096, 3, MAP_SHARED, r.fd, 0x8000_0000 | 2 << 16]);
+        assert!(mapped < 1 << 47, "{mapped:#x}");
+        assert_eq!(
+            f.ret(9, &[0, 4096, 3, MAP_SHARED, r.fd, 0x8000_0000 | 1 << 16]),
+            errno(Errno::ENOMEM)
+        );
+        assert_eq!(
+            f.ret(9, &[0, 4096, 3, MAP_SHARED, r.fd, 0x8000_0000 | 3 << 16]),
+            errno(Errno::ENOMEM)
+        );
+        // An empty group of provided buffers gives way; one with some, not.
+        assert_eq!(one(&mut f, &r, &provide(1, DATA, 4, 3, 0)), 0);
+        assert_eq!(pbuf(&mut f, &r, page, 2, 3, 0), errno(Errno(17)));
+        assert_eq!(one(&mut f, &r, &remove(1, 3)), 1);
+        assert_eq!(pbuf(&mut f, &r, page, 2, 3, 0), 0);
+        // Provided buffers do not go in a ring.
+        assert_eq!(one(&mut f, &r, &provide(1, DATA, 4, 3, 0)), -22);
+        assert_eq!(one(&mut f, &r, &remove(1, 3)), -22);
+        // The status, and unregistering.
+        assert_eq!(head(&mut f, &r, 1), 0);
+        assert_eq!(head(&mut f, &r, 9), errno(Errno::ENOENT));
+        assert_eq!(head(&mut f, &r, 65536 + 1), errno(Errno::ENOENT));
+        let reg = DATA + 0x500;
+        f.mem.write(GuestAddr(reg), &[0; 40]).unwrap();
+        f.mem
+            .write(GuestAddr(reg + 12), &1u16.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(reg + 14), &1u16.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 23, reg, 1]), einval);
+        f.mem
+            .write(GuestAddr(reg + 14), &0u16.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 23, reg, 1]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 23, reg, 1]), errno(Errno::ENOENT));
+        assert_eq!(one(&mut f, &r, &provide(1, DATA, 4, 4, 0)), 0);
+        f.mem
+            .write(GuestAddr(reg + 12), &4u16.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 23, reg, 1]), einval);
+        assert_eq!(head(&mut f, &r, 4), einval);
+    }
+
+    #[test]
+    fn reads_take_buffers_from_rings() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let buf = DATA + 0x800;
+        let fd = file(&mut f, b"/c\0", b"abcdefghij");
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(pbuf(&mut f, &r, page, 2, 1, 0), 0);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 0, 0, 1)),
+            (ENOBUFS, 0)
+        );
+        entry(&f, page, 0, buf, 4, 5);
+        entry(&f, page, 1, buf + 4, 4, 6);
+        tail(&f, page, 2);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 0, 0, 1)),
+            (4, BUFFER | 5 << 16)
+        );
+        assert_eq!(bytes(&f, buf, 4), b"abcd");
+        assert_eq!(head(&mut f, &r, 1), 1);
+        // A regular file cannot be polled: its buffer goes as it is chosen,
+        // even if the read then fails.
+        f.mem.write(GuestAddr(DATA), b"/c\0").unwrap();
+        let wronly = f.ret(2, &[DATA, 1]);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, wronly, 0, 0, 1)),
+            (-9, BUFFER | 6 << 16)
+        );
+        assert_eq!(head(&mut f, &r, 1), 2);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 0, 0, 1)),
+            (ENOBUFS, 0)
+        );
+        // With IOU_PBUF_RING_INC a read uses what it may take of one.
+        assert_eq!(pbuf(&mut f, &r, 8, 1, 2, 1 | 2), 0);
+        let mapped = f.ret(9, &[0, 4096, 3, MAP_SHARED, r.fd, 0x8000_0000 | 2 << 16]);
+        entry(&f, mapped, 0, buf, 10, 9);
+        tail(&f, mapped, 1);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 0, 4, 2)),
+            (4, BUFFER | BUF_MORE | 9 << 16)
+        );
+        assert_eq!(f.mem.read_u64(GuestAddr(mapped)).unwrap(), buf + 4);
+        assert_eq!(u32_at(&f, mapped + 8), 6);
+        assert_eq!(head(&mut f, &r, 2), 0);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, fd, 4, 0, 2)),
+            (6, BUFFER | 9 << 16)
+        );
+        assert_eq!(bytes(&f, buf + 4, 6), b"efghij");
+        assert_eq!(head(&mut f, &r, 2), 1);
+    }
+
+    #[test]
+    fn a_pipe_uses_its_ring_buffer_once_the_read_is_done() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0o4000]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(pbuf(&mut f, &r, page, 1, 1, 2), 0);
+        entry(&f, page, 0, buf, 8, 3);
+        tail(&f, page, 1);
+        // A read that would wait leaves the buffer.
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, read, HERE, 0, 1)),
+            (-11, 0)
+        );
+        assert_eq!(head(&mut f, &r, 1), 0);
+        f.mem.write(GuestAddr(DATA), b"xyz").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 3]), 3);
+        // It uses what it read.
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, read, HERE, 0, 1)),
+            (3, BUFFER | BUF_MORE | 3 << 16)
+        );
+        assert_eq!(bytes(&f, buf, 3), b"xyz");
+        assert_eq!(u32_at(&f, page + 8), 5);
+        assert_eq!(head(&mut f, &r, 1), 0);
+        // Provided buffers go as they are chosen.
+        assert_eq!(one(&mut f, &r, &provide(1, buf, 4, 2, 0)), 0);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, read, HERE, 0, 2)),
+            (-11, BUFFER)
+        );
+        assert_eq!(one(&mut f, &r, &remove(1, 2)), 0);
     }
 }
 

@@ -1633,7 +1633,8 @@ kernel.
 - io_uring is Linux 6.12's with these operations: `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
-  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, and `IORING_OP_FILES_UPDATE`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, and
+  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. A request runs while `io_uring_enter` takes it, so
@@ -1646,8 +1647,8 @@ kernel.
   priority, the attributes, and the buffer or vector, and an error there
   ends the submission. Its issue completes with the error instead: the
   file (`EBADF` for no descriptor, or with `IOSQE_FIXED_FILE` for an empty
-  slot of the registered files), a provided buffer for
-  a read that selects one (`ENOBUFS`), the access mode, the `RWF_*` flags
+  slot of the registered files), the buffer of a read that selects one
+  (`ENOBUFS`, then `EFAULT` for one past the user half), the access mode, the `RWF_*` flags
   (`RWF_HIPRI` is `EINVAL`), the range, a read's `FAN_ACCESS_PERM`, and a
   file that cannot read or write (`EINVAL`, `EISDIR` for a directory). An
   offset of -1 is the file's position, which moves past what was moved,
@@ -1708,6 +1709,39 @@ kernel.
     (`EFAULT`; `EOVERFLOW`, and `EINVAL` for a range past the registered
     files). Registering files
     makes it all of them.
+
+- A ring keeps groups of buffers that a read with `IOSQE_BUFFER_SELECT`
+  chooses one of, the group that `buf_group` names, as Linux's
+  `io_uring/kbuf.c` does. The read is of its length at most, or of the whole
+  buffer, and its completion has `IORING_CQE_F_BUFFER` and the buffer's ID
+  in the top 16 bits of its flags. A group with none left, or none, is
+  `ENOBUFS`.
+  - `IORING_OP_PROVIDE_BUFFERS` adds buffers at the end of a group, making
+    it, with IDs from `off`, and `IORING_OP_REMOVE_BUFFERS` takes up to a
+    count from its start (`ENOENT` for no group), giving how many. They check
+    the entry as `io_provide_buffers_prep` and `io_remove_buffers_prep` do
+    (`E2BIG`, `EINVAL`, `EOVERFLOW`, `EFAULT` for buffers past the user
+    half). A group holds 65535 at most (`EOVERFLOW` if none could be
+    added). A read uses its buffer once it chose it, even if it then fails.
+  - `IORING_REGISTER_PBUF_RING` registers a ring of buffers for a group, as
+    `io_register_pbuf_ring` does: reserved bytes, an unknown flag, or a
+    count of entries not a power of two below 65536 is `EINVAL`, and a ring,
+    or a group with buffers, there already is `EEXIST`. The ring is in the
+    program's memory, page-aligned (`EINVAL`), not wrapping (`EOVERFLOW`) and
+    writable (`EFAULT`), or with `IOU_PBUF_RING_MMAP` in pages the kernel
+    gives, which `mmap` of the ring's descriptor at `IORING_OFF_PBUF_RING`
+    and the group's ID shows (`ENOMEM` for a group without them). Its pages
+    charge RLIMIT_MEMLOCK as registered buffers do.
+    `IORING_UNREGISTER_PBUF_RING` takes it away (`ENOENT`, `EINVAL` for
+    provided buffers), and `IORING_REGISTER_PBUF_STATUS` gives its head.
+  - A read takes the buffer at a ring's head unless the tail is there. A
+    file that cannot be polled, such as a regular file, uses it as the read
+    chooses it, whatever the read then does; a pipe or socket uses it once
+    its read did not fail, and one that failed leaves it in the ring. With
+    `IOU_PBUF_RING_INC` a read uses only the bytes it took (a file that
+    cannot be polled: the bytes it asked for), moving the buffer's address
+    and length past them, and its completion has `IORING_CQE_F_BUF_MORE`
+    while some of the buffer is left.
 
 - Linux's native asynchronous I/O (the calls libaio wraps) is `fs/aio.c`'s.
   `io_setup` makes the number of events at least four for each CPU and

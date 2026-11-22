@@ -405,12 +405,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ベースを残します。
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
-  `IORING_OP_FILES_UPDATE` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
+  `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
-  `IORING_REGISTER_FILE_ALLOC_RANGE` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
+  `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_PBUF_RING`、
+  `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
   パーソナリティは登録できず、バッファーは更新できません。タグを付ける
   `IORING_REGISTER_FILES2` と `_BUFFERS2` でファイルやバッファーを登録することもできません。登録した
   バッファーのページは固定されません。固定バッファーの転送は、そのときそのアドレスにマップ
@@ -427,8 +428,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   しておきますが（読むもののないパイプ、ソケット、eventfd、いっぱいのパイプ。`O_NONBLOCK`
   でも同じです）、エミュレーターは `EAGAIN` で完了させます。端末の読み出しは `io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに
-  `EINVAL` で失敗します。バッファーを提供できないので、`IOSQE_BUFFER_SELECT` の読み出しは
-  `ENOBUFS` で完了します。
+  `EINVAL` で失敗します。そのような読み出しがバッファーを選んでいれば、`RWF_NOWAIT` の
+  ものと同じく `EAGAIN` で完了します。リングのバッファーはリングに残り、提供バッファーは
+  使い終えます（Linux はその読み出しのために保ちます）。位置のないファイル（パイプ、ソケット、
+  端末、eventfd）はポーリングできるものとみなし、それで読み出しがリングのバッファーを使う
+  時点が決まります。プログラムのメモリにあるバッファーのリングも固定しません。カーネルは
+  使うたびにそのマッピングを通して読み書きするので、外したリングを読み出しが見つけると
+  `EFAULT` で失敗します。Linux は固定したページを使います。
 - **ネイティブ AIO の一部**：読み書きと同期は、Linux のバッファー付き I/O と同じく、
   どれも `io_submit` が取ったときに実行されます。`O_DIRECT` で開いたファイルのものも
   Linux のように裏では実行されず、同期のイベントは、Linux ではワーカーが少し後に入れるのに、

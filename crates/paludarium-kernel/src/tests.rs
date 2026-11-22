@@ -4707,7 +4707,7 @@ mod io_uring {
         let supported: Vec<u64> = (0..58)
             .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
             .collect();
-        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 22, 23, 29]);
+        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 20, 22, 23, 29]);
         // A probe that is not zeroed, buffers without an argument, another
         // operation, another file.
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 1]), errno(Errno::EINVAL));
@@ -4992,6 +4992,231 @@ mod io_uring {
         assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
         assert_eq!(f.ret(427, &[other.fd, 0, vec, 1]), 0);
         assert_eq!(f.ret(3, &[other.fd]), 0);
+    }
+
+    const FILES_UPDATE: u8 = 20;
+    const EMFILE: Errno = Errno(24);
+    const ENFILE: Errno = Errno(23);
+
+    fn fds(f: &Fixture, at: u64, fds: &[i32]) {
+        for (i, fd) in fds.iter().enumerate() {
+            f.mem
+                .write(GuestAddr(at + 4 * i as u64), &fd.to_le_bytes())
+                .unwrap();
+        }
+    }
+
+    /// A transfer on registered file `slot`.
+    fn on_slot(opcode: u8, slot: i32, offset: u64, addr: u64, len: u32) -> [u8; 64] {
+        let mut e = rw(opcode, slot as u64, offset, addr, len);
+        e[1] = 1;
+        e
+    }
+
+    /// An `IORING_OP_FILES_UPDATE` of `count` descriptors at `addr` from `offset`.
+    fn files_update(offset: u32, addr: u64, count: u32) -> [u8; 64] {
+        rw(FILES_UPDATE, 0, u64::from(offset), addr, count)
+    }
+
+    #[test]
+    fn registered_files_stand_for_their_descriptors() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (list, buf) = (DATA + 0x100, DATA + 0x800);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]) as i32;
+        f.mem.write(GuestAddr(DATA), b"/b\0").unwrap();
+        let other = f.ret(2, &[DATA, 0o102, 0o600]) as i32;
+        // None registered: a fixed transfer finds no file.
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 0, 0, buf, 1)), -9);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), errno(ENXIO));
+        // The registration's own checks, then each descriptor's.
+        assert_eq!(f.ret(427, &[r.fd, 2, 0, 1]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 2, list, (1 << 20) + 1]), errno(EMFILE));
+        assert_eq!(f.ret(427, &[r.fd, 2, 0x40_0000, 1]), errno(Errno::EFAULT));
+        for bad in [99, -2, r.fd as i32] {
+            fds(&f, list, &[fd, -1, bad]);
+            assert_eq!(
+                f.ret(427, &[r.fd, 2, list, 3]),
+                errno(Errno::EBADF),
+                "{bad}"
+            );
+        }
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), errno(ENXIO));
+        // Above RLIMIT_NOFILE.
+        f.mem.write_u64(GuestAddr(DATA + 0x400), 8).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 0x408), 8).unwrap();
+        assert_eq!(f.ret(160, &[7, DATA + 0x400]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 9]), errno(EMFILE));
+        fds(&f, list, &[fd, -1]);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 2]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 2]), errno(EBUSY));
+        // The slot holds the file once its descriptor is closed.
+        f.mem.write(GuestAddr(buf), b"hi").unwrap();
+        assert_eq!(one(&mut f, &r, &on_slot(WRITE, 0, 0, buf, 2)), 2);
+        assert_eq!(f.ret(3, &[fd as u64]), 0);
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 0, 0, buf + 0x10, 8)), 2);
+        assert_eq!(bytes(&f, buf + 0x10, 2), b"hi");
+        assert_eq!(one(&mut f, &r, &on_slot(FSYNC, 0, 0, 0, 0)), 0);
+        for slot in [1, 2, -1] {
+            assert_eq!(
+                one(&mut f, &r, &on_slot(READ, slot, 0, buf, 1)),
+                -9,
+                "{slot}"
+            );
+        }
+        // IORING_REGISTER_FILES_UPDATE.
+        let update = DATA + 0x200;
+        let set = |f: &Fixture, offset: u32, resv: u32| {
+            f.mem
+                .write(GuestAddr(update), &offset.to_le_bytes())
+                .unwrap();
+            f.mem
+                .write(GuestAddr(update + 4), &resv.to_le_bytes())
+                .unwrap();
+            f.mem.write_u64(GuestAddr(update + 8), list).unwrap();
+        };
+        fds(&f, list, &[other]);
+        set(&f, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 6, 0, 1]), errno(Errno::EFAULT));
+        set(&f, 1, 1);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 1]), errno(Errno::EINVAL));
+        set(&f, 2, 0);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 1]), errno(Errno::EINVAL));
+        set(&f, u32::MAX, 0);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 2]), errno(EOVERFLOW));
+        set(&f, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 1]), 1);
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 1, 0, buf, 1)), 0);
+        // Skipped, emptied; a bad descriptor empties its slot first.
+        fds(&f, list, &[-2, -1]);
+        set(&f, 0, 0);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 2]), 2);
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 0, 0, buf, 2)), 2);
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 1, 0, buf, 1)), -9);
+        fds(&f, list, &[99]);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 1]), errno(Errno::EBADF));
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 0, 0, buf, 2)), -9);
+        fds(&f, list, &[other, 99]);
+        assert_eq!(f.ret(427, &[r.fd, 6, update, 2]), 1);
+        // Unregistering takes arguments of none, then they are gone.
+        assert_eq!(f.ret(427, &[r.fd, 3, list, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), errno(ENXIO));
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 0, 0, buf, 1)), -9);
+    }
+
+    #[test]
+    fn files_update_puts_files_in_slots_or_free_ones() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let list = DATA + 0x100;
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]) as i32;
+        let alloc = u32::MAX;
+        // Preparation's checks, then none registered.
+        fds(&f, list, &[fd]);
+        let mut e = files_update(0, list, 1);
+        e[1] = 1;
+        assert_eq!(one(&mut f, &r, &e), -22);
+        let mut e = files_update(0, list, 1);
+        e[28] = 1;
+        assert_eq!(one(&mut f, &r, &e), -22);
+        let mut e = files_update(0, list, 1);
+        e[44] = 1;
+        assert_eq!(one(&mut f, &r, &e), -22);
+        assert_eq!(one(&mut f, &r, &files_update(0, list, 0)), -22);
+        assert_eq!(one(&mut f, &r, &files_update(0, list, 1)), -6);
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 1)), -6);
+        // Three empty slots, filled in order from the first.
+        fds(&f, list, &[-1, -1, -1]);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 3]), 0);
+        fds(&f, list, &[fd, fd]);
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 2)), 2);
+        assert_eq!((u32_at(&f, list), u32_at(&f, list + 4)), (0, 1));
+        fds(&f, list, &[fd, fd]);
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 2)), 1);
+        assert_eq!((u32_at(&f, list), u32_at(&f, list + 4)), (2, fd as u32));
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 1)), -(ENFILE.0));
+        // An emptied slot is the next one.
+        fds(&f, list, &[-1]);
+        assert_eq!(one(&mut f, &r, &files_update(1, list, 1)), 1);
+        fds(&f, list, &[fd]);
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 1)), 1);
+        assert_eq!(u32_at(&f, list), 1);
+        // No ring, no unknown descriptor; at an offset, within the table.
+        for bad in [r.fd as i32, 99] {
+            fds(&f, list, &[-1]);
+            assert_eq!(one(&mut f, &r, &files_update(0, list, 1)), 1);
+            fds(&f, list, &[bad]);
+            assert_eq!(one(&mut f, &r, &files_update(alloc, list, 1)), -9, "{bad}");
+        }
+        assert_eq!(one(&mut f, &r, &files_update(3, list, 1)), -22);
+        assert_eq!(
+            one(&mut f, &r, &files_update(alloc - 1, list, 2)),
+            -(EOVERFLOW.0)
+        );
+        // IORING_REGISTER_FILE_ALLOC_RANGE: only slot 2, which is taken.
+        let range = DATA + 0x200;
+        let set = |f: &Fixture, off: u32, len: u32, resv: u64| {
+            f.mem.write(GuestAddr(range), &off.to_le_bytes()).unwrap();
+            f.mem
+                .write(GuestAddr(range + 4), &len.to_le_bytes())
+                .unwrap();
+            f.mem.write_u64(GuestAddr(range + 8), resv).unwrap();
+        };
+        // No argument, or a count, then one that cannot be read.
+        assert_eq!(f.ret(427, &[r.fd, 25, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 25, 8, 0]), errno(Errno::EFAULT));
+        set(&f, u32::MAX, 2, 0);
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 0]), errno(EOVERFLOW));
+        set(&f, 2, 2, 0);
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 0]), errno(Errno::EINVAL));
+        set(&f, 2, 1, 1);
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 0]), errno(Errno::EINVAL));
+        set(&f, 2, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 0]), 0);
+        fds(&f, list, &[fd]);
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 1)), -(ENFILE.0));
+        fds(&f, list, &[-1]);
+        assert_eq!(one(&mut f, &r, &files_update(2, list, 1)), 1);
+        fds(&f, list, &[fd]);
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 1)), 1);
+        assert_eq!(u32_at(&f, list), 2);
+        // Unregistered, the range is the whole of the next table.
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        set(&f, 0, 0, 0);
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 0]), 0);
+        set(&f, 0, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 0]), errno(Errno::EINVAL));
+        fds(&f, list, &[-1, -1]);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 2]), 0);
+        fds(&f, list, &[fd]);
+        assert_eq!(one(&mut f, &r, &files_update(alloc, list, 1)), 1);
+        assert_eq!(u32_at(&f, list), 0);
+    }
+
+    #[test]
+    fn a_registered_pipe_end_holds_the_pipe_open() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, list) = (DATA + 0x300, DATA + 0x100);
+        assert_eq!(f.ret(293, &[ends, 0o4000]), 0);
+        let (read, write) = (u32_at(&f, ends), u32_at(&f, ends + 4));
+        fds(&f, list, &[write as i32]);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 1]), 0);
+        assert_eq!(f.ret(3, &[u64::from(write)]), 0);
+        // A writer is left: no end of file.
+        assert_eq!(f.ret(0, &[u64::from(read), DATA, 1]), errno(Errno::EAGAIN));
+        f.mem.write(GuestAddr(DATA), b"x").unwrap();
+        assert_eq!(one(&mut f, &r, &on_slot(WRITE, 0, HERE, DATA, 1)), 1);
+        assert_eq!(f.ret(0, &[u64::from(read), DATA + 8, 4]), 1);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        assert_eq!(f.ret(0, &[u64::from(read), DATA, 1]), 0);
     }
 }
 

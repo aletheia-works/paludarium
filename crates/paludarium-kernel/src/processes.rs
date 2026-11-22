@@ -186,7 +186,8 @@ pub(crate) struct ProcessView {
     pub zombie: bool,
     /// The wait status of a process that has ended (`exit_code` in Linux's
     /// `stat`): its code in the second byte, or its signal with 0x80 for a
-    /// core dumped; 0 while it runs.
+    /// core dumped; while it runs, that of its leader's own `exit` if the
+    /// leader has ended before the other threads, 0 otherwise.
     pub exit_code: i32,
     /// The signal of a group stop its parent's wait has not yet reported
     /// (Linux's `group_exit_code` while `SIGNAL_STOP_STOPPED`).
@@ -1078,7 +1079,7 @@ impl Processes {
                 Some(ExitStatus::Exited(code)) => (code & 255) << 8,
                 Some(ExitStatus::Signaled(signal)) if entry.dumped => signal & 127 | 0x80,
                 Some(ExitStatus::Signaled(signal)) => signal & 127,
-                _ => 0,
+                _ => entry.group.leader_exit(),
             },
             stop_report: entry.stop_report,
             exit_signal: entry.exit_signal,

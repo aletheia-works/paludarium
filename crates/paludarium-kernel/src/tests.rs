@@ -4031,7 +4031,7 @@ fn landlock_restricts_access_beneath_its_rules() {
 mod rseq {
     use super::*;
 
-    const SIGNATURE: u64 = 0x5305_3053;
+    pub(super) const SIGNATURE: u64 = 0x5305_3053;
 
     #[test]
     fn rseq_checks_its_arguments_as_linux_does() {
@@ -4181,6 +4181,81 @@ mod rseq {
             let cleared = f.mem.read_u64(GuestAddr(DATA + 8)).unwrap() == 0;
             assert_eq!(cleared, next == Next::Resume);
         }
+    }
+}
+
+/// The faults of the kernel's writes for a thread on its way back to user
+/// space count as the kernel's (Linux takes them in kernel mode, so perf's
+/// `exclude_kernel` leaves them out), wherever the checkpoint runs from.
+mod kernel_faults {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The thread's own faults and the kernel's for it.
+    fn counts(f: &Fixture) -> (u64, u64) {
+        let used = &f.thread.state.cpu.used;
+        (
+            used.faults.load(Ordering::SeqCst),
+            used.kernel_faults.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Counts the calling thread's faults to the fixture's thread, as the
+    /// runtime does from its start, outside any system call.
+    fn bound(f: &Fixture) {
+        paludarium_mmu::faults::bind(Arc::clone(&f.thread.state.cpu.used) as _);
+    }
+
+    #[test]
+    fn a_signal_frame_written_at_the_run_loops_checkpoint_faults_as_the_kernel() {
+        let mut f = fixture();
+        // A stack nothing has touched yet.
+        let stack = f
+            .mem
+            .map(None, 0x2000, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        f.thread.state.signal_actions.insert(
+            10,
+            SignalAction {
+                handler: 0x10_1300,
+                ..SignalAction::default()
+            },
+        );
+        f.thread.cpu.gpr[reg::RSP] = stack.0 + 0x2000;
+        bound(&f);
+        let before = counts(&f);
+        signals::queue(&mut f.thread.state, signals::PendingSignal::user(10, 0));
+        // Not from `handle`: as the run loop calls it before a run.
+        assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+        assert_eq!(f.thread.cpu.rip, GuestAddr(0x10_1300));
+        let after = counts(&f);
+        paludarium_mmu::faults::unbind();
+        assert_eq!(after.0, before.0);
+        assert!(after.1 > before.1, "{before:?} {after:?}");
+    }
+
+    #[test]
+    fn an_rseq_area_brought_up_to_date_before_a_run_faults_as_the_kernel() {
+        let mut f = fixture();
+        f.mem.write(GuestAddr(DATA), &[0xff; 32]).unwrap();
+        f.mem.write(GuestAddr(DATA + 8), &[0; 8]).unwrap();
+        assert_eq!(f.ret(334, &[DATA, 32, 0, rseq::SIGNATURE]), 0);
+        assert_eq!(f.kernel.enter_cpu(&mut f.thread, &f.mem), Next::Resume);
+        // The area's page loses its frame (MADV_DONTNEED); the next update
+        // faults it in again.
+        assert_eq!(f.ret(28, &[DATA, 0x1000, 4]), 0);
+        bound(&f);
+        let before = counts(&f);
+        f.thread.state.rseq_notify = true;
+        assert_eq!(f.kernel.enter_cpu(&mut f.thread, &f.mem), Next::Resume);
+        let after = counts(&f);
+        paludarium_mmu::faults::unbind();
+        let cpu = f.thread.state.on_cpu.expect("on a CPU").cpu;
+        let mut id = [0; 4];
+        f.mem.read(GuestAddr(DATA + 4), &mut id).unwrap();
+        assert_eq!(u32::from_le_bytes(id), cpu);
+        assert_eq!(after.0, before.0);
+        assert!(after.1 > before.1, "{before:?} {after:?}");
     }
 }
 

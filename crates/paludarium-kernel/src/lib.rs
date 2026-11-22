@@ -945,6 +945,11 @@ impl Kernel {
 
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
+        // Its writes to user memory, a signal frame's and the rseq area's,
+        // are the kernel's work for the thread on its way back to user space
+        // (`get_signal`, `rseq_handle_notify_resume`): their faults are the
+        // kernel's, wherever it is called from.
+        let _faults = KernelFaults::enter(&thread.state);
         // As in `handle`: a wait here shows the thread asleep.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         // A traced thread's clone goes on once the new task has started.

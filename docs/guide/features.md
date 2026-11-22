@@ -4303,7 +4303,7 @@ kernel.
   them to the task: a thread's first read or write of a page and its write
   to a page `fork` shares or of a private mapping of a file (in its own code
   and in the kernel's accesses for it: a system call's copies, a signal
-  frame), each as it is taken, and the faults of the reads and writes
+  frame, an `rseq` area's update), each as it is taken, and the faults of the reads and writes
   through `get_user_pages` made for it, which `perf` does not count:
   `mlock`'s population, a tracer's `PTRACE_PEEKDATA` and `PTRACE_POKEDATA`
   (counted to the tracer) and a core dump's (which leaves anonymous memory
@@ -4533,8 +4533,8 @@ kernel.
   `minor-faults` (a first read or write of a page, and a write to a page
   `fork` shares or a private mapping of a file's: the faults of the
   thread's code, left out with `exclude_user`, and those of the kernel's
-  accesses for it, a system call's copies or a signal frame, left out with
-  `exclude_kernel`), `context-switches` (each time it
+  accesses for it, a system call's copies, a signal frame or an `rseq`
+  area's update, left out with `exclude_kernel`), `context-switches` (each time it
   sleeps) and `cpu-migrations` (each time the CPU `getcpu` reports
   changes), the last two made by the kernel and so left out with
   `exclude_kernel`, as Linux leaves them out; `major-faults`, which count

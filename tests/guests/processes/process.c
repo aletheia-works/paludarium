@@ -7460,6 +7460,9 @@ static int proc_stat_counts_case(const char *self) {
     char *kept = mmap(NULL, (size_t)(pages * page), PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (kept == MAP_FAILED) return 2;
+    /* One fault a page: from about 128 CPUs on, the mapping reaches 2 MiB,
+       and a transparent huge page would fill 512 pages in one fault. */
+    madvise(kept, (size_t)(pages * page), MADV_NOHUGEPAGE);
     for (long i = 0; i < pages; i++) kept[i * page] = 1;
     long after = ps_field("/proc/self/stat", 10);
     long grown = ps_field("/proc/self/stat", 24);

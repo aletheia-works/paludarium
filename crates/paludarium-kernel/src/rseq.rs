@@ -297,6 +297,9 @@ impl Kernel {
     /// registration. Linux's `rseq_handle_notify_resume` on the way back to
     /// user space. An area it cannot bring up to date sends it `SIGSEGV`.
     pub fn enter_cpu(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
+        // Its accesses to the area are the kernel's (`get_user`, `put_user`
+        // in `rseq_handle_notify_resume`), and so are their faults.
+        let _faults = crate::KernelFaults::enter(&thread.state);
         let Some(registration) = thread.state.rseq else {
             self.seat = None;
             thread.state.on_cpu = None;

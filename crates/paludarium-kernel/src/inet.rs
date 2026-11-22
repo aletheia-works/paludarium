@@ -3351,7 +3351,6 @@ impl FileHandle for InetSocket {
     }
 }
 
-/// The inet socket of `file`, if it is one.
 /// Whether a peer of `ip` needs an interface (`__ipv6_addr_needs_scope_id`):
 /// a link-local unicast address, or a group of the node or the link scope
 /// (`ipv6_addr_scope2type`).
@@ -3363,6 +3362,7 @@ fn needs_scope_id(ip: Ipv6Addr) -> bool {
         first & 0xffc0 == 0xfe80
     }
 }
+/// The inet socket of `file`, if it is one.
 pub(crate) fn of(file: &Arc<dyn FileHandle>) -> Option<&InetSocket> {
     file.as_any()?.downcast_ref::<InetSocket>()
 }

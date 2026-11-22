@@ -7329,6 +7329,25 @@ static int proc_stat_sched_case(void) {
     pss_show("after the thread", self);
     return 0;
 }
+/* The pages to touch so that rss shows them: Linux counts rss in
+   percpu_counters (mm_struct rss_stat), which /proc reads as their folded
+   total (get_mm_counter), each CPU keeping less than percpu_counter_batch,
+   max(32, 2 * online CPUs) (lib/percpu_counter.c compute_batch_value), of
+   its own. Two reads can so differ from what changed between them by up to
+   2 * (batch - 1) * online CPUs pages, and 64 more than that are shown. The
+   online CPUs are the cpuN lines of /proc/stat (show_stat). */
+static long ps_rss_pages(void) {
+    long cpus = 0;
+    FILE *stat = fopen("/proc/stat", "r");
+    char line[256];
+    while (stat && fgets(line, sizeof line, stat))
+        if (!strncmp(line, "cpu", 3) && line[3] >= '0' && line[3] <= '9') cpus++;
+    if (stat) fclose(stat);
+    long configured = sysconf(_SC_NPROCESSORS_CONF);
+    if (cpus < configured) cpus = configured;
+    long batch = 2 * cpus > 32 ? 2 * cpus : 32;
+    return 2 * batch * cpus + 64;
+}
 static int proc_stat_counts_case(const char *self) {
     fflush(stdout);
     pid_t measuring = fork();
@@ -7342,18 +7361,19 @@ static int proc_stat_counts_case(const char *self) {
     ps_process_start = ps_field("/proc/self/stat", 22);
     printf("start: recent=%d\n", ps_recent(ps_process_start, ps_uptime()));
 
+    long pages = ps_rss_pages();
     long rusage = pf_get(RUSAGE_SELF);
     long before = ps_field("/proc/self/stat", 10);
     long rss = ps_field("/proc/self/stat", 24);
-    char *kept = mmap(NULL, (size_t)(64 * page), PROT_READ | PROT_WRITE,
+    char *kept = mmap(NULL, (size_t)(pages * page), PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (kept == MAP_FAILED) return 2;
-    for (long i = 0; i < 64; i++) kept[i * page] = 1;
+    for (long i = 0; i < pages; i++) kept[i * page] = 1;
     long after = ps_field("/proc/self/stat", 10);
     long grown = ps_field("/proc/self/stat", 24);
     printf("touched: at-least-rusage=%d at-least-64=%d rss-was=%d rss-grew-64=%d\n", before >= rusage,
            after - before >= 64, rss > 0, grown - rss >= 64);
-    munmap(kept, (size_t)(64 * page));
+    munmap(kept, (size_t)(pages * page));
     printf("unmapped: rss-fell=%d\n", ps_field("/proc/self/stat", 24) < grown);
 
     pthread_t thread;

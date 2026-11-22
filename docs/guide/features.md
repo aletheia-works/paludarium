@@ -2451,6 +2451,23 @@ kernel.
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).
+  - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
+    unicast one, or the multicast `ff00::/8`) goes out through an end
+    leaves from the route's preferred source, or the address
+    `ipv6_dev_get_saddr` picks: of the end's own for a group or a
+    link-local destination, else of every device's, none tentative, by
+    its rules (the same address, the scope, not deprecated, the outgoing
+    device, the label, the longest prefix), and `EADDRNOTAVAIL` where
+    none is. It comes to the peer's namespace when the end has its
+    carrier, neighbour discovery finds the peer (below), the peer takes
+    IPv6 (an MTU of 1280 at least and `disable_ipv6` off), neither address
+    is a loopback one (`ip6_rcv_core`), and the destination is an address
+    of that namespace, not tentative. There, and back, it goes as IPv4's
+    does, with ICMPv6's port unreachable and address unreachable
+    (`EHOSTUNREACH`, 3 seconds on), but without reverse path filtering;
+    and one from `::1` goes out, to be dropped there. A datagram holds
+    65527 bytes at most (`EMSGSIZE`), TCP takes no group (`ENETUNREACH`),
+    and a datagram to one reaches no one.
   - **IPv6 of veth ends:** an end up with its carrier is made ready as
     `addrconf_dev_config` does, once until it goes down: the multicast
     route `ff00::/8` (local table, metric 256), then the prefix route
@@ -2766,8 +2783,8 @@ kernel.
     with `NLMSGERR_ATTR_MISS_TYPE`), with another attribute, a key of
     another length, no device, or padding, a state, a type or a flag but
     `NTF_PROXY`; `EAFNOSUPPORT` for a family but IPv4's and IPv6's;
-    `ENODEV` for a device the namespace has not; `EOPNOTSUPP` for an IPv6
-    neighbour or a proxy entry of a veth end; and `ENOENT` for a neighbour
+    `ENODEV` for a device the namespace has not; `EOPNOTSUPP` for a proxy
+    entry of a veth end; and `ENOENT` for a neighbour
     the device has not, and for a proxy entry neither for the device asked
     nor for none.
   - **Neighbour changes:** `RTM_NEWNEIGH` adds or changes one of the
@@ -2778,8 +2795,10 @@ kernel.
     `NDA_DST` (`EINVAL`); a device the namespace has not (`ENODEV`), and
     to add, a link-layer address shorter than the device's six bytes
     (`EINVAL`); a family but IPv4's and IPv6's (`EAFNOSUPPORT`); a key
-    shorter than the family's (`EINVAL`); and for a veth end, an IPv6
-    neighbour or a proxy entry (`EOPNOTSUPP`). IPv4's neighbour of a loopback is keyed by `0.0.0.0`
+    shorter than the family's (`EINVAL`); and for a veth end, a proxy
+    entry (`EOPNOTSUPP`). An IPv6 neighbour is made only on a device with
+    IPv6 (`ndisc_constructor`: `EINVAL` for a veth end whose MTU is below
+    1280). IPv4's neighbour of a loopback is keyed by `0.0.0.0`
     whatever is asked, as `arp_constructor` keys it: a request for another
     key makes or changes that one with `NLM_F_CREATE` (`ENOENT` without),
     and removing it is `ENOENT`. An existing one with `NLM_F_EXCL` is
@@ -2808,7 +2827,9 @@ kernel.
     proxy entries, as `neigh_ifdown` does, but not those of no device.
   - **Neighbours of veth ends:** a veth end has IPv4's neighbours,
     resolved by ARP as `arp_constructor`, `neigh_event_send`,
-    `arp_process` and `neigh_timer_handler` do. Each is keyed by the
+    `arp_process` and `neigh_timer_handler` do, and IPv6's, resolved by
+    neighbour discovery as `ndisc_constructor`, `ndisc_solicit`,
+    `ndisc_recv_ns` and `ndisc_recv_na` do (below). Each is keyed by the
     address asked, of the type `inet_addr_type` gives that address as it
     is made (`RTN_BROADCAST` while the namespace has no local table): a
     group's is `NUD_NOARP` with the group's Ethernet address
@@ -2827,10 +2848,22 @@ kernel.
     told to `RTNLGRP_NEIGH`, the timers' as a netlink socket of the
     namespace next reads, polls or writes. A request with `NTF_USE` or
     `NTF_MANAGED` asks ARP as a packet does, from the address
-    `inet_select_addr` picks on the end (`arp_solicit`). An end going down takes its
+    `inet_select_addr` picks on the end (`arp_solicit`). IPv6's go the
+    same way, with neighbour discovery's timers (the same probes and
+    times), but: a unicast one's type is `RTN_UNICAST` and a group's
+    neighbour has its `33:33` Ethernet address (`ndisc_mc_map`); the
+    solicitation leaves from the packet's source if the end has it, not
+    tentative, else from the end's link-local address (`ipv6_get_lladdr`),
+    and without one none goes; it goes to the target's solicited-node
+    group, whose neighbour it makes; the peer answers only for an address
+    of its own end, not tentative (`ndisc_recv_ns`); and its advertisement
+    goes back through the neighbour it learns, which so delays at once. A
+    request with `NTF_USE` or `NTF_MANAGED` solicits from the end's
+    link-local address. An end going down takes its
     neighbours, each told of with `RTM_DELNEIGH` after its
-    `RTM_NEWLINK`; its peer losing its carrier, all but the permanent
-    ones (`neigh_carrier_down`); and an end that goes or moves away, all.
+    `RTM_NEWLINK`, IPv4's, then IPv6's; its peer losing its carrier, all
+    but the permanent ones (`neigh_carrier_down`); and an end that goes or
+    moves away, all.
   - **Neighbour tables:** an `RTM_GETNEIGHTBL` dump, as
     `neightbl_dump_info`, gives each table the family names (ARP's and
     neighbour discovery's for `AF_UNSPEC`, none for another family) with
@@ -2838,7 +2871,7 @@ kernel.
     configuration, statistics and default parameters, then each device's
     parameters, the newest first, which count its neighbours' references:
     ARP's of the veth ends and `lo` (`inetdev_init`), neighbour
-    discovery's of `lo`. Strictly, an
+    discovery's of `lo` and the ends with IPv6 (`ipv6_add_dev`). Strictly, an
     `ndtmsg` short, with padding or with attributes after it is `EINVAL`
     (`neightbl_valid_dump_info`).
   - **Notifications:** a socket is a member of the groups `bind` names

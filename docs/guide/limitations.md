@@ -970,10 +970,17 @@ verified.
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
   across a pair to an address of the peer's namespace; it takes IPv6
   addresses, makes its link-local one and its routes, and takes IPv6
-  routes a request adds without a gateway, but no IPv6 neighbour or proxy
-  entry, no route through a gateway and no IPv6 route lookup in through
-  it (`RTA_IIF`), each `EOPNOTSUPP`; and no IPv6 traffic goes through it
-  (`ENETUNREACH`). Its duplicate address detection sends no probe, finds
+  routes a request adds without a gateway, and IPv6's TCP and UDP and its
+  neighbours, but no proxy entry, no route through a gateway and no IPv6
+  route lookup in through it (`RTA_IIF`), each `EOPNOTSUPP`. A link-local
+  destination's scope ID is not taken: the first route to it is, and a
+  connect without one is not `EINVAL`. Neighbour discovery makes none of
+  the neighbours of the groups router solicitation, MLD reports and
+  duplicate address detection send to (`ff02::2`, `ff02::16`, the
+  solicited-node ones), no advertisement unasked, and no redirect; the
+  probe a delaying neighbour sends teaches the peer nothing, where
+  Linux's, from the end's link-local address, makes it a neighbour of
+  that address. Its duplicate address detection sends no probe, finds
   no duplicate and ends 1.5 seconds after it begins (half of
   `rtr_solicit_delay`, then a probe and a retransmit time), where Linux's
   ends 1 to 2 seconds on after a random delay; its link-local address is always made from its
@@ -982,18 +989,17 @@ verified.
   an end moves no counters; a namespace forwards nothing
   on to another; and a broadcast or multicast destination through an end
   reaches no one. ICMP's port unreachable is not rate limited
-  (`icmpv4_xrlim_allow`), so every datagram to a closed port of the
+  (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,
-  or the address or route it took goes, where Linux's packets stop. A connection to an address nobody answers ARP for fails
+  or the address or route it took goes, where Linux's packets stop. A connection to an address nobody answers ARP or neighbour discovery for fails
   3 seconds after each connect, where Linux's attempts made while the
   neighbour is resolving fail together. An end's neighbour is answered or
   not as the peer would answer when it begins to resolve or to delay,
   where Linux asks again with each probe, and so a packet waiting for one
   never goes once it is answered later; `NTF_MANAGED` ones are never
   probed again; no traffic confirms one (`dst_confirm`, `MSG_CONFIRM`), so
-  a delaying one is always probed; and the neighbour table dump gives no
-  veth end's IPv6 parameters. The addresses of an end that goes tell
+  a delaying one is always probed. The addresses of an end that goes tell
   their lifetimes as of the last netlink request, read or poll in its
   namespace, where Linux takes the time it goes. Making one takes
   only a name, an address and an MTU for each end (`EOPNOTSUPP` for the

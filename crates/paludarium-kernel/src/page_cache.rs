@@ -218,6 +218,7 @@ impl PageCaches {
             resolved: false,
             unlinked: false,
         }));
+        let _use = self.notify.fan.using();
         self.kept
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -360,12 +361,14 @@ impl PageCaches {
         Some(hold)
     }
     fn hold_of(self: &Arc<Self>, key: Key) -> Hold {
+        let use_ = self.notify.fan.using();
         *self
             .holds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry(key)
             .or_default() += 1;
+        drop(use_);
         Hold {
             caches: Arc::clone(self),
             key,
@@ -421,6 +424,7 @@ impl PageCaches {
         self.count(key, -1)
     }
     fn count(self: &Arc<Self>, key: Key, change: i64) -> Result<WriteAccess, Errno> {
+        let _use = self.notify.fan.using();
         let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
         let count = writes.entry(key).or_insert(0);
         if *count * change < 0 {
@@ -730,6 +734,14 @@ impl paludarium_mmu::PageSource for FilePages {
     fn shmem(&self) -> bool {
         !self.secret && self.file.shmem_pages()
     }
+    /// A memfd's holes that `MADV_COLLAPSE` fills are its own pages then.
+    fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        if self.shmem() {
+            self.file.allocate(offset, len)
+        } else {
+            Ok(())
+        }
+    }
     /// Whether the memfd holds the page, as shmem's page cache has a folio
     /// there; any other file holds every page.
     fn holds(&self, offset: u64) -> bool {
@@ -905,6 +917,7 @@ impl CoherentFile {
     /// Lists this description among the open ones.
     fn list(&self) {
         let id = Arc::as_ptr(&self.inner).cast::<()>().addr();
+        let _use = self.caches.notify.fan.using();
         self.caches
             .opens
             .lock()

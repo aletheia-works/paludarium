@@ -58,8 +58,8 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(config["licenses"]["exceptions"], LICENSE_EXCEPTIONS)
         self.assertEqual(config["advisories"]["unused-ignored-advisory"], "deny")
         self.assertEqual(
-            [entry["id"] for entry in config["advisories"]["ignore"]],
-            [a["id"] for a in ADVISORY_EXCEPTIONS],
+            [(entry["id"], entry["reason"]) for entry in config["advisories"]["ignore"]],
+            [(a["id"], f"{a['crate']} {a['reason']}") for a in ADVISORY_EXCEPTIONS],
         )
 
     def test_coreutils_policy_adds_only_its_license_exception(self):
@@ -93,6 +93,8 @@ class PolicyTests(unittest.TestCase):
             ADVISORY_EXCEPTIONS[:1],
             [*ADVISORY_EXCEPTIONS, extra],
             [{**ADVISORY_EXCEPTIONS[0], "crate": "zstd@0.14.3"}, *ADVISORY_EXCEPTIONS[1:]],
+            [*ADVISORY_EXCEPTIONS[:-1], {**ADVISORY_EXCEPTIONS[-1], "crate": "url@2.5.9"}],
+            [*ADVISORY_EXCEPTIONS[:-1], {**ADVISORY_EXCEPTIONS[-1], "reason": "other"}],
         ):
             with self.assertRaises(ValueError):
                 policy(EMPTY, advisories=advisories)

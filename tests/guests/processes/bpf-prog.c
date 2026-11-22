@@ -35,6 +35,29 @@
    SOCK_SEQPACKET pair, not at all for a stream socket, and before a
    datagram socket
    connected elsewhere refuses the sender (EPERM).
+   bpf-prog-atomic: BPF_ATOMIC's read-modify-write operations (add, or,
+   and, xor, each with and without BPF_FETCH, xchg and cmpxchg) in 32
+   and 64 bits: programs it takes and refuses, with the order of the
+   checks (the operation, its size, the registers, the context, the
+   alignment on the stack and in a value, a read-only value, the register
+   the old value goes to), and a filter that runs them on a map's value
+   and the stack, whose results the case reads back from the map. Then,
+   with BPF_F_STRICT_ALIGNMENT, plain loads through a hash lookup's result
+   before its null check: misaligned, which is refused for that first, and
+   aligned.
+   bpf-prog-acqrel: BPF_ATOMIC's load-acquire and store-release in each
+   size: programs it takes and refuses (the registers, the alignment on
+   the stack and in a value, a read-only value, the context, before a
+   load's access and after a store's, a spilled pointer's fill), and a
+   filter that runs them on a map's value and the stack, whose results the
+   case reads back from the map.
+   bpf-prog-ldabs: BPF_LD_ABS and BPF_LD_IND in each size: programs it
+   takes and refuses (R6 not the context, or moved, the source register,
+   R1 to R5 after the load, the reserved fields, a 64-bit load), and
+   filters that run them on AF_UNIX datagrams: the bytes they load,
+   big-endian, at offsets from the start, the network header and a
+   register, one that keeps as many bytes as it loads, and the loads past
+   the message or before it, or from the MAC header, which drop it.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -1820,6 +1843,351 @@ static int case_classic(void) {
     return 0;
 }
 
+#define ATOMIC_W(dst, src, off, op) I(0xc3, dst, src, off, op)
+#define ATOMIC_DW(dst, src, off, op) I(0xdb, dst, src, off, op)
+#define A_ADD 0x00
+#define A_OR 0x40
+#define A_AND 0x50
+#define A_XOR 0xa0
+#define A_FETCH 0x01
+#define A_XCHG 0xe1
+#define A_CMPXCHG 0xf1
+#define SLOTS 24
+
+/* The map's value, 8 bytes a slot. */
+static void slots(const char *name, int m) {
+    uint32_t key = 0;
+    uint64_t value[SLOTS] = {0};
+    uint64_t a[4] = {(uint32_t)m, (uintptr_t)&key, (uintptr_t)value, 0};
+    long r = bpf(1, a, sizeof a);
+    printf("%s lookup %ld:", name, r);
+    for (int i = 0; i < SLOTS; i++) printf(" %llx", (unsigned long long)value[i]);
+    putchar('\n');
+    fflush(stdout);
+}
+
+static int case_atomic(void) {
+    int value = map(2, 4, 8 * SLOTS, 1, 0);
+    int rdonly = map(2, 4, 8, 1, 1 << 7);
+    int hash = map(1, 8, 8, 4, 0);
+    say("maps %d", value > 0 && rdonly > 0 && hash > 0);
+
+    /* Programs it takes: fp-8 = 1 and r1 = 1, then the atomic. */
+#define ON_STACK(name, ...) LOAD(name, MOV(1, 1), STX_DW(10, 1, -8), __VA_ARGS__, MOV(0, 0), EXIT())
+    ON_STACK("add", ATOMIC_DW(10, 1, -8, A_ADD));
+    ON_STACK("fetch add", ATOMIC_DW(10, 1, -8, A_ADD | A_FETCH));
+    ON_STACK("or", ATOMIC_DW(10, 1, -8, A_OR));
+    ON_STACK("fetch or", ATOMIC_DW(10, 1, -8, A_OR | A_FETCH));
+    ON_STACK("and", ATOMIC_DW(10, 1, -8, A_AND));
+    ON_STACK("fetch and", ATOMIC_DW(10, 1, -8, A_AND | A_FETCH));
+    ON_STACK("xor", ATOMIC_DW(10, 1, -8, A_XOR));
+    ON_STACK("fetch xor", ATOMIC_DW(10, 1, -8, A_XOR | A_FETCH));
+    ON_STACK("xchg", ATOMIC_DW(10, 1, -8, A_XCHG));
+    ON_STACK("cmpxchg", MOV(0, 1), ATOMIC_DW(10, 1, -8, A_CMPXCHG));
+    ON_STACK("32-bit add", ATOMIC_W(10, 1, -4, A_ADD));
+    ON_STACK("32-bit fetch xor", ATOMIC_W(10, 1, -8, A_XOR | A_FETCH));
+    ON_STACK("32-bit xchg", ATOMIC_W(10, 1, -4, A_XCHG));
+    ON_STACK("32-bit cmpxchg", MOV(0, 1), ATOMIC_W(10, 1, -8, A_CMPXCHG));
+    ON_STACK("a pointer as the source", ATOMIC_DW(10, 10, -8, A_ADD));
+    LOAD("fetch a spilled pointer", STX_DW(10, 10, -8), MOV(1, 0), ATOMIC_DW(10, 1, -8, A_ADD | A_FETCH),
+         LDX_DW(0, 1, -16), EXIT());
+    LOAD("never written stack", MOV(1, 1), ATOMIC_DW(10, 1, -16, A_ADD), MOV(0, 0), EXIT());
+    LOAD_MAPS("into a value", LD_VALUE(6, value, 0), MOV(1, 1), ATOMIC_DW(6, 1, 8, A_ADD | A_FETCH),
+              MOV(0, 0), ATOMIC_W(6, 1, 4, A_CMPXCHG), MOV(0, 0), EXIT());
+
+    /* Programs it refuses. */
+    ON_STACK("no such operation", ATOMIC_DW(10, 1, -8, 0x02));
+    ON_STACK("operation -1", ATOMIC_DW(10, 1, -8, -1));
+    ON_STACK("sub", ATOMIC_DW(10, 1, -8, 0x10));
+    ON_STACK("8-bit fetch add", I(0xd3, 10, 1, -8, A_ADD | A_FETCH));
+    ON_STACK("16-bit add", I(0xcb, 10, 1, -8, A_ADD));
+    ON_STACK("16-bit, no such operation", I(0xcb, 10, 1, -8, 0x07));
+    ON_STACK("unwritten source", ATOMIC_DW(10, 2, -8, A_ADD));
+    ON_STACK("unwritten destination", ATOMIC_DW(3, 1, -8, A_ADD));
+    LOAD("cmpxchg without R0", MOV(1, 1), STX_DW(10, 1, -8), ATOMIC_DW(10, 1, -8, A_CMPXCHG), EXIT());
+    LOAD("into cb[]", MOV(2, 1), ATOMIC_W(1, 2, 48, A_ADD), MOV(0, 0), EXIT());
+    ON_STACK("misaligned on the stack", ATOMIC_DW(10, 1, -12, A_ADD));
+    ON_STACK("at the frame pointer", ATOMIC_DW(10, 1, 0, A_ADD));
+    ON_STACK("below the stack", ATOMIC_DW(10, 1, -520, A_ADD));
+    LOAD_MAPS("misaligned in a value", LD_VALUE(6, value, 0), MOV(1, 1), ATOMIC_W(6, 1, 2, A_ADD),
+              MOV(0, 0), EXIT());
+    LOAD_MAPS("past the value", LD_VALUE(6, value, 0), MOV(1, 1),
+              ATOMIC_DW(6, 1, 8 * SLOTS, A_ADD), MOV(0, 0), EXIT());
+    LOAD_MAPS("into a read-only value", LD_VALUE(6, rdonly, 0), MOV(1, 1), ATOMIC_DW(6, 1, 0, A_ADD),
+              MOV(0, 0), EXIT());
+    LOAD_MAPS("into a lookup's result unchecked", KEY8(hash), CALL(LOOKUP), MOV(1, 1),
+              ATOMIC_W(0, 1, 2, A_ADD), MOV(0, 0), EXIT());
+    ON_STACK("fetch into the frame pointer", ATOMIC_DW(10, 10, -8, A_ADD | A_FETCH));
+    ON_STACK("fetch into its own pointer", MOV_REG(2, 10), ATOMIC_DW(2, 2, -8, A_ADD | A_FETCH));
+    ON_STACK("cmpxchg through R0", MOV_REG(0, 10), ATOMIC_DW(0, 1, -8, A_CMPXCHG));
+    LOAD("a pointer's slot after an atomic", STX_DW(10, 10, -8), MOV(1, 0),
+         ATOMIC_DW(10, 1, -8, A_ADD | A_FETCH), LDX_DW(2, 10, -8), LDX_DW(0, 2, 0), EXIT());
+    LOAD("32 bits of a spilled pointer", STX_DW(10, 10, -8), MOV(1, 0),
+         ATOMIC_W(10, 1, -8, A_ADD | A_FETCH), MOV(0, 0), EXIT());
+#undef ON_STACK
+
+    /* BPF_F_STRICT_ALIGNMENT, for loads too: a lookup's result before its
+       null check is checked for alignment before it is refused. */
+    {
+        struct insn misaligned[] = {KEY8(hash), CALL(LOOKUP), LDX_W(0, 0, 2), EXIT()};
+        struct insn aligned[] = {KEY8(hash), CALL(LOOKUP), LDX_W(0, 0, 4), EXIT()};
+        struct prog_attr p = attr(misaligned, COUNT(misaligned));
+        p.prog_flags = 1;
+        run("strict, misaligned in a lookup's result unchecked", p);
+        p = attr(aligned, COUNT(aligned));
+        p.prog_flags = 1;
+        run("strict, aligned in a lookup's result unchecked", p);
+        run("not strict, misaligned in a lookup's result unchecked",
+            attr(misaligned, COUNT(misaligned)));
+    }
+
+    /* A filter that runs them on the map's value and the stack, and keeps
+       what each gave in the value. */
+    uint64_t start[SLOTS];
+    for (int i = 0; i < SLOTS; i++) start[i] = 0x0123456789abcdefULL ^ (0x1010101010101010ULL * (uint64_t)i);
+    uint32_t key = 0;
+    uint64_t u[4] = {(uint32_t)value, (uintptr_t)&key, (uintptr_t)start, 0};
+    say("update %ld", bpf(2, u, sizeof u));
+    int filter = PROGRAM(
+        LD_VALUE(6, value, 0),
+        MOV(1, 1), ATOMIC_DW(6, 1, 0, A_ADD),
+        MOV(1, 0xf00), ATOMIC_DW(6, 1, 8, A_OR),
+        MOV(2, 0xff), ATOMIC_DW(6, 2, 16, A_AND | A_FETCH), STX_DW(6, 2, 96),
+        MOV(3, -1), ATOMIC_DW(6, 3, 24, A_XOR | A_FETCH), STX_DW(6, 3, 104),
+        MOV(4, 5), ATOMIC_DW(6, 4, 32, A_XCHG), STX_DW(6, 4, 112),
+        /* Equal to what is there, then not. */
+        LDX_DW(0, 6, 40), MOV(1, 7), ATOMIC_DW(6, 1, 40, A_CMPXCHG), STX_DW(6, 0, 120),
+        MOV(0, 1), ATOMIC_DW(6, 1, 48, A_CMPXCHG), STX_DW(6, 0, 128),
+        /* 32 bits: the source's lower half, the old value zero-extended,
+           and R0's lower half compared. */
+        LD64(5, 0x710000001ULL), ATOMIC_W(6, 5, 56, A_ADD | A_FETCH), STX_DW(6, 5, 136),
+        LD64(5, 0x900000005ULL), ATOMIC_W(6, 5, 64, A_XCHG), STX_DW(6, 5, 144),
+        LDX_W(0, 6, 72), LD64(1, 0x300000000ULL), I(0x4f, 0, 1, 0, 0), MOV(1, 9),
+        ATOMIC_W(6, 1, 72, A_CMPXCHG), STX_DW(6, 0, 152),
+        /* The upper half of a slot, by its own address. */
+        LD64(1, 0xf000000f0ULL), ATOMIC_W(6, 1, 84, A_OR | A_FETCH), STX_DW(6, 1, 160),
+        /* The stack. */
+        LDX_DW(1, 6, 88), STX_DW(10, 1, -8), MOV(7, 2), ATOMIC_DW(10, 7, -8, A_ADD | A_FETCH),
+        LDX_DW(1, 10, -8), STX_DW(6, 1, 168), STX_DW(6, 7, 176),
+        MOV(0, 0), EXIT());
+    say("filter loaded %d", filter >= 0);
+    if (filter < 0) {
+        LOAD_MAPS("why", LD_VALUE(6, value, 0), MOV(0, 0), EXIT());
+        return 1;
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    say("attach %d", attach(pair[1], filter));
+    slots("before", value);
+    through("first", pair[0], pair[1], 4);
+    slots("after one", value);
+    through("second", pair[0], pair[1], 4);
+    slots("after two", value);
+    return 0;
+}
+
+#define LOAD_ACQ(size, dst, src, off) I(0xc3 | (size), dst, src, off, 0x100)
+#define STORE_REL(size, dst, src, off) I(0xc3 | (size), dst, src, off, 0x110)
+#define S_B 0x10
+#define S_H 0x08
+#define S_W 0x00
+#define S_DW 0x18
+
+static int case_acqrel(void) {
+    int value = map(2, 4, 8 * SLOTS, 1, 0);
+    int rdonly = map(2, 4, 8, 1, 1 << 7);
+    int hash = map(1, 8, 8, 4, 0);
+    say("maps %d", value > 0 && rdonly > 0 && hash > 0);
+
+    /* Programs it takes: r1 = 1, then the instructions. */
+#define WITH_R1(name, ...) LOAD(name, MOV(1, 1), __VA_ARGS__, MOV(0, 0), EXIT())
+#define MAPS_R1(name, ...) LOAD_MAPS(name, MOV(1, 1), __VA_ARGS__, MOV(0, 0), EXIT())
+    WITH_R1("8-bit", STORE_REL(S_B, 10, 1, -1), LOAD_ACQ(S_B, 2, 10, -1));
+    WITH_R1("16-bit", STORE_REL(S_H, 10, 1, -4), LOAD_ACQ(S_H, 2, 10, -4));
+    WITH_R1("32-bit", STORE_REL(S_W, 10, 1, -8), LOAD_ACQ(S_W, 2, 10, -8));
+    WITH_R1("64-bit", STORE_REL(S_DW, 10, 1, -8), LOAD_ACQ(S_DW, 2, 10, -8));
+    WITH_R1("load of never written stack", LOAD_ACQ(S_DW, 2, 10, -16));
+    LOAD_MAPS("in a value", LD_VALUE(6, value, 0), MOV(1, 1), STORE_REL(S_DW, 6, 1, 8),
+              LOAD_ACQ(S_W, 2, 6, 12), MOV(0, 0), EXIT());
+    LOAD_MAPS("load from a read-only value", LD_VALUE(6, rdonly, 0), LOAD_ACQ(S_DW, 2, 6, 0),
+              MOV(0, 0), EXIT());
+    LOAD("a pointer stored and loaded", STORE_REL(S_DW, 10, 10, -8), LOAD_ACQ(S_DW, 2, 10, -8),
+         LDX_DW(0, 2, -16), EXIT());
+    MAPS_R1("store of a pointer into a value", LD_VALUE(6, value, 0), STORE_REL(S_DW, 6, 10, 0));
+
+    /* Programs it refuses. */
+    WITH_R1("load from an unwritten register", LOAD_ACQ(S_DW, 2, 3, -8));
+    WITH_R1("load into the frame pointer", LOAD_ACQ(S_DW, 10, 10, -8));
+    WITH_R1("store of an unwritten register", STORE_REL(S_DW, 10, 3, -8));
+    WITH_R1("store through an unwritten register", STORE_REL(S_DW, 3, 1, -8));
+    WITH_R1("load misaligned on the stack", LOAD_ACQ(S_DW, 2, 10, -12));
+    WITH_R1("store misaligned on the stack", STORE_REL(S_W, 10, 1, -6));
+    MAPS_R1("load misaligned in a value", LD_VALUE(6, value, 0), LOAD_ACQ(S_W, 2, 6, 2));
+    MAPS_R1("store misaligned in a value", LD_VALUE(6, value, 0), STORE_REL(S_H, 6, 1, 1));
+    MAPS_R1("load past the value", LD_VALUE(6, value, 0), LOAD_ACQ(S_DW, 2, 6, 8 * SLOTS));
+    WITH_R1("store below the stack", STORE_REL(S_DW, 10, 1, -520));
+    MAPS_R1("store into a read-only value", LD_VALUE(6, rdonly, 0), STORE_REL(S_DW, 6, 1, 0));
+    LOAD_MAPS("load from a lookup's result unchecked", KEY8(hash), CALL(LOOKUP),
+              LOAD_ACQ(S_W, 2, 0, 2), MOV(0, 0), EXIT());
+    LOAD("load from the context", LOAD_ACQ(S_W, 2, 1, 0), MOV(0, 0), EXIT());
+    LOAD("load misaligned in the context", LOAD_ACQ(S_W, 2, 1, 2), MOV(0, 0), EXIT());
+    LOAD("load from the context into its own register", LOAD_ACQ(S_W, 1, 1, 0), MOV(0, 0), EXIT());
+    LOAD("store into cb[]", MOV(2, 1), STORE_REL(S_W, 1, 2, 48), MOV(0, 0), EXIT());
+    LOAD("store into len", MOV(2, 1), STORE_REL(S_W, 1, 2, 0), MOV(0, 0), EXIT());
+    LOAD("32 bits of a stored pointer", STORE_REL(S_DW, 10, 10, -8), LOAD_ACQ(S_W, 2, 10, -8),
+         MOV(0, 0), EXIT());
+#undef MAPS_R1
+#undef WITH_R1
+
+    /* A filter that runs them on the map's value and the stack, and keeps
+       what each gave in the value. */
+    uint64_t start[SLOTS];
+    for (int i = 0; i < SLOTS; i++) start[i] = 0x0123456789abcdefULL ^ (0x1010101010101010ULL * (uint64_t)i);
+    uint32_t key = 0;
+    uint64_t u[4] = {(uint32_t)value, (uintptr_t)&key, (uintptr_t)start, 0};
+    say("update %ld", bpf(2, u, sizeof u));
+    int filter = PROGRAM(
+        LD_VALUE(6, value, 0),
+        /* Stores of each size change only their own bytes. */
+        LD64(1, 0xfedcba9876543210ULL),
+        STORE_REL(S_B, 6, 1, 0), STORE_REL(S_H, 6, 1, 10), STORE_REL(S_W, 6, 1, 20),
+        STORE_REL(S_DW, 6, 1, 24),
+        /* Loads of each size, zero-extended into all ones. */
+        MOV(2, -1), LOAD_ACQ(S_B, 2, 6, 33), STX_DW(6, 2, 64),
+        MOV(2, -1), LOAD_ACQ(S_H, 2, 6, 34), STX_DW(6, 2, 72),
+        MOV(2, -1), LOAD_ACQ(S_W, 2, 6, 36), STX_DW(6, 2, 80),
+        MOV(2, -1), LOAD_ACQ(S_DW, 2, 6, 40), STX_DW(6, 2, 88),
+        /* A load into the register it loads from. */
+        MOV_REG(3, 6), LOAD_ACQ(S_DW, 3, 3, 48), STX_DW(6, 3, 96),
+        /* The stack: a store, then loads of its parts. */
+        LDX_DW(1, 6, 56), STORE_REL(S_DW, 10, 1, -8), LOAD_ACQ(S_H, 2, 10, -6), STX_DW(6, 2, 104),
+        MOV(1, 0x5a), STORE_REL(S_B, 10, 1, -7), LOAD_ACQ(S_DW, 2, 10, -8), STX_DW(6, 2, 112),
+        /* Count the messages. */
+        LOAD_ACQ(S_DW, 1, 6, 120), ADD(1, 1), STORE_REL(S_DW, 6, 1, 120),
+        MOV(0, 0), EXIT());
+    say("filter loaded %d", filter >= 0);
+    if (filter < 0) {
+        LOAD_MAPS("why", LD_VALUE(6, value, 0), MOV(0, 0), EXIT());
+        return 1;
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    say("attach %d", attach(pair[1], filter));
+    slots("before", value);
+    through("first", pair[0], pair[1], 4);
+    slots("after one", value);
+    through("second", pair[0], pair[1], 4);
+    slots("after two", value);
+    return 0;
+}
+
+#define ABS(size, imm) I(0x20 | (size), 0, 0, 0, imm)
+#define IND(size, src, imm) I(0x40 | (size), 0, src, 0, imm)
+
+/* Sends 64 bytes (0, 1, 2, ...) through a filter of `insns`, after R6 =
+   the context. */
+static void ldabs_through(const char *name, const struct insn *insns, unsigned count) {
+    struct insn p[16] = {MOV_REG(6, 1)};
+    memcpy(p + 1, insns, count * sizeof *insns);
+    int prog = load(p, count + 1);
+    int pair[2];
+    if (prog < 0 || socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) {
+        say("%s: %d", name, prog);
+        return;
+    }
+    int r = attach(pair[1], prog);
+    if (r) say("%s attach %d", name, r);
+    through(name, pair[0], pair[1], 64);
+    close(pair[0]);
+    close(pair[1]);
+    close(prog);
+}
+#define LDABS_THROUGH(name, ...)                                \
+    do {                                                        \
+        struct insn i_[] = {__VA_ARGS__};                       \
+        ldabs_through((name), i_, COUNT(i_));                   \
+    } while (0)
+
+static int case_ldabs(void) {
+    /* Programs it takes: R6 = the context, then the instructions. */
+#define CTX(name, ...) LOAD(name, MOV_REG(6, 1), __VA_ARGS__, EXIT())
+    CTX("abs 32-bit", ABS(S_W, 0));
+    CTX("abs 16-bit", ABS(S_H, 1));
+    CTX("abs 8-bit", ABS(S_B, 2));
+    CTX("ind of each size", MOV(7, 1), IND(S_W, 7, 0), IND(S_H, 7, -1), IND(S_B, 7, 2));
+    CTX("ind from the frame pointer", IND(S_B, 10, 0));
+    CTX("ind from the context", IND(S_B, 6, 0));
+    CTX("from the network and MAC headers", ABS(S_H, NET(0)), ABS(S_B, LL(0)));
+    CTX("past the end and before the start", ABS(S_W, 0x7fffffff), ABS(S_B, -1));
+    CTX("R6 to R9 kept", MOV(7, 7), MOV(8, 8), MOV(9, 9), ABS(S_B, 0), ADD(0, 1), MOV_REG(0, 9),
+        MOV_REG(0, 8), MOV_REG(0, 7), LDX_W(0, 6, 0));
+    CTX("R0 a number", ABS(S_B, 0), ADD(0, 1));
+
+    /* Programs it refuses. */
+    LOAD("R6 unwritten", ABS(S_B, 0), EXIT());
+    LOAD("R6 a number", MOV(6, 0), ABS(S_B, 0), EXIT());
+    LOAD("R6 the frame pointer", MOV_REG(6, 10), ABS(S_B, 0), EXIT());
+    LOAD("R6 the context moved", MOV_REG(6, 1), ADD(6, 4), ABS(S_B, 0), EXIT());
+    LOAD("R6 a number, the source unwritten", MOV(6, 0), IND(S_B, 7, 0), EXIT());
+    CTX("the source unwritten", IND(S_B, 7, 0));
+    LOAD("the context moved, the source unwritten", MOV_REG(6, 1), ADD(6, 4), IND(S_B, 7, 0), EXIT());
+    CTX("R1 after the load", ABS(S_B, 0), MOV_REG(0, 1));
+    CTX("R5 after the load", MOV(5, 5), ABS(S_B, 0), MOV_REG(0, 5));
+    CTX("a destination", I(0x30, 1, 0, 0, 0));
+    CTX("an offset", I(0x30, 0, 0, 1, 0));
+    CTX("abs with a source", I(0x30, 0, 1, 0, 0));
+    CTX("ind with an offset", I(0x50, 0, 1, 2, 0));
+    CTX("abs 64-bit", I(0x38, 0, 0, 0, 0));
+    CTX("ind 64-bit", I(0x58, 0, 1, 0, 0));
+#undef CTX
+
+    /* What they load, kept in a value of 8 slots. */
+    int value = map(2, 4, 8 * SLOTS, 1, 0);
+    say("map %d", value > 0);
+    int filter = PROGRAM(
+        MOV_REG(6, 1), LD_VALUE(8, value, 0), MOV(7, 5),
+        ABS(S_W, 0), STX_DW(8, 0, 0),
+        ABS(S_H, 1), STX_DW(8, 0, 8),
+        ABS(S_B, 63), STX_DW(8, 0, 16),
+        ABS(S_W, 60), STX_DW(8, 0, 24),
+        IND(S_W, 7, 1), STX_DW(8, 0, 32),
+        IND(S_H, 7, -5), STX_DW(8, 0, 40),
+        ABS(S_H, NET(2)), STX_DW(8, 0, 48),
+        IND(S_B, 7, NET(0)), STX_DW(8, 0, 56),
+        /* The offset is an int: the upper half of R7 goes. */
+        LD64(7, 0x100000003ULL), IND(S_W, 7, 1), STX_DW(8, 0, 64),
+        LD64(7, -0x200000LL), IND(S_B, 7, 0x100009), STX_DW(8, 0, 72),
+        MOV(0, 64), EXIT());
+    say("filter loaded %d", filter >= 0);
+    if (filter < 0) return 1;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    say("attach %d", attach(pair[1], filter));
+    through("loads", pair[0], pair[1], 64);
+    slots("loaded", value);
+    close(pair[0]);
+    close(pair[1]);
+
+    /* What they keep: R0 as loaded, or nothing where the load fails. */
+    LDABS_THROUGH("keep byte 10", ABS(S_B, 10), EXIT());
+    LDABS_THROUGH("keep 16 bits at 9", ABS(S_H, 9), EXIT());
+    LDABS_THROUGH("keep from the network header", ABS(S_B, NET(20)), EXIT());
+    LDABS_THROUGH("keep through R7", MOV(7, 30), IND(S_B, 7, 3), EXIT());
+    LDABS_THROUGH("32 bits at 61", ABS(S_W, 61), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at 64", ABS(S_B, 64), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at -1", ABS(S_B, -1), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at INT_MAX", ABS(S_B, 0x7fffffff), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at INT_MIN", ABS(S_B, INT32_MIN), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits from the network header at 64", ABS(S_B, NET(64)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits below the network header", ABS(S_B, NET(-1)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits from the MAC header", ABS(S_B, LL(0)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits below the MAC header", ABS(S_B, LL(-1)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("ind at -1", MOV(7, -1), IND(S_B, 7, 0), MOV(0, 3), EXIT());
+    LDABS_THROUGH("ind past the end", MOV(7, 62), IND(S_H, 7, 1), MOV(0, 3), EXIT());
+    LDABS_THROUGH("ind at the end", MOV(7, 62), IND(S_H, 7, 0), MOV(0, 3), EXIT());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1829,5 +2197,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-attach")) return case_attach();
     if (!strcmp(mode, "bpf-prog-corpus")) return case_corpus();
     if (!strcmp(mode, "bpf-prog-classic")) return case_classic();
+    if (!strcmp(mode, "bpf-prog-atomic")) return case_atomic();
+    if (!strcmp(mode, "bpf-prog-acqrel")) return case_acqrel();
+    if (!strcmp(mode, "bpf-prog-ldabs")) return case_ldabs();
     return 2;
 }

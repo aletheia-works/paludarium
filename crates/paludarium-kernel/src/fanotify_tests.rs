@@ -807,3 +807,239 @@ fn a_mount_namespace_that_ends_takes_out_each_mount_and_its_marks() {
         errno(Errno::ENOENT)
     );
 }
+
+#[test]
+fn drop_caches_evicts_the_evictable_marks_of_files_nothing_holds() {
+    let mut f = fixture();
+    let eacces = errno(Errno::EACCES);
+    // Mode 0200: root may write it, and no one read it.
+    assert_eq!(f.open("/proc/sys/vm/drop_caches", 0), eacces);
+    assert_eq!(f.open("/proc/sys/vm/drop_caches", 2), eacces);
+    let drop = |f: &mut Fixture, value: &[u8]| {
+        let fd = f.open("/proc/sys/vm/drop_caches", 1);
+        let at = f.put(value);
+        let n = f.ret(1, &[fd, at, value.len() as u64]);
+        f.close(fd);
+        n
+    };
+    let einval = errno(Errno::EINVAL);
+    assert_eq!(drop(&mut f, b"0"), einval);
+    assert_eq!(drop(&mut f, b"5"), einval);
+    assert_eq!(drop(&mut f, b"4\n"), 2);
+    // A host's directory, whose inodes go once nothing uses them, as an
+    // ext4's do; a tmpfs keeps its own (its dentries stay).
+    let host = std::env::temp_dir().join(format!("paludarium-drop-caches-{}", std::process::id()));
+    std::fs::create_dir_all(&host).unwrap();
+    let base = paludarium_vfs::MemFs::new();
+    let _ = <paludarium_vfs::MemFs as paludarium_vfs::HostFs>::mkdir(&base, b"/tmp", 0o1777);
+    let mut mounted = paludarium_vfs::MountedFs::new(base);
+    mounted
+        .mount(
+            b"/data".to_vec(),
+            Arc::new(paludarium_host::NativeFs::new(&host).unwrap()),
+        )
+        .unwrap();
+    f.kernel.files.set_file_system(Arc::new(mounted));
+    f.mkdir("/data/d");
+    for name in [
+        "/data/e",
+        "/data/held",
+        "/data/kept",
+        "/data/watched",
+        "/tmp/t",
+    ] {
+        f.touch(name);
+    }
+    let fan = f.init(NONBLOCK, 0);
+    let other = f.init(NONBLOCK, 0);
+    for name in [
+        "/data/e",
+        "/data/d",
+        "/data/held",
+        "/data/kept",
+        "/data/watched",
+        "/tmp/t",
+    ] {
+        assert_eq!(f.mark(fan, ADD | EVICTABLE, OPEN, name), 0);
+    }
+    // A file made, written back and marked by its descriptor, as the
+    // differential case marks its free files, goes too once closed.
+    let made = f.open("/data/made", 0o301);
+    assert_eq!(f.ret(74, &[made]), 0);
+    assert_eq!(f.ret(MARK, &[fan, ADD | EVICTABLE, OPEN, made, 0]), 0);
+    f.close(made);
+    // Another group's mark that holds its inode, an open description and
+    // an inotify watch keep theirs.
+    assert_eq!(f.mark(other, ADD, OPEN, "/data/kept"), 0);
+    let held = f.open("/data/held", 0);
+    let inotify = f.ret(294, &[0]);
+    let watched = f.put(b"/data/watched");
+    assert!((f.ret(254, &[inotify, watched, 0x20]) as i64) > 0);
+    let marks = |f: &mut Fixture| {
+        f.fdinfo(fan)
+            .lines()
+            .filter(|l| l.starts_with("fanotify ino:"))
+            .count()
+    };
+    assert_eq!(marks(&mut f), 7);
+    // 1 drops the page cache alone.
+    assert_eq!(drop(&mut f, b"1"), 1);
+    assert_eq!(marks(&mut f), 7);
+    assert_eq!(drop(&mut f, b"2"), 1);
+    // e's and made's go. The directory's stays (its children's dentries
+    // may hold it), and so does the tmpfs file's.
+    assert_eq!(marks(&mut f), 5);
+    f.close(held);
+    assert_eq!(drop(&mut f, b"3"), 1);
+    assert_eq!(marks(&mut f), 4);
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[test]
+fn a_use_made_between_an_evictions_look_and_its_removal_keeps_the_mark() {
+    let mut f = fixture();
+    let host = std::env::temp_dir().join(format!("paludarium-evict-race-{}", std::process::id()));
+    std::fs::create_dir_all(&host).unwrap();
+    let base = paludarium_vfs::MemFs::new();
+    let _ = <paludarium_vfs::MemFs as paludarium_vfs::HostFs>::mkdir(&base, b"/tmp", 0o1777);
+    let mut mounted = paludarium_vfs::MountedFs::new(base);
+    mounted
+        .mount(
+            b"/data".to_vec(),
+            Arc::new(paludarium_host::NativeFs::new(&host).unwrap()),
+        )
+        .unwrap();
+    f.kernel.files.set_file_system(Arc::new(mounted));
+    let fan = f.init(NONBLOCK, 0);
+    let other = f.init(NONBLOCK, 0);
+    for name in ["/data/opened", "/data/marked", "/data/free"] {
+        f.touch(name);
+        assert_eq!(f.mark(fan, ADD | EVICTABLE, OPEN, name), 0);
+    }
+    let marks = |f: &mut Fixture| {
+        f.fdinfo(fan)
+            .lines()
+            .filter(|l| l.starts_with("fanotify ino:"))
+            .count()
+    };
+    let caches = Arc::clone(&f.kernel.files.caches);
+    let held = |key| caches.held(key) || caches.notify.watches_file(key);
+    // The eviction looks at the marks: all three files are unused.
+    let candidates = caches.notify.fan.evictable();
+    assert_eq!(candidates.len(), 3);
+    // Before it takes them, one file is opened and another gets a mark
+    // that holds it, as a new reference to an inode stops Linux's evict.
+    let opened = f.open("/data/opened", 0);
+    assert_eq!(f.mark(other, ADD, OPEN, "/data/marked"), 0);
+    caches.notify.fan.evict_of(candidates, &held);
+    assert_eq!(marks(&mut f), 2);
+    // Once closed, the opened file's goes; the held one's stays.
+    f.close(opened);
+    caches.notify.fan.evict(&held);
+    assert_eq!(marks(&mut f), 1);
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+/// The names a read's events give, with their masks, from the first
+/// record of each (a directory and name).
+fn named(seen: &[Seen]) -> Vec<(u64, String)> {
+    seen.iter()
+        .map(|s| {
+            let record = &s.records[0].1;
+            let bytes = u32::from_le_bytes(record[8..12].try_into().unwrap()) as usize;
+            let name = &record[16 + bytes..];
+            let end = name.iter().position(|&b| b == 0).unwrap();
+            (s.mask, String::from_utf8(name[..end].to_vec()).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn an_event_merges_only_into_the_newest_128_of_its_bucket() {
+    let mut f = fixture();
+    let bucket =
+        |name: &str| crate::fanotify::full_name_hash(name.len() as u64, name.as_bytes()) % 128;
+    let first = "n00000";
+    // Names whose events in one directory by one task share the first's
+    // bucket, as on Linux, and some that do not.
+    let names: Vec<String> = (1..20_000).map(|i| format!("n{i:05}")).collect();
+    let alike: Vec<&String> = names
+        .iter()
+        .filter(|n| bucket(n) == bucket(first))
+        .take(128)
+        .collect();
+    let other: Vec<&String> = names
+        .iter()
+        .filter(|n| bucket(n) != bucket(first))
+        .take(40)
+        .collect();
+    assert_eq!(alike.len(), 128);
+    let fan = f.init(NONBLOCK | REPORT_DIR_FID | REPORT_NAME, 0);
+    for (dir, before) in [("/tmp/d", 127), ("/tmp/e", 128)] {
+        f.next = DATA;
+        f.mkdir(dir);
+        assert_eq!(f.mark(fan, ADD, CREATE | DELETE, dir), 0);
+        f.touch(&format!("{dir}/{first}"));
+        for (i, name) in alike.iter().take(before).enumerate() {
+            f.next = DATA + 0x100;
+            f.touch(&format!("{dir}/{name}"));
+            if let Some(name) = other.get(i) {
+                f.touch(&format!("{dir}/{name}"));
+            }
+        }
+        let path = f.put(format!("{dir}/{first}").as_bytes());
+        assert_eq!(f.ret(87, &[path]), 0);
+        let mut seen = Vec::new();
+        while let Ok(more) = f.read(fan, 0x7000) {
+            seen.extend(named(&more));
+        }
+        let of_first: Vec<u64> = seen
+            .iter()
+            .filter(|(_, n)| n == first)
+            .map(|(m, _)| *m)
+            .collect();
+        if before == 127 {
+            // The removal is the same event as the creation, 127 events of
+            // its bucket later.
+            assert_eq!(of_first, [CREATE | DELETE]);
+        } else {
+            // With 128 between them, the creation is past the window.
+            assert_eq!(of_first, [CREATE, DELETE]);
+        }
+        assert_eq!(
+            seen.len(),
+            1 + before + other.len().min(before) + usize::from(before == 128)
+        );
+    }
+}
+
+#[test]
+fn a_superblock_that_goes_takes_the_marks_on_it_and_its_files() {
+    let mut f = fixture();
+    f.mkdir("/tmp/m");
+    let (source, target, kind) = (f.put(b"none"), f.put(b"/tmp/m"), f.put(b"tmpfs"));
+    assert_eq!(f.ret(165, &[source, target, kind, 0, 0]), 0);
+    f.touch("/tmp/m/f");
+    let fan = f.init(NONBLOCK, 0);
+    assert_eq!(f.mark(fan, ADD, OPEN, "/tmp/m/f"), 0);
+    assert_eq!(f.mark(fan, ADD | FILESYSTEM, OPEN, "/tmp/m"), 0);
+    assert_eq!(f.mark(fan, ADD, OPEN, "/tmp"), 0);
+    let marks = |f: &mut Fixture| {
+        f.fdinfo(fan)
+            .lines()
+            .filter(|l| l.starts_with("fanotify ") && !l.starts_with("fanotify flags:"))
+            .count()
+    };
+    assert_eq!(marks(&mut f), 3);
+    let target = f.put(b"/tmp/m");
+    assert_eq!(f.ret(166, &[target, 0]), 0);
+    // fsnotify_sb_delete: the file's and the file system's marks go; the
+    // other file system's stays.
+    assert_eq!(marks(&mut f), 1);
+    // A tmpfs that takes the device next hears nothing of them.
+    let (source, target, kind) = (f.put(b"none"), f.put(b"/tmp/m"), f.put(b"tmpfs"));
+    assert_eq!(f.ret(165, &[source, target, kind, 0, 0]), 0);
+    f.touch("/tmp/m/f");
+    assert_eq!(f.read(fan, 4096).unwrap_err(), errno(Errno::EAGAIN));
+    assert_eq!(f.kernel.files.caches.notify.fan.marks_count(), 1);
+}

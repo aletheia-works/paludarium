@@ -754,6 +754,72 @@ fn polls_wait_for_their_files_and_can_be_cancelled() {
 }
 
 #[test]
+fn the_call_that_readies_a_file_puts_the_poll_in_the_ring() {
+    let mut f = fixture();
+    let (reader, writer) = f.pipe();
+    let ctx = f.setup(8);
+    let waiting = f.iocb(
+        0,
+        Iocb {
+            data: 7,
+            opcode: 5,
+            fildes: reader as u32,
+            buf: 1,
+            ..Iocb::default()
+        },
+    );
+    assert_eq!(f.ret(SUBMIT, &[ctx, 1, POINTERS]), 1);
+    // The ring's head and tail (at 8 and 12) show nothing yet.
+    assert_eq!((f.u32_at(ctx + 8), f.u32_at(ctx + 12)), (0, 0));
+    f.mem.write(GuestAddr(BUFFERS), b"x").unwrap();
+    assert_eq!(f.ret(1, &[writer, BUFFERS, 1]), 1);
+    // The write completed the poll before it returned: the event is in the
+    // ring for a program that reads it without a call, as libaio does.
+    assert_eq!(f.u32_at(ctx + 12), 1);
+    assert_eq!(
+        (f.u64_at(ctx + 32), f.u64_at(ctx + 40), f.u64_at(ctx + 48)),
+        (7, waiting, 0x41)
+    );
+}
+
+#[test]
+fn a_timer_that_expires_puts_the_poll_in_the_ring_with_no_call() {
+    let mut f = fixture();
+    let start = f.host.clock(paludarium_host::ClockId::Monotonic).unwrap();
+    // timerfd_create(CLOCK_MONOTONIC, 0), then 1 s to its expiry.
+    let timer = f.ret(283, &[1, 0]);
+    let spec = DATA + 0xe00;
+    let mut b = [0; 32];
+    b[16..24].copy_from_slice(&1u64.to_le_bytes());
+    f.mem.write(GuestAddr(spec), &b).unwrap();
+    assert_eq!(f.ret(286, &[timer, 0, spec, 0]), 0);
+    let ctx = f.setup(8);
+    let waiting = f.iocb(
+        0,
+        Iocb {
+            data: 9,
+            opcode: 5,
+            fildes: timer as u32,
+            buf: 1,
+            ..Iocb::default()
+        },
+    );
+    assert_eq!(f.ret(SUBMIT, &[ctx, 1, POINTERS]), 1);
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    assert_eq!(f.u32_at(ctx + 12), 0);
+    // The timer expires while the program runs: the next checkpoint
+    // completes the poll, as Linux's timer does, before any call.
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, start + 2_000_000_000);
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    assert_eq!(f.u32_at(ctx + 12), 1);
+    assert_eq!(
+        (f.u64_at(ctx + 32), f.u64_at(ctx + 40), f.u64_at(ctx + 48)),
+        (9, waiting, 1)
+    );
+}
+
+#[test]
 fn getevents_checks_its_arguments_and_waits_for_min_nr() {
     let mut f = fixture();
     let fd = f.file("a", b"abc");

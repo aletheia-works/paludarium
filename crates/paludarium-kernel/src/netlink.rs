@@ -5393,8 +5393,8 @@ fn neighbour_dump(
 /// error, checked strictly throughout; `EINVAL` without `NDA_DST` and for
 /// any other attribute; `EAFNOSUPPORT` for a family but IPv4 and IPv6;
 /// `EINVAL` for a key of another length than the family's; `ENODEV` for a
-/// device the namespace has not, and `EOPNOTSUPP` for an IPv6 or proxy one
-/// of a veth end; `ENOENT` for a proxy entry there is not for that device
+/// device the namespace has not, and `EOPNOTSUPP` for a proxy one of a
+/// veth end; `ENOENT` for a proxy entry there is not for that device
 /// or for none ([`Addresses::proxy`]), and for a neighbour the device has
 /// not. The answer counts the reference the lookup holds as it is made
 /// (`neigh_lookup`).
@@ -5459,8 +5459,8 @@ fn neighbour_get(
     if index != 0 && !network.has_device(index) {
         return Err(extack::message(ENODEV, "Unknown device ifindex"));
     }
-    // A veth end has IPv4's neighbours here alone, and no proxy entry.
-    if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) && (ip.is_ipv6() || proxy) {
+    // A veth end has no proxy entry here.
+    if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) && proxy {
         return Err(EOPNOTSUPP);
     }
     let addresses = network.addresses();
@@ -5574,14 +5574,26 @@ fn neighbour_tables(
             ));
         }
     }
-    // The veth ends, in the order they came to the namespace.
-    let ends: Vec<i32> = {
+    // The veth ends, in the order they came to the namespace, and those
+    // of them with IPv6 (`ipv6_add_dev`: an MTU of 1280 at least).
+    let (ends, ends6): (Vec<i32>, Vec<i32>) = {
         let devices = network.devices();
-        devices
+        let ends: Vec<i32> = devices
             .order()
             .into_iter()
             .filter(|&i| devices.by_index(i).is_some_and(|d| d.veth.is_some()))
-            .collect()
+            .collect();
+        let ends6 = ends
+            .iter()
+            .copied()
+            .filter(|&i| {
+                devices
+                    .by_index(i)
+                    .and_then(|d| d.veth.as_ref())
+                    .is_some_and(|v| v.mtu >= 1280)
+            })
+            .collect();
+        (ends, ends6)
     };
     let addresses = network.addresses();
     let since = u32::try_from(now / 1_000_000).unwrap_or(u32::MAX);
@@ -5625,12 +5637,14 @@ fn neighbour_tables(
         messages.push(message(RTM_NEWNEIGHTBL, NLM_F_MULTI, seq, port, &body));
         // Each device's, the newest first, as `neigh_parms_alloc` puts each
         // right after the table's: IPv4's of the veth ends too
-        // (`inetdev_init`), IPv6's of `lo` alone here.
-        let devices: Vec<i32> = if v6 {
-            vec![LOOPBACK_INDEX]
-        } else {
-            ends.iter().rev().copied().chain([LOOPBACK_INDEX]).collect()
-        };
+        // (`inetdev_init`), and IPv6's of those with IPv6
+        // (`ipv6_add_dev`).
+        let devices: Vec<i32> = if v6 { &ends6 } else { &ends }
+            .iter()
+            .rev()
+            .copied()
+            .chain([LOOPBACK_INDEX])
+            .collect();
         for index in devices {
             let refs = addresses
                 .neighbours()
@@ -5730,8 +5744,8 @@ fn change_neighbour(
             }
             _ => return Err(EAFNOSUPPORT),
         };
-        // A veth end has IPv4's neighbours here alone, and no proxy entry.
-        if veth && (ip.is_ipv6() || flags & u32::from(NTF_PROXY) != 0) {
+        // A veth end has no proxy entry here.
+        if veth && flags & u32::from(NTF_PROXY) != 0 {
             return Err(EOPNOTSUPP);
         }
         let state = u16::from_le_bytes([payload[8], payload[9]]);
@@ -5780,18 +5794,19 @@ fn change_neighbour(
             lladdr: lladdr.and_then(|l| l.first_chunk::<6>().copied()),
             protocol,
             request: header.flags,
+            no_inet6: ip.is_ipv6() && ipv6_device(network, index).is_some_and(|d| !d.has),
         };
         // What a change tells goes even when it then fails.
         let (events, result) = addresses.add_neighbour(index, ask, now);
         drop(addresses);
-        // On a veth end, one used is resolved by ARP.
+        // On a veth end, one used is resolved by ARP or neighbour
+        // discovery.
         let using = flags & (crate::interface::NTF_USE | crate::interface::NTF_MANAGED) != 0;
-        if veth
-            && using
-            && result.is_ok()
-            && let core::net::IpAddr::V4(to) = ip
-        {
-            network.arp_resolve(index, to, now);
+        if veth && using && result.is_ok() {
+            match ip {
+                core::net::IpAddr::V4(to) => network.arp_resolve(index, to, now),
+                core::net::IpAddr::V6(to) => network.nd_resolve(index, to, now),
+            }
         }
         Ok((events, result))
     })();

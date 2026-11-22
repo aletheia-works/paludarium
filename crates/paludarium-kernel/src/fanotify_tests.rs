@@ -940,6 +940,109 @@ fn a_use_made_between_an_evictions_look_and_its_removal_keeps_the_mark() {
     let _ = std::fs::remove_dir_all(&host);
 }
 
+/// A host directory whose opens of one path run `during` between the
+/// open's lookup and its return, as another thread's eviction may.
+struct Midway {
+    inner: paludarium_host::NativeFs,
+    path: Vec<u8>,
+    during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl paludarium_vfs::HostFs for Midway {
+    fn open(
+        &self,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+    ) -> Result<Arc<dyn paludarium_host::FileHandle>, Errno> {
+        if path == self.path
+            && let Some(during) = self.during.lock().unwrap().take()
+        {
+            during();
+        }
+        self.inner.open(path, flags, mode)
+    }
+    fn metadata(&self, path: &[u8], follow: bool) -> Result<paludarium_host::FileStat, Errno> {
+        self.inner.metadata(path, follow)
+    }
+    fn statfs(&self, path: &[u8]) -> Result<paludarium_host::FsStats, Errno> {
+        self.inner.statfs(path)
+    }
+    fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
+        self.inner.mkdir(path, mode)
+    }
+    fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
+        self.inner.unlink(path, directory)
+    }
+    fn link(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
+        self.inner.link(old, new)
+    }
+    fn symlink(&self, target: &[u8], path: &[u8]) -> Result<(), Errno> {
+        self.inner.symlink(target, path)
+    }
+    fn readlink(&self, path: &[u8]) -> Result<Vec<u8>, Errno> {
+        self.inner.readlink(path)
+    }
+    fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
+        self.inner.rename(old, new)
+    }
+    fn read_dir(&self, path: &[u8]) -> Result<Vec<paludarium_host::DirectoryEntry>, Errno> {
+        self.inner.read_dir(path)
+    }
+}
+
+#[test]
+fn an_eviction_while_a_file_is_being_opened_keeps_its_mark() {
+    let mut f = fixture();
+    let host = std::env::temp_dir().join(format!("paludarium-evict-open-{}", std::process::id()));
+    std::fs::create_dir_all(&host).unwrap();
+    let midway = Arc::new(Midway {
+        inner: paludarium_host::NativeFs::new(&host).unwrap(),
+        path: b"opening".to_vec(),
+        during: Mutex::new(None),
+    });
+    let base = paludarium_vfs::MemFs::new();
+    let _ = <paludarium_vfs::MemFs as paludarium_vfs::HostFs>::mkdir(&base, b"/tmp", 0o1777);
+    let mut mounted = paludarium_vfs::MountedFs::new(base);
+    mounted
+        .mount(b"/data".to_vec(), Arc::clone(&midway) as _)
+        .unwrap();
+    f.kernel.files.set_file_system(Arc::new(mounted));
+    let fan = f.init(NONBLOCK, 0);
+    for name in ["/data/opening", "/data/free"] {
+        f.touch(name);
+        assert_eq!(f.mark(fan, ADD | EVICTABLE, OPEN, name), 0);
+    }
+    let marks = |f: &mut Fixture| {
+        f.fdinfo(fan)
+            .lines()
+            .filter(|l| l.starts_with("fanotify ino:"))
+            .count()
+    };
+    assert_eq!(marks(&mut f), 2);
+    // The file being opened is in use from its lookup on, as its dentry
+    // reference keeps Linux's inode: the eviction takes only the other's.
+    let caches = Arc::clone(&f.kernel.files.caches);
+    *midway.during.lock().unwrap() = Some(Box::new(move || {
+        caches
+            .notify
+            .fan
+            .evict(&|key| caches.held(key) || caches.notify.watches_file(key));
+    }));
+    let opening = f.open("/data/opening", 0);
+    assert!(midway.during.lock().unwrap().is_none());
+    assert_eq!(marks(&mut f), 1);
+    // Once closed, it goes too.
+    f.close(opening);
+    let caches = Arc::clone(&f.kernel.files.caches);
+    caches
+        .notify
+        .fan
+        .evict(&|key| caches.held(key) || caches.notify.watches_file(key));
+    assert_eq!(marks(&mut f), 0);
+    let _ = std::fs::remove_dir_all(&host);
+}
+
 /// The names a read's events give, with their masks, from the first
 /// record of each (a directory and name).
 fn named(seen: &[Seen]) -> Vec<(u64, String)> {

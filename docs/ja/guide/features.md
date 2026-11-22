@@ -4414,8 +4414,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`FAN_MARK_EVICTABLE`）は inode への参照を持たず、`/proc/sys/vm/drop_caches` が inode を
   追い出すと、`fsnotify_inode_delete` がマークを外すのと同じくなくなります。対象は、
   tmpfs（dentry が残ります）の外にあり、開いたファイル記述、作業ディレクトリ、動いている
-  プログラム、inotify のウォッチ、`FAN_MARK_EVICTABLE` のないマークのどれも持っていない
-  ファイルです。exec がプログラムとそのインタープリターを
+  プログラム、inotify のウォッチ、`FAN_MARK_EVICTABLE` のないマークのどれも持っておらず、
+  開いている途中でもない（パスの検索から後は、Linux で検索の dentry の参照が inode を保つのと
+  同じく使われています）ファイルです。追い出しが調べている間に使われたものも、マークが
+  残ります。exec がプログラムとそのインタープリターを
   開くことは、`do_open_execat` が `__FMODE_EXEC` で開くのと同じく `FAN_OPEN_EXEC` 付きの
   `FAN_OPEN` として伝わり、inotify には `IN_OPEN` として伝わります。その前に、そうした
   オープンはそれぞれ `FAN_OPEN_EXEC_PERM`、`FAN_OPEN_PERM` を、exec によるそのファイルの

@@ -1329,6 +1329,19 @@ impl HostFs for CoherentFs {
         // A running program's file is not truncated: `handle_truncate`
         // takes write access first (ETXTBSY), whatever the access mode.
         const O_NOFOLLOW: u32 = 0o400000;
+        // The file the open's lookup found is in use until the open is
+        // listed or fails, as the lookup's dentry reference keeps Linux's
+        // inode from `evict`: an eviction meanwhile keeps its marks
+        // ([`crate::fanotify::Registry::evict_of`]). Only marks are evicted.
+        let _lookup = if self.caches.notify.fan.active() {
+            self.inner
+                .metadata(path, flags & O_NOFOLLOW == 0)
+                .ok()
+                .filter(|stat| stat.mode & 0o170000 == REGULAR)
+                .map(|stat| self.caches.hold_of((self.inner.device(path), stat.inode)))
+        } else {
+            None
+        };
         if flags & O_TRUNC != 0
             && flags & O_PATH == 0
             && let Ok(stat) = self.inner.metadata(path, flags & O_NOFOLLOW == 0)

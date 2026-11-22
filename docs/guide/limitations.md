@@ -1006,9 +1006,7 @@ verified.
   allows it), and `FAN_FS_ERROR` never comes. An evictable mark on a
   directory is never evicted, where Linux's goes once none of the
   directory's children's dentries is in use; one on a file Linux would
-  still write back, or one a mount is on, goes all the same, and so does
-  one on a file another thread is opening at that moment but has not yet
-  opened, which Linux's path lookup keeps. Which events
+  still write back, or one a mount is on, goes all the same. Which events
   share a bucket of a group's merge hash follows a hash of the emulator's
   own where Linux's mixes in kernel addresses (of the process, and of a
   path in the non-FID modes), so only events of one task's names in one

@@ -6,7 +6,10 @@
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with, and
 //! `IORING_REGISTER_FILES` the files a request with `IOSQE_FIXED_FILE`
-//! names by their index.
+//! names by their index. The registered files, their updates and their
+//! allocation range are checked as Linux 7.0's `io_uring/rsrc.c`,
+//! `register.c` and `filetable.c` check them, the kernel the differential
+//! tests run on.
 //!
 //! The rings are pages the kernel shares with the mappings of the ring's
 //! descriptor ([`SharedPages`]). A request runs when `io_uring_enter` takes
@@ -1247,7 +1250,8 @@ fn read_fd(c: &Context<'_>, addr: u64) -> Result<i32, Errno> {
     Ok(i32::from_le_bytes(fd))
 }
 
-/// `IORING_REGISTER_FILES`, as Linux's `io_sqe_files_register`: none
+/// `IORING_REGISTER_FILES`, as Linux's `io_sqe_files_register` once the
+/// dispatcher found an argument (`EFAULT` for none, before all else): none
 /// registered yet (`EBUSY`), 1 (`EINVAL`) to `IORING_MAX_FIXED_FILES` and
 /// RLIMIT_NOFILE of them (`EMFILE`), then each descriptor in turn
 /// (`EFAULT`): -1 leaves its slot empty, and one `fget` does not find, or a

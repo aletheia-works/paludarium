@@ -1657,8 +1657,10 @@ kernel.
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
 
-- `IORING_REGISTER_FILES` registers a ring's files as Linux's
-  `io_sqe_files_register` does: none registered yet (`EBUSY`), 1
+- `IORING_REGISTER_FILES` registers a ring's files as Linux 7.0's
+  `io_sqe_files_register` does, the kernel the differential tests run on
+  (its updates and allocation range are 7.0's too). It needs an argument
+  (`EFAULT`), then none may be registered yet (`EBUSY`), 1
   (`EINVAL`) to 1048576 of them and no more than RLIMIT_NOFILE (`EMFILE`),
   then each descriptor (`EFAULT`). A descriptor of -1 leaves its slot
   empty, and one that is not open, an `O_PATH` one or a ring is `EBADF`.

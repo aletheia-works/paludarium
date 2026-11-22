@@ -1469,8 +1469,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。
 
-- `IORING_REGISTER_FILES` は、Linux の `io_sqe_files_register` と同じくリングのファイルを
-  登録します。まだ登録していないこと（`EBUSY`）、1 個以上（`EINVAL`）で 1048576 個と
+- `IORING_REGISTER_FILES` は、差分テストのカーネルである Linux 7.0 の
+  `io_sqe_files_register` と同じくリングのファイルを登録します（更新と割り当て範囲も 7.0 の
+  ものです）。引数が要り（`EFAULT`）、それからまだ登録していないこと（`EBUSY`）、1 個以上（`EINVAL`）で 1048576 個と
   RLIMIT_NOFILE 以下であること（`EMFILE`）を調べ、それから記述子を 1 つずつ読みます
   （`EFAULT`）。記述子 -1 はスロットを空のままにします。開いていない記述子、`O_PATH` の
   記述子、リングは `EBADF` です。失敗すると何も登録しません。`IOSQE_FIXED_FILE` の要求は、

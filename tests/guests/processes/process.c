@@ -13752,6 +13752,11 @@ static int leader_exit_status_case(void) {
             during = les_stat(kid, &state);
             if (state != 'Z') nanosleep(&(struct timespec){0, 10000000}, NULL);
         }
+        if (state != 'Z') {
+            kill(kid, SIGKILL);
+            waitpid(kid, NULL, 0);
+            return 4;
+        }
         if (les_variant == 2)
             kill(kid, SIGKILL);
         else if (write(les_go[1], "g", 1) != 1)

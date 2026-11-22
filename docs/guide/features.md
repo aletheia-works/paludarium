@@ -3536,9 +3536,10 @@ kernel.
   ended (its code times 256, or its signal, with 0x80 for a core dumped), and
   a stopped process's signal in its own `stat` until a wait reports the stop
   (Linux's `group_exit_code`); a thread's `stat` under `task` has no stop's.
-  A process whose threads all end with `exit` has the status of the last one
-  to end, even when the leader ended first, as Linux's
-  `synchronize_group_exit` makes it, for `stat` and the wait alike.
+  A process whose leader ends with `exit` before its other threads has, once
+  they end, the status of the last one's `exit`, or the group's for
+  `exit_group` or a fatal signal, as Linux's `synchronize_group_exit` makes
+  it, for `stat` and the wait alike.
   `stat` is made at each read from its start, as Linux's is, so a descriptor
   shows what the task and the reader are then: one that drops its rights
   sees the addresses hidden, and a task that has been reaped is `ESRCH`.

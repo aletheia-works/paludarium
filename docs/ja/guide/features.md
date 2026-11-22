@@ -3071,9 +3071,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ステータス（終了コードの 256 倍か、シグナル。コアダンプしたものは 0x80 を足します）で、
   止まったプロセスでは、wait がその停止を報告するまで、プロセス自身の `stat` に止めた
   シグナルが出ます（Linux の `group_exit_code`）。`task` の下のスレッドの `stat` には
-  停止のものは出ません。スレッドがみな `exit` で終わったプロセスは、リーダーが先に
-  終わっていても、Linux の `synchronize_group_exit` と同じく最後に終わったスレッドの
-  ステータスで、`stat` も wait もそれを示します。`stat` は Linux と同じく先頭から読むたびに作るので、
+  停止のものは出ません。リーダーがほかのスレッドより先に `exit` で
+  終わったプロセスは、それらが終わると、Linux の `synchronize_group_exit` と同じく
+  最後のスレッドの `exit` のステータス（`exit_group` や致命的なシグナルではグループの
+  もの）になり、`stat` も wait もそれを示します。`stat` は Linux と同じく先頭から読むたびに作るので、
   同じディスクリプターでもそのときのタスクと読み手で決まります。権限を手放した読み手には
   アドレスが隠れ、回収されたタスクは `ESRCH` です。`status`、`statm`、`limits`、
   `cmdline`、`comm` も、Linux の `proc_single_show`・`proc_pid_cmdline_read`・`comm_show` と

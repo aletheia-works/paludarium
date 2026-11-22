@@ -433,12 +433,14 @@ fn verify(
             }
         });
     let (processed, stack_depth) = match &result {
-        Ok(v) => (v.processed, v.stack_depth),
-        Err(r) => (r.processed, r.stack_depth),
+        Ok(v) => (v.processed, &v.stack_depth),
+        Err(r) => (r.processed, &r.stack_depth),
     };
     if log.level & log_level::STATS != 0 {
         lines.push("verification time 0 usec".into());
-        lines.push(format!("stack depth {stack_depth}"));
+        // 7.0's line: each function's, joined by '+'.
+        let depths: Vec<String> = stack_depth.iter().map(u32::to_string).collect();
+        lines.push(format!("stack depth {}", depths.join("+")));
     }
     // print_verification_stats: the walk keeps no states to prune with.
     lines.push(format!(
@@ -488,7 +490,7 @@ fn early(c: &Context<'_>, attr: &[u8], insns: &[Insn]) -> Result<(), bpf_verifie
         errno,
         line: line.into(),
         processed: 0,
-        stack_depth: 0,
+        stack_depth: vec![0],
     };
     let fd_array_cnt = half(attr, 148);
     let signature = word(attr, 152);

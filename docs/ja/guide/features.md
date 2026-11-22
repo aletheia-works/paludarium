@@ -4213,6 +4213,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   受け取ったままであることを確かめます（"dereference of modified ctx ptr R6 off=%d
   disallowed"、`EACCES`）。読んだ後の R1 から R5 は読めず、R0 は数です。
 
+- `BPF_PSEUDO_CALL` の `BPF_CALL` は、呼び出しの `imm` 命令後にあるプログラムの関数を
+  呼びます。BTF がなければ関数はどれも静的で、Linux が静的な関数の呼び出しを確かめるのと
+  同じに確かめます。呼び出し先はそれぞれ関数の始まりです（プログラムの外は "call to
+  invalid destination"、`EINVAL`。256 を超えると "too many subprograms"、`E2BIG`）。関数の
+  ジャンプはその関数の中にとどまり（"jump out of range from insn %d to %d"）、最後の命令は
+  exit かジャンプです（"last insn is not an exit or jmp"）。メインプログラム以外の関数に
+  `BPF_LD_ABS`、`BPF_LD_IND`、`bpf_tail_call` は置けません（7.0 と同じく "LD_ABS is not
+  allowed in subprogs without BTF"、"tail_call is not allowed in subprogs without BTF"。master
+  は受け入れます）。どれも、どの経路をたどるより前に `EINVAL` で断ります。呼ばれた関数は、
+  呼び出し元の R1 から R5 と、自分のフレームポインタと 512 バイトのスタックで始まります。
+  その R0 と R6 から R9 は書くまで読めず、呼び出し元の R0 から R5 は呼び出しの後は読めません。
+  呼び出し元の R0 には呼ばれた関数の R0 が入ります。呼ばれた関数は、スタックへのポインタを
+  返すことも（"cannot return stack pointer to the caller"）、呼び出し元のフレームに置くことも
+  できません（"cannot spill pointers to stack into stack frame of the caller"、どちらも
+  `EINVAL`）。呼び出し元のスタックは、そこへのポインタを通して読み書きできます。呼び出しの
+  深さは 8 フレームまでです（"the call stack of %d frames is too deep"、`E2BIG`）。経路を
+  たどった後、呼び出しの連なりのどれでも、各関数のスタックの深さを JIT と同じく 16 バイトに
+  切り上げた和は 512 バイトまでです（"combined stack size of %d calls is %d. Too large"、
+  `EACCES`）。`BPF_LOG_STATS` では、ログに関数ごとのスタックの深さが出ます（"stack depth
+  %d+%d"）。
+
 - ソケットフィルターは `SO_ATTACH_BPF` で、古典的なものは `SO_ATTACH_FILTER`（後述）で、
   AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の
   ソケットにアタッチし、送られてくるメッセージごとに、Linux の `sk_filter` と
@@ -4224,7 +4245,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   符号付き剰余は 0 です。32 ビットのアトミック演算は、スロットの下半分をソースの下半分で変え、
   R0 の下半分と比べます。古い値はゼロ拡張して返ります。マップの値への読みと書きの間に、
   その値へのほかのアクセスは入りません。ロードアクワイアはゼロ拡張して返り、ストアリリースは
-  ソースの下位のバイトを書きます。`BPF_LD_ABS` と `BPF_LD_IND` は、Linux の
+  ソースの下位のバイトを書きます。呼ばれた関数は自分のフレームで動き、その後の呼び出し元の
+  R6 から R9 は元のままです。`BPF_LD_ABS` と `BPF_LD_IND` は、Linux の
   `bpf_gen_ld_abs` が `bpf_skb_load_helper_8`、`_16`、`_32` の呼び出しに書き換えるのと
   同じく、ビッグエンディアンで読みます。オフセットは `int`（レジスタと `imm` の和の下半分）で、
   メッセージの先頭から、`SKF_NET_OFF` からはネットワークヘッダ（メッセージの先頭）からです。

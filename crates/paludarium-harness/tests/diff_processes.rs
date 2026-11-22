@@ -331,6 +331,7 @@ mod linux {
                     | "bpf-prog-atomic"
                     | "bpf-prog-acqrel"
                     | "bpf-prog-ldabs"
+                    | "bpf-prog-calls"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -713,6 +714,7 @@ mod linux {
         bpf_prog_atomic => ("bpf-prog-atomic","bpf-prog"),
         bpf_prog_acqrel => ("bpf-prog-acqrel","bpf-prog"),
         bpf_prog_ldabs => ("bpf-prog-ldabs","bpf-prog"),
+        bpf_prog_calls => ("bpf-prog-calls","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),

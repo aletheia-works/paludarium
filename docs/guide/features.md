@@ -4872,6 +4872,31 @@ kernel.
   ("dereference of modified ctx ptr R6 off=%d disallowed", `EACCES`).
   R1 to R5 are not readable after one, and R0 is a number.
 
+- A `BPF_CALL` with `BPF_PSEUDO_CALL` calls a function of the program,
+  `imm` instructions after the call, as Linux checks a call of a static
+  function, the only kind without BTF. Each target starts a function
+  ("call to invalid destination" outside the program, `EINVAL`; "too many
+  subprograms" past 256, `E2BIG`). A function's jumps stay in it ("jump
+  out of range from insn %d to %d"), its last instruction is an exit or a
+  jump ("last insn is not an exit or jmp"), and one other than the main
+  program has no `BPF_LD_ABS`, `BPF_LD_IND` or `bpf_tail_call` ("LD_ABS
+  is not allowed in subprogs without BTF", "tail_call is not allowed in
+  subprogs without BTF", as 7.0 refuses them; master takes them), all
+  `EINVAL` before any path is walked. The callee starts with the caller's
+  R1 to R5 and a frame pointer and 512-byte stack of its own; its R0 and
+  R6 to R9 are not readable until written, and the caller's R0 to R5 are
+  not readable after the call, which gives it the callee's R0. A callee
+  may not return a pointer to a stack ("cannot return stack pointer to
+  the caller") or store one in a caller's frame ("cannot spill pointers to
+  stack into stack frame of the caller", both `EINVAL`), but reads and
+  writes a caller's stack through a pointer to it. Calls go 8 frames deep
+  at most ("the call stack of %d frames is too deep", `E2BIG`), and after
+  the walk, along every chain of calls, each function's stack depth,
+  rounded up to 16 bytes as with the JIT, adds up to 512 bytes at most
+  ("combined stack size of %d calls is %d. Too large", `EACCES`). With
+  `BPF_LOG_STATS` the log gives each function's stack depth
+  ("stack depth %d+%d").
+
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`
   (below), and runs on each message sent to it, as
@@ -4893,7 +4918,9 @@ kernel.
   message's start or, from `SKF_NET_OFF`, the network header, its start;
   where the bytes are not in the message, or the offset is from the MAC
   header, which is not set, or below it, the program returns 0 then and
-  there. The context is the message's `__sk_buff`: its `len`, `cb[]`
+  there. A called function runs in a frame of its own, and the caller's
+  R6 to R9 are as they were after it. The context is the message's
+  `__sk_buff`: its `len`, `cb[]`
   from 0 and 0 for the fields an AF_UNIX message does not set.
   `bpf_skb_load_bytes` reads the message, and its relative form reads it
   from the network header, its start, where there is no MAC header

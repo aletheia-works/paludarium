@@ -639,12 +639,13 @@ impl Network {
     }
     /// What an IPv6 packet from `from` to `to` out through this
     /// namespace's veth end `index` finds at `now`, as [`Self::reach`]
-    /// tells for IPv4, its neighbour resolved by neighbour discovery
+    /// tells for IPv4, its neighbour, its route's gateway or else `to`
+    /// ([`Self::next_hop6`]), resolved by neighbour discovery
     /// ([`Self::nd`]):
     /// - Nothing answers ([`Reach::Unanswered`]) unless the end has its
     ///   carrier, a solicitation goes ([`crate::interface::Addresses::ns_source`]),
-    ///   and the peer, taking IPv6, has `to` itself, not tentative
-    ///   (`ndisc_recv_ns`); its advertisement makes the neighbour
+    ///   and the peer, taking IPv6, has that neighbour's address on its
+    ///   end, not tentative (`ndisc_recv_ns`); its advertisement makes the neighbour
     ///   reachable, and the solicitation teaches the peer its sender
     ///   ([`Self::teach6`]).
     /// - The packet is lost ([`Reach::Dropped`]) where its neighbour's
@@ -654,23 +655,25 @@ impl Network {
     ///   route: `ip6_route_input`, and no forwarding).
     /// - The packet comes there, and the answer back ([`Reach::Answered`])
     ///   only when the peer's namespace routes `from` back out through its
-    ///   end and this namespace has `from`, not tentative; else that
-    ///   answer goes nowhere ([`Reach::OneWay`]).
+    ///   end, this namespace has `from`, not tentative, and this end has
+    ///   that route's next hop; else that answer goes nowhere
+    ///   ([`Reach::OneWay`]).
     fn reach6(&self, index: i32, from: Ipv6Addr, to: Ipv6Addr, now: Option<u64>) -> Reach {
+        let hop = self.next_hop6(index, to, now);
         let Some(Nd {
             peer,
             answer,
             own_mac,
             asker,
-        }) = self.nd(index, Some(from), to, now)
+        }) = self.nd(index, Some(from), hop, now)
         else {
             return Reach::Unanswered;
         };
         let at = now.unwrap_or(0);
-        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, to, answer, at);
+        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
         self.later(events);
         if asked {
-            self.solicit(index, asker, to, at);
+            self.solicit(index, asker, hop, at);
         }
         if asked && answer.is_some() {
             Self::teach6(peer.as_ref(), asker, own_mac, at);
@@ -686,20 +689,41 @@ impl Network {
         }
         let (arrives, back) = {
             let addresses = there.addresses_at(now);
-            let back = addresses.lookup6(from).is_ok_and(|r| {
-                r.kind == crate::interface::Kind::Unicast
-                    && i64::from(r.oif) == i64::from(peer_index)
-            });
+            let back = addresses
+                .lookup6(from)
+                .ok()
+                .filter(|r| {
+                    r.kind == crate::interface::Kind::Unicast
+                        && i64::from(r.oif) == i64::from(peer_index)
+                })
+                .map(|r| r.gateway.unwrap_or(from));
             (addresses.local6(to), back)
         };
         if !arrives {
             return Reach::Dropped;
         }
-        if back && self.addresses_at(now).local6(from) {
+        // The answer's next hop must be this end's, as neighbour discovery
+        // finds it.
+        let back = back.is_some_and(|hop| {
+            let addresses = self.addresses_at(now);
+            addresses.local6(from) && addresses.nd_target(index, hop)
+        });
+        if back {
             Reach::Answered(there)
         } else {
             Reach::OneWay(there)
         }
+    }
+    /// The neighbour a packet to `to` out through the veth end `index`
+    /// goes to at `now`: its route's gateway, else `to` itself
+    /// (`rt6_nexthop`).
+    fn next_hop6(&self, index: i32, to: Ipv6Addr, now: Option<u64>) -> Ipv6Addr {
+        self.addresses_at(now)
+            .lookup6(to)
+            .ok()
+            .filter(|r| i64::from(r.oif) == i64::from(index))
+            .and_then(|r| r.gateway)
+            .unwrap_or(to)
     }
     /// What neighbour discovery finds out through this namespace's veth
     /// end `index` for `to`, for a packet from `from` (none for a request's

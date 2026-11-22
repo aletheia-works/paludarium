@@ -2544,10 +2544,22 @@ kernel.
     only then. An end with IPv6 off (`disable_ipv6`) or an MTU below 1280
     has none. An end's IPv6 routes but its local ones are
     `RTNH_F_LINKDOWN` while it is up without its carrier, as IPv4's are.
-    `RTM_NEWROUTE` adds an IPv6 route through an end without a gateway
+    `RTM_NEWROUTE` adds an IPv6 route through an end
     (`fib6_nh_init`: `ENODEV` for one without IPv6, an MTU below 1280,
     `EACCES` for one with it off, then `ENETDOWN` while it is down), which
-    goes with it as it goes down. Turning `disable_ipv6` on for an end
+    goes with it as it goes down, and with a gateway (`RTA_GATEWAY`) one
+    through the end a route to the gateway goes through, as
+    `ip6_validate_gw` checks it: `EINVAL` for a local, unspecified or
+    multicast gateway, a link-local one without a device or one through
+    `lo`, `EHOSTUNREACH` for one no route without a gateway takes or that
+    goes through another device; `RTNH_F_ONLINK` takes the gateway to be
+    on the named end's link (`ENODEV` without one, `ENETDOWN` while it is
+    down). A route with a gateway goes out to the gateway's neighbour
+    entry, and a dump, a notification and a lookup give it as
+    `RTA_GATEWAY`. Another route with a gateway of the same metric would
+    be its multipath sibling (`rt6_qualify_for_ecmp`), which is
+    `EOPNOTSUPP`; one of the same device and gateway is `EEXIST`, and
+    `RTM_DELROUTE` with a gateway removes only a route through it. Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
     Going down, or away, it loses its IPv6 routes, told of in the order of
@@ -2704,9 +2716,9 @@ kernel.
     table and, from the first time `lo` is up with it (for one added while
     down, if it is permanent), a unicast prefix route in the main table, of
     its priority or else metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
-    through `lo` (or, for IPv4 without a gateway, a veth end) or of a kind without a device (`blackhole`, `unreachable`,
+    through `lo` or a veth end (for IPv4 without a gateway) or of a kind without a device (`blackhole`, `unreachable`,
     `prohibit`, `throw`) to any table, with its metric, protocol, scope,
-    TOS, preferred source and an IPv4 gateway (on link too), as
+    TOS, preferred source and a gateway (on link too), as
     `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
     `NLM_F_REPLACE`, `NLM_F_APPEND` and `NLM_F_CREATE` put it in Linux's
     place, or Linux's error refuses it (`EEXIST`, `ENOENT`; `EINVAL` for a
@@ -2767,7 +2779,7 @@ kernel.
     route (`ENETUNREACH`) without a source, or to a loopback, link-local
     or multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
     and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
-    not. With `RTA_IIF` of `lo`, or for IPv4 of a veth end, a route is
+    not. With `RTA_IIF` of `lo` or a veth end, a route is
     looked up as a packet coming in on that device would take it
     (`ip_route_input_slow`, `ip6_route_input_lookup`), and the answer names
     the device as `RTA_IIF`. IPv4 drops martians
@@ -2793,7 +2805,12 @@ kernel.
     route goes through another device than the one it came in on while
     that has an address; loosely, a lookup of it through that device
     decides. IPv6 gives the route the
-    tables do, whatever its source and its `forwarding`. The mark, the user ID, the protocol and the ports choose among
+    tables do, whatever its source and its `forwarding`, through the
+    device it came in on only for a loopback, link-local or multicast
+    destination (`rt6_need_strict`), and the route's gateway and device;
+    a local one goes out through `lo`. A multicast one is `EMSGSIZE`, as
+    Linux's multicast routing knows no device of the reply it fills
+    (`ip6mr_get_route`). The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they
     change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its

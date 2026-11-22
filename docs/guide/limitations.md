@@ -973,8 +973,10 @@ verified.
   routes a request adds without a gateway, and IPv6's TCP and UDP and its
   neighbours, but no proxy entry, no route through a gateway and no IPv6
   route lookup in through it (`RTA_IIF`), each `EOPNOTSUPP`. A link-local
-  destination's scope ID is not taken: the first route to it is, and a
-  connect without one is not `EINVAL`. Neighbour discovery makes none of
+  destination's scope ID is not taken: the first route to it is. A
+  connect without one to it, or a UDP one to a group of the node or the
+  link, is `EINVAL`, as Linux's is with no device bound and no multicast
+  interface, which sockets here have none of. Neighbour discovery makes none of
   the neighbours of the groups router solicitation, MLD reports and
   duplicate address detection send to (`ff02::2`, `ff02::16`, the
   solicited-node ones), no advertisement unasked, and no redirect; the

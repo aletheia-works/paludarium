@@ -2457,8 +2457,9 @@ kernel.
     `ipv6_dev_get_saddr` picks: of the end's own for a group or a
     link-local destination, else of every device's, none tentative, by
     its rules (the same address, the scope, not deprecated, the outgoing
-    device, the label, the longest prefix), and `EADDRNOTAVAIL` where
-    none is. It comes to the peer's namespace when the end has its
+    device, the label, the longest prefix; a group's scope is its scope
+    nibble, and of two that tie the device's newer one wins), and
+    `EADDRNOTAVAIL` where none is. It comes to the peer's namespace when the end has its
     carrier, neighbour discovery finds the peer (below), the peer takes
     IPv6 (an MTU of 1280 at least and `disable_ipv6` off), neither address
     is a loopback one (`ip6_rcv_core`), and the destination is an address

@@ -16,7 +16,10 @@
    and vb losing its carrier all but the permanent ones. Last, an address
    of the subnet nobody has gives EHOSTUNREACH once neighbour discovery
    gives up, about 3 s later, to a blocking connect and to a nonblocking
-   one. The two processes take turns through pipes, so their lines come
+   one. Connected UDP sockets show the sources groups of each scope
+   take, before and after a site-local address comes (EINVAL for the
+   node's and the link's, as for a link-local peer, without a scope ID),
+   and the newer of two addresses of a subnet winning their tie. The two processes take turns through pipes, so their lines come
    in one order. What Linux does in its work queue or link watch (an
    address done, a carrier) and the advertisement that resolves a
    datagram's neighbour are waited for on netlink. Neighbours are dumped
@@ -74,6 +77,7 @@
 #define NDA_IFINDEX 8
 #define NTF_USE 0x01
 #define NUD_REACHABLE 0x02
+#define NUD_FAILED 0x20
 #define NUD_PERMANENT 0x80
 #define A_INDEX 1000
 #define B_INDEX 1001
@@ -194,16 +198,16 @@ static void drain(int fd) {
 static unsigned char wanted[16];
 /* Whether `h` is what is waited for: the local route of `wanted` (an
    address done), the RTM_NEWLINK of the device of `index` with its
-   carrier `carrier`, or the neighbour `wanted` reachable. */
-static int is(const struct nl_header *h, int index, int carrier, int reachable) {
+   carrier `carrier`, or the neighbour `wanted` in the state `state`. */
+static int is(const struct nl_header *h, int index, int carrier, int state) {
     const unsigned char *body = (const unsigned char *)(h + 1);
     int len = (int)(h->len - sizeof *h);
     int start;
-    if (reachable) {
+    if (state) {
         struct ndmsg_ n;
         if (h->type != RTM_NEWNEIGH || len < (int)sizeof n) return 0;
         memcpy(&n, body, sizeof n);
-        if (n.family != AF_INET6 || n.state != NUD_REACHABLE) return 0;
+        if (n.family != AF_INET6 || n.state != state) return 0;
         start = (int)sizeof n;
     } else if (index) {
         int got;
@@ -227,7 +231,7 @@ static int is(const struct nl_header *h, int index, int carrier, int reachable) 
     return 0;
 }
 /* Waits, up to 5 s however much else comes, on `fd` for what `is` says. */
-static void wait_for(int fd, const char *ip, int index, int carrier, int reachable, const char *label) {
+static void wait_for(int fd, const char *ip, int index, int carrier, int state, const char *label) {
     static unsigned char buf[65536];
     memset(wanted, 0, sizeof wanted);
     if (ip) inet_pton(AF_INET6, ip, wanted);
@@ -244,7 +248,7 @@ static void wait_for(int fd, const char *ip, int index, int carrier, int reachab
             for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
                 const struct nl_header *h = (const void *)(buf + at);
                 if (h->len < sizeof *h || at + h->len > n) break;
-                if (is(h, index, carrier, reachable)) return;
+                if (is(h, index, carrier, state)) return;
                 at += (h->len + 3) & ~3u;
             }
     }
@@ -513,7 +517,10 @@ static void child(int in, int out) {
         if (command == 'u') {
             sysctl("/proc/sys/net/ipv6/conf/vb/accept_dad", "0");
             set_link(ctl, 1, 1, "up lo");
-            end_up(ctl, B_INDEX, "2001:db8::2", "fe80::ff:fe00:b");
+            /* Its carrier comes with va's, which A waits for. */
+            drain(events);
+            set_link(ctl, B_INDEX, 1, "up the end");
+            address6(ctl, B_INDEX, "2001:db8::2", "add its address");
             listener = socket(AF_INET6, SOCK_STREAM, 0);
             struct sockaddr_in6 any = at("::", 5000);
             printf("B: bind=%ld\n", result(bind(listener, (void *)&any, sizeof any)));
@@ -627,7 +634,7 @@ int main(int argc, char **argv) {
     struct sockaddr_in6 to = at("2001:db8::2", 6000);
     drain(resolved);
     printf("A: udp sendto=%ld\n", result(sendto(u, "hello", 5, 0, (void *)&to, sizeof to)));
-    wait_for(resolved, "2001:db8::2", 0, 0, 1, "2001:db8::2 reachable");
+    wait_for(resolved, "2001:db8::2", 0, 0, NUD_REACHABLE, "2001:db8::2 reachable");
     heard("heard");
     B_DOES("d");
     receive(u, "udp recvfrom");
@@ -697,6 +704,7 @@ int main(int argc, char **argv) {
     neighbour(ctl, RTM_GETNEIGH, 0, 0, A_INDEX, "2001:db8::5", 0, 0, 0, "get 2001:db8::5");
     neighbour(ctl, RTM_GETNEIGH, 0, 0, A_INDEX, "2001:db8::2", 0, 0, 0, "get 2001:db8::2");
     neighbour(ctl, RTM_GETNEIGH, 0, 0, A_INDEX, "2001:db8::8", 0, 0, 0, "get 2001:db8::8");
+    drain(resolved);
     neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE, 0, A_INDEX, "2001:db8::6", 0, NTF_USE, 0, "use 2001:db8::6");
     neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE, 0, A_INDEX, "2001:db8::2", 0, NTF_USE, 0, "use 2001:db8::2");
     neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE, 0, A_INDEX, "2001:db8::7", NUD_REACHABLE, 0, 7,
@@ -710,6 +718,9 @@ int main(int argc, char **argv) {
               "add one to vc, without IPv6");
     neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE, 1, C_INDEX, "10.77.0.5", NUD_PERMANENT, 0, 5, "add IPv4's to vc");
     tables(ctl, "neighbour discovery's table");
+    /* Nobody answers for 2001:db8::6: dumped once it has failed, its
+       probes are done. */
+    wait_for(resolved, "2001:db8::6", 0, 0, NUD_FAILED, "2001:db8::6 failed");
     dump(ctl, 0, A_INDEX, "neighbours");
     heard("heard");
 
@@ -746,6 +757,37 @@ int main(int argc, char **argv) {
     heard("heard");
     dump(ctl, AF_INET6, A_INDEX, "neighbours");
     close(u);
+
+    /* The source a connected UDP socket takes: a group's scope is its
+       scope nibble, and of two addresses that tie the newer wins. */
+    const char *groups[] = {"ff00::1", "ff01::1", "ff02::1", "ff05::1", "ff0e::1"};
+    for (int round = 0; round < 2; round++) {
+        if (round) address6(ctl, A_INDEX, "fec0::1", "add a site-local address");
+        for (size_t i = 0; i < sizeof groups / sizeof *groups; i++) {
+            cu = socket(AF_INET6, SOCK_DGRAM, 0);
+            to = at(groups[i], 6004);
+            char label[64];
+            snprintf(label, sizeof label, "udp connect to %s", groups[i]);
+            printf("A: %s=%ld\n", label, result(connect(cu, (void *)&to, sizeof to)));
+            show_name(cu, 0, 0, "from");
+            close(cu);
+        }
+    }
+    /* A link-local peer without a scope ID: no interface to go out of. */
+    cu = socket(AF_INET6, SOCK_DGRAM, 0);
+    to = at("fe80::ff:fe00:b", 6004);
+    printf("A: udp connect to fe80::ff:fe00:b=%ld\n", result(connect(cu, (void *)&to, sizeof to)));
+    close(cu);
+    c = socket(AF_INET6, SOCK_STREAM, 0);
+    to = at("fe80::ff:fe00:b", 5000);
+    printf("A: connect to fe80::ff:fe00:b=%ld\n", result(connect(c, (void *)&to, sizeof to)));
+    close(c);
+    address6(ctl, A_INDEX, "2001:db8::11", "add a second address of the subnet");
+    cu = socket(AF_INET6, SOCK_DGRAM, 0);
+    to = at("2001:db8::2", 6004);
+    printf("A: udp connect to 2001:db8::2=%ld\n", result(connect(cu, (void *)&to, sizeof to)));
+    show_name(cu, 0, 0, "from");
+    close(cu);
 
     fflush(stdout);
     if (write(to_b[1], "x", 1) != 1) printf("A: B gone\n");

@@ -3207,7 +3207,8 @@ impl Addresses {
     /// The address a neighbour solicitation out through the veth end
     /// `index` leaves from, for a packet from `from` (`ndisc_solicit`): that
     /// one, if the end has it and it is not tentative; else the end's
-    /// link-local one (`ipv6_get_lladdr`, the newest not tentative); else
+    /// link-local one (`ipv6_get_lladdr`, walking its addresses backwards: the
+    /// oldest not tentative); else
     /// none, and no solicitation goes.
     pub(crate) fn ns_source(&self, index: i32, from: Option<Ipv6Addr>) -> Option<Ipv6Addr> {
         if let Some(from) = from
@@ -3224,18 +3225,19 @@ impl Addresses {
     /// The address `ipv6_dev_get_saddr` picks for a packet to `ip` out
     /// through the device `oif`: of the addresses not tentative on that
     /// device for a multicast or link-local `ip`, else on every device in
-    /// `order`, each device's link-local ones first, the newest first
-    /// (`ipv6_link_dev_addr`), by these of its rules: `ip` itself, the
+    /// `order`, each device's in its list's order (`ipv6_link_dev_addr`:
+    /// the widest scope first, the newest first within one), by these of
+    /// its rules: `ip` itself, the
     /// narrowest scope as wide as `ip`'s (else the widest), not
     /// deprecated, on `oif`, the same label, then the longest prefix
-    /// shared, up to the address's own; the first of the best. `None` for
+    /// shared, up to the address's own; the first of the best. A group's
+    /// scope is its scope nibble (`ipv6_addr_scope2type`). `None` for
     /// none (`EADDRNOTAVAIL`).
     pub(crate) fn select6(&self, oif: i32, ip: Ipv6Addr, order: &[i32]) -> Option<Ipv6Addr> {
         let scope = |a: Ipv6Addr| -> i32 {
-            if a.is_loopback()
-                || a.segments()[0] & 0xffc0 == 0xfe80
-                || a.is_multicast() && a.segments()[0] & 0xf == 2
-            {
+            if a.is_multicast() {
+                i32::from(a.segments()[0] & 0xf)
+            } else if a.is_loopback() || a.segments()[0] & 0xffc0 == 0xfe80 {
                 2
             } else if a.segments()[0] & 0xffc0 == 0xfec0 {
                 5
@@ -3264,13 +3266,10 @@ impl Addresses {
         let devices: Vec<i32> = if only_oif { vec![oif] } else { order.to_vec() };
         let mut best: Option<&V6> = None;
         for device in devices {
-            let mut candidates: Vec<&V6> = self
+            let candidates = self
                 .v6
                 .iter()
-                .filter(|a| a.index == device && !a.tentative())
-                .collect();
-            candidates.reverse();
-            candidates.sort_by_key(|a| a.scope() != SCOPE_LINK);
+                .filter(|a| a.index == device && !a.tentative());
             for a in candidates {
                 if best.is_none_or(|b| score(a) > score(b)) {
                     best = Some(a);
@@ -4352,6 +4351,30 @@ mod tests {
             Some(ip6("fe80::ff:fe00:a"))
         );
         assert_eq!(a.select6(1001, ip6("ff02::1"), &order), None);
+        // A group's scope is its nibble: node-local and reserved ones take
+        // the link-local address, a site-local one the site-local one.
+        assert_eq!(
+            a.select6(1000, ip6("ff01::1"), &order),
+            Some(ip6("fe80::ff:fe00:a"))
+        );
+        assert_eq!(
+            a.select6(1000, ip6("ff00::1"), &order),
+            Some(ip6("fe80::ff:fe00:a"))
+        );
+        at(&mut a, "fec0::1", 64, None);
+        assert_eq!(
+            a.select6(1000, ip6("ff05::1"), &order),
+            Some(ip6("fec0::1"))
+        );
+        // Of two that tie, the newer: the first in the list.
+        at(&mut a, "2001:db8::3", 64, None);
+        assert_eq!(
+            a.select6(1000, ip6("2001:db8::2"), &order),
+            Some(ip6("2001:db8::3"))
+        );
+        // Of two link-local ones, a solicitation leaves from the older.
+        at(&mut a, "fe80::b", 64, None);
+        assert_eq!(a.ns_source(1000, None), Some(ip6("fe80::ff:fe00:a")));
         // A unicast neighbour is RTN_UNICAST, for neighbour discovery; a
         // group's NUD_NOARP at its 33:33 address.
         let (lladdr, asked, events) =

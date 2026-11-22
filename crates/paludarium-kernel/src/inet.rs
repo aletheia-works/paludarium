@@ -1934,6 +1934,16 @@ impl InetSocket {
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
                     let plain_to = SocketAddr::new(plain(address.ip()), address.port());
+                    // A link-local peer needs an interface (`tcp_v6_connect`,
+                    // after a group's `ENETUNREACH`): the scope ID's, for no
+                    // device is bound here.
+                    if let SocketAddr::V6(v6) = address
+                        && v6.scope_id() == 0
+                        && !v6.ip().is_multicast()
+                        && needs_scope_id(*v6.ip())
+                    {
+                        return Err(Errno::EINVAL);
+                    }
                     let dest = self
                         .network
                         .route(plain_to, s.bound.map(|b| b.ip()), self.now())?;
@@ -1950,7 +1960,7 @@ impl InetSocket {
                         Dest::Here(to) => self.open_loopback(&mut s, to, &options)?,
                         Dest::Away => None,
                         // `tcp_v4_connect` takes no broadcast or multicast
-                        // route.
+                        // route, and `tcp_v6_connect` no multicast address.
                         Dest::Veth(_, Cast::Broadcast | Cast::Multicast) => {
                             return Err(ENETUNREACH);
                         }
@@ -2152,6 +2162,15 @@ impl InetSocket {
         let to = SocketAddr::new(plain(address.ip()), address.port());
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
+        }
+        // A link-local address, or a group of the node or the link, needs
+        // an interface (`__ip6_datagram_connect`): the scope ID's, for no
+        // device is bound and no multicast interface set here.
+        if let SocketAddr::V6(v6) = address
+            && v6.scope_id() == 0
+            && needs_scope_id(*v6.ip())
+        {
+            return Err(Errno::EINVAL);
         }
         match self.network.route(to, Some(bound.ip()), self.now())? {
             Dest::Here(to) => {
@@ -3333,6 +3352,17 @@ impl FileHandle for InetSocket {
 }
 
 /// The inet socket of `file`, if it is one.
+/// Whether a peer of `ip` needs an interface (`__ipv6_addr_needs_scope_id`):
+/// a link-local unicast address, or a group of the node or the link scope
+/// (`ipv6_addr_scope2type`).
+fn needs_scope_id(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    if ip.is_multicast() {
+        matches!(first & 0xf, 1 | 2)
+    } else {
+        first & 0xffc0 == 0xfe80
+    }
+}
 pub(crate) fn of(file: &Arc<dyn FileHandle>) -> Option<&InetSocket> {
     file.as_any()?.downcast_ref::<InetSocket>()
 }

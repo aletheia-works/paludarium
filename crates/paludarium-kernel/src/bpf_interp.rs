@@ -21,7 +21,10 @@
 //!   keeps the dividend (its lower half, zero-extended, in 32 bits);
 //! - a signed division by -1 negates, and a signed remainder by -1 is 0,
 //!   for a register and an immediate alike;
-//! - a shift by a register takes its count modulo the width.
+//! - a shift by a register takes its count modulo the width;
+//! - a `BPF_LD_ABS` or `BPF_LD_IND` loads the packet's bytes big-endian
+//!   through `bpf_skb_load_helper_8`, `_16` or `_32` (`bpf_gen_ld_abs`),
+//!   and where they are not there the program returns 0.
 //!
 //! The context's fields that a socket filter may read are those of an
 //! AF_UNIX datagram's `sk_buff`: its length, and 0 for the rest, which such
@@ -244,6 +247,8 @@ const MEM: u8 = 0x60;
 const MEMSX: u8 = 0x80;
 const ATOMIC: u8 = 0xc0;
 const IMM: u8 = 0x00;
+const ABS: u8 = 0x20;
+const IND: u8 = 0x40;
 const DW: u8 = 0x18;
 /// `BPF_X`, and for `BPF_END` `BPF_TO_BE`.
 const X: u8 = 0x08;
@@ -313,6 +318,25 @@ impl Machine<'_, '_> {
                             };
                         }
                     }
+                }
+                LD if matches!(insn.code & 0xe0, ABS | IND) => {
+                    // bpf_gen_ld_abs: bpf_skb_load_helper_8, _16 or _32 of
+                    // the context in R6 and the offset, as an int, and an
+                    // exit with R0 = 0 where it fails.
+                    if self.regs[6] != address(CONTEXT, 0) || insn.code & 0x18 == DW {
+                        return Err(Fault);
+                    }
+                    let offset = if insn.code & 0xe0 == IND {
+                        self.regs[src].wrapping_add(imm)
+                    } else {
+                        imm
+                    };
+                    let r0 = self.load(offset as i32, width(insn.code));
+                    if (r0 as i64) < 0 {
+                        return Ok(0);
+                    }
+                    self.regs[0] = r0;
+                    pc = next;
                 }
                 LD => {
                     if insn.code != LD | IMM | DW {
@@ -1187,6 +1211,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ld_abs_and_ld_ind_load_big_endian_or_return_0() {
+        let data: Vec<u8> = (1..=8).collect();
+        // R6 = ctx, R7 = 2, R0 = the load, then R0 + 0x100 so that the
+        // program's own exit shows.
+        let ld = |code: u8, src: u8, imm: i32| {
+            let p = [
+                i(0xbf, 6, 1, 0, 0),
+                i(0xb7, 7, 0, 0, 2),
+                i(0xb7, 0, 0, 0, -1),
+                i(code, 0, src, 0, imm),
+                i(0x07, 0, 0, 0, 0x100),
+                exit(),
+            ];
+            let packet = Packet {
+                data: &data,
+                linear: 3,
+            };
+            let loads = BTreeMap::new();
+            let program = Program {
+                insns: &p,
+                maps: &[],
+                loads: &loads,
+            };
+            run(&program, &packet, &mut Quiet).unwrap()
+        };
+        assert_eq!(ld(0x20, 0, 0), 0x0102_0304 + 0x100);
+        assert_eq!(ld(0x28, 0, 6), 0x0708 + 0x100);
+        assert_eq!(ld(0x30, 0, 7), 0x08 + 0x100);
+        assert_eq!(ld(0x30, 0, 8), 0);
+        assert_eq!(ld(0x20, 0, 5), 0);
+        assert_eq!(ld(0x30, 0, -1), 0);
+        // From the network header, the data's start; no MAC header.
+        assert_eq!(ld(0x28, 0, -0x10_0000 + 1), 0x0203 + 0x100);
+        assert_eq!(ld(0x30, 0, -0x20_0000), 0);
+        // R7 + imm, which is an int.
+        assert_eq!(ld(0x40, 7, 1), 0x0405_0607 + 0x100);
+        assert_eq!(ld(0x50, 7, -2), 0x01 + 0x100);
+        assert_eq!(ld(0x50, 7, -3), 0);
+        assert_eq!(ld(0x48, 7, -0x10_0000 - 1), 0x0203 + 0x100);
+    }
+
+    #[test]
     fn the_helpers_of_no_arguments_and_of_the_socket() {
         let call = |id: i32, r1: Option<i32>| {
             let mut p = Vec::new();
@@ -1246,9 +1312,9 @@ pub(crate) mod tests {
 
     /// The soundness the verifier gives the interpreter: random programs
     /// near what it takes, of registers, the stack, the context, jumps,
-    /// atomics, load-acquires, store-releases and the helpers without
-    /// maps, and every one it takes runs on packets of a few lengths
-    /// without a load or store outside what it points to.
+    /// atomics, load-acquires, store-releases, packet loads and the
+    /// helpers without maps, and every one it takes runs on packets of a
+    /// few lengths without a load or store outside what it points to.
     #[test]
     fn programs_the_verifier_takes_never_fault() {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -1259,7 +1325,7 @@ pub(crate) mod tests {
             (seed % u64::from(n)) as u32
         };
         const EDGES: [i32; 12] = [0, 1, -1, 7, 8, 16, 31, 32, 63, 64, i32::MIN, i32::MAX];
-        let (mut taken, mut atomics, mut ordered) = (0, 0, 0);
+        let (mut taken, mut atomics, mut ordered, mut packet_loads) = (0, 0, 0, 0);
         for _ in 0..120_000 {
             let mut p = vec![i(0xbf, 6, 1, 0, 0)];
             for _ in 0..1 + next(12) {
@@ -1273,7 +1339,7 @@ pub(crate) mod tests {
                 let size = [0x18, 0x00, 0x08, 0x10][next(4) as usize];
                 let at = -8 * (1 + next(64) as i16) + next(8) as i16;
                 let alu = (next(14) as u8) << 4;
-                let insn = match next(14) {
+                let insn = match next(15) {
                     0 => i(0xb7, dst, 0, 0, imm),
                     1 => i(0x07 | alu, dst, 0, next(2) as i16, imm),
                     2 => i(0x04 | alu, dst, 0, 0, imm),
@@ -1326,6 +1392,16 @@ pub(crate) mod tests {
                             i(0xc3 | size, base, src, at, 0x110)
                         }
                     }
+                    // A BPF_LD_ABS or BPF_LD_IND of 1, 2 or 4 bytes, in the
+                    // packet, past it, or from the network or MAC header.
+                    13 => {
+                        let mode = [0x20, 0x40][next(2) as usize];
+                        let size = [0x00, 0x08, 0x10][next(3) as usize];
+                        let src = if mode == 0x40 { src } else { 0 };
+                        let imm =
+                            [0, 1, 6, 63, 64, -1, -0x10_0000, -0x20_0000, imm][next(9) as usize];
+                        i(mode | size, 0, src, 0, imm)
+                    }
                     _ => i(0x85, 0, 0, 0, [5, 7, 8, 14, 15, 46, 47][next(7) as usize]),
                 };
                 p.push(insn);
@@ -1348,6 +1424,9 @@ pub(crate) mod tests {
             {
                 ordered += 1;
             }
+            if p.iter().any(|insn| matches!(insn.code & 0xe7, 0x20 | 0x40)) {
+                packet_loads += 1;
+            }
             for len in [0, 1, 7, 64] {
                 let data = vec![0x5a; len];
                 let program = Program {
@@ -1365,12 +1444,13 @@ pub(crate) mod tests {
                 );
             }
         }
-        // Enough of them load for the check to mean something: 6,312 with
-        // this seed and this verifier, 625 of them with an atomic and 434
-        // with a load-acquire or store-release. A change to either that
-        // loads fewer than 6,000, fewer than 150 with an atomic or fewer
-        // than 300 with a load-acquire or store-release, should look again
-        // at what the programs cover.
+        // Enough of them load for the check to mean something: 6,672 with
+        // this seed and this verifier, 558 of them with an atomic, 375 with
+        // a load-acquire or store-release and 1,102 with a BPF_LD_ABS or
+        // BPF_LD_IND. A change to either that loads fewer than 6,000,
+        // fewer than 150 with an atomic, fewer than 300 with a load-acquire
+        // or store-release or fewer than 800 with a packet load, should
+        // look again at what the programs cover.
         assert!(taken >= 6_000, "only {taken} programs loaded");
         assert!(
             atomics >= 150,
@@ -1379,6 +1459,10 @@ pub(crate) mod tests {
         assert!(
             ordered >= 300,
             "only {ordered} programs with a load-acquire or store-release loaded"
+        );
+        assert!(
+            packet_loads >= 800,
+            "only {packet_loads} programs with a BPF_LD_ABS or BPF_LD_IND loaded"
         );
     }
 }

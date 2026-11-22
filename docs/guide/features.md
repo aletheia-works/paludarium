@@ -1649,24 +1649,40 @@ kernel.
     ignores its failed unmap.
   - A child of `fork` keeps the seals; `exec` starts without any.
 
-- io_uring is Linux 6.12's with these operations: `IORING_OP_NOP`,
+- io_uring is Linux 6.12's, but for its registered files, its groups of
+  buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
+  `kbuf.c` and `nop.c`, with master's `IOSQE_FIXED_FILE` for a NOP), the
+  kernel the differential tests run on. Its
+  operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
-  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, and `IORING_OP_FILES_UPDATE`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, and
+  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. A request runs while `io_uring_enter` takes it, so
   its completion is in the queue when the call returns; links, completions
   that skip success, and completions kept while the queue is full
-  (`IORING_FEAT_NODROP`) behave as on Linux.
+  (`IORING_FEAT_NODROP`) behave as on Linux. The completions of one
+  submission go in once all its requests ran, as Linux posts them
+  (`io_submit_flush_completions`).
+
+- `IORING_OP_NOP` takes Linux 7.0's flags, as `io_nop_prep` and `io_nop`
+  do. `IORING_NOP_INJECT_RESULT` completes it with its `len`.
+  `IORING_NOP_FILE` looks for the file of its `fd`, a registered one with
+  `IORING_NOP_FIXED_FILE`, and `IORING_NOP_FIXED_BUFFER` for registered
+  buffer `buf_index`, as Linux master does; `IOSQE_FIXED_FILE` also names
+  a registered file. A NOP that does not find its file completes with
+  `EBADF`, and one that does not find its buffer with `EFAULT`. `IORING_NOP_CQE32` is `EINVAL`,
+  as no ring has 32-byte completions, and so are unknown flags.
 
 - A transfer is checked as Linux's `io_prep_rw` and `io_read` or
   `io_write` check it, and fails at the same step. Its preparation takes the
   priority, the attributes, and the buffer or vector, and an error there
   ends the submission. Its issue completes with the error instead: the
   file (`EBADF` for no descriptor, or with `IOSQE_FIXED_FILE` for an empty
-  slot of the registered files), a provided buffer for
-  a read that selects one (`ENOBUFS`), the access mode, the `RWF_*` flags
+  slot of the registered files), the buffer of a read that selects one
+  (`ENOBUFS`, then `EFAULT` for one past the user half), the access mode, the `RWF_*` flags
   (`RWF_HIPRI` is `EINVAL`), the range, a read's `FAN_ACCESS_PERM`, and a
   file that cannot read or write (`EINVAL`, `EISDIR` for a directory). An
   offset of -1 is the file's position, which moves past what was moved,
@@ -1727,6 +1743,53 @@ kernel.
     (`EFAULT`; `EOVERFLOW`, and `EINVAL` for a range past the registered
     files). Registering files
     makes it all of them.
+  - `IORING_REGISTER_FILES2` and `IORING_REGISTER_FILES_UPDATE2` register
+    and update files with a tag for each slot, as Linux 7.0's
+    `io_register_rsrc` and `io_register_rsrc_update` do. The argument must
+    be of its size (`EINVAL`), readable (`EFAULT`), with a count and no
+    reserved field (`EINVAL`). `IORING_RSRC_REGISTER_SPARSE`, the only
+    flag, registers empty slots and takes no descriptors (`EINVAL`), as a
+    registration without descriptors does. Each tag is read before its
+    descriptor (`EFAULT`), and a tag needs a file (`EINVAL` for an empty or
+    skipped slot). Once nothing holds a tagged file, after its slot was
+    emptied or the files were unregistered (the last slot first), a
+    completion with the tag as its `user_data` and a result of 0 goes in at
+    once, ahead of the completions of the submission that emptied the slot,
+    or after them if a request of that submission holds the file. A
+    registration that fails posts no tag.
+
+- A ring keeps groups of buffers that a read with `IOSQE_BUFFER_SELECT`
+  chooses one of, the group that `buf_group` names, as Linux's
+  `io_uring/kbuf.c` does. The read is of its length at most, or of the whole
+  buffer, and its completion has `IORING_CQE_F_BUFFER` and the buffer's ID
+  in the top 16 bits of its flags. A group with none left, or none, is
+  `ENOBUFS`.
+  - `IORING_OP_PROVIDE_BUFFERS` adds buffers at the end of a group, making
+    it, with IDs from `off`, and `IORING_OP_REMOVE_BUFFERS` takes up to a
+    count from its start (`ENOENT` for no group), giving how many. They check
+    the entry as `io_provide_buffers_prep` and `io_remove_buffers_prep` do
+    (`E2BIG`, `EINVAL`, `EOVERFLOW`, `EFAULT` for buffers past the user
+    half). A group holds 65535 at most (`EOVERFLOW` if none could be
+    added). A read uses its buffer once it chose it, even if it then fails.
+  - `IORING_REGISTER_PBUF_RING` registers a ring of buffers for a group, as
+    `io_register_pbuf_ring` does: reserved bytes, an unknown flag, or a
+    count of entries not a power of two below 65536 is `EINVAL`, and a ring,
+    or a group with buffers, there already is `EEXIST`. The ring is in the
+    program's memory, page-aligned (`EINVAL`), not wrapping (`EOVERFLOW`) and
+    writable (`EFAULT`), or with `IOU_PBUF_RING_MMAP` in pages the kernel
+    gives, which `mmap` of the ring's descriptor at `IORING_OFF_PBUF_RING`
+    and the group's ID shows (`ENOMEM` for a group without them). Its pages
+    charge RLIMIT_MEMLOCK as registered buffers do.
+    `IORING_UNREGISTER_PBUF_RING` takes it away (`ENOENT`, `EINVAL` for
+    provided buffers), and `IORING_REGISTER_PBUF_STATUS` gives its head.
+  - A read takes the buffer at a ring's head unless the tail is there. A
+    file that cannot be polled, such as a regular file, uses it as the read
+    chooses it, whatever the read then does; a pipe or socket uses it once
+    its read did not fail, and one that failed leaves it in the ring. With
+    `IOU_PBUF_RING_INC` a read uses only the bytes it took (a file that
+    cannot be polled: the bytes it asked for), moving the buffer's address
+    and length past them, and its completion has `IORING_CQE_F_BUF_MORE`
+    while some of the buffer is left.
 
 - Linux's native asynchronous I/O (the calls libaio wraps) is `fs/aio.c`'s.
   `io_setup` makes the number of events at least four for each CPU and
@@ -1755,7 +1818,10 @@ kernel.
   alone; a hang-up, which has no key, what is ready). The call that makes
   the file ready, in this process or another (a forked child's write to the
   pipe), puts the event in the ring before it returns, so a program that
-  takes events from the ring itself sees it without a call. `io_cancel`
+  takes events from the ring itself sees it without a call. So does a
+  timerfd that expires while the program runs without a call: the next
+  checkpoint of a running thread completes the poll, as Linux's timer does
+  from its wake-up. `io_cancel`
   cancels only a poll that waits (`EINPROGRESS`, with an event of no events
   in the ring), and gives `EINVAL` for another request. `io_getevents` and
   `io_pgetevents` take events from the head and wait for `min_nr` of them
@@ -2525,7 +2591,17 @@ kernel.
     a connection times out (`ETIMEDOUT`) and a datagram is lost. TCP
     takes no broadcast or multicast route (`ENETUNREACH`), and UDP no
     broadcast one, to an address a broadcast route has or the limited
-    broadcast one, without `SO_BROADCAST` (`EACCES`). A group or the
+    broadcast one, without `SO_BROADCAST` (`EACCES`). With it, a broadcast
+    datagram reaches each UDP socket of its port that takes it, a copy
+    each (`__udp4_lib_mcast_deliver`): one bound to the unspecified
+    address or to the datagram's, not connected or connected to its
+    sender, and not `IPV6_V6ONLY`, in the sending namespace, as
+    `ip_mc_output` loops a broadcast back even without a carrier, and,
+    while the end has its carrier, in the peer's, if it takes the
+    address as a broadcast one (the limited one, or one its routes make
+    so) from a source its reverse path filtering takes
+    (`ip_route_input_slow`). A socket connected from the unspecified
+    address has taken its route's source, and takes none. A group or the
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).
@@ -3438,7 +3514,7 @@ kernel.
 
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
-  `fs`, `kernel` and `net` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -3752,6 +3828,18 @@ kernel.
   did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
+
+- `/proc/sys/vm` has `drop_caches` alone, so its listing differs from
+  Linux's, which has the rest of the `vm` sysctls too. As Linux's
+  `fs/drop_caches.c` has it, the file is root's, of mode 0200: no one may
+  open it to read, root included (`EACCES`, as `test_perm` gives root the
+  owner's bits), and only root may open it to write. A write takes one
+  `int` from 1 to 4 (`proc_dointvec_minmax`, else `EINVAL`). Each write
+  that goes through, one past the start too (with the value last written),
+  then drops as `drop_caches_sysctl_handler` does: 2 (`drop_slab`) evicts
+  the inodes nothing uses, and their evictable fanotify marks go (below);
+  1 drops the page cache, of which nothing here shows; 4 only quiets the
+  kernel log's line, which there is none of here.
 
 - `/proc/sys/net` has the settings of the opener's network namespace, as
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
@@ -4162,7 +4250,8 @@ kernel.
   `ru_minflt` counts the minor faults, as Linux's `mm_account_fault` adds
   them to the task: a thread's first read or write of a page and its write
   to a page `fork` shares or of a private mapping of a file (in its own code
-  and in its system calls' copies), and the faults of the reads and writes
+  and in the kernel's accesses for it: a system call's copies, a signal
+  frame), each as it is taken, and the faults of the reads and writes
   through `get_user_pages` made for it, which `perf` does not count:
   `mlock`'s population, a tracer's `PTRACE_PEEKDATA` and `PTRACE_POKEDATA`
   (counted to the tracer) and a core dump's (which leaves anonymous memory
@@ -4391,8 +4480,9 @@ kernel.
   event of a CPU counts the time that passes); a thread's `page-faults` and
   `minor-faults` (a first read or write of a page, and a write to a page
   `fork` shares or a private mapping of a file's: the faults of the
-  thread's code, left out with `exclude_user`, and those of system calls'
-  copies, left out with `exclude_kernel`), `context-switches` (each time it
+  thread's code, left out with `exclude_user`, and those of the kernel's
+  accesses for it, a system call's copies or a signal frame, left out with
+  `exclude_kernel`), `context-switches` (each time it
   sleeps) and `cpu-migrations` (each time the CPU `getcpu` reports
   changes), the last two made by the kernel and so left out with
   `exclude_kernel`, as Linux leaves them out; `major-faults`, which count
@@ -4777,6 +4867,18 @@ kernel.
   "program of this type cannot use helper %s#%d" and a number that is no
   helper "invalid func %s#%d" (`EINVAL`).
 
+- `BPF_LD_ABS` and `BPF_LD_IND` load 1, 2 or 4 bytes of the packet into
+  R0, at `imm` or at the source register plus `imm`, as Linux's
+  `check_ld_abs` checks them. Their reserved fields, a destination, an
+  offset or, for `BPF_LD_ABS`, a source, are "BPF_LD_[ABS|IND] uses
+  reserved fields", checked before any path is walked as master does,
+  and 8 bytes is an unknown opcode (`EINVAL`). R6 must be written ("R6
+  !read_ok", `EACCES`) and be the context ("at the time of
+  BPF_LD_ABS|IND R6 != pointer to skb", `EINVAL`); then the source of a
+  `BPF_LD_IND` must be written, and the context in R6 must be as it came
+  ("dereference of modified ctx ptr R6 off=%d disallowed", `EACCES`).
+  R1 to R5 are not readable after one, and R0 is a number.
+
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`
   (below), and runs on each message sent to it, as
@@ -4791,7 +4893,14 @@ kernel.
   the source's lower half and compares R0's, and the old value comes back
   zero-extended; no other access to a map's value comes between its read
   and its write. A load-acquire comes back zero-extended, and a
-  store-release writes the source's lower bytes. The context is the message's `__sk_buff`: its `len`, `cb[]`
+  store-release writes the source's lower bytes. A `BPF_LD_ABS` or
+  `BPF_LD_IND` loads big-endian, as Linux's `bpf_gen_ld_abs` rewrites it
+  into a call of `bpf_skb_load_helper_8`, `_16` or `_32`: its offset is
+  an `int` (the lower half of the register plus `imm`), from the
+  message's start or, from `SKF_NET_OFF`, the network header, its start;
+  where the bytes are not in the message, or the offset is from the MAC
+  header, which is not set, or below it, the program returns 0 then and
+  there. The context is the message's `__sk_buff`: its `len`, `cb[]`
   from 0 and 0 for the fields an AF_UNIX message does not set.
   `bpf_skb_load_bytes` reads the message, and its relative form reads it
   from the network header, its start, where there is no MAC header
@@ -5002,7 +5111,12 @@ kernel.
   so a mount that takes the ID next is not marked. As a tmpfs's superblock
   goes with its last mount, the marks on its files and on itself go
   (`fsnotify_sb_delete`), so one that takes the device next is not marked.
-  Exec's open of the
+  An evictable mark (`FAN_MARK_EVICTABLE`) holds no reference to its inode:
+  once `/proc/sys/vm/drop_caches` evicts the inode, the mark goes, as
+  `fsnotify_inode_delete` takes off its marks. That is a file outside a
+  tmpfs (whose dentries stay) that no open description, working
+  directory, running program, inotify watch or mark without
+  `FAN_MARK_EVICTABLE` holds. Exec's open of the
   program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
   as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as
   `IN_OPEN`. Before that, each such open asks `FAN_OPEN_EXEC_PERM`, then

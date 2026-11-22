@@ -783,6 +783,43 @@ fn the_call_that_readies_a_file_puts_the_poll_in_the_ring() {
 }
 
 #[test]
+fn a_timer_that_expires_puts_the_poll_in_the_ring_with_no_call() {
+    let mut f = fixture();
+    let start = f.host.clock(paludarium_host::ClockId::Monotonic).unwrap();
+    // timerfd_create(CLOCK_MONOTONIC, 0), then 1 s to its expiry.
+    let timer = f.ret(283, &[1, 0]);
+    let spec = DATA + 0xe00;
+    let mut b = [0; 32];
+    b[16..24].copy_from_slice(&1u64.to_le_bytes());
+    f.mem.write(GuestAddr(spec), &b).unwrap();
+    assert_eq!(f.ret(286, &[timer, 0, spec, 0]), 0);
+    let ctx = f.setup(8);
+    let waiting = f.iocb(
+        0,
+        Iocb {
+            data: 9,
+            opcode: 5,
+            fildes: timer as u32,
+            buf: 1,
+            ..Iocb::default()
+        },
+    );
+    assert_eq!(f.ret(SUBMIT, &[ctx, 1, POINTERS]), 1);
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    assert_eq!(f.u32_at(ctx + 12), 0);
+    // The timer expires while the program runs: the next checkpoint
+    // completes the poll, as Linux's timer does, before any call.
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, start + 2_000_000_000);
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    assert_eq!(f.u32_at(ctx + 12), 1);
+    assert_eq!(
+        (f.u64_at(ctx + 32), f.u64_at(ctx + 40), f.u64_at(ctx + 48)),
+        (9, waiting, 1)
+    );
+}
+
+#[test]
 fn getevents_checks_its_arguments_and_waits_for_min_nr() {
     let mut f = fixture();
     let fd = f.file("a", b"abc");

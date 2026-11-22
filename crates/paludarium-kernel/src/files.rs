@@ -3583,7 +3583,7 @@ pub(crate) fn kiocb_rw_flags(file: &Arc<dyn FileHandle>, flags: u32) -> Result<u
 /// position that `pread` and `pwrite` take (Linux's `FMODE_PREAD`), not a
 /// pipe, socket or terminal, a signalfd or an inotify instance, which read
 /// and write as a stream whatever the offset.
-fn aio_positioned(file: &Arc<dyn FileHandle>) -> bool {
+pub(crate) fn aio_positioned(file: &Arc<dyn FileHandle>) -> bool {
     file.seek(0, 1).is_ok()
         && !file.as_any().is_some_and(|any| {
             any.is::<crate::signalfd::SignalFile>() || any.is::<crate::inotify::Instance>()

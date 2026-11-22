@@ -232,44 +232,123 @@ pub enum ReadHint {
     Random,
 }
 
-/// The page faults that the calling host thread's accesses took, which the
-/// kernel adds to its guest thread's (`perf`'s `page-faults`). They are
-/// those of Linux's `mm_account_fault` with the registers of an access: a
+/// The page faults that the calling host thread's accesses take, which
+/// count to its guest thread as they are taken, as Linux's
+/// `mm_account_fault` counts them to `current` (`perf`'s `page-faults`).
+/// They are those of `mm_account_fault` with the registers of an access: a
 /// read or fetch of a page that had no entry yet (Linux maps the zero page
 /// or the file's), and a write to a page with no frame of its own yet (its
 /// first write, the copy of a page-cache page of a private mapping or of a
 /// frame `fork` shared). A core dump's, `ptrace`'s or a lock's population's
 /// access through `get_user_pages` is not among them, as it passes no
 /// registers and so no `perf` event; its faults are kept apart
-/// ([`faults::take_forced`]), for the thread's `min_flt` alone.
+/// ([`Sink::forced`]), for the thread's `min_flt` alone.
+///
+/// The kernel [`bind`]s the host thread to its guest thread's [`Sink`]
+/// as it starts to run it, before its first instruction, and says when it
+/// works for it ([`set_kernel`]); a host thread no guest thread is bound to
+/// keeps its faults itself, for [`take`] and [`take_forced`] or for the
+/// first [`bind`].
 pub mod faults {
-    use core::cell::Cell;
+    use core::cell::{Cell, RefCell};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Where a guest thread's faults count: those of its own code
+    /// (`user`), of the kernel's accesses for it (`kernel`), and those
+    /// through `get_user_pages` (`forced`), which are no `perf` event.
+    pub trait Sink: Send + Sync {
+        fn user(&self) -> &AtomicU64;
+        fn kernel(&self) -> &AtomicU64;
+        fn forced(&self) -> &AtomicU64;
+    }
 
     std::thread_local! {
         static TAKEN: Cell<u64> = const { Cell::new(0) };
         static FORCED: Cell<u64> = const { Cell::new(0) };
+        static SINK: RefCell<Option<Arc<dyn Sink>>> = const { RefCell::new(None) };
+        static KERNEL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Adds a fault to the bound sink's count `forced` or not; `false`
+    /// when the host thread is not bound.
+    fn add(forced: bool) -> bool {
+        SINK.with(|sink| {
+            let sink = sink.borrow();
+            let Some(counts) = sink.as_ref() else {
+                return false;
+            };
+            let field = if forced {
+                counts.forced()
+            } else if KERNEL.with(Cell::get) {
+                counts.kernel()
+            } else {
+                counts.user()
+            };
+            field.fetch_add(1, Ordering::SeqCst);
+            true
+        })
     }
 
     pub(crate) fn count() {
-        TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
+        if !add(false) {
+            TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
+        }
     }
 
     pub(crate) fn count_forced() {
-        FORCED.with(|forced| forced.set(forced.get().wrapping_add(1)));
+        if !add(true) {
+            FORCED.with(|forced| forced.set(forced.get().wrapping_add(1)));
+        }
     }
 
-    /// The faults taken since the last call, on this host thread.
+    /// Counts the calling host thread's faults to `counts` from now on, and
+    /// adds those it took while it was not bound.
+    pub fn bind(counts: Arc<dyn Sink>) {
+        let bound = SINK.with(|sink| {
+            sink.borrow()
+                .as_ref()
+                .is_some_and(|bound| core::ptr::addr_eq(Arc::as_ptr(bound), Arc::as_ptr(&counts)))
+        });
+        if bound {
+            return;
+        }
+        let field = if KERNEL.with(Cell::get) {
+            counts.kernel()
+        } else {
+            counts.user()
+        };
+        field.fetch_add(take(), Ordering::SeqCst);
+        counts.forced().fetch_add(take_forced(), Ordering::SeqCst);
+        SINK.with(|sink| *sink.borrow_mut() = Some(counts));
+    }
+
+    /// Counts no more of the calling host thread's faults to the guest
+    /// thread it was bound to, as that thread is done there.
+    pub fn unbind() {
+        SINK.with(|sink| sink.borrow_mut().take());
+    }
+
+    /// Whether the calling host thread's accesses are the kernel's from now
+    /// on (a system call's, a signal frame's), or its guest code's; returns
+    /// what it was.
+    pub fn set_kernel(kernel: bool) -> bool {
+        KERNEL.with(|was| was.replace(kernel))
+    }
+
+    /// The faults taken while the calling host thread was not bound, since
+    /// the last call.
     #[must_use]
     pub fn take() -> u64 {
         TAKEN.with(|taken| taken.replace(0))
     }
 
     /// The faults that reads and writes through `get_user_pages` took
-    /// since the last call, on this host thread: a read of a page that had
-    /// no entry (a core dump's, `PTRACE_PEEKDATA`'s, a lock's population's)
-    /// and a forced write that needs a frame of its own
-    /// (`PTRACE_POKEDATA`'s). Linux's `mm_account_fault` adds them to the
-    /// calling task's `min_flt` with no `perf` event.
+    /// while the calling host thread was not bound, since the last call: a
+    /// read of a page that had no entry (a core dump's, `PTRACE_PEEKDATA`'s,
+    /// a lock's population's) and a forced write that needs a frame of its
+    /// own (`PTRACE_POKEDATA`'s). Linux's `mm_account_fault` adds them to
+    /// the calling task's `min_flt` with no `perf` event.
     #[must_use]
     pub fn take_forced() -> u64 {
         FORCED.with(|forced| forced.replace(0))
@@ -2887,7 +2966,11 @@ impl AddressSpaceData {
                 let Ok(n @ 1..) = read else {
                     break;
                 };
-                if self.write_initial(GuestAddr(at), &buf[..n]).is_err() {
+                // No fault: Linux reads the page in as it is touched again.
+                if self
+                    .write_with(GuestAddr(at), &buf[..n], Access::Setup)
+                    .is_err()
+                {
                     break;
                 }
                 at += n as u64;
@@ -4409,9 +4492,24 @@ impl AddressSpaceData {
     }
 
     /// Writes ignoring page protection (pages must be mapped). Used by the
-    /// loader to fill read-only segments and the initial stack.
+    /// loader to fill the program's segments. Each page it gives a frame
+    /// counts a fault through `get_user_pages` ([`faults::take_forced`]):
+    /// Linux maps the file and faults its pages in as the program first
+    /// touches them, which the pages filled here no longer do.
     pub fn write_initial(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
-        self.write_with(addr, buf, Access::Setup).map(|_| ())
+        let fresh = {
+            let directory = self.read_directory();
+            chunks(addr, buf.len())
+                .filter(|&(page, _, _)| {
+                    lookup(&directory, page).is_none_or(|p| p.frame.get().is_none())
+                })
+                .count()
+        };
+        self.write_with(addr, buf, Access::Setup)?;
+        for _ in 0..fresh {
+            faults::count_forced();
+        }
+        Ok(())
     }
 
     fn overlaps(&self, start: u64, end: u64) -> bool {
@@ -9385,6 +9483,61 @@ mod tests {
         assert!(space.write_u64(anon, 1).is_err());
         space.unmap(GuestAddr(0x10000), 0xff_ffff_0000).unwrap();
         assert!(space.read_u64(GuestAddr(0xff_ffff_fff8)).is_err());
+    }
+
+    #[test]
+    fn a_bound_thread_counts_its_faults_as_they_are_taken() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3]);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+        }
+        let load = |counts: &Counts| counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
+        let mut space = AddressSpace::new();
+        let anon = space
+            .map(
+                None,
+                5 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let _ = (faults::take(), faults::take_forced());
+        // One taken before it is bound counts at the binding.
+        space.write_u64(anon, 1).unwrap();
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        assert_eq!(load(&counts), [1, 0, 0]);
+        // Then each as it is taken, the kernel's apart.
+        space.write_u64(GuestAddr(anon.0 + PAGE_SIZE), 1).unwrap();
+        assert_eq!(load(&counts), [2, 0, 0]);
+        let was = faults::set_kernel(true);
+        space
+            .write_u64(GuestAddr(anon.0 + 2 * PAGE_SIZE), 1)
+            .unwrap();
+        faults::set_kernel(was);
+        assert_eq!(load(&counts), [2, 1, 0]);
+        // The loader's fill counts one through `get_user_pages` for each
+        // page it gives a frame, and none for one that has its own.
+        space
+            .write_initial(GuestAddr(anon.0 + 2 * PAGE_SIZE), &[1; 2 * PAGE_BYTES])
+            .unwrap();
+        assert_eq!(load(&counts), [2, 1, 1]);
+        // Once unbound, its faults wait in the host thread again.
+        faults::unbind();
+        space
+            .write_u64(GuestAddr(anon.0 + 4 * PAGE_SIZE), 1)
+            .unwrap();
+        assert_eq!(load(&counts), [2, 1, 1]);
+        assert_eq!((faults::take(), faults::take_forced()), (1, 0));
     }
 
     #[test]

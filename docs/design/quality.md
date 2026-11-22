@@ -233,8 +233,9 @@ every test passing.
 - The terminal gate runs the libraries' unit tests, not the harness's
   differential tests. So that the system calls those check count there too,
   some kernel unit tests (`replay_tests.rs`, `ptrace_replay_tests.rs`,
-  `bpf_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`, `mctp_tests.rs`,
-  `seccomp_tests.rs`, `perf_sample_tests.rs` and `perf_side_band_tests.rs` in
+  `bpf_tests.rs`, `bpf_prog_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`,
+  `mctp_tests.rs`, `seccomp_tests.rs`, `perf_sample_tests.rs` and
+  `perf_side_band_tests.rs` in
   `crates/paludarium-kernel/src/`) make a differential guest's calls in
   the same order and compare its lines with what the guest prints on
   native Linux: as printed on Linux 7.0, or as printed under the emulator

@@ -884,11 +884,13 @@ static struct {
     uint64_t id;
 } seen_mounts[16];
 static int seen_count;
-static void name_mount(const char *name) {
+/* Gives `path`'s mount the name `name` in the events shown. */
+static void name_mount_at(const char *name, const char *path) {
     if (seen_count == 16) return;
     seen_mounts[seen_count].name = name;
-    seen_mounts[seen_count++].id = unique_of(at(name));
+    seen_mounts[seen_count++].id = unique_of(path);
 }
+static void name_mount(const char *name) { name_mount_at(name, at(name)); }
 static const char *mount_name(uint64_t id) {
     for (int i = 0; i < seen_count; i++)
         if (seen_mounts[i].id && seen_mounts[i].id == id) return seen_mounts[i].name;
@@ -1077,16 +1079,13 @@ static int case_mount_events(void) {
     show_namespace_exit(fan);
     close(fan);
     close(detach);
-    printf("umount=%ld %ld %ld\n", e(umount2(at("e"), 0)), e(umount2(at("a/in"), 0)), e(umount2(at("a"), 0)));
+    // One by one: C leaves the order of a call's arguments open.
+    long first = e(umount2(at("e"), 0));
+    long second = e(umount2(at("a/in"), 0));
+    long third = e(umount2(at("a"), 0));
+    printf("umount=%ld %ld %ld\n", first, second, third);
     remove_base();
     return 0;
-}
-
-/* Gives `path`'s mount the name `name` in the events shown. */
-static void name_mount_at(const char *name, const char *path) {
-    if (seen_count == 16) return;
-    seen_mounts[seen_count].name = name;
-    seen_mounts[seen_count++].id = unique_of(path);
 }
 
 /* The moves of FAN_REPORT_MNT that are not a move_mount. An unmount that
@@ -1098,7 +1097,10 @@ static int case_mount_moves(void) {
     make_base("mount-moves");
     const char *dirs[] = {"a", "e", "p"};
     for (int i = 0; i < 3; i++) mkdir(at(dirs[i]), 0755);
-    printf("unshare=%ld\n", e(unshare(CLONE_NEWNS)));
+    // Nothing below may touch the mounts of the namespace this began in.
+    long shared = e(unshare(CLONE_NEWNS));
+    printf("unshare=%ld\n", shared);
+    if (shared) return 81;
     printf("private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
     int fan = fan_init(FAN_REPORT_MNT | FAN_NONBLOCK, 0);
     if (fan < 0) return 80;
@@ -1117,13 +1119,14 @@ static int case_mount_moves(void) {
     show_mount_events("mounted", fan);
     printf("umount a/x=%ld\n", e(umount2(at("a/x"), 0)));
     show_mount_events("propagated unmount", fan);
-    printf("cover at e/x=%d\n", unique_of(at("e/x")) == seen_mounts[seen_count - 1].id);
+    uint64_t cover = seen_mounts[seen_count - 1].id;
+    printf("cover at e/x=%d\n", cover != 0 && unique_of(at("e/x")) == cover);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
         seen_count = 0;
-        int code = unshare(CLONE_NEWNS) == 0 ? 0 : 1;
-        printf("child unshare=%d\n", code);
+        // A pivot_root in the parent's namespace would change its root.
+        if (unshare(CLONE_NEWNS)) _exit(1);
         printf("child private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
         printf("tmpfs p=%ld\n", e(mount("none", at("p"), "tmpfs", 0, NULL)));
         mkdir(at("p/old"), 0755);
@@ -1143,7 +1146,11 @@ static int case_mount_moves(void) {
     printf("child exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     show_mount_events("after the child", fan);
     close(fan);
-    printf("umount=%ld %ld %ld\n", e(umount2(at("e/x"), 0)), e(umount2(at("e"), 0)), e(umount2(at("a"), 0)));
+    // One by one: C leaves the order of a call's arguments open.
+    long first = e(umount2(at("e/x"), 0));
+    long second = e(umount2(at("e"), 0));
+    long third = e(umount2(at("a"), 0));
+    printf("umount=%ld %ld %ld\n", first, second, third);
     remove_base();
     return 0;
 }

@@ -875,47 +875,35 @@ static int case_reap(void) {
     return 0;
 }
 
-/* A timerfd that expires while the program spins on the ring: Linux's
-   timer completes the poll from its wake-up, so the event is in the ring
-   with no call. Each round spins with no system call and then sleeps 1 ms:
-   the test host's virtual clock passes only in a wait, so the sleep is what
-   lets the timer expire there, and the emulator's checkpoint or the sleep's
-   return completes the poll. 10000 rounds give up. */
+/* A poll that waits for a timerfd completes as the timer expires, which
+   io_getevents waits for: the event with its POLLIN, then the expiry for
+   the timerfd's read. A 10 s timeout ends the wait if it never comes. (The
+   kernel unit test shows the event in the ring with no call; the test
+   host's virtual clock passes only in a wait, so a case cannot.) */
 static int case_timer(void) {
     aio_context_t ctx = 0;
     printf("setup=%ld\n", setup(8, &ctx));
     if (!ctx) return 3;
     struct aio_ring *ring = (struct aio_ring *)ctx;
-    struct io_event *events = (struct io_event *)(ring + 1);
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
     if (tfd < 0) return 4;
     struct iocb cb = poll_of(tfd, POLLIN, 9);
     printf("submit=%ld in-ring=%u\n", submit1(ctx, &cb), (ring->tail - ring->head) % ring->nr);
     struct itimerspec soon = {.it_value = {.tv_nsec = 20000000}};
-    struct timespec ms = {0, 1000000};
-    unsigned head = ring->head, tail = head;
     if (timerfd_settime(tfd, 0, &soon, NULL)) return 5;
-    for (int round = 0; round < 10000 && tail == head; round++) {
-        for (long spin = 0; spin < (1L << 14); spin++) {
-            tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
-            if (tail != head) break;
-        }
-        if (tail == head) nanosleep(&ms, NULL);
-    }
-    if (tail == head) {
-        printf("never came\n");
-    } else {
-        struct io_event ev = events[head];
-        printf("reaped: in-ring=%u data=%llu obj=%d res=%#llx res2=%lld\n", (tail - head) % ring->nr,
-               (unsigned long long)ev.data, ev.obj == (uint64_t)(uintptr_t)&cb, (long long)ev.res,
-               (long long)ev.res2);
-        __atomic_store_n(&ring->head, (head + 1) % ring->nr, __ATOMIC_RELEASE);
-    }
+    struct timespec ten = {10, 0};
     struct io_event ev[8];
-    long got = getevents(ctx, 0, 8, ev, &zero);
+    long got = getevents(ctx, 1, 8, ev, &ten);
+    if (got < 1) {
+        printf("never came: getevents=%ld\n", got);
+    } else {
+        printf("got=%ld data=%llu obj=%d res=%#llx res2=%lld\n", got, (unsigned long long)ev[0].data,
+               ev[0].obj == (uint64_t)(uintptr_t)&cb, (long long)ev[0].res, (long long)ev[0].res2);
+    }
     uint64_t ticks = 0;
     ssize_t n = read(tfd, &ticks, sizeof ticks);
-    printf("after: getevents=%ld read=%zd ticks=%llu\n", got, n, (unsigned long long)ticks);
+    printf("after: empty=%u read=%zd ticks=%llu\n", ring->head == ring->tail ? 1u : 0u, n,
+           (unsigned long long)ticks);
     printf("destroy=%ld\n", destroy(ctx));
     return 0;
 }

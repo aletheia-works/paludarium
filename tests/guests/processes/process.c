@@ -15342,6 +15342,220 @@ static int ldt_case(const char *self) {
     return 0;
 }
 
+/* --- segment-registers ------------------------------------------------ */
+
+/* Where the handler below resumes a load that faulted. */
+static volatile unsigned long seg_resume;
+
+/* The signal a refused load gives: its code and address, the frame's
+   vector, error code, cs and ss and the two uc_flags bits about ss, and the
+   ss the handler runs on. */
+static void seg_handler(int sig, siginfo_t *info, void *context) {
+    ucontext_t *uc = context;
+    greg_t *g = uc->uc_mcontext.gregs;
+    unsigned short ss;
+    __asm__ volatile("mov %%ss, %0" : "=r"(ss));
+    unsigned long selectors = g[REG_CSGSFS];
+    printf("  signal=%d code=%d addr=%s trapno=%lld err=%#llx cs=%#lx ss=%#lx handler-ss=%#x "
+           "uc-ss-flags=%#lx\n",
+           sig, info->si_code,
+           info->si_addr == NULL                                ? "0"
+           : (unsigned long)info->si_addr == seg_resume - 2 ? "insn"
+                                                                : "other",
+           g[REG_TRAPNO], g[REG_ERR], selectors & 0xffff, selectors >> 48, ss,
+           uc->uc_flags & 6);
+    /* A fault no load expected ends the case rather than resuming again. */
+    if (seg_resume == 0) {
+        fflush(stdout);
+        _exit(97);
+    }
+    g[REG_RIP] = seg_resume;
+    seg_resume = 0;
+}
+
+/* Runs `insn` (of 2 bytes when it faults, for the SIGILL address) with
+   the selector in ax, after `name`; a fault resumes after it. */
+#define SEG_TRY(name, insn, value)                                                           \
+    do {                                                                                     \
+        printf("%s:\n", name);                                                               \
+        fflush(stdout);                                                                      \
+        unsigned long v_ = (value);                                                          \
+        __asm__ volatile("lea 1f(%%rip), %%rcx\n\tmov %%rcx, %[r]\n\t" insn "\n1:"          \
+                         : [r] "=m"(seg_resume)                                              \
+                         : "a"(v_)                                                           \
+                         : "rcx", "memory");                                                 \
+    } while (0)
+
+static unsigned short seg_read_gs(void) {
+    unsigned short s;
+    __asm__ volatile("mov %%gs, %0" : "=r"(s));
+    return s;
+}
+static unsigned long seg_gs_base(void) {
+    unsigned long base = 0;
+    syscall(SYS_arch_prctl, 0x1004, &base);
+    return base;
+}
+
+/* Moves to and from segment registers as the CPU checks them against
+   Linux's GDT and an LDT that modify_ldt writes: fs and gs take a
+   descriptor's base, a null selector clears it, and each refused load is
+   SIGSEGV (#GP) or SIGBUS (#NP, #SS) with its vector and error code in the
+   frame. Then ss across a system call and a signal, arch_prctl, the reload
+   modify_ldt makes of ds and es, push and pop, and a fork. glibc keeps its
+   thread pointer in fs, so fs changes only within one asm statement. */
+static int segments_case(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = seg_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    unsigned short cs, ss, ds, es, fs, gs;
+    __asm__ volatile("mov %%cs, %0\n\tmov %%ss, %1\n\tmov %%ds, %2\n\tmov %%es, %3\n\t"
+                     "mov %%fs, %4\n\tmov %%gs, %5"
+                     : "=r"(cs), "=r"(ss), "=r"(ds), "=r"(es), "=r"(fs), "=r"(gs));
+    printf("initial cs=%#x ss=%#x ds=%#x es=%#x fs=%#x gs=%#x gs-base=%#lx\n", cs, ss, ds, es,
+           fs, gs, seg_gs_base());
+    unsigned long *area = mmap((void *)0x10000000, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (area != (void *)0x10000000) return 1;
+    area[0] = 0x1111111111111111UL;
+    area[0x100 / 8 + 1] = 0x2222222222222222UL;
+    area[0x200 / 8] = 0x3333333333333333UL;
+    /* 0x7 read/write data at the page; 0xf the same, not present; 0x17
+       read-only data 0x100 in; 0x1f execute-only code; 0x27 readable code
+       0x200 in. */
+    long written[] = {ldt_write(0x11, 0, 0x10000000, 0xfffff, 1 | 1 << 4),
+                      ldt_write(0x11, 1, 0x10000000, 0xfffff, 1 | 1 << 4 | 1 << 5),
+                      ldt_write(0x11, 2, 0x10000100, 0xfffff, 1 | 1 << 3 | 1 << 4),
+                      ldt_write(0x11, 3, 0x10000000, 0xfffff, 1 | 2 << 1 | 1 << 3 | 1 << 4),
+                      ldt_write(0x11, 4, 0x10000200, 0xfffff, 1 | 2 << 1 | 1 << 4)};
+    printf("ldt=%ld %ld %ld %ld %ld\n", written[0], written[1], written[2], written[3],
+           written[4]);
+    for (unsigned i = 0; i < 5; i++)
+        if (written[i] != 0) return 1;
+    unsigned long loads[] = {0x7, 0x17, 0x27, 0x7b, 0x2b, 0x33, 0x23, 0x28, 0x3, 0};
+    for (unsigned i = 0; i < sizeof loads / sizeof *loads; i++) {
+        unsigned long value = 0;
+        __asm__ volatile("mov %w0, %%gs" : : "r"(loads[i]));
+        /* Only an LDT segment here has a base with memory at it. */
+        if (loads[i] & 4) __asm__ volatile("mov %%gs:8, %0" : "=r"(value) : : "memory");
+        printf("gs<-%#lx: gs=%#x base=%#lx gs:8=%#lx\n", loads[i], seg_read_gs(), seg_gs_base(),
+               value);
+        __asm__ volatile("mov %w0, %%ds\n\tmov %w0, %%es" : : "r"(loads[i]));
+        __asm__ volatile("mov %%ds, %0\n\tmov %%es, %1" : "=r"(ds), "=r"(es));
+        printf("  ds=%#x es=%#x\n", ds, es);
+    }
+    /* What the CPU refuses. */
+    SEG_TRY("gs<-0xf not present", "mov %%ax, %%gs", 0xf);
+    SEG_TRY("gs<-0x1f execute-only code", "mov %%ax, %%gs", 0x1f);
+    SEG_TRY("gs<-0x2f past the table", "mov %%ax, %%gs", 0x2f);
+    SEG_TRY("ds<-0x10 kernel code", "mov %%ax, %%ds", 0x10);
+    SEG_TRY("ds<-0x1b kernel data", "mov %%ax, %%ds", 0x1b);
+    SEG_TRY("ds<-0x40 tss", "mov %%ax, %%ds", 0x40);
+    SEG_TRY("ds<-0x63 empty tls", "mov %%ax, %%ds", 0x63);
+    SEG_TRY("ds<-0x83 past the gdt", "mov %%ax, %%ds", 0x83);
+    SEG_TRY("es<-0xfffb", "mov %%ax, %%es", 0xfffb);
+    SEG_TRY("ss<-0 null", "mov %%ax, %%ss", 0);
+    SEG_TRY("ss<-0x33 code", "mov %%ax, %%ss", 0x33);
+    SEG_TRY("ss<-0x17 read-only", "mov %%ax, %%ss", 0x17);
+    SEG_TRY("ss<-0x4 rpl 0", "mov %%ax, %%ss", 0x4);
+    SEG_TRY("ss<-0x7b cpunode", "mov %%ax, %%ss", 0x7b);
+    SEG_TRY("ss<-0xf not present", "mov %%ax, %%ss", 0xf);
+    SEG_TRY("cs<-0x33", ".byte 0x8e, 0xc8", 0x33);
+    __asm__ volatile("mov %%ss, %0\n\tmov %%ds, %1\n\tmov %%es, %2" : "=r"(ss), "=r"(ds), "=r"(es));
+    printf("after ss=%#x ds=%#x es=%#x gs=%#x\n", ss, ds, es, seg_read_gs());
+    /* The forms that read one: 16 bits, a 32-bit or 64-bit register
+       zero-extended, and memory, 16 bits. */
+    unsigned long r16 = ~0UL, r32 = ~0UL, r64 = ~0UL, word = ~0UL;
+    __asm__ volatile("mov %w4, %%gs\n\tmov %%gs, %w0\n\tmov %%gs, %k1\n\tmov %%gs, %2\n\t"
+                     "mov %%gs, %3"
+                     : "+r"(r16), "+r"(r32), "+r"(r64), "+m"(word)
+                     : "r"(0x27UL));
+    printf("reads %#lx %#lx %#lx %#lx\n", r16, r32, r64, word);
+    /* push and pop: the slot cleared first, as some CPUs write 16 bits of
+       a 64-bit push. pop loads with its checks and moves rsp only then. */
+    unsigned long pushed = 0, pushed16 = 0, popped = 0, before, after;
+    __asm__ volatile("pushq $0\n\tpopq %%rcx\n\tpush %%gs\n\tpop %0\n\t"
+                     "pushq $0\n\tpopq %%rcx\n\tpushw %%gs\n\tpopw %w1\n\t"
+                     "pushq $0x7\n\tpop %%gs\n\tmov %%gs:0, %2\n\tpushw $0x17\n\tpopw %%gs"
+                     : "=r"(pushed), "+r"(pushed16), "=r"(popped)
+                     :
+                     : "rcx", "memory");
+    printf("push=%#lx pushw=%#lx pop-gs:0=%#lx gs=%#x base=%#lx\n", pushed, pushed16, popped,
+           seg_read_gs(), seg_gs_base());
+    printf("pop gs<-0xf:\n");
+    fflush(stdout);
+    __asm__ volatile("lea 1f(%%rip), %%rcx\n\tmov %%rcx, %[r]\n\tmov %%rsp, %[b]\n\t"
+                     "pushq $0xf\n\tpop %%gs\n1:\n\tmov %%rsp, %[a]\n\tmov %[b], %%rsp"
+                     : [r] "=m"(seg_resume), [b] "=&r"(before), [a] "=&r"(after)
+                     :
+                     : "rcx", "memory");
+    printf("  rsp moved %ld gs=%#x\n", (long)(after - before), seg_read_gs());
+    /* A null selector clears the base; arch_prctl nulls the selector. */
+    syscall(SYS_arch_prctl, 0x1001, 0x10000000);
+    printf("set-gs gs=%#x base=%#lx\n", seg_read_gs(), seg_gs_base());
+    __asm__ volatile("mov %w0, %%gs" : : "r"(0UL));
+    printf("null gs=%#x base=%#lx\n", seg_read_gs(), seg_gs_base());
+    __asm__ volatile("mov %w0, %%gs" : : "r"(0x7UL));
+    syscall(SYS_arch_prctl, 0x1001, 0x10000100);
+    printf("set-gs after ldt gs=%#x base=%#lx\n", seg_read_gs(), seg_gs_base());
+    /* fs within one statement: an LDT base, then arch_prctl back. */
+    unsigned long fs_base = 0, fs_value, fs_selector;
+    syscall(SYS_arch_prctl, 0x1003, &fs_base);
+    __asm__ volatile("mov %w[sel], %%fs\n\tmov %%fs:0, %[v]\n\tmov %%fs, %k[s]\n\t"
+                     "mov $158, %%eax\n\tmov $0x1002, %%edi\n\tmov %[saved], %%rsi\n\tsyscall"
+                     : [v] "=&r"(fs_value), [s] "=&r"(fs_selector)
+                     : [sel] "r"(0x7UL), [saved] "r"(fs_base)
+                     : "rax", "rdi", "rsi", "rcx", "r11", "memory");
+    __asm__ volatile("mov %%fs, %0" : "=r"(fs));
+    printf("fs<-0x7: fs:0=%#lx fs=%#lx, after arch_prctl fs=%#x\n", fs_value, fs_selector, fs);
+    /* ss from the LDT stays until a system call, which gives back
+       __USER_DS; a signal's frame and handler keep it, and sigreturn gives
+       it back. */
+    unsigned long ss_loaded, ss_syscall;
+    __asm__ volatile("mov %w2, %%ss\n\tmov %%ss, %k0\n\tmov $39, %%eax\n\tsyscall\n\t"
+                     "mov %%ss, %k1"
+                     : "=&r"(ss_loaded), "=&r"(ss_syscall)
+                     : "r"(0x7UL)
+                     : "rax", "rcx", "r11", "memory");
+    printf("ss<-0x7: ss=%#lx after syscall ss=%#lx\n", ss_loaded, ss_syscall);
+    printf("fault on ss 0x7:\n");
+    fflush(stdout);
+    unsigned long ss_after;
+    __asm__ volatile("mov %w[sel], %%ss\n\tlea 1f(%%rip), %%rcx\n\tmov %%rcx, %[r]\n\t"
+                     "mov %w[bad], %%ds\n1:\n\tmov %%ss, %k[a]\n\tmov $39, %%eax\n\tsyscall"
+                     : [r] "=m"(seg_resume), [a] "=&r"(ss_after)
+                     : [sel] "r"(0x7UL), [bad] "r"(0x10UL)
+                     : "rax", "rcx", "r11", "memory");
+    printf("  after sigreturn ss=%#lx\n", ss_after);
+    /* modify_ldt loads ds and es again: an entry still there stays, one
+       cleared becomes null. */
+    __asm__ volatile("mov %w0, %%ds\n\tmov %w1, %%es" : : "r"(0x7UL), "r"(0x17UL));
+    ldt_write(0x11, 3, 0x10000000, 0xfffff, 1 | 1 << 4);
+    __asm__ volatile("mov %%ds, %0\n\tmov %%es, %1" : "=r"(ds), "=r"(es));
+    printf("rewrite 3: ds=%#x es=%#x\n", ds, es);
+    ldt_write(0x11, 2, 0, 0, 1 << 3 | 1 << 5);
+    __asm__ volatile("mov %%ds, %0\n\tmov %%es, %1" : "=r"(ds), "=r"(es));
+    printf("clear 2: ds=%#x es=%#x\n", ds, es);
+    /* A fork's child has the selectors and the base. */
+    __asm__ volatile("mov %w0, %%gs" : : "r"(0x27UL));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        unsigned long value;
+        __asm__ volatile("mov %%gs:0, %0" : "=r"(value));
+        printf("child gs=%#x base=%#lx gs:0=%#lx\n", seg_read_gs(), seg_gs_base(), value);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("child exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
 /* iopl, ioperm and acct as a user without capabilities: the arguments, then
    EPERM for whatever needs CAP_SYS_RAWIO or CAP_SYS_PACCT. */
 static int port_access_case(void) {
@@ -33271,6 +33485,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
+    if (!strcmp(mode, "segment-registers")) return segments_case();
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);
         return 0;

@@ -964,6 +964,7 @@ mod linux {
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
+        processes_segment_registers => ("segment-registers","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),
         processes_cpu_sleep => ("cpu-sleep","process"),

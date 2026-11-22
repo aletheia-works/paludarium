@@ -426,6 +426,7 @@
     {"name":"proc-stat-exit-code","binary":"process"},
     {"name":"proc-fd-links","binary":"process"},
     {"name":"modify-ldt","binary":"process"},
+    {"name":"segment-registers","binary":"process"},
     {"name":"port-access","binary":"process"},
     {"name":"timer-limits","binary":"process"},
     {"name":"cpu-sleep","binary":"process"},

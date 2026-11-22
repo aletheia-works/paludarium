@@ -501,6 +501,104 @@ fn signal_return_preserves_registers_sse_and_mask() {
     assert_eq!(f.thread.cpu, before);
     assert_eq!(f.thread.state.signal_mask, 1 << 11);
 }
+/// A `modify_ldt` read/write data segment of privilege 3, present or not.
+fn ldt_data_segment(present: bool) -> u64 {
+    0xffff | 3 << 40 | 1 << 44 | 3 << 45 | u64::from(present) << 47 | 0xf << 48 | 3 << 54
+}
+#[test]
+fn signal_frame_shows_the_task_ss_and_sigreturn_restores_it() {
+    use paludarium_cpu::segments::{DS, GS, SS};
+    let mut f = signal_fixture();
+    // Entry 1 (0xf) a stack segment, entry 2 (0x17) not present.
+    f.mem
+        .ldt()
+        .lock()
+        .unwrap()
+        .extend([0, ldt_data_segment(true), ldt_data_segment(false)]);
+    f.thread.cpu.segments[SS] = 0xf;
+    f.thread.cpu.segments[DS] = 0xf;
+    f.kernel.queue_signal(&mut f.thread, 10).unwrap();
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    let base = f.thread.cpu.gpr[reg::RSP];
+    // UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS; cs, gs, fs and ss.
+    assert_eq!(f.mem.read_u64(GuestAddr(base + 8)).unwrap(), 6);
+    let selectors = GuestAddr(base + 48 + 144);
+    assert_eq!(f.mem.read_u64(selectors).unwrap(), 0x000f_0000_0000_0033);
+    // The handler keeps a valid ss, and ds; what it loads into gs stays.
+    assert_eq!(f.thread.cpu.segments, [0, 0x33, 0xf, 0xf, 0, 0]);
+    f.thread.cpu.segments[GS] = 0xf;
+    f.thread.cpu.segments[SS] = 0x2b;
+    f.mem.write_u64(selectors, 0x002b_0000_0000_0030).unwrap();
+    f.thread.cpu.gpr[reg::RSP] += 8;
+    assert_eq!(f.call(nr::RT_SIGRETURN, &[]), Next::Resume);
+    assert_eq!(f.thread.cpu.segments, [0, 0x33, 0x2b, 0xf, 0, 0xf]);
+    // A task on a stack segment that no longer loads gets __USER_DS for
+    // its handler, and shows its own in the frame.
+    f.thread.cpu.segments[SS] = 0x17;
+    f.kernel.queue_signal(&mut f.thread, 10).unwrap();
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    let base = f.thread.cpu.gpr[reg::RSP];
+    let selectors = GuestAddr(base + 48 + 144);
+    assert_eq!(f.mem.read_u64(selectors).unwrap() >> 48, 0x17);
+    assert_eq!(f.thread.cpu.segments[SS], 0x2b);
+    // Without UC_STRICT_RESTORE_SS sigreturn replaces it too.
+    f.mem.write_u64(GuestAddr(base + 8), 0).unwrap();
+    f.thread.cpu.gpr[reg::RSP] += 8;
+    assert_eq!(f.call(nr::RT_SIGRETURN, &[]), Next::Resume);
+    assert_eq!(f.thread.cpu.segments[SS], 0x2b);
+}
+#[test]
+fn sigreturn_to_a_stack_segment_that_does_not_load_faults_there() {
+    use paludarium_cpu::segments::SS;
+    let mut f = signal_fixture();
+    f.mem
+        .ldt()
+        .lock()
+        .unwrap()
+        .extend([0, ldt_data_segment(true), ldt_data_segment(false)]);
+    f.kernel.queue_signal(&mut f.thread, 10).unwrap();
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    let base = f.thread.cpu.gpr[reg::RSP];
+    f.mem
+        .write_u64(GuestAddr(base + 48 + 144), 0x0017_0000_0000_0033)
+        .unwrap();
+    f.thread.cpu.gpr[reg::RSP] += 8;
+    // The return's #SS(0x14) is SIGBUS, with no handler: the end.
+    assert_eq!(
+        f.call(nr::RT_SIGRETURN, &[]),
+        Next::Exit(ExitStatus::Signaled(7))
+    );
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x400000));
+    assert_eq!(f.thread.cpu.segments[SS], 0x17);
+}
+#[test]
+fn modify_ldt_reloads_ds_and_es_that_name_the_table() {
+    use paludarium_cpu::segments::{DS, ES, FS};
+    let mut f = fixture();
+    let n = syscalls::nr::MODIFY_LDT;
+    let desc = |f: &mut Fixture, words: [u32; 4]| {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        f.mem.write(GuestAddr(DATA), &bytes).unwrap();
+    };
+    desc(&mut f, [1, 0x1000, 0xfff, 1]);
+    assert_eq!(f.ret(n, &[0x11, DATA, 16]), 0);
+    f.thread.cpu.segments[DS] = 0xf;
+    f.thread.cpu.segments[ES] = 0x2b;
+    f.thread.cpu.segments[FS] = 0xf;
+    // Another entry changes: entry 1 still loads.
+    desc(&mut f, [2, 0x1000, 0xfff, 1]);
+    assert_eq!(f.ret(n, &[0x11, DATA, 16]), 0);
+    assert_eq!(f.thread.cpu.segments[DS], 0xf);
+    f.thread.cpu.segments[ES] = 0xf;
+    // Entry 1 cleared: ds and es become null, fs stays as it was.
+    desc(&mut f, [1, 0, 0, 1 << 3 | 1 << 5]);
+    assert_eq!(f.ret(n, &[0x11, DATA, 16]), 0);
+    assert_eq!(
+        (f.thread.cpu.segments[DS], f.thread.cpu.segments[ES]),
+        (0, 0)
+    );
+    assert_eq!(f.thread.cpu.segments[FS], 0xf);
+}
 #[test]
 fn signal_frame_ignores_privileged_flag_edits() {
     let mut f = signal_fixture();

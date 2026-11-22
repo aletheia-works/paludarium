@@ -12905,6 +12905,108 @@ static int generated_noexec_case(void) {
     return 0;
 }
 
+/* The exec-truncated case: execve of a small ELF program cut short at
+   chosen lengths, as Linux's binfmt_elf takes it. The program has a text
+   segment of two pages from offset 0 (its code in the first, a byte it
+   reads, 7, in the second) and a data segment of 16 bytes and bss from
+   offset 0x2000, writable or read-only. A short header or program headers
+   past the end are no program (ENOEXEC) and an interpreter path past it
+   EIO; segments past the end map, and a page wholly past it raises SIGBUS
+   when touched, unless a writable segment's bss starts in such a page,
+   which padzero cannot clear: the exec then fails after its point of no
+   return, SIGSEGV. Each runs in a child with no core dump; its status is
+   printed. */
+static void et_put16(unsigned char *b, int at, unsigned v) { b[at] = v; b[at + 1] = v >> 8; }
+static void et_put32(unsigned char *b, int at, unsigned v) {
+    for (int i = 0; i < 4; i++) b[at + i] = v >> (8 * i);
+}
+static void et_put64(unsigned char *b, int at, unsigned long long v) {
+    for (int i = 0; i < 8; i++) b[at + i] = v >> (8 * i);
+}
+static void et_phdr(unsigned char *b, int n, unsigned type, unsigned flags, unsigned long long off,
+                    unsigned long long vaddr, unsigned long long filesz, unsigned long long memsz) {
+    int at = 64 + 56 * n;
+    et_put32(b, at, type);
+    et_put32(b, at + 4, flags);
+    et_put64(b, at + 8, off);
+    et_put64(b, at + 16, vaddr);
+    et_put64(b, at + 24, vaddr);
+    et_put64(b, at + 32, filesz);
+    et_put64(b, at + 40, memsz);
+    et_put64(b, at + 48, 0x1000);
+}
+/* The program, 0x2010 bytes; with `interp` a PT_INTERP whose path lies
+   past the end of the file. */
+static size_t et_build(unsigned char *b, int data_writable, int interp) {
+    memset(b, 0, 0x2010);
+    memcpy(b, "\177ELF\2\1\1", 7);
+    et_put16(b, 16, 2);                  /* ET_EXEC */
+    et_put16(b, 18, 62);                 /* EM_X86_64 */
+    et_put32(b, 20, 1);
+    et_put64(b, 24, 0x400100);           /* e_entry */
+    et_put64(b, 32, 64);                 /* e_phoff */
+    et_put16(b, 52, 64);
+    et_put16(b, 54, 56);
+    et_put16(b, 56, interp ? 3 : 2);
+    et_phdr(b, 0, 1, 5, 0, 0x400000, 0x2000, 0x2000);
+    et_phdr(b, 1, 1, data_writable ? 6 : 4, 0x2000, 0x602000, 0x10, 0x1000);
+    if (interp) et_phdr(b, 2, 3, 4, 0x3000, 0, 16, 16);
+    /* movzbl 0x401000, %eax; mov %eax, %edi; mov $231, %eax; syscall */
+    static const unsigned char code[] = {0x0f, 0xb6, 0x04, 0x25, 0x00, 0x10, 0x40, 0x00, 0x89, 0xc7,
+                                         0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05};
+    memcpy(b + 0x100, code, sizeof code);
+    b[0x1000] = 7;
+    memset(b + 0x2000, 0x5a, 0x10);
+    return 0x2010;
+}
+static void et_run(const char *name, const unsigned char *b, size_t len) {
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-truncated-%d", (int)getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+    if (fd < 0 || (len && write(fd, b, len) != (ssize_t)len) || close(fd)) {
+        printf("%s: setup failed\n", name);
+        return;
+    }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit none = {0, 0};
+        setrlimit(RLIMIT_CORE, &none);
+        char *args[] = {"truncated", NULL};
+        char *env[] = {NULL};
+        syscall(SYS_execve, path, args, env);
+        _exit(100 + errno);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) >= 100)
+        printf("%s: errno=%d\n", name, WEXITSTATUS(status) - 100);
+    else if (WIFEXITED(status))
+        printf("%s: exit=%d\n", name, WEXITSTATUS(status));
+    else
+        printf("%s: signal=%d\n", name, WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    unlink(path);
+}
+static int exec_truncated_case(void) {
+    static unsigned char rw[0x2010], ro[0x2010], interp[0x2010];
+    size_t full = et_build(rw, 1, 0);
+    et_build(ro, 0, 0);
+    et_build(interp, 1, 1);
+    et_run("full", rw, full);
+    et_run("empty", rw, 0);
+    et_run("magic", rw, 3);
+    et_run("header", rw, 40);
+    et_run("one-phdr", rw, 64 + 56);
+    et_run("interp-past-end", interp, full);
+    et_run("data-half", rw, 0x2008);
+    et_run("data-page-rw", rw, 0x2000);
+    et_run("text-half-rw", rw, 0x1800);
+    et_run("text-half-ro", ro, 0x1800);
+    et_run("text-page-ro", ro, 0x1000);
+    et_run("text-page-rw", rw, 0x1000);
+    return 0;
+}
+
 /* The dev-shm case: /dev/shm is a tmpfs on /dev from start-up, nosuid and
    nodev, where files are made, mapped and removed, reached through a link
    too. Only flags, modes, errno values and agreements are printed. */
@@ -34511,6 +34613,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
+    if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
     if (!strcmp(mode, "tree-namespace")) return tree_namespace_case();
     if (!strcmp(mode, "beneath")) return beneath_case();

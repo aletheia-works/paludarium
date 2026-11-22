@@ -3768,10 +3768,14 @@ impl AddressSpaceData {
                     ..fault(at)
                 });
             }
+            // A loaded program's segment too, whose file may be cut short,
+            // as Linux maps it whole from the file (`elf_map`): a page past
+            // the end is never filled, so it has no entry.
             let file = lookup(directory, page).map_or_else(
                 || {
                     self.mapping_at(page)
                         .is_some_and(|m| m.kind == MappingKind::File)
+                        || self.segment_with_file(page)
                 },
                 |p| p.file,
             );

@@ -3220,7 +3220,13 @@ kernel.
   interpreter, as Linux's `load_elf_binary` does, with `AT_BASE` and `AT_ENTRY`
   to find the program. The interpreter needs the same permissions and counts the
   same for dumping, its set-ID bits do not count, and a file that is no x86-64
-  program is `ELIBBAD`. A file that starts with `#!` runs its
+  program is `ELIBBAD`. A program file cut short loads as Linux's binfmt_elf
+  takes it: a short header or program headers past the end of the file are
+  `ENOEXEC` and an interpreter path past it `EIO`, while segments past the
+  end are mapped, and a page wholly past it raises `SIGBUS` when touched. A
+  writable segment whose bss starts in such a page cannot be cleared
+  (`padzero`), so the exec fails after its point of no return and the
+  process ends by `SIGSEGV`. A file that starts with `#!` runs its
   interpreter as Linux's `load_script` does: the first line, within 255 bytes,
   names it and may give it one argument, its arguments are that name, that
   argument and the script's path in place of `argv[0]`, and the interpreter's

@@ -28,13 +28,34 @@ COREUTILS_LICENSE_EXCEPTIONS = [{"crate": "notify@8.2.2", "allow": ["CC0-1.0"]}]
 COREUTILS_LICENSE_SUFFIX = (
     b'\n[[licenses.exceptions]]\ncrate = "notify@8.2.2"\nallow = ["CC0-1.0"]\n'
 )
-# RustSec advisories aube's audit ignores for now: the zstd 0.13 ones, which
-# aube gets through decmpfs's exact `zstd = "=0.13.3"` pin and cannot update.
-# Remove them once a decmpfs release takes zstd 0.14 (SocketDev/decmpfs#16).
+# RustSec advisories aube's audit ignores for now, each with the reason its
+# ignore entry gives. The zstd 0.13 ones aube gets through decmpfs's exact
+# `zstd = "=0.13.3"` pin and cannot update; remove them once a decmpfs release
+# takes zstd 0.14 (SocketDev/decmpfs#16). RUSTSEC-2026-0592 is against url
+# 2.5.8, which aube 2.10.0's Cargo.lock has through hickory-net,
+# hickory-resolver and reqwest, and url 2.5.9 fixes; the user allowed it on
+# 2026-11-22 until the pinned aube release locks url 2.5.9 or later.
 ADVISORY_EXCEPTIONS = [
-    {"id": "RUSTSEC-2026-0391", "crate": "zstd@0.13.3"},
-    {"id": "RUSTSEC-2026-0398", "crate": "zstd-safe@7.3.0"},
-    {"id": "RUSTSEC-2026-0403", "crate": "zstd-safe@7.3.0"},
+    {
+        "id": "RUSTSEC-2026-0391",
+        "crate": "zstd@0.13.3",
+        "reason": "through decmpfs (SocketDev/decmpfs#16)",
+    },
+    {
+        "id": "RUSTSEC-2026-0398",
+        "crate": "zstd-safe@7.3.0",
+        "reason": "through decmpfs (SocketDev/decmpfs#16)",
+    },
+    {
+        "id": "RUSTSEC-2026-0403",
+        "crate": "zstd-safe@7.3.0",
+        "reason": "through decmpfs (SocketDev/decmpfs#16)",
+    },
+    {
+        "id": "RUSTSEC-2026-0592",
+        "crate": "url@2.5.8",
+        "reason": "through hickory-net, hickory-resolver and reqwest; fixed in url 2.5.9",
+    },
 ]
 # The root policy's empty advisory ignore list, which the guest policy fills.
 ROOT_IGNORE = b"ignore = []\n"
@@ -48,8 +69,7 @@ def advisory_ignore(advisories):
     """The ignore list of `advisories`. One that no crate matches any more
     fails the audit, so that a guest bump cannot leave a stale exception."""
     entries = "".join(
-        f'  {{ id = "{a["id"]}", reason = "{a["crate"]} through decmpfs (SocketDev/decmpfs#16)" }},\n'
-        for a in advisories
+        f'  {{ id = "{a["id"]}", reason = "{a["crate"]} {a["reason"]}" }},\n' for a in advisories
     )
     return f'unused-ignored-advisory = "deny"\nignore = [\n{entries}]\n'.encode()
 

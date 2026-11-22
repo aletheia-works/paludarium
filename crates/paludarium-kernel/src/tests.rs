@@ -5545,6 +5545,197 @@ mod io_uring {
         );
         assert_eq!(one(&mut f, &r, &remove(1, 2)), 0);
     }
+
+    /// Submits `entries` at once, waiting for none, and gives every
+    /// completion.
+    fn batch(f: &mut Fixture, r: &Ring, entries: &[[u8; 64]]) -> Vec<(u64, i32)> {
+        for e in entries {
+            let slot = u32_at(f, r.rings + 4) & 3;
+            push(f, r, slot, e);
+        }
+        let n = entries.len() as u64;
+        assert_eq!(f.ret(426, &[r.fd, n, 0, GETEVENTS]), n);
+        reap(f, r)
+    }
+
+    /// An `IORING_OP_NOP` with `nop_flags`, a file, a registered buffer's
+    /// index and a result.
+    fn nop(user_data: u64, flags: u32, fd: i32, index: u16, result: i32) -> [u8; 64] {
+        let mut e = sqe(0, user_data);
+        e[4..8].copy_from_slice(&fd.to_le_bytes());
+        e[24..28].copy_from_slice(&result.to_le_bytes());
+        e[28..32].copy_from_slice(&flags.to_le_bytes());
+        e[40..42].copy_from_slice(&index.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn nops_look_for_files_and_buffers_as_linux_7_does() {
+        const INJECT: u32 = 1;
+        const FILE: u32 = 1 << 1;
+        const FIXED_FILE: u32 = 1 << 2;
+        const FIXED_BUFFER: u32 = 1 << 3;
+        const TW: u32 = 1 << 4;
+        const SKIP: u8 = 1 << 6;
+        let skip = |mut e: [u8; 64]| {
+            e[1] = SKIP;
+            e
+        };
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (list, iov) = (DATA + 0x100, DATA + 0x200);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]) as i32;
+        fds(&f, list, &[-1, fd]);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 2]), 0);
+        iovecs(&f, iov, &[(DATA + 0x800, 16)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, iov, 1]), 0);
+        // Unknown flags, and 32-byte completions no ring has.
+        assert_eq!(batch(&mut f, &r, &[nop(1, 1 << 6, 0, 0, 0)]), [(1, -22)]);
+        assert_eq!(batch(&mut f, &r, &[nop(2, 1 << 5, 0, 0, 0)]), [(2, -22)]);
+        assert_eq!(batch(&mut f, &r, &[nop(3, TW | INJECT, 0, 0, 3)]), [(3, 3)]);
+        // A file it does not find fails it, with its result all the same.
+        let file = FILE | INJECT;
+        assert_eq!(batch(&mut f, &r, &[nop(4, file, fd, 0, 5)]), [(4, 5)]);
+        assert_eq!(batch(&mut f, &r, &[nop(5, file, 99, 0, 5)]), [(5, 5)]);
+        let fixed = FILE | FIXED_FILE;
+        assert_eq!(batch(&mut f, &r, &[skip(nop(6, fixed, 1, 0, 0))]), []);
+        assert_eq!(batch(&mut f, &r, &[skip(nop(7, fixed, 0, 0, 0))]), [(7, 0)]);
+        assert_eq!(batch(&mut f, &r, &[skip(nop(8, fixed, 2, 0, 0))]), [(8, 0)]);
+        assert_eq!(batch(&mut f, &r, &[skip(nop(9, FIXED_FILE, 0, 0, 0))]), []);
+        // So does a registered buffer it does not find.
+        let buffer = FIXED_BUFFER;
+        assert_eq!(batch(&mut f, &r, &[skip(nop(10, buffer, 0, 0, 0))]), []);
+        assert_eq!(
+            batch(&mut f, &r, &[skip(nop(11, buffer, 0, 1, 0))]),
+            [(11, 0)]
+        );
+        // A failed one ends its link.
+        let mut head = nop(12, FILE, 99, 0, 0);
+        head[1] = 1 << 2;
+        assert_eq!(
+            batch(&mut f, &r, &[head, nop(13, 0, 0, 0, 0)]),
+            [(12, 0), (13, -125)]
+        );
+    }
+
+    #[test]
+    fn tagged_files_post_their_tags_once_let_go() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (list, tags, arg, buf) = (DATA + 0x100, DATA + 0x200, DATA + 0x300, DATA + 0x800);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]) as i32;
+        let set_tags = |f: &Fixture, values: &[u64]| {
+            for (i, &tag) in values.iter().enumerate() {
+                f.mem
+                    .write_u64(GuestAddr(tags + 8 * i as u64), tag)
+                    .unwrap();
+            }
+        };
+        // struct io_uring_rsrc_register.
+        let register = |f: &Fixture, nr: u32, flags: u32, resv: u64, data: u64, tags: u64| {
+            f.mem.write(GuestAddr(arg), &nr.to_le_bytes()).unwrap();
+            f.mem
+                .write(GuestAddr(arg + 4), &flags.to_le_bytes())
+                .unwrap();
+            f.mem.write_u64(GuestAddr(arg + 8), resv).unwrap();
+            f.mem.write_u64(GuestAddr(arg + 16), data).unwrap();
+            f.mem.write_u64(GuestAddr(arg + 24), tags).unwrap();
+        };
+        fds(&f, list, &[fd, -1, fd]);
+        set_tags(&f, &[7, 0, 9]);
+        register(&f, 3, 0, 0, list, tags);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 24]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 13, 0, 32]), errno(Errno::EFAULT));
+        for (nr, flags, resv, data) in [
+            (0, 0, 0, list),
+            (3, 0, 1, list),
+            (3, 2, 0, list),
+            (3, 1, 0, list),
+        ] {
+            register(&f, nr, flags, resv, data, tags);
+            assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), errno(Errno::EINVAL));
+        }
+        register(&f, 3, 0, 0, list, 8);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), errno(Errno::EFAULT));
+        // A tag for an empty slot fails it, and no tag is posted.
+        set_tags(&f, &[7, 5, 9]);
+        register(&f, 3, 0, 0, list, tags);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), errno(Errno::EINVAL));
+        assert_eq!(reap(&mut f, &r), []);
+        set_tags(&f, &[7, 0, 9]);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), errno(EBUSY));
+        // struct io_uring_rsrc_update2.
+        let update = |f: &Fixture, offset: u32, resv: u32, tags: u64, nr: u32, resv2: u32| {
+            f.mem.write(GuestAddr(arg), &offset.to_le_bytes()).unwrap();
+            f.mem
+                .write(GuestAddr(arg + 4), &resv.to_le_bytes())
+                .unwrap();
+            f.mem.write_u64(GuestAddr(arg + 8), list).unwrap();
+            f.mem.write_u64(GuestAddr(arg + 16), tags).unwrap();
+            f.mem.write(GuestAddr(arg + 24), &nr.to_le_bytes()).unwrap();
+            f.mem
+                .write(GuestAddr(arg + 28), &resv2.to_le_bytes())
+                .unwrap();
+        };
+        update(&f, 0, 0, tags, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 14, arg, 24]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 14, 0, 32]), errno(Errno::EFAULT));
+        for (resv, nr, resv2) in [(0, 0, 0), (1, 1, 0), (0, 1, 1)] {
+            update(&f, 0, resv, tags, nr, resv2);
+            assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), errno(Errno::EINVAL));
+        }
+        update(&f, u32::MAX, 0, tags, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), errno(EOVERFLOW));
+        update(&f, 0, 0, tags, 1, 0);
+        set_tags(&f, &[3]);
+        for skip_or_clear in [-2, -1] {
+            fds(&f, list, &[skip_or_clear]);
+            assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), errno(Errno::EINVAL));
+        }
+        fds(&f, list, &[fd]);
+        update(&f, 0, 0, 8, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), errno(Errno::EFAULT));
+        assert_eq!(reap(&mut f, &r), []);
+        // Slot 0's file goes: its tag at once.
+        set_tags(&f, &[11]);
+        update(&f, 0, 0, tags, 1, 0);
+        assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), [(7, 0)]);
+        // Within a submission, before its completions.
+        fds(&f, list, &[-1]);
+        assert_eq!(
+            batch(&mut f, &r, &[sqe(0, 30), files_update(2, list, 1)]),
+            [(9, 0), (30, 0), (1, 1)]
+        );
+        // After them while a request of it holds the file.
+        assert_eq!(
+            batch(
+                &mut f,
+                &r,
+                &[on_slot(READ, 0, 0, buf, 1), files_update(0, list, 1)]
+            ),
+            [(1, 0), (1, 1), (11, 0)]
+        );
+        // Unregistering lets go of the last slot first.
+        fds(&f, list, &[fd, -1, fd]);
+        set_tags(&f, &[13, 0, 14]);
+        update(&f, 0, 0, tags, 3, 0);
+        assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), 3);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        assert_eq!(reap(&mut f, &r), [(14, 0), (13, 0)]);
+        // Sparse, with IORING_RSRC_REGISTER_SPARSE or no descriptors.
+        register(&f, 2, 1, 0, 0, tags);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), errno(Errno::EINVAL));
+        set_tags(&f, &[0, 0]);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        register(&f, 2, 0, 0, 0, tags);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), 0);
+        assert_eq!(one(&mut f, &r, &on_slot(READ, 1, 0, buf, 1)), -9);
+    }
 }
 
 mod vectored_flags {

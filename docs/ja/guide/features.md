@@ -1455,7 +1455,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
-  完了（`IORING_FEAT_NODROP`）は Linux と同じです。
+  完了（`IORING_FEAT_NODROP`）は Linux と同じです。一度の投入の完了は、Linux が投稿する
+  ように、その要求をすべて実行してから入ります（`io_submit_flush_completions`）。
+
+- `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
+  `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は
+  `fd` のファイルを、`IORING_NOP_FIXED_FILE` があれば登録したものを探し、
+  `IORING_NOP_FIXED_BUFFER` は登録したバッファー `buf_index` を探します。見つからない NOP
+  は失敗し、リンクを終わらせ、`IOSQE_CQE_SKIP_SUCCESS` があっても完了を投稿しますが、
+  結果はそのまま自分の結果です。32 バイトの完了を持つリングはないので `IORING_NOP_CQE32`
+  は `EINVAL` で、知らないフラグも `EINVAL` です。
 
 - 転送は Linux の `io_prep_rw` と `io_read` または `io_write` と同じ順に調べ、同じところで
   失敗します。準備では優先度、属性、バッファーかベクターを調べ、そこでのエラーは投入を
@@ -1511,6 +1520,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - `IORING_REGISTER_FILE_ALLOC_RANGE` はその範囲を決めます。引数が要り、数は取らず
     （`EINVAL`）、それから範囲を読みます（`EFAULT`。`EOVERFLOW`。登録したファイルを越える
     範囲は `EINVAL`）。ファイルを登録すると、範囲はそのすべてになります。
+  - `IORING_REGISTER_FILES2` と `IORING_REGISTER_FILES_UPDATE2` は、Linux 7.0 の
+    `io_register_rsrc` と `io_register_rsrc_update` と同じく、スロットごとにタグを付けて
+    ファイルを登録し、更新します。引数はその大きさで（`EINVAL`）、読めて（`EFAULT`）、数が
+    あり予約欄が 0 でなければなりません（`EINVAL`）。唯一のフラグ
+    `IORING_RSRC_REGISTER_SPARSE` は空のスロットを登録し、記述子を取りません（`EINVAL`）。
+    記述子なしの登録も同じです。タグはそれぞれ記述子より先に読み（`EFAULT`）、タグには
+    ファイルが要ります（空にするスロットや飛ばすスロットには `EINVAL`）。タグ付きのファイルを
+    何も持たなくなると、つまりスロットが空になったかファイルの登録が外れると（最後のスロット
+    から）、タグを `user_data` に、0 を結果にした完了がすぐに入ります。スロットを空にした
+    投入の完了より先ですが、その投入の要求がファイルを持っていればそれらの後です。失敗した
+    登録はタグを投稿しません。
 
 - リングはバッファーのグループを保ち、`IOSQE_BUFFER_SELECT` の読み出しは `buf_group` が
   指すグループからその 1 つを選びます。Linux の `io_uring/kbuf.c` と同じです。読み出しは

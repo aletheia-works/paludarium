@@ -6,13 +6,15 @@
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
-//! `IORING_REGISTER_FILES` the files a request with `IOSQE_FIXED_FILE`
-//! names by their index, and `IORING_REGISTER_PBUF_RING` a ring of the
-//! buffers a read with `IOSQE_BUFFER_SELECT` chooses from, as it does from
-//! provided ones. The registered files, their updates and their allocation
-//! range are checked as Linux 7.0's `io_uring/rsrc.c`, `register.c` and
-//! `filetable.c` check them, and the provided buffers and their rings as its
-//! `kbuf.c` does, the kernel the differential tests run on.
+//! `IORING_REGISTER_FILES` (or `_FILES2`, with tags) the files a request
+//! with `IOSQE_FIXED_FILE` names by their index, and
+//! `IORING_REGISTER_PBUF_RING` a ring of the buffers a read with
+//! `IOSQE_BUFFER_SELECT` chooses from, as it does from provided ones. The
+//! registered files, their updates and their allocation range are checked
+//! as Linux 7.0's `io_uring/rsrc.c`, `register.c` and `filetable.c` check
+//! them, the provided buffers and their rings as its `kbuf.c` does, and a
+//! NOP's flags as its `nop.c` takes them: the kernel the differential tests
+//! run on.
 //!
 //! The rings are pages the kernel shares with the mappings of the ring's
 //! descriptor ([`SharedPages`]). A request runs when `io_uring_enter` takes
@@ -139,6 +141,19 @@ const SQE_VALID_FLAGS: u8 =
 const LINK_FLAGS: u8 = IOSQE_IO_LINK | IOSQE_IO_HARDLINK;
 /// `IORING_NOP_INJECT_RESULT`: the NOP completes with its `len`.
 const NOP_INJECT_RESULT: u32 = 1;
+/// `IORING_NOP_FILE`: the NOP looks for the file of its `fd`, registered
+/// with `IORING_NOP_FIXED_FILE`.
+const NOP_FILE: u32 = 1 << 1;
+const NOP_FIXED_FILE: u32 = 1 << 2;
+/// `IORING_NOP_FIXED_BUFFER`: the NOP looks for registered buffer
+/// `buf_index`.
+const NOP_FIXED_BUFFER: u32 = 1 << 3;
+/// `IORING_NOP_CQE32`: the NOP fills a 32-byte completion, which only an
+/// `IORING_SETUP_CQE32` or `_CQE_MIXED` ring has.
+const NOP_CQE32: u32 = 1 << 5;
+/// Linux 7.0's `NOP_FLAGS`: `IORING_NOP_INJECT_RESULT` to `_CQE32`, with
+/// `IORING_NOP_TW` (completing as task work).
+const NOP_FLAGS: u32 = (1 << 6) - 1;
 /// `IORING_FSYNC_DATASYNC`, the only flag of `IORING_OP_FSYNC`.
 const FSYNC_DATASYNC: u32 = 1;
 /// `IORING_RW_ATTR_FLAG_PI`, the only attribute of a read or write.
@@ -153,6 +168,8 @@ const UNREGISTER_BUFFERS: u64 = 1;
 const REGISTER_FILES: u64 = 2;
 const UNREGISTER_FILES: u64 = 3;
 const REGISTER_FILES_UPDATE: u64 = 6;
+const REGISTER_FILES2: u64 = 13;
+const REGISTER_FILES_UPDATE2: u64 = 14;
 const REGISTER_PROBE: u64 = 8;
 const REGISTER_PBUF_RING: u64 = 22;
 const UNREGISTER_PBUF_RING: u64 = 23;
@@ -170,6 +187,9 @@ const MAX_BIDS_PER_BGID: u64 = 1 << 16;
 const CQE_F_BUFFER: u32 = 1;
 const CQE_F_BUF_MORE: u32 = 1 << 4;
 const CQE_BUFFER_SHIFT: u32 = 16;
+/// `IORING_RSRC_REGISTER_SPARSE`: an `IORING_REGISTER_FILES2` with no
+/// descriptors, its slots all empty.
+const RSRC_REGISTER_SPARSE: u32 = 1;
 /// `IORING_MAX_FIXED_FILES`.
 const MAX_FIXED_FILES: u32 = 1 << 20;
 /// `IORING_REGISTER_FILES_SKIP`: an update leaves the slot as it is.
@@ -397,13 +417,23 @@ struct Chosen {
     more: bool,
 }
 
+/// A registered file (`struct io_rsrc_node`), held while a slot or a
+/// request of the running submission has it, and the tag
+/// `IORING_REGISTER_FILES2` or `_FILES_UPDATE2` gave it: once nothing
+/// holds it, a tag that is not 0 is the `user_data` of a completion of 0
+/// ([`Ring::put_nodes`]).
+struct Node {
+    file: crate::files::Descriptor,
+    tag: u64,
+}
+
 /// A ring's registered files: the slots of its `count` that hold an open
 /// file, each held as its descriptor was, and where
 /// `IORING_FILE_INDEX_ALLOC` looks for a free one (`file_alloc_start` to
 /// `file_alloc_end`, from the table's `alloc_hint`).
 struct Files {
     count: u32,
-    slots: std::collections::BTreeMap<u32, crate::files::Descriptor>,
+    slots: std::collections::BTreeMap<u32, Arc<Node>>,
     alloc: (u32, u32),
     hint: u32,
 }
@@ -411,7 +441,7 @@ struct Files {
 impl Files {
     /// Empties `slot` (`io_reset_rsrc_node`), giving what it held; the
     /// next free one is looked for from there (`io_file_bitmap_clear`).
-    fn clear(&mut self, slot: u32) -> Option<crate::files::Descriptor> {
+    fn clear(&mut self, slot: u32) -> Option<Arc<Node>> {
         let held = self.slots.remove(&slot);
         if held.is_some() {
             self.hint = slot;
@@ -421,8 +451,8 @@ impl Files {
 
     /// Puts `file` in the empty `slot`; the next free one is looked for
     /// past it (`io_file_bitmap_set`).
-    fn set(&mut self, slot: u32, file: crate::files::Descriptor) {
-        self.slots.insert(slot, file);
+    fn set(&mut self, slot: u32, file: crate::files::Descriptor, tag: u64) {
+        self.slots.insert(slot, Arc::new(Node { file, tag }));
         self.hint = slot + 1;
     }
 
@@ -478,6 +508,18 @@ struct State {
     /// A request asked to skip its completion: `IOSQE_IO_DRAIN` is
     /// `EOPNOTSUPP` from then on.
     drain_disabled: bool,
+    /// While a submission runs, the completions of its requests, which
+    /// Linux posts once it has issued them all (`compl_reqs`,
+    /// `io_submit_flush_completions`); a registered file's tag goes in at
+    /// once (`io_post_aux_cqe`).
+    deferred: Option<Vec<(u64, i32, u32)>>,
+    /// The registered files the requests of the running submission found,
+    /// in order, which they hold until their completions are posted
+    /// (`io_free_batch_list`).
+    held: Vec<Arc<Node>>,
+    /// Files no slot holds any more that a request of the running
+    /// submission still does.
+    retired: Vec<Arc<Node>>,
 }
 
 /// A request taken from the submission queue and prepared.
@@ -490,7 +532,14 @@ struct Request {
 }
 
 enum Work {
-    Nop(i32),
+    /// `IORING_OP_NOP`: its result, and the registered or other file
+    /// (`IORING_NOP_FILE`) and registered buffer
+    /// (`IORING_NOP_FIXED_BUFFER`) it looks for.
+    Nop {
+        result: i32,
+        file: Option<(i32, bool)>,
+        buffer: Option<u16>,
+    },
     EpollCtl {
         epfd: i32,
         op: i32,
@@ -579,6 +628,59 @@ impl Ring {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Posts a request's completion, after the others of the running
+    /// submission if one runs ([`State::deferred`]).
+    fn complete(&self, state: &mut State, user_data: u64, res: i32, flags: u32) {
+        match &mut state.deferred {
+            Some(deferred) => deferred.push((user_data, res, flags)),
+            None => self.post(state, user_data, res, flags),
+        }
+    }
+
+    /// Lets go of registered files no slot holds (`io_put_rsrc_node`): one
+    /// a request of the running submission holds waits for its completion,
+    /// and the others post their tags now, in order.
+    fn put_nodes(&self, gone: impl IntoIterator<Item = Arc<Node>>) {
+        let mut state = self.state();
+        for node in gone {
+            if Arc::strong_count(&node) > 1 && state.deferred.is_some() {
+                state.retired.push(node);
+            } else if node.tag != 0 {
+                self.post(&mut state, node.tag, 0, 0);
+            }
+        }
+    }
+
+    /// Starts a submission, whose completions wait for its end.
+    fn begin(&self) {
+        self.state().deferred = Some(Vec::new());
+    }
+
+    /// Ends a submission: its completions go in, in order, then the files
+    /// its requests held go, posting the tags of those no slot holds as
+    /// each request lets go of them.
+    fn end(&self) {
+        let mut state = self.state();
+        for (user_data, res, flags) in state.deferred.take().unwrap_or_default() {
+            self.post(&mut state, user_data, res, flags);
+        }
+        for node in std::mem::take(&mut state.held) {
+            if let Some(at) = state.retired.iter().position(|r| Arc::ptr_eq(r, &node))
+                && Arc::strong_count(&node) == 2
+            {
+                let retired = state.retired.remove(at);
+                if retired.tag != 0 {
+                    self.post(&mut state, retired.tag, 0, 0);
+                }
+            }
+        }
+        for retired in std::mem::take(&mut state.retired) {
+            if retired.tag != 0 {
+                self.post(&mut state, retired.tag, 0, 0);
+            }
+        }
     }
 
     /// Puts a completion in the queue, or keeps it while the queue is full
@@ -722,15 +824,21 @@ impl Ring {
                 }
             }
             OP_NOP => {
+                // `io_nop_prep`: no ring has 32-byte completions.
                 let nop_flags = u32_at(sqe, 28);
-                if nop_flags & !NOP_INJECT_RESULT != 0 {
+                if nop_flags & !NOP_FLAGS != 0 || nop_flags & NOP_CQE32 != 0 {
                     return fail(request, Errno::EINVAL);
                 }
-                Work::Nop(if nop_flags & NOP_INJECT_RESULT != 0 {
-                    int_at(24)
-                } else {
-                    0
-                })
+                let has = |flag: u32| nop_flags & flag != 0;
+                Work::Nop {
+                    result: if has(NOP_INJECT_RESULT) {
+                        int_at(24)
+                    } else {
+                        0
+                    },
+                    file: has(NOP_FILE).then(|| (int_at(4), has(NOP_FIXED_FILE))),
+                    buffer: has(NOP_FIXED_BUFFER).then(|| u16::from_le_bytes([sqe[40], sqe[41]])),
+                }
             }
             OP_EPOLL_CTL => {
                 if u16::from_le_bytes([sqe[40], sqe[41]]) != 0 || int_at(44) != 0 {
@@ -898,11 +1006,19 @@ fn file_of(
     fixed: bool,
 ) -> Result<crate::files::Descriptor, Errno> {
     if fixed {
-        let files = ring.files.lock().unwrap_or_else(PoisonError::into_inner);
-        return files
+        let node = ring
+            .files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .and_then(|files| files.slots.get(&(fd as u32)).cloned())
-            .ok_or(Errno::EBADF);
+            .ok_or(Errno::EBADF)?;
+        let file = node.file.clone();
+        let mut state = ring.state();
+        if state.deferred.is_some() {
+            state.held.push(node);
+        }
+        return Ok(file);
     }
     fget(c, fd)
 }
@@ -1085,15 +1201,32 @@ fn give_back(c: &Context<'_>, ring: &Ring, chosen: &Chosen, result: &Result<u64,
     }
 }
 
-/// Runs a request and gives its result and its completion's flags.
-fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32) {
+/// Runs a request and gives its result, its completion's flags and
+/// whether it failed (`req_set_fail`), which a negative result does.
+fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool) {
     let result = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
-    if let Work::Transfer(work) = work {
-        let (r, flags) = transfer(c, ring, work);
-        return (result(r), flags);
+    match work {
+        Work::Transfer(work) => {
+            let (r, flags) = transfer(c, ring, work);
+            let res = result(r);
+            return (res, flags, res < 0);
+        }
+        // `io_nop`: a file it does not find (`EBADF`), or a buffer
+        // (`EFAULT`), fails it, yet it completes with its result.
+        &Work::Nop {
+            result,
+            file,
+            buffer,
+        } => {
+            let found = match file {
+                Some((fd, fixed)) => file_of(c, ring, fd, fixed).is_ok(),
+                None => true,
+            } && buffer.is_none_or(|index| ring.has_buffer(index));
+            return (result, 0, result < 0 || !found);
+        }
+        _ => {}
     }
     let res = match work {
-        &Work::Nop(result) => result,
         &Work::EpollCtl {
             epfd,
             op,
@@ -1120,7 +1253,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32) {
         } => result(if offset == FILE_INDEX_ALLOC {
             update_files_anywhere(c, ring, addr, count)
         } else {
-            update_files(c, ring, offset, addr, count)
+            update_files(c, ring, offset, addr, count, 0)
         }),
         &Work::Buffers {
             provide,
@@ -1130,9 +1263,9 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32) {
             bgid,
             bid,
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
-        Work::Transfer(_) | Work::None => 0,
+        Work::Transfer(_) | Work::Nop { .. } | Work::None => 0,
     };
-    (res, 0)
+    (res, 0, res < 0)
 }
 
 /// `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, as Linux's
@@ -1193,21 +1326,21 @@ fn complete(c: &mut Context<'_>, ring: &Ring, chain: Vec<Request>) {
     let mut cancelled = false;
     for request in chain {
         let res = if !prepared {
-            (-request.failed.unwrap_or(ECANCELED).0, 0)
+            (-request.failed.unwrap_or(ECANCELED).0, 0, true)
         } else if cancelled {
-            (-ECANCELED.0, 0)
+            (-ECANCELED.0, 0, true)
         } else {
-            let (res, flags) = run(c, ring, &request.work);
-            if res < 0 && request.flags & IOSQE_IO_HARDLINK == 0 {
+            let (res, flags, failed) = run(c, ring, &request.work);
+            if failed && request.flags & IOSQE_IO_HARDLINK == 0 {
                 cancelled = true;
             }
-            (res, flags)
+            (res, flags, failed)
         };
-        if res.0 >= 0 && request.flags & IOSQE_CQE_SKIP_SUCCESS != 0 {
+        if !res.2 && request.flags & IOSQE_CQE_SKIP_SUCCESS != 0 {
             continue;
         }
         let mut state = ring.state();
-        ring.post(&mut state, request.user_data, res.0, res.1);
+        ring.complete(&mut state, request.user_data, res.0, res.1);
     }
 }
 
@@ -1228,6 +1361,7 @@ fn submit(c: &mut Context<'_>, ring: &Ring, wanted: u32) -> u32 {
     };
     let total = wanted.min(available);
     let mut left = total;
+    ring.begin();
     let mut chain: Vec<Request> = Vec::new();
     while left > 0 {
         let mut index = head & mask;
@@ -1265,6 +1399,7 @@ fn submit(c: &mut Context<'_>, ring: &Ring, wanted: u32) -> u32 {
     if !chain.is_empty() {
         complete(c, ring, chain);
     }
+    ring.end();
     ring.state().sq_head = head;
     ring.store_u32(SQ_HEAD, head);
     total - left
@@ -1599,7 +1734,7 @@ fn wait(
 
 /// `io_uring_register(fd, opcode, arg, nr_args)`: only
 /// `IORING_REGISTER_PROBE`, the buffers' and the files' registrations, the
-/// files' updates and allocation range, and the rings of buffers'
+/// files' tagged registrations, updates and allocation range, and the rings of buffers'
 /// registrations and status; every other operation gives `EINVAL`.
 pub(crate) fn sys_register(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match register(c, a) {
@@ -1640,17 +1775,22 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map(|_| 0)
             .ok_or(ENXIO),
         REGISTER_FILES if a[2] == 0 => Err(Errno::EFAULT),
-        REGISTER_FILES => register_files(c, ring, a[2], a[3] as u32),
+        REGISTER_FILES => register_files(c, ring, a[2], a[3] as u32, 0),
+        REGISTER_FILES2 => register_files2(c, ring, a[2], a[3] as u32),
         UNREGISTER_FILES if a[2] != 0 || a[3] as u32 != 0 => Err(Errno::EINVAL),
         UNREGISTER_FILES => {
             let gone = ring
                 .files
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            gone.map(|_| 0).ok_or(ENXIO)
+                .take()
+                .ok_or(ENXIO)?;
+            // `io_rsrc_data_free` lets go of the last slot first.
+            ring.put_nodes(gone.slots.into_values().rev());
+            Ok(0)
         }
         REGISTER_FILES_UPDATE => register_files_update(c, ring, a[2], a[3] as u32),
+        REGISTER_FILES_UPDATE2 => register_files_update2(c, ring, a[2], a[3] as u32),
         REGISTER_FILE_ALLOC_RANGE if a[2] == 0 || a[3] as u32 != 0 => Err(Errno::EINVAL),
         REGISTER_FILE_ALLOC_RANGE => file_alloc_range(c, ring, a[2]),
         REGISTER_PBUF_RING | UNREGISTER_PBUF_RING | REGISTER_PBUF_STATUS
@@ -1677,11 +1817,19 @@ fn read_fd(c: &Context<'_>, addr: u64) -> Result<i32, Errno> {
 /// `IORING_REGISTER_FILES`, as Linux's `io_sqe_files_register` once the
 /// dispatcher found an argument (`EFAULT` for none, before all else): none
 /// registered yet (`EBUSY`), 1 (`EINVAL`) to `IORING_MAX_FIXED_FILES` and
-/// RLIMIT_NOFILE of them (`EMFILE`), then each descriptor in turn
-/// (`EFAULT`): -1 leaves its slot empty, and one `fget` does not find, or a
-/// ring, is `EBADF`. A failure registers none of them. The table is the
+/// RLIMIT_NOFILE of them (`EMFILE`), then each tag at `tags` if there are
+/// tags and each descriptor at `arg` in turn (`EFAULT`): -1, or every one
+/// with no `arg`, leaves its slot empty, which a tag may not have
+/// (`EINVAL`), and one `fget` does not find, or a ring, is `EBADF`. A
+/// failure registers none of them, and posts no tag. The table is the
 /// allocation range of `IORING_FILE_INDEX_ALLOC`.
-fn register_files(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> Result<u64, Errno> {
+fn register_files(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    arg: u64,
+    count: u32,
+    tags: u64,
+) -> Result<u64, Errno> {
     let mut registered = ring.files.lock().unwrap_or_else(PoisonError::into_inner);
     if registered.is_some() {
         return Err(EBUSY);
@@ -1699,18 +1847,93 @@ fn register_files(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> Res
         hint: 0,
     };
     for index in 0..count {
-        let fd = read_fd(c, arg.wrapping_add(4 * u64::from(index)))?;
+        let tag = read_tag(c, tags, index)?;
+        let fd = if arg == 0 {
+            -1
+        } else {
+            read_fd(c, arg.wrapping_add(4 * u64::from(index)))?
+        };
         if fd == -1 {
+            if tag != 0 {
+                return Err(Errno::EINVAL);
+            }
             continue;
         }
         let d = fget(c, fd)?;
         if is_ring(&d) {
             return Err(Errno::EBADF);
         }
-        files.slots.insert(index, d);
+        files.slots.insert(index, Arc::new(Node { file: d, tag }));
     }
     *registered = Some(files);
     Ok(0)
+}
+
+/// The tag at index `index` of `tags` (`EFAULT`), or 0 with no tags.
+fn read_tag(c: &Context<'_>, tags: u64, index: u32) -> Result<u64, Errno> {
+    if tags == 0 {
+        return Ok(0);
+    }
+    let mut tag = [0; 8];
+    c.mem
+        .read(GuestAddr(tags.wrapping_add(8 * u64::from(index))), &mut tag)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(u64::from_le_bytes(tag))
+}
+
+/// `IORING_REGISTER_FILES2`, as Linux's `io_register_rsrc`: `size` is
+/// that of a `struct io_uring_rsrc_register` (`EINVAL`), which is read
+/// (`EFAULT`) and must have a count, no reserved field and no flag but
+/// `IORING_RSRC_REGISTER_SPARSE`, which takes no descriptors (`EINVAL`);
+/// then as [`register_files`] with its tags.
+fn register_files2(c: &mut Context<'_>, ring: &Ring, arg: u64, size: u32) -> Result<u64, Errno> {
+    if size != 32 {
+        return Err(Errno::EINVAL);
+    }
+    let mut rr = [0; 32];
+    c.mem
+        .read(GuestAddr(arg), &mut rr)
+        .map_err(|_| Errno::EFAULT)?;
+    let (count, flags, data) = (u32_at(&rr, 0), u32_at(&rr, 4), u64_at(&rr, 16));
+    if count == 0
+        || u64_at(&rr, 8) != 0
+        || flags & !RSRC_REGISTER_SPARSE != 0
+        || flags & RSRC_REGISTER_SPARSE != 0 && data != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    register_files(c, ring, data, count, u64_at(&rr, 24))
+}
+
+/// `IORING_REGISTER_FILES_UPDATE2`, as `io_register_rsrc_update`: `size`
+/// is that of a `struct io_uring_rsrc_update2` (`EINVAL`), which is read
+/// (`EFAULT`) and must have a count and no reserved field (`EINVAL`); then
+/// as [`update_files`] with its tags.
+fn register_files_update2(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    arg: u64,
+    size: u32,
+) -> Result<u64, Errno> {
+    if size != 32 {
+        return Err(Errno::EINVAL);
+    }
+    let mut up = [0; 32];
+    c.mem
+        .read(GuestAddr(arg), &mut up)
+        .map_err(|_| Errno::EFAULT)?;
+    let count = u32_at(&up, 24);
+    if count == 0 || u32_at(&up, 4) != 0 || u32_at(&up, 28) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    update_files(
+        c,
+        ring,
+        u32_at(&up, 0),
+        u64_at(&up, 8),
+        count,
+        u64_at(&up, 16),
+    )
 }
 
 /// `IORING_REGISTER_FILES_UPDATE`, as `io_register_files_update`: `count`
@@ -1732,22 +1955,26 @@ fn register_files_update(
     if u32_at(&update, 4) != 0 {
         return Err(Errno::EINVAL);
     }
-    update_files(c, ring, u32_at(&update, 0), u64_at(&update, 8), count)
+    update_files(c, ring, u32_at(&update, 0), u64_at(&update, 8), count, 0)
 }
 
 /// Linux's `__io_sqe_files_update`, after `__io_register_rsrc_update`:
 /// slots `offset` on must not wrap (`EOVERFLOW`), files must be registered
-/// (`ENXIO`) and the slots within them (`EINVAL`). Each descriptor at
-/// `fds` in turn (`EFAULT`) then empties its slot and puts its file there,
-/// but `IORING_REGISTER_FILES_SKIP` leaves the slot be and -1 leaves it
-/// empty; one `fget` does not find, or a ring, is `EBADF` once the slot is
-/// empty. It gives how many it went through, or the error if none.
+/// (`ENXIO`) and the slots within them (`EINVAL`). Each tag at `tags` if
+/// there are tags and each descriptor at `fds` in turn (`EFAULT`) then
+/// empties its slot and puts its file there with the tag, but
+/// `IORING_REGISTER_FILES_SKIP` leaves the slot be and -1 leaves it empty,
+/// which a tag may not go with (`EINVAL`); one `fget` does not find, or a
+/// ring, is `EBADF` once the slot is empty. The files the slots let go of
+/// post their tags ([`Ring::put_nodes`]). It gives how many it went
+/// through, or the error if none.
 fn update_files(
     c: &mut Context<'_>,
     ring: &Ring,
     offset: u32,
     fds: u64,
     count: u32,
+    tags: u64,
 ) -> Result<u64, Errno> {
     let end = offset.checked_add(count).ok_or(EOVERFLOW)?;
     let mut gone = Vec::new();
@@ -1759,8 +1986,14 @@ fn update_files(
     let mut done = 0;
     let mut error = Errno::EINVAL;
     while done < count {
-        let fd = match read_fd(c, fds.wrapping_add(4 * u64::from(done))) {
-            Ok(fd) => fd,
+        let read = read_tag(c, tags, done)
+            .and_then(|tag| Ok((tag, read_fd(c, fds.wrapping_add(4 * u64::from(done)))?)));
+        let (tag, fd) = match read {
+            Ok((tag, fd)) if tag != 0 && (fd == FILES_SKIP || fd == -1) => {
+                error = Errno::EINVAL;
+                break;
+            }
+            Ok(read) => read,
             Err(e) => {
                 error = e;
                 break;
@@ -1771,9 +2004,8 @@ fn update_files(
             gone.extend(files.clear(slot));
             if fd != -1 {
                 match fget(c, fd) {
-                    Ok(d) if !is_ring(&d) => files.set(slot, d),
-                    Ok(d) => {
-                        gone.push(d);
+                    Ok(d) if !is_ring(&d) => files.set(slot, d, tag),
+                    Ok(_) => {
                         error = Errno::EBADF;
                         break;
                     }
@@ -1787,7 +2019,7 @@ fn update_files(
         done += 1;
     }
     drop(registered);
-    drop(gone);
+    ring.put_nodes(gone);
     if done > 0 {
         Ok(u64::from(done))
     } else {
@@ -1819,10 +2051,9 @@ fn update_files_anywhere(
             let d = fget(c, fd)?;
             let slot = files.free()?;
             if is_ring(&d) {
-                gone.push(d);
                 return Err(Errno::EBADF);
             }
-            files.set(slot, d);
+            files.set(slot, d, 0);
             if c.mem.write(GuestAddr(at), &slot.to_le_bytes()).is_err() {
                 gone.extend(files.clear(slot));
                 return Err(Errno::EFAULT);
@@ -1836,7 +2067,7 @@ fn update_files_anywhere(
         done += 1;
     }
     drop(registered);
-    drop(gone);
+    ring.put_nodes(gone);
     if done > 0 {
         Ok(u64::from(done))
     } else {
@@ -2083,6 +2314,14 @@ impl Ring {
     /// as `io_import_reg_buf` finds them: none registered there, a range
     /// that wraps or leaves the buffer, or more than `MAX_RW_COUNT`, is
     /// `EFAULT` (`validate_fixed_range`).
+    /// Whether registered buffer `index` is there (`io_find_buf_node`).
+    fn has_buffer(&self, index: u16) -> bool {
+        let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
+        buffers
+            .as_ref()
+            .is_some_and(|buffers| matches!(buffers.slots.get(usize::from(index)), Some(Some(_))))
+    }
+
     fn registered(&self, index: u16, addr: u64, len: u32) -> Result<(u64, usize), Errno> {
         let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         let (base, size) = buffers

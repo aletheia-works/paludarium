@@ -8687,6 +8687,46 @@ static void uf_list(int *list, int a, int b, int c) {
     list[2] = c;
 }
 
+struct uf_register2 {
+    unsigned nr, flags;
+    unsigned long resv2, data, tags;
+};
+
+struct uf_update2 {
+    unsigned offset, resv;
+    unsigned long data, tags;
+    unsigned nr, resv2;
+};
+
+/* A NOP with nop_flags `flags`: its file `fd`, registered buffer `index`
+   and result `result`. */
+static unsigned char *uf_nop(unsigned long data, unsigned flags, int fd, unsigned short index,
+                             int result) {
+    unsigned char *sqe = uring_push(&ut, 0, data);
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 24, &result, 4);
+    memcpy(sqe + 28, &flags, 4);
+    memcpy(sqe + 40, &index, 2);
+    return sqe;
+}
+
+/* Submits the `n` entries pushed last, then prints every completion by its
+   user_data, the tags' too. */
+static void uf_submit(unsigned n, const char *label) {
+    uring_show(label, uring_enter(ut.fd, n, 0, 1, NULL, 0));
+    uring_reap(&ut, label);
+}
+
+static unsigned char *uf_files_update(unsigned long data, unsigned offset, int *list,
+                                      unsigned count) {
+    unsigned char *sqe = uring_push(&ut, 20, data);
+    unsigned long off = offset, a = (unsigned long)list;
+    memcpy(sqe + 8, &off, 8);
+    memcpy(sqe + 16, &a, 8);
+    memcpy(sqe + 24, &count, 4);
+    return sqe;
+}
+
 static int io_uring_files_case(void) {
     char dir[] = "/tmp/io-uring-files-XXXXXX";
     if (!mkdtemp(dir) || chdir(dir)) return 80;
@@ -8895,6 +8935,131 @@ static int io_uring_files_case(void) {
     uring_show("pipe-read", read(ends[0], got, 4));
     uring_show("unregister-pipe", syscall(427, ut.fd, 3, NULL, 0));
     uring_show("pipe-read-end", read(ends[0], got, 1));
+
+    /* IORING_REGISTER_FILES2 and _FILES_UPDATE2: a tag is the user_data of
+       a completion of 0 once nothing holds the slot's file, at once, before
+       the completions of the submission that let go of it, unless one of
+       its requests holds the file. */
+    unsigned long tags[3] = {7, 0, 9};
+    struct uf_register2 rr = {3, 0, 0, (unsigned long)list, (unsigned long)tags};
+    uf_list(list, fd, -1, fd);
+    uring_show("register2-size", syscall(427, ut.fd, 13, &rr, 24));
+    uring_show("register2-null", syscall(427, ut.fd, 13, NULL, 32));
+    rr.nr = 0;
+    uring_show("register2-zero", syscall(427, ut.fd, 13, &rr, 32));
+    rr.nr = 3;
+    rr.resv2 = 1;
+    uring_show("register2-resv", syscall(427, ut.fd, 13, &rr, 32));
+    rr.resv2 = 0;
+    rr.flags = 2;
+    uring_show("register2-flags", syscall(427, ut.fd, 13, &rr, 32));
+    rr.flags = 1;
+    uring_show("register2-sparse-data", syscall(427, ut.fd, 13, &rr, 32));
+    rr.flags = 0;
+    rr.tags = 8;
+    uring_show("register2-tags-unmapped", syscall(427, ut.fd, 13, &rr, 32));
+    rr.tags = (unsigned long)tags;
+    tags[1] = 5;
+    uring_show("register2-tag-empty", syscall(427, ut.fd, 13, &rr, 32));
+    uring_reap(&ut, "register2-failed-tags");
+    tags[1] = 0;
+    uring_show("register2", syscall(427, ut.fd, 13, &rr, 32));
+    uring_show("register2-again", syscall(427, ut.fd, 13, &rr, 32));
+    struct uf_update2 up2 = {0, 0, (unsigned long)list, (unsigned long)tags, 1, 0};
+    uring_show("update2-size", syscall(427, ut.fd, 14, &up2, 24));
+    uring_show("update2-null", syscall(427, ut.fd, 14, NULL, 32));
+    up2.nr = 0;
+    uring_show("update2-zero", syscall(427, ut.fd, 14, &up2, 32));
+    up2.nr = 1;
+    up2.resv = 1;
+    uring_show("update2-resv", syscall(427, ut.fd, 14, &up2, 32));
+    up2.resv = 0;
+    up2.resv2 = 1;
+    uring_show("update2-resv2", syscall(427, ut.fd, 14, &up2, 32));
+    up2.resv2 = 0;
+    up2.offset = 0xffffffff;
+    uring_show("update2-wraps", syscall(427, ut.fd, 14, &up2, 32));
+    up2.offset = 0;
+    list[0] = -2;
+    tags[0] = 3;
+    uring_show("update2-skip-tag", syscall(427, ut.fd, 14, &up2, 32));
+    list[0] = -1;
+    uring_show("update2-clear-tag", syscall(427, ut.fd, 14, &up2, 32));
+    up2.tags = 8;
+    list[0] = other;
+    uring_show("update2-tags-unmapped", syscall(427, ut.fd, 14, &up2, 32));
+    up2.tags = (unsigned long)tags;
+    uring_reap(&ut, "update2-failed-tags");
+    tags[0] = 11;
+    uring_show("update2", syscall(427, ut.fd, 14, &up2, 32));
+    uring_reap(&ut, "update2-tags");
+    /* Slot 2's file goes as a NOP completes, before it. */
+    uf_nop(30, 0, 0, 0, 0);
+    list[0] = -1;
+    uf_files_update(31, 2, list, 1);
+    uf_submit(2, "op-update-tag");
+    /* A read of slot 0's file holds it past the update that empties it. */
+    uf_slot(22, 0, 0, got, 1);
+    uf_files_update(32, 0, list, 1);
+    uf_submit(2, "op-update-held");
+    list[0] = fd;
+    list[1] = -1;
+    list[2] = other;
+    tags[0] = 13;
+    tags[1] = 0;
+    tags[2] = 14;
+    up2.nr = 3;
+    uring_show("update2-three", syscall(427, ut.fd, 14, &up2, 32));
+    uring_show("unregister2", syscall(427, ut.fd, 3, NULL, 0));
+    uring_reap(&ut, "unregister2-tags");
+    rr = (struct uf_register2){2, 1, 0, 0, (unsigned long)tags};
+    uring_show("register2-sparse-tags", syscall(427, ut.fd, 13, &rr, 32));
+    tags[0] = 0;
+    tags[1] = 0;
+    uring_show("register2-sparse", syscall(427, ut.fd, 13, &rr, 32));
+    uring_show("unregister-sparse", syscall(427, ut.fd, 3, NULL, 0));
+    rr.flags = 0;
+    uring_show("register2-no-data", syscall(427, ut.fd, 13, &rr, 32));
+
+    /* IORING_OP_NOP's Linux 7.0 flags: one that does not find its file or
+       buffer fails, which cancels its link and posts its completion even
+       with IOSQE_CQE_SKIP_SUCCESS, yet completes with its result. */
+    struct iovec nopbuf = {got, sizeof got};
+    uring_show("register-buffer", syscall(427, ut.fd, 0, &nopbuf, 1));
+    uf_list(list, fd, 0, 0);
+    up2 = (struct uf_update2){1, 0, (unsigned long)list, 0, 1, 0};
+    uring_show("update2-untagged", syscall(427, ut.fd, 14, &up2, 32));
+    uf_nop(40, 1 << 6, 0, 0, 0);
+    uf_submit(1, "nop-unknown-flag");
+    uf_nop(41, 1 << 5, 0, 0, 0);
+    uf_submit(1, "nop-cqe32");
+    uf_nop(42, 1 << 4 | 1, 0, 0, 3);
+    uf_submit(1, "nop-tw");
+    uf_nop(43, 1 << 1 | 1, fd, 0, 5);
+    uf_submit(1, "nop-file");
+    uf_nop(44, 1 << 1 | 1, 999, 0, 5);
+    uf_submit(1, "nop-file-bad");
+    uf_nop(45, 1 << 1 | 1, path, 0, 5);
+    uf_submit(1, "nop-file-o-path");
+    uf_nop(46, 1 << 1 | 1 << 2, 1, 0, 0)[1] = 1 << 6;
+    uf_submit(1, "nop-fixed-file-skip");
+    uf_nop(47, 1 << 1 | 1 << 2, 0, 0, 0)[1] = 1 << 6;
+    uf_submit(1, "nop-fixed-file-empty");
+    uf_nop(48, 1 << 1 | 1 << 2 | 1, 1, 0, 6);
+    uf_submit(1, "nop-fixed-file");
+    uf_nop(49, 1 << 2 | 1, 0, 0, 7);
+    uf_submit(1, "nop-fixed-file-alone");
+    uf_nop(50, 1 << 3, 0, 0, 0)[1] = 1 << 6;
+    uf_submit(1, "nop-fixed-buffer-skip");
+    uf_nop(51, 1 << 3 | 1, 0, 1, 8);
+    uf_submit(1, "nop-fixed-buffer-missing");
+    uf_nop(52, 1 << 1, 999, 0, 0)[1] = 1 << 2;
+    uf_nop(53, 0, 0, 0, 0);
+    uf_submit(2, "nop-file-bad-link");
+    uf_nop(54, 1 << 1 | 1 << 3, 999, 1, 0)[1] = 1 << 6;
+    uf_submit(1, "nop-file-bad-skip");
+    uring_show("unregister-buffer", syscall(427, ut.fd, 1, NULL, 0));
+    uring_show("unregister-nop", syscall(427, ut.fd, 3, NULL, 0));
 
     unsigned char probe[16 + 8 * 64];
     memset(probe, 0, sizeof probe);

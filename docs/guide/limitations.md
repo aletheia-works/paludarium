@@ -489,11 +489,17 @@ verified.
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
   `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
+  `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING` and
   `IORING_REGISTER_PBUF_STATUS` (the others give `EINVAL`). So no ring descriptor or personality can be
-  registered, buffers cannot be updated, and neither files nor buffers can
-  be registered with `IORING_REGISTER_FILES2` or `_BUFFERS2`, which give
-  them tags. A registered buffer's pages
+  registered, buffers cannot be updated, and buffers cannot be registered
+  with `IORING_REGISTER_BUFFERS2`, which gives them tags.
+  `IORING_NOP_TW` completes a NOP as any other, where Linux posts it as
+  task work after the other completions of its submission, and on an
+  `IORING_SETUP_DEFER_TASKRUN` ring only once `io_uring_enter` waits.
+  A request after the first of a link runs with the submission's others,
+  where Linux runs it as task work once their completions are in, so a
+  tag its update of the registered files posts comes before them. A registered buffer's pages
   are not pinned: a fixed transfer moves the memory at its address as that
   is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
   made read-only, and a process that shares the ring moves its own memory.

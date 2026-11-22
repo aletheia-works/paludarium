@@ -1640,7 +1640,18 @@ kernel.
   descriptor shows them. A request runs while `io_uring_enter` takes it, so
   its completion is in the queue when the call returns; links, completions
   that skip success, and completions kept while the queue is full
-  (`IORING_FEAT_NODROP`) behave as on Linux.
+  (`IORING_FEAT_NODROP`) behave as on Linux. The completions of one
+  submission go in once all its requests ran, as Linux posts them
+  (`io_submit_flush_completions`).
+
+- `IORING_OP_NOP` takes Linux 7.0's flags, as `io_nop_prep` and `io_nop`
+  do. `IORING_NOP_INJECT_RESULT` completes it with its `len`.
+  `IORING_NOP_FILE` looks for the file of its `fd`, a registered one with
+  `IORING_NOP_FIXED_FILE`, and `IORING_NOP_FIXED_BUFFER` for registered
+  buffer `buf_index`. A NOP that finds neither fails, which ends its link
+  and posts its completion even with `IOSQE_CQE_SKIP_SUCCESS`, yet it
+  completes with its result all the same. `IORING_NOP_CQE32` is `EINVAL`,
+  as no ring has 32-byte completions, and so are unknown flags.
 
 - A transfer is checked as Linux's `io_prep_rw` and `io_read` or
   `io_write` check it, and fails at the same step. Its preparation takes the
@@ -1709,6 +1720,20 @@ kernel.
     (`EFAULT`; `EOVERFLOW`, and `EINVAL` for a range past the registered
     files). Registering files
     makes it all of them.
+  - `IORING_REGISTER_FILES2` and `IORING_REGISTER_FILES_UPDATE2` register
+    and update files with a tag for each slot, as Linux 7.0's
+    `io_register_rsrc` and `io_register_rsrc_update` do. The argument must
+    be of its size (`EINVAL`), readable (`EFAULT`), with a count and no
+    reserved field (`EINVAL`). `IORING_RSRC_REGISTER_SPARSE`, the only
+    flag, registers empty slots and takes no descriptors (`EINVAL`), as a
+    registration without descriptors does. Each tag is read before its
+    descriptor (`EFAULT`), and a tag needs a file (`EINVAL` for an empty or
+    skipped slot). Once nothing holds a tagged file, after its slot was
+    emptied or the files were unregistered (the last slot first), a
+    completion with the tag as its `user_data` and a result of 0 goes in at
+    once, ahead of the completions of the submission that emptied the slot,
+    or after them if a request of that submission holds the file. A
+    registration that fails posts no tag.
 
 - A ring keeps groups of buffers that a read with `IOSQE_BUFFER_SELECT`
   chooses one of, the group that `buf_group` names, as Linux's

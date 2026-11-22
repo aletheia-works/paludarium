@@ -561,9 +561,11 @@ pub(crate) fn full_name_hash(salt: u64, bytes: &[u8]) -> u32 {
     y = y.wrapping_mul(GOLDEN_RATIO_64);
     (y >> 32) as u32
 }
-/// `hash_32(value, FANOTIFY_EVENT_HASH_BITS)`.
+/// `hash_32(value, FANOTIFY_EVENT_HASH_BITS)`: the 29 bits of an event's
+/// hash field, 32 less the 3 of its type (`FANOTIFY_EVENT_TYPE_BITS`, for
+/// the 7 types up to `FANOTIFY_EVENT_TYPE_MNT`).
 fn hash_32(value: u32) -> u32 {
-    value.wrapping_mul(0x61C8_8647) >> 2
+    value.wrapping_mul(0x61C8_8647) >> 3
 }
 /// `fanotify_hash_fsid`.
 fn hash_fsid(fsid: [u32; 2]) -> u32 {

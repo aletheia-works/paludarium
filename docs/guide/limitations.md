@@ -415,11 +415,18 @@ verified.
   state, which Linux writes at levels 1 and 2, and master's diagnostics
   after an error are not written, so its size (`log_true_size`) is
   smaller than Linux's. The other program commands (`BPF_PROG_TEST_RUN`
-  and the rest), BTF (`BPF_BTF_LOAD`), links, attachment, pins
-  (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of programs, BTF and links
+  and the rest), BTF (`BPF_BTF_LOAD`), links, attachment, the IDs of
+  programs, BTF and links
   (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID` and the rest), tokens,
   iterators and statistics are `ENOSYS`, as each command Linux has that is
-  not here; a number Linux has no command for is `EINVAL`, as there. So
+  not here; a number Linux has no command for is `EINVAL`, as there.
+  `BPF_OBJ_PIN` pins maps alone: a program's descriptor is `EINVAL`, as
+  for no object. A BPF file system does not yet have extended attributes
+  (Linux master's `trusted.` and `security.` ones); its mountinfo does not
+  yet show the root's mode, owner and group after a `chmod` or `chown` of
+  it, only as it was mounted; and a missing name with a dot is not yet
+  `EPERM` in every call Linux looks it up in, only in those that make or
+  rename a name, pin or get, while `stat` and the like give `ENOENT`. So
   libbpf's trivial-program probe loads a socket filter and finds no other
   program type, and `bpftool feature` finds socket filters and only the
   helpers the verifier checks. A command with master's `BPF_COMMON_ATTRS`
@@ -789,7 +796,8 @@ verified.
   `chown` gives a file, and those of a file a guest makes there, are kept
   only while the emulator runs, not on the host file. The next run sees
   every file there as root's again.
-- **mount and umount2, in part**: `mount` makes only tmpfs and bind mounts;
+- **mount and umount2, in part**: `mount` makes only tmpfs, BPF file
+  systems and bind mounts;
   any other type is `ENODEV`, as from a kernel without it. Once Linux's
   checks before them pass, `MS_NOSYMFOLLOW` on a tmpfs or set by a
   remount, a mount on or a move of the generated `/proc` or `/dev` (or a

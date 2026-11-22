@@ -73,6 +73,12 @@ impl HostFs for MemFs {
         if matches!(n.kind, Kind::Special) && flags & O_PATH == 0 {
             return Err(Errno(6));
         }
+        // An object's file opens as its file system's operations say: a
+        // BPF file system's map without BTF to show, and every other object
+        // there, has `bpffs_obj_fops`, whose `open` is EIO.
+        if matches!(n.kind, Kind::Object(_)) && flags & O_PATH == 0 {
+            return Err(Errno::EIO);
+        }
         if flags & 65536 != 0 && !matches!(n.kind, Kind::Dir(_)) {
             return Err(Errno::ENOTDIR);
         }

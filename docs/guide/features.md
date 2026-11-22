@@ -1907,7 +1907,8 @@ kernel.
   `ENOTDIR`, `ELOOP`, `EACCES`), `MS_NOUSER` is `EINVAL`, a Landlock domain
   that handles file access `EPERM`, and `CAP_SYS_ADMIN` over the mount
   namespace is needed (`EPERM`). A new mount then needs a type (`EINVAL`)
-  that is `tmpfs` (`ENODEV` for any other), options tmpfs takes (`EINVAL`
+  that is `tmpfs` or `bpf` (a BPF file system, below; `ENODEV` for any
+  other), options tmpfs takes (`EINVAL`
   for any other or a value of the wrong kind: `size`, `nr_blocks`,
   `nr_inodes`, `mode`, `uid`, `gid`, `huge`, `mpol`, `inode32`, `inode64`,
   `noswap`, the quota ones, and the common `sync`, `dirsync`, `lazytime` and
@@ -2155,10 +2156,11 @@ kernel.
   the target private and the source shared or a slave (`EINVAL`).
 
 - `fsopen`, `fsconfig`, `fsmount` and `fspick` (Linux master's
-  `fs/fsopen.c`) make a tmpfs through a file system context, a descriptor
+  `fs/fsopen.c`) make a tmpfs or a BPF file system through a file system
+  context, a descriptor
   (`anon_inode:[fscontext]`) that `fsconfig` fills and acts on. `fsopen`
   needs `CAP_SYS_ADMIN` over the mount namespace (`EPERM`) and known flags
-  (`EINVAL`), and any type but tmpfs is `ENODEV`. `fsconfig` checks each
+  (`EINVAL`), and any type but those is `ENODEV`. `fsconfig` checks each
   command's arguments (`EINVAL`, `EOPNOTSUPP` for an unknown command), then
   the descriptor (`EBADF`, `EINVAL` for another file); it takes the
   parameters `mount` takes, one at a time, with the same checks, and
@@ -4406,7 +4408,7 @@ kernel.
   The buffer size is 256 KiB (`CONFIG_LOG_BUF_SHIFT` 18), and nothing is
   unread.
 
-- `sysfs` numbers the file system types: `tmpfs`, `proc`, `sockfs`,
+- `sysfs` numbers the file system types: `tmpfs`, `proc`, `sockfs`, `bpf`,
   `pipefs`, `devpts`, `ext4` and `mqueue`, the types of the files paludarium
   gives (a host file's as `ext4`), in the order Linux registers them. Option
   1 gives a name's index, 2 copies an index's name and 3 gives the count; an
@@ -4770,6 +4772,38 @@ kernel.
   descriptor's, not the map's: `map_flags` (in fdinfo, `bpf_map_info` and a
   template) leaves them out, as Linux's `bpf_map_flags_retain_permanent`
   does. See [limitations](./limitations) for what is not there.
+
+- `BPF_OBJ_PIN` leaves a map in a file of a BPF file system and
+  `BPF_OBJ_GET` gives a descriptor of it again, as Linux's
+  `bpf_obj_pin_user` and `bpf_obj_get_user` do. A BPF file system is a
+  mount of type `bpf`, by `mount` or `fsopen`: it is `FS_USERNS_MOUNT`, but
+  `bpf_fill_super` needs `CAP_SYS_ADMIN` in the first user namespace from a
+  caller outside it (`EPERM`). `uid`, `gid` and `mode` give its root, which
+  is 0777 and the sticky bit by default; the common superblock flags apply,
+  and other options are ignored, as Linux ignores them. `delegate_cmds`,
+  `delegate_maps`, `delegate_progs` and `delegate_attachs` take names of
+  Linux master's UAPI enums (in any case, without their `BPF_`,
+  `BPF_MAP_TYPE_` or `BPF_PROG_TYPE_` prefix), numbers (`EINVAL`, `ERANGE`)
+  or `any`, joined by `:`, and need `CAP_SYS_ADMIN` (`EPERM`); mountinfo
+  shows them as `bpf_show_options` does, by name, `any` or in hex. Its
+  `statfs` is `BPF_FS_MAGIC`, with no size and no inodes, and a remount
+  changes its superblock flags alone. Both commands take no flag but
+  theirs (`BPF_F_PATH_FD`; for a get, `BPF_F_RDONLY` or `BPF_F_WRONLY`, not
+  both), and a `path_fd` only with `BPF_F_PATH_FD` (`EINVAL`). A pin takes
+  a map's descriptor of any access (`EINVAL` for another), then a new name
+  (`EEXIST`, and `ENOENT` with a slash after it) on a writable mount
+  (`EROFS`) in a BPF file system's directory (`EPERM` for another), which
+  the thread may write (`EACCES`): a regular file of mode 0600 less the
+  umask, the thread's, that holds the map while a name of it is there, with
+  no descriptor of the map left. A get follows the path's links and needs
+  the access it asks for on the file (`EACCES`), which must hold a map
+  (`EACCES` for another file); the new descriptor has that access. Opening
+  the file is `EIO`, as Linux's `bpffs_obj_fops` give a map with no BTF to
+  show. Its directories make directories, symbolic links, hard links and
+  renames, as `bpf_dir_iops` do, and no other file: a new regular file is
+  `EACCES`, a node (a FIFO, a socket's `bind`) `EPERM` and `O_TMPFILE`
+  `EOPNOTSUPP`; a name with a dot that is not there is `EPERM` for a call
+  that would make it (`bpf_lookup`).
 
 - `BPF_PROG_LOAD` loads socket filters (`BPF_PROG_TYPE_SOCKET_FILTER`),
   which a verifier checks as Linux's does, and an interpreter runs them on

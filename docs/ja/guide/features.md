@@ -1677,7 +1677,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   の中で終わらない文字列は `EINVAL`）、リンクをたどってターゲットを探し（`ENOENT`、
   `ENOTDIR`、`ELOOP`、`EACCES`）、`MS_NOUSER` は `EINVAL`、ファイルへのアクセスを扱う
   Landlock のドメインは `EPERM` で、マウント名前空間に対する `CAP_SYS_ADMIN` が要ります
-  （`EPERM`）。新しいマウントには、型（`EINVAL`）が `tmpfs` であること（ほかは `ENODEV`）、
+  （`EPERM`）。新しいマウントには、型（`EINVAL`）が `tmpfs` か `bpf`（BPF ファイルシステム、
+  後述）であること（ほかは `ENODEV`）、
   tmpfs が受け取るオプション（ほかのもの、種類の違う値は `EINVAL`。`size`、`nr_blocks`、
   `nr_inodes`、`mode`、`uid`、`gid`、`huge`、`mpol`、`inode32`、`inode64`、`noswap`、
   クォータのもの、共通の `sync`、`dirsync`、`lazytime`、`mand` とその反対）、呼び出し元の
@@ -1900,10 +1901,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プライベート、ソースは共有かスレーブであることが要ります（`EINVAL`）。
 
 - `fsopen`、`fsconfig`、`fsmount`、`fspick`（Linux master の `fs/fsopen.c`）は、
-  ファイルシステムのコンテキストを通して tmpfs を作ります。コンテキストは
+  ファイルシステムのコンテキストを通して tmpfs か BPF ファイルシステムを作ります。コンテキストは
   ディスクリプタ（`anon_inode:[fscontext]`）で、`fsconfig` が中身を入れて操作します。
   `fsopen` はマウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）と知っているフラグ
-  （`EINVAL`）を求め、tmpfs 以外の型は `ENODEV` です。`fsconfig` はコマンドごとの
+  （`EINVAL`）を求め、それら以外の型は `ENODEV` です。`fsconfig` はコマンドごとの
   引数（`EINVAL`。知らないコマンドは `EOPNOTSUPP`）、次にディスクリプタ（`EBADF`。
   ほかのファイルなら `EINVAL`）を確かめます。`mount` が受け取るパラメーターを 1 つずつ
   同じ確認で受け取り、断ったものごとに Linux が記録するメッセージを、ディスクリプタの
@@ -3820,7 +3821,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   写さず 0 を返します。バッファの大きさは 256 KiB（`CONFIG_LOG_BUF_SHIFT` が 18）で、
   未読のものはありません。
 
-- `sysfs` はファイルシステムの種類に番号を付けます。種類は `tmpfs`、`proc`、`sockfs`、
+- `sysfs` はファイルシステムの種類に番号を付けます。種類は `tmpfs`、`proc`、`sockfs`、`bpf`、
   `pipefs`、`devpts`、`ext4`、`mqueue` で、paludarium が渡すファイルの種類（ホストの
   ファイルは `ext4`）を、Linux が登録する順に並べています。オプション 1 は名前の番号を、
   2 は番号の名前を、3 は種類の数を返します。知らないオプション、名前、番号は `EINVAL`
@@ -4131,6 +4132,33 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディスクリプタのものなので、Linux の `bpf_map_flags_retain_permanent` と同じく、
   `map_flags`（fdinfo、`bpf_map_info`、手本）には入りません。ないものは
   [制限](./limitations) を参照してください。
+
+- `BPF_OBJ_PIN` は BPF ファイルシステムのファイルにマップを残し、`BPF_OBJ_GET` はそのマップの
+  ディスクリプタを再び返します。Linux の `bpf_obj_pin_user` と `bpf_obj_get_user` と同じです。
+  BPF ファイルシステムは `mount` か `fsopen` で作る型 `bpf` のマウントです。`FS_USERNS_MOUNT`
+  ですが、最初のユーザー名前空間の外からは `bpf_fill_super` がそこでの `CAP_SYS_ADMIN` を
+  求めます（`EPERM`）。`uid`、`gid`、`mode` がルートを決め、既定は 0777 とスティッキービット
+  です。共通のスーパーブロックのフラグが効き、ほかのオプションは Linux と同じく無視します。
+  `delegate_cmds`、`delegate_maps`、`delegate_progs`、`delegate_attachs` は、Linux master の
+  UAPI の列挙の名前（大文字小文字を問わず、`BPF_`、`BPF_MAP_TYPE_`、`BPF_PROG_TYPE_` の
+  接頭辞を除いたもの）、数（`EINVAL`、`ERANGE`）、`any` を `:` でつないで受け取り、
+  `CAP_SYS_ADMIN` を求めます（`EPERM`）。mountinfo は `bpf_show_options` と同じく、名前、
+  `any`、16 進数で見せます。`statfs` は `BPF_FS_MAGIC` で、大きさも inode もなく、
+  マウントし直しはスーパーブロックのフラグだけを変えます。どちらのコマンドも自分のフラグ
+  （`BPF_F_PATH_FD`、取得では `BPF_F_RDONLY` か `BPF_F_WRONLY` のどちらか一方）だけを受け取り、
+  `path_fd` は `BPF_F_PATH_FD` があるときだけです（`EINVAL`）。ピンは、どのアクセスのものでも
+  マップのディスクリプタ（ほかは `EINVAL`）を取り、次に新しい名前（`EEXIST`、後ろに
+  スラッシュがあれば `ENOENT`）を、書き込めるマウント（`EROFS`）の BPF ファイルシステムの
+  ディレクトリ（ほかは `EPERM`）で、スレッドが書き込めるもの（`EACCES`）に作ります。
+  作るのは、umask を除いたモード 0600 の、スレッドのものの通常のファイルで、マップの
+  ディスクリプタがなくなっても、名前がある間はマップを持ちます。取得はパスのリンクをたどり、
+  ファイルに求めるアクセス（`EACCES`）と、ファイルがマップを持つこと（ほかのファイルは
+  `EACCES`）を求めます。新しいディスクリプタはそのアクセスを持ちます。ファイルを開くと
+  `EIO` で、これは見せる BTF のないマップに Linux の `bpffs_obj_fops` が返すものです。
+  ディレクトリは `bpf_dir_iops` と同じくディレクトリ、シンボリックリンク、ハードリンク、
+  名前の変更を作り、ほかのファイルは作りません。新しい通常のファイルは `EACCES`、ノード
+  （FIFO、ソケットの `bind`）は `EPERM`、`O_TMPFILE` は `EOPNOTSUPP` です。ない名前で
+  ドットを含むものは、それを作る呼び出しで `EPERM` です（`bpf_lookup`）。
 
 - `BPF_PROG_LOAD` はソケットフィルター（`BPF_PROG_TYPE_SOCKET_FILTER`）を読み込み、
   Linux と同じく検証器で確かめます。アタッチした AF_UNIX のソケットで、インタープリタが

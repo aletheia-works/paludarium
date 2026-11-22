@@ -22,6 +22,7 @@ pub use inbox::SignalInbox;
 mod aio;
 mod bpf;
 mod bpf_classic;
+mod bpf_fs;
 mod bpf_interp;
 mod bpf_prog;
 #[cfg(test)]

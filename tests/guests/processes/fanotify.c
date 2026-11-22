@@ -1442,8 +1442,15 @@ static long drop_caches(const char *value) {
    frees the inodes nothing uses, and with them their evictable marks
    (FAN_MARK_EVICTABLE, which hold no reference): not those of an open
    file, nor one another group's mark without FAN_MARK_EVICTABLE holds.
-   The dcache may keep a dentry it saw used through a pass, so 2 is
-   written until the mark goes, ten times at most. */
+
+   One write evicts the free files' inodes, as each is set up so that
+   nothing gives it a second chance. It is made, written back (fsync: a
+   dirty inode is on no LRU) and marked by its descriptor, with no lookup,
+   so its dentry first goes on the LRU at the close and without
+   DCACHE_REFERENCED, which a dput of a dentry already there sets and which
+   makes dentry_lru_isolate rotate it once. The first pass of drop_slab
+   frees the two dentries, so freed > 1 and it passes again, and in that
+   pass their inodes, unused and unreferenced, are freed. */
 static int case_drop_caches(void) {
     make_base("drop-caches");
     struct stat st;
@@ -1453,30 +1460,25 @@ static int case_drop_caches(void) {
     printf("read-write open=%ld\n", e(open("/proc/sys/vm/drop_caches", O_RDWR)));
     const char *values[] = {"0", "5", "x", "4\n"};
     for (int i = 0; i < 4; i++) printf("write %.1s=%ld\n", values[i], drop_caches(values[i]));
-    const char *names[] = {"free", "open", "kept"};
-    ino_t inos[3];
-    for (int i = 0; i < 3; i++) {
-        touch(at(names[i]));
-        stat(at(names[i]), &st);
-        inos[i] = st.st_ino;
-    }
-    sync();
     int fan = fan_init(FAN_NONBLOCK, 0), other = fan_init(FAN_NONBLOCK, 0);
     if (fan < 0 || other < 0) return 80;
-    for (int i = 0; i < 3; i++)
+    const char *names[] = {"free", "free2", "open", "kept"};
+    ino_t inos[4];
+    for (int i = 0; i < 4; i++) {
+        int fd = open(at(names[i]), O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) return 82;
+        fsync(fd);
+        fstat(fd, &st);
+        inos[i] = st.st_ino;
         printf("evictable %s=%ld\n", names[i],
-               fan_mark(fan, FAN_MARK_ADD | FAN_MARK_EVICTABLE, FAN_OPEN, AT_FDCWD, at(names[i])));
-    printf("other kept=%ld\n", fan_mark(other, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, at("kept")));
-    int held = open(at("open"), O_RDONLY);
-    int tries = 0;
-    long dropped = 0;
-    while (tries < 10 && marked(fan, inos[0])) {
-        dropped = drop_caches("2");
-        tries++;
+               fan_mark(fan, FAN_MARK_ADD | FAN_MARK_EVICTABLE, FAN_OPEN, fd, NULL));
+        if (i == 3) printf("other kept=%ld\n", fan_mark(other, FAN_MARK_ADD, FAN_OPEN, fd, NULL));
+        close(fd);
     }
-    printf("dropped=%ld gone=%d\n", dropped, !marked(fan, inos[0]));
-    for (int i = 1; i < 3; i++) printf("%s marked=%d\n", names[i], marked(fan, inos[i]));
-    /* The file's inode is a new one: nothing tells of its open. */
+    int held = open(at("open"), O_RDONLY);
+    printf("write 2=%ld\n", drop_caches("2"));
+    for (int i = 0; i < 4; i++) printf("%s marked=%d\n", names[i], marked(fan, inos[i]));
+    /* The free file's inode is a new one: nothing tells of its open. */
     int fd = open(at("free"), O_RDONLY);
     if (fd >= 0) close(fd);
     printf("events=%d\n", drain(fan));

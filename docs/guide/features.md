@@ -1681,8 +1681,10 @@ kernel.
     past the last slot filled (or the last one emptied), then from the
     range's start (`ENFILE` when none is free). It writes the slot's index
     over the descriptor.
-  - `IORING_REGISTER_FILE_ALLOC_RANGE` sets that range (`EOVERFLOW`, and
-    `EINVAL` for a range past the registered files). Registering files
+  - `IORING_REGISTER_FILE_ALLOC_RANGE` sets that range. It needs an
+    argument and takes no count (`EINVAL`), then reads the range
+    (`EFAULT`; `EOVERFLOW`, and `EINVAL` for a range past the registered
+    files). Registering files
     makes it all of them.
 
 - Linux's native asynchronous I/O (the calls libaio wraps) is `fs/aio.c`'s.

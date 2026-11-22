@@ -1232,6 +1232,7 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             gone.map(|_| 0).ok_or(ENXIO)
         }
         REGISTER_FILES_UPDATE => register_files_update(c, ring, a[2], a[3] as u32),
+        REGISTER_FILE_ALLOC_RANGE if a[2] == 0 || a[3] as u32 != 0 => Err(Errno::EINVAL),
         REGISTER_FILE_ALLOC_RANGE => file_alloc_range(c, ring, a[2]),
         _ => Err(Errno::EINVAL),
     }
@@ -1415,8 +1416,9 @@ fn update_files_anywhere(
     }
 }
 
-/// `IORING_REGISTER_FILE_ALLOC_RANGE`, as `io_register_file_alloc_range`:
-/// a `struct io_uring_file_index_range` (`EFAULT`) whose end does not wrap
+/// `IORING_REGISTER_FILE_ALLOC_RANGE`, as `io_register_file_alloc_range`
+/// once the dispatcher found an argument and no count (`EINVAL`): a
+/// `struct io_uring_file_index_range` (`EFAULT`) whose end does not wrap
 /// (`EOVERFLOW`), with its reserved field 0 and its end within the
 /// registered files (`EINVAL`), is where `IORING_FILE_INDEX_ALLOC` looks
 /// from now on.

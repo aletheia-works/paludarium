@@ -5146,7 +5146,10 @@ mod io_uring {
                 .unwrap();
             f.mem.write_u64(GuestAddr(range + 8), resv).unwrap();
         };
-        assert_eq!(f.ret(427, &[r.fd, 25, 0, 0]), errno(Errno::EFAULT));
+        // No argument, or a count, then one that cannot be read.
+        assert_eq!(f.ret(427, &[r.fd, 25, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 25, range, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 25, 8, 0]), errno(Errno::EFAULT));
         set(&f, u32::MAX, 2, 0);
         assert_eq!(f.ret(427, &[r.fd, 25, range, 0]), errno(EOVERFLOW));
         set(&f, 2, 2, 0);

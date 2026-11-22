@@ -8851,6 +8851,8 @@ static int io_uring_files_case(void) {
     /* IORING_REGISTER_FILE_ALLOC_RANGE: slot 2 only, which is taken. */
     struct uf_range range = {0xffffffff, 2, 0};
     uring_show("range-null", syscall(427, ut.fd, 25, NULL, 0));
+    uring_show("range-count", syscall(427, ut.fd, 25, &range, 1));
+    uring_show("range-unmapped", syscall(427, ut.fd, 25, (void *)8, 0));
     uring_show("range-wraps", syscall(427, ut.fd, 25, &range, 0));
     range = (struct uf_range){2, 2, 0};
     uring_show("range-past-end", syscall(427, ut.fd, 25, &range, 0));
@@ -10890,7 +10892,8 @@ static int mt_inner(const char *self) {
     dev_t base = mt_dev(mt_base);
     /* Changing propagation, if this kernel can; not compared. */
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=1m,mode=0750")));
+    /* Room for a copy of this program, which mt_run_from runs from it. */
+    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=16m,mode=0750")));
     printf("own device=%d\n", mt_dev(m) != base && mt_dev(m) != (dev_t)-1);
     mt_mountinfo(m);
     struct statfs fs;

@@ -8750,6 +8750,262 @@ static int io_uring_transfers_case(void) {
     return 0;
 }
 
+/* io_uring's registered files: IORING_REGISTER_FILES, _UNREGISTER_FILES,
+   _FILES_UPDATE and _FILE_ALLOC_RANGE, IORING_OP_FILES_UPDATE (at an offset,
+   or each file in a free slot), and the requests that name a registered
+   file by its slot with IOSQE_FIXED_FILE. A slot holds its file open once
+   the descriptor is closed: the file's watches hear of its close when the
+   slot lets go of it, and a pipe's write end keeps its reader from the end
+   of the file. */
+static unsigned char *uf_slot(unsigned char opcode, int slot, long offset, const void *addr,
+                              unsigned len) {
+    unsigned char *sqe = ut_entry(opcode, slot, offset, addr, len);
+    sqe[1] = 1;
+    return sqe;
+}
+
+struct uf_update {
+    unsigned offset, resv;
+    unsigned long data;
+};
+
+struct uf_range {
+    unsigned off, len;
+    unsigned long resv;
+};
+
+static void uf_list(int *list, int a, int b, int c) {
+    list[0] = a;
+    list[1] = b;
+    list[2] = c;
+}
+
+static int io_uring_files_case(void) {
+    char dir[] = "/tmp/io-uring-files-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    if (uring_open(&ut, 8)) return 81;
+    int fd = open("a", O_RDWR | O_CREAT, 0600);
+    int other = open("b", O_RDWR | O_CREAT, 0600);
+    int path = open("a", O_PATH);
+    int ifd = (int)syscall(294, 04000);
+    if (fd < 0 || other < 0 || path < 0 || ifd < 0) return 82;
+    if (syscall(254, ifd, "a", 0x1b) < 0) return 83;
+    char got[16];
+    int list[4];
+    memset(got, 0, sizeof got);
+
+    /* None registered. */
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("fixed-none");
+    uring_show("unregister-none", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("register-null", syscall(427, ut.fd, 2, NULL, 1));
+    uring_show("register-zero", syscall(427, ut.fd, 2, list, 0));
+    uring_show("register-too-many", syscall(427, ut.fd, 2, list, (1 << 20) + 1));
+    uring_show("register-unmapped", syscall(427, ut.fd, 2, (void *)8, 1));
+    const struct {
+        const char *label;
+        int fd;
+    } bad[] = {
+        {"register-unknown", 999},
+        {"register-minus-two", -2},
+        {"register-o-path", path},
+        {"register-ring", ut.fd},
+    };
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+        uf_list(list, fd, -1, bad[i].fd);
+        uring_show(bad[i].label, syscall(427, ut.fd, 2, list, 3));
+    }
+    uring_show("unregister-after-failure", syscall(427, ut.fd, 3, NULL, 0));
+    struct rlimit old, low;
+    if (getrlimit(RLIMIT_NOFILE, &old)) return 84;
+    low = old;
+    low.rlim_cur = 8;
+    if (setrlimit(RLIMIT_NOFILE, &low)) return 85;
+    uring_show("register-over-nofile", syscall(427, ut.fd, 2, list, 9));
+    if (setrlimit(RLIMIT_NOFILE, &old)) return 86;
+
+    /* Slot 0 holds the file, slot 1 nothing. */
+    uf_list(list, fd, -1, -1);
+    uring_show("register", syscall(427, ut.fd, 2, list, 2));
+    uring_show("register-again", syscall(427, ut.fd, 2, list, 2));
+    uf_slot(23, 0, 0, "hi", 2);
+    ut_run("write-slot");
+    close(fd);
+    ut_events(ifd, "events-closed");
+    uf_slot(22, 0, 0, got, sizeof got);
+    ut_run("read-slot");
+    printf("read: %.2s\n", got);
+    uf_slot(3, 0, 0, NULL, 0);
+    ut_run("fsync-slot");
+    ut_events(ifd, "events-transfers");
+    const int slots[] = {1, 2, -1};
+    for (unsigned i = 0; i < sizeof slots / sizeof *slots; i++) {
+        uf_slot(22, slots[i], 0, got, 1);
+        printf("slot %d: ", slots[i]);
+        fflush(stdout);
+        ut_run("read");
+    }
+
+    /* IORING_REGISTER_FILES_UPDATE. */
+    struct uf_update up = {1, 0, (unsigned long)list};
+    list[0] = other;
+    uring_show("update-zero", syscall(427, ut.fd, 6, &up, 0));
+    uring_show("update-null", syscall(427, ut.fd, 6, NULL, 1));
+    up.resv = 1;
+    uring_show("update-resv", syscall(427, ut.fd, 6, &up, 1));
+    up.resv = 0;
+    up.offset = 2;
+    uring_show("update-past-end", syscall(427, ut.fd, 6, &up, 1));
+    up.offset = 0xffffffff;
+    uring_show("update-wraps", syscall(427, ut.fd, 6, &up, 2));
+    up.offset = 1;
+    uring_show("update", syscall(427, ut.fd, 6, &up, 1));
+    uf_slot(22, 1, 0, got, 1);
+    ut_run("read-updated");
+    up.offset = 0;
+    uf_list(list, -2, -1, 0);
+    uring_show("update-skip-clear", syscall(427, ut.fd, 6, &up, 2));
+    uf_slot(22, 0, 0, got, 2);
+    ut_run("read-skipped");
+    uf_slot(22, 1, 0, got, 1);
+    ut_run("read-cleared");
+    uf_list(list, 999, 0, 0);
+    uring_show("update-unknown", syscall(427, ut.fd, 6, &up, 1));
+    ut_events(ifd, "events-let-go");
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("read-let-go");
+    uf_list(list, other, 999, 0);
+    uring_show("update-partly", syscall(427, ut.fd, 6, &up, 2));
+    uring_show("unregister-arg", syscall(427, ut.fd, 3, list, 0));
+    uring_show("unregister-count", syscall(427, ut.fd, 3, NULL, 1));
+    uring_show("unregister", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("unregister-again", syscall(427, ut.fd, 3, NULL, 0));
+    uf_slot(22, 0, 0, got, 1);
+    ut_run("read-unregistered");
+
+    /* IORING_OP_FILES_UPDATE: its preparation, then none registered. */
+    fd = open("a", O_RDWR);
+    if (fd < 0) return 87;
+    list[0] = fd;
+    unsigned char *sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[1] = 1;
+    ut_run("op-fixed");
+    sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[28] = 1;
+    ut_run("op-flags");
+    sqe = ut_entry(20, 0, 0, list, 1);
+    sqe[44] = 1;
+    ut_run("op-splice-fd");
+    ut_entry(20, 0, 0, list, 0);
+    ut_run("op-none");
+    ut_entry(20, 0, 0, list, 1);
+    ut_run("op-unregistered");
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-unregistered");
+
+    /* Three empty slots, filled from the first; a slot emptied is next. */
+    uf_list(list, -1, -1, -1);
+    uring_show("register-sparse", syscall(427, ut.fd, 2, list, 3));
+    uf_list(list, fd, fd, 0);
+    ut_entry(20, 0, 0xffffffff, list, 2);
+    ut_run("op-alloc");
+    printf("slots: %d %d\n", list[0], list[1]);
+    uf_list(list, fd, fd, 0);
+    ut_entry(20, 0, 0xffffffff, list, 2);
+    ut_run("op-alloc-full");
+    printf("slots: %d %d\n", list[0], list[1] == fd ? -1 : list[1]);
+    uf_list(list, fd, 0, 0);
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-none-free");
+    list[0] = -1;
+    ut_entry(20, 0, 1, list, 1);
+    ut_run("op-clear");
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-cleared");
+    printf("slot: %d\n", list[0]);
+    const struct {
+        const char *label;
+        int fd;
+    } refused[] = {{"op-alloc-ring", ut.fd}, {"op-alloc-unknown", 999}};
+    for (unsigned i = 0; i < 2; i++) {
+        list[0] = -1;
+        ut_entry(20, 0, 0, list, 1);
+        ut_run("op-clear-first");
+        list[0] = refused[i].fd;
+        ut_entry(20, 0, 0xffffffff, list, 1);
+        ut_run(refused[i].label);
+    }
+    ut_entry(20, 0, 3, list, 1);
+    ut_run("op-past-end");
+    ut_entry(20, 0, 0xfffffffe, list, 2);
+    ut_run("op-wraps");
+
+    /* IORING_REGISTER_FILE_ALLOC_RANGE: slot 2 only, which is taken. */
+    struct uf_range range = {0xffffffff, 2, 0};
+    uring_show("range-null", syscall(427, ut.fd, 25, NULL, 0));
+    uring_show("range-count", syscall(427, ut.fd, 25, &range, 1));
+    uring_show("range-unmapped", syscall(427, ut.fd, 25, (void *)8, 0));
+    uring_show("range-wraps", syscall(427, ut.fd, 25, &range, 0));
+    range = (struct uf_range){2, 2, 0};
+    uring_show("range-past-end", syscall(427, ut.fd, 25, &range, 0));
+    range = (struct uf_range){2, 1, 1};
+    uring_show("range-resv", syscall(427, ut.fd, 25, &range, 0));
+    range.resv = 0;
+    uring_show("range", syscall(427, ut.fd, 25, &range, 0));
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-range-full");
+    list[0] = -1;
+    ut_entry(20, 0, 2, list, 1);
+    ut_run("op-clear-2");
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-range");
+    printf("slot: %d\n", list[0]);
+    uring_show("unregister-range", syscall(427, ut.fd, 3, NULL, 0));
+    range = (struct uf_range){0, 0, 0};
+    uring_show("range-unregistered", syscall(427, ut.fd, 25, &range, 0));
+    range.len = 1;
+    uring_show("range-unregistered-past-end", syscall(427, ut.fd, 25, &range, 0));
+    uf_list(list, -1, -1, 0);
+    uring_show("register-two", syscall(427, ut.fd, 2, list, 2));
+    list[0] = fd;
+    ut_entry(20, 0, 0xffffffff, list, 1);
+    ut_run("op-alloc-whole");
+    printf("slot: %d\n", list[0]);
+    uring_show("unregister-two", syscall(427, ut.fd, 3, NULL, 0));
+
+    /* A pipe's write end in a slot: its reader sees no end of file. */
+    int ends[2];
+    if (pipe2(ends, O_NONBLOCK)) return 88;
+    list[0] = ends[1];
+    uring_show("register-pipe", syscall(427, ut.fd, 2, list, 1));
+    close(ends[1]);
+    uring_show("pipe-read-held", read(ends[0], got, 1));
+    uf_slot(23, 0, -1, "x", 1);
+    ut_run("pipe-write-slot");
+    uring_show("pipe-read", read(ends[0], got, 4));
+    uring_show("unregister-pipe", syscall(427, ut.fd, 3, NULL, 0));
+    uring_show("pipe-read-end", read(ends[0], got, 1));
+
+    unsigned char probe[16 + 8 * 64];
+    memset(probe, 0, sizeof probe);
+    syscall(427, ut.fd, 8, probe, 64);
+    printf("probe: 20=%d\n", probe[16 + 8 * 20 + 2] & 1);
+    close(ends[0]);
+    close(ifd);
+    close(path);
+    close(other);
+    close(fd);
+    close(ut.fd);
+    unlink("a");
+    unlink("b");
+    if (chdir("/")) return 89;
+    rmdir(dir);
+    return 0;
+}
+
 /* mprotect's checks in Linux's order, and the grows flags: the main stack
    grows down (as a MAP_GROWSDOWN mapping does, see grows_down_case), and
    nothing grows up on x86-64. */
@@ -10701,11 +10957,13 @@ static void mt_run_from(const char *self, const char *dir) {
     snprintf(copy, sizeof copy, "%s/self", dir);
     int in = open(self, O_RDONLY), out = open(copy, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     char chunk[65536];
-    ssize_t n;
+    ssize_t n = -1;
     while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
         if (write(out, chunk, n) != n) break;
     close(in);
     close(out);
+    /* A copy cut short (ENOSPC) shows here, not as the child's status. */
+    printf("exe copied=%d\n", n == 0);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -10729,7 +10987,8 @@ static int mt_inner(const char *self) {
     dev_t base = mt_dev(mt_base);
     /* Changing propagation, if this kernel can; not compared. */
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=1m,mode=0750")));
+    /* Room for a copy of this program, which mt_run_from runs from it. */
+    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=16m,mode=0750")));
     printf("own device=%d\n", mt_dev(m) != base && mt_dev(m) != (dev_t)-1);
     mt_mountinfo(m);
     struct statfs fs;
@@ -10743,11 +11002,13 @@ static int mt_inner(const char *self) {
     snprintf(dotdot, sizeof dotdot, "%s/..", m);
     printf("dotdot=%d\n", !stat(dotdot, &up) && !stat(mt_base, &outer) && up.st_ino == outer.st_ino &&
                               up.st_dev == outer.st_dev);
-    mt_run_from(self, m);
     /* The defaults: 01777, owned by the caller, and nr_inodes in statfs. */
     printf("default=%d\n", mt_result(mount("none", m2, "tmpfs", MS_NOSUID, "nr_inodes=100")));
     if (!stat(m2, &st)) printf("default mode=%o uid=%d gid=%d\n", st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid);
     if (!statfs(m2, &fs)) printf("default files=%ld free=%ld\n", (long)fs.f_files, (long)fs.f_ffree);
+    /* Run from the default tmpfs, which has no size limit: the binary can be
+       larger than the 1 MiB one above, which a copy there would cut short. */
+    mt_run_from(self, m2);
     printf("umount default=%d\n", mt_result(umount2(m2, 0)));
     /* mount's checks. */
     printf("null-type=%d unknown-type=%d bad-option=%d flag-value=%d missing=%d not-dir=%d nouser=%d\n",
@@ -13792,6 +14053,117 @@ static int proc_at_read_case(const char *self) {
     return 0;
 }
 
+/* The leader-exit-status case: a process whose leader ends with exit
+   before its other thread has, once that thread ends too, the status Linux's
+   synchronize_group_exit gives it: the last thread's own exit code, or the
+   group's for exit_group or a fatal signal. While the thread runs, its stat
+   shows the leader as a zombie with the leader's own exit_code (5 << 8),
+   and the zombie's stat and the wait show the process's status. */
+static int les_go[2], les_variant;
+static void *les_worker(void *unused) {
+    (void)unused;
+    char c;
+    if (read(les_go[0], &c, 1) != 1) syscall(SYS_exit, 99);
+    if (les_variant == 0) syscall(SYS_exit, 7);
+    if (les_variant == 1) syscall(SYS_exit_group, 9);
+    for (;;) pause();
+}
+
+/* The state and exit_code (field 52) of /proc/<pid>/stat, -1 if unread. */
+static int les_stat(pid_t pid, char *state) {
+    char path[64], buffer[4096];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    long n = proc_read(path, buffer, sizeof buffer - 1);
+    if (n <= 0) return -1;
+    buffer[n] = 0;
+    char *s = strrchr(buffer, ')');
+    if (!s || !s[1]) return -1;
+    s += 2;
+    *state = *s;
+    for (int i = 0; i < 49 && s; i++) {
+        s = strchr(s, ' ');
+        if (s) s++;
+    }
+    return s ? atoi(s) : -1;
+}
+
+static int leader_exit_status_case(void) {
+    static const char *names[] = {"exit", "exit_group", "sigkill"};
+    for (les_variant = 0; les_variant < 3; les_variant++) {
+        if (pipe(les_go) < 0) return 1;
+        fflush(stdout);
+        pid_t kid = fork();
+        if (kid < 0) return 2;
+        if (kid == 0) {
+            pthread_t worker;
+            if (pthread_create(&worker, NULL, les_worker, NULL)) _exit(98);
+            syscall(SYS_exit, 5);
+        }
+        /* Until the leader is a zombie, for at most 5 s. */
+        char state = '?';
+        int during = -1;
+        for (int i = 0; i < 500 && state != 'Z'; i++) {
+            during = les_stat(kid, &state);
+            if (state != 'Z') nanosleep(&(struct timespec){0, 10000000}, NULL);
+        }
+        if (state != 'Z') {
+            kill(kid, SIGKILL);
+            waitpid(kid, NULL, 0);
+            return 4;
+        }
+        if (les_variant == 2)
+            kill(kid, SIGKILL);
+        else if (write(les_go[1], "g", 1) != 1)
+            return 3;
+        siginfo_t info;
+        memset(&info, 0, sizeof info);
+        waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+        char zombie_state = '?';
+        int zombie = les_stat(kid, &zombie_state);
+        int status = 0;
+        waitpid(kid, &status, 0);
+        close(les_go[0]);
+        close(les_go[1]);
+        printf("%s: running state=%c exit_code=%d; zombie state=%c exit_code=%d; wait=%#x\n",
+               names[les_variant], state, during, zombie_state, zombie, status);
+    }
+    return 0;
+}
+
+/* The loadavg-running case: /proc/loadavg's running count, as Linux's
+   nr_running(), counts the threads that can run: with two threads spinning
+   besides the reader, at least 3, and no more than the live tasks; and
+   /proc/stat's procs_running counts at least as many. */
+static volatile int lr_stop;
+static void *lr_spin(void *unused) {
+    (void)unused;
+    while (!lr_stop) {
+    }
+    return NULL;
+}
+
+static int loadavg_running_case(void) {
+    pthread_t spinners[2];
+    for (int i = 0; i < 2; i++) pthread_create(&spinners[i], NULL, lr_spin, NULL);
+    /* Let both start spinning. */
+    nanosleep(&(struct timespec){0, 50000000}, NULL);
+    char buffer[4096];
+    long running = -1, tasks = -1, procs_running = -1;
+    if (proc_read("/proc/loadavg", buffer, sizeof buffer) > 0)
+        sscanf(buffer, "%*s %*s %*s %ld/%ld", &running, &tasks);
+    long n = proc_read("/proc/stat", buffer, sizeof buffer - 1);
+    if (n > 0) {
+        buffer[n] = 0;
+        char *line = strstr(buffer, "\nprocs_running ");
+        if (line) procs_running = atol(line + 15);
+    }
+    lr_stop = 1;
+    for (int i = 0; i < 2; i++) pthread_join(spinners[i], NULL);
+    printf("loadavg running>=3=%d running<=tasks=%d stat-running>=3=%d\n", running >= 3,
+           running <= tasks, procs_running >= 3);
+    return 0;
+}
+
 /* The proc-stat-counters case: /proc/stat's lines have show_stat's shape
    (ten times on the cpu line and each online CPU's, intr's total, ctxt,
    processes, procs_running, procs_blocked, softirq's total and ten kinds),
@@ -16109,6 +16481,220 @@ static int ldt_case(const char *self) {
     waitpid(child, &status, 0);
     printf("child exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     ldt_show("parent", 64);
+    return 0;
+}
+
+/* --- segment-registers ------------------------------------------------ */
+
+/* Where the handler below resumes a load that faulted. */
+static volatile unsigned long seg_resume;
+
+/* The signal a refused load gives: its code and address, the frame's
+   vector, error code, cs and ss and the two uc_flags bits about ss, and the
+   ss the handler runs on. */
+static void seg_handler(int sig, siginfo_t *info, void *context) {
+    ucontext_t *uc = context;
+    greg_t *g = uc->uc_mcontext.gregs;
+    unsigned short ss;
+    __asm__ volatile("mov %%ss, %0" : "=r"(ss));
+    unsigned long selectors = g[REG_CSGSFS];
+    printf("  signal=%d code=%d addr=%s trapno=%lld err=%#llx cs=%#lx ss=%#lx handler-ss=%#x "
+           "uc-ss-flags=%#lx\n",
+           sig, info->si_code,
+           info->si_addr == NULL                                ? "0"
+           : (unsigned long)info->si_addr == seg_resume - 2 ? "insn"
+                                                                : "other",
+           g[REG_TRAPNO], g[REG_ERR], selectors & 0xffff, selectors >> 48, ss,
+           uc->uc_flags & 6);
+    /* A fault no load expected ends the case rather than resuming again. */
+    if (seg_resume == 0) {
+        fflush(stdout);
+        _exit(97);
+    }
+    g[REG_RIP] = seg_resume;
+    seg_resume = 0;
+}
+
+/* Runs `insn` (of 2 bytes when it faults, for the SIGILL address) with
+   the selector in ax, after `name`; a fault resumes after it. */
+#define SEG_TRY(name, insn, value)                                                           \
+    do {                                                                                     \
+        printf("%s:\n", name);                                                               \
+        fflush(stdout);                                                                      \
+        unsigned long v_ = (value);                                                          \
+        __asm__ volatile("lea 1f(%%rip), %%rcx\n\tmov %%rcx, %[r]\n\t" insn "\n1:"          \
+                         : [r] "=m"(seg_resume)                                              \
+                         : "a"(v_)                                                           \
+                         : "rcx", "memory");                                                 \
+    } while (0)
+
+static unsigned short seg_read_gs(void) {
+    unsigned short s;
+    __asm__ volatile("mov %%gs, %0" : "=r"(s));
+    return s;
+}
+static unsigned long seg_gs_base(void) {
+    unsigned long base = 0;
+    syscall(SYS_arch_prctl, 0x1004, &base);
+    return base;
+}
+
+/* Moves to and from segment registers as the CPU checks them against
+   Linux's GDT and an LDT that modify_ldt writes: fs and gs take a
+   descriptor's base, a null selector clears it, and each refused load is
+   SIGSEGV (#GP) or SIGBUS (#NP, #SS) with its vector and error code in the
+   frame. Then ss across a system call and a signal, arch_prctl, the reload
+   modify_ldt makes of ds and es, push and pop, and a fork. glibc keeps its
+   thread pointer in fs, so fs changes only within one asm statement. */
+static int segments_case(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = seg_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    unsigned short cs, ss, ds, es, fs, gs;
+    __asm__ volatile("mov %%cs, %0\n\tmov %%ss, %1\n\tmov %%ds, %2\n\tmov %%es, %3\n\t"
+                     "mov %%fs, %4\n\tmov %%gs, %5"
+                     : "=r"(cs), "=r"(ss), "=r"(ds), "=r"(es), "=r"(fs), "=r"(gs));
+    printf("initial cs=%#x ss=%#x ds=%#x es=%#x fs=%#x gs=%#x gs-base=%#lx\n", cs, ss, ds, es,
+           fs, gs, seg_gs_base());
+    unsigned long *area = mmap((void *)0x10000000, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (area != (void *)0x10000000) return 1;
+    area[0] = 0x1111111111111111UL;
+    area[0x100 / 8 + 1] = 0x2222222222222222UL;
+    area[0x200 / 8] = 0x3333333333333333UL;
+    /* 0x7 read/write data at the page; 0xf the same, not present; 0x17
+       read-only data 0x100 in; 0x1f execute-only code; 0x27 readable code
+       0x200 in. */
+    long written[] = {ldt_write(0x11, 0, 0x10000000, 0xfffff, 1 | 1 << 4),
+                      ldt_write(0x11, 1, 0x10000000, 0xfffff, 1 | 1 << 4 | 1 << 5),
+                      ldt_write(0x11, 2, 0x10000100, 0xfffff, 1 | 1 << 3 | 1 << 4),
+                      ldt_write(0x11, 3, 0x10000000, 0xfffff, 1 | 2 << 1 | 1 << 3 | 1 << 4),
+                      ldt_write(0x11, 4, 0x10000200, 0xfffff, 1 | 2 << 1 | 1 << 4)};
+    printf("ldt=%ld %ld %ld %ld %ld\n", written[0], written[1], written[2], written[3],
+           written[4]);
+    for (unsigned i = 0; i < 5; i++)
+        if (written[i] != 0) return 1;
+    unsigned long loads[] = {0x7, 0x17, 0x27, 0x7b, 0x2b, 0x33, 0x23, 0x28, 0x3, 0};
+    for (unsigned i = 0; i < sizeof loads / sizeof *loads; i++) {
+        unsigned long value = 0;
+        __asm__ volatile("mov %w0, %%gs" : : "r"(loads[i]));
+        /* Only an LDT segment here has a base with memory at it. */
+        if (loads[i] & 4) __asm__ volatile("mov %%gs:8, %0" : "=r"(value) : : "memory");
+        printf("gs<-%#lx: gs=%#x base=%#lx gs:8=%#lx\n", loads[i], seg_read_gs(), seg_gs_base(),
+               value);
+        __asm__ volatile("mov %w0, %%ds\n\tmov %w0, %%es" : : "r"(loads[i]));
+        __asm__ volatile("mov %%ds, %0\n\tmov %%es, %1" : "=r"(ds), "=r"(es));
+        printf("  ds=%#x es=%#x\n", ds, es);
+    }
+    /* What the CPU refuses. */
+    SEG_TRY("gs<-0xf not present", "mov %%ax, %%gs", 0xf);
+    SEG_TRY("gs<-0x1f execute-only code", "mov %%ax, %%gs", 0x1f);
+    SEG_TRY("gs<-0x2f past the table", "mov %%ax, %%gs", 0x2f);
+    SEG_TRY("ds<-0x10 kernel code", "mov %%ax, %%ds", 0x10);
+    SEG_TRY("ds<-0x1b kernel data", "mov %%ax, %%ds", 0x1b);
+    SEG_TRY("ds<-0x40 tss", "mov %%ax, %%ds", 0x40);
+    SEG_TRY("ds<-0x63 empty tls", "mov %%ax, %%ds", 0x63);
+    SEG_TRY("ds<-0x83 past the gdt", "mov %%ax, %%ds", 0x83);
+    SEG_TRY("es<-0xfffb", "mov %%ax, %%es", 0xfffb);
+    SEG_TRY("ss<-0 null", "mov %%ax, %%ss", 0);
+    SEG_TRY("ss<-0x33 code", "mov %%ax, %%ss", 0x33);
+    SEG_TRY("ss<-0x17 read-only", "mov %%ax, %%ss", 0x17);
+    SEG_TRY("ss<-0x4 rpl 0", "mov %%ax, %%ss", 0x4);
+    SEG_TRY("ss<-0x7b cpunode", "mov %%ax, %%ss", 0x7b);
+    SEG_TRY("ss<-0xf not present", "mov %%ax, %%ss", 0xf);
+    SEG_TRY("cs<-0x33", ".byte 0x8e, 0xc8", 0x33);
+    __asm__ volatile("mov %%ss, %0\n\tmov %%ds, %1\n\tmov %%es, %2" : "=r"(ss), "=r"(ds), "=r"(es));
+    printf("after ss=%#x ds=%#x es=%#x gs=%#x\n", ss, ds, es, seg_read_gs());
+    /* The forms that read one: 16 bits, a 32-bit or 64-bit register
+       zero-extended, and memory, 16 bits. */
+    unsigned long r16 = ~0UL, r32 = ~0UL, r64 = ~0UL, word = ~0UL;
+    __asm__ volatile("mov %w4, %%gs\n\tmov %%gs, %w0\n\tmov %%gs, %k1\n\tmov %%gs, %2\n\t"
+                     "mov %%gs, %3"
+                     : "+r"(r16), "+r"(r32), "+r"(r64), "+m"(word)
+                     : "r"(0x27UL));
+    printf("reads %#lx %#lx %#lx %#lx\n", r16, r32, r64, word);
+    /* push and pop: the slot cleared first, as some CPUs write 16 bits of
+       a 64-bit push. pop loads with its checks and moves rsp only then. */
+    unsigned long pushed = 0, pushed16 = 0, popped = 0, before, after;
+    __asm__ volatile("pushq $0\n\tpopq %%rcx\n\tpush %%gs\n\tpop %0\n\t"
+                     "pushq $0\n\tpopq %%rcx\n\tpushw %%gs\n\tpopw %w1\n\t"
+                     "pushq $0x7\n\tpop %%gs\n\tmov %%gs:0, %2\n\tpushw $0x17\n\tpopw %%gs"
+                     : "=r"(pushed), "+r"(pushed16), "=r"(popped)
+                     :
+                     : "rcx", "memory");
+    printf("push=%#lx pushw=%#lx pop-gs:0=%#lx gs=%#x base=%#lx\n", pushed, pushed16, popped,
+           seg_read_gs(), seg_gs_base());
+    printf("pop gs<-0xf:\n");
+    fflush(stdout);
+    __asm__ volatile("lea 1f(%%rip), %%rcx\n\tmov %%rcx, %[r]\n\tmov %%rsp, %[b]\n\t"
+                     "pushq $0xf\n\tpop %%gs\n1:\n\tmov %%rsp, %[a]\n\tmov %[b], %%rsp"
+                     : [r] "=m"(seg_resume), [b] "=&r"(before), [a] "=&r"(after)
+                     :
+                     : "rcx", "memory");
+    printf("  rsp moved %ld gs=%#x\n", (long)(after - before), seg_read_gs());
+    /* A null selector clears the base; arch_prctl nulls the selector. */
+    syscall(SYS_arch_prctl, 0x1001, 0x10000000);
+    printf("set-gs gs=%#x base=%#lx\n", seg_read_gs(), seg_gs_base());
+    __asm__ volatile("mov %w0, %%gs" : : "r"(0UL));
+    printf("null gs=%#x base=%#lx\n", seg_read_gs(), seg_gs_base());
+    __asm__ volatile("mov %w0, %%gs" : : "r"(0x7UL));
+    syscall(SYS_arch_prctl, 0x1001, 0x10000100);
+    printf("set-gs after ldt gs=%#x base=%#lx\n", seg_read_gs(), seg_gs_base());
+    /* fs within one statement: an LDT base, then arch_prctl back. */
+    unsigned long fs_base = 0, fs_value, fs_selector;
+    syscall(SYS_arch_prctl, 0x1003, &fs_base);
+    __asm__ volatile("mov %w[sel], %%fs\n\tmov %%fs:0, %[v]\n\tmov %%fs, %k[s]\n\t"
+                     "mov $158, %%eax\n\tmov $0x1002, %%edi\n\tmov %[saved], %%rsi\n\tsyscall"
+                     : [v] "=&r"(fs_value), [s] "=&r"(fs_selector)
+                     : [sel] "r"(0x7UL), [saved] "r"(fs_base)
+                     : "rax", "rdi", "rsi", "rcx", "r11", "memory");
+    __asm__ volatile("mov %%fs, %0" : "=r"(fs));
+    printf("fs<-0x7: fs:0=%#lx fs=%#lx, after arch_prctl fs=%#x\n", fs_value, fs_selector, fs);
+    /* ss from the LDT stays until a system call, which gives back
+       __USER_DS; a signal's frame and handler keep it, and sigreturn gives
+       it back. */
+    unsigned long ss_loaded, ss_syscall;
+    __asm__ volatile("mov %w2, %%ss\n\tmov %%ss, %k0\n\tmov $39, %%eax\n\tsyscall\n\t"
+                     "mov %%ss, %k1"
+                     : "=&r"(ss_loaded), "=&r"(ss_syscall)
+                     : "r"(0x7UL)
+                     : "rax", "rcx", "r11", "memory");
+    printf("ss<-0x7: ss=%#lx after syscall ss=%#lx\n", ss_loaded, ss_syscall);
+    printf("fault on ss 0x7:\n");
+    fflush(stdout);
+    unsigned long ss_after;
+    __asm__ volatile("mov %w[sel], %%ss\n\tlea 1f(%%rip), %%rcx\n\tmov %%rcx, %[r]\n\t"
+                     "mov %w[bad], %%ds\n1:\n\tmov %%ss, %k[a]\n\tmov $39, %%eax\n\tsyscall"
+                     : [r] "=m"(seg_resume), [a] "=&r"(ss_after)
+                     : [sel] "r"(0x7UL), [bad] "r"(0x10UL)
+                     : "rax", "rcx", "r11", "memory");
+    printf("  after sigreturn ss=%#lx\n", ss_after);
+    /* modify_ldt loads ds and es again: an entry still there stays, one
+       cleared becomes null. */
+    __asm__ volatile("mov %w0, %%ds\n\tmov %w1, %%es" : : "r"(0x7UL), "r"(0x17UL));
+    ldt_write(0x11, 3, 0x10000000, 0xfffff, 1 | 1 << 4);
+    __asm__ volatile("mov %%ds, %0\n\tmov %%es, %1" : "=r"(ds), "=r"(es));
+    printf("rewrite 3: ds=%#x es=%#x\n", ds, es);
+    ldt_write(0x11, 2, 0, 0, 1 << 3 | 1 << 5);
+    __asm__ volatile("mov %%ds, %0\n\tmov %%es, %1" : "=r"(ds), "=r"(es));
+    printf("clear 2: ds=%#x es=%#x\n", ds, es);
+    /* A fork's child has the selectors and the base. */
+    __asm__ volatile("mov %w0, %%gs" : : "r"(0x27UL));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        unsigned long value;
+        __asm__ volatile("mov %%gs:0, %0" : "=r"(value));
+        printf("child gs=%#x base=%#lx gs:0=%#lx\n", seg_read_gs(), seg_gs_base(), value);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("child exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
 
@@ -34040,9 +34626,12 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-own-at-read")) return proc_own_at_read_case(argv);
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
+    if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
+    if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
+    if (!strcmp(mode, "segment-registers")) return segments_case();
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);
         return 0;
@@ -34061,6 +34650,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "io-uring-transfers")) return io_uring_transfers_case();
+    if (!strcmp(mode, "io-uring-files")) return io_uring_files_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

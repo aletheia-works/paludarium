@@ -754,6 +754,35 @@ fn polls_wait_for_their_files_and_can_be_cancelled() {
 }
 
 #[test]
+fn the_call_that_readies_a_file_puts_the_poll_in_the_ring() {
+    let mut f = fixture();
+    let (reader, writer) = f.pipe();
+    let ctx = f.setup(8);
+    let waiting = f.iocb(
+        0,
+        Iocb {
+            data: 7,
+            opcode: 5,
+            fildes: reader as u32,
+            buf: 1,
+            ..Iocb::default()
+        },
+    );
+    assert_eq!(f.ret(SUBMIT, &[ctx, 1, POINTERS]), 1);
+    // The ring's head and tail (at 8 and 12) show nothing yet.
+    assert_eq!((f.u32_at(ctx + 8), f.u32_at(ctx + 12)), (0, 0));
+    f.mem.write(GuestAddr(BUFFERS), b"x").unwrap();
+    assert_eq!(f.ret(1, &[writer, BUFFERS, 1]), 1);
+    // The write completed the poll before it returned: the event is in the
+    // ring for a program that reads it without a call, as libaio does.
+    assert_eq!(f.u32_at(ctx + 12), 1);
+    assert_eq!(
+        (f.u64_at(ctx + 32), f.u64_at(ctx + 40), f.u64_at(ctx + 48)),
+        (7, waiting, 0x41)
+    );
+}
+
+#[test]
 fn getevents_checks_its_arguments_and_waits_for_min_nr() {
     let mut f = fixture();
     let fd = f.file("a", b"abc");

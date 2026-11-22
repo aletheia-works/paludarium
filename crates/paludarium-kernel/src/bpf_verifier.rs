@@ -49,7 +49,8 @@
 //!   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
 //!   `fd_array` and maps made with
 //!   `excl_prog_hash`, BTF IDs and functions in `BPF_LD_IMM64`,
-//!   `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`, indirect jumps, a
+//!   `BPF_LD_ABS` and `BPF_LD_IND`, the load-acquire and store-release
+//!   atomics, `may_goto`, indirect jumps, a
 //!   back-edge (Linux takes a bounded loop from a privileged loader), a
 //!   pointer with a variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a
 //!   conditional jump.
@@ -111,6 +112,20 @@ mod mode {
 /// `BPF_K` and `BPF_X`, which for `BPF_END` are `BPF_TO_LE` and
 /// `BPF_TO_BE`.
 const X: u8 = 0x08;
+
+/// The operations of a `BPF_ATOMIC`, in its `imm`.
+mod atomic {
+    pub const ADD: i32 = 0x00;
+    pub const OR: i32 = 0x40;
+    pub const AND: i32 = 0x50;
+    pub const XOR: i32 = 0xa0;
+    /// `BPF_FETCH`: the old value goes to the source register.
+    pub const FETCH: i32 = 0x01;
+    pub const XCHG: i32 = 0xe0 | FETCH;
+    pub const CMPXCHG: i32 = 0xf0 | FETCH;
+    pub const LOAD_ACQ: i32 = 0x100;
+    pub const STORE_REL: i32 = 0x110;
+}
 
 mod alu {
     pub const ADD: u8 = 0x00;
@@ -1020,11 +1035,13 @@ fn alu_name(op: u8) -> &'static str {
     }
 }
 
-/// What a store writes: a register, or a BPF_ST's immediate.
+/// What a store writes: a register, a BPF_ST's immediate, or a value the
+/// verifier does not follow (a `BPF_ATOMIC`'s, whose `value_regno` is -1).
 #[derive(Clone, Copy)]
 enum Store {
     Reg(Reg),
     Imm(i32),
+    Bytes,
 }
 
 /// How an instruction leaves the walk.
@@ -1173,7 +1190,8 @@ impl Walk {
             }
             class::STX => {
                 if insn.mode() == mode::ATOMIC {
-                    return gap("atomic operations");
+                    self.atomic(s, insn, options)?;
+                    return Ok(next);
                 }
                 read_ok(s, insn.src)?;
                 read_ok(s, insn.dst)?;
@@ -1208,6 +1226,79 @@ impl Walk {
                 Ok(Step::Next(i + 2))
             }
         }
+    }
+
+    /// `check_atomic`: the operation, then `check_atomic_rmw`. The
+    /// registers are read, the destination may not be the context, the
+    /// register the old value goes to (the source with `BPF_FETCH`, R0
+    /// for `BPF_CMPXCHG`) is unknown from then on, even when it is the
+    /// destination, and the memory is read and then written, always
+    /// aligned (`strict_alignment_once`). The loader may leak pointers, so
+    /// the source and R0 may be pointers. Master and 7.0 check alike.
+    fn atomic(&mut self, s: &mut State, insn: Insn, options: Options) -> Checked<()> {
+        let old = match insn.imm {
+            atomic::ADD | atomic::AND | atomic::OR | atomic::XOR => None,
+            op if op & atomic::FETCH != 0
+                && matches!(
+                    op & !atomic::FETCH,
+                    atomic::ADD | atomic::AND | atomic::OR | atomic::XOR
+                ) =>
+            {
+                Some(insn.src)
+            }
+            atomic::XCHG => Some(insn.src),
+            atomic::CMPXCHG => Some(0),
+            atomic::LOAD_ACQ | atomic::STORE_REL => {
+                return gap("load-acquire and store-release atomics");
+            }
+            op => {
+                return refuse(
+                    Errno::EINVAL,
+                    format!("BPF_ATOMIC uses invalid atomic opcode {:02x}", op as u32),
+                );
+            }
+        };
+        if !matches!(insn.size(), size::W | size::DW) {
+            return refuse(Errno::EINVAL, "invalid atomic operand size");
+        }
+        read_ok(s, insn.src)?;
+        read_ok(s, insn.dst)?;
+        if insn.imm == atomic::CMPXCHG {
+            read_ok(s, 0)?;
+        }
+        // atomic_ptr_type_ok: of the types here, only the context is
+        // refused.
+        if let Reg::Ptr(p @ Ptr::Ctx, _) = s.regs[usize::from(insn.dst)] {
+            return refuse(
+                EACCES,
+                format!(
+                    "BPF_ATOMIC stores into R{} {} is not allowed",
+                    insn.dst,
+                    p.name()
+                ),
+            );
+        }
+        if let Some(r) = old {
+            write_ok(r)?;
+            s.regs[usize::from(r)] = Reg::Scalar(None);
+        }
+        let aligned = Options {
+            strict_alignment: true,
+            ..options
+        };
+        let value = self.access(s, insn.dst, insn.off, insn.size(), None, aligned)?;
+        if let Some(r) = old {
+            s.regs[usize::from(r)] = value;
+        }
+        self.access(
+            s,
+            insn.dst,
+            insn.off,
+            insn.size(),
+            Some(Store::Bytes),
+            aligned,
+        )?;
+        Ok(())
     }
 
     /// `check_mem_access` through the register `ptr` at `off`: a read
@@ -1287,7 +1378,15 @@ impl Walk {
                 }
             }
             Reg::Ptr(Ptr::Map(_), _) => gap("the fields of struct bpf_map"),
-            Reg::Ptr(p @ Ptr::MaybeNull(..), _) => {
+            Reg::Ptr(p @ Ptr::MaybeNull(..), base) => {
+                // check_generic_ptr_alignment, with no word for the type.
+                let total = i64::from(base) + i64::from(off);
+                if options.strict_alignment && bytes > 1 && total % bytes != 0 {
+                    return refuse(
+                        EACCES,
+                        format!("misaligned access off 0+{base}+{off} size {bytes}"),
+                    );
+                }
                 refuse(EACCES, format!("R{ptr} invalid mem access '{}'", p.name()))
             }
             Reg::Ptr(Ptr::Value(map), base) => {
@@ -2363,7 +2462,12 @@ mod tests {
             exit(),
         ]);
         gap(&[i(0x30, 0, 0, 0, 0), exit()]);
-        gap(&[mov(0, 0), i(0xdb, 10, 0, -8, 0), exit()]);
+        gap(&[
+            mov(0, 0),
+            stx_dw(10, 0, -8),
+            i(0xdb, 10, 0, -8, 0x100),
+            exit(),
+        ]);
         gap(&[
             mov(1, -8),
             ldx(0x18, 0, 10, -8),
@@ -2409,6 +2513,153 @@ mod tests {
         v.extend(ld_map(1, fd));
         v.extend([mov_reg(2, 10), i(0x07, 2, 0, 0, -4), call(1)]);
         v
+    }
+
+    #[test]
+    fn atomics_are_checked_as_check_atomic_does() {
+        const W: u8 = 0xc3;
+        const DW: u8 = 0xdb;
+        let einval = |line: &str| (Errno::EINVAL, line.to_string());
+        let eacces = |line: &str| (EACCES, line.to_string());
+        // fp-8 = 1; r1 = 1; then `last`, and exit with 0.
+        let with = |last: &[Insn]| {
+            let mut p = vec![mov(1, 1), stx_dw(10, 1, -8)];
+            p.extend_from_slice(last);
+            p.extend([mov(0, 0), exit()]);
+            p
+        };
+        for imm in [0x00, 0x01, 0x40, 0x41, 0x50, 0x51, 0xa0, 0xa1, 0xe1] {
+            ok(&with(&[i(DW, 10, 1, -8, imm)]));
+            ok(&with(&[i(W, 10, 1, -4, imm)]));
+        }
+        ok(&with(&[mov(0, 1), i(DW, 10, 1, -8, 0xf1)]));
+        // The operation, then its size.
+        assert_eq!(
+            refused(&with(&[i(DW, 10, 1, -8, 0x02)])),
+            einval("BPF_ATOMIC uses invalid atomic opcode 02")
+        );
+        assert_eq!(
+            refused(&with(&[i(DW, 10, 1, -8, -1)])),
+            einval("BPF_ATOMIC uses invalid atomic opcode ffffffff")
+        );
+        assert_eq!(
+            refused(&with(&[i(0xd3, 10, 1, -8, 0x01)])),
+            einval("invalid atomic operand size")
+        );
+        assert_eq!(
+            refused(&with(&[i(0xcb, 10, 1, -8, 0x07)])),
+            einval("BPF_ATOMIC uses invalid atomic opcode 07")
+        );
+        assert_eq!(
+            refused(&with(&[i(DW, 10, 1, -8, 0x100)])).1,
+            "paludarium: load-acquire and store-release atomics are not verified yet"
+        );
+        // The source, the destination, and R0 for CMPXCHG must be written.
+        assert_eq!(
+            refused(&with(&[i(DW, 10, 2, -8, 0)])),
+            eacces("R2 !read_ok")
+        );
+        assert_eq!(refused(&with(&[i(DW, 3, 1, -8, 0)])), eacces("R3 !read_ok"));
+        assert_eq!(
+            refused(&[mov(1, 1), stx_dw(10, 1, -8), i(DW, 10, 1, -8, 0xf1), exit()]),
+            eacces("R0 !read_ok")
+        );
+        // Not into the context, even into cb[].
+        assert_eq!(
+            refused(&[mov(2, 1), i(W, 1, 2, 48, 0), mov(0, 0), exit()]),
+            eacces("BPF_ATOMIC stores into R1 ctx is not allowed")
+        );
+        // Aligned on the stack and in a map's value, unasked.
+        assert_eq!(
+            refused(&with(&[i(DW, 10, 1, -12, 0)])),
+            eacces("misaligned stack access off 0+0+-12 size 8")
+        );
+        let mut p = lookup(3);
+        p.extend([
+            i(0x15, 0, 0, 3, 0),
+            mov(1, 1),
+            i(W, 0, 1, 2, 0x01),
+            mov(0, 0),
+            exit(),
+        ]);
+        assert_eq!(
+            refused(&p),
+            eacces("misaligned value access off 0+0+2 size 4")
+        );
+        let mut p = lookup(3);
+        p.extend([
+            i(0x15, 0, 0, 3, 0),
+            mov(1, 1),
+            i(W, 0, 1, 4, 0x01),
+            mov(0, 0),
+            exit(),
+        ]);
+        ok(&p);
+        // A hash's lookup result before its check, which Linux too takes to
+        // be null (an array's of a constant key it knows is not).
+        let mut p = vec![i(0x7a, 10, 0, -8, 0)];
+        p.extend(ld_map(1, 4));
+        p.extend([mov_reg(2, 10), i(0x07, 2, 0, 0, -8), call(1)]);
+        p.extend([mov(1, 1), i(W, 0, 1, 2, 0), mov(0, 0), exit()]);
+        assert_eq!(refused(&p), eacces("misaligned access off 0+0+2 size 4"));
+        // A read-only value is read, then refused the write.
+        let mut p = lookup(5);
+        p.extend([
+            i(0x15, 0, 0, 3, 0),
+            mov(1, 1),
+            i(DW, 0, 1, 0, 0),
+            mov(0, 0),
+            exit(),
+        ]);
+        assert_eq!(
+            refused(&p),
+            eacces("write into map forbidden, value_size=8 off=0 size=8")
+        );
+        assert_eq!(
+            refused(&with(&[i(DW, 10, 1, 0, 0)])),
+            eacces("invalid read from stack R10 off=0 size=8")
+        );
+        // The old value's register is written before the memory is read:
+        // as the destination it is then a scalar Linux knows nothing of,
+        // which is not aligned.
+        assert_eq!(
+            refused(&with(&[i(DW, 10, 10, -8, 0x01)])),
+            eacces("frame pointer is read only")
+        );
+        let unknown = "misaligned access off (0x0; 0xffffffffffffffff)+0+-8 size 8";
+        assert_eq!(
+            refused(&with(&[mov_reg(2, 10), i(DW, 2, 2, -8, 0x01)])),
+            eacces(unknown)
+        );
+        assert_eq!(
+            refused(&with(&[mov_reg(0, 10), i(DW, 0, 1, -8, 0xf1)])),
+            eacces(unknown)
+        );
+        // It takes what the stack holds, here a pointer, and leaves the
+        // slot bytes.
+        let p = [
+            stx_dw(10, 10, -8),
+            mov(1, 0),
+            i(DW, 10, 1, -8, 0x01),
+            ldx(size::DW, 0, 1, -16),
+            ldx(size::DW, 2, 10, -8),
+            ldx(size::DW, 0, 2, 0),
+            exit(),
+        ];
+        assert_eq!(refused(&p), eacces("R2 invalid mem access 'scalar'"));
+        ok(&p[..4].iter().copied().chain([exit()]).collect::<Vec<_>>());
+        assert_eq!(
+            refused(&[
+                stx_dw(10, 10, -8),
+                mov(1, 0),
+                i(W, 10, 1, -8, 0x01),
+                mov(0, 0),
+                exit()
+            ]),
+            eacces("invalid size of register fill")
+        );
+        // A pointer may be the source.
+        ok(&with(&[i(DW, 10, 10, -8, 0x00)]));
     }
 
     #[test]

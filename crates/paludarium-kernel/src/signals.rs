@@ -1,5 +1,6 @@
 //! Checked Linux x86-64 signal frame codec. Offsets are observed by signals-14.
 use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState};
+use paludarium_cpu::segments::{self, SegmentFault};
 use paludarium_cpu::{CpuState, FX_WRITTEN, INITIAL_MXCSR, X87, flag, reg};
 use paludarium_host::ClockId;
 use paludarium_mmu::AddressSpace;
@@ -60,6 +61,49 @@ pub(crate) struct PendingSignal {
     pub queued: Option<[u8; 48]>,
     /// The discard generation it was sent in ([`Discards`]).
     pub born: u64,
+}
+/// The signal a refused segment-register load gives, as Linux's
+/// `exc_general_protection` (SIGSEGV) and `exc_segment_not_present` and
+/// `exc_stack_segment` (SIGBUS) do: `SI_KERNEL`, no address, and the
+/// vector and error code in the frame's `trapno` and `err`.
+pub(crate) fn segment_fault(trap: u8, error: u16) -> PendingSignal {
+    PendingSignal {
+        target: PendingTarget::Thread,
+        number: if trap == 13 {
+            paludarium_types::signal::SIGSEGV
+        } else {
+            paludarium_types::signal::SIGBUS
+        },
+        code: 128,
+        addr: 0,
+        trap: u64::from(trap),
+        error: u64::from(error),
+        synchronous: true,
+        timer: None,
+        child: None,
+        sender: None,
+        sender_uid: None,
+        queued: None,
+        born: generation(),
+    }
+}
+/// `uc_flags` bits: the frame's `ss` is the task's (`UC_SIGCONTEXT_SS`),
+/// and `rt_sigreturn` restores it as it is (`UC_STRICT_RESTORE_SS`). With
+/// no XSAVE on the virtual CPU there is no `UC_FP_XSTATE`.
+const UC_SIGCONTEXT_SS: u64 = 2;
+const UC_STRICT_RESTORE_SS: u64 = 4;
+/// `force_valid_ss`: `ss` if it would load as a stack segment, else
+/// `__USER_DS`.
+fn valid_stack(ss: u16, mem: &AddressSpace) -> u16 {
+    let ldt = mem
+        .ldt()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if segments::check_stack(ss, &ldt).is_ok() {
+        ss
+    } else {
+        segments::USER_DS
+    }
 }
 /// When a `sigaction` last discarded each signal's pending instances, as
 /// Linux's `flush_sigqueue_mask` does for a signal it makes ignored. Each
@@ -474,7 +518,17 @@ pub(crate) fn install(
     let mut b = [0u8; FRAME_SIZE];
     let fp = usize::try_from(((base + 440 + 63) & !63) - base).map_err(|_| ())?;
     put(&mut b, 0, action.restorer);
-    put(&mut b, UC, 0);
+    let (cs, ss) = (cpu.segments[segments::CS], cpu.segments[segments::SS]);
+    // `user_64bit_mode`: only a 64-bit task's frame restores SS strictly.
+    put(
+        &mut b,
+        UC,
+        if cs == segments::USER_CS {
+            UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS
+        } else {
+            UC_SIGCONTEXT_SS
+        },
+    );
     put(&mut b, UC + 16, old_stack.sp);
     put(
         &mut b,
@@ -487,7 +541,8 @@ pub(crate) fn install(
     }
     put(&mut b, SC + 128, cpu.rip.0);
     put(&mut b, SC + 136, cpu.rflags);
-    put(&mut b, SC + 144, 0x002b_0000_0000_0033);
+    // cs, gs, fs and ss: gs and fs are 0, as Linux's 64-bit frame has them.
+    put(&mut b, SC + 144, u64::from(cs) | u64::from(ss) << 48);
     put(&mut b, SC + 152, signal.error);
     put(&mut b, SC + 160, signal.trap);
     put(&mut b, SC + 168, process.signal_mask);
@@ -544,13 +599,23 @@ pub(crate) fn install(
     cpu.gpr[reg::RDX] = base + UC as u64;
     cpu.rflags &= !(flag::DF | flag::TF | flag::RF);
     cpu.repeat_continuation = None;
+    // The handler runs in `__USER_CS`, on the task's SS if that is still a
+    // valid stack segment (`force_valid_ss`); DS and ES stay as they are.
+    cpu.segments[segments::CS] = segments::USER_CS;
+    cpu.segments[segments::SS] = valid_stack(ss, mem);
     Ok(())
 }
+/// `rt_sigreturn`'s `restore_sigcontext`. The frame's cs and ss are taken
+/// with RPL 3; cs must be `__USER_CS`, the only code segment the virtual
+/// CPU runs. An ss that is no stack segment is replaced by `__USER_DS`
+/// unless the frame says to restore it strictly (`force_valid_ss`); then the
+/// context is restored and the return to it faults, as Linux's `iret` does,
+/// which `Ok(Some(fault))` gives.
 pub(crate) fn restore(
     process: &mut ThreadState,
     cpu: &mut CpuState,
     mem: &AddressSpace,
-) -> Result<(), ()> {
+) -> Result<Option<SegmentFault>, ()> {
     // The restorer was reached through ret, so RSP points immediately after pretcode.
     let base = cpu.gpr[reg::RSP].checked_sub(8).ok_or(())?;
     let saved = process.frames.last().cloned();
@@ -567,9 +632,25 @@ pub(crate) fn restore(
         return Err(());
     }
     let selectors = get(&b, SC + 144);
-    if selectors & 0xffff != 0x33 || selectors >> 48 != 0x2b {
+    let cs = selectors as u16 | 3;
+    let mut ss = (selectors >> 48) as u16 | 3;
+    if cs != segments::USER_CS {
         return Err(());
     }
+    if get(&b, UC) & UC_STRICT_RESTORE_SS == 0 {
+        ss = valid_stack(ss, mem);
+    }
+    let fault = {
+        let ldt = mem
+            .ldt()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        segments::check_stack(ss, &ldt).err()
+    };
+    // DS, ES, FS and GS are the thread's, not members of the frame.
+    restored.segments = cpu.segments;
+    restored.segments[segments::CS] = cs;
+    restored.segments[segments::SS] = ss;
     // `FIX_EFLAGS`: what popf may change, and RF, which an execute
     // breakpoint's frame keeps so that the instruction runs once.
     let fixed = flag::USER_WRITABLE | flag::RF;
@@ -615,7 +696,7 @@ pub(crate) fn restore(
     process.alt_stack = alt;
     process.frames.pop();
     *cpu = restored;
-    Ok(())
+    Ok(fault)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

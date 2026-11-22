@@ -3716,12 +3716,19 @@ impl AddressSpaceData {
 
     /// Checks that `[addr, addr+len)` is accessible; returns the first
     /// faulting address otherwise.
+    /// Checks that `[addr, addr+len)` may be accessed as `access`. With
+    /// `creating`, the caller gives a page without an entry one next, so a
+    /// page its memory has to take in is asked for then
+    /// ([`PageSource::admit`]); a first look under the read lock, which
+    /// gives no entry, does not ask, or a `userfaultfd` registered for
+    /// minor faults would find the page it took in and wait for it.
     fn check(
         &self,
         directory: &Directory,
         addr: GuestAddr,
         len: usize,
         access: Access,
+        creating: bool,
     ) -> Result<(), Fault> {
         let fault = |at: u64| Fault {
             addr: GuestAddr(at),
@@ -3815,6 +3822,7 @@ impl AddressSpaceData {
             // only of a page within its file, so that one past the end is
             // never charged.
             if access != Access::Setup
+                && (creating || lookup(directory, page).is_some())
                 && let Some((source, offset)) = self.admitting(directory, page)
                 && !source.admit(offset)
             {
@@ -3938,7 +3946,7 @@ impl AddressSpaceData {
         };
         {
             let directory = self.read_directory();
-            self.check(&directory, addr, buf.len(), access)?;
+            self.check(&directory, addr, buf.len(), access, false)?;
             if chunks(addr, buf.len()).all(|(page, _, _)| ready(&directory, page)) {
                 if access == Access::Fetch {
                     self.mark_fetched(&directory, addr, buf.len());
@@ -3951,7 +3959,7 @@ impl AddressSpaceData {
             }
         }
         let mut directory = self.write_directory();
-        self.check(&directory, addr, buf.len(), access)?;
+        self.check(&directory, addr, buf.len(), access, true)?;
         // A successful lazy read installs the logical zero-page entry without
         // allocating its byte frame, matching subsequent Linux fault metadata.
         for (page, _, _) in chunks(addr, buf.len()) {
@@ -3984,7 +3992,7 @@ impl AddressSpaceData {
         }
         // Again, as a truncation may have come between the check and the
         // refresh: a page it left past the end of the file is a bus error.
-        self.check(&directory, addr, buf.len(), access)?;
+        self.check(&directory, addr, buf.len(), access, true)?;
         if access == Access::Fetch {
             self.mark_fetched(&directory, addr, buf.len());
         }
@@ -4105,7 +4113,7 @@ impl AddressSpaceData {
     fn prepare_write(&self, addr: GuestAddr, len: usize, access: Access) -> Result<bool, Fault> {
         {
             let directory = self.read_directory();
-            self.check(&directory, addr, len, access)?;
+            self.check(&directory, addr, len, access, false)?;
             let ready = |page: u64| {
                 lookup(&directory, page).is_some_and(|p| {
                     !p.cow
@@ -4123,7 +4131,7 @@ impl AddressSpaceData {
             }
         }
         let mut directory = self.write_directory();
-        self.check(&directory, addr, len, access)?;
+        self.check(&directory, addr, len, access, true)?;
         for (page, _, _) in chunks(addr, len) {
             let Some(prot) = self.mapping_at(page).map(|m| m.prot) else {
                 return Err(Fault {
@@ -4199,7 +4207,7 @@ impl AddressSpaceData {
         // refresh, which read the shrinks after it: a page it left past the
         // end of the file must not take the write, in a copy that records
         // the shrink and so would stay.
-        self.check(&directory, addr, len, access)?;
+        self.check(&directory, addr, len, access, true)?;
         if let Some(page) = Self::single_page(addr, len) {
             self.remember(&directory, page);
         }
@@ -8086,12 +8094,12 @@ impl AddressSpace {
     /// Checks a syscall buffer's read permission before allocating a copy.
     pub fn check_read(&self, addr: GuestAddr, len: usize) -> Result<(), Fault> {
         let data = self.locked();
-        data.check(&data.read_directory(), addr, len, Access::Read)
+        data.check(&data.read_directory(), addr, len, Access::Read, false)
     }
     /// Checks a stack allocation's write permission without changing bytes.
     pub fn check_write(&self, addr: GuestAddr, len: usize) -> Result<(), Fault> {
         let data = self.locked();
-        data.check(&data.read_directory(), addr, len, Access::Write)
+        data.check(&data.read_directory(), addr, len, Access::Write, false)
     }
     pub fn fetch(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().fetch(addr, buf)
@@ -8542,7 +8550,7 @@ impl AddressSpace {
         let data = self.locked();
         // Checked first, so that one that faults leaves the TLBs: nothing
         // that takes no lock changes a protection.
-        data.check(&data.read_directory(), addr, size, Access::Write)?;
+        data.check(&data.read_directory(), addr, size, Access::Write, false)?;
         data.code.bump_epoch();
         let mut bytes = [0u8; 16];
         data.read(addr, &mut bytes[..size])?;

@@ -2112,6 +2112,22 @@ fn faults_bring_shmem_pages_into_their_file_or_are_bus_errors() {
     assert_eq!(byte, [1]);
     assert_eq!(file.asked.load(Ordering::Relaxed), asked);
     assert_eq!(file.held(), [0]);
+    // A hole of a mapping a userfaultfd registered for minor faults comes
+    // in at once, as Linux allocates it, without waiting for the page it
+    // took in.
+    let file = Tmpfs::new(2 * PAGE_SIZE, 2, true);
+    let source: Arc<dyn PageSource> = file.clone();
+    let pages = SharedPages::new().with_source(source);
+    let at = m
+        .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 2 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    m.view()
+        .userfault_register(at.0, at.0 + 2 * PAGE_SIZE, 7, Userfault::MINOR)
+        .unwrap();
+    m.read(GuestAddr(at.0 + PAGE_SIZE), &mut byte).unwrap();
+    assert_eq!(file.held(), [1]);
     // A private mapping of a file that is not shmem's asks nothing.
     let file = Tmpfs::new(4 * PAGE_SIZE, 0, false);
     let cache = SharedPages::new().with_source(file.clone());

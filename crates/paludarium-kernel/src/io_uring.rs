@@ -980,7 +980,8 @@ fn prepare_transfer(c: &Context<'_>, transfer: &mut Transfer) -> Result<(), Errn
             c.mem
                 .read(GuestAddr(transfer.addr), &mut iovec)
                 .map_err(|_| Errno::EFAULT)?;
-            // The vector's length is the most to read.
+            // The vector's length is the most to read, cut to 32 bits as
+            // `io_iov_buffer_select_prep` stores it in `struct io_rw`'s `len`.
             transfer.len = u64_at(&iovec, 8) as u32;
         }
         return Ok(());
@@ -2310,10 +2311,6 @@ fn pbuf_status(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno>
 }
 
 impl Ring {
-    /// The `len` bytes at `addr` of a request's registered buffer `index`,
-    /// as `io_import_reg_buf` finds them: none registered there, a range
-    /// that wraps or leaves the buffer, or more than `MAX_RW_COUNT`, is
-    /// `EFAULT` (`validate_fixed_range`).
     /// Whether registered buffer `index` is there (`io_find_buf_node`).
     fn has_buffer(&self, index: u16) -> bool {
         let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2322,6 +2319,10 @@ impl Ring {
             .is_some_and(|buffers| matches!(buffers.slots.get(usize::from(index)), Some(Some(_))))
     }
 
+    /// The `len` bytes at `addr` of a request's registered buffer `index`,
+    /// as `io_import_reg_buf` finds them: none registered there, a range
+    /// that wraps or leaves the buffer, or more than `MAX_RW_COUNT`, is
+    /// `EFAULT` (`validate_fixed_range`).
     fn registered(&self, index: u16, addr: u64, len: u32) -> Result<(u64, usize), Errno> {
         let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         let (base, size) = buffers

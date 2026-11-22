@@ -2254,6 +2254,9 @@ impl InetSocket {
         {
             return Err(Errno::EINVAL);
         }
+        if to.is_ipv4() {
+            self.mapped_source(bound)?;
+        }
         match self.network.route(to, Some(bound.ip()), self.now())? {
             Dest::Here(to) => {
                 let from = self.datagram_source(&mut s, to, &options)?;
@@ -2301,6 +2304,28 @@ impl InetSocket {
             }
         }
         Ok(0)
+    }
+    /// The check Linux's `ip_route_output_key_hash_rcu` makes, for IPv4,
+    /// of the source an IPv6 socket bound to an IPv4-mapped broadcast
+    /// address has: `__inet6_bind` keeps that address as `inet_saddr`,
+    /// where IPv4's `inet_bind` drops it. So the limited broadcast address
+    /// is `EINVAL`, and a subnet's, which no device has, `ENETUNREACH`.
+    fn mapped_source(&self, bound: SocketAddr) -> Result<(), Errno> {
+        let IpAddr::V4(ip) = bound.ip() else {
+            return Ok(());
+        };
+        if self.family != Family::V6 {
+            return Ok(());
+        }
+        if ip.is_broadcast() {
+            return Err(Errno::EINVAL);
+        }
+        let addresses = self.network.addresses_at(self.now());
+        let local = crate::interface::TABLE_LOCAL;
+        if addresses.has_table4(local) && addresses.bindable4(ip) && !addresses.local4(ip) {
+            return Err(ENETUNREACH);
+        }
+        Ok(())
     }
     /// This socket's address, with a port bound now on every address, or
     /// on the one the guest kept, if it had none (Linux's `inet_autobind`).
@@ -2356,6 +2381,16 @@ impl InetSocket {
             None => Ok(()),
         };
         let plain_to = SocketAddr::new(plain(to.ip()), to.port());
+        // `udpv6_sendmsg` hands a datagram to an IPv4 address to
+        // `udp_sendmsg` after IPV6_V6ONLY's check; that checks its length,
+        // then looks its route up from the bound source.
+        if plain_to.is_ipv4()
+            && !options.v6_only
+            && bytes.len() <= 65_535
+            && let Some(bound) = s.bound
+        {
+            self.mapped_source(bound)?;
+        }
         let route = self
             .network
             .route(plain_to, s.bound.map(|b| b.ip()), self.now())?;

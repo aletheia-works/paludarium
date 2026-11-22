@@ -6,8 +6,14 @@
    SO_BROADCAST to the subnet's broadcast address and to the limited one.
    Each socket that takes it gets a copy (__udp4_lib_mcast_deliver): one
    bound to the unspecified address or to the broadcast address the
-   datagram has, or connected to its sender, and a dual-stack IPv6 one;
-   not one bound to a unicast address, connected elsewhere, or IPV6_V6ONLY.
+   datagram has, a dual-stack IPv6 one, and one bound to the broadcast
+   address and connected to the sender; not one bound to a unicast
+   address, IPV6_V6ONLY, connected elsewhere, or connected while bound to
+   the unspecified address, as connect gives it the route's source
+   (__udp_is_mcast_sock checks that first). An IPv6 one bound to an
+   IPv4-mapped broadcast address keeps it as its IPv4 source
+   (__inet6_bind), so it connects and sends to IPv4 with ENETUNREACH, or
+   EINVAL for the limited one, and stays unconnected.
    A's own sockets get a copy too, as ip_mc_output loops a broadcast back,
    even after B's end goes down and the carrier with it. A broadcast's
    sendto returns once it has been delivered, so B looks after A has sent;
@@ -198,7 +204,7 @@ static struct sockaddr_in at(const char *ip, int port) {
 }
 /* A UDP socket of `family` with SO_REUSEADDR (and IPV6_V6ONLY where
    `only`), bound to `ip` port 7000, and connected to 10.77.0.1 port
-   `peer` unless it is 0. */
+   `peer` (its IPv4-mapped form for IPv6) unless it is 0. */
 static int bound(int family, const char *ip, int only, int peer, const char *label) {
     int fd = socket(family, SOCK_DGRAM, 0), on = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
@@ -213,7 +219,11 @@ static int bound(int family, const char *ip, int only, int peer, const char *lab
         r = result(bind(fd, (void *)&a, sizeof a));
     }
     printf("%s: bind %s=%ld\n", side, label, r);
-    if (peer) {
+    if (peer && family == AF_INET6) {
+        struct sockaddr_in6 to = {.sin6_family = AF_INET6, .sin6_port = htons((unsigned short)peer)};
+        inet_pton(AF_INET6, "::ffff:10.77.0.1", &to.sin6_addr);
+        printf("%s: connect %s=%ld\n", side, label, result(connect(fd, (void *)&to, sizeof to)));
+    } else if (peer) {
         struct sockaddr_in to = at("10.77.0.1", peer);
         printf("%s: connect %s=%ld\n", side, label, result(connect(fd, (void *)&to, sizeof to)));
     }
@@ -243,9 +253,11 @@ static void receive(int fd, int wait, const char *label) {
     printf("%s: %s=%ld \"%s\" from %s:%u\n", side, label, n, n > 0 ? buf : "", ip, port);
 }
 
-#define B_SOCKETS 8
+#define B_SOCKETS 15
 static const char *const b_labels[B_SOCKETS] = {
     "any", "any again", "unicast", "broadcast", "connected", "connected elsewhere", "dual-stack", "v6only",
+    "dual-stack connected", "dual-stack connected elsewhere", "broadcast connected",
+    "broadcast connected elsewhere", "mapped broadcast connected", "mapped broadcast connected elsewhere", "mapped limited connected",
 };
 
 /* B: makes its namespace, then does what A writes to `in`, one letter at
@@ -271,6 +283,18 @@ static void child(int in, int out) {
             fds[5] = bound(AF_INET, "0.0.0.0", 0, 7009, b_labels[5]);
             fds[6] = bound(AF_INET6, "::", 0, 0, b_labels[6]);
             fds[7] = bound(AF_INET6, "::", 1, 0, b_labels[7]);
+            fds[8] = bound(AF_INET6, "::", 0, 7001, b_labels[8]);
+            fds[9] = bound(AF_INET6, "::", 0, 7009, b_labels[9]);
+            fds[10] = bound(AF_INET, "10.77.0.255", 0, 7001, b_labels[10]);
+            fds[11] = bound(AF_INET, "10.77.0.255", 0, 7009, b_labels[11]);
+            fds[12] = bound(AF_INET6, "::ffff:10.77.0.255", 0, 7001, b_labels[12]);
+            fds[13] = bound(AF_INET6, "::ffff:10.77.0.255", 0, 7009, b_labels[13]);
+            fds[14] = bound(AF_INET6, "::ffff:255.255.255.255", 0, 7001, b_labels[14]);
+            /* Its broadcast source fails a send as it failed connect. */
+            struct sockaddr_in6 to = {.sin6_family = AF_INET6, .sin6_port = htons(7000)};
+            inet_pton(AF_INET6, "::ffff:10.77.0.1", &to.sin6_addr);
+            printf("B: sendto from mapped broadcast=%ld\n",
+                   result(sendto(fds[12], "x", 1, 0, (void *)&to, sizeof to)));
         } else if (command == 'r') {
             /* The first takes every broadcast that comes. */
             for (int i = 0; i < B_SOCKETS; i++) receive(fds[i], i == 0, b_labels[i]);
@@ -352,7 +376,7 @@ int main(int argc, char **argv) {
     receive(unicast, 0, "unicast");
     B_DOES("r");
 
-    /* A connected one, from another port: "connected" takes none. */
+    /* A connected one, from another port: no connected one takes it. */
     int linked = socket(AF_INET, SOCK_DGRAM, 0);
     from = at("10.77.0.1", 7002);
     printf("A: bind linked=%ld\n", result(bind(linked, (void *)&from, sizeof from)));

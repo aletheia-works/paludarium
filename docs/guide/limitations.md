@@ -819,8 +819,9 @@ verified.
   in its blocks only then. A memfd's pages count once a fault brings them
   in, as `shmem_fault` charges them, but those `MAP_POPULATE`,
   `MAP_LOCKED` or a lock would bring into a shared mapping of one only
-  once touched. Its extended attributes take none of the inodes' room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
-  counts them, does not happen); the root from start-up has no limit but
+  once touched. Its extended attributes take none of the inodes' room
+  (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set` counts
+  them, does not happen); the root from start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime
   flags, `sync`, `dirsync` and `mand`; no mount here holds a
   device node but a host directory's (`mknod` of one is `EPERM`), so

@@ -10608,11 +10608,13 @@ static void mt_run_from(const char *self, const char *dir) {
     snprintf(copy, sizeof copy, "%s/self", dir);
     int in = open(self, O_RDONLY), out = open(copy, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     char chunk[65536];
-    ssize_t n;
+    ssize_t n = -1;
     while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
         if (write(out, chunk, n) != n) break;
     close(in);
     close(out);
+    /* A copy cut short (ENOSPC) shows here, not as the child's status. */
+    printf("exe copied=%d\n", n == 0);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -10650,11 +10652,13 @@ static int mt_inner(const char *self) {
     snprintf(dotdot, sizeof dotdot, "%s/..", m);
     printf("dotdot=%d\n", !stat(dotdot, &up) && !stat(mt_base, &outer) && up.st_ino == outer.st_ino &&
                               up.st_dev == outer.st_dev);
-    mt_run_from(self, m);
     /* The defaults: 01777, owned by the caller, and nr_inodes in statfs. */
     printf("default=%d\n", mt_result(mount("none", m2, "tmpfs", MS_NOSUID, "nr_inodes=100")));
     if (!stat(m2, &st)) printf("default mode=%o uid=%d gid=%d\n", st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid);
     if (!statfs(m2, &fs)) printf("default files=%ld free=%ld\n", (long)fs.f_files, (long)fs.f_ffree);
+    /* Run from the default tmpfs, which has no size limit: the binary can be
+       larger than the 1 MiB one above, which a copy there would cut short. */
+    mt_run_from(self, m2);
     printf("umount default=%d\n", mt_result(umount2(m2, 0)));
     /* mount's checks. */
     printf("null-type=%d unknown-type=%d bad-option=%d flag-value=%d missing=%d not-dir=%d nouser=%d\n",

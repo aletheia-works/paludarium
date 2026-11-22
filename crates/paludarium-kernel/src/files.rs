@@ -208,8 +208,10 @@ impl Space {
 /// Tells the machine's fanotify of each mount of `table`, and of every
 /// table copied from it, that is freed ([`crate::fanotify::Registry::unmounted`]),
 /// as Linux's `cleanup_mnt` calls `fsnotify_vfsmount_delete`, and its
-/// inotify of each superblock that goes ([`crate::inotify::Notifier::unmounted`]),
-/// as `generic_shutdown_super` calls `fsnotify_sb_delete`.
+/// inotify and fanotify of each superblock that goes
+/// ([`crate::inotify::Notifier::unmounted`],
+/// [`crate::fanotify::Registry::superblock_gone`]), as
+/// `generic_shutdown_super` calls `fsnotify_sb_delete`.
 fn released_to_notifiers(
     table: &paludarium_vfs::MountTable,
     caches: &Arc<crate::page_cache::PageCaches>,
@@ -224,6 +226,7 @@ fn released_to_notifiers(
     table.set_superblock_hook(Some(Arc::new(move |device| {
         if let Some(notify) = notify.upgrade() {
             notify.unmounted(device);
+            notify.fan.superblock_gone(device);
         }
     })));
     mounts_to_fanotify(table, caches, crate::namespaces::FIRST_MOUNT_INODE);

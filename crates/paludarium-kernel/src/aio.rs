@@ -171,6 +171,13 @@ impl Limits {
     /// on, whichever process makes a call.
     fn watch(&self, ring: &Arc<Ring>) {
         let mut waiting = lock(&self.waiting);
+        // Ended contexts go here too, so that the list stays as long as the
+        // live contexts even while no poll waits and `watched` is not asked.
+        waiting.retain(|known| {
+            known
+                .upgrade()
+                .is_some_and(|known| !known.dead.load(Ordering::SeqCst))
+        });
         if !waiting
             .iter()
             .any(|known| std::ptr::eq(known.as_ptr(), Arc::as_ptr(ring)))

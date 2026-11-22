@@ -565,6 +565,12 @@ verified.
     where Linux copies no page table of a VMA without an `anon_vma`
     (`-ENOENT` until the child touches the page): the loader's copy is
     the only one the page has here.
+  - A program's ELF segments are backed by the bytes the loader read at
+    `execve`. The program's own file cannot be written while it runs
+    (`ETXTBSY`), but Linux gives its interpreter's back for writing once it
+    is loaded: a later write to that file is not seen in a segment page
+    nothing wrote yet, and a page past the end at `execve` stays `SIGBUS`
+    when the file grows, where Linux maps both from the page cache.
   - A fault of a `memfd_secret` page takes the faulting process's
     `RLIMIT_MEMLOCK` as of its last system call (its creator's before
     one), and the pages count only `memfd_secret` files and `io_uring`'s

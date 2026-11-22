@@ -8135,7 +8135,8 @@ mod madvise_advice {
         assert_eq!(f.ret(28, &[BASE, HUGE, 15]), 0);
         assert_eq!(f.ret(28, &[BASE, PAGE, 25]), errno(Errno::EINVAL));
         assert_eq!(f.ret(28, &[BASE + HUGE, PAGE, 25]), 0);
-        // Too small a VMA, shared memory and a file's are refused.
+        // Too small a VMA is refused, and shared memory whose address is
+        // out of step with its file offsets (0 at its start).
         let small = f.ret(mmap, &[0, HUGE, 3, 0x22, u64::MAX, 0]);
         f.mem.write(GuestAddr(small), &[1]).unwrap();
         let aligned = small & (HUGE - 1) == 0;
@@ -8145,7 +8146,11 @@ mod madvise_advice {
         );
         let shared = f.ret(mmap, &[0, 2 * HUGE, 3, 0x21, u64::MAX, 0]);
         f.mem.write(GuestAddr(shared), &[1]).unwrap();
-        assert_eq!(f.ret(28, &[shared, PAGE, 25]), errno(Errno::EINVAL));
+        let aligned = shared & (HUGE - 1) == 0;
+        assert_eq!(
+            f.ret(28, &[shared, PAGE, 25]),
+            if aligned { 0 } else { errno(Errno::EINVAL) }
+        );
     }
     #[test]
     fn collapse_of_a_registered_range_wants_every_page() {

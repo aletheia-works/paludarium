@@ -116,6 +116,11 @@ pub struct LoadedImage {
     /// them: the highest address and the highest end in the file of all its
     /// `PT_LOAD` segments.
     pub data: (u64, u64),
+    /// Whether the exec fails after its point of no return, which ends the
+    /// process by SIGSEGV as Linux's `bprm_execve` does: a writable segment
+    /// whose bss starts within a page wholly past the end of the file cut
+    /// short, which `padzero` cannot clear (`EFAULT`).
+    pub fails: bool,
 }
 
 /// The entries of [`LoadedImage::auxv`], `AT_NULL`'s with them.
@@ -188,6 +193,8 @@ struct SegmentFile {
     identity: (u64, u64),
     /// Kept as long as the mappings ([`Keep`]).
     _keep: Option<Keep>,
+    /// The file's size: a page wholly past it raises SIGBUS.
+    size: u64,
 }
 impl PageSource for SegmentFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -206,6 +213,27 @@ impl PageSource for SegmentFile {
     fn identity(&self) -> (u64, u64) {
         self.identity
     }
+    fn size(&self) -> Option<u64> {
+        Some(self.size)
+    }
+}
+
+/// Whether Linux's `padzero` faults on segment `h` mapped at `start`: the
+/// segment is writable (a fault of another is ignored) and its bss starts
+/// within a page, which lies wholly past the end of a file of `size` bytes.
+fn padzero_faults(h: &ProgramHeader, start: u64, size: u64) -> bool {
+    let head = start % PAGE_SIZE;
+    // The page's offset in the file, as `elf_map` maps the segment from
+    // `p_offset` less the start's offset in its page.
+    let page = h
+        .offset
+        .wrapping_sub(head)
+        .wrapping_add((head + h.filesz) & !(PAGE_SIZE - 1));
+    h.filesz != 0
+        && h.memsz > h.filesz
+        && h.flags & elf::PF_W != 0
+        && !start.wrapping_add(h.filesz).is_multiple_of(PAGE_SIZE)
+        && page >= size.div_ceil(PAGE_SIZE) * PAGE_SIZE
 }
 
 /// Places the `PT_LOAD` segments, as Linux's binfmt_elf does: the pages that
@@ -213,7 +241,10 @@ impl PageSource for SegmentFile {
 /// (bss) anonymous memory. A segment remembers its file pages, so that
 /// `MADV_DONTNEED` reads them again, also a read-only one that `mprotect`
 /// made writable and that was written, at its offset in the file `name`.
-/// Returns the load base and the end of the highest segment.
+/// A segment's data past the end of a file cut short is not there: its
+/// pages wholly past the end raise SIGBUS. Returns the load base, the end
+/// of the highest segment, and whether a segment's `padzero` faults
+/// ([`LoadedImage::fails`]).
 fn map_segments(
     bytes: &[u8],
     name: Option<&[u8]>,
@@ -222,13 +253,15 @@ fn map_segments(
     mem: &mut AddressSpace,
     dynamic_base: u64,
     keep: Option<&Keep>,
-) -> Result<(u64, u64), LoadError> {
+) -> Result<(u64, u64, bool), LoadError> {
     let base = if info.kind == elf::ET_DYN {
         dynamic_base
     } else {
         0
     };
     let mut highest = 0u64;
+    let mut fails = false;
+    let size = bytes.len() as u64;
     let file = loaded_span(bytes, info);
     let name: Option<Arc<[u8]>> = name.map(Arc::from);
     for h in info.loads() {
@@ -274,10 +307,10 @@ fn map_segments(
         } else {
             let from = usize::try_from(h.offset).map_err(|_| LoadError::TooLarge)?;
             let len = usize::try_from(h.filesz).map_err(|_| LoadError::TooLarge)?;
-            bytes
-                .get(from..from + len)
-                .ok_or(LoadError::Malformed("segment out of range"))?
+            let from = from.min(bytes.len());
+            &bytes[from..from.saturating_add(len).min(bytes.len())]
         };
+        fails |= padzero_faults(h, start, size);
         // The rest of the segment (bss) stays zero: fresh pages read as zero.
         mem.write_initial(GuestAddr(start), data)
             .map_err(|_| LoadError::Errno(Errno::EFAULT))?;
@@ -291,6 +324,7 @@ fn map_segments(
                 name: name.clone(),
                 identity,
                 _keep: keep.cloned(),
+                size,
             };
             mem.back_with_file(
                 page_start,
@@ -302,7 +336,7 @@ fn map_segments(
         }
         highest = highest.max(end);
     }
-    Ok((base, highest))
+    Ok((base, highest, fails))
 }
 
 /// The part of the executable that its segments' file pages lie in, and its
@@ -649,7 +683,8 @@ fn load_image(
         })
     };
     let own = name.map_or((0, 0), identity);
-    let (base, highest) = map_segments(bytes, name, own, &info, mem, STATIC_PIE_BASE, None)?;
+    let (base, highest, mut fails) =
+        map_segments(bytes, name, own, &info, mem, STATIC_PIE_BASE, None)?;
     let initial_break = GuestAddr(highest)
         .page_align_up()
         .ok_or(LoadError::Malformed("segment address overflow"))?;
@@ -666,7 +701,7 @@ fn load_image(
             Some(base) => interpreter_low(&parsed, mem, base)?,
             None => interpreter_base(&parsed, top)?,
         };
-        let (at, _) = map_segments(
+        let (at, _, interpreter_fails) = map_segments(
             &file,
             Some(&path),
             identity(&path),
@@ -677,6 +712,7 @@ fn load_image(
         )?;
         entry_point = GuestAddr(at.wrapping_add(parsed.entry));
         interpreter_at = at;
+        fails |= interpreter_fails;
     }
     let mut image = LoadedImage {
         entry_point,
@@ -690,6 +726,7 @@ fn load_image(
         auxv: [(0, 0); AUXV_ENTRIES],
         code: code_range(&info, base),
         data: data_range(&info, base),
+        fails,
     };
     let (stack, auxv) = build_stack(mem, start, &image)?;
     image.initial_stack_pointer = GuestAddr(stack);

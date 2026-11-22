@@ -334,7 +334,10 @@ those versions through `decmpfs`, which pins `zstd` exactly, so aube cannot
 update them. The advisory exceptions go once a `decmpfs` release takes `zstd`
 0.14 ([SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)):
 an exception that no crate matches fails the audit, so the aube bump that no
-longer needs them cannot merge until they are removed.
+longer needs them cannot merge until they are removed. aube also has, for now,
+RUSTSEC-2026-0592 against `url` 2.5.8, which aube 2.10.0's `Cargo.lock` gets
+through `hickory-net`, `hickory-resolver` and `reqwest`. `url` 2.5.9 fixes it,
+and the exception goes once the pinned aube release locks `url` 2.5.9 or later.
 `tests/guests/programs/evidence.py` lists every exception, and `source-lock.json`
 names them with the exact crate versions.
 

@@ -377,6 +377,20 @@ pub enum Fast {
         src: Register,
         size: u8,
     },
+    /// `movd` (`size` 4) or `movq` (8) of memory into an xmm register: the
+    /// bytes zero-extended into the whole register.
+    XmmLoadScalar {
+        dst: u8,
+        mem: Address,
+        size: u8,
+    },
+    /// `movd` (`size` 4) or `movq` (8) of an xmm register into memory: its
+    /// low `size` bytes.
+    XmmStoreScalar {
+        mem: Address,
+        src: u8,
+        size: u8,
+    },
     /// `cmpxchg [m], r`, with `lock` or without: one atomic compare and
     /// exchange of memory with rax, as [`Exec::cmpxchg`] does.
     CmpxchgStore {
@@ -728,6 +742,16 @@ impl Fast {
                     }
                     _ => None,
                 };
+                let sized = |o: Option<Operand>| address(o).filter(|mem| mem.size == size);
+                match (xmm(a), sized(b), sized(a), xmm(b)) {
+                    (Some(dst), Some(mem), _, _) => {
+                        return Some(Self::XmmLoadScalar { dst, mem, size });
+                    }
+                    (_, _, Some(mem), Some(src)) => {
+                        return Some(Self::XmmStoreScalar { mem, src, size });
+                    }
+                    _ => {}
+                }
                 let (dst, src) = (scalar(a)?, scalar(b)?);
                 if !matches!(dst, Register::Xmm(_)) && !matches!(src, Register::Xmm(_)) {
                     return None;
@@ -1191,6 +1215,16 @@ pub(crate) fn execute(
         Fast::MoveScalar { dst, src, size } => {
             let v = x.read_reg(src) & size_mask(size);
             x.write_reg(dst, v);
+            next
+        }
+        Fast::XmmLoadScalar { dst, mem, size } => {
+            let v = x.load(x.fast_linear(&mem), size)?;
+            x.s.xmm[usize::from(dst)] = u128::from(v & size_mask(size));
+            next
+        }
+        Fast::XmmStoreScalar { mem, src, size } => {
+            let v = x.s.xmm[usize::from(src)] as u64 & size_mask(size);
+            x.store(x.fast_linear(&mem), size, v)?;
             next
         }
         Fast::Imul { dst, a, b } => {

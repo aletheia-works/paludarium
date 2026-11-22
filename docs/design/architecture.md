@@ -131,8 +131,9 @@ out:
 - `mul` and `imul` of a register into rdx:rax, `div` and `idiv` of rdx:rax by a
   register, and `imul` of two registers or of a register and an immediate;
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
-  registers and memory, `pxor` and `xorps` of xmm registers, and `movd` and
-  `movq` between xmm registers and general ones;
+  registers and memory, `pxor` and `xorps` of xmm registers, `movd` and `movq`
+  between xmm registers and general ones or memory, and `movq` between xmm
+  registers;
 - `pshufd`, `pshuflw`, `pshufhw`, the `punpckl` and `punpckh` unpacks,
   `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`,
   `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` and `pcmpeqd` of xmm

@@ -1729,6 +1729,22 @@ impl Emitter<'_, '_> {
                     r => self.write(r, v),
                 }
             }
+            Fast::XmmLoadScalar { dst, mem, size } => {
+                let address = self.linear(&mem);
+                let (v, status) = self.load(address, size);
+                self.unless_failed(status, n, rip);
+                let zero = self.constant(0);
+                self.set_word(XMM + 2 * usize::from(dst), v);
+                self.set_word(XMM + 2 * usize::from(dst) + 1, zero);
+            }
+            Fast::XmmStoreScalar { mem, src, size } => {
+                let v = self.word(XMM + 2 * usize::from(src));
+                let v = self.masked(v, size);
+                let address = self.linear(&mem);
+                let status = self.store(address, size, v);
+                self.unless_failed(status, n, rip);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::Imul { dst, a, b } => {
                 let size = dst.size();
                 let a = self.read(a);

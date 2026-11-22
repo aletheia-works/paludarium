@@ -852,6 +852,9 @@ pub(crate) struct Status<'a> {
     /// has its memory does not show either.
     pub resident: Option<(u64, u64)>,
     pub threads: usize,
+    /// The times the task went to sleep (Linux's `nvcsw`): nothing
+    /// preempts a guest thread, so its involuntary switches are 0.
+    pub switches: u64,
     pub queued: usize,
     pub queue_limit: u64,
     pub pending: u64,
@@ -929,7 +932,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
          CapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n\
          NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n\
-         voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
+         voluntary_ctxt_switches:\t{}\nnonvoluntary_ctxt_switches:\t0\n",
         s.parent,
         s.tracer,
         uid(c.uid),
@@ -956,6 +959,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         u8::from(s.no_new_privs),
         s.seccomp.0,
         s.seccomp.1,
+        s.switches,
     )
     .into_bytes()
 }
@@ -2453,6 +2457,7 @@ mod tests {
             locked: Some(3),
             resident: Some((9, 5)),
             threads: 2,
+            switches: 7,
             queued: 1,
             queue_limit: 4096,
             pending: 1 << 9,
@@ -2498,6 +2503,7 @@ mod tests {
             "CapBnd:\t0000000000000fff\n",
             "CapAmb:\t0000000000000002\n",
             "NoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n",
+            "voluntary_ctxt_switches:\t7\nnonvoluntary_ctxt_switches:\t0\n",
         ] {
             assert!(text.contains(line), "{line:?} in {text}");
         }

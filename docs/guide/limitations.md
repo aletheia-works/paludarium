@@ -119,16 +119,14 @@ verified.
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
   so not counted.
-  `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
-  Linux has the stop's signal until the tracer's wait. After a leader's
-  `exit`, while its process's other threads run, the leader's directory
-  under `task` is `ENOENT`, where Linux shows it as a zombie. `/proc/stat` counts all CPU time as
-  user time, as `getrusage` does, each thread's to the CPU it was on at its
-  system calls, and none as idle; it counts no interrupts or softirqs, and
-  as context switches only the times threads went to sleep, as nothing
-  preempts a guest thread. A thread's `stat` gives its process's CPU time, and
-  another process's thread is `S (sleeping)` in every wait, where Linux
-  shows some waits it cannot interrupt as `D (disk sleep)`. A thread shows another process
+  `/proc/stat` counts all CPU time as user time, as `getrusage` does, each
+  thread's to the CPU it was on at its system calls, and none as idle; it
+  counts no interrupts or softirqs, and as context switches only the times
+  threads went to sleep, as nothing preempts a guest thread, so `status`
+  shows those as `voluntary_ctxt_switches` and 0 as
+  `nonvoluntary_ctxt_switches`. Another process's thread is
+  `S (sleeping)` in every wait, where Linux shows some waits it cannot
+  interrupt as `D (disk sleep)`. A thread shows another process
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
   only while the thread is stopped in it. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing

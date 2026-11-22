@@ -3483,7 +3483,12 @@ kernel.
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
   has the same files but `task`, of that thread: its name, its signal masks,
-  and its ID as `Pid` with the process's as `Tgid`. `/proc/thread-self` is a
+  its ID as `Pid` with the process's as `Tgid`, and its own
+  `voluntary_ctxt_switches` (the times it went to sleep; the process's
+  `status` shows the leader's, as Linux's `task_context_switch_counts`). A
+  leader that ended before the other threads stays first in `task` as a
+  zombie, `Z` in its `stat` and `status`, and `Threads` and `num_threads`
+  count it until the process ends, as Linux keeps a delayed group leader. `/proc/thread-self` is a
   link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
@@ -3603,7 +3608,8 @@ kernel.
   (as Linux's `task_cpu` is the one it last ran on; `getcpu` looks at the
   mask again at once, so after `sched_setaffinity` `stat` follows from the
   task's next system call), and the real-time priority and policy. A path under
-  `task` gives the thread's own; the process's are its leader's. What
+  `task` gives the thread's own, its CPU time and minor faults too; the
+  process's CPU time and faults are all its threads', the rest its leader's. What
   nothing measures is 0: major faults, and the system time, as all the CPU
   time counts as the user's.
   A reader that may not see the task's memory, as Linux's
@@ -3614,6 +3620,10 @@ kernel.
   ended (its code times 256, or its signal, with 0x80 for a core dumped), and
   a stopped process's signal in its own `stat` until a wait reports the stop
   (Linux's `group_exit_code`); a thread's `stat` under `task` has no stop's.
+  A task in a ptrace stop shows that stop's `exit_code` (its signal, or
+  `SIGTRAP | 0x80` for a syscall stop under `PTRACE_O_TRACESYSGOOD`), its
+  process's `stat` too for the leader, until the tracer's wait reports it
+  (one with `WNOWAIT` does not), as Linux's `ptrace_stop` sets it.
   A process whose leader ends with `exit` before its other threads shows the
   leader's own code in its `stat` while they run, as Linux's leader
   `exit_code` is; once they end it has the status of the last one's `exit`,

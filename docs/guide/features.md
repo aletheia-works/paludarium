@@ -5110,7 +5110,8 @@ kernel.
   tmpfs (whose dentries stay) that no open description, working
   directory, running program, inotify watch or mark without
   `FAN_MARK_EVICTABLE` holds, and that no open is on its way to (from its
-  path lookup on, as the lookup's dentry reference keeps Linux's inode).
+  path lookup on, a FIFO's wait for its other end too, as the lookup's
+  dentry reference keeps Linux's inode).
   A use made while the eviction looks keeps the mark too. Exec's open of the
   program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
   as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as

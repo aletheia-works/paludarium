@@ -58,6 +58,10 @@ pub(crate) fn open(
     node: &FileStat,
     flags: u32,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
+    // The node the lookup found stays in use while the open waits for the
+    // other end, until the kernel keeps its open of it
+    // ([`crate::page_cache::PageCaches::looked_up`]).
+    let _lookup = c.files.caches.looked_up(key, node);
     let description = join(c, key, node, flags)?;
     if let Some(closing) =
         crate::inotify::Closing::opened(&c.files.caches, &c.files.fs(), path, key.0, node, flags)

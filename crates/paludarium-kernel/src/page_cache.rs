@@ -360,6 +360,13 @@ impl PageCaches {
         hold.pin = fs.mount_pin(&path);
         Some(hold)
     }
+    /// What keeps file `key`, of status `stat`, that an open's lookup found,
+    /// until the open is listed or fails, as the lookup's dentry reference
+    /// keeps Linux's inode from `evict`: none while fanotify has no mark,
+    /// or for a directory, whose marks are never evicted here.
+    pub(crate) fn looked_up(self: &Arc<Self>, key: Key, stat: &FileStat) -> Option<Hold> {
+        (self.notify.fan.active() && stat.mode & 0o170000 != 0o040000).then(|| self.hold_of(key))
+    }
     fn hold_of(self: &Arc<Self>, key: Key) -> Hold {
         let use_ = self.notify.fan.using();
         *self
@@ -1340,8 +1347,10 @@ impl HostFs for CoherentFs {
             self.inner
                 .metadata(path, flags & O_NOFOLLOW == 0)
                 .ok()
-                .filter(|stat| stat.mode & 0o170000 == REGULAR)
-                .map(|stat| self.caches.hold_of((self.inner.device(path), stat.inode)))
+                .and_then(|stat| {
+                    self.caches
+                        .looked_up((self.inner.device(path), stat.inode), &stat)
+                })
         } else {
             None
         };

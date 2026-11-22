@@ -59,6 +59,19 @@ macro_rules! mnemonics {
             MovsdSse,
             /// Legacy scalar-double compare (distinct from string CMPSD).
             CmpsdSse,
+            /// `mov` to a segment register (8E): operand 0 is a
+            /// [`Register::Segment`], operand 1 the 16-bit selector.
+            MovToSegment,
+            /// `mov` from a segment register (8C): operand 0 takes the
+            /// selector (a 16-bit store, or a register zero-extended to its
+            /// size), operand 1 is a [`Register::Segment`].
+            MovFromSegment,
+            /// `push %fs` and `push %gs` (0F A0, 0F A8), of
+            /// `implicit_size` bytes.
+            PushSegment,
+            /// `pop %fs` and `pop %gs` (0F A1, 0F A9), of `implicit_size`
+            /// bytes.
+            PopSegment,
             Jcc(Condition),
             Setcc(Condition),
             Cmovcc(Condition),
@@ -499,6 +512,33 @@ fn map_mnemonic(insn: &iced::Instruction) -> Option<Mnemonic> {
     if insn.code() == iced::Code::Cmpsd_xmm_xmmm64_imm8 {
         return Some(Mnemonic::CmpsdSse);
     }
+    {
+        use iced::Code as C;
+        match insn.code() {
+            C::Mov_Sreg_rm16 | C::Mov_Sreg_r32m16 | C::Mov_Sreg_r64m16 => {
+                return Some(Mnemonic::MovToSegment);
+            }
+            C::Mov_rm16_Sreg | C::Mov_r32m16_Sreg | C::Mov_r64m16_Sreg => {
+                return Some(Mnemonic::MovFromSegment);
+            }
+            C::Pushw_FS | C::Pushq_FS | C::Pushw_GS | C::Pushq_GS => {
+                return Some(Mnemonic::PushSegment);
+            }
+            C::Popw_FS | C::Popq_FS | C::Popw_GS | C::Popq_GS => {
+                return Some(Mnemonic::PopSegment);
+            }
+            // Far jumps and calls through memory load CS, which the
+            // virtual CPU does not: unsupported, not the near forms iced
+            // also names `jmp` and `call`.
+            C::Jmp_m1616
+            | C::Jmp_m1632
+            | C::Jmp_m1664
+            | C::Call_m1616
+            | C::Call_m1632
+            | C::Call_m1664 => return None,
+            _ => {}
+        }
+    }
     // Non-temporal is only a hint about the cache.
     if m == M::Movnti {
         return Some(Mnemonic::Mov);
@@ -585,6 +625,9 @@ pub enum Register {
     Xmm(u8),
     /// st(0) ..= st(7), from the top of the x87 stack.
     St(u8),
+    /// A segment register by its `sreg` number: 0 es, 1 cs, 2 ss, 3 ds,
+    /// 4 fs, 5 gs. Only the segment mnemonics have one.
+    Segment(u8),
 }
 
 impl Register {
@@ -596,6 +639,7 @@ impl Register {
             Register::GprHigh8 { .. } => 1,
             Register::Xmm(_) => 16,
             Register::St(_) => 10,
+            Register::Segment(_) => 2,
         }
     }
 }
@@ -731,6 +775,10 @@ fn map_register(r: iced::Register) -> Option<Register> {
     } else if r.is_st() {
         Some(Register::St(
             (r as u8).wrapping_sub(iced::Register::ST0 as u8),
+        ))
+    } else if r.is_segment_register() {
+        Some(Register::Segment(
+            (r as u8).wrapping_sub(iced::Register::ES as u8),
         ))
     } else {
         None
@@ -928,6 +976,19 @@ pub fn decode(bytes: &[u8], rip: GuestAddr) -> Result<Instruction, DecodeError> 
                     }
                 }
             },
+            Mnemonic::PushSegment | Mnemonic::PopSegment => {
+                if matches!(
+                    insn.code(),
+                    iced::Code::Pushw_FS
+                        | iced::Code::Pushw_GS
+                        | iced::Code::Popw_FS
+                        | iced::Code::Popw_GS
+                ) {
+                    2
+                } else {
+                    8
+                }
+            }
             Mnemonic::Pushfq | Mnemonic::Popfq => 8,
             Mnemonic::Pushf | Mnemonic::Popf => 2,
             Mnemonic::Leave => {
@@ -1093,6 +1154,66 @@ mod tests {
             decode(&[0x0f, 0xfc, 0xc1], rip),
             Err(DecodeError::Unsupported)
         );
+    }
+
+    #[test]
+    fn segment_register_moves_decode_with_their_sreg() {
+        let seg = |n| Some(Operand::Register(Register::Segment(n)));
+        // mov ds, eax (8e d8), of which the low 16 bits load; mov fs, [rax]
+        // (8e 20); mov ss, r9d (41 8e d1)
+        let i = decode(&[0x8e, 0xd8], RIP).unwrap();
+        assert_eq!(i.mnemonic, Mnemonic::MovToSegment);
+        assert_eq!((i.operand(0), i.operand(1)), (seg(3), Some(gpr(0, 4))));
+        let i = decode(&[0x8e, 0x20], RIP).unwrap();
+        assert_eq!(i.operand(0), seg(4));
+        assert!(matches!(i.operand(1), Some(Operand::Memory(m)) if m.size == 2));
+        let i = decode(&[0x41, 0x8e, 0xd1], RIP).unwrap();
+        assert_eq!(i.operand(0), seg(2));
+        // mov eax, gs (8c e8); mov rax, es (48 8c c0); mov [rax], cs (8c 08)
+        let i = decode(&[0x8c, 0xe8], RIP).unwrap();
+        assert_eq!(i.mnemonic, Mnemonic::MovFromSegment);
+        assert_eq!((i.operand(0), i.operand(1)), (Some(gpr(0, 4)), seg(5)));
+        let i = decode(&[0x48, 0x8c, 0xc0], RIP).unwrap();
+        assert_eq!((i.operand(0), i.operand(1)), (Some(gpr(0, 8)), seg(0)));
+        let i = decode(&[0x8c, 0x08], RIP).unwrap();
+        assert!(matches!(i.operand(0), Some(Operand::Memory(m)) if m.size == 2));
+        assert_eq!(i.operand(1), seg(1));
+        // push fs, pushw gs, pop gs, popw fs.
+        for (bytes, mnemonic, sreg, size) in [
+            (&[0x0f, 0xa0][..], Mnemonic::PushSegment, 4, 8),
+            (&[0x66, 0x0f, 0xa8], Mnemonic::PushSegment, 5, 2),
+            (&[0x0f, 0xa9], Mnemonic::PopSegment, 5, 8),
+            (&[0x66, 0x0f, 0xa1], Mnemonic::PopSegment, 4, 2),
+        ] {
+            let i = decode(bytes, RIP).unwrap();
+            assert_eq!((i.mnemonic, i.operand(0)), (mnemonic, seg(sreg)));
+            assert_eq!(i.implicit_size, size);
+        }
+        // Segment registers 6 and 7 do not exist, and mov to cs is #UD.
+        assert_eq!(decode(&[0x8e, 0xf0], RIP), Err(DecodeError::Invalid));
+        assert_eq!(decode(&[0x8c, 0xf8], RIP), Err(DecodeError::Invalid));
+        assert_eq!(decode(&[0x8e, 0xc8], RIP), Err(DecodeError::Invalid));
+    }
+
+    #[test]
+    fn far_jumps_and_calls_are_unsupported_and_near_ones_are_not() {
+        // ljmp *(%rax), lcall *(%rax), rex.w ljmp *(%rax), lret.
+        for bytes in [
+            &[0xff, 0x28][..],
+            &[0xff, 0x18],
+            &[0x48, 0xff, 0x28],
+            &[0x66, 0xff, 0x18],
+            &[0xcb],
+        ] {
+            assert_eq!(
+                decode(bytes, RIP),
+                Err(DecodeError::Unsupported),
+                "{bytes:x?}"
+            );
+        }
+        // jmp *(%rax), call *(%rax).
+        assert_eq!(decode(&[0xff, 0x20], RIP).unwrap().mnemonic, Mnemonic::Jmp);
+        assert_eq!(decode(&[0xff, 0x10], RIP).unwrap().mnemonic, Mnemonic::Call);
     }
 
     #[test]

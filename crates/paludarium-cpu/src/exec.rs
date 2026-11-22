@@ -7,6 +7,7 @@ use paludarium_mmu::{AddressSpace, AtomicOp, AtomicWidth, Fault};
 use paludarium_types::GuestAddr;
 
 use crate::alu::{self, ShiftKind, sign_extend, size_mask};
+use crate::segments::{self, SegmentFault};
 use crate::softfloat::{F32, F64};
 use crate::state::{CpuState, FX_WRITTEN, flag, reg};
 use crate::x87::{
@@ -23,6 +24,8 @@ pub(crate) enum Stop {
     Invalid,
     Halt,
     GeneralProtection,
+    /// A segment-register load the CPU refused.
+    Segment(SegmentFault),
     ArithmeticFault,
     FloatingPointFault(u8),
     /// An unmasked x87 exception found pending: the `si_code` Linux gives.
@@ -162,6 +165,10 @@ pub(crate) fn keeps_vector_state(i: &Instruction) -> bool {
             | Mnemonic::Leave
             | Mnemonic::Nop
             | Mnemonic::Endbr64
+            | Mnemonic::MovToSegment
+            | Mnemonic::MovFromSegment
+            | Mnemonic::PushSegment
+            | Mnemonic::PopSegment
     );
     general
         && !i
@@ -202,7 +209,11 @@ pub(crate) fn fails_cleanly(i: &Instruction) -> bool {
         | Mnemonic::Setcc(_)
         | Mnemonic::Cmovcc(_)
         | Mnemonic::Nop
-        | Mnemonic::Endbr64 => true,
+        | Mnemonic::Endbr64
+        | Mnemonic::MovToSegment
+        | Mnemonic::MovFromSegment
+        | Mnemonic::PushSegment
+        | Mnemonic::PopSegment => true,
         Mnemonic::Pop => matches!(i.operand(0), Some(Operand::Register(_))),
         _ => false,
     }
@@ -259,6 +270,11 @@ impl Exec<'_> {
             Register::Xmm(n) => self.s.xmm[usize::from(n & 15)] as u64,
             // Only `Exec::x87` has these, and it reads them itself.
             Register::St(_) => 0,
+            Register::Segment(n) => self
+                .s
+                .segments
+                .get(usize::from(n))
+                .map_or(0, |&selector| u64::from(selector)),
         }
     }
 
@@ -278,7 +294,8 @@ impl Exec<'_> {
                 *slot = (*slot & !0xff00) | ((value & 0xff) << 8);
             }
             Register::Xmm(n) => self.s.xmm[usize::from(n & 15)] = u128::from(value),
-            Register::St(_) => {}
+            // Only `Exec::load_segment` loads one, with its checks.
+            Register::St(_) | Register::Segment(_) => {}
         }
     }
 
@@ -353,6 +370,51 @@ impl Exec<'_> {
 
     fn set_status(&mut self, update: u64, value: u64) {
         self.s.rflags = (self.s.rflags & !update) | (value & update);
+    }
+
+    /// The `sreg` number of a segment-register operand.
+    fn segment_number(o: Operand) -> Result<usize> {
+        match o {
+            Operand::Register(Register::Segment(n)) if usize::from(n) <= segments::GS => {
+                Ok(usize::from(n))
+            }
+            _ => Err(Stop::Invalid),
+        }
+    }
+
+    /// Loads `selector` into segment register `sreg`, with the checks of
+    /// [`segments::load`] against the address space's LDT. CS cannot be
+    /// loaded this way (#UD).
+    fn load_segment(&mut self, sreg: usize, selector: u16) -> Result<()> {
+        if sreg == segments::CS {
+            return Err(Stop::Invalid);
+        }
+        let ldt = self
+            .mem
+            .ldt()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        segments::load(self.s, sreg, selector, &ldt).map_err(Stop::Segment)
+    }
+
+    /// `mov` to a segment register: the low 16 bits of a register, or a
+    /// 16-bit load, whatever the operand size.
+    fn mov_to_segment(&mut self) -> Result<()> {
+        let sreg = Self::segment_number(op(self.i, 0)?)?;
+        let selector = self.read(op(self.i, 1)?, 2)? as u16;
+        self.load_segment(sreg, selector)
+    }
+
+    /// `pop %fs` and `pop %gs`: the stack pointer moves only once the
+    /// selector has loaded.
+    fn pop_segment(&mut self) -> Result<()> {
+        let sreg = Self::segment_number(op(self.i, 0)?)?;
+        let size = self.i.implicit_size;
+        let rsp = self.s.gpr[reg::RSP];
+        let selector = self.load(GuestAddr(rsp), size)? as u16;
+        self.load_segment(sreg, selector)?;
+        self.s.gpr[reg::RSP] = rsp.wrapping_add(u64::from(size));
+        Ok(())
     }
 
     fn push(&mut self, value: u64, size: u8) -> Result<()> {
@@ -2213,6 +2275,21 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
             let v = x.pop(size)?;
             x.write(op(i, 0)?, size, v)?;
         }
+        Mnemonic::MovToSegment => x.mov_to_segment()?,
+        // A register takes the selector zero-extended to its size, as the
+        // CPUs since the Pentium Pro do; memory takes 16 bits.
+        Mnemonic::MovFromSegment => {
+            let destination = op(i, 0)?;
+            let selector = x.read(op(i, 1)?, 2)?;
+            x.write(destination, Exec::size_of(destination, None), selector)?;
+        }
+        // The selector zero-extended, as the SDM gives a 64-bit push of a
+        // segment register.
+        Mnemonic::PushSegment => {
+            let selector = x.read(op(i, 0)?, 2)?;
+            x.push(selector, i.implicit_size)?;
+        }
+        Mnemonic::PopSegment => x.pop_segment()?,
         Mnemonic::Pushfq | Mnemonic::Pushf => {
             let v = x.s.rflags & !(flag::RF | flag::VM);
             x.push(v, i.implicit_size)?;

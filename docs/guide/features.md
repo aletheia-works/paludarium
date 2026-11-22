@@ -11,6 +11,26 @@ Linux.
   restart after an interruption), `CMPXCHG8B`/`CMPXCHG16B`, BMI
   (`ADCX`/`ADOX`, `ANDN`, `BZHI`, `MULX`, `PEXT`, `RORX`, `SHLX`/`SHRX`),
   `MOVBE`, `ENTER`/`LEAVE` and more.
+- **Segment registers**: `mov` to and from `%ds`, `%es`, `%fs`, `%gs` and
+  `%ss`, and `push` and `pop` of `%fs` and `%gs`, load a selector with the
+  checks of a 64-bit CPU at privilege level 3. It is looked up in Linux's
+  GDT (`__USER32_CS` 0x23, `__USER_DS` 0x2b, `__USER_CS` 0x33 and the CPU
+  number segment 0x7b load; the kernel's segments, the system descriptors
+  and the empty thread-local entries do not) or in the table `modify_ldt`
+  writes. A load the CPU refuses is `SIGSEGV` for #GP, or `SIGBUS` for #NP
+  (#SS for `%ss`), with `SI_KERNEL`, the vector in `trapno` and the
+  selector without its RPL in `err`, as Linux gives them; `mov` to `%cs` is
+  `SIGILL`. A selector that is not null gives `%fs` or `%gs` the 32-bit
+  base of its descriptor, and a null one clears it, as Intel's CPUs and
+  AMD's since Zen 2 do; in 64-bit mode the other segments have no base.
+  `arch_prctl`'s `ARCH_SET_FS` and `ARCH_SET_GS`, `PTRACE_ARCH_PRCTL` and
+  `CLONE_SETTLS` make the selector of the base they set null. A system call
+  gives back `__USER_CS` and `__USER_DS` in `%cs` and `%ss`. A signal frame
+  shows the task's `%ss`, and its handler runs on it while it still loads
+  (`force_valid_ss`); `rt_sigreturn` restores it, and a return to one that
+  no longer loads faults there, as Linux's `iret` does. A fork keeps the
+  selectors, an exec starts with Linux's, and ptrace and core dumps show
+  them.
 - **Hints**: `PAUSE` and the `PREFETCHNTA`/`PREFETCHT0`/`T1`/`T2` prefetches,
   which change nothing and never fault.
 - **Traps**: the trap flag single-steps: with `TF` set, which `popf`,
@@ -1704,7 +1724,10 @@ kernel.
   entry written. Reading (0) gives 0 until something is written, then the
   entries, zero-filled up to the count (at most 64 KiB); 2 reads up to 128
   zero bytes, and other functions give `ENOSYS`. A fork keeps a copy and an
-  exec starts with none. The result is Linux's `int` as an `unsigned int`,
+  exec starts with none. After a write, `%ds` and `%es` load again if they
+  name an entry of the table, and become null if it no longer loads
+  (`refresh_ldt_segments`); the entries load into the segment registers as
+  above. The result is Linux's `int` as an `unsigned int`,
   so an error comes back as, say, `0xffffffea`, not `-EINVAL`.
 
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
@@ -3702,8 +3725,9 @@ kernel.
   else 0).
 
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
-  in Linux's formats: load averages of 0 with the running and live tasks and
-  the last ID handed out; 4 GiB of total, free and available memory and
+  in Linux's formats: load averages of 0 with the running tasks (the threads
+  `/proc/stat`'s `procs_running` counts), the live tasks and the last ID
+  handed out; 4 GiB of total, free and available memory and
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
 
@@ -5627,12 +5651,14 @@ one only with an `--allow-net`.
   `PR_SET_SECCOMP` with 1) allows `read`, `write`, `exit` and `rt_sigreturn`;
   any other call ends the thread by `SIGKILL`, `exit_group` too. Filter mode
   (`SECCOMP_SET_MODE_FILTER`, which needs `no_new_privs` or `CAP_SYS_ADMIN`)
-  adds a classic BPF program, checked as Linux checks one: up to 4096
-  instructions, only the ones seccomp takes (32-bit loads of
-  `struct seccomp_data`, no `mod`), forward jumps inside the program, scratch
-  words written before they are read on every path, and a return at the end,
-  else `EINVAL`; all of a thread's filters may hold 32768 instructions, each
-  counting 4 more (`ENOMEM`). Before each call every filter runs over the
+  adds a classic BPF program, checked as Linux checks one: first as a
+  socket's classic filter is (`bpf_check_classic`), then for the
+  instructions seccomp takes (`seccomp_check_filter`). It has up to 4096
+  instructions, only 32-bit loads of `struct seccomp_data` and no `mod`,
+  forward jumps inside the program, scratch words written before they are
+  read on every path, and a return at the end, else `EINVAL`. All of a
+  thread's filters may hold 32768 instructions, each counting 4 more
+  (`ENOMEM`). Before each call every filter runs over the
   call's number, `AUDIT_ARCH_X86_64`, the address after its `syscall`
   instruction and its six argument registers, whole, and the lowest action
   decides. `SECCOMP_RET_KILL_PROCESS` ends the process by `SIGSYS`, and

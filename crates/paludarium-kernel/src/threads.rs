@@ -2523,8 +2523,11 @@ impl Kernel {
         if a[1] != 0 {
             cpu.gpr[reg::RSP] = a[1];
         }
+        // CLONE_SETTLS: `do_arch_prctl_64`'s ARCH_SET_FS, which also nulls
+        // the fs selector.
         if flags & 0x80000 != 0 {
             cpu.fs_base = a[4];
+            cpu.segments[paludarium_cpu::segments::FS] = 0;
         }
         let mut state = parent.state.clone();
         self.group

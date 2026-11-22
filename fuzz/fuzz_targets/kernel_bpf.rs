@@ -1,9 +1,12 @@
 #![no_main]
 //! BPF socket filters: programs built from the input, loaded with
 //! `BPF_PROG_LOAD`, and those the verifier takes attached to an AF_UNIX
-//! datagram socket and run on a message. The kernel's `fuzzing` feature
-//! makes a load or store of a verified program outside what it points to
-//! panic, so this checks that the verifier and the interpreter agree.
+//! datagram socket and run on a message; or classic programs attached with
+//! `SO_ATTACH_FILTER`, which the kernel checks and converts to eBPF. The
+//! kernel's `fuzzing` feature makes a load or store of a verified or
+//! converted program outside what it points to panic, so this checks that
+//! the checks, the conversion and the interpreter agree. A message is
+//! short, or 20,000 bytes, most of them in pages.
 use libfuzzer_sys::fuzz_target;
 use paludarium_cpu::{CpuState, reg};
 use paludarium_kernel::{Kernel, Thread};
@@ -19,7 +22,11 @@ const OPTION: u64 = MEMORY + 0x308;
 const KEY: u64 = MEMORY + 0x310;
 const VALUE: u64 = MEMORY + 0x320;
 const INSNS: u64 = MEMORY + 0x1000;
+const LENGTH: u64 = MEMORY + 0x330;
 const PACKET: u64 = MEMORY + 0x2000;
+/// A datagram longer than an skb's linear part, which the packet starts.
+const LARGE: usize = 20_000;
+const MAPPED: u64 = 0x2000 + 0x5000;
 const MAX_INSNS: usize = 128;
 
 fn call(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, n: u64, args: [u64; 6]) -> u64 {
@@ -122,11 +129,69 @@ fn program(data: &[u8], maps: [i32; 2]) -> Vec<[u8; 8]> {
     insns
 }
 
+/// The codes Linux's `chk_code_allowed` takes: the ALU operations with K
+/// and X, neg, the loads, the stores, tax and txa, the returns, and the
+/// jumps.
+const CLASSIC_CODES: [u16; 49] = [
+    0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3c, 0x94, 0x9c, 0x54, 0x5c, 0x44, 0x4c, 0xa4, 0xac,
+    0x64, 0x6c, 0x74, 0x7c, 0x84, 0x20, 0x28, 0x30, 0x80, 0x40, 0x48, 0x50, 0x00, 0x60, 0x81, 0xb1,
+    0x01, 0x61, 0x02, 0x03, 0x07, 0x87, 0x06, 0x16, 0x05, 0x15, 0x1d, 0x25, 0x2d, 0x35, 0x3d, 0x45,
+    0x4d,
+];
+
+/// A classic program of `data`, four bytes each: a code, the jumps'
+/// offsets, and a value near an edge (the scratch words, shift counts,
+/// `SKF_AD_OFF` and its ancillary loads, `SKF_NET_OFF`, `SKF_LL_OFF`),
+/// ending in a return.
+fn classic(data: &[u8]) -> Vec<[u8; 8]> {
+    const EDGES: [u32; 12] = [
+        0,
+        1,
+        3,
+        15,
+        16,
+        31,
+        32,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xfff0_0000,
+        0xffe0_0000,
+        u32::MAX,
+    ];
+    let mut insns = Vec::new();
+    for c in data.as_chunks::<4>().0 {
+        if insns.len() + 1 >= MAX_INSNS {
+            break;
+        }
+        let code = CLASSIC_CODES[usize::from(c[0]) % CLASSIC_CODES.len()];
+        let k = match c[3] >> 6 {
+            0 => EDGES[usize::from(c[3]) % EDGES.len()],
+            1 => 0xffff_f000 + u32::from(c[2] % 17) * 4,
+            2 => u32::from(c[2]) + 256 * u32::from(c[3] & 0x3f),
+            _ => (i32::from(c[2] as i8) * 64) as u32,
+        };
+        let mut b = [0; 8];
+        b[..2].copy_from_slice(&code.to_le_bytes());
+        b[2] = c[1] & 7;
+        b[3] = c[1] >> 4 & 7;
+        b[4..].copy_from_slice(&k.to_le_bytes());
+        insns.push(b);
+    }
+    // ret a, or ret k of all.
+    let last = data.last().copied().unwrap_or(0);
+    insns.push(if last & 1 == 0 {
+        [0x16, 0, 0, 0, 0, 0, 0, 0]
+    } else {
+        [6, 0, 0, 0, 0xff, 0xff, 0, 0]
+    });
+    insns
+}
+
 fuzz_target!(|data: &[u8]| {
     let m = AddressSpace::new();
     if m.map_shared(
         Some(GuestAddr(MEMORY)),
-        0x3000,
+        MAPPED,
         Prot::READ_WRITE,
         MappingKind::Anonymous,
     )
@@ -149,26 +214,44 @@ fuzz_target!(|data: &[u8]| {
     let _ = m.write(GuestAddr(ATTR), &update);
     call(&mut k, &mut t, &m, 321, [2, ATTR, 32, 0, 0, 0]);
 
-    let (packet, code) =
-        data.split_at(usize::from(data.first().copied().unwrap_or(0) % 65).min(data.len()));
-    let insns = program(code, [hash, array]);
+    // The first byte: the packet's length, whether the program is
+    // classic, and whether the message is large.
+    let first = data.first().copied().unwrap_or(0);
+    let (packet, code) = data.split_at(usize::from(first % 65).min(data.len()));
+    let is_classic = first & 0x40 != 0;
+    let length = if first & 0x80 != 0 {
+        LARGE
+    } else {
+        packet.len()
+    };
+    let insns = if is_classic {
+        classic(code)
+    } else {
+        program(code, [hash, array])
+    };
     let bytes: Vec<u8> = insns.iter().flatten().copied().collect();
-    let mut attr = [0u8; 168];
-    attr[..4].copy_from_slice(&1u32.to_le_bytes());
-    attr[4..8].copy_from_slice(&(insns.len() as u32).to_le_bytes());
-    attr[8..16].copy_from_slice(&INSNS.to_le_bytes());
-    attr[16..24].copy_from_slice(&LICENSE.to_le_bytes());
-    if m.write(GuestAddr(INSNS), &bytes).is_err()
-        || m.write(GuestAddr(LICENSE), b"GPL\0").is_err()
-        || m.write(GuestAddr(ATTR), &attr).is_err()
-        || m.write(GuestAddr(PACKET), packet).is_err()
-    {
+    if m.write(GuestAddr(INSNS), &bytes).is_err() || m.write(GuestAddr(PACKET), packet).is_err() {
         return;
     }
-    let prog = call(&mut k, &mut t, &m, 321, [5, ATTR, 168, 0, 0, 0]) as i64;
-    if prog < 0 {
-        return;
-    }
+    let prog = if is_classic {
+        0
+    } else {
+        let mut attr = [0u8; 168];
+        attr[..4].copy_from_slice(&1u32.to_le_bytes());
+        attr[4..8].copy_from_slice(&(insns.len() as u32).to_le_bytes());
+        attr[8..16].copy_from_slice(&INSNS.to_le_bytes());
+        attr[16..24].copy_from_slice(&LICENSE.to_le_bytes());
+        if m.write(GuestAddr(LICENSE), b"GPL\0").is_err()
+            || m.write(GuestAddr(ATTR), &attr).is_err()
+        {
+            return;
+        }
+        let prog = call(&mut k, &mut t, &m, 321, [5, ATTR, 168, 0, 0, 0]) as i64;
+        if prog < 0 {
+            return;
+        }
+        prog
+    };
     // socketpair(AF_UNIX, SOCK_DGRAM), the filter on the second end, and a
     // message through it.
     if call(&mut k, &mut t, &m, 53, [1, 2, 0, PAIR, 0, 0]) != 0 {
@@ -180,8 +263,22 @@ fuzz_target!(|data: &[u8]| {
     }
     let a = u64::from(u32::from_le_bytes(fds[..4].try_into().unwrap()));
     let b = u64::from(u32::from_le_bytes(fds[4..].try_into().unwrap()));
-    let _ = m.write(GuestAddr(OPTION), &(prog as u32).to_le_bytes());
-    call(&mut k, &mut t, &m, 54, [b, 1, 50, OPTION, 4, 0]);
+    if is_classic {
+        // SO_ATTACH_FILTER with a struct sock_fprog; one the checks refuse
+        // goes no further. SO_GET_FILTER then gives it back.
+        let mut fprog = [0u8; 16];
+        fprog[..2].copy_from_slice(&(insns.len() as u16).to_le_bytes());
+        fprog[8..].copy_from_slice(&INSNS.to_le_bytes());
+        let _ = m.write(GuestAddr(ATTR), &fprog);
+        if call(&mut k, &mut t, &m, 54, [b, 1, 26, ATTR, 16, 0]) != 0 {
+            return;
+        }
+        let _ = m.write(GuestAddr(LENGTH), &(MAX_INSNS as u32).to_le_bytes());
+        call(&mut k, &mut t, &m, 55, [b, 1, 26, INSNS, LENGTH, 0]);
+    } else {
+        let _ = m.write(GuestAddr(OPTION), &(prog as u32).to_le_bytes());
+        call(&mut k, &mut t, &m, 54, [b, 1, 50, OPTION, 4, 0]);
+    }
     for _ in 0..2 {
         // sendto and recvfrom with MSG_DONTWAIT.
         call(
@@ -189,7 +286,7 @@ fuzz_target!(|data: &[u8]| {
             &mut t,
             &m,
             44,
-            [a, PACKET, packet.len() as u64, 0x40, 0, 0],
+            [a, PACKET, length as u64, 0x40, 0, 0],
         );
         call(&mut k, &mut t, &m, 45, [b, PACKET, 64, 0x40, 0, 0]);
     }

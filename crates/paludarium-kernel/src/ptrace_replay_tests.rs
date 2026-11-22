@@ -2452,8 +2452,12 @@ fn tracer_exit() {
         kids.push(g.fork(move |c| {
             // PR_SET_PTRACER, PR_SET_PTRACER_ANY.
             c.sys(PRCTL, [0x5961_6d61, u64::MAX, 0, 0, 0, 0]).unwrap();
-            c.sys(WRITE, [ready_write, HEAP + 0x790, 1, 0, 0, 0])
-                .unwrap();
+            // The parent may read the byte, and the tracer seize and exit
+            // (or the parent send SIGTERM), before this write returns: the
+            // signal then ends the kid there, as Linux may.
+            if let Err(status) = c.sys(WRITE, [ready_write, HEAP + 0x790, 1, 0, 0, 0]) {
+                return status;
+            }
             loop {
                 if let Err(status) = c.sys(PAUSE, [0; 6]) {
                     return status;

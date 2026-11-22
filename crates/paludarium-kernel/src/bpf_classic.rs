@@ -22,7 +22,7 @@ use crate::bpf_verifier::Insn;
 /// `BPF_MAXINSNS`.
 pub(crate) const MAX_INSNS: usize = 4096;
 /// `BPF_MEMWORDS`.
-const MEMWORDS: u32 = 16;
+pub(crate) const MEMWORDS: u32 = 16;
 /// `SKF_AD_OFF`, where the ancillary loads start.
 const AD_OFF: u32 = -0x1000i32 as u32;
 /// The ancillary loads (`SKF_AD_*`), from [`AD_OFF`].

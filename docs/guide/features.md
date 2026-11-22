@@ -4881,8 +4881,11 @@ kernel.
   jump ("last insn is not an exit or jmp"), and one other than the main
   program has no `BPF_LD_ABS`, `BPF_LD_IND` or `bpf_tail_call` ("LD_ABS
   is not allowed in subprogs without BTF", "tail_call is not allowed in
-  subprogs without BTF", as 7.0 refuses them; master takes them), all
-  `EINVAL` before any path is walked. The callee starts with the caller's
+  subprogs without BTF", as 7.0 refuses them; master takes them), and no
+  function calls itself, directly or through others ("recursive call from
+  () to ()", master's check, as a function has no name without BTF; 7.0
+  refuses one as the walk goes 9 frames deep), all `EINVAL` before any
+  path is walked. The callee starts with the caller's
   R1 to R5 and a frame pointer and 512-byte stack of its own; its R0 and
   R6 to R9 are not readable until written, and the caller's R0 to R5 are
   not readable after the call, which gives it the callee's R0. A callee

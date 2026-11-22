@@ -17,7 +17,10 @@
 //! - master takes an exit whose `src_reg` is `BPF_UNWIND_EXIT`;
 //! - with no BTF, master takes `BPF_LD_ABS`, `BPF_LD_IND` and
 //!   `bpf_tail_call` in a function other than the main program, where 7.0
-//!   refuses them (`check_abnormal_return`).
+//!   refuses them (`check_abnormal_return`);
+//! - master refuses a recursive call before the walk ("recursive call from
+//!   %s() to %s()", `sort_subprogs_topo`), where 7.0 refuses it as the walk
+//!   goes 9 frames deep; the check and its line are master's.
 //!
 //! Every function is static, as no program here has BTF: a call gives the
 //! callee a frame of its own, up to 8 frames, whose stacks add up to 512
@@ -56,10 +59,8 @@
 //!   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
 //!   `fd_array` and maps made with `excl_prog_hash`, BTF IDs and functions
 //!   in `BPF_LD_IMM64` (and so callbacks), `may_goto`, indirect jumps, a
-//!   back-edge (Linux takes a bounded loop from a privileged loader; a
-//!   recursive call is one too, which master refuses as "recursive call
-//!   from %s() to %s()" and 7.0 as "the call stack of 9 frames is too
-//!   deep"), a pointer with a variable offset, and
+//!   back-edge (Linux takes a bounded loop from a privileged loader), a
+//!   pointer with a variable offset, and
 //!   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump.
 //! - The loader has `CAP_BPF` and `CAP_PERFMON` ([`crate::bpf_prog`]
 //!   refuses others), so the verifier allows what Linux allows them:
@@ -540,6 +541,7 @@ fn structure(
         i += fields(insns, i, options, maps, walk)?;
     }
     cfg(insns)?;
+    acyclic(insns, &walk.starts)?;
     // check_attach_btf_id: a socket filter cannot sleep. 7.0's words.
     if options.sleepable {
         return refuse(
@@ -559,6 +561,53 @@ fn structure(
 
 /// `BPF_MAX_SUBPROGS`.
 const MAX_SUBPROGS: usize = 256;
+/// Master's `sort_subprogs_topo`: no function calls itself, directly or
+/// through others. With no BTF a function has no name, so the line is the
+/// same whichever call it finds; 7.0 has no such check and refuses a
+/// recursive call as the walk goes 9 frames deep.
+fn acyclic(insns: &[Insn], starts: &[usize]) -> Checked<()> {
+    let n = starts.len();
+    let callees: Vec<Vec<usize>> = (0..n)
+        .map(|f| {
+            body(starts, insns.len(), f)
+                .filter(|&i| {
+                    insns[i].code == class::JMP | jmp::CALL && insns[i].src == pseudo::CALL
+                })
+                .filter_map(|i| {
+                    let start = (i as i64 + i64::from(insns[i].imm) + 1) as usize;
+                    starts.binary_search(&start).ok()
+                })
+                .collect()
+        })
+        .collect();
+    // 0 unvisited, 1 on the stack, 2 done.
+    let mut color = vec![0u8; n];
+    for root in 0..n {
+        if color[root] != 0 {
+            continue;
+        }
+        color[root] = 1;
+        let mut stack = vec![(root, 0usize)];
+        while let Some(&mut (f, ref mut next)) = stack.last_mut() {
+            let Some(&g) = callees[f].get(*next) else {
+                color[f] = 2;
+                stack.pop();
+                continue;
+            };
+            *next += 1;
+            match color[g] {
+                1 => return refuse(Errno::EINVAL, "recursive call from () to ()"),
+                0 => {
+                    color[g] = 1;
+                    stack.push((g, 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `MAX_CALL_FRAMES`.
 const MAX_CALL_FRAMES: usize = 8;
 
@@ -929,44 +978,53 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
     let mut state = vec![0u8; n];
     let mut stack = vec![0usize];
     state[0] = DISCOVERED;
-    let push =
-        |state: &mut Vec<u8>, stack: &mut Vec<usize>, t: usize, w: i64, e: u8| -> Checked<Next> {
-            if state[t] >= DISCOVERED | e {
-                return Ok(Next::Done);
-            }
-            if w < 0 || w >= n as i64 {
-                return refuse(
-                    Errno::EINVAL,
-                    format!("jump out of range from insn {t} to {w}"),
-                );
-            }
-            let w = w as usize;
-            if state[w] == 0 {
-                state[t] = DISCOVERED | e;
-                state[w] = DISCOVERED;
-                stack.push(w);
-                Ok(Next::Keep)
-            } else if state[w] & 0xf0 == DISCOVERED {
-                // Linux takes the back-edge from a privileged loader and checks
-                // the loop as it walks it; it is not walked here.
-                refuse(Errno::EINVAL, format!("back-edge from insn {t} to {w}"))
-            } else {
-                state[t] = DISCOVERED | e;
-                Ok(Next::Done)
-            }
-        };
+    // A call's edge to its function may reach one the walk is in: that is
+    // recursion, which sort_subprogs_topo refuses after.
+    let push = |state: &mut Vec<u8>,
+                stack: &mut Vec<usize>,
+                t: usize,
+                w: i64,
+                e: u8,
+                call: bool|
+     -> Checked<Next> {
+        if state[t] >= DISCOVERED | e {
+            return Ok(Next::Done);
+        }
+        if w < 0 || w >= n as i64 {
+            return refuse(
+                Errno::EINVAL,
+                format!("jump out of range from insn {t} to {w}"),
+            );
+        }
+        let w = w as usize;
+        if state[w] == 0 {
+            state[t] = DISCOVERED | e;
+            state[w] = DISCOVERED;
+            stack.push(w);
+            Ok(Next::Keep)
+        } else if state[w] & 0xf0 == DISCOVERED && call {
+            Ok(Next::Done)
+        } else if state[w] & 0xf0 == DISCOVERED {
+            // Linux takes the back-edge from a privileged loader and checks
+            // the loop as it walks it; it is not walked here.
+            refuse(Errno::EINVAL, format!("back-edge from insn {t} to {w}"))
+        } else {
+            state[t] = DISCOVERED | e;
+            Ok(Next::Done)
+        }
+    };
     while let Some(&t) = stack.last() {
         let insn = insns[t];
         let t64 = t as i64;
         let next = if !insn.jumps() {
             let width = if insn.ldimm64() { 2 } else { 1 };
-            push(&mut state, &mut stack, t, t64 + width, FALLTHROUGH)?
+            push(&mut state, &mut stack, t, t64 + width, FALLTHROUGH, false)?
         } else {
             match insn.op() {
                 jmp::EXIT => Next::Done,
                 // visit_func_call_insn: after the call, then the function.
                 jmp::CALL if insn.src == pseudo::CALL => {
-                    match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH)? {
+                    match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)? {
                         Next::Keep => Next::Keep,
                         Next::Done => push(
                             &mut state,
@@ -974,10 +1032,11 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
                             t,
                             t64 + i64::from(insn.imm) + 1,
                             BRANCH,
+                            true,
                         )?,
                     }
                 }
-                jmp::CALL => push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH)?,
+                jmp::CALL => push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)?,
                 jmp::JA if insn.x() => return gap("indirect jumps"),
                 jmp::JA => push(
                     &mut state,
@@ -985,8 +1044,9 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
                     t,
                     t64 + insn.jump() + 1,
                     FALLTHROUGH,
+                    false,
                 )?,
-                _ => match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH)? {
+                _ => match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)? {
                     Next::Keep => Next::Keep,
                     Next::Done => push(
                         &mut state,
@@ -994,6 +1054,7 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
                         t,
                         t64 + i64::from(insn.off) + 1,
                         BRANCH,
+                        false,
                     )?,
                 },
             }
@@ -3488,15 +3549,29 @@ mod tests {
             refused(&[call_by(1), exit(), i(0x85, 0, 0, 0, 12), exit()]),
             einval("tail_call is not allowed in subprogs without BTF")
         );
-        // check_cfg: code no path reaches, with a call in it, and recursion,
-        // which is a back-edge here.
+        // check_cfg: code no path reaches, with a call in it; and master's
+        // sort_subprogs_topo: recursion, direct or not.
         assert_eq!(
             refused(&[mov(0, 0), exit(), mov(0, 0), call_by(-4), exit()]),
             einval("unreachable insn 2")
         );
+        let recursive = einval("recursive call from () to ()");
         assert_eq!(
             refused(&[call_by(1), exit(), call_by(-1), exit()]),
-            einval("back-edge from insn 2 to 2")
+            recursive
+        );
+        assert_eq!(
+            refused(&[call_by(1), exit(), call_by(1), exit(), call_by(-3), exit()]),
+            recursive
+        );
+        assert_eq!(
+            refused(&[call_by(1), exit(), mov(0, 0), call_by(-4), exit()]),
+            recursive
+        );
+        // A jump back is still a back-edge.
+        assert_eq!(
+            refused(&[mov(0, 0), i(0x05, 0, 0, -2, 0), exit()]),
+            einval("back-edge from insn 1 to 0")
         );
     }
 

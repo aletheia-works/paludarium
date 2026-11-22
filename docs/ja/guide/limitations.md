@@ -333,15 +333,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ヘルパーのうち [機能](./features) に挙げたもの以外（`bpf_tail_call`、
   `bpf_perf_event_output`、`bpf_trace_printk`、リングバッファ、スピンロックなど）、マップの
   マップ、キュー、スタック、ブルームフィルタのためのマップのヘルパー、検証器が値を知らない
-  ヘルパーの大きさ、0 とわからないスカラーを渡す `bpf_get_netns_cookie`、kfunc、
-  コンテキストのソケット（`__sk_buff.sk`）とマップ自身のフィールド
-  （`struct bpf_map`）、`fd_array` からのマップと `excl_prog_hash` を付けて作ったマップ、BTF ID と
-  関数の `BPF_LD_IMM64`（そのためコールバックも）、`may_goto`、
-  間接ジャンプ、オフセットの決まらないポインタ、条件ジャンプのあるプログラムの
+  ヘルパーの大きさ、0 とわからないスカラーを渡す `bpf_get_netns_cookie`、kfunc、コンテキストの
+  ソケット（`__sk_buff.sk`）とマップ自身のフィールド（`struct bpf_map`）、`fd_array` からの
+  マップと `excl_prog_hash` を付けて作ったマップ、BTF ID と関数の `BPF_LD_IMM64`（そのため
+  コールバックも）、`may_goto`、間接ジャンプ、オフセットの決まらないポインタ、条件ジャンプのある
+  プログラムの
   `BPF_F_TEST_REG_INVARIANTS` です。後ろ向きの辺は Linux の行（"back-edge from insn %d to
-  %d"）で断ります。Linux は特権のある読み込み手からの有限のループを受け入れます。再帰呼び出しも後ろ向きの辺に
-  なります。master はこれを "recursive call from %s() to %s()"、7.0 は "the call stack of 9
-  frames is too deep" で断ります。スカラーは、
+  %d"）で断ります。Linux は特権のある読み込み手からの有限のループを受け入れます。スカラーは、
   検証器が知る値か、何もわからないかのどちらかで、Linux のように範囲を持ちません。そのため、
   Linux なら一方へだけ進むとわかるジャンプの両方をたどります。状態の刈り込みもしないので、
   分岐の多いプログラムは早く上限に届くことがあります。検索の結果は、64 ビットの `BPF_JEQ` か

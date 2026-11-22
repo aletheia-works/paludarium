@@ -62,8 +62,8 @@
    it takes and refuses (the call's destination, jumps that leave a
    function or fall into the next, BPF_LD_ABS and bpf_tail_call in a
    function, R0 to R5 after a call and R0 and R6 to R9 in the callee, a
-   pointer to a stack returned or stored in a caller's frame, 9 frames, and
-   the combined stack), each function's stack depth in the log's
+   pointer to a stack returned or stored in a caller's frame, 9 frames,
+   recursion, and the combined stack), each function's stack depth in the log's
    statistics, and a filter whose functions write a map's value through
    pointers to it and to their callers' stacks, which the case reads back.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
@@ -2278,6 +2278,11 @@ static int case_calls(void) {
     chain("5 frames of 100 bytes", 5, 100);
     LOAD("512 bytes and 1", ST_B(10, -504, 0), CALLF(2), MOV(0, 0), EXIT(), ST_B(10, -1, 0),
          MOV(0, 0), EXIT());
+    LOAD("a function that calls itself", CALLF(1), EXIT(), CALLF(-1), EXIT());
+    LOAD("two functions that call each other", CALLF(1), EXIT(), CALLF(1), EXIT(), CALLF(-3),
+         EXIT());
+    LOAD("a function that calls the main program", CALLF(1), EXIT(), MOV(0, 0), CALLF(-4),
+         EXIT());
 
     /* Each function's stack depth. */
     DEPTHS("depths of one", ST_B(10, -3, 0), MOV(0, 0), EXIT());

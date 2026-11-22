@@ -385,17 +385,14 @@ verified.
   `bpf_trace_printk`, the ring buffer, spin locks and the rest), the map
   helpers of maps of maps, queues, stacks and bloom filters, a helper's
   size whose value the verifier does not know, `bpf_get_netns_cookie` of
-  a scalar it does not know is 0, kfuncs, the
-  context's socket (`__sk_buff.sk`) and a map's own fields (`struct
-  bpf_map`), maps from `fd_array` and maps made with `excl_prog_hash`,
-  `BPF_LD_IMM64` of BTF IDs
-  and of functions (and so callbacks), `may_goto`, indirect
-  jumps, a pointer with a variable offset, and
-  `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
+  a scalar it does not know is 0, kfuncs, the context's socket
+  (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
+  `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF
+  IDs and of functions (and so callbacks), `may_goto`, indirect jumps, a
+  pointer with a variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a
+  conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
-  takes a bounded loop from a privileged loader). A recursive call is a
-  back-edge too, where master refuses it as "recursive call from %s() to
-  %s()" and 7.0 as "the call stack of 9 frames is too deep". A scalar is a value the
+  takes a bounded loop from a privileged loader). A scalar is a value the
   verifier knows or nothing at all, where Linux keeps its bounds, so it
   walks both ways of a jump Linux knows goes one way, and it prunes no
   states, so a program with many branches may reach the limits sooner. A

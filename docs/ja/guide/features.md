@@ -4221,7 +4221,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   exit かジャンプです（"last insn is not an exit or jmp"）。メインプログラム以外の関数に
   `BPF_LD_ABS`、`BPF_LD_IND`、`bpf_tail_call` は置けません（7.0 と同じく "LD_ABS is not
   allowed in subprogs without BTF"、"tail_call is not allowed in subprogs without BTF"。master
-  は受け入れます）。どれも、どの経路をたどるより前に `EINVAL` で断ります。呼ばれた関数は、
+  は受け入れます）。関数が自分自身を、直接にもほかの関数を通しても呼ぶことはできません
+  （master の確かめ方で "recursive call from () to ()"。BTF がなければ関数に名前がありません。
+  7.0 は、たどる経路が 9 フレームの深さになったところで断ります）。どれも、どの経路を
+  たどるより前に `EINVAL` で断ります。呼ばれた関数は、
   呼び出し元の R1 から R5 と、自分のフレームポインタと 512 バイトのスタックで始まります。
   その R0 と R6 から R9 は書くまで読めず、呼び出し元の R0 から R5 は呼び出しの後は読めません。
   呼び出し元の R0 には呼ばれた関数の R0 が入ります。呼ばれた関数は、スタックへのポインタを

@@ -16,8 +16,12 @@
 //! in the ring before the call returns: as Linux's buffered I/O, a read of a
 //! pipe with nothing in it waits there. `IOCB_CMD_POLL` completes at once if
 //! the file is ready; otherwise it waits in the context until the file is
-//! ready or the request is cancelled, and whether it is ready is looked at
-//! as the process makes a call and while it waits (see [`progress`]).
+//! ready or the request is cancelled. Whether it is ready is looked at in
+//! every context of the machine that holds a poll, before and after each
+//! call of any process and while a call waits (see [`progress`]): the call
+//! that makes the file ready, such as another process's write to a pipe,
+//! completes the poll before it returns, as Linux's wake-up does, so a
+//! program that takes its events from the ring without a call sees it.
 //!
 //! The contexts belong to the address space, as Linux keeps them on the
 //! `mm`: threads and `CLONE_VM` children share them, a fork's child has
@@ -27,7 +31,7 @@
 //! contexts are set up for, which `aio-nr` counts.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use paludarium_host::FileHandle;
 use paludarium_mmu::{AddressSpace, PageSource, SharedPages};
@@ -113,12 +117,14 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 }
 
 /// The machine's events that contexts were set up for (`aio_nr`), their
-/// limit (`aio_max_nr`), and how many polls wait in any context, which lets
-/// [`progress`] do nothing while none does.
+/// limit (`aio_max_nr`), how many polls wait in any context, which lets
+/// [`progress`] do nothing while none does, and the contexts a poll has
+/// waited in, which [`progress`] looks at.
 pub(crate) struct Limits {
     nr: Mutex<u64>,
     max: AtomicU64,
     polls: AtomicUsize,
+    waiting: Mutex<Vec<Weak<Ring>>>,
 }
 
 impl Default for Limits {
@@ -127,6 +133,7 @@ impl Default for Limits {
             nr: Mutex::new(0),
             max: AtomicU64::new(DEFAULT_MAX_NR),
             polls: AtomicUsize::new(0),
+            waiting: Mutex::default(),
         }
     }
 }
@@ -159,6 +166,33 @@ impl Limits {
     fn give(&self, events: u64) {
         let mut nr = lock(&self.nr);
         *nr = nr.saturating_sub(events);
+    }
+    /// `ring` holds a poll that waits, which [`progress`] looks at from now
+    /// on, whichever process makes a call.
+    fn watch(&self, ring: &Arc<Ring>) {
+        let mut waiting = lock(&self.waiting);
+        // Ended contexts go here too, so that the list stays as long as the
+        // live contexts even while no poll waits and `watched` is not asked.
+        waiting.retain(|known| {
+            known
+                .upgrade()
+                .is_some_and(|known| !known.dead.load(Ordering::SeqCst))
+        });
+        if !waiting
+            .iter()
+            .any(|known| std::ptr::eq(known.as_ptr(), Arc::as_ptr(ring)))
+        {
+            waiting.push(Arc::downgrade(ring));
+        }
+    }
+    /// The live contexts a poll has waited in; ended ones are let go of.
+    fn watched(&self) -> Vec<Arc<Ring>> {
+        let mut waiting = lock(&self.waiting);
+        waiting.retain(|ring| {
+            ring.upgrade()
+                .is_some_and(|ring| !ring.dead.load(Ordering::SeqCst))
+        });
+        waiting.iter().filter_map(Weak::upgrade).collect()
     }
 }
 
@@ -239,6 +273,9 @@ pub(crate) struct Ring {
     _source: Arc<RingPages>,
     dead: AtomicBool,
     limits: Arc<Limits>,
+    /// What a completed poll wakes: the waits of the files table that set
+    /// the context up, whose `io_getevents` may wait for the event.
+    hub: Arc<crate::events::ReadinessHub>,
     /// Held while events are taken from the ring (`ctx->ring_lock`).
     reading: Mutex<()>,
     state: Mutex<State>,
@@ -517,19 +554,33 @@ fn lookup(c: &Context<'_>, ctx_id: u64) -> Option<Arc<Ring>> {
     Some(ring)
 }
 
-/// Completes the polls of the caller's contexts that are ready: before each
-/// call, and as a call waits ([`crate::events::wait`]). Nothing while no
-/// poll waits anywhere.
+/// Completes the polls that are ready in every context of the machine:
+/// before and after each call of any process, and as a call waits
+/// ([`crate::events::wait`]). A call that makes a file ready (a write to a
+/// pipe, from this process or another) so completes the poll before it
+/// returns, as Linux's `aio_poll_wake` does from the wake-up, and a program
+/// that takes events from the ring without a call sees it there. Nothing
+/// while no poll waits anywhere.
 pub(crate) fn progress(c: &Context<'_>) {
-    if c.processes.aio.polls.load(Ordering::SeqCst) == 0 {
+    complete_ready(&c.processes.aio, &c.files.readiness);
+}
+
+/// [`progress`] where no call runs: as a process's last thread ends, after
+/// it closed its files, whose close (a pipe's last writer) may be what a
+/// poll waits for. `hub` is woken if a poll completes.
+pub(crate) fn complete_ready(limits: &Limits, hub: &crate::events::ReadinessHub) {
+    if limits.polls.load(Ordering::SeqCst) == 0 {
         return;
     }
     let mut any = false;
-    for ring in c.group.aio().table().live() {
-        any |= ring.check_polls();
+    for ring in limits.watched() {
+        if ring.check_polls() {
+            any = true;
+            ring.hub.changed();
+        }
     }
     if any {
-        c.files.readiness.changed();
+        hub.changed();
     }
 }
 
@@ -670,7 +721,7 @@ fn fget(c: &Context<'_>, fd: u32) -> Result<Arc<dyn FileHandle>, Errno> {
 
 /// `io_submit_one`: reads the `iocb` at `user_iocb` (`EFAULT`), checks it
 /// (`EINVAL`), takes a place in the ring (`EAGAIN`), and starts it.
-fn submit_one(c: &mut Context<'_>, ring: &Ring, user_iocb: u64) -> Result<(), Errno> {
+fn submit_one(c: &mut Context<'_>, ring: &Arc<Ring>, user_iocb: u64) -> Result<(), Errno> {
     let mut bytes = [0; IOCB_BYTES];
     c.mem
         .read(GuestAddr(user_iocb), &mut bytes)
@@ -711,6 +762,9 @@ fn submit_one(c: &mut Context<'_>, ring: &Ring, user_iocb: u64) -> Result<(), Er
                     None
                 }
             };
+            if cancelled.is_none() {
+                ring.limits.watch(ring);
+            }
             if let Some(poll) = cancelled {
                 ring.complete(poll.obj, poll.data, 0, poll.eventfd.as_ref());
             }
@@ -949,6 +1003,7 @@ fn setup(c: &mut Context<'_>, nr_events: u32, ctxp: u64) -> Result<u64, Errno> {
             _source: source,
             dead: AtomicBool::new(false),
             limits,
+            hub: Arc::clone(&c.files.readiness),
             reading: Mutex::default(),
             state: Mutex::default(),
         });

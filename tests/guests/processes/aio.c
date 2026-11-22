@@ -782,6 +782,98 @@ static int case_exec(char **argv) {
     return 0;
 }
 
+/* A poll on a pipe that a forked child writes, taken from the ring in user
+   space as libaio does, with no call while it waits: the child's write
+   completes it (aio_poll_wake), so the event is in the ring at once. The
+   wait spins on the ring's tail until a monotonic deadline, which on Linux
+   clock_gettime reads in the vDSO. */
+static int case_reap(void) {
+    aio_context_t ctx = 0;
+    printf("setup=%ld\n", setup(8, &ctx));
+    if (!ctx) return 3;
+    struct aio_ring *ring = (struct aio_ring *)ctx;
+    struct io_event *events = (struct io_event *)(ring + 1);
+    int p[2], go[2], done[2];
+    if (pipe(p) || pipe(go) || pipe(done)) return 4;
+    struct iocb cb = poll_of(p[0], POLLIN, 7);
+    printf("submit=%ld head=%u tail=%u\n", submit1(ctx, &cb), ring->head, ring->tail);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char c;
+        /* The write comes after the parent says it is spinning. */
+        read(go[0], &c, 1);
+        write(p[1], "x", 1);
+        read(done[0], &c, 1);
+        _exit(0);
+    }
+    struct timespec now, end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    end.tv_sec += 10;
+    write(go[1], "g", 1);
+    unsigned head = ring->head, tail;
+    for (;;) {
+        tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+        if (tail != head) break;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > end.tv_sec || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec)) {
+            printf("never came\n");
+            break;
+        }
+    }
+    if (tail != head) {
+        struct io_event ev = events[head];
+        printf("reaped: in-ring=%u data=%llu obj=%d res=%#llx res2=%lld\n", (tail - head) % ring->nr,
+               (unsigned long long)ev.data, ev.obj == (uint64_t)(uintptr_t)&cb, (long long)ev.res,
+               (long long)ev.res2);
+        __atomic_store_n(&ring->head, (head + 1) % ring->nr, __ATOMIC_RELEASE);
+    }
+    struct io_event ev[8];
+    printf("after: getevents=%ld empty=%u one-taken=%u\n", getevents(ctx, 0, 8, ev, &zero), ring->head == ring->tail ? 1u : 0u,
+           ring->tail == (head + 1) % ring->nr ? 1u : 0u);
+    write(done[1], "d", 1);
+    int status = 0;
+    waitpid(child, &status, 0);
+    char c;
+    printf("child=%d read=%zd\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, read(p[0], &c, 1));
+    /* A child that holds the pipe's only write end ends: its exit closes
+       it, and the hang-up completes the poll (POLLHUP) with no call here. */
+    int q[2];
+    if (pipe(q)) return 5;
+    struct iocb hup = poll_of(q[0], POLLIN, 8);
+    printf("hang-up submit=%ld\n", submit1(ctx, &hup));
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        close(q[0]);
+        read(go[0], &c, 1);
+        _exit(0);
+    }
+    close(q[1]);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    end.tv_sec += 10;
+    write(go[1], "g", 1);
+    head = ring->head;
+    for (;;) {
+        tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+        if (tail != head) break;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > end.tv_sec || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec)) {
+            printf("hang-up never came\n");
+            break;
+        }
+    }
+    if (tail != head) {
+        struct io_event ev2 = events[head];
+        printf("hang-up reaped: data=%llu obj=%d res=%#llx\n", (unsigned long long)ev2.data,
+               ev2.obj == (uint64_t)(uintptr_t)&hup, (long long)ev2.res);
+        __atomic_store_n(&ring->head, (head + 1) % ring->nr, __ATOMIC_RELEASE);
+    }
+    waitpid(child, &status, 0);
+    printf("hang-up child=%d destroy=%ld\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, destroy(ctx));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -794,6 +886,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "aio-full")) return case_full();
     if (!strcmp(mode, "aio-lifetime")) return case_lifetime(argc, argv);
     if (!strcmp(mode, "aio-mremap")) return case_mremap();
+    if (!strcmp(mode, "aio-reap")) return case_reap();
     if (!strcmp(mode, "aio-exec") && argc > 3) return case_exec(argv);
     return 2;
 }

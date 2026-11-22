@@ -1483,3 +1483,39 @@ fn a_map_maps_only_as_linux_s_bpf_map_mmap_lets_it() {
     assert_eq!(try_map(ro, PROT_READ | PROT_WRITE), errno(Errno::EACCES));
     assert_eq!(try_map(wo, PROT_READ), errno(Errno::EACCES));
 }
+
+/// A mapping that replaces a writable mapping of a map (`MAP_FIXED`)
+/// closes it, so only the new one holds a freeze off.
+#[test]
+fn a_fixed_mapping_over_a_writable_one_closes_it() {
+    const MAP_FIXED: u64 = 0x10;
+    let (mut k, mut t, m) = setup();
+    k.enter_thread(t.tid);
+    let fd = make(&mut k, &mut t, &m, map(ARRAY, 4, 8, 4, F_MMAPABLE));
+    let rw = PROT_READ | PROT_WRITE;
+    let at = mmap(&mut k, &mut t, &m, [fd, PAGE_SIZE, rw, MAP_SHARED, 0]);
+    assert!(at < u64::MAX - 4095, "mmap: {at:#x}");
+    // A writable one over it: still one.
+    let fixed = syscall(
+        &mut k,
+        &mut t,
+        &m,
+        MMAP,
+        [at, PAGE_SIZE, rw, MAP_SHARED | MAP_FIXED, fd, 0],
+    );
+    assert_eq!(fixed, at);
+    assert_eq!(
+        elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None),
+        errno(Errno(16))
+    );
+    // A read-only one over that: none.
+    let fixed = syscall(
+        &mut k,
+        &mut t,
+        &m,
+        MMAP,
+        [at, PAGE_SIZE, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0],
+    );
+    assert_eq!(fixed, at);
+    assert_eq!(elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None), 0);
+}

@@ -1608,6 +1608,11 @@ static void vma(const char *name, void *at) {
     fflush(stdout);
 }
 
+/* The binary's own path, which the harness gives after the mode (as
+   process.c takes it), else the one it was started with: bpf-mmap's child
+   execs it. */
+static const char *self_path = "";
+
 static int case_mmap(void) {
     /* 300 values of 12 bytes, 16 apart: 4800 bytes, two pages. */
     int fd = make(TYPE_ARRAY, 4, 12, 300, F_MMAPABLE);
@@ -1703,11 +1708,27 @@ static int case_mmap(void) {
     close(plain);
     close(hash);
     close(prog_ro);
+
+    /* A writable mapping goes with the space an execve replaces. */
+    int exec_map = make(TYPE_ARRAY, 4, 12, 300, F_MMAPABLE);
+    pid_t execed = fork();
+    if (execed == 0) {
+        if (mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, exec_map, 0) == MAP_FAILED) _exit(1);
+        char *again[] = { "bpf", "bpf-exit", NULL };
+        execv(self_path, again);
+        _exit(2);
+    }
+    int exec_status;
+    waitpid(execed, &exec_status, 0);
+    long exec_freeze = freeze_map(exec_map);
+    say("exec child %d, freeze after exec %ld", WEXITSTATUS(exec_status), exec_freeze);
+    close(exec_map);
     return 0;
 }
 
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
+    self_path = argc > 2 ? argv[2] : argv[0];
     alarm(20);
     if (!strcmp(mode, "bpf-calls")) return case_calls();
     if (!strcmp(mode, "bpf-elements")) return case_elements();
@@ -1721,5 +1742,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-maps")) return case_maps();
     if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
     if (!strcmp(mode, "bpf-mmap")) return case_mmap();
+    /* What bpf-mmap's child execs: nothing. */
+    if (!strcmp(mode, "bpf-exit")) return 0;
     return 2;
 }

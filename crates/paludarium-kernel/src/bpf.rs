@@ -2475,11 +2475,16 @@ pub(crate) fn mmap(
     );
     match mapped {
         Ok(at) => {
-            c.mem.advise_flags(
-                at,
-                at.0 + len.next_multiple_of(PAGE_SIZE),
-                paludarium_mmu::FlagAdvice::DontDump,
-            )?;
+            let span = len.next_multiple_of(PAGE_SIZE);
+            let dont_dump =
+                c.mem
+                    .advise_flags(at, at.0 + span, paludarium_mmu::FlagAdvice::DontDump);
+            if let Err(e) = dont_dump {
+                // The mapping goes again, its VMA closed as an unmap closes
+                // it, so that a failed call leaves nothing counted.
+                let _ = c.mem.unmap_shared(at, span);
+                return Err(e);
+            }
             Ok(at)
         }
         Err(e) => {

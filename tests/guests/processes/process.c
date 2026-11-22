@@ -13702,9 +13702,9 @@ static int proc_at_read_case(const char *self) {
 /* The leader-exit-status case: a process whose leader ends with exit
    before its other thread has, once that thread ends too, the status Linux's
    synchronize_group_exit gives it: the last thread's own exit code, or the
-   group's for exit_group or a fatal signal. Its stat shows the leader as a
-   zombie with exit_code 0 while the thread runs, and the zombie's stat and
-   the wait show that status. */
+   group's for exit_group or a fatal signal. While the thread runs, its stat
+   shows the leader as a zombie with the leader's own exit_code (5 << 8),
+   and the zombie's stat and the wait show the process's status. */
 static int les_go[2], les_variant;
 static void *les_worker(void *unused) {
     (void)unused;

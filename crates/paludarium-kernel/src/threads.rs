@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -66,6 +66,10 @@ pub struct ThreadGroup {
     seccomp: Mutex<crate::seccomp::Threads>,
     seccomp_syncs: AtomicU64,
     status: Mutex<Option<ExitStatus>>,
+    /// The wait status the leader's own `exit` left while other threads
+    /// go on, 0 until then (the leader's `exit_code` in Linux's
+    /// `do_task_stat`); `execve` gives the process a new leader without one.
+    leader_exit: AtomicI32,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
     actions: Mutex<Arc<Mutex<BTreeMap<i32, SignalAction>>>>,
@@ -249,6 +253,7 @@ impl Default for ThreadGroup {
             seccomp: Mutex::default(),
             seccomp_syncs: AtomicU64::new(0),
             status: Mutex::new(None),
+            leader_exit: AtomicI32::new(0),
             actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
             process_pending: Mutex::new(ThreadState::default()),
@@ -548,6 +553,8 @@ impl ThreadGroup {
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         members.remove(&old_tid);
         members.insert(pid, inbox);
+        // The new leader has not exited, whatever the old one left.
+        self.leader_exit.store(0, Ordering::SeqCst);
         // The thread that ran execve keeps its nice value as the leader.
         let mut nice = self.nice.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(value) = nice.remove(&old_tid) {
@@ -1770,6 +1777,10 @@ impl ThreadGroup {
     pub fn status(&self) -> Option<ExitStatus> {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// The wait status of the leader's own `exit`, 0 while it has none.
+    pub(crate) fn leader_exit(&self) -> i32 {
+        self.leader_exit.load(Ordering::SeqCst)
+    }
     pub fn active_threads(&self) -> usize {
         self.members
             .lock()
@@ -2309,7 +2320,13 @@ impl Kernel {
                 Ok(u64::from(self.pid_space(thread.tid).number(thread.tid)))
             }
             60 => {
-                return Some(Next::Exit(ExitStatus::Exited((a[0] & 255) as i32)));
+                let code = (a[0] & 255) as i32;
+                // The leader's own code, which its process's `stat` shows
+                // while the other threads go on.
+                if thread.tid == self.process.pid {
+                    self.group.leader_exit.store(code << 8, Ordering::SeqCst);
+                }
+                return Some(Next::Exit(ExitStatus::Exited(code)));
             }
             // reboot(magic1, magic2, cmd, arg): the commands that end the
             // PID namespace's init end the calling thread too.

@@ -7238,23 +7238,42 @@ static int proc_stat_exec(const char *start, const char *faults) {
 }
 /* The page-faults-live case: a fault counts to its task as it is taken
    (mm/memory.c mm_account_fault adds to current->min_flt in the fault),
-   so another thread sees it at once, before the task makes another system
-   call: in the task's /proc/<pid>/task/<tid>/stat minflt and in
+   so another thread sees it at once, before the task makes a system call
+   at all: in the task's /proc/<pid>/task/<tid>/stat minflt and in
    getrusage's RUSAGE_SELF. An execve counts the faults of its copy of the
    arguments to the new stack (fs/exec.c copy_strings, through
    get_user_pages): one for each page they fill, at least. */
-static int pfl_state, pfl_tid;
+static int pfl_state;
 static char *pfl_pages;
 static long pfl_page;
-static void *pfl_thread(void *unused) {
-    (void)unused;
-    __atomic_store_n(&pfl_tid, (int)syscall(SYS_gettid), __ATOMIC_SEQ_CST);
-    /* No system call from here until it is let go. */
+/* A bare clone thread, which (unlike a pthread's start) makes no system
+   call before it faults: Linux counts its faults from the first. */
+static int pfl_thread(void) {
     for (long i = 0; i < 64; i++) pfl_pages[i * pfl_page] = 1;
     __atomic_store_n(&pfl_state, 1, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&pfl_state, __ATOMIC_SEQ_CST) != 2) {
     }
-    return NULL;
+    __atomic_store_n(&pfl_state, 3, __ATOMIC_SEQ_CST);
+    return 0;
+}
+/* clone(2) of a thread that runs fn on stack and then exits, with no
+   system call before fn; musl's clone() refuses CLONE_THREAD. */
+static long pfl_spawn(unsigned long flags, void *stack, int (*fn)(void)) {
+    register int (*entry)(void) __asm__("r12") = fn;
+    long r;
+    __asm__ volatile("syscall\n\t"
+                     "test %%rax, %%rax\n\t"
+                     "jnz 1f\n\t"
+                     "xor %%ebp, %%ebp\n\t"
+                     "call *%%r12\n\t"
+                     "mov %%eax, %%edi\n\t"
+                     "mov $60, %%eax\n\t"
+                     "syscall\n\t"
+                     "1:"
+                     : "=a"(r)
+                     : "a"((long)SYS_clone), "D"(flags), "S"(stack), "d"(0L), "r"(entry)
+                     : "rcx", "r8", "r10", "r11", "memory");
+    return r;
 }
 static int page_faults_live_exec(const char *before) {
     printf("after exec: arguments-counted=%d\n", pf_get(RUSAGE_SELF) - atol(before) >= 32);
@@ -7272,18 +7291,20 @@ static int page_faults_live_case(const char *self) {
     pfl_pages = mmap(NULL, (size_t)(64 * pfl_page), PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (pfl_pages == MAP_FAILED) return 2;
+    static char stack[64 * 1024] __attribute__((aligned(16)));
     long before = pf_get(RUSAGE_SELF);
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, pfl_thread, NULL)) return 3;
+    int tid = (int)pfl_spawn(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
+                             stack + sizeof stack, pfl_thread);
+    if (tid < 0) return 3;
     while (__atomic_load_n(&pfl_state, __ATOMIC_SEQ_CST) != 1) sched_yield();
     char path[64];
-    snprintf(path, sizeof path, "/proc/self/task/%d/stat", __atomic_load_n(&pfl_tid, __ATOMIC_SEQ_CST));
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
     long task = ps_field(path, 10);
     long process = pf_get(RUSAGE_SELF) - before;
     printf("while it runs: task-at-least-64=%d process-grew-by-64=%d\n", task >= 64,
            process >= 64);
     __atomic_store_n(&pfl_state, 2, __ATOMIC_SEQ_CST);
-    pthread_join(thread, NULL);
+    while (__atomic_load_n(&pfl_state, __ATOMIC_SEQ_CST) != 3) sched_yield();
 
     /* 32 arguments of a page each. */
     static char big[32][4096];

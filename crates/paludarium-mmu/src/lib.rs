@@ -245,9 +245,10 @@ pub enum ReadHint {
 /// ([`Sink::forced`]), for the thread's `min_flt` alone.
 ///
 /// The kernel [`bind`]s the host thread to its guest thread's [`Sink`]
-/// and says when it works for it ([`set_kernel`]); until a thread is bound,
-/// its faults wait in the thread itself, for [`take`] and [`take_forced`]
-/// or for the first [`bind`].
+/// as it starts to run it, before its first instruction, and says when it
+/// works for it ([`set_kernel`]); a host thread no guest thread is bound to
+/// keeps its faults itself, for [`take`] and [`take_forced`] or for the
+/// first [`bind`].
 pub mod faults {
     use core::cell::{Cell, RefCell};
     use std::sync::Arc;

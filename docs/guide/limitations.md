@@ -264,7 +264,8 @@ verified.
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
 - **Page-fault counts**: `ru_minflt` counts each fault as it is taken, as
-  Linux does. `execve`'s loader fills the pages of the program's segments
+  Linux does, from a thread's first fault, before its first system call.
+  `execve`'s loader fills the pages of the program's segments
   with its file's bytes and counts a fault for each page then, where Linux
   maps the file and counts the faults as the program first touches the
   pages, a read fault for several of them at once (`fault_around_bytes`);

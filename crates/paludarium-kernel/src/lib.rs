@@ -185,6 +185,10 @@ impl Default for AltStack {
 pub(crate) struct CpuAccount {
     base: Option<u64>,
     used: Arc<Usage>,
+    /// Whether the thread group lists [`Self::used`] yet
+    /// ([`ThreadGroup::register_cpu`]): from the thread's start
+    /// ([`Kernel::start_thread`]), or else its first account.
+    registered: bool,
     /// The CPU the thread was last seen on, for its migrations, with the
     /// thread group's [`ThreadGroup::affinity_generation`] when it was the
     /// lowest its mask allows; `None` for a virtual CPU of `rseq`, which is
@@ -256,19 +260,43 @@ impl paludarium_mmu::faults::Sink for Usage {
 /// thread's [`Usage`] as the kernel's for it (Linux tells a fault of user
 /// mode from one of the kernel's accesses to user memory); after it, as the
 /// thread's own code's.
-pub(crate) struct KernelFaults;
+/// It puts back what it found, so one inside another leaves the outer one
+/// the kernel's.
+pub(crate) struct KernelFaults {
+    was: bool,
+}
 
 impl KernelFaults {
     pub(crate) fn enter(state: &ThreadState) -> Self {
         paludarium_mmu::faults::bind(Arc::clone(&state.cpu.used) as _);
-        paludarium_mmu::faults::set_kernel(true);
-        KernelFaults
+        KernelFaults {
+            was: paludarium_mmu::faults::set_kernel(true),
+        }
     }
 }
 
 impl Drop for KernelFaults {
     fn drop(&mut self) {
-        paludarium_mmu::faults::set_kernel(false);
+        paludarium_mmu::faults::set_kernel(self.was);
+    }
+}
+
+/// Lists the thread's [`Usage`] in its thread group, once.
+fn register_usage(group: &ThreadGroup, tid: u32, account: &mut CpuAccount) {
+    if !account.registered {
+        account.registered = true;
+        group.register_cpu(tid, Arc::clone(&account.used));
+    }
+}
+
+impl Kernel {
+    /// The calling host thread runs `thread` from now on: its faults count
+    /// to it from the first one, as Linux's `mm_account_fault` counts each
+    /// to `current`, and they show in `/proc` and `getrusage` before its
+    /// first system call.
+    pub fn start_thread(&self, thread: &mut Thread) {
+        register_usage(&self.group, thread.tid, &mut thread.state.cpu);
+        paludarium_mmu::faults::bind(Arc::clone(&thread.state.cpu.used) as _);
     }
 }
 
@@ -289,8 +317,8 @@ pub(crate) fn account_cpu(
         .unwrap_or(0);
     let on_cpu = state.on_cpu.map(|on| on.cpu);
     let account = &mut state.cpu;
+    register_usage(group, tid, account);
     let base = *account.base.get_or_insert_with(|| {
-        group.register_cpu(tid, Arc::clone(&account.used));
         // A thread no clone made, the first process's, was made about now.
         group.set_started(
             tid,

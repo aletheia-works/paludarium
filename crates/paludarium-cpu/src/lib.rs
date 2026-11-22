@@ -30,6 +30,7 @@ mod integer_tests;
 pub mod jit_cost;
 #[cfg(feature = "cost-profile")]
 mod jit_cost_sites;
+pub mod segments;
 #[cfg(test)]
 mod snapshot_tests;
 mod softfloat;
@@ -576,6 +577,7 @@ struct Snapshot {
     rflags: u64,
     fs_base: u64,
     gs_base: u64,
+    segments: [u16; 6],
     vector: Option<([u128; 16], u32)>,
 }
 
@@ -588,6 +590,7 @@ impl Snapshot {
             rflags,
             fs_base,
             gs_base,
+            segments,
             xmm,
             mxcsr,
             // Its instructions change it after the last thing that can fail.
@@ -601,6 +604,7 @@ impl Snapshot {
             rflags,
             fs_base,
             gs_base,
+            segments,
             vector: (!keeps_vector_state).then_some((xmm, mxcsr)),
         }
     }
@@ -611,6 +615,7 @@ impl Snapshot {
         state.rflags = self.rflags;
         state.fs_base = self.fs_base;
         state.gs_base = self.gs_base;
+        state.segments = self.segments;
         if let Some((xmm, mxcsr)) = self.vector {
             state.xmm = xmm;
             state.mxcsr = mxcsr;
@@ -694,6 +699,11 @@ fn execute_decoded(
         },
         Stop::Halt => ExitReason::Halt { rip },
         Stop::GeneralProtection => ExitReason::GeneralProtection { rip },
+        Stop::Segment(fault) => ExitReason::SegmentFault {
+            rip,
+            trap: fault.trap(),
+            error: fault.error(),
+        },
         Stop::ArithmeticFault => ExitReason::ArithmeticFault { rip },
         Stop::FloatingPointFault(code) => ExitReason::FloatingPointFault { rip, code },
         Stop::MathFault(code) => ExitReason::MathFault { rip, code },
@@ -2047,5 +2057,91 @@ mod tests {
         mem.write_u64(GuestAddr(STACK_TOP - 0xf8), 0xabcd).unwrap();
         assert!(matches!(run(&mut s, &mem, 10), ExitReason::Halt { .. }));
         assert_eq!(s.gpr[reg::RAX], 0xabcd);
+    }
+
+    /// A present read/write data segment of privilege 3 with base `base`,
+    /// as `modify_ldt` writes it, or a not-present one.
+    fn ldt_data(base: u64, present: bool) -> u64 {
+        0xffff
+            | (base & 0xff_ffff) << 16
+            | 3 << 40
+            | 1 << 44
+            | 3 << 45
+            | u64::from(present) << 47
+            | 0xf << 48
+            | 3 << 54
+            | (base >> 24) << 56
+    }
+
+    #[test]
+    fn an_ldt_selector_in_fs_gives_its_base_and_reads_back() {
+        // mov fs, ax; mov rbx, fs:[8]; mov ecx, fs; mov [rsp-8], fs
+        // (a 16-bit store); push fs; hlt
+        let code = [
+            0x8e, 0xe0, 0x64, 0x48, 0x8b, 0x1c, 0x25, 0x08, 0, 0, 0, 0x8c, 0xe1, 0x8c, 0x64, 0x24,
+            0xf8, 0x0f, 0xa0, 0xf4,
+        ];
+        let (mut s, mem) = machine(&code);
+        let base = STACK_TOP - 0x100;
+        mem.ldt().lock().unwrap().extend([0, ldt_data(base, true)]);
+        mem.write_u64(GuestAddr(base + 8), 0xabcd).unwrap();
+        mem.write_u64(GuestAddr(STACK_TOP - 8), u64::MAX).unwrap();
+        s.gpr[reg::RAX] = 0xffff_000f;
+        s.gpr[reg::RCX] = u64::MAX;
+        s.gpr[reg::RSP] = STACK_TOP;
+        assert!(matches!(run(&mut s, &mem, 10), ExitReason::Halt { .. }));
+        assert_eq!((s.segments[segments::FS], s.fs_base), (0xf, base));
+        assert_eq!(s.gpr[reg::RBX], 0xabcd);
+        assert_eq!(s.gpr[reg::RCX], 0xf);
+        // The push wrote all 8 bytes over the 16-bit store.
+        assert_eq!(s.gpr[reg::RSP], STACK_TOP - 8);
+        assert_eq!(mem.read_u64(GuestAddr(STACK_TOP - 8)).unwrap(), 0xf);
+    }
+
+    #[test]
+    fn a_refused_segment_load_faults_and_changes_nothing() {
+        // pop gs; hlt
+        let (mut s, mem) = machine(&[0x0f, 0xa9, 0xf4]);
+        mem.ldt().lock().unwrap().extend([0, 0, ldt_data(0, false)]);
+        s.gpr[reg::RSP] = STACK_TOP - 8;
+        mem.write_u64(GuestAddr(STACK_TOP - 8), 0x17).unwrap();
+        s.gs_base = 0x1234;
+        assert_eq!(
+            run(&mut s, &mem, 10),
+            ExitReason::SegmentFault {
+                rip: GuestAddr(CODE),
+                trap: 11,
+                error: 0x14
+            }
+        );
+        assert_eq!((s.gpr[reg::RSP], s.gs_base), (STACK_TOP - 8, 0x1234));
+        assert_eq!(s.segments[segments::GS], 0);
+        // mov ss, ax with a null selector: #GP(0).
+        let (mut s, mem) = machine(&[0x8e, 0xd0, 0xf4]);
+        assert_eq!(
+            run(&mut s, &mem, 10),
+            ExitReason::SegmentFault {
+                rip: GuestAddr(CODE),
+                trap: 13,
+                error: 0
+            }
+        );
+        // mov ds, ax with the kernel's data segment: #GP(0x18).
+        let (mut s, mem) = machine(&[0x8e, 0xd8, 0xf4]);
+        s.gpr[reg::RAX] = 0x1b;
+        assert_eq!(
+            run(&mut s, &mem, 10),
+            ExitReason::SegmentFault {
+                rip: GuestAddr(CODE),
+                trap: 13,
+                error: 0x18
+            }
+        );
+        // mov cs, ax is #UD.
+        let (mut s, mem) = machine(&[0x8e, 0xc8, 0xf4]);
+        assert!(matches!(
+            run(&mut s, &mem, 10),
+            ExitReason::InvalidOpcode { .. }
+        ));
     }
 }

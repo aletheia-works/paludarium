@@ -215,10 +215,6 @@ pub(crate) struct Local {
     /// `TIF_FORCED_TF`: the trap flag is set because the tracer
     /// single-steps the thread, not because the thread set it.
     pub(crate) forced_tf: bool,
-    /// The segment selectors a tracer wrote, `ds`, `es`, `fs`, `gs`, `cs`
-    /// and `ss` (`thread.ds` and the others); none for the ones every task
-    /// starts with, which an exec gives back.
-    pub(crate) selectors: Option<[u16; 6]>,
     /// The debug registers a tracer set (`ptrace_bps`, `ptrace_dr7`,
     /// `virtual_dr6`), which a new task does not take and exec clears.
     pub(crate) debug: Debug,
@@ -349,12 +345,9 @@ fn check_breakpoint(address: u64, length: u8) -> Result<(), Errno> {
     Ok(())
 }
 
-/// The selectors of a 64-bit task: null data and `fs`/`gs` selectors,
-/// `__USER_CS` and `__USER_DS`.
-const SELECTORS: [u16; 6] = [0, 0, 0, 0, 0x33, 0x2b];
-
-/// Where each selector is in `user_regs_struct`, in [`SELECTORS`]' order.
-const SELECTOR_SLOTS: [u64; 6] = [DS, ES, FS, GS, CS, SS];
+/// Where each segment selector of [`CpuState::segments`] is in
+/// `user_regs_struct`, in its `sreg` order (es, cs, ss, ds, fs, gs).
+const SELECTOR_SLOTS: [u64; 6] = [ES, CS, SS, DS, FS, GS];
 
 /// The `clone` of a traced thread: its flags, the new task once it is
 /// made, and the event the tracer asked for.
@@ -384,8 +377,6 @@ impl Clone for Local {
         Self {
             forked_by: self.tid,
             orig_rax: self.orig_rax,
-            // `copy_thread` copies the selectors.
-            selectors: self.selectors,
             ..Self::default()
         }
     }
@@ -430,8 +421,6 @@ struct Stop {
     group_stopped: bool,
     /// The thread's `TIF_FORCED_TF`, which a tracer's requests change.
     forced_tf: bool,
-    /// Its segment selectors, which a tracer may write.
-    selectors: [u16; 6],
     /// Its debug registers, which a tracer may write.
     debug: Debug,
 }
@@ -751,7 +740,7 @@ fn regs(stop: &Stop) -> [u64; 27] {
     }
     out[ORIG_RAX as usize] = stop.orig_rax;
     out[RIP as usize] = cpu.rip.0;
-    for (&slot, &selector) in SELECTOR_SLOTS.iter().zip(&stop.selectors) {
+    for (&slot, &selector) in SELECTOR_SLOTS.iter().zip(&cpu.segments) {
         out[slot as usize] = u64::from(selector);
     }
     // A trap flag the tracer set is not shown (`get_flags`).
@@ -768,9 +757,10 @@ fn regs(stop: &Stop) -> [u64; 27] {
 
 /// Linux's `putreg`: register `index` of `user_regs_struct` takes `value`.
 /// A segment selector must be null or of user privilege, and `cs` and `ss`
-/// not null (`EIO`); the selectors cannot be changed here, so a valid one
-/// is taken and left as it is. The flags change only where a tracer may
-/// change them, and a segment base must be below `TASK_SIZE_MAX` (`EIO`).
+/// not null (`EIO`); it is taken as it is, without the descriptor checks
+/// of a load, and leaves the fs and gs bases as they are. The flags change
+/// only where a tracer may change them, and a segment base must be below
+/// `TASK_SIZE_MAX` (`EIO`).
 fn putreg(stop: &mut Stop, index: u64, value: u64) -> Result<(), Errno> {
     let cpu = &mut stop.cpu;
     match index {
@@ -799,7 +789,7 @@ fn putreg(stop: &mut Stop, index: u64, value: u64) -> Result<(), Errno> {
                 return Err(Errno::EIO);
             }
             if let Some(slot) = SELECTOR_SLOTS.iter().position(|&s| s == index) {
-                stop.selectors[slot] = selector;
+                cpu.segments[slot] = selector;
             }
         }
         FS_BASE | GS_BASE => {
@@ -936,7 +926,6 @@ impl Kernel {
                 listening: false,
                 group_stopped: self.group.is_stopped(),
                 forced_tf: thread.state.ptrace.forced_tf,
-                selectors: thread.state.ptrace.selectors.unwrap_or(SELECTORS),
                 debug: thread.state.ptrace.debug,
             });
             tracee.tracer_pid
@@ -1047,7 +1036,6 @@ impl Kernel {
             thread.state.signal_mask = mask;
             thread.state.wait_restore_mask = None;
         }
-        thread.state.ptrace.selectors = (stop.selectors != SELECTORS).then_some(stop.selectors);
         thread.state.ptrace.debug = stop.debug;
         let orig = stop.orig_rax;
         if orig != before {
@@ -2078,10 +2066,13 @@ impl Kernel {
                         return Err(Errno::EPERM);
                     }
                     traces.stopped(tid, |stop| {
+                        // `thread.fsindex = 0` and the base.
                         if data == ARCH_SET_FS {
                             stop.cpu.fs_base = addr;
+                            stop.cpu.segments[paludarium_cpu::segments::FS] = 0;
                         } else {
                             stop.cpu.gs_base = addr;
+                            stop.cpu.segments[paludarium_cpu::segments::GS] = 0;
                         }
                         Ok(0)
                     })
@@ -2488,7 +2479,6 @@ mod tests {
             listening: false,
             group_stopped: false,
             forced_tf: false,
-            selectors: SELECTORS,
             debug: Debug::default(),
         }
     }

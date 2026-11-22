@@ -94,6 +94,11 @@ pub struct CpuState {
     pub rflags: u64,
     pub fs_base: u64,
     pub gs_base: u64,
+    /// The segment selectors, indexed by [`crate::segments`]' `ES` ..= `GS`
+    /// (the order of the `sreg` field of `mov`): `cs` and `ss` are
+    /// `__USER_CS` and `__USER_DS`, the others null, as a 64-bit task
+    /// starts. Only the fs and gs bases above take part in addressing.
+    pub segments: [u16; 6],
     /// xmm0 ..= xmm15.
     pub xmm: [u128; 16],
     pub mxcsr: u32,
@@ -112,6 +117,7 @@ impl Default for CpuState {
             rflags: INITIAL_RFLAGS,
             fs_base: 0,
             gs_base: 0,
+            segments: crate::segments::INITIAL,
             xmm: [0; 16],
             mxcsr: INITIAL_MXCSR,
             x87: X87::default(),

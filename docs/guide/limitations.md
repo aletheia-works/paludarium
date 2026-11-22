@@ -120,9 +120,9 @@ verified.
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
   so not counted.
   `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
-  Linux has the stop's signal until the tracer's wait, and a process whose
-  leader ended with `exit` before the last of its threads shows the last
-  thread's status, where Linux shows the leader's. `/proc/stat` counts all CPU time as
+  Linux has the stop's signal until the tracer's wait. After a leader's
+  `exit`, while its process's other threads run, the leader's directory
+  under `task` is `ENOENT`, where Linux shows it as a zombie. `/proc/stat` counts all CPU time as
   user time, as `getrusage` does, each thread's to the CPU it was on at its
   system calls, and none as idle; it counts no interrupts or softirqs, and
   as context switches only the times threads went to sleep, as nothing
@@ -381,8 +381,9 @@ verified.
   context's socket (`__sk_buff.sk`) and a map's own fields (`struct
   bpf_map`), maps from `fd_array` and maps made with `excl_prog_hash`,
   `BPF_LD_IMM64` of BTF IDs
-  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`,
-  indirect jumps, a pointer with a variable offset, and
+  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, the load-acquire
+  and store-release atomics (`BPF_LOAD_ACQ`, `BPF_STORE_REL`),
+  `may_goto`, indirect jumps, a pointer with a variable offset, and
   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
   takes a bounded loop from a privileged loader). A scalar is a value the
@@ -466,20 +467,31 @@ verified.
   `pkey_alloc` gives `ENOSPC` as Linux does on such a CPU, and programs carry
   on without them. `RDPKRU` and `WRPKRU` stop a program with `SIGILL`, as on
   such a CPU.
-- **Segment registers**: the virtual CPU cannot move to or from a segment
-  register (`mov` to `%ds`, `%fs` and the like stops a program with
-  `SIGILL`), so an entry that `modify_ldt` writes cannot be loaded and used,
-  where Linux loads it. The table itself reads back as Linux's.
+- **Segment registers, in part**: `lfs`, `lgs` and `lss`, `lar`, `lsl`,
+  `verr` and `verw`, and far jumps, calls and returns stop a program with
+  `SIGILL`, and the CPU runs only in `__USER_CS`: an `rt_sigreturn` frame
+  with another `cs` is a bad frame. `set_thread_area` is not implemented,
+  so the GDT's thread-local entries stay empty, and the limit of the CPU
+  number segment is 0. A `mov` or `pop` to `%ss` does not hold off the
+  single-step trap of the instruction after it, as the CPU does. After
+  `modify_ldt` only the calling thread's `%ds` and `%es` load again, where
+  Linux reloads them in every thread of the address space. A null selector
+  clears the `%fs` or `%gs` base, where AMD's CPUs before Zen 2 keep it.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
-  `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`
-  and `_WRITE_FIXED` run; the other operations complete with `EOPNOTSUPP`.
+  `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`,
+  `_WRITE_FIXED` and `IORING_OP_FILES_UPDATE` run; the other operations
+  complete with `EOPNOTSUPP`.
   The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
-  `IORING_REGISTER_BUFFERS` and `IORING_UNREGISTER_BUFFERS` (the others give
-  `EINVAL`), so no ring descriptor, file or personality can be registered,
-  and buffers cannot be updated or given tags. A registered buffer's pages
+  `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
+  `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
+  `IORING_REGISTER_FILES_UPDATE` and `IORING_REGISTER_FILE_ALLOC_RANGE`
+  (the others give `EINVAL`). So no ring descriptor or personality can be
+  registered, buffers cannot be updated, and neither files nor buffers can
+  be registered with `IORING_REGISTER_FILES2` or `_BUFFERS2`, which give
+  them tags. A registered buffer's pages
   are not pinned: a fixed transfer moves the memory at its address as that
   is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
   made read-only, and a process that shares the ring moves its own memory.
@@ -505,11 +517,11 @@ verified.
   takes it, as Linux's buffered I/O does; one of a file opened with
   `O_DIRECT` does not run in the background as on Linux, and a sync's event
   is in the ring when the call returns, where Linux's comes from a worker
-  soon after. A poll that waits is looked at only as a thread of the
-  process makes a call (any call) and while one waits: a program that takes
-  events from the ring without ever calling the kernel does not see it
-  complete. Which files' polls wait on two queues, which Linux refuses with
-  `EINVAL` unless the file is ready, is guessed from the kind of file: a FIFO
+  soon after. A poll that waits for a file made ready by no call (a timer
+  that expires, input from the host) completes only at the next call of any
+  process, or while one waits, where Linux's comes at once. Which files'
+  polls wait on two queues, which Linux refuses with `EINVAL` unless the
+  file is ready, is guessed from the kind of file: a FIFO
   open to read and write, and a character device (a terminal). A ring holds
   exactly one request fewer than its events, where Linux's per-CPU counts
   can stop one sooner; and the I/O priority of `IOCB_FLAG_IOPRIO` is checked

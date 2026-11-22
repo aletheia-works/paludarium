@@ -18,7 +18,10 @@
    with the links' and addresses' as the peer's carrier goes and as the
    pair goes. Only IPv4's are shown, as the
    ends make IPv6's of their own as they come up. The two processes take
-   turns through pipes, so their lines come in one order. */
+   turns through pipes, so their lines come in one order; the peer's
+   carrier going, which Linux's link watch may tell of a second later, is
+   waited for on RTNLGRP_LINK, and the ARP answer NTF_USE asks for on
+   RTNLGRP_NEIGH. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -174,18 +177,21 @@ static void address(int fd, int index, const char *ip, const char *label) {
     put(&b, IFA_ADDRESS, &in, 4);
     request(fd, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &b, label);
 }
-/* Waits, up to 5 s, until the member links hears that the device of
-   `index` has its carrier. */
-static void carrier(int links, int index) {
+/* Waits, up to 5 s however much else comes, until the member links hears
+   that the device of `index` has its carrier, or with `gone` has lost it,
+   as Linux's link watch may tell of it a second later. */
+static void carrier_is(int links, int index, int gone) {
     static unsigned char buf[65536];
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = 5000 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (left <= 0) break;
         struct pollfd ready = {.fd = links, .events = POLLIN};
-        if (poll(&ready, 1, 5000) <= 0) {
-            printf("%s: no carrier on %d\n", side, index);
-            return;
-        }
+        if (poll(&ready, 1, (int)left) <= 0) continue;
         long n = recv(links, buf, sizeof buf, MSG_DONTWAIT);
-        if (n <= 0) return;
+        if (n <= 0) continue;
         for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
             const struct nl_header *h = (const void *)(buf + at);
             if (h->len < sizeof *h || at + h->len > n) break;
@@ -199,14 +205,17 @@ static void carrier(int links, int index) {
                     memcpy(&alen, body + a, 2);
                     memcpy(&kind, body + a + 2, 2);
                     if (alen < 4 || a + alen > body_len) break;
-                    if ((kind & 0x3fff) == IFLA_CARRIER && alen >= 5 && body[a + 4] == 1) return;
+                    if ((kind & 0x3fff) == IFLA_CARRIER && alen >= 5 && body[a + 4] == !gone) return;
                     a += (alen + 3) & ~3;
                 }
             }
             at += (h->len + 3) & ~3u;
         }
     }
+    printf("%s: %s %d: never came\n", side, gone ? "carrier gone from" : "carrier on", index);
 }
+
+static void carrier(int links, int index) { carrier_is(links, index, 0); }
 
 static struct sockaddr_in at(const char *ip, int port) {
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((unsigned short)port)};
@@ -468,6 +477,48 @@ static void tables(int fd, const char *label) {
 #define NUD_NOARP 0x40
 #define NUD_PERMANENT 0x80
 
+/* Waits, up to 5 s however much else comes, on `resolved` (a member of
+   RTNLGRP_NEIGH) for the neighbour `ip` of the device of `index` to be
+   reachable: Linux's ARP answer comes back through the peer's namespace
+   in its own time. */
+static void reachable(int resolved, int index, const char *ip) {
+    static unsigned char buf[65536];
+    unsigned char wanted[4];
+    inet_pton(AF_INET, ip, wanted);
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = 5000 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (left <= 0) break;
+        struct pollfd ready = {.fd = resolved, .events = POLLIN};
+        if (poll(&ready, 1, (int)left) <= 0) continue;
+        long n = recv(resolved, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0) continue;
+        for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
+            const struct nl_header *h = (const void *)(buf + at);
+            if (h->len < sizeof *h || at + h->len > n) break;
+            const unsigned char *body = (const unsigned char *)(h + 1);
+            int body_len = (int)(h->len - sizeof *h);
+            struct ndmsg_ m;
+            if (h->type == RTM_NEWNEIGH && body_len >= (int)sizeof m) {
+                memcpy(&m, body, sizeof m);
+                for (int a = (int)sizeof m; m.family == AF_INET && m.index == index && m.state == NUD_REACHABLE &&
+                                            a + 4 <= body_len;) {
+                    unsigned short alen, kind;
+                    memcpy(&alen, body + a, 2);
+                    memcpy(&kind, body + a + 2, 2);
+                    if (alen < 4 || a + alen > body_len) break;
+                    if (kind == NDA_DST && alen == 8 && !memcmp(body + a + 4, wanted, 4)) return;
+                    a += (alen + 3) & ~3;
+                }
+            }
+            at += (h->len + 3) & ~3u;
+        }
+    }
+    printf("%s: %s reachable: never came\n", side, ip);
+}
+
 /* B: makes its namespace, then does what A writes to `in`, one letter at
    a time, writing back to `out` when done. */
 static void child(int in, int out) {
@@ -492,10 +543,12 @@ static void child(int in, int out) {
         } else if (command == 'z') {
             sequence(order, "order", 1);
         } else if (command == 'q') {
-            sleep(2);
             sequence(order, "order", 0);
         } else if (command == 'c') {
             carrier(links, B_INDEX);
+        } else if (command == 'k') {
+            /* vb has lost its carrier, and so its neighbours. */
+            carrier_is(links, B_INDEX, 1);
         } else if (command == 'l') {
             listener = socket(AF_INET, SOCK_STREAM, 0);
             struct sockaddr_in any = at("0.0.0.0", 5000);
@@ -525,7 +578,7 @@ static void child(int in, int out) {
             neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, B_INDEX, "10.77.0.71", NUD_STALE, 0x71,
                       "add stale 10.77.0.71");
         } else if (command == 'o') {
-            sleep(2);
+            carrier_is(links, B_INDEX, 1);
             dump(ctl, B_INDEX, "vb's, va down");
             heard(watch, "heard");
         }
@@ -557,6 +610,7 @@ int main(int argc, char **argv) {
     } while (0)
     printf("A: unshare=%ld\n", result(unshare(CLONE_NEWNET)));
     int ctl = route_socket(0), links = route_socket(1), watch = route_socket(4), order = route_socket(1 | 4 | 0x10);
+    int resolved = route_socket(4);
     struct body m = {0};
     const unsigned char mac_a[6] = {2, 0, 0, 0, 0, 0x0a}, mac_b[6] = {2, 0, 0, 0, 0, 0x0b};
     info(&m, A_INDEX, 0, 0);
@@ -682,8 +736,12 @@ int main(int argc, char **argv) {
     dump(ctl, A_INDEX, "va's, up again");
     heard(watch, "heard");
     B_DOES("s");
-    /* NTF_USE asks ARP, as a packet does. */
+    /* NTF_USE asks ARP, as a packet does; B's answer is waited for. */
+    static char unread[65536];
+    while (recv(resolved, unread, sizeof unread, MSG_DONTWAIT) > 0) {
+    }
     use(ctl, A_INDEX, "10.77.0.2", "use B's");
+    reachable(resolved, A_INDEX, "10.77.0.2");
     use(ctl, A_INDEX, "10.77.0.8", "use nobody's");
     get(ctl, A_INDEX, "10.77.0.2", "used B's");
     get(ctl, A_INDEX, "10.77.0.8", "used nobody's");
@@ -731,6 +789,7 @@ int main(int argc, char **argv) {
     request(ctl, RTM_NEWLINK, 0, &down, "down va again");
     neighbour(ctl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, A_INDEX, "10.77.0.50", NUD_PERMANENT, 0x50,
               "add while down again");
+    B_DOES("k");
     B_DOES("z");
     sequence(order, "order", 1);
     struct body gone = {0};

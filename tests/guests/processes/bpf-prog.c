@@ -35,6 +35,16 @@
    SOCK_SEQPACKET pair, not at all for a stream socket, and before a
    datagram socket
    connected elsewhere refuses the sender (EPERM).
+   bpf-prog-atomic: BPF_ATOMIC's read-modify-write operations (add, or,
+   and, xor, each with and without BPF_FETCH, xchg and cmpxchg) in 32
+   and 64 bits: programs it takes and refuses, with the order of the
+   checks (the operation, its size, the registers, the context, the
+   alignment on the stack and in a value, a read-only value, the register
+   the old value goes to), and a filter that runs them on a map's value
+   and the stack, whose results the case reads back from the map. Then,
+   with BPF_F_STRICT_ALIGNMENT, plain loads through a hash lookup's result
+   before its null check: misaligned, which is refused for that first, and
+   aligned.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -1820,6 +1830,149 @@ static int case_classic(void) {
     return 0;
 }
 
+#define ATOMIC_W(dst, src, off, op) I(0xc3, dst, src, off, op)
+#define ATOMIC_DW(dst, src, off, op) I(0xdb, dst, src, off, op)
+#define A_ADD 0x00
+#define A_OR 0x40
+#define A_AND 0x50
+#define A_XOR 0xa0
+#define A_FETCH 0x01
+#define A_XCHG 0xe1
+#define A_CMPXCHG 0xf1
+#define SLOTS 24
+
+/* The map's value, 8 bytes a slot. */
+static void slots(const char *name, int m) {
+    uint32_t key = 0;
+    uint64_t value[SLOTS] = {0};
+    uint64_t a[4] = {(uint32_t)m, (uintptr_t)&key, (uintptr_t)value, 0};
+    long r = bpf(1, a, sizeof a);
+    printf("%s lookup %ld:", name, r);
+    for (int i = 0; i < SLOTS; i++) printf(" %llx", (unsigned long long)value[i]);
+    putchar('\n');
+    fflush(stdout);
+}
+
+static int case_atomic(void) {
+    int value = map(2, 4, 8 * SLOTS, 1, 0);
+    int rdonly = map(2, 4, 8, 1, 1 << 7);
+    int hash = map(1, 8, 8, 4, 0);
+    say("maps %d", value > 0 && rdonly > 0 && hash > 0);
+
+    /* Programs it takes: fp-8 = 1 and r1 = 1, then the atomic. */
+#define ON_STACK(name, ...) LOAD(name, MOV(1, 1), STX_DW(10, 1, -8), __VA_ARGS__, MOV(0, 0), EXIT())
+    ON_STACK("add", ATOMIC_DW(10, 1, -8, A_ADD));
+    ON_STACK("fetch add", ATOMIC_DW(10, 1, -8, A_ADD | A_FETCH));
+    ON_STACK("or", ATOMIC_DW(10, 1, -8, A_OR));
+    ON_STACK("fetch or", ATOMIC_DW(10, 1, -8, A_OR | A_FETCH));
+    ON_STACK("and", ATOMIC_DW(10, 1, -8, A_AND));
+    ON_STACK("fetch and", ATOMIC_DW(10, 1, -8, A_AND | A_FETCH));
+    ON_STACK("xor", ATOMIC_DW(10, 1, -8, A_XOR));
+    ON_STACK("fetch xor", ATOMIC_DW(10, 1, -8, A_XOR | A_FETCH));
+    ON_STACK("xchg", ATOMIC_DW(10, 1, -8, A_XCHG));
+    ON_STACK("cmpxchg", MOV(0, 1), ATOMIC_DW(10, 1, -8, A_CMPXCHG));
+    ON_STACK("32-bit add", ATOMIC_W(10, 1, -4, A_ADD));
+    ON_STACK("32-bit fetch xor", ATOMIC_W(10, 1, -8, A_XOR | A_FETCH));
+    ON_STACK("32-bit xchg", ATOMIC_W(10, 1, -4, A_XCHG));
+    ON_STACK("32-bit cmpxchg", MOV(0, 1), ATOMIC_W(10, 1, -8, A_CMPXCHG));
+    ON_STACK("a pointer as the source", ATOMIC_DW(10, 10, -8, A_ADD));
+    LOAD("fetch a spilled pointer", STX_DW(10, 10, -8), MOV(1, 0), ATOMIC_DW(10, 1, -8, A_ADD | A_FETCH),
+         LDX_DW(0, 1, -16), EXIT());
+    LOAD("never written stack", MOV(1, 1), ATOMIC_DW(10, 1, -16, A_ADD), MOV(0, 0), EXIT());
+    LOAD_MAPS("into a value", LD_VALUE(6, value, 0), MOV(1, 1), ATOMIC_DW(6, 1, 8, A_ADD | A_FETCH),
+              MOV(0, 0), ATOMIC_W(6, 1, 4, A_CMPXCHG), MOV(0, 0), EXIT());
+
+    /* Programs it refuses. */
+    ON_STACK("no such operation", ATOMIC_DW(10, 1, -8, 0x02));
+    ON_STACK("operation -1", ATOMIC_DW(10, 1, -8, -1));
+    ON_STACK("sub", ATOMIC_DW(10, 1, -8, 0x10));
+    ON_STACK("8-bit fetch add", I(0xd3, 10, 1, -8, A_ADD | A_FETCH));
+    ON_STACK("16-bit add", I(0xcb, 10, 1, -8, A_ADD));
+    ON_STACK("16-bit, no such operation", I(0xcb, 10, 1, -8, 0x07));
+    ON_STACK("unwritten source", ATOMIC_DW(10, 2, -8, A_ADD));
+    ON_STACK("unwritten destination", ATOMIC_DW(3, 1, -8, A_ADD));
+    LOAD("cmpxchg without R0", MOV(1, 1), STX_DW(10, 1, -8), ATOMIC_DW(10, 1, -8, A_CMPXCHG), EXIT());
+    LOAD("into cb[]", MOV(2, 1), ATOMIC_W(1, 2, 48, A_ADD), MOV(0, 0), EXIT());
+    ON_STACK("misaligned on the stack", ATOMIC_DW(10, 1, -12, A_ADD));
+    ON_STACK("at the frame pointer", ATOMIC_DW(10, 1, 0, A_ADD));
+    ON_STACK("below the stack", ATOMIC_DW(10, 1, -520, A_ADD));
+    LOAD_MAPS("misaligned in a value", LD_VALUE(6, value, 0), MOV(1, 1), ATOMIC_W(6, 1, 2, A_ADD),
+              MOV(0, 0), EXIT());
+    LOAD_MAPS("past the value", LD_VALUE(6, value, 0), MOV(1, 1),
+              ATOMIC_DW(6, 1, 8 * SLOTS, A_ADD), MOV(0, 0), EXIT());
+    LOAD_MAPS("into a read-only value", LD_VALUE(6, rdonly, 0), MOV(1, 1), ATOMIC_DW(6, 1, 0, A_ADD),
+              MOV(0, 0), EXIT());
+    LOAD_MAPS("into a lookup's result unchecked", KEY8(hash), CALL(LOOKUP), MOV(1, 1),
+              ATOMIC_W(0, 1, 2, A_ADD), MOV(0, 0), EXIT());
+    ON_STACK("fetch into the frame pointer", ATOMIC_DW(10, 10, -8, A_ADD | A_FETCH));
+    ON_STACK("fetch into its own pointer", MOV_REG(2, 10), ATOMIC_DW(2, 2, -8, A_ADD | A_FETCH));
+    ON_STACK("cmpxchg through R0", MOV_REG(0, 10), ATOMIC_DW(0, 1, -8, A_CMPXCHG));
+    LOAD("a pointer's slot after an atomic", STX_DW(10, 10, -8), MOV(1, 0),
+         ATOMIC_DW(10, 1, -8, A_ADD | A_FETCH), LDX_DW(2, 10, -8), LDX_DW(0, 2, 0), EXIT());
+    LOAD("32 bits of a spilled pointer", STX_DW(10, 10, -8), MOV(1, 0),
+         ATOMIC_W(10, 1, -8, A_ADD | A_FETCH), MOV(0, 0), EXIT());
+#undef ON_STACK
+
+    /* BPF_F_STRICT_ALIGNMENT, for loads too: a lookup's result before its
+       null check is checked for alignment before it is refused. */
+    {
+        struct insn misaligned[] = {KEY8(hash), CALL(LOOKUP), LDX_W(0, 0, 2), EXIT()};
+        struct insn aligned[] = {KEY8(hash), CALL(LOOKUP), LDX_W(0, 0, 4), EXIT()};
+        struct prog_attr p = attr(misaligned, COUNT(misaligned));
+        p.prog_flags = 1;
+        run("strict, misaligned in a lookup's result unchecked", p);
+        p = attr(aligned, COUNT(aligned));
+        p.prog_flags = 1;
+        run("strict, aligned in a lookup's result unchecked", p);
+        run("not strict, misaligned in a lookup's result unchecked",
+            attr(misaligned, COUNT(misaligned)));
+    }
+
+    /* A filter that runs them on the map's value and the stack, and keeps
+       what each gave in the value. */
+    uint64_t start[SLOTS];
+    for (int i = 0; i < SLOTS; i++) start[i] = 0x0123456789abcdefULL ^ (0x1010101010101010ULL * (uint64_t)i);
+    uint32_t key = 0;
+    uint64_t u[4] = {(uint32_t)value, (uintptr_t)&key, (uintptr_t)start, 0};
+    say("update %ld", bpf(2, u, sizeof u));
+    int filter = PROGRAM(
+        LD_VALUE(6, value, 0),
+        MOV(1, 1), ATOMIC_DW(6, 1, 0, A_ADD),
+        MOV(1, 0xf00), ATOMIC_DW(6, 1, 8, A_OR),
+        MOV(2, 0xff), ATOMIC_DW(6, 2, 16, A_AND | A_FETCH), STX_DW(6, 2, 96),
+        MOV(3, -1), ATOMIC_DW(6, 3, 24, A_XOR | A_FETCH), STX_DW(6, 3, 104),
+        MOV(4, 5), ATOMIC_DW(6, 4, 32, A_XCHG), STX_DW(6, 4, 112),
+        /* Equal to what is there, then not. */
+        LDX_DW(0, 6, 40), MOV(1, 7), ATOMIC_DW(6, 1, 40, A_CMPXCHG), STX_DW(6, 0, 120),
+        MOV(0, 1), ATOMIC_DW(6, 1, 48, A_CMPXCHG), STX_DW(6, 0, 128),
+        /* 32 bits: the source's lower half, the old value zero-extended,
+           and R0's lower half compared. */
+        LD64(5, 0x710000001ULL), ATOMIC_W(6, 5, 56, A_ADD | A_FETCH), STX_DW(6, 5, 136),
+        LD64(5, 0x900000005ULL), ATOMIC_W(6, 5, 64, A_XCHG), STX_DW(6, 5, 144),
+        LDX_W(0, 6, 72), LD64(1, 0x300000000ULL), I(0x4f, 0, 1, 0, 0), MOV(1, 9),
+        ATOMIC_W(6, 1, 72, A_CMPXCHG), STX_DW(6, 0, 152),
+        /* The upper half of a slot, by its own address. */
+        LD64(1, 0xf000000f0ULL), ATOMIC_W(6, 1, 84, A_OR | A_FETCH), STX_DW(6, 1, 160),
+        /* The stack. */
+        LDX_DW(1, 6, 88), STX_DW(10, 1, -8), MOV(7, 2), ATOMIC_DW(10, 7, -8, A_ADD | A_FETCH),
+        LDX_DW(1, 10, -8), STX_DW(6, 1, 168), STX_DW(6, 7, 176),
+        MOV(0, 0), EXIT());
+    say("filter loaded %d", filter >= 0);
+    if (filter < 0) {
+        LOAD_MAPS("why", LD_VALUE(6, value, 0), MOV(0, 0), EXIT());
+        return 1;
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    say("attach %d", attach(pair[1], filter));
+    slots("before", value);
+    through("first", pair[0], pair[1], 4);
+    slots("after one", value);
+    through("second", pair[0], pair[1], 4);
+    slots("after two", value);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1829,5 +1982,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-attach")) return case_attach();
     if (!strcmp(mode, "bpf-prog-corpus")) return case_corpus();
     if (!strcmp(mode, "bpf-prog-classic")) return case_classic();
+    if (!strcmp(mode, "bpf-prog-atomic")) return case_atomic();
     return 2;
 }

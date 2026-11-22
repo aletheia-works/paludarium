@@ -679,6 +679,7 @@ mod linux {
         aio_mremap => ("aio-mremap","aio"),
         aio_reap => ("aio-reap","aio"),
         aio_timer => ("aio-timer","aio"),
+        aio_signalfd => ("aio-signalfd","aio"),
         perf_calls => ("perf-calls","perf"),
         perf_counts => ("perf-counts","perf"),
         perf_exec => ("perf-exec","perf"),

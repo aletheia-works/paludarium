@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/signalfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -908,6 +909,53 @@ static int case_timer(void) {
     return 0;
 }
 
+/* A poll on a signalfd for a blocked SIGUSR2: one submitted with the signal
+   already pending completes at once; one submitted before the signal is
+   sent waits, and io_getevents shows whether the kill completes it (Linux's
+   signalfd_notify wakes the poll, whose worker then checks its own
+   signals). A 1 s timeout ends the wait, printing never came. Either way the
+   signalfd's read takes the signal. */
+static void read_signal(int sfd) {
+    struct signalfd_siginfo si;
+    memset(&si, 0, sizeof si);
+    ssize_t n = read(sfd, &si, sizeof si);
+    printf("read=%zd signo=%u code=%d\n", n, si.ssi_signo, si.ssi_code);
+}
+
+static int case_signalfd(void) {
+    aio_context_t ctx = 0;
+    printf("setup=%ld\n", setup(8, &ctx));
+    if (!ctx) return 3;
+    struct aio_ring *ring = (struct aio_ring *)ctx;
+    sigset_t usr2;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    if (sigprocmask(SIG_BLOCK, &usr2, NULL)) return 4;
+    int sfd = signalfd(-1, &usr2, SFD_NONBLOCK);
+    if (sfd < 0) return 5;
+    struct io_event ev[8];
+    struct timespec one = {1, 0};
+
+    kill(getpid(), SIGUSR2);
+    struct iocb pending = poll_of(sfd, POLLIN, 1);
+    printf("pending: submit=%ld in-ring=%u\n", submit1(ctx, &pending), (ring->tail - ring->head) % ring->nr);
+    long got = getevents(ctx, 1, 8, ev, &one);
+    if (got < 1) printf("pending: never came: getevents=%ld\n", got);
+    else printf("pending: got=%ld data=%llu res=%#llx\n", got, (unsigned long long)ev[0].data, (long long)ev[0].res);
+    read_signal(sfd);
+
+    struct iocb later = poll_of(sfd, POLLIN, 2);
+    printf("later: submit=%ld in-ring=%u\n", submit1(ctx, &later), (ring->tail - ring->head) % ring->nr);
+    kill(getpid(), SIGUSR2);
+    got = getevents(ctx, 1, 8, ev, &one);
+    if (got < 1) printf("later: never came: getevents=%ld\n", got);
+    else printf("later: got=%ld data=%llu res=%#llx\n", got, (unsigned long long)ev[0].data, (long long)ev[0].res);
+    read_signal(sfd);
+    printf("after: empty=%u\n", ring->head == ring->tail ? 1u : 0u);
+    printf("destroy=%ld\n", destroy(ctx));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -922,6 +970,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "aio-mremap")) return case_mremap();
     if (!strcmp(mode, "aio-reap")) return case_reap();
     if (!strcmp(mode, "aio-timer")) return case_timer();
+    if (!strcmp(mode, "aio-signalfd")) return case_signalfd();
     if (!strcmp(mode, "aio-exec") && argc > 3) return case_exec(argv);
     return 2;
 }

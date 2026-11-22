@@ -13,8 +13,13 @@
     {"crate": "notify@8.2.2", "allow": ["CC0-1.0"]}
   ],
   "guest_advisory_exceptions": [
-    {"id": "RUSTSEC-2026-0391", "crate": "zstd@0.13.3"},
-    {"id": "RUSTSEC-2026-0398", "crate": "zstd-safe@7.3.0"},
-    {"id": "RUSTSEC-2026-0403", "crate": "zstd-safe@7.3.0"}
+    {"id": "RUSTSEC-2026-0391", "crate": "zstd@0.13.3", "reason": "through decmpfs (SocketDev/decmpfs#16)"},
+    {"id": "RUSTSEC-2026-0398", "crate": "zstd-safe@7.3.0", "reason": "through decmpfs (SocketDev/decmpfs#16)"},
+    {"id": "RUSTSEC-2026-0403", "crate": "zstd-safe@7.3.0", "reason": "through decmpfs (SocketDev/decmpfs#16)"},
+    {
+      "id": "RUSTSEC-2026-0592",
+      "crate": "url@2.5.8",
+      "reason": "through hickory-net, hickory-resolver and reqwest; fixed in url 2.5.9"
+    }
   ]
 }

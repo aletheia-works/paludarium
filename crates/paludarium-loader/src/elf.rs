@@ -149,16 +149,14 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
             align: u64_at(bytes, at + 48)?,
         };
         if h.kind == PT_LOAD {
-            // A segment that takes nothing from the file may name any offset,
-            // as GNU ld 2.46 does past the end of the file for bss alone.
+            // A segment may name file data past the end of the file, as one
+            // that takes nothing from it does (GNU ld 2.46 for bss alone) and
+            // as a file cut short does: Linux maps it all, and a page wholly
+            // past the end raises SIGBUS when it is touched.
             if h.filesz != 0 {
-                let file_end = h
-                    .offset
+                h.offset
                     .checked_add(h.filesz)
                     .ok_or(LoadError::Malformed("segment out of range"))?;
-                if file_end > file_len {
-                    return Err(LoadError::Malformed("segment out of range"));
-                }
             }
             if h.filesz > h.memsz {
                 return Err(LoadError::Malformed(

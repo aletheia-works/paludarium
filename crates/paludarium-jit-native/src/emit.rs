@@ -1620,6 +1620,17 @@ impl Emitter<'_, '_> {
                 self.set_gpr(4, rsp);
                 self.unless_changed(status, n + 1, next);
             }
+            Fast::PushLoad(mem) => {
+                let address = self.linear(&mem);
+                let (v, status) = self.load(address, 8);
+                self.unless_failed(status, n, rip);
+                let rsp = self.gpr(4);
+                let rsp = self.b.ins().iadd_imm_s(rsp, -8);
+                let status = self.store(rsp, 8, v);
+                self.unless_failed(status, n, rip);
+                self.set_gpr(4, rsp);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::MulWide { src, signed } => {
                 let size = src.size();
                 let b = self.read(src);

@@ -4613,6 +4613,19 @@ kernel.
   map has `BPF_F_RDONLY_PROG` and not read when it has
   `BPF_F_WRONLY_PROG` (`EACCES`). The program keeps the maps it uses.
 
+- `BPF_ATOMIC` changes 4 or 8 bytes of the stack or of a map's value in
+  one step, as Linux's `check_atomic` checks it: add, or, and and xor,
+  each with or without `BPF_FETCH`, `BPF_XCHG` and `BPF_CMPXCHG`. Another
+  operation is "BPF_ATOMIC uses invalid atomic opcode %02x" and another
+  size "invalid atomic operand size" (`EINVAL`). The source and
+  destination registers, and R0 for `BPF_CMPXCHG`, must be written; the
+  context is "BPF_ATOMIC stores into R%d ctx is not allowed" (`EACCES`).
+  The register the old value goes to, the source with `BPF_FETCH` and R0
+  for `BPF_CMPXCHG`, is unknown from then on, even when it is the
+  destination, which then reads through a scalar. The memory is read,
+  then written, aligned to the size whatever the program's flags, and a
+  stack slot written so holds bytes, even where a pointer was spilled.
+
 - The context, R1 as a program starts, is the packet's `struct
   __sk_buff`, read and written as Linux lets a socket filter: its 4-byte
   fields read whole or narrower, at an offset that is a multiple of the
@@ -4651,7 +4664,10 @@ kernel.
   as Linux's `___bpf_prog_run` does after the verifier's rewrites. A
   division by a register that is 0 gives 0, and a remainder by it keeps
   the dividend. A signed division by -1 negates, and a signed remainder by
-  -1 gives 0. The context is the message's `__sk_buff`: its `len`, `cb[]`
+  -1 gives 0. An atomic in 32 bits changes the lower half of a slot with
+  the source's lower half and compares R0's, and the old value comes back
+  zero-extended; no other access to a map's value comes between its read
+  and its write. The context is the message's `__sk_buff`: its `len`, `cb[]`
   from 0 and 0 for the fields an AF_UNIX message does not set.
   `bpf_skb_load_bytes` reads the message, and its relative form reads it
   from the network header, its start, where there is no MAC header

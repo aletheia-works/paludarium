@@ -47,12 +47,11 @@
 //!   is not known here, `bpf_get_netns_cookie` of a scalar not known to be
 //!   0, bpf-to-bpf calls and kfuncs, the context's socket pointer
 //!   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
-//!   `fd_array` and maps made with
-//!   `excl_prog_hash`, BTF IDs and functions in `BPF_LD_IMM64`,
-//!   `BPF_LD_ABS` and `BPF_LD_IND`, `may_goto`, indirect jumps, a
-//!   back-edge (Linux takes a bounded loop from a privileged loader), a
-//!   pointer with a variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a
-//!   conditional jump.
+//!   `fd_array` and maps made with `excl_prog_hash`, BTF IDs and functions
+//!   in `BPF_LD_IMM64`, `may_goto`, indirect jumps, a back-edge (Linux
+//!   takes a bounded loop from a privileged loader), a pointer with a
+//!   variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a conditional
+//!   jump.
 //! - The loader has `CAP_BPF` and `CAP_PERFMON` ([`crate::bpf_prog`]
 //!   refuses others), so the verifier allows what Linux allows them:
 //!   pointer leaks, uninitialized stack reads and no Spectre sanitizing.
@@ -1201,7 +1200,8 @@ impl Walk {
             class::JMP | class::JMP32 => self.jmp_op(s, insn, i),
             _ => {
                 if insn.mode() != mode::IMM {
-                    return gap("BPF_LD_ABS and BPF_LD_IND");
+                    ld_abs(s, insn)?;
+                    return Ok(next);
                 }
                 // check_ld_imm: a 64-bit constant, a map or a map's value.
                 write_ok(insn.dst)?;
@@ -1777,6 +1777,32 @@ fn memory_type(r: u8, reg: Reg) -> Checked<()> {
             reg_name(reg)
         ),
     )
+}
+
+/// `check_ld_abs` of a socket filter's `BPF_LD_ABS` or `BPF_LD_IND`, whose
+/// fields [`insn_fields`] checked (where master does; 7.0 checks them
+/// here, after the program type, which a socket filter passes): a call of
+/// a helper that loads the packet's bytes at `imm`, or at `src + imm`,
+/// from the context in R6, into R0, and clobbers R1 to R5.
+fn ld_abs(s: &mut State, insn: Insn) -> Checked<()> {
+    const CTX: u8 = 6;
+    read_ok(s, CTX)?;
+    // check_resource_leak: no helper that takes a reference or a lock is
+    // verified yet, so none is held.
+    let Reg::Ptr(Ptr::Ctx, off) = s.regs[usize::from(CTX)] else {
+        return refuse(
+            Errno::EINVAL,
+            "at the time of BPF_LD_ABS|IND R6 != pointer to skb",
+        );
+    };
+    if insn.mode() == mode::IND {
+        read_ok(s, insn.src)?;
+    }
+    // check_ptr_off_reg.
+    ctx_offset(CTX, off)?;
+    s.regs[1..=5].fill(Reg::NotInit);
+    s.regs[0] = Reg::Scalar(None);
+    Ok(())
 }
 
 /// `check_reg_arg` of a source: the register has been written.
@@ -2498,7 +2524,6 @@ mod tests {
             i(0x85, 0, 0, 0, 1),
             exit(),
         ]);
-        gap(&[i(0x30, 0, 0, 0, 0), exit()]);
         gap(&[
             mov(1, -8),
             ldx(0x18, 0, 10, -8),
@@ -3014,6 +3039,89 @@ mod tests {
         };
         let r = verify(&[ldx(size::H, 0, 1, 5), exit()], strict).expect_err("accepted");
         assert_eq!(r.line, "misaligned context access off 0+0+5 size 2");
+    }
+
+    #[test]
+    fn ld_abs_and_ld_ind_are_checked_as_check_ld_abs_does() {
+        let einval = |line: &str| (Errno::EINVAL, line.to_string());
+        let eacces = |line: &str| (EACCES, line.to_string());
+        let abs = |size: u8, imm: i32| i(0x20 | size, 0, 0, 0, imm);
+        let ind = |size: u8, src: u8, imm: i32| i(0x40 | size, 0, src, 0, imm);
+        let ctx = mov_reg(6, 1);
+        // Each size, from the context in R6, and R0 is a scalar after it.
+        for size in [size::W, size::H, size::B] {
+            ok(&[ctx, abs(size, 0), exit()]);
+            ok(&[ctx, mov(7, 3), ind(size, 7, -1), exit()]);
+            ok(&[ctx, ind(size, 6, 0), exit()]);
+            ok(&[ctx, ind(size, 10, 0), exit()]);
+            ok(&[
+                ctx,
+                abs(size, -0x10_0000),
+                mov_reg(2, 0),
+                mov_reg(0, 2),
+                exit(),
+            ]);
+        }
+        // R6 to R9 stay; R1 to R5 do not.
+        ok(&[
+            ctx,
+            mov(9, 1),
+            abs(size::B, 0),
+            mov_reg(0, 9),
+            ldx(size::W, 2, 6, 0),
+            exit(),
+        ]);
+        for r in 1..=5 {
+            assert_eq!(
+                refused(&[ctx, abs(size::B, 0), mov_reg(0, r), exit()]),
+                eacces(&format!("R{r} !read_ok"))
+            );
+        }
+        // R6 must be the context, at its start.
+        assert_eq!(refused(&[abs(size::B, 0), exit()]), eacces("R6 !read_ok"));
+        let skb = "at the time of BPF_LD_ABS|IND R6 != pointer to skb";
+        assert_eq!(refused(&[mov(6, 0), abs(size::B, 0), exit()]), einval(skb));
+        assert_eq!(
+            refused(&[mov_reg(6, 10), abs(size::W, 0), exit()]),
+            einval(skb)
+        );
+        let mut lookup = lookup(3);
+        lookup.extend([mov_reg(6, 0), abs(size::B, 0), exit()]);
+        assert_eq!(refused(&lookup), einval(skb));
+        assert_eq!(
+            refused(&[ctx, i(0x07, 6, 0, 0, 4), abs(size::B, 0), exit()]),
+            eacces("dereference of modified ctx ptr R6 off=4 disallowed")
+        );
+        assert_eq!(
+            refused(&[ctx, i(0x07, 6, 0, 0, -4), ind(size::B, 1, 0), exit()]),
+            eacces("negative offset ctx ptr R6 off=-4 disallowed")
+        );
+        // The source is checked after R6's type and before its offset.
+        assert_eq!(
+            refused(&[ctx, ind(size::B, 7, 0), exit()]),
+            eacces("R7 !read_ok")
+        );
+        assert_eq!(
+            refused(&[mov(6, 0), ind(size::B, 7, 0), exit()]),
+            einval(skb)
+        );
+        assert_eq!(
+            refused(&[ctx, i(0x07, 6, 0, 0, 4), ind(size::B, 7, 0), exit()]),
+            eacces("R7 !read_ok")
+        );
+        // The fields, before any path is walked.
+        let reserved = einval("BPF_LD_[ABS|IND] uses reserved fields");
+        assert_eq!(refused(&[i(0x30, 1, 0, 0, 0), exit()]), reserved);
+        assert_eq!(refused(&[i(0x30, 0, 0, 1, 0), exit()]), reserved);
+        assert_eq!(refused(&[i(0x30, 0, 1, 0, 0), exit()]), reserved);
+        assert_eq!(
+            refused(&[i(0x38, 0, 0, 0, 0), exit()]),
+            einval("unknown opcode 38")
+        );
+        assert_eq!(
+            refused(&[i(0x58, 0, 1, 0, 0), exit()]),
+            einval("unknown opcode 58")
+        );
     }
 
     #[test]

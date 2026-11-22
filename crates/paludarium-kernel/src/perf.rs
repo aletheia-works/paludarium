@@ -700,8 +700,9 @@ impl Event {
         }
         state
     }
-    /// What the thread's [`crate::Usage`] counts for a counter of it, as of
-    /// its latest system call, and kept once it is gone; `None` for the
+    /// What the thread's [`crate::Usage`] counts for a counter of it (its
+    /// faults as they are taken, its switches and migrations as of its
+    /// latest system call), and kept once it is gone; `None` for the
     /// other counters, an event of a CPU, and a thread that has made no
     /// system call yet. As Linux's `perf_exclude_event` has it, the faults
     /// of the thread's code are left out with `exclude_user` and those of
@@ -1845,9 +1846,9 @@ mod tests {
         let host = paludarium_host::testing::RecordingHost::default();
         let group = Arc::new(ThreadGroup::default());
         let mut state = crate::ThreadState::default();
-        // A system call: what the thread's code faulted on, then the call.
+        // Its faults count as they are taken, the rest at a system call.
+        paludarium_mmu::faults::bind(Arc::clone(&state.cpu.used) as _);
         let account = |state: &mut crate::ThreadState| {
-            crate::account_faults(state, false);
             crate::account_cpu(&host, &group, state, 5);
         };
         let excluding = |counter, bit: u32| {
@@ -1882,7 +1883,7 @@ mod tests {
         ] {
             event.enable();
         }
-        // Two sleeps and a page's first write, accounted at the next call.
+        // Two sleeps, accounted at the next call, and a page's first write.
         paludarium_host::switches::sleep(&mut false);
         paludarium_host::switches::sleep(&mut false);
         let mut space = paludarium_mmu::AddressSpace::new();
@@ -1901,7 +1902,7 @@ mod tests {
         // The kernel makes the switches; the fault was the thread's own.
         assert_eq!(user_switches.values().0, 0);
         assert_eq!((user_faults.values().0, kernel_faults.values().0), (1, 0));
-        // A fault of a system call's access, as it leaves the call.
+        // A fault of the kernel's access for it.
         let copy = space
             .map(
                 None,
@@ -1910,8 +1911,10 @@ mod tests {
                 paludarium_mmu::MappingKind::Anonymous,
             )
             .unwrap();
-        space.write_u64(copy, 1).unwrap();
-        crate::account_faults(&state, true);
+        {
+            let _kernel = crate::KernelFaults::enter(&state);
+            space.write_u64(copy, 1).unwrap();
+        }
         account(&mut state);
         assert_eq!((user_faults.values().0, kernel_faults.values().0), (1, 1));
         // A disabled event leaves out what comes meanwhile.

@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -874,6 +875,39 @@ static int case_reap(void) {
     return 0;
 }
 
+/* A poll that waits for a timerfd completes as the timer expires, which
+   io_getevents waits for: the event with its POLLIN, then the expiry for
+   the timerfd's read. A 10 s timeout ends the wait if it never comes. (The
+   kernel unit test shows the event in the ring with no call; the test
+   host's virtual clock passes only in a wait, so a case cannot.) */
+static int case_timer(void) {
+    aio_context_t ctx = 0;
+    printf("setup=%ld\n", setup(8, &ctx));
+    if (!ctx) return 3;
+    struct aio_ring *ring = (struct aio_ring *)ctx;
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd < 0) return 4;
+    struct iocb cb = poll_of(tfd, POLLIN, 9);
+    printf("submit=%ld in-ring=%u\n", submit1(ctx, &cb), (ring->tail - ring->head) % ring->nr);
+    struct itimerspec soon = {.it_value = {.tv_nsec = 20000000}};
+    if (timerfd_settime(tfd, 0, &soon, NULL)) return 5;
+    struct timespec ten = {10, 0};
+    struct io_event ev[8];
+    long got = getevents(ctx, 1, 8, ev, &ten);
+    if (got < 1) {
+        printf("never came: getevents=%ld\n", got);
+    } else {
+        printf("got=%ld data=%llu obj=%d res=%#llx res2=%lld\n", got, (unsigned long long)ev[0].data,
+               ev[0].obj == (uint64_t)(uintptr_t)&cb, (long long)ev[0].res, (long long)ev[0].res2);
+    }
+    uint64_t ticks = 0;
+    ssize_t n = read(tfd, &ticks, sizeof ticks);
+    printf("after: empty=%u read=%zd ticks=%llu\n", ring->head == ring->tail ? 1u : 0u, n,
+           (unsigned long long)ticks);
+    printf("destroy=%ld\n", destroy(ctx));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -887,6 +921,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "aio-lifetime")) return case_lifetime(argc, argv);
     if (!strcmp(mode, "aio-mremap")) return case_mremap();
     if (!strcmp(mode, "aio-reap")) return case_reap();
+    if (!strcmp(mode, "aio-timer")) return case_timer();
     if (!strcmp(mode, "aio-exec") && argc > 3) return case_exec(argv);
     return 2;
 }

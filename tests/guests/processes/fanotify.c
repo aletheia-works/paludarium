@@ -2,8 +2,9 @@
    marks fdinfo shows, the events of files with the descriptors they give,
    their merging (within the newest 128 of a bucket), the marks that go
    with a superblock, the file handles and names of the FID modes, the pidfds
-   of FAN_REPORT_PIDFD, the mount events of FAN_REPORT_MNT (moves too), and
-   what a group without CAP_SYS_ADMIN may do.
+   of FAN_REPORT_PIDFD, the mount events of FAN_REPORT_MNT (moves too),
+   what a group without CAP_SYS_ADMIN may do, and the evictable marks
+   /proc/sys/vm/drop_caches evicts.
 
    Each case works in a directory of its own under /tmp. A file system
    mark there hears of what other programs do in /tmp too, so only the
@@ -1490,6 +1491,78 @@ static int case_exec_perm(const char *self) {
     return 0;
 }
 
+/* Whether fdinfo shows a mark of `fan` on the inode `ino`. */
+static int marked(int fan, ino_t ino) {
+    char path[64], line[512], want[48];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fan);
+    snprintf(want, sizeof want, "ino:%lx ", (unsigned long)ino);
+    FILE *info = fopen(path, "r");
+    int found = 0;
+    while (info && fgets(line, sizeof line, info))
+        if (!strncmp(line, "fanotify ", 9) && strstr(line, want)) found = 1;
+    if (info) fclose(info);
+    return found;
+}
+static long drop_caches(const char *value) {
+    int fd = open("/proc/sys/vm/drop_caches", O_WRONLY);
+    if (fd < 0) return -errno;
+    long n = e(write(fd, value, strlen(value)));
+    close(fd);
+    return n;
+}
+
+/* /proc/sys/vm/drop_caches (fs/drop_caches.c): mode 0200, so not even
+   root may read it; proc_dointvec_minmax takes 1 to 4. 2 (drop_slab)
+   frees the inodes nothing uses, and with them their evictable marks
+   (FAN_MARK_EVICTABLE, which hold no reference): not those of an open
+   file, nor one another group's mark without FAN_MARK_EVICTABLE holds.
+
+   One write evicts the free files' inodes, as each is set up so that
+   nothing gives it a second chance. It is made, written back (fsync: a
+   dirty inode is on no LRU) and marked by its descriptor, with no lookup,
+   so its dentry first goes on the LRU at the close and without
+   DCACHE_REFERENCED, which a dput of a dentry already there sets and which
+   makes dentry_lru_isolate rotate it once. The first pass of drop_slab
+   frees the two dentries, so freed > 1 and it passes again, and in that
+   pass their inodes, unused and unreferenced, are freed. */
+static int case_drop_caches(void) {
+    make_base("drop-caches");
+    struct stat st;
+    long got = e(stat("/proc/sys/vm/drop_caches", &st));
+    printf("stat=%ld mode=%o\n", got, got ? 0 : st.st_mode & 07777);
+    printf("read open=%ld\n", e(open("/proc/sys/vm/drop_caches", O_RDONLY)));
+    printf("read-write open=%ld\n", e(open("/proc/sys/vm/drop_caches", O_RDWR)));
+    const char *values[] = {"0", "5", "x", "4\n"};
+    for (int i = 0; i < 4; i++) printf("write %.1s=%ld\n", values[i], drop_caches(values[i]));
+    int fan = fan_init(FAN_NONBLOCK, 0), other = fan_init(FAN_NONBLOCK, 0);
+    if (fan < 0 || other < 0) return 80;
+    const char *names[] = {"free", "free2", "open", "kept"};
+    ino_t inos[4];
+    for (int i = 0; i < 4; i++) {
+        int fd = open(at(names[i]), O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) return 82;
+        fsync(fd);
+        fstat(fd, &st);
+        inos[i] = st.st_ino;
+        printf("evictable %s=%ld\n", names[i],
+               fan_mark(fan, FAN_MARK_ADD | FAN_MARK_EVICTABLE, FAN_OPEN, fd, NULL));
+        if (i == 3) printf("other kept=%ld\n", fan_mark(other, FAN_MARK_ADD, FAN_OPEN, fd, NULL));
+        close(fd);
+    }
+    int held = open(at("open"), O_RDONLY);
+    printf("write 2=%ld\n", drop_caches("2"));
+    for (int i = 0; i < 4; i++) printf("%s marked=%d\n", names[i], marked(fan, inos[i]));
+    /* The free file's inode is a new one: nothing tells of its open. */
+    int fd = open(at("free"), O_RDONLY);
+    if (fd >= 0) close(fd);
+    printf("events=%d\n", drain(fan));
+    close(held);
+    close(fan);
+    close(other);
+    remove_base();
+    return 0;
+}
+
 /* The hash Linux's full_name_hash gives on x86-64, whole little-endian
    words first, then the bytes left over: what fanotify_alloc_name_event
    mixes a name into an event's merge key with, salted with its length. */
@@ -1659,6 +1732,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-noop")) return 0;
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();
+    if (!strcmp(mode, "fanotify-drop-caches")) return case_drop_caches();
     if (!strcmp(mode, "fanotify-merge-window")) return case_merge_window();
     if (!strcmp(mode, "fanotify-superblock-marks")) return case_superblock_marks();
     printf("unknown mode %s\n", mode);

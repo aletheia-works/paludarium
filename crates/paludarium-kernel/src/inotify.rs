@@ -526,6 +526,15 @@ impl Notifier {
     pub(crate) fn watching(&self) -> bool {
         (self.watches.load(Ordering::SeqCst) != 0 || self.fan.active()) && !QUIET.with(Cell::get)
     }
+    /// Whether an inotify watch is on file `key`, which keeps its inode in
+    /// the cache as an inotify mark's reference (`iref`) does.
+    pub(crate) fn watches_file(&self, key: Key) -> bool {
+        self.watches.load(Ordering::SeqCst) != 0
+            && self
+                .instances()
+                .iter()
+                .any(|instance| instance.queue().by_key.contains_key(&key))
+    }
     fn instances(&self) -> Vec<Arc<Instance>> {
         let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
         registry
@@ -1280,6 +1289,7 @@ impl Instance {
     /// added with `IN_MASK_ADD`), or a new watch is made.
     fn watch(&self, key: Key, file_system: u64, directory: bool, mask: u32) -> Result<i32, Errno> {
         let wanted = mask & (ALL_EVENTS | EXCL_UNLINK | ONESHOT);
+        let _use = self.notifier.fan.using();
         let mut queue = self.queue();
         if let Some(&wd) = queue.by_key.get(&key) {
             if mask & MASK_CREATE != 0 {

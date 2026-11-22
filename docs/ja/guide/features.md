@@ -1433,7 +1433,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - io_uring は Linux 6.12 のもので、操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
-  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、それに `IORING_OP_FILES_UPDATE` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
@@ -1441,8 +1441,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - 転送は Linux の `io_prep_rw` と `io_read` または `io_write` と同じ順に調べ、同じところで
   失敗します。準備では優先度、属性、バッファーかベクターを調べ、そこでのエラーは投入を
-  終わらせます。実行で調べるものは、エラーで完了します。記述子（`EBADF`。`IOSQE_FIXED_FILE`
-  も）、バッファーを選ぶ読み出しの提供バッファー（`ENOBUFS`）、アクセスモード、`RWF_*`
+  終わらせます。実行で調べるものは、エラーで完了します。ファイル（記述子がなければ `EBADF`。
+  `IOSQE_FIXED_FILE` では、登録したファイルのスロットが空なら `EBADF`）、バッファーを選ぶ
+  読み出しの提供バッファー（`ENOBUFS`）、アクセスモード、`RWF_*`
   フラグ（`RWF_HIPRI` は `EINVAL`）、範囲、読み出しの `FAN_ACCESS_PERM`、読み書きできない
   ファイル（`EINVAL`。ディレクトリーは `EISDIR`）の順です。オフセット -1 はファイルの位置で、
   位置は動かした分だけ進みます。パイプのようなストリームは、どのオフセットでも受け付けます。
@@ -1467,6 +1468,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   登録がなければ `ENXIO` です。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。
+
+- `IORING_REGISTER_FILES` は、Linux の `io_sqe_files_register` と同じくリングのファイルを
+  登録します。まだ登録していないこと（`EBUSY`）、1 個以上（`EINVAL`）で 1048576 個と
+  RLIMIT_NOFILE 以下であること（`EMFILE`）を調べ、それから記述子を 1 つずつ読みます
+  （`EFAULT`）。記述子 -1 はスロットを空のままにします。開いていない記述子、`O_PATH` の
+  記述子、リングは `EBADF` です。失敗すると何も登録しません。`IOSQE_FIXED_FILE` の要求は、
+  ファイルをスロットで指します。スロットは、記述子を閉じたあともファイルを開いたまま
+  保つので、ファイルのクローズのイベントはスロットが放したときに起こり、書き込み側を
+  スロットに入れたパイプには書き手がいます。
+  - `IORING_UNREGISTER_FILES` は引数を取らず（`EINVAL`）、登録がなければ `ENXIO` です。
+  - `IORING_REGISTER_FILES_UPDATE` と `IORING_OP_FILES_UPDATE` は、
+    `__io_sqe_files_update` と同じく、あるオフセットからのスロットのファイルを置き換えます。
+    スロットが一周しないこと（`EOVERFLOW`）、ファイルを登録してあること（`ENXIO`）、
+    スロットがその中にあること（`EINVAL`）を調べ、それから記述子ごとにスロットを空にして
+    そのファイルを入れます。`IORING_REGISTER_FILES_SKIP` はスロットをそのままにし、-1 は
+    空のままにします。`fget` が見つけない記述子は、スロットを空にしたあとで `EBADF` です。
+    通ったスロットの数を返し、1 つも通らなければエラーを返します。
+  - オフセット `IORING_FILE_INDEX_ALLOC` の `IORING_OP_FILES_UPDATE` は、それぞれのファイルを
+    割り当て範囲の空いたスロットに入れます。最後に埋めた（または最後に空けた）スロットの
+    先から探し、次に範囲の初めから探します（空きがなければ `ENFILE`）。スロットの番号は
+    記述子の上に書きます。
+  - `IORING_REGISTER_FILE_ALLOC_RANGE` はその範囲を決めます（`EOVERFLOW`。登録したファイルを
+    越える範囲は `EINVAL`）。ファイルを登録すると、範囲はそのすべてになります。
 
 - Linux のネイティブな非同期 I/O（libaio が包む呼び出し）は `fs/aio.c` のものです。
   `io_setup` はイベント数を CPU ごとに少なくとも 4 にして 2 倍にし（`0x8000000 / 32` を

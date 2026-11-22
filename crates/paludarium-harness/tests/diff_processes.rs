@@ -984,6 +984,7 @@ mod linux {
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         processes_io_uring_transfers => ("io-uring-transfers","process"),
+        processes_io_uring_files => ("io-uring-files","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

@@ -5066,9 +5066,13 @@ fn accessed(c: &Context<'_>, n: u64, a: [u64; 6], result: &Result<u64, Errno>) {
 /// (`fsnotify_file`). A pipe, a socket or another file no path opened has
 /// none, as Linux's pseudo files are `FMODE_NONOTIFY`.
 pub(crate) fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
-    let Ok(d) = c.files.descriptor(fd) else {
-        return;
-    };
+    if let Ok(d) = c.files.descriptor(fd) {
+        notify_open(c, &d, mask);
+    }
+}
+/// [`notify_descriptor`] of an open file held as `d`, which may be one no
+/// descriptor holds any more (a file `io_uring` registered).
+pub(crate) fn notify_open(c: &Context<'_>, d: &Descriptor, mask: u32) {
     if d.path.is_empty() || d.file.flags() & O_PATH != 0 || d.file.notify_event(mask) {
         return;
     }
@@ -5079,7 +5083,7 @@ pub(crate) fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
     let opener = || crate::fanotify::path_opener(&fs, &d.path);
     c.files.caches.notify.file_event(
         Some((&*fs, &d.path, false)),
-        descriptor_device(c, &d),
+        descriptor_device(c, d),
         &stat,
         mask,
         &opener,

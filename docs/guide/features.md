@@ -1613,7 +1613,7 @@ kernel.
 - io_uring is Linux 6.12's with these operations: `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
-  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, and `IORING_OP_FILES_UPDATE`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. A request runs while `io_uring_enter` takes it, so
@@ -1625,7 +1625,8 @@ kernel.
   `io_write` check it, and fails at the same step. Its preparation takes the
   priority, the attributes, and the buffer or vector, and an error there
   ends the submission. Its issue completes with the error instead: the
-  descriptor (`EBADF`, also for `IOSQE_FIXED_FILE`), a provided buffer for
+  file (`EBADF` for no descriptor, or with `IOSQE_FIXED_FILE` for an empty
+  slot of the registered files), a provided buffer for
   a read that selects one (`ENOBUFS`), the access mode, the `RWF_*` flags
   (`RWF_HIPRI` is `EINVAL`), the range, a read's `FAN_ACCESS_PERM`, and a
   file that cannot read or write (`EINVAL`, `EISDIR` for a directory). An
@@ -1655,6 +1656,34 @@ kernel.
   argument (`EINVAL`) and needs buffers (`ENXIO`). `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
+
+- `IORING_REGISTER_FILES` registers a ring's files as Linux's
+  `io_sqe_files_register` does: none registered yet (`EBUSY`), 1
+  (`EINVAL`) to 1048576 of them and no more than RLIMIT_NOFILE (`EMFILE`),
+  then each descriptor (`EFAULT`). A descriptor of -1 leaves its slot
+  empty, and one that is not open, an `O_PATH` one or a ring is `EBADF`.
+  A failure registers none of them. A request with `IOSQE_FIXED_FILE`
+  names its file by slot. A slot holds its file open after the descriptor
+  is closed, so the file's close events come when the slot lets it go, and
+  a pipe whose write end is in a slot has a writer.
+  - `IORING_UNREGISTER_FILES` takes no argument (`EINVAL`) and needs files
+    (`ENXIO`).
+  - `IORING_REGISTER_FILES_UPDATE` and `IORING_OP_FILES_UPDATE` replace the
+    files of slots from an offset, as `__io_sqe_files_update` does. The
+    slots must not wrap (`EOVERFLOW`), files must be registered (`ENXIO`),
+    and the slots must be within them (`EINVAL`). Each descriptor then
+    empties its slot and puts its file there; `IORING_REGISTER_FILES_SKIP`
+    leaves the slot as it is, and -1 leaves it empty. One that `fget` does
+    not find is `EBADF` after its slot was emptied. They give how many slots
+    they went through, or the error if none.
+  - `IORING_OP_FILES_UPDATE` with the offset `IORING_FILE_INDEX_ALLOC`
+    puts each file in a free slot of the allocation range, looking from
+    past the last slot filled (or the last one emptied), then from the
+    range's start (`ENFILE` when none is free). It writes the slot's index
+    over the descriptor.
+  - `IORING_REGISTER_FILE_ALLOC_RANGE` sets that range (`EOVERFLOW`, and
+    `EINVAL` for a range past the registered files). Registering files
+    makes it all of them.
 
 - Linux's native asynchronous I/O (the calls libaio wraps) is `fs/aio.c`'s.
   `io_setup` makes the number of events at least four for each CPU and

@@ -4666,6 +4666,13 @@ kernel.
   destination, which then reads through a scalar. The memory is read,
   then written, aligned to the size whatever the program's flags, and a
   stack slot written so holds bytes, even where a pointer was spilled.
+  `BPF_LOAD_ACQ` and `BPF_STORE_REL`, of any size, are checked as a load
+  and a store are, aligned whatever the flags, and then refused through
+  the context ("BPF_ATOMIC loads from R%d ctx is not allowed",
+  "BPF_ATOMIC stores into R%d ctx is not allowed", `EACCES`). Master
+  refuses the context before the load and 7.0 after it, so the line of a
+  load is 7.0's, but a load into the register it loads from, which 7.0
+  takes, is refused as master refuses it.
 
 - The context, R1 as a program starts, is the packet's `struct
   __sk_buff`, read and written as Linux lets a socket filter: its 4-byte
@@ -4708,7 +4715,8 @@ kernel.
   -1 gives 0. An atomic in 32 bits changes the lower half of a slot with
   the source's lower half and compares R0's, and the old value comes back
   zero-extended; no other access to a map's value comes between its read
-  and its write. The context is the message's `__sk_buff`: its `len`, `cb[]`
+  and its write. A load-acquire comes back zero-extended, and a
+  store-release writes the source's lower bytes. The context is the message's `__sk_buff`: its `len`, `cb[]`
   from 0 and 0 for the fields an AF_UNIX message does not set.
   `bpf_skb_load_bytes` reads the message, and its relative form reads it
   from the network header, its start, where there is no MAC header

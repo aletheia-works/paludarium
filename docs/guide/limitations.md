@@ -381,9 +381,8 @@ verified.
   context's socket (`__sk_buff.sk`) and a map's own fields (`struct
   bpf_map`), maps from `fd_array` and maps made with `excl_prog_hash`,
   `BPF_LD_IMM64` of BTF IDs
-  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, the load-acquire
-  and store-release atomics (`BPF_LOAD_ACQ`, `BPF_STORE_REL`),
-  `may_goto`, indirect jumps, a pointer with a variable offset, and
+  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, `may_goto`, indirect
+  jumps, a pointer with a variable offset, and
   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
   takes a bounded loop from a privileged loader). A scalar is a value the

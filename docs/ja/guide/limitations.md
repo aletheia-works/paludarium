@@ -327,9 +327,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ヘルパーの大きさ、0 とわからないスカラーを渡す `bpf_get_netns_cookie`、bpf から bpf への
   呼び出しと kfunc、コンテキストのソケット（`__sk_buff.sk`）とマップ自身のフィールド
   （`struct bpf_map`）、`fd_array` からのマップと `excl_prog_hash` を付けて作ったマップ、BTF ID と
-  関数の `BPF_LD_IMM64`、`BPF_LD_ABS` と `BPF_LD_IND`、ロードアクワイアとストア
-  リリースのアトミック演算（`BPF_LOAD_ACQ`、`BPF_STORE_REL`）、`may_goto`、間接ジャンプ、
-  オフセットの決まらないポインタ、条件ジャンプのあるプログラムの
+  関数の `BPF_LD_IMM64`、`BPF_LD_ABS` と `BPF_LD_IND`、`may_goto`、
+  間接ジャンプ、オフセットの決まらないポインタ、条件ジャンプのあるプログラムの
   `BPF_F_TEST_REG_INVARIANTS` です。後ろ向きの辺は Linux の行（"back-edge from insn %d to
   %d"）で断ります。Linux は特権のある読み込み手からの有限のループを受け入れます。スカラーは、
   検証器が知る値か、何もわからないかのどちらかで、Linux のように範囲を持ちません。そのため、

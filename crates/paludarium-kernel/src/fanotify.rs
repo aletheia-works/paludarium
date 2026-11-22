@@ -24,7 +24,7 @@ use paludarium_vfs::MountChange;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, Weak};
 
 // The events, as `include/uapi/linux/fanotify.h` numbers them (the same
 // bits as `fsnotify`'s).
@@ -338,6 +338,14 @@ pub(crate) struct Registry {
     /// The mounts freed since the marks were last looked at, whose marks
     /// go then ([`Registry::unmounted`]).
     released: Mutex<Vec<u64>>,
+    /// The devices of the superblocks gone since then, whose marks go too
+    /// ([`Registry::superblock_gone`]).
+    superblocks: Mutex<Vec<u64>>,
+    /// Taken shared by each new use of a file ([`Registry::using`]) and
+    /// alone by an eviction's check and removal ([`Registry::evict_of`]),
+    /// as Linux's `evict` and a new reference meet at the inode's lock: a
+    /// use the check does not see comes after the eviction.
+    uses: RwLock<()>,
     /// The inodes of the mount namespaces, the only namespaces a mount
     /// namespace mark may be on (`mnt_ns_from_dentry`), each with its
     /// tables: the first namespace's table is replaced when the machine's
@@ -525,8 +533,108 @@ struct Event {
     body: Body,
     /// A permission event's number in its group's answers ([`Answer`]).
     perm: Option<u64>,
+    /// Its merge hash's bucket ([`Event::hash`]), set as it is queued.
+    bucket: u32,
 }
+/// `FANOTIFY_HTABLE_SIZE`: the buckets of a group's events still queued,
+/// by their hash, that a new one may merge into, and how many of a
+/// bucket's newest it looks at (`FANOTIFY_MAX_MERGE_EVENTS`).
+const BUCKETS: u32 = 128;
+const MAX_MERGE_EVENTS: usize = 128;
+
+/// `full_name_hash` of `bytes` with `salt`, as Linux computes it on x86-64
+/// (`CONFIG_DCACHE_WORD_ACCESS`, little-endian words): each whole word
+/// mixed in, then the bytes left over, folded to 32 bits.
+pub(crate) fn full_name_hash(salt: u64, bytes: &[u8]) -> u32 {
+    const GOLDEN_RATIO_64: u64 = 0x61C8_8646_80B5_83EB;
+    let (mut x, mut y) = (0u64, salt);
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+        x ^= u64::from_le_bytes(*word);
+        y ^= x;
+        x = x.rotate_left(12);
+        x = x.wrapping_add(y);
+        y = y.rotate_left(45);
+        y = y.wrapping_mul(9);
+    }
+    if !rest.is_empty() {
+        let mut a = [0; 8];
+        a[..rest.len()].copy_from_slice(rest);
+        x ^= u64::from_le_bytes(a);
+    }
+    y ^= x.wrapping_mul(GOLDEN_RATIO_64);
+    y = y.wrapping_mul(GOLDEN_RATIO_64);
+    (y >> 32) as u32
+}
+/// `hash_32(value, FANOTIFY_EVENT_HASH_BITS)`: the 29 bits of an event's
+/// hash field, 32 less the 3 of its type (`FANOTIFY_EVENT_TYPE_BITS`, for
+/// the 7 types up to `FANOTIFY_EVENT_TYPE_MNT`).
+fn hash_32(value: u32) -> u32 {
+    value.wrapping_mul(0x61C8_8647) >> 3
+}
+/// `fanotify_hash_fsid`.
+fn hash_fsid(fsid: [u32; 2]) -> u32 {
+    hash_32(fsid[0]) ^ hash_32(fsid[1])
+}
+/// `fanotify_hash_fh`: of the handle's bytes, salted with its type and
+/// length.
+fn hash_handle(handle: &Handle) -> u32 {
+    full_name_hash(
+        u64::from(handle.kind & 0xff) | (handle.bytes.len() as u64) << 8,
+        &handle.bytes,
+    )
+}
+/// What stands for the hash of a kernel address that Linux mixes in (a
+/// task's `struct pid`, a path's dentry and mount): a hash of the value
+/// that names the same thing here.
+fn hash_address(value: u64) -> u32 {
+    let mut x = value ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    (x >> 32) as u32
+}
+
 impl Event {
+    /// The merge key's hash, as `fanotify_alloc_event` mixes it: the
+    /// file system ID, the handles and the names of the event's records as
+    /// Linux hashes them, so that the events of names in one directory by
+    /// one task share a bucket as on Linux; a path, and the task with
+    /// `FAN_ONDIR`, where Linux hashes kernel addresses, by a hash of their
+    /// own.
+    fn hash(&self) -> u32 {
+        let mut hash = match &self.body {
+            Body::Path { key, .. } => hash_address(key.0) ^ hash_address(key.1.rotate_left(17)),
+            Body::Fid { fsid, object } => hash_fsid(*fsid) ^ hash_handle(object),
+            Body::Name {
+                fsid,
+                dir,
+                name,
+                dir2,
+                name2,
+                file,
+            } => {
+                let mut hash = hash_fsid(*fsid);
+                for handle in [dir, dir2, file].into_iter().flatten() {
+                    hash ^= hash_handle(handle);
+                }
+                for name in [name, name2] {
+                    if !name.is_empty() {
+                        hash ^= full_name_hash(name.len() as u64, name);
+                    }
+                }
+                hash
+            }
+            Body::Mount(_) | Body::Overflow => 0,
+        };
+        hash ^= hash_address(u64::from(self.pid) | u64::from(self.mask & ONDIR) << 32);
+        hash
+    }
+    /// Whether it is in the merge hash (`fanotify_is_hashed_event`): not a
+    /// permission event nor the overflow event.
+    fn hashed(&self) -> bool {
+        self.perm.is_none() && !matches!(self.body, Body::Overflow)
+    }
     /// `fanotify_should_merge`.
     fn merges(&self, new: &Event) -> bool {
         if self.pid != new.pid
@@ -911,20 +1019,26 @@ impl Registry {
             lock(&self.released).push(id);
         }
     }
-    /// Takes off the marks of the mounts freed since the last look, as
-    /// `fsnotify_destroy_marks` does, giving them back to their users.
+    /// Takes off the marks of the mounts freed and of the superblocks gone
+    /// since the last look, as `fsnotify_destroy_marks` does, giving them
+    /// back to their users.
     fn purge(&self) {
         let released = std::mem::take(&mut *lock(&self.released));
-        if released.is_empty() {
+        let devices = std::mem::take(&mut *lock(&self.superblocks));
+        if released.is_empty() && devices.is_empty() {
             return;
         }
         for group in self.live_groups() {
             let removed = {
                 let mut queue = group.queue();
                 let before = queue.marks.len();
-                queue.marks.retain(
-                    |m| !matches!(m.target, Target::Mount(id, _) if released.contains(&id)),
-                );
+                queue.marks.retain(|m| match m.target {
+                    Target::Mount(id, _) => !released.contains(&id),
+                    Target::Inode((device, _)) | Target::FileSystem(device) => {
+                        !devices.contains(&device)
+                    }
+                    Target::Namespace(_) => true,
+                });
                 (before - queue.marks.len()) as u64
             };
             if removed > 0 {
@@ -995,6 +1109,107 @@ impl Registry {
                     false,
                 );
             }
+        }
+    }
+
+    /// `drop_slab`'s end of the evictable marks (`FAN_MARK_EVICTABLE`,
+    /// which hold no reference to their inode) on the files whose inodes it
+    /// evicts: a file not on a tmpfs, whose dentries stay, and not a
+    /// directory (whose children's dentries may hold it, which are not
+    /// known here), that `held` does not keep in use (an open description,
+    /// a working directory, an inotify watch) and that no mark without
+    /// `FAN_MARK_EVICTABLE` holds (`fsnotify_update_iref`). As
+    /// `fsnotify_inode_delete` does, each of its marks goes then.
+    pub(crate) fn evict(&self, held: &dyn Fn(Key) -> bool) {
+        if !self.active() {
+            return;
+        }
+        let candidates = self.evictable();
+        self.evict_of(candidates, held);
+    }
+
+    /// Held while a file gets a new use (an open description, a hold, a
+    /// running program, a kernel open, an inotify watch or a mark), which
+    /// an eviction then either sees or comes before ([`Self::evict_of`]).
+    pub(crate) fn using(&self) -> RwLockReadGuard<'_, ()> {
+        self.uses.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The files [`Self::evict`] may evict as the marks are now: each once,
+    /// with an evictable mark, not on a tmpfs, not a directory, and with no
+    /// mark that holds it. Whether they are in use is checked as they go.
+    pub(crate) fn evictable(&self) -> Vec<Key> {
+        let (mut candidates, mut pinned) = (Vec::new(), std::collections::HashSet::new());
+        for group in &self.groups() {
+            for m in &group.queue().marks {
+                let Target::Inode(key) = m.target else {
+                    continue;
+                };
+                if m.flags & NO_IREF == 0 {
+                    pinned.insert(key);
+                } else if m.kind != paludarium_vfs::TMPFS_MAGIC && !m.directory {
+                    candidates.push(key);
+                }
+            }
+        }
+        candidates.retain(|key| !pinned.contains(key));
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    }
+
+    /// Evicts those of `candidates` ([`Self::evictable`]) that are still
+    /// unused, with no other use made meanwhile: under [`Self::using`]'s
+    /// lock, a mark that holds the file since, or a use `held` sees, keeps
+    /// it, as Linux's `evict` passes over an inode that got a reference.
+    pub(crate) fn evict_of(&self, mut candidates: Vec<Key>, held: &dyn Fn(Key) -> bool) {
+        if candidates.is_empty() {
+            return;
+        }
+        let _uses = self.uses.write().unwrap_or_else(PoisonError::into_inner);
+        let groups = self.groups();
+        for group in &groups {
+            for m in &group.queue().marks {
+                if let Target::Inode(key) = m.target
+                    && m.flags & NO_IREF == 0
+                {
+                    candidates.retain(|&k| k != key);
+                }
+            }
+        }
+        candidates.retain(|&key| !held(key));
+        if candidates.is_empty() {
+            return;
+        }
+        for group in groups {
+            let removed = {
+                let mut queue = group.queue();
+                let before = queue.marks.len();
+                queue.marks.retain(
+                    |m| !matches!(m.target, Target::Inode(key) if candidates.contains(&key)),
+                );
+                (before - queue.marks.len()) as u64
+            };
+            if removed > 0 {
+                self.release(
+                    group.owner,
+                    removed,
+                    group.flags & UNLIMITED_MARKS == 0,
+                    false,
+                );
+            }
+        }
+    }
+
+    /// The superblock of `device` goes, as Linux's `fsnotify_sb_delete` at
+    /// its last mount: the marks on its files (`fsnotify_unmount_inodes`,
+    /// whose `FS_UNMOUNT` no fanotify mark asks for) and on itself
+    /// (`fsnotify_clear_marks_by_sb`) go, so a file system that takes the
+    /// device next is not marked. They go when the marks are next looked
+    /// at ([`Self::purge`]), as a mount's do ([`Self::unmounted`]).
+    pub(crate) fn superblock_gone(&self, device: u64) {
+        if self.active() {
+            lock(&self.superblocks).push(device);
         }
     }
 
@@ -1190,6 +1405,7 @@ impl Registry {
                     },
                     body: Body::Mount(unique),
                     perm: None,
+                    bucket: 0,
                 };
                 let queued = Group::insert(&mut queue, event);
                 drop(queue);
@@ -1511,12 +1727,14 @@ impl Group {
             pid,
             body,
             perm: None,
+            bucket: 0,
         })
     }
 
     /// `fsnotify_insert_event` with `fanotify_merge`: past the limit only
-    /// the overflow event, once; else an event the same as an earlier one
-    /// still queued is merged into it. Whether a new event was queued.
+    /// the overflow event, once; else an event the same as one of the
+    /// newest [`MAX_MERGE_EVENTS`] still queued in its bucket is merged
+    /// into it. Whether a new event was queued.
     fn insert(queue: &mut Queue, event: Event) -> bool {
         if queue.events.len() >= queue.max {
             if queue.overflowed {
@@ -1528,13 +1746,17 @@ impl Group {
                 pid: 0,
                 body: Body::Overflow,
                 perm: None,
+                bucket: 0,
             });
         } else {
+            let mut event = event;
+            event.bucket = event.hash() % BUCKETS;
             if let Some(old) = queue
                 .events
                 .iter_mut()
                 .rev()
-                .filter(|old| !matches!(old.body, Body::Overflow) && old.perm.is_none())
+                .filter(|old| old.hashed() && old.bucket == event.bucket)
+                .take(MAX_MERGE_EVENTS)
                 .find(|old| event.perm.is_none() && old.merges(&event))
             {
                 old.mask |= event.mask;
@@ -2012,6 +2234,7 @@ fn add_mark(
     mark_flags: u32,
     fsid: [u32; 2],
 ) -> Result<(), Errno> {
+    let _use = group.fan().using();
     let mut queue = group.queue();
     let at = match queue.marks.iter().position(|m| m.target == target) {
         Some(at) => at,

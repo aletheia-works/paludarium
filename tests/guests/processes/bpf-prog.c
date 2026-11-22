@@ -51,6 +51,13 @@
    load's access and after a store's, a spilled pointer's fill), and a
    filter that runs them on a map's value and the stack, whose results the
    case reads back from the map.
+   bpf-prog-ldabs: BPF_LD_ABS and BPF_LD_IND in each size: programs it
+   takes and refuses (R6 not the context, or moved, the source register,
+   R1 to R5 after the load, the reserved fields, a 64-bit load), and
+   filters that run them on AF_UNIX datagrams: the bytes they load,
+   big-endian, at offsets from the start, the network header and a
+   register, one that keeps as many bytes as it loads, and the loads past
+   the message or before it, or from the MAC header, which drop it.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -2074,6 +2081,113 @@ static int case_acqrel(void) {
     return 0;
 }
 
+#define ABS(size, imm) I(0x20 | (size), 0, 0, 0, imm)
+#define IND(size, src, imm) I(0x40 | (size), 0, src, 0, imm)
+
+/* Sends 64 bytes (0, 1, 2, ...) through a filter of `insns`, after R6 =
+   the context. */
+static void ldabs_through(const char *name, const struct insn *insns, unsigned count) {
+    struct insn p[16] = {MOV_REG(6, 1)};
+    memcpy(p + 1, insns, count * sizeof *insns);
+    int prog = load(p, count + 1);
+    int pair[2];
+    if (prog < 0 || socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) {
+        say("%s: %d", name, prog);
+        return;
+    }
+    int r = attach(pair[1], prog);
+    if (r) say("%s attach %d", name, r);
+    through(name, pair[0], pair[1], 64);
+    close(pair[0]);
+    close(pair[1]);
+    close(prog);
+}
+#define LDABS_THROUGH(name, ...)                                \
+    do {                                                        \
+        struct insn i_[] = {__VA_ARGS__};                       \
+        ldabs_through((name), i_, COUNT(i_));                   \
+    } while (0)
+
+static int case_ldabs(void) {
+    /* Programs it takes: R6 = the context, then the instructions. */
+#define CTX(name, ...) LOAD(name, MOV_REG(6, 1), __VA_ARGS__, EXIT())
+    CTX("abs 32-bit", ABS(S_W, 0));
+    CTX("abs 16-bit", ABS(S_H, 1));
+    CTX("abs 8-bit", ABS(S_B, 2));
+    CTX("ind of each size", MOV(7, 1), IND(S_W, 7, 0), IND(S_H, 7, -1), IND(S_B, 7, 2));
+    CTX("ind from the frame pointer", IND(S_B, 10, 0));
+    CTX("ind from the context", IND(S_B, 6, 0));
+    CTX("from the network and MAC headers", ABS(S_H, NET(0)), ABS(S_B, LL(0)));
+    CTX("past the end and before the start", ABS(S_W, 0x7fffffff), ABS(S_B, -1));
+    CTX("R6 to R9 kept", MOV(7, 7), MOV(8, 8), MOV(9, 9), ABS(S_B, 0), ADD(0, 1), MOV_REG(0, 9),
+        MOV_REG(0, 8), MOV_REG(0, 7), LDX_W(0, 6, 0));
+    CTX("R0 a number", ABS(S_B, 0), ADD(0, 1));
+
+    /* Programs it refuses. */
+    LOAD("R6 unwritten", ABS(S_B, 0), EXIT());
+    LOAD("R6 a number", MOV(6, 0), ABS(S_B, 0), EXIT());
+    LOAD("R6 the frame pointer", MOV_REG(6, 10), ABS(S_B, 0), EXIT());
+    LOAD("R6 the context moved", MOV_REG(6, 1), ADD(6, 4), ABS(S_B, 0), EXIT());
+    LOAD("R6 a number, the source unwritten", MOV(6, 0), IND(S_B, 7, 0), EXIT());
+    CTX("the source unwritten", IND(S_B, 7, 0));
+    LOAD("the context moved, the source unwritten", MOV_REG(6, 1), ADD(6, 4), IND(S_B, 7, 0), EXIT());
+    CTX("R1 after the load", ABS(S_B, 0), MOV_REG(0, 1));
+    CTX("R5 after the load", MOV(5, 5), ABS(S_B, 0), MOV_REG(0, 5));
+    CTX("a destination", I(0x30, 1, 0, 0, 0));
+    CTX("an offset", I(0x30, 0, 0, 1, 0));
+    CTX("abs with a source", I(0x30, 0, 1, 0, 0));
+    CTX("ind with an offset", I(0x50, 0, 1, 2, 0));
+    CTX("abs 64-bit", I(0x38, 0, 0, 0, 0));
+    CTX("ind 64-bit", I(0x58, 0, 1, 0, 0));
+#undef CTX
+
+    /* What they load, kept in a value of 8 slots. */
+    int value = map(2, 4, 8 * SLOTS, 1, 0);
+    say("map %d", value > 0);
+    int filter = PROGRAM(
+        MOV_REG(6, 1), LD_VALUE(8, value, 0), MOV(7, 5),
+        ABS(S_W, 0), STX_DW(8, 0, 0),
+        ABS(S_H, 1), STX_DW(8, 0, 8),
+        ABS(S_B, 63), STX_DW(8, 0, 16),
+        ABS(S_W, 60), STX_DW(8, 0, 24),
+        IND(S_W, 7, 1), STX_DW(8, 0, 32),
+        IND(S_H, 7, -5), STX_DW(8, 0, 40),
+        ABS(S_H, NET(2)), STX_DW(8, 0, 48),
+        IND(S_B, 7, NET(0)), STX_DW(8, 0, 56),
+        /* The offset is an int: the upper half of R7 goes. */
+        LD64(7, 0x100000003ULL), IND(S_W, 7, 1), STX_DW(8, 0, 64),
+        LD64(7, -0x200000LL), IND(S_B, 7, 0x100009), STX_DW(8, 0, 72),
+        MOV(0, 64), EXIT());
+    say("filter loaded %d", filter >= 0);
+    if (filter < 0) return 1;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    say("attach %d", attach(pair[1], filter));
+    through("loads", pair[0], pair[1], 64);
+    slots("loaded", value);
+    close(pair[0]);
+    close(pair[1]);
+
+    /* What they keep: R0 as loaded, or nothing where the load fails. */
+    LDABS_THROUGH("keep byte 10", ABS(S_B, 10), EXIT());
+    LDABS_THROUGH("keep 16 bits at 9", ABS(S_H, 9), EXIT());
+    LDABS_THROUGH("keep from the network header", ABS(S_B, NET(20)), EXIT());
+    LDABS_THROUGH("keep through R7", MOV(7, 30), IND(S_B, 7, 3), EXIT());
+    LDABS_THROUGH("32 bits at 61", ABS(S_W, 61), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at 64", ABS(S_B, 64), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at -1", ABS(S_B, -1), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at INT_MAX", ABS(S_B, 0x7fffffff), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits at INT_MIN", ABS(S_B, INT32_MIN), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits from the network header at 64", ABS(S_B, NET(64)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits below the network header", ABS(S_B, NET(-1)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits from the MAC header", ABS(S_B, LL(0)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("8 bits below the MAC header", ABS(S_B, LL(-1)), MOV(0, 3), EXIT());
+    LDABS_THROUGH("ind at -1", MOV(7, -1), IND(S_B, 7, 0), MOV(0, 3), EXIT());
+    LDABS_THROUGH("ind past the end", MOV(7, 62), IND(S_H, 7, 1), MOV(0, 3), EXIT());
+    LDABS_THROUGH("ind at the end", MOV(7, 62), IND(S_H, 7, 0), MOV(0, 3), EXIT());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -2085,5 +2199,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-classic")) return case_classic();
     if (!strcmp(mode, "bpf-prog-atomic")) return case_atomic();
     if (!strcmp(mode, "bpf-prog-acqrel")) return case_acqrel();
+    if (!strcmp(mode, "bpf-prog-ldabs")) return case_ldabs();
     return 2;
 }

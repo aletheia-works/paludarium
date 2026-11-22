@@ -1748,7 +1748,10 @@ kernel.
   alone; a hang-up, which has no key, what is ready). The call that makes
   the file ready, in this process or another (a forked child's write to the
   pipe), puts the event in the ring before it returns, so a program that
-  takes events from the ring itself sees it without a call. `io_cancel`
+  takes events from the ring itself sees it without a call. So does a
+  timerfd that expires while the program runs without a call: the next
+  checkpoint of a running thread completes the poll, as Linux's timer does
+  from its wake-up. `io_cancel`
   cancels only a poll that waits (`EINPROGRESS`, with an event of no events
   in the ring), and gives `EINVAL` for another request. `io_getevents` and
   `io_pgetevents` take events from the head and wait for `min_nr` of them

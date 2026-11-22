@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -874,6 +875,64 @@ static int case_reap(void) {
     return 0;
 }
 
+static volatile sig_atomic_t give_up;
+static void on_give_up(int sig) {
+    (void)sig;
+    give_up = 1;
+}
+
+/* A timerfd that expires while the program spins on the ring with no
+   system call: Linux's timer completes the poll from its wake-up, so the
+   event is in the ring before any call. A POSIX timer's signal ends the
+   spin if it never comes. */
+static int case_timer(void) {
+    aio_context_t ctx = 0;
+    printf("setup=%ld\n", setup(8, &ctx));
+    if (!ctx) return 3;
+    struct aio_ring *ring = (struct aio_ring *)ctx;
+    struct io_event *events = (struct io_event *)(ring + 1);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_give_up;
+    if (sigaction(SIGUSR1, &sa, NULL)) return 4;
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGUSR1;
+    timer_t give;
+    if (timer_create(CLOCK_MONOTONIC, &sev, &give)) return 5;
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd < 0) return 6;
+    struct iocb cb = poll_of(tfd, POLLIN, 9);
+    printf("submit=%ld in-ring=%u\n", submit1(ctx, &cb), (ring->tail - ring->head) % ring->nr);
+    struct itimerspec ten = {.it_value = {.tv_sec = 10}};
+    struct itimerspec soon = {.it_value = {.tv_nsec = 20000000}};
+    unsigned head = ring->head, tail = head;
+    give_up = 0;
+    if (timer_settime(give, 0, &ten, NULL)) return 7;
+    if (timerfd_settime(tfd, 0, &soon, NULL)) return 8;
+    while (!give_up) {
+        tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+        if (tail != head) break;
+    }
+    struct itimerspec off = {{0, 0}, {0, 0}};
+    timer_settime(give, 0, &off, NULL);
+    if (tail == head) {
+        printf("never came\n");
+    } else {
+        struct io_event ev = events[head];
+        printf("reaped: in-ring=%u data=%llu obj=%d res=%#llx res2=%lld\n", (tail - head) % ring->nr,
+               (unsigned long long)ev.data, ev.obj == (uint64_t)(uintptr_t)&cb, (long long)ev.res,
+               (long long)ev.res2);
+        __atomic_store_n(&ring->head, (head + 1) % ring->nr, __ATOMIC_RELEASE);
+    }
+    uint64_t ticks = 0;
+    struct io_event ev[8];
+    printf("after: getevents=%ld read=%zd ticks=%llu destroy=%ld\n", getevents(ctx, 0, 8, ev, &zero),
+           read(tfd, &ticks, sizeof ticks), (unsigned long long)ticks, destroy(ctx));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -887,6 +946,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "aio-lifetime")) return case_lifetime(argc, argv);
     if (!strcmp(mode, "aio-mremap")) return case_mremap();
     if (!strcmp(mode, "aio-reap")) return case_reap();
+    if (!strcmp(mode, "aio-timer")) return case_timer();
     if (!strcmp(mode, "aio-exec") && argc > 3) return case_exec(argv);
     return 2;
 }

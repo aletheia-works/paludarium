@@ -18,10 +18,12 @@
 //! the file is ready; otherwise it waits in the context until the file is
 //! ready or the request is cancelled. Whether it is ready is looked at in
 //! every context of the machine that holds a poll, before and after each
-//! call of any process and while a call waits (see [`progress`]): the call
-//! that makes the file ready, such as another process's write to a pipe,
-//! completes the poll before it returns, as Linux's wake-up does, so a
-//! program that takes its events from the ring without a call sees it.
+//! call of any process, while a call waits, and at each checkpoint of a
+//! running thread (see [`progress`]): the call that makes the file ready,
+//! such as another process's write to a pipe, completes the poll before it
+//! returns, as Linux's wake-up does, and so does the next checkpoint after
+//! a timerfd expires, so a program that takes its events from the ring
+//! without a call sees it.
 //!
 //! The contexts belong to the address space, as Linux keeps them on the
 //! `mm`: threads and `CLONE_VM` children share them, a fork's child has
@@ -565,7 +567,8 @@ pub(crate) fn progress(c: &Context<'_>) {
     complete_ready(&c.processes.aio, &c.files.readiness);
 }
 
-/// [`progress`] where no call runs: as a process's last thread ends, after
+/// [`progress`] where no call runs: at a checkpoint of a thread that runs
+/// (a timerfd may have expired), and as a process's last thread ends, after
 /// it closed its files, whose close (a pipe's last writer) may be what a
 /// poll waits for. `hub` is woken if a poll completes.
 pub(crate) fn complete_ready(limits: &Limits, hub: &crate::events::ReadinessHub) {

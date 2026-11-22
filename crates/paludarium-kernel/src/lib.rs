@@ -950,6 +950,11 @@ impl Kernel {
         if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
             self.group.expire_timer(&mut thread.state, now);
         }
+        // A timerfd that has expired may be what a waiting aio poll waits
+        // for, in this process or another: it completes here as the program
+        // runs without a call, as Linux's timer completes it from its
+        // wake-up (`timerfd_tmrproc`).
+        aio::complete_ready(&self.processes.aio, &self.files.readiness);
         self.ptrace_traps(thread, &mut restart);
         while let Some(index) = signals::next_pending(&thread.state, false) {
             let mut signal = thread.state.pending.remove(index);

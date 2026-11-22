@@ -841,9 +841,10 @@ verified.
   the file whatever its size (no `ENOMEM` past it); a mount whose `huge=`
   is not `never` charges a page at a time, where Linux takes a huge page
   whole; and the pages `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring
-  into a shared mapping count only once touched. Its extended attributes take none of the inodes' room
-  (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set` counts
-  them, does not happen); the root from start-up has no limit but
+  into a shared mapping count only once touched. Its extended attributes
+  take none of the inodes' room (`ENOSPC` from `setxattr` past it, as
+  `shmem_xattr_handler_set` counts them, does not happen); the root from
+  start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime
   flags, `sync`, `dirsync` and `mand`; no mount here holds a
   device node but a host directory's (`mknod` of one is `EPERM`), so
@@ -995,8 +996,9 @@ verified.
   with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the
   in-memory file system from start-up (`/tmp` among them) is refused
   (`EINVAL`) though it says it is on a tmpfs, as it stands for the files a
-  guest has on disk, and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
-  private mapping of a shmem file is a page of zeros of its own, which
+  guest has on disk, and a host's tmpfs file is not kept here. A zero
+  page `UFFDIO_ZEROPAGE` gives a private mapping of a shmem file is a
+  page of zeros of its own, which
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
   zero page. A system call's own
   copy to or from a missing page of a registered range, or to a

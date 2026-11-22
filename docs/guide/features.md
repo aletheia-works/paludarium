@@ -368,7 +368,7 @@ kernel.
   `F_SEAL_EXEC` the execute bits, all with `EPERM`. A fault of a mapping
   of a memfd brings the page into the file, as `shmem_fault` does, a
   private mapping's read or copy-on-write fault too, so `st_blocks` counts
-  it. Memfds share a
+  it, as for the files of a tmpfs mount. Memfds share a
   filesystem of their own, as Linux's internal tmpfs mount, so
   `copy_file_range` between one and a file on a mount gives `EXDEV`. Other
   files have no seals (`EINVAL`), even on the in-memory `/tmp`, where a real

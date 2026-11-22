@@ -25,6 +25,8 @@ mod bpf_classic;
 mod bpf_interp;
 mod bpf_prog;
 #[cfg(test)]
+mod bpf_prog_tests;
+#[cfg(test)]
 mod bpf_tests;
 mod bpf_trie;
 mod bpf_verifier;

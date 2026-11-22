@@ -393,7 +393,9 @@ pub(crate) fn sysvipc_entries() -> Vec<paludarium_host::DirectoryEntry> {
     .collect()
 }
 /// `/proc/loadavg` as Linux's `loadavg_proc_show` prints it. The averages
-/// are 0, as `sysinfo` reports them, since nothing measures the load.
+/// are 0, as `sysinfo` reports them, since nothing measures the load; the
+/// running tasks are those `/proc/stat`'s `procs_running` counts
+/// ([`crate::processes::Processes::running_tasks`]).
 pub(crate) fn render_loadavg(running: usize, tasks: usize, last_pid: u32) -> Vec<u8> {
     format!("0.00 0.00 0.00 {running}/{tasks} {last_pid}\n").into_bytes()
 }

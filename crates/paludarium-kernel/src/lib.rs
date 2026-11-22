@@ -1449,6 +1449,10 @@ impl Kernel {
                     born: signals::generation(),
                 })
             }
+            ExitReason::SegmentFault { rip, trap, error } => {
+                thread.cpu.rip = rip;
+                Some(signals::segment_fault(trap, error))
+            }
             ExitReason::GeneralProtection { rip } | ExitReason::Halt { rip } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
@@ -1475,6 +1479,13 @@ impl Kernel {
         }
         match reason {
             ExitReason::Syscall { .. } => {
+                // The entry saves `__USER_CS` and `__USER_DS` as the task's
+                // cs and ss (`entry_SYSCALL_64`), which the return gives
+                // back unless a tracer or `rt_sigreturn` changes them.
+                thread.cpu.segments[paludarium_cpu::segments::CS] =
+                    paludarium_cpu::segments::USER_CS;
+                thread.cpu.segments[paludarium_cpu::segments::SS] =
+                    paludarium_cpu::segments::USER_DS;
                 account_faults(&thread.state, false);
                 let next = self.syscall(thread, mem);
                 account_faults(&thread.state, true);
@@ -1482,7 +1493,9 @@ impl Kernel {
             }
             ExitReason::PageFault { .. }
             | ExitReason::GeneralProtection { .. }
+            | ExitReason::SegmentFault { trap: 13, .. }
             | ExitReason::Halt { .. } => self.terminate(thread, signal::SIGSEGV),
+            ExitReason::SegmentFault { .. } => self.terminate(thread, signal::SIGBUS),
             ExitReason::InvalidOpcode { .. } => self.terminate(thread, signal::SIGILL),
             ExitReason::ArithmeticFault { .. }
             | ExitReason::FloatingPointFault { .. }
@@ -1669,6 +1682,15 @@ impl Kernel {
             }
             syscalls::Outcome::Restored => self.checkpoint(thread, mem),
             syscalls::Outcome::BadFrame => self.terminate(thread, signal::SIGSEGV),
+            // The return to the restored context faults on its SS, as
+            // Linux's `iret` does, at the restored instruction.
+            syscalls::Outcome::RestoredFault(fault) => {
+                signals::queue(
+                    &mut thread.state,
+                    signals::segment_fault(fault.trap(), fault.error()),
+                );
+                self.checkpoint(thread, mem)
+            }
             syscalls::Outcome::Exit(code) => {
                 let status = ExitStatus::Exited(code & 0xff);
                 thread.state.exit_status = Some(status);
@@ -1699,6 +1721,8 @@ mod fanotify_tests;
 mod keys_tests;
 #[cfg(test)]
 mod perf_sample_tests;
+#[cfg(test)]
+mod perf_side_band_tests;
 #[cfg(test)]
 mod perf_tests;
 #[cfg(test)]

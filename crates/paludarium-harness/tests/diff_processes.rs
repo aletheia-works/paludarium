@@ -272,6 +272,7 @@ mod linux {
                     | "fanotify-unprivileged"
                     | "fanotify-mounts"
                     | "fanotify-mount-events"
+                    | "fanotify-mount-moves"
                     | "inotify-unmount"
                     | "fanotify-perm"
                     | "fanotify-access-perm"
@@ -706,6 +707,7 @@ mod linux {
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         fanotify_mounts => ("fanotify-mounts","fanotify"),
         fanotify_mount_events => ("fanotify-mount-events","fanotify"),
+        fanotify_mount_moves => ("fanotify-mount-moves","fanotify"),
         fanotify_perm => ("fanotify-perm","fanotify"),
         fanotify_access_perm => ("fanotify-access-perm","fanotify"),
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),
@@ -977,9 +979,11 @@ mod linux {
         processes_proc_own_at_read => ("proc-own-at-read","process"),
         processes_proc_sizes => ("proc-sizes","process"),
         processes_proc_stat_counters => ("proc-stat-counters","process"),
+        processes_loadavg_running => ("loadavg-running","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
+        processes_segment_registers => ("segment-registers","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),
         processes_cpu_sleep => ("cpu-sleep","process"),

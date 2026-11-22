@@ -487,16 +487,17 @@ pub(crate) struct Event {
     clockid: Option<i32>,
     host: Arc<dyn Host>,
     /// The group's leader, `None` for one that leads its own: taken away
-    /// when either leaves the group (`perf_group_detach`).
-    leader: Mutex<Option<Arc<Event>>>,
-    siblings: Mutex<Vec<Weak<Event>>>,
+    /// when either leaves the group (`perf_group_detach`). It and the
+    /// events below are held by no particular type ([`Held`], [`Erased`]).
+    leader: Mutex<Option<Held>>,
+    siblings: Mutex<Vec<Erased>>,
     state: Mutex<State>,
     /// For one a new task inherited (`inherit`), the event it comes from,
     /// the one opened, as Linux keeps `parent` at the top of the tree.
-    parent: Option<Weak<Event>>,
+    parent: Option<Erased>,
     /// The opened event's inherited ones, of the tasks that still run
     /// (`child_list`).
-    children: Mutex<Vec<Arc<Event>>>,
+    children: Mutex<Vec<Held>>,
     /// The ring buffer it writes to (`rb`), while one is mapped.
     rb: Mutex<Option<Arc<buffer::Buffer>>>,
     /// What the mappings of the buffer it made hold (`mmap_count`).
@@ -559,6 +560,28 @@ fn erase<T: Send + Sync + 'static>(value: &Arc<T>) -> Erased {
 /// The event an [`Erased`] holds, while it is there.
 fn event(erased: &Erased) -> Option<Arc<Event>> {
     erased.upgrade()?.downcast::<Event>().ok()
+}
+
+/// An [`Event`] another holds (its group's leader, or an inherited one),
+/// by no particular type as [`Erased`] is: an event's leader, members,
+/// parent and children are events, and kept by their own type the
+/// compiler's checks of what may be sent between threads would go round
+/// them past their limit.
+#[derive(Clone)]
+struct Held(Arc<dyn std::any::Any + Send + Sync>);
+
+impl Held {
+    fn new(event: &Arc<Event>) -> Self {
+        Self(Arc::clone(event) as _)
+    }
+    /// The event it holds.
+    fn get(&self) -> Option<Arc<Event>> {
+        Arc::clone(&self.0).downcast::<Event>().ok()
+    }
+    /// Whether it holds `event`.
+    fn is(&self, event: &Event) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&self.0), event)
+    }
 }
 
 /// An event and the thread that opened it (`event->owner`).
@@ -727,10 +750,7 @@ impl Event {
     }
     /// The group's members but the leader.
     fn members(&self) -> Vec<Arc<Event>> {
-        lock(&self.siblings)
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect()
+        lock(&self.siblings).iter().filter_map(event).collect()
     }
     fn set_enabled(&self, enabled: bool) {
         {
@@ -767,7 +787,7 @@ impl Event {
         leader: Option<&Arc<Event>>,
     ) -> Option<Arc<Event>> {
         let top = match &self.parent {
-            Some(parent) => parent.upgrade()?,
+            Some(parent) => event(parent)?,
             None => Arc::clone(self),
         };
         let enabled = {
@@ -785,14 +805,14 @@ impl Event {
             cpu: top.cpu,
             clockid: top.clockid,
             host: Arc::clone(&top.host),
-            leader: Mutex::new(leader.cloned()),
+            leader: Mutex::new(leader.map(Held::new)),
             siblings: Mutex::default(),
             state: Mutex::new(State {
                 enabled,
                 paused: leader.is_some_and(|leader| !leader.enabled()),
                 ..State::default()
             }),
-            parent: Some(Arc::downgrade(&top)),
+            parent: Some(erase(&top)),
             children: Mutex::default(),
             rb: Mutex::default(),
             mapped: Mutex::default(),
@@ -803,14 +823,14 @@ impl Event {
             event_limit: Default::default(),
         });
         if let Some(leader) = leader {
-            lock(&leader.siblings).push(Arc::downgrade(&child));
+            lock(&leader.siblings).push(erase(&child));
         }
-        lock(&top.children).push(Arc::clone(&child));
+        lock(&top.children).push(Held::new(&child));
         Some(child)
     }
     /// The inherited events, of the tasks that still run.
     fn children(&self) -> Vec<Arc<Event>> {
-        lock(&self.children).clone()
+        lock(&self.children).iter().filter_map(Held::get).collect()
     }
     /// `_perf_event_enable` and `_disable` through
     /// `perf_event_for_each_child`: the event and those inherited from it.
@@ -858,7 +878,7 @@ impl Event {
     /// `sync_child_event`: an inherited event's task ends, and the event
     /// it comes from takes its count and times.
     fn give_back(self: &Arc<Self>) {
-        let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) else {
+        let Some(parent) = self.parent.as_ref().and_then(event) else {
             return;
         };
         let (count, enabled, running) = self.values();
@@ -868,12 +888,13 @@ impl Event {
             state.child_enabled += enabled;
             state.child_running += running;
         }
-        lock(&parent.children).retain(|child| !Arc::ptr_eq(child, self));
+        lock(&parent.children).retain(|child| !child.is(self));
     }
     /// The group's leader: the event itself or the one it joined.
     fn leader(self: &Arc<Self>) -> Arc<Event> {
         lock(&self.leader)
-            .clone()
+            .as_ref()
+            .and_then(Held::get)
             .unwrap_or_else(|| Arc::clone(self))
     }
     /// `perf_group_detach`: a member leaves its leader's group, and a
@@ -882,13 +903,15 @@ impl Event {
     fn detach(self: &Arc<Self>) {
         let leader = lock(&self.leader).take();
         if let Some(leader) = leader {
-            lock(&leader.siblings)
-                .retain(|member| !std::ptr::eq(member.as_ptr(), Arc::as_ptr(self)));
+            if let Some(leader) = leader.get() {
+                lock(&leader.siblings)
+                    .retain(|member| !std::ptr::addr_eq(member.as_ptr(), Arc::as_ptr(self)));
+            }
             return;
         }
         let members: Vec<Arc<Event>> = std::mem::take(&mut *lock(&self.siblings))
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(event)
             .collect();
         for member in members {
             *lock(&member.leader) = None;
@@ -899,7 +922,7 @@ impl Event {
     fn group(self: &Arc<Self>) -> Vec<Arc<Event>> {
         let leader = self.leader();
         let mut events = vec![Arc::clone(&leader)];
-        events.extend(lock(&leader.siblings).iter().filter_map(Weak::upgrade));
+        events.extend(lock(&leader.siblings).iter().filter_map(event));
         events
     }
     /// `perf_event__read_size`.
@@ -1190,7 +1213,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         cpu,
         clockid,
         host: Arc::clone(c.shared_host),
-        leader: Mutex::new(leader.clone()),
+        leader: Mutex::new(leader.as_ref().map(Held::new)),
         siblings: Mutex::default(),
         state: Mutex::default(),
         parent: None,
@@ -1209,7 +1232,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     if let Some(leader) = &leader {
         event.set_paused(!leader.enabled());
-        lock(&leader.siblings).push(Arc::downgrade(&event));
+        lock(&leader.siblings).push(erase(&event));
     }
     if !attr.flag(bit::DISABLED) {
         event.enable();
@@ -1794,7 +1817,7 @@ mod tests {
             cpu: 0,
             clockid: None,
             host: Arc::new(paludarium_host::testing::RecordingHost::default()),
-            leader: Mutex::new(leader.cloned()),
+            leader: Mutex::new(leader.map(Held::new)),
             siblings: Mutex::default(),
             state: Mutex::default(),
             parent: None,
@@ -1808,7 +1831,7 @@ mod tests {
             event_limit: Default::default(),
         });
         if let Some(leader) = leader {
-            lock(&leader.siblings).push(Arc::downgrade(&event));
+            lock(&leader.siblings).push(erase(&event));
         }
         event
     }

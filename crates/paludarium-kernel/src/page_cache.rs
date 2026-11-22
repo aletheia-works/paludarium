@@ -730,6 +730,14 @@ impl paludarium_mmu::PageSource for FilePages {
     fn shmem(&self) -> bool {
         !self.secret && self.file.shmem_pages()
     }
+    /// A memfd's holes that `MADV_COLLAPSE` fills are its own pages then.
+    fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        if self.shmem() {
+            self.file.allocate(offset, len)
+        } else {
+            Ok(())
+        }
+    }
     /// Whether the memfd holds the page, as shmem's page cache has a folio
     /// there; any other file holds every page.
     fn holds(&self, offset: u64) -> bool {

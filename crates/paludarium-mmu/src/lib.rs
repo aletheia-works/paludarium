@@ -1609,6 +1609,17 @@ impl SharedPages {
     }
 }
 
+/// The size of a transparent huge page, and its alignment.
+const HUGE_PAGE: u64 = 2 << 20;
+
+/// How an extent of `MADV_COLLAPSE` failed: Linux's `madvise_collapse`
+/// goes on to the next extent after some results, and stops at the
+/// others.
+enum Collapse {
+    GoOn(Errno),
+    Stop(Errno),
+}
+
 #[derive(Clone)]
 struct SharedMapping {
     end: u64,
@@ -1762,6 +1773,19 @@ pub trait PageSource: Send + Sync {
     /// `vma_is_shmem`), whose mappings a `userfaultfd` registers.
     fn shmem(&self) -> bool {
         false
+    }
+    /// Whether the file's memory is shmem's (Linux's `shmem_file`), which
+    /// `MADV_COLLAPSE` takes: that of a [`Self::shmem`] file, and of System V
+    /// shared memory, whose VMAs are not shmem's.
+    fn shmem_file(&self) -> bool {
+        self.shmem()
+    }
+    /// Allocates `[offset, offset+len)` of the file, as `MADV_COLLAPSE`
+    /// charges the holes it fills to a shmem file (`shmem_charge`), or
+    /// fails (`ENOSPC` past a tmpfs mount's size).
+    fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        let _ = (offset, len);
+        Ok(())
     }
     /// Whether the file holds the page at `offset`, written or allocated,
     /// as shmem's page cache has a folio there (`filemap_get_entry`);
@@ -6394,10 +6418,13 @@ impl AddressSpaceData {
     /// Linux's `madvise_collapse` of `[start, end)` in the VMA
     /// `[vma_start, vma_end)`: the VMA must be one that may hold a
     /// transparent huge page (`thp_vma_allowable_order` with
-    /// `TVA_FORCED_COLLAPSE`, `EINVAL`): private anonymous memory (shmem's
-    /// and files' are refused here, which Linux takes by their own rules),
-    /// without `MADV_NOHUGEPAGE`, with an `anon_vma` (a page of it was
-    /// written, [`Mapping::written`]) and room for an aligned 2 MiB extent.
+    /// `TVA_FORCED_COLLAPSE`, `EINVAL`): without `MADV_NOHUGEPAGE`, with
+    /// room for an aligned 2 MiB extent, and either private anonymous
+    /// memory with an `anon_vma` (a page of it was written,
+    /// [`Mapping::written`]) or a mapping of shmem's page cache
+    /// ([`Self::collapse_shmem_vma`]). A regular file's mapping is refused
+    /// here, which Linux takes by rules that changed after v6.12 and by the
+    /// state of the host's page cache.
     /// Then each whole aligned extent of the range is collapsed
     /// ([`Self::collapse_extent`]): `EBUSY` ends it at once; the failures
     /// Linux goes on past (`EINVAL` here) are the result once the others
@@ -6409,7 +6436,6 @@ impl AddressSpaceData {
         start: u64,
         end: u64,
     ) -> Result<(), Errno> {
-        const HUGE: u64 = 2 << 20;
         let Some(&mapping) = self.mapping_at(vma_start) else {
             return Err(Errno::EINVAL);
         };
@@ -6418,27 +6444,188 @@ impl AddressSpaceData {
             MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
         ) && self.shared_at(vma_start).is_none()
             && self.backing_at(vma_start).is_none();
-        let room = vma_end >= HUGE && (vma_end - HUGE) & !(HUGE - 1) >= vma_start;
+        let room = vma_end >= HUGE_PAGE && (vma_end - HUGE_PAGE) & !(HUGE_PAGE - 1) >= vma_start;
+        if mapping.huge_pages == Some(false) || !room {
+            return Err(Errno::EINVAL);
+        }
+        if !anonymous {
+            return self.collapse_shmem_vma(&mapping, vma_start, start, end);
+        }
         let written = self
             .mappings
             .range(vma_start..vma_end)
             .any(|(_, m)| m.written);
-        if !anonymous || mapping.huge_pages == Some(false) || !room || !written {
+        if !written {
             return Err(Errno::EINVAL);
         }
-        let first = start.next_multiple_of(HUGE);
-        let last = end & !(HUGE - 1);
+        let first = start.next_multiple_of(HUGE_PAGE);
+        let last = end & !(HUGE_PAGE - 1);
         let mut failed = None;
         let mut extent = first;
         while extent < last {
-            match self.collapse_extent(extent, extent + HUGE, mapping.userfault.is_some()) {
+            match self.collapse_extent(extent, extent + HUGE_PAGE, mapping.userfault.is_some()) {
                 Ok(()) => {}
                 Err(e) if e == Errno::EINVAL => failed = Some(e),
                 Err(e) => return Err(e),
             }
-            extent += HUGE;
+            extent += HUGE_PAGE;
         }
         failed.map_or(Ok(()), Err)
+    }
+
+    /// The page cache the mapping at `page` shows, if it is shmem's
+    /// (Linux's `shmem_file`): that of shared memory of no file, or of a
+    /// shared or private mapping of a file whose memory is shmem's
+    /// ([`PageSource::shmem_file`]); with the shift from an address of the
+    /// mapping to the page's key, its offset in the file.
+    fn shmem_cache_at(&self, page: u64) -> Option<(&SharedPages, u64)> {
+        match self.shared_at(page) {
+            Some(shared) => shared
+                .pages
+                .source
+                .as_ref()
+                .is_none_or(|source| source.shmem_file() && !source.fixed())
+                .then_some((&shared.pages, shared.shift)),
+            None => {
+                let backing = self.backing_at(page)?;
+                let file = self
+                    .mapping_at(page)
+                    .is_some_and(|m| m.kind == MappingKind::File);
+                if !file || !backing.source.shmem_file() || backing.source.fixed() {
+                    return None;
+                }
+                Some((backing.cache.as_ref()?, backing.shift))
+            }
+        }
+    }
+
+    /// Whether shmem's page cache holds the page at `page` of a mapping of
+    /// it, as `collapse_file` finds a folio there: one a mapping touched,
+    /// or one the file holds ([`PageSource::holds`]). A file whose memory
+    /// is shmem's but whose VMAs are not (System V shared memory's) has
+    /// only the pages its mappings touched.
+    fn collapse_holds(&self, pages: &SharedPages, shift: u64, page: u64) -> bool {
+        pages.has(page.wrapping_add(shift))
+            || self
+                .file_at(page)
+                .is_some_and(|(source, offset)| source.shmem() && source.holds(offset))
+    }
+
+    /// `MADV_COLLAPSE` of `[start, end)` in a VMA of shmem's page cache,
+    /// from `vma_start`: Linux's `shmem_allowable_huge_orders` takes any
+    /// (the mount's `huge=` option and sysfs are ignored for a forced
+    /// collapse), so long as its addresses and its file offsets are aligned
+    /// to each other (`thp_vma_suitable_order`), else `EINVAL`. Each whole
+    /// aligned extent is then collapsed ([`Self::collapse_shmem_extent`]):
+    /// some failures end it at once, the others are the result once the
+    /// rest are done.
+    fn collapse_shmem_vma(
+        &mut self,
+        mapping: &Mapping,
+        vma_start: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Errno> {
+        let Some((_, shift)) = self.shmem_cache_at(vma_start) else {
+            return Err(Errno::EINVAL);
+        };
+        if shift % HUGE_PAGE != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let modes = mapping.userfault.map_or(0, |u| u.modes);
+        let first = start.next_multiple_of(HUGE_PAGE);
+        let last = end & !(HUGE_PAGE - 1);
+        let mut failed = None;
+        let mut extent = first;
+        while extent < last {
+            match self.collapse_shmem_extent(extent, extent + HUGE_PAGE, modes) {
+                Ok(()) => {}
+                Err(Collapse::GoOn(e)) => failed = Some(e),
+                Err(Collapse::Stop(e)) => return Err(e),
+            }
+            extent += HUGE_PAGE;
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// One aligned 2 MiB extent of shmem's page cache, as Linux's
+    /// `collapse_file` makes it one huge folio and
+    /// `try_collapse_pte_mapped_thp` maps that into the caller:
+    /// - an extent the page cache holds no page of was truncated
+    ///   (`SCAN_TRUNCATED`), which ends the collapse with `EINVAL`;
+    /// - holes in it, with a VMA a `userfaultfd` registered for missing
+    ///   pages, are `EBUSY` (`SCAN_EXCEED_NONE_PTE`), which ends it too;
+    /// - otherwise every page within the file comes into the page cache,
+    ///   zeros in a hole, as a read of the mapping brings it in, and the
+    ///   holes are charged to the file ([`PageSource::allocate`]), which
+    ///   ends it with `EINVAL` where they do not fit (`SCAN_FAIL`);
+    /// - the mapping fails then if a `userfaultfd` protects the VMA for
+    ///   writes (`SCAN_PTE_UFFD`) or a page has a marker
+    ///   (`SCAN_PTE_NON_PRESENT`), which the collapse goes on past, or if a
+    ///   private mapping has its own copy of a page (`SCAN_FAIL`), which
+    ///   ends it.
+    ///
+    /// The huge folio itself is not kept: its 512 pages stay ordinary ones.
+    fn collapse_shmem_extent(&mut self, start: u64, end: u64, modes: u8) -> Result<(), Collapse> {
+        let Some((pages, shift)) = self.shmem_cache_at(start) else {
+            return Err(Collapse::Stop(Errno::EINVAL));
+        };
+        let pages = pages.clone();
+        let within = |s: &Self, page: u64| !s.past_file_end(page);
+        let mut any = false;
+        let mut holes = false;
+        let mut page = start;
+        while page < end {
+            if within(self, page) {
+                if self.collapse_holds(&pages, shift, page) {
+                    any = true;
+                } else {
+                    holes = true;
+                }
+            }
+            page += PAGE_SIZE;
+        }
+        if !any {
+            return Err(Collapse::Stop(Errno::EINVAL));
+        }
+        if holes && modes & Userfault::MISSING != 0 {
+            return Err(Collapse::Stop(Errno(16))); // EBUSY
+        }
+        if holes && let Some((source, offset)) = self.file_at(start) {
+            let len = source.size().map_or(end - start, |size| {
+                size.saturating_sub(offset).min(end - start)
+            });
+            if source.allocate(offset, len).is_err() {
+                return Err(Collapse::Stop(Errno::EINVAL));
+            }
+        }
+        let marked = |s: &Self, page: u64| {
+            s.uffd_markers.contains(page) || s.guarded(page) || s.poisoned(page)
+        };
+        let mut page = start;
+        while page < end {
+            if within(self, page) && !marked(self, page) {
+                let mut byte = [0];
+                let _ = self.read_with(GuestAddr(page), &mut byte, Access::Setup);
+            }
+            page += PAGE_SIZE;
+        }
+        if modes & Userfault::WP != 0 {
+            return Err(Collapse::GoOn(Errno::EINVAL));
+        }
+        let private = self.shared_at(start).is_none();
+        let directory = self.read_directory();
+        let mut page = start;
+        while page < end {
+            if marked(self, page) {
+                return Err(Collapse::GoOn(Errno::EINVAL));
+            }
+            if private && lookup(&directory, page).is_some_and(|pte| !pte.cache) {
+                return Err(Collapse::Stop(Errno::EINVAL));
+            }
+            page += PAGE_SIZE;
+        }
+        Ok(())
     }
 
     /// One aligned 2 MiB extent of `MADV_COLLAPSE`, as Linux's

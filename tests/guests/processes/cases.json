@@ -74,6 +74,7 @@
     {"name":"landlock","binary":"process"},
     {"name":"madvise-advice","binary":"process"},
     {"name":"madvise-collapse","binary":"process"},
+    {"name":"madvise-collapse-shmem","binary":"process"},
     {"name":"madvise-fork","binary":"process"},
     {"name":"madvise-remove","binary":"process"},
     {"name":"lock-state","binary":"process"},

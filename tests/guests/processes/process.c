@@ -8864,6 +8864,85 @@ static int madvise_collapse_case(void) {
     close((int)uffd);
     return 0;
 }
+/* MADV_COLLAPSE of shmem's page cache: shared anonymous memory, a memfd
+ * (shared and private mappings) and System V shared memory, each mapped
+ * where its addresses and file offsets are 2 MiB aligned to each other. */
+static int madvise_collapse_shmem_case(void) {
+    long page = 4096, huge = 2 << 20;
+    char *map = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return 80;
+    char *base = (char *)(((unsigned long)map + huge - 1) & ~(huge - 1));
+    char *shared = mmap(base, 2 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+                        -1, 0);
+    if (shared == MAP_FAILED) return 81;
+    /* No page of the page cache in an extent: it was truncated. */
+    printf("untouched=%ld\n", advice_errno(madvise(shared, 2 * huge, 25)));
+    shared[3 * page] = 7;
+    long first = advice_errno(madvise(shared, 2 * huge, 25));
+    long again = advice_errno(madvise(shared, huge, 25));
+    printf("first=%ld again=%ld resident=%d byte=%d %d\n", first, again, collapse_resident(shared),
+           shared[3 * page], shared[0]);
+    /* A memfd with a page written, mapped at a file offset out of step
+     * with the address, then in step. */
+    int fd = memfd_create("collapse", 0);
+    if (fd < 0 || ftruncate(fd, 2 * huge) || pwrite(fd, "x", 1, 5 * page) != 1) return 82;
+    char *offset = mmap(shared, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, page);
+    if (offset == MAP_FAILED) return 83;
+    printf("offset=%ld\n", advice_errno(madvise(offset, huge, 25)));
+    char *file = mmap(shared, 2 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (file == MAP_FAILED) return 84;
+    long memfd = advice_errno(madvise(file, huge, 25));
+    long rest = advice_errno(madvise(file + huge, huge, 25));
+    struct stat st;
+    if (fstat(fd, &st)) return 85;
+    printf("memfd=%ld rest=%ld blocks=%lld byte=%c %d\n", memfd, rest, (long long)st.st_blocks,
+           file[5 * page], file[6 * page]);
+    /* A private mapping of it: the collapsed extent maps, but an extent
+     * with a page of the mapping's own does not. */
+    char *private = mmap(shared, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if (private == MAP_FAILED) return 86;
+    volatile char sink = private[0];
+    (void)sink;
+    long mapped = advice_errno(madvise(private, huge, 25));
+    private[huge + page] = 1;
+    long copied = advice_errno(madvise(private + huge, huge, 25));
+    printf("private=%ld copied=%ld\n", mapped, copied);
+    close(fd);
+    /* MADV_NOHUGEPAGE refuses shmem's VMAs too. */
+    char *nohuge = mmap(base, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+                        -1, 0);
+    if (nohuge == MAP_FAILED) return 87;
+    nohuge[0] = 1;
+    long advised = advice_errno(madvise(nohuge, huge, MADV_NOHUGEPAGE));
+    printf("nohugepage=%ld collapse=%ld\n", advised, advice_errno(madvise(nohuge, huge, 25)));
+    /* System V shared memory, attached where the PROT_NONE mapping was. */
+    munmap(base, 2 * huge);
+    int id = shmget(IPC_PRIVATE, (size_t)(2 * huge), IPC_CREAT | 0600);
+    if (id < 0) return 88;
+    char *segment = shmat(id, base, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (segment == (void *)-1) return 89;
+    segment[page] = 3;
+    long sysv = advice_errno(madvise(segment, huge, 25));
+    long sysv_rest = advice_errno(madvise(segment + huge, huge, 25));
+    printf("sysv=%ld rest=%ld byte=%d\n", sysv, sysv_rest, segment[page]);
+    shmdt(segment);
+    /* Holes, with a userfaultfd registered for missing pages. */
+    char *armed = mmap(base, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (armed == MAP_FAILED) return 90;
+    armed[0] = 1;
+    long uffd = syscall(SYS_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
+    if (uffd < 0) {
+        printf("userfaultfd=%d\n", -errno);
+        return 0;
+    }
+    unsigned long long api[3] = {0xAA, 0, 0};
+    unsigned long long reg[4] = {(unsigned long)armed, (unsigned long)huge, 1, 0};
+    if (ioctl((int)uffd, 0xC018AA3F, api) || ioctl((int)uffd, 0xC020AA00, reg)) return 91;
+    printf("registered=%ld\n", advice_errno(madvise(armed, huge, 25)));
+    close((int)uffd);
+    return 0;
+}
 /* The VMAs of [start, end) /proc/self/maps lists. It allocates nothing, so
  * that no new mapping lands in the range (a fork's MADV_DONTFORK hole). */
 static int advice_vmas(char *start, char *end) {
@@ -33881,6 +33960,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mlock-private-copy")) return mlock_private_copy_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-collapse")) return madvise_collapse_case();
+    if (!strcmp(mode, "madvise-collapse-shmem")) return madvise_collapse_shmem_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();

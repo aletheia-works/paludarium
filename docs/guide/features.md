@@ -983,16 +983,28 @@ kernel.
   leaving pages without contents. Sealed memory whose pages may not be
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
   which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`).
-  `MADV_COLLAPSE` collapses private anonymous memory as Linux's
-  `madvise_collapse` does, VMA by VMA: a VMA no page of which was written,
-  one with `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent,
-  and shared memory and file mappings refuse it (`EINVAL`), and a range
-  with no whole aligned extent then succeeds. Each whole extent becomes a
-  huge page that holds every page of it, so `mincore` and the resident
-  counts show all 2 MiB, unless no page of it was touched (no page table)
-  or it has a guard, a poison or a uffd-wp marker (`EINVAL`, once the other
-  extents are done), or it lies in a range a `userfaultfd` registered and
-  has an empty page (`EBUSY`, at once). `MADV_HWPOISON` and
+  `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
+  cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
+  `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent, a
+  private anonymous one no page of which was written, a shmem one whose
+  addresses and file offsets are not 2 MiB aligned to each other, and a
+  regular file's mapping refuse it (`EINVAL`), and a range with no whole
+  aligned extent then succeeds. Each whole extent of private anonymous
+  memory becomes a huge page that holds every page of it, so `mincore` and
+  the resident counts show all 2 MiB, unless no page of it was touched (no
+  page table) or it has a guard, a poison or a uffd-wp marker (`EINVAL`,
+  once the other extents are done), or it lies in a range a `userfaultfd`
+  registered and has an empty page (`EBUSY`, at once). Shmem's page cache
+  is that of shared memory of no file, a memfd, a tmpfs file and System V
+  shared memory, mapped shared or private. An extent of it the page cache
+  holds no page of ends the collapse (`EINVAL`), as does one with holes in
+  a VMA a `userfaultfd` registered for missing pages (`EBUSY`). Otherwise
+  every page of the extent within the file comes into the page cache,
+  zeros in a hole, which a memfd or tmpfs file is charged for (`EINVAL`,
+  at once, past its mount's size), and the extent is collapsed, unless the VMA is
+  registered for write protection or a page has a marker (`EINVAL`, once
+  the other extents are done) or a private mapping has a copy of its own
+  of a page (`EINVAL`, at once). `MADV_HWPOISON` and
   `MADV_SOFT_OFFLINE` check the range's arguments, then `CAP_SYS_ADMIN`
   (`EPERM`), before the address limit or any mapping. With it each page in
   turn is brought in by reading it: `EFAULT` for a page no mapping holds,

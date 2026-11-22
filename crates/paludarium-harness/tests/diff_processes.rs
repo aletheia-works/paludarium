@@ -587,6 +587,7 @@ mod linux {
         processes_landlock => ("landlock","process"),
         processes_madvise_advice => ("madvise-advice","process"),
         processes_madvise_collapse => ("madvise-collapse","process"),
+        processes_madvise_collapse_shmem => ("madvise-collapse-shmem","process"),
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),

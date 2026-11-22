@@ -2570,7 +2570,7 @@ kernel.
     entry, and a dump, a notification and a lookup give it as
     `RTA_GATEWAY`. Another route with a gateway of the same metric would
     be its multipath sibling (`rt6_qualify_for_ecmp`), which is
-    `EOPNOTSUPP`; one of the same device and gateway is `EEXIST`, and
+    `EOPNOTSUPP` for now; one of the same device and gateway is `EEXIST`, and
     `RTM_DELROUTE` with a gateway removes only a route through it. Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).

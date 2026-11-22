@@ -1003,7 +1003,7 @@ verified.
   each `EOPNOTSUPP`. An IPv6 gateway's neighbour state does not steer a
   lookup, as Linux's `rt6_check_neigh` does among routes of one metric,
   and two routes with gateways of one metric, which Linux makes
-  multipath siblings, are `EOPNOTSUPP`. A link-local
+  multipath siblings, are `EOPNOTSUPP` for now. A link-local
   destination's scope ID is not taken: the first route to it is. A
   connect without one to it, or a UDP one to a group of the node or the
   link, is `EINVAL`, as Linux's is with no device bound and no multicast

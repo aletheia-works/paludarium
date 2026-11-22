@@ -202,6 +202,8 @@
     {"name":"fanotify-open-exec","binary":"fanotify"},
     {"name":"fanotify-aio-perm","binary":"fanotify"},
     {"name":"fanotify-exec-perm","binary":"fanotify"},
+    {"name":"fanotify-merge-window","binary":"fanotify"},
+    {"name":"fanotify-superblock-marks","binary":"fanotify"},
     {"name":"userfaultfd-calls","binary":"userfaultfd"},
     {"name":"userfaultfd-faults","binary":"userfaultfd"},
     {"name":"userfaultfd-signals","binary":"userfaultfd"},

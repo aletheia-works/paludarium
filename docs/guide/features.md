@@ -4995,7 +4995,10 @@ kernel.
   `mnt_ns_from_dentry` finds none); a mount's mark, by the mount's ID, hears only of the paths
   in that mount, not of a bind mount of the same file system, and fdinfo
   shows that ID; it goes when its mount is freed (`fsnotify_vfsmount_delete`),
-  so a mount that takes the ID next is not marked. Exec's open of the
+  so a mount that takes the ID next is not marked. As a tmpfs's superblock
+  goes with its last mount, the marks on its files and on itself go
+  (`fsnotify_sb_delete`), so one that takes the device next is not marked.
+  Exec's open of the
   program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
   as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as
   `IN_OPEN`. Before that, each such open asks `FAN_OPEN_EXEC_PERM`, then
@@ -5035,7 +5038,13 @@ kernel.
   records of the file's handle (`name_to_handle_at`'s identifier), its
   directory's and its name, a rename's old and new directory and name, and
   `.` for a directory's own event. An event of the same object, process and
-  kind as one still queued merges into it, past `max_queued_events` there is
+  kind as one still queued among the newest 128 of its bucket of the merge
+  hash merges into it (`fanotify_merge`). The bucket comes from the hash
+  `fanotify_alloc_event` mixes: the file system ID, the handles and the
+  names as Linux hashes them (`full_name_hash` on x86-64), so the events of
+  names in one directory by one task share a bucket exactly when they do on
+  Linux; the process, and a path in the non-FID modes, which Linux hashes
+  by kernel address, by a hash of their own. Past `max_queued_events` there is
   one `FAN_Q_OVERFLOW`, and `FAN_REPORT_PIDFD` adds the process's pidfd
   (with `FAN_REPORT_TID` it is `EINVAL`, as on Linux 7.0, which the CI
   runners have; master takes both and gives the thread's). A group with

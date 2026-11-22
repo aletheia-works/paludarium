@@ -110,6 +110,10 @@ struct Descriptor {
     privilege: u8,
     present: bool,
     base: u32,
+    /// The L bit: 64-bit code.
+    long: bool,
+    /// The D bit: 32-bit code or data.
+    default_big: bool,
 }
 
 impl Descriptor {
@@ -120,6 +124,8 @@ impl Descriptor {
             privilege: (d >> 45 & 3) as u8,
             present: d >> 47 & 1 != 0,
             base: ((d >> 16 & 0xff_ffff) | (d >> 56 & 0xff) << 24) as u32,
+            long: d >> 53 & 1 != 0,
+            default_big: d >> 54 & 1 != 0,
         }
     }
     const fn code(&self) -> bool {
@@ -197,6 +203,54 @@ pub fn check_data(selector: u16, ldt: &[u64]) -> Result<u32, SegmentFault> {
         return Err(SegmentFault::NotPresent(error));
     }
     Ok(d.base)
+}
+
+/// The mode the code segment of a far transfer runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeMode {
+    /// 64-bit code (the L bit), as `__USER_CS`.
+    Long,
+    /// 32-bit or 16-bit compatibility mode, as `__USER32_CS`.
+    Compatibility,
+}
+
+/// What a far `jmp` or `call` (`returning` false) or a far `ret` (true) at
+/// privilege 3 checks of the code segment it loads into CS, as the Intel
+/// SDM gives them: not null (`#GP(0)`); within its table, a code segment
+/// rather than data or a system descriptor (Linux's tables hold no call
+/// gates), conforming of a privilege no higher than the CPL (for `ret`,
+/// the RPL), or else non-conforming of exactly that privilege, and not both
+/// L and D (`#GP(selector)`); a `ret` also needs an RPL no lower than the
+/// CPL, and a higher one, a return to an outer level, is none at CPL 3.
+/// Then present (`#NP(selector)`). Gives the mode it runs in.
+///
+/// # Errors
+/// The fault the transfer raises.
+pub fn check_code(selector: u16, ldt: &[u64], returning: bool) -> Result<CodeMode, SegmentFault> {
+    if is_null(selector) {
+        return Err(SegmentFault::GeneralProtection(0));
+    }
+    let error = selector & !3;
+    let fault = SegmentFault::GeneralProtection(error);
+    let d = Descriptor::of(descriptor(selector, ldt).ok_or(fault)?);
+    let rpl = (selector & 3) as u8;
+    let level = if returning { rpl } else { CPL };
+    let privilege_ok = if d.conforming() {
+        d.privilege <= level
+    } else {
+        d.privilege == level
+    };
+    if !d.user || !d.code() || !privilege_ok || d.long && d.default_big || returning && rpl < CPL {
+        return Err(fault);
+    }
+    if !d.present {
+        return Err(SegmentFault::NotPresent(error));
+    }
+    Ok(if d.long {
+        CodeMode::Long
+    } else {
+        CodeMode::Compatibility
+    })
 }
 
 /// Loads `selector` into segment register `sreg` (not CS) of `state`, as
@@ -286,6 +340,51 @@ mod tests {
             Err(SegmentFault::GeneralProtection(0))
         );
         assert_eq!(s.segments[SS], 0x2b);
+    }
+
+    #[test]
+    fn far_transfers_check_the_code_segment() {
+        let ldt = [
+            (ldt_entry(0xb, 0, true) | 1 << 53) & !(1 << 54), // 64-bit code
+            ldt_entry(0xb, 0, false),                         // not present
+            ldt_entry(3, 0, true),                            // data
+            ldt_entry(0xf, 0, true) & !(3 << 45),             // conforming, privilege 0
+            ldt_entry(0xb, 0, true) | 1 << 53,                // both L and D
+        ];
+        assert_eq!(check_code(0x33, &[], false), Ok(CodeMode::Long));
+        // A jump sets the RPL to the CPL; a return needs it.
+        assert_eq!(check_code(0x30, &[], false), Ok(CodeMode::Long));
+        assert_eq!(
+            check_code(0x30, &[], true),
+            Err(SegmentFault::GeneralProtection(0x30))
+        );
+        assert_eq!(check_code(0x23, &[], true), Ok(CodeMode::Compatibility));
+        assert_eq!(check_code(0x7, &ldt, false), Ok(CodeMode::Long));
+        assert_eq!(check_code(0x1f, &ldt, false), Ok(CodeMode::Compatibility));
+        assert_eq!(
+            check_code(0xf, &ldt, false),
+            Err(SegmentFault::NotPresent(0xc))
+        );
+        for (selector, error) in [
+            (0, 0),
+            (3, 0),
+            (0x10, 0x10),
+            (0x2b, 0x28),
+            (0x40, 0x40),
+            (0x83, 0x80),
+        ] {
+            assert_eq!(
+                check_code(selector, &[], false),
+                Err(SegmentFault::GeneralProtection(error)),
+                "{selector:#x}"
+            );
+        }
+        for selector in [0x17, 0x27] {
+            assert_eq!(
+                check_code(selector, &ldt, false),
+                Err(SegmentFault::GeneralProtection(selector & !3))
+            );
+        }
     }
 
     #[test]

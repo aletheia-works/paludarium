@@ -72,6 +72,14 @@ macro_rules! mnemonics {
             /// `pop %fs` and `pop %gs` (0F A1, 0F A9), of `implicit_size`
             /// bytes.
             PopSegment,
+            /// A far `jmp` and `call` through a memory operand (`m16:16`,
+            /// `m16:32` or `m16:64`: an offset of `implicit_size` bytes,
+            /// then the selector), loading CS.
+            JmpFar,
+            CallFar,
+            /// A far `ret`: an offset and a selector in slots of
+            /// `implicit_size` bytes, and an optional immediate.
+            RetFar,
             Jcc(Condition),
             Setcc(Condition),
             Cmovcc(Condition),
@@ -527,15 +535,12 @@ fn map_mnemonic(insn: &iced::Instruction) -> Option<Mnemonic> {
             C::Popw_FS | C::Popq_FS | C::Popw_GS | C::Popq_GS => {
                 return Some(Mnemonic::PopSegment);
             }
-            // Far jumps and calls through memory load CS, which the
-            // virtual CPU does not: unsupported, not the near forms iced
-            // also names `jmp` and `call`.
-            C::Jmp_m1616
-            | C::Jmp_m1632
-            | C::Jmp_m1664
-            | C::Call_m1616
-            | C::Call_m1632
-            | C::Call_m1664 => return None,
+            // Not the near forms iced also names `jmp`, `call` and `ret`.
+            C::Jmp_m1616 | C::Jmp_m1632 | C::Jmp_m1664 => return Some(Mnemonic::JmpFar),
+            C::Call_m1616 | C::Call_m1632 | C::Call_m1664 => return Some(Mnemonic::CallFar),
+            C::Retfw | C::Retfd | C::Retfq | C::Retfw_imm16 | C::Retfd_imm16 | C::Retfq_imm16 => {
+                return Some(Mnemonic::RetFar);
+            }
             _ => {}
         }
     }
@@ -989,6 +994,18 @@ pub fn decode(bytes: &[u8], rip: GuestAddr) -> Result<Instruction, DecodeError> 
                     8
                 }
             }
+            // The size of the offset, and of each slot on the stack.
+            Mnemonic::JmpFar | Mnemonic::CallFar | Mnemonic::RetFar => match insn.code() {
+                iced::Code::Jmp_m1616
+                | iced::Code::Call_m1616
+                | iced::Code::Retfw
+                | iced::Code::Retfw_imm16 => 2,
+                iced::Code::Jmp_m1664
+                | iced::Code::Call_m1664
+                | iced::Code::Retfq
+                | iced::Code::Retfq_imm16 => 8,
+                _ => 4,
+            },
             Mnemonic::Pushfq | Mnemonic::Popfq => 8,
             Mnemonic::Pushf | Mnemonic::Popf => 2,
             Mnemonic::Leave => {
@@ -1196,18 +1213,22 @@ mod tests {
     }
 
     #[test]
-    fn far_jumps_and_calls_are_unsupported_and_near_ones_are_not() {
-        // ljmp *(%rax), lcall *(%rax), rex.w ljmp *(%rax), lret.
-        for bytes in [
-            &[0xff, 0x28][..],
-            &[0xff, 0x18],
-            &[0x48, 0xff, 0x28],
-            &[0x66, 0xff, 0x18],
-            &[0xcb],
+    fn far_transfers_decode_with_their_offset_size_and_near_ones_stay_near() {
+        // ljmp *(%rax), lcall *(%rax), rex.w ljmp *(%rax), 66 lcall *(%rax),
+        // lret, lretq $8, 66 lret.
+        for (bytes, mnemonic, size) in [
+            (&[0xff, 0x28][..], Mnemonic::JmpFar, 4),
+            (&[0xff, 0x18], Mnemonic::CallFar, 4),
+            (&[0x48, 0xff, 0x28], Mnemonic::JmpFar, 8),
+            (&[0x66, 0xff, 0x18], Mnemonic::CallFar, 2),
+            (&[0xcb], Mnemonic::RetFar, 4),
+            (&[0x48, 0xca, 8, 0], Mnemonic::RetFar, 8),
+            (&[0x66, 0xcb], Mnemonic::RetFar, 2),
         ] {
+            let i = decode(bytes, RIP).unwrap();
             assert_eq!(
-                decode(bytes, RIP),
-                Err(DecodeError::Unsupported),
+                (i.mnemonic, i.implicit_size),
+                (mnemonic, size),
                 "{bytes:x?}"
             );
         }

@@ -120,9 +120,7 @@ verified.
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
   so not counted.
   `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
-  Linux has the stop's signal until the tracer's wait, and a process whose
-  leader ended with `exit` before the last of its threads shows the last
-  thread's status, where Linux shows the leader's. `/proc/stat` counts all CPU time as
+  Linux has the stop's signal until the tracer's wait. `/proc/stat` counts all CPU time as
   user time, as `getrusage` does, each thread's to the CPU it was on at its
   system calls, and none as idle; it counts no interrupts or softirqs, and
   as context switches only the times threads went to sleep, as nothing

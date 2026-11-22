@@ -1471,6 +1471,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
   完了（`IORING_FEAT_NODROP`）は Linux と同じです。一度の投入の完了は、Linux が投稿する
   ように、その要求をすべて実行してから入ります（`io_submit_flush_completions`）。
+  ただし、タスクワーク（下）を待つ完了は別です。
+
+- タスクワークは Linux の `io_uring/tw.c` と同じく実行します。`IORING_NOP_TW`、リンクの
+  次の要求、失敗したリンクの残りはタスクワークとして、投入のほかの完了の後に完了します。
+  - `IORING_SETUP_COOP_TASKRUN` のないリングは、呼び出しがプログラムに戻るときに実行します。
+  - 協調的なリングは、スレッドが次にどれかのリングで完了を待つときか、シグナルを受けるときに
+    実行します。
+  - `IORING_SETUP_DEFER_TASKRUN` のリングは、そのリングで `io_uring_enter` が待つときだけ、
+    待ちがそれ以上を求めない限り一度に 20 個（`IO_LOCAL_TW_DEFAULT_MAX`）実行します。
+
+  `IORING_SETUP_TASKRUN_FLAG` があれば、`IORING_SQ_TASKRUN` が待っているものがあることを
+  示します。`IOSQE_CQE_SKIP_SUCCESS` 付きの要求が失敗したリンクは、残りを完了なしで取り消し
+  ます（`REQ_F_SKIP_LINK_CQES`）。
 
 - `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
   `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は

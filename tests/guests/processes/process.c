@@ -9283,6 +9283,135 @@ static int io_uring_files_case(void) {
     return 0;
 }
 
+/* io_uring's task work: an IORING_NOP_TW, and a link's next request, complete
+   after the other completions of their submission. A ring without
+   IORING_SETUP_COOP_TASKRUN runs its task work as the call returns; a
+   cooperative one when the thread next waits on any ring or takes a signal;
+   one with IORING_SETUP_DEFER_TASKRUN only when it waits itself.
+   IORING_SQ_TASKRUN says some is waiting. A link that fails with
+   IOSQE_CQE_SKIP_SUCCESS cancels the rest without their completions. */
+static int uring_open_flags(struct uring *u, unsigned entries, unsigned flags) {
+    unsigned char p[120];
+    memset(p, 0, sizeof p);
+    memcpy(p + 8, &flags, 4);
+    long fd = uring_setup(entries, p);
+    if (fd < 0) return -1;
+    u->fd = (int)fd;
+    u->sq_entries = *u32p(p, 0);
+    u->cq_entries = *u32p(p, 4);
+    u->array = *u32p(p, 64);
+    u->rings = mmap(NULL, u->array + 4 * u->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED,
+                    u->fd, 0);
+    u->sqes = mmap(NULL, 64 * u->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED, u->fd,
+                   0x10000000);
+    return u->rings == MAP_FAILED || u->sqes == MAP_FAILED ? -1 : 0;
+}
+
+static unsigned char *tw_nop(struct uring *u, unsigned long data, unsigned flags, int fd,
+                             unsigned char sqe_flags) {
+    unsigned char *sqe = uring_push(u, 0, data);
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 28, &flags, 4);
+    sqe[1] = sqe_flags;
+    return sqe;
+}
+
+static void tw_submit(struct uring *u, unsigned n, unsigned flags, const char *label) {
+    uring_show(label, uring_enter(u->fd, n, 0, flags, NULL, 0));
+    uring_reap(u, label);
+}
+
+static void tw_taskrun(struct uring *u, const char *label) {
+    printf("%s: taskrun=%u\n", label, *u32p(u->rings, 36) & 4);
+}
+
+static volatile int tw_signals;
+static void tw_handler(int signo) {
+    (void)signo;
+    tw_signals++;
+}
+
+static int io_uring_task_work_case(void) {
+    struct uring u, coop, defer;
+    if (uring_open(&u, 8)) return 80;
+    /* NOP_TW, then a NOP: the NOP first. */
+    tw_nop(&u, 1, 1 << 4, 0, 0);
+    tw_nop(&u, 2, 0, 0, 0);
+    tw_submit(&u, 2, 1, "tw-after");
+    /* A link's second request after a request submitted after the link. */
+    tw_nop(&u, 3, 0, 0, 1 << 2);
+    tw_nop(&u, 4, 0, 0, 0);
+    tw_nop(&u, 5, 0, 0, 0);
+    tw_submit(&u, 3, 1, "link-after");
+    /* Without a wait: in the queue once the call returns. */
+    tw_nop(&u, 6, 1 << 4, 0, 0);
+    tw_submit(&u, 1, 0, "tw-no-wait");
+    /* A NOP that does not find its file fails its link; with
+       IOSQE_CQE_SKIP_SUCCESS the cancelled rest post nothing. */
+    tw_nop(&u, 7, 1 << 1, 999, 1 << 2 | 1 << 6);
+    tw_nop(&u, 8, 0, 0, 1 << 2);
+    tw_nop(&u, 9, 0, 0, 0);
+    tw_submit(&u, 3, 1, "fail-skip");
+    tw_nop(&u, 10, 1 << 1, 999, 1 << 2);
+    tw_nop(&u, 11, 0, 0, 1 << 2);
+    tw_nop(&u, 12, 0, 0, 0);
+    tw_submit(&u, 3, 1, "fail");
+    /* A link whose second request fails to prepare. */
+    tw_nop(&u, 13, 0, 0, 1 << 2 | 1 << 6);
+    tw_nop(&u, 14, 1 << 7, 0, 1 << 2);
+    tw_nop(&u, 15, 0, 0, 0);
+    tw_submit(&u, 3, 1, "prep-fail-skip");
+    tw_nop(&u, 16, 0, 0, 1 << 2);
+    tw_nop(&u, 17, 1 << 7, 0, 1 << 2);
+    tw_nop(&u, 18, 0, 0, 0);
+    tw_submit(&u, 3, 1, "prep-fail");
+    /* A hard link goes on past a failure. */
+    tw_nop(&u, 19, 1 << 1, 999, 1 << 3);
+    tw_nop(&u, 20, 0, 0, 0);
+    tw_submit(&u, 2, 1, "hardlink");
+
+    /* IORING_SETUP_COOP_TASKRUN | _TASKRUN_FLAG: the work waits. */
+    if (uring_open_flags(&coop, 8, 1 << 8 | 1 << 9)) return 81;
+    tw_nop(&coop, 21, 1 << 4, 0, 0);
+    tw_submit(&coop, 1, 0, "coop-no-wait");
+    tw_taskrun(&coop, "coop-pending");
+    /* A wait on another ring runs it: the work is the thread's. */
+    uring_show("other-ring-wait", uring_enter(u.fd, 0, 0, 1, NULL, 0));
+    uring_reap(&coop, "coop-after-other-wait");
+    tw_taskrun(&coop, "coop-ran");
+    /* So does a signal the thread takes. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = tw_handler;
+    if (sigaction(SIGUSR1, &sa, NULL)) return 82;
+    tw_nop(&coop, 22, 1 << 4, 0, 0);
+    tw_submit(&coop, 1, 0, "coop-before-signal");
+    raise(SIGUSR1);
+    printf("signals: %d\n", tw_signals);
+    uring_reap(&coop, "coop-after-signal");
+
+    /* IORING_SETUP_DEFER_TASKRUN: only its own wait runs it. */
+    if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13 | 1 << 9)) return 83;
+    tw_nop(&defer, 23, 1 << 4, 0, 0);
+    tw_submit(&defer, 1, 0, "defer-no-wait");
+    raise(SIGUSR1);
+    uring_show("defer-other-ring-wait", uring_enter(u.fd, 0, 0, 1, NULL, 0));
+    uring_reap(&defer, "defer-still");
+    tw_taskrun(&defer, "defer-pending");
+    uring_show("defer-wait", uring_enter(defer.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&defer, "defer-wait");
+    tw_taskrun(&defer, "defer-ran");
+    /* Submitted and waited for in one call. */
+    tw_nop(&defer, 24, 1 << 4, 0, 0);
+    tw_nop(&defer, 25, 0, 0, 0);
+    tw_submit(&defer, 2, 1, "defer-submit-wait");
+    signal(SIGUSR1, SIG_DFL);
+    close(defer.fd);
+    close(coop.fd);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -35404,6 +35533,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-transfers")) return io_uring_transfers_case();
     if (!strcmp(mode, "io-uring-files")) return io_uring_files_case();
     if (!strcmp(mode, "io-uring-buffers")) return io_uring_buffers_case();
+    if (!strcmp(mode, "io-uring-task-work")) return io_uring_task_work_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

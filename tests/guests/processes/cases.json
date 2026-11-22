@@ -461,6 +461,7 @@
     {"name":"io-uring-transfers","binary":"process"},
     {"name":"io-uring-files","binary":"process"},
     {"name":"io-uring-buffers","binary":"process"},
+    {"name":"io-uring-task-work","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

@@ -1654,11 +1654,27 @@ kernel.
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. A request runs while `io_uring_enter` takes it, so
-  its completion is in the queue when the call returns; links, completions
+  its completion is in the queue when the call returns, unless it waits for
+  task work (below); links, completions
   that skip success, and completions kept while the queue is full
   (`IORING_FEAT_NODROP`) behave as on Linux. The completions of one
   submission go in once all its requests ran, as Linux posts them
   (`io_submit_flush_completions`).
+
+- Task work runs as Linux's `io_uring/tw.c` runs it. An `IORING_NOP_TW`, a
+  link's next request, and the rest of a link that failed complete as task
+  work, after the other completions of their submission.
+  - A ring without `IORING_SETUP_COOP_TASKRUN` runs it as the call returns
+    to the program.
+  - A cooperative ring runs it when the thread next waits for completions
+    on any of its rings, or takes a signal.
+  - A ring with `IORING_SETUP_DEFER_TASKRUN` runs it only as
+    `io_uring_enter` waits on that ring, 20 at a time unless the wait wants
+    more (`IO_LOCAL_TW_DEFAULT_MAX`).
+
+  With `IORING_SETUP_TASKRUN_FLAG`, `IORING_SQ_TASKRUN` shows that some
+  waits. A link whose request fails with `IOSQE_CQE_SKIP_SUCCESS` cancels
+  the rest without their completions (`REQ_F_SKIP_LINK_CQES`).
 
 - `IORING_OP_NOP` takes Linux 7.0's flags, as `io_nop_prep` and `io_nop`
   do. `IORING_NOP_INJECT_RESULT` completes it with its `len`.

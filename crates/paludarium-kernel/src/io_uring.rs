@@ -18,11 +18,15 @@
 //!
 //! The rings are pages the kernel shares with the mappings of the ring's
 //! descriptor ([`SharedPages`]). A request runs when `io_uring_enter` takes
-//! it from the submission queue, and its completion is in the completion
-//! queue before the call returns, so no request is ever in flight: a wait for
-//! more completions than there are ends only by a signal or a timeout. The
-//! setup flags that need a kernel thread, polled I/O or another layout of the
-//! rings give `EINVAL`.
+//! it from the submission queue, and its completion goes in at the end of
+//! the submission, or as task work ([`Deferred`]): an `IORING_NOP_TW`, a
+//! link's next request and the rest of a failed link run after the
+//! submission's completions, when the thread returns to its program, waits
+//! or takes a signal, or with `IORING_SETUP_DEFER_TASKRUN` when it waits on
+//! the ring, as Linux 7.0's `tw.c` runs them. So no request waits for its
+//! file: a wait for more completions than there will be ends only by a
+//! signal or a timeout. The setup flags that need a kernel thread, polled
+//! I/O or another layout of the rings give `EINVAL`.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -88,6 +92,12 @@ const CQ_OVERFLOW: u64 = 44;
 const CQES: u64 = 64;
 /// `IORING_SQ_CQ_OVERFLOW`: completions wait in the kernel for room.
 const SQ_CQ_OVERFLOW: u32 = 1 << 1;
+/// `IORING_SQ_TASKRUN`: with `IORING_SETUP_TASKRUN_FLAG`, task work of the
+/// ring waits to run.
+const SQ_TASKRUN: u32 = 1 << 2;
+/// `IO_LOCAL_TW_DEFAULT_MAX`: the task work an `IORING_SETUP_DEFER_TASKRUN`
+/// ring runs at once, unless a wait wants more completions.
+const LOCAL_TW_DEFAULT_MAX: u32 = 20;
 
 const SQE_BYTES: u64 = 64;
 const CQE_BYTES: u64 = 16;
@@ -148,6 +158,8 @@ const NOP_FIXED_FILE: u32 = 1 << 2;
 /// `IORING_NOP_FIXED_BUFFER`: the NOP looks for registered buffer
 /// `buf_index`.
 const NOP_FIXED_BUFFER: u32 = 1 << 3;
+/// `IORING_NOP_TW`: the NOP completes as task work.
+const NOP_TW: u32 = 1 << 4;
 /// `IORING_NOP_CQE32`: the NOP fills a 32-byte completion, which only an
 /// `IORING_SETUP_CQE32` or `_CQE_MIXED` ring has.
 const NOP_CQE32: u32 = 1 << 5;
@@ -279,6 +291,70 @@ pub(crate) struct Ring {
     files: Mutex<Option<Files>>,
     /// The buffer groups, by ID (`ctx->io_bl_xa`).
     buffer_lists: Mutex<std::collections::BTreeMap<u16, BufferList>>,
+    /// The task work of an `IORING_SETUP_DEFER_TASKRUN` ring, which only
+    /// its waits run (`ctx->work_list`).
+    local: Mutex<VecDeque<Deferred>>,
+}
+
+/// A thread's task work for its rings without
+/// `IORING_SETUP_DEFER_TASKRUN` (`tctx->task_list`), in order: it runs as
+/// the thread returns to its program if the work that started the list came
+/// from a ring without `IORING_SETUP_COOP_TASKRUN` (`TWA_SIGNAL_NO_IPI`),
+/// before a signal is delivered (`get_signal`), and as any of its rings
+/// waits. A new thread has none of its maker's.
+#[derive(Default)]
+pub(crate) struct TaskWork {
+    queue: VecDeque<(Arc<dyn FileHandle>, Deferred)>,
+    notify: bool,
+}
+
+impl Clone for TaskWork {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for TaskWork {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TaskWork {}
+
+impl std::fmt::Debug for TaskWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TaskWork({})", self.queue.len())
+    }
+}
+
+/// Task work: what is left of a request, or of its link, until it runs.
+enum Deferred {
+    /// `io_req_task_complete`: an `IORING_NOP_TW` that ran, its completion,
+    /// the registered files it holds, and the rest of its link.
+    Complete {
+        done: Done,
+        held: Vec<Arc<Node>>,
+        rest: Vec<Request>,
+        flags: u8,
+    },
+    /// `io_req_task_submit`: a link's next request runs, and the rest wait
+    /// for it.
+    Submit(Vec<Request>),
+    /// `io_req_tw_fail_links`: the rest of a link that failed completes,
+    /// each with the error it failed to prepare with or `ECANCELED`, and
+    /// none posts with `REQ_F_SKIP_LINK_CQES`.
+    Fail { chain: Vec<Request>, skip: bool },
+}
+
+/// A request that completed in a batch: its completion, whether it posts
+/// one, and the task work its link goes on with.
+struct Done {
+    user_data: u64,
+    res: i32,
+    flags: u32,
+    post: bool,
+    next: Option<Box<Deferred>>,
 }
 
 /// A buffer group (`struct io_buffer_list`): the buffers
@@ -512,7 +588,7 @@ struct State {
     /// Linux posts once it has issued them all (`compl_reqs`,
     /// `io_submit_flush_completions`); a registered file's tag goes in at
     /// once (`io_post_aux_cqe`).
-    deferred: Option<Vec<(u64, i32, u32)>>,
+    deferred: Option<Vec<Done>>,
     /// The registered files the requests of the running submission found,
     /// in order, which they hold until their completions are posted
     /// (`io_free_batch_list`).
@@ -539,6 +615,7 @@ enum Work {
         result: i32,
         file: Option<(i32, bool)>,
         buffer: Option<u16>,
+        tw: bool,
     },
     EpollCtl {
         epfd: i32,
@@ -630,12 +707,33 @@ impl Ring {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Posts a request's completion, after the others of the running
-    /// submission if one runs ([`State::deferred`]).
-    fn complete(&self, state: &mut State, user_data: u64, res: i32, flags: u32) {
+    /// Keeps a request's completion for the end of the running batch
+    /// ([`State::deferred`]).
+    fn complete(&self, done: Done) {
+        let mut state = self.state();
         match &mut state.deferred {
-            Some(deferred) => deferred.push((user_data, res, flags)),
-            None => self.post(state, user_data, res, flags),
+            Some(deferred) => deferred.push(done),
+            None => {
+                if done.post {
+                    self.post(&mut state, done.user_data, done.res, done.flags);
+                }
+            }
+        }
+    }
+
+    /// Sets or clears `IORING_SQ_TASKRUN`, with `IORING_SETUP_TASKRUN_FLAG`.
+    fn mark_taskrun(&self, set: bool) {
+        if self.flags & SETUP_TASKRUN_FLAG == 0 {
+            return;
+        }
+        let flags = self.load_u32(SQ_FLAGS);
+        let marked = if set {
+            flags | SQ_TASKRUN
+        } else {
+            flags & !SQ_TASKRUN
+        };
+        if marked != flags {
+            self.store_u32(SQ_FLAGS, marked);
         }
     }
 
@@ -653,19 +751,29 @@ impl Ring {
         }
     }
 
-    /// Starts a submission, whose completions wait for its end.
+    /// Starts a batch, a submission or a run of task work, whose
+    /// completions wait for its end.
     fn begin(&self) {
         self.state().deferred = Some(Vec::new());
     }
 
-    /// Ends a submission: its completions go in, in order, then the files
-    /// its requests held go, posting the tags of those no slot holds as
-    /// each request lets go of them.
-    fn end(&self) {
+    /// Ends a batch (`io_submit_flush_completions`): its completions go in,
+    /// in order, then its requests go (`io_free_batch_list`): the task work
+    /// their links go on with, which it gives, and the files they held,
+    /// posting the tags of those no slot holds as each request lets go of
+    /// them.
+    fn end(&self) -> Vec<Deferred> {
         let mut state = self.state();
-        for (user_data, res, flags) in state.deferred.take().unwrap_or_default() {
-            self.post(&mut state, user_data, res, flags);
+        let done = state.deferred.take().unwrap_or_default();
+        for done in &done {
+            if done.post {
+                self.post(&mut state, done.user_data, done.res, done.flags);
+            }
         }
+        let next = done
+            .into_iter()
+            .filter_map(|done| done.next.map(|next| *next))
+            .collect();
         for node in std::mem::take(&mut state.held) {
             if let Some(at) = state.retired.iter().position(|r| Arc::ptr_eq(r, &node))
                 && Arc::strong_count(&node) == 2
@@ -681,6 +789,7 @@ impl Ring {
                 self.post(&mut state, retired.tag, 0, 0);
             }
         }
+        next
     }
 
     /// Puts a completion in the queue, or keeps it while the queue is full
@@ -839,6 +948,7 @@ impl Ring {
                     // `IOSQE_FIXED_FILE` names a registered one too.
                     file: has(NOP_FILE).then(|| (int_at(4), fixed || has(NOP_FIXED_FILE))),
                     buffer: has(NOP_FIXED_BUFFER).then(|| u16::from_le_bytes([sqe[40], sqe[41]])),
+                    tw: has(NOP_TW),
                 }
             }
             OP_EPOLL_CTL => {
@@ -1219,6 +1329,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool) {
             result,
             file,
             buffer,
+            ..
         } => {
             let res = if file.is_some_and(|(fd, fixed)| file_of(c, ring, fd, fixed).is_err()) {
                 -Errno::EBADF.0
@@ -1321,31 +1432,272 @@ fn manage_buffers(
     Ok(0)
 }
 
-/// Completes a chain of linked requests in order, as Linux runs a link once
-/// it is whole: one that failed to prepare fails the chain, whose others
-/// complete with `ECANCELED`; otherwise each runs, and a failure ends the
-/// chain at a soft link (`IOSQE_IO_LINK`) but not at a hard one. A request
-/// that succeeds with `IOSQE_CQE_SKIP_SUCCESS` posts nothing.
-fn complete(c: &mut Context<'_>, ring: &Ring, chain: Vec<Request>) {
-    let prepared = chain.iter().all(|r| r.failed.is_none());
-    let mut cancelled = false;
-    for request in chain {
-        let res = if !prepared {
-            (-request.failed.unwrap_or(ECANCELED).0, 0, true)
-        } else if cancelled {
-            (-ECANCELED.0, 0, true)
-        } else {
-            let (res, flags, failed) = run(c, ring, &request.work);
-            if failed && request.flags & IOSQE_IO_HARDLINK == 0 {
-                cancelled = true;
-            }
-            (res, flags, failed)
+/// Completes a chain of linked requests, as Linux runs a link once it is
+/// whole. One that failed to prepare fails the chain
+/// (`io_queue_sqe_fallback`): its first request completes with its error, or
+/// `ECANCELED`, and the rest as task work ([`Deferred::Fail`]). Otherwise
+/// the first runs ([`issue_link`]).
+fn complete(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, mut chain: Vec<Request>) {
+    if chain.is_empty() {
+        return;
+    }
+    if chain.iter().any(|r| r.failed.is_some()) {
+        let head = chain.remove(0);
+        let skip = head.flags & IOSQE_CQE_SKIP_SUCCESS != 0;
+        ring.complete(Done {
+            user_data: head.user_data,
+            res: -head.failed.unwrap_or(ECANCELED).0,
+            flags: 0,
+            post: true,
+            next: (!chain.is_empty()).then(|| Box::new(Deferred::Fail { chain, skip })),
+        });
+        return;
+    }
+    issue_link(c, file, ring, chain);
+}
+
+/// Runs the first request of a link (`io_issue_sqe`): its completion goes
+/// in the batch, or for an `IORING_NOP_TW` in task work with the
+/// registered files it found.
+fn issue_link(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    ring: &Ring,
+    mut chain: Vec<Request>,
+) {
+    let request = chain.remove(0);
+    let mark = ring.state().held.len();
+    let (res, flags, failed) = run(c, ring, &request.work);
+    let done = Done {
+        user_data: request.user_data,
+        res,
+        flags,
+        post: true,
+        next: None,
+    };
+    if matches!(request.work, Work::Nop { tw: true, .. }) {
+        let held = {
+            let mut state = ring.state();
+            let at = mark.min(state.held.len());
+            state.held.split_off(at)
         };
-        if !res.2 && request.flags & IOSQE_CQE_SKIP_SUCCESS != 0 {
+        queue(
+            c,
+            file,
+            ring,
+            Deferred::Complete {
+                done,
+                held,
+                rest: chain,
+                flags: request.flags,
+            },
+        );
+        return;
+    }
+    ring.complete(finish(done, request.flags, failed, chain));
+}
+
+/// What a request's completion does, after its flags: one that failed posts
+/// even with `IOSQE_CQE_SKIP_SUCCESS` (`req_set_fail`), and so ends its soft
+/// link, whose rest posts nothing if it had the flag
+/// (`REQ_F_SKIP_LINK_CQES`); otherwise the link's next request runs
+/// (`io_req_find_next`).
+fn finish(mut done: Done, flags: u8, failed: bool, rest: Vec<Request>) -> Done {
+    let skip = flags & IOSQE_CQE_SKIP_SUCCESS != 0;
+    done.post = failed || !skip;
+    done.next = if rest.is_empty() {
+        None
+    } else if failed && flags & IOSQE_IO_HARDLINK == 0 {
+        Some(Box::new(Deferred::Fail { chain: rest, skip }))
+    } else {
+        Some(Box::new(Deferred::Submit(rest)))
+    };
+    done
+}
+
+/// Runs a piece of task work in the ring's open batch.
+fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Deferred) {
+    match work {
+        Deferred::Complete {
+            done,
+            held,
+            rest,
+            flags,
+        } => {
+            ring.state().held.extend(held);
+            let failed = done.res < 0;
+            ring.complete(finish(done, flags, failed, rest));
+        }
+        Deferred::Submit(chain) => issue_link(c, file, ring, chain),
+        Deferred::Fail { chain, skip } => {
+            for request in chain {
+                ring.complete(Done {
+                    user_data: request.user_data,
+                    res: -request.failed.unwrap_or(ECANCELED).0,
+                    flags: 0,
+                    post: !skip,
+                    next: None,
+                });
+            }
+        }
+    }
+}
+
+/// Adds task work (`io_req_task_work_add`): to the ring's own list with
+/// `IORING_SETUP_DEFER_TASKRUN` (`io_req_local_work_add`), else to the
+/// thread's (`io_req_normal_work_add`). The work that starts a list sets
+/// `IORING_SQ_TASKRUN`, and starts the thread's with the ring's way of
+/// telling it (`ctx->notify_method`).
+fn queue(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Deferred) {
+    if ring.flags & SETUP_DEFER_TASKRUN != 0 {
+        let first = {
+            let mut local = ring.local.lock().unwrap_or_else(PoisonError::into_inner);
+            local.push_back(work);
+            local.len() == 1
+        };
+        if first {
+            ring.mark_taskrun(true);
+        }
+        return;
+    }
+    let task_work = &mut c.process.task_work;
+    task_work.queue.push_back((Arc::clone(file), work));
+    if task_work.queue.len() == 1 {
+        task_work.notify = ring.flags & SETUP_COOP_TASKRUN == 0;
+        ring.mark_taskrun(true);
+    }
+}
+
+/// Ends a ring's batch and adds the task work its requests' links go on
+/// with.
+fn flush_batch(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring) {
+    for work in ring.end() {
+        queue(c, file, ring, work);
+    }
+}
+
+/// Whether the thread runs its task work as it returns to its program:
+/// with a list a ring without `IORING_SETUP_COOP_TASKRUN` started
+/// (`TIF_NOTIFY_SIGNAL`), or a signal to deliver (`get_signal`).
+pub(crate) fn task_work_due(state: &crate::ThreadState) -> bool {
+    !state.task_work.queue.is_empty()
+        && (state.task_work.notify || crate::signals::next_pending(state, false).is_some())
+}
+
+/// Runs the thread's task work (`tctx_task_work_run`) in order, a batch for
+/// each ring in turn, whose end clears `IORING_SQ_TASKRUN`
+/// (`ctx_flush_and_put`), until none is left.
+pub(crate) fn run_task_work(c: &mut Context<'_>) {
+    let mut current: Option<Arc<dyn FileHandle>> = None;
+    loop {
+        let Some((file, work)) = c.process.task_work.queue.pop_front() else {
+            match current.take() {
+                Some(file) => {
+                    end_task_work(c, &file);
+                    continue;
+                }
+                None => break,
+            }
+        };
+        if !current
+            .as_ref()
+            .is_some_and(|f| std::ptr::addr_eq(Arc::as_ptr(f), Arc::as_ptr(&file)))
+        {
+            if let Some(previous) = current.take() {
+                end_task_work(c, &previous);
+            }
+            if let Ok(ring) = downcast(&file) {
+                ring.begin();
+            }
+            current = Some(Arc::clone(&file));
+        }
+        if let Ok(ring) = downcast(&file) {
+            let _submitting = ring
+                .submitting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            run_deferred(c, &file, ring, work);
+        }
+    }
+    c.process.task_work.notify = false;
+}
+
+fn end_task_work(c: &mut Context<'_>, file: &Arc<dyn FileHandle>) {
+    if let Ok(ring) = downcast(file) {
+        ring.mark_taskrun(false);
+        let _submitting = ring
+            .submitting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        flush_batch(c, file, ring);
+    }
+}
+
+/// Whether an `IORING_SETUP_DEFER_TASKRUN` ring has task work.
+fn local_pending(ring: &Ring) -> bool {
+    !ring
+        .local
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+}
+
+/// Linux's `__io_run_local_work`: runs up to `max_events` of the ring's own
+/// task work at a time, and again while some is left and fewer than
+/// `min_events` ran, ending the batch between; what it leaves sets
+/// `IORING_SQ_TASKRUN` again.
+fn run_local(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    ring: &Ring,
+    min_events: u32,
+    max_events: u32,
+) {
+    let carry_on = |events: u32, min: i64| {
+        if !local_pending(ring) {
+            return false;
+        }
+        if i64::from(events) < min {
+            return true;
+        }
+        ring.mark_taskrun(true);
+        false
+    };
+    let _submitting = ring
+        .submitting
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    ring.mark_taskrun(false);
+    let mut min = i64::from(min_events);
+    let mut ran = 0;
+    let mut open = false;
+    loop {
+        min -= i64::from(ran);
+        if !open {
+            ring.begin();
+            open = true;
+        }
+        ran = 0;
+        while ran < max_events {
+            let Some(work) = ring
+                .local
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+            else {
+                break;
+            };
+            run_deferred(c, file, ring, work);
+            ran += 1;
+        }
+        if carry_on(ran, min) {
             continue;
         }
-        let mut state = ring.state();
-        ring.complete(&mut state, request.user_data, res.0, res.1);
+        flush_batch(c, file, ring);
+        open = false;
+        if !carry_on(ran, min) {
+            return;
+        }
     }
 }
 
@@ -1354,7 +1706,7 @@ fn complete(c: &mut Context<'_>, ring: &Ring, chain: Vec<Request>) {
 /// outside a link ends the submission (after it) unless
 /// `IORING_SETUP_SUBMIT_ALL`; an index past the entries in the queue's
 /// array is dropped and ends it before it.
-fn submit(c: &mut Context<'_>, ring: &Ring, wanted: u32) -> u32 {
+fn submit(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wanted: u32) -> u32 {
     let mask = ring.sq_entries - 1;
     let (mut head, available) = {
         let state = ring.state();
@@ -1394,7 +1746,7 @@ fn submit(c: &mut Context<'_>, ring: &Ring, wanted: u32) -> u32 {
         chain.push(request);
         left -= 1;
         if !linked {
-            complete(c, ring, std::mem::take(&mut chain));
+            complete(c, file, ring, std::mem::take(&mut chain));
             if failed && ring.flags & SETUP_SUBMIT_ALL == 0 {
                 break;
             }
@@ -1402,9 +1754,9 @@ fn submit(c: &mut Context<'_>, ring: &Ring, wanted: u32) -> u32 {
     }
     // A link the submission left open runs as it is.
     if !chain.is_empty() {
-        complete(c, ring, chain);
+        complete(c, file, ring, chain);
     }
-    ring.end();
+    flush_batch(c, file, ring);
     ring.state().sq_head = head;
     ring.store_u32(SQ_HEAD, head);
     total - left
@@ -1516,6 +1868,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         buffers: Mutex::default(),
         files: Mutex::default(),
         buffer_lists: Mutex::default(),
+        local: Mutex::default(),
     };
     ring.store_u32(SQ_RING_MASK, sq_entries - 1);
     ring.store_u32(CQ_RING_MASK, cq_entries - 1);
@@ -1610,19 +1963,35 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         if ring.submitter.is_some_and(|tid| tid != c.tid) {
             return Err(EEXIST);
         }
-        let _submitting = ring
-            .submitting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        ring.flush(&mut ring.state());
-        submitted = submit(c, ring, to_submit);
+        {
+            let _submitting = ring
+                .submitting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ring.flush(&mut ring.state());
+            submitted = submit(c, &file, ring, to_submit);
+        }
         if submitted != to_submit {
             return Ok(u64::from(submitted));
+        }
+        // `io_run_local_work_locked`, before the wait.
+        if flags & ENTER_GETEVENTS != 0
+            && ring.flags & SETUP_DEFER_TASKRUN != 0
+            && local_pending(ring)
+        {
+            run_local(
+                c,
+                &file,
+                ring,
+                min_complete,
+                LOCAL_TW_DEFAULT_MAX.max(min_complete),
+            );
         }
     }
     if flags & ENTER_GETEVENTS != 0 {
         let waited = wait(
             c,
+            &file,
             ring,
             min_complete.min(ring.cq_entries),
             flags,
@@ -1636,12 +2005,14 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     Ok(u64::from(submitted))
 }
 
-/// Linux's `io_cqring_wait`: done once the program has `min` completions
-/// to consume, else it waits, with the signal mask it was given, for a
-/// signal (`EINTR`) or the timeout (`ETIME`). Completions in the queue by
+/// Linux's `io_cqring_wait`: it runs the ring's own task work and the
+/// thread's, then is done once the program has `min` completions to
+/// consume, else it waits, with the signal mask it was given, for a signal
+/// (`EINTR`) or the timeout (`ETIME`), running task work that comes. Completions in the queue by
 /// then make it succeed whatever ended the wait.
 fn wait(
     c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
     ring: &Ring,
     min: u32,
     flags: u32,
@@ -1668,6 +2039,12 @@ fn wait(
     if ring.flags & SETUP_DEFER_TASKRUN != 0 && ring.submitter.is_some_and(|t| t != c.tid) {
         return Err(EEXIST);
     }
+    if local_pending(ring) {
+        run_local(c, file, ring, min, LOCAL_TW_DEFAULT_MAX.max(min));
+    }
+    if !c.process.task_work.queue.is_empty() {
+        run_task_work(c);
+    }
     {
         let mut state = ring.state();
         ring.flush(&mut state);
@@ -1675,6 +2052,9 @@ fn wait(
     if ring.completions() >= min {
         return Ok(());
     }
+    // How many more it waits for (`nr_wait`), as much task work as its
+    // ring's own runs at a time while it waits.
+    let wanted = min - ring.completions();
     let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
     let deadline = if ts == 0 {
         None
@@ -1709,6 +2089,14 @@ fn wait(
         let ticket = c.files.readiness.token.value();
         if ring.completions() >= min {
             break Ok(());
+        }
+        if local_pending(ring) {
+            run_local(c, file, ring, wanted, wanted);
+            continue;
+        }
+        if !c.process.task_work.queue.is_empty() {
+            run_task_work(c);
+            continue;
         }
         if deadline.is_some_and(|end| {
             c.host

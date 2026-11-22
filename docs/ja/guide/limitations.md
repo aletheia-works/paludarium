@@ -422,12 +422,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
   `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
   パーソナリティは登録できず、バッファーは更新できません。タグを付ける
-  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。
-  `IORING_NOP_TW` の NOP もほかと同じく完了しますが、Linux はタスクワークとして投入のほかの
-  完了の後に投稿し、`IORING_SETUP_DEFER_TASKRUN` のリングでは `io_uring_enter` が待つまで
-  投稿しません。リンクの 2 番目以降の要求も投入のほかの要求と一緒に実行しますが、Linux は
-  それらの完了が入ってからタスクワークとして実行するので、その要求が登録ファイルを更新して
-  投稿するタグは、ここではそれらより先になります。登録した
+  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。スレッドが exit や
+  `execve` のときにまだ持っているタスクワークは捨てられ、リングを閉じたときのリング自身の
+  ものも捨てられます。Linux はそれらを取り消しとして実行します（`io_uring_cancel_generic`）。
+  登録した
   バッファーのページは固定されません。固定バッファーの転送は、そのときそのアドレスにマップ
   されているメモリを動かすので、バッファーを外したり読み出し専用にしたりすると `EFAULT` で
   失敗し、リングを共有するプロセスは自分のメモリを動かします。Linux は固定したページを

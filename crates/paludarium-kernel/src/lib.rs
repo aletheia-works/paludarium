@@ -435,6 +435,8 @@ pub struct ThreadState {
     pub(crate) seccomp_restart: Option<bool>,
     /// What the thread keeps of ptrace ([`ptrace::Local`]).
     pub(crate) ptrace: ptrace::Local,
+    /// Its io_uring task work ([`io_uring::TaskWork`]).
+    pub(crate) task_work: io_uring::TaskWork,
 }
 
 impl ThreadState {
@@ -992,6 +994,27 @@ impl Kernel {
         // wake-up (`timerfd_tmrproc`).
         aio::complete_ready(&self.processes.aio, &self.files.readiness);
         self.ptrace_traps(thread, &mut restart);
+        // io_uring's task work runs on the way back to the program, after
+        // the call's ptrace stops and before a signal is taken, as Linux's
+        // `exit_to_user_mode_loop` runs it (`TIF_NOTIFY_SIGNAL`, or
+        // `get_signal`'s `task_work_run`).
+        if io_uring::task_work_due(&thread.state) {
+            let mut ctx = syscalls::Context {
+                number: u64::MAX,
+                tid: thread.tid,
+                host: &*self.host,
+                shared_host: &self.host,
+                files: &mut self.files,
+                process: &mut thread.state,
+                cpu: &mut thread.cpu,
+                mem,
+                cancellation: &self.cancellation,
+                inbox: &self.inbox,
+                group: &self.group,
+                processes: &self.processes,
+            };
+            io_uring::run_task_work(&mut ctx);
+        }
         while let Some(index) = signals::next_pending(&thread.state, false) {
             let mut signal = thread.state.pending.remove(index);
             // A traced thread reports each signal but SIGKILL to its tracer

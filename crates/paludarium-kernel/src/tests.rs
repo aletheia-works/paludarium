@@ -5749,6 +5749,110 @@ mod io_uring {
         assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), 0);
         assert_eq!(one(&mut f, &r, &on_slot(READ, 1, 0, buf, 1)), -9);
     }
+
+    /// A ring set up with `flags`.
+    fn ring_with(f: &mut Fixture, flags: u32) -> Ring {
+        let p = params(f, flags);
+        let fd = f.ret(425, &[4, p]);
+        assert!(fd < 1024, "{fd:#x}");
+        let array = u64::from(u32_at(f, p + 64));
+        let rings = f.ret(9, &[0, array + 16, 3, MAP_SHARED, fd, 0]);
+        let sqes = f.ret(9, &[0, 4096, 3, MAP_SHARED, fd, OFF_SQES]);
+        Ring {
+            fd,
+            rings,
+            sqes,
+            array,
+        }
+    }
+
+    /// Submits `entries` at once with no wait.
+    fn submit_only(f: &mut Fixture, r: &Ring, entries: &[[u8; 64]]) {
+        for e in entries {
+            let slot = u32_at(f, r.rings + 4) & 3;
+            push(f, r, slot, e);
+        }
+        let n = entries.len() as u64;
+        assert_eq!(f.ret(426, &[r.fd, n, 0, 0]), n);
+    }
+
+    #[test]
+    fn task_work_completes_after_the_submission() {
+        const TW: u32 = 1 << 4;
+        const LINK: u8 = 1 << 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        // An IORING_NOP_TW after the others of its submission.
+        assert_eq!(
+            batch(&mut f, &r, &[nop(1, TW, 0, 0, 0), nop(2, 0, 0, 0, 0)]),
+            [(2, 0), (1, 0)]
+        );
+        // A link's next request after them too.
+        let mut head = nop(3, 0, 0, 0, 0);
+        head[1] = LINK;
+        assert_eq!(
+            batch(&mut f, &r, &[head, nop(4, 0, 0, 0, 0), nop(5, 0, 0, 0, 0)]),
+            [(3, 0), (5, 0), (4, 0)]
+        );
+        // On the way back to the program, with no wait.
+        submit_only(&mut f, &r, &[nop(6, TW, 0, 0, 0)]);
+        assert_eq!(reap(&mut f, &r), [(6, 0)]);
+    }
+
+    #[test]
+    fn a_failed_link_skips_the_rest_with_its_cqe_skip() {
+        const FILE: u32 = 1 << 1;
+        const LINK: u8 = 1 << 2;
+        const SKIP: u8 = 1 << 6;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let flagged = |mut e: [u8; 64], flags: u8| {
+            e[1] = flags;
+            e
+        };
+        // A failure shows; the rest of the link is cancelled, and shows
+        // only if the failure did not skip success.
+        let tail = [flagged(nop(2, 0, 0, 0, 0), LINK), nop(3, 0, 0, 0, 0)];
+        let head = flagged(nop(1, FILE, 99, 0, 0), LINK | SKIP);
+        assert_eq!(batch(&mut f, &r, &[head, tail[0], tail[1]]), [(1, -9)]);
+        let head = flagged(nop(1, FILE, 99, 0, 0), LINK);
+        assert_eq!(
+            batch(&mut f, &r, &[head, tail[0], tail[1]]),
+            [(1, -9), (2, -125), (3, -125)]
+        );
+        // So for a link one of whose requests failed to prepare.
+        let bad = flagged(nop(5, 1 << 7, 0, 0, 0), LINK);
+        let head = flagged(nop(4, 0, 0, 0, 0), LINK | SKIP);
+        assert_eq!(
+            batch(&mut f, &r, &[head, bad, nop(6, 0, 0, 0, 0)]),
+            [(4, -125)]
+        );
+        let head = flagged(nop(4, 0, 0, 0, 0), LINK);
+        assert_eq!(
+            batch(&mut f, &r, &[head, bad, nop(6, 0, 0, 0, 0)]),
+            [(4, -125), (5, -22), (6, -125)]
+        );
+    }
+
+    #[test]
+    fn deferred_and_cooperative_task_work_waits_for_a_wait() {
+        const TW: u32 = 1 << 4;
+        const COOP: u32 = 1 << 8;
+        const TASKRUN_FLAG: u32 = 1 << 9;
+        const SINGLE_ISSUER: u32 = 1 << 12;
+        const DEFER: u32 = 1 << 13;
+        const TASKRUN: u32 = 1 << 2;
+        let mut f = fixture();
+        for flags in [COOP | TASKRUN_FLAG, SINGLE_ISSUER | DEFER | TASKRUN_FLAG] {
+            let r = ring_with(&mut f, flags);
+            submit_only(&mut f, &r, &[nop(1, TW, 0, 0, 0)]);
+            assert_eq!(reap(&mut f, &r), [], "{flags:#x}");
+            assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, TASKRUN, "{flags:#x}");
+            assert_eq!(f.ret(426, &[r.fd, 0, 1, GETEVENTS]), 0);
+            assert_eq!(reap(&mut f, &r), [(1, 0)], "{flags:#x}");
+            assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, 0, "{flags:#x}");
+        }
+    }
 }
 
 mod vectored_flags {

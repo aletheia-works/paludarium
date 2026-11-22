@@ -468,6 +468,32 @@ fn individual_exit_does_not_stop_group() {
     assert_eq!(k.group.status(), None);
 }
 #[test]
+fn a_leader_s_own_exit_shows_in_its_process_s_stat_until_a_new_leader() {
+    let mut k = kernel();
+    let mut t = thread();
+    let m = memory();
+    clone(&mut k, &mut t, &m, 0x10900);
+    let (mut child, mut ct) = k.take_child().unwrap();
+    let pid = k.process.pid;
+    // Another thread's exit is its own.
+    child.thread_syscall(&mut ct, &m, 60, [3, 0, 0, 0, 0, 0]);
+    assert_eq!(k.group.leader_exit(), 0);
+    assert_eq!(
+        k.thread_syscall(&mut t, &m, 60, [5, 0, 0, 0, 0, 0]),
+        Some(Next::Exit(ExitStatus::Exited(5)))
+    );
+    assert_eq!(k.group.leader_exit(), 5 << 8);
+    assert_eq!(
+        k.processes
+            .view(pid)
+            .map(|view| (view.zombie, view.exit_code)),
+        Some((false, 5 << 8))
+    );
+    // execve's thread, the new leader, has not exited.
+    k.group.end_exec(pid, pid, Arc::default());
+    assert_eq!(k.group.leader_exit(), 0);
+}
+#[test]
 fn exit_group_stops_all() {
     let mut k = kernel();
     let mut t = thread();

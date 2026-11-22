@@ -10,6 +10,7 @@
 //! larger than the limit is cut there; it still counts as dumped, as Linux's
 //! binfmt_elf reports a core once it has started to write it.
 use crate::signals;
+use paludarium_cpu::segments;
 use paludarium_cpu::{CpuState, FX_WRITTEN, reg};
 use paludarium_mmu::{AddressSpace, Mapping, MappingKind, Prot};
 use paludarium_types::GuestAddr;
@@ -311,6 +312,7 @@ fn prstatus(dump: &Dump, who: &Identity, thread: &ThreadCore) -> [u8; 336] {
     }
     let c = &thread.cpu;
     let g = |r: usize| c.gpr[r];
+    let sel = |n: usize| u64::from(c.segments[n]);
     let registers = [
         g(reg::R15),
         g(reg::R14),
@@ -329,16 +331,16 @@ fn prstatus(dump: &Dump, who: &Identity, thread: &ThreadCore) -> [u8; 336] {
         g(reg::RDI),
         u64::MAX, // orig_rax: not in a system call
         c.rip.0,
-        0x33, // cs
+        sel(segments::CS),
         c.rflags,
         g(reg::RSP),
-        0x2b, // ss
+        sel(segments::SS),
         c.fs_base,
         c.gs_base,
-        0,
-        0,
-        0,
-        0, // ds, es, fs, gs
+        sel(segments::DS),
+        sel(segments::ES),
+        sel(segments::FS),
+        sel(segments::GS),
     ];
     for (i, value) in registers.iter().enumerate() {
         put64(&mut s, 112 + 8 * i, *value);

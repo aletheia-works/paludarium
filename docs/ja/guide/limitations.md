@@ -105,8 +105,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （`EINVAL`、`EFAULT`。eventfd に小さすぎるバッファを渡したときなど）で失敗した読み書きは、
   前で断られたものとして数えません。`stat` の `exit_code` は
   スレッドが ptrace で止まっている間は 0 です（Linux ではトレーサーの wait までその停止の
-  シグナルです）。また、リーダーが `exit` でほかのスレッドより先に終わったプロセスは、
-  Linux ではリーダーのステータスを示すところ、最後のスレッドのステータスを示します。
+  シグナルです）。リーダーが `exit` したあと、プロセスのほかのスレッドが動いている間は、
+  `task` の下のリーダーのディレクトリーは `ENOENT` です（Linux ではゾンビとして示します）。
   `/proc/stat` は CPU 時間をすべて、`getrusage` と同じく
   ユーザー時間として数えます。スレッドの時間は、システムコールのときにいた CPU の分になり、
   アイドルの時間は数えません。割り込みと softirq は数えず、コンテキストスイッチとして数えるのは
@@ -236,7 +236,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   コアダンプのフォールトは最後に終了するスレッドに数えます。Linux はダンプするスレッドに
   数えます。`process_vm_readv`、`process_vm_writev`、`MADV_POPULATE_READ`、
   `MADV_POPULATE_WRITE` は、フォールトを `perf` の `page-faults` にも数えます。Linux の
-  `get_user_pages` は `perf` のイベントにしません。
+  `get_user_pages` は `perf` のイベントにしません。`/proc/<pid>/stat` の `minflt` と
+  `cminflt` も同じ数を読むので、同じ制限があります。
 - **perf のイベントの一部**：数えるのはソフトウェアのイベントだけです。cgroup の切り替え、
   トレースポイント、ブレークポイント、kprobe、uprobe は `ENOENT` で、ハードウェアの
   イベントも、PMU のあるホストでも `ENOENT` です。スレッドの CPU 時間、ページフォルト、
@@ -326,7 +327,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ヘルパーの大きさ、0 とわからないスカラーを渡す `bpf_get_netns_cookie`、bpf から bpf への
   呼び出しと kfunc、コンテキストのソケット（`__sk_buff.sk`）とマップ自身のフィールド
   （`struct bpf_map`）、`fd_array` からのマップと `excl_prog_hash` を付けて作ったマップ、BTF ID と
-  関数の `BPF_LD_IMM64`、`BPF_LD_ABS` と `BPF_LD_IND`、アトミック演算、`may_goto`、間接ジャンプ、
+  関数の `BPF_LD_IMM64`、`BPF_LD_ABS` と `BPF_LD_IND`、ロードアクワイアとストア
+  リリースのアトミック演算（`BPF_LOAD_ACQ`、`BPF_STORE_REL`）、`may_goto`、間接ジャンプ、
   オフセットの決まらないポインタ、条件ジャンプのあるプログラムの
   `BPF_F_TEST_REG_INVARIANTS` です。後ろ向きの辺は Linux の行（"back-edge from insn %d to
   %d"）で断ります。Linux は特権のある読み込み手からの有限のループを受け入れます。スカラーは、
@@ -392,17 +394,25 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **保護キー**：仮想 CPU には保護キーがありません（`CPUID` は PKU を報告しません）。そのため
   `pkey_alloc` は、そういう CPU での Linux と同じく `ENOSPC` を返し、プログラムは保護キーなしで
   続けます。`RDPKRU` と `WRPKRU` は、そういう CPU と同じく `SIGILL` でプログラムを止めます。
-- **セグメントレジスタ**：仮想 CPU はセグメントレジスタへの、またはそこからの移動ができません
-  （`%ds` や `%fs` などへの `mov` は `SIGILL` でプログラムを止めます）。そのため `modify_ldt`
-  が書いたエントリを読み込んで使うことはできません。Linux は読み込みます。テーブルそのものは
-  Linux と同じに読み返せます。
+- **セグメントレジスタの一部**：`lfs`、`lgs`、`lss`、`lar`、`lsl`、`verr`、`verw` と、far の
+  ジャンプ・コール・リターンは `SIGILL` でプログラムを止めます。CPU は `__USER_CS` でしか
+  動かないので、ほかの `cs` の `rt_sigreturn` のフレームは不正なフレームです。
+  `set_thread_area` は実装していないので、GDT のスレッドローカルのエントリは空のままで、CPU
+  番号のセグメントのリミットは 0 です。`%ss` への `mov` や `pop` は、CPU と違い、次の命令の
+  シングルステップのトラップを遅らせません。`modify_ldt` のあとに `%ds` と `%es` を読み込み
+  直すのは呼んだスレッドだけで、Linux はアドレス空間のすべてのスレッドで読み込み直します。
+  null のセレクタは `%fs` と `%gs` のベースを消しますが、Zen 2 より前の AMD の CPU は
+  ベースを残します。
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
-  `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`
-  だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
+  `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
+  `IORING_OP_FILES_UPDATE` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
-  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS` だけで（ほかは `EINVAL`）、リングの
-  記述子、ファイル、パーソナリティは登録できず、バッファーの更新やタグもありません。登録した
+  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_FILES`、
+  `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
+  `IORING_REGISTER_FILE_ALLOC_RANGE` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
+  パーソナリティは登録できず、バッファーは更新できません。タグを付ける
+  `IORING_REGISTER_FILES2` と `_BUFFERS2` でファイルやバッファーを登録することもできません。登録した
   バッファーのページは固定されません。固定バッファーの転送は、そのときそのアドレスにマップ
   されているメモリを動かすので、バッファーを外したり読み出し専用にしたりすると `EFAULT` で
   失敗し、リングを共有するプロセスは自分のメモリを動かします。Linux は固定したページを
@@ -422,9 +432,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **ネイティブ AIO の一部**：読み書きと同期は、Linux のバッファー付き I/O と同じく、
   どれも `io_submit` が取ったときに実行されます。`O_DIRECT` で開いたファイルのものも
   Linux のように裏では実行されず、同期のイベントは、Linux ではワーカーが少し後に入れるのに、
-  呼び出しが戻るときにはリングにあります。待っている poll を確かめるのは、プロセスの
-  スレッドが呼び出しをするとき（どの呼び出しでも）と待っているあいだだけなので、カーネルを
-  一度も呼ばずにリングからイベントを取るプログラムには、その完了が見えません。poll が
+  呼び出しが戻るときにはリングにあります。どの呼び出しにもよらずに準備できたファイル
+  （期限が来たタイマー、ホストからの入力）を待つ poll は、Linux ではすぐに完了するのに、
+  どれかのプロセスの次の呼び出しか、呼び出しが待っているあいだに完了します。poll が
   2 つのキューで待つファイル（Linux は準備できていなければ `EINVAL` で断ります）は、
   ファイルの種類から推します。読み書き両方で開いた FIFO と、キャラクターデバイス（端末）です。
   リングが保てる要求はちょうどイベント数より 1 少なく、Linux では CPU ごとの数のために

@@ -252,6 +252,15 @@ pub enum ExitReason {
     /// A general-protection exception, e.g. a misaligned `movaps` operand
     /// (SIGSEGV, as on Linux).
     GeneralProtection { rip: GuestAddr },
+    /// A segment-register load the CPU refused: `trap` is the vector,
+    /// 13 for #GP (SIGSEGV), 11 for #NP or 12 for #SS (SIGBUS, as on Linux),
+    /// and `error` its error code, the selector without its RPL bits (0 for
+    /// a null SS).
+    SegmentFault {
+        rip: GuestAddr,
+        trap: u8,
+        error: u16,
+    },
     /// A divide error: division by zero or quotient overflow (SIGFPE).
     ArithmeticFault { rip: GuestAddr },
     /// An unmasked SIMD floating-point exception (Linux SIGFPE, trap 19).
@@ -288,6 +297,7 @@ impl ExitReason {
             | ExitReason::InvalidOpcode { rip, .. }
             | ExitReason::Halt { rip }
             | ExitReason::GeneralProtection { rip }
+            | ExitReason::SegmentFault { rip, .. }
             | ExitReason::ArithmeticFault { rip }
             | ExitReason::FloatingPointFault { rip, .. }
             | ExitReason::MathFault { rip, .. }

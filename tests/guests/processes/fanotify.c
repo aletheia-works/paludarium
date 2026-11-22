@@ -1,8 +1,8 @@
 /* fanotify, compared with Linux: the calls' errors and their order, the
    marks fdinfo shows, the events of files with the descriptors they give,
    their merging, the file handles and names of the FID modes, the pidfds
-   of FAN_REPORT_PIDFD, the mount events of FAN_REPORT_MNT, and what a
-   group without CAP_SYS_ADMIN may do.
+   of FAN_REPORT_PIDFD, the mount events of FAN_REPORT_MNT (moves too), and
+   what a group without CAP_SYS_ADMIN may do.
 
    Each case works in a directory of its own under /tmp. A file system
    mark there hears of what other programs do in /tmp too, so only the
@@ -884,11 +884,13 @@ static struct {
     uint64_t id;
 } seen_mounts[16];
 static int seen_count;
-static void name_mount(const char *name) {
+/* Gives `path`'s mount the name `name` in the events shown. */
+static void name_mount_at(const char *name, const char *path) {
     if (seen_count == 16) return;
     seen_mounts[seen_count].name = name;
-    seen_mounts[seen_count++].id = unique_of(at(name));
+    seen_mounts[seen_count++].id = unique_of(path);
 }
+static void name_mount(const char *name) { name_mount_at(name, at(name)); }
 static const char *mount_name(uint64_t id) {
     for (int i = 0; i < seen_count; i++)
         if (seen_mounts[i].id && seen_mounts[i].id == id) return seen_mounts[i].name;
@@ -1077,7 +1079,78 @@ static int case_mount_events(void) {
     show_namespace_exit(fan);
     close(fan);
     close(detach);
-    printf("umount=%ld %ld %ld\n", e(umount2(at("e"), 0)), e(umount2(at("a/in"), 0)), e(umount2(at("a"), 0)));
+    // One by one: C leaves the order of a call's arguments open.
+    long first = e(umount2(at("e"), 0));
+    long second = e(umount2(at("a/in"), 0));
+    long third = e(umount2(at("a"), 0));
+    printf("umount=%ld %ld %ld\n", first, second, third);
+    remove_base();
+    return 0;
+}
+
+/* The moves of FAN_REPORT_MNT that are not a move_mount. An unmount that
+   propagates to a copy that a mount covers slides that mount down onto
+   the copy's parent (propagate_umount's reparent): it moves, before the
+   mount and its copy go. pivot_root, in a child's mount namespace of its
+   own, moves the old root, then the new one. */
+static int case_mount_moves(void) {
+    make_base("mount-moves");
+    const char *dirs[] = {"a", "e", "p"};
+    for (int i = 0; i < 3; i++) mkdir(at(dirs[i]), 0755);
+    // Nothing below may touch the mounts of the namespace this began in.
+    long shared = e(unshare(CLONE_NEWNS));
+    printf("unshare=%ld\n", shared);
+    if (shared) return 81;
+    printf("private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    int fan = fan_init(FAN_REPORT_MNT | FAN_NONBLOCK, 0);
+    if (fan < 0) return 80;
+    printf("mark=%ld\n",
+           fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_MNT_ATTACH | FAN_MNT_DETACH, AT_FDCWD, "/proc/self/ns/mnt"));
+    printf("tmpfs a=%ld\n", e(mount("none", at("a"), "tmpfs", 0, NULL)));
+    printf("shared a=%ld\n", e(mount(NULL, at("a"), NULL, MS_SHARED, NULL)));
+    printf("bind a e=%ld\n", e(mount(at("a"), at("e"), NULL, MS_BIND, NULL)));
+    mkdir(at("a/x"), 0755);
+    printf("tmpfs a/x=%ld\n", e(mount("none", at("a/x"), "tmpfs", 0, NULL)));
+    name_mount("a/x");
+    name_mount("e/x");
+    printf("private e/x=%ld\n", e(mount(NULL, at("e/x"), NULL, MS_PRIVATE, NULL)));
+    printf("tmpfs on e/x=%ld\n", e(mount("none", at("e/x"), "tmpfs", 0, NULL)));
+    name_mount_at("cover", at("e/x"));
+    show_mount_events("mounted", fan);
+    printf("umount a/x=%ld\n", e(umount2(at("a/x"), 0)));
+    show_mount_events("propagated unmount", fan);
+    uint64_t cover = seen_mounts[seen_count - 1].id;
+    printf("cover at e/x=%d\n", cover != 0 && unique_of(at("e/x")) == cover);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        seen_count = 0;
+        // A pivot_root in the parent's namespace would change its root.
+        if (unshare(CLONE_NEWNS)) _exit(1);
+        printf("child private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+        printf("tmpfs p=%ld\n", e(mount("none", at("p"), "tmpfs", 0, NULL)));
+        mkdir(at("p/old"), 0755);
+        name_mount_at("old root", "/");
+        name_mount("p");
+        int group = fan_init(FAN_REPORT_MNT | FAN_NONBLOCK, 0);
+        printf("child mark=%ld\n",
+               fan_mark(group, FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_MNT_ATTACH | FAN_MNT_DETACH, AT_FDCWD,
+                        "/proc/self/ns/mnt"));
+        printf("pivot_root=%ld\n", e(syscall(SYS_pivot_root, at("p"), at("p/old"))));
+        show_mount_events("pivoted", group);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    show_mount_events("after the child", fan);
+    close(fan);
+    // One by one: C leaves the order of a call's arguments open.
+    long first = e(umount2(at("e/x"), 0));
+    long second = e(umount2(at("e"), 0));
+    long third = e(umount2(at("a"), 0));
+    printf("umount=%ld %ld %ld\n", first, second, third);
     remove_base();
     return 0;
 }
@@ -1428,6 +1501,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
     if (!strcmp(mode, "fanotify-mount-events")) return case_mount_events();
+    if (!strcmp(mode, "fanotify-mount-moves")) return case_mount_moves();
     if (!strcmp(mode, "fanotify-open-exec")) return case_open_exec(argc > 2 ? argv[2] : "");
     if (!strcmp(mode, "fanotify-aio-perm")) return case_aio_perm();
     if (!strcmp(mode, "fanotify-exec-perm")) return case_exec_perm(argc > 2 ? argv[2] : "");

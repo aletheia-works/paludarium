@@ -186,7 +186,8 @@ pub(crate) struct ProcessView {
     pub zombie: bool,
     /// The wait status of a process that has ended (`exit_code` in Linux's
     /// `stat`): its code in the second byte, or its signal with 0x80 for a
-    /// core dumped; 0 while it runs.
+    /// core dumped; while it runs, that of its leader's own `exit` if the
+    /// leader has ended before the other threads, 0 otherwise.
     pub exit_code: i32,
     /// The signal of a group stop its parent's wait has not yet reported
     /// (Linux's `group_exit_code` while `SIGNAL_STOP_STOPPED`).
@@ -1078,7 +1079,7 @@ impl Processes {
                 Some(ExitStatus::Exited(code)) => (code & 255) << 8,
                 Some(ExitStatus::Signaled(signal)) if entry.dumped => signal & 127 | 0x80,
                 Some(ExitStatus::Signaled(signal)) => signal & 127,
-                _ => 0,
+                _ => entry.group.leader_exit(),
             },
             stop_report: entry.stop_report,
             exit_signal: entry.exit_signal,
@@ -3484,8 +3485,11 @@ impl Kernel {
         if a[1] != 0 {
             cpu.gpr[reg::RSP] = a[1];
         }
+        // CLONE_SETTLS: `do_arch_prctl_64`'s ARCH_SET_FS, which also nulls
+        // the fs selector.
         if flags & 0x80000 != 0 {
             cpu.fs_base = a[4];
+            cpu.segments[paludarium_cpu::segments::FS] = 0;
         }
         // The parent's word has the child as the parent's PID namespace
         // numbers it, which `clone` returns; the child's, as its own does.
@@ -5059,9 +5063,9 @@ impl Kernel {
             ptrace: std::mem::take(&mut thread.state.ptrace),
             ..ThreadState::default()
         };
-        // `start_thread` loads the selectors a new program starts with.
-        thread.state.ptrace.selectors = None;
-        // And `flush_thread` the hardware breakpoints.
+        // `start_thread` loaded the selectors a new program starts with, in
+        // the new CPU state above, and `flush_thread` clears the hardware
+        // breakpoints.
         thread.state.ptrace.debug = crate::ptrace::Debug::default();
         thread.state.name_after(&path);
         // Linux decides from the IDs before exec, then installs the new ones

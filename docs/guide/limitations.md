@@ -511,11 +511,11 @@ verified.
   takes it, as Linux's buffered I/O does; one of a file opened with
   `O_DIRECT` does not run in the background as on Linux, and a sync's event
   is in the ring when the call returns, where Linux's comes from a worker
-  soon after. A poll that waits is looked at only as a thread of the
-  process makes a call (any call) and while one waits: a program that takes
-  events from the ring without ever calling the kernel does not see it
-  complete. Which files' polls wait on two queues, which Linux refuses with
-  `EINVAL` unless the file is ready, is guessed from the kind of file: a FIFO
+  soon after. A poll that waits for a file made ready by no call (a timer
+  that expires, input from the host) completes only at the next call of any
+  process, or while one waits, where Linux's comes at once. Which files'
+  polls wait on two queues, which Linux refuses with `EINVAL` unless the
+  file is ready, is guessed from the kind of file: a FIFO
   open to read and write, and a character device (a terminal). A ring holds
   exactly one request fewer than its events, where Linux's per-CPU counts
   can stop one sooner; and the I/O priority of `IOCB_FLAG_IOPRIO` is checked

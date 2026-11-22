@@ -131,6 +131,7 @@
     {"name":"aio-full","binary":"aio"},
     {"name":"aio-lifetime","binary":"aio"},
     {"name":"aio-mremap","binary":"aio"},
+    {"name":"aio-reap","binary":"aio"},
     {"name":"perf-calls","binary":"perf"},
     {"name":"perf-counts","binary":"perf"},
     {"name":"perf-exec","binary":"perf"},

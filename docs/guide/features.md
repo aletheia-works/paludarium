@@ -1700,9 +1700,12 @@ kernel.
   at once with what is ready among its events if its file is ready, else
   waits until it is and then gives the wake-up's whole key, as Linux's
   `aio_poll_wake` does (a pipe's `POLLIN | POLLRDNORM` even for `POLLIN`
-  alone; a hang-up, which has no key, what is ready); `io_cancel` cancels
-  only a poll that waits (`EINPROGRESS`, with an event of no events in the
-  ring), and gives `EINVAL` for another request. `io_getevents` and
+  alone; a hang-up, which has no key, what is ready). The call that makes
+  the file ready, in this process or another (a forked child's write to the
+  pipe), puts the event in the ring before it returns, so a program that
+  takes events from the ring itself sees it without a call. `io_cancel`
+  cancels only a poll that waits (`EINPROGRESS`, with an event of no events
+  in the ring), and gives `EINVAL` for another request. `io_getevents` and
   `io_pgetevents` take events from the head and wait for `min_nr` of them
   as Linux's `read_events` does (a negative timeout waits as none does, as
   Linux's): until the timeout, a signal (`EINTR`, never

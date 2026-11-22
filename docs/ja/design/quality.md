@@ -209,7 +209,10 @@ RUSTSEC-2026-0398、RUSTSEC-2026-0403）です。aube はこの版を、`zstd` �
 `zstd` 0.14 にしたリリースを出したら外します
 （[SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)）。どのクレートにも
 当たらなくなった例外は監査を失敗させるので、例外が要らなくなった aube の更新は、例外を
-外すまでマージされません。例外はすべて
+外すまでマージされません。aube には今のところ、`url` 2.5.8 への RUSTSEC-2026-0592 の
+例外もあります。aube 2.10.0 の `Cargo.lock` は、この版を `hickory-net`、`hickory-resolver`、
+`reqwest` を通して持っています。`url` 2.5.9 で直っているので、固定している aube のリリースが
+`url` 2.5.9 以降を固定したら外します。例外はすべて
 `tests/guests/programs/evidence.py` に並んでいて、`source-lock.json` はクレートの版まで
 書いて例外を挙げています。
 

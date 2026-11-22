@@ -9213,6 +9213,85 @@ static int madvise_collapse_case(void) {
     close((int)uffd);
     return 0;
 }
+/* MADV_COLLAPSE of shmem's page cache: shared anonymous memory, a memfd
+ * (shared and private mappings) and System V shared memory, each mapped
+ * where its addresses and file offsets are 2 MiB aligned to each other. */
+static int madvise_collapse_shmem_case(void) {
+    long page = 4096, huge = 2 << 20;
+    char *map = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return 80;
+    char *base = (char *)(((unsigned long)map + huge - 1) & ~(huge - 1));
+    char *shared = mmap(base, 2 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+                        -1, 0);
+    if (shared == MAP_FAILED) return 81;
+    /* No page of the page cache in an extent: it was truncated. */
+    printf("untouched=%ld\n", advice_errno(madvise(shared, 2 * huge, 25)));
+    shared[3 * page] = 7;
+    long first = advice_errno(madvise(shared, 2 * huge, 25));
+    long again = advice_errno(madvise(shared, huge, 25));
+    printf("first=%ld again=%ld resident=%d byte=%d %d\n", first, again, collapse_resident(shared),
+           shared[3 * page], shared[0]);
+    /* A memfd with a page written, mapped at a file offset out of step
+     * with the address, then in step. */
+    int fd = memfd_create("collapse", 0);
+    if (fd < 0 || ftruncate(fd, 2 * huge) || pwrite(fd, "x", 1, 5 * page) != 1) return 82;
+    char *offset = mmap(shared, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, page);
+    if (offset == MAP_FAILED) return 83;
+    printf("offset=%ld\n", advice_errno(madvise(offset, huge, 25)));
+    char *file = mmap(shared, 2 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (file == MAP_FAILED) return 84;
+    long memfd = advice_errno(madvise(file, huge, 25));
+    long rest = advice_errno(madvise(file + huge, huge, 25));
+    struct stat st;
+    if (fstat(fd, &st)) return 85;
+    printf("memfd=%ld rest=%ld blocks=%lld byte=%c %d\n", memfd, rest, (long long)st.st_blocks,
+           file[5 * page], file[6 * page]);
+    /* A private mapping of it: the collapsed extent maps, but an extent
+     * with a page of the mapping's own does not. */
+    char *private = mmap(shared, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if (private == MAP_FAILED) return 86;
+    volatile char sink = private[0];
+    (void)sink;
+    long mapped = advice_errno(madvise(private, huge, 25));
+    private[huge + page] = 1;
+    long copied = advice_errno(madvise(private + huge, huge, 25));
+    printf("private=%ld copied=%ld\n", mapped, copied);
+    close(fd);
+    /* MADV_NOHUGEPAGE refuses shmem's VMAs too. */
+    char *nohuge = mmap(base, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+                        -1, 0);
+    if (nohuge == MAP_FAILED) return 87;
+    nohuge[0] = 1;
+    long advised = advice_errno(madvise(nohuge, huge, MADV_NOHUGEPAGE));
+    printf("nohugepage=%ld collapse=%ld\n", advised, advice_errno(madvise(nohuge, huge, 25)));
+    /* System V shared memory, attached where the PROT_NONE mapping was. */
+    munmap(base, 2 * huge);
+    int id = shmget(IPC_PRIVATE, (size_t)(2 * huge), IPC_CREAT | 0600);
+    if (id < 0) return 88;
+    char *segment = shmat(id, base, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (segment == (void *)-1) return 89;
+    segment[page] = 3;
+    long sysv = advice_errno(madvise(segment, huge, 25));
+    long sysv_rest = advice_errno(madvise(segment + huge, huge, 25));
+    printf("sysv=%ld rest=%ld byte=%d\n", sysv, sysv_rest, segment[page]);
+    shmdt(segment);
+    /* Holes, with a userfaultfd registered for missing pages. */
+    char *armed = mmap(base, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (armed == MAP_FAILED) return 90;
+    armed[0] = 1;
+    long uffd = syscall(SYS_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
+    if (uffd < 0) {
+        printf("userfaultfd=%d\n", -errno);
+        return 0;
+    }
+    unsigned long long api[3] = {0xAA, 0, 0};
+    unsigned long long reg[4] = {(unsigned long)armed, (unsigned long)huge, 1, 0};
+    if (ioctl((int)uffd, 0xC018AA3F, api) || ioctl((int)uffd, 0xC020AA00, reg)) return 91;
+    printf("registered=%ld\n", advice_errno(madvise(armed, huge, 25)));
+    close((int)uffd);
+    return 0;
+}
 /* The VMAs of [start, end) /proc/self/maps lists. It allocates nothing, so
  * that no new mapping lands in the range (a fork's MADV_DONTFORK hole). */
 static int advice_vmas(char *start, char *end) {
@@ -12995,6 +13074,108 @@ static int generated_noexec_case(void) {
            gn_map(link, MAP_PRIVATE, PROT_READ | PROT_EXEC) == (tmp_noexec ? -EPERM : 0));
     close(fd);
     unlink(file);
+    return 0;
+}
+
+/* The exec-truncated case: execve of a small ELF program cut short at
+   chosen lengths, as Linux's binfmt_elf takes it. The program has a text
+   segment of two pages from offset 0 (its code in the first, a byte it
+   reads, 7, in the second) and a data segment of 16 bytes and bss from
+   offset 0x2000, writable or read-only. A short header or program headers
+   past the end are no program (ENOEXEC) and an interpreter path past it
+   EIO; segments past the end map, and a page wholly past it raises SIGBUS
+   when touched, unless a writable segment's bss starts in such a page,
+   which padzero cannot clear: the exec then fails after its point of no
+   return, SIGSEGV. Each runs in a child with no core dump; its status is
+   printed. */
+static void et_put16(unsigned char *b, int at, unsigned v) { b[at] = v; b[at + 1] = v >> 8; }
+static void et_put32(unsigned char *b, int at, unsigned v) {
+    for (int i = 0; i < 4; i++) b[at + i] = v >> (8 * i);
+}
+static void et_put64(unsigned char *b, int at, unsigned long long v) {
+    for (int i = 0; i < 8; i++) b[at + i] = v >> (8 * i);
+}
+static void et_phdr(unsigned char *b, int n, unsigned type, unsigned flags, unsigned long long off,
+                    unsigned long long vaddr, unsigned long long filesz, unsigned long long memsz) {
+    int at = 64 + 56 * n;
+    et_put32(b, at, type);
+    et_put32(b, at + 4, flags);
+    et_put64(b, at + 8, off);
+    et_put64(b, at + 16, vaddr);
+    et_put64(b, at + 24, vaddr);
+    et_put64(b, at + 32, filesz);
+    et_put64(b, at + 40, memsz);
+    et_put64(b, at + 48, 0x1000);
+}
+/* The program, 0x2010 bytes; with `interp` a PT_INTERP whose path lies
+   past the end of the file. */
+static size_t et_build(unsigned char *b, int data_writable, int interp) {
+    memset(b, 0, 0x2010);
+    memcpy(b, "\177ELF\2\1\1", 7);
+    et_put16(b, 16, 2);                  /* ET_EXEC */
+    et_put16(b, 18, 62);                 /* EM_X86_64 */
+    et_put32(b, 20, 1);
+    et_put64(b, 24, 0x400100);           /* e_entry */
+    et_put64(b, 32, 64);                 /* e_phoff */
+    et_put16(b, 52, 64);
+    et_put16(b, 54, 56);
+    et_put16(b, 56, interp ? 3 : 2);
+    et_phdr(b, 0, 1, 5, 0, 0x400000, 0x2000, 0x2000);
+    et_phdr(b, 1, 1, data_writable ? 6 : 4, 0x2000, 0x602000, 0x10, 0x1000);
+    if (interp) et_phdr(b, 2, 3, 4, 0x3000, 0, 16, 16);
+    /* movzbl 0x401000, %eax; mov %eax, %edi; mov $231, %eax; syscall */
+    static const unsigned char code[] = {0x0f, 0xb6, 0x04, 0x25, 0x00, 0x10, 0x40, 0x00, 0x89, 0xc7,
+                                         0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05};
+    memcpy(b + 0x100, code, sizeof code);
+    b[0x1000] = 7;
+    memset(b + 0x2000, 0x5a, 0x10);
+    return 0x2010;
+}
+static void et_run(const char *name, const unsigned char *b, size_t len) {
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-truncated-%d", (int)getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+    if (fd < 0 || (len && write(fd, b, len) != (ssize_t)len) || close(fd)) {
+        printf("%s: setup failed\n", name);
+        return;
+    }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit none = {0, 0};
+        setrlimit(RLIMIT_CORE, &none);
+        char *args[] = {"truncated", NULL};
+        char *env[] = {NULL};
+        syscall(SYS_execve, path, args, env);
+        _exit(100 + errno);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) >= 100)
+        printf("%s: errno=%d\n", name, WEXITSTATUS(status) - 100);
+    else if (WIFEXITED(status))
+        printf("%s: exit=%d\n", name, WEXITSTATUS(status));
+    else
+        printf("%s: signal=%d\n", name, WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    unlink(path);
+}
+static int exec_truncated_case(void) {
+    static unsigned char rw[0x2010], ro[0x2010], interp[0x2010];
+    size_t full = et_build(rw, 1, 0);
+    et_build(ro, 0, 0);
+    et_build(interp, 1, 1);
+    et_run("full", rw, full);
+    et_run("empty", rw, 0);
+    et_run("magic", rw, 3);
+    et_run("header", rw, 40);
+    et_run("one-phdr", rw, 64 + 56);
+    et_run("interp-past-end", interp, full);
+    et_run("data-half", rw, 0x2008);
+    et_run("data-page-rw", rw, 0x2000);
+    et_run("text-half-rw", rw, 0x1800);
+    et_run("text-half-ro", ro, 0x1800);
+    et_run("text-page-ro", ro, 0x1000);
+    et_run("text-page-rw", rw, 0x1000);
     return 0;
 }
 
@@ -34560,6 +34741,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mlock-private-copy")) return mlock_private_copy_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-collapse")) return madvise_collapse_case();
+    if (!strcmp(mode, "madvise-collapse-shmem")) return madvise_collapse_shmem_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
@@ -34604,6 +34786,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
+    if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
     if (!strcmp(mode, "tree-namespace")) return tree_namespace_case();
     if (!strcmp(mode, "beneath")) return beneath_case();

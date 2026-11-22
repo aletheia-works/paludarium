@@ -49,8 +49,7 @@
 //!   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
 //!   `fd_array` and maps made with
 //!   `excl_prog_hash`, BTF IDs and functions in `BPF_LD_IMM64`,
-//!   `BPF_LD_ABS` and `BPF_LD_IND`, the load-acquire and store-release
-//!   atomics, `may_goto`, indirect jumps, a
+//!   `BPF_LD_ABS` and `BPF_LD_IND`, `may_goto`, indirect jumps, a
 //!   back-edge (Linux takes a bounded loop from a privileged loader), a
 //!   pointer with a variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a
 //!   conditional jump.
@@ -1180,25 +1179,15 @@ impl Walk {
                 Ok(next)
             }
             class::LDX => {
-                read_ok(s, insn.src)?;
-                write_ok(insn.dst)?;
-                let pointer = s.regs[usize::from(insn.src)];
-                let value = self.access(s, insn.src, insn.off, insn.size(), None, options)?;
-                s.regs[usize::from(insn.dst)] = value;
-                self.same_pointers(i, pointer)?;
+                self.load(s, insn, i, options)?;
                 Ok(next)
             }
             class::STX => {
                 if insn.mode() == mode::ATOMIC {
-                    self.atomic(s, insn, options)?;
-                    return Ok(next);
+                    self.atomic(s, insn, i, options)?;
+                } else {
+                    self.store(s, insn, i, options)?;
                 }
-                read_ok(s, insn.src)?;
-                read_ok(s, insn.dst)?;
-                let value = Store::Reg(s.regs[usize::from(insn.src)]);
-                let pointer = s.regs[usize::from(insn.dst)];
-                self.access(s, insn.dst, insn.off, insn.size(), Some(value), options)?;
-                self.same_pointers(i, pointer)?;
                 Ok(next)
             }
             class::ST => {
@@ -1228,14 +1217,76 @@ impl Walk {
         }
     }
 
-    /// `check_atomic`: the operation, then `check_atomic_rmw`. The
-    /// registers are read, the destination may not be the context, the
-    /// register the old value goes to (the source with `BPF_FETCH`, R0
-    /// for `BPF_CMPXCHG`) is unknown from then on, even when it is the
-    /// destination, and the memory is read and then written, always
-    /// aligned (`strict_alignment_once`). The loader may leak pointers, so
-    /// the source and R0 may be pointers. Master and 7.0 check alike.
-    fn atomic(&mut self, s: &mut State, insn: Insn, options: Options) -> Checked<()> {
+    /// `check_load_mem`: the instruction at `i` loads the destination from
+    /// the memory at the source.
+    fn load(&mut self, s: &mut State, insn: Insn, i: usize, options: Options) -> Checked<()> {
+        read_ok(s, insn.src)?;
+        write_ok(insn.dst)?;
+        let pointer = s.regs[usize::from(insn.src)];
+        let value = self.access(s, insn.src, insn.off, insn.size(), None, options)?;
+        s.regs[usize::from(insn.dst)] = value;
+        self.same_pointers(i, pointer)
+    }
+
+    /// `check_store_reg`: the instruction at `i` stores the source into the
+    /// memory at the destination.
+    fn store(&mut self, s: &mut State, insn: Insn, i: usize, options: Options) -> Checked<()> {
+        read_ok(s, insn.src)?;
+        read_ok(s, insn.dst)?;
+        let value = Store::Reg(s.regs[usize::from(insn.src)]);
+        let pointer = s.regs[usize::from(insn.dst)];
+        self.access(s, insn.dst, insn.off, insn.size(), Some(value), options)?;
+        self.same_pointers(i, pointer)
+    }
+
+    /// `check_atomic`: the operation, then `check_atomic_rmw`,
+    /// `check_atomic_load` or `check_atomic_store`.
+    ///
+    /// A read-modify-write is 4 or 8 bytes. Its registers are read, the
+    /// destination may not be the context, the register the old value goes
+    /// to (the source with `BPF_FETCH`, R0 for `BPF_CMPXCHG`) is unknown
+    /// from then on, even when it is the destination, and the memory is
+    /// read and then written, always aligned (`strict_alignment_once`).
+    /// The loader may leak pointers, so the source and R0 may be pointers.
+    /// Master and 7.0 check it alike.
+    ///
+    /// A load-acquire or store-release, of any size, is checked as a load
+    /// or a store is, always aligned, and may not go through the context
+    /// (`atomic_ptr_type_ok`). Master refuses the context for a load once
+    /// the source is read, before the load, and the test machines' 7.0
+    /// does too; 7.0 as released refuses it after the load, which also
+    /// lets a load into the register it loads from through. A store is
+    /// refused after it is checked, in both.
+    fn atomic(&mut self, s: &mut State, insn: Insn, i: usize, options: Options) -> Checked<()> {
+        let aligned = Options {
+            strict_alignment: true,
+            ..options
+        };
+        let ctx = |s: &State, r: u8| matches!(s.regs[usize::from(r)], Reg::Ptr(Ptr::Ctx, _));
+        let not_allowed = |what: &str, r: u8| {
+            refuse(
+                EACCES,
+                format!("BPF_ATOMIC {what} R{r} {} is not allowed", Ptr::Ctx.name()),
+            )
+        };
+        match insn.imm {
+            atomic::LOAD_ACQ => {
+                read_ok(s, insn.src)?;
+                if ctx(s, insn.src) {
+                    return not_allowed("loads from", insn.src);
+                }
+                return self.load(s, insn, i, aligned);
+            }
+            atomic::STORE_REL => {
+                self.store(s, insn, i, aligned)?;
+                return if ctx(s, insn.dst) {
+                    not_allowed("stores into", insn.dst)
+                } else {
+                    Ok(())
+                };
+            }
+            _ => {}
+        }
         let old = match insn.imm {
             atomic::ADD | atomic::AND | atomic::OR | atomic::XOR => None,
             op if op & atomic::FETCH != 0
@@ -1248,9 +1299,6 @@ impl Walk {
             }
             atomic::XCHG => Some(insn.src),
             atomic::CMPXCHG => Some(0),
-            atomic::LOAD_ACQ | atomic::STORE_REL => {
-                return gap("load-acquire and store-release atomics");
-            }
             op => {
                 return refuse(
                     Errno::EINVAL,
@@ -1268,24 +1316,13 @@ impl Walk {
         }
         // atomic_ptr_type_ok: of the types here, only the context is
         // refused.
-        if let Reg::Ptr(p @ Ptr::Ctx, _) = s.regs[usize::from(insn.dst)] {
-            return refuse(
-                EACCES,
-                format!(
-                    "BPF_ATOMIC stores into R{} {} is not allowed",
-                    insn.dst,
-                    p.name()
-                ),
-            );
+        if ctx(s, insn.dst) {
+            return not_allowed("stores into", insn.dst);
         }
         if let Some(r) = old {
             write_ok(r)?;
             s.regs[usize::from(r)] = Reg::Scalar(None);
         }
-        let aligned = Options {
-            strict_alignment: true,
-            ..options
-        };
         let value = self.access(s, insn.dst, insn.off, insn.size(), None, aligned)?;
         if let Some(r) = old {
             s.regs[usize::from(r)] = value;
@@ -2463,12 +2500,6 @@ mod tests {
         ]);
         gap(&[i(0x30, 0, 0, 0, 0), exit()]);
         gap(&[
-            mov(0, 0),
-            stx_dw(10, 0, -8),
-            i(0xdb, 10, 0, -8, 0x100),
-            exit(),
-        ]);
-        gap(&[
             mov(1, -8),
             ldx(0x18, 0, 10, -8),
             i(0x0f, 0, 10, 0, 0),
@@ -2549,10 +2580,6 @@ mod tests {
         assert_eq!(
             refused(&with(&[i(0xcb, 10, 1, -8, 0x07)])),
             einval("BPF_ATOMIC uses invalid atomic opcode 07")
-        );
-        assert_eq!(
-            refused(&with(&[i(DW, 10, 1, -8, 0x100)])).1,
-            "paludarium: load-acquire and store-release atomics are not verified yet"
         );
         // The source, the destination, and R0 for CMPXCHG must be written.
         assert_eq!(
@@ -2660,6 +2687,91 @@ mod tests {
         );
         // A pointer may be the source.
         ok(&with(&[i(DW, 10, 10, -8, 0x00)]));
+    }
+
+    #[test]
+    fn load_acquire_and_store_release_are_checked_as_linux_does() {
+        const ACQ: i32 = 0x100;
+        const REL: i32 = 0x110;
+        let eacces = |line: &str| (EACCES, line.to_string());
+        let with = |last: &[Insn]| {
+            let mut p = vec![mov(1, 1)];
+            p.extend_from_slice(last);
+            p.extend([mov(0, 0), exit()]);
+            p
+        };
+        // Every size, on the stack.
+        for (code, off) in [(0xd3, -1), (0xcb, -4), (0xc3, -8), (0xdb, -8)] {
+            ok(&with(&[i(code, 10, 1, off, REL), i(code, 2, 10, off, ACQ)]));
+        }
+        // Registers as a load's and a store's.
+        assert_eq!(
+            refused(&with(&[i(0xdb, 2, 3, -8, ACQ)])),
+            eacces("R3 !read_ok")
+        );
+        assert_eq!(
+            refused(&with(&[i(0xdb, 10, 10, -8, ACQ)])),
+            eacces("frame pointer is read only")
+        );
+        assert_eq!(
+            refused(&with(&[i(0xdb, 10, 3, -8, REL)])),
+            eacces("R3 !read_ok")
+        );
+        // Always aligned, in a map's value too.
+        for imm in [ACQ, REL] {
+            let (dst, src) = if imm == ACQ { (1, 0) } else { (0, 1) };
+            let mut p = lookup(3);
+            p.extend([i(0x15, 0, 0, 3, 0), mov(1, 1), i(0xc3, dst, src, 2, imm)]);
+            p.extend([mov(0, 0), exit()]);
+            assert_eq!(
+                refused(&p),
+                eacces("misaligned value access off 0+0+2 size 4")
+            );
+        }
+        // A read-only value can be loaded from, not stored into.
+        let mut p = lookup(5);
+        p.extend([i(0x15, 0, 0, 3, 0), mov(1, 1), i(0xdb, 1, 0, 0, ACQ)]);
+        p.extend([mov(0, 0), exit()]);
+        ok(&p);
+        let n = p.len();
+        p[n - 3] = i(0xdb, 0, 1, 0, REL);
+        assert_eq!(
+            refused(&p),
+            eacces("write into map forbidden, value_size=8 off=0 size=8")
+        );
+        // Not through the context: a load is refused before the access,
+        // into the register it loads from too, and a store after it.
+        for (dst, off) in [(2, 0), (2, 2), (1, 0), (1, 2), (10, 0)] {
+            assert_eq!(
+                refused(&[i(0xc3, dst, 1, off, ACQ), mov(0, 0), exit()]),
+                eacces("BPF_ATOMIC loads from R1 ctx is not allowed")
+            );
+        }
+        assert_eq!(
+            refused(&[mov(2, 1), i(0xc3, 1, 2, 48, REL), mov(0, 0), exit()]),
+            eacces("BPF_ATOMIC stores into R1 ctx is not allowed")
+        );
+        assert_eq!(
+            refused(&[mov(2, 1), i(0xc3, 1, 2, 0, REL), mov(0, 0), exit()]),
+            eacces("invalid bpf_context access off=0 size=4")
+        );
+        // A pointer stored is loaded back, whole only.
+        let p = [
+            i(0xdb, 10, 10, -8, REL),
+            i(0xdb, 2, 10, -8, ACQ),
+            ldx(size::DW, 0, 2, -16),
+            exit(),
+        ];
+        ok(&p);
+        assert_eq!(
+            refused(&[
+                i(0xdb, 10, 10, -8, REL),
+                i(0xc3, 2, 10, -8, ACQ),
+                mov(0, 0),
+                exit()
+            ]),
+            eacces("invalid size of register fill")
+        );
     }
 
     #[test]

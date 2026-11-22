@@ -216,6 +216,11 @@ impl PageSource for Attachment {
     fn merges(&self) -> bool {
         false
     }
+    /// A segment's memory is shmem's file's, though its VMAs are not
+    /// shmem's (`shm_vm_ops`): `MADV_COLLAPSE` takes them.
+    fn shmem_file(&self) -> bool {
+        true
+    }
     /// A VMA of it opened (`shm_open`): a split, a `fork` or a move.
     fn opened(&self, by: &paludarium_mmu::Actor) {
         self.touched(by, true);

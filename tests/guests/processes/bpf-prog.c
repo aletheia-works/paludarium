@@ -45,6 +45,12 @@
    with BPF_F_STRICT_ALIGNMENT, plain loads through a hash lookup's result
    before its null check: misaligned, which is refused for that first, and
    aligned.
+   bpf-prog-acqrel: BPF_ATOMIC's load-acquire and store-release in each
+   size: programs it takes and refuses (the registers, the alignment on
+   the stack and in a value, a read-only value, the context, before a
+   load's access and after a store's, a spilled pointer's fill), and a
+   filter that runs them on a map's value and the stack, whose results the
+   case reads back from the map.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -1973,6 +1979,101 @@ static int case_atomic(void) {
     return 0;
 }
 
+#define LOAD_ACQ(size, dst, src, off) I(0xc3 | (size), dst, src, off, 0x100)
+#define STORE_REL(size, dst, src, off) I(0xc3 | (size), dst, src, off, 0x110)
+#define S_B 0x10
+#define S_H 0x08
+#define S_W 0x00
+#define S_DW 0x18
+
+static int case_acqrel(void) {
+    int value = map(2, 4, 8 * SLOTS, 1, 0);
+    int rdonly = map(2, 4, 8, 1, 1 << 7);
+    int hash = map(1, 8, 8, 4, 0);
+    say("maps %d", value > 0 && rdonly > 0 && hash > 0);
+
+    /* Programs it takes: r1 = 1, then the instructions. */
+#define WITH_R1(name, ...) LOAD(name, MOV(1, 1), __VA_ARGS__, MOV(0, 0), EXIT())
+#define MAPS_R1(name, ...) LOAD_MAPS(name, MOV(1, 1), __VA_ARGS__, MOV(0, 0), EXIT())
+    WITH_R1("8-bit", STORE_REL(S_B, 10, 1, -1), LOAD_ACQ(S_B, 2, 10, -1));
+    WITH_R1("16-bit", STORE_REL(S_H, 10, 1, -4), LOAD_ACQ(S_H, 2, 10, -4));
+    WITH_R1("32-bit", STORE_REL(S_W, 10, 1, -8), LOAD_ACQ(S_W, 2, 10, -8));
+    WITH_R1("64-bit", STORE_REL(S_DW, 10, 1, -8), LOAD_ACQ(S_DW, 2, 10, -8));
+    WITH_R1("load of never written stack", LOAD_ACQ(S_DW, 2, 10, -16));
+    LOAD_MAPS("in a value", LD_VALUE(6, value, 0), MOV(1, 1), STORE_REL(S_DW, 6, 1, 8),
+              LOAD_ACQ(S_W, 2, 6, 12), MOV(0, 0), EXIT());
+    LOAD_MAPS("load from a read-only value", LD_VALUE(6, rdonly, 0), LOAD_ACQ(S_DW, 2, 6, 0),
+              MOV(0, 0), EXIT());
+    LOAD("a pointer stored and loaded", STORE_REL(S_DW, 10, 10, -8), LOAD_ACQ(S_DW, 2, 10, -8),
+         LDX_DW(0, 2, -16), EXIT());
+    MAPS_R1("store of a pointer into a value", LD_VALUE(6, value, 0), STORE_REL(S_DW, 6, 10, 0));
+
+    /* Programs it refuses. */
+    WITH_R1("load from an unwritten register", LOAD_ACQ(S_DW, 2, 3, -8));
+    WITH_R1("load into the frame pointer", LOAD_ACQ(S_DW, 10, 10, -8));
+    WITH_R1("store of an unwritten register", STORE_REL(S_DW, 10, 3, -8));
+    WITH_R1("store through an unwritten register", STORE_REL(S_DW, 3, 1, -8));
+    WITH_R1("load misaligned on the stack", LOAD_ACQ(S_DW, 2, 10, -12));
+    WITH_R1("store misaligned on the stack", STORE_REL(S_W, 10, 1, -6));
+    MAPS_R1("load misaligned in a value", LD_VALUE(6, value, 0), LOAD_ACQ(S_W, 2, 6, 2));
+    MAPS_R1("store misaligned in a value", LD_VALUE(6, value, 0), STORE_REL(S_H, 6, 1, 1));
+    MAPS_R1("load past the value", LD_VALUE(6, value, 0), LOAD_ACQ(S_DW, 2, 6, 8 * SLOTS));
+    WITH_R1("store below the stack", STORE_REL(S_DW, 10, 1, -520));
+    MAPS_R1("store into a read-only value", LD_VALUE(6, rdonly, 0), STORE_REL(S_DW, 6, 1, 0));
+    LOAD_MAPS("load from a lookup's result unchecked", KEY8(hash), CALL(LOOKUP),
+              LOAD_ACQ(S_W, 2, 0, 2), MOV(0, 0), EXIT());
+    LOAD("load from the context", LOAD_ACQ(S_W, 2, 1, 0), MOV(0, 0), EXIT());
+    LOAD("load misaligned in the context", LOAD_ACQ(S_W, 2, 1, 2), MOV(0, 0), EXIT());
+    LOAD("load from the context into its own register", LOAD_ACQ(S_W, 1, 1, 0), MOV(0, 0), EXIT());
+    LOAD("store into cb[]", MOV(2, 1), STORE_REL(S_W, 1, 2, 48), MOV(0, 0), EXIT());
+    LOAD("store into len", MOV(2, 1), STORE_REL(S_W, 1, 2, 0), MOV(0, 0), EXIT());
+    LOAD("32 bits of a stored pointer", STORE_REL(S_DW, 10, 10, -8), LOAD_ACQ(S_W, 2, 10, -8),
+         MOV(0, 0), EXIT());
+#undef MAPS_R1
+#undef WITH_R1
+
+    /* A filter that runs them on the map's value and the stack, and keeps
+       what each gave in the value. */
+    uint64_t start[SLOTS];
+    for (int i = 0; i < SLOTS; i++) start[i] = 0x0123456789abcdefULL ^ (0x1010101010101010ULL * (uint64_t)i);
+    uint32_t key = 0;
+    uint64_t u[4] = {(uint32_t)value, (uintptr_t)&key, (uintptr_t)start, 0};
+    say("update %ld", bpf(2, u, sizeof u));
+    int filter = PROGRAM(
+        LD_VALUE(6, value, 0),
+        /* Stores of each size change only their own bytes. */
+        LD64(1, 0xfedcba9876543210ULL),
+        STORE_REL(S_B, 6, 1, 0), STORE_REL(S_H, 6, 1, 10), STORE_REL(S_W, 6, 1, 20),
+        STORE_REL(S_DW, 6, 1, 24),
+        /* Loads of each size, zero-extended into all ones. */
+        MOV(2, -1), LOAD_ACQ(S_B, 2, 6, 33), STX_DW(6, 2, 64),
+        MOV(2, -1), LOAD_ACQ(S_H, 2, 6, 34), STX_DW(6, 2, 72),
+        MOV(2, -1), LOAD_ACQ(S_W, 2, 6, 36), STX_DW(6, 2, 80),
+        MOV(2, -1), LOAD_ACQ(S_DW, 2, 6, 40), STX_DW(6, 2, 88),
+        /* A load into the register it loads from. */
+        MOV_REG(3, 6), LOAD_ACQ(S_DW, 3, 3, 48), STX_DW(6, 3, 96),
+        /* The stack: a store, then loads of its parts. */
+        LDX_DW(1, 6, 56), STORE_REL(S_DW, 10, 1, -8), LOAD_ACQ(S_H, 2, 10, -6), STX_DW(6, 2, 104),
+        MOV(1, 0x5a), STORE_REL(S_B, 10, 1, -7), LOAD_ACQ(S_DW, 2, 10, -8), STX_DW(6, 2, 112),
+        /* Count the messages. */
+        LOAD_ACQ(S_DW, 1, 6, 120), ADD(1, 1), STORE_REL(S_DW, 6, 1, 120),
+        MOV(0, 0), EXIT());
+    say("filter loaded %d", filter >= 0);
+    if (filter < 0) {
+        LOAD_MAPS("why", LD_VALUE(6, value, 0), MOV(0, 0), EXIT());
+        return 1;
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    say("attach %d", attach(pair[1], filter));
+    slots("before", value);
+    through("first", pair[0], pair[1], 4);
+    slots("after one", value);
+    through("second", pair[0], pair[1], 4);
+    slots("after two", value);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1983,5 +2084,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-corpus")) return case_corpus();
     if (!strcmp(mode, "bpf-prog-classic")) return case_classic();
     if (!strcmp(mode, "bpf-prog-atomic")) return case_atomic();
+    if (!strcmp(mode, "bpf-prog-acqrel")) return case_acqrel();
     return 2;
 }

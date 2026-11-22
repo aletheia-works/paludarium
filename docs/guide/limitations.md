@@ -381,9 +381,8 @@ verified.
   context's socket (`__sk_buff.sk`) and a map's own fields (`struct
   bpf_map`), maps from `fd_array` and maps made with `excl_prog_hash`,
   `BPF_LD_IMM64` of BTF IDs
-  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, the load-acquire
-  and store-release atomics (`BPF_LOAD_ACQ`, `BPF_STORE_REL`),
-  `may_goto`, indirect jumps, a pointer with a variable offset, and
+  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, `may_goto`, indirect
+  jumps, a pointer with a variable offset, and
   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
   takes a bounded loop from a privileged loader). A scalar is a value the
@@ -535,11 +534,19 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `MADV_COLLAPSE` refuses shmem's and files' mappings (`EINVAL`), which
-    Linux collapses by the rules of shmem and of read-only files, and a
-    collapsed extent stays 512 ordinary pages, so `/proc/<pid>/smaps` shows
-    no `AnonHugePages` for it. Whether an extent has a page table is taken
-    as whether a page of it has an entry or a marker. Linux can also fail a
+  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`). Linux's
+    rules for them changed after v6.12, which collapses only a file nobody
+    has open for writing (`READ_ONLY_THP_FOR_FS`), where later kernels take
+    any file on a file system with large folios. The result also depends
+    on the host's page cache: pages not read in yet, and dirty ones, which
+    are written back once and are otherwise `EAGAIN`. A collapsed extent
+    stays 512 ordinary pages, so `/proc/<pid>/smaps` shows no
+    `AnonHugePages` or `ShmemPmdMapped` for it. Whether an extent of
+    private anonymous memory has a page table is taken as whether a page of
+    it has an entry or a marker. For shmem only the collapsing VMA's own
+    `userfaultfd` registration counts, where Linux refuses holes if any VMA
+    of the file, in any process, is registered for missing pages, and
+    sysfs's `shmem_enabled` is taken as never `deny`. Linux can also fail a
     collapse for want of a free huge page (`ENOMEM`) or for a page in use
     (`EAGAIN`), which never happens here.
   - With `CAP_SYS_ADMIN`, `MADV_HWPOISON` refuses (`EIO`) a page of a file
@@ -565,6 +572,12 @@ verified.
     where Linux copies no page table of a VMA without an `anon_vma`
     (`-ENOENT` until the child touches the page): the loader's copy is
     the only one the page has here.
+  - A program's ELF segments are backed by the bytes the loader read at
+    `execve`. The program's own file cannot be written while it runs
+    (`ETXTBSY`), but Linux gives its interpreter's back for writing once it
+    is loaded: a later write to that file is not seen in a segment page
+    nothing wrote yet, and a page past the end at `execve` stays `SIGBUS`
+    when the file grows, where Linux maps both from the page cache.
   - A fault of a `memfd_secret` page takes the faulting process's
     `RLIMIT_MEMLOCK` as of its last system call (its creator's before
     one), and the pages count only `memfd_secret` files and `io_uring`'s
@@ -798,7 +811,9 @@ verified.
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
   `nr_blocks` and `nr_inodes`, but not for what a mapping writes (a write
   fault past the size is no `SIGBUS`, and the pages go back to the file
-  whatever its size), and its extended attributes take none of the inodes'
+  whatever its size; nor are the pages a fault brings into a tmpfs file
+  or a memfd counted in its blocks, which only `MADV_COLLAPSE` charges
+  for the holes it fills), and its extended attributes take none of the inodes'
   room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
   counts them, does not happen); the root from start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime
@@ -964,15 +979,15 @@ verified.
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes. An evictable mark is never
-  evicted. A group merges an event
-  into any like it still queued, where Linux looks only at the last 128 of
-  its hash bucket. Whether a directory watches its children is judged by the
+  evicted. Which events share a bucket of a group's merge hash follows a
+  hash of the emulator's own where Linux's mixes in kernel addresses (of
+  the process, and of a path in the non-FID modes), so only events of one
+  task's names in one directory collide as on Linux. Whether a directory
+  watches its children is judged by the
   fanotify marks alone, where Linux's counts inotify's too. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
   it had, which fails once it is gone, and a FIFO's or device's read or
-  write is told of without its directory and name. A tmpfs superblock that
-  goes keeps the marks on its files and on itself, where Linux's
-  `fsnotify_sb_delete` removes them.
+  write is told of without its directory and name.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the

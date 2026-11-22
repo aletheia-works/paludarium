@@ -444,6 +444,8 @@ pub(crate) struct Verified {
     /// The stack each function uses (`stack_depth`), in bytes, rounded up
     /// to 8, the main program's first.
     pub(crate) stack_depth: Vec<u32>,
+    /// `max_stack_depth`: the most stack a chain of calls takes.
+    pub(crate) max_stack_depth: u32,
     /// The maps the program uses (`used_maps`), by ID.
     pub(crate) maps: Vec<u32>,
     /// Each `BPF_LD_IMM64` of a map: the map's index in `maps`, and the
@@ -459,6 +461,7 @@ pub(crate) struct Rejection {
     /// `insn_processed` when it was refused.
     pub(crate) processed: u32,
     pub(crate) stack_depth: Vec<u32>,
+    pub(crate) max_stack_depth: u32,
 }
 
 type Checked<T> = Result<T, (Errno, String)>;
@@ -503,6 +506,7 @@ pub(crate) fn check(
         Ok(()) => Ok(Verified {
             processed: walk.processed,
             stack_depth,
+            max_stack_depth: walk.max_depth,
             maps: walk.maps.iter().map(|m| m.id).collect(),
             loads: std::mem::take(&mut walk.loads),
         }),
@@ -511,6 +515,7 @@ pub(crate) fn check(
             line,
             processed: walk.processed,
             stack_depth,
+            max_stack_depth: walk.max_depth,
         }),
     }
 }
@@ -1256,6 +1261,9 @@ struct Walk {
     /// The deepest stack byte each function's frames accessed
     /// (`stack_depth`).
     depth: Vec<u32>,
+    /// The deepest chain of calls' stack, each function's rounded up to 16
+    /// (`max_stack_depth`), once `check_max_stack_depth` has run.
+    max_depth: u32,
     /// `used_maps`.
     maps: Vec<MapShape>,
     /// Each BPF_LD_IMM64 of a map: its index in `maps`, and the offset in
@@ -1979,7 +1987,7 @@ impl Walk {
     /// to 512 bytes at most, and no chain is 8 frames deep. A chain is
     /// followed only where it may go past either, so that the first one
     /// that does is the one Linux finds.
-    fn max_stack_depth(&self, insns: &[Insn]) -> Checked<()> {
+    fn max_stack_depth(&mut self, insns: &[Insn]) -> Checked<()> {
         let n = self.starts.len();
         let round = |f: usize| i64::from((self.depth[f].div_ceil(8) * 8).next_multiple_of(16));
         let calls = |f: usize| {
@@ -2023,8 +2031,10 @@ impl Walk {
             callees: &[Vec<usize>],
             round: &dyn Fn(usize) -> i64,
             below: &[Option<(i64, usize)>],
+            max: &mut i64,
         ) -> Checked<()> {
             let depth = depth + round(f);
+            *max = (*max).max(depth);
             if depth > MAX_STACK {
                 return refuse(
                     EACCES,
@@ -2038,15 +2048,21 @@ impl Walk {
                         format!("the call stack of {frames} frames is too deep !"),
                     );
                 }
+                // A chain that cannot fail adds only its deepest stack to
+                // the maximum, as Linux's walk of it would.
                 let (d, k) = below[g].unwrap_or((0, 0));
                 if depth + d <= MAX_STACK && frames + k < MAX_CALL_FRAMES {
+                    *max = (*max).max(depth + d);
                     continue;
                 }
-                walk(g, depth, frames + 1, callees, round, below)?;
+                walk(g, depth, frames + 1, callees, round, below, max)?;
             }
             Ok(())
         }
-        walk(0, 0, 1, &callees, &round, &below)
+        let mut max = 0;
+        let result = walk(0, 0, 1, &callees, &round, &below, &mut max);
+        self.max_depth = max as u32;
+        result
     }
 }
 
@@ -3709,6 +3725,24 @@ mod tests {
         // 64 bytes each, rounded to 64: eight frames take 512.
         ok(&chain(8, 64));
         assert_eq!(stack_depth(&chain(2, 100)), vec![104, 104]);
+        // max_stack_depth: the deepest chain, each function's rounded to 16.
+        let max = |p: &[Insn]| verify(p, Options::default()).unwrap().max_stack_depth;
+        assert_eq!(max(&chain(2, 100)), 224);
+        assert_eq!(max(&[i(0x72, 10, 0, -3, 0), mov(0, 0), exit()]), 16);
+        assert_eq!(
+            max(&[
+                call_by(3),
+                call_by(5),
+                mov(0, 0),
+                exit(),
+                i(0x72, 10, 0, -100, 0),
+                mov(0, 0),
+                exit(),
+                mov(0, 0),
+                exit(),
+            ]),
+            112
+        );
         // 104 rounds to 112: five frames take 560.
         assert_eq!(
             refused(&chain(5, 100)),

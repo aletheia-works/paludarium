@@ -4897,8 +4897,9 @@ kernel.
   the walk, along every chain of calls, each function's stack depth,
   rounded up to 16 bytes as with the JIT, adds up to 512 bytes at most
   ("combined stack size of %d calls is %d. Too large", `EACCES`). With
-  `BPF_LOG_STATS` the log gives each function's stack depth
-  ("stack depth %d+%d").
+  `BPF_LOG_STATS` the log gives each function's stack depth and the most
+  a chain of calls takes ("stack depth %d+%d max %d", as the test
+  machines' 7.0 writes it).
 
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`

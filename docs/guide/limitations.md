@@ -263,11 +263,13 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
-- **Page-fault counts**: `ru_minflt` counts the faults as of each
-  thread's latest system call, and none of the loader's work for `execve`,
-  where Linux counts the faults of its copies of the arguments and of the
-  program's pages. No fault is major (`ru_majflt` is 0), as every page of a
-  file is taken to be in the page cache. A core dump's faults count to the
+- **Page-fault counts**: `ru_minflt` counts each fault as it is taken, as
+  Linux does. `execve`'s loader fills the pages of the program's segments
+  with its file's bytes and counts a fault for each page then, where Linux
+  maps the file and counts the faults as the program first touches the
+  pages, a read fault for several of them at once (`fault_around_bytes`);
+  these faults are no `perf` event. No fault is major (`ru_majflt` is 0),
+  as every page of a file is taken to be in the page cache. A core dump's faults count to the
   last thread to exit, where Linux counts them to the thread that dumps.
   `process_vm_readv`, `process_vm_writev`, `MADV_POPULATE_READ` and
   `MADV_POPULATE_WRITE` count their faults in `perf`'s `page-faults` too,
@@ -275,14 +277,14 @@ verified.
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
-  are hardware events even on a host with a PMU. A thread's CPU time, page
-  faults, context switches and CPU migrations are those it last accounted,
-  at its latest system call. An event of a CPU counts the time that passes,
-  and no faults, switches or migrations. A fault that ends in `SIGSEGV` or
-  `SIGBUS` is not counted, where Linux counts it in `page-faults`; one of a
-  signal frame's write counts as the thread's own; a context switch is a
-  sleep of the thread, not a preemption (but for a thread with `rseq` that
-  gives its virtual CPU to another); and a thread without `rseq` moves to
+  are hardware events even on a host with a PMU. A thread's CPU time,
+  context switches and CPU migrations are those it last accounted, at its
+  latest system call; its page faults count as they are taken. An event of
+  a CPU counts the time that passes, and no faults, switches or migrations.
+  A fault that ends in `SIGSEGV` or `SIGBUS` is not counted, where Linux
+  counts it in `page-faults`; a context switch is a sleep of the thread,
+  not a preemption (but for a thread with `rseq` that gives its virtual CPU
+  to another); and a thread without `rseq` moves to
   another CPU only when a new CPU mask changes the lowest CPU it allows.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where

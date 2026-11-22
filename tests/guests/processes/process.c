@@ -7236,6 +7236,70 @@ static int proc_stat_exec(const char *start, const char *faults) {
            ps_field("/proc/self/stat", 10) >= atol(faults));
     return 0;
 }
+/* The page-faults-live case: a fault counts to its task as it is taken
+   (mm/memory.c mm_account_fault adds to current->min_flt in the fault),
+   so another thread sees it at once, before the task makes another system
+   call: in the task's /proc/<pid>/task/<tid>/stat minflt and in
+   getrusage's RUSAGE_SELF. An execve counts the faults of its copy of the
+   arguments to the new stack (fs/exec.c copy_strings, through
+   get_user_pages): one for each page they fill, at least. */
+static int pfl_state, pfl_tid;
+static char *pfl_pages;
+static long pfl_page;
+static void *pfl_thread(void *unused) {
+    (void)unused;
+    __atomic_store_n(&pfl_tid, (int)syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    /* No system call from here until it is let go. */
+    for (long i = 0; i < 64; i++) pfl_pages[i * pfl_page] = 1;
+    __atomic_store_n(&pfl_state, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&pfl_state, __ATOMIC_SEQ_CST) != 2) {
+    }
+    return NULL;
+}
+static int page_faults_live_exec(const char *before) {
+    printf("after exec: arguments-counted=%d\n", pf_get(RUSAGE_SELF) - atol(before) >= 32);
+    return 0;
+}
+static int page_faults_live_case(const char *self) {
+    fflush(stdout);
+    pid_t measuring = fork();
+    if (measuring != 0) {
+        int status;
+        waitpid(measuring, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+    pfl_page = sysconf(_SC_PAGESIZE);
+    pfl_pages = mmap(NULL, (size_t)(64 * pfl_page), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pfl_pages == MAP_FAILED) return 2;
+    long before = pf_get(RUSAGE_SELF);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, pfl_thread, NULL)) return 3;
+    while (__atomic_load_n(&pfl_state, __ATOMIC_SEQ_CST) != 1) sched_yield();
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", __atomic_load_n(&pfl_tid, __ATOMIC_SEQ_CST));
+    long task = ps_field(path, 10);
+    long process = pf_get(RUSAGE_SELF) - before;
+    printf("while it runs: task-at-least-64=%d process-grew-by-64=%d\n", task >= 64,
+           process >= 64);
+    __atomic_store_n(&pfl_state, 2, __ATOMIC_SEQ_CST);
+    pthread_join(thread, NULL);
+
+    /* 32 arguments of a page each. */
+    static char big[32][4096];
+    char *arguments[36] = {(char *)self, "page-faults-live-exec", NULL};
+    for (int i = 0; i < 32; i++) {
+        memset(big[i], 'a' + i % 26, sizeof big[i] - 1);
+        arguments[3 + i] = big[i];
+    }
+    arguments[35] = NULL;
+    char text[24];
+    snprintf(text, sizeof text, "%ld", pf_get(RUSAGE_SELF));
+    arguments[2] = text;
+    fflush(stdout);
+    execv(self, arguments);
+    _exit(71);
+}
 /* The proc-stat-sched case: /proc/<pid>/stat's scheduling fields, as
    fs/proc/array.c do_task_stat writes them: priority is task_prio (prio
    less MAX_RT_PRIO: 20 + nice for a normal task, -1 - rt_priority for a
@@ -35082,6 +35146,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "page-faults-exec")) return argc < 3 ? 98 : page_faults_exec(argv[2]);
     if (!strcmp(mode, "proc-stat-counts")) return proc_stat_counts_case(self);
     if (!strcmp(mode, "proc-stat-sched")) return proc_stat_sched_case();
+    if (!strcmp(mode, "page-faults-live")) return page_faults_live_case(self);
+    if (!strcmp(mode, "page-faults-live-exec")) return argc < 3 ? 98 : page_faults_live_exec(argv[2]);
     if (!strcmp(mode, "proc-stat-exec")) return argc < 4 ? 98 : proc_stat_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-stat-thread-exec"))
         return argc < 5 ? 98 : proc_stat_thread_exec(argv[2], argv[3], argv[4]);

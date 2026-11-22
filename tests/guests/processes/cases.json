@@ -285,6 +285,7 @@
     {"name":"page-faults","binary":"process"},
     {"name":"proc-stat-counts","binary":"process"},
     {"name":"proc-stat-sched","binary":"process"},
+    {"name":"page-faults-live","binary":"process"},
     {"name":"script-exec","binary":"process"},
     {"name":"capabilities","binary":"process"},
     {"name":"file-capabilities","binary":"process"},

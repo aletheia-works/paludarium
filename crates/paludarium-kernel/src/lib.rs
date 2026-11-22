@@ -203,15 +203,14 @@ impl PartialEq for CpuAccount {
 }
 impl Eq for CpuAccount {}
 
-/// What a guest thread has used, as of its latest system call: its CPU
-/// time in nanoseconds, the page faults its accesses took
-/// ([`paludarium_mmu::faults`]) in its own code and in system calls, the
-/// times it went to sleep ([`paludarium_host::switches`]) and the times it
-/// moved to another CPU. The software events of `perf` count these. The
-/// faults of its reads and writes through `get_user_pages`
-/// ([`paludarium_mmu::faults::take_forced`]) are kept apart
-/// (`forced_faults`), as they count to its `min_flt` but are no `perf`
-/// event.
+/// What a guest thread has used: its CPU time in nanoseconds, the times it
+/// went to sleep ([`paludarium_host::switches`]) and the times it moved to
+/// another CPU, as of its latest system call, and the page faults its
+/// accesses take ([`paludarium_mmu::faults`]), in its own code and in the
+/// kernel's work for it (`kernel_faults`), as they are taken. The software
+/// events of `perf` count these. The faults of its reads and writes
+/// through `get_user_pages` are kept apart (`forced_faults`), as they count
+/// to its `min_flt` but are no `perf` event.
 #[derive(Debug, Default)]
 pub(crate) struct Usage {
     pub(crate) cpu: std::sync::atomic::AtomicU64,
@@ -231,7 +230,7 @@ pub(crate) struct Usage {
 
 impl Usage {
     /// Its minor faults (Linux's `min_flt`): every fault it took, its own
-    /// code's, its system calls' and those through `get_user_pages`.
+    /// code's, the kernel's for it and those through `get_user_pages`.
     pub(crate) fn minor_faults(&self) -> u64 {
         use std::sync::atomic::Ordering::SeqCst;
         self.faults
@@ -241,28 +240,35 @@ impl Usage {
     }
 }
 
-/// Adds the page faults taken since the last call to the thread's
-/// [`Usage`]: those of its own code as it enters a system call, and those of
-/// the call (`kernel`) as it leaves it, as Linux tells a fault of user mode
-/// from one of the kernel's accesses to user memory.
-pub(crate) fn account_faults(state: &ThreadState, kernel: bool) {
-    let forced = paludarium_mmu::faults::take_forced();
-    if forced != 0 {
-        state
-            .cpu
-            .used
-            .forced_faults
-            .fetch_add(forced, std::sync::atomic::Ordering::SeqCst);
+impl paludarium_mmu::faults::Sink for Usage {
+    fn user(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.faults
     }
-    let faults = paludarium_mmu::faults::take();
-    if faults != 0 {
-        let usage = &state.cpu.used;
-        let field = if kernel {
-            &usage.kernel_faults
-        } else {
-            &usage.faults
-        };
-        field.fetch_add(faults, std::sync::atomic::Ordering::SeqCst);
+    fn kernel(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.kernel_faults
+    }
+    fn forced(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.forced_faults
+    }
+}
+
+/// While it lives, the calling host thread's faults count to the guest
+/// thread's [`Usage`] as the kernel's for it (Linux tells a fault of user
+/// mode from one of the kernel's accesses to user memory); after it, as the
+/// thread's own code's.
+pub(crate) struct KernelFaults;
+
+impl KernelFaults {
+    pub(crate) fn enter(state: &ThreadState) -> Self {
+        paludarium_mmu::faults::bind(Arc::clone(&state.cpu.used) as _);
+        paludarium_mmu::faults::set_kernel(true);
+        KernelFaults
+    }
+}
+
+impl Drop for KernelFaults {
+    fn drop(&mut self) {
+        paludarium_mmu::faults::set_kernel(false);
     }
 }
 
@@ -1187,6 +1193,10 @@ impl Kernel {
 
     /// Handles a stop of `thread` (W3, W4).
     pub fn handle(&mut self, thread: &mut Thread, mem: &AddressSpace, reason: ExitReason) -> Next {
+        // Its work for the thread is the kernel's: the faults of its
+        // accesses count as the kernel's, those of the thread's code before
+        // it as the thread's own.
+        let _faults = KernelFaults::enter(&thread.state);
         // What it waits for in the host while it handles the stop shows it
         // as sleeping (`/proc/<pid>/stat`), and nothing else does.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
@@ -1490,10 +1500,7 @@ impl Kernel {
                     paludarium_cpu::segments::USER_CS;
                 thread.cpu.segments[paludarium_cpu::segments::SS] =
                     paludarium_cpu::segments::USER_DS;
-                account_faults(&thread.state, false);
-                let next = self.syscall(thread, mem);
-                account_faults(&thread.state, true);
-                next
+                self.syscall(thread, mem)
             }
             ExitReason::PageFault { .. }
             | ExitReason::GeneralProtection { .. }

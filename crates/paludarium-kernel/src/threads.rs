@@ -2140,6 +2140,9 @@ impl Kernel {
             .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
+        // Its exit is the kernel's work for it, whose faults (a core
+        // dump's reads, the child TID's clearing) count to it.
+        let _faults = crate::KernelFaults::enter(&thread.state);
         // Its tracees are let go of, and its tracer told, before it goes.
         let status = self
             .group
@@ -2206,8 +2209,6 @@ impl Kernel {
         };
         if last && let Some(dump) = core.take() {
             self.write_core(&dump, mem);
-            // Its reads' faults count to the thread that dumped.
-            crate::account_faults(&thread.state, true);
             for (tid, head) in dump.robust_lists {
                 crate::futex::exit_robust_list(&self.group.futexes, mem, tid, head);
             }

@@ -233,8 +233,9 @@ every test passing.
 - The terminal gate runs the libraries' unit tests, not the harness's
   differential tests. So that the system calls those check count there too,
   some kernel unit tests (`replay_tests.rs`, `ptrace_replay_tests.rs`,
-  `bpf_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`, `mctp_tests.rs`,
-  `seccomp_tests.rs`, `perf_sample_tests.rs` and `perf_side_band_tests.rs` in
+  `bpf_tests.rs`, `bpf_prog_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`,
+  `mctp_tests.rs`, `seccomp_tests.rs`, `perf_sample_tests.rs` and
+  `perf_side_band_tests.rs` in
   `crates/paludarium-kernel/src/`) make a differential guest's calls in
   the same order and compare its lines with what the guest prints on
   native Linux: as printed on Linux 7.0, or as printed under the emulator
@@ -334,7 +335,10 @@ those versions through `decmpfs`, which pins `zstd` exactly, so aube cannot
 update them. The advisory exceptions go once a `decmpfs` release takes `zstd`
 0.14 ([SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)):
 an exception that no crate matches fails the audit, so the aube bump that no
-longer needs them cannot merge until they are removed.
+longer needs them cannot merge until they are removed. aube also has, for now,
+RUSTSEC-2026-0592 against `url` 2.5.8, which aube 2.10.0's `Cargo.lock` gets
+through `hickory-net`, `hickory-resolver` and `reqwest`. `url` 2.5.9 fixes it,
+and the exception goes once the pinned aube release locks `url` 2.5.9 or later.
 `tests/guests/programs/evidence.py` lists every exception, and `source-lock.json`
 names them with the exact crate versions.
 

@@ -904,14 +904,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ガードを置けません（`EPERM`）。Linux が `VM_DONTEXPAND` でマップする AIO と
   `io_uring` のリングは、どちらの指定も受け付けません（`EINVAL`）。
   `MADV_COLLAPSE` は、Linux の `madvise_collapse` と同じく VMA ごとにプライベートな
-  anonymous メモリをまとめます。どのページも書かれていない VMA、`MADV_NOHUGEPAGE` の
-  VMA、揃った 2 MiB の区間が入らない VMA、共有メモリとファイルのマッピングは断り
-  （`EINVAL`）、そのうえで揃った区間をまるごと含まない範囲は成功します。まるごとの
-  区間はそれぞれ、そのすべてのページを持つ huge page になるので、`mincore` と常駐の
-  数は 2 MiB すべてを示します。ただし、区間のどのページにも触れていない（ページ
-  テーブルがない）か、ガード、毒、uffd-wp のマーカーがあれば `EINVAL`（ほかの区間を
-  済ませてから）、`userfaultfd` が登録した範囲にあって空のページがあれば `EBUSY`
-  （すぐに）です。`MADV_HWPOISON` と `MADV_SOFT_OFFLINE` は、範囲の引数を確かめ、
+  anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA、
+  揃った 2 MiB の区間が入らない VMA、どのページも書かれていないプライベートな
+  anonymous の VMA、アドレスとファイルのオフセットが 2 MiB 単位で揃っていない shmem の
+  VMA、通常のファイルのマッピングは断り（`EINVAL`）、そのうえで揃った区間をまるごと
+  含まない範囲は成功します。プライベートな anonymous メモリのまるごとの区間はそれぞれ、
+  そのすべてのページを持つ huge page になるので、`mincore` と常駐の数は 2 MiB すべてを
+  示します。ただし、区間のどのページにも触れていない（ページテーブルがない）か、
+  ガード、毒、uffd-wp のマーカーがあれば `EINVAL`（ほかの区間を済ませてから）、
+  `userfaultfd` が登録した範囲にあって空のページがあれば `EBUSY`（すぐに）です。
+  shmem のページキャッシュは、ファイルのない共有メモリ、memfd、tmpfs のファイル、
+  System V の共有メモリのもので、共有でもプライベートでもマップできます。ページ
+  キャッシュがどのページも持たない区間はまとめるのを終わらせ（`EINVAL`）、
+  `userfaultfd` が欠けたページについて登録した VMA で穴のある区間も同じです
+  （`EBUSY`）。そうでなければ区間のうちファイルの中にあるページはすべてページ
+  キャッシュに入り、穴はゼロになります。memfd と tmpfs のファイルは穴の分を
+  割り当てられ、マウントの大きさを超えれば `EINVAL`（すぐに）です。そのうえで区間は
+  まとめられます。ただし、VMA が書き込みの保護について登録されているかページに
+  マーカーがあれば `EINVAL`（ほかの区間を済ませてから）、プライベートなマッピングが
+  ページの自分のコピーを持っていれば `EINVAL`（すぐに）です。`MADV_HWPOISON` と
+  `MADV_SOFT_OFFLINE` は、範囲の引数を確かめ、
   次に `CAP_SYS_ADMIN` を確かめます（`EPERM`）。アドレスの上限やマッピングより先です。
   `CAP_SYS_ADMIN` があれば、ページを順に読んで持ち込みます。どのマッピングにもない
   ページ、読めないページ、持ち込めないページは `EFAULT`、毒のあるページは
@@ -1448,19 +1460,31 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     成功してマップされたまま残します。
   - `fork` の子は封印を受け継ぎ、`exec` のあとは何も封印されていません。
 
-- io_uring は Linux 6.12 のもので、操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
+- io_uring は Linux 6.12 のものですが、登録したファイル、バッファーのグループ、NOP の
+  フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
+  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
-  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、それに `IORING_OP_FILES_UPDATE` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
+  それに `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
-  完了（`IORING_FEAT_NODROP`）は Linux と同じです。
+  完了（`IORING_FEAT_NODROP`）は Linux と同じです。一度の投入の完了は、Linux が投稿する
+  ように、その要求をすべて実行してから入ります（`io_submit_flush_completions`）。
+
+- `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
+  `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は
+  `fd` のファイルを、`IORING_NOP_FIXED_FILE` があれば登録したものを探し、
+  `IORING_NOP_FIXED_BUFFER` は登録したバッファー `buf_index` を探します。これは Linux
+  master と同じで、`IOSQE_FIXED_FILE` でも登録したファイルを指します。ファイルが見つからない
+  NOP は `EBADF` で、バッファーが見つからない NOP は `EFAULT` で完了します。32 バイトの完了を持つリングはないので `IORING_NOP_CQE32`
+  は `EINVAL` で、知らないフラグも `EINVAL` です。
 
 - 転送は Linux の `io_prep_rw` と `io_read` または `io_write` と同じ順に調べ、同じところで
   失敗します。準備では優先度、属性、バッファーかベクターを調べ、そこでのエラーは投入を
   終わらせます。実行で調べるものは、エラーで完了します。ファイル（記述子がなければ `EBADF`。
   `IOSQE_FIXED_FILE` では、登録したファイルのスロットが空なら `EBADF`）、バッファーを選ぶ
-  読み出しの提供バッファー（`ENOBUFS`）、アクセスモード、`RWF_*`
+  読み出しのバッファー（`ENOBUFS`。次にユーザー空間を越えるものは `EFAULT`）、アクセスモード、`RWF_*`
   フラグ（`RWF_HIPRI` は `EINVAL`）、範囲、読み出しの `FAN_ACCESS_PERM`、読み書きできない
   ファイル（`EINVAL`。ディレクトリーは `EISDIR`）の順です。オフセット -1 はファイルの位置で、
   位置は動かした分だけ進みます。パイプのようなストリームは、どのオフセットでも受け付けます。
@@ -1510,6 +1534,46 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - `IORING_REGISTER_FILE_ALLOC_RANGE` はその範囲を決めます。引数が要り、数は取らず
     （`EINVAL`）、それから範囲を読みます（`EFAULT`。`EOVERFLOW`。登録したファイルを越える
     範囲は `EINVAL`）。ファイルを登録すると、範囲はそのすべてになります。
+  - `IORING_REGISTER_FILES2` と `IORING_REGISTER_FILES_UPDATE2` は、Linux 7.0 の
+    `io_register_rsrc` と `io_register_rsrc_update` と同じく、スロットごとにタグを付けて
+    ファイルを登録し、更新します。引数はその大きさで（`EINVAL`）、読めて（`EFAULT`）、数が
+    あり予約欄が 0 でなければなりません（`EINVAL`）。唯一のフラグ
+    `IORING_RSRC_REGISTER_SPARSE` は空のスロットを登録し、記述子を取りません（`EINVAL`）。
+    記述子なしの登録も同じです。タグはそれぞれ記述子より先に読み（`EFAULT`）、タグには
+    ファイルが要ります（空にするスロットや飛ばすスロットには `EINVAL`）。タグ付きのファイルを
+    何も持たなくなると、つまりスロットが空になったかファイルの登録が外れると（最後のスロット
+    から）、タグを `user_data` に、0 を結果にした完了がすぐに入ります。スロットを空にした
+    投入の完了より先ですが、その投入の要求がファイルを持っていればそれらの後です。失敗した
+    登録はタグを投稿しません。
+
+- リングはバッファーのグループを保ち、`IOSQE_BUFFER_SELECT` の読み出しは `buf_group` が
+  指すグループからその 1 つを選びます。Linux の `io_uring/kbuf.c` と同じです。読み出しは
+  長さの分まで（長さがなければバッファー全体）で、完了のフラグには `IORING_CQE_F_BUFFER` と、
+  上位 16 ビットにバッファーの ID が入ります。グループに残りがないか、グループがなければ
+  `ENOBUFS` です。
+  - `IORING_OP_PROVIDE_BUFFERS` はグループの終わりにバッファーを加え（グループがなければ
+    作ります）、ID は `off` からです。`IORING_OP_REMOVE_BUFFERS` は初めから指定の数まで
+    取り除き（グループがなければ `ENOENT`）、取り除いた数を返します。エントリーは
+    `io_provide_buffers_prep` と `io_remove_buffers_prep` と同じく調べます（`E2BIG`、
+    `EINVAL`、`EOVERFLOW`、ユーザー空間を越えるバッファーは `EFAULT`）。1 つのグループは
+    65535 個までです（1 つも加えられなければ `EOVERFLOW`）。読み出しは、選んだ時点で
+    バッファーを使い終えます。そのあと失敗しても同じです。
+  - `IORING_REGISTER_PBUF_RING` は、`io_register_pbuf_ring` と同じくグループのバッファーの
+    リングを登録します。予約バイト、未知のフラグ、65536 未満の 2 の累乗でないエントリー数は
+    `EINVAL`、そこにリングかバッファーのあるグループがあれば `EEXIST` です。リングは
+    プログラムのメモリにあり、ページ境界にあって（`EINVAL`）、一周せず（`EOVERFLOW`）、
+    書き込めること（`EFAULT`）が要ります。`IOU_PBUF_RING_MMAP` ではカーネルがページを用意し、
+    リングの記述子を `IORING_OFF_PBUF_RING` とグループの ID のオフセットで `mmap` すると
+    見えます（そのページのないグループは `ENOMEM`）。そのページは、登録バッファーと同じく
+    RLIMIT_MEMLOCK に数えます。`IORING_UNREGISTER_PBUF_RING` はリングを外し（`ENOENT`。
+    提供バッファーなら `EINVAL`）、`IORING_REGISTER_PBUF_STATUS` はその head を返します。
+  - 読み出しは、tail がそこになければリングの head のバッファーを取ります。通常のファイルの
+    ようにポーリングできないファイルは、読み出しが選んだ時点でバッファーを使い、読み出しが
+    そのあとどうなっても同じです。パイプやソケットは、読み出しが失敗しなかったときに使い、
+    失敗すればバッファーはリングに残ります。`IOU_PBUF_RING_INC` では、読み出しは読んだ
+    バイトの分だけ使い（ポーリングできないファイルでは求めたバイトの分）、バッファーの
+    アドレスと長さをその先へ進めます。バッファーが残っているあいだ、完了には
+    `IORING_CQE_F_BUF_MORE` が付きます。
 
 - Linux のネイティブな非同期 I/O（libaio が包む呼び出し）は `fs/aio.c` のものです。
   `io_setup` はイベント数を CPU ごとに少なくとも 4 にして 2 倍にし（`0x8000000 / 32` を
@@ -1533,7 +1597,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   キーのないハングアップなら準備できたもの）。ファイルを準備できた状態にした呼び出しは、
   このプロセスのものでもほかのプロセスのもの（fork した子のパイプへの書き込み）でも、
   戻る前にイベントをリングに入れるので、リングから自分でイベントを取るプログラムには、
-  呼び出しなしでそれが見えます。
+  呼び出しなしでそれが見えます。プログラムが呼び出しなしで動いているあいだに期限が来た
+  timerfd も同じで、Linux のタイマーが起床から完了させるように、動いているスレッドの次の
+  チェックポイントが poll を完了させます。
   `io_cancel` が取り消せるのは待っている poll だけで（`EINPROGRESS` で、イベントのない
   イベントがリングに入ります）、ほかの要求には `EINVAL` です。`io_getevents` と
   `io_pgetevents` は head からイベントを取り、Linux の `read_events` と同じく `min_nr` 個まで
@@ -2196,7 +2262,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`ETIMEDOUT`）になり、データグラムは失われます。TCP はブロードキャストとマルチ
     キャストの経路を取らず（`ENETUNREACH`）、UDP は、`SO_BROADCAST` がなければ、
     ブロードキャストの経路が持つアドレスや限定ブロードキャストのアドレスへの経路を
-    取りません（`EACCES`）。端のアドレスにバインドしたソケット
+    取りません（`EACCES`）。`SO_BROADCAST` があれば、ブロードキャストのデータグラムは、
+    そのポートの受け取るどの UDP ソケットにも 1 つずつ届きます
+    （`__udp4_lib_mcast_deliver`）。受け取るのは、未指定のアドレスかデータグラムの
+    宛先にバインドし、接続していないか送り手に接続した、`IPV6_V6ONLY` でないソケット
+    です。届くのは、`ip_mc_output` がキャリアがなくてもブロードキャストを折り返すので
+    送った名前空間と、端にキャリアがある間は、相手がそのアドレスをブロードキャストと
+    見て（限定ブロードキャストか、経路がそうするもの）、送り元を逆経路フィルタが
+    通すとき（`ip_route_input_slow`）の相手の名前空間です。未指定のアドレスから
+    接続したソケットは経路の送り元を取っているので、受け取りません。端のアドレスにバインドしたソケット
     からのグループや限定ブロードキャストのアドレスへのものは、経路がなくてもその端から
     出ます（`ip_route_output_key_hash_rcu`）。
   - **組を通る IPv6:** IPv6 の経路（ユニキャストのもの、またはマルチキャストの
@@ -2823,7 +2897,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PT_INTERP` のあるプログラムは、Linux の `load_elf_binary` と同じくそのインタプリタ
   から始まり、`AT_BASE` と `AT_ENTRY` でプログラムを見つけます。インタプリタにも同じ権限が
   要り、読めなければダンプできません。set-ID ビットは効かず、x86-64 のプログラムでない
-  ファイルは `ELIBBAD` です。
+  ファイルは `ELIBBAD` です。途中で切れたプログラムのファイルは、Linux の binfmt_elf と
+  同じく読み込みます。ヘッダーが短いか、プログラムヘッダーがファイルの終わりを越えれば
+  `ENOEXEC`、インタプリタのパスが越えれば `EIO` です。終わりを越えるセグメントはマップし、
+  まるごと終わりの先にあるページは、触れたときに `SIGBUS` を起こします。書き込める
+  セグメントの bss がそのようなページで始まると消せない（`padzero`）ので、exec は引き返せない
+  ところを過ぎてから失敗し、プロセスは `SIGSEGV` で終わります。
   `#!` で始まるファイルは、Linux の `load_script` と同じくインタプリタを動かします。
   最初の行（255 バイトまで）がインタプリタの名前と、任意の引数 1 つを示します。引数は、
   その名前、その引数、そして `argv[0]` の代わりにスクリプトのパスです。set-ID ビットは
@@ -2965,7 +3044,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `execve`、Unix ソケットのアドレスは扱いません。
 
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
-  `fs`、`kernel`、`net` だけを持つ `/proc/sys`（後述）、
+  `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -3239,6 +3318,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
   `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+
+- `/proc/sys/vm` にあるのは `drop_caches` だけなので、ほかの `vm` の sysctl もある
+  Linux とは一覧が違います。Linux の `fs/drop_caches.c` と同じく、このファイルは root の
+  もので、モードは 0200 です。読むためには root でも開けず（`EACCES`。`test_perm` は root
+  に持ち主のビットを与えます）、書くために開けるのは root だけです。書き込みは 1 から 4 の
+  `int` を 1 つ受け取ります（`proc_dointvec_minmax`。ほかは `EINVAL`）。通った書き込みは、
+  先頭より後ろへの書き込みでも（最後に書かれた値で）、`drop_caches_sysctl_handler` と
+  同じく捨てます。2（`drop_slab`）は何にも使われていない inode を追い出し、その
+  追い出せる fanotify のマークもなくなります（後述）。1 はページキャッシュを捨てますが、
+  ここではそれが見えるものはありません。4 はカーネルログの行を止めるだけで、ここには
+  その行がありません。
 
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
   `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
@@ -3601,7 +3691,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   子は 0 から始まり、`execve` はどちらも保ちます。`ru_minflt` は、Linux の
   `mm_account_fault` がタスクに足すのと同じくマイナーフォールトを数えます。スレッドが
   ページを初めて読み書きしたとき、`fork` が共有したページやファイルのプライベートな
-  マッピングのページに書いたとき（自身のコードでも、システムコールのコピーでも）と、
+  マッピングのページに書いたとき（自身のコードでも、システムコールのコピーやシグナル
+  フレームのようなカーネルのアクセスでも。起きたときに数えます）と、
   `get_user_pages` がそのスレッドのために読み書きしてフォールトしたときです。後者は
   `perf` は数えません。`mlock` が取り込むとき、トレーサーの `PTRACE_PEEKDATA` と
   `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（一度も触れていない無名メモリは
@@ -3796,7 +3887,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `cpu-clock` と `task-clock`（スレッドの CPU 時間をナノ秒で。CPU のイベントは経った時間）、
   スレッドの `page-faults` と `minor-faults`（ページへの最初の読み書きと、`fork` で共有した
   ページやファイルのプライベートなマッピングへの書き込み。スレッドのコードのフォルトは
-  `exclude_user` で、システムコールのコピーのフォルトは `exclude_kernel` で除きます）、
+  `exclude_user` で、システムコールのコピーやシグナルフレームのようなカーネルのアクセスの
+  フォルトは `exclude_kernel` で除きます）、
   `context-switches`（眠るたび）と `cpu-migrations`（`getcpu` の返す CPU が変わるたび）。
   後の二つはカーネルが起こすので、Linux と同じく `exclude_kernel` で除きます。すべての
   ページがメモリにあるので何も数えない `major-faults` と、x86-64 と同じく何も数えない
@@ -4035,6 +4127,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EFAULT`）、結び付けるデバイス（`EINVAL`）、そして型です。ソケットフィルター以外の型は、
   それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。名前は、マップと同じく最後に
   確かめます（`EINVAL`）。
+  `BPF_F_STRICT_ALIGNMENT` があり `BPF_F_ANY_ALIGNMENT` がないとき、検証器は Linux の
+  `check_ptr_alignment` と同じく、どのアクセスも大きさに揃っていることを求めます。
+  コンテキスト（"misaligned context access off %s+%d+%d size %d"）、マップの値
+  （"misaligned value access ..."）、null を確かめる前のルックアップの結果、スカラー
+  （"misaligned access ..."。アクセスを断る前に確かめます）を通したアクセスで、どれも
+  `EACCES` です。スタックと `BPF_ATOMIC` は、フラグにかかわらず揃っていなければなりません。
 
 - 検証器（`kernel/bpf/verifier.c`）は、テストが知る二つのカーネル、master と 7.0 の
   どちらも受け入れるプログラムだけを受け入れ、どちらかが断るものは断ります。最初に構造を
@@ -4073,10 +4171,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   収まり（"invalid access to map value"、`EACCES`）、マップが `BPF_F_RDONLY_PROG` なら書けず、
   `BPF_F_WRONLY_PROG` なら読めません（`EACCES`）。プログラムは使うマップを持ち続けます。
 
-- `BPF_ATOMIC` は、スタックかマップの値の 4 バイトか 8 バイトを一度に変えます。確かめ方は
-  Linux の `check_atomic` と同じです。加算、OR、AND、XOR（それぞれ `BPF_FETCH` ありとなし）、
-  `BPF_XCHG`、`BPF_CMPXCHG` を受け付けます。ほかの演算は "BPF_ATOMIC uses invalid atomic
-  opcode %02x"、ほかの大きさは "invalid atomic operand size" です（`EINVAL`）。ソースと
+- `BPF_ATOMIC` の読み出し・変更・書き込みの演算は、スタックかマップの値の 4 バイトか
+  8 バイトを一度に変えます。確かめ方は Linux の `check_atomic` と同じです。加算、OR、AND、
+  XOR（それぞれ `BPF_FETCH` ありとなし）、`BPF_XCHG`、`BPF_CMPXCHG` を受け付けます。ほかの
+  演算は "BPF_ATOMIC uses invalid atomic opcode %02x"、これらのほかの大きさは "invalid atomic
+  operand size" です（`EINVAL`）。ソースと
   デスティネーションのレジスタ、`BPF_CMPXCHG` では R0 も、書かれていなければなりません。
   コンテキストへは "BPF_ATOMIC stores into R%d ctx is not allowed" です（`EACCES`）。古い値を
   受け取るレジスタ（`BPF_FETCH` ではソース、`BPF_CMPXCHG` では R0）は、その時点から値の
@@ -4084,6 +4183,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   読むことになります。メモリは読んでから書き、プログラムのフラグにかかわらず大きさに揃って
   いなければなりません。こうして書いたスタックのスロットは、ポインタを退避していたところでも、
   ただのバイトになります。
+  `BPF_LOAD_ACQ` と `BPF_STORE_REL` は、どの大きさでも、ロードとストアと同じに確かめ、
+  フラグにかかわらず揃っていなければなりません。コンテキストを通したものは断ります
+  （"BPF_ATOMIC loads from R%d ctx is not allowed"、"BPF_ATOMIC stores into R%d ctx is not
+  allowed"、`EACCES`）。ロードは、master とテストのマシンの 7.0 と同じく、ソースを読んだ
+  すぐあと、アクセスを確かめる前に断ります。ストアはアクセスを確かめたあとに断ります。
 
 - コンテキストは、プログラムが始まるときの R1 で、パケットの `struct __sk_buff` です。
   Linux がソケットフィルターに許すとおりに読み書きできます。4 バイトのフィールドは、
@@ -4107,6 +4211,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `bpf_get_current_uid_gid` です。ソケットフィルターが呼べないヘルパーは "program of this
   type cannot use helper %s#%d"、ヘルパーでない番号は "invalid func %s#%d" です（`EINVAL`）。
 
+- `BPF_LD_ABS` と `BPF_LD_IND` は、パケットの 1、2、4 バイトを、`imm` か、ソースレジスタに
+  `imm` を足したところから R0 に読みます。Linux の `check_ld_abs` と同じに確かめます。
+  予約されたフィールド（宛先、オフセット、`BPF_LD_ABS` ではソース）は、master と同じく
+  どの経路をたどるより前に "BPF_LD_[ABS|IND] uses reserved fields" で断り、8 バイトは
+  未知のオペコードです（`EINVAL`）。R6 は書き込まれていて（"R6 !read_ok"、`EACCES`）、
+  コンテキストでなければなりません（"at the time of BPF_LD_ABS|IND R6 != pointer to skb"、
+  `EINVAL`）。その後、`BPF_LD_IND` のソースが書き込まれていること、R6 のコンテキストが
+  受け取ったままであることを確かめます（"dereference of modified ctx ptr R6 off=%d
+  disallowed"、`EACCES`）。読んだ後の R1 から R5 は読めず、R0 は数です。
+
 - ソケットフィルターは `SO_ATTACH_BPF` で、古典的なものは `SO_ATTACH_FILTER`（後述）で、
   AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の
   ソケットにアタッチし、送られてくるメッセージごとに、Linux の `sk_filter` と
@@ -4117,7 +4231,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   レジスタによる除算は 0 で、剰余は被除数のままです。-1 による符号付き除算は符号を反転し、
   符号付き剰余は 0 です。32 ビットのアトミック演算は、スロットの下半分をソースの下半分で変え、
   R0 の下半分と比べます。古い値はゼロ拡張して返ります。マップの値への読みと書きの間に、
-  その値へのほかのアクセスは入りません。コンテキストはメッセージの `__sk_buff` です。`len`、0 から始まる
+  その値へのほかのアクセスは入りません。ロードアクワイアはゼロ拡張して返り、ストアリリースは
+  ソースの下位のバイトを書きます。`BPF_LD_ABS` と `BPF_LD_IND` は、Linux の
+  `bpf_gen_ld_abs` が `bpf_skb_load_helper_8`、`_16`、`_32` の呼び出しに書き換えるのと
+  同じく、ビッグエンディアンで読みます。オフセットは `int`（レジスタと `imm` の和の下半分）で、
+  メッセージの先頭から、`SKF_NET_OFF` からはネットワークヘッダ（メッセージの先頭）からです。
+  そのバイトがメッセージにないとき、オフセットが設定されていない MAC ヘッダからのものか
+  それより下のときは、プログラムはその場で 0 を返します。コンテキストはメッセージの `__sk_buff` です。`len`、0 から始まる
   `cb[]` があり、AF_UNIX のメッセージが設定しないフィールドは 0 です。
   `bpf_skb_load_bytes` はメッセージを読み、相対形はネットワークヘッダ（メッセージの先頭）
   から読みます。MAC ヘッダはありません（`EFAULT`）。プログラムが更新するマップは、
@@ -4296,7 +4416,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   まとめて消します。マウントへのマークはマウントの ID で持ち、同じファイルシステムの
   バインドマウントではなくそのマウントの中のパスのイベントだけを受け、fdinfo はその ID を
   示します。マウントが解放されるとそのマークもなくなるので（`fsnotify_vfsmount_delete`）、
-  次にその ID を得たマウントにはマークがありません。exec がプログラムとそのインタープリターを
+  次にその ID を得たマウントにはマークがありません。tmpfs のスーパーブロックが最後の
+  マウントとともに消えると、そのファイルとスーパーブロック自身のマークもなくなるので
+  （`fsnotify_sb_delete`）、次にそのデバイスを得たものにはマークがありません。追い出せるマーク
+  （`FAN_MARK_EVICTABLE`）は inode への参照を持たず、`/proc/sys/vm/drop_caches` が inode を
+  追い出すと、`fsnotify_inode_delete` がマークを外すのと同じくなくなります。対象は、
+  tmpfs（dentry が残ります）の外にあり、開いたファイル記述、作業ディレクトリ、動いている
+  プログラム、inotify のウォッチ、`FAN_MARK_EVICTABLE` のないマークのどれも持っていない
+  ファイルです。exec がプログラムとそのインタープリターを
   開くことは、`do_open_execat` が `__FMODE_EXEC` で開くのと同じく `FAN_OPEN_EXEC` 付きの
   `FAN_OPEN` として伝わり、inotify には `IN_OPEN` として伝わります。その前に、そうした
   オープンはそれぞれ `FAN_OPEN_EXEC_PERM`、`FAN_OPEN_PERM` を、exec によるそのファイルの
@@ -4329,8 +4456,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `FAN_REPORT_FD_ERROR` ではそのエラー、それ以外は read のエラーです）。FID モードでは
   ファイルのハンドル（`name_to_handle_at` の識別子）、ディレクトリのハンドルと名前、
   名前の変更での古いと新しいディレクトリと名前、ディレクトリ自身のイベントでの `.` の
-  レコードがつきます。まだ溜まっている同じ対象、同じプロセス、同じ種類のイベントには
-  まとめ、`max_queued_events` を超えると `FAN_Q_OVERFLOW` を 1 つ溜め、
+  レコードがつきます。まだ溜まっている同じ対象、同じプロセス、同じ種類のイベントが、
+  マージ用ハッシュの同じバケットの新しい 128 個の中にあれば、それにまとめます
+  （`fanotify_merge`）。バケットは `fanotify_alloc_event` が混ぜるハッシュで決まります。
+  ファイルシステムの ID、ハンドル、名前は Linux と同じくハッシュするので（x86-64 の
+  `full_name_hash`）、1 つのタスクが 1 つのディレクトリで出す名前のイベントは、Linux と
+  ちょうど同じときに同じバケットに入ります。Linux がカーネルのアドレスでハッシュする
+  プロセスと、FID でないモードのパスは、独自のハッシュで扱います。
+  `max_queued_events` を超えると `FAN_Q_OVERFLOW` を 1 つ溜め、
   `FAN_REPORT_PIDFD` ではプロセスの pidfd を足します（`FAN_REPORT_TID` と一緒には、CI の
   ランナーの Linux 7.0 と同じく `EINVAL` です。master は両方を受け付け、スレッドのものを
   示します）。`FAN_REPORT_MNT` のグループは、マークしたマウント名前空間にマウントが

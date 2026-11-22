@@ -1,15 +1,20 @@
 //! io_uring, as Linux 6.12's (`io_uring/`) with these operations:
 //! `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL` (the one libuv batches its
 //! `epoll_ctl` calls with), and the file transfers `IORING_OP_READ`,
-//! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, and `IORING_OP_FILES_UPDATE`.
-//! The others answer `EOPNOTSUPP`, as on a Linux built without them, and
+//! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`, and
+//! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`. The others answer
+//! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
-//! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with, and
-//! `IORING_REGISTER_FILES` the files a request with `IOSQE_FIXED_FILE`
-//! names by their index. The registered files, their updates and their
-//! allocation range are checked as Linux 7.0's `io_uring/rsrc.c`,
-//! `register.c` and `filetable.c` check them, the kernel the differential
-//! tests run on.
+//! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
+//! `IORING_REGISTER_FILES` (or `_FILES2`, with tags) the files a request
+//! with `IOSQE_FIXED_FILE` names by their index, and
+//! `IORING_REGISTER_PBUF_RING` a ring of the buffers a read with
+//! `IOSQE_BUFFER_SELECT` chooses from, as it does from provided ones. The
+//! registered files, their updates and their allocation range are checked
+//! as Linux 7.0's `io_uring/rsrc.c`, `register.c` and `filetable.c` check
+//! them, the provided buffers and their rings as its `kbuf.c` does, and a
+//! NOP's flags as its `nop.c` takes them (with Linux master's
+//! `IOSQE_FIXED_FILE`): the kernel the differential tests run on.
 //!
 //! The rings are pages the kernel shares with the mappings of the ring's
 //! descriptor ([`SharedPages`]). A request runs when `io_uring_enter` takes
@@ -103,8 +108,10 @@ const OP_FILES_UPDATE: u8 = 20;
 const OP_READ: u8 = 22;
 const OP_WRITE: u8 = 23;
 const OP_EPOLL_CTL: u8 = 29;
+const OP_PROVIDE_BUFFERS: u8 = 31;
+const OP_REMOVE_BUFFERS: u8 = 32;
 /// The operations implemented.
-const OPS: [u8; 10] = [
+const OPS: [u8; 12] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
@@ -115,6 +122,8 @@ const OPS: [u8; 10] = [
     OP_READ,
     OP_WRITE,
     OP_EPOLL_CTL,
+    OP_PROVIDE_BUFFERS,
+    OP_REMOVE_BUFFERS,
 ];
 /// `IORING_OP_LAST` of Linux 6.12, after `IORING_OP_LISTEN`.
 const OP_LAST: u8 = 58;
@@ -132,6 +141,19 @@ const SQE_VALID_FLAGS: u8 =
 const LINK_FLAGS: u8 = IOSQE_IO_LINK | IOSQE_IO_HARDLINK;
 /// `IORING_NOP_INJECT_RESULT`: the NOP completes with its `len`.
 const NOP_INJECT_RESULT: u32 = 1;
+/// `IORING_NOP_FILE`: the NOP looks for the file of its `fd`, registered
+/// with `IORING_NOP_FIXED_FILE`.
+const NOP_FILE: u32 = 1 << 1;
+const NOP_FIXED_FILE: u32 = 1 << 2;
+/// `IORING_NOP_FIXED_BUFFER`: the NOP looks for registered buffer
+/// `buf_index`.
+const NOP_FIXED_BUFFER: u32 = 1 << 3;
+/// `IORING_NOP_CQE32`: the NOP fills a 32-byte completion, which only an
+/// `IORING_SETUP_CQE32` or `_CQE_MIXED` ring has.
+const NOP_CQE32: u32 = 1 << 5;
+/// Linux 7.0's `NOP_FLAGS`: `IORING_NOP_INJECT_RESULT` to `_CQE32`, with
+/// `IORING_NOP_TW` (completing as task work).
+const NOP_FLAGS: u32 = (1 << 6) - 1;
 /// `IORING_FSYNC_DATASYNC`, the only flag of `IORING_OP_FSYNC`.
 const FSYNC_DATASYNC: u32 = 1;
 /// `IORING_RW_ATTR_FLAG_PI`, the only attribute of a read or write.
@@ -146,8 +168,28 @@ const UNREGISTER_BUFFERS: u64 = 1;
 const REGISTER_FILES: u64 = 2;
 const UNREGISTER_FILES: u64 = 3;
 const REGISTER_FILES_UPDATE: u64 = 6;
+const REGISTER_FILES2: u64 = 13;
+const REGISTER_FILES_UPDATE2: u64 = 14;
 const REGISTER_PROBE: u64 = 8;
+const REGISTER_PBUF_RING: u64 = 22;
+const UNREGISTER_PBUF_RING: u64 = 23;
 const REGISTER_FILE_ALLOC_RANGE: u64 = 25;
+const REGISTER_PBUF_STATUS: u64 = 26;
+/// `IOU_PBUF_RING_MMAP`: the kernel gives the ring's pages, which the
+/// ring's descriptor maps at `IORING_OFF_PBUF_RING`.
+const PBUF_RING_MMAP: u16 = 1;
+/// `IOU_PBUF_RING_INC`: a buffer is used up a part at a time.
+const PBUF_RING_INC: u16 = 2;
+const OFF_PBUF_RING: u64 = 0x8000_0000;
+const OFF_PBUF_SHIFT: u64 = 16;
+/// `MAX_BIDS_PER_BGID`: a buffer's ID is 16 bits of a completion.
+const MAX_BIDS_PER_BGID: u64 = 1 << 16;
+const CQE_F_BUFFER: u32 = 1;
+const CQE_F_BUF_MORE: u32 = 1 << 4;
+const CQE_BUFFER_SHIFT: u32 = 16;
+/// `IORING_RSRC_REGISTER_SPARSE`: an `IORING_REGISTER_FILES2` with no
+/// descriptors, its slots all empty.
+const RSRC_REGISTER_SPARSE: u32 = 1;
 /// `IORING_MAX_FIXED_FILES`.
 const MAX_FIXED_FILES: u32 = 1 << 20;
 /// `IORING_REGISTER_FILES_SKIP`: an update leaves the slot as it is.
@@ -176,6 +218,7 @@ const ENXIO: Errno = Errno(6);
 const EBUSY: Errno = Errno(16);
 const EOVERFLOW: Errno = Errno(75);
 const ENFILE: Errno = Errno(23);
+const E2BIG: Errno = Errno(7);
 
 /// The pages of a ring, which a mapping cannot reach past: a page past
 /// them raises `SIGBUS`, as Linux inserts only the ring's pages.
@@ -234,6 +277,154 @@ pub(crate) struct Ring {
     /// The registered files, once `IORING_REGISTER_FILES` registered them
     /// (`ctx->file_table`).
     files: Mutex<Option<Files>>,
+    /// The buffer groups, by ID (`ctx->io_bl_xa`).
+    buffer_lists: Mutex<std::collections::BTreeMap<u16, BufferList>>,
+}
+
+/// A buffer group (`struct io_buffer_list`): the buffers
+/// `IORING_OP_PROVIDE_BUFFERS` gave, first first, or a ring of them that
+/// `IORING_REGISTER_PBUF_RING` registered. A group of provided buffers
+/// stays once they are all used.
+enum BufferList {
+    Provided(VecDeque<Provided>),
+    Ring(BufferRing),
+}
+
+/// A provided buffer (`struct io_buffer`).
+#[derive(Clone, Copy)]
+struct Provided {
+    addr: u64,
+    len: u32,
+    bid: u16,
+}
+
+/// A ring of buffers the program fills (`struct io_uring_buf_ring`): its
+/// tail is the last 2 bytes of the first entry, and the kernel keeps the
+/// head.
+struct BufferRing {
+    memory: RingMemory,
+    mask: u16,
+    head: u16,
+    incremental: bool,
+    /// Who its pages charge, as the registered buffers'.
+    charged: Option<(Arc<crate::memfd::SecretPages>, u32)>,
+    pages: u64,
+}
+
+/// Where a ring of buffers is: pages the kernel gave, of a size
+/// (`IOU_PBUF_RING_MMAP`), or the program's memory at an address, which
+/// is read and written through its mappings at each use.
+enum RingMemory {
+    Kernel(SharedPages, u64),
+    User(u64),
+}
+
+impl Drop for BufferRing {
+    fn drop(&mut self) {
+        if let Some((pages, user)) = &self.charged {
+            pages.release(*user, self.pages);
+        }
+    }
+}
+
+impl BufferRing {
+    fn load(&self, c: &Context<'_>, at: u64, bytes: &mut [u8]) -> Result<(), Errno> {
+        match &self.memory {
+            RingMemory::Kernel(pages, _) => {
+                pages.load(at, bytes);
+                Ok(())
+            }
+            RingMemory::User(addr) => c
+                .mem
+                .read(GuestAddr(addr + at), bytes)
+                .map_err(|_| Errno::EFAULT),
+        }
+    }
+
+    fn store(&self, c: &Context<'_>, at: u64, bytes: &[u8]) -> Result<(), Errno> {
+        match &self.memory {
+            RingMemory::Kernel(pages, _) => {
+                pages.store(at, bytes);
+                Ok(())
+            }
+            RingMemory::User(addr) => c
+                .mem
+                .write(GuestAddr(addr + at), bytes)
+                .map_err(|_| Errno::EFAULT),
+        }
+    }
+
+    /// The tail the program moved to.
+    fn tail(&self, c: &Context<'_>) -> Result<u16, Errno> {
+        let mut tail = [0; 2];
+        self.load(c, 14, &mut tail)?;
+        Ok(u16::from_le_bytes(tail))
+    }
+
+    /// The entry at `index` (`io_ring_head_to_buf`): its address, length
+    /// and buffer ID.
+    fn entry(&self, c: &Context<'_>, index: u16) -> Result<(u64, u32, u16), Errno> {
+        let mut entry = [0; 16];
+        self.load(c, 16 * u64::from(index & self.mask), &mut entry)?;
+        Ok((
+            u64_at(&entry, 0),
+            u32_at(&entry, 8),
+            u16::from_le_bytes([entry[12], entry[13]]),
+        ))
+    }
+
+    /// Uses `len` bytes of one buffer (`io_kbuf_commit`), and says whether
+    /// that buffer is used up: a whole one moves the head, and with
+    /// `IOU_PBUF_RING_INC` the bytes come off the buffer's start
+    /// (`io_kbuf_inc_commit`), a buffer used up moving the head; no bytes,
+    /// or a buffer of none, leaves it.
+    fn commit(&mut self, c: &Context<'_>, mut len: u32) -> Result<bool, Errno> {
+        if !self.incremental {
+            self.head = self.head.wrapping_add(1);
+            return Ok(true);
+        }
+        if len == 0 {
+            return Ok(false);
+        }
+        while len != 0 {
+            let (addr, buf_len, _) = self.entry(c, self.head)?;
+            let at = 16 * u64::from(self.head & self.mask);
+            let this_len = len.min(buf_len);
+            let left = buf_len - this_len;
+            if left != 0 || this_len == 0 {
+                self.store(c, at, &addr.wrapping_add(u64::from(this_len)).to_le_bytes())?;
+                self.store(c, at + 8, &left.to_le_bytes())?;
+                return Ok(false);
+            }
+            self.store(c, at + 8, &0u32.to_le_bytes())?;
+            self.head = self.head.wrapping_add(1);
+            len -= this_len;
+        }
+        Ok(true)
+    }
+}
+
+/// A buffer a read selected: its group and ID, the bytes it reads to,
+/// and, for one of a ring, whether it was used already (a file that cannot
+/// be polled) and whether that left some of it.
+struct Chosen {
+    bgid: u16,
+    bid: u16,
+    addr: u64,
+    len: u32,
+    ring: bool,
+    committed: bool,
+    more: bool,
+}
+
+/// A registered file (`struct io_rsrc_node`), held while a slot or a
+/// request of the running submission has it, and the tag
+/// `IORING_REGISTER_FILES2` or `_FILES_UPDATE2` gave it: once nothing
+/// holds it, a tag that is not 0 is the `user_data` of a completion of 0
+/// ([`Ring::put_nodes`]).
+struct Node {
+    file: crate::files::Descriptor,
+    tag: u64,
 }
 
 /// A ring's registered files: the slots of its `count` that hold an open
@@ -242,7 +433,7 @@ pub(crate) struct Ring {
 /// `file_alloc_end`, from the table's `alloc_hint`).
 struct Files {
     count: u32,
-    slots: std::collections::BTreeMap<u32, crate::files::Descriptor>,
+    slots: std::collections::BTreeMap<u32, Arc<Node>>,
     alloc: (u32, u32),
     hint: u32,
 }
@@ -250,7 +441,7 @@ struct Files {
 impl Files {
     /// Empties `slot` (`io_reset_rsrc_node`), giving what it held; the
     /// next free one is looked for from there (`io_file_bitmap_clear`).
-    fn clear(&mut self, slot: u32) -> Option<crate::files::Descriptor> {
+    fn clear(&mut self, slot: u32) -> Option<Arc<Node>> {
         let held = self.slots.remove(&slot);
         if held.is_some() {
             self.hint = slot;
@@ -260,8 +451,8 @@ impl Files {
 
     /// Puts `file` in the empty `slot`; the next free one is looked for
     /// past it (`io_file_bitmap_set`).
-    fn set(&mut self, slot: u32, file: crate::files::Descriptor) {
-        self.slots.insert(slot, file);
+    fn set(&mut self, slot: u32, file: crate::files::Descriptor, tag: u64) {
+        self.slots.insert(slot, Arc::new(Node { file, tag }));
         self.hint = slot + 1;
     }
 
@@ -313,10 +504,22 @@ struct State {
     cq_tail: u32,
     /// Completions that found the queue full (`IORING_FEAT_NODROP`), in
     /// order: they go in as the program makes room.
-    overflow: VecDeque<(u64, i32)>,
+    overflow: VecDeque<(u64, i32, u32)>,
     /// A request asked to skip its completion: `IOSQE_IO_DRAIN` is
     /// `EOPNOTSUPP` from then on.
     drain_disabled: bool,
+    /// While a submission runs, the completions of its requests, which
+    /// Linux posts once it has issued them all (`compl_reqs`,
+    /// `io_submit_flush_completions`); a registered file's tag goes in at
+    /// once (`io_post_aux_cqe`).
+    deferred: Option<Vec<(u64, i32, u32)>>,
+    /// The registered files the requests of the running submission found,
+    /// in order, which they hold until their completions are posted
+    /// (`io_free_batch_list`).
+    held: Vec<Arc<Node>>,
+    /// Files no slot holds any more that a request of the running
+    /// submission still does.
+    retired: Vec<Arc<Node>>,
 }
 
 /// A request taken from the submission queue and prepared.
@@ -329,7 +532,14 @@ struct Request {
 }
 
 enum Work {
-    Nop(i32),
+    /// `IORING_OP_NOP`: its result, and the registered or other file
+    /// (`IORING_NOP_FILE`) and registered buffer
+    /// (`IORING_NOP_FIXED_BUFFER`) it looks for.
+    Nop {
+        result: i32,
+        file: Option<(i32, bool)>,
+        buffer: Option<u16>,
+    },
     EpollCtl {
         epfd: i32,
         op: i32,
@@ -348,6 +558,17 @@ enum Work {
         addr: u64,
         count: u32,
     },
+    /// `IORING_OP_PROVIDE_BUFFERS`: `count` buffers of `len` bytes from
+    /// `addr`, with the IDs from `bid`, go in group `bgid`; or
+    /// `IORING_OP_REMOVE_BUFFERS`: `count` of its buffers go.
+    Buffers {
+        provide: bool,
+        count: u32,
+        addr: u64,
+        len: u32,
+        bgid: u16,
+        bid: u16,
+    },
     None,
 }
 
@@ -363,7 +584,8 @@ struct Transfer {
     /// registered one of index `buf_index`.
     registered: bool,
     buf_index: u16,
-    /// `IOSQE_BUFFER_SELECT`: a provided buffer, of which there are none.
+    /// `IOSQE_BUFFER_SELECT`: a buffer of group `buf_index` is chosen at
+    /// issue.
     select: bool,
     offset: u64,
     addr: u64,
@@ -408,10 +630,63 @@ impl Ring {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Posts a request's completion, after the others of the running
+    /// submission if one runs ([`State::deferred`]).
+    fn complete(&self, state: &mut State, user_data: u64, res: i32, flags: u32) {
+        match &mut state.deferred {
+            Some(deferred) => deferred.push((user_data, res, flags)),
+            None => self.post(state, user_data, res, flags),
+        }
+    }
+
+    /// Lets go of registered files no slot holds (`io_put_rsrc_node`): one
+    /// a request of the running submission holds waits for its completion,
+    /// and the others post their tags now, in order.
+    fn put_nodes(&self, gone: impl IntoIterator<Item = Arc<Node>>) {
+        let mut state = self.state();
+        for node in gone {
+            if Arc::strong_count(&node) > 1 && state.deferred.is_some() {
+                state.retired.push(node);
+            } else if node.tag != 0 {
+                self.post(&mut state, node.tag, 0, 0);
+            }
+        }
+    }
+
+    /// Starts a submission, whose completions wait for its end.
+    fn begin(&self) {
+        self.state().deferred = Some(Vec::new());
+    }
+
+    /// Ends a submission: its completions go in, in order, then the files
+    /// its requests held go, posting the tags of those no slot holds as
+    /// each request lets go of them.
+    fn end(&self) {
+        let mut state = self.state();
+        for (user_data, res, flags) in state.deferred.take().unwrap_or_default() {
+            self.post(&mut state, user_data, res, flags);
+        }
+        for node in std::mem::take(&mut state.held) {
+            if let Some(at) = state.retired.iter().position(|r| Arc::ptr_eq(r, &node))
+                && Arc::strong_count(&node) == 2
+            {
+                let retired = state.retired.remove(at);
+                if retired.tag != 0 {
+                    self.post(&mut state, retired.tag, 0, 0);
+                }
+            }
+        }
+        for retired in std::mem::take(&mut state.retired) {
+            if retired.tag != 0 {
+                self.post(&mut state, retired.tag, 0, 0);
+            }
+        }
+    }
+
     /// Puts a completion in the queue, or keeps it while the queue is full
     /// or completions wait already, which keeps them in order.
-    fn post(&self, state: &mut State, user_data: u64, res: i32) {
-        state.overflow.push_back((user_data, res));
+    fn post(&self, state: &mut State, user_data: u64, res: i32, flags: u32) {
+        state.overflow.push_back((user_data, res, flags));
         self.flush(state);
     }
 
@@ -421,12 +696,13 @@ impl Ring {
         let head = self.load_u32(CQ_HEAD);
         let mut moved = false;
         while state.cq_tail.wrapping_sub(head) < self.cq_entries
-            && let Some((user_data, res)) = state.overflow.pop_front()
+            && let Some((user_data, res, flags)) = state.overflow.pop_front()
         {
             let slot = u64::from(state.cq_tail & (self.cq_entries - 1));
             let mut cqe = [0; CQE_BYTES as usize];
             cqe[..8].copy_from_slice(&user_data.to_le_bytes());
             cqe[8..12].copy_from_slice(&res.to_le_bytes());
+            cqe[12..].copy_from_slice(&flags.to_le_bytes());
             self.rings.store(CQES + slot * CQE_BYTES, &cqe);
             state.cq_tail = state.cq_tail.wrapping_add(1);
             moved = true;
@@ -541,16 +817,29 @@ impl Ring {
                     count: u32_at(sqe, 24),
                 }
             }
+            OP_PROVIDE_BUFFERS | OP_REMOVE_BUFFERS => {
+                match prepare_buffers(opcode == OP_PROVIDE_BUFFERS, sqe) {
+                    Ok(work) => work,
+                    Err(e) => return fail(request, e),
+                }
+            }
             OP_NOP => {
+                // `io_nop_prep`: no ring has 32-byte completions.
                 let nop_flags = u32_at(sqe, 28);
-                if nop_flags & !NOP_INJECT_RESULT != 0 {
+                if nop_flags & !NOP_FLAGS != 0 || nop_flags & NOP_CQE32 != 0 {
                     return fail(request, Errno::EINVAL);
                 }
-                Work::Nop(if nop_flags & NOP_INJECT_RESULT != 0 {
-                    int_at(24)
-                } else {
-                    0
-                })
+                let has = |flag: u32| nop_flags & flag != 0;
+                Work::Nop {
+                    result: if has(NOP_INJECT_RESULT) {
+                        int_at(24)
+                    } else {
+                        0
+                    },
+                    // `IOSQE_FIXED_FILE` names a registered one too.
+                    file: has(NOP_FILE).then(|| (int_at(4), fixed || has(NOP_FIXED_FILE))),
+                    buffer: has(NOP_FIXED_BUFFER).then(|| u16::from_le_bytes([sqe[40], sqe[41]])),
+                }
             }
             OP_EPOLL_CTL => {
                 if u16::from_le_bytes([sqe[40], sqe[41]]) != 0 || int_at(44) != 0 {
@@ -567,6 +856,59 @@ impl Ring {
         };
         request
     }
+}
+
+/// Linux's `io_provide_buffers_prep` and `io_remove_buffers_prep`. The
+/// count is the entry's `fd`, a negative one as large.
+///
+/// - Providing: `rw_flags` or `splice_fd_in` set is `EINVAL`, a count of
+///   0 or past `MAX_BIDS_PER_BGID` `E2BIG`, a length of 0 `EINVAL`, buffers
+///   that wrap `EOVERFLOW`, or leave the user half `EFAULT`, a first ID
+///   past 16 bits `E2BIG`, and IDs that would be `EINVAL`.
+/// - Removing: any of `rw_flags`, `addr`, `len`, `off` or `splice_fd_in`
+///   set, or a count of 0 or past `MAX_BIDS_PER_BGID`, is `EINVAL`.
+fn prepare_buffers(provide: bool, sqe: &[u8]) -> Result<Work, Errno> {
+    let count = i64::from(u32_at(sqe, 4) as i32) as u64;
+    let (offset, addr, len) = (u64_at(sqe, 8), u64_at(sqe, 16), u32_at(sqe, 24));
+    let bgid = u16::from_le_bytes([sqe[40], sqe[41]]);
+    let unused = u32_at(sqe, 28) != 0 || u32_at(sqe, 44) != 0;
+    if !provide {
+        if unused || addr != 0 || len != 0 || offset != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if count == 0 || count > MAX_BIDS_PER_BGID {
+            return Err(Errno::EINVAL);
+        }
+    } else {
+        if unused {
+            return Err(Errno::EINVAL);
+        }
+        if count == 0 || count > MAX_BIDS_PER_BGID {
+            return Err(E2BIG);
+        }
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let size = u64::from(len) * count;
+        if addr.checked_add(size).is_none() {
+            return Err(EOVERFLOW);
+        }
+        crate::sockets::access_ok_u64(addr, size)?;
+        if offset > u64::from(u16::MAX) {
+            return Err(E2BIG);
+        }
+        if offset + count > MAX_BIDS_PER_BGID {
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(Work::Buffers {
+        provide,
+        count: count as u32,
+        addr,
+        len,
+        bgid,
+        bid: offset as u16,
+    })
 }
 
 /// The rest of a request's `prep`, which reads the caller's memory: the
@@ -639,6 +981,9 @@ fn prepare_transfer(c: &Context<'_>, transfer: &mut Transfer) -> Result<(), Errn
             c.mem
                 .read(GuestAddr(transfer.addr), &mut iovec)
                 .map_err(|_| Errno::EFAULT)?;
+            // The vector's length is the most to read, cut to 32 bits as
+            // `io_iov_buffer_select_prep` stores it in `struct io_rw`'s `len`.
+            transfer.len = u64_at(&iovec, 8) as u32;
         }
         return Ok(());
     }
@@ -663,11 +1008,19 @@ fn file_of(
     fixed: bool,
 ) -> Result<crate::files::Descriptor, Errno> {
     if fixed {
-        let files = ring.files.lock().unwrap_or_else(PoisonError::into_inner);
-        return files
+        let node = ring
+            .files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .and_then(|files| files.slots.get(&(fd as u32)).cloned())
-            .ok_or(Errno::EBADF);
+            .ok_or(Errno::EBADF)?;
+        let file = node.file.clone();
+        let mut state = ring.state();
+        if state.deferred.is_some() {
+            state.held.push(node);
+        }
+        return Ok(file);
     }
     fget(c, fd)
 }
@@ -690,29 +1043,52 @@ fn is_ring(d: &crate::files::Descriptor) -> bool {
     d.file.as_any().is_some_and(|v| v.is::<Ring>())
 }
 
-/// Linux's `io_read` and `io_write`, run inline: the file, the registered
-/// buffer of `IORING_OP_READ_FIXED` and `_WRITE_FIXED`
-/// ([`Ring::registered`]), a provided buffer for a read that selects one (`ENOBUFS`, as none is ever
-/// provided), then `io_rw_init_file` (the access mode, `EBADF`; the flags,
-/// `kiocb_set_rw_flags`; polled I/O, `EINVAL` on a ring without
-/// `IORING_SETUP_IOPOLL`; protection information, `EINVAL`), then the
-/// transfer ([`crate::files::ring_transfer`]). Once the file's own read or
-/// write ran, its watches hear of it as `io_req_io_end` tells them:
-/// `IN_ACCESS` for a read that did not fail, `IN_MODIFY` for any write, no
-/// bytes too.
-fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Result<u64, Errno> {
-    let opened = file_of(c, ring, transfer.fd, transfer.fixed)?;
-    let file = &opened.file;
-    let within;
-    let segments = if transfer.registered {
-        within = [ring.registered(transfer.buf_index, transfer.addr, transfer.len)?];
-        &within[..]
-    } else {
-        &transfer.segments[..]
+/// Linux's `io_read` and `io_write`, run inline, and the completion's
+/// flags: the file, then the registered buffer of `IORING_OP_READ_FIXED`
+/// and `_WRITE_FIXED` ([`Ring::registered`]), or a buffer a read selects
+/// ([`select`]), whose length is cut to `MAX_RW_COUNT` and which must be
+/// in the user half (`EFAULT`, `import_ubuf`), then the rest ([`issue`]).
+/// The selected buffer goes as [`give_back`] says.
+fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> (Result<u64, Errno>, u32) {
+    let opened = match file_of(c, ring, transfer.fd, transfer.fixed) {
+        Ok(opened) => opened,
+        Err(e) => return (Err(e), 0),
     };
-    if transfer.select {
-        return Err(ENOBUFS);
+    if transfer.registered {
+        let result = ring
+            .registered(transfer.buf_index, transfer.addr, transfer.len)
+            .and_then(|within| issue(c, transfer, &opened, &[within]));
+        return (result, 0);
     }
+    if !transfer.select {
+        return (issue(c, transfer, &opened, &transfer.segments), 0);
+    }
+    let pollable = !crate::files::aio_positioned(&opened.file);
+    let chosen = match select(c, ring, transfer.buf_index, transfer.len, pollable) {
+        Ok(chosen) => chosen,
+        Err(e) => return (Err(e), 0),
+    };
+    let len = u64::from(chosen.len).min(crate::files::MAX_RW_COUNT as u64);
+    let result = crate::sockets::access_ok_u64(chosen.addr, len)
+        .and_then(|()| issue(c, transfer, &opened, &[(chosen.addr, len as usize)]));
+    let flags = give_back(c, ring, &chosen, &result);
+    (result, flags)
+}
+
+/// The rest of `io_read` and `io_write`: `io_rw_init_file` (the access
+/// mode, `EBADF`; the flags, `kiocb_set_rw_flags`; polled I/O, `EINVAL` on
+/// a ring without `IORING_SETUP_IOPOLL`; protection information, `EINVAL`),
+/// then the transfer of `segments` ([`crate::files::ring_transfer`]). Once
+/// the file's own read or write ran, its watches hear of it as
+/// `io_req_io_end` tells them: `IN_ACCESS` for a read that did not fail,
+/// `IN_MODIFY` for any write, no bytes too.
+fn issue(
+    c: &mut Context<'_>,
+    transfer: &Transfer,
+    opened: &crate::files::Descriptor,
+    segments: &[(u64, usize)],
+) -> Result<u64, Errno> {
+    let file = &opened.file;
     if file.flags() & 3 == if transfer.write { 0 } else { 1 } {
         return Err(Errno::EBADF);
     }
@@ -727,18 +1103,135 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Result<u64
     // one that asked for `RWF_NOWAIT` ends at once, and they hear of it.
     let waited = result == Err(Errno::EAGAIN) && flags & RWF_NOWAIT == 0;
     if transfer.write && !waited {
-        crate::files::notify_open(c, &opened, crate::inotify::MODIFY);
+        crate::files::notify_open(c, opened, crate::inotify::MODIFY);
     } else if result.is_ok() {
-        crate::files::notify_open(c, &opened, crate::inotify::ACCESS);
+        crate::files::notify_open(c, opened, crate::inotify::ACCESS);
     }
     result
 }
 
-/// Runs a request and gives its result.
-fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> i32 {
+/// The buffer of group `bgid` a read of `len` bytes (0 for any) reads to,
+/// as `io_buffer_select` chooses it: none, or a group with none left, is
+/// `ENOBUFS`. The read is of `len` bytes at most, or the whole buffer.
+///
+/// - Provided buffers: the first goes from the group
+///   (`io_provided_buffer_select`).
+/// - A ring: the entry at its head, unless the tail is there
+///   (`io_ring_buffer_select`). A file that cannot be polled uses it at once
+///   (`io_should_commit`), all the bytes the read may take; one that can
+///   uses it once the read is done.
+fn select(
+    c: &Context<'_>,
+    ring: &Ring,
+    bgid: u16,
+    len: u32,
+    pollable: bool,
+) -> Result<Chosen, Errno> {
+    let mut lists = ring
+        .buffer_lists
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let cut = |size: u32| if len == 0 || len > size { size } else { len };
+    match lists.get_mut(&bgid) {
+        None => Err(ENOBUFS),
+        Some(BufferList::Provided(list)) => {
+            let buffer = list.pop_front().ok_or(ENOBUFS)?;
+            Ok(Chosen {
+                bgid,
+                bid: buffer.bid,
+                addr: buffer.addr,
+                len: cut(buffer.len),
+                ring: false,
+                committed: true,
+                more: false,
+            })
+        }
+        Some(BufferList::Ring(buffers)) => {
+            if buffers.tail(c)? == buffers.head {
+                return Err(ENOBUFS);
+            }
+            let (addr, size, bid) = buffers.entry(c, buffers.head)?;
+            let mut chosen = Chosen {
+                bgid,
+                bid,
+                addr,
+                len: cut(size),
+                ring: true,
+                committed: false,
+                more: false,
+            };
+            if !pollable {
+                chosen.more = !buffers.commit(c, chosen.len)?;
+                chosen.committed = true;
+            }
+            Ok(chosen)
+        }
+    }
+}
+
+/// What becomes of a selected buffer once its read ended, and the
+/// completion's flags, as `io_put_kbuf` and `io_kbuf_recycle` leave them:
+/// a provided buffer is used, and so is a ring's that was used at
+/// selection, or that a read that did not fail used now (its bytes, with
+/// `IOU_PBUF_RING_INC`); their completion has `IORING_CQE_F_BUFFER` and the
+/// ID, and `IORING_CQE_F_BUF_MORE` for a buffer some of which is left. A
+/// ring's buffer whose read failed before it was used stays in the ring.
+///
+/// A read that would wait completes with `EAGAIN` here, where Linux keeps
+/// it in flight: its buffer goes as one with `RWF_NOWAIT` would.
+fn give_back(c: &Context<'_>, ring: &Ring, chosen: &Chosen, result: &Result<u64, Errno>) -> u32 {
+    let flags = CQE_F_BUFFER | u32::from(chosen.bid) << CQE_BUFFER_SHIFT;
+    let more = |more: bool| if more { CQE_F_BUF_MORE } else { 0 };
+    if !chosen.ring {
+        return flags;
+    }
+    if chosen.committed {
+        return flags | more(chosen.more);
+    }
+    let Ok(count) = result else {
+        return 0;
+    };
+    let mut lists = ring
+        .buffer_lists
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match lists.get_mut(&chosen.bgid) {
+        Some(BufferList::Ring(buffers)) => {
+            flags | more(!buffers.commit(c, *count as u32).unwrap_or(true))
+        }
+        _ => flags,
+    }
+}
+
+/// Runs a request and gives its result, its completion's flags and
+/// whether it failed (`req_set_fail`), which a negative result does.
+fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool) {
     let result = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
     match work {
-        &Work::Nop(result) => result,
+        Work::Transfer(work) => {
+            let (r, flags) = transfer(c, ring, work);
+            let res = result(r);
+            return (res, flags, res < 0);
+        }
+        // `io_nop`, as Linux master has it: a file it does not find is
+        // `EBADF`, then a registered buffer `EFAULT`, else its result.
+        &Work::Nop {
+            result,
+            file,
+            buffer,
+        } => {
+            let res = if file.is_some_and(|(fd, fixed)| file_of(c, ring, fd, fixed).is_err()) {
+                -Errno::EBADF.0
+            } else if buffer.is_some_and(|index| !ring.has_buffer(index)) {
+                -Errno::EFAULT.0
+            } else {
+                result
+            };
+            return (res, 0, res < 0);
+        }
+        _ => {}
+    }
+    let res = match work {
         &Work::EpollCtl {
             epfd,
             op,
@@ -751,7 +1244,6 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> i32 {
                 Err(e) => -e.0,
             }
         }
-        Work::Transfer(work) => result(transfer(c, ring, work)),
         // `io_fsync`: `vfs_fsync_range`, `EINVAL` for a file without
         // `fsync`; nothing is cached, so the range and `IORING_FSYNC_DATASYNC`
         // change nothing.
@@ -766,10 +1258,67 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> i32 {
         } => result(if offset == FILE_INDEX_ALLOC {
             update_files_anywhere(c, ring, addr, count)
         } else {
-            update_files(c, ring, offset, addr, count)
+            update_files(c, ring, offset, addr, count, 0)
         }),
-        Work::None => 0,
+        &Work::Buffers {
+            provide,
+            count,
+            addr,
+            len,
+            bgid,
+            bid,
+        } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
+        Work::Transfer(_) | Work::Nop { .. } | Work::None => 0,
+    };
+    (res, 0, res < 0)
+}
+
+/// `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, as Linux's
+/// `io_manage_buffers_legacy`: removing from a group there is not is
+/// `ENOENT` (providing makes it), and from a ring `EINVAL`. Removing takes
+/// up to `count` buffers from the group's start and gives how many it
+/// took; providing adds them at its end, stopping at 65535 in a group,
+/// which is `EOVERFLOW` if it added none (`io_add_buffers`).
+fn manage_buffers(
+    ring: &Ring,
+    provide: bool,
+    count: u32,
+    addr: u64,
+    len: u32,
+    bgid: u16,
+    bid: u16,
+) -> Result<u64, Errno> {
+    use std::collections::btree_map::Entry;
+    let mut lists = ring
+        .buffer_lists
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let list = match lists.entry(bgid) {
+        Entry::Occupied(list) => list.into_mut(),
+        Entry::Vacant(_) if !provide => return Err(Errno::ENOENT),
+        Entry::Vacant(list) => list.insert(BufferList::Provided(VecDeque::new())),
+    };
+    let BufferList::Provided(list) = list else {
+        return Err(Errno::EINVAL);
+    };
+    if !provide {
+        let taken = (count as usize).min(list.len());
+        list.drain(..taken);
+        return Ok(taken as u64);
     }
+    let mut at = addr;
+    for index in 0..count {
+        if list.len() == usize::from(u16::MAX) {
+            return if index == 0 { Err(EOVERFLOW) } else { Ok(0) };
+        }
+        list.push_back(Provided {
+            addr: at,
+            len: len.min(crate::files::MAX_RW_COUNT as u32),
+            bid: bid.wrapping_add(index as u16),
+        });
+        at = at.wrapping_add(u64::from(len));
+    }
+    Ok(0)
 }
 
 /// Completes a chain of linked requests in order, as Linux runs a link once
@@ -782,21 +1331,21 @@ fn complete(c: &mut Context<'_>, ring: &Ring, chain: Vec<Request>) {
     let mut cancelled = false;
     for request in chain {
         let res = if !prepared {
-            -request.failed.unwrap_or(ECANCELED).0
+            (-request.failed.unwrap_or(ECANCELED).0, 0, true)
         } else if cancelled {
-            -ECANCELED.0
+            (-ECANCELED.0, 0, true)
         } else {
-            let res = run(c, ring, &request.work);
-            if res < 0 && request.flags & IOSQE_IO_HARDLINK == 0 {
+            let (res, flags, failed) = run(c, ring, &request.work);
+            if failed && request.flags & IOSQE_IO_HARDLINK == 0 {
                 cancelled = true;
             }
-            res
+            (res, flags, failed)
         };
-        if res >= 0 && request.flags & IOSQE_CQE_SKIP_SUCCESS != 0 {
+        if !res.2 && request.flags & IOSQE_CQE_SKIP_SUCCESS != 0 {
             continue;
         }
         let mut state = ring.state();
-        ring.post(&mut state, request.user_data, res);
+        ring.complete(&mut state, request.user_data, res.0, res.1);
     }
 }
 
@@ -817,6 +1366,7 @@ fn submit(c: &mut Context<'_>, ring: &Ring, wanted: u32) -> u32 {
     };
     let total = wanted.min(available);
     let mut left = total;
+    ring.begin();
     let mut chain: Vec<Request> = Vec::new();
     while left > 0 {
         let mut index = head & mask;
@@ -854,6 +1404,7 @@ fn submit(c: &mut Context<'_>, ring: &Ring, wanted: u32) -> u32 {
     if !chain.is_empty() {
         complete(c, ring, chain);
     }
+    ring.end();
     ring.state().sq_head = head;
     ring.store_u32(SQ_HEAD, head);
     total - left
@@ -944,15 +1495,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
     let sq_array = (flags & SETUP_NO_SQARRAY == 0).then_some(cqes_end);
     let rings_len = cqes_end + sq_array.map_or(0, |_| 4 * u64::from(sq_entries));
     let sqes_len = u64::from(sq_entries) * SQE_BYTES;
-    let pages = |len: u64| -> Result<SharedPages, Errno> {
-        let size = len.next_multiple_of(4096);
-        let pages = SharedPages::new().with_source(Arc::new(RingPages { size }));
-        let meter = c.mem.memory_meter();
-        for key in (0..size).step_by(4096) {
-            pages.fill(key, &[], meter.as_ref())?;
-        }
-        Ok(pages)
-    };
+    let pages = |len: u64| ring_pages(c, len);
     let ring = Ring {
         flags,
         sq_entries,
@@ -972,6 +1515,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         }),
         buffers: Mutex::default(),
         files: Mutex::default(),
+        buffer_lists: Mutex::default(),
     };
     ring.store_u32(SQ_RING_MASK, sq_entries - 1);
     ring.store_u32(CQ_RING_MASK, cq_entries - 1);
@@ -1021,6 +1565,18 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         .write(GuestAddr(params), &p)
         .map_err(|_| Errno::EFAULT)?;
     c.files.install(Arc::new(ring), true, c.group.nofile())
+}
+
+/// Zeroed pages the kernel gives for `len` bytes, which a mapping of the
+/// ring's descriptor shares; a page past them raises `SIGBUS`.
+fn ring_pages(c: &Context<'_>, len: u64) -> Result<SharedPages, Errno> {
+    let size = len.next_multiple_of(4096);
+    let pages = SharedPages::new().with_source(Arc::new(RingPages { size }));
+    let meter = c.mem.memory_meter();
+    for key in (0..size).step_by(4096) {
+        pages.fill(key, &[], meter.as_ref())?;
+    }
+    Ok(pages)
 }
 
 /// `io_uring_enter(fd, to_submit, min_complete, flags, argp, argsz)`: the
@@ -1182,9 +1738,9 @@ fn wait(
 }
 
 /// `io_uring_register(fd, opcode, arg, nr_args)`: only
-/// `IORING_REGISTER_PROBE`, the buffers' and the files' registrations, and
-/// the files' updates and allocation range; every other operation gives
-/// `EINVAL`.
+/// `IORING_REGISTER_PROBE`, the buffers' and the files' registrations, the
+/// files' tagged registrations, updates and allocation range, and the rings of buffers'
+/// registrations and status; every other operation gives `EINVAL`.
 pub(crate) fn sys_register(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match register(c, a) {
         Ok(n) => ok(n),
@@ -1224,19 +1780,32 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map(|_| 0)
             .ok_or(ENXIO),
         REGISTER_FILES if a[2] == 0 => Err(Errno::EFAULT),
-        REGISTER_FILES => register_files(c, ring, a[2], a[3] as u32),
+        REGISTER_FILES => register_files(c, ring, a[2], a[3] as u32, 0),
+        REGISTER_FILES2 => register_files2(c, ring, a[2], a[3] as u32),
         UNREGISTER_FILES if a[2] != 0 || a[3] as u32 != 0 => Err(Errno::EINVAL),
         UNREGISTER_FILES => {
             let gone = ring
                 .files
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            gone.map(|_| 0).ok_or(ENXIO)
+                .take()
+                .ok_or(ENXIO)?;
+            // `io_rsrc_data_free` lets go of the last slot first.
+            ring.put_nodes(gone.slots.into_values().rev());
+            Ok(0)
         }
         REGISTER_FILES_UPDATE => register_files_update(c, ring, a[2], a[3] as u32),
+        REGISTER_FILES_UPDATE2 => register_files_update2(c, ring, a[2], a[3] as u32),
         REGISTER_FILE_ALLOC_RANGE if a[2] == 0 || a[3] as u32 != 0 => Err(Errno::EINVAL),
         REGISTER_FILE_ALLOC_RANGE => file_alloc_range(c, ring, a[2]),
+        REGISTER_PBUF_RING | UNREGISTER_PBUF_RING | REGISTER_PBUF_STATUS
+            if a[2] == 0 || a[3] as u32 != 1 =>
+        {
+            Err(Errno::EINVAL)
+        }
+        REGISTER_PBUF_RING => register_pbuf_ring(c, ring, a[2]),
+        UNREGISTER_PBUF_RING => unregister_pbuf_ring(c, ring, a[2]),
+        REGISTER_PBUF_STATUS => pbuf_status(c, ring, a[2]),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -1253,11 +1822,19 @@ fn read_fd(c: &Context<'_>, addr: u64) -> Result<i32, Errno> {
 /// `IORING_REGISTER_FILES`, as Linux's `io_sqe_files_register` once the
 /// dispatcher found an argument (`EFAULT` for none, before all else): none
 /// registered yet (`EBUSY`), 1 (`EINVAL`) to `IORING_MAX_FIXED_FILES` and
-/// RLIMIT_NOFILE of them (`EMFILE`), then each descriptor in turn
-/// (`EFAULT`): -1 leaves its slot empty, and one `fget` does not find, or a
-/// ring, is `EBADF`. A failure registers none of them. The table is the
+/// RLIMIT_NOFILE of them (`EMFILE`), then each tag at `tags` if there are
+/// tags and each descriptor at `arg` in turn (`EFAULT`): -1, or every one
+/// with no `arg`, leaves its slot empty, which a tag may not have
+/// (`EINVAL`), and one `fget` does not find, or a ring, is `EBADF`. A
+/// failure registers none of them, and posts no tag. The table is the
 /// allocation range of `IORING_FILE_INDEX_ALLOC`.
-fn register_files(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> Result<u64, Errno> {
+fn register_files(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    arg: u64,
+    count: u32,
+    tags: u64,
+) -> Result<u64, Errno> {
     let mut registered = ring.files.lock().unwrap_or_else(PoisonError::into_inner);
     if registered.is_some() {
         return Err(EBUSY);
@@ -1275,18 +1852,93 @@ fn register_files(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> Res
         hint: 0,
     };
     for index in 0..count {
-        let fd = read_fd(c, arg.wrapping_add(4 * u64::from(index)))?;
+        let tag = read_tag(c, tags, index)?;
+        let fd = if arg == 0 {
+            -1
+        } else {
+            read_fd(c, arg.wrapping_add(4 * u64::from(index)))?
+        };
         if fd == -1 {
+            if tag != 0 {
+                return Err(Errno::EINVAL);
+            }
             continue;
         }
         let d = fget(c, fd)?;
         if is_ring(&d) {
             return Err(Errno::EBADF);
         }
-        files.slots.insert(index, d);
+        files.slots.insert(index, Arc::new(Node { file: d, tag }));
     }
     *registered = Some(files);
     Ok(0)
+}
+
+/// The tag at index `index` of `tags` (`EFAULT`), or 0 with no tags.
+fn read_tag(c: &Context<'_>, tags: u64, index: u32) -> Result<u64, Errno> {
+    if tags == 0 {
+        return Ok(0);
+    }
+    let mut tag = [0; 8];
+    c.mem
+        .read(GuestAddr(tags.wrapping_add(8 * u64::from(index))), &mut tag)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(u64::from_le_bytes(tag))
+}
+
+/// `IORING_REGISTER_FILES2`, as Linux's `io_register_rsrc`: `size` is
+/// that of a `struct io_uring_rsrc_register` (`EINVAL`), which is read
+/// (`EFAULT`) and must have a count, no reserved field and no flag but
+/// `IORING_RSRC_REGISTER_SPARSE`, which takes no descriptors (`EINVAL`);
+/// then as [`register_files`] with its tags.
+fn register_files2(c: &mut Context<'_>, ring: &Ring, arg: u64, size: u32) -> Result<u64, Errno> {
+    if size != 32 {
+        return Err(Errno::EINVAL);
+    }
+    let mut rr = [0; 32];
+    c.mem
+        .read(GuestAddr(arg), &mut rr)
+        .map_err(|_| Errno::EFAULT)?;
+    let (count, flags, data) = (u32_at(&rr, 0), u32_at(&rr, 4), u64_at(&rr, 16));
+    if count == 0
+        || u64_at(&rr, 8) != 0
+        || flags & !RSRC_REGISTER_SPARSE != 0
+        || flags & RSRC_REGISTER_SPARSE != 0 && data != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    register_files(c, ring, data, count, u64_at(&rr, 24))
+}
+
+/// `IORING_REGISTER_FILES_UPDATE2`, as `io_register_rsrc_update`: `size`
+/// is that of a `struct io_uring_rsrc_update2` (`EINVAL`), which is read
+/// (`EFAULT`) and must have a count and no reserved field (`EINVAL`); then
+/// as [`update_files`] with its tags.
+fn register_files_update2(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    arg: u64,
+    size: u32,
+) -> Result<u64, Errno> {
+    if size != 32 {
+        return Err(Errno::EINVAL);
+    }
+    let mut up = [0; 32];
+    c.mem
+        .read(GuestAddr(arg), &mut up)
+        .map_err(|_| Errno::EFAULT)?;
+    let count = u32_at(&up, 24);
+    if count == 0 || u32_at(&up, 4) != 0 || u32_at(&up, 28) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    update_files(
+        c,
+        ring,
+        u32_at(&up, 0),
+        u64_at(&up, 8),
+        count,
+        u64_at(&up, 16),
+    )
 }
 
 /// `IORING_REGISTER_FILES_UPDATE`, as `io_register_files_update`: `count`
@@ -1308,22 +1960,26 @@ fn register_files_update(
     if u32_at(&update, 4) != 0 {
         return Err(Errno::EINVAL);
     }
-    update_files(c, ring, u32_at(&update, 0), u64_at(&update, 8), count)
+    update_files(c, ring, u32_at(&update, 0), u64_at(&update, 8), count, 0)
 }
 
 /// Linux's `__io_sqe_files_update`, after `__io_register_rsrc_update`:
 /// slots `offset` on must not wrap (`EOVERFLOW`), files must be registered
-/// (`ENXIO`) and the slots within them (`EINVAL`). Each descriptor at
-/// `fds` in turn (`EFAULT`) then empties its slot and puts its file there,
-/// but `IORING_REGISTER_FILES_SKIP` leaves the slot be and -1 leaves it
-/// empty; one `fget` does not find, or a ring, is `EBADF` once the slot is
-/// empty. It gives how many it went through, or the error if none.
+/// (`ENXIO`) and the slots within them (`EINVAL`). Each tag at `tags` if
+/// there are tags and each descriptor at `fds` in turn (`EFAULT`) then
+/// empties its slot and puts its file there with the tag, but
+/// `IORING_REGISTER_FILES_SKIP` leaves the slot be and -1 leaves it empty,
+/// which a tag may not go with (`EINVAL`); one `fget` does not find, or a
+/// ring, is `EBADF` once the slot is empty. The files the slots let go of
+/// post their tags ([`Ring::put_nodes`]). It gives how many it went
+/// through, or the error if none.
 fn update_files(
     c: &mut Context<'_>,
     ring: &Ring,
     offset: u32,
     fds: u64,
     count: u32,
+    tags: u64,
 ) -> Result<u64, Errno> {
     let end = offset.checked_add(count).ok_or(EOVERFLOW)?;
     let mut gone = Vec::new();
@@ -1335,8 +1991,14 @@ fn update_files(
     let mut done = 0;
     let mut error = Errno::EINVAL;
     while done < count {
-        let fd = match read_fd(c, fds.wrapping_add(4 * u64::from(done))) {
-            Ok(fd) => fd,
+        let read = read_tag(c, tags, done)
+            .and_then(|tag| Ok((tag, read_fd(c, fds.wrapping_add(4 * u64::from(done)))?)));
+        let (tag, fd) = match read {
+            Ok((tag, fd)) if tag != 0 && (fd == FILES_SKIP || fd == -1) => {
+                error = Errno::EINVAL;
+                break;
+            }
+            Ok(read) => read,
             Err(e) => {
                 error = e;
                 break;
@@ -1347,9 +2009,8 @@ fn update_files(
             gone.extend(files.clear(slot));
             if fd != -1 {
                 match fget(c, fd) {
-                    Ok(d) if !is_ring(&d) => files.set(slot, d),
-                    Ok(d) => {
-                        gone.push(d);
+                    Ok(d) if !is_ring(&d) => files.set(slot, d, tag),
+                    Ok(_) => {
                         error = Errno::EBADF;
                         break;
                     }
@@ -1363,7 +2024,7 @@ fn update_files(
         done += 1;
     }
     drop(registered);
-    drop(gone);
+    ring.put_nodes(gone);
     if done > 0 {
         Ok(u64::from(done))
     } else {
@@ -1395,10 +2056,9 @@ fn update_files_anywhere(
             let d = fget(c, fd)?;
             let slot = files.free()?;
             if is_ring(&d) {
-                gone.push(d);
                 return Err(Errno::EBADF);
             }
-            files.set(slot, d);
+            files.set(slot, d, 0);
             if c.mem.write(GuestAddr(at), &slot.to_le_bytes()).is_err() {
                 gone.extend(files.clear(slot));
                 return Err(Errno::EFAULT);
@@ -1412,7 +2072,7 @@ fn update_files_anywhere(
         done += 1;
     }
     drop(registered);
-    drop(gone);
+    ring.put_nodes(gone);
     if done > 0 {
         Ok(u64::from(done))
     } else {
@@ -1516,7 +2176,153 @@ fn register_buffers(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> R
     Ok(0)
 }
 
+/// `IORING_REGISTER_PBUF_RING`, as Linux's `io_register_pbuf_ring` reads
+/// `struct io_uring_buf_reg` (`EFAULT`): reserved bytes set, an unknown
+/// flag, or a count of entries not a power of two below 65536, is
+/// `EINVAL`; a group of buffers, or a ring, there already is `EEXIST`,
+/// though an empty group goes. Then its pages, as `io_create_region` makes
+/// them: without `IOU_PBUF_RING_MMAP` the ring is at `ring_addr`, which
+/// must be set (`EFAULT`), on a page (`EINVAL`), not wrap (`EOVERFLOW`) and
+/// be writable (`EFAULT`, `io_pin_pages`); with it, the address is not
+/// looked at and the kernel gives zeroed pages. They charge the ring's
+/// user, as registered buffers do (`ENOMEM`).
+fn register_pbuf_ring(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno> {
+    let mut reg = [0; 40];
+    c.mem
+        .read(GuestAddr(arg), &mut reg)
+        .map_err(|_| Errno::EFAULT)?;
+    let ring_addr = u64_at(&reg, 0);
+    let entries = u32_at(&reg, 8);
+    let bgid = u16::from_le_bytes([reg[12], reg[13]]);
+    let flags = u16::from_le_bytes([reg[14], reg[15]]);
+    if reg[16..].iter().any(|&b| b != 0)
+        || flags & !(PBUF_RING_MMAP | PBUF_RING_INC) != 0
+        || !entries.is_power_of_two()
+        || entries >= 65536
+    {
+        return Err(Errno::EINVAL);
+    }
+    let mut lists = ring
+        .buffer_lists
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match lists.get(&bgid) {
+        Some(BufferList::Provided(list)) if list.is_empty() => {
+            lists.remove(&bgid);
+        }
+        Some(_) => return Err(EEXIST),
+        None => {}
+    }
+    let size = (16 * u64::from(entries)).next_multiple_of(4096);
+    let user_addr = if flags & PBUF_RING_MMAP == 0 {
+        if ring_addr == 0 {
+            return Err(Errno::EFAULT);
+        }
+        ring_addr
+    } else {
+        0
+    };
+    if user_addr % 4096 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if user_addr.checked_add(size).is_none() {
+        return Err(EOVERFLOW);
+    }
+    let pages = size / 4096;
+    let limit = c.processes.soft_limit(c.process.pid, 8) >> 12;
+    if let Some((charged, user)) = &ring.charged
+        && !charged.charge(*user, pages, limit)
+    {
+        return Err(Errno::ENOMEM);
+    }
+    let mut buffers = BufferRing {
+        memory: RingMemory::User(user_addr),
+        mask: (entries - 1) as u16,
+        head: 0,
+        incremental: flags & PBUF_RING_INC != 0,
+        charged: ring.charged.clone(),
+        pages,
+    };
+    if user_addr != 0 {
+        c.mem
+            .check_write(GuestAddr(user_addr), size as usize)
+            .map_err(|_| Errno::EFAULT)?;
+    } else {
+        buffers.memory = RingMemory::Kernel(ring_pages(c, size)?, size);
+    }
+    lists.insert(bgid, BufferList::Ring(buffers));
+    Ok(0)
+}
+
+/// `IORING_UNREGISTER_PBUF_RING`, as Linux's `io_unregister_pbuf_ring`
+/// reads `struct io_uring_buf_reg` (`EFAULT`): reserved bytes or flags set
+/// are `EINVAL`, no group `ENOENT`, and provided buffers `EINVAL`.
+fn unregister_pbuf_ring(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno> {
+    let mut reg = [0; 40];
+    c.mem
+        .read(GuestAddr(arg), &mut reg)
+        .map_err(|_| Errno::EFAULT)?;
+    if reg[14..].iter().any(|&b| b != 0) {
+        return Err(Errno::EINVAL);
+    }
+    let bgid = u16::from_le_bytes([reg[12], reg[13]]);
+    let gone = {
+        let mut lists = ring
+            .buffer_lists
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match lists.get(&bgid) {
+            None => return Err(Errno::ENOENT),
+            Some(BufferList::Provided(_)) => return Err(Errno::EINVAL),
+            Some(BufferList::Ring(_)) => lists.remove(&bgid),
+        }
+    };
+    drop(gone);
+    Ok(0)
+}
+
+/// `IORING_REGISTER_PBUF_STATUS`, as Linux's `io_register_pbuf_status`:
+/// `struct io_uring_buf_status` is read (`EFAULT`), reserved bytes set are
+/// `EINVAL`, no group `ENOENT`, provided buffers `EINVAL`; then the ring's
+/// head is written in it (`EFAULT`).
+fn pbuf_status(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno> {
+    let mut status = [0; 40];
+    c.mem
+        .read(GuestAddr(arg), &mut status)
+        .map_err(|_| Errno::EFAULT)?;
+    if status[8..].iter().any(|&b| b != 0) {
+        return Err(Errno::EINVAL);
+    }
+    let head = {
+        let lists = ring
+            .buffer_lists
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match u16::try_from(u32_at(&status, 0))
+            .ok()
+            .and_then(|bgid| lists.get(&bgid))
+        {
+            None => return Err(Errno::ENOENT),
+            Some(BufferList::Provided(_)) => return Err(Errno::EINVAL),
+            Some(BufferList::Ring(buffers)) => buffers.head,
+        }
+    };
+    status[4..8].copy_from_slice(&u32::from(head).to_le_bytes());
+    c.mem
+        .write(GuestAddr(arg), &status)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(0)
+}
+
 impl Ring {
+    /// Whether registered buffer `index` is there (`io_find_buf_node`).
+    fn has_buffer(&self, index: u16) -> bool {
+        let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
+        buffers
+            .as_ref()
+            .is_some_and(|buffers| matches!(buffers.slots.get(usize::from(index)), Some(Some(_))))
+    }
+
     /// The `len` bytes at `addr` of a request's registered buffer `index`,
     /// as `io_import_reg_buf` finds them: none registered there, a range
     /// that wraps or leaves the buffer, or more than `MAX_RW_COUNT`, is
@@ -1564,10 +2370,13 @@ fn probe(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 
 /// `mmap` of a ring descriptor, as Linux's `io_uring_get_unmapped_area`
 /// and `io_uring_mmap`: no address may be asked for (`EINVAL`), the offset's
-/// region picks the rings or the entries (another gives `ENOMEM`), and the
-/// mapping shows from the start of them however far into the region the
-/// offset is. A mapping of the rings shows what fits, and past the rings a
-/// page raises `SIGBUS`; one of the entries must hold them all (`EFAULT`).
+/// region picks the rings, the entries, or the ring of buffers of a group
+/// (`IORING_OFF_PBUF_RING`, the group's ID from bit 16 of the offset)
+/// whose pages the kernel gave (another gives `ENOMEM`), and the mapping
+/// shows from the start of them however far into the region the offset
+/// is. A mapping of the rings shows what fits, and past the rings a page
+/// raises `SIGBUS`; one of the entries or of a ring of buffers must hold
+/// them all (`EFAULT`).
 /// Only a shared mapping is implemented: a private one gives `EINVAL`.
 pub(crate) fn mmap(
     c: &mut Context<'_>,
@@ -1585,9 +2394,29 @@ pub(crate) fn mmap(
     if addr != 0 {
         return Err(Errno::EINVAL);
     }
+    let buffers;
     let (pages, entries) = match offset & OFF_MMAP_MASK {
         0 | OFF_CQ_RING => (&ring.rings, None),
         OFF_SQES => (&ring.sqes, Some(ring.sqes_len)),
+        OFF_PBUF_RING => {
+            // The ID is an `unsigned int` there.
+            let id = ((offset & !OFF_MMAP_MASK) >> OFF_PBUF_SHIFT) as u32;
+            let lists = ring
+                .buffer_lists
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            buffers = u16::try_from(id)
+                .ok()
+                .and_then(|bgid| match lists.get(&bgid) {
+                    Some(BufferList::Ring(BufferRing {
+                        memory: RingMemory::Kernel(pages, size),
+                        ..
+                    })) => Some((pages.clone(), *size)),
+                    _ => None,
+                })
+                .ok_or(Errno::ENOMEM)?;
+            (&buffers.0, Some(buffers.1))
+        }
         _ => return Err(Errno::ENOMEM),
     };
     if !shared {

@@ -181,7 +181,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-neigh, veth-ipv6, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-neigh, veth-ipv6, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -280,6 +280,9 @@ mod linux {
                     | "fanotify-open-exec"
                     | "fanotify-aio-perm"
                     | "fanotify-exec-perm"
+                    | "fanotify-drop-caches"
+                    | "fanotify-merge-window"
+                    | "fanotify-superblock-marks"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -326,6 +329,8 @@ mod linux {
                     | "bpf-prog-corpus"
                     | "bpf-prog-classic"
                     | "bpf-prog-atomic"
+                    | "bpf-prog-acqrel"
+                    | "bpf-prog-ldabs"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -379,6 +384,7 @@ mod linux {
                     | "veth-ipv4"
                     | "veth-traffic"
                     | "veth-iif"
+                    | "veth-broadcast"
                     | "veth-neigh"
                     | "veth-ipv6"
                     | "veth-ipv6-traffic"
@@ -479,6 +485,22 @@ mod linux {
                 config
             };
             let host = Arc::new(RecordingHost::new());
+            // Its files must be on a host's file system, as the native run's
+            // /tmp is, whose inodes go once nothing uses them (a tmpfs keeps
+            // its own): a host directory of its own is the guest's /tmp, as
+            // the files tests' is.
+            let mut config = config;
+            let host_tmp = (mode == "fanotify-drop-caches").then(|| {
+                let dir =
+                    std::env::temp_dir().join(format!("paludarium-{mode}-{}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                config.mounts.push(paludarium::Mount {
+                    host: dir.clone(),
+                    guest: b"/tmp".to_vec(),
+                });
+                host.mount_host_directories();
+                dir
+            });
             // Their timers and limits wait for CPU time, which the virtual
             // clock does not pass, and the perf cases' clocks count it.
             if matches!(
@@ -506,6 +528,9 @@ mod linux {
                 status,
                 elapsed: start.elapsed(),
             };
+            if let Some(dir) = host_tmp {
+                let _ = std::fs::remove_dir_all(dir);
+            }
             println!(
                 "{mode}: native {:?} {:?}, emulated {:?} {:?}; stop {:?}",
                 native.status,
@@ -584,6 +609,7 @@ mod linux {
         veth_ipv4 => ("veth-ipv4","veth-ipv4"),
         veth_traffic => ("veth-traffic","veth-traffic"),
         veth_iif => ("veth-iif","veth-iif"),
+        veth_broadcast => ("veth-broadcast","veth-broadcast"),
         veth_neigh => ("veth-neigh","veth-neigh"),
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),
         veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
@@ -593,6 +619,7 @@ mod linux {
         processes_landlock => ("landlock","process"),
         processes_madvise_advice => ("madvise-advice","process"),
         processes_madvise_collapse => ("madvise-collapse","process"),
+        processes_madvise_collapse_shmem => ("madvise-collapse-shmem","process"),
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
@@ -651,6 +678,7 @@ mod linux {
         aio_lifetime => ("aio-lifetime","aio"),
         aio_mremap => ("aio-mremap","aio"),
         aio_reap => ("aio-reap","aio"),
+        aio_timer => ("aio-timer","aio"),
         perf_calls => ("perf-calls","perf"),
         perf_counts => ("perf-counts","perf"),
         perf_exec => ("perf-exec","perf"),
@@ -683,6 +711,8 @@ mod linux {
         bpf_prog_corpus => ("bpf-prog-corpus","bpf-prog"),
         bpf_prog_classic => ("bpf-prog-classic","bpf-prog"),
         bpf_prog_atomic => ("bpf-prog-atomic","bpf-prog"),
+        bpf_prog_acqrel => ("bpf-prog-acqrel","bpf-prog"),
+        bpf_prog_ldabs => ("bpf-prog-ldabs","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -718,6 +748,9 @@ mod linux {
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),
         fanotify_aio_perm => ("fanotify-aio-perm","fanotify"),
         fanotify_exec_perm => ("fanotify-exec-perm","fanotify"),
+        fanotify_drop_caches => ("fanotify-drop-caches","fanotify"),
+        fanotify_merge_window => ("fanotify-merge-window","fanotify"),
+        fanotify_superblock_marks => ("fanotify-superblock-marks","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
@@ -839,6 +872,7 @@ mod linux {
         processes_page_faults => ("page-faults","process"),
         processes_proc_stat_counts => ("proc-stat-counts","process"),
         processes_proc_stat_sched => ("proc-stat-sched","process"),
+        processes_page_faults_live => ("page-faults-live","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),
         processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),
@@ -965,6 +999,7 @@ mod linux {
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_generated_noexec => ("generated-noexec","process"),
+        processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),
         processes_tree_namespace => ("tree-namespace","process"),
         processes_beneath => ("beneath","process"),
@@ -1001,6 +1036,7 @@ mod linux {
         processes_io_uring => ("io-uring","process"),
         processes_io_uring_transfers => ("io-uring-transfers","process"),
         processes_io_uring_files => ("io-uring-files","process"),
+        processes_io_uring_buffers => ("io-uring-buffers","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

@@ -42,6 +42,12 @@
 //! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
 //! `bpf_unpriv_handler`.
 //!
+//! `/proc/sys/vm` has `drop_caches` alone, as `fs/drop_caches.c` has it:
+//! root's, of mode 0200, which no one opens to read (`EACCES`) and only root
+//! to write; a write takes an `int` from 1 to 4, and each that goes through
+//! drops as its value says, 2 evicting the evictable fanotify marks of the
+//! inodes nothing uses ([`crate::fanotify::Registry::evict`]).
+//!
 //! Each file is the opener's IPC namespace's ([`crate::mqueue::Limits`]),
 //! so a new namespace shows Linux's defaults again. A read gives the value
 //! and a newline from the start of the file, nothing from elsewhere; a
@@ -85,6 +91,8 @@ pub(crate) enum Directory {
     Inotify,
     Fanotify,
     Kernel,
+    /// `vm`, which has `drop_caches` alone.
+    Vm,
     /// `net`, and in it `ipv4`, `ipv6`, their `conf` and a device's
     /// directory in each.
     Net,
@@ -299,6 +307,7 @@ pub(crate) struct Machine {
     perf_event_mlock_kb: AtomicI32,
     perf_event_paranoid: AtomicI32,
     unprivileged_bpf_disabled: AtomicI32,
+    drop_caches: AtomicI32,
 }
 
 impl Default for Machine {
@@ -309,11 +318,17 @@ impl Default for Machine {
             perf_event_mlock_kb: AtomicI32::new(crate::perf::MLOCK_KB),
             perf_event_paranoid: AtomicI32::new(crate::perf::PARANOID),
             unprivileged_bpf_disabled: AtomicI32::new(crate::bpf::UNPRIVILEGED_DISABLED),
+            drop_caches: AtomicI32::new(0),
         }
     }
 }
 
 impl Machine {
+    /// `vm.drop_caches` as last written (`sysctl_drop_caches`), which a
+    /// write past the start of the file drops again.
+    fn drop_caches(&self) -> i32 {
+        self.drop_caches.load(Ordering::SeqCst)
+    }
     /// What `perf_event_open` checks (`sysctl_perf_event_paranoid`).
     pub(crate) fn perf_event_paranoid(&self) -> i32 {
         self.perf_event_paranoid.load(Ordering::SeqCst)
@@ -414,6 +429,8 @@ pub(crate) enum Entry {
     Fanotify(Fanotify),
     Kernel(Kernel),
     Net(Net),
+    /// `/proc/sys/vm/drop_caches`.
+    DropCaches,
 }
 
 /// The entry under `/proc/sys/net` that `rest` (the path after it) names,
@@ -480,6 +497,8 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
+        b"/vm" => Some(Entry::Directory(Directory::Vm)),
+        b"/vm/drop_caches" => Some(Entry::DropCaches),
         _ => {
             if let Some(rest) = rest.strip_prefix(b"/net")
                 && (rest.is_empty() || rest.starts_with(b"/"))
@@ -528,7 +547,13 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
     }
     devices.sort();
     let names: Vec<(&[u8], u8)> = match directory {
-        Directory::Sys => vec![(b"fs", DT_DIR), (b"kernel", DT_DIR), (b"net", DT_DIR)],
+        Directory::Sys => vec![
+            (b"fs", DT_DIR),
+            (b"kernel", DT_DIR),
+            (b"net", DT_DIR),
+            (b"vm", DT_DIR),
+        ],
+        Directory::Vm => vec![(b"drop_caches", DT_REG)],
         Directory::Net => vec![(b"ipv4", DT_DIR), (b"ipv6", DT_DIR)],
         Directory::Ipv4 => vec![(b"conf", DT_DIR), (b"ip_forward", DT_REG)],
         Directory::Ipv6 => vec![(b"conf", DT_DIR)],
@@ -576,7 +601,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
 fn parent(directory: Directory) -> Option<Directory> {
     Some(match directory {
         Directory::Sys => return None,
-        Directory::Fs | Directory::Kernel | Directory::Net => Directory::Sys,
+        Directory::Fs | Directory::Kernel | Directory::Net | Directory::Vm => Directory::Sys,
         Directory::Mqueue | Directory::Inotify | Directory::Fanotify => Directory::Fs,
         Directory::Ipv4 | Directory::Ipv6 => Directory::Net,
         Directory::Conf4 => Directory::Ipv4,
@@ -604,8 +629,10 @@ fn child(
             b"fs" => dir(Directory::Fs),
             b"kernel" => dir(Directory::Kernel),
             b"net" => dir(Directory::Net),
+            b"vm" => dir(Directory::Vm),
             _ => None,
         },
+        Directory::Vm => (name == b"drop_caches").then_some(Entry::DropCaches),
         Directory::Net => match name {
             b"ipv4" => dir(Directory::Ipv4),
             b"ipv6" => dir(Directory::Ipv6),
@@ -886,6 +913,11 @@ fn shown(c: &Context<'_>, entry: Entry) -> FileStat {
             mode: 0o100_644,
             ..crate::proc::stat(fanotify_line(&c.files.caches.notify.fan.limits, file).len())
         },
+        // Mode 0200: root may only write it.
+        Entry::DropCaches => FileStat {
+            mode: 0o100_200,
+            ..crate::proc::stat(0)
+        },
         Entry::Kernel(file) if !file.ipc() => FileStat {
             mode: 0o100_644,
             ..crate::proc::stat(c.processes.sysctls.line(file).len())
@@ -967,6 +999,16 @@ pub(crate) fn open(
         // The machine's: root's, which only root may open to write.
         Entry::Kernel(file) if !file.ipc() => (
             Value::Machine(Arc::clone(&c.processes.sysctls), file),
+            Writers::Root,
+        ),
+        // Mode 0200: `test_perm` gives root the owner's bits, which do not
+        // let it read, and everyone else none.
+        Entry::DropCaches if flags & 3 != 1 => return Err(Errno::EACCES),
+        Entry::DropCaches => (
+            Value::DropCaches(
+                Arc::clone(&c.processes.sysctls),
+                Arc::clone(&c.files.caches),
+            ),
             Writers::Root,
         ),
         Entry::Kernel(file) if file.next_id() => {
@@ -1097,6 +1139,8 @@ enum Value {
     /// The machine's.
     Machine(Arc<Machine>, Kernel),
     Net(NetFile),
+    /// The machine's `vm.drop_caches`, which drops from its caches.
+    DropCaches(Arc<Machine>, Arc<crate::page_cache::PageCaches>),
 }
 
 /// A file of `/proc/sys/net` as opened: of the opener's network
@@ -1229,15 +1273,30 @@ impl Value {
             Self::Kernel(ipc, file) => kernel_line(ipc, *file),
             Self::Machine(machine, file) => machine.line(*file),
             Self::Net(net) => line(net_value(&net.network, net.file)),
+            Self::DropCaches(machine, _) => line(machine.drop_caches()),
         }
     }
-    /// After a write that went through, one past the start too: a set
-    /// `kernel.shm_rmid_forced` removes the orphans no mapping shows, as
-    /// Linux master's `proc_ipc_dointvec_minmax_orphans` does (7.0's did so
-    /// after a read too).
+    /// What follows a write that went through, one past the start too:
+    /// - A set `kernel.shm_rmid_forced` removes the orphans no mapping
+    ///   shows, as Linux master's `proc_ipc_dointvec_minmax_orphans` does
+    ///   (7.0's did so after a read too).
+    /// - `vm.drop_caches` drops as its value says (the one last written,
+    ///   for a write past the start), as `drop_caches_sysctl_handler` does
+    ///   after `proc_dointvec_minmax`: 2 frees the inodes nothing uses
+    ///   (`drop_slab`), whose evictable fanotify marks go
+    ///   ([`crate::fanotify::Registry::evict`]). 1 drops the page cache, of
+    ///   which nothing here shows; 4 only quiets the kernel log's line,
+    ///   which there is none of here.
     fn touched(&self) {
-        if let Self::Kernel(ipc, Kernel::ShmRmidForced) = self {
-            ipc.shm.remove_orphans();
+        match self {
+            Self::Kernel(ipc, Kernel::ShmRmidForced) => ipc.shm.remove_orphans(),
+            Self::DropCaches(machine, caches) if machine.drop_caches() & 2 != 0 => {
+                let notify = &caches.notify;
+                notify
+                    .fan
+                    .evict(&|key| caches.held(key) || notify.watches_file(key));
+            }
+            _ => {}
         }
     }
     /// Takes the value written at the start of the file, by a writer with
@@ -1252,6 +1311,12 @@ impl Value {
             }
             Self::Kernel(ipc, file) => kernel_write(ipc, *file, buf),
             Self::Machine(machine, file) => machine.write(*file, buf, admin),
+            // `proc_dointvec_minmax` from 1 to 4.
+            Self::DropCaches(machine, _) => {
+                let (value, consumed) = parse(buf, Some((1, 4)))?;
+                machine.drop_caches.store(value, Ordering::SeqCst);
+                Ok(consumed)
+            }
             // Taken whole by [`NetFile::take`].
             Self::Net(_) => Err(Errno::EINVAL),
             Self::Aio(limits, _) => {
@@ -1642,7 +1707,12 @@ mod tests {
             Some(Entry::Kernel(Kernel::Sem))
         );
         assert_eq!(lookup(b"/proc/sys/kernel/other", None), None);
-        assert_eq!(entries_of(Directory::Sys, None).len(), 5);
+        assert_eq!(entries_of(Directory::Sys, None).len(), 6);
+        assert_eq!(
+            lookup(b"/proc/sys/vm/drop_caches", None),
+            Some(Entry::DropCaches)
+        );
+        assert_eq!(entries_of(Directory::Vm, None).len(), 3);
         assert_eq!(entries_of(Directory::Kernel, None).len(), 19);
         assert_eq!(lookup(b"/proc/system", None), None);
         assert_eq!(entries_of(Directory::Mqueue, None).len(), 7);

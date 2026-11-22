@@ -107,7 +107,7 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
-  `kernel` and `net` it has, ...) and the other names in
+  `kernel` and `net` it has and `vm/drop_caches`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `stack`
@@ -178,7 +178,8 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Multicast and broadcast datagrams reach no one. A datagram is always
+    Multicast datagrams reach no one, nor do broadcast ones but through a
+    veth end (below). A datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
     `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer
@@ -263,11 +264,14 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
-- **Page-fault counts**: `ru_minflt` counts the faults as of each
-  thread's latest system call, and none of the loader's work for `execve`,
-  where Linux counts the faults of its copies of the arguments and of the
-  program's pages. No fault is major (`ru_majflt` is 0), as every page of a
-  file is taken to be in the page cache. A core dump's faults count to the
+- **Page-fault counts**: `ru_minflt` counts each fault as it is taken, as
+  Linux does, from a thread's first fault, before its first system call.
+  `execve`'s loader fills the pages of the program's segments
+  with its file's bytes and counts a fault for each page then, where Linux
+  maps the file and counts the faults as the program first touches the
+  pages, a read fault for several of them at once (`fault_around_bytes`);
+  these faults are no `perf` event. No fault is major (`ru_majflt` is 0),
+  as every page of a file is taken to be in the page cache. A core dump's faults count to the
   last thread to exit, where Linux counts them to the thread that dumps.
   `process_vm_readv`, `process_vm_writev`, `MADV_POPULATE_READ` and
   `MADV_POPULATE_WRITE` count their faults in `perf`'s `page-faults` too,
@@ -275,14 +279,14 @@ verified.
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
-  are hardware events even on a host with a PMU. A thread's CPU time, page
-  faults, context switches and CPU migrations are those it last accounted,
-  at its latest system call. An event of a CPU counts the time that passes,
-  and no faults, switches or migrations. A fault that ends in `SIGSEGV` or
-  `SIGBUS` is not counted, where Linux counts it in `page-faults`; one of a
-  signal frame's write counts as the thread's own; a context switch is a
-  sleep of the thread, not a preemption (but for a thread with `rseq` that
-  gives its virtual CPU to another); and a thread without `rseq` moves to
+  are hardware events even on a host with a PMU. A thread's CPU time,
+  context switches and CPU migrations are those it last accounted, at its
+  latest system call; its page faults count as they are taken. An event of
+  a CPU counts the time that passes, and no faults, switches or migrations.
+  A fault that ends in `SIGSEGV` or `SIGBUS` is not counted, where Linux
+  counts it in `page-faults`; a context switch is a sleep of the thread,
+  not a preemption (but for a thread with `rseq` that gives its virtual CPU
+  to another); and a thread without `rseq` moves to
   another CPU only when a new CPU mask changes the lowest CPU it allows.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where
@@ -366,7 +370,11 @@ verified.
   monotonic one, and `CLOCK_TAI` is the real time. A program is charged to
   its socket as though Linux's rewrites made it 16 times longer, so
   `SO_ATTACH_BPF` is `ENOMEM` sooner than on Linux for a long one; a
-  classic filter is charged what Linux charges for it.
+  classic filter is charged what Linux charges for it. A program's memory
+  in fdinfo (`memlock`) is not yet what Linux's is for a long program:
+  it counts the instructions as loaded, where Linux's rewrites (a
+  division's, a context access's, `BPF_LD_ABS`'s and the rest) may make
+  more of them and take another page (`bpf_prog_realloc`).
   Every other program type is
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are
@@ -381,9 +389,8 @@ verified.
   context's socket (`__sk_buff.sk`) and a map's own fields (`struct
   bpf_map`), maps from `fd_array` and maps made with `excl_prog_hash`,
   `BPF_LD_IMM64` of BTF IDs
-  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, the load-acquire
-  and store-release atomics (`BPF_LOAD_ACQ`, `BPF_STORE_REL`),
-  `may_goto`, indirect jumps, a pointer with a variable offset, and
+  and of functions, `may_goto`, indirect
+  jumps, a pointer with a variable offset, and
   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
   takes a bounded loop from a privileged loader). A scalar is a value the
@@ -479,7 +486,8 @@ verified.
   clears the `%fs` or `%gs` base, where AMD's CPUs before Zen 2 keep it.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
   `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`,
-  `_WRITE_FIXED` and `IORING_OP_FILES_UPDATE` run; the other operations
+  `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS` and
+  `_REMOVE_BUFFERS` run; the other operations
   complete with `EOPNOTSUPP`.
   The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
@@ -487,11 +495,18 @@ verified.
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
   `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
-  `IORING_REGISTER_FILES_UPDATE` and `IORING_REGISTER_FILE_ALLOC_RANGE`
-  (the others give `EINVAL`). So no ring descriptor or personality can be
-  registered, buffers cannot be updated, and neither files nor buffers can
-  be registered with `IORING_REGISTER_FILES2` or `_BUFFERS2`, which give
-  them tags. A registered buffer's pages
+  `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
+  `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
+  `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING` and
+  `IORING_REGISTER_PBUF_STATUS` (the others give `EINVAL`). So no ring descriptor or personality can be
+  registered, buffers cannot be updated, and buffers cannot be registered
+  with `IORING_REGISTER_BUFFERS2`, which gives them tags.
+  `IORING_NOP_TW` completes a NOP as any other, where Linux posts it as
+  task work after the other completions of its submission, and on an
+  `IORING_SETUP_DEFER_TASKRUN` ring only once `io_uring_enter` waits.
+  A request after the first of a link runs with the submission's others,
+  where Linux runs it as task work once their completions are in, so a
+  tag its update of the registered files posts comes before them. A registered buffer's pages
   are not pinned: a fixed transfer moves the memory at its address as that
   is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
   made read-only, and a process that shares the ring moves its own memory.
@@ -511,15 +526,24 @@ verified.
   `EAGAIN`. A
   terminal's read waits in `io_uring_enter`. A file that is never read
   (an epoll instance, a ring) fails with `EINVAL` at once, where Linux
-  first waits for it to be ready. As no buffer can be provided, a read with
-  `IOSQE_BUFFER_SELECT` completes with `ENOBUFS`.
+  first waits for it to be ready. Such a read that selected a buffer
+  completes with `EAGAIN` as one with `RWF_NOWAIT` would: a ring's buffer
+  stays in the ring, and a provided buffer is used, where Linux keeps it for
+  the read. A file without a position (a pipe, a socket, a terminal, an
+  eventfd) is taken as one that can be polled, which decides when a read
+  uses a ring's buffer. A ring of buffers in the program's memory is not
+  pinned either: the kernel reads and writes it through its mapping at each
+  use, so a read that finds it unmapped fails with `EFAULT`, where Linux uses
+  the pages it pinned.
 - **Native AIO, in part**: every read, write and sync runs as `io_submit`
   takes it, as Linux's buffered I/O does; one of a file opened with
   `O_DIRECT` does not run in the background as on Linux, and a sync's event
   is in the ring when the call returns, where Linux's comes from a worker
-  soon after. A poll that waits for a file made ready by no call (a timer
-  that expires, input from the host) completes only at the next call of any
-  process, or while one waits, where Linux's comes at once. Which files'
+  soon after. A poll that waits for a file made ready by no call (a
+  timerfd that expires, input from the host) completes at the next call of
+  any process, while a call waits for files, or at the next checkpoint of
+  a running thread, where Linux's comes at once: while every thread sleeps
+  in a call that waits for no file, it comes once one wakes. Which files'
   polls wait on two queues, which Linux refuses with `EINVAL` unless the
   file is ready, is guessed from the kind of file: a FIFO
   open to read and write, and a character device (a terminal). A ring holds
@@ -535,11 +559,19 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `MADV_COLLAPSE` refuses shmem's and files' mappings (`EINVAL`), which
-    Linux collapses by the rules of shmem and of read-only files, and a
-    collapsed extent stays 512 ordinary pages, so `/proc/<pid>/smaps` shows
-    no `AnonHugePages` for it. Whether an extent has a page table is taken
-    as whether a page of it has an entry or a marker. Linux can also fail a
+  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`). Linux's
+    rules for them changed after v6.12, which collapses only a file nobody
+    has open for writing (`READ_ONLY_THP_FOR_FS`), where later kernels take
+    any file on a file system with large folios. The result also depends
+    on the host's page cache: pages not read in yet, and dirty ones, which
+    are written back once and are otherwise `EAGAIN`. A collapsed extent
+    stays 512 ordinary pages, so `/proc/<pid>/smaps` shows no
+    `AnonHugePages` or `ShmemPmdMapped` for it. Whether an extent of
+    private anonymous memory has a page table is taken as whether a page of
+    it has an entry or a marker. For shmem only the collapsing VMA's own
+    `userfaultfd` registration counts, where Linux refuses holes if any VMA
+    of the file, in any process, is registered for missing pages, and
+    sysfs's `shmem_enabled` is taken as never `deny`. Linux can also fail a
     collapse for want of a free huge page (`ENOMEM`) or for a page in use
     (`EAGAIN`), which never happens here.
   - With `CAP_SYS_ADMIN`, `MADV_HWPOISON` refuses (`EIO`) a page of a file
@@ -565,6 +597,12 @@ verified.
     where Linux copies no page table of a VMA without an `anon_vma`
     (`-ENOENT` until the child touches the page): the loader's copy is
     the only one the page has here.
+  - A program's ELF segments are backed by the bytes the loader read at
+    `execve`. The program's own file cannot be written while it runs
+    (`ETXTBSY`), but Linux gives its interpreter's back for writing once it
+    is loaded: a later write to that file is not seen in a segment page
+    nothing wrote yet, and a page past the end at `execve` stays `SIGBUS`
+    when the file grows, where Linux maps both from the page cache.
   - A fault of a `memfd_secret` page takes the faulting process's
     `RLIMIT_MEMLOCK` as of its last system call (its creator's before
     one), and the pages count only `memfd_secret` files and `io_uring`'s
@@ -798,7 +836,9 @@ verified.
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
   `nr_blocks` and `nr_inodes`, but not for what a mapping writes (a write
   fault past the size is no `SIGBUS`, and the pages go back to the file
-  whatever its size), and its extended attributes take none of the inodes'
+  whatever its size; nor are the pages a fault brings into a tmpfs file
+  or a memfd counted in its blocks, which only `MADV_COLLAPSE` charges
+  for the holes it fills), and its extended attributes take none of the inodes'
   room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
   counts them, does not happen); the root from start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime
@@ -963,16 +1003,21 @@ verified.
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
-  allows it), and `FAN_FS_ERROR` never comes. An evictable mark is never
-  evicted. A group merges an event
-  into any like it still queued, where Linux looks only at the last 128 of
-  its hash bucket. Whether a directory watches its children is judged by the
+  allows it), and `FAN_FS_ERROR` never comes. An evictable mark on a
+  directory is never evicted, where Linux's goes once none of the
+  directory's children's dentries is in use; one on a file Linux would
+  still write back, or one a mount is on, goes all the same, and so does
+  one on a file another thread is opening at that moment but has not yet
+  opened, which Linux's path lookup keeps. Which events
+  share a bucket of a group's merge hash follows a hash of the emulator's
+  own where Linux's mixes in kernel addresses (of the process, and of a
+  path in the non-FID modes), so only events of one task's names in one
+  directory collide as on Linux. Whether a directory watches its children
+  is judged by the
   fanotify marks alone, where Linux's counts inotify's too. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
   it had, which fails once it is gone, and a FIFO's or device's read or
-  write is told of without its directory and name. A tmpfs superblock that
-  goes keeps the marks on its files and on itself, where Linux's
-  `fsnotify_sb_delete` removes them.
+  write is told of without its directory and name.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the
@@ -1002,8 +1047,8 @@ verified.
   Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
   solicitation nor MLD report. Traffic through
   an end moves no counters; a namespace forwards nothing
-  on to another; and a broadcast or multicast destination through an end
-  reaches no one. ICMP's port unreachable is not rate limited
+  on to another; and a multicast destination through an end reaches no
+  one, as no socket joins a group (`IP_ADD_MEMBERSHIP`, `IPV6_ADD_MEMBERSHIP`). ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,

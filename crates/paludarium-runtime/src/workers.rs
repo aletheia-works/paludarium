@@ -78,6 +78,7 @@ impl Execution {
     ) {
         // This host thread runs the task from now on, as Linux's `current`.
         kernel.enter_thread(thread.tid);
+        kernel.start_thread(thread);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run(kernel, thread, &mut memory)
         }))
@@ -94,6 +95,7 @@ impl Execution {
         // And no longer: what this host thread lets go of after this is no
         // task's doing.
         paludarium_mmu::set_current_actor(None);
+        paludarium_mmu::faults::unbind();
         kernel.complete_process(
             result
                 .as_ref()

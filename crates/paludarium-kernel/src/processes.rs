@@ -2429,7 +2429,7 @@ impl Kernel {
                 // leader's, but its perf events are its own.
                 let tid = thread.tid;
                 match self.exec(thread, mem, n, a) {
-                    Ok(closed) => {
+                    Ok((closed, fails)) => {
                         self.close_on_exec(thread, mem, closed);
                         // The events that wait for it start counting, as
                         // `begin_new_exec` runs `perf_event_exec` before the
@@ -2455,6 +2455,12 @@ impl Kernel {
                         });
                         let image = space.as_ref().map(|space| (space, &thread.state.name[..]));
                         crate::perf::exec(events, &self.group, tid, thread.tid, image);
+                        // The new program cannot start: past the point of
+                        // no return, `bprm_execve` forces SIGSEGV, before
+                        // any exec stop of a tracer.
+                        if fails {
+                            return Some(self.terminate(thread, crate::signal::SIGSEGV));
+                        }
                         self.ptrace_exec(thread);
                         return Some(Next::Resume);
                     }
@@ -4509,7 +4515,7 @@ impl Kernel {
         mem: &AddressSpace,
         n: u64,
         a: [u64; 6],
-    ) -> Result<Vec<crate::files::Descriptor>, Errno> {
+    ) -> Result<Execed, Errno> {
         // Exec's opens of the files it runs, for inotify, in their order.
         let mut opens = ExecOpens::default();
         // Their permission events (`FAN_OPEN_EXEC_PERM`, `FAN_OPEN_PERM`,
@@ -4535,7 +4541,7 @@ impl Kernel {
         a: [u64; 6],
         gathering: &mut Option<crate::fanotify::Gathering>,
         opens: &mut ExecOpens,
-    ) -> Result<Vec<crate::files::Descriptor>, Errno> {
+    ) -> Result<Execed, Errno> {
         const AT_FDCWD: u64 = -100i64 as u64;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         const AT_EMPTY_PATH: u64 = 0x1000;
@@ -4798,7 +4804,7 @@ impl Kernel {
         held: Option<HeldProgram>,
         program_file: Option<crate::page_cache::WriteAccess>,
         (gathering, opens): (&mut Option<crate::fanotify::Gathering>, &ExecOpens),
-    ) -> Result<Vec<crate::files::Descriptor>, Errno> {
+    ) -> Result<Execed, Errno> {
         let mut random = [0; 16];
         let early = self
             .host
@@ -5087,9 +5093,14 @@ impl Kernel {
         self.group.keep_peak(mem.resident_pages().0);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();
-        Ok(closed)
+        Ok((closed, image.fails))
     }
 }
+/// What an exec that loaded its program gives: the descriptors it closed,
+/// and whether the program then cannot start
+/// ([`paludarium_loader::LoadedImage::fails`]).
+type Execed = (Vec<crate::files::Descriptor>, bool);
+
 /// `clone3`'s own flag: reset the signal handlers in the child.
 pub(crate) const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
 /// The namespace flags of `clone`'s flags, with `clone3`'s `CLONE_NEWTIME`

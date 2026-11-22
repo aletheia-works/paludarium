@@ -208,8 +208,10 @@ impl Space {
 /// Tells the machine's fanotify of each mount of `table`, and of every
 /// table copied from it, that is freed ([`crate::fanotify::Registry::unmounted`]),
 /// as Linux's `cleanup_mnt` calls `fsnotify_vfsmount_delete`, and its
-/// inotify of each superblock that goes ([`crate::inotify::Notifier::unmounted`]),
-/// as `generic_shutdown_super` calls `fsnotify_sb_delete`.
+/// inotify and fanotify of each superblock that goes
+/// ([`crate::inotify::Notifier::unmounted`],
+/// [`crate::fanotify::Registry::superblock_gone`]), as
+/// `generic_shutdown_super` calls `fsnotify_sb_delete`.
 fn released_to_notifiers(
     table: &paludarium_vfs::MountTable,
     caches: &Arc<crate::page_cache::PageCaches>,
@@ -224,6 +226,7 @@ fn released_to_notifiers(
     table.set_superblock_hook(Some(Arc::new(move |device| {
         if let Some(notify) = notify.upgrade() {
             notify.unmounted(device);
+            notify.fan.superblock_gone(device);
         }
     })));
     mounts_to_fanotify(table, caches, crate::namespaces::FIRST_MOUNT_INODE);
@@ -3580,7 +3583,7 @@ pub(crate) fn kiocb_rw_flags(file: &Arc<dyn FileHandle>, flags: u32) -> Result<u
 /// position that `pread` and `pwrite` take (Linux's `FMODE_PREAD`), not a
 /// pipe, socket or terminal, a signalfd or an inotify instance, which read
 /// and write as a stream whatever the offset.
-fn aio_positioned(file: &Arc<dyn FileHandle>) -> bool {
+pub(crate) fn aio_positioned(file: &Arc<dyn FileHandle>) -> bool {
     file.seek(0, 1).is_ok()
         && !file.as_any().is_some_and(|any| {
             any.is::<crate::signalfd::SignalFile>() || any.is::<crate::inotify::Instance>()

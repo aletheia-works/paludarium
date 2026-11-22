@@ -2020,3 +2020,88 @@ fn a_discard_drops_the_entries_of_any_shared_mapping_and_keeps_its_pages() {
     m.read(page(1), &mut b).unwrap();
     assert_eq!(b, *b"c");
 }
+
+#[test]
+fn collapse_takes_shmem_page_caches_an_aligned_extent_at_a_time() {
+    const AT: u64 = 0x4000_0000;
+    const HUGE: u64 = 2 << 20;
+    let m = AddressSpace::new();
+    let view = m.view();
+    let shared = |at: u64, pages: &SharedPages, offset: u64| {
+        let kind = if pages.source().is_some() {
+            MappingKind::File
+        } else {
+            MappingKind::Anonymous
+        };
+        let _ = m.unmap_shared(GuestAddr(at), 2 * HUGE);
+        m.map_shared(Some(GuestAddr(at)), 2 * HUGE, Prot::READ_WRITE, kind)
+            .unwrap();
+        m.share_pages(
+            GuestAddr(at),
+            2 * HUGE,
+            pages,
+            offset,
+            SharedWrites::Allowed,
+        )
+        .unwrap();
+    };
+    let einval = Err(Errno::EINVAL);
+    // Shared memory of no file: an extent of it nothing touched was
+    // truncated, which ends the collapse; one touched becomes whole.
+    let memory = SharedPages::new();
+    shared(AT, &memory, 0);
+    assert_eq!(m.collapse(GuestAddr(AT), AT + 2 * HUGE), einval);
+    m.write(GuestAddr(AT + 3 * PAGE_SIZE), &[7]).unwrap();
+    assert_eq!(m.collapse(GuestAddr(AT), AT + 2 * HUGE), einval);
+    assert!((0..HUGE / PAGE_SIZE).all(|i| memory.has(i * PAGE_SIZE)));
+    assert!(!memory.has(HUGE));
+    assert_eq!(m.collapse(GuestAddr(AT), AT + HUGE), Ok(()));
+    let mut byte = [0];
+    m.read(GuestAddr(AT + 3 * PAGE_SIZE), &mut byte).unwrap();
+    assert_eq!(byte, [7]);
+    // A shmem file holding a page, mapped out of step with its offsets
+    // and then in step; a file that is not shmem's is refused.
+    let file = |shmem| -> SharedPages {
+        SharedPages::new().with_source(Arc::new(Shmem {
+            size: 2 * HUGE,
+            held: vec![5],
+            shmem,
+        }))
+    };
+    let memfd = file(true);
+    shared(AT, &memfd, PAGE_SIZE);
+    assert_eq!(m.collapse(GuestAddr(AT), AT + HUGE), einval);
+    shared(AT, &memfd, 0);
+    assert_eq!(m.collapse(GuestAddr(AT), AT + HUGE), Ok(()));
+    assert!((0..HUGE / PAGE_SIZE).all(|i| memfd.has(i * PAGE_SIZE)));
+    assert_eq!(m.collapse(GuestAddr(AT + HUGE), AT + 2 * HUGE), einval);
+    shared(AT, &file(false), 0);
+    m.write(GuestAddr(AT), &[1]).unwrap();
+    assert_eq!(m.collapse(GuestAddr(AT), AT + HUGE), einval);
+    // A private mapping of the shmem file: an extent it only reads maps,
+    // one with a page of its own does not.
+    let cache = file(true);
+    m.unmap_shared(GuestAddr(AT), 2 * HUGE).unwrap();
+    m.map_shared(
+        Some(GuestAddr(AT)),
+        2 * HUGE,
+        Prot::READ_WRITE,
+        MappingKind::File,
+    )
+    .unwrap();
+    m.back_with_cache(GuestAddr(AT), 2 * HUGE, &cache, 0)
+        .unwrap();
+    m.read(GuestAddr(AT), &mut byte).unwrap();
+    assert_eq!(byte, [b'f']);
+    assert_eq!(m.collapse(GuestAddr(AT), AT + HUGE), Ok(()));
+    m.write(GuestAddr(AT + HUGE + PAGE_SIZE), &[1]).unwrap();
+    assert_eq!(m.collapse(GuestAddr(AT + HUGE), AT + 2 * HUGE), einval);
+    // Holes, in a VMA a userfaultfd registered for missing pages.
+    let armed = SharedPages::new();
+    shared(AT, &armed, 0);
+    m.write(GuestAddr(AT), &[1]).unwrap();
+    view.userfault_register(AT, AT + HUGE, 7, Userfault::MISSING)
+        .unwrap();
+    assert_eq!(m.collapse(GuestAddr(AT), AT + HUGE), Err(Errno(16)));
+    assert!(!armed.has(PAGE_SIZE));
+}

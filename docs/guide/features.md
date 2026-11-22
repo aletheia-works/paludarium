@@ -1814,7 +1814,11 @@ kernel.
   takes events from the ring itself sees it without a call. So does a
   timerfd that expires while the program runs without a call: the next
   checkpoint of a running thread completes the poll, as Linux's timer does
-  from its wake-up. `io_cancel`
+  from its wake-up. A poll of a signalfd completes only if one of its
+  signals is pending at `io_submit`: one that waits is never completed by
+  a signal sent later, as Linux polls it again in a kernel worker, whose
+  own signals `signalfd_poll` looks at, so only `io_cancel` or the
+  context's end completes it. `io_cancel`
   cancels only a poll that waits (`EINPROGRESS`, with an event of no events
   in the ring), and gives `EINVAL` for another request. `io_getevents` and
   `io_pgetevents` take events from the head and wait for `min_nr` of them

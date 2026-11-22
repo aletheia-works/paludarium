@@ -393,7 +393,11 @@ impl Ring {
             let mut index = 0;
             while index < state.polls.len() {
                 let poll = &state.polls[index];
-                let mask = woken(&poll.file, polled(&poll.file).0, poll.events);
+                let mask = if polled_by_a_worker(&poll.file) {
+                    0
+                } else {
+                    woken(&poll.file, polled(&poll.file).0, poll.events)
+                };
                 if mask == 0 {
                     index += 1;
                 } else {
@@ -612,6 +616,17 @@ fn polled(file: &Arc<dyn FileHandle>) -> (u32, u32) {
         1
     };
     (mask, queues)
+}
+
+/// Whether a poll that waits for `file` never completes as it becomes
+/// ready: a signalfd's wake-up (`signalfd_notify`) carries no key, so
+/// Linux polls it again in a kernel worker (`aio_poll_complete_work`),
+/// and `signalfd_poll` looks at the worker's own signals, of which there
+/// are none. Only `io_cancel` or the context's end completes it; a signal
+/// already pending at `io_submit` completes it there.
+fn polled_by_a_worker(file: &Arc<dyn FileHandle>) -> bool {
+    file.as_any()
+        .is_some_and(|any| any.is::<crate::signalfd::SignalFile>())
 }
 
 /// What a poll that waits completes with once `file` is ready (`mask`)

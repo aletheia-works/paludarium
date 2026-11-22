@@ -820,6 +820,43 @@ fn a_timer_that_expires_puts_the_poll_in_the_ring_with_no_call() {
 }
 
 #[test]
+fn a_signalfd_poll_completes_only_if_its_signal_is_pending_at_submit() {
+    let mut f = fixture();
+    // Block SIGUSR2 and open a signalfd for it.
+    let mask = DATA + 0xe00;
+    f.mem
+        .write(GuestAddr(mask), &(1u64 << 11).to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(14, &[0, mask, 0, 8]), 0);
+    let sfd = f.ret(289, &[u64::MAX, mask, 8, 0x800]);
+    let pid = f.ret(39, &[]);
+    let ctx = f.setup(8);
+    // Pending at submit: the poll completes there with POLLIN.
+    assert_eq!(f.ret(62, &[pid, 12]), 0);
+    let poll = Iocb {
+        data: 1,
+        opcode: 5,
+        fildes: sfd as u32,
+        buf: 1,
+        ..Iocb::default()
+    };
+    assert_eq!(f.submit(ctx, poll), 1);
+    assert_eq!(f.reap(ctx), [(1, IOCBS, 1)]);
+    assert_eq!(f.ret(0, &[sfd, BUFFERS, 128]), 128);
+    // Sent after submit: Linux polls it again in a kernel worker, whose
+    // signals it looks at, so neither the call nor a checkpoint completes
+    // it; io_cancel does.
+    let waiting = f.iocb(1, Iocb { data: 2, ..poll });
+    assert_eq!(f.ret(SUBMIT, &[ctx, 1, POINTERS + 8]), 1);
+    assert_eq!(f.ret(62, &[pid, 12]), 0);
+    assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Resume);
+    assert_eq!(f.u32_at(ctx + 12), 1);
+    assert_eq!(f.ret(CANCEL, &[ctx, waiting, 0]), errno(Errno(115)));
+    assert_eq!(f.reap(ctx), [(2, waiting, 0)]);
+    assert_eq!(f.ret(0, &[sfd, BUFFERS, 128]), 128);
+}
+
+#[test]
 fn getevents_checks_its_arguments_and_waits_for_min_nr() {
     let mut f = fixture();
     let fd = f.file("a", b"abc");

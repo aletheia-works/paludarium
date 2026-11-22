@@ -889,7 +889,8 @@ static int case_timer(void) {
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
     if (tfd < 0) return 4;
     struct iocb cb = poll_of(tfd, POLLIN, 9);
-    printf("submit=%ld in-ring=%u\n", submit1(ctx, &cb), (ring->tail - ring->head) % ring->nr);
+    long submitted = submit1(ctx, &cb);
+    printf("submit=%ld in-ring=%u\n", submitted, (ring->tail - ring->head) % ring->nr);
     struct itimerspec soon = {.it_value = {.tv_nsec = 20000000}};
     if (timerfd_settime(tfd, 0, &soon, NULL)) return 5;
     struct timespec ten = {10, 0};
@@ -911,10 +912,10 @@ static int case_timer(void) {
 
 /* A poll on a signalfd for a blocked SIGUSR2: one submitted with the signal
    already pending completes at once; one submitted before the signal is
-   sent waits, and io_getevents shows whether the kill completes it (Linux's
-   signalfd_notify wakes the poll, whose worker then checks its own
-   signals). A 1 s timeout ends the wait, printing never came. Either way the
-   signalfd's read takes the signal. */
+   sent waits, and the kill does not complete it: Linux's signalfd_notify
+   wakes the poll with no key, and the kernel worker that polls it again
+   looks at its own signals. io_getevents' 1 s timeout ends the wait,
+   printing never came, and the signalfd's read takes the signal. */
 static void read_signal(int sfd) {
     struct signalfd_siginfo si;
     memset(&si, 0, sizeof si);
@@ -938,14 +939,16 @@ static int case_signalfd(void) {
 
     kill(getpid(), SIGUSR2);
     struct iocb pending = poll_of(sfd, POLLIN, 1);
-    printf("pending: submit=%ld in-ring=%u\n", submit1(ctx, &pending), (ring->tail - ring->head) % ring->nr);
+    long submitted = submit1(ctx, &pending);
+    printf("pending: submit=%ld in-ring=%u\n", submitted, (ring->tail - ring->head) % ring->nr);
     long got = getevents(ctx, 1, 8, ev, &one);
     if (got < 1) printf("pending: never came: getevents=%ld\n", got);
     else printf("pending: got=%ld data=%llu res=%#llx\n", got, (unsigned long long)ev[0].data, (long long)ev[0].res);
     read_signal(sfd);
 
     struct iocb later = poll_of(sfd, POLLIN, 2);
-    printf("later: submit=%ld in-ring=%u\n", submit1(ctx, &later), (ring->tail - ring->head) % ring->nr);
+    submitted = submit1(ctx, &later);
+    printf("later: submit=%ld in-ring=%u\n", submitted, (ring->tail - ring->head) % ring->nr);
     kill(getpid(), SIGUSR2);
     got = getevents(ctx, 1, 8, ev, &one);
     if (got < 1) printf("later: never came: getevents=%ld\n", got);

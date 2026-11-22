@@ -126,11 +126,13 @@ verified.
   shows those as `voluntary_ctxt_switches` and 0 as
   `nonvoluntary_ctxt_switches`. Another process's thread is
   `S (sleeping)` in every wait, where Linux shows some waits it cannot
-  interrupt as `D (disk sleep)`. A thread shows another process
-  what it published at its last system call or signal check, so a mask
-  changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
-  only while the thread is stopped in it. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
-  used.
+  interrupt as `D (disk sleep)`. A thread shows another process what it
+  published at its last system call or signal check, so a mask changed
+  only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen only
+  while the thread is stopped in it. A leader that ended before its other
+  threads still shows its process's descriptors and memory in its files
+  (`fd`, `maps`, `cmdline`, ...), where Linux's zombie leader has none. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with
+  nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
   root. `mount` mounts no `proc` filesystem and nothing on `/proc` or

@@ -47,11 +47,11 @@
 //!   is not known here, `bpf_get_netns_cookie` of a scalar not known to be
 //!   0, bpf-to-bpf calls and kfuncs, the context's socket pointer
 //!   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
-//!   `fd_array` and maps made with
-//!   `excl_prog_hash`, BTF IDs and functions in `BPF_LD_IMM64`,
-//!   `may_goto`, indirect jumps, a back-edge (Linux takes a bounded loop from a privileged loader), a
-//!   pointer with a variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a
-//!   conditional jump.
+//!   `fd_array` and maps made with `excl_prog_hash`, BTF IDs and functions
+//!   in `BPF_LD_IMM64`, `may_goto`, indirect jumps, a back-edge (Linux
+//!   takes a bounded loop from a privileged loader), a pointer with a
+//!   variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a conditional
+//!   jump.
 //! - The loader has `CAP_BPF` and `CAP_PERFMON` ([`crate::bpf_prog`]
 //!   refuses others), so the verifier allows what Linux allows them:
 //!   pointer leaks, uninitialized stack reads and no Spectre sanitizing.

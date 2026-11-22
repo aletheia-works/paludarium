@@ -366,7 +366,11 @@ verified.
   monotonic one, and `CLOCK_TAI` is the real time. A program is charged to
   its socket as though Linux's rewrites made it 16 times longer, so
   `SO_ATTACH_BPF` is `ENOMEM` sooner than on Linux for a long one; a
-  classic filter is charged what Linux charges for it.
+  classic filter is charged what Linux charges for it. A program's memory
+  in fdinfo (`memlock`) is not yet what Linux's is for a long program:
+  it counts the instructions as loaded, where Linux's rewrites (a
+  division's, a context access's, `BPF_LD_ABS`'s and the rest) may make
+  more of them and take another page (`bpf_prog_realloc`).
   Every other program type is
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are

@@ -2346,7 +2346,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // adds no PROT_EXEC to its mapping, which may never run.
     // Its mount is found by where the file now is, as its open description
     // keeps that through renames, not by its mount itself.
+    // A BPF map's anonymous inode is on a file system that runs nothing.
     let noexec = descriptor.as_ref().is_some_and(|d| {
+        if crate::bpf::is_map(d.file.as_ref()) {
+            return true;
+        }
         let at = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
         crate::files::mount_says(c.files, &at, crate::files::ST_NOEXEC)
     });
@@ -2476,6 +2480,16 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // in under one hold of the lock, so that no other thread sees the
     // mapping without it, or maps the range in between.
     let result = match (&file, &descriptor) {
+        // A BPF map's mapping shows its values (`bpf_map_mmap`).
+        (Some(file), Some(_)) if crate::bpf::is_map(file.as_ref()) => crate::bpf::mmap(
+            c,
+            file,
+            placement,
+            len,
+            prot,
+            flags & MAP_SHARED != 0,
+            offset,
+        ),
         (Some(file), Some(d)) if flags & MAP_SHARED != 0 => {
             // The mapping shows the file's page cache.
             shared_file(c, d, file, len, offset, prot, |pages, writes| {
@@ -2627,8 +2641,9 @@ fn check_mappable(
     }
     // Neither a file that is not regular nor one that /proc generates can
     // be read at an offset, which a mapping needs.
+    // A BPF map's file maps by its own `mmap` ([`crate::bpf::mmap`]).
     let readable = regular && file.read_at(0, &mut []) != Err(Errno::ENODEV);
-    if !readable && !is_zero_device(file) {
+    if !readable && !is_zero_device(file) && !crate::bpf::is_map(file) {
         return Err(Errno::ENODEV);
     }
     // A file's mapping never grows down (`do_mmap`), /dev/zero's included.

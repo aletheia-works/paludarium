@@ -1565,6 +1565,32 @@ impl SharedPages {
             done += piece;
         }
     }
+    /// Changes the `size` bytes at offset `at`, which lie in one word, to
+    /// what `change` makes of them, in one compare-and-swap of the word, as
+    /// the kernel changes memory a mapping writes without it (a BPF map's
+    /// value under `BPF_ATOMIC`); `change` runs again whenever another
+    /// access came between. Gives the bytes it changed, little-endian. A page
+    /// without contents is left alone and reads as zeros, as for
+    /// [`Self::store`].
+    pub fn update(&self, at: u64, size: usize, mut change: impl FnMut(u64) -> u64) -> u64 {
+        let key = at - at % PAGE_SIZE;
+        let within = page_offset(at);
+        let frame = self.lock().get(&key).cloned();
+        let Some(bytes) = frame.as_ref().and_then(|frame| frame.get()) else {
+            return 0;
+        };
+        let word = &bytes.words[within / WORD_BYTES];
+        let shift = 8 * (within % WORD_BYTES);
+        let mask = value_mask(size);
+        let mut old = 0;
+        let _ = word.try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            old = current >> shift & mask;
+            Some(current & !(mask << shift) | (change(old) & mask) << shift)
+        });
+        // After the bytes, as in `Self::store`.
+        self.changed();
+        old
+    }
     /// Zeros `[start, end)` of the memory, as truncating or punching a hole
     /// in the file does to its page cache. The pages do not become dirty.
     pub fn zero(&self, start: u64, end: u64) {

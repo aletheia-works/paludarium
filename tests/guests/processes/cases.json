@@ -159,6 +159,7 @@
     {"name":"bpf-lpm","binary":"bpf"},
     {"name":"bpf-maps","binary":"bpf"},
     {"name":"bpf-prog-load","binary":"bpf"},
+    {"name":"bpf-mmap","binary":"bpf"},
     {"name":"bpf-prog-verify","binary":"bpf-prog"},
     {"name":"bpf-prog-maps","binary":"bpf-prog"},
     {"name":"bpf-prog-context","binary":"bpf-prog"},

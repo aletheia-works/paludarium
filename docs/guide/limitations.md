@@ -449,8 +449,10 @@ verified.
   `BPF_F_RDONLY` with `BPF_F_WRONLY` is refused once the map is made (7.0
   refuses it before the NUMA node and the type, so another error may come
   first here). Map IDs are the emulated machine's, so they
-  start at 1 and do not see the host's maps. `BPF_F_MMAPABLE` is taken but `mmap` of a map
-  is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
+  start at 1 and do not see the host's maps. A map's SHA-256
+  (`bpf_map_info.hash`) is `EINVAL`. The `/proc/<pid>/maps` line of a
+  map's mapping shows device `00:00` and inode 0, where Linux shows its
+  anonymous inode's.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its

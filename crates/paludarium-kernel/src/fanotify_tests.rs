@@ -862,6 +862,12 @@ fn drop_caches_evicts_the_evictable_marks_of_files_nothing_holds() {
     ] {
         assert_eq!(f.mark(fan, ADD | EVICTABLE, OPEN, name), 0);
     }
+    // A file made, written back and marked by its descriptor, as the
+    // differential case marks its free files, goes too once closed.
+    let made = f.open("/data/made", 0o301);
+    assert_eq!(f.ret(74, &[made]), 0);
+    assert_eq!(f.ret(MARK, &[fan, ADD | EVICTABLE, OPEN, made, 0]), 0);
+    f.close(made);
     // Another group's mark that holds its inode, an open description and
     // an inotify watch keep theirs.
     assert_eq!(f.mark(other, ADD, OPEN, "/data/kept"), 0);
@@ -875,13 +881,13 @@ fn drop_caches_evicts_the_evictable_marks_of_files_nothing_holds() {
             .filter(|l| l.starts_with("fanotify ino:"))
             .count()
     };
-    assert_eq!(marks(&mut f), 6);
+    assert_eq!(marks(&mut f), 7);
     // 1 drops the page cache alone.
     assert_eq!(drop(&mut f, b"1"), 1);
-    assert_eq!(marks(&mut f), 6);
+    assert_eq!(marks(&mut f), 7);
     assert_eq!(drop(&mut f, b"2"), 1);
-    // e's goes. The directory's stays (its children's dentries may hold
-    // it), and so does the tmpfs file's.
+    // e's and made's go. The directory's stays (its children's dentries
+    // may hold it), and so does the tmpfs file's.
     assert_eq!(marks(&mut f), 5);
     f.close(held);
     assert_eq!(drop(&mut f, b"3"), 1);

@@ -28,6 +28,9 @@ struct Streams {
     /// Whether a thread's CPU time is the host thread's, not the virtual
     /// monotonic clock ([`RecordingHost::measure_cpu_time`]).
     cpu_time: bool,
+    /// Whether `--mount` may show host directories, as the native host
+    /// shows them ([`RecordingHost::mount_host_directories`]).
+    mounts: bool,
     /// The NTP state [`Host::ntp_state`] gives in place of the machine's
     /// ([`RecordingHost::set_ntp_state`]).
     ntp: Option<Option<crate::NtpState>>,
@@ -49,6 +52,7 @@ impl Default for Streams {
             output_full: [false; 2],
             network: false,
             cpu_time: false,
+            mounts: false,
             ntp: None,
         }
     }
@@ -145,6 +149,12 @@ impl RecordingHost {
     pub fn measure_cpu_time(&self) {
         self.lock().cpu_time = true;
     }
+    /// Shows the host directories a `--mount` names, as the native host
+    /// does, for the differential tests of guests whose files must be on a
+    /// host's file system (one whose inodes go once nothing uses them).
+    pub fn mount_host_directories(&self) {
+        self.lock().mounts = true;
+    }
     /// Gives `state` as the real-time clock's NTP state (`None`: the host
     /// tells none) in place of the machine's.
     pub fn set_ntp_state(&self, state: Option<crate::NtpState>) {
@@ -201,6 +211,13 @@ impl RecordingHost {
 }
 
 impl Host for RecordingHost {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mount_fs(&self, root: &std::path::Path) -> Result<std::sync::Arc<dyn crate::HostFs>, Errno> {
+        if !self.lock().mounts {
+            return Err(Errno::ENOSYS);
+        }
+        Ok(std::sync::Arc::new(crate::NativeFs::new(root)?))
+    }
     fn terminal_info(&self, stream: StreamId) -> Result<Option<TerminalInfo>, Errno> {
         Ok(self.lock().terminals[stream.index()])
     }

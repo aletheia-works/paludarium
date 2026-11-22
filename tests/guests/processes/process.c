@@ -7333,9 +7333,11 @@ static int proc_stat_sched_case(void) {
    percpu_counters (mm_struct rss_stat), which /proc reads as their folded
    total (get_mm_counter), each CPU keeping less than percpu_counter_batch,
    max(32, 2 * online CPUs) (lib/percpu_counter.c compute_batch_value), of
-   its own. Two reads can so differ from what changed between them by up to
-   2 * (batch - 1) * online CPUs pages, and 64 more than that are shown. The
-   online CPUs are the cpuN lines of /proc/stat (show_stat). */
+   its own. Pinned to one CPU, the task changes only that CPU's part:
+   2 * batch + 64 pages show at least 64 more as they are touched, and
+   their unmapping, a change of more than the batch, is folded in at once
+   (percpu_counter_add_batch). The online CPUs are the cpuN lines of
+   /proc/stat (show_stat), or more if sysconf says so. */
 static long ps_rss_pages(void) {
     long cpus = 0;
     FILE *stat = fopen("/proc/stat", "r");
@@ -7346,7 +7348,7 @@ static long ps_rss_pages(void) {
     long configured = sysconf(_SC_NPROCESSORS_CONF);
     if (cpus < configured) cpus = configured;
     long batch = 2 * cpus > 32 ? 2 * cpus : 32;
-    return 2 * batch * cpus + 64;
+    return 2 * batch + 64;
 }
 static int proc_stat_counts_case(const char *self) {
     fflush(stdout);
@@ -7362,6 +7364,10 @@ static int proc_stat_counts_case(const char *self) {
     printf("start: recent=%d\n", ps_recent(ps_process_start, ps_uptime()));
 
     long pages = ps_rss_pages();
+    cpu_set_t allowed;
+    int pinned = !sched_getaffinity(0, sizeof allowed, &allowed) && pss_pin_high() >= 0;
+    printf("rss: pinned=%d\n", pinned);
+    if (!pinned) return 3;
     long rusage = pf_get(RUSAGE_SELF);
     long before = ps_field("/proc/self/stat", 10);
     long rss = ps_field("/proc/self/stat", 24);
@@ -7375,6 +7381,7 @@ static int proc_stat_counts_case(const char *self) {
            after - before >= 64, rss > 0, grown - rss >= 64);
     munmap(kept, (size_t)(pages * page));
     printf("unmapped: rss-fell=%d\n", ps_field("/proc/self/stat", 24) < grown);
+    printf("rss: unpinned=%d\n", !sched_setaffinity(0, sizeof allowed, &allowed));
 
     pthread_t thread;
     fflush(stdout);

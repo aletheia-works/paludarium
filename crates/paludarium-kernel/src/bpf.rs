@@ -2519,6 +2519,10 @@ impl paludarium_mmu::PageSource for Mapped {
     fn name(&self) -> Option<Vec<u8>> {
         Some(b"anon_inode:bpf-map".to_vec())
     }
+    /// The device and inode the map's descriptor's `fstat` gives.
+    fn identity(&self) -> (u64, u64) {
+        (crate::files::Internal::AnonInodes.device(), 0)
+    }
     /// The VMAs have a `close` operation, which keeps Linux from merging
     /// them.
     fn merges(&self) -> bool {

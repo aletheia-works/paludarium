@@ -1313,6 +1313,14 @@ fn a_mappable_arrays_mapping_shows_its_values() {
     let mut seen = [0; 16];
     m.read(GuestAddr(at + 16), &mut seen).unwrap();
     assert_eq!(seen, [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 0, 0, 0, 0]);
+    // `/proc/<pid>/maps` shows the device and inode the descriptor's
+    // `fstat` gives.
+    let vma = m.view().vma_from(at).unwrap();
+    assert_eq!(vma.start, at);
+    assert_eq!(
+        vma.identity,
+        (crate::files::Internal::AnonInodes.device(), 0)
+    );
     m.write(GuestAddr(at + 299 * 16), &[3; 8]).unwrap();
     let last = Some(&299u32.to_le_bytes()[..]);
     assert_eq!(

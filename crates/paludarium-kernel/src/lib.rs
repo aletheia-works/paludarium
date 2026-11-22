@@ -82,6 +82,8 @@ mod seccomp_tests;
 mod sem;
 mod seq;
 mod shm;
+#[cfg(test)]
+mod sock_diag_tests;
 mod sockets;
 mod syscalls;
 mod sysctl;

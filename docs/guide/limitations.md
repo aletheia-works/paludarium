@@ -111,28 +111,27 @@ verified.
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `stack`
-  and the rest. `wchan` is `0` for a waiting task too, where Linux names
-  the kernel function it waits in for a reader that may read the task:
-  there are no kernel functions here to name. `io` does not count what Linux's `kernel_read` and
-  `kernel_write` count for the process (`execve` reading its program and
-  interpreter, a core dump's writes), and a read or write that fails with
-  an errno Linux gives both before and in the file's operation (`EINVAL`,
-  `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
-  so not counted.
+  and the rest. `wchan` is `0` for a waiting task too, where Linux names the
+  kernel function it waits in for a reader that may read the task: there are
+  no kernel functions here to name. `io` does not count what Linux's
+  `kernel_read` and `kernel_write` count for the process (`execve` reading its
+  program and interpreter, a core dump's writes), and a read or write that
+  fails with an errno Linux gives both before and in the file's operation
+  (`EINVAL`, `EFAULT`: an eventfd's too small a buffer) is taken as refused
+  before it, so not counted.
   `/proc/stat` counts all CPU time as user time, as `getrusage` does, each
   thread's to the CPU it was on at its system calls, and none as idle; it
   counts no interrupts or softirqs, and as context switches only the times
-  threads went to sleep, as nothing preempts a guest thread, so `status`
-  shows those as `voluntary_ctxt_switches` and 0 as
-  `nonvoluntary_ctxt_switches`. Another process's thread is
-  `S (sleeping)` in every wait, where Linux shows some waits it cannot
-  interrupt as `D (disk sleep)`. A thread shows another process what it
-  published at its last system call or signal check, so a mask changed
-  only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen only
-  while the thread is stopped in it. A leader that ended before its other
-  threads still shows its process's descriptors and memory in its files
-  (`fd`, `maps`, `cmdline`, ...), where Linux's zombie leader has none. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with
-  nothing used.
+  threads went to sleep, as nothing preempts a guest thread, so `status` shows
+  those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`.
+  Another process's thread is `S (sleeping)` in every wait, where Linux shows
+  some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
+  process what it published at its last system call or signal check, so a mask
+  changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
+  only while the thread is stopped in it. A leader that ended before its other
+  threads still shows its process's descriptors and memory in its files (`fd`,
+  `maps`, `cmdline`, ...), where Linux's zombie leader has none. `meminfo`
+  shows the fixed 4 GiB that `sysinfo` reports, with nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
   root. `mount` mounts no `proc` filesystem and nothing on `/proc` or

@@ -130,9 +130,9 @@ impl Task {
         }
         crate::coredump::string_ranges_in(&|at, buf| self.read(at, buf), self.start_stack())
     }
-    /// The threads Linux counts for a process: a zombie still counts as one.
-    /// Its process's threads (Linux's `nr_threads`), which count a leader
-    /// that ended before the others until they all have.
+    /// Its process's threads as Linux counts them (`nr_threads`): a leader
+    /// that ended before the others counts until they all have, and a
+    /// zombie process counts as one.
     fn threads(&self) -> usize {
         if self.live() {
             let leader_gone = !self.view.group.has_member(self.pid);

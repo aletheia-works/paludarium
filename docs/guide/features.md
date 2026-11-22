@@ -4770,6 +4770,18 @@ kernel.
   "program of this type cannot use helper %s#%d" and a number that is no
   helper "invalid func %s#%d" (`EINVAL`).
 
+- `BPF_LD_ABS` and `BPF_LD_IND` load 1, 2 or 4 bytes of the packet into
+  R0, at `imm` or at the source register plus `imm`, as Linux's
+  `check_ld_abs` checks them. Their reserved fields, a destination, an
+  offset or, for `BPF_LD_ABS`, a source, are "BPF_LD_[ABS|IND] uses
+  reserved fields", checked before any path is walked as master does,
+  and 8 bytes is an unknown opcode (`EINVAL`). R6 must be written ("R6
+  !read_ok", `EACCES`) and be the context ("at the time of
+  BPF_LD_ABS|IND R6 != pointer to skb", `EINVAL`); then the source of a
+  `BPF_LD_IND` must be written, and the context in R6 must be as it came
+  ("dereference of modified ctx ptr R6 off=%d disallowed", `EACCES`).
+  R1 to R5 are not readable after one, and R0 is a number.
+
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`
   (below), and runs on each message sent to it, as
@@ -4784,7 +4796,14 @@ kernel.
   the source's lower half and compares R0's, and the old value comes back
   zero-extended; no other access to a map's value comes between its read
   and its write. A load-acquire comes back zero-extended, and a
-  store-release writes the source's lower bytes. The context is the message's `__sk_buff`: its `len`, `cb[]`
+  store-release writes the source's lower bytes. A `BPF_LD_ABS` or
+  `BPF_LD_IND` loads big-endian, as Linux's `bpf_gen_ld_abs` rewrites it
+  into a call of `bpf_skb_load_helper_8`, `_16` or `_32`: its offset is
+  an `int` (the lower half of the register plus `imm`), from the
+  message's start or, from `SKF_NET_OFF`, the network header, its start;
+  where the bytes are not in the message, or the offset is from the MAC
+  header, which is not set, or below it, the program returns 0 then and
+  there. The context is the message's `__sk_buff`: its `len`, `cb[]`
   from 0 and 0 for the fields an AF_UNIX message does not set.
   `bpf_skb_load_bytes` reads the message, and its relative form reads it
   from the network header, its start, where there is no MAC header

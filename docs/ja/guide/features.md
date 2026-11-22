@@ -4128,6 +4128,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `bpf_get_current_uid_gid` です。ソケットフィルターが呼べないヘルパーは "program of this
   type cannot use helper %s#%d"、ヘルパーでない番号は "invalid func %s#%d" です（`EINVAL`）。
 
+- `BPF_LD_ABS` と `BPF_LD_IND` は、パケットの 1、2、4 バイトを、`imm` か、ソースレジスタに
+  `imm` を足したところから R0 に読みます。Linux の `check_ld_abs` と同じに確かめます。
+  予約されたフィールド（宛先、オフセット、`BPF_LD_ABS` ではソース）は、master と同じく
+  どの経路をたどるより前に "BPF_LD_[ABS|IND] uses reserved fields" で断り、8 バイトは
+  未知のオペコードです（`EINVAL`）。R6 は書き込まれていて（"R6 !read_ok"、`EACCES`）、
+  コンテキストでなければなりません（"at the time of BPF_LD_ABS|IND R6 != pointer to skb"、
+  `EINVAL`）。その後、`BPF_LD_IND` のソースが書き込まれていること、R6 のコンテキストが
+  受け取ったままであることを確かめます（"dereference of modified ctx ptr R6 off=%d
+  disallowed"、`EACCES`）。読んだ後の R1 から R5 は読めず、R0 は数です。
+
 - ソケットフィルターは `SO_ATTACH_BPF` で、古典的なものは `SO_ATTACH_FILTER`（後述）で、
   AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の
   ソケットにアタッチし、送られてくるメッセージごとに、Linux の `sk_filter` と
@@ -4139,7 +4149,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   符号付き剰余は 0 です。32 ビットのアトミック演算は、スロットの下半分をソースの下半分で変え、
   R0 の下半分と比べます。古い値はゼロ拡張して返ります。マップの値への読みと書きの間に、
   その値へのほかのアクセスは入りません。ロードアクワイアはゼロ拡張して返り、ストアリリースは
-  ソースの下位のバイトを書きます。コンテキストはメッセージの `__sk_buff` です。`len`、0 から始まる
+  ソースの下位のバイトを書きます。`BPF_LD_ABS` と `BPF_LD_IND` は、Linux の
+  `bpf_gen_ld_abs` が `bpf_skb_load_helper_8`、`_16`、`_32` の呼び出しに書き換えるのと
+  同じく、ビッグエンディアンで読みます。オフセットは `int`（レジスタと `imm` の和の下半分）で、
+  メッセージの先頭から、`SKF_NET_OFF` からはネットワークヘッダ（メッセージの先頭）からです。
+  そのバイトがメッセージにないとき、オフセットが設定されていない MAC ヘッダからのものか
+  それより下のときは、プログラムはその場で 0 を返します。コンテキストはメッセージの `__sk_buff` です。`len`、0 から始まる
   `cb[]` があり、AF_UNIX のメッセージが設定しないフィールドは 0 です。
   `bpf_skb_load_bytes` はメッセージを読み、相対形はネットワークヘッダ（メッセージの先頭）
   から読みます。MAC ヘッダはありません（`EFAULT`）。プログラムが更新するマップは、

@@ -2021,6 +2021,125 @@ fn a_discard_drops_the_entries_of_any_shared_mapping_and_keeps_its_pages() {
     assert_eq!(b, *b"c");
 }
 
+/// A tmpfs file of `size` bytes with room for `room` pages, which takes in
+/// each page an access asks it to until it is full.
+struct Tmpfs {
+    size: u64,
+    room: usize,
+    shmem: bool,
+    held: Mutex<std::collections::BTreeSet<u64>>,
+    asked: AtomicU64,
+}
+
+impl Tmpfs {
+    fn new(size: u64, room: usize, shmem: bool) -> Arc<Self> {
+        Arc::new(Tmpfs {
+            size,
+            room,
+            shmem,
+            held: Mutex::default(),
+            asked: AtomicU64::new(0),
+        })
+    }
+    fn held(&self) -> Vec<u64> {
+        self.held.lock().unwrap().iter().copied().collect()
+    }
+}
+
+impl PageSource for Tmpfs {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let n = buf
+            .len()
+            .min(usize::try_from(self.size.saturating_sub(offset)).unwrap_or(0));
+        buf[..n].fill(0);
+        Ok(n)
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.size)
+    }
+    fn shmem(&self) -> bool {
+        self.shmem
+    }
+    fn holds(&self, offset: u64) -> bool {
+        self.held.lock().unwrap().contains(&(offset / PAGE_SIZE))
+    }
+    fn admit(&self, offset: u64) -> bool {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        let mut held = self.held.lock().unwrap();
+        held.len() < self.room && held.insert(offset / PAGE_SIZE)
+            || held.contains(&(offset / PAGE_SIZE))
+    }
+}
+
+#[test]
+fn faults_bring_shmem_pages_into_their_file_or_are_bus_errors() {
+    let m = AddressSpace::new();
+    let mut byte = [0];
+    // Shared: a read fault and a write fault each bring a page into the
+    // file, and one the file has no room for is a bus error.
+    let file = Tmpfs::new(4 * PAGE_SIZE, 2, true);
+    let source: Arc<dyn PageSource> = file.clone();
+    let pages = SharedPages::new().with_source(source);
+    let at = m
+        .map_shared(None, 4 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 4 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    m.read(at, &mut byte).unwrap();
+    m.write(GuestAddr(at.0 + PAGE_SIZE), &[1]).unwrap();
+    assert_eq!(file.held(), [0, 1]);
+    let fault = m
+        .read(GuestAddr(at.0 + 2 * PAGE_SIZE), &mut byte)
+        .unwrap_err();
+    assert!(fault.bus);
+    let fault = m.write(GuestAddr(at.0 + 3 * PAGE_SIZE), &[1]).unwrap_err();
+    assert!(fault.bus);
+    // Private: a read and a copy-on-write fault bring the file's page in
+    // too; a page with a copy of its own asks nothing more.
+    let file = Tmpfs::new(4 * PAGE_SIZE, 2, true);
+    let cache = SharedPages::new().with_source(file.clone());
+    let at = m
+        .map_shared(None, 4 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.back_with_cache(at, 4 * PAGE_SIZE, &cache, 0).unwrap();
+    m.read(at, &mut byte).unwrap();
+    m.write(GuestAddr(at.0 + PAGE_SIZE), &[1]).unwrap();
+    assert_eq!(file.held(), [0, 1]);
+    file.held.lock().unwrap().remove(&1);
+    let asked = file.asked.load(Ordering::Relaxed);
+    m.write(GuestAddr(at.0 + PAGE_SIZE + 1), &[2]).unwrap();
+    m.read(GuestAddr(at.0 + PAGE_SIZE), &mut byte).unwrap();
+    assert_eq!(byte, [1]);
+    assert_eq!(file.asked.load(Ordering::Relaxed), asked);
+    assert_eq!(file.held(), [0]);
+    // A hole of a mapping a userfaultfd registered for minor faults comes
+    // in at once, as Linux allocates it, without waiting for the page it
+    // took in.
+    let file = Tmpfs::new(2 * PAGE_SIZE, 2, true);
+    let source: Arc<dyn PageSource> = file.clone();
+    let pages = SharedPages::new().with_source(source);
+    let at = m
+        .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 2 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    m.view()
+        .userfault_register(at.0, at.0 + 2 * PAGE_SIZE, 7, Userfault::MINOR)
+        .unwrap();
+    m.read(GuestAddr(at.0 + PAGE_SIZE), &mut byte).unwrap();
+    assert_eq!(file.held(), [1]);
+    // A private mapping of a file that is not shmem's asks nothing.
+    let file = Tmpfs::new(4 * PAGE_SIZE, 0, false);
+    let cache = SharedPages::new().with_source(file.clone());
+    let at = m
+        .map_shared(None, 4 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.back_with_cache(at, 4 * PAGE_SIZE, &cache, 0).unwrap();
+    m.read(at, &mut byte).unwrap();
+    m.write(GuestAddr(at.0 + PAGE_SIZE), &[1]).unwrap();
+    assert_eq!(file.asked.load(Ordering::Relaxed), 0);
+}
+
 #[test]
 fn collapse_takes_shmem_page_caches_an_aligned_extent_at_a_time() {
     const AT: u64 = 0x4000_0000;

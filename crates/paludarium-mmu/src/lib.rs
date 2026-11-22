@@ -1644,6 +1644,32 @@ impl SharedPages {
             done += piece;
         }
     }
+    /// Changes the `size` bytes at offset `at`, which lie in one word, to
+    /// what `change` makes of them, in one compare-and-swap of the word, as
+    /// the kernel changes memory a mapping writes without it (a BPF map's
+    /// value under `BPF_ATOMIC`); `change` runs again whenever another
+    /// access came between. Gives the bytes it changed, little-endian. A page
+    /// without contents is left alone and reads as zeros, as for
+    /// [`Self::store`].
+    pub fn update(&self, at: u64, size: usize, mut change: impl FnMut(u64) -> u64) -> u64 {
+        let key = at - at % PAGE_SIZE;
+        let within = page_offset(at);
+        let frame = self.lock().get(&key).cloned();
+        let Some(bytes) = frame.as_ref().and_then(|frame| frame.get()) else {
+            return 0;
+        };
+        let word = &bytes.words[within / WORD_BYTES];
+        let shift = 8 * (within % WORD_BYTES);
+        let mask = value_mask(size);
+        let mut old = 0;
+        let _ = word.try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            old = current >> shift & mask;
+            Some(current & !(mask << shift) | (change(old) & mask) << shift)
+        });
+        // After the bytes, as in `Self::store`.
+        self.changed();
+        old
+    }
     /// Zeros `[start, end)` of the memory, as truncating or punching a hole
     /// in the file does to its page cache. The pages do not become dirty.
     pub fn zero(&self, start: u64, end: u64) {
@@ -1823,8 +1849,10 @@ pub trait PageSource: Send + Sync {
         true
     }
     /// Whether the page at `offset` may come into the file's memory, which
-    /// an access to it asks each time: `false` makes the access a bus
-    /// error (`SIGBUS`), as secretmem's fault past `RLIMIT_MEMLOCK` is.
+    /// an access to it asks each time, through a shared mapping or a
+    /// private one of a shmem file that still shows the file's page:
+    /// `false` makes the access a bus error (`SIGBUS`), as secretmem's
+    /// fault past `RLIMIT_MEMLOCK` is and shmem's past its mount's size.
     fn admit(&self, offset: u64) -> bool {
         let _ = offset;
         true
@@ -3797,12 +3825,19 @@ impl AddressSpaceData {
 
     /// Checks that `[addr, addr+len)` is accessible; returns the first
     /// faulting address otherwise.
+    /// Checks that `[addr, addr+len)` may be accessed as `access`. With
+    /// `creating`, the caller gives a page without an entry one next, so a
+    /// page its memory has to take in is asked for then
+    /// ([`PageSource::admit`]); a first look under the read lock, which
+    /// gives no entry, does not ask, or a `userfaultfd` registered for
+    /// minor faults would find the page it took in and wait for it.
     fn check(
         &self,
         directory: &Directory,
         addr: GuestAddr,
         len: usize,
         access: Access,
+        creating: bool,
     ) -> Result<(), Fault> {
         let fault = |at: u64| Fault {
             addr: GuestAddr(at),
@@ -3892,13 +3927,13 @@ impl AddressSpaceData {
                     ..fault(at)
                 });
             }
-            // A shared page its memory refuses to take in is a bus error;
-            // asked only of a page within its file, so that one past the
-            // end is never charged.
+            // A page its memory refuses to take in is a bus error; asked
+            // only of a page within its file, so that one past the end is
+            // never charged.
             if access != Access::Setup
-                && let Some(shared) = self.shared_at(page)
-                && let Some(source) = &shared.pages.source
-                && !source.admit(page.wrapping_add(shared.shift))
+                && (creating || lookup(directory, page).is_some())
+                && let Some((source, offset)) = self.admitting(directory, page)
+                && !source.admit(offset)
             {
                 return Err(Fault {
                     bus: true,
@@ -3921,6 +3956,27 @@ impl AddressSpaceData {
             }
         }
         Ok(())
+    }
+
+    /// The memory an access to the page at `page` asks to take the page in
+    /// ([`PageSource::admit`]), and the page's offset in it: a shared
+    /// mapping's, or the shmem page cache a private mapping shows where it
+    /// has no copy of its own, as Linux's `shmem_fault` brings the page
+    /// into the file for a private mapping's read and copy-on-write faults
+    /// too.
+    fn admitting(&self, directory: &Directory, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
+        if let Some(shared) = self.shared_at(page) {
+            return shared
+                .pages
+                .source
+                .as_ref()
+                .map(|source| (source, page.wrapping_add(shared.shift)));
+        }
+        let backing = self.backing_at(page)?;
+        (backing.cache.is_some()
+            && backing.source.shmem()
+            && lookup(directory, page).is_none_or(|p| p.cache))
+        .then(|| (&backing.source, page.wrapping_add(backing.shift)))
     }
 
     /// Remembers the page at `page` in this thread's [`ThreadTlb`] when an
@@ -3999,7 +4055,7 @@ impl AddressSpaceData {
         };
         {
             let directory = self.read_directory();
-            self.check(&directory, addr, buf.len(), access)?;
+            self.check(&directory, addr, buf.len(), access, false)?;
             if chunks(addr, buf.len()).all(|(page, _, _)| ready(&directory, page)) {
                 if access == Access::Fetch {
                     self.mark_fetched(&directory, addr, buf.len());
@@ -4012,7 +4068,7 @@ impl AddressSpaceData {
             }
         }
         let mut directory = self.write_directory();
-        self.check(&directory, addr, buf.len(), access)?;
+        self.check(&directory, addr, buf.len(), access, true)?;
         // A successful lazy read installs the logical zero-page entry without
         // allocating its byte frame, matching subsequent Linux fault metadata.
         for (page, _, _) in chunks(addr, buf.len()) {
@@ -4045,7 +4101,7 @@ impl AddressSpaceData {
         }
         // Again, as a truncation may have come between the check and the
         // refresh: a page it left past the end of the file is a bus error.
-        self.check(&directory, addr, buf.len(), access)?;
+        self.check(&directory, addr, buf.len(), access, true)?;
         if access == Access::Fetch {
             self.mark_fetched(&directory, addr, buf.len());
         }
@@ -4166,7 +4222,7 @@ impl AddressSpaceData {
     fn prepare_write(&self, addr: GuestAddr, len: usize, access: Access) -> Result<bool, Fault> {
         {
             let directory = self.read_directory();
-            self.check(&directory, addr, len, access)?;
+            self.check(&directory, addr, len, access, false)?;
             let ready = |page: u64| {
                 lookup(&directory, page).is_some_and(|p| {
                     !p.cow
@@ -4184,7 +4240,7 @@ impl AddressSpaceData {
             }
         }
         let mut directory = self.write_directory();
-        self.check(&directory, addr, len, access)?;
+        self.check(&directory, addr, len, access, true)?;
         for (page, _, _) in chunks(addr, len) {
             let Some(prot) = self.mapping_at(page).map(|m| m.prot) else {
                 return Err(Fault {
@@ -4260,7 +4316,7 @@ impl AddressSpaceData {
         // refresh, which read the shrinks after it: a page it left past the
         // end of the file must not take the write, in a copy that records
         // the shrink and so would stay.
-        self.check(&directory, addr, len, access)?;
+        self.check(&directory, addr, len, access, true)?;
         if let Some(page) = Self::single_page(addr, len) {
             self.remember(&directory, page);
         }
@@ -8162,12 +8218,12 @@ impl AddressSpace {
     /// Checks a syscall buffer's read permission before allocating a copy.
     pub fn check_read(&self, addr: GuestAddr, len: usize) -> Result<(), Fault> {
         let data = self.locked();
-        data.check(&data.read_directory(), addr, len, Access::Read)
+        data.check(&data.read_directory(), addr, len, Access::Read, false)
     }
     /// Checks a stack allocation's write permission without changing bytes.
     pub fn check_write(&self, addr: GuestAddr, len: usize) -> Result<(), Fault> {
         let data = self.locked();
-        data.check(&data.read_directory(), addr, len, Access::Write)
+        data.check(&data.read_directory(), addr, len, Access::Write, false)
     }
     pub fn fetch(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().fetch(addr, buf)
@@ -8618,7 +8674,7 @@ impl AddressSpace {
         let data = self.locked();
         // Checked first, so that one that faults leaves the TLBs: nothing
         // that takes no lock changes a protection.
-        data.check(&data.read_directory(), addr, size, Access::Write)?;
+        data.check(&data.read_directory(), addr, size, Access::Write, false)?;
         data.code.bump_epoch();
         let mut bytes = [0u8; 16];
         data.read(addr, &mut bytes[..size])?;

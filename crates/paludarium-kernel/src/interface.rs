@@ -332,6 +332,8 @@ impl V6 {
             metrics: NO_METRICS,
             expires: None,
             linkdown: false,
+            gateway: None,
+            onlink: false,
         }
     }
     /// Its prefix route in the main table (`addrconf_prefix_route`), which
@@ -352,6 +354,8 @@ impl V6 {
             metrics: NO_METRICS,
             expires: None,
             linkdown: false,
+            gateway: None,
+            onlink: false,
         })
     }
     fn prefix_of(&self) -> Ipv6Addr {
@@ -568,6 +572,11 @@ pub(crate) struct Route6 {
     /// `fib6_nh_init` finds it for any but a local route and
     /// `rt6_sync_down_dev` and `rt6_sync_up` change it, without a word.
     pub linkdown: bool,
+    /// Its next hop's address (`fib_nh_gw6`), which a rejecting route has
+    /// not.
+    pub gateway: Option<Ipv6Addr>,
+    /// `RTNH_F_ONLINK`: the gateway is taken to be on its device's link.
+    pub onlink: bool,
 }
 impl Route6 {
     fn covers(&self, ip: Ipv6Addr) -> bool {
@@ -1086,6 +1095,10 @@ pub(crate) struct Ask6 {
     pub metric: u32,
     pub prefsrc: Option<Ipv6Addr>,
     pub oif: u32,
+    /// Its gateway (`RTA_GATEWAY`), and whether it is on link
+    /// (`RTNH_F_ONLINK`).
+    pub gateway: Option<Ipv6Addr>,
+    pub onlink: bool,
     /// Whether the namespace has a device of `oif`.
     pub device: bool,
     /// That device's IPv6 (`inet6_dev`): `None` where it has none (a veth
@@ -1806,6 +1819,8 @@ impl Addresses {
                 metrics: NO_METRICS,
                 expires: None,
                 linkdown: false,
+                gateway: None,
+                onlink: false,
             },
             &mut events,
         );
@@ -2445,19 +2460,39 @@ impl Addresses {
         let mut told = F_EXCL;
         // `fib6_add_rt2node`: with `NLM_F_EXCL` any route of the node of
         // the same metric is there already, and `NLM_F_REPLACE` takes the
-        // first of them (none here has a gateway, so all qualify alike
-        // for ECMP); with neither, only one through the same device is
-        // the same (`rt6_duplicate_nexthop`), another device's of the
-        // prefix being another route of its node.
+        // first of them that qualifies for ECMP as the new one does; with
+        // neither, only one through the same device and gateway is the
+        // same, another of the prefix being another route of its node.
         let same_metric = |r: &Route6| {
             r.table == new.table && r.dst == new.dst && r.len == new.len && r.metric == new.metric
         };
-        let found = if asked(F_EXCL) || asked(F_REPLACE) {
+        // `rt6_qualify_for_ecmp`: a route with a gateway, which none of
+        // the kernel's has here.
+        let ecmp = |r: &Route6| r.gateway.is_some();
+        let found = if asked(F_EXCL) {
             self.routes6.iter().position(same_metric)
-        } else {
+        } else if asked(F_REPLACE) {
+            // The first that qualifies for ECMP as the new one does, else
+            // the first of them.
             self.routes6
                 .iter()
-                .position(|r| same_metric(r) && r.oif == new.oif)
+                .position(|r| same_metric(r) && ecmp(r) == ecmp(&new))
+                .or_else(|| self.routes6.iter().position(same_metric))
+        } else {
+            // `rt6_duplicate_nexthop`: the same device and gateway.
+            let found = self
+                .routes6
+                .iter()
+                .position(|r| same_metric(r) && r.oif == new.oif && r.gateway == new.gateway);
+            // Another with a gateway would take it as a sibling, which
+            // multipath routes are not here.
+            if found.is_none()
+                && ecmp(&new)
+                && self.routes6.iter().any(|r| same_metric(r) && ecmp(r))
+            {
+                return Err(EOPNOTSUPP);
+            }
+            found
         };
         if let Some(i) = found {
             if asked(F_EXCL) || !asked(F_REPLACE) {
@@ -2780,12 +2815,18 @@ impl Addresses {
             .ok_or(ESRCH)?;
         Ok(vec![Event::DelRoute4(self.routes4.remove(at))])
     }
-    /// Adds the IPv6 route `ask` asks for, as `inet6_rtm_newroute`: a
-    /// metric of 0 is 1024; `EINVAL` for a prefix past 128 or a preferred
-    /// source that is not the loopback's; `ENODEV` for a device not `lo`,
-    /// or none for a route that does not reject; `ENETDOWN` for one while
-    /// `lo` is down. Its destination is taken to its prefix's length.
-    /// Broadcast, anycast, multicast and NAT routes are `EOPNOTSUPP`.
+    /// Adds the IPv6 route `ask` asks for, as `inet6_rtm_newroute`
+    /// (`fib6_nh_init`): a metric of 0 is 1024; `EINVAL` for a prefix past
+    /// 128; `ENODEV` for a device named that is not there or has no IPv6;
+    /// for an on-link one, `ENODEV` without a device and `ENETDOWN` while
+    /// it is down. A rejecting route goes through `lo`, with no gateway;
+    /// another's gateway is checked ([`Self::gateway6`]), which finds its
+    /// device where none is named, then `ENODEV` for no device, `EACCES`
+    /// for one with IPv6 off and `ENETDOWN` for one down; `EINVAL` for a
+    /// preferred source that is not local. Its destination is taken to its
+    /// prefix's length. Broadcast, anycast, multicast and NAT routes are
+    /// `EOPNOTSUPP`, as is one that would join another of its prefix and
+    /// metric with a gateway as a sibling (ECMP).
     pub(crate) fn add_route6(&mut self, ask: &Ask6, up: bool) -> Result<Vec<Event>, Errno> {
         if ask.len > 128 {
             return Err(Errno::EINVAL);
@@ -2808,38 +2849,57 @@ impl Addresses {
         if ask.oif != 0 && (!ask.device || ask.ipv6_off.is_none()) {
             return Err(Errno::ENODEV);
         }
-        if kind.error().is_none() {
+        if ask.onlink {
             if ask.oif == 0 {
-                return Err(Errno::ENODEV);
-            }
-            // Then that it is on, then whether it is up.
-            match ask.ipv6_off {
-                None => return Err(Errno::ENODEV),
-                Some(true) => {
-                    return Err(extack::message(
-                        Errno::EACCES,
-                        "IPv6 is disabled on nexthop device",
-                    ));
-                }
-                Some(false) => {}
+                return Err(extack::message(
+                    Errno::ENODEV,
+                    "Nexthop device required for onlink",
+                ));
             }
             if !up {
                 return Err(extack::message(ENETDOWN, "Nexthop device is not up"));
             }
+        }
+        // A rejecting route takes no gateway; another's names its device
+        // where the request does not, which a route of the namespace
+        // reaches, so that it is up with IPv6 on.
+        let mut oif = ask.oif;
+        let mut gateway = None;
+        if kind.error().is_none() {
+            if let Some(via) = ask.gateway {
+                oif = self.gateway6(via, ask, table)?;
+                gateway = Some(via);
+            }
+            if oif == 0 {
+                return Err(Errno::ENODEV);
+            }
+            if ask.oif != 0 {
+                // Then that it is on, then whether it is up.
+                match ask.ipv6_off {
+                    None => return Err(Errno::ENODEV),
+                    Some(true) => {
+                        return Err(extack::message(
+                            Errno::EACCES,
+                            "IPv6 is disabled on nexthop device",
+                        ));
+                    }
+                    Some(false) => {}
+                }
+                if !up {
+                    return Err(extack::message(ENETDOWN, "Nexthop device is not up"));
+                }
+            }
+        } else {
+            // A rejecting one's is `lo` (`ip6_route_info_create`).
+            oif = LOOPBACK_OIF;
         }
         if let Some(source) = ask.prefsrc
             && !self.local6(source)
         {
             return Err(extack::message(Errno::EINVAL, "Invalid source address"));
         }
-        // Through the device asked, `lo` or a veth end (`fib6_nh_init`),
-        // `RTNH_F_LINKDOWN` where it has no carrier; a rejecting one's is
-        // `lo` (`ip6_route_info_create`).
-        let oif = if kind.error().is_none() {
-            ask.oif
-        } else {
-            LOOPBACK_OIF
-        };
+        // Through the device asked or found, `lo` or a veth end
+        // (`fib6_nh_init`), `RTNH_F_LINKDOWN` where it has no carrier.
         let route = Route6 {
             oif,
             table,
@@ -2858,9 +2918,83 @@ impl Addresses {
             linkdown: kind.error().is_none()
                 && kind != Kind::Local
                 && self.no_carrier.contains(&oif),
+            gateway,
+            onlink: ask.onlink,
         };
         let flags = self.insert6(route, Some(ask.request))?;
         Ok(vec![Event::NewRoute6(route, flags)])
+    }
+    /// The device of a route's gateway `via` (`ip6_validate_gw`), the one
+    /// `ask` names or else the one a route to it goes through; `EINVAL`,
+    /// told of, for an address of the namespace (on that device, for a
+    /// link-local one), the unspecified address or a group, an on-link
+    /// gateway the main table has a route to of a kind that is not
+    /// unicast nor rejecting, no device, or `lo`. A gateway not link-local
+    /// and not on link needs a route to it through that device, without a
+    /// gateway, that does not reject (`ip6_route_check_nh`): the table's
+    /// asked for, else the local and main tables'; `EHOSTUNREACH` for
+    /// none.
+    fn gateway6(&self, via: Ipv6Addr, ask: &Ask6, table: u32) -> Result<u32, Errno> {
+        let invalid = |text| extack::message(Errno::EINVAL, text);
+        let first = via.segments()[0];
+        let link_local = !via.is_multicast() && first & 0xffc0 == 0xfe80;
+        // `ipv6_chk_addr_and_flags`: any device's address, or a
+        // link-local one of the device's, not tentative.
+        let local = |oif: u32| {
+            self.v6.iter().any(|a| {
+                a.address == via && !a.tentative() && (!link_local || a.index.unsigned_abs() == oif)
+            })
+        };
+        let gone = invalid("Gateway can not be a local address");
+        if ask.oif != 0 && local(ask.oif) {
+            return Err(gone);
+        }
+        let mut oif = ask.oif;
+        if !link_local {
+            if via.is_unspecified() || via.is_multicast() {
+                return Err(invalid("Invalid gateway address"));
+            }
+            if ask.onlink {
+                // `ip6_route_check_nh_onlink`.
+                if let Some(found) = self.table_lookup6(TABLE_MAIN, via)
+                    && found.kind.error().is_none()
+                    && found.kind != Kind::Unicast
+                {
+                    return Err(invalid("Nexthop has invalid gateway"));
+                }
+            } else {
+                let usable = |r: &Route6| r.kind.error().is_none() && r.gateway.is_none();
+                let in_table = (ask.table != 0 && self.tables6.contains(&table))
+                    .then(|| self.lookup6_in(table, via, ask.oif))
+                    .flatten()
+                    .filter(|r| usable(r));
+                let found = match in_table {
+                    Some(found) => found,
+                    None => self
+                        .lookup6_on(via, ask.oif)
+                        .ok()
+                        .filter(|r| usable(r))
+                        .ok_or(EHOSTUNREACH)?,
+                };
+                if ask.oif == 0 {
+                    oif = found.oif;
+                } else if found.oif != ask.oif {
+                    return Err(EHOSTUNREACH);
+                }
+            }
+        }
+        if oif == 0 {
+            return Err(invalid("Egress device not specified"));
+        }
+        if oif == LOOPBACK_OIF {
+            return Err(invalid(
+                "Egress device can not be loopback device for this route",
+            ));
+        }
+        if ask.oif == 0 && local(oif) {
+            return Err(gone);
+        }
+        Ok(oif)
     }
     /// Removes the first IPv6 route of `ask`'s table to its prefix of its
     /// metric and protocol, of any kind (`ip6_route_del`): `ESRCH` for
@@ -2885,6 +3019,9 @@ impl Addresses {
                     && (ask.metric == 0 || r.metric == ask.metric)
                     && (ask.proto == 0 || r.proto == ask.proto)
                     && (ask.oif == 0 || r.oif == ask.oif)
+                    && ask
+                        .gateway
+                        .is_none_or(|g| r.gateway.unwrap_or(Ipv6Addr::UNSPECIFIED) == g)
             })
             .ok_or(ESRCH)?;
         Ok(vec![Event::DelRoute6(self.routes6.remove(at))])
@@ -3111,9 +3248,14 @@ impl Addresses {
     /// A lookup in one IPv6 table: the route of the longest prefix that has
     /// `ip`, the lowest metric first.
     fn table_lookup6(&self, table: u32, ip: Ipv6Addr) -> Option<Route6> {
+        self.lookup6_in(table, ip, 0)
+    }
+    /// The route of `table` to `ip` through the device `oif`, any for 0
+    /// (`RT6_LOOKUP_F_IFACE`): the longest prefix's, of the lowest metric.
+    fn lookup6_in(&self, table: u32, ip: Ipv6Addr, oif: u32) -> Option<Route6> {
         self.routes6
             .iter()
-            .filter(|r| r.table == table && r.covers(ip))
+            .filter(|r| r.table == table && r.covers(ip) && (oif == 0 || r.oif == oif))
             .min_by_key(|r| (Reverse(r.len), r.metric))
             .copied()
     }
@@ -3121,8 +3263,13 @@ impl Addresses {
     /// the main one's, where the first has none or a throw route; a
     /// rejecting route's error; `ENETUNREACH` for none.
     pub(crate) fn lookup6(&self, ip: Ipv6Addr) -> Result<Route6, Errno> {
+        self.lookup6_on(ip, 0)
+    }
+    /// The IPv6 route to `ip` through the device `oif`, as
+    /// [`Self::lookup6`] finds one through any for 0.
+    pub(crate) fn lookup6_on(&self, ip: Ipv6Addr, oif: u32) -> Result<Route6, Errno> {
         for table in [TABLE_LOCAL, TABLE_MAIN] {
-            if let Some(route) = self.table_lookup6(table, ip) {
+            if let Some(route) = self.lookup6_in(table, ip, oif) {
                 match route.kind.error() {
                     Some(Errno::EAGAIN) => {}
                     Some(e) => return Err(e),
@@ -3766,6 +3913,8 @@ mod tests {
             metric,
             prefsrc: None,
             oif: 1,
+            gateway: None,
+            onlink: false,
             device: true,
             ipv6_off: Some(false),
             request: 0x600,
@@ -4302,6 +4451,96 @@ mod tests {
         assert!(a.v6.iter().all(|v| v.index != 1000));
         assert!(a.routes6.iter().all(|r| r.oif != 1000));
         assert!(a.routes6.iter().any(|r| r.oif == 1001));
+    }
+    #[test]
+    fn ipv6_gateways_take_their_routes_device_and_qualify_for_ecmp() {
+        let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
+        let mut a = Addresses::first();
+        a.up(0, true);
+        let mut end = V6::new(ip6("2001:db8::1"), 64);
+        end.index = 1000;
+        a.add_v6(end, Lifetimes::FOREVER, false, true, None, 0)
+            .unwrap();
+        let mut link = V6::new(ip6("fe80::ff:fe00:a"), 64);
+        link.index = 1000;
+        a.add_v6(link, Lifetimes::FOREVER, false, true, None, 0)
+            .unwrap();
+        let ask = |via: &str, oif, onlink| Ask6 {
+            table: TABLE_MAIN,
+            dst: ip6("2001:db8:2::"),
+            len: 64,
+            kind: 1,
+            proto: 3,
+            metric: 0,
+            prefsrc: None,
+            oif,
+            gateway: Some(ip6(via)),
+            onlink,
+            device: oif != 0,
+            ipv6_off: (oif != 0).then_some(false),
+            request: 0x600,
+            metrics: Ok(NO_METRICS),
+        };
+        let error = |a: &mut Addresses, via, oif, onlink| {
+            a.add_route6(&ask(via, oif, onlink), true).map(|_| ())
+        };
+        for (via, oif) in [
+            ("ff02::1", 0),
+            ("::", 0),
+            ("2001:db8::1", 0),
+            ("2001:db8::1", 1000),
+            ("::1", 0),
+            ("fe80::ff:fe00:b", 0),
+            ("fe80::ff:fe00:b", 1),
+            ("fe80::ff:fe00:a", 1000),
+        ] {
+            assert_eq!(error(&mut a, via, oif, false), Err(Errno::EINVAL), "{via}");
+        }
+        for (via, oif) in [
+            ("2001:db8:9::1", 0),
+            ("::ffff:10.0.0.1", 0),
+            ("2001:db8::2", 1),
+        ] {
+            assert_eq!(error(&mut a, via, oif, false), Err(EHOSTUNREACH), "{via}");
+        }
+        assert_eq!(error(&mut a, "2001:db8::2", 0, true), Err(Errno::ENODEV));
+        // On link, through the device it names; else through the device
+        // of its route.
+        let events = a
+            .add_route6(&ask("2001:db8:7::1", 1000, true), true)
+            .unwrap();
+        assert!(matches!(events[..], [Event::NewRoute6(r, _)] if r.oif == 1000 && r.onlink));
+        a.del_route6(&ask("2001:db8:7::1", 1000, true)).unwrap();
+        let events = a.add_route6(&ask("2001:db8::2", 0, false), true).unwrap();
+        assert!(matches!(
+            events[..],
+            [Event::NewRoute6(r, _)] if r.oif == 1000 && r.gateway == Some(ip6("2001:db8::2"))
+        ));
+        assert_eq!(error(&mut a, "2001:db8::2", 0, false), Err(Errno::EEXIST));
+        // Another gateway of the prefix and metric would be its sibling.
+        let mut other = ask("fe80::ff:fe00:b", 1000, false);
+        other.request = 0x400;
+        assert_eq!(a.add_route6(&other, true).map(|_| ()), Err(EOPNOTSUPP));
+        // A gateway's route does not reach another gateway.
+        let mut further = ask("2001:db8:2::2", 0, false);
+        further.dst = ip6("2001:db8:6::");
+        assert_eq!(a.add_route6(&further, true).map(|_| ()), Err(EHOSTUNREACH));
+        other.request = 0x100;
+        a.add_route6(&other, true).unwrap();
+        let route = a.lookup6(ip6("2001:db8:2::2")).unwrap();
+        assert_eq!(route.gateway, Some(ip6("fe80::ff:fe00:b")));
+        // A removal naming another gateway finds none.
+        assert_eq!(
+            a.del_route6(&ask("2001:db8::2", 0, false)).map(|_| ()),
+            Err(ESRCH)
+        );
+        a.del_route6(&ask("fe80::ff:fe00:b", 0, false)).unwrap();
+        // Strictly through a device, a lookup takes only its routes.
+        assert_eq!(
+            a.lookup6_on(ip6("2001:db8::2"), 1).map(|_| ()),
+            Err(ENETUNREACH)
+        );
+        assert_eq!(a.lookup6_on(ip6("2001:db8::2"), 1000).unwrap().oif, 1000);
     }
     #[test]
     fn a_veth_ends_ipv6_neighbours_and_sources_follow_neighbour_discovery() {

@@ -3,12 +3,16 @@
 //! `PERF_RECORD_SAMPLE` of the fields `sample_type` asks for in Linux's
 //! order, a full buffer's lost samples and the `PERF_RECORD_LOST` after
 //! them, `PERF_EVENT_IOC_PAUSE_OUTPUT`, a read-only buffer that overwrites,
-//! a backward one, and a user callchain. The expected values are Linux's
+//! a backward one, and a user callchain; and the wakeups of a buffer, the
+//! `O_ASYNC` signals of each overflow, `PERF_EVENT_IOC_REFRESH` and
+//! `sigtrap`'s `SIGTRAP`. The expected values are Linux's
 //! (`kernel/events/core.c`, `ring_buffer.c`): they are the lines of the
-//! perf-sample case of `tests/guests/processes/perf.c`, which the
-//! differential tests compare with Linux. The guest's writes to fresh pages
-//! are this test's writes to them, which the next system call counts as
-//! the thread's faults, as the guest's do.
+//! perf-sample and perf-wakeup cases of `tests/guests/processes/perf.c`,
+//! which the differential tests compare with Linux. The guest's writes to
+//! fresh pages are this test's writes to them, which the next system call
+//! counts as the thread's faults, as the guest's do; a signal its handlers
+//! take is this test's look at the frame the kernel builds, then the
+//! handler's return through `rt_sigreturn`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use paludarium_mmu::{MappingKind, Prot};
@@ -25,6 +29,34 @@ const MMAP: u64 = 9;
 const MUNMAP: u64 = 11;
 const IOCTL: u64 = 16;
 const PERF_EVENT_OPEN: u64 = 298;
+const POLL: u64 = 7;
+const RT_SIGACTION: u64 = 13;
+const RT_SIGPROCMASK: u64 = 14;
+const RT_SIGRETURN: u64 = 15;
+const GETPID: u64 = 39;
+const FCNTL: u64 = 72;
+const RT_SIGTIMEDWAIT: u64 = 128;
+
+/// Where the guest's handlers are: never run, but taken as the guest's
+/// `on_io` and `on_trap` when a signal returns to it.
+const HANDLER: u64 = 0x40_1000;
+const SA_SIGINFO: u64 = 4;
+const SA_RESTORER: u64 = 0x0400_0000;
+const SIG_BLOCK: u64 = 0;
+const SIG_SETMASK: u64 = 2;
+const SIGTRAP: u64 = 5;
+/// musl's `SIGRTMIN`.
+const SIGRTMIN: u64 = 35;
+const TRAP_PERF: i32 = 6;
+const POLL_IN: i32 = 1;
+const POLL_HUP: i32 = 6;
+const POLLIN: u64 = 1;
+const POLLRDNORM: u64 = 0x40;
+const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
+const F_SETOWN: u64 = 8;
+const F_SETSIG: u64 = 10;
+const O_ASYNC: u64 = 0x2000;
 
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
@@ -32,6 +64,10 @@ const MAP_SHARED: u64 = 1;
 const MAP_PRIVATE_ANONYMOUS: u64 = 0x22;
 
 const DISABLED: u64 = 1 << 0;
+const INHERIT: u64 = 1 << 1;
+const WATERMARK: u64 = 1 << 14;
+const REMOVE_ON_EXEC: u64 = 1 << 36;
+const ATTR_SIGTRAP: u64 = 1 << 37;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 const EXCLUDE_HV: u64 = 1 << 6;
 const SAMPLE_ID_ALL: u64 = 1 << 18;
@@ -47,6 +83,7 @@ const FORMAT_LOST: u64 = 1 << 4;
 
 const IOC_ENABLE: u64 = 0x2400;
 const IOC_DISABLE: u64 = 0x2401;
+const IOC_REFRESH: u64 = 0x2402;
 const IOC_ID: u64 = 0x8008_2407;
 const IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
 const RECORD_LOST: u32 = 2;
@@ -61,8 +98,10 @@ struct Attr {
     sample_type: u64,
     read_format: u64,
     flags: u64,
+    wakeup_events: u32,
     sample_max_stack: u16,
     aux_action: u32,
+    sig_data: u64,
 }
 
 impl Attr {
@@ -88,8 +127,10 @@ impl Attr {
         ] {
             b[at..at + 8].copy_from_slice(&v.to_le_bytes());
         }
+        b[48..52].copy_from_slice(&self.wakeup_events.to_le_bytes());
         b[108..110].copy_from_slice(&self.sample_max_stack.to_le_bytes());
         b[116..120].copy_from_slice(&self.aux_action.to_le_bytes());
+        b[120..128].copy_from_slice(&self.sig_data.to_le_bytes());
         b
     }
 }
@@ -101,6 +142,21 @@ struct Env {
     t: Thread,
     m: AddressSpace,
     lines: Vec<String>,
+    /// What the guest's handlers saw: `on_io`'s and `on_trap`'s counts.
+    caught: Caught,
+}
+
+/// The guest's `io_count`, `io_in`, `io_hup`, `io_alike`, `io_fd`,
+/// `trap_count` and `trap_alike`.
+#[derive(Default)]
+struct Caught {
+    io_count: u32,
+    io_in: u32,
+    io_hup: u32,
+    io_alike: bool,
+    io_fd: i64,
+    trap_count: u32,
+    trap_alike: bool,
 }
 
 impl Env {
@@ -124,6 +180,7 @@ impl Env {
             t,
             m,
             lines: Vec::new(),
+            caught: Caught::default(),
         }
     }
 
@@ -139,7 +196,83 @@ impl Env {
         t.cpu.gpr[reg::R9] = a[5];
         self.k
             .handle(t, &self.m, ExitReason::Syscall { rip: t.cpu.rip });
-        t.cpu.gpr[reg::RAX] as i64
+        // A signal the call returns to runs the guest's handler, which
+        // returns through the restorer's rt_sigreturn.
+        while self.t.cpu.rip == GuestAddr(HANDLER) {
+            let number = self.t.cpu.gpr[reg::RDI];
+            let mut info = [0; 40];
+            self.m
+                .read(GuestAddr(self.t.cpu.gpr[reg::RSI]), &mut info)
+                .unwrap();
+            self.handler(number, &info);
+            let t = &mut self.t;
+            t.cpu.gpr[reg::RSP] += 8;
+            t.cpu.gpr[reg::RAX] = RT_SIGRETURN;
+            self.k
+                .handle(t, &self.m, ExitReason::Syscall { rip: t.cpu.rip });
+        }
+        self.t.cpu.gpr[reg::RAX] as i64
+    }
+
+    /// The guest's `on_io` and `on_trap`.
+    fn handler(&mut self, number: u64, info: &[u8; 40]) {
+        let int = |at: usize| i32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+        let long = |at: usize| u64::from_le_bytes(info[at..at + 8].try_into().unwrap());
+        let c = &mut self.caught;
+        let code = int(8);
+        if number == SIGRTMIN {
+            c.io_count += 1;
+            c.io_in += u32::from(code == POLL_IN);
+            c.io_hup += u32::from(code == POLL_HUP);
+            c.io_alike &= i64::from(int(24)) == c.io_fd
+                && (code == POLL_HUP || long(16) == POLLIN | POLLRDNORM);
+        } else {
+            assert_eq!(number, SIGTRAP);
+            c.trap_count += 1;
+            c.trap_alike &= code == TRAP_PERF && long(24) == 0x1234 && int(32) == 1 && int(36) == 0;
+        }
+    }
+
+    /// `sigaction` of the guest's handler for `number`, `SA_SIGINFO`.
+    fn catch(&mut self, number: u64) {
+        let mut act = [0u8; 32];
+        act[0..8].copy_from_slice(&HANDLER.to_le_bytes());
+        act[8..16].copy_from_slice(&(SA_SIGINFO | SA_RESTORER).to_le_bytes());
+        self.m.write(GuestAddr(ARG), &act).unwrap();
+        assert_eq!(self.call(RT_SIGACTION, [number, ARG, 0, 8, 0, 0]), 0);
+    }
+
+    /// The guest's `polled`: what `poll` gives for `POLLIN`, at once.
+    fn polled(&mut self, fd: i64) -> i64 {
+        let mut p = [0u8; 8];
+        p[0..4].copy_from_slice(&(fd as i32).to_le_bytes());
+        p[4..6].copy_from_slice(&1u16.to_le_bytes());
+        self.m.write(GuestAddr(ARG), &p).unwrap();
+        if self.call(POLL, [ARG, 1, 0, 0, 0, 0]) < 0 {
+            return -1;
+        }
+        self.m.read(GuestAddr(ARG), &mut p).unwrap();
+        i64::from(i16::from_le_bytes([p[6], p[7]]))
+    }
+
+    fn fcntl(&mut self, fd: i64, command: u64, arg: u64) -> i64 {
+        self.call(FCNTL, [fd as u64, command, arg, 0, 0, 0])
+    }
+
+    /// The guest's `own_signals`: signal-driven I/O to this process with
+    /// SIGRTMIN.
+    fn own_signals(&mut self, fd: i64) {
+        self.catch(SIGRTMIN);
+        let pid = self.call(GETPID, [0; 6]) as u64;
+        self.fcntl(fd, F_SETOWN, pid);
+        self.fcntl(fd, F_SETSIG, SIGRTMIN);
+        let flags = self.fcntl(fd, F_GETFL, 0) as u64;
+        self.fcntl(fd, F_SETFL, flags | O_ASYNC);
+        self.caught.io_fd = fd;
+        self.caught.io_count = 0;
+        self.caught.io_in = 0;
+        self.caught.io_hup = 0;
+        self.caught.io_alike = true;
     }
 
     fn say(&mut self, line: String) {
@@ -445,6 +578,147 @@ fn perf_sample_records_faults_loses_pauses_and_writes_backward() {
             "max stack 127 fd",
             "aux start paused pause resume -22",
             "aux start paused -95",
+        ],
+    );
+}
+
+/// perf-wakeup up to its child: poll without a buffer and with one,
+/// `wakeup_events` and `wakeup_watermark`, `O_ASYNC` signals of each
+/// overflow, `PERF_EVENT_IOC_REFRESH`, and `sigtrap`'s `SIGTRAP`, taken
+/// and blocked. The child whose event hangs up when it ends stays with the
+/// differential tests.
+#[test]
+fn perf_wakeup_polls_signals_refreshes_and_traps() {
+    let mut e = Env::new();
+    // Without a buffer, poll finds the event hung up.
+    let fd = e.open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
+    let r = e.polled(fd);
+    e.say(format!("no buffer {r}"));
+    let page = e.map(fd, 2, PROT_READ | PROT_WRITE);
+    let r = e.polled(fd);
+    e.say(format!("empty {r}"));
+    e.unmap(page, 2);
+    e.close(fd);
+    // Each wakeup_events-th sample makes it readable once.
+    let mut a = Attr::software(2);
+    a.sample_period = 1;
+    a.sample_type = SAMPLE_TID | SAMPLE_PERIOD;
+    a.flags |= DISABLED;
+    a.wakeup_events = 1;
+    let fd = e.open(&a);
+    let page = e.map(fd, 2, PROT_READ | PROT_WRITE);
+    e.faults_while_enabled(fd, 1);
+    let (first, second) = (e.polled(fd), e.polled(fd));
+    e.say(format!("wakeup events: readable {first} then {second}"));
+    e.unmap(page, 2);
+    e.close(fd);
+    // With watermark, once wakeup_watermark bytes are written.
+    a.flags |= WATERMARK;
+    a.wakeup_events = 4 * 24;
+    let fd = e.open(&a);
+    let page = e.map(fd, 2, PROT_READ | PROT_WRITE);
+    e.faults_while_enabled(fd, 6);
+    let first = e.polled(fd);
+    let past = e.head(page) > 96;
+    e.say(format!(
+        "watermark: readable {first} head>96 {}",
+        past as i32
+    ));
+    e.unmap(page, 2);
+    e.close(fd);
+    // O_ASYNC signals each overflow, with or without a buffer.
+    let fd = e.open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
+    e.own_signals(fd);
+    e.faults_while_enabled(fd, 3);
+    let c = &e.caught;
+    let line = format!(
+        "signals>=3 {} in {} alike {} hup {}",
+        (c.io_count >= 3) as i32,
+        (c.io_in == c.io_count) as i32,
+        c.io_alike as i32,
+        c.io_hup
+    );
+    e.say(line);
+    let flags = e.fcntl(fd, F_GETFL, 0) as u64;
+    e.fcntl(fd, F_SETFL, flags & !O_ASYNC);
+    e.caught.io_count = 0;
+    e.faults_while_enabled(fd, 2);
+    let line = format!("off {}", e.caught.io_count);
+    e.say(line);
+    e.close(fd);
+    // REFRESH allows that many overflows, the last hanging up.
+    let fd = e.open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
+    let page = e.map(fd, 2, PROT_READ | PROT_WRITE);
+    e.own_signals(fd);
+    let refreshed = e.ioctl(fd, IOC_REFRESH, 2);
+    e.touch(5);
+    e.ioctl(fd, IOC_ID, ARG);
+    let records = e.head(page) / 24;
+    let c = &e.caught;
+    let line = format!(
+        "refresh {refreshed}: signals {} in {} hup {} records {records}",
+        c.io_count, c.io_in, c.io_hup
+    );
+    e.say(line);
+    e.touch(2);
+    e.ioctl(fd, IOC_ID, ARG);
+    let line = format!("after: signals {}", e.caught.io_count);
+    e.say(line);
+    let counting = e.open(&Attr::software(2));
+    let r = e.ioctl(counting, IOC_REFRESH, 1);
+    e.say(format!("refresh counting {r}"));
+    let mut inherited = Attr::software(2);
+    inherited.sample_period = 1;
+    inherited.flags |= INHERIT;
+    let inherited = e.open(&inherited);
+    let r = e.ioctl(inherited, IOC_REFRESH, 1);
+    e.say(format!("refresh inherit {r}"));
+    e.unmap(page, 2);
+    e.close(fd);
+    // sigtrap: SIGTRAP of TRAP_PERF with sig_data and the type.
+    e.catch(SIGTRAP);
+    let mut a = Attr::software(2);
+    a.sample_period = 1;
+    a.flags |= DISABLED | ATTR_SIGTRAP | REMOVE_ON_EXEC;
+    a.sig_data = 0x1234;
+    let fd = e.open(&a);
+    e.caught.trap_alike = true;
+    e.faults_while_enabled(fd, 2);
+    let c = &e.caught;
+    let line = format!(
+        "sigtrap>=1 {} alike {}",
+        (c.trap_count >= 1) as i32,
+        c.trap_alike as i32
+    );
+    e.say(line);
+    // Blocked, it waits, flagged as late.
+    let (set, old, info, none) = (ARG + 0x40, ARG + 0x48, ARG + 0x80, ARG + 0x50);
+    e.m.write(GuestAddr(set), &(1u64 << (SIGTRAP - 1)).to_le_bytes())
+        .unwrap();
+    e.m.write(GuestAddr(none), &[0; 16]).unwrap();
+    assert_eq!(e.call(RT_SIGPROCMASK, [SIG_BLOCK, set, old, 8, 0, 0]), 0);
+    e.faults_while_enabled(fd, 1);
+    let got = e.call(RT_SIGTIMEDWAIT, [set, info, none, 8, 0, 0]);
+    let code = e.long(info + 8) as u32;
+    let late = (e.long(info + 32) >> 32) as u32;
+    e.say(format!("blocked {got} code {code} async {late}"));
+    assert_eq!(e.call(RT_SIGPROCMASK, [SIG_SETMASK, old, 0, 8, 0, 0]), 0);
+    e.close(fd);
+    check(
+        &e.lines,
+        &[
+            "no buffer 16",
+            "empty 0",
+            "wakeup events: readable 1 then 0",
+            "watermark: readable 1 head>96 1",
+            "signals>=3 1 in 1 alike 1 hup 0",
+            "off 0",
+            "refresh 0: signals 2 in 1 hup 1 records 2",
+            "after: signals 2",
+            "refresh counting -22",
+            "refresh inherit -22",
+            "sigtrap>=1 1 alike 1",
+            "blocked 5 code 6 async 1",
         ],
     );
 }

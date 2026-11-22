@@ -2978,6 +2978,40 @@ fn memfd_shared_mapping_and_the_write_seal() {
     assert_eq!(f.ret(10, &[at, 4096, 3]), errno(Errno::EACCES));
 }
 #[test]
+fn memfd_pages_faults_bring_in_count_in_its_blocks() {
+    let mut f = fixture();
+    let (name, stat) = (DATA + 0x100, DATA + 0x200);
+    f.mem.write(GuestAddr(name), b"faults\0").unwrap();
+    let fd = f.ret(319, &[name, 0]);
+    assert!(fd < 1 << 32);
+    assert_eq!(f.ret(77, &[fd, 4 * 4096]), 0);
+    let blocks = |f: &mut Fixture| {
+        assert_eq!(f.ret(5, &[fd, stat]), 0);
+        f.mem.read_u64(GuestAddr(stat + 64)).unwrap()
+    };
+    assert_eq!(blocks(&mut f), 0);
+    // A shared mapping's read fault and write fault, a page each.
+    let mmap = syscalls::nr::MMAP;
+    let shared = f.ret(mmap, &[0, 4 * 4096, 3, 1, fd, 0]);
+    let mut byte = [0];
+    f.mem.read(GuestAddr(shared), &mut byte).unwrap();
+    assert_eq!(blocks(&mut f), 8);
+    f.mem.write(GuestAddr(shared + 4096), b"x").unwrap();
+    assert_eq!(blocks(&mut f), 16);
+    // A private mapping's read fault and copy-on-write fault bring the
+    // file's page in too; a page the file holds costs nothing more.
+    let private = f.ret(mmap, &[0, 4 * 4096, 3, 2, fd, 0]);
+    f.mem
+        .read(GuestAddr(private + 2 * 4096), &mut byte)
+        .unwrap();
+    assert_eq!(blocks(&mut f), 24);
+    f.mem.write(GuestAddr(private + 3 * 4096), b"y").unwrap();
+    assert_eq!(blocks(&mut f), 32);
+    f.mem.write(GuestAddr(private), b"z").unwrap();
+    assert_eq!(blocks(&mut f), 32);
+    assert_eq!(memory_bytes(&f, shared + 3 * 4096, 1), [0]);
+}
+#[test]
 fn memfd_secret_maps_shared_only_and_refuses_reads_and_writes() {
     let mut f = fixture();
     let (einval, espipe, eopnotsupp) = (

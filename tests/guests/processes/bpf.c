@@ -20,6 +20,12 @@
    which maps fit it, the IDs a lookup gives, an inner map kept after its
    descriptor closes and given up on delete, the flags, the batch
    commands and the room they take.
+   bpf-mmap: mmap of BPF_F_MMAPABLE arrays, whose mappings show the values
+   the system calls read and write: which maps, descriptors, protections
+   and ranges map, the flags of the VMA (/proc/self/smaps), what a frozen
+   map and BPF_F_RDONLY_PROG allow, the freeze a mapping that writes holds
+   off, a child's included, and the map a mapping keeps after its
+   descriptor closes.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -42,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1561,6 +1568,144 @@ static int case_maps(void) {
     return 0;
 }
 
+/* What mmap of a map gives: 0, or the error. */
+static long map_mmap(int fd, size_t len, int prot, int flags, off_t offset) {
+    void *at = mmap(NULL, len, prot, flags, fd, offset);
+    if (at == MAP_FAILED) return -errno;
+    munmap(at, len);
+    return 0;
+}
+
+static long freeze_map(int fd) {
+    union attr a;
+    memset(&a, 0, sizeof a);
+    a.elem.map_fd = (uint32_t)fd;
+    return bpf(MAP_FREEZE, &a, sizeof a);
+}
+
+/* The protections, offset and name of the maps line at `at`, and the
+   VmFlags smaps gives it. */
+static void vma(const char *name, void *at) {
+    char line[512], perms[8] = "", path[128] = "";
+    unsigned long start, end, offset;
+    int found = 0;
+    FILE *smaps = fopen("/proc/self/smaps", "r");
+    if (!smaps) {
+        say("%s no smaps", name);
+        return;
+    }
+    while (fgets(line, sizeof line, smaps)) {
+        if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %127s", &start, &end, perms, &offset, path) >= 4
+            && strchr(line, '-') < strchr(line, ' ')) {
+            found = start == (uintptr_t)at;
+            if (found) printf("%s %s %lx %lu %s\n", name, perms, offset, (end - start) / 4096, path);
+        } else if (found && !strncmp(line, "VmFlags:", 8)) {
+            printf("%s %s", name, line);
+            found = 0;
+        }
+    }
+    fclose(smaps);
+    fflush(stdout);
+}
+
+static int case_mmap(void) {
+    /* 300 values of 12 bytes, 16 apart: 4800 bytes, two pages. */
+    int fd = make(TYPE_ARRAY, 4, 12, 300, F_MMAPABLE);
+    uint32_t key = 1;
+    unsigned char value[12], back[12];
+    for (int i = 0; i < 12; i++) value[i] = (unsigned char)(i + 1);
+    say("update %ld", elem(MAP_UPDATE_ELEM, fd, &key, value, ANY));
+    unsigned char *m = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        say("mmap %d", -errno);
+        return 1;
+    }
+    say("mapped value 1: %d %d %d, padding %d, value 0 %d", m[16], m[17], m[27], m[28], m[0]);
+    memcpy(m + 32, "abcdefghijkl", 12);
+    m[299 * 16] = 99;
+    key = 2;
+    long r = elem(MAP_LOOKUP_ELEM, fd, &key, back, 0);
+    say("lookup 2 %ld %.12s", r, (char *)back);
+    key = 299;
+    r = elem(MAP_LOOKUP_ELEM, fd, &key, back, 0);
+    say("lookup 299 %ld %d", r, back[0]);
+    key = 3;
+    value[0] = 77;
+    r = elem(MAP_UPDATE_ELEM, fd, &key, value, ANY);
+    say("update 3 %ld, seen %d", r, m[48]);
+    vma("rw", m);
+    say("mprotect exec %d", mprotect(m, 4096, PROT_READ | PROT_EXEC) ? -errno : 0);
+    say("mremap grow %d", mremap(m, 8192, 12288, 0) == MAP_FAILED ? -errno : 0);
+    say("freeze mapped %ld", freeze_map(fd));
+    /* A child's copy of the mapping holds the freeze off too. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 1;
+    pid_t child = fork();
+    if (child == 0) {
+        char c;
+        m[64] = 5;
+        if (write(ready[1], "x", 1) != 1 || read(go[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    char c;
+    if (read(ready[0], &c, 1) != 1) return 1;
+    say("child wrote %d", m[64]);
+    munmap(m, 8192);
+    say("freeze with the child's %ld", freeze_map(fd));
+    if (write(go[1], "x", 1) != 1) return 1;
+    int status;
+    waitpid(child, &status, 0);
+    long frozen = freeze_map(fd);
+    say("freeze %ld, again %ld", frozen, freeze_map(fd));
+    say("frozen: rw %ld, r %ld", map_mmap(fd, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, 0),
+        map_mmap(fd, 4096, PROT_READ, MAP_SHARED, 0));
+    unsigned char *r_only = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    if (r_only == MAP_FAILED) return 1;
+    say("read only %d, mprotect write %d", r_only[48],
+        mprotect(r_only, 4096, PROT_READ | PROT_WRITE) ? -errno : 0);
+    vma("r", r_only);
+    munmap(r_only, 4096);
+    close(fd);
+
+    /* Which descriptors, protections and ranges map. */
+    fd = make(TYPE_ARRAY, 4, 12, 300, F_MMAPABLE);
+    say("whole %ld, second page %ld, past %ld, three pages %ld, one byte %ld",
+        map_mmap(fd, 8192, PROT_READ, MAP_SHARED, 0), map_mmap(fd, 4096, PROT_READ, MAP_SHARED, 4096),
+        map_mmap(fd, 4096, PROT_READ, MAP_SHARED, 8192), map_mmap(fd, 12288, PROT_READ, MAP_SHARED, 0),
+        map_mmap(fd, 1, PROT_READ, MAP_SHARED, 0));
+    say("private %ld, exec %ld, none %ld", map_mmap(fd, 4096, PROT_READ, MAP_PRIVATE, 0),
+        map_mmap(fd, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, 0), map_mmap(fd, 4096, PROT_NONE, MAP_SHARED, 0));
+    uint32_t id = id_of(fd);
+    int ro = (int)fd_by_id(id, F_RDONLY), wo = (int)fd_by_id(id, F_WRONLY);
+    say("read-only fd: r %ld, rw %ld; write-only fd: r %ld, w %ld",
+        map_mmap(ro, 4096, PROT_READ, MAP_SHARED, 0), map_mmap(ro, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, 0),
+        map_mmap(wo, 4096, PROT_READ, MAP_SHARED, 0), map_mmap(wo, 4096, PROT_WRITE, MAP_SHARED, 0));
+    close(ro);
+    close(wo);
+    /* The mapping keeps the map after its descriptor closes. */
+    m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) return 1;
+    close(fd);
+    m[16] = 42;
+    fd = (int)fd_by_id(id, 0);
+    key = 1;
+    r = elem(MAP_LOOKUP_ELEM, fd, &key, back, 0);
+    say("after close: fd %d, lookup %ld %d", fd >= 0, r, back[0]);
+    munmap(m, 4096);
+    close(fd);
+
+    int plain = make(TYPE_ARRAY, 4, 8, 4, 0), hash = make(TYPE_HASH, 4, 8, 4, 0);
+    int prog_ro = make(TYPE_ARRAY, 4, 8, 4, F_MMAPABLE | F_RDONLY_PROG);
+    say("not mappable %ld, hash %ld, read-only for programs: rw %ld, r %ld",
+        map_mmap(plain, 4096, PROT_READ, MAP_SHARED, 0), map_mmap(hash, 4096, PROT_READ, MAP_SHARED, 0),
+        map_mmap(prog_ro, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, 0),
+        map_mmap(prog_ro, 4096, PROT_READ, MAP_SHARED, 0));
+    close(plain);
+    close(hash);
+    close(prog_ro);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1575,5 +1720,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-lpm")) return case_lpm();
     if (!strcmp(mode, "bpf-maps")) return case_maps();
     if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
+    if (!strcmp(mode, "bpf-mmap")) return case_mmap();
     return 2;
 }

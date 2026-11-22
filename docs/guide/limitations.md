@@ -456,8 +456,10 @@ verified.
   `BPF_F_RDONLY` with `BPF_F_WRONLY` is refused once the map is made (7.0
   refuses it before the NUMA node and the type, so another error may come
   first here). Map IDs are the emulated machine's, so they
-  start at 1 and do not see the host's maps. `BPF_F_MMAPABLE` is taken but `mmap` of a map
-  is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
+  start at 1 and do not see the host's maps. A map's SHA-256
+  (`bpf_map_info.hash`) is `EINVAL`. A map's descriptor (`fstat`) and its
+  mappings (`/proc/<pid>/maps`) show inode 0, where Linux numbers the
+  anonymous inode they share.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its
@@ -558,7 +560,10 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`). Linux's
+  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`), a file
+    of the in-memory file system's tmpfs mounts too, which is not yet
+    taken for shmem's here (nor by `userfaultfd`), where Linux collapses
+    it as shmem. Linux's
     rules for them changed after v6.12, which collapses only a file nobody
     has open for writing (`READ_ONLY_THP_FOR_FS`), where later kernels take
     any file on a file system with large folios. The result also depends
@@ -833,13 +838,16 @@ verified.
   shared with the host's. `propagate_from:` is found from the namespace's
   root, not the reader's after `chroot`. `MS_RDONLY` (`EROFS`), `noexec`,
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
-  `nr_blocks` and `nr_inodes`, but not for what a mapping writes (a write
-  fault past the size is no `SIGBUS`, and the pages go back to the file
-  whatever its size; nor are the pages a fault brings into a tmpfs file
-  or a memfd counted in its blocks, which only `MADV_COLLAPSE` charges
-  for the holes it fills), and its extended attributes take none of the inodes'
-  room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
-  counts them, does not happen); the root from start-up has no limit but
+  `nr_blocks` and `nr_inodes`, but not for what a mapping writes: a file
+  on such a mount is not yet taken for shmem's (nor by `userfaultfd`), so a
+  fault brings nothing into it, a write fault past the size is no
+  `SIGBUS`, and the pages go back to the file whatever its size, counting
+  in its blocks only then. A memfd's pages count once a fault brings them
+  in, as `shmem_fault` charges them, but those `MAP_POPULATE`,
+  `MAP_LOCKED` or a lock would bring into a shared mapping of one only
+  once touched. Its extended attributes take none of the inodes' room
+  (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set` counts
+  them, does not happen); the root from start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime
   flags, `sync`, `dirsync` and `mand`; no mount here holds a
   device node but a host directory's (`mknod` of one is `EPERM`), so
@@ -1027,9 +1035,12 @@ verified.
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
   across a pair to an address of the peer's namespace; it takes IPv6
   addresses, makes its link-local one and its routes, and takes IPv6
-  routes a request adds without a gateway, and IPv6's TCP and UDP and its
-  neighbours, but no proxy entry, no route through a gateway and no IPv6
-  route lookup in through it (`RTA_IIF`), each `EOPNOTSUPP`. A link-local
+  routes a request adds, with a gateway too, and IPv6's TCP and UDP and
+  its neighbours, but no proxy entry and no IPv4 route through a gateway,
+  each `EOPNOTSUPP`. An IPv6 gateway's neighbour state does not steer a
+  lookup, as Linux's `rt6_check_neigh` does among routes of one metric,
+  and two routes with gateways of one metric, which Linux makes
+  multipath siblings, are `EOPNOTSUPP` for now. A link-local
   destination's scope ID is not taken: the first route to it is. A
   connect without one to it, or a UDP one to a group of the node or the
   link, is `EINVAL`, as Linux's is with no device bound and no multicast
@@ -1114,7 +1125,7 @@ verified.
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
   A
-  route goes through `lo`, a veth end (without a gateway) or rejects: IPv6 gateways, multipath routes,
+  route goes through `lo`, a veth end (for IPv4 without a gateway) or rejects: multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup

@@ -722,10 +722,21 @@ impl paludarium_mmu::PageSource for FilePages {
     fn open_file(&self) -> usize {
         Arc::as_ptr(&self.file).cast::<()>() as usize
     }
+    /// A `memfd_secret` page charges its creator; a page of a shmem file (a
+    /// memfd) that neither the file nor its page cache holds yet becomes
+    /// the file's own, as `shmem_fault` allocates and charges its folio for
+    /// a read fault too, and a failure to (`ENOSPC`) makes the fault a
+    /// `SIGBUS`. A page the cache has is one Linux's page cache has, so
+    /// charged already: one a `userfaultfd` filled reaches the file when it
+    /// is written back.
     fn admit(&self, offset: u64) -> bool {
-        self.charge
-            .as_ref()
-            .is_none_or(|charge| charge.admit(offset))
+        if let Some(charge) = &self.charge {
+            return charge.admit(offset);
+        }
+        !self.shmem()
+            || self.holds(offset)
+            || self.cache.pages.contains(offset)
+            || self.file.allocate(offset, PAGE_SIZE).is_ok()
     }
     fn secret(&self) -> bool {
         self.secret

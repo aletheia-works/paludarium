@@ -1269,3 +1269,217 @@ fn an_lpm_trie_finds_the_longest_prefix_and_walks_its_keys_in_linux_s_order() {
         [key([10, 9, 9, 9], 8), key([192, 168, 128, 0], 24)]
     );
 }
+
+const MMAP: u64 = 9;
+const MPROTECT: u64 = 10;
+const MUNMAP: u64 = 11;
+const MAP_SHARED: u64 = 1;
+const MAP_PRIVATE: u64 = 2;
+const PROT_READ: u64 = 1;
+const PROT_WRITE: u64 = 2;
+const PROT_EXEC: u64 = 4;
+
+/// `mmap` of `[fd, len, prot, flags, offset]` at an address of the
+/// kernel's choice.
+fn mmap(
+    k: &mut Kernel,
+    t: &mut Thread,
+    m: &AddressSpace,
+    [fd, len, prot, flags, offset]: [u64; 5],
+) -> u64 {
+    syscall(k, t, m, MMAP, [0, len, prot, flags, fd, offset])
+}
+
+#[test]
+fn a_mappable_arrays_mapping_shows_its_values() {
+    let (mut k, mut t, m) = setup();
+    // A VMA's open and close reach the map only from a thread the kernel
+    // runs, as Linux's `current`.
+    k.enter_thread(t.tid);
+    // 300 values of 12 bytes, 16 apart: two pages.
+    let fd = make(&mut k, &mut t, &m, map(ARRAY, 4, 12, 300, F_MMAPABLE));
+    let key = Some(&[1u8, 0, 0, 0][..]);
+    assert_eq!(
+        elem(&mut k, &mut t, &m, MAP_UPDATE_ELEM, fd, key, Some(&[7; 12])),
+        0
+    );
+    let at = mmap(
+        &mut k,
+        &mut t,
+        &m,
+        [fd, 2 * PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, 0],
+    );
+    assert!(at < u64::MAX - 4095, "mmap: {at:#x}");
+    let mut seen = [0; 16];
+    m.read(GuestAddr(at + 16), &mut seen).unwrap();
+    assert_eq!(seen, [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 0, 0, 0, 0]);
+    // `/proc/<pid>/maps` shows the device and inode the descriptor's
+    // `fstat` gives.
+    let vma = m.view().vma_from(at).unwrap();
+    assert_eq!(vma.start, at);
+    assert_eq!(
+        vma.identity,
+        (crate::files::Internal::AnonInodes.device(), 0)
+    );
+    m.write(GuestAddr(at + 299 * 16), &[3; 8]).unwrap();
+    let last = Some(&299u32.to_le_bytes()[..]);
+    assert_eq!(
+        elem(
+            &mut k,
+            &mut t,
+            &m,
+            MAP_LOOKUP_ELEM,
+            fd,
+            last,
+            Some(&[0; 12])
+        ),
+        0
+    );
+    assert_eq!(value(&m), u64::from_le_bytes([3; 8]));
+    // And what an update writes, the mapping shows.
+    let third = Some(&3u32.to_le_bytes()[..]);
+    assert_eq!(
+        elem(
+            &mut k,
+            &mut t,
+            &m,
+            MAP_UPDATE_ELEM,
+            fd,
+            third,
+            Some(&[9; 12])
+        ),
+        0
+    );
+    m.read(GuestAddr(at + 48), &mut seen).unwrap();
+    assert_eq!(seen[..12], [9; 12]);
+    // Nothing executes it, and it never grows.
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            MPROTECT,
+            [at, PAGE_SIZE, PROT_READ | PROT_EXEC, 0, 0, 0]
+        ),
+        errno(Errno::EACCES)
+    );
+    // A mapping that writes holds a freeze off until it goes.
+    assert_eq!(
+        elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None),
+        errno(Errno(16))
+    );
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            MUNMAP,
+            [at + PAGE_SIZE, PAGE_SIZE, 0, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None),
+        errno(Errno(16))
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, MUNMAP, [at, PAGE_SIZE, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None), 0);
+    // A frozen map maps only to be read, and that mapping never writes.
+    assert_eq!(
+        mmap(
+            &mut k,
+            &mut t,
+            &m,
+            [fd, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, 0]
+        ),
+        errno(Errno::EPERM)
+    );
+    let at = mmap(
+        &mut k,
+        &mut t,
+        &m,
+        [fd, PAGE_SIZE, PROT_READ, MAP_SHARED, 0],
+    );
+    assert!(at < u64::MAX - 4095, "mmap: {at:#x}");
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            MPROTECT,
+            [at, PAGE_SIZE, PROT_READ | PROT_WRITE, 0, 0, 0]
+        ),
+        errno(Errno::EACCES)
+    );
+}
+
+#[test]
+fn a_map_maps_only_as_linux_s_bpf_map_mmap_lets_it() {
+    let (mut k, mut t, m) = setup();
+    let fd = make(&mut k, &mut t, &m, map(ARRAY, 4, 12, 300, F_MMAPABLE));
+    let mut try_map = |fd, len, prot, flags, offset| {
+        let r = mmap(&mut k, &mut t, &m, [fd, len, prot, flags, offset]);
+        if r < u64::MAX - 4095 { 0 } else { r }
+    };
+    assert_eq!(try_map(fd, PAGE_SIZE, PROT_READ, MAP_SHARED, PAGE_SIZE), 0);
+    assert_eq!(
+        try_map(fd, PAGE_SIZE, PROT_READ, MAP_SHARED, 2 * PAGE_SIZE),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        try_map(fd, 3 * PAGE_SIZE, PROT_READ, MAP_SHARED, 0),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        try_map(fd, PAGE_SIZE, PROT_READ, MAP_PRIVATE, 0),
+        errno(Errno::EINVAL)
+    );
+    // Its anonymous inode's file system runs nothing.
+    assert_eq!(
+        try_map(fd, PAGE_SIZE, PROT_READ | PROT_EXEC, MAP_SHARED, 0),
+        errno(Errno::EPERM)
+    );
+    let plain = make(&mut k, &mut t, &m, map(ARRAY, 4, 8, 4, 0));
+    let hash = make(&mut k, &mut t, &m, map(HASH, 4, 8, 4, 0));
+    let read_only = make(
+        &mut k,
+        &mut t,
+        &m,
+        map(ARRAY, 4, 8, 4, F_MMAPABLE | F_RDONLY_PROG),
+    );
+    let mut try_map = |fd, prot| {
+        let r = mmap(&mut k, &mut t, &m, [fd, PAGE_SIZE, prot, MAP_SHARED, 0]);
+        if r < u64::MAX - 4095 { 0 } else { r }
+    };
+    assert_eq!(try_map(plain, PROT_READ), errno(Errno::EINVAL));
+    assert_eq!(try_map(hash, PROT_READ), errno(ENOTSUPP));
+    assert_eq!(
+        try_map(read_only, PROT_READ | PROT_WRITE),
+        errno(Errno::EACCES)
+    );
+    assert_eq!(try_map(read_only, PROT_READ), 0);
+    // A descriptor open only for reading maps nothing shared, and one only
+    // for writing nothing at all.
+    let id = id(&mut k, &mut t, &m, fd);
+    let by_id = |k: &mut Kernel, t: &mut Thread, flags| {
+        bpf(
+            k,
+            t,
+            &m,
+            MAP_GET_FD_BY_ID,
+            &Attr::default().half(0, id).half(8, flags),
+        )
+    };
+    let ro = by_id(&mut k, &mut t, F_RDONLY);
+    let wo = by_id(&mut k, &mut t, F_WRONLY);
+    let mut try_map = |fd, prot| {
+        let r = mmap(&mut k, &mut t, &m, [fd, PAGE_SIZE, prot, MAP_SHARED, 0]);
+        if r < u64::MAX - 4095 { 0 } else { r }
+    };
+    assert_eq!(try_map(ro, PROT_READ), errno(Errno::EINVAL));
+    assert_eq!(try_map(ro, PROT_READ | PROT_WRITE), errno(Errno::EACCES));
+    assert_eq!(try_map(wo, PROT_READ), errno(Errno::EACCES));
+}

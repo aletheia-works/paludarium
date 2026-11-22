@@ -8,7 +8,8 @@
 //! their elements (`LOOKUP`, `UPDATE`, `DELETE`,
 //! `GET_NEXT_KEY`, `LOOKUP_AND_DELETE`), `BPF_MAP_FREEZE`, the batch
 //! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
-//! `BPF_MAP_GET_FD_BY_ID`) and the descriptor's fdinfo, with the checks
+//! `BPF_MAP_GET_FD_BY_ID`), the descriptor's fdinfo and `mmap` of a
+//! mappable array ([`mmap`]), with the checks
 //! every command makes first (`bpf_check_uarg_tail_zero`, `CHECK_ATTR`)
 //! and the machine's `kernel.unprivileged_bpf_disabled`, which starts at
 //! Linux's default 2 and root may write ([`crate::sysctl::Machine`]).
@@ -31,6 +32,7 @@
 use crate::bpf_trie::{self, Trie};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
+use paludarium_mmu::SharedPages;
 use paludarium_types::{Errno, GuestAddr, PAGE_SIZE};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,10 +159,64 @@ fn copy(cell: &Cell) -> Vec<u8> {
     lock(cell).to_vec()
 }
 
+/// An array's values.
+enum Values {
+    /// By index: those never written or pointed at are zeros.
+    Cells(BTreeMap<u32, Cell>),
+    /// A mappable array's (`BPF_F_MMAPABLE`), one each `round_up(value_size,
+    /// 8)` bytes from the start of the pages its mappings show, as Linux's
+    /// `array->value` is page-aligned for `array_map_mmap`. A page no one
+    /// has written or touched has no contents yet, and reads as zeros.
+    Pages(Pages),
+}
+
+/// A mappable array's pages, by no particular type: with the pages' own
+/// type in the map, the compiler's check that a perf event's file may be
+/// shared between threads (`EventFile: Sync`) goes past its recursion
+/// limit.
+#[derive(Clone)]
+struct Pages(Arc<dyn AsPages>);
+
+trait AsPages: Send + Sync {
+    fn get(&self) -> &SharedPages;
+}
+
+impl AsPages for SharedPages {
+    fn get(&self) -> &SharedPages {
+        self
+    }
+}
+
+impl Pages {
+    fn new() -> Self {
+        Self(Arc::new(SharedPages::new()))
+    }
+}
+
+impl std::ops::Deref for Pages {
+    type Target = SharedPages;
+    fn deref(&self) -> &SharedPages {
+        self.0.get()
+    }
+}
+
+impl Values {
+    /// Stores `bytes` at `at` of a mappable array's pages, giving them
+    /// contents first ([`SharedPages::store`] leaves alone a page without).
+    fn store(pages: &SharedPages, at: u64, bytes: &[u8]) {
+        let end = at + bytes.len() as u64;
+        for key in (at - at % PAGE_SIZE..end).step_by(PAGE_SIZE as usize) {
+            // Without a meter, filling a page cannot fail.
+            let _ = pages.fill(key, &[], None);
+        }
+        pages.store(at, bytes);
+    }
+}
+
 /// The elements of a map.
 enum Elements {
-    /// An array's, by index: those never written or pointed at are zeros.
-    Array(BTreeMap<u32, Cell>),
+    /// An array's.
+    Array(Values),
     /// A hash's, by key.
     Hash(BTreeMap<Vec<u8>, Cell>),
     /// An LRU hash's, with the lists that choose which goes when it is
@@ -358,6 +414,10 @@ pub(crate) struct Map {
     /// `num_possible_cpus()`, which a hash's spare elements count.
     cpus: u64,
     frozen: AtomicBool,
+    /// The VMAs of its mappings that may write (`writecnt`'s), which a
+    /// freeze waits for none of; its lock is Linux's `freeze_mutex`, under
+    /// which a freeze and a mapping that writes see each other.
+    writable_mappings: Mutex<u64>,
     /// Made with `excl_prog_hash`: only the program of that hash may use
     /// it, so it is no map's inner map (`excl_prog_sha`).
     exclusive: bool,
@@ -814,6 +874,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         ids: Arc::clone(ids),
         cpus,
         frozen: AtomicBool::new(false),
+        writable_mappings: Mutex::new(0),
         exclusive: excl_hash != 0,
         inner,
         elements: Mutex::new(if kind == TYPE_BLOOM_FILTER {
@@ -854,7 +915,8 @@ fn bloom_size(max_entries: u32, extra: u64) -> u64 {
 /// A new map's elements: none.
 fn elements(kind: u32, key_size: u32, max_entries: u32, flags: u32, cpus: u64) -> Elements {
     match kind {
-        TYPE_ARRAY => Elements::Array(BTreeMap::new()),
+        TYPE_ARRAY if flags & flag::MMAPABLE != 0 => Elements::Array(Values::Pages(Pages::new())),
+        TYPE_ARRAY => Elements::Array(Values::Cells(BTreeMap::new())),
         TYPE_ARRAY_OF_MAPS | TYPE_HASH_OF_MAPS => Elements::Maps(BTreeMap::new()),
         TYPE_LPM_TRIE => Elements::Trie(Box::new(Trie::new(key_size, max_entries))),
         TYPE_QUEUE | TYPE_STACK => Elements::Queue(std::collections::VecDeque::new()),
@@ -1234,6 +1296,11 @@ impl Map {
     fn elements(&self) -> MutexGuard<'_, Elements> {
         lock(&self.elements)
     }
+    /// Where a mappable array's `i`th value starts in its pages
+    /// (`array->elem_size` apart).
+    fn value_at(&self, i: u32) -> u64 {
+        u64::from(i) * round8(self.value_size)
+    }
     /// A hash or an LRU hash, which share their batch and delete commands.
     fn hashed(&self) -> bool {
         matches!(self.kind, TYPE_HASH | TYPE_LRU_HASH)
@@ -1260,9 +1327,16 @@ impl Map {
                 if i >= self.max_entries {
                     return Err(Errno::ENOENT);
                 }
-                Ok(values
-                    .get(&i)
-                    .map_or_else(|| vec![0; self.value_size as usize], copy))
+                Ok(match values {
+                    Values::Cells(values) => values
+                        .get(&i)
+                        .map_or_else(|| vec![0; self.value_size as usize], copy),
+                    Values::Pages(pages) => {
+                        let mut value = vec![0; self.value_size as usize];
+                        pages.load(self.value_at(i), &mut value);
+                        value
+                    }
+                })
             }
             Elements::Hash(values) => values.get(key).map(copy).ok_or(Errno::ENOENT),
             // As `htab_lru_map_lookup_elem_sys`, which leaves the
@@ -1322,11 +1396,14 @@ impl Map {
                 if locked {
                     return Err(Errno::EINVAL);
                 }
-                match values.get(&i) {
-                    Some(held) => lock(held).copy_from_slice(&value),
-                    None => {
-                        values.insert(i, cell(value));
-                    }
+                match values {
+                    Values::Cells(values) => match values.get(&i) {
+                        Some(held) => lock(held).copy_from_slice(&value),
+                        None => {
+                            values.insert(i, cell(value));
+                        }
+                    },
+                    Values::Pages(pages) => Values::store(pages, self.value_at(i), &value),
                 }
             }
             Elements::Hash(values) => {
@@ -1575,7 +1652,16 @@ impl Map {
 /// A value a program's `bpf_map_lookup_elem` points at, which it reads and
 /// writes in place; the verifier keeps its accesses within the value, and
 /// one outside it is `EFAULT`.
-pub(crate) struct ValueRef(Cell);
+pub(crate) struct ValueRef(Value);
+
+/// Where a [`ValueRef`]'s value is.
+enum Value {
+    /// The element's own bytes.
+    Cell(Cell),
+    /// `len` bytes at `at` of a mappable array's pages, which its mappings
+    /// read and write too.
+    Page { pages: Pages, at: u64, len: usize },
+}
 
 #[cfg_attr(
     not(test),
@@ -1584,49 +1670,113 @@ pub(crate) struct ValueRef(Cell);
 impl ValueRef {
     /// The `out.len()` bytes from `off`.
     pub(crate) fn read(&self, off: usize, out: &mut [u8]) -> Result<(), Errno> {
-        let value = lock(&self.0);
-        let bytes = off
-            .checked_add(out.len())
-            .and_then(|end| value.get(off..end))
-            .ok_or(Errno::EFAULT)?;
-        out.copy_from_slice(bytes);
+        match &self.0 {
+            Value::Cell(cell) => {
+                let value = lock(cell);
+                let bytes = off
+                    .checked_add(out.len())
+                    .and_then(|end| value.get(off..end))
+                    .ok_or(Errno::EFAULT)?;
+                out.copy_from_slice(bytes);
+            }
+            Value::Page { pages, at, len } => {
+                Self::within(off, out.len(), *len)?;
+                pages.load(at + off as u64, out);
+            }
+        }
         Ok(())
     }
     /// `bytes` written from `off`.
     pub(crate) fn write(&self, off: usize, bytes: &[u8]) -> Result<(), Errno> {
-        let mut value = lock(&self.0);
-        let place = off
-            .checked_add(bytes.len())
-            .and_then(|end| value.get_mut(off..end))
-            .ok_or(Errno::EFAULT)?;
-        place.copy_from_slice(bytes);
+        match &self.0 {
+            Value::Cell(cell) => {
+                let mut value = lock(cell);
+                let place = off
+                    .checked_add(bytes.len())
+                    .and_then(|end| value.get_mut(off..end))
+                    .ok_or(Errno::EFAULT)?;
+                place.copy_from_slice(bytes);
+            }
+            Value::Page { pages, at, len } => {
+                Self::within(off, bytes.len(), *len)?;
+                Values::store(pages, at + off as u64, bytes);
+            }
+        }
         Ok(())
     }
     /// The `len` bytes from `off` changed by `change` in one hold of the
     /// value, as a `BPF_ATOMIC` changes them: no other reader or writer of
-    /// the value comes between. Gives what was there.
+    /// the value comes between. Gives what was there. In a mappable array's
+    /// pages, which its mappings write without the map, that is a
+    /// compare-and-swap of the word, so `change` may run again until it
+    /// lands; it is called with 4 or 8 aligned bytes there.
     pub(crate) fn update(
         &self,
         off: usize,
         len: usize,
-        change: impl FnOnce(&[u8]) -> Vec<u8>,
+        mut change: impl FnMut(&[u8]) -> Vec<u8>,
     ) -> Result<Vec<u8>, Errno> {
-        let mut value = lock(&self.0);
-        let place = off
-            .checked_add(len)
-            .and_then(|end| value.get_mut(off..end))
-            .ok_or(Errno::EFAULT)?;
-        let before = place.to_vec();
-        place.copy_from_slice(&change(&before));
-        Ok(before)
+        match &self.0 {
+            Value::Cell(cell) => {
+                let mut value = lock(cell);
+                let place = off
+                    .checked_add(len)
+                    .and_then(|end| value.get_mut(off..end))
+                    .ok_or(Errno::EFAULT)?;
+                let before = place.to_vec();
+                place.copy_from_slice(&change(&before));
+                Ok(before)
+            }
+            Value::Page {
+                pages,
+                at,
+                len: size,
+            } => {
+                Self::within(off, len, *size)?;
+                let at = at + off as u64;
+                if !matches!(len, 4 | 8) || !at.is_multiple_of(len as u64) {
+                    return Err(Errno::EFAULT);
+                }
+                // Without a meter, filling the page cannot fail.
+                let _ = pages.fill(at - at % PAGE_SIZE, &[], None);
+                let old = pages.update(at, len, |old| {
+                    let new = change(&old.to_le_bytes()[..len]);
+                    let mut word = [0; 8];
+                    word[..len].copy_from_slice(&new[..len]);
+                    u64::from_le_bytes(word)
+                });
+                Ok(old.to_le_bytes()[..len].to_vec())
+            }
+        }
+    }
+    /// `EFAULT` unless `size` bytes from `off` are within `len`.
+    fn within(off: usize, size: usize, len: usize) -> Result<(), Errno> {
+        match off.checked_add(size) {
+            Some(end) if end <= len => Ok(()),
+            _ => Err(Errno::EFAULT),
+        }
     }
     /// The value's size, the map's `value_size`.
     pub(crate) fn len(&self) -> usize {
-        lock(&self.0).len()
+        match &self.0 {
+            Value::Cell(cell) => lock(cell).len(),
+            Value::Page { len, .. } => *len,
+        }
     }
     /// Whether both are the same element's value.
     pub(crate) fn same(&self, other: &ValueRef) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        match (&self.0, &other.0) {
+            (Value::Cell(a), Value::Cell(b)) => Arc::ptr_eq(a, b),
+            (
+                Value::Page {
+                    pages: a, at: i, ..
+                },
+                Value::Page {
+                    pages: b, at: j, ..
+                },
+            ) => a.id() == b.id() && i == j,
+            _ => false,
+        }
     }
 }
 
@@ -1681,11 +1831,20 @@ impl Map {
                 if i >= self.max_entries {
                     return None;
                 }
-                Arc::clone(
-                    values
-                        .entry(i)
-                        .or_insert_with(|| cell(vec![0; self.value_size as usize])),
-                )
+                match values {
+                    Values::Cells(values) => Arc::clone(
+                        values
+                            .entry(i)
+                            .or_insert_with(|| cell(vec![0; self.value_size as usize])),
+                    ),
+                    Values::Pages(pages) => {
+                        return Some(ValueRef(Value::Page {
+                            pages: pages.clone(),
+                            at: self.value_at(i),
+                            len: self.value_size as usize,
+                        }));
+                    }
+                }
             }
             Elements::Hash(values) => Arc::clone(values.get(key)?),
             Elements::Lru(lru) => Arc::clone(lru.reference(key)?),
@@ -1698,7 +1857,7 @@ impl Map {
             // [`Map::prog_inner`].
             Elements::Maps(_) => return None,
         };
-        Some(ValueRef(value))
+        Some(ValueRef(Value::Cell(value)))
     }
     /// `array_of_map_lookup_elem` and `htab_of_map_lookup_elem`: the map at
     /// `key` of a map of maps, or none (a null pointer).
@@ -1925,14 +2084,16 @@ fn lookup_and_delete(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
 
 /// `BPF_MAP_FREEZE`, as Linux's `map_freeze`: a frozen map is not written
 /// through any descriptor, so a second freeze is `EPERM`; `EBUSY` is for
-/// one that finds it frozen after that check.
+/// one that finds it frozen after that check, and for one with a mapping
+/// that may write (`bpf_map_write_active`), checked first.
 fn freeze(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     check_attr(attr, 4)?;
     let (map, _, writable) = map_of(c, half(attr, 0))?;
     if !writable {
         return Err(Errno::EPERM);
     }
-    if map.frozen.swap(true, Ordering::SeqCst) {
+    let writable_mappings = lock(&map.writable_mappings);
+    if *writable_mappings != 0 || map.frozen.swap(true, Ordering::SeqCst) {
         return Err(EBUSY);
     }
     Ok(0)
@@ -2230,6 +2391,161 @@ pub(crate) fn fdinfo(file: &Arc<dyn FileHandle>) -> Option<Vec<u8>> {
         )
         .into_bytes(),
     )
+}
+
+/// Whether `file` is a map's, which `mmap` maps with [`mmap`]: its
+/// anonymous inode's file system runs nothing (`SB_I_NOEXEC`).
+pub(crate) fn is_map(file: &dyn FileHandle) -> bool {
+    file.as_any().is_some_and(|v| v.is::<MapFile>())
+}
+
+/// `mmap` of a map's file at `placement`, once `do_mmap`'s checks of the
+/// file have passed, as Linux's `bpf_map_mmap` and `array_map_mmap`: a type
+/// that has no `map_mmap`, every one here but an array, is `ENOTSUPP`; the
+/// mapping must be shared, which a file open only for reading cannot be
+/// (`do_mmap` takes `VM_SHARED` from it), else `EINVAL`; one that writes
+/// may not be of a frozen map (`EPERM`) or of one programs only read
+/// (`BPF_F_RDONLY_PROG`, `EACCES`); the array must be mappable
+/// (`BPF_F_MMAPABLE`), and the mapping may not reach past its values,
+/// rounded up to a page (`EINVAL`).
+///
+/// The mapping shows the values themselves, which the system calls and
+/// programs read and write. Its VMA is `VM_DONTEXPAND | VM_DONTDUMP |
+/// VM_MIXEDMAP` without `VM_MAYEXEC`, and one that does not write without
+/// `VM_MAYWRITE`, so that it never does. Each VMA that may write counts
+/// for the map while it lasts ([`Map::writable_mappings`]).
+pub(crate) fn mmap(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    placement: paludarium_mmu::Placement,
+    len: u64,
+    prot: paludarium_mmu::Prot,
+    shared: bool,
+    offset: u64,
+) -> Result<GuestAddr, Errno> {
+    let opened = of(file).ok_or(Errno::ENODEV)?;
+    let map = &opened.map;
+    if map.kind != TYPE_ARRAY {
+        return Err(ENOTSUPP);
+    }
+    if !shared || opened.access != O_RDWR {
+        return Err(Errno::EINVAL);
+    }
+    let writes = prot.contains(paludarium_mmu::Prot::WRITE);
+    let mut writable_mappings = lock(&map.writable_mappings);
+    if writes {
+        if map.frozen.load(Ordering::SeqCst) {
+            return Err(Errno::EPERM);
+        }
+        if map.flags & flag::RDONLY_PROG != 0 {
+            return Err(Errno::EACCES);
+        }
+    }
+    let size = (u64::from(map.max_entries) * round8(map.value_size)).next_multiple_of(PAGE_SIZE);
+    let end = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .and_then(|len| offset.checked_add(len));
+    let pages = match &*map.elements() {
+        Elements::Array(Values::Pages(pages)) if end.is_some_and(|end| end <= size) => pages
+            .with_source(Arc::new(Mapped {
+                map: Arc::clone(map),
+                size,
+                writes,
+            })),
+        _ => return Err(Errno::EINVAL),
+    };
+    if writes {
+        *writable_mappings += 1;
+    }
+    drop(writable_mappings);
+    let mapped = c.mem.map_backed(
+        placement,
+        len,
+        prot,
+        paludarium_mmu::MappingKind::File,
+        paludarium_mmu::Backing::Shared {
+            pages: &pages,
+            offset,
+            writes: if writes {
+                paludarium_mmu::SharedWrites::Allowed
+            } else {
+                paludarium_mmu::SharedWrites::Sealed
+            },
+        },
+    );
+    match mapped {
+        Ok(at) => {
+            c.mem.advise_flags(
+                at,
+                at.0 + len.next_multiple_of(PAGE_SIZE),
+                paludarium_mmu::FlagAdvice::DontDump,
+            )?;
+            Ok(at)
+        }
+        Err(e) => {
+            if writes {
+                *lock(&map.writable_mappings) -= 1;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The file of a mapping of a map's values: what pages of them have no
+/// contents yet read as zeros, and nothing lies past them (a page there
+/// raises `SIGBUS`). It keeps the map while a VMA of it lasts, as the VMA's
+/// file does on Linux.
+struct Mapped {
+    map: Arc<Map>,
+    /// The values' size, rounded up to a page.
+    size: u64,
+    /// Whether its VMAs may write, and so count for the map
+    /// (`bpf_map_mmap_open` and `bpf_map_mmap_close`).
+    writes: bool,
+}
+
+impl paludarium_mmu::PageSource for Mapped {
+    fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.size)
+    }
+    fn linked(&self) -> bool {
+        false
+    }
+    /// The anonymous inode's name, as `/proc/<pid>/maps` gives it.
+    fn name(&self) -> Option<Vec<u8>> {
+        Some(b"anon_inode:bpf-map".to_vec())
+    }
+    /// The device and inode the map's descriptor's `fstat` gives.
+    fn identity(&self) -> (u64, u64) {
+        (crate::files::Internal::AnonInodes.device(), 0)
+    }
+    /// The VMAs have a `close` operation, which keeps Linux from merging
+    /// them.
+    fn merges(&self) -> bool {
+        false
+    }
+    /// `VM_DONTEXPAND`.
+    fn fixed(&self) -> bool {
+        true
+    }
+    fn vma_flags(&self, flags: u64) -> u64 {
+        use paludarium_mmu::vm;
+        (flags | vm::DONTEXPAND | vm::MIXEDMAP) & !vm::MAYEXEC
+    }
+    fn opened(&self, _: &paludarium_mmu::Actor) {
+        if self.writes {
+            *lock(&self.map.writable_mappings) += 1;
+        }
+    }
+    fn closed(&self, _: &paludarium_mmu::Actor) {
+        if self.writes {
+            *lock(&self.map.writable_mappings) -= 1;
+        }
+    }
 }
 
 impl FileHandle for MapFile {
@@ -2696,6 +3012,7 @@ mod tests {
             ids: Arc::clone(ids),
             cpus: 2,
             frozen: AtomicBool::new(false),
+            writable_mappings: Mutex::new(0),
             exclusive: false,
             inner: None,
             elements: Mutex::new(elements(kind, 4, max_entries, flags, 2)),
@@ -3342,5 +3659,92 @@ mod tests {
         lazy.hold(&[1; 4], Arc::new(shaped(TYPE_HASH, 4, 8, 0, &ids, 42)), 0)
             .unwrap();
         assert_eq!(lazy.memory(), HASH_HEADER + BUCKET * 4 + element + POINTER);
+    }
+
+    #[test]
+    fn a_mappable_arrays_values_are_in_its_pages_each_round8_apart() {
+        let m = shaped(TYPE_ARRAY, 300, 12, flag::MMAPABLE, &Arc::default(), 1);
+        let pages = match &*m.elements() {
+            Elements::Array(Values::Pages(pages)) => pages.clone(),
+            _ => panic!("a mappable array keeps its values in pages"),
+        };
+        let value: Vec<u8> = (1..=12).collect();
+        m.set(&1u32.to_le_bytes(), value.clone(), 0).unwrap();
+        let mut seen = [0; 16];
+        pages.load(16, &mut seen);
+        assert_eq!(&seen[..12], value.as_slice());
+        assert_eq!(&seen[12..], &[0; 4]);
+        // The last value is on the second page, which had no contents.
+        m.set(&299u32.to_le_bytes(), vec![9; 12], 0).unwrap();
+        pages.load(299 * 16, &mut seen);
+        assert_eq!(&seen[..12], &[9; 12]);
+        // What the mapping writes, a lookup gives.
+        pages.fill(0, &[], None).unwrap();
+        pages.store(32, b"abcdefghijkl");
+        assert_eq!(m.get(&2u32.to_le_bytes()).unwrap(), b"abcdefghijkl");
+        assert_eq!(m.get(&300u32.to_le_bytes()), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn an_atomic_on_a_mappable_arrays_value_is_one_against_its_mappings_writes() {
+        let m = shaped(TYPE_ARRAY, 4, 16, flag::MMAPABLE, &Arc::default(), 1);
+        let pages = match &*m.elements() {
+            Elements::Array(Values::Pages(pages)) => pages.clone(),
+            _ => panic!("a mappable array keeps its values in pages"),
+        };
+        let value = Arc::new(m.prog_lookup(&1u32.to_le_bytes()).unwrap());
+        let add = |old: &[u8]| {
+            let mut word = [0; 8];
+            word[..old.len()].copy_from_slice(old);
+            u64::from_le_bytes(word).wrapping_add(1).to_le_bytes()[..old.len()].to_vec()
+        };
+        // Four adders of each size on the value's two words, while a mapping
+        // writes the 4 bytes beside the 32-bit counter in the same word (of
+        // a page the mapping has touched).
+        pages.fill(0, &[], None).unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let value = Arc::clone(&value);
+                s.spawn(move || {
+                    for _ in 0..1000 {
+                        value.update(0, 4, add).unwrap();
+                        value.update(8, 8, add).unwrap();
+                    }
+                });
+            }
+            let pages = pages.clone();
+            s.spawn(move || {
+                for i in 0..1000u32 {
+                    pages.store(16 + 4, &i.to_le_bytes());
+                }
+            });
+        });
+        let mut seen = [0; 16];
+        value.read(0, &mut seen).unwrap();
+        assert_eq!(seen[..4], 4000u32.to_le_bytes());
+        assert_eq!(seen[4..8], 999u32.to_le_bytes());
+        assert_eq!(seen[8..], 4000u64.to_le_bytes());
+        // What it gives is what was there, and only aligned words change.
+        assert_eq!(value.update(0, 4, add).unwrap(), 4000u32.to_le_bytes());
+        assert_eq!(value.update(2, 4, add), Err(Errno::EFAULT));
+        assert_eq!(value.update(12, 8, add), Err(Errno::EFAULT));
+    }
+
+    #[test]
+    fn a_programs_lookup_in_a_mappable_array_points_into_its_pages() {
+        let m = shaped(TYPE_ARRAY, 4, 12, flag::MMAPABLE, &Arc::default(), 1);
+        let value = m.prog_lookup(&3u32.to_le_bytes()).unwrap();
+        assert_eq!(value.len(), 12);
+        value.write(4, &[7, 8]).unwrap();
+        assert_eq!(value.write(11, &[0; 2]), Err(Errno::EFAULT));
+        assert_eq!(m.get(&3u32.to_le_bytes()).unwrap()[4..6], [7, 8]);
+        m.set(&3u32.to_le_bytes(), vec![5; 12], 0).unwrap();
+        let mut out = [0; 2];
+        value.read(10, &mut out).unwrap();
+        assert_eq!(out, [5, 5]);
+        assert_eq!(value.read(11, &mut out), Err(Errno::EFAULT));
+        assert!(value.same(&m.prog_lookup(&3u32.to_le_bytes()).unwrap()));
+        assert!(!value.same(&m.prog_lookup(&2u32.to_le_bytes()).unwrap()));
+        assert!(m.prog_lookup(&4u32.to_le_bytes()).is_none());
     }
 }

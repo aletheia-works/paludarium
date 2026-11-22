@@ -242,8 +242,7 @@ static char ns_thread_link[64];
 static char ns_thread_name[65];
 static volatile int ns_thread_done;
 static long ns_thread_set;
-static int ns_thread(void *unused) {
-    (void)unused;
+static int ns_thread(void) {
     struct utsname names;
     ns_thread_set = syscall(SYS_sethostname, "thread-host", 11);
     syscall(SYS_uname, &names);
@@ -7257,8 +7256,10 @@ static int pfl_thread(void) {
     return 0;
 }
 /* clone(2) of a thread that runs fn on stack and then exits, with no
-   system call before fn; musl's clone() refuses CLONE_THREAD. */
-static long pfl_spawn(unsigned long flags, void *stack, int (*fn)(void)) {
+   system call before fn. musl's clone() refuses CLONE_THREAD with EINVAL,
+   so a case that needs a thread of its own flags makes it with this. The
+   thread shares the caller's TLS (no CLONE_SETTLS), errno included. */
+static long bare_thread(unsigned long flags, void *stack, int (*fn)(void)) {
     register int (*entry)(void) __asm__("r12") = fn;
     long r;
     __asm__ volatile("syscall\n\t"
@@ -7293,7 +7294,7 @@ static int page_faults_live_case(const char *self) {
     if (pfl_pages == MAP_FAILED) return 2;
     static char stack[64 * 1024] __attribute__((aligned(16)));
     long before = pf_get(RUSAGE_SELF);
-    int tid = (int)pfl_spawn(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
+    int tid = (int)bare_thread(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
                              stack + sizeof stack, pfl_thread);
     if (tid < 0) return 3;
     while (__atomic_load_n(&pfl_state, __ATOMIC_SEQ_CST) != 1) sched_yield();
@@ -14104,6 +14105,46 @@ static int tmpfs_limits_case(void) {
     printf("status=%d\n", reaped(child));
     rmdir(m);
     printf("cleaned=%d\n", rmdir(tl_base) == 0);
+    return 0;
+}
+
+/* The shmem-fault-charge case: the pages faults bring into a memfd count
+   in its blocks, for a shared mapping's read and write faults and for a
+   private mapping's read and copy-on-write faults, which bring the file's
+   page in too; a pread of a hole brings nothing in, and a page the file
+   holds costs nothing more. */
+static long sf_blocks(int fd) {
+    struct stat st;
+    return fstat(fd, &st) ? -errno : (long)st.st_blocks;
+}
+static int shmem_fault_charge_case(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = on_bus;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, NULL)) return 82;
+    int fd = memfd_create("charge", 0);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return 83;
+    char byte;
+    printf("pread=%ld blocks=%ld\n", (long)pread(fd, &byte, 1, 0), sf_blocks(fd));
+    char *shared = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *private = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (shared == MAP_FAILED || private == MAP_FAILED) return 84;
+    touch("shared-read", shared, 0);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("shared-write", shared + 4096, 1);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("private-read", private + 2 * 4096, 0);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("private-copy", private + 3 * 4096, 1);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("held-copy", private, 1);
+    touch("file", shared + 3 * 4096, 0);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    munmap(shared, 4 * 4096);
+    munmap(private, 4 * 4096);
+    printf("unmapped blocks=%ld\n", sf_blocks(fd));
+    close(fd);
     return 0;
 }
 
@@ -26885,9 +26926,9 @@ int main(int argc, char **argv) {
         fflush(stdout);
         pid_t host = child();
         if (host == 0) {
-            int tid = clone(ns_thread, stack + 65536,
-                            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_NEWUTS,
-                            NULL);
+            int tid = (int)bare_thread(
+                CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_NEWUTS,
+                stack + 65536, ns_thread);
             while (tid > 0 && !ns_thread_done) sched_yield();
             printf("thread: cloned=%d set=%ld name=%s own=%d leader=%d\n", tid > 0, ns_thread_set, ns_thread_name,
                    ns_named(ns_thread_link, "uts") && strcmp(ns_thread_link, ns_link("self", "uts", buf, sizeof buf)),
@@ -35354,6 +35395,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
+    if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

@@ -365,7 +365,10 @@ kernel.
   does: `F_SEAL_WRITE` and `F_SEAL_FUTURE_WRITE` refuse writes, punch holes
   and writable shared mappings, `F_SEAL_SHRINK` and `F_SEAL_GROW` the size
   (a write stops at the last page that ends within the file), and
-  `F_SEAL_EXEC` the execute bits, all with `EPERM`. Memfds share a
+  `F_SEAL_EXEC` the execute bits, all with `EPERM`. A fault of a mapping
+  of a memfd brings the page into the file, as `shmem_fault` does, a
+  private mapping's read or copy-on-write fault too, so `st_blocks` counts
+  it. Memfds share a
   filesystem of their own, as Linux's internal tmpfs mount, so
   `copy_file_range` between one and a file on a mount gives `EXDEV`. Other
   files have no seals (`EINVAL`), even on the in-memory `/tmp`, where a real
@@ -1015,13 +1018,13 @@ kernel.
   page table) or it has a guard, a poison or a uffd-wp marker (`EINVAL`,
   once the other extents are done), or it lies in a range a `userfaultfd`
   registered and has an empty page (`EBUSY`, at once). Shmem's page cache
-  is that of shared memory of no file, a memfd, a tmpfs file and System V
-  shared memory, mapped shared or private. An extent of it the page cache
+  is that of shared memory of no file, a memfd and System V shared memory,
+  mapped shared or private. An extent of it the page cache
   holds no page of ends the collapse (`EINVAL`), as does one with holes in
   a VMA a `userfaultfd` registered for missing pages (`EBUSY`). Otherwise
   every page of the extent within the file comes into the page cache,
-  zeros in a hole, which a memfd or tmpfs file is charged for (`EINVAL`,
-  at once, past its mount's size), and the extent is collapsed, unless
+  zeros in a hole, which a memfd is charged for, and the extent is
+  collapsed, unless
   the VMA is registered for write protection or a page has a marker
   (`EINVAL`, once the other extents are done) or a private mapping has a
   copy of its own of a page (`EINVAL`, at once). `MADV_HWPOISON` and
@@ -2632,10 +2635,22 @@ kernel.
     only then. An end with IPv6 off (`disable_ipv6`) or an MTU below 1280
     has none. An end's IPv6 routes but its local ones are
     `RTNH_F_LINKDOWN` while it is up without its carrier, as IPv4's are.
-    `RTM_NEWROUTE` adds an IPv6 route through an end without a gateway
+    `RTM_NEWROUTE` adds an IPv6 route through an end
     (`fib6_nh_init`: `ENODEV` for one without IPv6, an MTU below 1280,
     `EACCES` for one with it off, then `ENETDOWN` while it is down), which
-    goes with it as it goes down. Turning `disable_ipv6` on for an end
+    goes with it as it goes down, and with a gateway (`RTA_GATEWAY`) one
+    through the end a route to the gateway goes through, as
+    `ip6_validate_gw` checks it: `EINVAL` for a local, unspecified or
+    multicast gateway, a link-local one without a device or one through
+    `lo`, `EHOSTUNREACH` for one no route without a gateway takes or that
+    goes through another device; `RTNH_F_ONLINK` takes the gateway to be
+    on the named end's link (`ENODEV` without one, `ENETDOWN` while it is
+    down). A route with a gateway goes out to the gateway's neighbour
+    entry, and a dump, a notification and a lookup give it as
+    `RTA_GATEWAY`. Another route with a gateway of the same metric would
+    be its multipath sibling (`rt6_qualify_for_ecmp`), which is
+    `EOPNOTSUPP` for now; one of the same device and gateway is `EEXIST`, and
+    `RTM_DELROUTE` with a gateway removes only a route through it. Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
     Going down, or away, it loses its IPv6 routes, told of in the order of
@@ -2792,9 +2807,9 @@ kernel.
     table and, from the first time `lo` is up with it (for one added while
     down, if it is permanent), a unicast prefix route in the main table, of
     its priority or else metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
-    through `lo` (or, for IPv4 without a gateway, a veth end) or of a kind without a device (`blackhole`, `unreachable`,
+    through `lo` or a veth end (for IPv4 without a gateway) or of a kind without a device (`blackhole`, `unreachable`,
     `prohibit`, `throw`) to any table, with its metric, protocol, scope,
-    TOS, preferred source and an IPv4 gateway (on link too), as
+    TOS, preferred source and a gateway (on link too), as
     `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
     `NLM_F_REPLACE`, `NLM_F_APPEND` and `NLM_F_CREATE` put it in Linux's
     place, or Linux's error refuses it (`EEXIST`, `ENOENT`; `EINVAL` for a
@@ -2855,7 +2870,7 @@ kernel.
     route (`ENETUNREACH`) without a source, or to a loopback, link-local
     or multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
     and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
-    not. With `RTA_IIF` of `lo`, or for IPv4 of a veth end, a route is
+    not. With `RTA_IIF` of `lo` or a veth end, a route is
     looked up as a packet coming in on that device would take it
     (`ip_route_input_slow`, `ip6_route_input_lookup`), and the answer names
     the device as `RTA_IIF`. IPv4 drops martians
@@ -2881,7 +2896,12 @@ kernel.
     route goes through another device than the one it came in on while
     that has an address; loosely, a lookup of it through that device
     decides. IPv6 gives the route the
-    tables do, whatever its source and its `forwarding`. The mark, the user ID, the protocol and the ports choose among
+    tables do, whatever its source and its `forwarding`, through the
+    device it came in on only for a loopback, link-local or multicast
+    destination (`rt6_need_strict`), and the route's gateway and device;
+    a local one goes out through `lo`. A multicast one is `EMSGSIZE`, as
+    Linux's multicast routing knows no device of the reply it fills
+    (`ip6mr_get_route`). The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they
     change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
@@ -4660,7 +4680,22 @@ kernel.
   (`sysinfo`'s 4 GiB), checked as `vmalloc` checks it, is `ENOMEM`. Its
   fdinfo has `map_type`, `key_size`, `value_size`, `max_entries`,
   `map_flags`, `map_extra`, `memlock` (that memory), `map_id` and
-  `frozen`. A `BPF_MAP_TYPE_LRU_HASH` is a hash that, when full, gives up
+  `frozen`. An array made with `BPF_F_MMAPABLE` maps with `mmap`, as
+  Linux's `bpf_map_mmap` and `array_map_mmap` map it: a shared mapping of
+  its values, each `value_size` rounded up to 8 bytes from the last, that
+  shows what the system calls and programs read and write. It reaches no
+  further than the values, rounded up to a page (`EINVAL`). Another map
+  type is the kernel's `ENOTSUPP` (524), and an array without the flag
+  `EINVAL`; so is a private mapping, or a shared one of a descriptor open
+  only for reading, while one of a descriptor open only for writing is
+  `EACCES` and one that executes `EPERM`. A mapping that writes may not be
+  of a frozen map (`EPERM`) or of one made with `BPF_F_RDONLY_PROG`
+  (`EACCES`), and while one lasts, a child's copy included,
+  `BPF_MAP_FREEZE` is `EBUSY`. The VMA, which `/proc/<pid>/maps` names
+  `anon_inode:bpf-map`, is `VM_DONTEXPAND`, `VM_DONTDUMP` and
+  `VM_MIXEDMAP`, never executes, and never writes unless it was mapped to
+  (`mprotect` gives `EACCES`); it keeps the map after the map's
+  descriptors close. A `BPF_MAP_TYPE_LRU_HASH` is a hash that, when full, gives up
   a key for a new one instead of `E2BIG`, as Linux's `bpf_lru_list.c`
   chooses it: its elements move between the free, active and inactive
   lists and a CPU's local free and pending lists, so that the key that
@@ -4914,7 +4949,8 @@ kernel.
   -1 gives 0. An atomic in 32 bits changes the lower half of a slot with
   the source's lower half and compares R0's, and the old value comes back
   zero-extended; no other access to a map's value comes between its read
-  and its write. A load-acquire comes back zero-extended, and a
+  and its write, a mapping's write to a mappable array's value included.
+  A load-acquire comes back zero-extended, and a
   store-release writes the source's lower bytes. A `BPF_LD_ABS` or
   `BPF_LD_IND` loads big-endian, as Linux's `bpf_gen_ld_abs` rewrites it
   into a call of `bpf_skb_load_helper_8`, `_16` or `_32`: its offset is

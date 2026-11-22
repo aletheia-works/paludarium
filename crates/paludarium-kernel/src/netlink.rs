@@ -4025,9 +4025,7 @@ fn ipv6_route_of(
         RT_SCOPE_UNIVERSE,
         route.kind.code(),
     ];
-    // `rtm_flags`: `RTNH_F_LINKDOWN` (`fib_nexthop_info`).
-    let link = if route.linkdown { RTNH_F_LINKDOWN } else { 0 };
-    body.extend_from_slice(&link.to_le_bytes());
+    body.extend_from_slice(&nexthop_flags6(route).to_le_bytes());
     attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
     if route.len != 0 {
         attribute(&mut body, RTA_DST, &route.dst.octets());
@@ -4037,7 +4035,7 @@ fn ipv6_route_of(
     }
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-    attribute(&mut body, RTA_OIF, &route.oif.to_le_bytes());
+    put_nexthop6(&mut body, route);
     let mut cache = [0; RTA_CACHEINFO_LEN];
     cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &cache);
@@ -4172,10 +4170,6 @@ fn lookup(
     if iif != 0 && !network.has_device(iif) {
         return Err(ENODEV);
     }
-    // A veth end has no IPv6 here, so nothing comes in on one.
-    if v6 && iif != 0 && iif != LOOPBACK_OIF {
-        return Err(EOPNOTSUPP);
-    }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
     // The device it comes in on alone, before the addresses: whether it
     // is up, its forwarding, and the reverse path filtering that counts.
@@ -4219,15 +4213,15 @@ fn lookup(
         if !network.is_up() {
             return Err(ENETUNREACH);
         }
-        // `rt6_score_route`: a route must go through the device named
-        // (`RT6_LOOKUP_F_IFACE`) with no source, or to a loopback,
-        // link-local or multicast address (`rt6_need_strict`), and every
-        // one goes through `lo`.
+        // `ip6_route_output_flags_noref`: a route must go through the
+        // device named (`RT6_LOOKUP_F_IFACE`) with no source, or to a
+        // loopback, link-local or multicast address (`rt6_need_strict`).
         let strict = ip.is_loopback() || ip.is_unicast_link_local() || ip.is_multicast();
-        if oif != 0 && oif != LOOPBACK_OIF && (strict || source6 == [0; 16]) {
-            return Err(ENETUNREACH);
-        }
-        let route = addresses.lookup6(ip)?;
+        let route = if oif != 0 && (strict || source6 == [0; 16]) {
+            addresses.lookup6_on(ip, oif)?
+        } else {
+            addresses.lookup6(ip)?
+        };
         if fib_match {
             return Ok(ipv6_route_of(RTM_NEWROUTE, &route, seq, port, 0, now));
         }
@@ -4254,10 +4248,14 @@ fn lookup(
         if let Some(source) = route.prefsrc {
             attribute(&mut body, RTA_PREFSRC, &source.octets());
         }
-        // The route's metrics, which its `rt6_info` shares.
+        // The route's metrics, which its `rt6_info` shares, then its
+        // gateway and device: `lo` for a local one (`ip6_rt_get_dev_rcu`).
         put_metrics(&mut body, &route.metrics);
         attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-        attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+        if let Some(gateway) = route.gateway {
+            attribute(&mut body, RTA_GATEWAY, &gateway.octets());
+        }
+        attribute(&mut body, RTA_OIF, &dst_device6(&route).to_le_bytes());
         attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
         attribute(&mut body, RTA_PREF, &[0]);
         return Ok(message(RTM_NEWROUTE, 0, seq, port, &body));
@@ -4669,6 +4667,29 @@ fn input4(
 /// own entry with `RTA_IIF`.
 ///
 /// [`Addresses::lookup6`]: crate::interface::Addresses::lookup6
+/// The device of the `rt6_info` a lookup makes of `route`: `lo` for a
+/// local one (`ip6_rt_get_dev_rcu`), else its own.
+fn dst_device6(route: &crate::interface::Route6) -> u32 {
+    if route.kind == crate::interface::Kind::Local {
+        LOOPBACK_OIF
+    } else {
+        route.oif
+    }
+}
+/// The `rtm_flags` a route's next hop gives (`fib_nexthop_info`):
+/// `RTNH_F_LINKDOWN` and `RTNH_F_ONLINK`.
+fn nexthop_flags6(route: &crate::interface::Route6) -> u32 {
+    (if route.onlink { RTNH_F_ONLINK } else { 0 })
+        | if route.linkdown { RTNH_F_LINKDOWN } else { 0 }
+}
+/// A route's next hop as `fib_nexthop_info` puts it: its gateway, then
+/// its device.
+fn put_nexthop6(body: &mut Vec<u8>, route: &crate::interface::Route6) {
+    if let Some(gateway) = route.gateway {
+        attribute(body, RTA_GATEWAY, &gateway.octets());
+    }
+    attribute(body, RTA_OIF, &route.oif.to_le_bytes());
+}
 fn input6(
     addresses: &crate::interface::Addresses,
     address: [u8; 16],
@@ -4676,7 +4697,22 @@ fn input6(
     input: &Input,
     now: u64,
 ) -> Result<Vec<u8>, Errno> {
-    let route = addresses.lookup6(core::net::Ipv6Addr::from(address))?;
+    let ip = core::net::Ipv6Addr::from(address);
+    // `ip6_route_input_lookup`: through the device it comes in on for a
+    // loopback, link-local or multicast address (`rt6_need_strict`).
+    let strict = ip.is_loopback() || ip.is_unicast_link_local() || ip.is_multicast();
+    let iif = input.iif.unsigned_abs();
+    let route = if strict {
+        addresses.lookup6_on(ip, iif)?
+    } else {
+        addresses.lookup6(ip)?
+    };
+    // `rt6_fill_node` asks multicast routing of a group's
+    // (`ip6mr_get_route`), which finds no device on the reply it fills and
+    // fails with `ENODEV`; the fill turns any failure into `EMSGSIZE`.
+    if route.dst.is_multicast() {
+        return Err(EMSGSIZE);
+    }
     let (seq, port) = input.reply;
     let fib_match = input.flags & RTM_F_FIB_MATCH != 0;
     let mut body = vec![
@@ -4689,7 +4725,8 @@ fn input6(
         RT_SCOPE_UNIVERSE,
         route.kind.code(),
     ];
-    body.extend_from_slice(&0u32.to_le_bytes());
+    let flags = if fib_match { nexthop_flags6(&route) } else { 0 };
+    body.extend_from_slice(&flags.to_le_bytes());
     attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
     if fib_match {
         if route.len != 0 {
@@ -4699,13 +4736,20 @@ fn input6(
         attribute(&mut body, RTA_DST, &address);
         attribute(&mut body, RTA_SRC, &source);
     }
-    attribute(&mut body, RTA_IIF, &LOOPBACK_OIF.to_le_bytes());
+    attribute(&mut body, RTA_IIF, &iif.to_le_bytes());
     if let Some(source) = route.prefsrc {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    if fib_match {
+        put_nexthop6(&mut body, &route);
+    } else {
+        if let Some(gateway) = route.gateway {
+            attribute(&mut body, RTA_GATEWAY, &gateway.octets());
+        }
+        attribute(&mut body, RTA_OIF, &dst_device6(&route).to_le_bytes());
+    }
     if fib_match {
         let mut cache = [0; RTA_CACHEINFO_LEN];
         cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
@@ -4727,7 +4771,7 @@ fn input6(
 /// destination shorter than its prefix, then, adding (`fib6_config_validate`),
 /// for `RTM_F_CLONED`, a kind past `RTN_MAX` and a prefix or source prefix
 /// past 128. Multipath routes, encapsulations, nexthop objects, realms, expiries,
-/// IPv6 gateways, source prefixes and router preferences are
+/// source prefixes and router preferences are
 /// `EOPNOTSUPP`. A route added takes the metrics `RTA_METRICS` holds
 /// ([`convert_metrics`]); an IPv4 one removed must have those it names
 /// ([`metrics_match`]), and IPv6's does not look. The table is the
@@ -4817,11 +4861,7 @@ fn change_route(
             }
             RTA_DST => dst = Some(address(value)?),
             RTA_PREFSRC => prefsrc = Some(address(value)?),
-            RTA_GATEWAY => {
-                let raw = address(value)?;
-                unsupported |= v6;
-                gateway = Some(raw);
-            }
+            RTA_GATEWAY => gateway = Some(address(value)?),
             RTA_OIF => oif = number(value)?,
             RTA_PRIORITY => priority = number(value)?,
             RTA_TABLE => table = number(value)?,
@@ -4882,6 +4922,8 @@ fn change_route(
             metric: priority,
             prefsrc: ip(prefsrc),
             oif,
+            gateway: ip(gateway),
+            onlink: flags & RTNH_F_ONLINK != 0,
             device: network.has_device(oif),
             ipv6_off: i32::try_from(oif)
                 .ok()
@@ -8477,11 +8519,11 @@ mod tests {
             ask(AF_INET, [10, 99, 0, 2], [10, 77, 0, 1]),
             Err(Errno::EINVAL)
         );
-        // IPv6 does not come in on an end.
+        // IPv6 in on an end looks up its tables, which take no `::`.
         let mut six = vec![AF_INET6, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         attribute(&mut six, RTA_DST, &[0; 16]);
         attribute(&mut six, RTA_IIF, &1000u32.to_le_bytes());
-        assert_eq!(lookup(&network, &six, 1, 7, 0, 0), Err(EOPNOTSUPP));
+        assert_eq!(lookup(&network, &six, 1, 7, 0, 0), Err(ENETUNREACH));
         // Down, it leaves 224.0.0.1.
         set_veth_up(&network, false);
         assert_eq!(

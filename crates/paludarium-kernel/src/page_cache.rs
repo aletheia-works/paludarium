@@ -1333,6 +1333,9 @@ impl HostFs for CoherentFs {
         // listed or fails, as the lookup's dentry reference keeps Linux's
         // inode from `evict`: an eviction meanwhile keeps its marks
         // ([`crate::fanotify::Registry::evict_of`]). Only marks are evicted.
+        // It goes as a hold does: a file removed meanwhile that nothing else
+        // holds ends as it goes (`IN_DELETE_SELF`), even if the open fails,
+        // as the lookup's `dput` ends it on Linux.
         let _lookup = if self.caches.notify.fan.active() {
             self.inner
                 .metadata(path, flags & O_NOFOLLOW == 0)

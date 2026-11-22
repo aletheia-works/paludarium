@@ -8925,7 +8925,7 @@ fn system_file(
     let content = match entry {
         crate::proc::SystemEntry::Loadavg => {
             let (tasks, last_pid) = c.processes.task_counts();
-            crate::proc::render_loadavg(1, tasks, last_pid)
+            crate::proc::render_loadavg(c.processes.running_tasks(c.tid), tasks, last_pid)
         }
         crate::proc::SystemEntry::Meminfo => {
             crate::proc::render_meminfo(crate::syscalls::SYSINFO_RAM)

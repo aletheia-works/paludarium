@@ -3702,8 +3702,9 @@ kernel.
   else 0).
 
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
-  in Linux's formats: load averages of 0 with the running and live tasks and
-  the last ID handed out; 4 GiB of total, free and available memory and
+  in Linux's formats: load averages of 0 with the running tasks (the threads
+  `/proc/stat`'s `procs_running` counts), the live tasks and the last ID
+  handed out; 4 GiB of total, free and available memory and
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
 

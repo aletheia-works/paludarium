@@ -13699,6 +13699,40 @@ static int proc_at_read_case(const char *self) {
     return 0;
 }
 
+/* The loadavg-running case: /proc/loadavg's running count, as Linux's
+   nr_running(), counts the threads that can run: with two threads spinning
+   besides the reader, at least 3, and no more than the live tasks; and
+   /proc/stat's procs_running counts at least as many. */
+static volatile int lr_stop;
+static void *lr_spin(void *unused) {
+    (void)unused;
+    while (!lr_stop) {
+    }
+    return NULL;
+}
+
+static int loadavg_running_case(void) {
+    pthread_t spinners[2];
+    for (int i = 0; i < 2; i++) pthread_create(&spinners[i], NULL, lr_spin, NULL);
+    /* Let both start spinning. */
+    nanosleep(&(struct timespec){0, 50000000}, NULL);
+    char buffer[4096];
+    long running = -1, tasks = -1, procs_running = -1;
+    if (proc_read("/proc/loadavg", buffer, sizeof buffer) > 0)
+        sscanf(buffer, "%*s %*s %*s %ld/%ld", &running, &tasks);
+    long n = proc_read("/proc/stat", buffer, sizeof buffer - 1);
+    if (n > 0) {
+        buffer[n] = 0;
+        char *line = strstr(buffer, "\nprocs_running ");
+        if (line) procs_running = atol(line + 15);
+    }
+    lr_stop = 1;
+    for (int i = 0; i < 2; i++) pthread_join(spinners[i], NULL);
+    printf("loadavg running>=3=%d running<=tasks=%d stat-running>=3=%d\n", running >= 3,
+           running <= tasks, procs_running >= 3);
+    return 0;
+}
+
 /* The proc-stat-counters case: /proc/stat's lines have show_stat's shape
    (ten times on the cpu line and each online CPU's, intr's total, ctxt,
    processes, procs_running, procs_blocked, softirq's total and ten kinds),
@@ -33947,6 +33981,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-own-at-read")) return proc_own_at_read_case(argv);
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
+    if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

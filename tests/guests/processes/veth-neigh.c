@@ -176,19 +176,21 @@ static void address(int fd, int index, const char *ip, const char *label) {
     put(&b, IFA_ADDRESS, &in, 4);
     request(fd, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &b, label);
 }
-/* Waits, up to 5 s, until the member links hears that the device of
-   `index` has its carrier, or with `gone` has lost it, as Linux's link
-   watch may tell of it a second later. */
+/* Waits, up to 5 s however much else comes, until the member links hears
+   that the device of `index` has its carrier, or with `gone` has lost it,
+   as Linux's link watch may tell of it a second later. */
 static void carrier_is(int links, int index, int gone) {
     static unsigned char buf[65536];
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = 5000 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (left <= 0) break;
         struct pollfd ready = {.fd = links, .events = POLLIN};
-        if (poll(&ready, 1, 5000) <= 0) {
-            printf("%s: %s on %d\n", side, gone ? "carrier not lost" : "no carrier", index);
-            return;
-        }
+        if (poll(&ready, 1, (int)left) <= 0) continue;
         long n = recv(links, buf, sizeof buf, MSG_DONTWAIT);
-        if (n <= 0) return;
+        if (n <= 0) continue;
         for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
             const struct nl_header *h = (const void *)(buf + at);
             if (h->len < sizeof *h || at + h->len > n) break;
@@ -209,6 +211,7 @@ static void carrier_is(int links, int index, int gone) {
             at += (h->len + 3) & ~3u;
         }
     }
+    printf("%s: %s %d: never came\n", side, gone ? "carrier gone from" : "carrier on", index);
 }
 
 static void carrier(int links, int index) { carrier_is(links, index, 0); }

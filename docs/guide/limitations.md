@@ -794,7 +794,9 @@ verified.
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
   `nr_blocks` and `nr_inodes`, but not for what a mapping writes (a write
   fault past the size is no `SIGBUS`, and the pages go back to the file
-  whatever its size), and its extended attributes take none of the inodes'
+  whatever its size; nor are the pages a fault brings into a tmpfs file
+  or a memfd counted in its blocks, which only `MADV_COLLAPSE` charges
+  for the holes it fills), and its extended attributes take none of the inodes'
   room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
   counts them, does not happen); the root from start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime

@@ -666,7 +666,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ルートからではありません。`MS_RDONLY`（`EROFS`）、`noexec`、`nodev`、`nosuid` は
   効かせ、tmpfs のマウントの `size`、`nr_blocks`、`nr_inodes` も効かせますが、
   マッピングが書くものには効きません（大きさを超える書き込みのフォールトは `SIGBUS` に
-  ならず、ページは大きさにかかわらずファイルに戻ります）。拡張属性は inode の分を
+  ならず、ページは大きさにかかわらずファイルに戻ります。フォールトが tmpfs のファイルや
+  memfd に持ち込むページもそのブロックには数えません。数えるのは、`MADV_COLLAPSE` が
+  埋めた穴の分だけです）。拡張属性は inode の分を
   使いません（`shmem_xattr_handler_set` のように数えて、超えたときの `setxattr` の
   `ENOSPC` にはなりません）。起動したときからあるルートには、`fallocate` の上限（返す
   メモリーの大きさ）のほかに上限がありません。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが

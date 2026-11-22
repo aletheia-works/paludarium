@@ -1001,10 +1001,10 @@ kernel.
   a VMA a `userfaultfd` registered for missing pages (`EBUSY`). Otherwise
   every page of the extent within the file comes into the page cache,
   zeros in a hole, which a memfd or tmpfs file is charged for (`EINVAL`,
-  at once, past its mount's size), and the extent is collapsed, unless the VMA is
-  registered for write protection or a page has a marker (`EINVAL`, once
-  the other extents are done) or a private mapping has a copy of its own
-  of a page (`EINVAL`, at once). `MADV_HWPOISON` and
+  at once, past its mount's size), and the extent is collapsed, unless
+  the VMA is registered for write protection or a page has a marker
+  (`EINVAL`, once the other extents are done) or a private mapping has a
+  copy of its own of a page (`EINVAL`, at once). `MADV_HWPOISON` and
   `MADV_SOFT_OFFLINE` check the range's arguments, then `CAP_SYS_ADMIN`
   (`EPERM`), before the address limit or any mapping. With it each page in
   turn is brought in by reading it: `EFAULT` for a page no mapping holds,

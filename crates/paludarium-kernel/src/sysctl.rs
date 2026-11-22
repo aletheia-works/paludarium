@@ -324,12 +324,12 @@ impl Default for Machine {
 }
 
 impl Machine {
-    /// What `perf_event_open` checks (`sysctl_perf_event_paranoid`).
     /// `vm.drop_caches` as last written (`sysctl_drop_caches`), which a
     /// write past the start of the file drops again.
     fn drop_caches(&self) -> i32 {
         self.drop_caches.load(Ordering::SeqCst)
     }
+    /// What `perf_event_open` checks (`sysctl_perf_event_paranoid`).
     pub(crate) fn perf_event_paranoid(&self) -> i32 {
         self.perf_event_paranoid.load(Ordering::SeqCst)
     }
@@ -1276,17 +1276,17 @@ impl Value {
             Self::DropCaches(machine, _) => line(machine.drop_caches()),
         }
     }
-    /// After a write that went through, one past the start too: a set
-    /// `kernel.shm_rmid_forced` removes the orphans no mapping shows, as
-    /// Linux master's `proc_ipc_dointvec_minmax_orphans` does (7.0's did so
-    /// after a read too).
-    /// A `vm.drop_caches` write drops as its value (the one last written,
-    /// for a write past the start) says, as `drop_caches_sysctl_handler`
-    /// does after `proc_dointvec_minmax`: 2 frees the inodes nothing uses
-    /// (`drop_slab`), whose evictable fanotify marks go
-    /// ([`crate::fanotify::Registry::evict`]). 1 drops the page cache, of
-    /// which nothing here shows; 4 only quiets the kernel log's line, which
-    /// there is none of here.
+    /// What follows a write that went through, one past the start too:
+    /// - A set `kernel.shm_rmid_forced` removes the orphans no mapping
+    ///   shows, as Linux master's `proc_ipc_dointvec_minmax_orphans` does
+    ///   (7.0's did so after a read too).
+    /// - `vm.drop_caches` drops as its value says (the one last written,
+    ///   for a write past the start), as `drop_caches_sysctl_handler` does
+    ///   after `proc_dointvec_minmax`: 2 frees the inodes nothing uses
+    ///   (`drop_slab`), whose evictable fanotify marks go
+    ///   ([`crate::fanotify::Registry::evict`]). 1 drops the page cache, of
+    ///   which nothing here shows; 4 only quiets the kernel log's line,
+    ///   which there is none of here.
     fn touched(&self) {
         match self {
             Self::Kernel(ipc, Kernel::ShmRmidForced) => ipc.shm.remove_orphans(),

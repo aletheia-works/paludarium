@@ -2964,19 +2964,18 @@ impl Addresses {
                 }
             } else {
                 let usable = |r: &Route6| r.kind.error().is_none() && r.gateway.is_none();
-                let mut found = None;
-                if ask.table != 0 && self.tables6.contains(&table) {
-                    found = self.lookup6_in(table, via, ask.oif).filter(|r| usable(r));
-                }
-                if found.is_none() {
-                    found = Some(
-                        self.lookup6_on(via, ask.oif)
-                            .ok()
-                            .filter(|r| usable(r))
-                            .ok_or(EHOSTUNREACH)?,
-                    );
-                }
-                let found = found.ok_or(EHOSTUNREACH)?;
+                let in_table = (ask.table != 0 && self.tables6.contains(&table))
+                    .then(|| self.lookup6_in(table, via, ask.oif))
+                    .flatten()
+                    .filter(|r| usable(r));
+                let found = match in_table {
+                    Some(found) => found,
+                    None => self
+                        .lookup6_on(via, ask.oif)
+                        .ok()
+                        .filter(|r| usable(r))
+                        .ok_or(EHOSTUNREACH)?,
+                };
                 if ask.oif == 0 {
                     oif = found.oif;
                 } else if found.oif != ask.oif {

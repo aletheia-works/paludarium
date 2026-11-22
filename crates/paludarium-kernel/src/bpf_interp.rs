@@ -535,12 +535,35 @@ impl Machine<'_, '_> {
         Ok(())
     }
 
-    /// A `BPF_ATOMIC` of 4 or 8 bytes, as `___bpf_prog_run` runs it: the
-    /// operation with the source, or with `BPF_CMPXCHG` the source in place
-    /// of a value equal to R0's. The old value, zero-extended from 32 bits,
-    /// goes to the source with `BPF_FETCH` and to R0 with `BPF_CMPXCHG`.
+    /// A `BPF_ATOMIC`, as `___bpf_prog_run` runs it.
+    ///
+    /// `BPF_LOAD_ACQ` loads the destination from the memory at the source,
+    /// zero-extended, and `BPF_STORE_REL` stores the source's lower bytes
+    /// at the destination, of any size. Each is one read or write, which
+    /// for a map's value is under the value's lock, so it is ordered with
+    /// every other access to the value as an acquire or a release is.
+    ///
+    /// The others, of 4 or 8 bytes: the operation with the source, or with
+    /// `BPF_CMPXCHG` the source in place of a value equal to R0's. The old
+    /// value, zero-extended from 32 bits, goes to the source with
+    /// `BPF_FETCH` and to R0 with `BPF_CMPXCHG`.
     fn atomic(&mut self, insn: Insn, dst: usize, src: usize) -> Result<(), Fault> {
         let size = width(insn.code);
+        match insn.imm {
+            0x100 => {
+                let at = self.regs[src].wrapping_add(i64::from(insn.off) as u64);
+                let mut bytes = [0; 8];
+                self.read(at, &mut bytes[..size])?;
+                self.regs[dst] = u64::from_le_bytes(bytes);
+                return Ok(());
+            }
+            0x110 => {
+                let at = self.regs[dst].wrapping_add(i64::from(insn.off) as u64);
+                let v = self.regs[src];
+                return self.write(at, &v.to_le_bytes()[..size]);
+            }
+            _ => {}
+        }
         if size < 4 {
             return Err(Fault);
         }
@@ -1078,6 +1101,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn load_acquire_and_store_release_move_bytes_as_linux_s_do() {
+        let m = 0x8877_6655_4433_2211_u64;
+        let s = 0xffee_ddcc_bbaa_9988_u64;
+        let ld = |r: u8, v: u64| {
+            [
+                i(0x18, r, 0, 0, v as u32 as i32),
+                i(0, 0, 0, 0, (v >> 32) as u32 as i32),
+            ]
+        };
+        for (code, mask) in [
+            (0xd3, 0xff_u64),
+            (0xcb, 0xffff),
+            (0xc3, 0xffff_ffff),
+            (0xdb, u64::MAX),
+        ] {
+            // The store changes the lower bytes only.
+            let mut p = ld(3, m).to_vec();
+            p.push(i(0x7b, 10, 3, -8, 0));
+            p.extend(ld(2, s));
+            p.extend([i(code, 10, 2, -8, 0x110), i(0x79, 0, 10, -8, 0), exit()]);
+            assert_eq!(run_on(&p, &[]).unwrap(), m & !mask | s & mask);
+            // The load zero-extends into a register that held all ones.
+            let mut p = ld(3, m).to_vec();
+            p.push(i(0x7b, 10, 3, -8, 0));
+            p.extend(ld(0, u64::MAX));
+            p.extend([i(code, 0, 10, -8, 0x100), exit()]);
+            assert_eq!(run_on(&p, &[]).unwrap(), m & mask);
+        }
+    }
+
+    #[test]
     fn the_context_and_the_stack() {
         // R0 = len; cb[0] = len + 1; R0 = cb[0] as one byte.
         let p = [
@@ -1192,8 +1246,9 @@ pub(crate) mod tests {
 
     /// The soundness the verifier gives the interpreter: random programs
     /// near what it takes, of registers, the stack, the context, jumps,
-    /// atomics and the helpers without maps, and every one it takes runs on packets of
-    /// a few lengths without a load or store outside what it points to.
+    /// atomics, load-acquires, store-releases and the helpers without
+    /// maps, and every one it takes runs on packets of a few lengths
+    /// without a load or store outside what it points to.
     #[test]
     fn programs_the_verifier_takes_never_fault() {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -1204,7 +1259,7 @@ pub(crate) mod tests {
             (seed % u64::from(n)) as u32
         };
         const EDGES: [i32; 12] = [0, 1, -1, 7, 8, 16, 31, 32, 63, 64, i32::MIN, i32::MAX];
-        let (mut taken, mut atomics) = (0, 0);
+        let (mut taken, mut atomics, mut ordered) = (0, 0, 0);
         for _ in 0..120_000 {
             let mut p = vec![i(0xbf, 6, 1, 0, 0)];
             for _ in 0..1 + next(12) {
@@ -1218,7 +1273,7 @@ pub(crate) mod tests {
                 let size = [0x18, 0x00, 0x08, 0x10][next(4) as usize];
                 let at = -8 * (1 + next(64) as i16) + next(8) as i16;
                 let alu = (next(14) as u8) << 4;
-                let insn = match next(13) {
+                let insn = match next(14) {
                     0 => i(0xb7, dst, 0, 0, imm),
                     1 => i(0x07 | alu, dst, 0, next(2) as i16, imm),
                     2 => i(0x04 | alu, dst, 0, 0, imm),
@@ -1258,9 +1313,19 @@ pub(crate) mod tests {
                         src,
                         -8 * (1 + next(64) as i16) + 4 * next(2) as i16,
                         [
-                            0x00, 0x01, 0x40, 0x41, 0x50, 0x51, 0xa0, 0xa1, 0xe1, 0xf1, 0x100, 0x03,
-                        ][next(12) as usize],
+                            0x00, 0x01, 0x40, 0x41, 0x50, 0x51, 0xa0, 0xa1, 0xe1, 0xf1, 0x03,
+                        ][next(11) as usize],
                     ),
+                    // A load-acquire or store-release of any size, mostly
+                    // of the stack, sometimes misaligned.
+                    12 => {
+                        let base = if next(8) == 0 { 6 } else { 10 };
+                        if next(2) == 0 {
+                            i(0xc3 | size, dst, base, at, 0x100)
+                        } else {
+                            i(0xc3 | size, base, src, at, 0x110)
+                        }
+                    }
                     _ => i(0x85, 0, 0, 0, [5, 7, 8, 14, 15, 46, 47][next(7) as usize]),
                 };
                 p.push(insn);
@@ -1277,6 +1342,11 @@ pub(crate) mod tests {
             taken += 1;
             if p.iter().any(|insn| insn.code & 0xe7 == STX | ATOMIC) {
                 atomics += 1;
+            }
+            if p.iter()
+                .any(|insn| insn.code & 0xe7 == STX | ATOMIC && insn.imm & 0x100 != 0)
+            {
+                ordered += 1;
             }
             for len in [0, 1, 7, 64] {
                 let data = vec![0x5a; len];
@@ -1295,14 +1365,20 @@ pub(crate) mod tests {
                 );
             }
         }
-        // Enough of them load for the check to mean something: 6,444 with
-        // this seed and this verifier, 204 of them with an atomic. A change
-        // to either that loads fewer than 6,000, or fewer than 150 with an
-        // atomic, should look again at what the programs cover.
+        // Enough of them load for the check to mean something: 6,312 with
+        // this seed and this verifier, 625 of them with an atomic and 434
+        // with a load-acquire or store-release. A change to either that
+        // loads fewer than 6,000, fewer than 150 with an atomic or fewer
+        // than 300 with a load-acquire or store-release, should look again
+        // at what the programs cover.
         assert!(taken >= 6_000, "only {taken} programs loaded");
         assert!(
             atomics >= 150,
             "only {atomics} programs with an atomic loaded"
+        );
+        assert!(
+            ordered >= 300,
+            "only {ordered} programs with a load-acquire or store-release loaded"
         );
     }
 }

@@ -534,7 +534,10 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`). Linux's
+  - `MADV_COLLAPSE` refuses a regular file's mappings (`EINVAL`), a file
+    of the in-memory file system's tmpfs mounts too, which is not yet
+    taken for shmem's here (nor by `userfaultfd`), where Linux collapses
+    it as shmem. Linux's
     rules for them changed after v6.12, which collapses only a file nobody
     has open for writing (`READ_ONLY_THP_FOR_FS`), where later kernels take
     any file on a file system with large folios. The result also depends
@@ -809,12 +812,14 @@ verified.
   shared with the host's. `propagate_from:` is found from the namespace's
   root, not the reader's after `chroot`. `MS_RDONLY` (`EROFS`), `noexec`,
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
-  `nr_blocks` and `nr_inodes`, but not for what a mapping writes (a write
-  fault past the size is no `SIGBUS`, and the pages go back to the file
-  whatever its size; nor are the pages a fault brings into a tmpfs file
-  or a memfd counted in its blocks, which only `MADV_COLLAPSE` charges
-  for the holes it fills), and its extended attributes take none of the inodes'
-  room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
+  `nr_blocks` and `nr_inodes`, but not for what a mapping writes: a file
+  on such a mount is not yet taken for shmem's (nor by `userfaultfd`), so a
+  fault brings nothing into it, a write fault past the size is no
+  `SIGBUS`, and the pages go back to the file whatever its size, counting
+  in its blocks only then. A memfd's pages count once a fault brings them
+  in, as `shmem_fault` charges them, but those `MAP_POPULATE`,
+  `MAP_LOCKED` or a lock would bring into a shared mapping of one only
+  once touched. Its extended attributes take none of the inodes' room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
   counts them, does not happen); the root from start-up has no limit but
   `fallocate`'s, the memory reported. Not enforced either are the atime
   flags, `sync`, `dirsync` and `mand`; no mount here holds a

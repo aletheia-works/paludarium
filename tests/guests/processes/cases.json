@@ -418,6 +418,7 @@
     {"name":"generated-binds","binary":"process"},
     {"name":"generated-changes","binary":"process"},
     {"name":"tmpfs-limits","binary":"process"},
+    {"name":"shmem-fault-charge","binary":"process"},
     {"name":"generated-noexec","binary":"process"},
     {"name":"exec-truncated","binary":"process"},
     {"name":"dev-shm","binary":"process"},

@@ -13538,6 +13538,46 @@ static int tmpfs_limits_case(void) {
     return 0;
 }
 
+/* The shmem-fault-charge case: the pages faults bring into a memfd count
+   in its blocks, for a shared mapping's read and write faults and for a
+   private mapping's read and copy-on-write faults, which bring the file's
+   page in too; a pread of a hole brings nothing in, and a page the file
+   holds costs nothing more. */
+static long sf_blocks(int fd) {
+    struct stat st;
+    return fstat(fd, &st) ? -errno : (long)st.st_blocks;
+}
+static int shmem_fault_charge_case(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = on_bus;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, NULL)) return 82;
+    int fd = memfd_create("charge", 0);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return 83;
+    char byte;
+    printf("pread=%ld blocks=%ld\n", (long)pread(fd, &byte, 1, 0), sf_blocks(fd));
+    char *shared = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *private = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (shared == MAP_FAILED || private == MAP_FAILED) return 84;
+    touch("shared-read", shared, 0);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("shared-write", shared + 4096, 1);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("private-read", private + 2 * 4096, 0);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("private-copy", private + 3 * 4096, 1);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    touch("held-copy", private, 1);
+    touch("file", shared + 3 * 4096, 0);
+    printf("blocks=%ld\n", sf_blocks(fd));
+    munmap(shared, 4 * 4096);
+    munmap(private, 4 * 4096);
+    printf("unmapped blocks=%ld\n", sf_blocks(fd));
+    close(fd);
+    return 0;
+}
+
 /* The generated-changes case: the path calls that change or go to a file
    the kernel generates in /dev or /proc, by its own path. chdir and fchdir
    make a directory there the working directory, which relative paths and
@@ -34785,6 +34825,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
+    if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

@@ -365,7 +365,10 @@ kernel.
   does: `F_SEAL_WRITE` and `F_SEAL_FUTURE_WRITE` refuse writes, punch holes
   and writable shared mappings, `F_SEAL_SHRINK` and `F_SEAL_GROW` the size
   (a write stops at the last page that ends within the file), and
-  `F_SEAL_EXEC` the execute bits, all with `EPERM`. Memfds share a
+  `F_SEAL_EXEC` the execute bits, all with `EPERM`. A fault of a mapping
+  of a memfd brings the page into the file, as `shmem_fault` does, a
+  private mapping's read or copy-on-write fault too, so `st_blocks` counts
+  it. Memfds share a
   filesystem of their own, as Linux's internal tmpfs mount, so
   `copy_file_range` between one and a file on a mount gives `EXDEV`. Other
   files have no seals (`EINVAL`), even on the in-memory `/tmp`, where a real
@@ -1015,13 +1018,13 @@ kernel.
   page table) or it has a guard, a poison or a uffd-wp marker (`EINVAL`,
   once the other extents are done), or it lies in a range a `userfaultfd`
   registered and has an empty page (`EBUSY`, at once). Shmem's page cache
-  is that of shared memory of no file, a memfd, a tmpfs file and System V
-  shared memory, mapped shared or private. An extent of it the page cache
+  is that of shared memory of no file, a memfd and System V shared memory,
+  mapped shared or private. An extent of it the page cache
   holds no page of ends the collapse (`EINVAL`), as does one with holes in
   a VMA a `userfaultfd` registered for missing pages (`EBUSY`). Otherwise
   every page of the extent within the file comes into the page cache,
-  zeros in a hole, which a memfd or tmpfs file is charged for (`EINVAL`,
-  at once, past its mount's size), and the extent is collapsed, unless
+  zeros in a hole, which a memfd is charged for, and the extent is
+  collapsed, unless
   the VMA is registered for write protection or a page has a marker
   (`EINVAL`, once the other extents are done) or a private mapping has a
   copy of its own of a page (`EINVAL`, at once). `MADV_HWPOISON` and

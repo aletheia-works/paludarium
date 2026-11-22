@@ -1744,8 +1744,10 @@ pub trait PageSource: Send + Sync {
         true
     }
     /// Whether the page at `offset` may come into the file's memory, which
-    /// an access to it asks each time: `false` makes the access a bus
-    /// error (`SIGBUS`), as secretmem's fault past `RLIMIT_MEMLOCK` is.
+    /// an access to it asks each time, through a shared mapping or a
+    /// private one of a shmem file that still shows the file's page:
+    /// `false` makes the access a bus error (`SIGBUS`), as secretmem's
+    /// fault past `RLIMIT_MEMLOCK` is and shmem's past its mount's size.
     fn admit(&self, offset: u64) -> bool {
         let _ = offset;
         true
@@ -3809,13 +3811,12 @@ impl AddressSpaceData {
                     ..fault(at)
                 });
             }
-            // A shared page its memory refuses to take in is a bus error;
-            // asked only of a page within its file, so that one past the
-            // end is never charged.
+            // A page its memory refuses to take in is a bus error; asked
+            // only of a page within its file, so that one past the end is
+            // never charged.
             if access != Access::Setup
-                && let Some(shared) = self.shared_at(page)
-                && let Some(source) = &shared.pages.source
-                && !source.admit(page.wrapping_add(shared.shift))
+                && let Some((source, offset)) = self.admitting(directory, page)
+                && !source.admit(offset)
             {
                 return Err(Fault {
                     bus: true,
@@ -3838,6 +3839,27 @@ impl AddressSpaceData {
             }
         }
         Ok(())
+    }
+
+    /// The memory an access to the page at `page` asks to take the page in
+    /// ([`PageSource::admit`]), and the page's offset in it: a shared
+    /// mapping's, or the shmem page cache a private mapping shows where it
+    /// has no copy of its own, as Linux's `shmem_fault` brings the page
+    /// into the file for a private mapping's read and copy-on-write faults
+    /// too.
+    fn admitting(&self, directory: &Directory, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
+        if let Some(shared) = self.shared_at(page) {
+            return shared
+                .pages
+                .source
+                .as_ref()
+                .map(|source| (source, page.wrapping_add(shared.shift)));
+        }
+        let backing = self.backing_at(page)?;
+        (backing.cache.is_some()
+            && backing.source.shmem()
+            && lookup(directory, page).is_none_or(|p| p.cache))
+        .then(|| (&backing.source, page.wrapping_add(backing.shift)))
     }
 
     /// Remembers the page at `page` in this thread's [`ThreadTlb`] when an

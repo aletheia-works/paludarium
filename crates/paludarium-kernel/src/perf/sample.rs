@@ -462,7 +462,7 @@ impl Event {
     /// for an inherited one, the one it comes from.
     pub(super) fn top(self: &Arc<Self>) -> Option<Arc<Event>> {
         match &self.parent {
-            Some(parent) => parent.upgrade(),
+            Some(parent) => super::event(parent),
             None => Some(Arc::clone(self)),
         }
     }
@@ -591,9 +591,7 @@ impl Event {
     /// (`perf_event_throttle_group`), written by thread `who`: the
     /// leader's time, its ID and its own (`stream_id`).
     fn log_throttle(self: &Arc<Self>, unthrottle: bool, who: &Who) {
-        let leader = lock(&self.leader)
-            .clone()
-            .unwrap_or_else(|| Arc::clone(self));
+        let leader = self.leader();
         let mut body = Vec::with_capacity(24);
         body.extend(leader.clock_now().to_le_bytes());
         body.extend(leader.id.to_le_bytes());

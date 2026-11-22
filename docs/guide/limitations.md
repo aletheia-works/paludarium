@@ -466,10 +466,16 @@ verified.
   `pkey_alloc` gives `ENOSPC` as Linux does on such a CPU, and programs carry
   on without them. `RDPKRU` and `WRPKRU` stop a program with `SIGILL`, as on
   such a CPU.
-- **Segment registers**: the virtual CPU cannot move to or from a segment
-  register (`mov` to `%ds`, `%fs` and the like stops a program with
-  `SIGILL`), so an entry that `modify_ldt` writes cannot be loaded and used,
-  where Linux loads it. The table itself reads back as Linux's.
+- **Segment registers, in part**: `lfs`, `lgs` and `lss`, `lar`, `lsl`,
+  `verr` and `verw`, and far jumps, calls and returns stop a program with
+  `SIGILL`, and the CPU runs only in `__USER_CS`: an `rt_sigreturn` frame
+  with another `cs` is a bad frame. `set_thread_area` is not implemented,
+  so the GDT's thread-local entries stay empty, and the limit of the CPU
+  number segment is 0. A `mov` or `pop` to `%ss` does not hold off the
+  single-step trap of the instruction after it, as the CPU does. After
+  `modify_ldt` only the calling thread's `%ds` and `%es` load again, where
+  Linux reloads them in every thread of the address space. A null selector
+  clears the `%fs` or `%gs` base, where AMD's CPUs before Zen 2 keep it.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
   `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`
   and `_WRITE_FIXED` run; the other operations complete with `EOPNOTSUPP`.

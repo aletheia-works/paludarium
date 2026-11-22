@@ -13,8 +13,8 @@
 //! registered files, their updates and their allocation range are checked
 //! as Linux 7.0's `io_uring/rsrc.c`, `register.c` and `filetable.c` check
 //! them, the provided buffers and their rings as its `kbuf.c` does, and a
-//! NOP's flags as its `nop.c` takes them: the kernel the differential tests
-//! run on.
+//! NOP's flags as its `nop.c` takes them (with Linux master's
+//! `IOSQE_FIXED_FILE`): the kernel the differential tests run on.
 //!
 //! The rings are pages the kernel shares with the mappings of the ring's
 //! descriptor ([`SharedPages`]). A request runs when `io_uring_enter` takes
@@ -836,7 +836,8 @@ impl Ring {
                     } else {
                         0
                     },
-                    file: has(NOP_FILE).then(|| (int_at(4), has(NOP_FIXED_FILE))),
+                    // `IOSQE_FIXED_FILE` names a registered one too.
+                    file: has(NOP_FILE).then(|| (int_at(4), fixed || has(NOP_FIXED_FILE))),
                     buffer: has(NOP_FIXED_BUFFER).then(|| u16::from_le_bytes([sqe[40], sqe[41]])),
                 }
             }
@@ -1212,18 +1213,21 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool) {
             let res = result(r);
             return (res, flags, res < 0);
         }
-        // `io_nop`: a file it does not find (`EBADF`), or a buffer
-        // (`EFAULT`), fails it, yet it completes with its result.
+        // `io_nop`, as Linux master has it: a file it does not find is
+        // `EBADF`, then a registered buffer `EFAULT`, else its result.
         &Work::Nop {
             result,
             file,
             buffer,
         } => {
-            let found = match file {
-                Some((fd, fixed)) => file_of(c, ring, fd, fixed).is_ok(),
-                None => true,
-            } && buffer.is_none_or(|index| ring.has_buffer(index));
-            return (result, 0, result < 0 || !found);
+            let res = if file.is_some_and(|(fd, fixed)| file_of(c, ring, fd, fixed).is_err()) {
+                -Errno::EBADF.0
+            } else if buffer.is_some_and(|index| !ring.has_buffer(index)) {
+                -Errno::EFAULT.0
+            } else {
+                result
+            };
+            return (res, 0, res < 0);
         }
         _ => {}
     }

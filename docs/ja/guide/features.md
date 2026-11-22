@@ -1450,7 +1450,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - io_uring は Linux 6.12 のものですが、登録したファイル、バッファーのグループ、NOP の
   フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
-  `kbuf.c`、`nop.c`）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
+  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
   それに `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS` です。ほかの操作は、それらなしでビルドした Linux と同じく
@@ -1463,9 +1463,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
   `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は
   `fd` のファイルを、`IORING_NOP_FIXED_FILE` があれば登録したものを探し、
-  `IORING_NOP_FIXED_BUFFER` は登録したバッファー `buf_index` を探します。見つからない NOP
-  は失敗し、リンクを終わらせ、`IOSQE_CQE_SKIP_SUCCESS` があっても完了を投稿しますが、
-  結果はそのまま自分の結果です。32 バイトの完了を持つリングはないので `IORING_NOP_CQE32`
+  `IORING_NOP_FIXED_BUFFER` は登録したバッファー `buf_index` を探します。これは Linux
+  master と同じで、`IOSQE_FIXED_FILE` でも登録したファイルを指します。ファイルが見つからない
+  NOP は `EBADF` で、バッファーが見つからない NOP は `EFAULT` で完了します。32 バイトの完了を持つリングはないので `IORING_NOP_CQE32`
   は `EINVAL` で、知らないフラグも `EINVAL` です。
 
 - 転送は Linux の `io_prep_rw` と `io_read` または `io_write` と同じ順に調べ、同じところで

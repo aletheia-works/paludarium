@@ -1632,7 +1632,8 @@ kernel.
 
 - io_uring is Linux 6.12's, but for its registered files, its groups of
   buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
-  `kbuf.c` and `nop.c`), the kernel the differential tests run on. Its
+  `kbuf.c` and `nop.c`, with master's `IOSQE_FIXED_FILE` for a NOP), the
+  kernel the differential tests run on. Its
   operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
@@ -1651,9 +1652,9 @@ kernel.
   do. `IORING_NOP_INJECT_RESULT` completes it with its `len`.
   `IORING_NOP_FILE` looks for the file of its `fd`, a registered one with
   `IORING_NOP_FIXED_FILE`, and `IORING_NOP_FIXED_BUFFER` for registered
-  buffer `buf_index`. A NOP that finds neither fails, which ends its link
-  and posts its completion even with `IOSQE_CQE_SKIP_SUCCESS`, yet it
-  completes with its result all the same. `IORING_NOP_CQE32` is `EINVAL`,
+  buffer `buf_index`, as Linux master does; `IOSQE_FIXED_FILE` also names
+  a registered file. A NOP that does not find its file completes with
+  `EBADF`, and one that does not find its buffer with `EFAULT`. `IORING_NOP_CQE32` is `EINVAL`,
   as no ring has 32-byte completions, and so are unknown flags.
 
 - A transfer is checked as Linux's `io_prep_rw` and `io_read` or

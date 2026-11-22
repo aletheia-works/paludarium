@@ -5594,28 +5594,41 @@ mod io_uring {
         assert_eq!(batch(&mut f, &r, &[nop(1, 1 << 6, 0, 0, 0)]), [(1, -22)]);
         assert_eq!(batch(&mut f, &r, &[nop(2, 1 << 5, 0, 0, 0)]), [(2, -22)]);
         assert_eq!(batch(&mut f, &r, &[nop(3, TW | INJECT, 0, 0, 3)]), [(3, 3)]);
-        // A file it does not find fails it, with its result all the same.
+        // A file it does not find is EBADF, which fails it.
         let file = FILE | INJECT;
         assert_eq!(batch(&mut f, &r, &[nop(4, file, fd, 0, 5)]), [(4, 5)]);
-        assert_eq!(batch(&mut f, &r, &[nop(5, file, 99, 0, 5)]), [(5, 5)]);
+        assert_eq!(batch(&mut f, &r, &[nop(5, file, 99, 0, 5)]), [(5, -9)]);
         let fixed = FILE | FIXED_FILE;
         assert_eq!(batch(&mut f, &r, &[skip(nop(6, fixed, 1, 0, 0))]), []);
-        assert_eq!(batch(&mut f, &r, &[skip(nop(7, fixed, 0, 0, 0))]), [(7, 0)]);
-        assert_eq!(batch(&mut f, &r, &[skip(nop(8, fixed, 2, 0, 0))]), [(8, 0)]);
+        assert_eq!(
+            batch(&mut f, &r, &[skip(nop(7, fixed, 0, 0, 0))]),
+            [(7, -9)]
+        );
+        assert_eq!(
+            batch(&mut f, &r, &[skip(nop(8, fixed, 2, 0, 0))]),
+            [(8, -9)]
+        );
         assert_eq!(batch(&mut f, &r, &[skip(nop(9, FIXED_FILE, 0, 0, 0))]), []);
-        // So does a registered buffer it does not find.
+        // IOSQE_FIXED_FILE names a registered one too.
+        let mut e = nop(14, file, fd, 0, 5);
+        e[1] = 1;
+        assert_eq!(batch(&mut f, &r, &[e]), [(14, -9)]);
+        let mut e = nop(15, file, 1, 0, 5);
+        e[1] = 1;
+        assert_eq!(batch(&mut f, &r, &[e]), [(15, 5)]);
+        // A registered buffer it does not find is EFAULT.
         let buffer = FIXED_BUFFER;
         assert_eq!(batch(&mut f, &r, &[skip(nop(10, buffer, 0, 0, 0))]), []);
         assert_eq!(
             batch(&mut f, &r, &[skip(nop(11, buffer, 0, 1, 0))]),
-            [(11, 0)]
+            [(11, -14)]
         );
         // A failed one ends its link.
         let mut head = nop(12, FILE, 99, 0, 0);
         head[1] = 1 << 2;
         assert_eq!(
             batch(&mut f, &r, &[head, nop(13, 0, 0, 0, 0)]),
-            [(12, 0), (13, -125)]
+            [(12, -9), (13, -125)]
         );
     }
 

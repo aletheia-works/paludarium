@@ -9021,9 +9021,9 @@ static int io_uring_files_case(void) {
     rr.flags = 0;
     uring_show("register2-no-data", syscall(427, ut.fd, 13, &rr, 32));
 
-    /* IORING_OP_NOP's Linux 7.0 flags: one that does not find its file or
-       buffer fails, which cancels its link and posts its completion even
-       with IOSQE_CQE_SKIP_SUCCESS, yet completes with its result. */
+    /* IORING_OP_NOP's Linux 7.0 flags: one that does not find its file
+       (EBADF) or buffer (EFAULT) fails, which cancels its link and posts its
+       completion even with IOSQE_CQE_SKIP_SUCCESS. */
     struct iovec nopbuf = {got, sizeof got};
     uring_show("register-buffer", syscall(427, ut.fd, 0, &nopbuf, 1));
     uf_list(list, fd, 0, 0);

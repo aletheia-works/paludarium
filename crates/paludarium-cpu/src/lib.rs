@@ -247,7 +247,15 @@ fn ends_block(insn: &Instruction) -> bool {
     use paludarium_decoder::Mnemonic as M;
     matches!(
         insn.mnemonic,
-        M::Jmp | M::Call | M::Ret | M::Syscall | M::Hlt | M::Ud2
+        M::Jmp
+            | M::JmpFar
+            | M::Call
+            | M::CallFar
+            | M::Ret
+            | M::RetFar
+            | M::Syscall
+            | M::Hlt
+            | M::Ud2
     )
 }
 

@@ -3343,6 +3343,16 @@ impl Addresses {
     pub(crate) fn local6(&self, ip: Ipv6Addr) -> bool {
         self.v6.iter().any(|a| a.address == ip && !a.tentative())
     }
+    /// Whether `ip` is an address here, not tentative, that a socket on the
+    /// device `index` may bind (`ipv6_chk_addr` without `strict`): one of
+    /// global scope of any device, a link-local or loopback one only of
+    /// that device.
+    pub(crate) fn local6_on(&self, ip: Ipv6Addr, index: i32) -> bool {
+        let scoped = ip.is_loopback() || ip.segments()[0] & 0xffc0 == 0xfe80;
+        self.v6
+            .iter()
+            .any(|a| a.address == ip && !a.tentative() && (!scoped || a.index == index))
+    }
     /// Whether `ip` is an address of the veth end `index`, not tentative,
     /// as `ndisc_recv_ns` answers a solicitation for it there
     /// (`ipv6_get_ifaddr`, strictly on the device).
@@ -4451,6 +4461,31 @@ mod tests {
         assert!(a.v6.iter().all(|v| v.index != 1000));
         assert!(a.routes6.iter().all(|r| r.oif != 1000));
         assert!(a.routes6.iter().any(|r| r.oif == 1001));
+    }
+    #[test]
+    fn a_device_binds_its_scoped_addresses_and_any_global_one() {
+        let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
+        let mut a = Addresses::first();
+        a.up(0, true);
+        for (ip, index) in [
+            ("2001:db8::1", 1000),
+            ("fe80::ff:fe00:a", 1000),
+            ("2001:db8:5::1", 1),
+        ] {
+            let mut address = V6::new(ip6(ip), 64);
+            address.index = index;
+            a.add_v6(address, Lifetimes::FOREVER, false, true, None, 0)
+                .unwrap();
+        }
+        // A link-local or loopback address only of its own device.
+        assert!(a.local6_on(ip6("fe80::ff:fe00:a"), 1000));
+        assert!(!a.local6_on(ip6("fe80::ff:fe00:a"), 1));
+        assert!(a.local6_on(ip6("::1"), 1));
+        assert!(!a.local6_on(ip6("::1"), 1000));
+        // A global one of any.
+        assert!(a.local6_on(ip6("2001:db8::1"), 1));
+        assert!(a.local6_on(ip6("2001:db8:5::1"), 1000));
+        assert!(!a.local6_on(ip6("2001:db8::2"), 1000));
     }
     #[test]
     fn ipv6_gateways_take_their_routes_device_and_qualify_for_ecmp() {

@@ -5665,8 +5665,9 @@ other is refused. Any network has its loopback, even one that allows nothing
 (`allow: []` in JavaScript, `NetworkPolicy::new()` in Rust); the command makes
 one only with an `--allow-net`.
 
-- **`bind`** takes a loopback address (`127.0.0.0/8`, `::1`, or IPv4
-  ones IPv4-mapped on an IPv6 socket) or the unspecified one, with a port
+- **`bind`** takes an address of its network namespace (the loopback's
+  `127.0.0.0/8` and `::1`, a veth end's, or IPv4 ones IPv4-mapped on an
+  IPv6 socket) or the unspecified one, with a port
   or, for port 0, an ephemeral one from 32768–60999, with Linux's checks in
   its order: `EADDRNOTAVAIL` for another address, `EINVAL` once bound,
   `EADDRINUSE` for a port another socket holds on an address both cover (a
@@ -5674,7 +5675,21 @@ one only with an `--allow-net`.
   `SO_REUSEADDR` and the other does not listen, or both set
   `SO_REUSEPORT`. An IPv6 socket on `::` holds the port for IPv4 too,
   unless `IPV6_V6ONLY`; binding to another IPv6 address that is not an
-  IPv4 one sets `IPV6_V6ONLY`, as `__inet6_bind` does.
+  IPv4 one sets `IPV6_V6ONLY`, as `__inet6_bind` does. A link-local
+  address, or a group of the node or the link (which only a UDP socket
+  binds, as any group), needs a device: its scope ID's (`sin6_scope_id`,
+  of a 28-byte address), which becomes the socket's and stays though the
+  bind fails, or the one the socket has: `EINVAL` without one, `ENODEV`
+  for one there is not, and `EADDRNOTAVAIL` for a link-local or loopback
+  address of another device (`ipv6_chk_addr`). `getsockname` and
+  `getpeername` give the socket's device as the scope ID of an address
+  that needs one, and `recvfrom` the device a datagram came in on. UDP's
+  `sendto` goes through the scope ID's device, for an address that needs
+  one, else the socket's, strictly (`ENETUNREACH` where no route goes
+  through it), and `connect`, UDP's and TCP's, the same way: the scope ID
+  becomes the socket's device, which stays though the connect fails;
+  `EINVAL` for one other than the device the socket has, or for none
+  where the socket has none (`__ip6_datagram_connect`, `tcp_v6_connect`).
 - **`listen`** keeps up to `backlog` + 1 connections waiting (at most
   4096, `net.core.somaxconn`); an unbound socket takes an ephemeral port on
   every address. A listener is readable while a connection waits (for

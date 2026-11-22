@@ -1054,11 +1054,13 @@ verified.
   each `EOPNOTSUPP`. An IPv6 gateway's neighbour state does not steer a
   lookup, as Linux's `rt6_check_neigh` does among routes of one metric,
   and two routes with gateways of one metric, which Linux makes
-  multipath siblings, are `EOPNOTSUPP` for now. A link-local
-  destination's scope ID is not taken: the first route to it is. A
-  connect without one to it, or a UDP one to a group of the node or the
-  link, is `EINVAL`, as Linux's is with no device bound and no multicast
-  interface, which sockets here have none of. Neighbour discovery makes none of
+  multipath siblings, are `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
+  link without a scope ID or a device is `EINVAL`, as Linux's is with no
+  multicast interface, which none is here. A connection accepted from a
+  link-local address has no device, so its names have no scope ID. A
+  socket's device steers only its IPv6 datagrams and connects,
+  and two sockets on one port conflict whatever their devices, where
+  Linux's on different devices do not. Neighbour discovery makes none of
   the neighbours of the groups router solicitation, MLD reports and
   duplicate address detection send to (`ff02::2`, `ff02::16`, the
   solicited-node ones), no advertisement unasked, and no redirect; the

@@ -17,7 +17,7 @@
    through its own gateway; TCP connects. Route lookups show the gateway
    and device, out and in through va or lo (RTA_IIF): strictly through
    the device for a link-local, loopback or group address, through lo for
-   a local one, and ENODEV for a group's. The routes of the main table
+   a local one, and EMSGSIZE for a group's. The routes of the main table
    through va are dumped, and what RTNLGRP_IPV6_ROUTE hears is shown in its
    order. The two processes take turns through pipes, so their lines come
    in one order; an address done and a neighbour resolved are waited for

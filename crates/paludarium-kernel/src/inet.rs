@@ -393,7 +393,40 @@ impl Network {
     /// limited broadcast address from a source `from` of a veth end's goes
     /// out through that end without a route, as `ip_route_output_key_hash_rcu`
     /// takes the source's device for them.
-    fn route(&self, to: SocketAddr, from: Option<IpAddr>, now: Option<u64>) -> Result<Dest, Errno> {
+    ///
+    /// Through a device `oif` other than 0, which a scope ID or the socket's
+    /// device gives, an IPv6 destination's route is looked up strictly
+    /// through it (`RT6_LOOKUP_F_IFACE`), a local one too, and `ENETUNREACH`
+    /// where none goes. An IPv4 one goes as through any.
+    fn route(
+        &self,
+        to: SocketAddr,
+        from: Option<IpAddr>,
+        oif: u32,
+        now: Option<u64>,
+    ) -> Result<Dest, Errno> {
+        if let IpAddr::V6(ip) = to.ip()
+            && oif != 0
+            && !ip.is_unspecified()
+        {
+            use crate::interface::Kind;
+            let route = self.addresses_at(now).lookup6_on(ip, oif)?;
+            return match route.kind {
+                Kind::Local if self.is_up() => Ok(Dest::Here(to)),
+                Kind::Unicast | Kind::Multicast if route.oif != crate::netdev::LOOPBACK_OIF => {
+                    let index = i32::try_from(route.oif).map_err(|_| ENETUNREACH)?;
+                    let cast = if ip.is_multicast() {
+                        Cast::Multicast
+                    } else {
+                        Cast::Unicast
+                    };
+                    Ok(Dest::Veth(index, cast))
+                }
+                Kind::Local => Err(ENETUNREACH),
+                _ if self.isolated => Err(ENETUNREACH),
+                _ => Ok(Dest::Away),
+            };
+        }
         if let (Some(IpAddr::V4(src)), IpAddr::V4(ip)) = (from.map(plain), to.ip())
             && !src.is_unspecified()
             && (ip.is_multicast() || ip.is_broadcast())
@@ -714,6 +747,30 @@ impl Network {
             Reach::OneWay(there)
         }
     }
+    /// The device a packet to this namespace's own address `ip` comes in on:
+    /// that of its local route, which for an IPv6 one is its address's
+    /// device (`addrconf_f6i_alloc`); 0 for an IPv4 one.
+    fn local_device(&self, ip: IpAddr, now: Option<u64>) -> u32 {
+        match ip {
+            IpAddr::V6(ip) => self
+                .addresses_at(now)
+                .lookup6(ip)
+                .ok()
+                .filter(|r| r.kind == crate::interface::Kind::Local)
+                .map_or(0, |r| r.oif),
+            IpAddr::V4(_) => 0,
+        }
+    }
+    /// The index the peer of this namespace's veth end `index` has in its
+    /// own namespace, where a packet out through the end comes in; 0 for
+    /// none.
+    fn peer_index(&self, index: i32) -> u32 {
+        self.devices()
+            .by_index(index)
+            .and_then(|d| d.veth.as_ref()?.peer.as_ref().map(|p| p.index))
+            .and_then(|i| u32::try_from(i).ok())
+            .unwrap_or(0)
+    }
     /// The neighbour a packet to `to` out through the veth end `index`
     /// goes to at `now`: its route's gateway, else `to` itself
     /// (`rt6_nexthop`).
@@ -1002,6 +1059,15 @@ impl Network {
                     || self.addresses_at(now).bindable4(ip)
             }
             IpAddr::V6(ip) => ip.is_unspecified() || self.addresses_at(now).local6(ip),
+        }
+    }
+    /// Whether a socket on the device `index` (or none, 0) may bind the
+    /// IPv6 address `ip` (`ipv6_chk_addr`): an address of this namespace's,
+    /// of that device's where it is link-local or a loopback one.
+    fn bindable6_on(&self, ip: Ipv6Addr, index: u32, now: Option<u64>) -> bool {
+        match i32::try_from(index) {
+            Ok(index) if index != 0 => self.addresses_at(now).local6_on(ip, index),
+            _ => self.addresses_at(now).local6(ip),
         }
     }
     /// The user namespace whose `CAP_NET_ADMIN` changes this network, as
@@ -1543,6 +1609,9 @@ struct Options {
     user_timeout: i32,
     type_of_service: i32,
     v6_only: bool,
+    /// The device the socket is bound to (`sk_bound_dev_if`), which a
+    /// link-local address's scope ID gives, or 0.
+    device: u32,
     /// `SO_TIMESTAMP`, its kin and `SO_TIMESTAMPING`.
     timestamps: Timestamps,
 }
@@ -1570,6 +1639,7 @@ impl Default for Options {
             user_timeout: 0,
             type_of_service: 0,
             v6_only: false,
+            device: 0,
             timestamps: Timestamps::default(),
         }
     }
@@ -2011,24 +2081,31 @@ impl InetSocket {
             if s.listen.is_some() {
                 return Err(EISCONN);
             }
-            let pending = match s.connection {
+            let connection = s.connection;
+            let pending = match connection {
                 Connection::Connected => return Err(EISCONN),
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
                     let plain_to = SocketAddr::new(plain(address.ip()), address.port());
-                    // A link-local peer needs an interface (`tcp_v6_connect`,
-                    // after a group's `ENETUNREACH`): the scope ID's, for no
-                    // device is bound here.
-                    if let SocketAddr::V6(v6) = address
-                        && v6.scope_id() == 0
-                        && !v6.ip().is_multicast()
-                        && needs_scope_id(*v6.ip())
-                    {
-                        return Err(Errno::EINVAL);
+                    // `tcp_v6_connect` takes a group's `ENETUNREACH` first,
+                    // which its route gives here.
+                    let device = if address.ip().is_multicast() {
+                        options.device
+                    } else {
+                        connect_device(address, options.device)?
+                    };
+                    if device != options.device {
+                        // The options' lock comes before the state's.
+                        drop(s);
+                        self.options().device = device;
+                        s = self.lock();
                     }
-                    let dest = self
-                        .network
-                        .route(plain_to, s.bound.map(|b| b.ip()), self.now())?;
+                    let dest = self.network.route(
+                        plain_to,
+                        s.bound.map(|b| b.ip()),
+                        device,
+                        self.now(),
+                    )?;
                     let to = match dest {
                         Dest::Here(to) => Some(to),
                         Dest::Away | Dest::Veth(..) => None,
@@ -2245,19 +2322,20 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        // A link-local address, or a group of the node or the link, needs
-        // an interface (`__ip6_datagram_connect`): the scope ID's, for no
-        // device is bound and no multicast interface set here.
-        if let SocketAddr::V6(v6) = address
-            && v6.scope_id() == 0
-            && needs_scope_id(*v6.ip())
-        {
-            return Err(Errno::EINVAL);
+        let device = connect_device(address, options.device)?;
+        if device != options.device {
+            // The options' lock comes before the state's.
+            drop(s);
+            self.options().device = device;
+            s = self.lock();
         }
         if to.is_ipv4() {
             self.mapped_source(bound)?;
         }
-        match self.network.route(to, Some(bound.ip()), self.now())? {
+        match self
+            .network
+            .route(to, Some(bound.ip()), device, self.now())?
+        {
             Dest::Here(to) => {
                 let from = self.datagram_source(&mut s, to, &options)?;
                 self.ports().connect(&self.this, from, Some(to));
@@ -2391,9 +2469,15 @@ impl InetSocket {
         {
             self.mapped_source(bound)?;
         }
+        // Out through the scope ID's device, of an address that needs one,
+        // else the socket's (`udpv6_sendmsg`).
+        let oif = match to {
+            SocketAddr::V6(v6) if v6.scope_id() != 0 && needs_scope_id(*v6.ip()) => v6.scope_id(),
+            _ => options.device,
+        };
         let route = self
             .network
-            .route(plain_to, s.bound.map(|b| b.ip()), self.now())?;
+            .route(plain_to, s.bound.map(|b| b.ip()), oif, self.now())?;
         if let Dest::Veth(index, cast) = route {
             let v6 = plain_to.is_ipv6();
             if self.family == Family::V6 && options.v6_only && !v6 {
@@ -2457,7 +2541,7 @@ impl InetSocket {
                 self.network.reply(index, from.ip(), to.ip(), self.now());
             }
             match receiver {
-                Some(receiver) => receiver.deliver(from, bytes),
+                Some(receiver) => receiver.deliver_on(from, bytes, self.network.peer_index(index)),
                 None if answered && to_peer => {
                     self.lock().error = Some(ECONNREFUSED);
                     self.signals.send(Reason::Error);
@@ -2485,7 +2569,7 @@ impl InetSocket {
             self.network.output(dest.ip(), now);
             let receiver = self.ports().receiver(dest, from);
             if let Some(receiver) = receiver {
-                receiver.deliver(from, bytes);
+                receiver.deliver_on(from, bytes, self.network.local_device(dest.ip(), now));
                 return Ok(bytes.len());
             }
             // A nested namespace has no stub.
@@ -2539,6 +2623,13 @@ impl InetSocket {
     /// `__udp_enqueue_schedule_skb` drops it: an empty buffer takes one of
     /// any size, unless `SO_RCVBUF` is over half of `INT_MAX`.
     fn deliver(&self, from: SocketAddr, bytes: &[u8]) {
+        self.deliver_on(from, bytes, 0);
+    }
+    /// Queues a datagram from `from` that came in on the device `iif`, which
+    /// `recvfrom` gives as the scope ID of a sender that needs one
+    /// (`ipv6_iface_scope_id` of `inet6_iif`).
+    fn deliver_on(&self, from: SocketAddr, bytes: &[u8], iif: u32) {
+        let from = scoped(from, iif);
         let limit = usize::try_from(self.options().receive_buffer).unwrap_or(0);
         // A datagram from an IPv4 address goes as IPv4, to a dual-stack
         // socket too.
@@ -2737,21 +2828,46 @@ impl InetSocket {
                 if (ip.is_multicast() && !self.datagram) || taken(&s) {
                     return Err(Errno::EINVAL);
                 }
+                let device = options.device;
                 if let Some(v4) = ip.to_ipv4_mapped() {
                     if options.v6_only {
                         return Err(Errno::EINVAL);
+                    }
+                    if device != 0 && !self.network.has_device(device) {
+                        return Err(ENODEV);
                     }
                     if !own(v4) {
                         return Err(EADDRNOTAVAIL);
                     }
                     SocketAddr::from((v4, port))
-                } else if self.network.bindable(IpAddr::V6(ip), self.now()) {
+                } else if ip.is_unspecified() {
                     SocketAddr::from((ip, port))
-                } else if ip.segments()[0] & 0xffc0 == 0xfe80 && scope == 0 {
-                    // A link-local address needs its interface.
-                    return Err(Errno::EINVAL);
                 } else {
-                    return Err(EADDRNOTAVAIL);
+                    // A link-local address, or a group of the node or the
+                    // link, takes its scope ID as the socket's device, which
+                    // stays though the bind fails, and needs one.
+                    let device = if needs_scope_id(ip) && scope != 0 {
+                        scope
+                    } else {
+                        device
+                    };
+                    let chosen = if needs_scope_id(ip) && device == 0 {
+                        Err(Errno::EINVAL)
+                    } else if device != 0 && !self.network.has_device(device) {
+                        Err(ENODEV)
+                    } else if ip.is_multicast() || self.network.bindable6_on(ip, device, self.now())
+                    {
+                        Ok(SocketAddr::from((ip, port)))
+                    } else {
+                        Err(EADDRNOTAVAIL)
+                    };
+                    if device != options.device {
+                        // The options' lock comes before the state's.
+                        drop(s);
+                        self.options().device = device;
+                        s = self.lock();
+                    }
+                    chosen?
                 }
             }
         };
@@ -3482,6 +3598,41 @@ impl FileHandle for InetSocket {
     }
 }
 
+/// `address` with the scope ID it has as a name (`ipv6_iface_scope_id`): the
+/// device `device` where its address needs one, else none.
+fn scoped(address: SocketAddr, device: u32) -> SocketAddr {
+    match address {
+        SocketAddr::V6(mut v6) => {
+            v6.set_scope_id(if needs_scope_id(*v6.ip()) { device } else { 0 });
+            SocketAddr::V6(v6)
+        }
+        address => address,
+    }
+}
+/// The device a connect to `address` from a socket bound to `device` goes
+/// out through, which the socket keeps though the connect then fails
+/// (`__ip6_datagram_connect`, `tcp_v6_connect`): a link-local address, or a
+/// group of the node or the link, takes its scope ID's, which must be the
+/// socket's device where it has one (`sk_dev_equal_l3scope`), and needs one
+/// (`EINVAL` for both); any other the socket's. No multicast interface is set
+/// here to stand in for a group's.
+fn connect_device(address: SocketAddr, device: u32) -> Result<u32, Errno> {
+    let SocketAddr::V6(v6) = address else {
+        return Ok(device);
+    };
+    if !needs_scope_id(*v6.ip()) {
+        return Ok(device);
+    }
+    let device = match v6.scope_id() {
+        0 => device,
+        scope if device != 0 && device != scope => return Err(Errno::EINVAL),
+        scope => scope,
+    };
+    if device == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(device)
+}
 /// Whether a peer of `ip` needs an interface (`__ipv6_addr_needs_scope_id`):
 /// a link-local unicast address, or a group of the node or the link scope
 /// (`ipv6_addr_scope2type`).
@@ -4034,6 +4185,7 @@ pub(crate) fn dispatch(
             } else {
                 socket.peer()?
             };
+            let address = scoped(address, socket.options().device);
             write_address(c, &encode_address(socket.family, address), a[1], a[2])?;
             Ok(0)
         }
@@ -4857,7 +5009,12 @@ mod tests {
         assert!(!at(2 * SECOND));
         assert!(
             network
-                .route(SocketAddr::new(IpAddr::V4(ip), 9), None, Some(3 * SECOND))
+                .route(
+                    SocketAddr::new(IpAddr::V4(ip), 9),
+                    None,
+                    0,
+                    Some(3 * SECOND)
+                )
                 .is_err()
         );
         // What the socket found goes to netlink first, in its order: the

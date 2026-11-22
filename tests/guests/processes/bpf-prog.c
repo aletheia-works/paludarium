@@ -41,7 +41,10 @@
    checks (the operation, its size, the registers, the context, the
    alignment on the stack and in a value, a read-only value, the register
    the old value goes to), and a filter that runs them on a map's value
-   and the stack, whose results the case reads back from the map.
+   and the stack, whose results the case reads back from the map. Then,
+   with BPF_F_STRICT_ALIGNMENT, plain loads through a hash lookup's result
+   before its null check: misaligned, which is refused for that first, and
+   aligned.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -1909,6 +1912,21 @@ static int case_atomic(void) {
     LOAD("32 bits of a spilled pointer", STX_DW(10, 10, -8), MOV(1, 0),
          ATOMIC_W(10, 1, -8, A_ADD | A_FETCH), MOV(0, 0), EXIT());
 #undef ON_STACK
+
+    /* BPF_F_STRICT_ALIGNMENT, for loads too: a lookup's result before its
+       null check is checked for alignment before it is refused. */
+    {
+        struct insn misaligned[] = {KEY8(hash), CALL(LOOKUP), LDX_W(0, 0, 2), EXIT()};
+        struct insn aligned[] = {KEY8(hash), CALL(LOOKUP), LDX_W(0, 0, 4), EXIT()};
+        struct prog_attr p = attr(misaligned, COUNT(misaligned));
+        p.prog_flags = 1;
+        run("strict, misaligned in a lookup's result unchecked", p);
+        p = attr(aligned, COUNT(aligned));
+        p.prog_flags = 1;
+        run("strict, aligned in a lookup's result unchecked", p);
+        run("not strict, misaligned in a lookup's result unchecked",
+            attr(misaligned, COUNT(misaligned)));
+    }
 
     /* A filter that runs them on the map's value and the stack, and keeps
        what each gave in the value. */

@@ -348,7 +348,10 @@ mod real_console {
         // SAFETY: pipe outputs are live host-owned pointer buffers, and each
         // handle is closed once, here.
         unsafe {
-            assert_ne!(CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0), 0);
+            assert_ne!(
+                CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0),
+                0
+            );
             CloseHandle(read);
             CloseHandle(write);
         }

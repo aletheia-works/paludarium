@@ -9650,6 +9650,361 @@ static int io_uring_poll_case(void) {
     return 0;
 }
 
+/* poll and epoll on a ring's descriptor (io_uring_poll): writable while the
+   submission queue has room, readable while completions wait in the queue
+   or the kernel, or a ring with IORING_SETUP_DEFER_TASKRUN has task work.
+   Only a completion wakes a poll, and only one that waits for input: an
+   edge-triggered interest in output hears of no completion. */
+static void rp_poll(struct uring *u, const char *label) {
+    struct pollfd p = {u->fd, POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM, 0};
+    int r = poll(&p, 1, 0);
+    printf("%s: poll=%d revents=%x\n", label, r, (unsigned)p.revents);
+}
+
+static void rp_epoll(int ep, const char *label) {
+    struct epoll_event e[4];
+    int r = epoll_wait(ep, e, 4, 0);
+    printf("%s: epoll=%d", label, r);
+    for (int i = 0; i < r; i++) printf(" %lu:%x", (unsigned long)e[i].data.u64, e[i].events);
+    printf("\n");
+}
+
+static int rp_add(int ep, int fd, unsigned events, unsigned long data) {
+    struct epoll_event e = {events, {.u64 = data}};
+    return epoll_ctl(ep, EPOLL_CTL_ADD, fd, &e);
+}
+
+struct rp_helper {
+    struct uring *u;
+    int fd;
+};
+
+/* Submits a NOP to the ring after 100 ms, or writes the pipe. */
+static void *rp_helper_main(void *arg) {
+    struct rp_helper *h = arg;
+    pw_sleep_ms(100);
+    if (h->u) {
+        tw_nop(h->u, 99, 0, 0, 0);
+        uring_enter(h->u->fd, 1, 0, 0, NULL, 0);
+    } else if (write(h->fd, "w", 1) != 1) {
+        return NULL;
+    }
+    return NULL;
+}
+
+static int io_uring_ring_poll_case(void) {
+    struct uring u, defer;
+    pthread_t t;
+    struct rp_helper h;
+    int a[2];
+    char buf[8];
+    if (uring_open(&u, 8) || pipe(a)) return 80;
+    rp_poll(&u, "empty");
+    tw_nop(&u, 1, 0, 0, 0);
+    uring_show("nop", uring_enter(u.fd, 1, 0, 0, NULL, 0));
+    rp_poll(&u, "completion");
+    uring_reap(&u, "reaped");
+    rp_poll(&u, "reaped");
+    /* A full submission queue takes no entry. */
+    for (int i = 0; i < 8; i++) tw_nop(&u, 10 + i, 0, 0, 0);
+    rp_poll(&u, "sq-full");
+    uring_show("submit-8", uring_enter(u.fd, 8, 0, 0, NULL, 0));
+    rp_poll(&u, "submitted");
+    /* Completions that wait in the kernel for room. */
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 8; i++) tw_nop(&u, 20 + 8 * round + i, 0, 0, 0);
+        uring_enter(u.fd, 8, 0, 0, NULL, 0);
+    }
+    printf("overflow-flag: %x\n", *u32p(u.rings, 36) & 2);
+    __atomic_store_n(u32p(u.rings, 8), *u32p(u.rings, 12), __ATOMIC_RELEASE);
+    rp_poll(&u, "overflowed");
+    uring_show("flush", uring_enter(u.fd, 0, 0, 1, NULL, 0));
+    uring_reap(&u, "flushed");
+    rp_poll(&u, "flushed");
+
+    /* epoll, level- and edge-triggered. */
+    int lt = epoll_create1(0), et = epoll_create1(0), out = epoll_create1(0);
+    if (lt < 0 || et < 0 || out < 0) return 81;
+    printf("add: %d %d %d\n", rp_add(lt, u.fd, EPOLLIN, 1), rp_add(et, u.fd, EPOLLIN | EPOLLET, 2),
+           rp_add(out, u.fd, EPOLLOUT | EPOLLET, 3));
+    rp_epoll(lt, "lt-empty");
+    rp_epoll(et, "et-empty");
+    rp_epoll(out, "out-first");
+    rp_epoll(out, "out-again");
+    tw_nop(&u, 40, 0, 0, 0);
+    uring_enter(u.fd, 1, 0, 0, NULL, 0);
+    rp_epoll(lt, "lt-completion");
+    rp_epoll(lt, "lt-again");
+    rp_epoll(et, "et-completion");
+    rp_epoll(et, "et-again");
+    rp_epoll(out, "out-completion");
+    tw_nop(&u, 41, 0, 0, 0);
+    uring_enter(u.fd, 1, 0, 0, NULL, 0);
+    rp_epoll(et, "et-second");
+    uring_reap(&u, "epoll-reaped");
+    rp_epoll(lt, "lt-reaped");
+
+    /* Another thread's submission wakes an epoll_wait and a poll. */
+    struct epoll_event e;
+    h.u = &u;
+    pthread_create(&t, NULL, rp_helper_main, &h);
+    int r = epoll_wait(lt, &e, 1, 5000);
+    printf("woken-epoll: %d %x\n", r, r == 1 ? e.events : 0);
+    pthread_join(t, NULL);
+    uring_reap(&u, "woken-epoll");
+    pthread_create(&t, NULL, rp_helper_main, &h);
+    struct pollfd p = {u.fd, POLLIN, 0};
+    r = poll(&p, 1, 5000);
+    printf("woken-poll: %d %x\n", r, (unsigned)p.revents);
+    pthread_join(t, NULL);
+    uring_reap(&u, "woken-poll");
+    /* So does a read that waited for its pipe, as its task work runs. */
+    pw_read(&u, 50, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    h.u = NULL;
+    h.fd = a[1];
+    pthread_create(&t, NULL, rp_helper_main, &h);
+    p.revents = 0;
+    r = poll(&p, 1, 5000);
+    printf("read-poll: %d %x\n", r, (unsigned)p.revents);
+    pthread_join(t, NULL);
+    uring_reap(&u, "read-poll");
+
+    /* A ring with IORING_SETUP_DEFER_TASKRUN is readable with task work. */
+    if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 82;
+    tw_nop(&defer, 60, 1 << 4, 0, 0);
+    tw_submit(&defer, 1, 0, "defer-tw");
+    rp_poll(&defer, "defer-tw");
+    uring_show("defer-wait", uring_enter(defer.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&defer, "defer-wait");
+    rp_poll(&defer, "defer-reaped");
+    close(defer.fd);
+    close(lt);
+    close(et);
+    close(out);
+    close(u.fd);
+    return 0;
+}
+
+/* IORING_OP_ASYNC_CANCEL and IORING_REGISTER_SYNC_CANCEL, of reads that wait
+   for their pipes: by user_data, every match with IORING_ASYNC_CANCEL_ALL,
+   any with _ANY, by file (_FD, registered with _FD_FIXED) or operation
+   (_OP). The cancelled read completes with ECANCELED as task work, after
+   the cancellation, and fails its link; its provided buffer is used. A
+   read whose pipe became ready, whose task work has not run (a ring with
+   IORING_SETUP_DEFER_TASKRUN before its wait), is cancelled too, and the
+   bytes stay in the pipe. */
+static unsigned char *uc_cancel(struct uring *u, unsigned long data, unsigned long target,
+                                unsigned flags, int fd) {
+    unsigned char *sqe = uring_push(u, 14, data);
+    memcpy(sqe + 16, &target, 8);
+    memcpy(sqe + 28, &flags, 4);
+    memcpy(sqe + 4, &fd, 4);
+    return sqe;
+}
+
+struct uc_sync {
+    unsigned long addr;
+    int fd;
+    unsigned flags;
+    long tv_sec, tv_nsec;
+    unsigned char opcode, pad[7];
+    unsigned long pad2[3];
+};
+
+static long uc_sync_cancel(struct uring *u, struct uc_sync *sc, unsigned nr) {
+    return syscall(427, u->fd, 24, sc, nr);
+}
+
+static int io_uring_cancel_case(void) {
+    struct uring u, defer;
+    char buf[8], more[8];
+    int a[2], b[2], c[2];
+    if (uring_open(&u, 8) || pipe(a) || pipe(b) || pipe(c)) return 80;
+
+    pw_read(&u, 1, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    uc_cancel(&u, 100, 1, 0, 0);
+    tw_submit(&u, 1, 0, "cancel");
+    uc_cancel(&u, 101, 1, 0, 0);
+    tw_submit(&u, 1, 0, "cancel-gone");
+    /* The pipe's bytes are not read. */
+    printf("write: %ld\n", (long)write(a[1], "ab", 2));
+    printf("read: %ld\n", (long)read(a[0], more, sizeof more));
+    uring_reap(&u, "nothing");
+
+    /* A link after the read fails with it; one after a cancellation that
+       found nothing fails too. */
+    unsigned char *sqe = pw_read(&u, 2, a[0], buf, sizeof buf, 0);
+    sqe[1] = 1 << 2;
+    tw_nop(&u, 3, 0, 0, 0);
+    tw_submit(&u, 2, 0, "linked");
+    sqe = uc_cancel(&u, 102, 2, 0, 0);
+    sqe[1] = 1 << 2;
+    tw_nop(&u, 103, 0, 0, 0);
+    tw_submit(&u, 2, 0, "cancel-linked");
+    sqe = uc_cancel(&u, 104, 2, 0, 0);
+    sqe[1] = 1 << 2;
+    tw_nop(&u, 105, 0, 0, 0);
+    tw_submit(&u, 2, 0, "cancel-none-linked");
+
+    /* Twice in one submission: a cancelled read stays findable until its
+       task work runs. */
+    pw_read(&u, 4, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-4");
+    uc_cancel(&u, 106, 4, 0, 0);
+    uc_cancel(&u, 107, 4, 0, 0);
+    tw_submit(&u, 2, 0, "cancel-twice");
+
+    /* IORING_ASYNC_CANCEL_ALL by user_data, then _ANY, in the order of the
+       ring's hash of user_data. */
+    pw_read(&u, 5, a[0], buf, sizeof buf, 0);
+    pw_read(&u, 5, b[0], buf, sizeof buf, 0);
+    pw_read(&u, 6, c[0], buf, sizeof buf, 0);
+    tw_submit(&u, 3, 0, "armed-all");
+    uc_cancel(&u, 108, 5, 1, 0);
+    tw_submit(&u, 1, 0, "cancel-all");
+    uc_cancel(&u, 109, 5, 1, 0);
+    tw_submit(&u, 1, 0, "cancel-all-none");
+    for (int i = 0; i < 6; i++) pw_read(&u, 7 + i, i % 2 ? b[0] : c[0], buf, sizeof buf, 0);
+    tw_submit(&u, 6, 0, "armed-any");
+    uc_cancel(&u, 110, 0, 1 << 2, 0);
+    tw_submit(&u, 1, 0, "cancel-any");
+    uc_cancel(&u, 111, 6, 0, 0);
+    tw_submit(&u, 1, 0, "cancel-any-gone");
+
+    /* By file, by operation. */
+    pw_read(&u, 20, a[0], buf, sizeof buf, 0);
+    pw_read(&u, 21, b[0], buf, sizeof buf, 0);
+    pw_read(&u, 22, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 3, 0, "armed-fd");
+    uc_cancel(&u, 112, 0, 1 << 1, b[0]);
+    tw_submit(&u, 1, 0, "cancel-fd");
+    uc_cancel(&u, 113, 0, 1 << 1 | 1, b[0]);
+    tw_submit(&u, 1, 0, "cancel-fd-all");
+    uc_cancel(&u, 114, 0, 1 << 1, 1000);
+    tw_submit(&u, 1, 0, "cancel-fd-closed");
+    uc_cancel(&u, 115, 0, 1 << 1 | 1 << 3, 0);
+    tw_submit(&u, 1, 0, "cancel-fd-fixed-none");
+    sqe = uc_cancel(&u, 116, 0, 1 << 5, 0);
+    unsigned op = 22;
+    memcpy(sqe + 24, &op, 4);
+    tw_submit(&u, 1, 0, "cancel-op");
+    /* Registered files: _FD_FIXED, or IOSQE_FIXED_FILE. */
+    int fds[2] = {a[0], b[0]};
+    uring_show("register", syscall(427, u.fd, 2, fds, 2));
+    pw_read(&u, 23, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-fixed");
+    uc_cancel(&u, 117, 0, 1 << 1 | 1 << 3, 1);
+    tw_submit(&u, 1, 0, "cancel-fd-fixed");
+    sqe = uc_cancel(&u, 118, 0, 1 << 1, 0);
+    sqe[1] = 1;
+    tw_submit(&u, 1, 0, "cancel-fixed-flag");
+    uring_show("unregister", syscall(427, u.fd, 3, NULL, 0));
+
+    /* What the preparation refuses, one at a time: each ends its
+       submission. */
+    uc_cancel(&u, 120, 0, 1 << 6, 0);
+    tw_submit(&u, 1, 0, "unknown-flag");
+    uc_cancel(&u, 121, 0, 1 << 2 | 1 << 1, 0);
+    tw_submit(&u, 1, 0, "any-fd");
+    uc_cancel(&u, 122, 0, 1 << 2 | 1 << 5, 0);
+    tw_submit(&u, 1, 0, "any-op");
+    sqe = uc_cancel(&u, 123, 0, 1 << 5, 0);
+    op = 255;
+    memcpy(sqe + 24, &op, 4);
+    tw_submit(&u, 1, 0, "op-past-last");
+    uc_cancel(&u, 124, 0, 0, 0)[8] = 1;
+    tw_submit(&u, 1, 0, "off");
+    uc_cancel(&u, 125, 0, 0, 0)[44] = 1;
+    tw_submit(&u, 1, 0, "splice-fd");
+    uc_cancel(&u, 126, 0, 0, 0)[2] = 1;
+    tw_submit(&u, 1, 0, "ioprio");
+    uc_cancel(&u, 127, 0, 0, 0)[1] = 1 << 5;
+    tw_submit(&u, 1, 0, "buffer-select");
+    /* Without _OP, the operation's field is not looked at. */
+    pw_read(&u, 24, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-24");
+    uc_cancel(&u, 128, 24, 0, 0)[24] = 1;
+    tw_submit(&u, 1, 0, "len-ignored");
+
+    /* A provided buffer the read kept is used. */
+    char *pool = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pool == MAP_FAILED) return 81;
+    sqe = uring_push(&u, 31, 130);
+    int count = 2;
+    unsigned short bgid = 3;
+    unsigned long addr = (unsigned long)pool;
+    unsigned len = 8;
+    long bid = 4;
+    memcpy(sqe + 4, &count, 4);
+    memcpy(sqe + 8, &bid, 8);
+    memcpy(sqe + 16, &addr, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 40, &bgid, 2);
+    tw_submit(&u, 1, 0, "provide");
+    sqe = pw_read(&u, 25, c[0], NULL, 8, 0);
+    sqe[1] = 1 << 5;
+    memcpy(sqe + 40, &bgid, 2);
+    tw_submit(&u, 1, 0, "armed-select");
+    uc_cancel(&u, 131, 25, 0, 0);
+    uring_show("cancel-select", uring_enter(u.fd, 1, 0, 0, NULL, 0));
+    pw_reap_flags(&u, "cancel-select");
+
+    /* IORING_REGISTER_SYNC_CANCEL. */
+    pw_read(&u, 27, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-sync");
+    struct uc_sync sc;
+    memset(&sc, 0, sizeof sc);
+    sc.addr = 27;
+    sc.tv_sec = sc.tv_nsec = -1;
+    uring_show("sync-nr-0", uc_sync_cancel(&u, &sc, 0));
+    uring_show("sync-null", syscall(427, u.fd, 24, NULL, 1));
+    sc.flags = 1 << 6;
+    uring_show("sync-flags", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 0;
+    sc.pad[3] = 1;
+    uring_show("sync-pad", uc_sync_cancel(&u, &sc, 1));
+    sc.pad[3] = 0;
+    sc.pad2[2] = 1;
+    uring_show("sync-pad2", uc_sync_cancel(&u, &sc, 1));
+    sc.pad2[2] = 0;
+    sc.flags = 1 << 1;
+    sc.fd = 1000;
+    uring_show("sync-fd-closed", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 1 << 1 | 1 << 3;
+    uring_show("sync-fixed-none", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 0;
+    uring_show("sync", uc_sync_cancel(&u, &sc, 1));
+    uring_reap(&u, "sync");
+    uring_show("sync-none", uc_sync_cancel(&u, &sc, 1));
+    pw_read(&u, 26, a[0], buf, sizeof buf, 0);
+    pw_read(&u, 26, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 2, 0, "armed-sync-all");
+    sc.addr = 26;
+    sc.flags = 1;
+    uring_show("sync-all", uc_sync_cancel(&u, &sc, 1));
+    uring_reap(&u, "sync-all");
+    uring_show("sync-all-none", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 1 << 2 | 1 << 1;
+    sc.fd = a[0];
+    uring_show("sync-any-fd", uc_sync_cancel(&u, &sc, 1));
+
+    /* A read whose pipe is ready waits for its ring's wait to run. */
+    if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 82;
+    pw_read(&defer, 30, a[0], buf, sizeof buf, 0);
+    tw_submit(&defer, 1, 0, "defer-armed");
+    printf("write: %ld\n", (long)write(a[1], "cd", 2));
+    uc_cancel(&defer, 140, 30, 0, 0);
+    tw_submit(&defer, 1, 0, "defer-cancel");
+    uring_show("defer-wait", uring_enter(defer.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&defer, "defer-wait");
+    printf("read: %ld\n", (long)read(a[0], more, sizeof more));
+    close(defer.fd);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -36342,6 +36697,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-buffers")) return io_uring_buffers_case();
     if (!strcmp(mode, "io-uring-task-work")) return io_uring_task_work_case();
     if (!strcmp(mode, "io-uring-poll")) return io_uring_poll_case();
+    if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
+    if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

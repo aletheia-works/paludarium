@@ -433,22 +433,21 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ベースを残します。
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
-  `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
+  `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
-  `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
+  `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、`IORING_REGISTER_SYNC_CANCEL` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
   パーソナリティは登録できず、バッファーは更新できません。タグを付ける
   `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。スレッドが exit や
   `execve` のときにまだ持っているタスクワークは捨てられ、そのスレッドが投入してファイルを
   待っている要求と、リングを閉じたときのリング自身のタスクワークも捨てられます。Linux は
   それらを取り消しとして実行し、`ECANCELED` を投稿します（`io_uring_cancel_generic`）。
   ファイルを待つ要求は、リングを閉じたあともファイルの準備ができるまでリングを保ちます
-  （Linux はそのとき取り消します）。要求がほかの要求を取り消すことはできません
-  （`IORING_OP_ASYNC_CANCEL` は `EOPNOTSUPP`）。投入の外の更新でスロットから外れた登録
+  （Linux はそのとき取り消します）。投入の外の更新でスロットから外れた登録
   ファイルは、ファイルを待つ要求が持っていてもすぐにタグを投稿します。Linux はその要求が
   完了してから投稿します。
   登録した
@@ -457,8 +456,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   失敗し、リングを共有するプロセスは自分のメモリを動かします。Linux は固定したページを
   動かします。ディスクのファイルの共有マッピングも登録できます（Linux の長期の固定は
   `EFAULT` で断ります）。ヒュージページは 4 KiB のページごとに RLIMIT_MEMLOCK を数えます
-  （Linux は 1 回だけ数えます）。リングは共有でしかマップできず（`MAP_PRIVATE` は `EINVAL`）、`poll` と `epoll` は
-  その記述子を見張れません。機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
+  （Linux は 1 回だけ数えます）。リングは共有でしかマップできません（`MAP_PRIVATE` は `EINVAL`）。
+  リングの投入キューの空きを待つ `poll` やレベルトリガーの `epoll` は、空きができると
+  終わります。Linux のリングが起こすのは、その完了を待つものだけです。機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
   `IORING_FEAT_REG_REG_RING` を、待ちの `min_wait_usec` は何も変えないのに
   `IORING_FEAT_MIN_TIMEOUT` を報告します。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。

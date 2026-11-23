@@ -1477,7 +1477,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
-  それに `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、それに `IORING_OP_ASYNC_CANCEL` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
@@ -1517,6 +1517,34 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     割り込みません。
   - 提供バッファーを選んだ読み出しは、待つあいだそれを保ちます（`REQ_F_BUFFER_SELECTED`）。
     リングのバッファーはリングの先頭に残り、読み出しが続くときにもう一度選ばれます。
+
+- `IORING_OP_ASYNC_CANCEL` と `IORING_REGISTER_SYNC_CANCEL` は、Linux master の
+  `io_uring/cancel.c` と `io_poll_cancel` と同じく、そのリングでファイルを待つ要求を取り消します。
+  ほかの要求が実行中になることはないので、見つけるものはそれだけです。
+  - 取り消しは `user_data` で、`IORING_ASYNC_CANCEL_FD` ならファイルで（`_FD_FIXED` か
+    `IOSQE_FIXED_FILE` なら登録したファイルで）、`_OP` なら操作で一致を探し、`_ANY` なら
+    どの要求にも一致します。`_USERDATA` があれば `user_data` も一致しなければなりません。
+  - `_ALL` も `_ANY` もなければ、最初に一致したものを取り消して 0 を返し、なければ
+    `ENOENT` を返してリンクを失敗させます。どちらかがあれば一致したものをすべて取り消して
+    その数を返し、なければ 0 です。順序はリングのハッシュ表のもの（`user_data` の
+    `hash_long`、同じバケツでは新しいものが先）です。
+  - 取り消された要求は、取り消しのあとで、投入したスレッドのタスクワークとして
+    `ECANCELED` で完了し、リンクを失敗させます。保っていた提供バッファーは使われます
+    （`IORING_CQE_F_BUFFER`）。
+  - ファイルの準備ができても、タスクワークがまだ実行されていない要求も取り消されます。
+    タスクワークが実行されるまでは見つかるからです。ファイルのバイトは残ります。
+  - `IORING_OP_ASYNC_CANCEL` は、知らないフラグ、`_FD` か `_OP` と一緒の `_ANY`、
+    `IORING_OP_LAST` 以降の操作、`off` か `splice_fd_in` を断ります（`EINVAL`）。
+    開いていない記述子は `EBADF` です。
+  - `IORING_REGISTER_SYNC_CANCEL` は `struct io_uring_sync_cancel_reg` を一つ取ります。
+    詰め物は 0 でなければならず、数か 0 か `ENOENT` をそのまま返します。見つけるものが
+    実行中になることはないので待つことはなく、タイムアウトは使いません。
+
+- `poll` と `epoll` は、Linux の `io_uring_poll` が答えるとおりにリングの記述子を見ます。
+  投入キューに空きがあれば書き込み可能で、完了がキューかカーネルで待っているか、
+  `IORING_SETUP_DEFER_TASKRUN` のリングにタスクワークがあれば読み出し可能です。待つものを
+  起こすのは完了だけで、それも入力を待つものだけなので、出力へのエッジトリガーの関心は
+  一度だけ報告されます。
 
 - `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
   `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は

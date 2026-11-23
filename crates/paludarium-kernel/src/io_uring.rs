@@ -1,8 +1,9 @@
 //! io_uring, as Linux 6.12's (`io_uring/`) with these operations:
 //! `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL` (the one libuv batches its
 //! `epoll_ctl` calls with), and the file transfers `IORING_OP_READ`,
-//! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`, and
-//! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`. The others answer
+//! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`,
+//! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, and
+//! `IORING_OP_ASYNC_CANCEL` ([`cancel`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
@@ -26,7 +27,9 @@
 //! the ring, as Linux master's `tw.c` runs them. A transfer that would wait
 //! for its file waits ([`arm`]), and goes on as task work of its submitter
 //! once a call of any thread or process made the file ready
-//! ([`complete_ready`]), waking the submitter's wait as a signal would. The
+//! ([`complete_ready`]), waking the submitter's wait as a signal would.
+//! `poll` and `epoll` watch the ring's descriptor as `io_uring_poll`
+//! answers. The
 //! setup flags that need a kernel thread, polled I/O or another layout of
 //! the rings give `EINVAL`.
 
@@ -116,6 +119,7 @@ const OP_WRITEV: u8 = 2;
 const OP_FSYNC: u8 = 3;
 const OP_READ_FIXED: u8 = 4;
 const OP_WRITE_FIXED: u8 = 5;
+const OP_ASYNC_CANCEL: u8 = 14;
 const OP_FILES_UPDATE: u8 = 20;
 const OP_READ: u8 = 22;
 const OP_WRITE: u8 = 23;
@@ -123,13 +127,14 @@ const OP_EPOLL_CTL: u8 = 29;
 const OP_PROVIDE_BUFFERS: u8 = 31;
 const OP_REMOVE_BUFFERS: u8 = 32;
 /// The operations implemented.
-const OPS: [u8; 12] = [
+const OPS: [u8; 13] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
     OP_FSYNC,
     OP_READ_FIXED,
     OP_WRITE_FIXED,
+    OP_ASYNC_CANCEL,
     OP_FILES_UPDATE,
     OP_READ,
     OP_WRITE,
@@ -168,6 +173,19 @@ const NOP_CQE32: u32 = 1 << 5;
 /// Linux 7.0's `NOP_FLAGS`: `IORING_NOP_INJECT_RESULT` to `_CQE32`, with
 /// `IORING_NOP_TW` (completing as task work).
 const NOP_FLAGS: u32 = (1 << 6) - 1;
+/// `IORING_ASYNC_CANCEL_*`: what an `IORING_OP_ASYNC_CANCEL` or
+/// `IORING_REGISTER_SYNC_CANCEL` looks for. Every request that matches,
+/// not only the first; any request; one of a file, `fd` registered with
+/// `_FD_FIXED`; one of a `user_data` (without `_FD` or `_OP`, too); one of
+/// an operation.
+const CANCEL_ALL: u32 = 1 << 0;
+const CANCEL_FD: u32 = 1 << 1;
+const CANCEL_ANY: u32 = 1 << 2;
+const CANCEL_FD_FIXED: u32 = 1 << 3;
+const CANCEL_USERDATA: u32 = 1 << 4;
+const CANCEL_OP: u32 = 1 << 5;
+/// `CANCEL_FLAGS`, every flag a cancellation takes.
+const CANCEL_FLAGS: u32 = (1 << 6) - 1;
 /// `IORING_FSYNC_DATASYNC`, the only flag of `IORING_OP_FSYNC`.
 const FSYNC_DATASYNC: u32 = 1;
 /// `IORING_RW_ATTR_FLAG_PI`, the only attribute of a read or write.
@@ -187,6 +205,7 @@ const REGISTER_FILES_UPDATE2: u64 = 14;
 const REGISTER_PROBE: u64 = 8;
 const REGISTER_PBUF_RING: u64 = 22;
 const UNREGISTER_PBUF_RING: u64 = 23;
+const REGISTER_SYNC_CANCEL: u64 = 24;
 const REGISTER_FILE_ALLOC_RANGE: u64 = 25;
 const REGISTER_PBUF_STATUS: u64 = 26;
 /// `IOU_PBUF_RING_MMAP`: the kernel gives the ring's pages, which the
@@ -296,6 +315,15 @@ pub(crate) struct Ring {
     /// The task work of an `IORING_SETUP_DEFER_TASKRUN` ring, which only
     /// its waits run (`ctx->work_list`).
     local: Mutex<VecDeque<Deferred>>,
+    /// The requests that wait for their files, which a cancellation finds
+    /// (`ctx->cancel_table`), and the bits of its hash.
+    cancels: Mutex<Cancels>,
+    hash_bits: u32,
+    /// The readiness hub of the thread that made it, which a completion
+    /// tells (`io_poll_wq_wake`), and how many times one went in: its
+    /// descriptor's input generation for `poll` and `epoll`.
+    hub: Arc<crate::events::ReadinessHub>,
+    posted: std::sync::atomic::AtomicU64,
     /// Its own anonymous inode's status (`anon_inode_create_getfile`).
     stat: FileStat,
 }
@@ -333,6 +361,8 @@ pub(crate) struct Polls {
 /// thread's readiness hub, the file and the events it waits for, the
 /// request and the rest of its link, and the registered files it holds.
 struct Armed {
+    /// Its entry in the ring's [`Cancels`].
+    id: u64,
     ring: Arc<dyn FileHandle>,
     inbox: Arc<crate::SignalInbox>,
     hub: Arc<crate::events::ReadinessHub>,
@@ -356,10 +386,53 @@ enum Deferred {
     /// for it; or a request whose file became ready runs again
     /// (`io_poll_task_func`), with the registered files it held.
     Submit(Vec<Request>, Vec<Arc<Node>>),
+    /// `io_poll_task_func`: a request whose file became ready, or that a
+    /// cancellation took from its wait ([`cancel`]), leaves the ring's
+    /// [`Cancels`], and runs again or fails with `ECANCELED`, with the
+    /// registered files it held.
+    Poll {
+        id: u64,
+        chain: Vec<Request>,
+        held: Vec<Arc<Node>>,
+    },
     /// `io_req_tw_fail_links`: the rest of a link that failed completes,
     /// each with the error it failed to prepare with or `ECANCELED`, and
     /// none posts with `REQ_F_SKIP_LINK_CQES`.
     Fail { chain: Vec<Request>, skip: bool },
+}
+
+/// The requests of a ring that wait for their files (`ctx->cancel_table`),
+/// in the order they began to, from then until their task work runs
+/// (`io_poll_task_func`), and the number of the last cancellation
+/// (`ctx->cancel_seq`).
+#[derive(Default)]
+struct Cancels {
+    hashed: Vec<Hashed>,
+    seq: u32,
+    next: u64,
+}
+
+/// A request in [`Cancels`]: what a cancellation matches it by, whether one
+/// did, and the number of the last that matched it
+/// (`req->work.cancel_seq`), which the same one does not again.
+struct Hashed {
+    id: u64,
+    user_data: u64,
+    opcode: u8,
+    file: usize,
+    cancelled: bool,
+    seq: Option<u32>,
+}
+
+/// What an `IORING_OP_ASYNC_CANCEL` or `IORING_REGISTER_SYNC_CANCEL` looks
+/// for (`struct io_cancel_data`): the `user_data`, the flags, the descriptor
+/// of `IORING_ASYNC_CANCEL_FD` and the operation of `_OP`.
+#[derive(Clone, Copy)]
+struct CancelKey {
+    user_data: u64,
+    flags: u32,
+    fd: i32,
+    opcode: u8,
 }
 
 /// A request that completed in a batch: its completion, whether it posts
@@ -617,6 +690,7 @@ struct State {
 /// A request taken from the submission queue and prepared.
 struct Request {
     user_data: u64,
+    opcode: u8,
     flags: u8,
     /// What it fails with if its preparation failed.
     failed: Option<Errno>,
@@ -640,6 +714,12 @@ enum Work {
         event: (u32, u64),
     },
     Transfer(Box<Transfer>),
+    /// `IORING_OP_ASYNC_CANCEL`: what it looks for, and whether its `fd` is
+    /// a registered one (`IOSQE_FIXED_FILE`).
+    Cancel {
+        key: CancelKey,
+        fixed: bool,
+    },
     Fsync {
         fd: i32,
         fixed: bool,
@@ -815,12 +895,23 @@ impl Ring {
     /// or completions wait already, which keeps them in order.
     fn post(&self, state: &mut State, user_data: u64, res: i32, flags: u32) {
         state.overflow.push_back((user_data, res, flags));
-        self.flush(state);
+        if !self.flush(state) {
+            self.posted();
+        }
+    }
+
+    /// Tells those that poll the ring's descriptor of a completion
+    /// (`io_commit_cqring_flush` waking `ctx->poll_wq`).
+    fn posted(&self) {
+        self.posted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.hub.changed();
     }
 
     /// Moves the completions waiting in the kernel into the room the
-    /// program made, and says whether any still wait in `sq_flags`.
-    fn flush(&self, state: &mut State) {
+    /// program made, and says whether any still wait in `sq_flags`, and
+    /// whether it moved any.
+    fn flush(&self, state: &mut State) -> bool {
         let head = self.load_u32(CQ_HEAD);
         let mut moved = false;
         while state.cq_tail.wrapping_sub(head) < self.cq_entries
@@ -837,6 +928,7 @@ impl Ring {
         }
         if moved {
             self.store_u32(CQ_TAIL, state.cq_tail);
+            self.posted();
         }
         let flags = self.load_u32(SQ_FLAGS);
         let waiting = if state.overflow.is_empty() {
@@ -847,6 +939,7 @@ impl Ring {
         if waiting != flags {
             self.store_u32(SQ_FLAGS, waiting);
         }
+        moved
     }
 
     /// How many completions the program has not consumed.
@@ -861,6 +954,7 @@ impl Ring {
         let flags = sqe[1];
         let mut request = Request {
             user_data: u64_at(sqe, 32),
+            opcode,
             flags,
             failed: None,
             work: Work::None,
@@ -969,6 +1063,29 @@ impl Ring {
                     file: has(NOP_FILE).then(|| (int_at(4), fixed || has(NOP_FIXED_FILE))),
                     buffer: has(NOP_FIXED_BUFFER).then(|| u16::from_le_bytes([sqe[40], sqe[41]])),
                     tw: has(NOP_TW),
+                }
+            }
+            OP_ASYNC_CANCEL => {
+                // `io_async_cancel_prep`: `IORING_ASYNC_CANCEL_ANY` matches
+                // any file and operation.
+                let cancel_flags = u32_at(sqe, 28);
+                let op = u32_at(sqe, 24);
+                if u64_at(sqe, 8) != 0
+                    || int_at(44) != 0
+                    || cancel_flags & !CANCEL_FLAGS != 0
+                    || cancel_flags & CANCEL_ANY != 0 && cancel_flags & (CANCEL_FD | CANCEL_OP) != 0
+                    || cancel_flags & CANCEL_OP != 0 && op >= u32::from(OP_LAST)
+                {
+                    return fail(request, Errno::EINVAL);
+                }
+                Work::Cancel {
+                    key: CancelKey {
+                        user_data: u64_at(sqe, 16),
+                        flags: cancel_flags,
+                        fd: int_at(4),
+                        opcode: op as u8,
+                    },
+                    fixed,
                 }
             }
             OP_EPOLL_CTL => {
@@ -1243,6 +1360,8 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
     (result, flags, None, len)
 }
 
+const POLL_RDNORM: u32 = 0x40;
+const POLL_WRNORM: u32 = 0x100;
 /// `POLLIN | POLLPRI | POLLRDNORM | POLLERR`, what a read waits for
 /// (`io_arm_poll_handler`: urgent data is an event for a reader).
 const POLL_IN_EVENTS: u32 = 0x1 | 0x2 | 0x40 | 0x8;
@@ -1445,6 +1564,17 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool, Option
             d.file.sync()?;
             Ok(0)
         })),
+        // `io_async_cancel`: the file of `IORING_ASYNC_CANCEL_FD`, which
+        // `EBADF` fails without, then the requests.
+        &Work::Cancel { key, fixed } => result((|| {
+            let file = if key.flags & CANCEL_FD != 0 {
+                let fixed = fixed || key.flags & CANCEL_FD_FIXED != 0;
+                Some(file_identity(&file_of(c, ring, key.fd, fixed)?.file))
+            } else {
+                None
+            };
+            cancel(c, ring, &key, file)
+        })()),
         &Work::FilesUpdate {
             offset,
             addr,
@@ -1612,11 +1742,13 @@ fn arm(
     }
     let polls = &c.processes.io_uring;
     let (polled, mask) = (Arc::clone(&waits.file), waits.mask);
+    let id = ring.hash(&chain[0], &polled);
     polls
         .armed
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(Armed {
+            id,
             ring: Arc::clone(file),
             inbox: Arc::clone(c.inbox),
             hub: Arc::clone(&c.files.readiness),
@@ -1666,7 +1798,11 @@ pub(crate) fn complete_ready(polls: &Polls) {
             ring,
             &armed.inbox,
             Some(&armed.hub),
-            Deferred::Submit(armed.chain, armed.held),
+            Deferred::Poll {
+                id: armed.id,
+                chain: armed.chain,
+                held: armed.held,
+            },
         );
     }
 }
@@ -1695,6 +1831,220 @@ pub(crate) fn drop_task(polls: &Polls, inbox: &crate::SignalInbox) {
     let work = std::mem::take(&mut inbox.task_work().queue);
     drop(work);
     inbox.clear_notify_if_idle();
+}
+
+/// The identity of an open file, which a cancellation with
+/// `IORING_ASYNC_CANCEL_FD` matches requests by (`req->file`).
+fn file_identity(file: &Arc<dyn FileHandle>) -> usize {
+    Arc::as_ptr(file).cast::<()>() as usize
+}
+
+/// `hash_long`: the bucket of `ctx->cancel_table` a `user_data` is in.
+fn bucket(user_data: u64, bits: u32) -> u64 {
+    user_data.wrapping_mul(0x61c8_8646_80b5_83eb) >> (64 - bits)
+}
+
+impl Ring {
+    /// Puts a request that waits for `file` in the ring's [`Cancels`]
+    /// (`io_poll_req_insert`), and gives its entry.
+    fn hash(&self, request: &Request, file: &Arc<dyn FileHandle>) -> u64 {
+        let mut cancels = self.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+        let id = cancels.next;
+        cancels.next += 1;
+        cancels.hashed.push(Hashed {
+            id,
+            user_data: request.user_data,
+            opcode: request.opcode,
+            file: file_identity(file),
+            cancelled: false,
+            seq: None,
+        });
+        id
+    }
+
+    /// Takes a request's entry from the ring's [`Cancels`] as its task work
+    /// runs, and says whether a cancellation found it.
+    fn unhash(&self, id: u64) -> bool {
+        let mut cancels = self.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+        cancels
+            .hashed
+            .iter()
+            .position(|h| h.id == id)
+            .is_some_and(|at| cancels.hashed.remove(at).cancelled)
+    }
+}
+
+/// Whether `hashed` is what `key` looks for (`io_cancel_req_match`): any
+/// request with `IORING_ASYNC_CANCEL_ANY`, else one of its file, operation
+/// and `user_data` (that alone without the others, or with
+/// `IORING_ASYNC_CANCEL_USERDATA`). With `IORING_ASYNC_CANCEL_ALL` or
+/// `_ANY`, a request cancellation `seq` matched already does not match again
+/// (`io_cancel_match_sequence`).
+fn cancel_matches(hashed: &mut Hashed, key: &CancelKey, file: Option<usize>, seq: u32) -> bool {
+    if key.flags & CANCEL_ANY == 0 {
+        let by_data = key.flags & CANCEL_USERDATA != 0 || key.flags & (CANCEL_FD | CANCEL_OP) == 0;
+        if key.flags & CANCEL_FD != 0 && file != Some(hashed.file)
+            || key.flags & CANCEL_OP != 0 && hashed.opcode != key.opcode
+            || by_data && hashed.user_data != key.user_data
+        {
+            return false;
+        }
+        if key.flags & CANCEL_ALL == 0 {
+            return true;
+        }
+    }
+    if hashed.seq == Some(seq) {
+        return false;
+    }
+    hashed.seq = Some(seq);
+    true
+}
+
+/// Linux's `__io_async_cancel`, which `IORING_OP_ASYNC_CANCEL` and
+/// `IORING_REGISTER_SYNC_CANCEL` run: the requests of the ring that wait
+/// for their files are the only ones it can find (no request runs in a
+/// worker or waits for a timeout, which it would look for first and last).
+/// With `IORING_ASYNC_CANCEL_ALL` or `_ANY` it cancels every one that
+/// matches and gives how many, else the first, giving 0, or `ENOENT` for
+/// none.
+fn cancel(
+    c: &Context<'_>,
+    ring: &Ring,
+    key: &CancelKey,
+    file: Option<usize>,
+) -> Result<u64, Errno> {
+    let all = key.flags & (CANCEL_ALL | CANCEL_ANY) != 0;
+    let seq = {
+        let mut cancels = ring.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+        cancels.seq = cancels.seq.wrapping_add(1);
+        cancels.seq
+    };
+    if !all {
+        return cancel_polls(c, ring, key, file, seq).map(|_| 0);
+    }
+    let mut count = 0;
+    while let Ok(found) = cancel_polls(c, ring, key, file, seq) {
+        count += found.max(1);
+    }
+    Ok(count)
+}
+
+/// Linux's `io_poll_cancel`: marks the requests that match `key` cancelled,
+/// in the order of `ctx->cancel_table` (by the bucket of their
+/// `user_data`, the latest first in each), every one with
+/// `IORING_ASYNC_CANCEL_ALL` or `_ANY`, else the first, and gives how many,
+/// or `ENOENT` for none. Each that still waits for its file stops, and its
+/// task work fails it ([`Deferred::Poll`], `io_poll_cancel_req`); one whose
+/// file became ready already fails as its task work runs.
+fn cancel_polls(
+    c: &Context<'_>,
+    ring: &Ring,
+    key: &CancelKey,
+    file: Option<usize>,
+    seq: u32,
+) -> Result<u64, Errno> {
+    let all = key.flags & (CANCEL_ALL | CANCEL_ANY) != 0;
+    let found: Vec<u64> = {
+        let mut cancels = ring.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut order: Vec<usize> = (0..cancels.hashed.len()).collect();
+        order.sort_by_key(|&at| {
+            (
+                bucket(cancels.hashed[at].user_data, ring.hash_bits),
+                std::cmp::Reverse(at),
+            )
+        });
+        let mut found = Vec::new();
+        for at in order {
+            let hashed = &mut cancels.hashed[at];
+            if cancel_matches(hashed, key, file, seq) {
+                hashed.cancelled = true;
+                found.push(hashed.id);
+                if !all {
+                    break;
+                }
+            }
+        }
+        found
+    };
+    if found.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    // Their task work goes in the order they were found.
+    let stopped: Vec<Armed> = {
+        let polls = &c.processes.io_uring;
+        let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut stopped, waiting): (Vec<Armed>, Vec<Armed>) =
+            std::mem::take(&mut *armed).into_iter().partition(|a| {
+                std::ptr::addr_eq(Arc::as_ptr(&a.ring), ring as *const Ring)
+                    && found.contains(&a.id)
+            });
+        *armed = waiting;
+        polls
+            .count
+            .store(armed.len(), std::sync::atomic::Ordering::SeqCst);
+        stopped.sort_by_key(|a| found.iter().position(|&id| id == a.id));
+        stopped
+    };
+    for armed in stopped {
+        let other = !std::ptr::eq(Arc::as_ptr(&armed.inbox), Arc::as_ptr(c.inbox));
+        add_work(
+            &armed.ring,
+            ring,
+            &armed.inbox,
+            other.then_some(&*armed.hub),
+            Deferred::Poll {
+                id: armed.id,
+                chain: armed.chain,
+                held: armed.held,
+            },
+        );
+    }
+    Ok(found.len() as u64)
+}
+
+/// `IORING_REGISTER_SYNC_CANCEL` (`io_sync_cancel`): `struct
+/// io_uring_sync_cancel_reg` at `arg` (`EFAULT`), whose flags must be
+/// known and padding zero (`EINVAL`), and whose descriptor must be open
+/// (`EBADF`), registered with `IORING_ASYNC_CANCEL_FD_FIXED`. It gives what
+/// the cancellation found: how many with `IORING_ASYNC_CANCEL_ALL` or
+/// `_ANY`, else 0 or `ENOENT`. No request is ever running where it cannot
+/// be cancelled at once, so it never waits, and its timeout is unused.
+fn sync_cancel(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno> {
+    let mut sc = [0u8; 64];
+    c.mem
+        .read(GuestAddr(arg), &mut sc)
+        .map_err(|_| Errno::EFAULT)?;
+    let key = CancelKey {
+        user_data: u64_at(&sc, 0),
+        fd: u32_at(&sc, 8) as i32,
+        flags: u32_at(&sc, 12),
+        opcode: sc[32],
+    };
+    if key.flags & !CANCEL_FLAGS != 0 || sc[33..].iter().any(|&b| b != 0) {
+        return Err(Errno::EINVAL);
+    }
+    let file = if key.flags & CANCEL_FD != 0 {
+        let fixed = key.flags & CANCEL_FD_FIXED != 0;
+        let file = if fixed {
+            ring.files
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .and_then(|files| {
+                    files
+                        .slots
+                        .get(&(key.fd as u32))
+                        .map(|n| Arc::clone(&n.file.file))
+                })
+                .ok_or(Errno::EBADF)?
+        } else {
+            fget(c, key.fd)?.file
+        };
+        Some(file_identity(&file))
+    } else {
+        None
+    };
+    cancel(c, ring, &key, file)
 }
 
 /// What a request's completion does, after its flags: one that failed posts
@@ -1731,6 +2081,34 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
         Deferred::Submit(chain, held) => {
             ring.state().held.extend(held);
             issue_link(c, file, ring, chain);
+        }
+        Deferred::Poll {
+            id,
+            mut chain,
+            held,
+        } => {
+            ring.state().held.extend(held);
+            if !ring.unhash(id) {
+                issue_link(c, file, ring, chain);
+                return;
+            }
+            // `io_req_defer_failed`: a provided buffer it kept is used
+            // (`io_put_kbuf`), and the link fails.
+            let request = chain.remove(0);
+            let flags = match &request.work {
+                Work::Transfer(transfer) => transfer.kept.map_or(0, |kept| {
+                    CQE_F_BUFFER | u32::from(kept.bid) << CQE_BUFFER_SHIFT
+                }),
+                _ => 0,
+            };
+            let done = Done {
+                user_data: request.user_data,
+                res: -ECANCELED.0,
+                flags,
+                post: true,
+                next: None,
+            };
+            ring.complete(finish(done, request.flags, true, chain));
         }
         Deferred::Fail { chain, skip } => {
             for request in chain {
@@ -2096,6 +2474,11 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         files: Mutex::default(),
         buffer_lists: Mutex::default(),
         local: Mutex::default(),
+        cancels: Mutex::default(),
+        // `io_ring_ctx_alloc`: `ilog2(cq_entries) - 5`, from 1 to 8.
+        hash_bits: cq_entries.ilog2().saturating_sub(5).clamp(1, 8),
+        hub: Arc::clone(&c.files.readiness),
+        posted: std::sync::atomic::AtomicU64::new(0),
     };
     ring.store_u32(SQ_RING_MASK, sq_entries - 1);
     ring.store_u32(CQ_RING_MASK, cq_entries - 1);
@@ -2424,6 +2807,8 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         REGISTER_PBUF_RING => register_pbuf_ring(c, ring, a[2]),
         UNREGISTER_PBUF_RING => unregister_pbuf_ring(c, ring, a[2]),
         REGISTER_PBUF_STATUS => pbuf_status(c, ring, a[2]),
+        REGISTER_SYNC_CANCEL if a[2] == 0 || a[3] as u32 != 1 => Err(Errno::EINVAL),
+        REGISTER_SYNC_CANCEL => sync_cancel(c, ring, a[2]),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -3061,6 +3446,25 @@ pub(crate) fn mmap(
 impl FileHandle for Ring {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+    /// `io_uring_poll`: writable while the submission queue has room,
+    /// readable while completions wait in the queue or the kernel, or an
+    /// `IORING_SETUP_DEFER_TASKRUN` ring has task work. Only a completion
+    /// wakes a poll ([`Ring::posted`], with `EPOLLIN`), so the output
+    /// generation never moves.
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        let mut mask = 0;
+        if self.load_u32(SQ_TAIL).wrapping_sub(self.load_u32(SQ_HEAD)) != self.sq_entries {
+            mask |= crate::events::OUT | POLL_WRNORM;
+        }
+        if self.completions() != 0 || !self.state().overflow.is_empty() || local_pending(self) {
+            mask |= crate::events::IN | POLL_RDNORM;
+        }
+        Ok((
+            mask,
+            self.posted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        ))
     }
     fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
         Err(Errno::EINVAL)

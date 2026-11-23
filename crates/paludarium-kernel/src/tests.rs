@@ -4816,7 +4816,7 @@ mod io_uring {
         let supported: Vec<u64> = (0..58)
             .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
             .collect();
-        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 20, 22, 23, 29, 31, 32]);
+        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 14, 20, 22, 23, 29, 31, 32]);
         // A probe that is not zeroed, buffers without an argument, another
         // operation, another file.
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 1]), errno(Errno::EINVAL));
@@ -5678,6 +5678,100 @@ mod io_uring {
         );
         assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
         assert_eq!(reap(&mut f, &r), [(1, -105)]);
+    }
+
+    /// An `IORING_OP_ASYNC_CANCEL` of `user_data` with `flags` and `fd`.
+    fn cancel(user_data: u64, target: u64, flags: u32, fd: i32) -> [u8; 64] {
+        let mut e = sqe(14, user_data);
+        e[4..8].copy_from_slice(&fd.to_le_bytes());
+        e[16..24].copy_from_slice(&target.to_le_bytes());
+        e[28..32].copy_from_slice(&flags.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn a_cancellation_finds_the_reads_that_wait() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        // The cancellation completes, then the read as task work, and its
+        // link with it.
+        let mut first = rw(READ, read, HERE, buf, 8);
+        first[1] = 1 << 2;
+        assert_eq!(batch(&mut f, &r, &[first, nop(2, 0, 0, 0, 0)]), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 1, 0, 0)]),
+            [(9, 0), (1, -125), (2, -125)]
+        );
+        assert_eq!(one(&mut f, &r, &cancel(9, 1, 0, 0)), -2);
+        // Every one of a user_data, or any; by file; and what it refuses.
+        let mut two = rw(READ, read, HERE, buf, 8);
+        two[32..40].copy_from_slice(&5u64.to_le_bytes());
+        assert_eq!(batch(&mut f, &r, &[two, two]), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 5, 1, 0)]),
+            [(9, 2), (5, -125), (5, -125)]
+        );
+        assert_eq!(one(&mut f, &r, &cancel(9, 5, 1, 0)), 0);
+        assert_eq!(batch(&mut f, &r, &[rw(READ, read, HERE, buf, 8)]), []);
+        assert_eq!(one(&mut f, &r, &cancel(9, 0, 2, 1000)), -9);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 0, 2, read as i32)]),
+            [(9, 0), (1, -125)]
+        );
+        for refused in [
+            cancel(9, 0, 1 << 6, 0),
+            cancel(9, 0, 4 | 2, 0),
+            cancel(9, 0, 4 | 32, 0),
+        ] {
+            assert_eq!(one(&mut f, &r, &refused), -22);
+        }
+        // The bytes stay in the pipe.
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), []);
+        assert_eq!(f.ret(0, &[read, buf, 8]), 2);
+        // In the order of the ring's hash: user_data 6 and 8 are in its
+        // first bucket, the latest first, and 7 in the second.
+        let reads: Vec<[u8; 64]> = [6u64, 7, 8]
+            .iter()
+            .map(|data| {
+                let mut e = rw(READ, read, HERE, buf, 8);
+                e[32..40].copy_from_slice(&data.to_le_bytes());
+                e
+            })
+            .collect();
+        assert_eq!(batch(&mut f, &r, &reads), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 0, 4, 0)]),
+            [(9, 3), (8, -125), (6, -125), (7, -125)]
+        );
+    }
+
+    #[test]
+    fn a_ring_is_readable_with_completions_and_writable_with_room() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let fds = DATA + 0x300;
+        let poll = |f: &mut Fixture| {
+            f.mem
+                .write(GuestAddr(fds), &r.fd.to_le_bytes()[..4])
+                .unwrap();
+            f.mem
+                .write(GuestAddr(fds + 4), &0x145u32.to_le_bytes())
+                .unwrap();
+            assert!(f.ret(7, &[fds, 1, 0]) <= 1);
+            u16::from_le_bytes(bytes(f, fds + 6, 2).try_into().unwrap())
+        };
+        assert_eq!(poll(&mut f), 0x104);
+        let slot = u32_at(&f, r.rings + 4) & 3;
+        push(&mut f, &r, slot, &nop(1, 0, 0, 0, 0));
+        assert_eq!(f.ret(426, &[r.fd, 1, 0, 0]), 1);
+        assert_eq!(poll(&mut f), 0x145);
+        assert_eq!(reap(&mut f, &r), [(1, 0)]);
+        assert_eq!(poll(&mut f), 0x104);
     }
 
     #[test]

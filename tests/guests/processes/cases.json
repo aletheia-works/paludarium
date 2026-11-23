@@ -477,6 +477,8 @@
     {"name":"io-uring-buffers","binary":"process"},
     {"name":"io-uring-task-work","binary":"process"},
     {"name":"io-uring-poll","binary":"process"},
+    {"name":"io-uring-ring-poll","binary":"process"},
+    {"name":"io-uring-cancel","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

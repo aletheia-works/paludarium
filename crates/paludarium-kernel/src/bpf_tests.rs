@@ -1319,7 +1319,10 @@ fn a_mappable_arrays_mapping_shows_its_values() {
     assert_eq!(vma.start, at);
     assert_eq!(
         vma.identity,
-        (crate::files::Internal::AnonInodes.device(), 0)
+        (
+            crate::files::Internal::AnonInodes.device(),
+            crate::files::anon_inode()
+        )
     );
     m.write(GuestAddr(at + 299 * 16), &[3; 8]).unwrap();
     let last = Some(&299u32.to_le_bytes()[..]);
@@ -1482,6 +1485,38 @@ fn a_map_maps_only_as_linux_s_bpf_map_mmap_lets_it() {
     assert_eq!(try_map(ro, PROT_READ), errno(Errno::EINVAL));
     assert_eq!(try_map(ro, PROT_READ | PROT_WRITE), errno(Errno::EACCES));
     assert_eq!(try_map(wo, PROT_READ), errno(Errno::EACCES));
+}
+
+/// A map's descriptor has the one anonymous inode an eventfd's and an
+/// epoll's descriptors have too (`anon_inode_getfd`), on the anonymous
+/// inodes' device, with its file type hidden.
+#[test]
+fn a_map_shares_the_anonymous_inode() {
+    const FSTAT: u64 = 5;
+    const STAT: u64 = DATA + 0xe00;
+    let (mut k, mut t, m) = setup();
+    let fd = make(&mut k, &mut t, &m, map(ARRAY, 4, 8, 4, 0));
+    let eventfd = syscall(&mut k, &mut t, &m, 290, [0, 0, 0, 0, 0, 0]);
+    let epoll = syscall(&mut k, &mut t, &m, 291, [0, 0, 0, 0, 0, 0]);
+    let mut seen = Vec::new();
+    for fd in [fd, eventfd, epoll] {
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, FSTAT, [fd, STAT, 0, 0, 0, 0]),
+            0
+        );
+        let device = m.read_u64(GuestAddr(STAT)).unwrap();
+        let inode = m.read_u64(GuestAddr(STAT + 8)).unwrap();
+        let mut mode = [0; 4];
+        m.read(GuestAddr(STAT + 24), &mut mode).unwrap();
+        seen.push((device, inode, u32::from_le_bytes(mode)));
+    }
+    let shared = (
+        crate::files::Internal::AnonInodes.device(),
+        crate::files::anon_inode(),
+        0o600,
+    );
+    assert_ne!(shared.1, 0);
+    assert_eq!(seen, [shared; 3]);
 }
 
 /// A mapping that replaces a writable mapping of a map (`MAP_FIXED`)

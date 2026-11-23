@@ -1705,11 +1705,7 @@ impl FileHandle for EventFile {
         Err(Errno::ESPIPE)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(FileStat {
-            mode: 0o600,
-            links: 1,
-            ..FileStat::default()
-        })
+        Ok(crate::files::anon_inode_stat())
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)

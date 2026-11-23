@@ -4824,6 +4824,26 @@ impl Internal {
         minor & 0xff | (minor & !0xff) << 12
     }
 }
+/// The number of the inode Linux's `anon_inode_getfile` and
+/// `anon_inode_getfd` share among all the files they make (eventfds,
+/// epolls, timerfds, signalfds, inotify and fanotify instances, perf
+/// events, seccomp listeners, BPF maps and programs, Landlock rulesets and
+/// file system contexts): one [`anonymous_inode`] number, taken once, as
+/// `anon_inode_init` takes one from `get_next_ino` at boot.
+pub(crate) fn anon_inode() -> u64 {
+    static INODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INODE.get_or_init(anonymous_inode)
+}
+/// What `fstat` gives for that inode: `alloc_anon_inode`'s 0600, with its
+/// file type hidden (`anon_inode_getattr`), and one link.
+pub(crate) fn anon_inode_stat() -> FileStat {
+    FileStat {
+        inode: anon_inode(),
+        mode: 0o600,
+        links: 1,
+        ..FileStat::default()
+    }
+}
 /// The device of the file a descriptor holds: an internal file system's for
 /// a memfd, a namespace file, a pipe, a socket, a pidfd or a file of no type
 /// (an anonymous inode) that no path opened, else that of the mount holding

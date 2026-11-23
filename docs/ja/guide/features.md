@@ -3598,7 +3598,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
   `[timerfd]`・`[signalfd]`・`[perf_event]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
   名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`anon_inode:bpf-map`、`/memfd:<名前> (deleted)` です。
-  そのためにパイプとソケットは自分の inode 番号を持ちます。リンクを開くと、ファイルを
+  そのためにパイプとソケットは自分の inode 番号を持ちます。それらの無名 inode のファイル
+  （eventfd、epoll、timerfd、signalfd、inotify と fanotify のインスタンス、perf イベント、
+  seccomp のリスナー、BPF のマップとプログラム、Landlock のルールセット、ファイルシステムの
+  コンテキスト）は、Linux の `anon_inode_getfd` が与えるとおり 1 つの inode を共有します。
+  `fstat` と、`/proc/<pid>/maps` での BPF マップのマッピングは、無名 inode のデバイスとその
+  inode の番号を示します。番号は Linux と同じく、パイプのものと同じように一度だけ取られます。リンクを開くと、ファイルを
   パスで開き直します。どのパスもそのファイルを指さなくなったとき（消された、または
   名前が変わった）は、同じファイルをそのハンドルから開き直し、オフセットは別に持ちます。
   memfd なら同じファイルとシールへの新しいハンドルを返します。パイプは、Linux の

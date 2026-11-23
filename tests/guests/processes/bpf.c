@@ -22,7 +22,8 @@
    commands and the room they take.
    bpf-mmap: mmap of BPF_F_MMAPABLE arrays, whose mappings show the values
    the system calls read and write: which maps, descriptors, protections
-   and ranges map, the flags of the VMA (/proc/self/smaps), what a frozen
+   and ranges map, the flags of the VMA (/proc/self/smaps), the anonymous
+   inode the descriptor and the mapping share with an eventfd, what a frozen
    map and BPF_F_RDONLY_PROG allow, the freeze a mapping that writes holds
    off, a child's included, and the map a mapping keeps after its
    descriptor closes.
@@ -54,11 +55,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -1624,6 +1628,35 @@ static void vma(const char *name, void *at) {
     fflush(stdout);
 }
 
+/* Whether the map's descriptor `fd`, its mapping at `at` and an eventfd
+   and an epoll have the one anonymous inode Linux's anon_inode_getfd
+   gives them all: its number differs from boot to boot, so only that it
+   is shared, and not 0, is said. */
+static void anon_inode(int fd, void *at) {
+    struct stat map, event, poll;
+    int efd = eventfd(0, EFD_CLOEXEC), pfd = epoll_create1(EPOLL_CLOEXEC);
+    if (efd < 0 || pfd < 0 || fstat(fd, &map) || fstat(efd, &event) || fstat(pfd, &poll)) {
+        say("anon inode %d", -errno);
+        return;
+    }
+    unsigned long start, inode = 0;
+    unsigned major_ = 0, minor_ = 0;
+    int found = 0;
+    char line[512];
+    FILE *maps = fopen("/proc/self/maps", "r");
+    while (maps && !found && fgets(line, sizeof line, maps))
+        found = sscanf(line, "%lx-%*x %*s %*x %x:%x %lu", &start, &major_, &minor_, &inode) == 4 &&
+                start == (uintptr_t)at;
+    if (maps) fclose(maps);
+    say("anon inode: set %d, mode %o, eventfd's %d, epoll's %d, maps %d",
+        map.st_ino != 0, map.st_mode,
+        event.st_ino == map.st_ino && event.st_dev == map.st_dev,
+        poll.st_ino == map.st_ino && poll.st_dev == map.st_dev,
+        found && inode == map.st_ino && major_ == major(map.st_dev) && minor_ == minor(map.st_dev));
+    close(efd);
+    close(pfd);
+}
+
 /* The binary's own path, which the harness gives after the mode (as
    process.c takes it), else the one it was started with: bpf-mmap's child
    execs it. */
@@ -1655,6 +1688,7 @@ static int case_mmap(void) {
     r = elem(MAP_UPDATE_ELEM, fd, &key, value, ANY);
     say("update 3 %ld, seen %d", r, m[48]);
     vma("rw", m);
+    anon_inode(fd, m);
     say("mprotect exec %d", mprotect(m, 4096, PROT_READ | PROT_EXEC) ? -errno : 0);
     say("mremap grow %d", mremap(m, 8192, 12288, 0) == MAP_FAILED ? -errno : 0);
     say("freeze mapped %ld", freeze_map(fd));
@@ -1733,6 +1767,10 @@ static int case_mmap(void) {
     if (pipe(exec_ready) || pipe(exec_go)) return 1;
     pid_t execed = fork();
     if (execed == 0) {
+        /* Only the parent's ends wake it: with the parent gone, the read
+           of go ends instead of waiting on an end it holds itself. */
+        close(exec_ready[0]);
+        close(exec_go[1]);
         if (mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, exec_map, 0) == MAP_FAILED) _exit(1);
         char ready[16], go[16];
         snprintf(ready, sizeof ready, "%d", exec_ready[1]);

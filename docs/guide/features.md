@@ -4153,7 +4153,13 @@ kernel.
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
   `anon_inode:inotify` (without brackets, as Linux names it), `anon_inode:bpf-map`, and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
-  own for it. Opening a link opens the file again by its path, or, for a
+  own for it. The files of those anonymous inodes (eventfds, epolls,
+  timerfds, signalfds, inotify and fanotify instances, perf events,
+  seccomp listeners, BPF maps and programs, Landlock rulesets and file
+  system contexts) share one inode, as Linux's `anon_inode_getfd` gives
+  them: `fstat` and a BPF map's mappings in `/proc/<pid>/maps` show the
+  anonymous inodes' device and that inode's number, which, as on Linux, is
+  taken once like a pipe's. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
   through its handle, with an offset of its own; a memfd gets a new handle
   on the same file and seals. Either end of a pipe opens through the link of

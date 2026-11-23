@@ -2559,7 +2559,10 @@ impl paludarium_mmu::PageSource for Mapped {
     }
     /// The device and inode the map's descriptor's `fstat` gives.
     fn identity(&self) -> (u64, u64) {
-        (crate::files::Internal::AnonInodes.device(), 0)
+        (
+            crate::files::Internal::AnonInodes.device(),
+            crate::files::anon_inode(),
+        )
     }
     /// The VMAs have a `close` operation, which keeps Linux from merging
     /// them.
@@ -2602,11 +2605,7 @@ impl FileHandle for MapFile {
         Ok(0)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(FileStat {
-            mode: 0o600,
-            links: 1,
-            ..FileStat::default()
-        })
+        Ok(crate::files::anon_inode_stat())
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)

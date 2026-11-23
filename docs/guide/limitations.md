@@ -468,9 +468,7 @@ verified.
   refuses it before the NUMA node and the type, so another error may come
   first here). Map IDs are the emulated machine's, so they
   start at 1 and do not see the host's maps. A map's SHA-256
-  (`bpf_map_info.hash`) is `EINVAL`. A map's descriptor (`fstat`) and its
-  mappings (`/proc/<pid>/maps`) show inode 0, where Linux numbers the
-  anonymous inode they share.
+  (`bpf_map_info.hash`) is `EINVAL`.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its

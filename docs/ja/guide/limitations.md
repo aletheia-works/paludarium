@@ -442,12 +442,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
   `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、`IORING_REGISTER_SYNC_CANCEL` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
   パーソナリティは登録できず、バッファーは更新できません。タグを付ける
-  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。スレッドが exit や
-  `execve` のときにまだ持っているタスクワークは捨てられ、そのスレッドが投入してファイルを
-  待っている要求と、リングを閉じたときのリング自身のタスクワークも捨てられます。Linux は
-  それらを取り消しとして実行し、`ECANCELED` を投稿します（`io_uring_cancel_generic`）。
-  ファイルを待つ要求は、リングを閉じたあともファイルの準備ができるまでリングを保ちます
-  （Linux はそのとき取り消します）。投入の外の更新でスロットから外れた登録
+  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。プロセス全体が
+  終わると、そのスレッドが投入してファイルを待っている要求は、Linux master の
+  `io_task_group_exiting` と同じく取り消されます。差分テストを走らせるカーネルである
+  Linux 7.0 は、ひとりで終わるスレッドのときと同じく、ファイルの準備ができてから取り消します。
+  その終了では、まだ実行を待っているリンクの次の要求は、終わろうとしているスレッドのものと
+  同じく `EFAULT` で失敗します。Linux master はスレッドが終わろうとする前にそれを実行します。
+  `execve` では、`IORING_SETUP_DEFER_TASKRUN` のリングの取り消された要求はそのリングの次の
+  待ちで完了します。Linux は `execve` のあいだにリングのタスクワークを実行します。
+  投入の外の更新でスロットから外れた登録
   ファイルは、ファイルを待つ要求が持っていてもすぐにタグを投稿します。Linux はその要求が
   完了してから投稿します。
   登録した

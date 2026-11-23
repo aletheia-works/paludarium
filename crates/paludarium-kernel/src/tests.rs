@@ -5751,6 +5751,30 @@ mod io_uring {
     }
 
     #[test]
+    fn a_ring_that_closes_lets_go_of_the_reads_that_wait() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        assert_eq!(batch(&mut f, &r, &[rw(READ, read, HERE, buf, 8)]), []);
+        // Its pipe's only reader is the read: once the ring goes, it takes no
+        // more writes.
+        assert_eq!(f.ret(3, &[read]), 0);
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(11, &[r.rings, r.array + 16]), 0);
+        assert_eq!(f.ret(11, &[r.sqes, 4096]), 0);
+        assert_eq!(f.ret(3, &[r.fd]), 0);
+        // SIGPIPE is ignored, so the write gives EPIPE.
+        f.mem.write(GuestAddr(DATA + 0x100), &[0; 32]).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(13, &[13, DATA + 0x100, 0, 8]), 0);
+        assert_eq!(f.ret(1, &[write, DATA, 2]), errno(Errno::EPIPE));
+    }
+
+    #[test]
     fn a_ring_is_readable_with_completions_and_writable_with_room() {
         let mut f = fixture();
         let r = ring(&mut f);

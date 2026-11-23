@@ -1745,6 +1745,23 @@ kernel.
     count, 0 or `ENOENT` itself. It never waits, as nothing it finds is
     running, so its timeout is unused.
 
+- A request's submitter or ring may go before it completes, as in Linux's
+  `io_uring_cancel_generic`, `tw.c` and `io_ring_ctx_wait_and_kill`.
+  - A thread that exits alone leaves the requests it submitted waiting.
+    Once a file is ready, its request fails with `ECANCELED` as Linux's
+    `io_fallback_tw` runs the work of a thread that is gone, and the bytes
+    stay in the file. Task work the thread still has as it exits runs so
+    too: a request whose file became ready fails with `ECANCELED`, a
+    link's next request with `EFAULT` (`io_should_terminate_tw`), and an
+    `IORING_NOP_TW` completes.
+  - `execve` cancels every request the thread submitted that waits for its
+    file (`io_uring_task_cancel`). Each completes with `ECANCELED` before
+    the new program runs.
+  - A ring whose last descriptor and mapping close lets go of its waiting
+    requests and the files they hold, as Linux master does before `close`
+    returns, so a pipe whose only reader was such a request takes no more
+    writes (`EPIPE`). Task work left for the ring goes with it.
+
 - `poll` and `epoll` watch a ring's descriptor as Linux's `io_uring_poll`
   answers. It is writable while the submission queue has room, and
   readable while completions wait in the queue or in the kernel, or while

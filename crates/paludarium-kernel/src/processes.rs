@@ -5055,9 +5055,9 @@ impl Kernel {
             .filter(|(_, action)| action.handler == 1)
             .map(|(&number, &action)| (number, action))
             .collect();
-        // Its io_uring task work, and the requests it submitted that wait
-        // for their files, go (`io_uring_task_cancel`).
-        crate::io_uring::drop_task(&self.processes.io_uring, &self.inbox);
+        // The io_uring requests it submitted that wait for their files are
+        // cancelled (`io_uring_task_cancel`).
+        crate::io_uring::cancel_task(&self.processes.io_uring, &self.inbox);
         // exec keeps the thread's CPU time, as it keeps the process.
         let cpu = std::mem::take(&mut thread.state.cpu);
         let old = std::mem::take(&mut thread.state.credentials);

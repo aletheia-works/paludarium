@@ -339,7 +339,10 @@ pub(crate) struct Ring {
 /// (`TIF_NOTIFY_SIGNAL`). A new thread has none of its maker's.
 #[derive(Default)]
 pub(crate) struct TaskWork {
-    queue: VecDeque<(Arc<dyn FileHandle>, Deferred)>,
+    queue: VecDeque<(std::sync::Weak<dyn FileHandle>, Deferred)>,
+    /// The thread exited (`PF_EXITING`): work added from then on runs at
+    /// once as Linux's `io_fallback_tw` runs it ([`run_terminated`]).
+    exited: bool,
 }
 
 impl TaskWork {
@@ -354,6 +357,9 @@ impl TaskWork {
 pub(crate) struct Polls {
     armed: Mutex<Vec<Armed>>,
     count: std::sync::atomic::AtomicUsize,
+    /// Task work that came for a thread that exited, which runs once no
+    /// ring's lock is held (`io_fallback_tw` queuing it for a worker).
+    fallback: Mutex<Vec<(std::sync::Weak<dyn FileHandle>, Deferred)>>,
 }
 
 /// A request that waits for its file (`struct async_poll`): the ring, the
@@ -363,7 +369,10 @@ pub(crate) struct Polls {
 struct Armed {
     /// Its entry in the ring's [`Cancels`].
     id: u64,
-    ring: Arc<dyn FileHandle>,
+    /// The ring, which a request does not keep open: once the ring's last
+    /// descriptor and mapping go, its requests go too
+    /// (`io_ring_ctx_wait_and_kill`).
+    ring: std::sync::Weak<dyn FileHandle>,
     inbox: Arc<crate::SignalInbox>,
     hub: Arc<crate::events::ReadinessHub>,
     polled: Arc<dyn FileHandle>,
@@ -1749,7 +1758,7 @@ fn arm(
         .unwrap_or_else(PoisonError::into_inner)
         .push(Armed {
             id,
-            ring: Arc::clone(file),
+            ring: Arc::downgrade(file),
             inbox: Arc::clone(c.inbox),
             hub: Arc::clone(&c.files.readiness),
             polled: waits.file,
@@ -1761,7 +1770,7 @@ fn arm(
         .count
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if ready(&polled, mask) {
-        complete_ready(polls);
+        wake(polls);
     }
 }
 
@@ -1775,13 +1784,31 @@ fn ready(file: &Arc<dyn FileHandle>, mask: u32) -> bool {
 /// `io_poll_task_func`), which wakes that thread's wait as a signal would
 /// ([`crate::SignalInbox::notify_signal`]).
 pub(crate) fn complete_ready(polls: &Polls) {
+    wake(polls);
+    let fallback = std::mem::take(
+        &mut *polls
+            .fallback
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    for (file, work) in fallback {
+        if let Some(file) = file.upgrade() {
+            run_terminated(&file, work);
+        }
+    }
+}
+
+/// [`complete_ready`] but for the work of threads that exited, as a
+/// submission holding its ring's lock arms a request.
+fn wake(polls: &Polls) {
     if polls.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return;
     }
     let woken: Vec<Armed> = {
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
-        let (woken, waiting) = std::mem::take(&mut *armed)
+        let (woken, waiting): (Vec<Armed>, Vec<Armed>) = std::mem::take(&mut *armed)
             .into_iter()
+            .filter(|a| a.ring.strong_count() != 0)
             .partition(|a| ready(&a.polled, a.mask));
         *armed = waiting;
         polls
@@ -1790,11 +1817,15 @@ pub(crate) fn complete_ready(polls: &Polls) {
         woken
     };
     for armed in woken {
-        let Ok(ring) = downcast(&armed.ring) else {
+        let Some(file) = armed.ring.upgrade() else {
+            continue;
+        };
+        let Ok(ring) = downcast(&file) else {
             continue;
         };
         add_work(
-            &armed.ring,
+            polls,
+            &file,
             ring,
             &armed.inbox,
             Some(&armed.hub),
@@ -1812,25 +1843,153 @@ pub(crate) fn progress(c: &Context<'_>) {
     complete_ready(&c.processes.io_uring);
 }
 
-/// Drops the task work of the thread `inbox` belongs to and the requests it
-/// submitted that wait for their files, as it execs or exits. Linux cancels
-/// them (`io_uring_cancel_generic`), posting `ECANCELED`.
-pub(crate) fn drop_task(polls: &Polls, inbox: &crate::SignalInbox) {
-    let dropped: Vec<Armed> = {
+/// Cancels the requests the thread `inbox` belongs to submitted that wait
+/// for their files, as it calls `execve` (`io_uring_task_cancel`, all of
+/// them) or its whole process exits (Linux master's
+/// `io_task_group_exiting`): each leaves its wait and fails with
+/// `ECANCELED` as its task work runs ([`Deferred::Poll`]).
+pub(crate) fn cancel_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>) {
+    let cancelled: Vec<Armed> = {
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
-        let (dropped, kept) = std::mem::take(&mut *armed)
+        let (cancelled, kept) = std::mem::take(&mut *armed)
             .into_iter()
-            .partition(|a| std::ptr::eq(Arc::as_ptr(&a.inbox), inbox));
+            .partition(|a| Arc::ptr_eq(&a.inbox, inbox));
         *armed = kept;
         polls
             .count
             .store(armed.len(), std::sync::atomic::Ordering::SeqCst);
-        dropped
+        cancelled
     };
-    drop(dropped);
-    let work = std::mem::take(&mut inbox.task_work().queue);
-    drop(work);
+    for armed in cancelled {
+        let Some(file) = armed.ring.upgrade() else {
+            continue;
+        };
+        let Ok(ring) = downcast(&file) else {
+            continue;
+        };
+        if let Some(hashed) = ring
+            .cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .hashed
+            .iter_mut()
+            .find(|h| h.id == armed.id)
+        {
+            hashed.cancelled = true;
+        }
+        add_work(
+            polls,
+            &file,
+            ring,
+            inbox,
+            None,
+            Deferred::Poll {
+                id: armed.id,
+                chain: armed.chain,
+                held: armed.held,
+            },
+        );
+    }
+}
+
+/// The thread `inbox` belongs to exits (`do_exit`): its process's whole
+/// exit cancels the requests it submitted that wait ([`cancel_task`]),
+/// and the task work it still has runs as an exiting task's does
+/// ([`run_terminated`]), as will any added later. A request of a thread
+/// that exits alone waits on, and fails once its file is ready.
+pub(crate) fn exit_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>, group_exit: bool) {
+    if group_exit {
+        cancel_task(polls, inbox);
+    }
+    let work = {
+        let mut task_work = inbox.task_work();
+        task_work.exited = true;
+        std::mem::take(&mut task_work.queue)
+    };
     inbox.clear_notify_if_idle();
+    for (file, work) in work {
+        if let Some(file) = file.upgrade() {
+            run_terminated(&file, work);
+        }
+    }
+}
+
+/// Runs task work as a thread that exits, or a ring that closes, runs it,
+/// and as Linux's `io_fallback_tw` runs what comes for a thread that has
+/// exited (`io_should_terminate_tw`): a request that waited for its file
+/// fails with `ECANCELED` (`io_poll_check_events`), a link's next request
+/// or one that found its file ready with `EFAULT` (`io_req_task_submit`),
+/// and the rest completes as it would. What it leaves runs so too.
+fn run_terminated(file: &Arc<dyn FileHandle>, work: Deferred) {
+    let Ok(ring) = downcast(file) else {
+        return;
+    };
+    let _submitting = ring
+        .submitting
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut pending = vec![work];
+    while !pending.is_empty() {
+        ring.begin();
+        for work in pending {
+            match work {
+                Deferred::Submit(chain, held) => {
+                    ring.state().held.extend(held);
+                    fail_request(ring, chain, Errno::EFAULT);
+                }
+                Deferred::Poll { id, chain, held } => {
+                    ring.state().held.extend(held);
+                    ring.unhash(id);
+                    fail_request(ring, chain, ECANCELED);
+                }
+                Deferred::Complete {
+                    done,
+                    held,
+                    rest,
+                    flags,
+                } => {
+                    ring.state().held.extend(held);
+                    let failed = done.res < 0;
+                    ring.complete(finish(done, flags, failed, rest));
+                }
+                Deferred::Fail { chain, skip } => fail_rest(ring, chain, skip),
+            }
+        }
+        pending = ring.end();
+    }
+}
+
+/// `io_req_defer_failed`: the first request of `chain` fails with `e`,
+/// using a provided buffer it kept (`io_put_kbuf`), and so does its link.
+fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
+    let request = chain.remove(0);
+    let flags = match &request.work {
+        Work::Transfer(transfer) => transfer.kept.map_or(0, |kept| {
+            CQE_F_BUFFER | u32::from(kept.bid) << CQE_BUFFER_SHIFT
+        }),
+        _ => 0,
+    };
+    let done = Done {
+        user_data: request.user_data,
+        res: -e.0,
+        flags,
+        post: true,
+        next: None,
+    };
+    ring.complete(finish(done, request.flags, true, chain));
+}
+
+/// `io_req_tw_fail_links`: the rest of a link that failed.
+fn fail_rest(ring: &Ring, chain: Vec<Request>, skip: bool) {
+    for request in chain {
+        ring.complete(Done {
+            user_data: request.user_data,
+            res: -request.failed.unwrap_or(ECANCELED).0,
+            flags: 0,
+            post: !skip,
+            next: None,
+        });
+    }
 }
 
 /// The identity of an open file, which a cancellation with
@@ -1975,8 +2134,7 @@ fn cancel_polls(
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut stopped, waiting): (Vec<Armed>, Vec<Armed>) =
             std::mem::take(&mut *armed).into_iter().partition(|a| {
-                std::ptr::addr_eq(Arc::as_ptr(&a.ring), ring as *const Ring)
-                    && found.contains(&a.id)
+                std::ptr::addr_eq(a.ring.as_ptr(), ring as *const Ring) && found.contains(&a.id)
             });
         *armed = waiting;
         polls
@@ -1986,9 +2144,13 @@ fn cancel_polls(
         stopped
     };
     for armed in stopped {
+        let Some(file) = armed.ring.upgrade() else {
+            continue;
+        };
         let other = !std::ptr::eq(Arc::as_ptr(&armed.inbox), Arc::as_ptr(c.inbox));
         add_work(
-            &armed.ring,
+            &c.processes.io_uring,
+            &file,
             ring,
             &armed.inbox,
             other.then_some(&*armed.hub),
@@ -2082,51 +2244,21 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
             ring.state().held.extend(held);
             issue_link(c, file, ring, chain);
         }
-        Deferred::Poll {
-            id,
-            mut chain,
-            held,
-        } => {
+        Deferred::Poll { id, chain, held } => {
             ring.state().held.extend(held);
-            if !ring.unhash(id) {
+            if ring.unhash(id) {
+                fail_request(ring, chain, ECANCELED);
+            } else {
                 issue_link(c, file, ring, chain);
-                return;
-            }
-            // `io_req_defer_failed`: a provided buffer it kept is used
-            // (`io_put_kbuf`), and the link fails.
-            let request = chain.remove(0);
-            let flags = match &request.work {
-                Work::Transfer(transfer) => transfer.kept.map_or(0, |kept| {
-                    CQE_F_BUFFER | u32::from(kept.bid) << CQE_BUFFER_SHIFT
-                }),
-                _ => 0,
-            };
-            let done = Done {
-                user_data: request.user_data,
-                res: -ECANCELED.0,
-                flags,
-                post: true,
-                next: None,
-            };
-            ring.complete(finish(done, request.flags, true, chain));
-        }
-        Deferred::Fail { chain, skip } => {
-            for request in chain {
-                ring.complete(Done {
-                    user_data: request.user_data,
-                    res: -request.failed.unwrap_or(ECANCELED).0,
-                    flags: 0,
-                    post: !skip,
-                    next: None,
-                });
             }
         }
+        Deferred::Fail { chain, skip } => fail_rest(ring, chain, skip),
     }
 }
 
 /// Adds task work (`io_req_task_work_add`) of the running thread.
 fn queue(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Deferred) {
-    add_work(file, ring, c.inbox, None, work);
+    add_work(&c.processes.io_uring, file, ring, c.inbox, None, work);
 }
 
 /// Adds task work to the ring's own list with `IORING_SETUP_DEFER_TASKRUN`
@@ -2136,6 +2268,7 @@ fn queue(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Def
 /// Work another thread adds (`hub`, that of the thread the work is for)
 /// wakes the thread's waits.
 fn add_work(
+    polls: &Polls,
     file: &Arc<dyn FileHandle>,
     ring: &Ring,
     inbox: &crate::SignalInbox,
@@ -2157,10 +2290,19 @@ fn add_work(
         return;
     }
     // The flag is set under the list's lock, so a run that empties the list
-    // after this push clears it after it is set.
+    // after this push clears it after it is set. A thread that exited runs
+    // nothing more: the work runs at once (`io_fallback_tw`).
     let first = {
         let mut task_work = inbox.task_work();
-        task_work.queue.push_back((Arc::clone(file), work));
+        if task_work.exited {
+            polls
+                .fallback
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((Arc::downgrade(file), work));
+            return;
+        }
+        task_work.queue.push_back((Arc::downgrade(file), work));
         inbox.notify_signal(hub.is_some());
         task_work.queue.len() == 1
     };
@@ -2194,6 +2336,14 @@ pub(crate) fn run_task_work(c: &mut Context<'_>) {
     let mut current: Option<Arc<dyn FileHandle>> = None;
     loop {
         let next = c.inbox.task_work().queue.pop_front();
+        // The work of a ring that closed goes with it.
+        let next = match next {
+            Some((file, work)) => match file.upgrade() {
+                Some(file) => Some((file, work)),
+                None => continue,
+            },
+            None => None,
+        };
         let Some((file, work)) = next else {
             match current.take() {
                 Some(file) => {

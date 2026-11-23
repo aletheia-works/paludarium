@@ -10005,6 +10005,102 @@ static int io_uring_cancel_case(void) {
     return 0;
 }
 
+/* io_uring requests whose submitter goes: a read of a thread that exits
+   alone waits on, and fails with ECANCELED once its pipe is ready, the
+   bytes left in the pipe (io_fallback_tw); one of a process that exits
+   does the same by then. execve cancels the thread's reads at once
+   (io_uring_task_cancel). A ring that closes lets go of the files its
+   waiting reads hold. */
+struct ue_thread {
+    struct uring *u;
+    int fd;
+};
+
+static void *ue_thread_main(void *arg) {
+    struct ue_thread *t = arg;
+    char buf[8];
+    pw_read(t->u, 1, t->fd, buf, sizeof buf, 0);
+    uring_enter(t->u->fd, 1, 0, 0, NULL, 0);
+    return NULL;
+}
+
+/* Waits up to two seconds for a completion, then shows them. */
+static void ue_reap(struct uring *u, const char *label) {
+    struct pollfd p = {u->fd, POLLIN, 0};
+    int r = poll(&p, 1, 2000);
+    printf("%s: ready=%d\n", label, r);
+    uring_reap(u, label);
+}
+
+static int io_uring_exit_case(const char *self) {
+    struct uring u, closing;
+    char more[8];
+    int a[2], b[2], c[2], d[2];
+    if (uring_open(&u, 8) || pipe(a) || pipe(b) || pipe(c) || pipe(d)) return 80;
+
+    /* A thread that exits alone. */
+    pthread_t t;
+    struct ue_thread arg = {&u, a[0]};
+    pthread_create(&t, NULL, ue_thread_main, &arg);
+    pthread_join(t, NULL);
+    uring_reap(&u, "thread-exited");
+    printf("write: %ld\n", (long)write(a[1], "ab", 2));
+    ue_reap(&u, "thread-ready");
+    printf("read: %ld\n", (long)read(a[0], more, sizeof more));
+
+    /* A process that exits. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char buf[8];
+        pw_read(&u, 2, b[0], buf, sizeof buf, 0);
+        _exit(uring_enter(u.fd, 1, 0, 0, NULL, 0) == 1 ? 0 : 1);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    printf("write: %ld\n", (long)write(b[1], "cd", 2));
+    ue_reap(&u, "process-ready");
+    printf("read: %ld\n", (long)read(b[0], more, sizeof more));
+
+    /* execve cancels the read at once. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        char buf[8];
+        pw_read(&u, 3, c[0], buf, sizeof buf, 0);
+        if (uring_enter(u.fd, 1, 0, 0, NULL, 0) != 1) _exit(1);
+        char *args[] = {"process", "io-uring-exec-child", (char *)self, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(2);
+    }
+    ue_reap(&u, "exec");
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    printf("write: %ld\n", (long)write(c[1], "ef", 2));
+    printf("read: %ld\n", (long)read(c[0], more, sizeof more));
+
+    /* A ring that closes lets go of the pipe its read holds. */
+    if (uring_open(&closing, 8)) return 81;
+    pw_read(&closing, 4, d[0], more, sizeof more, 0);
+    printf("armed: %ld\n", uring_enter(closing.fd, 1, 0, 0, NULL, 0));
+    close(d[0]);
+    signal(SIGPIPE, SIG_IGN);
+    munmap(closing.rings, closing.array + 4 * closing.sq_entries);
+    munmap(closing.sqes, 64 * closing.sq_entries);
+    close(closing.fd);
+    int epipe = 0;
+    for (int i = 0; i < 200 && !epipe; i++) {
+        epipe = write(d[1], "g", 1) < 0 && errno == EPIPE;
+        if (!epipe) pw_sleep_ms(10);
+    }
+    printf("closed: epipe=%d\n", epipe);
+    signal(SIGPIPE, SIG_DFL);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -36699,6 +36795,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-poll")) return io_uring_poll_case();
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
+    if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-exec-child")) {
+        pw_sleep_ms(300);
+        return 0;
+    }
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

@@ -522,13 +522,16 @@ verified.
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING` and
   `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the others give `EINVAL`). So no ring descriptor or personality can be
   registered, buffers cannot be updated, and buffers cannot be registered
-  with `IORING_REGISTER_BUFFERS2`, which gives them tags. Task work that
-  a thread still has when it exits or calls `execve` is dropped, and so are
-  the requests it submitted that wait for their files, and a ring's own
-  task work when the ring closes. Linux runs them cancelled
-  (`io_uring_cancel_generic`), posting `ECANCELED`. A request that waits
-  for its file keeps its ring after the ring closes, until the file is
-  ready, where Linux cancels it then. A registered file that an
+  with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
+  whole exit cancels the requests its threads submitted that wait for
+  their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
+  the kernel the differential tests run on, cancels them only once their
+  files are ready, as for a thread that exits alone. In that exit, a
+  link's next request that still waits to run fails with `EFAULT`, as an
+  exiting thread's does; Linux master runs it before the thread is
+  exiting. At `execve`, a cancelled request of an
+  `IORING_SETUP_DEFER_TASKRUN` ring completes at the ring's next wait,
+  where Linux runs the ring's work during `execve`. A registered file that an
   update outside a submission takes from its slot posts its tag at once,
   even while a request that waits for its file holds it; Linux posts the
   tag once that request completes. A registered buffer's pages

@@ -2150,9 +2150,14 @@ impl Kernel {
             .or(thread.state.exit_status)
             .unwrap_or(ExitStatus::Exited(0));
         self.ptrace_exit(thread, status);
-        // Its io_uring task work, and the requests it submitted that wait
-        // for their files, go (`io_uring_files_cancel`).
-        crate::io_uring::drop_task(&self.processes.io_uring, &self.inbox);
+        // Its io_uring task work runs as an exiting task's, and its
+        // process's whole exit cancels the requests it submitted that wait
+        // for their files (`io_uring_files_cancel`).
+        crate::io_uring::exit_task(
+            &self.processes.io_uring,
+            &self.inbox,
+            self.group.status().is_some(),
+        );
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).

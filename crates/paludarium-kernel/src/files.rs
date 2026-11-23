@@ -3626,9 +3626,9 @@ pub(crate) fn aio_transfer(
 ///   largest. Then a read's `FAN_ACCESS_PERM`, for no bytes too.
 /// - The operation: a directory reads `EISDIR` (`generic_read_dir`), and a
 ///   file with no read or write `EINVAL`.
-/// - A file that would wait (a pipe, a socket, an eventfd) does not:
-///   Linux keeps the request in flight until the file is ready, and the
-///   emulator completes it with `EAGAIN`.
+/// - A file that would wait (a pipe, a socket, an eventfd) gives `EAGAIN`,
+///   as Linux's issue with `IO_URING_F_NONBLOCK` does; the ring then waits
+///   for the file (`crate::io_uring`'s `arm`).
 pub(crate) fn ring_transfer(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,

@@ -231,6 +231,8 @@ pub struct Processes {
     kcmp_cookies: std::sync::OnceLock<[[u64; 2]; crate::kcmp::TYPES]>,
     /// The events the machine's aio contexts take, and their limit.
     pub(crate) aio: Arc<crate::aio::Limits>,
+    /// The io_uring requests that wait for their files.
+    pub(crate) io_uring: crate::io_uring::Polls,
     /// The machine's `kernel.perf_event_mlock_kb`, `kernel.perf_event_paranoid`
     /// and `kernel.unprivileged_bpf_disabled`.
     pub(crate) sysctls: Arc<crate::sysctl::Machine>,
@@ -275,6 +277,7 @@ impl Processes {
             mqueue_mount: group.namespaces(1).ipc.mq.clone(),
             kcmp_cookies: std::sync::OnceLock::new(),
             aio: Arc::default(),
+            io_uring: crate::io_uring::Polls::default(),
             sysctls: Arc::default(),
             traces: crate::ptrace::Traces::default(),
             bpf_maps: Arc::default(),
@@ -5050,6 +5053,9 @@ impl Kernel {
             .filter(|(_, action)| action.handler == 1)
             .map(|(&number, &action)| (number, action))
             .collect();
+        // Its io_uring task work, and the requests it submitted that wait
+        // for their files, go (`io_uring_task_cancel`).
+        crate::io_uring::drop_task(&self.processes.io_uring, &self.inbox);
         // exec keeps the thread's CPU time, as it keeps the process.
         let cpu = std::mem::take(&mut thread.state.cpu);
         let old = std::mem::take(&mut thread.state.credentials);

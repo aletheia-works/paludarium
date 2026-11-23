@@ -1188,6 +1188,14 @@ impl ThreadGroup {
         local.posix_deadline = self.posix_deadline();
         self.drain_process(local);
     }
+    /// The inbox of member `tid`.
+    pub(crate) fn inbox(&self, tid: u32) -> Option<Arc<SignalInbox>> {
+        self.members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .cloned()
+    }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
         inbox.attach(Arc::clone(&self.discards), Arc::clone(&self.arrivals));
         let wake = inbox.wake_token();
@@ -2150,6 +2158,9 @@ impl Kernel {
             .or(thread.state.exit_status)
             .unwrap_or(ExitStatus::Exited(0));
         self.ptrace_exit(thread, status);
+        // Its io_uring task work, and the requests it submitted that wait
+        // for their files, go (`io_uring_files_cancel`).
+        crate::io_uring::drop_task(&self.processes.io_uring, &self.inbox);
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).
@@ -2160,6 +2171,7 @@ impl Kernel {
         crate::mqueue::exited(&closed, self.process.pid);
         drop(closed);
         crate::aio::complete_ready(&self.processes.aio, &self.files.readiness);
+        crate::io_uring::complete_ready(&self.processes.io_uring);
         // Then `exit_fs`: the last task sharing the working directory lets
         // go of it.
         self.files.release_home();

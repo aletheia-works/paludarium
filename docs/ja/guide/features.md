@@ -1479,7 +1479,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
   完了（`IORING_FEAT_NODROP`）は Linux と同じです。一度の投入の完了は、Linux が投稿する
   ように、その要求をすべて実行してから入ります（`io_submit_flush_completions`）。
-  ただし、タスクワーク（下）を待つ完了は別です。
+  ただし、ファイルかタスクワーク（下）を待つ完了は別です。
 
 - タスクワークは Linux の `io_uring/tw.c` と同じく実行します。`IORING_NOP_TW`、リンクの
   次の要求、失敗したリンクの残りはタスクワークとして、投入のほかの完了の後に完了します。
@@ -1492,6 +1492,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_SETUP_TASKRUN_FLAG` があれば、`IORING_SQ_TASKRUN` が待っているものがあることを
   示します。`IOSQE_CQE_SKIP_SUCCESS` 付きの要求が失敗したリンクは、残りを完了なしで取り消し
   ます（`REQ_F_SKIP_LINK_CQES`）。
+
+- ファイルを待つことになる転送は、Linux の `io_arm_poll_handler` と同じく待ちます。読むものの
+  ないパイプ、ソケット、eventfd の読み出しと、いっぱいのパイプへの書き込みで、`O_NONBLOCK`
+  でも同じです。`RWF_NOWAIT` なら代わりに `EAGAIN` で終わります。リンクの残りはそれを待ちます。
+  - ファイルの準備ができると、要求は投入したスレッドのタスクワークとしてもう一度実行されます
+    （`io_poll_task_func`）。別のプロセスのスレッドが準備したときも同じです。そのスレッド自身が
+    準備したときは、準備した呼び出しが戻るときに終わっています。
+  - 別のスレッドが加えたタスクワークは、シグナルと同じく、そのスレッドの割り込み可能な待ちを
+    終わらせます（`TIF_NOTIFY_SIGNAL`）。届けるシグナルがなければ、Linux の
+    `arch_do_signal_or_restart` が再開するとおりに呼び出しはもう一度実行されます。ブロックする
+    `read` はもう一度、`nanosleep` は `restart_syscall` で残りの時間だけ眠ります。シグナルで
+    `EINTR` を返す呼び出し（`epoll_wait` など）は `EINTR` を返します。`io_uring_enter` の待ちは
+    タスクワークを実行して待ち続けます。
+  - `IORING_SETUP_DEFER_TASKRUN` では、タスクワークはそのリング自身の待ちを待ち、どの呼び出しにも
+    割り込みません。
+  - 提供バッファーを選んだ読み出しは、待つあいだそれを保ちます（`REQ_F_BUFFER_SELECTED`）。
+    リングのバッファーはリングの先頭に残り、読み出しが続くときにもう一度選ばれます。
 
 - `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
   `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は

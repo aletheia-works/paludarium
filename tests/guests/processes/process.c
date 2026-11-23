@@ -9413,6 +9413,240 @@ static int io_uring_task_work_case(void) {
     return 0;
 }
 
+/* io_uring requests that wait for their files: a read of an empty pipe, or
+   one opened O_NONBLOCK, waits until the pipe is ready (RWF_NOWAIT ends it
+   with EAGAIN), and its link's next request waits for it. It goes on as task
+   work of the thread that submitted it: the call that made the pipe ready
+   returns with it done when that thread made it, and another thread's or
+   process's write wakes the submitter's wait as a signal would
+   (TIF_NOTIFY_SIGNAL). With no signal to deliver, a call that wait ended
+   runs again (read, and nanosleep through restart_syscall), and epoll_wait
+   gives EINTR. A ring with IORING_SETUP_DEFER_TASKRUN interrupts no call: its
+   work waits for its own wait. A provided buffer stays with the read that
+   chose it; a ring's stays in the ring until the read goes on. */
+struct pw_helper {
+    struct uring *u;
+    int ready_fd, then_fd, settle_ms, patience_ms, saw;
+};
+
+static unsigned pw_cq_tail(struct uring *u) {
+    return __atomic_load_n(u32p(u->rings, 12), __ATOMIC_ACQUIRE);
+}
+
+static void pw_sleep_ms(int ms) {
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000};
+    while (nanosleep(&ts, &ts) && errno == EINTR) {
+    }
+}
+
+/* Makes `ready_fd` readable, waits up to `patience_ms` for the ring's
+   completion (the submitter ran its task work), then after `settle_ms`
+   writes `then_fd`. */
+static void *pw_helper_main(void *arg) {
+    struct pw_helper *h = arg;
+    unsigned before = pw_cq_tail(h->u);
+    pw_sleep_ms(100);
+    if (write(h->ready_fd, "ab", 2) != 2) return NULL;
+    for (int i = 0; i < h->patience_ms / 10 && pw_cq_tail(h->u) == before; i++)
+        pw_sleep_ms(10);
+    h->saw = pw_cq_tail(h->u) != before;
+    if (h->settle_ms) pw_sleep_ms(h->settle_ms);
+    if (h->then_fd >= 0 && write(h->then_fd, "z", 1) != 1) return NULL;
+    return NULL;
+}
+
+static unsigned char *pw_read(struct uring *u, unsigned long data, int fd, void *buf,
+                              unsigned len, unsigned rw_flags) {
+    unsigned char *sqe = uring_push(u, 22, data);
+    memcpy(sqe + 4, &fd, 4);
+    long offset = -1;
+    memcpy(sqe + 8, &offset, 8);
+    unsigned long a = (unsigned long)buf;
+    memcpy(sqe + 16, &a, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 28, &rw_flags, 4);
+    return sqe;
+}
+
+static void pw_reap_flags(struct uring *u, const char *label) {
+    unsigned head = *u32p(u->rings, 8);
+    unsigned tail = pw_cq_tail(u);
+    printf("%s:", label);
+    for (; head != tail; head++) {
+        unsigned char *cqe = u->rings + 64 + 16 * (head & (u->cq_entries - 1));
+        unsigned long data;
+        int res;
+        unsigned flags;
+        memcpy(&data, cqe, 8);
+        memcpy(&res, cqe + 8, 4);
+        memcpy(&flags, cqe + 12, 4);
+        printf(" %lu=%d/%x", data, res, flags);
+    }
+    printf("\n");
+    __atomic_store_n(u32p(u->rings, 8), head, __ATOMIC_RELEASE);
+}
+
+static int pw_pipe(int p[2], int flags) {
+    return pipe2(p, flags);
+}
+
+/* Starts the helper: it makes `a` readable, then writes `b` (if any). */
+static void pw_with_helper(struct uring *u, int a, int b, int settle_ms, int patience_ms,
+                           pthread_t *t, struct pw_helper *h) {
+    h->u = u;
+    h->ready_fd = a;
+    h->then_fd = b;
+    h->settle_ms = settle_ms;
+    h->patience_ms = patience_ms;
+    h->saw = 0;
+    pthread_create(t, NULL, pw_helper_main, h);
+}
+
+static int io_uring_poll_case(void) {
+    struct uring u, coop, defer;
+    char buf[16], other[4];
+    int a[2], b[2];
+    pthread_t t;
+    struct pw_helper h;
+    if (uring_open(&u, 8)) return 80;
+    if (pw_pipe(a, O_NONBLOCK) || pw_pipe(b, 0)) return 81;
+
+    /* With RWF_NOWAIT it ends at once. */
+    pw_read(&u, 1, a[0], buf, sizeof buf, 8);
+    tw_submit(&u, 1, 0, "nowait");
+    /* Without, it waits, and its link's next request with it. */
+    pw_read(&u, 2, a[0], buf, sizeof buf, 0)[1] = 1 << 2;
+    tw_nop(&u, 3, 0, 0, 0);
+    tw_submit(&u, 2, 0, "waits");
+    /* This thread's write: done as the write returns. */
+    printf("write: %ld\n", (long)write(a[1], "xy", 2));
+    uring_reap(&u, "after-write");
+
+    /* Another thread's write wakes a wait on the ring. */
+    pw_read(&u, 4, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    pw_with_helper(&u, a[1], -1, 0, 5000, &t, &h);
+    uring_show("ring-wait", uring_enter(u.fd, 0, 1, 1, NULL, 0));
+    pthread_join(t, NULL);
+    uring_reap(&u, "ring-wait");
+
+    /* It interrupts a blocking read, which runs again (ERESTARTSYS): the
+       completion is in before the read ends. The same with
+       IORING_SETUP_COOP_TASKRUN (TWA_SIGNAL_NO_IPI still wakes a wait). */
+    if (uring_open_flags(&coop, 8, 1 << 8)) return 82;
+    struct uring *rings[2] = {&u, &coop};
+    const char *names[2] = {"read-restarts", "coop-read-restarts"};
+    for (int i = 0; i < 2; i++) {
+        pw_read(rings[i], 5, a[0], buf, sizeof buf, 0);
+        tw_submit(rings[i], 1, 0, "armed");
+        pw_with_helper(rings[i], a[1], b[1], 200, 5000, &t, &h);
+        errno = 0;
+        long r = read(b[0], other, sizeof other);
+        printf("%s: r=%ld errno=%d\n", names[i], r, r < 0 ? errno : 0);
+        pthread_join(t, NULL);
+        printf("%s: done while blocked=%d\n", names[i], h.saw);
+        uring_reap(rings[i], names[i]);
+    }
+
+    /* nanosleep goes on through restart_syscall, for the whole time. */
+    pw_read(&u, 6, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    pw_with_helper(&u, a[1], -1, 0, 5000, &t, &h);
+    struct timespec start, end, nap = {0, 600000000};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    errno = 0;
+    long slept = nanosleep(&nap, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    long ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+    printf("nanosleep: r=%ld errno=%d whole=%d\n", slept, slept ? errno : 0, ms >= 590);
+    pthread_join(t, NULL);
+    printf("nanosleep: done while asleep=%d\n", h.saw);
+    uring_reap(&u, "nanosleep");
+
+    /* epoll_wait gives EINTR. */
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {EPOLLIN, {0}}, got;
+    if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, b[0], &ev)) return 83;
+    pw_read(&u, 7, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    pw_with_helper(&u, a[1], b[1], 200, 5000, &t, &h);
+    errno = 0;
+    long n = epoll_wait(ep, &got, 1, 5000);
+    printf("epoll_wait: r=%ld errno=%d\n", n, n < 0 ? errno : 0);
+    pthread_join(t, NULL);
+    printf("epoll_wait: done=%d\n", h.saw);
+    uring_reap(&u, "epoll_wait");
+    if (read(b[0], other, sizeof other) != 1) return 84;
+    close(ep);
+
+    /* IORING_SETUP_DEFER_TASKRUN: the read is not interrupted, and the
+       completion waits for the ring's own wait. */
+    if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 85;
+    pw_read(&defer, 8, a[0], buf, sizeof buf, 0);
+    tw_submit(&defer, 1, 0, "defer-armed");
+    pw_with_helper(&defer, a[1], b[1], 0, 300, &t, &h);
+    errno = 0;
+    long r = read(b[0], other, sizeof other);
+    printf("defer-read: r=%ld errno=%d\n", r, r < 0 ? errno : 0);
+    pthread_join(t, NULL);
+    printf("defer-read: done while blocked=%d\n", h.saw);
+    uring_reap(&defer, "defer-read");
+    uring_show("defer-wait", uring_enter(defer.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&defer, "defer-wait");
+
+    /* Another process's write wakes the wait too. */
+    pw_read(&u, 9, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        pw_sleep_ms(100);
+        _exit(write(a[1], "cd", 2) == 2 ? 0 : 1);
+    }
+    uring_show("child-wait", uring_enter(u.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&u, "child-wait");
+    int status;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    /* A provided buffer stays with the read; a file's read finds none. A
+       ring's stays in the ring, which the file's read takes first. */
+    char *pool = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char file_name[] = "/tmp/io-uring-poll-XXXXXX";
+    int file = mkstemp(file_name);
+    if (pool == MAP_FAILED || file < 0) return 86;
+    unlink(file_name);
+    unsigned char *sqe = uring_push(&u, 31, 10);
+    int count = 1;
+    unsigned short bgid = 1;
+    unsigned long addr = (unsigned long)pool;
+    unsigned len = 8;
+    long bid = 7;
+    memcpy(sqe + 4, &count, 4);
+    memcpy(sqe + 8, &bid, 8);
+    memcpy(sqe + 16, &addr, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 40, &bgid, 2);
+    tw_submit(&u, 1, 1, "provide");
+    sqe = pw_read(&u, 11, a[0], NULL, 8, 0);
+    sqe[1] = 1 << 5;
+    memcpy(sqe + 40, &bgid, 2);
+    tw_submit(&u, 1, 0, "select-armed");
+    sqe = pw_read(&u, 12, file, NULL, 8, 0);
+    sqe[1] = 1 << 5;
+    memcpy(sqe + 40, &bgid, 2);
+    memset(sqe + 8, 0, 8);
+    tw_submit(&u, 1, 1, "file-select");
+    printf("write: %ld\n", (long)write(a[1], "ef", 2));
+    pw_reap_flags(&u, "select-done");
+    printf("pool: %.2s\n", pool);
+    close(file);
+    close(defer.fd);
+    close(coop.fd);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -35838,6 +36072,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-files")) return io_uring_files_case();
     if (!strcmp(mode, "io-uring-buffers")) return io_uring_buffers_case();
     if (!strcmp(mode, "io-uring-task-work")) return io_uring_task_work_case();
+    if (!strcmp(mode, "io-uring-poll")) return io_uring_poll_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

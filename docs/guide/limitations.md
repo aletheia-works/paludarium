@@ -517,9 +517,16 @@ verified.
   `IORING_REGISTER_PBUF_STATUS` (the others give `EINVAL`). So no ring descriptor or personality can be
   registered, buffers cannot be updated, and buffers cannot be registered
   with `IORING_REGISTER_BUFFERS2`, which gives them tags. Task work that
-  a thread still has when it exits or calls `execve` is dropped, and so is
-  a ring's own when the ring closes, where Linux runs it cancelled
-  (`io_uring_cancel_generic`). A registered buffer's pages
+  a thread still has when it exits or calls `execve` is dropped, and so are
+  the requests it submitted that wait for their files, and a ring's own
+  task work when the ring closes. Linux runs them cancelled
+  (`io_uring_cancel_generic`), posting `ECANCELED`. A request that waits
+  for its file keeps its ring after the ring closes, until the file is
+  ready, where Linux cancels it then. No request can cancel another
+  (`IORING_OP_ASYNC_CANCEL` is `EOPNOTSUPP`). A registered file that an
+  update outside a submission takes from its slot posts its tag at once,
+  even while a request that waits for its file holds it; Linux posts the
+  tag once that request completes. A registered buffer's pages
   are not pinned: a fixed transfer moves the memory at its address as that
   is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
   made read-only, and a process that shares the ring moves its own memory.
@@ -527,24 +534,15 @@ verified.
   registered, where Linux's long-term pin refuses it (`EFAULT`), and a huge
   page charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where Linux
   charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`), and
-  `poll` and `epoll` cannot watch its descriptor. As every request completes
-  in `io_uring_enter`, a wait for more completions than there are ends only
-  by a signal or its timeout. The features are Linux 6.12's, so
-  `IORING_FEAT_REG_REG_RING` is reported though no ring descriptor can be
-  registered, and `IORING_FEAT_MIN_TIMEOUT` though a wait's `min_wait_usec`
-  changes nothing (no request is ever in flight). A transfer that would
-  wait for its file does not: Linux keeps it in flight until the file is
-  ready (a pipe, a socket or an eventfd with nothing to read, or a full
-  pipe, even with `O_NONBLOCK`), and the emulator completes it with
-  `EAGAIN`. A
-  terminal's read waits in `io_uring_enter`. A file that is never read
-  (an epoll instance, a ring) fails with `EINVAL` at once, where Linux
-  first waits for it to be ready. Such a read that selected a buffer
-  completes with `EAGAIN` as one with `RWF_NOWAIT` would: a ring's buffer
-  stays in the ring, and a provided buffer is used, where Linux keeps it for
-  the read. A file without a position (a pipe, a socket, a terminal, an
-  eventfd) is taken as one that can be polled, which decides when a read
-  uses a ring's buffer. A ring of buffers in the program's memory is not
+  `poll` and `epoll` cannot watch its descriptor. The features are Linux
+  6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
+  descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
+  wait's `min_wait_usec` changes nothing. A terminal's read waits in
+  `io_uring_enter`. A file that is never read (an epoll instance, a ring)
+  fails with `EINVAL` at once, where Linux first waits for it to be ready.
+  A file without a position (a pipe, a socket, a terminal, an eventfd) is
+  taken as one that can be polled, which decides when a read uses a ring's
+  buffer and whether a transfer waits for it. A ring of buffers in the program's memory is not
   pinned either: the kernel reads and writes it through its mapping at each
   use, so a read that finds it unmapped fails with `EFAULT`, where Linux uses
   the pages it pinned.

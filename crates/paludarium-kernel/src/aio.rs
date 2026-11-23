@@ -597,7 +597,7 @@ pub(crate) fn complete_ready(limits: &Limits, hub: &crate::events::ReadinessHub)
 /// and write and for a terminal, which wait on a queue for each. A pipe or
 /// socket that is readable is `POLLRDNORM` too, and one that takes a write
 /// `POLLWRNORM`, as Linux's `pipe_poll` and `unix_poll` say.
-fn polled(file: &Arc<dyn FileHandle>) -> (u32, u32) {
+pub(crate) fn polled(file: &Arc<dyn FileHandle>) -> (u32, u32) {
     let Ok((mut mask, _, _)) = file.readiness() else {
         return (DEFAULT_POLLMASK, 0);
     };

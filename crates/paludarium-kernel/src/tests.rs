@@ -4885,16 +4885,25 @@ mod io_uring {
         assert_eq!(one(&mut f, &r, &rw(READ, dir, 0, buf, 1)), -21);
         let epfd = f.ret(291, &[0]);
         assert_eq!(one(&mut f, &r, &rw(READ, epfd, 0, buf, 1)), -22);
-        // An empty pipe would wait: EAGAIN here.
+        // An empty pipe waits: the read goes on as the write's call
+        // returns, as task work.
         assert_eq!(f.ret(22, &[DATA + 0x500]), 0);
         let ends = bytes(&f, DATA + 0x500, 8);
         let reader = u64::from(u32::from_le_bytes(ends[..4].try_into().unwrap()));
         let writer = u64::from(u32::from_le_bytes(ends[4..].try_into().unwrap()));
-        assert_eq!(one(&mut f, &r, &rw(READ, reader, 0, buf, 4)), -11);
+        assert_eq!(batch(&mut f, &r, &[rw(READ, reader, 0, buf + 8, 8)]), []);
         f.mem.write(GuestAddr(buf), b"pipe").unwrap();
-        assert_eq!(one(&mut f, &r, &rw(WRITE, writer, 5, buf, 4)), 4);
-        assert_eq!(one(&mut f, &r, &rw(READ, reader, HERE, buf + 8, 8)), 4);
+        // Both are in the queue as the call returns: the write's, then the
+        // read's.
+        assert_eq!(
+            batch(&mut f, &r, &[rw(WRITE, writer, 5, buf, 4)]),
+            [(1, 4), (1, 4)]
+        );
         assert_eq!(bytes(&f, buf + 8, 4), b"pipe");
+        // With RWF_NOWAIT it ends at once.
+        let mut nowait = rw(READ, reader, HERE, buf, 4);
+        nowait[28] = 8;
+        assert_eq!(one(&mut f, &r, &nowait), -11);
     }
 
     const READ_FIXED: u8 = 4;
@@ -4992,13 +5001,18 @@ mod io_uring {
         assert_eq!(f.ret(1, &[fifo, DATA + 0x800, 4096]), 4096);
         let ifd = f.ret(294, &[0o4000]);
         assert!(f.ret(254, &[ifd, DATA, 2]) < 1024);
-        // Linux keeps it in flight: no event yet.
-        assert_eq!(one(&mut f, &r, &rw(WRITE, fifo, HERE, DATA, 1)), -11);
-        assert_eq!(f.ret(0, &[ifd, DATA + 0x100, 64]), errno(Errno::EAGAIN));
         // With RWF_NOWAIT it ends, and IN_MODIFY says so.
         let mut nowait = rw(WRITE, fifo, HERE, DATA, 1);
         nowait[28] = 8;
         assert_eq!(one(&mut f, &r, &nowait), -11);
+        assert_eq!(f.ret(0, &[ifd, DATA + 0x100, 64]), 16);
+        assert_eq!(u32_at(&f, DATA + 0x104), 2);
+        // Without, it waits for room: no event yet.
+        assert_eq!(batch(&mut f, &r, &[rw(WRITE, fifo, HERE, DATA, 1)]), []);
+        assert_eq!(f.ret(0, &[ifd, DATA + 0x100, 64]), errno(Errno::EAGAIN));
+        // A read makes room, and the write ends: IN_MODIFY says so.
+        assert_eq!(f.ret(0, &[fifo, DATA + 0x800, 4096]), 4096);
+        assert_eq!(reap(&mut f, &r), [(1, 1)]);
         assert_eq!(f.ret(0, &[ifd, DATA + 0x100, 64]), 16);
         assert_eq!(u32_at(&f, DATA + 0x104), 2);
     }
@@ -5545,6 +5559,46 @@ mod io_uring {
     }
 
     #[test]
+    fn a_read_that_would_wait_goes_on_once_its_pipe_is_ready() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        // O_NONBLOCK does not stop it waiting.
+        assert_eq!(f.ret(293, &[ends, 0o4000]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        // A link's next request waits for the read.
+        let mut first = rw(READ, read, HERE, buf, 8);
+        first[1] = 1 << 2;
+        assert_eq!(batch(&mut f, &r, &[first, nop(2, 0, 0, 0, 0)]), []);
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 2), (2, 0)]);
+        // A provided buffer stays with the read that chose it: none is left
+        // for a file's read.
+        f.mem.write(GuestAddr(DATA + 0x200), b"/tmp/w\0").unwrap();
+        let file = f.ret(2, &[DATA + 0x200, 0o102, 0o644]);
+        assert_eq!(one(&mut f, &r, &provide(1, buf, 4, 2, 7)), 0);
+        assert_eq!(batch(&mut f, &r, &[select(READ, read, HERE, 0, 2)]), []);
+        assert_eq!(one(&mut f, &r, &select(READ, file, 0, 0, 2)), -105);
+        f.mem.write(GuestAddr(DATA), b"cd").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 2)]);
+        assert_eq!(bytes(&f, buf, 2), b"cd");
+        // A ring's stays in the ring, which the file's read takes.
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(pbuf(&mut f, &r, page, 1, 3, 0), 0);
+        entry(&f, page, 0, buf, 8, 5);
+        tail(&f, page, 1);
+        assert_eq!(batch(&mut f, &r, &[select(READ, read, HERE, 0, 3)]), []);
+        assert_eq!(
+            one_flags(&mut f, &r, &select(READ, file, 0, 0, 3)),
+            (0, BUFFER | 5 << 16)
+        );
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, -105)]);
+    }
+
+    #[test]
     fn a_pipe_uses_its_ring_buffer_once_the_read_is_done() {
         let mut f = fixture();
         let r = ring(&mut f);
@@ -5555,11 +5609,11 @@ mod io_uring {
         assert_eq!(pbuf(&mut f, &r, page, 1, 1, 2), 0);
         entry(&f, page, 0, buf, 8, 3);
         tail(&f, page, 1);
-        // A read that would wait leaves the buffer.
-        assert_eq!(
-            one_flags(&mut f, &r, &select(READ, read, HERE, 0, 1)),
-            (-11, 0)
-        );
+        // A read that would wait leaves the buffer, or uses it with
+        // RWF_NOWAIT.
+        let mut nowait = select(READ, read, HERE, 0, 1);
+        nowait[28] = 8;
+        assert_eq!(one_flags(&mut f, &r, &nowait), (-11, 0));
         assert_eq!(head(&mut f, &r, 1), 0);
         f.mem.write(GuestAddr(DATA), b"xyz").unwrap();
         assert_eq!(f.ret(1, &[write, DATA, 3]), 3);
@@ -5573,10 +5627,9 @@ mod io_uring {
         assert_eq!(head(&mut f, &r, 1), 0);
         // Provided buffers go as they are chosen.
         assert_eq!(one(&mut f, &r, &provide(1, buf, 4, 2, 0)), 0);
-        assert_eq!(
-            one_flags(&mut f, &r, &select(READ, read, HERE, 0, 2)),
-            (-11, BUFFER)
-        );
+        let mut nowait = select(READ, read, HERE, 0, 2);
+        nowait[28] = 8;
+        assert_eq!(one_flags(&mut f, &r, &nowait), (-11, BUFFER));
         assert_eq!(one(&mut f, &r, &remove(1, 2)), 0);
     }
 

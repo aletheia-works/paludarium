@@ -442,8 +442,6 @@ pub struct ThreadState {
     pub(crate) seccomp_restart: Option<bool>,
     /// What the thread keeps of ptrace ([`ptrace::Local`]).
     pub(crate) ptrace: ptrace::Local,
-    /// Its io_uring task work ([`io_uring::TaskWork`]).
-    pub(crate) task_work: io_uring::TaskWork,
 }
 
 impl ThreadState {
@@ -1000,11 +998,17 @@ impl Kernel {
         // runs without a call, as Linux's timer completes it from its
         // wake-up (`timerfd_tmrproc`).
         aio::complete_ready(&self.processes.aio, &self.files.readiness);
+        // So do the io_uring requests that wait for a file this thread's
+        // call made ready, as task work of the threads that submitted them.
+        io_uring::complete_ready(&self.processes.io_uring);
         self.ptrace_traps(thread, &mut restart);
         // io_uring's task work runs on the way back to the program, after
         // the call's ptrace stops and before a signal is taken, as Linux's
-        // `exit_to_user_mode_loop` runs it (`TIF_NOTIFY_SIGNAL`).
-        if io_uring::task_work_due(&thread.state) {
+        // `exit_to_user_mode_loop` runs it (`TIF_NOTIFY_SIGNAL`), but not
+        // while the thread is stopped. A call it ended runs again if no
+        // handler runs ([`Self::rewind_restart`] below).
+        let notified = !thread.state.stopped && io_uring::task_work_due(&self.inbox);
+        if notified {
             let mut ctx = syscalls::Context {
                 number: u64::MAX,
                 tid: thread.tid,
@@ -1166,9 +1170,14 @@ impl Kernel {
         }
         // A call a ptrace stop interrupted runs again when no handler
         // runs, as after any stop.
+        // So does one io_uring task work ended, as Linux's
+        // `arch_do_signal_or_restart` restarts a call with no signal to
+        // deliver: ERESTARTSYS, ERESTARTNOHAND and ERESTARTNOINTR run again,
+        // and ERESTART_RESTARTBLOCK through restart_syscall; a call that
+        // gives EINTR (epoll_wait) gives it.
         if thread.state.stopped {
             Self::stop_rewind(thread, &restart, rewound);
-        } else if restart.traced {
+        } else if restart.traced || notified {
             Self::rewind_restart(thread, restart.number);
         }
         if thread.state.stopped {

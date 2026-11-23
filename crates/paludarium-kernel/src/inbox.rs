@@ -32,6 +32,14 @@ pub struct SignalInbox {
     /// The registers of its last entry into the kernel
     /// ([`Self::enter_kernel`]).
     entry: Entry,
+    /// The thread's io_uring task work (`tctx->task_list`), which any
+    /// thread or process may add to as a request it waited for becomes
+    /// ready.
+    task_work: Mutex<crate::io_uring::TaskWork>,
+    /// `TIF_NOTIFY_SIGNAL`: task work waits to run. Until the thread runs
+    /// it, every interruptible wait ends as a signal would end it
+    /// ([`WakeReceipt::interrupted`]).
+    notify: AtomicBool,
 }
 /// The registers Linux's `collect_syscall` reads of a task that has entered
 /// the kernel: `orig_ax` (the call's number, or -1 for another reason),
@@ -58,7 +66,12 @@ pub(crate) struct KernelEntry {
 pub(crate) struct WakeReceipt {
     pub signals: bool,
     pub timer_changed: bool,
+    /// The wait is to end: the emulator interrupted it, or task work waits
+    /// to run (`signal_pending` with `TIF_NOTIFY_SIGNAL`).
     pub interrupted: bool,
+    /// The emulator interrupted it ([`SignalInbox::interrupt`]), which
+    /// task work alone does not (`task_sigpending`).
+    pub control: bool,
 }
 impl SignalInbox {
     /// The flag its thread's waits set ([`paludarium_host::blocked::attach`]).
@@ -245,6 +258,40 @@ impl SignalInbox {
         self.timer_wake.store(true, Ordering::SeqCst);
         self.wake.store(true, Ordering::SeqCst);
     }
+    /// The thread's io_uring task work.
+    pub(crate) fn task_work(&self) -> std::sync::MutexGuard<'_, crate::io_uring::TaskWork> {
+        self.task_work
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Sets `TIF_NOTIFY_SIGNAL` for task work just added, as
+    /// `task_work_add` does with `TWA_SIGNAL` or `TWA_SIGNAL_NO_IPI`:
+    /// `__set_notify_signal` wakes the thread from an interruptible wait
+    /// (`wake_up_state`), so work another task adds wakes it (`remote`).
+    pub(crate) fn notify_signal(&self, remote: bool) {
+        let _queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        self.notify.store(true, Ordering::SeqCst);
+        if remote {
+            self.wake.store(true, Ordering::SeqCst);
+            self.notify_listeners();
+        }
+    }
+    /// Whether task work waits to run (`TIF_NOTIFY_SIGNAL`).
+    pub(crate) fn notified(&self) -> bool {
+        self.notify.load(Ordering::SeqCst)
+    }
+    /// Clears `TIF_NOTIFY_SIGNAL` once no task work is left
+    /// (`clear_notify_signal`), under the queue's lock, so work added after
+    /// the check sets it again.
+    pub(crate) fn clear_notify_if_idle(&self) -> bool {
+        let work = self.task_work();
+        if work.is_empty() {
+            self.notify.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
     pub(crate) fn owns_wake(&self, token: &AtomicBool) -> bool {
         std::ptr::eq(&*self.wake, token)
     }
@@ -326,10 +373,12 @@ impl SignalInbox {
         if let Some(discards) = &*self.discards.lock().unwrap_or_else(PoisonError::into_inner) {
             discards.apply(process);
         }
+        let control = self.control_wake.swap(false, Ordering::SeqCst);
         let received = WakeReceipt {
             signals: !queue.is_empty(),
             timer_changed: self.timer_wake.swap(false, Ordering::SeqCst),
-            interrupted: self.control_wake.swap(false, Ordering::SeqCst),
+            interrupted: control || self.notify.load(Ordering::SeqCst),
+            control,
         };
         queue.retain(|signal| {
             if signal.target == signals::PendingTarget::Thread {

@@ -27,9 +27,17 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// Whether the thread has to leave a wait: its group is ending, a signal is
-/// pending, or the emulator cancels it. [`wait`]'s other interruptions are
-/// only wake-ups, which a wait that cannot restart sleeps on through.
+/// pending, the emulator cancels it, or io_uring task work waits to run
+/// (`signal_pending`, which `TIF_NOTIFY_SIGNAL` makes true). [`wait`]'s
+/// other interruptions are only wake-ups, which a wait that cannot restart
+/// sleeps on through.
 pub(crate) fn signalled(c: &Context<'_>) -> bool {
+    task_sigpending(c) || c.inbox.notified()
+}
+
+/// [`signalled`] without the task work (`task_sigpending`), which io_uring's
+/// own wait runs instead of ending (`io_cqring_wait_schedule`).
+pub(crate) fn task_sigpending(c: &Context<'_>) -> bool {
     c.group.status().is_some()
         || crate::signals::next_pending(c.process, true).is_some()
         || (!c.inbox.owns_wake(c.cancellation) && c.cancellation.load(Ordering::SeqCst))
@@ -37,6 +45,24 @@ pub(crate) fn signalled(c: &Context<'_>) -> bool {
 
 /// Sample the ticket before readiness inspection to prevent lost writes.
 pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> Result<(), Errno> {
+    wait_for(c, ticket, deadline, true)
+}
+
+/// [`wait`], which io_uring task work waiting to run ends with `EINTR` only
+/// if `task_work_ends` (an io_uring wait runs it instead).
+pub(crate) fn wait_for(
+    c: &mut Context<'_>,
+    ticket: u32,
+    deadline: Option<u64>,
+    task_work_ends: bool,
+) -> Result<(), Errno> {
+    let ends = |c: &Context<'_>, receipt: &crate::inbox::WakeReceipt| {
+        if task_work_ends {
+            signalled(c) || receipt.interrupted
+        } else {
+            task_sigpending(c) || receipt.control
+        }
+    };
     // A process signal sent after this count can set the wake the drain
     // below clears, even one the drain after it takes in before the wait:
     // a later count tells it from an interruption once the wait ends.
@@ -45,7 +71,7 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
     c.group.drain_process(c.process);
     let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
     c.group.expire_timer(c.process, now);
-    if signalled(c) || receipt.interrupted {
+    if ends(c, &receipt) {
         return Err(Errno(4));
     }
     // Owner receipts distinguish metadata from actual interruption, including
@@ -79,13 +105,15 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
     // A poll an aio context holds completes once its file is ready, which
     // what this wait is for may be waiting for in turn (its eventfd).
     crate::aio::progress(c);
-    if signalled(c)
-        || receipt.interrupted
+    // So does a request an io_uring ring holds until its file is ready.
+    crate::io_uring::progress(c);
+    if ends(c, &receipt)
         || (outcome == paludarium_host::WaitOutcome::Interrupted
             && !receipt.timer_changed
             && !receipt.signals
             && !sent
-            && c.group.timer_generation() == generation)
+            && c.group.timer_generation() == generation
+            && (task_work_ends || !c.inbox.notified()))
     {
         Err(Errno(4))
     } else {

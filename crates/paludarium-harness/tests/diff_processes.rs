@@ -1048,6 +1048,7 @@ mod linux {
         processes_io_uring_files => ("io-uring-files","process"),
         processes_io_uring_buffers => ("io-uring-buffers","process"),
         processes_io_uring_task_work => ("io-uring-task-work","process"),
+        processes_io_uring_poll => ("io-uring-poll","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

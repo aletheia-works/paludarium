@@ -23,10 +23,12 @@
 //! link's next request and the rest of a failed link run after the
 //! submission's completions, when the thread returns to its program, waits
 //! or takes a signal, or with `IORING_SETUP_DEFER_TASKRUN` when it waits on
-//! the ring, as Linux master's `tw.c` runs them. So no request waits for its
-//! file: a wait for more completions than there will be ends only by a
-//! signal or a timeout. The setup flags that need a kernel thread, polled
-//! I/O or another layout of the rings give `EINVAL`.
+//! the ring, as Linux master's `tw.c` runs them. A transfer that would wait
+//! for its file waits ([`arm`]), and goes on as task work of its submitter
+//! once a call of any thread or process made the file ready
+//! ([`complete_ready`]), waking the submitter's wait as a signal would. The
+//! setup flags that need a kernel thread, polled I/O or another layout of
+//! the rings give `EINVAL`.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -297,34 +299,45 @@ pub(crate) struct Ring {
 }
 
 /// A thread's task work for its rings without
-/// `IORING_SETUP_DEFER_TASKRUN` (`tctx->task_list`), in order: it runs as
-/// the thread returns to its program, which every such ring tells it to
-/// (`TWA_SIGNAL`, or `TWA_SIGNAL_NO_IPI` with `IORING_SETUP_COOP_TASKRUN`,
-/// which only spares a thread running its program an interrupt), and as
-/// any of its rings waits. A new thread has none of its maker's.
+/// `IORING_SETUP_DEFER_TASKRUN` (`tctx->task_list`), in order, which its
+/// [`crate::SignalInbox`] keeps: it runs as the thread returns to its
+/// program, which every such ring tells it to (`TWA_SIGNAL`, or
+/// `TWA_SIGNAL_NO_IPI` with `IORING_SETUP_COOP_TASKRUN`, which only spares a
+/// thread running its program an interrupt), and as any of its rings waits.
+/// Work another thread or process adds, as a request that waited for its
+/// file goes on, ends the thread's interruptible wait as a signal would
+/// (`TIF_NOTIFY_SIGNAL`). A new thread has none of its maker's.
 #[derive(Default)]
 pub(crate) struct TaskWork {
     queue: VecDeque<(Arc<dyn FileHandle>, Deferred)>,
 }
 
-impl Clone for TaskWork {
-    fn clone(&self) -> Self {
-        Self::default()
+impl TaskWork {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 }
 
-impl PartialEq for TaskWork {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
+/// The requests of every ring that wait for their file to be ready
+/// (`io_arm_poll_handler`), in the order they began to.
+#[derive(Default)]
+pub(crate) struct Polls {
+    armed: Mutex<Vec<Armed>>,
+    count: std::sync::atomic::AtomicUsize,
 }
 
-impl Eq for TaskWork {}
-
-impl std::fmt::Debug for TaskWork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TaskWork({})", self.queue.len())
-    }
+/// A request that waits for its file (`struct async_poll`): the ring, the
+/// thread that submitted it, whose task work it goes on as, and that
+/// thread's readiness hub, the file and the events it waits for, the
+/// request and the rest of its link, and the registered files it holds.
+struct Armed {
+    ring: Arc<dyn FileHandle>,
+    inbox: Arc<crate::SignalInbox>,
+    hub: Arc<crate::events::ReadinessHub>,
+    polled: Arc<dyn FileHandle>,
+    mask: u32,
+    chain: Vec<Request>,
+    held: Vec<Arc<Node>>,
 }
 
 /// Task work: what is left of a request, or of its link, until it runs.
@@ -338,8 +351,9 @@ enum Deferred {
         flags: u8,
     },
     /// `io_req_task_submit`: a link's next request runs, and the rest wait
-    /// for it.
-    Submit(Vec<Request>),
+    /// for it; or a request whose file became ready runs again
+    /// (`io_poll_task_func`), with the registered files it held.
+    Submit(Vec<Request>, Vec<Arc<Node>>),
     /// `io_req_tw_fail_links`: the rest of a link that failed completes,
     /// each with the error it failed to prepare with or `ECANCELED`, and
     /// none posts with `REQ_F_SKIP_LINK_CQES`.
@@ -482,6 +496,7 @@ impl BufferRing {
 /// A buffer a read selected: its group and ID, the bytes it reads to,
 /// and, for one of a ring, whether it was used already (a file that cannot
 /// be polled) and whether that left some of it.
+#[derive(Clone, Copy)]
 struct Chosen {
     bgid: u16,
     bid: u16,
@@ -675,6 +690,9 @@ struct Transfer {
     /// Protection information came with it (`REQ_F_HAS_METADATA`), which
     /// no file here takes.
     metadata: bool,
+    /// The provided buffer it chose before it waited for its file, which it
+    /// reads to as it goes on.
+    kept: Option<Chosen>,
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
@@ -899,6 +917,7 @@ impl Ring {
                 attr_type_mask: u64_at(sqe, 56),
                 segments: Vec::new(),
                 metadata: false,
+                kept: None,
             })),
             OP_FSYNC => {
                 // `io_fsync_prep`.
@@ -1158,30 +1177,87 @@ fn is_ring(d: &crate::files::Descriptor) -> bool {
 /// ([`select`]), whose length is cut to `MAX_RW_COUNT` and which must be
 /// in the user half (`EFAULT`, `import_ubuf`), then the rest ([`issue`]).
 /// The selected buffer goes as [`give_back`] says.
-fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> (Result<u64, Errno>, u32) {
+/// A transfer's result and completion flags, and for one that would wait
+/// what it waits for ([`arm`]).
+type Transferred = (Result<u64, Errno>, u32, Option<Waits>);
+
+/// What a transfer that would wait waits for: its file's events, with the
+/// provided buffer it chose, which it keeps (`REQ_F_BUFFER_SELECTED`).
+struct Waits {
+    file: Arc<dyn FileHandle>,
+    mask: u32,
+    kept: Option<Chosen>,
+}
+
+fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferred {
     let opened = match file_of(c, ring, transfer.fd, transfer.fixed) {
         Ok(opened) => opened,
-        Err(e) => return (Err(e), 0),
+        Err(e) => return (Err(e), 0, None),
+    };
+    let waits = |result: &Result<u64, Errno>, kept: Option<Chosen>| {
+        waits_for(transfer, &opened.file, result).then(|| Waits {
+            file: Arc::clone(&opened.file),
+            mask: POLL_UNMASK
+                | if transfer.write {
+                    POLL_OUT_EVENTS
+                } else {
+                    POLL_IN_EVENTS
+                },
+            kept,
+        })
     };
     if transfer.registered {
         let result = ring
             .registered(transfer.buf_index, transfer.addr, transfer.len)
             .and_then(|within| issue(c, transfer, &opened, &[within]));
-        return (result, 0);
+        let poll = waits(&result, None);
+        return (result, 0, poll);
     }
     if !transfer.select {
-        return (issue(c, transfer, &opened, &transfer.segments), 0);
+        let result = issue(c, transfer, &opened, &transfer.segments);
+        let poll = waits(&result, None);
+        return (result, 0, poll);
     }
     let pollable = !crate::files::aio_positioned(&opened.file);
-    let chosen = match select(c, ring, transfer.buf_index, transfer.len, pollable) {
-        Ok(chosen) => chosen,
-        Err(e) => return (Err(e), 0),
+    let chosen = match transfer.kept {
+        Some(kept) => kept,
+        None => match select(c, ring, transfer.buf_index, transfer.len, pollable) {
+            Ok(chosen) => chosen,
+            Err(e) => return (Err(e), 0, None),
+        },
     };
     let len = u64::from(chosen.len).min(crate::files::MAX_RW_COUNT as u64);
     let result = crate::sockets::access_ok_u64(chosen.addr, len)
         .and_then(|()| issue(c, transfer, &opened, &[(chosen.addr, len as usize)]));
+    // A read that waits keeps a provided buffer; a ring's stays at the
+    // ring's head (`io_kbuf_recycle`, as a file that can be polled uses it
+    // only once its read is done) and is chosen again as the read goes on.
+    if let Some(poll) = waits(&result, (!chosen.ring).then_some(chosen)) {
+        return (result, 0, Some(poll));
+    }
     let flags = give_back(c, ring, &chosen, &result);
-    (result, flags)
+    (result, flags, None)
+}
+
+/// `POLLIN | POLLPRI | POLLRDNORM | POLLERR`, what a read waits for
+/// (`io_arm_poll_handler`: urgent data is an event for a reader).
+const POLL_IN_EVENTS: u32 = 0x1 | 0x2 | 0x40 | 0x8;
+/// `POLLOUT | POLLWRNORM | POLLERR`, what a write waits for.
+const POLL_OUT_EVENTS: u32 = 0x4 | 0x100 | 0x8;
+/// `IO_POLL_UNMASK`: `POLLERR | POLLHUP | POLLNVAL | POLLRDHUP`, which end
+/// any poll.
+const POLL_UNMASK: u32 = 0x8 | 0x10 | 0x20 | 0x2000;
+
+/// Whether a transfer that gave `result` waits for its file
+/// (`io_queue_async` arming a poll): `EAGAIN` from a file that can be
+/// polled, a pipe, a socket, an eventfd or a terminal, unless it asked for
+/// `RWF_NOWAIT` (`REQ_F_NOWAIT`). `O_NONBLOCK` does not stop it, as every
+/// such file supports `FMODE_NOWAIT` (`REQ_F_SUPPORT_NOWAIT`).
+fn waits_for(transfer: &Transfer, file: &Arc<dyn FileHandle>, result: &Result<u64, Errno>) -> bool {
+    *result == Err(Errno::EAGAIN)
+        && transfer.rw_flags & RWF_NOWAIT == 0
+        && !crate::files::aio_positioned(file)
+        && file.readiness().is_ok()
 }
 
 /// The rest of `io_read` and `io_write`: `io_rw_init_file` (the access
@@ -1207,9 +1283,9 @@ fn issue(
     }
     let result =
         crate::files::ring_transfer(c, file, transfer.write, segments, transfer.offset, flags)?;
-    // A write that would wait completes with `EAGAIN` here, where Linux
-    // keeps it in flight and its watches hear of it only once it ends;
-    // one that asked for `RWF_NOWAIT` ends at once, and they hear of it.
+    // A write that would wait waits for its file ([`arm`]), and its watches
+    // hear of it only once it ends; one that asked for `RWF_NOWAIT` ends at
+    // once, and they hear of it.
     let waited = result == Err(Errno::EAGAIN) && flags & RWF_NOWAIT == 0;
     if transfer.write && !waited {
         crate::files::notify_open(c, opened, crate::inotify::MODIFY);
@@ -1285,9 +1361,7 @@ fn select(
 /// `IOU_PBUF_RING_INC`); their completion has `IORING_CQE_F_BUFFER` and the
 /// ID, and `IORING_CQE_F_BUF_MORE` for a buffer some of which is left. A
 /// ring's buffer whose read failed before it was used stays in the ring.
-///
-/// A read that would wait completes with `EAGAIN` here, where Linux keeps
-/// it in flight: its buffer goes as one with `RWF_NOWAIT` would.
+/// (A read that waits for its file gives nothing back: [`transfer`].)
 fn give_back(c: &Context<'_>, ring: &Ring, chosen: &Chosen, result: &Result<u64, Errno>) -> u32 {
     let flags = CQE_F_BUFFER | u32::from(chosen.bid) << CQE_BUFFER_SHIFT;
     let more = |more: bool| if more { CQE_F_BUF_MORE } else { 0 };
@@ -1313,14 +1387,15 @@ fn give_back(c: &Context<'_>, ring: &Ring, chosen: &Chosen, result: &Result<u64,
 }
 
 /// Runs a request and gives its result, its completion's flags and
-/// whether it failed (`req_set_fail`), which a negative result does.
-fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool) {
+/// whether it failed (`req_set_fail`), which a negative result does, or
+/// what a transfer that would wait waits for.
+fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool, Option<Waits>) {
     let result = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
     match work {
         Work::Transfer(work) => {
-            let (r, flags) = transfer(c, ring, work);
+            let (r, flags, waits) = transfer(c, ring, work);
             let res = result(r);
-            return (res, flags, res < 0);
+            return (res, flags, res < 0, waits);
         }
         // `io_nop`, as Linux master has it: a file it does not find is
         // `EBADF`, then a registered buffer `EFAULT`, else its result.
@@ -1337,7 +1412,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool) {
             } else {
                 result
             };
-            return (res, 0, res < 0);
+            return (res, 0, res < 0, None);
         }
         _ => {}
     }
@@ -1380,7 +1455,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool) {
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
         Work::Transfer(_) | Work::Nop { .. } | Work::None => 0,
     };
-    (res, 0, res < 0)
+    (res, 0, res < 0, None)
 }
 
 /// `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, as Linux's
@@ -1457,16 +1532,31 @@ fn complete(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, mut ch
 
 /// Runs the first request of a link (`io_issue_sqe`): its completion goes
 /// in the batch, or for an `IORING_NOP_TW` in task work with the
-/// registered files it found.
+/// registered files it found; a transfer that would wait waits for its
+/// file ([`arm`]).
 fn issue_link(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     ring: &Ring,
     mut chain: Vec<Request>,
 ) {
-    let request = chain.remove(0);
+    let mut request = chain.remove(0);
     let mark = ring.state().held.len();
-    let (res, flags, failed) = run(c, ring, &request.work);
+    let (res, flags, failed, waits) = run(c, ring, &request.work);
+    let split_held = || {
+        let mut state = ring.state();
+        let at = mark.min(state.held.len());
+        state.held.split_off(at)
+    };
+    if let Some(waits) = waits {
+        if let Work::Transfer(transfer) = &mut request.work {
+            transfer.kept = waits.kept;
+        }
+        chain.insert(0, request);
+        let held = split_held();
+        arm(c, file, ring, waits, chain, held);
+        return;
+    }
     let done = Done {
         user_data: request.user_data,
         res,
@@ -1475,11 +1565,7 @@ fn issue_link(
         next: None,
     };
     if matches!(request.work, Work::Nop { tw: true, .. }) {
-        let held = {
-            let mut state = ring.state();
-            let at = mark.min(state.held.len());
-            state.held.split_off(at)
-        };
+        let held = split_held();
         queue(
             c,
             file,
@@ -1496,6 +1582,120 @@ fn issue_link(
     ring.complete(finish(done, request.flags, failed, chain));
 }
 
+/// Makes a request wait for its file (`io_arm_poll_handler`), holding the
+/// file and the registered files it found: it goes on as task work once
+/// the file is ready ([`complete_ready`]), at once if it is now
+/// (`IO_APOLL_READY`). One a thread that is not in its group submits (no
+/// inbox to go on through) completes with `EAGAIN` instead.
+fn arm(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    ring: &Ring,
+    waits: Waits,
+    chain: Vec<Request>,
+    held: Vec<Arc<Node>>,
+) {
+    if ready(&waits.file, waits.mask) {
+        queue(c, file, ring, Deferred::Submit(chain, held));
+        return;
+    }
+    let Some(inbox) = c.group.inbox(c.tid) else {
+        let mut chain = chain;
+        let request = chain.remove(0);
+        ring.state().held.extend(held);
+        let done = Done {
+            user_data: request.user_data,
+            res: -Errno::EAGAIN.0,
+            flags: 0,
+            post: true,
+            next: None,
+        };
+        ring.complete(finish(done, request.flags, true, chain));
+        return;
+    };
+    let polls = &c.processes.io_uring;
+    polls
+        .armed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Armed {
+            ring: Arc::clone(file),
+            inbox,
+            hub: Arc::clone(&c.files.readiness),
+            polled: waits.file,
+            mask: waits.mask,
+            chain,
+            held,
+        });
+    polls
+        .count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether `file` has any of the events of `mask` (`vfs_poll`).
+fn ready(file: &Arc<dyn FileHandle>, mask: u32) -> bool {
+    crate::aio::polled(file).0 & mask != 0
+}
+
+/// The requests that waited for files that are now ready go on, each as
+/// task work of the thread that submitted it (`io_poll_wake` queuing
+/// `io_poll_task_func`), which wakes that thread's wait as a signal would
+/// ([`crate::SignalInbox::notify_signal`]).
+pub(crate) fn complete_ready(polls: &Polls) {
+    if polls.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return;
+    }
+    let woken: Vec<Armed> = {
+        let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
+        let (woken, waiting) = std::mem::take(&mut *armed)
+            .into_iter()
+            .partition(|a| ready(&a.polled, a.mask));
+        *armed = waiting;
+        polls
+            .count
+            .store(armed.len(), std::sync::atomic::Ordering::SeqCst);
+        woken
+    };
+    for armed in woken {
+        let Ok(ring) = downcast(&armed.ring) else {
+            continue;
+        };
+        add_work(
+            &armed.ring,
+            ring,
+            &armed.inbox,
+            Some(&armed.hub),
+            Deferred::Submit(armed.chain, armed.held),
+        );
+    }
+}
+
+/// [`complete_ready`] as a call waits.
+pub(crate) fn progress(c: &Context<'_>) {
+    complete_ready(&c.processes.io_uring);
+}
+
+/// Drops the task work of the thread `inbox` belongs to and the requests it
+/// submitted that wait for their files, as it execs or exits. Linux cancels
+/// them (`io_uring_cancel_generic`), posting `ECANCELED`.
+pub(crate) fn drop_task(polls: &Polls, inbox: &crate::SignalInbox) {
+    let dropped: Vec<Armed> = {
+        let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
+        let (dropped, kept) = std::mem::take(&mut *armed)
+            .into_iter()
+            .partition(|a| std::ptr::eq(Arc::as_ptr(&a.inbox), inbox));
+        *armed = kept;
+        polls
+            .count
+            .store(armed.len(), std::sync::atomic::Ordering::SeqCst);
+        dropped
+    };
+    drop(dropped);
+    let work = std::mem::take(&mut inbox.task_work().queue);
+    drop(work);
+    inbox.clear_notify_if_idle();
+}
+
 /// What a request's completion does, after its flags: one that failed posts
 /// even with `IOSQE_CQE_SKIP_SUCCESS` (`req_set_fail`), and so ends its soft
 /// link, whose rest posts nothing if it had the flag
@@ -1509,7 +1709,7 @@ fn finish(mut done: Done, flags: u8, failed: bool, rest: Vec<Request>) -> Done {
     } else if failed && flags & IOSQE_IO_HARDLINK == 0 {
         Some(Box::new(Deferred::Fail { chain: rest, skip }))
     } else {
-        Some(Box::new(Deferred::Submit(rest)))
+        Some(Box::new(Deferred::Submit(rest, Vec::new())))
     };
     done
 }
@@ -1527,7 +1727,10 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
             let failed = done.res < 0;
             ring.complete(finish(done, flags, failed, rest));
         }
-        Deferred::Submit(chain) => issue_link(c, file, ring, chain),
+        Deferred::Submit(chain, held) => {
+            ring.state().held.extend(held);
+            issue_link(c, file, ring, chain);
+        }
         Deferred::Fail { chain, skip } => {
             for request in chain {
                 ring.complete(Done {
@@ -1542,11 +1745,24 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
     }
 }
 
-/// Adds task work (`io_req_task_work_add`): to the ring's own list with
-/// `IORING_SETUP_DEFER_TASKRUN` (`io_req_local_work_add`), else to the
-/// thread's (`io_req_normal_work_add`). The work that starts a list sets
-/// `IORING_SQ_TASKRUN`.
+/// Adds task work (`io_req_task_work_add`) of the running thread.
 fn queue(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Deferred) {
+    add_work(file, ring, c.inbox, None, work);
+}
+
+/// Adds task work to the ring's own list with `IORING_SETUP_DEFER_TASKRUN`
+/// (`io_req_local_work_add`), else to the list of the thread `inbox`
+/// belongs to (`io_req_normal_work_add`), which it tells to run it
+/// (`task_work_add`). The work that starts a list sets `IORING_SQ_TASKRUN`.
+/// Work another thread adds (`hub`, that of the thread the work is for)
+/// wakes the thread's waits.
+fn add_work(
+    file: &Arc<dyn FileHandle>,
+    ring: &Ring,
+    inbox: &crate::SignalInbox,
+    hub: Option<&crate::events::ReadinessHub>,
+    work: Deferred,
+) {
     if ring.flags & SETUP_DEFER_TASKRUN != 0 {
         let first = {
             let mut local = ring.local.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1556,12 +1772,22 @@ fn queue(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Def
         if first {
             ring.mark_taskrun(true);
         }
+        if let Some(hub) = hub {
+            hub.changed();
+        }
         return;
     }
-    let task_work = &mut c.process.task_work;
-    task_work.queue.push_back((Arc::clone(file), work));
-    if task_work.queue.len() == 1 {
+    let first = {
+        let mut task_work = inbox.task_work();
+        task_work.queue.push_back((Arc::clone(file), work));
+        task_work.queue.len() == 1
+    };
+    if first {
         ring.mark_taskrun(true);
+    }
+    inbox.notify_signal(hub.is_some());
+    if let Some(hub) = hub {
+        hub.changed();
     }
 }
 
@@ -1575,23 +1801,26 @@ fn flush_batch(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring) {
 
 /// Whether the thread has task work to run as it returns to its program
 /// (`TIF_NOTIFY_SIGNAL`).
-pub(crate) fn task_work_due(state: &crate::ThreadState) -> bool {
-    !state.task_work.queue.is_empty()
+pub(crate) fn task_work_due(inbox: &crate::SignalInbox) -> bool {
+    inbox.notified() || !inbox.task_work().is_empty()
 }
 
 /// Runs the thread's task work (`tctx_task_work_run`) in order, a batch for
 /// each ring in turn, whose end clears `IORING_SQ_TASKRUN`
-/// (`ctx_flush_and_put`), until none is left.
+/// (`ctx_flush_and_put`), until none is left, then clears
+/// `TIF_NOTIFY_SIGNAL`.
 pub(crate) fn run_task_work(c: &mut Context<'_>) {
     let mut current: Option<Arc<dyn FileHandle>> = None;
     loop {
-        let Some((file, work)) = c.process.task_work.queue.pop_front() else {
+        let next = c.inbox.task_work().queue.pop_front();
+        let Some((file, work)) = next else {
             match current.take() {
                 Some(file) => {
                     end_task_work(c, &file);
                     continue;
                 }
-                None => break,
+                None if c.inbox.clear_notify_if_idle() => break,
+                None => continue,
             }
         };
         if !current
@@ -2037,7 +2266,7 @@ fn wait(
     if local_pending(ring) {
         run_local(c, file, ring, min, LOCAL_TW_DEFAULT_MAX.max(min));
     }
-    if !c.process.task_work.queue.is_empty() {
+    if task_work_due(c.inbox) {
         run_task_work(c);
     }
     {
@@ -2089,7 +2318,7 @@ fn wait(
             run_local(c, file, ring, wanted, wanted);
             continue;
         }
-        if !c.process.task_work.queue.is_empty() {
+        if task_work_due(c.inbox) {
             run_task_work(c);
             continue;
         }
@@ -2100,7 +2329,9 @@ fn wait(
         }) {
             break Err(ETIME);
         }
-        if let Err(e) = crate::events::wait(c, ticket, deadline) {
+        // Task work that comes as it waits runs here, and ends no wait
+        // (`io_cqring_wait_schedule` checks `task_sigpending`).
+        if let Err(e) = crate::events::wait_for(c, ticket, deadline, false) {
             break Err(e);
         }
     };

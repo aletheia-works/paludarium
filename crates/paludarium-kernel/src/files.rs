@@ -6388,9 +6388,25 @@ pub(crate) struct StandardFile {
 const SETFL_FLAGS: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
 /// A file's flags after `F_SETFL` asks for `asked`, as Linux's `setfl`
 /// keeps them: only [`SETFL_FLAGS`] change, and the access mode and every
-/// other flag stay what they were.
+/// other flag stay what they were. `O_ASYNC` is not among them: a file with
+/// `fasync` keeps it itself ([`crate::fasync::set_flags`]).
 pub(crate) fn setfl(before: u32, asked: u32) -> u32 {
     (before & !SETFL_FLAGS) | (asked & SETFL_FLAGS)
+}
+/// The flags `F_SETFL` last set on a file whose other flags are fixed, as
+/// Linux's `setfl` keeps them in its `f_flags`: [`StatusFlags::of`] puts
+/// them over the fixed ones.
+#[derive(Default)]
+pub(crate) struct StatusFlags(AtomicU32);
+impl StatusFlags {
+    /// The file's flags, `fixed` with what `F_SETFL` set.
+    pub(crate) fn of(&self, fixed: u32) -> u32 {
+        setfl(fixed, self.0.load(Ordering::SeqCst))
+    }
+    /// `F_SETFL` asks for `asked`, of which [`SETFL_FLAGS`] are kept.
+    pub(crate) fn set(&self, asked: u32) {
+        self.0.store(asked & SETFL_FLAGS, Ordering::SeqCst);
+    }
 }
 /// What `F_GETFL` gives for `d`, as Linux keeps a file's `f_flags`: the open
 /// flags less `O_CLOEXEC` (`build_open_flags`) and `O_CREAT`, `O_EXCL`,

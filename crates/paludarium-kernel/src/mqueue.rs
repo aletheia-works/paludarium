@@ -1018,6 +1018,8 @@ fn search_root(c: &Context<'_>) -> Result<(), Errno> {
 pub(crate) struct MountedRoot {
     queues: Queues,
     position: Mutex<u64>,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 
 impl MountedRoot {
@@ -1025,6 +1027,7 @@ impl MountedRoot {
         let queues = mounted(c);
         let _ = queues.0.mtime(c);
         Self {
+            status: Default::default(),
             queues,
             position: Mutex::new(0),
         }
@@ -1072,9 +1075,11 @@ impl FileHandle for MountedRoot {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        0o200_000
+        self.status.of(0o200_000)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {

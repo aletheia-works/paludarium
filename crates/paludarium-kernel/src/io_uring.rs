@@ -298,6 +298,8 @@ pub(crate) struct Ring {
     local: Mutex<VecDeque<Deferred>>,
     /// Its own anonymous inode's status (`anon_inode_create_getfile`).
     stat: FileStat,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 
 /// A thread's task work for its rings without
@@ -2075,6 +2077,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
     let sqes_len = u64::from(sq_entries) * SQE_BYTES;
     let pages = |len: u64| ring_pages(c, len);
     let ring = Ring {
+        status: Default::default(),
         stat: crate::files::own_anonymous_inode(&c.process.credentials),
         flags,
         sq_entries,
@@ -3081,9 +3084,11 @@ impl FileHandle for Ring {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        2
+        self.status.of(2)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }

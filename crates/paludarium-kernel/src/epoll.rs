@@ -50,6 +50,8 @@ struct State {
 pub(crate) struct EpollInstance {
     state: Mutex<State>,
     hub: Arc<ReadinessHub>,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 impl EpollInstance {
     /// The files it watches, for `/proc/self/fdinfo`: each descriptor
@@ -76,6 +78,7 @@ impl EpollInstance {
     }
     pub fn new(hub: Arc<ReadinessHub>) -> Self {
         Self {
+            status: Default::default(),
             state: Mutex::default(),
             hub,
         }
@@ -262,9 +265,11 @@ impl FileHandle for EpollInstance {
         Err(Errno::ENOSYS)
     }
     fn flags(&self) -> u32 {
-        2
+        self.status.of(2)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }

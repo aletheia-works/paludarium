@@ -1007,6 +1007,7 @@ mod linux {
         processes_moves => ("moves","process"),
         processes_trees => ("trees","process"),
         processes_contexts => ("contexts","process"),
+        processes_setfl_kinds => ("setfl-kinds","process"),
         processes_setattrs => ("setattrs","process"),
         processes_mount_flags => ("mount-flags","process"),
         processes_listings => ("listings","process"),

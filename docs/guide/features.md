@@ -540,6 +540,10 @@ kernel.
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+  `F_SETFL` changes only `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`, `O_NOATIME`
+  and, on a file that signals, `O_ASYNC`; the access mode and the other
+  flags stay, as Linux's `setfl` keeps them. BPF maps and programs still
+  ignore it.
 
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
   reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,

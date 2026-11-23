@@ -93,8 +93,10 @@ async function untilSafariExited() {
 
 // Ending a session (DELETE /session, or closing its last window) leaves the Safari that safaridriver launched for it
 // running: it does not exit on its own, so each later session found it there (#947's runs: 14 of 14 never exited in
-// the 15 s wait and were killed). After a session, each Safari that the pgrep before it did not list (so one launched
-// for it, never a Safari that was running already, such as the person's own) is asked to quit through
+// the 15 s wait and were killed). After a session, or a request for one that failed (safaridriver may have launched a
+// Safari by then), each Safari that the pgrep before the request did not list is asked to quit: one launched for the
+// session, or one started by someone else in between, but never a Safari running already, such as the person's own. It
+// is asked through
 // NSRunningApplication's terminate, the same quit request as choosing Quit Safari, and its exit is awaited as an event
 // within safariExit.waitMs. Nothing is killed here: a Safari that does not quit is logged with exited:false, and the
 // next session's exit wait then reports it as never exited.
@@ -152,7 +154,7 @@ async function safariAttempt(url, timeout) {
   const port = 4455, base = `http://127.0.0.1:${port}`;
   const driver = spawn("/usr/bin/safaridriver", ["--port", String(port)], { stdio: ["ignore", "pipe", "pipe"] });
   const started = Date.now();
-  let driverError, sessionId, log = "", phase = "driver-startup", failure, exitWait = null, sessionRequestedAfter = null, launched = [];
+  let driverError, sessionId, log = "", phase = "driver-startup", failure, exitWait = null, sessionRequestedAfter = null;
   driver.on("error", error => { driverError = error; });
   for (const stream of [driver.stdout, driver.stderr]) stream.on("data", bytes => { log = (log + bytes.toString()).slice(-8192); });
   try {
@@ -171,7 +173,6 @@ async function safariAttempt(url, timeout) {
     const session = await webdriverRequest(base, "POST", "/session", { capabilities: { alwaysMatch: { browserName: "safari" } } }, 60000);
     sessionId = session.sessionId;
     if (!sessionId) throw new Error("Safari did not return a session ID");
-    launched = (await safariPids()).filter(pid => !exitWait.pids.includes(pid));
     phase = "navigation";
     await webdriverRequest(base, "POST", `/session/${sessionId}/url`, { url });
     phase = "script-report";
@@ -192,7 +193,10 @@ async function safariAttempt(url, timeout) {
     let cleanupError;
     try { if (sessionId) await webdriverRequest(base, "DELETE", `/session/${sessionId}`); }
     catch (error) { cleanupError = error; }
-    if (launched.length > 0) console.error(JSON.stringify({ safari_quit: await quitLaunched(launched) }));
+    if (sessionRequestedAfter !== null) {
+      const launched = (await safariPids()).filter(pid => !exitWait.pids.includes(pid));
+      if (launched.length > 0) console.error(JSON.stringify({ safari_quit: await quitLaunched(launched) }));
+    }
     await stopDriver(driver);
     if (cleanupError) {
       if (failure) failure.message += `; cleanup: ${cleanupError}`;

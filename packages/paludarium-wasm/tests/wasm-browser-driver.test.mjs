@@ -19,7 +19,7 @@ function stubPgrep(child, pids) {
 // Safari run; everything is restored in finally. `reply(key, count)` answers a WebDriver request (count = how many times
 // that key was asked) with [status, value]. `safaris` maps the pid of each Safari still running to the ms after which it
 // exits (Infinity: only when killed); `caffeinate -w <pid>` exits `lagMs` after that Safari does. `launch` is the Safari
-// a created session starts, { pid, quitMs }: pgrep lists it once a session was created, and it exits `quitMs` after the
+// a session request starts, { pid, quitMs }: pgrep lists it once a session was asked for (even if that failed), and it exits `quitMs` after the
 // osascript quit request for its pid (Infinity: never quits).
 async function stubbedSafari(reply, run, safaris = {}, lagMs = 0, launch = null) {
   const childProcess = createRequire(import.meta.url)("node:child_process");
@@ -59,7 +59,7 @@ async function stubbedSafari(reply, run, safaris = {}, lagMs = 0, launch = null)
     counts[key] = (counts[key] ?? 0) + 1;
     requests.push({ key, timeoutMs: timeouts.get(init.signal) });
     const [status, value] = reply(key, counts[key]) ?? [404, { error: "unexpected request" }];
-    if (key === "POST /session" && status === 200) sessionMade = true;
+    if (key === "POST /session") sessionMade = true;
     return new Response(JSON.stringify({ value }), { status });
   };
   try { return { outcome: await run().then(value => ({ value }), error => ({ error })), requests, spawned, logged, killed }; }
@@ -156,9 +156,9 @@ test("Safari launch timeout is retried once after stopping safaridriver and Safa
   assert.match(retry.first_failure, /^Safari session-creation: .*timed out while connecting to a Safari instance/);
   assert.deepEqual(retry.safari_stopped, { code: 0, signal: null });
   assert.deepEqual(run.spawned.map(({ command, args }) => [command, args]),
-    [["/usr/bin/safaridriver", ["--port", "4455"]], ["/usr/bin/pgrep", ["-x", "Safari"]], ["/usr/bin/pkill", ["-x", "Safari"]],
+    [["/usr/bin/safaridriver", ["--port", "4455"]], ["/usr/bin/pgrep", ["-x", "Safari"]], ["/usr/bin/pgrep", ["-x", "Safari"]], ["/usr/bin/pkill", ["-x", "Safari"]],
      ["/usr/bin/safaridriver", ["--port", "4455"]], ["/usr/bin/pgrep", ["-x", "Safari"]], ["/usr/bin/pgrep", ["-x", "Safari"]]]);
-  assert.equal(run.spawned[0].child.signalCode, "SIGTERM"); assert.equal(run.spawned[3].child.signalCode, "SIGTERM");
+  assert.equal(run.spawned[0].child.signalCode, "SIGTERM"); assert.equal(run.spawned[4].child.signalCode, "SIGTERM");
   assert.deepEqual(run.requests.map(r => r.key), ["GET /status", "POST /session", "GET /status", "POST /session", "POST /session/s1/url", "POST /session/s1/execute/sync", "DELETE /session/s1"]);
   assert.equal(run.logged.length, 1);
   const log = JSON.parse(run.logged[0]).safari_session_retry;
@@ -175,7 +175,7 @@ test("other Safari failures are not retried", async () => {
   const notEnabled = { error: "session not created", message: "Could not create a session: You must enable the 'Allow Remote Automation' option" };
   let run = await stubbedSafari(key => key === "POST /session" ? [500, notEnabled] : healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000));
   assert.match(String(run.outcome.error), /Safari session-creation: .*Allow Remote Automation/);
-  assert.equal(run.spawned.length, 2); assert.equal(run.logged.length, 0);
+  assert.equal(run.spawned.length, 3); assert.equal(run.logged.length, 0);
   assert.equal(run.requests.filter(r => r.key === "POST /session").length, 1);
   // the same timed-out text outside session creation (navigation) is not retried either
   run = await stubbedSafari(key => key === "POST /session/s1/url" ? [500, LAUNCH_TIMEOUT] : healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000));
@@ -189,7 +189,7 @@ test("a second launch timeout stops after the single retry and keeps both failur
   assert.match(error.message, /^Safari session-creation: .*; first attempt \(retried once\): Safari session-creation: .*timed out while connecting/);
   assert.equal(error.firstFailure.phase, "session-creation");
   assert.equal(run.requests.filter(r => r.key === "POST /session").length, 2);
-  assert.deepEqual(run.spawned.map(({ command }) => command), ["/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pkill", "/usr/bin/safaridriver", "/usr/bin/pgrep"]);
+  assert.deepEqual(run.spawned.map(({ command }) => command), ["/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pgrep", "/usr/bin/pkill", "/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pgrep"]);
   assert.equal(run.logged.length, 1);
 });
 test("Safari that never became ready is retried once like a launch timeout", async () => {
@@ -197,7 +197,7 @@ test("Safari that never became ready is retried once like a launch timeout", asy
   assert.ok(run.outcome.value, String(run.outcome.error));
   assert.equal(run.outcome.value.session_retry.attempts, 2);
   assert.match(run.outcome.value.session_retry.first_failure, /^Safari session-creation: .*The host application never became ready/);
-  assert.deepEqual(run.spawned.map(({ command }) => command), ["/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pkill", "/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pgrep"]);
+  assert.deepEqual(run.spawned.map(({ command }) => command), ["/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pgrep", "/usr/bin/pkill", "/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pgrep"]);
   assert.equal(run.logged.length, 1);
 });
 test("a second never-ready Safari stops after the single retry and keeps both failures", async () => {
@@ -288,4 +288,13 @@ test("a launched Safari that does not quit is logged as not exited and left for 
     const [quit] = JSON.parse(run.logged.at(-1)).safari_quit;
     assert.equal(quit.pid, 600); assert.equal(quit.exited, false); assert.ok(quit.waited_ms >= 45);
   } finally { Object.assign(safariExit, saved); }
+});
+test("a Safari launched for a session request that failed is asked to quit too", async () => {
+  const notEnabled = { error: "session not created", message: "Could not create a session: You must enable the 'Allow Remote Automation' option" };
+  const run = await stubbedSafari(key => key === "POST /session" ? [500, notEnabled] : healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), {}, 0, { pid: 600, quitMs: 0 });
+  assert.match(String(run.outcome.error), /Safari session-creation: /);
+  assert.ok(!run.requests.some(r => r.key.startsWith("DELETE")));
+  assert.deepEqual(run.spawned.filter(({ command }) => command === "/usr/bin/osascript").map(({ args }) => args), [quitArgs(600)]);
+  assert.deepEqual(run.killed, []);
+  assert.equal(JSON.parse(run.logged.at(-1)).safari_quit[0].exited, true);
 });

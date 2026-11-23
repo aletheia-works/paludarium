@@ -2675,7 +2675,15 @@ kernel.
     address as a broadcast one (the limited one, or one its routes make
     so) from a source its reverse path filtering takes
     (`ip_route_input_slow`). A socket connected from the unspecified
-    address has taken its route's source, and takes none. A group or the
+    address has taken its route's source, and takes none. An IPv4 socket
+    bound to a broadcast or multicast address keeps it as its name, which
+    a UDP connect leaves, but sends from its route's source (`inet_bind`),
+    and a TCP connection takes that source as its name too
+    (`tcp_v4_connect`). An IPv6 socket bound to such an IPv4-mapped
+    address keeps it as its IPv4 source (`__inet6_bind`), so its routes to
+    IPv4 fail: `EINVAL` from a group or the limited broadcast address,
+    `ENETUNREACH` from a subnet's, for UDP's `sendto` and `connect` and
+    TCP's `connect`. A group or the
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).

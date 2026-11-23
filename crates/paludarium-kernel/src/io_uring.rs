@@ -1177,9 +1177,10 @@ fn is_ring(d: &crate::files::Descriptor) -> bool {
 /// ([`select`]), whose length is cut to `MAX_RW_COUNT` and which must be
 /// in the user half (`EFAULT`, `import_ubuf`), then the rest ([`issue`]).
 /// The selected buffer goes as [`give_back`] says.
-/// A transfer's result and completion flags, and for one that would wait
-/// what it waits for ([`arm`]).
-type Transferred = (Result<u64, Errno>, u32, Option<Waits>);
+/// A transfer's result and completion flags, for one that would wait what
+/// it waits for ([`arm`]), and the bytes it asked for (`req->cqe.res`, the
+/// length of its buffers as imported).
+type Transferred = (Result<u64, Errno>, u32, Option<Waits>, u64);
 
 /// What a transfer that would wait waits for: its file's events, with the
 /// provided buffer it chose, which it keeps (`REQ_F_BUFFER_SELECTED`).
@@ -1192,8 +1193,9 @@ struct Waits {
 fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferred {
     let opened = match file_of(c, ring, transfer.fd, transfer.fixed) {
         Ok(opened) => opened,
-        Err(e) => return (Err(e), 0, None),
+        Err(e) => return (Err(e), 0, None, 0),
     };
+    let asked = |segments: &[(u64, usize)]| segments.iter().map(|&(_, len)| len as u64).sum();
     let waits = |result: &Result<u64, Errno>, kept: Option<Chosen>| {
         waits_for(transfer, &opened.file, result).then(|| Waits {
             file: Arc::clone(&opened.file),
@@ -1207,23 +1209,23 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
         })
     };
     if transfer.registered {
-        let result = ring
-            .registered(transfer.buf_index, transfer.addr, transfer.len)
-            .and_then(|within| issue(c, transfer, &opened, &[within]));
+        let within = ring.registered(transfer.buf_index, transfer.addr, transfer.len);
+        let wanted = within.as_ref().map_or(0, |&within| asked(&[within]));
+        let result = within.and_then(|within| issue(c, transfer, &opened, &[within]));
         let poll = waits(&result, None);
-        return (result, 0, poll);
+        return (result, 0, poll, wanted);
     }
     if !transfer.select {
         let result = issue(c, transfer, &opened, &transfer.segments);
         let poll = waits(&result, None);
-        return (result, 0, poll);
+        return (result, 0, poll, asked(&transfer.segments));
     }
     let pollable = !crate::files::aio_positioned(&opened.file);
     let chosen = match transfer.kept {
         Some(kept) => kept,
         None => match select(c, ring, transfer.buf_index, transfer.len, pollable) {
             Ok(chosen) => chosen,
-            Err(e) => return (Err(e), 0, None),
+            Err(e) => return (Err(e), 0, None, 0),
         },
     };
     let len = u64::from(chosen.len).min(crate::files::MAX_RW_COUNT as u64);
@@ -1233,10 +1235,10 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
     // ring's head (`io_kbuf_recycle`, as a file that can be polled uses it
     // only once its read is done) and is chosen again as the read goes on.
     if let Some(poll) = waits(&result, (!chosen.ring).then_some(chosen)) {
-        return (result, 0, Some(poll));
+        return (result, 0, Some(poll), len);
     }
     let flags = give_back(c, ring, &chosen, &result);
-    (result, flags, None)
+    (result, flags, None, len)
 }
 
 /// `POLLIN | POLLPRI | POLLRDNORM | POLLERR`, what a read waits for
@@ -1395,9 +1397,12 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool, Option
     let result = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
     match work {
         Work::Transfer(work) => {
-            let (r, flags, waits) = transfer(c, ring, work);
+            // A transfer of fewer bytes than it asked for fails its link too
+            // (`__io_complete_rw_common`), though its result is the count.
+            let (r, flags, waits, asked) = transfer(c, ring, work);
+            let short = r.as_ref().is_ok_and(|&count| count != asked);
             let res = result(r);
-            return (res, flags, res < 0, waits);
+            return (res, flags, res < 0 || short, waits);
         }
         // `io_nop`, as Linux master has it: a file it does not find is
         // `EBADF`, then a registered buffer `EFAULT`, else its result.

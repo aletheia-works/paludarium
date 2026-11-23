@@ -5566,11 +5566,18 @@ mod io_uring {
         // O_NONBLOCK does not stop it waiting.
         assert_eq!(f.ret(293, &[ends, 0o4000]), 0);
         let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
-        // A link's next request waits for the read.
+        // A link's next request waits for the read, which reads fewer
+        // bytes than it asked for and so fails the link.
         let mut first = rw(READ, read, HERE, buf, 8);
         first[1] = 1 << 2;
         assert_eq!(batch(&mut f, &r, &[first, nop(2, 0, 0, 0, 0)]), []);
         f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 2), (2, -125)]);
+        // One that reads all it asked for goes on with it.
+        let mut first = rw(READ, read, HERE, buf, 2);
+        first[1] = 1 << 2;
+        assert_eq!(batch(&mut f, &r, &[first, nop(2, 0, 0, 0, 0)]), []);
         assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
         assert_eq!(reap(&mut f, &r), [(1, 2), (2, 0)]);
         // A provided buffer stays with the read that chose it: none is left

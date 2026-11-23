@@ -1690,7 +1690,9 @@ kernel.
   `io_arm_poll_handler` makes it: a read of a pipe, a socket or an eventfd
   with nothing to read, or a write to a full pipe, even with `O_NONBLOCK`.
   `RWF_NOWAIT` ends it with `EAGAIN` instead. The rest of its link waits
-  for it.
+  for it. As with any transfer, one that moves fewer bytes than it asked
+  for fails its link (`__io_complete_rw_common`), though its completion
+  has the count.
   - Once the file is ready, the request runs again as task work of the
     thread that submitted it (`io_poll_task_func`), even when a thread of
     another process made the file ready. If that thread made it ready

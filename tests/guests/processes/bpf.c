@@ -1899,9 +1899,14 @@ static int case_pin(void) {
     say("dotted stat %ld, past it %ld, open %ld, unlink %ld, access %ld", TRY(stat(in("fs/x.y"), &dotted)),
         TRY(stat(in("fs/x.y/z"), &dotted)), TRY(open(in("fs/x.y"), O_RDONLY)), TRY(unlink(in("fs/x.y"))),
         TRY(access(in("fs/x.y"), F_OK)));
-    /* A directory of mode 0 takes such a name as any other, root's make included. */
-    say("mode 0 dir %ld, chmod %ld, stat %ld, mkdir %ld", TRY(mkdir(in("fs/zero"), 0755)), TRY(chmod(in("fs/zero"), 0)),
-        TRY(stat(in("fs/zero/x.y"), &dotted)), TRY(mkdir(in("fs/zero/a.b"), 0755)));
+    /* A directory not there is the walk's ENOENT; one of mode 0 takes such a
+       name as any other, root's make included. One call to a line: C leaves
+       the order of a call's arguments open. */
+    say("missing dir mkdir %ld", TRY(mkdir(in("fs/zero/a.b"), 0755)));
+    say("mode 0 dir %ld", TRY(mkdir(in("fs/zero"), 0755)));
+    say("chmod 0 %ld", TRY(chmod(in("fs/zero"), 0)));
+    say("mode 0 stat %ld", TRY(stat(in("fs/zero/x.y"), &dotted)));
+    say("mode 0 mkdir %ld", TRY(mkdir(in("fs/zero/a.b"), 0755)));
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un sun = { .sun_family = AF_UNIX };
     snprintf(sun.sun_path, sizeof sun.sun_path, "%s", in("fs/sock"));

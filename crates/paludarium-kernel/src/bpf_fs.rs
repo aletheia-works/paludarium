@@ -52,11 +52,12 @@ pub(crate) fn lookup(c: &Context<'_>, p: &[u8]) -> Result<(), Errno> {
     if c.files.fs().metadata(p, false).is_ok() || on_bpffs(c, &dir, true).is_none() {
         return Ok(());
     }
-    // A directory of mode 0 takes the name as any other.
+    // A directory of mode 0 takes the name as any other, and one not
+    // there is the walk's own error (`ENOENT`), before any lookup in it.
     if c.files
         .fs()
         .metadata(&dir, true)
-        .is_ok_and(|d| d.mode & 0o7777 == 0)
+        .map_or(true, |d| d.mode & 0o7777 == 0)
     {
         return Ok(());
     }

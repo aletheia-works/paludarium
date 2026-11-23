@@ -1892,6 +1892,11 @@ fn every_walk_to_a_missing_dotted_name_is_eperm() {
     // Not the caller's search but the directory's mode decides: root
     // makes the name there, as Linux's `bpf_mkdir` does once the lookup
     // gives none.
+    let missing = put(0xb40, "/pins/none/a.b");
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [missing, 0o755, 0, 0, 0, 0]),
+        errno(Errno::ENOENT)
+    );
     let dotted = put(0xb40, "/pins/zero/a.b");
     assert_eq!(
         syscall(&mut k, &mut t, &m, 83, [dotted, 0o755, 0, 0, 0, 0]),

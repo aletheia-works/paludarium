@@ -1022,6 +1022,13 @@ verified.
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
+- **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
+  dnotify is always on, as with Linux's default of 1. A FIFO's or device's
+  read or write does not reach its directory's watch, as with fanotify
+  below.
+- **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
+  `EINVAL`, where Linux takes a read or write lease and signals its holder
+  when another open or truncate breaks it.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes. An evictable mark on a
   directory is never evicted, where Linux's goes once none of the

@@ -40,6 +40,8 @@ pub(crate) struct FileOwner {
 pub(crate) enum Reason {
     In = 1,
     Out = 2,
+    /// `POLL_MSG`, which dnotify gives (`dnotify_handle_event`).
+    Message = 3,
     Error = 4,
     Priority = 5,
     HangUp = 6,
@@ -50,6 +52,7 @@ impl Reason {
         match self {
             Self::In => 0x41,
             Self::Out => 0x304,
+            Self::Message => 0x441,
             Self::Error => 0x8,
             Self::Priority => 0x82,
             Self::HangUp => 0x18,

@@ -442,6 +442,8 @@ pub(crate) struct Notifier {
     registry: Mutex<Registry>,
     /// The fanotify groups' marks, which hear of the same changes.
     pub(crate) fan: Arc<crate::fanotify::Registry>,
+    /// The dnotify watches (`F_NOTIFY`), which hear of them too.
+    pub(crate) dn: crate::dnotify::Watches,
 }
 
 #[derive(Default)]
@@ -524,7 +526,8 @@ fn split(path: &[u8]) -> Option<(&[u8], &[u8])> {
 impl Notifier {
     /// Whether any watch exists, which a change must be told to.
     pub(crate) fn watching(&self) -> bool {
-        (self.watches.load(Ordering::SeqCst) != 0 || self.fan.active()) && !QUIET.with(Cell::get)
+        (self.watches.load(Ordering::SeqCst) != 0 || self.fan.active() || self.dn.active())
+            && !QUIET.with(Cell::get)
     }
     /// Whether an inotify watch is on file `key`, which keeps its inode in
     /// the cache as an inotify mark's reference (`iref`) does.
@@ -599,6 +602,7 @@ impl Notifier {
         for instance in self.instances() {
             instance.report(directory, mask, name, cookie, false);
         }
+        self.dn.event(directory, mask, true);
     }
     /// An event of a file itself (`fsnotify_inode`): to its watches, without
     /// a name.
@@ -606,6 +610,7 @@ impl Notifier {
         for instance in self.instances() {
             instance.report(file.key, mask | file.isdir(), b"", 0, false);
         }
+        self.dn.event(file.key, mask | file.isdir(), false);
         self.fan.inode_event(mask, file.object());
     }
     /// An event of a file that its directory hears of too
@@ -626,6 +631,16 @@ impl Notifier {
             }
             instance.report(file.key, mask | file.isdir(), b"", 0, unlinked);
         }
+        // dnotify's marks, as `fsnotify_handle_event` tells them: the
+        // directory's with the name, then the file's own.
+        if let Some(parent) = named.and_then(|named| named.parent) {
+            self.dn.event(
+                parent,
+                mask | file.isdir() | crate::fanotify::EVENT_ON_CHILD,
+                true,
+            );
+        }
+        self.dn.event(file.key, mask | file.isdir(), false);
         if self.fan.active() {
             let data = match path {
                 Some((path, mount, opener)) => crate::fanotify::Data::Path {
@@ -842,6 +857,12 @@ impl Notifier {
             crate::fanotify::RENAME | isdir,
             Some((source, to)),
         );
+        // dnotify hears `FS_RENAME` of a rename within one directory only
+        // (`fsnotify_handle_event`).
+        if let Some(directory) = from.parent.filter(|_| from.parent == to.parent) {
+            self.dn
+                .event(directory, crate::fanotify::RENAME | isdir, true);
+        }
         self.entry(from.parent, MOVED_FROM | isdir, &from.name, cookie);
         self.fan_entry(&from_source, MOVED_FROM | isdir, None);
         self.entry(to.parent, MOVED_TO | isdir, &to.name, cookie);

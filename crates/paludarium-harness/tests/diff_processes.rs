@@ -723,6 +723,8 @@ mod linux {
         bpf_prog_ldabs => ("bpf-prog-ldabs","bpf-prog"),
         bpf_prog_calls => ("bpf-prog-calls","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
+        dnotify_calls => ("dnotify-calls","inotify"),
+        dnotify_events => ("dnotify-events","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
         inotify_flags => ("inotify-flags","inotify"),

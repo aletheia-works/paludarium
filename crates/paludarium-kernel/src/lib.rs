@@ -34,6 +34,7 @@ mod bpf_tests;
 mod bpf_trie;
 mod bpf_verifier;
 mod devices;
+mod dnotify;
 mod epoll;
 mod events;
 #[cfg(test)]

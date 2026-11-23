@@ -863,6 +863,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
+- **dnotify の一部**：`/proc/sys/fs/dir-notify-enable` はないので、Linux の既定の 1 と
+  同じく、dnotify はいつも使えます。FIFO やデバイスの読み書きは、下の fanotify と同じく、
+  そのディレクトリの見張りに届きません。
+- **ファイルのリース（まだできません）**：`fcntl` の `F_SETLEASE` と `F_GETLEASE` は
+  `EINVAL` です。Linux は読み込みか書き込みのリースを取り、ほかの open や truncate が
+  それを破るときに持ち主へシグナルを送ります。
 - **fanotify の一部**：`FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。`FAN_FS_ERROR` は
   来ません。ディレクトリへの追い出せるマークは追い出しません。Linux では、ディレクトリの

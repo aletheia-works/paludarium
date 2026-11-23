@@ -1,7 +1,7 @@
 /* inotify, compared with Linux: the calls' errors and their order, the
    events a directory and a file hear of as they are made, changed, moved
    and removed, the queue's merging and overflow, and the waits of a read,
-   poll and epoll.
+   poll and epoll. Also dnotify's signals (fcntl's F_NOTIFY).
 
    The opens, closes, reads and writes of files are events too: those of
    the cases' own calls, never the C library's (stdout is not watched).
@@ -1493,6 +1493,184 @@ static int case_exec_order(void) {
    open, which goes with that file's last close. Each instance's files go
    in one order on Linux v6.12 (newest inode first) and master (newest
    watched first): here the root and then f, so both agree. */
+/* dnotify (fcntl's F_NOTIFY): the signals a directory's watches send as it
+   and its files change, as Linux's dnotify.c sends them. Each signal is
+   printed by kind (the F_SETSIG one, or SIGIO), the descriptor its si_fd
+   names, its si_code and si_band. */
+#define DN_SIG (SIGRTMIN + 1)
+static int dn_fds[8];
+static const char *dn_names[8];
+static int dn_count;
+static void dn_name(int fd, const char *name) {
+    dn_fds[dn_count] = fd;
+    dn_names[dn_count++] = name;
+}
+static const char *dn_named(int fd) {
+    for (int i = 0; i < dn_count; i++)
+        if (dn_fds[i] == fd) return dn_names[i];
+    return "?";
+}
+static void dn_block(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, DN_SIG);
+    sigaddset(&set, SIGIO);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+}
+/* Prints the signals pending, in the order they are taken. */
+static void dn_drain(const char *label) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, DN_SIG);
+    sigaddset(&set, SIGIO);
+    struct timespec zero = {0, 0};
+    siginfo_t si;
+    printf("%s:", label);
+    while (sigtimedwait(&set, &si, &zero) > 0) {
+        if (si.si_signo == SIGIO)
+            printf(" io code=%d", si.si_code);
+        else
+            printf(" rt fd=%s code=%d band=%#lx", dn_named(si.si_fd), si.si_code, (long)si.si_band);
+    }
+    printf("\n");
+}
+static int dn_watch(const char *path, const char *name, unsigned arg) {
+    int fd = open(path, O_RDONLY | O_DIRECTORY);
+    dn_name(fd, name);
+    fcntl(fd, F_SETSIG, DN_SIG);
+    long r = e(fcntl(fd, F_NOTIFY, arg));
+    if (r) printf("notify %s=%ld\n", name, r);
+    return fd;
+}
+
+static int case_dnotify_calls(void) {
+    make_base("dnotify-calls");
+    dn_block();
+    touch(at("f"));
+    int file = open(at("f"), O_RDONLY);
+    int dir = open(base, O_RDONLY | O_DIRECTORY);
+    int path = open(base, O_PATH);
+    printf("regular=%ld regular-none=%ld regular-multishot-only=%ld\n",
+           e(fcntl(file, F_NOTIFY, DN_CREATE)), e(fcntl(file, F_NOTIFY, 0)),
+           e(fcntl(file, F_NOTIFY, DN_MULTISHOT)));
+    printf("o-path=%ld bad=%ld closed=%ld\n", e(fcntl(path, F_NOTIFY, DN_CREATE)),
+           e(fcntl(-1, F_NOTIFY, DN_CREATE)), e(fcntl(999, F_NOTIFY, DN_CREATE)));
+    /* Unknown bits are ignored; an owner is set if there was none. */
+    printf("owner-before=%d\n", (int)fcntl(dir, F_GETOWN));
+    printf("unknown-bits=%ld\n", e(fcntl(dir, F_NOTIFY, DN_CREATE | 0x4000)));
+    printf("owner-after-is-self=%d\n", (int)fcntl(dir, F_GETOWN) == getpid());
+    /* An owner set before stays. */
+    int other = open(base, O_RDONLY | O_DIRECTORY);
+    fcntl(other, F_SETOWN, -getpgrp());
+    fcntl(other, F_NOTIFY, DN_CREATE);
+    printf("owner-kept=%d\n", (int)fcntl(other, F_GETOWN) == -getpgrp());
+    printf("sig=%d\n", (int)fcntl(dir, F_GETSIG));
+    remove_all();
+    return 0;
+}
+
+static int case_dnotify_events(void) {
+    make_base("dnotify-events");
+    dn_block();
+    mkdir(at("sub"), 0755);
+    mkdir(at("other"), 0755);
+    int d = dn_watch(base, "d", DN_ACCESS | DN_MODIFY | DN_CREATE | DN_DELETE | DN_RENAME | DN_ATTRIB | DN_MULTISHOT);
+    touch(at("a"));
+    dn_drain("create");
+    int a = open(at("a"), O_RDWR);
+    write(a, "x", 1);
+    dn_drain("write");
+    char c;
+    pread(a, &c, 1, 0);
+    dn_drain("read");
+    close(a);
+    dn_drain("close");
+    chmod(at("a"), 0600);
+    dn_drain("chmod");
+    rename(at("a"), at("b"));
+    dn_drain("rename-within");
+    rename(at("b"), at("other/b"));
+    dn_drain("rename-out");
+    rename(at("other/b"), at("b"));
+    dn_drain("rename-in");
+    link(at("b"), at("c"));
+    dn_drain("link");
+    unlink(at("c"));
+    dn_drain("unlink");
+    mkdir(at("m"), 0755);
+    dn_drain("mkdir");
+    rmdir(at("m"));
+    dn_drain("rmdir");
+    /* The directory's own changes. */
+    chmod(base, 0755);
+    dn_drain("chmod-self");
+    int r = open(base, O_RDONLY | O_DIRECTORY);
+    char entries[1024];
+    syscall(SYS_getdents64, r, entries, sizeof entries);
+    close(r);
+    dn_drain("getdents-self");
+    /* A watched subdirectory: the parent's watch first, then its own. */
+    int s = dn_watch(at("sub"), "sub", DN_ATTRIB | DN_CREATE | DN_MULTISHOT);
+    chmod(at("sub"), 0700);
+    dn_drain("chmod-sub");
+    touch(at("sub/x"));
+    dn_drain("create-in-sub");
+    close(s);
+    /* Two watches of one directory: the newest signals first. */
+    int d2 = dn_watch(base, "d2", DN_CREATE | DN_MULTISHOT);
+    touch(at("two"));
+    dn_drain("two-watches");
+    /* A dup's close flushes the description's watch. */
+    int dup2nd = dup(d2);
+    close(dup2nd);
+    touch(at("two-after-dup-close"));
+    dn_drain("after-dup-close");
+    close(d2);
+    /* Asking again through a dup adds events and names the dup. */
+    int dd = dup(d);
+    dn_name(dd, "dd");
+    fcntl(dd, F_NOTIFY, DN_CREATE);
+    touch(at("through-dup"));
+    dn_drain("through-dup");
+    /* A child's close of an inherited descriptor keeps the parent's watch. */
+    pid_t child = fork();
+    if (child == 0) {
+        close(dd);
+        close(d);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    touch(at("after-child"));
+    dn_drain("after-child-close");
+    /* Taking the watch back with no events. */
+    fcntl(dd, F_NOTIFY, DN_MULTISHOT);
+    touch(at("removed"));
+    dn_drain("removed");
+    close(dd);
+    close(d);
+    /* One shot: only the first event, until asked again. */
+    int o = dn_watch(at("other"), "o", DN_CREATE);
+    touch(at("other/1"));
+    touch(at("other/2"));
+    dn_drain("oneshot");
+    fcntl(o, F_NOTIFY, DN_CREATE);
+    touch(at("other/3"));
+    dn_drain("oneshot-again");
+    close(o);
+    /* Without F_SETSIG: SIGIO. */
+    int q = open(at("other"), O_RDONLY | O_DIRECTORY);
+    dn_name(q, "q");
+    fcntl(q, F_NOTIFY, DN_DELETE | DN_MULTISHOT);
+    unlink(at("other/1"));
+    dn_drain("sigio");
+    close(q);
+    /* The watch ends with the descriptor's close. */
+    unlink(at("other/2"));
+    dn_drain("after-close");
+    remove_all();
+    return 0;
+}
+
 static int case_unmount(void) {
     make_base("unmount");
     mkdir(at("m"), 0755);
@@ -1556,6 +1734,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-handles")) return case_handles();
     if (!strcmp(mode, "inotify-open-handles")) return case_open_handles();
     if (!strcmp(mode, "inotify-unmount")) return case_unmount();
+    if (!strcmp(mode, "dnotify-calls")) return case_dnotify_calls();
+    if (!strcmp(mode, "dnotify-events")) return case_dnotify_events();
     /* What case_exec_order's dynamic program does: runs argv[2]. */
     if (!strcmp(mode, "inotify-then") && argc > 2) {
         char *const next[] = {argv[2], "inotify-quiet", NULL};

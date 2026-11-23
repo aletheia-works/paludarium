@@ -6926,6 +6926,90 @@ mod inotify {
         assert_eq!(f.ret(RM, &[fd, wd]), 0);
         assert_eq!(taken(&f), [(1, 0x41, fd as i32)]);
     }
+    #[test]
+    fn a_dnotify_watch_signals_its_directory_owner_as_dnotify_c_does() {
+        let mut f = fixture();
+        f.thread.state.signal_mask = 1 << 39;
+        let taken = |f: &Fixture| -> Vec<(i32, i64, i32)> {
+            std::iter::from_fn(|| f.kernel.group.take_process_signal(1 << 39))
+                .filter_map(|signal| signal.queued)
+                .map(|info| {
+                    let word = |at: usize| i32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+                    (
+                        word(8),
+                        i64::from_le_bytes(info[16..24].try_into().unwrap()),
+                        word(24),
+                    )
+                })
+                .collect()
+        };
+        const F_NOTIFY: u64 = 1026;
+        const DN_CREATE: u64 = 0x4;
+        const DN_DELETE: u64 = 0x8;
+        const DN_RENAME: u64 = 0x10;
+        const DN_ATTRIB: u64 = 0x20;
+        const DN_MULTISHOT: u64 = 0x8000_0000;
+        let tmp = put(&f, DATA, b"/tmp");
+        let dir = f.ret(2, &[tmp, 0o200000, 0]);
+        // A regular file is ENOTDIR, but taking nothing back is not.
+        let a = put(&f, DATA + 0x40, b"/tmp/a");
+        let file = f.ret(2, &[a, 0o101, 0o600]);
+        assert_eq!(f.ret(72, &[file, F_NOTIFY, DN_CREATE]), (-20i64) as u64);
+        assert_eq!(f.ret(72, &[file, F_NOTIFY, 0]), 0);
+        assert_eq!(f.ret(3, &[file]), 0);
+        // The caller's process becomes the owner of a file that had none.
+        assert_eq!(f.ret(72, &[dir, 9]), 0);
+        assert_eq!(f.ret(72, &[dir, 10, 40]), 0);
+        assert_eq!(
+            f.ret(
+                72,
+                &[
+                    dir,
+                    F_NOTIFY,
+                    DN_CREATE | DN_DELETE | DN_RENAME | DN_MULTISHOT
+                ]
+            ),
+            0
+        );
+        assert_eq!(f.ret(72, &[dir, 9]), 1);
+        // POLL_MSG, its band, and the descriptor asked through.
+        let b = put(&f, DATA + 0x80, b"/tmp/b");
+        let d = f.ret(2, &[b, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(taken(&f), [(3, 0x441, dir as i32)]);
+        // A rename within the directory: FS_RENAME, then MOVED_FROM
+        // (DN_DELETE) and MOVED_TO (DN_CREATE).
+        let c = put(&f, DATA + 0xc0, b"/tmp/c");
+        assert_eq!(f.ret(82, &[b, c]), 0);
+        assert_eq!(taken(&f).len(), 3);
+        // Not watched: DN_ATTRIB.
+        assert_eq!(f.ret(90, &[c, 0o644]), 0);
+        assert!(taken(&f).is_empty());
+        // Asking again through a dup adds DN_ATTRIB and names the dup.
+        let again = f.ret(32, &[dir]);
+        assert_eq!(f.ret(72, &[again, F_NOTIFY, DN_ATTRIB]), 0);
+        assert_eq!(f.ret(90, &[c, 0o600]), 0);
+        assert_eq!(taken(&f), [(3, 0x441, again as i32)]);
+        // The directory's own attributes.
+        assert_eq!(f.ret(90, &[tmp, 0o1777]), 0);
+        assert_eq!(taken(&f), [(3, 0x441, again as i32)]);
+        // Closing the dup ends the watch of the open file.
+        assert_eq!(f.ret(3, &[again]), 0);
+        assert_eq!(f.ret(87, &[c]), 0);
+        assert!(taken(&f).is_empty());
+        // One shot: the first event only.
+        assert_eq!(f.ret(72, &[dir, F_NOTIFY, DN_CREATE]), 0);
+        let d = f.ret(2, &[b, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let d = f.ret(2, &[c, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(taken(&f), [(3, 0x441, dir as i32)]);
+        // No events takes a watch back.
+        assert_eq!(f.ret(72, &[dir, F_NOTIFY, DN_DELETE | DN_MULTISHOT]), 0);
+        assert_eq!(f.ret(72, &[dir, F_NOTIFY, DN_MULTISHOT]), 0);
+        assert_eq!(f.ret(87, &[b]), 0);
+        assert!(taken(&f).is_empty());
+    }
     /// The lines of `/proc/self/fdinfo/<fd>` after the four every
     /// descriptor has.
     fn extra(f: &mut Fixture, fd: u64) -> Vec<String> {

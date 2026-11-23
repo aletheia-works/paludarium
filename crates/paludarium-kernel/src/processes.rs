@@ -4504,6 +4504,7 @@ impl Kernel {
         for descriptor in closed {
             crate::record_locks::closed(&c, &descriptor);
             crate::mqueue::closed(&c, &descriptor);
+            crate::dnotify::closed(&c, &descriptor);
             crate::inet::linger(&mut c, &descriptor.file);
         }
     }

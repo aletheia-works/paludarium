@@ -5124,6 +5124,24 @@ kernel.
   `SIGKILL` and `SIGSTOP` never enter one. A write gives `EINVAL`, `pread`
   and `pwrite` `ESPIPE`, and `lseek` 0, as Linux's `noop_llseek`.
 
+- Directory notifications (dnotify), as Linux's `dnotify.c`: `fcntl`'s
+  `F_NOTIFY` on a directory's descriptor asks for a signal when the
+  directory or a file in it is read (`DN_ACCESS`), written (`DN_MODIFY`),
+  made or moved in (`DN_CREATE`), removed or moved out (`DN_DELETE`),
+  renamed within it (`DN_RENAME`) or changes its attributes (`DN_ATTRIB`).
+  - The signal goes to the open file's owner. An open file with no owner
+    gets the caller's process as its owner.
+  - It is `SIGIO` from the kernel, or with `F_SETSIG` that signal, with
+    `POLL_MSG`, its band and the descriptor asked through as `si_fd`.
+  - A watch signals once and goes, unless `DN_MULTISHOT` keeps it.
+  - Asking again through the same open file and descriptor table adds the
+    events and names the new descriptor. Watches of one directory signal
+    the newest first.
+  - Any close of a descriptor of that open file through that table ends
+    its watch, as do asking with no events and the table's end.
+  - A file that is not a directory gives `ENOTDIR`, an `O_PATH` descriptor
+    `EBADF`. Unknown bits are ignored.
+
 - An inotify instance (`inotify_init`, `inotify_init1`, with `IN_NONBLOCK`
   and `IN_CLOEXEC`) watches files by their device and inode, which
   `inotify_add_watch` finds as Linux's `inotify_find_inode` does: the last

@@ -1220,6 +1220,7 @@ pub(crate) fn open_name(
         .ok_or(Errno::EBADF)?;
     crate::record_locks::closed(c, &closed);
     crate::mqueue::closed(c, &closed);
+    crate::dnotify::closed(c, &closed);
     Ok(closed.file)
 }
 /// The status of what the path at guest address `name` names, its links
@@ -3137,6 +3138,7 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     for descriptor in closed.into_iter().map(|(_, d)| d) {
         crate::record_locks::closed(c, &descriptor);
         crate::mqueue::closed(c, &descriptor);
+        crate::dnotify::closed(c, &descriptor);
         crate::inet::linger(c, &descriptor.file);
     }
     Ok(0)
@@ -5292,6 +5294,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 .ok_or(Errno::EBADF)?;
             crate::record_locks::closed(c, &closed);
             crate::mqueue::closed(c, &closed);
+            crate::dnotify::closed(c, &closed);
             crate::inet::linger(c, &closed.file);
             Ok(0)
         }
@@ -5373,6 +5376,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if let Some(closed) = c.files.replace(new, d)? {
                 crate::record_locks::closed(c, &closed);
                 crate::mqueue::closed(c, &closed);
+                crate::dnotify::closed(c, &closed);
                 crate::inet::linger(c, &closed.file);
             }
             Ok(u64::from(new))
@@ -5434,6 +5438,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     }
                 }
                 4 => crate::fasync::set_flags(c, &d.file, a[0], a[2] as u32).map(|()| 0),
+                // F_NOTIFY: dnotify.
+                1026 => crate::dnotify::fcntl(c, &d, a[0], a[2] as u32),
                 // The owner and signal of signal-driven I/O.
                 8..=11 | 15 | 16 => crate::fasync::fcntl(c, &d.file, a[1], a[2]),
                 // Byte-range locks: F_GETLK, F_SETLK, F_SETLKW and their OFD forms.

@@ -2156,6 +2156,7 @@ impl Kernel {
         let (table, closed) = self.files.release_descriptors();
         if let Some(table) = table {
             self.processes.locks().release_table(table);
+            self.files.caches.notify.dn.release_table(table);
         }
         crate::mqueue::exited(&closed, self.process.pid);
         drop(closed);

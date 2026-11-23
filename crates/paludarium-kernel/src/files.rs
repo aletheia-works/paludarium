@@ -8091,10 +8091,11 @@ pub(crate) enum Followed {
 /// What a call that follows path `p` (with `follow`) reaches, when `p` is a
 /// link in the `fd` directory of process `pid`: `None` for any other path,
 /// or when the call does not follow, and `ENOENT` for a descriptor that is
-/// not open, whose link is not there.
+/// not open, whose link is not there, and for every one once the process's
+/// leader has ended (`leader_gone`), as that zombie leader's `fd` has none.
 pub(crate) fn through_descriptor(
     files: &Files,
-    pid: u32,
+    (pid, leader_gone): (u32, bool),
     p: &[u8],
     follow: bool,
 ) -> Result<Option<Followed>, Errno> {
@@ -8109,6 +8110,9 @@ pub(crate) fn through_descriptor(
     let Some(crate::proc::OwnEntry::Descriptor(n)) = crate::proc::own_entry(&p, pid) else {
         return Ok(None);
     };
+    if leader_gone {
+        return Err(Errno::ENOENT);
+    }
     let d = files.descriptor(u64::from(n)).map_err(|_| Errno::ENOENT)?;
     descriptor_followed(files, d).map(Some)
 }
@@ -8162,7 +8166,9 @@ pub(crate) enum Program {
 }
 pub(crate) fn exec_program(
     files: &Files,
-    pid: u32,
+    // The process, and whether its leader has ended, when its `fd` has no
+    // links to follow.
+    process: (u32, bool),
     dir: u64,
     raw: &[u8],
     flags: u64,
@@ -8188,7 +8194,7 @@ pub(crate) fn exec_program(
         if !follow && symlink(&path) {
             return Err(ELOOP);
         }
-        match through_descriptor(files, pid, &path, follow)? {
+        match through_descriptor(files, process, &path, follow)? {
             Some(target) => target,
             None => return Ok(Program::Path(path)),
         }
@@ -8232,13 +8238,9 @@ pub(crate) fn exec_program(
         }
     })
 }
-/// [`through_descriptor`] for this thread's process; nothing once its
-/// leader has ended, when its `fd` is the zombie leader's, which has none.
+/// [`through_descriptor`] for this thread's process.
 fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {
-    if own_leader_gone(c) {
-        return Ok(None);
-    }
-    through_descriptor(c.files, c.process.pid, p, follow)
+    through_descriptor(c.files, (c.process.pid, own_leader_gone(c)), p, follow)
 }
 /// Whether the reader's process leader ended before its other threads: then
 /// `/proc/self` and `/proc/<pid>` are that zombie leader's directory, as on

@@ -15215,7 +15215,8 @@ static int ptrace_stop_exit_code_case(void) {
    still, while /proc/thread-self is the running thread's. Its fd and fdinfo
    list nothing and fd/1 is not there (ENOENT); maps, smaps and cmdline read
    nothing; environ, auxv and pagemap do not open (ESRCH); exe, cwd, root and
-   its net and mnt links are not there; mountinfo does not open (EINVAL);
+   its net and mnt links are not there, nor is a program to run through
+   fd/<n> or /dev/fd/<n>; mountinfo does not open (EINVAL);
    statm is zeros; status has no Vm lines or Umask and FDSize 0; and stat has
    no sizes or addresses. The other thread looks, then ends with exit(0). */
 static int glf_count(const char *path) {
@@ -15270,6 +15271,16 @@ static void *glf_worker(void *unused) {
     printf("environ=%ld auxv=%ld pagemap=%ld mountinfo=%ld\n", glf_size("/proc/self/environ"),
            glf_size("/proc/self/auxv"), glf_size("/proc/self/pagemap"),
            glf_size("/proc/self/mountinfo"));
+    /* The program through a descriptor, as fexecve falls back to: ENOENT,
+       as the zombie leader's fd has no links. */
+    int program = open("/proc/thread-self/exe", O_RDONLY | O_CLOEXEC);
+    char *none[] = {NULL};
+    snprintf(path, sizeof path, "/proc/self/fd/%d", program);
+    int through_proc = syscall(SYS_execveat, AT_FDCWD, path, none, none, 0) < 0 ? -errno : 0;
+    snprintf(path, sizeof path, "/dev/fd/%d", program);
+    int through_dev = syscall(SYS_execveat, AT_FDCWD, path, none, none, 0) < 0 ? -errno : 0;
+    close(program);
+    printf("execveat proc=%d dev=%d\n", through_proc, through_dev);
     printf("exe=%d cwd=%d root=%d thread-self exe=%d\n", glf_link("/proc/self/exe", own, sizeof own),
            glf_link("/proc/self/cwd", own, sizeof own), glf_link("/proc/self/root", own, sizeof own),
            glf_link("/proc/thread-self/exe", own, sizeof own));

@@ -3635,7 +3635,8 @@ kernel.
   Like Linux's after `exit_mm`, `exit_files`, `exit_fs` and
   `exit_task_namespaces`, that leader has no memory, descriptors, directories
   or namespaces but its PID and user ones, in `/proc/<pid>` and `/proc/self`
-  as in `task/<pid>`. Its `fd` and `fdinfo` list nothing; `maps`, `smaps` and
+  as in `task/<pid>`. Its `fd` and `fdinfo` list nothing, so `execveat`
+  through `/proc/self/fd/<n>` or `/dev/fd/<n>` is `ENOENT`; `maps`, `smaps` and
   `cmdline` read nothing; `environ`, `auxv` and `pagemap` are `ESRCH`;
   `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an

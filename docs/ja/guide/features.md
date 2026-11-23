@@ -3152,7 +3152,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `Z` で、`Threads` と `num_threads` にも数えます。そのリーダーには、Linux の `exit_mm`、
   `exit_files`、`exit_fs`、`exit_task_namespaces` の後と同じく、メモリー、ディスクリプター、
   ディレクトリー、PID とユーザー以外の名前空間がありません。これは `task/<pid>` でも
-  `/proc/<pid>` と `/proc/self` でも同じです。`fd` と `fdinfo` は何も並べず、`maps`、`smaps`、
+  `/proc/<pid>` と `/proc/self` でも同じです。`fd` と `fdinfo` は何も並べないので、
+  `/proc/self/fd/<n>` や `/dev/fd/<n>` を通した `execveat` は `ENOENT` です。`maps`、`smaps`、
   `cmdline` は何も読めず、`environ`、`auxv`、`pagemap` は `ESRCH`、`exe`、`cwd`、`root` と
   ほかの `ns` のリンクは `ENOENT`、`mountinfo` は `EINVAL` です。`statm` はすべて 0、
   `status` には `Vm` の行も `Umask` もなく `FDSize` は 0 で、`stat` には大きさもアドレスも

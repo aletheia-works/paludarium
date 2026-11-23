@@ -4568,7 +4568,8 @@ impl Kernel {
         // A link in `/proc/self/fd`, as `fexecve` falls back to, runs the
         // file its descriptor holds while a path still names it, and a file
         // none names (a memfd, a removed one) from the descriptor.
-        let program = crate::files::exec_program(&self.files, self.process.pid, dir, &raw, a[3])?;
+        let process = (self.process.pid, !self.group.has_member(self.process.pid));
+        let program = crate::files::exec_program(&self.files, process, dir, &raw, a[3])?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
         let creds = &thread.state.credentials;
         // What runs: a path's program, whose scripts are followed below, or

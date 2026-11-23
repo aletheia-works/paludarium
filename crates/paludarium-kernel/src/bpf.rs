@@ -2480,8 +2480,9 @@ pub(crate) fn mmap(
                 c.mem
                     .advise_flags(at, at.0 + span, paludarium_mmu::FlagAdvice::DontDump);
             if let Err(e) = dont_dump {
-                // The mapping goes again, its VMA closed as an unmap closes
-                // it, so that a failed call leaves nothing counted.
+                // The mapping goes again: the unmap tells its source the VMA
+                // closed (`PageSource::closed`, `Mapped::closed`), so that a
+                // failed call leaves nothing counted.
                 let _ = c.mem.unmap_shared(at, span);
                 return Err(e);
             }

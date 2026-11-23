@@ -1519,3 +1519,26 @@ fn a_fixed_mapping_over_a_writable_one_closes_it() {
     assert_eq!(fixed, at);
     assert_eq!(elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None), 0);
 }
+
+/// What `mmap` undoes a mapping with when its `MADV_DONTDUMP` fails: an
+/// unmap of the address space itself, which closes the VMA as `munmap`'s
+/// does (`PageSource::closed`), so the map counts it no more.
+#[test]
+fn an_unmap_of_the_space_closes_a_writable_mapping() {
+    let (mut k, mut t, m) = setup();
+    k.enter_thread(t.tid);
+    let fd = make(&mut k, &mut t, &m, map(ARRAY, 4, 8, 4, F_MMAPABLE));
+    let at = mmap(
+        &mut k,
+        &mut t,
+        &m,
+        [fd, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, 0],
+    );
+    assert!(at < u64::MAX - 4095, "mmap: {at:#x}");
+    assert_eq!(
+        elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None),
+        errno(Errno(16))
+    );
+    m.unmap_shared(GuestAddr(at), PAGE_SIZE).unwrap();
+    assert_eq!(elem(&mut k, &mut t, &m, MAP_FREEZE, fd, None, None), 0);
+}

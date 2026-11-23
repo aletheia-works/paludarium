@@ -281,8 +281,9 @@ impl SignalInbox {
         self.notify.load(Ordering::SeqCst)
     }
     /// Clears `TIF_NOTIFY_SIGNAL` once no task work is left
-    /// (`clear_notify_signal`), under the queue's lock, so work added after
-    /// the check sets it again.
+    /// (`clear_notify_signal`), under the task work's lock, which work is
+    /// added and the flag set under, so work added after the check sets it
+    /// again.
     pub(crate) fn clear_notify_if_idle(&self) -> bool {
         let work = self.task_work();
         if work.is_empty() {

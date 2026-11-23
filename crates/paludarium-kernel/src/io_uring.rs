@@ -1250,9 +1250,11 @@ const POLL_UNMASK: u32 = 0x8 | 0x10 | 0x20 | 0x2000;
 
 /// Whether a transfer that gave `result` waits for its file
 /// (`io_queue_async` arming a poll): `EAGAIN` from a file that can be
-/// polled, a pipe, a socket, an eventfd or a terminal, unless it asked for
+/// polled, such as a pipe, a socket or an eventfd, unless it asked for
 /// `RWF_NOWAIT` (`REQ_F_NOWAIT`). `O_NONBLOCK` does not stop it, as every
-/// such file supports `FMODE_NOWAIT` (`REQ_F_SUPPORT_NOWAIT`).
+/// such file supports `FMODE_NOWAIT` (`REQ_F_SUPPORT_NOWAIT`). A
+/// pseudo-terminal's read never gives `EAGAIN` here: it waits in
+/// `io_uring_enter`, a limitation the guide lists.
 fn waits_for(transfer: &Transfer, file: &Arc<dyn FileHandle>, result: &Result<u64, Errno>) -> bool {
     *result == Err(Errno::EAGAIN)
         && transfer.rw_flags & RWF_NOWAIT == 0
@@ -1585,8 +1587,10 @@ fn issue_link(
 /// Makes a request wait for its file (`io_arm_poll_handler`), holding the
 /// file and the registered files it found: it goes on as task work once
 /// the file is ready ([`complete_ready`]), at once if it is now
-/// (`IO_APOLL_READY`). One a thread that is not in its group submits (no
-/// inbox to go on through) completes with `EAGAIN` instead.
+/// (`IO_APOLL_READY`). The file is looked at again once the request is
+/// among those that wait, so one that became ready in between, which
+/// another thread's [`complete_ready`] could not see, goes on too, as Linux
+/// arms under the wait queue's lock.
 fn arm(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -1599,28 +1603,15 @@ fn arm(
         queue(c, file, ring, Deferred::Submit(chain, held));
         return;
     }
-    let Some(inbox) = c.group.inbox(c.tid) else {
-        let mut chain = chain;
-        let request = chain.remove(0);
-        ring.state().held.extend(held);
-        let done = Done {
-            user_data: request.user_data,
-            res: -Errno::EAGAIN.0,
-            flags: 0,
-            post: true,
-            next: None,
-        };
-        ring.complete(finish(done, request.flags, true, chain));
-        return;
-    };
     let polls = &c.processes.io_uring;
+    let (polled, mask) = (Arc::clone(&waits.file), waits.mask);
     polls
         .armed
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(Armed {
             ring: Arc::clone(file),
-            inbox,
+            inbox: Arc::clone(c.inbox),
             hub: Arc::clone(&c.files.readiness),
             polled: waits.file,
             mask: waits.mask,
@@ -1630,6 +1621,9 @@ fn arm(
     polls
         .count
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if ready(&polled, mask) {
+        complete_ready(polls);
+    }
 }
 
 /// Whether `file` has any of the events of `mask` (`vfs_poll`).
@@ -1777,15 +1771,17 @@ fn add_work(
         }
         return;
     }
+    // The flag is set under the list's lock, so a run that empties the list
+    // after this push clears it after it is set.
     let first = {
         let mut task_work = inbox.task_work();
         task_work.queue.push_back((Arc::clone(file), work));
+        inbox.notify_signal(hub.is_some());
         task_work.queue.len() == 1
     };
     if first {
         ring.mark_taskrun(true);
     }
-    inbox.notify_signal(hub.is_some());
     if let Some(hub) = hub {
         hub.changed();
     }

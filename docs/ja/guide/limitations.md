@@ -455,7 +455,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （Linux は 1 回だけ数えます）。リングは共有でしかマップできず（`MAP_PRIVATE` は `EINVAL`）、`poll` と `epoll` は
   その記述子を見張れません。機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
   `IORING_FEAT_REG_REG_RING` を、待ちの `min_wait_usec` は何も変えないのに
-  `IORING_FEAT_MIN_TIMEOUT` を報告します。端末の読み出しは `io_uring_enter` の中で待ちます。
+  `IORING_FEAT_MIN_TIMEOUT` を報告します。疑似端末の読み出しは、パイプの読み出しのように
+  ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに
   `EINVAL` で失敗します。位置のないファイル（パイプ、ソケット、端末、eventfd）はポーリング
   できるものとみなし、それで読み出しがリングのバッファーを使う時点と、転送がそれを待つか

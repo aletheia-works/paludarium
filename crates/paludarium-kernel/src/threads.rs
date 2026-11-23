@@ -1188,14 +1188,6 @@ impl ThreadGroup {
         local.posix_deadline = self.posix_deadline();
         self.drain_process(local);
     }
-    /// The inbox of member `tid`.
-    pub(crate) fn inbox(&self, tid: u32) -> Option<Arc<SignalInbox>> {
-        self.members
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&tid)
-            .cloned()
-    }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
         inbox.attach(Arc::clone(&self.discards), Arc::clone(&self.arrivals));
         let wake = inbox.wake_token();

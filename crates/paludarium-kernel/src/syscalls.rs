@@ -142,7 +142,7 @@ pub(crate) struct Context<'a> {
     pub cpu: &'a mut CpuState,
     pub mem: &'a AddressSpace,
     pub cancellation: &'a std::sync::atomic::AtomicBool,
-    pub inbox: &'a crate::SignalInbox,
+    pub inbox: &'a std::sync::Arc<crate::SignalInbox>,
     pub group: &'a crate::ThreadGroup,
     pub processes: &'a std::sync::Arc<crate::processes::Processes>,
 }

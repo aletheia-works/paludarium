@@ -537,8 +537,8 @@ verified.
   `poll` and `epoll` cannot watch its descriptor. The features are Linux
   6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
   descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
-  wait's `min_wait_usec` changes nothing. A terminal's read waits in
-  `io_uring_enter`. A file that is never read (an epoll instance, a ring)
+  wait's `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
+  `io_uring_enter` instead of waiting for its file as a pipe's read does. A file that is never read (an epoll instance, a ring)
   fails with `EINVAL` at once, where Linux first waits for it to be ready.
   A file without a position (a pipe, a socket, a terminal, an eventfd) is
   taken as one that can be polled, which decides when a read uses a ring's

@@ -235,10 +235,10 @@ every test passing.
   some kernel unit tests (`replay_tests.rs`, `ptrace_replay_tests.rs`,
   `bpf_tests.rs`, `bpf_prog_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`,
   `mctp_tests.rs`, `seccomp_tests.rs`, `signalfd_tests.rs`,
-  `sock_diag_tests.rs`, `extack_tests.rs`, `perf_sample_tests.rs` and
-  `perf_side_band_tests.rs` in `crates/paludarium-kernel/src/`) make a
-  differential guest's calls in the same order and compare its lines
-  with what the guest prints on
+  `sock_diag_tests.rs`, `extack_tests.rs`, `mempolicy_tests.rs`,
+  `perf_sample_tests.rs` and `perf_side_band_tests.rs` in
+  `crates/paludarium-kernel/src/`) make a differential guest's calls in
+  the same order and compare its lines with what the guest prints on
   native Linux: as printed on Linux 7.0, or as printed under the emulator
   for a case whose differential test finds it equal to Linux's. The
   differential tests still compare the whole guests with Linux on every

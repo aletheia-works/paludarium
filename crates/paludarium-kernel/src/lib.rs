@@ -62,6 +62,8 @@ pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;
 mod memfd;
 mod mempolicy;
+#[cfg(test)]
+mod mempolicy_tests;
 mod mounts;
 mod mqueue;
 #[cfg(test)]

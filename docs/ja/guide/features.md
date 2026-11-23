@@ -3781,7 +3781,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピングのページに書いたとき（自身のコードでも、システムコールのコピーやシグナル
   フレーム、`rseq` の領域の更新のようなカーネルのアクセスでも。起きたときに数えます）と、
   `get_user_pages` がそのスレッドのために読み書きしてフォールトしたときです。後者は
-  `perf` は数えません。`mlock` が取り込むとき、トレーサーの `PTRACE_PEEKDATA` と
+  `perf` は数えません。`mlock`、`mlockall`、`MAP_POPULATE` が取り込むとき、
+  `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE`、`process_vm_readv` と
+  `process_vm_writev`（呼び出し元に数えます）、トレーサーの `PTRACE_PEEKDATA` と
   `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（一度も触れていない無名メモリは
   穴として残し、フォールトしません）です。`RUSAGE_SELF` はプロセスのスレッドの合計、
   `RUSAGE_THREAD` はそのスレッドのもの、`RUSAGE_CHILDREN` と wait は CPU 時間と同じく

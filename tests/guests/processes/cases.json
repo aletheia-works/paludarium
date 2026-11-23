@@ -145,6 +145,7 @@
     {"name":"perf-prctl","binary":"perf"},
     {"name":"perf-inherit","binary":"perf"},
     {"name":"perf-software","binary":"perf"},
+    {"name":"perf-gup","binary":"perf"},
     {"name":"perf-mmap","binary":"perf"},
     {"name":"perf-output","binary":"perf"},
     {"name":"perf-sample","binary":"perf"},

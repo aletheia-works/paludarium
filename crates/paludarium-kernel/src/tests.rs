@@ -4257,6 +4257,91 @@ mod kernel_faults {
         assert_eq!(after.0, before.0);
         assert!(after.1 > before.1, "{before:?} {after:?}");
     }
+
+    /// The thread's own faults, the kernel's for it and those through
+    /// `get_user_pages`.
+    fn all_counts(f: &Fixture) -> [u64; 3] {
+        let used = &f.thread.state.cpu.used;
+        [
+            used.faults.load(Ordering::SeqCst),
+            used.kernel_faults.load(Ordering::SeqCst),
+            used.forced_faults.load(Ordering::SeqCst),
+        ]
+    }
+
+    /// The counts that grew from `before` to `after`, in [`all_counts`]'s
+    /// order.
+    fn grown(before: [u64; 3], after: [u64; 3]) -> [u64; 3] {
+        [0, 1, 2].map(|i| after[i] - before[i])
+    }
+
+    #[test]
+    fn madv_populate_faults_through_get_user_pages() {
+        let mut f = fixture();
+        let fresh = f
+            .mem
+            .map(None, 0x4000, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        bound(&f);
+        let before = all_counts(&f);
+        // MADV_POPULATE_READ of two pages, MADV_POPULATE_WRITE of the
+        // other two: one fault each, none a `perf` event.
+        assert_eq!(f.ret(28, &[fresh.0, 0x2000, 22]), 0);
+        assert_eq!(f.ret(28, &[fresh.0 + 0x2000, 0x2000, 23]), 0);
+        let after = all_counts(&f);
+        paludarium_mmu::faults::unbind();
+        assert_eq!(grown(before, after), [0, 0, 4]);
+    }
+
+    #[test]
+    fn map_populate_and_mlock_write_their_pages_in_through_get_user_pages() {
+        let mut f = fixture();
+        bound(&f);
+        let before = all_counts(&f);
+        // mmap(NULL, 3 pages, PROT_READ | PROT_WRITE,
+        // MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0).
+        assert!(f.ret(9, &[0, 0x3000, 3, 0x8022, u64::MAX, 0]) < 1 << 47);
+        let after = all_counts(&f);
+        assert_eq!(grown(before, after), [0, 0, 3]);
+        // mlock of two fresh pages writes them in too.
+        let fresh = f.ret(9, &[0, 0x2000, 3, 0x22, u64::MAX, 0]);
+        let before = all_counts(&f);
+        assert_eq!(f.ret(149, &[fresh, 0x2000]), 0);
+        let after = all_counts(&f);
+        paludarium_mmu::faults::unbind();
+        assert_eq!(grown(before, after), [0, 0, 2]);
+    }
+
+    #[test]
+    fn process_vm_readv_and_writev_fault_the_remote_pages_through_get_user_pages() {
+        let mut f = fixture();
+        let pid = f.ret(39, &[]);
+        let remote = f
+            .mem
+            .map(None, 0x2000, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        // The local buffer and the iovecs have their frames already, so
+        // only the remote pages fault.
+        let (local, lvec, rvec) = (DATA + 0x800, DATA + 0x400, DATA + 0x600);
+        f.mem.write(GuestAddr(local), &[1; 16]).unwrap();
+        let iovec = |f: &Fixture, at: u64, base: u64, len: u64| {
+            f.mem.write_u64(GuestAddr(at), base).unwrap();
+            f.mem.write_u64(GuestAddr(at + 8), len).unwrap();
+        };
+        iovec(&f, lvec, local, 16);
+        iovec(&f, rvec, remote.0, 16);
+        bound(&f);
+        let before = all_counts(&f);
+        assert_eq!(f.ret(310, &[pid, lvec, 1, rvec, 1, 0]), 16);
+        let read = all_counts(&f);
+        iovec(&f, rvec, remote.0 + 0x1000, 16);
+        let written_before = all_counts(&f);
+        assert_eq!(f.ret(311, &[pid, lvec, 1, rvec, 1, 0]), 16);
+        let written = all_counts(&f);
+        paludarium_mmu::faults::unbind();
+        assert_eq!(grown(before, read), [0, 0, 1]);
+        assert_eq!(grown(written_before, written), [0, 0, 1]);
+    }
 }
 
 mod pkeys {

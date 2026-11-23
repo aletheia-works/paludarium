@@ -3329,13 +3329,18 @@ fn mark_written_for(mem: &AddressSpace, page: u64) {
 
 /// Brings the page at `page` in by writing it, as a write fault does,
 /// leaving its bytes as they were: a private page gets a copy of its own.
-/// The caller has marked its mapping written ([`mark_written_for`]).
+/// The caller has marked its mapping written ([`mark_written_for`]). It
+/// is `get_user_pages` with `FOLL_WRITE` (`populate_vma_page_range`,
+/// `faultin_page_range`), so its fault is no `perf` event
+/// ([`paludarium_mmu::faults::through_gup`]).
 fn write_in(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> {
-    mem.atomic(
-        GuestAddr(page),
-        paludarium_mmu::AtomicWidth::W8,
-        paludarium_mmu::AtomicOp::Add(0),
-    )
+    paludarium_mmu::faults::through_gup(|| {
+        mem.atomic(
+            GuestAddr(page),
+            paludarium_mmu::AtomicWidth::W8,
+            paludarium_mmu::AtomicOp::Add(0),
+        )
+    })
     .map(drop)
 }
 
@@ -3347,7 +3352,9 @@ fn write_in(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> 
 /// `SIGBUS`) with `EFAULT`, or poisoned (`UFFDIO_POISON`) with `EHWPOISON`,
 /// after the pages before it. A read maps what a read would (the zero page of
 /// private anonymous memory); a write breaks copy-on-write as a write
-/// would, and leaves the bytes as they are.
+/// would, and leaves the bytes as they are. Both go through
+/// `get_user_pages` without `FOLL_FORCE` (`faultin_page_range`), so their
+/// faults count to the caller's `min_flt` with no `perf` event.
 fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), Errno> {
     let mut at = addr;
     while at < end {
@@ -3366,7 +3373,7 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
             let faulted = if write {
                 write_in(mem, at).err()
             } else {
-                mem.read(GuestAddr(at), &mut [0]).err()
+                paludarium_mmu::faults::through_gup(|| mem.read(GuestAddr(at), &mut [0])).err()
             };
             match faulted {
                 // `VM_FAULT_HWPOISON` is `EHWPOISON`.

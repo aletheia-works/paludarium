@@ -278,9 +278,7 @@ verified.
   these faults are no `perf` event. No fault is major (`ru_majflt` is 0),
   as every page of a file is taken to be in the page cache. A core dump's faults count to the
   last thread to exit, where Linux counts them to the thread that dumps.
-  `process_vm_readv`, `process_vm_writev`, `MADV_POPULATE_READ` and
-  `MADV_POPULATE_WRITE` count their faults in `perf`'s `page-faults` too,
-  where Linux's `get_user_pages` gives no `perf` event. `/proc/<pid>/stat`'s
+  `/proc/<pid>/stat`'s
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as

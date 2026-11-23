@@ -4359,8 +4359,10 @@ kernel.
   and in the kernel's accesses for it: a system call's copies, a signal
   frame, an `rseq` area's update), each as it is taken, and the faults of the reads and writes
   through `get_user_pages` made for it, which `perf` does not count:
-  `mlock`'s population, a tracer's `PTRACE_PEEKDATA` and `PTRACE_POKEDATA`
-  (counted to the tracer) and a core dump's (which leaves anonymous memory
+  `mlock`'s, `mlockall`'s and `MAP_POPULATE`'s population,
+  `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`, `process_vm_readv` and
+  `process_vm_writev` (counted to the caller), a tracer's `PTRACE_PEEKDATA`
+  and `PTRACE_POKEDATA` (counted to the tracer) and a core dump's (which leaves anonymous memory
   never touched a hole, with no fault). `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts

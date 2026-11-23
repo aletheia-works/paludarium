@@ -239,9 +239,11 @@ pub enum ReadHint {
 /// read or fetch of a page that had no entry yet (Linux maps the zero page
 /// or the file's), and a write to a page with no frame of its own yet (its
 /// first write, the copy of a page-cache page of a private mapping or of a
-/// frame `fork` shared). A core dump's, `ptrace`'s or a lock's population's
-/// access through `get_user_pages` is not among them, as it passes no
-/// registers and so no `perf` event; its faults are kept apart
+/// frame `fork` shared). An access through `get_user_pages` is not among
+/// them, as it passes no registers and so no `perf` event: a core dump's,
+/// `ptrace`'s and a lock's population's, with `FOLL_FORCE`, and those
+/// made in [`through_gup`] (`process_vm_readv`'s, `MADV_POPULATE_READ`'s,
+/// a population's writes), without. Their faults are kept apart
 /// ([`Sink::forced`]), for the thread's `min_flt` alone.
 ///
 /// The kernel [`bind`]s the host thread to its guest thread's [`Sink`]
@@ -268,6 +270,7 @@ pub mod faults {
         static FORCED: Cell<u64> = const { Cell::new(0) };
         static SINK: RefCell<Option<Arc<dyn Sink>>> = const { RefCell::new(None) };
         static KERNEL: Cell<bool> = const { Cell::new(false) };
+        static GUP: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
@@ -291,7 +294,9 @@ pub mod faults {
     }
 
     pub(crate) fn count() {
-        if !add(false) {
+        if GUP.with(Cell::get) {
+            count_forced();
+        } else if !add(false) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
     }
@@ -336,6 +341,23 @@ pub mod faults {
         KERNEL.with(|was| was.replace(kernel))
     }
 
+    /// Runs `f` with the calling host thread's accesses made through
+    /// `get_user_pages` without `FOLL_FORCE`: they keep the permission
+    /// checks of a read or a write, but `handle_mm_fault` is passed no
+    /// registers, so their faults count to the task's `min_flt` with no
+    /// `perf` event ([`Sink::forced`], [`take_forced`]), as Linux's
+    /// `mm_account_fault` counts them.
+    pub fn through_gup<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                GUP.with(|gup| gup.set(self.0));
+            }
+        }
+        let _restore = Restore(GUP.with(|gup| gup.replace(true)));
+        f()
+    }
+
     /// The faults taken while the calling host thread was not bound, since
     /// the last call.
     #[must_use]
@@ -347,7 +369,8 @@ pub mod faults {
     /// while the calling host thread was not bound, since the last call: a
     /// read of a page that had no entry (a core dump's, `PTRACE_PEEKDATA`'s,
     /// a lock's population's) and a forced write that needs a frame of its
-    /// own (`PTRACE_POKEDATA`'s). Linux's `mm_account_fault` adds them to
+    /// own (`PTRACE_POKEDATA`'s), and every fault of an access in
+    /// [`through_gup`]. Linux's `mm_account_fault` adds them to
     /// the calling task's `min_flt` with no `perf` event.
     #[must_use]
     pub fn take_forced() -> u64 {
@@ -7329,9 +7352,13 @@ impl MemoryView {
     /// `process_vm_readv` pins another task's pages: page by page, up to the
     /// first page that is not mapped with `PROT_READ` (`VM_READ`, which
     /// `PROT_WRITE` or `PROT_EXEC` alone does not give) or does not read.
+    /// Its faults are through `get_user_pages` ([`faults::through_gup`]).
     /// How many bytes were copied, or `None` once the space is gone.
     #[must_use]
     pub fn read_pages(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
+        faults::through_gup(|| self.read_pages_in(addr, buf))
+    }
+    fn read_pages_in(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
         self.with_data(|data| {
             let mut copied = 0;
             for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
@@ -7352,10 +7379,14 @@ impl MemoryView {
     }
     /// Copies `buf` into the space at `addr`, as Linux's
     /// `process_vm_writev` pins another task's pages for writing: page by
-    /// page, up to the first page that may not be written. How many bytes
+    /// page, up to the first page that may not be written. Its faults are
+    /// through `get_user_pages` ([`faults::through_gup`]). How many bytes
     /// were copied, or `None` once the space is gone.
     #[must_use]
     pub fn write_pages(&self, addr: u64, buf: &[u8]) -> Option<usize> {
+        faults::through_gup(|| self.write_pages_in(addr, buf))
+    }
+    fn write_pages_in(&self, addr: u64, buf: &[u8]) -> Option<usize> {
         let data = self.data.upgrade()?;
         let serialization = lock_spinning(&self.serialization);
         let mut guard = AddressSpaceGuard {
@@ -9804,6 +9835,50 @@ mod tests {
         assert_eq!((faults::take(), faults::take_forced()), (0, 1));
         // Its frame is its own now.
         assert_eq!(space.view().write_forced(base.0 + 1, &[8]), Some(1));
+        assert_eq!((faults::take(), faults::take_forced()), (0, 0));
+    }
+
+    #[test]
+    fn pinned_pages_count_their_faults_apart_with_their_protection_checked() {
+        let mut space = AddressSpace::new();
+        let base = GuestAddr(0x4000_0000);
+        space
+            .map(
+                Some(base),
+                3 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let _ = faults::take();
+        let _ = faults::take_forced();
+        let view = space.view();
+        // `process_vm_readv`'s read of an untouched page, and
+        // `process_vm_writev`'s write of another: through
+        // `get_user_pages`, with no `perf` event.
+        let mut byte = [9u8];
+        assert_eq!(view.read_pages(base.0, &mut byte), Some(1));
+        assert_eq!(byte, [0]);
+        assert_eq!((faults::take(), faults::take_forced()), (0, 1));
+        assert_eq!(view.write_pages(base.0 + PAGE_SIZE, &[7]), Some(1));
+        assert_eq!((faults::take(), faults::take_forced()), (0, 1));
+        // The zero page read in still takes a write fault for a frame.
+        assert_eq!(view.write_pages(base.0, &[7]), Some(1));
+        assert_eq!((faults::take(), faults::take_forced()), (0, 1));
+        // An access outside the scope is the thread's own again.
+        space
+            .write_u64(GuestAddr(base.0 + 2 * PAGE_SIZE), 1)
+            .unwrap();
+        assert_eq!((faults::take(), faults::take_forced()), (1, 0));
+        // And the scope checks protection as a plain access does (no
+        // `FOLL_FORCE`): a read-only page is not written.
+        space
+            .protect(GuestAddr(base.0 + 2 * PAGE_SIZE), PAGE_SIZE, Prot::READ)
+            .unwrap();
+        assert_eq!(view.write_pages(base.0 + 2 * PAGE_SIZE, &[1]), Some(0));
+        assert!(
+            faults::through_gup(|| space.write(GuestAddr(base.0 + 2 * PAGE_SIZE), &[1])).is_err()
+        );
         assert_eq!((faults::take(), faults::take_forced()), (0, 0));
     }
 

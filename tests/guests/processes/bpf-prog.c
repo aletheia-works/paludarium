@@ -2375,7 +2375,7 @@ static void grow(const char *name, const struct insn *pro, unsigned npro,
 #define REWRITE(name, d, n, flags, pro, ...)                                      \
     do {                                                                          \
         static const struct insn prologue[] = pro;                                \
-        static const struct insn block[] = {__VA_ARGS__};                         \
+        const struct insn block[] = {__VA_ARGS__};                                \
         unsigned at = 500 - (unsigned)((d) * (n));                                \
         grow(name, prologue, COUNT(prologue), block, COUNT(block), n, at, flags); \
         grow(name, prologue, COUNT(prologue), block, COUNT(block), n, at + 1, flags); \

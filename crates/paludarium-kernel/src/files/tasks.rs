@@ -975,19 +975,16 @@ pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errn
 /// The namespace a link of the task's `ns` names; none once it has ended,
 /// as Linux's task then has no `nsproxy`, and none for `pid_for_children`
 /// while that PID namespace has no init yet (`pidns_for_children_get`). A
-/// leader that ended before its other threads keeps its PID and user ones,
-/// which Linux's `pidns_get` and `userns_get` take from its PID and
-/// credentials rather than its `nsproxy`.
+/// task keeps its PID and user ones until it is reaped, a zombie and a
+/// leader that ended before its other threads too, which Linux's
+/// `pidns_get` and `userns_get` take from its PID and credentials rather
+/// than its `nsproxy`.
 pub(super) fn namespace(
     task: &Task,
     entry: crate::namespaces::Entry,
 ) -> Option<std::sync::Arc<crate::namespaces::Namespace>> {
     use crate::namespaces::Entry;
-    let kept = if matches!(entry, Entry::Pid | Entry::User) {
-        task.live()
-    } else {
-        task.holds()
-    };
+    let kept = matches!(entry, Entry::Pid | Entry::User) || task.holds();
     kept.then(|| task.view.group.namespaces(task.tid).entry(entry).clone())
         .filter(|namespace| {
             entry != crate::namespaces::Entry::PidForChildren || namespace.init().is_some()

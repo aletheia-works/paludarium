@@ -3201,7 +3201,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ESRCH`）、`exe`、`cwd`、`root` と
   ほかの `ns` のリンクは `ENOENT`、`mountinfo` は `EINVAL` です。`statm` はすべて 0、
   `status` には `Vm` の行も `Umask` もなく `FDSize` は 0 で、`stat` には大きさもアドレスも
-  ありません。`/proc/thread-self` は読んでいるスレッドのディレクトリへのリンク（0777）で、
+  ありません。ゾンビのプロセスも、Linux の `pidns_get` と `userns_get` が PID と資格情報から
+  取るのと同じく、回収されるまで `pid` と `user` のリンクを残し、ほかの `ns` のリンクと
+  `pid_for_children` は `ENOENT` です。`/proc/thread-self` は読んでいるスレッドのディレクトリへのリンク（0777）で、
   `<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、

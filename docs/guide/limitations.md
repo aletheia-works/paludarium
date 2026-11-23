@@ -138,9 +138,7 @@ verified.
   which outlives the memory, so those files stay the task's and their open
   is `ESRCH`; paludarium follows that once the runners run 7.2 or later, and
   the `gone-leader-files` case and the unit test
-  `a_task_without_memory_has_its_files_owned_by_root` change with it. A
-  zombie process has no `ns` links yet, where Linux's `pid` and `user` links
-  still resolve (`pidns_get` and `userns_get` need no `nsproxy`).
+  `a_task_without_memory_has_its_files_owned_by_root` change with it.
   `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the

@@ -3694,7 +3694,10 @@ kernel.
   `EACCES`, and `ESRCH` for root;
   `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
-  `FDSize` of 0; and `stat` has no sizes or addresses. `/proc/thread-self` is
+  `FDSize` of 0; and `stat` has no sizes or addresses. A zombie process keeps
+  its `pid` and `user` links too until it is reaped, as Linux's `pidns_get`
+  and `userns_get` take them from its PID and credentials, while its other
+  `ns` links and `pid_for_children` are `ENOENT`. `/proc/thread-self` is
   a link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`

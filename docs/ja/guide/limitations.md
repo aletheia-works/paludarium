@@ -121,9 +121,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `task_dump_owner` が、メモリーより長く残る `exec_state` の dumpable フラグから持ち主を
   決めるので、これらのファイルはタスクのもののままで、開くと `ESRCH` です。ランナーが
   7.2 以降になったら paludarium もそれに合わせ、`gone-leader-files` のケースと単体テスト
-  `a_task_without_memory_has_its_files_owned_by_root` もそのとき変わります。ゾンビの
-  プロセスにはまだ `ns` のリンクがありません。Linux では `pid` と `user` のリンクは
-  引き続き解決できます（`pidns_get` と `userns_get` は `nsproxy` を使いません）。
+  `a_task_without_memory_has_its_files_owned_by_root` もそのとき変わります。
   `meminfo` は `sysinfo` と同じ固定の 4 GiB を、何も使っていないものとして返します。
 - **自分のルートの一部**：生成される `/proc` や `/dev`（またはその中のディレクトリ）への
   `chroot` は `EINVAL` を返します。Linux はそこをルートにします。`mount` は `proc`

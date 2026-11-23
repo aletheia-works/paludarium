@@ -66,6 +66,16 @@ CI run produces them afresh on an x86-64 Linux runner.
   `kernel.apparmor_restrict_unprivileged_userns` is 1, so CI sets it to 0
   with `sysctl`; elsewhere the case differs from such a host's native run.
 
+- Whether Linux gets a large folio for a tmpfs page depends on its free
+  memory, unless it may reclaim and compact for it: under the default
+  `defrag=madvise`, only for a fault of a mapping advised `MADV_HUGEPAGE`
+  (`vma_thp_gfp_mask`). So the `tmpfs-huge` case takes each large folio
+  from such a fault, and tries a write, `fallocate` and an unadvised fault
+  only on a mount of one page, where no larger folio fits whatever the
+  memory. That a write, `fallocate`, `huge=within_size` and an unadvised
+  fault on `huge=always` take a large folio is checked by the in-memory
+  file system's unit tests alone.
+
 - The native side must be a real x86-64 Linux. Docker on an Arm Mac runs
   x86-64 programs under QEMU's user-mode emulation, which handles signals
   itself, so there even native results can differ from Linux: a stopped and

@@ -722,17 +722,22 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ルートからではありません。`MS_RDONLY`（`EROFS`）、`noexec`、`nodev`、`nosuid` は
   効かせ、tmpfs のマウントの `size`、`nr_blocks`、`nr_inodes` も効かせます。フォールトが
   tmpfs マウントのファイルや memfd に持ち込むページは `shmem_fault` が課金するように
-  そのブロックに数え、マウントの大きさを超えるページは `SIGBUS` です。まだそう数えない
-  のは、`UFFDIO_COPY` や `UFFDIO_ZEROPAGE` が埋めるページで、大きさにかかわらずファイル
-  に戻ります（超えても `ENOMEM` になりません）。`huge=` が `never` でないマウントも
-  1 ページずつ数え、Linux のように巨大ページをまとめて取ることはありません。
-  `MAP_POPULATE`、`MAP_LOCKED`、ロックが共有マッピングに持ち込むはずのページは、触れた
+  そのブロックに数え（`huge=` のあるマウントでは大きな folio のほかのページとともに）、
+  マウントの大きさを超えるページは `SIGBUS` です。まだそうしないのは次のことです。
+  `mmap` はそのファイルのマッピングをほかのものと同じ場所に置きます
+  （`shmem_get_unmapped_area` は 2 MiB 以上のものを 2 MiB の境目に置きます）。そのため
+  フォールトで 2 MiB の folio を取るのは、プログラムが自分で置いたマッピングだけです。
+  大きな folio は 1 ページずつマップするので、`/proc/<pid>/smaps` と `/proc/meminfo` は
+  それを `ShmemPmdMapped`、`FilePmdMapped`、`ShmemHugePages` に数えず、フォールトは
+  folio 全体ではなくまわりのページだけをマップします（`Rss` にもそれだけを数えます）。大きな folio はいつも取れます。Linux はメモリーにそれほど
+  大きな空きがなければ小さいものを取ります。メモリーが足りなくなって分けることはなく、
+  ほかのものの場所を空けるときだけ分けます。`MAP_POPULATE`、`MAP_LOCKED`、ロックが共有マッピングに持ち込むはずのページは、触れた
   ときに初めて数えます。拡張属性は inode の分を使いません（`shmem_xattr_handler_set` のように数えて、超えたときの `setxattr` の
   `ENOSPC` にはなりません）。起動したときからあるルートには、`fallocate` の上限（返す
   メモリーの大きさ）のほかに上限がありません。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが
   持つデバイスノードはホストのディレクトリのものだけなので（その `mknod` は `EPERM`）、
   `nodev` が断るのもそれだけです。
-  `huge`、`mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
+  `mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
   （マウントし直しで `noswap` やクォータを有効にしたり、クォータの上限を変えたりすると
   `EINVAL`）表示しますが、何もせず、
   `casefold` と `strict_encoding` は、`CONFIG_UNICODE` なしのカーネルと同じく `EINVAL`

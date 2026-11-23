@@ -14648,6 +14648,148 @@ static int shmem_fault_charge_case(void) {
     return 0;
 }
 
+/* The tmpfs-huge case: a tmpfs mount's huge= brings a page in with a large
+   folio's others, of the largest order up to 512 pages whose aligned
+   extent the file has no page of yet and the fault's mapping holds at
+   offsets aligned as its addresses are, or the page alone when that does
+   not fit the size, after a folio past another file's end is split to
+   make room. A userfaultfd's fill of a full mount is ENOMEM. Each large
+   folio comes from a fault of a mapping advised MADV_HUGEPAGE, which
+   Linux allocates with direct reclaim and compaction (vma_thp_gfp_mask);
+   a write's, fallocate's and an unadvised fault's take none of that, so
+   they are tried only where no large folio fits the size, which makes
+   each a page whatever the memory. Mounted, as shmem-fault-charge's, in a
+   user and mount namespace of its own. */
+static char th_base[] = "/tmp/paludarium-tmpfs-huge-XXXXXX";
+static int th_mount(const char *m, const char *options) {
+    int r = tl_err(mount("none", m, "tmpfs", 0, options));
+    printf("mount %s=%d\n", options, r);
+    return r;
+}
+static int th_file(const char *m, const char *name, long size) {
+    char path[320];
+    snprintf(path, sizeof path, "%s/%s", m, name);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd >= 0 && size && ftruncate(fd, size)) return -1;
+    return fd;
+}
+/* `len` bytes of address space at a 2 MiB boundary, mapped PROT_NONE. */
+static char *th_aligned(long len) {
+    long huge = 2 << 20;
+    char *map = mmap(NULL, len + huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return NULL;
+    return (char *)(((uintptr_t)map + huge - 1) & ~(uintptr_t)(huge - 1));
+}
+/* A shared mapping of `fd` at `at` given `advice` (none for 0), its first
+   byte read: the file's blocks. */
+static long th_fault(const char *name, int fd, char *at, long len, int advice) {
+    char *map = mmap(at, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (map == MAP_FAILED) return -errno;
+    if (advice && madvise(map, len, advice)) return -errno;
+    touch(name, map, 0);
+    return sf_blocks(fd);
+}
+static long th_uffd(int fd, long request, void *arg) {
+    long r = ioctl(fd, request, arg);
+    return r < 0 ? -errno : r;
+}
+static int th_inner(const char *m) {
+    long huge = 2 << 20;
+    /* 768 pages: two 512-page folios do not fit together. */
+    if (th_mount(m, "size=3m,huge=always")) return 0;
+    char *at = th_aligned(5 * huge);
+    if (!at) return 80;
+    int a = th_file(m, "a", 4096), b = th_file(m, "b", huge), c = th_file(m, "c", huge);
+    int d = th_file(m, "d", huge), e = th_file(m, "e", huge), f = th_file(m, "f", huge);
+    if (a < 0 || b < 0 || c < 0 || d < 0 || e < 0 || f < 0) return 81;
+    printf("past-end=%ld\n", th_fault("past-end", a, at, huge, 14));
+    long split = th_fault("split", b, at + huge, huge, 14);
+    printf("split=%ld %ld\n", split, sf_blocks(a));
+    printf("no-room=%ld\n", th_fault("no-room", c, at + 2 * huge, huge, 14));
+    printf("small=%ld\n", th_fault("small", d, at + 3 * huge, 64 << 10, 14));
+    printf("misaligned=%ld\n", th_fault("misaligned", e, at + 4 * huge + 4096, huge - 4096, 14));
+    printf("nohugepage=%ld\n", th_fault("nohugepage", f, at + 3 * huge + (64 << 10), 64 << 10, 15));
+    munmap(at, 5 * huge);
+    close(a), close(b), close(c), close(d), close(e), close(f);
+    printf("umount=%d\n", tl_err(umount(m)));
+    if (th_mount(m, "huge=advise")) return 0;
+    if (!(at = th_aligned(2 * huge))) return 82;
+    a = th_file(m, "a", 2 * huge);
+    printf("unadvised=%ld\n", th_fault("unadvised", a, at, huge, 0));
+    char *rest = mmap(at + huge, huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, a, huge);
+    if (rest == MAP_FAILED) return 83;
+    printf("advised=%d\n", tl_err(madvise(rest, huge, 14)));
+    touch("advised", rest, 0);
+    printf("blocks=%ld\n", sf_blocks(a));
+    munmap(at, 2 * huge);
+    close(a);
+    printf("umount=%d\n", tl_err(umount(m)));
+    /* One page: a write, fallocate and a fault each take a page alone,
+       and with it full, a fault is SIGBUS and a fill ENOMEM. */
+    if (th_mount(m, "size=4k,huge=always")) return 0;
+    int u = syscall(SYS_userfaultfd, O_CLOEXEC | 1);
+    uint64_t api[3] = {0xaa, 0, 0};
+    printf("userfaultfd=%d", u < 0 ? -errno : 0);
+    printf(" api=%ld\n", th_uffd(u, 0xc018aa3f, api));
+    if (!(at = th_aligned(huge))) return 84;
+    a = th_file(m, "a", 0);
+    b = th_file(m, "b", 4 * 4096);
+    long wrote = write(a, "x", 1);
+    printf("write=%ld blocks=%ld\n", wrote, sf_blocks(a));
+    printf("truncate=%d\n", tl_err(ftruncate(a, 0)));
+    int allocated = tl_err(fallocate(b, 0, 0, 4096));
+    printf("fallocate=%d blocks=%ld\n", allocated, sf_blocks(b));
+    printf("full=%d\n", tl_err(fallocate(a, 0, 0, 4096)));
+    printf("page=%ld\n", th_fault("page", b, at, 4 * 4096, 0));
+    touch("full", at + 4096, 0);
+    uint64_t reg[4] = {(uintptr_t)at, 4 * 4096, 1, 0};
+    printf("register=%ld\n", th_uffd(u, 0xc020aa00, reg));
+    char src[4096] = {'c'};
+    int64_t copy[5] = {(intptr_t)(at + 2 * 4096), (intptr_t)src, 4096, 0, 0};
+    long copied = th_uffd(u, 0xc028aa03, copy);
+    printf("copy=%ld %lld\n", copied, (long long)copy[4]);
+    int64_t zero[4] = {(intptr_t)(at + 3 * 4096), 4096, 0, 0};
+    long zeroed = th_uffd(u, 0xc020aa04, zero);
+    printf("zeropage=%ld %lld blocks=%ld\n", zeroed, (long long)zero[3], sf_blocks(b));
+    munmap(at, 4 * 4096);
+    close(a), close(b), close(u);
+    printf("umount=%d\n", tl_err(umount(m)));
+    return 0;
+}
+static int tmpfs_huge_case(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = on_bus;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, NULL)) return 85;
+    if (!mkdtemp(th_base)) return 86;
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", th_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(th_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(th_base) == 0);
+    return 0;
+}
+
 /* The generated-changes case: the path calls that change or go to a file
    the kernel generates in /dev or /proc, by its own path. chdir and fchdir
    make a directory there the working directory, which relative paths and
@@ -36286,6 +36428,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
+    if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

@@ -543,6 +543,19 @@ pub struct ScanWalk {
 /// The bytes of address space one page table maps (Linux's `PMD_SIZE`).
 const BLOCK_SIZE: u64 = ENTRIES_PER_TABLE * PAGE_SIZE;
 
+/// How a mapping would hold a large folio around a page it faults in
+/// ([`PageSource::admit`]), as `thp_vma_suitable_orders` and
+/// `vma_thp_disabled` look at the VMA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HugeFit {
+    /// The largest order, up to a PMD's 9, whose aligned extent around the
+    /// page lies in the mapping at file offsets aligned as its addresses
+    /// are; 0 for none.
+    pub order: u8,
+    /// `MADV_HUGEPAGE` (`true`) or `MADV_NOHUGEPAGE` on the mapping.
+    pub advised: Option<bool>,
+}
+
 /// Adds `[from, to)` to `ranges`, joining it to the last one it continues.
 fn add_range(ranges: &mut Vec<(u64, u64)>, from: u64, to: u64) {
     match ranges.last_mut() {
@@ -1853,8 +1866,10 @@ pub trait PageSource: Send + Sync {
     /// private one of a shmem file that still shows the file's page:
     /// `false` makes the access a bus error (`SIGBUS`), as secretmem's
     /// fault past `RLIMIT_MEMLOCK` is and shmem's past its mount's size.
-    fn admit(&self, offset: u64) -> bool {
-        let _ = offset;
+    /// `fit` is how the mapping would hold a large folio around it, which
+    /// a tmpfs mount's `huge=` may bring the page in with.
+    fn admit(&self, offset: u64, fit: HugeFit) -> bool {
+        let _ = (offset, fit);
         true
     }
     /// Whether the memory's VMAs are fixed mappings that core mm does not
@@ -1888,7 +1903,8 @@ pub trait PageSource: Send + Sync {
         self.shmem()
     }
     /// Allocates `[offset, offset+len)` of the file, as `MADV_COLLAPSE`
-    /// charges the holes it fills to a shmem file (`shmem_charge`), or
+    /// charges the holes it fills to a shmem file (`shmem_charge`) and a
+    /// `userfaultfd` the page it fills (`shmem_mfill_atomic_pte`), or
     /// fails (`ENOSPC` past a tmpfs mount's size).
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         let _ = (offset, len);
@@ -3932,7 +3948,7 @@ impl AddressSpaceData {
             if access != Access::Setup
                 && (creating || lookup(directory, page).is_some())
                 && let Some((source, offset)) = self.admitting(directory, page)
-                && !source.admit(offset)
+                && !source.admit(offset, self.huge_fit(page, offset))
             {
                 return Err(Fault {
                     bus: true,
@@ -3955,6 +3971,28 @@ impl AddressSpaceData {
             }
         }
         Ok(())
+    }
+
+    /// How the mapping of `page`, at file offset `offset`, would hold a
+    /// large folio around it ([`HugeFit`]).
+    fn huge_fit(&self, page: u64, offset: u64) -> HugeFit {
+        let Some(m) = self.mapping_at(page) else {
+            return HugeFit::default();
+        };
+        let order = (1..=9u8)
+            .rev()
+            .find(|&order| {
+                let size = PAGE_SIZE << order;
+                let start = page & !(size - 1);
+                offset.wrapping_sub(page).is_multiple_of(size)
+                    && start >= m.start.0
+                    && start + size <= m.end()
+            })
+            .unwrap_or(0);
+        HugeFit {
+            order,
+            advised: m.huge_pages,
+        }
     }
 
     /// The memory an access to the page at `page` asks to take the page in
@@ -5994,6 +6032,18 @@ impl AddressSpaceData {
             || (file && shared.is_some() && self.shmem_holds(page))
         {
             return Err(Errno::EEXIST);
+        }
+        // A shmem file's page is charged to its mount first, `ENOMEM` when
+        // that is full (`shmem_mfill_atomic_pte`).
+        if file
+            && let Some(shared) = shared
+            && let Some(source) = &shared.pages.source
+            && source.shmem()
+            && source
+                .allocate(page.wrapping_add(shared.shift), PAGE_SIZE)
+                .is_err()
+        {
+            return Err(Errno::ENOMEM);
         }
         // A file's page needs its bytes, zeros too: one without would be
         // read from the file.

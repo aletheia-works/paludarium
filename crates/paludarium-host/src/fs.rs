@@ -176,6 +176,22 @@ pub trait FileHandle: Send + Sync {
     fn allocate(&self, _offset: u64, _len: u64) -> Result<(), Errno> {
         Ok(())
     }
+    /// Takes the holes of `[offset, offset+len)` in as the file's pages,
+    /// all or none (`ENOSPC` past a tmpfs mount's size): the holes
+    /// `MADV_COLLAPSE` fills and the page a `userfaultfd` fills in a shmem
+    /// file. Files whose pages the emulator does not keep have none.
+    fn charge(&self, _offset: u64, _len: u64) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// Takes in the page at `offset` for a fault of a shmem file's mapping,
+    /// as `shmem_fault` does, in a large folio where the mount's `huge=`
+    /// and the mapping allow one: `order` is the largest whose aligned
+    /// extent around the page lies in the mapping at an offset aligned as
+    /// its address (0 for none), `advised` its `MADV_HUGEPAGE` (`true`) or
+    /// `MADV_NOHUGEPAGE`. `ENOSPC` past the mount's size.
+    fn fault(&self, _offset: u64, _order: u8, _advised: Option<bool>) -> Result<(), Errno> {
+        Ok(())
+    }
     /// Opens the same file again with `flags` (an access mode, `O_TRUNC`,
     /// `O_APPEND`, `O_DIRECTORY`), as a new open file description with an
     /// offset of its own: how a link in `/proc/self/fd` opens a file no

@@ -2029,6 +2029,7 @@ struct Tmpfs {
     shmem: bool,
     held: Mutex<std::collections::BTreeSet<u64>>,
     asked: AtomicU64,
+    fits: Mutex<Vec<crate::HugeFit>>,
 }
 
 impl Tmpfs {
@@ -2039,6 +2040,7 @@ impl Tmpfs {
             shmem,
             held: Mutex::default(),
             asked: AtomicU64::new(0),
+            fits: Mutex::default(),
         })
     }
     fn held(&self) -> Vec<u64> {
@@ -2063,12 +2065,73 @@ impl PageSource for Tmpfs {
     fn holds(&self, offset: u64) -> bool {
         self.held.lock().unwrap().contains(&(offset / PAGE_SIZE))
     }
-    fn admit(&self, offset: u64) -> bool {
+    fn admit(&self, offset: u64, fit: crate::HugeFit) -> bool {
         self.asked.fetch_add(1, Ordering::Relaxed);
+        self.fits.lock().unwrap().push(fit);
         let mut held = self.held.lock().unwrap();
         held.len() < self.room && held.insert(offset / PAGE_SIZE)
             || held.contains(&(offset / PAGE_SIZE))
     }
+    fn allocate(&self, offset: u64, _len: u64) -> Result<(), Errno> {
+        let mut held = self.held.lock().unwrap();
+        if held.len() < self.room && held.insert(offset / PAGE_SIZE) {
+            Ok(())
+        } else {
+            Err(Errno(28))
+        }
+    }
+}
+
+#[test]
+fn a_fault_tells_the_file_how_its_mapping_would_hold_a_large_folio() {
+    let m = AddressSpace::new();
+    let mut byte = [0];
+    let huge = 2 << 20;
+    let file = Tmpfs::new(4 * huge, 8, true);
+    let pages = SharedPages::new().with_source(file.clone());
+    // 64 KiB at a 2 MiB boundary, at offset 0: a 16-page extent fits.
+    let base = GuestAddr(0x4000_0000);
+    let at = m
+        .map_shared(Some(base), 64 << 10, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 64 << 10, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    m.read(GuestAddr(at.0 + PAGE_SIZE), &mut byte).unwrap();
+    // A page off the boundary, at offset 0: none does.
+    let off = GuestAddr(base.0 + huge + PAGE_SIZE);
+    m.map_shared(Some(off), huge, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(off, huge, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    m.read(off, &mut byte).unwrap();
+    let fits = file.fits.lock().unwrap().clone();
+    assert_eq!(fits.first().map(|fit| fit.order), Some(4));
+    assert_eq!(fits.last().map(|fit| fit.order), Some(0));
+}
+
+#[test]
+fn a_fill_of_a_shmem_page_its_file_has_no_room_for_is_enomem() {
+    let m = AddressSpace::new();
+    let file = Tmpfs::new(2 * PAGE_SIZE, 1, true);
+    let pages = SharedPages::new().with_source(file.clone());
+    let at = m
+        .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 2 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    let view = m.view();
+    view.userfault_register(at.0, at.0 + 2 * PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    let end = at.0 + 2 * PAGE_SIZE;
+    assert_eq!(
+        view.userfault_fill(at.0, end, at.0, Some(b"a"), false),
+        Ok(())
+    );
+    assert_eq!(
+        view.userfault_fill(at.0, end, at.0 + PAGE_SIZE, Some(b"b"), false),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!(file.held(), [0]);
 }
 
 #[test]

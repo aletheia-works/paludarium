@@ -1014,6 +1014,7 @@ mod linux {
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),
+        processes_tmpfs_huge => ("tmpfs-huge","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),

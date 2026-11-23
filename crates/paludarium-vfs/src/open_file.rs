@@ -148,7 +148,7 @@ impl FileHandle for MemFile {
         let room = usize::try_from(contents.len().saturating_sub(offset)).unwrap_or(usize::MAX);
         let b = &b[..b.len().min(room)];
         if !b.is_empty() {
-            contents.write_unlimited(offset, b);
+            contents.write_back(offset, b)?;
             n.mtime_ns = i128::from(modified);
         }
         Ok(())
@@ -168,25 +168,40 @@ impl FileHandle for MemFile {
     }
     /// Allocates the pages of the range, or none with `ENOSPC` when they
     /// would take the file system past its size (the size it was mounted
-    /// with, else `MEMORY_BYTES`), as tmpfs refuses to go past its size.
+    /// with, else `MEMORY_BYTES`), as tmpfs refuses to go past its size: a
+    /// range longer than the size at once (`shmem_fallocate`).
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         let t = lock(&self.tree);
         let used = t.used_blocks();
-        let size = match t.usage.max_pages() {
-            0 => MEMORY_BYTES / BLOCK,
-            max => max,
-        };
+        let max = t.usage.max_pages();
         let mut n = lock(&self.node);
         let Kind::File(contents) = &mut n.kind else {
             return Err(Errno::EISDIR);
         };
+        let pages = offset.saturating_add(len).div_ceil(BLOCK) - offset / BLOCK;
         // A file system without a size (`size=0`, or none mounted) still
         // ends at the memory; `Contents::allocate` takes the pages against
-        // a mount's size, which this check has already let through.
-        if used.saturating_add(contents.missing(offset, len)) > size {
+        // a mount's size.
+        let past_memory =
+            max == 0 && used.saturating_add(contents.missing(offset, len)) > MEMORY_BYTES / BLOCK;
+        if past_memory || (max != 0 && pages > max) {
             return Err(Errno(28));
         }
         contents.allocate(offset, len)
+    }
+    fn charge(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        let mut n = lock(&self.node);
+        let Kind::File(contents) = &mut n.kind else {
+            return Err(Errno::EISDIR);
+        };
+        contents.charge_holes(offset, len)
+    }
+    fn fault(&self, offset: u64, order: u8, advised: Option<bool>) -> Result<(), Errno> {
+        let mut n = lock(&self.node);
+        let Kind::File(contents) = &mut n.kind else {
+            return Err(Errno::EISDIR);
+        };
+        contents.fault(offset, Vma { order, advised })
     }
     fn truncate(&self, size: u64) -> Result<(), Errno> {
         if self.flags() & 3 == 0 {

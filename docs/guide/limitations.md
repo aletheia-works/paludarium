@@ -854,11 +854,18 @@ verified.
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
   `nr_blocks` and `nr_inodes`, and a page a fault brings into a file of a
   tmpfs mount or a memfd counts in its blocks, as `shmem_fault` charges
-  it, one past the mount's size being a `SIGBUS`. Not yet charged that way
-  are the pages `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills, which go back to
-  the file whatever its size (no `ENOMEM` past it); a mount whose `huge=`
-  is not `never` charges a page at a time, where Linux takes a huge page
-  whole; and the pages `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring
+  it, one past the mount's size being a `SIGBUS`, with a large folio's
+  others on a mount with `huge=`. Not yet so: `mmap` places a mapping of
+  such a file where it would place any (`shmem_get_unmapped_area` puts
+  one of 2 MiB or more at a 2 MiB boundary), so only a mapping a program
+  places itself takes 2 MiB folios on a fault; a large folio is mapped a
+  page at a time, so `/proc/<pid>/smaps` and `/proc/meminfo` count no
+  `ShmemPmdMapped`, `FilePmdMapped` or `ShmemHugePages` for it and a
+  fault maps (and counts in `Rss`) only the pages around it, not the whole
+  folio; a large folio always comes, where Linux
+  takes a smaller one when memory has no free extent so large; and none
+  is split under memory pressure but to make room for another. The pages
+  `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring
   into a shared mapping count only once touched. Its extended attributes
   take none of the inodes' room (`ENOSPC` from `setxattr` past it, as
   `shmem_xattr_handler_set` counts them, does not happen); the root from
@@ -867,7 +874,7 @@ verified.
   flags, `sync`, `dirsync` and `mand`; no mount here holds a
   device node but a host directory's (`mknod` of one is `EPERM`), so
   `nodev` only refuses those;
-  `huge`, `mpol`, `noswap` and the quota options are taken, checked as
+  `mpol`, `noswap` and the quota options are taken, checked as
   Linux checks them (a remount that turns on `noswap` or quotas, or
   changes a quota limit, is `EINVAL`) and shown, but do nothing, and
   `casefold` and `strict_encoding` are `EINVAL`, as from a

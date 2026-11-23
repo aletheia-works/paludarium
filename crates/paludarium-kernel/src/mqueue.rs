@@ -1037,7 +1037,10 @@ impl MountedRoot {
         if flags & O_ACCMODE != 0 {
             return Err(Errno::EISDIR);
         }
-        let root = Self::new(c);
+        let root = Self {
+            status: crate::files::StatusFlags::opened(flags),
+            ..Self::new(c)
+        };
         crate::permissions::permission(&c.process.credentials, &root.queues.0.stat(), 4)?;
         Ok(Arc::new(root))
     }

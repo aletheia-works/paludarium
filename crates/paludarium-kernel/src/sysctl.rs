@@ -1049,7 +1049,7 @@ pub(crate) fn open(
     }
     let net_admin = writers.net_admin(credentials);
     Ok(Arc::new(SettingFile {
-        status: Default::default(),
+        status: crate::files::StatusFlags::opened(flags),
         value,
         admin: credentials.capable(crate::credentials::CAP_SYS_ADMIN),
         net_admin,

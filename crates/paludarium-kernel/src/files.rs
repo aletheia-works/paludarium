@@ -6399,6 +6399,11 @@ pub(crate) fn setfl(before: u32, asked: u32) -> u32 {
 #[derive(Default)]
 pub(crate) struct StatusFlags(AtomicU32);
 impl StatusFlags {
+    /// The flags an open with `flags` left that `F_SETFL` changes, as
+    /// Linux keeps them in `f_flags` from the open.
+    pub(crate) fn opened(flags: u32) -> Self {
+        Self(AtomicU32::new(flags & SETFL_FLAGS))
+    }
     /// The file's flags, `fixed` with what `F_SETFL` set.
     pub(crate) fn of(&self, fixed: u32) -> u32 {
         setfl(fixed, self.0.load(Ordering::SeqCst))

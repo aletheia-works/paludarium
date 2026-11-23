@@ -87,7 +87,7 @@ pub(crate) struct SeqFile {
 impl SeqFile {
     pub(crate) fn open(records: Box<dyn Records>, flags: u32) -> Self {
         Self {
-            status: Default::default(),
+            status: crate::files::StatusFlags::opened(flags),
             records,
             access: flags & 3,
             writable: flags & 3 != 0,

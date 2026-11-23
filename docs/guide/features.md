@@ -118,7 +118,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX sockets (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX and UDP sockets (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -3243,7 +3243,8 @@ kernel.
     traffic class, and while listening or closed its `IPV6_V6ONLY`, its
     mark to `CAP_NET_ADMIN`, its priority as its class, its cgroup, its
     options (`inet_diag_sockopt`), its memory (a UDP socket's datagrams
-    charged in pages, as `udp_rmem_schedule` does, its buffers, and a
+    charged in pages, as `udp_rmem_schedule` does, its buffers, a UDP
+    socket's datagrams that its filter or its full buffer dropped, and a
     listener's handshakes that a full queue dropped), a TCP socket's
     `tcp_info` (`INET_DIAG_INFO`, which `ss -i` shows), and its
     congestion control (`cubic`). A hold in `TIME_WAIT` tells
@@ -5131,6 +5132,45 @@ kernel.
     instructions as attached and their number in `*len`, in blocks: a
     `*len` of 0 only asks for it, and one short of it is `EINVAL`.
   - `SO_BPF_EXTENSIONS` gives 64 (`SKF_AD_MAX`).
+
+- On a UDP socket, IPv4 or IPv6, a filter takes the same options and runs
+  on each datagram that comes to it through the loopback or a veth pair, as
+  Linux's `udp_queue_rcv_one_skb` and `udpv6_queue_rcv_one_skb` run
+  `sk_filter_trim_cap`: before the receive buffer's check, so that a
+  datagram it drops is never queued. 0 drops it, and any other value keeps
+  that many bytes from the UDP header on, the header always: what is
+  received (and `FIONREAD`) is the rest. The datagram takes of the receive
+  buffer what it took as it came. A drop, the filter's or the full
+  buffer's, counts in `sk_drops` (`INET_DIAG_SKMEMINFO`). The filter runs
+  on the `sk_buff` Linux 7.0 makes:
+  - `skb->data` is at the UDP header, with the IP header before it
+    (`SKF_NET_OFF`, `BPF_HDR_START_NET`) and the MAC header before that
+    (`SKF_LL_OFF`, `BPF_HDR_START_MAC`): the loopback's Ethernet header of
+    zeros, a veth end's from its address to its peer's (or to the
+    broadcast address), and for a broadcast's copy looped back on the
+    sending end (`dev_loopback_xmit`) the network header itself.
+    `BPF_LD_ABS` and `BPF_LD_IND` from a header reach the datagram's end;
+    `bpf_skb_load_bytes_relative` the linear part's, which is the whole
+    datagram unless
+    `__ip_append_data` or `__ip6_append_data` puts it in pages (past
+    `SKB_MAX_ALLOC` with the headers and the room they reserve), when it is
+    the UDP header's.
+  - The IPv4 header has `IP_TOS`, `DF`, a TTL of 64 and a connected
+    socket's IDs from the random one `connect` gives (else a random one);
+    the IPv6 header a hop limit of 64 and the auto flow label of the
+    datagram's hash. The UDP checksum is the pseudo-header's, as the device
+    takes the rest (`CHECKSUM_PARTIAL`), or the whole one for a datagram
+    that goes in fragments.
+  - The context's `len` is the UDP header's and the payload's; `protocol`
+    is `ETH_P_IP` or `ETH_P_IPV6`; `pkt_type` `PACKET_HOST`,
+    `PACKET_BROADCAST` or `PACKET_LOOPBACK`; `ifindex` and
+    `ingress_ifindex` the loopback's (1) or the veth end it came in on;
+    `priority` the sender's `SO_PRIORITY`, or 0 across a veth pair
+    (`____dev_forward_skb`); `hash` a connected socket's `sk_txhash`, the
+    flow's for IPv6, else 0; the rest 0. Classic loads see the same, with
+    `SKF_AD_HATYPE` `ARPHRD_LOOPBACK` or `ARPHRD_ETHER` and
+    `SKF_AD_PAY_OFFSET` 8. The helpers run as the sending task, in whose
+    context Linux's softirq runs the receive.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it

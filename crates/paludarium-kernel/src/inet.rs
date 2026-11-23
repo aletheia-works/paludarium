@@ -25,6 +25,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
+mod arrival;
+use crate::sockets::Filtered;
+
 /// The interface requests of `ioctl` ([`Network::interface`]).
 pub(crate) const SIOCGIFFLAGS: u64 = 0x8913;
 pub(crate) const SIOCSIFFLAGS: u64 = 0x8914;
@@ -1381,6 +1384,16 @@ struct State {
     inbox_size: usize,
     /// How many datagrams and queries have come, which orders them.
     received: u64,
+    /// The socket filter and its lock (`sk_filter`, `SOCK_FILTER_LOCKED`).
+    filtering: crate::sockets::FilterSlot,
+    /// The datagrams it dropped as they came (`sk_drops`): those its
+    /// filter dropped and those its full receive buffer did.
+    drops: u32,
+    /// A connected socket's last IPv4 ID, from the random one `connect`
+    /// gives (`inet_id`), and its flow hash (`sk_txhash`), which `connect`
+    /// gives too and a disconnect keeps.
+    ip_id: u16,
+    txhash: u32,
 }
 
 /// What a TCP connection has carried, for `tcp_info`: from its handshake's
@@ -1645,6 +1658,18 @@ impl Default for Options {
     }
 }
 
+impl Filtered for InetSocket {
+    fn with_filter<R>(&self, f: impl FnOnce(&mut crate::sockets::FilterSlot) -> R) -> R {
+        f(&mut self.lock().filtering)
+    }
+    fn filter_socket(&self) -> (crate::bpf_prog::FilterSocket, u32) {
+        (
+            crate::bpf_prog::FilterSocket::Inet(Weak::clone(&self.this)),
+            self.uid.load(Ordering::SeqCst),
+        )
+    }
+}
+
 /// Signal-driven I/O of a socket, as Linux's `sock_wake_async` sends it:
 /// the owner and signal `F_SETOWN` and `F_SETSIG` set, the descriptor
 /// `O_ASYNC` was set through, and its `SOCKWQ_ASYNC_WAITDATA` and
@@ -1829,8 +1854,14 @@ impl InetSocket {
         socket
     }
     /// Its cookie, given when first asked for, as `sock_gen_cookie`.
-    fn cookie(&self) -> u64 {
+    pub(crate) fn cookie(&self) -> u64 {
         *self.cookie.get_or_init(crate::sockets::new_cookie)
+    }
+    /// Random bytes from the host.
+    fn random<const N: usize>(&self) -> [u8; N] {
+        let mut b = [0; N];
+        let _ = self.host.random_bytes(&mut b);
+        b
     }
     /// The network it was made in.
     pub(crate) fn network(&self) -> &Arc<Network> {
@@ -2013,9 +2044,21 @@ impl InetSocket {
     /// never connected, or shut down for sending, is `EPIPE`; a failed one
     /// gives its pending error first. Only the guest's own loopback carries
     /// the urgent byte as such.
-    fn send(&self, bytes: &[u8], to: Option<SocketAddr>, urgent: bool) -> Result<usize, Errno> {
+    /// `write` for the task whose real user and group IDs are `ids`.
+    pub(crate) fn write_as(&self, buf: &[u8], ids: (u32, u32)) -> Result<usize, Errno> {
+        self.send(buf, None, false, ids)
+    }
+    /// Sends `bytes`, a datagram's to `to`, for the task whose real user
+    /// and group IDs are `ids`.
+    fn send(
+        &self,
+        bytes: &[u8],
+        to: Option<SocketAddr>,
+        urgent: bool,
+        ids: (u32, u32),
+    ) -> Result<usize, Errno> {
         if self.datagram {
-            return self.send_datagram(bytes, to);
+            return self.send_datagram(bytes, to, ids);
         }
         let mut s = self.lock();
         s.note();
@@ -2333,6 +2376,12 @@ impl InetSocket {
         // (`__ip6_datagram_connect`, since "ipv6: fix device binding after
         // failed datagram connect").
         let connected = self.connect_datagram_to(&mut s, address, bound, device, &options);
+        if connected.is_ok() {
+            // `ip4_datagram_connect` and `ip6_datagram_connect`: a new flow
+            // hash (`sk_set_txhash`, never 0), and a random first ID.
+            s.txhash = u32::from_le_bytes(self.random()).max(1);
+            s.ip_id = u16::from_le_bytes(self.random());
+        }
         if connected.is_err() && device != options.device {
             drop(s);
             self.options().device = options.device;
@@ -2470,7 +2519,12 @@ impl InetSocket {
     /// Any other destination is `ENETUNREACH`. Then, as Linux's
     /// `sock_alloc_send_pskb` checks them, a connected socket's pending
     /// error goes first, and a socket shut down for sending is `EPIPE`.
-    fn send_datagram(&self, bytes: &[u8], to: Option<SocketAddr>) -> Result<usize, Errno> {
+    fn send_datagram(
+        &self,
+        bytes: &[u8],
+        to: Option<SocketAddr>,
+        ids: (u32, u32),
+    ) -> Result<usize, Errno> {
         let options = *self.options();
         let mut s = self.lock();
         let to = to.or(s.peer).ok_or(EDESTADDRREQ)?;
@@ -2525,6 +2579,8 @@ impl InetSocket {
                 return Err(EMSGSIZE);
             }
             sendable(&mut s)?;
+            let sent = self.sent(&mut s, from, plain_to, &options, ids);
+            let (own_mac, mtu) = self.network.veth_link(index);
             // A broadcast one reaches each socket that takes it, here and
             // across the pair, before `sendto` returns, as both copies go
             // through the backlog of the sending CPU; a multicast one no
@@ -2539,8 +2595,22 @@ impl InetSocket {
                 };
                 self.network.noarp(index, plain_to.ip(), now);
                 drop(s);
+                let peer_index = self.network.peer_index(index);
                 for receiver in receivers {
-                    receiver.deliver(from, bytes);
+                    let way = if Arc::ptr_eq(&receiver.network, &self.network) {
+                        arrival::Way::Looped {
+                            index: index as u32,
+                            mtu,
+                        }
+                    } else {
+                        arrival::Way::Veth {
+                            index: peer_index,
+                            src: own_mac,
+                            dst: [0xff; 6],
+                            mtu,
+                        }
+                    };
+                    receiver.deliver(from, bytes, &sent, way);
                 }
                 return Ok(bytes.len());
             }
@@ -2562,7 +2632,16 @@ impl InetSocket {
                 self.network.reply(index, from.ip(), to.ip(), self.now());
             }
             match receiver {
-                Some(receiver) => receiver.deliver_on(from, bytes, self.network.peer_index(index)),
+                Some(receiver) => {
+                    let peer_index = self.network.peer_index(index);
+                    let way = arrival::Way::Veth {
+                        index: peer_index,
+                        src: own_mac,
+                        dst: there.veth_link(peer_index as i32).0,
+                        mtu,
+                    };
+                    receiver.deliver_on(from, bytes, peer_index, &sent, way);
+                }
                 None if answered && to_peer => {
                     self.lock().error = Some(ECONNREFUSED);
                     self.signals.send(Reason::Error);
@@ -2585,12 +2664,14 @@ impl InetSocket {
             sendable(&mut s)?;
             let from = self.datagram_source(&mut s, dest, &options)?;
             let to_peer = s.peer == Some(dest);
+            let sent = self.sent(&mut s, from, dest, &options, ids);
             drop(s);
             let now = self.now();
             self.network.output(dest.ip(), now);
             let receiver = self.ports().receiver(dest, from);
             if let Some(receiver) = receiver {
-                receiver.deliver_on(from, bytes, self.network.local_device(dest.ip(), now));
+                let iif = self.network.local_device(dest.ip(), now);
+                receiver.deliver_on(from, bytes, iif, &sent, arrival::Way::Loopback);
                 return Ok(bytes.len());
             }
             // A nested namespace has no stub.
@@ -2639,27 +2720,49 @@ impl InetSocket {
         }
         Ok(bytes.len())
     }
-    /// A datagram from `from` arrives, unless it would take the receive
-    /// buffer past `SO_RCVBUF` while another waits, when Linux's
-    /// `__udp_enqueue_schedule_skb` drops it: an empty buffer takes one of
-    /// any size, unless `SO_RCVBUF` is over half of `INT_MAX`.
-    fn deliver(&self, from: SocketAddr, bytes: &[u8]) {
-        self.deliver_on(from, bytes, 0);
+    /// A datagram from `from` arrives, as `sent` made it and as it came
+    /// `way`, with no device to give as its scope ID.
+    fn deliver(&self, from: SocketAddr, bytes: &[u8], sent: &arrival::Sent, way: arrival::Way) {
+        self.deliver_on(from, bytes, 0, sent, way);
     }
     /// Queues a datagram from `from` that came in on the device `iif`, which
     /// `recvfrom` gives as the scope ID of a sender that needs one
-    /// (`ipv6_iface_scope_id` of `inet6_iif`).
-    fn deliver_on(&self, from: SocketAddr, bytes: &[u8], iif: u32) {
+    /// (`ipv6_iface_scope_id` of `inet6_iif`), as `sent` made it and as it
+    /// came `way`. First the socket's filter runs on it, which may drop it
+    /// or keep only its first bytes (`sk_filter_trim_cap`); then it is
+    /// dropped if it would take the receive buffer past `SO_RCVBUF` while
+    /// another waits, as Linux's `__udp_enqueue_schedule_skb` drops it: an
+    /// empty buffer takes one of any size, unless `SO_RCVBUF` is over half
+    /// of `INT_MAX`. What it takes of the buffer is what it took as it came,
+    /// however much the filter kept. Either drop counts in `sk_drops`.
+    fn deliver_on(
+        &self,
+        from: SocketAddr,
+        bytes: &[u8],
+        iif: u32,
+        sent: &arrival::Sent,
+        way: arrival::Way,
+    ) {
         let from = scoped(from, iif);
+        let filter = self.lock().filtering.filter.clone();
+        let kept = match filter {
+            Some(filter) => sent.filter(&filter, bytes, way, &self.host),
+            None => Some(bytes.len()),
+        };
         let limit = usize::try_from(self.options().receive_buffer).unwrap_or(0);
         // A datagram from an IPv4 address goes as IPv4, to a dual-stack
         // socket too.
         let size = truesize(bytes.len(), plain(from.ip()).is_ipv4());
         let mut s = self.lock();
+        let Some(kept) = kept else {
+            s.drops = s.drops.wrapping_add(1);
+            return;
+        };
         // `SO_RCVBUF` stays under half of `INT_MAX` without
         // `SO_RCVBUFFORCE`, which is not taken here, so only the first
         // clause drops for now.
         if s.inbox_size + size > limit && (s.inbox_size > 0 || limit > (i32::MAX >> 1) as usize) {
+            s.drops = s.drops.wrapping_add(1);
             return;
         }
         let seq = s.received;
@@ -2669,12 +2772,45 @@ impl InetSocket {
             from,
             seq,
             came: self.host.clock(paludarium_host::ClockId::Realtime).ok(),
-            bytes: bytes.to_vec(),
+            bytes: bytes[..kept].to_vec(),
             size,
         });
         drop(s);
         self.signals.waking(Reason::In);
         self.hub.changed();
+    }
+    /// What a datagram from `from` to `to` that this socket sends now is
+    /// made with (`ip_make_skb`, `ip6_make_skb`), for its receivers'
+    /// filters: a connected socket's next IPv4 ID, and its flow hash.
+    fn sent(
+        &self,
+        s: &mut State,
+        from: SocketAddr,
+        to: SocketAddr,
+        options: &Options,
+        ids: (u32, u32),
+    ) -> arrival::Sent {
+        let (from, to) = (
+            SocketAddr::new(plain(from.ip()), from.port()),
+            SocketAddr::new(plain(to.ip()), to.port()),
+        );
+        let id = (s.peer.is_some() && to.is_ipv4()).then(|| {
+            s.ip_id = s.ip_id.wrapping_add(1);
+            s.ip_id
+        });
+        let hash = match s.txhash {
+            0 if to.is_ipv6() => arrival::flow_hash(from, to, &self.host),
+            hash => hash,
+        };
+        arrival::Sent::new(
+            from,
+            to,
+            options.type_of_service as u8,
+            id,
+            hash,
+            options.priority as u32,
+            ids,
+        )
     }
     /// The first datagram that has come, a guest socket's or the stub's
     /// ready answer, in the order they came: its sender and bytes, whether
@@ -3573,8 +3709,14 @@ impl FileHandle for InetSocket {
         self.receive(buf, false, !self.nonblocking())
             .map(|received| received.count)
     }
+    /// A write with no task to name, as a splice's: as the socket's
+    /// owner. `write` itself sends through [`Self::write_as`].
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
-        self.send(buf, None, false)
+        let ids = (
+            self.uid.load(Ordering::SeqCst),
+            self.gid.load(Ordering::SeqCst),
+        );
+        self.send(buf, None, false, ids)
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)
@@ -3792,7 +3934,7 @@ impl InetSocket {
             priority: options.priority as u32,
             port_locked: s.port_locked,
             received: received as u32,
-            drops: s.listen.as_ref().map_or(0, |listen| listen.drops),
+            drops: s.listen.as_ref().map_or(s.drops, |listen| listen.drops),
             tcp: (!self.datagram).then(|| self.tcp_info(&s, now)),
             receive_buffer: options.receive_buffer as u32,
             send_buffer: options.send_buffer as u32,
@@ -4378,13 +4520,14 @@ fn send(
     }
     // TCP ignores the address of a connected socket's send.
     let to = if socket.datagram { to } else { None };
+    let ids = (c.process.credentials.uid, c.process.credentials.gid);
     crate::files::write_with(
         c,
         file,
         bytes,
         flags & MSG_NOSIGNAL != 0,
         flags & MSG_DONTWAIT != 0,
-        |part| socket.send(part, to, flags & MSG_OOB != 0),
+        |part| socket.send(part, to, flags & MSG_OOB != 0, ids),
     )
 }
 /// Receives for recvfrom or recvmsg: `MSG_PEEK` keeps the bytes, and on
@@ -4473,6 +4616,22 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         (1, 16 | 34 | 76 | 83) => {
             option_int(c, at, len)?;
             return Err(EOPNOTSUPP);
+        }
+        // `SO_ATTACH_FILTER`, `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and
+        // `SO_ATTACH_BPF`, as a socket pair takes them; the socket's lock,
+        // not its options', holds the filter.
+        (1, 26 | 27 | 44 | 50) => {
+            let value = option_int(c, at, len)?;
+            drop(options);
+            return crate::sockets::set_filter(
+                c,
+                socket,
+                name as u32,
+                at,
+                len as u32 as i32,
+                value,
+            )
+            .unwrap_or(Err(ENOPROTOOPT));
         }
         (1, 20 | 21 | 66 | 67) => {
             if (len as u32 as i32) < 16 {
@@ -4630,6 +4789,8 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
     }
     let value: Vec<u8> = match (level, name) {
         (1, 16 | 34 | 76 | 83) => return Err(EOPNOTSUPP),
+        // `SO_GET_FILTER`.
+        (1, 26) => return crate::sockets::get_filter(c, socket, at, len_at, room as i32),
         (1, _) if Timestamps::is_option(name as u32) => options.timestamps.get(name as u32),
         (1, 20 | 21 | 66 | 67) => {
             let timeout = if matches!(name, 20 | 66) {
@@ -4668,6 +4829,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (1, 12) => options.priority,
                 (1, 15) => i32::from(options.reuse_port),
                 (1, 30) => i32::from(socket.lock().listen.is_some()),
+                (1, 44) => i32::from(socket.with_filter(|slot| slot.locked)),
                 (1, 38) => {
                     if tcp {
                         6

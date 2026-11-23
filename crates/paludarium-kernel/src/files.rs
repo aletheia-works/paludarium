@@ -6126,6 +6126,16 @@ fn write_io_with(
             socket.send(b, &mut Vec::new(), sender)
         });
     }
+    // An INET socket's datagram filters run as its writer.
+    if let Some(socket) = file
+        .as_any()
+        .and_then(|a| a.downcast_ref::<crate::inet::InetSocket>())
+    {
+        let ids = (c.process.credentials.uid, c.process.credentials.gid);
+        return write_with(c, file, bytes, nosignal, dontwait, |b| {
+            socket.write_as(b, ids)
+        });
+    }
     let written = write_with(c, file, bytes, nosignal, dontwait, |b| file.write(b))?;
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &**file);

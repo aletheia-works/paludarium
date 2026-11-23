@@ -75,9 +75,13 @@ const REGIONS: u64 = 1 << 24;
 /// The packet's linear part (`skb->data`), the last region, which only
 /// converted classic programs read.
 const PACKET: u64 = REGIONS - 1;
+/// The packet's device (`skb->dev`), below the packet's region, which only
+/// converted classic programs read: its index, then its type
+/// ([`classic::field::DEV_TYPE`]).
+const DEVICE: u64 = PACKET - 1;
 /// The stacks of the callees' frames, frame `f` in region `CALLEES + f`
-/// (the main program's is [`STACK`]), below the packet's.
-const CALLEES: u64 = PACKET - FRAMES as u64;
+/// (the main program's is [`STACK`]), below the device's.
+const CALLEES: u64 = DEVICE - FRAMES as u64;
 
 /// The region of frame `f`'s stack.
 fn frame_region(f: usize) -> u64 {
@@ -141,17 +145,22 @@ pub(crate) mod classic {
         pub const VLAN_ALL: i16 = 20;
         pub const VLAN_TCI: i16 = 24;
         pub const VLAN_PROTO: i16 = 28;
+        pub const PRIORITY: i16 = 32;
+        pub const INGRESS_IFINDEX: i16 = 36;
+        pub const IFINDEX: i16 = 40;
         pub const HASH: i16 = 68;
         pub const DATA: i16 = 192;
         pub const DATA_LEN: i16 = 200;
         pub const DEV: i16 = 208;
+        /// Where `dev->type` is in the device's region, after its index.
+        pub const DEV_TYPE: i16 = 4;
     }
 }
 
 /// `SKF_NET_OFF`, where a classic load's negative offsets from the network
-/// header start, and `SKF_LL_OFF`, from the MAC header, which an AF_UNIX
-/// message has not set.
+/// header start, and `SKF_LL_OFF`, from the MAC header.
 const NET_OFF: i32 = -0x10_0000;
+const LL_OFF: i32 = -0x20_0000;
 
 /// The clocks the `bpf_ktime_get_*` helpers read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,17 +196,89 @@ pub(crate) trait Kernel {
 
 /// The packet a socket filter runs on.
 pub(crate) struct Packet<'a> {
-    /// Every byte of it (`skb->len`).
+    /// Every byte of it from `skb->data` on (`skb->len`).
     pub(crate) data: &'a [u8],
-    /// How many of them are in the linear part (`skb_headlen`), which
-    /// `bpf_skb_load_bytes_relative` reads from the network header on.
+    /// How many of them are in the linear part (`skb_headlen`).
     pub(crate) linear: usize,
+    /// The headers before `skb->data`, which the linear part holds too:
+    /// the MAC header, if one is set, and the network header.
+    pub(crate) headers: &'a [u8],
+    /// Where in [`Self::headers`] the MAC header starts
+    /// (`skb_mac_header`), if it is set (`skb_mac_header_was_set`).
+    pub(crate) mac: Option<usize>,
+    /// Where in [`Self::headers`] the network header starts
+    /// (`skb_network_header`).
+    pub(crate) network: usize,
+    /// Its `sk_buff`'s fields.
+    pub(crate) skb: Skb,
+}
+
+/// The `sk_buff` fields of a packet that a filter reads, other than its
+/// bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Skb {
+    /// `pkt_type` (`PACKET_HOST`, `PACKET_BROADCAST`, `PACKET_LOOPBACK`
+    /// and so on).
+    pub(crate) pkt_type: u32,
+    pub(crate) mark: u32,
+    pub(crate) priority: u32,
+    /// `protocol`, as it is in memory: in network order.
+    pub(crate) protocol: [u8; 2],
+    /// `skb_iif`.
+    pub(crate) ingress_ifindex: u32,
+    pub(crate) hash: u32,
+    /// `dev`: its index and type (`ARPHRD_*`), if there is one.
+    pub(crate) device: Option<(u32, u16)>,
+    /// What `__skb_get_poff` finds: where the payload past the transport
+    /// header starts, from `skb->data`, or 0 when the flow dissector does
+    /// not know the protocol.
+    pub(crate) payload_offset: u32,
 }
 
 impl<'a> Packet<'a> {
-    /// The linear part.
+    /// An AF_UNIX message of `data`, `linear` of its bytes in the linear
+    /// part: its network header is where the data starts, and it has no
+    /// MAC header, device or protocol.
+    pub(crate) fn message(data: &'a [u8], linear: usize) -> Self {
+        Self {
+            data,
+            linear,
+            headers: &[],
+            mac: None,
+            network: 0,
+            skb: Skb::default(),
+        }
+    }
+
+    /// The linear part from `skb->data` on.
     fn head(&self) -> &'a [u8] {
         &self.data[..self.linear.min(self.data.len())]
+    }
+
+    /// `size` bytes at `offset` from the header that starts at `start` in
+    /// [`Self::headers`], which must end by the linear part's end
+    /// (`skb_tail_pointer`), or with `paged` by the packet's.
+    fn header_bytes(
+        &self,
+        start: usize,
+        offset: usize,
+        size: usize,
+        paged: bool,
+    ) -> Option<Vec<u8>> {
+        let at = start.checked_add(offset)?;
+        let end = at.checked_add(size)?;
+        let data = if paged { self.data } else { self.head() };
+        if end > self.headers.len() + data.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        for i in at..end {
+            out.push(match self.headers.get(i) {
+                Some(&b) => b,
+                None => self.data[i - self.headers.len()],
+            });
+        }
+        Some(out)
     }
 }
 
@@ -233,6 +314,25 @@ pub(crate) fn run(
     let mut context = [0; CONTEXT_WITH_TAIL];
     let len = u32::try_from(packet.data.len()).map_err(|_| Fault)?;
     context[0..4].copy_from_slice(&len.to_le_bytes());
+    let skb = &packet.skb;
+    let mut put = |at: i16, value: u32| {
+        let at = at as usize;
+        context[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    put(classic::field::PKT_TYPE, skb.pkt_type);
+    put(classic::field::MARK, skb.mark);
+    put(
+        classic::field::PROTOCOL,
+        u32::from(u16::from_le_bytes(skb.protocol)),
+    );
+    put(classic::field::PRIORITY, skb.priority);
+    put(classic::field::INGRESS_IFINDEX, skb.ingress_ifindex);
+    put(classic::field::IFINDEX, skb.device.map_or(0, |d| d.0));
+    put(classic::field::HASH, skb.hash);
+    if skb.device.is_some() {
+        let at = classic::field::DEV as usize;
+        context[at..at + 8].copy_from_slice(&address(DEVICE, 0).to_le_bytes());
+    }
     let data = address(PACKET, 0).to_le_bytes();
     let at = classic::field::DATA as usize;
     context[at..at + 8].copy_from_slice(&data);
@@ -562,7 +662,7 @@ impl Machine<'_, '_> {
     fn frame(&mut self, region: u64) -> Option<&mut [u8; STACK_SIZE]> {
         match region {
             STACK => Some(&mut self.stack[0]),
-            r if r > CALLEES && r < PACKET => Some(&mut self.stack[(r - CALLEES) as usize]),
+            r if r > CALLEES && r < DEVICE => Some(&mut self.stack[(r - CALLEES) as usize]),
             _ => None,
         }
     }
@@ -572,13 +672,21 @@ impl Machine<'_, '_> {
         let end = offset + out.len();
         match region {
             STACK => out.copy_from_slice(self.stack[0].get(offset..end).ok_or(Fault)?),
-            r if r > CALLEES && r < PACKET => out.copy_from_slice(
+            r if r > CALLEES && r < DEVICE => out.copy_from_slice(
                 self.stack[(r - CALLEES) as usize]
                     .get(offset..end)
                     .ok_or(Fault)?,
             ),
             CONTEXT => out.copy_from_slice(self.context.get(offset..end).ok_or(Fault)?),
             PACKET => out.copy_from_slice(self.packet.head().get(offset..end).ok_or(Fault)?),
+            DEVICE => {
+                let (index, kind) = self.packet.skb.device.ok_or(Fault)?;
+                let mut device = [0; 8];
+                device[..4].copy_from_slice(&index.to_le_bytes());
+                let at = classic::field::DEV_TYPE as usize;
+                device[at..at + 2].copy_from_slice(&kind.to_le_bytes());
+                out.copy_from_slice(device.get(offset..end).ok_or(Fault)?);
+            }
             r if (VALUES..CALLEES).contains(&r) => {
                 let value = self.values.get((r - VALUES) as usize).ok_or(Fault)?;
                 value.read(offset, out).map_err(|_| Fault)?;
@@ -803,13 +911,18 @@ impl Machine<'_, '_> {
             func::SKB_LOAD_BYTES_RELATIVE => {
                 self.context_arg()?;
                 let (offset, len) = (r2 as u32, r4 as u32 as usize);
-                let linear = self.packet.head();
-                // No MAC header is set; the network header is where the
-                // data starts; anything else is EFAULT.
-                let bytes = (offset <= 0xffff && r5 as u32 == 1)
-                    .then(|| linear.get(offset as usize..(offset as usize).checked_add(len)?))
-                    .flatten();
-                self.give(r3, len, bytes)?
+                // From the MAC header (`BPF_HDR_START_MAC`), if one is
+                // set, or the network header (`BPF_HDR_START_NET`), to the
+                // linear part's end; anything else is EFAULT.
+                let start = match r5 as u32 {
+                    0 => self.packet.mac,
+                    1 => Some(self.packet.network),
+                    _ => None,
+                };
+                let bytes = start
+                    .filter(|_| offset <= 0xffff)
+                    .and_then(|start| self.packet.header_bytes(start, offset as usize, len, false));
+                self.give(r3, len, bytes.as_deref())?
             }
             classic::LOAD_BYTE | classic::LOAD_HALF | classic::LOAD_WORD => {
                 self.context_arg()?;
@@ -824,10 +937,9 @@ impl Machine<'_, '_> {
                 self.context_arg()?;
                 self.nlattr(r2 as u32, r3 as u32, id == classic::NLATTR_NEST)
             }
-            // The flow dissector knows no AF_UNIX message's protocol.
             classic::PAY_OFFSET => {
                 self.context_arg()?;
-                0
+                u64::from(self.packet.skb.payload_offset)
             }
             classic::CPU => u64::from(self.kernel.processor()),
             classic::RANDOM => u64::from(self.kernel.random()),
@@ -836,19 +948,30 @@ impl Machine<'_, '_> {
     }
 
     /// `bpf_skb_load_helper_8`, `_16` and `_32`: the packet's `size` bytes
-    /// at `offset`, big-endian, where a negative one is from the network
-    /// header (the data's start, `SKF_NET_OFF`) or the MAC header (not set,
-    /// `SKF_LL_OFF`); `-EFAULT` past the end, or for no header.
+    /// at `offset`, big-endian, from the data, or for a negative one from
+    /// the network header (`SKF_NET_OFF`) or the MAC header, if one is set
+    /// (`SKF_LL_OFF`), as `bpf_skb_load_helper_convert_offset` takes it
+    /// and `skb_copy_bits` reads it, to the packet's end; `-EFAULT` past
+    /// the end, or for no header.
     fn load(&self, offset: i32, size: usize) -> u64 {
-        let offset = match offset {
-            o if o >= 0 => Some(o),
-            o if o >= NET_OFF => Some(o - NET_OFF),
+        let bytes = match offset {
+            o if o >= 0 => {
+                let o = o as usize;
+                self.packet
+                    .data
+                    .get(o..o.saturating_add(size))
+                    .map(<[u8]>::to_vec)
+            }
+            o if o >= NET_OFF => {
+                self.packet
+                    .header_bytes(self.packet.network, (o - NET_OFF) as usize, size, true)
+            }
+            o if o >= LL_OFF => self.packet.mac.and_then(|mac| {
+                self.packet
+                    .header_bytes(mac, (o - LL_OFF) as usize, size, true)
+            }),
             _ => None,
         };
-        let bytes = offset.and_then(|o| {
-            let o = o as usize;
-            self.packet.data.get(o..o.checked_add(size)?)
-        });
         match bytes {
             Some(b) => b.iter().fold(0, |v, &b| v << 8 | u64::from(b)),
             None => (-i64::from(Errno::EFAULT.0)) as u64,
@@ -1025,10 +1148,7 @@ pub(crate) mod tests {
             maps: &[],
             loads: &loads,
         };
-        let packet = Packet {
-            data,
-            linear: data.len(),
-        };
+        let packet = Packet::message(data, data.len());
         run(&program, &packet, &mut Quiet)
     }
 
@@ -1278,10 +1398,7 @@ pub(crate) mod tests {
                 i(0x07, 0, 0, 0, 0x100),
                 exit(),
             ];
-            let packet = Packet {
-                data: &data,
-                linear: 3,
-            };
+            let packet = Packet::message(&data, 3);
             let loads = BTreeMap::new();
             let program = Program {
                 insns: &p,
@@ -1304,6 +1421,69 @@ pub(crate) mod tests {
         assert_eq!(ld(0x50, 7, -2), 0x01 + 0x100);
         assert_eq!(ld(0x50, 7, -3), 0);
         assert_eq!(ld(0x48, 7, -0x10_0000 - 1), 0x0203 + 0x100);
+    }
+
+    #[test]
+    fn headers_before_the_data_reach_the_linear_part_s_end() {
+        let data: Vec<u8> = (1..=8).collect();
+        // A MAC header of 2 bytes and a network header of 2 before the
+        // data, of which 3 bytes are linear.
+        let headers = [0x0a, 0x0b, 0x0c, 0x0d];
+        let skb = Skb {
+            protocol: [0x08, 0x00],
+            device: Some((7, 772)),
+            ..Skb::default()
+        };
+        let run_one = |p: &[Insn]| {
+            let packet = Packet {
+                data: &data,
+                linear: 3,
+                headers: &headers,
+                mac: Some(0),
+                network: 2,
+                skb,
+            };
+            let loads = BTreeMap::new();
+            let program = Program {
+                insns: p,
+                maps: &[],
+                loads: &loads,
+            };
+            run(&program, &packet, &mut Quiet).unwrap()
+        };
+        // R6 = ctx, R0 = the load + 0x100, or 0.
+        let ld = |code: u8, imm: i32| {
+            run_one(&[
+                i(0xbf, 6, 1, 0, 0),
+                i(code, 0, 0, 0, imm),
+                i(0x07, 0, 0, 0, 0x100),
+                exit(),
+            ])
+        };
+        assert_eq!(ld(0x30, -0x10_0000), 0x0c + 0x100);
+        assert_eq!(ld(0x30, -0x10_0000 + 2), 0x01 + 0x100);
+        assert_eq!(ld(0x30, -0x10_0000 + 4), 0x03 + 0x100);
+        // Past the linear part too, to the packet's end.
+        assert_eq!(ld(0x30, -0x10_0000 + 9), 0x08 + 0x100);
+        assert_eq!(ld(0x30, -0x10_0000 + 10), 0);
+        assert_eq!(ld(0x30, -0x20_0000), 0x0a + 0x100);
+        assert_eq!(ld(0x20, -0x20_0000 + 1), 0x0b0c_0d01 + 0x100);
+        assert_eq!(ld(0x30, -0x20_0000 - 1), 0);
+        // Past the linear part from the data's start is fine.
+        assert_eq!(ld(0x30, 7), 0x08 + 0x100);
+        // The context's fields, and the device a converted program reads.
+        let field = |off: i16| run_one(&[i(0x61, 0, 1, off, 0), exit()]);
+        assert_eq!(field(classic::field::PROTOCOL), 8);
+        assert_eq!(field(classic::field::IFINDEX), 7);
+        let device = |off: i16| {
+            run_one(&[
+                i(0x79, 2, 1, classic::field::DEV, 0),
+                i(0x69, 0, 2, off, 0),
+                exit(),
+            ])
+        };
+        assert_eq!(device(0), 7);
+        assert_eq!(device(classic::field::DEV_TYPE), 772);
     }
 
     #[test]
@@ -1576,10 +1756,7 @@ pub(crate) mod tests {
                     maps: &[],
                     loads: &verified.loads,
                 };
-                let packet = Packet {
-                    data: &data,
-                    linear: data.len(),
-                };
+                let packet = Packet::message(&data, data.len());
                 assert!(
                     run(&program, &packet, &mut Quiet).is_ok(),
                     "{p:?} faulted on {len} bytes"

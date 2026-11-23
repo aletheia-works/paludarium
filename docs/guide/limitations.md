@@ -366,12 +366,19 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps and socket filters on AF_UNIX sockets only**: `bpf` makes
+- **BPF, maps and socket filters on AF_UNIX and UDP sockets only**: `bpf` makes
   arrays, hashes, LRU hashes, longest-prefix-match tries, queues, stacks,
   bloom filters, and arrays and hashes of maps, and loads socket filters,
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
-  or packet socket; on an internet socket the options are `ENOPROTOOPT`.
+  or packet socket and on a UDP socket. A TCP socket takes the options as
+  Linux does, but its filter does not run yet, and `SO_BPF_EXTENSIONS` is
+  `ENOPROTOOPT` on an internet socket (64 on Linux). On a UDP socket no
+  filter runs on the DNS stub's answers, which come through no device
+  here; a datagram that Linux sends in fragments across a veth pair comes
+  whole, though its filter sees the reassembled one's linear part and
+  checksum; the IPv4 ID, the IPv6 flow label and `skb->hash` are random,
+  as on Linux, but not drawn as Linux draws them.
   No JIT compiles a program: the interpreter runs it. Of the helpers'
   values, the processor is 0, a network namespace's cookie is 1 (the
   initial one's) in every namespace, the boot and coarse clocks are the
@@ -967,8 +974,8 @@ verified.
     socket goes, where Linux's garbage collector closes them a little
     later, from a work queue.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
-  whose effect is not modelled, where Linux takes them: filters and the
-  other options Linux has. No security module is modelled, so `SO_PASSSEC`
+  whose effect is not modelled, where Linux takes them: filters on sockets
+  other than AF_UNIX and internet ones, and the other options Linux has. No security module is modelled, so `SO_PASSSEC`
   brings no `SCM_SECURITY` and `SO_PEERSEC` is `ENOPROTOOPT`, as on a Linux
   without one; with SELinux, Linux gives the sender's or peer's context, and
   with AppArmor `SO_PEERSEC` gives the peer's label. `SO_RCVTIMEO` and

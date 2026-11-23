@@ -100,7 +100,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX のソケットにアタッチします（下を参照） |
+| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX と UDP のソケットにアタッチします（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -2801,7 +2801,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     クラス、待ち受け中か閉じていれば `IPV6_V6ONLY` を伝えます。続けて、`CAP_NET_ADMIN`
     にはマーク、クラスとして優先度、cgroup、オプション（`inet_diag_sockopt`）、メモリ
     （UDP のソケットのデータグラムは `udp_rmem_schedule` と同じくページ単位で数えたもの、
-    バッファー、リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの
+    バッファー、UDP のソケットのフィルターかいっぱいのバッファーが落としたデータグラムの数、
+    リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの
     `tcp_info`（`ss -i` が見せる `INET_DIAG_INFO`）と輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
     については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
@@ -4425,6 +4426,40 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ブロック単位で `*len` に返します。`*len` が 0 なら数だけを問い合わせ、足りなければ
     `EINVAL` です。
   - `SO_BPF_EXTENSIONS` は 64（`SKF_AD_MAX`）を返します。
+
+- UDP のソケット（IPv4 と IPv6）でも、フィルターは同じオプションを取り、ループバックか
+  veth ペアを通って届くデータグラムごとに、Linux の `udp_queue_rcv_one_skb` と
+  `udpv6_queue_rcv_one_skb` が `sk_filter_trim_cap` を動かすのと同じく動きます。受信
+  バッファの確認の前なので、捨てたデータグラムはキューに入りません。0 なら捨て、それ以外の
+  値なら UDP ヘッダから数えてその数のバイトを残し、ヘッダはいつも残します。受け取るもの
+  （と `FIONREAD`）はその残りです。データグラムは、届いたときの大きさの分だけ受信
+  バッファを使います。フィルターによるものも、バッファがいっぱいなためのものも、捨てた
+  数は `sk_drops`（`INET_DIAG_SKMEMINFO`）に数えます。フィルターは Linux 7.0 が作る
+  `sk_buff` の上で動きます。
+  - `skb->data` は UDP ヘッダにあり、その前に IP ヘッダ（`SKF_NET_OFF`、
+    `BPF_HDR_START_NET`）、さらにその前に MAC ヘッダ（`SKF_LL_OFF`、
+    `BPF_HDR_START_MAC`）があります。MAC ヘッダは、ループバックではゼロの Ethernet
+    ヘッダ、veth の端ではそのアドレスから相手のアドレス（かブロードキャストアドレス）への
+    もの、送った端で折り返すブロードキャストの写し（`dev_loopback_xmit`）ではネットワーク
+    ヘッダそのものです。ヘッダからの `BPF_LD_ABS` と `BPF_LD_IND` はデータグラムの終わり
+    まで、`bpf_skb_load_bytes_relative` は線形部分の終わりまで届きます。線形部分は
+    データグラム全体ですが、`__ip_append_data` か `__ip6_append_data` がページに置く
+    とき（ヘッダと確保する余白を合わせて `SKB_MAX_ALLOC` を超えるとき）は UDP ヘッダの
+    終わりまでです。
+  - IPv4 のヘッダには `IP_TOS`、`DF`、64 の TTL と、接続したソケットなら `connect` が
+    決める乱数から続く ID（ほかは乱数）が入ります。IPv6 のヘッダには 64 のホップ限度と、
+    データグラムのハッシュから作る自動のフローラベルが入ります。UDP のチェックサムは、
+    残りをデバイスが計算する擬似ヘッダの分だけ（`CHECKSUM_PARTIAL`）で、フラグメントに
+    分けて送るデータグラムでは全体のものです。
+  - コンテキストの `len` は UDP ヘッダとペイロードの長さ、`protocol` は `ETH_P_IP` か
+    `ETH_P_IPV6`、`pkt_type` は `PACKET_HOST`、`PACKET_BROADCAST` か
+    `PACKET_LOOPBACK`、`ifindex` と `ingress_ifindex` はループバック（1）か、届いた veth
+    の端、`priority` は送り手の `SO_PRIORITY` で、veth ペアを越えると 0
+    （`____dev_forward_skb`）、`hash` は接続したソケットの `sk_txhash`、IPv6 ではフロー
+    のもの、ほかは 0 で、残りは 0 です。古典的な読み出しも同じものを見て、`SKF_AD_HATYPE`
+    は `ARPHRD_LOOPBACK` か `ARPHRD_ETHER`、`SKF_AD_PAY_OFFSET` は 8 です。ヘルパーは
+    送ったタスクとして動きます。Linux のソフト割り込みが受信をそのコンテキストで動かすため
+    です。
 
 - 古典的なフィルター（`SO_ATTACH_FILTER`、`struct sock_fprog`。ほかの大きさは `EINVAL`）は、
   Linux の `bpf_check_classic` と同じく確かめ、`bpf_convert_filter` と同じく命令ごとに

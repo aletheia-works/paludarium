@@ -1632,3 +1632,40 @@ fn commands_past_master_s_last_are_einval() {
         );
     }
 }
+
+/// A missing name with a dot is a BPF file system's `EPERM` only once the
+/// walk reaches its directory: one the thread may not search is `EACCES`.
+#[test]
+fn a_dotted_name_is_eperm_only_past_the_search() {
+    let (mut k, mut t, m) = setup();
+    let put = |at: u64, text: &str| {
+        m.write(GuestAddr(DATA + at), format!("{text}\0").as_bytes())
+            .unwrap();
+        DATA + at
+    };
+    let (dir, kind, locked) = (
+        put(0xa00, "/pins"),
+        put(0xa20, "bpf"),
+        put(0xa40, "/pins/locked"),
+    );
+    let (hidden, open_name) = (put(0xa80, "/pins/locked/a.b"), put(0xac0, "/pins/a.b"));
+    assert_eq!(syscall(&mut k, &mut t, &m, 83, [dir, 0o755, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 165, [kind, dir, kind, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [locked, 0o700, 0, 0, 0, 0]),
+        0
+    );
+    // setuid(1000): no longer root, nor able to search `locked`.
+    assert_eq!(syscall(&mut k, &mut t, &m, 105, [1000, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [hidden, 0o755, 0, 0, 0, 0]),
+        errno(Errno::EACCES)
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [open_name, 0o755, 0, 0, 0, 0]),
+        errno(Errno::EPERM)
+    );
+}

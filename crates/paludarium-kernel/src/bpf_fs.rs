@@ -43,10 +43,15 @@ pub(crate) fn lookup(c: &Context<'_>, p: &[u8]) -> Result<(), Errno> {
     if name == b"." || name == b".." || !name.contains(&b'.') {
         return Ok(());
     }
-    if c.files.fs().metadata(p, false).is_err() && on_bpffs(c, &dir, true).is_some() {
-        return Err(Errno::EPERM);
+    if c.files.fs().metadata(p, false).is_ok() || on_bpffs(c, &dir, true).is_none() {
+        return Ok(());
     }
-    Ok(())
+    // The walk to the directory comes first: a directory the thread may
+    // not search is the call's own error (`EACCES`), not this one.
+    if crate::permissions::search(c.files, &c.process.credentials, AT_FDCWD, p, false).is_err() {
+        return Ok(());
+    }
+    Err(Errno::EPERM)
 }
 
 /// What a BPF file system refuses of an open at `p` with `flags`: an

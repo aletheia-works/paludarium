@@ -28,6 +28,8 @@ from evidence import (
     snapshot,
 )
 
+# An advisory exception the user never approved.
+OTHER_ADVISORY = {"id": "RUSTSEC-0000-0000", "crate": "x@1", "reason": "unapproved"}
 # The smallest root policy a guest policy can be made from.
 EMPTY = b"[advisories]\n" + ROOT_IGNORE
 
@@ -88,14 +90,17 @@ class PolicyTests(unittest.TestCase):
                 policy(root)
 
     def test_other_advisory_exceptions_rejected(self):
-        extra = {"id": "RUSTSEC-0000-0000", "crate": "x@1"}
-        for advisories in (
-            ADVISORY_EXCEPTIONS[:-1],
-            [*ADVISORY_EXCEPTIONS, extra],
-            [{**ADVISORY_EXCEPTIONS[0], "id": "RUSTSEC-0000-0000"}, *ADVISORY_EXCEPTIONS[1:]],
-            [*ADVISORY_EXCEPTIONS[:-1], {**ADVISORY_EXCEPTIONS[-1], "crate": "url@2.5.9"}],
-            [*ADVISORY_EXCEPTIONS[:-1], {**ADVISORY_EXCEPTIONS[-1], "reason": "other"}],
-        ):
+        cases = [[*ADVISORY_EXCEPTIONS, OTHER_ADVISORY]]
+        # A changed or missing entry, while there is one to change.
+        if ADVISORY_EXCEPTIONS:
+            *rest, last = ADVISORY_EXCEPTIONS
+            cases += [
+                rest,
+                [*rest, {**last, "id": "RUSTSEC-0000-0000"}],
+                [*rest, {**last, "crate": "other@0.0.0"}],
+                [*rest, {**last, "reason": "other"}],
+            ]
+        for advisories in cases:
             with self.assertRaises(ValueError):
                 policy(EMPTY, advisories=advisories)
 
@@ -189,9 +194,12 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
             receipt["license_policy"]["exceptions"] = copy.deepcopy(LICENSE_EXCEPTIONS)
-            receipt["license_policy"]["advisories"] = ADVISORY_EXCEPTIONS[:-1]
-            with self.assertRaises(ValueError):
-                policy_receipt_valid(directory, receipt, root)
+            for advisories in (ADVISORY_EXCEPTIONS[:-1], [*ADVISORY_EXCEPTIONS, OTHER_ADVISORY]):
+                if advisories == ADVISORY_EXCEPTIONS:
+                    continue
+                receipt["license_policy"]["advisories"] = advisories
+                with self.assertRaises(ValueError):
+                    policy_receipt_valid(directory, receipt, root)
             receipt["license_policy"]["advisories"] = copy.deepcopy(ADVISORY_EXCEPTIONS)
             policy_receipt_valid(directory, receipt, root)
             receipt["audits"]["aube"] = 4

@@ -28,11 +28,10 @@ COREUTILS_LICENSE_EXCEPTIONS = [{"crate": "notify@8.2.2", "allow": ["CC0-1.0"]}]
 COREUTILS_LICENSE_SUFFIX = (
     b'\n[[licenses.exceptions]]\ncrate = "notify@8.2.2"\nallow = ["CC0-1.0"]\n'
 )
-# RustSec advisories aube's audit ignores for now, each with the reason its
-# ignore entry gives. RUSTSEC-2026-0592 is against url 2.5.8, which aube
-# 2.10.1's Cargo.lock has through hickory-net, hickory-resolver and reqwest,
-# and url 2.5.9 fixes; the user allowed it on 2026-11-22 until the pinned aube
-# release locks url 2.5.9 or later.
+# RustSec advisories aube's audit ignores for now, each approved by the user
+# until the pinned aube release no longer locks the crate, with the reason its
+# ignore entry gives. source-lock.json lists the same; scripts/bump-pins.py
+# drops an entry from both when a release's Cargo.lock no longer has its crate.
 ADVISORY_EXCEPTIONS = [
     {
         "id": "RUSTSEC-2026-0592",

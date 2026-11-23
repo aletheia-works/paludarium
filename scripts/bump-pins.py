@@ -3,10 +3,13 @@
 
     bump-pins.py toolchain --body body.md      # rust-toolchain.toml, source-lock.json
     bump-pins.py rust-version --body body.md   # Cargo.toml: the latest stable Rust
-    bump-pins.py aube --body body.md           # source-lock.json, the feature pages
+    bump-pins.py aube --body body.md           # source-lock.json, evidence.py, the feature pages
     bump-pins.py ripgrep --body body.md        # the same for ripgrep
     bump-pins.py coreutils --body body.md      # the same for uutils coreutils
     bump-pins.py --self-test
+
+A guest's bump also drops each of its advisory exceptions whose crate the
+release's Cargo.lock no longer has, since the audit denies an unused one.
 
 When the pin moves, the pull request title goes to stdout and its body to
 --body; when the pin is already the latest, nothing is printed.
@@ -14,6 +17,7 @@ When the pin moves, the pull request title goes to stdout and its body to
 """
 
 import argparse
+import ast
 import datetime
 import hashlib
 import json
@@ -29,6 +33,7 @@ TOOLCHAIN_FILE = "rust-toolchain.toml"
 WORKSPACE_MANIFEST = "Cargo.toml"
 SOURCE_LOCK = "tests/guests/programs/source-lock.json"
 FEATURE_PAGES = ("docs/guide/features.md", "docs/ja/guide/features.md")
+EVIDENCE = "tests/guests/programs/evidence.py"
 DIST = "https://static.rust-lang.org/dist"
 # The guests built from a fixed release: their GitHub repositories.
 GUESTS = {
@@ -36,6 +41,9 @@ GUESTS = {
     "ripgrep": "BurntSushi/ripgrep",
     "coreutils": "uutils/coreutils",
 }
+# The guests whose audit ignores advisories: the source-lock.json key and the
+# evidence.py list that both hold the exceptions.
+GUEST_ADVISORIES = {"aube": ("guest_advisory_exceptions", "ADVISORY_EXCEPTIONS")}
 # What a guest's bump must also check, beyond its build, audit and tests.
 GUEST_NOTES = {
     "coreutils": [
@@ -173,6 +181,76 @@ def edit_line(path, marker, old, new):
     file.write_text("".join(lines))
 
 
+def locked_crates(cargo_lock):
+    """Every package of a Cargo.lock as "name@version"."""
+    packages = tomllib.loads(cargo_lock.decode()).get("package", [])
+    return {f"{package['name']}@{package['version']}" for package in packages}
+
+
+def json_exceptions(exceptions):
+    """The list as source-lock.json writes it under its top-level key."""
+    return json.dumps(exceptions, indent=2).replace("\n", "\n  ")
+
+
+def python_exceptions(variable, exceptions):
+    """The list as evidence.py assigns it, in the formatter's style."""
+    if not exceptions:
+        return f"{variable} = []\n"
+    lines = [f"{variable} = ["]
+    for exception in exceptions:
+        lines.append("    {")
+        lines += [f"        {json.dumps(k)}: {json.dumps(v)}," for k, v in exception.items()]
+        lines.append("    },")
+    return "\n".join([*lines, "]"]) + "\n"
+
+
+def json_value_span(text, key):
+    """Where the value of the one top-level `key` of source-lock.json is."""
+    marker = f'\n  "{key}": '
+    if text.count(marker) != 1:
+        raise SystemExit(f"{SOURCE_LOCK}: expected one {key}, found {text.count(marker)}")
+    start = text.index(marker) + len(marker)
+    value, end = json.JSONDecoder().raw_decode(text, start)
+    return value, start, end
+
+
+def python_assignment_span(text, variable):
+    """The lines of evidence.py that assign `variable`, and its value."""
+    nodes = [
+        node
+        for node in ast.parse(text).body
+        if isinstance(node, ast.Assign)
+        and [getattr(target, "id", None) for target in node.targets] == [variable]
+    ]
+    if len(nodes) != 1:
+        raise SystemExit(f"{EVIDENCE}: expected one {variable}, found {len(nodes)}")
+    lines = text.splitlines(keepends=True)
+    start = sum(len(line) for line in lines[: nodes[0].lineno - 1])
+    end = sum(len(line) for line in lines[: nodes[0].end_lineno])
+    return ast.literal_eval(nodes[0].value), start, end
+
+
+def drop_unused_advisories(name, crates):
+    """Removes the guest's advisory exceptions whose crate is not in `crates`."""
+    if name not in GUEST_ADVISORIES:
+        return []
+    key, variable = GUEST_ADVISORIES[name]
+    lock_text = (ROOT / SOURCE_LOCK).read_text()
+    locked, start, end = json_value_span(lock_text, key)
+    evidence_text = (ROOT / EVIDENCE).read_text()
+    approved, first, last = python_assignment_span(evidence_text, variable)
+    if locked != approved:
+        raise SystemExit(f"{SOURCE_LOCK} {key} and {EVIDENCE} {variable} differ")
+    kept = [exception for exception in locked if exception["crate"] in crates]
+    if kept == locked:
+        return []
+    (ROOT / SOURCE_LOCK).write_text(lock_text[:start] + json_exceptions(kept) + lock_text[end:])
+    (ROOT / EVIDENCE).write_text(
+        evidence_text[:first] + python_exceptions(variable, kept) + evidence_text[last:]
+    )
+    return [exception for exception in locked if exception not in kept]
+
+
 def bump_guest(name, get=fetch):
     repository = GUESTS[name]
     lock = json.loads((ROOT / SOURCE_LOCK).read_text())[name]
@@ -190,6 +268,11 @@ def bump_guest(name, get=fetch):
     edit_line(SOURCE_LOCK, marker, lock["lock_sha256"], lock_sha256)
     for page in FEATURE_PAGES:
         edit_line(page, f"**{name}**", lock["tag"], tag)
+    dropped = drop_unused_advisories(name, locked_crates(cargo_lock))
+    notes = [
+        f"- Drops the advisory exception {a['id']}: the release no longer locks {a['crate']}."
+        for a in dropped
+    ]
     body = "\n".join(
         [
             f"Moves the {name} guest from {lock['tag']} to {tag} ({commit}), its latest release.",
@@ -197,6 +280,7 @@ def bump_guest(name, get=fetch):
             f"- Release notes: {release['html_url']}",
             f"- Changes: https://github.com/{repository}/compare/{lock['tag']}...{tag}",
             f"- Cargo.lock SHA-256: `{lock_sha256}`",
+            *notes,
             "",
             "If the guest build, its audit or the differential tests fail, fix the cause",
             f"in {name} itself rather than adding an exception here.",
@@ -255,6 +339,15 @@ def self_test():
 
         walk("", value)
         return "\n".join(out) + "\n"
+
+    # The exceptions are written back exactly as the repository writes them.
+    for key, variable in GUEST_ADVISORIES.values():
+        text = (ROOT / SOURCE_LOCK).read_text()
+        value, start, end = json_value_span(text, key)
+        assert text[start:end] == json_exceptions(value), text[start:end]
+        text = (ROOT / EVIDENCE).read_text()
+        value, start, end = python_assignment_span(text, variable)
+        assert text[start:end] == python_exceptions(variable, value), text[start:end]
 
     with tempfile.TemporaryDirectory() as tmp:
         ROOT = Path(tmp)
@@ -334,15 +427,29 @@ def self_test():
                 f'"lock_sha256": "{digest}"}}'
             )
 
-        (ROOT / SOURCE_LOCK).write_text(
-            "{\n"
-            + guest_line("aube", "v2.8.1", "a" * 40, "b" * 64)
-            + ",\n"
-            + guest_line("ripgrep", "15.2.0", "d" * 40, "e" * 64)
-            + ",\n"
-            + guest_line("coreutils", "0.13.0", "f" * 40, "0" * 64)
-            + "\n}\n"
-        )
+        advisories = [
+            {"id": "RUSTSEC-0000-0001", "crate": "kept@1.0.0", "reason": "still locked"},
+            {"id": "RUSTSEC-0000-0002", "crate": "gone@2.0.0", "reason": "fixed"},
+        ]
+
+        def write_advisories(exceptions):
+            (ROOT / SOURCE_LOCK).write_text(
+                "{\n"
+                + guest_line("aube", "v2.8.1", "a" * 40, "b" * 64)
+                + ",\n"
+                + guest_line("ripgrep", "15.2.0", "d" * 40, "e" * 64)
+                + ",\n"
+                + guest_line("coreutils", "0.13.0", "f" * 40, "0" * 64)
+                + ',\n  "guest_advisory_exceptions": '
+                + json_exceptions(exceptions)
+                + "\n}\n"
+            )
+            (ROOT / EVIDENCE).parent.mkdir(parents=True, exist_ok=True)
+            (ROOT / EVIDENCE).write_text(
+                "# before\n" + python_exceptions("ADVISORY_EXCEPTIONS", exceptions) + "AFTER = 1\n"
+            )
+
+        write_advisories(advisories)
         for page in FEATURE_PAGES:
             (ROOT / page).parent.mkdir(parents=True, exist_ok=True)
             (ROOT / page).write_text(
@@ -359,22 +466,39 @@ def self_test():
                     ).encode()
                 if "/commits/" in url:
                     return json.dumps({"sha": "c" * 40}).encode()
-                return b"lock"
+                return LOCK
 
             return get
 
+        LOCK = b'version = 4\n\n[[package]]\nname = "kept"\nversion = "1.0.0"\n'
         assert bump_guest("aube", aube_get("v2.8.1")) is None
         assert bump_guest("aube", aube_get("v2.7.9")) is None
-        title, _ = bump_guest("aube", aube_get("v2.10.0"))
+        title, body = bump_guest("aube", aube_get("v2.10.0"))
         assert title == "chore(guests): bump aube to v2.10.0", title
-        lock = json.loads((ROOT / SOURCE_LOCK).read_text())["aube"]
+        locks = json.loads((ROOT / SOURCE_LOCK).read_text())
+        lock = locks["aube"]
         assert lock == {
             "tag": "v2.10.0",
             "revision": "c" * 40,
-            "lock_sha256": hashlib.sha256(b"lock").hexdigest(),
+            "lock_sha256": hashlib.sha256(LOCK).hexdigest(),
         }, lock
+        # The exception whose crate the release no longer locks goes from both
+        # files; the other stays, and so does the rest of evidence.py.
+        assert locks["guest_advisory_exceptions"] == advisories[:1], locks
+        evidence = (ROOT / EVIDENCE).read_text()
+        assert (
+            evidence
+            == "# before\n"
+            + python_exceptions("ADVISORY_EXCEPTIONS", advisories[:1])
+            + "AFTER = 1\n"
+        ), evidence
+        assert "RUSTSEC-0000-0002" in body and "gone@2.0.0" in body, body
+        assert "RUSTSEC-0000-0001" not in body, body
         for page in FEATURE_PAGES:
             assert "(v2.10.0)" in (ROOT / page).read_text()
+        # ripgrep has no advisory exceptions: aube's stay, though ripgrep's
+        # Cargo.lock lacks the crate.
+        LOCK = b"version = 4\n"
         title, _ = bump_guest("ripgrep", aube_get("15.10.0"))
         assert title == "chore(guests): bump ripgrep to 15.10.0", title
         locks = json.loads((ROOT / SOURCE_LOCK).read_text())
@@ -389,6 +513,25 @@ def self_test():
         assert locks["coreutils"]["tag"] == "0.14.0" and locks["ripgrep"]["tag"] == "15.10.0"
         for page in FEATURE_PAGES:
             assert "(0.14.0)" in (ROOT / page).read_text()
+        assert locks["guest_advisory_exceptions"] == advisories[:1], locks
+        # The last exception going leaves empty lists, and a bump that drops
+        # nothing leaves both files as they were.
+        title, body = bump_guest("aube", aube_get("v2.11.0"))
+        assert json.loads((ROOT / SOURCE_LOCK).read_text())["guest_advisory_exceptions"] == []
+        assert "ADVISORY_EXCEPTIONS = []\n" in (ROOT / EVIDENCE).read_text()
+        assert "RUSTSEC-0000-0001" in body, body
+        before = (ROOT / EVIDENCE).read_text(), (ROOT / SOURCE_LOCK).read_text()
+        assert drop_unused_advisories("aube", set()) == []
+        assert before == ((ROOT / EVIDENCE).read_text(), (ROOT / SOURCE_LOCK).read_text())
+        # The two lists must agree before anything is dropped.
+        write_advisories(advisories)
+        (ROOT / EVIDENCE).write_text(python_exceptions("ADVISORY_EXCEPTIONS", advisories[:1]))
+        try:
+            drop_unused_advisories("aube", set())
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("dropped from lists that differ")
 
         # A value that is not there exactly once stops the bump.
         try:

@@ -329,12 +329,12 @@ you have reason to think the failure was a flake.
 Before a guest program is built, its dependencies must pass `cargo deny`
 under the root policy. Only aube and coreutils have exceptions. coreutils has
 one, for itself alone: the CC0-1.0 license of `notify` 8.2.2, which `uu_tail`
-uses; the build keeps its full license text. aube has the licenses of two crates
-and, for now, RUSTSEC-2026-0592 against `url` 2.5.8, which aube 2.10.1's
-`Cargo.lock` gets through `hickory-net`, `hickory-resolver` and `reqwest`.
-`url` 2.5.9 fixes it, and the exception goes once the pinned aube release locks
-`url` 2.5.9 or later. An exception that no crate matches fails the audit, so an
-aube bump that no longer needs one cannot merge until it is removed.
+uses; the build keeps its full license text. aube has the licenses of two
+crates, and may have RustSec advisories that the user allowed until the pinned
+aube release no longer locks the affected crate version; each gives its reason
+in its ignore entry. An advisory exception that no crate matches fails the
+audit. So when a release's `Cargo.lock` no longer has the crate, the weekly
+bump (`scripts/bump-pins.py`) removes the exception in the same pull request.
 `tests/guests/programs/evidence.py` lists every exception, and `source-lock.json`
 names them with the exact crate versions.
 

@@ -4342,6 +4342,39 @@ mod kernel_faults {
         assert_eq!(grown(before, read), [0, 0, 1]);
         assert_eq!(grown(written_before, written), [0, 0, 1]);
     }
+
+    #[test]
+    fn a_core_another_thread_writes_faults_as_the_dumping_thread() {
+        let mut f = fixture();
+        // Shared anonymous memory never touched: the dump faults its pages
+        // in (`get_dump_page`), where a private page would be a hole.
+        // mmap(NULL, 4 pages, PROT_READ | PROT_WRITE,
+        // MAP_SHARED | MAP_ANONYMOUS, -1, 0).
+        assert!(f.ret(9, &[0, 0x4000, 3, 0x21, u64::MAX, 0]) < 1 << 47);
+        // The signal ended another thread of the process, gone already;
+        // this one is the last to exit, and writes the core.
+        let dumper = Arc::new(crate::Usage::default());
+        f.kernel
+            .group
+            .register_cpu(f.thread.tid + 1, Arc::clone(&dumper));
+        f.kernel.group.begin_core(crate::coredump::Dump {
+            signal: 6,
+            dumper: f.thread.tid + 1,
+            siginfo: crate::coredump::kernel_siginfo(&f.thread.state, 6),
+            limit: u64::MAX,
+            threads: Vec::new(),
+            credentials: f.thread.state.credentials.clone(),
+            clear_tids: Vec::new(),
+            robust_lists: Vec::new(),
+        });
+        bound(&f);
+        let before = all_counts(&f);
+        f.kernel.finish_thread(&f.thread, &f.mem);
+        let after = all_counts(&f);
+        paludarium_mmu::faults::unbind();
+        assert_eq!(grown(before, after), [0, 0, 0]);
+        assert!(dumper.forced_faults.load(Ordering::SeqCst) >= 4);
+    }
 }
 
 mod pkeys {

@@ -328,6 +328,22 @@ pub mod faults {
         SINK.with(|sink| *sink.borrow_mut() = Some(counts));
     }
 
+    /// Runs `f` with the calling host thread's faults counted to `counts`,
+    /// then to what it was bound to before (or to nothing): work the kernel
+    /// does there as another guest thread, whose faults Linux counts to
+    /// that task, as the dumping thread's for a core another thread
+    /// writes.
+    pub fn counted_to<T>(counts: Arc<dyn Sink>, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Arc<dyn Sink>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SINK.with(|sink| *sink.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(SINK.with(|sink| sink.borrow_mut().replace(counts)));
+        f()
+    }
+
     /// Counts no more of the calling host thread's faults to the guest
     /// thread it was bound to, as that thread is done there.
     pub fn unbind() {
@@ -9641,7 +9657,7 @@ mod tests {
         let anon = space
             .map(
                 None,
-                5 * PAGE_SIZE,
+                6 * PAGE_SIZE,
                 Prot::READ_WRITE,
                 MappingKind::Anonymous,
             )
@@ -9661,6 +9677,15 @@ mod tests {
             .unwrap();
         faults::set_kernel(was);
         assert_eq!(load(&counts), [2, 1, 0]);
+        // Work done there as another thread counts to that one, and then
+        // to this one again.
+        let other = Arc::new(Counts::default());
+        faults::counted_to(Arc::clone(&other) as _, || {
+            space
+                .write_u64(GuestAddr(anon.0 + 5 * PAGE_SIZE), 1)
+                .unwrap();
+        });
+        assert_eq!((load(&counts), load(&other)), ([2, 1, 0], [1, 0, 0]));
         // The loader's fill counts one through `get_user_pages` for each
         // page it gives a frame, and none for one that has its own.
         space

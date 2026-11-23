@@ -3098,6 +3098,63 @@ static pid_t core_child(rlim_t limit, int dumpable, int thread, int signal) {
     else *(volatile int *)0 = 1;
     _exit(70);
 }
+/* The core-dump-faults case: a core's faults count to the thread that
+   dumps it. Linux's get_signal calls vfs_coredump in the thread that took
+   the signal while the others wait (coredump_wait), and get_dump_page
+   faults in each page of shared anonymous memory never touched. The
+   leader, with a thread parked beside it, maps 64 such pages, sends its
+   own minor faults so far, and raises SIGABRT at itself; its zombie's
+   /proc/<pid>/task/<pid>/stat then shows the dump's faults. */
+static unsigned long stat_minflt(const char *path) {
+    char buf[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    long n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *end = strrchr(buf, ')');
+    unsigned long minflt = 0;
+    if (!end || sscanf(end + 2, "%*c %*d %*d %*d %*d %*d %*u %lu", &minflt) != 1) return 0;
+    return minflt;
+}
+static int core_dump_faults_case(void) {
+    char dir[] = "/tmp/core-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    int fds[2];
+    if (pipe(fds)) return 81;
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit r;
+        getrlimit(RLIMIT_CORE, &r);
+        r.rlim_cur = r.rlim_max;
+        setrlimit(RLIMIT_CORE, &r);
+        char *shared = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        pthread_t t;
+        if (shared == MAP_FAILED || pthread_create(&t, NULL, core_parked, NULL)) _exit(71);
+        struct rusage usage;
+        getrusage(RUSAGE_THREAD, &usage);
+        long before = usage.ru_minflt;
+        if (write(fds[1], &before, sizeof before) != sizeof before) _exit(72);
+        raise(SIGABRT);
+        _exit(70);
+    }
+    close(fds[1]);
+    long before = -1;
+    if (read(fds[0], &before, sizeof before) != sizeof before) before = -1;
+    siginfo_t info;
+    waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, pid);
+    unsigned long leader = stat_minflt(path);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("dumped=%d core=%d leader-faulted-64=%d\n", info.si_code == CLD_DUMPED,
+           WCOREDUMP(status) ? 1 : 0, before >= 0 && leader >= (unsigned long)before + 64);
+    unlink("core");
+    if (chdir("/") || rmdir(dir)) return 82;
+    return 0;
+}
 /* A little-endian field of the core, or 0 past its end. */
 static const unsigned char *core_bytes;
 static uint64_t core_size;
@@ -34099,6 +34156,7 @@ int main(int argc, char **argv) {
         result("death-code", found[1]);
         return 0;
     }
+    if (!strcmp(mode, "core-dump-faults")) return core_dump_faults_case();
     if (!strcmp(mode, "core-dump")) {
         /* A core-dumping signal writes `core` in the working directory when
            RLIMIT_CORE allows a page and the process is dumpable; wait then

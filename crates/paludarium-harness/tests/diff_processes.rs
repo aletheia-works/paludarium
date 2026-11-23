@@ -132,6 +132,7 @@ mod linux {
         // Linux writes the core the cases read only with the kernel's
         // default core_pattern, which CI sets.
         if mode == "core-dump"
+            || mode == "core-dump-faults"
             || mode == "core-mappings"
             || mode == "core-credentials"
             || mode == "ptrace-exit-core"
@@ -914,6 +915,7 @@ mod linux {
         processes_signal_sender => ("signal-sender","process"),
         processes_kill_before_sleep => ("kill-before-sleep","process"),
         processes_core_dump => ("core-dump","process"),
+        processes_core_dump_faults => ("core-dump-faults","process"),
         processes_core_mappings => ("core-mappings","process"),
         processes_sigqueue => ("sigqueue","process"),
         processes_sparse => ("sparse","process"),

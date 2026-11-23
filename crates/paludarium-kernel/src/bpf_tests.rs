@@ -1846,7 +1846,9 @@ fn a_bpf_file_system_holds_trusted_and_security_attributes() {
 /// BPF file system's directory (`bpf_lookup`), not only where a call makes
 /// a name: `stat`, `open`, `unlink`, and a walk past it. A directory the
 /// walk may not search is `EACCES` first, one with no mode bits takes the
-/// name as any other, and a name without a dot is `ENOENT`.
+/// name as any other (even to make it, whoever looks: `bpf_lookup` checks
+/// the directory's mode, not a search of it), and a name without a dot is
+/// `ENOENT`.
 #[test]
 fn every_walk_to_a_missing_dotted_name_is_eperm() {
     const OPEN: u64 = 2;
@@ -1886,6 +1888,14 @@ fn every_walk_to_a_missing_dotted_name_is_eperm() {
     assert_eq!(
         walk(&mut k, &mut t, STAT, "/pins/zero/a.b"),
         errno(Errno::ENOENT)
+    );
+    // Not the caller's search but the directory's mode decides: root
+    // makes the name there, as Linux's `bpf_mkdir` does once the lookup
+    // gives none.
+    let dotted = put(0xb40, "/pins/zero/a.b");
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [dotted, 0o755, 0, 0, 0, 0]),
+        0
     );
     // setuid(1000): `locked` may not be searched.
     assert_eq!(syscall(&mut k, &mut t, &m, 105, [1000, 0, 0, 0, 0, 0]), 0);

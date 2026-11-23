@@ -41,14 +41,23 @@ fn split(p: &[u8]) -> (Vec<u8>, &[u8]) {
     }
 }
 
-/// `bpf_lookup`: in a BPF file system's directory, a name with a dot
-/// that is not there is `EPERM`, as it keeps such names for itself.
+/// `bpf_lookup`: in a BPF file system's directory with any mode bits
+/// (`S_IALLUGO`, whoever looks), a name with a dot that is not there is
+/// `EPERM`, as it keeps such names for itself.
 pub(crate) fn lookup(c: &Context<'_>, p: &[u8]) -> Result<(), Errno> {
     let (dir, name) = split(p);
     if name == b"." || name == b".." || !name.contains(&b'.') {
         return Ok(());
     }
     if c.files.fs().metadata(p, false).is_ok() || on_bpffs(c, &dir, true).is_none() {
+        return Ok(());
+    }
+    // A directory of mode 0 takes the name as any other.
+    if c.files
+        .fs()
+        .metadata(&dir, true)
+        .is_ok_and(|d| d.mode & 0o7777 == 0)
+    {
         return Ok(());
     }
     // The walk to the directory comes first: a directory the thread may

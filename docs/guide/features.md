@@ -4652,7 +4652,10 @@ kernel.
   too and never given back, as in Linux master. The mapping is not copied
   to a `fork`ed child nor held in a core dump (`VM_DONTCOPY`,
   `VM_DONTDUMP`), and keeps the event counting though its descriptors are
-  closed; its last unmapping frees the buffer and its charges. The user
+  closed; its last unmapping frees the buffer and its charges. It is a
+  mapping of the event's file, which `/proc/<pid>/maps` and the `MMAP2`
+  records name `anon_inode:[perf_event]` with the device and inode its
+  descriptor's `fstat` gives, the anonymous inodes' one. The user
   page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
   offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
   index 0, and the count and times enabled and running between two bumps

@@ -1256,13 +1256,16 @@ static int case_throttle(void) {
 /* What the cases compare the records with. */
 struct expected {
     pid_t pid, tid, child, parent;
-    char *anon, *exec_at, *shm, *heap, *shared;
+    char *anon, *exec_at, *shm, *heap, *shared, *ring;
     size_t anon_len;
     const char *path, *self;
     struct stat file;
     /* The device and inode /proc/self/maps gives the shared mapping. */
     unsigned shared_major, shared_minor;
     unsigned long shared_inode;
+    /* The same of another event's ring buffer. */
+    unsigned ring_major, ring_minor;
+    unsigned long ring_inode;
     int mmap_records;
 };
 
@@ -1280,6 +1283,26 @@ static int maps_identity(const char *at, unsigned *major_, unsigned *minor_, uns
     }
     fclose(maps);
     return found;
+}
+
+/* Whether the line of the mapping at `at` in /proc/self/maps names it
+   `name`. */
+static int maps_names(const char *at, const char *name) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512];
+    int named = 0;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long start;
+        int path = 0;
+        if (sscanf(line, "%lx-%*x %*s %*x %*x:%*x %*u %n", &start, &path) < 1 || start != (unsigned long)at || !path)
+            continue;
+        line[strcspn(line, "\n")] = 0;
+        named = !strcmp(line + path, name);
+        break;
+    }
+    fclose(maps);
+    return named;
 }
 
 /* An MMAP or MMAP2 record's name, at `words` 64-bit words in. */
@@ -1306,6 +1329,7 @@ static void say_record(const uint64_t *record, void *with) {
         else if (!strcmp(name, "//anon")) what = "anon";
         else if (!strcmp(name, "/dev/zero (deleted)")) what = name;
         else if (!strncmp(name, "/SYSV", 5)) what = name;
+        else if (!strcmp(name, "anon_inode:[perf_event]")) what = name;
         else if (name[0] == '[') what = name;
         say("%s %s data %d ids %d", mmap2 ? "mmap2" : "mmap", what, !!(misc & MISC_DATA),
             ids[0] == (uint32_t)e->pid && ids[1] == (uint32_t)e->tid);
@@ -1326,6 +1350,11 @@ static void say_record(const uint64_t *record, void *with) {
             if (e->shared && at == e->shared)
                 say("  shared device %d inode %d", words[0] == e->shared_major && words[1] == e->shared_minor,
                     *(const uint64_t *)(words + 2) == (uint64_t)e->shared_inode);
+            /* A ring buffer's file: the event's anonymous inode. */
+            if (e->ring && at == e->ring)
+                say("  ring offset %llu len %llu device %d inode %d", (unsigned long long)pgoff,
+                    (unsigned long long)len, words[0] == e->ring_major && words[1] == e->ring_minor,
+                    *(const uint64_t *)(words + 2) == (uint64_t)e->ring_inode);
         }
         e->mmap_records++;
     } else if (type == RECORD_COMM) {
@@ -1391,8 +1420,22 @@ static int case_side_band(void) {
     int status;
     waitpid(child, &status, 0);
     e.child = child;
+    /* Another event's ring buffer, a shared mapping of its file. */
+    struct attr ring_attr = software(9);
+    ring_attr.flags |= DISABLED;
+    int ring = (int)open_event(&ring_attr, 0, -1, -1, 0);
+    void *ring_at = NULL;
+    if (ring >= 0 && map_event(ring, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &ring_at) >= 0) e.ring = ring_at;
     ioctl(fd, IOC_DISABLE, 0);
     ioctl(exec_fd, IOC_DISABLE, 0);
+    /* Its line in /proc/self/maps: the anonymous inode `fstat` gives. */
+    struct stat ring_stat;
+    int ring_found = e.ring && maps_identity(e.ring, &e.ring_major, &e.ring_minor, &e.ring_inode) &&
+                     !fstat(ring, &ring_stat);
+    say("ring in maps %d as fstat %d named %d", ring_found,
+        ring_found && e.ring_major == major(ring_stat.st_dev) && e.ring_minor == minor(ring_stat.st_dev) &&
+            e.ring_inode == (unsigned long)ring_stat.st_ino,
+        ring_found && maps_names(e.ring, "anon_inode:[perf_event]"));
     shmdt(e.shm);
     shmctl(id, IPC_RMID, NULL);
     unlink(path);

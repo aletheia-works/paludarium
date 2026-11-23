@@ -4031,7 +4031,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   master と同じくユーザーに課され、返されません。マッピングは `fork` した子に写されず、
   コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ディスクリプタが閉じられても
   イベントを数え続けさせます。最後にアンマップされると、バッファと課したものは
-  なくなります。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
+  なくなります。これはイベントのファイルのマッピングで、`/proc/<pid>/maps` と `MMAP2`
+  の記録は、ディスクリプタの `fstat` が示すデバイスと inode（無名 inode のもの）を付けて
+  `anon_inode:[perf_event]` と示します。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
   `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
   `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
   数と有効な時間と動いた時間があります。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに

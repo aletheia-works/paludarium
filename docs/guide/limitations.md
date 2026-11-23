@@ -337,12 +337,9 @@ verified.
   given another protection, where Linux refuses to split it (`EINVAL`); and
   `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
   (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
-  mapping unlocked. `/proc/<pid>/maps` does not yet name the mapping
-  `anon_inode:[perf_event]` with the anonymous inodes' device and inode, as
-  Linux does (it shows no name, device or inode), and the `MMAP` records
-  are not yet checked against what Linux writes of it. `inherit_stat` is taken, but an
-  inherited event's end sends no read record, as nothing is recorded. An
-  event of a task on one CPU counts on any, and the cgroup mode
+  mapping unlocked. `inherit_stat` is taken, but an inherited event's end
+  sends no read record, as nothing is recorded. An event of a task on one
+  CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2

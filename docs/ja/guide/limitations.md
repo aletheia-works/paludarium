@@ -297,11 +297,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マッピングの一部をアンマップ、移動、保護の変更でき、Linux は分割を断ります
   （`EINVAL`）。`MADV_DOFORK` で子に渡せ、Linux は `VM_IO` に対して断ります
   （`EINVAL`）。`mlock` でロックでき、Linux は `VM_SPECIAL` のマッピングをロックしません。
-  `/proc/<pid>/maps` はこのマッピングを、Linux のように無名 inode のデバイスと inode を付けた
-  `anon_inode:[perf_event]` とはまだ示さず（名前、デバイス、inode のどれも示しません）、`MMAP` の
-  記録も Linux がそれについて書くものとはまだ照らし合わせていません。`inherit_stat` は
-  受け付けますが、記録するものがないので、引き継いだイベントの終わりに読み取りの記録は
-  送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
+  `inherit_stat` は受け付けますが、記録するものがないので、引き継いだイベントの終わりに
+  読み取りの記録は送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。ioctl の `SET_FILTER`、`SET_BPF`、
   `QUERY_BPF`、`MODIFY_ATTRIBUTES` は `ENOTTY` です。`remove_on_exec` は、
   Linux master が 7.2 から（037a3c43edfb）するように、イベントをグループから外し、そうした

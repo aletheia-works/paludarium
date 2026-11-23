@@ -1043,6 +1043,120 @@ fn an_eviction_while_a_file_is_being_opened_keeps_its_mark() {
     let _ = std::fs::remove_dir_all(&host);
 }
 
+/// An in-memory file system that calls itself ext4, whose marks may be
+/// evicted as tmpfs's may not, and which makes FIFOs on any host.
+struct Disk(paludarium_vfs::MemFs);
+
+/// The absolute path in [`Disk`]'s file system of `path` below its mount.
+fn at(path: &[u8]) -> Vec<u8> {
+    [b"/", path].concat()
+}
+
+impl paludarium_vfs::HostFs for Disk {
+    fn open(
+        &self,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+    ) -> Result<Arc<dyn paludarium_host::FileHandle>, Errno> {
+        self.0.open(&at(path), flags, mode)
+    }
+    fn metadata(&self, path: &[u8], follow: bool) -> Result<paludarium_host::FileStat, Errno> {
+        self.0.metadata(&at(path), follow)
+    }
+    fn statfs(&self, path: &[u8]) -> Result<paludarium_host::FsStats, Errno> {
+        const EXT4_SUPER_MAGIC: u64 = 0xef53;
+        Ok(paludarium_host::FsStats {
+            kind: EXT4_SUPER_MAGIC,
+            ..self.0.statfs(&at(path))?
+        })
+    }
+    fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
+        self.0.mkdir(&at(path), mode)
+    }
+    fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
+        self.0.unlink(&at(path), directory)
+    }
+    fn link(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
+        self.0.link(&at(old), &at(new))
+    }
+    fn symlink(&self, target: &[u8], path: &[u8]) -> Result<(), Errno> {
+        self.0.symlink(target, &at(path))
+    }
+    fn readlink(&self, path: &[u8]) -> Result<Vec<u8>, Errno> {
+        self.0.readlink(&at(path))
+    }
+    fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
+        self.0.rename(&at(old), &at(new))
+    }
+    fn read_dir(&self, path: &[u8]) -> Result<Vec<paludarium_host::DirectoryEntry>, Errno> {
+        self.0.read_dir(&at(path))
+    }
+    fn make_fifo(&self, path: &[u8], mode: u32) -> Result<paludarium_host::FileStat, Errno> {
+        self.0.make_fifo(&at(path), mode)
+    }
+}
+
+#[test]
+fn an_eviction_while_a_fifo_open_waits_keeps_its_mark() {
+    let host = Arc::new(RecordingHost::new());
+    let mut f = fixture();
+    f.kernel = Kernel::new(Arc::clone(&host) as _);
+    let base = paludarium_vfs::MemFs::new();
+    let _ = <paludarium_vfs::MemFs as paludarium_vfs::HostFs>::mkdir(&base, b"/tmp", 0o1777);
+    let mut mounted = paludarium_vfs::MountedFs::new(base);
+    mounted
+        .mount(
+            b"/data".to_vec(),
+            Arc::new(Disk(paludarium_vfs::MemFs::new())) as _,
+        )
+        .unwrap();
+    f.kernel.files.set_file_system(Arc::new(mounted));
+    let fan = f.init(NONBLOCK, 0);
+    let fifo = f.put(b"/data/fifo");
+    assert_eq!(f.ret(133, &[fifo, 0o010_644, 0]), 0);
+    f.touch("/data/free");
+    for name in ["/data/fifo", "/data/free"] {
+        assert_eq!(f.mark(fan, ADD | EVICTABLE, OPEN, name), 0);
+    }
+    let marks = |f: &mut Fixture| {
+        f.fdinfo(fan)
+            .lines()
+            .filter(|l| l.starts_with("fanotify ino:"))
+            .count()
+    };
+    assert_eq!(marks(&mut f), 2);
+    // The FIFO an open for reading waits on is in use from its lookup on:
+    // an eviction while it waits for a writer (once its thread's wait flag
+    // shows it asleep) takes only the other's mark. The wait then ends with
+    // `EINTR`.
+    let waiting = Arc::clone(f.kernel.inbox.blocked_flag());
+    let caches = Arc::clone(&f.kernel.files.caches);
+    let evicting = std::thread::spawn({
+        let host = Arc::clone(&host);
+        move || {
+            while !waiting.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            caches
+                .notify
+                .fan
+                .evict(&|key| caches.held(key) || caches.notify.watches_file(key));
+            host.interrupt_next_wait();
+        }
+    });
+    assert_eq!(f.ret(2, &[fifo, 0, 0]), errno(Errno(4)));
+    evicting.join().unwrap();
+    assert_eq!(marks(&mut f), 1);
+    // Once the open is over, it goes too.
+    let caches = Arc::clone(&f.kernel.files.caches);
+    caches
+        .notify
+        .fan
+        .evict(&|key| caches.held(key) || caches.notify.watches_file(key));
+    assert_eq!(marks(&mut f), 0);
+}
+
 /// The names a read's events give, with their masks, from the first
 /// record of each (a directory and name).
 fn named(seen: &[Seen]) -> Vec<(u64, String)> {

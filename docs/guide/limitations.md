@@ -1027,9 +1027,7 @@ verified.
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
-  dnotify is always on, as with Linux's default of 1. A FIFO's or device's
-  read or write does not reach its directory's watch, as with fanotify
-  below.
+  dnotify is always on, as with Linux's default of 1.
 - **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
   `EINVAL`, where Linux takes a read or write lease and signals its holder
   when another open or truncate breaks it.
@@ -1051,8 +1049,7 @@ verified.
   is judged by the
   fanotify marks alone, where Linux's counts inotify's too. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
-  it had, which fails once it is gone, and a FIFO's or device's read or
-  write is told of without its directory and name.
+  it had, which fails once it is gone.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the

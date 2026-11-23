@@ -204,6 +204,7 @@
     {"name":"fanotify-marks","binary":"fanotify"},
     {"name":"fanotify-events","binary":"fanotify"},
     {"name":"fanotify-fid","binary":"fanotify"},
+    {"name":"fanotify-fifo-names","binary":"fanotify"},
     {"name":"fanotify-pidfd","binary":"fanotify"},
     {"name":"fanotify-unprivileged","binary":"fanotify"},
     {"name":"fanotify-mounts","binary":"fanotify"},

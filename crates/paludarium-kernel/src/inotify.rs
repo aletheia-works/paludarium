@@ -625,15 +625,23 @@ impl Notifier {
         path: Option<PathEvent<'_>>,
         special: bool,
     ) {
+        // `__fsnotify_parent`: a directory's interest in a read or write of
+        // a file that is a FIFO or a device does not count, as those are
+        // not on the directory's file system. Only fanotify's groups that
+        // need the parent's name hear of it with one.
+        let to_directory = !(special && path.is_some() && mask & (ACCESS | MODIFY) != 0);
+        let parent = named
+            .filter(|_| to_directory)
+            .and_then(|named| named.parent.map(|p| (p, named)));
         for instance in self.instances() {
-            if let Some(parent) = named.and_then(|named| named.parent.map(|p| (p, named))) {
+            if let Some(parent) = parent {
                 instance.report(parent.0, mask | file.isdir(), &parent.1.name, 0, unlinked);
             }
             instance.report(file.key, mask | file.isdir(), b"", 0, unlinked);
         }
         // dnotify's marks, as `fsnotify_handle_event` tells them: the
         // directory's with the name, then the file's own.
-        if let Some(parent) = named.and_then(|named| named.parent) {
+        if let Some((parent, _)) = parent {
             self.dn.event(
                 parent,
                 mask | file.isdir() | crate::fanotify::EVENT_ON_CHILD,
@@ -944,16 +952,14 @@ impl Notifier {
         // its parent; one whose path no longer names the file (a change the
         // host made) is heard of by its own watches only.
         let gone = place.is_some_and(|(_, _, unlinked)| unlinked) || stat.links == 0;
-        let named = place
-            .and_then(|(fs, path, _)| {
-                if gone {
-                    self.named(fs, path, false)
-                } else {
-                    self.named(fs, path, true)
-                        .filter(|named| named.file.is_some_and(|found| found.key == file.key))
-                }
-            })
-            .filter(|_| !(content && special && mask & (ACCESS | MODIFY) != 0));
+        let named = place.and_then(|(fs, path, _)| {
+            if gone {
+                self.named(fs, path, false)
+            } else {
+                self.named(fs, path, true)
+                    .filter(|named| named.file.is_some_and(|found| found.key == file.key))
+            }
+        });
         // `fsnotify_handle_inode_event` skips either watch with
         // `IN_EXCL_UNLINK` for an unlinked dentry.
         let unlinked = content && gone;

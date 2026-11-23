@@ -269,6 +269,7 @@ mod linux {
                     | "fanotify-marks"
                     | "fanotify-events"
                     | "fanotify-fid"
+                    | "fanotify-fifo-names"
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
                     | "fanotify-mounts"
@@ -753,6 +754,7 @@ mod linux {
         fanotify_marks => ("fanotify-marks","fanotify"),
         fanotify_events => ("fanotify-events","fanotify"),
         fanotify_fid => ("fanotify-fid","fanotify"),
+        fanotify_fifo_names => ("fanotify-fifo-names","fanotify"),
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         fanotify_mounts => ("fanotify-mounts","fanotify"),

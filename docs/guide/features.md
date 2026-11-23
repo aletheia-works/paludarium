@@ -5382,7 +5382,10 @@ kernel.
   The groups hear what inotify watches hear, by the same hooks, as Linux's
   `fsnotify` sends it: the file's, its mount's and its file system's marks,
   its directory's when it watches its children, and for `FAN_RENAME` the
-  new directory's. An event is queued as `fanotify_handle_event` makes it:
+  new directory's. A FIFO's or device's read or write is not its
+  directory's, as `__fsnotify_parent` keeps it from the directory's
+  interest, but a group that needs the directory and name hears of it with
+  them, without `FAN_EVENT_ON_CHILD`. An event is queued as `fanotify_handle_event` makes it:
   without a FID mode only the open, access, modification and close of a
   regular file or directory, with a descriptor of it opened again with the
   group's flags, which `F_GETFL` shows with `O_CLOEXEC` and which a

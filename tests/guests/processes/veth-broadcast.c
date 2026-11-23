@@ -295,6 +295,11 @@ static void child(int in, int out) {
             inet_pton(AF_INET6, "::ffff:10.77.0.1", &to.sin6_addr);
             printf("B: sendto from mapped broadcast=%ld\n",
                    result(sendto(fds[12], "x", 1, 0, (void *)&to, sizeof to)));
+            printf("B: sendto from mapped limited=%ld\n",
+                   result(sendto(fds[14], "x", 1, 0, (void *)&to, sizeof to)));
+            /* Neither connected. */
+            printf("B: send from mapped broadcast=%ld\n", result(send(fds[12], "x", 1, 0)));
+            printf("B: send from mapped limited=%ld\n", result(send(fds[14], "x", 1, 0)));
         } else if (command == 'r') {
             /* The first takes every broadcast that comes. */
             for (int i = 0; i < B_SOCKETS; i++) receive(fds[i], i == 0, b_labels[i]);

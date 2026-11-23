@@ -474,10 +474,14 @@ impl Contents {
     pub(crate) fn write(&mut self, offset: u64, data: &[u8]) -> Result<usize, Errno> {
         self.write_within(offset, data, false)
     }
-    /// Writes a shared mapping's page back at `offset`, taking it in if the
-    /// file has none (`ENOSPC` past the size): one a fault took in has it.
+    /// Writes a shared mapping's pages back at `offset`, taking in those
+    /// the file has none of (`ENOSPC` past the size, also when only the
+    /// first fit): one a fault took in has it.
     pub(crate) fn write_back(&mut self, offset: u64, data: &[u8]) -> Result<(), Errno> {
-        self.write_within(offset, data, false).map(drop)
+        match self.write_within(offset, data, false)? {
+            done if done == data.len() => Ok(()),
+            _ => Err(ENOSPC),
+        }
     }
     /// Writes `data` at `offset` whatever the size: a start-up file.
     fn write_unlimited(&mut self, offset: u64, data: &[u8]) {

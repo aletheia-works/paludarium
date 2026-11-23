@@ -608,5 +608,7 @@ mod huge_folios {
         assert_eq!(f.write_back(2 * 4096, b"x"), Err(Errno(28)));
         assert_eq!(f.write_back(0, b"x"), Ok(()));
         assert_eq!(f.fault(4096, 0, None), Err(Errno(28)));
+        // Pages that fit only in part are ENOSPC too.
+        assert_eq!(f.write_back(0, &[1; 2 * 4096]), Err(Errno(28)));
     }
 }

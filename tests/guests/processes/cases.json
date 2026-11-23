@@ -68,6 +68,7 @@
     {"name":"veth-iif","binary":"veth-iif"},
     {"name":"veth-broadcast","binary":"veth-broadcast"},
     {"name":"veth-filter","binary":"veth-filter"},
+    {"name":"veth-broadcast-source","binary":"veth-broadcast-source"},
     {"name":"veth-neigh","binary":"veth-neigh"},
     {"name":"veth-ipv6","binary":"veth-ipv6"},
     {"name":"veth-ipv6-gateway","binary":"veth-ipv6-gateway"},

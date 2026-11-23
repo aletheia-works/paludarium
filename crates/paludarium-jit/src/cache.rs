@@ -1,38 +1,27 @@
 //! Bounded immutable translations keyed by address space, RIP and MMU epoch.
 use std::collections::BTreeMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock};
 
 struct Entry<T> {
     generation: u64,
     end: u64,
     translation: T,
     /// The clock at the entry's last use: the least recently used entry has
-    /// the smallest. A hit only writes it; an insertion into a full cache
-    /// looks for the smallest.
-    access: u64,
+    /// the smallest. A hit raises it under the shared lock; an insertion
+    /// into a full cache looks for the smallest under the exclusive one.
+    access: AtomicU64,
 }
 
-struct State<T> {
-    entries: BTreeMap<(u64, u64), Entry<T>>,
-    clock: u64,
-}
-impl<T> State<T> {
-    fn tick(&mut self) -> u64 {
-        if self.clock == u64::MAX {
-            // Evicting all entries on counter exhaustion is a safe fallback.
-            self.entries.clear();
-            self.clock = 0;
-        }
-        self.clock += 1;
-        self.clock
-    }
-    fn remove(&mut self, key: &(u64, u64)) {
-        self.entries.remove(key);
-    }
-}
-
+/// Hits, which every guest thread's Worker makes on every block the JIT
+/// runs, share the lock: they read the entries and raise one stamp. Only a
+/// change to the entries (an insertion, an epoch's removal, invalidation or
+/// the clock's exhaustion) takes it exclusively.
 pub(crate) struct EpochCache<T> {
-    state: Mutex<State<T>>,
+    entries: RwLock<BTreeMap<(u64, u64), Entry<T>>>,
+    /// The last stamp handed out. Stamps are unique, so the eviction order
+    /// is that of one lock taken for every use.
+    clock: AtomicU64,
 }
 
 #[cfg(feature = "cost-profile")]
@@ -47,8 +36,8 @@ impl<T: Clone> EpochCache<T> {
     /// Diagnostic observation only: even stale entries retain their recency.
     #[cfg(feature = "cost-profile")]
     pub(crate) fn peek(&self, space: u64, rip: u64, generation: u64) -> Peek<T> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        match state.entries.get(&(space, rip)) {
+        let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
+        match entries.get(&(space, rip)) {
             None => Peek::Missing,
             Some(entry) if entry.generation != generation => Peek::Stale,
             Some(entry) => Peek::Present(entry.translation.clone()),
@@ -56,11 +45,29 @@ impl<T: Clone> EpochCache<T> {
     }
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(State {
-                entries: BTreeMap::new(),
-                clock: 0,
-            }),
+            entries: RwLock::new(BTreeMap::new()),
+            clock: AtomicU64::new(0),
         }
+    }
+
+    /// The next stamp, or `None` once the clock is exhausted.
+    fn tick(&self) -> Option<u64> {
+        self.clock
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |clock| {
+                clock.checked_add(1)
+            })
+            .ok()
+            .map(|clock| clock + 1)
+    }
+
+    /// The next stamp under the exclusive lock. Evicting all entries on
+    /// counter exhaustion is a safe fallback.
+    fn tick_exclusive(&self, entries: &mut BTreeMap<(u64, u64), Entry<T>>) -> u64 {
+        self.tick().unwrap_or_else(|| {
+            entries.clear();
+            self.clock.store(1, Ordering::Relaxed);
+            1
+        })
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
@@ -75,29 +82,46 @@ impl<T: Clone> EpochCache<T> {
         generation: u64,
         touch: impl FnOnce(&T) -> bool,
     ) -> Option<T> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let key = (space, rip);
-        if state.entries.get(&key)?.generation != generation {
-            #[cfg(feature = "cost-profile")]
-            paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::EpochInvalidations, 1);
-            state.remove(&key);
-            return None;
-        }
-        #[cfg(feature = "cost-profile")]
-        paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::CacheHits, 1);
-        let entry = state.entries.get(&key)?;
-        if !touch(&entry.translation) {
-            return Some(entry.translation.clone());
-        }
-        let access = state.tick();
-        #[cfg(feature = "cost-profile")]
         {
-            use paludarium_cpu::jit_cost::{Counter, add};
-            add(Counter::LruUpdates, 1);
+            let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
+            let entry = entries.get(&key)?;
+            if entry.generation == generation {
+                #[cfg(feature = "cost-profile")]
+                paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::CacheHits, 1);
+                if !touch(&entry.translation) {
+                    return Some(entry.translation.clone());
+                }
+                if let Some(access) = self.tick() {
+                    #[cfg(feature = "cost-profile")]
+                    paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::LruUpdates, 1);
+                    // The largest: a hit that took its stamp later may
+                    // have stored it first.
+                    entry.access.fetch_max(access, Ordering::Relaxed);
+                    return Some(entry.translation.clone());
+                }
+            }
         }
-        let entry = state.entries.get_mut(&key)?;
-        entry.access = access;
-        Some(entry.translation.clone())
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        match entries.get(&key) {
+            Some(entry) if entry.generation != generation => {
+                #[cfg(feature = "cost-profile")]
+                paludarium_cpu::jit_cost::add(
+                    paludarium_cpu::jit_cost::Counter::EpochInvalidations,
+                    1,
+                );
+                entries.remove(&key);
+            }
+            // The clock ran out under the shared lock: as an insertion
+            // would, evict everything and restart it.
+            Some(_) if self.clock.load(Ordering::Relaxed) == u64::MAX => {
+                entries.clear();
+                self.clock.store(1, Ordering::Relaxed);
+            }
+            // Another Worker changed the entries in between: run interpreted.
+            _ => {}
+        }
+        None
     }
 
     pub(crate) fn insert(
@@ -114,28 +138,27 @@ impl<T: Clone> EpochCache<T> {
         let Some(end) = rip.checked_add(length as u64) else {
             return false;
         };
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let access = state.tick();
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        let access = self.tick_exclusive(&mut entries);
         #[cfg(feature = "cost-profile")]
         paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::LruUpdates, 1);
         let key = (space, rip);
-        state.remove(&key);
-        if state.entries.len() >= 1024
-            && let Some(oldest) = state
-                .entries
+        entries.remove(&key);
+        if entries.len() >= 1024
+            && let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.access)
+                .min_by_key(|(_, entry)| entry.access.load(Ordering::Relaxed))
                 .map(|(&key, _)| key)
         {
-            state.remove(&oldest);
+            entries.remove(&oldest);
         }
-        state.entries.insert(
+        entries.insert(
             key,
             Entry {
                 generation,
                 end,
                 translation,
-                access,
+                access: AtomicU64::new(access),
             },
         );
         true
@@ -144,17 +167,9 @@ impl<T: Clone> EpochCache<T> {
     pub(crate) fn invalidate(&self, address: u64) {
         let page = address & !4095;
         let end = page.checked_add(4096);
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let removed = state
-            .entries
-            .iter()
-            .filter_map(|(&key @ (_, start), entry)| {
-                (!(entry.end <= page || end.is_some_and(|end| start >= end))).then_some(key)
-            })
-            .collect::<Vec<_>>();
-        for key in removed {
-            state.remove(&key);
-        }
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .retain(|&(_, start), entry| entry.end <= page || end.is_some_and(|end| start >= end));
     }
 }
 
@@ -164,15 +179,17 @@ mod tests {
 
     #[cfg(feature = "cost-profile")]
     fn snapshot(cache: &EpochCache<Option<u64>>) -> String {
-        let state = cache.state.lock().unwrap();
+        let entries = cache.entries.read().unwrap();
         format!(
             "{:?}/{}",
-            state
-                .entries
+            entries
                 .iter()
-                .map(|(k, e)| (*k, e.generation, e.end, e.translation, e.access))
+                .map(|(k, e)| {
+                    let access = e.access.load(Ordering::Relaxed);
+                    (*k, e.generation, e.end, e.translation, access)
+                })
                 .collect::<Vec<_>>(),
-            state.clock
+            cache.clock.load(Ordering::Relaxed)
         )
     }
     #[cfg(feature = "cost-profile")]
@@ -216,7 +233,7 @@ mod tests {
     fn peek_does_not_trigger_clock_exhaustion() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, Some(42));
-        cache.state.lock().unwrap().clock = u64::MAX;
+        cache.clock.store(u64::MAX, Ordering::Relaxed);
         let before = snapshot(&cache);
         assert_eq!(cache.peek(1, 4096, 1), Peek::Present(Some(42)));
         assert_eq!(snapshot(&cache), before);
@@ -247,12 +264,12 @@ mod tests {
     fn negative_cache_hit_does_not_mutate_recency() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, None::<u64>);
-        let clock = cache.state.lock().unwrap().clock;
+        let clock = cache.clock.load(Ordering::Relaxed);
         for _ in 0..100 {
             assert_eq!(cache.get_selected(1, 4096, 1, Option::is_some), Some(None));
         }
-        assert_eq!(cache.state.lock().unwrap().clock, clock);
-        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+        assert_eq!(cache.clock.load(Ordering::Relaxed), clock);
+        assert_eq!(cache.entries.read().unwrap().len(), 1);
         assert_eq!(cache.get_selected(1, 4096, 2, Option::is_some), None);
     }
 
@@ -274,19 +291,19 @@ mod tests {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, 42);
         assert_eq!(cache.get(1, 4096, 2), None);
-        assert!(cache.state.lock().unwrap().entries.is_empty());
+        assert!(cache.entries.read().unwrap().is_empty());
         cache.insert(1, 4096, 2, 1, 43);
         cache.invalidate(4096);
-        assert!(cache.state.lock().unwrap().entries.is_empty());
+        assert!(cache.entries.read().unwrap().is_empty());
     }
 
     #[test]
     fn cache_lru_recency_exhaustion_discards_safely() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, 42);
-        cache.state.lock().unwrap().clock = u64::MAX;
+        cache.clock.store(u64::MAX, Ordering::Relaxed);
         assert_eq!(cache.get(1, 4096, 1), None);
-        assert!(cache.state.lock().unwrap().entries.is_empty());
+        assert!(cache.entries.read().unwrap().is_empty());
         assert!(cache.insert(1, 8192, 1, 1, 43));
         assert_eq!(cache.get(1, 8192, 1), Some(43));
     }
@@ -352,5 +369,86 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(cache.get(1, 4096, 2), None);
+    }
+
+    /// The order of eviction is that of a plain least-recently-used list:
+    /// a hit makes an entry the most recent, an insertion adds or replaces
+    /// one as the most recent, and a full cache evicts the least recent.
+    #[test]
+    fn cache_eviction_order_is_least_recently_used() {
+        let cache = EpochCache::new();
+        // Most recent last.
+        let mut model: Vec<u64> = Vec::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for step in 0..20_000_u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let rip = seed % 1536;
+            if seed & 0x30000 == 0 {
+                assert!(cache.insert(1, rip, 1, 1, rip));
+                model.retain(|&other| other != rip);
+                if model.len() >= 1024 {
+                    model.remove(0);
+                }
+                model.push(rip);
+            } else {
+                let expected = model.contains(&rip).then_some(rip);
+                assert_eq!(cache.get(1, rip, 1), expected, "step {step}");
+                if expected.is_some() {
+                    model.retain(|&other| other != rip);
+                    model.push(rip);
+                }
+            }
+        }
+        let mut held = cache
+            .entries
+            .read()
+            .unwrap()
+            .keys()
+            .map(|&(_, rip)| rip)
+            .collect::<Vec<_>>();
+        let mut expected = model.clone();
+        held.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(held, expected);
+        assert_eq!(model.len(), 1024);
+    }
+
+    /// Hits from many Workers at once keep every entry and raise each
+    /// entry's stamp past the stamps of the insertions before them.
+    #[test]
+    fn cache_shared_hits_keep_entries_and_stamps() {
+        let cache = std::sync::Arc::new(EpochCache::new());
+        for rip in 0..64 {
+            cache.insert(1, rip, 1, 1, rip);
+        }
+        let inserted = cache.clock.load(Ordering::Relaxed);
+        let workers = (0..4)
+            .map(|_| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    for round in 0..1000 {
+                        for rip in 0..64 {
+                            assert_eq!(cache.get(1, rip, 1), Some(rip), "round {round}");
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            cache.clock.load(Ordering::Relaxed),
+            inserted + 4 * 1000 * 64
+        );
+        let entries = cache.entries.read().unwrap();
+        assert_eq!(entries.len(), 64);
+        assert!(
+            entries
+                .values()
+                .all(|entry| entry.access.load(Ordering::Relaxed) > inserted)
+        );
     }
 }

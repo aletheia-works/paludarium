@@ -45,8 +45,9 @@ export function jitImports(memory, cost = null, now = () => performance.now()) {
     return true;
   };
   let running = false;
-  const range = (pointer, length) => Number.isInteger(pointer) && pointer > 0
-    && Number.isInteger(length) && length > 0 && pointer + length <= memory.buffer.byteLength;
+  const inside = (pointer, length, size) => Number.isInteger(pointer) && pointer > 0
+    && Number.isInteger(length) && length > 0 && pointer + length <= size;
+  const range = (pointer, length) => inside(pointer, length, memory.buffer.byteLength);
   return {
     prepare(key, codePointer, codeLength) {
       if (running || !Number.isInteger(key) || key <= 0 || codeLength > 65536
@@ -93,8 +94,11 @@ export function jitImports(memory, cost = null, now = () => performance.now()) {
         cost(89, bytes.length);
         return equalBytes(entry.bytes, bytes) ? 0 : -1;
       }
-      if (running || !Number.isInteger(key) || key <= 0 || codeLength > 65536
-          || stateLength !== JIT_STATE_BYTES || !range(codePointer, codeLength) || !range(statePointer, stateLength)) return -1;
+      // The buffer is read once: on every block the JIT runs, its getter and
+      // the views made from it showed in profiles of the Wasm gate's probe.
+      const buffer = memory.buffer;
+      if (running || !Number.isInteger(key) || key <= 0 || codeLength > 65536 || stateLength !== JIT_STATE_BYTES
+          || !inside(codePointer, codeLength, buffer.byteLength) || !inside(statePointer, stateLength, buffer.byteLength)) return -1;
       // A module ID is allocated in shared Rust and never reused. Each Worker
       // separately compiles it; JS objects/handles never cross Worker boundaries.
       // The module runs from prepare's private copy of its bytes, compared
@@ -105,7 +109,7 @@ export function jitImports(memory, cost = null, now = () => performance.now()) {
       if (entry.bytes.length !== codeLength) return -1;
       running = true;
       try {
-        rollback.set(new Uint8Array(memory.buffer, statePointer, stateLength));
+        rollback.set(new Uint8Array(buffer, statePointer, stateLength));
         if (cost) cost(19, stateLength);
         entry.used = ++clock;
         try {

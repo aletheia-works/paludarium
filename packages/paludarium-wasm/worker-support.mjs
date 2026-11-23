@@ -31,8 +31,10 @@ export function imports(memory, { spawnTask, cost, net } = {}) {
   return {
     env: { memory },
     paludarium: {
-      jit_prepare: (...arguments_) => jit.prepare(...arguments_),
-      jit_execute: (...arguments_) => jit.execute(...arguments_),
+      // Passed as they are: neither uses `this`, and a wrapper with rest
+      // parameters would build an array on every block the JIT runs.
+      jit_prepare: jit.prepare,
+      jit_execute: jit.execute,
       spawn_task(handle) {
         try { if (!spawnTask || !Number.isInteger(handle) || handle <= 0) return -1; spawnTask(handle); return 0; }
         catch { return -1; }

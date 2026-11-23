@@ -10,11 +10,13 @@
    not count for an address that needs none. Groups of the node or link need
    one too, and a TCP socket takes no group. getsockname gives the device as
    the scope ID of an address that needs one. UDP sendto a link-local
-   address goes through the scope ID's device, else the socket's, else the
-   first route's; B's recvfrom gives the device it came in on as the
-   sender's scope ID, and A's of B's answer va's. connect takes a scope ID
-   as sendto does, which must be the socket's device if it has one, and the
-   device stays though the connect fails. The two processes take
+   address goes through the scope ID's device, even one not the socket's,
+   else the socket's, else the first route's; B's recvfrom gives the device
+   it came in on as the sender's scope ID, and A's of B's answer va's.
+   connect takes a scope ID as sendto does, which must be the socket's
+   device if it has one; a TCP socket keeps it though the connect fails.
+   (Linux master puts a UDP socket's back, which kernels without its fix
+   do not, so no line here depends on it.) The two processes take
    turns through pipes, so their lines come in one order; an address done
    and a neighbour resolved are waited for on netlink. */
 #define _GNU_SOURCE
@@ -480,6 +482,7 @@ int main(int argc, char **argv) {
     B_DOES("d");
     receive(any, "recvfrom");
     send_to(bound, "fe80::ff:fe00:b", 6000, 0, "bound", "from the bound one");
+    send_to(bound, "fe80::ff:fe00:b", 6000, 1, "x", "from the bound one through lo");
     B_DOES("d");
     receive(bound, "recvfrom");
     send_to(any, "2001:db8::2", 6000, A_INDEX, "global", "global with a scope ID");
@@ -500,7 +503,6 @@ int main(int argc, char **argv) {
     connect6(s, b_ll, 6000, 0, "udp without a scope ID");
     peer(s, "its peer");
     connect6(s, b_ll, 6000, 999, "udp scope ID of no device");
-    connect6(s, b_ll, 6000, 0, "then without one");
     close(s);
     s = udp();
     bind6(s, "::", 6200, 0, whole, "udp on 6200");
@@ -524,6 +526,7 @@ int main(int argc, char **argv) {
     s = socket(AF_INET6, SOCK_STREAM, 0);
     connect6(s, b_ll, 7000, 0, "tcp without a scope ID");
     connect6(s, b_ll, 7000, A_INDEX, "tcp through va");
+    connect6(s, b_ll, 7000, 0, "then without a scope ID");
     close(s);
     s = socket(AF_INET6, SOCK_STREAM, 0);
     bind6(s, own, 0, 1, whole, "tcp scope ID of lo");

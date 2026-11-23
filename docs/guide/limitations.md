@@ -1057,8 +1057,11 @@ verified.
   multipath siblings, are `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
   link without a scope ID or a device is `EINVAL`, as Linux's is with no
   multicast interface, which none is here. A connection accepted from a
-  link-local address has no device, so its names have no scope ID. A
-  socket's device steers only its IPv6 datagrams and connects,
+  link-local address has no device, so its names have no scope ID. A UDP
+  connect whose route fails puts the socket's device back, as Linux
+  master does since "ipv6: fix device binding after failed datagram
+  connect"; a CI kernel without that fix keeps the device the scope ID
+  gave. A socket's device steers only its IPv6 datagrams and connects,
   and two sockets on one port conflict whatever their devices, where
   Linux's on different devices do not. Neighbour discovery makes none of
   the neighbours of the groups router solicitation, MLD reports and

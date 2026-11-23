@@ -2329,6 +2329,27 @@ impl InetSocket {
             self.options().device = device;
             s = self.lock();
         }
+        // Linux master puts the device back where the route fails
+        // (`__ip6_datagram_connect`, since "ipv6: fix device binding after
+        // failed datagram connect").
+        let connected = self.connect_datagram_to(&mut s, address, bound, device, &options);
+        if connected.is_err() && device != options.device {
+            drop(s);
+            self.options().device = options.device;
+        }
+        connected
+    }
+    /// The rest of [`Self::connect_datagram`] to `address`, from the port
+    /// `bound`, through `device`, once the scope ID has been taken.
+    fn connect_datagram_to(
+        &self,
+        s: &mut State,
+        address: SocketAddr,
+        bound: SocketAddr,
+        device: u32,
+        options: &Options,
+    ) -> Result<u64, Errno> {
+        let to = SocketAddr::new(plain(address.ip()), address.port());
         if to.is_ipv4() {
             self.mapped_source(bound)?;
         }
@@ -2337,7 +2358,7 @@ impl InetSocket {
             .route(to, Some(bound.ip()), device, self.now())?
         {
             Dest::Here(to) => {
-                let from = self.datagram_source(&mut s, to, &options)?;
+                let from = self.datagram_source(s, to, options)?;
                 self.ports().connect(&self.this, from, Some(to));
                 s.bound = Some(from);
                 s.peer = Some(to);
@@ -2346,7 +2367,7 @@ impl InetSocket {
             // from, which Linux's `__mkroute_output` takes from no
             // loopback address (`EINVAL`).
             Dest::Veth(_, cast) => {
-                let from = self.datagram_source(&mut s, to, &options)?;
+                let from = self.datagram_source(s, to, options)?;
                 if to.is_ipv6() && from.ip().is_unspecified() {
                     return Err(EADDRNOTAVAIL);
                 }

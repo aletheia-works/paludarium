@@ -4744,3 +4744,35 @@ fn netlink_tells_its_members_of_changes() {
     assert_eq!(join(&mut f, joined, 1, 30), errno(1));
     assert_eq!(join(&mut f, joined, 1, 32), 0);
 }
+#[test]
+fn a_failed_udp_connect_puts_the_device_back_and_a_tcp_one_keeps_it() {
+    let mut f = network_fixture(&["127.0.0.1:80"]);
+    // fe80::1, port 9, with the scope ID `scope`.
+    let link_local = |f: &Fixture, scope: u32| {
+        let mut a = 10u16.to_le_bytes().to_vec();
+        a.extend(9u16.to_be_bytes());
+        a.extend(0u32.to_le_bytes());
+        let mut ip = [0; 16];
+        ip[..2].copy_from_slice(&[0xfe, 0x80]);
+        ip[15] = 1;
+        a.extend(ip);
+        a.extend(scope.to_le_bytes());
+        f.mem.write(GuestAddr(DATA + 0x100), &a).unwrap();
+    };
+    let unreachable = Errno(101).to_syscall_return();
+    let invalid = Errno::EINVAL.to_syscall_return();
+    // Linux master's `__ip6_datagram_connect` puts the socket's device
+    // back when the route through the scope ID's fails, so a link-local
+    // peer without one needs one again.
+    let udp = f.ret(41, [10, 2, 0, 0, 0, 0]);
+    link_local(&f, 999);
+    assert_eq!(f.ret(42, [udp, DATA + 0x100, 28, 0, 0, 0]), unreachable);
+    link_local(&f, 0);
+    assert_eq!(f.ret(42, [udp, DATA + 0x100, 28, 0, 0, 0]), invalid);
+    // `tcp_v6_connect` keeps it.
+    let tcp = f.ret(41, [10, 1, 0, 0, 0, 0]);
+    link_local(&f, 999);
+    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 28, 0, 0, 0]), unreachable);
+    link_local(&f, 0);
+    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 28, 0, 0, 0]), unreachable);
+}

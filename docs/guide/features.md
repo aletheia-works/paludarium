@@ -5687,9 +5687,10 @@ one only with an `--allow-net`.
   `sendto` goes through the scope ID's device, for an address that needs
   one, else the socket's, strictly (`ENETUNREACH` where no route goes
   through it), and `connect`, UDP's and TCP's, the same way: the scope ID
-  becomes the socket's device, which stays though the connect fails;
-  `EINVAL` for one other than the device the socket has, or for none
-  where the socket has none (`__ip6_datagram_connect`, `tcp_v6_connect`).
+  becomes the socket's device, which a TCP socket keeps though the connect
+  fails and a UDP one does not, as Linux master puts it back; `EINVAL`
+  for one other than the device the socket has, or for none where the
+  socket has none (`__ip6_datagram_connect`, `tcp_v6_connect`).
 - **`listen`** keeps up to `backlog` + 1 connections waiting (at most
   4096, `net.core.somaxconn`); an unbound socket takes an ephemeral port on
   every address. A listener is readable while a connection waits (for

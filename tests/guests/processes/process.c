@@ -9784,8 +9784,8 @@ static int madvise_collapse_case(void) {
 }
 /* MADV_COLLAPSE of shmem's page cache: shared anonymous memory, a memfd
  * (shared and private mappings), a file of /dev/shm's tmpfs and System V
- * shared memory, each mapped
- * where its addresses and file offsets are 2 MiB aligned to each other. */
+ * shared memory, each mapped where its addresses and file offsets are 2 MiB
+ * aligned to each other. */
 static int madvise_collapse_shmem_case(void) {
     long page = 4096, huge = 2 << 20;
     char *map = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

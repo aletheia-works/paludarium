@@ -1131,9 +1131,15 @@ static int case_shmem(void) {
     /* A file of a tmpfs mount, /dev/shm, is shmem's: its hole waits too. */
     char tmpfs_path[] = "/dev/shm/uffd-shmem-XXXXXX";
     int tmpfs = mkstemp(tmpfs_path);
-    unlink(tmpfs_path);
-    ftruncate(tmpfs, 2 * PAGE);
+    if (tmpfs < 0 || unlink(tmpfs_path) || ftruncate(tmpfs, 2 * PAGE)) {
+        printf("tmpfs file: errno %d\n", errno);
+        return 3;
+    }
     char *mapped = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, tmpfs, 0);
+    if (mapped == MAP_FAILED) {
+        printf("tmpfs map: errno %d\n", errno);
+        return 4;
+    }
     printf("register tmpfs: %s\n", err(reg(fd, mapped, 2 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
     t = (struct toucher){mapped + 3, 0, 0, 0};
     pthread_create(&thread, NULL, touch, &t);

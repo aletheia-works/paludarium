@@ -74,8 +74,8 @@
    -1, BPF_LD_ABS and BPF_LD_IND, the context's fields read whole, narrower
    and sign-extended, bpf_get_smp_processor_id and a lookup of an array, a
    hash and an LRU hash inlined and of either of two arrays not, dead code
-   and jumps of 0 removed, a bpf_fastcall spill and fill removed with
-   their stack, a 32-bit cmpxchg's zero-extension, and with
+   and jumps of 0 removed, a bpf_fastcall spill and fill that stay, a
+   32-bit cmpxchg's zero-extension, and with
    BPF_F_TEST_RND_HI32 the 32-bit results' upper halves. Then what
    SO_ATTACH_BPF charges the socket for a program, after its rewrites, at
    the edge of net.core.optmem_max.
@@ -2438,9 +2438,10 @@ static int case_rewrites(void) {
             I(0x3f, 0, 2, 0, 0));
     REWRITE("jump over a jump of 0", 2, 10, 0, BASE, I(0x05, 0, 0, 1, 0), I(0x05, 0, 0, 0, 0),
             I(0x3f, 0, 2, 0, 0));
-    /* bpf_fastcall: the spill and fill around the inlined helper go, and
-       the stack with them, unless another access needs that stack. */
-    REWRITE("spill and fill around the processor", 0, 10, 0, PRO(MOV_REG(6, 1), MOV(0, 1)),
+    /* bpf_fastcall: a socket filter's bpf_get_smp_processor_id has none
+       (bpf_get_raw_smp_processor_id_proto), so the spill and fill around
+       it stay, and their stack, and only the call is inlined. */
+    REWRITE("spill and fill around the processor", 2, 10, 0, PRO(MOV_REG(6, 1), MOV(0, 1)),
             STX_DW(10, 1, -8), CALL(8), LDX_DW(1, 10, -8));
     REWRITE("spill and fill around the processor, the stack read", 2, 10, 0,
             PRO(MOV_REG(6, 1), MOV(0, 1), LDX_DW(3, 10, -8)), STX_DW(10, 1, -8), CALL(8),
@@ -2474,7 +2475,12 @@ static int case_rewrites(void) {
         for (int k = 0; k < 100; k++) big[at++] = (struct insn)I(0x3f, 0, 2, 1, 0);
         while (at < count - 1) big[at++] = (struct insn)MOV(0, 1);
         big[at++] = (struct insn)EXIT();
+        /* Without a log: Linux's at level 1 traces each instruction, more
+           than log_text holds (ENOSPC). */
         struct prog_attr p = attr(big, at);
+        p.log_level = 0;
+        p.log_buf = 0;
+        p.log_size = 0;
         long fd = bpf(PROG_LOAD, &p, sizeof p);
         int q[2];
         if (socketpair(AF_UNIX, SOCK_DGRAM, 0, q)) return 1;

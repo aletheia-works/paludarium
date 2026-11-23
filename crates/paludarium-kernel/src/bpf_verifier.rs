@@ -513,9 +513,7 @@ pub(crate) fn check(
         ..Walk::default()
     };
     let result = structure(insns, options, maps, &mut walk)
-        .map(|()| walk.fastcall_patterns(insns))
         .and_then(|()| walk.run(insns, options))
-        .and_then(|()| walk.remove_fastcall_spills_fills())
         .and_then(|()| walk.max_stack_depth(insns))
         .and_then(|()| rewrite::len(&walk.facts(insns, options)));
     let mut stack_depth: Vec<u32> = walk.depth.iter().map(|d| d.div_ceil(8) * 8).collect();
@@ -1262,17 +1260,6 @@ struct Walk {
     /// Each `bpf_map_lookup_elem` reached: the map it looked up, or none
     /// if paths looked up different ones (`map_ptr_state`, poisoned).
     lookups: std::collections::BTreeMap<usize, Option<u8>>,
-    /// Each function's `fastcall_stack_off` and `keep_fastcall_stack`.
-    fastcall: Vec<(i64, bool)>,
-    /// `fastcall_pattern` and `fastcall_spills_num` of each instruction.
-    pattern: Vec<bool>,
-    spills: Vec<usize>,
-    /// A pattern around a helper the walk refuses, which the walk did not
-    /// reach.
-    fastcall_unknown: bool,
-    /// The spills and fills `remove_fastcall_spills_fills` made `BPF_JA`
-    /// of 0.
-    nops: Vec<bool>,
 }
 
 impl Walk {
@@ -1610,10 +1597,8 @@ impl Walk {
                     );
                 }
                 let caller = frame != s.frame();
-                let insn = s.insn;
                 let (stack, subprog) = s.stack_of(frame);
                 self.deepen(subprog, -total);
-                self.fastcall_contract(insn, subprog, total);
                 let slot = ((-total - 1) / 8) as usize;
                 let aligned = total % 8 == 0;
                 match value {
@@ -1753,7 +1738,6 @@ impl Walk {
                 }
                 let subprog = s.stack_of(frame).1;
                 self.deepen(subprog, -base);
-                self.fastcall_contract(s.insn, subprog, base);
                 Ok(())
             }
             Reg::Ptr(Ptr::Value(map), base) => {
@@ -1934,10 +1918,8 @@ impl Walk {
         // The raw mode's writes, a byte at a time, after every argument:
         // the bytes are bytes the program may read.
         if let Some((frame, base)) = written {
-            let insn = s.insn;
             let (stack, subprog) = s.stack_of(frame);
             self.deepen(subprog, -base);
-            self.fastcall_contract(insn, subprog, base);
             for at in base..base + len {
                 stack[((-at - 1) / 8) as usize] = Slot::Bytes;
             }
@@ -2071,133 +2053,11 @@ impl Walk {
         Ok(Step::Next(start))
     }
 
-    /// `mark_fastcall_patterns`, before the walk: around a helper call,
-    /// pairs of a spill to the stack before it and a fill after, from the
-    /// function's lowest spill up, of the caller-saved registers the call
-    /// leaves (`bpf_fastcall`). Where the JIT inlines the helper, which of
-    /// those here is `bpf_get_smp_processor_id` alone, the pairs go after
-    /// the walk; elsewhere they keep their stack.
-    fn fastcall_patterns(&mut self, insns: &[Insn]) {
-        let n = insns.len();
-        self.fastcall = vec![(0, false); self.starts.len()];
-        self.pattern = vec![false; n];
-        self.spills = vec![0; n];
-        let spill =
-            |insn: Insn| insn.code == class::STX | mode::MEM | size::DW && insn.dst == FP as u8;
-        for f in 0..self.starts.len() {
-            let range = body(&self.starts, n, f);
-            let lowest = insns[range.clone()]
-                .iter()
-                .filter(|&&insn| spill(insn))
-                .map(|insn| i64::from(insn.off))
-                .fold(0, i64::min);
-            for c in range {
-                let call = insns[c];
-                if call.code != class::JMP | jmp::CALL || call.src != 0 {
-                    continue;
-                }
-                // get_helper_proto: no pattern around a helper the program
-                // may not call.
-                if !socket_filter_helper(call.imm) {
-                    continue;
-                }
-                let first = |j: usize| {
-                    c >= j && c + j < n && {
-                        let (stx, ldx) = (insns[c - j], insns[c + j]);
-                        spill(stx)
-                            && ldx.code == class::LDX | mode::MEM | size::DW
-                            && ldx.src == FP as u8
-                            && stx.src == ldx.dst
-                    }
-                };
-                let Some(params) = helper_params(call.imm) else {
-                    // A helper the walk refuses where it reaches it: a
-                    // pattern around it in dead code is refused after.
-                    if first(1) && i64::from(insns[c - 1].off) == lowest {
-                        self.fastcall_unknown = true;
-                    }
-                    continue;
-                };
-                // The call clobbers R0 and its arguments.
-                let mut expected: u32 = 0x3f & !((1 << (params + 1)) - 1);
-                let mut off = lowest;
-                let mut i = 1;
-                while i <= 6 {
-                    if !first(i) {
-                        break;
-                    }
-                    let (stx, ldx) = (insns[c - i], insns[c + i]);
-                    if expected & (1 << stx.src) == 0
-                        || i64::from(stx.off) != off
-                        || i64::from(ldx.off) != off
-                    {
-                        break;
-                    }
-                    expected &= !(1 << stx.src);
-                    self.pattern[c - i] = true;
-                    self.pattern[c + i] = true;
-                    i += 1;
-                    off += 8;
-                }
-                if i == 1 {
-                    continue;
-                }
-                if call.imm == func::GET_SMP_PROCESSOR_ID {
-                    self.spills[c] = i - 1;
-                } else {
-                    self.fastcall[f].1 = true;
-                }
-                self.fastcall[f].0 = self.fastcall[f].0.min(off);
-            }
-        }
-    }
-
-    /// `check_fastcall_stack_contract` of an access at `off` of the stack
-    /// of `subprog` by the instruction at `i`: one that is no pattern's,
-    /// below the patterns' stack, keeps every pattern of the function.
-    fn fastcall_contract(&mut self, i: usize, subprog: usize, off: i64) {
-        if self.fastcall[subprog].0 <= off || self.pattern[i] {
-            return;
-        }
-        self.fastcall[subprog].0 = i64::from(i16::MIN);
-        for j in body(&self.starts, self.pattern.len(), subprog) {
-            self.spills[j] = 0;
-            self.pattern[j] = false;
-        }
-    }
-
-    /// `remove_fastcall_spills_fills`, after the walk: the pairs around an
-    /// inlined helper become `BPF_JA` of 0, which `opt_remove_nops`
-    /// removes, and a function that had any, and keeps no other pattern's
-    /// stack, has only the stack above them.
-    fn remove_fastcall_spills_fills(&mut self) -> Checked<()> {
-        if self.fastcall_unknown {
-            return gap("bpf_fastcall patterns around helpers the verifier refuses");
-        }
-        self.nops = vec![false; self.spills.len()];
-        for f in 0..self.starts.len() {
-            let mut modified = false;
-            for c in body(&self.starts, self.spills.len(), f) {
-                for j in 1..=self.spills[c] {
-                    self.nops[c - j] = true;
-                    self.nops[c + j] = true;
-                    modified = true;
-                }
-            }
-            let (off, keep) = self.fastcall[f];
-            if modified && !keep {
-                self.depth[f] = (-off) as u32;
-            }
-        }
-        Ok(())
-    }
-
     /// What the rewrites after the walk depend on.
     fn facts<'a>(&'a self, insns: &'a [Insn], options: Options) -> rewrite::Facts<'a> {
         rewrite::Facts {
             insns,
             seen: &self.seen,
-            nops: &self.nops,
             through_ctx: &self.through_ctx,
             lookups: &self.lookups,
             maps: &self.maps,
@@ -4317,23 +4177,18 @@ mod tests {
     }
 
     #[test]
-    fn a_fastcall_spill_and_fill_go_with_their_stack() {
-        let options = Options::default();
-        // *(u64 *)(r10 - 8) = r1; call bpf_get_smp_processor_id;
-        // r1 = *(u64 *)(r10 - 8): the pair goes, and the call is 3.
-        let pattern = [i(0x7b, 10, 1, -8, 0), call(8), i(0x79, 1, 10, -8, 0)];
-        let mut insns = pattern.to_vec();
-        insns.extend([mov(0, 0), exit()]);
-        assert_eq!(rewritten(&insns, options), (5, vec![0]));
-        // Another read of that stack keeps it.
-        let mut kept = vec![i(0x79, 3, 10, -8, 0)];
-        kept.extend(&insns);
-        assert_eq!(rewritten(&kept, options), (8, vec![8]));
-        // Around a helper the JIT does not inline, the pair stays, and the
-        // stack with it.
-        let mut insns = vec![i(0x7b, 10, 1, -8, 0), call(5), i(0x79, 1, 10, -8, 0)];
-        insns.extend([mov(0, 0), exit()]);
-        assert_eq!(rewritten(&insns, options), (5, vec![8]));
+    fn a_fastcall_spill_and_fill_stay_with_their_stack() {
+        // A socket filter's bpf_get_smp_processor_id is
+        // bpf_get_raw_smp_processor_id_proto, which has no bpf_fastcall:
+        // the pair around it stays, and only the call is inlined.
+        let insns = [
+            i(0x7b, 10, 1, -8, 0),
+            call(8),
+            i(0x79, 1, 10, -8, 0),
+            mov(0, 0),
+            exit(),
+        ];
+        assert_eq!(rewritten(&insns, Options::default()), (7, vec![8]));
     }
 
     #[test]

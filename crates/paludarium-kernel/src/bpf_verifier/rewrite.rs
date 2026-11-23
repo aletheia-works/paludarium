@@ -9,9 +9,10 @@
 //! - `opt_hard_wire_dead_code_branches`, `opt_remove_dead_code` and
 //!   `opt_remove_nops` (the loader has `CAP_BPF`): a conditional jump one
 //!   of whose sides no path took becomes a `BPF_JA`, the instructions no
-//!   path reached go, and then each `BPF_JA` of 0 as the pass comes to it,
-//!   the spills and fills `remove_fastcall_spills_fills` made one among
-//!   them;
+//!   path reached go, and then each `BPF_JA` of 0 as the pass comes to it
+//!   (`remove_fastcall_spills_fills` makes none: a socket filter's
+//!   `bpf_get_smp_processor_id` is `bpf_get_raw_smp_processor_id_proto`,
+//!   which has no `bpf_fastcall`);
 //! - `convert_ctx_accesses`: an access to the `struct __sk_buff` becomes
 //!   the loads of `struct sk_buff` that `bpf_convert_ctx_access` gives;
 //! - `do_misc_fixups`: a division or remainder by a register gets its
@@ -34,8 +35,6 @@ pub(super) struct Facts<'a> {
     pub(super) insns: &'a [Insn],
     /// `seen`, per instruction.
     pub(super) seen: &'a [bool],
-    /// The fastcall spills and fills made `BPF_JA` of 0.
-    pub(super) nops: &'a [bool],
     /// Each load or store, and whether through the context.
     pub(super) through_ctx: &'a BTreeMap<usize, bool>,
     /// Each lookup, and its one map.
@@ -121,9 +120,6 @@ fn removed_nop(f: &Facts<'_>, seen_before: &[usize], i: usize) -> bool {
     // opt_hard_wire_dead_code_branches.
     let taken = (i as i64 + insn.jump() + 1) as usize;
     let wired = cond_jump(insn) && (!f.seen[i + 1] || !f.seen[taken]);
-    if f.nops[i] {
-        return true;
-    }
     if !ja && !wired {
         return false;
     }
@@ -318,14 +314,12 @@ mod tests {
     fn facts<'a>(
         insns: &'a [Insn],
         seen: &'a [bool],
-        nops: &'a [bool],
         zext: &'a [bool],
         empty: &'a (BTreeMap<usize, bool>, BTreeMap<usize, Option<u8>>),
     ) -> Facts<'a> {
         Facts {
             insns,
             seen,
-            nops,
             through_ctx: &empty.0,
             lookups: &empty.1,
             maps: &[],
@@ -345,24 +339,21 @@ mod tests {
         let insns = [ja(1), mov, mov, exit];
         let seen = [true, false, true, true];
         let n = [false; 4];
-        assert_eq!(len(&facts(&insns, &seen, &n, &n, &empty)), Ok(2));
+        assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(2));
         // A jump over a nop that goes later stays as a jump of 0.
         let insns = [ja(1), ja(0), mov, exit];
         let seen = [true; 4];
-        assert_eq!(len(&facts(&insns, &seen, &n, &n, &empty)), Ok(3));
+        assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(3));
         // A conditional jump whose target is dead is a jump of 0, and one
         // whose fall-through is dead goes to the target.
         let insns = [jeq(1), mov, mov, exit];
         let seen = [true, true, false, true];
-        assert_eq!(len(&facts(&insns, &seen, &n, &n, &empty)), Ok(2));
+        assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(2));
         let seen = [true, false, true, true];
-        assert_eq!(len(&facts(&insns, &seen, &n, &n, &empty)), Ok(2));
+        assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(2));
         // Both sides taken: the jump stays.
         let seen = [true; 4];
-        assert_eq!(len(&facts(&insns, &seen, &n, &n, &empty)), Ok(4));
-        // The fastcall spills and fills go.
-        let nops = [false, true, false, false];
-        assert_eq!(len(&facts(&insns, &seen, &nops, &n, &empty)), Ok(3));
+        assert_eq!(len(&facts(&insns, &seen, &n, &empty)), Ok(4));
     }
 
     #[test]
@@ -374,7 +365,7 @@ mod tests {
             let insns = [insn, exit];
             let seen = [true; 2];
             let n = [false; 2];
-            len(&facts(&insns, &seen, &n, &n, &empty)).unwrap() - 1
+            len(&facts(&insns, &seen, &n, &empty)).unwrap() - 1
         };
         assert_eq!(count(i(class::ALU64 | alu::DIV | x, 0, 1, 1, 0)), 8);
         assert_eq!(count(i(class::ALU64 | alu::DIV | x, 0, 1, 0, 0)), 4);

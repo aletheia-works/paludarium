@@ -5020,11 +5020,9 @@ kernel.
   are inlined (`do_misc_fixups`). A 32-bit `BPF_CMPXCHG` whose R0 is read
   as 64 bits is zero-extended, and with `BPF_F_TEST_RND_HI32` a 32-bit
   result never read as more gets three instructions that fill its upper
-  half (`opt_subreg_zext_lo32_rnd_hi32`). Spills and fills around
-  `bpf_get_smp_processor_id` of the registers it leaves, from the
-  function's lowest spill up (`bpf_fastcall`), go as well, and the
-  function's stack depth no longer counts them, unless another access
-  uses that stack or such a pattern around another helper keeps it. A
+  half (`opt_subreg_zext_lo32_rnd_hi32`). No `bpf_fastcall` spill and
+  fill goes: a socket filter's `bpf_get_smp_processor_id` is
+  `bpf_get_raw_smp_processor_id_proto`, which has none. A
   rewrite after which a jump no longer reaches in 16 bits is `ENOMEM`
   ("insn %d cannot be patched due to 16-bit range"). The program's memory
   grows to the instructions the rewrites make (`bpf_prog_realloc`), and

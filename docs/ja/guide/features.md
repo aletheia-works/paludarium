@@ -4334,10 +4334,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   配列・ハッシュ・LRU ハッシュの検索はインライン化されます（`do_misc_fixups`）。R0 を 64
   ビットとして読む 32 ビットの `BPF_CMPXCHG` はゼロ拡張され、`BPF_F_TEST_RND_HI32` では、
   それ以上の幅で読まない 32 ビットの結果に、上位の半分を埋める 3 命令が付きます
-  （`opt_subreg_zext_lo32_rnd_hi32`）。`bpf_get_smp_processor_id` の前後で、それが残すレジスタを
-  関数の最も低いスピルから退避して戻す命令（`bpf_fastcall`）も除かれ、関数のスタックの深さにも
-  数えなくなります。ただし、ほかのアクセスがそのスタックを使うか、ほかのヘルパーの前後の同じ形が
-  それを残すときは別です。書き換えの後にジャンプが 16 ビットで届かなくなるものは `ENOMEM`
+  （`opt_subreg_zext_lo32_rnd_hi32`）。`bpf_fastcall` の退避と復帰は除かれません。
+  ソケットフィルターの `bpf_get_smp_processor_id` は `bpf_get_raw_smp_processor_id_proto` で、
+  `bpf_fastcall` がないためです。書き換えの後にジャンプが 16 ビットで届かなくなるものは `ENOMEM`
   です（"insn %d cannot be patched due to 16-bit range"）。プログラムのメモリは書き換えが作る
   命令まで増え（`bpf_prog_realloc`）、ソケットにはその分を課金します。
 

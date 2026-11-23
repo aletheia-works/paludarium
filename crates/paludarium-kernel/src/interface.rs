@@ -4209,11 +4209,8 @@ mod tests {
             oif,
             device: oif == 1 || oif == 1000,
             flags: if onlink { 4 } else { 0 },
-            ..ask4("10.2.0.0", 24, 1, 0x600)
-        };
-        let ask = |via: &str, oif: u32, onlink: bool| Ask4 {
             scope: SCOPE_UNIVERSE,
-            ..ask(via, oif, onlink)
+            ..ask4("10.2.0.0", 24, 1, 0x600)
         };
         let up = |_: u32| true;
         let error = |a: &mut Addresses, via, oif, onlink| {

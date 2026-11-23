@@ -1064,10 +1064,11 @@ verified.
   across a pair to an address of the peer's namespace; it takes IPv6
   addresses, makes its link-local one and its routes, and takes IPv6
   routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
-  and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6 gateway's neighbour state does not steer a
-  lookup, as Linux's `rt6_check_neigh` does among routes of one metric,
-  and two routes with gateways of one metric, which Linux makes
-  multipath siblings, are `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
+  and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
+  gateway's neighbour state does not steer a lookup, as Linux's
+  `rt6_check_neigh` does among routes of one metric, and two routes with
+  gateways of one metric, which Linux makes multipath siblings, are
+  `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
   link without a scope ID or a device is `EINVAL`, as Linux's is with no
   multicast interface, which none is here. A connection accepted from a
   link-local address has no device, so its names have no scope ID. A UDP

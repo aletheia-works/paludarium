@@ -275,7 +275,9 @@ static int case_rw(void) {
     }
     struct iocb *list[8];
     for (int i = 0; i < 8; i++) list[i] = &cbs[i];
-    printf("submit=%ld key=%#x\n", submit(ctx, 7, list), cbs[0].aio_key);
+    /* Submitted first: io_submit writes aio_key, and the order printf's arguments are evaluated in is unspecified. */
+    long submitted = submit(ctx, 7, list);
+    printf("submit=%ld key=%#x\n", submitted, cbs[0].aio_key);
     reap("events", ctx, 7, cbs);
     uint64_t count = 0;
     printf("eventfd=%zd", read(evfd, &count, 8));
@@ -798,7 +800,9 @@ static int case_reap(void) {
     int p[2], go[2], done[2];
     if (pipe(p) || pipe(go) || pipe(done)) return 4;
     struct iocb cb = poll_of(p[0], POLLIN, 7);
-    printf("submit=%ld head=%u tail=%u\n", submit1(ctx, &cb), ring->head, ring->tail);
+    /* Submitted before the ring is read, not in printf's arguments, whose evaluation order is unspecified. */
+    long submitted = submit1(ctx, &cb);
+    printf("submit=%ld head=%u tail=%u\n", submitted, ring->head, ring->tail);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -831,7 +835,8 @@ static int case_reap(void) {
         __atomic_store_n(&ring->head, (head + 1) % ring->nr, __ATOMIC_RELEASE);
     }
     struct io_event ev[8];
-    printf("after: getevents=%ld empty=%u one-taken=%u\n", getevents(ctx, 0, 8, ev, &zero), ring->head == ring->tail ? 1u : 0u,
+    long got = getevents(ctx, 0, 8, ev, &zero);
+    printf("after: getevents=%ld empty=%u one-taken=%u\n", got, ring->head == ring->tail ? 1u : 0u,
            ring->tail == (head + 1) % ring->nr ? 1u : 0u);
     write(done[1], "d", 1);
     int status = 0;

@@ -5385,7 +5385,8 @@ kernel.
   new directory's. A FIFO's or device's read or write is not its
   directory's, as `__fsnotify_parent` keeps it from the directory's
   interest, but a group that needs the directory and name hears of it with
-  them, without `FAN_EVENT_ON_CHILD`. An event is queued as `fanotify_handle_event` makes it:
+  them, without `FAN_EVENT_ON_CHILD`. An event is queued as
+  `fanotify_handle_event` makes it:
   without a FID mode only the open, access, modification and close of a
   regular file or directory, with a descriptor of it opened again with the
   group's flags, which `F_GETFL` shows with `O_CLOEXEC` and which a

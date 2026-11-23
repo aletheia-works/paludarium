@@ -1,7 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
+import { serveInputs } from "./wasm-browser-guests.mjs";
 
-export function createJitHandler({ root, modulePath, page, encoded, oracle, onRow, read = readFile }) {
+export function createJitHandler({ root, modulePath, page, encoded, guests = {}, oracle, onRow, read = readFile }) {
+  const input = Buffer.from(JSON.stringify(encoded));
   const headers = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };
   return async (request, response) => {
     const send = (status, body, type) => {
@@ -11,7 +13,7 @@ export function createJitHandler({ root, modulePath, page, encoded, oracle, onRo
     };
     try {
       if (request.url === "/") send(200, page, "text/html");
-      else if (request.url === "/input.json") send(200, JSON.stringify(encoded), "application/json");
+      else if (serveInputs(request, response, headers, input, guests)) return;
       else if (request.url === "/row" && request.method === "POST") {
         const chunks = []; let size = 0;
         for await (const chunk of request) {

@@ -26,21 +26,24 @@ if (environment === "node") {
   const page = `<!doctype html><script type="module">
 import {createPaludarium} from '/packages/paludarium-wasm/index.mjs';
 import {observeX87} from '/packages/paludarium-wasm/tests/wasm-x87.mjs';
+import {loadJson, loadGuests} from '/packages/paludarium-wasm/tests/wasm-browser-load.mjs';
 try {
  if (!crossOriginIsolated) throw new Error('Shared memory unavailable');
- const input = await (await fetch('/input.json')).json();
- const x87 = Uint8Array.from(atob(input.x87), char => char.charCodeAt(0));
+ const input = await loadJson('/input.json');
+ const {x87} = await loadGuests(['x87']);
  const onRow = async (name, row) => { await fetch('/row', {method: 'POST', body: JSON.stringify({name, row})}); };
  const rows = await observeX87(() => createPaludarium({wasmUrl: '/production.wasm'}), {x87, cases: input.cases, native: input.native, onRow});
  window.__wasmReport = {rows, passed: Object.values(rows).every(row => row.pass), complete: true};
 } catch (error) { window.__wasmReport = {passed: false, complete: false, error: String(error)}; }
 </script>`;
-  const input = JSON.stringify({ x87: Buffer.from(x87).toString("base64"), cases, native });
+  const { serveInputs } = await import("./wasm-browser-guests.mjs");
+  // The binary is served raw at /guest/x87; input.json keeps the cases and the native results.
+  const input = Buffer.from(JSON.stringify({ cases, native })), guests = { x87 };
   const headers = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };
   const server = createServer(async (request, response) => {
     try {
       if (request.url === "/") response.writeHead(200, { ...headers, "Content-Type": "text/html" }).end(page);
-      else if (request.url === "/input.json") response.writeHead(200, { ...headers, "Content-Type": "application/json" }).end(input);
+      else if (serveInputs(request, response, headers, input, guests)) return;
       else if (request.url === "/row" && request.method === "POST") {
         // Each row as it comes, so that a case that hangs leaves the ones before it.
         const chunks = []; let size = 0;

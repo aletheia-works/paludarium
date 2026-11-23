@@ -42,26 +42,48 @@ const RETRY_PAUSE_MS = 2000;
 
 // A Safari that was told to quit (the CI warm-up's, or an earlier session's) may still be exiting when the next
 // session is asked for; safaridriver then attaches to it as it goes, which is one way its "host application never
-// became ready". Before a session, wait until no Safari process is left, polled with `pgrep -x Safari` and bounded:
-// past the bound the session is asked for anyway, and the log says so. The tests shorten the bound.
-export const safariExit = { waitMs: 15000, pollMs: 250 };
-function safariRunning() {
-  const probe = spawn("/usr/bin/pgrep", ["-x", "Safari"], { stdio: "ignore" });
+// became ready", and a page load in the next session can fail (#919, #922). Before a session, the pids of one
+// `pgrep -x Safari` are each waited for with `caffeinate -w <pid>`, which returns on the process's exit (an event,
+// not a poll), all within one deadline. A Safari past it is logged as never exited, with its pid, and then killed
+// with SIGKILL only on CI, where every Safari is the job's own; elsewhere it may be the person's own browser, so it
+// is only logged. The session is asked for after that either way. The tests shorten the bounds and set `kill`.
+export const safariExit = { waitMs: 15000, killWaitMs: 5000, kill: process.env.GITHUB_ACTIONS === "true" };
+function safariPids() {
+  const probe = spawn("/usr/bin/pgrep", ["-x", "Safari"], { stdio: ["ignore", "pipe", "ignore"] });
+  let out = "";
+  probe.stdout.on("data", bytes => { out += bytes; });
   return new Promise(resolve => {
-    probe.once("exit", code => resolve(code === 0));
-    probe.once("error", () => resolve(false));
+    probe.once("close", () => resolve(out.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger)));
+    probe.once("error", () => resolve([]));
+  });
+}
+// Whether `pid` exited within `ms`.
+function exitOf(pid, ms) {
+  const waiter = spawn("/usr/bin/caffeinate", ["-w", String(pid)], { stdio: "ignore" });
+  return new Promise(resolve => {
+    const bound = setTimeout(() => { resolve(false); waiter.kill("SIGTERM"); }, ms);
+    waiter.once("exit", () => { clearTimeout(bound); resolve(true); });
+    waiter.once("error", () => { clearTimeout(bound); resolve(false); });
   });
 }
 async function untilSafariExited() {
-  const start = Date.now();
-  let polls = 0;
-  while (await safariRunning()) {
-    polls += 1;
-    const waited = Date.now() - start;
-    if (waited >= safariExit.waitMs) return { exited: false, waited_ms: waited, polls };
-    await sleep(safariExit.pollMs);
+  const start = Date.now(), deadline = start + safariExit.waitMs;
+  const pids = await safariPids();
+  const exited = await Promise.all(pids.map(pid => exitOf(pid, Math.max(0, deadline - Date.now()))));
+  const left = pids.filter((_, index) => !exited[index]);
+  const wait = { exited: left.length === 0, waited_ms: Date.now() - start, pids };
+  if (left.length === 0) return wait;
+  wait.never_exited = [];
+  for (const pid of left) {
+    const entry = { pid, killed: false, exited_after_kill: null };
+    console.error(JSON.stringify({ safari_never_exited: { pid, waited_ms: wait.waited_ms, killing: safariExit.kill } }));
+    if (safariExit.kill) {
+      try { process.kill(pid, "SIGKILL"); entry.killed = true; } catch (error) { entry.kill_error = String(error); }
+      entry.exited_after_kill = await exitOf(pid, safariExit.killWaitMs);
+    }
+    wait.never_exited.push(entry);
   }
-  return { exited: true, waited_ms: Date.now() - start, polls };
+  return wait;
 }
 
 async function safari(url, timeout) {
@@ -111,7 +133,7 @@ async function safariAttempt(url, timeout) {
     }
     phase = "safari-exit-wait";
     exitWait = await untilSafariExited();
-    if (exitWait.polls > 0) console.error(JSON.stringify({ safari_exit_wait: exitWait }));
+    if (exitWait.pids.length > 0) console.error(JSON.stringify({ safari_exit_wait: exitWait }));
     phase = "session-creation";
     sessionRequestedAfter = Date.now() - started;
     const session = await webdriverRequest(base, "POST", "/session", { capabilities: { alwaysMatch: { browserName: "safari" } } }, 60000);

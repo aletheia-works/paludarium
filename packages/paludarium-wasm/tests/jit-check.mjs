@@ -39,13 +39,16 @@ try {
     report.version = process.version;
     result = await runJitSuite({ ...input, wasmUrl: pathToFileURL(resolve(modulePath)), onRow });
   } else {
-    const encoded = { ...input, probe: probe.toString("base64"), aube: aube.toString("base64"), ripgrep: ripgrep.toString("base64"), coreutils: coreutils.toString("base64"),
+    // The guests are served raw at /guest/<name>; input.json keeps the oracle, the configs and the fixtures.
+    const guests = { probe, aube, ripgrep, coreutils };
+    const encoded = { oracle, config: input.config, ripgrepCases, coreutilsCases,
       coreutilsFixture: Object.fromEntries(Object.entries(coreutilsFixture).map(([name, bytes]) => [name, Buffer.from(bytes).toString("base64")])),
       fixtures: Object.fromEntries(Object.entries(fixtures).map(([name, bytes]) => [name, Buffer.from(bytes).toString("base64")])) };
     const page = `<!doctype html><script type="module">
 import{runJitSuite}from'/packages/paludarium-wasm/tests/jit-suite.mjs';
-try{if(!crossOriginIsolated)throw Error('Shared memory unavailable');const input=await(await fetch('/input.json')).json();const decode=text=>Uint8Array.from(atob(text),c=>c.charCodeAt(0));input.probe=decode(input.probe);input.aube=decode(input.aube);input.ripgrep=decode(input.ripgrep);input.coreutils=decode(input.coreutils);for(const name of Object.keys(input.fixtures))input.fixtures[name]=decode(input.fixtures[name]);for(const name of Object.keys(input.coreutilsFixture))input.coreutilsFixture[name]=decode(input.coreutilsFixture[name]);window.__wasmReport=await runJitSuite({...input,wasmUrl:'/production.wasm',onRow:async(mode,name,row,group)=>{await fetch('/row',{method:'POST',body:JSON.stringify({mode,name,row,group})});}});}catch(error){window.__wasmReport={complete:false,passed:false,error:String(error)};}</script>`;
-    server = createServer(createJitHandler({ root, modulePath, page, encoded, oracle, onRow }));
+import{loadJson,loadGuests,decodeBase64 as decode}from'/packages/paludarium-wasm/tests/wasm-browser-load.mjs';
+try{if(!crossOriginIsolated)throw Error('Shared memory unavailable');const input=await loadJson('/input.json');Object.assign(input,await loadGuests(['probe','aube','ripgrep','coreutils']));for(const name of Object.keys(input.fixtures))input.fixtures[name]=decode(input.fixtures[name]);for(const name of Object.keys(input.coreutilsFixture))input.coreutilsFixture[name]=decode(input.coreutilsFixture[name]);window.__wasmReport=await runJitSuite({...input,wasmUrl:'/production.wasm',onRow:async(mode,name,row,group)=>{await fetch('/row',{method:'POST',body:JSON.stringify({mode,name,row,group})});}});}catch(error){window.__wasmReport={complete:false,passed:false,error:String(error)};}</script>`;
+    server = createServer(createJitHandler({ root, modulePath, page, encoded, guests, oracle, onRow }));
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     result = await runBrowser(environment, `http://127.0.0.1:${server.address().port}/`, 1200000);
   }

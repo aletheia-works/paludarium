@@ -8,21 +8,36 @@ import { isSafariLaunchFailure, runBrowser, safariExit, webdriverRequest } from 
 const LAUNCH_TIMEOUT = { error: "session not created", message: "Could not create a session: The session timed out while connecting to a Safari instance. The following asynchronous operation timed out: Finding or launching a compatible local Safari and waiting for its RWIApplication to appear and become ready.", stacktrace: "" };
 // The exact safaridriver answer of run 43576635510 attempt 1 (job 132402449303).
 const NEVER_READY = { error: "session not created", message: "Could not create a session: The host application never became ready, unable to create a WebDriver session.", stacktrace: "" };
-// Stub safaridriver/pkill, fetch, AbortSignal.timeout and console.error for one Safari run; everything is restored in finally.
-// `reply(key, count)` answers a WebDriver request (count = how many times that key was asked) with [status, value].
-// `running` is how many `pgrep -x Safari` polls still find a Safari before it has exited (default: none left).
-async function stubbedSafari(reply, run, running = 0) {
+// A stub `pgrep -x Safari` that prints `pids` and closes.
+function stubPgrep(child, pids) {
+  setImmediate(() => {
+    if (pids.length > 0) child.stdout.emit("data", Buffer.from(pids.join("\n") + "\n"));
+    child.exitCode = pids.length > 0 ? 0 : 1; child.emit("exit", child.exitCode, null); child.emit("close", child.exitCode, null);
+  });
+}
+// Stub safaridriver/pkill/pgrep/caffeinate, process.kill, fetch, AbortSignal.timeout and console.error for one Safari
+// run; everything is restored in finally. `reply(key, count)` answers a WebDriver request (count = how many times that
+// key was asked) with [status, value]. `safaris` maps the pid of each Safari still running to the ms after which it
+// exits (Infinity: only when killed); `caffeinate -w <pid>` exits when that Safari does.
+async function stubbedSafari(reply, run, safaris = {}) {
   const childProcess = createRequire(import.meta.url)("node:child_process");
-  const original = { spawn: childProcess.spawn, fetch: globalThis.fetch, timeout: AbortSignal.timeout, error: console.error };
-  const timeouts = new WeakMap(), requests = [], spawned = [], logged = [], counts = {};
+  const original = { spawn: childProcess.spawn, fetch: globalThis.fetch, timeout: AbortSignal.timeout, error: console.error, kill: process.kill };
+  const timeouts = new WeakMap(), requests = [], spawned = [], logged = [], counts = {}, killed = [];
+  const exits = Object.fromEntries(Object.entries(safaris).map(([pid, ms]) => {
+    let done; const exited = new Promise(resolve => { done = resolve; });
+    if (Number.isFinite(ms)) setTimeout(done, ms).unref();
+    return [pid, { exited, done }];
+  }));
   childProcess.spawn = (command, args) => {
     const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, stdout: new EventEmitter(), stderr: new EventEmitter() });
     child.kill = signal => { if (child.signalCode === null && child.exitCode === null) { child.signalCode = signal; setImmediate(() => child.emit("exit", null, signal)); } return true; };
     if (command === "/usr/bin/pkill") setImmediate(() => { child.exitCode = 0; child.emit("exit", 0, null); });
-    if (command === "/usr/bin/pgrep") { const code = running > 0 ? 0 : 1; running -= 1; setImmediate(() => { child.exitCode = code; child.emit("exit", code, null); }); }
+    if (command === "/usr/bin/pgrep") stubPgrep(child, Object.keys(safaris).map(Number));
+    if (command === "/usr/bin/caffeinate") (exits[args[1]]?.exited ?? Promise.resolve()).then(() => { if (child.signalCode === null) { child.exitCode = 0; child.emit("exit", 0, null); } });
     spawned.push({ command, args, child });
     return child;
   };
+  process.kill = (pid, signal) => { killed.push([pid, signal]); exits[pid]?.done(); return true; };
   syncBuiltinESMExports();
   AbortSignal.timeout = ms => { const signal = original.timeout.call(AbortSignal, ms); timeouts.set(signal, ms); return signal; };
   console.error = (...args) => { logged.push(args.join(" ")); };
@@ -33,8 +48,9 @@ async function stubbedSafari(reply, run, running = 0) {
     const [status, value] = reply(key, counts[key]) ?? [404, { error: "unexpected request" }];
     return new Response(JSON.stringify({ value }), { status });
   };
-  try { return { outcome: await run().then(value => ({ value }), error => ({ error })), requests, spawned, logged }; }
+  try { return { outcome: await run().then(value => ({ value }), error => ({ error })), requests, spawned, logged, killed }; }
   finally {
+    process.kill = original.kill;
     childProcess.spawn = original.spawn;
     syncBuiltinESMExports();
     globalThis.fetch = original.fetch;
@@ -67,7 +83,7 @@ test("Safari session creation alone waits 60000 ms while other WebDriver request
   childProcess.spawn = (command, args) => {
     const driver = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, stdout: new EventEmitter(), stderr: new EventEmitter() });
     driver.kill = signal => { if (driver.signalCode === null) { driver.signalCode = signal; setImmediate(() => driver.emit("exit", null, signal)); } return true; };
-    if (command === "/usr/bin/pgrep") setImmediate(() => { driver.exitCode = 1; driver.emit("exit", 1, null); });
+    if (command === "/usr/bin/pgrep") stubPgrep(driver, []);
     spawned.push({ command, args, driver });
     return driver;
   };
@@ -83,7 +99,7 @@ test("Safari session creation alone waits 60000 ms while other WebDriver request
   try {
     const result = await runBrowser("safari", "http://127.0.0.1/page", 5000);
     assert.equal(result.safari_exit_wait.exited, true);
-    assert.equal(result.safari_exit_wait.polls, 0);
+    assert.deepEqual(result.safari_exit_wait.pids, []);
     delete result.safari_exit_wait;
     assert.deepEqual(result, { environment: "safari", version: "stub", stub: true, session_retry: { attempts: 1, retried: false, first_failure: null } });
   } finally {
@@ -136,7 +152,7 @@ test("Safari launch timeout is retried once after stopping safaridriver and Safa
   assert.ok(!Number.isNaN(Date.parse(log.at)));
   assert.ok(Number.isInteger(log.failed_after_ms) && log.failed_after_ms >= 0);
   assert.ok(Number.isInteger(log.session_requested_after_ms) && log.session_requested_after_ms <= log.failed_after_ms);
-  assert.deepEqual(log.safari_exit_wait, { exited: true, waited_ms: log.safari_exit_wait.waited_ms, polls: 0 });
+  assert.deepEqual(log.safari_exit_wait, { exited: true, waited_ms: log.safari_exit_wait.waited_ms, pids: [] });
   assert.equal(log.pause_ms, 2000);
   assert.equal(retry.first_failed_after_ms, log.failed_after_ms);
 });
@@ -177,27 +193,33 @@ test("a second never-ready Safari stops after the single retry and keeps both fa
   assert.equal(run.requests.filter(r => r.key === "POST /session").length, 2);
   assert.equal(run.logged.length, 1);
 });
-test("a session waits for a Safari that is still exiting, and the wait is logged", async () => {
-  const run = await stubbedSafari(key => healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), 2);
+test("a session waits for the exit of a Safari that is still exiting, and the wait is logged", async () => {
+  const run = await stubbedSafari(key => healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), { 501: 30, 502: 60 });
   assert.ok(run.outcome.value, String(run.outcome.error));
-  assert.equal(run.outcome.value.safari_exit_wait.exited, true);
-  assert.equal(run.outcome.value.safari_exit_wait.polls, 2);
-  assert.deepEqual(run.spawned.map(({ command }) => command), ["/usr/bin/safaridriver", "/usr/bin/pgrep", "/usr/bin/pgrep", "/usr/bin/pgrep"]);
-  // The session is asked for only after the last poll found no Safari.
+  const wait = run.outcome.value.safari_exit_wait;
+  assert.equal(wait.exited, true); assert.deepEqual(wait.pids, [501, 502]); assert.ok(wait.waited_ms >= 50);
+  // One pgrep, then one exit wait per pid: no polling.
+  assert.deepEqual(run.spawned.map(({ command, args }) => [command, args]), [["/usr/bin/safaridriver", ["--port", "4455"]], ["/usr/bin/pgrep", ["-x", "Safari"]],
+    ["/usr/bin/caffeinate", ["-w", "501"]], ["/usr/bin/caffeinate", ["-w", "502"]]]);
+  // The session is asked for only after both exited.
   assert.deepEqual(run.requests.map(r => r.key).slice(0, 2), ["GET /status", "POST /session"]);
+  assert.deepEqual(run.killed, []);
   assert.equal(run.logged.length, 1);
   assert.deepEqual(Object.keys(JSON.parse(run.logged[0])), ["safari_exit_wait"]);
 });
-test("the wait for Safari to exit is bounded, and the session is asked for after it", async () => {
+for (const kill of [true, false]) test(`a Safari that never exits is logged with its pid${kill ? ", killed on CI" : " and left running off CI"}, and the session is asked for after it`, async () => {
   const saved = { ...safariExit };
-  Object.assign(safariExit, { waitMs: 50, pollMs: 10 });
+  Object.assign(safariExit, { waitMs: 50, killWaitMs: 50, kill });
   try {
-    const run = await stubbedSafari(key => healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), 1000);
+    const run = await stubbedSafari(key => healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), { 501: 10, 502: Infinity });
     assert.ok(run.outcome.value, String(run.outcome.error));
     const wait = run.outcome.value.safari_exit_wait;
-    assert.equal(wait.exited, false);
-    assert.ok(wait.waited_ms >= 50 && wait.polls >= 2);
+    assert.equal(wait.exited, false); assert.ok(wait.waited_ms >= 50); assert.deepEqual(wait.pids, [501, 502]);
+    assert.deepEqual(wait.never_exited, [{ pid: 502, killed: kill, exited_after_kill: kill ? true : null }]);
+    // Only the Safari that never exited, and only on CI.
+    assert.deepEqual(run.killed, kill ? [[502, "SIGKILL"]] : []);
     assert.equal(run.requests.filter(r => r.key === "POST /session").length, 1);
-    assert.equal(JSON.parse(run.logged[0]).safari_exit_wait.exited, false);
+    assert.deepEqual(JSON.parse(run.logged[0]), { safari_never_exited: { pid: 502, waited_ms: wait.waited_ms, killing: kill } });
+    assert.equal(JSON.parse(run.logged[1]).safari_exit_wait.exited, false);
   } finally { Object.assign(safariExit, saved); }
 });

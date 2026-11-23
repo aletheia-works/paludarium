@@ -15903,6 +15903,120 @@ static int thread_caps_status_case(void) {
     return 0;
 }
 
+/* The userns-nondumpable-read case: as Linux's __ptrace_may_access asks
+   (task_still_dumpable), an undumpable process is readable only with
+   CAP_SYS_PTRACE in the user namespace its program runs in: where it was
+   when it ran it (alloc_bprm), or, for a file it may not read, the nearest
+   one above that maps the file's owner and group (would_dump). The child, a
+   user that is not root, unshares a user namespace that maps its user as
+   root and no group, so it and its own children have every capability
+   there. Its children may open its environ while it is dumpable, not once
+   PR_SET_DUMPABLE has cleared it, as its program still runs in the first
+   namespace. A readable copy of this program it runs then runs in the new
+   one, so they may again; an execute-only copy, which it may not read as
+   the namespace does not map the copy's group, runs undumpable in the
+   first one, so they may not. An undumpable task's files are root's of
+   that namespace (task_dump_owner), so environ (0400) is refused by its mode
+   unless that root is the reader, and maps (0444) by the ptrace check alone.
+   Each probe prints 0 or the open's negated errno. */
+static int und_open(const char *file) {
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader < 0) return -1000;
+    if (reader == 0) {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/%s", (int)getppid(), file);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) close(fd);
+        _exit(fd >= 0 ? 0 : errno & 255);
+    }
+    int status = 0;
+    waitpid(reader, &status, 0);
+    return WIFEXITED(status) ? -WEXITSTATUS(status) : -1001;
+}
+
+static void und_probe(const char *when) {
+    int environ_error = und_open("environ");
+    printf("%s environ=%d maps=%d\n", when, environ_error, und_open("maps"));
+}
+
+static int und_copy(const char *from_path, const char *to_path, mode_t mode) {
+    int from = open(from_path, O_RDONLY), to = open(to_path, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    if (from < 0 || to < 0) return -1;
+    char buffer[65536];
+    ssize_t n;
+    while ((n = read(from, buffer, sizeof buffer)) > 0)
+        if (write(to, buffer, (size_t)n) != n) return -1;
+    return n < 0 || fchmod(to, mode) || close(to) || close(from) ? -1 : 0;
+}
+
+/* The readable copy, in the new namespace: undumpable, still readable. */
+static int userns_nondumpable_stage(const char *dir) {
+    prctl(PR_SET_DUMPABLE, 0);
+    und_probe("readable exec undumpable");
+    char unreadable[64];
+    snprintf(unreadable, sizeof unreadable, "%s/unreadable", dir);
+    fflush(stdout);
+    char *arguments[] = {unreadable, "userns-nondumpable-target", unreadable, NULL};
+    execv(unreadable, arguments);
+    printf("exec errno=%d\n", errno);
+    return 0;
+}
+
+/* The execute-only copy: undumpable (as fs.suid_dumpable says, so only
+   whether it is not 1 is printed), in the first namespace. */
+static int userns_nondumpable_target(void) {
+    printf("unreadable exec undumpable=%d\n", prctl(PR_GET_DUMPABLE) != 1);
+    und_probe("unreadable exec");
+    fflush(stdout);
+    return 0;
+}
+
+static int userns_nondumpable_read_case(const char *self) {
+    char dir[] = "/tmp/userns-dump-XXXXXX";
+    if (!mkdtemp(dir) || chmod(dir, 0777)) return 1;
+    char readable[64], unreadable[64];
+    snprintf(readable, sizeof readable, "%s/readable", dir);
+    snprintf(unreadable, sizeof unreadable, "%s/unreadable", dir);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 2;
+    if (kid == 0) {
+        if (getuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(97);
+        prctl(PR_SET_DUMPABLE, 1);
+        if (und_copy(self, readable, 0755) || und_copy(self, unreadable, 0111)) _exit(96);
+        uid_t uid = getuid();
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(0);
+        }
+        char map[32];
+        int length = snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
+        int fd = open("/proc/self/uid_map", O_WRONLY);
+        if (fd < 0 || write(fd, map, (size_t)length) != length || close(fd)) {
+            printf("uid_map errno=%d\n", errno);
+            _exit(0);
+        }
+        und_probe("dumpable");
+        prctl(PR_SET_DUMPABLE, 0);
+        und_probe("undumpable");
+        fflush(stdout);
+        char *arguments[] = {readable, "userns-nondumpable-stage", dir, NULL};
+        execv(readable, arguments);
+        printf("exec errno=%d\n", errno);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("wait=%#x\n", status);
+    unlink(readable);
+    unlink(unreadable);
+    rmdir(dir);
+    return 0;
+}
+
 /* The loadavg-running case: /proc/loadavg's running count, as Linux's
    nr_running(), counts the threads that can run: with two threads spinning
    besides the reader, at least 3, and no more than the live tasks; and
@@ -36565,6 +36679,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
+    if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);
+    if (!strcmp(mode, "userns-nondumpable-target")) return userns_nondumpable_target();
+    if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

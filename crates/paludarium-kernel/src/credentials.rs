@@ -269,33 +269,61 @@ impl Credentials {
     }
     /// Whether a task with these credentials may read the details of a task
     /// of another process with `target`'s, as Linux's `__ptrace_may_access`
-    /// in read mode decides: `CAP_SYS_PTRACE` in the target's user
-    /// namespace, or every user and group ID of a dumpable target equal to
-    /// the reader's filesystem ones, or with `real`
-    /// (`PTRACE_MODE_REALCREDS`) its real ones. The capability module then
-    /// asks the same capability again, or a reader in the target's user
-    /// namespace whose permitted capabilities (with `real`; its effective
-    /// ones for `PTRACE_MODE_FSCREDS`) cover the target's permitted ones
+    /// in read mode decides: every user and group ID of the target equal to
+    /// the reader's filesystem ones, or with `real` (`PTRACE_MODE_REALCREDS`)
+    /// its real ones, or `CAP_SYS_PTRACE` in the target's user namespace;
+    /// and then a `dumpable` target, or `CAP_SYS_PTRACE` in `exec_user`, the
+    /// user namespace its program runs in ([`Self::exec_user`]), as
+    /// `task_still_dumpable` asks. The capability module then asks for a
+    /// reader in the target's user namespace whose permitted capabilities
+    /// (with `real`; its effective ones for `PTRACE_MODE_FSCREDS`) cover the
+    /// target's permitted ones, or the same capability again
     /// (`cap_ptrace_access_check`), and Landlock keeps a reader in a domain
     /// from a task outside it (`hook_ptrace_access_check`).
-    pub(crate) fn may_read_task(&self, target: &Credentials, dumpable: bool, real: bool) -> bool {
-        self.may_read_ids(&target.task_ids(), dumpable, real)
+    pub(crate) fn may_read_task(
+        &self,
+        target: &Credentials,
+        (dumpable, exec_user): (bool, &crate::namespaces::Namespace),
+        real: bool,
+    ) -> bool {
+        self.may_read_ids(&target.task_ids(), (dumpable, exec_user), real)
     }
     /// [`Self::may_read_task`] of a task with the IDs and sets `target`.
-    pub(crate) fn may_read_ids(&self, target: &TaskIds, dumpable: bool, real: bool) -> bool {
+    pub(crate) fn may_read_ids(
+        &self,
+        target: &TaskIds,
+        (dumpable, exec_user): (bool, &crate::namespaces::Namespace),
+        real: bool,
+    ) -> bool {
         let (uid, gid, caps) = if real {
             (self.uid, self.gid, self.permitted)
         } else {
             (self.fsuid, self.fsgid, self.effective)
         };
         let tracer = self.capable_in(CAP_SYS_PTRACE, &target.user);
-        (tracer
-            || dumpable
-                && [target.uid, target.euid, target.suid] == [uid; 3]
-                && [target.gid, target.egid, target.sgid] == [gid; 3]
-                && self.user == target.user
-                && target.permitted & !caps == 0)
+        let same_ids = [target.uid, target.euid, target.suid] == [uid; 3]
+            && [target.gid, target.egid, target.sgid] == [gid; 3];
+        (same_ids || tracer)
+            && (dumpable || self.capable_in(CAP_SYS_PTRACE, exec_user))
+            && (self.user == target.user && target.permitted & !caps == 0 || tracer)
             && crate::landlock::may_trace(&self.landlock, &target.landlock)
+    }
+    /// The user namespace a program exec runs is in, as Linux's
+    /// `alloc_bprm` and `would_dump` take it: the thread's own, or, when the
+    /// thread may not read one of the files exec runs, whose owners and
+    /// groups `unread` has, the nearest one above it that maps each of
+    /// them (`privileged_wrt_inode_uidgid`), up to the first.
+    pub(crate) fn exec_user(&self, unread: &[(u32, u32)]) -> crate::users::UserNs {
+        use crate::users::Ids;
+        let mut at = &self.user.0;
+        while let Some(parent) = at.users.parent()
+            && !unread.iter().all(|&(uid, gid)| {
+                at.id_of(Ids::User, uid).is_some() && at.id_of(Ids::Group, gid).is_some()
+            })
+        {
+            at = parent;
+        }
+        crate::users::UserNs(std::sync::Arc::clone(at))
     }
     /// Whether its user namespace is `ns` or one below it
     /// (`current_in_userns`).
@@ -1184,6 +1212,129 @@ mod credentials_tests {
         assert_eq!([groups.gid, groups.egid, groups.sgid], [1, 2, 3]);
     }
     #[test]
+    fn an_undumpable_task_needs_cap_sys_ptrace_where_its_program_runs() {
+        use crate::namespaces::Namespace;
+        use crate::users::{Ids, UserNs, first};
+        let root = Credentials::default();
+        let ns = Namespace::new_user(first(), 0xF000_2000, &root, u64::MAX).unwrap();
+        ns.write_map(Ids::User, b"0 1000 1", &root, &root).unwrap();
+        ns.write_map(Ids::Group, b"0 1000 1", &root, &root).unwrap();
+        // User 1000 in a namespace of its own, with every capability there.
+        let inner = Credentials {
+            uid: 1000,
+            euid: 1000,
+            suid: 1000,
+            fsuid: 1000,
+            gid: 1000,
+            egid: 1000,
+            sgid: 1000,
+            fsgid: 1000,
+            user: UserNs(std::sync::Arc::clone(&ns)),
+            ..root.clone()
+        };
+        let first = &**first();
+        assert!(inner.may_read_task(&inner, (true, first), true));
+        // Undumpable, it is readable only with CAP_SYS_PTRACE in the
+        // namespace its program runs in, as `task_still_dumpable` asks.
+        assert!(!inner.may_read_task(&inner, (false, first), true));
+        assert!(inner.may_read_task(&inner, (false, &ns), true));
+        assert!(root.may_read_task(&inner, (false, first), true));
+        // The program runs in the thread's namespace, or, for a file it may
+        // not read, the nearest one that maps its owner and group.
+        assert_eq!(inner.exec_user(&[]), UserNs(std::sync::Arc::clone(&ns)));
+        assert_eq!(
+            inner.exec_user(&[(1000, 1000)]),
+            UserNs(std::sync::Arc::clone(&ns))
+        );
+        assert_eq!(inner.exec_user(&[(1000, 0)]), UserNs::default());
+        assert_eq!(
+            inner.exec_user(&[(1000, 1000), (0, 1000)]),
+            UserNs::default()
+        );
+    }
+    #[test]
+    fn a_program_runs_where_each_file_it_may_not_read_is_mapped() {
+        use crate::namespaces::Namespace;
+        use crate::users::{Ids, UserNs, first};
+        use std::sync::Arc;
+        let root = Credentials::default();
+        // Kernel IDs 1000 to 1009 in the outer namespace, 1001 alone in the
+        // inner one.
+        let outer = Namespace::new_user(first(), 0xF000_3000, &root, u64::MAX).unwrap();
+        outer
+            .write_map(Ids::User, b"0 1000 10", &root, &root)
+            .unwrap();
+        outer
+            .write_map(Ids::Group, b"0 1000 10", &root, &root)
+            .unwrap();
+        let in_outer = Credentials {
+            uid: 1000,
+            euid: 1000,
+            suid: 1000,
+            fsuid: 1000,
+            gid: 1000,
+            egid: 1000,
+            sgid: 1000,
+            fsgid: 1000,
+            user: UserNs(Arc::clone(&outer)),
+            ..root.clone()
+        };
+        let inner = Namespace::new_user(&outer, 0xF000_3001, &in_outer, u64::MAX).unwrap();
+        inner
+            .write_map(Ids::User, b"0 1 1", &in_outer, &in_outer)
+            .unwrap();
+        inner
+            .write_map(Ids::Group, b"0 1 1", &in_outer, &in_outer)
+            .unwrap();
+        let in_inner = Credentials {
+            uid: 1001,
+            euid: 1001,
+            suid: 1001,
+            fsuid: 1001,
+            gid: 1001,
+            egid: 1001,
+            sgid: 1001,
+            fsgid: 1001,
+            user: UserNs(Arc::clone(&inner)),
+            ..root.clone()
+        };
+        // Linux's `would_dump` walks up once for each file it may not read,
+        // the ELF interpreter's and then the program's, each walk from
+        // where the last one ended.
+        let walk = |mut at: UserNs, (uid, gid): (u32, u32)| {
+            while let Some(parent) = at.users.parent()
+                && (at.id_of(Ids::User, uid).is_none() || at.id_of(Ids::Group, gid).is_none())
+            {
+                at = UserNs(Arc::clone(parent));
+            }
+            at
+        };
+        let inner_file = (1001, 1001);
+        let outer_file = (1005, 1005);
+        let first_file = (2000, 1001);
+        let ns = |n: &Arc<Namespace>| UserNs(Arc::clone(n));
+        for files in [
+            &[][..],
+            &[inner_file],
+            &[outer_file],
+            &[inner_file, outer_file],
+            &[outer_file, inner_file],
+            &[inner_file, first_file],
+            &[first_file, outer_file],
+        ] {
+            let walked = files.iter().fold(ns(&inner), |at, &file| walk(at, file));
+            assert_eq!(in_inner.exec_user(files), walked, "{files:?}");
+        }
+        assert_eq!(in_inner.exec_user(&[inner_file]), ns(&inner));
+        assert_eq!(in_inner.exec_user(&[outer_file]), ns(&outer));
+        assert_eq!(in_inner.exec_user(&[inner_file, outer_file]), ns(&outer));
+        assert_eq!(in_inner.exec_user(&[outer_file, inner_file]), ns(&outer));
+        assert_eq!(
+            in_inner.exec_user(&[first_file, outer_file]),
+            UserNs::default()
+        );
+    }
+    #[test]
     fn reading_another_task_needs_its_capabilities_or_cap_sys_ptrace() {
         let no_ptrace = ALL_CAPABILITIES & !CAP_SYS_PTRACE;
         let target = Credentials::default()
@@ -1192,16 +1343,22 @@ mod credentials_tests {
         // The same permitted set; with the filesystem IDs, the effective
         // one counts.
         let same = target.capset(0, no_ptrace, 0).unwrap();
-        assert!(same.may_read_task(&target, true, true));
-        assert!(!same.may_read_task(&target, true, false));
-        assert!(target.may_read_task(&target, true, false));
+        let first = &**crate::users::first();
+        let dumpable = (true, first);
+        let undumpable = (false, first);
+        assert!(same.may_read_task(&target, dumpable, true));
+        assert!(!same.may_read_task(&target, dumpable, false));
+        assert!(target.may_read_task(&target, dumpable, false));
         // One permitted capability fewer.
         let fewer = target.capset(0, no_ptrace & !(1 << 13), 0).unwrap();
-        assert!(!fewer.may_read_task(&target, true, true));
-        assert!(fewer.may_read_task(&fewer, true, true));
+        assert!(!fewer.may_read_task(&target, dumpable, true));
+        assert!(fewer.may_read_task(&fewer, dumpable, true));
         // CAP_SYS_PTRACE lets it read anything.
-        assert!(Credentials::default().may_read_task(&target, false, true));
-        assert!(!same.may_read_task(&target, false, true), "not dumpable");
+        assert!(Credentials::default().may_read_task(&target, undumpable, true));
+        assert!(
+            !same.may_read_task(&target, undumpable, true),
+            "not dumpable"
+        );
     }
     #[test]
     fn capset_keeps_within_what_the_thread_holds() {

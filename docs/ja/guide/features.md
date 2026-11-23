@@ -3136,7 +3136,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、
   `pagemap`、`wchan`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
-  `PR_SET_DUMPABLE` まで）root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
+  `PR_SET_DUMPABLE` まで）root です。この root は、そのプログラムが動くユーザー名前空間の
+  root で、その名前空間が root を対応づけていなければ最初の名前空間の root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
   プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
   その持ち主とモード（`environ`、`auxv`、`pagemap`、`io`、`personality`、`syscall` は 0400、`comm` は 0644、`clear_refs`
   は 0200、ほかのファイルは 0444）を示します。
@@ -3209,7 +3210,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
-  同じです。ファイルの持ち主はこのプロセス自身のもの（前述）と
+  同じです。プロセスのユーザー名前空間での `CAP_SYS_PTRACE` があれば読めますが、ダンプできない
+  プロセスは、Linux の `task_still_dumpable` と同じく、そのプログラムが動くユーザー名前空間での
+  その権限がなければ読めません。それはプログラムを実行したときの名前空間で、読めない
+  プログラムなら、ファイルの持ち主とグループを対応づけている最も近い上の名前空間です
+  （`would_dump`）。そのため、ユーザー名前空間を `unshare` したあと `PR_SET_DUMPABLE` を外した
+  プロセスは、そこでの子プロセスからも読めません。ファイルの持ち主はこのプロセス自身のもの（前述）と
   同じで（ダンプできないプロセスのディレクトリ（0555）もそのプロセスのものです）、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
   ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
   `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、

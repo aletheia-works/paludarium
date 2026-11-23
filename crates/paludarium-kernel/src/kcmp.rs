@@ -20,6 +20,9 @@ pub(crate) struct Task {
     /// those, though it keeps its dispositions until it is reaped.
     pub zombie: bool,
     pub dumpable: bool,
+    /// The user namespace its program runs in, where reading an undumpable
+    /// task needs `CAP_SYS_PTRACE`.
+    pub exec_user: crate::users::UserNs,
     pub credentials: Credentials,
     pub memory: Option<usize>,
     pub files: FilesView,
@@ -30,7 +33,7 @@ impl Task {
         tid: u32,
         group: Arc<ThreadGroup>,
         zombie: bool,
-        dumpable: bool,
+        (dumpable, exec_user): (bool, crate::users::UserNs),
         public: PublicThread,
     ) -> Self {
         Self {
@@ -38,6 +41,7 @@ impl Task {
             group,
             zombie,
             dumpable,
+            exec_user,
             memory: public
                 .memory
                 .as_ref()
@@ -113,7 +117,7 @@ pub(crate) fn compare(
         std::ptr::eq(Arc::as_ptr(&task.group), caller.0)
             || caller
                 .1
-                .may_read_task(&task.credentials, task.dumpable, true)
+                .may_read_task(&task.credentials, (task.dumpable, &task.exec_user), true)
     };
     if !readable(first) || !readable(second) {
         return Err(Errno::EPERM);

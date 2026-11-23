@@ -645,7 +645,7 @@ impl Kernel {
             &credentials::Credentials::default(),
             (path.to_vec(), loaded),
             program,
-            &mut true,
+            &mut Vec::new(),
             (argv, &mut budget),
             &mut processes::ExecOpens::default(),
         )?;

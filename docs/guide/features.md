@@ -3618,7 +3618,8 @@ kernel.
   `clear_refs`, `smaps`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
-  gives them; the directory, `task` and `fdinfo` (0555) are the process's
+  gives them: root of the user namespace its program runs in, or the first
+  one's where that namespace maps no root; the directory, `task` and `fdinfo` (0555) are the process's
   either way, and `/proc/self` itself is root's. `stat` shows that owner and
   the mode, 0400 for `environ`, `auxv`, `pagemap`, `io`, `personality` and `syscall`, 0644 for `comm`, 0200 for
   `clear_refs` and 0444 for the other files.
@@ -3703,7 +3704,13 @@ kernel.
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
-  asks above. Its files are
+  asks above. `CAP_SYS_PTRACE` in the process's user namespace lets a reader
+  in, but for an undumpable process only that capability in the user
+  namespace its program runs in does, as Linux's `task_still_dumpable` asks:
+  the one it ran the program from, or, for a program it could not read, the
+  nearest one above that maps the file's owner and group (`would_dump`). So
+  after `unshare` of a user namespace, a process that clears
+  `PR_SET_DUMPABLE` is not readable by its children there. Its files are
   owned as this process's own are (above), an undumpable process's
   directory (0555) staying its own, and an open checks a regular
   file's mode for that owner before anything else, as Linux's

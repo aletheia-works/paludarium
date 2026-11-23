@@ -467,6 +467,7 @@
     {"name":"ptrace-stop-exit-code","binary":"process"},
     {"name":"gone-leader-files","binary":"process"},
     {"name":"thread-caps-status","binary":"process"},
+    {"name":"userns-nondumpable-read","binary":"process"},
     {"name":"proc-stat-exit-code","binary":"process"},
     {"name":"proc-fd-links","binary":"process"},
     {"name":"modify-ldt","binary":"process"},

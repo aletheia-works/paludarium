@@ -168,6 +168,10 @@ verified.
 - **A pipe's packet mode**: `F_SETFL` takes `O_DIRECT` on a pipe or FIFO,
   as Linux does, but the emulator has no packet mode: its writes are not
   kept apart as packets, and `F_GETFL` does not show `O_DIRECT`.
+- **`O_DIRECT`'s alignment**: a read or write of a file opened with
+  `O_DIRECT` goes through as any other. On a disk file system such as
+  ext4, Linux refuses a buffer, offset or length that is not aligned to its
+  block size (`EINVAL`); the emulator does not.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.

@@ -406,14 +406,39 @@ fn signals(stream: &(impl rustix::fd::AsFd + std::io::IsTerminal)) -> bool {
         })
 }
 
-/// Maps a host I/O error to the errno the guest sees.
+/// Maps a host I/O error to the errno the guest sees. A descriptor or
+/// handle that is not open, such as a standard stream the command was
+/// started without, is `EBADF`, as the guest's own call is on Linux when
+/// it has no such descriptor.
 #[must_use]
 pub fn errno_from_io(err: &io::Error) -> Errno {
+    if bad_descriptor(err) {
+        return Errno::EBADF;
+    }
     match err.kind() {
         io::ErrorKind::BrokenPipe => Errno::EPIPE,
         io::ErrorKind::WouldBlock => Errno::EAGAIN,
         io::ErrorKind::InvalidInput => Errno::EINVAL,
         _ => Errno::EIO,
+    }
+}
+
+/// `EBADF` on a Unix host, `ERROR_INVALID_HANDLE` on Windows: what `std`
+/// itself takes for a closed standard stream.
+fn bad_descriptor(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error())
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_INVALID_HANDLE: i32 = 6;
+        err.raw_os_error() == Some(ERROR_INVALID_HANDLE)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = err;
+        false
     }
 }
 
@@ -508,7 +533,9 @@ impl Host for NativeHost {
     }
     /// On a Unix host the descriptor is read directly, past `std`'s buffer,
     /// so that [`Host::stdin_state`] sees every byte not yet read. A closed
-    /// standard input (`EBADF`) reads as its end, as `std`'s `Stdin` has it.
+    /// standard input (`EBADF`, `ERROR_INVALID_HANDLE` on Windows) reads as
+    /// its end on every host, as `std`'s `Stdin` read it until Rust's
+    /// nightly of 2026-11-19 (rust-lang/rust e60e0731bd).
     fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         #[cfg(unix)]
         {
@@ -519,7 +546,10 @@ impl Host for NativeHost {
         }
         #[cfg(not(unix))]
         {
-            io::stdin().lock().read(buf).map_err(|e| errno_from_io(&e))
+            match io::stdin().lock().read(buf) {
+                Err(e) if bad_descriptor(&e) => Ok(0),
+                result => result.map_err(|e| errno_from_io(&e)),
+            }
         }
     }
     /// A poll of the standard input that does not wait, on a Unix host:
@@ -669,6 +699,14 @@ mod tests {
         }
         let other = io::Error::other("x");
         assert_eq!(errno_from_io(&other), Errno::EIO);
+        // A closed descriptor or handle, which `std` no longer turns into
+        // success for the standard streams.
+        #[cfg(unix)]
+        let closed = io::Error::from_raw_os_error(9);
+        #[cfg(windows)]
+        let closed = io::Error::from_raw_os_error(6);
+        #[cfg(any(unix, windows))]
+        assert_eq!(errno_from_io(&closed), Errno::EBADF);
         struct Broken;
         impl Write for Broken {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {

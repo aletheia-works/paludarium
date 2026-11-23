@@ -340,6 +340,11 @@ mod real_console {
             return;
         };
         let case: usize = case.parse().unwrap();
+        let kinds = [(-10_i32) as u32, (-11_i32) as u32, (-12_i32) as u32];
+        // The standard handles libtest writes its report to once the test
+        // returns, after the fixture's console handles have closed.
+        // SAFETY: reads the process's standard handles; no guest data.
+        let original = kinds.map(|kind| unsafe { GetStdHandle(kind) });
         // SAFETY: this test runs in its own process; console ownership is local.
         unsafe {
             FreeConsole();
@@ -347,7 +352,6 @@ mod real_console {
         }
         let input = console("CONIN$").unwrap();
         let output = console("CONOUT$").unwrap();
-        let kinds = [(-10_i32) as u32, (-11_i32) as u32, (-12_i32) as u32];
         for (index, kind) in kinds.iter().enumerate() {
             assert_ne!(
                 // SAFETY: all fixture handles remain live throughout the test.
@@ -381,10 +385,11 @@ mod real_console {
             assert!(info.columns > 0 && info.rows > 0);
         }
         assert_eq!((mode(input.0).unwrap(), mode(output.0).unwrap()), before);
-        for (index, kind) in kinds.iter().enumerate() {
+        for (kind, handle) in kinds.iter().zip(original) {
             assert_ne!(
-                // SAFETY: reset borrowed standard handles to the live fixture.
-                unsafe { SetStdHandle(*kind, if index == 0 { input.0 } else { output.0 }) },
+                // SAFETY: gives back the standard handles the process had,
+                // which it still owns, before the fixture's handles close.
+                unsafe { SetStdHandle(*kind, handle) },
                 0
             );
         }

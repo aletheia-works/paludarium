@@ -15313,6 +15313,14 @@ static int gone_leader_files_case(void) {
     pid_t kid = fork();
     if (kid < 0) return 1;
     if (kid == 0) {
+        /* Not root, whose CAP_DAC_READ_SEARCH would open the root-owned
+           0400 files of a task without memory: the guest runs as root, the
+           native side as the runner's user. Dumpable again after the change
+           of IDs, as the runner's process is. */
+        if (geteuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(90);
+        if (prctl(PR_SET_DUMPABLE, 1)) _exit(91);
         pthread_t worker;
         if (pthread_create(&worker, NULL, glf_worker, NULL)) _exit(98);
         syscall(SYS_exit, 5);

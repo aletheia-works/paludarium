@@ -1033,6 +1033,7 @@ mod linux {
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),
         processes_ptrace_stop_exit_code => ("ptrace-stop-exit-code","process"),
+        processes_gone_leader_files => ("gone-leader-files","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),

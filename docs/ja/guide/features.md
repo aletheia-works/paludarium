@@ -3149,8 +3149,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `status` は Linux の `task_context_switch_counts` と同じくリーダーのものを示します）を
   示します。ほかのスレッドより先に終わったリーダーは、Linux が遅れたグループリーダーを残す
   のと同じく、プロセスが終わるまでゾンビとして `task` の先頭に残り、`stat` と `status` では
-  `Z` で、`Threads` と `num_threads` にも数えます。`/proc/thread-self` は読んでいるスレッドのディレクトリへの
-  リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
+  `Z` で、`Threads` と `num_threads` にも数えます。そのリーダーには、Linux の `exit_mm`、
+  `exit_files`、`exit_fs`、`exit_task_namespaces` の後と同じく、メモリー、ディスクリプター、
+  ディレクトリー、PID とユーザー以外の名前空間がありません。これは `task/<pid>` でも
+  `/proc/<pid>` と `/proc/self` でも同じです。`fd` と `fdinfo` は何も並べず、`maps`、`smaps`、
+  `cmdline` は何も読めず、`environ`、`auxv`、`pagemap` は `ESRCH`、`exe`、`cwd`、`root` と
+  ほかの `ns` のリンクは `ENOENT`、`mountinfo` は `EINVAL` です。`statm` はすべて 0、
+  `status` には `Vm` の行も `Umask` もなく `FDSize` は 0 で、`stat` には大きさもアドレスも
+  ありません。`/proc/thread-self` は読んでいるスレッドのディレクトリへのリンク（0777）で、
+  `<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
   `environ` は実 ID が、`auxv`、`maps`、`smaps`、`pagemap`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの

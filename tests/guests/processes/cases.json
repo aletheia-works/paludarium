@@ -456,6 +456,7 @@
     {"name":"thread-own-counters","binary":"process"},
     {"name":"leader-zombie-task","binary":"process"},
     {"name":"ptrace-stop-exit-code","binary":"process"},
+    {"name":"gone-leader-files","binary":"process"},
     {"name":"proc-stat-exit-code","binary":"process"},
     {"name":"proc-fd-links","binary":"process"},
     {"name":"modify-ldt","binary":"process"},

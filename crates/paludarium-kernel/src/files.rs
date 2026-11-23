@@ -1273,7 +1273,7 @@ fn through_magic_links(c: &Context<'_>, mut p: Vec<u8>) -> Result<Vec<u8>, Errno
 /// or `None` when `path` is not one.
 fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, Errno>> {
     const ENOTDIR: Errno = Errno::ENOTDIR;
-    match crate::proc::own_entry(path, c.process.pid) {
+    match own_entry(c, path) {
         Some(crate::proc::OwnEntry::Descriptor(n)) => Some(
             c.files
                 .descriptor(u64::from(n))
@@ -1293,7 +1293,7 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
             })
         }
         _ => {
-            let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
+            let task_path = task_path(c, path)?;
             match task_path.entry {
                 // Another task's descriptor, for a reader that may look at
                 // it, as Linux's `proc_fd_link` jumps to its file.
@@ -1796,7 +1796,7 @@ fn read_link(c: &mut Context<'_>, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
     let p = crate::devices::through_link(&p).unwrap_or(p);
     Ok(if p == b"/proc/self" {
         c.process.pid.to_string().into_bytes()
-    } else if let Some(path) = crate::proc::task_path(&p, c.process.pid, c.tid) {
+    } else if let Some(path) = task_path(c, &p) {
         let task = tasks::find(c, &path)?;
         match tasks::link(&task, path.entry) {
             // Only a link is checked: another file is `EINVAL`.
@@ -1814,7 +1814,7 @@ fn read_link(c: &mut Context<'_>, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
             return Err(Errno::EINVAL);
         };
         target.to_vec()
-    } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
+    } else if let Some(entry) = own_entry(c, &p) {
         if let Some(target) = own_link(c, entry) {
             from_reader(c, target)
         } else {
@@ -2571,8 +2571,8 @@ fn directory_entries(
     if d.file.stat()?.mode & 0o170000 != 0o040000 {
         return Err(Errno::ENOTDIR);
     }
-    let task = crate::proc::task_path(&d.path, c.process.pid, c.tid);
-    let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
+    let task = task_path(c, &d.path);
+    let entries = match own_entry(c, &d.path) {
         _ if tasks::is_root(&d.path) => tasks::root_entries(c),
         _ if let Some(crate::sysctl::Entry::Directory(directory)) =
             crate::sysctl::entry(c, &d.path) =>
@@ -4629,8 +4629,7 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
     Ok(if in_proc(p) {
         // A link in `fd` leads to its descriptor's file; one for a
         // descriptor not open is not there (`ENOENT`).
-        if let Some(crate::proc::OwnEntry::Descriptor(n)) = crate::proc::own_entry(p, c.process.pid)
-        {
+        if let Some(crate::proc::OwnEntry::Descriptor(n)) = own_entry(c, p) {
             let d = c
                 .files
                 .descriptor(u64::from(n))
@@ -5967,7 +5966,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let stats = path_statfs(c, &p)?;
             // A link in `/proc/self/fd` leads to its descriptor's file, on
             // that file's mount.
-            let flags = match crate::proc::own_entry(&p, c.process.pid) {
+            let flags = match own_entry(c, &p) {
                 Some(crate::proc::OwnEntry::Descriptor(n)) => {
                     let d = c
                         .files
@@ -6223,7 +6222,7 @@ impl LinkPath {
             }
             _ => p.to_vec(),
         };
-        match crate::proc::own_entry(p, c.process.pid) {
+        match own_entry(c, p) {
             Some(crate::proc::OwnEntry::Descriptor(n)) => {
                 let d = c
                     .files
@@ -6252,7 +6251,7 @@ impl LinkPath {
                 target: LinkTarget::OwnProcess,
             }));
         }
-        if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
+        if let Some(path) = task_path(c, p) {
             let task = tasks::find(c, &path)?;
             // Only a link is checked: `O_PATH` opens a file such as `maps`
             // without its `open`, which is what refuses a reader.
@@ -7131,28 +7130,25 @@ fn resolve_scoped(
         if last && !follow_last && !trailing_slash {
             break;
         }
-        let magic =
+        let magic = matches!(
+            own_entry(c, &candidate),
+            Some(
+                crate::proc::OwnEntry::Descriptor(_)
+                    | crate::proc::OwnEntry::Exe
+                    | crate::proc::OwnEntry::Cwd
+                    | crate::proc::OwnEntry::Root
+            )
+        ) || task_path(c, &candidate).is_some_and(|path| {
             matches!(
-                crate::proc::own_entry(&candidate, c.process.pid),
-                Some(
-                    crate::proc::OwnEntry::Descriptor(_)
-                        | crate::proc::OwnEntry::Exe
-                        | crate::proc::OwnEntry::Cwd
-                        | crate::proc::OwnEntry::Root
-                )
-            ) || crate::proc::task_path(&candidate, c.process.pid, c.tid).is_some_and(|path| {
-                matches!(
-                    path.entry,
-                    crate::proc::TaskEntry::Exe
-                        | crate::proc::TaskEntry::Cwd
-                        | crate::proc::TaskEntry::Root
-                )
-            });
+                path.entry,
+                crate::proc::TaskEntry::Exe
+                    | crate::proc::TaskEntry::Cwd
+                    | crate::proc::TaskEntry::Root
+            )
+        });
         if magic {
             // The link of a descriptor that is not open is not there.
-            if let Some(crate::proc::OwnEntry::Descriptor(n)) =
-                crate::proc::own_entry(&candidate, c.process.pid)
-            {
+            if let Some(crate::proc::OwnEntry::Descriptor(n)) = own_entry(c, &candidate) {
                 c.files
                     .descriptor(u64::from(n))
                     .map_err(|_| Errno::ENOENT)?;
@@ -7215,10 +7211,10 @@ fn resolve_scoped(
 /// Where this process's `exe` or `cwd` link at `path` leads, or another
 /// task's.
 fn own_link_target(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
-    if let Some(entry) = crate::proc::own_entry(path, c.process.pid) {
+    if let Some(entry) = own_entry(c, path) {
         return own_link(c, entry);
     }
-    let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
+    let task_path = task_path(c, path)?;
     let task = tasks::find(c, &task_path).ok()?;
     tasks::link(&task, task_path.entry)?.ok()
 }
@@ -7227,7 +7223,7 @@ fn own_link_target(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
 /// directory or the root, of this process or of another one that the
 /// reader may look at ([`tasks::check`]). `ENOENT` once it is gone.
 fn task_link(c: &Context<'_>, path: &[u8]) -> Result<Vec<u8>, Errno> {
-    match crate::proc::own_entry(path, c.process.pid) {
+    match own_entry(c, path) {
         Some(crate::proc::OwnEntry::Descriptor(n)) => {
             let d = c
                 .files
@@ -7238,7 +7234,7 @@ fn task_link(c: &Context<'_>, path: &[u8]) -> Result<Vec<u8>, Errno> {
         Some(entry) => return own_link(c, entry).ok_or(Errno::ENOENT),
         None => {}
     }
-    let task_path = crate::proc::task_path(path, c.process.pid, c.tid).ok_or(Errno::ENOENT)?;
+    let task_path = task_path(c, path).ok_or(Errno::ENOENT)?;
     let task = tasks::find(c, &task_path)?;
     let target = tasks::link(&task, task_path.entry).ok_or(Errno::ENOENT)?;
     tasks::check(c, &task, task_path.entry)?;
@@ -7308,6 +7304,11 @@ fn open_path(
             crate::devices::Entry::Link(target) => return open_path(c, target, flags, mode),
         }
     } else if let Some(mountinfo) = crate::proc::mount_table(p) {
+        // The zombie leader's directory, once the leader has ended, has no
+        // `nsproxy`, whose mounts Linux's `mounts_open_common` refuses.
+        if own_leader_gone(c) {
+            return Err(Errno::EINVAL);
+        }
         own_open_check(c, p, flags)?;
         // The mounts at each read of the namespace and root it has now.
         let stat = own_stat(c, crate::proc::stat(0));
@@ -7322,7 +7323,7 @@ fn open_path(
             return Err(Errno::EISDIR);
         }
         Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
-    } else if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
+    } else if let Some(path) = task_path(c, p) {
         let task = tasks::find(c, &path)?;
         let link = tasks::link(&task, path.entry).is_some();
         // What the file is, and whose: an open checks a regular file's mode
@@ -7523,7 +7524,7 @@ fn open_path(
         Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
     } else if let Some(entry) = crate::proc::system_entry(p) {
         system_file(c, entry, flags)
-    } else if let Some(entry) = crate::proc::own_entry(p, c.process.pid) {
+    } else if let Some(entry) = own_entry(c, p) {
         own_open_check(c, p, flags)?;
         // The inode an open file holds, whose owner each later lookup of
         // its path gives it (`pid_revalidate`).
@@ -8231,9 +8232,31 @@ pub(crate) fn exec_program(
         }
     })
 }
-/// [`through_descriptor`] for this thread's process.
+/// [`through_descriptor`] for this thread's process; nothing once its
+/// leader has ended, when its `fd` is the zombie leader's, which has none.
 fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {
+    if own_leader_gone(c) {
+        return Ok(None);
+    }
     through_descriptor(c.files, c.process.pid, p, follow)
+}
+/// Whether the reader's process leader ended before its other threads: then
+/// `/proc/self` and `/proc/<pid>` are that zombie leader's directory, as on
+/// Linux, which has no memory, descriptors or directories left.
+fn own_leader_gone(c: &Context<'_>) -> bool {
+    !c.group.has_member(c.process.pid)
+}
+/// [`crate::proc::own_entry`] for the reader's process, which has no entries
+/// of its own once its leader has ended ([`own_leader_gone`]).
+fn own_entry(c: &Context<'_>, path: &[u8]) -> Option<crate::proc::OwnEntry> {
+    if own_leader_gone(c) {
+        return None;
+    }
+    crate::proc::own_entry(path, c.process.pid)
+}
+/// [`crate::proc::task_path`] for the reading thread.
+fn task_path(c: &Context<'_>, path: &[u8]) -> Option<crate::proc::TaskPath> {
+    crate::proc::task_path(path, c.process.pid, c.tid, own_leader_gone(c))
 }
 /// The queue's name a path in `/dev/mqueue` gives, where the `mqueue`
 /// filesystem is mounted ([`crate::mqueue::mounted_name`]).
@@ -8554,7 +8577,7 @@ fn generated_stat(
 ) -> Result<Option<(FileStat, u64, u32)>, Errno> {
     // Under another process's directory or `task`: ENOENT for what is not
     // there, rather than whatever a mounted directory holds at the path.
-    if let Some(task_path) = crate::proc::task_path(path, c.process.pid, c.tid) {
+    if let Some(task_path) = task_path(c, path) {
         let task = tasks::find(c, &task_path)?;
         let stat = tasks::stat(c, path, &task, task_path.entry, follow)?;
         if tasks::link(&task, task_path.entry).is_none() {
@@ -8716,7 +8739,7 @@ fn other_generated_stat(
             SMALL_BLOCK_SIZE,
         ));
     }
-    let entry = crate::proc::own_entry(path, c.process.pid)?;
+    let entry = own_entry(c, path)?;
     if let Some(target) = own_link(c, entry) {
         if follow {
             let stat = c.files.fs().metadata(&target, true).ok()?;

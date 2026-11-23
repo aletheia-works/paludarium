@@ -15208,6 +15208,110 @@ static int ptrace_stop_exit_code_case(void) {
     return 0;
 }
 
+/* The gone-leader-files case: a leader that ended before its other threads
+   has, as Linux's after exit_mm, exit_files, exit_fs and
+   exit_task_namespaces, no memory, descriptors, directories or namespaces
+   but its PID and user ones; /proc/self and /proc/<pid> are its directory
+   still, while /proc/thread-self is the running thread's. Its fd and fdinfo
+   list nothing and fd/1 is not there (ENOENT); maps, smaps and cmdline read
+   nothing; environ, auxv and pagemap do not open (ESRCH); exe, cwd, root and
+   its net and mnt links are not there; mountinfo does not open (EINVAL);
+   statm is zeros; status has no Vm lines or Umask and FDSize 0; and stat has
+   no sizes or addresses. The other thread looks, then ends with exit(0). */
+static int glf_count(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return -errno;
+    int count = 0;
+    for (struct dirent *e; (e = readdir(dir));) count += e->d_name[0] != '.';
+    closedir(dir);
+    return count;
+}
+
+static long glf_size(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    char buffer[4096];
+    long total = 0, n;
+    while ((n = read(fd, buffer, sizeof buffer)) > 0) total += n;
+    close(fd);
+    return n < 0 ? -errno : total;
+}
+
+static int glf_link(const char *path, char *target, size_t size) {
+    ssize_t n = readlink(path, target, size - 1);
+    if (n < 0) return -errno;
+    target[n] = 0;
+    return 0;
+}
+
+static void *glf_worker(void *unused) {
+    (void)unused;
+    char state = '?';
+    for (int i = 0; i < 500 && state != 'Z'; i++) {
+        pid_stat_field("/proc/self/stat", 3, &state);
+        if (state != 'Z') nanosleep(&(struct timespec){0, 10000000}, NULL);
+    }
+    int pid = getpid();
+    char path[64], leader[64], own[256], mine[256];
+    snprintf(path, sizeof path, "/proc/%d/fd", pid);
+    snprintf(leader, sizeof leader, "/proc/self/task/%d/fd", pid);
+    printf("state=%c fd self=%d pid=%d leader-task=%d thread-self>0=%d fdinfo=%d\n", state,
+           glf_count("/proc/self/fd"), glf_count(path), glf_count(leader),
+           glf_count("/proc/thread-self/fd") > 0, glf_count("/proc/self/fdinfo"));
+    struct stat st;
+    int opened = open("/proc/self/fd/1", O_RDONLY);
+    printf("fd/1 open=%d stat=%d\n", opened < 0 ? -errno : 0,
+           stat("/proc/self/fd/1", &st) < 0 ? -errno : 0);
+    if (opened >= 0) close(opened);
+    printf("maps=%ld smaps=%ld cmdline=%ld thread-self maps>0=%d cmdline>0=%d\n",
+           glf_size("/proc/self/maps"), glf_size("/proc/self/smaps"),
+           glf_size("/proc/self/cmdline"), glf_size("/proc/thread-self/maps") > 0,
+           glf_size("/proc/thread-self/cmdline") > 0);
+    printf("environ=%ld auxv=%ld pagemap=%ld mountinfo=%ld\n", glf_size("/proc/self/environ"),
+           glf_size("/proc/self/auxv"), glf_size("/proc/self/pagemap"),
+           glf_size("/proc/self/mountinfo"));
+    printf("exe=%d cwd=%d root=%d thread-self exe=%d\n", glf_link("/proc/self/exe", own, sizeof own),
+           glf_link("/proc/self/cwd", own, sizeof own), glf_link("/proc/self/root", own, sizeof own),
+           glf_link("/proc/thread-self/exe", own, sizeof own));
+    int net = glf_link("/proc/self/ns/net", own, sizeof own);
+    int mnt = glf_link("/proc/self/ns/mnt", own, sizeof own);
+    int user = glf_link("/proc/self/ns/user", own, sizeof own) == 0 &&
+               glf_link("/proc/thread-self/ns/user", mine, sizeof mine) == 0 && !strcmp(own, mine);
+    int pidns = glf_link("/proc/self/ns/pid", own, sizeof own) == 0 &&
+                glf_link("/proc/thread-self/ns/pid", mine, sizeof mine) == 0 && !strcmp(own, mine);
+    printf("ns net=%d mnt=%d user-same=%d pid-same=%d\n", net, mnt, user, pidns);
+    char buffer[4096];
+    proc_read("/proc/self/statm", buffer, sizeof buffer);
+    printf("statm=%s", buffer);
+    proc_read("/proc/self/status", buffer, sizeof buffer);
+    const char *fds = strstr(buffer, "\nFDSize:\t");
+    printf("status vm=%d umask=%d FDSize=%ld\n", strstr(buffer, "\nVmSize:") != NULL,
+           strstr(buffer, "\nUmask:") != NULL, fds ? atol(fds + 9) : -1);
+    /* vsize, rss, startcode, startstack, arg_start. */
+    printf("stat vsize=%ld rss=%ld startcode=%ld startstack=%ld arg_start=%ld\n",
+           pid_stat_field("/proc/self/stat", 23, NULL), pid_stat_field("/proc/self/stat", 24, NULL),
+           pid_stat_field("/proc/self/stat", 26, NULL), pid_stat_field("/proc/self/stat", 28, NULL),
+           pid_stat_field("/proc/self/stat", 48, NULL));
+    fflush(stdout);
+    syscall(SYS_exit, 0);
+    return NULL;
+}
+
+static int gone_leader_files_case(void) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, glf_worker, NULL)) _exit(98);
+        syscall(SYS_exit, 5);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("wait=%#x\n", status);
+    return 0;
+}
+
 /* The loadavg-running case: /proc/loadavg's running count, as Linux's
    nr_running(), counts the threads that can run: with two threads spinning
    besides the reader, at least 3, and no more than the live tasks; and
@@ -35813,6 +35917,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "thread-own-counters")) return thread_own_counters_case();
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
+    if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

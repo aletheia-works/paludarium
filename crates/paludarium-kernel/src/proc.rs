@@ -244,9 +244,15 @@ pub(crate) struct TaskPath {
 /// The path under `/proc/<pid>` of a process other than `own`, the reader,
 /// under `task` of any process, or under `/proc/thread-self`, the reading
 /// thread `own_tid`'s; `None` for the rest of the reader's own directory,
-/// which [`own_entry`] finds. The path is taken as it reads, `.` and `..`
-/// included.
-pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath> {
+/// which [`own_entry`] finds, unless `own_leader_gone`: then the reader's
+/// process directory is its zombie leader's, found here as another's is.
+/// The path is taken as it reads, `.` and `..` included.
+pub(crate) fn task_path(
+    path: &[u8],
+    own: u32,
+    own_tid: u32,
+    own_leader_gone: bool,
+) -> Option<TaskPath> {
     if !path.starts_with(b"/proc/") {
         return None;
     }
@@ -325,7 +331,7 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
             b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
             | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan" | b"syscall",
         ] => (None, entry(&parts)),
-        _ if pid == own => return None,
+        _ if pid == own && !own_leader_gone => return None,
         [] => (None, TaskEntry::Directory),
         _ => (None, entry(&parts)),
     };
@@ -2318,7 +2324,7 @@ mod tests {
     }
     #[test]
     fn task_paths_are_other_processes_and_threads() {
-        let path = |p: &[u8]| task_path(p, 7, 9);
+        let path = |p: &[u8]| task_path(p, 7, 9, false);
         let at = |pid, tid, entry| Some(TaskPath { pid, tid, entry });
         assert_eq!(path(b"/proc/8"), at(8, None, TaskEntry::Directory));
         assert_eq!(path(b"/proc/8/"), at(8, None, TaskEntry::Directory));
@@ -2328,6 +2334,17 @@ mod tests {
         assert_eq!(path(b"/proc/8/exe"), at(8, None, TaskEntry::Exe));
         assert_eq!(path(b"/proc/8/root"), at(8, None, TaskEntry::Root));
         assert_eq!(path(b"/proc/8/environ"), at(8, None, TaskEntry::Environ));
+        // The reader's own directory is `own_entry`'s, but the zombie
+        // leader's once its leader has ended.
+        assert_eq!(path(b"/proc/self/maps"), None);
+        assert_eq!(path(b"/proc/7/fd"), None);
+        let gone = |p: &[u8]| task_path(p, 7, 9, true);
+        assert_eq!(
+            gone(b"/proc/self/maps"),
+            at(7, None, TaskEntry::Maps(false))
+        );
+        assert_eq!(gone(b"/proc/7/fd"), at(7, None, TaskEntry::Descriptors));
+        assert_eq!(gone(b"/proc/self"), at(7, None, TaskEntry::Directory));
         assert_eq!(
             path(b"/proc/thread-self"),
             at(7, Some(9), TaskEntry::ThreadLink)

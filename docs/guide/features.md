@@ -3631,8 +3631,16 @@ kernel.
   `status` shows the leader's, as Linux's `task_context_switch_counts`). A
   leader that ended before the other threads stays first in `task` as a
   zombie, `Z` in its `stat` and `status`, and `Threads` and `num_threads`
-  count it until the process ends, as Linux keeps a delayed group leader. `/proc/thread-self` is a
-  link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
+  count it until the process ends, as Linux keeps a delayed group leader.
+  Like Linux's after `exit_mm`, `exit_files`, `exit_fs` and
+  `exit_task_namespaces`, that leader has no memory, descriptors, directories
+  or namespaces but its PID and user ones, in `/proc/<pid>` and `/proc/self`
+  as in `task/<pid>`. Its `fd` and `fdinfo` list nothing; `maps`, `smaps` and
+  `cmdline` read nothing; `environ`, `auxv` and `pagemap` are `ESRCH`;
+  `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
+  `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
+  `FDSize` of 0; and `stat` has no sizes or addresses. `/proc/thread-self` is
+  a link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`

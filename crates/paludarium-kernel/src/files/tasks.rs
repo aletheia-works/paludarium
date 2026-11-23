@@ -33,6 +33,11 @@ pub(super) struct Task {
     /// The `exit_code` of its ptrace stop until a wait reports it, 0
     /// otherwise.
     stop_code: i32,
+    /// It is a leader that ended before its process's other threads: a
+    /// zombie that, as Linux's after `exit_mm`, `exit_files`, `exit_fs` and
+    /// `exit_task_namespaces`, has no memory, descriptors, directories or
+    /// namespaces but its PID and user ones, which its process still has.
+    gone: bool,
 }
 
 /// The thread of `path`: ENOENT for a process that is not there (reaped,
@@ -83,6 +88,7 @@ fn shown(
         Some((_, blocked)) if blocked && tid != reader => ('S', "S (sleeping)"),
         Some(_) => ('R', "R (running)"),
     };
+    let gone = !view.zombie && tid == pid && member.is_none();
     Some(Task {
         pid,
         tid,
@@ -95,30 +101,38 @@ fn shown(
         state,
         tracer: processes.traces.tracer_of(tid).unwrap_or(0),
         stop_code: processes.traces.stop_code(tid),
+        gone,
     })
 }
 
 impl Task {
+    /// Its process has not ended.
     fn live(&self) -> bool {
         !self.view.zombie
     }
-    /// The memory a live process has, which a zombie no longer does.
+    /// It still has what a task gives up at its exit: memory, descriptors,
+    /// directories and namespaces. A zombie process does not, nor a leader
+    /// that ended before its other threads.
+    fn holds(&self) -> bool {
+        self.live() && !self.gone
+    }
+    /// The memory a live task has, which a zombie no longer does.
     fn memory(&self) -> Option<&paludarium_mmu::MemoryView> {
-        self.public.memory.as_ref().filter(|_| self.live())
+        self.public.memory.as_ref().filter(|_| self.holds())
     }
     fn read(&self, at: u64, buf: &mut [u8]) -> bool {
         self.memory().is_some_and(|memory| memory.read(at, buf))
     }
     /// Its program's code range, which a zombie no longer has.
     fn code(&self) -> (u64, u64) {
-        if self.live() {
+        if self.holds() {
             self.view.group.code()
         } else {
             (0, 0)
         }
     }
     fn start_stack(&self) -> u64 {
-        if self.live() {
+        if self.holds() {
             self.view.group.start_stack()
         } else {
             0
@@ -242,19 +256,19 @@ fn descriptors_permission(c: &Context<'_>, task: &Task, mask: u32) -> Result<(),
 /// Whose the task's descriptors are ([`super::Holder`]); `None` once it has
 /// ended.
 pub(super) fn holder(task: &Task) -> Option<super::Holder> {
-    task.live()
+    task.holds()
         .then(|| task.public.files.holder(task.pid))
         .flatten()
 }
 /// Descriptor `n` of the task while it is open; none once it has ended.
 pub(super) fn descriptor(task: &Task, n: u32) -> Option<super::Descriptor> {
-    task.live()
+    task.holds()
         .then(|| task.public.files.descriptor(n))
         .flatten()
 }
 /// The task's open descriptors, none once it has ended.
 pub(super) fn descriptors(task: &Task) -> Vec<(u32, super::Descriptor)> {
-    if task.live() {
+    if task.holds() {
         task.public.files.all()
     } else {
         Vec::new()
@@ -303,7 +317,7 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
         }
         TaskEntry::Status => crate::proc::render_status(&crate::proc::Status {
             name: &public.name,
-            umask: task.live().then(|| public.files.umask()),
+            umask: task.holds().then(|| public.files.umask()),
             state: task.state.1,
             tgid: task.pid,
             pid: task.tid,
@@ -312,7 +326,7 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
             group_id: task.view.group_id,
             session: task.view.session,
             space: &task.view.space,
-            descriptors: task.live().then(|| public.files.descriptors()),
+            descriptors: task.holds().then(|| public.files.descriptors()),
             locked: task.memory().and_then(|memory| memory.locked_pages()),
             resident: task.memory().and_then(|memory| memory.resident_pages()),
             threads: task.threads(),
@@ -399,7 +413,7 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
         memory: task.memory().is_some(),
         permitted,
         code: task.code(),
-        data: if task.live() {
+        data: if task.holds() {
             task.view.group.data()
         } else {
             (0, 0)
@@ -500,7 +514,9 @@ pub(super) fn clear_refs(
         if thread && !member && tid != pid {
             return Err(Errno(3));
         }
-        if view.zombie {
+        // A zombie, or a leader that ended before its other threads, has
+        // no address space left to clear.
+        if view.zombie || (tid == pid && !member) {
             return Ok(None);
         }
         Ok(view
@@ -936,9 +952,9 @@ pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errn
             );
         }
         TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
-        TaskEntry::Exe => task.live().then(|| task.view.group.executable()),
-        TaskEntry::Cwd => task.live().then(|| task.public.files.cwd()).flatten(),
-        TaskEntry::Root => task.live().then(|| task.public.files.root()).flatten(),
+        TaskEntry::Exe => task.holds().then(|| task.view.group.executable()),
+        TaskEntry::Cwd => task.holds().then(|| task.public.files.cwd()).flatten(),
+        TaskEntry::Root => task.holds().then(|| task.public.files.root()).flatten(),
         TaskEntry::Namespace(entry) => namespace(task, entry).map(|namespace| namespace.link()),
         _ => return None,
     };
@@ -946,13 +962,21 @@ pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errn
 }
 /// The namespace a link of the task's `ns` names; none once it has ended,
 /// as Linux's task then has no `nsproxy`, and none for `pid_for_children`
-/// while that PID namespace has no init yet (`pidns_for_children_get`).
+/// while that PID namespace has no init yet (`pidns_for_children_get`). A
+/// leader that ended before its other threads keeps its PID and user ones,
+/// which Linux's `pidns_get` and `userns_get` take from its PID and
+/// credentials rather than its `nsproxy`.
 pub(super) fn namespace(
     task: &Task,
     entry: crate::namespaces::Entry,
 ) -> Option<std::sync::Arc<crate::namespaces::Namespace>> {
-    task.live()
-        .then(|| task.view.group.namespaces(task.tid).entry(entry).clone())
+    use crate::namespaces::Entry;
+    let kept = if matches!(entry, Entry::Pid | Entry::User) {
+        task.live()
+    } else {
+        task.holds()
+    };
+    kept.then(|| task.view.group.namespaces(task.tid).entry(entry).clone())
         .filter(|namespace| {
             entry != crate::namespaces::Entry::PidForChildren || namespace.init().is_some()
         })

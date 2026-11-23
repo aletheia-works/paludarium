@@ -128,8 +128,16 @@ verified.
   some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
   process what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is seen
-  only while the thread is stopped in it. `meminfo` shows the fixed 4 GiB that
-  `sysinfo` reports, with nothing used.
+  only while the thread is stopped in it. A task with no memory left (a
+  zombie, or a leader that ended before its other threads) has its files but
+  its directory owned by root, so a reader that is not root gets `EACCES` for
+  `environ`, `auxv` and `pagemap`: this follows the kernel of the x86-64 CI
+  runners that the differential tests compare with, from before Linux 7.2's
+  commit 6b1c66c9 ("exec_state: relocate dumpable information"). From 7.2,
+  `task_dump_owner` takes the owner from the dumpable flag in `exec_state`,
+  which outlives the memory, so those files stay the task's and their open
+  is `ESRCH`; paludarium follows that once the runners run 7.2 or later.
+  `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
   root. `mount` mounts no `proc` filesystem and nothing on `/proc` or

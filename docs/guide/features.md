@@ -3637,7 +3637,9 @@ kernel.
   or namespaces but its PID and user ones, in `/proc/<pid>` and `/proc/self`
   as in `task/<pid>`. Its `fd` and `fdinfo` list nothing, so `execveat`
   through `/proc/self/fd/<n>` or `/dev/fd/<n>` is `ENOENT`; `maps`, `smaps` and
-  `cmdline` read nothing; `environ`, `auxv` and `pagemap` are `ESRCH`;
+  `cmdline` read nothing; its files but its directory are root's, as a
+  zombie's are (see limitations), so `environ`, `auxv` and `pagemap` are
+  `EACCES`, and `ESRCH` for root;
   `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
   `FDSize` of 0; and `stat` has no sizes or addresses. `/proc/thread-self` is
@@ -3682,7 +3684,9 @@ kernel.
   memory; its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
   `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
-  process with no memory before they check the reader.
+  process with no memory before they check the reader. Its files but its
+  directory are root's, as on the CI runners' kernel (see limitations), so
+  their mode lets only root open them, and any other reader gets `EACCES`.
 
 - `personality` of a process or of a thread, 0400 and of size 0, is the
   thread's execution domain and flags in 8 hex digits and a newline, as

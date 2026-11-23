@@ -177,10 +177,15 @@ impl Task {
     /// Its files' owner: the task's effective IDs, as Linux's
     /// `task_dump_owner` gives a dumpable task's, and root an undumpable
     /// one's but for a directory any reader may read and look in (0555),
-    /// which is always the task's.
+    /// which is always the task's. A task with no memory left (a zombie, or
+    /// a leader that ended before its other threads) has the rest owned by
+    /// root, as `task_dump_owner` did before Linux 7.2's commit 6b1c66c9
+    /// ("exec_state: relocate dumpable information"), finding no `mm` to
+    /// ask: the kernel of the x86-64 CI runners that the differential tests
+    /// compare with. From 7.2 the dumpable flag outlives the `mm`.
     pub(super) fn owned(&self, stat: FileStat) -> FileStat {
         let ids = &self.public.credentials;
-        let (uid, gid) = if self.view.dumpable || stat.mode == OPEN_DIRECTORY {
+        let (uid, gid) = if (self.holds() && self.view.dumpable) || stat.mode == OPEN_DIRECTORY {
             (ids.euid, ids.egid)
         } else {
             (0, 0)
@@ -206,8 +211,9 @@ impl Task {
 /// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
 /// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself, read or
 /// looked in, as its mode lets (`proc_fd_permission`). `environ`, `auxv` and
-/// `pagemap` of a task with no memory left are `ESRCH` for anyone, as Linux's
-/// `__mem_open` and `pagemap_open` refuse them before they check the reader,
+/// `pagemap` of a task with no memory left are `ESRCH` for a reader their mode
+/// lets open them (root's, [`Task::owned`]), as Linux's `__mem_open` and
+/// `pagemap_open` refuse them before they check the reader,
 /// while `maps` and `smaps` (`proc_maps_open`) then open for anyone and read
 /// nothing.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
@@ -554,8 +560,11 @@ pub(crate) fn own_live_owner(
             return (0, 0);
         };
         let public = view.group.public(tid);
+        // Root's but for an open directory once the task has no memory left,
+        // as Linux's `task_dump_owner` before 7.2 ([`Task::owned`]).
+        let gone = view.zombie || (tid == pid && !view.group.has_member(pid));
         match public {
-            Some(public) if open || view.dumpable => {
+            Some(public) if open || (view.dumpable && !gone) => {
                 (public.credentials.euid, public.credentials.egid)
             }
             _ => (0, 0),

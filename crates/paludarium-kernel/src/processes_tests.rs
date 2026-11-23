@@ -7015,6 +7015,68 @@ mod proc_other {
             Err(Errno::ENOENT.to_syscall_return())
         );
     }
+    /// A task with no memory left has its files but its directory owned by
+    /// root, as Linux's `task_dump_owner` before 7.2 (commit 6b1c66c9) found
+    /// no `mm`: the kernel of the CI runners. So a reader of the task's own
+    /// user may no longer open `environ` (0400), `EACCES` before its
+    /// missing memory (`ESRCH`), while `maps` (0444) opens and reads
+    /// nothing; the directory (0555) stays the task's.
+    #[test]
+    fn a_task_without_memory_has_its_files_owned_by_root() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        // Dumpable again after the change of IDs (PR_SET_DUMPABLE), so a
+        // task with memory owns its files.
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [4, 1, 0, 0, 0, 0]), 0);
+        let owner = |k: &mut Kernel, t: &mut Thread, path: &str| {
+            m.write(GuestAddr(DATA), format!("{path}\0").as_bytes())
+                .unwrap();
+            assert_eq!(
+                syscall(k, t, &m, 4, [DATA, DATA + 512, 0, 0, 0, 0]),
+                0,
+                "{path}"
+            );
+            let mut uid = [0; 4];
+            m.read(GuestAddr(DATA + 512 + 28), &mut uid).unwrap();
+            u32::from_le_bytes(uid)
+        };
+        let eacces = Err(Errno::EACCES.to_syscall_return());
+        // A gone leader: its process runs on with another thread.
+        let (leader, lt, _lm) = fork(&mut k, &mut t, &m);
+        let pid = lt.tid;
+        assert_eq!(owner(&mut k, &mut t, &format!("/proc/{pid}/environ")), 1000);
+        assert!(read(&mut k, &mut t, &m, &format!("/proc/{pid}/environ")).is_ok());
+        leader.group.register(42, Arc::new(SignalInbox::default()));
+        leader.abandon_thread(pid);
+        // A zombie process.
+        let (mut zombie, zt, zm) = fork(&mut k, &mut t, &m);
+        finish(&mut zombie, &zt, &zm, ExitStatus::Exited(0));
+        for dir in [
+            format!("/proc/{pid}"),
+            format!("/proc/{pid}/task/{pid}"),
+            format!("/proc/{}", zt.tid),
+        ] {
+            assert_eq!(owner(&mut k, &mut t, &dir), 1000, "{dir}");
+            for file in ["environ", "auxv", "pagemap", "maps", "status"] {
+                assert_eq!(
+                    owner(&mut k, &mut t, &format!("{dir}/{file}")),
+                    0,
+                    "{dir}/{file}"
+                );
+            }
+            for file in ["environ", "auxv", "pagemap"] {
+                let path = format!("{dir}/{file}");
+                assert_eq!(read(&mut k, &mut t, &m, &path), eacces, "{path}");
+            }
+            assert_eq!(
+                read(&mut k, &mut t, &m, &format!("{dir}/maps")),
+                Ok(Vec::new())
+            );
+        }
+    }
     /// A leader that ended before its process's other threads has, as
     /// Linux's zombie leader after `exit_mm`, `exit_files` and `exit_fs`,
     /// no memory, descriptors or directories in its process's directory or

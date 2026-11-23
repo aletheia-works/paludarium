@@ -20,7 +20,14 @@ Linux.
   writes. A load the CPU refuses is `SIGSEGV` for #GP, or `SIGBUS` for #NP
   (#SS for `%ss`), with `SI_KERNEL`, the vector in `trapno` and the
   selector without its RPL in `err`, as Linux gives them; `mov` to `%cs` is
-  `SIGILL`. A selector that is not null gives `%fs` or `%gs` the 32-bit
+  `SIGILL`. A far `jmp` and `call` through an `m16:16`, `m16:32` or
+  `m16:64` pointer and a far `ret` load `%cs` with the same checks of a code
+  segment: `__USER_CS` runs, whatever RPL the selector has for a jump or
+  call (a return needs RPL 3), and a call pushes `%cs` and the return
+  address in slots of the offset's size; a null selector, data, a system
+  descriptor, the kernel's code or a return to an offset that is not
+  canonical is `SIGSEGV` for #GP, and a code segment not present `SIGBUS`
+  for #NP, with nothing moved. A selector that is not null gives `%fs` or `%gs` the 32-bit
   base of its descriptor, and a null one clears it, as Intel's CPUs and
   AMD's since Zen 2 do; in 64-bit mode the other segments have no base.
   `arch_prctl`'s `ARCH_SET_FS` and `ARCH_SET_GS`, `PTRACE_ARCH_PRCTL` and
@@ -1907,7 +1914,8 @@ kernel.
   `ENOTDIR`, `ELOOP`, `EACCES`), `MS_NOUSER` is `EINVAL`, a Landlock domain
   that handles file access `EPERM`, and `CAP_SYS_ADMIN` over the mount
   namespace is needed (`EPERM`). A new mount then needs a type (`EINVAL`)
-  that is `tmpfs` (`ENODEV` for any other), options tmpfs takes (`EINVAL`
+  that is `tmpfs` or `bpf` (a BPF file system, below; `ENODEV` for any
+  other), options tmpfs takes (`EINVAL`
   for any other or a value of the wrong kind: `size`, `nr_blocks`,
   `nr_inodes`, `mode`, `uid`, `gid`, `huge`, `mpol`, `inode32`, `inode64`,
   `noswap`, the quota ones, and the common `sync`, `dirsync`, `lazytime` and
@@ -2155,10 +2163,11 @@ kernel.
   the target private and the source shared or a slave (`EINVAL`).
 
 - `fsopen`, `fsconfig`, `fsmount` and `fspick` (Linux master's
-  `fs/fsopen.c`) make a tmpfs through a file system context, a descriptor
+  `fs/fsopen.c`) make a tmpfs or a BPF file system through a file system
+  context, a descriptor
   (`anon_inode:[fscontext]`) that `fsconfig` fills and acts on. `fsopen`
   needs `CAP_SYS_ADMIN` over the mount namespace (`EPERM`) and known flags
-  (`EINVAL`), and any type but tmpfs is `ENODEV`. `fsconfig` checks each
+  (`EINVAL`), and any type but those is `ENODEV`. `fsconfig` checks each
   command's arguments (`EINVAL`, `EOPNOTSUPP` for an unknown command), then
   the descriptor (`EBADF`, `EINVAL` for another file); it takes the
   parameters `mount` takes, one at a time, with the same checks, and
@@ -3597,7 +3606,12 @@ kernel.
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
   has the same files but `task`, of that thread: its name, its signal masks,
-  and its ID as `Pid` with the process's as `Tgid`. `/proc/thread-self` is a
+  its ID as `Pid` with the process's as `Tgid`, and its own
+  `voluntary_ctxt_switches` (the times it went to sleep; the process's
+  `status` shows the leader's, as Linux's `task_context_switch_counts`). A
+  leader that ended before the other threads stays first in `task` as a
+  zombie, `Z` in its `stat` and `status`, and `Threads` and `num_threads`
+  count it until the process ends, as Linux keeps a delayed group leader. `/proc/thread-self` is a
   link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
@@ -3717,7 +3731,8 @@ kernel.
   (as Linux's `task_cpu` is the one it last ran on; `getcpu` looks at the
   mask again at once, so after `sched_setaffinity` `stat` follows from the
   task's next system call), and the real-time priority and policy. A path under
-  `task` gives the thread's own; the process's are its leader's. What
+  `task` gives the thread's own, its CPU time and minor faults too; the
+  process's CPU time and faults are all its threads', the rest its leader's. What
   nothing measures is 0: major faults, and the system time, as all the CPU
   time counts as the user's.
   A reader that may not see the task's memory, as Linux's
@@ -3728,6 +3743,10 @@ kernel.
   ended (its code times 256, or its signal, with 0x80 for a core dumped), and
   a stopped process's signal in its own `stat` until a wait reports the stop
   (Linux's `group_exit_code`); a thread's `stat` under `task` has no stop's.
+  A task in a ptrace stop shows that stop's `exit_code` (its signal, or
+  `SIGTRAP | 0x80` for a syscall stop under `PTRACE_O_TRACESYSGOOD`), its
+  process's `stat` too for the leader, until the tracer's wait reports it
+  (one with `WNOWAIT` does not), as Linux's `ptrace_stop` sets it.
   A process whose leader ends with `exit` before its other threads shows the
   leader's own code in its `stat` while they run, as Linux's leader
   `exit_code` is; once they end it has the status of the last one's `exit`,
@@ -4406,7 +4425,7 @@ kernel.
   The buffer size is 256 KiB (`CONFIG_LOG_BUF_SHIFT` 18), and nothing is
   unread.
 
-- `sysfs` numbers the file system types: `tmpfs`, `proc`, `sockfs`,
+- `sysfs` numbers the file system types: `tmpfs`, `proc`, `sockfs`, `bpf`,
   `pipefs`, `devpts`, `ext4` and `mqueue`, the types of the files paludarium
   gives (a host file's as `ext4`), in the order Linux registers them. Option
   1 gives a name's index, 2 copies an index's name and 3 gives the count; an
@@ -4771,6 +4790,38 @@ kernel.
   template) leaves them out, as Linux's `bpf_map_flags_retain_permanent`
   does. See [limitations](./limitations) for what is not there.
 
+- `BPF_OBJ_PIN` leaves a map in a file of a BPF file system and
+  `BPF_OBJ_GET` gives a descriptor of it again, as Linux's
+  `bpf_obj_pin_user` and `bpf_obj_get_user` do. A BPF file system is a
+  mount of type `bpf`, by `mount` or `fsopen`: it is `FS_USERNS_MOUNT`, but
+  `bpf_fill_super` needs `CAP_SYS_ADMIN` in the first user namespace from a
+  caller outside it (`EPERM`). `uid`, `gid` and `mode` give its root, which
+  is 0777 and the sticky bit by default; the common superblock flags apply,
+  and other options are ignored, as Linux ignores them. `delegate_cmds`,
+  `delegate_maps`, `delegate_progs` and `delegate_attachs` take names of
+  Linux master's UAPI enums (in any case, without their `BPF_`,
+  `BPF_MAP_TYPE_` or `BPF_PROG_TYPE_` prefix), numbers (`EINVAL`, `ERANGE`)
+  or `any`, joined by `:`, and need `CAP_SYS_ADMIN` (`EPERM`); mountinfo
+  shows them as `bpf_show_options` does, by name, `any` or in hex. Its
+  `statfs` is `BPF_FS_MAGIC`, with no size and no inodes, and a remount
+  changes its superblock flags alone. Both commands take no flag but
+  theirs (`BPF_F_PATH_FD`; for a get, `BPF_F_RDONLY` or `BPF_F_WRONLY`, not
+  both), and a `path_fd` only with `BPF_F_PATH_FD` (`EINVAL`). A pin takes
+  a map's descriptor of any access (`EINVAL` for another), then a new name
+  (`EEXIST`, and `ENOENT` with a slash after it) on a writable mount
+  (`EROFS`) in a BPF file system's directory (`EPERM` for another), which
+  the thread may write (`EACCES`): a regular file of mode 0600 less the
+  umask, the thread's, that holds the map while a name of it is there, with
+  no descriptor of the map left. A get follows the path's links and needs
+  the access it asks for on the file (`EACCES`), which must hold a map
+  (`EACCES` for another file); the new descriptor has that access. Opening
+  the file is `EIO`, as Linux's `bpffs_obj_fops` give a map with no BTF to
+  show. Its directories make directories, symbolic links, hard links and
+  renames, as `bpf_dir_iops` do, and no other file: a new regular file is
+  `EACCES`, a node (a FIFO, a socket's `bind`) `EPERM` and `O_TMPFILE`
+  `EOPNOTSUPP`; a name with a dot that is not there is `EPERM` for a call
+  that would make it (`bpf_lookup`).
+
 - `BPF_PROG_LOAD` loads socket filters (`BPF_PROG_TYPE_SOCKET_FILTER`),
   which a verifier checks as Linux's does, and an interpreter runs them on
   AF_UNIX sockets they are attached to (below). It checks
@@ -4907,6 +4958,35 @@ kernel.
   ("dereference of modified ctx ptr R6 off=%d disallowed", `EACCES`).
   R1 to R5 are not readable after one, and R0 is a number.
 
+- A `BPF_CALL` with `BPF_PSEUDO_CALL` calls a function of the program,
+  `imm` instructions after the call, as Linux checks a call of a static
+  function, the only kind without BTF. Each target starts a function
+  ("call to invalid destination" outside the program, `EINVAL`; "too many
+  subprograms" past 256, `E2BIG`). A function's jumps stay in it ("jump
+  out of range from insn %d to %d"), its last instruction is an exit or a
+  jump ("last insn is not an exit or jmp"), and one other than the main
+  program has no `BPF_LD_ABS`, `BPF_LD_IND` or `bpf_tail_call` ("LD_ABS
+  is not allowed in subprogs without BTF", "tail_call is not allowed in
+  subprogs without BTF", as 7.0 refuses them; master takes them), all
+  `EINVAL` before any path is walked. The callee starts with the caller's
+  R1 to R5 and a frame pointer and 512-byte stack of its own; its R0 and
+  R6 to R9 are not readable until written, and the caller's R0 to R5 are
+  not readable after the call, which gives it the callee's R0. A callee
+  may not return a pointer to a stack ("cannot return stack pointer to
+  the caller") or store one in a caller's frame ("cannot spill pointers to
+  stack into stack frame of the caller", both `EINVAL`), but reads and
+  writes a caller's stack through a pointer to it. Calls go 8 frames deep
+  at most ("the call stack of %d frames is too deep", `E2BIG`), which is
+  how a recursive call is refused, as the test machines' 7.0 does (master
+  refuses one before the walk, "recursive call from %s() to %s()", which
+  comes here once the test machines' kernel has it); after
+  the walk, along every chain of calls, each function's stack depth,
+  rounded up to 16 bytes as with the JIT, adds up to 512 bytes at most
+  ("combined stack size of %d calls is %d. Too large", `EACCES`). With
+  `BPF_LOG_STATS` the log gives each function's stack depth and the most
+  a chain of calls takes ("stack depth %d+%d max %d", as the test
+  machines' 7.0 writes it).
+
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`
   (below), and runs on each message sent to it, as
@@ -4929,7 +5009,9 @@ kernel.
   message's start or, from `SKF_NET_OFF`, the network header, its start;
   where the bytes are not in the message, or the offset is from the MAC
   header, which is not set, or below it, the program returns 0 then and
-  there. The context is the message's `__sk_buff`: its `len`, `cb[]`
+  there. A called function runs in a frame of its own, and the caller's
+  R6 to R9 are as they were after it. The context is the message's
+  `__sk_buff`: its `len`, `cb[]`
   from 0 and 0 for the fields an AF_UNIX message does not set.
   `bpf_skb_load_bytes` reads the message, and its relative form reads it
   from the network header, its start, where there is no MAC header
@@ -6010,7 +6092,7 @@ one only with an `--allow-net`.
 - **aube**: a Node.js package manager written in Rust (v2.10.0). `--version`,
   `install`, `install --frozen-lockfile` and `list` give the same output and
   exit status as on real Linux.
-- **ripgrep**: a text search tool written in Rust (15.2.0), which runs its
+- **ripgrep**: a text search tool written in Rust (16.0.0), which runs its
   searches on several threads. Nine searches, including a regular expression
   replacement, a parallel search, one through a memory-mapped file and two
   errors, give the same output and exit status as on real Linux. `--version`

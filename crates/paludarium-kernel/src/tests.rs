@@ -9399,7 +9399,7 @@ mod kernel_info {
         let mut f = fixture();
         let einval = errno(Errno::EINVAL);
         let count = f.ret(139, &[3, 0, 0]);
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
         f.mem.write(GuestAddr(BUF), b"proc\0").unwrap();
         let proc = f.ret(139, &[1, BUF, 0]);
         assert_eq!(proc, 1);

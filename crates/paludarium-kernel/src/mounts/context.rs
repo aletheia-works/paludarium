@@ -1,6 +1,7 @@
 //! The file system context of `fsopen` and `fspick` (Linux's `fs_context`,
 //! `fs/fsopen.c`), which `fsconfig` fills and acts on and `fsmount` mounts,
-//! in Linux master's order of checks. Only tmpfs is there, as for `mount`.
+//! in Linux master's order of checks. Only tmpfs and the BPF file system
+//! are there, as for `mount`.
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -9,6 +10,7 @@ use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{NewTmpfs, Target, mount_flags as mnt};
 
+use super::bpffs::{self, Bpffs};
 use super::{
     AT_FDCWD, CAP_SYS_ADMIN, MS_RDONLY, MS_RMT_MASK, O_CLOEXEC, O_NOFOLLOW, O_PATH, Refused, Tmpfs,
     Value, built_tmpfs, may_mount, outcome, over_superblock, reconfigure_superblock, user_string,
@@ -74,15 +76,22 @@ enum Phase {
 
 /// What a context makes or changes.
 enum Purpose {
-    /// A new tmpfs (`FS_CONTEXT_FOR_MOUNT`): its options, then the
-    /// superblock `FSCONFIG_CMD_CREATE` made, which `fsmount` takes.
+    /// A new tmpfs or BPF file system (`FS_CONTEXT_FOR_MOUNT`): its
+    /// options, then the superblock `FSCONFIG_CMD_CREATE` made, which
+    /// `fsmount` takes.
     Mount {
-        options: Box<Tmpfs>,
+        options: Options,
         made: Option<NewTmpfs>,
     },
     /// The superblock of mount `mount` (`FS_CONTEXT_FOR_RECONFIGURE`), and
     /// the options asked of it.
     Reconfigure { mount: u64, asked: Box<Tmpfs> },
+}
+
+/// A new superblock's options, by its type.
+enum Options {
+    Tmpfs(Box<Tmpfs>),
+    Bpf(Box<Bpffs>),
 }
 
 struct State {
@@ -201,9 +210,10 @@ fn installed(c: &mut Context<'_>, context: FsContext, cloexec: bool) -> Result<u
 
 /// `fsopen(fs_name, flags)`: `CAP_SYS_ADMIN` over the caller's mount
 /// namespace (`EPERM`), the flags (`EINVAL`), the name (`EFAULT`, `EINVAL`
-/// beyond a page), then the type: tmpfs, or `ENODEV` for any other, as
-/// from a kernel without it. The context starts from tmpfs's defaults
-/// (`shmem_init_fs_context`).
+/// beyond a page), then the type: tmpfs or the BPF file system, or
+/// `ENODEV` for any other, as from a kernel without it. The context starts
+/// from the type's defaults (`shmem_init_fs_context`,
+/// `bpf_init_fs_context`).
 fn fsopen(c: &mut Context<'_>, name: u64, flags: u64) -> Result<u64, Errno> {
     let namespaces = c.group.namespaces(c.tid);
     if !may_mount(c, &namespaces.mnt) {
@@ -213,11 +223,13 @@ fn fsopen(c: &mut Context<'_>, name: u64, flags: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let name = user_string(c, name, super::PAGE)?.ok_or(Errno::EFAULT)?;
-    if name != b"tmpfs" {
-        return Err(super::ENODEV);
-    }
+    let options = match &name[..] {
+        b"tmpfs" => Options::Tmpfs(Box::new(Tmpfs::fresh(c, None))),
+        b"bpf" => Options::Bpf(Box::new(Bpffs::fresh(c, None))),
+        _ => return Err(super::ENODEV),
+    };
     let purpose = Purpose::Mount {
-        options: Box::new(Tmpfs::fresh(c, None)),
+        options,
         made: None,
     };
     let context = FsContext::new(purpose, Phase::CreateParams, false);
@@ -352,7 +364,14 @@ fn fsconfig(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 Given::Other => Value::Other,
             };
             let kind = match &state.purpose {
-                Purpose::Mount { .. } => "tmpfs",
+                Purpose::Mount {
+                    options: Options::Tmpfs(_),
+                    ..
+                } => "tmpfs",
+                Purpose::Mount {
+                    options: Options::Bpf(_),
+                    ..
+                } => bpffs::KIND,
                 Purpose::Reconfigure { mount, .. } => c
                     .files
                     .namespaced()
@@ -360,9 +379,25 @@ fn fsconfig(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                     .map_or("tmpfs", |t| t.kind),
             };
             let parsed = match &mut state.purpose {
-                Purpose::Mount { options, .. } => options.parse(c, &key, value),
+                Purpose::Mount {
+                    options: Options::Tmpfs(options),
+                    ..
+                } => options.parse(c, &key, value),
+                Purpose::Mount {
+                    options: Options::Bpf(options),
+                    ..
+                } => options.parse(c, &key, value),
                 Purpose::Reconfigure { asked, .. } if kind == "tmpfs" => {
                     asked.parse(c, &key, value)
+                }
+                // A BPF file system parses into a context its reconfigure
+                // drops, the common flags aside.
+                Purpose::Reconfigure { asked, .. } if kind == bpffs::KIND => {
+                    if asked.parse_common(&key) {
+                        Ok(())
+                    } else {
+                        Bpffs::fresh(c, None).parse(c, &key, value)
+                    }
                 }
                 // Another file system takes only the common flags here.
                 Purpose::Reconfigure { asked, .. } => {
@@ -401,7 +436,11 @@ fn create(c: &Context<'_>, state: &mut State) -> Result<u64, Errno> {
     let Purpose::Mount { options, made } = &mut state.purpose else {
         return Err(EBUSY);
     };
-    match built_tmpfs(c, (**options).clone(), 0, mnt::RELATIME) {
+    let built = match options {
+        Options::Tmpfs(options) => built_tmpfs(c, (**options).clone(), 0, mnt::RELATIME),
+        Options::Bpf(options) => (**options).clone().built(c, 0, mnt::RELATIME),
+    };
+    match built {
         Ok(new) => {
             *made = Some(new);
             state.root = true;

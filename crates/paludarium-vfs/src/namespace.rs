@@ -328,6 +328,11 @@ struct Superblock {
     /// Behind a trait object, which keeps the auto-trait checks of what
     /// holds a table shallow.
     fs: Arc<dyn FileSystem>,
+    /// The same files as a [`MemFs`], for [`NamespacedFs::memory_at`],
+    /// behind a trait object for the same reason.
+    memory: Arc<dyn std::any::Any + Send + Sync>,
+    /// Its file system's type: `tmpfs`, or `bpf` for a BPF file system.
+    kind: &'static str,
     minor: u64,
     numbers: Arc<Numbers>,
     settings: Mutex<Settings>,
@@ -393,6 +398,19 @@ pub struct NewTmpfs {
     /// The user namespace that owns the superblock, which the kernel keeps
     /// (`s_user_ns`).
     pub owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Its file system's type, as mountinfo and `statmount` name it:
+    /// `tmpfs`, or `bpf` for a BPF file system, whose files the kernel
+    /// makes ([`NamespacedFs::memory_at`]).
+    pub kind: &'static str,
+}
+
+/// The files of a memory mount a path is in, and the path within them
+/// ([`NamespacedFs::memory_at`]).
+pub struct MemoryAt {
+    pub fs: MemFs,
+    pub path: Vec<u8>,
+    /// The mount's file system's type ([`NewTmpfs::kind`]).
+    pub kind: &'static str,
 }
 
 #[derive(Clone)]
@@ -1413,6 +1431,26 @@ impl NamespacedFs {
             },
         );
     }
+    /// The files of the memory mount (a tmpfs, a BPF file system) that the
+    /// resolved `path` is in, and its path in them, as the kernel's own
+    /// operations on a file system's inodes reach them (a BPF file system's
+    /// `vfs_mkobj`): its last symbolic link followed if `follow`, and it
+    /// need not be there yet. `None` when it is on no memory mount.
+    pub fn memory_at(&self, path: &[u8], follow: bool) -> Result<Option<MemoryAt>, Errno> {
+        let entries = self.table.snapshot();
+        let loc = self.walk(&entries, path, follow, true, true)?;
+        let Some(e) = loc.at.map(|i| &entries[i]) else {
+            return Ok(None);
+        };
+        let Some(sb) = e.memory() else {
+            return Ok(None);
+        };
+        Ok(sb.memory.downcast_ref::<MemFs>().map(|fs| MemoryAt {
+            fs: fs.shared(),
+            path: e.inside(&loc.path),
+            kind: sb.kind,
+        }))
+    }
     /// What `umount2` and `mount` find at the resolved `path` (whose last
     /// symbolic link is not followed).
     pub fn target(&self, path: &[u8]) -> Result<Target, Errno> {
@@ -1459,7 +1497,7 @@ impl NamespacedFs {
             locks: e.locks,
             kind: match &e.backing {
                 Backing::Boot { kind, .. } | Backing::Lower { kind, .. } => kind,
-                Backing::Memory(_) => "tmpfs",
+                Backing::Memory(sb) => sb.kind,
                 Backing::Generated(fs) => fs.0.kind,
             },
             settings: e.memory().map(|sb| lock(&sb.settings).clone()),
@@ -1554,6 +1592,8 @@ impl NamespacedFs {
         let usage = new.fs.usage();
         usage.set_limits(new.settings.blocks, new.settings.inodes);
         let sb = Arc::new(Superblock {
+            memory: Arc::new(new.fs.shared()),
+            kind: new.kind,
             fs: Arc::new(new.fs),
             minor,
             numbers: Arc::clone(numbers),
@@ -2984,7 +3024,7 @@ impl FileSystem for NamespacedFs {
                     Backing::Memory(sb) => {
                         let settings = lock(&sb.settings);
                         (
-                            "tmpfs",
+                            sb.kind,
                             sb.device(),
                             e.root.clone(),
                             settings.common_options.clone(),
@@ -3359,6 +3399,10 @@ impl HostFs for NamespacedFs {
             stats.blocks_available = stats.blocks_free;
             stats.files = settings.inodes;
             stats.files_free = settings.inodes.saturating_sub(files);
+            // A BPF file system's `simple_statfs`, with no size or inodes.
+            if sb.kind == "bpf" {
+                stats.kind = crate::BPF_FS_MAGIC;
+            }
         }
         Ok(stats)
     }

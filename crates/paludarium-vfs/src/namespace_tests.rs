@@ -33,6 +33,7 @@ fn tmpfs(blocks: u64) -> NewTmpfs {
         flags: mount_flags::RELATIME,
         source: b"none".to_vec(),
         owner: None,
+        kind: "tmpfs",
     }
 }
 

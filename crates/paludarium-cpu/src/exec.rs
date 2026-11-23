@@ -169,6 +169,9 @@ pub(crate) fn keeps_vector_state(i: &Instruction) -> bool {
             | Mnemonic::MovFromSegment
             | Mnemonic::PushSegment
             | Mnemonic::PopSegment
+            | Mnemonic::JmpFar
+            | Mnemonic::CallFar
+            | Mnemonic::RetFar
     );
     general
         && !i
@@ -213,7 +216,10 @@ pub(crate) fn fails_cleanly(i: &Instruction) -> bool {
         | Mnemonic::MovToSegment
         | Mnemonic::MovFromSegment
         | Mnemonic::PushSegment
-        | Mnemonic::PopSegment => true,
+        | Mnemonic::PopSegment
+        | Mnemonic::JmpFar
+        | Mnemonic::CallFar
+        | Mnemonic::RetFar => true,
         Mnemonic::Pop => matches!(i.operand(0), Some(Operand::Register(_))),
         _ => false,
     }
@@ -415,6 +421,73 @@ impl Exec<'_> {
         self.load_segment(sreg, selector)?;
         self.s.gpr[reg::RSP] = rsp.wrapping_add(u64::from(size));
         Ok(())
+    }
+
+    /// The checks of a far `jmp`, `call` (`returning` false) or `ret` (true)
+    /// to `selector:offset` ([`segments::check_code`]), with a 64-bit
+    /// offset that must be canonical (`#GP(0)`). A segment that runs in
+    /// compatibility mode, as `__USER32_CS` does, is a mode the virtual CPU
+    /// does not run: unsupported (SIGILL at the transfer). Gives CS to load.
+    fn far_target(&self, selector: u16, offset: u64, returning: bool) -> Result<u16> {
+        let mode = {
+            let ldt = self
+                .mem
+                .ldt()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            segments::check_code(selector, &ldt, returning).map_err(Stop::Segment)?
+        };
+        if mode == segments::CodeMode::Compatibility {
+            return Err(Stop::Invalid);
+        }
+        if (offset as i64) << 16 >> 16 != offset as i64 {
+            return Err(Stop::Segment(segments::SegmentFault::GeneralProtection(0)));
+        }
+        Ok(selector | 3)
+    }
+
+    /// The offset and selector a far `jmp` or `call` reads from its memory
+    /// operand, and the CS it loads.
+    fn far_pointer(&self) -> Result<(u64, u16)> {
+        let Operand::Memory(m) = op(self.i, 0)? else {
+            return Err(Stop::Invalid);
+        };
+        let size = self.i.implicit_size;
+        let address = self.linear(&m);
+        let offset = self.load(address, size)?;
+        let selector = self.load(GuestAddr(address.0.wrapping_add(u64::from(size))), 2)? as u16;
+        Ok((offset, self.far_target(selector, offset, false)?))
+    }
+
+    /// A far `call`: CS and then the return address in slots of the
+    /// offset's size, the stack pointer moving once both are written.
+    fn call_far(&mut self, next: u64) -> Result<u64> {
+        let (offset, cs) = self.far_pointer()?;
+        let size = self.i.implicit_size;
+        let rsp = self.s.gpr[reg::RSP].wrapping_sub(2 * u64::from(size));
+        let old_cs = u64::from(self.s.segments[segments::CS]);
+        self.store(GuestAddr(rsp.wrapping_add(u64::from(size))), size, old_cs)?;
+        self.store(GuestAddr(rsp), size, next)?;
+        self.s.gpr[reg::RSP] = rsp;
+        self.s.segments[segments::CS] = cs;
+        Ok(offset)
+    }
+
+    /// A far `ret`: the offset and CS from the stack, which then drops by
+    /// both slots and the immediate.
+    fn ret_far(&mut self) -> Result<u64> {
+        let size = self.i.implicit_size;
+        let rsp = self.s.gpr[reg::RSP];
+        let offset = self.load(GuestAddr(rsp), size)?;
+        let selector = self.load(GuestAddr(rsp.wrapping_add(u64::from(size))), size)? as u16;
+        let cs = self.far_target(selector, offset, true)?;
+        let extra = match self.i.operand(0) {
+            Some(Operand::Immediate(extra)) => extra & 0xffff,
+            _ => 0,
+        };
+        self.s.gpr[reg::RSP] = rsp.wrapping_add(2 * u64::from(size)).wrapping_add(extra);
+        self.s.segments[segments::CS] = cs;
+        Ok(offset)
     }
 
     fn push(&mut self, value: u64, size: u8) -> Result<()> {
@@ -2319,6 +2392,13 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
             target = Some(t);
         }
         Mnemonic::Jmp => target = Some(x.branch_target()?),
+        Mnemonic::JmpFar => {
+            let (offset, cs) = x.far_pointer()?;
+            x.s.segments[segments::CS] = cs;
+            target = Some(offset);
+        }
+        Mnemonic::CallFar => target = Some(x.call_far(next.0)?),
+        Mnemonic::RetFar => target = Some(x.ret_far()?),
         Mnemonic::Jrcxz | Mnemonic::Jecxz => {
             let count = x.s.gpr[reg::RCX]
                 & if i.mnemonic == Mnemonic::Jecxz {

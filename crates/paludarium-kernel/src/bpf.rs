@@ -66,6 +66,8 @@ mod cmd {
     pub const MAP_DELETE_ELEM: u32 = 3;
     pub const MAP_GET_NEXT_KEY: u32 = 4;
     pub const PROG_LOAD: u32 = 5;
+    pub const OBJ_PIN: u32 = 6;
+    pub const OBJ_GET: u32 = 7;
     pub const MAP_GET_NEXT_ID: u32 = 12;
     pub const MAP_GET_FD_BY_ID: u32 = 14;
     pub const OBJ_GET_INFO_BY_FD: u32 = 15;
@@ -75,8 +77,10 @@ mod cmd {
     pub const MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
     pub const MAP_UPDATE_BATCH: u32 = 26;
     pub const MAP_DELETE_BATCH: u32 = 27;
-    /// `__MAX_BPF_CMD` in Linux master.
-    pub const MAX: u32 = 39;
+    /// `__MAX_BPF_CMD` in Linux master, after `BPF_PROG_STREAM_OPEN` (39):
+    /// a number below it is a command Linux has (`ENOSYS` when it is not
+    /// here), and one past it `__sys_bpf`'s `EINVAL`.
+    pub const MAX: u32 = 40;
 }
 
 pub(crate) const TYPE_HASH: u32 = 1;
@@ -88,8 +92,8 @@ pub(crate) const TYPE_HASH_OF_MAPS: u32 = 13;
 pub(crate) const TYPE_QUEUE: u32 = 22;
 pub(crate) const TYPE_STACK: u32 = 23;
 pub(crate) const TYPE_BLOOM_FILTER: u32 = 30;
-/// `__MAX_BPF_MAP_TYPE` in Linux master.
-const TYPE_MAX: u32 = 39;
+/// `__MAX_BPF_MAP_TYPE` in Linux master, after `BPF_MAP_TYPE_RHASH` (35).
+const TYPE_MAX: u32 = 36;
 /// `BPF_MAP_TYPE_STRUCT_OPS`, the one `btf_vmlinux_value_type_id` is for.
 const TYPE_STRUCT_OPS: u32 = 26;
 /// The types `map_extra` is for: bloom filters, arenas and resizable hashes.
@@ -575,6 +579,22 @@ fn dispatch(c: &mut Context<'_>, command: u32, at: u64, size: u32) -> Result<u64
         cmd::MAP_DELETE_ELEM => delete(c, &attr),
         cmd::MAP_GET_NEXT_KEY => next_key(c, &attr),
         cmd::PROG_LOAD => crate::bpf_prog::load(c, &attr, at, size as u32),
+        cmd::OBJ_PIN | cmd::OBJ_GET => {
+            // BPF_OBJ_LAST_FIELD is path_fd.
+            check_attr(&attr, 20)?;
+            let object = if command == cmd::OBJ_PIN {
+                crate::bpf_fs::pin
+            } else {
+                crate::bpf_fs::get
+            };
+            object(
+                c,
+                word(&attr, 0),
+                half(&attr, 8),
+                half(&attr, 12),
+                half(&attr, 16),
+            )
+        }
         cmd::MAP_LOOKUP_AND_DELETE_ELEM => lookup_and_delete(c, &attr),
         cmd::MAP_FREEZE => freeze(c, &attr),
         cmd::MAP_LOOKUP_BATCH
@@ -1192,13 +1212,25 @@ fn fd_by_id(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
 
 /// `bpf_get_file_flag`: the access `BPF_F_RDONLY` and `BPF_F_WRONLY` ask
 /// for, not both (`EINVAL`).
-fn file_access(flags: u32) -> Result<u32, Errno> {
+pub(crate) fn file_access(flags: u32) -> Result<u32, Errno> {
     match (flags & flag::RDONLY != 0, flags & flag::WRONLY != 0) {
         (true, true) => Err(Errno::EINVAL),
         (true, false) => Ok(O_RDONLY),
         (false, true) => Ok(O_WRONLY),
         (false, false) => Ok(O_RDWR),
     }
+}
+
+/// The map of descriptor `fd`, whatever its access, as a pin holds it
+/// (`bpf_map_get_with_uref`); `None` for no descriptor or one of no map.
+pub(crate) fn pinnable(c: &Context<'_>, fd: u32) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    let (map, _, _) = map_of(c, fd).ok()?;
+    Some(map as Arc<dyn std::any::Any + Send + Sync>)
+}
+
+/// A new descriptor of the pinned `map` with `access` (`bpf_map_new_fd`).
+pub(crate) fn map_fd(c: &mut Context<'_>, map: Arc<Map>, access: u32) -> Result<u64, Errno> {
+    new_fd(c, map, access)
 }
 
 /// `__bpf_map_get`: `EBADF` for no descriptor, `EINVAL` for one that is

@@ -58,6 +58,14 @@
    big-endian, at offsets from the start, the network header and a
    register, one that keeps as many bytes as it loads, and the loads past
    the message or before it, or from the MAC header, which drop it.
+   bpf-prog-calls: bpf-to-bpf calls of static functions (no BTF): programs
+   it takes and refuses (the call's destination, jumps that leave a
+   function or fall into the next, BPF_LD_ABS and bpf_tail_call in a
+   function, R0 to R5 after a call and R0 and R6 to R9 in the callee, a
+   pointer to a stack returned or stored in a caller's frame, 9 frames,
+   recursion, and the combined stack), each function's stack depth in the log's
+   statistics, and a filter whose functions write a map's value through
+   pointers to it and to their callers' stacks, which the case reads back.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -2188,6 +2196,135 @@ static int case_ldabs(void) {
     return 0;
 }
 
+#define CALLF(by) I(0x85, 0, 1, 0, by) /* call the function `by` instructions on */
+
+/* The log's "stack depth" line, with BPF_LOG_STATS, of a program taken. */
+static void depths(const char *name, const struct insn *insns, unsigned count) {
+    struct prog_attr p = attr(insns, count);
+    p.log_level = 4;
+    memset(log_text, 0, sizeof log_text);
+    long fd = bpf(PROG_LOAD, &p, sizeof p);
+    const char *line = strstr(log_text, "stack depth ");
+    const char *end = line ? strchr(line, '\n') : NULL;
+    if (fd < 0 || !end) {
+        say("%s: %ld", name, fd);
+        return;
+    }
+    say("%s: %.*s", name, (int)(end - line), line);
+    close((int)fd);
+}
+#define DEPTHS(name, ...)                                       \
+    do {                                                        \
+        static const struct insn insns[] = {__VA_ARGS__};       \
+        depths(name, insns, COUNT(insns));                      \
+    } while (0)
+
+/* A chain of functions, each writing a byte `bytes` below its frame pointer
+   and calling the next; the last returns 0. */
+static void chain(const char *name, int functions, int16_t bytes) {
+    struct insn p[64];
+    unsigned n = 0;
+    for (int f = 0; f < functions; f++) {
+        p[n++] = (struct insn)ST_B(10, -bytes, 0);
+        if (f + 1 < functions) p[n++] = (struct insn)CALLF(2);
+        p[n++] = (struct insn)MOV(0, 0);
+        p[n++] = (struct insn)EXIT();
+    }
+    run(name, attr(p, n));
+}
+
+static int case_calls(void) {
+    /* Programs it takes. */
+    LOAD("a call", MOV(1, 3), CALLF(1), EXIT(), MOV_REG(0, 1), EXIT());
+    LOAD("R6 to R9 kept", MOV(6, 6), MOV(9, 9), CALLF(3), MOV_REG(0, 6), ADD(0, 9), EXIT(),
+         MOV(6, 0), MOV(0, 0), EXIT());
+    LOAD("R1 to R5 in", MOV(1, 1), MOV(2, 2), MOV(3, 3), MOV(4, 4), MOV(5, 5), CALLF(1), EXIT(),
+         MOV_REG(0, 1), I(0x0f, 0, 2, 0, 0), I(0x0f, 0, 3, 0, 0), I(0x0f, 0, 4, 0, 0),
+         I(0x0f, 0, 5, 0, 0), EXIT());
+    LOAD("the caller's stack through R1", ST_DW(10, -8, 1), MOV_REG(1, 10), ADD(1, -8), CALLF(2),
+         LDX_DW(0, 10, -8), EXIT(), ST_DW(1, 0, 7), MOV(0, 0), EXIT());
+    LOAD("a pointer to the caller's own stack in its stack", MOV_REG(1, 10), ADD(1, -8), CALLF(3),
+         LDX_DW(0, 10, -16), MOV(0, 0), EXIT(), STX_DW(10, 1, -8), MOV(0, 0), EXIT());
+    LOAD("the context to the callee", CALLF(2), MOV(0, 0), EXIT(), LDX_W(0, 1, 0), EXIT());
+    LOAD("a function called twice", CALLF(3), CALLF(2), MOV(0, 0), EXIT(), MOV(0, 1), EXIT());
+    LOAD("two functions", CALLF(3), CALLF(4), MOV(0, 0), EXIT(), MOV(0, 1), EXIT(), MOV(0, 2),
+         EXIT());
+    LOAD("a function the walk never enters", MOV(0, 0), JEQ(0, 0, 1), CALLF(2), MOV(0, 0), EXIT(),
+         ST_B(10, -512, 0), MOV(0, 0), EXIT());
+    chain("8 frames", 8, 8);
+    chain("8 frames of 64 bytes", 8, 64);
+    chain("4 frames of 100 bytes", 4, 100);
+
+    /* Programs it refuses. */
+    LOAD("call past the end", CALLF(1), EXIT());
+    LOAD("call before the start", CALLF(-2), EXIT());
+    LOAD("jump into the function", CALLF(2), MOV(0, 0), I(0x05, 0, 0, 1, 0), EXIT(), EXIT());
+    LOAD("fall into the function", CALLF(2), MOV(0, 0), MOV(1, 0), EXIT());
+    LOAD("the function falls off the end", CALLF(1), EXIT(), MOV(0, 0));
+    LOAD("BPF_LD_ABS in a function", CALLF(1), EXIT(), MOV_REG(6, 1), I(0x30, 0, 0, 0, 0), EXIT());
+    LOAD("bpf_tail_call in a function", CALLF(1), EXIT(), CALL(12), EXIT());
+    LOAD("R0 after a call to an exit", CALLF(1), EXIT(), EXIT());
+    LOAD("R1 after the call", MOV(1, 1), CALLF(2), MOV_REG(0, 1), EXIT(), MOV(0, 0), EXIT());
+    LOAD("R5 after the call", MOV(5, 1), CALLF(2), MOV_REG(0, 5), EXIT(), MOV(0, 0), EXIT());
+    LOAD("R0 in the callee", MOV(0, 1), CALLF(1), EXIT(), ADD(0, 1), EXIT());
+    LOAD("R6 in the callee", MOV(6, 1), CALLF(1), EXIT(), MOV_REG(0, 6), EXIT());
+    LOAD("an argument not written", MOV(1, 1), CALLF(1), EXIT(), MOV_REG(0, 2), EXIT());
+    LOAD("the callee's frame pointer back", CALLF(2), MOV(0, 0), EXIT(), MOV_REG(0, 10), EXIT());
+    LOAD("the caller's stack pointer back", MOV_REG(1, 10), CALLF(2), MOV(0, 0), EXIT(),
+         MOV_REG(0, 1), EXIT());
+    LOAD("the callee's frame pointer into the caller's stack", MOV_REG(1, 10), ADD(1, -8), CALLF(2),
+         MOV(0, 0), EXIT(), STX_DW(1, 10, 0), MOV(0, 0), EXIT());
+    chain("9 frames", 9, 8);
+    chain("5 frames of 100 bytes", 5, 100);
+    LOAD("512 bytes and 1", ST_B(10, -504, 0), CALLF(2), MOV(0, 0), EXIT(), ST_B(10, -1, 0),
+         MOV(0, 0), EXIT());
+    LOAD("a function that calls itself", CALLF(1), EXIT(), CALLF(-1), EXIT());
+    LOAD("two functions that call each other", CALLF(1), EXIT(), CALLF(1), EXIT(), CALLF(-3),
+         EXIT());
+    LOAD("a function that calls the main program", CALLF(1), EXIT(), MOV(0, 0), CALLF(-4),
+         EXIT());
+
+    /* Each function's stack depth. */
+    DEPTHS("depths of one", ST_B(10, -3, 0), MOV(0, 0), EXIT());
+    DEPTHS("depths of two", ST_DW(10, -8, 0), MOV_REG(1, 10), CALLF(2), MOV(0, 0), EXIT(),
+           ST_B(1, -40, 0), ST_B(10, -3, 0), MOV(0, 0), EXIT());
+    DEPTHS("depths of three", CALLF(3), CALLF(5), MOV(0, 0), EXIT(), ST_B(10, -100, 0), MOV(0, 0),
+           EXIT(), MOV(0, 0), EXIT());
+
+    /* A filter whose functions write the map's value. */
+    int value = map(2, 4, 8 * SLOTS, 1, 0);
+    say("map %d", value > 0);
+    int filter = PROGRAM(
+        LD_VALUE(6, value, 0),
+        /* f(value, 5) writes 15 at value[0] and returns 6. */
+        MOV_REG(1, 6), MOV(2, 5), CALLF(17), STX_DW(6, 0, 8),
+        /* g(fp - 8) adds 1 to the caller's slot, and its own slot is its own. */
+        ST_DW(10, -8, 41), ST_DW(10, -16, 1000), MOV_REG(1, 10), ADD(1, -8), CALLF(17),
+        LDX_DW(1, 10, -8), STX_DW(6, 1, 16), LDX_DW(1, 10, -16), STX_DW(6, 1, 24), STX_DW(6, 0, 32),
+        /* h(value) calls f(value + 40, 7) and keeps R6. */
+        MOV(7, 77), MOV_REG(1, 6), CALLF(16), STX_DW(6, 7, 56),
+        MOV(0, 64), EXIT(),
+        /* f: *(R1) = R2 * 3; R0 = R2 + 1. */
+        MOV_REG(3, 2), I(0x27, 3, 0, 0, 3), STX_DW(1, 3, 0), MOV_REG(0, 2), ADD(0, 1), EXIT(),
+        /* g: *(R1) += 1; its own fp - 8 and fp - 16; R0 = its fp - 16. */
+        ST_DW(10, -8, 5), ST_DW(10, -16, 9), LDX_DW(2, 1, 0), ADD(2, 1), STX_DW(1, 2, 0),
+        LDX_DW(0, 10, -16), EXIT(),
+        /* h: R6 = R1 + 40, f(R6, 7), then value[6] = R0, R7 its own. */
+        MOV_REG(6, 1), ADD(1, 40), MOV(2, 7), MOV(7, 1), CALLF(-18), STX_DW(6, 0, 48), MOV(0, 0),
+        EXIT());
+    say("filter loaded %d", filter >= 0);
+    if (filter < 0) {
+        LOAD_MAPS("why", LD_VALUE(6, value, 0), MOV(0, 0), EXIT());
+        return 1;
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    say("attach %d", attach(pair[1], filter));
+    through("calls", pair[0], pair[1], 64);
+    slots("after", value);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -2200,5 +2337,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-atomic")) return case_atomic();
     if (!strcmp(mode, "bpf-prog-acqrel")) return case_acqrel();
     if (!strcmp(mode, "bpf-prog-ldabs")) return case_ldabs();
+    if (!strcmp(mode, "bpf-prog-calls")) return case_calls();
     return 2;
 }

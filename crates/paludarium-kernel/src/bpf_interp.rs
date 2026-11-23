@@ -22,6 +22,9 @@
 //! - a signed division by -1 negates, and a signed remainder by -1 is 0,
 //!   for a register and an immediate alike;
 //! - a shift by a register takes its count modulo the width;
+//! - a bpf-to-bpf call gives the callee a frame of its own, 512 bytes after
+//!   its caller's in the stack's region, and R6 to R9 and the frame pointer
+//!   back after it;
 //! - a `BPF_LD_ABS` or `BPF_LD_IND` loads the packet's bytes big-endian
 //!   through `bpf_skb_load_helper_8`, `_16` or `_32` (`bpf_gen_ld_abs`),
 //!   and where they are not there the program returns 0.
@@ -51,6 +54,11 @@ const CONTEXT_WITH_TAIL: usize = CONTEXT_SIZE + 24;
 const CB: std::ops::Range<usize> = 48..68;
 /// `MAX_BPF_STACK`.
 const STACK_SIZE: usize = 512;
+/// `MAX_CALL_FRAMES`: the main program's frame and its callees'.
+const FRAMES: usize = 8;
+/// `BPF_COMPLEXITY_LIMIT_INSNS`. The verifier walks every path a program
+/// may take and takes no back-edge, so no run goes further.
+const STEPS: usize = 1_000_000;
 
 /// The top byte of every address, as a kernel pointer has it set.
 const SPACE: u64 = 0xff00_0000_0000_0000;
@@ -67,6 +75,14 @@ const REGIONS: u64 = 1 << 24;
 /// The packet's linear part (`skb->data`), the last region, which only
 /// converted classic programs read.
 const PACKET: u64 = REGIONS - 1;
+/// The stacks of the callees' frames, frame `f` in region `CALLEES + f`
+/// (the main program's is [`STACK`]), below the packet's.
+const CALLEES: u64 = PACKET - FRAMES as u64;
+
+/// The region of frame `f`'s stack.
+fn frame_region(f: usize) -> u64 {
+    if f == 0 { STACK } else { CALLEES + f as u64 }
+}
 
 const fn address(region: u64, offset: u64) -> u64 {
     SPACE | region << 32 | offset
@@ -199,7 +215,10 @@ struct Machine<'a, 'k> {
     packet: &'a Packet<'a>,
     kernel: &'k mut dyn Kernel,
     regs: [u64; 11],
-    stack: [u8; STACK_SIZE],
+    stack: [[u8; STACK_SIZE]; FRAMES],
+    /// The frames of the functions that called the running one: where
+    /// each goes on, and its R6 to R9 and frame pointer.
+    callers: Vec<(usize, [u64; 5])>,
     context: [u8; CONTEXT_WITH_TAIL],
     values: Vec<ValueRef>,
 }
@@ -225,7 +244,8 @@ pub(crate) fn run(
         packet,
         kernel,
         regs: [0; 11],
-        stack: [0; STACK_SIZE],
+        stack: [[0; STACK_SIZE]; FRAMES],
+        callers: Vec::new(),
         context,
         values: Vec::new(),
     };
@@ -266,9 +286,7 @@ impl Machine<'_, '_> {
     fn run(&mut self) -> Result<u64, Fault> {
         let insns = self.program.insns;
         let mut pc = 0usize;
-        // The verifier takes no back-edge, so a program ends within as many
-        // steps as it has instructions.
-        for _ in 0..=insns.len() {
+        for _ in 0..=STEPS {
             let insn = *insns.get(pc).ok_or(Fault)?;
             let next = pc + 1;
             let dst = usize::from(insn.dst);
@@ -293,11 +311,31 @@ impl Machine<'_, '_> {
                             };
                             pc = target(next, by)?;
                         }
+                        // A bpf-to-bpf call: the callee's frame pointer is
+                        // its own, and R6 to R9 come back as they were.
+                        0x80 if insn.src == 1 => {
+                            let depth = self.callers.len() + 1;
+                            if depth >= FRAMES {
+                                return Err(Fault);
+                            }
+                            let mut saved = [0; 5];
+                            saved.copy_from_slice(&self.regs[6..=10]);
+                            self.callers.push((next, saved));
+                            self.stack[depth] = [0; STACK_SIZE];
+                            self.regs[10] = address(frame_region(depth), STACK_SIZE as u64);
+                            pc = target(next, i64::from(insn.imm))?;
+                        }
                         0x80 => {
                             self.regs[0] = self.call(insn.imm)?;
                             pc = next;
                         }
-                        0x90 => return Ok(self.regs[0]),
+                        0x90 => match self.callers.pop() {
+                            Some((ret, saved)) => {
+                                self.regs[6..=10].copy_from_slice(&saved);
+                                pc = ret;
+                            }
+                            None => return Ok(self.regs[0]),
+                        },
                         _ => {
                             let a = self.regs[dst];
                             let b = if insn.code & X != 0 {
@@ -503,7 +541,7 @@ impl Machine<'_, '_> {
             }
         };
         let region = VALUES + i as u64;
-        if region >= PACKET {
+        if region >= CALLEES {
             return Err(Fault);
         }
         Ok(address(region, offset))
@@ -520,14 +558,28 @@ impl Machine<'_, '_> {
         Ok((region, offset))
     }
 
+    /// The stack of the frame whose region is `region`.
+    fn frame(&mut self, region: u64) -> Option<&mut [u8; STACK_SIZE]> {
+        match region {
+            STACK => Some(&mut self.stack[0]),
+            r if r > CALLEES && r < PACKET => Some(&mut self.stack[(r - CALLEES) as usize]),
+            _ => None,
+        }
+    }
+
     fn read(&self, at: u64, out: &mut [u8]) -> Result<(), Fault> {
         let (region, offset) = self.place(at, out.len())?;
         let end = offset + out.len();
         match region {
-            STACK => out.copy_from_slice(self.stack.get(offset..end).ok_or(Fault)?),
+            STACK => out.copy_from_slice(self.stack[0].get(offset..end).ok_or(Fault)?),
+            r if r > CALLEES && r < PACKET => out.copy_from_slice(
+                self.stack[(r - CALLEES) as usize]
+                    .get(offset..end)
+                    .ok_or(Fault)?,
+            ),
             CONTEXT => out.copy_from_slice(self.context.get(offset..end).ok_or(Fault)?),
             PACKET => out.copy_from_slice(self.packet.head().get(offset..end).ok_or(Fault)?),
-            r if r >= VALUES => {
+            r if (VALUES..CALLEES).contains(&r) => {
                 let value = self.values.get((r - VALUES) as usize).ok_or(Fault)?;
                 value.read(offset, out).map_err(|_| Fault)?;
             }
@@ -540,17 +592,19 @@ impl Machine<'_, '_> {
     fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), Fault> {
         let (region, offset) = self.place(at, bytes.len())?;
         let end = offset + bytes.len();
-        match region {
-            STACK => self
-                .stack
+        if let Some(frame) = self.frame(region) {
+            frame
                 .get_mut(offset..end)
                 .ok_or(Fault)?
-                .copy_from_slice(bytes),
+                .copy_from_slice(bytes);
+            return Ok(());
+        }
+        match region {
             // Only `cb[]` is written.
             CONTEXT if offset >= CB.start && end <= CB.end => {
                 self.context[offset..end].copy_from_slice(bytes)
             }
-            r if (VALUES..PACKET).contains(&r) => {
+            r if (VALUES..CALLEES).contains(&r) => {
                 let value = self.values.get((r - VALUES) as usize).ok_or(Fault)?;
                 value.write(offset, bytes).map_err(|_| Fault)?;
             }
@@ -619,8 +673,8 @@ impl Machine<'_, '_> {
             )
         };
         let (region, offset) = self.place(at, size)?;
-        let old = if region == STACK {
-            let place = self.stack.get_mut(offset..offset + size).ok_or(Fault)?;
+        let old = if let Some(frame) = self.frame(region) {
+            let place = frame.get_mut(offset..offset + size).ok_or(Fault)?;
             let mut bytes = [0; 8];
             bytes[..size].copy_from_slice(place);
             let old = u64::from_le_bytes(bytes);
@@ -1253,6 +1307,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn calls_have_frames_of_their_own() {
+        let call = |by: i32| i(0x85, 0, 1, 0, by);
+        // R1 in, R0 out, R6 kept across the call.
+        let p = [
+            i(0xb7, 6, 0, 0, 10),
+            i(0xb7, 1, 0, 0, 3),
+            call(2),
+            i(0x0f, 0, 6, 0, 0),
+            exit(),
+            i(0xbf, 0, 1, 0, 0),
+            i(0x27, 0, 0, 0, 2),
+            i(0xb7, 6, 0, 0, 99),
+            exit(),
+        ];
+        assert_eq!(run_on(&p, &[]).unwrap(), 16);
+        // A pointer to the caller's stack, and the callee's own.
+        let p = [
+            i(0x7a, 10, 0, -8, 5),
+            i(0xbf, 1, 10, 0, 0),
+            i(0x07, 1, 0, 0, -8),
+            call(2),
+            i(0x79, 0, 10, -8, 0),
+            exit(),
+            i(0x7a, 10, 0, -8, 100),
+            i(0x79, 2, 1, 0, 0),
+            i(0x07, 2, 0, 0, 1),
+            i(0x7b, 1, 2, 0, 0),
+            i(0x79, 0, 10, -8, 0),
+            exit(),
+        ];
+        assert_eq!(run_on(&p, &[]).unwrap(), 6);
+        // Seven calls deep, each frame's slot its own: the main program's
+        // R0 is 1 + 2 + ... + 8.
+        let mut p = Vec::new();
+        for f in 0..8 {
+            p.push(i(0x7a, 10, 0, -8, f + 1));
+            if f < 7 {
+                p.push(call(3));
+            } else {
+                p.push(i(0xb7, 0, 0, 0, 0));
+            }
+            p.push(i(0x79, 1, 10, -8, 0));
+            p.push(i(0x0f, 0, 1, 0, 0));
+            p.push(exit());
+        }
+        assert_eq!(run_on(&p, &[]).unwrap(), 36);
+    }
+
+    #[test]
     fn the_helpers_of_no_arguments_and_of_the_socket() {
         let call = |id: i32, r1: Option<i32>| {
             let mut p = Vec::new();
@@ -1312,9 +1415,10 @@ pub(crate) mod tests {
 
     /// The soundness the verifier gives the interpreter: random programs
     /// near what it takes, of registers, the stack, the context, jumps,
-    /// atomics, load-acquires, store-releases, packet loads and the
-    /// helpers without maps, and every one it takes runs on packets of a
-    /// few lengths without a load or store outside what it points to.
+    /// atomics, load-acquires, store-releases, packet loads, the helpers
+    /// without maps and calls of a function, and every one it takes runs on
+    /// packets of a few lengths without a load or store outside what it
+    /// points to.
     #[test]
     fn programs_the_verifier_takes_never_fault() {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -1325,9 +1429,12 @@ pub(crate) mod tests {
             (seed % u64::from(n)) as u32
         };
         const EDGES: [i32; 12] = [0, 1, -1, 7, 8, 16, 31, 32, 63, 64, i32::MIN, i32::MAX];
-        let (mut taken, mut atomics, mut ordered, mut packet_loads) = (0, 0, 0, 0);
+        let (mut taken, mut atomics, mut ordered, mut packet_loads, mut calls) = (0, 0, 0, 0, 0);
         for _ in 0..120_000 {
             let mut p = vec![i(0xbf, 6, 1, 0, 0)];
+            // The calls of the function after the main program, whose
+            // offsets are known once it is.
+            let mut sites = Vec::new();
             for _ in 0..1 + next(12) {
                 let dst = next(10) as u8;
                 let src = next(11) as u8;
@@ -1339,7 +1446,7 @@ pub(crate) mod tests {
                 let size = [0x18, 0x00, 0x08, 0x10][next(4) as usize];
                 let at = -8 * (1 + next(64) as i16) + next(8) as i16;
                 let alu = (next(14) as u8) << 4;
-                let insn = match next(15) {
+                let insn = match next(16) {
                     0 => i(0xb7, dst, 0, 0, imm),
                     1 => i(0x07 | alu, dst, 0, next(2) as i16, imm),
                     2 => i(0x04 | alu, dst, 0, 0, imm),
@@ -1402,12 +1509,44 @@ pub(crate) mod tests {
                             [0, 1, 6, 63, 64, -1, -0x10_0000, -0x20_0000, imm][next(9) as usize];
                         i(mode | size, 0, src, 0, imm)
                     }
+                    // A call of the function, sometimes with a pointer to
+                    // the caller's stack in R1.
+                    14 => {
+                        if next(2) == 0 {
+                            p.push(i(0xbf, 1, 10, 0, 0));
+                            p.push(i(0x07, 1, 0, 0, -8 * (1 + next(64) as i32)));
+                        }
+                        sites.push(p.len());
+                        i(0x85, 0, 1, 0, 0)
+                    }
                     _ => i(0x85, 0, 0, 0, [5, 7, 8, 14, 15, 46, 47][next(7) as usize]),
                 };
                 p.push(insn);
             }
             p.push(i(0xb7, 0, 0, 0, 1));
             p.push(exit());
+            if !sites.is_empty() {
+                let start = p.len();
+                for &site in &sites {
+                    p[site].imm = (start - site - 1) as i32;
+                }
+                // The function: its own stack, its caller's through R1, a
+                // helper, and R0.
+                let at = -8 * (1 + next(64) as i16) + next(8) as i16;
+                let size = [0x18, 0x00, 0x08, 0x10][next(4) as usize];
+                for _ in 0..1 + next(4) {
+                    p.push(match next(6) {
+                        0 => i(0x62 | size, 10, 0, at, 7),
+                        1 => i(0x61 | size, 0, 10, at, 0),
+                        2 => i(0x61 | size, 0, 1, [0, -4, 8][next(3) as usize], 0),
+                        3 => i(0x63 | size, 1, 1, 0, 0),
+                        4 => i(0x85, 0, 0, 0, 7),
+                        _ => i(0xbf, 6, 1, 0, 0),
+                    });
+                }
+                p.push(i(0xb7, 0, 0, 0, next(3) as i32));
+                p.push(exit());
+            }
             let Ok(verified) = crate::bpf_verifier::check(
                 &p,
                 crate::bpf_verifier::Options::default(),
@@ -1427,6 +1566,9 @@ pub(crate) mod tests {
             if p.iter().any(|insn| matches!(insn.code & 0xe7, 0x20 | 0x40)) {
                 packet_loads += 1;
             }
+            if !sites.is_empty() {
+                calls += 1;
+            }
             for len in [0, 1, 7, 64] {
                 let data = vec![0x5a; len];
                 let program = Program {
@@ -1444,13 +1586,14 @@ pub(crate) mod tests {
                 );
             }
         }
-        // Enough of them load for the check to mean something: 6,672 with
-        // this seed and this verifier, 558 of them with an atomic, 375 with
-        // a load-acquire or store-release and 1,102 with a BPF_LD_ABS or
-        // BPF_LD_IND. A change to either that loads fewer than 6,000,
-        // fewer than 150 with an atomic, fewer than 300 with a load-acquire
-        // or store-release or fewer than 800 with a packet load, should
-        // look again at what the programs cover.
+        // Enough of them load for the check to mean something: 6,362 with
+        // this seed and this verifier, 536 of them with an atomic, 378 with
+        // a load-acquire or store-release, 951 with a BPF_LD_ABS or
+        // BPF_LD_IND and 479 with a call. A change to either that loads
+        // fewer than 6,000, fewer than 150 with an atomic, fewer than 300
+        // with a load-acquire or store-release, fewer than 800 with a
+        // packet load or fewer than 300 with a call, should look again at
+        // what the programs cover.
         assert!(taken >= 6_000, "only {taken} programs loaded");
         assert!(
             atomics >= 150,
@@ -1464,5 +1607,6 @@ pub(crate) mod tests {
             packet_loads >= 800,
             "only {packet_loads} programs with a BPF_LD_ABS or BPF_LD_IND loaded"
         );
+        assert!(calls >= 300, "only {calls} programs with a call loaded");
     }
 }

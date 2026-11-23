@@ -22,6 +22,7 @@ pub use inbox::SignalInbox;
 mod aio;
 mod bpf;
 mod bpf_classic;
+mod bpf_fs;
 mod bpf_interp;
 mod bpf_prog;
 #[cfg(test)]
@@ -82,6 +83,8 @@ mod seccomp_tests;
 mod sem;
 mod seq;
 mod shm;
+#[cfg(test)]
+mod sock_diag_tests;
 mod sockets;
 mod syscalls;
 mod sysctl;

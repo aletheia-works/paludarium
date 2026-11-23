@@ -247,7 +247,15 @@ fn ends_block(insn: &Instruction) -> bool {
     use paludarium_decoder::Mnemonic as M;
     matches!(
         insn.mnemonic,
-        M::Jmp | M::Call | M::Ret | M::Syscall | M::Hlt | M::Ud2
+        M::Jmp
+            | M::JmpFar
+            | M::Call
+            | M::CallFar
+            | M::Ret
+            | M::RetFar
+            | M::Syscall
+            | M::Hlt
+            | M::Ud2
     )
 }
 
@@ -2143,5 +2151,55 @@ mod tests {
             run(&mut s, &mem, 10),
             ExitReason::InvalidOpcode { .. }
         ));
+    }
+
+    #[test]
+    fn far_transfers_load_cs_and_refuse_other_segments() {
+        // lcall *(%rax); hlt; then at +0x10 hlt.
+        let mut code = vec![0xff, 0x18, 0xf4];
+        code.resize(0x10, 0x90);
+        code.push(0xf4);
+        let pointer = STACK_TOP - 0x100;
+        let (mut s, mem) = machine(&code);
+        mem.write_u64(GuestAddr(pointer), (0x31 << 32) | (CODE + 0x10))
+            .unwrap();
+        s.gpr[reg::RAX] = pointer;
+        s.gpr[reg::RSP] = STACK_TOP - 0x200;
+        assert_eq!(
+            run(&mut s, &mem, 10),
+            ExitReason::Halt {
+                rip: GuestAddr(CODE + 0x10)
+            }
+        );
+        // CS and a 32-bit return address, CS with the CPL as its RPL.
+        assert_eq!(s.gpr[reg::RSP], STACK_TOP - 0x208);
+        assert_eq!(
+            mem.read_u64(GuestAddr(STACK_TOP - 0x208)).unwrap(),
+            0x33 << 32 | (CODE + 2)
+        );
+        assert_eq!(s.segments[segments::CS], 0x33);
+        // ljmp *(%rax) to __USER32_CS: compatibility mode is not run.
+        let (mut s, mem) = machine(&[0xff, 0x28, 0xf4]);
+        mem.write_u64(GuestAddr(pointer), (0x23 << 32) | CODE)
+            .unwrap();
+        s.gpr[reg::RAX] = pointer;
+        assert!(matches!(
+            run(&mut s, &mem, 10),
+            ExitReason::InvalidOpcode { .. }
+        ));
+        // lretq to __USER_DS: #GP(0x28), the stack as it was.
+        let (mut s, mem) = machine(&[0x48, 0xcb, 0xf4]);
+        s.gpr[reg::RSP] = STACK_TOP - 0x20;
+        mem.write_u64(GuestAddr(STACK_TOP - 0x20), CODE).unwrap();
+        mem.write_u64(GuestAddr(STACK_TOP - 0x18), 0x2b).unwrap();
+        assert_eq!(
+            run(&mut s, &mem, 10),
+            ExitReason::SegmentFault {
+                rip: GuestAddr(CODE),
+                trap: 13,
+                error: 0x28
+            }
+        );
+        assert_eq!(s.gpr[reg::RSP], STACK_TOP - 0x20);
     }
 }

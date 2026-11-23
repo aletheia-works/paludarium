@@ -16,7 +16,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   システムディスクリプタ、空のスレッドローカルのエントリは読み込めません）か、`modify_ldt`
   が書くテーブルから引きます。CPU が拒む読み込みは、Linux と同じく、#GP なら `SIGSEGV`、
   #NP（`%ss` なら #SS）なら `SIGBUS` で、`SI_KERNEL`、`trapno` にベクタ、`err` に RPL を
-  除いたセレクタが入ります。`%cs` への `mov` は `SIGILL` です。null でないセレクタは
+  除いたセレクタが入ります。`%cs` への `mov` は `SIGILL` です。`m16:16`、`m16:32`、
+  `m16:64` のポインタを通す far の `jmp` と `call`、far の `ret` は、コードセグメントの同じ
+  検査をして `%cs` を読み込みます。`__USER_CS` へは、ジャンプとコールならセレクタの RPL に
+  よらず（リターンは RPL 3 が要ります）移り、コールは `%cs` と戻り先をオフセットの大きさの
+  スロットに積みます。null のセレクタ、データ、システムディスクリプタ、カーネルのコード、
+  カノニカルでないオフセットへのリターンは #GP の `SIGSEGV`、存在しないコードセグメントは
+  #NP の `SIGBUS` で、何も動きません。null でないセレクタは
   `%fs` や `%gs` にディスクリプタの 32 ビットのベースを与え、null のセレクタはベースを
   消します。Intel の CPU と Zen 2 以降の AMD の CPU と同じです。64 ビットモードでは、ほかの
   セグメントにベースはありません。`arch_prctl` の `ARCH_SET_FS` と `ARCH_SET_GS`、
@@ -1677,7 +1683,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   の中で終わらない文字列は `EINVAL`）、リンクをたどってターゲットを探し（`ENOENT`、
   `ENOTDIR`、`ELOOP`、`EACCES`）、`MS_NOUSER` は `EINVAL`、ファイルへのアクセスを扱う
   Landlock のドメインは `EPERM` で、マウント名前空間に対する `CAP_SYS_ADMIN` が要ります
-  （`EPERM`）。新しいマウントには、型（`EINVAL`）が `tmpfs` であること（ほかは `ENODEV`）、
+  （`EPERM`）。新しいマウントには、型（`EINVAL`）が `tmpfs` か `bpf`（BPF ファイルシステム、
+  後述）であること（ほかは `ENODEV`）、
   tmpfs が受け取るオプション（ほかのもの、種類の違う値は `EINVAL`。`size`、`nr_blocks`、
   `nr_inodes`、`mode`、`uid`、`gid`、`huge`、`mpol`、`inode32`、`inode64`、`noswap`、
   クォータのもの、共通の `sync`、`dirsync`、`lazytime`、`mand` とその反対）、呼び出し元の
@@ -1900,10 +1907,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プライベート、ソースは共有かスレーブであることが要ります（`EINVAL`）。
 
 - `fsopen`、`fsconfig`、`fsmount`、`fspick`（Linux master の `fs/fsopen.c`）は、
-  ファイルシステムのコンテキストを通して tmpfs を作ります。コンテキストは
+  ファイルシステムのコンテキストを通して tmpfs か BPF ファイルシステムを作ります。コンテキストは
   ディスクリプタ（`anon_inode:[fscontext]`）で、`fsconfig` が中身を入れて操作します。
   `fsopen` はマウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）と知っているフラグ
-  （`EINVAL`）を求め、tmpfs 以外の型は `ENODEV` です。`fsconfig` はコマンドごとの
+  （`EINVAL`）を求め、それら以外の型は `ENODEV` です。`fsconfig` はコマンドごとの
   引数（`EINVAL`。知らないコマンドは `EOPNOTSUPP`）、次にディスクリプタ（`EBADF`。
   ほかのファイルなら `EINVAL`）を確かめます。`mount` が受け取るパラメーターを 1 つずつ
   同じ確認で受け取り、断ったものごとに Linux が記録するメッセージを、ディスクリプタの
@@ -3121,7 +3128,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
   `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` 以外の同じファイルが
   あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
-  プロセスの ID）を示します。`/proc/thread-self` は読んでいるスレッドのディレクトリへの
+  プロセスの ID、スレッド自身の `voluntary_ctxt_switches`。眠った回数で、プロセスの
+  `status` は Linux の `task_context_switch_counts` と同じくリーダーのものを示します）を
+  示します。ほかのスレッドより先に終わったリーダーは、Linux が遅れたグループリーダーを残す
+  のと同じく、プロセスが終わるまでゾンビとして `task` の先頭に残り、`stat` と `status` では
+  `Z` で、`Threads` と `num_threads` にも数えます。`/proc/thread-self` は読んでいるスレッドのディレクトリへの
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
@@ -3220,8 +3231,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マイナーフォールト、常駐ページ、開始時刻、タスクが最後のシステムコールのときにいた CPU
   （Linux の `task_cpu` が最後に動いた CPU であるのと同じです。`getcpu` はすぐにマスクを
   見直すので、`sched_setaffinity` の後の `stat` はタスクの次のシステムコールから
-  それに従います）、リアルタイム優先度とポリシーです。`task` の下のパスはそのスレッド自身のもの、
-  プロセスのものはリーダーのものです。何も測っていないもの（メジャーフォールトと、
+  それに従います）、リアルタイム優先度とポリシーです。`task` の下のパスはそのスレッド自身のもの
+  （CPU 時間とマイナーフォールトも）で、プロセスの CPU 時間とフォールトはすべてのスレッドの
+  もの、ほかはリーダーのものです。何も測っていないもの（メジャーフォールトと、
   CPU 時間をすべてユーザーのものとして数えるのでシステム時間）は 0 です。Linux の `ptrace_may_access` がファイルシステムの ID で決めるとおり、
   タスクのメモリを見てはいけない読み手には、Linux の `do_task_stat` と同じく、
   `start_code` と `end_code` を 1、スタックの始まり、`wchan`、`start_data` から後の
@@ -3229,7 +3241,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ステータス（終了コードの 256 倍か、シグナル。コアダンプしたものは 0x80 を足します）で、
   止まったプロセスでは、wait がその停止を報告するまで、プロセス自身の `stat` に止めた
   シグナルが出ます（Linux の `group_exit_code`）。`task` の下のスレッドの `stat` には
-  停止のものは出ません。リーダーがほかのスレッドより先に `exit` で
+  停止のものは出ません。ptrace で止まっているタスクは、Linux の `ptrace_stop` と同じく、
+  トレーサーの wait が報告するまで（`WNOWAIT` の wait は報告しません）その停止の
+  `exit_code`（シグナル。`PTRACE_O_TRACESYSGOOD` のシステムコールの停止では
+  `SIGTRAP | 0x80`）を示し、リーダーならプロセスの `stat` にも示します。リーダーがほかのスレッドより先に `exit` で
   終わったプロセスは、それらが動いている間、Linux のリーダーの `exit_code` と同じく
   リーダー自身の終了コードを `stat` に示し、それらが終わると、Linux の
   `synchronize_group_exit` と同じく
@@ -3820,7 +3835,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   写さず 0 を返します。バッファの大きさは 256 KiB（`CONFIG_LOG_BUF_SHIFT` が 18）で、
   未読のものはありません。
 
-- `sysfs` はファイルシステムの種類に番号を付けます。種類は `tmpfs`、`proc`、`sockfs`、
+- `sysfs` はファイルシステムの種類に番号を付けます。種類は `tmpfs`、`proc`、`sockfs`、`bpf`、
   `pipefs`、`devpts`、`ext4`、`mqueue` で、paludarium が渡すファイルの種類（ホストの
   ファイルは `ext4`）を、Linux が登録する順に並べています。オプション 1 は名前の番号を、
   2 は番号の名前を、3 は種類の数を返します。知らないオプション、名前、番号は `EINVAL`
@@ -4132,6 +4147,33 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `map_flags`（fdinfo、`bpf_map_info`、手本）には入りません。ないものは
   [制限](./limitations) を参照してください。
 
+- `BPF_OBJ_PIN` は BPF ファイルシステムのファイルにマップを残し、`BPF_OBJ_GET` はそのマップの
+  ディスクリプタを再び返します。Linux の `bpf_obj_pin_user` と `bpf_obj_get_user` と同じです。
+  BPF ファイルシステムは `mount` か `fsopen` で作る型 `bpf` のマウントです。`FS_USERNS_MOUNT`
+  ですが、最初のユーザー名前空間の外からは `bpf_fill_super` がそこでの `CAP_SYS_ADMIN` を
+  求めます（`EPERM`）。`uid`、`gid`、`mode` がルートを決め、既定は 0777 とスティッキービット
+  です。共通のスーパーブロックのフラグが効き、ほかのオプションは Linux と同じく無視します。
+  `delegate_cmds`、`delegate_maps`、`delegate_progs`、`delegate_attachs` は、Linux master の
+  UAPI の列挙の名前（大文字小文字を問わず、`BPF_`、`BPF_MAP_TYPE_`、`BPF_PROG_TYPE_` の
+  接頭辞を除いたもの）、数（`EINVAL`、`ERANGE`）、`any` を `:` でつないで受け取り、
+  `CAP_SYS_ADMIN` を求めます（`EPERM`）。mountinfo は `bpf_show_options` と同じく、名前、
+  `any`、16 進数で見せます。`statfs` は `BPF_FS_MAGIC` で、大きさも inode もなく、
+  マウントし直しはスーパーブロックのフラグだけを変えます。どちらのコマンドも自分のフラグ
+  （`BPF_F_PATH_FD`、取得では `BPF_F_RDONLY` か `BPF_F_WRONLY` のどちらか一方）だけを受け取り、
+  `path_fd` は `BPF_F_PATH_FD` があるときだけです（`EINVAL`）。ピンは、どのアクセスのものでも
+  マップのディスクリプタ（ほかは `EINVAL`）を取り、次に新しい名前（`EEXIST`、後ろに
+  スラッシュがあれば `ENOENT`）を、書き込めるマウント（`EROFS`）の BPF ファイルシステムの
+  ディレクトリ（ほかは `EPERM`）で、スレッドが書き込めるもの（`EACCES`）に作ります。
+  作るのは、umask を除いたモード 0600 の、スレッドのものの通常のファイルで、マップの
+  ディスクリプタがなくなっても、名前がある間はマップを持ちます。取得はパスのリンクをたどり、
+  ファイルに求めるアクセス（`EACCES`）と、ファイルがマップを持つこと（ほかのファイルは
+  `EACCES`）を求めます。新しいディスクリプタはそのアクセスを持ちます。ファイルを開くと
+  `EIO` で、これは見せる BTF のないマップに Linux の `bpffs_obj_fops` が返すものです。
+  ディレクトリは `bpf_dir_iops` と同じくディレクトリ、シンボリックリンク、ハードリンク、
+  名前の変更を作り、ほかのファイルは作りません。新しい通常のファイルは `EACCES`、ノード
+  （FIFO、ソケットの `bind`）は `EPERM`、`O_TMPFILE` は `EOPNOTSUPP` です。ない名前で
+  ドットを含むものは、それを作る呼び出しで `EPERM` です（`bpf_lookup`）。
+
 - `BPF_PROG_LOAD` はソケットフィルター（`BPF_PROG_TYPE_SOCKET_FILTER`）を読み込み、
   Linux と同じく検証器で確かめます。アタッチした AF_UNIX のソケットで、インタープリタが
   動かします（下を参照）。引数は Linux の
@@ -4242,6 +4284,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   受け取ったままであることを確かめます（"dereference of modified ctx ptr R6 off=%d
   disallowed"、`EACCES`）。読んだ後の R1 から R5 は読めず、R0 は数です。
 
+- `BPF_PSEUDO_CALL` の `BPF_CALL` は、呼び出しの `imm` 命令後にあるプログラムの関数を
+  呼びます。BTF がなければ関数はどれも静的で、Linux が静的な関数の呼び出しを確かめるのと
+  同じに確かめます。呼び出し先はそれぞれ関数の始まりです（プログラムの外は "call to
+  invalid destination"、`EINVAL`。256 を超えると "too many subprograms"、`E2BIG`）。関数の
+  ジャンプはその関数の中にとどまり（"jump out of range from insn %d to %d"）、最後の命令は
+  exit かジャンプです（"last insn is not an exit or jmp"）。メインプログラム以外の関数に
+  `BPF_LD_ABS`、`BPF_LD_IND`、`bpf_tail_call` は置けません（7.0 と同じく "LD_ABS is not
+  allowed in subprogs without BTF"、"tail_call is not allowed in subprogs without BTF"。master
+  は受け入れます）。どれも、どの経路をたどるより前に `EINVAL` で断ります。呼ばれた関数は、
+  呼び出し元の R1 から R5 と、自分のフレームポインタと 512 バイトのスタックで始まります。
+  その R0 と R6 から R9 は書くまで読めず、呼び出し元の R0 から R5 は呼び出しの後は読めません。
+  呼び出し元の R0 には呼ばれた関数の R0 が入ります。呼ばれた関数は、スタックへのポインタを
+  返すことも（"cannot return stack pointer to the caller"）、呼び出し元のフレームに置くことも
+  できません（"cannot spill pointers to stack into stack frame of the caller"、どちらも
+  `EINVAL`）。呼び出し元のスタックは、そこへのポインタを通して読み書きできます。呼び出しの
+  深さは 8 フレームまでです（"the call stack of %d frames is too deep"、`E2BIG`）。再帰呼び出しも、
+  テストのマシンの 7.0 と同じくこれで断ります（master は経路をたどる前に "recursive call from
+  %s() to %s()" で断ります。テストのマシンのカーネルにこれが入ったら、ここでもそうします）。経路を
+  たどった後、呼び出しの連なりのどれでも、各関数のスタックの深さを JIT と同じく 16 バイトに
+  切り上げた和は 512 バイトまでです（"combined stack size of %d calls is %d. Too large"、
+  `EACCES`）。`BPF_LOG_STATS` では、ログに関数ごとのスタックの深さと、呼び出しの連なりが使う
+  最大の深さが出ます（テストのマシンの 7.0 と同じく "stack depth %d+%d max %d"）。
+
 - ソケットフィルターは `SO_ATTACH_BPF` で、古典的なものは `SO_ATTACH_FILTER`（後述）で、
   AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の
   ソケットにアタッチし、送られてくるメッセージごとに、Linux の `sk_filter` と
@@ -4253,7 +4318,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   符号付き剰余は 0 です。32 ビットのアトミック演算は、スロットの下半分をソースの下半分で変え、
   R0 の下半分と比べます。古い値はゼロ拡張して返ります。マップの値への読みと書きの間に、
   その値へのほかのアクセスは、mmap できる配列の値へのマッピングの書き込みも含めて入りません。ロードアクワイアはゼロ拡張して返り、ストアリリースは
-  ソースの下位のバイトを書きます。`BPF_LD_ABS` と `BPF_LD_IND` は、Linux の
+  ソースの下位のバイトを書きます。呼ばれた関数は自分のフレームで動き、その後の呼び出し元の
+  R6 から R9 は元のままです。`BPF_LD_ABS` と `BPF_LD_IND` は、Linux の
   `bpf_gen_ld_abs` が `bpf_skb_load_helper_8`、`_16`、`_32` の呼び出しに書き換えるのと
   同じく、ビッグエンディアンで読みます。オフセットは `int`（レジスタと `imm` の和の下半分）で、
   メッセージの先頭から、`SKF_NET_OFF` からはネットワークヘッダ（メッセージの先頭）からです。
@@ -5214,7 +5280,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
 - **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.10.0）。`--version`、
   `install`、`install --frozen-lockfile`、`list` の 4 つの操作が、本物の Linux と
   同じ出力と終了コードになります。
-- **ripgrep**：Rust で書かれたテキストの検索のツール（15.2.0）。検索を複数のスレッドで
+- **ripgrep**：Rust で書かれたテキストの検索のツール（16.0.0）。検索を複数のスレッドで
   動かします。正規表現での置き換え、並列の検索、ファイルをメモリへマップした検索、2 つの
   エラーを含む 9 つの検索が、本物の Linux と同じ出力と終了コードになります。
   `--version` は比べていません。`CPUID` が見せる SIMD の機能を表示するためで、

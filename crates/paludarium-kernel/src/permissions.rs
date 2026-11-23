@@ -227,7 +227,7 @@ pub(crate) fn permission(creds: &Credentials, stat: &FileStat, mask: u32) -> Res
 }
 
 /// `may_create`: writing and searching the directory a name goes into.
-fn may_create(creds: &Credentials, parent: &FileStat) -> Result<(), Errno> {
+pub(crate) fn may_create(creds: &Credentials, parent: &FileStat) -> Result<(), Errno> {
     permission(creds, parent, MAY_WRITE | MAY_EXEC)
 }
 

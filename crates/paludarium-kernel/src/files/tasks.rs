@@ -30,6 +30,9 @@ pub(super) struct Task {
     state: (char, &'static str),
     /// The process tracing it, 0 for none (`TracerPid`).
     tracer: u32,
+    /// The `exit_code` of its ptrace stop until a wait reports it, 0
+    /// otherwise.
+    stop_code: i32,
 }
 
 /// The thread of `path`: ENOENT for a process that is not there (reaped,
@@ -58,7 +61,9 @@ fn shown(
 ) -> Option<Task> {
     let threads = view.group.threads();
     let member = threads.iter().find(|&&(t, _)| t == tid).copied();
-    if thread && member.is_none() && !(view.zombie && tid == pid) {
+    // The leader stays, a zombie once it has ended, until its process is
+    // reaped (Linux's delayed group leader).
+    if thread && member.is_none() && tid != pid {
         return None;
     }
     let public = view
@@ -89,6 +94,7 @@ fn shown(
         public,
         state,
         tracer: processes.traces.tracer_of(tid).unwrap_or(0),
+        stop_code: processes.traces.stop_code(tid),
     })
 }
 
@@ -124,10 +130,13 @@ impl Task {
         }
         crate::coredump::string_ranges_in(&|at, buf| self.read(at, buf), self.start_stack())
     }
-    /// The threads Linux counts for a process: a zombie still counts as one.
+    /// Its process's threads as Linux counts them (`nr_threads`): a leader
+    /// that ended before the others counts until they all have, and a
+    /// zombie process counts as one.
     fn threads(&self) -> usize {
         if self.live() {
-            self.view.group.active_threads().max(1)
+            let leader_gone = !self.view.group.has_member(self.pid);
+            (self.view.group.active_threads() + usize::from(leader_gone)).max(1)
         } else {
             1
         }
@@ -307,6 +316,14 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
             locked: task.memory().and_then(|memory| memory.locked_pages()),
             resident: task.memory().and_then(|memory| memory.resident_pages()),
             threads: task.threads(),
+            // The task's own, the leader's for the process.
+            switches: task
+                .view
+                .group
+                .last_thread_usage(task.tid)
+                .map_or(0, |usage| {
+                    usage.switches.load(std::sync::atomic::Ordering::SeqCst)
+                }),
             queued: public.queued,
             queue_limit: task.view.queue_limit,
             pending: public.pending,
@@ -346,7 +363,13 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
         group: task.view.group_id,
         session: task.view.session,
         terminal: crate::pty::stat_fields(task.view.terminal.as_deref()),
-        cpu: task.view.group.process_cpu(),
+        // As `do_task_stat`: the process's, or for a path under `task` the
+        // thread's own.
+        cpu: if task.thread {
+            task.view.group.last_thread_cpu(task.tid).unwrap_or(0)
+        } else {
+            task.view.group.process_cpu()
+        },
         children_cpu: task.view.children_cpu,
         // As `do_task_stat`: the process's, its ended threads' too, or for
         // a path under `task` the thread's own.
@@ -391,13 +414,15 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
         caught,
         // As Linux's `do_task_stat`: the process's group exit or stop code
         // for its own `stat` (`group_exit_code`, a stop's until a wait
-        // reports it), else its leader's (that of an `exit` before the other
-        // threads'), a thread's own otherwise, the same wait status once it
-        // has ended.
+        // reports it), else the task's own `exit_code`, the leader's for the
+        // process: its ptrace stop's until a wait reports it, or the
+        // leader's `exit` before the other threads'; the same wait status
+        // once it has ended.
         exit_code: match task.view.stop_report {
             _ if task.view.zombie => task.view.exit_code,
             Some(signal) if !task.thread => signal,
-            _ if !task.thread => task.view.exit_code,
+            _ if task.stop_code != 0 => task.stop_code,
+            _ if task.tid == task.pid => task.view.exit_code,
             _ => 0,
         },
     })
@@ -472,7 +497,7 @@ pub(super) fn clear_refs(
         let processes = processes.upgrade().ok_or(Errno(3))?; // ESRCH
         let view = processes.view(pid).ok_or(Errno(3))?;
         let member = view.group.threads().iter().any(|&(t, _)| t == tid);
-        if thread && !member && !(view.zombie && tid == pid) {
+        if thread && !member && tid != pid {
             return Err(Errno(3));
         }
         if view.zombie {
@@ -552,7 +577,7 @@ impl AtRead {
         let processes = processes.upgrade().ok_or(Errno(3))?; // ESRCH
         let view = processes.view(pid).ok_or(Errno(3))?;
         let member = view.group.threads().iter().any(|&(t, _)| t == tid);
-        if thread && !member && !(view.zombie && tid == pid) {
+        if thread && !member && tid != pid {
             return Err(Errno(3));
         }
         let target = view
@@ -1067,9 +1092,9 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
                 .into_iter()
                 .map(|(tid, _)| tid)
                 .collect();
-            // A zombie's task directory still has its leader.
-            if threads.is_empty() {
-                threads.push(task.pid);
+            // The leader stays first while it is a zombie, its process's too.
+            if !threads.contains(&task.pid) {
+                threads.insert(0, task.pid);
             }
             listing(
                 threads

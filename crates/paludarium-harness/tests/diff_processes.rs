@@ -323,6 +323,7 @@ mod linux {
                     | "bpf-maps"
                     | "bpf-prog-load"
                     | "bpf-mmap"
+                    | "bpf-pin"
                     | "bpf-prog-verify"
                     | "bpf-prog-maps"
                     | "bpf-prog-context"
@@ -332,6 +333,7 @@ mod linux {
                     | "bpf-prog-atomic"
                     | "bpf-prog-acqrel"
                     | "bpf-prog-ldabs"
+                    | "bpf-prog-calls"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -708,6 +710,7 @@ mod linux {
         bpf_maps => ("bpf-maps","bpf"),
         bpf_prog_load => ("bpf-prog-load","bpf"),
         bpf_mmap => ("bpf-mmap","bpf"),
+        bpf_pin => ("bpf-pin","bpf"),
         bpf_prog_verify => ("bpf-prog-verify","bpf-prog"),
         bpf_prog_maps => ("bpf-prog-maps","bpf-prog"),
         bpf_prog_context => ("bpf-prog-context","bpf-prog"),
@@ -717,6 +720,7 @@ mod linux {
         bpf_prog_atomic => ("bpf-prog-atomic","bpf-prog"),
         bpf_prog_acqrel => ("bpf-prog-acqrel","bpf-prog"),
         bpf_prog_ldabs => ("bpf-prog-ldabs","bpf-prog"),
+        bpf_prog_calls => ("bpf-prog-calls","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -1025,6 +1029,9 @@ mod linux {
         processes_proc_stat_counters => ("proc-stat-counters","process"),
         processes_loadavg_running => ("loadavg-running","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
+        processes_thread_own_counters => ("thread-own-counters","process"),
+        processes_leader_zombie_task => ("leader-zombie-task","process"),
+        processes_ptrace_stop_exit_code => ("ptrace-stop-exit-code","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),

@@ -1571,6 +1571,15 @@ static int case_dnotify_calls(void) {
     printf("set=%ld owner-kept=%d\n", set, (int)fcntl(other, F_GETOWN) == child);
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
+    /* And a process group. The first process's group started outside a
+       PID namespace's view, where getpgrp() is 0 and F_SETOWN of 0 sets no
+       owner, so it makes a group of its own first. */
+    long grouped = e(setpgid(0, 0));
+    int third = open(base, O_RDONLY | O_DIRECTORY);
+    set = e(fcntl(third, F_SETOWN, -getpgrp()));
+    fcntl(third, F_NOTIFY, DN_CREATE);
+    printf("setpgid=%ld group-is-self=%d set=%ld group-owner-kept=%d\n", grouped, getpgrp() == getpid(),
+           set, (int)fcntl(third, F_GETOWN) == -getpgrp());
     printf("sig=%d\n", (int)fcntl(dir, F_GETSIG));
     remove_all();
     return 0;

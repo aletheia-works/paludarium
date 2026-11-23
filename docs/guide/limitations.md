@@ -1023,7 +1023,10 @@ verified.
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
-  allows it), and `FAN_FS_ERROR` never comes. An evictable mark on a
+  allows it), and `FAN_FS_ERROR` never comes, as no file system here
+  reports errors. Linux's ext4 reports them, and since 7.0 its XFS, Btrfs,
+  F2FS, iomap's I/O and fsverity do too, through `fserror_report`; its
+  tmpfs and procfs report none. An evictable mark on a
   directory is never evicted, where Linux's goes once none of the
   directory's children's dentries is in use; one on a file Linux would
   still write back, or one a mount is on, goes all the same. An open

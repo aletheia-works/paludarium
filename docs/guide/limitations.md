@@ -165,6 +165,9 @@ verified.
   no device for it to stand for. A FIFO in a mounted host directory can be
   made on Linux hosts only, and connects only the guest's own openers, not
   host programs that open the same node.
+- **A pipe's packet mode**: `F_SETFL` takes `O_DIRECT` on a pipe or FIFO,
+  as Linux does, but the emulator has no packet mode: its writes are not
+  kept apart as packets, and `F_GETFL` does not show `O_DIRECT`.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.

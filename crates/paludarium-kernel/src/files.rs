@@ -5470,7 +5470,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         Ok(pipe.size())
                     }
                 }
-                4 => crate::fasync::set_flags(c, &d.file, a[0], a[2] as u32).map(|()| 0),
+                4 => {
+                    let direct = direct_io(&*d.file, &d.path, d.opened);
+                    crate::fasync::set_flags(c, &d.file, a[0], a[2] as u32, direct).map(|()| 0)
+                }
                 // F_NOTIFY: dnotify.
                 1026 => crate::dnotify::fcntl(c, &d, a[0], a[2] as u32),
                 // The owner and signal of signal-driven I/O.
@@ -6382,6 +6385,33 @@ pub(crate) struct StandardFile {
     /// watcher looks only now and then, and must not miss what comes next.
     refused: std::sync::atomic::AtomicBool,
 }
+/// `O_DIRECT`.
+pub(crate) const O_DIRECT: u32 = 0o40000;
+/// `O_NOATIME`.
+pub(crate) const O_NOATIME: u32 = 0o1000000;
+/// Whether an open file description has Linux's `FMODE_CAN_ODIRECT`,
+/// which `O_DIRECT` needs at `open` (`do_dentry_open`, `EINVAL`) and at
+/// `F_SETFL` (`setfl`): a regular file of a disk file system or tmpfs,
+/// whose address space has `direct_IO` or whose open sets it
+/// (`ext4_file_open`, `shmem_file_open`), opened by `path`. A memfd has
+/// it only once opened again by a path, as `memfd_create` makes its file
+/// with no open; `/proc`'s files and `/dev`'s own, mqueue's queues, a
+/// pidfd and every file that is not regular have none.
+pub(crate) fn direct_io(file: &dyn FileHandle, path: &[u8], opened: bool) -> bool {
+    if file
+        .as_any()
+        .is_some_and(|any| any.is::<crate::memfd::Memfd>())
+    {
+        return opened;
+    }
+    opened
+        && !path.is_empty()
+        && !generated(path)
+        && !crate::mqueue::is_queue(file)
+        && file
+            .stat()
+            .is_ok_and(|stat| stat.mode & 0o170000 == 0o100000)
+}
 /// The flags `F_SETFL` changes (Linux's `SETFL_MASK` but `O_ASYNC`, which
 /// only a file with `fasync` keeps): `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`
 /// and `O_NOATIME`.
@@ -6916,6 +6946,12 @@ pub(crate) fn open_at(
                     crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
                 }
             })?;
+            // `do_dentry_open`: `O_DIRECT` without `FMODE_CAN_ODIRECT` is
+            // refused once the file is open (a FIFO too, unlike
+            // `F_SETFL`), so a file it created stays, with no `IN_OPEN`.
+            if flags & O_DIRECT != 0 && !direct_io(&*opened.0, &opened.1, true) {
+                return Err(Errno::EINVAL);
+            }
             let landlock = match landlock {
                 Some(rights) => rights,
                 None => landlock_after_open(c, &p, flags)?,
@@ -7773,7 +7809,7 @@ fn reopen_descriptor(
     let stat = d.file.stat()?;
     // `may_open` of the inode the link leads to.
     if !matches!(stat.mode & 0o170000, 0o040000 | 0o120000) {
-        attributes::may_open(&stat, flags)?;
+        attributes::may_open(&c.process.credentials, &stat, flags)?;
     }
     // A FIFO a path opened: its node opened again, at the same dentry.
     if stat.mode & 0o170000 == 0o010000

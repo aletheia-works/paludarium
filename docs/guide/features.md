@@ -552,6 +552,14 @@ kernel.
   `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
 
+- `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`
+  check them. `O_DIRECT` needs a regular file of a disk file system or
+  tmpfs, or a memfd opened again by a path (`EINVAL` for a directory, a
+  device, a FIFO, a socket, an anonymous inode or a file of `/proc`);
+  `F_SETFL` also takes it on a pipe or FIFO. `O_NOATIME` needs the file's
+  owner or `CAP_FOWNER` (`EPERM`), at `open` and when `F_SETFL` newly
+  sets it.
+
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
   locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a descriptor table owns (a
   process's, which its threads and a child cloned with `CLONE_FILES` share,

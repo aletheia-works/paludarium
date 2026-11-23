@@ -488,6 +488,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
   `close` は受け付け、`*at` の呼び出しではディレクトリになります。
 
+- `O_DIRECT` と `O_NOATIME` は、Linux の `open` と `F_SETFL` と同じく確かめます。
+  `O_DIRECT` には、ディスクのファイルシステムか tmpfs の通常のファイル、またはパスで開き直した
+  memfd が要ります（ディレクトリ、デバイス、FIFO、ソケット、匿名 inode、`/proc` のファイルは
+  `EINVAL`）。`F_SETFL` はパイプと FIFO の `O_DIRECT` も受け付けます。`O_NOATIME` には、
+  `open` のときと `F_SETFL` で新たに付けるときに、ファイルの所有者か `CAP_FOWNER` が要ります
+  （`EPERM`）。
+
 - `fcntl` のバイト範囲のロックを、Linux の `fs/locks.c` と同じく扱います。記述子の表
   （Linux の `files_struct` と同じく、プロセスのもので、そのスレッドと `CLONE_FILES` で
   clone した子が共有します）が持つレコードロック（`F_SETLK`、`F_SETLKW`、`F_GETLK`）と、開いたファイルの記述が持つ OFD ロック

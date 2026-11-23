@@ -439,7 +439,7 @@ pub(crate) fn open(
                 DIRECTORY if mask & MAY_WRITE != 0 => Ok(None),
                 _ => {
                     permission(creds, &file, mask)?;
-                    attributes::may_open(&file, flags).map(|()| None)
+                    attributes::may_open(creds, &file, flags).map(|()| None)
                 }
             }
         }

@@ -4080,7 +4080,7 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                     if !crate::fasync::has_fasync(&file) {
                         return Err(Errno::ENOTTY);
                     }
-                    crate::fasync::set_flags(c, &file, a[0], flags)?;
+                    crate::fasync::set_flags(c, &file, a[0], flags, true)?;
                 }
                 return Ok(0);
             }

@@ -477,9 +477,13 @@ verified.
   on without them. `RDPKRU` and `WRPKRU` stop a program with `SIGILL`, as on
   such a CPU.
 - **Segment registers, in part**: `lfs`, `lgs` and `lss`, `lar`, `lsl`,
-  `verr` and `verw`, and far jumps, calls and returns stop a program with
-  `SIGILL`, and the CPU runs only in `__USER_CS`: an `rt_sigreturn` frame
-  with another `cs` is a bad frame. `set_thread_area` is not implemented,
+  `verr` and `verw` stop a program with `SIGILL`. The CPU runs only in
+  64-bit mode: a far `jmp`, `call` or `ret` to a compatibility-mode
+  segment (`__USER32_CS`, or any code segment `modify_ldt` writes, which
+  Linux never makes 64-bit) is `SIGILL` at the transfer, where Linux runs
+  32-bit code there, and an `rt_sigreturn` frame whose `cs` is one is a bad
+  frame. A far `jmp` or `call` with REX.W takes an `m16:64` pointer, as
+  Intel's CPUs do, where AMD's read `m16:32`. `set_thread_area` is not implemented,
   so the GDT's thread-local entries stay empty, and the limit of the CPU
   number segment is 0. A `mov` or `pop` to `%ss` does not hold off the
   single-step trap of the instruction after it, as the CPU does. After

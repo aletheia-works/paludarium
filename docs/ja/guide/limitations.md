@@ -402,9 +402,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **保護キー**：仮想 CPU には保護キーがありません（`CPUID` は PKU を報告しません）。そのため
   `pkey_alloc` は、そういう CPU での Linux と同じく `ENOSPC` を返し、プログラムは保護キーなしで
   続けます。`RDPKRU` と `WRPKRU` は、そういう CPU と同じく `SIGILL` でプログラムを止めます。
-- **セグメントレジスタの一部**：`lfs`、`lgs`、`lss`、`lar`、`lsl`、`verr`、`verw` と、far の
-  ジャンプ・コール・リターンは `SIGILL` でプログラムを止めます。CPU は `__USER_CS` でしか
-  動かないので、ほかの `cs` の `rt_sigreturn` のフレームは不正なフレームです。
+- **セグメントレジスタの一部**：`lfs`、`lgs`、`lss`、`lar`、`lsl`、`verr`、`verw` は
+  `SIGILL` でプログラムを止めます。CPU は 64 ビットモードでしか動かないので、互換モードの
+  セグメント（`__USER32_CS` や、Linux が 64 ビットにしない `modify_ldt` のコードセグメント）
+  への far の `jmp`、`call`、`ret` は、Linux ならそこで 32 ビットのコードを実行するところを、
+  移る命令で `SIGILL` になります。`cs` がそれである `rt_sigreturn` のフレームは不正な
+  フレームです。REX.W の付いた far の `jmp` と `call` は、Intel の CPU と同じく `m16:64` の
+  ポインタを取ります。AMD の CPU は `m16:32` を読みます。
   `set_thread_area` は実装していないので、GDT のスレッドローカルのエントリは空のままで、CPU
   番号のセグメントのリミットは 0 です。`%ss` への `mov` や `pop` は、CPU と違い、次の命令の
   シングルステップのトラップを遅らせません。`modify_ldt` のあとに `%ds` と `%es` を読み込み

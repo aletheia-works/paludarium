@@ -606,11 +606,11 @@ pub(crate) fn install(
     Ok(())
 }
 /// `rt_sigreturn`'s `restore_sigcontext`. The frame's cs and ss are taken
-/// with RPL 3; cs must be `__USER_CS`, the only code segment the virtual
-/// CPU runs. An ss that is no stack segment is replaced by `__USER_DS`
+/// with RPL 3; a cs of compatibility mode, which the virtual CPU does not
+/// run, is refused. An ss that is no stack segment is replaced by `__USER_DS`
 /// unless the frame says to restore it strictly (`force_valid_ss`); then the
 /// context is restored and the return to it faults, as Linux's `iret` does,
-/// which `Ok(Some(fault))` gives.
+/// which `Ok(Some(fault))` gives; so does a cs that is no code segment.
 pub(crate) fn restore(
     process: &mut ThreadState,
     cpu: &mut CpuState,
@@ -634,18 +634,20 @@ pub(crate) fn restore(
     let selectors = get(&b, SC + 144);
     let cs = selectors as u16 | 3;
     let mut ss = (selectors >> 48) as u16 | 3;
-    if cs != segments::USER_CS {
-        return Err(());
-    }
     if get(&b, UC) & UC_STRICT_RESTORE_SS == 0 {
         ss = valid_stack(ss, mem);
     }
+    // `iret` checks CS before SS.
     let fault = {
         let ldt = mem
             .ldt()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        segments::check_stack(ss, &ldt).err()
+        match segments::check_code(cs, &ldt, true) {
+            Ok(segments::CodeMode::Long) => segments::check_stack(ss, &ldt).err(),
+            Ok(segments::CodeMode::Compatibility) => return Err(()),
+            Err(fault) => Some(fault),
+        }
     };
     // DS, ES, FS and GS are the thread's, not members of the frame.
     restored.segments = cpu.segments;

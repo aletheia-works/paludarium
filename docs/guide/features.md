@@ -20,7 +20,14 @@ Linux.
   writes. A load the CPU refuses is `SIGSEGV` for #GP, or `SIGBUS` for #NP
   (#SS for `%ss`), with `SI_KERNEL`, the vector in `trapno` and the
   selector without its RPL in `err`, as Linux gives them; `mov` to `%cs` is
-  `SIGILL`. A selector that is not null gives `%fs` or `%gs` the 32-bit
+  `SIGILL`. A far `jmp` and `call` through an `m16:16`, `m16:32` or
+  `m16:64` pointer and a far `ret` load `%cs` with the same checks of a code
+  segment: `__USER_CS` runs, whatever RPL the selector has for a jump or
+  call (a return needs RPL 3), and a call pushes `%cs` and the return
+  address in slots of the offset's size; a null selector, data, a system
+  descriptor, the kernel's code or a return to an offset that is not
+  canonical is `SIGSEGV` for #GP, and a code segment not present `SIGBUS`
+  for #NP, with nothing moved. A selector that is not null gives `%fs` or `%gs` the 32-bit
   base of its descriptor, and a null one clears it, as Intel's CPUs and
   AMD's since Zen 2 do; in 64-bit mode the other segments have no base.
   `arch_prctl`'s `ARCH_SET_FS` and `ARCH_SET_GS`, `PTRACE_ARCH_PRCTL` and

@@ -322,6 +322,17 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
             length: 8,
             write: false,
         }),
+        // The two slots of a far call and return: CS and the offset.
+        Mnemonic::CallFar => out.push(Access {
+            address: rsp.wrapping_sub(2 * u64::from(insn.implicit_size)),
+            length: 2 * u16::from(insn.implicit_size),
+            write: true,
+        }),
+        Mnemonic::RetFar => out.push(Access {
+            address: rsp,
+            length: 2 * u16::from(insn.implicit_size),
+            write: false,
+        }),
         _ => {}
     }
     out

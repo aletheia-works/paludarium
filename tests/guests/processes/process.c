@@ -17319,6 +17319,106 @@ static void seg_handler(int sig, siginfo_t *info, void *context) {
                          : "rcx", "memory");                                                 \
     } while (0)
 
+/* Runs `insn` with the far pointer, or the offset and selector a far
+   return pops, at rdx, below the red zone; a fault resumes after it, and
+   how far the stack pointer moved from just before it shows what the
+   faulting transfer left. */
+#define FAR_TRY(name, insn, pointer)                                                         \
+    do {                                                                                     \
+        long moved_;                                                                         \
+        printf("%s:\n", name);                                                               \
+        fflush(stdout);                                                                      \
+        __asm__ volatile("lea -128(%%rsp), %%rsp\n\tlea 1f(%%rip), %%rcx\n\t"               \
+                         "mov %%rcx, %[r]\n\tmov %%rsp, %%r8\n\t" insn "\n1:\n\t"            \
+                         "mov %%r8, %%r9\n\tsub %%rsp, %%r9\n\tmov %%r8, %%rsp\n\t"          \
+                         "lea 128(%%rsp), %%rsp\n\tmov %%r9, %[m]"                           \
+                         : [r] "=m"(seg_resume), [m] "=m"(moved_)                            \
+                         : "d"(pointer)                                                      \
+                         : "rcx", "r8", "r9", "memory");                                     \
+        printf("  rsp moved %ld\n", moved_);                                                 \
+    } while (0)
+
+/* An m16:32 far pointer. */
+struct far32 {
+    unsigned offset;
+    unsigned short selector;
+} __attribute__((packed));
+
+/* Far jumps, calls and returns in 64-bit mode: to __USER_CS whatever the
+   RPL a jump or call gives; each other target faults before anything
+   moves. A 32-bit offset leaves a jump and call (and the return address a
+   call pushes) below 4 GiB, so those run from a page there. Linux's LDT
+   code segments are never 64-bit (fill_ldt clears L), and a transfer to
+   one or to __USER32_CS runs 32-bit code: left out. */
+static void far_case(void) {
+    unsigned char *low = mmap((void *)0x10002000, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (low != (void *)0x10002000) {
+        printf("far mmap failed\n");
+        return;
+    }
+    /* 0x00: lcall *(%rdi); ret. 0x10: the callee stores the offset and CS
+       the call pushed and the CS it runs in at rsi, then lret. 0x30: mov
+       %cs, %eax; jmp *%rcx. */
+    static const unsigned char caller[] = {0xff, 0x1f, 0xc3};
+    static const unsigned char callee[] = {0x8b, 0x04, 0x24, 0x89, 0x06, 0x0f, 0xb7, 0x44,
+                                           0x24, 0x04, 0x89, 0x46, 0x04, 0x8c, 0xc8, 0x89,
+                                           0x46, 0x08, 0xcb};
+    static const unsigned char landing[] = {0x8c, 0xc8, 0xff, 0xe1};
+    memcpy(low, caller, sizeof caller);
+    memcpy(low + 0x10, callee, sizeof callee);
+    memcpy(low + 0x30, landing, sizeof landing);
+    unsigned short targets[] = {0x33, 0x30, 0x31};
+    for (unsigned i = 0; i < 3; i++) {
+        struct far32 to_landing = {0x10002030, targets[i]};
+        unsigned long cs = 0;
+        __asm__ volatile("lea 1f(%%rip), %%rcx\n\t.byte 0xff, 0x2a\n1:"
+                         : "=a"(cs)
+                         : "d"(&to_landing)
+                         : "rcx", "memory");
+        struct far32 to_callee = {0x10002010, targets[i]};
+        unsigned seen[3] = {0};
+        __asm__ volatile("lea -128(%%rsp), %%rsp\n\tcall *%[f]\n\tlea 128(%%rsp), %%rsp"
+                         :
+                         : [f] "r"(low), "D"(&to_callee), "S"(seen)
+                         : "rax", "memory");
+        printf("far %#x: ljmp cs=%#lx lcall pushed %#x:%#x ran in cs=%#x\n", targets[i],
+               cs & 0xffff, seen[1], seen[0], seen[2]);
+    }
+    /* lretq, and lretq $16 dropping two more slots. */
+    unsigned long dropped = 0, ret_cs = 0;
+    __asm__ volatile("lea -128(%%rsp), %%rsp\n\tmov %%rsp, %%r8\n\tpushq $0\n\tpushq $0\n\t"
+                     "pushq $0x33\n\tlea 1f(%%rip), %%rcx\n\tpush %%rcx\n\t.byte 0x48, 0xca, 16, 0\n"
+                     "1:\n\tmov %%cs, %%eax\n\tmov %%r8, %%rcx\n\tsub %%rsp, %%rcx\n\t"
+                     "mov %%r8, %%rsp\n\tlea 128(%%rsp), %%rsp"
+                     : "=c"(dropped), "=a"(ret_cs)
+                     :
+                     : "r8", "memory");
+    printf("lretq $16: cs=%#lx rsp left %ld\n", ret_cs & 0xffff, (long)dropped);
+    /* 0x2f: not-present 32-bit code. */
+    long written = ldt_write(0x11, 5, 0, 0xfffff, 1 | 2 << 1 | 1 << 4 | 1 << 5);
+    printf("ldt 5=%ld\n", written);
+    static const unsigned short refused[] = {0, 3, 0x2b, 0x10, 0x13, 0x40, 0x7b, 0x83, 0x2f};
+    for (unsigned i = 0; i < sizeof refused / sizeof *refused; i++) {
+        char name[48];
+        struct far32 pointer = {0x10002030, refused[i]};
+        snprintf(name, sizeof name, "ljmp %#x", refused[i]);
+        FAR_TRY(name, ".byte 0xff, 0x2a", &pointer);
+        snprintf(name, sizeof name, "lcall %#x", refused[i]);
+        FAR_TRY(name, ".byte 0xff, 0x1a", &pointer);
+        unsigned long slots[2] = {0x10002030, refused[i]};
+        snprintf(name, sizeof name, "lretq %#x", refused[i]);
+        FAR_TRY(name, "pushq 8(%%rdx)\n\tpushq (%%rdx)\n\t.byte 0x48, 0xcb", slots);
+    }
+    /* A return to RPL 0, and to an offset that is not canonical. */
+    unsigned long rpl0[2] = {0x10002030, 0x30};
+    FAR_TRY("lretq 0x30", "pushq 8(%%rdx)\n\tpushq (%%rdx)\n\t.byte 0x48, 0xcb", rpl0);
+    unsigned long wild[2] = {0x8000000000000000UL, 0x33};
+    FAR_TRY("lretq to 1<<63", "pushq 8(%%rdx)\n\tpushq (%%rdx)\n\t.byte 0x48, 0xcb", wild);
+    ldt_write(0x11, 5, 0, 0, 1 << 3 | 1 << 5);
+    munmap(low, 4096);
+}
+
 static unsigned short seg_read_gs(void) {
     unsigned short s;
     __asm__ volatile("mov %%gs, %0" : "=r"(s));
@@ -17426,6 +17526,7 @@ static int segments_case(void) {
                      :
                      : "rcx", "memory");
     printf("  rsp moved %ld gs=%#x\n", (long)(after - before), seg_read_gs());
+    far_case();
     /* A null selector clears the base; arch_prctl nulls the selector. */
     syscall(SYS_arch_prctl, 0x1001, 0x10000000);
     printf("set-gs gs=%#x base=%#lx\n", seg_read_gs(), seg_gs_base());

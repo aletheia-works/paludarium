@@ -14921,6 +14921,164 @@ static int leader_exit_status_case(void) {
     return 0;
 }
 
+/* Field `index` (1-based, after the name) of the stat file at `path`, and
+   its state in *state; -1 when it cannot be read. */
+static long pid_stat_field(const char *path, int index, char *state) {
+    char buffer[4096];
+    long n = proc_read(path, buffer, sizeof buffer - 1);
+    if (n <= 0) return -1;
+    buffer[n] = 0;
+    char *s = strrchr(buffer, ')');
+    if (!s || !s[1]) return -1;
+    s += 2;
+    if (state) *state = *s;
+    for (int i = 3; i < index && s; i++) {
+        s = strchr(s, ' ');
+        if (s) s++;
+    }
+    return s ? atol(s) : -1;
+}
+
+/* The number after `name` in the status file at `path`, -1 if none. */
+static long pid_status_field(const char *path, const char *name) {
+    char buffer[8192];
+    long n = proc_read(path, buffer, sizeof buffer - 1);
+    if (n <= 0) return -1;
+    buffer[n] = 0;
+    char *line = strstr(buffer, name);
+    return line ? atol(line + strlen(name)) : -1;
+}
+
+/* The thread-own-counters case: as Linux's do_task_stat and
+   task_context_switch_counts, a thread's stat under task gives its own CPU
+   time, and its status its own voluntary context switches, where the
+   process's stat sums its threads' time and its status shows the leader's
+   switches. A thread spins for 500 ms of its CPU time and sleeps 20 times
+   while the leader waits for it; only how the counts compare is printed. */
+static void *toc_worker(void *unused) {
+    (void)unused;
+    struct timespec now;
+    do clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    while (now.tv_sec == 0 && now.tv_nsec < 500000000);
+    for (int i = 0; i < 20; i++) nanosleep(&(struct timespec){0, 1000000}, NULL);
+    char own[64], leader[64];
+    snprintf(own, sizeof own, "/proc/self/task/%ld/stat", (long)syscall(SYS_gettid));
+    snprintf(leader, sizeof leader, "/proc/self/task/%d/stat", (int)getpid());
+    /* utime and stime, fields 14 and 15. */
+    long own_ticks = pid_stat_field(own, 14, NULL) + pid_stat_field(own, 15, NULL);
+    long leader_ticks = pid_stat_field(leader, 14, NULL) + pid_stat_field(leader, 15, NULL);
+    long all_ticks = pid_stat_field("/proc/self/stat", 14, NULL) +
+                     pid_stat_field("/proc/self/stat", 15, NULL);
+    snprintf(own, sizeof own, "/proc/self/task/%ld/status", (long)syscall(SYS_gettid));
+    long own_switches = pid_status_field(own, "\nvoluntary_ctxt_switches:\t");
+    long leader_switches = pid_status_field("/proc/self/status", "\nvoluntary_ctxt_switches:\t");
+    printf("thread cpu>=40=%d leader<thread=%d process>=thread=%d\n", own_ticks >= 40,
+           leader_ticks >= 0 && leader_ticks < own_ticks, all_ticks >= own_ticks);
+    printf("thread switches>=20=%d leader<20=%d\n", own_switches >= 20,
+           leader_switches >= 0 && leader_switches < 20);
+    return NULL;
+}
+
+static int thread_own_counters_case(void) {
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, toc_worker, NULL)) return 1;
+    pthread_join(worker, NULL);
+    return 0;
+}
+
+/* The leader-zombie-task case: after the leader's exit, while another
+   thread runs, Linux keeps the leader as a zombie until the process ends:
+   it is first in task, its stat there is Z with its own exit_code (5 << 8),
+   its status is Z (zombie), and the process's Threads and num_threads
+   count it. The other thread looks, then ends with exit(0). */
+static void *lzt_worker(void *unused) {
+    (void)unused;
+    char state = '?';
+    for (int i = 0; i < 500 && state != 'Z'; i++) {
+        pid_stat_field("/proc/self/stat", 3, &state);
+        if (state != 'Z') nanosleep(&(struct timespec){0, 10000000}, NULL);
+    }
+    int pid = getpid(), first = 0, count = 0;
+    DIR *dir = opendir("/proc/self/task");
+    for (struct dirent *e; dir && (e = readdir(dir));) {
+        if (e->d_name[0] == '.') continue;
+        if (count++ == 0) first = atoi(e->d_name);
+    }
+    if (dir) closedir(dir);
+    char path[64], task_state = '?';
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", pid);
+    long code = pid_stat_field(path, 52, &task_state);
+    snprintf(path, sizeof path, "/proc/self/task/%d/status", pid);
+    char buffer[4096];
+    long n = proc_read(path, buffer, sizeof buffer - 1);
+    if (n < 0) n = 0;
+    buffer[n] = 0;
+    printf("process state=%c task first-is-leader=%d count=%d\n", state, first == pid, count);
+    printf("leader task state=%c exit_code=%ld status-zombie=%d\n", task_state, code,
+           strstr(buffer, "\nState:\tZ (zombie)\n") != NULL);
+    printf("Threads=%ld num_threads=%ld\n", pid_status_field("/proc/self/status", "\nThreads:\t"),
+           pid_stat_field("/proc/self/stat", 20, NULL));
+    fflush(stdout);
+    syscall(SYS_exit, 0);
+    return NULL;
+}
+
+static int leader_zombie_task_case(void) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, lzt_worker, NULL)) _exit(98);
+        syscall(SYS_exit, 5);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("wait=%#x\n", status);
+    return 0;
+}
+
+/* The ptrace-stop-exit-code case: as Linux's do_task_stat, a tracee's
+   stat shows the exit_code of its ptrace stop until its tracer's wait
+   reports it (one with WNOWAIT does not), then 0: SIGSTOP for its
+   signal-delivery stop, SIGTRAP | 0x80 for a syscall stop under
+   PTRACE_O_TRACESYSGOOD, in the process's stat and its thread's alike. */
+static void psx_show(const char *when, pid_t kid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    long process = pid_stat_field(path, 52, NULL);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)kid, (int)kid);
+    printf("%s: stat exit_code=%ld task=%ld\n", when, process, pid_stat_field(path, 52, NULL));
+}
+
+static int ptrace_stop_exit_code_case(void) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        if (syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0)) _exit(1);
+        raise(SIGSTOP);
+        for (;;) syscall(SYS_getppid);
+    }
+    siginfo_t info;
+    int status;
+    memset(&info, 0, sizeof info);
+    if (waitid(P_PID, kid, &info, WSTOPPED | WNOWAIT)) return 2;
+    psx_show("signal stop", kid);
+    waitpid(kid, &status, 0);
+    psx_show("reported", kid);
+    if (syscall(SYS_ptrace, 0x4200 /* PTRACE_SETOPTIONS */, kid, 0, 1 /* TRACESYSGOOD */)) return 3;
+    if (syscall(SYS_ptrace, 24 /* PTRACE_SYSCALL */, kid, 0, 0)) return 4;
+    memset(&info, 0, sizeof info);
+    if (waitid(P_PID, kid, &info, WSTOPPED | WNOWAIT)) return 5;
+    psx_show("syscall stop", kid);
+    waitpid(kid, &status, 0);
+    psx_show("reported", kid);
+    kill(kid, SIGKILL);
+    waitpid(kid, &status, 0);
+    return 0;
+}
+
 /* The loadavg-running case: /proc/loadavg's running count, as Linux's
    nr_running(), counts the threads that can run: with two threads spinning
    besides the reader, at least 3, and no more than the live tasks; and
@@ -35523,6 +35681,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
     if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
+    if (!strcmp(mode, "thread-own-counters")) return thread_own_counters_case();
+    if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();
+    if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

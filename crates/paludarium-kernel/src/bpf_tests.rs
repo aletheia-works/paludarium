@@ -1483,3 +1483,189 @@ fn a_map_maps_only_as_linux_s_bpf_map_mmap_lets_it() {
     assert_eq!(try_map(ro, PROT_READ | PROT_WRITE), errno(Errno::EACCES));
     assert_eq!(try_map(wo, PROT_READ), errno(Errno::EACCES));
 }
+
+const OBJ_PIN: u64 = 6;
+const OBJ_GET: u64 = 7;
+const F_PATH_FD: u32 = 1 << 14;
+
+/// A `BPF_OBJ` attribute: the path at `path`, the descriptor and flags.
+fn object(path: u64, fd: u64, flags: u32) -> Attr {
+    Attr::default()
+        .word(0, path)
+        .half(8, fd as u32)
+        .half(12, flags)
+}
+
+#[test]
+fn a_pinned_map_stays_in_a_bpf_file_system_until_its_name_goes() {
+    let (mut k, mut t, m) = setup();
+    let put = |at: u64, text: &str| {
+        m.write(GuestAddr(DATA + at), format!("{text}\0").as_bytes())
+            .unwrap();
+        DATA + at
+    };
+    let (dir, bpf_kind, options) = (
+        put(0xa00, "/pins"),
+        put(0xa20, "bpf"),
+        put(0xa40, "mode=0700,uid=5"),
+    );
+    let (pinned, dotted, plain) = (
+        put(0xa80, "/pins/m"),
+        put(0xaa0, "/pins/a.b"),
+        put(0xac0, "/m"),
+    );
+    let (made, file, relative) = (
+        put(0xae0, "/pins/d"),
+        put(0xb00, "/pins/f"),
+        put(0xb20, "m"),
+    );
+    assert_eq!(syscall(&mut k, &mut t, &m, 83, [dir, 0o755, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            165,
+            [bpf_kind, dir, bpf_kind, 0, options, 0]
+        ),
+        0
+    );
+    let fd = make(&mut k, &mut t, &m, map(ARRAY, 4, 8, 4, 0));
+    let pinned_id = id(&mut k, &mut t, &m, fd);
+    assert_eq!(bpf(&mut k, &mut t, &m, OBJ_PIN, &object(pinned, fd, 0)), 0);
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_PIN, &object(pinned, fd, 0)),
+        errno(Errno::EEXIST)
+    );
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_PIN, &object(dotted, fd, 0)),
+        errno(Errno::EPERM)
+    );
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_PIN, &object(plain, fd, 0)),
+        errno(Errno::EPERM)
+    );
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_PIN, &object(file, NO_FD, 0)),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_PIN, &object(file, fd, 1 << 3)),
+        errno(Errno::EINVAL)
+    );
+    let past = object(file, fd, 0).half(20, 1);
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_PIN, &past),
+        errno(Errno::EINVAL)
+    );
+    // A get gives the same map, with the access asked.
+    let got = bpf(&mut k, &mut t, &m, OBJ_GET, &object(pinned, 0, 0));
+    assert!(got < 1024, "get: {got:#x}");
+    assert_eq!(id(&mut k, &mut t, &m, got), pinned_id);
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_GET, &object(pinned, fd, 0)),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_GET, &object(dir, 0, 0)),
+        errno(Errno::EACCES)
+    );
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, OBJ_GET, &object(dotted, 0, 0)),
+        errno(Errno::EPERM)
+    );
+    let at = syscall(&mut k, &mut t, &m, 2, [dir, 0o200000, 0, 0, 0, 0]);
+    let from = object(relative, 0, F_PATH_FD).half(16, at as u32);
+    assert!(bpf(&mut k, &mut t, &m, OBJ_GET, &from) < 1024);
+    // Its directories make directories but no other file.
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [made, 0o755, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 2, [file, 0o101, 0o644, 0, 0, 0]),
+        errno(Errno::EACCES)
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 133, [file, 0o010644, 0, 0, 0, 0]),
+        errno(Errno::EPERM)
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 2, [pinned, 0, 0, 0, 0, 0]),
+        errno(Errno::EIO)
+    );
+    // The map stays while its name does.
+    for held in [fd, got, at] {
+        assert_eq!(syscall(&mut k, &mut t, &m, CLOSE, [held, 0, 0, 0, 0, 0]), 0);
+    }
+    for open in 3..8 {
+        let _ = syscall(&mut k, &mut t, &m, CLOSE, [open, 0, 0, 0, 0, 0]);
+    }
+    let by_id = Attr::default().half(0, pinned_id);
+    let kept = bpf(&mut k, &mut t, &m, MAP_GET_FD_BY_ID, &by_id);
+    assert!(kept < 1024, "kept: {kept:#x}");
+    assert_eq!(syscall(&mut k, &mut t, &m, CLOSE, [kept, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(syscall(&mut k, &mut t, &m, 87, [pinned, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, MAP_GET_FD_BY_ID, &by_id),
+        errno(Errno::ENOENT)
+    );
+}
+
+/// A command Linux master has but this kernel lacks is `ENOSYS`, up to
+/// `BPF_PROG_STREAM_OPEN` (39); a number past `__MAX_BPF_CMD` (40) is
+/// `__sys_bpf`'s `EINVAL`.
+#[test]
+fn commands_past_master_s_last_are_einval() {
+    let (mut k, mut t, m) = setup();
+    let none = Attr::default();
+    assert_eq!(bpf(&mut k, &mut t, &m, 38, &none), errno(Errno::ENOSYS));
+    assert_eq!(bpf(&mut k, &mut t, &m, 39, &none), errno(Errno::ENOSYS));
+    assert_eq!(bpf(&mut k, &mut t, &m, 40, &none), errno(Errno::EINVAL));
+    assert_eq!(bpf(&mut k, &mut t, &m, 1000, &none), errno(Errno::EINVAL));
+    // A map type past `__MAX_BPF_MAP_TYPE` (36) is EINVAL, as one with no
+    // ops here is.
+    for kind in [35, 36, 39] {
+        assert_eq!(
+            create(&mut k, &mut t, &m, map(kind, 4, 8, 1, 0)),
+            errno(Errno::EINVAL)
+        );
+    }
+}
+
+/// A missing name with a dot is a BPF file system's `EPERM` only once the
+/// walk reaches its directory: one the thread may not search is `EACCES`.
+#[test]
+fn a_dotted_name_is_eperm_only_past_the_search() {
+    let (mut k, mut t, m) = setup();
+    let put = |at: u64, text: &str| {
+        m.write(GuestAddr(DATA + at), format!("{text}\0").as_bytes())
+            .unwrap();
+        DATA + at
+    };
+    let (dir, kind, locked) = (
+        put(0xa00, "/pins"),
+        put(0xa20, "bpf"),
+        put(0xa40, "/pins/locked"),
+    );
+    let (hidden, open_name) = (put(0xa80, "/pins/locked/a.b"), put(0xac0, "/pins/a.b"));
+    assert_eq!(syscall(&mut k, &mut t, &m, 83, [dir, 0o755, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 165, [kind, dir, kind, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [locked, 0o700, 0, 0, 0, 0]),
+        0
+    );
+    // setuid(1000): no longer root, nor able to search `locked`.
+    assert_eq!(syscall(&mut k, &mut t, &m, 105, [1000, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [hidden, 0o755, 0, 0, 0, 0]),
+        errno(Errno::EACCES)
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [open_name, 0o755, 0, 0, 0, 0]),
+        errno(Errno::EPERM)
+    );
+}

@@ -26,6 +26,12 @@
    map and BPF_F_RDONLY_PROG allow, the freeze a mapping that writes holds
    off, a child's included, and the map a mapping keeps after its
    descriptor closes.
+   bpf-pin: the BPF file system and BPF_OBJ_PIN and BPF_OBJ_GET of maps
+   in it, in a mount namespace of its own: the mount's options as
+   mountinfo shows them (delegation masks by name), its statfs and root,
+   a pinned map's file, the checks of both commands (BPF_F_PATH_FD, the
+   access a descriptor got again gives), the files its directories make
+   and refuse, a remount, fsopen, and the map going with its last name.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -49,7 +55,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -121,6 +132,11 @@ union attr {
     struct {
         uint32_t start_id, next_id, open_flags;
     } id;
+    struct {
+        uint64_t pathname;
+        uint32_t bpf_fd, file_flags;
+        int32_t path_fd;
+    } obj;
     unsigned char bytes[128];
 };
 
@@ -1706,6 +1722,197 @@ static int case_mmap(void) {
     return 0;
 }
 
+#define OBJ_PIN 6
+#define OBJ_GET 7
+#define F_PATH_FD (1 << 14)
+
+static long obj(int cmd, int fd, const char *path, uint32_t flags, int dir) {
+    union attr a;
+    memset(&a, 0, sizeof a);
+    a.obj.pathname = (uintptr_t)path;
+    a.obj.bpf_fd = (uint32_t)fd;
+    a.obj.file_flags = flags;
+    a.obj.path_fd = dir;
+    return bpf(cmd, &a, sizeof a);
+}
+
+static char pin_base[64];
+static char *in(const char *name) {
+    static char paths[8][128];
+    static int next;
+    char *p = paths[next++ % 8];
+    snprintf(p, sizeof paths[0], "%s/%s", pin_base, name);
+    return p;
+}
+
+/* The mount options and what follows " - " in mountinfo's line of the
+   mount at `point`. */
+static void mountinfo(const char *name, const char *point) {
+    char line[1024];
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char mnt[256], options[256];
+        if (sscanf(line, "%*s %*s %*s %*s %255s %255s", mnt, options) != 2 || strcmp(mnt, point)) continue;
+        char *rest = strstr(line, " - ");
+        if (rest) rest[strcspn(rest, "\n")] = 0;
+        say("%s %s%s", name, options, rest ? rest : "");
+    }
+    fclose(f);
+}
+
+static void stat_of(const char *name, const char *path) {
+    struct stat st;
+    long r = TRY(stat(path, &st));
+    if (r < 0) {
+        say("%s stat %ld", name, r);
+        return;
+    }
+    say("%s mode %o links %lu uid %u gid %u size %lld", name, st.st_mode, (unsigned long)st.st_nlink, st.st_uid,
+        st.st_gid, (long long)st.st_size);
+}
+
+static int case_pin(void) {
+    snprintf(pin_base, sizeof pin_base, "/tmp/bpf-pin-XXXXXX");
+    if (!mkdtemp(pin_base)) return 1;
+    mkdir(in("fs"), 0755);
+    mkdir(in("plain"), 0755);
+    mkdir(in("other"), 0755);
+    close(open(in("plain/file"), O_CREAT | O_WRONLY, 0644));
+    umask(022);
+    say("unshare %ld", TRY(unshare(CLONE_NEWNS)));
+    say("private %ld", TRY(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    say("mount %ld", TRY(mount("bpf", in("fs"), "bpf", 0, "mode=0700,uid=1,gid=2,size=3")));
+    mountinfo("mounted", in("fs"));
+    struct statfs sf;
+    long r = TRY(statfs(in("fs"), &sf));
+    say("statfs %ld type %lx bsize %ld blocks %ld files %ld namelen %ld", r, (long)sf.f_type, (long)sf.f_bsize,
+        (long)sf.f_blocks, (long)sf.f_files, (long)sf.f_namelen);
+    stat_of("root", in("fs"));
+
+    int map = make(TYPE_ARRAY, 4, 8, 4, 0);
+    uint32_t key = 1;
+    uint64_t value = 42, back = 0;
+    say("update %ld", elem(MAP_UPDATE_ELEM, map, &key, &value, ANY));
+    uint32_t id = id_of(map);
+    say("pin %ld", obj(OBJ_PIN, map, in("fs/m"), 0, 0));
+    stat_of("pinned", in("fs/m"));
+    say("again %ld", obj(OBJ_PIN, map, in("fs/m"), 0, 0));
+    say("plain dir %ld", obj(OBJ_PIN, map, in("plain/m"), 0, 0));
+    say("dotted %ld", obj(OBJ_PIN, map, in("fs/a.b"), 0, 0));
+    say("slash %ld", obj(OBJ_PIN, map, in("fs/s/"), 0, 0));
+    say("no dir %ld", obj(OBJ_PIN, map, in("fs/no/m"), 0, 0));
+    say("dot %ld", obj(OBJ_PIN, map, in("fs/."), 0, 0));
+    int pipes[2];
+    if (pipe(pipes)) return 1;
+    say("no map %ld, no descriptor %ld", obj(OBJ_PIN, pipes[0], in("fs/p"), 0, 0), obj(OBJ_PIN, 999, in("fs/p"), 0, 0));
+    say("pin flags %ld", obj(OBJ_PIN, map, in("fs/p"), F_RDONLY, 0));
+    say("path_fd alone %ld", obj(OBJ_PIN, map, in("fs/p"), 0, 3));
+    union attr a;
+    memset(&a, 0, sizeof a);
+    a.obj.pathname = (uintptr_t)in("fs/p");
+    a.obj.bpf_fd = (uint32_t)map;
+    a.bytes[20] = 1;
+    say("past path_fd %ld", bpf(OBJ_PIN, &a, sizeof a));
+    int dir = open(in("fs"), O_RDONLY | O_DIRECTORY);
+    say("relative %ld", obj(OBJ_PIN, map, "rel", F_PATH_FD, dir));
+    say("bad path_fd %ld", obj(OBJ_PIN, map, "rel2", F_PATH_FD, 999));
+
+    int got = (int)obj(OBJ_GET, 0, in("fs/m"), 0, 0);
+    say("get %d", got >= 0 ? 0 : got);
+    say("same map %d", id_of(got) == id);
+    r = elem(MAP_LOOKUP_ELEM, got, &key, &back, 0);
+    say("lookup %ld %llu", r, (unsigned long long)back);
+    int ro = (int)obj(OBJ_GET, 0, in("fs/m"), F_RDONLY, 0);
+    value = 7;
+    say("read-only get %d, update %ld", ro >= 0 ? 0 : ro, elem(MAP_UPDATE_ELEM, ro, &key, &value, ANY));
+    long relative = obj(OBJ_GET, 0, "rel", F_PATH_FD, dir);
+    say("relative get %ld", relative < 0 ? relative : 0L);
+    if (relative >= 0) close((int)relative);
+    say("get fd %ld, both %ld", obj(OBJ_GET, map, in("fs/m"), 0, 0), obj(OBJ_GET, 0, in("fs/m"), F_RDONLY | F_WRONLY, 0));
+    say("get dir %ld, plain %ld, none %ld, dotted %ld", obj(OBJ_GET, 0, in("fs"), 0, 0),
+        obj(OBJ_GET, 0, in("plain/file"), 0, 0), obj(OBJ_GET, 0, in("fs/none"), 0, 0),
+        obj(OBJ_GET, 0, in("fs/x.y"), 0, 0));
+
+    /* What its directories make. */
+    say("symlink %ld", TRY(symlink("m", in("fs/l"))));
+    long linked = obj(OBJ_GET, 0, in("fs/l"), 0, 0);
+    say("through link %ld", linked < 0 ? linked : 0L);
+    if (linked >= 0) close((int)linked);
+    say("link %ld", TRY(link(in("fs/m"), in("fs/m2"))));
+    say("rename %ld", TRY(rename(in("fs/m2"), in("fs/m3"))));
+    stat_of("linked", in("fs/m3"));
+    say("mkdir %ld", TRY(mkdir(in("fs/d"), 0755)));
+    stat_of("root now", in("fs"));
+    say("pin in dir %ld", obj(OBJ_PIN, map, in("fs/d/m"), 0, 0));
+    say("open %ld", TRY(open(in("fs/m"), O_RDONLY)));
+    long path = TRY(open(in("fs/m"), O_PATH));
+    say("open path %ld", path < 0 ? path : 0L);
+    if (path >= 0) close((int)path);
+    say("creat %ld", TRY(open(in("fs/f"), O_CREAT | O_WRONLY, 0644)));
+    say("tmpfile %ld", TRY(open(in("fs"), O_TMPFILE | O_WRONLY, 0644)));
+    say("fifo %ld, file %ld", TRY(mknod(in("fs/q"), S_IFIFO | 0644, 0)), TRY(mknod(in("fs/r"), S_IFREG | 0644, 0)));
+    say("dotted dir %ld", TRY(mkdir(in("fs/a.b"), 0755)));
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un sun = { .sun_family = AF_UNIX };
+    snprintf(sun.sun_path, sizeof sun.sun_path, "%s", in("fs/sock"));
+    say("bind %ld", TRY(bind(s, (struct sockaddr *)&sun, sizeof sun)));
+    say("chmod %ld", TRY(chmod(in("fs/m"), 0640)));
+    stat_of("chmod", in("fs/m"));
+
+    /* The map stays while a name holds it, and goes with the last. */
+    close(map);
+    close(got);
+    close(ro);
+    long kept = fd_by_id(id, 0);
+    say("kept %ld", kept >= 0 ? 0L : kept);
+    if (kept >= 0) close((int)kept);
+    say("unlink %ld %ld %ld %ld", TRY(unlink(in("fs/m"))), TRY(unlink(in("fs/m3"))), TRY(unlink(in("fs/rel"))),
+        TRY(unlink(in("fs/d/m"))));
+    say("gone %ld", fd_by_id(id, 0));
+
+    /* A remount changes the superblock's flags alone. */
+    say("remount %ld", TRY(mount(NULL, in("fs"), NULL, MS_REMOUNT | MS_RDONLY, "mode=0755")));
+    mountinfo("remounted", in("fs"));
+    map = make(TYPE_ARRAY, 4, 8, 4, 0);
+    say("read-only pin %ld", obj(OBJ_PIN, map, in("fs/n"), 0, 0));
+
+    /* Delegation, by name and by number. */
+    say("delegate %ld", TRY(mount("none", in("other"), "bpf", 0,
+                                  "delegate_cmds=MAP_CREATE:prog_load,delegate_maps=array:hash,"
+                                  "delegate_progs=any,delegate_attachs=0x3")));
+    mountinfo("delegated", in("other"));
+    say("unknown name %ld", TRY(mount("none", in("plain"), "bpf", 0, "delegate_cmds=nothing")));
+    say("empty %ld", TRY(mount("none", in("plain"), "bpf", 0, "delegate_maps=")));
+    say("too big %ld", TRY(mount("none", in("plain"), "bpf", 0, "delegate_progs=0x10000000000000000")));
+    say("bad uid %ld", TRY(mount("none", in("plain"), "bpf", 0, "uid=x")));
+
+    /* The new mount API. */
+    long fsfd = syscall(430, "bpf", 0);
+    say("fsopen %ld", fsfd < 0 ? -errno : 0L);
+    long set = syscall(431, (int)fsfd, 1, "uid", "x", 0);
+    say("fsconfig uid %ld", set < 0 ? -errno : set);
+    char message[256] = "";
+    long n = read((int)fsfd, message, sizeof message - 1);
+    if (n > 0) message[n] = 0;
+    say("log %s", n > 0 ? message : "none");
+    set = syscall(431, (int)fsfd, 1, "mode", "0750", 0);
+    say("fsconfig mode %ld", set < 0 ? -errno : set);
+    set = syscall(431, (int)fsfd, 6, NULL, NULL, 0);
+    say("create %ld", set < 0 ? -errno : set);
+    long mfd = syscall(432, (int)fsfd, 0, 0);
+    say("fsmount %ld", mfd < 0 ? -errno : 0L);
+    if (mfd >= 0) {
+        r = TRY(fstatfs((int)mfd, &sf));
+        struct stat st;
+        fstat((int)mfd, &st);
+        say("detached statfs %ld type %lx, root mode %o", r, (long)sf.f_type, st.st_mode);
+    }
+    long other = syscall(430, "bpff", 0);
+    say("fsopen other %ld", other < 0 ? -errno : 0L);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1721,5 +1928,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-maps")) return case_maps();
     if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
     if (!strcmp(mode, "bpf-mmap")) return case_mmap();
+    if (!strcmp(mode, "bpf-pin")) return case_pin();
     return 2;
 }

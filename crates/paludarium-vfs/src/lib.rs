@@ -108,6 +108,8 @@ pub fn normalize_in(root: &[u8], path: &[u8]) -> Result<Vec<u8>, Errno> {
 }
 /// `TMPFS_MAGIC`: what the in-memory filesystem calls itself.
 pub const TMPFS_MAGIC: u64 = 0x0102_1994;
+/// `BPF_FS_MAGIC`: what a BPF file system calls itself.
+pub const BPF_FS_MAGIC: u64 = 0xcafe_4a11;
 /// The size the in-memory filesystem reports, the memory `sysinfo` reports.
 pub const MEMORY_BYTES: u64 = 4 << 30;
 const BLOCK: u64 = 4096;
@@ -323,6 +325,10 @@ enum Kind {
     /// as `bind` of an AF_UNIX socket to a path makes one, or a FIFO, as
     /// `mknod` makes one.
     Special,
+    /// A regular file that holds a kernel object instead of contents, as a
+    /// BPF file system's file holds the map pinned there (its `i_private`):
+    /// the object goes with the node's last link (`bpf_destroy_inode`).
+    Object(Arc<dyn std::any::Any + Send + Sync>),
 }
 struct Node {
     kind: Kind,
@@ -394,7 +400,7 @@ impl Node {
             size: match &self.kind {
                 Kind::File(contents) => contents.len(),
                 Kind::Symlink(b) => b.len() as u64,
-                Kind::Dir(_) | Kind::Special => 0,
+                Kind::Dir(_) | Kind::Special | Kind::Object(_) => 0,
             },
             blocks: match &self.kind {
                 Kind::File(contents) => Some(contents.blocks()),
@@ -417,7 +423,7 @@ impl Node {
                 f(&mut self.attributes);
                 Ok(())
             }
-            Kind::Symlink(_) | Kind::Special => Err(Errno::EOPNOTSUPP),
+            Kind::Symlink(_) | Kind::Special | Kind::Object(_) => Err(Errno::EOPNOTSUPP),
         }
     }
 }
@@ -631,6 +637,43 @@ impl Default for MemFs {
     }
 }
 impl MemFs {
+    /// Another handle on the same files, as a superblock keeps of its tree.
+    #[must_use]
+    pub fn shared(&self) -> Self {
+        Self {
+            tree: Arc::clone(&self.tree),
+        }
+    }
+    /// Makes a regular file of mode `mode` at `path` that holds `object`,
+    /// as `vfs_mkobj` makes a BPF file system's file of what is pinned
+    /// there: `EEXIST` when something is there, `ENOENT` or `ENOTDIR` when
+    /// its directory is not.
+    pub fn make_object(
+        &self,
+        path: &[u8],
+        mode: u32,
+        object: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<FileStat, Errno> {
+        let mut t = lock(&self.tree);
+        let id = t.insert(path, Kind::Object(object), 0o100000 | (mode & 0o7777))?;
+        Ok(lock(&*t.node(id)?).stat(id))
+    }
+    /// The object the file at `path` holds ([`Self::make_object`]), its
+    /// last component followed if `follow`; `None` for another file.
+    pub fn object(
+        &self,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Errno> {
+        let t = lock(&self.tree);
+        let id = t.resolve(path, follow)?;
+        let node = t.node(id)?;
+        let n = lock(&node);
+        Ok(match &n.kind {
+            Kind::Object(object) => Some(Arc::clone(object)),
+            _ => None,
+        })
+    }
     /// Typed realtime clock used for created and modified files. The default
     /// preserves deterministic epoch metadata for existing standalone callers.
     pub fn with_clock(clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>) -> Self {
@@ -708,9 +751,9 @@ pub use mount::MountedFs;
 
 mod namespace;
 pub use namespace::{
-    FIRST_NAMESPACE_ID, GeneratedSource, InUse, MountChange, MountHook, MountPin, MountTable,
-    NamespacedFs, NewTmpfs, Propagation, Reach, ReleaseHook, Settings, SuperblockHook, Target,
-    UNIQUE_OFFSET, keeping_expiry, mount_flags,
+    FIRST_NAMESPACE_ID, GeneratedSource, InUse, MemoryAt, MountChange, MountHook, MountPin,
+    MountTable, NamespacedFs, NewTmpfs, Propagation, Reach, ReleaseHook, Settings, SuperblockHook,
+    Target, UNIQUE_OFFSET, keeping_expiry, mount_flags,
 };
 
 mod open_file;

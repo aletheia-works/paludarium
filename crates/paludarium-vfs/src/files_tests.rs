@@ -474,3 +474,30 @@ fn memory_path_finds_a_linked_file_the_guest_reaches() {
     assert_eq!(mounted.memory_path(b"/a/x/y", inode), None);
     assert_eq!(mounted.memory_path(b"/", 99), None);
 }
+#[test]
+fn an_object_file_holds_its_object_until_its_last_name_goes() {
+    let fs = MemFs::new();
+    let object: Arc<dyn std::any::Any + Send + Sync> = Arc::new(7u32);
+    let made = fs.make_object(b"/o", 0o640, Arc::clone(&object)).unwrap();
+    assert_eq!((made.mode, made.size, made.links), (0o100640, 0, 1));
+    assert_eq!(
+        fs.make_object(b"/o", 0o600, Arc::clone(&object)).err(),
+        Some(Errno::EEXIST)
+    );
+    let held = fs.object(b"/o", false).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&held, &object));
+    drop(held);
+    // It opens as a path alone, and nothing else is one.
+    assert_eq!(fs.open(b"/o", 0, 0).err(), Some(Errno::EIO));
+    assert!(fs.open(b"/o", 0o10000000, 0).is_ok());
+    fs.mkdir(b"/d", 0o755).unwrap();
+    assert!(fs.object(b"/d", false).unwrap().is_none());
+    fs.symlink(b"o", b"/l").unwrap();
+    assert!(fs.object(b"/l", true).unwrap().is_some());
+    assert!(fs.object(b"/l", false).unwrap().is_none());
+    fs.link(b"/o", b"/p").unwrap();
+    fs.unlink(b"/o", false).unwrap();
+    assert_eq!(Arc::strong_count(&object), 2);
+    fs.unlink(b"/p", false).unwrap();
+    assert_eq!(Arc::strong_count(&object), 1);
+}

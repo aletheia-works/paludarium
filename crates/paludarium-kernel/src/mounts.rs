@@ -18,8 +18,9 @@
 //! passed: `MS_NOSYMFOLLOW` on a tmpfs or set by a remount, a mount on or a
 //! move of `/proc` or `/dev`, which the kernel generates (a bind mount of a
 //! file or a directory there shows it), and a move of a mount from start-up
-//! that the lower filesystem shows. Any other file system type is `ENODEV`,
-//! as from a kernel without it.
+//! that the lower filesystem shows. It also makes BPF file systems
+//! ([`bpffs`]). Any other file system type is `ENODEV`, as from a kernel
+//! without it.
 //!
 //! `umount2` unmounts the mounts `mount` made, and the old root after a
 //! `pivot_root`; a mount from start-up (the root, a `--mount` directory)
@@ -33,6 +34,7 @@ use paludarium_vfs::{MemFs, NewTmpfs, Propagation, Settings, Target, mount_flags
 use crate::namespaces::Namespace;
 use crate::syscalls::{Context, Outcome};
 
+mod bpffs;
 mod context;
 pub(crate) use context::{FsContext, sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick};
 mod listing;
@@ -845,6 +847,25 @@ fn remount_bind(c: &Context<'_>, found: &Target, flags: u32, ns: &Namespace) -> 
     Ok(0)
 }
 
+/// A common superblock flag (`vfs_parse_sb_flag`): the flags `key` sets
+/// and clears, none for another key.
+fn common_flag(key: &[u8]) -> Option<(u64, u64)> {
+    let set = |flag: u64| (flag, 0);
+    let clear = |flag: u64| (0, flag);
+    match key {
+        b"dirsync" => Some(set(MS_DIRSYNC)),
+        b"lazytime" => Some(set(MS_LAZYTIME)),
+        b"mand" => Some(set(MS_MANDLOCK)),
+        b"ro" => Some(set(MS_RDONLY)),
+        b"sync" => Some(set(MS_SYNCHRONOUS)),
+        b"async" => Some(clear(MS_SYNCHRONOUS)),
+        b"nolazytime" => Some(clear(MS_LAZYTIME)),
+        b"nomand" => Some(clear(MS_MANDLOCK)),
+        b"rw" => Some(clear(MS_RDONLY)),
+        _ => None,
+    }
+}
+
 /// The superblock's options as `show_sb_opts` shows them.
 fn common_options(sb_flags: u64) -> String {
     [
@@ -890,6 +911,12 @@ fn remount(
         };
         if found.kind == "tmpfs" {
             asked.parse(c, key, Value::of(value))?;
+        } else if found.kind == bpffs::KIND {
+            // A BPF file system parses its options into a context
+            // `reconfigure_super` drops, having no `reconfigure` of its own.
+            if !asked.parse_common(key) {
+                bpffs::Bpffs::fresh(c, None).parse(c, key, Value::of(value))?;
+            }
         } else if !asked.parse_common(key) {
             return Err(Errno::EINVAL);
         }
@@ -937,6 +964,12 @@ fn reconfigure_superblock(
             let Some((settings, used, files)) = old else {
                 return Ok(None);
             };
+            // A BPF file system's superblock changes its flags alone.
+            if let Some(old) = settings.parsed.downcast_ref::<bpffs::Bpffs>() {
+                let mut new = old.clone();
+                new.sb_flags = old.sb_flags & !mask | requested & mask;
+                return Ok(Some(new.settings()));
+            }
             let Some(old) = settings.parsed.downcast_ref::<Tmpfs>() else {
                 return Ok(None);
             };
@@ -1194,21 +1227,7 @@ impl Tmpfs {
     }
     /// A common superblock flag (`vfs_parse_sb_flag`), if `key` is one.
     fn parse_common(&mut self, key: &[u8]) -> bool {
-        let set = |flag: u64| (flag, 0);
-        let clear = |flag: u64| (0, flag);
-        let common = match key {
-            b"dirsync" => Some(set(MS_DIRSYNC)),
-            b"lazytime" => Some(set(MS_LAZYTIME)),
-            b"mand" => Some(set(MS_MANDLOCK)),
-            b"ro" => Some(set(MS_RDONLY)),
-            b"sync" => Some(set(MS_SYNCHRONOUS)),
-            b"async" => Some(clear(MS_SYNCHRONOUS)),
-            b"nolazytime" => Some(clear(MS_LAZYTIME)),
-            b"nomand" => Some(clear(MS_MANDLOCK)),
-            b"rw" => Some(clear(MS_RDONLY)),
-            _ => None,
-        };
-        let Some((on, off)) = common else {
+        let Some((on, off)) = common_flag(key) else {
             return false;
         };
         self.sb_set = (self.sb_set | on) & !off;
@@ -1514,7 +1533,8 @@ fn split_options(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// `do_new_mount`: a type (`EINVAL` for none), one this kernel has
-/// (`ENODEV` for any but `tmpfs`), its options (`EINVAL`), and
+/// (`ENODEV` for any but `tmpfs` and `bpf`, [`new_bpffs`]), its options
+/// (`EINVAL`), and
 /// CAP_SYS_ADMIN in the caller's user namespace (`mount_capable`, as tmpfs
 /// is `FS_USERNS_MOUNT`). Its root is a directory of mode 01777 owned by
 /// the caller's filesystem IDs, unless `mode`, `uid` and `gid` say
@@ -1529,6 +1549,9 @@ fn new_tmpfs(
     mount_flags: u32,
 ) -> Result<NewTmpfs, Errno> {
     let kind = kind.ok_or(Errno::EINVAL)?;
+    if kind == bpffs::KIND.as_bytes() {
+        return new_bpffs(c, source, data, sb_flags, mount_flags);
+    }
     if kind != b"tmpfs" {
         return Err(ENODEV);
     }
@@ -1544,6 +1567,29 @@ fn new_tmpfs(
         return Err(Errno::EPERM);
     }
     built_tmpfs(c, options, sb_flags, mount_flags)
+}
+/// `do_new_mount` of a BPF file system: its options (`bpf_parse_param`,
+/// after the common superblock flags), CAP_SYS_ADMIN in the caller's user
+/// namespace (`mount_capable`, as it is `FS_USERNS_MOUNT`), then
+/// `bpf_fill_super`.
+fn new_bpffs(
+    c: &Context<'_>,
+    source: Option<Vec<u8>>,
+    data: Option<&[u8]>,
+    sb_flags: u64,
+    mount_flags: u32,
+) -> Result<NewTmpfs, Errno> {
+    let mut options = bpffs::Bpffs::fresh(c, source);
+    for option in data.map(split_options).unwrap_or_default() {
+        let Some((key, value)) = option_pair(option) else {
+            continue;
+        };
+        options.parse(c, key, Value::of(value))?;
+    }
+    if !c.process.credentials.administers_own() {
+        return Err(Errno::EPERM);
+    }
+    options.built(c, sb_flags, mount_flags)
 }
 /// The tmpfs on `/dev/shm` from start-up, as systemd mounts it
 /// (`mount_setup`): `mode=01777`, `nosuid`, `nodev` and `strictatime`, its
@@ -1580,6 +1626,7 @@ pub(crate) fn device_shm(clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync
         flags: mnt::NOSUID | mnt::NODEV,
         source: b"tmpfs".to_vec(),
         owner: None,
+        kind: "tmpfs",
     }
 }
 /// The new tmpfs `shmem_fill_super` makes of `options`, with the
@@ -1608,6 +1655,7 @@ fn built_tmpfs(
         flags: mount_flags,
         source,
         owner: Some(Arc::clone(&creds.user.0) as Arc<dyn std::any::Any + Send + Sync>),
+        kind: "tmpfs",
     })
 }
 

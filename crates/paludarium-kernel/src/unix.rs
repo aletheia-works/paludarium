@@ -517,6 +517,10 @@ impl UnixSocket {
         // Landlock's MAKE_SOCK on its directory, for a name not there yet.
         if c.files.fs().metadata(&full, false).is_err() {
             crate::files::landlock_name(c, &full, crate::landlock::MAKE_SOCK)?;
+            // A BPF file system's directory has no `mknod`.
+            if crate::bpf_fs::makes_no_files(c, &full) {
+                return Err(Errno::EPERM);
+            }
         }
         let stat = c
             .files

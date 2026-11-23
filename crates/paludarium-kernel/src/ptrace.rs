@@ -486,6 +486,14 @@ impl Traces {
     pub(crate) fn in_stop(&self, tid: u32) -> bool {
         self.lock().get(&tid).is_some_and(|t| t.stop.is_some())
     }
+    /// The `exit_code` of task `tid`'s ptrace stop, until a wait reports
+    /// it; 0 when it is in none or it was reported.
+    pub(crate) fn stop_code(&self, tid: u32) -> i32 {
+        self.lock()
+            .get(&tid)
+            .and_then(|t| t.stop.as_ref())
+            .map_or(0, |stop| stop.code)
+    }
     /// Whether the exit of process `pid`, traced by another process, waits
     /// for its tracer (Linux's `EXIT_TRACE` zombie).
     pub(crate) fn holds_exit(&self, pid: u32, parent: u32) -> bool {

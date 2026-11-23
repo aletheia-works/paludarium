@@ -14,7 +14,19 @@
 //! - with `allow_ptr_leaks`, master makes a number of a pointer that a
 //!   multiplication, a shift or a bitwise operation is applied to, where
 //!   7.0 refuses it;
-//! - master takes an exit whose `src_reg` is `BPF_UNWIND_EXIT`.
+//! - master takes an exit whose `src_reg` is `BPF_UNWIND_EXIT`;
+//! - with no BTF, master takes `BPF_LD_ABS`, `BPF_LD_IND` and
+//!   `bpf_tail_call` in a function other than the main program, where 7.0
+//!   refuses them (`check_abnormal_return`);
+//! - master refuses a recursive call before the walk ("recursive call from
+//!   %s() to %s()", `sort_subprogs_topo`, `EINVAL`), where 7.0 and the test
+//!   machines' kernel refuse it as the walk goes 9 frames deep (`E2BIG`),
+//!   which is what is done here, as the differential tests compare it with
+//!   that kernel; master's check comes once that kernel has it.
+//!
+//! Every function is static, as no program here has BTF: a call gives the
+//! callee a frame of its own, up to 8 frames, whose stacks add up to 512
+//! bytes, each rounded up to 16 as with the JIT the test machines run.
 //!
 //! The log lines are 7.0's where the two kernels word them differently
 //! (the misaligned stack access, a sleepable program), as the differential
@@ -45,13 +57,13 @@
 //!   node, the current task's IDs), the map helpers of maps of maps,
 //!   queues, stacks and bloom filters, a helper's size argument whose value
 //!   is not known here, `bpf_get_netns_cookie` of a scalar not known to be
-//!   0, bpf-to-bpf calls and kfuncs, the context's socket pointer
+//!   0, kfuncs, the context's socket pointer
 //!   (`__sk_buff.sk`) and a map's own fields (`struct bpf_map`), maps from
 //!   `fd_array` and maps made with `excl_prog_hash`, BTF IDs and functions
-//!   in `BPF_LD_IMM64`, `may_goto`, indirect jumps, a back-edge (Linux
-//!   takes a bounded loop from a privileged loader), a pointer with a
-//!   variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a conditional
-//!   jump.
+//!   in `BPF_LD_IMM64` (and so callbacks), `may_goto`, indirect jumps, a
+//!   back-edge (Linux takes a bounded loop from a privileged loader), a
+//!   pointer with a variable offset, and
+//!   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump.
 //! - The loader has `CAP_BPF` and `CAP_PERFMON` ([`crate::bpf_prog`]
 //!   refuses others), so the verifier allows what Linux allows them:
 //!   pointer leaks, uninitialized stack reads and no Spectre sanitizing.
@@ -283,6 +295,7 @@ const F_WRONLY_PROG: u32 = 1 << 8;
 /// The helpers in range, `enum bpf_func_id`.
 mod func {
     pub const MAP_LOOKUP_ELEM: i32 = 1;
+    pub const TAIL_CALL: i32 = 12;
     pub const MAP_UPDATE_ELEM: i32 = 2;
     pub const MAP_DELETE_ELEM: i32 = 3;
     pub const KTIME_GET_NS: i32 = 5;
@@ -430,8 +443,11 @@ fn context_field(off: i64, size: i64, write: bool) -> Option<Field> {
 pub(crate) struct Verified {
     /// `insn_processed`, which fdinfo's `verified_insns` gives.
     pub(crate) processed: u32,
-    /// The stack the program uses, in bytes, rounded up to 8.
-    pub(crate) stack_depth: u32,
+    /// The stack each function uses (`stack_depth`), in bytes, rounded up
+    /// to 8, the main program's first.
+    pub(crate) stack_depth: Vec<u32>,
+    /// `max_stack_depth`: the most stack a chain of calls takes.
+    pub(crate) max_stack_depth: u32,
     /// The maps the program uses (`used_maps`), by ID.
     pub(crate) maps: Vec<u32>,
     /// Each `BPF_LD_IMM64` of a map: the map's index in `maps`, and the
@@ -446,7 +462,8 @@ pub(crate) struct Rejection {
     pub(crate) line: String,
     /// `insn_processed` when it was refused.
     pub(crate) processed: u32,
-    pub(crate) stack_depth: u32,
+    pub(crate) stack_depth: Vec<u32>,
+    pub(crate) max_stack_depth: u32,
 }
 
 type Checked<T> = Result<T, (Errno, String)>;
@@ -480,12 +497,18 @@ pub(crate) fn check(
 ) -> Result<Verified, Rejection> {
     debug_assert!(!insns.is_empty() && !ends_in_half(insns));
     let mut walk = Walk::default();
-    let result = structure(insns, options, maps, &mut walk).and_then(|()| walk.run(insns, options));
-    let stack_depth = walk.depth.div_ceil(8) * 8;
+    let result = structure(insns, options, maps, &mut walk)
+        .and_then(|()| walk.run(insns, options))
+        .and_then(|()| walk.max_stack_depth(insns));
+    let mut stack_depth: Vec<u32> = walk.depth.iter().map(|d| d.div_ceil(8) * 8).collect();
+    if stack_depth.is_empty() {
+        stack_depth.push(0);
+    }
     match result {
         Ok(()) => Ok(Verified {
             processed: walk.processed,
             stack_depth,
+            max_stack_depth: walk.max_depth,
             maps: walk.maps.iter().map(|m| m.id).collect(),
             loads: std::mem::take(&mut walk.loads),
         }),
@@ -494,6 +517,7 @@ pub(crate) fn check(
             line,
             processed: walk.processed,
             stack_depth,
+            max_stack_depth: walk.max_depth,
         }),
     }
 }
@@ -505,18 +529,19 @@ fn structure(
     maps: &mut Maps<'_>,
     walk: &mut Walk,
 ) -> Checked<()> {
-    // add_subprogs, add_kfuncs: one function, calling no other.
+    // add_subprogs, then kfuncs and references to functions.
+    walk.starts = add_subprogs(insns)?;
+    walk.depth = vec![0; walk.starts.len()];
     for insn in insns {
-        if insn.code == class::JMP | jmp::CALL
-            && matches!(insn.src, pseudo::CALL | pseudo::KFUNC_CALL)
-        {
-            return gap("bpf-to-bpf calls and kfuncs");
+        if insn.code == class::JMP | jmp::CALL && insn.src == pseudo::KFUNC_CALL {
+            return gap("kfuncs");
         }
         if insn.ldimm64() && insn.src == pseudo::FUNC {
             return gap("references to functions");
         }
     }
-    subprogs(insns)?;
+    subprogs(insns, &walk.starts)?;
+    abnormal_return(insns, &walk.starts)?;
     let mut i = 0;
     while i < insns.len() {
         // A BPF_LD_IMM64's second half is checked with its first.
@@ -540,27 +565,93 @@ fn structure(
     Ok(())
 }
 
-/// `check_subprogs` of the one function: jumps stay in it, and its last
-/// instruction is an exit or a jump.
-fn subprogs(insns: &[Insn]) -> Checked<()> {
-    let n = insns.len() as i64;
+/// `BPF_MAX_SUBPROGS`.
+const MAX_SUBPROGS: usize = 256;
+/// `MAX_CALL_FRAMES`.
+const MAX_CALL_FRAMES: usize = 8;
+
+/// `add_subprogs`: where each function starts, in order, the main
+/// program's at 0 and one at each target of a `BPF_PSEUDO_CALL`. The
+/// loader has `CAP_BPF`.
+fn add_subprogs(insns: &[Insn]) -> Checked<Vec<usize>> {
+    let mut starts = vec![0];
     for (i, insn) in insns.iter().enumerate() {
-        if insn.jumps() && !matches!(insn.op(), jmp::CALL | jmp::EXIT) {
-            let to = i as i64 + insn.jump() + 1;
-            if to < 0 || to >= n {
-                return refuse(
-                    Errno::EINVAL,
-                    format!("jump out of range from insn {i} to {to}"),
-                );
+        if insn.code != class::JMP | jmp::CALL || insn.src != pseudo::CALL {
+            continue;
+        }
+        let to = i as i64 + i64::from(insn.imm) + 1;
+        if to < 0 || to >= insns.len() as i64 {
+            return refuse(Errno::EINVAL, "call to invalid destination");
+        }
+        let to = to as usize;
+        if let Err(at) = starts.binary_search(&to) {
+            if starts.len() >= MAX_SUBPROGS {
+                return refuse(E2BIG, "too many subprograms");
             }
+            starts.insert(at, to);
         }
     }
-    let last = insns[insns.len() - 1].code;
-    if last != class::JMP | jmp::EXIT
-        && last != class::JMP32 | jmp::JA
-        && last != class::JMP | jmp::JA
-    {
-        return refuse(Errno::EINVAL, "last insn is not an exit or jmp");
+    Ok(starts)
+}
+
+/// The instructions of function `f`.
+fn body(starts: &[usize], n: usize, f: usize) -> std::ops::Range<usize> {
+    starts[f]..starts.get(f + 1).copied().unwrap_or(n)
+}
+
+/// `check_subprogs`: jumps stay in their function, and each function's
+/// last instruction is an exit or a jump.
+fn subprogs(insns: &[Insn], starts: &[usize]) -> Checked<()> {
+    for f in 0..starts.len() {
+        let range = body(starts, insns.len(), f);
+        for i in range.clone() {
+            let insn = insns[i];
+            if insn.jumps() && !matches!(insn.op(), jmp::CALL | jmp::EXIT) {
+                let to = i as i64 + insn.jump() + 1;
+                if to < range.start as i64 || to >= range.end as i64 {
+                    return refuse(
+                        Errno::EINVAL,
+                        format!("jump out of range from insn {i} to {to}"),
+                    );
+                }
+            }
+        }
+        let last = insns[range.end - 1].code;
+        if last != class::JMP | jmp::EXIT
+            && last != class::JMP32 | jmp::JA
+            && last != class::JMP | jmp::JA
+        {
+            return refuse(Errno::EINVAL, "last insn is not an exit or jmp");
+        }
+    }
+    Ok(())
+}
+
+/// 7.0's `check_abnormal_return`, which `check_btf_func` makes of a
+/// program with no `func_info`, as every program is here: no function but
+/// the main program may use `BPF_LD_ABS` or `BPF_LD_IND`, or call
+/// `bpf_tail_call`. Master takes them.
+fn abnormal_return(insns: &[Insn], starts: &[usize]) -> Checked<()> {
+    for f in 1..starts.len() {
+        let body = &insns[body(starts, insns.len(), f)];
+        if body
+            .iter()
+            .any(|i| i.class() == class::LD && matches!(i.mode(), mode::ABS | mode::IND))
+        {
+            return refuse(
+                Errno::EINVAL,
+                "LD_ABS is not allowed in subprogs without BTF",
+            );
+        }
+        if body
+            .iter()
+            .any(|i| i.code == class::JMP | jmp::CALL && i.src == 0 && i.imm == func::TAIL_CALL)
+        {
+            return refuse(
+                Errno::EINVAL,
+                "tail_call is not allowed in subprogs without BTF",
+            );
+        }
     }
     Ok(())
 }
@@ -846,42 +937,65 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
     let mut state = vec![0u8; n];
     let mut stack = vec![0usize];
     state[0] = DISCOVERED;
-    let push =
-        |state: &mut Vec<u8>, stack: &mut Vec<usize>, t: usize, w: i64, e: u8| -> Checked<Next> {
-            if state[t] >= DISCOVERED | e {
-                return Ok(Next::Done);
-            }
-            if w < 0 || w >= n as i64 {
-                return refuse(
-                    Errno::EINVAL,
-                    format!("jump out of range from insn {t} to {w}"),
-                );
-            }
-            let w = w as usize;
-            if state[w] == 0 {
-                state[t] = DISCOVERED | e;
-                state[w] = DISCOVERED;
-                stack.push(w);
-                Ok(Next::Keep)
-            } else if state[w] & 0xf0 == DISCOVERED {
-                // Linux takes the back-edge from a privileged loader and checks
-                // the loop as it walks it; it is not walked here.
-                refuse(Errno::EINVAL, format!("back-edge from insn {t} to {w}"))
-            } else {
-                state[t] = DISCOVERED | e;
-                Ok(Next::Done)
-            }
-        };
+    // A call's edge to its function may reach one the walk is in: that is
+    // recursion, which the walk refuses as it goes 9 frames deep.
+    let push = |state: &mut Vec<u8>,
+                stack: &mut Vec<usize>,
+                t: usize,
+                w: i64,
+                e: u8,
+                call: bool|
+     -> Checked<Next> {
+        if state[t] >= DISCOVERED | e {
+            return Ok(Next::Done);
+        }
+        if w < 0 || w >= n as i64 {
+            return refuse(
+                Errno::EINVAL,
+                format!("jump out of range from insn {t} to {w}"),
+            );
+        }
+        let w = w as usize;
+        if state[w] == 0 {
+            state[t] = DISCOVERED | e;
+            state[w] = DISCOVERED;
+            stack.push(w);
+            Ok(Next::Keep)
+        } else if state[w] & 0xf0 == DISCOVERED && call {
+            Ok(Next::Done)
+        } else if state[w] & 0xf0 == DISCOVERED {
+            // Linux takes the back-edge from a privileged loader and checks
+            // the loop as it walks it; it is not walked here.
+            refuse(Errno::EINVAL, format!("back-edge from insn {t} to {w}"))
+        } else {
+            state[t] = DISCOVERED | e;
+            Ok(Next::Done)
+        }
+    };
     while let Some(&t) = stack.last() {
         let insn = insns[t];
         let t64 = t as i64;
         let next = if !insn.jumps() {
             let width = if insn.ldimm64() { 2 } else { 1 };
-            push(&mut state, &mut stack, t, t64 + width, FALLTHROUGH)?
+            push(&mut state, &mut stack, t, t64 + width, FALLTHROUGH, false)?
         } else {
             match insn.op() {
                 jmp::EXIT => Next::Done,
-                jmp::CALL => push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH)?,
+                // visit_func_call_insn: after the call, then the function.
+                jmp::CALL if insn.src == pseudo::CALL => {
+                    match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)? {
+                        Next::Keep => Next::Keep,
+                        Next::Done => push(
+                            &mut state,
+                            &mut stack,
+                            t,
+                            t64 + i64::from(insn.imm) + 1,
+                            BRANCH,
+                            true,
+                        )?,
+                    }
+                }
+                jmp::CALL => push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)?,
                 jmp::JA if insn.x() => return gap("indirect jumps"),
                 jmp::JA => push(
                     &mut state,
@@ -889,8 +1003,9 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
                     t,
                     t64 + insn.jump() + 1,
                     FALLTHROUGH,
+                    false,
                 )?,
-                _ => match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH)? {
+                _ => match push(&mut state, &mut stack, t, t64 + 1, FALLTHROUGH, false)? {
                     Next::Keep => Next::Keep,
                     Next::Done => push(
                         &mut state,
@@ -898,6 +1013,7 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
                         t,
                         t64 + i64::from(insn.off) + 1,
                         BRANCH,
+                        false,
                     )?,
                 },
             }
@@ -940,8 +1056,9 @@ enum Reg {
 enum Ptr {
     /// `PTR_TO_CTX`, the `struct __sk_buff` R1 starts with.
     Ctx,
-    /// `PTR_TO_STACK`, from the frame pointer.
-    Stack,
+    /// `PTR_TO_STACK`, from the frame pointer of the frame of this number
+    /// (`frameno`, 0 the main program's).
+    Stack(u8),
     /// `CONST_PTR_TO_MAP`, the map of an index into `used_maps`.
     Map(u8),
     /// `PTR_TO_MAP_VALUE`, into a value of the map.
@@ -956,7 +1073,7 @@ impl Ptr {
     fn name(self) -> &'static str {
         match self {
             Ptr::Ctx => "ctx",
-            Ptr::Stack => "fp",
+            Ptr::Stack(_) => "fp",
             Ptr::Map(_) => "map_ptr",
             Ptr::Value(_) => "map_value",
             Ptr::MaybeNull(..) => "map_value_or_null",
@@ -982,16 +1099,46 @@ enum Slot {
     Spill(Reg),
 }
 
+/// A frame's 512-byte stack, by 8-byte slot from the frame pointer down.
+type Stack = [Slot; (MAX_STACK / 8) as usize];
+
+/// A frame below the current one: the caller's registers as the call
+/// left them, its stack, its function and where it goes on.
+#[derive(Clone)]
+struct Caller {
+    regs: [Reg; REGS],
+    stack: Stack,
+    subprog: usize,
+    ret: usize,
+}
+
+/// A path's state (`bpf_verifier_state`): the current frame's registers,
+/// stack and function, and the frames of its callers, as many as its
+/// number (`curframe`).
 #[derive(Clone)]
 struct State {
     insn: usize,
     regs: [Reg; REGS],
-    stack: [Slot; (MAX_STACK / 8) as usize],
+    stack: Stack,
+    subprog: usize,
+    callers: Vec<Caller>,
 }
 
 impl State {
+    /// The current frame's number.
+    fn frame(&self) -> u8 {
+        self.callers.len() as u8
+    }
+    /// The stack of frame `frame` and its function.
+    fn stack_of(&mut self, frame: u8) -> (&mut Stack, usize) {
+        match self.callers.get_mut(usize::from(frame)) {
+            Some(caller) => (&mut caller.stack, caller.subprog),
+            None => (&mut self.stack, self.subprog),
+        }
+    }
     /// `mark_ptr_or_null_regs`: every copy of the lookup's result `id`, in
-    /// a register or spilled, is 0 (a scalar) or a pointer to a value.
+    /// a register or spilled, in any frame, is 0 (a scalar) or a pointer to
+    /// a value.
     fn null_check(&mut self, id: u32, null: bool) {
         let mark = |reg: &mut Reg| {
             if let Reg::Ptr(Ptr::MaybeNull(map, i), _) = *reg
@@ -1004,10 +1151,17 @@ impl State {
                 };
             }
         };
-        self.regs.iter_mut().for_each(mark);
-        for slot in &mut self.stack {
-            if let Slot::Spill(reg) = slot {
-                mark(reg);
+        let frames = std::iter::once((&mut self.regs, &mut self.stack)).chain(
+            self.callers
+                .iter_mut()
+                .map(|caller| (&mut caller.regs, &mut caller.stack)),
+        );
+        for (regs, stack) in frames {
+            regs.iter_mut().for_each(mark);
+            for slot in stack.iter_mut() {
+                if let Slot::Spill(reg) = slot {
+                    mark(reg);
+                }
             }
         }
     }
@@ -1055,8 +1209,15 @@ enum Step {
 struct Walk {
     /// `insn_processed`.
     processed: u32,
-    /// The deepest stack byte accessed.
-    depth: u32,
+    /// Where each function starts (`subprog_info`), the main program's
+    /// first.
+    starts: Vec<usize>,
+    /// The deepest stack byte each function's frames accessed
+    /// (`stack_depth`).
+    depth: Vec<u32>,
+    /// The deepest chain of calls' stack, each function's rounded up to 16
+    /// (`max_stack_depth`), once `check_max_stack_depth` has run.
+    max_depth: u32,
     /// `used_maps`.
     maps: Vec<MapShape>,
     /// Each BPF_LD_IMM64 of a map: its index in `maps`, and the offset in
@@ -1123,11 +1284,13 @@ impl Walk {
     fn run(&mut self, insns: &[Insn], options: Options) -> Checked<()> {
         let mut regs = [Reg::NotInit; REGS];
         regs[1] = Reg::Ptr(Ptr::Ctx, 0);
-        regs[FP] = Reg::Ptr(Ptr::Stack, 0);
+        regs[FP] = Reg::Ptr(Ptr::Stack(0), 0);
         let mut state = State {
             insn: 0,
             regs,
             stack: [Slot::Bytes; (MAX_STACK / 8) as usize],
+            subprog: 0,
+            callers: Vec::new(),
         };
         let mut pending: Vec<State> = Vec::new();
         loop {
@@ -1357,7 +1520,7 @@ impl Walk {
         };
         let reg = s.regs[usize::from(ptr)];
         match reg {
-            Reg::Ptr(Ptr::Stack, base) => {
+            Reg::Ptr(Ptr::Stack(frame), base) => {
                 let total = i64::from(base) + i64::from(off);
                 // check_ptr_alignment: stack accesses are always strict.
                 if bytes > 1 && total % bytes != 0 {
@@ -1383,15 +1546,17 @@ impl Walk {
                         format!("invalid{what} stack R{ptr} off={total} size={bytes}"),
                     );
                 }
-                self.depth = self.depth.max((-total) as u32);
+                let caller = frame != s.frame();
+                let (stack, subprog) = s.stack_of(frame);
+                self.deepen(subprog, -total);
                 let slot = ((-total - 1) / 8) as usize;
                 let aligned = total % 8 == 0;
                 match value {
                     Some(value) => {
-                        stack_write(s, slot, aligned, bytes, value)?;
+                        stack_write(stack, caller, slot, aligned, bytes, value)?;
                         Ok(Reg::NotInit)
                     }
-                    None => stack_read(s, slot, bytes),
+                    None => stack_read(stack, slot, bytes),
                 }
             }
             Reg::Ptr(Ptr::Ctx, base) => {
@@ -1501,11 +1666,11 @@ impl Walk {
 
     /// `check_helper_mem_access` of a helper's argument in `r`, which
     /// reads `bytes`: a fixed place on the stack, or in a map's value.
-    fn helper_read(&mut self, s: &State, r: u8, bytes: u32) -> Checked<()> {
+    fn helper_read(&mut self, s: &mut State, r: u8, bytes: u32) -> Checked<()> {
         read_ok(s, r)?;
         let bytes = i64::from(bytes);
         match s.regs[usize::from(r)] {
-            Reg::Ptr(Ptr::Stack, base) => {
+            Reg::Ptr(Ptr::Stack(frame), base) => {
                 let base = i64::from(base);
                 // check_stack_range_initialized: a privileged loader may
                 // pass bytes it never wrote.
@@ -1521,7 +1686,8 @@ impl Walk {
                         format!("invalid read from stack R{r} off={base} size={bytes}"),
                     );
                 }
-                self.depth = self.depth.max((-base) as u32);
+                let subprog = s.stack_of(frame).1;
+                self.deepen(subprog, -base);
                 Ok(())
             }
             Reg::Ptr(Ptr::Value(map), base) => {
@@ -1634,7 +1800,7 @@ impl Walk {
         read_ok(s, 2)?;
         read_ok(s, 3)?;
         let to = s.regs[3];
-        if !matches!(to, Reg::Ptr(Ptr::Stack | Ptr::Value(_), _)) {
+        if !matches!(to, Reg::Ptr(Ptr::Stack(_) | Ptr::Value(_), _)) {
             return memory_type(3, to);
         }
         // check_reg_type and check_mem_size_reg of the size.
@@ -1664,7 +1830,7 @@ impl Walk {
         let len = len as i64;
         // check_helper_mem_access of a write.
         let written = match to {
-            Reg::Ptr(Ptr::Stack, base) => {
+            Reg::Ptr(Ptr::Stack(frame), base) => {
                 // check_stack_access_within_bounds.
                 let base = i64::from(base);
                 if !(-MAX_STACK..=-1).contains(&base) {
@@ -1679,7 +1845,7 @@ impl Walk {
                         format!("invalid write to stack R3 off={base} size={len}"),
                     );
                 }
-                Some(base)
+                Some((frame, base))
             }
             Reg::Ptr(Ptr::Value(map), base) => {
                 self.value_access(3, map, i64::from(base), len, true)?;
@@ -1692,10 +1858,11 @@ impl Walk {
         }
         // The raw mode's writes, a byte at a time, after every argument:
         // the bytes are bytes the program may read.
-        if let Some(base) = written {
-            self.depth = self.depth.max((-base) as u32);
+        if let Some((frame, base)) = written {
+            let (stack, subprog) = s.stack_of(frame);
+            self.deepen(subprog, -base);
             for at in base..base + len {
-                s.stack[((-at - 1) / 8) as usize] = Slot::Bytes;
+                stack[((-at - 1) / 8) as usize] = Slot::Bytes;
             }
         }
         Ok(())
@@ -1717,11 +1884,145 @@ impl Walk {
 
     /// The jumps: `BPF_JA`, `BPF_EXIT`, a call, and `check_cond_jmp_op`.
     fn jmp_op(&mut self, s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
+        if insn.op() == jmp::CALL && insn.src == pseudo::CALL {
+            return self.call(s, insn, i);
+        }
         if insn.op() == jmp::CALL {
             self.helper(s, insn.imm)?;
             return Ok(Step::Next(i + 1));
         }
+        if insn.op() == jmp::EXIT && !s.callers.is_empty() {
+            return func_exit(s);
+        }
         jmp_op(s, insn, i)
+    }
+
+    /// `check_func_call` of a static function, the only kind without BTF
+    /// (`setup_func_entry`, `set_callee_state`): the callee's frame gets
+    /// R1 to R5 and a frame pointer of its own, and the caller's R0 to R5
+    /// are gone.
+    fn call(&mut self, s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
+        let start = (i as i64 + i64::from(insn.imm) + 1) as usize;
+        let subprog = self
+            .starts
+            .binary_search(&start)
+            .map_err(|_| (Errno::EFAULT, String::new()))?;
+        let frame = s.callers.len();
+        if frame + 1 >= MAX_CALL_FRAMES {
+            return refuse(
+                E2BIG,
+                format!("the call stack of {} frames is too deep", frame + 2),
+            );
+        }
+        let mut regs = [Reg::NotInit; REGS];
+        regs[1..=5].copy_from_slice(&s.regs[1..=5]);
+        regs[FP] = Reg::Ptr(Ptr::Stack(frame as u8 + 1), 0);
+        let mut caller = std::mem::replace(&mut s.regs, regs);
+        caller[0..=5].fill(Reg::NotInit);
+        s.callers.push(Caller {
+            regs: caller,
+            stack: std::mem::replace(&mut s.stack, [Slot::Bytes; (MAX_STACK / 8) as usize]),
+            subprog: std::mem::replace(&mut s.subprog, subprog),
+            ret: i + 1,
+        });
+        Ok(Step::Next(start))
+    }
+
+    /// `grow_stack_state`: the frames of `subprog` reach `bytes` below
+    /// their frame pointer.
+    fn deepen(&mut self, subprog: usize, bytes: i64) {
+        let depth = &mut self.depth[subprog];
+        *depth = (*depth).max(bytes as u32);
+    }
+
+    /// `check_max_stack_depth`, after the walk: along every chain of calls
+    /// from the main program, in the instructions' order, each function's
+    /// stack rounded up to 16 bytes, as Linux does with the JIT on, adds up
+    /// to 512 bytes at most, and no chain is 8 frames deep. A chain is
+    /// followed only where it may go past either, so that the first one
+    /// that does is the one Linux finds.
+    fn max_stack_depth(&mut self, insns: &[Insn]) -> Checked<()> {
+        let n = self.starts.len();
+        let round = |f: usize| i64::from((self.depth[f].div_ceil(8) * 8).next_multiple_of(16));
+        let calls = |f: usize| {
+            body(&self.starts, insns.len(), f)
+                .filter(|&i| {
+                    insns[i].code == class::JMP | jmp::CALL && insns[i].src == pseudo::CALL
+                })
+                .map(|i| {
+                    let start = (i as i64 + i64::from(insns[i].imm) + 1) as usize;
+                    self.starts.binary_search(&start).unwrap_or(0)
+                })
+                .collect::<Vec<_>>()
+        };
+        let callees: Vec<Vec<usize>> = (0..n).map(calls).collect();
+        // For each function at each frame (1 the main program's), the
+        // deepest stack of the chains below it and whether one of them goes
+        // past 8 frames. A recursive call, which the walk refuses as it goes
+        // 9 frames deep, may be in code the walk does not take: the frames
+        // keep this finite.
+        let mut below = vec![[None::<(i64, bool)>; MAX_CALL_FRAMES + 1]; n];
+        fn measure(
+            f: usize,
+            frame: usize,
+            callees: &[Vec<usize>],
+            round: &dyn Fn(usize) -> i64,
+            below: &mut [[Option<(i64, bool)>; MAX_CALL_FRAMES + 1]],
+        ) -> (i64, bool) {
+            if let Some(m) = below[f][frame] {
+                return m;
+            }
+            let mut m = (round(f), false);
+            if frame >= MAX_CALL_FRAMES {
+                m.1 = !callees[f].is_empty();
+            } else {
+                for &g in &callees[f] {
+                    let (depth, deep) = measure(g, frame + 1, callees, round, below);
+                    m = (m.0.max(round(f) + depth), m.1 || deep);
+                }
+            }
+            below[f][frame] = Some(m);
+            m
+        }
+        fn walk(
+            f: usize,
+            depth: i64,
+            frames: usize,
+            callees: &[Vec<usize>],
+            round: &dyn Fn(usize) -> i64,
+            below: &mut [[Option<(i64, bool)>; MAX_CALL_FRAMES + 1]],
+            max: &mut i64,
+        ) -> Checked<()> {
+            let depth = depth + round(f);
+            *max = (*max).max(depth);
+            if depth > MAX_STACK {
+                return refuse(
+                    EACCES,
+                    format!("combined stack size of {frames} calls is {depth}. Too large"),
+                );
+            }
+            for &g in &callees[f] {
+                if frames >= MAX_CALL_FRAMES {
+                    return refuse(
+                        E2BIG,
+                        format!("the call stack of {frames} frames is too deep !"),
+                    );
+                }
+                // A chain that cannot fail adds only its deepest stack to
+                // the maximum, as Linux's walk of it would.
+                let (d, deep) = measure(g, frames + 1, callees, round, below);
+                if depth + d <= MAX_STACK && !deep {
+                    *max = (*max).max(depth + d);
+                    continue;
+                }
+                walk(g, depth, frames + 1, callees, round, below, max)?;
+            }
+            Ok(())
+        }
+        let mut max = 0;
+        let result = walk(0, 0, 1, &callees, &round, &mut below, &mut max);
+        self.max_depth = max as u32;
+        result
     }
 }
 
@@ -1824,11 +2125,25 @@ fn write_ok(r: u8) -> Checked<()> {
 /// `check_stack_write_fixed_off`, for a privileged loader: a register
 /// or an immediate that fills an aligned slot is spilled whole, a pointer
 /// only so, and anything else leaves bytes. A narrower spill of a scalar,
-/// which Linux keeps, is bytes here, so its value is unknown.
-fn stack_write(s: &mut State, slot: usize, aligned: bool, bytes: i64, value: Store) -> Checked<()> {
+/// which Linux keeps, is bytes here, so its value is unknown. A pointer to
+/// a stack may not go into a caller's frame (`caller`).
+fn stack_write(
+    stack: &mut Stack,
+    caller: bool,
+    slot: usize,
+    aligned: bool,
+    bytes: i64,
+    value: Store,
+) -> Checked<()> {
     let stored = match value {
         Store::Reg(Reg::Ptr(..)) if bytes != 8 => {
             return refuse(EACCES, "invalid size of register spill");
+        }
+        Store::Reg(Reg::Ptr(Ptr::Stack(_), _)) if caller => {
+            return refuse(
+                Errno::EINVAL,
+                "cannot spill pointers to stack into stack frame of the caller",
+            );
         }
         Store::Reg(reg @ Reg::Ptr(..)) => Slot::Spill(reg),
         Store::Reg(reg @ Reg::Scalar(_)) if aligned && bytes == 8 => Slot::Spill(reg),
@@ -1837,13 +2152,13 @@ fn stack_write(s: &mut State, slot: usize, aligned: bool, bytes: i64, value: Sto
         }
         _ => Slot::Bytes,
     };
-    s.stack[slot] = stored;
+    stack[slot] = stored;
     Ok(())
 }
 
 /// `check_stack_read_fixed_off`, for a privileged loader.
-fn stack_read(s: &State, slot: usize, bytes: i64) -> Checked<Reg> {
-    match s.stack[slot] {
+fn stack_read(stack: &Stack, slot: usize, bytes: i64) -> Checked<Reg> {
+    match stack[slot] {
         Slot::Spill(reg @ Reg::Ptr(..)) => {
             if bytes != 8 {
                 return refuse(EACCES, "invalid size of register fill");
@@ -2024,7 +2339,7 @@ fn pointer_math(
                     format!("R{dst} tried to subtract pointer from scalar"),
                 );
             }
-            if ptr == Ptr::Stack {
+            if matches!(ptr, Ptr::Stack(_)) {
                 return refuse(
                     EACCES,
                     format!("R{dst} subtraction from stack pointer prohibited"),
@@ -2147,6 +2462,24 @@ fn jmp_op(s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
             }
         }
     }
+}
+
+/// `prepare_func_exit`: the callee's R0, which may not point into a stack,
+/// goes back to its caller, after the call.
+fn func_exit(s: &mut State) -> Checked<Step> {
+    let r0 = s.regs[0];
+    if let Reg::Ptr(Ptr::Stack(_), _) = r0 {
+        return refuse(Errno::EINVAL, "cannot return stack pointer to the caller");
+    }
+    // Walk::jmp_op comes here only from a callee.
+    let Some(caller) = s.callers.pop() else {
+        return refuse(Errno::EFAULT, "");
+    };
+    s.regs = caller.regs;
+    s.regs[0] = r0;
+    s.stack = caller.stack;
+    s.subprog = caller.subprog;
+    Ok(Step::Next(caller.ret))
 }
 
 /// `is_branch_taken` of two known values.
@@ -2512,7 +2845,16 @@ mod tests {
         };
         // bpf_tail_call, which Linux gives a socket filter.
         gap(&[i(0x85, 0, 0, 0, 12), exit()]);
-        gap(&[i(0x85, 0, 1, 0, 1), exit(), mov(0, 0), exit()]);
+        // A kfunc, and a reference to a function.
+        gap(&[i(0x85, 0, 2, 0, 1), exit()]);
+        gap(&[
+            i(0x18, 1, 4, 0, 1),
+            i(0, 0, 0, 0, 0),
+            mov(0, 0),
+            exit(),
+            mov(0, 0),
+            exit(),
+        ]);
         // The context's socket.
         gap(&[ldx(0x18, 0, 1, 168), exit()]);
         // A queue's helpers are push, pop and peek.
@@ -3121,6 +3463,298 @@ mod tests {
         assert_eq!(
             refused(&[i(0x58, 0, 1, 0, 0), exit()]),
             einval("unknown opcode 58")
+        );
+    }
+
+    /// A call of the function `by` instructions after it.
+    fn call_by(by: i32) -> Insn {
+        i(0x85, 0, 1, 0, by)
+    }
+    fn stack_depth(insns: &[Insn]) -> Vec<u32> {
+        verify(insns, Options::default()).unwrap().stack_depth
+    }
+
+    #[test]
+    fn functions_are_found_and_checked_before_the_walk() {
+        let einval = |line: &str| (Errno::EINVAL, line.to_string());
+        // add_subprogs.
+        assert_eq!(
+            refused(&[call_by(1), exit()]),
+            einval("call to invalid destination")
+        );
+        assert_eq!(
+            refused(&[call_by(-2), exit()]),
+            einval("call to invalid destination")
+        );
+        let mut many = Vec::new();
+        for k in 0..256 {
+            many.push(call_by(257 + k));
+        }
+        many.push(mov(0, 0));
+        many.push(exit());
+        for _ in 0..256 {
+            many.extend([mov(0, 0), exit()]);
+        }
+        assert_eq!(refused(&many), (E2BIG, "too many subprograms".into()));
+        // check_subprogs: a jump into another function, and one that falls
+        // into the next.
+        assert_eq!(
+            refused(&[call_by(2), mov(0, 0), i(0x05, 0, 0, 1, 0), exit(), exit()]),
+            einval("jump out of range from insn 2 to 4")
+        );
+        assert_eq!(
+            refused(&[call_by(1), exit(), mov(0, 0)]),
+            einval("last insn is not an exit or jmp")
+        );
+        assert_eq!(
+            refused(&[call_by(2), mov(0, 0), mov(1, 0), exit()]),
+            einval("last insn is not an exit or jmp")
+        );
+        // 7.0's check_abnormal_return.
+        assert_eq!(
+            refused(&[
+                call_by(1),
+                exit(),
+                mov_reg(6, 1),
+                i(0x30, 0, 0, 0, 0),
+                exit()
+            ]),
+            einval("LD_ABS is not allowed in subprogs without BTF")
+        );
+        assert_eq!(
+            refused(&[call_by(1), exit(), i(0x85, 0, 0, 0, 12), exit()]),
+            einval("tail_call is not allowed in subprogs without BTF")
+        );
+        // check_cfg: code no path reaches, with a call in it; and recursion,
+        // direct or not, which the walk refuses 9 frames deep, as 7.0 does.
+        assert_eq!(
+            refused(&[mov(0, 0), exit(), mov(0, 0), call_by(-4), exit()]),
+            einval("unreachable insn 2")
+        );
+        let recursive = (E2BIG, "the call stack of 9 frames is too deep".to_string());
+        assert_eq!(
+            refused(&[call_by(1), exit(), call_by(-1), exit()]),
+            recursive
+        );
+        assert_eq!(
+            refused(&[call_by(1), exit(), call_by(1), exit(), call_by(-3), exit()]),
+            recursive
+        );
+        assert_eq!(
+            refused(&[call_by(1), exit(), mov(0, 0), call_by(-4), exit()]),
+            recursive
+        );
+        // Recursion where the walk does not go: the stack check after it
+        // goes 8 frames deep.
+        assert_eq!(
+            refused(&[
+                mov(0, 0),
+                i(0x15, 0, 0, 1, 0),
+                call_by(1),
+                exit(),
+                call_by(-1),
+                exit(),
+            ]),
+            (E2BIG, "the call stack of 8 frames is too deep !".into())
+        );
+        // A jump back is still a back-edge.
+        assert_eq!(
+            refused(&[mov(0, 0), i(0x05, 0, 0, -2, 0), exit()]),
+            einval("back-edge from insn 1 to 0")
+        );
+    }
+
+    #[test]
+    fn a_call_passes_r1_to_r5_and_gets_r0() {
+        let eacces = |line: &str| (EACCES, line.to_string());
+        // The callee reads R1 to R5 and returns R0; the caller keeps R6 to R9
+        // and loses R1 to R5.
+        let callee = [mov_reg(0, 1), i(0x0f, 0, 5, 0, 0), exit()];
+        let program = |after: Insn| {
+            let mut p = vec![mov(1, 1), mov(5, 5), mov(6, 6), call_by(2), after, exit()];
+            p.extend(callee);
+            p
+        };
+        ok(&program(mov_reg(0, 6)));
+        ok(&program(i(0x07, 0, 0, 0, 1)));
+        for r in 1..=5 {
+            assert_eq!(
+                refused(&program(mov_reg(0, r))),
+                eacces(&format!("R{r} !read_ok"))
+            );
+        }
+        // R0 and R6 to R9 are not the callee's to read, nor an argument the
+        // caller did not write.
+        for (r, set) in [(0, 1), (6, 1), (9, 1), (2, 1)] {
+            let p = [mov(set, 1), call_by(1), exit(), mov_reg(0, r), exit()];
+            assert_eq!(refused(&p), eacces(&format!("R{r} !read_ok")));
+        }
+        // The callee's own R0 must be written before the caller reads it.
+        assert_eq!(
+            refused(&[call_by(1), exit(), exit()]),
+            eacces("R0 !read_ok")
+        );
+        ok(&[call_by(2), mov(0, 0), exit(), exit()]);
+    }
+
+    #[test]
+    fn a_callee_s_frame_is_its_own() {
+        // The callee's frame pointer is its own stack; a pointer to the
+        // caller's reaches the caller's, whose slot keeps its spill.
+        ok(&[
+            mov_reg(1, 10),
+            i(0x07, 1, 0, 0, -8),
+            stx_dw(1, 1, 0),
+            call_by(2),
+            ldx(size::DW, 0, 10, -8),
+            exit(),
+            // A spill of a scalar into the caller's slot, then a read.
+            mov(2, 7),
+            stx_dw(1, 2, 0),
+            ldx(size::DW, 0, 1, 0),
+            stx_dw(10, 0, -16),
+            exit(),
+        ]);
+        // A pointer to a stack may not go into the caller's frame, even
+        // the caller's own frame pointer.
+        assert_eq!(
+            refused(&[
+                mov_reg(1, 10),
+                i(0x07, 1, 0, 0, -8),
+                call_by(2),
+                mov(0, 0),
+                exit(),
+                stx_dw(1, 10, 0),
+                mov(0, 0),
+                exit(),
+            ]),
+            (
+                Errno::EINVAL,
+                "cannot spill pointers to stack into stack frame of the caller".into()
+            )
+        );
+        // A callee may not return a pointer to a stack.
+        assert_eq!(
+            refused(&[call_by(2), mov(0, 0), exit(), mov_reg(0, 10), exit()]),
+            (
+                Errno::EINVAL,
+                "cannot return stack pointer to the caller".into()
+            )
+        );
+        assert_eq!(
+            refused(&[
+                mov_reg(1, 10),
+                call_by(2),
+                mov(0, 0),
+                exit(),
+                mov_reg(0, 1),
+                exit()
+            ]),
+            (
+                Errno::EINVAL,
+                "cannot return stack pointer to the caller".into()
+            )
+        );
+        // Each function's stack depth is its own frames', rounded to 8,
+        // and a pointer into the caller's counts for the caller.
+        assert_eq!(
+            stack_depth(&[
+                i(0x7a, 10, 0, -8, 0),
+                mov_reg(1, 10),
+                call_by(2),
+                mov(0, 0),
+                exit(),
+                i(0x72, 1, 0, -40, 0),
+                i(0x72, 10, 0, -3, 0),
+                mov(0, 0),
+                exit(),
+            ]),
+            vec![40, 8]
+        );
+    }
+
+    #[test]
+    fn the_calls_go_8_frames_and_512_bytes_deep_at_most() {
+        // A chain of `n` functions, each calling the next, each with `bytes`
+        // of its stack written.
+        let chain = |n: usize, bytes: i16| {
+            let mut p = Vec::new();
+            for f in 0..n {
+                if bytes > 0 {
+                    p.push(i(0x72, 10, 0, -bytes, 0));
+                }
+                if f + 1 < n {
+                    p.push(call_by(2));
+                }
+                p.extend([mov(0, 0), exit()]);
+            }
+            p
+        };
+        ok(&chain(8, 0));
+        assert_eq!(
+            refused(&chain(9, 0)),
+            (E2BIG, "the call stack of 9 frames is too deep".into())
+        );
+        // 64 bytes each, rounded to 64: eight frames take 512.
+        ok(&chain(8, 64));
+        assert_eq!(stack_depth(&chain(2, 100)), vec![104, 104]);
+        // max_stack_depth: the deepest chain, each function's rounded to 16.
+        let max = |p: &[Insn]| verify(p, Options::default()).unwrap().max_stack_depth;
+        assert_eq!(max(&chain(2, 100)), 224);
+        assert_eq!(max(&[i(0x72, 10, 0, -3, 0), mov(0, 0), exit()]), 16);
+        assert_eq!(
+            max(&[
+                call_by(3),
+                call_by(5),
+                mov(0, 0),
+                exit(),
+                i(0x72, 10, 0, -100, 0),
+                mov(0, 0),
+                exit(),
+                mov(0, 0),
+                exit(),
+            ]),
+            112
+        );
+        // 104 rounds to 112: five frames take 560.
+        assert_eq!(
+            refused(&chain(5, 100)),
+            (
+                EACCES,
+                "combined stack size of 5 calls is 560. Too large".into()
+            )
+        );
+        ok(&chain(4, 100));
+        // 8 bytes round to 16 for the JIT.
+        assert_eq!(
+            refused(&[
+                i(0x72, 10, 0, -504, 0),
+                call_by(2),
+                mov(0, 0),
+                exit(),
+                i(0x72, 10, 0, -1, 0),
+                mov(0, 0),
+                exit(),
+            ]),
+            (
+                EACCES,
+                "combined stack size of 2 calls is 528. Too large".into()
+            )
+        );
+        // A function the walk never enters uses no stack.
+        assert_eq!(
+            stack_depth(&[
+                i(0x72, 10, 0, -512, 0),
+                mov(0, 0),
+                i(0x15, 0, 0, 1, 0),
+                call_by(2),
+                mov(0, 0),
+                exit(),
+                i(0x72, 10, 0, -1, 0),
+                mov(0, 0),
+                exit(),
+            ]),
+            vec![512, 0]
         );
     }
 

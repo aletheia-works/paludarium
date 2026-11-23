@@ -2530,6 +2530,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
         new_name_free(c, new_dir, &new_raw, &new)?;
         return Err(EXDEV);
     }
+    crate::bpf_fs::lookup(c, &new)?;
     // `filename_create`'s EROFS comes before EXDEV.
     crate::permissions::want_write_new(c.files, new_dir, &new_raw, false)?;
     let source = c.files.fs().metadata(&old, false).ok();
@@ -5692,6 +5693,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 let walks = ((old_dir, &old_raw[..]), (new_dir, &new_raw[..]));
                 return rename_queue(c, (&old, &new), walks, names, flags);
             }
+            crate::bpf_fs::lookup(c, &old)?;
+            crate::bpf_fs::lookup(c, &new)?;
             crate::permissions::rename(
                 c.files,
                 &c.process.credentials,
@@ -5772,6 +5775,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, crate::landlock::MAKE_DIR)
                 });
             }
+            crate::bpf_fs::lookup(c, &p)?;
             let created =
                 crate::permissions::create(c.files, &c.process.credentials, dir, &raw, true)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
@@ -5846,6 +5850,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, crate::landlock::MAKE_SYM)
                 });
             }
+            crate::bpf_fs::lookup(c, &p)?;
             let created =
                 crate::permissions::create(c.files, &c.process.credentials, dir, &raw, false)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
@@ -6851,8 +6856,11 @@ pub(crate) fn open_at(
     // nothing is opened or created.
     let fd = c.files.reserve(c.group.nofile())?;
     let credentials = &c.process.credentials;
-    let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
+    let opened = match crate::bpf_fs::lookup(c, &p)
+        .and_then(|()| crate::permissions::open(c.files, credentials, dir, &raw, flags))
+    {
         Ok(created) => landlock_before_open(c, &p, flags).and_then(|landlock| {
+            crate::bpf_fs::may_open(c, &p, flags)?;
             // Its `FAN_OPEN_PERM`, asked once Landlock's check passed (as
             // `do_dentry_open` calls `security_file_open` first), waits for
             // the groups' answers, then its `IN_OPEN`; a file refused or
@@ -9007,9 +9015,19 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         _ => return Err(Errno::EINVAL),
     }
     let p = c.files.named(dir, raw.to_vec())?;
+    crate::bpf_fs::lookup(c, &p)?;
     let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw, false)?;
     if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
         landlock_name(c, &p, crate::landlock::make_access(kind, 0))?;
+    }
+    // A BPF file system's directory has no `create` (`vfs_create`'s
+    // EACCES) and no `mknod` (`vfs_mknod`'s EPERM).
+    if c.files.fs().metadata(&p, false).is_err() && crate::bpf_fs::makes_no_files(c, &p) {
+        return Err(if matches!(kind, 0 | 0o100000) {
+            Errno::EACCES
+        } else {
+            Errno::EPERM
+        });
     }
     let permissions = mode & 0o7777 & !c.files.umask();
     match kind {

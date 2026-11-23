@@ -13439,6 +13439,8 @@ static int setfl_checks_case(void) {
     printf("created-stays=%d\n", access(made, F_OK) == 0);
     direct_line("open-shm", open(shm, O_RDWR | O_CREAT | O_DIRECT, 0644), O_DIRECT);
     direct_line("open-directory", open(dir, O_RDONLY | O_DIRECTORY | O_DIRECT), O_DIRECT);
+    /* O_PATH keeps none of the other flags, so O_DIRECT is not checked. */
+    direct_line("open-path", open(dir, O_PATH | O_DIRECT), O_DIRECT);
     direct_line("open-fifo", open(fifo, O_RDWR | O_DIRECT), O_DIRECT);
     direct_line("open-null", open("/dev/null", O_RDWR | O_DIRECT), O_DIRECT);
     direct_line("open-proc", open("/proc/self/status", O_RDONLY | O_DIRECT), O_DIRECT);
@@ -13476,6 +13478,12 @@ static int setfl_checks_case(void) {
         close(open(own, O_CREAT | O_WRONLY, 0644));
         direct_line("noatime-own", open(own, O_RDONLY | O_NOATIME), O_NOATIME);
         direct_line("noatime-other", open("/", O_RDONLY | O_DIRECTORY | O_NOATIME), O_NOATIME);
+        /* The same directory again, through its link in /proc/self/fd. */
+        int root = open("/", O_RDONLY | O_DIRECTORY);
+        char again[64];
+        snprintf(again, sizeof again, "/proc/self/fd/%d", root);
+        direct_line("noatime-other-again", open(again, O_RDONLY | O_DIRECTORY | O_NOATIME), O_NOATIME);
+        close(root);
         setfl_line("setfl-noatime-own", open(own, O_RDONLY), O_NOATIME);
         setfl_line("setfl-noatime-other", open("/", O_RDONLY | O_DIRECTORY), O_NOATIME);
         unlink(own);

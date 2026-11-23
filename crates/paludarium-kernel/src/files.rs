@@ -6949,7 +6949,8 @@ pub(crate) fn open_at(
             // `do_dentry_open`: `O_DIRECT` without `FMODE_CAN_ODIRECT` is
             // refused once the file is open (a FIFO too, unlike
             // `F_SETFL`), so a file it created stays, with no `IN_OPEN`.
-            if flags & O_DIRECT != 0 && !direct_io(&*opened.0, &opened.1, true) {
+            // An `O_PATH` open has none of the flags (`build_open_flags`).
+            if flags & (O_PATH | O_DIRECT) == O_DIRECT && !direct_io(&*opened.0, &opened.1, true) {
                 return Err(Errno::EINVAL);
             }
             let landlock = match landlock {
@@ -7807,8 +7808,12 @@ fn reopen_descriptor(
         .as_any()
         .is_some_and(|v| v.is::<crate::processes::PidFd>());
     let stat = d.file.stat()?;
-    // `may_open` of the inode the link leads to.
-    if !matches!(stat.mode & 0o170000, 0o040000 | 0o120000) {
+    // `may_open` of the inode the link leads to, as `permissions::open`
+    // has it: none for `O_PATH` or a symbolic link, and for a directory
+    // only when it is not opened to write, which is `EISDIR` first; a
+    // directory's `O_NOATIME` is checked too.
+    let kind = stat.mode & 0o170000;
+    if flags & O_PATH == 0 && kind != 0o120000 && !(kind == 0o040000 && flags & 3 != 0) {
         attributes::may_open(&c.process.credentials, &stat, flags)?;
     }
     // A FIFO a path opened: its node opened again, at the same dentry.

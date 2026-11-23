@@ -1377,7 +1377,10 @@ verified.
   times out launching Safari, or the launched Safari never becomes ready. The
   test driver waits, up to 15 seconds, until a Safari told to quit has exited
   before it asks for a session; on CI it logs a Safari still running then,
-  with its process ID, and kills it. It asks once more after either failure,
+  with its process ID, and kills it. Ending a WebDriver session leaves running
+  the Safari that safaridriver launched for it, so after each session the
+  driver asks that Safari, and no other, to quit, and waits up to 15 seconds
+  for it to exit. A Safari that does not quit is logged, not killed. It asks once more after either failure,
   never for a third time. It retries nothing else, no test and no result, and
   each retry is logged with its error and timing. These failures come and go,
   so a run that passes does not show they are gone.

@@ -3661,9 +3661,11 @@ kernel.
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
   has the same files but `task`, of that thread: its name, its signal masks,
-  its ID as `Pid` with the process's as `Tgid`, and its own
-  `voluntary_ctxt_switches` (the times it went to sleep; the process's
-  `status` shows the leader's, as Linux's `task_context_switch_counts`). A
+  its ID as `Pid` with the process's as `Tgid`, its own credentials (the
+  process's `status`, `/proc/self/status` too, shows the leader's, as Linux's
+  `proc_pid_status`), and its own `voluntary_ctxt_switches` (the times it
+  went to sleep; the process's `status` shows the leader's, as Linux's
+  `task_context_switch_counts`). A
   leader that ended before the other threads stays first in `task` as a
   zombie, `Z` in its `stat` and `status`, and `Threads` and `num_threads`
   count it until the process ends, as Linux keeps a delayed group leader.

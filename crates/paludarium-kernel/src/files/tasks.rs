@@ -182,7 +182,10 @@ impl Task {
     /// root, as `task_dump_owner` did before Linux 7.2's commit 6b1c66c9
     /// ("exec_state: relocate dumpable information"), finding no `mm` to
     /// ask: the kernel of the x86-64 CI runners that the differential tests
-    /// compare with. From 7.2 the dumpable flag outlives the `mm`.
+    /// compare with. From 7.2 the dumpable flag outlives the `mm`; when the
+    /// runners run 7.2, `gone-leader-files` and
+    /// `a_task_without_memory_has_its_files_owned_by_root` change with this
+    /// rule.
     pub(super) fn owned(&self, stat: FileStat) -> FileStat {
         let ids = &self.public.credentials;
         let (uid, gid) = if (self.holds() && self.view.dumpable) || stat.mode == OPEN_DIRECTORY {

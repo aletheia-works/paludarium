@@ -15710,6 +15710,57 @@ static int gone_leader_files_case(void) {
     return 0;
 }
 
+/* The thread-caps-status case: as Linux's proc_pid_status, /proc/self/status
+   shows the credentials of the thread group leader, which /proc/self names,
+   and a thread's own under task and /proc/thread-self. In a user namespace
+   of its own, where it has every capability, a thread drops its effective
+   ones with a raw capset, which changes only the calling thread's; only how
+   the CapEff lines compare is printed, as the full set is the kernel's. */
+static unsigned long long tcs_cap_eff(const char *path) {
+    char buffer[4096];
+    if (proc_read(path, buffer, sizeof buffer) < 0) return ~0ULL;
+    const char *line = strstr(buffer, "\nCapEff:\t");
+    return line ? strtoull(line + 9, NULL, 16) : ~0ULL;
+}
+
+static void *tcs_worker(void *unused) {
+    (void)unused;
+    struct caps_word data[2];
+    if (caps_get(CAPS_V3, 0, data)) return NULL;
+    uint64_t permitted = data[0].permitted | (uint64_t)data[1].permitted << 32;
+    long dropped = caps_set(0, permitted, 0);
+    char own[64], leader[64];
+    snprintf(own, sizeof own, "/proc/self/task/%ld/status", (long)syscall(SYS_gettid));
+    snprintf(leader, sizeof leader, "/proc/self/task/%d/status", (int)getpid());
+    unsigned long long process = tcs_cap_eff("/proc/self/status");
+    printf("capset=%ld process full=%d leader-task same=%d thread-self=%llx task=%llx\n", dropped,
+           process == permitted, tcs_cap_eff(leader) == process,
+           tcs_cap_eff("/proc/thread-self/status"), tcs_cap_eff(own));
+    return NULL;
+}
+
+static int thread_caps_status_case(void) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(0);
+        }
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, tcs_worker, NULL)) _exit(98);
+        pthread_join(worker, NULL);
+        printf("leader after=%d\n", tcs_cap_eff("/proc/thread-self/status") != 0);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("wait=%#x\n", status);
+    return 0;
+}
+
 /* The loadavg-running case: /proc/loadavg's running count, as Linux's
    nr_running(), counts the threads that can run: with two threads spinning
    besides the reader, at least 3, and no more than the live tasks; and
@@ -36316,6 +36367,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
+    if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

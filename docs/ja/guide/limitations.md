@@ -120,8 +120,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （"exec_state: relocate dumpable information"）より前の動きです。7.2 からは
   `task_dump_owner` が、メモリーより長く残る `exec_state` の dumpable フラグから持ち主を
   決めるので、これらのファイルはタスクのもののままで、開くと `ESRCH` です。ランナーが
-  7.2 以降になったら paludarium もそれに合わせます。`meminfo` は `sysinfo` と同じ固定の
-  4 GiB を、何も使っていないものとして返します。
+  7.2 以降になったら paludarium もそれに合わせ、`gone-leader-files` のケースと単体テスト
+  `a_task_without_memory_has_its_files_owned_by_root` もそのとき変わります。ゾンビの
+  プロセスにはまだ `ns` のリンクがありません。Linux では `pid` と `user` のリンクは
+  引き続き解決できます（`pidns_get` と `userns_get` は `nsproxy` を使いません）。
+  `meminfo` は `sysinfo` と同じ固定の 4 GiB を、何も使っていないものとして返します。
 - **自分のルートの一部**：生成される `/proc` や `/dev`（またはその中のディレクトリ）への
   `chroot` は `EINVAL` を返します。Linux はそこをルートにします。`mount` は `proc`
   ファイルシステムをマウントせず、`/proc` や `/dev` に何もマウントしないため、新しいルートの
@@ -815,8 +818,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `execveat` の `AT_EXECVE_CHECK`（Linux 6.14）は `EINVAL` です。これはユーザー空間が
   `SECBIT_EXEC_RESTRICT_FILE` のもとでファイルを実行する前に確かめるためのものです。
   その確かめのための securebits は保って示しますが、ここでは何もそれに従いません。
-  `/proc/self/status` は呼んだスレッドの資格情報を示しますが、Linux はスレッド
-  グループのリーダーのものを示します。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
   `SCM_RIGHTS` でディスクリプタを、`SCM_CREDENTIALS` で資格情報を受け渡します。
   違いは次のとおりです。

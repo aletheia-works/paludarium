@@ -136,7 +136,11 @@ verified.
   commit 6b1c66c9 ("exec_state: relocate dumpable information"). From 7.2,
   `task_dump_owner` takes the owner from the dumpable flag in `exec_state`,
   which outlives the memory, so those files stay the task's and their open
-  is `ESRCH`; paludarium follows that once the runners run 7.2 or later.
+  is `ESRCH`; paludarium follows that once the runners run 7.2 or later, and
+  the `gone-leader-files` case and the unit test
+  `a_task_without_memory_has_its_files_owned_by_root` change with it. A
+  zombie process has no `ns` links yet, where Linux's `pid` and `user` links
+  still resolve (`pidns_get` and `userns_get` need no `nsproxy`).
   `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
@@ -958,8 +962,6 @@ verified.
   a file before it runs it under `SECBIT_EXEC_RESTRICT_FILE`, is `EINVAL`:
   the securebits for those checks are kept and shown, but nothing here acts
   on them.
-  `/proc/self/status` shows the calling thread's credentials, where Linux
-  shows the thread group leader's.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
   these differences:

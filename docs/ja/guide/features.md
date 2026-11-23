@@ -3173,8 +3173,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
   `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` 以外の同じファイルが
   あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
-  プロセスの ID、スレッド自身の `voluntary_ctxt_switches`。眠った回数で、プロセスの
-  `status` は Linux の `task_context_switch_counts` と同じくリーダーのものを示します）を
+  プロセスの ID、スレッド自身の資格情報（プロセスの `status` は `/proc/self/status` も
+  含め、Linux の `proc_pid_status` と同じくリーダーのものを示します）、スレッド自身の
+  `voluntary_ctxt_switches`。眠った回数で、プロセスの `status` は Linux の
+  `task_context_switch_counts` と同じくリーダーのものを示します）を
   示します。ほかのスレッドより先に終わったリーダーは、Linux が遅れたグループリーダーを残す
   のと同じく、プロセスが終わるまでゾンビとして `task` の先頭に残り、`stat` と `status` では
   `Z` で、`Threads` と `num_threads` にも数えます。そのリーダーには、Linux の `exit_mm`、

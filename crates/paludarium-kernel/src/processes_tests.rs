@@ -7077,6 +7077,38 @@ mod proc_other {
             );
         }
     }
+    /// `status` shows the credentials of the task its directory names, as
+    /// Linux's `proc_pid_status`: the leader's for the process, and a
+    /// thread's own under `task`, after that thread alone dropped its
+    /// effective capabilities.
+    #[test]
+    fn status_shows_the_leader_s_credentials_and_a_thread_s_its_own() {
+        let (mut k, mut t, m) = setup();
+        let pid = k.process.pid;
+        let cap_eff = |text: Vec<u8>| {
+            let text = String::from_utf8(text).unwrap();
+            let line = text.lines().find(|l| l.starts_with("CapEff:")).unwrap();
+            u64::from_str_radix(line.trim_start_matches("CapEff:\t"), 16).unwrap()
+        };
+        let leader = cap_eff(read(&mut k, &mut t, &m, "/proc/self/status").unwrap());
+        assert_ne!(leader, 0);
+        let mut thread = k.group.public(pid).unwrap();
+        thread.credentials.effective = 0;
+        k.group.register(42, Arc::new(SignalInbox::default()));
+        k.group.publish(42, thread);
+        for path in [
+            "/proc/self/status".to_owned(),
+            format!("/proc/{pid}/task/{pid}/status"),
+        ] {
+            assert_eq!(
+                cap_eff(read(&mut k, &mut t, &m, &path).unwrap()),
+                leader,
+                "{path}"
+            );
+        }
+        let own = format!("/proc/{pid}/task/42/status");
+        assert_eq!(cap_eff(read(&mut k, &mut t, &m, &own).unwrap()), 0);
+    }
     /// A leader that ended before its process's other threads has, as
     /// Linux's zombie leader after `exit_mm`, `exit_files` and `exit_fs`,
     /// no memory, descriptors or directories in its process's directory or

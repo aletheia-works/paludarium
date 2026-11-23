@@ -15096,13 +15096,21 @@ static void *toc_worker(void *unused) {
     /* utime and stime, fields 14 and 15. */
     long own_ticks = pid_stat_field(own, 14, NULL) + pid_stat_field(own, 15, NULL);
     long leader_ticks = pid_stat_field(leader, 14, NULL) + pid_stat_field(leader, 15, NULL);
+    /* Read after the thread's own, so the process's runtime (rtime) is at
+       least the thread's: thread_group_cputime adds this thread's
+       sum_exec_runtime, refreshed by task_sched_runtime, to the others'.
+       cputime_adjust makes each file's utime + stime equal its rtime, but
+       do_task_stat truncates utime and stime to clock ticks one by one, so
+       each file's tick sum is floor(rtime / tick) or one less. The process's
+       sum can thus be one below the thread's, never two: it is more than
+       its rtime / tick - 2, so more than the thread's sum minus 2. */
     long all_ticks = pid_stat_field("/proc/self/stat", 14, NULL) +
                      pid_stat_field("/proc/self/stat", 15, NULL);
     snprintf(own, sizeof own, "/proc/self/task/%ld/status", (long)syscall(SYS_gettid));
     long own_switches = pid_status_field(own, "\nvoluntary_ctxt_switches:\t");
     long leader_switches = pid_status_field("/proc/self/status", "\nvoluntary_ctxt_switches:\t");
-    printf("thread cpu>=40=%d leader<thread=%d process>=thread=%d\n", own_ticks >= 40,
-           leader_ticks >= 0 && leader_ticks < own_ticks, all_ticks >= own_ticks);
+    printf("thread cpu>=40=%d leader<thread=%d process>=thread-1=%d\n", own_ticks >= 40,
+           leader_ticks >= 0 && leader_ticks < own_ticks, all_ticks >= own_ticks - 1);
     printf("thread switches>=20=%d leader<20=%d\n", own_switches >= 20,
            leader_switches >= 0 && leader_switches < 20);
     return NULL;

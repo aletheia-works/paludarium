@@ -1269,7 +1269,7 @@ impl GeneratedFile {
     }
     fn failing_writes(content: Vec<u8>, flags: u32, error: Errno, entry: bool) -> Self {
         Self {
-            status: Default::default(),
+            status: crate::files::StatusFlags::opened(flags),
             content,
             position: Mutex::new(0),
             write_error: (flags & 3 != 0).then_some(error),
@@ -1554,7 +1554,7 @@ pub(crate) struct PagemapFile {
 impl PagemapFile {
     pub(crate) fn open(memory: MemoryView, flags: u32, owner: Owner) -> Self {
         Self {
-            status: Default::default(),
+            status: crate::files::StatusFlags::opened(flags),
             memory,
             writable: flags & 3 != 0,
             position: Mutex::new(0),
@@ -1671,7 +1671,7 @@ pub(crate) struct ClearRefsFile {
 impl ClearRefsFile {
     pub(crate) fn open(memory: CurrentMemory, flags: u32, owner: Owner) -> Self {
         Self {
-            status: Default::default(),
+            status: crate::files::StatusFlags::opened(flags),
             memory,
             access: flags & 3,
             readable: flags & 3 != 1,

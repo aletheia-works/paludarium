@@ -23472,6 +23472,9 @@ static int setfl_kinds_case(void) {
     setfl_kind("sysctl", open("/proc/sys/kernel/perf_event_paranoid", O_RDONLY));
     opened_nonblock("mqueue-root", open("/dev/mqueue", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
     opened_nonblock("proc-maps", open("/proc/self/maps", O_RDONLY | O_NONBLOCK));
+    opened_nonblock("proc-status", open("/proc/self/status", O_RDONLY | O_NONBLOCK));
+    opened_nonblock("pagemap", open("/proc/self/pagemap", O_RDONLY | O_NONBLOCK));
+    opened_nonblock("clear-refs", open("/proc/self/clear_refs", O_WRONLY | O_NONBLOCK));
     opened_nonblock("sysvipc-msg", open("/proc/sysvipc/msg", O_RDONLY | O_NONBLOCK));
     opened_nonblock("sysctl", open("/proc/sys/kernel/perf_event_paranoid", O_RDONLY | O_NONBLOCK));
     return 0;

@@ -405,6 +405,8 @@ pub(crate) struct UserfaultFile {
     /// Its close releases the context: not so for a fork's file that found
     /// no room ([`hand_over`]).
     owns: AtomicBool,
+    /// Its own anonymous inode's status (`anon_inode_create_getfile`).
+    stat: FileStat,
 }
 
 impl Drop for UserfaultFile {
@@ -455,6 +457,7 @@ fn create(c: &mut Context<'_>, flags: u32) -> Result<u64, Errno> {
         context,
         status: AtomicU32::new(flags & O_NONBLOCK),
         owns: AtomicBool::new(true),
+        stat: crate::files::own_anonymous_inode(&c.process.credentials),
     });
     c.files
         .install(file, flags & O_CLOEXEC != 0, c.group.nofile())
@@ -670,6 +673,7 @@ fn hand_over(
         status: AtomicU32::new(child.flags & O_NONBLOCK),
         context: Arc::clone(&child),
         owns: AtomicBool::new(true),
+        stat: crate::files::own_anonymous_inode(&c.process.credentials),
     });
     let installed = c.files.install(
         Arc::clone(&file) as Arc<dyn FileHandle>,
@@ -1344,11 +1348,7 @@ impl FileHandle for UserfaultFile {
         Ok(0)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(FileStat {
-            mode: 0o600,
-            links: 1,
-            ..FileStat::default()
-        })
+        Ok(self.stat)
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)

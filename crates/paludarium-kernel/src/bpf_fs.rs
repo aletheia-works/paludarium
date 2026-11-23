@@ -26,6 +26,11 @@ fn on_bpffs(c: &Context<'_>, p: &[u8], follow: bool) -> Option<paludarium_vfs::M
         .filter(|at| at.kind == "bpf")
 }
 
+/// Whether the path at `p` is in a BPF file system.
+pub(crate) fn holds(c: &Context<'_>, p: &[u8], follow: bool) -> bool {
+    on_bpffs(c, p, follow).is_some()
+}
+
 /// `p`'s directory and its last name.
 fn split(p: &[u8]) -> (Vec<u8>, &[u8]) {
     let p = p.strip_suffix(b"/").unwrap_or(p);

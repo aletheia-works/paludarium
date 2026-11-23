@@ -294,6 +294,8 @@ pub(crate) struct Ring {
     /// The task work of an `IORING_SETUP_DEFER_TASKRUN` ring, which only
     /// its waits run (`ctx->work_list`).
     local: Mutex<VecDeque<Deferred>>,
+    /// Its own anonymous inode's status (`anon_inode_create_getfile`).
+    stat: FileStat,
 }
 
 /// A thread's task work for its rings without
@@ -1843,6 +1845,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
     let sqes_len = u64::from(sq_entries) * SQE_BYTES;
     let pages = |len: u64| ring_pages(c, len);
     let ring = Ring {
+        stat: crate::files::own_anonymous_inode(&c.process.credentials),
         flags,
         sq_entries,
         cq_entries,
@@ -2837,12 +2840,7 @@ impl FileHandle for Ring {
         Err(Errno::ESPIPE)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        // The anonymous inode's: 0600, with its file type hidden.
-        Ok(FileStat {
-            mode: 0o600,
-            links: 1,
-            ..FileStat::default()
-        })
+        Ok(self.stat)
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)

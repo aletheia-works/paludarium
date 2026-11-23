@@ -166,6 +166,8 @@ impl Bpffs {
         self.sb_flags = sb_flags;
         let host = Arc::clone(c.shared_host);
         let fs = MemFs::with_clock(Arc::new(move || host.clock(ClockId::Realtime)));
+        // `bpf_lookup`: a missing name with a dot is `EPERM`.
+        fs.reserve_dotted_names();
         fs.set_mode(b"/", S_ISVTX | self.mode)?;
         fs.set_owner(b"/", true, Some(self.uid), Some(self.gid))?;
         let now = c.host.clock(ClockId::Realtime)?;
@@ -184,60 +186,72 @@ impl Bpffs {
     /// What `statfs` and mountinfo report: no size or inodes
     /// (`simple_statfs`), and the options `bpf_show_options` shows.
     pub(super) fn settings(self) -> Settings {
+        let delegates = self.delegates;
         Settings {
             blocks: 0,
             inodes: 0,
             common_options: common_options(self.sb_flags),
             super_options: self.shown(),
             parsed: Arc::new(self),
+            // `bpf_show_options` reads the mount's root inode, so a
+            // `chmod` or `chown` of it shows.
+            show: Some(Arc::new(move |root: &paludarium_host::FileStat| {
+                shown(root.uid, root.gid, root.mode, &delegates)
+            })),
         }
     }
-    /// `bpf_show_options`: an owner other than root, a mode other than
-    /// 0777 (the sticky bit aside), and each delegation mask by its names,
-    /// `any` for every bit there is, and in hex what no name gives. The
-    /// root's mode and owner are those it was mounted with.
+    /// [`shown`] of the root as it was mounted.
     fn shown(&self) -> String {
-        let mut out = String::new();
-        if self.uid != 0 {
-            out.push_str(&format!(",uid={}", self.uid));
-        }
-        if self.gid != 0 {
-            out.push_str(&format!(",gid={}", self.gid));
-        }
-        if self.mode & !S_ISVTX != S_IRWXUGO {
-            out.push_str(&format!(",mode={:o}", self.mode & !S_ISVTX));
-        }
-        for (&(option, names, prefix, max), &delegated) in DELEGATES.iter().zip(&self.delegates) {
-            let any = (1u64 << max) - 1;
-            let mut left = delegated & any;
-            if left == 0 {
-                continue;
-            }
-            out.push(',');
-            out.push_str(option);
-            if left == any {
-                out.push_str("=any");
-                continue;
-            }
-            let mut first = true;
-            for &(name, value) in names {
-                let Some(short) = strip_prefix_ignoring_case(name, prefix) else {
-                    continue;
-                };
-                let bit = 1u64.wrapping_shl(value);
-                if left & bit != 0 {
-                    out.push(if first { '=' } else { ':' });
-                    out.push_str(&short.to_ascii_lowercase());
-                    left &= !bit;
-                    first = false;
-                }
-            }
-            if left != 0 {
-                out.push_str(&format!("{}{left:#x}", if first { '=' } else { ':' }));
-            }
-        }
-        out
+        shown(self.uid, self.gid, self.mode, &self.delegates)
     }
+}
+
+/// `bpf_show_options`, of a root of owner `uid` and `gid` and mode `mode`:
+/// an owner other than root, a mode other than 0777 (the sticky bit and the
+/// file type aside), and each delegation mask by its names, `any` for every
+/// bit there is, and in hex what no name gives.
+fn shown(uid: u32, gid: u32, mode: u32, delegates: &[u64; 4]) -> String {
+    let mut out = String::new();
+    let mode = mode & 0o7777 & !S_ISVTX;
+    if uid != 0 {
+        out.push_str(&format!(",uid={uid}"));
+    }
+    if gid != 0 {
+        out.push_str(&format!(",gid={gid}"));
+    }
+    if mode != S_IRWXUGO {
+        out.push_str(&format!(",mode={mode:o}"));
+    }
+    for (&(option, names, prefix, max), &delegated) in DELEGATES.iter().zip(delegates) {
+        let any = (1u64 << max) - 1;
+        let mut left = delegated & any;
+        if left == 0 {
+            continue;
+        }
+        out.push(',');
+        out.push_str(option);
+        if left == any {
+            out.push_str("=any");
+            continue;
+        }
+        let mut first = true;
+        for &(name, value) in names {
+            let Some(short) = strip_prefix_ignoring_case(name, prefix) else {
+                continue;
+            };
+            let bit = 1u64.wrapping_shl(value);
+            if left & bit != 0 {
+                out.push(if first { '=' } else { ':' });
+                out.push_str(&short.to_ascii_lowercase());
+                left &= !bit;
+                first = false;
+            }
+        }
+        if left != 0 {
+            out.push_str(&format!("{}{left:#x}", if first { '=' } else { ':' }));
+        }
+    }
+    out
 }
 
 /// `name` without `prefix`, which it starts with in any case

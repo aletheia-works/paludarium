@@ -446,6 +446,9 @@ struct Tree {
     /// The pages and inodes the files take, also those of one unlinked but
     /// still open.
     usage: Arc<Usage>,
+    /// A BPF file system's: a name with a dot is kept for itself, so one
+    /// not there is `EPERM` ([`MemFs::reserve_dotted_names`]).
+    reserves_dotted: bool,
     next: u64,
     owner: u64,
     clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>,
@@ -546,7 +549,13 @@ impl Tree {
                 }
                 continue;
             }
-            let id = *children.get(&p).ok_or(Errno::ENOENT)?;
+            let Some(&id) = children.get(&p) else {
+                // `bpf_lookup`: in a directory with any mode bits.
+                if self.reserves_dotted && n.mode & 0o7777 != 0 && p.contains(&b'.') {
+                    return Err(Errno::EPERM);
+                }
+                return Err(Errno::ENOENT);
+            };
             drop(n);
             let arc = self.node(id)?;
             let child = lock(&arc);
@@ -658,6 +667,12 @@ impl MemFs {
         let id = t.insert(path, Kind::Object(object), 0o100000 | (mode & 0o7777))?;
         Ok(lock(&*t.node(id)?).stat(id))
     }
+    /// Makes a missing name with a dot `EPERM` wherever a walk looks it up,
+    /// as `bpf_lookup` keeps such names in a BPF file system's directories
+    /// for itself; one there is found as any other.
+    pub fn reserve_dotted_names(&self) {
+        lock(&self.tree).reserves_dotted = true;
+    }
     /// The object the file at `path` holds ([`Self::make_object`]), its
     /// last component followed if `follow`; `None` for another file.
     pub fn object(
@@ -695,6 +710,7 @@ impl MemFs {
             tree: Arc::new(Mutex::new(Tree {
                 nodes: BTreeMap::from([(1, Arc::new(Mutex::new(root)))]),
                 usage,
+                reserves_dotted: false,
                 next: 2,
                 owner: 1,
                 clock,
@@ -752,8 +768,8 @@ pub use mount::MountedFs;
 mod namespace;
 pub use namespace::{
     FIRST_NAMESPACE_ID, GeneratedSource, InUse, MemoryAt, MountChange, MountHook, MountPin,
-    MountTable, NamespacedFs, NewTmpfs, Propagation, Reach, ReleaseHook, Settings, SuperblockHook,
-    Target, UNIQUE_OFFSET, keeping_expiry, mount_flags,
+    MountTable, NamespacedFs, NewTmpfs, Propagation, Reach, ReleaseHook, Settings, Show,
+    SuperblockHook, Target, UNIQUE_OFFSET, keeping_expiry, mount_flags,
 };
 
 mod open_file;

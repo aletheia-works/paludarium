@@ -17,6 +17,12 @@ const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: u64 = 65536;
 const XATTR_LIST_MAX: u64 = 65536;
 const NAMESPACES: [&[u8]; 3] = [b"user.", b"trusted.", b"security."];
+/// A BPF file system's, from Linux 7.2 (`bpf_fs_xattr_handlers`).
+const BPF_NAMESPACES: [&[u8]; 2] = [b"trusted.", b"security."];
+/// What a BPF file system holds of `security.*` for each inode
+/// (`SIMPLE_XATTR_MAX_NR`, `SIMPLE_XATTR_MAX_SIZE`), `ENOSPC` past it.
+const BPF_SECURITY_MAX_NR: usize = 128;
+const BPF_SECURITY_MAX_SIZE: usize = 128 << 10;
 use crate::permissions::CAPS;
 const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
 const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
@@ -171,6 +177,15 @@ impl Target {
             Self::Generated { .. } => Err(Errno::EOPNOTSUPP),
         }
     }
+    /// Whether it is in a BPF file system, whose attributes are only
+    /// `trusted.*` and `security.*`.
+    fn on_bpffs(&self, c: &Context<'_>) -> bool {
+        match self {
+            Self::Path { path, follow, .. } => crate::bpf_fs::holds(c, path, *follow),
+            Self::File { path, .. } => crate::bpf_fs::holds(c, path, false),
+            Self::Generated { .. } => false,
+        }
+    }
     /// Runs `f` on the attributes; `EOPNOTSUPP` if it holds none.
     fn with(&self, c: &Context<'_>, f: &mut dyn FnMut(&mut Xattrs)) -> Result<(), Errno> {
         match self {
@@ -212,9 +227,15 @@ fn name(c: &Context<'_>, ptr: u64) -> Result<Vec<u8>, Errno> {
     Ok(name)
 }
 
-/// `xattr_resolve_name`: a namespace this file system has, with a name in it.
-fn namespace(name: &[u8]) -> Result<(), Errno> {
-    match NAMESPACES.iter().find(|n| name.starts_with(n)) {
+/// `xattr_resolve_name`: a namespace the file system of `target` has, with
+/// a name in it.
+fn namespace(c: &Context<'_>, target: &Target, name: &[u8]) -> Result<(), Errno> {
+    let namespaces: &[&[u8]] = if target.on_bpffs(c) {
+        &BPF_NAMESPACES
+    } else {
+        &NAMESPACES
+    };
+    match namespaces.iter().find(|n| name.starts_with(n)) {
         Some(n) if name.len() == n.len() => Err(Errno::EINVAL),
         Some(_) => Ok(()),
         None => Err(Errno::EOPNOTSUPP),
@@ -363,7 +384,7 @@ fn get(
     let name = name(c, ptr)?;
     let target = target(c)?;
     permitted(&c.process.credentials, target.stat(), &name, false)?;
-    namespace(&name)?;
+    namespace(c, &target, &name)?;
     let mut value = target
         .read(c, |map| map.get(&name).cloned(), None)?
         .ok_or(ENODATA)?;
@@ -438,11 +459,14 @@ fn set(
     }
     permitted(creds, target.stat(), &name, true)?;
     security_permitted(creds, target.stat(), &name, false)?;
-    namespace(&name)?;
+    namespace(c, &target, &name)?;
+    let limited = name.starts_with(b"security.") && target.on_bpffs(c);
     let mut result = Ok(0);
     target.with(c, &mut |map| {
         let there = map.contains_key(&name);
-        if flags & XATTR_CREATE != 0 && there {
+        if limited && !within_limits(map, value.len()) {
+            result = Err(Errno::ENOSPC);
+        } else if flags & XATTR_CREATE != 0 && there {
             result = Err(Errno::EEXIST);
         } else if flags & XATTR_REPLACE != 0 && !there {
             result = Err(ENODATA);
@@ -452,6 +476,18 @@ fn set(
         }
     })?;
     result
+}
+
+/// `simple_xattr_limits_inc`: whether a BPF file system's inode, with the
+/// attributes `map`, has room for another `security.*` value of `size`
+/// bytes. The new one is counted before any it replaces is let go, so one
+/// at the limit has no room even to replace a value.
+fn within_limits(map: &Xattrs, size: usize) -> bool {
+    let held = map
+        .iter()
+        .filter(|(name, _)| name.starts_with(b"security."));
+    let (count, bytes) = held.fold((0, 0), |(n, b), (_, v)| (n + 1, b + v.len()));
+    count < BPF_SECURITY_MAX_NR && bytes + size <= BPF_SECURITY_MAX_SIZE
 }
 
 /// `removexattr`: the name, then the file (as since Linux 6.13).
@@ -465,7 +501,7 @@ fn remove(
     target.want_write(c)?;
     permitted(&c.process.credentials, target.stat(), &name, true)?;
     security_permitted(&c.process.credentials, target.stat(), &name, true)?;
-    namespace(&name)?;
+    namespace(c, &target, &name)?;
     let mut result = Err(ENODATA);
     target.with(c, &mut |map| {
         if map.remove(&name).is_some() {

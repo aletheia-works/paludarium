@@ -984,7 +984,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フォールトも届くもの（`UFFD_USER_MODE_ONLY` なし）には `CAP_SYS_PTRACE` が要り
   （`vm.unprivileged_userfaultfd` が 0 なので `EPERM`）、これはフラグ（`EINVAL`）より
   先に確かめます。ファイルは読み出し用の `anon_inode:[userfaultfd]` で、誰が持っていても
-  作られたアドレス空間のものです。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
+  作られたアドレス空間のものです。読み出しが渡すフォークのファイルと同じく、自分だけの無名
+  inode です（`anon_inode_create_getfile`）。`fstat` は新しい inode 番号、ファイルの型のない
+  モード 0600、作ったスレッドの `fsuid` と `fsgid` を返します。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
   （2 度目は `EINVAL`）、提供する機能と ioctl を書き戻します。失敗したときは 0 を
   書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
   `UFFD_FEATURE_THREAD_ID`、`UFFD_FEATURE_MINOR_SHMEM`、
@@ -1475,7 +1477,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
   それに `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
-  見えます。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
+  見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
+  `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
+  `fsgid` を返します。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
   完了（`IORING_FEAT_NODROP`）は Linux と同じです。一度の投入の完了は、Linux が投稿する
   ように、その要求をすべて実行してから入ります（`io_submit_flush_completions`）。
@@ -4173,8 +4177,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `delegate_cmds`、`delegate_maps`、`delegate_progs`、`delegate_attachs` は、Linux master の
   UAPI の列挙の名前（大文字小文字を問わず、`BPF_`、`BPF_MAP_TYPE_`、`BPF_PROG_TYPE_` の
   接頭辞を除いたもの）、数（`EINVAL`、`ERANGE`）、`any` を `:` でつないで受け取り、
-  `CAP_SYS_ADMIN` を求めます（`EPERM`）。mountinfo は `bpf_show_options` と同じく、名前、
-  `any`、16 進数で見せます。`statfs` は `BPF_FS_MAGIC` で、大きさも inode もなく、
+  `CAP_SYS_ADMIN` を求めます（`EPERM`）。mountinfo は `bpf_show_options` と同じく、マウントの
+  ルートの今の所有者とモード（`chmod` や `chown` のあとのもの）に続けて、名前、`any`、16 進数で
+  見せます。`statfs` は `BPF_FS_MAGIC` で、大きさも inode もなく、
   マウントし直しはスーパーブロックのフラグだけを変えます。どちらのコマンドも自分のフラグ
   （`BPF_F_PATH_FD`、取得では `BPF_F_RDONLY` か `BPF_F_WRONLY` のどちらか一方）だけを受け取り、
   `path_fd` は `BPF_F_PATH_FD` があるときだけです（`EINVAL`）。ピンは、どのアクセスのものでも
@@ -4189,7 +4194,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリは `bpf_dir_iops` と同じくディレクトリ、シンボリックリンク、ハードリンク、
   名前の変更を作り、ほかのファイルは作りません。新しい通常のファイルは `EACCES`、ノード
   （FIFO、ソケットの `bind`）は `EPERM`、`O_TMPFILE` は `EOPNOTSUPP` です。ない名前で
-  ドットを含むものは、それを作る呼び出しで `EPERM` です（`bpf_lookup`）。
+  ドットを含むものは、モードのビットがあるディレクトリでそれを探すどの経路でも `EPERM` で、
+  `stat`、`open`、`unlink` でもそうです（`bpf_lookup`）。そこへの経路の `EACCES` が先です。
+  ファイルとディレクトリは Linux master の 7.2 からのものと同じく（`bpf_fs_xattr_handlers`）
+  `trusted.*` と `security.*` の拡張属性を持ち、ほかは持ちません（`EOPNOTSUPP`）。`security.*`
+  は inode ごとに 128 個、値の合計 128 KiB までで、置き換える前に新しいものを数えます
+  （`simple_xattr_set_limited`、`ENOSPC`）。
 
 - `BPF_PROG_LOAD` はソケットフィルター（`BPF_PROG_TYPE_SOCKET_FILTER`）を読み込み、
   Linux と同じく検証器で確かめます。アタッチした AF_UNIX のソケットで、インタープリタが

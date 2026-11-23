@@ -28,6 +28,7 @@ fn tmpfs(blocks: u64) -> NewTmpfs {
             common_options: String::new(),
             super_options: format!(",size={}k", blocks * 4),
             parsed: Arc::new(()),
+            show: None,
         },
         read_only: false,
         flags: mount_flags::RELATIME,

@@ -1094,7 +1094,10 @@ kernel.
   needs `CAP_SYS_PTRACE` (`EPERM`, as `vm.unprivileged_userfaultfd` is 0),
   checked before the flags (`EINVAL`). The file is
   `anon_inode:[userfaultfd]`, open for reading, and belongs to the address
-  space it was made in, whoever holds it. `UFFDIO_API` takes the version
+  space it was made in, whoever holds it. It is an anonymous inode of its
+  own (`anon_inode_create_getfile`), as a fork's file a read hands over is:
+  `fstat` gives a new inode number, mode 0600 without a file type, and the
+  maker's `fsuid` and `fsgid`. `UFFDIO_API` takes the version
   and the features once (`EINVAL` again), writing back the features it
   offers and its ioctls, or zeros when it fails; it offers
   `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
@@ -1663,7 +1666,10 @@ kernel.
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
-  descriptor shows them. A request runs while `io_uring_enter` takes it, so
+  descriptor shows them. The descriptor is an anonymous inode of its own,
+  as `anon_inode_create_getfile` makes one: `fstat` gives a new inode
+  number, mode 0600 without a file type, and the maker's `fsuid` and
+  `fsgid`. A request runs while `io_uring_enter` takes it, so
   its completion is in the queue when the call returns, unless it waits for
   task work (below); links, completions
   that skip success, and completions kept while the queue is full
@@ -4822,7 +4828,9 @@ kernel.
   Linux master's UAPI enums (in any case, without their `BPF_`,
   `BPF_MAP_TYPE_` or `BPF_PROG_TYPE_` prefix), numbers (`EINVAL`, `ERANGE`)
   or `any`, joined by `:`, and need `CAP_SYS_ADMIN` (`EPERM`); mountinfo
-  shows them as `bpf_show_options` does, by name, `any` or in hex. Its
+  shows them as `bpf_show_options` does, by name, `any` or in hex, after
+  the mount root's owner and mode as they are now (a `chmod` or `chown` of
+  it shows). Its
   `statfs` is `BPF_FS_MAGIC`, with no size and no inodes, and a remount
   changes its superblock flags alone. Both commands take no flag but
   theirs (`BPF_F_PATH_FD`; for a get, `BPF_F_RDONLY` or `BPF_F_WRONLY`, not
@@ -4839,8 +4847,14 @@ kernel.
   show. Its directories make directories, symbolic links, hard links and
   renames, as `bpf_dir_iops` do, and no other file: a new regular file is
   `EACCES`, a node (a FIFO, a socket's `bind`) `EPERM` and `O_TMPFILE`
-  `EOPNOTSUPP`; a name with a dot that is not there is `EPERM` for a call
-  that would make it (`bpf_lookup`).
+  `EOPNOTSUPP`; a name with a dot that is not there is `EPERM` wherever a
+  walk looks it up in a directory with any mode bits, so for `stat`,
+  `open` and `unlink` too (`bpf_lookup`), after any `EACCES` of the walk to
+  it. Its files and directories hold `trusted.*` and `security.*` extended
+  attributes, as Linux master's from 7.2 (`bpf_fs_xattr_handlers`), and no
+  others (`EOPNOTSUPP`); `security.*` ones are up to 128 names and 128 KiB
+  of values for each inode, counting a new one before any it replaces
+  (`simple_xattr_set_limited`, `ENOSPC`).
 
 - `BPF_PROG_LOAD` loads socket filters (`BPF_PROG_TYPE_SOCKET_FILTER`),
   which a verifier checks as Linux's does, and an interpreter runs them on

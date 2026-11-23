@@ -2953,6 +2953,20 @@ pub(crate) fn anonymous_inode() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
+/// The status of an anonymous inode of its own, as Linux's
+/// `anon_inode_create_getfile` makes for an io_uring or a userfaultfd
+/// (`alloc_anon_inode`): a new number, mode 0600 with its file type hidden
+/// (`anon_inode_getattr`), one link, and the maker's `fsuid` and `fsgid`.
+pub(crate) fn own_anonymous_inode(creds: &crate::credentials::Credentials) -> FileStat {
+    FileStat {
+        inode: anonymous_inode(),
+        mode: 0o600,
+        links: 1,
+        uid: creds.fsuid,
+        gid: creds.fsgid,
+        ..FileStat::default()
+    }
+}
 const DIRECTORY: u32 = 0o040000;
 /// A guest `loff_t *` argument: none when null, else its value (EFAULT).
 fn offset_argument(c: &Context<'_>, at: u64) -> Result<Option<u64>, Errno> {

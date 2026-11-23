@@ -353,7 +353,13 @@ pub struct Settings {
     pub super_options: String,
     /// The options as the kernel parsed them, which a remount starts from.
     pub parsed: Arc<dyn std::any::Any + Send + Sync>,
+    /// What shows the file system's own options from the status of a
+    /// mount's root as it is now, in place of `super_options`, for one whose
+    /// `show_options` reads its root inode (`bpf_show_options`).
+    pub show: Option<Show>,
 }
+/// [`Settings::show`].
+pub type Show = Arc<dyn Fn(&FileStat) -> String + Send + Sync>;
 /// What a remount reconfigures from: a tmpfs superblock's settings and the
 /// blocks and inodes its files use, none for the lower file system's.
 pub type InUse<'a> = Option<(&'a Settings, u64, u64)>;
@@ -3023,12 +3029,15 @@ impl FileSystem for NamespacedFs {
                     ),
                     Backing::Memory(sb) => {
                         let settings = lock(&sb.settings);
+                        let shown = settings.show.as_ref().and_then(|show| {
+                            sb.fs.metadata(&e.root, true).ok().map(|root| show(&root))
+                        });
                         (
                             sb.kind,
                             sb.device(),
                             e.root.clone(),
                             settings.common_options.clone(),
-                            settings.super_options.clone(),
+                            shown.unwrap_or_else(|| settings.super_options.clone()),
                         )
                     }
                 };

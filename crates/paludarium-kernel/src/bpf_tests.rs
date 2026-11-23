@@ -1728,3 +1728,217 @@ fn a_dotted_name_is_eperm_only_past_the_search() {
         errno(Errno::EPERM)
     );
 }
+
+/// A BPF file system's inodes hold `trusted.*` and `security.*`
+/// attributes and no others, as Linux's from 7.2 (`bpf_fs_xattr_handlers`):
+/// `security.*` up to 128 names and 128 KiB of values for each inode
+/// (`simple_xattr_set_limited`), counting a new value before the one it
+/// replaces goes.
+#[test]
+fn a_bpf_file_system_holds_trusted_and_security_attributes() {
+    const SETXATTR: u64 = 188;
+    const GETXATTR: u64 = 191;
+    const LISTXATTR: u64 = 194;
+    const REMOVEXATTR: u64 = 197;
+    const XATTR_CREATE: u64 = 1;
+    const BIG: u64 = 0x70_0000;
+    let (mut k, mut t, m) = setup();
+    m.map_shared(
+        Some(GuestAddr(BIG)),
+        64 << 10,
+        Prot::READ_WRITE,
+        MappingKind::Anonymous,
+    )
+    .unwrap();
+    let put = |at: u64, text: &str| {
+        m.write(GuestAddr(DATA + at), format!("{text}\0").as_bytes())
+            .unwrap();
+        DATA + at
+    };
+    let (dir, kind, made) = (
+        put(0xa00, "/pins"),
+        put(0xa20, "bpf"),
+        put(0xa40, "/pins/d"),
+    );
+    let (user, trusted, security) = (
+        put(0xa80, "user.a"),
+        put(0xaa0, "trusted.a"),
+        put(0xac0, "security.a"),
+    );
+    let (value, list) = (put(0xb00, "v"), DATA + 0xc00);
+    assert_eq!(syscall(&mut k, &mut t, &m, 83, [dir, 0o755, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 165, [kind, dir, kind, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 83, [made, 0o755, 0, 0, 0, 0]),
+        0
+    );
+    let set = |k: &mut Kernel, t: &mut Thread, name: u64, at: u64, size: u64, flags: u64| {
+        syscall(k, t, &m, SETXATTR, [made, name, at, size, flags, 0])
+    };
+    assert_eq!(
+        set(&mut k, &mut t, user, value, 1, 0),
+        errno(Errno::EOPNOTSUPP)
+    );
+    assert_eq!(set(&mut k, &mut t, trusted, value, 1, 0), 0);
+    assert_eq!(set(&mut k, &mut t, security, value, 1, 0), 0);
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            GETXATTR,
+            [made, trusted, list, 16, 0, 0]
+        ),
+        1
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, GETXATTR, [made, user, list, 16, 0, 0]),
+        errno(Errno::EOPNOTSUPP)
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, LISTXATTR, [made, list, 64, 0, 0, 0]),
+        21
+    );
+    let mut names = [0; 21];
+    m.read(GuestAddr(list), &mut names).unwrap();
+    assert_eq!(&names, b"security.a\0trusted.a\0");
+    // 127 more `security.*` names: 128, and none past them, not even a
+    // value in place of one there.
+    for i in 0..127 {
+        let name = put(0xd00, &format!("security.n{i}"));
+        assert_eq!(set(&mut k, &mut t, name, value, 1, 0), 0, "{i}");
+    }
+    let more = put(0xd00, "security.more");
+    assert_eq!(set(&mut k, &mut t, more, value, 1, 0), errno(Errno::ENOSPC));
+    assert_eq!(
+        set(&mut k, &mut t, security, value, 1, 0),
+        errno(Errno::ENOSPC)
+    );
+    // The limit comes before `XATTR_CREATE` finds the name there.
+    assert_eq!(
+        set(&mut k, &mut t, security, value, 1, XATTR_CREATE),
+        errno(Errno::ENOSPC)
+    );
+    // `trusted.*` has no such limit.
+    let other = put(0xd00, "trusted.b");
+    assert_eq!(set(&mut k, &mut t, other, value, 1, 0), 0);
+    // Removed, a name makes room; then 128 KiB of values is all there is.
+    for i in 0..127 {
+        let name = put(0xd00, &format!("security.n{i}"));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, REMOVEXATTR, [made, name, 0, 0, 0, 0]),
+            0
+        );
+    }
+    let (first, second) = (put(0xd00, "security.x"), put(0xd40, "security.y"));
+    assert_eq!(set(&mut k, &mut t, first, BIG, 64 << 10, 0), 0);
+    assert_eq!(
+        set(&mut k, &mut t, second, BIG, 64 << 10, 0),
+        errno(Errno::ENOSPC)
+    );
+    assert_eq!(set(&mut k, &mut t, second, BIG, (64 << 10) - 1, 0), 0);
+}
+
+/// A missing name with a dot is `EPERM` wherever a walk looks it up in a
+/// BPF file system's directory (`bpf_lookup`), not only where a call makes
+/// a name: `stat`, `open`, `unlink`, and a walk past it. A directory the
+/// walk may not search is `EACCES` first, one with no mode bits takes the
+/// name as any other, and a name without a dot is `ENOENT`.
+#[test]
+fn every_walk_to_a_missing_dotted_name_is_eperm() {
+    const OPEN: u64 = 2;
+    const STAT: u64 = 4;
+    const CHMOD: u64 = 90;
+    const UNLINK: u64 = 87;
+    let (mut k, mut t, m) = setup();
+    let put = |at: u64, text: &str| {
+        m.write(GuestAddr(DATA + at), format!("{text}\0").as_bytes())
+            .unwrap();
+        DATA + at
+    };
+    let (dir, kind, buf) = (put(0xa00, "/pins"), put(0xa20, "bpf"), DATA + 0xe00);
+    assert_eq!(syscall(&mut k, &mut t, &m, 83, [dir, 0o755, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 165, [kind, dir, kind, 0, 0, 0]),
+        0
+    );
+    let (zero, locked) = (put(0xa40, "/pins/zero"), put(0xa60, "/pins/locked"));
+    for made in [zero, locked] {
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 83, [made, 0o700, 0, 0, 0, 0]),
+            0
+        );
+    }
+    assert_eq!(syscall(&mut k, &mut t, &m, CHMOD, [zero, 0, 0, 0, 0, 0]), 0);
+    let walk = |k: &mut Kernel, t: &mut Thread, call: u64, path: &str| {
+        let p = put(0xb00, path);
+        syscall(k, t, &m, call, [p, buf, 0, 0, 0, 0])
+    };
+    let eperm = errno(Errno::EPERM);
+    assert_eq!(walk(&mut k, &mut t, STAT, "/pins/a.b"), eperm);
+    assert_eq!(walk(&mut k, &mut t, STAT, "/pins/a.b/c"), eperm);
+    assert_eq!(walk(&mut k, &mut t, OPEN, "/pins/a.b"), eperm);
+    assert_eq!(walk(&mut k, &mut t, UNLINK, "/pins/a.b"), eperm);
+    assert_eq!(walk(&mut k, &mut t, STAT, "/pins/ab"), errno(Errno::ENOENT));
+    assert_eq!(
+        walk(&mut k, &mut t, STAT, "/pins/zero/a.b"),
+        errno(Errno::ENOENT)
+    );
+    // setuid(1000): `locked` may not be searched.
+    assert_eq!(syscall(&mut k, &mut t, &m, 105, [1000, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        walk(&mut k, &mut t, STAT, "/pins/locked/a.b"),
+        errno(Errno::EACCES)
+    );
+    assert_eq!(walk(&mut k, &mut t, STAT, "/pins/a.b"), eperm);
+}
+
+/// mountinfo shows a BPF file system's root as it is now, as
+/// `bpf_show_options` reads the root inode: a `chmod` or `chown` of it
+/// shows, and a root back at 0777 and root's shows none.
+#[test]
+fn a_bpf_file_system_shows_its_root_as_it_is_now() {
+    const CHMOD: u64 = 90;
+    const CHOWN: u64 = 92;
+    let (mut k, mut t, m) = setup();
+    let put = |at: u64, text: &str| {
+        m.write(GuestAddr(DATA + at), format!("{text}\0").as_bytes())
+            .unwrap();
+        DATA + at
+    };
+    let (dir, kind, options) = (
+        put(0xa00, "/pins"),
+        put(0xa20, "bpf"),
+        put(0xa40, "mode=0700,uid=5,delegate_cmds=map_create"),
+    );
+    assert_eq!(syscall(&mut k, &mut t, &m, 83, [dir, 0o755, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 165, [kind, dir, kind, 0, options, 0]),
+        0
+    );
+    let shown = |k: &Kernel| {
+        k.files
+            .fs()
+            .mounts()
+            .into_iter()
+            .find(|mount| mount.path == b"/pins")
+            .map(|mount| mount.super_options)
+            .unwrap()
+    };
+    assert_eq!(shown(&k), ",uid=5,mode=700,delegate_cmds=map_create");
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, CHMOD, [dir, 0o1750, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(syscall(&mut k, &mut t, &m, CHOWN, [dir, 7, 8, 0, 0, 0]), 0);
+    assert_eq!(shown(&k), ",uid=7,gid=8,mode=750,delegate_cmds=map_create");
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, CHMOD, [dir, 0o777, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(syscall(&mut k, &mut t, &m, CHOWN, [dir, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(shown(&k), ",delegate_cmds=map_create");
+}

@@ -31,7 +31,11 @@
    mountinfo shows them (delegation masks by name), its statfs and root,
    a pinned map's file, the checks of both commands (BPF_F_PATH_FD, the
    access a descriptor got again gives), the files its directories make
-   and refuse, a remount, fsopen, and the map going with its last name.
+   and refuse, every walk to a missing name with a dot, the root's mode
+   and owner in mountinfo after a chmod and chown of it, a remount,
+   fsopen, and the map going with its last name. (A BPF file system's
+   extended attributes are Linux 7.2's, newer than the CI kernel's, so
+   the unit tests cover them, not this case.)
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -1890,6 +1894,11 @@ static int case_pin(void) {
     say("tmpfile %ld", TRY(open(in("fs"), O_TMPFILE | O_WRONLY, 0644)));
     say("fifo %ld, file %ld", TRY(mknod(in("fs/q"), S_IFIFO | 0644, 0)), TRY(mknod(in("fs/r"), S_IFREG | 0644, 0)));
     say("dotted dir %ld", TRY(mkdir(in("fs/a.b"), 0755)));
+    /* Every walk to a missing name with a dot, not only one that makes it. */
+    struct stat dotted;
+    say("dotted stat %ld, past it %ld, open %ld, unlink %ld, access %ld", TRY(stat(in("fs/x.y"), &dotted)),
+        TRY(stat(in("fs/x.y/z"), &dotted)), TRY(open(in("fs/x.y"), O_RDONLY)), TRY(unlink(in("fs/x.y"))),
+        TRY(access(in("fs/x.y"), F_OK)));
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un sun = { .sun_family = AF_UNIX };
     snprintf(sun.sun_path, sizeof sun.sun_path, "%s", in("fs/sock"));
@@ -1907,6 +1916,10 @@ static int case_pin(void) {
     say("unlink %ld %ld %ld %ld", TRY(unlink(in("fs/m"))), TRY(unlink(in("fs/m3"))), TRY(unlink(in("fs/rel"))),
         TRY(unlink(in("fs/d/m"))));
     say("gone %ld", fd_by_id(id, 0));
+
+    /* mountinfo shows the root as it is now. */
+    say("chmod root %ld, chown root %ld", TRY(chmod(in("fs"), 0750)), TRY(chown(in("fs"), 3, 4)));
+    mountinfo("root changed", in("fs"));
 
     /* A remount changes the superblock's flags alone. */
     say("remount %ld", TRY(mount(NULL, in("fs"), NULL, MS_REMOUNT | MS_RDONLY, "mode=0755")));

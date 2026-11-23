@@ -211,6 +211,18 @@ fn uffdio_api_takes_the_features_once() {
     let mut target = vec![0; n as usize];
     f.mem.read(GuestAddr(DATA + 0x100), &mut target).unwrap();
     assert_eq!(target, b"anon_inode:[userfaultfd]");
+    // An anonymous inode of its own (`anon_inode_create_getfile`): another
+    // userfaultfd has another, neither 0, and both are the maker's.
+    let other = f.ready(0, 0);
+    let inode = |f: &mut Fixture, fd: u64| {
+        assert_eq!(f.ret(5, &[fd, ARG, 0]), 0);
+        let mut mode = [0; 4];
+        f.mem.read(GuestAddr(ARG + 24), &mut mode).unwrap();
+        assert_eq!(u32::from_le_bytes(mode), 0o600);
+        f.mem.read_u64(GuestAddr(ARG + 8)).unwrap()
+    };
+    let (one, two) = (inode(&mut f, fd), inode(&mut f, other));
+    assert!(one != 0 && two != 0 && one != two, "{one} {two}");
 }
 
 #[test]

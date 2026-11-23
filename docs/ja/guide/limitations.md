@@ -291,7 +291,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   データページへの書き込みは、Linux では `SIGBUS` ですがそのまま書かれます。
   マッピングの一部をアンマップ、移動、保護の変更でき、Linux は分割を断ります
   （`EINVAL`）。`MADV_DOFORK` で子に渡せ、Linux は `VM_IO` に対して断ります
-  （`EINVAL`）。`mlock` でロックでき、Linux は `VM_SPECIAL` のマッピングをロックしません。`inherit_stat` は
+  （`EINVAL`）。`mlock` でロックでき、Linux は `VM_SPECIAL` のマッピングをロックしません。
+  `/proc/<pid>/maps` はこのマッピングを、Linux のように無名 inode のデバイスと inode を付けた
+  `anon_inode:[perf_event]` とはまだ示さず（名前、デバイス、inode のどれも示しません）、`MMAP` の
+  記録も Linux がそれについて書くものとはまだ照らし合わせていません。`inherit_stat` は
   受け付けますが、記録するものがないので、引き継いだイベントの終わりに読み取りの記録は
   送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。ioctl の `SET_FILTER`、`SET_BPF`、
@@ -362,12 +365,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （`BPF_PROG_GET_NEXT_ID`、`BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、
   Linux にあってここにないコマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と
   同じく `EINVAL` です。`BPF_OBJ_PIN` がピンするのはマップだけで、プログラムの
-  ディスクリプタは、オブジェクトでないものと同じく `EINVAL` です。BPF ファイルシステムには
-  拡張属性がまだありません（Linux master の `trusted.` と `security.` のもの）。その mountinfo
-  はルートのモード、所有者、グループをマウントしたときのまま見せ、`chmod` や `chown` の
-  あとのものはまだ見せません。ない名前でドットを含むものが `EPERM` になるのは、Linux が
-  それを探すすべての呼び出しではまだなく、名前を作るか変える呼び出し、ピン、取得だけで、
-  `stat` などは `ENOENT` です。そのため libbpf の最小のプログラムでの確認はソケットフィルターを
+  ディスクリプタは、オブジェクトでないものと同じく `EINVAL` です。BPF ファイルシステムの
+  拡張属性は Linux master に従います。master には 7.2（9722955b5430）から `trusted.` と
+  `security.` のものがあり、テストマシンの Linux 7.0 にはありません（そこではどの呼び出しも
+  `EOPNOTSUPP` です）。そのためこれはユニットテストだけが確かめ、ランナーが 7.2 になれば
+  差分テストのケースで比べられます。そのため libbpf の最小のプログラムでの確認はソケットフィルターを
   読み込み、ほかのプログラムの型は見つけません。`bpftool feature` はソケットフィルターと、
   検証器が確かめるヘルパーだけを見つけます。master の `BPF_COMMON_ATTRS`（ビット 16）を
   立てたコマンドも `EINVAL` です。試験機の Linux 7.0 にはこのフラグがないからです。master なら

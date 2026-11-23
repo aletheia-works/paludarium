@@ -1463,6 +1463,7 @@ impl Tmpfs {
             common_options: common_options(self.sb_flags),
             super_options: self.shown(),
             parsed: Arc::new(self),
+            show: None,
         }
     }
     /// `shmem_show_options`, after the common ones (`show_sb_opts`).

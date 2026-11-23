@@ -331,7 +331,10 @@ verified.
   given another protection, where Linux refuses to split it (`EINVAL`); and
   `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
   (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
-  mapping unlocked. `inherit_stat` is taken, but an
+  mapping unlocked. `/proc/<pid>/maps` does not yet name the mapping
+  `anon_inode:[perf_event]` with the anonymous inodes' device and inode, as
+  Linux does (it shows no name, device or inode), and the `MMAP` records
+  are not yet checked against what Linux writes of it. `inherit_stat` is taken, but an
   inherited event's end sends no read record, as nothing is recorded. An
   event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
@@ -424,12 +427,11 @@ verified.
   iterators and statistics are `ENOSYS`, as each command Linux has that is
   not here; a number Linux has no command for is `EINVAL`, as there.
   `BPF_OBJ_PIN` pins maps alone: a program's descriptor is `EINVAL`, as
-  for no object. A BPF file system does not yet have extended attributes
-  (Linux master's `trusted.` and `security.` ones); its mountinfo does not
-  yet show the root's mode, owner and group after a `chmod` or `chown` of
-  it, only as it was mounted; and a missing name with a dot is not yet
-  `EPERM` in every call Linux looks it up in, only in those that make or
-  rename a name, pin or get, while `stat` and the like give `ENOENT`. So
+  for no object. A BPF file system's extended attributes follow Linux
+  master, which has had `trusted.` and `security.` ones since 7.2
+  (9722955b5430); the test machines' Linux 7.0 has none (each call is
+  `EOPNOTSUPP` there), so the unit tests alone check them, and the
+  differential case can compare them once the runners have 7.2. So
   libbpf's trivial-program probe loads a socket filter and finds no other
   program type, and `bpftool feature` finds socket filters and only the
   helpers the verifier checks. A command with master's `BPF_COMMON_ATTRS`

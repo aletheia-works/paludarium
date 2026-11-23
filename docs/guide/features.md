@@ -6017,7 +6017,7 @@ one only with an `--allow-net`.
 - **aube**: a Node.js package manager written in Rust (v2.10.0). `--version`,
   `install`, `install --frozen-lockfile` and `list` give the same output and
   exit status as on real Linux.
-- **ripgrep**: a text search tool written in Rust (15.2.0), which runs its
+- **ripgrep**: a text search tool written in Rust (16.0.0), which runs its
   searches on several threads. Nine searches, including a regular expression
   replacement, a parallel search, one through a memory-mapped file and two
   errors, give the same output and exit status as on real Linux. `--version`

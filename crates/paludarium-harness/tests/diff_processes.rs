@@ -303,6 +303,7 @@ mod linux {
                     | "perf-prctl"
                     | "perf-inherit"
                     | "perf-software"
+                    | "perf-gup"
                     | "perf-mmap"
                     | "perf-output"
                     | "perf-sample"
@@ -694,6 +695,7 @@ mod linux {
         perf_prctl => ("perf-prctl","perf"),
         perf_inherit => ("perf-inherit","perf"),
         perf_software => ("perf-software","perf"),
+        perf_gup => ("perf-gup","perf"),
         perf_mmap => ("perf-mmap","perf"),
         perf_output => ("perf-output","perf"),
         perf_sample => ("perf-sample","perf"),

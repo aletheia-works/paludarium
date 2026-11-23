@@ -377,15 +377,15 @@ pub enum Fast {
         src: Register,
         size: u8,
     },
-    /// `movd` (`size` 4) or `movq` (8) of memory into an xmm register: the
-    /// bytes zero-extended into the whole register.
+    /// `movd` (`size` 4), or `movq` or `movsd` (8), of memory into an xmm
+    /// register: the bytes zero-extended into the whole register.
     XmmLoadScalar {
         dst: u8,
         mem: Address,
         size: u8,
     },
-    /// `movd` (`size` 4) or `movq` (8) of an xmm register into memory: its
-    /// low `size` bytes.
+    /// `movd` (`size` 4), or `movq` or `movsd` (8), of an xmm register into
+    /// memory: its low `size` bytes.
     XmmStoreScalar {
         mem: Address,
         src: u8,
@@ -757,6 +757,16 @@ impl Fast {
                     return None;
                 }
                 Self::MoveScalar { dst, src, size }
+            }
+            // `movsd` between xmm registers keeps the destination's high
+            // half, so only its memory forms are scalar moves.
+            Mnemonic::MovsdSse => {
+                let sized = |o: Option<Operand>| address(o).filter(|mem| mem.size == 8);
+                match (xmm(a), sized(b), sized(a), xmm(b)) {
+                    (Some(dst), Some(mem), _, _) => Self::XmmLoadScalar { dst, mem, size: 8 },
+                    (_, _, Some(mem), Some(src)) => Self::XmmStoreScalar { mem, src, size: 8 },
+                    _ => return None,
+                }
             }
             Mnemonic::Cmpxchg => {
                 let mem = address(a)?;

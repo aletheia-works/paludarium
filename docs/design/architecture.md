@@ -132,8 +132,8 @@ out:
   register, and `imul` of two registers or of a register and an immediate;
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
   registers and memory, `pxor` and `xorps` of xmm registers, `movd` and `movq`
-  between xmm registers and general ones or memory, and `movq` between xmm
-  registers;
+  between xmm registers and general ones or memory, `movq` between xmm
+  registers, and the SSE2 `movsd` between xmm registers and memory;
 - `pshufd`, `pshuflw`, `pshufhw`, the `punpckl` and `punpckh` unpacks,
   `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`,
   `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` and `pcmpeqd` of xmm

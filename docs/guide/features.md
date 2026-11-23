@@ -542,8 +542,7 @@ kernel.
   (a link in `/proc/self/fd`, `/dev/stdout`).
   `F_SETFL` changes only `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`, `O_NOATIME`
   and, on a file that signals, `O_ASYNC`; the access mode and the other
-  flags stay, as Linux's `setfl` keeps them. BPF maps and programs still
-  ignore it.
+  flags stay, as Linux's `setfl` keeps them.
 
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
   reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,

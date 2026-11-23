@@ -481,7 +481,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   除いて `O_LARGEFILE` がありません。
   `F_SETFL` が変えるのは `O_APPEND`、`O_NONBLOCK`、`O_DIRECT`、`O_NOATIME` と、
   シグナルを送れるファイルでの `O_ASYNC` だけで、アクセスモードとほかのフラグは
-  Linux の `setfl` と同じく残ります。BPF のマップとプログラムは、まだこれを無視します。
+  Linux の `setfl` と同じく残ります。
 
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
   読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`splice`、`tee`、`vmsplice`、`fsync`、

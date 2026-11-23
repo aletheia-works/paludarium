@@ -266,6 +266,17 @@ static void fdinfo(int fd) {
     if (readlink(path, link, sizeof link - 1) < 0) strcpy(link, "?");
     say("  link %s flags %#x fd flags %d", link, fcntl(fd, F_GETFL) & O_ACCMODE,
         fcntl(fd, F_GETFD));
+    /* F_SETFL keeps O_NONBLOCK in a program's f_flags, as for any file,
+       and the access mode stays; once, for the first program. */
+    static int setfl_shown;
+    if (!setfl_shown++) {
+        int before = fcntl(fd, F_GETFL);
+        int set = fcntl(fd, F_SETFL, before | O_NONBLOCK);
+        int on = fcntl(fd, F_GETFL);
+        fcntl(fd, F_SETFL, before);
+        say("  setfl %d nonblock %d access %d cleared %d", set, (on & O_NONBLOCK) != 0, on & O_ACCMODE,
+            (fcntl(fd, F_GETFL) & O_NONBLOCK) != 0);
+    }
 }
 
 static void run(const char *name, struct prog_attr p) {

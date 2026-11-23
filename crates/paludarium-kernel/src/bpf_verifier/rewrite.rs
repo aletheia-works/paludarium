@@ -111,7 +111,9 @@ fn target(f: &Facts<'_>, i: usize) -> usize {
 
 /// Whether `opt_remove_nops` removes the instruction at `i`, which a path
 /// reached: a `BPF_JA` of 0, all its other fields 0 too, once the dead
-/// code is gone. It goes through the program once, so a jump that only a
+/// code is gone. Linux compares the instruction whole with
+/// `BPF_JMP_IMM(BPF_JA, 0, 0, 0)`, so a 32-bit `BPF_JA` (`gotol`) of 0
+/// stays. It goes through the program once, so a jump that only a
 /// later removal makes one of 0 stays.
 fn removed_nop(f: &Facts<'_>, seen_before: &[usize], i: usize) -> bool {
     let insn = f.insns[i];
@@ -164,6 +166,8 @@ fn ctx_access(f: &Facts<'_>, i: usize) -> Option<usize> {
         12 | 16 | 24 | 28 | 44 => (1, 2),
         20 | 40 | 84 => (3, 4),
         164 | 176 => (4, 2),
+        // context_field refuses every other offset before the access is
+        // recorded (the test below goes through them all).
         _ => unreachable!("the verifier takes no other field"),
     };
     let narrow = bytes < 4 && bytes < target_size;

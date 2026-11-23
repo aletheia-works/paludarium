@@ -4362,4 +4362,24 @@ mod tests {
             Ok(insns.len() + 3)
         );
     }
+
+    #[test]
+    fn every_context_field_the_verifier_takes_has_its_rewrite() {
+        // rewrite::ctx_access ends in unreachable! for an offset it does
+        // not know: every read context_field takes is one it knows.
+        for off in 0..skb::SIZE + 8 {
+            for bytes in [1, 2, 4, 8] {
+                if let Some(Field::Scalar) = context_field(off, bytes, false) {
+                    let code = match bytes {
+                        1 => 0x71,
+                        2 => 0x69,
+                        4 => 0x61,
+                        _ => 0x79,
+                    };
+                    let insns = [i(code, 0, 1, off as i16, 0), exit()];
+                    assert!(verify(&insns, Options::default()).is_ok(), "{off} {bytes}");
+                }
+            }
+        }
+    }
 }

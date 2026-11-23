@@ -203,16 +203,11 @@ GitHub は、ホストのランナーがどれも受け取らなかったジョ�
 なりません。例外があるのは aube と coreutils だけです。coreutils の例外は、coreutils だけに
 認めた 1 つで、`uu_tail` が使う `notify` 8.2.2 の CC0-1.0 のライセンスです。ビルドはその
 ライセンスの全文を残します。aube の例外は、2 つのクレートのライセンスと、今のところ
-`zstd` 0.13.3 と `zstd-safe` 7.3.0 への 3 つの RustSec のアドバイザリ（RUSTSEC-2026-0391、
-RUSTSEC-2026-0398、RUSTSEC-2026-0403）です。aube はこの版を、`zstd` を版まで固定している
-`decmpfs` から受け取るので、自分では上げられません。アドバイザリの例外は、`decmpfs` が
-`zstd` 0.14 にしたリリースを出したら外します
-（[SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)）。どのクレートにも
-当たらなくなった例外は監査を失敗させるので、例外が要らなくなった aube の更新は、例外を
-外すまでマージされません。aube には今のところ、`url` 2.5.8 への RUSTSEC-2026-0592 の
-例外もあります。aube 2.10.0 の `Cargo.lock` は、この版を `hickory-net`、`hickory-resolver`、
-`reqwest` を通して持っています。`url` 2.5.9 で直っているので、固定している aube のリリースが
-`url` 2.5.9 以降を固定したら外します。例外はすべて
+`url` 2.5.8 への RUSTSEC-2026-0592 です。aube 2.10.1 の `Cargo.lock` は、この版を
+`hickory-net`、`hickory-resolver`、`reqwest` を通して持っています。`url` 2.5.9 で
+直っているので、固定している aube のリリースが `url` 2.5.9 以降を固定したら外します。
+どのクレートにも当たらなくなった例外は監査を失敗させるので、例外が要らなくなった
+aube の更新は、例外を外すまでマージされません。例外はすべて
 `tests/guests/programs/evidence.py` に並んでいて、`source-lock.json` はクレートの版まで
 書いて例外を挙げています。
 

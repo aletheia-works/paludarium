@@ -330,16 +330,11 @@ Before a guest program is built, its dependencies must pass `cargo deny`
 under the root policy. Only aube and coreutils have exceptions. coreutils has
 one, for itself alone: the CC0-1.0 license of `notify` 8.2.2, which `uu_tail`
 uses; the build keeps its full license text. aube has the licenses of two crates
-and, for now, three RustSec advisories against `zstd` 0.13.3 and `zstd-safe`
-7.3.0 (RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403). aube gets
-those versions through `decmpfs`, which pins `zstd` exactly, so aube cannot
-update them. The advisory exceptions go once a `decmpfs` release takes `zstd`
-0.14 ([SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)):
-an exception that no crate matches fails the audit, so the aube bump that no
-longer needs them cannot merge until they are removed. aube also has, for now,
-RUSTSEC-2026-0592 against `url` 2.5.8, which aube 2.10.0's `Cargo.lock` gets
-through `hickory-net`, `hickory-resolver` and `reqwest`. `url` 2.5.9 fixes it,
-and the exception goes once the pinned aube release locks `url` 2.5.9 or later.
+and, for now, RUSTSEC-2026-0592 against `url` 2.5.8, which aube 2.10.1's
+`Cargo.lock` gets through `hickory-net`, `hickory-resolver` and `reqwest`.
+`url` 2.5.9 fixes it, and the exception goes once the pinned aube release locks
+`url` 2.5.9 or later. An exception that no crate matches fails the audit, so an
+aube bump that no longer needs one cannot merge until it is removed.
 `tests/guests/programs/evidence.py` lists every exception, and `source-lock.json`
 names them with the exact crate versions.
 

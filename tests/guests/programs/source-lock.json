@@ -2,7 +2,7 @@
   "schema": 1,
   "toolchain": "nightly-2026-11-15",
   "target": "x86_64-unknown-linux-musl",
-  "aube": {"repository": "https://github.com/aubepkg/aube", "tag": "v2.10.0", "revision": "0fee54efb41ef21afedf1e9458b2a681774c4ec9", "lock_sha256": "a6d22494f5dfd2811493c68c9bcc9e028b4993f56e3438af9a78c2d471003a59", "primer": "empty file, outside unmodified source tree"},
+  "aube": {"repository": "https://github.com/aubepkg/aube", "tag": "v2.10.1", "revision": "429af5d24c98789e396db75724907f6a08fda2a6", "lock_sha256": "75055cdf053072c7ec6ae38a79110cc0c9b7b103dde3c26c93db60db0d83ee88", "primer": "empty file, outside unmodified source tree"},
   "ripgrep": {"repository": "https://github.com/BurntSushi/ripgrep", "tag": "16.0.0", "revision": "669cb4c755db20b26c3af3d923c042ae224c7496", "lock_sha256": "4216c9689e2f80812a51abde30731dbbf5f36d404fda3945bb50f10973336361"},
   "coreutils": {"repository": "https://github.com/uutils/coreutils", "tag": "0.13.0", "revision": "07b76df463390fd56856725201ae52df5df0a063", "lock_sha256": "a86913b2ebcbff692b0ebb7c998b65ff4ee4cdce7f12f95e4ce0dff148178b8f"},
   "guest_license_exceptions": [
@@ -13,9 +13,6 @@
     {"crate": "notify@8.2.2", "allow": ["CC0-1.0"]}
   ],
   "guest_advisory_exceptions": [
-    {"id": "RUSTSEC-2026-0391", "crate": "zstd@0.13.3", "reason": "through decmpfs (SocketDev/decmpfs#16)"},
-    {"id": "RUSTSEC-2026-0398", "crate": "zstd-safe@7.3.0", "reason": "through decmpfs (SocketDev/decmpfs#16)"},
-    {"id": "RUSTSEC-2026-0403", "crate": "zstd-safe@7.3.0", "reason": "through decmpfs (SocketDev/decmpfs#16)"},
     {
       "id": "RUSTSEC-2026-0592",
       "crate": "url@2.5.8",

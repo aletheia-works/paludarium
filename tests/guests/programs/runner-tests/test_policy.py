@@ -90,9 +90,9 @@ class PolicyTests(unittest.TestCase):
     def test_other_advisory_exceptions_rejected(self):
         extra = {"id": "RUSTSEC-0000-0000", "crate": "x@1"}
         for advisories in (
-            ADVISORY_EXCEPTIONS[:1],
+            ADVISORY_EXCEPTIONS[:-1],
             [*ADVISORY_EXCEPTIONS, extra],
-            [{**ADVISORY_EXCEPTIONS[0], "crate": "zstd@0.14.3"}, *ADVISORY_EXCEPTIONS[1:]],
+            [{**ADVISORY_EXCEPTIONS[0], "id": "RUSTSEC-0000-0000"}, *ADVISORY_EXCEPTIONS[1:]],
             [*ADVISORY_EXCEPTIONS[:-1], {**ADVISORY_EXCEPTIONS[-1], "crate": "url@2.5.9"}],
             [*ADVISORY_EXCEPTIONS[:-1], {**ADVISORY_EXCEPTIONS[-1], "reason": "other"}],
         ):
@@ -189,7 +189,7 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
             receipt["license_policy"]["exceptions"] = copy.deepcopy(LICENSE_EXCEPTIONS)
-            receipt["license_policy"]["advisories"] = ADVISORY_EXCEPTIONS[1:]
+            receipt["license_policy"]["advisories"] = ADVISORY_EXCEPTIONS[:-1]
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
             receipt["license_policy"]["advisories"] = copy.deepcopy(ADVISORY_EXCEPTIONS)

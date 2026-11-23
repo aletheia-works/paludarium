@@ -2,7 +2,7 @@
 
 ## Inputs and state
 
-Native x86-64 Linux must run in a network namespace with no network access. The guest environment is cases.json, with an empty/nonexistent PATH so node is unavailable. Native HOME/TMPDIR are dedicated scratch directories, mapped to their guest equivalents. Each probe item starts in a separate fresh fixture. All eight items must emit exactly PASS <name> and exit 0. A no-argument standard run must emit all eight in their listed order and exit 0.
+Native x86-64 Linux must run in a network namespace with no network access. The guest environment is cases.json, with an empty/nonexistent PATH so node is unavailable, and an SSL_CERT_FILE that names a missing file, so that neither side has CA certificates: the emulator's guest sees only the fixture, not the host's /etc/ssl, and aube 2.10.1 and later warn on stderr when no system roots load. Native HOME/TMPDIR are dedicated scratch directories, mapped to their guest equivalents. Each probe item starts in a separate fresh fixture. All eight items must emit exactly PASS <name> and exit 0. A no-argument standard run must emit all eight in their listed order and exit 0.
 
 Aube receives freshly built identical bytes. Each side starts from fixtures/ and runs --version, install, removes app/node_modules, install --frozen-lockfile, then list. List uses frozen's state. No registry packages or node installation are permitted. The linked package is outside app, but inside the explicitly provided fixture root. Read-only package manifests are data fixtures, independently authored here, not another project's code.
 

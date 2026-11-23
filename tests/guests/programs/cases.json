@@ -8,7 +8,7 @@
     {"name": "frozen", "args": ["install", "--frozen-lockfile"], "before": "remove-node-modules"},
     {"name": "list", "args": ["list"]}
   ],
-  "environment": {"PATH": "/no-node", "HOME": "/home/guest", "TMPDIR": "/tmp", "NO_COLOR": "1", "TERM": "dumb", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"},
+  "environment": {"PATH": "/no-node", "HOME": "/home/guest", "TMPDIR": "/tmp", "NO_COLOR": "1", "TERM": "dumb", "LANG": "C", "LC_ALL": "C", "TZ": "UTC", "SSL_CERT_FILE": "/no-ca-certificates"},
   "network": "native network namespace; emulator network disabled",
   "comparison": {"stdout": true, "exit": true, "stderr": true, "filesystem": "diagnostic snapshot"}
 }

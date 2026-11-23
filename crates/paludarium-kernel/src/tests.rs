@@ -5835,7 +5835,7 @@ mod io_uring {
     }
 
     #[test]
-    fn deferred_and_cooperative_task_work_waits_for_a_wait() {
+    fn deferred_task_work_waits_for_its_ring_to_wait() {
         const TW: u32 = 1 << 4;
         const COOP: u32 = 1 << 8;
         const TASKRUN_FLAG: u32 = 1 << 9;
@@ -5843,15 +5843,18 @@ mod io_uring {
         const DEFER: u32 = 1 << 13;
         const TASKRUN: u32 = 1 << 2;
         let mut f = fixture();
-        for flags in [COOP | TASKRUN_FLAG, SINGLE_ISSUER | DEFER | TASKRUN_FLAG] {
-            let r = ring_with(&mut f, flags);
-            submit_only(&mut f, &r, &[nop(1, TW, 0, 0, 0)]);
-            assert_eq!(reap(&mut f, &r), [], "{flags:#x}");
-            assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, TASKRUN, "{flags:#x}");
-            assert_eq!(f.ret(426, &[r.fd, 0, 1, GETEVENTS]), 0);
-            assert_eq!(reap(&mut f, &r), [(1, 0)], "{flags:#x}");
-            assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, 0, "{flags:#x}");
-        }
+        // A cooperative ring's runs as the call returns all the same.
+        let r = ring_with(&mut f, COOP | TASKRUN_FLAG);
+        submit_only(&mut f, &r, &[nop(1, TW, 0, 0, 0)]);
+        assert_eq!(reap(&mut f, &r), [(1, 0)]);
+        assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, 0);
+        let r = ring_with(&mut f, SINGLE_ISSUER | DEFER | TASKRUN_FLAG);
+        submit_only(&mut f, &r, &[nop(2, TW, 0, 0, 0)]);
+        assert_eq!(reap(&mut f, &r), []);
+        assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, TASKRUN);
+        assert_eq!(f.ret(426, &[r.fd, 0, 1, GETEVENTS]), 0);
+        assert_eq!(reap(&mut f, &r), [(2, 0)]);
+        assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, 0);
     }
 }
 

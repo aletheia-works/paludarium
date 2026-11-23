@@ -1664,10 +1664,10 @@ kernel.
 - Task work runs as Linux's `io_uring/tw.c` runs it. An `IORING_NOP_TW`, a
   link's next request, and the rest of a link that failed complete as task
   work, after the other completions of their submission.
-  - A ring without `IORING_SETUP_COOP_TASKRUN` runs it as the call returns
-    to the program.
-  - A cooperative ring runs it when the thread next waits for completions
-    on any of its rings, or takes a signal.
+  - A ring without `IORING_SETUP_DEFER_TASKRUN` runs it as the call returns
+    to the program, or as the thread waits on any of its rings. With
+    `IORING_SETUP_COOP_TASKRUN` too (`TWA_SIGNAL_NO_IPI`), which only spares
+    a thread running its program an interrupt.
   - A ring with `IORING_SETUP_DEFER_TASKRUN` runs it only as
     `io_uring_enter` waits on that ring, 20 at a time unless the wait wants
     more (`IO_LOCAL_TW_DEFAULT_MAX`).

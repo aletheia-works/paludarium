@@ -298,14 +298,13 @@ pub(crate) struct Ring {
 
 /// A thread's task work for its rings without
 /// `IORING_SETUP_DEFER_TASKRUN` (`tctx->task_list`), in order: it runs as
-/// the thread returns to its program if the work that started the list came
-/// from a ring without `IORING_SETUP_COOP_TASKRUN` (`TWA_SIGNAL_NO_IPI`),
-/// before a signal is delivered (`get_signal`), and as any of its rings
-/// waits. A new thread has none of its maker's.
+/// the thread returns to its program, which every such ring tells it to
+/// (`TWA_SIGNAL`, or `TWA_SIGNAL_NO_IPI` with `IORING_SETUP_COOP_TASKRUN`,
+/// which only spares a thread running its program an interrupt), and as
+/// any of its rings waits. A new thread has none of its maker's.
 #[derive(Default)]
 pub(crate) struct TaskWork {
     queue: VecDeque<(Arc<dyn FileHandle>, Deferred)>,
-    notify: bool,
 }
 
 impl Clone for TaskWork {
@@ -1546,8 +1545,7 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
 /// Adds task work (`io_req_task_work_add`): to the ring's own list with
 /// `IORING_SETUP_DEFER_TASKRUN` (`io_req_local_work_add`), else to the
 /// thread's (`io_req_normal_work_add`). The work that starts a list sets
-/// `IORING_SQ_TASKRUN`, and starts the thread's with the ring's way of
-/// telling it (`ctx->notify_method`).
+/// `IORING_SQ_TASKRUN`.
 fn queue(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Deferred) {
     if ring.flags & SETUP_DEFER_TASKRUN != 0 {
         let first = {
@@ -1563,7 +1561,6 @@ fn queue(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, work: Def
     let task_work = &mut c.process.task_work;
     task_work.queue.push_back((Arc::clone(file), work));
     if task_work.queue.len() == 1 {
-        task_work.notify = ring.flags & SETUP_COOP_TASKRUN == 0;
         ring.mark_taskrun(true);
     }
 }
@@ -1576,12 +1573,10 @@ fn flush_batch(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring) {
     }
 }
 
-/// Whether the thread runs its task work as it returns to its program:
-/// with a list a ring without `IORING_SETUP_COOP_TASKRUN` started
-/// (`TIF_NOTIFY_SIGNAL`), or a signal to deliver (`get_signal`).
+/// Whether the thread has task work to run as it returns to its program
+/// (`TIF_NOTIFY_SIGNAL`).
 pub(crate) fn task_work_due(state: &crate::ThreadState) -> bool {
     !state.task_work.queue.is_empty()
-        && (state.task_work.notify || crate::signals::next_pending(state, false).is_some())
 }
 
 /// Runs the thread's task work (`tctx_task_work_run`) in order, a batch for
@@ -1619,7 +1614,6 @@ pub(crate) fn run_task_work(c: &mut Context<'_>) {
             run_deferred(c, &file, ring, work);
         }
     }
-    c.process.task_work.notify = false;
 }
 
 fn end_task_work(c: &mut Context<'_>, file: &Arc<dyn FileHandle>) {

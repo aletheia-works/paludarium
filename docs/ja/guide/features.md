@@ -1475,9 +1475,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - タスクワークは Linux の `io_uring/tw.c` と同じく実行します。`IORING_NOP_TW`、リンクの
   次の要求、失敗したリンクの残りはタスクワークとして、投入のほかの完了の後に完了します。
-  - `IORING_SETUP_COOP_TASKRUN` のないリングは、呼び出しがプログラムに戻るときに実行します。
-  - 協調的なリングは、スレッドが次にどれかのリングで完了を待つときか、シグナルを受けるときに
-    実行します。
+  - `IORING_SETUP_DEFER_TASKRUN` のないリングは、呼び出しがプログラムに戻るときか、スレッドが
+    どれかのリングで待つときに実行します。`IORING_SETUP_COOP_TASKRUN` でも同じです
+    （`TWA_SIGNAL_NO_IPI`）。これはプログラムを実行中のスレッドに割り込みを送らないだけです。
   - `IORING_SETUP_DEFER_TASKRUN` のリングは、そのリングで `io_uring_enter` が待つときだけ、
     待ちがそれ以上を求めない限り一度に 20 個（`IO_LOCAL_TW_DEFAULT_MAX`）実行します。
 

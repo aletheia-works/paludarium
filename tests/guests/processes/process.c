@@ -9285,9 +9285,9 @@ static int io_uring_files_case(void) {
 
 /* io_uring's task work: an IORING_NOP_TW, and a link's next request, complete
    after the other completions of their submission. A ring without
-   IORING_SETUP_COOP_TASKRUN runs its task work as the call returns; a
-   cooperative one when the thread next waits on any ring or takes a signal;
-   one with IORING_SETUP_DEFER_TASKRUN only when it waits itself.
+   IORING_SETUP_DEFER_TASKRUN runs its task work as the call returns, with
+   IORING_SETUP_COOP_TASKRUN too; one with IORING_SETUP_DEFER_TASKRUN only
+   when it waits itself.
    IORING_SQ_TASKRUN says some is waiting. A link that fails with
    IOSQE_CQE_SKIP_SUCCESS cancels the rest without their completions. */
 static int uring_open_flags(struct uring *u, unsigned entries, unsigned flags) {

@@ -996,8 +996,7 @@ impl Kernel {
         self.ptrace_traps(thread, &mut restart);
         // io_uring's task work runs on the way back to the program, after
         // the call's ptrace stops and before a signal is taken, as Linux's
-        // `exit_to_user_mode_loop` runs it (`TIF_NOTIFY_SIGNAL`, or
-        // `get_signal`'s `task_work_run`).
+        // `exit_to_user_mode_loop` runs it (`TIF_NOTIFY_SIGNAL`).
         if io_uring::task_work_due(&thread.state) {
             let mut ctx = syscalls::Context {
                 number: u64::MAX,

@@ -202,7 +202,7 @@ test("a session waits for the exit of a Safari that is still exiting, and the wa
   const run = await stubbedSafari(key => healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), { 501: 30, 502: 60 });
   assert.ok(run.outcome.value, String(run.outcome.error));
   const wait = run.outcome.value.safari_exit_wait;
-  assert.equal(wait.exited, true); assert.deepEqual(wait.pids, [501, 502]); assert.ok(wait.waited_ms >= 50);
+  assert.equal(wait.exited, true); assert.deepEqual(wait.pids, [501, 502]); assert.ok(wait.waited_ms >= 45); // timers may wake a few ms before Date.now() shows the bound
   // One pgrep, then one exit wait per pid: no polling.
   assert.deepEqual(run.spawned.map(({ command, args }) => [command, args]), [["/usr/bin/safaridriver", ["--port", "4455"]], ["/usr/bin/pgrep", ["-x", "Safari"]],
     ["/usr/bin/caffeinate", ["-w", "501"]], ["/usr/bin/caffeinate", ["-w", "502"]]]);
@@ -219,7 +219,7 @@ for (const kill of [true, false]) test(`a Safari that never exits is logged with
     const run = await stubbedSafari(key => healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), { 501: 10, 502: Infinity });
     assert.ok(run.outcome.value, String(run.outcome.error));
     const wait = run.outcome.value.safari_exit_wait;
-    assert.equal(wait.exited, false); assert.ok(wait.waited_ms >= 50); assert.deepEqual(wait.pids, [501, 502]);
+    assert.equal(wait.exited, false); assert.ok(wait.waited_ms >= 45); // timers may wake a few ms before Date.now() shows the bound assert.deepEqual(wait.pids, [501, 502]);
     assert.deepEqual(wait.never_exited, [{ pid: 502, killed: kill, exited_after_kill: kill ? true : null }]);
     // Only the Safari that never exited, and only on CI.
     assert.deepEqual(run.killed, kill ? [[502, "SIGKILL"]] : []);

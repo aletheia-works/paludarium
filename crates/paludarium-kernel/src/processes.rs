@@ -5055,9 +5055,22 @@ impl Kernel {
             .filter(|(_, action)| action.handler == 1)
             .map(|(&number, &action)| (number, action))
             .collect();
-        // The io_uring requests it submitted that wait for their files are
-        // cancelled (`io_uring_task_cancel`).
-        crate::io_uring::cancel_task(&self.processes.io_uring, &self.inbox);
+        // Its io_uring requests are cancelled and its task work runs, on the
+        // old image's memory (`io_uring_task_cancel`).
+        crate::io_uring::exec_task(&mut crate::syscalls::Context {
+            number: u64::MAX,
+            tid: thread.tid,
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut thread.state,
+            cpu: &mut thread.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        });
         // exec keeps the thread's CPU time, as it keeps the process.
         let cpu = std::mem::take(&mut thread.state.cpu);
         let old = std::mem::take(&mut thread.state.credentials);

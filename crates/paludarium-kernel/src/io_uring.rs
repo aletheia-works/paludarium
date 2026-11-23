@@ -360,6 +360,9 @@ pub(crate) struct Polls {
     /// Task work that came for a thread that exited, which runs once no
     /// ring's lock is held (`io_fallback_tw` queuing it for a worker).
     fallback: Mutex<Vec<(std::sync::Weak<dyn FileHandle>, Deferred)>>,
+    /// Every ring, which a thread's `execve` or exit looks through for its
+    /// requests (`tctx->xa`).
+    rings: Mutex<Vec<std::sync::Weak<dyn FileHandle>>>,
 }
 
 /// A request that waits for its file (`struct async_poll`): the ring, the
@@ -426,6 +429,10 @@ struct Cancels {
 /// (`req->work.cancel_seq`), which the same one does not again.
 struct Hashed {
     id: u64,
+    /// The [`crate::SignalInbox`] of the thread that submitted it
+    /// (`req->tctx`), which its `execve` or its process's exit cancels it
+    /// for.
+    inbox: usize,
     user_data: u64,
     opcode: u8,
     file: usize,
@@ -1751,7 +1758,7 @@ fn arm(
     }
     let polls = &c.processes.io_uring;
     let (polled, mask) = (Arc::clone(&waits.file), waits.mask);
-    let id = ring.hash(&chain[0], &polled);
+    let id = ring.hash(&chain[0], &polled, c.inbox);
     polls
         .armed
         .lock()
@@ -1849,6 +1856,18 @@ pub(crate) fn progress(c: &Context<'_>) {
 /// `io_task_group_exiting`): each leaves its wait and fails with
 /// `ECANCELED` as its task work runs ([`Deferred::Poll`]).
 pub(crate) fn cancel_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>) {
+    // Every request of the thread in a ring's cancel table is cancelled
+    // (`io_poll_remove_all`), one whose file became ready too: its task work,
+    // queued already, fails it.
+    let owner = Arc::as_ptr(inbox) as usize;
+    for file in live_rings(polls) {
+        if let Ok(ring) = downcast(&file) {
+            let mut cancels = ring.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+            for hashed in cancels.hashed.iter_mut().filter(|h| h.inbox == owner) {
+                hashed.cancelled = true;
+            }
+        }
+    }
     let cancelled: Vec<Armed> = {
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
         let (cancelled, kept) = std::mem::take(&mut *armed)
@@ -1867,16 +1886,6 @@ pub(crate) fn cancel_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>) {
         let Ok(ring) = downcast(&file) else {
             continue;
         };
-        if let Some(hashed) = ring
-            .cancels
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .hashed
-            .iter_mut()
-            .find(|h| h.id == armed.id)
-        {
-            hashed.cancelled = true;
-        }
         add_work(
             polls,
             &file,
@@ -1890,6 +1899,44 @@ pub(crate) fn cancel_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>) {
             },
         );
     }
+}
+
+/// The rings still open, dropping those that closed.
+fn live_rings(polls: &Polls) -> Vec<Arc<dyn FileHandle>> {
+    let mut rings = polls.rings.lock().unwrap_or_else(PoisonError::into_inner);
+    rings.retain(|r| r.strong_count() != 0);
+    rings.iter().filter_map(std::sync::Weak::upgrade).collect()
+}
+
+/// The thread calls `execve` (`io_uring_task_cancel`, before the new image
+/// replaces its memory): as `io_uring_cancel_generic` loops, the task work
+/// of the `IORING_SETUP_DEFER_TASKRUN` rings it submits to runs
+/// (`io_run_local_work`), the requests it submitted that wait are
+/// cancelled ([`cancel_task`]), its own task work runs, and the rings' again.
+pub(crate) fn exec_task(c: &mut Context<'_>) {
+    let own: Vec<Arc<dyn FileHandle>> = live_rings(&c.processes.io_uring)
+        .into_iter()
+        .filter(|file| {
+            downcast(file).is_ok_and(|ring| {
+                ring.flags & SETUP_DEFER_TASKRUN != 0 && ring.submitter == Some(c.tid)
+            })
+        })
+        .collect();
+    let run_own = |c: &mut Context<'_>| {
+        for file in &own {
+            if let Ok(ring) = downcast(file)
+                && local_pending(ring)
+            {
+                run_local(c, file, ring, u32::MAX, u32::MAX);
+            }
+        }
+    };
+    run_own(c);
+    cancel_task(&c.processes.io_uring, c.inbox);
+    if task_work_due(c.inbox) {
+        run_task_work(c);
+    }
+    run_own(c);
 }
 
 /// The thread `inbox` belongs to exits (`do_exit`): its process's whole
@@ -2006,12 +2053,18 @@ fn bucket(user_data: u64, bits: u32) -> u64 {
 impl Ring {
     /// Puts a request that waits for `file` in the ring's [`Cancels`]
     /// (`io_poll_req_insert`), and gives its entry.
-    fn hash(&self, request: &Request, file: &Arc<dyn FileHandle>) -> u64 {
+    fn hash(
+        &self,
+        request: &Request,
+        file: &Arc<dyn FileHandle>,
+        inbox: &Arc<crate::SignalInbox>,
+    ) -> u64 {
         let mut cancels = self.cancels.lock().unwrap_or_else(PoisonError::into_inner);
         let id = cancels.next;
         cancels.next += 1;
         cancels.hashed.push(Hashed {
             id,
+            inbox: Arc::as_ptr(inbox) as usize,
             user_data: request.user_data,
             opcode: request.opcode,
             file: file_identity(file),
@@ -2677,7 +2730,14 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
     c.mem
         .write(GuestAddr(params), &p)
         .map_err(|_| Errno::EFAULT)?;
-    c.files.install(Arc::new(ring), true, c.group.nofile())
+    let file: Arc<dyn FileHandle> = Arc::new(ring);
+    c.processes
+        .io_uring
+        .rings
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Arc::downgrade(&file));
+    c.files.install(file, true, c.group.nofile())
 }
 
 /// Zeroed pages the kernel gives for `len` bytes, which a mapping of the

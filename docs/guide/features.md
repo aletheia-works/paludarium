@@ -1755,8 +1755,12 @@ kernel.
     link's next request with `EFAULT` (`io_should_terminate_tw`), and an
     `IORING_NOP_TW` completes.
   - `execve` cancels every request the thread submitted that waits for its
-    file (`io_uring_task_cancel`). Each completes with `ECANCELED` before
-    the new program runs.
+    file, one whose file became ready too (`io_uring_task_cancel`), on the
+    old image's memory, as `io_uring_cancel_generic` loops. The task work of
+    the `IORING_SETUP_DEFER_TASKRUN` rings it submits to runs first, so a
+    request whose file became ready there goes on. Then the requests are
+    cancelled, and its task work and theirs run, so each completes with
+    `ECANCELED` before the new program runs.
   - A ring whose last descriptor and mapping close lets go of its waiting
     requests and the files they hold, as Linux master does before `close`
     returns, so a pipe whose only reader was such a request takes no more

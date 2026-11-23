@@ -10081,6 +10081,32 @@ static int io_uring_exit_case(const char *self) {
     printf("write: %ld\n", (long)write(c[1], "ef", 2));
     printf("read: %ld\n", (long)read(c[0], more, sizeof more));
 
+    /* With IORING_SETUP_DEFER_TASKRUN, execve runs the ring's work first: a
+       read whose pipe became ready reads, then the one that waits is
+       cancelled. The new program reads the ring it kept. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        struct uring dr;
+        int e[2], g[2];
+        char buf[8], buf2[8];
+        if (uring_open_flags(&dr, 8, 1 << 12 | 1 << 13) || pipe(e) || pipe(g)) _exit(1);
+        pw_read(&dr, 5, e[0], buf, sizeof buf, 0);
+        pw_read(&dr, 6, g[0], buf2, sizeof buf2, 0);
+        if (uring_enter(dr.fd, 2, 0, 0, NULL, 0) != 2) _exit(1);
+        if (write(e[1], "hi", 2) != 2) _exit(1);
+        if (dup2(dr.fd, 50) != 50 || dup2(e[0], 51) != 51) _exit(1);
+        char len[16], entries[16];
+        snprintf(len, sizeof len, "%u", dr.array + 4 * dr.sq_entries);
+        snprintf(entries, sizeof entries, "%u", dr.cq_entries);
+        char *args[] = {"process", "io-uring-exec-reap", (char *)self, len, entries, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(2);
+    }
+    waitpid(child, &status, 0);
+    printf("defer-child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
     /* A ring that closes lets go of the pipe its read holds. */
     if (uring_open(&closing, 8)) return 81;
     pw_read(&closing, 4, d[0], more, sizeof more, 0);
@@ -36796,6 +36822,19 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-exec-reap")) {
+        struct uring r;
+        r.fd = 50;
+        r.cq_entries = (unsigned)atoi(argv[4]);
+        r.rings = mmap(NULL, (size_t)atoi(argv[3]), PROT_READ | PROT_WRITE, MAP_SHARED, 50, 0);
+        if (r.rings == MAP_FAILED) return 3;
+        uring_reap(&r, "defer-exec");
+        char b[8];
+        fcntl(51, F_SETFL, O_NONBLOCK);
+        long n = read(51, b, sizeof b);
+        printf("defer-read: %ld errno=%d\n", n, n < 0 ? errno : 0);
+        return 0;
+    }
     if (!strcmp(mode, "io-uring-exec-child")) {
         pw_sleep_ms(300);
         return 0;

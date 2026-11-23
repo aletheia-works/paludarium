@@ -529,9 +529,7 @@ verified.
   files are ready, as for a thread that exits alone. In that exit, a
   link's next request that still waits to run fails with `EFAULT`, as an
   exiting thread's does; Linux master runs it before the thread is
-  exiting. At `execve`, a cancelled request of an
-  `IORING_SETUP_DEFER_TASKRUN` ring completes at the ring's next wait,
-  where Linux runs the ring's work during `execve`. A registered file that an
+  exiting. A registered file that an
   update outside a submission takes from its slot posts its tag at once,
   even while a request that waits for its file holds it; Linux posts the
   tag once that request completes. A registered buffer's pages

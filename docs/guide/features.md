@@ -4916,11 +4916,8 @@ kernel.
   jump ("last insn is not an exit or jmp"), and one other than the main
   program has no `BPF_LD_ABS`, `BPF_LD_IND` or `bpf_tail_call` ("LD_ABS
   is not allowed in subprogs without BTF", "tail_call is not allowed in
-  subprogs without BTF", as 7.0 refuses them; master takes them), and no
-  function calls itself, directly or through others ("recursive call from
-  () to ()", master's check, as a function has no name without BTF; 7.0
-  refuses one as the walk goes 9 frames deep), all `EINVAL` before any
-  path is walked. The callee starts with the caller's
+  subprogs without BTF", as 7.0 refuses them; master takes them), all
+  `EINVAL` before any path is walked. The callee starts with the caller's
   R1 to R5 and a frame pointer and 512-byte stack of its own; its R0 and
   R6 to R9 are not readable until written, and the caller's R0 to R5 are
   not readable after the call, which gives it the callee's R0. A callee
@@ -4928,7 +4925,10 @@ kernel.
   the caller") or store one in a caller's frame ("cannot spill pointers to
   stack into stack frame of the caller", both `EINVAL`), but reads and
   writes a caller's stack through a pointer to it. Calls go 8 frames deep
-  at most ("the call stack of %d frames is too deep", `E2BIG`), and after
+  at most ("the call stack of %d frames is too deep", `E2BIG`), which is
+  how a recursive call is refused, as the test machines' 7.0 does (master
+  refuses one before the walk, "recursive call from %s() to %s()", which
+  comes here once the test machines' kernel has it); after
   the walk, along every chain of calls, each function's stack depth,
   rounded up to 16 bytes as with the JIT, adds up to 512 bytes at most
   ("combined stack size of %d calls is %d. Too large", `EACCES`). With

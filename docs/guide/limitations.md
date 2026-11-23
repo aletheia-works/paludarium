@@ -392,7 +392,12 @@ verified.
   pointer with a variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a
   conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
-  takes a bounded loop from a privileged loader). A scalar is a value the
+  takes a bounded loop from a privileged loader). A recursive call is
+  refused as the test machines' 7.0 refuses it, as the walk goes 9
+  frames deep ("the call stack of 9 frames is too deep", `E2BIG`), not
+  before the walk as master does ("recursive call from %s() to %s()",
+  `EINVAL`): the differential tests compare the line with that kernel,
+  and master's check comes here once it has it. A scalar is a value the
   verifier knows or nothing at all, where Linux keeps its bounds, so it
   walks both ways of a jump Linux knows goes one way, and it prunes no
   states, so a program with many branches may reach the limits sooner. A

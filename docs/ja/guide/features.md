@@ -4250,17 +4250,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   exit かジャンプです（"last insn is not an exit or jmp"）。メインプログラム以外の関数に
   `BPF_LD_ABS`、`BPF_LD_IND`、`bpf_tail_call` は置けません（7.0 と同じく "LD_ABS is not
   allowed in subprogs without BTF"、"tail_call is not allowed in subprogs without BTF"。master
-  は受け入れます）。関数が自分自身を、直接にもほかの関数を通しても呼ぶことはできません
-  （master の確かめ方で "recursive call from () to ()"。BTF がなければ関数に名前がありません。
-  7.0 は、たどる経路が 9 フレームの深さになったところで断ります）。どれも、どの経路を
-  たどるより前に `EINVAL` で断ります。呼ばれた関数は、
+  は受け入れます）。どれも、どの経路をたどるより前に `EINVAL` で断ります。呼ばれた関数は、
   呼び出し元の R1 から R5 と、自分のフレームポインタと 512 バイトのスタックで始まります。
   その R0 と R6 から R9 は書くまで読めず、呼び出し元の R0 から R5 は呼び出しの後は読めません。
   呼び出し元の R0 には呼ばれた関数の R0 が入ります。呼ばれた関数は、スタックへのポインタを
   返すことも（"cannot return stack pointer to the caller"）、呼び出し元のフレームに置くことも
   できません（"cannot spill pointers to stack into stack frame of the caller"、どちらも
   `EINVAL`）。呼び出し元のスタックは、そこへのポインタを通して読み書きできます。呼び出しの
-  深さは 8 フレームまでです（"the call stack of %d frames is too deep"、`E2BIG`）。経路を
+  深さは 8 フレームまでです（"the call stack of %d frames is too deep"、`E2BIG`）。再帰呼び出しも、
+  テストのマシンの 7.0 と同じくこれで断ります（master は経路をたどる前に "recursive call from
+  %s() to %s()" で断ります。テストのマシンのカーネルにこれが入ったら、ここでもそうします）。経路を
   たどった後、呼び出しの連なりのどれでも、各関数のスタックの深さを JIT と同じく 16 バイトに
   切り上げた和は 512 バイトまでです（"combined stack size of %d calls is %d. Too large"、
   `EACCES`）。`BPF_LOG_STATS` では、ログに関数ごとのスタックの深さと、呼び出しの連なりが使う

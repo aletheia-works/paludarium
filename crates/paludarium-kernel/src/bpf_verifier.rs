@@ -19,8 +19,10 @@
 //!   `bpf_tail_call` in a function other than the main program, where 7.0
 //!   refuses them (`check_abnormal_return`);
 //! - master refuses a recursive call before the walk ("recursive call from
-//!   %s() to %s()", `sort_subprogs_topo`), where 7.0 refuses it as the walk
-//!   goes 9 frames deep; the check and its line are master's.
+//!   %s() to %s()", `sort_subprogs_topo`, `EINVAL`), where 7.0 and the test
+//!   machines' kernel refuse it as the walk goes 9 frames deep (`E2BIG`),
+//!   which is what is done here, as the differential tests compare it with
+//!   that kernel; master's check comes once that kernel has it.
 //!
 //! Every function is static, as no program here has BTF: a call gives the
 //! callee a frame of its own, up to 8 frames, whose stacks add up to 512
@@ -546,7 +548,6 @@ fn structure(
         i += fields(insns, i, options, maps, walk)?;
     }
     cfg(insns)?;
-    acyclic(insns, &walk.starts)?;
     // check_attach_btf_id: a socket filter cannot sleep. 7.0's words.
     if options.sleepable {
         return refuse(
@@ -566,53 +567,6 @@ fn structure(
 
 /// `BPF_MAX_SUBPROGS`.
 const MAX_SUBPROGS: usize = 256;
-/// Master's `sort_subprogs_topo`: no function calls itself, directly or
-/// through others. With no BTF a function has no name, so the line is the
-/// same whichever call it finds; 7.0 has no such check and refuses a
-/// recursive call as the walk goes 9 frames deep.
-fn acyclic(insns: &[Insn], starts: &[usize]) -> Checked<()> {
-    let n = starts.len();
-    let callees: Vec<Vec<usize>> = (0..n)
-        .map(|f| {
-            body(starts, insns.len(), f)
-                .filter(|&i| {
-                    insns[i].code == class::JMP | jmp::CALL && insns[i].src == pseudo::CALL
-                })
-                .filter_map(|i| {
-                    let start = (i as i64 + i64::from(insns[i].imm) + 1) as usize;
-                    starts.binary_search(&start).ok()
-                })
-                .collect()
-        })
-        .collect();
-    // 0 unvisited, 1 on the stack, 2 done.
-    let mut color = vec![0u8; n];
-    for root in 0..n {
-        if color[root] != 0 {
-            continue;
-        }
-        color[root] = 1;
-        let mut stack = vec![(root, 0usize)];
-        while let Some(&mut (f, ref mut next)) = stack.last_mut() {
-            let Some(&g) = callees[f].get(*next) else {
-                color[f] = 2;
-                stack.pop();
-                continue;
-            };
-            *next += 1;
-            match color[g] {
-                1 => return refuse(Errno::EINVAL, "recursive call from () to ()"),
-                0 => {
-                    color[g] = 1;
-                    stack.push((g, 0));
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
 /// `MAX_CALL_FRAMES`.
 const MAX_CALL_FRAMES: usize = 8;
 
@@ -984,7 +938,7 @@ fn cfg(insns: &[Insn]) -> Checked<()> {
     let mut stack = vec![0usize];
     state[0] = DISCOVERED;
     // A call's edge to its function may reach one the walk is in: that is
-    // recursion, which sort_subprogs_topo refuses after.
+    // recursion, which the walk refuses as it goes 9 frames deep.
     let push = |state: &mut Vec<u8>,
                 stack: &mut Vec<usize>,
                 t: usize,
@@ -2002,35 +1956,41 @@ impl Walk {
                 .collect::<Vec<_>>()
         };
         let callees: Vec<Vec<usize>> = (0..n).map(calls).collect();
-        // The deepest stack and the most frames below each function, which
-        // check_cfg's refusal of back-edges keeps finite: a function's
-        // callees start after the calls that reach them are explored.
-        let mut below = vec![None::<(i64, usize)>; n];
+        // For each function at each frame (1 the main program's), the
+        // deepest stack of the chains below it and whether one of them goes
+        // past 8 frames. A recursive call, which the walk refuses as it goes
+        // 9 frames deep, may be in code the walk does not take: the frames
+        // keep this finite.
+        let mut below = vec![[None::<(i64, bool)>; MAX_CALL_FRAMES + 1]; n];
         fn measure(
             f: usize,
+            frame: usize,
             callees: &[Vec<usize>],
             round: &dyn Fn(usize) -> i64,
-            below: &mut [Option<(i64, usize)>],
-        ) -> (i64, usize) {
-            if let Some(m) = below[f] {
+            below: &mut [[Option<(i64, bool)>; MAX_CALL_FRAMES + 1]],
+        ) -> (i64, bool) {
+            if let Some(m) = below[f][frame] {
                 return m;
             }
-            let mut m = (round(f), 1);
-            for &g in &callees[f] {
-                let (depth, frames) = measure(g, callees, round, below);
-                m = (m.0.max(round(f) + depth), m.1.max(frames + 1));
+            let mut m = (round(f), false);
+            if frame >= MAX_CALL_FRAMES {
+                m.1 = !callees[f].is_empty();
+            } else {
+                for &g in &callees[f] {
+                    let (depth, deep) = measure(g, frame + 1, callees, round, below);
+                    m = (m.0.max(round(f) + depth), m.1 || deep);
+                }
             }
-            below[f] = Some(m);
+            below[f][frame] = Some(m);
             m
         }
-        measure(0, &callees, &round, &mut below);
         fn walk(
             f: usize,
             depth: i64,
             frames: usize,
             callees: &[Vec<usize>],
             round: &dyn Fn(usize) -> i64,
-            below: &[Option<(i64, usize)>],
+            below: &mut [[Option<(i64, bool)>; MAX_CALL_FRAMES + 1]],
             max: &mut i64,
         ) -> Checked<()> {
             let depth = depth + round(f);
@@ -2050,8 +2010,8 @@ impl Walk {
                 }
                 // A chain that cannot fail adds only its deepest stack to
                 // the maximum, as Linux's walk of it would.
-                let (d, k) = below[g].unwrap_or((0, 0));
-                if depth + d <= MAX_STACK && frames + k < MAX_CALL_FRAMES {
+                let (d, deep) = measure(g, frames + 1, callees, round, below);
+                if depth + d <= MAX_STACK && !deep {
                     *max = (*max).max(depth + d);
                     continue;
                 }
@@ -2060,7 +2020,7 @@ impl Walk {
             Ok(())
         }
         let mut max = 0;
-        let result = walk(0, 0, 1, &callees, &round, &below, &mut max);
+        let result = walk(0, 0, 1, &callees, &round, &mut below, &mut max);
         self.max_depth = max as u32;
         result
     }
@@ -3565,13 +3525,13 @@ mod tests {
             refused(&[call_by(1), exit(), i(0x85, 0, 0, 0, 12), exit()]),
             einval("tail_call is not allowed in subprogs without BTF")
         );
-        // check_cfg: code no path reaches, with a call in it; and master's
-        // sort_subprogs_topo: recursion, direct or not.
+        // check_cfg: code no path reaches, with a call in it; and recursion,
+        // direct or not, which the walk refuses 9 frames deep, as 7.0 does.
         assert_eq!(
             refused(&[mov(0, 0), exit(), mov(0, 0), call_by(-4), exit()]),
             einval("unreachable insn 2")
         );
-        let recursive = einval("recursive call from () to ()");
+        let recursive = (E2BIG, "the call stack of 9 frames is too deep".to_string());
         assert_eq!(
             refused(&[call_by(1), exit(), call_by(-1), exit()]),
             recursive
@@ -3583,6 +3543,19 @@ mod tests {
         assert_eq!(
             refused(&[call_by(1), exit(), mov(0, 0), call_by(-4), exit()]),
             recursive
+        );
+        // Recursion where the walk does not go: the stack check after it
+        // goes 8 frames deep.
+        assert_eq!(
+            refused(&[
+                mov(0, 0),
+                i(0x15, 0, 0, 1, 0),
+                call_by(1),
+                exit(),
+                call_by(-1),
+                exit(),
+            ]),
+            (E2BIG, "the call stack of 8 frames is too deep !".into())
         );
         // A jump back is still a back-edge.
         assert_eq!(

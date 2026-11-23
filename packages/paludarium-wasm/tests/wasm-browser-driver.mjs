@@ -57,6 +57,10 @@ function safariPids() {
     probe.once("error", () => resolve([]));
   });
 }
+// Whether `pid` is still a process (signal 0 checks without sending one).
+function running(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code !== "ESRCH"; }
+}
 // Whether `pid` exited within `ms`.
 function exitOf(pid, ms) {
   const waiter = spawn("/usr/bin/caffeinate", ["-w", String(pid)], { stdio: "ignore" });
@@ -70,7 +74,8 @@ async function untilSafariExited() {
   const start = Date.now(), deadline = start + safariExit.waitMs;
   const pids = await safariPids();
   const exited = await Promise.all(pids.map(pid => exitOf(pid, Math.max(0, deadline - Date.now()))));
-  const left = pids.filter((_, index) => !exited[index]);
+  // A wait cut short by the deadline (0 ms for a pid reached after it) may miss an exit that came: ask once more.
+  const left = pids.filter((pid, index) => !exited[index] && running(pid));
   const wait = { exited: left.length === 0, waited_ms: Date.now() - start, pids };
   if (left.length === 0) return wait;
   wait.never_exited = [];

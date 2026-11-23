@@ -18,26 +18,31 @@ function stubPgrep(child, pids) {
 // Stub safaridriver/pkill/pgrep/caffeinate, process.kill, fetch, AbortSignal.timeout and console.error for one Safari
 // run; everything is restored in finally. `reply(key, count)` answers a WebDriver request (count = how many times that
 // key was asked) with [status, value]. `safaris` maps the pid of each Safari still running to the ms after which it
-// exits (Infinity: only when killed); `caffeinate -w <pid>` exits when that Safari does.
-async function stubbedSafari(reply, run, safaris = {}) {
+// exits (Infinity: only when killed); `caffeinate -w <pid>` exits `lagMs` after that Safari does.
+async function stubbedSafari(reply, run, safaris = {}, lagMs = 0) {
   const childProcess = createRequire(import.meta.url)("node:child_process");
   const original = { spawn: childProcess.spawn, fetch: globalThis.fetch, timeout: AbortSignal.timeout, error: console.error, kill: process.kill };
   const timeouts = new WeakMap(), requests = [], spawned = [], logged = [], counts = {}, killed = [];
   const exits = Object.fromEntries(Object.entries(safaris).map(([pid, ms]) => {
-    let done; const exited = new Promise(resolve => { done = resolve; });
-    if (Number.isFinite(ms)) setTimeout(done, ms).unref();
-    return [pid, { exited, done }];
+    const entry = { gone: false };
+    entry.exited = new Promise(resolve => { entry.done = () => { entry.gone = true; resolve(); }; });
+    if (Number.isFinite(ms)) setTimeout(entry.done, ms).unref();
+    return [pid, entry];
   }));
   childProcess.spawn = (command, args) => {
     const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, stdout: new EventEmitter(), stderr: new EventEmitter() });
     child.kill = signal => { if (child.signalCode === null && child.exitCode === null) { child.signalCode = signal; setImmediate(() => child.emit("exit", null, signal)); } return true; };
     if (command === "/usr/bin/pkill") setImmediate(() => { child.exitCode = 0; child.emit("exit", 0, null); });
     if (command === "/usr/bin/pgrep") stubPgrep(child, Object.keys(safaris).map(Number));
-    if (command === "/usr/bin/caffeinate") (exits[args[1]]?.exited ?? Promise.resolve()).then(() => { if (child.signalCode === null) { child.exitCode = 0; child.emit("exit", 0, null); } });
+    if (command === "/usr/bin/caffeinate") (exits[args[1]]?.exited ?? Promise.resolve()).then(() => setTimeout(() => { if (child.signalCode === null) { child.exitCode = 0; child.emit("exit", 0, null); } }, lagMs));
     spawned.push({ command, args, child });
     return child;
   };
-  process.kill = (pid, signal) => { killed.push([pid, signal]); exits[pid]?.done(); return true; };
+  process.kill = (pid, signal) => {
+    if (!exits[pid] || exits[pid].gone) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    if (signal === 0) return true;
+    killed.push([pid, signal]); exits[pid].done(); return true;
+  };
   syncBuiltinESMExports();
   AbortSignal.timeout = ms => { const signal = original.timeout.call(AbortSignal, ms); timeouts.set(signal, ms); return signal; };
   console.error = (...args) => { logged.push(args.join(" ")); };
@@ -221,5 +226,18 @@ for (const kill of [true, false]) test(`a Safari that never exits is logged with
     assert.equal(run.requests.filter(r => r.key === "POST /session").length, 1);
     assert.deepEqual(JSON.parse(run.logged[0]), { safari_never_exited: { pid: 502, waited_ms: wait.waited_ms, killing: kill } });
     assert.equal(JSON.parse(run.logged[1]).safari_exit_wait.exited, false);
+  } finally { Object.assign(safariExit, saved); }
+});
+test("a Safari whose exit the deadline cut short is not taken for one that never exited", async () => {
+  const saved = { ...safariExit };
+  // The wait ends at 10 ms, before caffeinate reports (40 ms late) the exit of a Safari gone at 0 ms.
+  Object.assign(safariExit, { waitMs: 10, killWaitMs: 50, kill: true });
+  try {
+    const run = await stubbedSafari(key => healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000), { 501: 0 }, 40);
+    assert.ok(run.outcome.value, String(run.outcome.error));
+    const wait = run.outcome.value.safari_exit_wait;
+    assert.equal(wait.exited, true); assert.deepEqual(wait.pids, [501]);
+    assert.deepEqual(run.killed, []);
+    assert.ok(!run.logged.some(line => line.includes("safari_never_exited")));
   } finally { Object.assign(safariExit, saved); }
 });

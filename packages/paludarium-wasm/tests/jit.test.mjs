@@ -128,14 +128,34 @@ test('reused rollback refreshes state view after shared memory growth',()=>{
   assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),-1);
   assert.deepEqual(scratch(s),before);
 });
-test('byte loop rejects last-byte mutation before execution',()=>{
-  const s=setup(),before=pattern(s);
+test('execution runs the prepared copy after a last-byte mutation of the caller\'s bytes',()=>{
+  const s=setup();
   assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);
   new Uint8Array(s.memory.buffer)[512+s.bytes.length-1]^=1;
-  assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),-1);
-  assert.deepEqual(scratch(s),before);
+  assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),0);
+  assert.equal(new BigUint64Array(s.memory.buffer,64,50)[0],42n);
 });
-test('byte loop rejects different length without touching scratch',()=>{
+test('execution runs the prepared copy after the caller\'s bytes become another module',()=>{
+  const s=setup(),other=fillAndTrap(),before=pattern(s);
+  assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);
+  new Uint8Array(s.memory.buffer,512,other.length).set(other);
+  assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),0);
+  assert.deepEqual(scratch(s).subarray(8),before.subarray(8));
+  assert.equal(new BigUint64Array(s.memory.buffer,64,50)[0],42n);
+});
+test('a full module map evicts the least recently used module',()=>{
+  const s=setup();
+  for(let key=1;key<=1024;key++)assert.equal(s.bridge.prepare(key,512,s.bytes.length),0);
+  assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),0);
+  assert.equal(s.bridge.prepare(1025,512,s.bytes.length),0);
+  assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),0);
+  assert.equal(s.bridge.execute(2,512,s.bytes.length,64,S),-2);
+  assert.equal(s.bridge.execute(3,512,s.bytes.length,64,S),0);
+  assert.equal(s.bridge.prepare(1026,512,s.bytes.length),0);
+  assert.equal(s.bridge.execute(4,512,s.bytes.length,64,S),-2);
+  assert.equal(s.bridge.execute(3,512,s.bytes.length,64,S),0);
+});
+test('execution rejects a different length without touching scratch',()=>{
   const s=setup(),before=pattern(s);
   assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);
   assert.equal(s.bridge.execute(1,512,s.bytes.length-1,64,S),-1);

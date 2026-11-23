@@ -6,12 +6,14 @@ struct Entry<T> {
     generation: u64,
     end: u64,
     translation: T,
+    /// The clock at the entry's last use: the least recently used entry has
+    /// the smallest. A hit only writes it; an insertion into a full cache
+    /// looks for the smallest.
     access: u64,
 }
 
 struct State<T> {
     entries: BTreeMap<(u64, u64), Entry<T>>,
-    accesses: BTreeMap<u64, (u64, u64)>,
     clock: u64,
 }
 impl<T> State<T> {
@@ -19,16 +21,13 @@ impl<T> State<T> {
         if self.clock == u64::MAX {
             // Evicting all entries on counter exhaustion is a safe fallback.
             self.entries.clear();
-            self.accesses.clear();
             self.clock = 0;
         }
         self.clock += 1;
         self.clock
     }
     fn remove(&mut self, key: &(u64, u64)) {
-        if let Some(entry) = self.entries.remove(key) {
-            self.accesses.remove(&entry.access);
-        }
+        self.entries.remove(key);
     }
 }
 
@@ -59,7 +58,6 @@ impl<T: Clone> EpochCache<T> {
         Self {
             state: Mutex::new(State {
                 entries: BTreeMap::new(),
-                accesses: BTreeMap::new(),
                 clock: 0,
             }),
         }
@@ -98,12 +96,8 @@ impl<T: Clone> EpochCache<T> {
             add(Counter::LruUpdates, 1);
         }
         let entry = state.entries.get_mut(&key)?;
-        let old_access = entry.access;
         entry.access = access;
-        let translation = entry.translation.clone();
-        state.accesses.remove(&old_access);
-        state.accesses.insert(access, key);
-        Some(translation)
+        Some(entry.translation.clone())
     }
 
     pub(crate) fn insert(
@@ -127,9 +121,12 @@ impl<T: Clone> EpochCache<T> {
         let key = (space, rip);
         state.remove(&key);
         if state.entries.len() >= 1024
-            && let Some((_, oldest)) = state.accesses.first_key_value()
+            && let Some(oldest) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.access)
+                .map(|(&key, _)| key)
         {
-            let oldest = *oldest;
             state.remove(&oldest);
         }
         state.entries.insert(
@@ -141,7 +138,6 @@ impl<T: Clone> EpochCache<T> {
                 access,
             },
         );
-        state.accesses.insert(access, key);
         true
     }
 
@@ -170,13 +166,12 @@ mod tests {
     fn snapshot(cache: &EpochCache<Option<u64>>) -> String {
         let state = cache.state.lock().unwrap();
         format!(
-            "{:?}/{:?}/{}",
+            "{:?}/{}",
             state
                 .entries
                 .iter()
                 .map(|(k, e)| (*k, e.generation, e.end, e.translation, e.access))
                 .collect::<Vec<_>>(),
-            state.accesses,
             state.clock
         )
     }
@@ -257,7 +252,7 @@ mod tests {
             assert_eq!(cache.get_selected(1, 4096, 1, Option::is_some), Some(None));
         }
         assert_eq!(cache.state.lock().unwrap().clock, clock);
-        assert_eq!(cache.state.lock().unwrap().accesses.len(), 1);
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
         assert_eq!(cache.get_selected(1, 4096, 2, Option::is_some), None);
     }
 
@@ -279,10 +274,10 @@ mod tests {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, 42);
         assert_eq!(cache.get(1, 4096, 2), None);
-        assert!(cache.state.lock().unwrap().accesses.is_empty());
+        assert!(cache.state.lock().unwrap().entries.is_empty());
         cache.insert(1, 4096, 2, 1, 43);
         cache.invalidate(4096);
-        assert!(cache.state.lock().unwrap().accesses.is_empty());
+        assert!(cache.state.lock().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -291,7 +286,7 @@ mod tests {
         cache.insert(1, 4096, 1, 1, 42);
         cache.state.lock().unwrap().clock = u64::MAX;
         assert_eq!(cache.get(1, 4096, 1), None);
-        assert!(cache.state.lock().unwrap().accesses.is_empty());
+        assert!(cache.state.lock().unwrap().entries.is_empty());
         assert!(cache.insert(1, 8192, 1, 1, 43));
         assert_eq!(cache.get(1, 8192, 1), Some(43));
     }

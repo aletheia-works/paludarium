@@ -34,7 +34,10 @@ export function costSnapshot(exports) {
 // u64 words (144 bytes), then XMM0..15 as 16-byte little-endian lanes.
 export const JIT_STATE_BYTES = 400;
 export function jitImports(memory, cost = null, now = () => performance.now()) {
+  // Each entry keeps the clock at its last use; a full map evicts the least
+  // recently used, so a use writes one number instead of reordering the map.
   const compiled = new Map();
+  let clock = 0;
   const rollback = new Uint8Array(JIT_STATE_BYTES);
   const equalBytes = (stored, view) => {
     if (stored.length !== view.length) return false;
@@ -54,7 +57,7 @@ export function jitImports(memory, cost = null, now = () => performance.now()) {
         if (entry) {
           if (cost) cost(17, view.length);
           if (!equalBytes(entry.bytes, view)) return -1;
-          compiled.delete(key); compiled.set(key, entry);
+          entry.used = ++clock;
           return 0;
         }
         const bytes = view.slice();
@@ -68,8 +71,12 @@ export function jitImports(memory, cost = null, now = () => performance.now()) {
           if (cost) { cost(14, 1); cost(15, Math.round(Math.max(0, now() - started) * 1e6)); }
         }
         if (typeof instance.exports.run !== "function") return -1;
-        if (compiled.size >= 1024) compiled.delete(compiled.keys().next().value);
-        compiled.set(key, { bytes, run: instance.exports.run });
+        if (compiled.size >= 1024) {
+          let oldest, used = Infinity;
+          for (const [other, entry] of compiled) if (entry.used < used) { oldest = other; used = entry.used; }
+          compiled.delete(oldest);
+        }
+        compiled.set(key, { bytes, run: instance.exports.run, used: ++clock });
         return 0;
       } catch { return -1; }
     },
@@ -90,16 +97,17 @@ export function jitImports(memory, cost = null, now = () => performance.now()) {
           || stateLength !== JIT_STATE_BYTES || !range(codePointer, codeLength) || !range(statePointer, stateLength)) return -1;
       // A module ID is allocated in shared Rust and never reused. Each Worker
       // separately compiles it; JS objects/handles never cross Worker boundaries.
+      // The module runs from prepare's private copy of its bytes, compared
+      // there and compiled from it, so a later change to the caller's bytes
+      // cannot reach what runs: only their length is checked again.
       const entry = compiled.get(key);
       if (!entry) return -2;
-      const bytes = new Uint8Array(memory.buffer, codePointer, codeLength);
-      if (cost) cost(17, bytes.length);
-      if (!equalBytes(entry.bytes, bytes)) return -1;
+      if (entry.bytes.length !== codeLength) return -1;
       running = true;
       try {
         rollback.set(new Uint8Array(memory.buffer, statePointer, stateLength));
         if (cost) cost(19, stateLength);
-        compiled.delete(key); compiled.set(key, entry);
+        entry.used = ++clock;
         try {
           if (entry.run(statePointer) !== 0) throw new Error("JIT result rejected");
           return 0;

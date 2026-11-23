@@ -181,7 +181,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-neigh, veth-ipv6, veth-ipv6-gateway, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-neigh, veth-ipv6, veth-ipv6-gateway, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -390,6 +390,7 @@ mod linux {
                     | "veth-traffic"
                     | "veth-iif"
                     | "veth-broadcast"
+                    | "veth-filter"
                     | "veth-neigh"
                     | "veth-ipv6"
                     | "veth-ipv6-gateway"
@@ -617,6 +618,7 @@ mod linux {
         veth_traffic => ("veth-traffic","veth-traffic"),
         veth_iif => ("veth-iif","veth-iif"),
         veth_broadcast => ("veth-broadcast","veth-broadcast"),
+        veth_filter => ("veth-filter","veth-filter"),
         veth_neigh => ("veth-neigh","veth-neigh"),
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),

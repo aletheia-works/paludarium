@@ -25,6 +25,7 @@ musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie 
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-traffic" "$here/veth-traffic.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-iif" "$here/veth-iif.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-broadcast" "$here/veth-broadcast.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-filter" "$here/veth-filter.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-neigh" "$here/veth-neigh.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6" "$here/veth-ipv6.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-gateway" "$here/veth-ipv6-gateway.c"

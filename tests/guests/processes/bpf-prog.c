@@ -79,9 +79,11 @@
    BPF_F_TEST_RND_HI32 the 32-bit results' upper halves. Then what
    SO_ATTACH_BPF charges the socket for a program, after its rewrites, at
    the edge of net.core.optmem_max.
-   bpf-prog-udp: socket filters on UDP sockets of the loopback, IPv4 and
+   bpf-prog-udp: in a network namespace of its own, with its loopback up,
+   socket filters on UDP sockets of the loopback, IPv4 and
    IPv6, and an IPv4 datagram to a dual-stack IPv6 socket: the options'
-   errors and SO_LOCK_FILTER, as on an AF_UNIX socket; what a filter keeps
+   errors, SO_LOCK_FILTER and SO_BPF_EXTENSIONS, as on an AF_UNIX socket;
+   what a filter keeps
    (always the UDP header, and of the rest what it says), and what is then
    queued (FIONREAD); the fields of struct __sk_buff that it reads, of an
    unconnected socket and of a connected one with SO_PRIORITY (the hash
@@ -123,7 +125,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2647,6 +2651,8 @@ static void udp_family(int family) {
     get(name, r, SO_GET_FILTER);
     snprintf(name, sizeof name, "%s lock filter", f);
     get(name, r, SO_LOCK_FILTER);
+    snprintf(name, sizeof name, "%s bpf extensions", f);
+    get(name, r, SO_BPF_EXTENSIONS);
 
     /* What a filter keeps: the UDP header always, of what it says. */
     snprintf(name, sizeof name, "%s no filter", f);
@@ -2669,7 +2675,8 @@ static void udp_family(int family) {
     attach(r, keep11);
     sendto(s, udp_out, 20, 0, (struct sockaddr *)&to, tolen);
     int queued = -1;
-    say("%s queued after keep 11 %d %d", f, ioctl(r, FIONREAD, &queued) ? -errno : 0, queued);
+    int asked = ioctl(r, FIONREAD, &queued) ? -errno : 0;
+    say("%s queued after keep 11 %d %d", f, asked, queued);
     recv(r, udp_in, sizeof udp_in, MSG_DONTWAIT);
 
     /* The fields of struct __sk_buff: unconnected, and connected. */
@@ -2780,6 +2787,20 @@ static void udp_family(int family) {
 
 static int case_udp(void) {
     for (size_t i = 0; i < sizeof udp_out; i++) udp_out[i] = (unsigned char)(i * 7 + 3);
+    /* A network namespace of its own, whose loopback it brings up: the
+       emulator gives internet sockets to a guest without a network only
+       there. */
+    say("unshare %d", unshare(CLONE_NEWNET) ? -errno : 0);
+    {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof ifr);
+        strcpy(ifr.ifr_name, "lo");
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        int r = ioctl(u, SIOCGIFFLAGS, &ifr) ? -errno : 0;
+        ifr.ifr_flags |= IFF_UP;
+        say("lo %d up %d", r, ioctl(u, SIOCSIFFLAGS, &ifr) ? -errno : 0);
+        close(u);
+    }
     udp_family(AF_INET);
     udp_family(AF_INET6);
     /* An IPv4 datagram to a dual-stack IPv6 socket is IPv4's. */

@@ -372,8 +372,7 @@ verified.
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
   or packet socket and on a UDP socket. A TCP socket takes the options as
-  Linux does, but its filter does not run yet, and `SO_BPF_EXTENSIONS` is
-  `ENOPROTOOPT` on an internet socket (64 on Linux). On a UDP socket no
+  Linux does, but its filter does not run yet. On a UDP socket no
   filter runs on the DNS stub's answers, which come through no device
   here; a datagram that Linux sends in fragments across a veth pair comes
   whole, though its filter sees the reassembled one's linear part and

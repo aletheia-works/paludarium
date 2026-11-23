@@ -2040,16 +2040,16 @@ impl InetSocket {
     pub(crate) fn at_mark(&self) -> bool {
         Self::joined(&self.lock()).is_some_and(|(link, side)| link.urgent_state(side).1)
     }
-    /// Sends `bytes`, the last of them `urgent` (`MSG_OOB`): a TCP socket
-    /// never connected, or shut down for sending, is `EPIPE`; a failed one
-    /// gives its pending error first. Only the guest's own loopback carries
-    /// the urgent byte as such.
     /// `write` for the task whose real user and group IDs are `ids`.
     pub(crate) fn write_as(&self, buf: &[u8], ids: (u32, u32)) -> Result<usize, Errno> {
         self.send(buf, None, false, ids)
     }
-    /// Sends `bytes`, a datagram's to `to`, for the task whose real user
-    /// and group IDs are `ids`.
+    /// Sends `bytes`, the last of them `urgent` (`MSG_OOB`): a TCP socket
+    /// never connected, or shut down for sending, is `EPIPE`; a failed one
+    /// gives its pending error first. Only the guest's own loopback carries
+    /// the urgent byte as such. A datagram goes to `to`, or the peer, for
+    /// the task whose real user and group IDs are `ids`, as its receivers'
+    /// filters see it.
     fn send(
         &self,
         bytes: &[u8],
@@ -4591,10 +4591,12 @@ fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
 /// `setsockopt` of an inet socket: the `SOL_SOCKET` options a client sets,
 /// `IPPROTO_TCP`'s `TCP_NODELAY`, keepalive timing (1 to 32767 seconds, at
 /// most 127 probes), `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
-/// `IPV6_V6ONLY`. `SO_PASSCRED`, `SO_PASSSEC`, `SO_PASSPIDFD` and
-/// `SO_PASSRIGHTS` are EOPNOTSUPP, as Linux takes them only on AF_UNIX
-/// (`sk_may_scm_recv` adds netlink and Bluetooth for the first two). Any
-/// other option is ENOPROTOOPT. Only
+/// `IPV6_V6ONLY`, and the filter options (`SO_ATTACH_FILTER`,
+/// `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and `SO_ATTACH_BPF`, as
+/// [`crate::sockets::set_filter`] takes them). `SO_PASSCRED`, `SO_PASSSEC`,
+/// `SO_PASSPIDFD` and `SO_PASSRIGHTS` are EOPNOTSUPP, as Linux takes them
+/// only on AF_UNIX (`sk_may_scm_recv` adds netlink and Bluetooth for the
+/// first two). Any other option is ENOPROTOOPT. Only
 /// `TCP_NODELAY` reaches the host; the rest are kept for getsockopt.
 fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u64, Errno> {
     let (level, name, at, len) = (a[1], a[2], a[3], a[4]);
@@ -4762,7 +4764,9 @@ fn size_buffers(stream: &Stream, options: &Options) {
 }
 /// `getsockopt` of an inet socket: the options [`set_option`] keeps, and
 /// `SO_TYPE`, `SO_ERROR` (which takes the pending error), `SO_ACCEPTCONN`,
-/// `SO_PROTOCOL` and `SO_DOMAIN`. A level the socket does not have is
+/// `SO_PROTOCOL`, `SO_DOMAIN`, `SO_GET_FILTER` (the classic filter, as
+/// [`crate::sockets::get_filter`] gives it) and `SO_BPF_EXTENSIONS`. A
+/// level the socket does not have is
 /// EOPNOTSUPP (setsockopt's is ENOPROTOOPT), as are `SO_PASSCRED`,
 /// `SO_PASSSEC`, `SO_PASSPIDFD` and `SO_PASSRIGHTS`; an unknown name is
 /// ENOPROTOOPT.
@@ -4830,6 +4834,8 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (1, 15) => i32::from(options.reuse_port),
                 (1, 30) => i32::from(socket.lock().listen.is_some()),
                 (1, 44) => i32::from(socket.with_filter(|slot| slot.locked)),
+                // `SO_BPF_EXTENSIONS`: `SKF_AD_MAX` (`bpf_tell_extensions`).
+                (1, 48) => 64,
                 (1, 38) => {
                     if tcp {
                         6

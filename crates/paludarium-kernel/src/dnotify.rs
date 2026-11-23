@@ -111,13 +111,14 @@ impl Watches {
         self.count.store(list.len(), Ordering::SeqCst);
     }
     /// `dnotify_flush`: a close of `file` through `table` drops what that
-    /// table asked of it.
+    /// table asked of it. A watch whose open file is gone goes too: only a
+    /// close missed on its way could leave one.
     pub(crate) fn flush(&self, table: u64, file: &Arc<dyn FileHandle>) {
         if !self.active() {
             return;
         }
         let mut list = self.list();
-        list.retain(|w| !(w.table == table && same(&w.file, file)));
+        list.retain(|w| w.file.strong_count() != 0 && !(w.table == table && same(&w.file, file)));
         self.recount(&list);
     }
     /// Every watch of `table`, which no task uses any more: its files'

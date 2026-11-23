@@ -1147,6 +1147,7 @@ fn install(c: &mut Context<'_>, addfd: &AddFd) -> Result<u32, Errno> {
     if let Some(closed) = c.files.replace(at, descriptor)? {
         crate::record_locks::closed(c, &closed);
         crate::mqueue::closed(c, &closed);
+        crate::dnotify::closed(c, &closed);
         crate::inet::linger(c, &closed.file);
     }
     Ok(at)

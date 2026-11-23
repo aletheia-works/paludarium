@@ -9692,6 +9692,27 @@ static void *rp_helper_main(void *arg) {
     return NULL;
 }
 
+/* Submits the entries waiting in the ring after 100 ms, then writes the
+   pipe, if any. */
+struct rp_submitter {
+    struct uring *u;
+    unsigned n;
+    int fd;
+};
+
+static void *rp_submitter_main(void *arg) {
+    struct rp_submitter *h = arg;
+    pw_sleep_ms(100);
+    uring_enter(h->u->fd, h->n, 0, 0, NULL, 0);
+    if (h->fd >= 0 && write(h->fd, "w", 1) != 1) return NULL;
+    return NULL;
+}
+
+/* Fills the submission queue with NOPs from `data` on. */
+static void rp_full(struct uring *u, unsigned long data) {
+    for (unsigned i = 0; i < u->sq_entries; i++) tw_nop(u, data + i, 0, 0, 0);
+}
+
 static int io_uring_ring_poll_case(void) {
     struct uring u, defer;
     pthread_t t;
@@ -9769,6 +9790,41 @@ static int io_uring_ring_poll_case(void) {
     printf("read-poll: %d %x\n", r, (unsigned)p.revents);
     pthread_join(t, NULL);
     uring_reap(&u, "read-poll");
+
+    /* Only a completion wakes a wait on the ring, and only one for input:
+       a poll for room in a full queue sleeps through another thread's
+       submission, unless another file wakes it, which looks at the ring
+       again. A level-triggered epoll interest in output is never listed. */
+    struct rp_submitter sub = {&u, u.sq_entries, -1};
+    rp_full(&u, 70);
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    struct pollfd po = {u.fd, POLLOUT, 0};
+    r = poll(&po, 1, 500);
+    printf("room-poll: %d %x\n", r, (unsigned)po.revents);
+    pthread_join(t, NULL);
+    rp_poll(&u, "room-after");
+    uring_reap(&u, "room-poll");
+    rp_full(&u, 80);
+    sub.fd = a[1];
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    struct pollfd both[2] = {{u.fd, POLLOUT, 0}, {a[0], POLLIN, 0}};
+    r = poll(both, 2, 5000);
+    printf("room-pipe-poll: %d %x %x\n", r, (unsigned)both[0].revents, (unsigned)both[1].revents);
+    pthread_join(t, NULL);
+    printf("drain: %ld\n", (long)read(a[0], buf, sizeof buf));
+    uring_reap(&u, "room-pipe-poll");
+    int room = epoll_create1(0);
+    if (room < 0) return 83;
+    rp_full(&u, 90);
+    printf("room-add: %d\n", rp_add(room, u.fd, EPOLLOUT, 4));
+    sub.fd = -1;
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    r = epoll_wait(room, &e, 1, 500);
+    printf("room-epoll: %d\n", r);
+    pthread_join(t, NULL);
+    rp_epoll(room, "room-epoll-after");
+    uring_reap(&u, "room-epoll");
+    close(room);
 
     /* A ring with IORING_SETUP_DEFER_TASKRUN is readable with task work. */
     if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 82;

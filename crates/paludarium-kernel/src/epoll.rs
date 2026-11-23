@@ -205,15 +205,24 @@ impl EpollInstance {
             // Linux's `ep_send_events` polls only what its ready list
             // holds; one asked to take a write that cannot is noted as full
             // (`polled_full`), so that a read frees room with POLL_OUT.
+            // A file with keyed wake-ups is looked at only while it is on
+            // the list, or once it woke the interest for what it waits for
+            // (`ep_poll_callback`'s key).
+            let mut unlisted = false;
             if let Some(file) = i.file.upgrade()
                 && let Ok((mask, input, output)) = file.readiness()
             {
                 let woken = (input, output) != i.seen;
+                let keyed_woken = crate::syscalls::woke(i.events, i.seen, (input, output));
+                unlisted = file.keyed_wakeups() && !i.listed && !keyed_woken;
                 i.seen = (input, output);
                 if (i.listed || woken) && i.enabled && i.events & OUT != 0 && mask & OUT == 0 {
                     crate::sockets::polled_full(&file);
                 }
                 i.listed = false;
+            }
+            if unlisted {
+                continue;
             }
             if let Some((mask, input, output)) = i.ready() {
                 // A level-triggered report goes back on the list.

@@ -3676,6 +3676,9 @@ impl FileHandle for Ring {
     /// `IORING_SETUP_DEFER_TASKRUN` ring has task work. Only a completion
     /// wakes a poll ([`Ring::posted`], with `EPOLLIN`), so the output
     /// generation never moves.
+    fn keyed_wakeups(&self) -> bool {
+        true
+    }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         let mut mask = 0;
         if self.load_u32(SQ_TAIL).wrapping_sub(self.load_u32(SQ_HEAD)) != self.sq_entries {

@@ -552,9 +552,7 @@ verified.
   registered, where Linux's long-term pin refuses it (`EFAULT`), and a huge
   page charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where Linux
   charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`).
-  A `poll`, or a level-triggered `epoll`, that waits for room in a ring's
-  submission queue ends once there is room, where Linux's ring wakes only
-  what waits for its completions. The features are Linux
+  The features are Linux
   6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
   descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
   wait's `min_wait_usec` changes nothing. A pseudo-terminal's read waits in

@@ -1559,11 +1559,18 @@ static int case_dnotify_calls(void) {
     printf("owner-before=%d\n", (int)fcntl(dir, F_GETOWN));
     printf("unknown-bits=%ld\n", e(fcntl(dir, F_NOTIFY, DN_CREATE | 0x4000)));
     printf("owner-after-is-self=%d\n", (int)fcntl(dir, F_GETOWN) == getpid());
-    /* An owner set before stays. */
+    /* An owner set before stays: a child that waits to be killed. */
+    pid_t child = fork();
+    if (child == 0) {
+        pause();
+        _exit(0);
+    }
     int other = open(base, O_RDONLY | O_DIRECTORY);
-    fcntl(other, F_SETOWN, -getpgrp());
+    long set = e(fcntl(other, F_SETOWN, child));
     fcntl(other, F_NOTIFY, DN_CREATE);
-    printf("owner-kept=%d\n", (int)fcntl(other, F_GETOWN) == -getpgrp());
+    printf("set=%ld owner-kept=%d\n", set, (int)fcntl(other, F_GETOWN) == child);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
     printf("sig=%d\n", (int)fcntl(dir, F_GETSIG));
     remove_all();
     return 0;

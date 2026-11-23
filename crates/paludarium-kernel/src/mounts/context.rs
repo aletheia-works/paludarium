@@ -178,8 +178,11 @@ impl FileHandle for FsContext {
     fn flags(&self) -> u32 {
         self.status.load(Ordering::SeqCst)
     }
+    /// `F_SETFL`: the access mode stays (`setfl`).
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.status.store(flags, Ordering::SeqCst);
+        let before = self.status.load(Ordering::SeqCst);
+        self.status
+            .store(crate::files::setfl(before, flags), Ordering::SeqCst);
         Ok(())
     }
 }

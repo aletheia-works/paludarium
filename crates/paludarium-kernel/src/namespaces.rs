@@ -788,8 +788,11 @@ impl FileHandle for NamespaceFile {
     fn flags(&self) -> u32 {
         self.flags.load(Ordering::SeqCst)
     }
+    /// `F_SETFL`: the access mode and the open flags stay (`setfl`).
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.flags.store(flags, Ordering::SeqCst);
+        let before = self.flags.load(Ordering::SeqCst);
+        self.flags
+            .store(crate::files::setfl(before, flags), Ordering::SeqCst);
         Ok(())
     }
 }

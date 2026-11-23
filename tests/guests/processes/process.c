@@ -13065,6 +13065,72 @@ static int fc_inner(void) {
     close((int)root_fd);
     printf("\n");
     fc_info("m", m);
+    /* The descriptor's own file operations, a message longer than the
+       buffer, and a log that drops its oldest once it holds 8. */
+    long fd2 = fc_open("tmpfs", 0);
+    printf("descriptor");
+    RM("write", write((int)fd2, "x", 1));
+    RM("seek", lseek((int)fd2, 0, SEEK_SET));
+    RM("truncate", ftruncate((int)fd2, 0));
+    RM("flock", syscall(SYS_flock, (int)fd2, 2));
+    printf(" getfl=%#x", fcntl((int)fd2, F_GETFL));
+    RM("setfl", fcntl((int)fd2, F_SETFL, O_NONBLOCK));
+    printf(" now=%#x", fcntl((int)fd2, F_GETFL));
+    /* F_SETFL keeps a namespace file's open flags too. */
+    int ns = open("/proc/self/ns/mnt", O_RDONLY);
+    printf(" ns=%#x", fcntl(ns, F_GETFL));
+    RM("ns-setfl", fcntl(ns, F_SETFL, O_NONBLOCK));
+    printf(" ns-now=%#x", fcntl(ns, F_GETFL));
+    close(ns);
+    RM("size-flag", fc_config((int)fd2, 0, "size", NULL, 0));
+    char small[4];
+    RM("small", read((int)fd2, small, sizeof small));
+    for (int i = 0; i < 9; i++) {
+        char key[8];
+        snprintf(key, sizeof key, "b%d", i);
+        fc_config((int)fd2, 0, key, NULL, 0);
+    }
+    printf("\nmessages");
+    fc_messages((int)fd2);
+    /* The values other than flags and strings. */
+    printf("values");
+    RM("blob-none", fc_config((int)fd2, 2, "size", "1m", 0));
+    RM("blob-big", fc_config((int)fd2, 2, "size", "1m", (1 << 20) + 1));
+    RM("blob-fault", fc_config((int)fd2, 2, "size", (const void *)8, 2));
+    RM("blob", fc_config((int)fd2, 2, "size", "1m", 2));
+    RM("path-dfd", fc_config((int)fd2, 3, "source", "/", -5));
+    RM("path-none", fc_config((int)fd2, 3, "source", "", AT_FDCWD));
+    RM("path", fc_config((int)fd2, 3, "source", "/", AT_FDCWD));
+    RM("path-empty", fc_config((int)fd2, 4, "source", "", AT_FDCWD));
+    RM("fd-bad", fc_config((int)fd2, 5, "source", NULL, 99));
+    RM("fd", fc_config((int)fd2, 5, "source", NULL, 0));
+    printf("\nmessages");
+    fc_messages((int)fd2);
+    /* fsmount's other checks, and a mount with its descriptor closed on
+       exec and strict access times. */
+    printf("mount");
+    RM("create", fc_config((int)fd2, 6, NULL, NULL, 0));
+    RM("not-context", fc_mount(1, 0, 0));
+    RM("attr-bad", fc_mount((int)fd2, 0, 0x100));
+    RM("two-atimes", fc_mount((int)fd2, 0, 0x30));
+    long m2 = fc_mount((int)fd2, 1, 0x20);
+    printf(" mounted=%d cloexec=%d\n", m2 >= 0, fcntl((int)m2, F_GETFD));
+    close((int)m2);
+    close((int)fd2);
+    /* A picked superblock gathers again after a reconfiguration, and one
+       that fails fails the context. */
+    printf("repick");
+    long again = fc_pick(AT_FDCWD, m, 0);
+    RM("rw", fc_config((int)again, 0, "rw", NULL, 0));
+    RM("apply", fc_config((int)again, 7, NULL, NULL, 0));
+    RM("dirsync", fc_config((int)again, 0, "dirsync", NULL, 0));
+    RM("refused", fc_config((int)again, 7, NULL, NULL, 0));
+    RM("failed", fc_config((int)again, 0, "ro", NULL, 0));
+    RM("failed-apply", fc_config((int)again, 7, NULL, NULL, 0));
+    printf("\nmessages");
+    fc_messages((int)again);
+    close((int)again);
+    fc_info("m", m);
     return 0;
 }
 static int contexts_case(void) {

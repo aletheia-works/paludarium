@@ -236,7 +236,7 @@ every test passing.
   `bpf_tests.rs`, `bpf_prog_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`,
   `mctp_tests.rs`, `seccomp_tests.rs`, `signalfd_tests.rs`,
   `sock_diag_tests.rs`, `extack_tests.rs`, `mempolicy_tests.rs`,
-  `perf_sample_tests.rs` and `perf_side_band_tests.rs` in
+  `context_tests.rs`, `perf_sample_tests.rs` and `perf_side_band_tests.rs` in
   `crates/paludarium-kernel/src/`) make a differential guest's calls in
   the same order and compare its lines with what the guest prints on
   native Linux: as printed on Linux 7.0, or as printed under the emulator

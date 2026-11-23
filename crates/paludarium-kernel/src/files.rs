@@ -6367,6 +6367,12 @@ pub(crate) struct StandardFile {
 /// only a file with `fasync` keeps): `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`
 /// and `O_NOATIME`.
 const SETFL_FLAGS: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
+/// A file's flags after `F_SETFL` asks for `asked`, as Linux's `setfl`
+/// keeps them: only [`SETFL_FLAGS`] change, and the access mode and every
+/// other flag stay what they were.
+pub(crate) fn setfl(before: u32, asked: u32) -> u32 {
+    (before & !SETFL_FLAGS) | (asked & SETFL_FLAGS)
+}
 /// What `F_GETFL` gives for `d`, as Linux keeps a file's `f_flags`: the open
 /// flags less `O_CLOEXEC` (`build_open_flags`) and `O_CREAT`, `O_EXCL`,
 /// `O_NOCTTY` and `O_TRUNC` (`do_dentry_open`), and `O_LARGEFILE` for a

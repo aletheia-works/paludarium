@@ -5007,6 +5007,29 @@ kernel.
   a chain of calls takes ("stack depth %d+%d max %d", as the test
   machines' 7.0 writes it).
 
+- After the walk, a program is as long as Linux's rewrites make it,
+  though the interpreter runs the instructions as loaded. A conditional
+  jump one of whose sides no path took becomes a jump, then the code no
+  path reached goes, and each jump of 0 (`opt_remove_dead_code`,
+  `opt_remove_nops`). An access to the context becomes the loads of
+  `struct sk_buff` the x86-64 kernel makes of it, with a narrower load's
+  shift and mask and a sign extension's move (`convert_ctx_accesses`). A
+  division or remainder by a register gets its checks of 0 and -1,
+  `BPF_LD_ABS` and `BPF_LD_IND` get their calls, and
+  `bpf_get_smp_processor_id` and a lookup of one array, hash or LRU hash
+  are inlined (`do_misc_fixups`). A 32-bit `BPF_CMPXCHG` whose R0 is read
+  as 64 bits is zero-extended, and with `BPF_F_TEST_RND_HI32` a 32-bit
+  result never read as more gets three instructions that fill its upper
+  half (`opt_subreg_zext_lo32_rnd_hi32`). Spills and fills around
+  `bpf_get_smp_processor_id` of the registers it leaves, from the
+  function's lowest spill up (`bpf_fastcall`), go as well, and the
+  function's stack depth no longer counts them, unless another access
+  uses that stack or such a pattern around another helper keeps it. A
+  rewrite after which a jump no longer reaches in 16 bits is `ENOMEM`
+  ("insn %d cannot be patched due to 16-bit range"). The program's memory
+  grows to the instructions the rewrites make (`bpf_prog_realloc`), and
+  its socket is charged for them.
+
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`
   (below), and runs on each message sent to it, as
@@ -5087,7 +5110,8 @@ kernel.
   close-on-exec, of `anon_inode:bpf-prog`, whose fdinfo gives its type,
   its tag (the first 8 bytes of the SHA-256 of its instructions, with
   maps' descriptors taken out, as Linux's `bpf_prog_calc_tag`), its memory
-  (its 96-byte header and instructions, in pages), its ID (from IDs of
+  (its 96-byte header and instructions, in pages, as many as the rewrites
+  make if they make more), its ID (from IDs of
   programs, apart from the maps') and the instructions the verifier went
   through; `prog_jited` and the run statistics are 0. See
   [Limitations](./limitations) for what the verifier refuses that Linux

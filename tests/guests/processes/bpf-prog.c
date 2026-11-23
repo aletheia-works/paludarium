@@ -66,6 +66,19 @@
    recursion, and the combined stack), each function's stack depth in the log's
    statistics, and a filter whose functions write a map's value through
    pointers to it and to their callers' stacks, which the case reads back.
+   bpf-prog-rewrites: the program's memory in fdinfo (memlock), which
+   grows with the instructions the verifier's rewrites make: for each
+   rewrite, programs that come to 500 instructions after it, which fit a
+   page with the program's header, and to 501, which take two. The
+   rewrites: a division or remainder by a register, of each kind, and by
+   -1, BPF_LD_ABS and BPF_LD_IND, the context's fields read whole, narrower
+   and sign-extended, bpf_get_smp_processor_id and a lookup of an array, a
+   hash and an LRU hash inlined and of either of two arrays not, dead code
+   and jumps of 0 removed, a bpf_fastcall spill and fill removed with
+   their stack, a 32-bit cmpxchg's zero-extension, and with
+   BPF_F_TEST_RND_HI32 the 32-bit results' upper halves. Then what
+   SO_ATTACH_BPF charges the socket for a program, after its rewrites, at
+   the edge of net.core.optmem_max.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -2325,6 +2338,155 @@ static int case_calls(void) {
     return 0;
 }
 
+/* A program of `count` instructions as loaded: the prologue, `n` copies of
+   the block, moves of 0 and the exit. Its memory in fdinfo, in pages of
+   the instructions after the verifier's rewrites, and the log's stack
+   depth. */
+static struct insn grown[600];
+static void grow(const char *name, const struct insn *pro, unsigned npro,
+                 const struct insn *block, unsigned nblock, unsigned n, unsigned count,
+                 uint32_t flags) {
+    unsigned at = 0;
+    for (unsigned i = 0; i < npro; i++) grown[at++] = pro[i];
+    for (unsigned k = 0; k < n; k++)
+        for (unsigned i = 0; i < nblock; i++) grown[at++] = block[i];
+    while (at < count - 1) grown[at++] = (struct insn)MOV(0, 0);
+    grown[at++] = (struct insn)EXIT();
+    struct prog_attr p = attr(grown, at);
+    p.prog_flags = flags;
+    p.log_level = 4;
+    memset(log_text, 0, sizeof log_text);
+    long fd = bpf(PROG_LOAD, &p, sizeof p);
+    say("%s, %u: %s", name, at, fd < 0 ? "refused" : "loaded");
+    if (fd < 0) {
+        say("  %ld", fd);
+        return;
+    }
+    fdinfo((int)fd);
+    const char *line = strstr(log_text, "stack depth ");
+    const char *end = line ? strchr(line, '\n') : NULL;
+    if (end) say("  %.*s", (int)(end - line), line);
+    close((int)fd);
+}
+
+/* The block's `d` more instructions after the rewrites, at 500 of them in
+   all and at 501: 500 fit the first page with the program's header, 501
+   take a second. */
+#define REWRITE(name, d, n, flags, pro, ...)                                      \
+    do {                                                                          \
+        static const struct insn prologue[] = pro;                                \
+        static const struct insn block[] = {__VA_ARGS__};                         \
+        unsigned at = 500 - (unsigned)((d) * (n));                                \
+        grow(name, prologue, COUNT(prologue), block, COUNT(block), n, at, flags); \
+        grow(name, prologue, COUNT(prologue), block, COUNT(block), n, at + 1, flags); \
+    } while (0)
+#define PRO(...) {__VA_ARGS__}
+#define TEST_RND_HI32 (1 << 2)
+
+static int case_rewrites(void) {
+    int array = map(2, 4, 8, 1, 0);
+    int other = map(2, 4, 8, 1, 0);
+    int hash = map(1, 4, 8, 4, 0);
+    int lru = map(9, 4, 8, 4, 0);
+    say("maps %d", array > 0 && other > 0 && hash > 0 && lru > 0);
+    /* R6 the context, R2 3, R0 1, R7 0 and fp-8 0. */
+#define BASE PRO(MOV_REG(6, 1), MOV(2, 3), MOV(0, 1), MOV(7, 0), ST_DW(10, -8, 0))
+    REWRITE("no rewrite", 0, 10, 0, BASE, MOV(3, 1));
+    /* do_misc_fixups: a division or remainder by a register. */
+    REWRITE("unsigned 64-bit division", 3, 10, 0, BASE, I(0x3f, 0, 2, 0, 0));
+    REWRITE("signed 64-bit division", 7, 10, 0, BASE, I(0x3f, 0, 2, 1, 0));
+    REWRITE("signed 32-bit division", 7, 10, 0, BASE, I(0x3c, 0, 2, 1, 0));
+    REWRITE("unsigned 64-bit remainder", 1, 10, 0, BASE, I(0x9f, 0, 2, 0, 0));
+    REWRITE("unsigned 32-bit remainder", 3, 10, 0, BASE, I(0x9c, 0, 2, 0, 0));
+    REWRITE("signed 64-bit remainder", 6, 10, 0, BASE, I(0x9f, 0, 2, 1, 0));
+    REWRITE("signed 32-bit remainder", 8, 10, 0, BASE, I(0x9c, 0, 2, 1, 0));
+    REWRITE("signed division by -1", 0, 10, 0, BASE, I(0x37, 0, 0, 1, -1));
+    REWRITE("division by a constant", 0, 10, 0, BASE, I(0x37, 0, 0, 0, 3));
+    /* BPF_LD_ABS and BPF_LD_IND, with an offset and without. */
+    REWRITE("BPF_LD_ABS", 5, 10, 0, BASE, I(0x30, 0, 0, 0, 1));
+    REWRITE("BPF_LD_IND with an offset", 6, 10, 0, BASE, I(0x50, 0, 7, 0, 2));
+    REWRITE("BPF_LD_IND", 5, 10, 0, BASE, I(0x48, 0, 7, 0, 0));
+    /* convert_ctx_accesses: the fields of struct __sk_buff. */
+    REWRITE("len", 0, 10, 0, BASE, LDX_W(0, 6, 0));
+    REWRITE("len's second byte", 2, 10, 0, BASE, LDX_B(0, 6, 1));
+    REWRITE("len's low half", 1, 10, 0, BASE, LDX_H(0, 6, 0));
+    REWRITE("pkt_type", 1, 10, 0, BASE, LDX_W(0, 6, 4));
+    REWRITE("queue_mapping", 0, 10, 0, BASE, LDX_W(0, 6, 12));
+    REWRITE("protocol's second byte", 2, 10, 0, BASE, LDX_B(0, 6, 17));
+    REWRITE("protocol's half", 0, 10, 0, BASE, LDX_H(0, 6, 16));
+    REWRITE("vlan_present", 2, 10, 0, BASE, LDX_W(0, 6, 20));
+    REWRITE("ifindex", 2, 10, 0, BASE, LDX_W(0, 6, 40));
+    REWRITE("cb written and read", 0, 10, 0, BASE, STX_W(6, 0, 48), LDX_W(0, 6, 52));
+    REWRITE("napi_id", 2, 10, 0, BASE, LDX_W(0, 6, 84));
+    REWRITE("gso_segs", 3, 10, 0, BASE, LDX_W(0, 6, 164));
+    REWRITE("gso_size", 3, 10, 0, BASE, LDX_W(0, 6, 176));
+    REWRITE("len's byte sign-extended", 2, 10, 0, BASE, I(0x91, 0, 6, 0, 0));
+    /* Helpers inlined: the processor, and a lookup of one map. */
+    REWRITE("bpf_get_smp_processor_id", 2, 10, 0, BASE, CALL(8));
+#define LOOKUP_OF(fd) LD_MAP(1, fd), MOV_REG(2, 10), ADD(2, -8), CALL(LOOKUP)
+    REWRITE("array lookup", 6, 10, 0, BASE, LOOKUP_OF(array));
+    REWRITE("hash lookup", 2, 10, 0, BASE, LOOKUP_OF(hash));
+    REWRITE("LRU hash lookup", 5, 10, 0, BASE, LOOKUP_OF(lru));
+    REWRITE("lookup of either of two arrays", 0, 4, 0,
+            PRO(MOV_REG(6, 1), MOV(2, 3), MOV(0, 1), LDX_W(7, 6, 0), ST_DW(10, -8, 0)),
+            LD_MAP(1, array), JEQ(7, 0, 2), LD_MAP(1, other), MOV_REG(2, 10), ADD(2, -8),
+            CALL(LOOKUP));
+    /* Dead code, and jumps of 0, which go first. */
+    REWRITE("dead code before a division", 1, 10, 0, BASE, MOV(3, 0), JEQ(3, 0, 1), MOV(0, 2),
+            I(0x3f, 0, 2, 0, 0));
+    REWRITE("jump of 0 before a division", 2, 10, 0, BASE, I(0x05, 0, 0, 0, 0),
+            I(0x3f, 0, 2, 0, 0));
+    REWRITE("jump over a jump of 0", 2, 10, 0, BASE, I(0x05, 0, 0, 1, 0), I(0x05, 0, 0, 0, 0),
+            I(0x3f, 0, 2, 0, 0));
+    /* bpf_fastcall: the spill and fill around the inlined helper go, and
+       the stack with them, unless another access needs that stack. */
+    REWRITE("spill and fill around the processor", 0, 10, 0, PRO(MOV_REG(6, 1), MOV(0, 1)),
+            STX_DW(10, 1, -8), CALL(8), LDX_DW(1, 10, -8));
+    REWRITE("spill and fill around the processor, the stack read", 2, 10, 0,
+            PRO(MOV_REG(6, 1), MOV(0, 1), LDX_DW(3, 10, -8)), STX_DW(10, 1, -8), CALL(8),
+            LDX_DW(1, 10, -8));
+    REWRITE("spill and fill around a hash lookup", 2, 10, 0, PRO(MOV_REG(6, 1), MOV(0, 1)),
+            ST_W(10, -4, 0), LD_MAP(1, hash), MOV_REG(2, 10), ADD(2, -4), MOV(3, 5),
+            STX_DW(10, 3, -16), CALL(LOOKUP), LDX_DW(3, 10, -16));
+    /* opt_subreg_zext_lo32_rnd_hi32: a 32-bit compare-and-exchange's R0
+       read as 64 bits, and with BPF_F_TEST_RND_HI32 32-bit results read
+       as no more. */
+    REWRITE("32-bit cmpxchg read as 64 bits", 1, 10, 0, BASE, I(0xc3, 10, 7, -8, 0xf1),
+            MOV_REG(3, 0));
+    REWRITE("32-bit cmpxchg read as 32", 0, 10, 0, BASE, I(0xc3, 10, 7, -8, 0xf1),
+            I(0xbc, 3, 0, 0, 0));
+    REWRITE("64-bit cmpxchg", 0, 10, 0, BASE, I(0xdb, 10, 7, -8, 0xf1), MOV_REG(3, 0));
+    REWRITE("32-bit results never read", 3, 10, TEST_RND_HI32, BASE, I(0xb4, 3, 0, 0, 1));
+    REWRITE("32-bit results read as 64 bits", 0, 10, TEST_RND_HI32, BASE, I(0xb4, 3, 0, 0, 1),
+            MOV_REG(4, 3));
+    REWRITE("32-bit loads never read", 3, 10, TEST_RND_HI32, BASE, LDX_W(3, 10, -8));
+    REWRITE("32-bit context loads never read", 0, 10, TEST_RND_HI32, BASE, LDX_W(3, 6, 0));
+#undef BASE
+
+    /* The socket is charged the program after the rewrites (96 bytes and
+       8 for each instruction), below net.core.optmem_max (131072): up to
+       16,371 of them, here with 100 signed divisions of 8 each. */
+    static struct insn big[16372 - 700];
+    for (unsigned count = 16371 - 700; count <= 16372 - 700; count++) {
+        unsigned at = 0;
+        big[at++] = (struct insn)MOV(0, 1);
+        big[at++] = (struct insn)MOV(2, 3);
+        for (int k = 0; k < 100; k++) big[at++] = (struct insn)I(0x3f, 0, 2, 1, 0);
+        while (at < count - 1) big[at++] = (struct insn)MOV(0, 1);
+        big[at++] = (struct insn)EXIT();
+        struct prog_attr p = attr(big, at);
+        long fd = bpf(PROG_LOAD, &p, sizeof p);
+        int q[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, q)) return 1;
+        say("%u instructions, %u after the rewrites: loaded %d, attached %d", at, at + 700,
+            fd >= 0, fd < 0 ? 0 : attach(q[1], (int)fd));
+        if (fd >= 0) close((int)fd);
+        close(q[0]);
+        close(q[1]);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -2338,5 +2500,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-acqrel")) return case_acqrel();
     if (!strcmp(mode, "bpf-prog-ldabs")) return case_ldabs();
     if (!strcmp(mode, "bpf-prog-calls")) return case_calls();
+    if (!strcmp(mode, "bpf-prog-rewrites")) return case_rewrites();
     return 2;
 }

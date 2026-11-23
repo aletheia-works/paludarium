@@ -425,6 +425,9 @@ pub(crate) struct Map {
     /// Made with `excl_prog_hash`: only the program of that hash may use
     /// it, so it is no map's inner map (`excl_prog_sha`).
     exclusive: bool,
+    /// `bypass_spec_v1`, which an array has from a creator with
+    /// `CAP_PERFMON`: a program's lookup in it has no index mask.
+    bypass_spec: bool,
     /// A map of maps' `inner_map_meta`: what the maps it holds are like.
     inner: Option<Template>,
     elements: Mutex<Elements>,
@@ -896,6 +899,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         frozen: AtomicBool::new(false),
         writable_mappings: Mutex::new(0),
         exclusive: excl_hash != 0,
+        bypass_spec: bypass_spec && matches!(kind, TYPE_ARRAY | TYPE_ARRAY_OF_MAPS),
         inner,
         elements: Mutex::new(if kind == TYPE_BLOOM_FILTER {
             Elements::Bloom(bloom(max_entries, map_extra, u32::from_le_bytes(seed)))
@@ -1261,6 +1265,7 @@ pub(crate) fn program_map(
         max_entries: map.max_entries,
         flags: map.flags,
         exclusive: map.exclusive,
+        bypass_spec: map.bypass_spec,
     };
     Ok((map, shape))
 }
@@ -3052,6 +3057,7 @@ mod tests {
             frozen: AtomicBool::new(false),
             writable_mappings: Mutex::new(0),
             exclusive: false,
+            bypass_spec: false,
             inner: None,
             elements: Mutex::new(elements(kind, 4, max_entries, flags, 2)),
         }

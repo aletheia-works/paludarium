@@ -175,6 +175,7 @@
     {"name":"bpf-prog-acqrel","binary":"bpf-prog"},
     {"name":"bpf-prog-ldabs","binary":"bpf-prog"},
     {"name":"bpf-prog-calls","binary":"bpf-prog"},
+    {"name":"bpf-prog-rewrites","binary":"bpf-prog"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},
     {"name":"inotify-files","binary":"inotify"},

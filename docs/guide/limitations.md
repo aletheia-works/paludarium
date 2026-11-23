@@ -366,14 +366,14 @@ verified.
   No JIT compiles a program: the interpreter runs it. Of the helpers'
   values, the processor is 0, a network namespace's cookie is 1 (the
   initial one's) in every namespace, the boot and coarse clocks are the
-  monotonic one, and `CLOCK_TAI` is the real time. A program is charged to
-  its socket as though Linux's rewrites made it 16 times longer, so
-  `SO_ATTACH_BPF` is `ENOMEM` sooner than on Linux for a long one; a
-  classic filter is charged what Linux charges for it. A program's memory
-  in fdinfo (`memlock`) is not yet what Linux's is for a long program:
-  it counts the instructions as loaded, where Linux's rewrites (a
-  division's, a context access's, `BPF_LD_ABS`'s and the rest) may make
-  more of them and take another page (`bpf_prog_realloc`).
+  monotonic one, and `CLOCK_TAI` is the real time. The verifier's
+  rewrites are counted, not made: the interpreter runs the instructions as
+  loaded. Linux's verifier knows of more branches that they are never
+  taken than the one here does (below), and removes the code only those
+  reach, which is counted here, with the registers it reads as 64 bits
+  and the maps its lookups get: so a program with such code may take
+  other memory in fdinfo (`memlock`) and be charged otherwise to its
+  socket than on Linux.
   Every other program type is
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are

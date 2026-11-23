@@ -385,13 +385,19 @@ pub(crate) fn load(c: &mut Context<'_>, attr: &[u8], at: u64, size: u32) -> Resu
             && prog_flags & flag::ANY_ALIGNMENT == 0,
         test_reg_invariants: prog_flags & flag::TEST_REG_INVARIANTS != 0,
         fd_array: word(attr, 120) != 0,
+        rnd_hi32: prog_flags & flag::TEST_RND_HI32 != 0,
     };
     let (verified, maps) = verify(c, attr, &log, &insns, options, at, size)?;
     let program = c.processes.bpf_progs.publish(|id| Program {
         id,
         kind,
         tag: tag(&insns),
-        pages: (PROG_HEADER + INSN_SIZE * u64::from(insn_cnt)).div_ceil(PAGE_SIZE),
+        // bpf_prog_alloc of the instructions as loaded, which the
+        // rewrites' bpf_prog_realloc only grows.
+        pages: prog_size(insn_cnt as usize)
+            .max(prog_size(verified.len))
+            .div_ceil(PAGE_SIZE),
+        len: verified.len,
         verified: verified.processed,
         gpl,
         name,
@@ -626,6 +632,8 @@ pub(crate) struct Program {
     tag: [u8; 8],
     /// `prog->pages`.
     pages: u64,
+    /// `prog->len`, after the verifier's rewrites.
+    len: usize,
     /// `aux->verified_insns`.
     verified: u32,
     /// `gpl_compatible`, for the helpers that need it.
@@ -644,19 +652,12 @@ pub(crate) struct Program {
     ids: Arc<Ids>,
 }
 
-/// How many instructions Linux's rewrites may make of one, at most, as the
-/// verifier patches a signed division (`do_misc_fixups`, nine for a 32-bit
-/// remainder) and a context access (`convert_ctx_accesses`): a bound above
-/// what they do, so that a program is charged no less than on Linux.
-const REWRITTEN: u64 = 16;
-
 impl Program {
     /// `bpf_prog_size` of the program as `sk_attach_bpf` charges it to the
-    /// socket, of the instructions after Linux's rewrites, which are not
-    /// made here: [`REWRITTEN`] times as many, so that where Linux has room
-    /// for it this may not, and never the other way round.
+    /// socket: of its instructions after Linux's rewrites, which only
+    /// their number is made of here.
     pub(crate) fn filter_size(&self) -> u64 {
-        PROG_HEADER + INSN_SIZE * REWRITTEN * self.insns.len() as u64
+        prog_size(self.len)
     }
 
     /// Runs the socket filter on `packet`: the bytes to keep (`R0`, as

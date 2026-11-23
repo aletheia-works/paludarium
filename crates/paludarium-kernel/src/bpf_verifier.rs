@@ -69,6 +69,8 @@
 //!   pointer leaks, uninitialized stack reads and no Spectre sanitizing.
 use paludarium_types::Errno;
 
+mod rewrite;
+
 const EACCES: Errno = Errno(13);
 const EPROTO: Errno = Errno(71);
 /// The kernel's own `ENOTSUPP`, which reaches user space as it is.
@@ -253,6 +255,9 @@ pub(crate) struct Options {
     pub(crate) test_reg_invariants: bool,
     /// Whether `fd_array` is given.
     pub(crate) fd_array: bool,
+    /// `BPF_F_TEST_RND_HI32`, which only the rewrites' length depends on
+    /// here ([`rewrite`]).
+    pub(crate) rnd_hi32: bool,
 }
 
 /// What the verifier needs of a map a program names by its descriptor.
@@ -268,6 +273,9 @@ pub(crate) struct MapShape {
     pub(crate) flags: u32,
     /// Made with `excl_prog_hash`.
     pub(crate) exclusive: bool,
+    /// `bypass_spec_v1`: made by a loader with `CAP_PERFMON`, so an
+    /// array's inlined lookup has no index mask.
+    pub(crate) bypass_spec: bool,
 }
 
 /// `__bpf_map_get` of a descriptor: the map's shape, or `EBADF` for no
@@ -453,6 +461,9 @@ pub(crate) struct Verified {
     /// Each `BPF_LD_IMM64` of a map: the map's index in `maps`, and the
     /// offset in the value of a `BPF_PSEUDO_MAP_VALUE`.
     pub(crate) loads: std::collections::BTreeMap<usize, (u8, Option<u32>)>,
+    /// `prog->len` after Linux's rewrites ([`rewrite`]), which the
+    /// program's memory grows to and its socket is charged for.
+    pub(crate) len: usize,
 }
 
 /// Why a program is refused: the error and the line the log gets.
@@ -496,21 +507,29 @@ pub(crate) fn check(
     maps: &mut Maps<'_>,
 ) -> Result<Verified, Rejection> {
     debug_assert!(!insns.is_empty() && !ends_in_half(insns));
-    let mut walk = Walk::default();
+    let mut walk = Walk {
+        seen: vec![false; insns.len()],
+        zext: vec![false; insns.len()],
+        ..Walk::default()
+    };
     let result = structure(insns, options, maps, &mut walk)
+        .map(|()| walk.fastcall_patterns(insns))
         .and_then(|()| walk.run(insns, options))
-        .and_then(|()| walk.max_stack_depth(insns));
+        .and_then(|()| walk.remove_fastcall_spills_fills())
+        .and_then(|()| walk.max_stack_depth(insns))
+        .and_then(|()| rewrite::len(&walk.facts(insns, options)));
     let mut stack_depth: Vec<u32> = walk.depth.iter().map(|d| d.div_ceil(8) * 8).collect();
     if stack_depth.is_empty() {
         stack_depth.push(0);
     }
     match result {
-        Ok(()) => Ok(Verified {
+        Ok(len) => Ok(Verified {
             processed: walk.processed,
             stack_depth,
             max_stack_depth: walk.max_depth,
             maps: walk.maps.iter().map(|m| m.id).collect(),
             loads: std::mem::take(&mut walk.loads),
+            len,
         }),
         Err((errno, line)) => Err(Rejection {
             errno,
@@ -1102,11 +1121,17 @@ enum Slot {
 /// A frame's 512-byte stack, by 8-byte slot from the frame pointer down.
 type Stack = [Slot; (MAX_STACK / 8) as usize];
 
+/// Each register's `subreg_def`: the instruction that wrote its low 32
+/// bits only, if the last write did and nothing has read it as 64 bits
+/// since.
+type Subreg = [Option<u32>; REGS];
+
 /// A frame below the current one: the caller's registers as the call
 /// left them, its stack, its function and where it goes on.
 #[derive(Clone)]
 struct Caller {
     regs: [Reg; REGS],
+    subreg: Subreg,
     stack: Stack,
     subprog: usize,
     ret: usize,
@@ -1119,6 +1144,7 @@ struct Caller {
 struct State {
     insn: usize,
     regs: [Reg; REGS],
+    subreg: Subreg,
     stack: Stack,
     subprog: usize,
     callers: Vec<Caller>,
@@ -1228,6 +1254,25 @@ struct Walk {
     /// Each load or store reached so far, and whether through the context
     /// (`insn_aux_data`'s `ptr_type`, which tells only that apart).
     through_ctx: std::collections::BTreeMap<usize, bool>,
+    /// The instructions a path reached (`insn_aux_data`'s `seen`).
+    seen: Vec<bool>,
+    /// The 32-bit definitions an instruction read as 64 bits
+    /// (`zext_dst`, which `mark_insn_zext` sets).
+    zext: Vec<bool>,
+    /// Each `bpf_map_lookup_elem` reached: the map it looked up, or none
+    /// if paths looked up different ones (`map_ptr_state`, poisoned).
+    lookups: std::collections::BTreeMap<usize, Option<u8>>,
+    /// Each function's `fastcall_stack_off` and `keep_fastcall_stack`.
+    fastcall: Vec<(i64, bool)>,
+    /// `fastcall_pattern` and `fastcall_spills_num` of each instruction.
+    pattern: Vec<bool>,
+    spills: Vec<usize>,
+    /// A pattern around a helper the walk refuses, which the walk did not
+    /// reach.
+    fastcall_unknown: bool,
+    /// The spills and fills `remove_fastcall_spills_fills` made `BPF_JA`
+    /// of 0.
+    nops: Vec<bool>,
 }
 
 impl Walk {
@@ -1288,6 +1333,7 @@ impl Walk {
         let mut state = State {
             insn: 0,
             regs,
+            subreg: [None; REGS],
             stack: [Slot::Bytes; (MAX_STACK / 8) as usize],
             subprog: 0,
             callers: Vec::new(),
@@ -1331,7 +1377,24 @@ impl Walk {
         }
     }
 
+    /// One instruction of a path: `sanitize_mark_insn_seen`, the
+    /// instruction's checks, and the 32-bit definitions it reads as 64
+    /// bits and makes.
     fn step(&mut self, insns: &[Insn], s: &mut State, options: Options) -> Checked<Step> {
+        let i = s.insn;
+        let insn = insns[i];
+        self.seen[i] = true;
+        if insn.ldimm64() {
+            self.seen[i + 1] = true;
+        }
+        self.subreg_reads(s, insn);
+        let step = self.check_insn(insns, s, options)?;
+        subreg_defs(s, insn, i);
+        Ok(step)
+    }
+
+    /// `do_check_insn`.
+    fn check_insn(&mut self, insns: &[Insn], s: &mut State, options: Options) -> Checked<Step> {
         let i = s.insn;
         let insn = insns[i];
         let next = Step::Next(i + 1);
@@ -1547,8 +1610,10 @@ impl Walk {
                     );
                 }
                 let caller = frame != s.frame();
+                let insn = s.insn;
                 let (stack, subprog) = s.stack_of(frame);
                 self.deepen(subprog, -total);
+                self.fastcall_contract(insn, subprog, total);
                 let slot = ((-total - 1) / 8) as usize;
                 let aligned = total % 8 == 0;
                 match value {
@@ -1688,6 +1753,7 @@ impl Walk {
                 }
                 let subprog = s.stack_of(frame).1;
                 self.deepen(subprog, -base);
+                self.fastcall_contract(s.insn, subprog, base);
                 Ok(())
             }
             Reg::Ptr(Ptr::Value(map), base) => {
@@ -1784,6 +1850,15 @@ impl Walk {
             return refuse(EACCES, "write into map forbidden");
         }
         Ok(if id == func::MAP_LOOKUP_ELEM {
+            // record_func_map: a lookup of two maps is not inlined.
+            self.lookups
+                .entry(s.insn)
+                .and_modify(|m| {
+                    if *m != Some(map) {
+                        *m = None;
+                    }
+                })
+                .or_insert(Some(map));
             self.ids += 1;
             Reg::Ptr(Ptr::MaybeNull(map, self.ids), 0)
         } else {
@@ -1859,13 +1934,74 @@ impl Walk {
         // The raw mode's writes, a byte at a time, after every argument:
         // the bytes are bytes the program may read.
         if let Some((frame, base)) = written {
+            let insn = s.insn;
             let (stack, subprog) = s.stack_of(frame);
             self.deepen(subprog, -base);
+            self.fastcall_contract(insn, subprog, base);
             for at in base..base + len {
                 stack[((-at - 1) / 8) as usize] = Slot::Bytes;
             }
         }
         Ok(())
+    }
+
+    /// `mark_insn_zext` of what `check_reg_arg` reads of `insn` as 64
+    /// bits (`is_reg64`): the instruction that wrote a register's low half
+    /// only has it zero-extended. A pointer's last write is 64 bits, so its
+    /// reads mark nothing whatever their width.
+    fn subreg_reads(&mut self, s: &mut State, insn: Insn) {
+        let main = s.callers.is_empty();
+        let mut read = |r: u8| {
+            if let Some(def) = s.subreg[usize::from(r)].take() {
+                self.zext[def as usize] = true;
+            }
+        };
+        let dw = insn.size() == size::DW;
+        match insn.class() {
+            class::ALU | class::ALU64 if reg64(insn) => match insn.op() {
+                alu::NEG | alu::END => read(insn.dst),
+                alu::MOV if insn.x() => read(insn.src),
+                alu::MOV => {}
+                _ => {
+                    if insn.x() {
+                        read(insn.src);
+                    }
+                    read(insn.dst);
+                }
+            },
+            // A store's or an atomic's source, and a compare-and-exchange's
+            // R0, as wide as the operand.
+            class::STX if dw && insn.mode() == mode::ATOMIC => match insn.imm {
+                atomic::LOAD_ACQ => {}
+                atomic::CMPXCHG => {
+                    read(insn.src);
+                    read(0);
+                }
+                _ => read(insn.src),
+            },
+            class::STX if dw => read(insn.src),
+            class::JMP => match insn.op() {
+                // check_func_arg reads the helper's arguments.
+                jmp::CALL if insn.src == 0 => {
+                    for r in 1..=helper_params(insn.imm).unwrap_or(0) {
+                        read(r);
+                    }
+                }
+                // check_return_code reads the main program's R0; a callee's
+                // goes back to its caller unread.
+                jmp::EXIT if main => read(0),
+                jmp::CALL | jmp::EXIT | jmp::JA | jmp::JCOND => {}
+                _ => {
+                    if insn.x() {
+                        read(insn.src);
+                    }
+                    read(insn.dst);
+                }
+            },
+            // BPF_LD_IND's register, of any width.
+            class::LD if insn.mode() == mode::IND => read(insn.src),
+            _ => {}
+        }
     }
 
     /// `save_aux_ptr_type` of the pointer a load or store at `i` went
@@ -1919,13 +2055,155 @@ impl Walk {
         regs[FP] = Reg::Ptr(Ptr::Stack(frame as u8 + 1), 0);
         let mut caller = std::mem::replace(&mut s.regs, regs);
         caller[0..=5].fill(Reg::NotInit);
+        // The arguments keep their subreg_def, which a read in the callee
+        // marks.
+        let mut subreg = [None; REGS];
+        subreg[1..=5].copy_from_slice(&s.subreg[1..=5]);
+        let mut caller_subreg = std::mem::replace(&mut s.subreg, subreg);
+        caller_subreg[0..=5].fill(None);
         s.callers.push(Caller {
             regs: caller,
+            subreg: caller_subreg,
             stack: std::mem::replace(&mut s.stack, [Slot::Bytes; (MAX_STACK / 8) as usize]),
             subprog: std::mem::replace(&mut s.subprog, subprog),
             ret: i + 1,
         });
         Ok(Step::Next(start))
+    }
+
+    /// `mark_fastcall_patterns`, before the walk: around a helper call,
+    /// pairs of a spill to the stack before it and a fill after, from the
+    /// function's lowest spill up, of the caller-saved registers the call
+    /// leaves (`bpf_fastcall`). Where the JIT inlines the helper, which of
+    /// those here is `bpf_get_smp_processor_id` alone, the pairs go after
+    /// the walk; elsewhere they keep their stack.
+    fn fastcall_patterns(&mut self, insns: &[Insn]) {
+        let n = insns.len();
+        self.fastcall = vec![(0, false); self.starts.len()];
+        self.pattern = vec![false; n];
+        self.spills = vec![0; n];
+        let spill =
+            |insn: Insn| insn.code == class::STX | mode::MEM | size::DW && insn.dst == FP as u8;
+        for f in 0..self.starts.len() {
+            let range = body(&self.starts, n, f);
+            let lowest = insns[range.clone()]
+                .iter()
+                .filter(|&&insn| spill(insn))
+                .map(|insn| i64::from(insn.off))
+                .fold(0, i64::min);
+            for c in range {
+                let call = insns[c];
+                if call.code != class::JMP | jmp::CALL || call.src != 0 {
+                    continue;
+                }
+                // get_helper_proto: no pattern around a helper the program
+                // may not call.
+                if !socket_filter_helper(call.imm) {
+                    continue;
+                }
+                let first = |j: usize| {
+                    c >= j && c + j < n && {
+                        let (stx, ldx) = (insns[c - j], insns[c + j]);
+                        spill(stx)
+                            && ldx.code == class::LDX | mode::MEM | size::DW
+                            && ldx.src == FP as u8
+                            && stx.src == ldx.dst
+                    }
+                };
+                let Some(params) = helper_params(call.imm) else {
+                    // A helper the walk refuses where it reaches it: a
+                    // pattern around it in dead code is refused after.
+                    if first(1) && i64::from(insns[c - 1].off) == lowest {
+                        self.fastcall_unknown = true;
+                    }
+                    continue;
+                };
+                // The call clobbers R0 and its arguments.
+                let mut expected: u32 = 0x3f & !((1 << (params + 1)) - 1);
+                let mut off = lowest;
+                let mut i = 1;
+                while i <= 6 {
+                    if !first(i) {
+                        break;
+                    }
+                    let (stx, ldx) = (insns[c - i], insns[c + i]);
+                    if expected & (1 << stx.src) == 0
+                        || i64::from(stx.off) != off
+                        || i64::from(ldx.off) != off
+                    {
+                        break;
+                    }
+                    expected &= !(1 << stx.src);
+                    self.pattern[c - i] = true;
+                    self.pattern[c + i] = true;
+                    i += 1;
+                    off += 8;
+                }
+                if i == 1 {
+                    continue;
+                }
+                if call.imm == func::GET_SMP_PROCESSOR_ID {
+                    self.spills[c] = i - 1;
+                } else {
+                    self.fastcall[f].1 = true;
+                }
+                self.fastcall[f].0 = self.fastcall[f].0.min(off);
+            }
+        }
+    }
+
+    /// `check_fastcall_stack_contract` of an access at `off` of the stack
+    /// of `subprog` by the instruction at `i`: one that is no pattern's,
+    /// below the patterns' stack, keeps every pattern of the function.
+    fn fastcall_contract(&mut self, i: usize, subprog: usize, off: i64) {
+        if self.fastcall[subprog].0 <= off || self.pattern[i] {
+            return;
+        }
+        self.fastcall[subprog].0 = i64::from(i16::MIN);
+        for j in body(&self.starts, self.pattern.len(), subprog) {
+            self.spills[j] = 0;
+            self.pattern[j] = false;
+        }
+    }
+
+    /// `remove_fastcall_spills_fills`, after the walk: the pairs around an
+    /// inlined helper become `BPF_JA` of 0, which `opt_remove_nops`
+    /// removes, and a function that had any, and keeps no other pattern's
+    /// stack, has only the stack above them.
+    fn remove_fastcall_spills_fills(&mut self) -> Checked<()> {
+        if self.fastcall_unknown {
+            return gap("bpf_fastcall patterns around helpers the verifier refuses");
+        }
+        self.nops = vec![false; self.spills.len()];
+        for f in 0..self.starts.len() {
+            let mut modified = false;
+            for c in body(&self.starts, self.spills.len(), f) {
+                for j in 1..=self.spills[c] {
+                    self.nops[c - j] = true;
+                    self.nops[c + j] = true;
+                    modified = true;
+                }
+            }
+            let (off, keep) = self.fastcall[f];
+            if modified && !keep {
+                self.depth[f] = (-off) as u32;
+            }
+        }
+        Ok(())
+    }
+
+    /// What the rewrites after the walk depend on.
+    fn facts<'a>(&'a self, insns: &'a [Insn], options: Options) -> rewrite::Facts<'a> {
+        rewrite::Facts {
+            insns,
+            seen: &self.seen,
+            nops: &self.nops,
+            through_ctx: &self.through_ctx,
+            lookups: &self.lookups,
+            maps: &self.maps,
+            zext: &self.zext,
+            rnd_hi32: options.rnd_hi32,
+        }
     }
 
     /// `grow_stack_state`: the frames of `subprog` reach `bytes` below
@@ -2464,6 +2742,78 @@ fn jmp_op(s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
     }
 }
 
+/// `is_reg64` of an ALU instruction's registers: a 64-bit operation's,
+/// but for a 16- or 32-bit byte swap, and a 32-bit one's only for a
+/// conversion of 64 bits.
+fn reg64(insn: Insn) -> bool {
+    let swap = insn.op() == alu::END;
+    if insn.class() == class::ALU64 {
+        !(swap && matches!(insn.imm, 16 | 32))
+    } else {
+        swap && insn.imm == 64
+    }
+}
+
+/// `insn_def_regno` and `insn_has_def32`: the register an instruction
+/// writes, and whether only its low 32 bits.
+fn def32(insn: Insn) -> Option<(u8, bool)> {
+    let narrow = insn.size() != size::DW;
+    match insn.class() {
+        class::JMP | class::JMP32 | class::ST => None,
+        class::STX if insn.mode() != mode::ATOMIC => None,
+        class::STX => match insn.imm {
+            atomic::CMPXCHG => Some((0, narrow)),
+            atomic::LOAD_ACQ => Some((insn.dst, narrow)),
+            op if op & atomic::FETCH != 0 => Some((insn.src, narrow)),
+            _ => None,
+        },
+        class::ALU | class::ALU64 => Some((insn.dst, !reg64(insn))),
+        class::LDX => Some((insn.dst, narrow && insn.mode() != mode::MEMSX)),
+        // BPF_LD_ABS and BPF_LD_IND load 32 bits into R0.
+        _ => Some((insn.dst, insn.mode() != mode::IMM)),
+    }
+}
+
+/// The `subreg_def` an instruction at `i` leaves: its destination's
+/// (`check_reg_arg` of `DST_OP`), and none for a helper's R0 and the
+/// registers a call or `BPF_LD_ABS` takes. A call to a function and an
+/// exit from one move theirs with the frames.
+fn subreg_defs(s: &mut State, insn: Insn, i: usize) {
+    if insn.class() == class::JMP {
+        if insn.op() == jmp::CALL && insn.src == 0 {
+            s.subreg[0..=5].fill(None);
+        }
+        return;
+    }
+    if insn.class() == class::LD && insn.mode() != mode::IMM {
+        s.subreg[1..=5].fill(None);
+    }
+    if let Some((r, narrow)) = def32(insn) {
+        s.subreg[usize::from(r)] = narrow.then_some(i as u32);
+    }
+}
+
+/// How many arguments a helper verified here takes (`arg1_type` to
+/// `arg5_type` that are not `ARG_DONTCARE`); none returns `void`.
+fn helper_params(id: i32) -> Option<u8> {
+    match id {
+        func::MAP_LOOKUP_ELEM | func::MAP_DELETE_ELEM => Some(2),
+        func::MAP_UPDATE_ELEM | func::SKB_LOAD_BYTES => Some(4),
+        func::SKB_LOAD_BYTES_RELATIVE => Some(5),
+        func::GET_SOCKET_COOKIE | func::GET_SOCKET_UID | func::GET_NETNS_COOKIE => Some(1),
+        func::KTIME_GET_NS
+        | func::GET_PRANDOM_U32
+        | func::GET_SMP_PROCESSOR_ID
+        | func::GET_CURRENT_PID_TGID
+        | func::GET_CURRENT_UID_GID
+        | func::GET_NUMA_NODE_ID
+        | func::KTIME_GET_BOOT_NS
+        | func::KTIME_GET_COARSE_NS
+        | func::KTIME_GET_TAI_NS => Some(0),
+        _ => None,
+    }
+}
+
 /// `prepare_func_exit`: the callee's R0, which may not point into a stack,
 /// goes back to its caller, after the call.
 fn func_exit(s: &mut State) -> Checked<Step> {
@@ -2475,8 +2825,11 @@ fn func_exit(s: &mut State) -> Checked<Step> {
     let Some(caller) = s.callers.pop() else {
         return refuse(Errno::EFAULT, "");
     };
+    let r0_subreg = s.subreg[0];
     s.regs = caller.regs;
     s.regs[0] = r0;
+    s.subreg = caller.subreg;
+    s.subreg[0] = r0_subreg;
     s.stack = caller.stack;
     s.subprog = caller.subprog;
     Ok(Step::Next(caller.ret))
@@ -2551,6 +2904,7 @@ mod tests {
             max_entries,
             flags,
             exclusive: false,
+            bypass_spec: kind == map_type::ARRAY,
         };
         match fd {
             3 => Ok(shape(30, map_type::ARRAY, 4, 8, 1, 0)),
@@ -3900,6 +4254,112 @@ mod tests {
                 exit(),
             ]),
             (EACCES, "R5 !read_ok".into())
+        );
+    }
+
+    fn rewritten(insns: &[Insn], options: Options) -> (usize, Vec<u32>) {
+        match verify(insns, options) {
+            Ok(v) => (v.len, v.stack_depth),
+            Err(r) => panic!("refused: {} ({:?})", r.line, r.errno),
+        }
+    }
+
+    #[test]
+    fn the_rewrites_make_the_program_as_long_as_linux_s() {
+        let options = Options::default();
+        let len = |insns: &[Insn]| rewritten(insns, options).0;
+        // r0 = 1; r1 = 2; r0 /= r1 gets its check of 0.
+        assert_eq!(len(&[mov(0, 1), mov(1, 2), i(0x3f, 0, 1, 0, 0), exit()]), 7);
+        // A known branch: the move it jumps over and the jump go.
+        assert_eq!(len(&[mov(0, 0), i(0x15, 0, 0, 1, 0), mov(0, 1), exit()]), 2);
+        // The context's len, its second byte, and vlan_present.
+        let ctx = |insn| len(&[insn, mov(0, 0), exit()]) - 2;
+        assert_eq!(ctx(i(0x61, 2, 1, 0, 0)), 1);
+        assert_eq!(ctx(i(0x71, 2, 1, 1, 0)), 3);
+        assert_eq!(ctx(i(0x61, 2, 1, 20, 0)), 3);
+        // A lookup of an array of a creator with CAP_PERFMON, and of a
+        // hash, inlined.
+        let mut insns = lookup(3);
+        insns.extend([mov(0, 0), exit()]);
+        assert_eq!(len(&insns), insns.len() + 6);
+        let mut insns = vec![i(0x7a, 10, 0, -8, 0)];
+        insns.extend(ld_map(1, 4));
+        insns.extend([
+            mov_reg(2, 10),
+            i(0x07, 2, 0, 0, -8),
+            call(1),
+            mov(0, 0),
+            exit(),
+        ]);
+        assert_eq!(len(&insns), insns.len() + 2);
+        // A 32-bit cmpxchg's R0 read as 64 bits by the exit is
+        // zero-extended; one written over first is not.
+        let cmpxchg = [
+            i(0x7a, 10, 0, -8, 0),
+            mov(0, 0),
+            mov(2, 0),
+            i(0xc3, 10, 2, -8, 0xf1),
+        ];
+        let mut insns = cmpxchg.to_vec();
+        insns.push(exit());
+        assert_eq!(len(&insns), 6);
+        insns.insert(4, i(0xb4, 0, 0, 0, 1));
+        assert_eq!(len(&insns), 6);
+        // With BPF_F_TEST_RND_HI32, a 32-bit result nothing reads as 64
+        // bits gets three more.
+        let rnd = Options {
+            rnd_hi32: true,
+            ..options
+        };
+        let insns = [i(0xb4, 0, 0, 0, 1), i(0xb4, 0, 0, 0, 2), exit()];
+        assert_eq!(rewritten(&insns, rnd).0, 6);
+        assert_eq!(rewritten(&insns, options).0, 3);
+    }
+
+    #[test]
+    fn a_fastcall_spill_and_fill_go_with_their_stack() {
+        let options = Options::default();
+        // *(u64 *)(r10 - 8) = r1; call bpf_get_smp_processor_id;
+        // r1 = *(u64 *)(r10 - 8): the pair goes, and the call is 3.
+        let pattern = [i(0x7b, 10, 1, -8, 0), call(8), i(0x79, 1, 10, -8, 0)];
+        let mut insns = pattern.to_vec();
+        insns.extend([mov(0, 0), exit()]);
+        assert_eq!(rewritten(&insns, options), (5, vec![0]));
+        // Another read of that stack keeps it.
+        let mut kept = vec![i(0x79, 3, 10, -8, 0)];
+        kept.extend(&insns);
+        assert_eq!(rewritten(&kept, options), (8, vec![8]));
+        // Around a helper the JIT does not inline, the pair stays, and the
+        // stack with it.
+        let mut insns = vec![i(0x7b, 10, 1, -8, 0), call(5), i(0x79, 1, 10, -8, 0)];
+        insns.extend([mov(0, 0), exit()]);
+        assert_eq!(rewritten(&insns, options), (5, vec![8]));
+    }
+
+    #[test]
+    fn a_rewrite_whose_jump_no_longer_reaches_is_enomem() {
+        // r2 = len; if r2 == 0 goto +32767 over a division and moves.
+        let mut insns = vec![
+            i(0x61, 2, 1, 0, 0),
+            mov(0, 1),
+            i(0x15, 2, 0, i16::MAX, 0),
+            i(0x3f, 0, 2, 0, 0),
+        ];
+        insns.resize(3 + i16::MAX as usize, mov(0, 1));
+        insns.push(exit());
+        let r = verify(&insns, Options::default()).expect_err("accepted");
+        assert_eq!(
+            (r.errno, r.line.as_str()),
+            (
+                Errno::ENOMEM,
+                "insn 3 cannot be patched due to 16-bit range"
+            )
+        );
+        // A jump that still reaches.
+        insns[2].off = i16::MAX - 3;
+        assert_eq!(
+            verify(&insns, Options::default()).map(|v| v.len),
+            Ok(insns.len() + 3)
         );
     }
 }

@@ -4324,6 +4324,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EACCES`）。`BPF_LOG_STATS` では、ログに関数ごとのスタックの深さと、呼び出しの連なりが使う
   最大の深さが出ます（テストのマシンの 7.0 と同じく "stack depth %d+%d max %d"）。
 
+- 経路をたどった後のプログラムの長さは、Linux の書き換えが作る長さです。ただしインタープリタは
+  読み込んだままの命令を動かします。片側をどの経路も通らなかった条件ジャンプはジャンプになり、
+  どの経路も届かなかったコードと、0 のジャンプが除かれます（`opt_remove_dead_code`、
+  `opt_remove_nops`）。コンテキストへのアクセスは、x86-64 のカーネルが作る `struct sk_buff`
+  の読み込みになり、狭い読み込みにはシフトとマスク、符号拡張には移動が付きます
+  （`convert_ctx_accesses`）。レジスタによる除算と剰余には 0 と -1 の確認が付き、
+  `BPF_LD_ABS` と `BPF_LD_IND` には呼び出しが付き、`bpf_get_smp_processor_id` と、一つの
+  配列・ハッシュ・LRU ハッシュの検索はインライン化されます（`do_misc_fixups`）。R0 を 64
+  ビットとして読む 32 ビットの `BPF_CMPXCHG` はゼロ拡張され、`BPF_F_TEST_RND_HI32` では、
+  それ以上の幅で読まない 32 ビットの結果に、上位の半分を埋める 3 命令が付きます
+  （`opt_subreg_zext_lo32_rnd_hi32`）。`bpf_get_smp_processor_id` の前後で、それが残すレジスタを
+  関数の最も低いスピルから退避して戻す命令（`bpf_fastcall`）も除かれ、関数のスタックの深さにも
+  数えなくなります。ただし、ほかのアクセスがそのスタックを使うか、ほかのヘルパーの前後の同じ形が
+  それを残すときは別です。書き換えの後にジャンプが 16 ビットで届かなくなるものは `ENOMEM`
+  です（"insn %d cannot be patched due to 16-bit range"）。プログラムのメモリは書き換えが作る
+  命令まで増え（`bpf_prog_realloc`）、ソケットにはその分を課金します。
+
 - ソケットフィルターは `SO_ATTACH_BPF` で、古典的なものは `SO_ATTACH_FILTER`（後述）で、
   AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の
   ソケットにアタッチし、送られてくるメッセージごとに、Linux の `sk_filter` と
@@ -4385,7 +4402,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EFAULT` で、読み込みの結果に代わります。`log_true_size` はログの長さです。読み込んだ
   プログラムは `anon_inode:bpf-prog` の close-on-exec のディスクリプタです。その fdinfo は、
   型、タグ（Linux の `bpf_prog_calc_tag` と同じく、マップのディスクリプタを除いた命令の
-  SHA-256 の先頭 8 バイト）、メモリ（96 バイトのヘッダーと命令をページで）、ID（マップとは
+  SHA-256 の先頭 8 バイト）、メモリ（96 バイトのヘッダーと命令をページで。書き換えで命令が増えれば、その数で）、ID（マップとは
   別のプログラムの ID）、検証器が通った命令の数を示します。`prog_jited` と実行の統計は 0 です。
   Linux が受け入れるのに検証器が断るものは [制限](./limitations) を参照してください。
 

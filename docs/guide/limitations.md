@@ -1082,9 +1082,8 @@ verified.
   routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
   and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
   gateway's neighbour state does not steer a lookup, as Linux's
-  `rt6_check_neigh` does among routes of one metric, and two routes with
-  gateways of one metric, which Linux makes multipath siblings, are
-  `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
+  `rt6_check_neigh` does among routes of one metric. A UDP connect to a
+  group of the node or the
   link without a scope ID or a device is `EINVAL`, as Linux's is with no
   multicast interface, which none is here. A connection accepted from a
   link-local address has no device, so its names have no scope ID. A UDP
@@ -1174,8 +1173,8 @@ verified.
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
   A
-  route goes through `lo`, a veth end or rejects: multipath routes,
-  encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
+  route goes through `lo`, a veth end or rejects: IPv4 multipath
+  routes, encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
@@ -1282,7 +1281,7 @@ verified.
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
   With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
-  not have (a multipath route, say, or a link of a kind) carries no
+  not have (an IPv4 multipath route, say, or a link of a kind) carries no
   message, as Linux would take it; an IPv6 route replaced without
   `NLM_F_CREATE` that is not there is told of
   ("Can not replace route - no match found") only where its prefix has

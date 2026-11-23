@@ -2803,14 +2803,42 @@ kernel.
     on the named end's link (`ENODEV` without one, `ENETDOWN` while it is
     down). A route with a gateway goes out to the gateway's neighbour
     entry, and a dump, a notification and a lookup give it as
-    `RTA_GATEWAY`. Another route with a gateway of the same metric would
-    be its multipath sibling (`rt6_qualify_for_ecmp`), which is
-    `EOPNOTSUPP` for now; one of the same device and gateway is `EEXIST`, and
-    `RTM_DELROUTE` with a gateway removes only a route through it. Turning `disable_ipv6` on for an end
+    `RTA_GATEWAY`. Another route with a gateway of the same metric is its
+    multipath sibling (`rt6_qualify_for_ecmp`, `fib6_add_rt2node`): it
+    goes after the routes of that metric, and is told of with all the hops
+    of its route in `RTA_MULTIPATH`, from itself on, without
+    `NLM_F_EXCL` and with the request's `NLM_F_APPEND`. A dump tells of a
+    multipath route once, its hops in the order they came, and passes over
+    a route of the metric without a gateway that came between them
+    (`fib6_dump_node`); `RTM_F_FIB_MATCH` gives the hops from the one a
+    lookup took. One of the same device and gateway is `EEXIST`, and
+    `NLM_F_REPLACE` takes away all of a multipath route's hops but the new
+    one. `RTM_DELROUTE` with a gateway removes only a route through it;
+    without one, a multipath route goes with all its hops, told of in one
+    message (`__ip6_del_rt_siblings`). A request's `RTA_MULTIPATH` adds
+    or removes each of its next hops, with the device and gateway each
+    names, else the request's, and its weight (`rtnh_hops`, given back in
+    dumps), as `ip6_route_multipath_add` and `ip6_route_multipath_del`
+    do: none, a gateway shorter than an address, or a hop added without a
+    gateway is `EINVAL`, and one twice `EEXIST`; all are checked before any
+    goes in, and one message tells of those put in. Where one then fails,
+    those put in are told of, then go, each told of. A removal takes each
+    hop alone, and gives the last error. A lookup takes the hop the flow's
+    hash falls to, each hop living taking a share of the hashes by its
+    weight (`fib6_select_path`, `rt6_multipath_rebalance`), with the
+    namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
+    the source, the destination, the flow label and the protocol; a
+    socket's packets hash as it is bound, `::` unbound, with no flow
+    label. Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
-    Going down, or away, it loses its IPv6 routes, told of in the order of
-    a dump, then its addresses (`addrconf_ifdown`).
+    Going down, it loses its IPv6 routes, told of in the order of a dump,
+    but a multipath route's hop, which turns `RTNH_F_DEAD` and
+    `RTNH_F_LINKDOWN` without a word, and which lookups pass over until
+    the end is ready again (`fib6_ifdown`, `rt6_sync_up`), unless the
+    devices of all its route's hops are then down, when all of it goes;
+    then its addresses (`addrconf_ifdown`). Going away, it loses what is
+    left of them.
   - **Netconf of veth ends:** each end's settings
     are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
     `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their
@@ -3057,9 +3085,11 @@ kernel.
     destination (`rt6_need_strict`), and the route's gateway and device;
     a local one goes out through `lo`. A multicast one is `EMSGSIZE`, as
     Linux's multicast routing knows no device of the reply it fills
-    (`ip6mr_get_route`). The mark, the user ID, the protocol and the ports choose among
-    policy rules and multipath routes, which there are none of, so they
-    change nothing.
+    (`ip6mr_get_route`). The source, the flow label (`RTA_FLOWLABEL`)
+    and the protocol choose among a multipath route's hops, as
+    `fib6_select_path` hashes them; the mark, the user ID and the ports
+    choose among policy rules, which there are none of, so they change
+    nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed

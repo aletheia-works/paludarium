@@ -1827,10 +1827,20 @@ pub(crate) fn drop_task(polls: &Polls, inbox: &crate::SignalInbox) {
             .store(armed.len(), std::sync::atomic::Ordering::SeqCst);
         dropped
     };
-    drop(dropped);
     let work = std::mem::take(&mut inbox.task_work().queue);
-    drop(work);
     inbox.clear_notify_if_idle();
+    // They leave their rings' cancel tables, which a cancellation would
+    // find them in otherwise.
+    for armed in &dropped {
+        if let Ok(ring) = downcast(&armed.ring) {
+            ring.unhash(armed.id);
+        }
+    }
+    for (file, work) in &work {
+        if let (Ok(ring), Deferred::Poll { id, .. }) = (downcast(file), work) {
+            ring.unhash(*id);
+        }
+    }
 }
 
 /// The identity of an open file, which a cancellation with

@@ -5901,8 +5901,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     a socket takes only what comes in on that device, or for one bound to
     no device anything, one bound to it before one bound to none and
     after a connected one (`compute_score`); a packet to the namespace's
-    own address comes in on `lo` for IPv4, or on the device the sender is
-    bound to, and on the address's device for IPv6. Its IPv4 packets go
+    own address comes in on that address's device (its local route's, or
+    `lo` for none), for IPv4 as for IPv6. Its IPv4 packets go
     by the routes through the device only, and where none goes, on link
     through it; a group of 224.0.0.0/24 or the limited broadcast address
     straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`

@@ -782,9 +782,6 @@ impl Network {
             IpAddr::V4(_) => 0,
         }
     }
-    /// The index the peer of this namespace's veth end `index` has in its
-    /// own namespace, where a packet out through the end comes in; 0 for
-    /// none.
     /// The device a packet to this namespace's own `to` comes in on: its
     /// local route's, the address's device, as an IPv6 one comes in on its
     /// route's `rt6i_idev` (`ip6_rcv_core`) and an IPv4 one's `rt_iif` is
@@ -806,6 +803,9 @@ impl Network {
             device
         }
     }
+    /// The index the peer of this namespace's veth end `index` has in its
+    /// own namespace, where a packet out through the end comes in; 0 for
+    /// none.
     fn peer_index(&self, index: i32) -> u32 {
         self.devices()
             .by_index(index)

@@ -11,7 +11,7 @@
    to one's own address comes in on lo for IPv4, unless sent from a socket
    bound to a device, and on the address's device for IPv6, and only
    sockets bound to no device or to that one take it, one bound to it
-   before others; a TCP listener the same, and the connection it accepts
+   before others but a connected one; a TCP listener the same, and the connection it accepts
    is bound as it is. An IPv4 socket bound to a device goes by its routes
    only, else on link through it: from va to vc's address, out through va,
    in on vb. A device down is ENETUNREACH, one gone ENODEV. */
@@ -438,6 +438,25 @@ int main(int argc, char **argv) {
     send4(out_va, "10.1.0.1", 7000, "from va to 10.1.0.1");
     which(four, four_names, 4, "to 10.1.0.1 from va");
     send4(out_va, "224.0.0.5", 7000, "from va to 224.0.0.5");
+    /* Of two bound to one address and port, a connected one before one
+       bound to the device (compute_score). */
+    int reuse = 1;
+    struct sockaddr_in at7200 = at4("10.0.0.1", 7200);
+    int on_dev = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(on_dev, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+    to_name(on_dev, "va", 2, "UDP to va, for 10.0.0.1:7200");
+    printf("bind it=%ld\n", result(bind(on_dev, (void *)&at7200, sizeof at7200)));
+    int joined = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(joined, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+    printf("UDP on none, 10.0.0.1:7200: bind=%ld\n", result(bind(joined, (void *)&at7200, sizeof at7200)));
+    int from7300 = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in at7300 = at4("10.0.0.1", 7300);
+    printf("a sender at 10.0.0.1:7300: bind=%ld\n", result(bind(from7300, (void *)&at7300, sizeof at7300)));
+    printf("connect the one on none to it=%ld\n", result(connect(joined, (void *)&at7300, sizeof at7300)));
+    send4(from7300, "10.0.0.1", 7200, "from 10.0.0.1:7300 to 10.0.0.1:7200");
+    const int pair[] = {on_dev, joined};
+    const char *const pair_names[] = {"va", "connected"};
+    which(pair, pair_names, 2, "to 10.0.0.1:7200");
     int out6 = socket(AF_INET6, SOCK_DGRAM, 0);
     send6(out6, "2001:db8::1", 7100, "from none to 2001:db8::1");
     which(sixes, six_names, 3, "to 2001:db8::1");

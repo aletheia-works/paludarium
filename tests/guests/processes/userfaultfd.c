@@ -304,7 +304,6 @@ static void on_segv(int sig, siginfo_t *info, void *context) {
     siglongjmp(refused, 1);
 }
 
-/* The calls' errors and their order. */
 /* /dev/userfaultfd (userfaultfd_misc): a root misc device of mode 0600,
    whose only operation, USERFAULTFD_IOC_NEW, makes a context of the flags
    it is given with no capability; and vm.unprivileged_userfaultfd, read
@@ -344,6 +343,7 @@ static void dev_calls(void) {
     printf("sysctl: %ld bytes, a bit %d\n", n, n == 2 && (text[0] == '0' || text[0] == '1') && text[1] == '\n');
 }
 
+/* The calls' errors and their order. */
 static int case_calls(void) {
     printf("bad flags: %s\n", err(uffd(0x10)));
     printf("user mode only, bad flags: %s\n", err(uffd(UFFD_USER_MODE_ONLY | 0x10)));

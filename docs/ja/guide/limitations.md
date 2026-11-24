@@ -93,7 +93,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   拒みます（[設計判断](../design/decisions)）。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
-  `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches` 以外など）と、
+  `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
+  `vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前
   （`stack`、`sched` など）は、ふつうのパスと同じように探すので、`--mount /:/` ではホストの
   `/proc` に届きます。ほかのプロセスのディレクトリでは、それらは `ENOENT` です。Linux は

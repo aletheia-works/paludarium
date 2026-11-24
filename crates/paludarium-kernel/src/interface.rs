@@ -5132,6 +5132,63 @@ mod tests {
         );
     }
     #[test]
+    fn a_lone_dead_ipv6_hop_stays_dead_until_its_device_is_ready_or_goes_down() {
+        let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
+        let mut a = Addresses::first();
+        a.up(0, true);
+        for (address, index) in [("2001:db8::1", 1000), ("2001:db8:1::1", 1001)] {
+            let mut end = V6::new(ip6(address), 64);
+            end.index = index;
+            a.add_v6(end, Lifetimes::FOREVER, false, true, None, 0)
+                .unwrap();
+        }
+        let ask = |via: &str| Ask6 {
+            table: TABLE_MAIN,
+            dst: ip6("2001:db8:2::"),
+            len: 64,
+            kind: 1,
+            proto: 3,
+            metric: 0,
+            prefsrc: None,
+            oif: 0,
+            gateway: Some(ip6(via)),
+            onlink: false,
+            device: false,
+            ipv6_off: None,
+            request: 0x400,
+            metrics: Ok(NO_METRICS),
+        };
+        for via in ["2001:db8::2", "2001:db8:1::2"] {
+            a.add_route6(&ask(via), true).unwrap();
+        }
+        a.device_down6(1000);
+        // Its live sibling gone, the dead hop is left alone, as Linux
+        // leaves a route `RTNH_F_DEAD`, which lookups pass over.
+        a.del_route6(&ask("2001:db8:1::2")).unwrap();
+        let left: Vec<_> = a
+            .routes6
+            .iter()
+            .filter(|r| r.dst == ip6("2001:db8:2::"))
+            .collect();
+        assert!(matches!(left[..], [r] if r.dead && r.oif == 1000));
+        assert_eq!(
+            a.lookup6(ip6("2001:db8:2::9")).map(|_| ()),
+            Err(ENETUNREACH)
+        );
+        // Ready again, it is not dead.
+        a.link_ready6(1000, ([2, 0, 0, 0, 0, 1], false), 0);
+        assert_eq!(
+            a.lookup6(ip6("2001:db8:2::9")).unwrap().gateway,
+            Some(ip6("2001:db8::2"))
+        );
+        // Its device down again, with no sibling, it goes.
+        assert!(
+            told(&a.device_down6(1000))
+                .contains(&"-route 254 2001:db8:2::/64 Unicast 1024".to_owned())
+        );
+        assert!(a.routes6.iter().all(|r| r.dst != ip6("2001:db8:2::")));
+    }
+    #[test]
     fn ipv6_multipath_removal_without_a_gateway_takes_all_its_hops_in_one_message() {
         let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
         let mut a = Addresses::first();

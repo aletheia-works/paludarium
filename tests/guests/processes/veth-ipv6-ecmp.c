@@ -668,7 +668,8 @@ int main(int argc, char **argv) {
        appended, told of from the first sibling; one hop already there
        tells of those put in, then of their going. A removal takes each
        hop, giving the last error; a replacement takes all the hops. */
-    const struct hop two[] = {{"2001:db8::4", 0, 1}, {"2001:db8::5", VA, 3}};
+    /* A weight of 256, the most rtnh_hops (255) gives. */
+    const struct hop two[] = {{"2001:db8::4", 0, 1}, {"2001:db8::5", VA, 256}};
     const struct hop none[] = {{NULL, 0, 1}};
     const struct hop bad[] = {{"short", 0, 1}};
     const struct hop same[] = {{"2001:db8::6", 0, 1}, {"2001:db8::6", VA, 1}};

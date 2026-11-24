@@ -13,6 +13,7 @@
 //! socket listens reaches it in the kernel, whatever the policy allows.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
+use crate::interface::Flow6;
 use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::{Timeout, Timestamps};
 use crate::syscalls::Context;
@@ -43,11 +44,11 @@ const IPPROTO_ICMP: u64 = 1;
 const IPPROTO_TCP: u64 = 6;
 const IPPROTO_UDP: u64 = 17;
 const IPPROTO_ICMPV6: u64 = 58;
-/// The protocols a flow is hashed with ([`Network::flow6`]).
-const IPPROTO_TCP_: u8 = 6;
-const IPPROTO_UDP_: u8 = 17;
-const IPPROTO_ICMPV6_: u8 = 58;
-use crate::interface::Flow6;
+/// The protocol numbers a flow is hashed with ([`Network::flow6`]), as
+/// the `u8` of `flowi6_proto`.
+const FLOW_TCP: u8 = 6;
+const FLOW_UDP: u8 = 17;
+const FLOW_ICMPV6: u8 = 58;
 const ENOTSOCK: Errno = Errno(88);
 const EDESTADDRREQ: Errno = Errno(89);
 const ENOPROTOOPT: Errno = Errno(92);
@@ -2229,13 +2230,9 @@ impl InetSocket {
                     {
                         self.mapped_source(bound)?;
                     }
-                    let dest = self.network.route(
-                        plain_to,
-                        s.source(),
-                        device,
-                        IPPROTO_TCP_,
-                        self.now(),
-                    )?;
+                    let dest =
+                        self.network
+                            .route(plain_to, s.source(), device, FLOW_TCP, self.now())?;
                     let to = match dest {
                         Dest::Here(to) => Some(to),
                         Dest::Away | Dest::Veth(..) => None,
@@ -2498,7 +2495,7 @@ impl InetSocket {
         let source = (!keep).then_some(bound.ip());
         match self
             .network
-            .route(to, source, device, IPPROTO_UDP_, self.now())?
+            .route(to, source, device, FLOW_UDP, self.now())?
         {
             Dest::Here(to) => {
                 let from = self.datagram_source(s, to, options)?;
@@ -2646,10 +2643,10 @@ impl InetSocket {
             SocketAddr::V6(v6) if v6.scope_id() != 0 && needs_scope_id(*v6.ip()) => v6.scope_id(),
             _ => options.device,
         };
-        let flow = Network::flow6(s.source(), IPPROTO_UDP_);
+        let flow = Network::flow6(s.source(), FLOW_UDP);
         let route = self
             .network
-            .route(plain_to, s.source(), oif, IPPROTO_UDP_, self.now())?;
+            .route(plain_to, s.source(), oif, FLOW_UDP, self.now())?;
         if let Dest::Veth(index, cast) = route {
             let v6 = plain_to.is_ipv6();
             if self.family == Family::V6 && options.v6_only && !v6 {
@@ -2730,7 +2727,7 @@ impl InetSocket {
             // the peer's neighbour of `from`.
             if receiver.is_none() && answered {
                 self.network
-                    .reply(index, from.ip(), to.ip(), IPPROTO_ICMPV6_, self.now());
+                    .reply(index, from.ip(), to.ip(), FLOW_ICMPV6, self.now());
             }
             match receiver {
                 Some(receiver) => {
@@ -3441,7 +3438,7 @@ impl InetSocket {
             self.give_back(s, bound);
             return Err(Errno::EINVAL);
         }
-        let flow = Network::flow6(bound.map(|b| b.ip()), IPPROTO_TCP_);
+        let flow = Network::flow6(bound.map(|b| b.ip()), FLOW_TCP);
         let failing = match self
             .network
             .reach(index, from.ip(), to.ip(), &flow, self.now())
@@ -3449,7 +3446,7 @@ impl InetSocket {
             Reach::Answered(there) => {
                 // Its SYN-ACK, or its reset, comes back.
                 self.network
-                    .reply(index, from.ip(), to.ip(), IPPROTO_TCP_, self.now());
+                    .reply(index, from.ip(), to.ip(), FLOW_TCP, self.now());
                 return Ok(self.join(&there, s, (bound, from), to, options, false));
             }
             Reach::OneWay(_) | Reach::Dropped => (SYN_TIMEOUT, ETIMEDOUT),

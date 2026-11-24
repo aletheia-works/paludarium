@@ -50,6 +50,17 @@ pub trait FileHandle: Send + Sync {
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         Err(Errno::EPERM)
     }
+    /// Whether the generations [`Self::readiness`] gives are the file's
+    /// wake-ups, as Linux's keyed wake-ups are (`wake_up_poll`): the input
+    /// generation moves only as the file wakes its waiters for input
+    /// (`POLLIN`, `POLLPRI`, `POLLRDNORM`, `POLLRDBAND`), the output one only
+    /// for output, and both for `POLLERR` or `POLLHUP`. A wait for such a
+    /// file looks at it again only once a generation moved for what it waits
+    /// for (`pollwake`, `ep_poll_callback`). Without, any change anywhere
+    /// makes a wait look again.
+    fn keyed_wakeups(&self) -> bool {
+        false
+    }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }

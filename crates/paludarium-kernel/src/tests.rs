@@ -6016,6 +6016,36 @@ mod io_uring {
     }
 
     #[test]
+    fn a_ring_wakes_only_what_waits_for_its_completions() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        for slot in 0..4 {
+            push(&mut f, &r, slot, &nop(1, 0, 0, 0, 0));
+        }
+        let (event, out) = (DATA + 0x300, DATA + 0x400);
+        let interest = |f: &mut Fixture, events: u32| {
+            let mut e = [0u8; 12];
+            e[..4].copy_from_slice(&events.to_le_bytes());
+            e[4..].copy_from_slice(&3u64.to_le_bytes());
+            f.mem.write(GuestAddr(event), &e).unwrap();
+        };
+        let ep = f.ret(291, &[0]);
+        interest(&mut f, 4);
+        assert_eq!(f.ret(233, &[ep, 1, r.fd, event]), 0);
+        assert_eq!(f.ret(232, &[ep, out, 4, 0]), 0);
+        // The submission makes room, but its completions wake only what
+        // waits for input: a level-triggered interest in output is never
+        // listed.
+        assert_eq!(f.ret(426, &[r.fd, 4, 0, 0]), 4);
+        assert_eq!(f.ret(232, &[ep, out, 4, 0]), 0);
+        // epoll_ctl looks at it again.
+        interest(&mut f, 5);
+        assert_eq!(f.ret(233, &[ep, 3, r.fd, event]), 0);
+        assert_eq!(f.ret(232, &[ep, out, 4, 0]), 1);
+        assert_eq!(u32_at(&f, out), 5);
+    }
+
+    #[test]
     fn a_ring_is_readable_with_completions_and_writable_with_room() {
         let mut f = fixture();
         let r = ring(&mut f);

@@ -247,6 +247,10 @@ struct Poll {
     /// What it waits for, `POLLERR` and `POLLHUP` always among them.
     events: u32,
     eventfd: Option<Arc<dyn FileHandle>>,
+    /// The file's generations as it began to wait, for a file with keyed
+    /// wake-ups, which only one of them moving for what it waits for wakes
+    /// (`aio_poll_wake`'s key).
+    key: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -393,7 +397,11 @@ impl Ring {
             let mut index = 0;
             while index < state.polls.len() {
                 let poll = &state.polls[index];
-                let mask = if polled_by_a_worker(&poll.file) {
+                let asleep = poll.key.is_some_and(|before| {
+                    !crate::syscalls::wake_key(&poll.file)
+                        .is_some_and(|now| crate::syscalls::woke(poll.events, before, now))
+                });
+                let mask = if polled_by_a_worker(&poll.file) || asleep {
                     0
                 } else {
                     woken(&poll.file, polled(&poll.file).0, poll.events)
@@ -691,7 +699,7 @@ enum Started {
     /// It ran: its result, for the event.
     Done(i64),
     /// It waits for its file (`IOCB_CMD_POLL`).
-    Waiting(Arc<dyn FileHandle>, u32),
+    Waiting(Arc<dyn FileHandle>, u32, Option<(u64, u64)>),
 }
 
 /// `struct iocb`, as `io_submit` reads it.
@@ -760,13 +768,14 @@ fn submit_one(c: &mut Context<'_>, ring: &Arc<Ring>, user_iocb: u64) -> Result<(
             c.files.readiness.changed();
             Ok(())
         }
-        Ok(Started::Waiting(file, events)) => {
+        Ok(Started::Waiting(file, events, key)) => {
             let poll = Poll {
                 obj: user_iocb,
                 data: iocb.data,
                 file,
                 events,
                 eventfd,
+                key,
             };
             // A context another thread ended meanwhile cancels it, as
             // Linux's `free_ioctx_users` cancels what it finds waiting.
@@ -842,6 +851,7 @@ fn start(
                 return Err(Errno::EINVAL);
             }
             let events = iocb.buf as u32 | POLLERR | POLLHUP;
+            let key = crate::syscalls::wake_key(&file);
             let (mask, queues) = polled(&file);
             let mask = mask & events;
             // A file whose poll adds no waiter, or more than one, is
@@ -849,7 +859,7 @@ fn start(
             if mask != 0 {
                 Ok(Started::Done(i64::from(mask)))
             } else if queues == 1 {
-                Ok(Started::Waiting(file, events))
+                Ok(Started::Waiting(file, events, key))
             } else {
                 Err(Errno::EINVAL)
             }

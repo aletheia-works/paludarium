@@ -45,9 +45,10 @@ verified.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used. A
-  program's own segments and its interpreter's are named by the path it was
-  started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  program's own segments and its interpreter's are named by the path the
+  file had when it was started, with its symbolic links resolved and
+  `(deleted)` once nothing links it, but not after a rename, which Linux
+  follows. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
@@ -528,8 +529,9 @@ verified.
   `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
-  `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING` and
-  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the others give `EINVAL`). So no ring descriptor or personality can be
+  `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
+  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the
+  others give `EINVAL`). So no ring descriptor or personality can be
   registered, buffers cannot be updated, and buffers cannot be registered
   with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
   whole exit cancels the requests its threads submitted that wait for
@@ -546,9 +548,7 @@ verified.
   registered, where Linux's long-term pin refuses it (`EFAULT`), and a huge
   page charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where Linux
   charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`).
-  A `poll`, or a level-triggered `epoll`, that waits for room in a ring's
-  submission queue ends once there is room, where Linux's ring wakes only
-  what waits for its completions. The features are Linux
+  The features are Linux
   6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
   descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
   wait's `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
@@ -1357,8 +1357,8 @@ verified.
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. Its `NT_FILE`
   note names a mapped file by the path it had when it was mapped, and the
-  program by the path it was started by, where Linux follows a rename and
-  resolves symbolic links.
+  program by the path it had when it was started (resolved, `(deleted)`
+  once removed), where Linux follows a rename.
 - **Memory limit**: a write beyond the limit ends the process that made it,
   where Linux's OOM killer picks the process using the most memory.
 - **The native JIT**: it is experimental and off unless `--jit` asks for it,

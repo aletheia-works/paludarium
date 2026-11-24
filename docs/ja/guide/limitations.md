@@ -40,8 +40,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **`/proc/self/maps` の一部**：エミュレーターには vDSO も `vsyscall` のページも
   ないので、`[vvar]`、`[vdso]`、`[vsyscall]` の行はありません。スタックの VMA は
   初めから全体の大きさで、Linux のように使うにつれて伸びません。プログラムと
-  インタープリターのセグメントの名前は起動時のパスで、`(deleted)` も付きません。
-  Linux は名前の変更を追い、シンボリックリンクを解決します。
+  インタープリターのセグメントの名前は起動したときのファイルのパスで、シンボリック
+  リンクを解決し、ファイルを指す名前がなくなると `(deleted)` が付きますが、Linux と
+  違って名前の変更は追いません。
   `[anon:<名前>]` の名前（`PR_SET_VMA`）はありません。
 - **`/proc/self/smaps` と `smaps_rollup` の一部**：数える値は、エミュレーターのページのエントリーから
   出します。`Referenced` は数えたページすべてです。読み込んだプログラムの
@@ -449,7 +450,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
-  `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、`IORING_REGISTER_SYNC_CANCEL` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
+  `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、
+  `IORING_REGISTER_SYNC_CANCEL` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
   パーソナリティは登録できず、バッファーは更新できません。タグを付ける
   `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。プロセス全体が
   終わると、そのスレッドが投入してファイルを待っている要求は、Linux master の
@@ -464,9 +466,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   失敗し、リングを共有するプロセスは自分のメモリを動かします。Linux は固定したページを
   動かします。ディスクのファイルの共有マッピングも登録できます（Linux の長期の固定は
   `EFAULT` で断ります）。ヒュージページは 4 KiB のページごとに RLIMIT_MEMLOCK を数えます
-  （Linux は 1 回だけ数えます）。リングは共有でしかマップできません（`MAP_PRIVATE` は `EINVAL`）。
-  リングの投入キューの空きを待つ `poll` やレベルトリガーの `epoll` は、空きができると
-  終わります。Linux のリングが起こすのは、その完了を待つものだけです。機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
+  （Linux は 1 回だけ数えます）。リングは共有でしかマップできません（`MAP_PRIVATE` は `EINVAL`）。機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
   `IORING_FEAT_REG_REG_RING` を、待ちの `min_wait_usec` は何も変えないのに
   `IORING_FEAT_MIN_TIMEOUT` を報告します。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
@@ -1150,8 +1150,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **コアファイル**：コアは、カーネルの既定の `core_pattern`（作業ディレクトリの
   `core`）と同じように書きます。コアをクラッシュの処理系（systemd-coredump、apport）
   に渡すホストの設定は再現しません。コアの `NT_FILE` ノートは、マップしたファイルを
-  マップしたときのパスで、プログラムを起動したときのパスで示します。Linux は名前の
-  変更を追い、シンボリックリンクを解決します。
+  マップしたときのパスで、プログラムを起動したときのパス（解決したもので、消すと
+  `(deleted)` が付きます）で示します。Linux は名前の変更を追います。
 - **メモリの上限**：上限を超える書き込みをしたプロセスが終わります。Linux の
   OOM killer は、いちばんメモリを使っているプロセスを選びます。
 - **ネイティブの JIT**：試験的な機能で、`--jit` を付けたときだけ使います。使えるのは

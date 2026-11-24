@@ -7118,6 +7118,125 @@ static int context_switches_case(void) {
     fflush(stdout);
     _exit(0);
 }
+/* The exec-names case: a program's segments in /proc/self/maps are
+   named as /proc/self/exe names the program, as Linux's d_path of the
+   vm_file and of exe_file gives both: by the path with its symbolic links
+   resolved, and with " (deleted)" once nothing links the file, and a
+   core's NT_FILE note names it the same way. A copy of this program runs
+   through a symbolic link to it and looks. */
+static void en_maps_name(char *out, size_t size) {
+    out[0] = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return;
+    char line[4096];
+    /* The first line is the program's first segment. */
+    if (fgets(line, sizeof line, maps)) {
+        char *path = strchr(line, '/');
+        if (path) {
+            path[strcspn(path, "\n")] = 0;
+            snprintf(out, size, "%s", path);
+        }
+    }
+    fclose(maps);
+}
+static int exec_names_child(void) {
+    char exe[4096] = {0}, maps[4096];
+    if (readlink("/proc/self/exe", exe, sizeof exe - 1) < 0) return 70;
+    en_maps_name(maps, sizeof maps);
+    const char *base = strrchr(exe, '/');
+    printf("exe is the copy: %d\n", base && !strcmp(base, "/prog-copy"));
+    printf("maps names it so: %d\n", !strcmp(maps, exe));
+    char path[4096];
+    snprintf(path, sizeof path, "%s", exe);
+    if (unlink(path)) return 71;
+    char gone[4096] = {0};
+    if (readlink("/proc/self/exe", gone, sizeof gone - 1) < 0) return 72;
+    en_maps_name(maps, sizeof maps);
+    char marked[4200];
+    snprintf(marked, sizeof marked, "%s (deleted)", path);
+    printf("exe marked: %d\n", !strcmp(gone, marked));
+    printf("maps marked: %d\n", !strcmp(maps, marked));
+    /* A core names it so in its NT_FILE note too (fill_files_note's
+       file_path): a forked child dumps it, in the copy's directory. */
+    char *slash = strrchr(path, '/');
+    if (!slash) return 73;
+    *slash = 0;
+    if (chdir(path)) return 74;
+    struct rlimit r;
+    getrlimit(RLIMIT_CORE, &r);
+    r.rlim_cur = r.rlim_max;
+    setrlimit(RLIMIT_CORE, &r);
+    fflush(stdout);
+    pid_t dumper = fork();
+    if (dumper == 0) {
+        raise(SIGABRT);
+        _exit(75);
+    }
+    int status = 0;
+    waitpid(dumper, &status, 0);
+    int fd = open("core", O_RDONLY);
+    struct stat st;
+    unsigned char *core = NULL;
+    long size = 0, n;
+    if (fd >= 0 && fstat(fd, &st) == 0 && (core = malloc((size_t)st.st_size + 1)))
+        while (size < st.st_size && (n = read(fd, core + size, (size_t)(st.st_size - size))) > 0)
+            size += n;
+    if (fd >= 0) close(fd);
+    unlink("core");
+    core_bytes = core;
+    core_size = core ? (uint64_t)size : 0;
+    uint64_t files = 0;
+    for (int k = 0; core && size >= 64 && k < (int)le(56, 2); k++) {
+        uint64_t h = le(32, 8) + 56 * (uint64_t)k, offset = le(h + 8, 8), filesz = le(h + 32, 8);
+        if (le(h, 4) != 4) continue;
+        for (uint64_t q = offset; q + 12 <= offset + filesz && q + 12 <= core_size;) {
+            uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
+            uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
+            if (type == 0x46494c45 && !files) files = desc;
+            q = desc + ((descsz + 3) & ~3ULL);
+        }
+    }
+    uint64_t start, end, pgoff;
+    const char *named = file_entry(files, (uintptr_t)&exec_names_child, &start, &end, &pgoff);
+    printf("core dumped: %d names it so: %d\n", WCOREDUMP(status) ? 1 : 0,
+           named && !strcmp(named, marked));
+    free(core);
+    core_bytes = NULL;
+    core_size = 0;
+    fflush(stdout);
+    return 0;
+}
+static int exec_names_case(void) {
+    char dir[] = "/tmp/names-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char copy[64], link[64];
+    snprintf(copy, sizeof copy, "%s/prog-copy", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    int from = open("/proc/self/exe", O_RDONLY);
+    int to = open(copy, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    if (from < 0 || to < 0) return 81;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return 82;
+    close(from);
+    close(to);
+    if (symlink("prog-copy", link)) return 83;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char *argv[] = {link, "exec-names-child", link, NULL};
+        execv(link, argv);
+        _exit(84);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    unlink(link);
+    unlink(copy);
+    rmdir(dir);
+    return 0;
+}
 /* The proc-mem case: /proc/<pid>/mem reads and writes a task's memory at
    the address its position gives, as fs/proc/base.c's mem_rw does through
    access_remote_vm with FOLL_FORCE: a read-only page is written, a call
@@ -9890,6 +10009,27 @@ static void *rp_helper_main(void *arg) {
     return NULL;
 }
 
+/* Submits the entries waiting in the ring after 100 ms, then writes the
+   pipe, if any. */
+struct rp_submitter {
+    struct uring *u;
+    unsigned n;
+    int fd;
+};
+
+static void *rp_submitter_main(void *arg) {
+    struct rp_submitter *h = arg;
+    pw_sleep_ms(100);
+    uring_enter(h->u->fd, h->n, 0, 0, NULL, 0);
+    if (h->fd >= 0 && write(h->fd, "w", 1) != 1) return NULL;
+    return NULL;
+}
+
+/* Fills the submission queue with NOPs from `data` on. */
+static void rp_full(struct uring *u, unsigned long data) {
+    for (unsigned i = 0; i < u->sq_entries; i++) tw_nop(u, data + i, 0, 0, 0);
+}
+
 static int io_uring_ring_poll_case(void) {
     struct uring u, defer;
     pthread_t t;
@@ -9967,6 +10107,46 @@ static int io_uring_ring_poll_case(void) {
     printf("read-poll: %d %x\n", r, (unsigned)p.revents);
     pthread_join(t, NULL);
     uring_reap(&u, "read-poll");
+
+    /* Only a completion wakes a wait on the ring, and only one for input:
+       a poll for room in a full queue sleeps through another thread's
+       submission, unless another file wakes it, which looks at the ring
+       again. A level-triggered epoll interest in output is never listed. */
+    struct rp_submitter sub = {&u, u.sq_entries, -1};
+    rp_full(&u, 70);
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    struct pollfd po = {u.fd, POLLOUT, 0};
+    struct timespec before, after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    r = poll(&po, 1, 500);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    long slept = (after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1000000;
+    /* Its last look, as its time runs out, finds the room. */
+    printf("room-poll: %d %x slept=%d\n", r, (unsigned)po.revents, slept >= 400);
+    pthread_join(t, NULL);
+    rp_poll(&u, "room-after");
+    uring_reap(&u, "room-poll");
+    rp_full(&u, 80);
+    sub.fd = a[1];
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    struct pollfd both[2] = {{u.fd, POLLOUT, 0}, {a[0], POLLIN, 0}};
+    r = poll(both, 2, 5000);
+    printf("room-pipe-poll: %d %x %x\n", r, (unsigned)both[0].revents, (unsigned)both[1].revents);
+    pthread_join(t, NULL);
+    printf("drain: %ld\n", (long)read(a[0], buf, sizeof buf));
+    uring_reap(&u, "room-pipe-poll");
+    int room = epoll_create1(0);
+    if (room < 0) return 83;
+    rp_full(&u, 90);
+    printf("room-add: %d\n", rp_add(room, u.fd, EPOLLOUT, 4));
+    sub.fd = -1;
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    r = epoll_wait(room, &e, 1, 500);
+    printf("room-epoll: %d\n", r);
+    pthread_join(t, NULL);
+    rp_epoll(room, "room-epoll-after");
+    uring_reap(&u, "room-epoll");
+    close(room);
 
     /* A ring with IORING_SETUP_DEFER_TASKRUN is readable with task work. */
     if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 82;
@@ -38216,6 +38396,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
     if (!strcmp(mode, "context-switches")) return context_switches_case();
+    if (!strcmp(mode, "exec-names")) return exec_names_case();
+    if (!strcmp(mode, "exec-names-child")) return exec_names_child();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();

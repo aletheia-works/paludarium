@@ -135,6 +135,16 @@ pub type InterpreterCheck<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(Vec<u8>, Opt
 /// shared by a split and a fork, given back by an unmap and an exec.
 pub type Keep = Arc<dyn std::any::Any + Send + Sync>;
 
+/// A [`Keep`] that also names its segments' file as it is asked, as
+/// Linux's `d_path` names a `vm_file` when `/proc/<pid>/maps` or a core's
+/// `NT_FILE` note reads it: marked ` (deleted)` once nothing links the
+/// file. Its segments take `name` in place of the path they were loaded
+/// from, and keep `keep` too.
+pub struct Named {
+    pub name: Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>,
+    pub keep: Option<Keep>,
+}
+
 /// Inputs of the initial stack.
 #[derive(Clone, Copy, Debug)]
 pub struct StartInfo<'a> {
@@ -150,6 +160,9 @@ pub struct StartInfo<'a> {
     /// Whether the exec is secure (`AT_SECURE`): the program runs with
     /// other effective IDs than its real ones.
     pub secure: bool,
+    /// What the program's segments keep while they last, a [`Named`] to
+    /// name them as they are asked.
+    pub program: Option<&'a Keep>,
 }
 
 fn prot_of(flags: u32) -> Prot {
@@ -208,6 +221,13 @@ impl PageSource for SegmentFile {
         Ok(n)
     }
     fn name(&self) -> Option<Vec<u8>> {
+        if let Some(named) = self
+            ._keep
+            .as_deref()
+            .and_then(|keep| keep.downcast_ref::<Named>())
+        {
+            return (named.name)();
+        }
         self.name.as_deref().map(<[u8]>::to_vec)
     }
     fn identity(&self) -> (u64, u64) {
@@ -684,7 +704,7 @@ fn load_image(
     };
     let own = name.map_or((0, 0), identity);
     let (base, highest, mut fails) =
-        map_segments(bytes, name, own, &info, mem, STATIC_PIE_BASE, None)?;
+        map_segments(bytes, name, own, &info, mem, STATIC_PIE_BASE, start.program)?;
     let initial_break = GuestAddr(highest)
         .page_align_up()
         .ok_or(LoadError::Malformed("segment address overflow"))?;

@@ -79,6 +79,7 @@ mod perf;
 mod proc;
 mod process_vm;
 mod processes;
+mod program_name;
 mod ptrace;
 mod pty;
 #[cfg(test)]
@@ -735,15 +736,29 @@ impl Kernel {
     /// What the mappings of the first program's ELF interpreter, at `path`,
     /// keep while they last: a hold on its file, as Linux's hold theirs.
     pub fn interpreter_keep(&self, path: &[u8]) -> Option<paludarium_loader::Keep> {
-        self.files.interpreter_keep(path)
+        // Named as the program is, resolved and marked once removed.
+        let name = crate::program_name::ProgramName::of(&self.files, path);
+        Some(name.keep(self.files.interpreter_keep(path)))
+    }
+    /// What the segments of the first program, at `path`, keep while they
+    /// last: their name, as `/proc/self/maps` and a core give it (see
+    /// [`Self::set_executable`]).
+    pub fn program_keep(&self, path: &[u8]) -> paludarium_loader::Keep {
+        let path = self
+            .files
+            .exec_path(path.to_vec())
+            .unwrap_or_else(|_| path.to_vec());
+        crate::program_name::ProgramName::of(&self.files, &path).keep(None)
     }
     /// Records `path` as the program the first process runs, as
-    /// `/proc/self/exe` names it: with its symbolic links resolved.
+    /// `/proc/self/exe` names it: with its symbolic links resolved, and
+    /// marked ` (deleted)` once nothing links its file.
     pub fn set_executable(&self, path: &[u8]) {
         let path = self
             .files
             .exec_path(path.to_vec())
             .unwrap_or_else(|_| path.to_vec());
+        let name = crate::program_name::ProgramName::of(&self.files, &path);
         let path = crate::files::resolved(&self.files, &path).unwrap_or(path);
         // It runs, so its file may not be opened for writing (ETXTBSY). A
         // writer can only be the host's here, which is not counted, so the
@@ -751,7 +766,7 @@ impl Kernel {
         if let Ok(denied) = crate::processes::deny_writes(&self.files, &path) {
             self.group.set_exe_file(denied.map(Arc::new));
         }
-        self.group.set_executable(path);
+        self.group.set_executable(name);
     }
 
     /// Creates the initial thread for a loaded image: rip at the entry

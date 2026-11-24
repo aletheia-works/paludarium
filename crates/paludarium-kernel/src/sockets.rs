@@ -2766,6 +2766,10 @@ impl Side {
     /// the bytes it reads, and those of a packet it drops, as it ends at
     /// the end of a packet.
     fn pipe_read_plan(&self, want: usize) -> (usize, usize) {
+        // A read of nothing touches no buffer (`anon_pipe_read`).
+        if want == 0 {
+            return (0, 0);
+        }
         let mut taken = 0;
         for buf in &self.pipe_bufs {
             let chars = buf.len.min(want - taken);

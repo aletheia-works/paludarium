@@ -14425,6 +14425,10 @@ static int pipe_packets_case(void) {
     long w2 = pp_write(p[1], "defgh", 5);
     long w3 = pp_write(p[1], "i", 1);
     printf("writes %ld %ld %ld\n", w1, w2, w3);
+    /* A read of nothing leaves the packet at the front as it is. */
+    char none[1];
+    long zero = read(p[0], none, 0);
+    printf("zero %ld\n", zero < 0 ? -errno : zero);
     pp_reads("reads", p[0], 100, 4);
     printf("write %ld\n", pp_write(p[1], "jklmn", 5));
     pp_reads("short", p[0], 2, 1);

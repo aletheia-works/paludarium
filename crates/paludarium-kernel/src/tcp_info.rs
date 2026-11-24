@@ -43,7 +43,7 @@ const WINDOW: u32 = 65_536;
 /// loopback connections take them.
 const OPTIONS: u8 = 0x1 | 0x2 | 0x4;
 /// Linux's default `tcp_rmem[2]` (32 MiB), which window scaling covers.
-const RMEM_MAX: u32 = 32 << 20;
+pub(crate) const RMEM_MAX: u32 = 32 << 20;
 
 /// The fields `tcp_get_info` fills, the rest 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

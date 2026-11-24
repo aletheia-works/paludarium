@@ -96,6 +96,15 @@
    the bytes in pages too; and that a
    datagram takes of the receive buffer what it took as it came, however
    little of it the filter kept.
+   bpf-prog-tcp: in a network namespace of its own, a listener's filter
+   on the SYNs that come to it, IPv4 and IPv6: for each field of the SYN
+   and its sk_buff (the TCP header and its options, the length, protocol,
+   packet and device types, device, payload offset, the IP header's
+   protocol and hops, the MAC header's type), a filter that keeps every
+   segment but a SYN that does not have Linux's value, so that the
+   connection is made only where it has it; a SYN the filter drops, sent
+   again once it has gone; and the filter and its lock that the accepted
+   socket takes from the listener.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -127,6 +136,7 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -2796,11 +2806,10 @@ static void udp_family(int family) {
     for (unsigned i = 0; i < COUNT(fds); i++) close(fds[i]);
 }
 
-static int case_udp(void) {
-    for (size_t i = 0; i < sizeof udp_out; i++) udp_out[i] = (unsigned char)(i * 7 + 3);
-    /* A network namespace of its own, whose loopback it brings up: the
-       emulator gives internet sockets to a guest without a network only
-       there. */
+/* A network namespace of its own, whose loopback it brings up: the
+   emulator gives internet sockets to a guest without a network only
+   there. */
+static void own_network(void) {
     say("unshare %d", unshare(CLONE_NEWNET) ? -errno : 0);
     {
         struct ifreq ifr;
@@ -2812,6 +2821,11 @@ static int case_udp(void) {
         say("lo %d up %d", r, ioctl(u, SIOCSIFFLAGS, &ifr) ? -errno : 0);
         close(u);
     }
+}
+
+static int case_udp(void) {
+    for (size_t i = 0; i < sizeof udp_out; i++) udp_out[i] = (unsigned char)(i * 7 + 3);
+    own_network();
     udp_family(AF_INET);
     udp_family(AF_INET6);
     /* An IPv4 datagram to a dual-stack IPv6 socket is IPv4's. */
@@ -2825,6 +2839,146 @@ static int case_udp(void) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     udp_through("dual", s, r, (struct sockaddr_storage *)&to, sizeof to, 20);
     say_fields("dual fields", fm);
+    return 0;
+}
+
+
+/* bpf-prog-tcp: a listener's filter on the SYNs that come to it. */
+static int tcp_listener(int family, struct sockaddr_storage *at, socklen_t *len) {
+    int s = socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    memset(at, 0, sizeof *at);
+    if (family == AF_INET) {
+        struct sockaddr_in *a = (struct sockaddr_in *)at;
+        a->sin_family = AF_INET;
+        a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        *len = sizeof *a;
+    } else {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)at;
+        a->sin6_family = AF_INET6;
+        a->sin6_addr = in6addr_loopback;
+        *len = sizeof *a;
+    }
+    if (s < 0 || bind(s, (struct sockaddr *)at, *len) || getsockname(s, (struct sockaddr *)at, len) ||
+        listen(s, 8))
+        return -1;
+    return s;
+}
+/* A connection to the listener `l` at `at`: whether it is made within
+   `ms` (connect's result after it, 1 for made, 0 for still waiting), and
+   whether the listener has it to accept; `keep` keeps the client open. */
+static int tcp_try(const char *name, int family, int l, const struct sockaddr_storage *at, socklen_t len, int ms,
+                   int keep) {
+    int c = socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int r = connect(c, (const struct sockaddr *)at, len) ? -errno : 1;
+    if (r == -EINPROGRESS) {
+        struct pollfd ready = {.fd = c, .events = POLLOUT};
+        r = 0;
+        if (poll(&ready, 1, ms) > 0) {
+            int error = 0;
+            socklen_t elen = sizeof error;
+            getsockopt(c, SOL_SOCKET, SO_ERROR, &error, &elen);
+            r = error ? -error : 1;
+        }
+    }
+    int a = r == 1 ? accept(l, NULL, NULL) : -1;
+    say("%s connect %d accept %d", name, r, a >= 0 ? 1 : -errno);
+    if (a >= 0) close(a);
+    if (!keep) close(c);
+    return keep ? c : -1;
+}
+/* The filter on the listener: every segment but a SYN is kept, and a SYN
+   only where `load` gives `value`. */
+static void syn_check(const char *name, int family, int l, const struct sockaddr_storage *at, socklen_t len,
+                      struct sf load, uint32_t value) {
+    struct sf f[] = {
+        S(C_LD_B_ABS, 13), SJ(C_JSET_K, 0, 3, 0x02), load, SJ(C_JEQ_K, 1, 0, value), S(C_RET_K, 0),
+        S(C_RET_K, 0xffffffff),
+    };
+    int r = attach_classic(l, f, COUNT(f));
+    if (r) say("%s attach %d", name, r);
+    tcp_try(name, family, l, at, len, 300, 0);
+}
+
+static void tcp_family(int family) {
+    const char *f = family == AF_INET ? "v4" : "v6";
+    int v6 = family == AF_INET6;
+    char name[96];
+    struct sockaddr_storage at;
+    socklen_t len;
+    int l = tcp_listener(family, &at, &len);
+    say("%s listener %d", f, l >= 0);
+    uint32_t mss = v6 ? 65476 : 65495;
+    struct {
+        const char *name;
+        struct sf load;
+        uint32_t value;
+    } checks[] = {
+        {"header length", S(C_LD_B_ABS, 12), 0xa0},
+        {"acknowledgement", S(C_LD_W_ABS, 8), 0},
+        {"window", S(C_LD_H_ABS, 14), mss},
+        {"urgent pointer", S(C_LD_H_ABS, 18), 0},
+        {"mss option", S(C_LD_H_ABS, 20), 0x0204},
+        {"mss", S(C_LD_H_ABS, 22), mss},
+        {"sack and timestamps", S(C_LD_W_ABS, 24), 0x0402080a},
+        {"timestamp echo", S(C_LD_W_ABS, 32), 0},
+        {"window scale", S(C_LD_W_ABS, 36), 0x0103030a},
+        {"len", S(C_LD_LEN, 0), 40},
+        {"protocol", S(C_LD_W_ABS, AD(0)), v6 ? 0x86dd : 0x800},
+        {"pkttype", S(C_LD_W_ABS, AD(4)), 0},
+        {"ifindex", S(C_LD_W_ABS, AD(8)), 1},
+        {"hatype", S(C_LD_W_ABS, AD(28)), 772},
+        {"payload offset", S(C_LD_W_ABS, AD(52)), 40},
+        {"ip protocol", S(C_LD_B_ABS, NET(v6 ? 6 : 9)), 6},
+        {"hops", S(C_LD_B_ABS, NET(v6 ? 7 : 8)), 64},
+        {"ethertype", S(C_LD_H_ABS, LL(12)), v6 ? 0x86dd : 0x800},
+        {"a window it does not have", S(C_LD_H_ABS, 14), 1},
+    };
+    for (unsigned i = 0; i < COUNT(checks); i++) {
+        snprintf(name, sizeof name, "%s %s", f, checks[i].name);
+        syn_check(name, family, l, &at, len, checks[i].load, checks[i].value);
+    }
+
+    /* A SYN the filter drops is sent again, and comes once the filter has
+       gone. */
+    struct sf none[] = {S(C_RET_K, 0)};
+    say("%s attach drop %d", f, attach_classic(l, none, COUNT(none)));
+    int c = socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int r = connect(c, (struct sockaddr *)&at, len) ? -errno : 0;
+    struct pollfd ready = {.fd = c, .events = POLLOUT};
+    say("%s dropped connect %d ready %d", f, r, poll(&ready, 1, 300));
+    say("%s detach %d", f, option(l, SO_DETACH_FILTER, 0));
+    int made = poll(&ready, 1, 3000);
+    int error = 0;
+    socklen_t elen = sizeof error;
+    getsockopt(c, SOL_SOCKET, SO_ERROR, &error, &elen);
+    int a = accept(l, NULL, NULL);
+    say("%s sent again ready %d error %d accept %d", f, made, error, a >= 0 ? 1 : -errno);
+    if (a >= 0) close(a);
+    close(c);
+
+    /* The accepted socket has the listener's filter, and its lock. */
+    struct sf all[] = {S(C_LD_IMM, 7), S(C_RET_K, 0xffffffff)};
+    say("%s attach all %d", f, attach_classic(l, all, COUNT(all)));
+    say("%s lock %d", f, option(l, SO_LOCK_FILTER, 1));
+    c = socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (struct sockaddr *)&at, len);
+    poll(&ready, 1, 2000);
+    a = accept(l, NULL, NULL);
+    say("%s accepted %d", f, a >= 0);
+    snprintf(name, sizeof name, "%s accepted's filter", f);
+    get_classic(name, a, 2);
+    snprintf(name, sizeof name, "%s accepted's lock", f);
+    get(name, a, SO_LOCK_FILTER);
+    say("%s accepted's detach %d", f, option(a, SO_DETACH_FILTER, 0));
+    close(a);
+    close(c);
+    close(l);
+}
+
+static int case_tcp(void) {
+    own_network();
+    tcp_family(AF_INET);
+    tcp_family(AF_INET6);
     return 0;
 }
 
@@ -2843,5 +2997,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-calls")) return case_calls();
     if (!strcmp(mode, "bpf-prog-rewrites")) return case_rewrites();
     if (!strcmp(mode, "bpf-prog-udp")) return case_udp();
+    if (!strcmp(mode, "bpf-prog-tcp")) return case_tcp();
     return 2;
 }

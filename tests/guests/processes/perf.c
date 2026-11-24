@@ -523,6 +523,46 @@ static void touch(int pages) {
     for (int i = 0; i < pages; i++) p[(size_t)i * 4096] = 1;
 }
 
+/* Events of this thread on CPU 0 and on CPU 1 (task-clock, page-faults
+   and cpu-migrations), while it runs on CPU 1 and then is moved to CPU 0:
+   each counts only while it runs on its CPU (event_filter_match), but is
+   enabled all the while, and the migration counts on the CPU it comes
+   to. */
+static void per_cpu(void) {
+    static const uint64_t configs[3] = {1, 2, 4};
+    static const char *const names[3] = {"task-clock", "page-faults", "cpu-migrations"};
+    int fds[3][2];
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) {
+            struct attr a = software(configs[i]);
+            a.read_format = FORMAT_ENABLED | FORMAT_RUNNING;
+            fds[i][cpu] = (int)open_event(&a, 0, cpu, -1, 0);
+        }
+    spin();
+    touch(8);
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(0, &one);
+    sched_setaffinity(0, sizeof one, &one);
+    spin();
+    touch(8);
+    uint64_t values[3][2][3];
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) ioctl(fds[i][cpu], IOC_DISABLE, 0);
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++)
+            if (read(fds[i][cpu], values[i][cpu], sizeof values[i][cpu]) != sizeof values[i][cpu])
+                memset(values[i][cpu], 0xff, sizeof values[i][cpu]);
+    for (int i = 0; i < 2; i++)
+        say("%s on cpu 0: counted %d running less %d; on cpu 1: counted %d running less %d", names[i],
+            values[i][0][0] > 0 && values[i][0][0] != (uint64_t)-1, values[i][0][2] < values[i][0][1],
+            values[i][1][0] > 0 && values[i][1][0] != (uint64_t)-1, values[i][1][2] < values[i][1][1]);
+    say("cpu-migrations on cpu 0 %llu on cpu 1 %llu", (unsigned long long)values[2][0][0],
+        (unsigned long long)values[2][1][0]);
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) close(fds[i][cpu]);
+}
+
 static int case_software(void) {
     int faults = open_software(2, 0), minor = open_software(5, 0), major = open_software(6, 0);
     int user_faults = open_software(2, EXCLUDE_KERNEL), kernel_faults = open_software(2, EXCLUDE_USER);
@@ -570,6 +610,7 @@ static int case_software(void) {
         say("moved %ld: migrations %d user %d", moved, h - g >= 1, count(user_migrations) - ug == 0);
         for (int i = 0; i < 3; i++) usleep(1000);
         say("kept: migrations %d", count(migrations) - h == 0);
+        per_cpu();
     } else {
         say("fewer than two cpus");
     }
@@ -623,6 +664,25 @@ static int case_gup(void) {
     gup_step("mlock", faults, 3, fresh_pages(32), local);
     gup_step("process_vm_readv", faults, 4, fresh_pages(32), local);
     gup_step("process_vm_writev", faults, 5, fresh_pages(32), local);
+    return 0;
+}
+
+/* The perf-ring-gup case: a ring is VM_IO | VM_PFNMAP, which
+   get_user_pages refuses (check_vma_flags): process_vm_readv and
+   process_vm_writev pin nothing of it (EFAULT), and MADV_POPULATE_READ is
+   EINVAL (FOLL_MADV_POPULATE), while the task's own reads see it. */
+static int case_ring_gup(void) {
+    int fd = open_software(9, 0);
+    char *ring = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    say("open %d mapped %d", fd >= 0, ring != MAP_FAILED);
+    if (ring == MAP_FAILED) return 0;
+    /* The task's own read of the user page: its compat_version, 0. */
+    say("own read: compat %u", ((volatile uint32_t *)ring)[1]);
+    static char local[16];
+    struct iovec mine = {local, sizeof local}, theirs = {ring, sizeof local};
+    say("process_vm_readv %ld", TRY(syscall(SYS_process_vm_readv, getpid(), &mine, 1, &theirs, 1, 0)));
+    say("process_vm_writev %ld", TRY(syscall(SYS_process_vm_writev, getpid(), &mine, 1, &theirs, 1, 0)));
+    say("populate read %ld", TRY(madvise(ring, 4096, 22 /* MADV_POPULATE_READ */)));
     return 0;
 }
 
@@ -1698,6 +1758,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-prctl")) return case_prctl();
     if (!strcmp(mode, "perf-inherit")) return case_inherit();
     if (!strcmp(mode, "perf-software")) return case_software();
+    if (!strcmp(mode, "perf-ring-gup")) return case_ring_gup();
     if (!strcmp(mode, "perf-gup")) return case_gup();
     if (!strcmp(mode, "perf-mmap")) return case_mmap();
     if (!strcmp(mode, "perf-output")) return case_output();

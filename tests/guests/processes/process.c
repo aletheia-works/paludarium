@@ -15446,6 +15446,66 @@ static int th_inner(const char *m) {
     printf("umount=%d\n", tl_err(umount(m)));
     return 0;
 }
+/* The tmpfs-huge-placement case: a mapping of a file of a tmpfs mount with
+   huge= goes at a 2 MiB boundary, or one page past one for an offset of one
+   page, as shmem_get_unmapped_area places it, unless a free hint is given;
+   so a fault of it advised MADV_HUGEPAGE takes a 512-page folio. Only what
+   holds for every layout is printed. */
+static int thp_inner(const char *m) {
+    long huge = 2 << 20;
+    if (th_mount(m, "huge=always")) return 0;
+    int f = th_file(m, "f", 4 * huge), g = th_file(m, "g", huge);
+    if (f < 0 || g < 0) return 80;
+    int rw = PROT_READ | PROT_WRITE;
+    char *a = mmap(NULL, 2 * huge, rw, MAP_SHARED, f, 0);
+    char *b = mmap(NULL, 2 * huge, rw, MAP_SHARED, f, 4096);
+    if (a == MAP_FAILED || b == MAP_FAILED) return 81;
+    printf("aligned=%d offset=%d\n", ((uintptr_t)a & (huge - 1)) == 0,
+           ((uintptr_t)b & (huge - 1)) == 4096);
+    char *free_area = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (free_area == MAP_FAILED) return 82;
+    munmap(free_area, 4 * huge);
+    char *hint = free_area + huge + 4096;
+    char *c = mmap(hint, 2 * huge, rw, MAP_SHARED, f, 0);
+    printf("hint=%d\n", c == hint);
+    char *d = mmap(NULL, huge, rw, MAP_SHARED, g, 0);
+    if (c == MAP_FAILED || d == MAP_FAILED) return 83;
+    printf("advised=%d\n", tl_err(madvise(d, huge, 14)));
+    touch("fault", d, 0);
+    printf("blocks=%ld\n", sf_blocks(g));
+    munmap(a, 2 * huge), munmap(b, 2 * huge), munmap(c, 2 * huge), munmap(d, huge);
+    close(f), close(g);
+    printf("umount=%d\n", tl_err(umount(m)));
+    return 0;
+}
+static int tmpfs_huge_placement_case(void) {
+    if (!mkdtemp(th_base)) return 86;
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", th_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char ids[64];
+        snprintf(ids, sizeof ids, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", ids);
+        snprintf(ids, sizeof ids, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", ids));
+        _exit(thp_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(th_base) == 0);
+    return 0;
+}
 static int tmpfs_huge_case(void) {
     struct sigaction action = {0};
     action.sa_sigaction = on_bus;
@@ -37481,6 +37541,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
+    if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

@@ -28501,6 +28501,37 @@ int main(int argc, char **argv) {
             ext.base.eid = 0;
             mctp_send(f, &ext, sizeof ext, 5, "ext null");
             mctp_receive(a, 0, 100, "any got");
+            close(f);
+            /* What a message takes of a receive buffer (its truesize): how
+               many the smallest buffer and twice it take, for messages
+               around the sizes of the small head cache and the next head,
+               then through a gateway's route of MTU 68, in packets. */
+            int g = socket(45, SOCK_DGRAM, 0), h = socket(45, SOCK_DGRAM, 0);
+            name = mctp_name(0, 0xff, 6, 0);
+            printf("bind any type 6=%ld\n", netns_result(bind(h, (void *)&name, sizeof name)));
+            struct mctp_tag_ctl near = {.peer = 8}, far = {.peer = 20};
+            printf("alloc near=%ld\n", netns_result(ioctl(g, 0x89e0, &near)));
+            printf("alloc far=%ld\n", netns_result(ioctl(g, 0x89e0, &far)));
+            for (int buffer = 1; buffer <= 2304; buffer += 2303) {
+                static const int lens[] = {0, 1, 299, 300, 363, 364, 683, 684, -191, -255, -319};
+                int set = setsockopt(h, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof buffer);
+                int got = 0;
+                len = sizeof got;
+                getsockopt(h, SOL_SOCKET, SO_RCVBUF, &got, &len);
+                printf("set=%d rcvbuf=%d\n", set, got);
+                for (size_t i = 0; i < sizeof lens / sizeof *lens; i++) {
+                    static unsigned char bytes[700];
+                    /* A negative length goes in packets. */
+                    int packets = lens[i] < 0, size = packets ? -lens[i] : lens[i];
+                    name = packets ? mctp_name(0, 20, 6, far.tag) : mctp_name(0, 8, 6, near.tag);
+                    int sent = 0, came = 0;
+                    long last = 0;
+                    while (sent < 20 && (last = netns_result(sendto(g, bytes, size, 0, (void *)&name, sizeof name))) >= 0)
+                        sent++;
+                    while (came < 20 && recv(h, bytes, sizeof bytes, MSG_DONTWAIT) == size) came++;
+                    printf("%s%d: sent=%d last=%ld came=%d\n", packets ? "packets of " : "", size, sent, last, came);
+                }
+            }
             fflush(stdout);
             _exit(0);
         }

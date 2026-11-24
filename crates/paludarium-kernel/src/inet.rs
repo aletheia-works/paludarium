@@ -1646,10 +1646,7 @@ struct Datagram {
 /// page fragments. An IPv6 datagram too long for the loopback's MTU comes
 /// as two fragments, reassembled.
 fn truesize(len: usize, ipv4: bool) -> usize {
-    use crate::skb::{MAX_ALLOC, SHARED_INFO, SKB};
-    // `SKB_SMALL_HEAD_SIZE`, which `MAX_HEADER` sizes: 704 bytes on the CI
-    // runner's kernel, built with Hyper-V's networking (640 on Docker's).
-    const SMALL_HEAD: usize = 704;
+    use crate::skb::{MAX_ALLOC, SKB, SMALL_HEAD};
     const MTU: usize = 65_536;
     // The IP and UDP headers, and the link header's room and the tail's
     // (IPv4) or the fragment header's (IPv6).
@@ -1663,12 +1660,7 @@ fn truesize(len: usize, ipv4: bool) -> usize {
     if head >= MAX_ALLOC {
         return SKB + SMALL_HEAD + len;
     }
-    let data = head.next_multiple_of(64) + SHARED_INFO;
-    SKB + if data <= SMALL_HEAD {
-        SMALL_HEAD
-    } else {
-        data.next_power_of_two()
-    }
+    crate::skb::truesize(head)
 }
 
 /// A listening socket's connections, as Linux's accept queue.

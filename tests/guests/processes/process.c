@@ -9799,8 +9799,13 @@ static int io_uring_ring_poll_case(void) {
     rp_full(&u, 70);
     pthread_create(&t, NULL, rp_submitter_main, &sub);
     struct pollfd po = {u.fd, POLLOUT, 0};
+    struct timespec before, after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
     r = poll(&po, 1, 500);
-    printf("room-poll: %d %x\n", r, (unsigned)po.revents);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    long slept = (after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1000000;
+    /* Its last look, as its time runs out, finds the room. */
+    printf("room-poll: %d %x slept=%d\n", r, (unsigned)po.revents, slept >= 400);
     pthread_join(t, NULL);
     rp_poll(&u, "room-after");
     uring_reap(&u, "room-poll");

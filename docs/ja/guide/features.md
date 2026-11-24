@@ -1575,7 +1575,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `aio_poll_wake`）と同じく入力を待つものだけです。そのため、出力へのエッジトリガーの関心は
   一度だけ、レベルトリガーの関心は `epoll_ctl` が加えるか変えるときだけ報告され、投入キューの
   空きだけを待つ `poll`、`select`、aio の poll は、ほかのファイルが起こすか時間が尽きるまで
-  眠り続けます。
+  眠り続けます。時間が尽きると、`poll` と `select` は最後にもう一度見ます（`do_poll`、
+  `do_select`）。
 
 - `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
   `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は

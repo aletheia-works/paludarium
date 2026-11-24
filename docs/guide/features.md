@@ -1786,7 +1786,8 @@ kernel.
   an edge-triggered interest in output is reported once, a level-triggered
   one only as `epoll_ctl` adds or changes it, and a `poll`, `select` or aio
   poll that waits only for room in the submission queue sleeps on until
-  another of its files wakes it or its time runs out.
+  another of its files wakes it or its time runs out, when `poll` and
+  `select` look a last time (`do_poll`, `do_select`).
 
 - `IORING_OP_NOP` takes Linux 7.0's flags, as `io_nop_prep` and `io_nop`
   do. `IORING_NOP_INJECT_RESULT` completes it with its `len`.

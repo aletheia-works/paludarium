@@ -2046,14 +2046,14 @@ fn wait_ready(
         let past = |c: &Context<'_>| {
             deadline.is_some_and(|end| c.host.clock(ClockId::Monotonic).is_ok_and(|now| now >= end))
         };
-        if !quiet {
+        // Once its time is out it looks at all of them a last time, as
+        // `do_poll` and `do_select` do before they give up.
+        if !quiet || past(c) {
             let ready = check(c)?;
             if ready != 0 || past(c) {
                 return Ok(ready);
             }
             asleep = now;
-        } else if past(c) {
-            return Ok(0);
         }
         crate::events::wait(c, ticket, deadline)?;
     }

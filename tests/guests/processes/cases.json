@@ -307,6 +307,7 @@
     {"name":"proc-own-files","binary":"process"},
     {"name":"proc-other-files","binary":"process"},
     {"name":"page-faults","binary":"process"},
+    {"name":"exec-names","binary":"process"},
     {"name":"context-switches","binary":"process"},
     {"name":"proc-stat-counts","binary":"process"},
     {"name":"proc-stat-sched","binary":"process"},

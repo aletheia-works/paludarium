@@ -4189,6 +4189,10 @@ kernel.
   the name in Linux's column: the file's path, with a newline in it as
   `\012`, followed by a space and `(deleted)` once nothing names it, `/memfd:<name> (deleted)`,
   `/dev/zero (deleted)` for shared anonymous memory, `[heap]` or `[stack]`.
+  A program's segments and its interpreter's are named as
+  `/proc/self/exe` names the program, as Linux's `d_path` of the file:
+  by its path with symbolic links resolved, and `(deleted)` once nothing
+  links it.
   It is made as it is read, as Linux's `seq_file` makes it: a read gathers
   whole lines up to a page, goes on from the VMA it found next, and sees the
   mappings of that moment, `lseek` goes from the start or the current

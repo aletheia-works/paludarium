@@ -429,6 +429,8 @@ impl Session {
         let (loaded, script) = kernel
             .first_program(&self.config.program, &mut argv, &envp)
             .map_err(script_error)?;
+        // Its segments are named as `/proc/self/maps` and a core name them.
+        let program = kernel.program_keep(&loaded);
         let start = StartInfo {
             argv: &argv,
             envp: &envp,
@@ -437,6 +439,7 @@ impl Session {
             // The first process runs as root.
             ids: [0; 4],
             secure: false,
+            program: Some(&program),
         };
         let mut mem = match self.config.limits.memory {
             Some(max) => AddressSpace::new().with_memory_meter(Arc::new(MemoryMeter::new(max))),

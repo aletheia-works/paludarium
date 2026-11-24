@@ -4881,6 +4881,14 @@ impl Kernel {
         let (credentials, secure) = exec_credentials
             .clone()
             .unwrap_or_else(|_| (thread.state.credentials.clone(), false));
+        // The program's name, which `/proc/<pid>/exe`, the maps and a
+        // core take as Linux's `d_path` gives it: resolved, and marked
+        // ` (deleted)` once its file goes. A held file's name is fixed.
+        let program_name = match &held {
+            Some((_, name, _)) => crate::program_name::ProgramName::fixed(name.clone()),
+            None => crate::program_name::ProgramName::of(&self.files, &loaded),
+        };
+        let program_keep = program_name.keep(None);
         let start = StartInfo {
             argv: &argv,
             envp: &envp,
@@ -4893,6 +4901,7 @@ impl Kernel {
                 credentials.egid,
             ],
             secure,
+            program: Some(&program_keep),
         };
         let mut memory = match mem.memory_meter() {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
@@ -4957,6 +4966,8 @@ impl Kernel {
             unread.extend(unread_by(stat.as_ref(), may_read));
             let keep: paludarium_loader::Keep =
                 Arc::new((closing, self.files.interpreter_keep(&path)));
+            // Named as the program is, resolved and marked once removed.
+            let keep = crate::program_name::ProgramName::of(&self.files, &path).keep(Some(keep));
             Ok((path, Some(keep)))
         };
         let fs = &*self.files.fs();
@@ -5065,10 +5076,7 @@ impl Kernel {
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
         self.group.set_program(&image);
-        self.group.set_executable(match held {
-            Some((_, name, _)) => name,
-            None => crate::files::resolved(&self.files, &loaded).unwrap_or(loaded),
-        });
+        self.group.set_executable(program_name);
         // The exec is done: the program and the interpreter close as the
         // process and the mappings end.
         failing.interpreters.clear();

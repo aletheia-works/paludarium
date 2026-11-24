@@ -900,6 +900,7 @@ mod linux {
         processes_proc_own_files => ("proc-own-files","process"),
         processes_proc_other_files => ("proc-other-files","process"),
         processes_page_faults => ("page-faults","process"),
+        processes_exec_names => ("exec-names","process"),
         processes_context_switches => ("context-switches","process"),
         processes_proc_stat_counts => ("proc-stat-counts","process"),
         processes_proc_stat_sched => ("proc-stat-sched","process"),

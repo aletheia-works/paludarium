@@ -45,9 +45,10 @@ verified.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used. A
-  program's own segments and its interpreter's are named by the path it was
-  started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
+  program's own segments and its interpreter's are named by the path the
+  file had when it was started, with its symbolic links resolved and
+  `(deleted)` once nothing links it, but not after a rename, which Linux
+  follows. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
   do not exist.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
@@ -1356,8 +1357,8 @@ verified.
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. Its `NT_FILE`
   note names a mapped file by the path it had when it was mapped, and the
-  program by the path it was started by, where Linux follows a rename and
-  resolves symbolic links.
+  program by the path it had when it was started (resolved, `(deleted)`
+  once removed), where Linux follows a rename.
 - **Memory limit**: a write beyond the limit ends the process that made it,
   where Linux's OOM killer picks the process using the most memory.
 - **The native JIT**: it is experimental and off unless `--jit` asks for it,

@@ -133,8 +133,9 @@ CI run produces them afresh on an x86-64 Linux runner.
   `mise run test:diff:jit` and the `differential-jit` job of `ci.yml`.
   `diff_events` and `diff_threads` run the emulator's binary, which those
   jobs build first (`cargo build -p paludarium`); with the JIT it runs with
-  `--jit=N`, which compiles in the background, where the harness's own
-  guests compile on the thread that runs them.
+  `--jit=N`, which compiles in the background. The harness's own guests wait
+  for their code, which the JIT's own thread compiles there too, so that a
+  guest thread's CPU time has no compiling in it.
 
 - The network cases (`diff_network`) serve the guest from the test itself, on
   127.0.0.1, so that native Linux and the emulator talk to the same server;

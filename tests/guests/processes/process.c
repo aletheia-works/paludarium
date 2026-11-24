@@ -7295,7 +7295,9 @@ static int vma_names_case(void) {
     munlock(a + 2 * page, (size_t)page);
     /* Every line of the range still carries the name. How many lines there
        are depends on anon_vma identity, which Linux's VMA merge checks and
-       the emulator does not model (see limitations: "/proc/self/maps"). */
+       the emulator does not model (see limitations: "/proc/self/maps"): on
+       Linux the first page can share the anon_vma of memory musl's fopen
+       mapped right below it and wrote, which keeps it apart from page 2's. */
     printf("after munlock: all named %d\n",
            vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]") ==
                vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), " "));

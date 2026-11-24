@@ -1809,8 +1809,10 @@ kernel.
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
   `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
-  `IORING_OP_ASYNC_CANCEL`, and the socket requests `IORING_OP_SHUTDOWN`,
-  `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
+  `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, and the socket requests
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
+  `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
@@ -1964,6 +1966,28 @@ kernel.
   differential tests' kernel has: only protection information, which no
   file here takes (`EINVAL`). `IORING_OP_FSYNC` takes only
   `IORING_FSYNC_DATASYNC`.
+
+- The timeouts are Linux master's (`io_uring/timeout.c`).
+  `IORING_OP_TIMEOUT` waits for its time, relative or
+  `IORING_TIMEOUT_ABS`, on the monotonic, boot-time or realtime clock, and
+  completes with `ETIME`, which fails its link but with
+  `IORING_TIMEOUT_ETIME_SUCCESS`; or, with a count in `off`, completes with
+  0 once that many other completions are posted. Completions of timeouts
+  that expire or are removed are not counted. With
+  `IORING_TIMEOUT_MULTISHOT` it posts a completion with
+  `IORING_CQE_F_MORE` each time, up to `off` times in all.
+  `IORING_OP_TIMEOUT_REMOVE` cancels the timeout of a `user_data`
+  (`ECANCELED`, `ENOENT` for none), or with `IORING_TIMEOUT_UPDATE` gives
+  it, or with `IORING_LINK_TIMEOUT_UPDATE` a linked one, a new time.
+  `IORING_OP_LINK_TIMEOUT` follows a request in its link: it starts as that
+  request is issued, and cancels it by its `user_data` and completes with
+  `ETIME` when it expires, or completes with `ECANCELED` once the request is
+  done, the rest of the link going on without it. The entries are checked as
+  Linux checks them (`EINVAL`), and the time is read as they are taken
+  (`EFAULT`, `EINVAL` for a negative one), or is in the entry with
+  `IORING_TIMEOUT_IMMEDIATE_ARG`. A cancellation finds the timeouts after
+  the requests that wait for their files, but none by a file, and no linked
+  one. `execve` and a whole process's exit cancel the thread's.
 
 - The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and

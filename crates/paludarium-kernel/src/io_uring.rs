@@ -750,10 +750,10 @@ struct State {
     /// in order, which they hold until their completions are posted
     /// (`io_free_batch_list`).
     held: Vec<Arc<Node>>,
-    /// Registered files no slot holds any more that a request still does:
-    /// one of the running batch, or one that waits for its file ([`arm`]).
-    /// Each posts its tag once nothing holds it, at the end of the batch it
-    /// is let go of in ([`Ring::end`]).
+    /// Registered files and buffers no slot holds any more that a request
+    /// still does: one of the running batch, or one that waits for its
+    /// file ([`arm`]). Each posts its tag once nothing holds it, at the
+    /// end of the batch it is let go of in ([`Ring::end`]).
     retired: Vec<Arc<Node>>,
 }
 
@@ -845,9 +845,10 @@ struct Transfer {
     /// The provided buffer it chose before it waited for its file, which it
     /// reads to as it goes on.
     kept: Option<Chosen>,
-    /// The file it found before it waited for it (`req->file`): it goes on
-    /// with it, whatever its descriptor or slot holds by then.
-    found: Option<crate::files::Descriptor>,
+    /// The file it found before it waited for it, and the registered buffer
+    /// (`req->file`, `req->buf_node`): it goes on with them, whatever its
+    /// descriptor or slots hold by then.
+    found: Option<(crate::files::Descriptor, Option<Arc<Node>>)>,
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
@@ -923,10 +924,10 @@ impl Ring {
         }
     }
 
-    /// Lets go of registered files no slot holds (`io_put_rsrc_node`): one a
-    /// request holds, of the running submission or one that waits for its
-    /// file, waits for that request's completion ([`State::retired`]), and
-    /// the others post their tags now, in order.
+    /// Lets go of registered files and buffers no slot holds
+    /// (`io_put_rsrc_node`): one a request holds, of the running submission
+    /// or one that waits for its file, waits for that request's completion
+    /// ([`State::retired`]), and the others post their tags now, in order.
     fn put_nodes(&self, gone: impl IntoIterator<Item = Arc<Node>>) {
         let mut state = self.state();
         for node in gone {
@@ -1402,16 +1403,21 @@ struct Waits {
     file: Arc<dyn FileHandle>,
     mask: u32,
     kept: Option<Chosen>,
-    found: crate::files::Descriptor,
+    found: (crate::files::Descriptor, Option<Arc<Node>>),
 }
 
 fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferred {
-    let opened = match &transfer.found {
-        Some(opened) => opened.clone(),
+    let (opened, buffer) = match &transfer.found {
+        Some((opened, buffer)) => (opened.clone(), buffer.clone()),
         None => match file_of(c, ring, transfer.fd, transfer.fixed) {
-            Ok(opened) => opened,
+            Ok(opened) => (opened, None),
             Err(e) => return (Err(e), 0, None, 0),
         },
+    };
+    let buffer = if transfer.registered {
+        buffer.or_else(|| ring.buffer_node(transfer.buf_index))
+    } else {
+        None
     };
     let asked = |segments: &[(u64, usize)]| segments.iter().map(|&(_, len)| len as u64).sum();
     let waits = |result: &Result<u64, Errno>, kept: Option<Chosen>| {
@@ -1424,11 +1430,14 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
                     POLL_IN_EVENTS
                 },
             kept,
-            found: opened.clone(),
+            found: (opened.clone(), buffer.clone()),
         })
     };
     if transfer.registered {
-        let within = ring.registered(transfer.buf_index, transfer.addr, transfer.len);
+        let within = buffer
+            .as_ref()
+            .ok_or(Errno::EFAULT)
+            .and_then(|node| within(node, transfer.addr, transfer.len));
         let wanted = within.as_ref().map_or(0, |within| within.len as u64);
         let result = within.and_then(|within| {
             let memory = crate::files::Memory::Pinned {
@@ -3827,25 +3836,23 @@ impl Ring {
         }
         Some(node)
     }
+}
 
-    /// The `len` bytes at `addr` of a request's registered buffer `index`,
-    /// as `io_import_reg_buf` finds them: none registered there, a range
-    /// that wraps or leaves the buffer, or more than `MAX_RW_COUNT`, is
-    /// `EFAULT` (`validate_fixed_range`).
-    fn registered(&self, index: u16, addr: u64, len: u32) -> Result<Registered, Errno> {
-        let node = self.buffer_node(index).ok_or(Errno::EFAULT)?;
-        let buffer = node.buffer().ok_or(Errno::EFAULT)?;
-        let (base, size, pages) = (buffer.base, buffer.len, Arc::clone(&buffer.pages));
-        let end = addr.checked_add(u64::from(len)).ok_or(Errno::EFAULT)?;
-        if addr < base || end > base + size || len as usize > crate::files::MAX_RW_COUNT {
-            return Err(Errno::EFAULT);
-        }
-        Ok(Registered {
-            pages,
-            at: (addr - base) as usize,
-            len: len as usize,
-        })
+/// The `len` bytes at `addr` of the registered buffer `node`, as
+/// `io_import_reg_buf` finds them: a range that wraps or leaves the buffer,
+/// or more than `MAX_RW_COUNT`, is `EFAULT` (`validate_fixed_range`).
+fn within(node: &Node, addr: u64, len: u32) -> Result<Registered, Errno> {
+    let buffer = node.buffer().ok_or(Errno::EFAULT)?;
+    let (base, size, pages) = (buffer.base, buffer.len, Arc::clone(&buffer.pages));
+    let end = addr.checked_add(u64::from(len)).ok_or(Errno::EFAULT)?;
+    if addr < base || end > base + size || len as usize > crate::files::MAX_RW_COUNT {
+        return Err(Errno::EFAULT);
     }
+    Ok(Registered {
+        pages,
+        at: (addr - base) as usize,
+        len: len as usize,
+    })
 }
 
 /// `IORING_REGISTER_PROBE`: what each operation is, and whether it runs.

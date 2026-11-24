@@ -6599,6 +6599,25 @@ mod io_uring {
         f.mem.write(GuestAddr(DATA), b"ab").unwrap();
         assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
         assert_eq!(reap(&mut f, &r), [(1, 2), (21, 0)]);
+        // So is its registered buffer, which it goes on to.
+        iovecs(&f, list, &[(buf, 0x100)]);
+        f.mem.write_u64(GuestAddr(tags), 31).unwrap();
+        rsrc_register(&f, arg, 1, 0, list, tags);
+        assert_eq!(f.ret(427, &[r.fd, 15, arg, 32]), 0);
+        let e = fixed(READ_FIXED, read, u64::MAX, buf, 2, 0);
+        assert_eq!(batch(&mut f, &r, &[e]), []);
+        iovecs(&f, list, &[(0, 0)]);
+        rsrc_update(&f, arg, 0, list, 0, 1);
+        assert_eq!(f.ret(427, &[r.fd, 16, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), []);
+        f.mem.write(GuestAddr(DATA), b"cd").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        let done = reap(&mut f, &r);
+        assert_eq!(done[0].1, 2);
+        assert_eq!(done[1..], [(31, 0)]);
+        let mut read_back = [0; 2];
+        f.mem.read(GuestAddr(buf), &mut read_back).unwrap();
+        assert_eq!(&read_back, b"cd");
     }
 
     #[test]

@@ -1129,6 +1129,7 @@ mod linux {
         processes_io_uring_pinned => ("io-uring-pinned","process"),
         processes_io_uring_held_tag => ("io-uring-held-tag","process"),
         processes_io_uring_buffers2 => ("io-uring-buffers2","process"),
+        processes_io_uring_held_buffer => ("io-uring-held-buffer","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

@@ -11134,6 +11134,34 @@ static int io_uring_buffers2_case(void) {
     return 0;
 }
 
+/* A request that waits for its file keeps its registered buffer
+   (req->buf_node): it goes on though its slot is updated meanwhile, and the
+   buffer's tag posts after its completion (io_put_rsrc_node). */
+static int io_uring_held_buffer_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int p[2];
+    if (pipe(p)) return 81;
+    char *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 82;
+    struct iovec iov = {page, 4096};
+    unsigned long tag = 31;
+    struct ub2_register rr = {1, 0, 0, (unsigned long)&iov, (unsigned long)&tag};
+    uring_show("register", ub2_register(&u, &rr, sizeof rr));
+    pw_read(&u, 3, p[0], page, 4, 0)[0] = 4;
+    tw_submit(&u, 1, 0, "armed");
+    iov = (struct iovec){NULL, 0};
+    struct ub2_update up = {0, 0, (unsigned long)&iov, 0, 1, 0};
+    uring_show("update", ub2_update(&u, &up, sizeof up));
+    uring_reap(&u, "updated");
+    printf("write: %ld\n", (long)write(p[1], "efgh", 4));
+    uring_reap(&u, "done");
+    printf("page: %.4s\n", page);
+    munmap(page, 4096);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -39711,6 +39739,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-pinned")) return io_uring_pinned_case();
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-buffers2")) return io_uring_buffers2_case();
+    if (!strcmp(mode, "io-uring-held-buffer")) return io_uring_held_buffer_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

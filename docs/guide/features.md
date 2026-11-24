@@ -396,7 +396,9 @@ kernel.
   seals (`EINVAL`), and opening it again through `/proc/self/fd` gives
   `ENXIO`. The kernel may not reach the pages of its mapping, as Linux's
   `get_user_pages` refuses them: `MADV_POPULATE_READ` and
-  `MADV_POPULATE_WRITE` give `EINVAL`, and `mlock` `ENOMEM`, with
+  `MADV_POPULATE_WRITE` give `EINVAL`, `process_vm_readv` and
+  `process_vm_writev` `EFAULT`, `PTRACE_PEEKDATA` and `PTRACE_POKEDATA`
+  `EIO`, and `mlock` `ENOMEM`, with
   `MLOCK_ONFAULT` too, as `mlock_fixup` gives its VMA no `VM_LOCKONFAULT`.
   `msync` with `MS_SYNC` gives `EINVAL` for it, as its file has no `fsync`,
   even after a hole in the range. A fault brings a page in only while the
@@ -2075,7 +2077,11 @@ kernel.
   at offsets aligned as its addresses are, unless it was advised
   `MADV_NOHUGEPAGE`. It is charged whole, after the large folio at the
   end of a file that runs past its end is split to make room
-  (`shmem_unused_huge_shrink`), or else the page alone. The files are held as `shmem`
+  (`shmem_unused_huge_shrink`), or else the page alone. `mmap` without
+  `MAP_FIXED` places a mapping of such a file of 2 MiB or more, unless
+  at a free hint, at a 2 MiB boundary, or as far past one as its offset
+  is past one (`shmem_get_unmapped_area`), so that a fault of it can take
+  a 512-page folio. The files are held as `shmem`
   counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,
@@ -3814,7 +3820,10 @@ kernel.
   `EACCES`, and `ESRCH` for root;
   `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
-  `FDSize` of 0; and `stat` has no sizes or addresses. `/proc/thread-self` is
+  `FDSize` of 0; and `stat` has no sizes or addresses. A zombie process keeps
+  its `pid` and `user` links too until it is reaped, as Linux's `pidns_get`
+  and `userns_get` take them from its PID and credentials, while its other
+  `ns` links and `pid_for_children` are `ENOENT`. `/proc/thread-self` is
   a link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
@@ -4745,8 +4754,12 @@ kernel.
   `exclude_kernel`, as Linux leaves them out; `major-faults`, which count
   nothing, as every page is in memory; and `alignment-faults`,
   `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
-  x86-64. Branch sampling or the XMM registers of one is `EOPNOTSUPP`.
-  Hardware, cache and raw events are `ENOENT`, as on a machine without a
+  x86-64. An event of a thread on one CPU, as `perf record` opens one for
+  each, counts and runs only while the thread is on that CPU
+  (`event_filter_match`), and is enabled all the while; a migration counts
+  on the CPU the thread comes to, and `sched_setaffinity` moves the thread
+  before it returns. Branch sampling or the XMM registers of one is
+  `EOPNOTSUPP`. Hardware, cache and raw events are `ENOENT`, as on a machine without a
   PMU. An event of another process needs `CAP_PERFMON` or to be able to
   read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the
   times enabled and running, the ID and the lost samples as the read
@@ -4802,8 +4815,12 @@ kernel.
   or the caller has `CAP_IPC_LOCK`; a later mapping is charged to the user
   too and never given back, as in Linux master. The mapping is not copied
   to a `fork`ed child nor held in a core dump (`VM_DONTCOPY`,
-  `VM_DONTDUMP`), and keeps the event counting though its descriptors are
-  closed; its last unmapping frees the buffer and its charges. It is a
+  `VM_DONTDUMP`), and is memory of no pages (`VM_IO | VM_PFNMAP`), which
+  `get_user_pages` refuses: `process_vm_readv` and `process_vm_writev`
+  give `EFAULT` for it, `PTRACE_PEEKDATA` and `PTRACE_POKEDATA` `EIO`, and
+  `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` `EINVAL`. It keeps the
+  event counting though its descriptors are closed; its last unmapping
+  frees the buffer and its charges. It is a
   mapping of the event's file, which `/proc/<pid>/maps` and the `MMAP2`
   records name `anon_inode:[perf_event]` with the device and inode its
   descriptor's `fstat` gives, the anonymous inodes' one. It keeps
@@ -5331,6 +5348,24 @@ kernel.
     `SKF_AD_HATYPE` `ARPHRD_LOOPBACK` or `ARPHRD_ETHER` and
     `SKF_AD_PAY_OFFSET` 8. The helpers run as the sending task, in whose
     context Linux's softirq runs the receive.
+
+- On a TCP listener, IPv4 or IPv6, the filter runs on each SYN that
+  comes to it through the loopback or a veth pair, as `tcp_v4_rcv` and
+  `tcp_v6_rcv` run `tcp_filter` before `tcp_v4_do_rcv` takes it, and so
+  before the accept queue's check: a SYN it drops counts in the
+  listener's `sk_drops` and is sent again on the handshake's schedule,
+  as one a full queue dropped. The SYN is Linux 7.0's: a 40-byte TCP
+  header with a random sequence number, the window that half the
+  receive buffer holds rounded down to the MSS, and the options MSS (the
+  device's MTU less the headers), SACK permitted, the timestamps (a
+  random value, then 0) and a window scale of 10, for `tcp_rmem[2]`'s 32
+  MiB; the IP header, MAC
+  header and `__sk_buff` fields as a UDP datagram's (above), with the
+  connecting socket's flow hash, which `connect` gives it and each SYN
+  sent again draws anew (`sk_rethink_txhash`), and `SKF_AD_PAY_OFFSET`
+  40; a SYN sent again is the connecting socket's, with its options. An accepted socket
+  takes the listener's filter and its lock, as `sk_clone_lock` copies
+  them.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it

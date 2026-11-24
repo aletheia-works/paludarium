@@ -305,6 +305,7 @@ mod linux {
                     | "perf-prctl"
                     | "perf-inherit"
                     | "perf-software"
+                    | "perf-ring-gup"
                     | "perf-gup"
                     | "perf-mmap"
                     | "perf-output"
@@ -339,6 +340,7 @@ mod linux {
                     | "bpf-prog-calls"
                     | "bpf-prog-rewrites"
                     | "bpf-prog-udp"
+                    | "bpf-prog-tcp"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -531,6 +533,7 @@ mod linux {
                     | "perf-prctl"
                     | "perf-inherit"
                     | "perf-throttle"
+                    | "perf-software"
             ) {
                 host.measure_cpu_time();
             }
@@ -708,6 +711,7 @@ mod linux {
         perf_prctl => ("perf-prctl","perf"),
         perf_inherit => ("perf-inherit","perf"),
         perf_software => ("perf-software","perf"),
+        perf_ring_gup => ("perf-ring-gup","perf"),
         perf_gup => ("perf-gup","perf"),
         perf_mmap => ("perf-mmap","perf"),
         perf_output => ("perf-output","perf"),
@@ -742,6 +746,7 @@ mod linux {
         bpf_prog_calls => ("bpf-prog-calls","bpf-prog"),
         bpf_prog_rewrites => ("bpf-prog-rewrites","bpf-prog"),
         bpf_prog_udp => ("bpf-prog-udp","bpf-prog"),
+        bpf_prog_tcp => ("bpf-prog-tcp","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
         dnotify_events => ("dnotify-events","inotify"),
@@ -1037,6 +1042,7 @@ mod linux {
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),
         processes_shmem_populate => ("shmem-populate","process"),
         processes_tmpfs_huge => ("tmpfs-huge","process"),
+        processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),
@@ -1064,6 +1070,7 @@ mod linux {
         processes_ptrace_stop_exit_code => ("ptrace-stop-exit-code","process"),
         processes_gone_leader_files => ("gone-leader-files","process"),
         processes_thread_caps_status => ("thread-caps-status","process"),
+        processes_zombie_ns_links => ("zombie-ns-links","process"),
         processes_userns_nondumpable_read => ("userns-nondumpable-read","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),

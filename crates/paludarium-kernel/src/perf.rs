@@ -450,6 +450,9 @@ struct State {
     running_time: u64,
     /// The clock when these were last brought up to date.
     since: u64,
+    /// For an event of a thread on one CPU, the thread's CPU time there
+    /// then: only that time runs and counts.
+    since_on: u64,
     /// For a counter of the thread's [`crate::Usage`], its values then, in
     /// the thread's own code and in system calls.
     tally: (u64, u64),
@@ -676,6 +679,18 @@ impl Event {
         let now = self.now(&mut state);
         let passed = now.saturating_sub(state.since);
         state.since = now;
+        // An event of a thread on one CPU is scheduled in only while the
+        // thread runs there (`event_filter_match`): its time enabled is
+        // the thread's, and its time running and count only that CPU's.
+        let ran = match self.on_cpu() {
+            Some((usage, cpu)) => {
+                let on = usage.time_on(cpu);
+                let ran = on.saturating_sub(state.since_on);
+                state.since_on = on;
+                ran
+            }
+            None => passed,
+        };
         let tallied = self.used().map_or((0, 0), |(user, kernel)| {
             let more = (
                 user.saturating_sub(state.tally.0),
@@ -687,9 +702,9 @@ impl Event {
         if state.enabled {
             state.enabled_time += passed;
             if !state.paused {
-                state.running_time += passed;
+                state.running_time += ran;
                 let (user, kernel) = if self.counter == Counter::Clock {
-                    (passed, 0)
+                    (ran, 0)
                 } else {
                     tallied
                 };
@@ -699,6 +714,15 @@ impl Event {
             }
         }
         state
+    }
+    /// The thread's [`crate::Usage`] and the CPU, for an event of a thread
+    /// on one CPU.
+    fn on_cpu(&self) -> Option<(Arc<crate::Usage>, u32)> {
+        let Target::Thread { group, tid } = &self.target else {
+            return None;
+        };
+        let cpu = u32::try_from(self.cpu).ok()?;
+        Some((group.last_thread_usage(*tid)?, cpu))
     }
     /// What the thread's [`crate::Usage`] counts for a counter of it (its
     /// faults as they are taken, its switches and migrations as of its
@@ -719,11 +743,23 @@ impl Event {
             return None;
         }
         let usage = group.last_thread_usage(*tid)?;
-        let load = |value: &AtomicU64| value.load(Ordering::SeqCst);
+        // Of an event of one CPU, what the thread counted there alone.
+        let [faults, kernel_faults, switches, migrations] = match u32::try_from(self.cpu) {
+            Ok(cpu) => usage.counts_on(cpu),
+            Err(_) => {
+                let load = |value: &AtomicU64| value.load(Ordering::SeqCst);
+                [
+                    load(&usage.faults),
+                    load(&usage.kernel_faults),
+                    load(&usage.switches),
+                    load(&usage.migrations),
+                ]
+            }
+        };
         let (user, kernel) = match self.counter {
-            Counter::Faults => (load(&usage.faults), load(&usage.kernel_faults)),
-            Counter::Switches => (0, load(&usage.switches)),
-            _ => (0, load(&usage.migrations)),
+            Counter::Faults => (faults, kernel_faults),
+            Counter::Switches => (0, switches),
+            _ => (0, migrations),
         };
         let user = if self.attr.flag(bit::EXCLUDE_USER) {
             0
@@ -1806,6 +1842,17 @@ mod tests {
         attr: Attr,
         counter: Counter,
     ) -> Arc<Event> {
+        // Any CPU, as `perf_event_open`'s -1.
+        of_counter_on(leader, target, attr, counter, -1)
+    }
+
+    fn of_counter_on(
+        leader: Option<&Arc<Event>>,
+        target: Target,
+        attr: Attr,
+        counter: Counter,
+        cpu: i32,
+    ) -> Arc<Event> {
         let event = Arc::new(Event {
             id: 0,
             stream_id: 0,
@@ -1813,7 +1860,7 @@ mod tests {
             attr,
             counter,
             target,
-            cpu: 0,
+            cpu,
             clockid: None,
             host: Arc::new(paludarium_host::testing::RecordingHost::default()),
             leader: Mutex::new(leader.map(Held::new)),
@@ -1959,6 +2006,77 @@ mod tests {
         space.write_u64(more, 1).unwrap();
         account(&mut state);
         assert_eq!((cpu.values().0, faults.values().0), (0, 3));
+    }
+
+    #[test]
+    fn an_event_of_a_thread_on_one_cpu_counts_what_it_did_there() {
+        let host = paludarium_host::testing::RecordingHost::default();
+        let group = Arc::new(ThreadGroup::default());
+        let mut state = crate::ThreadState::default();
+        paludarium_mmu::faults::bind(Arc::clone(&state.cpu.used) as _);
+        let account = |state: &mut crate::ThreadState| {
+            crate::account_cpu(&host, &group, state, 5);
+        };
+        let on = |counter, cpu| {
+            let target = Target::Thread {
+                group: Arc::clone(&group),
+                tid: 5,
+            };
+            let event = of_counter_on(None, target, Attr::default(), counter, cpu);
+            event.enable();
+            event
+        };
+        let mut space = paludarium_mmu::AddressSpace::new();
+        let mut fault = || {
+            let page = space
+                .map(
+                    None,
+                    4096,
+                    paludarium_mmu::Prot::READ_WRITE,
+                    paludarium_mmu::MappingKind::Anonymous,
+                )
+                .unwrap();
+            space.write_u64(page, 1).unwrap();
+        };
+        // The thread starts on CPU 0, the lowest its mask allows.
+        account(&mut state);
+        let faults = [-1, 0, 1].map(|cpu| on(Counter::Faults, cpu));
+        let migrations = [-1, 0, 1].map(|cpu| on(Counter::Migrations, cpu));
+        let switches = [-1, 0, 1].map(|cpu| on(Counter::Switches, cpu));
+        let counts = |events: &[Arc<Event>; 3]| events.each_ref().map(|e| e.values().0);
+        let _ = paludarium_host::switches::take();
+        fault();
+        paludarium_host::switches::sleep(&mut false);
+        account(&mut state);
+        assert_eq!(counts(&faults), [1, 1, 0]);
+        assert_eq!(counts(&switches), [1, 1, 0]);
+        // A new mask moves it to CPU 1: the sleep before it was on CPU 0,
+        // and the migration counts on CPU 1.
+        paludarium_host::switches::sleep(&mut false);
+        group.set_affinity(5, vec![0b10]);
+        account(&mut state);
+        assert_eq!(counts(&switches), [2, 2, 0]);
+        assert_eq!(counts(&migrations), [1, 0, 1]);
+        fault();
+        fault();
+        account(&mut state);
+        assert_eq!(counts(&faults), [3, 1, 2]);
+        // Back on CPU 0, CPU 1 keeps what it counted.
+        group.set_affinity(5, vec![0b1]);
+        account(&mut state);
+        fault();
+        assert_eq!(counts(&faults), [4, 2, 2]);
+        assert_eq!(counts(&migrations), [2, 1, 1]);
+        // Each runs only for the time on its CPU, and is enabled for all.
+        for [any, zero, one] in [faults, migrations, switches] {
+            let (_, enabled, running) = any.values();
+            assert_eq!(enabled, running);
+            for event in [zero, one] {
+                let (_, mine, ran) = event.values();
+                assert_eq!(mine, enabled);
+                assert!(ran <= enabled);
+            }
+        }
     }
 
     #[test]

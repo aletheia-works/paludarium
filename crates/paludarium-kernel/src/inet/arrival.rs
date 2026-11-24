@@ -24,8 +24,9 @@ const LO_MTU: usize = 65_536;
 const MAX_ALLOC: usize = 16_384 - crate::bpf_prog::SKB_SHARED_INFO;
 /// `sysctl_ip_default_ttl` and IPv6's `hop_limit`.
 const HOPS: u8 = 64;
-/// `IPPROTO_UDP`.
+/// `IPPROTO_UDP` and `IPPROTO_TCP`.
 const UDP: u8 = 17;
+const TCP: u8 = 6;
 /// The UDP header's length, which `sk_filter_trim_cap` keeps
 /// (`sizeof(struct udphdr)`).
 pub(super) const UDP_HEADER: usize = 8;
@@ -73,6 +74,16 @@ pub(super) enum Way {
     Looped { index: u32, mtu: usize },
 }
 
+impl Way {
+    /// The MTU of the device it comes through.
+    fn mtu(self) -> usize {
+        match self {
+            Way::Loopback => LO_MTU,
+            Way::Veth { mtu, .. } | Way::Looped { mtu, .. } => mtu,
+        }
+    }
+}
+
 impl Sent {
     pub(super) fn new(
         from: SocketAddr,
@@ -107,13 +118,53 @@ impl Sent {
         host: &Arc<dyn paludarium_host::Host>,
     ) -> Option<usize> {
         let v4 = self.from.is_ipv4();
-        let mtu = match way {
-            Way::Loopback => LO_MTU,
-            Way::Veth { mtu, .. } | Way::Looped { mtu, .. } => mtu,
-        };
+        let mtu = way.mtu();
         let ip = if v4 { 20 } else { 40 };
         let fragmented = ip + UDP_HEADER + payload.len() > mtu;
         let data = self.udp(payload, fragmented);
+        let linear = linear(payload.len(), v4, mtu);
+        self.run(
+            filter,
+            &data,
+            (UDP, UDP_HEADER, !fragmented),
+            linear,
+            way,
+            host,
+        )
+    }
+
+    /// Runs the listener's `filter` on the SYN of a connection to it that
+    /// came `way`, with a receive window of `window` bytes and an MSS of
+    /// `mss`: whether the filter keeps it (`tcp_filter` in `tcp_v4_rcv`
+    /// and `tcp_v6_rcv`, before `tcp_v4_do_rcv` takes it).
+    pub(super) fn syn_kept(
+        &self,
+        filter: &Filter,
+        way: Way,
+        window: (u16, u16, u8),
+        host: &Arc<dyn paludarium_host::Host>,
+    ) -> bool {
+        let data = self.syn(window, host);
+        let len = data.len();
+        self.run(filter, &data, (TCP, len, true), len, way, host)
+            .is_some()
+    }
+
+    /// Runs `filter` on the transport header and payload `data`, of
+    /// protocol `proto`, whose first `cap` bytes it always keeps
+    /// (`pskb_trim` to `max(cap, pkt_len)`), `DF` set when it goes `whole`,
+    /// `linear` of its bytes in the linear part, as it came `way`: how
+    /// many bytes past `cap` it keeps, or `None` when it drops it.
+    fn run(
+        &self,
+        filter: &Filter,
+        data: &[u8],
+        (proto, cap, whole): (u8, usize, bool),
+        linear: usize,
+        way: Way,
+        host: &Arc<dyn paludarium_host::Host>,
+    ) -> Option<usize> {
+        let v4 = self.from.is_ipv4();
         let (mut headers, kind, index) = match way {
             Way::Loopback => (ethernet([0; 6], [0; 6], v4), LOOPBACK, LO_INDEX),
             Way::Veth {
@@ -132,9 +183,9 @@ impl Sent {
                     u16::from_le_bytes(b)
                 })
             });
-            headers.extend(self.ipv4(data.len(), id, !fragmented));
+            headers.extend(self.ipv4(proto, data.len(), id, whole));
         } else {
-            headers.extend(self.ipv6(data.len()));
+            headers.extend(self.ipv6(proto, data.len()));
         }
         let skb = Skb {
             pkt_type: match way {
@@ -153,11 +204,11 @@ impl Sent {
             ingress_ifindex: index,
             hash: self.hash,
             device: Some((index, kind)),
-            payload_offset: UDP_HEADER as u32,
+            payload_offset: cap as u32,
         };
         let packet = Packet {
-            linear: linear(payload.len(), v4, mtu),
-            data: &data,
+            linear,
+            data,
             headers: &headers,
             mac: Some(0),
             network,
@@ -172,12 +223,7 @@ impl Sent {
         };
         match filter.program.run(&packet, &mut kernel) {
             0 => None,
-            keep => Some(
-                (keep as usize)
-                    .max(UDP_HEADER)
-                    .min(data.len())
-                    .saturating_sub(UDP_HEADER),
-            ),
+            keep => Some((keep as usize).max(cap).min(data.len()) - cap),
         }
     }
 
@@ -194,21 +240,7 @@ impl Sent {
         data.extend((len as u16).to_be_bytes());
         data.extend([0, 0]);
         data.extend(payload);
-        let mut sum = 0;
-        match (self.from.ip(), self.to.ip()) {
-            (IpAddr::V4(from), IpAddr::V4(to)) => {
-                sum = add(sum, &from.octets());
-                sum = add(sum, &to.octets());
-                sum = add(sum, &[0, UDP]);
-                sum = add(sum, &(len as u16).to_be_bytes());
-            }
-            (from, to) => {
-                sum = add(sum, &v6(from));
-                sum = add(sum, &v6(to));
-                sum = add(sum, &(len as u32).to_be_bytes());
-                sum = add(sum, &[0, 0, 0, UDP]);
-            }
-        }
+        let sum = self.pseudo(UDP, len);
         let check = if full {
             match !fold(add(sum, &data)) {
                 0 => 0xffff,
@@ -221,9 +253,59 @@ impl Sent {
         data
     }
 
-    /// The IPv4 header of a datagram of `len` bytes from the UDP header on,
-    /// `DF` set when it goes whole (`IP_PMTUDISC_WANT`).
-    fn ipv4(&self, len: usize, id: u16, whole: bool) -> Vec<u8> {
+    /// The one's complement sum of the pseudo-header of `len` bytes of
+    /// protocol `proto` from its source to its destination.
+    fn pseudo(&self, proto: u8, len: usize) -> u32 {
+        match (self.from.ip(), self.to.ip()) {
+            (IpAddr::V4(from), IpAddr::V4(to)) => {
+                let sum = add(add(0, &from.octets()), &to.octets());
+                add(add(sum, &[0, proto]), &(len as u16).to_be_bytes())
+            }
+            (from, to) => {
+                let sum = add(add(0, &v6(from)), &v6(to));
+                add(add(sum, &(len as u32).to_be_bytes()), &[0, 0, 0, proto])
+            }
+        }
+    }
+
+    /// A connection's SYN (`tcp_connect`): a random first sequence number,
+    /// the window `window`, unscaled, and `tcp_syn_options`' options in
+    /// `tcp_options_write`'s order, MSS `mss`, SACK permitted with the
+    /// timestamps (a random first value, and 0), and the window scale
+    /// `wscale`.
+    /// Its checksum is the pseudo-header's (`CHECKSUM_PARTIAL`,
+    /// `__tcp_v4_send_check`).
+    fn syn(
+        &self,
+        (window, mss, wscale): (u16, u16, u8),
+        host: &Arc<dyn paludarium_host::Host>,
+    ) -> Vec<u8> {
+        let mut random = [0; 8];
+        let _ = host.random_bytes(&mut random);
+        let mut h = Vec::with_capacity(40);
+        h.extend(self.from.port().to_be_bytes());
+        h.extend(self.to.port().to_be_bytes());
+        h.extend(&random[..4]);
+        h.extend([0, 0, 0, 0]);
+        // 40 bytes (`doff` 10), and SYN.
+        h.extend([0xa0, 0x02]);
+        h.extend(window.to_be_bytes());
+        h.extend([0, 0, 0, 0]);
+        h.extend([2, 4]);
+        h.extend(mss.to_be_bytes());
+        h.extend([4, 2, 8, 10]);
+        h.extend(&random[4..]);
+        h.extend([0, 0, 0, 0]);
+        h.extend([1, 3, 3, wscale]);
+        let check = fold(self.pseudo(TCP, h.len()));
+        h[16..18].copy_from_slice(&check.to_be_bytes());
+        h
+    }
+
+    /// The IPv4 header of a packet of protocol `proto` and `len` bytes from
+    /// its transport header on, `DF` set when it goes whole
+    /// (`IP_PMTUDISC_WANT`).
+    fn ipv4(&self, proto: u8, len: usize, id: u16, whole: bool) -> Vec<u8> {
         let (IpAddr::V4(from), IpAddr::V4(to)) = (self.from.ip(), self.to.ip()) else {
             unreachable!("an IPv4 datagram has IPv4 addresses");
         };
@@ -231,7 +313,7 @@ impl Sent {
         h.extend(((20 + len) as u16).to_be_bytes());
         h.extend(id.to_be_bytes());
         h.extend(if whole { [0x40, 0] } else { [0, 0] });
-        h.extend([HOPS, UDP, 0, 0]);
+        h.extend([HOPS, proto, 0, 0]);
         h.extend(from.octets());
         h.extend(to.octets());
         let check = !fold(add(0, &h));
@@ -239,14 +321,15 @@ impl Sent {
         h
     }
 
-    /// The IPv6 header of a datagram of `len` bytes from the UDP header on:
-    /// no traffic class, and the auto flow label of its hash.
-    fn ipv6(&self, len: usize) -> Vec<u8> {
+    /// The IPv6 header of a packet of protocol `proto` and `len` bytes from
+    /// its transport header on: no traffic class, and the auto flow label of
+    /// its hash.
+    fn ipv6(&self, proto: u8, len: usize) -> Vec<u8> {
         let label = self.hash.rotate_left(16) & 0xf_ffff;
         let mut h = label.to_be_bytes().to_vec();
         h[0] = 0x60;
         h.extend((len as u16).to_be_bytes());
-        h.extend([UDP, HOPS]);
+        h.extend([proto, HOPS]);
         h.extend(v6(self.from.ip()));
         h.extend(v6(self.to.ip()));
         h
@@ -261,6 +344,33 @@ impl super::Network {
             .and_then(|d| d.veth.as_ref())
             .map_or(([0; 6], LO_MTU), |v| (v.mac, v.mtu as usize))
     }
+}
+
+/// The window, MSS and window scale of a connection's SYN that comes
+/// `way`, from a socket of receive buffer `rcvbuf` (`tcp_connect_init`):
+/// the MSS is the
+/// device's MTU less the headers (`ipv4_default_advmss`, at most 65,495;
+/// `ip6_default_advmss`), and the window is what half the buffer holds
+/// (`tcp_full_space`, at `TCP_DEFAULT_SCALING_RATIO`), rounded down to
+/// the MSS (`tcp_select_initial_window`), at most 65,535 unscaled; the
+/// scale is what the largest of that, `tcp_rmem[2]` (32 MiB) and
+/// `rmem_max` takes past 16 bits, at most 14.
+pub(super) fn syn_window(rcvbuf: i32, way: Way, v4: bool) -> (u16, u16, u8) {
+    let mtu = way.mtu();
+    let mss = if v4 {
+        (mtu - 40).min(65_495)
+    } else {
+        (mtu - 60).min(65_535)
+    };
+    let space = usize::try_from(rcvbuf).unwrap_or(0) / 2;
+    let window = if space > mss {
+        space - space % mss
+    } else {
+        space
+    };
+    let largest = (window as u32).max(crate::tcp_info::RMEM_MAX).max(212_992);
+    let wscale = (largest.ilog2().saturating_sub(15)).min(14) as u8;
+    (window.min(65_535) as u16, mss as u16, wscale)
 }
 
 /// The Ethernet header from `src` to `dst` of an IPv4 or IPv6 packet.
@@ -365,12 +475,32 @@ mod tests {
             0,
             (0, 0),
         );
-        assert_eq!(fold(add(0, &sent.ipv4(12, 1, true))), 0xffff);
+        assert_eq!(fold(add(0, &sent.ipv4(UDP, 12, 1, true))), 0xffff);
         // A whole UDP checksum over its pseudo-header sums to all ones too.
         let data = sent.udp(b"abcd", true);
         let mut sum = add(0, &[127, 0, 0, 1, 127, 0, 0, 1, 0, UDP]);
         sum = add(sum, &12u16.to_be_bytes());
         assert_eq!(fold(add(sum, &data)), 0xffff);
+    }
+
+    #[test]
+    fn a_syn_has_linux_s_window_and_mss() {
+        assert_eq!(
+            syn_window(131_072, Way::Loopback, true),
+            (65_495, 65_495, 10)
+        );
+        assert_eq!(
+            syn_window(131_072, Way::Loopback, false),
+            (65_476, 65_476, 10)
+        );
+        let veth = Way::Veth {
+            index: 2,
+            src: [0; 6],
+            dst: [0; 6],
+            mtu: 1500,
+        };
+        assert_eq!(syn_window(131_072, veth, true), (64_240, 1460, 10));
+        assert_eq!(syn_window(2304, Way::Loopback, true), (1152, 65_495, 10));
     }
 
     #[test]

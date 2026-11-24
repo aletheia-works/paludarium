@@ -138,7 +138,8 @@ out:
   `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`,
   `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` and `pcmpeqd` of xmm
   registers, `pslld` and `psrld` of one by an immediate, and `pmovmskb`;
-- `movsb`, `movsw`, `movsd` and `movsq`, with `rep` or without, of 64-bit
+- the string moves `movsb`, `movsw`, `movsd` and `movsq`, and the string
+  stores `stosb`, `stosw`, `stosd` and `stosq`, with `rep` or without, of 64-bit
   addresses;
 - `cmpxchg` (with `lock` or without) and `xchg` between memory and a register,
   each as the one atomic access of memory that the interpreter makes.
@@ -155,8 +156,8 @@ checks for every form from random states. A repeated string instruction runs at
 most 4096 iterations in a step, and then runs again in the next. One that is
 not a comparison and faults after an iteration of its step ends the step there,
 with the iterations it made, and the next step reports the fault, as a CPU may
-stop `rep` between two iterations. A repeated string move therefore also
-changes nothing when its form fails. The cache keeps the form, with the
+stop `rep` between two iterations. A repeated string move or store therefore
+also changes nothing when its form fails. The cache keeps the form, with the
 address of the next instruction and three flags (within one 64-byte cache line),
 apart from the decoded instruction itself, which only the general path reads. A
 run of such forms therefore reads little host memory.
@@ -188,10 +189,10 @@ own loads and stores, with their checks, which fill the slot again. It stops
 before an instruction whose load or store fails, having changed nothing for
 it, so that the interpreter runs it again and reports the fault, and after a
 call into the MMU that finds the code generation moved on. It stops the same
-way before a `div` or `idiv` that faults (#DE). A `rep movs` runs as in
-the interpreter: after 4096 iterations, or when an iteration after the first
-fails, it leaves at the instruction with the iterations made, counting it as
-run, so that the instruction runs again. An access to a
+way before a `div` or `idiv` that faults (#DE). A `rep movs` or `rep stos`
+runs as in the interpreter: after 4096 iterations, or when an iteration after
+the first fails, it leaves at the instruction with the iterations made,
+counting it as run, so that the instruction runs again. An access to a
 page's bytes never moves it: a slot never allows a write to a page an
 instruction was fetched from, nor to a shared or file page, whose stores the
 MMU counts as code changes for the mappings and page caches it watches. A

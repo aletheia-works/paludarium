@@ -1568,6 +1568,10 @@ struct Syn {
     notify: crate::loopback::Notify,
     from: SocketAddr,
     to: SocketAddr,
+    /// The veth end it goes out through, or `None` on the loopback.
+    veth: Option<i32>,
+    /// The connecting socket, whose SYN each try is.
+    client: Weak<InetSocket>,
     start: u64,
     /// How many of [`SYN_RETRIES`] it has made.
     tries: usize,
@@ -3276,7 +3280,15 @@ impl InetSocket {
                 syns.swap_remove(i);
                 continue;
             };
-            match self.knock(&there, &stream, (&syn.link, &syn.notify), syn.from, syn.to) {
+            let ends = (syn.from, syn.to, syn.veth);
+            let client = syn.client.upgrade();
+            match self.knock(
+                client.as_deref(),
+                &there,
+                &stream,
+                (&syn.link, &syn.notify),
+                ends,
+            ) {
                 Knock::Full => {}
                 Knock::Taken => {
                     syns.swap_remove(i);
@@ -3301,26 +3313,41 @@ impl InetSocket {
     /// takes it into its queue when it has room.
     fn knock(
         &self,
+        client: Option<&InetSocket>,
         there: &Network,
         stream: &Arc<Stream>,
         link: (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
-        from: SocketAddr,
-        to: SocketAddr,
+        (from, to, veth): (SocketAddr, SocketAddr, Option<i32>),
     ) -> Knock {
         let Some(listener) = there.ports(false).listener(from, to) else {
             return Knock::Refused;
         };
+        // The SYN sent again is the client's, with a new flow hash, as
+        // `tcp_write_timeout` takes one for each retransmission
+        // (`sk_rethink_txhash`).
+        let kept = client.is_none_or(|client| {
+            let options = *client.options();
+            let hash = {
+                let mut s = client.lock();
+                s.txhash = u32::from_le_bytes(client.random()).max(1);
+                s.txhash
+            };
+            client.syn_kept(&listener, there, (from, to, veth), &options, hash)
+        });
         let theirs = *listener.options();
         let mut state = listener.lock();
         let locked = state.port_locked;
+        let filtering = state.filtering.clone();
         let Some(listen) = state.listen.as_mut() else {
             return Knock::Refused;
         };
-        if !listen.has_room() {
+        // The filter drops it as a full queue does, and either counts in
+        // the listener's `sk_drops`.
+        if !kept || !listen.has_room() {
             listen.drops += 1;
             return Knock::Full;
         }
-        let child = listener.child((theirs, locked), stream, link, from, to);
+        let child = listener.child((theirs, locked, filtering), stream, link, from, to);
         listen.ready.push_back(child);
         listen.arrivals += 1;
         drop(state);
@@ -3340,7 +3367,7 @@ impl InetSocket {
     /// the listener's port on `to`.
     fn child(
         &self,
-        (options, locked): (Options, bool),
+        (options, locked, filtering): (Options, bool, crate::sockets::FilterSlot),
         stream: &Arc<Stream>,
         (link, notify): (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
         from: SocketAddr,
@@ -3379,8 +3406,67 @@ impl InetSocket {
         s.bound = Some(to);
         s.port_locked = locked;
         s.counts = Counts::new(child.now(), &options);
+        // `sk_clone_lock` copies the listener's filter, which it charges
+        // again (`sk_filter_charge`), and its lock (`SOCK_FILTER_LOCKED`).
+        s.filtering = crate::sockets::FilterSlot {
+            filter: filtering.filter.map(|f| crate::sockets::Filter {
+                socket: crate::bpf_prog::FilterSocket::Inet(Weak::clone(&child.this)),
+                ..f
+            }),
+            locked: filtering.locked,
+        };
         drop(s);
         child
+    }
+    /// Whether the listener's filter keeps the SYN of a connection from
+    /// this socket at `from` to it at `to`, in the namespace `there`, out
+    /// through the veth end `veth` or on the loopback, with this socket's
+    /// `options` and flow hash `hash` (`tcp_filter` in `tcp_v4_rcv` and
+    /// `tcp_v6_rcv`); one with no filter keeps it. It runs as this socket's
+    /// owner, as the softirq that sends it runs in its context.
+    fn syn_kept(
+        &self,
+        listener: &InetSocket,
+        there: &Network,
+        (from, to, veth): (SocketAddr, SocketAddr, Option<i32>),
+        options: &Options,
+        hash: u32,
+    ) -> bool {
+        let Some(filter) = listener.lock().filtering.filter.clone() else {
+            return true;
+        };
+        let way = match veth {
+            None => arrival::Way::Loopback,
+            Some(index) => {
+                let (src, mtu) = self.network.veth_link(index);
+                let peer = self.network.peer_index(index);
+                arrival::Way::Veth {
+                    index: peer,
+                    src,
+                    dst: there.veth_link(peer as i32).0,
+                    mtu,
+                }
+            }
+        };
+        let (from, to) = (
+            SocketAddr::new(plain(from.ip()), from.port()),
+            SocketAddr::new(plain(to.ip()), to.port()),
+        );
+        let ids = (
+            self.uid.load(Ordering::SeqCst),
+            self.gid.load(Ordering::SeqCst),
+        );
+        let sent = arrival::Sent::new(
+            from,
+            to,
+            options.type_of_service as u8,
+            None,
+            hash,
+            options.priority as u32,
+            ids,
+        );
+        let window = arrival::syn_window(options.receive_buffer, way, to.is_ipv4());
+        sent.syn_kept(&filter, way, window, &self.host)
     }
     /// A connection to `to` on the guest's loopback, when a guest socket
     /// listens there: in its listener's queue, or, when that is full, to be
@@ -3403,7 +3489,7 @@ impl InetSocket {
         // the connection leaves from.
         let bound = s.bound;
         let from = self.loopback_source(s, to, options)?;
-        Ok(self.join(&self.network, s, (bound, from), to, options, true))
+        Ok(self.join(&self.network, s, (bound, from), to, options, None))
     }
     /// A connection to `to` out through the veth end `index`, from the
     /// address its route leaves from on a port bound now, as on the
@@ -3447,7 +3533,7 @@ impl InetSocket {
                 // Its SYN-ACK, or its reset, comes back.
                 self.network
                     .reply(index, from.ip(), to.ip(), FLOW_TCP, self.now());
-                return Ok(self.join(&there, s, (bound, from), to, options, false));
+                return Ok(self.join(&there, s, (bound, from), to, options, Some(index)));
             }
             Reach::OneWay(_) | Reach::Dropped => (SYN_TIMEOUT, ETIMEDOUT),
             Reach::Unanswered if self.network.is_up() => (ARP_TIMEOUT, EHOSTUNREACH),
@@ -3495,17 +3581,23 @@ impl InetSocket {
         (bound, from): (Option<SocketAddr>, SocketAddr),
         to: SocketAddr,
         options: &Options,
-        loopback: bool,
+        veth: Option<i32>,
     ) -> Option<Arc<Stream>> {
+        let loopback = veth.is_none();
         let Some(listener) = there.ports(false).listener(from, to) else {
             // The listener closed meanwhile, or none was there: the
             // refused connect gives back the port it took.
             self.give_back(s, bound);
             return None;
         };
+        // `tcp_v4_connect` and `tcp_v6_connect` give the socket its flow
+        // hash (`sk_set_txhash`), which its SYN goes with.
+        s.txhash = u32::from_le_bytes(self.random()).max(1);
+        let kept = self.syn_kept(&listener, there, (from, to, veth), options, s.txhash);
         let theirs = *listener.options();
         let mut state = listener.lock();
         let locked = state.port_locked;
+        let filtering = state.filtering.clone();
         let listen = state.listen.as_mut()?;
         let stream = Stream::new(to);
         stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
@@ -3514,14 +3606,22 @@ impl InetSocket {
         let link = Arc::new(OnceLock::new());
         s.link = Some((Arc::clone(&link), 0));
         self.ports().attach(&self.this, (&link, 0));
-        let arrived = listen.has_room();
+        // The listener's filter runs before its queue is checked, and a
+        // SYN it drops is tried again as one a full queue dropped.
+        let arrived = kept && listen.has_room();
         if arrived {
             // The listener's answer goes back out through the loopback.
             if loopback {
                 self.network.output(from.ip(), self.now());
             }
             let notify = self.urgent_notify();
-            let child = listener.child((theirs, locked), &stream, (&link, &notify), from, to);
+            let child = listener.child(
+                (theirs, locked, filtering),
+                &stream,
+                (&link, &notify),
+                from,
+                to,
+            );
             listen.ready.push_back(child);
             listen.arrivals += 1;
         } else {
@@ -3543,6 +3643,8 @@ impl InetSocket {
                 notify: self.urgent_notify(),
                 from,
                 to,
+                veth,
+                client: Weak::clone(&self.this),
                 start,
                 tries: 0,
             });

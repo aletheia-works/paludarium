@@ -170,7 +170,7 @@ impl Usage {
     pub(crate) fn set_huge(&self, huge: Huge) {
         self.huge.store(huge as u8, Ordering::SeqCst);
     }
-    fn huge(&self) -> Huge {
+    pub(crate) fn huge(&self) -> Huge {
         match self.huge.load(Ordering::SeqCst) {
             1 => Huge::Always,
             2 => Huge::WithinSize,

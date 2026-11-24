@@ -552,6 +552,14 @@ pub enum Fast {
         repeat: bool,
         segment: Segment,
     },
+    /// `stosb`, `stosw`, `stosd` or `stosq`, with `rep` when `repeat`: the
+    /// low `size` bytes of rax to `[rdi]`, which steps by `size` up or, with
+    /// DF set, down. It repeats and stops as [`Fast::MoveString`] does. The
+    /// address is 64 bits wide; a segment override does not apply to it.
+    StoreString {
+        size: u8,
+        repeat: bool,
+    },
 }
 
 /// A general register, or one of the high-byte registers ah, ch, dh and bh.
@@ -619,8 +627,10 @@ impl Fast {
         // Of the locked instructions, only these have a form: their memory
         // access is one atomic operation either way.
         let lockable = matches!(i.mnemonic, Mnemonic::Cmpxchg | Mnemonic::Xchg);
-        // Of the repeated instructions, only the string moves have a form.
-        if (i.lock && !lockable) || (i.rep != RepPrefix::None && !is_move_string(i.mnemonic)) {
+        // Of the repeated instructions, only the string moves and stores
+        // have a form.
+        let repeatable = is_move_string(i.mnemonic) || is_store_string(i.mnemonic);
+        if (i.lock && !lockable) || (i.rep != RepPrefix::None && !repeatable) {
             return Self::None;
         }
         Self::form(i).unwrap_or(Self::None)
@@ -798,6 +808,10 @@ impl Fast {
                 size: i.implicit_size,
                 repeat: i.rep != RepPrefix::None,
                 segment: i.string_segment,
+            },
+            m if is_store_string(m) && !i.string_address_size_32 => Self::StoreString {
+                size: i.implicit_size,
+                repeat: i.rep != RepPrefix::None,
             },
             Mnemonic::Nop | Mnemonic::Endbr64 => Self::Nop,
             Mnemonic::Mov => {
@@ -1429,8 +1443,8 @@ pub(crate) fn execute(
             divide(&mut x, signed)?;
             next
         }
-        Fast::MoveString { .. } => {
-            if move_string(&mut x)? {
+        Fast::MoveString { .. } | Fast::StoreString { .. } => {
+            if string(&mut x)? {
                 next
             } else {
                 // Not finished: the same instruction runs again next step.
@@ -1500,10 +1514,11 @@ fn divide(x: &mut Exec<'_>, signed: bool) -> Result<()> {
     x.divide(signed)
 }
 
-/// [`Fast::MoveString`], which [`Exec::string`] runs: it reads the
-/// instruction. False when the instruction is to run again.
+/// [`Fast::MoveString`] and [`Fast::StoreString`], which [`Exec::string`]
+/// runs: it reads the instruction. False when the instruction is to run
+/// again.
 #[inline(never)]
-fn move_string(x: &mut Exec<'_>) -> Result<bool> {
+fn string(x: &mut Exec<'_>) -> Result<bool> {
     x.string(x.i.mnemonic)
 }
 
@@ -1511,5 +1526,12 @@ fn is_move_string(m: Mnemonic) -> bool {
     matches!(
         m,
         Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd | Mnemonic::Movsq
+    )
+}
+
+fn is_store_string(m: Mnemonic) -> bool {
+    matches!(
+        m,
+        Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq
     )
 }

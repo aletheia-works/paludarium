@@ -2287,3 +2287,61 @@ fn collapse_takes_shmem_page_caches_an_aligned_extent_at_a_time() {
     assert_eq!(m.collapse(GuestAddr(AT), AT + HUGE), Err(Errno(16)));
     assert!(!armed.has(PAGE_SIZE));
 }
+
+#[test]
+fn an_aligned_placement_puts_a_mapping_at_its_offset_past_a_boundary() {
+    const HUGE: u64 = 2 << 20;
+    let place = |m: &AddressSpace, hint: Option<GuestAddr>, len: u64, offset: u64| {
+        m.map_backed(
+            Placement::Aligned {
+                hint,
+                size: HUGE,
+                offset,
+            },
+            len,
+            Prot::READ,
+            MappingKind::Anonymous,
+            Backing::None,
+        )
+        .unwrap()
+        .0
+    };
+    for bottom_up in [false, true] {
+        let mut m = AddressSpace::new();
+        if bottom_up {
+            m.set_bottom_up(Some(GuestAddr(0x1000_1000)));
+        }
+        // A page off a boundary first, so that the ordinary choice is not
+        // aligned.
+        m.map_shared(None, PAGE_SIZE, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        assert_eq!(place(&m, None, 2 * HUGE, 0) % HUGE, 0, "{bottom_up}");
+        assert_eq!(
+            place(&m, None, 2 * HUGE, PAGE_SIZE) % HUGE,
+            PAGE_SIZE,
+            "{bottom_up}"
+        );
+        // Shorter than the size, or ending within the second at an
+        // offset: where `Near` would put it.
+        let near = |m: &mut AddressSpace, len: u64| {
+            let at = m
+                .map_backed(
+                    Placement::Near(None),
+                    len,
+                    Prot::READ,
+                    MappingKind::Anonymous,
+                    Backing::None,
+                )
+                .unwrap();
+            m.unmap(at, len).unwrap();
+            at.0
+        };
+        let expected = near(&mut m, HUGE / 2);
+        assert_eq!(place(&m, None, HUGE / 2, 0), expected, "{bottom_up}");
+        let expected = near(&mut m, HUGE);
+        assert_eq!(place(&m, None, HUGE, PAGE_SIZE), expected, "{bottom_up}");
+        // A free hint is taken as it is.
+        let hint = GuestAddr(0x2000_3000);
+        assert_eq!(place(&m, Some(hint), 2 * HUGE, 0), hint.0, "{bottom_up}");
+    }
+}

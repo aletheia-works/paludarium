@@ -349,8 +349,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ベクタの形はなく（`EINVAL`）、`lseek`（`ESPIPE`）、`fsync`（`EINVAL`）、`fallocate`
   （`EOPNOTSUPP`）、シール（`EINVAL`）もありません。`/proc/self/fd` から開き直すと
   `ENXIO` です。Linux の `get_user_pages` と同じく、カーネルはそのマッピングのページに
-  触れられません。`MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL`、`mlock` は
-  `ENOMEM` です。`mlock_fixup` がその VMA に `VM_LOCKONFAULT` を付けないので、
+  触れられません。`MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL`、
+  `process_vm_readv` と `process_vm_writev` は `EFAULT`、`PTRACE_PEEKDATA` と
+  `PTRACE_POKEDATA` は `EIO`、`mlock` は `ENOMEM` です。`mlock_fixup` がその VMA に `VM_LOCKONFAULT` を付けないので、
   `MLOCK_ONFAULT` でも同じです。ファイルに `fsync` がないので、`MS_SYNC` の `msync` も、
   範囲に穴があってもそのマッピングに着けば `EINVAL` です。ページフォールトでページを
   割り当てるのは、そのユーザーが作ったファイルのページが、フォールトしたプロセスの
@@ -1814,7 +1815,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   もの、フォールトではマッピングがアドレスと同じくそろったオフセットで持つもの
   （`MADV_NOHUGEPAGE` を受けていないもの）です。まとめて数え、入らなければ、終わりを
   越えるファイルの終わりの大きな folio を分けて場所を空けてから
-  （`shmem_unused_huge_shrink`）、だめならそのページだけを数えます。長いシンボリックリンク
+  （`shmem_unused_huge_shrink`）、だめならそのページだけを数えます。`MAP_FIXED` なしの
+  `mmap` は、そういうファイルの 2 MiB 以上のマッピングを、空いているヒントのとき
+  のほかは 2 MiB の境目に置くか、オフセットが境目を越える分だけ越えたところに置きます
+  （`shmem_get_unmapped_area`）。そのフォールトは 512 ページの folio を取れます。長いシンボリックリンク
   （127 バイトを超えるもの）は 1 ページを使い、新しい inode とファイルの 2 つめ以降の
   名前（`link`）はそれぞれ inode を 1 つ使います（残っていなければ `ENOSPC`）。消した
   けれどまだ開いているファイルは、最後に閉じるまでその分を持ちます。マウントし直すと
@@ -3302,7 +3306,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ESRCH`）、`exe`、`cwd`、`root` と
   ほかの `ns` のリンクは `ENOENT`、`mountinfo` は `EINVAL` です。`statm` はすべて 0、
   `status` には `Vm` の行も `Umask` もなく `FDSize` は 0 で、`stat` には大きさもアドレスも
-  ありません。`/proc/thread-self` は読んでいるスレッドのディレクトリへのリンク（0777）で、
+  ありません。ゾンビのプロセスも、Linux の `pidns_get` と `userns_get` が PID と資格情報から
+  取るのと同じく、回収されるまで `pid` と `user` のリンクを残し、ほかの `ns` のリンクと
+  `pid_for_children` は `ENOENT` です。`/proc/thread-self` は読んでいるスレッドのディレクトリへのリンク（0777）で、
   `<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
@@ -4105,8 +4111,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `context-switches`（眠るたび）と `cpu-migrations`（`getcpu` の返す CPU が変わるたび）。
   後の二つはカーネルが起こすので、Linux と同じく `exclude_kernel` で除きます。すべての
   ページがメモリにあるので何も数えない `major-faults` と、x86-64 と同じく何も数えない
-  `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。それらの
-  分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
+  `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。
+  `perf record` が CPU ごとに開くような、一つの CPU のスレッドのイベントは、スレッドが
+  その CPU にいる間だけ数えて動き（`event_filter_match`）、有効な時間はその間ずっと
+  進みます。移動はスレッドが移った先の CPU で数え、`sched_setaffinity` は戻る前に
+  スレッドを移します。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
   キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
   イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
   要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った
@@ -4155,7 +4164,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   後者は、`perf_event_paranoid` が -1 か、呼び出し元が `CAP_IPC_LOCK` を持つので
   なければ、`RLIMIT_MEMLOCK` を超えられません（`EPERM`）。後のマッピングも、Linux
   master と同じくユーザーに課され、返されません。マッピングは `fork` した子に写されず、
-  コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ディスクリプタが閉じられても
+  コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ページのないメモリ
+  （`VM_IO | VM_PFNMAP`）なので `get_user_pages` はこれを拒みます。`process_vm_readv` と
+  `process_vm_writev` は `EFAULT`、`PTRACE_PEEKDATA` と `PTRACE_POKEDATA` は `EIO`、
+  `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL` です。ディスクリプタが閉じられても
   イベントを数え続けさせます。最後にアンマップされると、バッファと課したものは
   なくなります。これはイベントのファイルのマッピングで、`/proc/<pid>/maps` と `MMAP2`
   の記録は、ディスクリプタの `fstat` が示すデバイスと inode（無名 inode のもの）を付けて
@@ -4593,6 +4605,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     は `ARPHRD_LOOPBACK` か `ARPHRD_ETHER`、`SKF_AD_PAY_OFFSET` は 8 です。ヘルパーは
     送ったタスクとして動きます。Linux のソフト割り込みが受信をそのコンテキストで動かすため
     です。
+
+- TCP の待ち受けソケット（IPv4 と IPv6）では、フィルターはループバックか veth ペアを
+  通って届く SYN ごとに動きます。`tcp_v4_rcv` と `tcp_v6_rcv` が `tcp_v4_do_rcv` に
+  渡す前に `tcp_filter` を動かすのと同じで、受け入れキューの確認より前です。捨てた SYN
+  は待ち受けソケットの `sk_drops` に数え、キューがいっぱいで捨てたものと同じく、
+  ハンドシェイクの間隔で送り直されます。SYN は Linux 7.0 のものです。40 バイトの TCP
+  ヘッダに、乱数のシーケンス番号、受信バッファの半分を MSS の倍数に切り下げたウィンドウ、
+  オプションとして MSS（デバイスの MTU からヘッダを引いたもの）、SACK の許可、
+  タイムスタンプ（乱数と 0）、`tcp_rmem[2]` の 32 MiB による 10 のウィンドウスケールが入ります。IP ヘッダ、MAC ヘッダ、
+  `__sk_buff` のフィールドは UDP のデータグラムと同じ（上を参照）で、ハッシュは接続する
+  ソケットのフロー（`connect` が与え、送り直す SYN ごとに引き直す。`sk_rethink_txhash`）、
+  `SKF_AD_PAY_OFFSET` は 40 です。送り直す SYN も、接続するソケットのオプションで作ります。受け入れたソケットは、`sk_clone_lock`
+  がコピーするのと同じく、待ち受けソケットのフィルターとそのロックを引き継ぎます。
 
 - 古典的なフィルター（`SO_ATTACH_FILTER`、`struct sock_fprog`。ほかの大きさは `EINVAL`）は、
   Linux の `bpf_check_classic` と同じく確かめ、`bpf_convert_filter` と同じく命令ごとに

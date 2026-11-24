@@ -62,6 +62,8 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`). A page of a host file
   that `write` filled is clean (see "Pages `write` filled" below).
+- **No `/proc/<pid>/mem`**: a task's memory is read and written through
+  `ptrace` and `process_vm_readv` and `process_vm_writev` only.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
@@ -136,9 +138,7 @@ verified.
   which outlives the memory, so those files stay the task's and their open
   is `ESRCH`; paludarium follows that once the runners run 7.2 or later, and
   the `gone-leader-files` case and the unit test
-  `a_task_without_memory_has_its_files_owned_by_root` change with it. A
-  zombie process has no `ns` links yet, where Linux's `pid` and `user` links
-  still resolve (`pidns_get` and `userns_get` need no `nsproxy`).
+  `a_task_without_memory_has_its_files_owned_by_root` change with it.
   `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
@@ -297,7 +297,10 @@ verified.
   counts it in `page-faults`; a context switch is a sleep of the thread,
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
   to another); and a thread without `rseq` moves to
-  another CPU only when a new CPU mask changes the lowest CPU it allows.
+  another CPU only when a new CPU mask changes the lowest CPU it allows,
+  at once for its own `sched_setaffinity` and at its next system call for
+  another thread's, so that until then its events of one CPU count what it
+  does to the CPU it was on, where Linux has moved it already.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where
   Linux takes each at its occurrence: they show the thread's address,
@@ -337,8 +340,7 @@ verified.
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
   mapping's are the error here. `inherit_stat` is taken, but an inherited
-  event's end sends no read record, as nothing is recorded. An event of a
-  task on one CPU counts on any, and the cgroup mode
+  event's end sends no read record, as nothing is recorded. The cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
@@ -367,8 +369,12 @@ verified.
   bloom filters, and arrays and hashes of maps, and loads socket filters,
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
-  or packet socket and on a UDP socket. A TCP socket takes the options as
-  Linux does, but its filter does not run yet. On a UDP socket no
+  or packet socket, on a UDP socket and on the SYNs that come to a TCP
+  listener. Here a TCP connection has no segments yet, so no filter runs
+  yet on the handshake's last ACK, nor on the data, ACKs and FINs that come
+  to a connected socket, which Linux filters each (`tcp_filter`): a filter
+  that drops or cuts them, or keeps a SYN but drops that ACK, does
+  otherwise there. On a UDP socket no
   filter runs on the DNS stub's answers, which come through no device
   here; a datagram that Linux sends in fragments across a veth pair comes
   whole, though its filter sees the reassembled one's linear part and
@@ -862,10 +868,9 @@ verified.
   `nr_blocks` and `nr_inodes`, and a page a fault brings into a file of a
   tmpfs mount or a memfd counts in its blocks, as `shmem_fault` charges
   it, one past the mount's size being a `SIGBUS`, with a large folio's
-  others on a mount with `huge=`. Not yet so: `mmap` places a mapping of
-  such a file where it would place any (`shmem_get_unmapped_area` puts
-  one of 2 MiB or more at a 2 MiB boundary), so only a mapping a program
-  places itself takes 2 MiB folios on a fault; a large folio is mapped a
+  others on a mount with `huge=`. Not yet so: `mremap` moves a mapping of
+  such a file where it would move any, where Linux places it at a 2 MiB
+  boundary as `mmap` does; a large folio is mapped a
   page at a time, so `/proc/<pid>/smaps` and `/proc/meminfo` count no
   `ShmemPmdMapped`, `FilePmdMapped` or `ShmemHugePages` for it and a
   fault maps (and counts in `Rss`) only the pages around it, not the whole

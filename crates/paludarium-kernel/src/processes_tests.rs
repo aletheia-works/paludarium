@@ -7109,6 +7109,38 @@ mod proc_other {
         let own = format!("/proc/{pid}/task/42/status");
         assert_eq!(cap_eff(read(&mut k, &mut t, &m, &own).unwrap()), 0);
     }
+    /// A zombie keeps its `pid` and `user` links until it is reaped, as
+    /// Linux's `pidns_get` and `userns_get` take them from its PID and
+    /// credentials, while the others and `pid_for_children`, which need the
+    /// `nsproxy` it gave up, are gone.
+    #[test]
+    fn a_zombie_keeps_its_pid_and_user_namespace_links() {
+        let (mut k, mut t, m) = setup();
+        let link = |k: &mut Kernel, t: &mut Thread, path: &str| {
+            m.write(GuestAddr(DATA), format!("{path}\0").as_bytes())
+                .unwrap();
+            let n = syscall(k, t, &m, 89, [DATA, DATA + 1024, 256, 0, 0, 0]);
+            if n >= 1 << 20 {
+                return Err(n);
+            }
+            let mut target = vec![0; n as usize];
+            m.read(GuestAddr(DATA + 1024), &mut target).unwrap();
+            Ok::<_, u64>(target)
+        };
+        let (mut zombie, zt, zm) = fork(&mut k, &mut t, &m);
+        finish(&mut zombie, &zt, &zm, ExitStatus::Exited(0));
+        let pid = zt.tid;
+        for name in ["pid", "user"] {
+            let own = link(&mut k, &mut t, &format!("/proc/self/ns/{name}"));
+            assert!(own.is_ok(), "{name}");
+            assert_eq!(link(&mut k, &mut t, &format!("/proc/{pid}/ns/{name}")), own);
+        }
+        let enoent = Err(Errno::ENOENT.to_syscall_return());
+        for name in ["net", "mnt", "uts", "pid_for_children"] {
+            let path = format!("/proc/{pid}/ns/{name}");
+            assert_eq!(link(&mut k, &mut t, &path), enoent, "{path}");
+        }
+    }
     /// An undumpable process is readable only with `CAP_SYS_PTRACE` in the
     /// user namespace its program runs in (Linux's `task_still_dumpable`),
     /// not in the one its credentials moved to: after `unshare` of a user

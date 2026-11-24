@@ -103,7 +103,9 @@ export function jitImports(memory, cost = null, now = () => performance.now()) {
       // separately compiles it; JS objects/handles never cross Worker boundaries.
       // The module runs from prepare's private copy of its bytes, compared
       // there and compiled from it, so a later change to the caller's bytes
-      // cannot reach what runs: only their length is checked again.
+      // cannot reach what runs: only their length is checked again. So
+      // comparisonBytesUpperBound (cost field 17) counts prepare's compares
+      // only; before #960, it counted every execution's too.
       const entry = compiled.get(key);
       if (!entry) return -2;
       if (entry.bytes.length !== codeLength) return -1;

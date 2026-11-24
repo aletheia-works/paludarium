@@ -7237,6 +7237,149 @@ static int exec_names_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The rename-names case: a file's name in /proc/self/maps, /proc/self/exe
+   and a core's NT_FILE note is where the file is now, as Linux's d_path
+   of the dentry, which d_move moves on each rename (of the file, or of a
+   directory above it), gives it, with " (deleted)" once the name it then
+   has is removed. */
+static int rn_maps_name(uint64_t at, char *out, size_t size) {
+    out[0] = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[4096];
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && at >= start && at < end) {
+            char *path = strchr(line, '/');
+            if (path) {
+                path[strcspn(path, "\n")] = 0;
+                snprintf(out, size, "%s", path);
+            }
+            break;
+        }
+    }
+    fclose(maps);
+    return out[0] != 0;
+}
+/* The NT_FILE name a core of a forked child gives the code at `at`. */
+static int rn_core_name(uint64_t at, char *out, size_t size) {
+    out[0] = 0;
+    struct rlimit r;
+    getrlimit(RLIMIT_CORE, &r);
+    r.rlim_cur = r.rlim_max;
+    setrlimit(RLIMIT_CORE, &r);
+    fflush(stdout);
+    pid_t dumper = fork();
+    if (dumper == 0) {
+        raise(SIGABRT);
+        _exit(75);
+    }
+    int status = 0;
+    waitpid(dumper, &status, 0);
+    int fd = open("core", O_RDONLY);
+    struct stat st;
+    unsigned char *core = NULL;
+    long got = 0, n;
+    if (fd >= 0 && fstat(fd, &st) == 0 && (core = malloc((size_t)st.st_size + 1)))
+        while (got < st.st_size && (n = read(fd, core + got, (size_t)(st.st_size - got))) > 0) got += n;
+    if (fd >= 0) close(fd);
+    unlink("core");
+    core_bytes = core;
+    core_size = core ? (uint64_t)got : 0;
+    uint64_t files = 0;
+    for (int k = 0; core && got >= 64 && k < (int)le(56, 2); k++) {
+        uint64_t h = le(32, 8) + 56 * (uint64_t)k, offset = le(h + 8, 8), filesz = le(h + 32, 8);
+        if (le(h, 4) != 4) continue;
+        for (uint64_t q = offset; q + 12 <= offset + filesz && q + 12 <= core_size;) {
+            uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
+            uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
+            if (type == 0x46494c45 && !files) files = desc;
+            q = desc + ((descsz + 3) & ~3ULL);
+        }
+    }
+    uint64_t start, end, pgoff;
+    const char *named = file_entry(files, at, &start, &end, &pgoff);
+    if (named) snprintf(out, size, "%s", named);
+    free(core);
+    core_bytes = NULL;
+    core_size = 0;
+    return WCOREDUMP(status) ? 1 : 0;
+}
+static int rename_names_child(void) {
+    char exe[4096] = {0}, now[4096], seen[4096];
+    if (readlink("/proc/self/exe", exe, sizeof exe - 1) < 0) return 70;
+    char *slash = strrchr(exe, '/');
+    if (!slash) return 71;
+    /* The program renames its own file within its directory. */
+    snprintf(now, sizeof now, "%.*s/prog-moved", (int)(slash - exe), exe);
+    if (rename(exe, now)) return 72;
+    char link[4096] = {0};
+    if (readlink("/proc/self/exe", link, sizeof link - 1) < 0) return 73;
+    printf("exe after rename: %d\n", !strcmp(link, now));
+    rn_maps_name((uintptr_t)&rename_names_child, seen, sizeof seen);
+    printf("maps after rename: %d\n", !strcmp(seen, now));
+    *strrchr(now, '/') = 0;
+    if (chdir(now)) return 74;
+    snprintf(now + strlen(now), sizeof now - strlen(now), "/prog-moved");
+    int dumped = rn_core_name((uintptr_t)&rename_names_child, seen, sizeof seen);
+    printf("core after rename: dumped=%d named=%d\n", dumped, !strcmp(seen, now));
+    unlink(now);
+    fflush(stdout);
+    return 0;
+}
+static int rename_names_case(void) {
+    char dir[] = "/tmp/rename-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char d1[64], d2[64], data[80], data2[80], moved[80], prog[80];
+    snprintf(d1, sizeof d1, "%s/d1", dir);
+    snprintf(d2, sizeof d2, "%s/d2", dir);
+    snprintf(data, sizeof data, "%s/data", d1);
+    snprintf(data2, sizeof data2, "%s/data2", d1);
+    snprintf(moved, sizeof moved, "%s/data2", d2);
+    if (mkdir(d1, 0755)) return 81;
+    int fd = open(data, O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ftruncate(fd, 4096)) return 82;
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 83;
+    char seen[4096];
+    if (rename(data, data2)) return 84;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping after file rename: %d\n", !strcmp(seen, data2));
+    if (rename(d1, d2)) return 85;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping after directory rename: %d\n", !strcmp(seen, moved));
+    if (unlink(moved)) return 86;
+    char marked[128];
+    snprintf(marked, sizeof marked, "%s (deleted)", moved);
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping after unlink: %d\n", !strcmp(seen, marked));
+    munmap(map, 4096);
+    /* A copy of this program, run from d2, renames itself. */
+    snprintf(prog, sizeof prog, "%s/prog", d2);
+    int from = open("/proc/self/exe", O_RDONLY), to = open(prog, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    if (from < 0 || to < 0) return 87;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return 88;
+    close(from);
+    close(to);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char *argv[] = {prog, "rename-names-child", prog, NULL};
+        execv(prog, argv);
+        _exit(89);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    unlink(prog);
+    rmdir(d2);
+    rmdir(dir);
+    return 0;
+}
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
    faults a task took (mm/memory.c mm_account_fault, current->min_flt),
    its own accesses' and those of get_user_pages for it: mlock's
@@ -38309,6 +38452,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "context-switches")) return context_switches_case();
     if (!strcmp(mode, "exec-names")) return exec_names_case();
     if (!strcmp(mode, "exec-names-child")) return exec_names_child();
+    if (!strcmp(mode, "rename-names")) return rename_names_case();
+    if (!strcmp(mode, "rename-names-child")) return rename_names_child();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();

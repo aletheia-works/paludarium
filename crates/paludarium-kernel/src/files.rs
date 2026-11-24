@@ -8692,6 +8692,26 @@ fn opened_path(d: &Descriptor) -> Vec<u8> {
 /// file is now, or where it was opened if no name reaches it there (the
 /// mapping marks that itself), or a memfd's own path. `None` if the file
 /// cannot tell.
+/// What a mapping of `d`'s file, whose page cache is file `key`'s, shows:
+/// a memfd's fixed name, or where the file is now, from its description's
+/// place, which renames and removals move from then on as they move the
+/// description's (`d_path` of the mapping's dentry).
+pub(crate) fn mapped_name(
+    c: &Context<'_>,
+    d: &Descriptor,
+    key: crate::page_cache::Key,
+) -> Option<crate::page_cache::FileName> {
+    if d.file
+        .as_any()
+        .is_some_and(|v| v.is::<crate::memfd::Memfd>())
+    {
+        return mapped_path(c, d).map(crate::page_cache::FileName::Fixed);
+    }
+    let path = d.file.guest_path_hint().or_else(|| mapped_path(c, d))?;
+    Some(crate::page_cache::FileName::Moving(
+        c.files.caches.keep_place(key, &path),
+    ))
+}
 pub(crate) fn mapped_path(c: &Context<'_>, d: &Descriptor) -> Option<Vec<u8>> {
     if let Some(memfd) = d
         .file

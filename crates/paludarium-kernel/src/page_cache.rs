@@ -540,15 +540,19 @@ impl Drop for Mapped {
 }
 
 impl FileCache {
+    /// The device and inode of the file.
+    pub(crate) fn key(&self) -> Key {
+        self.key
+    }
     /// The pages for a new mapping of `[offset, offset+len)` of `file`, with
     /// the pages of the file's first `size` bytes filled from it where the
     /// cache has none. A mapping that `may_write` keeps `file` to write the
     /// pages back through, unless the cache has a handle already. `name` is
-    /// the file's path ([`FilePages`]).
+    /// what the mapping shows ([`FileName`]).
     pub(crate) fn map(
         self: &Arc<Self>,
         file: &Arc<dyn FileHandle>,
-        name: Option<Vec<u8>>,
+        name: Option<FileName>,
         offset: u64,
         len: u64,
         may_write: bool,
@@ -589,7 +593,7 @@ impl FileCache {
     pub(crate) fn map_private(
         self: &Arc<Self>,
         file: &Arc<dyn FileHandle>,
-        name: Option<Vec<u8>>,
+        name: Option<FileName>,
     ) -> SharedPages {
         self.pages
             .with_owner(Arc::new(Mapped {
@@ -654,12 +658,21 @@ impl FileCache {
     }
 }
 
+/// The name a mapping of a file shows ([`FilePages`]'s `name`), as Linux's
+/// `d_path` of the mapping's dentry gives it: one that does not change (a
+/// memfd's), or where the file is now, which renames move and removals
+/// mark ([`PageCaches::keep_place`]).
+pub(crate) enum FileName {
+    Fixed(Vec<u8>),
+    Moving(Arc<Mutex<Place>>),
+}
+
 /// A mapped file as the MMU reads it ([`paludarium_mmu::PageSource`]), with
-/// the size its page cache keeps and the path it was mapped by.
+/// the size its page cache keeps and the name it shows.
 pub(crate) struct FilePages {
     file: Arc<dyn FileHandle>,
     cache: Arc<FileCache>,
-    name: Option<Vec<u8>>,
+    name: Option<FileName>,
     /// The file is a `memfd_secret` file, whose own handle `file` is not.
     secret: bool,
     /// What the pages of a `memfd_secret` file charge as faults bring
@@ -670,7 +683,7 @@ pub(crate) struct FilePages {
 impl FilePages {
     pub(crate) fn new(
         file: &Arc<dyn FileHandle>,
-        name: Option<Vec<u8>>,
+        name: Option<FileName>,
         cache: &Arc<FileCache>,
         secret: bool,
         charge: Option<Arc<crate::memfd::SecretCharge>>,
@@ -714,11 +727,15 @@ impl paludarium_mmu::PageSource for FilePages {
     fn linked(&self) -> bool {
         self.file.stat().map_or(true, |stat| stat.links > 0)
     }
-    /// Its path, marked ` (deleted)` once no name links it, as Linux's
-    /// `d_path` marks it.
+    /// Where its file is now, marked ` (deleted)` once the name it had is
+    /// removed or nothing links it, as Linux's `d_path` marks an unlinked
+    /// dentry.
     fn name(&self) -> Option<Vec<u8>> {
-        let mut name = self.name.clone()?;
-        if !self.linked() {
+        let (mut name, unlinked) = match self.name.as_ref()? {
+            FileName::Fixed(name) => (name.clone(), false),
+            FileName::Moving(place) => Place::at(place),
+        };
+        if unlinked || !self.linked() {
             name.extend_from_slice(b" (deleted)");
         }
         Some(name)

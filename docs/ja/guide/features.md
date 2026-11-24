@@ -4135,8 +4135,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。
   `perf record` が CPU ごとに開くような、一つの CPU のスレッドのイベントは、スレッドが
   その CPU にいる間だけ数えて動き（`event_filter_match`）、有効な時間はその間ずっと
-  進みます。移動はスレッドが移った先の CPU で数え、`sched_setaffinity` は戻る前に
-  スレッドを移します。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
+  進みます。移動はスレッドが移った先の CPU で数え、`sched_setaffinity` は、ほかの
+  スレッドのものも、戻る前にスレッドを移します（その前に眠ったことは眠った CPU で
+  数えます）。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
   キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
   イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
   要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った

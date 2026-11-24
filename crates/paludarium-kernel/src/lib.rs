@@ -249,6 +249,8 @@ pub(crate) struct Usage {
     /// Its faults, switches and migrations on each CPU, for the `perf`
     /// events of one CPU ([`CpuCounts`]).
     pub(crate) per_cpu_counts: std::sync::Mutex<CpuCounts>,
+    /// It runs on a virtual CPU of `rseq`, which no CPU mask moves.
+    pub(crate) virtual_cpu: std::sync::atomic::AtomicBool,
 }
 
 /// What a thread's [`Usage`] counted on each CPU: its faults in its own
@@ -298,6 +300,36 @@ impl Usage {
             // What it counted before it was first seen is the first CPU's.
             None => counts.on = Some((cpu, [0; 4])),
         }
+    }
+    /// Another thread's `sched_setaffinity` left it the mask whose lowest
+    /// CPU is `cpu`: Linux moves a running thread there before the call
+    /// returns (`__set_cpus_allowed_ptr`), so what it counts from now is
+    /// that CPU's, and its next account counts the migration there. One on
+    /// a virtual CPU of `rseq` stays where it is.
+    pub(crate) fn moved_to(&self, cpu: u32) {
+        if !self.virtual_cpu.load(std::sync::atomic::Ordering::SeqCst) {
+            self.arrive(cpu);
+        }
+    }
+    /// `n` switches, just counted, that it made on `cpu`: they count there
+    /// even if it has been moved from it since.
+    fn switched_on(&self, cpu: u32, n: u64) {
+        let mut counts = self
+            .per_cpu_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((on, since)) = counts.on.as_mut() else {
+            return;
+        };
+        if *on == cpu {
+            return;
+        }
+        since[2] = since[2].saturating_add(n);
+        let cpu = cpu as usize;
+        if counts.done.len() <= cpu {
+            counts.done.resize(cpu + 1, [0; 4]);
+        }
+        counts.done[cpu][2] = counts.done[cpu][2].saturating_add(n);
     }
     /// What it counted on `cpu`, as [`CpuCounts`] orders it.
     pub(crate) fn counts_on(&self, cpu: u32) -> [u64; 4] {
@@ -424,6 +456,12 @@ pub(crate) fn account_cpu(
     let switches = paludarium_host::switches::take();
     if switches != 0 {
         usage.switches.fetch_add(switches, Ordering::SeqCst);
+        // Its sleeps since its last account were on the CPU it was on
+        // then, though another thread's `sched_setaffinity` moved its
+        // counts since ([`Usage::moved_to`]).
+        if let Some((was, _)) = account.on {
+            usage.switched_on(was, switches);
+        }
     }
     // The CPU it runs on: its virtual one with `rseq`, else the lowest its
     // mask allows (`getcpu`), looked up again only when a mask changed.
@@ -435,6 +473,7 @@ pub(crate) fn account_cpu(
     };
     let was = account.on.replace(seen).map(|(was, _)| was);
     usage.last_cpu.store(seen.0, Ordering::SeqCst);
+    usage.virtual_cpu.store(seen.1.is_none(), Ordering::SeqCst);
     // What it counted until now is the CPU's it was on, and a migration the
     // new one's.
     usage.arrive(seen.0);

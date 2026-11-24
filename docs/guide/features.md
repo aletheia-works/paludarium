@@ -4783,7 +4783,8 @@ kernel.
   each, counts and runs only while the thread is on that CPU
   (`event_filter_match`), and is enabled all the while; a migration counts
   on the CPU the thread comes to, and `sched_setaffinity` moves the thread
-  before it returns. Branch sampling or the XMM registers of one is
+  before it returns, another thread's too (a sleep it made before counts
+  where it slept). Branch sampling or the XMM registers of one is
   `EOPNOTSUPP`. Hardware, cache and raw events are `ENOENT`, as on a machine without a
   PMU. An event of another process needs `CAP_PERFMON` or to be able to
   read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the

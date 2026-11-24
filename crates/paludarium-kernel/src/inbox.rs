@@ -357,6 +357,14 @@ impl SignalInbox {
             .count();
         (set, coming as u64)
     }
+    /// Whether a signal `fatal` picks is queued, without taking it in.
+    pub(crate) fn queued_any(&self, fatal: &dyn Fn(i32) -> bool) -> bool {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|s| fatal(s.number))
+    }
     /// Drops the queued instances of signal `number`.
     pub(crate) fn purge(&self, number: i32) {
         self.queue

@@ -809,6 +809,10 @@ impl paludarium_mmu::PageSource for FilePages {
     fn secret(&self) -> bool {
         self.secret
     }
+    /// A file of a tmpfs mount with `huge=`.
+    fn huge_placement(&self) -> bool {
+        self.file.huge_placement()
+    }
     /// A memfd that is not secret (Linux's `vma_is_shmem`).
     fn shmem(&self) -> bool {
         !self.secret && self.file.shmem_pages()

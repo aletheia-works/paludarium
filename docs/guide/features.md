@@ -611,9 +611,20 @@ kernel.
   (45 at first) are root's files of mode 0644, which take any `int`
   (`proc_dointvec`).
 
-- A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
-  `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
-  at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
+- A pipe holds 16 buffers of a page each (64 KiB), as on Linux, and
+  `fcntl`'s `F_SETPIPE_SZ` and `F_GETPIPE_SZ` resize and report it like
+  `pipe_set_size`: a power of two of at least a page, `EBUSY` below the
+  buffers in use and `EINVAL` past 2³¹. A write's bytes past whole pages
+  join the last buffer where it has room, and the rest go into new
+  buffers, as `anon_pipe_write` places them; `splice`, `tee` and
+  `vmsplice` make buffers of their own, which no write joins.
+
+- A pipe's packet mode: a write end with `O_DIRECT` (`pipe2`, or
+  `F_SETFL`, which `F_GETFL` shows) writes each page as a packet of its
+  own, and a read ends at the end of a packet and drops the rest of it.
+  Packets fill a buffer each, so 16 fill a pipe however small they are.
+  `splice` and `tee` to another pipe keep them; a splice to a file takes
+  bytes across them.
 
 - A `SOCK_DGRAM` pair keeps message boundaries like `SOCK_SEQPACKET`, but has
   no end of file: when the peer closes, reads wait and the next send gets
@@ -1139,7 +1150,13 @@ kernel.
   others on memory it registered, as Linux's `fs/userfaultfd.c`. One that
   the kernel's own faults reach as well (without `UFFD_USER_MODE_ONLY`)
   needs `CAP_SYS_PTRACE` unless `vm.unprivileged_userfaultfd` is 1
-  (`EPERM`), checked before the flags (`EINVAL`). `/dev/userfaultfd`, a
+  (`EPERM`), checked before the flags (`EINVAL`). Those reach it as an
+  instruction's do: a system call's own copy to or from a registered page
+  waits for it, through any signal that is not fatal, as Linux retries a
+  kernel fault (`fault_signal_pending`), and the copy goes on once the page
+  is filled; a SIGKILL, the process's exit or the context's release ends
+  the wait with `EFAULT`, as does `UFFD_USER_MODE_ONLY` or
+  `UFFD_FEATURE_SIGBUS` at once. `/dev/userfaultfd`, a
   misc device of root's of mode 0600 (`userfaultfd_misc`, whose minor
   number Linux gives at boot), makes one with its only operation, the
   ioctl `USERFAULTFD_IOC_NEW`, of the flags in the low 32 bits of its
@@ -1671,9 +1688,10 @@ kernel.
 
 - A mapping that grows down, the main stack or private anonymous memory that
   `mmap` made with `MAP_GROWSDOWN` (`VmFlags` shows `gd`), grows as Linux's
-  `expand_downwards` makes it: an access to an unmapped page below it, or a
-  signal frame written there, extends it down to that page, and the access is
-  made again. It does not grow below `mmap_min_addr` (64 KiB), within the
+  `expand_downwards` makes it: an access to an unmapped page below it, a
+  signal frame written there, or a system call's own copy there (as
+  `do_user_addr_fault` serves a kernel access), extends it down to that
+  page, and the access is made again. It does not grow below `mmap_min_addr` (64 KiB), within the
   guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
   grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,
   locked, past `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`; the access then gives
@@ -2117,7 +2135,8 @@ kernel.
   `MAP_FIXED` places a mapping of such a file of 2 MiB or more, unless
   at a free hint, at a 2 MiB boundary, or as far past one as its offset
   is past one (`shmem_get_unmapped_area`), so that a fault of it can take
-  a 512-page folio. The files are held as `shmem`
+  a 512-page folio; `mremap` moves one there too, shared or private
+  (`vrm_set_new_addr` asks the file). The files are held as `shmem`
   counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,
@@ -2752,7 +2771,25 @@ kernel.
     the named end's link, which must be up, and refuses one that is an
     address of the namespace, a broadcast or a group (`EINVAL`). Its
     packets go to the gateway's neighbour where a route of link scope
-    reaches the gateway (`rt_uses_gateway`), else to their destination's. An output lookup that goes through an end leaves from its first
+    reaches the gateway (`rt_uses_gateway`), else to their destination's.
+    A route's `RTA_MULTIPATH` makes one route of its next hops
+    (`fib_get_nhs`), each checked as a route's next hop of its own device,
+    gateway and flags (`fib_check_nh`), with its weight (`rtnh_hops` + 1):
+    `EINVAL` for data past them, a hop `RTNH_F_DEAD` or
+    `RTNH_F_LINKDOWN`, a gateway shorter than an address, a first hop not
+    of the request's `RTA_OIF` or `RTA_GATEWAY`, a kind that rejects, and
+    more than one of host scope. Dumps and notifications give its hops in
+    `RTA_MULTIPATH`, each with its flags, weight less one, device and
+    gateway, and its `rtm_flags` the route's own, `RTNH_F_LINKDOWN` where
+    all its hops are; one of one hop is a route of one. Another of other
+    hops or weights is another route; the same again is `EEXIST`. A hop
+    whose end goes down turns `RTNH_F_DEAD` and `RTNH_F_LINKDOWN`,
+    without a word, which lookups pass over, until the end comes up
+    (`fib_sync_down_dev`, `fib_sync_up`); one without its carrier
+    `RTNH_F_LINKDOWN`; a route whose hops are all dead goes, as one does
+    through an end that goes away. A removal naming a device or gateway
+    matches a route's first hop, and one with `RTA_MULTIPATH` each of its
+    hops in turn (`fib_nh_match`). An output lookup that goes through an end leaves from its first
     primary address, else from the first of the other devices' in the
     order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
     without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
@@ -3139,10 +3176,10 @@ kernel.
     a local one goes out through `lo`. A multicast one is `EMSGSIZE`, as
     Linux's multicast routing knows no device of the reply it fills
     (`ip6mr_get_route`). The source, the flow label (`RTA_FLOWLABEL`)
-    and the protocol choose among a multipath route's hops, as
-    `fib6_select_path` hashes them; the mark, the user ID and the ports
-    choose among policy rules, which there are none of, so they change
-    nothing.
+    and the protocol choose among an IPv6 multipath route's hops, as
+    `fib6_select_path` hashes them, and of an IPv4 one's a lookup takes
+    the first not dead; the mark, the user ID and the ports choose among
+    policy rules, which there are none of, so they change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed
@@ -3775,22 +3812,22 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
-  `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
+  `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mem`, `mounts`, `mountinfo`,
   `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them: root of the user namespace its program runs in, or the first
   one's where that namespace maps no root; the directory, `task` and `fdinfo` (0555) are the process's
   either way, and `/proc/self` itself is root's. `stat` shows that owner and
-  the mode, 0400 for `environ`, `auxv`, `pagemap`, `io`, `personality` and `syscall`, 0644 for `comm`, 0200 for
-  `clear_refs` and 0444 for the other files.
+  the mode, 0400 for `environ`, `auxv`, `pagemap`, `io`, `personality` and `syscall`, 0644 for `comm`, 0600 for
+  `mem`, 0200 for `clear_refs` and 0444 for the other files.
   `fstat` of an open file shows its owner as of the last lookup of its path
   (an open, a `stat`, by any process), as Linux's inode, which each lookup
   of the path an open file pins brings up to date (`pid_revalidate`); of
   the open directory and its `ns`, the owner at that moment, as Linux's
   `pid_getattr` asks it. An open checks the mode for that owner, as Linux's
   `generic_permission` does, so opening one for writing is `EACCES` without
-  `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv` or `pagemap` once the
+  `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv`, `pagemap` or `mem` once the
   process is not dumpable; a write to one opened for writing (root's) is
   `EINVAL`, but to `comm`, which renames the thread as Linux's
   `comm_write` does: to its first 15 bytes, up to a NUL, taking the whole
@@ -3838,7 +3875,7 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
-  `comm`, `syscall` (0400), `maps`, `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
+  `comm`, `syscall` (0400), `maps`, `mem` (0600), `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
   `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
@@ -3859,7 +3896,7 @@ kernel.
   as in `task/<pid>`. Its `fd` and `fdinfo` list nothing, so `execveat`
   through `/proc/self/fd/<n>` or `/dev/fd/<n>` is `ENOENT`; `maps`, `smaps` and
   `cmdline` read nothing; its files but its directory are root's, as a
-  zombie's are (see limitations), so `environ`, `auxv` and `pagemap` are
+  zombie's are (see limitations), so `environ`, `auxv`, `pagemap` and `mem` are
   `EACCES`, and `ESRCH` for root; `smaps_rollup` is `ESRCH` for any reader
   (`smaps_rollup_open`); `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
@@ -3871,7 +3908,7 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `exe`, `cwd`,
+  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `mem`, `exe`, `cwd`,
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
@@ -3887,7 +3924,7 @@ kernel.
   file's mode for that owner before anything else, as Linux's
   `generic_permission` does (`EACCES`): writing needs `CAP_DAC_OVERRIDE`
   but for `comm`, `uid_map`, `gid_map` and `setgroups` (0644), and
-  reading `environ`, `auxv` or `pagemap` needs the owner or
+  reading `environ`, `auxv`, `pagemap` or `mem` needs the owner or
   `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner as this
   process's own do (above). `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
   and looked in as its mode (0500) lets the reader, as Linux's
@@ -3901,7 +3938,7 @@ kernel.
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
-  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
+  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `mem`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
@@ -3912,7 +3949,7 @@ kernel.
   `maps` and `smaps` are empty, and open for any reader their mode lets,
   as Linux's `proc_mem_open` checks the reader only of a process with
   memory; its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
-  `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
+  `environ`, `auxv`, `pagemap` and `mem` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
   process with no memory before they check the reader, nor does its
   `smaps_rollup` (`ESRCH` for any reader, `smaps_rollup_open`), as for a
@@ -4378,6 +4415,24 @@ kernel.
   - Any other ioctl is `ENOTTY`, and a scan once the address space is gone
     is `ESRCH`.
 
+- `/proc/<pid>/mem` (mode 0600, size 0, a thread's too) reads and writes
+  the task's memory at the address its position gives, as Linux's `mem_rw`
+  does through `access_remote_vm` with `FOLL_FORCE`: a page whatever its
+  protection, a private one written to a copy of its own, a page at a time.
+  A call that moves no byte (no page there, a `perf` ring's or a
+  `memfd_secret` file's, which `get_user_pages` refuses) is `EIO`, and one
+  that stops later gives what it moved. `lseek` takes `SEEK_SET` and
+  `SEEK_CUR` only (`EINVAL`), and its positions are unsigned
+  (`FOP_UNSIGNED_OFFSET`): `lseek` goes past `i64::MAX`, and a read or
+  write there moves bytes at that address; `pread64` and `pwrite64` refuse
+  such an offset (`EINVAL`), as Linux v7.0 does (see limitations). An open
+  takes the memory the task has then, which the file keeps: after an
+  `execve` or the end of the task, that memory is gone and nothing moves.
+  It is the reader's own
+  or one it may attach to (`mm_access` with `PTRACE_MODE_ATTACH` and the
+  filesystem IDs: `EACCES`), and a task with no memory (a zombie) is
+  `ESRCH`.
+
 - `/proc/<pid>/clear_refs` (mode 0200, size 0, a thread's too), as Linux's
   `clear_refs_write`: a write's first 12 bytes at most, which is what it
   returns, are a number as `kstrtoint` reads one in base 10 (spaces
@@ -4813,7 +4868,8 @@ kernel.
   each, counts and runs only while the thread is on that CPU
   (`event_filter_match`), and is enabled all the while; a migration counts
   on the CPU the thread comes to, and `sched_setaffinity` moves the thread
-  before it returns. Branch sampling or the XMM registers of one is
+  before it returns, another thread's too (a sleep it made before counts
+  where it slept). Branch sampling or the XMM registers of one is
   `EOPNOTSUPP`. Hardware, cache and raw events are `ENOENT`, as on a machine without a
   PMU. An event of another process needs `CAP_PERFMON` or to be able to
   read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the
@@ -6026,7 +6082,23 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
-    while it is closed or listening).
+    while it is closed or listening). `SO_BINDTODEVICE` takes a device's
+    name, of at most 15 bytes (`ENODEV` for one there is not), none or an
+    empty one for no device, and `SO_BINDTOIFINDEX` an index (`EINVAL` for
+    a negative one, any other taken); without `CAP_NET_RAW` a socket bound
+    to a device stays so (`EPERM`, `sock_bindtoindex_locked`). Read back,
+    `SO_BINDTODEVICE` gives the name in room for a whole one (`EINVAL` for
+    less, `ENODEV` for an index of no device), nothing for none. Bound so,
+    a socket takes only what comes in on that device, or for one bound to
+    no device anything, one bound to it before one bound to none and
+    after a connected one (`compute_score`); a packet to the namespace's
+    own address comes in on that address's device (its local route's, or
+    `lo` for none), for IPv4 as for IPv6. Its IPv4 packets go
+    by the routes through the device only, and where none goes, on link
+    through it; a group of 224.0.0.0/24 or the limited broadcast address
+    straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`
+    once it has gone, `ENETUNREACH` while it is down. A connection
+    accepted is bound as its listener.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
     as the room asks (`tcp_get_info`): a listener's state, connections
     waiting and backlog; a socket that has not connected, Linux's
@@ -6090,7 +6162,8 @@ one only with an `--allow-net`.
   `EADDRINUSE` for a port another socket holds on an address both cover (a
   listener's, a connection it accepted, a client's), unless both set
   `SO_REUSEADDR` and the other does not listen, or both set
-  `SO_REUSEPORT`. An IPv6 socket on `::` holds the port for IPv4 too,
+  `SO_REUSEPORT`, or the two are bound to other devices
+  (`inet_bind_conflict`, `udp_lib_lport_inuse`). An IPv6 socket on `::` holds the port for IPv4 too,
   unless `IPV6_V6ONLY`; binding to another IPv6 address that is not an
   IPv4 one sets `IPV6_V6ONLY`, as `__inet6_bind` does. A link-local
   address, or a group of the node or the link (which only a UDP socket

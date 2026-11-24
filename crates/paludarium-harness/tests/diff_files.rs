@@ -3,6 +3,22 @@
 #[path = "support/files.rs"]
 mod support;
 use paludarium_harness::{compare, run_emulated, run_native, workspace_root};
+/// Builds the files guests into `out` once for the whole test binary. A
+/// second build while another test runs a guest would rewrite a running
+/// program (`ETXTBSY`, "Text file busy"), so every test goes through this.
+fn build(out: &std::path::Path) {
+    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
+        assert!(
+            std::process::Command::new("bash")
+                .arg(workspace_root().join("tests/guests/files/build.sh"))
+                .arg(out)
+                .status()
+                .unwrap()
+                .success()
+        )
+    });
+}
 fn case(name_arg: &'static str, id: usize) {
     // Native guests use the same absolute fixture names in this process's /tmp.
     // Keep each bounded native/emulated pair together, even under cargo's
@@ -14,17 +30,7 @@ fn case(name_arg: &'static str, id: usize) {
     let out = workspace_root().join("target/guests/files");
     let name = name_arg;
     if std::env::var("PALUDARIUM_FILES_CHILD").is_err() {
-        static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        BUILT.get_or_init(|| {
-            assert!(
-                std::process::Command::new("bash")
-                    .arg(workspace_root().join("tests/guests/files/build.sh"))
-                    .arg(&out)
-                    .status()
-                    .unwrap()
-                    .success()
-            )
-        });
+        build(&out);
     }
     support::bounded(name, || {
         let name = format!("files-{id}");
@@ -146,7 +152,9 @@ fn run_mounted(
     let host = std::sync::Arc::new(MountedHost {
         record: RecordingHost::new(),
     });
-    let session = paludarium::Session::new(config, host.clone()).unwrap();
+    let session =
+        paludarium_harness::with_test_jit(paludarium::Session::new(config, host.clone()).unwrap())
+            .unwrap();
     let start = std::time::Instant::now();
     let status = session.run().unwrap();
     let stop = session.termination_detail();
@@ -165,14 +173,7 @@ cases!(host_read_write=>3,host_hard_link=>4,host_symlink=>5,host_rename=>6,host_
 fn host_signed_mtime_stat_fstat() {
     let name = "host_signed_mtime_stat_fstat";
     let out = workspace_root().join("target/guests/files");
-    assert!(
-        std::process::Command::new("bash")
-            .arg(workspace_root().join("tests/guests/files/build.sh"))
-            .arg(&out)
-            .status()
-            .unwrap()
-            .success()
-    );
+    build(&out);
     support::bounded(name, || {
         let root =
             std::env::temp_dir().join(format!("paludarium-files-mtime-{}", std::process::id()));
@@ -227,7 +228,10 @@ fn host_signed_mtime_stat_fstat() {
             let host = std::sync::Arc::new(MountedHost {
                 record: RecordingHost::new(),
             });
-            let session = paludarium::Session::new(config, host.clone()).unwrap();
+            let session = paludarium_harness::with_test_jit(
+                paludarium::Session::new(config, host.clone()).unwrap(),
+            )
+            .unwrap();
             let start = std::time::Instant::now();
             let status = session.run().unwrap();
             let emulated = paludarium_harness::Outcome {

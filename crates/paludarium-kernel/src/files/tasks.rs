@@ -516,6 +516,41 @@ pub(super) fn pagemap(
         owner,
     )))
 }
+/// `mem` of the task, opened with `flags`, as Linux's `mem_open` takes it
+/// (`proc_mem_open` with `PTRACE_MODE_ATTACH`, then `mm_access` with the
+/// filesystem IDs): `ESRCH` once it has no memory; `EACCES` unless the
+/// memory is the reader's own or the reader may attach to the task
+/// ([`crate::processes::may_attach_task`], which a thread of its own
+/// process always may). The file keeps that memory, which it reads and
+/// writes until it is gone ([`crate::proc::MemFile`]).
+pub(super) fn mem(
+    c: &Context<'_>,
+    task: &Task,
+    flags: u32,
+    owner: crate::proc::Owner,
+) -> Result<std::sync::Arc<dyn paludarium_host::FileHandle>, Errno> {
+    // The reader's own process's memory is the reader's, but for a leader
+    // that is gone, which has none.
+    let memory = if task.pid == c.process.pid && !task.gone {
+        c.mem.view()
+    } else {
+        task.memory().ok_or(Errno(3))?.clone() // ESRCH
+    };
+    let own = task.pid == c.process.pid || memory.is_of(c.mem);
+    if !own
+        && !crate::processes::may_attach_task(
+            c.processes,
+            (c.process.pid, &c.process.credentials),
+            (task.pid, &task.view, &task.public),
+            false,
+        )
+    {
+        return Err(Errno::EACCES);
+    }
+    Ok(std::sync::Arc::new(crate::proc::MemFile::open(
+        memory, flags, owner,
+    )))
+}
 /// `clear_refs` of the task, opened with `flags`: a write acts on the
 /// address space the task has then (`get_task_mm`), as Linux's
 /// `clear_refs_write`, and is `ESRCH` once it is gone.
@@ -1093,6 +1128,11 @@ pub(super) fn stat(
         TaskEntry::Wchan => crate::proc::stat(0),
         // 0200, as Linux's.
         TaskEntry::ClearRefs => crate::proc::write_only_stat(),
+        // 0600, as Linux's.
+        TaskEntry::Mem => FileStat {
+            mode: 0o100_600,
+            ..crate::proc::stat(0)
+        },
         // 0644, which their owner may write.
         TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => FileStat {
             mode: 0o100_644,

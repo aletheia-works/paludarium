@@ -1282,6 +1282,9 @@ impl ThreadGroup {
             .get(&tid)
             .cloned()
     }
+    /// `sched_setaffinity`'s new mask for thread `tid`: what the thread
+    /// counts from now is its new lowest CPU's ([`crate::Usage::moved_to`]),
+    /// though it looks the CPU up again only at its next account.
     pub(crate) fn set_affinity(&self, tid: u32, mask: Vec<u64>) {
         self.affinity
             .lock()
@@ -1289,6 +1292,9 @@ impl ThreadGroup {
             .insert(tid, mask);
         self.affinity_changes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(usage) = self.last_thread_usage(tid) {
+            usage.moved_to(self.lowest_cpu(tid));
+        }
     }
     /// Changes with every [`Self::set_affinity`].
     pub(crate) fn affinity_generation(&self) -> u64 {
@@ -2045,6 +2051,46 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .notices()
     }
+    /// `fatal_signal_pending` for a thread that cannot take its signals in
+    /// (one in a kernel access's wait for a `userfaultfd`, while its system
+    /// call holds its state): the process exits, or SIGKILL or a signal
+    /// whose default action ends the process and that `mask` does not
+    /// block was sent to it or to `inbox`'s thread, as Linux's
+    /// `complete_signal` makes such a signal a SIGKILL for every thread.
+    pub(crate) fn fatal_pending(&self, inbox: &SignalInbox, mask: u64) -> bool {
+        if self.status().is_some() {
+            return true;
+        }
+        let actions = self
+            .shared_actions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let fatal = |number: i32| {
+            number == 9
+                || (1..=64).contains(&number)
+                    && mask & (1u64 << (number - 1)) == 0
+                    && actions.get(&number).map_or(0, |a| a.handler) == 0
+                    && !matches!(number, 17..=23 | 28)
+        };
+        if self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .iter()
+            .any(|s| fatal(s.number))
+        {
+            return true;
+        }
+        let process = Arc::clone(
+            &self
+                .process_inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        inbox.queued_any(&fatal) || process.queued_any(&fatal)
+    }
     /// Takes in the process's signals; whether a signal has been sent to the
     /// process inbox since this thread last did, which is what woke a
     /// thread its own inbox has nothing for.
@@ -2676,6 +2722,7 @@ impl Kernel {
             cancellation: inbox.wake_token(),
             inbox: inbox.clone(),
             group: self.group.clone(),
+            copies: None,
             pending_child: None,
             processes: self.processes.clone(),
             spawn_memory: None,

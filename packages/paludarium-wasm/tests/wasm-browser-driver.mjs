@@ -48,8 +48,9 @@ const RETRY_PAUSE_MS = 2000;
 // with SIGKILL only on CI, where every Safari is the job's own; elsewhere it may be the person's own browser, so it
 // is only logged. The session is asked for after that either way. The tests shorten the bounds and set `kill`.
 export const safariExit = { waitMs: 15000, killWaitMs: 5000, kill: process.env.GITHUB_ACTIONS === "true" };
-function safariPids() {
-  const probe = spawn("/usr/bin/pgrep", ["-x", "Safari"], { stdio: ["ignore", "pipe", "ignore"] });
+function safariPids() { return pgrep(["-x", "Safari"]); }
+function pgrep(args) {
+  const probe = spawn("/usr/bin/pgrep", args, { stdio: ["ignore", "pipe", "ignore"] });
   let out = "";
   probe.stdout.on("data", bytes => { out += bytes; });
   return new Promise(resolve => {
@@ -118,6 +119,24 @@ async function quitLaunched(pids) {
     const exited = await exitOf(pid, Math.max(0, start + safariExit.waitMs - Date.now())) || !running(pid);
     return { pid, answer, exited, waited_ms: Date.now() - start };
   }));
+}
+
+// safaridriver serves WebDriver through a helper, com.apple.WebDriver.HTTPService, which registers with the per-user
+// daemon webinspectord. webinspectord shuts itself down when its last client disconnects and may take seconds to exit.
+// A driver started meanwhile has its helper connect to the exiting webinspectord ("webinspectord validation failed"),
+// the helper shuts down, and safaridriver exits 1 with no output (2 of 35 CI jobs after #965, once the session's Safari,
+// another client, quit before the driver stopped). So after safaridriver stops, the helper and each webinspectord that
+// were running before the stop are each waited for with `caffeinate -w`, all within safariExit.waitMs, and logged.
+// Nothing is killed: one that stays (webinspectord serving another client) is logged, and the next driver starts anyway.
+function driverHelperPids() {
+  return Promise.all([pgrep(["-f", "com.apple.WebDriver.HTTPService"]), pgrep(["-x", "webinspectord"])])
+    .then(([helper, webinspectord]) => ({ helper, webinspectord }));
+}
+async function untilDriverHelpersExited(pids) {
+  const start = Date.now(), all = [...pids.helper, ...pids.webinspectord];
+  const exited = await Promise.all(all.map(pid => exitOf(pid, Math.max(0, start + safariExit.waitMs - Date.now()))));
+  const left = all.filter((pid, index) => !exited[index] && running(pid));
+  return { ...pids, exited: left.length === 0, waited_ms: Date.now() - start, ...(left.length > 0 ? { left } : {}) };
 }
 
 async function safari(url, timeout) {
@@ -197,7 +216,10 @@ async function safariAttempt(url, timeout) {
       const launched = (await safariPids()).filter(pid => !exitWait.pids.includes(pid));
       if (launched.length > 0) console.error(JSON.stringify({ safari_quit: await quitLaunched(launched) }));
     }
+    const helpers = await driverHelperPids();
     await stopDriver(driver);
+    if (helpers.helper.length + helpers.webinspectord.length > 0)
+      console.error(JSON.stringify({ webinspectord_exit: await untilDriverHelpersExited(helpers) }));
     if (cleanupError) {
       if (failure) failure.message += `; cleanup: ${cleanupError}`;
       else throw new Error(`Safari cleanup: ${cleanupError}`);

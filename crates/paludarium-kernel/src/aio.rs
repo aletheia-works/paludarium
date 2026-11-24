@@ -1286,6 +1286,7 @@ fn pgetevents(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let old_mask = c.process.signal_mask;
     if let Some(mask) = mask {
         c.process.signal_mask = mask & !crate::signals::unblockable();
+        crate::userfaultfd::mask_changed(c.process.signal_mask);
     }
     let got = get_events(c, a[0], a[1] as i64, a[2] as i64, a[3], until);
     let interrupted = crate::events::signalled(c);
@@ -1294,6 +1295,7 @@ fn pgetevents(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             c.process.wait_restore_mask = Some(old_mask);
         } else {
             c.process.signal_mask = old_mask;
+            crate::userfaultfd::mask_changed(c.process.signal_mask);
         }
     }
     if interrupted && got == 0 {

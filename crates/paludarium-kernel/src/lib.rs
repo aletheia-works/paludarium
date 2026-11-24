@@ -20,6 +20,7 @@ mod signalfd;
 #[cfg(test)]
 mod signalfd_tests;
 mod signals;
+mod skb;
 pub use inbox::SignalInbox;
 mod aio;
 mod bpf;
@@ -251,6 +252,8 @@ pub(crate) struct Usage {
     /// Its faults, switches and migrations on each CPU, for the `perf`
     /// events of one CPU ([`CpuCounts`]).
     pub(crate) per_cpu_counts: std::sync::Mutex<CpuCounts>,
+    /// It runs on a virtual CPU of `rseq`, which no CPU mask moves.
+    pub(crate) virtual_cpu: std::sync::atomic::AtomicBool,
 }
 
 /// What a thread's [`Usage`] counted on each CPU: its faults in its own
@@ -301,6 +304,36 @@ impl Usage {
             None => counts.on = Some((cpu, [0; 4])),
         }
     }
+    /// Another thread's `sched_setaffinity` left it the mask whose lowest
+    /// CPU is `cpu`: Linux moves a running thread there before the call
+    /// returns (`__set_cpus_allowed_ptr`), so what it counts from now is
+    /// that CPU's, and its next account counts the migration there. One on
+    /// a virtual CPU of `rseq` stays where it is.
+    pub(crate) fn moved_to(&self, cpu: u32) {
+        if !self.virtual_cpu.load(std::sync::atomic::Ordering::SeqCst) {
+            self.arrive(cpu);
+        }
+    }
+    /// `n` switches, just counted, that it made on `cpu`: they count there
+    /// even if it has been moved from it since.
+    fn switched_on(&self, cpu: u32, n: u64) {
+        let mut counts = self
+            .per_cpu_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((on, since)) = counts.on.as_mut() else {
+            return;
+        };
+        if *on == cpu {
+            return;
+        }
+        since[2] = since[2].saturating_add(n);
+        let cpu = cpu as usize;
+        if counts.done.len() <= cpu {
+            counts.done.resize(cpu + 1, [0; 4]);
+        }
+        counts.done[cpu][2] = counts.done[cpu][2].saturating_add(n);
+    }
     /// What it counted on `cpu`, as [`CpuCounts`] orders it.
     pub(crate) fn counts_on(&self, cpu: u32) -> [u64; 4] {
         let now = self.counts();
@@ -347,6 +380,28 @@ impl paludarium_mmu::faults::Sink for Usage {
     }
     fn forced(&self) -> &std::sync::atomic::AtomicU64 {
         &self.forced_faults
+    }
+}
+
+/// While it lives, the calling host thread's kernel accesses that fault are
+/// resolved by a [`userfaultfd::KernelCopies`], with the call's signal mask
+/// and `CAP_IPC_LOCK`; then by what was there.
+struct KernelCopies {
+    resolver: Option<Arc<dyn paludarium_mmu::faults::Resolver>>,
+    call: (u64, bool),
+}
+impl KernelCopies {
+    fn install(copies: Arc<userfaultfd::KernelCopies>, mask: u64, ipc_lock: bool) -> Self {
+        Self {
+            call: userfaultfd::enter_call(mask, ipc_lock),
+            resolver: paludarium_mmu::faults::set_resolver(Some(copies)),
+        }
+    }
+}
+impl Drop for KernelCopies {
+    fn drop(&mut self) {
+        paludarium_mmu::faults::set_resolver(self.resolver.take());
+        userfaultfd::leave_call(self.call);
     }
 }
 
@@ -426,6 +481,12 @@ pub(crate) fn account_cpu(
     let switches = paludarium_host::switches::take();
     if switches != 0 {
         usage.switches.fetch_add(switches, Ordering::SeqCst);
+        // Its sleeps since its last account were on the CPU it was on
+        // then, though another thread's `sched_setaffinity` moved its
+        // counts since ([`Usage::moved_to`]).
+        if let Some((was, _)) = account.on {
+            usage.switched_on(was, switches);
+        }
     }
     // The CPU it runs on: its virtual one with `rseq`, else the lowest its
     // mask allows (`getcpu`), looked up again only when a mask changed.
@@ -437,6 +498,7 @@ pub(crate) fn account_cpu(
     };
     let was = account.on.replace(seen).map(|(was, _)| was);
     usage.last_cpu.store(seen.0, Ordering::SeqCst);
+    usage.virtual_cpu.store(seen.1.is_none(), Ordering::SeqCst);
     // What it counted until now is the CPU's it was on, and a migration the
     // new one's.
     usage.arrive(seen.0);
@@ -558,6 +620,8 @@ pub struct Kernel {
     cancellation: Arc<AtomicBool>,
     inbox: Arc<SignalInbox>,
     group: Arc<ThreadGroup>,
+    /// What resolves its calls' faulting copies ([`KernelCopies`]).
+    copies: Option<Arc<userfaultfd::KernelCopies>>,
     pending_child: Option<(Box<Kernel>, Thread)>,
     processes: Arc<Processes>,
     spawn_memory: Option<Arc<AddressSpace>>,
@@ -613,6 +677,7 @@ impl Kernel {
             cancellation: Arc::new(AtomicBool::new(false)),
             inbox: Arc::new(SignalInbox::default()),
             group,
+            copies: None,
             pending_child: None,
             processes,
             spawn_memory: None,
@@ -1377,6 +1442,42 @@ impl Kernel {
         // accesses count as the kernel's, those of the thread's code before
         // it as the thread's own.
         let _faults = KernelFaults::enter(&thread.state);
+        // And its accesses that fault are served as an instruction's are: a
+        // mapping that grows down grows, and a `userfaultfd` is waited for.
+        // Its resolver is kept from call to call, while it serves this one.
+        let copies = match &self.copies {
+            Some(copies)
+                if copies.serves(
+                    mem,
+                    &self.group,
+                    &self.files.readiness,
+                    &self.inbox,
+                    self.process.pid,
+                    thread.tid,
+                ) =>
+            {
+                Arc::clone(copies)
+            }
+            _ => {
+                let copies = Arc::new(userfaultfd::KernelCopies {
+                    mem: mem.view(),
+                    group: Arc::clone(&self.group),
+                    tid: thread.tid,
+                    hub: Arc::clone(&self.files.readiness),
+                    host: Arc::clone(&self.host),
+                    inbox: Arc::clone(&self.inbox),
+                    processes: Arc::clone(&self.processes),
+                    pid: self.process.pid,
+                });
+                self.copies = Some(Arc::clone(&copies));
+                copies
+            }
+        };
+        let _copies = KernelCopies::install(
+            copies,
+            thread.state.signal_mask,
+            thread.state.credentials.capable(1 << 14),
+        );
         // What it waits for in the host while it handles the stop shows it
         // as sleeping (`/proc/<pid>/stat`), and nothing else does.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());

@@ -3,20 +3,26 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::{path::PathBuf, process::Command, sync::OnceLock};
 
-fn case(id: usize) {
-    let root = paludarium_harness::workspace_root();
-    let guests = root.join("target/guests/events");
+/// Builds the events guests once for the whole test binary. A second
+/// build while another test runs a guest would rewrite a running program
+/// (`ETXTBSY`, "Text file busy"), so every test goes through this one.
+fn build(root: &std::path::Path) {
     static BUILT: OnceLock<()> = OnceLock::new();
     BUILT.get_or_init(|| {
         assert!(
             Command::new("bash")
                 .arg(root.join("tests/guests/events/build.sh"))
-                .arg(&guests)
+                .arg(root.join("target/guests/events"))
                 .status()
                 .unwrap()
                 .success()
         );
     });
+}
+fn case(id: usize) {
+    let root = paludarium_harness::workspace_root();
+    let guests = root.join("target/guests/events");
+    build(&root);
     let emulator = std::env::var_os("PALUDARIUM_EVENTS_EMULATOR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("target/debug/paludarium"));
@@ -127,14 +133,7 @@ fn unix_stream() {
 }
 fn named_case(name: &str) {
     let root = paludarium_harness::workspace_root();
-    assert!(
-        Command::new("bash")
-            .arg(root.join("tests/guests/events/build.sh"))
-            .arg(root.join("target/guests/events"))
-            .status()
-            .unwrap()
-            .success()
-    );
+    build(&root);
     assert!(
         Command::new("python3")
             .arg(root.join("scripts/events-native-observe.py"))

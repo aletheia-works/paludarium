@@ -526,6 +526,7 @@ mod linux {
                     | "perf-prctl"
                     | "perf-inherit"
                     | "perf-throttle"
+                    | "perf-software"
             ) {
                 host.measure_cpu_time();
             }

@@ -3070,12 +3070,11 @@ pub(crate) fn advise(
     if end > USER_ADDRESS_LIMIT {
         return Err(Errno::ENOMEM);
     }
-    if advice == MADV_DONTNEED_LOCKED {
-        removing(addr, end);
-        return mem.discard_shared(GuestAddr(addr), length);
-    }
-    if advice == MADV_DONTNEED {
-        return short_of_locked(mem, addr, end, true, |to| {
+    // A `VM_PFNMAP` VMA's pages are not dropped, nor without
+    // `MADV_DONTNEED_LOCKED` a locked one's (`madvise_dontneed_free_valid_vma`).
+    if advice == MADV_DONTNEED_LOCKED || advice == MADV_DONTNEED {
+        let stop = mem.first_undiscardable(GuestAddr(addr), end, advice == MADV_DONTNEED);
+        return short_of(mem, addr, end, stop, true, |to| {
             removing(addr, to);
             mem.discard_shared(GuestAddr(addr), to - addr)
         });
@@ -3247,10 +3246,23 @@ fn short_of_locked(
     discards: bool,
     op: impl FnOnce(u64) -> Result<(), Errno>,
 ) -> Result<(), Errno> {
-    let Some(locked) = mem.first_locked(GuestAddr(addr), end) else {
+    let stop = mem.first_locked(GuestAddr(addr), end);
+    short_of(mem, addr, end, stop, discards, op)
+}
+
+/// The same, short of the mapping `stop` the advice may not take.
+fn short_of(
+    mem: &AddressSpace,
+    addr: u64,
+    end: u64,
+    stop: Option<paludarium_mmu::Mapping>,
+    discards: bool,
+    op: impl FnOnce(u64) -> Result<(), Errno>,
+) -> Result<(), Errno> {
+    let Some(stop) = stop else {
         return op(end);
     };
-    let at = locked.start.0.max(addr);
+    let at = stop.start.0.max(addr);
     if at > addr {
         match op(at) {
             Ok(()) | Err(Errno::ENOMEM) => {}

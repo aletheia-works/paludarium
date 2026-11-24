@@ -297,13 +297,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   時間は、`mmap`、イベントの有効化、リセットのときのもので、Linux はイベントが
   スケジュールされるたびに更新します。`cap_user_time` は設定しません。マッピングの
   確認と置き場所の確認の両方が失敗するときは、ここではマッピングの確認のエラーに
-  なります。メモリ管理がこのマッピング（`VM_PFNMAP`）の Linux の規則を持つまでは、
-  データページへの書き込みは、Linux では `SIGBUS` ですがそのまま書かれます。
-  マッピングの一部をアンマップ、移動、保護の変更でき、Linux は分割を断ります
-  （`EINVAL`）。`MADV_DOFORK` で子に渡せ、Linux は `VM_IO` に対して断ります
-  （`EINVAL`）。`mlock` でロックでき、Linux は `VM_SPECIAL` のマッピングをロックしません。
-  `inherit_stat` は受け付けますが、記録するものがないので、引き継いだイベントの終わりに
-  読み取りの記録は送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
+  なります。`inherit_stat` は受け付けますが、記録するものがないので、引き継いだ
+  イベントの終わりに読み取りの記録は送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。ioctl の `SET_FILTER`、`SET_BPF`、
   `QUERY_BPF`、`MODIFY_ATTRIBUTES` は `ENOTTY` です。`remove_on_exec` は、
   Linux master が 7.2 から（037a3c43edfb）するように、イベントをグループから外し、そうした

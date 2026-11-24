@@ -406,8 +406,10 @@ pub mod vm {
     pub const MAYEXEC: u64 = 1 << 6;
     pub const MAYSHARE: u64 = 1 << 7;
     pub const GROWSDOWN: u64 = 1 << 8;
+    pub const PFNMAP: u64 = 1 << 10;
     pub const MAYBE_GUARD: u64 = 1 << 11;
     pub const LOCKED: u64 = 1 << 13;
+    pub const IO: u64 = 1 << 14;
     pub const SEQ_READ: u64 = 1 << 15;
     pub const RAND_READ: u64 = 1 << 16;
     pub const DONTCOPY: u64 = 1 << 17;
@@ -1922,6 +1924,20 @@ pub trait PageSource: Send + Sync {
     /// moves only whole (`aio_ring_mremap`).
     fn moves(&self, length: u64) -> bool {
         let _ = length;
+        true
+    }
+    /// Whether a VMA of this memory may be split (the VMA's
+    /// `vm_ops->may_split`): a perf event's ring buffer's may not, so that
+    /// an `munmap`, `mprotect`, `mremap`, `madvise` or `mseal` that would
+    /// split it is `EINVAL`.
+    fn splits(&self) -> bool {
+        true
+    }
+    /// Whether a write to the page at `offset` makes it writable (the
+    /// VMA's `vm_ops->pfn_mkwrite`): `false` makes the write a bus error
+    /// (`SIGBUS`), as of a perf event's ring buffer's data pages.
+    fn writable(&self, offset: u64) -> bool {
+        let _ = offset;
         true
     }
     /// Whether the memory is a `memfd_secret` file's (Linux's
@@ -3994,6 +4010,20 @@ impl AddressSpaceData {
                     ..fault(at)
                 });
             }
+            // A write to a page its memory keeps read-only is a bus error
+            // (`vm_ops->pfn_mkwrite`), as to a perf ring buffer's data.
+            if access == Access::Write
+                && let Some(shared) = self.shared_at(page)
+                && shared
+                    .pages
+                    .source()
+                    .is_some_and(|source| !source.writable(page.wrapping_add(shared.shift)))
+            {
+                return Err(Fault {
+                    bus: true,
+                    ..fault(at)
+                });
+            }
             // A write to a page with a uffd-wp marker, which the kernel
             // takes to its `userfaultfd` ([`Self::userfault_for`]); with
             // `WP_ASYNC` the page faults in without the protection.
@@ -4068,6 +4098,18 @@ impl AddressSpaceData {
             return;
         }
         let shared = self.shared_at(page).map(|mapping| mapping.pages.stores());
+        // A page its memory keeps read-only ([`PageSource::writable`]) is
+        // remembered for reads alone, so that each write goes to `check`.
+        let read_only = self.shared_at(page).is_some_and(|mapping| {
+            mapping
+                .pages
+                .source()
+                .is_some_and(|source| !source.writable(page.wrapping_add(mapping.shift)))
+        });
+        let mut prot = p.cached_access();
+        if read_only {
+            prot = Prot(prot.0 & !Prot::WRITE.0);
+        }
         // A file mapping without a file, or whose file has no end, has no end
         // to check, as in `check`. One whose file does not say where it keeps
         // its size stays out.
@@ -4096,7 +4138,7 @@ impl AddressSpaceData {
             }
             thread.tlb.insert(TlbEntry {
                 page,
-                prot: p.cached_access(),
+                prot,
                 frame: TlbFrame::of(&p.frame),
                 fetched: Arc::clone(&p.frame.fetched),
                 cow: p.cow,
@@ -4953,17 +4995,68 @@ impl AddressSpaceData {
         self.mappings.insert(start, head);
         self.mappings.insert(at, tail);
     }
+    /// Whether a split at `at` falls inside a VMA, not at its ends, of
+    /// memory that may not be split ([`PageSource::splits`]), where Linux's
+    /// `__split_vma` fails (`EINVAL`).
+    fn refuses_split(&self, at: u64) -> bool {
+        self.shared
+            .range(..at)
+            .next_back()
+            .is_some_and(|(_, shared)| {
+                at < shared.end && shared.pages.source().is_some_and(|source| !source.splits())
+            })
+    }
+    /// Whether the VMA at `addr` is one of Linux's `VM_SPECIAL`, memory core
+    /// mm does not back: a fixed mapping ([`PageSource::fixed`]) or one of
+    /// `VM_IO`, `VM_PFNMAP` or `VM_MIXEDMAP`.
+    fn special(&self, addr: u64) -> bool {
+        self.shared_at(addr)
+            .and_then(|shared| shared.pages.source())
+            .is_some_and(|source| {
+                source.fixed() || source.vma_flags(0) & (vm::IO | vm::PFNMAP | vm::MIXEDMAP) != 0
+            })
+    }
+    /// Whether the VMA at `addr` is a `VM_PFNMAP` one, whose pages
+    /// `MADV_DONTNEED` may not drop (`madvise_dontneed_free_valid_vma`).
+    fn pfn_mapped(&self, addr: u64) -> bool {
+        self.shared_at(addr)
+            .and_then(|shared| shared.pages.source())
+            .is_some_and(|source| source.vma_flags(0) & vm::PFNMAP != 0)
+    }
+    /// The first mapping of `[addr, end)` whose pages `MADV_DONTNEED` may
+    /// not drop: a `VM_PFNMAP` one, or with `locked` a locked one too.
+    pub fn first_undiscardable(&self, addr: u64, end: u64, locked: bool) -> Option<Mapping> {
+        self.mappings.range(..end).map(|(_, m)| *m).find(|m| {
+            m.end() > addr && ((locked && m.locked.is_some()) || self.pfn_mapped(m.start.0))
+        })
+    }
 
     /// Unmaps `[addr, addr+len)`. Unmapped holes inside the range are fine;
     /// a sealed mapping in it is EPERM, and nothing is unmapped
     /// (`vms_gather_munmap_vmas`).
     pub fn unmap(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
-        if self.sealed_in(addr.0, end) {
-            return Err(Errno::EPERM);
+        // VMA by VMA, a sealed one is `EPERM` and one that may not be split
+        // where the range ends in it `EINVAL`.
+        for m in self.mappings_in(addr.0, end) {
+            if m.sealed {
+                return Err(Errno::EPERM);
+            }
+            if self.splits_refused(&m, addr.0, end) {
+                return Err(Errno::EINVAL);
+            }
         }
         self.remove(addr.0, end);
         Ok(())
+    }
+
+    /// Whether `[start, end)` ends in `m` where its memory may not be split
+    /// ([`Self::refuses_split`]). The VMA is the shared mapping's, which
+    /// `refuses_split` looks at: `m` may be a part of it, as the mappings
+    /// split where nothing about them changed.
+    fn splits_refused(&self, m: &Mapping, start: u64, end: u64) -> bool {
+        let within = |at: u64| m.start.0 <= at && at <= m.end();
+        (within(start) && self.refuses_split(start)) || (within(end) && self.refuses_split(end))
     }
 
     /// Takes `[addr, end)` out of the space, its mappings, memory and pages,
@@ -5198,7 +5291,11 @@ impl AddressSpaceData {
         if !keep_old && old_len > 0 {
             // `remap` moves pages of one VMA only, whose mapping at `old` it
             // found not sealed, and sealed mappings make VMAs of their own:
-            // nothing here is sealed, so the unmap cannot fail.
+            // nothing here is sealed. Nor is it a part of memory that may not
+            // be split ([`PageSource::splits`]): `remap` refused that before
+            // the move with `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and the move
+            // without either only grows, which such memory, a fixed mapping,
+            // does not (`EFAULT`). So the unmap cannot fail.
             let unmapped = self.unmap(GuestAddr(old), old_len);
             debug_assert!(unmapped.is_ok(), "{unmapped:?}");
         }
@@ -5345,6 +5442,11 @@ impl AddressSpaceData {
             if old_len > new_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
             }
+            // Moving a part of memory that may not be split
+            // (`prep_move_vma`).
+            if self.refuses_split(addr.0) || self.refuses_split(addr.0 + kept) {
+                return Err(Errno::EINVAL);
+            }
             if !moves(new_len) {
                 return Err(Errno::EINVAL);
             }
@@ -5394,13 +5496,6 @@ impl AddressSpaceData {
         Ok(GuestAddr(to))
     }
 
-    /// Whether a mapping in `[start, end)` is sealed.
-    fn sealed_in(&self, start: u64, end: u64) -> bool {
-        self.mappings
-            .range(..end)
-            .any(|(_, m)| m.sealed && m.end() > start)
-    }
-
     /// `mseal(addr, len)` of a range that every page of which is mapped
     /// (else ENOMEM, and nothing is sealed): its mappings are split at its
     /// ends and sealed, as Linux's `mseal_range` seals its VMAs.
@@ -5409,13 +5504,23 @@ impl AddressSpaceData {
         if !self.covers(addr, len)? {
             return Err(Errno::ENOMEM);
         }
+        // VMA by VMA (`mseal_apply`): one not yet sealed that may not be
+        // split where the range ends in it is `EINVAL`, after those before.
+        let refused = self
+            .mappings_in(addr.0, end)
+            .into_iter()
+            .find(|m| !m.sealed && self.splits_refused(m, addr.0, end));
+        let to = refused.map_or(end, |m| m.start.0.max(addr.0));
         self.split_at(addr.0);
-        self.split_at(end);
-        for (_, m) in self.mappings.range_mut(addr.0..end) {
+        self.split_at(to);
+        for (_, m) in self.mappings.range_mut(addr.0..to) {
             m.sealed = true;
         }
         self.split_unmergeable_shared_where_changed(addr.0);
-        self.split_unmergeable_shared_where_changed(end);
+        self.split_unmergeable_shared_where_changed(to);
+        if refused.is_some() {
+            return Err(Errno::EINVAL);
+        }
         Ok(())
     }
 
@@ -5461,7 +5566,9 @@ impl AddressSpaceData {
     /// may not take the advice ends it with `EINVAL`, after those before
     /// it; a hole in the range is `ENOMEM` once the rest has it. Only
     /// private anonymous memory takes `MADV_WIPEONFORK` (Linux's VMA of no
-    /// file and not shared).
+    /// file and not shared), memory core mm does not back takes no
+    /// `MADV_DOFORK` or `MADV_DODUMP`, and a VMA whose flags change but may
+    /// not be split is taken whole or not at all.
     pub fn advise_flags(&mut self, addr: u64, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
         let starts: Vec<u64> = self
             .mappings
@@ -5485,24 +5592,38 @@ impl AddressSpaceData {
             {
                 return Err(Errno::EINVAL);
             }
+            // Memory core mm does not back is neither copied into a child
+            // nor dumped again (`VM_SPECIAL` in Linux 7.0, not
+            // `vma_is_mm_backed` in master: the same for every memory here).
+            if matches!(advice, FlagAdvice::DoFork | FlagAdvice::DoDump) && self.special(start) {
+                return Err(Errno::EINVAL);
+            }
             let ksm = self.shared_at(start).is_none();
+            let advise = |m: &mut Mapping| match advice {
+                FlagAdvice::DontFork => m.dont_fork = true,
+                FlagAdvice::DoFork => m.dont_fork = false,
+                FlagAdvice::WipeOnFork => m.wipe_on_fork = true,
+                FlagAdvice::KeepOnFork => m.wipe_on_fork = false,
+                FlagAdvice::DontDump => m.dont_dump = true,
+                FlagAdvice::DoDump => m.dont_dump = false,
+                FlagAdvice::Read(hint) => m.read_hint = hint,
+                FlagAdvice::HugePages(huge) => m.huge_pages = Some(huge),
+                // KSM leaves shared memory and the rings, which core mm
+                // does not back, as they are (`ksm_compatible`).
+                FlagAdvice::Mergeable(on) => m.mergeable = on && (m.mergeable || ksm),
+            };
             let (from, to) = (start.max(addr), m.end().min(end));
+            // A VMA whose flags change is split, unless its memory may not
+            // be (`madvise_update_vma`).
+            let mut advised = m;
+            advise(&mut advised);
+            if advised != m && self.splits_refused(&m, addr, end) {
+                return Err(Errno::EINVAL);
+            }
             self.split_at(from);
             self.split_at(to);
             for (_, m) in self.mappings.range_mut(from..to) {
-                match advice {
-                    FlagAdvice::DontFork => m.dont_fork = true,
-                    FlagAdvice::DoFork => m.dont_fork = false,
-                    FlagAdvice::WipeOnFork => m.wipe_on_fork = true,
-                    FlagAdvice::KeepOnFork => m.wipe_on_fork = false,
-                    FlagAdvice::DontDump => m.dont_dump = true,
-                    FlagAdvice::DoDump => m.dont_dump = false,
-                    FlagAdvice::Read(hint) => m.read_hint = hint,
-                    FlagAdvice::HugePages(huge) => m.huge_pages = Some(huge),
-                    // KSM leaves shared memory and the rings, which core mm
-                    // does not back, as they are (`ksm_compatible`).
-                    FlagAdvice::Mergeable(on) => m.mergeable = on && (m.mergeable || ksm),
-                }
+                advise(m);
             }
             self.split_unmergeable_shared_where_changed(from);
             self.split_unmergeable_shared_where_changed(to);
@@ -6380,11 +6501,7 @@ impl AddressSpaceData {
     /// rings of AIO and `io_uring`, stays unlocked. Secret memory is locked
     /// here, as only `mlock_fixup` passes it over.
     pub fn lock_new(&mut self, addr: u64, end: u64, lock: Lock) {
-        let fixed = self
-            .shared_at(addr)
-            .and_then(|shared| shared.pages.source())
-            .is_some_and(|source| source.fixed());
-        if fixed {
+        if self.special(addr) {
             return;
         }
         self.split_at(addr);
@@ -6466,13 +6583,16 @@ impl AddressSpaceData {
             }
         }
     }
-    /// Whether the mapping at `addr` cannot be locked: the rings of AIO and
-    /// `io_uring` (Linux's `vma_supports_mlock`), and secret memory, which
-    /// `mlock_fixup` leaves as it is.
+    /// Whether the mapping at `addr` cannot be locked: memory core mm does
+    /// not back ([`Self::special`]: the rings of AIO, `io_uring` and perf
+    /// events, Linux's `VM_SPECIAL` and `vma_supports_mlock`), and secret
+    /// memory, which `mlock_fixup` leaves as it is.
     fn refuses_lock(&self, addr: u64) -> bool {
-        self.shared_at(addr)
-            .and_then(|shared| shared.pages.source())
-            .is_some_and(|source| source.fixed() || source.secret())
+        self.special(addr)
+            || self
+                .shared_at(addr)
+                .and_then(|shared| shared.pages.source())
+                .is_some_and(|source| source.secret())
     }
 
     /// `mlockall` and `munlockall`: new mappings take `future`, and with
@@ -7038,6 +7158,12 @@ impl AddressSpaceData {
             // (`mprotect_fixup`).
             if m.sealed {
                 denied = Some(Errno::EPERM);
+                break;
+            }
+            // One that may not be split takes a new protection whole
+            // (`vma_modify_flags`), or keeps its own.
+            if m.prot != prot && self.splits_refused(m, addr.0, end) {
+                denied = Some(Errno::EINVAL);
                 break;
             }
             covered = m.end();
@@ -8568,6 +8694,10 @@ impl AddressSpace {
     pub fn first_locked(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
         self.locked().first_locked(addr.0, end)
     }
+    /// See [`AddressSpaceData::first_undiscardable`].
+    pub fn first_undiscardable(&self, addr: GuestAddr, end: u64, locked: bool) -> Option<Mapping> {
+        self.locked().first_undiscardable(addr.0, end, locked)
+    }
     /// See [`AddressSpaceData::refuses_discard_at`].
     pub fn refuses_discard_at(&self, addr: GuestAddr) -> bool {
         self.locked().refuses_discard_at(addr.0)
@@ -9809,6 +9939,114 @@ mod tests {
             }
             Ok(n)
         }
+    }
+
+    /// Memory as a perf event's ring buffer is: zero-filled, `VM_PFNMAP` and
+    /// `VM_IO`, never split, and its pages after the first read-only.
+    struct Ring;
+    impl PageSource for Ring {
+        fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            buf.fill(0);
+            Ok(buf.len())
+        }
+        fn fixed(&self) -> bool {
+            true
+        }
+        fn vma_flags(&self, flags: u64) -> u64 {
+            flags | vm::PFNMAP | vm::IO | vm::DONTEXPAND
+        }
+        fn splits(&self) -> bool {
+            false
+        }
+        fn writable(&self, offset: u64) -> bool {
+            offset == 0
+        }
+    }
+
+    #[test]
+    fn memory_that_may_not_be_split_changes_whole_or_not_at_all() {
+        let space = AddressSpace::new();
+        let pages = SharedPages::new().with_source(Arc::new(Ring));
+        let len = 4 * PAGE_SIZE;
+        let at = space
+            .map_shared(None, len, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        space
+            .share_pages(at, len, &pages, 0, SharedWrites::Allowed)
+            .unwrap();
+        let mid = GuestAddr(at.0 + PAGE_SIZE);
+        let end = at.0 + len;
+        // A part that would not change takes the call first, which leaves
+        // the VMA whole for those after.
+        assert_eq!(
+            space.protect_shared(at, PAGE_SIZE, Prot::READ_WRITE),
+            Ok(())
+        );
+        // The first page takes a write; another's is a bus error, and it
+        // reads as it was, though a read remembered it first.
+        space.write(at, b"x").unwrap();
+        let mut first = [0];
+        space.read(mid, &mut first).unwrap();
+        let fault = space.write(mid, b"x").unwrap_err();
+        assert!(fault.bus && fault.write);
+        let mut b = [1];
+        space.read(mid, &mut b).unwrap();
+        assert_eq!(b, [0]);
+        // A change of a part is EINVAL, and leaves the VMA whole.
+        assert_eq!(space.unmap_shared(mid, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(
+            space.protect_shared(at, PAGE_SIZE, Prot::READ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            space.advise_flags(mid, end, FlagAdvice::DontDump),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(space.seal_shared(mid, PAGE_SIZE), Err(Errno::EINVAL));
+        let stay = Remap {
+            may_move: false,
+            fixed: false,
+            keep_old: false,
+            new_addr: GuestAddr(0),
+        };
+        assert_eq!(
+            space.remap_shared(at, len, 2 * PAGE_SIZE, stay),
+            Err(Errno::EINVAL)
+        );
+        let away = Remap {
+            may_move: true,
+            fixed: true,
+            keep_old: false,
+            new_addr: GuestAddr(end + 16 * PAGE_SIZE),
+        };
+        assert_eq!(
+            space.remap_shared(mid, PAGE_SIZE, PAGE_SIZE, away),
+            Err(Errno::EINVAL)
+        );
+        let vma = space.view().vma_from(at.0).unwrap();
+        assert_eq!((vma.start, vma.end), (at.0, end));
+        // A part that would not change splits nothing.
+        assert_eq!(
+            space.protect_shared(at, PAGE_SIZE, Prot::READ_WRITE),
+            Ok(())
+        );
+        space.advise_flags(at, end, FlagAdvice::DontDump).unwrap();
+        assert_eq!(space.advise_flags(mid, end, FlagAdvice::DontDump), Ok(()));
+        // Memory core mm does not back is not copied into a child nor
+        // dumped again, and its pages are not dropped.
+        for advice in [FlagAdvice::DoFork, FlagAdvice::DoDump] {
+            assert_eq!(space.advise_flags(at, end, advice), Err(Errno::EINVAL));
+        }
+        assert!(space.first_undiscardable(at, end, false).is_some());
+        // The whole takes any of them.
+        space.protect_shared(at, len, Prot::READ).unwrap();
+        space.unmap_shared(at, len).unwrap();
+        assert!(
+            space
+                .view()
+                .vma_from(at.0)
+                .is_none_or(|vma| vma.start >= end)
+        );
     }
 
     /// A file whose size can change, each byte its offset modulo 251.

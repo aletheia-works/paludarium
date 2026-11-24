@@ -438,3 +438,75 @@ fn a_pid_no_task_has_is_esrch() {
     );
     assert!(fd < 1024, "{fd:#x}");
 }
+
+/// A ring buffer's mapping keeps Linux's rules for a `VM_PFNMAP` one
+/// (`perf_mmap_vmops`): a write to a data page is a bus error, no part of
+/// it changes on its own, and as core mm does not back it, it takes no
+/// `MADV_DOFORK` or `MADV_DODUMP`, gives `MADV_DONTNEED` no pages and
+/// stays unlocked.
+#[test]
+fn a_ring_buffer_is_changed_whole_or_not_at_all() {
+    const MMAP: u64 = 9;
+    const MPROTECT: u64 = 10;
+    const MUNMAP: u64 = 11;
+    const MREMAP: u64 = 25;
+    const MADVISE: u64 = 28;
+    const MLOCK: u64 = 149;
+    const MSEAL: u64 = 462;
+    let (mut k, mut t, m) = setup();
+    let fd = open(&mut k, &mut t, &m, &Spec::default(), -1);
+    let len = 9 * PAGE_SIZE;
+    let at = syscall(&mut k, &mut t, &m, MMAP, [0, len, 3, 1, fd, 0]);
+    assert!(at < u64::MAX - 4095, "{at:#x}");
+    let data = at + PAGE_SIZE;
+    // The user page takes a write; a data page's is a bus error.
+    m.write(GuestAddr(at + 8), &[0]).unwrap();
+    assert!(m.write(GuestAddr(data), &[0]).unwrap_err().bus);
+    let einval = errno(Errno::EINVAL);
+    let calls: [(u64, [u64; 6]); 12] = [
+        (MUNMAP, [at, PAGE_SIZE, 0, 0, 0, 0]),
+        // MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED over a data page.
+        (MMAP, [data, PAGE_SIZE, 1, 0x32, u64::MAX, 0]),
+        (MPROTECT, [at, PAGE_SIZE, 1, 0, 0, 0]),
+        (MREMAP, [at, len, PAGE_SIZE, 0, 0, 0]),
+        // MREMAP_MAYMOVE | MREMAP_FIXED of a data page.
+        (
+            MREMAP,
+            [data, PAGE_SIZE, PAGE_SIZE, 3, at + 64 * PAGE_SIZE, 0],
+        ),
+        // MADV_RANDOM of a part.
+        (MADVISE, [at, PAGE_SIZE, 1, 0, 0, 0]),
+        // MADV_DOFORK, MADV_DODUMP, MADV_DONTNEED and MADV_DONTNEED_LOCKED.
+        (MADVISE, [at, len, 11, 0, 0, 0]),
+        (MADVISE, [at, len, 17, 0, 0, 0]),
+        (MADVISE, [at, len, 4, 0, 0, 0]),
+        (MADVISE, [at, len, 24, 0, 0, 0]),
+        (MSEAL, [at, PAGE_SIZE, 0, 0, 0, 0]),
+        (MUNMAP, [at + 8 * PAGE_SIZE, PAGE_SIZE, 0, 0, 0, 0]),
+    ];
+    for (n, a) in calls {
+        assert_eq!(syscall(&mut k, &mut t, &m, n, a), einval, "{n} {a:x?}");
+    }
+    // What would not change a part takes the call: the same protection,
+    // and MADV_DONTDUMP, which the buffer has.
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, MPROTECT, [at, PAGE_SIZE, 3, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, MADVISE, [at, PAGE_SIZE, 16, 0, 0, 0]),
+        0
+    );
+    // mlock takes it and leaves it unlocked.
+    assert_eq!(syscall(&mut k, &mut t, &m, MLOCK, [at, len, 0, 0, 0, 0]), 0);
+    assert_eq!(m.locked_pages(), 0);
+    // The whole takes a change.
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, MPROTECT, [at, len, 1, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, MUNMAP, [at, len, 0, 0, 0, 0]),
+        0
+    );
+}

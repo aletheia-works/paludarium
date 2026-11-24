@@ -8688,10 +8688,6 @@ pub(crate) fn seen_from(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
 fn opened_path(d: &Descriptor) -> Vec<u8> {
     paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
 }
-/// The path of the file `d` holds, for a mapping of it to name: where the
-/// file is now, or where it was opened if no name reaches it there (the
-/// mapping marks that itself), or a memfd's own path. `None` if the file
-/// cannot tell.
 /// What a mapping of `d`'s file, whose page cache is file `key`'s, shows:
 /// a memfd's fixed name, or where the file is now, from its description's
 /// place, which renames and removals move from then on as they move the
@@ -8712,6 +8708,10 @@ pub(crate) fn mapped_name(
         c.files.caches.keep_place(key, &path),
     ))
 }
+/// The path of the file `d` holds, for a mapping of it to name: where the
+/// file is now, or where it was opened if no name reaches it there (the
+/// mapping marks that itself), or a memfd's own path. `None` if the file
+/// cannot tell.
 pub(crate) fn mapped_path(c: &Context<'_>, d: &Descriptor) -> Option<Vec<u8>> {
     if let Some(memfd) = d
         .file

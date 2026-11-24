@@ -219,10 +219,14 @@ impl PageCaches {
             unlinked: false,
         }));
         let _use = self.notify.fan.using();
-        self.kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((key, Arc::downgrade(&place)));
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        // Every mapping of a file keeps one, so those let go are dropped
+        // here too, not only at a rename, once there are many.
+        if kept.len() >= 64 && kept.len().is_power_of_two() {
+            kept.retain(|(_, place)| place.strong_count() != 0);
+        }
+        kept.push((key, Arc::downgrade(&place)));
+        drop(kept);
         place
     }
     /// Whether a description of file `key` is open, a [`Hold`] holds it,

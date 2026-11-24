@@ -337,6 +337,7 @@ mod linux {
                     | "bpf-prog-calls"
                     | "bpf-prog-rewrites"
                     | "bpf-prog-udp"
+                    | "bpf-prog-tcp"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -732,6 +733,7 @@ mod linux {
         bpf_prog_calls => ("bpf-prog-calls","bpf-prog"),
         bpf_prog_rewrites => ("bpf-prog-rewrites","bpf-prog"),
         bpf_prog_udp => ("bpf-prog-udp","bpf-prog"),
+        bpf_prog_tcp => ("bpf-prog-tcp","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
         dnotify_events => ("dnotify-events","inotify"),

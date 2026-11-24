@@ -5193,6 +5193,22 @@ kernel.
     `SKF_AD_PAY_OFFSET` 8. The helpers run as the sending task, in whose
     context Linux's softirq runs the receive.
 
+- On a TCP listener, IPv4 or IPv6, the filter runs on each SYN that
+  comes to it through the loopback or a veth pair, as `tcp_v4_rcv` and
+  `tcp_v6_rcv` run `tcp_filter` before `tcp_v4_do_rcv` takes it, and so
+  before the accept queue's check: a SYN it drops counts in the
+  listener's `sk_drops` and is sent again on the handshake's schedule,
+  as one a full queue dropped. The SYN is Linux 7.0's: a 40-byte TCP
+  header with a random sequence number, the window that half the
+  receive buffer holds rounded down to the MSS, and the options MSS (the
+  device's MTU less the headers), SACK permitted, the timestamps (a
+  random value, then 0) and a window scale of 10, for `tcp_rmem[2]`'s 32
+  MiB; the IP header, MAC
+  header and `__sk_buff` fields as a UDP datagram's (above), with the
+  socket's own flow hash and `SKF_AD_PAY_OFFSET` 40. An accepted socket
+  takes the listener's filter and its lock, as `sk_clone_lock` copies
+  them.
+
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it
   and converted as `bpf_convert_filter` converts it, instruction for

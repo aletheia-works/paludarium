@@ -370,8 +370,12 @@ verified.
   bloom filters, and arrays and hashes of maps, and loads socket filters,
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
-  or packet socket and on a UDP socket. A TCP socket takes the options as
-  Linux does, but its filter does not run yet. On a UDP socket no
+  or packet socket, on a UDP socket and on the SYNs that come to a TCP
+  listener. Here a TCP connection has no segments yet, so no filter runs
+  yet on the handshake's last ACK, nor on the data, ACKs and FINs that come
+  to a connected socket, which Linux filters each (`tcp_filter`): a filter
+  that drops or cuts them, or keeps a SYN but drops that ACK, does
+  otherwise there. On a UDP socket no
   filter runs on the DNS stub's answers, which come through no device
   here; a datagram that Linux sends in fragments across a veth pair comes
   whole, though its filter sees the reassembled one's linear part and

@@ -349,7 +349,7 @@ fn page_state_tells_untouched_read_and_written_pages_apart() {
     assert_eq!(m.view().page_state(0x21000), Some(PageState::Zero));
     // A child of fork shares the written page and the zero page, as
     // Linux copies the page table of a VMA with an anon_vma.
-    assert_eq!(states(&m.fork())[..3], expected[..3]);
+    assert_eq!(states(&m.fork().unwrap())[..3], expected[..3]);
     // Discarded, a written page has none again.
     m.discard_shared(GuestAddr(0x20000), PAGE_SIZE).unwrap();
     assert_eq!(m.page_state(GuestAddr(0x20000)), Some(PageState::Absent));
@@ -484,7 +484,7 @@ fn usage_counts_pages_as_linux_smaps_does() {
         (2, 2, 2)
     );
     // After a fork the pages are shared until either writes them.
-    let child = m.fork();
+    let child = m.fork().unwrap();
     let shared = usage(&child);
     assert_eq!(
         (shared.resident, shared.shared_dirty, shared.private_dirty),
@@ -625,7 +625,7 @@ fn a_userfaultfd_registration_faults_on_missing_pages_only() {
         )
         .unwrap();
     m.mark_shared(s, 2 * PAGE_SIZE).unwrap();
-    let child = m.fork();
+    let child = m.fork().unwrap();
     // A page the child's mapping of the memory has is no missing page.
     child.write(GuestAddr(s.0 + PAGE_SIZE), b"k").unwrap();
     let view = m.view();
@@ -750,7 +750,7 @@ fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
     m.protect(a, PAGE_SIZE, Prot::READ_WRITE).unwrap();
     assert!(m.write(a, b"d").is_err());
     // A child's mapping is not registered, nor its pages protected.
-    let child = m.fork();
+    let child = m.fork().unwrap();
     child.write(a, b"e").unwrap();
     m.read(a, &mut byte).unwrap();
     assert_eq!(byte, [b'a']);
@@ -888,7 +888,7 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
     view.userfault_unregister(a.0, a.0 + 3 * PAGE_SIZE, 7)
         .unwrap();
     assert!(m.read(a, &mut [0]).unwrap_err().poison);
-    let child = m.fork();
+    let child = m.fork().unwrap();
     assert!(child.read(a, &mut [0]).unwrap_err().poison);
     // It moves with the pages.
     let moved = m
@@ -938,7 +938,7 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
         )
         .unwrap();
     m.mark_shared(s, PAGE_SIZE).unwrap();
-    let sharer = m.fork();
+    let sharer = m.fork().unwrap();
     sharer.write(s, b"s").unwrap();
     view.userfault_register(s.0, s.0 + PAGE_SIZE, 7, Userfault::MISSING)
         .unwrap();
@@ -946,7 +946,7 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
     assert!(m.read(s, &mut [0]).unwrap_err().poison);
     sharer.read(s, &mut byte).unwrap();
     assert_eq!(byte, [b's']);
-    let other = m.fork();
+    let other = m.fork().unwrap();
     other.read(s, &mut byte).unwrap();
     assert_eq!(byte, [b's']);
     m.clear_poisons(s, PAGE_SIZE);
@@ -996,7 +996,7 @@ fn a_userfaultfd_move_moves_exclusive_pages_and_refuses_markers() {
         (0, Some(Errno::EINVAL))
     );
     // A page `fork` shares is EBUSY until a write gives it its own.
-    let child = m.fork();
+    let child = m.fork().unwrap();
     assert_eq!(
         view.userfault_move(dst, src, PAGE_SIZE, 7, false),
         (0, Some(Errno(16))) // EBUSY
@@ -1445,7 +1445,7 @@ fn uffdio_writeprotect_marks_unpopulated_anonymous_pages_with_wp_unpopulated() {
     // A child has no markers.
     m.discard_shared(page(1), 2 * PAGE_SIZE).unwrap();
     view.userfault_write_protect(at, end, true).unwrap();
-    let child = m.fork();
+    let child = m.fork().unwrap();
     child.write(page(1), b"f").unwrap();
     assert!(m.write(page(1), b"g").is_err());
 }
@@ -1677,7 +1677,7 @@ fn the_vmas_of_a_file_that_never_merges_open_and_close_as_linux_s_do() {
     assert_eq!(told(), [(false, 1), (true, 1)]);
     // A fork opens the child's VMAs as the parent; the child's space then
     // closes them as whoever lets go of it last.
-    let child = m.fork();
+    let child = m.fork().unwrap();
     assert_eq!(told(), [(true, 1); 4]);
     set_current_actor(Some(Arc::new(2u32)));
     drop(child);
@@ -1696,6 +1696,71 @@ fn the_vmas_of_a_file_that_never_merges_open_and_close_as_linux_s_do() {
     drop(other);
     assert_eq!(told(), [(false, 3); 3]);
     set_current_actor(None);
+}
+
+#[test]
+fn a_fork_that_fails_closes_the_vmas_it_opened() {
+    let file = Arc::new(Counted::default());
+    let told = || std::mem::take(&mut *file.told.lock().unwrap());
+    let meter = Arc::new(MemoryMeter::new(PAGE_SIZE));
+    let mut m = AddressSpace::new().with_memory_meter(Arc::clone(&meter));
+    // The private page is between three shared mappings, one of which
+    // MADV_DONTFORK leaves out.
+    let shared = [0x10000, 0x20000, 0x40000].map(GuestAddr);
+    for at in shared {
+        m.map_shared(Some(at), PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(file.clone());
+        m.share_pages(at, PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+            .unwrap();
+    }
+    m.advise_flags(shared[0], 0x11000, FlagAdvice::DontFork)
+        .unwrap();
+    let at = m
+        .map(
+            Some(GuestAddr(0x30000)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.write(at, b"p").unwrap();
+    set_current_actor(Some(Arc::new(1u32)));
+    told();
+    let pinned = m.pin(at, 1).unwrap();
+    assert!(matches!(m.fork(), Err(Errno::ENOMEM)));
+    // Only the mapping before the one that failed was opened (`dup_mmap`).
+    assert_eq!(told(), [(true, 1), (false, 1)]);
+    assert_eq!(meter.used(), PAGE_SIZE);
+    drop(pinned);
+    drop(m.fork().unwrap());
+    assert_eq!(told(), [(true, 1), (true, 1), (false, 1), (false, 1)]);
+    set_current_actor(None);
+}
+
+#[test]
+fn a_fork_leaves_out_a_pinned_page_the_child_does_not_get() {
+    for advice in [FlagAdvice::DontFork, FlagAdvice::WipeOnFork] {
+        // Room for the one page written: `dup_mmap` copies no page of a
+        // mapping the child does not get or gets empty.
+        let meter = Arc::new(MemoryMeter::new(PAGE_SIZE));
+        let mut m = AddressSpace::new().with_memory_meter(Arc::clone(&meter));
+        let at = m
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        m.write(at, b"p").unwrap();
+        m.advise_flags(at, at.0 + PAGE_SIZE, advice).unwrap();
+        let pinned = m.pin(at, 1).unwrap();
+        let child = m.fork().unwrap();
+        assert_eq!(meter.used(), PAGE_SIZE);
+        assert_eq!(child.resident_pages(), (0, 0));
+        // The parent's page is still the pinned one.
+        m.write(at, b"q").unwrap();
+        let mut buf = [0u8; 1];
+        pinned.read(0, &mut buf);
+        assert_eq!(&buf, b"q");
+        assert_eq!(meter.used(), PAGE_SIZE);
+    }
 }
 
 #[test]
@@ -1732,7 +1797,7 @@ fn a_child_and_a_moved_mapping_keep_the_registrations_whose_events_they_give() {
             (2 * PAGE_SIZE, 3 * PAGE_SIZE, 8)
         ]
     );
-    let child = m.fork();
+    let child = m.fork().unwrap();
     let in_child = child.view();
     let registered = |space: &AddressSpace, addr: GuestAddr| {
         space

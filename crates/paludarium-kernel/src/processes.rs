@@ -3402,6 +3402,13 @@ impl Kernel {
         let msgqueue = self.processes.soft_limit(self.process.pid, 12);
         let credentials =
             crate::namespaces::user_for(&own, &parent.state.credentials, namespaces, msgqueue)?;
+        // copy_mm, before copy_namespaces: `dup_mm` fails with `ENOMEM` when a
+        // pinned page's copy finds no room.
+        let child_mem = if flags & 0x100 == 0 {
+            Some(Arc::new(mem.fork()?))
+        } else {
+            None
+        };
         crate::namespaces::check(namespaces, credentials.administers_own())?;
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
             return Err(Errno::EINVAL);
@@ -3425,11 +3432,6 @@ impl Kernel {
                 self.host.clock(ClockId::Realtime).unwrap_or(0),
             );
         }
-        let child_mem = if flags & 0x100 == 0 {
-            Some(Arc::new(mem.fork()))
-        } else {
-            None
-        };
         let mut userfaults = crate::userfaultfd::Events::default();
         if let Some(child_mem) = &child_mem {
             crate::userfaultfd::fork(&child_mem.view(), &mut userfaults);

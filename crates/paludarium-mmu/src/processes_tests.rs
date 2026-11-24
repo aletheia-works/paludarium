@@ -16,7 +16,7 @@ fn space() -> AddressSpace {
 fn private_copy() {
     let p = space();
     p.write_u64(GuestAddr(0x10000), 7).unwrap();
-    let c = p.fork();
+    let c = p.fork().unwrap();
     assert_ne!(p.id(), c.id());
     assert_eq!(c.read_u64(GuestAddr(0x10000)), Ok(7));
     c.write_u64(GuestAddr(0x10000), 9).unwrap();
@@ -26,21 +26,21 @@ fn private_copy() {
 fn shared_lazy_pages() {
     let p = space();
     p.mark_shared(GuestAddr(0x10000), PAGE_SIZE * 2).unwrap();
-    let c = p.fork();
+    let c = p.fork().unwrap();
     c.write_u64(GuestAddr(0x11000), 9).unwrap();
     assert_eq!(p.read_u64(GuestAddr(0x11000)), Ok(9));
 }
 #[test]
 fn parent_child_writes() {
     let p = space();
-    let c = p.fork();
+    let c = p.fork().unwrap();
     p.write_u64(GuestAddr(0x10000), 7).unwrap();
     assert_eq!(c.read_u64(GuestAddr(0x10000)), Ok(0));
 }
 #[test]
 fn protections_independent() {
     let p = space();
-    let c = p.fork();
+    let c = p.fork().unwrap();
     c.protect_shared(GuestAddr(0x10000), PAGE_SIZE, Prot::READ)
         .unwrap();
     assert!(c.write_u64(GuestAddr(0x10000), 1).is_err());
@@ -51,7 +51,7 @@ fn break_cloned() {
     let mut p = space();
     p.set_initial_break(GuestAddr(0x20000));
     p.set_break(GuestAddr(0x22001));
-    let c = p.fork();
+    let c = p.fork().unwrap();
     assert_eq!(c.current_break(), GuestAddr(0x22001));
     c.set_break_shared(GuestAddr(0x20000));
     assert_eq!(p.current_break(), GuestAddr(0x22001));
@@ -60,7 +60,7 @@ fn break_cloned() {
 fn unmap_and_remap_detaches_shared() {
     let p = space();
     p.mark_shared(GuestAddr(0x10000), PAGE_SIZE * 2).unwrap();
-    let c = p.fork();
+    let c = p.fork().unwrap();
     c.unmap_shared(GuestAddr(0x10000), PAGE_SIZE).unwrap();
     c.map_shared(
         Some(GuestAddr(0x10000)),
@@ -79,7 +79,7 @@ fn faults_and_shared_atomic() {
     let p = Arc::new(space());
     assert!(p.mark_shared(GuestAddr(0x10001), PAGE_SIZE).is_err());
     p.mark_shared(GuestAddr(0x10000), PAGE_SIZE * 2).unwrap();
-    let c = Arc::new(p.fork());
+    let c = Arc::new(p.fork().unwrap());
     assert!(c.read_u64(GuestAddr(0)).is_err());
     std::thread::scope(|scope| {
         for s in [p.clone(), c.clone()] {
@@ -114,7 +114,7 @@ fn the_meter_counts_written_frames_once_until_they_go() {
     p.write_u64(GuestAddr(0x20000), 1).unwrap();
     assert_eq!(meter.used(), PAGE_SIZE * 2);
     // fork shares both frames: each counts once for both spaces.
-    let c = p.fork();
+    let c = p.fork().unwrap();
     assert_eq!(meter.used(), PAGE_SIZE * 2);
     c.write_u64(GuestAddr(0x10000), 3).unwrap();
     assert_eq!(p.read_u64(GuestAddr(0x10000)), Ok(3));
@@ -154,7 +154,7 @@ fn a_fork_shares_private_frames_until_either_space_writes() {
     p.write_u64(GuestAddr(0x10000), 1).unwrap();
     p.write_u64(GuestAddr(0x11000), 2).unwrap();
     // The frames do not fit twice, but a fork copies none of them.
-    let c = p.fork();
+    let c = p.fork().unwrap();
     assert_eq!(meter.used(), PAGE_SIZE * 2);
     assert_eq!(c.read_u64(GuestAddr(0x11000)), Ok(2));
     // A write copies the frame it changes; once the other space has its
@@ -178,7 +178,7 @@ fn shared_offset_names_the_memory_not_the_address() {
     let p = space();
     assert_eq!(p.shared_offset(GuestAddr(0x10008)), None);
     p.mark_shared(GuestAddr(0x10000), PAGE_SIZE * 2).unwrap();
-    let c = p.fork();
+    let c = p.fork().unwrap();
     let inherited = p.shared_offset(GuestAddr(0x11008));
     assert!(inherited.is_some());
     assert_eq!(c.shared_offset(GuestAddr(0x11008)), inherited);
@@ -225,7 +225,7 @@ fn collapse_gives_the_parent_its_own_pages_and_leaves_a_forked_child_its_own() {
     .unwrap();
     p.write(GuestAddr(AT), &[1]).unwrap();
     p.write(GuestAddr(AT + PAGE_SIZE), &[2]).unwrap();
-    let c = p.fork();
+    let c = p.fork().unwrap();
     let exclusive = |space: &AddressSpace, at: u64| {
         space.view().pagemap(at, 1).unwrap()[0] & pagemap::EXCLUSIVE != 0
     };

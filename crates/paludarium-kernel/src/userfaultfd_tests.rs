@@ -512,7 +512,7 @@ fn a_child_and_a_moved_mapping_leave_the_registration() {
     let mut f = fixture();
     let fd = f.ready(0, 0);
     assert_eq!(f.register(fd, AREA, 2 * PAGE), 0);
-    let child = f.mem.fork();
+    let child = f.mem.fork().unwrap();
     assert!(child.userfault_at(GuestAddr(AREA)).is_none());
     assert!(f.mem.userfault_at(GuestAddr(AREA)).is_some());
     // mremap moves it without its registration (MREMAP_MAYMOVE).
@@ -525,7 +525,7 @@ fn a_child_and_a_moved_mapping_leave_the_registration() {
     f.mem.write(GuestAddr(AREA), b"a").unwrap();
     assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 2, 0]).0, 0);
     assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 1]).0, 0);
-    let child = f.mem.fork();
+    let child = f.mem.fork().unwrap();
     child.write(GuestAddr(AREA), b"b").unwrap();
     assert!(f.mem.write(GuestAddr(AREA), b"b").is_err());
     let moved = f.ret(25, &[AREA, 2 * PAGE, 4 * PAGE, 1, 0]);
@@ -1042,7 +1042,7 @@ fn a_fork_hands_the_child_a_context_of_its_own() {
     assert_eq!(f.userfault(AREA).map(|u| u.context), Some(id));
     // A read hands the child's context over as a file of its own, with the
     // features of the old, whose close takes the child's mappings out.
-    let copy = f.mem.fork();
+    let copy = f.mem.fork().unwrap();
     let mut events = crate::userfaultfd::Events::default();
     crate::userfaultfd::fork(&copy.view(), &mut events);
     let made = children(&events);

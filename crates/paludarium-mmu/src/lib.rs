@@ -3885,8 +3885,11 @@ impl AddressSpaceData {
         }
     }
     /// The space for a child `fork` makes: it shares every frame, a private
-    /// one until either space writes it, as Linux shares the pages.
-    fn fork(&mut self) -> Self {
+    /// one until either space writes it, as Linux shares the pages. A pinned
+    /// private page is copied for the child at once, and with no room under
+    /// the meter for that copy the fork fails (`ENOMEM`, as
+    /// `copy_present_page`), leaving the pinned page the parent's own.
+    fn fork(&mut self) -> Result<Self, Errno> {
         let mut copy = Self::new();
         copy.meter = self.meter.clone();
         copy.mappings = self.mappings.clone();
@@ -3928,6 +3931,12 @@ impl AddressSpaceData {
         copy.bottom_up = self.bottom_up;
         let mut directory = BTreeMap::new();
         let shared = &self.shared;
+        let left_out = |mappings: &BTreeMap<u64, Mapping>, page: u64| {
+            mappings
+                .range(..=page)
+                .next_back()
+                .is_some_and(|(_, m)| page < m.end() && (m.dont_fork || m.wipe_on_fork))
+        };
         let own = self
             .directory
             .get_mut()
@@ -3937,6 +3946,11 @@ impl AddressSpaceData {
             for (slot, page) in table.pages.iter_mut().enumerate() {
                 if let Some(page) = page {
                     let address = (index * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
+                    // Not copied at all (`dup_mmap`), so that it neither
+                    // needs room nor becomes copy-on-write.
+                    if left_out(&self.mappings, address) {
+                        continue;
+                    }
                     let is_shared = shared
                         .range(..=address)
                         .next_back()
@@ -3956,10 +3970,20 @@ impl AddressSpaceData {
                     // A pinned page stays the parent's own, and the child gets
                     // a copy now (`page_needs_cow_for_dma`).
                     let pinned =
-                        (!is_shared && !page.cache && page.frame.pins.load(Ordering::Relaxed) != 0)
-                            .then(|| copied(&page.frame, self.meter.as_ref()))
-                            .flatten();
-                    if let Some(frame) = pinned {
+                        !is_shared && !page.cache && page.frame.pins.load(Ordering::Relaxed) != 0;
+                    if pinned {
+                        let Some(frame) = copied(&page.frame, self.meter.as_ref()) else {
+                            // `dup_mmap` closes the VMAs it opened, up to the
+                            // one it could not copy, as the child's space does
+                            // when it goes.
+                            copy.shared.retain(|&start, _| {
+                                start <= address && !left_out(&self.mappings, start)
+                            });
+                            for shared in copy.shared.values() {
+                                tell(shared, true);
+                            }
+                            return Err(Errno::ENOMEM);
+                        };
                         child.frame = Mapped::new(frame);
                         child.cow = false;
                     } else if !is_shared && !page.cache {
@@ -4026,7 +4050,7 @@ impl AddressSpaceData {
         }
         // The child's peak is what it holds (`dup_mm`).
         copy.peak_resident = copy.resident_pages();
-        copy
+        Ok(copy)
     }
 
     fn bump_code_generation(&mut self) {
@@ -8298,15 +8322,20 @@ impl AddressSpace {
     /// Private pages are shared until either space writes them, which
     /// copies them; MAP_SHARED pages stay shared. A shared serialization lock
     /// keeps cross-process memory operations indivisible.
-    pub fn fork(&self) -> Self {
-        let child = Self::with_data(self.locked().fork(), self.serialization.clone());
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` when the meter has no room for the copy of a pinned page
+    /// ([`Self::pin`]), which the child gets at once.
+    pub fn fork(&self) -> Result<Self, Errno> {
+        let child = Self::with_data(self.locked().fork()?, self.serialization.clone());
         // Linux's dup_mm copies the mm whole, membarrier_state with it.
         child
             .membarrier
             .store(self.membarrier.load(Ordering::SeqCst), Ordering::SeqCst);
         // ldt_dup_context copies the parent's LDT.
         lock_spinning(&child.ldt).clone_from(&lock_spinning(&self.ldt));
-        child
+        Ok(child)
     }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
     pub fn mark_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -9726,7 +9755,7 @@ mod tests {
             .unwrap();
         space.write(at, b"p").unwrap();
         let pinned = space.pin(at, 1).unwrap();
-        let child = space.fork();
+        let child = space.fork().unwrap();
         // The parent's page stays the pinned one: its stores and the pin's
         // meet, and the child's copy sees neither.
         space.write(at, b"q").unwrap();
@@ -9741,10 +9770,35 @@ mod tests {
         assert_eq!(&buf, b"r");
         // Once let go of, a fork shares the page until either writes it.
         drop(pinned);
-        let later = space.fork();
+        let later = space.fork().unwrap();
         assert_eq!(byte(&later, at.0), b'r');
         later.write(at, b"l").unwrap();
         assert_eq!(byte(&space, at.0), b'r');
+    }
+
+    #[test]
+    fn fork_fails_when_a_pinned_page_has_no_room_for_its_copy() {
+        // Room for the one page written, none for the child's copy.
+        let meter = Arc::new(MemoryMeter::new(PAGE_SIZE));
+        let mut space = AddressSpace::new().with_memory_meter(Arc::clone(&meter));
+        let at = space
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        space.write(at, b"p").unwrap();
+        let pinned = space.pin(at, 1).unwrap();
+        assert!(matches!(space.fork(), Err(Errno::ENOMEM)));
+        // The pinned page is still the parent's own, not shared copy-on-write:
+        // the parent's store and the pin's meet.
+        space.write(at, b"q").unwrap();
+        let mut buf = [0u8; 1];
+        pinned.read(0, &mut buf);
+        assert_eq!(&buf, b"q");
+        pinned.write(0, b"r");
+        assert_eq!(byte(&space, at.0), b'r');
+        // Once let go of, the fork shares the page and needs no room.
+        drop(pinned);
+        let child = space.fork().unwrap();
+        assert_eq!(byte(&child, at.0), b'r');
     }
 
     #[test]
@@ -9907,7 +9961,7 @@ mod tests {
         space.unmap(at(2), PAGE_SIZE).unwrap();
         assert_eq!(space.mappings().count(), 2);
         // A fork keeps the seal.
-        let child = space.fork();
+        let child = space.fork().unwrap();
         assert!(child.mappings().all(|m| m.sealed));
     }
 
@@ -9943,7 +9997,7 @@ mod tests {
             ]
         );
         assert_eq!(space.vma_at(at(1)), Some((at(1), PAGE_SIZE)));
-        let child = space.fork();
+        let child = space.fork().unwrap();
         assert_eq!(child.read_u64(at(0)).unwrap(), 1);
         assert!(child.read_u64(at(1)).is_err());
         assert_eq!(child.page_state(at(2)), Some(PageState::Absent));
@@ -10004,7 +10058,7 @@ mod tests {
             Some((GuestAddr(0x50000), 3 * PAGE_SIZE))
         );
         // A child has none.
-        assert_eq!(space.fork().locked_pages(), 0);
+        assert_eq!(space.fork().unwrap().locked_pages(), 0);
         // MREMAP_DONTUNMAP leaves the old range unlocked, the new locked.
         let how = Remap {
             may_move: true,
@@ -10064,7 +10118,7 @@ mod tests {
         space.guard(GuestAddr(0x80000), 0x81000, false).unwrap();
         space.write_u64(GuestAddr(0x80000), 4).unwrap();
         assert_eq!(space.page_state(GuestAddr(0x60000)), Some(PageState::Zero));
-        let child = space.fork();
+        let child = space.fork().unwrap();
         let states: Vec<_> = [0x50000, 0x60000, 0x70000, 0x80000]
             .map(|at| child.page_state(GuestAddr(at)))
             .into();
@@ -10118,13 +10172,13 @@ mod tests {
         assert_eq!(space.read_u64(at(3)).unwrap(), 0);
         assert!(space.read_u64(at(2)).is_err());
         // A fork copies them; a wiped mapping drops them in the child.
-        let child = space.fork();
+        let child = space.fork().unwrap();
         assert!(child.read_u64(at(1)).is_err());
         assert_eq!(child.read_u64(at(3)).unwrap(), 0);
         space
             .advise_flags(at(0), end(3), FlagAdvice::WipeOnFork)
             .unwrap();
-        let wiped = space.fork();
+        let wiped = space.fork().unwrap();
         assert_eq!(wiped.read_u64(at(1)).unwrap(), 0);
         assert!(space.read_u64(at(1)).is_err());
         // mremap moves them with the pages, and DONTUNMAP leaves none.
@@ -10383,7 +10437,7 @@ mod tests {
         assert_eq!(faults::take(), 1);
         // After a fork, the first write of each space to a page it shares
         // faults, the last one's too, which keeps the frame.
-        let child = space.fork();
+        let child = space.fork().unwrap();
         child.write_u64(anon, 4).unwrap();
         space.write_u64(anon, 5).unwrap();
         space.write_u64(anon, 6).unwrap();
@@ -10851,7 +10905,7 @@ mod tests {
             .back_with_cache(at, 2 * PAGE_SIZE, &pages, 0)
             .unwrap();
         assert_eq!(byte(&parent, at.0 + 3), 3);
-        let child = parent.fork();
+        let child = parent.fork().unwrap();
         // The cache's changes show in both, and change the code.
         let code = parent.code_generation();
         pages.store(3, b"c");
@@ -10893,19 +10947,19 @@ mod tests {
         space.write(at, b"x").unwrap();
         assert!(exclusive(&space, at.0));
         // fork maps it twice until either space writes its own copy.
-        let child = space.fork();
+        let child = space.fork().unwrap();
         assert!(!exclusive(&space, at.0));
         assert!(!exclusive(&child, at.0));
         child.write(at, b"y").unwrap();
         assert!(exclusive(&space, at.0));
         assert!(exclusive(&child, at.0));
         // A space that goes unmaps its pages.
-        let other = space.fork();
+        let other = space.fork().unwrap();
         assert!(!exclusive(&space, at.0));
         drop(other);
         assert!(exclusive(&space, at.0));
         // So does munmap.
-        let mut other = space.fork();
+        let mut other = space.fork().unwrap();
         other.unmap(at, PAGE_SIZE).unwrap();
         assert!(exclusive(&space, at.0));
     }
@@ -10941,7 +10995,7 @@ mod tests {
         space.discard_shared(at, 2 * PAGE_SIZE).unwrap();
         assert_eq!(space.resident_pages(), (4, 2));
         // A child's peak is what it holds at the fork (`dup_mm`).
-        let child = space.fork();
+        let child = space.fork().unwrap();
         assert_eq!(child.resident_pages(), (2, 2));
         // The view agrees, and has nothing once the space is gone.
         let view = space.view();
@@ -11087,7 +11141,7 @@ mod tests {
         );
         assert_eq!(byte(&space, at(2, 100).0), 0); // past the end of the file
         // A fork, and a move by mremap, keep the file at the same offsets.
-        let child = space.fork();
+        let child = space.fork().unwrap();
         space.write(at(0, 1), &[0xee]).unwrap();
         let fixed = Remap {
             fixed: true,
@@ -11262,7 +11316,7 @@ mod tests {
     fn remap_keeps_shared_memory_shared_after_fork_and_on_duplicates() {
         let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE);
         space.mark_shared(GuestAddr(0x10000), 4096).unwrap();
-        let child = space.fork();
+        let child = space.fork().unwrap();
         let moved = space
             .remap_shared(
                 GuestAddr(0x10000),
@@ -11302,7 +11356,7 @@ mod tests {
             .share_pages(at, 2 * PAGE_SIZE, &pages, 0x2000, SharedWrites::Allowed)
             .unwrap();
         assert_eq!(byte(&space, at.0 + PAGE_SIZE), b'f');
-        let child = space.fork();
+        let child = space.fork().unwrap();
         child.write(GuestAddr(at.0 + PAGE_SIZE + 1), b"I").unwrap();
         assert_eq!(byte(&space, at.0 + PAGE_SIZE + 1), b'I');
         // Only stores make pages dirty, and taking them makes them clean.
@@ -11432,7 +11486,7 @@ mod tests {
             .unwrap();
         assert!(written(&space, 0x10000) && written(&space, 0x13000));
         // So does fork.
-        assert!(written(&space.fork(), 0x10000));
+        assert!(written(&space.fork().unwrap(), 0x10000));
         // A new mapping that merges with a written VMA is part of it; one
         // that does not stays unwritten.
         space

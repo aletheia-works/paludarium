@@ -205,6 +205,51 @@ fn finish(k: &mut Kernel, t: &Thread, m: &AddressSpace, status: ExitStatus) {
 mod process {
     use super::*;
     #[test]
+    fn a_fork_with_no_room_for_a_pinned_page_leaves_nothing_behind() {
+        let mut k = Kernel::new(Arc::new(paludarium_host::testing::RecordingHost::new()));
+        k.enter_thread(1);
+        let mut t = Thread::new(
+            1,
+            CpuState::new(GuestAddr(0x400000), GuestAddr(DATA + PAGE_SIZE)),
+        );
+        let meter = Arc::new(paludarium_mmu::MemoryMeter::new(PAGE_SIZE));
+        let m = AddressSpace::new().with_memory_meter(Arc::clone(&meter));
+        let at = GuestAddr(DATA);
+        m.map_shared(
+            Some(at),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.write(at, b"p").unwrap();
+        let pinned = m.pin(at, 1).unwrap();
+        let tasks = k.processes.task_counts();
+        // fork, vfork without CLONE_VM, and a clone with new namespaces,
+        // whose copy (`copy_namespaces`) comes after the memory's.
+        for (number, flags) in [(57, 0), (56, 0x4011), (56, 0x7c02_0011)] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, number, [flags, 0, 0, 0, 0, 0]),
+                Errno::ENOMEM.to_syscall_return()
+            );
+            assert!(k.take_child().is_none());
+            assert!(k.vfork_wait.is_none());
+            assert_eq!(k.processes.task_counts(), tasks);
+            assert_eq!(meter.used(), PAGE_SIZE);
+            // The parent's page is still the pinned one.
+            m.write(at, b"q").unwrap();
+            let mut buf = [0u8; 1];
+            pinned.read(0, &mut buf);
+            assert_eq!(&buf, b"q");
+        }
+        drop(pinned);
+        let (_child, ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(ct.tid, tasks.1 + 1);
+        let mut buf = [0u8; 1];
+        cm.read(at, &mut buf).unwrap();
+        assert_eq!(&buf, b"q");
+    }
+    #[test]
     fn sleep_on_another_process_cpu_clock() {
         let host = Arc::new(paludarium_host::testing::RecordingHost::new());
         let mut k = Kernel::new(Arc::clone(&host) as Arc<dyn paludarium_host::Host>);

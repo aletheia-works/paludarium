@@ -602,7 +602,7 @@ fn membarrier_needs_registrations_and_reports_them() {
     assert_eq!(call(&mut f, 4, 0), 0);
     assert_eq!(call(&mut f, 512, 0), 4 | 16 | 64 | 256);
     // A fork's copy of the space keeps them, and a new one has none.
-    let copy = f.mem.fork();
+    let copy = f.mem.fork().unwrap();
     assert_eq!(
         copy.membarrier_state()
             .load(std::sync::atomic::Ordering::SeqCst),

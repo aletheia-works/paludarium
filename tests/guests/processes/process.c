@@ -23774,6 +23774,11 @@ static int setfl_kinds_case(void) {
     opened_nonblock("clear-refs", open("/proc/self/clear_refs", O_WRONLY | O_NONBLOCK));
     opened_nonblock("sysvipc-msg", open("/proc/sysvipc/msg", O_RDONLY | O_NONBLOCK));
     opened_nonblock("sysctl", open("/proc/sys/kernel/perf_event_paranoid", O_RDONLY | O_NONBLOCK));
+    opened_nonblock("proc", open("/proc", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("proc-pid", open("/proc/self", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("proc-fd", open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("dev", open("/dev", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("dev-pts", open("/dev/pts", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
     return 0;
 }
 

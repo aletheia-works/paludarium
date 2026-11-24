@@ -985,9 +985,11 @@ pub(crate) struct OwnDirectory {
 /// The owner of a process's directory as it is now.
 pub(crate) type LiveOwner = Arc<dyn Fn() -> (u32, u32) + Send + Sync>;
 impl OwnDirectory {
-    pub(crate) fn new(stat: FileStat) -> Self {
+    /// The directory an open with `flags` made, which keeps the open's
+    /// flags that `F_SETFL` changes, as Linux's `f_flags` does.
+    pub(crate) fn opened(flags: u32, stat: FileStat) -> Self {
         Self {
-            status: Default::default(),
+            status: crate::files::StatusFlags::opened(flags),
             stat,
             position: Mutex::new(0),
             owner: None,

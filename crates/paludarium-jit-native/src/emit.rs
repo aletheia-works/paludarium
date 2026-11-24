@@ -1496,13 +1496,13 @@ impl Emitter<'_, '_> {
 
     /// [`Fast::MoveString`] (from the `source` segment) or
     /// [`Fast::StoreString`] (with none), the `n`th instruction, at `rip`,
-    /// with `next` after it. Repeated, it runs as the interpreter's `string` does: it
-    /// ends when RCX is 0, and otherwise leaves at `rip` after
-    /// [`REP_CHUNK`] iterations, or when an iteration after the first
-    /// fails, counting the instruction as run; when the first fails, it
-    /// leaves before the instruction, which then gives the fault. The code
-    /// may change under it: it then goes on to the end of the instruction,
-    /// as the interpreter does, and leaves after it.
+    /// with `next` after it. Repeated, it runs as the interpreter's `string`
+    /// does: it ends when RCX is 0, and otherwise leaves at `rip` after
+    /// [`REP_CHUNK`] iterations, or when an iteration after the first fails,
+    /// counting the instruction as run; when the first fails, it leaves
+    /// before the instruction, which then gives the fault. The code may
+    /// change under it: it then goes on to the end of the instruction, as
+    /// the interpreter does, and leaves after it.
     fn string(
         &mut self,
         size: u8,

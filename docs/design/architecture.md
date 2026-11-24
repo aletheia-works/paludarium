@@ -190,9 +190,9 @@ before an instruction whose load or store fails, having changed nothing for
 it, so that the interpreter runs it again and reports the fault, and after a
 call into the MMU that finds the code generation moved on. It stops the same
 way before a `div` or `idiv` that faults (#DE). A `rep movs` or `rep stos`
-runs as in the interpreter: after 4096 iterations, or when an iteration after the first
-fails, it leaves at the instruction with the iterations made, counting it as
-run, so that the instruction runs again. An access to a
+runs as in the interpreter: after 4096 iterations, or when an iteration after
+the first fails, it leaves at the instruction with the iterations made,
+counting it as run, so that the instruction runs again. An access to a
 page's bytes never moves it: a slot never allows a write to a page an
 instruction was fetched from, nor to a shared or file page, whose stores the
 MMU counts as code changes for the mappings and page caches it watches. A

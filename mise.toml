@@ -74,7 +74,7 @@ description = "Differential tests against native Linux (x86-64 Linux only; elsew
 run = "cargo build --locked -p paludarium && cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network --test diff_events --test diff_threads --test diff_files -- --nocapture"
 
 [tasks."test:diff:jit"]
-description = "Differential tests with the native JIT compiling every block the first time it runs (x86-64 Linux only)"
+description = "Differential tests with the native JIT in the suites that use it (x86-64 Linux only)"
 env = { PALUDARIUM_TEST_JIT = "1" }
 # diff_events and diff_threads run the emulator's binary, with --jit=1.
 run = "cargo build --locked -p paludarium && cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network --test diff_events --test diff_threads --test diff_files -- --nocapture"

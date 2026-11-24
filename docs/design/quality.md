@@ -398,14 +398,14 @@ compiled the first time it runs, on the thread that runs it, and those of
 `diff_events` and `diff_threads` with the command's `--jit=1`, which compiles
 in the background. The cases that call the interpreter itself rather than run
 a guest program run as without it, and so does all of `diff_processes` for
-now: with the JIT a thread's CPU clock counts another thread's time
-(`cpu-timer`). The `jit_native` fuzz target compares compiled code with the
-interpreter for arbitrary instruction bytes. Half of the unit tests' runs start with the slots
-of the thread's TLB filled, so that compiled code loads and stores through
-them, and the MMU's tests check which pages a slot lets it read and write
-after `mprotect`, `fork`, `clear_refs` and `UFFDIO_WRITEPROTECT`. Stores
-through a slot that a load just filled again after `mprotect` and
-`UFFDIO_WRITEPROTECT` must fault, and one after `clear_refs` must set the
+now: a block's compilation on the thread that runs it counts in that thread's
+CPU clock (`cpu-timer`). The `jit_native` fuzz target compares compiled
+code with the interpreter for arbitrary instruction bytes. Half of the unit
+tests' runs start with the slots of the thread's TLB filled, so that compiled
+code loads and stores through them, and the MMU's tests check which pages a
+slot lets it read and write after `mprotect`, `fork`, `clear_refs` and
+`UFFDIO_WRITEPROTECT`. Stores through a slot that a load just filled again
+after `mprotect` and `UFFDIO_WRITEPROTECT` must fault, and one after `clear_refs` must set the
 soft-dirty bit again.
 
 ### How speed is measured

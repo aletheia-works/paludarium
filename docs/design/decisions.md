@@ -225,7 +225,8 @@ CI's own records, so anyone can check it:
    the JIT (the `jit` run of `distro-programs.yml`), with every case giving
    native Linux's result. One failure starts the count again. The two
    complement each other: the first compiles every block the first time it
-   runs, over the differential tests; the second uses the default threshold,
+   runs, over the differential tests
+   ([all but `diff_processes` for now](./quality#the-native-jit)); the second uses the default threshold,
    over Debian's real programs.
 2. **Fuzzing.** The nightly `jit_native` fuzz target, which compares compiled
    code with the interpreter for arbitrary instruction bytes, found nothing in

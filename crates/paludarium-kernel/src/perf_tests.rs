@@ -510,3 +510,37 @@ fn a_ring_buffer_is_changed_whole_or_not_at_all() {
         0
     );
 }
+
+/// A ring is `VM_IO | VM_PFNMAP`, which `get_user_pages` refuses
+/// (`check_vma_flags`): `process_vm_readv` and `process_vm_writev` pin
+/// nothing of it (`EFAULT`), and `MADV_POPULATE_READ` is `EINVAL`
+/// (`FOLL_MADV_POPULATE`), while the task's own reads see it.
+#[test]
+fn get_user_pages_refuses_a_ring() {
+    let (mut k, mut t, m) = setup();
+    let fd = open(&mut k, &mut t, &m, &Spec::default(), -1);
+    assert!(fd < 1024, "{fd}");
+    // mmap(NULL, 2 pages, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0).
+    let ring = syscall(&mut k, &mut t, &m, 9, [0, 2 * PAGE_SIZE, 3, 1, fd, 0]);
+    assert!(ring < 1 << 47, "{ring:#x}");
+    let mut version = [0u8; 4];
+    m.read(GuestAddr(ring), &mut version).unwrap();
+    let pid = syscall(&mut k, &mut t, &m, 39, [0; 6]);
+    let (local, lvec, rvec) = (DATA + 0xa00, DATA + 0x800, DATA + 0x900);
+    for (at, base) in [(lvec, local), (rvec, ring)] {
+        m.write_u64(GuestAddr(at), base).unwrap();
+        m.write_u64(GuestAddr(at + 8), 16).unwrap();
+    }
+    for call in [310, 311] {
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, call, [pid, lvec, 1, rvec, 1, 0]),
+            errno(Errno::EFAULT),
+            "{call}"
+        );
+    }
+    // madvise(ring, 1 page, MADV_POPULATE_READ).
+    assert_eq!(
+        syscall(&mut k, &mut t, &m, 28, [ring, PAGE_SIZE, 22, 0, 0, 0]),
+        errno(Errno::EINVAL)
+    );
+}

@@ -1364,6 +1364,9 @@ impl FileHandle for CoherentFile {
     fn charge(&self, offset: u64, len: u64) -> Result<(), Errno> {
         self.inner.charge(offset, len)
     }
+    fn huge_placement(&self) -> bool {
+        self.inner.huge_placement()
+    }
     fn fault(&self, offset: u64, order: u8, advised: Option<bool>) -> Result<(), Errno> {
         self.inner.fault(offset, order, advised)
     }
@@ -1430,9 +1433,20 @@ impl HostFs for CoherentFs {
         self.inner.root()
     }
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
-        // A running program's file is not truncated: `handle_truncate`
-        // takes write access first (ETXTBSY), whatever the access mode.
         const O_NOFOLLOW: u32 = 0o400000;
+        const O_CREAT: u32 = 0o100;
+        let follow = flags & O_NOFOLLOW == 0;
+        // The file the path names before the open, with its device: looked
+        // up once, at the first check that needs it, and shared by those
+        // after it, as nothing between them changes the file system.
+        let found = std::cell::OnceCell::new();
+        let lookup = || {
+            *found.get_or_init(|| {
+                self.inner
+                    .metadata(path, follow)
+                    .map(|stat| (self.inner.device(path), stat))
+            })
+        };
         // The file the open's lookup found is in use until the open is
         // listed or fails, as the lookup's dentry reference keeps Linux's
         // inode from `evict`: an eviction meanwhile keeps its marks
@@ -1441,38 +1455,33 @@ impl HostFs for CoherentFs {
         // holds ends as it goes (`IN_DELETE_SELF`), even if the open fails,
         // as the lookup's `dput` ends it on Linux.
         let _lookup = if self.caches.notify.fan.active() {
-            self.inner
-                .metadata(path, flags & O_NOFOLLOW == 0)
+            lookup()
                 .ok()
-                .and_then(|stat| {
-                    self.caches
-                        .looked_up((self.inner.device(path), stat.inode), &stat)
-                })
+                .and_then(|(device, stat)| self.caches.looked_up((device, stat.inode), &stat))
         } else {
             None
         };
+        // A running program's file is not truncated: `handle_truncate`
+        // takes write access first (ETXTBSY), whatever the access mode.
         if flags & O_TRUNC != 0
             && flags & O_PATH == 0
-            && let Ok(stat) = self.inner.metadata(path, flags & O_NOFOLLOW == 0)
+            && let Ok((device, stat)) = lookup()
             && stat.mode & 0o170000 == REGULAR
         {
-            let key = (self.inner.device(path), stat.inode);
-            drop(self.caches.write_access(key)?);
+            drop(self.caches.write_access((device, stat.inode))?);
         }
-        const O_CREAT: u32 = 0o100;
         let notify = &self.caches.notify;
         // Whether the file was there, for inotify: a new one is
         // `IN_CREATE`, an old one emptied `IN_MODIFY`.
         let existed = (notify.watching() && flags & (O_CREAT | O_TRUNC) != 0)
-            .then(|| self.inner.metadata(path, flags & O_NOFOLLOW == 0).ok());
+            .then(|| lookup().ok().map(|(_, stat)| stat));
         // Nothing is made or emptied on a read-only mount, whatever the
         // calls before found.
-        let follow = flags & O_NOFOLLOW == 0;
         if flags & (O_CREAT | O_TRUNC) != 0
             && flags & O_PATH == 0
             && self.inner.read_only(path, follow).mount
-            && match self.inner.metadata(path, follow) {
-                Ok(stat) => flags & O_TRUNC != 0 && stat.mode & 0o170000 == REGULAR,
+            && match lookup() {
+                Ok((_, stat)) => flags & O_TRUNC != 0 && stat.mode & 0o170000 == REGULAR,
                 Err(_) => flags & O_CREAT != 0,
             }
         {

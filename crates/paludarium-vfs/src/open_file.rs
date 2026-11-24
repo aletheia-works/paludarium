@@ -254,6 +254,11 @@ impl FileHandle for MemFile {
     fn shmem_pages(&self) -> bool {
         lock(&self.tree).shmem
     }
+    /// A file of a tmpfs mount with `huge=`.
+    fn huge_placement(&self) -> bool {
+        let tree = lock(&self.tree);
+        tree.shmem && tree.usage.huge() != contents::Huge::Never
+    }
     fn cached_pages(&self, first: u64, last: u64) -> u64 {
         match &lock(&self.node).kind {
             Kind::File(contents) => contents.resident(first, last),

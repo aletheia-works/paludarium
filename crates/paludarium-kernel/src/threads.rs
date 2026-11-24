@@ -2186,21 +2186,39 @@ impl Kernel {
         // Its exit is the kernel's work for it, whose faults (a core
         // dump's reads, the child TID's clearing) count to it.
         let _faults = crate::KernelFaults::enter(&thread.state);
-        // Its tracees are let go of, and its tracer told, before it goes.
+        // A traced thread reports its exit first (`PTRACE_EVENT_EXIT`).
         let status = self
             .group
             .status()
             .or(thread.state.exit_status)
             .unwrap_or(ExitStatus::Exited(0));
+        self.ptrace_exit_event(thread, status);
+        // Then, as the thread still runs (`io_uring_files_cancel`, before
+        // `exit_signals`), its process's whole exit cancels the io_uring
+        // requests it submitted, and runs their task work and its own, as
+        // Linux master's `io_task_group_exiting` asks. The work runs on a
+        // copy of the thread, as the exit event's stop does.
+        if self.group.status().is_some() {
+            let mut exiting = thread.clone();
+            crate::io_uring::cancel_all_task(&mut crate::syscalls::Context {
+                number: u64::MAX,
+                tid: exiting.tid,
+                host: &*self.host,
+                shared_host: &self.host,
+                files: &mut self.files,
+                process: &mut exiting.state,
+                cpu: &mut exiting.cpu,
+                mem,
+                cancellation: &self.cancellation,
+                inbox: &self.inbox,
+                group: &self.group,
+                processes: &self.processes,
+            });
+        }
+        // Its tracees are let go of, and its tracer told, before it goes.
         self.ptrace_exit(thread, status);
-        // Its io_uring task work runs as an exiting task's, and its
-        // process's whole exit cancels the requests it submitted that wait
-        // for their files (`io_uring_files_cancel`).
-        crate::io_uring::exit_task(
-            &self.processes.io_uring,
-            &self.inbox,
-            self.group.status().is_some(),
-        );
+        // What task work it still has runs as an exiting task's.
+        crate::io_uring::exit_task(&self.inbox);
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).

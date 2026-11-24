@@ -173,6 +173,64 @@ fn userfaultfd_checks_its_flags_and_who_asks() {
 }
 
 #[test]
+fn dev_userfaultfd_makes_contexts_for_whoever_may_open_it() {
+    const OPEN: u64 = 2;
+    const READ: u64 = 0;
+    const WRITE: u64 = 1;
+    const FSTAT: u64 = 5;
+    const IOCTL: u64 = 16;
+    const IOC_NEW: u64 = 0xaa00;
+    let mut f = fixture();
+    let open = |f: &mut Fixture, path: &[u8], flags: u64| {
+        f.mem
+            .write(GuestAddr(DATA), &[path, b"\0"].concat())
+            .unwrap();
+        f.ret(OPEN, &[DATA, flags, 0])
+    };
+    let dev = open(&mut f, b"/dev/userfaultfd", 2);
+    assert!((dev as i64) >= 0, "{dev:#x}");
+    // A root character device of mode 0600, a misc one (major 10).
+    assert_eq!(f.ret(FSTAT, &[dev, DATA + 0x200]), 0);
+    let mut stat = [0u8; 48];
+    f.mem.read(GuestAddr(DATA + 0x200), &mut stat).unwrap();
+    let mode = u32::from_le_bytes(stat[24..28].try_into().unwrap());
+    let rdev = u64::from_le_bytes(stat[40..48].try_into().unwrap());
+    assert_eq!((mode, rdev >> 8), (0o020_600, 10));
+    // Its ioctl makes a context of the flags it is given, and no other.
+    let made = f.ret(IOCTL, &[dev, IOC_NEW, 0o2000000 | NONBLOCK]);
+    assert!((made as i64) >= 0, "{made:#x}");
+    assert_eq!(f.ret(72, &[made, 3]), NONBLOCK);
+    assert_eq!(f.ret(72, &[made, 1]), 1);
+    assert_eq!(f.ioctl(made, API, &[0xaa, 0, 0]).0, 0);
+    assert_eq!(f.ret(IOCTL, &[dev, IOC_NEW, 0x10]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(IOCTL, &[dev, 0xaa01, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(READ, &[dev, DATA + 0x200, 8]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(WRITE, &[dev, DATA + 0x200, 8]), errno(Errno::EINVAL));
+    // vm.unprivileged_userfaultfd: 0 at first, root's to set to 0 or 1.
+    let sysctl = b"/proc/sys/vm/unprivileged_userfaultfd";
+    let file = open(&mut f, sysctl, 0);
+    assert_eq!(f.ret(READ, &[file, DATA + 0x200, 8]), 2);
+    let mut text = [0u8; 2];
+    f.mem.read(GuestAddr(DATA + 0x200), &mut text).unwrap();
+    assert_eq!(&text, b"0\n");
+    let file = open(&mut f, sysctl, 1);
+    f.mem.write(GuestAddr(DATA + 0x200), b"2\n").unwrap();
+    assert_eq!(f.ret(WRITE, &[file, DATA + 0x200, 2]), errno(Errno::EINVAL));
+    f.mem.write(GuestAddr(DATA + 0x200), b"1\n").unwrap();
+    assert_eq!(f.ret(WRITE, &[file, DATA + 0x200, 2]), 2);
+    // Set, it lets a user without CAP_SYS_PTRACE take the kernel's faults
+    // too; the device and the sysctl stay root's to open.
+    assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
+    let user = f.ret(USERFAULTFD, &[0]);
+    assert!((user as i64) >= 0, "{user:#x}");
+    assert_eq!(open(&mut f, b"/dev/userfaultfd", 2), errno(Errno::EACCES));
+    assert_eq!(open(&mut f, sysctl, 1), errno(Errno::EACCES));
+    // What root opened still makes contexts.
+    let again = f.ret(IOCTL, &[dev, IOC_NEW, 0]);
+    assert!((again as i64) >= 0, "{again:#x}");
+}
+
+#[test]
 fn uffdio_api_takes_the_features_once() {
     let mut f = fixture();
     let fd = f.ret(USERFAULTFD, &[NONBLOCK]);

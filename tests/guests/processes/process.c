@@ -15566,6 +15566,66 @@ static int th_inner(const char *m) {
     printf("umount=%d\n", tl_err(umount(m)));
     return 0;
 }
+/* The tmpfs-huge-placement case: a mapping of a file of a tmpfs mount with
+   huge= goes at a 2 MiB boundary, or one page past one for an offset of one
+   page, as shmem_get_unmapped_area places it, unless a free hint is given;
+   so a fault of it advised MADV_HUGEPAGE takes a 512-page folio. Only what
+   holds for every layout is printed. */
+static int thp_inner(const char *m) {
+    long huge = 2 << 20;
+    if (th_mount(m, "huge=always")) return 0;
+    int f = th_file(m, "f", 4 * huge), g = th_file(m, "g", huge);
+    if (f < 0 || g < 0) return 80;
+    int rw = PROT_READ | PROT_WRITE;
+    char *a = mmap(NULL, 2 * huge, rw, MAP_SHARED, f, 0);
+    char *b = mmap(NULL, 2 * huge, rw, MAP_SHARED, f, 4096);
+    if (a == MAP_FAILED || b == MAP_FAILED) return 81;
+    printf("aligned=%d offset=%d\n", ((uintptr_t)a & (huge - 1)) == 0,
+           ((uintptr_t)b & (huge - 1)) == 4096);
+    char *free_area = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (free_area == MAP_FAILED) return 82;
+    munmap(free_area, 4 * huge);
+    char *hint = free_area + huge + 4096;
+    char *c = mmap(hint, 2 * huge, rw, MAP_SHARED, f, 0);
+    printf("hint=%d\n", c == hint);
+    char *d = mmap(NULL, huge, rw, MAP_SHARED, g, 0);
+    if (c == MAP_FAILED || d == MAP_FAILED) return 83;
+    printf("advised=%d\n", tl_err(madvise(d, huge, 14)));
+    touch("fault", d, 0);
+    printf("blocks=%ld\n", sf_blocks(g));
+    munmap(a, 2 * huge), munmap(b, 2 * huge), munmap(c, 2 * huge), munmap(d, huge);
+    close(f), close(g);
+    printf("umount=%d\n", tl_err(umount(m)));
+    return 0;
+}
+static int tmpfs_huge_placement_case(void) {
+    if (!mkdtemp(th_base)) return 86;
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", th_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char ids[64];
+        snprintf(ids, sizeof ids, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", ids);
+        snprintf(ids, sizeof ids, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", ids));
+        _exit(thp_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(th_base) == 0);
+    return 0;
+}
 static int tmpfs_huge_case(void) {
     struct sigaction action = {0};
     action.sa_sigaction = on_bus;
@@ -16805,6 +16865,122 @@ static int thread_caps_status_case(void) {
         printf("leader after=%d\n", tcs_cap_eff("/proc/thread-self/status") != 0);
         fflush(stdout);
         _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("wait=%#x\n", status);
+    return 0;
+}
+
+/* The smaps-rollup case: /proc/self/smaps_rollup, as Linux's
+   show_smaps_rollup makes it, is one line from the first VMA's start to the
+   last one's end ([vsyscall], a gate area, is none), with no flags, file or
+   name but [rollup], then __show_smap's fields with Pss split by what each
+   page is. Read right after smaps, its sums match smaps's: Rss exactly,
+   Pss and Locked within the kB each VMA's line rounds away, and the split
+   adds up to Pss within its own rounding. A zombie's open is ESRCH, as
+   smaps_rollup_open finds no mm.
+   Only these relations are printed, as the sizes are the program's. */
+static char sr_smaps[1 << 20], sr_rollup[1 << 14];
+
+static long sr_field(const char *text, const char *name) {
+    long sum = 0;
+    size_t length = strlen(name);
+    for (const char *at = text; (at = strstr(at, name)); at += length)
+        if (at == text || at[-1] == '\n') sum += strtol(at + length, NULL, 10);
+    return sum;
+}
+
+static int smaps_rollup_case(void) {
+    memset(sr_smaps, 1, sizeof sr_smaps);
+    memset(sr_rollup, 1, sizeof sr_rollup);
+    int rss_equal = 0;
+    long vmas = 0;
+    for (int attempt = 0; attempt < 3 && !rss_equal; attempt++) {
+        if (proc_read("/proc/self/smaps", sr_smaps, sizeof sr_smaps) <= 0 ||
+            proc_read("/proc/self/smaps_rollup", sr_rollup, sizeof sr_rollup) <= 0)
+            return 1;
+        rss_equal = sr_field(sr_rollup, "Rss:") == sr_field(sr_smaps, "Rss:");
+    }
+    /* The header against the first and last VMA. */
+    unsigned long first = 0, last = 0, start, end, rollup_start = 0, rollup_end = 0;
+    for (const char *line = sr_smaps; *line;) {
+        const char *next = strchr(line, '\n');
+        size_t digits = strspn(line, "0123456789abcdef");
+        int vma = digits > 0 && line[digits] == '-' && sscanf(line, "%lx-%lx ", &start, &end) == 2;
+        if (vma && !(next && memmem(line, (size_t)(next - line), "[vsyscall]", 10))) {
+            if (!vmas++) first = start;
+            last = end;
+        }
+        line = next ? next + 1 : line + strlen(line);
+    }
+    char header[256] = "";
+    sscanf(sr_rollup, "%255[^\n]", header);
+    char rest[256] = "";
+    int shaped = sscanf(header, "%lx-%lx ---p 00000000 00:00 0 %255[^\n]", &rollup_start, &rollup_end, rest) == 3 &&
+                 !strcmp(rest, "[rollup]") && strstr(header, " [rollup]") - header == 72;
+    printf("header shaped=%d first=%d last=%d\n", shaped, rollup_start == first, rollup_end == last);
+    /* The field names, in order. */
+    printf("fields:");
+    for (const char *line = strchr(sr_rollup, '\n'); line && line[1]; line = strchr(line + 1, '\n')) {
+        int n = (int)strcspn(line + 1, ":");
+        printf(" %.*s", n, line + 1);
+    }
+    printf("\n");
+    long pss = sr_field(sr_rollup, "Pss:"), smaps_pss = sr_field(sr_smaps, "Pss:");
+    long locked = sr_field(sr_rollup, "Locked:"), smaps_locked = sr_field(sr_smaps, "Locked:");
+    long split = sr_field(sr_rollup, "Pss_Anon:") + sr_field(sr_rollup, "Pss_File:") +
+                 sr_field(sr_rollup, "Pss_Shmem:");
+    printf("rss equal=%d pss within=%d locked within=%d split within=%d\n", rss_equal,
+           pss >= smaps_pss && pss <= smaps_pss + vmas, locked >= smaps_locked && locked <= smaps_locked + vmas,
+           split <= pss && split + 3 > pss);
+    /* A zombie's. */
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 2;
+    if (kid == 0) _exit(0);
+    siginfo_t info;
+    if (waitid(P_PID, (id_t)kid, &info, WEXITED | WNOWAIT)) return 3;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/smaps_rollup", (int)kid);
+    int fd = open(path, O_RDONLY);
+    char byte;
+    ssize_t got = fd >= 0 ? read(fd, &byte, 1) : 0;
+    printf("zombie open=%d read=%d\n", fd >= 0 ? 0 : -errno, got < 0 ? -errno : (int)got);
+    if (fd >= 0) close(fd);
+    waitpid(kid, NULL, 0);
+    return 0;
+}
+
+/* The zombie-ns-links case: a zombie keeps its pid and user links until it
+   is reaped, as Linux's pidns_get and userns_get take them from its PID and
+   credentials, while the links that need the nsproxy it gave up at its exit
+   (exit_task_namespaces), pid_for_children among them, are ENOENT. The
+   parent waits for the child with WNOWAIT, so it stays a zombie, and compares
+   its links with its own. */
+static int zombie_ns_links_case(void) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) _exit(0);
+    siginfo_t info;
+    if (waitid(P_PID, (id_t)kid, &info, WEXITED | WNOWAIT)) return 2;
+    static const char *const kept[] = {"pid", "user"};
+    for (size_t i = 0; i < sizeof kept / sizeof *kept; i++) {
+        char path[64], own[128], its[128];
+        snprintf(path, sizeof path, "/proc/self/ns/%s", kept[i]);
+        int own_error = glf_link(path, own, sizeof own);
+        snprintf(path, sizeof path, "/proc/%d/ns/%s", (int)kid, kept[i]);
+        int its_error = glf_link(path, its, sizeof its);
+        printf("%s own=%d zombie=%d same=%d\n", kept[i], own_error, its_error,
+               !own_error && !its_error && !strcmp(own, its));
+    }
+    static const char *const gone[] = {"net", "mnt", "uts", "ipc", "cgroup",
+                                       "time", "pid_for_children", "time_for_children"};
+    for (size_t i = 0; i < sizeof gone / sizeof *gone; i++) {
+        char path[64], target[128];
+        snprintf(path, sizeof path, "/proc/%d/ns/%s", (int)kid, gone[i]);
+        printf("%s=%d\n", gone[i], glf_link(path, target, sizeof target));
     }
     int status = 0;
     waitpid(kid, &status, 0);
@@ -37566,6 +37742,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
+    if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
@@ -37596,7 +37773,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
+    if (!strcmp(mode, "smaps-rollup")) return smaps_rollup_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
+    if (!strcmp(mode, "zombie-ns-links")) return zombie_ns_links_case();
     if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);
     if (!strcmp(mode, "userns-nondumpable-target")) return userns_nondumpable_target();
     if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);

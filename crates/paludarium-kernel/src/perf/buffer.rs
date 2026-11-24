@@ -439,10 +439,8 @@ impl PageSource for Pages {
         true
     }
     fn vma_flags(&self, flags: u64) -> u64 {
-        const VM_PFNMAP: u64 = 1 << 10;
-        const VM_IO: u64 = 1 << 14;
         use paludarium_mmu::vm;
-        (flags | VM_PFNMAP | VM_IO | vm::DONTEXPAND) & !vm::MAYEXEC
+        (flags | vm::PFNMAP | vm::IO | vm::DONTEXPAND) & !vm::MAYEXEC
     }
     fn linked(&self) -> bool {
         false

@@ -1922,11 +1922,19 @@ fn live_rings(polls: &Polls) -> Vec<Arc<dyn FileHandle>> {
 }
 
 /// The thread calls `execve` (`io_uring_task_cancel`, before the new image
-/// replaces its memory): as `io_uring_cancel_generic` loops, the task work
-/// of the `IORING_SETUP_DEFER_TASKRUN` rings it submits to runs
-/// (`io_run_local_work`), the requests it submitted that wait are
-/// cancelled ([`cancel_task`]), its own task work runs, and the rings' again.
+/// replaces its memory): [`cancel_all_task`].
 pub(crate) fn exec_task(c: &mut Context<'_>) {
+    cancel_all_task(c);
+}
+
+/// `io_uring_cancel_generic` with `cancel_all`, which `execve` and a whole
+/// process's exit run (Linux master's `io_task_group_exiting`) while the
+/// thread still runs: as it loops, the task work of the
+/// `IORING_SETUP_DEFER_TASKRUN` rings the thread submits to runs
+/// (`io_run_local_work`), the requests it submitted that wait are
+/// cancelled ([`cancel_task`]), its own task work runs, and the rings'
+/// again.
+pub(crate) fn cancel_all_task(c: &mut Context<'_>) {
     let own: Vec<Arc<dyn FileHandle>> = live_rings(&c.processes.io_uring)
         .into_iter()
         .filter(|file| {
@@ -1952,15 +1960,12 @@ pub(crate) fn exec_task(c: &mut Context<'_>) {
     run_own(c);
 }
 
-/// The thread `inbox` belongs to exits (`do_exit`): its process's whole
-/// exit cancels the requests it submitted that wait ([`cancel_task`]),
-/// and the task work it still has runs as an exiting task's does
-/// ([`run_terminated`]), as will any added later. A request of a thread
-/// that exits alone waits on, and fails once its file is ready.
-pub(crate) fn exit_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>, group_exit: bool) {
-    if group_exit {
-        cancel_task(polls, inbox);
-    }
+/// The thread `inbox` belongs to exits (`do_exit`, `PF_EXITING`): the task
+/// work it still has runs as an exiting task's does ([`run_terminated`]),
+/// as will any added later. A whole process's exit ran
+/// [`cancel_all_task`] first; a request of a thread that exits alone waits
+/// on, and fails once its file is ready.
+pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
     let work = {
         let mut task_work = inbox.task_work();
         task_work.exited = true;

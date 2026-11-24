@@ -111,8 +111,9 @@ impl Task {
         !self.view.zombie
     }
     /// It still has what a task gives up at its exit: memory, descriptors,
-    /// directories and namespaces. A zombie process does not, nor a leader
-    /// that ended before its other threads.
+    /// directories and the namespaces of its `nsproxy` (not its PID and user
+    /// ones, which it keeps until it is reaped, [`namespace`]). A zombie
+    /// process does not, nor a leader that ended before its other threads.
     fn holds(&self) -> bool {
         self.live() && !self.gone
     }
@@ -213,18 +214,24 @@ impl Task {
 }
 
 /// Refuses what the reader may not see of the task: `environ`, `auxv`, `maps`,
-/// `smaps`, `pagemap`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
-/// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
-/// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself, read or
-/// looked in, as its mode lets (`proc_fd_permission`). `environ`, `auxv` and
-/// `pagemap` of a task with no memory left are `ESRCH` for a reader their mode
-/// lets open them (root's, [`Task::owned`]), as Linux's `__mem_open` and
-/// `pagemap_open` refuse them before they check the reader,
-/// while `maps` and `smaps` (`proc_maps_open`) then open for anyone and read
-/// nothing.
+/// `smaps`, `smaps_rollup`, `pagemap`, `exe`, `cwd`, the links of `ns` and
+/// `fd`, and `fdinfo` (`EACCES`), as Linux's `proc_mem_open`,
+/// `proc_fd_access_allowed`, `proc_ns_get_link` and `proc_fdinfo_permission`
+/// do; and `fd` itself, read or looked in, as its mode lets
+/// (`proc_fd_permission`). `environ`, `auxv` and `pagemap` of a task with no
+/// memory left are `ESRCH` for a reader their mode lets open them (root's,
+/// [`Task::owned`]), as Linux's `__mem_open` and `pagemap_open` refuse them
+/// before they check the reader, and `smaps_rollup` for any reader, as
+/// `smaps_rollup_open` finds no `mm`, while `maps` and `smaps`
+/// (`proc_maps_open`) then open for anyone and read nothing.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
-        TaskEntry::Environ | TaskEntry::Auxv | TaskEntry::Pagemap if task.memory().is_none() => {
+        TaskEntry::Environ
+        | TaskEntry::Auxv
+        | TaskEntry::Pagemap
+        | TaskEntry::Maps(crate::proc::MapsKind::Rollup)
+            if task.memory().is_none() =>
+        {
             Err(Errno(3)) // ESRCH
         }
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
@@ -467,12 +474,14 @@ pub(super) fn mounts(
     task.public.files.mount_view()
 }
 
-/// `maps` or `smaps` (`smaps` set) of the task, opened with `flags`, its
-/// files named from the reader's `root` as Linux's `seq_file_path` names
-/// them; empty once it has ended, as Linux's `m_start` finds no `mm`.
+/// `maps`, `smaps` or `smaps_rollup` (`kind`) of the task, opened with
+/// `flags`, its files named from the reader's `root` as Linux's
+/// `seq_file_path` names them; empty once it has ended, as Linux's
+/// `m_start` finds no `mm` (`smaps_rollup`'s open is `ESRCH` then,
+/// [`check`]).
 pub(super) fn maps(
     task: &Task,
-    smaps: bool,
+    kind: crate::proc::MapsKind,
     flags: u32,
     root: Vec<u8>,
     owner: crate::proc::Owner,
@@ -483,7 +492,7 @@ pub(super) fn maps(
             task.start_stack(),
             flags,
             root,
-            smaps,
+            kind,
             owner,
         )),
         None => std::sync::Arc::new(
@@ -990,19 +999,16 @@ pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errn
 /// The namespace a link of the task's `ns` names; none once it has ended,
 /// as Linux's task then has no `nsproxy`, and none for `pid_for_children`
 /// while that PID namespace has no init yet (`pidns_for_children_get`). A
-/// leader that ended before its other threads keeps its PID and user ones,
-/// which Linux's `pidns_get` and `userns_get` take from its PID and
-/// credentials rather than its `nsproxy`.
+/// task keeps its PID and user ones until it is reaped, a zombie and a
+/// leader that ended before its other threads too, which Linux's
+/// `pidns_get` and `userns_get` take from its PID and credentials rather
+/// than its `nsproxy`.
 pub(super) fn namespace(
     task: &Task,
     entry: crate::namespaces::Entry,
 ) -> Option<std::sync::Arc<crate::namespaces::Namespace>> {
     use crate::namespaces::Entry;
-    let kept = if matches!(entry, Entry::Pid | Entry::User) {
-        task.live()
-    } else {
-        task.holds()
-    };
+    let kept = matches!(entry, Entry::Pid | Entry::User) || task.holds();
     kept.then(|| task.view.group.namespaces(task.tid).entry(entry).clone())
         .filter(|namespace| {
             entry != crate::namespaces::Entry::PidForChildren || namespace.init().is_some()

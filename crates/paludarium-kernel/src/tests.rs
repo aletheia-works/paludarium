@@ -2298,8 +2298,22 @@ fn dev_reports_its_devices_and_lists_them() {
     assert_eq!(
         names,
         [
-            ".", "..", "fd", "full", "mqueue", "null", "ptmx", "pts", "random", "shm", "stderr",
-            "stdin", "stdout", "urandom", "zero"
+            ".",
+            "..",
+            "fd",
+            "full",
+            "mqueue",
+            "null",
+            "ptmx",
+            "pts",
+            "random",
+            "shm",
+            "stderr",
+            "stdin",
+            "stdout",
+            "urandom",
+            "userfaultfd",
+            "zero"
         ]
     );
     assert_eq!(f.ret(217, &[dir, out, 0x1000]), 0); // the end
@@ -5924,6 +5938,63 @@ mod io_uring {
             batch(&mut f, &r, &[cancel(9, 0, 4, 0)]),
             [(9, 3), (8, -125), (6, -125), (7, -125)]
         );
+    }
+
+    /// Forks, has the child submit the entry pushed at `slot` and exit,
+    /// its whole process with `group`, and gives the parent's completions.
+    fn child_submits_and_exits(
+        f: &mut Fixture,
+        r: &Ring,
+        sqe: &[u8; 64],
+        group: bool,
+    ) -> Vec<(u64, i32)> {
+        let slot = u32_at(f, r.rings + 4) & 3;
+        push(f, r, slot, sqe);
+        f.ret(57, &[0; 6]);
+        let (mut child, mut thread) = f.kernel.take_child().unwrap();
+        let memory = child.take_spawn_memory().unwrap();
+        thread.cpu.gpr[reg::RAX] = 426;
+        for (at, v) in [reg::RDI, reg::RSI, reg::RDX, reg::R10]
+            .iter()
+            .zip([r.fd, 1, 0, 0])
+        {
+            thread.cpu.gpr[*at] = v;
+        }
+        let reason = ExitReason::Syscall {
+            rip: GuestAddr(0x1000),
+        };
+        assert_eq!(child.handle(&mut thread, &memory, reason), Next::Resume);
+        assert_eq!(thread.cpu.gpr[reg::RAX], 1);
+        if group {
+            child.group.stop(ExitStatus::Exited(0));
+        }
+        child.finish_thread(&thread, &memory);
+        reap(f, r)
+    }
+
+    #[test]
+    fn a_process_that_exits_cancels_its_reads_and_a_thread_does_not() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        // The whole process's exit cancels the read at once, as Linux
+        // master's `io_task_group_exiting` does (Linux 7.0 waits for the
+        // pipe, as for a thread).
+        assert_eq!(
+            child_submits_and_exits(&mut f, &r, &rw(READ, read, HERE, buf, 8), true),
+            [(1, -125)]
+        );
+        // A thread's own exit leaves it waiting, until the pipe is ready.
+        assert_eq!(
+            child_submits_and_exits(&mut f, &r, &rw(READ, read, HERE, buf, 8), false),
+            []
+        );
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, -125)]);
+        assert_eq!(f.ret(0, &[read, buf, 8]), 2);
     }
 
     #[test]

@@ -1229,8 +1229,8 @@ impl Exec<'_> {
             );
             // A fault after an iteration of this step ends the step there,
             // with the iterations it made; the next step gives the fault,
-            // as the native JIT's code for a string move does. Only a
-            // comparison keeps going to the fault: its flags at the fault
+            // as the native JIT's code for a string move or store does. Only
+            // a comparison keeps going to the fault: its flags at the fault
             // depend on where it started (`rep_fault_flags`).
             let early = |stop: Stop| {
                 if ran && matches!(stop, Stop::Fault(_)) {

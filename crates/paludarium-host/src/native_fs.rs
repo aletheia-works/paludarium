@@ -681,8 +681,11 @@ impl FileHandle for NativeFile {
             wanted.set(rustix::fs::OFlags::NONBLOCK, f & 2048 != 0);
             let flags = (current & !mutable) | wanted;
             rustix::fs::fcntl_setfl(&*file, flags).map_err(|e| err(e.into()))?;
+            // The guest's flags keep `O_DIRECT` and `O_NOATIME` too, as
+            // Linux's `setfl` does; the host's file is left without them.
+            const SETFL: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
             let mut saved = self.flags.lock().unwrap_or_else(PoisonError::into_inner);
-            *saved = (*saved & !3072) | (f & 3072);
+            *saved = (*saved & !SETFL) | (f & SETFL);
             Ok(())
         }
         #[cfg(not(unix))]

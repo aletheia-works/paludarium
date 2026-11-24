@@ -162,11 +162,14 @@ fn take_owner(
 /// Gives `file`, open as descriptor `fd`, the status `flags` of `F_SETFL`.
 /// Only the files with `fasync` ([`has_fasync`]) keep `O_ASYNC`, and
 /// changing it registers or drops the descriptor, as Linux's `fasync` does.
+/// `direct` is whether its description may have `O_DIRECT`
+/// ([`crate::files::direct_io`]).
 pub(crate) fn set_flags(
     c: &Context<'_>,
     file: &Arc<dyn FileHandle>,
     fd: u64,
     flags: u32,
+    direct: bool,
 ) -> Result<(), Errno> {
     let flags = if has_fasync(file) {
         flags
@@ -181,6 +184,27 @@ pub(crate) fn set_flags(
             .is_ok_and(|stat| crate::files::attributes::append_only(&stat))
     {
         return Err(Errno::EPERM);
+    }
+    // `setfl`: `O_NOATIME`, newly set, only by the file's owner or with
+    // `CAP_FOWNER` (EPERM), then `O_DIRECT` only where the description may
+    // have it, or on a FIFO, where it is a pipe's packet mode (EINVAL).
+    // Either flag already set passed these when it was, so `FIOASYNC`,
+    // which keeps them as they are, never meets them, as Linux's does not.
+    let added = flags & !before;
+    if added & crate::files::O_NOATIME != 0
+        && !file
+            .stat()
+            .is_ok_and(|stat| crate::permissions::owner_or_capable(&c.process.credentials, &stat))
+    {
+        return Err(Errno::EPERM);
+    }
+    if added & crate::files::O_DIRECT != 0
+        && !direct
+        && !file
+            .stat()
+            .is_ok_and(|stat| stat.mode & 0o170000 == 0o010000)
+    {
+        return Err(Errno::EINVAL);
     }
     // A hung-up terminal's `fasync` refuses, and nothing changes.
     if (before ^ flags) & O_ASYNC != 0 && crate::pty::hung_up(file) {

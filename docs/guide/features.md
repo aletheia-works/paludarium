@@ -542,8 +542,7 @@ kernel.
   (a link in `/proc/self/fd`, `/dev/stdout`).
   `F_SETFL` changes only `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`, `O_NOATIME`
   and, on a file that signals, `O_ASYNC`; the access mode and the other
-  flags stay, as Linux's `setfl` keeps them. BPF maps and programs still
-  ignore it.
+  flags stay, as Linux's `setfl` keeps them.
 
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
   reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,
@@ -555,6 +554,14 @@ kernel.
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
   `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
+
+- `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`
+  check them. `O_DIRECT` needs a regular file of a disk file system or
+  tmpfs, or a memfd opened again by a path (`EINVAL` for a directory, a
+  device, a FIFO, a socket, an anonymous inode or a file of `/proc`);
+  `F_SETFL` also takes it on a pipe or FIFO. `O_NOATIME` needs the file's
+  owner or `CAP_FOWNER` (`EPERM`), at `open` and when `F_SETFL` newly
+  sets it.
 
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
   locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a descriptor table owns (a
@@ -950,10 +957,18 @@ kernel.
   end of its file). A writable private mapping's pages are brought in by
   writing them, as Linux's `populate_vma_page_range` does (`FOLL_WRITE`):
   a page of a file there becomes a copy of its own, which no longer shows
-  the file's later writes. `MAP_POPULATE`, `MAP_LOCKED`, `mlockall` with
-  `MCL_CURRENT` and an `mprotect` that makes a locked private mapping
-  writable do the same; a lock with `MLOCK_ONFAULT` or `MCL_ONFAULT` brings
-  nothing in. `mlockall` locks every mapping with `MCL_CURRENT`
+  the file's later writes. Any other mapping's pages are brought in by
+  reading them (`FOLL_FORCE`), which takes a page of a shmem file (a
+  memfd, a tmpfs mount's file) into the file, so that it counts in its
+  blocks at once. `MAP_POPULATE` (without `MAP_NONBLOCK`), `MAP_LOCKED`,
+  `mlockall` with `MCL_CURRENT` and a growing `mremap` of a locked mapping
+  bring their pages in the same way (`mm_populate`), but ignore a page that
+  cannot be: it ends its mapping's, so that an `mmap` past a tmpfs mount's
+  size still succeeds with the pages that fit. An `mprotect` that makes a
+  locked private mapping writable writes its pages in. A lock with
+  `MLOCK_ONFAULT` or `MCL_ONFAULT` brings nothing in, and nor does a
+  mapping without access, one of a `memfd_secret` file, or one that is
+  `VM_IO` or `VM_PFNMAP` (a perf ring). `mlockall` locks every mapping with `MCL_CURRENT`
   (`ENOMEM` when all that is mapped does not fit) and every new one with
   `MCL_FUTURE`, which `mmap`, `brk` and a growing `mremap` then need room
   for (`EAGAIN`; `brk` keeps the break), as `MAP_LOCKED` does; `munlockall`
@@ -1668,8 +1683,9 @@ kernel.
   operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
-  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, and
-  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
+  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, and
+  `IORING_OP_ASYNC_CANCEL`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
@@ -1721,6 +1737,60 @@ kernel.
   - A read that chose a provided buffer keeps it while it waits
     (`REQ_F_BUFFER_SELECTED`). A ring's buffer stays at the ring's head and
     is chosen again as the read goes on.
+
+- `IORING_OP_ASYNC_CANCEL` and `IORING_REGISTER_SYNC_CANCEL` cancel the
+  requests of their ring that wait for their files, as Linux master's
+  `io_uring/cancel.c` and `io_poll_cancel` do. No other request is ever in
+  flight to find.
+  - A cancellation matches by `user_data`, by file with
+    `IORING_ASYNC_CANCEL_FD` (a registered one with `_FD_FIXED` or
+    `IOSQE_FIXED_FILE`), by operation with `_OP`, or any request with
+    `_ANY`. With `_USERDATA` the `user_data` must match too.
+  - Without `_ALL` or `_ANY` it cancels the first match and gives 0, or
+    `ENOENT`, which fails its link. With them it cancels every match and
+    gives how many, 0 for none. The order is that of the ring's hash table
+    (`hash_long` of the `user_data`, latest first within a bucket).
+  - A cancelled request completes with `ECANCELED` as task work of the
+    thread that submitted it, after the cancellation, and fails its link. A
+    provided buffer it kept is used (`IORING_CQE_F_BUFFER`).
+  - A request whose file became ready, but whose task work has not run yet,
+    is cancelled too: it stays findable until the work runs. The bytes stay
+    in the file.
+  - `IORING_OP_ASYNC_CANCEL` refuses unknown flags, `_ANY` with `_FD` or
+    `_OP`, and an `off` or `splice_fd_in` (`EINVAL`), as Linux 7.0's
+    `io_async_cancel_prep` does. A descriptor that is not open is `EBADF`.
+  - `IORING_REGISTER_SYNC_CANCEL` takes one `struct
+    io_uring_sync_cancel_reg`. Its padding must be zero, and it gives the
+    count, 0 or `ENOENT` itself. It never waits, as nothing it finds is
+    running, so its timeout is unused.
+
+- A request's submitter or ring may go before it completes, as in Linux's
+  `io_uring_cancel_generic`, `tw.c` and `io_ring_ctx_wait_and_kill`.
+  - A thread that exits alone leaves the requests it submitted waiting.
+    Once a file is ready, its request fails with `ECANCELED` as Linux's
+    `io_fallback_tw` runs the work of a thread that is gone, and the bytes
+    stay in the file. Task work the thread still has as it exits runs so
+    too: a request whose file became ready fails with `ECANCELED`, a
+    link's next request with `EFAULT` (`io_should_terminate_tw`), and an
+    `IORING_NOP_TW` completes.
+  - `execve` cancels every request the thread submitted that waits for its
+    file, one whose file became ready too (`io_uring_task_cancel`), on the
+    old image's memory, as `io_uring_cancel_generic` loops. The task work of
+    the `IORING_SETUP_DEFER_TASKRUN` rings it submits to runs first, so a
+    request whose file became ready there goes on. Then the requests are
+    cancelled, and its task work and theirs run, so each completes with
+    `ECANCELED` before the new program runs.
+  - A ring whose last descriptor and mapping close lets go of its waiting
+    requests and the files they hold, as Linux master does before `close`
+    returns, so a pipe whose only reader was such a request takes no more
+    writes (`EPIPE`). Task work left for the ring goes with it.
+
+- `poll` and `epoll` watch a ring's descriptor as Linux's `io_uring_poll`
+  answers. It is writable while the submission queue has room, and
+  readable while completions wait in the queue or in the kernel, or while
+  an `IORING_SETUP_DEFER_TASKRUN` ring has task work. Only a completion
+  wakes a waiter, and only one that waits for input, so an edge-triggered
+  interest in output is reported once.
 
 - `IORING_OP_NOP` takes Linux 7.0's flags, as `io_nop_prep` and `io_nop`
   do. `IORING_NOP_INJECT_RESULT` completes it with its `len`.
@@ -2629,7 +2699,15 @@ kernel.
     `RTNH_F_LINKDOWN` (`fib_check_nh_nongw`, `NETDEV_CHANGE`). A route the
     guest adds through an end without a gateway is taken as well
     (`ENETDOWN` while the end is down, `ENODEV` for a device there is
-    not). An output lookup that goes through an end leaves from its first
+    not), and one with a gateway (`RTA_GATEWAY`) goes through the end it
+    names or else the one the gateway's route goes through, as
+    `fib_check_nh_v4_gw` checks it: a route of link scope or narrower,
+    unicast or local, must reach it, through that end if named, and that
+    end must be up (`ENETDOWN`); `RTNH_F_ONLINK` takes the gateway to be on
+    the named end's link, which must be up, and refuses one that is an
+    address of the namespace, a broadcast or a group (`EINVAL`). Its
+    packets go to the gateway's neighbour where a route of link scope
+    reaches the gateway (`rt_uses_gateway`), else to their destination's. An output lookup that goes through an end leaves from its first
     primary address, else from the first of the other devices' in the
     order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
     without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
@@ -2885,7 +2963,7 @@ kernel.
     table and, from the first time `lo` is up with it (for one added while
     down, if it is permanent), a unicast prefix route in the main table, of
     its priority or else metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
-    through `lo` or a veth end (for IPv4 without a gateway) or of a kind without a device (`blackhole`, `unreachable`,
+    through `lo` or a veth end or of a kind without a device (`blackhole`, `unreachable`,
     `prohibit`, `throw`) to any table, with its metric, protocol, scope,
     TOS, preferred source and a gateway (on link too), as
     `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
@@ -3618,7 +3696,8 @@ kernel.
   `clear_refs`, `smaps`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
-  gives them; the directory, `task` and `fdinfo` (0555) are the process's
+  gives them: root of the user namespace its program runs in, or the first
+  one's where that namespace maps no root; the directory, `task` and `fdinfo` (0555) are the process's
   either way, and `/proc/self` itself is root's. `stat` shows that owner and
   the mode, 0400 for `environ`, `auxv`, `pagemap`, `io`, `personality` and `syscall`, 0644 for `comm`, 0200 for
   `clear_refs` and 0444 for the other files.
@@ -3706,7 +3785,13 @@ kernel.
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
-  asks above. Its files are
+  asks above. `CAP_SYS_PTRACE` in the process's user namespace lets a reader
+  in, but for an undumpable process only that capability in the user
+  namespace its program runs in does, as Linux's `task_still_dumpable` asks:
+  the one it ran the program from, or, for a program it could not read, the
+  nearest one above that maps the file's owner and group (`would_dump`). So
+  after `unshare` of a user namespace, a process that clears
+  `PR_SET_DUMPABLE` is not readable by its children there. Its files are
   owned as this process's own are (above), an undumpable process's
   directory (0555) staying its own, and an open checks a regular
   file's mode for that owner before anything else, as Linux's
@@ -4386,8 +4471,12 @@ kernel.
   never touched a hole, with no fault). `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts
-  from none, and an `execve` keeps them. The other counts (major faults,
-  context switches, blocks) are 0. `/proc/<pid>/stat` gives the same counts
+  from none, and an `execve` keeps them. `ru_nvcsw` counts the voluntary
+  context switches, the times a thread went to sleep, as Linux's `nvcsw`,
+  for the same processes and threads and with a wait's and
+  `RUSAGE_CHILDREN`'s the children's (`cnvcsw`), as of each thread's latest
+  system call. The other counts (major faults, involuntary context
+  switches, blocks) are 0. `/proc/<pid>/stat` gives the same counts
   as `minflt` (a thread's own under `task`) and `cminflt`, and 0 as
   `majflt` and `cmajflt`.
 
@@ -5371,8 +5460,11 @@ kernel.
   mount left keeps it, and a detached one goes with the last file open on
   it), each watch on one of its files hears `IN_UNMOUNT`, with `IN_ISDIR`
   for a directory, whatever it asked for, then goes with `IN_IGNORED`, as
-  Linux's `fsnotify_sb_delete` ends them; an instance's watches go the
-  newest first. Each instance queues its events, merging one into the same
+  Linux's `fsnotify_sb_delete` ends them. The files go as
+  `fsnotify_unmount_inodes` takes them, the newest connector first: the
+  order in which they got the first of the marks of any group (an
+  inotify instance's, dnotify's or fanotify's) that they still hold, not
+  the order one instance watched them. Each instance queues its events, merging one into the same
   event (descriptor, mask and name) just before it unless that one is
   `IN_IGNORED` or a move, and after 16384 queues one `IN_Q_OVERFLOW` (with
   descriptor -1) until it is read. A read gives as many whole
@@ -5446,7 +5538,11 @@ kernel.
   The groups hear what inotify watches hear, by the same hooks, as Linux's
   `fsnotify` sends it: the file's, its mount's and its file system's marks,
   its directory's when it watches its children, and for `FAN_RENAME` the
-  new directory's. An event is queued as `fanotify_handle_event` makes it:
+  new directory's. A FIFO's or device's read or write is not its
+  directory's, as `__fsnotify_parent` keeps it from the directory's
+  interest, but a group that needs the directory and name hears of it with
+  them, without `FAN_EVENT_ON_CHILD`. An event is queued as
+  `fanotify_handle_event` makes it:
   without a FID mode only the open, access, modification and close of a
   regular file or directory, with a descriptor of it opened again with the
   group's flags, which `F_GETFL` shows with `O_CLOEXEC` and which a

@@ -66,6 +66,14 @@ struct Watch {
 pub(crate) struct Watches {
     list: Mutex<Vec<Watch>>,
     count: AtomicUsize,
+    /// The directories with dnotify's mark, each with the address of an
+    /// open file that asked for a watch of it, once for each. As Linux's, the mark
+    /// stays after a one-shot watch's signal took the last watch off
+    /// (`dnotify_handle_event`), and goes at a flush of the directory that
+    /// finds none (`dnotify_flush`).
+    marked: Mutex<Vec<(Key, usize)>>,
+    /// How many entries `marked` holds.
+    marks: AtomicUsize,
 }
 
 /// `convert_arg`: the fsnotify events of `F_NOTIFY`'s `arg`.
@@ -98,44 +106,131 @@ fn convert(arg: u32) -> u32 {
 fn same(file: &Weak<dyn FileHandle>, other: &Arc<dyn FileHandle>) -> bool {
     std::ptr::addr_eq(file.as_ptr(), Arc::as_ptr(other))
 }
+/// The address of an open file, which tells it from the others while it
+/// is open.
+fn address(file: &Arc<dyn FileHandle>) -> usize {
+    Arc::as_ptr(file).cast::<()>() as usize
+}
 
 impl Watches {
     /// Whether any watch is there, which a change must be told to.
     pub(crate) fn active(&self) -> bool {
         self.count.load(Ordering::SeqCst) != 0
     }
+    /// Whether any directory has a mark, which a close then looks at.
+    pub(crate) fn marking(&self) -> bool {
+        self.marks.load(Ordering::SeqCst) != 0
+    }
     fn list(&self) -> std::sync::MutexGuard<'_, Vec<Watch>> {
         self.list.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn marked(&self) -> std::sync::MutexGuard<'_, Vec<(Key, usize)>> {
+        self.marked.lock().unwrap_or_else(PoisonError::into_inner)
     }
     fn recount(&self, list: &[Watch]) {
         self.count.store(list.len(), Ordering::SeqCst);
     }
+    /// Takes the mark off each of `directories` that `flushed` says a
+    /// flush reached and that has no watch left in `list`.
+    fn unmark(
+        &self,
+        list: &[Watch],
+        directories: impl IntoIterator<Item = Key>,
+        flushed: &dyn Fn(&[usize]) -> bool,
+        connectors: &crate::fanotify::Registry,
+    ) {
+        let mut marked = self.marked();
+        for directory in directories {
+            if list.iter().any(|w| w.directory == directory) {
+                continue;
+            }
+            let files: Vec<usize> = marked
+                .iter()
+                .filter(|(key, _)| *key == directory)
+                .map(|&(_, file)| file)
+                .collect();
+            if !files.is_empty() && flushed(&files) {
+                marked.retain(|(key, _)| *key != directory);
+                connectors.connector_removed(directory);
+            }
+        }
+        self.marks.store(marked.len(), Ordering::SeqCst);
+    }
     /// `dnotify_flush`: a close of `file` through `table` drops what that
-    /// table asked of it. A watch whose open file is gone goes too: only a
-    /// close missed on its way could leave one.
-    pub(crate) fn flush(&self, table: u64, file: &Arc<dyn FileHandle>) {
-        if !self.active() {
+    /// table asked of it, and the mark of the directory it is, `directory`,
+    /// once no watch is left. A watch whose open file is gone goes too
+    /// (only a close missed on its way could leave one), with its
+    /// directory's mark when none is left.
+    pub(crate) fn flush(
+        &self,
+        table: u64,
+        file: &Arc<dyn FileHandle>,
+        directory: Option<Key>,
+        connectors: &crate::fanotify::Registry,
+    ) {
+        if !self.active() && !self.marking() {
             return;
         }
         let mut list = self.list();
-        list.retain(|w| w.file.strong_count() != 0 && !(w.table == table && same(&w.file, file)));
+        let mut touched: Vec<Key> = directory.into_iter().collect();
+        list.retain(|w| {
+            let gone = w.file.strong_count() == 0 || w.table == table && same(&w.file, file);
+            if gone {
+                touched.push(w.directory);
+            }
+            !gone
+        });
+        self.unmark(&list, touched, &|_| true, connectors);
         self.recount(&list);
     }
     /// Every watch of `table`, which no task uses any more: its files'
-    /// closes as it goes (`put_files_struct`) flush them all.
-    pub(crate) fn release_table(&self, table: u64) {
-        if !self.active() {
+    /// closes as it goes (`put_files_struct`) flush them all, `closed`,
+    /// taking off the marks of the directories they asked of with no watch
+    /// left.
+    pub(crate) fn release_table(
+        &self,
+        table: u64,
+        closed: &[Arc<dyn FileHandle>],
+        connectors: &crate::fanotify::Registry,
+    ) {
+        if !self.active() && !self.marking() {
             return;
         }
         let mut list = self.list();
         list.retain(|w| w.table != table);
+        let mut directories: Vec<Key> = self.marked().iter().map(|&(key, _)| key).collect();
+        directories.sort_unstable();
+        directories.dedup();
+        let closed: Vec<usize> = closed.iter().map(address).collect();
+        self.unmark(
+            &list,
+            directories,
+            &|files| files.iter().any(|f| closed.contains(f)),
+            connectors,
+        );
         self.recount(&list);
     }
     /// `attach_dn`: a table that already asked of the file adds the events
     /// to its watch, which now names `fd`; otherwise a new watch comes
-    /// first.
-    fn attach(&self, watch: Watch) {
+    /// first. The directory's first watch gives it dnotify's mark.
+    fn attach(
+        &self,
+        watch: Watch,
+        file: &Arc<dyn FileHandle>,
+        connectors: &crate::fanotify::Registry,
+    ) {
         let mut list = self.list();
+        {
+            let mut marked = self.marked();
+            if !marked.iter().any(|&(key, _)| key == watch.directory) {
+                connectors.connector_added(watch.directory);
+            }
+            let entry = (watch.directory, address(file));
+            if !marked.contains(&entry) {
+                marked.push(entry);
+            }
+            self.marks.store(marked.len(), Ordering::SeqCst);
+        }
         let found = list.iter_mut().find(|w| {
             w.table == watch.table
                 && w.file
@@ -188,11 +283,12 @@ impl Watches {
 
 /// `fcntl_dirnotify`: `fcntl(fd, F_NOTIFY, arg)` on descriptor `d`.
 pub(crate) fn fcntl(c: &Context<'_>, d: &Descriptor, fd: u64, arg: u32) -> Result<u64, Errno> {
-    let watches = &c.files.caches.notify.dn;
+    let notify = &c.files.caches.notify;
+    let watches = &notify.dn;
     let table = c.files.table();
     // No events: the watch is taken back.
     if arg & !DN_MULTISHOT == 0 {
-        watches.flush(table, &d.file);
+        watches.flush(table, &d.file, directory_of(c, d), &notify.fan);
         return Ok(0);
     }
     let stat = d.file.stat()?;
@@ -213,20 +309,36 @@ pub(crate) fn fcntl(c: &Context<'_>, d: &Descriptor, fd: u64, arg: u32) -> Resul
             },
         );
     }
-    watches.attach(Watch {
-        directory,
-        table,
-        file: Arc::downgrade(&d.file),
-        fd: fd as i32,
-        mask: convert(arg),
-        processes: Arc::downgrade(c.processes) as Weak<dyn Signaller>,
-    });
+    watches.attach(
+        Watch {
+            directory,
+            table,
+            file: Arc::downgrade(&d.file),
+            fd: fd as i32,
+            mask: convert(arg),
+            processes: Arc::downgrade(c.processes) as Weak<dyn Signaller>,
+        },
+        &d.file,
+        &notify.fan,
+    );
     Ok(0)
+}
+
+/// The directory the open file of `d` is, which a flush takes the mark of.
+fn directory_of(c: &Context<'_>, d: &Descriptor) -> Option<Key> {
+    let stat = d.file.stat().ok()?;
+    (stat.mode & 0o170000 == 0o040000).then(|| (crate::files::descriptor_device(c, d), stat.inode))
 }
 
 /// After a close of `d` through this task's table (`filp_flush`).
 pub(crate) fn closed(c: &Context<'_>, d: &Descriptor) {
-    c.files.caches.notify.dn.flush(c.files.table(), &d.file);
+    let notify = &c.files.caches.notify;
+    if !notify.dn.active() && !notify.dn.marking() {
+        return;
+    }
+    notify
+        .dn
+        .flush(c.files.table(), &d.file, directory_of(c, d), &notify.fan);
 }
 
 #[cfg(test)]

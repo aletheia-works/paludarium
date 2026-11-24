@@ -4901,7 +4901,7 @@ mod io_uring {
         let supported: Vec<u64> = (0..58)
             .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
             .collect();
-        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 20, 22, 23, 29, 31, 32]);
+        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 14, 20, 22, 23, 29, 31, 32]);
         // A probe that is not zeroed, buffers without an argument, another
         // operation, another file.
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 1]), errno(Errno::EINVAL));
@@ -5763,6 +5763,130 @@ mod io_uring {
         );
         assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
         assert_eq!(reap(&mut f, &r), [(1, -105)]);
+    }
+
+    /// An `IORING_OP_ASYNC_CANCEL` of `user_data` with `flags` and `fd`.
+    fn cancel(user_data: u64, target: u64, flags: u32, fd: i32) -> [u8; 64] {
+        let mut e = sqe(14, user_data);
+        e[4..8].copy_from_slice(&fd.to_le_bytes());
+        e[16..24].copy_from_slice(&target.to_le_bytes());
+        e[28..32].copy_from_slice(&flags.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn a_cancellation_finds_the_reads_that_wait() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        // The cancellation completes, then the read as task work, and its
+        // link with it.
+        let mut first = rw(READ, read, HERE, buf, 8);
+        first[1] = 1 << 2;
+        assert_eq!(batch(&mut f, &r, &[first, nop(2, 0, 0, 0, 0)]), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 1, 0, 0)]),
+            [(9, 0), (1, -125), (2, -125)]
+        );
+        assert_eq!(one(&mut f, &r, &cancel(9, 1, 0, 0)), -2);
+        // Every one of a user_data, or any; by file; and what it refuses.
+        let mut two = rw(READ, read, HERE, buf, 8);
+        two[32..40].copy_from_slice(&5u64.to_le_bytes());
+        assert_eq!(batch(&mut f, &r, &[two, two]), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 5, 1, 0)]),
+            [(9, 2), (5, -125), (5, -125)]
+        );
+        assert_eq!(one(&mut f, &r, &cancel(9, 5, 1, 0)), 0);
+        assert_eq!(batch(&mut f, &r, &[rw(READ, read, HERE, buf, 8)]), []);
+        assert_eq!(one(&mut f, &r, &cancel(9, 0, 2, 1000)), -9);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 0, 2, read as i32)]),
+            [(9, 0), (1, -125)]
+        );
+        // An operation past `IORING_OP_LAST` matches no request, as on
+        // Linux 7.0; Linux master's `io_async_cancel_prep` refuses it
+        // (`EINVAL`).
+        let mut past_last = cancel(9, 0, 32, 0);
+        past_last[24..28].copy_from_slice(&255u32.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &past_last), -2);
+        for refused in [
+            cancel(9, 0, 1 << 6, 0),
+            cancel(9, 0, 4 | 2, 0),
+            cancel(9, 0, 4 | 32, 0),
+        ] {
+            assert_eq!(one(&mut f, &r, &refused), -22);
+        }
+        // The bytes stay in the pipe.
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), []);
+        assert_eq!(f.ret(0, &[read, buf, 8]), 2);
+        // In the order of the ring's hash: user_data 6 and 8 are in its
+        // first bucket, the latest first, and 7 in the second.
+        let reads: Vec<[u8; 64]> = [6u64, 7, 8]
+            .iter()
+            .map(|data| {
+                let mut e = rw(READ, read, HERE, buf, 8);
+                e[32..40].copy_from_slice(&data.to_le_bytes());
+                e
+            })
+            .collect();
+        assert_eq!(batch(&mut f, &r, &reads), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(9, 0, 4, 0)]),
+            [(9, 3), (8, -125), (6, -125), (7, -125)]
+        );
+    }
+
+    #[test]
+    fn a_ring_that_closes_lets_go_of_the_reads_that_wait() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        assert_eq!(batch(&mut f, &r, &[rw(READ, read, HERE, buf, 8)]), []);
+        // Its pipe's only reader is the read: once the ring goes, it takes no
+        // more writes.
+        assert_eq!(f.ret(3, &[read]), 0);
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(11, &[r.rings, r.array + 16]), 0);
+        assert_eq!(f.ret(11, &[r.sqes, 4096]), 0);
+        assert_eq!(f.ret(3, &[r.fd]), 0);
+        // SIGPIPE is ignored, so the write gives EPIPE.
+        f.mem.write(GuestAddr(DATA + 0x100), &[0; 32]).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(13, &[13, DATA + 0x100, 0, 8]), 0);
+        assert_eq!(f.ret(1, &[write, DATA, 2]), errno(Errno::EPIPE));
+    }
+
+    #[test]
+    fn a_ring_is_readable_with_completions_and_writable_with_room() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let fds = DATA + 0x300;
+        let poll = |f: &mut Fixture| {
+            f.mem
+                .write(GuestAddr(fds), &r.fd.to_le_bytes()[..4])
+                .unwrap();
+            f.mem
+                .write(GuestAddr(fds + 4), &0x145u32.to_le_bytes())
+                .unwrap();
+            assert!(f.ret(7, &[fds, 1, 0]) <= 1);
+            u16::from_le_bytes(bytes(f, fds + 6, 2).try_into().unwrap())
+        };
+        assert_eq!(poll(&mut f), 0x104);
+        let slot = u32_at(&f, r.rings + 4) & 3;
+        push(&mut f, &r, slot, &nop(1, 0, 0, 0, 0));
+        assert_eq!(f.ret(426, &[r.fd, 1, 0, 0]), 1);
+        assert_eq!(poll(&mut f), 0x145);
+        assert_eq!(reap(&mut f, &r), [(1, 0)]);
+        assert_eq!(poll(&mut f), 0x104);
     }
 
     #[test]
@@ -7927,6 +8051,61 @@ mod inotify {
         );
     }
     #[test]
+    fn a_fifos_reads_and_writes_carry_its_name_to_a_group_that_needs_it() {
+        // `__fsnotify_parent`: the directory's interest does not count for
+        // a FIFO's read or write, but a filesystem mark of a group reporting
+        // the parent's name still has it, without `FAN_EVENT_ON_CHILD`.
+        let mut f = fixture();
+        let q = put(&f, DATA, b"/tmp/q");
+        let p = put(&f, DATA + 0x20, b"/tmp/q/p");
+        let byte = put(&f, DATA + 0x40, b"x");
+        assert_eq!(f.ret(83, &[q, 0o700]), 0);
+        assert_eq!(f.ret(133, &[p, 0o010644, 0]), 0);
+        // FAN_NONBLOCK | FAN_REPORT_DFID_NAME | FAN_REPORT_FID.
+        let sb = f.ret(300, &[0xe02, 0, 0, 0, 0, 0]);
+        let dir = f.ret(300, &[0xe02, 0, 0, 0, 0, 0]);
+        // FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_ACCESS | FAN_MODIFY.
+        assert_eq!(f.ret(301, &[sb, 0x101, 3, -100i64 as u64, q, 0]), 0);
+        // FAN_MARK_ADD on the directory, with FAN_EVENT_ON_CHILD.
+        assert_eq!(f.ret(301, &[dir, 1, 0x800_0003, -100i64 as u64, q, 0]), 0);
+        let fifo = f.ret(2, &[p, 0o4002, 0]);
+        assert_eq!(f.ret(1, &[fifo, byte, 1]), 1);
+        assert_eq!(f.ret(0, &[fifo, DATA + 0x60, 1]), 1);
+        let buf = DATA + 0x100;
+        let n = f.ret(0, &[sb, buf, 4096]);
+        let mut bytes = vec![0; n as usize];
+        f.mem.read(GuestAddr(buf), &mut bytes).unwrap();
+        let mut seen = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let meta = u16::from_le_bytes(bytes[at + 6..at + 8].try_into().unwrap()) as usize;
+            let mask = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap());
+            let mut names = Vec::new();
+            let mut info = at + meta;
+            while info < at + len {
+                let kind = bytes[info];
+                let info_len =
+                    u16::from_le_bytes(bytes[info + 2..info + 4].try_into().unwrap()) as usize;
+                if kind == 2 {
+                    let handle = info + 12;
+                    let size =
+                        u32::from_le_bytes(bytes[handle..handle + 4].try_into().unwrap()) as usize;
+                    let name = &bytes[handle + 8 + size..info + info_len];
+                    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                    names.push(name[..end].to_vec());
+                }
+                info += info_len;
+            }
+            seen.push((mask, names));
+            at += len;
+        }
+        // The write and the read merge into one event, as both have the same
+        // file, directory and name (`fanotify_should_merge`).
+        assert_eq!(seen, [(3, vec![b"p".to_vec()])]);
+        assert_eq!(f.ret(0, &[dir, buf, 4096]), errno(Errno::EAGAIN));
+    }
+    #[test]
     fn the_calls_are_checked_in_linuxs_order() {
         let mut f = fixture();
         assert_eq!(f.ret(INIT1, &[1]), errno(Errno::EINVAL));
@@ -8147,6 +8326,70 @@ mod inotify {
             masks(&events(&mut f, one)),
             [(wd, 0x2000, &b""[..]), (wd, 0x8000, b"")]
         );
+    }
+    /// `fsnotify_unmount_inodes` takes the files by their connectors, the
+    /// newest first: a file's comes with its first mark of any group
+    /// (another instance's, dnotify's, fanotify's), not with this
+    /// instance's watch.
+    #[test]
+    fn a_superblocks_end_follows_when_its_files_were_first_marked() {
+        let mut f = fixture();
+        let none = put(&f, DATA, b"none");
+        let tmpfs = put(&f, DATA + 0x10, b"tmpfs");
+        let m = put(&f, DATA + 0x20, b"/tmp/m");
+        let names = ["x", "y", "z", "v", "w"];
+        let mut paths = Vec::new();
+        assert_eq!(f.ret(83, &[m, 0o755]), 0);
+        assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+        for (at, name) in names.iter().enumerate() {
+            let path = put(
+                &f,
+                DATA + 0x40 + 0x20 * at as u64,
+                format!("/tmp/m/{name}").as_bytes(),
+            );
+            let d = f.ret(2, &[path, 0o101, 0o600]);
+            assert_eq!(f.ret(3, &[d]), 0);
+            paths.push(path);
+        }
+        let [x, y, z, v, w] = paths[..] else {
+            unreachable!()
+        };
+        let d = put(&f, DATA + 0x100, b"/tmp/m/d");
+        assert_eq!(f.ret(83, &[d, 0o755]), 0);
+        let one = f.ret(INIT1, &[IN_NONBLOCK]);
+        let two = f.ret(INIT1, &[IN_NONBLOCK]);
+        // Another instance marks x first.
+        f.ret(ADD, &[two, x, 0x2]);
+        let wy = f.ret(ADD, &[one, y, 0x2]) as i32;
+        let wx = f.ret(ADD, &[one, x, 0x2]) as i32;
+        // dnotify marks d (`F_NOTIFY`, `DN_CREATE`) before this instance.
+        let dir = f.ret(2, &[d, 0o200000, 0]);
+        assert_eq!(f.ret(72, &[dir, 1026, 0x4]), 0);
+        let wz = f.ret(ADD, &[one, z, 0x2]) as i32;
+        let wd = f.ret(ADD, &[one, d, 0x2]) as i32;
+        // A fanotify group marks w (`FAN_OPEN`) before this instance.
+        let fan = f.ret(300, &[0x2, 0, 0, 0, 0, 0]);
+        assert_eq!(f.ret(301, &[fan, 1, 0x20, -100i64 as u64, w, 0]), 0);
+        let wv = f.ret(ADD, &[one, v, 0x2]) as i32;
+        let ww = f.ret(ADD, &[one, w, 0x2]) as i32;
+        // Detached, the superblock goes with the directory's descriptor,
+        // whose close takes dnotify's mark off; the instance's keeps d's
+        // connector.
+        assert_eq!(f.ret(166, &[m, 2]), 0);
+        assert_eq!(f.ret(3, &[dir]), 0);
+        let mut expected = Vec::new();
+        for (wd, mask) in [
+            (wv, 0x2000),
+            (ww, 0x2000),
+            (wz, 0x2000),
+            (wd, 0x4000_2000),
+            (wy, 0x2000),
+            (wx, 0x2000),
+        ] {
+            expected.push((wd, mask, &b""[..]));
+            expected.push((wd, 0x8000, &b""[..]));
+        }
+        assert_eq!(masks(&events(&mut f, one)), expected);
     }
     #[test]
     fn a_descriptor_is_heard_of_where_renames_took_its_file() {
@@ -11696,4 +11939,36 @@ fn a_bind_of_proc_shows_its_files_in_a_new_root() {
     assert_eq!(f.ret(3, &[fd]), 0);
     let missing = put(&mut f, 0xe0, b"/proc/nosuch");
     assert_eq!(f.ret(2, &[missing, 0, 0]), errno(Errno::ENOENT));
+}
+
+mod context_switches {
+    use super::*;
+
+    /// `ru_nvcsw` of a `struct rusage` at `at`.
+    fn nvcsw(f: &Fixture, at: u64) -> u64 {
+        f.mem.read_u64(GuestAddr(at + 128)).unwrap()
+    }
+
+    #[test]
+    fn getrusage_gives_the_sleeps_as_voluntary_context_switches() {
+        let mut f = fixture();
+        let at = DATA + 0x200;
+        assert_eq!(f.ret(98, &[0, at]), 0);
+        let before = (nvcsw(&f, at), {
+            assert_eq!(f.ret(98, &[1, at]), 0);
+            nvcsw(&f, at)
+        });
+        // Two sleeps on the host, counted at the next system call.
+        paludarium_host::switches::sleep(&mut false);
+        paludarium_host::switches::sleep(&mut false);
+        assert_eq!(f.ret(98, &[0, at]), 0);
+        let process = nvcsw(&f, at);
+        assert_eq!(f.ret(98, &[1, at]), 0);
+        let thread = nvcsw(&f, at);
+        assert_eq!((process - before.0, thread - before.1), (2, 2));
+        // No involuntary one, and no child's yet.
+        assert_eq!(f.mem.read_u64(GuestAddr(at + 136)).unwrap(), 0);
+        assert_eq!(f.ret(98, &[u64::MAX, at]), 0);
+        assert_eq!(nvcsw(&f, at), 0);
+    }
 }

@@ -138,8 +138,13 @@ pub(crate) fn unchangeable(stat: &FileStat) -> Result<(), Errno> {
 
 /// `may_open`'s checks of the flags of a file that is not a directory or a
 /// symbolic link: an immutable one is not opened to write or truncate,
-/// and an append-only one only to append (EPERM).
-pub(crate) fn may_open(stat: &FileStat, flags: u32) -> Result<(), Errno> {
+/// and an append-only one only to append; then `O_NOATIME` only by the
+/// file's owner or with `CAP_FOWNER` (EPERM).
+pub(crate) fn may_open(
+    creds: &crate::credentials::Credentials,
+    stat: &FileStat,
+    flags: u32,
+) -> Result<(), Errno> {
     const O_TRUNC: u32 = 0o1000;
     const O_APPEND: u32 = 0o2000;
     let writes = flags & 3 != 0;
@@ -147,6 +152,9 @@ pub(crate) fn may_open(stat: &FileStat, flags: u32) -> Result<(), Errno> {
         return Err(Errno::EPERM);
     }
     if append_only(stat) && ((writes && flags & O_APPEND == 0) || flags & O_TRUNC != 0) {
+        return Err(Errno::EPERM);
+    }
+    if flags & crate::files::O_NOATIME != 0 && !crate::permissions::owner_or_capable(creds, stat) {
         return Err(Errno::EPERM);
     }
     Ok(())

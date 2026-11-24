@@ -481,7 +481,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   除いて `O_LARGEFILE` がありません。
   `F_SETFL` が変えるのは `O_APPEND`、`O_NONBLOCK`、`O_DIRECT`、`O_NOATIME` と、
   シグナルを送れるファイルでの `O_ASYNC` だけで、アクセスモードとほかのフラグは
-  Linux の `setfl` と同じく残ります。BPF のマップとプログラムは、まだこれを無視します。
+  Linux の `setfl` と同じく残ります。
 
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
   読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`splice`、`tee`、`vmsplice`、`fsync`、
@@ -490,6 +490,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
   `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
   `close` は受け付け、`*at` の呼び出しではディレクトリになります。
+
+- `O_DIRECT` と `O_NOATIME` は、Linux の `open` と `F_SETFL` と同じく確かめます。
+  `O_DIRECT` には、ディスクのファイルシステムか tmpfs の通常のファイル、またはパスで開き直した
+  memfd が要ります（ディレクトリ、デバイス、FIFO、ソケット、匿名 inode、`/proc` のファイルは
+  `EINVAL`）。`F_SETFL` はパイプと FIFO の `O_DIRECT` も受け付けます。`O_NOATIME` には、
+  `open` のときと `F_SETFL` で新たに付けるときに、ファイルの所有者か `CAP_FOWNER` が要ります
+  （`EPERM`）。
 
 - `fcntl` のバイト範囲のロックを、Linux の `fs/locks.c` と同じく扱います。記述子の表
   （Linux の `files_struct` と同じく、プロセスのもので、そのスレッドと `CLONE_FILES` で
@@ -853,9 +860,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先）があれば `ENOMEM` を返します。書き込めるプライベートなマッピングのページは、
   Linux の `populate_vma_page_range` と同じく書き込んで取り込みます（`FOLL_WRITE`）。
   そこにあるファイルのページは自分だけのコピーになり、そのあとのファイルへの書き込みは
-  見えなくなります。`MAP_POPULATE`、`MAP_LOCKED`、`MCL_CURRENT` の `mlockall`、
-  ロックしたプライベートなマッピングを書き込めるようにする `mprotect` も同じです。
-  `MLOCK_ONFAULT` や `MCL_ONFAULT` のロックは何も取り込みません。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
+  見えなくなります。ほかのマッピングのページは読んで取り込みます（`FOLL_FORCE`）。
+  shmem のファイル（memfd、tmpfs マウントのファイル）のページはそれでファイルのものになり、
+  すぐにそのブロックに数えます。`MAP_POPULATE`（`MAP_NONBLOCK` なし）、`MAP_LOCKED`、
+  `MCL_CURRENT` の `mlockall`、ロックしたマッピングを広げる `mremap` も同じように取り込み
+  ますが（`mm_populate`）、取り込めないページは無視します。そのページでそのマッピングの分を
+  やめるので、tmpfs マウントの大きさを超える `mmap` も、入るページだけで成功します。
+  ロックしたプライベートなマッピングを書き込めるようにする `mprotect` は、ページを書き込んで
+  取り込みます。`MLOCK_ONFAULT` や `MCL_ONFAULT` のロックは何も取り込まず、アクセスの
+  できないマッピング、`memfd_secret` のファイルのもの、`VM_IO` か `VM_PFNMAP` のもの
+  （perf のリング）も取り込みません。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
   （マップしているもの全部が収まらなければ `ENOMEM`）、`MCL_FUTURE` で新しいマッピングを
   ロックします。そのあとの `mmap`、`brk`、広がる `mremap` には、`MAP_LOCKED` と同じく
   空きが要ります（`EAGAIN`。`brk` は区切りを変えません）。`munlockall` はどちらも
@@ -1480,7 +1494,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
-  それに `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、それに `IORING_OP_ASYNC_CANCEL` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
@@ -1520,6 +1534,52 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     割り込みません。
   - 提供バッファーを選んだ読み出しは、待つあいだそれを保ちます（`REQ_F_BUFFER_SELECTED`）。
     リングのバッファーはリングの先頭に残り、読み出しが続くときにもう一度選ばれます。
+
+- `IORING_OP_ASYNC_CANCEL` と `IORING_REGISTER_SYNC_CANCEL` は、Linux master の
+  `io_uring/cancel.c` と `io_poll_cancel` と同じく、そのリングでファイルを待つ要求を取り消します。
+  ほかの要求が実行中になることはないので、見つけるものはそれだけです。
+  - 取り消しは `user_data` で、`IORING_ASYNC_CANCEL_FD` ならファイルで（`_FD_FIXED` か
+    `IOSQE_FIXED_FILE` なら登録したファイルで）、`_OP` なら操作で一致を探し、`_ANY` なら
+    どの要求にも一致します。`_USERDATA` があれば `user_data` も一致しなければなりません。
+  - `_ALL` も `_ANY` もなければ、最初に一致したものを取り消して 0 を返し、なければ
+    `ENOENT` を返してリンクを失敗させます。どちらかがあれば一致したものをすべて取り消して
+    その数を返し、なければ 0 です。順序はリングのハッシュ表のもの（`user_data` の
+    `hash_long`、同じバケツでは新しいものが先）です。
+  - 取り消された要求は、取り消しのあとで、投入したスレッドのタスクワークとして
+    `ECANCELED` で完了し、リンクを失敗させます。保っていた提供バッファーは使われます
+    （`IORING_CQE_F_BUFFER`）。
+  - ファイルの準備ができても、タスクワークがまだ実行されていない要求も取り消されます。
+    タスクワークが実行されるまでは見つかるからです。ファイルのバイトは残ります。
+  - `IORING_OP_ASYNC_CANCEL` は、Linux 7.0 の `io_async_cancel_prep` と同じく、知らない
+    フラグ、`_FD` か `_OP` と一緒の `_ANY`、`off` か `splice_fd_in` を断ります（`EINVAL`）。
+    開いていない記述子は `EBADF` です。
+  - `IORING_REGISTER_SYNC_CANCEL` は `struct io_uring_sync_cancel_reg` を一つ取ります。
+    詰め物は 0 でなければならず、数か 0 か `ENOENT` をそのまま返します。見つけるものが
+    実行中になることはないので待つことはなく、タイムアウトは使いません。
+
+- 要求が完了する前に、投入したスレッドやリングがなくなることがあります。Linux の
+  `io_uring_cancel_generic`、`tw.c`、`io_ring_ctx_wait_and_kill` と同じく扱います。
+  - ひとりで終わるスレッドが投入した要求は待ち続けます。ファイルの準備ができると、Linux の
+    `io_fallback_tw` がいなくなったスレッドのタスクワークを実行するとおりに `ECANCELED` で
+    失敗し、バイトはファイルに残ります。スレッドが終わるときにまだ持っているタスクワークも
+    同じく実行されます。ファイルの準備ができた要求は `ECANCELED` で、リンクの次の要求は
+    `EFAULT` で失敗し（`io_should_terminate_tw`）、`IORING_NOP_TW` は完了します。
+  - `execve` は、`io_uring_cancel_generic` のループと同じく古いイメージのメモリの上で、
+    そのスレッドが投入してファイルを待っている要求を、ファイルの準備ができたものも含めて
+    すべて取り消します（`io_uring_task_cancel`）。先にそのスレッドが投入する
+    `IORING_SETUP_DEFER_TASKRUN` のリングのタスクワークが実行されるので、そこでファイルの
+    準備ができた要求は続きます。そのあと要求が取り消され、スレッドとリングのタスクワークが
+    実行されるので、どれも新しいプログラムが動く前に `ECANCELED` で完了します。
+  - 最後の記述子とマッピングが閉じたリングは、待っている要求とそれが持つファイルを手放します。
+    Linux master が `close` から戻る前にそうするのと同じで、そのような要求だけが読み手だった
+    パイプは、それ以上書き込みを受け付けません（`EPIPE`）。リングに残ったタスクワークも
+    一緒に消えます。
+
+- `poll` と `epoll` は、Linux の `io_uring_poll` が答えるとおりにリングの記述子を見ます。
+  投入キューに空きがあれば書き込み可能で、完了がキューかカーネルで待っているか、
+  `IORING_SETUP_DEFER_TASKRUN` のリングにタスクワークがあれば読み出し可能です。待つものを
+  起こすのは完了だけで、それも入力を待つものだけなので、出力へのエッジトリガーの関心は
+  一度だけ報告されます。
 
 - `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
   `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は
@@ -2298,7 +2358,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     リンクのメッセージの後でアドレスごとにそれらの経路ができます。下がると、ローカル経路の
     ほかは何も伝えずに消えます。上がっていてキャリアがない間は `RTNH_F_LINKDOWN` です
     （`fib_check_nh_nongw`、`NETDEV_CHANGE`）。ゲスト自身が足す、ゲートウェイのない端を
-    通る経路も取ります（端が下がっていれば `ENETDOWN`、ないデバイスは `ENODEV`）。端を
+    通る経路も取ります（端が下がっていれば `ENETDOWN`、ないデバイスは `ENODEV`）。
+    ゲートウェイ（`RTA_GATEWAY`）のある経路は、`fib_check_nh_v4_gw` と同じく確かめて、
+    名前の端を、なければゲートウェイへの経路が通る端を通します。リンクスコープ以下の
+    ユニキャストかローカルの経路がゲートウェイに届き（端の名前があればそれを通って）、
+    その端が上がっていなければなりません（`ENETDOWN`）。`RTNH_F_ONLINK` はゲートウェイを
+    名前の端のリンク上にあるものとし（端は上がっていなければなりません）、名前空間の
+    アドレス、ブロードキャスト、グループのものは断ります（`EINVAL`）。パケットは、
+    リンクスコープの経路がゲートウェイに届くときはゲートウェイの近隣へ
+    （`rt_uses_gateway`）、ほかは宛先の近隣へ出ていきます。端を
     通る出力の経路の検索は、端の最初のプライマリアドレスから、なければほかのデバイスの
     作られた順で最初のものから出て（`inet_select_addr`）、その端を `RTA_OIF` に、
     `RTCF_LOCAL` なしで答えます。`lo` から端へ転送する検索もその端を答え、送り元を
@@ -2510,7 +2578,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     上がってからは（落ちている間に足したものは永続のときだけ）、メインの表に、アドレスの
     優先度か、なければメトリック 256 のユニキャストの接頭辞の経路があります（`::1` には
     ありません）。`RTM_NEWROUTE` は、`inet_rtm_newroute` と `inet6_rtm_newroute` と同じく、
-    `lo` か veth の端（IPv4 ではゲートウェイのない経路）を通る経路か、デバイスのない種類（`blackhole`、`unreachable`、`prohibit`、
+    `lo` か veth の端を通る経路か、デバイスのない種類（`blackhole`、`unreachable`、`prohibit`、
     `throw`）の経路を、どの表にも足します。メトリック、プロトコル、スコープ、TOS、
     優先する送り元、ゲートウェイ（オンリンクも）を持てます。`NLM_F_EXCL`、
     `NLM_F_REPLACE`、`NLM_F_APPEND`、`NLM_F_CREATE` に従って Linux と同じ場所に置くか、
@@ -3136,7 +3204,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、
   `pagemap`、`wchan`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
-  `PR_SET_DUMPABLE` まで）root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
+  `PR_SET_DUMPABLE` まで）root です。この root は、そのプログラムが動くユーザー名前空間の
+  root で、その名前空間が root を対応づけていなければ最初の名前空間の root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
   プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
   その持ち主とモード（`environ`、`auxv`、`pagemap`、`io`、`personality`、`syscall` は 0400、`comm` は 0644、`clear_refs`
   は 0200、ほかのファイルは 0444）を示します。
@@ -3211,7 +3280,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
-  同じです。ファイルの持ち主はこのプロセス自身のもの（前述）と
+  同じです。プロセスのユーザー名前空間での `CAP_SYS_PTRACE` があれば読めますが、ダンプできない
+  プロセスは、Linux の `task_still_dumpable` と同じく、そのプログラムが動くユーザー名前空間での
+  その権限がなければ読めません。それはプログラムを実行したときの名前空間で、読めない
+  プログラムなら、ファイルの持ち主とグループを対応づけている最も近い上の名前空間です
+  （`would_dump`）。そのため、ユーザー名前空間を `unshare` したあと `PR_SET_DUMPABLE` を外した
+  プロセスは、そこでの子プロセスからも読めません。ファイルの持ち主はこのプロセス自身のもの（前述）と
   同じで（ダンプできないプロセスのディレクトリ（0555）もそのプロセスのものです）、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
   ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
   `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
@@ -3803,8 +3877,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（一度も触れていない無名メモリは
   穴として残し、フォールトしません）です。`RUSAGE_SELF` はプロセスのスレッドの合計、
   `RUSAGE_THREAD` はそのスレッドのもの、`RUSAGE_CHILDREN` と wait は CPU 時間と同じく
-  子のものです。fork した子は 0 から始まり、`execve` は保ちます。ほかの値
-  （メジャーフォールト、コンテキストスイッチ、ブロック）は 0 です。`/proc/<pid>/stat` は
+  子のものです。fork した子は 0 から始まり、`execve` は保ちます。`ru_nvcsw` は
+  Linux の `nvcsw` と同じく自発的なコンテキストスイッチ、つまりスレッドが眠った回数を、
+  同じプロセスとスレッドについて数え、wait と `RUSAGE_CHILDREN` では子のもの（`cnvcsw`）を
+  数えます。どれも各スレッドの最後のシステムコールの時点の値です。ほかの値
+  （メジャーフォールト、非自発的なコンテキストスイッチ、ブロック）は 0 です。`/proc/<pid>/stat` は
   同じ数を `minflt`（`task` の下ではそのスレッドのもの）と `cminflt` に示し、`majflt` と
   `cmajflt` は 0 です。
 
@@ -4630,8 +4707,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   残っていれば消えず、切り離したものはそこで開いている最後のファイルが閉じられたときに
   消えます）、そのファイルのウォッチはどれも、何を求めていても `IN_UNMOUNT`
   （ディレクトリなら `IN_ISDIR` 付き）を受け取り、`IN_IGNORED` とともに消えます。
-  Linux の `fsnotify_sb_delete` と同じです。インスタンスのウォッチは新しいものから
-  消えます。インスタンスはイベントを溜め、直前のイベントと同じもの（ディスクリプタ、
+  Linux の `fsnotify_sb_delete` と同じです。ファイルは `fsnotify_unmount_inodes` と同じく
+  新しいコネクタから順に扱います。これは、ファイルが今も持つマーク（inotify のインスタンス、
+  dnotify、fanotify のどれのものでも）の最初のものを得た順で、1 つのインスタンスが見張った
+  順ではありません。インスタンスはイベントを溜め、直前のイベントと同じもの（ディスクリプタ、
   マスク、名前）は、それが `IN_IGNORED` か名前の変更でなければまとめます。16384 個
   溜まると、読まれるまで `IN_Q_OVERFLOW`（ディスクリプタは -1）を 1 つだけ溜めます。
   読み込みは入るだけの `struct inotify_event` を返し、名前は 16 バイトの倍数まで NUL で
@@ -4693,8 +4772,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変更で消えます。
   グループは inotify と同じフックで、Linux の `fsnotify` と同じくイベントを受けます。
   ファイル、そのマウント、そのファイルシステムのマーク、子を見ているときのディレクトリの
-  マーク、`FAN_RENAME` では新しいディレクトリのマークです。イベントは
-  `fanotify_handle_event` と同じに作って溜めます。FID モードでなければ、通常のファイルか
+  マーク、`FAN_RENAME` では新しいディレクトリのマークです。FIFO やデバイスの読み書きは、
+  `__fsnotify_parent` がディレクトリの関心から外すのでディレクトリには届きませんが、
+  ディレクトリと名前が要るグループには、`FAN_EVENT_ON_CHILD` なしでそれらをつけて届きます。
+  イベントは `fanotify_handle_event` と同じに作って溜めます。FID モードでなければ、通常のファイルか
   ディレクトリを開く、読む、変える、閉じることだけで、グループのフラグで開き直した
   ディスクリプタがつきます。`dentry_open` と同じく、`F_GETFL` には `O_CLOEXEC` が残り、
   ディレクトリも書くために開きます（どのウォッチにも何も知らせないもの。開けなければ

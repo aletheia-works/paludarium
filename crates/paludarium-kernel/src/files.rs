@@ -3478,6 +3478,68 @@ pub(crate) fn iovecs_checked(
     Ok(segments)
 }
 /// Copies `bytes` into the guest buffers of `segments`, in order.
+/// The memory an aio or io_uring transfer moves bytes to or from: the
+/// program's, at the addresses of `segments` as they are mapped at the
+/// time, or `len` bytes from `at` of a registered buffer's pinned pages
+/// ([`paludarium_mmu::Pinned`]), whatever maps them now.
+#[derive(Clone, Copy)]
+pub(crate) enum Memory<'a> {
+    Guest(&'a [(u64, usize)]),
+    Pinned {
+        pages: &'a paludarium_mmu::Pinned,
+        at: usize,
+        len: usize,
+    },
+}
+
+impl Memory<'_> {
+    fn total(&self) -> usize {
+        match self {
+            Memory::Guest(segments) => segments.iter().map(|&(_, length)| length).sum(),
+            Memory::Pinned { len, .. } => *len,
+        }
+    }
+    /// Checks that the first `len` bytes may be written (`EFAULT`), which
+    /// pinned pages always may.
+    fn writable_prefix(&self, c: &Context<'_>, len: usize) -> Result<(), Errno> {
+        match self {
+            Memory::Guest(segments) => writable_prefix(c, segments, len),
+            Memory::Pinned { .. } => Ok(()),
+        }
+    }
+    /// Stores `bytes` from the start.
+    fn scatter(&self, c: &Context<'_>, bytes: &[u8]) -> Result<(), Errno> {
+        match self {
+            Memory::Guest(segments) => scatter(c, segments, bytes),
+            Memory::Pinned { pages, at, len } => {
+                pages.write(*at, &bytes[..bytes.len().min(*len)]);
+                Ok(())
+            }
+        }
+    }
+    /// Appends every byte to `bytes`.
+    fn gather(&self, c: &Context<'_>, bytes: &mut Vec<u8>) -> Result<(), Errno> {
+        bytes.try_reserve(self.total()).map_err(|_| Errno::ENOMEM)?;
+        match self {
+            Memory::Guest(segments) => {
+                for &(base, length) in *segments {
+                    let start = bytes.len();
+                    bytes.resize(start + length, 0);
+                    c.mem
+                        .read(GuestAddr(base), &mut bytes[start..])
+                        .map_err(|_| Errno::EFAULT)?;
+                }
+            }
+            Memory::Pinned { pages, at, len } => {
+                let start = bytes.len();
+                bytes.resize(start + len, 0);
+                pages.read(*at, &mut bytes[start..]);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn scatter(
     c: &Context<'_>,
     segments: &[(u64, usize)],
@@ -3645,10 +3707,11 @@ pub(crate) fn aio_transfer(
     offset: u64,
     flags: u32,
 ) -> i64 {
+    let memory = Memory::Guest(segments);
     let result = if write {
-        aio_write(c, file, segments, offset, flags)
+        aio_write(c, file, memory, offset, flags)
     } else {
-        aio_read(c, file, segments, offset, flags)
+        aio_read(c, file, memory, offset, flags)
     };
     result.map_or_else(|e| -i64::from(e.0), |count| count as i64)
 }
@@ -3675,7 +3738,7 @@ pub(crate) fn ring_transfer(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     write: bool,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     offset: u64,
     flags: u32,
 ) -> Result<Result<u64, Errno>, Errno> {
@@ -3689,10 +3752,7 @@ pub(crate) fn ring_transfer(
         (true, false) => None,
         (false, _) => Some(offset),
     };
-    let total = segments
-        .iter()
-        .map(|&(_, length)| length as u64)
-        .sum::<u64>();
+    let total = memory.total() as u64;
     if let Some(at) = at
         && ((at as i64) < 0 || (at as i64).checked_add(total as i64).is_none())
     {
@@ -3704,9 +3764,9 @@ pub(crate) fn ring_transfer(
     ring_operation(file, write)?;
     let transfer = |c: &mut Context<'_>, at: u64, flags: u32| {
         if write {
-            aio_write(c, file, segments, at, flags)
+            aio_write(c, file, memory, at, flags)
         } else {
-            aio_read(c, file, segments, at, flags)
+            aio_read(c, file, memory, at, flags)
         }
     };
     Ok(match at {
@@ -3775,47 +3835,39 @@ fn writable_prefix(
 fn aio_read(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     offset: u64,
     flags: u32,
 ) -> Result<u64, Errno> {
-    let total = segments.iter().map(|&(_, length)| length).sum::<usize>();
+    let total = memory.total();
     if total == 0 {
         return Ok(0);
     }
     let (b, count) = if aio_positioned(file) {
         let len = request(file, total as u64, offset, true)?;
-        writable_prefix(c, segments, len)?;
+        memory.writable_prefix(c, len)?;
         let mut b = buffer(len)?;
         let count = read_at(file, offset, &mut b)?;
         (b, count)
     } else {
-        writable_prefix(c, segments, total)?;
+        memory.writable_prefix(c, total)?;
         let mut b = buffer(total)?;
         let count = read_waiting(c, file, &mut b, flags & RWF_NOWAIT != 0)?;
         (b, count)
     };
-    scatter(c, segments, &b[..count])?;
+    memory.scatter(c, &b[..count])?;
     Ok(count as u64)
 }
 
 fn aio_write(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     offset: u64,
     flags: u32,
 ) -> Result<u64, Errno> {
-    let total = segments.iter().map(|&(_, length)| length).sum::<usize>();
     let mut bytes = Vec::new();
-    bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
-    for &(base, length) in segments {
-        let start = bytes.len();
-        bytes.resize(start + length, 0);
-        c.mem
-            .read(GuestAddr(base), &mut bytes[start..])
-            .map_err(|_| Errno::EFAULT)?;
-    }
+    memory.gather(c, &mut bytes)?;
     if bytes.is_empty() {
         return Ok(0);
     }

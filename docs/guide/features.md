@@ -1886,12 +1886,23 @@ kernel.
     one with no length is an empty slot;
   - a length of 1 byte to 1 GiB (`EFAULT`), and no end past the address
     space (`EOVERFLOW`);
-  - writable pages (`EFAULT`);
+  - its pages pinned for writing (`io_pin_pages`, `FOLL_LONGTERM`), as
+    `check_vma_flags` allows them: `EFAULT` for a page not mapped or not
+    writable, of a `perf` ring or a `memfd_secret` file, or of a shared
+    mapping of a disk file (one whose pages are written back; shared
+    memory, a memfd and tmpfs are pinned, and a private file mapping's copy
+    is);
   - room under RLIMIT_MEMLOCK (`ENOMEM`), shared with the user's other
     rings and `memfd_secret` pages, unless the ring's maker had
     `CAP_IPC_LOCK`.
 
-  A failure registers none of them. `IORING_UNREGISTER_BUFFERS` takes no
+  A failure registers none of them. A fixed transfer moves the pinned
+  pages, whatever maps the address now: after `munmap` it moves the old
+  pages, which a new mapping there does not show, and a page made
+  read-only still takes a read. A process that shares the ring moves the
+  registering process's pages; `fork` gives the child a copy of a pinned
+  private page, so the parent's later writes are what the ring moves
+  (`page_needs_cow_for_dma`). `IORING_UNREGISTER_BUFFERS` takes no
   argument (`EINVAL`) and needs buffers (`ENXIO`). `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.

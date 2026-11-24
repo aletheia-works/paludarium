@@ -507,6 +507,7 @@
     {"name":"io-uring-ring-poll","binary":"process"},
     {"name":"io-uring-cancel","binary":"process"},
     {"name":"io-uring-exit","binary":"process"},
+    {"name":"io-uring-pinned","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

@@ -5326,6 +5326,40 @@ mod io_uring {
     }
 
     #[test]
+    fn a_registered_buffer_keeps_its_pages_past_munmap() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let vec = DATA + 0x100;
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        f.mem.write(GuestAddr(page), b"old!").unwrap();
+        iovecs(&f, vec, &[(page, 4096)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), 0);
+        f.mem.write(GuestAddr(DATA), b"/b\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        // A write moves the pinned page, which nothing maps any more.
+        assert_eq!(f.ret(11, &[page, 4096]), 0);
+        assert_eq!(one(&mut f, &r, &fixed(WRITE_FIXED, fd, 0, page, 4, 0)), 4);
+        assert_eq!(f.ret(17, &[fd, DATA + 0x200, 4, 0]), 4);
+        assert_eq!(bytes(&f, DATA + 0x200, 4), b"old!");
+        // A read lands there too, not in a new mapping at the address.
+        assert_eq!(f.ret(9, &[page, 4096, 3, 0x32, u64::MAX, 0]), page);
+        assert_eq!(one(&mut f, &r, &fixed(READ_FIXED, fd, 0, page, 4, 0)), 4);
+        assert_eq!(bytes(&f, page, 4), [0; 4]);
+        // A page made read-only takes a read through the pin.
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        iovecs(&f, vec, &[(page, 4096)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), 0);
+        assert_eq!(f.ret(10, &[page, 4096, 1]), 0);
+        assert_eq!(one(&mut f, &r, &fixed(READ_FIXED, fd, 0, page, 4, 0)), 4);
+        assert_eq!(bytes(&f, page, 4), b"old!");
+        // PROT_NONE is refused.
+        let none = f.ret(9, &[0, 4096, 0, 0x22, u64::MAX, 0]);
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        iovecs(&f, vec, &[(none, 4096)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), errno(Errno::EFAULT));
+    }
+
+    #[test]
     fn a_write_that_would_wait_is_heard_of_only_with_nowait() {
         let mut f = fixture();
         let r = ring(&mut f);

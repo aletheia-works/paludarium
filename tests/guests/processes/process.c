@@ -10505,6 +10505,133 @@ static int io_uring_exit_case(const char *self) {
     return 0;
 }
 
+/* io_uring's registered buffers keep the pages they had when they were
+   registered (io_pin_pages, FOLL_LONGTERM): a fixed transfer moves them
+   after munmap, a new mapping at the address sees none of it, and a page
+   made read-only still takes a read. Registering refuses what a long-term
+   pin refuses: no access, and a shared mapping of a disk file; a memfd's
+   is pinned. A forked child that shares the ring moves the parent's
+   pinned page, which the parent's later writes reach. */
+static unsigned char *up_fixed(struct uring *u, unsigned long data, unsigned char op, int fd,
+                               long offset, void *addr, unsigned len) {
+    unsigned char *sqe = uring_push(u, op, data);
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 8, &offset, 8);
+    unsigned long a = (unsigned long)addr;
+    memcpy(sqe + 16, &a, 8);
+    memcpy(sqe + 24, &len, 4);
+    return sqe;
+}
+
+static void up_file(int fd, const char *label) {
+    char got[16];
+    long n = pread(fd, got, sizeof got, 0);
+    printf("%s: %ld %.*s\n", label, n, n > 0 ? (int)n : 0, got);
+}
+
+static int io_uring_pinned_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int fd = open("pinned", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 81;
+    unlink("pinned");
+
+    /* After munmap: the buffer is still the old page. */
+    char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 82;
+    memcpy(p, "old!", 4);
+    struct iovec iov = {p, 4096};
+    uring_show("register", syscall(427, u.fd, 0, &iov, 1));
+    munmap(p, 4096);
+    char *again = mmap(p, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (again != p) return 83;
+    up_fixed(&u, 1, 5, fd, 0, p, 4);
+    tw_submit(&u, 1, 1, "write-unmapped");
+    up_file(fd, "file");
+    if (pwrite(fd, "new?", 4, 0) != 4) return 84;
+    up_fixed(&u, 2, 4, fd, 0, p, 4);
+    tw_submit(&u, 1, 1, "read-unmapped");
+    printf("mapping: %d\n", p[0]);
+    up_fixed(&u, 3, 5, fd, 4, p, 4);
+    tw_submit(&u, 1, 1, "write-back");
+    up_file(fd, "file");
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+
+    /* A page made read-only still takes a read. */
+    memset(p, 0, 4096);
+    uring_show("register", syscall(427, u.fd, 0, &iov, 1));
+    mprotect(p, 4096, PROT_READ);
+    up_fixed(&u, 4, 4, fd, 0, p, 4);
+    tw_submit(&u, 1, 1, "read-read-only");
+    printf("mapping: %.4s\n", p);
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(p, 4096);
+
+    /* What a long-term pin refuses, and what it takes. */
+    char *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    iov = (struct iovec){none, 4096};
+    uring_show("register-prot-none", syscall(427, u.fd, 0, &iov, 1));
+    munmap(none, 4096);
+    if (ftruncate(fd, 4096)) return 85;
+    char *disk = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (disk == MAP_FAILED) return 86;
+    iov = (struct iovec){disk, 4096};
+    uring_show("register-shared-file", syscall(427, u.fd, 0, &iov, 1));
+    munmap(disk, 4096);
+    char *privfile = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    iov = (struct iovec){privfile, 4096};
+    uring_show("register-private-file", syscall(427, u.fd, 0, &iov, 1));
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(privfile, 4096);
+    int mfd = (int)syscall(319, "pinned", 0);
+    if (mfd < 0 || ftruncate(mfd, 4096)) return 87;
+    char *shm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (shm == MAP_FAILED) return 88;
+    iov = (struct iovec){shm, 4096};
+    uring_show("register-memfd", syscall(427, u.fd, 0, &iov, 1));
+    up_fixed(&u, 5, 4, fd, 4, shm, 4);
+    tw_submit(&u, 1, 1, "read-memfd");
+    char seen[4];
+    printf("memfd: %ld %.4s\n", (long)pread(mfd, seen, 4, 0), seen);
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(shm, 4096);
+    close(mfd);
+    char *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    iov = (struct iovec){shared, 4096};
+    uring_show("register-shared-anon", syscall(427, u.fd, 0, &iov, 1));
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(shared, 4096);
+
+    /* fork: the child's fixed write moves the parent's page. */
+    p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(p, "AAAA", 4);
+    iov = (struct iovec){p, 4096};
+    uring_show("register", syscall(427, u.fd, 0, &iov, 1));
+    int go[2];
+    if (pipe(go)) return 89;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char byte;
+        if (read(go[0], &byte, 1) != 1) _exit(1);
+        printf("child-page: %.4s\n", p);
+        up_fixed(&u, 6, 5, fd, 8, p, 4);
+        tw_submit(&u, 1, 1, "child-write");
+        fflush(stdout);
+        _exit(0);
+    }
+    memcpy(p, "BBBB", 4);
+    if (write(go[1], "g", 1) != 1) return 90;
+    int status;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    char got[4];
+    printf("file+8: %ld %.4s\n", (long)pread(fd, got, 4, 8), got);
+    close(fd);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -38215,6 +38342,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-pinned")) return io_uring_pinned_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

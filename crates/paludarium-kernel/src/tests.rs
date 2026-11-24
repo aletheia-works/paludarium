@@ -11752,3 +11752,35 @@ fn a_bind_of_proc_shows_its_files_in_a_new_root() {
     let missing = put(&mut f, 0xe0, b"/proc/nosuch");
     assert_eq!(f.ret(2, &[missing, 0, 0]), errno(Errno::ENOENT));
 }
+
+mod context_switches {
+    use super::*;
+
+    /// `ru_nvcsw` of a `struct rusage` at `at`.
+    fn nvcsw(f: &Fixture, at: u64) -> u64 {
+        f.mem.read_u64(GuestAddr(at + 128)).unwrap()
+    }
+
+    #[test]
+    fn getrusage_gives_the_sleeps_as_voluntary_context_switches() {
+        let mut f = fixture();
+        let at = DATA + 0x200;
+        assert_eq!(f.ret(98, &[0, at]), 0);
+        let before = (nvcsw(&f, at), {
+            assert_eq!(f.ret(98, &[1, at]), 0);
+            nvcsw(&f, at)
+        });
+        // Two sleeps on the host, counted at the next system call.
+        paludarium_host::switches::sleep(&mut false);
+        paludarium_host::switches::sleep(&mut false);
+        assert_eq!(f.ret(98, &[0, at]), 0);
+        let process = nvcsw(&f, at);
+        assert_eq!(f.ret(98, &[1, at]), 0);
+        let thread = nvcsw(&f, at);
+        assert_eq!((process - before.0, thread - before.1), (2, 2));
+        // No involuntary one, and no child's yet.
+        assert_eq!(f.mem.read_u64(GuestAddr(at + 136)).unwrap(), 0);
+        assert_eq!(f.ret(98, &[u64::MAX, at]), 0);
+        assert_eq!(nvcsw(&f, at), 0);
+    }
+}

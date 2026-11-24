@@ -123,7 +123,8 @@ verified.
   thread's to the CPU it was on at its system calls, and none as idle; it
   counts no interrupts or softirqs, and as context switches only the times
   threads went to sleep, as nothing preempts a guest thread, so `status` shows
-  those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`.
+  those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`,
+  and `getrusage` and a wait's rusage as `ru_nvcsw` and 0 as `ru_nivcsw`.
   Another process's thread is `S (sleeping)` in every wait, where Linux shows
   some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
   process what it published at its last system call or signal check, so a mask

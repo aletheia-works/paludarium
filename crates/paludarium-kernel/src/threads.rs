@@ -161,6 +161,9 @@ pub struct ThreadGroup {
     /// The minor faults of its reaped children and theirs (Linux's
     /// `signal->cmin_flt`).
     children_faults: AtomicU64,
+    /// The voluntary context switches of its reaped children and theirs
+    /// (Linux's `signal->cnvcsw`).
+    children_switches: AtomicU64,
     /// The process is the init of a nested PID namespace, which takes only
     /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
     /// SIGNAL_UNKILLABLE), until a fault ends it.
@@ -289,6 +292,7 @@ impl Default for ThreadGroup {
             peak: AtomicU64::new(0),
             children_peak: AtomicU64::new(0),
             children_faults: AtomicU64::new(0),
+            children_switches: AtomicU64::new(0),
             unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
@@ -1686,6 +1690,34 @@ impl ThreadGroup {
     /// (`wait_task_zombie`'s `cmin_flt`).
     pub(crate) fn reaped_faults(&self, faults: u64) {
         self.children_faults.fetch_add(faults, Ordering::Relaxed);
+    }
+    /// The process's voluntary context switches (`RUSAGE_SELF`): the sum of
+    /// its threads' latest accounts, live or not, as Linux adds the live
+    /// threads' `nvcsw` to `signal->nvcsw`.
+    pub(crate) fn process_switches(&self) -> u64 {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, used)| used.switches.load(Ordering::SeqCst))
+            .fold(0u64, u64::saturating_add)
+    }
+    /// The voluntary context switches of its reaped children and theirs
+    /// (`RUSAGE_CHILDREN`).
+    pub(crate) fn children_switches(&self) -> u64 {
+        self.children_switches.load(Ordering::Relaxed)
+    }
+    /// What a wait reports of its voluntary context switches
+    /// (`RUSAGE_BOTH`): its own and its reaped children's.
+    pub(crate) fn waited_switches(&self) -> u64 {
+        self.process_switches()
+            .saturating_add(self.children_switches())
+    }
+    /// Takes a reaped child's voluntary context switches, its own and its
+    /// children's (`wait_task_zombie`'s `cnvcsw`).
+    pub(crate) fn reaped_switches(&self, switches: u64) {
+        self.children_switches
+            .fetch_add(switches, Ordering::Relaxed);
     }
     /// Takes a reaped child's peak, its own or its children's
     /// (`wait_task_zombie`'s `cmaxrss`).
@@ -3129,6 +3161,22 @@ mod fault_count_tests {
     }
 
     #[test]
+    fn a_process_counts_its_threads_switches_and_its_reaped_childrens() {
+        let group = ThreadGroup::default();
+        let first = Arc::new(crate::Usage::default());
+        first.switches.store(3, SeqCst);
+        let second = Arc::new(crate::Usage::default());
+        second.switches.store(4, SeqCst);
+        group.register_cpu(1, first);
+        group.register_cpu(2, second);
+        assert_eq!(group.process_switches(), 7);
+        assert_eq!(group.children_switches(), 0);
+        group.reaped_switches(5);
+        assert_eq!(group.children_switches(), 5);
+        assert_eq!(group.waited_switches(), 12);
+    }
+
+    #[test]
     fn a_thread_counts_its_own_faults_and_keeps_when_it_was_made() {
         let group = ThreadGroup::default();
         let first = Arc::new(crate::Usage::default());
@@ -3159,8 +3207,12 @@ mod fault_count_tests {
             cpu: 0,
             peak: 0,
             minor_faults: 41,
+            switches: 9,
         });
         assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 41);
         assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 0);
+        // `ru_nvcsw`, and no involuntary switch (`ru_nivcsw`).
+        assert_eq!(u64::from_le_bytes(bytes[128..136].try_into().unwrap()), 9);
+        assert_eq!(u64::from_le_bytes(bytes[136..144].try_into().unwrap()), 0);
     }
 }

@@ -7009,6 +7009,58 @@ static int maxrss_case(const char *self) {
     _exit(0);
 }
 
+/* The context-switches case: getrusage's and wait4's ru_nvcsw count the
+   times a task gave up its CPU of its own accord (kernel/sched/core.c
+   __schedule, prev->nvcsw), as each sleep does, and a wait adds the
+   child's and its children's to RUSAGE_CHILDREN (wait_task_zombie's
+   cnvcsw). How many more times Linux switches is not fixed, and
+   ru_nivcsw depends on the host's load, so the case prints only what it
+   guarantees. It runs in a forked child, which starts from none. */
+static long nvcsw_get(int who) {
+    struct rusage usage;
+    if (getrusage(who, &usage)) return -1;
+    return usage.ru_nvcsw;
+}
+static void nvcsw_sleep(int times) {
+    for (int i = 0; i < times; i++) {
+        struct timespec t = {0, 1000000};
+        nanosleep(&t, NULL);
+    }
+}
+static int context_switches_case(void) {
+    fflush(stdout);
+    pid_t measuring = fork();
+    if (measuring != 0) {
+        int status;
+        waitpid(measuring, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+    printf("children at first: %ld\n", nvcsw_get(RUSAGE_CHILDREN));
+    long before = nvcsw_get(RUSAGE_SELF), thread_before = nvcsw_get(RUSAGE_THREAD);
+    nvcsw_sleep(3);
+    long after = nvcsw_get(RUSAGE_SELF), thread = nvcsw_get(RUSAGE_THREAD);
+    printf("slept: self-at-least-3=%d thread-at-least-3=%d thread-within=%d\n",
+           after - before >= 3, thread - thread_before >= 3, thread <= nvcsw_get(RUSAGE_SELF));
+    long children = nvcsw_get(RUSAGE_CHILDREN);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        nvcsw_sleep(5);
+        _exit(0);
+    }
+    struct rusage usage;
+    siginfo_t info;
+    memset(&usage, 0, sizeof usage);
+    syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, &usage);
+    long zombie = usage.ru_nvcsw;
+    memset(&usage, 0, sizeof usage);
+    wait4(child, NULL, 0, &usage);
+    printf("child: at-least-5=%d zombie-same=%d children-grew-by-it=%d\n",
+           usage.ru_nvcsw >= 5, zombie == usage.ru_nvcsw,
+           nvcsw_get(RUSAGE_CHILDREN) - children == usage.ru_nvcsw);
+    fflush(stdout);
+    _exit(0);
+}
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
    faults a task took (mm/memory.c mm_account_fault, current->min_flt),
    its own accesses' and those of get_user_pages for it: mlock's
@@ -37118,6 +37170,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "hiwater")) return hiwater_case();
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
+    if (!strcmp(mode, "context-switches")) return context_switches_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();

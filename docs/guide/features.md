@@ -4391,8 +4391,12 @@ kernel.
   never touched a hole, with no fault). `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts
-  from none, and an `execve` keeps them. The other counts (major faults,
-  context switches, blocks) are 0. `/proc/<pid>/stat` gives the same counts
+  from none, and an `execve` keeps them. `ru_nvcsw` counts the voluntary
+  context switches, the times a thread went to sleep, as Linux's `nvcsw`,
+  for the same processes and threads and with a wait's and
+  `RUSAGE_CHILDREN`'s the children's (`cnvcsw`), as of each thread's latest
+  system call. The other counts (major faults, involuntary context
+  switches, blocks) are 0. `/proc/<pid>/stat` gives the same counts
   as `minflt` (a thread's own under `task`) and `cminflt`, and 0 as
   `majflt` and `cmajflt`.
 

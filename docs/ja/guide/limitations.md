@@ -465,8 +465,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに
   `EINVAL` で失敗します。`IORING_ASYNC_CANCEL_OP` と `IORING_OP_LAST` 以降の操作を持つ
-  `IORING_OP_ASYNC_CANCEL` は、Linux master の `io_async_cancel_prep` と同じく `EINVAL` です。
-  差分テストを走らせるカーネルである Linux 7.0 は要求を見つけません（`ENOENT`）。位置のないファイル（パイプ、ソケット、端末、eventfd）はポーリング
+  `IORING_OP_ASYNC_CANCEL` は、差分テストを走らせるカーネルである Linux 7.0 と同じく要求を
+  見つけません（`ENOENT`）。Linux master の `io_async_cancel_prep` は `EINVAL` で断ります。
+  テストを走らせるカーネルが追いつけば master に合わせます。位置のないファイル（パイプ、ソケット、端末、eventfd）はポーリング
   できるものとみなし、それで読み出しがリングのバッファーを使う時点と、転送がそれを待つか
   どうかが決まります。プログラムのメモリにあるバッファーのリングも固定しません。カーネルは
   使うたびにそのマッピングを通して読み書きするので、外したリングを読み出しが見つけると

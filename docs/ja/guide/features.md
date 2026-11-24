@@ -1533,8 +1533,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`IORING_CQE_F_BUFFER`）。
   - ファイルの準備ができても、タスクワークがまだ実行されていない要求も取り消されます。
     タスクワークが実行されるまでは見つかるからです。ファイルのバイトは残ります。
-  - `IORING_OP_ASYNC_CANCEL` は、知らないフラグ、`_FD` か `_OP` と一緒の `_ANY`、
-    `IORING_OP_LAST` 以降の操作、`off` か `splice_fd_in` を断ります（`EINVAL`）。
+  - `IORING_OP_ASYNC_CANCEL` は、Linux 7.0 の `io_async_cancel_prep` と同じく、知らない
+    フラグ、`_FD` か `_OP` と一緒の `_ANY`、`off` か `splice_fd_in` を断ります（`EINVAL`）。
     開いていない記述子は `EBADF` です。
   - `IORING_REGISTER_SYNC_CANCEL` は `struct io_uring_sync_cancel_reg` を一つ取ります。
     詰め物は 0 でなければならず、数か 0 か `ENOENT` をそのまま返します。見つけるものが

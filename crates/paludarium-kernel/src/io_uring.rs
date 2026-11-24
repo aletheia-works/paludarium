@@ -1066,15 +1066,17 @@ impl Ring {
                 }
             }
             OP_ASYNC_CANCEL => {
-                // `io_async_cancel_prep`: `IORING_ASYNC_CANCEL_ANY` matches
-                // any file and operation.
+                // `io_async_cancel_prep`, as Linux 7.0 (the CI kernel) has it:
+                // `IORING_ASYNC_CANCEL_ANY` matches any file and operation,
+                // and the operation is the low byte of `len`. Linux master
+                // also refuses one past `IORING_OP_LAST` (`EINVAL`), which
+                // matches nothing here.
                 let cancel_flags = u32_at(sqe, 28);
                 let op = u32_at(sqe, 24);
                 if u64_at(sqe, 8) != 0
                     || int_at(44) != 0
                     || cancel_flags & !CANCEL_FLAGS != 0
                     || cancel_flags & CANCEL_ANY != 0 && cancel_flags & (CANCEL_FD | CANCEL_OP) != 0
-                    || cancel_flags & CANCEL_OP != 0 && op >= u32::from(OP_LAST)
                 {
                     return fail(request, Errno::EINVAL);
                 }

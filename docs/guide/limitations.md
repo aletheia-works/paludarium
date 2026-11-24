@@ -272,12 +272,9 @@ verified.
   file on the host, so a mapping of it counts it among the clean pages in
   `smaps`. On Linux it stays dirty in the page cache until writeback, and
   `smaps` counts it among the dirty ones until then.
-- **Mappings that grow down**: such a mapping grows when the guest's own
-  code touches a page below it or a signal frame is written there
-  ([features](./features#system-calls)), but not when a system call reads or
-  writes there: the call gives `EFAULT`, where Linux's copy of user memory
-  grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
-  growth, as it does not stop `mmap`.
+- **Mappings that grow down**: `RLIMIT_AS` does not stop the growth of
+  such a mapping ([features](./features#system-calls)), as it does not stop
+  `mmap`.
 - **Page-fault counts**: `ru_minflt` counts each fault as it is taken, as
   Linux does, from a thread's first fault, before its first system call.
   `execve`'s loader fills the pages of the program's segments
@@ -1035,10 +1032,11 @@ verified.
   page `UFFDIO_ZEROPAGE` gives a private mapping of a shmem file is a
   page of zeros of its own, which
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
-  zero page. A system call's own
-  copy to or from a missing page of a registered range, or to a
-  write-protected one without `UFFD_FEATURE_WP_ASYNC`, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
-  Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
+  zero page. A copy to or from a registered page by another process's
+  `process_vm_readv` or `process_vm_writev`, or by another
+  `get_user_pages` caller, stays `EFAULT`, where Linux's `get_user_pages`
+  reaches `handle_userfault` too, which does not check whose `mm` faults.
+  A `UFFDIO_MOVE` source
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise.

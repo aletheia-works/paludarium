@@ -630,6 +630,61 @@ static void on_signal(int sig) {
     signalled++;
 }
 
+/* What read_pipe reads, and where. */
+struct pipe_read {
+    int pipe;
+    char *at;
+    long got;
+    volatile pid_t tid;
+};
+
+static void *read_pipe(void *with) {
+    struct pipe_read *r = with;
+    r->tid = (pid_t)syscall(SYS_gettid);
+    r->got = read(r->pipe, r->at, 5);
+    return NULL;
+}
+
+/* A system call's own copy to a registered page that has none waits for
+   it as an instruction does (handle_userfault from a kernel fault, a write
+   one for read's copy), and a signal that is not fatal does not end the
+   wait, as do_user_addr_fault retries a kernel fault after one; a context
+   of user faults alone leaves the copy EFAULT. */
+static void kernel_copy(void) {
+    int fd = ready(O_NONBLOCK, UFFD_FEATURE_THREAD_ID);
+    char *base = anon(PAGE);
+    reg(fd, base, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+    int pipes[2];
+    pipe(pipes);
+    write(pipes[1], "hello", 5);
+    struct pipe_read r = {pipes[0], base + 16, 0, 0};
+    signalled = 0;
+    pthread_t thread;
+    pthread_create(&thread, NULL, read_pipe, &r);
+    printf("kernel copy polled: %d\n", wait_message(fd));
+    while (!r.tid)
+        usleep(1000);
+    wait_blocked(r.tid);
+    message("kernel copy fault", fd, base, r.tid);
+    syscall(SYS_tgkill, getpid(), r.tid, SIGUSR1);
+    usleep(20000);
+    char src[PAGE];
+    memset(src, 'k', sizeof src);
+    int64_t done;
+    printf("kernel copy fill: %s\n", err(copy(fd, base, src, PAGE, 0, &done)));
+    pthread_join(thread, NULL);
+    printf("kernel copy: read %ld bytes %.5s after %c signalled %d\n", r.got, base + 16, base[21], signalled);
+    close(fd);
+    int user = ready(O_NONBLOCK | UFFD_USER_MODE_ONLY, 0);
+    char *other = anon(PAGE);
+    reg(user, other, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+    write(pipes[1], "hello", 5);
+    printf("user mode only copy: %s\n", err(read(pipes[0], other, 5)));
+    close(user);
+    close(pipes[0]);
+    close(pipes[1]);
+}
+
 /* A signal during the wait runs its handler, then the access faults
    again; closing the file ends the wait. */
 static int case_signals(void) {
@@ -663,6 +718,7 @@ static int case_signals(void) {
     pthread_join(thread, NULL);
     printf("after closing: %c\n", t.seen);
     vma("closed", base, base);
+    kernel_copy();
     return 0;
 }
 

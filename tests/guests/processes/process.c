@@ -11609,6 +11609,17 @@ static int grows_down_case(void) {
     grows_touch("below", g, g - page, 1);
     grows_touch("far-below", g, g - 9 * page, 0);
     smaps_show("grown", g, SMAPS_SIZE);
+    /* A system call's copy below it grows it as well, as
+     * do_user_addr_fault grows it for a kernel access (expand_stack). */
+    int pipes[2];
+    if (pipe(pipes)) return 79;
+    write(pipes[1], "grown", 5);
+    char *low = (char *)grows_start(g) - page;
+    long got = read(pipes[0], low + 8, 5);
+    printf("copy-below: read %ld grown-to-it=%d bytes %.5s\n", got, grows_start(g) == (uintptr_t)low,
+           got == 5 ? low + 8 : "-----");
+    close(pipes[0]);
+    close(pipes[1]);
     /* PROT_GROWSDOWN reaches down to the start of the VMA. */
     printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
     grows_touch("read-only", g, g - page, 1);

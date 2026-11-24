@@ -348,6 +348,20 @@ impl paludarium_mmu::faults::Sink for Usage {
     }
 }
 
+/// While it lives, the calling host thread's kernel accesses that fault are
+/// resolved by a [`userfaultfd::KernelCopies`]; then by what was there.
+struct KernelCopies(Option<Arc<dyn paludarium_mmu::faults::Resolver>>);
+impl KernelCopies {
+    fn install(copies: userfaultfd::KernelCopies) -> Self {
+        Self(paludarium_mmu::faults::set_resolver(Some(Arc::new(copies))))
+    }
+}
+impl Drop for KernelCopies {
+    fn drop(&mut self) {
+        paludarium_mmu::faults::set_resolver(self.0.take());
+    }
+}
+
 /// While it lives, the calling host thread's faults count to the guest
 /// thread's [`Usage`] as the kernel's for it (Linux tells a fault of user
 /// mode from one of the kernel's accesses to user memory); after it, as the
@@ -1361,6 +1375,20 @@ impl Kernel {
         // accesses count as the kernel's, those of the thread's code before
         // it as the thread's own.
         let _faults = KernelFaults::enter(&thread.state);
+        // And its accesses that fault are served as an instruction's are: a
+        // mapping that grows down grows, and a `userfaultfd` is waited for.
+        let _copies = KernelCopies::install(userfaultfd::KernelCopies {
+            mem: mem.view(),
+            group: Arc::clone(&self.group),
+            tid: thread.tid,
+            hub: Arc::clone(&self.files.readiness),
+            host: Arc::clone(&self.host),
+            inbox: Arc::clone(&self.inbox),
+            mask: thread.state.signal_mask,
+            processes: Arc::clone(&self.processes),
+            pid: self.process.pid,
+            ipc_lock: thread.state.credentials.capable(1 << 14),
+        });
         // What it waits for in the host while it handles the stop shows it
         // as sleeping (`/proc/<pid>/stat`), and nothing else does.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());

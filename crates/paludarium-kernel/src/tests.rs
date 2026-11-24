@@ -4510,6 +4510,35 @@ mod mprotect_order {
         assert_eq!(prot_at(&f, stack), Prot::READ);
     }
 
+    /// A system call's copy into the room below a mapping that grows down
+    /// grows it, as Linux's `do_user_addr_fault` grows it for a kernel
+    /// access (`lock_mm_and_find_vma`'s `expand_stack`).
+    #[test]
+    fn a_system_call_s_copy_grows_a_map_growsdown_mapping() {
+        const MAP_GROWSDOWN: u64 = 0x100;
+        const PRIVATE_FIXED: u64 = 0x02 | 0x10 | 0x20;
+        let mut f = fixture();
+        let at = 0x60_0000;
+        let flags = PRIVATE_FIXED | MAP_GROWSDOWN;
+        assert_eq!(f.ret(9, &[at, 0x2000, 3, flags, u64::MAX, 0]), at);
+        assert_eq!(f.ret(293, &[DATA, 0]), 0);
+        let mut fds = [0u8; 8];
+        f.mem.read(GuestAddr(DATA), &mut fds).unwrap();
+        let reader = u64::from(u32::from_le_bytes(fds[..4].try_into().unwrap()));
+        let writer = u64::from(u32::from_le_bytes(fds[4..].try_into().unwrap()));
+        f.mem.write(GuestAddr(DATA + 0x100), b"grown").unwrap();
+        assert_eq!(f.ret(1, &[writer, DATA + 0x100, 5]), 5);
+        // Read into the page below its start: the mapping takes it.
+        assert_eq!(f.ret(0, &[reader, at - 0x1000 + 8, 5]), 5);
+        assert_eq!(
+            f.mem.vma_at(GuestAddr(at)),
+            Some((GuestAddr(at - 0x1000), 0x3000))
+        );
+        let mut got = [0u8; 5];
+        f.mem.read(GuestAddr(at - 0x1000 + 8), &mut got).unwrap();
+        assert_eq!(&got, b"grown");
+    }
+
     #[test]
     fn a_map_growsdown_mapping_grows_down_at_a_fault() {
         const MAP_GROWSDOWN: u64 = 0x100;

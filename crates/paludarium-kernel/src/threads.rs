@@ -2038,6 +2038,46 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .notices()
     }
+    /// `fatal_signal_pending` for a thread that cannot take its signals in
+    /// (one in a kernel access's wait for a `userfaultfd`, while its system
+    /// call holds its state): the process exits, or SIGKILL or a signal
+    /// whose default action ends the process and that `mask` does not
+    /// block was sent to it or to `inbox`'s thread, as Linux's
+    /// `complete_signal` makes such a signal a SIGKILL for every thread.
+    pub(crate) fn fatal_pending(&self, inbox: &SignalInbox, mask: u64) -> bool {
+        if self.status().is_some() {
+            return true;
+        }
+        let actions = self
+            .shared_actions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let fatal = |number: i32| {
+            number == 9
+                || (1..=64).contains(&number)
+                    && mask & (1u64 << (number - 1)) == 0
+                    && actions.get(&number).map_or(0, |a| a.handler) == 0
+                    && !matches!(number, 17..=23 | 28)
+        };
+        if self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .iter()
+            .any(|s| fatal(s.number))
+        {
+            return true;
+        }
+        let process = Arc::clone(
+            &self
+                .process_inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        inbox.queued_any(&fatal) || process.queued_any(&fatal)
+    }
     /// Takes in the process's signals; whether a signal has been sent to the
     /// process inbox since this thread last did, which is what woke a
     /// thread its own inbox has nothing for.

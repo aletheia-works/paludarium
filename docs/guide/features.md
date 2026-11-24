@@ -1118,7 +1118,13 @@ kernel.
   others on memory it registered, as Linux's `fs/userfaultfd.c`. One that
   the kernel's own faults reach as well (without `UFFD_USER_MODE_ONLY`)
   needs `CAP_SYS_PTRACE` unless `vm.unprivileged_userfaultfd` is 1
-  (`EPERM`), checked before the flags (`EINVAL`). `/dev/userfaultfd`, a
+  (`EPERM`), checked before the flags (`EINVAL`). Those reach it as an
+  instruction's do: a system call's own copy to or from a registered page
+  waits for it, through any signal that is not fatal, as Linux retries a
+  kernel fault (`fault_signal_pending`), and the copy goes on once the page
+  is filled; a SIGKILL, the process's exit or the context's release ends
+  the wait with `EFAULT`, as does `UFFD_USER_MODE_ONLY` or
+  `UFFD_FEATURE_SIGBUS` at once. `/dev/userfaultfd`, a
   misc device of root's of mode 0600 (`userfaultfd_misc`, whose minor
   number Linux gives at boot), makes one with its only operation, the
   ioctl `USERFAULTFD_IOC_NEW`, of the flags in the low 32 bits of its
@@ -1650,9 +1656,10 @@ kernel.
 
 - A mapping that grows down, the main stack or private anonymous memory that
   `mmap` made with `MAP_GROWSDOWN` (`VmFlags` shows `gd`), grows as Linux's
-  `expand_downwards` makes it: an access to an unmapped page below it, or a
-  signal frame written there, extends it down to that page, and the access is
-  made again. It does not grow below `mmap_min_addr` (64 KiB), within the
+  `expand_downwards` makes it: an access to an unmapped page below it, a
+  signal frame written there, or a system call's own copy there (as
+  `do_user_addr_fault` serves a kernel access), extends it down to that
+  page, and the access is made again. It does not grow below `mmap_min_addr` (64 KiB), within the
   guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
   grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,
   locked, past `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`; the access then gives

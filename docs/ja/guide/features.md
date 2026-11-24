@@ -1005,7 +1005,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   さばくためのファイルを、Linux の `fs/userfaultfd.c` と同じに作ります。カーネル自身の
   フォールトも届くもの（`UFFD_USER_MODE_ONLY` なし）には、`vm.unprivileged_userfaultfd`
   が 1 でなければ `CAP_SYS_PTRACE` が要り（`EPERM`）、これはフラグ（`EINVAL`）より
-  先に確かめます。root のモード 0600 の misc デバイス `/dev/userfaultfd`
+  先に確かめます。そのフォールトは命令のときと同じく届きます。システムコール自身の
+  登録したページとのコピーはページを待ち、Linux がカーネルのフォールトをやり直すので
+  （`fault_signal_pending`）、致命的でないシグナルでは待ち終わらず、ページが埋まると
+  コピーが進みます。SIGKILL、プロセスの終了、コンテキストの解放は待ちを `EFAULT` で
+  終わらせ、`UFFD_USER_MODE_ONLY` と `UFFD_FEATURE_SIGBUS` はすぐに `EFAULT` です。root のモード 0600 の misc デバイス `/dev/userfaultfd`
   （`userfaultfd_misc`。マイナー番号は Linux が起動時に決めます）は、ただ一つの操作である
   ioctl `USERFAULTFD_IOC_NEW` で、引数の下位 32 ビットのフラグのものを、ケーパビリティ
   なしで作ります。デバイスを開ける者は作れるからです。ほかの ioctl、`read`、`write` は
@@ -1464,8 +1468,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - 下に伸びるマッピング（メインのスタックか、`mmap` が `MAP_GROWSDOWN` で作った
   プライベートな匿名メモリで、`VmFlags` は `gd` を示します）は、Linux の
   `expand_downwards` と同じように伸びます。その下のマップされていないページへの
-  アクセスや、そこへのシグナルフレームの書き込みで、そのページまで下に伸び、アクセスは
-  やり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
+  アクセスや、そこへのシグナルフレームの書き込み、システムコール自身のそこへのコピー
+  （`do_user_addr_fault` はカーネルのアクセスも同じに扱います）で、そのページまで下に
+  伸び、アクセスはやり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
   上の 256 ページの guard gap（`stack_guard_gap`）の中、VMA 全体で `RLIMIT_STACK` を
   超えるところ、ロックされていれば `CAP_IPC_LOCK` なしで `RLIMIT_MEMLOCK` を超える
   ところへは伸びず、そのアクセスは `SIGSEGV` になります。その下の gap には、ヒントでも、

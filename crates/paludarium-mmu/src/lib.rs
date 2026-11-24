@@ -271,6 +271,36 @@ pub mod faults {
         static SINK: RefCell<Option<Arc<dyn Sink>>> = const { RefCell::new(None) };
         static KERNEL: Cell<bool> = const { Cell::new(false) };
         static GUP: Cell<bool> = const { Cell::new(false) };
+        static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
+    }
+
+    /// What a kernel access to user memory that faults may do before it
+    /// fails, as Linux's `do_user_addr_fault` serves the kernel's faults as
+    /// it does an instruction's: grow a mapping that grows down, or wait for
+    /// a `userfaultfd` to fill the page. It is asked with no lock of the
+    /// space held, and says whether the access may be tried again.
+    pub trait Resolver: Send + Sync {
+        fn resolve(&self, addr: u64, write: bool) -> bool;
+    }
+
+    /// Resolves the calling host thread's kernel accesses that fault with
+    /// `resolver` from now on (none for `None`); returns what it had.
+    pub fn set_resolver(resolver: Option<Arc<dyn Resolver>>) -> Option<Arc<dyn Resolver>> {
+        RESOLVER.with(|r| std::mem::replace(&mut *r.borrow_mut(), resolver))
+    }
+
+    /// Whether the kernel's access that took `fault` may be tried again,
+    /// as the calling host thread's resolver says; an instruction's access,
+    /// one through `get_user_pages` and a bus error are not resolved here.
+    pub(crate) fn resolve(fault: &super::Fault) -> bool {
+        if !KERNEL.with(Cell::get) || GUP.with(Cell::get) || fault.bus || fault.fetch {
+            return false;
+        }
+        // Taken out first, so that what it does may itself access memory.
+        let Some(resolver) = RESOLVER.with(|r| r.borrow().clone()) else {
+            return false;
+        };
+        resolver.resolve(fault.addr.0, fault.write)
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
@@ -7610,6 +7640,39 @@ impl MemoryView {
         }
         Some(vma)
     }
+    /// Runs `f` on the space, if it still lives, under its locks, for a
+    /// change, as [`AddressSpace`]'s own guard does.
+    fn with_guard<T>(&self, f: impl FnOnce(&mut AddressSpaceGuard<'_>) -> T) -> Option<T> {
+        let data = self.data.upgrade()?;
+        let serialization = lock_spinning(&self.serialization);
+        let mut guard = AddressSpaceGuard {
+            data: lock_spinning(&data),
+            _serialization: serialization,
+        };
+        Some(f(&mut guard))
+    }
+    /// [`AddressSpace::grow_down`], if the space still lives.
+    pub fn grow_down(&self, addr: GuestAddr, stack_limit: u64, lock_limit: u64) -> bool {
+        self.with_guard(|data| data.grow_down(addr.0, stack_limit, lock_limit))
+            .unwrap_or(false)
+    }
+    /// [`AddressSpace::userfault_for`], if the space still lives.
+    #[must_use]
+    pub fn userfault_for(
+        &self,
+        addr: GuestAddr,
+        write: bool,
+        fetch: bool,
+    ) -> Option<(u64, UserfaultReason)> {
+        self.with_guard(|data| {
+            let found = data.userfault_for(addr, write, fetch);
+            if matches!(found, Some((_, UserfaultReason::Protected))) {
+                data.userfault_fault_in(addr);
+            }
+            found
+        })
+        .flatten()
+    }
     /// The file of the VMA [`Self::vma_from`] gives for `addr` (Linux's
     /// `vm_file`), for reading it as perf's `build_id_parse_nofault` does;
     /// `None` for a VMA of no file of its own.
@@ -8402,10 +8465,17 @@ impl AddressSpace {
         self.locked().bottom_up()
     }
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
-        if self.read_unlocked(addr, buf, Access::Read) {
-            return Ok(());
+        loop {
+            if self.read_unlocked(addr, buf, Access::Read) {
+                return Ok(());
+            }
+            // The lock goes before the fault is resolved ([`faults::Resolver`]).
+            let result = self.locked().read(addr, buf);
+            match result {
+                Err(fault) if faults::resolve(&fault) => {}
+                result => return result,
+            }
         }
-        self.locked().read(addr, buf)
     }
     /// Runs `f` on this thread's [`ThreadTlb`] if it holds this space's
     /// pages; `None` otherwise, which empties it for the locked path to fill.
@@ -8455,10 +8525,16 @@ impl AddressSpace {
         self.locked().read_for_core(addr, buf)
     }
     pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
-        if self.write_unlocked(addr, buf) {
-            return Ok(());
+        loop {
+            if self.write_unlocked(addr, buf) {
+                return Ok(());
+            }
+            let result = Self::write_locked(self.locked(), addr, buf);
+            match result {
+                Err(fault) if faults::resolve(&fault) => {}
+                result => return result,
+            }
         }
-        Self::write_locked(self.locked(), addr, buf)
     }
     /// Runs `f`, which stores, on this thread's [`ThreadTlb`] if it holds
     /// this space's pages, as [`Self::with_thread_tlb`] does, and says
@@ -8563,13 +8639,23 @@ impl AddressSpace {
     }
     /// Checks a syscall buffer's read permission before allocating a copy.
     pub fn check_read(&self, addr: GuestAddr, len: usize) -> Result<(), Fault> {
-        let data = self.locked();
-        data.check(&data.read_directory(), addr, len, Access::Read, false)
+        self.check_access(addr, len, Access::Read)
     }
     /// Checks a stack allocation's write permission without changing bytes.
     pub fn check_write(&self, addr: GuestAddr, len: usize) -> Result<(), Fault> {
-        let data = self.locked();
-        data.check(&data.read_directory(), addr, len, Access::Write, false)
+        self.check_access(addr, len, Access::Write)
+    }
+    fn check_access(&self, addr: GuestAddr, len: usize, access: Access) -> Result<(), Fault> {
+        loop {
+            let result = {
+                let data = self.locked();
+                data.check(&data.read_directory(), addr, len, access, false)
+            };
+            match result {
+                Err(fault) if faults::resolve(&fault) => {}
+                result => return result,
+            }
+        }
     }
     pub fn fetch(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().fetch(addr, buf)

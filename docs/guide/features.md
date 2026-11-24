@@ -4380,8 +4380,8 @@ kernel.
   `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`, `process_vm_readv` and
   `process_vm_writev` (counted to the caller), a tracer's `PTRACE_PEEKDATA`
   and `PTRACE_POKEDATA` (counted to the tracer) and a core dump's (counted
-  to the thread the signal ended, which dumps while the others wait, whichever
-  thread is the last to exit; it leaves private anonymous memory never touched
+  to the thread the signal ended, which dumps while the others wait,
+  regardless of which thread exits last; it leaves private anonymous memory never touched
   a hole, with no fault). `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts

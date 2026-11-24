@@ -3799,7 +3799,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE`、`process_vm_readv` と
   `process_vm_writev`（呼び出し元に数えます）、トレーサーの `PTRACE_PEEKDATA` と
   `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（ほかのスレッドが待つあいだに
-  ダンプする、シグナルで終わったスレッドに数えます。どのスレッドが最後に終了しても同じです。
+  ダンプする、シグナルで終わったスレッドに数えます。最後に終了するスレッドがどれかは関係ありません。
   一度も触れていないプライベートな無名メモリは穴として残し、フォールトしません）です。`RUSAGE_SELF` はプロセスのスレッドの合計、
   `RUSAGE_THREAD` はそのスレッドのもの、`RUSAGE_CHILDREN` と wait は CPU 時間と同じく
   子のものです。fork した子は 0 から始まり、`execve` は保ちます。ほかの値

@@ -3102,8 +3102,8 @@ static pid_t core_child(rlim_t limit, int dumpable, int thread, int signal) {
    dumps it. Linux's get_signal calls vfs_coredump in the thread that took
    the signal while the others wait (coredump_wait), and get_dump_page
    faults in each page of shared anonymous memory never touched. The
-   leader, with a thread parked beside it, maps 64 such pages, sends its
-   own minor faults so far, and raises SIGABRT at itself; its zombie's
+   leader, with a thread parked beside it, maps 64 such pages, writes its
+   own minor faults so far to a pipe, and raises SIGABRT at itself; its zombie's
    /proc/<pid>/task/<pid>/stat then shows the dump's faults. */
 static unsigned long stat_minflt(const char *path) {
     char buf[1024];

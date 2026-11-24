@@ -51,6 +51,7 @@ mod io_uring;
 mod ipc;
 mod kcmp;
 mod keys;
+mod leases;
 mod loopback;
 mod lsm;
 mod mctp;

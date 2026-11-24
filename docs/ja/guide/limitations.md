@@ -877,9 +877,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **dnotify の一部**：`/proc/sys/fs/dir-notify-enable` はないので、Linux の既定の 1 と
   同じく、dnotify はいつも使えます。
-- **ファイルのリース（まだできません）**：`fcntl` の `F_SETLEASE` と `F_GETLEASE` は
-  `EINVAL` です。Linux は読み込みか書き込みのリースを取り、ほかの open や truncate が
-  それを破るときに持ち主へシグナルを送ります。
+- **ファイルのリースの一部**：リースとぶつかる open や truncate は、まだリースを破りません。
+  Linux の `__break_lease` は持ち主にシグナルを送り、開く側を
+  `/proc/sys/fs/lease-break-time` 秒まで待たせて（`O_NONBLOCK` なら `EWOULDBLOCK`）、
+  リースを外すか読み込みのリースにします。委任（`F_GETDELEG` と `F_SETDELEG`）は `EINVAL` です。
 - **fanotify の一部**：`FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。`FAN_FS_ERROR` は
   来ません。ここにはエラーを知らせるファイルシステムがないためです。Linux では ext4 が

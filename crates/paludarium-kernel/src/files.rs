@@ -5476,6 +5476,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 }
                 // F_NOTIFY: dnotify.
                 1026 => crate::dnotify::fcntl(c, &d, a[0], a[2] as u32),
+                // F_SETLEASE and F_GETLEASE.
+                1024 => crate::leases::set(c, &d, a[2]),
+                1025 => Ok(crate::leases::get(c, &d)),
                 // The owner and signal of signal-driven I/O.
                 8..=11 | 15 | 16 => crate::fasync::fcntl(c, &d.file, a[1], a[2]),
                 // Byte-range locks: F_GETLK, F_SETLK, F_SETLKW and their OFD forms.

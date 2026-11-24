@@ -11008,6 +11008,95 @@ static int mrelease_fatal_case(void) {
     }
     return 0;
 }
+/* File leases (F_SETLEASE, F_GETLEASE), as fs/locks.c takes and gives
+ * them back. No open or truncate here meets a lease that it would break. */
+static int lease_errno(int fd, int arg) {
+    return fcntl(fd, F_SETLEASE, arg) < 0 ? -errno : 0;
+}
+static int file_leases_case(void) {
+    char dir[] = "/tmp/leases-XXXXXX";
+    if (!mkdtemp(dir)) return 1;
+    char path[64];
+    snprintf(path, sizeof path, "%s/f", dir);
+    int made = open(path, O_RDWR | O_CREAT, 0644);
+    if (made < 0 || write(made, "x", 1) != 1) return 2;
+    close(made);
+    int rd = open(path, O_RDONLY);
+    printf("none get=%d unlck=%d bad=%d\n", fcntl(rd, F_GETLEASE), lease_errno(rd, F_UNLCK), lease_errno(rd, 5));
+    printf("read=%d get=%d owner-self=%d\n", lease_errno(rd, F_RDLCK), fcntl(rd, F_GETLEASE),
+           fcntl(rd, F_GETOWN) == getpid());
+    /* The only open: the lease becomes a write lease. */
+    printf("upgrade=%d get=%d\n", lease_errno(rd, F_WRLCK), fcntl(rd, F_GETLEASE));
+    int dup_rd = dup(rd);
+    printf("dup get=%d unlck=%d get=%d owner=%d sig=%d again=%d\n", fcntl(dup_rd, F_GETLEASE),
+           lease_errno(dup_rd, F_UNLCK), fcntl(rd, F_GETLEASE), fcntl(rd, F_GETOWN), fcntl(rd, F_GETSIG),
+           lease_errno(rd, F_UNLCK));
+    /* Leases the opens refuse. */
+    int rw = open(path, O_RDWR);
+    printf("rw read=%d write-beside-reader=%d\n", lease_errno(rw, F_RDLCK), lease_errno(rw, F_WRLCK));
+    printf("reader beside writer=%d\n", lease_errno(rd, F_RDLCK));
+    close(dup_rd);
+    close(rd);
+    printf("rw alone write=%d get=%d unlck=%d\n", lease_errno(rw, F_WRLCK), fcntl(rw, F_GETLEASE),
+           lease_errno(rw, F_UNLCK));
+    close(rw);
+    /* A description's close gives its lease back. */
+    int one = open(path, O_RDONLY);
+    printf("one read=%d\n", lease_errno(one, F_RDLCK));
+    int two = open(path, O_RDONLY);
+    printf("two write=%d read=%d\n", lease_errno(two, F_WRLCK), lease_errno(two, F_RDLCK));
+    printf("two unlck=%d\n", lease_errno(two, F_UNLCK));
+    close(one);
+    printf("after close write=%d unlck=%d\n", lease_errno(two, F_WRLCK), lease_errno(two, F_UNLCK));
+    /* Files that take none. */
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    printf("dir=%d get=%d\n", lease_errno(d, F_RDLCK), fcntl(d, F_GETLEASE));
+    close(d);
+    int pipes[2];
+    if (pipe(pipes)) return 3;
+    printf("pipe=%d\n", lease_errno(pipes[0], F_RDLCK));
+    close(pipes[0]);
+    close(pipes[1]);
+    int status = open("/proc/self/status", O_RDONLY);
+    printf("proc=%d\n", lease_errno(status, F_RDLCK));
+    close(status);
+    int path_only = open(path, O_PATH);
+    printf("o_path get=%d errno=%d\n", fcntl(path_only, F_GETLEASE), errno);
+    close(path_only);
+    /* The sysctls, and another user's file. */
+    char buf[32] = {0};
+    int s = open("/proc/sys/fs/lease-break-time", O_RDONLY);
+    long n = s < 0 ? -errno : read(s, buf, sizeof buf - 1);
+    printf("lease-break-time=%ld %s", n, n > 0 ? buf : "\n");
+    if (s >= 0) close(s);
+    memset(buf, 0, sizeof buf);
+    s = open("/proc/sys/fs/leases-enable", O_RDWR);
+    n = s < 0 ? -errno : pread(s, buf, sizeof buf - 1, 0);
+    printf("leases-enable=%ld %s", n, n > 0 ? buf : "\n");
+    if (s >= 0) {
+        printf("disable=%ld\n", (long)pwrite(s, "0\n", 2, 0));
+        int off = open(path, O_RDONLY);
+        printf("disabled read=%d\n", lease_errno(off, F_RDLCK));
+        close(off);
+        printf("enable=%ld\n", (long)pwrite(s, "1\n", 2, 0));
+        close(s);
+    }
+    int theirs = open(path, O_RDONLY);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534)) _exit(4);
+        printf("other user=%d get=%d\n", lease_errno(theirs, F_RDLCK), fcntl(theirs, F_GETLEASE));
+        fflush(stdout);
+        _exit(0);
+    }
+    int wstatus;
+    waitpid(child, &wstatus, 0);
+    printf("child=%d\n", WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
+    close(theirs);
+    unlink(path);
+    rmdir(dir);
+    return 0;
+}
 /* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
  * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
  * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
@@ -37400,6 +37489,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
+    if (!strcmp(mode, "file-leases")) return file_leases_case();
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();

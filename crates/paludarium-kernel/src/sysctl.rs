@@ -13,6 +13,10 @@
 //! (`/proc/sys/fs/fanotify`, `fs/notify/fanotify/fanotify_user.c`):
 //! `max_user_groups` and `max_user_marks` unsigned longs from 0 to
 //! `INT_MAX`, `max_queued_events` and `watchdog_timeout` `int`s from 0.
+//! The machine's `/proc/sys/fs/leases-enable` (1 at first) and
+//! `/proc/sys/fs/lease-break-time` (45), as `fs/locks.c` has them, are
+//! root's files of mode 0644 that take any `int` (`proc_dointvec`), as the
+//! machine's `/proc/sys/kernel` files below are.
 //!
 //! `/proc/sys/kernel` has the System V IPC limits of the opener's IPC
 //! namespace, as Linux's `ipc/ipc_sysctl.c` has them: `shmmax` and `shmall`
@@ -247,6 +251,11 @@ pub(crate) enum Kernel {
     Shmmax,
     Shmmni,
     UnprivilegedBpfDisabled,
+    /// `/proc/sys/fs/leases-enable` and `/proc/sys/fs/lease-break-time`,
+    /// the machine's as these are, which Linux's `fs/locks.c` registers
+    /// under `fs`.
+    LeasesEnable,
+    LeaseBreakTime,
 }
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
@@ -288,6 +297,8 @@ impl Kernel {
                 | Self::PerfEventMlockKb
                 | Self::PerfEventParanoid
                 | Self::UnprivilegedBpfDisabled
+                | Self::LeasesEnable
+                | Self::LeaseBreakTime
         )
     }
     /// Whether it is one of the IPC namespace's next IDs.
@@ -308,6 +319,8 @@ pub(crate) struct Machine {
     perf_event_paranoid: AtomicI32,
     unprivileged_bpf_disabled: AtomicI32,
     drop_caches: AtomicI32,
+    leases_enable: AtomicI32,
+    lease_break_time: AtomicI32,
 }
 
 impl Default for Machine {
@@ -319,6 +332,8 @@ impl Default for Machine {
             perf_event_paranoid: AtomicI32::new(crate::perf::PARANOID),
             unprivileged_bpf_disabled: AtomicI32::new(crate::bpf::UNPRIVILEGED_DISABLED),
             drop_caches: AtomicI32::new(0),
+            leases_enable: AtomicI32::new(1),
+            lease_break_time: AtomicI32::new(45),
         }
     }
 }
@@ -349,6 +364,10 @@ impl Machine {
         const HZ: u64 = 1_000_000_000 / crate::threads::TICK_NSEC;
         self.perf_event_max_sample_rate().div_ceil(HZ)
     }
+    /// Whether new leases may be taken (`leases_enable`).
+    pub(crate) fn leases_enable(&self) -> i32 {
+        self.leases_enable.load(Ordering::SeqCst)
+    }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
         self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
@@ -361,16 +380,20 @@ impl Machine {
             }
             Kernel::PerfEventMlockKb => self.perf_event_mlock_kb(),
             Kernel::PerfEventParanoid => self.perf_event_paranoid(),
+            Kernel::LeasesEnable => self.leases_enable(),
+            Kernel::LeaseBreakTime => self.lease_break_time.load(Ordering::SeqCst),
             _ => self.unprivileged_bpf_disabled(),
         })
     }
     /// Takes a value written at the start of the file, by a writer with
     /// `CAP_SYS_ADMIN` (`admin`) or without.
     fn write(&self, file: Kernel, buf: &[u8], admin: bool) -> Result<usize, Errno> {
-        // Both take any `int` (`proc_dointvec`).
+        // These take any `int` (`proc_dointvec`).
         if let Some(sysctl) = match file {
             Kernel::PerfEventMlockKb => Some(&self.perf_event_mlock_kb),
             Kernel::PerfEventParanoid => Some(&self.perf_event_paranoid),
+            Kernel::LeasesEnable => Some(&self.leases_enable),
+            Kernel::LeaseBreakTime => Some(&self.lease_break_time),
             _ => None,
         } {
             let (value, consumed) = parse(buf, None)?;
@@ -496,6 +519,8 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/fs/fanotify" => Some(Entry::Directory(Directory::Fanotify)),
         b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
+        b"/fs/lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
+        b"/fs/leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
         b"/vm" => Some(Entry::Directory(Directory::Vm)),
         b"/vm/drop_caches" => Some(Entry::DropCaches),
@@ -568,6 +593,8 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
             (b"aio-nr", DT_REG),
             (b"fanotify", DT_DIR),
             (b"inotify", DT_DIR),
+            (b"lease-break-time", DT_REG),
+            (b"leases-enable", DT_REG),
             (b"mqueue", DT_DIR),
         ],
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
@@ -672,6 +699,8 @@ fn child(
             b"aio-nr" => Some(Entry::Aio(Aio::Nr)),
             b"fanotify" => dir(Directory::Fanotify),
             b"inotify" => dir(Directory::Inotify),
+            b"lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
+            b"leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
             b"mqueue" => dir(Directory::Mqueue),
             _ => None,
         },
@@ -738,7 +767,9 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         | Kernel::PerfEventMaxSampleRate
         | Kernel::PerfEventMlockKb
         | Kernel::PerfEventParanoid
-        | Kernel::UnprivilegedBpfDisabled => Vec::new(),
+        | Kernel::UnprivilegedBpfDisabled
+        | Kernel::LeasesEnable
+        | Kernel::LeaseBreakTime => Vec::new(),
     }
 }
 
@@ -816,7 +847,9 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
         | Kernel::PerfEventMaxSampleRate
         | Kernel::PerfEventMlockKb
         | Kernel::PerfEventParanoid
-        | Kernel::UnprivilegedBpfDisabled => Err(Errno::EINVAL),
+        | Kernel::UnprivilegedBpfDisabled
+        | Kernel::LeasesEnable
+        | Kernel::LeaseBreakTime => Err(Errno::EINVAL),
     }
 }
 
@@ -1687,7 +1720,7 @@ mod tests {
             lookup(b"/proc/sys/fs/aio-nr", None),
             Some(Entry::Aio(Aio::Nr))
         );
-        assert_eq!(entries_of(Directory::Fs, None).len(), 7);
+        assert_eq!(entries_of(Directory::Fs, None).len(), 9);
         assert_eq!(
             lookup(b"/proc/sys/fs/inotify", None),
             Some(Entry::Directory(Directory::Inotify))

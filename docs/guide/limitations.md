@@ -1041,9 +1041,12 @@ verified.
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
-  `EINVAL`, where Linux takes a read or write lease and signals its holder
-  when another open or truncate breaks it.
+- **File leases, in part**: an open or a truncate that conflicts with a
+  lease does not break it yet, where Linux's `__break_lease` signals the
+  holder and makes the opener wait up to `/proc/sys/fs/lease-break-time`
+  seconds (or fail with `EWOULDBLOCK` under `O_NONBLOCK`), then takes the
+  lease away or makes it a read lease. Delegations (`F_GETDELEG` and
+  `F_SETDELEG`) are `EINVAL`.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes, as no file system here
   reports errors. Linux's ext4 reports them, and since 7.0 its XFS, Btrfs,

@@ -2586,16 +2586,12 @@ impl Kernel {
     /// `prctl(option, ...)`: PR_SET/GET_NAME, PR_SET/GET_SECCOMP and the
     /// capability module's options ([`crate::credentials::Credentials::prctl`])
     /// per thread, Yama's PR_SET_PTRACER, PR_SET/GET_PDEATHSIG,
-    /// PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER and
-    /// PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux
+    /// PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER,
+    /// PR_SET/GET_NO_NEW_PRIVS and PR_SET_VMA ([`set_anon_vma_name`]); any
+    /// other option is EINVAL, as Linux
     /// gives for options it does not know.
     fn prctl(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         match a[0] {
-            // Yama's PR_SET_PTRACER (`yama_task_prctl`), which reads no
-            // other argument: 0 clears it, PR_SET_PTRACER_ANY (-1 as an
-            // int too) lets any process attach, and anything else is the
-            // number of a task in the caller's PID namespace (`EINVAL` for
-            // none). It is the process's, whichever thread sets it.
             // PR_SET_VMA: only PR_SET_VMA_ANON_NAME (0), as Linux's
             // `prctl_set_vma` takes, which names `[a[2], a[2] + a[3])`.
             0x5356_4d41 => {
@@ -2604,6 +2600,11 @@ impl Kernel {
                 }
                 return set_anon_vma_name(mem, a[2], a[3], a[4]).map(|()| 0);
             }
+            // Yama's PR_SET_PTRACER (`yama_task_prctl`), which reads no
+            // other argument: 0 clears it, PR_SET_PTRACER_ANY (-1 as an
+            // int too) lets any process attach, and anything else is the
+            // number of a task in the caller's PID namespace (`EINVAL` for
+            // none). It is the process's, whichever thread sets it.
             0x5961_6d61 => {
                 let ptracer = if a[1] == 0 {
                     None
@@ -5290,7 +5291,7 @@ fn set_anon_vma_name(mem: &AddressSpace, addr: u64, size: u64, name: u64) -> Res
         {
             return Err(Errno::EINVAL);
         }
-        Some(paludarium_mmu::AnonName::new(&bytes))
+        Some(bytes)
     };
     if !addr.is_multiple_of(4096) {
         return Err(Errno::EINVAL);
@@ -5303,7 +5304,7 @@ fn set_anon_vma_name(mem: &AddressSpace, addr: u64, size: u64, name: u64) -> Res
     if end == addr {
         return Ok(());
     }
-    mem.set_anon_name(GuestAddr(addr), end, name)
+    mem.set_anon_name(GuestAddr(addr), end, name.as_deref())
 }
 fn read_string(
     mem: &AddressSpace,

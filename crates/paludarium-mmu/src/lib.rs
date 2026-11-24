@@ -166,45 +166,58 @@ pub struct Mapping {
 }
 
 /// A name `prctl(PR_SET_VMA_ANON_NAME)` gave anonymous memory
-/// ([`Mapping::anon_name`]): one of the names the machine was given, which
-/// it keeps while it runs, so that a mapping stays `Copy` and two mappings
-/// of one name compare equal.
+/// ([`Mapping::anon_name`]): its slot in its address space's names
+/// ([`AnonNames`]), so that a mapping stays `Copy` and two mappings of one
+/// name compare equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AnonName(u32);
 
-/// The names given, by id, and each name's id ([`AnonName`]).
-#[derive(Default)]
+/// The names an address space's mappings were given ([`AnonName`]), each
+/// once: copied to a `fork`ed child, and gone with the space. A name no
+/// mapping holds any more is let go as the table grows, its slot taken
+/// again.
+#[derive(Clone, Debug, Default)]
 struct AnonNames {
-    by_id: Vec<Arc<[u8]>>,
+    by_id: Vec<Option<Arc<[u8]>>>,
     ids: std::collections::HashMap<Arc<[u8]>, u32>,
 }
 
-/// The names given ([`AnonName`]), each once.
-static ANON_NAMES: std::sync::LazyLock<Mutex<AnonNames>> = std::sync::LazyLock::new(Mutex::default);
-
-impl AnonName {
-    /// The name `name`, the same one each time it is given.
-    #[must_use]
-    pub fn new(name: &[u8]) -> Self {
-        let mut names = ANON_NAMES.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(&id) = names.ids.get(name) {
+impl AnonNames {
+    /// The id of `name`, given its own slot if it has none, after the
+    /// names none of `live` holds are let go once the table has grown to a
+    /// power of two of 64 or more.
+    fn intern(&mut self, name: &[u8], live: &std::collections::HashSet<AnonName>) -> AnonName {
+        if let Some(&id) = self.ids.get(name) {
             return AnonName(id);
         }
-        let id = u32::try_from(names.by_id.len()).unwrap_or(u32::MAX);
+        if self.by_id.len() >= 64 && self.by_id.len().is_power_of_two() {
+            for (id, slot) in self.by_id.iter_mut().enumerate() {
+                let id = AnonName(u32::try_from(id).unwrap_or(u32::MAX));
+                if !live.contains(&id)
+                    && let Some(gone) = slot.take()
+                {
+                    self.ids.remove(&gone);
+                }
+            }
+        }
         let name: Arc<[u8]> = Arc::from(name);
-        names.by_id.push(Arc::clone(&name));
-        names.ids.insert(name, id);
+        let id = match self.by_id.iter().position(Option::is_none) {
+            Some(free) => {
+                self.by_id[free] = Some(Arc::clone(&name));
+                free
+            }
+            None => {
+                self.by_id.push(Some(Arc::clone(&name)));
+                self.by_id.len() - 1
+            }
+        };
+        let id = u32::try_from(id).unwrap_or(u32::MAX);
+        self.ids.insert(name, id);
         AnonName(id)
     }
-    /// The name's bytes.
-    #[must_use]
-    pub fn bytes(self) -> Arc<[u8]> {
-        let names = ANON_NAMES.lock().unwrap_or_else(PoisonError::into_inner);
-        names
-            .by_id
-            .get(self.0 as usize)
-            .cloned()
-            .unwrap_or_else(|| Arc::from(&b""[..]))
+    /// The bytes of the name `id` is, if it is one of the names here.
+    fn bytes(&self, id: AnonName) -> Option<Arc<[u8]>> {
+        self.by_id.get(id.0 as usize).cloned().flatten()
     }
 }
 
@@ -2713,6 +2726,8 @@ struct AddressSpaceData {
     /// How a new mapping is locked: `mlockall` with `MCL_FUTURE` (Linux's
     /// `def_flags`), which neither `fork` nor `exec` keeps.
     future_lock: Option<Lock>,
+    /// The names its mappings were given ([`AnonNames`]).
+    anon_names: AnonNames,
     /// What the frames are charged to; shared with the spaces forked from
     /// this one and the ones its exec starts.
     meter: Option<Arc<MemoryMeter>>,
@@ -2822,6 +2837,7 @@ impl AddressSpaceData {
             poisons: PageRanges::default(),
             uffd_markers: PageRanges::default(),
             future_lock: None,
+            anon_names: AnonNames::default(),
             code: Arc::default(),
             mappings: BTreeMap::new(),
             initial_break: GuestAddr(0),
@@ -3773,6 +3789,7 @@ impl AddressSpaceData {
         let mut copy = Self::new();
         copy.meter = self.meter.clone();
         copy.mappings = self.mappings.clone();
+        copy.anon_names = self.anon_names.clone();
         copy.shared = self.shared.clone();
         copy.backing = self.backing.clone();
         // Linux's `VM_COPY_ON_FORK` has `VM_MAYBE_GUARD`: the child gets the
@@ -4663,7 +4680,7 @@ impl AddressSpaceData {
             identity: (0, self.shared_at(start).map_or(0, |shared| shared.pages.id)),
             heap: start < self.current_break.0 && end > self.initial_break.0,
             flags: self.vma_flags(start, end),
-            anon_name: mapping.anon_name.map(AnonName::bytes),
+            anon_name: mapping.anon_name.and_then(|id| self.anon_names.bytes(id)),
         };
         Some((vma, source))
     }
@@ -5782,12 +5799,11 @@ impl AddressSpaceData {
     /// `userfaultfd`); one with a file but shared anonymous memory ends it
     /// with `EBADF` (`vma_is_anon_shmem`), after those before it; a hole in
     /// the range is `ENOMEM` once the rest has it.
-    pub fn set_anon_name(
-        &mut self,
-        addr: u64,
-        end: u64,
-        name: Option<AnonName>,
-    ) -> Result<(), Errno> {
+    pub fn set_anon_name(&mut self, addr: u64, end: u64, name: Option<&[u8]>) -> Result<(), Errno> {
+        let name = name.map(|name| {
+            let live = self.mappings.values().filter_map(|m| m.anon_name).collect();
+            self.anon_names.intern(name, &live)
+        });
         let starts: Vec<u64> = self
             .mappings
             .range(..end)
@@ -8888,7 +8904,7 @@ impl AddressSpace {
         &self,
         addr: GuestAddr,
         end: u64,
-        name: Option<AnonName>,
+        name: Option<&[u8]>,
     ) -> Result<(), Errno> {
         self.locked().set_anon_name(addr.0, end, name)
     }

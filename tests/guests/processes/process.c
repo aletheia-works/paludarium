@@ -15530,7 +15530,12 @@ static int thp_inner(const char *m) {
     if (ma == MAP_FAILED || mb == MAP_FAILED) return 84;
     printf("moved=%d moved-offset=%d\n", ((uintptr_t)ma & (huge - 1)) == 0,
            ((uintptr_t)mb & (huge - 1)) == 4096);
-    munmap(ma, 2 * huge), munmap(mb, 2 * huge);
+    /* A grow that has to move: a page right after it is taken. */
+    mmap(ma + 2 * huge, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    char *grown = mremap(ma, 2 * huge, 3 * huge, MREMAP_MAYMOVE);
+    if (grown == MAP_FAILED) return 85;
+    printf("grown=%d aligned=%d\n", grown != ma, ((uintptr_t)grown & (huge - 1)) == 0);
+    munmap(grown, 3 * huge), munmap(mb, 2 * huge);
     char *free_area = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (free_area == MAP_FAILED) return 82;
     munmap(free_area, 4 * huge);

@@ -2449,4 +2449,32 @@ fn a_moved_mapping_of_a_huge_file_goes_at_its_offset_past_a_boundary() {
         .unwrap();
     m.back_with_cache(at, 2 * HUGE, &cache, 0).unwrap();
     assert_eq!(moved(at, 2 * HUGE) % HUGE, 0);
+    // A grow that has to move, the old mapping gone.
+    let at = m
+        .map_shared(None, 2 * HUGE, Prot::READ, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 2 * HUGE, &pages, PAGE_SIZE, SharedWrites::Allowed)
+        .unwrap();
+    m.map_shared(
+        Some(GuestAddr(at.0 + 2 * HUGE)),
+        PAGE_SIZE,
+        Prot::NONE,
+        MappingKind::Anonymous,
+    )
+    .ok();
+    let grown = m
+        .remap_shared(
+            at,
+            2 * HUGE,
+            3 * HUGE,
+            Remap {
+                may_move: true,
+                fixed: false,
+                keep_old: false,
+                new_addr: GuestAddr(0),
+            },
+        )
+        .unwrap();
+    assert_ne!(grown, at);
+    assert_eq!(grown.0 % HUGE, PAGE_SIZE);
 }

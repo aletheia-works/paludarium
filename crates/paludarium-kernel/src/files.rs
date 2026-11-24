@@ -8721,25 +8721,14 @@ pub(crate) fn seen_from(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
 fn opened_path(d: &Descriptor) -> Vec<u8> {
     paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
 }
-/// What a mapping of `d`'s file, whose page cache is file `key`'s, shows:
-/// a memfd's fixed name, or where the file is now, from its description's
-/// place, which renames and removals move from then on as they move the
-/// description's (`d_path` of the mapping's dentry).
-pub(crate) fn mapped_name(
-    c: &Context<'_>,
-    d: &Descriptor,
-    key: crate::page_cache::Key,
-) -> Option<crate::page_cache::FileName> {
-    if d.file
-        .as_any()
-        .is_some_and(|v| v.is::<crate::memfd::Memfd>())
-    {
-        return mapped_path(c, d).map(crate::page_cache::FileName::Fixed);
+/// What a mapping of `d`'s file shows: where the file is now, as its
+/// description tells it, which the mapping holds (`d_path` of `vm_file`'s
+/// dentry), or a fixed name, for a memfd or a file that tells none.
+pub(crate) fn mapped_name(c: &Context<'_>, d: &Descriptor) -> Option<crate::page_cache::FileName> {
+    if d.file.dentry_path().is_some() {
+        return Some(crate::page_cache::FileName::Moving);
     }
-    let path = d.file.guest_path_hint().or_else(|| mapped_path(c, d))?;
-    Some(crate::page_cache::FileName::Moving(
-        c.files.caches.keep_place(key, &path),
-    ))
+    mapped_path(c, d).map(crate::page_cache::FileName::Fixed)
 }
 /// The path of the file `d` holds, for a mapping of it to name: where the
 /// file is now, or where it was opened if no name reaches it there (the

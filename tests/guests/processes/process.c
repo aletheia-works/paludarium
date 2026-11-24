@@ -7355,6 +7355,39 @@ static int rename_names_case(void) {
     rn_maps_name((uintptr_t)map, seen, sizeof seen);
     printf("mapping after unlink: %d\n", !strcmp(seen, marked));
     munmap(map, 4096);
+    /* Mapped once the name it was opened by is gone, another link left:
+       that name, marked, whichever file takes it later. */
+    char one[80], two[80], via[80];
+    snprintf(one, sizeof one, "%s/one", d2);
+    snprintf(two, sizeof two, "%s/two", d2);
+    snprintf(via, sizeof via, "%s/via", d2);
+    fd = open(one, O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ftruncate(fd, 4096) || link(one, two) || unlink(one)) return 90;
+    map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 91;
+    snprintf(marked, sizeof marked, "%s (deleted)", one);
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping of a removed name: %d\n", !strcmp(seen, marked));
+    fd = open(one, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return 92;
+    close(fd);
+    if (rename(one, via)) return 93;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("after another file took it: %d\n", !strcmp(seen, marked));
+    munmap(map, 4096);
+    unlink(via);
+    /* Opened through a symbolic link: the file's own name. */
+    if (symlink("two", via)) return 94;
+    fd = open(via, O_RDONLY);
+    map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 95;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping through a link: %d\n", !strcmp(seen, two));
+    munmap(map, 4096);
+    unlink(via);
+    unlink(two);
     /* A copy of this program, run from d2, renames itself. */
     snprintf(prog, sizeof prog, "%s/prog", d2);
     int from = open("/proc/self/exe", O_RDONLY), to = open(prog, O_WRONLY | O_CREAT | O_EXCL, 0755);

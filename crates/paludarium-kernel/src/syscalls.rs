@@ -2656,7 +2656,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 prot,
                 kind,
                 Backing::Cache {
-                    pages: &cache.map_private(file, crate::files::mapped_name(c, d, cache.key())),
+                    pages: &cache.map_private(file, crate::files::mapped_name(c, d)),
                     offset,
                 },
             )
@@ -2853,7 +2853,7 @@ fn shared_file(
     let cache = file_cache(c, d, file)?;
     let pages = cache.map(
         &crate::memfd::pages_source(file),
-        crate::files::mapped_name(c, d, cache.key()),
+        crate::files::mapped_name(c, d),
         offset,
         len,
         may_write,

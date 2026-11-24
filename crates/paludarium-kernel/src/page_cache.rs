@@ -131,6 +131,15 @@ impl Place {
         let place = place.lock().unwrap_or_else(PoisonError::into_inner);
         (place.path.clone(), place.unlinked)
     }
+    /// Resolves the symbolic links of the path in `fs`, the first time.
+    fn resolve(&mut self, fs: &dyn HostFs) {
+        if !self.resolved {
+            self.resolved = true;
+            if let Some(path) = crate::files::resolved_in(fs, &self.path) {
+                self.path = path;
+            }
+        }
+    }
 }
 
 /// The places a rename looked at, and its two entries.
@@ -248,8 +257,8 @@ impl PageCaches {
         }));
         let _use = self.notify.fan.using();
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
-        // Every mapping of a file keeps one, so those let go are dropped
-        // here too, not only at a rename, once there are many.
+        // Those let go are dropped here too, not only at a rename, once
+        // there are many.
         if kept.len() >= 64 && kept.len().is_power_of_two() {
             kept.retain(|(_, place)| place.strong_count() != 0);
         }
@@ -321,12 +330,7 @@ impl PageCaches {
         places.dedup_by(|a, b| Arc::ptr_eq(a, b));
         for place in &places {
             let mut place = place.lock().unwrap_or_else(PoisonError::into_inner);
-            if !place.resolved {
-                place.resolved = true;
-                if let Some(path) = crate::files::resolved_in(&**fs, &place.path) {
-                    place.path = path;
-                }
-            }
+            place.resolve(&**fs);
         }
         places
     }
@@ -606,10 +610,6 @@ impl Drop for Mapped {
 }
 
 impl FileCache {
-    /// The device and inode of the file.
-    pub(crate) fn key(&self) -> Key {
-        self.key
-    }
     /// The pages for a new mapping of `[offset, offset+len)` of `file`, with
     /// the pages of the file's first `size` bytes filled from it where the
     /// cache has none. A mapping that `may_write` keeps `file` to write the
@@ -726,18 +726,16 @@ impl FileCache {
 
 /// The name a mapping of a file shows ([`FilePages`]'s `name`), as Linux's
 /// `d_path` of the mapping's dentry gives it: one that does not change (a
-/// memfd's), or where the file is now, which renames move and removals
-/// mark ([`PageCaches::keep_place`]).
+/// memfd's), or where the file is now, which its description, held as the
+/// mapping's file, tells ([`FileHandle::dentry_path`]).
 pub(crate) enum FileName {
     Fixed(Vec<u8>),
-    Moving(Arc<Mutex<Place>>),
+    Moving,
 }
 
 /// A mapped file as the MMU reads it ([`paludarium_mmu::PageSource`]), with
 /// the size its page cache keeps and the name it shows.
 pub(crate) struct FilePages {
-    /// Dropped first, before `file`, so that the file's release, once the
-    /// last mapping goes, finds no place of it kept (`held`) and evicts it.
     name: Option<FileName>,
     file: Arc<dyn FileHandle>,
     cache: Arc<FileCache>,
@@ -801,7 +799,7 @@ impl paludarium_mmu::PageSource for FilePages {
     fn name(&self) -> Option<Vec<u8>> {
         let (mut name, unlinked) = match self.name.as_ref()? {
             FileName::Fixed(name) => (name.clone(), false),
-            FileName::Moving(place) => Place::at(place),
+            FileName::Moving => self.file.dentry_path()?,
         };
         if unlinked || !self.linked() {
             name.extend_from_slice(b" (deleted)");
@@ -1253,6 +1251,14 @@ impl FileHandle for CoherentFile {
             Device::Mount(_, _, place, _) => Some(Place::at(place).0),
             Device::Fixed(_) => self.inner.guest_path_hint(),
         }
+    }
+    fn dentry_path(&self) -> Option<(Vec<u8>, bool)> {
+        let Device::Mount(fs, _, place, _) = &self.device else {
+            return None;
+        };
+        let mut place = place.lock().unwrap_or_else(PoisonError::into_inner);
+        place.resolve(&**fs);
+        Some((place.path.clone(), place.unlinked))
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         self.write_back();

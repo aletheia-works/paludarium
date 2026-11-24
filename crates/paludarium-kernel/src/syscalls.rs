@@ -2079,8 +2079,13 @@ pub(crate) fn wake_key(file: &std::sync::Arc<dyn FileHandle>) -> Option<(u64, u6
 }
 
 /// Whether a file with keyed wake-ups woke a wait for `events` between the
-/// generations `before` and `now`.
+/// generations `before` and `now`. A wake-up for `POLLERR` or `POLLHUP`,
+/// which every wait takes, moves both generations; a wait for neither
+/// direction counts any move, and looks to see whether it was one.
 pub(crate) fn woke(events: u32, before: (u64, u64), now: (u64, u64)) -> bool {
+    if events & (INPUT_KEYS | OUTPUT_KEYS) == 0 {
+        return before != now;
+    }
     (before.0 != now.0 && events & INPUT_KEYS != 0)
         || (before.1 != now.1 && events & OUTPUT_KEYS != 0)
 }

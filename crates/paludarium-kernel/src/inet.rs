@@ -13,6 +13,7 @@
 //! socket listens reaches it in the kernel, whatever the policy allows.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
+use crate::interface::Flow6;
 use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::{Timeout, Timestamps};
 use crate::syscalls::Context;
@@ -43,6 +44,11 @@ const IPPROTO_ICMP: u64 = 1;
 const IPPROTO_TCP: u64 = 6;
 const IPPROTO_UDP: u64 = 17;
 const IPPROTO_ICMPV6: u64 = 58;
+/// The protocol numbers a flow is hashed with ([`Network::flow6`]), as
+/// the `u8` of `flowi6_proto`.
+const FLOW_TCP: u8 = 6;
+const FLOW_UDP: u8 = 17;
+const FLOW_ICMPV6: u8 = 58;
 const ENOTSOCK: Errno = Errno(88);
 const EDESTADDRREQ: Errno = Errno(89);
 const ENOPROTOOPT: Errno = Errno(92);
@@ -404,19 +410,25 @@ impl Network {
     /// through it (`RT6_LOOKUP_F_IFACE`), a local one too, and `ENETUNREACH`
     /// where none goes. An IPv4 one goes through it as
     /// [`Self::route4_through`] routes it.
+    ///
+    /// Of an IPv6 multipath route, the hop the flow takes: from `from`, of
+    /// the protocol `proto`, with no flow label, as the guest's sockets
+    /// send none ([`Self::flow6`]).
     fn route(
         &self,
         to: SocketAddr,
         from: Option<IpAddr>,
         oif: u32,
+        proto: u8,
         now: Option<u64>,
     ) -> Result<Dest, Errno> {
+        let flow = Self::flow6(from, proto);
         if let IpAddr::V6(ip) = to.ip()
             && oif != 0
             && !ip.is_unspecified()
         {
             use crate::interface::Kind;
-            let route = self.addresses_at(now).lookup6_on(ip, oif)?;
+            let route = self.addresses_at(now).lookup6_flow(ip, oif, &flow)?;
             return match route.kind {
                 Kind::Local if self.is_up() => Ok(Dest::Here(to)),
                 Kind::Unicast | Kind::Multicast if route.oif != crate::netdev::LOOPBACK_OIF => {
@@ -481,7 +493,7 @@ impl Network {
                 // IPv6's unicast routes through a veth end, and the
                 // multicast one each end has (`addrconf_add_mroute`).
                 if let IpAddr::V6(ip) = to.ip()
-                    && let Ok(route) = self.addresses_at(now).lookup6(ip)
+                    && let Ok(route) = self.addresses_at(now).lookup6_flow(ip, 0, &flow)
                     && matches!(route.kind, Kind::Unicast | Kind::Multicast)
                     && route.oif != crate::netdev::LOOPBACK_OIF
                     && let Ok(index) = i32::try_from(route.oif)
@@ -524,10 +536,10 @@ impl Network {
     ///   address), and this namespace takes the answer from `to` in on its
     ///   end, at its address `from`; else that answer goes nowhere
     ///   ([`Reach::OneWay`]).
-    fn reach(&self, index: i32, from: IpAddr, to: IpAddr, now: Option<u64>) -> Reach {
+    fn reach(&self, index: i32, from: IpAddr, to: IpAddr, flow: &Flow6, now: Option<u64>) -> Reach {
         let (from, to) = match (plain(from), plain(to)) {
             (IpAddr::V4(from), IpAddr::V4(to)) => (from, to),
-            (IpAddr::V6(from), IpAddr::V6(to)) => return self.reach6(index, from, to, now),
+            (IpAddr::V6(from), IpAddr::V6(to)) => return self.reach6(index, from, to, flow, now),
             _ => return Reach::Unanswered,
         };
         let hop = self.next_hop4(index, to, now);
@@ -712,8 +724,15 @@ impl Network {
     ///   end, this namespace has `from`, not tentative, and this end has
     ///   that route's next hop; else that answer goes nowhere
     ///   ([`Reach::OneWay`]).
-    fn reach6(&self, index: i32, from: Ipv6Addr, to: Ipv6Addr, now: Option<u64>) -> Reach {
-        let hop = self.next_hop6(index, to, now);
+    fn reach6(
+        &self,
+        index: i32,
+        from: Ipv6Addr,
+        to: Ipv6Addr,
+        flow: &Flow6,
+        now: Option<u64>,
+    ) -> Reach {
+        let hop = self.next_hop6(index, to, flow, now);
         let Some(Nd {
             peer,
             answer,
@@ -743,8 +762,10 @@ impl Network {
         }
         let (arrives, back) = {
             let addresses = there.addresses_at(now);
+            // The answer's flow, from `to`.
+            let answer = Self::flow6(Some(IpAddr::V6(to)), flow.proto);
             let back = addresses
-                .lookup6(from)
+                .lookup6_flow(from, 0, &answer)
                 .ok()
                 .filter(|r| {
                     r.kind == crate::interface::Kind::Unicast
@@ -874,6 +895,20 @@ impl Network {
             Err(_) => Ok(Dest::Veth(index, cast)),
         }
     }
+    /// The flow of a packet from `from` (the address a socket is bound
+    /// to, none for an unbound one) of the protocol `proto`, which chooses
+    /// among an IPv6 multipath route's hops (`rt6_multipath_hash`): its
+    /// IPv6 source, or `::`, and no flow label.
+    fn flow6(from: Option<IpAddr>, proto: u8) -> Flow6 {
+        Flow6 {
+            src: match from.map(plain) {
+                Some(IpAddr::V6(ip)) => Some(ip),
+                _ => None,
+            },
+            label: 0,
+            proto,
+        }
+    }
     /// The neighbour an IPv4 packet to `to` out through the veth end
     /// `index` goes to at `now`: its route's gateway, where a route of link
     /// scope reaches it, else `to` itself (`rt_nexthop`).
@@ -885,12 +920,13 @@ impl Network {
             .and_then(|r| r.gateway)
             .unwrap_or(to)
     }
-    /// The neighbour a packet to `to` out through the veth end `index`
-    /// goes to at `now`: its route's gateway, else `to` itself
+    /// The neighbour a packet of the flow `flow` to `to` out through the
+    /// veth end `index` goes to at `now`: its route's gateway, the hop of
+    /// a multipath route [`Self::route`] took, else `to` itself
     /// (`rt6_nexthop`).
-    fn next_hop6(&self, index: i32, to: Ipv6Addr, now: Option<u64>) -> Ipv6Addr {
+    fn next_hop6(&self, index: i32, to: Ipv6Addr, flow: &Flow6, now: Option<u64>) -> Ipv6Addr {
         self.addresses_at(now)
-            .lookup6(to)
+            .lookup6_flow(to, 0, flow)
             .ok()
             .filter(|r| i64::from(r.oif) == i64::from(index))
             .and_then(|r| r.gateway)
@@ -1012,7 +1048,7 @@ impl Network {
     /// from `from` to its `to` at `now` (a TCP handshake's, or ICMP's port
     /// unreachable): what it sends back takes its neighbour of `from`, as
     /// a packet of its own would ([`Self::reach`]).
-    fn reply(&self, index: i32, from: IpAddr, to: IpAddr, now: Option<u64>) {
+    fn reply(&self, index: i32, from: IpAddr, to: IpAddr, proto: u8, now: Option<u64>) {
         let peer = self
             .devices()
             .by_index(index)
@@ -1021,7 +1057,7 @@ impl Network {
         if let Some(peer) = peer
             && let Some(there) = peer.network.upgrade()
         {
-            let _ = there.reach(peer.index, to, from, now);
+            let _ = there.reach(peer.index, to, from, &Self::flow6(Some(to), proto), now);
         }
     }
     /// A broadcast or multicast packet goes out through the veth end
@@ -2327,9 +2363,9 @@ impl InetSocket {
                     {
                         self.mapped_source(bound)?;
                     }
-                    let dest = self
-                        .network
-                        .route(plain_to, s.source(), device, self.now())?;
+                    let dest =
+                        self.network
+                            .route(plain_to, s.source(), device, FLOW_TCP, self.now())?;
                     let to = match dest {
                         Dest::Here(to) => Some(to),
                         Dest::Away | Dest::Veth(..) => None,
@@ -2590,7 +2626,10 @@ impl InetSocket {
         let keep = s.device_source;
         let name = |from: SocketAddr| if keep { bound } else { from };
         let source = (!keep).then_some(bound.ip());
-        match self.network.route(to, source, device, self.now())? {
+        match self
+            .network
+            .route(to, source, device, FLOW_UDP, self.now())?
+        {
             Dest::Here(to) => {
                 let from = self.datagram_source(s, to, options)?;
                 let name = name(from);
@@ -2737,7 +2776,10 @@ impl InetSocket {
             SocketAddr::V6(v6) if v6.scope_id() != 0 && needs_scope_id(*v6.ip()) => v6.scope_id(),
             _ => options.device,
         };
-        let route = self.network.route(plain_to, s.source(), oif, self.now())?;
+        let flow = Network::flow6(s.source(), FLOW_UDP);
+        let route = self
+            .network
+            .route(plain_to, s.source(), oif, FLOW_UDP, self.now())?;
         if let Dest::Veth(index, cast) = route {
             let v6 = plain_to.is_ipv6();
             if self.family == Family::V6 && options.v6_only && !v6 {
@@ -2801,15 +2843,18 @@ impl InetSocket {
             }
             let to_peer = s.peer == Some(plain_to);
             drop(s);
-            let (there, answered) = match self.network.reach(index, from.ip(), to.ip(), self.now())
-            {
-                Reach::Answered(there) => (there, true),
-                Reach::OneWay(there) => (there, false),
-                // Dropped once ARP gives up; ICMP's host unreachable that
-                // tells of it is no hard error (`__udp4_lib_err`); or
-                // dropped where it comes.
-                Reach::Unanswered | Reach::Dropped => return Ok(bytes.len()),
-            };
+            let (there, answered) =
+                match self
+                    .network
+                    .reach(index, from.ip(), to.ip(), &flow, self.now())
+                {
+                    Reach::Answered(there) => (there, true),
+                    Reach::OneWay(there) => (there, false),
+                    // Dropped once ARP gives up; ICMP's host unreachable that
+                    // tells of it is no hard error (`__udp4_lib_err`); or
+                    // dropped where it comes.
+                    Reach::Unanswered | Reach::Dropped => return Ok(bytes.len()),
+                };
             let receiver =
                 there
                     .ports(true)
@@ -2817,7 +2862,8 @@ impl InetSocket {
             // ICMP's port unreachable comes back, where answers come, through
             // the peer's neighbour of `from`.
             if receiver.is_none() && answered {
-                self.network.reply(index, from.ip(), to.ip(), self.now());
+                self.network
+                    .reply(index, from.ip(), to.ip(), FLOW_ICMPV6, self.now());
             }
             match receiver {
                 Some(receiver) => {
@@ -3615,10 +3661,15 @@ impl InetSocket {
             self.give_back(s, bound);
             return Err(Errno::EINVAL);
         }
-        let failing = match self.network.reach(index, from.ip(), to.ip(), self.now()) {
+        let flow = Network::flow6(bound.map(|b| b.ip()), FLOW_TCP);
+        let failing = match self
+            .network
+            .reach(index, from.ip(), to.ip(), &flow, self.now())
+        {
             Reach::Answered(there) => {
                 // Its SYN-ACK, or its reset, comes back.
-                self.network.reply(index, from.ip(), to.ip(), self.now());
+                self.network
+                    .reply(index, from.ip(), to.ip(), FLOW_TCP, self.now());
                 return Ok(self.join(&there, s, (bound, from), to, options, Some(index)));
             }
             Reach::OneWay(_) | Reach::Dropped => (SYN_TIMEOUT, ETIMEDOUT),
@@ -5576,6 +5627,7 @@ mod tests {
                 .route(
                     SocketAddr::new(IpAddr::V4(ip), 9),
                     None,
+                    0,
                     0,
                     Some(3 * SECOND)
                 )

@@ -47,9 +47,8 @@ verified.
   VMA has its full size from the start, where Linux's grows as it is used. A
   program's own segments and its interpreter's are named by the path it was
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
-  do not exist.
-- **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
+  symbolic links. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+- **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
   maps no more than the 16 pages around it
@@ -106,7 +105,8 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
-  `kernel` and `net` it has and `vm/drop_caches`, ...) and the other names in
+  `kernel` and `net` it has and `vm/drop_caches` and
+  `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `stack`
@@ -324,7 +324,10 @@ verified.
   first writes a position-independent program's or interpreter's first
   segment as long as the whole image, before it trims it; a stack that
   grows down as the program touches it writes none; a mapping's inode
-  generation is 0 and no build ID is given (`build_id`); `mprotect` writes
+  generation is 0; a build ID is read from a file whose page cache the
+  emulator does not keep (a host's, or one of the in-memory file system from
+  start-up) as if its pages were all cached, where Linux gives none for a
+  page it has not read or has evicted; `mprotect` writes
   one record of each VMA as it ends up, where Linux writes one each time it
   changes one, of the VMA as merged so far; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
@@ -534,13 +537,10 @@ verified.
   whole exit cancels the requests its threads submitted that wait for
   their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
   the kernel the differential tests run on, cancels them only once their
-  files are ready, as for a thread that exits alone. In that exit, a
-  link's next request that still waits to run fails with `EFAULT`, as an
-  exiting thread's does; Linux master runs it before the thread is
-  exiting. A registered file that an
-  update outside a submission takes from its slot posts its tag at once,
-  even while a request that waits for its file holds it; Linux posts the
-  tag once that request completes. A registered buffer's pages
+  files are ready, as for a thread that exits alone. A registered file
+  that an update outside a submission takes from its slot posts its tag at
+  once, even while a request that waits for its file holds it; Linux posts
+  the tag once that request completes. A registered buffer's pages
   are not pinned: a fixed transfer moves the memory at its address as that
   is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
   made read-only, and a process that shares the ring moves its own memory.
@@ -1042,8 +1042,7 @@ verified.
   Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
-  which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
-  `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
+  which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
 - **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
@@ -1081,9 +1080,8 @@ verified.
   routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
   and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
   gateway's neighbour state does not steer a lookup, as Linux's
-  `rt6_check_neigh` does among routes of one metric, and two routes with
-  gateways of one metric, which Linux makes multipath siblings, are
-  `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
+  `rt6_check_neigh` does among routes of one metric. A UDP connect to a
+  group of the node or the
   link without a scope ID or a device is `EINVAL`, as Linux's is with no
   multicast interface, which none is here. A connection accepted from a
   link-local address has no device, so its names have no scope ID. A UDP
@@ -1173,8 +1171,8 @@ verified.
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
   A
-  route goes through `lo`, a veth end or rejects: multipath routes,
-  encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
+  route goes through `lo`, a veth end or rejects: IPv4 multipath
+  routes, encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
@@ -1281,7 +1279,7 @@ verified.
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
   With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
-  not have (a multipath route, say, or a link of a kind) carries no
+  not have (an IPv4 multipath route, say, or a link of a kind) carries no
   message, as Linux would take it; an IPv6 route replaced without
   `NLM_F_CREATE` that is not there is told of
   ("Can not replace route - no match found") only where its prefix has

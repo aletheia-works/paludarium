@@ -214,18 +214,24 @@ impl Task {
 }
 
 /// Refuses what the reader may not see of the task: `environ`, `auxv`, `maps`,
-/// `smaps`, `pagemap`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
-/// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
-/// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself, read or
-/// looked in, as its mode lets (`proc_fd_permission`). `environ`, `auxv` and
-/// `pagemap` of a task with no memory left are `ESRCH` for a reader their mode
-/// lets open them (root's, [`Task::owned`]), as Linux's `__mem_open` and
-/// `pagemap_open` refuse them before they check the reader,
-/// while `maps` and `smaps` (`proc_maps_open`) then open for anyone and read
-/// nothing.
+/// `smaps`, `smaps_rollup`, `pagemap`, `exe`, `cwd`, the links of `ns` and
+/// `fd`, and `fdinfo` (`EACCES`), as Linux's `proc_mem_open`,
+/// `proc_fd_access_allowed`, `proc_ns_get_link` and `proc_fdinfo_permission`
+/// do; and `fd` itself, read or looked in, as its mode lets
+/// (`proc_fd_permission`). `environ`, `auxv` and `pagemap` of a task with no
+/// memory left are `ESRCH` for a reader their mode lets open them (root's,
+/// [`Task::owned`]), as Linux's `__mem_open` and `pagemap_open` refuse them
+/// before they check the reader, and `smaps_rollup` for any reader, as
+/// `smaps_rollup_open` finds no `mm`, while `maps` and `smaps`
+/// (`proc_maps_open`) then open for anyone and read nothing.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
-        TaskEntry::Environ | TaskEntry::Auxv | TaskEntry::Pagemap if task.memory().is_none() => {
+        TaskEntry::Environ
+        | TaskEntry::Auxv
+        | TaskEntry::Pagemap
+        | TaskEntry::Maps(crate::proc::MapsKind::Rollup)
+            if task.memory().is_none() =>
+        {
             Err(Errno(3)) // ESRCH
         }
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
@@ -468,12 +474,14 @@ pub(super) fn mounts(
     task.public.files.mount_view()
 }
 
-/// `maps` or `smaps` (`smaps` set) of the task, opened with `flags`, its
-/// files named from the reader's `root` as Linux's `seq_file_path` names
-/// them; empty once it has ended, as Linux's `m_start` finds no `mm`.
+/// `maps`, `smaps` or `smaps_rollup` (`kind`) of the task, opened with
+/// `flags`, its files named from the reader's `root` as Linux's
+/// `seq_file_path` names them; empty once it has ended, as Linux's
+/// `m_start` finds no `mm` (`smaps_rollup`'s open is `ESRCH` then,
+/// [`check`]).
 pub(super) fn maps(
     task: &Task,
-    smaps: bool,
+    kind: crate::proc::MapsKind,
     flags: u32,
     root: Vec<u8>,
     owner: crate::proc::Owner,
@@ -484,7 +492,7 @@ pub(super) fn maps(
             task.start_stack(),
             flags,
             root,
-            smaps,
+            kind,
             owner,
         )),
         None => std::sync::Arc::new(

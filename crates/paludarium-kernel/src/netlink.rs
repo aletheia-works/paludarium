@@ -210,7 +210,8 @@ const NLM_F_DUMP_FILTERED: u16 = 0x20;
 /// and IPv6's `RT6_TABLE_DFLT`, which is its main one.
 const RT_TABLE_DEFAULT: u32 = 253;
 const RT6_TABLE_DFLT: u32 = 254;
-/// `RTNH_F_ONLINK`.
+/// `RTNH_F_DEAD` and `RTNH_F_ONLINK`.
+const RTNH_F_DEAD: u32 = 1;
 const RTNH_F_ONLINK: u32 = 4;
 const RTNH_F_LINKDOWN: u32 = 16;
 /// A table past 255, as an `rtmsg` names it.
@@ -1308,7 +1309,16 @@ impl NetlinkSocket {
                 Ok(false)
             }
             RTM_NEWROUTE | RTM_DELROUTE if matches!(family, AF_INET | AF_INET6) => {
-                let events = change_route(&self.network, header, payload)?;
+                // What a multipath route put in tells, even when it then
+                // fails (`ip6_route_multipath_add`).
+                let mut partial = Vec::new();
+                let events = match change_route_told(&self.network, header, payload, &mut partial) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        notices.extend(told(partial, header.seq, port, false, true, now));
+                        return Err(e);
+                    }
+                };
                 let echo = header.flags & NLM_F_ECHO != 0;
                 let told = told(events, header.seq, port, echo, true, now);
                 if echo {
@@ -3164,10 +3174,10 @@ fn route_dump(
         } else {
             messages.extend(
                 addresses
-                    .dump6()
+                    .dump6_entries()
                     .iter()
-                    .filter(|r| taken(r.table, r.kind.code(), r.proto, LOOPBACK_OIF))
-                    .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, flags, now)),
+                    .filter(|(r, _)| taken(r.table, r.kind.code(), r.proto, LOOPBACK_OIF))
+                    .map(|(r, hops)| ipv6_route_of(RTM_NEWROUTE, r, hops, seq, port, flags, now)),
             );
         }
     }
@@ -4005,11 +4015,13 @@ fn ipv4_route_of(
     message(kind, flags, seq, port, &body)
 }
 /// An IPv6 route as `rt6_fill_node` gives it at `now`, as a message of
-/// `kind` with `flags`: its `rta_cacheinfo` has only the time it has left,
+/// `kind` with `flags`, with the next hops `hops` of a multipath route
+/// ([`put_next_hops6`]): its `rta_cacheinfo` has only the time it has left,
 /// if it runs out ([`route_expires`]).
 fn ipv6_route_of(
     kind: u16,
     route: &crate::interface::Route6,
+    hops: &[crate::interface::Route6],
     seq: u32,
     port: u32,
     flags: u16,
@@ -4025,7 +4037,7 @@ fn ipv6_route_of(
         RT_SCOPE_UNIVERSE,
         route.kind.code(),
     ];
-    body.extend_from_slice(&nexthop_flags6(route).to_le_bytes());
+    body.extend_from_slice(&route_flags6(route, hops).to_le_bytes());
     attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
     if route.len != 0 {
         attribute(&mut body, RTA_DST, &route.dst.octets());
@@ -4035,7 +4047,7 @@ fn ipv6_route_of(
     }
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-    put_nexthop6(&mut body, route);
+    put_next_hops6(&mut body, route, hops);
     let mut cache = [0; RTA_CACHEINFO_LEN];
     cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &cache);
@@ -4109,9 +4121,11 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// IPv6, as `ip6_route_output`: `ENETUNREACH` while `lo` is down, and for
 /// an output device but `lo` without a source, or to a loopback,
 /// link-local or multicast address (`RT6_LOOKUP_F_IFACE`); the answer
-/// gives the request's source as `RTA_SRC`. The mark, the user ID, the
-/// protocol and the ports choose among policy rules and multipath routes,
-/// of which there are none, so they change nothing.
+/// gives the request's source as `RTA_SRC`. The source, the flow label
+/// and the protocol choose among a multipath route's hops
+/// ([`crate::interface::Addresses::lookup6_flow`]); the mark, the user ID
+/// and the ports choose among policy rules, of which there are none, so
+/// they change nothing.
 fn lookup(
     network: &Network,
     payload: &[u8],
@@ -4136,11 +4150,13 @@ fn lookup(
     let mut iif = 0;
     let mut oif = 0;
     let mut proto = None;
+    let mut flowlabel = 0;
     let number = |value: &[u8]| -> Result<u32, Errno> {
         Ok(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?))
     };
     for (kind, value) in attributes(&payload[12..]) {
         match kind {
+            RTA_FLOWLABEL => flowlabel = value.first_chunk().map_or(0, |b| u32::from_be_bytes(*b)),
             RTA_DST => dst = Some(value),
             RTA_SRC => src = Some(value),
             RTA_IIF => iif = number(value)?,
@@ -4171,6 +4187,13 @@ fn lookup(
         return Err(ENODEV);
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
+    // What chooses among a multipath route's hops: the source, the flow
+    // label without the TOS (`flowi6_get_flowlabel`) and the protocol.
+    let flow = crate::interface::Flow6 {
+        src: Some(Ipv6Addr::from(source6)),
+        label: flowlabel & 0x000f_ffff,
+        proto: proto.unwrap_or(0),
+    };
     // The device it comes in on alone, before the addresses: whether it
     // is up, its forwarding, and the reverse path filtering that counts.
     let device = {
@@ -4200,7 +4223,7 @@ fn lookup(
             rp_filter,
         };
         return if v6 {
-            input6(&addresses, address6, source6, &input, now)
+            input6(&addresses, address6, source6, &input, &flow, now)
         } else {
             let four = |value: Option<&[u8]>| -> Result<[u8; 4], Errno> {
                 value.map_or(Ok([0; 4]), |v| v.first_chunk().copied().ok_or(ERANGE))
@@ -4218,12 +4241,22 @@ fn lookup(
         // loopback, link-local or multicast address (`rt6_need_strict`).
         let strict = ip.is_loopback() || ip.is_unicast_link_local() || ip.is_multicast();
         let route = if oif != 0 && (strict || source6 == [0; 16]) {
-            addresses.lookup6_on(ip, oif)?
+            addresses.lookup6_flow(ip, oif, &flow)?
         } else {
-            addresses.lookup6(ip)?
+            addresses.lookup6_flow(ip, 0, &flow)?
         };
         if fib_match {
-            return Ok(ipv6_route_of(RTM_NEWROUTE, &route, seq, port, 0, now));
+            // The entry of the sibling the lookup took, first of its hops.
+            let hops = addresses.hops6(&route);
+            return Ok(ipv6_route_of(
+                RTM_NEWROUTE,
+                &route,
+                &hops,
+                seq,
+                port,
+                0,
+                now,
+            ));
         }
         // `rt6_fill_node` of the route the lookup made, with the request's
         // source, and the source it leaves from, then the route's own
@@ -4677,10 +4710,48 @@ fn dst_device6(route: &crate::interface::Route6) -> u32 {
     }
 }
 /// The `rtm_flags` a route's next hop gives (`fib_nexthop_info`):
-/// `RTNH_F_LINKDOWN` and `RTNH_F_ONLINK`.
+/// `RTNH_F_DEAD`, `RTNH_F_LINKDOWN` and `RTNH_F_ONLINK`.
 fn nexthop_flags6(route: &crate::interface::Route6) -> u32 {
-    (if route.onlink { RTNH_F_ONLINK } else { 0 })
+    (if route.dead { RTNH_F_DEAD } else { 0 })
+        | (if route.onlink { RTNH_F_ONLINK } else { 0 })
         | if route.linkdown { RTNH_F_LINKDOWN } else { 0 }
+}
+/// The `rtm_flags` of an IPv6 route with the next hops `hops`: none for a
+/// multipath route, whose hops carry theirs.
+fn route_flags6(route: &crate::interface::Route6, hops: &[crate::interface::Route6]) -> u32 {
+    if hops.is_empty() {
+        nexthop_flags6(route)
+    } else {
+        0
+    }
+}
+/// A route's next hop ([`put_nexthop6`]), or, with `hops`, its
+/// `RTA_MULTIPATH`, unmarked as nested (`nla_nest_start_noflag`), of a
+/// `rtnexthop` for each (`fib_add_nexthop`): its flags, its weight less
+/// one, its device, then its gateway.
+fn put_next_hops6(
+    body: &mut Vec<u8>,
+    route: &crate::interface::Route6,
+    hops: &[crate::interface::Route6],
+) {
+    if hops.is_empty() {
+        put_nexthop6(body, route);
+        return;
+    }
+    let mut nest = Vec::new();
+    for hop in hops {
+        let mut attrs = Vec::new();
+        if let Some(gateway) = hop.gateway {
+            attribute(&mut attrs, RTA_GATEWAY, &gateway.octets());
+        }
+        let len = u16::try_from(8 + attrs.len()).unwrap_or(u16::MAX);
+        nest.extend_from_slice(&len.to_le_bytes());
+        nest.push(u8::try_from(nexthop_flags6(hop)).unwrap_or_default());
+        nest.push(u8::try_from(hop.weight.saturating_sub(1)).unwrap_or(u8::MAX));
+        nest.extend_from_slice(&hop.oif.to_le_bytes());
+        nest.extend_from_slice(&attrs);
+    }
+    attribute(body, RTA_MULTIPATH, &nest);
 }
 /// A route's next hop as `fib_nexthop_info` puts it: its gateway, then
 /// its device.
@@ -4695,6 +4766,7 @@ fn input6(
     address: [u8; 16],
     source: [u8; 16],
     input: &Input,
+    flow: &crate::interface::Flow6,
     now: u64,
 ) -> Result<Vec<u8>, Errno> {
     let ip = core::net::Ipv6Addr::from(address);
@@ -4702,11 +4774,7 @@ fn input6(
     // loopback, link-local or multicast address (`rt6_need_strict`).
     let strict = ip.is_loopback() || ip.is_unicast_link_local() || ip.is_multicast();
     let iif = input.iif.unsigned_abs();
-    let route = if strict {
-        addresses.lookup6_on(ip, iif)?
-    } else {
-        addresses.lookup6(ip)?
-    };
+    let route = addresses.lookup6_flow(ip, if strict { iif } else { 0 }, flow)?;
     // `rt6_fill_node` asks multicast routing of a group's
     // (`ip6mr_get_route`), which finds no device on the reply it fills and
     // fails with `ENODEV`; the fill turns any failure into `EMSGSIZE`.
@@ -4725,7 +4793,12 @@ fn input6(
         RT_SCOPE_UNIVERSE,
         route.kind.code(),
     ];
-    let flags = if fib_match { nexthop_flags6(&route) } else { 0 };
+    let hops = addresses.hops6(&route);
+    let flags = if fib_match {
+        route_flags6(&route, &hops)
+    } else {
+        0
+    };
     body.extend_from_slice(&flags.to_le_bytes());
     attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
     if fib_match {
@@ -4743,7 +4816,7 @@ fn input6(
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
     if fib_match {
-        put_nexthop6(&mut body, &route);
+        put_next_hops6(&mut body, &route, &hops);
     } else {
         if let Some(gateway) = route.gateway {
             attribute(&mut body, RTA_GATEWAY, &gateway.octets());
@@ -4770,16 +4843,27 @@ fn input6(
 /// past `RTN_MAX`; for IPv6, `EINVAL` for `RTA_FLOWLABEL`, `RTA_VIA` and a
 /// destination shorter than its prefix, then, adding (`fib6_config_validate`),
 /// for `RTM_F_CLONED`, a kind past `RTN_MAX` and a prefix or source prefix
-/// past 128. Multipath routes, encapsulations, nexthop objects, realms, expiries,
+/// past 128. IPv4 multipath routes (`RTA_MULTIPATH`), encapsulations, nexthop objects, realms, expiries,
 /// source prefixes and router preferences are
 /// `EOPNOTSUPP`. A route added takes the metrics `RTA_METRICS` holds
 /// ([`convert_metrics`]); an IPv4 one removed must have those it names
 /// ([`metrics_match`]), and IPv6's does not look. The table is the
 /// `rtmsg`'s, or the one `RTA_TABLE` names.
+#[cfg(test)]
 fn change_route(
     network: &Network,
     header: &Header,
     payload: &[u8],
+) -> Result<Vec<crate::interface::Event>, Errno> {
+    change_route_told(network, header, payload, &mut Vec::new())
+}
+/// [`change_route`], what a multipath route that failed told of left in
+/// `partial`.
+fn change_route_told(
+    network: &Network,
+    header: &Header,
+    payload: &[u8],
+    partial: &mut Vec<crate::interface::Event>,
 ) -> Result<Vec<crate::interface::Event>, Errno> {
     use crate::interface::{Ask4, Ask6, Select4};
     use core::net::{Ipv4Addr, Ipv6Addr};
@@ -4805,6 +4889,7 @@ fn change_route(
     let mut oif = 0;
     let mut priority = 0;
     let mut metrics = None;
+    let mut multipath = None;
     let mut unsupported = src_len != 0 && v6;
     let number = |value: &[u8]| -> Result<u32, Errno> {
         Ok(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?))
@@ -4867,12 +4952,22 @@ fn change_route(
             RTA_TABLE => table = number(value)?,
             RTA_PREF if v6 => unsupported |= value.first().is_some_and(|&p| p == 1 || p == 3),
             RTA_METRICS => metrics = Some(value),
+            RTA_MULTIPATH if v6 => multipath = Some(value),
             RTA_MULTIPATH | RTA_FLOW | RTA_VIA | RTA_ENCAP | RTA_EXPIRES | RTA_NH_ID => {
                 unsupported = true;
             }
             _ => {}
         }
     }
+    // `rtm_to_fib6_multipath_config`.
+    let hops = match multipath {
+        Some(value) => {
+            let hops = nexthops6(value, gateway.is_some(), add)?;
+            unsupported |= hops.iter().any(|h| h.encap);
+            Some(hops)
+        }
+        None => None,
+    };
     // `fib6_config_validate`, for an IPv6 route added.
     if v6 && add {
         if flags & RTM_F_CLONED != 0 {
@@ -4943,6 +5038,48 @@ fn change_route(
             request: header.flags,
             metrics: converted,
         };
+        if let Some(hops) = hops {
+            // Each next hop a request of its own, of the device it names
+            // or else the request's, and its gateway or else the
+            // request's (`ip6_route_multipath_add`, `_del`).
+            let asks: Vec<(Ask6, bool, u16)> = hops
+                .iter()
+                .map(|hop| {
+                    let oif = if hop.ifindex == 0 { oif } else { hop.ifindex };
+                    let up = if oif != 0 {
+                        device_state(network, oif).is_some_and(|(_, up)| up)
+                    } else {
+                        network.is_up()
+                    };
+                    let ask = Ask6 {
+                        oif,
+                        gateway: hop.gateway.map(Ipv6Addr::from).or(ask.gateway),
+                        onlink: ask.onlink || hop.flags & RTNH_F_ONLINK != 0,
+                        device: network.has_device(oif),
+                        ipv6_off: i32::try_from(oif)
+                            .ok()
+                            .and_then(|i| ipv6_device(network, i))
+                            .filter(|d| d.has)
+                            .map(|d| d.disabled),
+                        metrics: ask.metrics,
+                        ..ask
+                    };
+                    (ask, up, u16::from(hop.hops) + 1)
+                })
+                .collect();
+            let (events, result) = if add {
+                addresses.add_multipath6(&asks)
+            } else {
+                addresses.del_multipath6(&asks.into_iter().map(|(a, _, _)| a).collect::<Vec<_>>())
+            };
+            return match result {
+                Ok(()) => Ok(events),
+                Err(e) => {
+                    *partial = events;
+                    Err(e)
+                }
+            };
+        }
         return if add {
             addresses.add_route6(&ask, up)
         } else {
@@ -4996,6 +5133,65 @@ fn change_route(
         oif,
         metrics: metrics.map_or(Some(Vec::new()), metrics_match),
     })
+}
+/// One next hop of an IPv6 `RTA_MULTIPATH` (`struct rtnexthop`).
+struct Nexthop6 {
+    flags: u32,
+    hops: u8,
+    ifindex: u32,
+    gateway: Option<[u8; 16]>,
+    /// Whether it names an encapsulation (`RTA_ENCAP_TYPE`).
+    encap: bool,
+}
+/// The next hops of an IPv6 route's `RTA_MULTIPATH` `value`, as
+/// `rtm_to_fib6_multipath_config` checks them, each while `rtnh_ok`:
+/// `EINVAL` for none, for an `RTA_GATEWAY` shorter than an address, and,
+/// adding, for one without a gateway where the request has none.
+fn nexthops6(value: &[u8], gateway: bool, add: bool) -> Result<Vec<Nexthop6>, Errno> {
+    let mut hops = Vec::new();
+    let mut at = 0;
+    while let Some(head) = value.get(at..at + 8) {
+        let len = usize::from(u16::from_le_bytes([head[0], head[1]]));
+        if len < 8 || at + len > value.len() {
+            break;
+        }
+        let mut hop = Nexthop6 {
+            flags: u32::from(head[2]),
+            hops: head[3],
+            ifindex: u32::from_le_bytes([head[4], head[5], head[6], head[7]]),
+            gateway: None,
+            encap: false,
+        };
+        // `nla_find`: the first of each.
+        let mut found_gateway = false;
+        for (kind, attr) in attributes(&value[at + 8..at + len]) {
+            if kind == RTA_GATEWAY && !found_gateway {
+                found_gateway = true;
+                hop.gateway = Some(
+                    <[u8; 16]>::try_from(attr.get(..16).ok_or_else(|| {
+                        extack::message(Errno::EINVAL, "Invalid IPv6 address in RTA_GATEWAY")
+                    })?)
+                    .unwrap_or_default(),
+                );
+            }
+            hop.encap |= kind == RTA_ENCAP_TYPE;
+        }
+        if add && !gateway && hop.gateway.is_none() {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Device only routes can not be added for IPv6 using the multipath API.",
+            ));
+        }
+        hops.push(hop);
+        at += len.next_multiple_of(4);
+    }
+    if hops.is_empty() {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid nexthop configuration - no valid nexthops",
+        ));
+    }
+    Ok(hops)
 }
 /// The key of the congestion control `RTAX_CC_ALGO`'s `value` names, as
 /// `nla_strscpy` and `tcp_ca_get_key_by_name` find it: to a NUL, in at
@@ -5190,12 +5386,30 @@ fn told(
                 Event::NewRoute6(r, flags) => (
                     RTNLGRP_IPV6_ROUTE,
                     route_origin,
-                    ipv6_route_of(RTM_NEWROUTE, &r, route_seq, route_port, flags, now),
+                    ipv6_route_of(RTM_NEWROUTE, &r, &[], route_seq, route_port, flags, now),
                 ),
                 Event::DelRoute6(r) => (
                     RTNLGRP_IPV6_ROUTE,
                     route_origin,
-                    ipv6_route_of(RTM_DELROUTE, &r, route_seq, route_port, 0, now),
+                    ipv6_route_of(RTM_DELROUTE, &r, &[], route_seq, route_port, 0, now),
+                ),
+                Event::NewMultipath6(hops, flags) => (
+                    RTNLGRP_IPV6_ROUTE,
+                    route_origin,
+                    ipv6_route_of(
+                        RTM_NEWROUTE,
+                        &hops[0],
+                        &hops,
+                        route_seq,
+                        route_port,
+                        flags,
+                        now,
+                    ),
+                ),
+                Event::DelMultipath6(hops) => (
+                    RTNLGRP_IPV6_ROUTE,
+                    route_origin,
+                    ipv6_route_of(RTM_DELROUTE, &hops[0], &hops, route_seq, route_port, 0, now),
                 ),
                 // `__neigh_update`'s, which names the request's port, and
                 // counts the reference `neigh_add` or `neigh_delete` holds.
@@ -5914,7 +6128,7 @@ pub(crate) fn addresses_gone(network: &Network, index: i32) -> Vec<Notice> {
         let (mut events, now) = addresses.device_gone4(index);
         events.extend(addresses.flush_device(index, false));
         // IPv6's `NETDEV_UNREGISTER`: what a down end still has.
-        events.extend(addresses.device_down6(index));
+        events.extend(addresses.device_gone6(index));
         (events, now)
     };
     told(events, 0, 0, false, false, now)

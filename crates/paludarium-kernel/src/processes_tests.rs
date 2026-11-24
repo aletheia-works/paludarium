@@ -7109,6 +7109,29 @@ mod proc_other {
         let own = format!("/proc/{pid}/task/42/status");
         assert_eq!(cap_eff(read(&mut k, &mut t, &m, &own).unwrap()), 0);
     }
+    /// `smaps_rollup` sums every VMA under one `[rollup]` line, for the
+    /// reader's own process and another's, and its open is `ESRCH` once the
+    /// other has no memory left, as Linux's `smaps_rollup_open` finds no
+    /// `mm`.
+    #[test]
+    fn smaps_rollup_sums_the_vmas_and_is_esrch_without_memory() {
+        let (mut k, mut t, m) = setup();
+        let own = String::from_utf8(read(&mut k, &mut t, &m, "/proc/self/smaps_rollup").unwrap())
+            .unwrap();
+        assert!(own.lines().next().unwrap().ends_with(" [rollup]"), "{own}");
+        assert!(
+            own.contains("\nPss_Anon:") && own.ends_with(" kB\n"),
+            "{own}"
+        );
+        let (mut zombie, zt, zm) = fork(&mut k, &mut t, &m);
+        let path = format!("/proc/{}/smaps_rollup", zt.tid);
+        assert!(read(&mut k, &mut t, &m, &path).is_ok());
+        finish(&mut zombie, &zt, &zm, ExitStatus::Exited(0));
+        assert_eq!(
+            read(&mut k, &mut t, &m, &path),
+            Err(Errno(3).to_syscall_return())
+        );
+    }
     /// A zombie keeps its `pid` and `user` links until it is reaped, as
     /// Linux's `pidns_get` and `userns_get` take them from its PID and
     /// credentials, while the others and `pid_for_children`, which need the

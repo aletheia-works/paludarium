@@ -69,6 +69,8 @@ pub(crate) enum OwnEntry {
     Maps,
     /// `smaps`: `maps` with what each VMA holds and its flags.
     Smaps,
+    /// `smaps_rollup`: what all the VMAs hold, in one.
+    SmapsRollup,
     /// `pagemap`: an entry of 8 bytes for each page ([`PagemapFile`]).
     Pagemap,
     /// `fd`, and one of its links by descriptor number.
@@ -99,6 +101,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
         b"/root" => Some(OwnEntry::Root),
         b"/maps" => Some(OwnEntry::Maps),
         b"/smaps" => Some(OwnEntry::Smaps),
+        b"/smaps_rollup" => Some(OwnEntry::SmapsRollup),
         b"/pagemap" => Some(OwnEntry::Pagemap),
         b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
         b"/fdinfo" | b"/fdinfo/" => Some(OwnEntry::DescriptorInfos),
@@ -114,7 +117,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 28] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 29] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -137,6 +140,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 28] = [
     (b"mountinfo", 8),
     (b"clear_refs", 8),
     (b"smaps", 8),
+    (b"smaps_rollup", 8),
     (b"pagemap", 8),
     (b"wchan", 8),
     (b"io", 8),
@@ -145,7 +149,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 28] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 28] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 29] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -168,6 +172,7 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 28] = [
     (b"mountinfo", 8),
     (b"clear_refs", 8),
     (b"smaps", 8),
+    (b"smaps_rollup", 8),
     (b"pagemap", 8),
     (b"wchan", 8),
     (b"io", 8),
@@ -197,8 +202,8 @@ pub(crate) enum TaskEntry {
     Cwd,
     /// `root`, the task's root (`chroot`'s).
     Root,
-    /// `maps`, and `smaps` (true), of the task's address space.
-    Maps(bool),
+    /// `maps`, `smaps` or `smaps_rollup` of the task's address space.
+    Maps(MapsKind),
     /// `pagemap`, the entry of each page of its address space.
     Pagemap,
     /// `clear_refs`, which a write clears its pages' soft-dirty bits with
@@ -282,8 +287,9 @@ pub(crate) fn task_path(
         b"exe" => TaskEntry::Exe,
         b"cwd" => TaskEntry::Cwd,
         b"root" => TaskEntry::Root,
-        b"maps" => TaskEntry::Maps(false),
-        b"smaps" => TaskEntry::Maps(true),
+        b"maps" => TaskEntry::Maps(MapsKind::Maps),
+        b"smaps" => TaskEntry::Maps(MapsKind::Smaps),
+        b"smaps_rollup" => TaskEntry::Maps(MapsKind::Rollup),
         b"pagemap" => TaskEntry::Pagemap,
         b"clear_refs" => TaskEntry::ClearRefs,
         b"io" => TaskEntry::Io,
@@ -1412,16 +1418,12 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
     line
 }
 /// The lines `smaps` writes after a VMA's line of `maps`, as Linux's
-/// `show_smap` does: its size, what its pages hold ([`Usage`]), and its
-/// flags. Pss counts each page for its share of the entries that map it.
-/// No page here is huge, swapped or merged by KSM, and the CPU
-/// has no protection keys, which leaves out `ProtectionKey`.
+/// `show_smap` does: its size, what its pages hold ([`smap_usage_lines`]),
+/// and its flags. No page here is huge, and the CPU has no protection keys,
+/// which leaves out `ProtectionKey`.
 fn smap_lines(vma: &Vma, usage: Usage) -> Vec<u8> {
-    let kb = |pages: u64| pages * 4;
-    let pss = |sum: u64| sum >> Usage::PSS_SHIFT >> 10;
-    let pss_all = pss(usage.pss);
     let locked = if vma.flags & vm::LOCKED != 0 {
-        pss_all
+        usage.pss
     } else {
         0
     };
@@ -1430,33 +1432,10 @@ fn smap_lines(vma: &Vma, usage: Usage) -> Vec<u8> {
         ("Size:           ", (vma.end - vma.start) >> 10),
         ("KernelPageSize: ", 4),
         ("MMUPageSize:    ", 4),
-        ("Rss:            ", kb(usage.resident)),
-        ("Pss:            ", pss_all),
-        ("Pss_Dirty:      ", pss(usage.pss_dirty)),
-        ("Shared_Clean:   ", kb(usage.shared_clean)),
-        ("Shared_Dirty:   ", kb(usage.shared_dirty)),
-        ("Private_Clean:  ", kb(usage.private_clean)),
-        ("Private_Dirty:  ", kb(usage.private_dirty)),
-        ("Referenced:     ", kb(usage.resident)),
-        ("Anonymous:      ", kb(usage.anonymous)),
-        ("KSM:            ", 0),
-        ("LazyFree:       ", 0),
-        ("AnonHugePages:  ", 0),
-        ("ShmemPmdMapped: ", 0),
-        ("FilePmdMapped:  ", 0),
-        ("Shared_Hugetlb: ", 0),
     ] {
         out.push_str(&format!("{name}{value:8} kB\n"));
     }
-    // One column more for the longer name.
-    out.push_str(&format!("Private_Hugetlb: {:7} kB\n", 0));
-    for (name, value) in [
-        ("Swap:           ", 0),
-        ("SwapPss:        ", 0),
-        ("Locked:         ", locked),
-    ] {
-        out.push_str(&format!("{name}{value:8} kB\n"));
-    }
+    out.push_str(&smap_usage_lines(&usage, locked, false));
     out.push_str(&format!("THPeligible:    {:8}\n", 0));
     out.push_str("VmFlags: ");
     for bit in 0..64 {
@@ -1470,6 +1449,94 @@ fn smap_lines(vma: &Vma, usage: Usage) -> Vec<u8> {
     }
     out.push('\n');
     out.into_bytes()
+}
+/// What `smaps` and `smaps_rollup` show of the pages `usage` counts, as
+/// Linux's `__show_smap`: `Pss` counts each page for its share of the
+/// entries that map it, and `Locked` is `locked`, the `Pss` of the locked
+/// VMAs among them; `rollup` adds `Pss` split by what each page is. No
+/// page here is huge, swapped, lazily freed or merged by KSM.
+fn smap_usage_lines(usage: &Usage, locked: u64, rollup: bool) -> String {
+    let kb = |pages: u64| pages * 4;
+    let pss = |sum: u64| sum >> Usage::PSS_SHIFT >> 10;
+    let mut fields = vec![
+        ("Rss:            ", kb(usage.resident)),
+        ("Pss:            ", pss(usage.pss)),
+        ("Pss_Dirty:      ", pss(usage.pss_dirty)),
+    ];
+    if rollup {
+        fields.extend([
+            ("Pss_Anon:       ", pss(usage.pss_anon)),
+            ("Pss_File:       ", pss(usage.pss_file)),
+            ("Pss_Shmem:      ", pss(usage.pss_shmem)),
+        ]);
+    }
+    fields.extend([
+        ("Shared_Clean:   ", kb(usage.shared_clean)),
+        ("Shared_Dirty:   ", kb(usage.shared_dirty)),
+        ("Private_Clean:  ", kb(usage.private_clean)),
+        ("Private_Dirty:  ", kb(usage.private_dirty)),
+        ("Referenced:     ", kb(usage.resident)),
+        ("Anonymous:      ", kb(usage.anonymous)),
+        ("KSM:            ", 0),
+        ("LazyFree:       ", 0),
+        ("AnonHugePages:  ", 0),
+        ("ShmemPmdMapped: ", 0),
+        ("FilePmdMapped:  ", 0),
+        ("Shared_Hugetlb: ", 0),
+    ]);
+    let mut out = String::new();
+    for (name, value) in fields {
+        out.push_str(&format!("{name}{value:8} kB\n"));
+    }
+    // One column more for the longer name.
+    out.push_str(&format!("Private_Hugetlb: {:7} kB\n", 0));
+    for (name, value) in [
+        ("Swap:           ", 0),
+        ("SwapPss:        ", 0),
+        ("Locked:         ", pss(locked)),
+    ] {
+        out.push_str(&format!("{name}{value:8} kB\n"));
+    }
+    out
+}
+/// `smaps_rollup` of `memory`, as Linux's `show_smaps_rollup`: one line
+/// for the range from the first VMA's start to the last one's end, with no
+/// flags, file or name but `[rollup]`, then what all of them hold, the
+/// sums taken before `Pss` is rounded to kB ([`smap_usage_lines`]).
+fn rollup_lines(memory: &MemoryView) -> Vec<u8> {
+    let (mut first, mut last) = (None, 0);
+    let mut total = Usage::default();
+    let mut locked = 0;
+    let mut next = 0;
+    while let Some(vma) = memory.vma_from(next) {
+        first.get_or_insert(vma.start);
+        last = vma.end;
+        next = vma.end;
+        let usage = memory.usage(vma.start, vma.end).unwrap_or_default();
+        if vma.flags & vm::LOCKED != 0 {
+            locked += usage.pss;
+        }
+        total.resident += usage.resident;
+        total.shared_clean += usage.shared_clean;
+        total.shared_dirty += usage.shared_dirty;
+        total.private_clean += usage.private_clean;
+        total.private_dirty += usage.private_dirty;
+        total.anonymous += usage.anonymous;
+        total.pss += usage.pss;
+        total.pss_dirty += usage.pss_dirty;
+        total.pss_anon += usage.pss_anon;
+        total.pss_file += usage.pss_file;
+        total.pss_shmem += usage.pss_shmem;
+    }
+    let mut line = format!(
+        "{:08x}-{last:08x} ---p 00000000 00:00 0 ",
+        first.unwrap_or(0)
+    )
+    .into_bytes();
+    line.resize(line.len().max(MAPS_NAME_COLUMN), b' ');
+    line.extend_from_slice(b" [rollup]\n");
+    line.extend_from_slice(smap_usage_lines(&total, locked, true).as_bytes());
+    line
 }
 /// The names `smaps` gives the bits of `vm_flags`, by bit, as Linux's
 /// `show_smap_vma_flags` has them on x86-64: the protection key's bits
@@ -1485,15 +1552,26 @@ const MAPS_NAME_COLUMN: usize = 72;
 /// Past the last VMA, as Linux's `m_start` is told by its sentinel.
 const MAPS_END: u64 = u64::MAX;
 
+/// Which of the files of an address space's mappings a [`Maps`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MapsKind {
+    /// `maps`: a line for each VMA.
+    Maps,
+    /// `smaps`, which follows each line with [`smap_lines`].
+    Smaps,
+    /// `smaps_rollup`: all of them in one ([`rollup_lines`]).
+    Rollup,
+}
+
 /// The lines of `/proc/<pid>/maps` ([`maps_file`]), one for each VMA of the
 /// address space it was opened on, by the address it starts at: a read sees
 /// the mappings of that moment, from the address it had reached, whatever
-/// they were when it was opened.
+/// they were when it was opened. `smaps_rollup` is one record, made at its
+/// first read, as Linux's `single_open` makes it.
 struct Maps {
     memory: MemoryView,
     start_stack: u64,
-    /// It is `smaps`, which follows each line with [`smap_lines`].
-    smaps: bool,
+    kind: MapsKind,
     /// The opener's root, from which file names are shown.
     root: Vec<u8>,
 }
@@ -1503,34 +1581,37 @@ impl crate::seq::Records for Maps {
         if next == MAPS_END {
             return Ok(None);
         }
+        if self.kind == MapsKind::Rollup {
+            return Ok((next == 0).then(|| (rollup_lines(&self.memory), MAPS_END)));
+        }
         let Some(vma) = self.memory.vma_from(next) else {
             return Ok(None);
         };
         let after = self.memory.vma_from(vma.end).map_or(MAPS_END, |v| v.start);
         let mut line = map_line(&vma, self.start_stack, &self.root);
-        if self.smaps {
+        if self.kind == MapsKind::Smaps {
             let usage = self.memory.usage(vma.start, vma.end).unwrap_or_default();
             line.extend_from_slice(&smap_lines(&vma, usage));
         }
         Ok(Some((line, after)))
     }
 }
-/// `/proc/<pid>/maps`, or `smaps` with `smaps`, of `memory`, opened with
-/// `flags` and its files named from the opener's `root`: a `seq_file` of
-/// [`Maps`], of size 0 and owned by whom its inode's `owner` says when
-/// `fstat` asks.
+/// `/proc/<pid>/maps`, `smaps` or `smaps_rollup` (`kind`) of `memory`,
+/// opened with `flags` and its files named from the opener's `root`: a
+/// `seq_file` of [`Maps`], of size 0 and owned by whom its inode's `owner`
+/// says when `fstat` asks.
 pub(crate) fn maps_file(
     memory: MemoryView,
     start_stack: u64,
     flags: u32,
     root: Vec<u8>,
-    smaps: bool,
+    kind: MapsKind,
     owner: Owner,
 ) -> crate::seq::SeqFile {
     let maps = Maps {
         memory,
         start_stack,
-        smaps,
+        kind,
         root,
     };
     crate::seq::SeqFile::of_task(Box::new(maps), flags, stat(0), owner)
@@ -1843,7 +1924,7 @@ mod tests {
             0x7fff0800,
             0,
             b"/".to_vec(),
-            false,
+            MapsKind::Maps,
             Owner::default(),
         );
         assert_eq!(
@@ -2062,7 +2143,7 @@ mod tests {
             0x7fff0800,
             0,
             b"/".to_vec(),
-            true,
+            MapsKind::Smaps,
             Owner::default(),
         );
         let text = String::from_utf8(read_all(&file, 4096)).unwrap();
@@ -2110,6 +2191,83 @@ mod tests {
         );
         // The initial stack is not soft-dirty.
         assert!(text.ends_with("VmFlags: rd wr mr mw me gd ac \n"), "{text}");
+    }
+
+    #[test]
+    fn smaps_rollup_sums_every_vma_under_one_line() {
+        let mut mem = AddressSpace::new();
+        mem.map(
+            Some(GuestAddr(0x5000)),
+            0x3000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.map(
+            Some(GuestAddr(0x7fff0000)),
+            0x1000,
+            Prot::READ_WRITE,
+            MappingKind::Stack,
+        )
+        .unwrap();
+        mem.write(GuestAddr(0x6000), b"x").unwrap();
+        mem.write(GuestAddr(0x7000), b"x").unwrap();
+        mem.lock(
+            GuestAddr(0x7000),
+            0x8000,
+            Some(paludarium_mmu::Lock::OnFault),
+        )
+        .unwrap();
+        let rollup = |mem: &AddressSpace| {
+            let file = maps_file(
+                mem.view(),
+                0x7fff0800,
+                0,
+                b"/".to_vec(),
+                MapsKind::Rollup,
+                Owner::default(),
+            );
+            String::from_utf8(read_all(&file, 4096)).unwrap()
+        };
+        // From the first VMA's start to the last one's end; the locked page
+        // is a VMA of its own.
+        let header = format!(
+            "{:<72} [rollup]\n",
+            "00005000-7fff1000 ---p 00000000 00:00 0 "
+        );
+        let text = rollup(&mem);
+        assert_eq!(
+            text,
+            header
+                + "Rss:                   8 kB\n\
+                   Pss:                   8 kB\n\
+                   Pss_Dirty:             8 kB\n\
+                   Pss_Anon:              8 kB\n\
+                   Pss_File:              0 kB\n\
+                   Pss_Shmem:             0 kB\n\
+                   Shared_Clean:          0 kB\n\
+                   Shared_Dirty:          0 kB\n\
+                   Private_Clean:         0 kB\n\
+                   Private_Dirty:         8 kB\n\
+                   Referenced:            8 kB\n\
+                   Anonymous:             8 kB\n\
+                   KSM:                   0 kB\n\
+                   LazyFree:              0 kB\n\
+                   AnonHugePages:         0 kB\n\
+                   ShmemPmdMapped:        0 kB\n\
+                   FilePmdMapped:         0 kB\n\
+                   Shared_Hugetlb:        0 kB\n\
+                   Private_Hugetlb:       0 kB\n\
+                   Swap:                  0 kB\n\
+                   SwapPss:               0 kB\n\
+                   Locked:                4 kB\n"
+        );
+        // An address space with nothing mapped has the range 0-0.
+        let empty = rollup(&AddressSpace::new());
+        assert!(
+            empty.starts_with("00000000-00000000 ---p 00000000 00:00 0 "),
+            "{empty}"
+        );
     }
 
     #[test]
@@ -2190,7 +2348,14 @@ mod tests {
         };
         map(0x10000);
         map(0x30000);
-        let file = maps_file(mem.view(), 0, 0, b"/".to_vec(), false, Owner::default());
+        let file = maps_file(
+            mem.view(),
+            0,
+            0,
+            b"/".to_vec(),
+            MapsKind::Maps,
+            Owner::default(),
+        );
         let mut buf = [0; 10];
         assert_eq!(file.read(&mut buf).unwrap(), 10);
         // The reader goes on from the VMA it found next, as Linux's does:
@@ -2219,7 +2384,14 @@ mod tests {
             )
             .unwrap();
         }
-        let file = maps_file(mem.view(), 0, 0, b"/".to_vec(), false, Owner::default());
+        let file = maps_file(
+            mem.view(),
+            0,
+            0,
+            b"/".to_vec(),
+            MapsKind::Maps,
+            Owner::default(),
+        );
         let whole = read_all(&file, 1 << 16);
         assert_eq!(whole.len(), 200 * 41);
         file.seek(0, 0).unwrap();
@@ -2239,7 +2411,15 @@ mod tests {
         assert_eq!(file.stat().unwrap().size, 0);
         assert_eq!(file.write(b"x"), Err(Errno::EBADF));
         assert_eq!(
-            maps_file(mem.view(), 0, 2, b"/".to_vec(), false, Owner::default()).write(b"x"),
+            maps_file(
+                mem.view(),
+                0,
+                2,
+                b"/".to_vec(),
+                MapsKind::Maps,
+                Owner::default()
+            )
+            .write(b"x"),
             Err(Errno::EINVAL)
         );
     }
@@ -2249,7 +2429,14 @@ mod tests {
         let mem = AddressSpace::new();
         mem.map_shared(None, 0x1000, Prot::READ, MappingKind::Anonymous)
             .unwrap();
-        let file = maps_file(mem.view(), 0, 0, b"/".to_vec(), false, Owner::default());
+        let file = maps_file(
+            mem.view(),
+            0,
+            0,
+            b"/".to_vec(),
+            MapsKind::Maps,
+            Owner::default(),
+        );
         drop(mem);
         assert_eq!(file.read(&mut [0; 16]).unwrap(), 0);
     }
@@ -2363,7 +2550,7 @@ mod tests {
         let gone = |p: &[u8]| task_path(p, 7, 9, true);
         assert_eq!(
             gone(b"/proc/self/maps"),
-            at(7, None, TaskEntry::Maps(false))
+            at(7, None, TaskEntry::Maps(MapsKind::Maps))
         );
         assert_eq!(gone(b"/proc/7/fd"), at(7, None, TaskEntry::Descriptors));
         assert_eq!(gone(b"/proc/self"), at(7, None, TaskEntry::Directory));
@@ -2400,10 +2587,13 @@ mod tests {
             path(b"/proc/8/task/8/mounts"),
             at(8, Some(8), TaskEntry::Mounts(false))
         );
-        assert_eq!(path(b"/proc/8/maps"), at(8, None, TaskEntry::Maps(false)));
+        assert_eq!(
+            path(b"/proc/8/maps"),
+            at(8, None, TaskEntry::Maps(MapsKind::Maps))
+        );
         assert_eq!(
             path(b"/proc/7/task/9/smaps"),
-            at(7, Some(9), TaskEntry::Maps(true))
+            at(7, Some(9), TaskEntry::Maps(MapsKind::Smaps))
         );
         assert_eq!(path(b"/proc/8/pagemap"), at(8, None, TaskEntry::Pagemap));
         assert_eq!(

@@ -1563,6 +1563,98 @@ static void say_record(const uint64_t *record, void *with) {
     }
 }
 
+#define ATTR_BUILD_ID (1ULL << 34)
+#define MISC_MMAP_BUILD_ID (1 << 14)
+
+/* The GNU build ID in the ELF notes of the file at `path` (its first
+   64 KiB), as the guest reads it itself: its size, 0 for none. */
+static int own_build_id(const char *path, unsigned char id[20]) {
+    static unsigned char b[65536];
+    int fd = open(path, O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, b, sizeof b);
+    if (fd >= 0) close(fd);
+    if (n < 64 || memcmp(b, "\x7f" "ELF", 4) || b[4] != 2) return 0;
+    uint64_t phoff;
+    uint16_t phnum;
+    memcpy(&phoff, b + 32, 8);
+    memcpy(&phnum, b + 56, 2);
+    for (unsigned i = 0; i < phnum && phoff + (i + 1) * 56 <= (uint64_t)n; i++) {
+        const unsigned char *ph = b + phoff + i * 56;
+        uint32_t type;
+        uint64_t off, size;
+        memcpy(&type, ph, 4);
+        memcpy(&off, ph + 8, 8);
+        memcpy(&size, ph + 32, 8);
+        if (type != 4 || off + size > (uint64_t)n) continue;
+        for (uint64_t at = off; at + 12 <= off + size;) {
+            uint32_t namesz, descsz, kind;
+            memcpy(&namesz, b + at, 4);
+            memcpy(&descsz, b + at + 4, 4);
+            memcpy(&kind, b + at + 8, 4);
+            uint64_t desc = at + 12 + ((namesz + 3) & ~3u);
+            if (kind == 3 && namesz == 4 && !memcmp(b + at + 12, "GNU", 4) && descsz && descsz <= 20) {
+                memcpy(id, b + desc, descsz);
+                return (int)descsz;
+            }
+            at = desc + ((descsz + 3) & ~3u);
+        }
+    }
+    return 0;
+}
+
+/* What build_ids compares its MMAP2 records with. */
+struct build_ids {
+    char *elf, *text;
+    unsigned char id[20];
+    int size;
+    struct stat text_stat;
+};
+
+static void see_build_id(const uint64_t *record, void *with) {
+    struct build_ids *b = with;
+    if ((uint32_t)record[0] != RECORD_MMAP2) return;
+    char *at = (char *)record[2];
+    unsigned misc = (unsigned)(record[0] >> 32) & 0xffff;
+    const unsigned char *bytes = (const unsigned char *)(record + 5);
+    if (at == b->elf)
+        say("build id: elf misc %d size %d zeros %d match %d", !!(misc & MISC_MMAP_BUILD_ID), bytes[0],
+            !bytes[1] && !bytes[2] && !bytes[3], b->size && bytes[0] == b->size && !memcmp(bytes + 4, b->id, b->size));
+    else if (at == b->text) {
+        const uint32_t *words = (const uint32_t *)bytes;
+        say("build id: text misc %d device %d inode %d", !!(misc & MISC_MMAP_BUILD_ID),
+            words[0] == major(b->text_stat.st_dev) && words[1] == minor(b->text_stat.st_dev),
+            *(const uint64_t *)(words + 2) == (uint64_t)b->text_stat.st_ino);
+    }
+}
+
+/* With build_id, an MMAP2 record of an ELF file gives its GNU build ID in
+   place of the device and inode (PERF_RECORD_MISC_MMAP_BUILD_ID): of the
+   guest's own file, mapped again, whose first page its execve read into
+   the page cache, as build_id_parse_nofault reads no other; and one of
+   another file gives its device and inode. */
+static void build_ids(void) {
+    struct build_ids b;
+    memset(&b, 0, sizeof b);
+    b.size = own_build_id("/proc/self/exe", b.id);
+    say("build id: own %d", b.size);
+    void *page;
+    int fd = open_side_band(0, -1, ATTR_MMAP2 | ATTR_MMAP_DATA | ATTR_BUILD_ID, &page);
+    say("build id: open %d", fd >= 0);
+    if (fd < 0) return;
+    int self = open("/proc/self/exe", O_RDONLY);
+    char path[] = "/tmp/perf-build-id-XXXXXX";
+    int text = mkstemp(path);
+    write(text, "not an ELF\n", 11);
+    fstat(text, &b.text_stat);
+    ioctl(fd, IOC_ENABLE, 0);
+    b.elf = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, self, 0);
+    b.text = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, text, 0);
+    ioctl(fd, IOC_DISABLE, 0);
+    uint64_t tail = 0;
+    each_record(page, &tail, see_build_id, &b);
+    unlink(path);
+}
+
 static int case_side_band(void) {
     struct expected e;
     memset(&e, 0, sizeof e);
@@ -1635,6 +1727,7 @@ static int case_side_band(void) {
     e.mmap_records = 0;
     each_record(exec_only, &tail, say_record, &e);
     say("exec only records %d", e.mmap_records);
+    build_ids();
     return 0;
 }
 

@@ -16752,6 +16752,86 @@ static int thread_caps_status_case(void) {
     return 0;
 }
 
+/* The smaps-rollup case: /proc/self/smaps_rollup, as Linux's
+   show_smaps_rollup makes it, is one line from the first VMA's start to the
+   last one's end ([vsyscall], a gate area, is none), with no flags, file or
+   name but [rollup], then __show_smap's fields with Pss split by what each
+   page is. Read right after smaps, its sums match smaps's: Rss exactly,
+   Pss and Locked within the kB each VMA's line rounds away, and the split
+   adds up to Pss within its own rounding. A zombie's open is ESRCH, as
+   smaps_rollup_open finds no mm.
+   Only these relations are printed, as the sizes are the program's. */
+static char sr_smaps[1 << 20], sr_rollup[1 << 14];
+
+static long sr_field(const char *text, const char *name) {
+    long sum = 0;
+    size_t length = strlen(name);
+    for (const char *at = text; (at = strstr(at, name)); at += length)
+        if (at == text || at[-1] == '\n') sum += strtol(at + length, NULL, 10);
+    return sum;
+}
+
+static int smaps_rollup_case(void) {
+    memset(sr_smaps, 1, sizeof sr_smaps);
+    memset(sr_rollup, 1, sizeof sr_rollup);
+    int rss_equal = 0;
+    long vmas = 0;
+    for (int attempt = 0; attempt < 3 && !rss_equal; attempt++) {
+        if (proc_read("/proc/self/smaps", sr_smaps, sizeof sr_smaps) <= 0 ||
+            proc_read("/proc/self/smaps_rollup", sr_rollup, sizeof sr_rollup) <= 0)
+            return 1;
+        rss_equal = sr_field(sr_rollup, "Rss:") == sr_field(sr_smaps, "Rss:");
+    }
+    /* The header against the first and last VMA. */
+    unsigned long first = 0, last = 0, start, end, rollup_start = 0, rollup_end = 0;
+    for (const char *line = sr_smaps; *line;) {
+        const char *next = strchr(line, '\n');
+        size_t digits = strspn(line, "0123456789abcdef");
+        int vma = digits > 0 && line[digits] == '-' && sscanf(line, "%lx-%lx ", &start, &end) == 2;
+        if (vma && !(next && memmem(line, (size_t)(next - line), "[vsyscall]", 10))) {
+            if (!vmas++) first = start;
+            last = end;
+        }
+        line = next ? next + 1 : line + strlen(line);
+    }
+    char header[256] = "";
+    sscanf(sr_rollup, "%255[^\n]", header);
+    char rest[256] = "";
+    int shaped = sscanf(header, "%lx-%lx ---p 00000000 00:00 0 %255[^\n]", &rollup_start, &rollup_end, rest) == 3 &&
+                 !strcmp(rest, "[rollup]") && strstr(header, " [rollup]") - header == 72;
+    printf("header shaped=%d first=%d last=%d\n", shaped, rollup_start == first, rollup_end == last);
+    /* The field names, in order. */
+    printf("fields:");
+    for (const char *line = strchr(sr_rollup, '\n'); line && line[1]; line = strchr(line + 1, '\n')) {
+        int n = (int)strcspn(line + 1, ":");
+        printf(" %.*s", n, line + 1);
+    }
+    printf("\n");
+    long pss = sr_field(sr_rollup, "Pss:"), smaps_pss = sr_field(sr_smaps, "Pss:");
+    long locked = sr_field(sr_rollup, "Locked:"), smaps_locked = sr_field(sr_smaps, "Locked:");
+    long split = sr_field(sr_rollup, "Pss_Anon:") + sr_field(sr_rollup, "Pss_File:") +
+                 sr_field(sr_rollup, "Pss_Shmem:");
+    printf("rss equal=%d pss within=%d locked within=%d split within=%d\n", rss_equal,
+           pss >= smaps_pss && pss <= smaps_pss + vmas, locked >= smaps_locked && locked <= smaps_locked + vmas,
+           split <= pss && split + 3 > pss);
+    /* A zombie's. */
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 2;
+    if (kid == 0) _exit(0);
+    siginfo_t info;
+    if (waitid(P_PID, (id_t)kid, &info, WEXITED | WNOWAIT)) return 3;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/smaps_rollup", (int)kid);
+    int fd = open(path, O_RDONLY);
+    char byte;
+    ssize_t got = fd >= 0 ? read(fd, &byte, 1) : 0;
+    printf("zombie open=%d read=%d\n", fd >= 0 ? 0 : -errno, got < 0 ? -errno : (int)got);
+    if (fd >= 0) close(fd);
+    waitpid(kid, NULL, 0);
+    return 0;
+}
+
 /* The zombie-ns-links case: a zombie keeps its pid and user links until it
    is reaped, as Linux's pidns_get and userns_get take them from its PID and
    credentials, while the links that need the nsproxy it gave up at its exit
@@ -37572,6 +37652,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
+    if (!strcmp(mode, "smaps-rollup")) return smaps_rollup_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
     if (!strcmp(mode, "zombie-ns-links")) return zombie_ns_links_case();
     if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);

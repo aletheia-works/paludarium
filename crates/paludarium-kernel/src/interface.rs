@@ -334,6 +334,8 @@ impl V6 {
             linkdown: false,
             gateway: None,
             onlink: false,
+            dead: false,
+            weight: 1,
         }
     }
     /// Its prefix route in the main table (`addrconf_prefix_route`), which
@@ -356,6 +358,8 @@ impl V6 {
             linkdown: false,
             gateway: None,
             onlink: false,
+            dead: false,
+            weight: 1,
         })
     }
     fn prefix_of(&self) -> Ipv6Addr {
@@ -577,8 +581,31 @@ pub(crate) struct Route6 {
     pub gateway: Option<Ipv6Addr>,
     /// `RTNH_F_ONLINK`: the gateway is taken to be on its device's link.
     pub onlink: bool,
+    /// `RTNH_F_DEAD`: a multipath sibling whose device went down
+    /// (`fib6_ifdown`), which lookups pass over, until the device is
+    /// ready again (`rt6_sync_up`).
+    pub dead: bool,
+    /// Its weight among a multipath route's hops (`fib_nh_weight`): 1,
+    /// or one past the `rtnh_hops` of its `RTA_MULTIPATH` next hop.
+    pub weight: u16,
+}
+/// Whether an IPv6 route may be a multipath sibling
+/// (`rt6_qualify_for_ecmp`): one with a gateway, which none of the
+/// kernel's has here.
+fn ecmp6(route: &Route6) -> bool {
+    route.gateway.is_some()
 }
 impl Route6 {
+    /// Whether `other` is of the same multipath route as this one: of its
+    /// table, prefix and metric, both with a gateway.
+    fn sibling_of(&self, other: &Route6) -> bool {
+        ecmp6(self)
+            && ecmp6(other)
+            && self.table == other.table
+            && self.dst == other.dst
+            && self.len == other.len
+            && self.metric == other.metric
+    }
     fn covers(&self, ip: Ipv6Addr) -> bool {
         (u128::from(ip) ^ u128::from(self.dst)) & mask6(self.len) == 0
     }
@@ -619,6 +646,10 @@ pub(crate) enum Event {
     DelAddr6(V6),
     NewRoute6(Route6, u16),
     DelRoute6(Route6),
+    /// A multipath route told of in one message, its next hops in the
+    /// order of its `RTA_MULTIPATH` ([`Addresses::hops6`]).
+    NewMultipath6(Vec<Route6>, u16),
+    DelMultipath6(Vec<Route6>),
     /// A neighbour a request changed, told of as `__neigh_update` does,
     /// naming the request's port.
     NewNeighbour(Neighbour),
@@ -1111,6 +1142,15 @@ pub(crate) struct Ask6 {
     pub metrics: Result<Metrics, Errno>,
 }
 
+/// What a multipath route's hop is chosen by (`rt6_multipath_hash`, of
+/// `fib_multipath_hash_policy` 0): the flow's source, flow label and
+/// protocol, with its destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Flow6 {
+    pub src: Option<Ipv6Addr>,
+    pub label: u32,
+    pub proto: u8,
+}
 /// The loopback's addresses and the routing tables, in Linux's orders.
 #[derive(Debug)]
 pub(crate) struct Addresses {
@@ -1154,6 +1194,10 @@ pub(crate) struct Addresses {
     /// The veth ends IPv6 has made ready (`IF_READY`), up with their
     /// carrier, by index.
     ready6: Vec<i32>,
+    /// The namespace's key for the hash that chooses among a multipath
+    /// route's hops, random as Linux's `mp_seed` is where no
+    /// `fib_multipath_hash_seed` is set.
+    multipath_seed: std::hash::RandomState,
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -1200,6 +1244,7 @@ impl Addresses {
             neighbours: Vec::new(),
             proxies: Vec::new(),
             ready6: Vec::new(),
+            multipath_seed: std::hash::RandomState::new(),
         }
     }
     /// A packet goes out through the loopback to `next` at `now`, as
@@ -1806,6 +1851,12 @@ impl Addresses {
         }
         self.ready6.push(index);
         let oif = index.unsigned_abs();
+        // `rt6_sync_up`: its routes are no longer dead, nor down, as it
+        // has its carrier.
+        for route in self.routes6.iter_mut().filter(|r| r.oif == oif) {
+            route.dead = false;
+            route.linkdown = false;
+        }
         self.kernel_add6(
             Route6 {
                 oif,
@@ -1821,6 +1872,8 @@ impl Addresses {
                 linkdown: false,
                 gateway: None,
                 onlink: false,
+                dead: false,
+                weight: 1,
             },
             &mut events,
         );
@@ -1856,12 +1909,66 @@ impl Addresses {
         self.insert_v6(link);
         events
     }
-    /// IPv6's part of the veth end `index` going down, or away
-    /// (`addrconf_ifdown`): its routes, told of in the order of a dump,
-    /// then its addresses.
+    /// IPv6's part of the veth end `index` going down (`addrconf_ifdown`):
+    /// its routes ([`Self::routes6_down`]), then its addresses.
     pub(crate) fn device_down6(&mut self, index: i32) -> Vec<Event> {
+        let mut events = self.routes6_down(index.unsigned_abs());
+        events.extend(self.addresses6_gone(index));
+        events
+    }
+    /// IPv6's part of the veth end `index` going away, once down
+    /// (`addrconf_ifdown` for `NETDEV_UNREGISTER`): what is left of its
+    /// routes, multipath siblings too, told of in the order of a dump,
+    /// then its addresses.
+    pub(crate) fn device_gone6(&mut self, index: i32) -> Vec<Event> {
         let mut events = self.routes6_gone(index.unsigned_abs());
         events.extend(self.addresses6_gone(index));
+        events
+    }
+    /// The IPv6 routes through the device of `oif` as it goes down
+    /// (`fib6_ifdown` for `NETDEV_DOWN`), told of in the order of a dump:
+    /// each goes, but a multipath sibling, which turns `RTNH_F_DEAD` and
+    /// `RTNH_F_LINKDOWN` without a word, unless all of its multipath
+    /// route would be dead, when all of it goes
+    /// (`rt6_multipath_flush`).
+    fn routes6_down(&mut self, oif: u32) -> Vec<Event> {
+        let routes = self.routes6.clone();
+        let flushed = |route: &Route6| {
+            let hops = self.hops6(route);
+            !hops.is_empty()
+                && hops.iter().any(|r| r.oif == oif)
+                && hops.iter().all(|r| r.oif == oif || r.dead)
+        };
+        let gone: Vec<bool> = routes
+            .iter()
+            .map(|r| {
+                if self.hops6(r).is_empty() {
+                    r.oif == oif
+                } else {
+                    flushed(r)
+                }
+            })
+            .collect();
+        let mut events: Vec<Event> = Vec::new();
+        for route in self.dump6() {
+            if let Some(i) = routes.iter().position(|r| *r == route)
+                && gone[i]
+            {
+                events.push(Event::DelRoute6(route));
+            }
+        }
+        let mut kept = Vec::new();
+        for (mut route, gone) in routes.into_iter().zip(gone) {
+            if gone {
+                continue;
+            }
+            if route.oif == oif && !self.hops6(&route).is_empty() {
+                route.dead = true;
+                route.linkdown = true;
+            }
+            kept.push(route);
+        }
+        self.routes6 = kept;
         events
     }
     /// Adds an IPv4 address with `lifetimes` at `now` to its device, as
@@ -2453,11 +2560,17 @@ impl Addresses {
     /// flags `flags` (`None` for the kernel's): a route of the same metric
     /// is `EEXIST`, unless `NLM_F_REPLACE`, which takes its place; without
     /// one, `NLM_F_REPLACE` without `NLM_F_CREATE` is `ENOENT`. It goes after
-    /// the routes of a metric as low or lower. The flags Linux tells of it
-    /// with.
+    /// the routes of a metric as low or lower, the multipath sibling of
+    /// those of its metric with a gateway where it has one
+    /// ([`Self::hops6`]). The flags Linux tells of it with: `NLM_F_EXCL`
+    /// where no other of its metric is there, and the request's
+    /// `NLM_F_APPEND`.
     fn insert6(&mut self, new: Route6, flags: Option<u16>) -> Result<u16, Errno> {
         let asked = |flag: u16| flags.is_some_and(|f| f & flag != 0);
         let mut told = F_EXCL;
+        if asked(F_APPEND) {
+            told |= F_APPEND;
+        }
         // `fib6_add_rt2node`: with `NLM_F_EXCL` any route of the node of
         // the same metric is there already, and `NLM_F_REPLACE` takes the
         // first of them that qualifies for ECMP as the new one does; with
@@ -2466,9 +2579,10 @@ impl Addresses {
         let same_metric = |r: &Route6| {
             r.table == new.table && r.dst == new.dst && r.len == new.len && r.metric == new.metric
         };
-        // `rt6_qualify_for_ecmp`: a route with a gateway, which none of
-        // the kernel's has here.
-        let ecmp = |r: &Route6| r.gateway.is_some();
+        let ecmp = ecmp6;
+        if self.routes6.iter().any(same_metric) {
+            told &= !F_EXCL;
+        }
         let found = if asked(F_EXCL) {
             self.routes6.iter().position(same_metric)
         } else if asked(F_REPLACE) {
@@ -2480,19 +2594,9 @@ impl Addresses {
                 .or_else(|| self.routes6.iter().position(same_metric))
         } else {
             // `rt6_duplicate_nexthop`: the same device and gateway.
-            let found = self
-                .routes6
+            self.routes6
                 .iter()
-                .position(|r| same_metric(r) && r.oif == new.oif && r.gateway == new.gateway);
-            // Another with a gateway would take it as a sibling, which
-            // multipath routes are not here.
-            if found.is_none()
-                && ecmp(&new)
-                && self.routes6.iter().any(|r| same_metric(r) && ecmp(r))
-            {
-                return Err(EOPNOTSUPP);
-            }
-            found
+                .position(|r| same_metric(r) && r.oif == new.oif && r.gateway == new.gateway)
         };
         if let Some(i) = found {
             if asked(F_EXCL) || !asked(F_REPLACE) {
@@ -2505,7 +2609,21 @@ impl Addresses {
                 }
                 return Err(Errno::EEXIST);
             }
+            // Replacing one of a multipath route takes its siblings away
+            // too, without a word: those after it with a gateway.
+            let siblings = !self.hops6(&self.routes6[i]).is_empty();
             self.routes6[i] = new;
+            if siblings {
+                let mut at = i + 1;
+                // A node's routes are next to each other, by metric.
+                while let Some(r) = self.routes6.get(at).filter(|r| same_metric(r)) {
+                    if ecmp(r) {
+                        self.routes6.remove(at);
+                    } else {
+                        at += 1;
+                    }
+                }
+            }
             return Ok(F_REPLACE);
         }
         if asked(F_REPLACE) && !asked(F_CREATE) {
@@ -2847,9 +2965,98 @@ impl Addresses {
     /// for one with IPv6 off and `ENETDOWN` for one down; `EINVAL` for a
     /// preferred source that is not local. Its destination is taken to its
     /// prefix's length. Broadcast, anycast, multicast and NAT routes are
-    /// `EOPNOTSUPP`, as is one that would join another of its prefix and
-    /// metric with a gateway as a sibling (ECMP).
+    /// `EOPNOTSUPP`. One with a gateway joins another of its prefix and
+    /// metric with one as a multipath sibling, told of with its hops.
     pub(crate) fn add_route6(&mut self, ask: &Ask6, up: bool) -> Result<Vec<Event>, Errno> {
+        let route = self.make_route6(ask, up)?;
+        let flags = self.insert6(route, Some(ask.request))?;
+        // `inet6_rt_notify`: with its siblings, where it has some.
+        Ok(vec![self.new_route6(route, flags)])
+    }
+    /// What Linux tells of `route` added, with `flags`: it, or the
+    /// multipath route it is of, its hops from it on.
+    fn new_route6(&self, route: Route6, flags: u16) -> Event {
+        let hops = self.hops6(&route);
+        if hops.is_empty() {
+            Event::NewRoute6(route, flags)
+        } else {
+            Event::NewMultipath6(hops, flags)
+        }
+    }
+    /// Adds a multipath route of the next hops `hops`, each a request
+    /// ([`Self::add_route6`]) with whether its device is up and its
+    /// weight, as `ip6_route_multipath_add` does: each is made and checked
+    /// first (`ip6_route_info_create`), two of the same device and gateway
+    /// being `EEXIST` (`ip6_route_info_append`); then each is put in its
+    /// table in turn, those after the first with `NLM_F_CREATE` and
+    /// without `NLM_F_EXCL` and `NLM_F_REPLACE`. One message tells of
+    /// them, with `NLM_F_REPLACE` or `NLM_F_CREATE` and the request's
+    /// `NLM_F_APPEND`: from the first put in, or with `NLM_F_APPEND` from
+    /// the first of the last one's siblings (`ip6_route_mpath_notify`).
+    /// Where one fails to go in, those put in are told of so, then go,
+    /// each told of (`fib6_del`), before the error.
+    pub(crate) fn add_multipath6(
+        &mut self,
+        hops: &[(Ask6, bool, u16)],
+    ) -> (Vec<Event>, Result<(), Errno>) {
+        let mut routes: Vec<Route6> = Vec::new();
+        for (ask, up, weight) in hops {
+            let mut route = match self.make_route6(ask, *up) {
+                Ok(route) => route,
+                Err(e) => return (Vec::new(), Err(e)),
+            };
+            route.weight = *weight;
+            if routes
+                .iter()
+                .any(|r| r.oif == route.oif && r.gateway == route.gateway)
+            {
+                return (Vec::new(), Err(Errno::EEXIST));
+            }
+            routes.push(route);
+        }
+        let Some((first, _, _)) = hops.first() else {
+            return (Vec::new(), Ok(()));
+        };
+        let mut flags = first.request;
+        let told = (if flags & F_REPLACE != 0 {
+            F_REPLACE
+        } else {
+            F_CREATE
+        }) | (flags & F_APPEND);
+        let mut added = Vec::new();
+        let mut failed = None;
+        for route in routes {
+            match self.insert6(route, Some(flags)) {
+                Ok(_) => added.push(route),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            flags = (flags & !(F_EXCL | F_REPLACE)) | F_CREATE;
+        }
+        let mut events = Vec::new();
+        if let (Some(&notified), Some(last)) = (added.first(), added.last()) {
+            let notified = if told & F_APPEND != 0 {
+                self.hops6(last).get(1).copied().unwrap_or(notified)
+            } else {
+                notified
+            };
+            events.push(self.new_route6(notified, told));
+        }
+        let Some(error) = failed else {
+            return (events, Ok(()));
+        };
+        for route in added {
+            if let Some(at) = self.routes6.iter().position(|r| *r == route) {
+                events.push(Event::DelRoute6(self.routes6.remove(at)));
+            }
+        }
+        (events, Err(error))
+    }
+    /// The route `ask` asks for, made and checked as [`Self::add_route6`]
+    /// tells, its table made, not yet put in.
+    fn make_route6(&mut self, ask: &Ask6, up: bool) -> Result<Route6, Errno> {
         if ask.len > 128 {
             return Err(Errno::EINVAL);
         }
@@ -2942,9 +3149,10 @@ impl Addresses {
                 && self.no_carrier.contains(&oif),
             gateway,
             onlink: ask.onlink,
+            dead: false,
+            weight: 1,
         };
-        let flags = self.insert6(route, Some(ask.request))?;
-        Ok(vec![Event::NewRoute6(route, flags)])
+        Ok(route)
     }
     /// The device of a route's gateway `via` (`ip6_validate_gw`), the one
     /// `ask` names or else the one a route to it goes through; `EINVAL`,
@@ -2987,7 +3195,7 @@ impl Addresses {
             } else {
                 let usable = |r: &Route6| r.kind.error().is_none() && r.gateway.is_none();
                 let in_table = (ask.table != 0 && self.tables6.contains(&table))
-                    .then(|| self.lookup6_in(table, via, ask.oif))
+                    .then(|| self.lookup6_in(table, via, ask.oif, &Flow6::default()))
                     .flatten()
                     .filter(|r| usable(r));
                 let found = match in_table {
@@ -3020,8 +3228,29 @@ impl Addresses {
     }
     /// Removes the first IPv6 route of `ask`'s table to its prefix of its
     /// metric and protocol, of any kind (`ip6_route_del`): `ESRCH` for
-    /// none.
+    /// none. Without a gateway, one of a multipath route takes its
+    /// siblings with it, told of in one message
+    /// (`__ip6_del_rt_siblings`); with one, only that next hop goes.
     pub(crate) fn del_route6(&mut self, ask: &Ask6) -> Result<Vec<Event>, Errno> {
+        self.del_route6_hops(ask, true)
+    }
+    /// Removes each next hop of `hops` as [`Self::del_route6`] does, but
+    /// without its siblings (`ip6_route_multipath_del`): what each tells,
+    /// and the last error.
+    pub(crate) fn del_multipath6(&mut self, hops: &[Ask6]) -> (Vec<Event>, Result<(), Errno>) {
+        let mut events = Vec::new();
+        let mut result = Ok(());
+        for ask in hops {
+            match self.del_route6_hops(ask, false) {
+                Ok(told) => events.extend(told),
+                Err(e) => result = Err(e),
+            }
+        }
+        (events, result)
+    }
+    /// [`Self::del_route6`], the siblings too with `all` and no gateway
+    /// (`fc_delete_all_nh`).
+    fn del_route6_hops(&mut self, ask: &Ask6, all: bool) -> Result<Vec<Event>, Errno> {
         let table = if ask.table == 0 {
             TABLE_MAIN
         } else {
@@ -3046,7 +3275,13 @@ impl Addresses {
                         .is_none_or(|g| r.gateway.unwrap_or(Ipv6Addr::UNSPECIFIED) == g)
             })
             .ok_or(ESRCH)?;
-        Ok(vec![Event::DelRoute6(self.routes6.remove(at))])
+        let hops = self.hops6(&self.routes6[at]);
+        if ask.gateway.is_some() || hops.is_empty() || !all {
+            return Ok(vec![Event::DelRoute6(self.routes6.remove(at))]);
+        }
+        let first = self.routes6[at];
+        self.routes6.retain(|r| !r.sibling_of(&first));
+        Ok(vec![Event::DelMultipath6(hops)])
     }
 
     /// The IPv4 routes, as a dump gives them: table by table
@@ -3064,6 +3299,46 @@ impl Addresses {
             .into_iter()
             .flat_map(|t| self.routes6.iter().filter(move |r| r.table == t).copied())
             .collect()
+    }
+    /// The next hops of the multipath route `route` is one of, as
+    /// `rt6_fill_node` puts them in `RTA_MULTIPATH`: it, then its
+    /// siblings (`fib6_siblings`) in the order they came in, from the one
+    /// after it, round to the one before; none where it has no sibling.
+    pub(crate) fn hops6(&self, route: &Route6) -> Vec<Route6> {
+        let mut hops: Vec<Route6> = self
+            .routes6
+            .iter()
+            .filter(|r| r.sibling_of(route))
+            .copied()
+            .collect();
+        if hops.len() < 2 {
+            return Vec::new();
+        }
+        let at = hops.iter().position(|r| r == route).unwrap_or(0);
+        hops.rotate_left(at);
+        hops
+    }
+    /// The IPv6 routes as a dump tells of them, each with its next hops
+    /// ([`Self::hops6`]): a multipath route once, as its first sibling,
+    /// the walk going on after its last (`fib6_dump_node`), which passes
+    /// over any route of its metric between them.
+    pub(crate) fn dump6_entries(&self) -> Vec<(Route6, Vec<Route6>)> {
+        let routes = self.dump6();
+        let mut entries = Vec::new();
+        let mut at = 0;
+        while let Some(&route) = routes.get(at) {
+            let hops = self.hops6(&route);
+            at = if hops.is_empty() {
+                at + 1
+            } else {
+                routes
+                    .iter()
+                    .rposition(|r| r.sibling_of(&route))
+                    .map_or(at + 1, |last| last + 1)
+            };
+            entries.push((route, hops));
+        }
+        entries
     }
     /// Whether IPv4 has made the table `table` (`fib_get_table`).
     pub(crate) fn has_table4(&self, table: u32) -> bool {
@@ -3270,16 +3545,78 @@ impl Addresses {
     /// A lookup in one IPv6 table: the route of the longest prefix that has
     /// `ip`, the lowest metric first.
     fn table_lookup6(&self, table: u32, ip: Ipv6Addr) -> Option<Route6> {
-        self.lookup6_in(table, ip, 0)
+        self.lookup6_in(table, ip, 0, &Flow6::default())
     }
     /// The route of `table` to `ip` through the device `oif`, any for 0
-    /// (`RT6_LOOKUP_F_IFACE`): the longest prefix's, of the lowest metric.
-    fn lookup6_in(&self, table: u32, ip: Ipv6Addr, oif: u32) -> Option<Route6> {
+    /// (`RT6_LOOKUP_F_IFACE`): the longest prefix's, of the lowest metric,
+    /// passing over a dead multipath hop (`RTNH_F_DEAD`); of a multipath
+    /// route, the hop the flow `flow` takes ([`Self::path6`]).
+    fn lookup6_in(&self, table: u32, ip: Ipv6Addr, oif: u32, flow: &Flow6) -> Option<Route6> {
         self.routes6
             .iter()
-            .filter(|r| r.table == table && r.covers(ip) && (oif == 0 || r.oif == oif))
+            .filter(|r| r.table == table && r.covers(ip) && (oif == 0 || r.oif == oif) && !r.dead)
             .min_by_key(|r| (Reverse(r.len), r.metric))
+            .map(|r| self.path6(*r, ip, oif, flow))
+    }
+    /// The hop of the multipath route of `matched` a flow to `ip` takes,
+    /// as `fib6_select_path` chooses it: by the flow's hash, each hop
+    /// taking the share of the hashes its weight gives it, in the order
+    /// of its siblings, a dead one none (`rt6_multipath_rebalance`); the
+    /// first that takes the hash, unless it is not through `oif`, the
+    /// device of a strict lookup (`rt6_score_route`), when `matched`.
+    fn path6(&self, matched: Route6, ip: Ipv6Addr, oif: u32, flow: &Flow6) -> Route6 {
+        let first = self
+            .routes6
+            .iter()
+            .find(|r| r.sibling_of(&matched))
             .copied()
+            .unwrap_or(matched);
+        let hops = self.hops6(&first);
+        if hops.is_empty() {
+            return matched;
+        }
+        let total: u64 = hops
+            .iter()
+            .filter(|r| !r.dead)
+            .map(|r| u64::from(r.weight))
+            .sum();
+        if total == 0 {
+            return matched;
+        }
+        // `rt6_multipath_hash`: of the flow's addresses, label and
+        // protocol, shifted down a bit.
+        let key = (
+            flow.src.unwrap_or(Ipv6Addr::UNSPECIFIED),
+            ip,
+            flow.label,
+            flow.proto,
+        );
+        let hash = i64::from(
+            u32::try_from(
+                core::hash::BuildHasher::hash_one(&self.multipath_seed, key) & u64::from(u32::MAX),
+            )
+            .unwrap_or(0)
+                >> 1,
+        );
+        let mut weight = 0u64;
+        for hop in hops {
+            if hop.dead {
+                continue;
+            }
+            weight += u64::from(hop.weight);
+            // `rt6_upper_bound_set`: `DIV_ROUND_CLOSEST_ULL(weight << 31,
+            // total) - 1`.
+            let bound = i64::try_from(((weight << 31) + total / 2) / total).unwrap_or(i64::MAX) - 1;
+            if hash > bound {
+                continue;
+            }
+            return if oif == 0 || hop.oif == oif {
+                hop
+            } else {
+                matched
+            };
+        }
+        matched
     }
     /// The IPv6 route to `ip` (`fib6_rule_lookup`): the local table's, then
     /// the main one's, where the first has none or a throw route; a
@@ -3290,8 +3627,19 @@ impl Addresses {
     /// The IPv6 route to `ip` through the device `oif`, as
     /// [`Self::lookup6`] finds one through any for 0.
     pub(crate) fn lookup6_on(&self, ip: Ipv6Addr, oif: u32) -> Result<Route6, Errno> {
+        self.lookup6_flow(ip, oif, &Flow6::default())
+    }
+    /// The IPv6 route to `ip` through the device `oif` (any for 0) of the
+    /// flow `flow`, as [`Self::lookup6_on`] finds it, the hop of a
+    /// multipath route it takes ([`Self::path6`]).
+    pub(crate) fn lookup6_flow(
+        &self,
+        ip: Ipv6Addr,
+        oif: u32,
+        flow: &Flow6,
+    ) -> Result<Route6, Errno> {
         for table in [TABLE_LOCAL, TABLE_MAIN] {
-            if let Some(route) = self.lookup6_in(table, ip, oif) {
+            if let Some(route) = self.lookup6_in(table, ip, oif, flow) {
                 match route.kind.error() {
                     Some(Errno::EAGAIN) => {}
                     Some(e) => return Err(e),
@@ -3528,6 +3876,16 @@ mod tests {
     fn short6(r: &Route6) -> String {
         format!("{} {}/{} {:?} {}", r.table, r.dst, r.len, r.kind, r.metric)
     }
+    /// The gateways and devices of next hops, a dead one marked so.
+    fn via6(hops: &[Route6]) -> String {
+        hops.iter()
+            .map(|r| {
+                let gateway = r.gateway.map_or_else(|| "-".to_owned(), |g| g.to_string());
+                format!("{gateway}@{}{}", r.oif, if r.dead { "!" } else { "" })
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 
     /// A short form of an event: what it is and its address or route.
     fn told(events: &[Event]) -> Vec<String> {
@@ -3544,6 +3902,10 @@ mod tests {
                 Event::DelAddr6(a) => format!("-addr {}/{}", a.address, a.prefix),
                 Event::NewRoute6(r, flags) => format!("+route {} {flags:#x}", short6(r)),
                 Event::DelRoute6(r) => format!("-route {}", short6(r)),
+                Event::NewMultipath6(hops, flags) => {
+                    format!("+multipath {} {flags:#x}", via6(hops))
+                }
+                Event::DelMultipath6(hops) => format!("-multipath {}", via6(hops)),
                 Event::NewNeighbour(n) => format!("+neigh {} {:#x}", n.ip, n.state),
                 Event::DelNeighbour(n) => format!("-neigh {}", n.ip),
             })
@@ -4631,16 +4993,31 @@ mod tests {
             [Event::NewRoute6(r, _)] if r.oif == 1000 && r.gateway == Some(ip6("2001:db8::2"))
         ));
         assert_eq!(error(&mut a, "2001:db8::2", 0, false), Err(Errno::EEXIST));
-        // Another gateway of the prefix and metric would be its sibling.
+        // Another gateway of the prefix and metric is its sibling, told of
+        // first of the hops, without `NLM_F_EXCL`.
         let mut other = ask("fe80::ff:fe00:b", 1000, false);
         other.request = 0x400;
-        assert_eq!(a.add_route6(&other, true).map(|_| ()), Err(EOPNOTSUPP));
+        assert_eq!(
+            told(&a.add_route6(&other, true).unwrap()),
+            ["+multipath fe80::ff:fe00:b@1000,2001:db8::2@1000 0x400"]
+        );
         // A gateway's route does not reach another gateway.
         let mut further = ask("2001:db8:2::2", 0, false);
         further.dst = ip6("2001:db8:6::");
         assert_eq!(a.add_route6(&further, true).map(|_| ()), Err(EHOSTUNREACH));
+        // Replacing the first takes its sibling away too.
         other.request = 0x100;
-        a.add_route6(&other, true).unwrap();
+        assert_eq!(
+            told(&a.add_route6(&other, true).unwrap()),
+            ["+route 254 2001:db8:2::/64 Unicast 1024 0x100"]
+        );
+        assert_eq!(
+            a.dump6_entries()
+                .iter()
+                .filter(|(r, _)| r.len == 64 && r.gateway.is_some())
+                .count(),
+            1
+        );
         let route = a.lookup6(ip6("2001:db8:2::2")).unwrap();
         assert_eq!(route.gateway, Some(ip6("fe80::ff:fe00:b")));
         // A removal naming another gateway finds none.
@@ -4655,6 +5032,292 @@ mod tests {
             Err(ENETUNREACH)
         );
         assert_eq!(a.lookup6_on(ip6("2001:db8::2"), 1000).unwrap().oif, 1000);
+    }
+    #[test]
+    fn ipv6_multipath_siblings_dump_once_die_with_their_device_and_go_together() {
+        let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
+        let mut a = Addresses::first();
+        a.up(0, true);
+        for (address, index) in [("2001:db8::1", 1000), ("2001:db8:1::1", 1001)] {
+            let mut end = V6::new(ip6(address), 64);
+            end.index = index;
+            a.add_v6(end, Lifetimes::FOREVER, false, true, None, 0)
+                .unwrap();
+        }
+        let ask = |via: &str, oif, request| Ask6 {
+            table: TABLE_MAIN,
+            dst: ip6("2001:db8:2::"),
+            len: 64,
+            kind: 1,
+            proto: 3,
+            metric: 0,
+            prefsrc: None,
+            oif,
+            gateway: Some(ip6(via)),
+            onlink: false,
+            device: oif != 0,
+            ipv6_off: (oif != 0).then_some(false),
+            request,
+            metrics: Ok(NO_METRICS),
+        };
+        let add = |a: &mut Addresses, via, oif, request| {
+            told(&a.add_route6(&ask(via, oif, request), true).unwrap())
+        };
+        assert_eq!(
+            add(&mut a, "2001:db8::2", 0, 0x600),
+            ["+route 254 2001:db8:2::/64 Unicast 1024 0x600"]
+        );
+        assert_eq!(
+            add(&mut a, "2001:db8:1::2", 0, 0xc00),
+            ["+multipath 2001:db8:1::2@1001,2001:db8::2@1000 0xc00"]
+        );
+        // A route of the metric without a gateway goes after the first two.
+        let mut plain = ask("::", 1001, 0x400);
+        plain.gateway = None;
+        a.add_route6(&plain, true).unwrap();
+        assert_eq!(
+            add(&mut a, "2001:db8::3", 0, 0x400),
+            ["+multipath 2001:db8::3@1000,2001:db8::2@1000,2001:db8:1::2@1001 0x400"]
+        );
+        // A dump passes over the route without a gateway between them.
+        let entries: Vec<_> = a
+            .dump6_entries()
+            .into_iter()
+            .filter(|(r, _)| r.dst == ip6("2001:db8:2::"))
+            .map(|(_, hops)| via6(&hops))
+            .collect();
+        assert_eq!(
+            entries,
+            ["2001:db8::2@1000,2001:db8:1::2@1001,2001:db8::3@1000"]
+        );
+        assert_eq!(
+            a.routes6
+                .iter()
+                .filter(|r| r.dst == ip6("2001:db8:2::"))
+                .count(),
+            4
+        );
+        // Its device going down leaves a sibling dead, which lookups pass
+        // over, told of by none.
+        assert_eq!(
+            told(&a.device_down6(1000)),
+            [
+                "-route 254 2001:db8::/64 Unicast 256",
+                "-route 255 2001:db8::1/128 Local 0",
+                "-addr 2001:db8::1/64"
+            ]
+        );
+        let hops = a.hops6(&a.lookup6(ip6("2001:db8:2::9")).unwrap());
+        assert_eq!(
+            via6(&hops),
+            "2001:db8:1::2@1001,2001:db8::3@1000!,2001:db8::2@1000!"
+        );
+        // Ready again, it is not dead.
+        a.link_ready6(1000, ([2, 0, 0, 0, 0, 1], false), 0);
+        assert!(a.routes6.iter().all(|r| !r.dead));
+        // All of it on the device going down goes.
+        a.del_route6(&ask("2001:db8:1::2", 0, 0)).unwrap();
+        let gone = told(&a.device_down6(1000));
+        assert_eq!(
+            gone.iter()
+                .filter(|e| e.contains("2001:db8:2::/64"))
+                .count(),
+            2,
+            "{gone:?}"
+        );
+        assert!(
+            a.routes6
+                .iter()
+                .all(|r| r.dst != ip6("2001:db8:2::") || r.gateway.is_none())
+        );
+    }
+    #[test]
+    fn a_lone_dead_ipv6_hop_stays_dead_until_its_device_is_ready_or_goes_down() {
+        let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
+        let mut a = Addresses::first();
+        a.up(0, true);
+        for (address, index) in [("2001:db8::1", 1000), ("2001:db8:1::1", 1001)] {
+            let mut end = V6::new(ip6(address), 64);
+            end.index = index;
+            a.add_v6(end, Lifetimes::FOREVER, false, true, None, 0)
+                .unwrap();
+        }
+        let ask = |via: &str| Ask6 {
+            table: TABLE_MAIN,
+            dst: ip6("2001:db8:2::"),
+            len: 64,
+            kind: 1,
+            proto: 3,
+            metric: 0,
+            prefsrc: None,
+            oif: 0,
+            gateway: Some(ip6(via)),
+            onlink: false,
+            device: false,
+            ipv6_off: None,
+            request: 0x400,
+            metrics: Ok(NO_METRICS),
+        };
+        for via in ["2001:db8::2", "2001:db8:1::2"] {
+            a.add_route6(&ask(via), true).unwrap();
+        }
+        a.device_down6(1000);
+        // Its live sibling gone, the dead hop is left alone, as Linux
+        // leaves a route `RTNH_F_DEAD`, which lookups pass over.
+        a.del_route6(&ask("2001:db8:1::2")).unwrap();
+        let left: Vec<_> = a
+            .routes6
+            .iter()
+            .filter(|r| r.dst == ip6("2001:db8:2::"))
+            .collect();
+        assert!(matches!(left[..], [r] if r.dead && r.oif == 1000));
+        assert_eq!(
+            a.lookup6(ip6("2001:db8:2::9")).map(|_| ()),
+            Err(ENETUNREACH)
+        );
+        // Ready again, it is not dead.
+        a.link_ready6(1000, ([2, 0, 0, 0, 0, 1], false), 0);
+        assert_eq!(
+            a.lookup6(ip6("2001:db8:2::9")).unwrap().gateway,
+            Some(ip6("2001:db8::2"))
+        );
+        // Its device down again, with no sibling, it goes.
+        assert!(
+            told(&a.device_down6(1000))
+                .contains(&"-route 254 2001:db8:2::/64 Unicast 1024".to_owned())
+        );
+        assert!(a.routes6.iter().all(|r| r.dst != ip6("2001:db8:2::")));
+    }
+    #[test]
+    fn ipv6_multipath_removal_without_a_gateway_takes_all_its_hops_in_one_message() {
+        let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
+        let mut a = Addresses::first();
+        a.up(0, true);
+        let mut end = V6::new(ip6("2001:db8::1"), 64);
+        end.index = 1000;
+        a.add_v6(end, Lifetimes::FOREVER, false, true, None, 0)
+            .unwrap();
+        let ask = |via: Option<&str>| Ask6 {
+            table: TABLE_MAIN,
+            dst: ip6("2001:db8:2::"),
+            len: 64,
+            kind: 1,
+            proto: 3,
+            metric: 0,
+            prefsrc: None,
+            oif: 0,
+            gateway: via.map(ip6),
+            onlink: false,
+            device: false,
+            ipv6_off: None,
+            request: 0x400,
+            metrics: Ok(NO_METRICS),
+        };
+        for via in ["2001:db8::2", "2001:db8::3", "2001:db8::4"] {
+            a.add_route6(&ask(Some(via)), true).unwrap();
+        }
+        assert_eq!(
+            told(&a.del_route6(&ask(Some("2001:db8::3"))).unwrap()),
+            ["-route 254 2001:db8:2::/64 Unicast 1024"]
+        );
+        assert_eq!(
+            told(&a.del_route6(&ask(None)).unwrap()),
+            ["-multipath 2001:db8::2@1000,2001:db8::4@1000"]
+        );
+        assert_eq!(a.del_route6(&ask(None)).map(|_| ()), Err(ESRCH));
+    }
+    #[test]
+    fn ipv6_multipath_requests_put_their_hops_in_together_and_flows_spread_by_weight() {
+        let ip6 = |ip: &str| ip.parse::<Ipv6Addr>().unwrap();
+        let mut a = Addresses::first();
+        a.up(0, true);
+        let mut end = V6::new(ip6("2001:db8::1"), 64);
+        end.index = 1000;
+        a.add_v6(end, Lifetimes::FOREVER, false, true, None, 0)
+            .unwrap();
+        let ask = |via: &str, request| Ask6 {
+            table: TABLE_MAIN,
+            dst: ip6("2001:db8:2::"),
+            len: 64,
+            kind: 1,
+            proto: 3,
+            metric: 0,
+            prefsrc: None,
+            oif: 0,
+            gateway: Some(ip6(via)),
+            onlink: false,
+            device: false,
+            ipv6_off: None,
+            request,
+            metrics: Ok(NO_METRICS),
+        };
+        let hops = |vias: &[(&str, u16)], request| -> Vec<(Ask6, bool, u16)> {
+            vias.iter()
+                .map(|&(via, weight)| (ask(via, request), true, weight))
+                .collect()
+        };
+        // A hop twice is refused before any goes in.
+        let (events, result) =
+            a.add_multipath6(&hops(&[("2001:db8::2", 1), ("2001:db8::2", 1)], 0x400));
+        assert_eq!(
+            (told(&events), result),
+            (Vec::<String>::new(), Err(Errno::EEXIST))
+        );
+        let (events, result) =
+            a.add_multipath6(&hops(&[("2001:db8::2", 1), ("2001:db8::3", 3)], 0x600));
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            told(&events),
+            ["+multipath 2001:db8::2@1000,2001:db8::3@1000 0x400"]
+        );
+        assert_eq!(
+            a.hops6(
+                &a.routes6
+                    .iter()
+                    .find(|r| r.gateway == Some(ip6("2001:db8::3")))
+                    .copied()
+                    .unwrap()
+            )[0]
+            .weight,
+            3
+        );
+        // One already there: those put in are told of, then go.
+        let (events, result) =
+            a.add_multipath6(&hops(&[("2001:db8::4", 1), ("2001:db8::2", 1)], 0x400));
+        assert_eq!(result, Err(Errno::EEXIST));
+        assert_eq!(
+            told(&events),
+            [
+                "+multipath 2001:db8::4@1000,2001:db8::2@1000,2001:db8::3@1000 0x400",
+                "-route 254 2001:db8:2::/64 Unicast 1024"
+            ]
+        );
+        // Flows take each hop, the heavier more often, and the same flow
+        // the same one.
+        let mut taken = [0u32; 2];
+        for n in 0..400u16 {
+            let flow = Flow6 {
+                src: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, n)),
+                label: 0,
+                proto: 17,
+            };
+            let route = a.lookup6_flow(ip6("2001:db8:2::9"), 0, &flow).unwrap();
+            assert_eq!(
+                a.lookup6_flow(ip6("2001:db8:2::9"), 0, &flow).unwrap(),
+                route
+            );
+            taken[usize::from(route.gateway == Some(ip6("2001:db8::3")))] += 1;
+        }
+        assert!(taken[0] > 40 && taken[1] > 200, "{taken:?}");
+        // A removal of hops takes each, giving the last error.
+        let gone = [ask("2001:db8::3", 0), ask("2001:db8::9", 0)];
+        let (events, result) = a.del_multipath6(&gone);
+        assert_eq!(result, Err(ESRCH));
+        assert_eq!(told(&events), ["-route 254 2001:db8:2::/64 Unicast 1024"]);
+        assert_eq!(
+            a.hops6(&a.lookup6(ip6("2001:db8:2::9")).unwrap()),
+            Vec::new()
+        );
     }
     #[test]
     fn a_veth_ends_ipv6_neighbours_and_sources_follow_neighbour_discovery() {

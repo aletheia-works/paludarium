@@ -22,6 +22,7 @@ const RECORD_MMAP2: u32 = 10;
 const MISC_USER: u16 = 2;
 const MISC_COMM_EXEC: u16 = 1 << 13;
 const MISC_MMAP_DATA: u16 = 1 << 13;
+const MISC_MMAP_BUILD_ID: u16 = 1 << 14;
 
 const PROT_READ: u32 = 1;
 const PROT_WRITE: u32 = 2;
@@ -184,6 +185,9 @@ struct Mapping {
     prot: u32,
     flags: u32,
     name: Vec<u8>,
+    /// Its file's build ID, when an event that asks for one would write
+    /// it ([`super::build_id`]).
+    build_id: Option<super::build_id::BuildId>,
 }
 
 impl Mapping {
@@ -234,6 +238,7 @@ impl Mapping {
                 | flag(vm::EXEC, PROT_EXEC),
             flags,
             name: padded(&name),
+            build_id: None,
         }
     }
     /// `perf_event_mmap_match`.
@@ -244,9 +249,10 @@ impl Mapping {
             attr.flag(bit::MMAP_DATA)
         }
     }
-    /// `perf_event_mmap_output` for `event`, by thread `who`: a build ID
-    /// is never given (`PERF_RECORD_MISC_MMAP_BUILD_ID`), as if none were
-    /// found, and the inode's generation is 0.
+    /// `perf_event_mmap_output` for `event`, by thread `who`: the file's
+    /// build ID is given only to an `mmap2` event with `build_id`, in place
+    /// of the device and inode (`PERF_RECORD_MISC_MMAP_BUILD_ID`), and the
+    /// inode's generation is 0.
     fn write(&self, event: &Arc<Event>, who: &Who) {
         let mut body = event.pid_tid_of(who.pid, who.tid).to_vec();
         put(&mut body, self.start);
@@ -257,10 +263,22 @@ impl Mapping {
             misc |= MISC_MMAP_DATA;
         }
         let kind = if event.attr.flag(bit::MMAP2) {
-            body.extend(self.major.to_le_bytes());
-            body.extend(self.minor.to_le_bytes());
-            put(&mut body, self.inode);
-            put(&mut body, 0);
+            // With `build_id`, the build ID in place of the device and
+            // inode: its size, three bytes of zeros and `BUILD_ID_SIZE_MAX`
+            // bytes.
+            match self.build_id.filter(|_| event.attr.flag(bit::BUILD_ID)) {
+                Some((size, id)) => {
+                    misc |= MISC_MMAP_BUILD_ID;
+                    body.extend([size, 0, 0, 0]);
+                    body.extend(id);
+                }
+                None => {
+                    body.extend(self.major.to_le_bytes());
+                    body.extend(self.minor.to_le_bytes());
+                    put(&mut body, self.inode);
+                    put(&mut body, 0);
+                }
+            }
             body.extend(self.prot.to_le_bytes());
             body.extend(self.flags.to_le_bytes());
             RECORD_MMAP2
@@ -301,9 +319,18 @@ impl Space<'_> {
         old_break: Option<u64>,
     ) {
         let start_stack = self.group.start_stack();
+        // `perf_event_mmap_event` parses the file's build ID while an event
+        // with `build_id` is open (`nr_build_id_events`).
+        let build_ids = events.iter().any(|event| event.attr.flag(bit::BUILD_ID));
+        let view = self.mem.view();
         for vma in vmas {
             let heap = vma.heap && old_break.is_none_or(|old| vma.start < old);
-            let mapping = Mapping::of(&vma, start_stack, self.root, heap);
+            let mut mapping = Mapping::of(&vma, start_stack, self.root, heap);
+            if build_ids && vma.file.as_ref().is_some_and(|file| file.source) {
+                mapping.build_id = view
+                    .vma_source(vma.start)
+                    .and_then(|source| super::build_id::parse(&*source));
+            }
             Self::write_one(events, &mapping, &self.who);
         }
     }

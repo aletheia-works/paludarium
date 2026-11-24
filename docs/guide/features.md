@@ -396,7 +396,9 @@ kernel.
   seals (`EINVAL`), and opening it again through `/proc/self/fd` gives
   `ENXIO`. The kernel may not reach the pages of its mapping, as Linux's
   `get_user_pages` refuses them: `MADV_POPULATE_READ` and
-  `MADV_POPULATE_WRITE` give `EINVAL`, and `mlock` `ENOMEM`, with
+  `MADV_POPULATE_WRITE` give `EINVAL`, `process_vm_readv` and
+  `process_vm_writev` `EFAULT`, `PTRACE_PEEKDATA` and `PTRACE_POKEDATA`
+  `EIO`, and `mlock` `ENOMEM`, with
   `MLOCK_ONFAULT` too, as `mlock_fixup` gives its VMA no `VM_LOCKONFAULT`.
   `msync` with `MS_SYNC` gives `EINVAL` for it, as its file has no `fsync`,
   even after a hole in the range. A fault brings a page in only while the
@@ -4678,8 +4680,11 @@ kernel.
   or the caller has `CAP_IPC_LOCK`; a later mapping is charged to the user
   too and never given back, as in Linux master. The mapping is not copied
   to a `fork`ed child nor held in a core dump (`VM_DONTCOPY`,
-  `VM_DONTDUMP`), and keeps the event counting though its descriptors are
-  closed; its last unmapping frees the buffer and its charges. It is a
+  `VM_DONTDUMP`), and is memory of no pages (`VM_IO | VM_PFNMAP`), which
+  `get_user_pages` refuses: `process_vm_readv` and `process_vm_writev`
+  give `EFAULT` for it, `PTRACE_PEEKDATA` and `PTRACE_POKEDATA` `EIO`, and
+  `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` `EINVAL`. It keeps the
+  event counting though its descriptors are closed; its last unmapping frees the buffer and its charges. It is a
   mapping of the event's file, which `/proc/<pid>/maps` and the `MMAP2`
   records name `anon_inode:[perf_event]` with the device and inode its
   descriptor's `fstat` gives, the anonymous inodes' one. The user

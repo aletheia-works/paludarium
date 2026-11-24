@@ -3363,7 +3363,13 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
         };
         let needed = if write { Prot::WRITE } else { Prot::READ };
         let stop = mapping.end().min(end);
-        if !mapping.prot.contains(needed) || maps_secret(mem, at, stop) {
+        // `check_vma_flags` refuses it, which `FOLL_MADV_POPULATE` makes
+        // `EINVAL`: a `memfd_secret` file's, or a mapping of no pages
+        // (`VM_IO | VM_PFNMAP`, a `perf` ring's).
+        if !mapping.prot.contains(needed)
+            || maps_secret(mem, at, stop)
+            || mem.refuses_gup(GuestAddr(at))
+        {
             return Err(Errno::EINVAL);
         }
         if write {

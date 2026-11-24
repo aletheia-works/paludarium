@@ -349,8 +349,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ベクタの形はなく（`EINVAL`）、`lseek`（`ESPIPE`）、`fsync`（`EINVAL`）、`fallocate`
   （`EOPNOTSUPP`）、シール（`EINVAL`）もありません。`/proc/self/fd` から開き直すと
   `ENXIO` です。Linux の `get_user_pages` と同じく、カーネルはそのマッピングのページに
-  触れられません。`MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL`、`mlock` は
-  `ENOMEM` です。`mlock_fixup` がその VMA に `VM_LOCKONFAULT` を付けないので、
+  触れられません。`MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL`、
+  `process_vm_readv` と `process_vm_writev` は `EFAULT`、`PTRACE_PEEKDATA` と
+  `PTRACE_POKEDATA` は `EIO`、`mlock` は `ENOMEM` です。`mlock_fixup` がその VMA に `VM_LOCKONFAULT` を付けないので、
   `MLOCK_ONFAULT` でも同じです。ファイルに `fsync` がないので、`MS_SYNC` の `msync` も、
   範囲に穴があってもそのマッピングに着けば `EINVAL` です。ページフォールトでページを
   割り当てるのは、そのユーザーが作ったファイルのページが、フォールトしたプロセスの
@@ -4052,7 +4053,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   後者は、`perf_event_paranoid` が -1 か、呼び出し元が `CAP_IPC_LOCK` を持つので
   なければ、`RLIMIT_MEMLOCK` を超えられません（`EPERM`）。後のマッピングも、Linux
   master と同じくユーザーに課され、返されません。マッピングは `fork` した子に写されず、
-  コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ディスクリプタが閉じられても
+  コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ページのないメモリ
+  （`VM_IO | VM_PFNMAP`）なので `get_user_pages` はこれを拒みます。`process_vm_readv` と
+  `process_vm_writev` は `EFAULT`、`PTRACE_PEEKDATA` と `PTRACE_POKEDATA` は `EIO`、
+  `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL` です。ディスクリプタが閉じられても
   イベントを数え続けさせます。最後にアンマップされると、バッファと課したものは
   なくなります。これはイベントのファイルのマッピングで、`/proc/<pid>/maps` と `MMAP2`
   の記録は、ディスクリプタの `fstat` が示すデバイスと inode（無名 inode のもの）を付けて

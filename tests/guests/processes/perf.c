@@ -624,6 +624,25 @@ static int case_gup(void) {
     return 0;
 }
 
+/* The perf-ring-gup case: a ring is VM_IO | VM_PFNMAP, which
+   get_user_pages refuses (check_vma_flags): process_vm_readv and
+   process_vm_writev pin nothing of it (EFAULT), and MADV_POPULATE_READ is
+   EINVAL (FOLL_MADV_POPULATE), while the task's own reads see it. */
+static int case_ring_gup(void) {
+    int fd = open_software(9, 0);
+    char *ring = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    say("open %d mapped %d", fd >= 0, ring != MAP_FAILED);
+    if (ring == MAP_FAILED) return 0;
+    /* The task's own read of the user page: its compat_version, 0. */
+    say("own read: compat %u", ((volatile uint32_t *)ring)[1]);
+    static char local[16];
+    struct iovec mine = {local, sizeof local}, theirs = {ring, sizeof local};
+    say("process_vm_readv %ld", TRY(syscall(SYS_process_vm_readv, getpid(), &mine, 1, &theirs, 1, 0)));
+    say("process_vm_writev %ld", TRY(syscall(SYS_process_vm_writev, getpid(), &mine, 1, &theirs, 1, 0)));
+    say("populate read %ld", TRY(madvise(ring, 4096, 22 /* MADV_POPULATE_READ */)));
+    return 0;
+}
+
 /* The user page's fields (struct perf_event_mmap_page). */
 #define PAGE_U32(page, at) (*(volatile uint32_t *)((char *)(page) + (at)))
 #define PAGE_U64(page, at) (*(volatile uint64_t *)((char *)(page) + (at)))
@@ -1621,6 +1640,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-prctl")) return case_prctl();
     if (!strcmp(mode, "perf-inherit")) return case_inherit();
     if (!strcmp(mode, "perf-software")) return case_software();
+    if (!strcmp(mode, "perf-ring-gup")) return case_ring_gup();
     if (!strcmp(mode, "perf-gup")) return case_gup();
     if (!strcmp(mode, "perf-mmap")) return case_mmap();
     if (!strcmp(mode, "perf-output")) return case_output();

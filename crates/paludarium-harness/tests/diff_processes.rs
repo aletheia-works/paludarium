@@ -132,6 +132,7 @@ mod linux {
         // Linux writes the core the cases read only with the kernel's
         // default core_pattern, which CI sets.
         if mode == "core-dump"
+            || mode == "exec-names"
             || mode == "core-dump-faults"
             || mode == "core-mappings"
             || mode == "core-credentials"

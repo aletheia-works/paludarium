@@ -536,11 +536,8 @@ verified.
   whole exit cancels the requests its threads submitted that wait for
   their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
   the kernel the differential tests run on, cancels them only once their
-  files are ready, as for a thread that exits alone. A registered file
-  that an update outside a submission takes from its slot posts its tag at
-  once, even while a request that waits for its file holds it; Linux posts
-  the tag once that request completes. A registered buffer's pages
-  are not pinned: a fixed transfer moves the memory at its address as that
+  files are ready, as for a thread that exits alone. A registered buffer's
+  pages are not pinned: a fixed transfer moves the memory at its address as that
   is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
   made read-only, and a process that shares the ring moves its own memory.
   Linux moves the pages it pinned. A shared mapping of a disk file can be

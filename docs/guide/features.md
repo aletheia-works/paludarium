@@ -1786,6 +1786,11 @@ kernel.
   - A read that chose a provided buffer keeps it while it waits
     (`REQ_F_BUFFER_SELECTED`). A ring's buffer stays at the ring's head and
     is chosen again as the read goes on.
+  - A request that waits keeps the file it found (`req->file`), and goes on
+    with it though its descriptor is closed or its slot is updated
+    meanwhile. A registered file that an update takes from its slot while
+    such a request holds it posts its tag once that request completes, after
+    its completion (`io_put_rsrc_node`).
 
 - `IORING_OP_ASYNC_CANCEL` and `IORING_REGISTER_SYNC_CANCEL` cancel the
   requests of their ring that wait for their files, as Linux master's

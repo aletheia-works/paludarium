@@ -6273,6 +6273,58 @@ mod io_uring {
         );
     }
 
+    /// A `struct io_uring_rsrc_register` at `at`.
+    fn rsrc_register(f: &Fixture, at: u64, count: u32, flags: u32, data: u64, tags: u64) {
+        let mut rr = [0u8; 32];
+        rr[..4].copy_from_slice(&count.to_le_bytes());
+        rr[4..8].copy_from_slice(&flags.to_le_bytes());
+        rr[16..24].copy_from_slice(&data.to_le_bytes());
+        rr[24..].copy_from_slice(&tags.to_le_bytes());
+        f.mem.write(GuestAddr(at), &rr).unwrap();
+    }
+
+    /// A `struct io_uring_rsrc_update2` at `at`.
+    fn rsrc_update(f: &Fixture, at: u64, offset: u32, data: u64, tags: u64, count: u32) {
+        let mut up = [0u8; 32];
+        up[..4].copy_from_slice(&offset.to_le_bytes());
+        up[8..16].copy_from_slice(&data.to_le_bytes());
+        up[16..24].copy_from_slice(&tags.to_le_bytes());
+        up[24..28].copy_from_slice(&count.to_le_bytes());
+        f.mem.write(GuestAddr(at), &up).unwrap();
+    }
+
+    #[test]
+    fn a_tag_waits_for_the_request_that_waits_for_its_file() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, list, tags, arg, buf) = (
+            DATA + 0x300,
+            DATA + 0x100,
+            DATA + 0x180,
+            DATA + 0x1c0,
+            DATA + 0x800,
+        );
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        fds(&f, list, &[read as i32]);
+        f.mem.write_u64(GuestAddr(tags), 21).unwrap();
+        rsrc_register(&f, arg, 1, 0, list, tags);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), 0);
+        // A read of the registered pipe waits, holding the file.
+        let mut e = rw(READ, 0, HERE, buf, 8);
+        e[1] = 1;
+        assert_eq!(batch(&mut f, &r, &[e]), []);
+        // An update takes it from its slot: the tag waits for the read.
+        fds(&f, list, &[-1]);
+        rsrc_update(&f, arg, 0, list, 0, 1);
+        assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), []);
+        // Its completion, then the tag (`io_put_rsrc_node`).
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 2), (21, 0)]);
+    }
+
     #[test]
     fn tagged_files_post_their_tags_once_let_go() {
         let mut f = fixture();

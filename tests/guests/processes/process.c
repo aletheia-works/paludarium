@@ -10505,6 +10505,55 @@ static int io_uring_exit_case(const char *self) {
     return 0;
 }
 
+/* A request that waits for its file keeps the file it found (req->file):
+   it goes on though its descriptor is closed or its slot is updated
+   meanwhile, and the tag of the file an update took posts after its
+   completion (io_put_rsrc_node). */
+static int io_uring_held_tag_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int a[2], b[2];
+    char buf[8];
+    if (pipe(a) || pipe(b)) return 81;
+
+    /* A registered file. */
+    int fds[1] = {a[0]};
+    unsigned long tags[1] = {21};
+    struct uf_register2 rr = {1, 0, 0, (unsigned long)fds, (unsigned long)tags};
+    uring_show("register-files", syscall(427, u.fd, 13, &rr, sizeof rr));
+    unsigned char *sqe = pw_read(&u, 1, 0, buf, sizeof buf, 0);
+    sqe[1] = 1;
+    tw_submit(&u, 1, 0, "armed-fixed-file");
+    fds[0] = -1;
+    struct uf_update2 up = {0, 0, (unsigned long)fds, 0, 1, 0};
+    uring_show("update-files", syscall(427, u.fd, 14, &up, sizeof up));
+    uring_reap(&u, "updated");
+    printf("write: %ld\n", (long)write(a[1], "ab", 2));
+    uring_reap(&u, "file-done");
+
+    /* A descriptor closed while its read waits. */
+    pw_read(&u, 2, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-fd");
+    close(b[0]);
+    printf("write: %ld\n", (long)write(b[1], "cd", 2));
+    uring_reap(&u, "closed-done");
+    printf("read: %.2s\n", buf);
+
+    /* A descriptor that names another file once its read goes on. */
+    int c[2], d[2];
+    if (pipe(c) || pipe(d)) return 82;
+    pw_read(&u, 3, c[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-replaced");
+    if (dup2(d[0], c[0]) != c[0]) return 83;
+    printf("write: %ld\n", (long)write(d[1], "gh", 2));
+    uring_reap(&u, "replaced-other");
+    printf("write: %ld\n", (long)write(c[1], "ef", 2));
+    uring_reap(&u, "replaced-done");
+    printf("read: %.2s\n", buf);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -38215,6 +38264,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

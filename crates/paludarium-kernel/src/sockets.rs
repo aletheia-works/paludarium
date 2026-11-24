@@ -46,6 +46,9 @@ pub(crate) struct PipeEnd {
     /// `O_NONBLOCK` of this open file description, which a pipe opened
     /// again through `/proc/self/fd` has of its own ([`FileHandle::reopen`]).
     nonblocking: AtomicBool,
+    /// `O_DIRECT` of this description (`pipe2`, `F_SETFL`): its writes
+    /// are packets ([`PipeBuf`]). An open refuses it (`do_dentry_open`).
+    direct: AtomicBool,
     /// The pipe's read and write ends, while some description holds each,
     /// which an open of the other end through a link takes.
     ends: Arc<Mutex<[Weak<SocketPairEnd>; 2]>>,
@@ -284,6 +287,50 @@ mod pipe_tests {
 }
 /// A new pipe holds 16 pages, as on Linux.
 const PIPE_DEFAULT: usize = 16 * 4096;
+/// A page: the most one of a pipe's buffers holds.
+const PIPE_PAGE: usize = 4096;
+/// `O_DIRECT`, which makes a pipe's writes packets (`is_packetized`).
+const O_DIRECT: u32 = 0o40000;
+/// One of a pipe's buffers, as Linux's `struct pipe_buffer` keeps it: its
+/// unread bytes start `offset` into its page. A write of its own appends
+/// to one that may `merge` (`PIPE_BUF_FLAG_CAN_MERGE`); a read stops at
+/// the end of a `packet` (`PIPE_BUF_FLAG_PACKET`) and drops the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PipeBuf {
+    offset: usize,
+    len: usize,
+    packet: bool,
+    merge: bool,
+}
+impl PipeBuf {
+    /// A buffer of `len` bytes from the start of its page, which no write
+    /// merges into, as `splice`, `vmsplice` and `tee` make them.
+    pub(crate) fn spliced(len: usize, packet: bool) -> Self {
+        Self {
+            offset: 0,
+            len,
+            packet,
+            merge: false,
+        }
+    }
+}
+/// How the bytes a pipe is given join its buffers.
+pub(crate) enum PipeLayout {
+    /// A `write`, as `anon_pipe_write`: the bytes past whole pages join
+    /// the last buffer if it may merge and has room, and the rest go into
+    /// new buffers of a page at most, packets if the description is
+    /// `O_DIRECT`.
+    Write { packet: bool },
+    /// These buffers, in order, as `splice`, `vmsplice` and `tee` make
+    /// them; as many whole ones as the pipe has room for.
+    Buffers(Vec<PipeBuf>),
+}
+thread_local! {
+    /// The layout of the pipe write this thread is making, which
+    /// [`SocketPairEnd::send_data`] takes; a plain write without it.
+    static PIPE_LAYOUT: std::cell::RefCell<Option<PipeLayout>> =
+        const { std::cell::RefCell::new(None) };
+}
 impl PipeEnd {
     pub(crate) fn pair(flags: u32, hub: Arc<ReadinessHub>) -> Result<[Arc<Self>; 2], Errno> {
         Self::make(flags, hub, None)
@@ -298,7 +345,7 @@ impl PipeEnd {
         hub: Arc<ReadinessHub>,
         node: Option<&FileStat>,
     ) -> Result<[Arc<Self>; 2], Errno> {
-        let [reader, writer] = SocketPairEnd::pair(1 | flags, hub)?;
+        let [reader, writer] = SocketPairEnd::pair(1 | (flags & !O_DIRECT), hub)?;
         reader.pair.window.store(PIPE_DEFAULT, Ordering::SeqCst);
         reader.pair.pipe.store(true, Ordering::SeqCst);
         reader.shutdown(1)?;
@@ -322,6 +369,8 @@ impl PipeEnd {
                 inode,
                 attributes: Arc::clone(&attributes),
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+                // `__do_pipe_flags` gives O_DIRECT to the write end only.
+                direct: AtomicBool::new(false),
                 ends: Arc::clone(&ends),
                 writer: None,
                 signalling: Arc::default(),
@@ -333,6 +382,7 @@ impl PipeEnd {
                 inode,
                 attributes,
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+                direct: AtomicBool::new(flags & O_DIRECT != 0),
                 ends,
                 writer: None,
                 signalling: Arc::default(),
@@ -370,6 +420,7 @@ impl PipeEnd {
             inode: self.inode,
             attributes: Arc::clone(&self.attributes),
             nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+            direct: AtomicBool::new(false),
             ends: Arc::clone(&self.ends),
             writer,
             signalling: Arc::default(),
@@ -459,15 +510,16 @@ impl PipeEnd {
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // The unread bytes are the reader's; each page holds 4096 of them.
-        let unread = sides[if self.reader {
+        // The unread buffers are the reader's, as `pipe_resize_ring` counts
+        // them.
+        let used = sides[if self.reader {
             self.endpoint.side
         } else {
             1 - self.endpoint.side
         }]
-        .bytes
+        .pipe_bufs
         .len();
-        if size / 4096 < unread.div_ceil(4096) {
+        if size / PIPE_PAGE < used {
             return Err(Errno(16)); // EBUSY
         }
         self.endpoint.pair.window.store(size, Ordering::SeqCst);
@@ -495,12 +547,64 @@ impl PipeEnd {
     pub(crate) fn unread_bytes(&self) -> usize {
         self.endpoint.lock_sides()[self.read_side()].bytes.len()
     }
-    /// The bytes a write may still put in the pipe.
+    /// The bytes the pipe's free buffers hold, a page each, as
+    /// `splice_file_to_pipe` limits a splice into it.
     pub(crate) fn room(&self) -> usize {
-        self.endpoint
-            .pair
-            .window()
-            .saturating_sub(self.unread_bytes())
+        let used = self.endpoint.lock_sides()[self.read_side()].pipe_bufs.len();
+        self.endpoint.pair.slots().saturating_sub(used) * PIPE_PAGE
+    }
+    /// Writes `bytes` laid out as `layout` says, through whichever end
+    /// this description writes.
+    fn write_laid(&self, bytes: &[u8], layout: PipeLayout) -> Result<usize, Errno> {
+        let end = match &self.writer {
+            Some(writer) => writer,
+            None if self.reader => return Err(Errno::EBADF),
+            None => &self.endpoint,
+        };
+        PIPE_LAYOUT.set(Some(layout));
+        let written = end.write(bytes);
+        PIPE_LAYOUT.take();
+        written
+    }
+    /// Puts `bytes` in the pipe as the buffers `bufs`, which `splice`,
+    /// `vmsplice` and `tee` make: as many whole ones as it has room for.
+    /// Returns how many bytes went in.
+    pub(crate) fn write_buffers(&self, bytes: &[u8], bufs: Vec<PipeBuf>) -> Result<usize, Errno> {
+        self.write_laid(bytes, PipeLayout::Buffers(bufs))
+    }
+    /// The first buffers, up to `len` bytes, as another pipe takes them:
+    /// `tee`'s copies (`link_pipe`) keep a packet's flag but merge with no
+    /// write; a splice (`splice_pipe_to_pipe`) moves a whole buffer as it
+    /// is, and a part of one as `tee` copies it. The last is shortened to
+    /// what is left of `len`.
+    pub(crate) fn buffers(&self, len: usize, tee: bool) -> Vec<PipeBuf> {
+        let sides = self.endpoint.lock_sides();
+        let mut left = len;
+        let mut taken = Vec::new();
+        for buf in &sides[self.read_side()].pipe_bufs {
+            if left == 0 {
+                break;
+            }
+            let n = buf.len.min(left);
+            let whole = n == buf.len && !tee;
+            taken.push(PipeBuf {
+                len: n,
+                merge: buf.merge && whole,
+                ..*buf
+            });
+            left -= n;
+        }
+        taken
+    }
+    /// Takes `count` bytes from the pipe as a splice out of it does
+    /// (`iter_file_splice_write`, `splice_pipe_to_pipe`): across packets,
+    /// whose rest stays. Tells its writers there is room.
+    pub(crate) fn take(&self, count: usize) -> Result<(), Errno> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.endpoint.take_raw(self.read_side(), count);
+        Ok(())
     }
     /// Whether some description still reads the pipe (Linux's `readers`).
     pub(crate) fn has_readers(&self) -> bool {
@@ -534,11 +638,8 @@ impl FileHandle for PipeEnd {
         }
     }
     fn write(&self, bytes: &[u8]) -> Result<usize, Errno> {
-        match &self.writer {
-            Some(writer) => writer.write(bytes),
-            None if self.reader => Err(Errno::EBADF),
-            None => self.endpoint.write(bytes),
-        }
+        let packet = self.direct.load(Ordering::SeqCst);
+        self.write_laid(bytes, PipeLayout::Write { packet })
     }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         let (mask, input, output) = self.endpoint.readiness()?;
@@ -579,13 +680,19 @@ impl FileHandle for PipeEnd {
         } else {
             0
         };
-        access | nonblocking | signals
+        let direct = if self.direct.load(Ordering::SeqCst) {
+            O_DIRECT
+        } else {
+            0
+        };
+        access | nonblocking | signals | direct
     }
-    /// `O_NONBLOCK`; `O_ASYNC` is this description's registration, which
-    /// [`crate::fasync::set_flags`] makes.
+    /// `O_NONBLOCK` and `O_DIRECT`; `O_ASYNC` is this description's
+    /// registration, which [`crate::fasync::set_flags`] makes.
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
         self.nonblocking
             .store(flags & NONBLOCK != 0, Ordering::SeqCst);
+        self.direct.store(flags & O_DIRECT != 0, Ordering::SeqCst);
         Ok(())
     }
     /// A new open file description of the pipe, as Linux's `fifo_open`
@@ -2608,6 +2715,86 @@ impl Pair {
 fn passes(side: &Side) -> bool {
     side.pass_credentials || side.pass_pidfd
 }
+/// A pipe's buffers on the side that holds its bytes.
+impl Side {
+    /// Where a write of `len` bytes to this pipe of `slots` buffers goes:
+    /// how many join the last buffer, and the new buffers.
+    fn pipe_plan(&self, layout: &PipeLayout, len: usize, slots: usize) -> (usize, Vec<PipeBuf>) {
+        debug_assert!(
+            !matches!(layout, PipeLayout::Buffers(bufs) if bufs.iter().map(|b| b.len).sum::<usize>() != len)
+        );
+        let mut free = slots.saturating_sub(self.pipe_bufs.len());
+        match layout {
+            PipeLayout::Write { packet } => {
+                let mut merged = 0;
+                let chars = len % PIPE_PAGE;
+                if chars != 0
+                    && let Some(last) = self.pipe_bufs.back()
+                    && last.merge
+                    && last.offset + last.len + chars <= PIPE_PAGE
+                {
+                    merged = chars;
+                }
+                let mut left = len - merged;
+                let mut new = Vec::new();
+                while left > 0 && free > 0 {
+                    let n = left.min(PIPE_PAGE);
+                    new.push(PipeBuf {
+                        offset: 0,
+                        len: n,
+                        packet: *packet,
+                        merge: !*packet,
+                    });
+                    left -= n;
+                    free -= 1;
+                }
+                (merged, new)
+            }
+            PipeLayout::Buffers(bufs) => (0, bufs.iter().copied().take(free).collect()),
+        }
+    }
+    /// Adds what [`Self::pipe_plan`] placed.
+    fn pipe_add(&mut self, merged: usize, new: Vec<PipeBuf>) {
+        if merged != 0
+            && let Some(last) = self.pipe_bufs.back_mut()
+        {
+            last.len += merged;
+        }
+        self.pipe_bufs.extend(new);
+    }
+    /// How a read of at most `want` bytes takes them, as `anon_pipe_read`:
+    /// the bytes it reads, and those of a packet it drops, as it ends at
+    /// the end of a packet.
+    fn pipe_read_plan(&self, want: usize) -> (usize, usize) {
+        let mut taken = 0;
+        for buf in &self.pipe_bufs {
+            let chars = buf.len.min(want - taken);
+            taken += chars;
+            if buf.packet {
+                return (taken, buf.len - chars);
+            }
+            if taken == want {
+                break;
+            }
+        }
+        (taken, 0)
+    }
+    /// Takes `count` bytes from the first buffers, freeing the emptied ones.
+    fn pipe_take(&mut self, mut count: usize) {
+        while count > 0 {
+            let Some(front) = self.pipe_bufs.front_mut() else {
+                break;
+            };
+            let n = front.len.min(count);
+            front.offset += n;
+            front.len -= n;
+            count -= n;
+            if front.len == 0 {
+                self.pipe_bufs.pop_front();
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct Side {
     /// The socket filter attached to this side's socket (`sk_filter`,
@@ -2622,6 +2809,9 @@ struct Side {
     /// Linux's `sk_ino` is 0 until `accept` grafts it.
     embryo: bool,
     bytes: VecDeque<u8>,
+    /// A pipe's buffers over `bytes`, oldest first ([`PipeBuf`]); empty for
+    /// a socket.
+    pipe_bufs: VecDeque<PipeBuf>,
     /// An AF_UNIX client whose connection a listener closed before it was
     /// accepted: its next read is `ECONNRESET` (`unix_release_sock` sets
     /// `sk_err`), once.
@@ -2877,6 +3067,10 @@ impl Pair {
     }
     fn window(&self) -> usize {
         self.window.load(Ordering::SeqCst)
+    }
+    /// How many buffers a pipe holds (`max_usage`), a page each.
+    fn slots(&self) -> usize {
+        self.window() / PIPE_PAGE
     }
     /// When a message sent to `peer` is stamped as sent: now, if the peer
     /// takes timestamps, as `unix_dgram_sendmsg` stamps it.
@@ -3668,7 +3862,12 @@ impl SocketPairEnd {
         let eof = sides[self.side].read_shutdown
             || sides[1 - self.side].closed
             || sides[1 - self.side].write_shutdown;
-        let full = sides[self.side].bytes.len() >= self.pair.window();
+        let pipe = self.is_pipe();
+        let full = if pipe {
+            sides[self.side].pipe_bufs.len() >= self.pair.slots()
+        } else {
+            sides[self.side].bytes.len() >= self.pair.window()
+        };
         let own = &mut sides[self.side];
         if own.read_shutdown {
             return Ok(Received::default());
@@ -3723,6 +3922,14 @@ impl SocketPairEnd {
             discarded,
             ..Received::default()
         };
+        // A pipe's read ends at the end of a packet, whose unread rest
+        // goes, as `anon_pipe_read`.
+        let (limit, dropped) = if pipe {
+            own.pipe_read_plan(buf.len())
+        } else {
+            (buf.len(), 0)
+        };
+        let buf = &mut buf[..limit];
         let mut credentials = after;
         let mut consumed_write = false;
         while let Some(front) = own.writes.front_mut() {
@@ -3773,6 +3980,23 @@ impl SocketPairEnd {
             if passed || received.count == buf.len() {
                 break;
             }
+        }
+        if pipe {
+            let own = &mut sides[self.side];
+            own.bytes.drain(..dropped);
+            let mut rest = dropped;
+            while rest > 0
+                && let Some(front) = own.writes.front_mut()
+            {
+                let n = front.len.min(rest);
+                front.len -= n;
+                rest -= n;
+                if front.len == 0 {
+                    own.writes.pop_front();
+                    consumed_write = true;
+                }
+            }
+            own.pipe_take(received.count + dropped);
         }
         Self::consumed(&mut sides[self.side], received.count);
         if full || consumed_write {
@@ -3874,6 +4098,29 @@ impl SocketPairEnd {
             let count = i32::try_from(count).unwrap_or(i32::MAX);
             own.peek_offset = own.peek_offset.saturating_sub(count).max(0);
         }
+    }
+    /// Takes the first `count` bytes of a pipe's `side` as they lie, with
+    /// no read's packet ends ([`PipeEnd::take`]), and tells the writer.
+    fn take_raw(&self, side: usize, count: usize) {
+        let mut sides = self.lock_sides();
+        let own = &mut sides[side];
+        let count = count.min(own.bytes.len());
+        own.bytes.drain(..count);
+        let mut rest = count;
+        while rest > 0
+            && let Some(front) = own.writes.front_mut()
+        {
+            let n = front.len.min(rest);
+            front.len -= n;
+            rest -= n;
+            if front.len == 0 {
+                own.writes.pop_front();
+            }
+        }
+        own.pipe_take(count);
+        sides[1 - side].output_epoch = sides[1 - side].output_epoch.wrapping_add(1);
+        drop(sides);
+        self.pair.hub.changed();
     }
 }
 impl Drop for SocketPairEnd {
@@ -4146,7 +4393,7 @@ impl FileHandle for SocketPairEnd {
         // A socket is writable as a datagram one is (unix_writable); a
         // pipe while its capacity has room.
         let writable = if self.is_pipe() {
-            peer.bytes.len() < self.pair.window() || peer.closed
+            peer.pipe_bufs.len() < self.pair.slots() || peer.closed
         } else {
             self.writable()
         };
@@ -4359,6 +4606,7 @@ impl SocketPairEnd {
             return None;
         }
         own.bytes.clear();
+        own.pipe_bufs.clear();
         own.input_epoch = own.input_epoch.wrapping_add(1);
         own.output_epoch = own.output_epoch.wrapping_add(1);
         Some(own.writes.drain(..).map(|write| write.passed).collect())
@@ -4609,9 +4857,17 @@ impl SocketPairEnd {
         // unix_stream_sendmsg, each part charged to it; the peer's unread
         // bytes bound nothing.
         let pipe = self.is_pipe();
+        // A pipe's bytes go into its buffers as Linux places them
+        // ([`PipeLayout`]): as many as its free buffers take.
+        let mut placed = None;
         let count = if pipe {
-            buf.len()
-                .min(self.pair.window().saturating_sub(peer.bytes.len()))
+            let layout = PIPE_LAYOUT
+                .take()
+                .unwrap_or(PipeLayout::Write { packet: false });
+            let (merged, new) = peer.pipe_plan(&layout, buf.len(), self.pair.slots());
+            let count = merged + new.iter().map(|b| b.len).sum::<usize>();
+            placed = Some((merged, new));
+            count
         } else {
             let (mut count, mut charged) = (0, self.sent.load(Ordering::SeqCst));
             for chunk in buf.chunks(part) {
@@ -4650,6 +4906,9 @@ impl SocketPairEnd {
                 from: from.clone(),
                 charge: (!pipe).then(|| self.charge(stream_truesize(chunk.len()))),
             });
+        }
+        if let Some((merged, new)) = placed {
+            peer.pipe_add(merged, new);
         }
         let waited = std::mem::take(&mut peer.waiting_data);
         self.pair.hub.changed();

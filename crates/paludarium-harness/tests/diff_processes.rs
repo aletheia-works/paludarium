@@ -1034,6 +1034,7 @@ mod linux {
         processes_setfl_kinds => ("setfl-kinds","process"),
         processes_setattrs => ("setattrs","process"),
         processes_setfl_checks => ("setfl-checks","process"),
+        processes_pipe_packets => ("pipe-packets","process"),
         processes_mount_flags => ("mount-flags","process"),
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),

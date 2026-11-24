@@ -14148,6 +14148,115 @@ static int setfl_checks_case(void) {
     return 0;
 }
 
+/* A pipe's packet mode (O_DIRECT, fs/pipe.c's is_packetized) and its
+   buffers: a packetized write makes a buffer of a page at most for each
+   page it writes, which no write merges into; a read ends at the end of a
+   packet and drops what it did not take. A pipe holds 16 buffers, so 16
+   packets fill it however small they are, while other writes merge into
+   the last buffer where it has room. splice and tee move or copy buffers,
+   packets kept, and a splice out of a pipe takes bytes across them. Each
+   value is a count or the errno. */
+static long pp_write(int fd, const char *s, size_t n) {
+    long r = write(fd, s, n);
+    return r < 0 ? -errno : r;
+}
+static void pp_reads(const char *name, int fd, size_t want, int times) {
+    printf("%s:", name);
+    for (int i = 0; i < times; i++) {
+        char buf[16384];
+        long r = read(fd, buf, want);
+        if (r < 0) {
+            printf(" %d", -errno);
+        } else {
+            printf(" %ld", r);
+            if (r > 0 && r <= 8) printf("=%.*s", (int)r, buf);
+        }
+    }
+    printf("\n");
+}
+static int pipe_packets_case(void) {
+    int p[2];
+    if (pipe2(p, O_DIRECT | O_NONBLOCK)) {
+        printf("pipe2 O_DIRECT: %d\n", errno);
+        return 1;
+    }
+    printf("flags read-direct=%d write-direct=%d\n", !!(fcntl(p[0], F_GETFL) & O_DIRECT),
+           !!(fcntl(p[1], F_GETFL) & O_DIRECT));
+    long w1 = pp_write(p[1], "abc", 3);
+    long w2 = pp_write(p[1], "defgh", 5);
+    long w3 = pp_write(p[1], "i", 1);
+    printf("writes %ld %ld %ld\n", w1, w2, w3);
+    pp_reads("reads", p[0], 100, 4);
+    printf("write %ld\n", pp_write(p[1], "jklmn", 5));
+    pp_reads("short", p[0], 2, 1);
+    pp_reads("after-short", p[0], 100, 1);
+    static char big[20000];
+    memset(big, 'x', sizeof big);
+    printf("big %ld\n", pp_write(p[1], big, 10000));
+    pp_reads("big-reads", p[0], 8192, 4);
+    long ones[17];
+    for (int i = 0; i < 17; i++) ones[i] = pp_write(p[1], "z", 1);
+    printf("ones first=%ld sixteenth=%ld seventeenth=%ld\n", ones[0], ones[15], ones[16]);
+    printf("resize-busy %d\n", fcntl(p[0], F_SETPIPE_SZ, 4096) < 0 ? errno : 0);
+    for (int i = 0; i < 16; i++) {
+        char c;
+        if (read(p[0], &c, 1) != 1) break;
+    }
+    close(p[0]);
+    close(p[1]);
+
+    /* Plain writes merge into the last buffer where it has room: 4097
+       bytes at a time until a full pipe refuses. */
+    if (pipe2(p, O_NONBLOCK)) return 1;
+    printf("plain:");
+    long total = 0;
+    for (int i = 0; i < 40; i++) {
+        long r = pp_write(p[1], big, 4097);
+        printf(" %ld", r);
+        if (r < 0) break;
+        total += r;
+    }
+    printf(" total=%ld\n", total);
+    close(p[0]);
+    close(p[1]);
+
+    /* O_DIRECT of the writing description only, set and cleared. */
+    if (pipe2(p, O_NONBLOCK)) return 1;
+    printf("setfl %d", fcntl(p[1], F_SETFL, O_DIRECT | O_NONBLOCK) < 0 ? errno : 0);
+    printf(" read-direct=%d write-direct=%d\n", !!(fcntl(p[0], F_GETFL) & O_DIRECT),
+           !!(fcntl(p[1], F_GETFL) & O_DIRECT));
+    pp_write(p[1], "ab", 2);
+    pp_write(p[1], "cd", 2);
+    fcntl(p[1], F_SETFL, O_NONBLOCK);
+    pp_write(p[1], "ef", 2);
+    pp_write(p[1], "gh", 2);
+    pp_reads("mixed", p[0], 100, 4);
+    close(p[0]);
+    close(p[1]);
+
+    /* splice and tee between pipes keep packets; a splice to a file takes
+       bytes across them. */
+    int q[2], r2[2];
+    if (pipe2(p, O_DIRECT | O_NONBLOCK) || pipe2(q, O_NONBLOCK) || pipe2(r2, O_NONBLOCK)) return 1;
+    pp_write(p[1], "abc", 3);
+    pp_write(p[1], "de", 2);
+    long teed = tee(p[0], r2[1], 100, SPLICE_F_NONBLOCK);
+    long spliced = splice(p[0], NULL, q[1], NULL, 100, SPLICE_F_NONBLOCK);
+    printf("tee %ld splice %ld\n", teed < 0 ? -errno : teed, spliced < 0 ? -errno : spliced);
+    pp_reads("teed", r2[0], 100, 3);
+    pp_reads("spliced", q[0], 100, 3);
+    pp_write(p[1], "fgh", 3);
+    pp_write(p[1], "ij", 2);
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-pipe-packets-%d", getpid());
+    int file = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    long out = splice(p[0], NULL, file, NULL, 100, SPLICE_F_NONBLOCK);
+    printf("to-file %ld size %ld\n", out < 0 ? -errno : out, (long)lseek(file, 0, SEEK_END));
+    close(file);
+    unlink(path);
+    return 0;
+}
+
 /* The setattrs case: mount_setattr and open_tree_attr (Linux master's) in a
    mount namespace of a user namespace of its own: the checks of a struct
    mount_attr, a mount's flags set and cleared with the mounts below it,
@@ -37674,6 +37783,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "setfl-kinds")) return setfl_kinds_case();
     if (!strcmp(mode, "setattrs")) return setattrs_case();
     if (!strcmp(mode, "setfl-checks")) return setfl_checks_case();
+    if (!strcmp(mode, "pipe-packets")) return pipe_packets_case();
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();

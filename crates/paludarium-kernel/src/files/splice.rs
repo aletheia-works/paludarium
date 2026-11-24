@@ -1,12 +1,13 @@
 //! `splice`, `tee` and `vmsplice`, as Linux's `fs/splice.c` has them: bytes
 //! move between a pipe and another file, or between two pipes, without the
-//! guest copying them. A pipe here is a queue of bytes and not of page
-//! buffers, so one holds as many bytes as its size, however they came.
+//! guest copying them. They come into a pipe as buffers of their own, which
+//! no write merges into ([`PipeBuf`]), and go out of one as they lie, with
+//! none of a read's packet ends.
 use super::{
     MAX_RW_COUNT, O_APPEND, O_PATH, REGULAR, buffer, iovecs_checked, offset_argument, read_at,
     read_limit, read_waiting, size_room, write_at, write_io,
 };
-use crate::sockets::PipeEnd;
+use crate::sockets::{PipeBuf, PipeEnd};
 use crate::syscalls::Context;
 use paludarium_host::FileHandle;
 use paludarium_types::{Errno, GuestAddr};
@@ -89,15 +90,29 @@ fn wait(c: &mut Context<'_>, ticket: u32) -> Result<(), Errno> {
     crate::events::wait(c, ticket, None)
 }
 /// Takes `count` bytes, already looked at, from the pipe `file` reads,
-/// which tells its writers there is room.
+/// across packets, which tells its writers there is room.
 fn consume(file: &Arc<dyn FileHandle>, count: usize) -> Result<(), Errno> {
     if count == 0 {
         return Ok(());
     }
-    let mut taken = buffer(count)?;
-    file.read(&mut taken)?;
+    pipe(file).ok_or(Errno::EBADF)?.take(count)?;
     crate::sockets::pipe_read_ended(file);
     Ok(())
+}
+/// `len` bytes as the buffers a splice into a pipe makes, a page each:
+/// from `start`'s page on for a regular file (`filemap_splice_read`), and
+/// from the first byte for another file (`copy_splice_read`).
+fn spliced_buffers(start: Option<u64>, len: usize) -> Vec<PipeBuf> {
+    let mut at = start.unwrap_or(0);
+    let mut left = len;
+    let mut bufs = Vec::new();
+    while left > 0 {
+        let part = left.min(4096 - (at % 4096) as usize);
+        bufs.push(PipeBuf::spliced(part, false));
+        at += part as u64;
+        left -= part;
+    }
+    bufs
 }
 /// Waits until the pipe `output` has room, as `wait_for_space` does: no
 /// reader is EPIPE with SIGPIPE, and a full pipe EAGAIN with `nonblock`.
@@ -232,7 +247,7 @@ fn do_splice(
             verify_area(start, len)?;
             super::access_permission(c, input)?;
             let nonblock = nonblock || nonblocking(output);
-            let read = to_pipe(c, input, start, off_in.is_some(), output, to, len, nonblock)?;
+            let read = to_pipe(c, input, start, off_in.is_some(), to, len, nonblock)?;
             let end = start + read;
             if off_in.is_none() && input.stat()?.mode & 0o170000 == REGULAR {
                 input.seek(end as i64, 0)?;
@@ -307,13 +322,11 @@ fn from_pipe(
 /// ([`wait_for_space`]), at most what fits, which a regular file gives from
 /// its offset up to its end. A unix stream socket's read does not wait with
 /// `nonblock`; other files read as their own `O_NONBLOCK` says.
-#[expect(clippy::too_many_arguments, reason = "both ends of the splice")]
 fn to_pipe(
     c: &mut Context<'_>,
     input: &Arc<dyn FileHandle>,
     start: u64,
     at_offset: bool,
-    output: &Arc<dyn FileHandle>,
     to: &PipeEnd,
     len: u64,
     nonblock: bool,
@@ -326,7 +339,8 @@ fn to_pipe(
         return Err(Errno::EINVAL);
     }
     let metadata = input.stat()?;
-    let read = if metadata.mode & 0o170000 == REGULAR {
+    let regular = metadata.mode & 0o170000 == REGULAR;
+    let read = if regular {
         let len = len.min(read_limit(input, &metadata).saturating_sub(start));
         let mut piece = buffer(usize::try_from(len).unwrap_or(usize::MAX))?;
         let read = read_at(input, start, &mut piece)?;
@@ -347,7 +361,8 @@ fn to_pipe(
     if read.is_empty() {
         return Ok(0);
     }
-    Ok(output.write(&read)? as u64)
+    let bufs = spliced_buffers(regular.then_some(start), read.len());
+    Ok(to.write_buffers(&read, bufs)? as u64)
 }
 /// Two pipes, as `splice_pipe_to_pipe`: once the input has data and the
 /// output room (`ipipe_prep`, `opipe_prep`), as much as both allow, up to
@@ -446,7 +461,8 @@ fn link(
         .min(to.room());
     let mut piece = buffer(count)?;
     let count = from.peek(&mut piece);
-    let written = to.write(&piece[..count])?;
+    let bufs = from.buffers(count, !retry);
+    let written = to.write_buffers(&piece[..count], bufs)?;
     Ok(Some(written))
 }
 /// `vmsplice(fd, iov, nr_segs, flags)`, in the order of Linux's: the flags,
@@ -472,7 +488,7 @@ pub(super) fn vmsplice(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let pipe = pipe(&file).ok_or(Errno::EBADF)?;
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     if write {
-        to_pipe_from_guest(c, &file, pipe, &segments, nonblock)
+        to_pipe_from_guest(c, pipe, &segments, nonblock)
     } else {
         from_pipe_to_guest(c, &file, pipe, &segments, nonblock)
     }
@@ -482,7 +498,6 @@ pub(super) fn vmsplice(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// the first byte).
 fn to_pipe_from_guest(
     c: &mut Context<'_>,
-    file: &Arc<dyn FileHandle>,
     to: &PipeEnd,
     segments: &[(u64, usize)],
     nonblock: bool,
@@ -490,6 +505,19 @@ fn to_pipe_from_guest(
     wait_for_space(c, to, nonblock)?;
     let mut room = to.room();
     let mut bytes = Vec::new();
+    // A buffer for each page of the guest's the bytes lie in
+    // (`iter_to_pipe`).
+    let mut bufs = Vec::new();
+    let mut page_buffers = |base: u64, len: usize| {
+        let mut at = base;
+        let mut left = len;
+        while left > 0 {
+            let part = left.min(4096 - (at % 4096) as usize);
+            bufs.push(PipeBuf::spliced(part, false));
+            at += part as u64;
+            left -= part;
+        }
+    };
     for &(base, length) in segments {
         let mut piece = buffer(length.min(room))?;
         if c.mem.read(GuestAddr(base), &mut piece).is_err() {
@@ -507,10 +535,12 @@ fn to_pipe_from_guest(
                 read = end;
             }
             bytes.extend_from_slice(&piece[..read]);
+            page_buffers(base, read);
             break;
         }
         room -= piece.len();
         bytes.extend_from_slice(&piece);
+        page_buffers(base, piece.len());
         if room == 0 {
             break;
         }
@@ -518,7 +548,7 @@ fn to_pipe_from_guest(
     if bytes.is_empty() {
         return Err(Errno::EFAULT);
     }
-    Ok(file.write(&bytes)? as u64)
+    Ok(to.write_buffers(&bytes, bufs)? as u64)
 }
 /// `vmsplice_to_user`: what the pipe has, up to the buffers' size, once it
 /// has some, which only SPLICE_F_NONBLOCK stops it waiting for; a buffer

@@ -590,9 +590,20 @@ kernel.
   locks are the guest's own: a program on the host does not see them, nor
   they its.
 
-- A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
-  `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
-  at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
+- A pipe holds 16 buffers of a page each (64 KiB), as on Linux, and
+  `fcntl`'s `F_SETPIPE_SZ` and `F_GETPIPE_SZ` resize and report it like
+  `pipe_set_size`: a power of two of at least a page, `EBUSY` below the
+  buffers in use and `EINVAL` past 2³¹. A write's bytes past whole pages
+  join the last buffer where it has room, and the rest go into new
+  buffers, as `anon_pipe_write` places them; `splice`, `tee` and
+  `vmsplice` make buffers of their own, which no write joins.
+
+- A pipe's packet mode: a write end with `O_DIRECT` (`pipe2`, or
+  `F_SETFL`, which `F_GETFL` shows) writes each page as a packet of its
+  own, and a read ends at the end of a packet and drops the rest of it.
+  Packets fill a buffer each, so 16 fill a pipe however small they are.
+  `splice` and `tee` to another pipe keep them; a splice to a file takes
+  bytes across them.
 
 - A `SOCK_DGRAM` pair keeps message boundaries like `SOCK_SEQPACKET`, but has
   no end of file: when the peer closes, reads wait and the next send gets

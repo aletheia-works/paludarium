@@ -5196,7 +5196,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?
             };
-            if flags & !(crate::events::NONBLOCK | crate::events::CLOEXEC) != 0 {
+            // `__do_pipe_flags`: O_DIRECT makes packets.
+            if flags & !(crate::events::NONBLOCK | crate::events::CLOEXEC | O_DIRECT) != 0 {
                 return Err(Errno::EINVAL);
             }
             c.mem

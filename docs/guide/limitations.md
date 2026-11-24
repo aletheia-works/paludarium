@@ -167,9 +167,6 @@ verified.
   no device for it to stand for. A FIFO in a mounted host directory can be
   made on Linux hosts only, and connects only the guest's own openers, not
   host programs that open the same node.
-- **A pipe's packet mode**: `F_SETFL` takes `O_DIRECT` on a pipe or FIFO,
-  as Linux does, but the emulator has no packet mode: its writes are not
-  kept apart as packets, and `F_GETFL` does not show `O_DIRECT`.
 - **`O_DIRECT`'s alignment**: a read or write of a file opened with
   `O_DIRECT` goes through as any other. On a disk file system such as
   ext4, Linux refuses a buffer, offset or length that is not aligned to its

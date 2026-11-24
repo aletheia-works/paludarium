@@ -443,6 +443,7 @@
     {"name":"setfl-kinds","binary":"process"},
     {"name":"setattrs","binary":"process"},
     {"name":"setfl-checks","binary":"process"},
+    {"name":"pipe-packets","binary":"process"},
     {"name":"mount-flags","binary":"process"},
     {"name":"listings","binary":"process"},
     {"name":"generated-binds","binary":"process"},

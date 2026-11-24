@@ -10505,6 +10505,98 @@ static int io_uring_exit_case(const char *self) {
     return 0;
 }
 
+/* IORING_REGISTER_RING_FDS: a thread registers ring descriptors, which
+   io_uring_enter and io_uring_register then find by index
+   (IORING_ENTER_REGISTERED_RING, IORING_REGISTER_USE_REGISTERED_RING). The
+   table is the thread's: a new thread and a forked child have no io_uring
+   context (EINVAL), and execve empties it, keeping the context (EBADF). */
+struct urf_update {
+    unsigned offset, resv;
+    unsigned long data;
+};
+
+static long urf_register(struct uring *u, unsigned op, struct urf_update *up, unsigned n) {
+    return syscall(427, u->fd, op, up, n);
+}
+
+static void *urf_thread(void *arg) {
+    (void)arg;
+    uring_show("thread-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    return NULL;
+}
+
+static int io_uring_ring_fds_case(const char *self) {
+    uring_show("no-context", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    uring_show("empty-slot", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("past-table", uring_enter(16, 0, 0, 1 << 4, NULL, 0));
+    struct urf_update up[2];
+    memset(up, 0, sizeof up);
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register-none", urf_register(&u, 20, up, 0));
+    uring_show("register-many", urf_register(&u, 20, up, 17));
+    up[0].resv = 1;
+    uring_show("register-resv", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){16, 0, (unsigned long)u.fd};
+    uring_show("register-past", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 999};
+    uring_show("register-badf", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 1};
+    uring_show("register-not-ring", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register", urf_register(&u, 20, up, 1));
+    printf("offset: %u\n", up[0].offset);
+    up[0] = (struct urf_update){3, 0, (unsigned long)u.fd};
+    up[1] = (struct urf_update){0, 0, (unsigned long)u.fd};
+    uring_show("register-busy-second", urf_register(&u, 20, up, 2));
+    tw_nop(&u, 5, 0, 0, 0);
+    uring_show("enter-registered", uring_enter(3, 1, 1, 1 << 4 | 1, NULL, 0));
+    uring_reap(&u, "enter-registered");
+    unsigned char probe[16 + 8];
+    memset(probe, 0, sizeof probe);
+    uring_show("register-registered", syscall(427, 0, 8 | (1U << 31), probe, 1));
+
+    /* A new thread and a forked child have no io_uring context. */
+    pthread_t t;
+    pthread_create(&t, NULL, urf_thread, NULL);
+    pthread_join(t, NULL);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        uring_show("child-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+
+    /* execve empties the table and keeps the context. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        struct uring mine;
+        if (uring_open(&mine, 8)) _exit(1);
+        struct urf_update one = {0xffffffff, 0, (unsigned long)mine.fd};
+        if (urf_register(&mine, 20, &one, 1) != 1) _exit(2);
+        char *args[] = {"process", "io-uring-ring-fds-exec", (char *)self, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(3);
+    }
+    waitpid(child, &status, 0);
+    printf("exec-child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    up[0] = (struct urf_update){0, 0, 1};
+    uring_show("unregister-data", urf_register(&u, 21, up, 1));
+    up[0] = (struct urf_update){0, 0, 0};
+    up[1] = (struct urf_update){3, 0, 0};
+    uring_show("unregister", urf_register(&u, 21, up, 2));
+    uring_show("after-unregister", uring_enter(3, 0, 0, 1 << 4, NULL, 0));
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -38215,6 +38307,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds")) return io_uring_ring_fds_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds-exec")) {
+        uring_show("exec-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        return 0;
+    }
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

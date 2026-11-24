@@ -1664,6 +1664,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。
 
+- `IORING_REGISTER_RING_FDS` は、Linux の `io_ringfd_register` と同じく、呼んだスレッドの
+  ためにリングの記述子を登録します。1 から 16 個の `struct io_uring_rsrc_update`（`EINVAL`）は、
+  それぞれ予約した欄が 0 で（`EINVAL`）、リングの記述子（`EBADF`、`EOPNOTSUPP`）と 16 個の
+  スロットの 1 つ、`-1` なら最初の空き（越えれば `EINVAL`、空きがなければ `EBUSY`）を指し、
+  そのスロットを書き戻します。登録した数を返します。`IORING_ENTER_REGISTERED_RING` の
+  `io_uring_enter` と `IORING_REGISTER_USE_REGISTERED_RING` の `io_uring_register` は、
+  そのあとスロットでリングを指します。空のスロットは `EBADF`、表を越えるスロットと、io_uring の
+  文脈がないスレッドからのものは `EINVAL` です。スレッドは、リングを作るか、投入するか、記述子を
+  登録すると文脈を持ちます。新しいスレッドと fork した子は持ちません。
+  `IORING_UNREGISTER_RING_FDS` はスロットを空にし（予約した欄、データ、表を越えるスロットは
+  `EINVAL`）、`execve` とスレッドの終わりはすべてを空にします（`io_uring_unreg_ringfd`）。
+  文脈は残ります。
+
 - `IORING_REGISTER_FILES` は、差分テストのカーネルである Linux 7.0 の
   `io_sqe_files_register` と同じくリングのファイルを登録します（更新と割り当て範囲も 7.0 の
   ものです）。引数が要り（`EFAULT`）、それからまだ登録していないこと（`EBUSY`）、1 個以上（`EINVAL`）で 1048576 個と

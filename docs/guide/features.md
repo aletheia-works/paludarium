@@ -1896,6 +1896,22 @@ kernel.
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
 
+- `IORING_REGISTER_RING_FDS` registers ring descriptors for the calling
+  thread, as Linux's `io_ringfd_register` does: 1 to 16 `struct
+  io_uring_rsrc_update`s (`EINVAL`), each with no reserved field
+  (`EINVAL`), naming a ring's descriptor (`EBADF`, `EOPNOTSUPP`) and a slot
+  of 16, or the first free one for `-1` (`EINVAL` past them, `EBUSY` for
+  none free), which is written back. It gives how many it registered.
+  `io_uring_enter` with `IORING_ENTER_REGISTERED_RING`, and
+  `io_uring_register` with `IORING_REGISTER_USE_REGISTERED_RING`, then name
+  the ring by its slot: an empty one is `EBADF`, and one past the table, or
+  any from a thread with no io_uring context, `EINVAL`. A thread has one
+  once it made a ring, submitted to one or registered a descriptor; a new
+  thread and a forked child have none. `IORING_UNREGISTER_RING_FDS` empties
+  slots (`EINVAL` for a reserved field, data or a slot past the table), and
+  `execve` and the thread's exit empty them all (`io_uring_unreg_ringfd`),
+  leaving its context.
+
 - `IORING_REGISTER_FILES` registers a ring's files as Linux 7.0's
   `io_sqe_files_register` does, the kernel the differential tests run on
   (its updates and allocation range are 7.0's too). It needs an argument

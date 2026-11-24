@@ -59,7 +59,10 @@ verified.
   system call's, and SGX is not emulated; a C library falls back to
   `getrandom(2)`. `smaps` counts a touched page of `[vdso]` as the process's
   own (`Private_Clean`), where Linux's is shared by every process
-  (`Shared_Clean`, `Pss` 0).
+  (`Shared_Clean`, `Pss` 0). `[vvar]` is the test machines' Linux 7.0's:
+  since 7.2 it is `VM_MIXEDMAP` instead of `VM_IO | VM_PFNMAP` (c27e727c9a60),
+  so `mlock` fills it and `get_user_pages` may reach it, and its pages 1 and 3
+  hold zeros (43648f9f3a67) instead of being a bus error.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping

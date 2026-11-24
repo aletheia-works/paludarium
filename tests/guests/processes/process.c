@@ -17287,7 +17287,9 @@ static int thread_caps_status_case(void) {
    does here, and gets what the system calls give. [vvar]'s pages 1 and 3
    (and [vvar_vclock]'s page 1) are a bus error, nothing in [vvar] may be
    made writable or reached from outside the process (VM_IO | VM_PFNMAP),
-   and the vDSO may be moved but not grown. statm counts the three areas,
+   and the vDSO may be moved but not grown. Linux 7.2 makes [vvar]
+   VM_MIXEDMAP (vdso_install_vvar_mapping, c27e727c9a60) and maps zeros for
+   its pages 1 and 3 (43648f9f3a67): this is the test machines' 7.0's. statm counts the three areas,
    and a fork keeps them where they are. The bytes of [vvar], Linux's time
    data, and whether [vvar_vclock]'s page 0 can be read, which depends on
    the machine's clock, are not printed. */
@@ -17524,7 +17526,9 @@ static int vdso_mappings_case(void) {
                                "madvise DONTNEED [vvar]", "madvise DONTNEED [vdso]", "mlock [vvar]", "mlock [vdso]",
                                "mlock [vvar] PROT_NONE"};
     for (int op = 0; op < 12; op++) vdm_in_child(ops[op], op);
-    /* From outside. paludarium has no /proc/<pid>/mem (limitations). */
+    /* From outside: no get_user_pages of [vvar] (VM_IO | VM_PFNMAP, and
+       special_mapping_vmops has no access), which /proc/<pid>/mem says as
+       EIO; a forced write to [vdso] (VM_MAYWRITE) copies its page. */
     for (int i = 0; i < 3; i += 2) {
         char byte;
         struct iovec local = {&byte, 1}, remote = {(void *)vdm_areas[i].start, 1};
@@ -17532,6 +17536,34 @@ static int vdso_mappings_case(void) {
         long v = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
         printf("%s process_vm_readv=%ld errno=%d\n", vdm_names[i], v, v < 0 ? errno : 0);
     }
+    fflush(stdout);
+    pid_t writer = fork();
+    if (writer == 0) {
+        int mem = open("/proc/self/mem", O_RDWR);
+        printf("mem open=%d\n", mem >= 0);
+        for (int i = 0; i < 3; i += 2) {
+            /* e_ident's padding, in [vdso]. */
+            unsigned char byte = 0xee;
+            off_t at = (off_t)(vdm_areas[i].start + 15);
+            errno = 0;
+            long got = pread(mem, &byte, 1, at);
+            printf("%s mem read=%ld errno=%d\n", vdm_names[i], got, got < 0 ? errno : 0);
+            byte = 'x';
+            errno = 0;
+            long put = pwrite(mem, &byte, 1, at);
+            printf("%s mem write=%ld errno=%d\n", vdm_names[i], put, put < 0 ? errno : 0);
+        }
+        /* One that begins in [vvar_vclock] moves nothing. */
+        char two[2];
+        errno = 0;
+        long across = pread(mem, two, 2, (off_t)(vdm_areas[2].start - 1));
+        printf("mem read across=%ld errno=%d\n", across, across < 0 ? errno : 0);
+        printf("[vdso] byte now=%#x\n", *(volatile unsigned char *)(vdm_areas[2].start + 15));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(writer, NULL, 0);
+    printf("parent's byte=%#x\n", *(volatile unsigned char *)(vdm_areas[2].start + 15));
     fflush(stdout);
     pid_t traced = fork();
     if (traced == 0) {

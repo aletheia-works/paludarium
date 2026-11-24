@@ -3126,11 +3126,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `__vdso_clock_getres` と、接頭辞のない弱い別名を見つけます。どの関数もそのシステム
   コールを呼びます。`[vvar]` と `[vvar_vclock]` は `VM_IO | VM_PFNMAP` で、そのページは
   書き込めるようにはできず（`EACCES`）、`get_user_pages` でも届きません
-  （`process_vm_readv` は `EFAULT`、`PTRACE_PEEKDATA` は `EIO`）。
+  （`process_vm_readv` は `EFAULT`、`PTRACE_PEEKDATA` と `/proc/<pid>/mem` は `EIO`）。
   `MADV_DONTNEED` は `EINVAL` で、`[vvar]` のページ 1 と 3、および `[vvar_vclock]` の
   ページはバスエラー（`BUS_ADRERR`）、`[vvar]` のページ 0 と 2 は 0 として読めます。
-  `[vdso]` は書き込めるようにでき（そのときは写しになります）、`mremap` で動かせますが、
-  大きくはできません（`EFAULT`）。`statm` と `VmSize` はこの三つを数え、`fork` しても
+  `[vdso]` は書き込めるようにでき（そのときは写しになり、`/proc/<pid>/mem` で書いたときも
+  同じです）、`mremap` で動かせますが、大きくはできません（`EFAULT`）。`statm` と `VmSize` はこの三つを数え、`fork` しても
   同じ場所に残り、Linux の `always_dump_vma` が特別なマッピングをそうするように、
   コアには全体が入ります。
 

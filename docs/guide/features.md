@@ -3623,10 +3623,12 @@ kernel.
   dynamic symbols; each makes its system call. `[vvar]` and
   `[vvar_vclock]` are `VM_IO | VM_PFNMAP`: their pages may not be made
   writable (`EACCES`) or reached through `get_user_pages`
-  (`process_vm_readv` `EFAULT`, `PTRACE_PEEKDATA` `EIO`), `MADV_DONTNEED` is `EINVAL` on them, `[vvar]`'s pages 1 and 3 and
+  (`process_vm_readv` `EFAULT`, `PTRACE_PEEKDATA` and `/proc/<pid>/mem`
+  `EIO`), `MADV_DONTNEED` is `EINVAL` on them, `[vvar]`'s pages 1 and 3 and
   `[vvar_vclock]`'s are a bus error (`BUS_ADRERR`), and its pages 0 and 2
-  read as zeros. `[vdso]` may be made writable, which copies it, and moved
-  by `mremap`, but not grown (`EFAULT`). `statm` and `VmSize` count the
+  read as zeros. `[vdso]` may be made writable, which copies it (so does a
+  write through `/proc/<pid>/mem`), and moved by `mremap`, but not grown
+  (`EFAULT`). `statm` and `VmSize` count the
   three, a `fork` keeps them where they are, and a core holds them whole,
   as Linux's `always_dump_vma` dumps a special mapping.
 

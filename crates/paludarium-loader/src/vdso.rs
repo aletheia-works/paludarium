@@ -479,10 +479,12 @@ impl PageSource for VdsoPages {
 }
 
 /// The memory of `[vvar]` and `[vvar_vclock]`: pages of no memory of their own
-/// (`VM_IO | VM_PFNMAP`), read-only for good (no `VM_MAYWRITE`), left out
-/// of a core dump. The pages Linux fills read as zeros, as nothing here
-/// reads the time from them; the others are a bus error, as Linux's are
-/// where its `vvar_fault` finds nothing to map.
+/// (`VM_IO | VM_PFNMAP`), read-only for good (no `VM_MAYWRITE`). The pages
+/// Linux fills read as zeros, as nothing here reads the time from them; the
+/// others are a bus error, as Linux's are where its `vvar_fault` finds
+/// nothing to map. This is Linux 7.0's `[vvar]`, the CI runners': 7.2 makes it
+/// `VM_MIXEDMAP` and maps zeros for those pages (c27e727c9a60,
+/// 43648f9f3a67).
 pub(crate) struct VvarPages {
     pub(crate) name: &'static [u8],
     /// The pages that may be read, by index.

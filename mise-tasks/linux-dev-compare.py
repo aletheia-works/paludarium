@@ -103,7 +103,7 @@ def run(checkout, tests, names=()):
         *[arg for suite in tests for arg in ("--test", suite)],
         *(("--", "--exact", *names) if names else ()),
     ]
-    # diff_events, diff_threads and diff_files run the emulator's binary, as
+    # diff_events and diff_threads run the emulator's binary, as
     # `mise run test:diff` builds it first.
     command = [
         "bash",

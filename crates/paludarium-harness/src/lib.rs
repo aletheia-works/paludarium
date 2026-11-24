@@ -173,6 +173,25 @@ pub fn run_native_within(
     })
 }
 
+/// `session` with the native JIT when `PALUDARIUM_TEST_JIT=N` asks for it,
+/// compiling the blocks run N times (1: every block, the first time it
+/// runs) on the thread that runs them, so that a block runs compiled from
+/// the entry that reaches N, for `mise run test:diff:jit`. A test that
+/// makes a session of its own passes it through this too.
+pub fn with_test_jit(session: Session) -> Result<Session, String> {
+    match std::env::var("PALUDARIUM_TEST_JIT")
+        .ok()
+        .and_then(|n| n.parse::<u16>().ok())
+    {
+        Some(threshold) => {
+            let compiler = paludarium_jit_native::compiler_with(threshold, false)
+                .ok_or("PALUDARIUM_TEST_JIT: this host has no JIT")?;
+            Ok(session.with_compiler(compiler))
+        }
+        None => Ok(session),
+    }
+}
+
 /// Runs `program` under paludarium, placed at `/<file name>` like the
 /// command does. Returns the outcome and the stop that ended the
 /// guest when it died of an exception (for diagnostics).
@@ -193,17 +212,7 @@ pub fn run_emulated(
     argv.extend(args.iter().map(|a| a.as_bytes().to_vec()));
     let config = Config::new(guest_path.clone(), argv).with_file(guest_path, content);
     let host = Arc::new(RecordingHost::new());
-    let mut session = Session::new(config, host.clone()).map_err(|e| e.to_string())?;
-    // `PALUDARIUM_TEST_JIT=N` runs the guest with the native JIT, compiling
-    // the blocks run N times (1: every block, the first time it runs).
-    if let Some(threshold) = std::env::var("PALUDARIUM_TEST_JIT")
-        .ok()
-        .and_then(|n| n.parse::<u16>().ok())
-    {
-        let compiler = paludarium_jit_native::compiler_with(threshold, false)
-            .ok_or("PALUDARIUM_TEST_JIT: this host has no JIT")?;
-        session = session.with_compiler(compiler);
-    }
+    let session = with_test_jit(Session::new(config, host.clone()).map_err(|e| e.to_string())?)?;
     let session = Arc::new(session);
     let started = Instant::now();
     let runner = {

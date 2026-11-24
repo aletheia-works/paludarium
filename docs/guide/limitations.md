@@ -1043,8 +1043,7 @@ verified.
   Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
-  which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
-  `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
+  which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
 - **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give

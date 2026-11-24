@@ -1112,8 +1112,13 @@ kernel.
 - `userfaultfd` makes a file through which a thread handles the faults of
   others on memory it registered, as Linux's `fs/userfaultfd.c`. One that
   the kernel's own faults reach as well (without `UFFD_USER_MODE_ONLY`)
-  needs `CAP_SYS_PTRACE` (`EPERM`, as `vm.unprivileged_userfaultfd` is 0),
-  checked before the flags (`EINVAL`). The file is
+  needs `CAP_SYS_PTRACE` unless `vm.unprivileged_userfaultfd` is 1
+  (`EPERM`), checked before the flags (`EINVAL`). `/dev/userfaultfd`, a
+  misc device of root's of mode 0600 (`userfaultfd_misc`, whose minor
+  number Linux gives at boot), makes one with its only operation, the
+  ioctl `USERFAULTFD_IOC_NEW`, of the flags in the low 32 bits of its
+  argument and with no capability, as whoever may open the device may make
+  them; any other ioctl, `read` and `write` are `EINVAL`. The file is
   `anon_inode:[userfaultfd]`, open for reading, and belongs to the address
   space it was made in, whoever holds it. It is an anonymous inode of its
   own (`anon_inode_create_getfile`), as a fork's file a read hands over is:
@@ -4031,8 +4036,11 @@ kernel.
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
 
-- `/proc/sys/vm` has `drop_caches` alone, so its listing differs from
-  Linux's, which has the rest of the `vm` sysctls too. As Linux's
+- `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
+  its listing differs from Linux's, which has the rest of the `vm` sysctls
+  too. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
+  mode 0644, which only root opens to write, and takes 0 or 1
+  (`proc_dointvec_minmax`, else `EINVAL`). As Linux's
   `fs/drop_caches.c` has it, the file is root's, of mode 0200: no one may
   open it to read, root included (`EACCES`, as `test_perm` gives root the
   owner's bits), and only root may open it to write. A write takes one
@@ -4357,7 +4365,10 @@ kernel.
   `st_rdev` (1:3, 1:5, 1:7, 1:8, 1:9): `null` reads nothing, `zero` and
   `full` read zeros, `random` and `urandom` read the host's random bytes,
   and `full` refuses writes with `ENOSPC` while the others take them. A
-  mapping of `zero` is anonymous memory, shared with `MAP_SHARED`. `fd`,
+  mapping of `zero` is anonymous memory, shared with `MAP_SHARED`.
+  `userfaultfd` is root's misc device (10:122, mode 0600), which opens for
+  whoever its mode lets (`EACCES`) and makes `userfaultfd` contexts (see
+  `userfaultfd` above). `fd`,
   `stdin`, `stdout` and `stderr` are links (0777) to `/proc/self/fd` and its
   first three entries, followed by `open`, `stat` and paths through them
   (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, and with `O_PATH` opens

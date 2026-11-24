@@ -878,8 +878,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`UFFDIO_MOVE` の
   動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
-  ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
-  `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
+  ページテーブルをほかのときに解放したり残したりもします。
 - **dnotify の一部**：`/proc/sys/fs/dir-notify-enable` はないので、Linux の既定の 1 と
   同じく、dnotify はいつも使えます。
 - **ファイルのリース（まだできません）**：`fcntl` の `F_SETLEASE` と `F_GETLEASE` は

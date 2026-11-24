@@ -1000,9 +1000,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `userfaultfd` は、登録したメモリでほかのスレッドが起こすフォールトをスレッドが
   さばくためのファイルを、Linux の `fs/userfaultfd.c` と同じに作ります。カーネル自身の
-  フォールトも届くもの（`UFFD_USER_MODE_ONLY` なし）には `CAP_SYS_PTRACE` が要り
-  （`vm.unprivileged_userfaultfd` が 0 なので `EPERM`）、これはフラグ（`EINVAL`）より
-  先に確かめます。ファイルは読み出し用の `anon_inode:[userfaultfd]` で、誰が持っていても
+  フォールトも届くもの（`UFFD_USER_MODE_ONLY` なし）には、`vm.unprivileged_userfaultfd`
+  が 1 でなければ `CAP_SYS_PTRACE` が要り（`EPERM`）、これはフラグ（`EINVAL`）より
+  先に確かめます。root のモード 0600 の misc デバイス `/dev/userfaultfd`
+  （`userfaultfd_misc`。マイナー番号は Linux が起動時に決めます）は、ただ一つの操作である
+  ioctl `USERFAULTFD_IOC_NEW` で、引数の下位 32 ビットのフラグのものを、ケーパビリティ
+  なしで作ります。デバイスを開ける者は作れるからです。ほかの ioctl、`read`、`write` は
+  `EINVAL` です。ファイルは読み出し用の `anon_inode:[userfaultfd]` で、誰が持っていても
   作られたアドレス空間のものです。読み出しが渡すフォークのファイルと同じく、自分だけの無名
   inode です（`anon_inode_create_getfile`）。`fstat` は新しい inode 番号、ファイルの型のない
   モード 0600、作ったスレッドの `fsuid` と `fsgid` を返します。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
@@ -3489,8 +3493,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
 
-- `/proc/sys/vm` にあるのは `drop_caches` だけなので、ほかの `vm` の sysctl もある
-  Linux とは一覧が違います。Linux の `fs/drop_caches.c` と同じく、このファイルは root の
+- `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
+  ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は
+  マシンのもので、初めは 0、root のモード 0644 のファイルで、書くために開けるのは root
+  だけです。0 か 1 を受け付けます（`proc_dointvec_minmax`、ほかは `EINVAL`）。Linux の `fs/drop_caches.c` と同じく、このファイルは root の
   もので、モードは 0200 です。読むためには root でも開けず（`EACCES`。`test_perm` は root
   に持ち主のビットを与えます）、書くために開けるのは root だけです。書き込みは 1 から 4 の
   `int` を 1 つ受け取ります（`proc_dointvec_minmax`。ほかは `EINVAL`）。通った書き込みは、
@@ -3774,6 +3780,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   1:8、1:9）を持ちます。`null` は何も読めず、`zero` と `full` は 0 を、`random` と
   `urandom` はホストの乱数を読みます。`full` は書き込みを `ENOSPC` で拒み、ほかは
   受け取ります。`zero` のマッピングは無名のメモリで、`MAP_SHARED` なら共有です。
+  `userfaultfd` は root の misc デバイス（10:122、モード 0600）で、モードが許す者だけが
+  開け（`EACCES`）、`userfaultfd` のコンテキストを作ります（上の `userfaultfd` を参照）。
   `fd`、`stdin`、`stdout`、`stderr` は `/proc/self/fd` とその最初の 3 つへのリンク
   （0777）で、`open` や `stat`、それを通るパス（`/dev/fd/3`）はリンクをたどります。
   リンクに `O_NOFOLLOW` を付けると `ELOOP` で、`O_PATH` も付けると `/proc/self/fd` と

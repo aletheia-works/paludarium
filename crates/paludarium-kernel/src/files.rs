@@ -7414,6 +7414,24 @@ fn open_path(
                 flags,
                 Some(Arc::clone(c.shared_host)),
             )),
+            crate::devices::Entry::Userfaultfd if flags & O_DIRECTORY != 0 => {
+                return Err(Errno::ENOTDIR);
+            }
+            // `may_open`'s `inode_permission` for the access asked: the
+            // node is root's, of mode 0600.
+            crate::devices::Entry::Userfaultfd => {
+                let mask = match flags & 3 {
+                    0 => crate::permissions::MAY_READ,
+                    1 => crate::permissions::MAY_WRITE,
+                    _ => crate::permissions::MAY_READ | crate::permissions::MAY_WRITE,
+                };
+                crate::permissions::permission(
+                    &c.process.credentials,
+                    &crate::devices::stat(entry),
+                    mask,
+                )?;
+                Arc::new(crate::userfaultfd::Device::new(flags))
+            }
             crate::devices::Entry::Link(_) if flags & O_NOFOLLOW != 0 => {
                 return Err(Errno(40)); // ELOOP
             }

@@ -5891,7 +5891,23 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
-    while it is closed or listening).
+    while it is closed or listening). `SO_BINDTODEVICE` takes a device's
+    name, of at most 15 bytes (`ENODEV` for one there is not), none or an
+    empty one for no device, and `SO_BINDTOIFINDEX` an index (`EINVAL` for
+    a negative one, any other taken); without `CAP_NET_RAW` a socket bound
+    to a device stays so (`EPERM`, `sock_bindtoindex_locked`). Read back,
+    `SO_BINDTODEVICE` gives the name in room for a whole one (`EINVAL` for
+    less, `ENODEV` for an index of no device), nothing for none. Bound so,
+    a socket takes only what comes in on that device, or for one bound to
+    no device anything, one bound to it before one bound to none and
+    after a connected one (`compute_score`); a packet to the namespace's
+    own address comes in on `lo` for IPv4, or on the device the sender is
+    bound to, and on the address's device for IPv6. Its IPv4 packets go
+    by the routes through the device only, and where none goes, on link
+    through it; a group of 224.0.0.0/24 or the limited broadcast address
+    straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`
+    once it has gone, `ENETUNREACH` while it is down. A connection
+    accepted is bound as its listener.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
     as the room asks (`tcp_get_info`): a listener's state, connections
     waiting and backlog; a socket that has not connected, Linux's
@@ -5955,7 +5971,8 @@ one only with an `--allow-net`.
   `EADDRINUSE` for a port another socket holds on an address both cover (a
   listener's, a connection it accepted, a client's), unless both set
   `SO_REUSEADDR` and the other does not listen, or both set
-  `SO_REUSEPORT`. An IPv6 socket on `::` holds the port for IPv4 too,
+  `SO_REUSEPORT`, or the two are bound to other devices
+  (`inet_bind_conflict`, `udp_lib_lport_inuse`). An IPv6 socket on `::` holds the port for IPv4 too,
   unless `IPV6_V6ONLY`; binding to another IPv6 address that is not an
   IPv4 one sets `IPV6_V6ONLY`, as `__inet6_bind` does. A link-local
   address, or a group of the node or the link (which only a UDP socket

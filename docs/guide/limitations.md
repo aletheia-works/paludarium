@@ -1083,9 +1083,9 @@ verified.
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
-  gave. A socket's device steers only its IPv6 datagrams and connects,
-  and two sockets on one port conflict whatever their devices, where
-  Linux's on different devices do not. Neighbour discovery makes none of
+  gave. Bound to `lo`, an IPv4 socket's packet to an address no route
+  through `lo` takes is `ENETUNREACH`, where Linux sends it, on link, and
+  drops it. Neighbour discovery makes none of
   the neighbours of the groups router solicitation, MLD reports and
   duplicate address detection send to (`ff02::2`, `ff02::16`, the
   solicited-node ones), no advertisement unasked, and no redirect; the

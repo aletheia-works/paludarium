@@ -531,8 +531,9 @@ verified.
   `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
-  `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING` and
-  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the others give `EINVAL`). So no ring descriptor or personality can be
+  `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
+  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the
+  others give `EINVAL`). So no ring descriptor or personality can be
   registered, buffers cannot be updated, and buffers cannot be registered
   with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
   whole exit cancels the requests its threads submitted that wait for

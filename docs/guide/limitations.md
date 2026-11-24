@@ -1085,7 +1085,10 @@ verified.
   routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
   and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
   gateway's neighbour state does not steer a lookup, as Linux's
-  `rt6_check_neigh` does among routes of one metric. A UDP connect to a
+  `rt6_check_neigh` does among routes of one metric. An IPv6 packet's
+  answer comes back only through the end the packet went out through, so
+  that one a multipath route sends back through another end is lost,
+  where Linux's comes. A UDP connect to a
   group of the node or the
   link without a scope ID or a device is `EINVAL`, as Linux's is with no
   multicast interface, which none is here. A connection accepted from a
@@ -1175,9 +1178,7 @@ verified.
   Linux is built. A veth end whose MTU is below 1280 still has the files
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
-  A route goes through `lo` or a veth end, or rejects; of an IPv4
-  multipath route's next hops, a lookup takes the first not dead, where
-  Linux picks one by a hash of the flow (`fib_select_multipath`). An IPv4
+  A route goes through `lo` or a veth end, or rejects; an IPv4
   next hop through an IPv6 gateway (`RTA_VIA`), encapsulations, nexthop
   objects, realms, expiries, source prefixes, router preferences and the
   anycast, multicast and NAT kinds (and broadcast for IPv6) are

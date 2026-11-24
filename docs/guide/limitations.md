@@ -45,9 +45,10 @@ verified.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used. A
-  program's own segments and its interpreter's are named by the path it was
-  started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  program's own segments and its interpreter's are named by the path the
+  file had when it was started, with its symbolic links resolved and
+  `(deleted)` once nothing links it, but not after a rename, which Linux
+  follows. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
@@ -297,10 +298,10 @@ verified.
   counts it in `page-faults`; a context switch is a sleep of the thread,
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
   to another); and a thread without `rseq` moves to
-  another CPU only when a new CPU mask changes the lowest CPU it allows,
-  at once for its own `sched_setaffinity` and at its next system call for
-  another thread's, so that until then its events of one CPU count what it
-  does to the CPU it was on, where Linux has moved it already.
+  another CPU only when a new CPU mask changes the lowest CPU it allows.
+  When another thread's `sched_setaffinity` moves it, its faults count on
+  the new CPU at once, but the CPU time it runs until its next system call
+  counts to the old one, where Linux has moved it already.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where
   Linux takes each at its occurrence: they show the thread's address,
@@ -530,8 +531,9 @@ verified.
   `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
-  `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING` and
-  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the others give `EINVAL`). So no ring descriptor or personality can be
+  `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
+  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the
+  others give `EINVAL`). So no ring descriptor or personality can be
   registered, buffers cannot be updated, and buffers cannot be registered
   with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
   whole exit cancels the requests its threads submitted that wait for
@@ -548,9 +550,7 @@ verified.
   registered, where Linux's long-term pin refuses it (`EFAULT`), and a huge
   page charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where Linux
   charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`).
-  A `poll`, or a level-triggered `epoll`, that waits for room in a ring's
-  submission queue ends once there is room, where Linux's ring wakes only
-  what waits for its completions. The features are Linux
+  The features are Linux
   6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
   descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
   wait's `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
@@ -1045,9 +1045,12 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
-  `EINVAL`, where Linux takes a read or write lease and signals its holder
-  when another open or truncate breaks it.
+- **File leases, in part**: an open or a truncate that conflicts with a
+  lease does not break it yet, where Linux's `__break_lease` signals the
+  holder and makes the opener wait up to `/proc/sys/fs/lease-break-time`
+  seconds (or fail with `EWOULDBLOCK` under `O_NONBLOCK`), then takes the
+  lease away or makes it a read lease. Delegations (`F_GETDELEG` and
+  `F_SETDELEG`) are `EINVAL`.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes, as no file system here
   reports errors. Linux's ext4 reports them, and since 7.0 its XFS, Btrfs,
@@ -1170,10 +1173,12 @@ verified.
   Linux is built. A veth end whose MTU is below 1280 still has the files
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
-  A
-  route goes through `lo`, a veth end or rejects: IPv4 multipath
-  routes, encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
-  and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
+  A route goes through `lo` or a veth end, or rejects; of an IPv4
+  multipath route's next hops, a lookup takes the first not dead, where
+  Linux picks one by a hash of the flow (`fib_select_multipath`). An IPv4
+  next hop through an IPv6 gateway (`RTA_VIA`), encapsulations, nexthop
+  objects, realms, expiries, source prefixes, router preferences and the
+  anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
   namespace a connection or datagram to an address no local route has is
@@ -1279,7 +1284,7 @@ verified.
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
   With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
-  not have (an IPv4 multipath route, say, or a link of a kind) carries no
+  not have (an IPv4 next hop through `RTA_VIA`, say, or a link of a kind) carries no
   message, as Linux would take it; an IPv6 route replaced without
   `NLM_F_CREATE` that is not there is told of
   ("Can not replace route - no match found") only where its prefix has
@@ -1359,8 +1364,8 @@ verified.
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. Its `NT_FILE`
   note names a mapped file by the path it had when it was mapped, and the
-  program by the path it was started by, where Linux follows a rename and
-  resolves symbolic links.
+  program by the path it had when it was started (resolved, `(deleted)`
+  once removed), where Linux follows a rename.
 - **Memory limit**: a write beyond the limit ends the process that made it,
   where Linux's OOM killer picks the process using the most memory.
 - **The native JIT**: it is experimental and off unless `--jit` asks for it,
@@ -1400,6 +1405,12 @@ verified.
   quit, and waits up to 15 seconds for it to exit. A Safari already running,
   such as your own, is never asked. A Safari that does not quit is logged, not
   killed.
+- safaridriver exits at startup, with no message, if it starts while the
+  previous driver's helper process is still connected to `webinspectord`, or
+  while `webinspectord` is exiting after its last client left. So after
+  safaridriver stops, the test driver waits up to 15 seconds for that helper
+  and each `webinspectord` to exit. One that keeps running, such as a
+  `webinspectord` serving another client, is logged, not killed.
 
 ## Found a problem?
 

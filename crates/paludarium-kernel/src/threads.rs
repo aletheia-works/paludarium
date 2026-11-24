@@ -135,7 +135,7 @@ pub struct ThreadGroup {
     shm_creators: Mutex<BTreeMap<u32, Arc<crate::shm::Creator>>>,
     /// The path of the program the process runs, which `/proc/self/exe`
     /// names (Linux's `exe_file`).
-    executable: Mutex<Vec<u8>>,
+    executable: Mutex<crate::program_name::ProgramName>,
     /// The denial of writes to that program's file, which the process holds
     /// while it runs it, and a fork shares (Linux's `exe_file`, which
     /// `dup_mm_exe_file` denies again); none for a program of no regular
@@ -679,7 +679,12 @@ impl ThreadGroup {
             auxv: Mutex::new(self.auxv()),
             code: Mutex::new(self.code()),
             data: Mutex::new(self.data()),
-            executable: Mutex::new(self.executable()),
+            executable: Mutex::new(
+                self.executable
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
             first_namespaces: self.first_namespaces.clone(),
             exe_file: Mutex::new(
                 self.exe_file
@@ -1277,6 +1282,9 @@ impl ThreadGroup {
             .get(&tid)
             .cloned()
     }
+    /// `sched_setaffinity`'s new mask for thread `tid`: what the thread
+    /// counts from now is its new lowest CPU's ([`crate::Usage::moved_to`]),
+    /// though it looks the CPU up again only at its next account.
     pub(crate) fn set_affinity(&self, tid: u32, mask: Vec<u64>) {
         self.affinity
             .lock()
@@ -1284,6 +1292,9 @@ impl ThreadGroup {
             .insert(tid, mask);
         self.affinity_changes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(usage) = self.last_thread_usage(tid) {
+            usage.moved_to(self.lowest_cpu(tid));
+        }
     }
     /// Changes with every [`Self::set_affinity`].
     pub(crate) fn affinity_generation(&self) -> u64 {
@@ -1835,17 +1846,19 @@ impl ThreadGroup {
     pub(crate) fn set_exe_file(&self, denied: Option<Arc<crate::page_cache::WriteAccess>>) {
         *self.exe_file.lock().unwrap_or_else(PoisonError::into_inner) = denied;
     }
-    pub(crate) fn set_executable(&self, path: Vec<u8>) {
+    pub(crate) fn set_executable(&self, name: crate::program_name::ProgramName) {
         *self
             .executable
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = path;
+            .unwrap_or_else(PoisonError::into_inner) = name;
     }
+    /// The program's path, as `/proc/<pid>/exe` reads it now: marked
+    /// ` (deleted)` once nothing links its file.
     pub(crate) fn executable(&self) -> Vec<u8> {
         self.executable
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .get()
     }
     pub(crate) fn set_start_stack(&self, stack: u64) {
         self.start_stack.store(stack, Ordering::SeqCst);

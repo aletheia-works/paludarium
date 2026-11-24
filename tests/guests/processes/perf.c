@@ -563,6 +563,55 @@ static void per_cpu(void) {
         for (int cpu = 0; cpu < 2; cpu++) close(fds[i][cpu]);
 }
 
+/* What remote_move's mover needs: the thread to move, and the flag it sets
+   once it has. */
+struct mover {
+    pid_t tid;
+    volatile int go, moved;
+};
+
+static void *move_to_cpu_0(void *with) {
+    struct mover *m = with;
+    while (!m->go) sink++;
+    cpu_set_t zero;
+    CPU_ZERO(&zero);
+    CPU_SET(0, &zero);
+    sched_setaffinity(m->tid, sizeof zero, &zero);
+    m->moved = 1;
+    return NULL;
+}
+
+/* Another thread's sched_setaffinity moves a running thread before it
+   returns (__set_cpus_allowed_ptr): pinned to CPU 1, this thread spins
+   without a system call while another moves it to CPU 0, then writes
+   pages it mapped before, still without one; its page faults count on
+   CPU 0's event, none on CPU 1's. */
+static void remote_move(void) {
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(1, &one);
+    sched_setaffinity(0, sizeof one, &one);
+    int fds[2];
+    for (int cpu = 0; cpu < 2; cpu++) {
+        struct attr a = software(2);
+        fds[cpu] = (int)open_event(&a, 0, cpu, -1, 0);
+    }
+    char *pages = mmap(NULL, 8 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct mover m = {(pid_t)syscall(SYS_gettid), 0, 0};
+    pthread_t mover;
+    pthread_create(&mover, NULL, move_to_cpu_0, &m);
+    uint64_t before[2] = {count(fds[0]), count(fds[1])};
+    m.go = 1;
+    while (!m.moved) sink++;
+    for (int i = 0; i < 8; i++) pages[i * 4096] = 1;
+    uint64_t after[2] = {count(fds[0]), count(fds[1])};
+    pthread_join(mover, NULL);
+    say("remote move: faults on cpu 0 %d on cpu 1 %d", after[0] - before[0] >= 8, after[1] - before[1] == 0);
+    close(fds[0]);
+    close(fds[1]);
+    munmap(pages, 8 * 4096);
+}
+
 static int case_software(void) {
     int faults = open_software(2, 0), minor = open_software(5, 0), major = open_software(6, 0);
     int user_faults = open_software(2, EXCLUDE_KERNEL), kernel_faults = open_software(2, EXCLUDE_USER);
@@ -611,6 +660,7 @@ static int case_software(void) {
         for (int i = 0; i < 3; i++) usleep(1000);
         say("kept: migrations %d", count(migrations) - h == 0);
         per_cpu();
+        remote_move();
     } else {
         say("fewer than two cpus");
     }

@@ -7118,6 +7118,125 @@ static int context_switches_case(void) {
     fflush(stdout);
     _exit(0);
 }
+/* The exec-names case: a program's segments in /proc/self/maps are
+   named as /proc/self/exe names the program, as Linux's d_path of the
+   vm_file and of exe_file gives both: by the path with its symbolic links
+   resolved, and with " (deleted)" once nothing links the file, and a
+   core's NT_FILE note names it the same way. A copy of this program runs
+   through a symbolic link to it and looks. */
+static void en_maps_name(char *out, size_t size) {
+    out[0] = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return;
+    char line[4096];
+    /* The first line is the program's first segment. */
+    if (fgets(line, sizeof line, maps)) {
+        char *path = strchr(line, '/');
+        if (path) {
+            path[strcspn(path, "\n")] = 0;
+            snprintf(out, size, "%s", path);
+        }
+    }
+    fclose(maps);
+}
+static int exec_names_child(void) {
+    char exe[4096] = {0}, maps[4096];
+    if (readlink("/proc/self/exe", exe, sizeof exe - 1) < 0) return 70;
+    en_maps_name(maps, sizeof maps);
+    const char *base = strrchr(exe, '/');
+    printf("exe is the copy: %d\n", base && !strcmp(base, "/prog-copy"));
+    printf("maps names it so: %d\n", !strcmp(maps, exe));
+    char path[4096];
+    snprintf(path, sizeof path, "%s", exe);
+    if (unlink(path)) return 71;
+    char gone[4096] = {0};
+    if (readlink("/proc/self/exe", gone, sizeof gone - 1) < 0) return 72;
+    en_maps_name(maps, sizeof maps);
+    char marked[4200];
+    snprintf(marked, sizeof marked, "%s (deleted)", path);
+    printf("exe marked: %d\n", !strcmp(gone, marked));
+    printf("maps marked: %d\n", !strcmp(maps, marked));
+    /* A core names it so in its NT_FILE note too (fill_files_note's
+       file_path): a forked child dumps it, in the copy's directory. */
+    char *slash = strrchr(path, '/');
+    if (!slash) return 73;
+    *slash = 0;
+    if (chdir(path)) return 74;
+    struct rlimit r;
+    getrlimit(RLIMIT_CORE, &r);
+    r.rlim_cur = r.rlim_max;
+    setrlimit(RLIMIT_CORE, &r);
+    fflush(stdout);
+    pid_t dumper = fork();
+    if (dumper == 0) {
+        raise(SIGABRT);
+        _exit(75);
+    }
+    int status = 0;
+    waitpid(dumper, &status, 0);
+    int fd = open("core", O_RDONLY);
+    struct stat st;
+    unsigned char *core = NULL;
+    long size = 0, n;
+    if (fd >= 0 && fstat(fd, &st) == 0 && (core = malloc((size_t)st.st_size + 1)))
+        while (size < st.st_size && (n = read(fd, core + size, (size_t)(st.st_size - size))) > 0)
+            size += n;
+    if (fd >= 0) close(fd);
+    unlink("core");
+    core_bytes = core;
+    core_size = core ? (uint64_t)size : 0;
+    uint64_t files = 0;
+    for (int k = 0; core && size >= 64 && k < (int)le(56, 2); k++) {
+        uint64_t h = le(32, 8) + 56 * (uint64_t)k, offset = le(h + 8, 8), filesz = le(h + 32, 8);
+        if (le(h, 4) != 4) continue;
+        for (uint64_t q = offset; q + 12 <= offset + filesz && q + 12 <= core_size;) {
+            uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
+            uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
+            if (type == 0x46494c45 && !files) files = desc;
+            q = desc + ((descsz + 3) & ~3ULL);
+        }
+    }
+    uint64_t start, end, pgoff;
+    const char *named = file_entry(files, (uintptr_t)&exec_names_child, &start, &end, &pgoff);
+    printf("core dumped: %d names it so: %d\n", WCOREDUMP(status) ? 1 : 0,
+           named && !strcmp(named, marked));
+    free(core);
+    core_bytes = NULL;
+    core_size = 0;
+    fflush(stdout);
+    return 0;
+}
+static int exec_names_case(void) {
+    char dir[] = "/tmp/names-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char copy[64], link[64];
+    snprintf(copy, sizeof copy, "%s/prog-copy", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    int from = open("/proc/self/exe", O_RDONLY);
+    int to = open(copy, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    if (from < 0 || to < 0) return 81;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return 82;
+    close(from);
+    close(to);
+    if (symlink("prog-copy", link)) return 83;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char *argv[] = {link, "exec-names-child", link, NULL};
+        execv(link, argv);
+        _exit(84);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    unlink(link);
+    unlink(copy);
+    rmdir(dir);
+    return 0;
+}
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
    faults a task took (mm/memory.c mm_account_fault, current->min_flt),
    its own accesses' and those of get_user_pages for it: mlock's
@@ -9801,6 +9920,27 @@ static void *rp_helper_main(void *arg) {
     return NULL;
 }
 
+/* Submits the entries waiting in the ring after 100 ms, then writes the
+   pipe, if any. */
+struct rp_submitter {
+    struct uring *u;
+    unsigned n;
+    int fd;
+};
+
+static void *rp_submitter_main(void *arg) {
+    struct rp_submitter *h = arg;
+    pw_sleep_ms(100);
+    uring_enter(h->u->fd, h->n, 0, 0, NULL, 0);
+    if (h->fd >= 0 && write(h->fd, "w", 1) != 1) return NULL;
+    return NULL;
+}
+
+/* Fills the submission queue with NOPs from `data` on. */
+static void rp_full(struct uring *u, unsigned long data) {
+    for (unsigned i = 0; i < u->sq_entries; i++) tw_nop(u, data + i, 0, 0, 0);
+}
+
 static int io_uring_ring_poll_case(void) {
     struct uring u, defer;
     pthread_t t;
@@ -9878,6 +10018,46 @@ static int io_uring_ring_poll_case(void) {
     printf("read-poll: %d %x\n", r, (unsigned)p.revents);
     pthread_join(t, NULL);
     uring_reap(&u, "read-poll");
+
+    /* Only a completion wakes a wait on the ring, and only one for input:
+       a poll for room in a full queue sleeps through another thread's
+       submission, unless another file wakes it, which looks at the ring
+       again. A level-triggered epoll interest in output is never listed. */
+    struct rp_submitter sub = {&u, u.sq_entries, -1};
+    rp_full(&u, 70);
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    struct pollfd po = {u.fd, POLLOUT, 0};
+    struct timespec before, after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    r = poll(&po, 1, 500);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    long slept = (after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1000000;
+    /* Its last look, as its time runs out, finds the room. */
+    printf("room-poll: %d %x slept=%d\n", r, (unsigned)po.revents, slept >= 400);
+    pthread_join(t, NULL);
+    rp_poll(&u, "room-after");
+    uring_reap(&u, "room-poll");
+    rp_full(&u, 80);
+    sub.fd = a[1];
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    struct pollfd both[2] = {{u.fd, POLLOUT, 0}, {a[0], POLLIN, 0}};
+    r = poll(both, 2, 5000);
+    printf("room-pipe-poll: %d %x %x\n", r, (unsigned)both[0].revents, (unsigned)both[1].revents);
+    pthread_join(t, NULL);
+    printf("drain: %ld\n", (long)read(a[0], buf, sizeof buf));
+    uring_reap(&u, "room-pipe-poll");
+    int room = epoll_create1(0);
+    if (room < 0) return 83;
+    rp_full(&u, 90);
+    printf("room-add: %d\n", rp_add(room, u.fd, EPOLLOUT, 4));
+    sub.fd = -1;
+    pthread_create(&t, NULL, rp_submitter_main, &sub);
+    r = epoll_wait(room, &e, 1, 500);
+    printf("room-epoll: %d\n", r);
+    pthread_join(t, NULL);
+    rp_epoll(room, "room-epoll-after");
+    uring_reap(&u, "room-epoll");
+    close(room);
 
     /* A ring with IORING_SETUP_DEFER_TASKRUN is readable with task work. */
     if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 82;
@@ -11006,6 +11186,126 @@ static int mrelease_fatal_case(void) {
         kill(child, SIGKILL);
         if (waitpid(child, &status, 0) != child) return 85;
     }
+    return 0;
+}
+/* File leases (F_SETLEASE, F_GETLEASE), as fs/locks.c takes and gives
+ * them back. No open or truncate here meets a lease that it would break. */
+static int lease_errno(int fd, int arg) {
+    return fcntl(fd, F_SETLEASE, arg) < 0 ? -errno : 0;
+}
+static int file_leases_case(void) {
+    char dir[] = "/tmp/leases-XXXXXX";
+    if (!mkdtemp(dir)) return 1;
+    char path[64];
+    snprintf(path, sizeof path, "%s/f", dir);
+    int made = open(path, O_RDWR | O_CREAT, 0644);
+    if (made < 0 || write(made, "x", 1) != 1) return 2;
+    close(made);
+    /* Each call is its own statement: printf's arguments have no order. */
+    int rd = open(path, O_RDONLY);
+    int get = fcntl(rd, F_GETLEASE);
+    int unlck = lease_errno(rd, F_UNLCK);
+    int bad = lease_errno(rd, 5);
+    printf("none get=%d unlck=%d bad=%d\n", get, unlck, bad);
+    int owner_before = fcntl(rd, F_GETOWN);
+    int read_lease = lease_errno(rd, F_RDLCK);
+    get = fcntl(rd, F_GETLEASE);
+    int owner_self = fcntl(rd, F_GETOWN) == getpid();
+    printf("owner before=%d read=%d get=%d owner-self=%d\n", owner_before, read_lease, get, owner_self);
+    /* The only open: the lease becomes a write lease. */
+    int upgrade = lease_errno(rd, F_WRLCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("upgrade=%d get=%d\n", upgrade, get);
+    /* A dup shares the description, and its lease. */
+    int dup_rd = dup(rd);
+    int dup_get = fcntl(dup_rd, F_GETLEASE);
+    int dup_unlck = lease_errno(dup_rd, F_UNLCK);
+    get = fcntl(rd, F_GETLEASE);
+    int owner = fcntl(rd, F_GETOWN);
+    int sig = fcntl(rd, F_GETSIG);
+    int again = lease_errno(rd, F_UNLCK);
+    printf("dup get=%d unlck=%d get=%d owner=%d sig=%d again=%d\n", dup_get, dup_unlck, get, owner, sig, again);
+    /* No lease now: the opens below break none. Leases they refuse. */
+    if (fcntl(rd, F_GETLEASE) != F_UNLCK) return 5;
+    int rw = open(path, O_RDWR);
+    int rw_read = lease_errno(rw, F_RDLCK);
+    int rw_write = lease_errno(rw, F_WRLCK);
+    printf("rw read=%d write-beside-reader=%d\n", rw_read, rw_write);
+    printf("reader beside writer=%d\n", lease_errno(rd, F_RDLCK));
+    close(dup_rd);
+    close(rd);
+    int alone = lease_errno(rw, F_WRLCK);
+    get = fcntl(rw, F_GETLEASE);
+    unlck = lease_errno(rw, F_UNLCK);
+    printf("rw alone write=%d get=%d unlck=%d\n", alone, get, unlck);
+    close(rw);
+    /* A description's close gives its lease back. A read lease breaks
+       for no read-only open. */
+    int one = open(path, O_RDONLY);
+    printf("one read=%d\n", lease_errno(one, F_RDLCK));
+    int two = open(path, O_RDONLY);
+    int two_write = lease_errno(two, F_WRLCK);
+    int two_read = lease_errno(two, F_RDLCK);
+    printf("two write=%d read=%d\n", two_write, two_read);
+    printf("two unlck=%d\n", lease_errno(two, F_UNLCK));
+    close(one);
+    int after_write = lease_errno(two, F_WRLCK);
+    int after_unlck = lease_errno(two, F_UNLCK);
+    printf("after close write=%d unlck=%d\n", after_write, after_unlck);
+    close(two);
+    /* Files that take none. */
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    int dir_lease = lease_errno(d, F_RDLCK);
+    get = fcntl(d, F_GETLEASE);
+    printf("dir=%d get=%d\n", dir_lease, get);
+    close(d);
+    int pipes[2];
+    if (pipe(pipes)) return 3;
+    printf("pipe=%d\n", lease_errno(pipes[0], F_RDLCK));
+    close(pipes[0]);
+    close(pipes[1]);
+    int status = open("/proc/self/status", O_RDONLY);
+    printf("proc=%d\n", lease_errno(status, F_RDLCK));
+    close(status);
+    int path_only = open(path, O_PATH);
+    get = fcntl(path_only, F_GETLEASE);
+    int path_errno = errno;
+    printf("o_path get=%d errno=%d\n", get, path_errno);
+    close(path_only);
+    /* The sysctls, and another user's file. */
+    char buf[32] = {0};
+    int s = open("/proc/sys/fs/lease-break-time", O_RDONLY);
+    long n = s < 0 ? -errno : read(s, buf, sizeof buf - 1);
+    printf("lease-break-time=%ld %s", n, n > 0 ? buf : "\n");
+    if (s >= 0) close(s);
+    memset(buf, 0, sizeof buf);
+    s = open("/proc/sys/fs/leases-enable", O_RDWR);
+    n = s < 0 ? -errno : pread(s, buf, sizeof buf - 1, 0);
+    printf("leases-enable=%ld %s", n, n > 0 ? buf : "\n");
+    if (s >= 0) {
+        printf("disable=%ld\n", (long)pwrite(s, "0\n", 2, 0));
+        int off = open(path, O_RDONLY);
+        printf("disabled read=%d\n", lease_errno(off, F_RDLCK));
+        close(off);
+        printf("enable=%ld\n", (long)pwrite(s, "1\n", 2, 0));
+        close(s);
+    }
+    int theirs = open(path, O_RDONLY);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534)) _exit(4);
+        int other = lease_errno(theirs, F_RDLCK);
+        int other_get = fcntl(theirs, F_GETLEASE);
+        printf("other user=%d get=%d\n", other, other_get);
+        fflush(stdout);
+        _exit(0);
+    }
+    int wstatus;
+    waitpid(child, &wstatus, 0);
+    printf("child=%d\n", WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
+    close(theirs);
+    unlink(path);
+    rmdir(dir);
     return 0;
 }
 /* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
@@ -37576,6 +37876,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
+    if (!strcmp(mode, "file-leases")) return file_leases_case();
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
@@ -38127,6 +38428,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
     if (!strcmp(mode, "context-switches")) return context_switches_case();
+    if (!strcmp(mode, "exec-names")) return exec_names_case();
+    if (!strcmp(mode, "exec-names-child")) return exec_names_child();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();

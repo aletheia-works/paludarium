@@ -370,7 +370,7 @@ jobs:
           mkdir -p target/encodings-guests
           uname -a > target/encodings-guests/uname.txt
           lscpu > target/encodings-guests/cpu.txt
-      # diff_events, diff_threads and diff_files run the emulator's binary,
+      # diff_events and diff_threads run the emulator's binary,
       # target/debug/paludarium, as a program.
       - name: Build the emulator's binary
         run: cargo build --locked -p paludarium
@@ -425,10 +425,14 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      # diff_events and diff_threads run the emulator's binary, with --jit=1
+      # from PALUDARIUM_TEST_JIT.
+      - name: Build the emulator's binary
+        run: cargo build --locked -p paludarium
       - name: Differential tests, every block compiled the first time it runs
         env:
           PALUDARIUM_TEST_JIT: "1"
-        run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network -- --nocapture
+        run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network --test diff_events --test diff_threads --test diff_files -- --nocapture
 
   coverage:
     name: line coverage >= 80%

@@ -69,14 +69,15 @@ PALUDARIUM_TEST_NODE="${PALUDARIUM_TEST_NODE:-$(command -v node)}" cargo test --
 
 [tasks."test:diff"]
 description = "Differential tests against native Linux (x86-64 Linux only; elsewhere use `mise run linux-dev -- ...`)"
-# diff_events, diff_threads and diff_files run the emulator's binary, so it is
+# diff_events and diff_threads run the emulator's binary, so it is
 # built first. One command, which mise-tasks/linux-dev-compare.py reads.
 run = "cargo build --locked -p paludarium && cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network --test diff_events --test diff_threads --test diff_files -- --nocapture"
 
 [tasks."test:diff:jit"]
 description = "Differential tests with the native JIT compiling every block the first time it runs (x86-64 Linux only)"
 env = { PALUDARIUM_TEST_JIT = "1" }
-run = "cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network -- --nocapture"
+# diff_events and diff_threads run the emulator's binary, with --jit=1.
+run = "cargo build --locked -p paludarium && cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network --test diff_events --test diff_threads --test diff_files -- --nocapture"
 
 [tasks.deny]
 description = "cargo-deny: advisories, licenses, bans and sources"

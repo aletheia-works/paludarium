@@ -3676,6 +3676,11 @@ impl FileHandle for Ring {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
+    /// A ring wakes its waiters only as completions go in, for input
+    /// (`io_commit_cqring_flush` waking `ctx->poll_wq` with `EPOLLIN`).
+    fn keyed_wakeups(&self) -> bool {
+        true
+    }
     /// `io_uring_poll`: writable while the submission queue has room,
     /// readable while completions wait in the queue or the kernel, or an
     /// `IORING_SETUP_DEFER_TASKRUN` ring has task work. Only a completion

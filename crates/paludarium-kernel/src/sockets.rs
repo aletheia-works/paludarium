@@ -2440,9 +2440,9 @@ impl Drop for Charge {
 /// and the rest, in whole pages and at most `MAX_SKB_FRAGS` (17) of them,
 /// goes in page fragments.
 fn truesize(len: usize) -> usize {
-    const SKB: usize = 256;
+    use crate::skb::{SHARED_INFO, SKB};
     let pages = crate::bpf_prog::unix_paged(len);
-    let head = (len - pages).next_multiple_of(64) + crate::bpf_prog::SKB_SHARED_INFO;
+    let head = (len - pages).next_multiple_of(64) + SHARED_INFO;
     SKB + pages + head.next_power_of_two()
 }
 /// What a stream part of `len` bytes takes of its sender's send buffer, as
@@ -2451,10 +2451,7 @@ fn truesize(len: usize) -> usize {
 /// smallest power of two that holds it and the `skb_shared_info`, and the
 /// rest in page fragments, whole pages of them.
 fn stream_truesize(len: usize) -> usize {
-    const SKB: usize = 256;
-    const SHARED_INFO: usize = 320;
-    const PAGE: usize = 4096;
-    const MAX_HEAD: usize = PAGE - SHARED_INFO;
+    use crate::skb::{MAX_HEAD, PAGE, SHARED_INFO, SKB};
     let pages = len.min(len.saturating_sub(MAX_HEAD).next_multiple_of(PAGE));
     let head = (len - pages).next_multiple_of(64) + SHARED_INFO;
     SKB + head.next_power_of_two() + pages.next_multiple_of(PAGE)

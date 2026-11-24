@@ -50,6 +50,17 @@ pub trait FileHandle: Send + Sync {
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         Err(Errno::EPERM)
     }
+    /// Whether the generations [`Self::readiness`] gives are the file's
+    /// wake-ups, as Linux's keyed wake-ups are (`wake_up_poll`): the input
+    /// generation moves only as the file wakes its waiters for input
+    /// (`POLLIN`, `POLLPRI`, `POLLRDNORM`, `POLLRDBAND`), the output one only
+    /// for output, and both for `POLLERR` or `POLLHUP`. A wait for such a
+    /// file looks at it again only once a generation moved for what it waits
+    /// for (`pollwake`, `ep_poll_callback`). Without, any change anywhere
+    /// makes a wait look again.
+    fn keyed_wakeups(&self) -> bool {
+        false
+    }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
@@ -63,6 +74,12 @@ pub trait FileHandle: Send + Sync {
     /// itself (`fsnotify_file`), for a handle that knows where its file is
     /// now; false leaves it to the caller.
     fn notify_event(&self, _mask: u32) -> bool {
+        false
+    }
+    /// Whether a lease may be taken on this open file (`F_SETLEASE`), as a
+    /// file system with `setlease` lets one: the kernel's files of a mounted
+    /// file system and memfds, not pseudo files.
+    fn leasable(&self) -> bool {
         false
     }
     /// The flags of its open this description keeps among its status

@@ -558,13 +558,20 @@ OWN_WORKFLOWS = {
     "diff_macos": ".github/workflows/macos-quality.yml",
     "diff_jit": ".github/workflows/quality.yml",
 }
-# Where each of the others runs: mise's test:diff and the differential jobs
-# of ci.yml (every pull request) and quality.yml (nightly), each read up to
-# the next task or job.
+# Where each of the others runs, each list read up to the next task or job:
+# mise's test:diff and test:diff:jit, the differential and differential-jit
+# jobs of ci.yml (every pull request) and quality.yml's differential job
+# (nightly).
 DIFFERENTIAL_LISTS = (
-    ("mise.toml", r'(?ms)^\[tasks\."test:diff"\]\n(.*?)(?=^\[|\Z)'),
-    (".github/workflows/ci.yml", r"(?ms)^  differential:\n(.*?)(?=^  \S|\Z)"),
-    (".github/workflows/quality.yml", r"(?ms)^  differential:\n(.*?)(?=^  \S|\Z)"),
+    ("mise.toml", "test:diff", r'(?ms)^\[tasks\."test:diff"\]\n(.*?)(?=^\[|\Z)'),
+    ("mise.toml", "test:diff:jit", r'(?ms)^\[tasks\."test:diff:jit"\]\n(.*?)(?=^\[|\Z)'),
+    (".github/workflows/ci.yml", "differential", r"(?ms)^  differential:\n(.*?)(?=^  \S|\Z)"),
+    (
+        ".github/workflows/ci.yml",
+        "differential-jit",
+        r"(?ms)^  differential-jit:\n(.*?)(?=^  \S|\Z)",
+    ),
+    (".github/workflows/quality.yml", "differential", r"(?ms)^  differential:\n(.*?)(?=^  \S|\Z)"),
 )
 
 
@@ -573,13 +580,13 @@ def differential_gaps(tests, read):
     gaps = []
     for name in sorted(tests):
         if name in OWN_WORKFLOWS:
-            lists = [(OWN_WORKFLOWS[name], r"(?s)(.*)")]
+            lists = [(OWN_WORKFLOWS[name], "the workflow", r"(?s)(.*)")]
         else:
             lists = DIFFERENTIAL_LISTS
-        for path, part in lists:
+        for path, list_name, part in lists:
             found = re.search(part, read(path))
             if not found or not re.search(rf"--test {re.escape(name)}(?!\w)", found.group(1)):
-                gaps.append(f"{name} in {path}")
+                gaps.append(f"{name} in {path} ({list_name})")
     return gaps
 
 
@@ -596,15 +603,22 @@ def check_differential_lists():
     if gaps:
         raise AssertionError("differential tests no job runs: " + ", ".join(gaps))
     lists = {
-        "mise.toml": '[tasks."test:diff"]\nrun = "cargo test --test diff_a --test diff_ab"\n[tasks.x]\n',
-        ".github/workflows/ci.yml": "  differential:\n    run: cargo test --test diff_a\n  later:\n    --test diff_b\n",
+        "mise.toml": (
+            '[tasks."test:diff"]\nrun = "cargo test --test diff_a --test diff_ab"\n'
+            '[tasks."test:diff:jit"]\nrun = "cargo test --test diff_a --test diff_b"\n'
+        ),
+        ".github/workflows/ci.yml": (
+            "  differential:\n    run: cargo test --test diff_a\n"
+            "  differential-jit:\n    run: cargo test --test diff_a\n  later:\n    --test diff_b\n"
+        ),
         ".github/workflows/quality.yml": "  differential:\n    --test diff_a --test diff_b\n",
     }
     if differential_gaps({"diff_a"}, lists.__getitem__) != []:
         raise AssertionError("a test every list runs must pass")
     if differential_gaps({"diff_b"}, lists.__getitem__) != [
-        "diff_b in mise.toml",
-        "diff_b in .github/workflows/ci.yml",
+        "diff_b in mise.toml (test:diff)",
+        "diff_b in .github/workflows/ci.yml (differential)",
+        "diff_b in .github/workflows/ci.yml (differential-jit)",
     ]:
         raise AssertionError("a test missing from a list, or only in another job, must be refused")
 

@@ -89,6 +89,10 @@ pub(crate) const F_CREATE: u16 = 0x400;
 pub(crate) const F_APPEND: u16 = 0x800;
 /// `RTNH_F_DEAD` and `RTNH_F_LINKDOWN`, which no request may set.
 const NEXTHOP_DEAD: u32 = 0x1 | 0x10;
+/// `RTNH_F_DEAD` alone.
+const NEXTHOP_DEAD_ONLY: u32 = 0x1;
+/// `RTNH_F_LINKDOWN` alone.
+const NEXTHOP_LINKDOWN: u32 = 0x10;
 /// An IPv6 route's metric when its request names none
 /// (`IP6_RT_PRIO_USER`), and an address's prefix route's
 /// (`IP6_RT_PRIO_ADDRCONF`).
@@ -482,8 +486,36 @@ impl Kind {
         }
     }
 }
-/// An IPv4 route (a `fib_alias` and its `fib_info`).
+/// Whether `route`'s next hops are those a removal's `RTA_MULTIPATH`
+/// names, as `fib_nh_match` compares them: each in turn needs one of the
+/// request's (those left over count for nothing), of its device where
+/// that names one, of its gateway where that names one.
+fn multipath_matches4(route: &Route4, hops: &[NextHop4]) -> bool {
+    let own = route.next_hops();
+    own.len() <= hops.len()
+        && own.iter().zip(hops).all(|(nh, asked)| {
+            (asked.oif == 0 || asked.oif == nh.oif)
+                && asked.gateway.is_none_or(|g| nh.gateway == Some(g))
+        })
+}
+/// One next hop of an IPv4 multipath route (a `fib_nh`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hop4 {
+    pub gateway: Option<Ipv4Addr>,
+    pub oif: u32,
+    pub onlink: bool,
+    pub linkdown: bool,
+    /// `RTNH_F_DEAD`: its device went down (`fib_sync_down_dev`), which
+    /// lookups pass over.
+    pub dead: bool,
+    pub uses_gateway: bool,
+    /// `fib_nh_weight`: one past its `rtnh_hops`.
+    pub weight: u16,
+}
+/// An IPv4 route (a `fib_alias` and its `fib_info`). Its next hop's
+/// fields are its first's, or, as a lookup gives it, the one the lookup
+/// took; a multipath route has all of them in `hops`, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Route4 {
     pub table: u32,
     pub dst: Ipv4Addr,
@@ -511,6 +543,75 @@ pub(crate) struct Route4 {
     /// Its `fib_info`'s metrics, which tell two routes apart as
     /// `fib_find_info` does.
     pub metrics: Metrics,
+    /// Its next hop's weight (`fib_nh_weight`), as its other next hop
+    /// fields: of its one next hop, or a multipath route's first, which
+    /// `hops` has too, or in a lookup's answer of the hop it took; 1 but
+    /// for one of an `RTA_MULTIPATH` of one next hop, whose weight tells
+    /// it apart from another route (`nh_comp`).
+    pub weight: u16,
+    /// A multipath route's next hops, in order (`fib_nh`); none for one
+    /// of a single next hop.
+    pub hops: Vec<Hop4>,
+    /// A multipath route's `fib_flags`: the request's `rtm_flags`, with
+    /// `RTNH_F_LINKDOWN` and `RTNH_F_DEAD` as `fib_create_info`,
+    /// `fib_sync_down_dev` and `fib_sync_up` set them for the whole.
+    pub fib_flags: u32,
+}
+impl Route4 {
+    /// Its next hops: those of a multipath route, else its one.
+    pub(crate) fn next_hops(&self) -> Vec<Hop4> {
+        if self.hops.is_empty() {
+            vec![Hop4 {
+                gateway: self.gateway,
+                oif: self.oif,
+                onlink: self.onlink,
+                linkdown: self.linkdown,
+                dead: false,
+                uses_gateway: self.uses_gateway,
+                weight: self.weight,
+            }]
+        } else {
+            self.hops.clone()
+        }
+    }
+    /// It, its next hop's fields `hop`'s (`res->nh_sel`).
+    pub(crate) fn through(&self, hop: Hop4) -> Route4 {
+        Route4 {
+            gateway: hop.gateway,
+            oif: hop.oif,
+            onlink: hop.onlink,
+            linkdown: hop.linkdown,
+            uses_gateway: hop.uses_gateway,
+            weight: hop.weight,
+            ..self.clone()
+        }
+    }
+    /// Whether `other` is the same route, as `fib_find_info` and `nh_comp`
+    /// compare them: whatever their next hops' and its own
+    /// `RTNH_F_DEAD` and `RTNH_F_LINKDOWN` (`RTNH_COMPARE_MASK`).
+    fn same_info(&self, other: &Route4) -> bool {
+        let masked = |r: &Route4| Route4 {
+            linkdown: false,
+            fib_flags: r.fib_flags & !NEXTHOP_DEAD,
+            hops: r
+                .hops
+                .iter()
+                .map(|h| Hop4 {
+                    dead: false,
+                    linkdown: false,
+                    ..*h
+                })
+                .collect(),
+            ..r.clone()
+        };
+        masked(self) == masked(other)
+    }
+    /// Its next hop's fields back to its first's, once `hops` changed.
+    fn first_again(&mut self) {
+        if let Some(&first) = self.hops.first() {
+            *self = self.through(first);
+        }
+    }
 }
 impl Route4 {
     /// One of the kernel's routes for an address through the device of
@@ -543,6 +644,9 @@ impl Route4 {
             linkdown: false,
             uses_gateway: false,
             metrics: NO_METRICS,
+            weight: 1,
+            hops: Vec::new(),
+            fib_flags: 0,
         }
     }
     /// The same route of the table, whatever its preferred source.
@@ -1114,6 +1218,31 @@ pub(crate) struct Select4 {
     /// index of [`Metrics`] and its value, none for a request that names
     /// none; `None` where the request names one no route has.
     pub metrics: Option<Vec<(usize, u32)>>,
+    /// The next hops of its `RTA_MULTIPATH` (`fib_nh_match`), as a
+    /// request gives them: none where it has none.
+    pub multipath: Option<Vec<NextHop4>>,
+}
+/// A next hop of an IPv4 request's `RTA_MULTIPATH` (`struct rtnexthop`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NextHop4 {
+    /// Its `rtnh_flags`.
+    pub flags: u32,
+    /// One past its `rtnh_hops`.
+    pub weight: u16,
+    /// Its `rtnh_ifindex`, and whether the namespace has a device of it.
+    pub oif: u32,
+    pub device: bool,
+    /// Its `RTA_GATEWAY`.
+    pub gateway: Option<Ipv4Addr>,
+}
+/// An IPv4 request's `RTA_MULTIPATH` to add, as `fib_create_info` takes
+/// it: whether `fib_count_nexthops` found them all, then its next hops or
+/// the error reading them gave (`fib_get_nhs`), which come after the
+/// metrics'.
+#[derive(Clone, Debug)]
+pub(crate) struct Multipath4 {
+    pub counted: Result<(), Errno>,
+    pub hops: Result<Vec<NextHop4>, Errno>,
 }
 /// An IPv6 route a request adds or (each field 0 for any) removes.
 #[derive(Clone, Copy, Debug)]
@@ -1669,6 +1798,23 @@ impl Addresses {
     /// `NETDEV_UP`): the routes each of its addresses has then that are not
     /// there, in the addresses' order (`fib_add_ifaddr`).
     pub(crate) fn device_up4(&mut self, index: i32) -> Vec<Event> {
+        // `fib_sync_up` of `RTNH_F_DEAD`: the next hops through it live
+        // again, and are not down with its carrier.
+        let oif = index.unsigned_abs();
+        let carrier = !self.no_carrier.contains(&oif);
+        for route in self.routes4.iter_mut().filter(|r| !r.hops.is_empty()) {
+            for hop in route.hops.iter_mut().filter(|h| h.oif == oif && h.dead) {
+                hop.dead = false;
+                hop.linkdown = !carrier;
+            }
+            if route.hops.iter().any(|h| !h.dead) {
+                route.fib_flags &= !NEXTHOP_DEAD_ONLY;
+                if carrier {
+                    route.fib_flags &= !NEXTHOP_LINKDOWN;
+                }
+            }
+            route.first_again();
+        }
         let mut events = Vec::new();
         let addresses: Vec<V4> = self
             .v4
@@ -1694,12 +1840,34 @@ impl Addresses {
         if !carrier {
             self.no_carrier.push(oif);
         }
-        for route in self
-            .routes4
-            .iter_mut()
-            .filter(|r| r.oif == oif && r.scope != SCOPE_HOST)
-        {
-            route.linkdown = !carrier;
+        for route in &mut self.routes4 {
+            if route.hops.is_empty() {
+                if route.oif == oif && route.scope != SCOPE_HOST {
+                    route.linkdown = !carrier;
+                }
+                continue;
+            }
+            // A multipath route's next hops through it, and the route
+            // as a whole: down where those through it and those dead are
+            // all of them (`fib_sync_down_dev` for `NETDEV_CHANGE`), up
+            // where one is up (`fib_sync_up`).
+            let mut counted = 0;
+            for hop in &mut route.hops {
+                if hop.dead {
+                    counted += 1;
+                } else if hop.oif == oif {
+                    hop.linkdown = !carrier;
+                    counted += 1;
+                }
+            }
+            let all = counted == route.hops.len();
+            if !carrier && all {
+                route.fib_flags |= NEXTHOP_LINKDOWN;
+            }
+            if carrier && route.hops.iter().any(|h| !h.linkdown) {
+                route.fib_flags &= !NEXTHOP_LINKDOWN;
+            }
+            route.first_again();
         }
         for route in self
             .routes6
@@ -1722,7 +1890,7 @@ impl Addresses {
             events.extend(self.remove_v4(first));
         }
         let oif = index.unsigned_abs();
-        self.routes4.retain(|r| r.oif != oif);
+        self.sync_down4(oif, true);
         self.no_carrier.retain(|&o| o != oif);
         (events, self.seen)
     }
@@ -1730,9 +1898,37 @@ impl Addresses {
     /// its routes but those of host scope go, without a word
     /// (`fib_sync_down_dev`, `fib_flush`).
     pub(crate) fn device_down4(&mut self, index: i32) {
-        let oif = index.unsigned_abs();
-        self.routes4
-            .retain(|r| !(r.oif == oif && r.scope != SCOPE_HOST));
+        self.sync_down4(index.unsigned_abs(), false);
+    }
+    /// `fib_sync_down_dev` for the device `oif` going down, or away
+    /// (`gone`): each next hop through it turns `RTNH_F_DEAD` and
+    /// `RTNH_F_LINKDOWN`, but a route of host scope's while it only goes
+    /// down; a route whose next hops are all dead goes (`fib_flush`), as
+    /// one through it does as it goes away.
+    fn sync_down4(&mut self, oif: u32, gone: bool) {
+        let mut kept = Vec::new();
+        for mut route in core::mem::take(&mut self.routes4) {
+            let mut hops = route.next_hops();
+            let mut dead = 0;
+            for hop in &mut hops {
+                if hop.dead {
+                    dead += 1;
+                } else if hop.oif == oif && (gone || route.scope != SCOPE_HOST) {
+                    hop.dead = true;
+                    hop.linkdown = true;
+                    dead += 1;
+                }
+            }
+            if dead == hops.len() || (gone && hops.iter().any(|h| h.oif == oif)) {
+                continue;
+            }
+            if !route.hops.is_empty() {
+                route.hops = hops;
+                route.first_again();
+            }
+            kept.push(route);
+        }
+        self.routes4 = kept;
     }
     /// IPv6's part of [`Self::up`], as `addrconf_notify` does it for
     /// `NETDEV_UP`: the prefix route of each permanent address
@@ -2049,7 +2245,7 @@ impl Addresses {
             self.kernel_add4(
                 Route4 {
                     priority: new.priority,
-                    ..route
+                    ..route.clone()
                 },
                 &mut events,
             );
@@ -2113,14 +2309,17 @@ impl Addresses {
             let candidates = self.candidates(&address, true);
             let (local, rest) = candidates
                 .split_first()
-                .map_or((None, &[][..]), |(l, r)| (Some(*l), r));
+                .map_or((None, &[][..]), |(l, r)| (Some(l.clone()), r));
             // The prefix route is local on `lo`, unicast elsewhere.
             let mut order: Vec<Route4> = rest
                 .iter()
                 .filter(|r| r.kind != Kind::Broadcast)
-                .map(|r| Route4 { priority: 0, ..*r })
+                .map(|r| Route4 {
+                    priority: 0,
+                    ..r.clone()
+                })
                 .collect();
-            order.extend(rest.iter().filter(|r| r.kind == Kind::Broadcast));
+            order.extend(rest.iter().filter(|r| r.kind == Kind::Broadcast).cloned());
             order.extend(local);
             if let Some(i) = self.v4.iter().position(|a| *a == address) {
                 self.v4.remove(i);
@@ -2529,7 +2728,7 @@ impl Addresses {
             let run = (first..end)
                 .find(|&i| !alike(&self.routes4[i]))
                 .unwrap_or(end);
-            let matched = (first..run).find(|&i| self.routes4[i] == new);
+            let matched = (first..run).find(|&i| self.routes4[i].same_info(&new));
             if flags & F_REPLACE != 0 {
                 return match matched {
                     Some(i) if i == first => Ok(None),
@@ -2659,7 +2858,7 @@ impl Addresses {
     fn kernel_add4(&mut self, mut route: Route4, events: &mut Vec<Event>) {
         route.linkdown = route.scope != SCOPE_HOST && self.no_carrier.contains(&route.oif);
         self.create4(route.table);
-        if let Ok(Some(flags)) = self.insert4(route, F_CREATE | F_APPEND) {
+        if let Ok(Some(flags)) = self.insert4(route.clone(), F_CREATE | F_APPEND) {
             events.push(Event::NewRoute4(route, flags));
         }
     }
@@ -2720,19 +2919,41 @@ impl Addresses {
     /// route through a veth end without its carrier is `RTNH_F_LINKDOWN`.
     /// Anycast, multicast and NAT routes are `EOPNOTSUPP`. The metrics'
     /// error comes after the scope's, as `fib_create_info` makes them.
+    #[cfg(test)]
     pub(crate) fn add_route4(
         &mut self,
         ask: &Ask4,
         up: &dyn Fn(u32) -> bool,
     ) -> Result<Vec<Event>, Errno> {
-        let added = self.insert_route4(ask, up);
+        self.add_multipath4(ask, None, up)
+    }
+    /// [`Self::add_route4`], with the next hops of an `RTA_MULTIPATH`
+    /// (`fib_get_nhs`): `EINVAL` for none, data after them, a hop
+    /// `RTNH_F_DEAD` or `RTNH_F_LINKDOWN`, a first hop not of the
+    /// request's `RTA_OIF` or `RTA_GATEWAY`, a kind that rejects, and
+    /// more than one of host scope; each is checked as a route's next hop
+    /// (`fib_check_nh`), of its own device, gateway and flags, with the
+    /// request's flags past its first byte; and it is `RTNH_F_LINKDOWN`
+    /// as a whole where each is.
+    pub(crate) fn add_multipath4(
+        &mut self,
+        ask: &Ask4,
+        multipath: Option<&Multipath4>,
+        up: &dyn Fn(u32) -> bool,
+    ) -> Result<Vec<Event>, Errno> {
+        let added = self.insert_route4(ask, multipath, up);
         if added.is_ok() && ask.kind == Kind::Local.code() {
             self.custom_local4 = true;
         }
         added
     }
     /// [`Self::add_route4`], but for what it marks.
-    fn insert_route4(&mut self, ask: &Ask4, up: &dyn Fn(u32) -> bool) -> Result<Vec<Event>, Errno> {
+    fn insert_route4(
+        &mut self,
+        ask: &Ask4,
+        multipath: Option<&Multipath4>,
+        up: &dyn Fn(u32) -> bool,
+    ) -> Result<Vec<Event>, Errno> {
         let table = if ask.table == 0 {
             TABLE_MAIN
         } else {
@@ -2756,7 +2977,47 @@ impl Addresses {
                 "Invalid rtm_flags - can not contain DEAD or LINKDOWN",
             ));
         }
+        if let Some(multipath) = multipath {
+            multipath.counted?;
+        }
         let metrics = ask.metrics.map_err(extack::raise)?;
+        // Each next hop a request of its own (`fib_get_nhs`).
+        let nexthops: Vec<(Ask4, u16)> = match multipath {
+            None => vec![(*ask, 1)],
+            Some(multipath) => {
+                let hops = multipath.hops.clone()?;
+                let asks: Vec<(Ask4, u16)> = hops
+                    .iter()
+                    .map(|hop| {
+                        (
+                            Ask4 {
+                                gateway: hop.gateway,
+                                oif: hop.oif,
+                                device: hop.device,
+                                flags: (ask.flags & !0xff) | hop.flags,
+                                ..*ask
+                            },
+                            hop.weight,
+                        )
+                    })
+                    .collect();
+                if let Some((first, _)) = asks.first() {
+                    if ask.oif != 0 && first.oif != ask.oif {
+                        return Err(extack::message(
+                            Errno::EINVAL,
+                            "Nexthop device index does not match RTA_OIF",
+                        ));
+                    }
+                    if ask.gateway.is_some() && first.gateway != ask.gateway {
+                        return Err(extack::message(
+                            Errno::EINVAL,
+                            "Nexthop gateway does not match RTA_GATEWAY or RTA_VIA",
+                        ));
+                    }
+                }
+                asks
+            }
+        };
         let kind = Kind::of(ask.kind).ok_or_else(|| {
             if matches!(ask.kind, 4 | 5 | 10 | 11) {
                 EOPNOTSUPP
@@ -2764,7 +3025,8 @@ impl Addresses {
                 extack::message(Errno::EINVAL, "Invalid route type")
             }
         })?;
-        let onlink = ask.flags & 4 != 0;
+        let (first, weight) = nexthops[0];
+        let onlink = first.flags & 4 != 0;
         let mut route = Route4 {
             table,
             dst: ask.dst,
@@ -2775,15 +3037,18 @@ impl Addresses {
             proto: ask.proto,
             scope: ask.scope,
             prefsrc: ask.prefsrc,
-            gateway: ask.gateway,
-            oif: ask.oif,
+            gateway: first.gateway,
+            oif: first.oif,
             onlink,
             linkdown: false,
             uses_gateway: false,
             metrics,
+            weight,
+            hops: Vec::new(),
+            fib_flags: 0,
         };
         if kind.error().is_some() {
-            if ask.gateway.is_some() || ask.oif != 0 {
+            if ask.gateway.is_some() || ask.oif != 0 || multipath.is_some() {
                 return Err(extack::message(
                     Errno::EINVAL,
                     "Gateway, device and multipath can not be specified for this route type",
@@ -2793,20 +3058,70 @@ impl Addresses {
         } else if ask.scope > SCOPE_HOST {
             return Err(extack::message(Errno::EINVAL, "Invalid scope"));
         } else if ask.scope == SCOPE_HOST {
-            if ask.gateway.is_some() {
+            if nexthops.len() != 1 {
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "Route with host scope can not have multiple nexthops",
+                ));
+            }
+            if first.gateway.is_some() {
                 return Err(extack::message(
                     Errno::EINVAL,
                     "Route with host scope can not have a gateway",
                 ));
             }
-            if !ask.device {
+            if !first.device {
                 return Err(Errno::ENODEV);
             }
-        } else if let Some(gateway) = ask.gateway {
+        } else {
+            let mut hops = Vec::new();
+            for (hop, weight) in &nexthops {
+                hops.push(Hop4 {
+                    weight: *weight,
+                    ..self.check_nh4(hop, table, up)?
+                });
+            }
+            if hops.len() > 1 {
+                route.fib_flags = ask.flags;
+                if hops.iter().all(|h| h.linkdown) {
+                    route.fib_flags |= NEXTHOP_LINKDOWN;
+                }
+                route.hops = hops;
+                route.first_again();
+            } else {
+                route = route.through(hops[0]);
+            }
+        }
+        if let Some(source) = ask.prefsrc
+            && !self.valid_prefsrc4(source, &route)
+        {
+            return Err(extack::message(Errno::EINVAL, "Invalid prefsrc address"));
+        }
+        Ok(self
+            .insert4(route.clone(), ask.request)?
+            .map(|flags| Event::NewRoute4(route, flags))
+            .into_iter()
+            .collect())
+    }
+    /// A next hop `ask` names, checked as `fib_check_nh` does: through
+    /// its gateway ([`Self::gateway4`]); else `EINVAL` on link, `ENODEV`
+    /// for no device, `ENETDOWN` while it is down, and `RTNH_F_LINKDOWN`
+    /// without its carrier (`fib_check_nh_nongw`).
+    fn check_nh4(&self, ask: &Ask4, table: u32, up: &dyn Fn(u32) -> bool) -> Result<Hop4, Errno> {
+        let onlink = ask.flags & 4 != 0;
+        let mut hop = Hop4 {
+            gateway: ask.gateway,
+            oif: ask.oif,
+            onlink,
+            linkdown: false,
+            dead: false,
+            uses_gateway: false,
+            weight: 1,
+        };
+        if let Some(gateway) = ask.gateway {
             let (oif, uses_gateway) = self.gateway4(gateway, ask, table, up)?;
-            route.oif = oif;
-            route.uses_gateway = uses_gateway;
-            route.linkdown = self.no_carrier.contains(&oif);
+            hop.oif = oif;
+            hop.uses_gateway = uses_gateway;
         } else if onlink {
             return Err(extack::message(
                 Errno::EINVAL,
@@ -2816,20 +3131,9 @@ impl Addresses {
             return Err(Errno::ENODEV);
         } else if !up(ask.oif) {
             return Err(extack::message(ENETDOWN, "Device for nexthop is not up"));
-        } else {
-            // `fib_check_nh_nongw`.
-            route.linkdown = self.no_carrier.contains(&route.oif);
         }
-        if let Some(source) = ask.prefsrc
-            && !self.valid_prefsrc4(source, &route)
-        {
-            return Err(extack::message(Errno::EINVAL, "Invalid prefsrc address"));
-        }
-        Ok(self
-            .insert4(route, ask.request)?
-            .map(|flags| Event::NewRoute4(route, flags))
-            .into_iter()
-            .collect())
+        hop.linkdown = self.no_carrier.contains(&hop.oif);
+        Ok(hop)
     }
     /// Checks a gateway as `fib_check_nh_v4_gw`: on link, through the
     /// device the route names, up, for a route wider than link scope, it
@@ -2914,7 +3218,9 @@ impl Addresses {
         self.addr_type4(source, table) == Kind::Local
             || (table != TABLE_LOCAL && self.addr_type4(source, TABLE_LOCAL) == Kind::Local)
     }
-    /// Removes the IPv4 route `select` names, as `fib_table_delete`:
+    /// Removes the IPv4 route `select` names, as `fib_table_delete`; a
+    /// device or gateway it names is its first next hop's, else its
+    /// `RTA_MULTIPATH`'s next hops are its own ([`multipath_matches4`]):
     /// `EINVAL` for a prefix past 32 or with bits past its length, then
     /// `ESRCH` for a table there is not, or no such route. A route must have
     /// the metrics `select` names (`fib_metrics_match`).
@@ -2946,6 +3252,12 @@ impl Addresses {
                     && (select.proto == 0 || r.proto == select.proto)
                     && (select.oif == 0 || r.oif == select.oif)
                     && select.gateway.is_none_or(|g| r.gateway == Some(g))
+                    && (select.oif != 0
+                        || select.gateway.is_some()
+                        || select
+                            .multipath
+                            .as_ref()
+                            .is_none_or(|hops| multipath_matches4(r, hops)))
                     && select
                         .metrics
                         .as_ref()
@@ -3289,7 +3601,7 @@ impl Addresses {
     pub(crate) fn dump4(&self) -> Vec<Route4> {
         table_order(&self.tables4)
             .into_iter()
-            .flat_map(|t| self.routes4.iter().filter(move |r| r.table == t).copied())
+            .flat_map(|t| self.routes4.iter().filter(move |r| r.table == t).cloned())
             .collect()
     }
     /// The IPv6 routes, as a dump gives them: table by table, each in the
@@ -3382,10 +3694,21 @@ impl Addresses {
                 if let Some(e) = r.kind.error() {
                     return Err(e);
                 }
-                if oif != 0 && r.oif != oif {
-                    continue;
+                if r.hops.is_empty() {
+                    if oif != 0 && r.oif != oif {
+                        continue;
+                    }
+                    return Ok(r.clone());
                 }
-                return Ok(*r);
+                // `fib_lookup_good_nhc`: the first next hop not dead,
+                // through `oif` where one is named.
+                if let Some(&hop) = r
+                    .hops
+                    .iter()
+                    .find(|h| !h.dead && (oif == 0 || h.oif == oif))
+                {
+                    return Ok(r.through(hop));
+                }
             }
         }
         Err(Errno::EAGAIN)
@@ -4247,9 +4570,10 @@ mod tests {
             gateway: None,
             oif: 0,
             metrics: Some(Vec::new()),
+            multipath: None,
         };
         let gone = a.del_route4(&select).unwrap();
-        assert!(matches!(gone[..], [Event::DelRoute4(r)] if r.scope == SCOPE_HOST));
+        assert!(matches!(&gone[..], [Event::DelRoute4(r)] if r.scope == SCOPE_HOST));
         // A blackhole is EINVAL to a lookup, a throw route goes on to the
         // default table, and the longest prefix wins across the tables.
         a.add_route4(&ask4("10.6.0.0", 16, 6, 0x600), &|_| true)
@@ -4557,6 +4881,98 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_multipath_routes_keep_their_hops_and_lose_them_with_their_devices() {
+        let mut a = Addresses::isolated();
+        for (ip, index) in [("10.0.0.1", 1000), ("10.1.0.1", 1001)] {
+            let end = V4 {
+                index,
+                ..v4(ip, 24)
+            };
+            a.add_v4(end, Lifetimes::FOREVER, false, true, 0).unwrap();
+        }
+        let hop = |via: &str, oif, weight| NextHop4 {
+            flags: 0,
+            weight,
+            oif,
+            device: true,
+            gateway: Some(via.parse().unwrap()),
+        };
+        let both = Multipath4 {
+            counted: Ok(()),
+            hops: Ok(vec![hop("10.0.0.2", 1000, 1), hop("10.1.0.2", 1001, 3)]),
+        };
+        let ask = Ask4 {
+            scope: SCOPE_UNIVERSE,
+            oif: 0,
+            device: false,
+            ..ask4("10.2.0.0", 24, 1, 0x600)
+        };
+        let up = |_: u32| true;
+        let events = a.add_multipath4(&ask, Some(&both), &up).unwrap();
+        let [Event::NewRoute4(route, _)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(route.hops.len(), 2);
+        assert_eq!((route.oif, route.hops[1].weight), (1000, 3));
+        // The same again is there; one naming another device first is not.
+        assert_eq!(
+            a.add_multipath4(&ask, Some(&both), &up).map(|_| ()),
+            Err(Errno::EEXIST)
+        );
+        let wrong = Ask4 { oif: 1001, ..ask };
+        assert_eq!(
+            a.add_multipath4(&wrong, Some(&both), &up).map(|_| ()),
+            Err(Errno::EINVAL)
+        );
+        // Its hops down one after the other, it is not down as a whole,
+        // and is still the same route as one asked for now, which is.
+        a.set_carrier(1000, false);
+        a.set_carrier(1001, false);
+        assert_eq!(
+            a.add_multipath4(&ask, Some(&both), &up).map(|_| ()),
+            Err(Errno::EEXIST)
+        );
+        a.set_carrier(1000, true);
+        a.set_carrier(1001, true);
+        let host = Ask4 {
+            scope: SCOPE_HOST,
+            ..ask
+        };
+        assert_eq!(
+            a.add_multipath4(&host, Some(&both), &up).map(|_| ()),
+            Err(Errno::EINVAL)
+        );
+        // A hop's device down leaves it dead, which lookups pass over.
+        a.device_down4(1001);
+        let route = a.lookup4("10.2.0.9".parse().unwrap()).unwrap();
+        assert_eq!(route.oif, 1000);
+        a.device_down4(1000);
+        assert!(a.lookup4("10.2.0.9".parse().unwrap()).is_err());
+        // A removal names each hop in turn.
+        a.device_up4(1000);
+        a.device_up4(1001);
+        a.add_multipath4(&ask, Some(&both), &up).unwrap();
+        let select = |hops: Vec<NextHop4>| Select4 {
+            table: TABLE_MAIN,
+            dst: "10.2.0.0".parse().unwrap(),
+            len: 24,
+            tos: 0,
+            priority: 0,
+            kind: 0,
+            proto: 0,
+            scope: SCOPE_NOWHERE,
+            prefsrc: None,
+            gateway: None,
+            oif: 0,
+            metrics: Some(Vec::new()),
+            multipath: Some(hops),
+        };
+        let backwards = select(vec![hop("10.1.0.2", 1001, 1), hop("10.0.0.2", 1000, 1)]);
+        assert_eq!(a.del_route4(&backwards).map(|_| ()), Err(ESRCH));
+        let forwards = select(vec![hop("10.0.0.2", 1000, 1), hop("10.1.0.2", 0, 1)]);
+        assert!(a.del_route4(&forwards).is_ok());
+    }
+    #[test]
     fn ipv4_gateways_take_the_device_their_route_goes_through() {
         let mut a = Addresses::isolated();
         let mut end = V4 {
@@ -4594,14 +5010,14 @@ mod tests {
         // On link through the device it names; else through the device
         // of its route, whose packets go to the gateway.
         let events = a.add_route4(&ask("10.7.0.1", 1000, true), &up).unwrap();
-        assert!(matches!(events[..], [Event::NewRoute4(r, _)] if r.oif == 1000 && r.uses_gateway));
+        assert!(matches!(&events[..], [Event::NewRoute4(r, _)] if r.oif == 1000 && r.uses_gateway));
         let events = a.add_route4(&ask("10.0.0.2", 0, false), &up);
         assert_eq!(events, Err(Errno::EEXIST));
         let mut other = ask("10.0.0.2", 0, false);
         other.dst = "10.6.0.0".parse().unwrap();
         let events = a.add_route4(&other, &up).unwrap();
         assert!(matches!(
-            events[..],
+            &events[..],
             [Event::NewRoute4(r, _)] if r.oif == 1000 && r.uses_gateway && !r.linkdown
         ));
         // A gateway's route does not reach another gateway.

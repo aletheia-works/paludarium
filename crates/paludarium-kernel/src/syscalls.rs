@@ -1966,7 +1966,12 @@ fn poll_until(
     nfds: u64,
     deadline: Option<u64>,
 ) -> Result<u64, Errno> {
-    let result = wait_ready(c, deadline, |c| poll_once(c, fds, nfds));
+    let result = wait_ready(
+        c,
+        deadline,
+        |c| poll_once(c, fds, nfds),
+        |c| poll_keys(c, fds, nfds),
+    );
     if result == Err(Errno(4))
         && let Some(deadline) = deadline
     {
@@ -2002,23 +2007,120 @@ fn sys_restart_syscall(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
 
 /// Runs `check` until it finds something ready or `deadline` passes, waiting
 /// for readiness changes in between; EINTR when a signal can be delivered.
+///
+/// When some file it waits for has keyed wake-ups (`keys`: the events each
+/// file waits for, its descriptor, and the generations of a keyed one,
+/// [`wake_key`]), a change looks at them all again only if it woke one of
+/// them: a keyed file whose generation moved for what it waits for, as
+/// Linux's `pollwake` filters a wake-up by its key, or another that is now
+/// ready. Then it looks at all of them (`do_poll`). Without a keyed file,
+/// every change makes it look.
 fn wait_ready(
     c: &mut Context<'_>,
     deadline: Option<u64>,
     mut check: impl FnMut(&mut Context<'_>) -> Result<u64, Errno>,
+    mut keys: impl FnMut(&mut Context<'_>) -> Option<Vec<Watched>>,
 ) -> Result<u64, Errno> {
+    let mut asleep: Option<Vec<Watched>> = None;
     loop {
-        // Sample the ticket before inspecting readiness, so no change is lost.
+        // Sample the ticket and the generations before inspecting readiness,
+        // so no change is lost.
         let ticket = c.files.readiness.token.value();
-        let ready = check(c)?;
-        if ready != 0
-            || deadline
-                .is_some_and(|end| c.host.clock(ClockId::Monotonic).is_ok_and(|now| now >= end))
-        {
-            return Ok(ready);
+        let now = keys(c);
+        let quiet = match (&asleep, &now) {
+            (Some(before), Some(now))
+                if before.len() == now.len() && now.iter().any(|w| w.2.is_some()) =>
+            {
+                !before
+                    .iter()
+                    .zip(now)
+                    .any(
+                        |(&(events, fd, before), &(_, _, now))| match (before, now) {
+                            (Some(before), Some(now)) => woke(events, before, now),
+                            _ => revents(c, fd, events as u16) != 0,
+                        },
+                    )
+            }
+            _ => false,
+        };
+        let past = |c: &Context<'_>| {
+            deadline.is_some_and(|end| c.host.clock(ClockId::Monotonic).is_ok_and(|now| now >= end))
+        };
+        // Once its time is out it looks at all of them a last time, as
+        // `do_poll` and `do_select` do before they give up.
+        if !quiet || past(c) {
+            let ready = check(c)?;
+            if ready != 0 || past(c) {
+                return Ok(ready);
+            }
+            asleep = now;
         }
         crate::events::wait(c, ticket, deadline)?;
     }
+}
+
+/// A file a wait waits for: the events, the descriptor, and the
+/// generations of a file with keyed wake-ups ([`wake_key`]).
+type Watched = (u32, i32, Option<(u64, u64)>);
+
+/// The events that wake a wait for input, and for output.
+const INPUT_KEYS: u32 = 0x1 | 0x2 | 0x40 | 0x80;
+const OUTPUT_KEYS: u32 = 0x4 | 0x100 | 0x200;
+
+/// The input and output generations of `file` if its wake-ups are keyed
+/// ([`FileHandle::keyed_wakeups`]).
+pub(crate) fn wake_key(file: &std::sync::Arc<dyn FileHandle>) -> Option<(u64, u64)> {
+    if !file.keyed_wakeups() {
+        return None;
+    }
+    file.readiness()
+        .ok()
+        .map(|(_, input, output)| (input, output))
+}
+
+/// Whether a file with keyed wake-ups woke a wait for `events` between the
+/// generations `before` and `now`. A wake-up for `POLLERR` or `POLLHUP`,
+/// which every wait takes, moves both generations; a wait for neither
+/// direction counts any move, and looks to see whether it was one.
+pub(crate) fn woke(events: u32, before: (u64, u64), now: (u64, u64)) -> bool {
+    if events & (INPUT_KEYS | OUTPUT_KEYS) == 0 {
+        return before != now;
+    }
+    (before.0 != now.0 && events & INPUT_KEYS != 0)
+        || (before.1 != now.1 && events & OUTPUT_KEYS != 0)
+}
+
+/// What a `poll` of the `nfds` entries at `fds` waits for ([`wait_ready`]):
+/// nothing for a set without a keyed file, or an array that cannot be read.
+fn poll_keys(c: &Context<'_>, fds: u64, nfds: u64) -> Option<Vec<Watched>> {
+    let mut keys = Vec::new();
+    for n in 0..nfds {
+        let mut entry = [0u8; 8];
+        c.mem
+            .read(GuestAddr(fds.wrapping_add(n * 8)), &mut entry)
+            .ok()?;
+        let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        if fd < 0 {
+            continue;
+        }
+        let events = u16::from_le_bytes([entry[4], entry[5]]);
+        keys.push((u32::from(events), fd, file_key(c, fd)));
+    }
+    // A set without a keyed file waits as before, keeping nothing.
+    keys.iter().any(|w| w.2.is_some()).then_some(keys)
+}
+
+/// The generations of the file of `fd`, if it is open and has keyed
+/// wake-ups.
+fn file_key(c: &Context<'_>, fd: i32) -> Option<(u64, u64)> {
+    if (0..3).contains(&fd) && c.files.uses_original_stdio(fd as u64) {
+        return None;
+    }
+    let d = c.files.descriptor(fd as u64).ok()?;
+    if d.file.flags() & O_PATH != 0 {
+        return None;
+    }
+    wake_key(&d.file)
 }
 
 /// The length of a `struct timespec` timeout at `at` (`None` without one),
@@ -2129,7 +2231,12 @@ fn sys_ppoll(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             Err(Errno::EINVAL)
         } else {
             with_wait_mask(c, mask, |c| {
-                wait_ready(c, deadline, |c| poll_once(c, a[0], a[1]))
+                wait_ready(
+                    c,
+                    deadline,
+                    |c| poll_once(c, a[0], a[1]),
+                    |c| poll_keys(c, a[0], a[1]),
+                )
             })
         };
         write_back_timeout(c, a[2], delay, start, false);
@@ -2212,33 +2319,53 @@ fn select(
         }
     }
     let mut found = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
-    let count = wait_ready(c, deadline, |c| {
-        let mut count = 0;
+    let keys = |c: &mut Context<'_>| {
+        let mut keys = Vec::new();
         for fd in 0..n {
             let (word, bit) = ((fd / 64) as usize, 1u64 << (fd % 64));
-            if wanted.iter().all(|set| set[word] & bit == 0) {
-                continue;
-            }
-            // Only a descriptor in the write set asks whether it takes a
-            // write, which a full datagram socket notes (`polled_full`).
             let events = [POLLIN, POLLOUT, POLLPRI]
                 .into_iter()
                 .enumerate()
                 .filter(|&(kind, _)| wanted[kind][word] & bit != 0)
                 .fold(0, |events, (_, event)| events | event);
-            let mask = revents(c, fd as i32, events);
-            for (kind, ready) in [POLLIN | 0x18, POLLOUT | 0x8, POLLPRI]
-                .into_iter()
-                .enumerate()
-            {
-                if wanted[kind][word] & bit != 0 && mask & ready != 0 {
-                    found[kind][word] |= bit;
-                    count += 1;
-                }
+            if events != 0 {
+                keys.push((u32::from(events), fd as i32, file_key(c, fd as i32)));
             }
         }
-        Ok(count)
-    })?;
+        keys.iter().any(|w| w.2.is_some()).then_some(keys)
+    };
+    let count = wait_ready(
+        c,
+        deadline,
+        |c| {
+            let mut count = 0;
+            for fd in 0..n {
+                let (word, bit) = ((fd / 64) as usize, 1u64 << (fd % 64));
+                if wanted.iter().all(|set| set[word] & bit == 0) {
+                    continue;
+                }
+                // Only a descriptor in the write set asks whether it takes a
+                // write, which a full datagram socket notes (`polled_full`).
+                let events = [POLLIN, POLLOUT, POLLPRI]
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(kind, _)| wanted[kind][word] & bit != 0)
+                    .fold(0, |events, (_, event)| events | event);
+                let mask = revents(c, fd as i32, events);
+                for (kind, ready) in [POLLIN | 0x18, POLLOUT | 0x8, POLLPRI]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if wanted[kind][word] & bit != 0 && mask & ready != 0 {
+                        found[kind][word] |= bit;
+                        count += 1;
+                    }
+                }
+            }
+            Ok(count)
+        },
+        keys,
+    )?;
     for (set, at) in found.iter().zip(sets) {
         if at != 0 {
             write_words(c.mem, at, set)?;

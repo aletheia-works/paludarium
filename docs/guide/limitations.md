@@ -48,7 +48,11 @@ verified.
   program's own segments and its interpreter's are named by the path the
   file had when it was started, with its symbolic links resolved and
   `(deleted)` once nothing links it, but not after a rename, which Linux
-  follows.
+  follows. Maps can show fewer VMAs than Linux after a merge: Linux merges
+  two VMAs only where their `anon_vma`s are compatible
+  (`is_mergeable_anon_vma`), and the emulator does not model `anon_vma`
+  identity, so it merges neighbours that Linux keeps apart, such as after
+  `munlock` of a page `mlock` populated between untouched ones.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping

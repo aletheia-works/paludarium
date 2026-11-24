@@ -2186,7 +2186,7 @@ impl Kernel {
         // Its exit is the kernel's work for it, whose faults (a core
         // dump's reads, the child TID's clearing) count to it.
         let _faults = crate::KernelFaults::enter(&thread.state);
-        // Its tracees are let go of, and its tracer told, before it goes.
+        // A traced thread reports its exit first (`PTRACE_EVENT_EXIT`).
         let status = self
             .group
             .status()
@@ -2215,6 +2215,7 @@ impl Kernel {
                 processes: &self.processes,
             });
         }
+        // Its tracees are let go of, and its tracer told, before it goes.
         self.ptrace_exit(thread, status);
         // What task work it still has runs as an exiting task's.
         crate::io_uring::exit_task(&self.inbox);

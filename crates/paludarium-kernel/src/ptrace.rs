@@ -1690,11 +1690,9 @@ impl Kernel {
         }
     }
 
-    /// The thread exits with `status`: as a tracer, it lets go of its
-    /// tracees (`exit_ptrace`), killing those that asked for it
-    /// (`PTRACE_O_EXITKILL`); as a traced thread other than its process's
-    /// leader, its tracer learns of the exit and waits for it, as for a
-    /// child. A leader's exit is its process's ([`crate::Processes::finish`]).
+    /// The thread begins to exit with `status`: a traced one reports
+    /// `PTRACE_EVENT_EXIT` with its code first (`do_exit`). The rest of its
+    /// ptrace goes later ([`Self::ptrace_exit`]).
     pub(crate) fn ptrace_exit_event(&mut self, thread: &Thread, status: ExitStatus) {
         if !self.processes.traces.any() {
             return;
@@ -1715,9 +1713,11 @@ impl Kernel {
         }
     }
 
-    /// The rest of an exiting thread's ptrace: its tracees are let go of
-    /// (killed with `PTRACE_O_EXITKILL`), and its tracer told of a traced
-    /// thread's exit.
+    /// The thread exits with `status`: as a tracer, it lets go of its
+    /// tracees (`exit_ptrace`), killing those that asked for it
+    /// (`PTRACE_O_EXITKILL`); as a traced thread other than its process's
+    /// leader, its tracer learns of the exit and waits for it, as for a
+    /// child. A leader's exit is its process's ([`crate::Processes::finish`]).
     pub(crate) fn ptrace_exit(&mut self, thread: &Thread, status: ExitStatus) {
         if !self.processes.traces.any() {
             return;

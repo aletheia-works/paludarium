@@ -521,6 +521,46 @@ static void touch(int pages) {
     for (int i = 0; i < pages; i++) p[(size_t)i * 4096] = 1;
 }
 
+/* Events of this thread on CPU 0 and on CPU 1 (task-clock, page-faults
+   and cpu-migrations), while it runs on CPU 1 and then is moved to CPU 0:
+   each counts only while it runs on its CPU (event_filter_match), but is
+   enabled all the while, and the migration counts on the CPU it comes
+   to. */
+static void per_cpu(void) {
+    static const uint64_t configs[3] = {1, 2, 4};
+    static const char *const names[3] = {"task-clock", "page-faults", "cpu-migrations"};
+    int fds[3][2];
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) {
+            struct attr a = software(configs[i]);
+            a.read_format = FORMAT_ENABLED | FORMAT_RUNNING;
+            fds[i][cpu] = (int)open_event(&a, 0, cpu, -1, 0);
+        }
+    spin();
+    touch(8);
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(0, &one);
+    sched_setaffinity(0, sizeof one, &one);
+    spin();
+    touch(8);
+    uint64_t values[3][2][3];
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) ioctl(fds[i][cpu], IOC_DISABLE, 0);
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++)
+            if (read(fds[i][cpu], values[i][cpu], sizeof values[i][cpu]) != sizeof values[i][cpu])
+                memset(values[i][cpu], 0xff, sizeof values[i][cpu]);
+    for (int i = 0; i < 2; i++)
+        say("%s on cpu 0: counted %d running less %d; on cpu 1: counted %d running less %d", names[i],
+            values[i][0][0] > 0 && values[i][0][0] != (uint64_t)-1, values[i][0][2] < values[i][0][1],
+            values[i][1][0] > 0 && values[i][1][0] != (uint64_t)-1, values[i][1][2] < values[i][1][1]);
+    say("cpu-migrations on cpu 0 %llu on cpu 1 %llu", (unsigned long long)values[2][0][0],
+        (unsigned long long)values[2][1][0]);
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) close(fds[i][cpu]);
+}
+
 static int case_software(void) {
     int faults = open_software(2, 0), minor = open_software(5, 0), major = open_software(6, 0);
     int user_faults = open_software(2, EXCLUDE_KERNEL), kernel_faults = open_software(2, EXCLUDE_USER);
@@ -568,6 +608,7 @@ static int case_software(void) {
         say("moved %ld: migrations %d user %d", moved, h - g >= 1, count(user_migrations) - ug == 0);
         for (int i = 0; i < 3; i++) usleep(1000);
         say("kept: migrations %d", count(migrations) - h == 0);
+        per_cpu();
     } else {
         say("fewer than two cpus");
     }

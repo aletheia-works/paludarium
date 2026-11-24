@@ -347,8 +347,7 @@ verified.
   `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
   (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
   mapping unlocked. `inherit_stat` is taken, but an inherited event's end
-  sends no read record, as nothing is recorded. An event of a task on one
-  CPU counts on any, and the cgroup mode
+  sends no read record, as nothing is recorded. The cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2

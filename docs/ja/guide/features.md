@@ -4002,8 +4002,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `context-switches`（眠るたび）と `cpu-migrations`（`getcpu` の返す CPU が変わるたび）。
   後の二つはカーネルが起こすので、Linux と同じく `exclude_kernel` で除きます。すべての
   ページがメモリにあるので何も数えない `major-faults` と、x86-64 と同じく何も数えない
-  `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。それらの
-  分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
+  `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。
+  `perf record` が CPU ごとに開くような、一つの CPU のスレッドのイベントは、スレッドが
+  その CPU にいる間だけ数えて動き（`event_filter_match`）、有効な時間はその間ずっと
+  進みます。移動はスレッドが移った先の CPU で数え、`sched_setaffinity` は戻る前に
+  スレッドを移します。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
   キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
   イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
   要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った

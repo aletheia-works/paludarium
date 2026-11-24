@@ -246,9 +246,85 @@ pub(crate) struct Usage {
     /// it ran between two accounts counts to the CPU it was seen on at the
     /// first, for `/proc/stat`'s `cpuN` lines.
     pub(crate) per_cpu: std::sync::Mutex<Vec<u64>>,
+    /// Its faults, switches and migrations on each CPU, for the `perf`
+    /// events of one CPU ([`CpuCounts`]).
+    pub(crate) per_cpu_counts: std::sync::Mutex<CpuCounts>,
+}
+
+/// What a thread's [`Usage`] counted on each CPU: its faults in its own
+/// code and the kernel's, its switches and its migrations, in that order.
+/// Those of the CPU it is on are what it counted since it came there; a
+/// migration counts to the CPU it comes to, as Linux's
+/// `perf_sw_event_sched` of `PERF_COUNT_SW_CPU_MIGRATIONS` runs there.
+#[derive(Debug, Default)]
+pub(crate) struct CpuCounts {
+    /// What it counted on each CPU it has left, by the CPU's number.
+    done: Vec<[u64; 4]>,
+    /// The CPU it is on, and its counts when it came there.
+    on: Option<(u32, [u64; 4])>,
 }
 
 impl Usage {
+    /// Its faults, switches and migrations, as [`CpuCounts`] orders them.
+    fn counts(&self) -> [u64; 4] {
+        use std::sync::atomic::Ordering::SeqCst;
+        [
+            self.faults.load(SeqCst),
+            self.kernel_faults.load(SeqCst),
+            self.switches.load(SeqCst),
+            self.migrations.load(SeqCst),
+        ]
+    }
+    /// The thread is on `cpu` now: what it counted since it came to the
+    /// CPU it was on counts to that one.
+    fn arrive(&self, cpu: u32) {
+        let now = self.counts();
+        let mut counts = self
+            .per_cpu_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match counts.on {
+            Some((was, _)) if was == cpu => {}
+            Some((was, since)) => {
+                let was = was as usize;
+                if counts.done.len() <= was {
+                    counts.done.resize(was + 1, [0; 4]);
+                }
+                for (done, (now, since)) in counts.done[was].iter_mut().zip(now.iter().zip(since)) {
+                    *done = done.saturating_add(now.saturating_sub(since));
+                }
+                counts.on = Some((cpu, now));
+            }
+            // What it counted before it was first seen is the first CPU's.
+            None => counts.on = Some((cpu, [0; 4])),
+        }
+    }
+    /// What it counted on `cpu`, as [`CpuCounts`] orders it.
+    pub(crate) fn counts_on(&self, cpu: u32) -> [u64; 4] {
+        let now = self.counts();
+        let counts = self
+            .per_cpu_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut on = counts.done.get(cpu as usize).copied().unwrap_or_default();
+        if let Some((current, since)) = counts.on
+            && current == cpu
+        {
+            for (on, (now, since)) in on.iter_mut().zip(now.iter().zip(since)) {
+                *on = on.saturating_add(now.saturating_sub(since));
+            }
+        }
+        on
+    }
+    /// Its CPU time in nanoseconds on `cpu`, as of its latest account.
+    pub(crate) fn time_on(&self, cpu: u32) -> u64 {
+        self.per_cpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cpu as usize)
+            .copied()
+            .unwrap_or(0)
+    }
     /// Its minor faults (Linux's `min_flt`): every fault it took, its own
     /// code's, the kernel's for it and those through `get_user_pages`.
     pub(crate) fn minor_faults(&self) -> u64 {
@@ -359,6 +435,9 @@ pub(crate) fn account_cpu(
     };
     let was = account.on.replace(seen).map(|(was, _)| was);
     usage.last_cpu.store(seen.0, Ordering::SeqCst);
+    // What it counted until now is the CPU's it was on, and a migration the
+    // new one's.
+    usage.arrive(seen.0);
     if was.is_some_and(|was| was != seen.0) {
         usage.migrations.fetch_add(1, Ordering::SeqCst);
     }
@@ -1772,6 +1851,11 @@ impl Kernel {
             && let Some(action) = thread.state.signal_actions.get(&(args[0] as i32))
         {
             self.group.set_action(args[0] as i32, *action);
+        }
+        // `sched_setaffinity` moves the thread before it returns
+        // (`__set_cpus_allowed_ptr`): what it does next is the new CPU's.
+        if number == syscalls::nr::SCHED_SETAFFINITY {
+            account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
         }
         self.inbox.drain(&mut thread.state);
         match outcome {

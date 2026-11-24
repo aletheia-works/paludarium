@@ -112,7 +112,9 @@ jobs:
           path: target/macos/macos
           retention-days: 14
   fuzz:
-    # A dispatch has no inputs, so `inputs.fuzz` is only false when a caller
-    # asks.
-    if: ${{ inputs.fuzz != false }}
+    # A dispatch has no inputs, so `inputs.fuzz` is null there, and only a
+    # caller's `fuzz: false` leaves the fuzz targets out. As text: Actions
+    # compares null and false as numbers, both 0, so `inputs.fuzz != false`
+    # would skip them on a dispatch too.
+    if: ${{ toJSON(inputs.fuzz) != 'false' }}
     uses: ./.github/workflows/fuzz-sanitizers.yml

@@ -3273,7 +3273,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/self/fd/<n>` や `/dev/fd/<n>` を通した `execveat` は `ENOENT` です。`maps`、`smaps`、
   `cmdline` は何も読めず、ディレクトリー以外のファイルはゾンビのものと同じく root の
   もの（制限事項を参照）なので、`environ`、`auxv`、`pagemap` は `EACCES`（root には
-  `ESRCH`）、`exe`、`cwd`、`root` と
+  `ESRCH`）です。`smaps_rollup` は、Linux の `smaps_rollup_open` と同じく、どの読み手にも
+  `ESRCH` です。`exe`、`cwd`、`root` と
   ほかの `ns` のリンクは `ENOENT`、`mountinfo` は `EINVAL` です。`statm` はすべて 0、
   `status` には `Vm` の行も `Umask` もなく `FDSize` は 0 で、`stat` には大きさもアドレスも
   ありません。`/proc/thread-self` は読んでいるスレッドのディレクトリへのリンク（0777）で、

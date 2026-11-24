@@ -3,8 +3,9 @@
 //! its [`Records`] for the records of that moment from where the reader
 //! had got to, so a reader sees what is there when it reads, not what was
 //! there when it opened the file. `/proc/sysvipc`'s files are these
-//! ([`crate::ipc::proc_record`]), and so are a process's `maps`, `smaps`
-//! and `io` ([`crate::proc::maps_file`], [`crate::proc::single_file`]).
+//! ([`crate::ipc::proc_record`]), and so are a process's `maps`, `smaps`,
+//! `smaps_rollup` and `io` ([`crate::proc::maps_file`],
+//! [`crate::proc::single_file`]).
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use std::sync::{Mutex, PoisonError};

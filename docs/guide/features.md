@@ -3777,8 +3777,8 @@ kernel.
   through `/proc/self/fd/<n>` or `/dev/fd/<n>` is `ENOENT`; `maps`, `smaps` and
   `cmdline` read nothing; its files but its directory are root's, as a
   zombie's are (see limitations), so `environ`, `auxv` and `pagemap` are
-  `EACCES`, and `ESRCH` for root;
-  `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
+  `EACCES`, and `ESRCH` for root; `smaps_rollup` is `ESRCH` for any reader
+  (`smaps_rollup_open`); `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
   `FDSize` of 0; and `stat` has no sizes or addresses. `/proc/thread-self` is
   a link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A

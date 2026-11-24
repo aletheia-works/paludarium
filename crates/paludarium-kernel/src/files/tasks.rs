@@ -213,15 +213,16 @@ impl Task {
 }
 
 /// Refuses what the reader may not see of the task: `environ`, `auxv`, `maps`,
-/// `smaps`, `pagemap`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
-/// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
-/// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself, read or
-/// looked in, as its mode lets (`proc_fd_permission`). `environ`, `auxv` and
-/// `pagemap` of a task with no memory left are `ESRCH` for a reader their mode
-/// lets open them (root's, [`Task::owned`]), as Linux's `__mem_open` and
-/// `pagemap_open` refuse them before they check the reader,
-/// while `maps` and `smaps` (`proc_maps_open`) then open for anyone and read
-/// nothing.
+/// `smaps`, `smaps_rollup`, `pagemap`, `exe`, `cwd`, the links of `ns` and
+/// `fd`, and `fdinfo` (`EACCES`), as Linux's `proc_mem_open`,
+/// `proc_fd_access_allowed`, `proc_ns_get_link` and `proc_fdinfo_permission`
+/// do; and `fd` itself, read or looked in, as its mode lets
+/// (`proc_fd_permission`). `environ`, `auxv` and `pagemap` of a task with no
+/// memory left are `ESRCH` for a reader their mode lets open them (root's,
+/// [`Task::owned`]), as Linux's `__mem_open` and `pagemap_open` refuse them
+/// before they check the reader, and `smaps_rollup` for any reader, as
+/// `smaps_rollup_open` finds no `mm`, while `maps` and `smaps`
+/// (`proc_maps_open`) then open for anyone and read nothing.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
         TaskEntry::Environ

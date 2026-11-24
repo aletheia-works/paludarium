@@ -931,6 +931,7 @@ fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
                 .map_err(|_| Errno::EFAULT)?;
             Ok(0)
         }
+        43 | 288 => accept(c, a, if number == 288 { a[3] as u32 } else { 0 }),
         _ => match c.files.descriptor(a[0]) {
             Ok(d) => route_file(c, number, a, &d.file),
             // `setsockopt` and `getsockopt` look the descriptor up in their
@@ -1031,7 +1032,30 @@ pub(crate) fn is_stream(file: &Arc<dyn FileHandle>) -> bool {
     endpoint(file).is_some_and(|socket| matches!(socket.pair.kind, SOCK_STREAM | SOCK_SEQPACKET))
 }
 
-/// `accept` on the socket `file` for an io_uring request, `nowait` as
+/// `accept` and `accept4` (`__sys_accept4`): the descriptor is looked up
+/// (`EBADF`), the flags checked (`EINVAL`), and the new descriptor taken
+/// (`EMFILE`) before anything is accepted, or the file found to be no
+/// socket.
+fn accept(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
+    let file = c.files.descriptor(a[0])?.file;
+    if flags & !(NONBLOCK | CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fd = c.files.reserve(c.group.nofile())?;
+    match accept_file(c, &file, a[1], a[2], u64::from(flags), false) {
+        Ok((child, _)) => {
+            let child = crate::files::Descriptor::unnamed(child, flags & CLOEXEC != 0);
+            c.files.fill(fd, child);
+            Ok(u64::from(fd))
+        }
+        Err(e) => {
+            c.files.unreserve(fd);
+            Err(e)
+        }
+    }
+}
+
+/// `accept` on the socket `file`, also for an io_uring request, `nowait` as
 /// `O_NONBLOCK`: the connection, made as `flags` (`SOCK_NONBLOCK`) say,
 /// with its peer's address written to `at` within the room at `len`, and
 /// whether more wait (`arg->is_empty`, which only TCP tells). A netlink or

@@ -37824,6 +37824,35 @@ int main(int argc, char **argv) {
         unlink(p.sun_path);
         unix_call("socket-protocol", socket(AF_UNIX, SOCK_STREAM, 2));
         unix_call("socket-type", socket(AF_UNIX, 4, 0));
+        /* accept takes its descriptor first: with none left nothing is
+           accepted, nor is the file found to be no socket
+           (__sys_accept4_file). */
+        int server = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        int client = socket(AF_UNIX, SOCK_STREAM, 0);
+        int datagram = socket(AF_UNIX, SOCK_DGRAM, 0);
+        int ends[2];
+        if (pipe(ends)) return 1;
+        struct sockaddr_un own;
+        socklen_t own_len = sizeof own;
+        struct sockaddr_un family = {.sun_family = AF_UNIX};
+        unix_call("autobind", bind(server, (void *)&family, sizeof family.sun_family));
+        getsockname(server, (void *)&own, &own_len);
+        unix_call("listen", listen(server, 1));
+        unix_call("connect", connect(client, (void *)&own, own_len));
+        struct rlimit limit, none;
+        getrlimit(RLIMIT_NOFILE, &limit);
+        none = (struct rlimit){0, limit.rlim_max};
+        setrlimit(RLIMIT_NOFILE, &none);
+        unix_call("accept-none-left", accept(server, NULL, NULL));
+        unix_call("accept-none-left-datagram", accept(datagram, NULL, NULL));
+        unix_call("accept-none-left-pipe", accept(ends[0], NULL, NULL));
+        unix_call("accept-none-left-flags", accept4(server, NULL, NULL, 1));
+        unix_call("accept-none-left-badf", accept(-1, NULL, NULL));
+        setrlimit(RLIMIT_NOFILE, &limit);
+        unix_call("accept-left", accept(server, NULL, NULL) >= 0 ? 0 : -1);
+        unix_call("accept-none-waits", accept(server, NULL, NULL));
+        unix_call("accept-pipe", accept(ends[0], NULL, NULL));
+        unix_call("accept-datagram", accept(datagram, NULL, NULL));
         return 0;
     }
     if (!strcmp(mode, "unix-path")) {

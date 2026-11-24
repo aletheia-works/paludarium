@@ -7282,6 +7282,39 @@ mod io_uring {
     }
 
     #[test]
+    fn accept_takes_its_descriptor_first() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let server = listener_named(&mut f, &r, b'a', 4);
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &[1, 0, 0, b'a'])
+            .unwrap();
+        let client = f.ret(41, &[1, 1, 0]);
+        assert_eq!(f.ret(42, &[client, DATA + 0x100, 4]), 0);
+        let pipe = DATA + 0x200;
+        assert_eq!(f.ret(293, &[pipe, 0]), 0);
+        let pipe = u64::from(u32_at(&f, pipe));
+        let limit = DATA + 0x600;
+        assert_eq!(f.ret(97, &[7, limit]), 0);
+        let soft = f.mem.read_u64(GuestAddr(limit)).unwrap();
+        f.mem.write_u64(GuestAddr(limit), 1).unwrap();
+        assert_eq!(f.ret(160, &[7, limit]), 0);
+        let (emfile, enotsock) = (errno(Errno(24)), errno(Errno(88)));
+        assert_eq!(f.ret(43, &[server, 0, 0]), emfile);
+        assert_eq!(f.ret(43, &[pipe, 0, 0]), emfile);
+        assert_eq!(f.ret(288, &[server, 0, 0, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(43, &[999, 0, 0]), errno(Errno::EBADF));
+        f.mem.write_u64(GuestAddr(limit), soft).unwrap();
+        assert_eq!(f.ret(160, &[7, limit]), 0);
+        // The connection is still there, and its descriptor the lowest.
+        assert_eq!(f.ret(43, &[pipe, 0, 0]), enotsock);
+        let next = f.ret(32, &[0]);
+        assert_eq!(f.ret(3, &[next]), 0);
+        assert_eq!(f.ret(288, &[server, 0, 0, 0o2_000_000]), next);
+        assert_eq!(f.ret(72, &[next, 1]), 1);
+    }
+
+    #[test]
     fn sockets_and_connections_go_in_registered_slots() {
         let mut f = fixture();
         let r = ring(&mut f);

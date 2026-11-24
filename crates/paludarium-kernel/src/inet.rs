@@ -405,10 +405,14 @@ impl Network {
     /// out through that end without a route, as `ip_route_output_key_hash_rcu`
     /// takes the source's device for them.
     ///
-    /// Through a device `oif` other than 0, which a scope ID or the socket's
-    /// device gives, an IPv6 destination's route is looked up strictly
-    /// through it (`RT6_LOOKUP_F_IFACE`), a local one too, and `ENETUNREACH`
-    /// where none goes. An IPv4 one goes through it as
+    /// Through a device `oif` other than 0, an IPv6 destination's route is
+    /// looked up through it, a local one too: strictly
+    /// (`RT6_LOOKUP_F_IFACE`) where it is the socket's own (`strict`), or
+    /// where the source is not chosen yet, or the destination a group, a
+    /// link-local address or `::1` (`ip6_route_output_flags`), and then
+    /// `ENETUNREACH` where none goes; else through it rather than another,
+    /// among the routes of one prefix and metric. `::` is `::1` by then
+    /// (`udpv6_sendmsg`). An IPv4 one goes through it as
     /// [`Self::route4_through`] routes it.
     ///
     /// Of an IPv6 multipath route, the hop the flow takes: from `from`, of
@@ -418,17 +422,31 @@ impl Network {
         &self,
         to: SocketAddr,
         from: Option<IpAddr>,
-        oif: u32,
+        (oif, strict): (u32, bool),
         proto: u8,
         now: Option<u64>,
     ) -> Result<Dest, Errno> {
         let flow = Self::flow6(from, proto);
+        let to = if oif != 0 && to.is_ipv6() && !from.is_some_and(|ip| plain(ip).is_ipv4()) {
+            crate::loopback::destination(to).unwrap_or(to)
+        } else {
+            to
+        };
         if let IpAddr::V6(ip) = to.ip()
             && oif != 0
             && !ip.is_unspecified()
         {
             use crate::interface::Kind;
-            let route = self.addresses_at(now).lookup6_flow(ip, oif, &flow)?;
+            let strict = strict
+                || from.is_none_or(|ip| ip.is_unspecified())
+                || ip.is_multicast()
+                || ip.is_unicast_link_local()
+                || ip.is_loopback();
+            let route = if strict {
+                self.addresses_at(now).lookup6_flow(ip, oif, &flow)?
+            } else {
+                self.addresses_at(now).lookup6_preferring(ip, oif, &flow)?
+            };
             return match route.kind {
                 Kind::Local if self.is_up() => Ok(Dest::Here(to)),
                 Kind::Unicast | Kind::Multicast if route.oif != crate::netdev::LOOPBACK_OIF => {
@@ -921,14 +939,13 @@ impl Network {
             .unwrap_or(to)
     }
     /// The neighbour a packet of the flow `flow` to `to` out through the
-    /// veth end `index` goes to at `now`: its route's gateway, the hop of
-    /// a multipath route [`Self::route`] took, else `to` itself
-    /// (`rt6_nexthop`).
+    /// veth end `index` goes to at `now`: the gateway of its route through
+    /// that end, the hop of a multipath route [`Self::route`] took, else
+    /// `to` itself (`rt6_nexthop`).
     fn next_hop6(&self, index: i32, to: Ipv6Addr, flow: &Flow6, now: Option<u64>) -> Ipv6Addr {
         self.addresses_at(now)
-            .lookup6_flow(to, 0, flow)
+            .lookup6_flow(to, index.unsigned_abs(), flow)
             .ok()
-            .filter(|r| i64::from(r.oif) == i64::from(index))
             .and_then(|r| r.gateway)
             .unwrap_or(to)
     }
@@ -1207,7 +1224,9 @@ impl Network {
     /// named, an address of the device's (`inet_select_addr`) of link
     /// scope to a local group or the limited broadcast address, of any
     /// scope to another group, and to an address no route through it
-    /// takes, on link; else its route's.
+    /// takes, on link; else its route's. For IPv6, its route's through the
+    /// device (`ip6_route_get_saddr`), looked up strictly, as no source is
+    /// chosen yet.
     pub(crate) fn source_through(&self, to: SocketAddr, oif: u32, now: Option<u64>) -> IpAddr {
         use crate::interface::{SCOPE_LINK, SCOPE_UNIVERSE};
         let order = self.devices().order();
@@ -1229,6 +1248,9 @@ impl Network {
             if let Some(picked) = picked {
                 return IpAddr::V4(picked);
             }
+        }
+        if let IpAddr::V6(ip) = to.ip() {
+            return IpAddr::V6(addresses.source6_through(ip, oif, &order));
         }
         addresses.source(to.ip(), &order)
     }
@@ -1835,8 +1857,35 @@ struct Options {
     /// The device the socket is bound to (`sk_bound_dev_if`), which a
     /// link-local address's scope ID gives, or 0.
     device: u32,
+    /// `IPV6_MULTICAST_IF` (`mcast_oif`) and `IPV6_UNICAST_IF`
+    /// (`ucast_oif`): the device a datagram to a group, or to another
+    /// address, goes out through where nothing else names one; 0 for none.
+    multicast_device: u32,
+    unicast_device: u32,
+    /// The sticky `IPV6_PKTINFO`'s device (`sticky_pktinfo`), which a
+    /// datagram goes out through after the socket's own; its address sends
+    /// from nowhere.
+    pktinfo_device: u32,
     /// `SO_TIMESTAMP`, its kin and `SO_TIMESTAMPING`.
     timestamps: Timestamps,
+}
+impl Options {
+    /// The device a datagram to the IPv6 address `to` goes out through, of
+    /// no scope ID (`udpv6_sendmsg`, `ip6_datagram_flow_key_init`): the
+    /// socket's, else the sticky `IPV6_PKTINFO`'s, else
+    /// `IPV6_MULTICAST_IF`'s to a group and `IPV6_UNICAST_IF`'s to another
+    /// address; 0 for none.
+    fn device6(&self, to: Ipv6Addr) -> u32 {
+        let last = if to.is_multicast() {
+            self.multicast_device
+        } else {
+            self.unicast_device
+        };
+        [self.device, self.pktinfo_device, last]
+            .into_iter()
+            .find(|&device| device != 0)
+            .unwrap_or(0)
+    }
 }
 impl Default for Options {
     fn default() -> Self {
@@ -1863,6 +1912,9 @@ impl Default for Options {
             type_of_service: 0,
             v6_only: false,
             device: 0,
+            multicast_device: 0,
+            unicast_device: 0,
+            pktinfo_device: 0,
             timestamps: Timestamps::default(),
         }
     }
@@ -2325,7 +2377,7 @@ impl InetSocket {
             self.renew(&mut self.lock());
             return Ok(0);
         };
-        let options = *self.options();
+        let mut options = *self.options();
         let wait = crate::sockets::wait_for(c, self.timeout(false))?;
         self.retry_syns();
         let stream = {
@@ -2345,12 +2397,13 @@ impl InetSocket {
                     let device = if address.ip().is_multicast() {
                         options.device
                     } else {
-                        connect_device(address, options.device)?
+                        connect_device(address, options.device, 0)?
                     };
                     if device != options.device {
                         // The options' lock comes before the state's.
                         drop(s);
-                        self.options().device = device;
+                        self.put_device(device);
+                        options.device = device;
                         s = self.lock();
                     }
                     // `tcp_v4_connect` looks the route up from the bound
@@ -2361,9 +2414,13 @@ impl InetSocket {
                     {
                         self.mapped_source(bound)?;
                     }
-                    let dest =
-                        self.network
-                            .route(plain_to, s.source(), device, FLOW_TCP, self.now())?;
+                    let dest = self.network.route(
+                        plain_to,
+                        s.source(),
+                        (device, true),
+                        FLOW_TCP,
+                        self.now(),
+                    )?;
                     let to = match dest {
                         Dest::Here(to) => Some(to),
                         Dest::Away | Dest::Veth(..) => None,
@@ -2581,11 +2638,11 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        let device = connect_device(address, options.device)?;
+        let device = connect_device(address, options.device, options.multicast_device)?;
         if device != options.device {
             // The options' lock comes before the state's.
             drop(s);
-            self.options().device = device;
+            self.put_device(device);
             s = self.lock();
         }
         // Linux master puts the device back where the route fails
@@ -2600,7 +2657,7 @@ impl InetSocket {
         }
         if connected.is_err() && device != options.device {
             drop(s);
-            self.options().device = options.device;
+            self.put_device(options.device);
         }
         connected
     }
@@ -2624,12 +2681,17 @@ impl InetSocket {
         let keep = s.device_source;
         let name = |from: SocketAddr| if keep { bound } else { from };
         let source = (!keep).then_some(bound.ip());
+        let oif = match to.ip() {
+            IpAddr::V6(ip) => Options { device, ..*options }.device6(ip),
+            IpAddr::V4(_) => device,
+        };
+        let through = (oif, device != 0);
         match self
             .network
-            .route(to, source, device, FLOW_UDP, self.now())?
+            .route(to, source, through, FLOW_UDP, self.now())?
         {
             Dest::Here(to) => {
-                let from = self.datagram_source(s, to, options)?;
+                let from = self.datagram_source(s, to, oif, options)?;
                 let name = name(from);
                 self.ports().connect(&self.this, name, Some(to));
                 s.bound = Some(name);
@@ -2639,7 +2701,7 @@ impl InetSocket {
             // from, which Linux's `__mkroute_output` takes from no
             // loopback address (`EINVAL`).
             Dest::Veth(_, cast) => {
-                let from = self.datagram_source(s, to, options)?;
+                let from = self.datagram_source(s, to, oif, options)?;
                 if to.is_ipv6() && from.ip().is_unspecified() {
                     return Err(EADDRNOTAVAIL);
                 }
@@ -2719,19 +2781,20 @@ impl InetSocket {
             Family::V6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         }
     }
-    /// The address a datagram to `to` on the loopback leaves from: this
-    /// socket's port, on the address it is bound to, or else, bound to
-    /// none or to one it sends from the route's source instead of, the
-    /// route's source address.
+    /// The address a datagram to `to` through the device `oif` (any for 0)
+    /// leaves from: this socket's port, on the address it is bound to, or
+    /// else, bound to none or to one it sends from the route's source
+    /// instead of, the route's source address.
     fn datagram_source(
         &self,
         s: &mut State,
         to: SocketAddr,
+        oif: u32,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
         let bound = self.autobind(s, options)?;
         let ip = if bound.ip().is_unspecified() || s.device_source {
-            self.network.source_through(to, options.device, self.now())
+            self.network.source_through(to, oif, self.now())
         } else {
             bound.ip()
         };
@@ -2769,15 +2832,20 @@ impl InetSocket {
             self.mapped_source(bound)?;
         }
         // Out through the scope ID's device, of an address that needs one,
-        // else the socket's (`udpv6_sendmsg`).
-        let oif = match to {
-            SocketAddr::V6(v6) if v6.scope_id() != 0 && needs_scope_id(*v6.ip()) => v6.scope_id(),
-            _ => options.device,
+        // else the socket's, the sticky `IPV6_PKTINFO`'s, or the one for a
+        // group or another address (`udpv6_sendmsg`).
+        let oif = match (to, plain_to.ip()) {
+            (SocketAddr::V6(v6), _) if v6.scope_id() != 0 && needs_scope_id(*v6.ip()) => {
+                v6.scope_id()
+            }
+            (_, IpAddr::V6(ip)) => options.device6(ip),
+            (_, IpAddr::V4(_)) => options.device,
         };
+        let through = (oif, options.device != 0);
         let flow = Network::flow6(s.source(), FLOW_UDP);
         let route = self
             .network
-            .route(plain_to, s.source(), oif, FLOW_UDP, self.now())?;
+            .route(plain_to, s.source(), through, FLOW_UDP, self.now())?;
         if let Dest::Veth(index, cast) = route {
             let v6 = plain_to.is_ipv6();
             if self.family == Family::V6 && options.v6_only && !v6 {
@@ -2790,7 +2858,7 @@ impl InetSocket {
             if !v6 && bytes.len() > 65_535 {
                 return Err(EMSGSIZE);
             }
-            let from = self.datagram_source(&mut s, plain_to, &options)?;
+            let from = self.datagram_source(&mut s, plain_to, oif, &options)?;
             if v6 && from.ip().is_unspecified() {
                 return Err(EADDRNOTAVAIL);
             }
@@ -2894,7 +2962,7 @@ impl InetSocket {
                 return Err(EMSGSIZE);
             }
             sendable(&mut s)?;
-            let from = self.datagram_source(&mut s, dest, &options)?;
+            let from = self.datagram_source(&mut s, dest, oif, &options)?;
             let to_peer = s.peer == Some(dest);
             let sent = self.sent(&mut s, from, dest, &options, ids);
             drop(s);
@@ -3162,6 +3230,13 @@ impl InetSocket {
             time_wait: None,
         }
     }
+    /// Makes `device` (0 for none) the socket's device, as a scope ID of a
+    /// bind or connect does.
+    fn put_device(&self, device: u32) {
+        let mut options = self.options();
+        options.device = device;
+        self.ports().set_device(&self.this, device);
+    }
     /// Landlock's `socket_bind` and `socket_connect` hooks, which only a TCP
     /// socket meets.
     fn landlock(&self, c: &Context<'_>, raw: &[u8], request: u64) -> Result<(), Errno> {
@@ -3176,7 +3251,7 @@ impl InetSocket {
     /// broadcast ones Linux takes too; any other is `EADDRNOTAVAIL`. Port 0
     /// takes an ephemeral port.
     fn bind(&self, raw: &[u8]) -> Result<u64, Errno> {
-        let options = *self.options();
+        let mut options = *self.options();
         let mut s = self.lock();
         let taken = |s: &State| s.bound.is_some() || s.stream.is_some();
         // The addresses the loopback's routes have, which IPv4's local
@@ -3255,7 +3330,8 @@ impl InetSocket {
                     if device != options.device {
                         // The options' lock comes before the state's.
                         drop(s);
-                        self.options().device = device;
+                        self.put_device(device);
+                        options.device = device;
                         s = self.lock();
                     }
                     chosen?
@@ -3266,7 +3342,6 @@ impl InetSocket {
         // one makes the socket IPv6-only (`__inet6_bind`), unless the bind
         // fails.
         let only = matches!(address, SocketAddr::V6(a) if !a.ip().is_unspecified());
-        let mut options = options;
         options.v6_only |= only;
         s.bound = Some(self.ports().bind(Binding {
             locked: address.port() != 0,
@@ -4132,9 +4207,9 @@ fn scoped(address: SocketAddr, device: u32) -> SocketAddr {
 /// (`__ip6_datagram_connect`, `tcp_v6_connect`): a link-local address, or a
 /// group of the node or the link, takes its scope ID's, which must be the
 /// socket's device where it has one (`sk_dev_equal_l3scope`), and needs one
-/// (`EINVAL` for both); any other the socket's. No multicast interface is set
-/// here to stand in for a group's.
-fn connect_device(address: SocketAddr, device: u32) -> Result<u32, Errno> {
+/// (`EINVAL` for both), a group `multicast` (`IPV6_MULTICAST_IF`'s) where
+/// there is no other; any other address the socket's.
+fn connect_device(address: SocketAddr, device: u32, multicast: u32) -> Result<u32, Errno> {
     let SocketAddr::V6(v6) = address else {
         return Ok(device);
     };
@@ -4145,6 +4220,11 @@ fn connect_device(address: SocketAddr, device: u32) -> Result<u32, Errno> {
         0 => device,
         scope if device != 0 && device != scope => return Err(Errno::EINVAL),
         scope => scope,
+    };
+    let device = if device == 0 && v6.ip().is_multicast() {
+        multicast
+    } else {
+        device
     };
     if device == 0 {
         return Err(Errno::EINVAL);
@@ -4943,13 +5023,24 @@ fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     Ok(i32::from_le_bytes(raw))
 }
+/// The `int` `do_ipv6_setsockopt` reads before it looks at the option: 0 for
+/// no pointer or fewer than 4 bytes.
+fn option6_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
+    match len as u32 as i32 {
+        ..0 => Err(Errno::EINVAL),
+        4.. if at != 0 => option_int(c, at, len),
+        _ => Ok(0),
+    }
+}
 /// `setsockopt` of an inet socket: the `SOL_SOCKET` options a client sets,
 /// `IPPROTO_TCP`'s `TCP_NODELAY`, keepalive timing (1 to 32767 seconds, at
 /// most 127 probes), `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
 /// `IPV6_V6ONLY`, and the filter options (`SO_ATTACH_FILTER`,
 /// `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and `SO_ATTACH_BPF`, as
 /// [`crate::sockets::set_filter`] takes them), and the device the socket
-/// is bound to (`SO_BINDTODEVICE`, `SO_BINDTOIFINDEX`, [`bind_to_device`]).
+/// is bound to (`SO_BINDTODEVICE`, `SO_BINDTOIFINDEX`, [`bind_to_device`]),
+/// and those a datagram goes out through (`IPV6_MULTICAST_IF`,
+/// `IPV6_UNICAST_IF`, the sticky `IPV6_PKTINFO`).
 /// `SO_PASSCRED`, `SO_PASSSEC`,
 /// `SO_PASSPIDFD` and `SO_PASSRIGHTS` are EOPNOTSUPP, as Linux takes them
 /// only on AF_UNIX (`sk_may_scm_recv` adds netlink and Bluetooth for the
@@ -5014,6 +5105,66 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     .ok_or(ENODEV)?
             };
             bind_to_device(c, socket, &mut options, index.cast_signed())?;
+        }
+        // `IPV6_MULTICAST_IF` (`do_ipv6_setsockopt`, before the socket's
+        // lock): not for TCP (`ENOPROTOOPT`); a device of the namespace
+        // (`ENODEV`), the socket's own where it has one (`EINVAL`), or 0.
+        (41, 17) if socket.family == Family::V6 => {
+            let value = option6_int(c, at, len)?;
+            if tcp {
+                return Err(ENOPROTOOPT);
+            }
+            if (len as u32 as i32) < 4 {
+                return Err(Errno::EINVAL);
+            }
+            if value != 0 {
+                if !socket.network.has_device(value) {
+                    return Err(ENODEV);
+                }
+                if options.device != 0 && options.device != value.cast_unsigned() {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            options.multicast_device = value.cast_unsigned();
+        }
+        // `IPV6_UNICAST_IF`: an `int` exactly (`EINVAL` for another
+        // length), an index in network byte order; 0 for none, else a
+        // device of the namespace (`EADDRNOTAVAIL`), and not on a socket
+        // bound to a device (`EINVAL`).
+        (41, 76) if socket.family == Family::V6 => {
+            let value = option6_int(c, at, len)?;
+            if len as u32 != 4 {
+                return Err(Errno::EINVAL);
+            }
+            let index = u32::from_be_bytes(value.to_le_bytes());
+            if index != 0 {
+                if !socket.network.has_device(index) {
+                    return Err(EADDRNOTAVAIL);
+                }
+                if options.device != 0 {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            options.unicast_device = index;
+        }
+        // The sticky `IPV6_PKTINFO`: a whole `in6_pktinfo` (`EINVAL` for
+        // less), whose device must be the socket's where it has one
+        // (`sk_dev_equal_l3scope`); neither the device nor the address is
+        // looked for.
+        (41, 50) if socket.family == Family::V6 => {
+            option6_int(c, at, len)?;
+            if (len as u32 as i32) < 20 || at == 0 {
+                return Err(Errno::EINVAL);
+            }
+            let mut raw = [0; 20];
+            c.mem
+                .read(GuestAddr(at), &mut raw)
+                .map_err(|_| Errno::EFAULT)?;
+            let index = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+            if options.device != 0 && options.device != index {
+                return Err(Errno::EINVAL);
+            }
+            options.pktinfo_device = index;
         }
         (1, 20 | 21 | 66 | 67) => {
             if (len as u32 as i32) < 16 {
@@ -5279,6 +5430,12 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, 18) => options.user_timeout,
                 (0, 1) => options.type_of_service,
                 (41, 26) if socket.family == Family::V6 => i32::from(options.v6_only),
+                // `IPV6_MULTICAST_IF`, and `IPV6_UNICAST_IF` in network byte
+                // order; `IPV6_PKTINFO` has no getsockopt (`ENOPROTOOPT`).
+                (41, 17) if socket.family == Family::V6 => options.multicast_device.cast_signed(),
+                (41, 76) if socket.family == Family::V6 => {
+                    i32::from_le_bytes(options.unicast_device.to_be_bytes())
+                }
                 _ => return Err(ENOPROTOOPT),
             };
             int.to_le_bytes().to_vec()
@@ -5625,7 +5782,7 @@ mod tests {
                 .route(
                     SocketAddr::new(IpAddr::V4(ip), 9),
                     None,
-                    0,
+                    (0, false),
                     0,
                     Some(3 * SECOND)
                 )

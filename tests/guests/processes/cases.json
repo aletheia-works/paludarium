@@ -77,6 +77,7 @@
     {"name":"veth-ipv6-gateway","binary":"veth-ipv6-gateway"},
     {"name":"veth-ipv6-ecmp","binary":"veth-ipv6-ecmp"},
     {"name":"veth-bindtodevice","binary":"veth-bindtodevice"},
+    {"name":"veth-ipv6-oif","binary":"veth-ipv6-oif"},
     {"name":"veth-ipv6-scope","binary":"veth-ipv6-scope"},
     {"name":"veth-ipv6-traffic","binary":"veth-ipv6-traffic"},
     {"name":"user-namespaces","binary":"process"},

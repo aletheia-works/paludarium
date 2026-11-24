@@ -6087,7 +6087,23 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     through it; a group of 224.0.0.0/24 or the limited broadcast address
     straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`
     once it has gone, `ENETUNREACH` while it is down. A connection
-    accepted is bound as its listener.
+    accepted is bound as its listener. Of an IPv6 socket,
+    `IPV6_MULTICAST_IF` (not of TCP, `ENOPROTOOPT`) and `IPV6_UNICAST_IF`
+    (in network byte order) take the index of a device (`ENODEV` and
+    `EADDRNOTAVAIL` for one there is not), 0 for none, and `IPV6_PKTINFO`
+    (set only, its address unused, as UDP sends) any; each `EINVAL` for
+    one other than the device the socket is bound to, `IPV6_UNICAST_IF`
+    for any then (`do_ipv6_setsockopt`). A UDP datagram to an address
+    without a scope ID, and a UDP `connect`, go through the socket's own
+    device, else `IPV6_PKTINFO`'s, else `IPV6_MULTICAST_IF`'s to a group
+    and `IPV6_UNICAST_IF`'s to another address (`udpv6_sendmsg`,
+    `ip6_datagram_flow_key_init`): strictly where the socket is bound to no
+    address, or the destination is a group, a link-local address or `::1`;
+    else through it rather than another, among the routes of one prefix
+    and metric (`rt6_score_route`). Connecting a socket of no device to a
+    group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks
+    its route up, where Linux's connected socket keeps the one it has
+    (`ip6_sk_dst_lookup_flow`) when one of these options goes back to 0.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
     as the room asks (`tcp_get_info`): a listener's state, connections
     waiting and backlog; a socket that has not connected, Linux's
@@ -6165,7 +6181,8 @@ one only with an `--allow-net`.
   that needs one, and `recvfrom` the device a datagram came in on. UDP's
   `sendto` goes through the scope ID's device, for an address that needs
   one, else the socket's, strictly (`ENETUNREACH` where no route goes
-  through it), and `connect`, UDP's and TCP's, the same way: the scope ID
+  through it), from an address of that device's where it is bound to
+  none, and `connect`, UDP's and TCP's, the same way: the scope ID
   becomes the socket's device, which a TCP socket keeps though the connect
   fails and a UDP one does not, as Linux master puts it back; `EINVAL`
   for one other than the device the socket has, or for none where the

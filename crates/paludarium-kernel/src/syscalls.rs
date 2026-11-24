@@ -2422,7 +2422,18 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     } else {
         // Linux rounds a non-fixed hint down to its page boundary.
         let hint = GuestAddr(addr & !4095);
-        Placement::Near((hint.0 != 0).then_some(hint))
+        let hint = (hint.0 != 0).then_some(hint);
+        // A file of a tmpfs mount with `huge=` goes at the 2 MiB boundary
+        // its offset agrees with (`shmem_get_unmapped_area`).
+        const HUGE: u64 = 2 << 20;
+        match &file {
+            Some(file) if file.huge_placement() => Placement::Aligned {
+                hint,
+                size: HUGE,
+                offset: offset & (HUGE - 1),
+            },
+            _ => Placement::Near(hint),
+        }
     };
     // A locked mapping, by MAP_LOCKED or `mlockall`'s MCL_FUTURE, needs
     // `can_do_mlock` (EPERM, for MAP_LOCKED) and room under RLIMIT_MEMLOCK

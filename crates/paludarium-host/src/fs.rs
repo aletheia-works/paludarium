@@ -105,6 +105,12 @@ pub trait FileHandle: Send + Sync {
     fn shmem_pages(&self) -> bool {
         false
     }
+    /// Whether a mapping of the file is placed at a 2 MiB boundary, as
+    /// Linux's `shmem_get_unmapped_area` places one of a file of a tmpfs
+    /// mount whose `huge=` is not `never`, which may have huge folios.
+    fn huge_placement(&self) -> bool {
+        false
+    }
     /// `fchmod`: replaces the permission bits with the low 12 bits of `mode`.
     fn set_mode(&self, _mode: u32) -> Result<(), Errno> {
         Err(Errno::EPERM)

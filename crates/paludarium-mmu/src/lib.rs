@@ -1482,6 +1482,18 @@ pub enum Placement {
     Exactly(GuestAddr),
     /// At the hint if it is free, else wherever there is room.
     Near(Option<GuestAddr>),
+    /// As `Near`, but where there is room the mapping is placed `offset`
+    /// past a multiple of `size` (a power of two), as Linux's
+    /// `shmem_get_unmapped_area` places a mapping of a file that may have
+    /// huge folios: unless it is shorter than `size`, starts at an
+    /// offset into its first `size` and ends within the second, or is
+    /// placed so already. Without room for `size` more it goes where
+    /// `Near` would.
+    Aligned {
+        hint: Option<GuestAddr>,
+        size: u64,
+        offset: u64,
+    },
 }
 
 /// What a mapping [`AddressSpace::map_backed`] makes shows.
@@ -4668,6 +4680,39 @@ impl AddressSpaceData {
             start = m.end().checked_next_multiple_of(align)?;
         }
         (start.checked_add(len)? <= limit).then_some(start)
+    }
+    /// Where a mapping of `len` bytes with no hint goes `offset` past a
+    /// multiple of `size` ([`Placement::Aligned`]): the free area
+    /// [`Self::find_free`] gives, or one found for `size` less a page more
+    /// and moved up to the offset (`shmem_get_unmapped_area`). `None`
+    /// where the ordinary choice has no room either.
+    fn aligned_area(&self, len: u64, size: u64, offset: u64) -> Option<u64> {
+        let len = GuestAddr(len).page_align_up()?.0;
+        let addr = self.find_free(len)?;
+        if len < size
+            || (offset != 0 && offset.saturating_add(len) < 2 * size)
+            || addr & (size - 1) == offset
+        {
+            return Some(addr);
+        }
+        let Some(inflated) = len
+            .checked_add(size - PAGE_SIZE)
+            .and_then(|wide| self.find_free(wide))
+        else {
+            return Some(addr);
+        };
+        let within = inflated & (size - 1);
+        let mut at = inflated - within + offset;
+        if within > offset {
+            at += size;
+        }
+        Some(
+            if at > (USER_ADDRESS_LIMIT - PAGE_SIZE).saturating_sub(len) {
+                addr
+            } else {
+                at
+            },
+        )
     }
     fn find_free(&self, len: u64) -> Option<u64> {
         if let Some(base) = self.bottom_up {
@@ -7936,7 +7981,7 @@ impl AddressSpace {
                 data.map(Some(at), len, prot, kind)?
             }
             Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
-            Placement::Near(hint) => {
+            Placement::Near(hint) | Placement::Aligned { hint, .. } => {
                 // A hint within the guard gap below a mapping that grows
                 // down is not taken (`vm_start_gap`).
                 let hint = hint.filter(|hint| {
@@ -7947,7 +7992,13 @@ impl AddressSpace {
                 });
                 match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
                     Some(at) => at,
-                    None => data.map(None, len, prot, kind)?,
+                    None => match placement {
+                        Placement::Aligned { size, offset, .. } => {
+                            let at = data.aligned_area(len, size, offset);
+                            data.map(at.map(GuestAddr), len, prot, kind)?
+                        }
+                        _ => data.map(None, len, prot, kind)?,
+                    },
                 }
             }
         };

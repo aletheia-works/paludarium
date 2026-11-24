@@ -868,10 +868,9 @@ verified.
   `nr_blocks` and `nr_inodes`, and a page a fault brings into a file of a
   tmpfs mount or a memfd counts in its blocks, as `shmem_fault` charges
   it, one past the mount's size being a `SIGBUS`, with a large folio's
-  others on a mount with `huge=`. Not yet so: `mmap` places a mapping of
-  such a file where it would place any (`shmem_get_unmapped_area` puts
-  one of 2 MiB or more at a 2 MiB boundary), so only a mapping a program
-  places itself takes 2 MiB folios on a fault; a large folio is mapped a
+  others on a mount with `huge=`. Not yet so: `mremap` moves a mapping of
+  such a file where it would move any, where Linux places it at a 2 MiB
+  boundary as `mmap` does; a large folio is mapped a
   page at a time, so `/proc/<pid>/smaps` and `/proc/meminfo` count no
   `ShmemPmdMapped`, `FilePmdMapped` or `ShmemHugePages` for it and a
   fault maps (and counts in `Rss`) only the pages around it, not the whole

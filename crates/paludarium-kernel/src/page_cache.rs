@@ -1284,6 +1284,9 @@ impl FileHandle for CoherentFile {
     fn charge(&self, offset: u64, len: u64) -> Result<(), Errno> {
         self.inner.charge(offset, len)
     }
+    fn huge_placement(&self) -> bool {
+        self.inner.huge_placement()
+    }
     fn fault(&self, offset: u64, order: u8, advised: Option<bool>) -> Result<(), Errno> {
         self.inner.fault(offset, order, advised)
     }

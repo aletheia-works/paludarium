@@ -2072,7 +2072,11 @@ kernel.
   at offsets aligned as its addresses are, unless it was advised
   `MADV_NOHUGEPAGE`. It is charged whole, after the large folio at the
   end of a file that runs past its end is split to make room
-  (`shmem_unused_huge_shrink`), or else the page alone. The files are held as `shmem`
+  (`shmem_unused_huge_shrink`), or else the page alone. `mmap` without
+  `MAP_FIXED` places a mapping of such a file of 2 MiB or more, unless
+  at a free hint, at a 2 MiB boundary, or as far past one as its offset
+  is past one (`shmem_get_unmapped_area`), so that a fault of it can take
+  a 512-page folio. The files are held as `shmem`
   counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,

@@ -322,6 +322,9 @@ impl FileHandle for Memfd {
         }
         self.file.allocate(offset, len)
     }
+    fn huge_placement(&self) -> bool {
+        self.file.huge_placement()
+    }
     fn charge(&self, offset: u64, len: u64) -> Result<(), Errno> {
         self.file.charge(offset, len)
     }

@@ -3023,17 +3023,17 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, lock: Option<paludarium_mmu:
         const VM_IO: u64 = 1 << 14;
         let view = c.mem.view();
         for m in mappings {
-            if m.prot == Prot::NONE {
-                return err(Errno::ENOMEM);
-            }
-            // A `VM_IO` or `VM_PFNMAP` VMA, such as `[vvar]`, has no page
-            // to bring in: `mlock` of it succeeds though some of its pages
-            // are a bus error to touch, as on Linux v7.0.
+            // Linux's `__mm_populate` passes a `VM_IO` or `VM_PFNMAP` VMA,
+            // such as `[vvar]`, over before it asks whether the VMA is
+            // accessible.
             if view
                 .vma_from(m.start.0.max(start))
                 .is_some_and(|vma| vma.flags & (VM_IO | VM_PFNMAP) != 0)
             {
                 continue;
+            }
+            if m.prot == Prot::NONE {
+                return err(Errno::ENOMEM);
             }
             let write = writes_in(c.mem, &m);
             let mut page = m.start.0.max(start);

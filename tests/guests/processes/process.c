@@ -17439,6 +17439,9 @@ static void vdm_in_child(const char *what, int op) {
             r = mlock((void *)vvar.start, vvar_size);
         } else if (op == 10) {
             r = mlock((void *)vdso.start, vdso_size);
+        } else if (op == 11) {
+            r = mprotect((void *)vvar.start, vvar_size, PROT_NONE);
+            if (!r) r = mlock((void *)vvar.start, vvar_size);
         }
         printf("%s r=%ld errno=%d\n", what, r, r < 0 ? errno : 0);
         fflush(stdout);
@@ -17518,8 +17521,9 @@ static int vdso_mappings_case(void) {
     /* What may be done to them. */
     const char *const ops[] = {"mprotect [vdso] rwx", "mprotect [vvar] rw", "munmap [vdso]", "munmap [vvar]",
                                "mremap [vdso] same size", "mremap [vdso] grow", "mremap [vvar] same size",
-                               "madvise DONTNEED [vvar]", "madvise DONTNEED [vdso]", "mlock [vvar]", "mlock [vdso]"};
-    for (int op = 0; op < 11; op++) vdm_in_child(ops[op], op);
+                               "madvise DONTNEED [vvar]", "madvise DONTNEED [vdso]", "mlock [vvar]", "mlock [vdso]",
+                               "mlock [vvar] PROT_NONE"};
+    for (int op = 0; op < 12; op++) vdm_in_child(ops[op], op);
     /* From outside. paludarium has no /proc/<pid>/mem (limitations). */
     for (int i = 0; i < 3; i += 2) {
         char byte;

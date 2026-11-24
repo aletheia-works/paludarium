@@ -1419,6 +1419,11 @@ struct FrameCell {
     /// cache, a [`SharedPages`] and a [`TlbEntry`] hold the frame without
     /// mapping it, as Linux's page-cache reference does not count.
     maps: AtomicU32,
+    /// How many [`PinnedFrame`]s hold the page (Linux's `FOLL_PIN`
+    /// references): `fork` copies a pinned private page for the child at
+    /// once, so that the page stays the parent's own
+    /// (`page_needs_cow_for_dma`).
+    pins: AtomicU32,
 }
 
 /// The frame a page entry shows, counted in its [`FrameCell::maps`] for as
@@ -1456,6 +1461,118 @@ impl std::ops::Deref for Mapped {
     }
 }
 
+/// A page [`AddressSpace::pin`] holds, as Linux's `pin_user_pages` with
+/// `FOLL_LONGTERM` holds one: its contents, whatever maps the address now,
+/// for as long as it lives. A store through it changes the page as the
+/// device's DMA does, without its entry: the code that a space may have
+/// decoded from it goes stale, as any store to fetched or shared memory
+/// makes it.
+pub struct PinnedFrame {
+    frame: Frame,
+    /// The shared memory or page cache the page is of, whose watchers hear
+    /// of a store ([`SharedPages::changed`]).
+    shared: Option<SharedPages>,
+    /// The counters of the space that pinned it, for a private page.
+    code: Arc<CodeCounters>,
+}
+
+impl PinnedFrame {
+    fn new(frame: Frame, shared: Option<SharedPages>, code: Arc<CodeCounters>) -> Self {
+        frame.pins.fetch_add(1, Ordering::Relaxed);
+        PinnedFrame {
+            frame,
+            shared,
+            code,
+        }
+    }
+}
+
+impl Drop for PinnedFrame {
+    fn drop(&mut self) {
+        self.frame.pins.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The pages of `[addr, addr + len)` that [`AddressSpace::pin`] pinned, and
+/// where the range starts in the first.
+pub struct Pinned {
+    frames: Vec<PinnedFrame>,
+    offset: usize,
+    len: usize,
+}
+
+impl Pinned {
+    /// The length of the range.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    /// Whether the range is empty, which a pin never is.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// The pieces of `[at, at + len)` of the range, clamped to it: the
+    /// page, the offset in it and the length.
+    fn pieces(&self, at: usize, len: usize) -> impl Iterator<Item = (&PinnedFrame, usize, usize)> {
+        let end = at.saturating_add(len).min(self.len);
+        let mut done = at.min(end);
+        std::iter::from_fn(move || {
+            if done >= end {
+                return None;
+            }
+            let from = self.offset + done;
+            let within = from % PAGE_BYTES;
+            let piece = (PAGE_BYTES - within).min(end - done);
+            done += piece;
+            Some((&self.frames[from / PAGE_BYTES], within, piece))
+        })
+    }
+    /// Copies `buf.len()` bytes from offset `at` of the range; past its end
+    /// they are left as they are.
+    pub fn read(&self, at: usize, buf: &mut [u8]) {
+        let mut done = 0;
+        for (frame, within, piece) in self.pieces(at, buf.len()) {
+            match frame.frame.get() {
+                Some(bytes) => bytes.read(within, &mut buf[done..done + piece]),
+                None => buf[done..done + piece].fill(0),
+            }
+            done += piece;
+        }
+    }
+    /// Stores `data` at offset `at` of the range, up to its end.
+    pub fn write(&self, at: usize, data: &[u8]) {
+        let mut done = 0;
+        let mut fetched = false;
+        let mut shared: Vec<&SharedPages> = Vec::new();
+        for (frame, within, piece) in self.pieces(at, data.len()) {
+            if let Some(bytes) = frame.frame.get() {
+                bytes.write(within, &data[done..done + piece]);
+                // A shared page becomes dirty, for write-back, as a store
+                // through a mapping makes it ([`AddressSpace::wrote`]).
+                if frame.shared.is_some() {
+                    bytes.dirty.store(true, Ordering::Release);
+                }
+            }
+            done += piece;
+            match &frame.shared {
+                Some(pages) if !shared.iter().any(|seen| seen.id() == pages.id()) => {
+                    shared.push(pages)
+                }
+                Some(_) => {}
+                None => fetched |= frame.frame.fetched(),
+            }
+        }
+        // After the bytes, as in `AddressSpaceData::store`.
+        if fetched && let Some(frame) = self.frames.first() {
+            frame.code.generation.fetch_add(1, Ordering::Release);
+        }
+        for pages in shared {
+            pages.changed();
+        }
+    }
+}
+
 impl FrameCell {
     #[inline]
     fn get(&self) -> Option<&FrameBytes> {
@@ -1479,6 +1596,7 @@ impl FrameCell {
             bytes: OnceLock::new(),
             fetched: Arc::new(AtomicBool::new(self.fetched())),
             maps: AtomicU32::new(0),
+            pins: AtomicU32::new(0),
         }
     }
 }
@@ -2864,6 +2982,55 @@ impl AddressSpaceData {
             .take_while(|(_, shared)| shared.end > start)
             .any(|(&from, _)| self.gup_refused(from.max(start)))
     }
+    /// Linux's `pin_user_pages` with `FOLL_WRITE | FOLL_LONGTERM`
+    /// ([`AddressSpace::pin`]).
+    fn pin(&self, addr: GuestAddr, len: usize) -> Result<Pinned, Errno> {
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = addr.0.checked_add(len as u64).ok_or(Errno::EOVERFLOW)?;
+        let start = addr.0 - addr.0 % PAGE_SIZE;
+        // `check_vma_flags`: a mapping of no pages or of a `memfd_secret`
+        // file, then a shared mapping of a file whose pages are written back
+        // (`writable_file_mapping_allowed`), which shared memory, a memfd and
+        // tmpfs are not.
+        let written_back = self
+            .shared
+            .range(..end)
+            .rev()
+            .take_while(|(_, shared)| shared.end > start)
+            .any(|(_, shared)| {
+                shared
+                    .pages
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| !source.shmem_file())
+            });
+        if self.gup_refused_in(start, end) || written_back {
+            return Err(Errno::EFAULT);
+        }
+        // The pages fault in to be written, which breaks their copy-on-write
+        // and gives each its own contents; a page that may not be written
+        // (read-only, `PROT_NONE`, none at all) is `EFAULT`.
+        faults::through_gup(|| self.prepare_write(addr, len, Access::Write))
+            .map_err(|_| Errno::EFAULT)?;
+        let directory = self.read_directory();
+        let mut frames = Vec::new();
+        for (page, _, _) in chunks(addr, len) {
+            let entry = lookup(&directory, page).ok_or(Errno::EFAULT)?;
+            let shared = self.shared_at(page).map(|shared| shared.pages.clone());
+            frames.push(PinnedFrame::new(
+                Arc::clone(&entry.frame),
+                shared,
+                Arc::clone(&self.code),
+            ));
+        }
+        Ok(Pinned {
+            frames,
+            offset: page_offset(addr.0),
+            len,
+        })
+    }
     fn shared_at(&self, page: u64) -> Option<&SharedMapping> {
         self.shared
             .range(..=page)
@@ -3786,7 +3953,16 @@ impl AddressSpaceData {
                         .range(..=address)
                         .next_back()
                         .is_some_and(|(_, &end)| address < end);
-                    if !is_shared && !page.cache {
+                    // A pinned page stays the parent's own, and the child gets
+                    // a copy now (`page_needs_cow_for_dma`).
+                    let pinned =
+                        (!is_shared && !page.cache && page.frame.pins.load(Ordering::Relaxed) != 0)
+                            .then(|| copied(&page.frame, self.meter.as_ref()))
+                            .flatten();
+                    if let Some(frame) = pinned {
+                        child.frame = Mapped::new(frame);
+                        child.cow = false;
+                    } else if !is_shared && !page.cache {
                         if page.frame.get().is_some() {
                             page.cow = true;
                             child.cow = true;
@@ -8865,6 +9041,17 @@ impl AddressSpace {
     pub fn refuses_gup(&self, start: u64, end: u64) -> bool {
         self.locked().gup_refused_in(start, end)
     }
+    /// Pins the pages of `[addr, addr + len)` for writing, as Linux's
+    /// `pin_user_pages` with `FOLL_WRITE | FOLL_LONGTERM` does
+    /// (`check_vma_flags`, `writable_file_mapping_allowed`): `EFAULT` for a
+    /// page not mapped or not writable, of a mapping of no pages or of a
+    /// `memfd_secret` file, or of a shared mapping of a file whose pages are
+    /// written back (a disk file's, not shared memory, a memfd or tmpfs);
+    /// `EINVAL` for none and `EOVERFLOW` for a range past the end. The
+    /// pages fault in to be written, which breaks their copy-on-write.
+    pub fn pin(&self, addr: GuestAddr, len: usize) -> Result<Pinned, Errno> {
+        self.locked().pin(addr, len)
+    }
     /// The shared mappings of the space, by address.
     #[must_use]
     pub fn shared_fragments(&self) -> Vec<SharedFragment> {
@@ -9404,6 +9591,160 @@ mod tests {
             .read_for_dump(GuestAddr(at.0 + 300), &mut buf)
             .unwrap();
         assert_eq!(buf, [300, 301, 302, 303].map(pattern));
+    }
+
+    #[test]
+    fn a_pin_holds_its_pages_past_unmap_and_protect() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write(GuestAddr(at.0 + 4090), b"abcdefgh").unwrap();
+        let pinned = space.pin(GuestAddr(at.0 + 4090), 8).unwrap();
+        assert_eq!(pinned.len(), 8);
+        let mut buf = [0u8; 8];
+        pinned.read(0, &mut buf);
+        assert_eq!(&buf, b"abcdefgh");
+        // A store through it shows through the mapping, across both pages.
+        pinned.write(4, b"WXYZ");
+        assert_eq!(byte(&space, at.0 + 4095), b'X');
+        assert_eq!(byte(&space, at.0 + 4096), b'Y');
+        // A read-only mapping or none at all leaves the pinned pages.
+        space.protect(at, 2 * PAGE_SIZE, Prot::READ).unwrap();
+        pinned.write(0, b"1");
+        assert_eq!(byte(&space, at.0 + 4090), b'1');
+        space.unmap(at, 2 * PAGE_SIZE).unwrap();
+        pinned.write(1, b"2");
+        pinned.read(0, &mut buf);
+        assert_eq!(&buf, b"12cdWXYZ");
+        let again = space
+            .map(
+                Some(at),
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        assert_eq!(byte(&space, again.0 + 4090), 0);
+        // Past its end it reads and writes nothing.
+        pinned.write(7, b"89");
+        pinned.read(6, &mut buf[..4]);
+        assert_eq!(&buf[..4], b"Y8cd");
+    }
+
+    #[test]
+    fn a_pin_refuses_what_long_term_pins_refuse() {
+        let mut space = AddressSpace::new();
+        let read_only = space
+            .map(None, PAGE_SIZE, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        let none = space
+            .map(None, PAGE_SIZE, Prot::NONE, MappingKind::Anonymous)
+            .unwrap();
+        for (at, len) in [(read_only.0, 1), (none.0, 1), (0x7000_0000, 1)] {
+            assert_eq!(space.pin(GuestAddr(at), len).err(), Some(Errno::EFAULT));
+        }
+        assert_eq!(space.pin(read_only, 0).err(), Some(Errno::EINVAL));
+        // A shared mapping of a file whose pages are written back.
+        let disk = space
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(Arc::new(Pattern(PAGE_SIZE)));
+        space
+            .share_pages(disk, PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+            .unwrap();
+        assert_eq!(space.pin(disk, 8).err(), Some(Errno::EFAULT));
+        // Its private mapping copies the page, and pins the copy.
+        let private = space
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        space
+            .back_with_cache(private, PAGE_SIZE, &pages, 0)
+            .unwrap();
+        let pinned = space.pin(private, 8).unwrap();
+        pinned.write(0, b"!");
+        assert_eq!(byte(&space, private.0), b'!');
+        let mut cached = [0u8; 1];
+        pages.load(0, &mut cached);
+        assert_eq!(cached[0], pattern(0));
+        // Shared memory is pinned, and its other mappings see the store.
+        let shared = space
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        space.pin(shared, PAGE_BYTES).unwrap().write(9, b"s");
+        assert_eq!(byte(&space, shared.0 + 9), b's');
+    }
+
+    #[test]
+    fn a_pin_of_a_shmem_mapping_dirties_its_page_cache() {
+        struct Shmem;
+        impl PageSource for Shmem {
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+            fn shmem(&self) -> bool {
+                true
+            }
+        }
+        let space = AddressSpace::new();
+        let at = space
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(Arc::new(Shmem));
+        space
+            .share_pages(at, PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+            .unwrap();
+        let pinned = space.pin(at, 8).unwrap();
+        // The pin's fault wrote nothing yet: written back already, clean.
+        pages.write_back(|_, _| Ok(())).unwrap();
+        pinned.write(0, b"shm!");
+        let mut cached = [0u8; 4];
+        pages.load(0, &mut cached);
+        assert_eq!(&cached, b"shm!");
+        // The store is written back to the file.
+        let mut written = Vec::new();
+        pages
+            .write_back(|offset, bytes| {
+                written.push((offset, bytes[..4].to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(written, [(0, b"shm!".to_vec())]);
+    }
+
+    #[test]
+    fn fork_copies_a_pinned_page_for_the_child() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        space.write(at, b"p").unwrap();
+        let pinned = space.pin(at, 1).unwrap();
+        let child = space.fork();
+        // The parent's page stays the pinned one: its stores and the pin's
+        // meet, and the child's copy sees neither.
+        space.write(at, b"q").unwrap();
+        let mut buf = [0u8; 1];
+        pinned.read(0, &mut buf);
+        assert_eq!(&buf, b"q");
+        pinned.write(0, b"r");
+        assert_eq!(byte(&space, at.0), b'r');
+        assert_eq!(byte(&child, at.0), b'p');
+        child.write(at, b"c").unwrap();
+        pinned.read(0, &mut buf);
+        assert_eq!(&buf, b"r");
+        // Once let go of, a fork shares the page until either writes it.
+        drop(pinned);
+        let later = space.fork();
+        assert_eq!(byte(&later, at.0), b'r');
+        later.write(at, b"l").unwrap();
+        assert_eq!(byte(&space, at.0), b'r');
     }
 
     #[test]

@@ -1398,6 +1398,12 @@ verified.
   quit, and waits up to 15 seconds for it to exit. A Safari already running,
   such as your own, is never asked. A Safari that does not quit is logged, not
   killed.
+- safaridriver exits at startup, with no message, if it starts while the
+  previous driver's helper process is still connected to `webinspectord`, or
+  while `webinspectord` is exiting after its last client left. So after
+  safaridriver stops, the test driver waits up to 15 seconds for that helper
+  and each `webinspectord` to exit. One that keeps running, such as a
+  `webinspectord` serving another client, is logged, not killed.
 
 ## Found a problem?
 

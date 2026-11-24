@@ -249,9 +249,10 @@ impl Mapping {
             attr.flag(bit::MMAP_DATA)
         }
     }
-    /// `perf_event_mmap_output` for `event`, by thread `who`: a build ID
-    /// is never given (`PERF_RECORD_MISC_MMAP_BUILD_ID`), as if none were
-    /// found, and the inode's generation is 0.
+    /// `perf_event_mmap_output` for `event`, by thread `who`: the file's
+    /// build ID is given only to an `mmap2` event with `build_id`, in place
+    /// of the device and inode (`PERF_RECORD_MISC_MMAP_BUILD_ID`), and the
+    /// inode's generation is 0.
     fn write(&self, event: &Arc<Event>, who: &Who) {
         let mut body = event.pid_tid_of(who.pid, who.tid).to_vec();
         put(&mut body, self.start);

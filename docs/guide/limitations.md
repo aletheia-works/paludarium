@@ -540,14 +540,18 @@ verified.
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
+  `IORING_REGISTER_BUFFERS2`, `IORING_REGISTER_BUFFERS_UPDATE`,
   `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
   `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the
   others give `EINVAL`). So no ring descriptor or personality can be
-  registered, buffers cannot be updated, and buffers cannot be registered
-  with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
+  registered. `IORING_REGISTER_BUFFERS_UPDATE` reads each slot's `iovec`
+  before its tag and refuses `IORING_RSRC_UPDATE_EXTENDED`, as Linux 7.0,
+  the kernel the differential tests run on, does; Linux master reads the
+  tag first and takes that flag's `struct io_uring_regbuf_desc`s. This
+  follows master once the test runners' kernel does. A process's
   whole exit cancels the requests its threads submitted that wait for
   their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
   the kernel the differential tests run on, cancels them only once their

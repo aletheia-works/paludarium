@@ -1941,7 +1941,25 @@ kernel.
   registering process's pages; `fork` gives the child a copy of a pinned
   private page, so the parent's later writes are what the ring moves
   (`page_needs_cow_for_dma`). `IORING_UNREGISTER_BUFFERS` takes no
-  argument (`EINVAL`) and needs buffers (`ENXIO`). `IORING_OP_READ_FIXED` and
+  argument (`EINVAL`) and needs buffers (`ENXIO`).
+
+  `IORING_REGISTER_BUFFERS2` registers them with tags, as Linux 7.0's
+  `io_register_rsrc` does. Its `struct io_uring_rsrc_register` must be
+  whole (`EINVAL`), with a count, no reserved field and no flag but
+  `IORING_RSRC_REGISTER_SPARSE`, which takes no `iovec`s and leaves every
+  slot empty. Each slot's tag is read after its `iovec` (`EFAULT`), and an
+  empty slot may have none (`EINVAL`). `IORING_REGISTER_BUFFERS_UPDATE`
+  (`io_register_rsrc_update`) puts new buffers, or none, in a run of
+  slots: a whole `struct io_uring_rsrc_update2` with a count and no
+  reserved field (`EINVAL`), an offset and count that do not wrap
+  (`EOVERFLOW`), buffers (`ENXIO`) and slots that are there (`EINVAL`).
+  It gives how many slots it updated, or the first slot's error. A buffer
+  that leaves its slot, by an update or as the buffers are unregistered
+  (the last slot first), posts its tag, if not 0, as the `user_data` of a
+  completion of 0 once nothing holds it, and gives its RLIMIT_MEMLOCK
+  pages back. A fixed transfer, or a NOP with `IORING_NOP_FIXED_BUFFER`,
+  holds its buffer until its completion is posted. A failed registration
+  posts no tag. `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
 

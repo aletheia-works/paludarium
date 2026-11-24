@@ -10992,6 +10992,148 @@ static int io_uring_held_tag_case(void) {
     return 0;
 }
 
+/* IORING_REGISTER_BUFFERS2 and _BUFFERS_UPDATE: buffers with tags. A
+   tag is the user_data of a completion of 0 once nothing holds its
+   buffer: once an update replaces it, or the buffers are unregistered,
+   the last slot first. A failed registration posts none, and an update
+   gives how many slots it updated. */
+struct ub2_register {
+    unsigned nr, flags;
+    unsigned long resv2, data, tags;
+};
+
+struct ub2_update {
+    unsigned offset, resv;
+    unsigned long data, tags;
+    unsigned nr, resv2;
+};
+
+static long ub2_register(struct uring *u, struct ub2_register *rr, unsigned size) {
+    return syscall(427, u->fd, 15, rr, size);
+}
+
+static long ub2_update(struct uring *u, struct ub2_update *up, unsigned size) {
+    return syscall(427, u->fd, 16, up, size);
+}
+
+static int io_uring_buffers2_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    char *page = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 81;
+    int fd = open("buffers2", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 82;
+    unlink("buffers2");
+    struct iovec iov[2];
+    unsigned long tags[2];
+    struct ub2_register rr;
+    struct ub2_update up;
+
+    /* io_register_rsrc's checks. */
+    memset(&rr, 0, sizeof rr);
+    rr.nr = 2;
+    uring_show("size", ub2_register(&u, &rr, sizeof rr - 1));
+    rr.nr = 0;
+    uring_show("no-count", ub2_register(&u, &rr, sizeof rr));
+    rr.nr = 2;
+    rr.flags = 2;
+    uring_show("unknown-flag", ub2_register(&u, &rr, sizeof rr));
+    rr.flags = 1;
+    rr.data = (unsigned long)iov;
+    uring_show("sparse-with-data", ub2_register(&u, &rr, sizeof rr));
+    rr.flags = 0;
+    rr.resv2 = 1;
+    uring_show("resv2", ub2_register(&u, &rr, sizeof rr));
+    rr.resv2 = 0;
+    memset(&up, 0, sizeof up);
+    up.nr = 1;
+    up.data = (unsigned long)iov;
+    uring_show("update-none", ub2_update(&u, &up, sizeof up));
+
+    /* A failed registration posts no tag; a tag on an empty slot fails. */
+    iov[0] = (struct iovec){page, 4096};
+    iov[1] = (struct iovec){NULL, 1};
+    tags[0] = 4;
+    tags[1] = 5;
+    rr.data = (unsigned long)iov;
+    rr.tags = (unsigned long)tags;
+    uring_show("register-bad", ub2_register(&u, &rr, sizeof rr));
+    iov[1] = (struct iovec){NULL, 0};
+    uring_show("register-tag-empty", ub2_register(&u, &rr, sizeof rr));
+    uring_reap(&u, "no-tags");
+
+    /* A sparse table, then the update's checks. */
+    memset(&rr, 0, sizeof rr);
+    rr.nr = 2;
+    rr.flags = 1;
+    uring_show("sparse", ub2_register(&u, &rr, sizeof rr));
+    uring_show("again", ub2_register(&u, &rr, sizeof rr));
+    up = (struct ub2_update){0, 0, (unsigned long)iov, (unsigned long)tags, 1, 0};
+    uring_show("update-size", ub2_update(&u, &up, sizeof up - 1));
+    up.nr = 0;
+    uring_show("update-no-count", ub2_update(&u, &up, sizeof up));
+    up.nr = 2;
+    up.offset = 1;
+    uring_show("update-past", ub2_update(&u, &up, sizeof up));
+    up.offset = 0xffffffff;
+    up.nr = 1;
+    uring_show("update-wraps", ub2_update(&u, &up, sizeof up));
+    up.offset = 0;
+    up.resv = 1;
+    uring_show("update-resv", ub2_update(&u, &up, sizeof up));
+    up.resv = 0;
+    iov[0] = (struct iovec){NULL, 0};
+    tags[0] = 7;
+    uring_show("update-tag-empty", ub2_update(&u, &up, sizeof up));
+
+    /* A tagged buffer moves bytes; replacing it posts its tag. */
+    iov[0] = (struct iovec){page, 4096};
+    tags[0] = 9;
+    up.offset = 1;
+    uring_show("update", ub2_update(&u, &up, sizeof up));
+    memcpy(page, "tag!", 4);
+    unsigned char *sqe = uring_push(&u, 5, 1);
+    memcpy(sqe + 4, &fd, 4);
+    unsigned long a = (unsigned long)page;
+    memcpy(sqe + 16, &a, 8);
+    unsigned len = 4;
+    memcpy(sqe + 24, &len, 4);
+    unsigned short index = 1;
+    memcpy(sqe + 40, &index, 2);
+    up_submit(&u, "write-fixed");
+    iov[0] = (struct iovec){page, 16};
+    iov[1] = (struct iovec){NULL, 1};
+    tags[0] = 0;
+    tags[1] = 0;
+    up.offset = 0;
+    up.nr = 2;
+    uring_show("update-partial", ub2_update(&u, &up, sizeof up));
+    uring_reap(&u, "partial");
+    up.offset = 1;
+    up.nr = 1;
+    uring_show("update-replace", ub2_update(&u, &up, sizeof up));
+    uring_reap(&u, "replaced");
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    uring_reap(&u, "unregistered");
+
+    /* Unregistering posts the tags of what is left, the last slot first. */
+    iov[0] = (struct iovec){page, 16};
+    iov[1] = (struct iovec){page + 4096, 16};
+    tags[0] = 3;
+    tags[1] = 6;
+    memset(&rr, 0, sizeof rr);
+    rr.nr = 2;
+    rr.data = (unsigned long)iov;
+    rr.tags = (unsigned long)tags;
+    uring_show("register-tags", ub2_register(&u, &rr, sizeof rr));
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    uring_reap(&u, "unregister-tags");
+    close(fd);
+    close(u.fd);
+    munmap(page, 2 * 4096);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -39568,6 +39710,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
     if (!strcmp(mode, "io-uring-pinned")) return io_uring_pinned_case();
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
+    if (!strcmp(mode, "io-uring-buffers2")) return io_uring_buffers2_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

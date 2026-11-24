@@ -456,14 +456,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
-  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_FILES`、
+  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
+  `IORING_REGISTER_BUFFERS_UPDATE`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
   `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、
   `IORING_REGISTER_SYNC_CANCEL` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
-  パーソナリティは登録できず、バッファーは更新できません。タグを付ける
-  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。プロセス全体が
+  パーソナリティは登録できません。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
+  カーネルである Linux 7.0 と同じく、スロットごとに `iovec` をタグより先に読み、
+  `IORING_RSRC_UPDATE_EXTENDED` を断ります。Linux master はタグを先に読み、そのフラグの
+  `struct io_uring_regbuf_desc` を受け付けます。テストを走らせるカーネルが追いつけば master に
+  合わせます。プロセス全体が
   終わると、そのスレッドが投入してファイルを待っている要求は、Linux master の
   `io_task_group_exiting` と同じく取り消されます。差分テストを走らせるカーネルである
   Linux 7.0 は、ひとりで終わるスレッドのときと同じく、ファイルの準備ができてから取り消します。

@@ -519,6 +519,7 @@
     {"name":"io-uring-exit","binary":"process"},
     {"name":"io-uring-pinned","binary":"process"},
     {"name":"io-uring-held-tag","binary":"process"},
+    {"name":"io-uring-buffers2","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

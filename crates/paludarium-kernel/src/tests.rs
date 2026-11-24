@@ -5430,6 +5430,99 @@ mod io_uring {
         assert_eq!(one(&mut f, &r, &rd), -14);
     }
 
+    /// A `struct io_uring_rsrc_register` at `at`.
+    fn rsrc_register(f: &Fixture, at: u64, count: u32, flags: u32, data: u64, tags: u64) {
+        let mut rr = [0u8; 32];
+        rr[..4].copy_from_slice(&count.to_le_bytes());
+        rr[4..8].copy_from_slice(&flags.to_le_bytes());
+        rr[16..24].copy_from_slice(&data.to_le_bytes());
+        rr[24..].copy_from_slice(&tags.to_le_bytes());
+        f.mem.write(GuestAddr(at), &rr).unwrap();
+    }
+
+    /// A `struct io_uring_rsrc_update2` at `at`.
+    fn rsrc_update(f: &Fixture, at: u64, offset: u32, data: u64, tags: u64, count: u32) {
+        let mut up = [0u8; 32];
+        up[..4].copy_from_slice(&offset.to_le_bytes());
+        up[8..16].copy_from_slice(&data.to_le_bytes());
+        up[16..24].copy_from_slice(&tags.to_le_bytes());
+        up[24..28].copy_from_slice(&count.to_le_bytes());
+        f.mem.write(GuestAddr(at), &up).unwrap();
+    }
+
+    #[test]
+    fn registered_buffers_carry_tags_and_take_updates() {
+        const BUFFERS2: u64 = 15;
+        const UPDATE: u64 = 16;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (arg, vec, tags, buf) = (DATA + 0x100, DATA + 0x180, DATA + 0x1c0, DATA + 0x800);
+        let tag_list = |f: &Fixture, list: &[u64]| {
+            for (i, t) in list.iter().enumerate() {
+                f.mem.write_u64(GuestAddr(tags + 8 * i as u64), *t).unwrap();
+            }
+        };
+        // `io_register_rsrc`'s checks.
+        rsrc_register(&f, arg, 2, 0, 0, 0);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 31]), errno(Errno::EINVAL));
+        for (count, flags, data) in [(0, 0, 0), (2, 2, 0), (2, 1, vec)] {
+            rsrc_register(&f, arg, count, flags, data, 0);
+            assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), errno(Errno::EINVAL));
+        }
+        // Updating no table.
+        rsrc_update(&f, arg, 0, vec, 0, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), errno(ENXIO));
+        // A failed registration posts no tag.
+        iovecs(&f, vec, &[(buf, 0x100), (0x40_0000, 1)]);
+        tag_list(&f, &[4, 5]);
+        rsrc_register(&f, arg, 2, 0, vec, tags);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), errno(Errno::EFAULT));
+        assert_eq!(reap(&mut f, &r), []);
+        // A sparse table of two.
+        rsrc_register(&f, arg, 2, 1, 0, 0);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), 0);
+        // The update's checks.
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 31]), errno(Errno::EINVAL));
+        for (offset, count, e) in [
+            (0, 0, Errno::EINVAL),
+            (1, 2, Errno::EINVAL),
+            (u32::MAX, 1, EOVERFLOW),
+        ] {
+            rsrc_update(&f, arg, offset, vec, 0, count);
+            assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), errno(e));
+        }
+        // A tag on an empty slot, then a buffer with one.
+        iovecs(&f, vec, &[(0, 0)]);
+        tag_list(&f, &[7]);
+        rsrc_update(&f, arg, 0, vec, tags, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), errno(Errno::EINVAL));
+        iovecs(&f, vec, &[(buf, 0x100)]);
+        tag_list(&f, &[9]);
+        rsrc_update(&f, arg, 1, vec, tags, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), 1);
+        f.mem.write(GuestAddr(DATA), b"/t\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        f.mem.write(GuestAddr(buf), b"tag!").unwrap();
+        assert_eq!(one(&mut f, &r, &fixed(WRITE_FIXED, fd, 0, buf, 4, 1)), 4);
+        // Replacing it posts its tag; a partial update gives how many it did.
+        iovecs(&f, vec, &[(buf, 0x10), (0x40_0000, 1)]);
+        tag_list(&f, &[0, 0]);
+        rsrc_update(&f, arg, 0, vec, tags, 2);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), []);
+        rsrc_update(&f, arg, 1, vec, tags, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), [(9, 0)]);
+        // Unregistering posts the tags of what is left, the last slot first.
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        iovecs(&f, vec, &[(buf, 0x10), (buf + 0x10, 0x10)]);
+        tag_list(&f, &[3, 6]);
+        rsrc_register(&f, arg, 2, 0, vec, tags);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        assert_eq!(reap(&mut f, &r), [(6, 0), (3, 0)]);
+    }
+
     #[test]
     fn a_registered_buffer_keeps_its_pages_past_munmap() {
         let mut f = fixture();
@@ -6474,26 +6567,6 @@ mod io_uring {
             batch(&mut f, &r, &[head, nop(13, 0, 0, 0, 0)]),
             [(12, -9), (13, -125)]
         );
-    }
-
-    /// A `struct io_uring_rsrc_register` at `at`.
-    fn rsrc_register(f: &Fixture, at: u64, count: u32, flags: u32, data: u64, tags: u64) {
-        let mut rr = [0u8; 32];
-        rr[..4].copy_from_slice(&count.to_le_bytes());
-        rr[4..8].copy_from_slice(&flags.to_le_bytes());
-        rr[16..24].copy_from_slice(&data.to_le_bytes());
-        rr[24..].copy_from_slice(&tags.to_le_bytes());
-        f.mem.write(GuestAddr(at), &rr).unwrap();
-    }
-
-    /// A `struct io_uring_rsrc_update2` at `at`.
-    fn rsrc_update(f: &Fixture, at: u64, offset: u32, data: u64, tags: u64, count: u32) {
-        let mut up = [0u8; 32];
-        up[..4].copy_from_slice(&offset.to_le_bytes());
-        up[8..16].copy_from_slice(&data.to_le_bytes());
-        up[16..24].copy_from_slice(&tags.to_le_bytes());
-        up[24..28].copy_from_slice(&count.to_le_bytes());
-        f.mem.write(GuestAddr(at), &up).unwrap();
     }
 
     #[test]

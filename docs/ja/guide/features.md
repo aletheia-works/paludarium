@@ -1701,7 +1701,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   するプロセスは登録したプロセスのページを動かします。`fork` は固定したプライベートな
   ページのコピーを子に渡すので、リングが動かすのは親がそのあと書いたものです
   （`page_needs_cow_for_dma`）。`IORING_UNREGISTER_BUFFERS` は引数を取らず（`EINVAL`）、
-  登録がなければ `ENXIO` です。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
+  登録がなければ `ENXIO` です。
+
+  `IORING_REGISTER_BUFFERS2` は、Linux 7.0 の `io_register_rsrc` と同じく、タグを付けて
+  バッファーを登録します。`struct io_uring_rsrc_register` は欠けがなく（`EINVAL`）、数があり、
+  予約した欄が 0 で、フラグは `IORING_RSRC_REGISTER_SPARSE` だけでなければなりません。この
+  フラグは `iovec` を取らず、すべてのスロットを空にします。スロットごとのタグは `iovec` の
+  あとに読み（`EFAULT`）、空のスロットはタグを持てません（`EINVAL`）。
+  `IORING_REGISTER_BUFFERS_UPDATE`（`io_register_rsrc_update`）は、続いたスロットに新しい
+  バッファーか空を入れます。欠けのない `struct io_uring_rsrc_update2` に数があり、予約した
+  欄が 0 で（`EINVAL`）、オフセットと数が一周せず（`EOVERFLOW`）、バッファーがあり
+  （`ENXIO`）、スロットが範囲内（`EINVAL`）でなければなりません。更新したスロットの数を返し、
+  1 つも更新できなければ最初のスロットの誤りを返します。更新か登録の解除（最後のスロットから）
+  でスロットを離れたバッファーは、何も持たなくなったときに、0 でなければタグを結果 0 の完了の
+  `user_data` として投稿し、RLIMIT_MEMLOCK のページを返します。固定バッファーの転送と
+  `IORING_NOP_FIXED_BUFFER` の NOP は、完了を投稿するまでバッファーを持ちます。失敗した登録は
+  タグを投稿しません。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。
 

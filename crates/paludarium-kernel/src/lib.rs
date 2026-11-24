@@ -7,6 +7,10 @@
 //! exceptions end the process with the matching signal; the core emulator
 //! records signal registrations but never delivers signals.
 #![forbid(unsafe_code)]
+// Proving that `Kernel` is `Send` walks every type it holds, its child
+// `Kernel`s' among them, and io_uring's registered buffers (their pinned
+// pages) take it past the default depth of 128.
+#![recursion_limit = "256"]
 
 mod admin;
 mod arguments;

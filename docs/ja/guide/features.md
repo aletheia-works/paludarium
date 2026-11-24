@@ -1582,7 +1582,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
-  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、それに `IORING_OP_ASYNC_CANCEL` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、それにソケットの要求
+  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
@@ -1708,6 +1709,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルはないので `EINVAL` になります。`IORING_OP_FSYNC` が受け付けるフラグは
   `IORING_FSYNC_DATASYNC` だけです。
 
+- ソケットの要求は Linux 7.0 の単発のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
+  `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。どれも Linux と同じく準備し、
+  エントリーを調べ（`EINVAL`）、次に接続や送信のアドレスを読み（`move_addr_to_kernel`。128 バイトを
+  超えれば `EINVAL`、読めなければ `EFAULT`）、バッファーがユーザー空間にあるかを調べます
+  （`EFAULT`）。実行は Linux がその場で実行するのと同じく待たずに行います。待つはずの要求
+  （`EAGAIN`、または進行中の接続）は、見つけたファイルを持ったままソケットを待ち、ソケットの
+  準備ができるともう一度実行します。ただし待たないように頼んだもの（`MSG_DONTWAIT`、
+  `IORING_ACCEPT_DONTWAIT`）は `EAGAIN` で完了します。`IORING_RECVSEND_POLL_FIRST` と
+  `IORING_ACCEPT_POLL_FIRST` は先に待ちます。送信は `MSG_NOSIGNAL` を加えます。`MSG_WAITALL` では、
+  ストリームまたは順序付きパケットのソケットの送受信は長さ全体まで続け、動かした分をすべて
+  返します。受信は提供されたバッファーを選べ（`ENOBUFS`）、そのバッファーは、Linux master の
+  `io_recv` が返すのと同じく、受信が待つあいだと、何も読まなかったときにグループへ戻ります。
+  受信は、TCP ソケット（または `tcp_inq_hint` と同じく相手が終えたあと）か AF_UNIX のストリームに
+  バイトが残っているあいだ、受け付けは TCP の接続がまだ待っているあいだ
+  `IORING_CQE_F_SOCK_NONEMPTY` を持ちます。新しいソケットや接続は、先に取る空いている最小の
+  記述子（`EMFILE`）か、登録したスロット（`file_index` はスロットの番号に 1 を足したもの。
+  `IORING_FILE_INDEX_ALLOC` なら空いているスロットで、なければ `ENFILE`。登録したファイルがなければ
+  `ENXIO`、その範囲を越えれば `EINVAL`）に入り、スロットは `SOCK_CLOEXEC` と組み合わせられません。
+  進行中の接続は、ソケットにエラーがあればそのエラーで、接続できれば 0 で完了します。Linux master と
+  同じく、受信は `IORING_RECVSEND_POLL_FIRST` で待つ前にソケットかどうかを調べ（`ENOTSOCK`）、
+  非ブロッキングのソケットの接続が `EAGAIN`（AF_UNIX のリスナーのバックログがいっぱい）なら、
+  それで完了します。Linux 7.0 はソケットを待ってからやり直します。
+
 - `IORING_REGISTER_BUFFERS` は、Linux の `io_sqe_buffers_register` と同じくリングの
   バッファーを登録します。調べる順は次のとおりです。
   - まだ登録していないこと（`EBUSY`）と、1 から 16384 個であること（`EINVAL`）。
@@ -1796,7 +1820,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     投入の完了より先ですが、その投入の要求がファイルを持っていればそれらの後です。失敗した
     登録はタグを投稿しません。
 
-- リングはバッファーのグループを保ち、`IOSQE_BUFFER_SELECT` の読み出しは `buf_group` が
+- リングはバッファーのグループを保ち、`IOSQE_BUFFER_SELECT` の読み出しやソケットの受信は `buf_group` が
   指すグループからその 1 つを選びます。Linux の `io_uring/kbuf.c` と同じです。読み出しは
   長さの分まで（長さがなければバッファー全体）で、完了のフラグには `IORING_CQE_F_BUFFER` と、
   上位 16 ビットにバッファーの ID が入ります。グループに残りがないか、グループがなければ

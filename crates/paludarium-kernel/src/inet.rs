@@ -1547,10 +1547,10 @@ impl Network {
 /// ICMP datagram is `EACCES`, as outside `net.ipv4.ping_group_range`; a raw
 /// socket is `EPERM`; any other type `ESOCKTNOSUPPORT`.
 pub(crate) fn socket(
-    c: &mut Context<'_>,
+    c: &Context<'_>,
     a: [u64; 6],
     network: &Arc<Network>,
-) -> Result<u64, Errno> {
+) -> Result<Arc<dyn FileHandle>, Errno> {
     let flags = a[1] as u32 & (NONBLOCK | CLOEXEC);
     let family = if a[0] == u64::from(AF_INET) {
         Family::V4
@@ -1580,9 +1580,7 @@ pub(crate) fn socket(
         options.send_buffer = 212_992;
         options.receive_buffer = 212_992;
     }
-    c.files
-        .install(socket, flags & CLOEXEC != 0, c.group.nofile())
-        .map(u64::from)
+    Ok(socket)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2251,6 +2249,10 @@ impl InetSocket {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Whether this is a UDP socket, not a TCP one.
+    pub(crate) fn is_datagram(&self) -> bool {
+        self.datagram
+    }
     /// Takes the pending error (`sock_error`), as `SO_ERROR` does.
     pub(crate) fn take_error(&self) -> Option<Errno> {
         let mut s = self.lock();
@@ -2433,14 +2435,20 @@ impl InetSocket {
     }
 
     /// Starts connecting to `address`, or goes on with a connection already
-    /// started; waits for it unless the socket is nonblocking. As Linux's
+    /// started; waits for it unless the socket is nonblocking or `nowait`
+    /// (an io_uring request's issue, as `O_NONBLOCK`). As Linux's
     /// `__inet_stream_connect`: `EISCONN` once connected or listening,
     /// `EALREADY` while still connecting, `EINPROGRESS` when a nonblocking
     /// one starts, and the pending error, or `ECONNABORTED`, when it failed.
     /// A loopback address where a guest socket listens is reached in the
     /// kernel; one where none does is refused, unless the policy allows the
     /// host's.
-    fn connect(&self, c: &mut Context<'_>, address: Option<SocketAddr>) -> Result<u64, Errno> {
+    fn connect(
+        &self,
+        c: &mut Context<'_>,
+        address: Option<SocketAddr>,
+        nowait: bool,
+    ) -> Result<u64, Errno> {
         if self.datagram {
             return self.connect_datagram(address);
         }
@@ -2567,7 +2575,7 @@ impl InetSocket {
                     // the answer only once connect has returned, even on its
                     // loopback, so a nonblocking one is in progress however
                     // soon its listener, or the host, opens the connection.
-                    if self.nonblocking() {
+                    if nowait || self.nonblocking() {
                         return Err(EINPROGRESS);
                     }
                     EINPROGRESS
@@ -2594,7 +2602,7 @@ impl InetSocket {
                     self.renew(&mut s);
                     return Err(error);
                 }
-                Phase::Connecting if self.nonblocking() => return Err(pending),
+                Phase::Connecting if nowait || self.nonblocking() => return Err(pending),
                 // Past `SO_SNDTIMEO`, Linux's `__inet_stream_connect` gives
                 // the error of the state it found: `EALREADY` once one was
                 // in progress.
@@ -3473,9 +3481,10 @@ impl InetSocket {
     }
     /// The first connection waiting on this listener, as Linux's
     /// `inet_csk_accept`: `EINVAL` unless listening (`EOPNOTSUPP` for UDP),
-    /// `EAGAIN` when none waits and the socket is nonblocking, or once
-    /// `SO_RCVTIMEO` has passed.
-    fn accept(&self, c: &mut Context<'_>) -> Result<Arc<InetSocket>, Errno> {
+    /// `EAGAIN` when none waits and the socket is nonblocking or `nowait`
+    /// (as `connect`), or once `SO_RCVTIMEO` has passed. With the
+    /// connection, whether more still wait (`arg->is_empty`).
+    fn accept(&self, c: &mut Context<'_>, nowait: bool) -> Result<(Arc<InetSocket>, bool), Errno> {
         if self.datagram {
             return Err(EOPNOTSUPP);
         }
@@ -3488,12 +3497,15 @@ impl InetSocket {
                 let Some(listen) = s.listen.as_mut() else {
                     return Err(Errno::EINVAL);
                 };
-                listen.ready.pop_front()
+                listen
+                    .ready
+                    .pop_front()
+                    .map(|child| (child, !listen.ready.is_empty()))
             };
-            if let Some(child) = child {
-                return Ok(child);
+            if let Some(accepted) = child {
+                return Ok(accepted);
             }
-            if self.nonblocking() {
+            if nowait || self.nonblocking() {
                 return Err(Errno::EAGAIN);
             }
             let Some(deadline) = wait.deadline(c)? else {
@@ -4881,8 +4893,7 @@ pub(crate) fn dispatch(
         // connect
         42 => {
             let raw = read_raw(c, a[1], a[2])?;
-            socket.landlock(c, &raw, crate::landlock::CONNECT_TCP)?;
-            socket.connect(c, parse_address(socket.family, &raw)?)
+            connect_raw(c, socket, &raw, false)
         }
         // accept and accept4
         43 | 288 => accept(c, socket, a, if number == 288 { a[3] } else { 0 }),
@@ -5025,33 +5036,69 @@ fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> 
         return Err(Errno::EINVAL);
     }
     let fd = c.files.reserve(c.group.nofile())?;
-    let child = match socket.accept(c) {
-        Ok(child) => child,
+    let child = match accepted(c, socket, a[1], a[2], flags, false) {
+        Ok((child, _)) => child,
         Err(e) => {
             c.files.unreserve(fd);
             return Err(e);
         }
     };
+    let cloexec = flags & u64::from(CLOEXEC) != 0;
+    c.files
+        .fill(fd, crate::files::Descriptor::unnamed(child, cloexec));
+    Ok(u64::from(fd))
+}
+/// The connection `accept` takes on `socket`, made the caller's, with
+/// `SOCK_NONBLOCK` of `flags` and its peer's address written to `at` (none
+/// when 0) within the room `len` gives; with whether more wait. `nowait` is
+/// as for [`InetSocket::accept`].
+fn accepted(
+    c: &mut Context<'_>,
+    socket: &InetSocket,
+    at: u64,
+    len: u64,
+    flags: u64,
+    nowait: bool,
+) -> Result<(Arc<InetSocket>, bool), Errno> {
+    let (child, more) = socket.accept(c, nowait)?;
     child.own(c);
     child.embryo.store(false, Ordering::SeqCst);
     if flags & u64::from(NONBLOCK) != 0 {
         child.flags.store(2 | NONBLOCK, Ordering::SeqCst);
     }
-    if a[1] != 0 {
+    if at != 0 {
         let peer = child.remote().unwrap_or(match socket.family {
             Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         });
         let peer = scoped(peer, child.options().device);
-        if let Err(e) = write_address(c, &encode_address(socket.family, peer), a[1], a[2]) {
-            c.files.unreserve(fd);
-            return Err(e);
-        }
+        write_address(c, &encode_address(socket.family, peer), at, len)?;
     }
-    let cloexec = flags & u64::from(CLOEXEC) != 0;
-    c.files
-        .fill(fd, crate::files::Descriptor::unnamed(child, cloexec));
-    Ok(u64::from(fd))
+    Ok((child, more))
+}
+/// An io_uring accept on `file` (`crate::sockets::accept_file`).
+pub(crate) fn accept_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    at: u64,
+    len: u64,
+    flags: u64,
+    nowait: bool,
+) -> Result<(Arc<dyn FileHandle>, bool), Errno> {
+    let socket = of(file).ok_or(ENOTSOCK)?;
+    let (child, more) = accepted(c, socket, at, len, flags, nowait)?;
+    Ok((child, more))
+}
+/// `connect` of `socket` to the address `raw`, as Landlock allows it;
+/// `nowait` is as for [`InetSocket::connect`].
+pub(crate) fn connect_raw(
+    c: &mut Context<'_>,
+    socket: &InetSocket,
+    raw: &[u8],
+    nowait: bool,
+) -> Result<u64, Errno> {
+    socket.landlock(c, raw, crate::landlock::CONNECT_TCP)?;
+    socket.connect(c, parse_address(socket.family, raw)?, nowait)
 }
 /// What a receive returns: with `MSG_TRUNC`, a datagram's whole length.
 fn returned(received: &Received, flags: u64, datagram: bool) -> usize {

@@ -11417,6 +11417,289 @@ static int io_uring_held_buffer_case(void) {
     return 0;
 }
 
+/* io_uring's socket requests on AF_UNIX sockets, as Linux 7.0's
+   io_uring/net.c has them: what their preparation refuses, sends and
+   receives (one that waits for its socket, one that waits for the whole
+   length, IORING_RECVSEND_POLL_FIRST, IORING_CQE_F_SOCK_NONEMPTY), a
+   shutdown, a socket, accept and connect, registered slots, and the
+   provided buffer a waiting receive gives back. */
+static unsigned char *unet_push(struct uring *u, unsigned char op, unsigned long data, int fd,
+                                unsigned long off, unsigned long addr, unsigned len, unsigned rw,
+                                unsigned short prio) {
+    unsigned char *sqe = uring_push(u, op, data);
+    memcpy(sqe + 2, &prio, 2);
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 8, &off, 8);
+    memcpy(sqe + 16, &addr, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 28, &rw, 4);
+    return sqe;
+}
+
+/* The completions, with their flags; a descriptor as "fd". It gives the
+   last one's result. */
+static int unet_reap(struct uring *u, const char *label, int fds) {
+    int last = 0;
+    unsigned head = *u32p(u->rings, 8);
+    unsigned tail = __atomic_load_n(u32p(u->rings, 12), __ATOMIC_ACQUIRE);
+    printf("%s:", label);
+    for (; head != tail; head++) {
+        unsigned char *cqe = u->rings + 64 + 16 * (head & (u->cq_entries - 1));
+        unsigned long data;
+        int res;
+        unsigned flags;
+        memcpy(&data, cqe, 8);
+        memcpy(&res, cqe + 8, 4);
+        memcpy(&flags, cqe + 12, 4);
+        if (fds && res > 0)
+            printf(" %lu=fd/%#x", data, flags);
+        else
+            printf(" %lu=%d/%#x", data, res, flags);
+        last = res;
+    }
+    printf("\n");
+    __atomic_store_n(u32p(u->rings, 8), head, __ATOMIC_RELEASE);
+    return last;
+}
+
+/* Submits what was pushed and waits for `wait` completions. */
+static int unet_run(struct uring *u, unsigned submit, unsigned wait, const char *label, int fds) {
+    uring_enter(u->fd, submit, wait, 1, NULL, 0);
+    return unet_reap(u, label, fds);
+}
+
+static int io_uring_net_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 81;
+    char got[64], put[] = "hello";
+    struct sockaddr_un name = {.sun_family = AF_UNIX};
+    memcpy(name.sun_path + 1, "pal-uring-net", 13);
+    socklen_t name_len = offsetof(struct sockaddr_un, sun_path) + 14;
+    unsigned char *sqe;
+    unsigned long big = 1ul << 63;
+
+    /* The preparation. */
+    unet_push(&u, 34, 1, sv[0], 1, 0, 1, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-off", 0);
+    unet_push(&u, 34, 1, sv[0], 0, 1, 1, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-addr", 0);
+    unet_push(&u, 34, 1, sv[0], 0, 0, 1, 1, 0);
+    unet_run(&u, 1, 1, "shutdown-flags", 0);
+    sqe = unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 0);
+    sqe[40] = 1;
+    unet_run(&u, 1, 1, "shutdown-buf-index", 0);
+    sqe = unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "shutdown-splice", 0);
+    unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 1);
+    unet_run(&u, 1, 1, "shutdown-ioprio", 0);
+    sqe = unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 0);
+    sqe[1] = 1 << 5;
+    unet_run(&u, 1, 1, "shutdown-select", 0);
+    unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM, 1, 0, 0, 0);
+    unet_run(&u, 1, 1, "socket-addr", 0);
+    unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM, 0, 0, 1, 0);
+    unet_run(&u, 1, 1, "socket-rw", 0);
+    sqe = unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "socket-cloexec-slot", 0);
+    unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM | 0x10, 0, 0, 0, 0);
+    unet_run(&u, 1, 1, "socket-flags", 0);
+    unet_push(&u, 13, 3, sv[0], 0, 0, 1, 0, 0);
+    unet_run(&u, 1, 1, "accept-len", 0);
+    sqe = unet_push(&u, 13, 3, sv[0], 0, 0, 0, 0, 0);
+    sqe[40] = 1;
+    unet_run(&u, 1, 1, "accept-buf-index", 0);
+    unet_push(&u, 13, 3, sv[0], 0, 0, 0, 0, 8);
+    unet_run(&u, 1, 1, "accept-ioprio", 0);
+    sqe = unet_push(&u, 13, 3, sv[0], 0, 0, 0, SOCK_CLOEXEC, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "accept-cloexec-slot", 0);
+    sqe = unet_push(&u, 13, 3, sv[0], 0, 0, 0, 0, 1);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "accept-multishot-slot", 0);
+    unet_push(&u, 13, 3, sv[0], 0, 0, 0, 1, 0);
+    unet_run(&u, 1, 1, "accept-flags", 0);
+    unet_push(&u, 16, 4, sv[0], name_len, (unsigned long)&name, 1, 0, 0);
+    unet_run(&u, 1, 1, "connect-len", 0);
+    unet_push(&u, 16, 4, sv[0], name_len, (unsigned long)&name, 0, 1, 0);
+    unet_run(&u, 1, 1, "connect-rw", 0);
+    sqe = unet_push(&u, 16, 4, sv[0], name_len, (unsigned long)&name, 0, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "connect-splice", 0);
+    unet_push(&u, 16, 4, sv[0], 129, (unsigned long)&name, 0, 0, 0);
+    unet_run(&u, 1, 1, "connect-long", 0);
+    unet_push(&u, 16, 4, sv[0], 4, 8, 0, 0, 0);
+    unet_run(&u, 1, 1, "connect-fault", 0);
+    unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, (unsigned)-1, 0, 0);
+    unet_run(&u, 1, 1, "send-len", 0);
+    unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, 1, 0, 4);
+    unet_run(&u, 1, 1, "send-fixed", 0);
+    unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, 1, 0, 8);
+    unet_run(&u, 1, 1, "send-report", 0);
+    sqe = unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, 1, 0, 0);
+    sqe[46] = 1;
+    unet_run(&u, 1, 1, "send-pad", 0);
+    unet_push(&u, 26, 5, sv[0], 0, big, 1, 0, 0);
+    unet_run(&u, 1, 1, "send-fault", 0);
+    sqe = unet_push(&u, 26, 5, sv[0], (unsigned long)&name, (unsigned long)put, 1, 0, 0);
+    sqe[44] = 129;
+    unet_run(&u, 1, 1, "send-long-to", 0);
+    sqe = unet_push(&u, 26, 5, sv[0], 8, (unsigned long)put, 1, 0, 0);
+    sqe[44] = 4;
+    unet_run(&u, 1, 1, "send-to-fault", 0);
+    unet_push(&u, 27, 6, sv[1], 1, (unsigned long)got, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-addr2", 0);
+    unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, (unsigned)-1, 0, 0);
+    unet_run(&u, 1, 1, "recv-len", 0);
+    unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, 1, 0, 4);
+    unet_run(&u, 1, 1, "recv-fixed", 0);
+    unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, 1, 0, 2);
+    unet_run(&u, 1, 1, "recv-multishot-plain", 0);
+    sqe = unet_push(&u, 27, 6, sv[1], 0, 0, 1, MSG_WAITALL, 2);
+    sqe[1] = 1 << 5;
+    unet_run(&u, 1, 1, "recv-multishot-waitall", 0);
+    sqe = unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, 1, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "recv-optlen", 0);
+    unet_push(&u, 27, 6, sv[1], 0, big, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-fault", 0);
+
+    /* Sends and receives. */
+    unet_push(&u, 26, 10, sv[0], 0, (unsigned long)put, 5, 0, 0);
+    unet_run(&u, 1, 1, "send", 0);
+    unet_push(&u, 27, 11, sv[1], 0, (unsigned long)got, 3, 0, 0);
+    unet_run(&u, 1, 1, "recv-part", 0);
+    unet_push(&u, 27, 12, sv[1], 0, (unsigned long)got + 3, 8, 0, 0);
+    unet_run(&u, 1, 1, "recv-rest", 0);
+    printf("received: %.5s\n", got);
+    unet_push(&u, 27, 13, sv[1], 0, (unsigned long)got, 8, MSG_DONTWAIT, 0);
+    unet_run(&u, 1, 1, "recv-dontwait", 0);
+    unet_push(&u, 27, 14, sv[1], 0, (unsigned long)got, 8, 0, 0);
+    unet_run(&u, 1, 0, "recv-waits", 0);
+    printf("write: %zd\n", write(sv[0], "ab", 2));
+    unet_run(&u, 0, 1, "recv-woken", 0);
+    unet_push(&u, 27, 15, sv[1], 0, (unsigned long)got, 4, MSG_WAITALL, 0);
+    unet_run(&u, 1, 0, "waitall-waits", 0);
+    printf("write: %zd\n", write(sv[0], "cd", 2));
+    unet_run(&u, 0, 0, "waitall-half", 0);
+    printf("write: %zd\n", write(sv[0], "ef", 2));
+    unet_run(&u, 0, 1, "waitall-whole", 0);
+    printf("received: %.4s\n", got);
+    printf("write: %zd\n", write(sv[0], "g", 1));
+    unet_push(&u, 27, 16, sv[1], 0, (unsigned long)got, 8, 0, 1);
+    unet_run(&u, 1, 1, "poll-first", 0);
+    printf("write: %zd\n", write(sv[0], "h", 1));
+    unet_push(&u, 27, 17, sv[1], 0, (unsigned long)got, 8, MSG_DONTWAIT, 1);
+    unet_run(&u, 1, 1, "poll-first-dontwait", 0);
+    printf("read: %zd\n", read(sv[1], got, 8));
+    int pipe_ends[2];
+    if (pipe(pipe_ends)) return 82;
+    unet_push(&u, 26, 18, pipe_ends[1], 0, (unsigned long)put, 1, 0, 0);
+    unet_run(&u, 1, 1, "send-pipe", 0);
+    unet_push(&u, 27, 18, pipe_ends[0], 0, (unsigned long)got, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-pipe", 0);
+    unet_push(&u, 34, 18, pipe_ends[0], 0, 0, 1, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-pipe", 0);
+    unet_push(&u, 13, 18, pipe_ends[0], 0, 0, 0, 0, 0);
+    unet_run(&u, 1, 1, "accept-pipe", 0);
+    unet_push(&u, 27, 18, 999, 0, (unsigned long)got, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-badf", 0);
+    int dg[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dg)) return 83;
+    unet_push(&u, 26, 19, dg[0], 0, (unsigned long)put, 2, 0, 0);
+    unet_push(&u, 26, 20, dg[0], 0, (unsigned long)put, 2, 0, 0);
+    unet_run(&u, 2, 2, "send-datagrams", 0);
+    unet_push(&u, 27, 21, dg[1], 0, (unsigned long)got, 8, 0, 0);
+    unet_run(&u, 1, 1, "recv-datagram", 0);
+    unet_push(&u, 34, 22, sv[0], 0, 0, SHUT_WR, 0, 0);
+    unet_run(&u, 1, 1, "shutdown", 0);
+    unet_push(&u, 27, 23, sv[1], 0, (unsigned long)got, 8, 0, 0);
+    unet_run(&u, 1, 1, "recv-end", 0);
+    unet_push(&u, 26, 24, sv[0], 0, (unsigned long)put, 1, 0, 0);
+    unet_run(&u, 1, 1, "send-shut", 0);
+    unet_push(&u, 34, 25, sv[0], 0, 0, 7, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-how", 0);
+
+    /* A socket, accept and connect. */
+    unet_push(&u, 45, 30, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0);
+    int server = unet_run(&u, 1, 1, "socket", 1);
+    printf("bind: %d\n", bind(server, (void *)&name, name_len));
+    printf("listen: %d\n", listen(server, 4));
+    unet_push(&u, 13, 31, server, 0, 0, 0, 0, 2);
+    unet_run(&u, 1, 1, "accept-dontwait", 0);
+    unet_push(&u, 13, 32, server, 0, 0, 0, 0, 2 | 4);
+    unet_run(&u, 1, 1, "accept-poll-first-dontwait", 0);
+    struct sockaddr_un peer;
+    socklen_t peer_len = sizeof peer;
+    unet_push(&u, 13, 33, server, (unsigned long)&peer_len, (unsigned long)&peer, 0, SOCK_CLOEXEC,
+              0);
+    unet_run(&u, 1, 0, "accept-waits", 0);
+    int client = socket(AF_UNIX, SOCK_STREAM, 0);
+    unet_push(&u, 16, 34, client, name_len, (unsigned long)&name, 0, 0, 0);
+    int accepted = unet_run(&u, 1, 2, "connect-accepted", 1);
+    printf("peer: %u %d\n", (unsigned)peer_len, peer.sun_family);
+    printf("cloexec: %d\n", fcntl(accepted, F_GETFD) & FD_CLOEXEC);
+    unet_push(&u, 16, 35, client, name_len, (unsigned long)&name, 0, 0, 0);
+    unet_run(&u, 1, 1, "connect-again", 0);
+    unet_push(&u, 13, 36, server, 0, 0, 0, 0, 4);
+    unet_run(&u, 1, 0, "poll-first-waits", 0);
+    int second = socket(AF_UNIX, SOCK_STREAM, 0);
+    printf("connect: %d\n", connect(second, (void *)&name, name_len));
+    unet_run(&u, 0, 1, "poll-first-accepted", 1);
+
+    /* Registered slots. */
+    unet_push(&u, 45, 40, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0)[44] = 1;
+    unet_run(&u, 1, 1, "slot-none", 0);
+    memset(unet_push(&u, 45, 41, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0) + 44, 0xff, 4);
+    unet_run(&u, 1, 1, "alloc-none", 0);
+    int sparse[2] = {-1, -1};
+    uring_show("register", syscall(427, u.fd, 2, sparse, 2));
+    unet_push(&u, 45, 42, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0)[44] = 3;
+    unet_run(&u, 1, 1, "slot-past", 0);
+    unet_push(&u, 45, 43, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0)[44] = 2;
+    unet_run(&u, 1, 1, "slot", 0);
+    memset(unet_push(&u, 45, 44, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0) + 44, 0xff, 4);
+    unet_run(&u, 1, 1, "alloc", 0);
+    memset(unet_push(&u, 45, 45, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0) + 44, 0xff, 4);
+    unet_run(&u, 1, 1, "alloc-full", 0);
+    uring_show("unregister", syscall(427, u.fd, 3, NULL, 0));
+    uring_show("register", syscall(427, u.fd, 2, sparse, 2));
+    int third = socket(AF_UNIX, SOCK_STREAM, 0);
+    printf("connect: %d\n", connect(third, (void *)&name, name_len));
+    unet_push(&u, 13, 46, server, 0, 0, 0, 0, 0)[44] = 1;
+    unet_run(&u, 1, 1, "accept-slot", 0);
+    unet_push(&u, 26, 47, 0, 0, (unsigned long)"xy", 2, 0, 0)[1] = 1;
+    unet_run(&u, 1, 1, "send-slot", 0);
+    memset(got, 0, sizeof got);
+    printf("read: %zd %.2s\n", read(third, got, 8), got);
+
+    /* A provided buffer, which a receive that waits gives back. */
+    int pb[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pb)) return 84;
+    char pool[16];
+    sqe = unet_push(&u, 27, 50, pb[1], 0, 0, 0, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    unet_run(&u, 1, 1, "select-none", 0);
+    unet_push(&u, 31, 51, 1, 3, (unsigned long)pool, 8, 0, 0)[40] = 4;
+    unet_run(&u, 1, 1, "provide", 0);
+    sqe = unet_push(&u, 27, 52, pb[1], 0, 0, 0, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    unet_run(&u, 1, 0, "select-waits", 0);
+    unet_push(&u, 32, 53, 1, 0, 0, 0, 0, 0)[40] = 4;
+    unet_run(&u, 1, 1, "remove", 0);
+    unet_push(&u, 31, 54, 1, 5, (unsigned long)pool, 8, 0, 0)[40] = 4;
+    unet_run(&u, 1, 1, "provide", 0);
+    printf("write: %zd\n", write(pb[0], "abc", 3));
+    unet_run(&u, 0, 1, "select-woken", 0);
+    printf("pool: %.3s\n", pool);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -40938,6 +41221,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-buffers2")) return io_uring_buffers2_case();
     if (!strcmp(mode, "io-uring-held-buffer")) return io_uring_held_buffer_case();
+    if (!strcmp(mode, "io-uring-net")) return io_uring_net_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

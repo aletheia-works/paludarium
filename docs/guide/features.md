@@ -1794,8 +1794,9 @@ kernel.
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
   `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
-  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, and
-  `IORING_OP_ASYNC_CANCEL`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
+  `IORING_OP_ASYNC_CANCEL`, and the socket requests `IORING_OP_SHUTDOWN`,
+  `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
@@ -1950,6 +1951,36 @@ kernel.
   file here takes (`EINVAL`). `IORING_OP_FSYNC` takes only
   `IORING_FSYNC_DATASYNC`.
 
+- The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
+  `_RECV`. Each is prepared as Linux prepares it, which checks its entry
+  (`EINVAL`), then reads a connect's or a send's address
+  (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a
+  buffer in the user half (`EFAULT`). It runs as Linux runs it inline,
+  without waiting: one that would wait (`EAGAIN`, or a connect in
+  progress) waits for its socket, holding the file it found, and runs
+  again once the socket is ready, unless it asked not to (`MSG_DONTWAIT`,
+  `IORING_ACCEPT_DONTWAIT`), when it completes with `EAGAIN`.
+  `IORING_RECVSEND_POLL_FIRST` and `IORING_ACCEPT_POLL_FIRST` wait first.
+  A send adds `MSG_NOSIGNAL`. With `MSG_WAITALL`, a stream or
+  sequenced-packet socket's send or receive goes on to its whole length
+  and gives all it moved. A receive may select a provided buffer
+  (`ENOBUFS`), which goes back to its group while the receive waits, or if
+  it read nothing, as Linux master's `io_recv` gives it back. A receive
+  has `IORING_CQE_F_SOCK_NONEMPTY` while bytes are left on a TCP socket
+  (or once its peer finished, as `tcp_inq_hint` tells) or an AF_UNIX
+  stream, and an accept while more TCP connections wait. A new socket or
+  connection goes at the lowest free descriptor, which it takes first
+  (`EMFILE`), or in a registered slot (`file_index`, one past the slot's
+  index, or a free one with `IORING_FILE_INDEX_ALLOC`, `ENFILE` when there
+  is none; `ENXIO` with no registered files, `EINVAL` past them), which
+  `SOCK_CLOEXEC` cannot go with. A connect in progress completes with the
+  socket's error once it has one, or with 0 once it is connected. As
+  Linux master has it, a receive checks for a socket (`ENOTSOCK`) before
+  `IORING_RECVSEND_POLL_FIRST` waits, and a nonblocking socket's connect
+  that gives `EAGAIN` (an AF_UNIX listener's full backlog) completes with
+  it, where Linux 7.0 waits for the socket and tries again.
+
 - `IORING_REGISTER_BUFFERS` registers a ring's buffers as Linux's
   `io_sqe_buffers_register` does. It checks in this order:
   - none registered yet (`EBUSY`), and 1 to 16384 of them (`EINVAL`);
@@ -2058,8 +2089,8 @@ kernel.
     or after them if a request of that submission holds the file. A
     registration that fails posts no tag.
 
-- A ring keeps groups of buffers that a read with `IOSQE_BUFFER_SELECT`
-  chooses one of, the group that `buf_group` names, as Linux's
+- A ring keeps groups of buffers that a read or a socket's receive with
+  `IOSQE_BUFFER_SELECT` chooses one of, the group that `buf_group` names, as Linux's
   `io_uring/kbuf.c` does. The read is of its length at most, or of the whole
   buffer, and its completion has `IORING_CQE_F_BUFFER` and the buffer's ID
   in the top 16 bits of its flags. A group with none left, or none, is

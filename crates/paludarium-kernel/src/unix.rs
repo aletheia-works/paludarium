@@ -176,7 +176,7 @@ struct Listen {
 /// or `PF_UNIX` (`EPROTONOSUPPORT`), `SOCK_STREAM`, `SOCK_SEQPACKET` or
 /// `SOCK_DGRAM`, which `SOCK_RAW` makes too; another type is
 /// `ESOCKTNOSUPPORT`.
-pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+pub(crate) fn socket(c: &Context<'_>, a: [u64; 6]) -> Result<Arc<dyn FileHandle>, Errno> {
     let kind = u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
     if kind & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
         return Err(Errno::EINVAL);
@@ -189,10 +189,7 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         3 => kind & !0xf | SOCK_DGRAM,
         _ => return Err(ESOCKTNOSUPPORT),
     };
-    let socket = UnixSocket::new(c, kind)?;
-    c.files
-        .install(socket, kind & CLOEXEC != 0, c.group.nofile())
-        .map(u64::from)
+    Ok(UnixSocket::new(c, kind)?)
 }
 
 /// `socketpair(AF_UNIX, type)`'s two sockets, as Linux's `unix_socketpair`:
@@ -258,25 +255,14 @@ pub(crate) fn dispatch(
     match number {
         42 => {
             let address = read_address(c, a[1], a[2])?;
-            socket.connect(c, &address)
+            socket.connect(c, &address, false)
         }
         43 | 288 => {
             let flags = if number == 288 { a[3] } else { 0 };
             if flags & !u64::from(NONBLOCK | CLOEXEC) != 0 {
                 return Err(Errno::EINVAL);
             }
-            // sock_no_accept.
-            if socket.datagram() {
-                return Err(EOPNOTSUPP);
-            }
-            let child = socket.accept(c)?;
-            if flags & u64::from(NONBLOCK) != 0 {
-                child.set_flags(child.flags() | NONBLOCK)?;
-            }
-            let peer = child.lock().peer.as_ref().and_then(|p| p.get().cloned());
-            if a[1] != 0 {
-                write_address(c, peer.as_deref(), a[1], a[2])?;
-            }
+            let child = accept_file(c, socket, a[1], a[2], flags, false)?;
             c.files
                 .install(child, flags & u64::from(CLOEXEC) != 0, c.group.nofile())
                 .map(u64::from)
@@ -320,6 +306,32 @@ fn read_address(c: &Context<'_>, at: u64, len: u64) -> Result<Vec<u8>, Errno> {
         .read(GuestAddr(at), &mut address)
         .map_err(|_| Errno::EFAULT)?;
     Ok(address)
+}
+/// The connection `accept` takes on `socket`, with `SOCK_NONBLOCK` of
+/// `flags` and its peer's address written to `at` (none when 0) within the
+/// room `len` gives; `nowait` is as for [`UnixSocket::accept`]. Also an
+/// io_uring accept's (`crate::sockets::accept_file`).
+pub(crate) fn accept_file(
+    c: &mut Context<'_>,
+    socket: &Arc<UnixSocket>,
+    at: u64,
+    len: u64,
+    flags: u64,
+    nowait: bool,
+) -> Result<Arc<dyn FileHandle>, Errno> {
+    // sock_no_accept.
+    if socket.datagram() {
+        return Err(EOPNOTSUPP);
+    }
+    let child = socket.accept(c, nowait)?;
+    if flags & u64::from(NONBLOCK) != 0 {
+        child.set_flags(child.flags() | NONBLOCK)?;
+    }
+    let peer = child.lock().peer.as_ref().and_then(|p| p.get().cloned());
+    if at != 0 {
+        write_address(c, peer.as_deref(), at, len)?;
+    }
+    Ok(child)
 }
 /// An AF_UNIX address, as `unix_getname` gives it: the family, then the
 /// name, none for an unnamed socket; cut to the room `len` holds, which
@@ -600,11 +612,17 @@ impl UnixSocket {
     }
     /// `connect`, as Linux's `unix_stream_connect` checks it: the address,
     /// then the listener of that name and type ([`find`]), whose full queue
-    /// a nonblocking socket finds `EAGAIN` and a blocking one waits for, at
+    /// a nonblocking socket, or one `nowait` (an io_uring request's issue, as
+    /// `O_NONBLOCK`), finds `EAGAIN` and a blocking one waits for, at
     /// most `SO_SNDTIMEO`; then this socket, `EISCONN` once connected,
     /// `EINVAL` listening. A datagram socket connects as
     /// [`Self::connect_datagram`].
-    fn connect(&self, c: &mut Context<'_>, address: &[u8]) -> Result<u64, Errno> {
+    pub(crate) fn connect(
+        &self,
+        c: &mut Context<'_>,
+        address: &[u8],
+        nowait: bool,
+    ) -> Result<u64, Errno> {
         if self.datagram() {
             return self.connect_datagram(c, address).map(|()| 0);
         }
@@ -617,7 +635,7 @@ impl UnixSocket {
             match listener.take(self, c) {
                 Ok(()) => return Ok(0),
                 Err(e) if e == Errno::EAGAIN => {
-                    if self.flags() & NONBLOCK != 0 {
+                    if nowait || self.flags() & NONBLOCK != 0 {
                         return Err(e);
                     }
                     let Some(deadline) = wait.deadline(c)? else {
@@ -941,8 +959,9 @@ impl UnixSocket {
     }
     /// `accept`, as Linux's `unix_accept`: `EINVAL` unless listening, then
     /// the first connection waiting, or `EAGAIN` when none does and the
-    /// socket is nonblocking, or once `SO_RCVTIMEO` has passed.
-    fn accept(&self, c: &mut Context<'_>) -> Result<Arc<Self>, Errno> {
+    /// socket is nonblocking or `nowait` (as [`Self::connect`]), or once
+    /// `SO_RCVTIMEO` has passed.
+    fn accept(&self, c: &mut Context<'_>, nowait: bool) -> Result<Arc<Self>, Errno> {
         let file: Arc<dyn FileHandle> = self.this.upgrade().ok_or(Errno::EBADF)? as _;
         let wait = crate::sockets::deadline(c, &file, true)?;
         loop {
@@ -961,7 +980,7 @@ impl UnixSocket {
                 child.end.set_embryo(false);
                 return Ok(child);
             }
-            if self.flags() & NONBLOCK != 0 {
+            if nowait || self.flags() & NONBLOCK != 0 {
                 return Err(Errno::EAGAIN);
             }
             let Some(deadline) = wait.deadline(c)? else {

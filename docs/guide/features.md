@@ -1700,6 +1700,17 @@ kernel.
   and shared memory cannot grow down (`EINVAL`). The main stack's VMA starts
   at 8 MiB, so with a larger `RLIMIT_STACK` it grows past that.
 
+- Private anonymous memory of whole 2 MiB that `mmap` places without a
+  hint goes at a 2 MiB boundary, as Linux's `thp_get_unmapped_area_vmflags`
+  places it: where `mmap` finds room for 2 MiB more, at the boundary above
+  that room's start when it is one in the top-down layout (so that one
+  such mapping lies right below the last), else at the next one. A move
+  by `mremap` to a length of whole 2 MiB, with no hint, goes there too, and
+  so does a private mapping of `/dev/zero` of any length that reaches 2 MiB
+  past the first boundary after its offset, at the boundary its offset
+  agrees with (`get_unmapped_area_zero`), or at the hint when the longer
+  room fits there.
+
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or

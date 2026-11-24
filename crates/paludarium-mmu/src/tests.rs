@@ -2543,3 +2543,48 @@ fn a_moved_mapping_of_a_huge_file_goes_at_its_offset_past_a_boundary() {
     assert_ne!(grown, at);
     assert_eq!(grown.0 % HUGE, PAGE_SIZE);
 }
+
+#[test]
+fn a_thp_placement_pads_by_2_mib_and_keeps_top_down_mappings_together() {
+    const HUGE: u64 = 2 << 20;
+    let place = |m: &AddressSpace, hint: Option<GuestAddr>, len: u64, offset: u64| {
+        m.map_backed(
+            Placement::Thp { hint, offset },
+            len,
+            Prot::READ,
+            MappingKind::Anonymous,
+            Backing::None,
+        )
+        .unwrap()
+        .0
+    };
+    for bottom_up in [false, true] {
+        let mut m = AddressSpace::new();
+        if bottom_up {
+            m.set_bottom_up(Some(GuestAddr(0x1000_1000)));
+        }
+        m.map_shared(None, PAGE_SIZE, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        let a = place(&m, None, 2 * HUGE, 0);
+        assert_eq!(a % HUGE, 0, "{bottom_up}");
+        let b = place(&m, None, 2 * HUGE, 0);
+        assert_eq!(b % HUGE, 0, "{bottom_up}");
+        if !bottom_up {
+            // The boundary above the padded area's aligned start: right
+            // below the one before.
+            assert_eq!(b + 2 * HUGE, a);
+        }
+        // An offset into the extent: that far past a boundary.
+        assert_eq!(
+            place(&m, None, 3 * HUGE, PAGE_SIZE) % HUGE,
+            PAGE_SIZE,
+            "{bottom_up}"
+        );
+        // Less than a whole extent past the first boundary: as `Near`.
+        let short = place(&m, None, HUGE + PAGE_SIZE, PAGE_SIZE);
+        assert_ne!(short, 0);
+        // A hint with room for the padded area is taken.
+        let hint = GuestAddr(0x2000_3000);
+        assert_eq!(place(&m, Some(hint), 2 * HUGE, 0), hint.0, "{bottom_up}");
+    }
+}

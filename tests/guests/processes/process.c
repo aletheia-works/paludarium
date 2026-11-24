@@ -16032,6 +16032,42 @@ static int tmpfs_huge_placement_case(void) {
     printf("cleaned=%d\n", rmdir(th_base) == 0);
     return 0;
 }
+/* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
+   no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
+   places it, a second one right below the first in the top-down layout, and
+   so does an mremap move to such a length; a free hint is taken as it is; a
+   private mapping of /dev/zero of 2 MiB or more goes at a boundary whatever
+   its length. A reserve of 64 MiB is mapped and unmapped first, so that
+   each lands in the same free area natively and emulated. Only what holds
+   for every layout is printed. */
+static int anon_thp_placement_case(void) {
+    long huge = 2 << 20;
+    int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    char *reserve = mmap(NULL, 32 * huge, PROT_NONE, anon, -1, 0);
+    if (reserve == MAP_FAILED) return 80;
+    munmap(reserve, 32 * huge);
+    char *a = mmap(NULL, 2 * huge, rw, anon, -1, 0);
+    char *b = mmap(NULL, 2 * huge, rw, anon, -1, 0);
+    if (a == MAP_FAILED || b == MAP_FAILED) return 81;
+    printf("aligned=%d below=%d\n", ((uintptr_t)a & (huge - 1)) == 0, b + 2 * huge == a);
+    char *hint = reserve + 4 * huge + 4096;
+    char *c = mmap(hint, 2 * huge, rw, anon, -1, 0);
+    printf("hint=%d\n", c == hint);
+    char *d = mmap(NULL, huge, rw, anon, -1, 0);
+    if (c == MAP_FAILED || d == MAP_FAILED) return 82;
+    mmap(d + huge, 4096, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0);
+    char *grown = mremap(d, huge, 2 * huge, MREMAP_MAYMOVE);
+    if (grown == MAP_FAILED) return 83;
+    printf("moved=%d aligned=%d\n", grown != d, ((uintptr_t)grown & (huge - 1)) == 0);
+    int zero = open("/dev/zero", O_RDWR);
+    char *z = zero < 0 ? MAP_FAILED : mmap(NULL, 3 * huge, rw, MAP_PRIVATE, zero, 0);
+    if (z == MAP_FAILED) return 84;
+    printf("zero=%d\n", ((uintptr_t)z & (huge - 1)) == 0);
+    munmap(a, 2 * huge), munmap(b, 2 * huge), munmap(c, 2 * huge), munmap(grown, 2 * huge);
+    munmap(z, 3 * huge);
+    close(zero);
+    return 0;
+}
 static int tmpfs_huge_case(void) {
     struct sigaction action = {0};
     action.sa_sigaction = on_bus;
@@ -38150,6 +38186,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
+    if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

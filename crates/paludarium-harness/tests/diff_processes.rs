@@ -1059,6 +1059,7 @@ mod linux {
         processes_shmem_populate => ("shmem-populate","process"),
         processes_tmpfs_huge => ("tmpfs-huge","process"),
         processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),
+        processes_anon_thp_placement => ("anon-thp-placement","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),

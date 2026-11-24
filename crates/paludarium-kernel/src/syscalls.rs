@@ -2527,6 +2527,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
     // A mapping of /dev/zero is anonymous memory (shared with MAP_SHARED),
     // as Linux's mmap_zero makes it.
+    let zero = file.as_ref().is_some_and(|f| is_zero_device(f.as_ref()));
     let file = file.filter(|f| !is_zero_device(f.as_ref()));
     let kind = if file.is_some() {
         MappingKind::File
@@ -2555,12 +2556,24 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // A file of a tmpfs mount with `huge=` goes at the 2 MiB boundary
         // its offset agrees with (`shmem_get_unmapped_area`).
         const HUGE: u64 = 2 << 20;
+        let private = flags & MAP_SHARED == 0;
         match &file {
             Some(file) if file.huge_placement() => Placement::Aligned {
                 hint,
                 size: HUGE,
                 offset: offset & (HUGE - 1),
             },
+            // Private anonymous memory of whole 2 MiB with no hint, and a
+            // private mapping of /dev/zero, go where transparent huge
+            // pages fit them (`thp_get_unmapped_area_vmflags`,
+            // `get_unmapped_area_zero`).
+            None if private && zero => Placement::Thp { hint, offset },
+            None if private
+                && hint.is_none()
+                && len.wrapping_add(4095) & !4095 & (HUGE - 1) == 0 =>
+            {
+                Placement::Thp { hint, offset: 0 }
+            }
             _ => Placement::Near(hint),
         }
     };

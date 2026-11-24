@@ -1652,6 +1652,18 @@ pub enum Placement {
         size: u64,
         offset: u64,
     },
+    /// Where Linux's `__thp_get_unmapped_area` puts memory that may take
+    /// transparent huge pages, private anonymous memory of whole 2 MiB
+    /// (with no hint, `offset` 0) and a private mapping of `/dev/zero`: in
+    /// an area 2 MiB longer, at the boundary its `offset` agrees with, the
+    /// boundary above the start in the top-down layout when that start is
+    /// one; at the hint if the longer area fits there. Without a whole
+    /// 2 MiB past its first boundary, or room for the longer area, it goes
+    /// where `Near` would.
+    Thp {
+        hint: Option<GuestAddr>,
+        offset: u64,
+    },
 }
 
 /// What a mapping [`AddressSpace::map_backed`] makes shows.
@@ -5037,6 +5049,37 @@ impl AddressSpaceData {
             },
         )
     }
+    /// Where memory that may take transparent huge pages goes
+    /// ([`Placement::Thp`], Linux's `__thp_get_unmapped_area`): `None`
+    /// where it goes as any other would.
+    fn thp_area(&self, len: u64, hint: Option<u64>, offset: u64) -> Option<u64> {
+        let size = BLOCK_SIZE;
+        let len = GuestAddr(len).page_align_up()?.0;
+        let end = offset.checked_add(len)?;
+        let first = offset.checked_next_multiple_of(size)?;
+        if end <= first || end - first < size {
+            return None;
+        }
+        let padded = len.checked_add(size)?;
+        offset.checked_add(padded)?;
+        let free_at = |at: u64| {
+            at >= MMAP_MIN_ADDR
+                && at
+                    .checked_add(padded)
+                    .is_some_and(|stop| stop <= USER_ADDRESS_LIMIT - PAGE_SIZE)
+                && !self.overlaps(at, at + padded)
+        };
+        let found = match hint {
+            Some(hint) if free_at(hint) => return Some(hint),
+            _ => self.find_free(padded)?,
+        };
+        let below = offset.wrapping_sub(found) & (size - 1);
+        Some(if self.bottom_up.is_none() && below == 0 {
+            found + size
+        } else {
+            found + below
+        })
+    }
     fn find_free(&self, len: u64) -> Option<u64> {
         if let Some(base) = self.bottom_up {
             return self.lowest_gap(base, len, PAGE_SIZE);
@@ -5759,8 +5802,15 @@ impl AddressSpaceData {
             })
             .filter(|(source, _)| source.huge_placement())
             .map(|(_, shift)| addr.0.wrapping_add(shift) & (BLOCK_SIZE - 1));
-        let free_for = |data: &Self, len: u64| match huge {
+        // Private anonymous memory moved without a hint to a length of
+        // whole 2 MiB goes where transparent huge pages fit it
+        // (`__get_unmapped_area`'s `thp_get_unmapped_area_vmflags`).
+        let anonymous = self.shared_at(addr.0).is_none() && self.backing_at(addr.0).is_none();
+        let free_for = |data: &Self, len: u64, hinted: bool| match huge {
             Some(offset) => data.aligned_area(len, BLOCK_SIZE, offset),
+            None if anonymous && !hinted && len.is_multiple_of(BLOCK_SIZE) => {
+                data.thp_area(len, None, 0).or_else(|| data.find_free(len))
+            }
             None => data.find_free(len),
         };
         // A shrink may cross the end of the VMA: only what stays must not.
@@ -5785,7 +5835,7 @@ impl AddressSpaceData {
             } else if hint != 0 && hint >= MMAP_MIN_ADDR && !self.overlaps(hint, hint + new_len) {
                 hint
             } else {
-                free_for(self, new_len).ok_or(Errno::ENOMEM)?
+                free_for(self, new_len, hint != 0).ok_or(Errno::ENOMEM)?
             };
             if old_len > new_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
@@ -5836,7 +5886,7 @@ impl AddressSpaceData {
         if !how.may_move {
             return Err(Errno::ENOMEM);
         }
-        let to = free_for(self, new_len).ok_or(Errno::ENOMEM)?;
+        let to = free_for(self, new_len, false).ok_or(Errno::ENOMEM)?;
         if !moves(new_len) {
             return Err(Errno::EINVAL);
         }
@@ -8479,7 +8529,9 @@ impl AddressSpace {
                 data.map(Some(at), len, prot, kind)?
             }
             Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
-            Placement::Near(hint) | Placement::Aligned { hint, .. } => {
+            Placement::Near(hint)
+            | Placement::Aligned { hint, .. }
+            | Placement::Thp { hint, .. } => {
                 // A hint within the guard gap below a mapping that grows
                 // down is not taken (`vm_start_gap`).
                 let hint = hint.filter(|hint| {
@@ -8488,15 +8540,25 @@ impl AddressSpace {
                         .next()
                         .is_none_or(|(_, m)| hint.0.saturating_add(len) <= m.start_gap())
                 });
-                match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
-                    Some(at) => at,
-                    None => match placement {
-                        Placement::Aligned { size, offset, .. } => {
-                            let at = data.aligned_area(len, size, offset);
-                            data.map(at.map(GuestAddr), len, prot, kind)?
-                        }
-                        _ => data.map(None, len, prot, kind)?,
-                    },
+                let thp = match placement {
+                    Placement::Thp { offset, .. } => {
+                        data.thp_area(len, hint.map(|hint| hint.0), offset)
+                    }
+                    _ => None,
+                };
+                if let Some(at) = thp {
+                    data.map(Some(GuestAddr(at)), len, prot, kind)?
+                } else {
+                    match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
+                        Some(at) => at,
+                        None => match placement {
+                            Placement::Aligned { size, offset, .. } => {
+                                let at = data.aligned_area(len, size, offset);
+                                data.map(at.map(GuestAddr), len, prot, kind)?
+                            }
+                            _ => data.map(None, len, prot, kind)?,
+                        },
+                    }
                 }
             }
         };

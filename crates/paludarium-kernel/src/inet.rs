@@ -493,11 +493,12 @@ impl Network {
         }
     }
     /// What a packet from `from` to `to` out through this namespace's veth
-    /// end `index` finds at `now`, its neighbour first
-    /// ([`crate::interface::Addresses::neigh_output`]):
-    /// - Nothing answers, as nobody answers ARP for `to`
+    /// end `index` finds at `now`, its neighbour first, its route's gateway
+    /// or else `to` ([`Self::next_hop4`],
+    /// [`crate::interface::Addresses::neigh_output`]):
+    /// - Nothing answers, as nobody answers ARP for that neighbour
     ///   ([`Reach::Unanswered`]), unless the end has its carrier, so that
-    ///   its peer is up (`veth_xmit`), `to` is an address of the peer's
+    ///   its peer is up (`veth_xmit`), the neighbour is an address of the peer's
     ///   namespace (`arp_process`: its local routes have it), and the peer
     ///   takes a packet from `from` in on it, as `ip_route_input` checks
     ///   the source with its reverse path filtering
@@ -510,26 +511,28 @@ impl Network {
     ///   peer drops it, as it does a martian from 0.0.0.0.
     /// - The packet comes there, and the answer back ([`Reach::Answered`])
     ///   only when the peer's namespace routes `from` back out through its
-    ///   end, without a gateway, and this namespace takes the answer from
-    ///   `to` in on its end, at its address `from`; else that answer goes
-    ///   nowhere ([`Reach::OneWay`]).
+    ///   end, to a next hop that is this namespace's (but a loopback
+    ///   address), and this namespace takes the answer from `to` in on its
+    ///   end, at its address `from`; else that answer goes nowhere
+    ///   ([`Reach::OneWay`]).
     fn reach(&self, index: i32, from: IpAddr, to: IpAddr, now: Option<u64>) -> Reach {
         let (from, to) = match (plain(from), plain(to)) {
             (IpAddr::V4(from), IpAddr::V4(to)) => (from, to),
             (IpAddr::V6(from), IpAddr::V6(to)) => return self.reach6(index, from, to, now),
             _ => return Reach::Unanswered,
         };
+        let hop = self.next_hop4(index, to, now);
         let Some(Arp {
             peer,
             answer,
             own_mac,
             own_rpf,
-        }) = self.arp(index, from, to, now)
+        }) = self.arp(index, from, hop, now)
         else {
             return Reach::Unanswered;
         };
         let at = now.unwrap_or(0);
-        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, to, answer, at);
+        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
         self.later(events);
         if asked
             && answer.is_some()
@@ -560,23 +563,29 @@ impl Network {
                 && addresses
                     .validate_source4_on(from, 0, 0, their_rpf, peer_index)
                     .is_ok();
-            let back = addresses.lookup4(from).is_ok_and(|r| {
-                r.kind == crate::interface::Kind::Unicast
-                    && i64::from(r.oif) == i64::from(peer_index)
-                    && r.gateway.is_none()
-            });
+            let back = addresses
+                .lookup4(from)
+                .ok()
+                .filter(|r| {
+                    r.kind == crate::interface::Kind::Unicast
+                        && i64::from(r.oif) == i64::from(peer_index)
+                })
+                .map(|r| r.gateway.filter(|_| r.uses_gateway).unwrap_or(from));
             (arrives, back)
         };
         if !arrives {
             return Reach::Dropped;
         }
-        let back = back && {
+        // The answer's next hop must be this end's, as ARP finds it.
+        let back = back.is_some_and(|hop| {
             let addresses = self.addresses_at(now);
             addresses.local4(from)
+                && !hop.is_loopback()
+                && addresses.local4(hop)
                 && addresses
                     .validate_source4_on(to, 0, 0, own_rpf, index)
                     .is_ok()
-        };
+        });
         if back {
             Reach::Answered(there)
         } else {
@@ -773,6 +782,17 @@ impl Network {
             .and_then(|d| d.veth.as_ref()?.peer.as_ref().map(|p| p.index))
             .and_then(|i| u32::try_from(i).ok())
             .unwrap_or(0)
+    }
+    /// The neighbour an IPv4 packet to `to` out through the veth end
+    /// `index` goes to at `now`: its route's gateway, where a route of link
+    /// scope reaches it, else `to` itself (`rt_nexthop`).
+    fn next_hop4(&self, index: i32, to: Ipv4Addr, now: Option<u64>) -> Ipv4Addr {
+        self.addresses_at(now)
+            .lookup4(to)
+            .ok()
+            .filter(|r| i64::from(r.oif) == i64::from(index) && r.uses_gateway)
+            .and_then(|r| r.gateway)
+            .unwrap_or(to)
     }
     /// The neighbour a packet to `to` out through the veth end `index`
     /// goes to at `now`: its route's gateway, else `to` itself
@@ -1063,6 +1083,19 @@ impl Network {
             }
             IpAddr::V6(ip) => ip.is_unspecified() || self.addresses_at(now).local6(ip),
         }
+    }
+    /// Whether IPv4's `inet_addr_type` makes `ip` a broadcast or multicast
+    /// address: the limited broadcast address, a group, or one the local
+    /// table has a broadcast route to.
+    fn broadcast4(&self, ip: Ipv4Addr, now: Option<u64>) -> bool {
+        ip.is_broadcast() || ip.is_multicast() || self.subnet_broadcast4(ip, now)
+    }
+    /// Whether the local table has a broadcast route to `ip`.
+    fn subnet_broadcast4(&self, ip: Ipv4Addr, now: Option<u64>) -> bool {
+        let addresses = self.addresses_at(now);
+        addresses.has_table4(crate::interface::TABLE_LOCAL)
+            && addresses.bindable4(ip)
+            && !addresses.local4(ip)
     }
     /// Whether a socket on the device `index` (or none, 0) may bind the
     /// IPv6 address `ip` (`ipv6_chk_addr`): an address of this namespace's,
@@ -1368,6 +1401,10 @@ struct State {
     /// (Linux's `SOCK_BINDPORT_LOCK`), or the address (`SOCK_BINDADDR_LOCK`).
     port_locked: bool,
     address_locked: bool,
+    /// An IPv4 socket bound to a broadcast or multicast address sends from
+    /// its route's source, not from that address, which stays its name
+    /// (`inet_bind`'s `inet_saddr = 0`, "use device").
+    device_source: bool,
     /// The address a disconnect kept without its port, which the next
     /// automatic bind takes.
     address: Option<IpAddr>,
@@ -1584,6 +1621,12 @@ impl Listen {
     }
 }
 impl State {
+    /// The source a route from this socket is looked up with: the address
+    /// it is bound to, unless that is one it sends from the route's source
+    /// instead of.
+    fn source(&self) -> Option<IpAddr> {
+        self.bound.filter(|_| !self.device_source).map(|b| b.ip())
+    }
     /// Notes the failure of the stream, once.
     fn note(&mut self) {
         if !self.noted
@@ -2143,12 +2186,17 @@ impl InetSocket {
                         self.options().device = device;
                         s = self.lock();
                     }
-                    let dest = self.network.route(
-                        plain_to,
-                        s.bound.map(|b| b.ip()),
-                        device,
-                        self.now(),
-                    )?;
+                    // `tcp_v4_connect` looks the route up from the bound
+                    // source, which an IPv6 socket's IPv4-mapped broadcast
+                    // or multicast address fails.
+                    if plain_to.is_ipv4()
+                        && let Some(bound) = s.bound
+                    {
+                        self.mapped_source(bound)?;
+                    }
+                    let dest = self
+                        .network
+                        .route(plain_to, s.source(), device, self.now())?;
                     let to = match dest {
                         Dest::Here(to) => Some(to),
                         Dest::Away | Dest::Veth(..) => None,
@@ -2353,6 +2401,7 @@ impl InetSocket {
                 bound: s.bound.take(),
                 port_locked: s.port_locked,
                 address_locked: s.address_locked,
+                device_source: s.device_source,
                 address: s.address.take(),
                 ..State::default()
             };
@@ -2402,14 +2451,18 @@ impl InetSocket {
         if to.is_ipv4() {
             self.mapped_source(bound)?;
         }
-        match self
-            .network
-            .route(to, Some(bound.ip()), device, self.now())?
-        {
+        // Bound to a broadcast or multicast address, the socket keeps it as
+        // its name, which takes the datagrams (`__ip4_datagram_connect`
+        // sets only an unset `inet_rcv_saddr`).
+        let keep = s.device_source;
+        let name = |from: SocketAddr| if keep { bound } else { from };
+        let source = (!keep).then_some(bound.ip());
+        match self.network.route(to, source, device, self.now())? {
             Dest::Here(to) => {
                 let from = self.datagram_source(s, to, options)?;
-                self.ports().connect(&self.this, from, Some(to));
-                s.bound = Some(from);
+                let name = name(from);
+                self.ports().connect(&self.this, name, Some(to));
+                s.bound = Some(name);
                 s.peer = Some(to);
             }
             // Out through a veth end, from the address its route leaves
@@ -2427,8 +2480,9 @@ impl InetSocket {
                 if cast == Cast::Broadcast && !options.broadcast {
                     return Err(Errno::EACCES);
                 }
-                self.ports().connect(&self.this, from, Some(to));
-                s.bound = Some(from);
+                let name = name(from);
+                self.ports().connect(&self.this, name, Some(to));
+                s.bound = Some(name);
                 s.peer = Some(to);
             }
             Dest::Away => {
@@ -2454,10 +2508,11 @@ impl InetSocket {
         Ok(0)
     }
     /// The check Linux's `ip_route_output_key_hash_rcu` makes, for IPv4,
-    /// of the source an IPv6 socket bound to an IPv4-mapped broadcast
-    /// address has: `__inet6_bind` keeps that address as `inet_saddr`,
-    /// where IPv4's `inet_bind` drops it. So the limited broadcast address
-    /// is `EINVAL`, and a subnet's, which no device has, `ENETUNREACH`.
+    /// of the source an IPv6 socket bound to an IPv4-mapped broadcast or
+    /// multicast address has: `__inet6_bind` keeps that address as
+    /// `inet_saddr`, where IPv4's `inet_bind` drops it. So the limited
+    /// broadcast address and a group are `EINVAL`, and a subnet's
+    /// broadcast address, which no device has, `ENETUNREACH`.
     fn mapped_source(&self, bound: SocketAddr) -> Result<(), Errno> {
         let IpAddr::V4(ip) = bound.ip() else {
             return Ok(());
@@ -2465,12 +2520,10 @@ impl InetSocket {
         if self.family != Family::V6 {
             return Ok(());
         }
-        if ip.is_broadcast() {
+        if ip.is_broadcast() || ip.is_multicast() {
             return Err(Errno::EINVAL);
         }
-        let addresses = self.network.addresses_at(self.now());
-        let local = crate::interface::TABLE_LOCAL;
-        if addresses.has_table4(local) && addresses.bindable4(ip) && !addresses.local4(ip) {
+        if self.network.subnet_broadcast4(ip, self.now()) {
             return Err(ENETUNREACH);
         }
         Ok(())
@@ -2497,8 +2550,9 @@ impl InetSocket {
         }
     }
     /// The address a datagram to `to` on the loopback leaves from: this
-    /// socket's port, on the address it is bound to, or else the loopback's
-    /// source address.
+    /// socket's port, on the address it is bound to, or else, bound to
+    /// none or to one it sends from the route's source instead of, the
+    /// route's source address.
     fn datagram_source(
         &self,
         s: &mut State,
@@ -2506,7 +2560,7 @@ impl InetSocket {
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
         let bound = self.autobind(s, options)?;
-        let ip = if bound.ip().is_unspecified() {
+        let ip = if bound.ip().is_unspecified() || s.device_source {
             self.network.source(to, self.now())
         } else {
             bound.ip()
@@ -2550,9 +2604,7 @@ impl InetSocket {
             SocketAddr::V6(v6) if v6.scope_id() != 0 && needs_scope_id(*v6.ip()) => v6.scope_id(),
             _ => options.device,
         };
-        let route = self
-            .network
-            .route(plain_to, s.bound.map(|b| b.ip()), oif, self.now())?;
+        let route = self.network.route(plain_to, s.source(), oif, self.now())?;
         if let Dest::Veth(index, cast) = route {
             let v6 = plain_to.is_ipv6();
             if self.family == Family::V6 && options.v6_only && !v6 {
@@ -3040,6 +3092,10 @@ impl InetSocket {
         })?);
         s.port_locked = address.port() != 0;
         s.address_locked = !address.ip().is_unspecified();
+        s.device_source = match address.ip() {
+            IpAddr::V4(ip) if self.family == Family::V4 => self.network.broadcast4(ip, self.now()),
+            _ => false,
+        };
         s.address = None;
         drop(s);
         if only {
@@ -3457,8 +3513,11 @@ impl InetSocket {
     ) -> Result<SocketAddr, Errno> {
         let source = self.network.source(to, self.now());
         let mut ports = self.ports();
+        // One bound to a broadcast or multicast address takes its route's
+        // source as its name too (`tcp_v4_connect`:
+        // `inet_bhash2_update_saddr`).
         let from = match s.bound {
-            Some(bound) if !bound.ip().is_unspecified() => bound,
+            Some(bound) if !bound.ip().is_unspecified() && !s.device_source => bound,
             Some(bound) => {
                 let from = SocketAddr::new(source, bound.port());
                 ports.rebind(&self.this, from);
@@ -3531,6 +3590,7 @@ impl InetSocket {
         }
         s.port_locked = old.port_locked;
         s.address_locked = old.address_locked;
+        s.device_source = old.address_locked && old.device_source;
     }
     /// Resets this socket's connection, as a listener that stops does to
     /// those it has not handed out.

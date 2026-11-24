@@ -7109,6 +7109,32 @@ mod proc_other {
         let own = format!("/proc/{pid}/task/42/status");
         assert_eq!(cap_eff(read(&mut k, &mut t, &m, &own).unwrap()), 0);
     }
+    /// An undumpable process is readable only with `CAP_SYS_PTRACE` in the
+    /// user namespace its program runs in (Linux's `task_still_dumpable`),
+    /// not in the one its credentials moved to: after `unshare` of a user
+    /// namespace, a child with every capability there may not open its
+    /// parent's `maps` (0444, which only that check refuses), while the
+    /// parent's, still dumpable, it may.
+    #[test]
+    fn an_undumpable_process_needs_cap_sys_ptrace_where_its_program_runs() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x1000_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        let pid = k.process.pid;
+        let path = format!("/proc/{pid}/maps");
+        {
+            let (mut child, mut ct, cm) = fork(&mut k, &mut t, &m);
+            assert!(read(&mut child, &mut ct, &cm, &path).is_ok());
+        }
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [4, 0, 0, 0, 0, 0]), 0);
+        let (mut child, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(
+            read(&mut child, &mut ct, &cm, &path),
+            Err(Errno::EACCES.to_syscall_return())
+        );
+    }
     /// A leader that ended before its process's other threads has, as
     /// Linux's zombie leader after `exit_mm`, `exit_files` and `exit_fs`,
     /// no memory, descriptors or directories in its process's directory or

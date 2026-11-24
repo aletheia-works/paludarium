@@ -51,10 +51,7 @@ verified.
   do not exist.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
-  anonymous once the segment was written, not once the page was. The
-  pages that `MAP_POPULATE`, `MAP_LOCKED` or a lock would read in of a
-  file (a mapping not both private and writable) are counted only once
-  touched. A read fault in a file's mapping
+  anonymous once the segment was written, not once the page was. A read fault in a file's mapping
   maps no more than the 16 pages around it
   ([features](./features#system-calls)), where Linux maps a large folio
   of its page cache whole when the folio lies within the file, the VMA
@@ -123,7 +120,8 @@ verified.
   thread's to the CPU it was on at its system calls, and none as idle; it
   counts no interrupts or softirqs, and as context switches only the times
   threads went to sleep, as nothing preempts a guest thread, so `status` shows
-  those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`.
+  those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`,
+  and `getrusage` and a wait's rusage as `ru_nvcsw` and 0 as `ru_nivcsw`.
   Another process's thread is `S (sleeping)` in every wait, where Linux shows
   some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
   process what it published at its last system call or signal check, so a mask
@@ -287,9 +285,7 @@ verified.
   maps the file and counts the faults as the program first touches the
   pages, a read fault for several of them at once (`fault_around_bytes`);
   these faults are no `perf` event. No fault is major (`ru_majflt` is 0),
-  as every page of a file is taken to be in the page cache. A core dump's faults count to the
-  last thread to exit, where Linux counts them to the thread that dumps.
-  `/proc/<pid>/stat`'s
+  as every page of a file is taken to be in the page cache. `/proc/<pid>/stat`'s
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
@@ -343,14 +339,8 @@ verified.
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
-  mapping's are the error here. Until the memory manager knows Linux's
-  rules for the mapping (`VM_PFNMAP`), a write to a data page lands, where
-  Linux raises `SIGBUS`; a part of the mapping may be unmapped, moved or
-  given another protection, where Linux refuses to split it (`EINVAL`); and
-  `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
-  (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
-  mapping unlocked. `inherit_stat` is taken, but an inherited event's end
-  sends no read record, as nothing is recorded. The cgroup mode
+  mapping's are the error here. `inherit_stat` is taken, but an inherited
+  event's end sends no read record, as nothing is recorded. The cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
@@ -522,8 +512,8 @@ verified.
   clears the `%fs` or `%gs` base, where AMD's CPUs before Zen 2 keep it.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
   `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`,
-  `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS` and
-  `_REMOVE_BUFFERS` run; the other operations
+  `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
+  `_REMOVE_BUFFERS` and `IORING_OP_ASYNC_CANCEL` run; the other operations
   complete with `EOPNOTSUPP`.
   The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
@@ -534,16 +524,16 @@ verified.
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING` and
-  `IORING_REGISTER_PBUF_STATUS` (the others give `EINVAL`). So no ring descriptor or personality can be
+  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the others give `EINVAL`). So no ring descriptor or personality can be
   registered, buffers cannot be updated, and buffers cannot be registered
-  with `IORING_REGISTER_BUFFERS2`, which gives them tags. Task work that
-  a thread still has when it exits or calls `execve` is dropped, and so are
-  the requests it submitted that wait for their files, and a ring's own
-  task work when the ring closes. Linux runs them cancelled
-  (`io_uring_cancel_generic`), posting `ECANCELED`. A request that waits
-  for its file keeps its ring after the ring closes, until the file is
-  ready, where Linux cancels it then. No request can cancel another
-  (`IORING_OP_ASYNC_CANCEL` is `EOPNOTSUPP`). A registered file that an
+  with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
+  whole exit cancels the requests its threads submitted that wait for
+  their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
+  the kernel the differential tests run on, cancels them only once their
+  files are ready, as for a thread that exits alone. In that exit, a
+  link's next request that still waits to run fails with `EFAULT`, as an
+  exiting thread's does; Linux master runs it before the thread is
+  exiting. A registered file that an
   update outside a submission takes from its slot posts its tag at once,
   even while a request that waits for its file holds it; Linux posts the
   tag once that request completes. A registered buffer's pages
@@ -553,13 +543,20 @@ verified.
   Linux moves the pages it pinned. A shared mapping of a disk file can be
   registered, where Linux's long-term pin refuses it (`EFAULT`), and a huge
   page charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where Linux
-  charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`), and
-  `poll` and `epoll` cannot watch its descriptor. The features are Linux
+  charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`).
+  A `poll`, or a level-triggered `epoll`, that waits for room in a ring's
+  submission queue ends once there is room, where Linux's ring wakes only
+  what waits for its completions. The features are Linux
   6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
   descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
   wait's `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
   `io_uring_enter` instead of waiting for its file as a pipe's read does. A file that is never read (an epoll instance, a ring)
   fails with `EINVAL` at once, where Linux first waits for it to be ready.
+  An `IORING_OP_ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_OP` and an
+  operation past `IORING_OP_LAST` finds no request (`ENOENT`), as on Linux
+  7.0, the kernel the differential tests run on; Linux master's
+  `io_async_cancel_prep` refuses it with `EINVAL`. This follows master once
+  the test runners' kernel does.
   A file without a position (a pipe, a socket, a terminal, an eventfd) is
   taken as one that can be polled, which decides when a read uses a ring's
   buffer and whether a transfer waits for it. A ring of buffers in the program's memory is not
@@ -778,9 +775,7 @@ verified.
     is kept and shown, but the tracee runs on in 64-bit mode, where Linux
     would run it in that segment or fault.
   - `mincore` counts a page of a file as in memory whenever it lies within the
-    file, where Linux asks its page cache, and does not count a page that
-    `MAP_POPULATE`, `MAP_LOCKED` or a memory lock read in (a mapping not both
-    private and writable) until it is touched.
+    file, where Linux asks its page cache.
   - Adjacent private VMAs merge once their flags agree again (after
     `munlock`, for one), whatever their `anon_vma`s. Linux merges them only
     when they share one. A VMA gets its `anon_vma` on its first write, and
@@ -878,9 +873,7 @@ verified.
   fault maps (and counts in `Rss`) only the pages around it, not the whole
   folio; a large folio always comes, where Linux
   takes a smaller one when memory has no free extent so large; and none
-  is split under memory pressure but to make room for another. The pages
-  `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring
-  into a shared mapping count only once touched. Its extended attributes
+  is split under memory pressure but to make room for another. Its extended attributes
   take none of the inodes' room (`ENOSPC` from `setxattr` past it, as
   `shmem_xattr_handler_set` counts them, does not happen); the root from
   start-up has no limit but
@@ -1009,10 +1002,13 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: when a superblock goes, an instance's watches
-  hear `IN_UNMOUNT` the newest watch first, where Linux takes the files the
-  newest first that any instance began to watch, so the orders can differ
-  when instances watch the same files. `/proc/self/fdinfo` lists an epoll's files by
+- **inotify, in part**: when a superblock goes, its files' watches hear
+  `IN_UNMOUNT` in the order the files got their first mark of any group, as
+  on Linux; but the dnotify mark a one-shot watch leaves on its directory
+  after its signal goes at the end of a descriptor table only through the
+  files that asked for a watch, where Linux's goes through any descriptor
+  of the directory, so a directory may keep its place in that order
+  longer. `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
@@ -1079,12 +1075,12 @@ verified.
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
   across a pair to an address of the peer's namespace; it takes IPv6
   addresses, makes its link-local one and its routes, and takes IPv6
-  routes a request adds, with a gateway too, and IPv6's TCP and UDP and
-  its neighbours, but no proxy entry and no IPv4 route through a gateway,
-  each `EOPNOTSUPP`. An IPv6 gateway's neighbour state does not steer a
-  lookup, as Linux's `rt6_check_neigh` does among routes of one metric,
-  and two routes with gateways of one metric, which Linux makes
-  multipath siblings, are `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
+  routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
+  and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
+  gateway's neighbour state does not steer a lookup, as Linux's
+  `rt6_check_neigh` does among routes of one metric, and two routes with
+  gateways of one metric, which Linux makes multipath siblings, are
+  `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
   link without a scope ID or a device is `EINVAL`, as Linux's is with no
   multicast interface, which none is here. A connection accepted from a
   link-local address has no device, so its names have no scope ID. A UDP
@@ -1174,7 +1170,7 @@ verified.
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
   A
-  route goes through `lo`, a veth end (for IPv4 without a gateway) or rejects: multipath routes,
+  route goes through `lo`, a veth end or rejects: multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup

@@ -2322,6 +2322,7 @@ const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const MAP_LOCKED: u64 = 0x2000;
 const MAP_POPULATE: u64 = 0x8000;
+const MAP_NONBLOCK: u64 = 0x10000;
 const MAP_NORESERVE: u64 = 0x4000;
 const MAP_STACK: u64 = 0x2_0000;
 const MAP_GROWSDOWN: u64 = 0x100;
@@ -2551,12 +2552,14 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             c.mem.mapped(a, end);
             // `perf_event_mmap` of it.
             crate::perf::mapped(c, a.0);
-            // Linux populates a writable private mapping by writing it, with
-            // MAP_POPULATE or a lock that is not on fault (`mm_populate`):
-            // each page becomes a copy of its own, and the mapping gets an
-            // anon_vma (a core then writes it whole).
-            if flags & MAP_POPULATE != 0 || lock == Some(paludarium_mmu::Lock::Populated) {
-                write_range_in(c.mem, a.0, end);
+            // Linux brings the pages in with MAP_POPULATE (without
+            // MAP_NONBLOCK) or a lock (`do_mmap`'s `populate`,
+            // `mm_populate`): a writable private mapping's by writing them,
+            // so each becomes a copy of its own and the mapping gets an
+            // anon_vma (a core then writes it whole), any other's by
+            // reading them.
+            if flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE || lock.is_some() {
+                populate_range_in(c.mem, a.0, end);
             }
             // A new VMA has no memory policy.
             c.group.numa().forget(a.0, len);
@@ -2966,10 +2969,9 @@ fn sys_mlockall(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         (flags & MCL_CURRENT != 0).then_some(Some(lock)),
         (flags & MCL_FUTURE != 0).then_some(lock),
     );
-    // `mm_populate(0, TASK_SIZE)`, which brings the writable private
-    // pages in by writing them.
-    if flags & MCL_CURRENT != 0 && lock == paludarium_mmu::Lock::Populated {
-        write_range_in(c.mem, 0, u64::MAX);
+    // `mm_populate(0, TASK_SIZE)`.
+    if flags & MCL_CURRENT != 0 {
+        populate_range_in(c.mem, 0, u64::MAX);
     }
     ok(0)
 }
@@ -3068,12 +3070,11 @@ pub(crate) fn advise(
     if end > USER_ADDRESS_LIMIT {
         return Err(Errno::ENOMEM);
     }
-    if advice == MADV_DONTNEED_LOCKED {
-        removing(addr, end);
-        return mem.discard_shared(GuestAddr(addr), length);
-    }
-    if advice == MADV_DONTNEED {
-        return short_of_locked(mem, addr, end, true, |to| {
+    // A `VM_PFNMAP` VMA's pages are not dropped, nor without
+    // `MADV_DONTNEED_LOCKED` a locked one's (`madvise_dontneed_free_valid_vma`).
+    if advice == MADV_DONTNEED_LOCKED || advice == MADV_DONTNEED {
+        let stop = mem.first_undiscardable(GuestAddr(addr), end, advice == MADV_DONTNEED);
+        return short_of(mem, addr, end, stop, true, |to| {
             removing(addr, to);
             mem.discard_shared(GuestAddr(addr), to - addr)
         });
@@ -3245,10 +3246,23 @@ fn short_of_locked(
     discards: bool,
     op: impl FnOnce(u64) -> Result<(), Errno>,
 ) -> Result<(), Errno> {
-    let Some(locked) = mem.first_locked(GuestAddr(addr), end) else {
+    let stop = mem.first_locked(GuestAddr(addr), end);
+    short_of(mem, addr, end, stop, discards, op)
+}
+
+/// The same, short of the mapping `stop` the advice may not take.
+fn short_of(
+    mem: &AddressSpace,
+    addr: u64,
+    end: u64,
+    stop: Option<paludarium_mmu::Mapping>,
+    discards: bool,
+    op: impl FnOnce(u64) -> Result<(), Errno>,
+) -> Result<(), Errno> {
+    let Some(stop) = stop else {
         return op(end);
     };
-    let at = locked.start.0.max(addr);
+    let at = stop.start.0.max(addr);
     if at > addr {
         match op(at) {
             Ok(()) | Err(Errno::ENOMEM) => {}
@@ -3295,6 +3309,56 @@ fn remove(
 /// breaks COW. Any other is brought in by reading.
 fn writes_in(mem: &AddressSpace, m: &paludarium_mmu::Mapping) -> bool {
     m.prot.contains(Prot::WRITE) && mem.shared_offset(m.start).is_none()
+}
+
+/// Brings the pages of `[start, end)` in as Linux's `mm_populate` does,
+/// whose errors its callers ignore: in each mapping there, a private one
+/// that may be written by writing them ([`write_in`]), any other by
+/// reading them (`FOLL_FORCE`), which takes a shmem file's page into the
+/// file (charging it to a tmpfs mount). A mapping locked on fault
+/// (`VM_LOCKONFAULT`), with no access, or whose file makes it `VM_IO` or
+/// `VM_PFNMAP` (a perf ring's) is passed over, and so is one of a
+/// `memfd_secret` file, which `get_user_pages` refuses; a page that
+/// cannot be brought in (past the end of its file, or past a tmpfs
+/// mount's size) ends its mapping's, as `__get_user_pages` stops there and
+/// `__mm_populate` goes on at the next VMA.
+fn populate_range_in(mem: &AddressSpace, start: u64, end: u64) {
+    let mut mappings: Vec<_> = mem
+        .mappings()
+        .filter(|m| m.start.0 < end && m.end() > start)
+        .collect();
+    mappings.sort_by_key(|m| m.start.0);
+    const VM_PFNMAP: u64 = 1 << 10;
+    const VM_IO: u64 = 1 << 14;
+    let view = mem.view();
+    for m in mappings {
+        let (from, to) = (m.start.0.max(start), m.end().min(end));
+        if m.locked == Some(paludarium_mmu::Lock::OnFault)
+            || m.prot == Prot::NONE
+            || maps_secret(mem, from, to)
+            || view
+                .vma_from(from)
+                .is_some_and(|vma| vma.flags & (VM_IO | VM_PFNMAP) != 0)
+        {
+            continue;
+        }
+        let write = writes_in(mem, &m);
+        if write {
+            mark_written_for(mem, from);
+        }
+        let mut page = from;
+        while page < to {
+            let faulted = if write {
+                write_in(mem, page).is_err()
+            } else {
+                mem.read_for_dump(GuestAddr(page), &mut [0]).is_err()
+            };
+            if faulted {
+                break;
+            }
+            page += 4096;
+        }
+    }
 }
 
 /// Brings the pages of `[start, end)` in by writing them ([`write_in`]),
@@ -3693,13 +3757,12 @@ fn sys_mremap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // (`mlock_future_ok` in `remap_is_valid`'s resize, EAGAIN).
     let align = |len: u64| len.wrapping_add(4095) & !4095;
     let grows = align(new_len).saturating_sub(align(old_len));
-    if addr & 4095 == 0
+    let locked_grows = addr & 4095 == 0
         && grows > 0
         && c.mem
             .first_locked(GuestAddr(addr), addr.saturating_add(1))
-            .is_some_and(|m| m.start.0 <= addr)
-        && !lock_fits(c, grows >> 12)
-    {
+            .is_some_and(|m| m.start.0 <= addr);
+    if locked_grows && !lock_fits(c, grows >> 12) {
         return err(Errno::EAGAIN);
     }
     let events = RemapEvents::new(c, addr, align(old_len), align(new_len), &how);
@@ -3707,6 +3770,12 @@ fn sys_mremap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Ok(at) => {
             c.group.numa().moved(addr, old_len, at.0, new_len, keep_old);
             events.deliver(c, addr, at.0, keep_old);
+            // A locked VMA that grew has the new part brought in
+            // (`populate_expand`, `mm_populate`).
+            if locked_grows {
+                let from = at.0 + align(old_len);
+                populate_range_in(c.mem, from, from + grows);
+            }
             ok(at.0)
         }
         Err(e) => err(e),
@@ -4500,26 +4569,31 @@ fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
 pub(crate) const SYSINFO_RAM: u64 = 4 << 30;
 
 /// What a `struct rusage` tells: CPU time in nanoseconds, the peak
-/// resident size in pages and the minor faults.
+/// resident size in pages, the minor faults and the voluntary context
+/// switches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourceUsage {
     pub cpu: u64,
     pub peak: u64,
     pub minor_faults: u64,
+    pub switches: u64,
 }
 
 /// A `struct rusage` with `usage.cpu` nanoseconds as user time,
-/// `usage.peak` pages as `ru_maxrss` in KiB and `usage.minor_faults` as
-/// `ru_minflt`. The emulator's own work for the guest's system calls
-/// happens in user space on the host, so the system time is 0; every page
-/// a file's mapping reads is taken to be in the page cache, so no fault is
-/// major (`ru_majflt` is 0); and the other counts are not kept.
+/// `usage.peak` pages as `ru_maxrss` in KiB, `usage.minor_faults` as
+/// `ru_minflt` and `usage.switches` as `ru_nvcsw`. The emulator's own work
+/// for the guest's system calls happens in user space on the host, so the
+/// system time is 0; every page a file's mapping reads is taken to be in
+/// the page cache, so no fault is major (`ru_majflt` is 0); nothing
+/// preempts a guest thread, so it switches only when it sleeps
+/// (`ru_nivcsw` is 0); and the other counts are not kept.
 pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
     let mut bytes = [0u8; 144];
     bytes[..8].copy_from_slice(&(usage.cpu / 1_000_000_000).to_le_bytes());
     bytes[8..16].copy_from_slice(&(usage.cpu % 1_000_000_000 / 1000).to_le_bytes());
     bytes[32..40].copy_from_slice(&(usage.peak * 4).to_le_bytes());
     bytes[64..72].copy_from_slice(&usage.minor_faults.to_le_bytes());
+    bytes[128..136].copy_from_slice(&usage.switches.to_le_bytes());
     bytes
 }
 
@@ -4531,7 +4605,8 @@ pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
 /// the largest of the reaped children's for RUSAGE_CHILDREN. The minor
 /// faults are the process's threads' (`signal->min_flt` and each thread's
 /// `min_flt`), the thread's, or the reaped children's (`cmin_flt`), as of
-/// each thread's latest system call.
+/// each thread's latest system call, and so are the voluntary context
+/// switches (`signal->nvcsw` and each thread's `nvcsw`, or `cnvcsw`).
 fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
     let own = || c.group.peak(c.mem.resident_pages().0);
@@ -4540,16 +4615,24 @@ fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             cpu: c.group.process_cpu(),
             peak: own(),
             minor_faults: c.group.process_faults(),
+            switches: c.group.process_switches(),
         },
         1 => ResourceUsage {
             cpu: thread,
             peak: own(),
             minor_faults: c.process.cpu.used.minor_faults(),
+            switches: c
+                .process
+                .cpu
+                .used
+                .switches
+                .load(std::sync::atomic::Ordering::SeqCst),
         },
         -1 => ResourceUsage {
             cpu: c.processes.children_cpu(c.process.pid),
             peak: c.group.children_peak(),
             minor_faults: c.group.children_faults(),
+            switches: c.group.children_switches(),
         },
         _ => return err(Errno::EINVAL),
     };

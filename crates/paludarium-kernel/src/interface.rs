@@ -2595,13 +2595,18 @@ impl Addresses {
     /// unknown kind, the scope `RT_SCOPE_NOWHERE`, a gateway of host
     /// scope, an on-link route without a gateway, an invalid gateway or a
     /// preferred source that is not local; `ENODEV` for none but a
-    /// gateway's; `ENETDOWN` while the device it names (`up`), or else
-    /// `lo`, is down, but for a route of host scope. A route through a
-    /// veth end without its carrier is `RTNH_F_LINKDOWN`. Anycast,
-    /// multicast and NAT routes are `EOPNOTSUPP`, as is a gateway through a
-    /// veth end, which is not taken yet. The metrics' error comes after
-    /// the scope's, as `fib_create_info` makes them.
-    pub(crate) fn add_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
+    /// gateway's; `ENETDOWN` while the device it names, or else `lo`, is
+    /// down (`up` tells of each device, `lo` for 0), but for a route of
+    /// host scope. A gateway's route goes through the device it names or
+    /// else the one its gateway is reached through ([`Self::gateway4`]). A
+    /// route through a veth end without its carrier is `RTNH_F_LINKDOWN`.
+    /// Anycast, multicast and NAT routes are `EOPNOTSUPP`. The metrics'
+    /// error comes after the scope's, as `fib_create_info` makes them.
+    pub(crate) fn add_route4(
+        &mut self,
+        ask: &Ask4,
+        up: &dyn Fn(u32) -> bool,
+    ) -> Result<Vec<Event>, Errno> {
         let added = self.insert_route4(ask, up);
         if added.is_ok() && ask.kind == Kind::Local.code() {
             self.custom_local4 = true;
@@ -2609,7 +2614,7 @@ impl Addresses {
         added
     }
     /// [`Self::add_route4`], but for what it marks.
-    fn insert_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
+    fn insert_route4(&mut self, ask: &Ask4, up: &dyn Fn(u32) -> bool) -> Result<Vec<Event>, Errno> {
         let table = if ask.table == 0 {
             TABLE_MAIN
         } else {
@@ -2680,13 +2685,10 @@ impl Addresses {
                 return Err(Errno::ENODEV);
             }
         } else if let Some(gateway) = ask.gateway {
-            // A route the guest adds through a gateway goes through `lo`
-            // alone: one through a veth end is not taken yet.
-            if ask.device && ask.oif != LOOPBACK_OIF {
-                return Err(EOPNOTSUPP);
-            }
-            route.uses_gateway = self.gateway4(gateway, ask, table, up)?;
-            route.oif = LOOPBACK_OIF;
+            let (oif, uses_gateway) = self.gateway4(gateway, ask, table, up)?;
+            route.oif = oif;
+            route.uses_gateway = uses_gateway;
+            route.linkdown = self.no_carrier.contains(&oif);
         } else if onlink {
             return Err(extack::message(
                 Errno::EINVAL,
@@ -2694,7 +2696,7 @@ impl Addresses {
             ));
         } else if !ask.device {
             return Err(Errno::ENODEV);
-        } else if !up {
+        } else if !up(ask.oif) {
             return Err(extack::message(ENETDOWN, "Device for nexthop is not up"));
         } else {
             // `fib_check_nh_nongw`.
@@ -2711,30 +2713,40 @@ impl Addresses {
             .into_iter()
             .collect())
     }
-    /// Checks a gateway as `fib_check_nh_v4_gw`: on link, it must be a
-    /// unicast address through `lo` while up, for a route wider than link
-    /// scope; else a lookup of a narrower scope must reach it by a unicast
-    /// or local route, in the route's table then the main one, its error
-    /// as it is. Whether a route of link scope reaches it.
-    fn gateway4(&self, gateway: Ipv4Addr, ask: &Ask4, table: u32, up: bool) -> Result<bool, Errno> {
+    /// Checks a gateway as `fib_check_nh_v4_gw`: on link, through the
+    /// device the route names, up, for a route wider than link scope, it
+    /// must be unicast ([`Self::gateway_type4`]); else a
+    /// lookup of a narrower scope, through the device named if any, must
+    /// reach it by a unicast or local route, in the route's table then the
+    /// main one, its error as it is, and the device that route goes
+    /// through must be up. That device, and whether a route of link scope
+    /// reaches the gateway, so that the route's packets go to it
+    /// (`rt_uses_gateway`).
+    fn gateway4(
+        &self,
+        gateway: Ipv4Addr,
+        ask: &Ask4,
+        table: u32,
+        up: &dyn Fn(u32) -> bool,
+    ) -> Result<(u32, bool), Errno> {
         let invalid = |error| extack::message(error, "Nexthop has invalid gateway");
         if ask.flags & 4 != 0 {
             if ask.scope >= SCOPE_LINK {
                 return Err(extack::message(Errno::EINVAL, "Nexthop has invalid scope"));
             }
-            if ask.oif != LOOPBACK_OIF {
+            if !ask.device {
                 return Err(extack::message(
                     Errno::ENODEV,
                     "Nexthop device required for onlink",
                 ));
             }
-            if !up {
+            if !up(ask.oif) {
                 return Err(extack::message(ENETDOWN, "Nexthop device is not up"));
             }
-            if self.addr_type4(gateway, TABLE_LOCAL) != Kind::Unicast {
+            if self.gateway_type4(gateway) != Kind::Unicast {
                 return Err(invalid(Errno::EINVAL));
             }
-            return Ok(true);
+            return Ok((ask.oif, true));
         }
         let scope = (ask.scope + 1).max(SCOPE_LINK);
         let mut found = Err(Errno::EAGAIN);
@@ -2749,15 +2761,25 @@ impl Addresses {
         if !matches!(via.kind, Kind::Unicast | Kind::Local) {
             return Err(invalid(Errno::EINVAL));
         }
-        // A route the guest adds goes through `lo` alone: a gateway
-        // reached through a veth end is not taken yet.
-        if via.oif != LOOPBACK_OIF {
-            return Err(EOPNOTSUPP);
-        }
-        if !up {
+        if !up(via.oif) {
             return Err(ENETDOWN);
         }
-        Ok(via.scope == SCOPE_LINK)
+        Ok((via.oif, via.scope == SCOPE_LINK))
+    }
+    /// What an on-link gateway `ip` is (`inet_addr_type_dev_table`, which
+    /// takes the local table and no device): a broadcast one for 0.0.0.0,
+    /// the limited broadcast address or no local table, a group
+    /// multicast, else the kind of the route the local table's trie has to
+    /// it, through any device, and unicast where it has none.
+    fn gateway_type4(&self, ip: Ipv4Addr) -> Kind {
+        if ip.is_unspecified() || ip.is_broadcast() || !self.tables4.contains(&TABLE_LOCAL) {
+            return Kind::Broadcast;
+        }
+        if ip.is_multicast() {
+            return Kind::Multicast;
+        }
+        self.table_lookup4(Self::trie(TABLE_LOCAL), ip, SCOPE_UNIVERSE, 0, 0)
+            .map_or(Kind::Unicast, |r| r.kind)
     }
     /// Whether `source` may be a route's preferred source
     /// (`fib_valid_prefsrc`): a local route's own destination, or an
@@ -3811,35 +3833,35 @@ mod tests {
         // Down, a route through lo is `ENETDOWN`; host scope needs it not.
         a.down();
         assert_eq!(
-            a.add_route4(&ask4("10.9.0.0", 16, 1, 0x600), false),
+            a.add_route4(&ask4("10.9.0.0", 16, 1, 0x600), &|_| false),
             Err(ENETDOWN)
         );
         a.up(0, true);
         // The same prefix: prepended, replaced, appended.
         let mut ask = ask4("10.9.0.0", 16, 1, 0x600);
         assert_eq!(
-            told(&a.add_route4(&ask, true).unwrap()),
+            told(&a.add_route4(&ask, &|_| true).unwrap()),
             ["+route 254 10.9.0.0/16 Unicast 0x600"]
         );
-        assert_eq!(a.add_route4(&ask, true), Err(Errno::EEXIST));
+        assert_eq!(a.add_route4(&ask, &|_| true), Err(Errno::EEXIST));
         ask.request = F_CREATE | F_REPLACE;
         ask.scope = SCOPE_HOST;
         assert_eq!(
-            told(&a.add_route4(&ask, true).unwrap()),
+            told(&a.add_route4(&ask, &|_| true).unwrap()),
             ["+route 254 10.9.0.0/16 Unicast 0x100"]
         );
-        assert_eq!(a.add_route4(&ask, true).unwrap(), []);
+        assert_eq!(a.add_route4(&ask, &|_| true).unwrap(), []);
         ask.request = F_CREATE | F_APPEND;
         ask.scope = SCOPE_LINK;
         assert_eq!(
-            told(&a.add_route4(&ask, true).unwrap()),
+            told(&a.add_route4(&ask, &|_| true).unwrap()),
             ["+route 254 10.9.0.0/16 Unicast 0xc00"]
         );
-        assert_eq!(a.add_route4(&ask, true), Err(Errno::EEXIST));
+        assert_eq!(a.add_route4(&ask, &|_| true), Err(Errno::EEXIST));
         ask.request = F_CREATE;
         ask.proto = 4;
         assert_eq!(
-            told(&a.add_route4(&ask, true).unwrap()),
+            told(&a.add_route4(&ask, &|_| true).unwrap()),
             ["+route 254 10.9.0.0/16 Unicast 0x400"]
         );
         let protos: Vec<_> = a
@@ -3868,11 +3890,13 @@ mod tests {
         assert!(matches!(gone[..], [Event::DelRoute4(r)] if r.scope == SCOPE_HOST));
         // A blackhole is EINVAL to a lookup, a throw route goes on to the
         // default table, and the longest prefix wins across the tables.
-        a.add_route4(&ask4("10.6.0.0", 16, 6, 0x600), true).unwrap();
-        a.add_route4(&ask4("10.3.0.0", 16, 9, 0x600), true).unwrap();
+        a.add_route4(&ask4("10.6.0.0", 16, 6, 0x600), &|_| true)
+            .unwrap();
+        a.add_route4(&ask4("10.3.0.0", 16, 9, 0x600), &|_| true)
+            .unwrap();
         let mut default = ask4("10.3.0.0", 16, 1, 0x600);
         default.table = TABLE_DEFAULT;
-        a.add_route4(&default, true).unwrap();
+        a.add_route4(&default, &|_| true).unwrap();
         assert_eq!(a.lookup4("10.6.1.1".parse().unwrap()), Err(Errno::EINVAL));
         assert_eq!(
             a.lookup4("10.3.1.1".parse().unwrap()).unwrap().table,
@@ -3889,7 +3913,7 @@ mod tests {
         local.scope = SCOPE_HOST;
         local.oif = 1;
         local.device = true;
-        a.add_route4(&local, true).unwrap();
+        a.add_route4(&local, &|_| true).unwrap();
         assert!(a.bindable4("10.7.1.1".parse().unwrap()));
         assert_eq!(
             a.source("10.7.1.1".parse().unwrap(), &[1]),
@@ -4170,6 +4194,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipv4_gateways_take_the_device_their_route_goes_through() {
+        let mut a = Addresses::isolated();
+        let mut end = V4 {
+            index: 1000,
+            label: b"va".to_vec(),
+            ..v4("10.0.0.1", 24)
+        };
+        end.broadcast = Some("10.0.0.255".parse().unwrap());
+        a.add_v4(end, Lifetimes::FOREVER, false, true, 0).unwrap();
+        let ask = |via: &str, oif: u32, onlink: bool| Ask4 {
+            gateway: Some(via.parse().unwrap()),
+            oif,
+            device: oif == 1 || oif == 1000,
+            flags: if onlink { 4 } else { 0 },
+            scope: SCOPE_UNIVERSE,
+            ..ask4("10.2.0.0", 24, 1, 0x600)
+        };
+        let up = |_: u32| true;
+        let error = |a: &mut Addresses, via, oif, onlink| {
+            a.add_route4(&ask(via, oif, onlink), &up).map(|_| ())
+        };
+        assert_eq!(error(&mut a, "10.9.0.1", 0, false), Err(ENETUNREACH));
+        assert_eq!(error(&mut a, "10.0.0.2", 1, false), Err(ENETUNREACH));
+        assert_eq!(error(&mut a, "10.0.0.255", 0, false), Err(Errno::EINVAL));
+        assert_eq!(error(&mut a, "10.7.0.1", 0, true), Err(Errno::ENODEV));
+        assert_eq!(error(&mut a, "10.0.0.1", 1000, true), Err(Errno::EINVAL));
+        assert_eq!(error(&mut a, "10.0.0.255", 1000, true), Err(Errno::EINVAL));
+        assert_eq!(error(&mut a, "224.0.0.1", 1000, true), Err(Errno::EINVAL));
+        // Its device down, the route to the gateway is not taken.
+        assert_eq!(
+            a.add_route4(&ask("10.0.0.2", 0, false), &|oif| oif != 1000)
+                .map(|_| ()),
+            Err(ENETDOWN)
+        );
+        // On link through the device it names; else through the device
+        // of its route, whose packets go to the gateway.
+        let events = a.add_route4(&ask("10.7.0.1", 1000, true), &up).unwrap();
+        assert!(matches!(events[..], [Event::NewRoute4(r, _)] if r.oif == 1000 && r.uses_gateway));
+        let events = a.add_route4(&ask("10.0.0.2", 0, false), &up);
+        assert_eq!(events, Err(Errno::EEXIST));
+        let mut other = ask("10.0.0.2", 0, false);
+        other.dst = "10.6.0.0".parse().unwrap();
+        let events = a.add_route4(&other, &up).unwrap();
+        assert!(matches!(
+            events[..],
+            [Event::NewRoute4(r, _)] if r.oif == 1000 && r.uses_gateway && !r.linkdown
+        ));
+        // A gateway's route does not reach another gateway.
+        let mut further = ask("10.6.0.2", 0, false);
+        further.dst = "10.8.0.0".parse().unwrap();
+        assert_eq!(a.add_route4(&further, &up).map(|_| ()), Err(ENETUNREACH));
+        let route = a.lookup4("10.6.0.9".parse().unwrap()).unwrap();
+        assert_eq!(route.gateway, Some("10.0.0.2".parse().unwrap()));
+    }
     #[test]
     fn a_veth_ends_addresses_bring_unicast_routes_that_follow_its_state() {
         let mut a = Addresses::isolated();

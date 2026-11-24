@@ -10,6 +10,11 @@ name: Full quality
 on:
   # Called by nightly.yml; dispatched for a release by scripts/release/evidence.py.
   workflow_call:
+    inputs:
+      macos:
+        description: Compare the macOS host too (macos-quality.yml without its fuzz targets)
+        type: boolean
+        default: false
   workflow_dispatch:
 
 permissions:
@@ -40,6 +45,14 @@ defaults:
     shell: bash
 
 jobs:
+  # The macOS host, with diff_macos, every night. A release dispatches
+  # macos-quality.yml on its own, so a dispatch of this workflow (no inputs)
+  # leaves it out rather than run it twice.
+  macos:
+    if: ${{ inputs.macos == true }}
+    uses: ./.github/workflows/macos-quality.yml
+    with:
+      fuzz: false
   windows-oracle:
     uses: ./.github/workflows/jit-native-first.yml
   windows-host:

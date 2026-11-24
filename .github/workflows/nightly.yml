@@ -24,6 +24,8 @@ jobs:
   quality:
     if: github.repository_owner == 'aletheia-works'
     uses: ./.github/workflows/quality.yml
+    with:
+      macos: true
 
   report:
     needs: [fuzz, quality]

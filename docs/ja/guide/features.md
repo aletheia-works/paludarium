@@ -481,7 +481,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   除いて `O_LARGEFILE` がありません。
   `F_SETFL` が変えるのは `O_APPEND`、`O_NONBLOCK`、`O_DIRECT`、`O_NOATIME` と、
   シグナルを送れるファイルでの `O_ASYNC` だけで、アクセスモードとほかのフラグは
-  Linux の `setfl` と同じく残ります。BPF のマップとプログラムは、まだこれを無視します。
+  Linux の `setfl` と同じく残ります。
 
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
   読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`splice`、`tee`、`vmsplice`、`fsync`、
@@ -860,9 +860,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先）があれば `ENOMEM` を返します。書き込めるプライベートなマッピングのページは、
   Linux の `populate_vma_page_range` と同じく書き込んで取り込みます（`FOLL_WRITE`）。
   そこにあるファイルのページは自分だけのコピーになり、そのあとのファイルへの書き込みは
-  見えなくなります。`MAP_POPULATE`、`MAP_LOCKED`、`MCL_CURRENT` の `mlockall`、
-  ロックしたプライベートなマッピングを書き込めるようにする `mprotect` も同じです。
-  `MLOCK_ONFAULT` や `MCL_ONFAULT` のロックは何も取り込みません。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
+  見えなくなります。ほかのマッピングのページは読んで取り込みます（`FOLL_FORCE`）。
+  shmem のファイル（memfd、tmpfs マウントのファイル）のページはそれでファイルのものになり、
+  すぐにそのブロックに数えます。`MAP_POPULATE`（`MAP_NONBLOCK` なし）、`MAP_LOCKED`、
+  `MCL_CURRENT` の `mlockall`、ロックしたマッピングを広げる `mremap` も同じように取り込み
+  ますが（`mm_populate`）、取り込めないページは無視します。そのページでそのマッピングの分を
+  やめるので、tmpfs マウントの大きさを超える `mmap` も、入るページだけで成功します。
+  ロックしたプライベートなマッピングを書き込めるようにする `mprotect` は、ページを書き込んで
+  取り込みます。`MLOCK_ONFAULT` や `MCL_ONFAULT` のロックは何も取り込まず、アクセスの
+  できないマッピング、`memfd_secret` のファイルのもの、`VM_IO` か `VM_PFNMAP` のもの
+  （perf のリング）も取り込みません。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
   （マップしているもの全部が収まらなければ `ENOMEM`）、`MCL_FUTURE` で新しいマッピングを
   ロックします。そのあとの `mmap`、`brk`、広がる `mremap` には、`MAP_LOCKED` と同じく
   空きが要ります（`EAGAIN`。`brk` は区切りを変えません）。`munlockall` はどちらも
@@ -870,7 +877,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MADV_PAGEOUT`、`MADV_REMOVE`、`MADV_GUARD_INSTALL` を断り（`EINVAL`。前の VMA は
   指定を受けたあとです）、`MS_INVALIDATE` の `msync` も断ります（`EBUSY`）。
   `MADV_DONTNEED_LOCKED` は受け付けます。`fork` の子と、`MREMAP_DONTUNMAP` が残す元の
-  範囲はロックされず、AIO と `io_uring` のリングもロックされません。`mlock2` と
+  範囲はロックされず、AIO、`io_uring`、perf イベントのリングもロックされません。`mlock2` と
   `mlockall` の未知のフラグは `EINVAL` です。スワップアウトは起きないので、ほかに
   何もしなくてもメモリはそのまま残ります。
 
@@ -899,7 +906,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   VMA のフラグを付けたり外したりします（あとのものでページは変わりません）。
   VMA は、Linux と同じように前後の VMA から分かれたり、つながったりします
   （`/proc/<pid>/maps`）。VMA を順に処理し、受け付けない VMA があればそこで `EINVAL`
-  で止まります（`MADV_WIPEONFORK` はプライベートの匿名メモリだけです）。範囲に穴が
+  で止まります（`MADV_WIPEONFORK` はプライベートの匿名メモリだけです。AIO、`io_uring`、
+  perf イベントのリングのような、コアの mm が支えないメモリは `MADV_DOFORK` と
+  `MADV_DODUMP` を受け付けず、perf のリングバッファは一部だけの変更を受け付けません）。範囲に穴が
   あれば、残りを処理してから `ENOMEM` を返します。`fork` の子は、`MADV_DONTFORK` の
   マッピングを受け継がず、`MADV_WIPEONFORK` のマッピングはページなしの、0 で埋まった
   新しいメモリとして受け継ぎます。そのフラグと `MADV_DONTDUMP` は子にも残ります。
@@ -983,7 +992,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   続きの上へ広げられ、そのページは初めて触れたときに読み込みます。また、複数の
   マッピングにまたがる範囲を
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
-  AIO と `io_uring` のリングは固定のマッピング（`VM_DONTEXPAND`）で、広げられず
+  AIO、`io_uring`、perf イベントのリングは固定のマッピング（`VM_DONTEXPAND`）で、広げられず
   （`EFAULT`）、動かして元を残すこともできません（`MREMAP_DONTUNMAP`、`EINVAL`）。
   AIO のリングは、Linux master の `aio_ring_mremap` と同じく丸ごとでなければ動かせず
   （行き先を空け、縮めて落とす分を外したあとで `EINVAL`）、コンテキストも一緒に移ります。
@@ -1487,7 +1496,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
-  それに `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、それに `IORING_OP_ASYNC_CANCEL` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
@@ -1527,6 +1536,52 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     割り込みません。
   - 提供バッファーを選んだ読み出しは、待つあいだそれを保ちます（`REQ_F_BUFFER_SELECTED`）。
     リングのバッファーはリングの先頭に残り、読み出しが続くときにもう一度選ばれます。
+
+- `IORING_OP_ASYNC_CANCEL` と `IORING_REGISTER_SYNC_CANCEL` は、Linux master の
+  `io_uring/cancel.c` と `io_poll_cancel` と同じく、そのリングでファイルを待つ要求を取り消します。
+  ほかの要求が実行中になることはないので、見つけるものはそれだけです。
+  - 取り消しは `user_data` で、`IORING_ASYNC_CANCEL_FD` ならファイルで（`_FD_FIXED` か
+    `IOSQE_FIXED_FILE` なら登録したファイルで）、`_OP` なら操作で一致を探し、`_ANY` なら
+    どの要求にも一致します。`_USERDATA` があれば `user_data` も一致しなければなりません。
+  - `_ALL` も `_ANY` もなければ、最初に一致したものを取り消して 0 を返し、なければ
+    `ENOENT` を返してリンクを失敗させます。どちらかがあれば一致したものをすべて取り消して
+    その数を返し、なければ 0 です。順序はリングのハッシュ表のもの（`user_data` の
+    `hash_long`、同じバケツでは新しいものが先）です。
+  - 取り消された要求は、取り消しのあとで、投入したスレッドのタスクワークとして
+    `ECANCELED` で完了し、リンクを失敗させます。保っていた提供バッファーは使われます
+    （`IORING_CQE_F_BUFFER`）。
+  - ファイルの準備ができても、タスクワークがまだ実行されていない要求も取り消されます。
+    タスクワークが実行されるまでは見つかるからです。ファイルのバイトは残ります。
+  - `IORING_OP_ASYNC_CANCEL` は、Linux 7.0 の `io_async_cancel_prep` と同じく、知らない
+    フラグ、`_FD` か `_OP` と一緒の `_ANY`、`off` か `splice_fd_in` を断ります（`EINVAL`）。
+    開いていない記述子は `EBADF` です。
+  - `IORING_REGISTER_SYNC_CANCEL` は `struct io_uring_sync_cancel_reg` を一つ取ります。
+    詰め物は 0 でなければならず、数か 0 か `ENOENT` をそのまま返します。見つけるものが
+    実行中になることはないので待つことはなく、タイムアウトは使いません。
+
+- 要求が完了する前に、投入したスレッドやリングがなくなることがあります。Linux の
+  `io_uring_cancel_generic`、`tw.c`、`io_ring_ctx_wait_and_kill` と同じく扱います。
+  - ひとりで終わるスレッドが投入した要求は待ち続けます。ファイルの準備ができると、Linux の
+    `io_fallback_tw` がいなくなったスレッドのタスクワークを実行するとおりに `ECANCELED` で
+    失敗し、バイトはファイルに残ります。スレッドが終わるときにまだ持っているタスクワークも
+    同じく実行されます。ファイルの準備ができた要求は `ECANCELED` で、リンクの次の要求は
+    `EFAULT` で失敗し（`io_should_terminate_tw`）、`IORING_NOP_TW` は完了します。
+  - `execve` は、`io_uring_cancel_generic` のループと同じく古いイメージのメモリの上で、
+    そのスレッドが投入してファイルを待っている要求を、ファイルの準備ができたものも含めて
+    すべて取り消します（`io_uring_task_cancel`）。先にそのスレッドが投入する
+    `IORING_SETUP_DEFER_TASKRUN` のリングのタスクワークが実行されるので、そこでファイルの
+    準備ができた要求は続きます。そのあと要求が取り消され、スレッドとリングのタスクワークが
+    実行されるので、どれも新しいプログラムが動く前に `ECANCELED` で完了します。
+  - 最後の記述子とマッピングが閉じたリングは、待っている要求とそれが持つファイルを手放します。
+    Linux master が `close` から戻る前にそうするのと同じで、そのような要求だけが読み手だった
+    パイプは、それ以上書き込みを受け付けません（`EPIPE`）。リングに残ったタスクワークも
+    一緒に消えます。
+
+- `poll` と `epoll` は、Linux の `io_uring_poll` が答えるとおりにリングの記述子を見ます。
+  投入キューに空きがあれば書き込み可能で、完了がキューかカーネルで待っているか、
+  `IORING_SETUP_DEFER_TASKRUN` のリングにタスクワークがあれば読み出し可能です。待つものを
+  起こすのは完了だけで、それも入力を待つものだけなので、出力へのエッジトリガーの関心は
+  一度だけ報告されます。
 
 - `IORING_OP_NOP` は、`io_nop_prep` と `io_nop` と同じく Linux 7.0 のフラグを取ります。
   `IORING_NOP_INJECT_RESULT` は `len` を結果にして完了させます。`IORING_NOP_FILE` は
@@ -2305,7 +2360,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     リンクのメッセージの後でアドレスごとにそれらの経路ができます。下がると、ローカル経路の
     ほかは何も伝えずに消えます。上がっていてキャリアがない間は `RTNH_F_LINKDOWN` です
     （`fib_check_nh_nongw`、`NETDEV_CHANGE`）。ゲスト自身が足す、ゲートウェイのない端を
-    通る経路も取ります（端が下がっていれば `ENETDOWN`、ないデバイスは `ENODEV`）。端を
+    通る経路も取ります（端が下がっていれば `ENETDOWN`、ないデバイスは `ENODEV`）。
+    ゲートウェイ（`RTA_GATEWAY`）のある経路は、`fib_check_nh_v4_gw` と同じく確かめて、
+    名前の端を、なければゲートウェイへの経路が通る端を通します。リンクスコープ以下の
+    ユニキャストかローカルの経路がゲートウェイに届き（端の名前があればそれを通って）、
+    その端が上がっていなければなりません（`ENETDOWN`）。`RTNH_F_ONLINK` はゲートウェイを
+    名前の端のリンク上にあるものとし（端は上がっていなければなりません）、名前空間の
+    アドレス、ブロードキャスト、グループのものは断ります（`EINVAL`）。パケットは、
+    リンクスコープの経路がゲートウェイに届くときはゲートウェイの近隣へ
+    （`rt_uses_gateway`）、ほかは宛先の近隣へ出ていきます。端を
     通る出力の経路の検索は、端の最初のプライマリアドレスから、なければほかのデバイスの
     作られた順で最初のものから出て（`inet_select_addr`）、その端を `RTA_OIF` に、
     `RTCF_LOCAL` なしで答えます。`lo` から端へ転送する検索もその端を答え、送り元を
@@ -2342,7 +2405,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     送った名前空間と、端にキャリアがある間は、相手がそのアドレスをブロードキャストと
     見て（限定ブロードキャストか、経路がそうするもの）、送り元を逆経路フィルタが
     通すとき（`ip_route_input_slow`）の相手の名前空間です。未指定のアドレスから
-    接続したソケットは経路の送り元を取っているので、受け取りません。端のアドレスにバインドしたソケット
+    接続したソケットは経路の送り元を取っているので、受け取りません。ブロードキャストか
+    マルチキャストのアドレスにバインドした IPv4 のソケットは、それを名前として持ち、UDP の
+    接続でも変わりませんが、経路の送り元から送ります（`inet_bind`）。TCP の接続では、その
+    送り元が名前にもなります（`tcp_v4_connect`）。そうしたアドレスを IPv4-mapped にしたものにバインドした
+    IPv6 のソケットは、それを IPv4 の送り元として持つので（`__inet6_bind`）、IPv4 への
+    経路が失敗します。UDP の `sendto` と `connect`、TCP の `connect` は、グループか限定
+    ブロードキャストのアドレスからでは `EINVAL`、サブネットのものからでは `ENETUNREACH`
+    です。端のアドレスにバインドしたソケット
     からのグループや限定ブロードキャストのアドレスへのものは、経路がなくてもその端から
     出ます（`ip_route_output_key_hash_rcu`）。
   - **組を通る IPv6:** IPv6 の経路（ユニキャストのもの、またはマルチキャストの
@@ -2517,7 +2587,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     上がってからは（落ちている間に足したものは永続のときだけ）、メインの表に、アドレスの
     優先度か、なければメトリック 256 のユニキャストの接頭辞の経路があります（`::1` には
     ありません）。`RTM_NEWROUTE` は、`inet_rtm_newroute` と `inet6_rtm_newroute` と同じく、
-    `lo` か veth の端（IPv4 ではゲートウェイのない経路）を通る経路か、デバイスのない種類（`blackhole`、`unreachable`、`prohibit`、
+    `lo` か veth の端を通る経路か、デバイスのない種類（`blackhole`、`unreachable`、`prohibit`、
     `throw`）の経路を、どの表にも足します。メトリック、プロトコル、スコープ、TOS、
     優先する送り元、ゲートウェイ（オンリンクも）を持てます。`NLM_F_EXCL`、
     `NLM_F_REPLACE`、`NLM_F_APPEND`、`NLM_F_CREATE` に従って Linux と同じ場所に置くか、
@@ -3143,7 +3213,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、
   `pagemap`、`wchan`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
-  `PR_SET_DUMPABLE` まで）root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
+  `PR_SET_DUMPABLE` まで）root です。この root は、そのプログラムが動くユーザー名前空間の
+  root で、その名前空間が root を対応づけていなければ最初の名前空間の root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
   プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
   その持ち主とモード（`environ`、`auxv`、`pagemap`、`io`、`personality`、`syscall` は 0400、`comm` は 0644、`clear_refs`
   は 0200、ほかのファイルは 0444）を示します。
@@ -3216,7 +3287,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
-  同じです。ファイルの持ち主はこのプロセス自身のもの（前述）と
+  同じです。プロセスのユーザー名前空間での `CAP_SYS_PTRACE` があれば読めますが、ダンプできない
+  プロセスは、Linux の `task_still_dumpable` と同じく、そのプログラムが動くユーザー名前空間での
+  その権限がなければ読めません。それはプログラムを実行したときの名前空間で、読めない
+  プログラムなら、ファイルの持ち主とグループを対応づけている最も近い上の名前空間です
+  （`would_dump`）。そのため、ユーザー名前空間を `unshare` したあと `PR_SET_DUMPABLE` を外した
+  プロセスは、そこでの子プロセスからも読めません。ファイルの持ち主はこのプロセス自身のもの（前述）と
   同じで（ダンプできないプロセスのディレクトリ（0555）もそのプロセスのものです）、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
   ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
   `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
@@ -3805,11 +3881,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `perf` は数えません。`mlock`、`mlockall`、`MAP_POPULATE` が取り込むとき、
   `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE`、`process_vm_readv` と
   `process_vm_writev`（呼び出し元に数えます）、トレーサーの `PTRACE_PEEKDATA` と
-  `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（一度も触れていない無名メモリは
-  穴として残し、フォールトしません）です。`RUSAGE_SELF` はプロセスのスレッドの合計、
+  `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（ほかのスレッドが待つあいだに
+  ダンプする、シグナルで終わったスレッドに数えます。最後に終了するスレッドがどれかは関係ありません。
+  一度も触れていないプライベートな無名メモリは穴として残し、フォールトしません）です。`RUSAGE_SELF` はプロセスのスレッドの合計、
   `RUSAGE_THREAD` はそのスレッドのもの、`RUSAGE_CHILDREN` と wait は CPU 時間と同じく
-  子のものです。fork した子は 0 から始まり、`execve` は保ちます。ほかの値
-  （メジャーフォールト、コンテキストスイッチ、ブロック）は 0 です。`/proc/<pid>/stat` は
+  子のものです。fork した子は 0 から始まり、`execve` は保ちます。`ru_nvcsw` は
+  Linux の `nvcsw` と同じく自発的なコンテキストスイッチ、つまりスレッドが眠った回数を、
+  同じプロセスとスレッドについて数え、wait と `RUSAGE_CHILDREN` では子のもの（`cnvcsw`）を
+  数えます。どれも各スレッドの最後のシステムコールの時点の値です。ほかの値
+  （メジャーフォールト、非自発的なコンテキストスイッチ、ブロック）は 0 です。`/proc/<pid>/stat` は
   同じ数を `minflt`（`task` の下ではそのスレッドのもの）と `cminflt` に示し、`majflt` と
   `cmajflt` は 0 です。
 
@@ -4059,7 +4139,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントを数え続けさせます。最後にアンマップされると、バッファと課したものは
   なくなります。これはイベントのファイルのマッピングで、`/proc/<pid>/maps` と `MMAP2`
   の記録は、ディスクリプタの `fstat` が示すデバイスと inode（無名 inode のもの）を付けて
-  `anon_inode:[perf_event]` と示します。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
+  `anon_inode:[perf_event]` と示します。Linux の `VM_PFNMAP` のマッピングの規則
+  （`perf_mmap_vmops`）に従い、データページは読み込み専用で、書き込むと `SIGBUS` です。
+  一部だけのアンマップ、上へのマップ、移動、保護やほかのフラグの変更、封印はできません
+  （`EINVAL`）が、呼び出しで変わらない一部なら受け付けます。コアの mm が支えるメモリでは
+  ないので、`MADV_DOFORK` と `MADV_DODUMP` は受け付けず、`MADV_DONTNEED` と
+  `MADV_DONTNEED_LOCKED` にページを渡さず（`EINVAL`）、`mlock` してもロックされません。
+  ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
   `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
   `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
   数と有効な時間と動いた時間があります。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに
@@ -4638,8 +4724,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   残っていれば消えず、切り離したものはそこで開いている最後のファイルが閉じられたときに
   消えます）、そのファイルのウォッチはどれも、何を求めていても `IN_UNMOUNT`
   （ディレクトリなら `IN_ISDIR` 付き）を受け取り、`IN_IGNORED` とともに消えます。
-  Linux の `fsnotify_sb_delete` と同じです。インスタンスのウォッチは新しいものから
-  消えます。インスタンスはイベントを溜め、直前のイベントと同じもの（ディスクリプタ、
+  Linux の `fsnotify_sb_delete` と同じです。ファイルは `fsnotify_unmount_inodes` と同じく
+  新しいコネクタから順に扱います。これは、ファイルが今も持つマーク（inotify のインスタンス、
+  dnotify、fanotify のどれのものでも）の最初のものを得た順で、1 つのインスタンスが見張った
+  順ではありません。インスタンスはイベントを溜め、直前のイベントと同じもの（ディスクリプタ、
   マスク、名前）は、それが `IN_IGNORED` か名前の変更でなければまとめます。16384 個
   溜まると、読まれるまで `IN_Q_OVERFLOW`（ディスクリプタは -1）を 1 つだけ溜めます。
   読み込みは入るだけの `struct inotify_event` を返し、名前は 16 バイトの倍数まで NUL で

@@ -698,12 +698,12 @@ impl Notifier {
     /// at its last mount: the watches on its files end ([`Instance::unmounted`]).
     /// No removed file of it awaits its last close, which holds the mount.
     pub(crate) fn unmounted(&self, device: u64) {
-        if self.watches.load(Ordering::SeqCst) == 0 {
-            return;
+        if self.watches.load(Ordering::SeqCst) != 0 {
+            for instance in self.instances() {
+                instance.unmounted(device);
+            }
         }
-        for instance in self.instances() {
-            instance.unmounted(device);
-        }
+        self.fan.connectors_gone(device);
     }
     /// A file no name ever linked (a memfd), which ends, as a removed one
     /// does, at its last close.
@@ -1136,9 +1136,10 @@ impl Queue {
     /// Removes watch `wd` and queues its `IN_IGNORED`, as Linux's
     /// `inotify_ignored_and_remove_idr`: none if there is no such watch,
     /// else whether the event was queued.
-    fn unwatch(&mut self, wd: i32) -> Option<bool> {
+    fn unwatch(&mut self, wd: i32, connectors: &crate::fanotify::Registry) -> Option<bool> {
         let watch = self.watches.remove(&wd)?;
         self.by_key.remove(&watch.key);
+        connectors.connector_removed(watch.key);
         Some(self.push(Event {
             wd,
             mask: IGNORED,
@@ -1261,7 +1262,11 @@ impl Instance {
             cookie,
             name: name.to_vec(),
         }));
-        let gone = if oneshot { queue.unwatch(wd) } else { None };
+        let gone = if oneshot {
+            queue.unwatch(wd, &self.notifier.fan)
+        } else {
+            None
+        };
         queued += usize::from(gone == Some(true));
         drop(queue);
         if gone.is_some() {
@@ -1273,15 +1278,17 @@ impl Instance {
     /// `IN_UNMOUNT` (with `IN_ISDIR` for a directory) whatever it asked
     /// for, as `inotify_arg_to_mask` gives every mark `FS_UNMOUNT`, then
     /// goes with `IN_IGNORED`. Linux takes the files by their connectors,
-    /// the newest first (`fsnotify_unmount_inodes`); here the watches go
-    /// the newest first.
+    /// the newest first (`fsnotify_unmount_inodes`): the order in which
+    /// their files got the first of the marks of any group they hold now,
+    /// not the order this instance watched them.
     fn unmounted(&self, device: u64) {
+        let connectors = &*self.notifier.fan;
         let mut queue = self.queue();
         let mut gone: Vec<_> = queue
             .watches
             .iter()
             .filter(|(_, watch)| watch.key.0 == device)
-            .map(|(&wd, watch)| (watch.made, wd, watch.directory))
+            .map(|(&wd, watch)| (connectors.connector_made(watch.key), wd, watch.directory))
             .collect();
         if gone.is_empty() {
             return;
@@ -1295,7 +1302,7 @@ impl Instance {
                 cookie: 0,
                 name: Vec::new(),
             }));
-            queued += usize::from(queue.unwatch(wd) == Some(true));
+            queued += usize::from(queue.unwatch(wd, &self.notifier.fan) == Some(true));
         }
         drop(queue);
         self.notifier.release(self.owner, gone.len(), false);
@@ -1307,7 +1314,7 @@ impl Instance {
         let Some(&wd) = queue.by_key.get(&key) else {
             return;
         };
-        let queued = queue.unwatch(wd) == Some(true);
+        let queued = queue.unwatch(wd, &self.notifier.fan) == Some(true);
         drop(queue);
         self.notifier.release(self.owner, 1, false);
         self.queued(usize::from(queued));
@@ -1348,12 +1355,13 @@ impl Instance {
             },
         );
         queue.by_key.insert(key, wd);
+        self.notifier.fan.connector_added(key);
         Ok(wd)
     }
     /// `inotify_rm_watch`: EINVAL for a descriptor no watch has.
     fn unwatch(&self, wd: i32) -> Result<(), Errno> {
         let mut queue = self.queue();
-        let queued = queue.unwatch(wd).ok_or(Errno::EINVAL)?;
+        let queued = queue.unwatch(wd, &self.notifier.fan).ok_or(Errno::EINVAL)?;
         drop(queue);
         self.notifier.release(self.owner, 1, false);
         self.queued(usize::from(queued));
@@ -1393,7 +1401,13 @@ impl Instance {
 }
 impl Drop for Instance {
     fn drop(&mut self) {
-        let watches = self.queue().watches.len();
+        let watches = {
+            let queue = self.queue();
+            for watch in queue.watches.values() {
+                self.notifier.fan.connector_removed(watch.key);
+            }
+            queue.watches.len()
+        };
         self.notifier.release(self.owner, watches, true);
     }
 }

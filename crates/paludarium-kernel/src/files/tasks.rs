@@ -175,11 +175,12 @@ impl Task {
         std::sync::Arc::clone(&self.public.credentials.user.0)
     }
     /// Its files' owner: the task's effective IDs, as Linux's
-    /// `task_dump_owner` gives a dumpable task's, and root an undumpable
-    /// one's but for a directory any reader may read and look in (0555),
-    /// which is always the task's. A task with no memory left (a zombie, or
-    /// a leader that ended before its other threads) has the rest owned by
-    /// root, as `task_dump_owner` did before Linux 7.2's commit 6b1c66c9
+    /// `task_dump_owner` gives a dumpable task's, and an undumpable one's
+    /// root of the user namespace its program runs in ([`dump_root`]) but
+    /// for a directory any reader may read and look in (0555), which is
+    /// always the task's. A task with no memory left (a zombie, or a leader
+    /// that ended before its other threads) has the rest owned by root, as
+    /// `task_dump_owner` did before Linux 7.2's commit 6b1c66c9
     /// ("exec_state: relocate dumpable information"), finding no `mm` to
     /// ask: the kernel of the x86-64 CI runners that the differential tests
     /// compare with. From 7.2 the dumpable flag outlives the `mm`; when the
@@ -190,6 +191,8 @@ impl Task {
         let ids = &self.public.credentials;
         let (uid, gid) = if (self.holds() && self.view.dumpable) || stat.mode == OPEN_DIRECTORY {
             (ids.euid, ids.egid)
+        } else if self.holds() {
+            dump_root(&self.view.exec_user)
         } else {
             (0, 0)
         };
@@ -203,7 +206,7 @@ impl Task {
         self.pid == c.process.pid
             || c.process.credentials.may_read_task(
                 &self.public.credentials,
-                self.view.dumpable,
+                (self.view.dumpable, &self.view.exec_user),
                 real,
             )
     }
@@ -564,15 +567,27 @@ pub(crate) fn own_live_owner(
         };
         let public = view.group.public(tid);
         // Root's but for an open directory once the task has no memory left,
-        // as Linux's `task_dump_owner` before 7.2 ([`Task::owned`]).
+        // as Linux's `task_dump_owner` before 7.2 ([`Task::owned`]), and
+        // its program's namespace's root's while it is undumpable.
         let gone = view.zombie || (tid == pid && !view.group.has_member(pid));
         match public {
             Some(public) if open || (view.dumpable && !gone) => {
                 (public.credentials.euid, public.credentials.egid)
             }
+            Some(_) if !gone => dump_root(&view.exec_user),
             _ => (0, 0),
         }
     })
+}
+/// Who owns an undumpable task's files, as Linux's `task_dump_owner`: root
+/// of the user namespace its program runs in, or, where that namespace
+/// maps no root, the first one's.
+fn dump_root(exec_user: &crate::namespaces::Namespace) -> (u32, u32) {
+    use crate::users::Ids;
+    (
+        exec_user.kernel_of(Ids::User, 0).unwrap_or(0),
+        exec_user.kernel_of(Ids::Group, 0).unwrap_or(0),
+    )
 }
 /// What a file of the task's that is made when it is read
 /// ([`crate::proc::single_file`]) finds then, as Linux's `proc_single_show`
@@ -640,7 +655,7 @@ impl AtRead {
             Reader::Own => true,
             Reader::Other(reader) => reader.credentials.may_read_task(
                 &self.target.credentials,
-                self.view.dumpable,
+                (self.view.dumpable, &self.view.exec_user),
                 false,
             ),
             Reader::Unknown => false,

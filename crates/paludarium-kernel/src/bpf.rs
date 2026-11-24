@@ -536,6 +536,8 @@ pub(crate) struct MapFile {
     /// `O_RDONLY`, `O_WRONLY` or `O_RDWR`, from `BPF_F_RDONLY` and
     /// `BPF_F_WRONLY`.
     access: u32,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 
 fn of(file: &Arc<dyn FileHandle>) -> Option<&MapFile> {
@@ -970,7 +972,15 @@ fn entries(kind: u32, max_entries: u32, flags: u32, cpus: u64) -> u32 {
 /// `bpf_map_new_fd`: a descriptor of the map, close-on-exec.
 fn new_fd(c: &mut Context<'_>, map: Arc<Map>, access: u32) -> Result<u64, Errno> {
     c.files
-        .install(Arc::new(MapFile { map, access }), true, c.group.nofile())
+        .install(
+            Arc::new(MapFile {
+                map,
+                access,
+                status: Default::default(),
+            }),
+            true,
+            c.group.nofile(),
+        )
         .map(u64::from)
 }
 
@@ -2619,9 +2629,11 @@ impl FileHandle for MapFile {
         Err(Errno::ENOSYS)
     }
     fn flags(&self) -> u32 {
-        self.access
+        self.status.of(self.access)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }

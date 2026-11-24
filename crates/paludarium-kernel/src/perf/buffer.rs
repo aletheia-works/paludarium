@@ -447,6 +447,16 @@ impl PageSource for Pages {
     fn linked(&self) -> bool {
         false
     }
+    /// `perf_mmap_may_split`: a part of the mapping is never unmapped,
+    /// moved or changed on its own (`EINVAL`).
+    fn splits(&self) -> bool {
+        false
+    }
+    /// `perf_mmap_pfn_mkwrite`: the pages are mapped read-only, and only the
+    /// user page becomes writable; a write to a data page is `SIGBUS`.
+    fn writable(&self, offset: u64) -> bool {
+        offset == 0
+    }
     /// The event's file, as `d_path` names it: an anonymous inode's
     /// (`anon_inode_getfile`'s `[perf_event]`), which `/proc/<pid>/maps`
     /// and the `MMAP` records give.

@@ -994,7 +994,10 @@ kernel.
   of the range (no page here depends on the last ones), which then split from and merge with
   their neighbours as Linux's do (`/proc/<pid>/maps`). They go VMA by VMA:
   one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
-  takes only private anonymous memory), and a hole in the range gives
+  takes only private anonymous memory, memory core mm does not back, as
+  the rings of AIO, `io_uring` and perf events, takes no `MADV_DOFORK` or
+  `MADV_DODUMP`, and a perf ring buffer takes a change of only a part of
+  it none), and a hole in the range gives
   `ENOMEM` after the rest has taken it. A `fork`ed child gets no mapping
   `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
   its pages, as new zero-filled memory; it keeps that flag and
@@ -4674,8 +4677,15 @@ kernel.
   closed; its last unmapping frees the buffer and its charges. It is a
   mapping of the event's file, which `/proc/<pid>/maps` and the `MMAP2`
   records name `anon_inode:[perf_event]` with the device and inode its
-  descriptor's `fstat` gives, the anonymous inodes' one. The user
-  page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
+  descriptor's `fstat` gives, the anonymous inodes' one. It keeps
+  Linux's rules for a `VM_PFNMAP` mapping (`perf_mmap_vmops`): its data
+  pages are read-only, a write to one raising `SIGBUS`; no part of it is
+  unmapped, mapped over, moved, given another protection or other flags,
+  or sealed on its own (`EINVAL`), though a part that the call would not
+  change takes it; and as memory core mm does not back, it takes no
+  `MADV_DOFORK` or `MADV_DODUMP`, gives `MADV_DONTNEED` and
+  `MADV_DONTNEED_LOCKED` no pages (`EINVAL`), and stays unlocked through
+  `mlock`. The user page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
   offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
   index 0, and the count and times enabled and running between two bumps
   of the sequence lock. `PERF_EVENT_IOC_SET_OUTPUT`, and

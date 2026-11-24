@@ -110,6 +110,7 @@ impl Env {
             auxv,
             code: (0x40_1000, 0x40_2345),
             data: (0x40_3000, 0x40_3100),
+            vdso: 0,
             fails: false,
         });
         Self { k, t, m }

@@ -17278,6 +17278,304 @@ static int thread_caps_status_case(void) {
     return 0;
 }
 
+/* The vdso-mappings case: as Linux's map_vdso maps them at exec, below the
+   other mappings and above nothing but the stack, [vvar] (4 pages),
+   [vvar_vclock] (2) and [vdso] (2) lie together, private and read-only but
+   [vdso] executable, of no file, and AT_SYSINFO_EHDR is the vDSO's start,
+   first in the auxiliary vector. A C library finds the vDSO's functions by
+   its dynamic symbols and their version, LINUX_2.6, as musl's __vdsosym
+   does here, and gets what the system calls give. [vvar]'s pages 1 and 3
+   (and [vvar_vclock]'s page 1) are a bus error, nothing in [vvar] may be
+   made writable or reached from outside the process (VM_IO | VM_PFNMAP),
+   and the vDSO may be moved but not grown. statm counts the three areas,
+   and a fork keeps them where they are. The bytes of [vvar], Linux's time
+   data, and whether [vvar_vclock]'s page 0 can be read, which depends on
+   the machine's clock, are not printed. */
+struct vdm_area {
+    unsigned long start, end;
+    char perms[8], rest[64];
+};
+static struct vdm_area vdm_areas[3];
+static const char *const vdm_names[3] = {"[vvar]", "[vvar_vclock]", "[vdso]"};
+static unsigned long vdm_stack_start, vdm_after_vdso;
+
+static void vdm_scan(void) {
+    memset(vdm_areas, 0, sizeof vdm_areas);
+    vdm_stack_start = vdm_after_vdso = 0;
+    char buffer[16384];
+    if (proc_read("/proc/self/maps", buffer, sizeof buffer) <= 0) return;
+    int previous_was_vdso = 0;
+    for (char *line = buffer; *line;) {
+        char *next = strchr(line, '\n');
+        if (next) *next = 0;
+        unsigned long start, end, offset;
+        char perms[8], dev[16], inode[32], name[256] = "";
+        int fields = sscanf(line, "%lx-%lx %7s %lx %15s %31s %255s", &start, &end, perms, &offset, dev, inode, name);
+        if (fields >= 6) {
+            if (previous_was_vdso) vdm_after_vdso = start;
+            previous_was_vdso = 0;
+            for (int i = 0; i < 3; i++)
+                if (!strcmp(name, vdm_names[i])) {
+                    vdm_areas[i].start = start;
+                    vdm_areas[i].end = end;
+                    snprintf(vdm_areas[i].perms, sizeof vdm_areas[i].perms, "%s", perms);
+                    snprintf(vdm_areas[i].rest, sizeof vdm_areas[i].rest, "%lx %s %s", offset, dev, inode);
+                    previous_was_vdso = i == 2;
+                }
+            if (!strcmp(name, "[stack]")) vdm_stack_start = start;
+        }
+        if (!next) break;
+        line = next + 1;
+    }
+}
+
+static const void *vdm_symbol(const char *wanted) {
+    const unsigned char *image = (const unsigned char *)getauxval(AT_SYSINFO_EHDR);
+    if (!image) return NULL;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(image + eh->e_phoff);
+    const Elf64_Dyn *dyn = NULL;
+    long bias = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) dyn = (const Elf64_Dyn *)(image + ph[i].p_offset);
+        if (ph[i].p_type == PT_LOAD) bias = (long)ph[i].p_offset - (long)ph[i].p_vaddr;
+    }
+    const char *strings = NULL;
+    const Elf64_Sym *symbols = NULL;
+    const uint32_t *hash = NULL;
+    const uint16_t *versym = NULL;
+    const unsigned char *verdef = NULL;
+    for (; dyn && dyn->d_tag != DT_NULL; dyn++) {
+        const unsigned char *at = image + bias + dyn->d_un.d_ptr;
+        if (dyn->d_tag == DT_STRTAB) strings = (const char *)at;
+        if (dyn->d_tag == DT_SYMTAB) symbols = (const Elf64_Sym *)at;
+        if (dyn->d_tag == DT_HASH) hash = (const uint32_t *)at;
+        if (dyn->d_tag == DT_VERSYM) versym = (const uint16_t *)at;
+        if (dyn->d_tag == DT_VERDEF) verdef = at;
+    }
+    if (!strings || !symbols || !hash || !versym || !verdef) return NULL;
+    for (uint32_t i = 1; i < hash[1]; i++) {
+        const Elf64_Sym *sym = &symbols[i];
+        if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC || !sym->st_shndx) continue;
+        if (strcmp(strings + sym->st_name, wanted)) continue;
+        for (const unsigned char *vd = verdef;;) {
+            const Elf64_Verdef *d = (const Elf64_Verdef *)vd;
+            if (d->vd_ndx == (versym[i] & 0x7fff)) {
+                const Elf64_Verdaux *a = (const Elf64_Verdaux *)(vd + d->vd_aux);
+                if (!strcmp(strings + a->vda_name, "LINUX_2.6")) return image + bias + sym->st_value;
+                break;
+            }
+            if (!d->vd_next) break;
+            vd += d->vd_next;
+        }
+    }
+    return NULL;
+}
+
+static sigjmp_buf vdm_jump;
+static volatile int vdm_signal, vdm_code, vdm_at_target;
+static volatile unsigned long vdm_target;
+static void vdm_on_signal(int number, siginfo_t *info, void *context) {
+    (void)context;
+    vdm_signal = number;
+    vdm_code = info->si_code;
+    vdm_at_target = (unsigned long)info->si_addr == vdm_target;
+    siglongjmp(vdm_jump, 1);
+}
+
+static void vdm_read(const char *what, unsigned long address) {
+    struct sigaction action = {.sa_sigaction = vdm_on_signal, .sa_flags = SA_SIGINFO | SA_NODEFER};
+    struct sigaction old_bus, old_segv;
+    sigaction(SIGBUS, &action, &old_bus);
+    sigaction(SIGSEGV, &action, &old_segv);
+    vdm_target = address;
+    if (sigsetjmp(vdm_jump, 1)) {
+        printf("read %s signal=%d code=%d addr==target=%d\n", what, vdm_signal, vdm_code, vdm_at_target);
+    } else {
+        volatile unsigned char byte = *(volatile unsigned char *)address;
+        (void)byte;
+        printf("read %s ok\n", what);
+    }
+    sigaction(SIGBUS, &old_bus, NULL);
+    sigaction(SIGSEGV, &old_segv, NULL);
+}
+
+/* `op` (one of the operations below) in a child, its result and errno. */
+static void vdm_in_child(const char *what, int op) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return;
+    if (kid == 0) {
+        struct vdm_area vvar = vdm_areas[0], vdso = vdm_areas[2];
+        size_t vvar_size = vvar.end - vvar.start, vdso_size = vdso.end - vdso.start;
+        long r = -1;
+        errno = 0;
+        if (op == 0) {
+            r = mprotect((void *)vdso.start, vdso_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+            if (!r) *(volatile char *)vdso.start = *(volatile char *)vdso.start;
+        } else if (op == 1) {
+            r = mprotect((void *)vvar.start, vvar_size, PROT_READ | PROT_WRITE);
+        } else if (op == 2) {
+            r = munmap((void *)vdso.start, vdso_size);
+        } else if (op == 3) {
+            r = munmap((void *)vvar.start, vvar_size);
+        } else if (op == 4 || op == 6) {
+            unsigned long from = op == 4 ? vdso.start : vvar.start;
+            size_t size = op == 4 ? vdso_size : vvar_size;
+            char *to = mmap(NULL, size + 0x10000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            void *moved = mremap((void *)from, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, to + 0x8000);
+            r = moved == MAP_FAILED ? -1 : 0;
+            if (!r) {
+                vdm_scan();
+                printf("  moved, named still=%d\n", vdm_areas[op == 4 ? 2 : 0].start == (unsigned long)(to + 0x8000));
+            }
+        } else if (op == 5) {
+            r = mremap((void *)vdso.start, vdso_size, vdso_size + 4096, MREMAP_MAYMOVE) == MAP_FAILED ? -1 : 0;
+        } else if (op == 7) {
+            r = madvise((void *)vvar.start, vvar_size, MADV_DONTNEED);
+        } else if (op == 8) {
+            r = madvise((void *)vdso.start, vdso_size, MADV_DONTNEED);
+        } else if (op == 9) {
+            r = mlock((void *)vvar.start, vvar_size);
+        } else if (op == 10) {
+            r = mlock((void *)vdso.start, vdso_size);
+        }
+        printf("%s r=%ld errno=%d\n", what, r, r < 0 ? errno : 0);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    if (!WIFEXITED(status)) printf("%s child status=%#x\n", what, status);
+}
+
+static int vdso_mappings_case(void) {
+    vdm_scan();
+    for (int i = 0; i < 3; i++)
+        printf("%s found=%d pages=%lu perms=%s rest=%s\n", vdm_names[i], vdm_areas[i].start != 0,
+               (vdm_areas[i].end - vdm_areas[i].start) / 4096, vdm_areas[i].perms, vdm_areas[i].rest);
+    printf("together=%d below-stack=%d next-is-stack=%d\n",
+           vdm_areas[0].end == vdm_areas[1].start && vdm_areas[1].end == vdm_areas[2].start,
+           vdm_areas[2].end <= vdm_stack_start, vdm_after_vdso == vdm_stack_start);
+    unsigned long auxv[2] = {0};
+    int fd = open("/proc/self/auxv", O_RDONLY);
+    if (fd >= 0) {
+        if (read(fd, auxv, sizeof auxv) != sizeof auxv) auxv[0] = 0;
+        close(fd);
+    }
+    printf("AT_SYSINFO_EHDR is [vdso]=%d first=%d\n", getauxval(AT_SYSINFO_EHDR) == vdm_areas[2].start,
+           auxv[0] == AT_SYSINFO_EHDR && auxv[1] == vdm_areas[2].start);
+    /* The VmFlags of each area. */
+    char smaps[65536];
+    if (proc_read("/proc/self/smaps", smaps, sizeof smaps) > 0)
+        for (int i = 0; i < 3; i++) {
+            char head[32];
+            snprintf(head, sizeof head, "%lx-", vdm_areas[i].start);
+            char *at = strstr(smaps, head);
+            char *flags = at ? strstr(at, "VmFlags:") : NULL;
+            if (flags) printf("%s %.*s\n", vdm_names[i], (int)strcspn(flags, "\n"), flags);
+        }
+    /* The functions, against the system calls. */
+    typedef long (*fn3)(long, long, long);
+    const char *const functions[] = {"__vdso_clock_gettime", "__vdso_gettimeofday", "__vdso_time", "__vdso_getcpu",
+                                     "__vdso_clock_getres", "clock_gettime", "time"};
+    for (size_t i = 0; i < sizeof functions / sizeof *functions; i++)
+        printf("symbol %s found=%d\n", functions[i], vdm_symbol(functions[i]) != NULL);
+    fn3 gettime = (fn3)vdm_symbol("__vdso_clock_gettime");
+    fn3 gettimeofday_fn = (fn3)vdm_symbol("__vdso_gettimeofday");
+    fn3 time_fn = (fn3)vdm_symbol("__vdso_time");
+    fn3 getcpu_fn = (fn3)vdm_symbol("__vdso_getcpu");
+    fn3 getres = (fn3)vdm_symbol("__vdso_clock_getres");
+    if (gettime && gettimeofday_fn && time_fn && getcpu_fn && getres) {
+        struct timespec a = {0}, b = {0};
+        long r1 = gettime(CLOCK_MONOTONIC, (long)&a, 0);
+        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &b);
+        struct timeval tv = {0};
+        long r2 = gettimeofday_fn((long)&tv, 0, 0);
+        long seconds = time_fn(0, 0, 0);
+        unsigned cpu = 99, node = 99, raw_cpu = 98, raw_node = 98;
+        long r3 = getcpu_fn((long)&cpu, (long)&node, 0);
+        syscall(SYS_getcpu, &raw_cpu, &raw_node, NULL);
+        struct timespec res = {0}, raw_res = {0};
+        long r4 = getres(CLOCK_REALTIME, (long)&res, 0);
+        syscall(SYS_clock_getres, CLOCK_REALTIME, &raw_res);
+        long einval = gettime(-1, (long)&a, 0);
+        printf("clock_gettime r=%ld within=%d gettimeofday r=%ld near=%d time near=%d\n", r1,
+               b.tv_sec - a.tv_sec >= 0 && b.tv_sec - a.tv_sec <= 1, r2, labs(tv.tv_sec - (long)time(NULL)) <= 1,
+               labs(seconds - (long)syscall(SYS_time, NULL)) <= 1);
+        printf("getcpu r=%ld same=%d clock_getres r=%ld same=%d bad clock=%ld\n", r3,
+               cpu == raw_cpu && node == raw_node, r4, res.tv_sec == raw_res.tv_sec && res.tv_nsec == raw_res.tv_nsec,
+               einval);
+    }
+    /* Reads. */
+    for (int page = 0; page < 4; page++) {
+        char what[32];
+        snprintf(what, sizeof what, "[vvar] page %d", page);
+        vdm_read(what, vdm_areas[0].start + (unsigned long)page * 4096);
+    }
+    vdm_read("[vvar_vclock] page 1", vdm_areas[1].start + 4096);
+    vdm_read("[vdso] page 0", vdm_areas[2].start);
+    /* What may be done to them. */
+    const char *const ops[] = {"mprotect [vdso] rwx", "mprotect [vvar] rw", "munmap [vdso]", "munmap [vvar]",
+                               "mremap [vdso] same size", "mremap [vdso] grow", "mremap [vvar] same size",
+                               "madvise DONTNEED [vvar]", "madvise DONTNEED [vdso]", "mlock [vvar]", "mlock [vdso]"};
+    for (int op = 0; op < 11; op++) vdm_in_child(ops[op], op);
+    /* From outside. paludarium has no /proc/<pid>/mem (limitations). */
+    for (int i = 0; i < 3; i += 2) {
+        char byte;
+        struct iovec local = {&byte, 1}, remote = {(void *)vdm_areas[i].start, 1};
+        errno = 0;
+        long v = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        printf("%s process_vm_readv=%ld errno=%d\n", vdm_names[i], v, v < 0 ? errno : 0);
+    }
+    fflush(stdout);
+    pid_t traced = fork();
+    if (traced == 0) {
+        syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    waitpid(traced, NULL, 0);
+    for (int i = 0; i < 3; i += 2) {
+        long word = 0;
+        errno = 0;
+        long r = syscall(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, traced, vdm_areas[i].start, &word);
+        printf("%s PTRACE_PEEKDATA r=%ld errno=%d\n", vdm_names[i], r, r < 0 ? errno : 0);
+    }
+    kill(traced, SIGKILL);
+    waitpid(traced, NULL, 0);
+    /* Counting: statm's size is every line of maps but [vsyscall]. */
+    char maps[16384], statm[256];
+    unsigned long total = 0, gate = 0, size_pages = 0;
+    if (proc_read("/proc/self/maps", maps, sizeof maps) > 0)
+        for (char *line = maps; line && *line;) {
+            unsigned long start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                char *eol = strchr(line, '\n');
+                size_t length = eol ? (size_t)(eol - line) : strlen(line);
+                if (memmem(line, length, "[vsyscall]", 10)) gate += end - start;
+                else total += end - start;
+            }
+            line = strchr(line, '\n');
+            if (line) line++;
+        }
+    if (proc_read("/proc/self/statm", statm, sizeof statm) > 0) sscanf(statm, "%lu", &size_pages);
+    printf("statm counts the areas=%d\n", size_pages * 4096 == total);
+    (void)gate;
+    /* A fork keeps them. */
+    unsigned long vdso = vdm_areas[2].start;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        vdm_scan();
+        printf("child keeps [vdso]=%d\n", vdm_areas[2].start == vdso && getauxval(AT_SYSINFO_EHDR) == vdso);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, NULL, 0);
+    return 0;
+}
+
 /* The smaps-rollup case: /proc/self/smaps_rollup, as Linux's
    show_smaps_rollup makes it, is one line from the first VMA's start to the
    last one's end ([vsyscall], a gate area, is none), with no flags, file or
@@ -38181,6 +38479,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
     if (!strcmp(mode, "smaps-rollup")) return smaps_rollup_case();
+    if (!strcmp(mode, "vdso-mappings")) return vdso_mappings_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
     if (!strcmp(mode, "zombie-ns-links")) return zombie_ns_links_case();
     if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);

@@ -3007,6 +3007,17 @@ impl AddressSpaceData {
             .is_some_and(|source| {
                 source.secret() || source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0
             })
+            || self.special_backing(page).is_some()
+    }
+    /// The source of a private mapping at `page` that core mm does not back
+    /// with pages of its own (`VM_IO | VM_PFNMAP`), as the vDSO's data,
+    /// Linux's `[vvar]`, is a special mapping: its accesses ask the source
+    /// to [`PageSource::admit`] each page, and `get_user_pages`, `madvise`
+    /// and `mremap` treat it as they treat a perf ring.
+    fn special_backing(&self, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
+        let backing = self.backing_at(page)?;
+        (backing.cache.is_none() && backing.source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0)
+            .then(|| (&backing.source, page.wrapping_add(backing.shift)))
     }
     /// Whether a page of `[start, end)` is one `get_user_pages` refuses
     /// ([`Self::gup_refused`]): the shared mappings that overlap it, as
@@ -4359,10 +4370,10 @@ impl AddressSpaceData {
 
     /// The memory an access to the page at `page` asks to take the page in
     /// ([`PageSource::admit`]), and the page's offset in it: a shared
-    /// mapping's, or the shmem page cache a private mapping shows where it
-    /// has no copy of its own, as Linux's `shmem_fault` brings the page
-    /// into the file for a private mapping's read and copy-on-write faults
-    /// too.
+    /// mapping's, a private special mapping's ([`Self::special_backing`]),
+    /// or the shmem page cache a private mapping shows where it has no copy
+    /// of its own, as Linux's `shmem_fault` brings the page into the file
+    /// for a private mapping's read and copy-on-write faults too.
     fn admitting(&self, directory: &Directory, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
         if let Some(shared) = self.shared_at(page) {
             return shared
@@ -4370,6 +4381,9 @@ impl AddressSpaceData {
                 .source
                 .as_ref()
                 .map(|source| (source, page.wrapping_add(shared.shift)));
+        }
+        if let Some(special) = self.special_backing(page) {
+            return Some(special);
         }
         let backing = self.backing_at(page)?;
         (backing.cache.is_some()
@@ -5341,6 +5355,17 @@ impl AddressSpaceData {
             .is_some_and(|source| {
                 source.fixed() || source.vma_flags(0) & (vm::IO | vm::PFNMAP | vm::MIXEDMAP) != 0
             })
+            || self.private_special(addr).is_some()
+    }
+    /// The source of a private mapping at `addr` that is one of Linux's
+    /// `VM_SPECIAL` ([`Self::special`]), as the vDSO and its data are
+    /// special mappings: fixed ([`PageSource::fixed`], `VM_DONTEXPAND`) or
+    /// of no pages of its own ([`Self::special_backing`]).
+    fn private_special(&self, addr: u64) -> Option<&Arc<dyn PageSource>> {
+        let backing = self.backing_at(addr)?;
+        (backing.cache.is_none()
+            && (backing.source.fixed() || backing.source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0))
+            .then_some(&backing.source)
     }
     /// Whether the VMA at `addr` is a `VM_PFNMAP` one, whose pages
     /// `MADV_DONTNEED` may not drop (`madvise_dontneed_free_valid_vma`).
@@ -5348,6 +5373,7 @@ impl AddressSpaceData {
         self.shared_at(addr)
             .and_then(|shared| shared.pages.source())
             .is_some_and(|source| source.vma_flags(0) & vm::PFNMAP != 0)
+            || self.special_backing(addr).is_some()
     }
     /// The first mapping of `[addr, end)` whose pages `MADV_DONTNEED` may
     /// not drop: a `VM_PFNMAP` one, or with `locked` a locked one too.
@@ -5736,7 +5762,8 @@ impl AddressSpaceData {
         // behind a move (`check_prep_vma`)...
         let source = self
             .shared_at(addr.0)
-            .and_then(|shared| shared.pages.source().cloned());
+            .and_then(|shared| shared.pages.source().cloned())
+            .or_else(|| self.private_special(addr.0).cloned());
         let fixed = source.as_ref().is_some_and(|source| source.fixed());
         if how.keep_old && fixed {
             return Err(Errno::EINVAL);
@@ -7498,6 +7525,16 @@ impl AddressSpaceData {
                 && self
                     .shared_at(m.start.0)
                     .is_some_and(|shared| !shared.may_write)
+            {
+                denied = Some(Errno::EACCES);
+                break;
+            }
+            // A special mapping its memory keeps from being written, as
+            // the vDSO's data, Linux's `[vvar]`, has no `VM_MAYWRITE`.
+            if prot.contains(Prot::WRITE)
+                && self
+                    .private_special(m.start.0)
+                    .is_some_and(|source| source.vma_flags(vm::MAYWRITE) & vm::MAYWRITE == 0)
             {
                 denied = Some(Errno::EACCES);
                 break;

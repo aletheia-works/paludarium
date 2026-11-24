@@ -3611,6 +3611,25 @@ kernel.
   A mounted host directory starts with every file root's and keeps the
   owners and groups for the run.
 
+- Each program gets a vDSO at `execve`, as Linux's `map_vdso` maps it on
+  x86-64: `[vvar]` (4 pages), `[vvar_vclock]` (2 pages) and `[vdso]` (2
+  pages), together where the next mapping without an address goes (below
+  the program's and its interpreter's), private, of no file, and
+  `AT_SYSINFO_EHDR`, first in the auxiliary vector, names `[vdso]`'s start.
+  `[vdso]` is `linux-vdso.so.1`, an `ET_DYN` object whose functions
+  `__vdso_clock_gettime`, `__vdso_gettimeofday`, `__vdso_time`,
+  `__vdso_getcpu` and `__vdso_clock_getres`, and their weak aliases without
+  the prefix, of version `LINUX_2.6`, a C library finds through its
+  dynamic symbols; each makes its system call. `[vvar]` and
+  `[vvar_vclock]` are `VM_IO | VM_PFNMAP`: their pages may not be made
+  writable (`EACCES`) or reached through `get_user_pages`
+  (`process_vm_readv` `EFAULT`, `PTRACE_PEEKDATA` `EIO`), `MADV_DONTNEED` is `EINVAL` on them, `[vvar]`'s pages 1 and 3 and
+  `[vvar_vclock]`'s are a bus error (`BUS_ADRERR`), and its pages 0 and 2
+  read as zeros. `[vdso]` may be made writable, which copies it, and moved
+  by `mremap`, but not grown (`EFAULT`). `statm` and `VmSize` count the
+  three, a `fork` keeps them where they are, and a core holds them whole,
+  as Linux's `always_dump_vma` dumps a special mapping.
+
 - Files are checked as Linux checks them (`generic_permission`): the
   owner's permission bits apply to the owner, the group's to a member of the
   file's group (by the filesystem group ID or a supplementary group) and

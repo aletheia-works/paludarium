@@ -1557,9 +1557,6 @@ static void say_record(const uint64_t *record, void *with) {
         int mmap2 = type == RECORD_MMAP2;
         uint64_t start = record[2], len = record[3], pgoff = record[4];
         const char *name = mapping_name(record, mmap2);
-        /* The emulator has no vDSO (see the limitations): Linux's records
-           of its mappings at exec are not compared. */
-        if (!strcmp(name, "[vdso]") || !strncmp(name, "[vvar", 5)) return;
         const uint32_t *words = (const uint32_t *)(record + 5);
         char *at = (char *)start;
         const char *what = "other";

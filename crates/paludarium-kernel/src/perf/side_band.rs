@@ -468,7 +468,22 @@ pub(super) fn exec(events: &Events, space: &Space<'_>, counted: u32, name: &[u8]
         let mapping = Mapping::of(&temporary, 0, space.root, false);
         Space::write_one(&receivers, &mapping, &who);
     }
-    space.write(&receivers, stack.into_iter().chain(rest), None);
+    // The special mappings come last, in the order Linux's `map_vdso`
+    // installs them: `[vdso]`, `[vvar]`, then `[vvar_vclock]`.
+    let rank = |vma: &Vma| {
+        let name = vma.file.as_ref().and_then(|file| file.name.as_deref());
+        [b"[vdso]".as_slice(), b"[vvar]", b"[vvar_vclock]"]
+            .iter()
+            .position(|special| name == Some(*special))
+    };
+    let (mut special, rest): (Vec<Vma>, Vec<Vma>) =
+        rest.into_iter().partition(|vma| rank(vma).is_some());
+    special.sort_by_key(rank);
+    space.write(
+        &receivers,
+        stack.into_iter().chain(rest).chain(special),
+        None,
+    );
 }
 
 #[cfg(test)]

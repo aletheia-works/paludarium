@@ -3116,6 +3116,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルシステムはその持ち主を覚えています。マウントしたホストのディレクトリでは、
   初めはどのファイルも root のもので、持ち主とグループはその回の間だけ覚えます。
 
+- プログラムは `execve` のとき、Linux の x86-64 での `map_vdso` と同じく vDSO を得ます。
+  `[vvar]`（4 ページ）、`[vvar_vclock]`（2 ページ）、`[vdso]`（2 ページ）が、アドレスを
+  指定しない次のマッピングが置かれる場所（プログラムとインタープリターのマッピングの下）に
+  並んで置かれ、プライベートでファイルはなく、補助ベクトルの最初の `AT_SYSINFO_EHDR` が
+  `[vdso]` の先頭を指します。`[vdso]` は `linux-vdso.so.1` という `ET_DYN` のオブジェクトで、
+  C ライブラリーは、その動的シンボルからバージョン `LINUX_2.6` の関数
+  `__vdso_clock_gettime`、`__vdso_gettimeofday`、`__vdso_time`、`__vdso_getcpu`、
+  `__vdso_clock_getres` と、接頭辞のない弱い別名を見つけます。どの関数もそのシステム
+  コールを呼びます。`[vvar]` と `[vvar_vclock]` は `VM_IO | VM_PFNMAP` で、そのページは
+  書き込めるようにはできず（`EACCES`）、`get_user_pages` でも届きません
+  （`process_vm_readv` は `EFAULT`、`PTRACE_PEEKDATA` は `EIO`）。
+  `MADV_DONTNEED` は `EINVAL` で、`[vvar]` のページ 1 と 3、および `[vvar_vclock]` の
+  ページはバスエラー（`BUS_ADRERR`）、`[vvar]` のページ 0 と 2 は 0 として読めます。
+  `[vdso]` は書き込めるようにでき（そのときは写しになります）、`mremap` で動かせますが、
+  大きくはできません（`EFAULT`）。`statm` と `VmSize` はこの三つを数え、`fork` しても
+  同じ場所に残り、Linux の `always_dump_vma` が特別なマッピングをそうするように、
+  コアには全体が入ります。
+
 - ファイルは Linux と同じように確かめます（`generic_permission`）。持ち主には
   持ち主のビット、ファイルのグループに属する者（ファイルシステム用のグループ ID か
   補助グループで）にはグループのビット、それ以外にはその他のビットが当てはまります。

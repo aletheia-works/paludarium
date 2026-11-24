@@ -42,13 +42,24 @@ verified.
   makes no access, and a real CPU may fault (an AMD EPYC does, and exits with
   `SIGSEGV`). A fault on a later byte also leaves the earlier ones written, which
   has not been compared with a real CPU.
-- **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
-  so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
+- **`/proc/self/maps`, in part**: the emulator has no `vsyscall` page, so the
+  `[vsyscall]` line is not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used. A
   program's own segments and its interpreter's are named by the path the
   file had when it was started, with its symbolic links resolved and
   `(deleted)` once nothing links it, but not after a rename, which Linux
   follows. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+- **The vDSO, in part**: its functions make their system calls, as Linux's
+  vDSO does only when no clock can be read from user space, so a seccomp
+  filter, a ptrace tracer's syscall stops and syscall counts see a call
+  where Linux's fast path makes none. `[vvar]` holds zeros, where Linux's
+  holds the time, which nothing here reads. `__vdso_getrandom` and
+  `__vdso_sgx_enter_enclave` (and their weak aliases) are not there: the
+  first's contract, the opaque state a C library asks it for, is not a
+  system call's, and SGX is not emulated; a C library falls back to
+  `getrandom(2)`. `smaps` counts a touched page of `[vdso]` as the process's
+  own (`Private_Clean`), where Linux's is shared by every process
+  (`Shared_Clean`, `Pss` 0).
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
@@ -331,7 +342,7 @@ verified.
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
   failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
-  written. With no vDSO, no record of one is written either. The overflows
+  written. The overflows
   of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
   each time the thread returns to its code, and its `si_addr` is 0, where
   Linux gives a fault's address. When `REFRESH`'s last overflow disables

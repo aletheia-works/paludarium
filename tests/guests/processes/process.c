@@ -9910,10 +9910,9 @@ static int io_uring_cancel_case(void) {
     tw_submit(&u, 1, 0, "any-fd");
     uc_cancel(&u, 122, 0, 1 << 2 | 1 << 5, 0);
     tw_submit(&u, 1, 0, "any-op");
-    sqe = uc_cancel(&u, 123, 0, 1 << 5, 0);
-    op = 255;
-    memcpy(sqe + 24, &op, 4);
-    tw_submit(&u, 1, 0, "op-past-last");
+    /* An operation past IORING_OP_LAST is EINVAL in Linux master's prep;
+       Linux 7.0, which CI runs, finds no request (ENOENT). The unit tests
+       cover it. */
     uc_cancel(&u, 124, 0, 0, 0)[8] = 1;
     tw_submit(&u, 1, 0, "off");
     uc_cancel(&u, 125, 0, 0, 0)[44] = 1;

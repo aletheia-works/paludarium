@@ -2806,6 +2806,16 @@ impl AddressSpaceData {
                 source.secret() || source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0
             })
     }
+    /// Whether a page of `[start, end)` is one `get_user_pages` refuses
+    /// ([`Self::gup_refused`]): the shared mappings that overlap it, as
+    /// they never overlap each other.
+    fn gup_refused_in(&self, start: u64, end: u64) -> bool {
+        self.shared
+            .range(..end)
+            .rev()
+            .take_while(|(_, shared)| shared.end > start)
+            .any(|(&from, _)| self.gup_refused(from.max(start)))
+    }
     fn shared_at(&self, page: u64) -> Option<&SharedMapping> {
         self.shared
             .range(..=page)
@@ -8618,12 +8628,12 @@ impl AddressSpace {
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
     }
-    /// Whether `get_user_pages` refuses the page at `addr`
+    /// Whether `get_user_pages` refuses a page of `[start, end)`
     /// (`check_vma_flags`): one of a mapping of no pages (`VM_IO |
     /// VM_PFNMAP`, a `perf` ring's) or of a `memfd_secret` file.
     #[must_use]
-    pub fn refuses_gup(&self, addr: GuestAddr) -> bool {
-        self.locked().gup_refused(addr.page_align_down().0)
+    pub fn refuses_gup(&self, start: u64, end: u64) -> bool {
+        self.locked().gup_refused_in(start, end)
     }
     /// The shared mappings of the space, by address.
     #[must_use]
@@ -9198,7 +9208,10 @@ mod tests {
                 .unwrap();
             // The space's own accesses reach it, as the task's do.
             assert_eq!(byte(&space, at.0 + 1), 7);
-            assert!(space.refuses_gup(GuestAddr(at.0 + PAGE_SIZE + 5)));
+            assert!(space.refuses_gup(at.0 + PAGE_SIZE, at.0 + 2 * PAGE_SIZE));
+            // A range that only ends in it is refused too.
+            assert!(space.refuses_gup(at.0 - PAGE_SIZE, at.0 + 1));
+            assert!(!space.refuses_gup(at.0 - PAGE_SIZE, at.0));
             let view = space.view();
             let mut buf = [0u8; 8];
             // `process_vm_readv` and `process_vm_writev` pin nothing of it;
@@ -9213,7 +9226,7 @@ mod tests {
         let at = space
             .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
             .unwrap();
-        assert!(!space.refuses_gup(at));
+        assert!(!space.refuses_gup(at.0, at.0 + PAGE_SIZE));
         assert_eq!(space.view().read_pages(at.0, &mut [0u8; 8]), Some(8));
     }
 

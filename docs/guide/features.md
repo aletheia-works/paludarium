@@ -4684,7 +4684,8 @@ kernel.
   `get_user_pages` refuses: `process_vm_readv` and `process_vm_writev`
   give `EFAULT` for it, `PTRACE_PEEKDATA` and `PTRACE_POKEDATA` `EIO`, and
   `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` `EINVAL`. It keeps the
-  event counting though its descriptors are closed; its last unmapping frees the buffer and its charges. It is a
+  event counting though its descriptors are closed; its last unmapping
+  frees the buffer and its charges. It is a
   mapping of the event's file, which `/proc/<pid>/maps` and the `MMAP2`
   records name `anon_inode:[perf_event]` with the device and inode its
   descriptor's `fstat` gives, the anonymous inodes' one. The user

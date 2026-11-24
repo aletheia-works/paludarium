@@ -3706,7 +3706,7 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `pagemap`, `exe`, `cwd`,
+  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `exe`, `cwd`,
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
@@ -3730,7 +3730,7 @@ kernel.
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
-  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
+  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
@@ -3743,7 +3743,9 @@ kernel.
   memory; its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
   `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
-  process with no memory before they check the reader. Its files but its
+  process with no memory before they check the reader, nor does its
+  `smaps_rollup` (`ESRCH` for any reader, `smaps_rollup_open`), as for a
+  leader that ended before its other threads. Its files but its
   directory are root's, as on the CI runners' kernel (see limitations), so
   their mode lets only root open them, and any other reader gets `EACCES`.
 

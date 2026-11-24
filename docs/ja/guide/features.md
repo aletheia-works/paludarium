@@ -3211,7 +3211,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`pagemap`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`smaps_rollup`、`pagemap`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
@@ -3231,7 +3231,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルのマウントと、そのプロセスが持つレコードロックを示します。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
-  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`pagemap`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`smaps_rollup`、`pagemap`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、Linux が動いていない
   タスクをそう見せるのと同じく、スレッドが待ちで眠っている間（パイプ、futex、タイマーなど
@@ -3243,6 +3243,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ゾンビの `maps` と `smaps` は、モードが許すどの読み手も開けます。Linux の `__mem_open` と
   `pagemap_open` は、読み手を確かめる前にメモリのないプロセスを断るので、ゾンビの
   `environ`、`auxv`、`pagemap` は、モードが許すどの読み手にも開けません（`ESRCH`）。
+  ゾンビの `smaps_rollup` も、Linux の `smaps_rollup_open` と同じく、どの読み手にも開けません
+  （`ESRCH`）。ほかのスレッドより先に終わったリーダーも同じです。
   ゾンビのディレクトリー以外のファイルは、CI ランナーのカーネルと同じく root のもの
   （制限事項を参照）なので、モードが開くのを許すのは root だけで、ほかの読み手には
   `EACCES` です。

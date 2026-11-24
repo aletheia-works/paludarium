@@ -544,6 +544,8 @@ mod linux {
             ) {
                 host.measure_cpu_time();
             }
+            // Not with_test_jit yet: under the JIT, cpu-timer's thread clock
+            // counts another thread's CPU time (thread other=1, Linux 0).
             let session = Session::new(config, host.clone()).unwrap();
             let start = Instant::now();
             let status = session.run().unwrap();

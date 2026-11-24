@@ -286,11 +286,11 @@ static void dump(int fd, unsigned short type, const char *label) {
    `by_device`, each device's in its order, the devices by index. */
 static void heard_as(int watch, const char *label, int by_device) {
     static unsigned char buf[65536];
-    static char lines[64][200];
-    int count = 0;
+    static char lines[256][200];
+    int count = 0, lost = 0;
     for (;;) {
         long n = recv(watch, buf, sizeof buf, MSG_DONTWAIT);
-        if (n <= 0) return;
+        if (n <= 0) break;
         for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
             const struct nl_header *h = (const void *)(buf + at);
             if (h->len < sizeof *h || at + h->len > n) break;
@@ -300,16 +300,19 @@ static void heard_as(int watch, const char *label, int by_device) {
             memcpy(&index, body + 4, 4);
             if (describe(h, line, sizeof line) &&
                 (h->type == RTM_NEWROUTE || h->type == RTM_DELROUTE || index >= A_INDEX)) {
-                if (by_device && count < 64)
+                if (!by_device)
+                    printf("%s: %s: %s\n", side, label, line);
+                else if (count < 256)
                     snprintf(lines[count++], sizeof lines[0], "%s", line);
                 else
-                    printf("%s: %s: %s\n", side, label, line);
+                    lost++;
             }
             at += (h->len + 3) & ~3u;
         }
     }
+    if (lost) printf("%s: %s: %d more not shown\n", side, label, lost);
     /* What a line's device is: its "dev=" number. */
-    long devices[64];
+    long devices[256];
     for (int i = 0; i < count; i++) {
         const char *dev = strstr(lines[i], "dev=");
         devices[i] = dev ? strtol(dev + 4, NULL, 10) : 0;

@@ -408,7 +408,14 @@ pub(crate) fn load(c: &mut Context<'_>, attr: &[u8], at: u64, size: u32) -> Resu
     })?;
     // bpf_prog_new_fd: read and write, close-on-exec.
     c.files
-        .install(Arc::new(ProgFile { program }), true, c.group.nofile())
+        .install(
+            Arc::new(ProgFile {
+                program,
+                status: Default::default(),
+            }),
+            true,
+            c.group.nofile(),
+        )
         .map(u64::from)
 }
 
@@ -918,6 +925,8 @@ impl Drop for Program {
 /// The open file: Linux's `bpf-prog`.
 pub(crate) struct ProgFile {
     program: Arc<Program>,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 
 fn of(file: &Arc<dyn FileHandle>) -> Option<&ProgFile> {
@@ -967,9 +976,11 @@ impl FileHandle for ProgFile {
         Err(Errno::ENOSYS)
     }
     fn flags(&self) -> u32 {
-        O_RDWR
+        self.status.of(O_RDWR)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }

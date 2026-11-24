@@ -7383,9 +7383,10 @@ fn open_path(
         const O_DIRECTORY: u32 = 0o200000;
         match entry {
             crate::devices::Entry::Pts if flags & 3 != 0 => return Err(Errno::EISDIR),
-            crate::devices::Entry::Pts => {
-                Arc::new(crate::proc::OwnDirectory::new(crate::pty::directory_stat()))
-            }
+            crate::devices::Entry::Pts => Arc::new(crate::proc::OwnDirectory::opened(
+                flags,
+                crate::pty::directory_stat(),
+            )),
             crate::devices::Entry::Slave(None) => return Err(Errno::ENOENT),
             crate::devices::Entry::Mqueue => crate::mqueue::MountedRoot::open(c, flags)?,
             crate::devices::Entry::Queue => {
@@ -7401,7 +7402,8 @@ fn open_path(
             crate::devices::Entry::Slave(Some(n)) => crate::pty::open_named(c, n, flags)?,
             // A directory opens only for reading, a device not as one.
             crate::devices::Entry::Directory if flags & 3 != 0 => return Err(Errno::EISDIR),
-            crate::devices::Entry::Directory => Arc::new(crate::proc::OwnDirectory::new(
+            crate::devices::Entry::Directory => Arc::new(crate::proc::OwnDirectory::opened(
+                flags,
                 crate::devices::directory_stat(),
             )),
             crate::devices::Entry::Device(_) if flags & O_DIRECTORY != 0 => {
@@ -7436,7 +7438,10 @@ fn open_path(
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
         }
-        Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
+        Arc::new(crate::proc::OwnDirectory::opened(
+            flags,
+            crate::proc::directory_stat(),
+        ))
     } else if let Some(path) = task_path(c, p) {
         let task = tasks::find(c, &path)?;
         let link = tasks::link(&task, path.entry).is_some();
@@ -7609,7 +7614,7 @@ fn open_path(
             if flags & 3 != 0 {
                 return Err(Errno::EISDIR);
             }
-            let directory = crate::proc::OwnDirectory::new(stat);
+            let directory = crate::proc::OwnDirectory::opened(flags, stat);
             // The process's or thread's directory and its `ns` take their
             // owner at each `fstat` (`pid_getattr`); the others their
             // inode's, as the files do.
@@ -7635,7 +7640,10 @@ fn open_path(
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
         }
-        Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
+        Arc::new(crate::proc::OwnDirectory::opened(
+            flags,
+            crate::proc::directory_stat(),
+        ))
     } else if let Some(entry) = crate::proc::system_entry(p) {
         system_file(c, entry, flags)
     } else if let Some(entry) = own_entry(c, p) {
@@ -7688,25 +7696,34 @@ fn open_path(
             }
             // Its owner at each `fstat` (`pid_getattr`).
             crate::proc::OwnEntry::Directory => Arc::new(
-                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::directory_stat()))
-                    .owned_by(tasks::own_live_owner(
-                        c.processes,
-                        c.process.pid,
-                        c.process.pid,
-                        true,
-                    )),
+                crate::proc::OwnDirectory::opened(
+                    flags,
+                    own_stat(c, crate::proc::directory_stat()),
+                )
+                .owned_by(tasks::own_live_owner(
+                    c.processes,
+                    c.process.pid,
+                    c.process.pid,
+                    true,
+                )),
             ),
             crate::proc::OwnEntry::Descriptors => Arc::new(
-                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::descriptors_stat()))
-                    .owned_by(Arc::new(move || {
-                        *owner.lock().unwrap_or_else(PoisonError::into_inner)
-                    })),
+                crate::proc::OwnDirectory::opened(
+                    flags,
+                    own_stat(c, crate::proc::descriptors_stat()),
+                )
+                .owned_by(Arc::new(move || {
+                    *owner.lock().unwrap_or_else(PoisonError::into_inner)
+                })),
             ),
             crate::proc::OwnEntry::DescriptorInfos => Arc::new(
-                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::directory_stat()))
-                    .owned_by(Arc::new(move || {
-                        *owner.lock().unwrap_or_else(PoisonError::into_inner)
-                    })),
+                crate::proc::OwnDirectory::opened(
+                    flags,
+                    own_stat(c, crate::proc::directory_stat()),
+                )
+                .owned_by(Arc::new(move || {
+                    *owner.lock().unwrap_or_else(PoisonError::into_inner)
+                })),
             ),
             // Opened above while the descriptor is open.
             crate::proc::OwnEntry::DescriptorInfo(_) => return Err(Errno::ENOENT),

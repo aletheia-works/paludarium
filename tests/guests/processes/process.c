@@ -3098,6 +3098,63 @@ static pid_t core_child(rlim_t limit, int dumpable, int thread, int signal) {
     else *(volatile int *)0 = 1;
     _exit(70);
 }
+/* The core-dump-faults case: a core's faults count to the thread that
+   dumps it. Linux's get_signal calls vfs_coredump in the thread that took
+   the signal while the others wait (coredump_wait), and get_dump_page
+   faults in each page of shared anonymous memory never touched. The
+   leader, with a thread parked beside it, maps 64 such pages, writes its
+   own minor faults so far to a pipe, and raises SIGABRT at itself; its zombie's
+   /proc/<pid>/task/<pid>/stat then shows the dump's faults. */
+static unsigned long stat_minflt(const char *path) {
+    char buf[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    long n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *end = strrchr(buf, ')');
+    unsigned long minflt = 0;
+    if (!end || sscanf(end + 2, "%*c %*d %*d %*d %*d %*d %*u %lu", &minflt) != 1) return 0;
+    return minflt;
+}
+static int core_dump_faults_case(void) {
+    char dir[] = "/tmp/core-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    int fds[2];
+    if (pipe(fds)) return 81;
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit r;
+        getrlimit(RLIMIT_CORE, &r);
+        r.rlim_cur = r.rlim_max;
+        setrlimit(RLIMIT_CORE, &r);
+        char *shared = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        pthread_t t;
+        if (shared == MAP_FAILED || pthread_create(&t, NULL, core_parked, NULL)) _exit(71);
+        struct rusage usage;
+        getrusage(RUSAGE_THREAD, &usage);
+        long before = usage.ru_minflt;
+        if (write(fds[1], &before, sizeof before) != sizeof before) _exit(72);
+        raise(SIGABRT);
+        _exit(70);
+    }
+    close(fds[1]);
+    long before = -1;
+    if (read(fds[0], &before, sizeof before) != sizeof before) before = -1;
+    siginfo_t info;
+    waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, pid);
+    unsigned long leader = stat_minflt(path);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("dumped=%d core=%d leader-faulted-64=%d\n", info.si_code == CLD_DUMPED,
+           WCOREDUMP(status) ? 1 : 0, before >= 0 && leader >= (unsigned long)before + 64);
+    unlink("core");
+    if (chdir("/") || rmdir(dir)) return 82;
+    return 0;
+}
 /* A little-endian field of the core, or 0 past its end. */
 static const unsigned char *core_bytes;
 static uint64_t core_size;
@@ -7009,6 +7066,58 @@ static int maxrss_case(const char *self) {
     _exit(0);
 }
 
+/* The context-switches case: getrusage's and wait4's ru_nvcsw count the
+   times a task gave up its CPU of its own accord (kernel/sched/core.c
+   __schedule, prev->nvcsw), as each sleep does, and a wait adds the
+   child's and its children's to RUSAGE_CHILDREN (wait_task_zombie's
+   cnvcsw). How many more times Linux switches is not fixed, and
+   ru_nivcsw depends on the host's load, so the case prints only what it
+   guarantees. It runs in a forked child, which starts from none. */
+static long nvcsw_get(int who) {
+    struct rusage usage;
+    if (getrusage(who, &usage)) return -1;
+    return usage.ru_nvcsw;
+}
+static void nvcsw_sleep(int times) {
+    for (int i = 0; i < times; i++) {
+        struct timespec t = {0, 1000000};
+        nanosleep(&t, NULL);
+    }
+}
+static int context_switches_case(void) {
+    fflush(stdout);
+    pid_t measuring = fork();
+    if (measuring != 0) {
+        int status;
+        waitpid(measuring, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+    printf("children at first: %ld\n", nvcsw_get(RUSAGE_CHILDREN));
+    long before = nvcsw_get(RUSAGE_SELF), thread_before = nvcsw_get(RUSAGE_THREAD);
+    nvcsw_sleep(3);
+    long after = nvcsw_get(RUSAGE_SELF), thread = nvcsw_get(RUSAGE_THREAD);
+    printf("slept: self-at-least-3=%d thread-at-least-3=%d thread-within=%d\n",
+           after - before >= 3, thread - thread_before >= 3, thread <= nvcsw_get(RUSAGE_SELF));
+    long children = nvcsw_get(RUSAGE_CHILDREN);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        nvcsw_sleep(5);
+        _exit(0);
+    }
+    struct rusage usage;
+    siginfo_t info;
+    memset(&usage, 0, sizeof usage);
+    syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, &usage);
+    long zombie = usage.ru_nvcsw;
+    memset(&usage, 0, sizeof usage);
+    wait4(child, NULL, 0, &usage);
+    printf("child: at-least-5=%d zombie-same=%d children-grew-by-it=%d\n",
+           usage.ru_nvcsw >= 5, zombie == usage.ru_nvcsw,
+           nvcsw_get(RUSAGE_CHILDREN) - children == usage.ru_nvcsw);
+    fflush(stdout);
+    _exit(0);
+}
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
    faults a task took (mm/memory.c mm_account_fault, current->min_flt),
    its own accesses' and those of get_user_pages for it: mlock's
@@ -9646,6 +9755,483 @@ static int io_uring_poll_case(void) {
     close(file);
     close(defer.fd);
     close(coop.fd);
+    close(u.fd);
+    return 0;
+}
+
+/* poll and epoll on a ring's descriptor (io_uring_poll): writable while the
+   submission queue has room, readable while completions wait in the queue
+   or the kernel, or a ring with IORING_SETUP_DEFER_TASKRUN has task work.
+   Only a completion wakes a poll, and only one that waits for input: an
+   edge-triggered interest in output hears of no completion. */
+static void rp_poll(struct uring *u, const char *label) {
+    struct pollfd p = {u->fd, POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM, 0};
+    int r = poll(&p, 1, 0);
+    printf("%s: poll=%d revents=%x\n", label, r, (unsigned)p.revents);
+}
+
+static void rp_epoll(int ep, const char *label) {
+    struct epoll_event e[4];
+    int r = epoll_wait(ep, e, 4, 0);
+    printf("%s: epoll=%d", label, r);
+    for (int i = 0; i < r; i++) printf(" %lu:%x", (unsigned long)e[i].data.u64, e[i].events);
+    printf("\n");
+}
+
+static int rp_add(int ep, int fd, unsigned events, unsigned long data) {
+    struct epoll_event e = {events, {.u64 = data}};
+    return epoll_ctl(ep, EPOLL_CTL_ADD, fd, &e);
+}
+
+struct rp_helper {
+    struct uring *u;
+    int fd;
+};
+
+/* Submits a NOP to the ring after 100 ms, or writes the pipe. */
+static void *rp_helper_main(void *arg) {
+    struct rp_helper *h = arg;
+    pw_sleep_ms(100);
+    if (h->u) {
+        tw_nop(h->u, 99, 0, 0, 0);
+        uring_enter(h->u->fd, 1, 0, 0, NULL, 0);
+    } else if (write(h->fd, "w", 1) != 1) {
+        return NULL;
+    }
+    return NULL;
+}
+
+static int io_uring_ring_poll_case(void) {
+    struct uring u, defer;
+    pthread_t t;
+    struct rp_helper h;
+    int a[2];
+    char buf[8];
+    if (uring_open(&u, 8) || pipe(a)) return 80;
+    rp_poll(&u, "empty");
+    tw_nop(&u, 1, 0, 0, 0);
+    uring_show("nop", uring_enter(u.fd, 1, 0, 0, NULL, 0));
+    rp_poll(&u, "completion");
+    uring_reap(&u, "reaped");
+    rp_poll(&u, "reaped");
+    /* A full submission queue takes no entry. */
+    for (int i = 0; i < 8; i++) tw_nop(&u, 10 + i, 0, 0, 0);
+    rp_poll(&u, "sq-full");
+    uring_show("submit-8", uring_enter(u.fd, 8, 0, 0, NULL, 0));
+    rp_poll(&u, "submitted");
+    /* Completions that wait in the kernel for room. */
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 8; i++) tw_nop(&u, 20 + 8 * round + i, 0, 0, 0);
+        uring_enter(u.fd, 8, 0, 0, NULL, 0);
+    }
+    printf("overflow-flag: %x\n", *u32p(u.rings, 36) & 2);
+    __atomic_store_n(u32p(u.rings, 8), *u32p(u.rings, 12), __ATOMIC_RELEASE);
+    rp_poll(&u, "overflowed");
+    uring_show("flush", uring_enter(u.fd, 0, 0, 1, NULL, 0));
+    uring_reap(&u, "flushed");
+    rp_poll(&u, "flushed");
+
+    /* epoll, level- and edge-triggered. */
+    int lt = epoll_create1(0), et = epoll_create1(0), out = epoll_create1(0);
+    if (lt < 0 || et < 0 || out < 0) return 81;
+    printf("add: %d %d %d\n", rp_add(lt, u.fd, EPOLLIN, 1), rp_add(et, u.fd, EPOLLIN | EPOLLET, 2),
+           rp_add(out, u.fd, EPOLLOUT | EPOLLET, 3));
+    rp_epoll(lt, "lt-empty");
+    rp_epoll(et, "et-empty");
+    rp_epoll(out, "out-first");
+    rp_epoll(out, "out-again");
+    tw_nop(&u, 40, 0, 0, 0);
+    uring_enter(u.fd, 1, 0, 0, NULL, 0);
+    rp_epoll(lt, "lt-completion");
+    rp_epoll(lt, "lt-again");
+    rp_epoll(et, "et-completion");
+    rp_epoll(et, "et-again");
+    rp_epoll(out, "out-completion");
+    tw_nop(&u, 41, 0, 0, 0);
+    uring_enter(u.fd, 1, 0, 0, NULL, 0);
+    rp_epoll(et, "et-second");
+    uring_reap(&u, "epoll-reaped");
+    rp_epoll(lt, "lt-reaped");
+
+    /* Another thread's submission wakes an epoll_wait and a poll. */
+    struct epoll_event e;
+    h.u = &u;
+    pthread_create(&t, NULL, rp_helper_main, &h);
+    int r = epoll_wait(lt, &e, 1, 5000);
+    printf("woken-epoll: %d %x\n", r, r == 1 ? e.events : 0);
+    pthread_join(t, NULL);
+    uring_reap(&u, "woken-epoll");
+    pthread_create(&t, NULL, rp_helper_main, &h);
+    struct pollfd p = {u.fd, POLLIN, 0};
+    r = poll(&p, 1, 5000);
+    printf("woken-poll: %d %x\n", r, (unsigned)p.revents);
+    pthread_join(t, NULL);
+    uring_reap(&u, "woken-poll");
+    /* So does a read that waited for its pipe, as its task work runs. */
+    pw_read(&u, 50, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    h.u = NULL;
+    h.fd = a[1];
+    pthread_create(&t, NULL, rp_helper_main, &h);
+    p.revents = 0;
+    r = poll(&p, 1, 5000);
+    printf("read-poll: %d %x\n", r, (unsigned)p.revents);
+    pthread_join(t, NULL);
+    uring_reap(&u, "read-poll");
+
+    /* A ring with IORING_SETUP_DEFER_TASKRUN is readable with task work. */
+    if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 82;
+    tw_nop(&defer, 60, 1 << 4, 0, 0);
+    tw_submit(&defer, 1, 0, "defer-tw");
+    rp_poll(&defer, "defer-tw");
+    uring_show("defer-wait", uring_enter(defer.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&defer, "defer-wait");
+    rp_poll(&defer, "defer-reaped");
+    close(defer.fd);
+    close(lt);
+    close(et);
+    close(out);
+    close(u.fd);
+    return 0;
+}
+
+/* IORING_OP_ASYNC_CANCEL and IORING_REGISTER_SYNC_CANCEL, of reads that wait
+   for their pipes: by user_data, every match with IORING_ASYNC_CANCEL_ALL,
+   any with _ANY, by file (_FD, registered with _FD_FIXED) or operation
+   (_OP). The cancelled read completes with ECANCELED as task work, after
+   the cancellation, and fails its link; its provided buffer is used. A
+   read whose pipe became ready, whose task work has not run (a ring with
+   IORING_SETUP_DEFER_TASKRUN before its wait), is cancelled too, and the
+   bytes stay in the pipe. */
+static unsigned char *uc_cancel(struct uring *u, unsigned long data, unsigned long target,
+                                unsigned flags, int fd) {
+    unsigned char *sqe = uring_push(u, 14, data);
+    memcpy(sqe + 16, &target, 8);
+    memcpy(sqe + 28, &flags, 4);
+    memcpy(sqe + 4, &fd, 4);
+    return sqe;
+}
+
+struct uc_sync {
+    unsigned long addr;
+    int fd;
+    unsigned flags;
+    long tv_sec, tv_nsec;
+    unsigned char opcode, pad[7];
+    unsigned long pad2[3];
+};
+
+static long uc_sync_cancel(struct uring *u, struct uc_sync *sc, unsigned nr) {
+    return syscall(427, u->fd, 24, sc, nr);
+}
+
+static int io_uring_cancel_case(void) {
+    struct uring u, defer;
+    char buf[8], more[8];
+    int a[2], b[2], c[2];
+    if (uring_open(&u, 8) || pipe(a) || pipe(b) || pipe(c)) return 80;
+
+    pw_read(&u, 1, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed");
+    uc_cancel(&u, 100, 1, 0, 0);
+    tw_submit(&u, 1, 0, "cancel");
+    uc_cancel(&u, 101, 1, 0, 0);
+    tw_submit(&u, 1, 0, "cancel-gone");
+    /* The pipe's bytes are not read. */
+    printf("write: %ld\n", (long)write(a[1], "ab", 2));
+    printf("read: %ld\n", (long)read(a[0], more, sizeof more));
+    uring_reap(&u, "nothing");
+
+    /* A link after the read fails with it; one after a cancellation that
+       found nothing fails too. */
+    unsigned char *sqe = pw_read(&u, 2, a[0], buf, sizeof buf, 0);
+    sqe[1] = 1 << 2;
+    tw_nop(&u, 3, 0, 0, 0);
+    tw_submit(&u, 2, 0, "linked");
+    sqe = uc_cancel(&u, 102, 2, 0, 0);
+    sqe[1] = 1 << 2;
+    tw_nop(&u, 103, 0, 0, 0);
+    tw_submit(&u, 2, 0, "cancel-linked");
+    sqe = uc_cancel(&u, 104, 2, 0, 0);
+    sqe[1] = 1 << 2;
+    tw_nop(&u, 105, 0, 0, 0);
+    tw_submit(&u, 2, 0, "cancel-none-linked");
+
+    /* Twice in one submission: a cancelled read stays findable until its
+       task work runs. */
+    pw_read(&u, 4, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-4");
+    uc_cancel(&u, 106, 4, 0, 0);
+    uc_cancel(&u, 107, 4, 0, 0);
+    tw_submit(&u, 2, 0, "cancel-twice");
+
+    /* IORING_ASYNC_CANCEL_ALL by user_data, then _ANY, in the order of the
+       ring's hash of user_data. */
+    pw_read(&u, 5, a[0], buf, sizeof buf, 0);
+    pw_read(&u, 5, b[0], buf, sizeof buf, 0);
+    pw_read(&u, 6, c[0], buf, sizeof buf, 0);
+    tw_submit(&u, 3, 0, "armed-all");
+    uc_cancel(&u, 108, 5, 1, 0);
+    tw_submit(&u, 1, 0, "cancel-all");
+    uc_cancel(&u, 109, 5, 1, 0);
+    tw_submit(&u, 1, 0, "cancel-all-none");
+    for (int i = 0; i < 6; i++) pw_read(&u, 7 + i, i % 2 ? b[0] : c[0], buf, sizeof buf, 0);
+    tw_submit(&u, 6, 0, "armed-any");
+    uc_cancel(&u, 110, 0, 1 << 2, 0);
+    tw_submit(&u, 1, 0, "cancel-any");
+    uc_cancel(&u, 111, 6, 0, 0);
+    tw_submit(&u, 1, 0, "cancel-any-gone");
+
+    /* By file, by operation. */
+    pw_read(&u, 20, a[0], buf, sizeof buf, 0);
+    pw_read(&u, 21, b[0], buf, sizeof buf, 0);
+    pw_read(&u, 22, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 3, 0, "armed-fd");
+    uc_cancel(&u, 112, 0, 1 << 1, b[0]);
+    tw_submit(&u, 1, 0, "cancel-fd");
+    uc_cancel(&u, 113, 0, 1 << 1 | 1, b[0]);
+    tw_submit(&u, 1, 0, "cancel-fd-all");
+    uc_cancel(&u, 114, 0, 1 << 1, 1000);
+    tw_submit(&u, 1, 0, "cancel-fd-closed");
+    uc_cancel(&u, 115, 0, 1 << 1 | 1 << 3, 0);
+    tw_submit(&u, 1, 0, "cancel-fd-fixed-none");
+    sqe = uc_cancel(&u, 116, 0, 1 << 5, 0);
+    unsigned op = 22;
+    memcpy(sqe + 24, &op, 4);
+    tw_submit(&u, 1, 0, "cancel-op");
+    /* Registered files: _FD_FIXED, or IOSQE_FIXED_FILE. */
+    int fds[2] = {a[0], b[0]};
+    uring_show("register", syscall(427, u.fd, 2, fds, 2));
+    pw_read(&u, 23, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-fixed");
+    uc_cancel(&u, 117, 0, 1 << 1 | 1 << 3, 1);
+    tw_submit(&u, 1, 0, "cancel-fd-fixed");
+    sqe = uc_cancel(&u, 118, 0, 1 << 1, 0);
+    sqe[1] = 1;
+    tw_submit(&u, 1, 0, "cancel-fixed-flag");
+    uring_show("unregister", syscall(427, u.fd, 3, NULL, 0));
+
+    /* What the preparation refuses, one at a time: each ends its
+       submission. */
+    uc_cancel(&u, 120, 0, 1 << 6, 0);
+    tw_submit(&u, 1, 0, "unknown-flag");
+    uc_cancel(&u, 121, 0, 1 << 2 | 1 << 1, 0);
+    tw_submit(&u, 1, 0, "any-fd");
+    uc_cancel(&u, 122, 0, 1 << 2 | 1 << 5, 0);
+    tw_submit(&u, 1, 0, "any-op");
+    sqe = uc_cancel(&u, 123, 0, 1 << 5, 0);
+    op = 255;
+    memcpy(sqe + 24, &op, 4);
+    tw_submit(&u, 1, 0, "op-past-last");
+    uc_cancel(&u, 124, 0, 0, 0)[8] = 1;
+    tw_submit(&u, 1, 0, "off");
+    uc_cancel(&u, 125, 0, 0, 0)[44] = 1;
+    tw_submit(&u, 1, 0, "splice-fd");
+    uc_cancel(&u, 126, 0, 0, 0)[2] = 1;
+    tw_submit(&u, 1, 0, "ioprio");
+    uc_cancel(&u, 127, 0, 0, 0)[1] = 1 << 5;
+    tw_submit(&u, 1, 0, "buffer-select");
+    /* Without _OP, the operation's field is not looked at. */
+    pw_read(&u, 24, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-24");
+    uc_cancel(&u, 128, 24, 0, 0)[24] = 1;
+    tw_submit(&u, 1, 0, "len-ignored");
+
+    /* A provided buffer the read kept is used. */
+    char *pool = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pool == MAP_FAILED) return 81;
+    sqe = uring_push(&u, 31, 130);
+    int count = 2;
+    unsigned short bgid = 3;
+    unsigned long addr = (unsigned long)pool;
+    unsigned len = 8;
+    long bid = 4;
+    memcpy(sqe + 4, &count, 4);
+    memcpy(sqe + 8, &bid, 8);
+    memcpy(sqe + 16, &addr, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 40, &bgid, 2);
+    tw_submit(&u, 1, 0, "provide");
+    sqe = pw_read(&u, 25, c[0], NULL, 8, 0);
+    sqe[1] = 1 << 5;
+    memcpy(sqe + 40, &bgid, 2);
+    tw_submit(&u, 1, 0, "armed-select");
+    uc_cancel(&u, 131, 25, 0, 0);
+    uring_show("cancel-select", uring_enter(u.fd, 1, 0, 0, NULL, 0));
+    pw_reap_flags(&u, "cancel-select");
+
+    /* IORING_REGISTER_SYNC_CANCEL. */
+    pw_read(&u, 27, a[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-sync");
+    struct uc_sync sc;
+    memset(&sc, 0, sizeof sc);
+    sc.addr = 27;
+    sc.tv_sec = sc.tv_nsec = -1;
+    uring_show("sync-nr-0", uc_sync_cancel(&u, &sc, 0));
+    uring_show("sync-null", syscall(427, u.fd, 24, NULL, 1));
+    sc.flags = 1 << 6;
+    uring_show("sync-flags", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 0;
+    sc.pad[3] = 1;
+    uring_show("sync-pad", uc_sync_cancel(&u, &sc, 1));
+    sc.pad[3] = 0;
+    sc.pad2[2] = 1;
+    uring_show("sync-pad2", uc_sync_cancel(&u, &sc, 1));
+    sc.pad2[2] = 0;
+    sc.flags = 1 << 1;
+    sc.fd = 1000;
+    uring_show("sync-fd-closed", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 1 << 1 | 1 << 3;
+    uring_show("sync-fixed-none", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 0;
+    uring_show("sync", uc_sync_cancel(&u, &sc, 1));
+    uring_reap(&u, "sync");
+    uring_show("sync-none", uc_sync_cancel(&u, &sc, 1));
+    pw_read(&u, 26, a[0], buf, sizeof buf, 0);
+    pw_read(&u, 26, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 2, 0, "armed-sync-all");
+    sc.addr = 26;
+    sc.flags = 1;
+    uring_show("sync-all", uc_sync_cancel(&u, &sc, 1));
+    uring_reap(&u, "sync-all");
+    uring_show("sync-all-none", uc_sync_cancel(&u, &sc, 1));
+    sc.flags = 1 << 2 | 1 << 1;
+    sc.fd = a[0];
+    uring_show("sync-any-fd", uc_sync_cancel(&u, &sc, 1));
+
+    /* A read whose pipe is ready waits for its ring's wait to run. */
+    if (uring_open_flags(&defer, 8, 1 << 12 | 1 << 13)) return 82;
+    pw_read(&defer, 30, a[0], buf, sizeof buf, 0);
+    tw_submit(&defer, 1, 0, "defer-armed");
+    printf("write: %ld\n", (long)write(a[1], "cd", 2));
+    uc_cancel(&defer, 140, 30, 0, 0);
+    tw_submit(&defer, 1, 0, "defer-cancel");
+    uring_show("defer-wait", uring_enter(defer.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&defer, "defer-wait");
+    printf("read: %ld\n", (long)read(a[0], more, sizeof more));
+    close(defer.fd);
+    close(u.fd);
+    return 0;
+}
+
+/* io_uring requests whose submitter goes: a read of a thread that exits
+   alone waits on, and fails with ECANCELED once its pipe is ready, the
+   bytes left in the pipe (io_fallback_tw); one of a process that exits
+   does the same by then. execve cancels the thread's reads at once
+   (io_uring_task_cancel). A ring that closes lets go of the files its
+   waiting reads hold. */
+struct ue_thread {
+    struct uring *u;
+    int fd;
+};
+
+static void *ue_thread_main(void *arg) {
+    struct ue_thread *t = arg;
+    char buf[8];
+    pw_read(t->u, 1, t->fd, buf, sizeof buf, 0);
+    uring_enter(t->u->fd, 1, 0, 0, NULL, 0);
+    return NULL;
+}
+
+/* Waits up to two seconds for a completion, then shows them. */
+static void ue_reap(struct uring *u, const char *label) {
+    struct pollfd p = {u->fd, POLLIN, 0};
+    int r = poll(&p, 1, 2000);
+    printf("%s: ready=%d\n", label, r);
+    uring_reap(u, label);
+}
+
+static int io_uring_exit_case(const char *self) {
+    struct uring u, closing;
+    char more[8];
+    int a[2], b[2], c[2], d[2];
+    if (uring_open(&u, 8) || pipe(a) || pipe(b) || pipe(c) || pipe(d)) return 80;
+
+    /* A thread that exits alone. */
+    pthread_t t;
+    struct ue_thread arg = {&u, a[0]};
+    pthread_create(&t, NULL, ue_thread_main, &arg);
+    pthread_join(t, NULL);
+    uring_reap(&u, "thread-exited");
+    printf("write: %ld\n", (long)write(a[1], "ab", 2));
+    ue_reap(&u, "thread-ready");
+    printf("read: %ld\n", (long)read(a[0], more, sizeof more));
+
+    /* A process that exits. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char buf[8];
+        pw_read(&u, 2, b[0], buf, sizeof buf, 0);
+        _exit(uring_enter(u.fd, 1, 0, 0, NULL, 0) == 1 ? 0 : 1);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    printf("write: %ld\n", (long)write(b[1], "cd", 2));
+    ue_reap(&u, "process-ready");
+    printf("read: %ld\n", (long)read(b[0], more, sizeof more));
+
+    /* execve cancels the read at once. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        char buf[8];
+        pw_read(&u, 3, c[0], buf, sizeof buf, 0);
+        if (uring_enter(u.fd, 1, 0, 0, NULL, 0) != 1) _exit(1);
+        char *args[] = {"process", "io-uring-exec-child", (char *)self, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(2);
+    }
+    ue_reap(&u, "exec");
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    printf("write: %ld\n", (long)write(c[1], "ef", 2));
+    printf("read: %ld\n", (long)read(c[0], more, sizeof more));
+
+    /* With IORING_SETUP_DEFER_TASKRUN, execve runs the ring's work first: a
+       read whose pipe became ready reads, then the one that waits is
+       cancelled. The new program reads the ring it kept. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        struct uring dr;
+        int e[2], g[2];
+        char buf[8], buf2[8];
+        if (uring_open_flags(&dr, 8, 1 << 12 | 1 << 13) || pipe(e) || pipe(g)) _exit(1);
+        pw_read(&dr, 5, e[0], buf, sizeof buf, 0);
+        pw_read(&dr, 6, g[0], buf2, sizeof buf2, 0);
+        if (uring_enter(dr.fd, 2, 0, 0, NULL, 0) != 2) _exit(1);
+        if (write(e[1], "hi", 2) != 2) _exit(1);
+        if (dup2(dr.fd, 50) != 50 || dup2(e[0], 51) != 51) _exit(1);
+        char len[16], entries[16];
+        snprintf(len, sizeof len, "%u", dr.array + 4 * dr.sq_entries);
+        snprintf(entries, sizeof entries, "%u", dr.cq_entries);
+        char *args[] = {"process", "io-uring-exec-reap", (char *)self, len, entries, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(2);
+    }
+    waitpid(child, &status, 0);
+    printf("defer-child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    /* A ring that closes lets go of the pipe its read holds. */
+    if (uring_open(&closing, 8)) return 81;
+    pw_read(&closing, 4, d[0], more, sizeof more, 0);
+    printf("armed: %ld\n", uring_enter(closing.fd, 1, 0, 0, NULL, 0));
+    close(d[0]);
+    signal(SIGPIPE, SIG_IGN);
+    munmap(closing.rings, closing.array + 4 * closing.sq_entries);
+    munmap(closing.sqes, 64 * closing.sq_entries);
+    close(closing.fd);
+    int epipe = 0;
+    for (int i = 0; i < 200 && !epipe; i++) {
+        epipe = write(d[1], "g", 1) < 0 && errno == EPIPE;
+        if (!epipe) pw_sleep_ms(10);
+    }
+    printf("closed: epipe=%d\n", epipe);
+    signal(SIGPIPE, SIG_DFL);
     close(u.fd);
     return 0;
 }
@@ -14894,6 +15480,105 @@ static int tmpfs_huge_case(void) {
     return 0;
 }
 
+/* The shmem-populate case: MAP_POPULATE (without MAP_NONBLOCK), MAP_LOCKED,
+   mlock and the growth of a locked mapping by mremap bring a shared or
+   private mapping's pages of a memfd in, as Linux's mm_populate reads them,
+   so the file counts them at once. On a full tmpfs mount, mmap's population
+   stops at the first page that does not fit and mmap still succeeds, and
+   mlock gives ENOMEM, as __mm_populate's EFAULT is for it. Mounted, as
+   shmem-fault-charge's, in a user and mount namespace of its own. */
+static char sp_base[] = "/tmp/paludarium-shmem-populate-XXXXXX";
+static long sp_map(int fd, long len, int prot, int flags) {
+    char *map = mmap(NULL, len, prot, flags, fd, 0);
+    long blocks = map == MAP_FAILED ? -errno : sf_blocks(fd);
+    if (map != MAP_FAILED) munmap(map, len);
+    return blocks;
+}
+static int sp_memfd(void) {
+    int fd = memfd_create("populate", 0);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return -1;
+    return fd;
+}
+static int sp_inner(const char *m) {
+    printf("mount=%d\n", tl_err(mount("none", m, "tmpfs", 0, "size=8k")));
+    char path[320];
+    snprintf(path, sizeof path, "%s/f", m);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return 80;
+    char *map = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+    printf("populate=%d blocks=%ld\n", map == MAP_FAILED ? -errno : 0, sf_blocks(fd));
+    if (map == MAP_FAILED) return 81;
+    touch("past", map + 2 * 4096, 0);
+    munmap(map, 4 * 4096);
+    close(fd);
+    unlink(path);
+    fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return 82;
+    map = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) return 83;
+    int locked = tl_err(mlock(map, 4 * 4096));
+    printf("mlock=%d blocks=%ld\n", locked, sf_blocks(fd));
+    munmap(map, 4 * 4096);
+    close(fd);
+    unlink(path);
+    printf("umount=%d\n", tl_err(umount(m)));
+    return 0;
+}
+static int shmem_populate_case(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = on_bus;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, NULL)) return 84;
+    int rw = PROT_READ | PROT_WRITE, fd;
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("populate=%ld\n", sp_map(fd, 4 * 4096, rw, MAP_SHARED | MAP_POPULATE));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("nonblock=%ld\n", sp_map(fd, 4 * 4096, rw, MAP_SHARED | MAP_POPULATE | MAP_NONBLOCK));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("locked=%ld\n", sp_map(fd, 4 * 4096, rw, MAP_SHARED | MAP_LOCKED));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("private=%ld\n", sp_map(fd, 4 * 4096, PROT_READ, MAP_PRIVATE | MAP_POPULATE));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    char *map = mmap(NULL, 2 * 4096, rw, MAP_SHARED | MAP_LOCKED, fd, 0);
+    if (map == MAP_FAILED) return 86;
+    long before = sf_blocks(fd);
+    char *grown = mremap(map, 2 * 4096, 4 * 4096, MREMAP_MAYMOVE);
+    printf("mremap=%d blocks=%ld %ld\n", grown == MAP_FAILED ? -errno : 0, before, sf_blocks(fd));
+    munmap(grown == MAP_FAILED ? map : grown, 4 * 4096);
+    close(fd);
+    if (!mkdtemp(sp_base)) return 87;
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", sp_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char ids[64];
+        snprintf(ids, sizeof ids, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", ids);
+        snprintf(ids, sizeof ids, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", ids));
+        _exit(sp_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(sp_base) == 0);
+    return 0;
+}
+
 /* The generated-changes case: the path calls that change or go to a file
    the kernel generates in /dev or /proc, by its own path. chdir and fchdir
    make a directory there the working directory, which relative paths and
@@ -16004,6 +16689,120 @@ static int thread_caps_status_case(void) {
     int status = 0;
     waitpid(kid, &status, 0);
     printf("wait=%#x\n", status);
+    return 0;
+}
+
+/* The userns-nondumpable-read case: as Linux's __ptrace_may_access asks
+   (task_still_dumpable), an undumpable process is readable only with
+   CAP_SYS_PTRACE in the user namespace its program runs in: where it was
+   when it ran it (alloc_bprm), or, for a file it may not read, the nearest
+   one above that maps the file's owner and group (would_dump). The child, a
+   user that is not root, unshares a user namespace that maps its user as
+   root and no group, so it and its own children have every capability
+   there. Its children may open its environ while it is dumpable, not once
+   PR_SET_DUMPABLE has cleared it, as its program still runs in the first
+   namespace. A readable copy of this program it runs then runs in the new
+   one, so they may again; an execute-only copy, which it may not read as
+   the namespace does not map the copy's group, runs undumpable in the
+   first one, so they may not. An undumpable task's files are root's of
+   that namespace (task_dump_owner), so environ (0400) is refused by its mode
+   unless that root is the reader, and maps (0444) by the ptrace check alone.
+   Each probe prints 0 or the open's negated errno. */
+static int und_open(const char *file) {
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader < 0) return -1000;
+    if (reader == 0) {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/%s", (int)getppid(), file);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) close(fd);
+        _exit(fd >= 0 ? 0 : errno & 255);
+    }
+    int status = 0;
+    waitpid(reader, &status, 0);
+    return WIFEXITED(status) ? -WEXITSTATUS(status) : -1001;
+}
+
+static void und_probe(const char *when) {
+    int environ_error = und_open("environ");
+    printf("%s environ=%d maps=%d\n", when, environ_error, und_open("maps"));
+}
+
+static int und_copy(const char *from_path, const char *to_path, mode_t mode) {
+    int from = open(from_path, O_RDONLY), to = open(to_path, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    if (from < 0 || to < 0) return -1;
+    char buffer[65536];
+    ssize_t n;
+    while ((n = read(from, buffer, sizeof buffer)) > 0)
+        if (write(to, buffer, (size_t)n) != n) return -1;
+    return n < 0 || fchmod(to, mode) || close(to) || close(from) ? -1 : 0;
+}
+
+/* The readable copy, in the new namespace: undumpable, still readable. */
+static int userns_nondumpable_stage(const char *dir) {
+    prctl(PR_SET_DUMPABLE, 0);
+    und_probe("readable exec undumpable");
+    char unreadable[64];
+    snprintf(unreadable, sizeof unreadable, "%s/unreadable", dir);
+    fflush(stdout);
+    char *arguments[] = {unreadable, "userns-nondumpable-target", unreadable, NULL};
+    execv(unreadable, arguments);
+    printf("exec errno=%d\n", errno);
+    return 0;
+}
+
+/* The execute-only copy: undumpable (as fs.suid_dumpable says, so only
+   whether it is not 1 is printed), in the first namespace. */
+static int userns_nondumpable_target(void) {
+    printf("unreadable exec undumpable=%d\n", prctl(PR_GET_DUMPABLE) != 1);
+    und_probe("unreadable exec");
+    fflush(stdout);
+    return 0;
+}
+
+static int userns_nondumpable_read_case(const char *self) {
+    char dir[] = "/tmp/userns-dump-XXXXXX";
+    if (!mkdtemp(dir) || chmod(dir, 0777)) return 1;
+    char readable[64], unreadable[64];
+    snprintf(readable, sizeof readable, "%s/readable", dir);
+    snprintf(unreadable, sizeof unreadable, "%s/unreadable", dir);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 2;
+    if (kid == 0) {
+        if (getuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(97);
+        prctl(PR_SET_DUMPABLE, 1);
+        if (und_copy(self, readable, 0755) || und_copy(self, unreadable, 0111)) _exit(96);
+        uid_t uid = getuid();
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(0);
+        }
+        char map[32];
+        int length = snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
+        int fd = open("/proc/self/uid_map", O_WRONLY);
+        if (fd < 0 || write(fd, map, (size_t)length) != length || close(fd)) {
+            printf("uid_map errno=%d\n", errno);
+            _exit(0);
+        }
+        und_probe("dumpable");
+        prctl(PR_SET_DUMPABLE, 0);
+        und_probe("undumpable");
+        fflush(stdout);
+        char *arguments[] = {readable, "userns-nondumpable-stage", dir, NULL};
+        execv(readable, arguments);
+        printf("exec errno=%d\n", errno);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("wait=%#x\n", status);
+    unlink(readable);
+    unlink(unreadable);
+    rmdir(dir);
     return 0;
 }
 
@@ -23774,6 +24573,11 @@ static int setfl_kinds_case(void) {
     opened_nonblock("clear-refs", open("/proc/self/clear_refs", O_WRONLY | O_NONBLOCK));
     opened_nonblock("sysvipc-msg", open("/proc/sysvipc/msg", O_RDONLY | O_NONBLOCK));
     opened_nonblock("sysctl", open("/proc/sys/kernel/perf_event_paranoid", O_RDONLY | O_NONBLOCK));
+    opened_nonblock("proc", open("/proc", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("proc-pid", open("/proc/self", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("proc-fd", open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("dev", open("/dev", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("dev-pts", open("/dev/pts", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
     return 0;
 }
 
@@ -34203,6 +35007,7 @@ int main(int argc, char **argv) {
         result("death-code", found[1]);
         return 0;
     }
+    if (!strcmp(mode, "core-dump-faults")) return core_dump_faults_case();
     if (!strcmp(mode, "core-dump")) {
         /* A core-dumping signal writes `core` in the working directory when
            RLIMIT_CORE allows a page and the process is dumpable; wait then
@@ -36638,6 +37443,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
+    if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
@@ -36670,6 +37476,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
+    if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);
+    if (!strcmp(mode, "userns-nondumpable-target")) return userns_nondumpable_target();
+    if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
@@ -36696,6 +37505,26 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-buffers")) return io_uring_buffers_case();
     if (!strcmp(mode, "io-uring-task-work")) return io_uring_task_work_case();
     if (!strcmp(mode, "io-uring-poll")) return io_uring_poll_case();
+    if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
+    if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
+    if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-exec-reap")) {
+        struct uring r;
+        r.fd = 50;
+        r.cq_entries = (unsigned)atoi(argv[4]);
+        r.rings = mmap(NULL, (size_t)atoi(argv[3]), PROT_READ | PROT_WRITE, MAP_SHARED, 50, 0);
+        if (r.rings == MAP_FAILED) return 3;
+        uring_reap(&r, "defer-exec");
+        char b[8];
+        fcntl(51, F_SETFL, O_NONBLOCK);
+        long n = read(51, b, sizeof b);
+        printf("defer-read: %ld errno=%d\n", n, n < 0 ? errno : 0);
+        return 0;
+    }
+    if (!strcmp(mode, "io-uring-exec-child")) {
+        pw_sleep_ms(300);
+        return 0;
+    }
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;
@@ -37118,6 +37947,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "hiwater")) return hiwater_case();
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
+    if (!strcmp(mode, "context-switches")) return context_switches_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();

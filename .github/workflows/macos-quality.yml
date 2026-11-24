@@ -1,6 +1,9 @@
 # Release evidence, dispatched by scripts/release/evidence.py (docs/release.md):
 # the macOS host compared with a fresh native Linux oracle (macos-oracle, then
-# macos-host) and the macOS fuzz targets. The checks every pull request runs
+# macos-host) and the macOS fuzz targets. quality.yml also calls it every
+# night, for the host comparison only (fuzz: false); that run is part of the
+# nightly run, so the release evidence, which reads this workflow's own
+# dispatched run, does not see it. The checks every pull request runs
 # (unit tests, lint, dependencies, differential tests, coverage, production
 # wasm) live in ci.yml and are not repeated here. Actions are pinned by commit
 # SHA and the default token is read-only.
@@ -8,14 +11,21 @@ name: macOS host and fuzz
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      fuzz:
+        description: Run the macOS fuzz targets too
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 # Dispatched once per release head; a second dispatch waits instead of
-# cancelling it.
+# cancelling it. The group names the calling workflow, as quality.yml's does,
+# so the nightly's call never makes a release's dispatch wait.
 concurrency:
-  group: macos-quality-${{ github.ref }}
+  group: macos-quality-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -102,4 +112,9 @@ jobs:
           path: target/macos/macos
           retention-days: 14
   fuzz:
+    # A dispatch has no inputs, so `inputs.fuzz` is null there, and only a
+    # caller's `fuzz: false` leaves the fuzz targets out. As text: Actions
+    # compares null and false as numbers, both 0, so `inputs.fuzz != false`
+    # would skip them on a dispatch too.
+    if: ${{ toJSON(inputs.fuzz) != 'false' }}
     uses: ./.github/workflows/fuzz-sanitizers.yml

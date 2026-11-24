@@ -1059,9 +1059,11 @@ fn task(c: &Context<'_>, pid: i32) -> Result<(Arc<ThreadGroup>, u32, bool), Errn
     }
     let public = view.group.public(tid).ok_or(ESRCH)?;
     let readable = perfmon_capable(c)
-        || c.process
-            .credentials
-            .may_read_task(&public.credentials, view.dumpable, true);
+        || c.process.credentials.may_read_task(
+            &public.credentials,
+            (view.dumpable, &view.exec_user),
+            true,
+        );
     Ok((view.group, tid, readable))
 }
 

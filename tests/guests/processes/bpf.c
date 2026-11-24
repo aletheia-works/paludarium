@@ -316,6 +316,16 @@ static int case_calls(void) {
     /* The descriptor. */
     int map = make(TYPE_ARRAY, 4, 8, 4, 0);
     say("cloexec %d access %d", (fcntl(map, F_GETFD) & FD_CLOEXEC) != 0, fcntl(map, F_GETFL) & O_ACCMODE);
+    /* F_SETFL keeps O_NONBLOCK in a map's f_flags, as for any file, and
+       the access mode stays. */
+    {
+        int before = fcntl(map, F_GETFL);
+        int set = fcntl(map, F_SETFL, before | O_NONBLOCK);
+        int on = fcntl(map, F_GETFL);
+        fcntl(map, F_SETFL, before);
+        say("setfl %d nonblock %d access %d cleared %d", set, (on & O_NONBLOCK) != 0, on & O_ACCMODE,
+            (fcntl(map, F_GETFL) & O_NONBLOCK) != 0);
+    }
     char path[64], link[64];
     snprintf(path, sizeof path, "/proc/self/fd/%d", map);
     ssize_t length = readlink(path, link, sizeof link - 1);

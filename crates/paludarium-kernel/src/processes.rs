@@ -67,6 +67,10 @@ struct Entry {
     /// PR_SET_DUMPABLE and PR_SET_NO_NEW_PRIVS, recorded for PR_GET_*.
     dumpable: bool,
     no_new_privs: bool,
+    /// The user namespace its program runs in, where a reader of an
+    /// undumpable process needs `CAP_SYS_PTRACE` (Linux's
+    /// `exec_state->user_ns`): set at exec, kept across fork.
+    exec_user: crate::users::UserNs,
     /// A stop by this signal, and a continue, not yet reported to a wait.
     stop_report: Option<i32>,
     continue_report: bool,
@@ -182,6 +186,8 @@ pub(crate) struct ProcessView {
     pub limits: [(u64, u64); RLIMITS],
     pub no_new_privs: bool,
     pub dumpable: bool,
+    /// The user namespace its program runs in ([`Entry::exec_user`]).
+    pub exec_user: crate::users::UserNs,
     /// It has ended and waits to be reaped.
     pub zombie: bool,
     /// The wait status of a process that has ended (`exit_code` in Linux's
@@ -302,6 +308,7 @@ impl Processes {
                     death_signal: 0,
                     dumpable: true,
                     no_new_privs: false,
+                    exec_user: crate::users::UserNs::default(),
                     stop_report: None,
                     continue_report: false,
                     children_cpu: 0,
@@ -475,19 +482,27 @@ impl Processes {
         space: Arc<Namespace>,
     ) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let (pgid, sid, limits, dumpable, no_new_privs, terminal) =
-            entries
-                .get(&parent)
-                .map_or((pid, 0, DEFAULT_LIMITS, true, false, None), |p| {
+        let (pgid, sid, limits, (dumpable, exec_user), no_new_privs, terminal) =
+            entries.get(&parent).map_or(
+                (
+                    pid,
+                    0,
+                    DEFAULT_LIMITS,
+                    (true, Default::default()),
+                    false,
+                    None,
+                ),
+                |p| {
                     (
                         p.pgid,
                         p.sid,
                         p.limits(),
-                        p.dumpable,
+                        (p.dumpable, p.exec_user.clone()),
                         p.no_new_privs,
                         p.terminal.clone(),
                     )
-                });
+                },
+            );
         entries.insert(
             pid,
             Entry {
@@ -502,6 +517,7 @@ impl Processes {
                 death_signal: 0,
                 dumpable,
                 no_new_privs,
+                exec_user,
                 stop_report: None,
                 continue_report: false,
                 children_cpu: 0,
@@ -866,19 +882,21 @@ impl Processes {
             entry.death_signal = 0;
         }
     }
-    /// After exec, the process is dumpable or not, may forget its
-    /// parent-death signal, and a secure exec lowers its RLIMIT_STACK soft
-    /// limit to 8 MiB (`_STK_LIM`), as Linux's `begin_new_exec` does.
+    /// After exec, the process is dumpable or not, its program runs in user
+    /// namespace `exec_user`, it may forget its parent-death signal, and a
+    /// secure exec lowers its RLIMIT_STACK soft limit to 8 MiB (`_STK_LIM`),
+    /// as Linux's `begin_new_exec` does.
     pub(crate) fn executed_as(
         &self,
         pid: u32,
-        dumpable: bool,
+        (dumpable, exec_user): (bool, crate::users::UserNs),
         forget_death_signal: bool,
         secure: bool,
     ) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
             entry.dumpable = dumpable;
+            entry.exec_user = exec_user;
             if forget_death_signal {
                 entry.death_signal = 0;
             }
@@ -1077,6 +1095,7 @@ impl Processes {
             limits: entry.limits(),
             no_new_privs: entry.no_new_privs,
             dumpable: entry.dumpable,
+            exec_user: entry.exec_user.clone(),
             zombie: entry.status.is_some(),
             exit_code: match entry.status {
                 Some(ExitStatus::Exited(code)) => (code & 255) << 8,
@@ -1567,11 +1586,12 @@ impl Processes {
             }?;
             // What `getrusage(RUSAGE_BOTH)` gives of the child: its CPU time
             // and its children's, the largest peak among them, and their
-            // minor faults.
+            // minor faults and voluntary context switches.
             let usage = crate::syscalls::ResourceUsage {
                 cpu: entry.group.process_cpu().saturating_add(entry.children_cpu),
                 peak: entry.group.waited_peak(),
                 minor_faults: entry.group.waited_faults(),
+                switches: entry.group.waited_switches(),
             };
             Some((pid, event, usage, entry.group.task_ids(pid, pid).uid))
         });
@@ -1580,7 +1600,7 @@ impl Processes {
             && !wait.keep
         {
             match event {
-                // A reaped child's CPU time and minor faults join its
+                // A reaped child's CPU time, minor faults and switches join its
                 // parent's children's, and its peak (its own or its
                 // children's) is kept as theirs if it is the largest. So do
                 // its read and write counts join its parent's process's.
@@ -1591,6 +1611,7 @@ impl Processes {
                         parent.children_cpu = parent.children_cpu.saturating_add(usage.cpu);
                         parent.group.reaped_peak(usage.peak);
                         parent.group.reaped_faults(usage.minor_faults);
+                        parent.group.reaped_switches(usage.switches);
                         if let Some(io) = io {
                             parent.group.reaped_io(io);
                         }
@@ -3172,10 +3193,11 @@ impl Kernel {
                 // ptrace_may_access with the real IDs.
                 let target = view.group.task_ids(pidfd.pid, pidfd.pid);
                 if pidfd.pid != self.process.pid
-                    && !thread
-                        .state
-                        .credentials
-                        .may_read_ids(&target, view.dumpable, true)
+                    && !thread.state.credentials.may_read_ids(
+                        &target,
+                        (view.dumpable, &view.exec_user),
+                        true,
+                    )
                 {
                     return Err(Errno::EPERM);
                 }
@@ -3805,12 +3827,12 @@ impl Kernel {
                     files: self.files.view(),
                     ..Default::default()
                 };
-                let dumpable = self.processes.view(self.process.pid)?.dumpable;
+                let own = self.processes.view(self.process.pid)?;
                 return Some(crate::kcmp::Task::new(
                     tid,
                     Arc::clone(&self.group),
                     false,
-                    dumpable,
+                    (own.dumpable, own.exec_user),
                     public,
                 ));
             }
@@ -3824,7 +3846,7 @@ impl Kernel {
                 tid,
                 Arc::clone(&view.group),
                 view.zombie,
-                view.dumpable,
+                (view.dumpable, view.exec_user.clone()),
                 public,
             ))
         };
@@ -3960,10 +3982,11 @@ impl Kernel {
         view: &ProcessView,
         public: &crate::threads::PublicThread,
     ) -> bool {
-        thread
-            .state
-            .credentials
-            .may_read_task(&public.credentials, view.dumpable, true)
+        thread.state.credentials.may_read_task(
+            &public.credentials,
+            (view.dumpable, &view.exec_user),
+            true,
+        )
     }
     /// Whether the caller may attach to a thread of process `pid`, another
     /// process, as Linux's `__ptrace_may_access` with
@@ -4079,7 +4102,7 @@ impl Kernel {
                 } else {
                     let readable = thread.state.credentials.may_read_task(
                         &public.credentials,
-                        view.dumpable,
+                        (view.dumpable, &view.exec_user),
                         false,
                     );
                     if !readable {
@@ -4583,7 +4606,7 @@ impl Kernel {
         // open on, as `do_open_execat` takes it, until exec ends; the program
         // it loads takes its own.
         let mut opened = None;
-        let (start, program, mut readable, image) = match program {
+        let (start, program, mut unread, image) = match program {
             crate::files::Program::Path(path) => {
                 let (program, readable) =
                     crate::permissions::exec(&self.files, creds, dir, &raw, &path)?;
@@ -4591,7 +4614,8 @@ impl Kernel {
                     .0
                     .push(exec_opened(&self.files, &path, reported_open()));
                 opened = deny_writes(&self.files, &path)?;
-                ((named.clone(), path.clone(), path), program, readable, None)
+                let unread = unread_by(program.as_ref(), readable);
+                ((named.clone(), path.clone(), path), program, unread, None)
             }
             crate::files::Program::File {
                 file,
@@ -4647,10 +4671,11 @@ impl Kernel {
                     &stat,
                 ));
                 let denied = self.files.caches.deny_write_access((device, stat.inode))?;
+                let unread = unread_by(Some(&stat), readable);
                 (
                     (Vec::new(), Vec::new(), entry),
                     Some(stat),
-                    readable,
+                    unread,
                     Some((file, name, denied)),
                 )
             }
@@ -4710,7 +4735,7 @@ impl Kernel {
                             &interpreter,
                             &loaded,
                         )?;
-                        readable = may_read;
+                        unread = unread_by(program.as_ref(), may_read);
                         opens
                             .0
                             .push(exec_opened(&self.files, &loaded, reported_open()));
@@ -4719,7 +4744,7 @@ impl Kernel {
                             creds,
                             (interpreter, loaded),
                             program,
-                            &mut readable,
+                            &mut unread,
                             (&mut argv, &mut budget),
                             opens,
                         )?;
@@ -4734,7 +4759,7 @@ impl Kernel {
                             mem,
                             (named, path, loaded),
                             program,
-                            readable,
+                            unread,
                             (argv, envp),
                             None,
                             exe,
@@ -4762,7 +4787,7 @@ impl Kernel {
                     creds,
                     (named_first, first),
                     program,
-                    &mut readable,
+                    &mut unread,
                     (&mut argv, &mut budget),
                     opens,
                 )?;
@@ -4778,7 +4803,7 @@ impl Kernel {
             mem,
             (named, path, loaded),
             program,
-            readable,
+            unread,
             (argv, envp),
             image,
             exe,
@@ -4804,7 +4829,7 @@ impl Kernel {
         mem: &AddressSpace,
         (raw, path, loaded): (Vec<u8>, Vec<u8>, Vec<u8>),
         program: Option<paludarium_host::FileStat>,
-        mut readable: bool,
+        mut unread: Vec<(u32, u32)>,
         (argv, envp): (Vec<Vec<u8>>, Vec<Vec<u8>>),
         held: Option<HeldProgram>,
         program_file: Option<crate::page_cache::WriteAccess>,
@@ -4904,7 +4929,7 @@ impl Kernel {
                 return Err(Errno::EACCES);
             }
             let path = self.files.exec_path(name.to_vec())?;
-            let (_, may_read) = crate::permissions::exec(
+            let (stat, may_read) = crate::permissions::exec(
                 &self.files,
                 &thread.state.credentials,
                 -100i64 as u64,
@@ -4929,7 +4954,7 @@ impl Kernel {
                     }
                 }
             }
-            readable &= may_read;
+            unread.extend(unread_by(stat.as_ref(), may_read));
             let keep: paludarium_loader::Keep =
                 Arc::new((closing, self.files.interpreter_keep(&path)));
             Ok((path, Some(keep)))
@@ -5055,9 +5080,22 @@ impl Kernel {
             .filter(|(_, action)| action.handler == 1)
             .map(|(&number, &action)| (number, action))
             .collect();
-        // Its io_uring task work, and the requests it submitted that wait
-        // for their files, go (`io_uring_task_cancel`).
-        crate::io_uring::drop_task(&self.processes.io_uring, &self.inbox);
+        // Its io_uring requests are cancelled and its task work runs, on the
+        // old image's memory (`io_uring_task_cancel`).
+        crate::io_uring::exec_task(&mut crate::syscalls::Context {
+            number: u64::MAX,
+            tid: thread.tid,
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut thread.state,
+            cpu: &mut thread.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        });
         // exec keeps the thread's CPU time, as it keeps the process.
         let cpu = std::mem::take(&mut thread.state.cpu);
         let old = std::mem::take(&mut thread.state.credentials);
@@ -5086,9 +5124,13 @@ impl Kernel {
         // as a change of credentials (`commit_creds`). A program the thread
         // may not read runs undumpable (`would_dump`).
         let changed = old.resets_dumpable(&credentials);
-        let dumpable = old.euid == old.uid && old.egid == old.gid && readable && !changed;
-        self.processes
-            .executed_as(self.process.pid, dumpable, secure || changed, secure);
+        let dumpable = old.euid == old.uid && old.egid == old.gid && unread.is_empty() && !changed;
+        self.processes.executed_as(
+            self.process.pid,
+            (dumpable, old.exec_user(&unread)),
+            secure || changed,
+            secure,
+        );
         self.group
             .reset_task_ids(self.process.pid, credentials.task_ids());
         self.group.reset_keyrings(self.process.pid, keyrings);
@@ -5234,18 +5276,28 @@ fn read_string(
     }
     Err(long)
 }
+/// The owner and group of a file exec runs, when its thread may not read it
+/// (`would_dump`): such a program runs undumpable, in the nearest user
+/// namespace that maps them
+/// ([`crate::credentials::Credentials::exec_user`]).
+fn unread_by(file: Option<&paludarium_host::FileStat>, may_read: bool) -> Vec<(u32, u32)> {
+    file.filter(|_| !may_read)
+        .map(|file| (file.uid, file.gid))
+        .into_iter()
+        .collect()
+}
 /// Follows the `#!` lines from `named`, the program as exec was given it, at
 /// `loaded`, to the program that runs, as Linux's `load_script` does: each
 /// script runs its interpreter, which may be a script too, with the arguments
 /// [`splice_script`] gives it. Returns the path loaded and its status, whose
-/// set-ID bits are the ones exec takes; `readable` drops when one of them may
-/// not be read.
+/// set-ID bits are the ones exec takes; `unread` holds the owner and group of
+/// the one loaded when it may not be read ([`unread_by`]).
 pub(crate) fn follow_scripts(
     files: &crate::files::Files,
     credentials: &crate::credentials::Credentials,
     (mut named, mut loaded): (Vec<u8>, Vec<u8>),
     mut program: Option<paludarium_host::FileStat>,
-    readable: &mut bool,
+    unread: &mut Vec<(u32, u32)>,
     (argv, budget): (&mut Vec<Vec<u8>>, &mut usize),
     opens: &mut ExecOpens,
 ) -> Result<(Vec<u8>, Option<paludarium_host::FileStat>), Errno> {
@@ -5278,7 +5330,7 @@ pub(crate) fn follow_scripts(
             crate::permissions::exec(files, credentials, -100i64 as u64, &interpreter, &loaded)?;
         opens.0.push(exec_opened(files, &loaded, reported_open()));
         drop(deny_writes(files, &loaded)?);
-        *readable = may_read;
+        *unread = unread_by(program.as_ref(), may_read);
         named = interpreter;
         // `exec_binprm` takes six handlers at most.
         if depth == MAX_SCRIPT_DEPTH && program.is_some() {
@@ -5702,7 +5754,7 @@ pub(crate) fn may_attach_task(
     (pid, view, public): (u32, &ProcessView, &crate::threads::PublicThread),
     real: bool,
 ) -> bool {
-    reader.may_read_task(&public.credentials, view.dumpable, real)
+    reader.may_read_task(&public.credentials, (view.dumpable, &view.exec_user), real)
         && (processes.yama_allows(reader_pid, pid)
             || reader.capable_in(crate::credentials::CAP_SYS_PTRACE, &public.credentials.user))
 }

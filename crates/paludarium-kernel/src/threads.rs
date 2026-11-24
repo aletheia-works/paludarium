@@ -161,6 +161,9 @@ pub struct ThreadGroup {
     /// The minor faults of its reaped children and theirs (Linux's
     /// `signal->cmin_flt`).
     children_faults: AtomicU64,
+    /// The voluntary context switches of its reaped children and theirs
+    /// (Linux's `signal->cnvcsw`).
+    children_switches: AtomicU64,
     /// The process is the init of a nested PID namespace, which takes only
     /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
     /// SIGNAL_UNKILLABLE), until a fault ends it.
@@ -289,6 +292,7 @@ impl Default for ThreadGroup {
             peak: AtomicU64::new(0),
             children_peak: AtomicU64::new(0),
             children_faults: AtomicU64::new(0),
+            children_switches: AtomicU64::new(0),
             unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
@@ -1672,6 +1676,17 @@ impl ThreadGroup {
             .find(|(owner, _)| *owner == tid)
             .map_or(0, |(_, used)| used.minor_faults())
     }
+    /// The account of thread `tid`, its latest, live or not: where its
+    /// faults count.
+    pub(crate) fn usage_of(&self, tid: u32) -> Option<Arc<crate::Usage>> {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|(owner, _)| *owner == tid)
+            .map(|(_, used)| Arc::clone(used))
+    }
     /// The minor faults of its reaped children and theirs
     /// (`RUSAGE_CHILDREN`).
     pub(crate) fn children_faults(&self) -> u64 {
@@ -1686,6 +1701,34 @@ impl ThreadGroup {
     /// (`wait_task_zombie`'s `cmin_flt`).
     pub(crate) fn reaped_faults(&self, faults: u64) {
         self.children_faults.fetch_add(faults, Ordering::Relaxed);
+    }
+    /// The process's voluntary context switches (`RUSAGE_SELF`): the sum of
+    /// its threads' latest accounts, live or not, as Linux adds the live
+    /// threads' `nvcsw` to `signal->nvcsw`.
+    pub(crate) fn process_switches(&self) -> u64 {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, used)| used.switches.load(Ordering::SeqCst))
+            .fold(0u64, u64::saturating_add)
+    }
+    /// The voluntary context switches of its reaped children and theirs
+    /// (`RUSAGE_CHILDREN`).
+    pub(crate) fn children_switches(&self) -> u64 {
+        self.children_switches.load(Ordering::Relaxed)
+    }
+    /// What a wait reports of its voluntary context switches
+    /// (`RUSAGE_BOTH`): its own and its reaped children's.
+    pub(crate) fn waited_switches(&self) -> u64 {
+        self.process_switches()
+            .saturating_add(self.children_switches())
+    }
+    /// Takes a reaped child's voluntary context switches, its own and its
+    /// children's (`wait_task_zombie`'s `cnvcsw`).
+    pub(crate) fn reaped_switches(&self, switches: u64) {
+        self.children_switches
+            .fetch_add(switches, Ordering::Relaxed);
     }
     /// Takes a reaped child's peak, its own or its children's
     /// (`wait_task_zombie`'s `cmaxrss`).
@@ -2150,16 +2193,22 @@ impl Kernel {
             .or(thread.state.exit_status)
             .unwrap_or(ExitStatus::Exited(0));
         self.ptrace_exit(thread, status);
-        // Its io_uring task work, and the requests it submitted that wait
-        // for their files, go (`io_uring_files_cancel`).
-        crate::io_uring::drop_task(&self.processes.io_uring, &self.inbox);
+        // Its io_uring task work runs as an exiting task's, and its
+        // process's whole exit cancels the requests it submitted that wait
+        // for their files (`io_uring_files_cancel`).
+        crate::io_uring::exit_task(
+            &self.processes.io_uring,
+            &self.inbox,
+            self.group.status().is_some(),
+        );
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).
         let (table, closed) = self.files.release_descriptors();
         if let Some(table) = table {
             self.processes.locks().release_table(table);
-            self.files.caches.notify.dn.release_table(table);
+            let notify = &self.files.caches.notify;
+            notify.dn.release_table(table, &closed, &notify.fan);
         }
         crate::mqueue::exited(&closed, self.process.pid);
         drop(closed);
@@ -2278,6 +2327,10 @@ impl Kernel {
     /// Writes the core of `dump` to `core` in the working directory. Once the
     /// file is made the process counts as dumped, even if the core is cut at
     /// the limit, as Linux's binfmt_elf sets `has_dumped` before it writes.
+    /// Its reads of the memory fault as the dumping thread's: Linux's
+    /// `vfs_coredump` runs in the thread that took the signal, while the
+    /// others wait (`coredump_wait`), so `get_dump_page`'s faults count to
+    /// its `min_flt`, whichever thread here is the last to exit.
     fn write_core(&self, dump: &crate::coredump::Dump, mem: &AddressSpace) {
         let pid = self.process.pid;
         let Some(identity) = self.processes.core_identity(
@@ -2293,16 +2346,22 @@ impl Kernel {
             return;
         };
         self.processes.set_dumped(pid);
-        crate::coredump::write(dump, &identity, mem, &mut |piece| {
-            let mut at = 0;
-            while at < piece.len() {
-                match file.write(&piece[at..]) {
-                    Ok(0) | Err(_) => return false,
-                    Ok(n) => at += n,
+        let write = || {
+            crate::coredump::write(dump, &identity, mem, &mut |piece| {
+                let mut at = 0;
+                while at < piece.len() {
+                    match file.write(&piece[at..]) {
+                        Ok(0) | Err(_) => return false,
+                        Ok(n) => at += n,
+                    }
                 }
-            }
-            true
-        });
+                true
+            });
+        };
+        match self.group.usage_of(dump.dumper) {
+            Some(dumper) => paludarium_mmu::faults::counted_to(dumper, write),
+            None => write(),
+        }
     }
     pub(crate) fn sync_actions(&mut self, thread: &mut Thread) {
         let actions = self.group.shared_actions();
@@ -3129,6 +3188,22 @@ mod fault_count_tests {
     }
 
     #[test]
+    fn a_process_counts_its_threads_switches_and_its_reaped_childrens() {
+        let group = ThreadGroup::default();
+        let first = Arc::new(crate::Usage::default());
+        first.switches.store(3, SeqCst);
+        let second = Arc::new(crate::Usage::default());
+        second.switches.store(4, SeqCst);
+        group.register_cpu(1, first);
+        group.register_cpu(2, second);
+        assert_eq!(group.process_switches(), 7);
+        assert_eq!(group.children_switches(), 0);
+        group.reaped_switches(5);
+        assert_eq!(group.children_switches(), 5);
+        assert_eq!(group.waited_switches(), 12);
+    }
+
+    #[test]
     fn a_thread_counts_its_own_faults_and_keeps_when_it_was_made() {
         let group = ThreadGroup::default();
         let first = Arc::new(crate::Usage::default());
@@ -3159,8 +3234,12 @@ mod fault_count_tests {
             cpu: 0,
             peak: 0,
             minor_faults: 41,
+            switches: 9,
         });
         assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 41);
         assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 0);
+        // `ru_nvcsw`, and no involuntary switch (`ru_nivcsw`).
+        assert_eq!(u64::from_le_bytes(bytes[128..136].try_into().unwrap()), 9);
+        assert_eq!(u64::from_le_bytes(bytes[136..144].try_into().unwrap()), 0);
     }
 }

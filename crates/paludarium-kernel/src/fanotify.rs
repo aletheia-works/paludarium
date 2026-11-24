@@ -351,6 +351,16 @@ pub(crate) struct Registry {
     /// tables: the first namespace's table is replaced when the machine's
     /// file system is, the old one going after the new one is set.
     mount_namespaces: Mutex<std::collections::BTreeMap<u64, usize>>,
+    /// The inode connectors of every file system (`inode_conn_list`): a
+    /// file gets one with its first mark of any group (inotify's,
+    /// dnotify's or fanotify's), and loses it with its last, each with
+    /// when it was made and how many marks it holds. When a superblock
+    /// goes, Linux's `fsnotify_unmount_inodes` takes its files by these,
+    /// the newest first, as `fsnotify_alloc_inode_connector` adds each at
+    /// the list's head.
+    connectors: Mutex<HashMap<Key, (u64, usize)>>,
+    /// The connectors made so far.
+    connectors_made: AtomicU64,
 }
 
 /// The machine's limits of `/proc/sys/fs/fanotify`.
@@ -989,6 +999,31 @@ pub(crate) fn fatal(c: &Context<'_>) -> bool {
 }
 
 impl Registry {
+    /// A mark on `key` is added: the file's first makes its connector.
+    pub(crate) fn connector_added(&self, key: Key) {
+        let mut list = lock(&self.connectors);
+        let made = self.connectors_made.fetch_add(1, Ordering::SeqCst) + 1;
+        list.entry(key).or_insert((made, 0)).1 += 1;
+    }
+    /// A mark on `key` goes; with its last, its connector does.
+    pub(crate) fn connector_removed(&self, key: Key) {
+        let mut list = lock(&self.connectors);
+        if let Some(connector) = list.get_mut(&key) {
+            connector.1 -= 1;
+            if connector.1 == 0 {
+                list.remove(&key);
+            }
+        }
+    }
+    /// When the connector of `key` was made: 0 for none.
+    pub(crate) fn connector_made(&self, key: Key) -> u64 {
+        lock(&self.connectors).get(&key).map_or(0, |c| c.0)
+    }
+    /// The superblock of `device` goes, and its files' marks with it
+    /// (`fsnotify_sb_delete`).
+    pub(crate) fn connectors_gone(&self, device: u64) {
+        lock(&self.connectors).retain(|key, _| key.0 != device);
+    }
     /// How many marks there are.
     #[cfg(test)]
     pub(crate) fn marks_count(&self) -> usize {
@@ -1101,6 +1136,9 @@ impl Registry {
                 queue.marks.retain(|m| m.target != Target::Inode(key));
                 (before - queue.marks.len()) as u64
             };
+            for _ in 0..removed {
+                self.connector_removed(key);
+            }
             if removed > 0 {
                 self.release(
                     group.owner,
@@ -1185,9 +1223,13 @@ impl Registry {
             let removed = {
                 let mut queue = group.queue();
                 let before = queue.marks.len();
-                queue.marks.retain(
-                    |m| !matches!(m.target, Target::Inode(key) if candidates.contains(&key)),
-                );
+                queue.marks.retain(|m| match m.target {
+                    Target::Inode(key) if candidates.contains(&key) => {
+                        self.connector_removed(key);
+                        false
+                    }
+                    _ => true,
+                });
                 (before - queue.marks.len()) as u64
             };
             if removed > 0 {
@@ -1942,7 +1984,15 @@ impl Drop for Group {
     /// `fanotify_release`: what waits for its answers is let through.
     fn drop(&mut self) {
         self.hub.changed();
-        let marks = self.queue().marks.len() as u64;
+        let marks = {
+            let queue = self.queue();
+            for m in &queue.marks {
+                if let Target::Inode(key) = m.target {
+                    self.fan().connector_removed(key);
+                }
+            }
+            queue.marks.len() as u64
+        };
         self.fan()
             .release(self.owner, marks, self.flags & UNLIMITED_MARKS == 0, true);
     }
@@ -2121,14 +2171,15 @@ fn mark(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         let removed = {
             let mut queue = group.queue();
             let before = queue.marks.len();
-            queue.marks.retain(|m| {
-                !matches!(
-                    (m.target, mark_type),
-                    (Target::Inode(_), 0)
-                        | (Target::Mount(..), MARK_MOUNT)
-                        | (Target::FileSystem(_), MARK_FILESYSTEM)
-                        | (Target::Namespace(_), MARK_MNTNS)
-                )
+            queue.marks.retain(|m| match (m.target, mark_type) {
+                (Target::Inode(key), 0) => {
+                    group.fan().connector_removed(key);
+                    false
+                }
+                (Target::Mount(..), MARK_MOUNT)
+                | (Target::FileSystem(_), MARK_FILESYSTEM)
+                | (Target::Namespace(_), MARK_MNTNS) => false,
+                _ => true,
             });
             (before - queue.marks.len()) as u64
         };
@@ -2278,6 +2329,9 @@ fn add_mark(
                     }
                 }
             }
+            if let Target::Inode(key) = target {
+                group.fan().connector_added(key);
+            }
             queue.marks.push(new);
             queue.marks.len() - 1
         }
@@ -2335,7 +2389,9 @@ fn remove_mark(
         m.ignore &= !mask;
     }
     if (m.mask | m.ignore) & !umask == 0 {
-        queue.marks.remove(at);
+        if let Target::Inode(key) = queue.marks.remove(at).target {
+            group.fan().connector_removed(key);
+        }
         drop(queue);
         group
             .fan()

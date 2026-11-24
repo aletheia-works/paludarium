@@ -46,8 +46,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **`/proc/self/smaps` の一部**：数える値は、エミュレーターのページのエントリーから
   出します。`Referenced` は数えたページすべてです。読み込んだプログラムの
   セグメントのページは、ページではなくセグメントに書き込んだ時点で匿名として数えます。
-  `MAP_POPULATE`、`MAP_LOCKED`、ロックが読み込むはずのファイルのページ（書き込める
-  プライベートなマッピング以外）は、触れたときに数えます。ファイルのマッピングで読み込みのフォールトが起きても、マップするのは
+  ファイルのマッピングで読み込みのフォールトが起きても、マップするのは
   周りの 16 ページまでです（[機能](./features#system-calls)）。Linux は、ページ
   キャッシュの大きなフォリオがファイル、VMA、ページテーブルの中に収まるならフォリオ全体を
   マップします（`filemap_map_folio_range`）。エミュレーターのページキャッシュには、
@@ -111,7 +110,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   アイドルの時間は数えません。割り込みと softirq は数えず、コンテキストスイッチとして数えるのは
   スレッドが眠った回数だけです。ゲストのスレッドを横取りするものがないためです。そのため
   `status` は、それを `voluntary_ctxt_switches` として示し、`nonvoluntary_ctxt_switches` は
-  0 です。ほかのプロセスのスレッドは、どの待ちでも
+  0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。ほかのプロセスのスレッドは、どの待ちでも
   `S (sleeping)` です。Linux は割り込めない待ちの一部を `D (disk sleep)` と見せます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は、スレッドがその中で停止している
@@ -254,8 +253,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   いくつものページを一度に読み込みます（`fault_around_bytes`）。これらのフォールトは
   `perf` のイベントにしません。ファイルのページはすべて
   ページキャッシュにあるとみなすので、メジャーフォールトはありません（`ru_majflt` は 0）。
-  コアダンプのフォールトは最後に終了するスレッドに数えます。Linux はダンプするスレッドに
-  数えます。`/proc/<pid>/stat` の `minflt` と
+  `/proc/<pid>/stat` の `minflt` と
   `cminflt` も同じ数を読むので、同じ制限があります。
 - **perf のイベントの一部**：数えるのはソフトウェアのイベントだけです。cgroup の切り替え、
   トレースポイント、ブレークポイント、kprobe、uprobe は `ENOENT` で、ハードウェアの
@@ -301,13 +299,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   時間は、`mmap`、イベントの有効化、リセットのときのもので、Linux はイベントが
   スケジュールされるたびに更新します。`cap_user_time` は設定しません。マッピングの
   確認と置き場所の確認の両方が失敗するときは、ここではマッピングの確認のエラーに
-  なります。メモリ管理がこのマッピング（`VM_PFNMAP`）の Linux の規則を持つまでは、
-  データページへの書き込みは、Linux では `SIGBUS` ですがそのまま書かれます。
-  マッピングの一部をアンマップ、移動、保護の変更でき、Linux は分割を断ります
-  （`EINVAL`）。`MADV_DOFORK` で子に渡せ、Linux は `VM_IO` に対して断ります
-  （`EINVAL`）。`mlock` でロックでき、Linux は `VM_SPECIAL` のマッピングをロックしません。
-  `inherit_stat` は受け付けますが、記録するものがないので、引き継いだイベントの終わりに
-  読み取りの記録は送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
+  なります。`inherit_stat` は受け付けますが、記録するものがないので、引き継いだ
+  イベントの終わりに読み取りの記録は送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。ioctl の `SET_FILTER`、`SET_BPF`、
   `QUERY_BPF`、`MODIFY_ATTRIBUTES` は `ENOTTY` です。`remove_on_exec` は、
   Linux master が 7.2 から（037a3c43edfb）するように、イベントをグループから外し、そうした
@@ -444,22 +437,22 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ベースを残します。
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
-  `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
+  `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
-  `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
+  `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、`IORING_REGISTER_SYNC_CANCEL` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
   パーソナリティは登録できず、バッファーは更新できません。タグを付ける
-  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。スレッドが exit や
-  `execve` のときにまだ持っているタスクワークは捨てられ、そのスレッドが投入してファイルを
-  待っている要求と、リングを閉じたときのリング自身のタスクワークも捨てられます。Linux は
-  それらを取り消しとして実行し、`ECANCELED` を投稿します（`io_uring_cancel_generic`）。
-  ファイルを待つ要求は、リングを閉じたあともファイルの準備ができるまでリングを保ちます
-  （Linux はそのとき取り消します）。要求がほかの要求を取り消すことはできません
-  （`IORING_OP_ASYNC_CANCEL` は `EOPNOTSUPP`）。投入の外の更新でスロットから外れた登録
+  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。プロセス全体が
+  終わると、そのスレッドが投入してファイルを待っている要求は、Linux master の
+  `io_task_group_exiting` と同じく取り消されます。差分テストを走らせるカーネルである
+  Linux 7.0 は、ひとりで終わるスレッドのときと同じく、ファイルの準備ができてから取り消します。
+  その終了では、まだ実行を待っているリンクの次の要求は、終わろうとしているスレッドのものと
+  同じく `EFAULT` で失敗します。Linux master はスレッドが終わろうとする前にそれを実行します。
+  投入の外の更新でスロットから外れた登録
   ファイルは、ファイルを待つ要求が持っていてもすぐにタグを投稿します。Linux はその要求が
   完了してから投稿します。
   登録した
@@ -468,13 +461,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   失敗し、リングを共有するプロセスは自分のメモリを動かします。Linux は固定したページを
   動かします。ディスクのファイルの共有マッピングも登録できます（Linux の長期の固定は
   `EFAULT` で断ります）。ヒュージページは 4 KiB のページごとに RLIMIT_MEMLOCK を数えます
-  （Linux は 1 回だけ数えます）。リングは共有でしかマップできず（`MAP_PRIVATE` は `EINVAL`）、`poll` と `epoll` は
-  その記述子を見張れません。機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
+  （Linux は 1 回だけ数えます）。リングは共有でしかマップできません（`MAP_PRIVATE` は `EINVAL`）。
+  リングの投入キューの空きを待つ `poll` やレベルトリガーの `epoll` は、空きができると
+  終わります。Linux のリングが起こすのは、その完了を待つものだけです。機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
   `IORING_FEAT_REG_REG_RING` を、待ちの `min_wait_usec` は何も変えないのに
   `IORING_FEAT_MIN_TIMEOUT` を報告します。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに
-  `EINVAL` で失敗します。位置のないファイル（パイプ、ソケット、端末、eventfd）はポーリング
+  `EINVAL` で失敗します。`IORING_ASYNC_CANCEL_OP` と `IORING_OP_LAST` 以降の操作を持つ
+  `IORING_OP_ASYNC_CANCEL` は、差分テストを走らせるカーネルである Linux 7.0 と同じく要求を
+  見つけません（`ENOENT`）。Linux master の `io_async_cancel_prep` は `EINVAL` で断ります。
+  テストを走らせるカーネルが追いつけば master に合わせます。位置のないファイル（パイプ、ソケット、端末、eventfd）はポーリング
   できるものとみなし、それで読み出しがリングのバッファーを使う時点と、転送がそれを待つか
   どうかが決まります。プログラムのメモリにあるバッファーのリングも固定しません。カーネルは
   使うたびにそのマッピングを通して読み書きするので、外したリングを読み出しが見つけると
@@ -655,8 +652,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     そのセレクタは残って見えますが、トレース対象は 64 ビットのまま動きます。Linux ではその
     セグメントで動くか、フォールトします。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
-    Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
-    読み込んだページ（書き込めるプライベートなマッピング以外）も、触るまでは数えません。
+    Linux はページキャッシュを調べます。
   - 隣り合うプライベートの VMA は、（`munlock` のあとなど）フラグがまたそろえば、
     `anon_vma` によらずつながります。Linux は同じ `anon_vma` を持つときだけつなげます。
     VMA は最初の書き込みで `anon_vma` を得て、そのとき隣とフラグがそろっていたときだけ
@@ -742,8 +738,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   それを `ShmemPmdMapped`、`FilePmdMapped`、`ShmemHugePages` に数えず、フォールトは
   folio 全体ではなくまわりのページだけをマップします（`Rss` にもそれだけを数えます）。大きな folio はいつも取れます。Linux はメモリーにそれほど
   大きな空きがなければ小さいものを取ります。メモリーが足りなくなって分けることはなく、
-  ほかのものの場所を空けるときだけ分けます。`MAP_POPULATE`、`MAP_LOCKED`、ロックが共有マッピングに持ち込むはずのページは、触れた
-  ときに初めて数えます。拡張属性は inode の分を使いません（`shmem_xattr_handler_set` のように数えて、超えたときの `setxattr` の
+  ほかのものの場所を空けるときだけ分けます。拡張属性は inode の分を使いません（`shmem_xattr_handler_set` のように数えて、超えたときの `setxattr` の
   `ENOSPC` にはなりません）。起動したときからあるルートには、`fallocate` の上限（返す
   メモリーの大きさ）のほかに上限がありません。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが
   持つデバイスノードはホストのディレクトリのものだけなので（その `mknod` は `EPERM`）、
@@ -904,10 +899,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マークだけで決めます。Linux は inotify のものも数えます。ディスクリプタが持っていない
   ファイル（exec が動かすプログラム）は、そのときのパスで開き直すので、なくなっていれば
   開けません。
-- **inotify の一部**：スーパーブロックが消えるとき、インスタンスのウォッチは新しいウォッチから
-  `IN_UNMOUNT` を受け取ります。Linux は、どれかのインスタンスが見張り始めたのが新しいファイル
-  から順に扱うので、複数のインスタンスが同じファイルを見張っていると順が違うことがあります。
-  `/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
+- **inotify の一部**：スーパーブロックが消えるとき、そのファイルのウォッチは Linux と同じく、
+  ファイルがどれかのグループの最初のマークを得た順に `IN_UNMOUNT` を受け取ります。ただし、
+  1 回だけの dnotify のウォッチがシグナルの後にディレクトリへ残すマークは、ディスクリプタの
+  テーブルが終わるとき、ウォッチを求めたファイルを通してだけ消えます。Linux はそのディレクトリの
+  どのディスクリプタを通しても消えるので、ディレクトリがその順での位置を長く保つことが
+  あります。`/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
   順です。eventfd の番号はエミュレータの中で数えます。Linux の `eventfd-id` はシステム
   全体で数えます。マウントしたディレクトリにホストが加えた変更は見えず、ディスクリプタの
   場所もそれを追いません。
@@ -918,12 +915,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   名前空間がルートを対応させていればそのルートのものです。ネットワーク名前空間には、ループバックと、要求が作る veth の端のほかにインターフェースが
   ありません。veth の端は IPv4 のアドレスと経路を持ち、TCP と UDP は組を通って相手の
   名前空間のアドレスへ届きます。IPv6 のアドレスも持ち、リンクローカルのアドレスと
-  その経路も作り、要求が足す IPv6 の経路（ゲートウェイのあるものも）、IPv6 の TCP と
-  UDP、その近隣も受け取りますが、代理のエントリと、ゲートウェイを通る IPv4 の経路は
-  どちらも `EOPNOTSUPP` です。IPv6 のゲートウェイの近隣の状態は、Linux の
-  `rt6_check_neigh` が同じメトリックの経路の間でするようには引き当てを左右せず、
-  Linux がマルチパスの兄弟にする、同じメトリックでゲートウェイのある二つの経路は、
-  今のところ `EOPNOTSUPP` です。スコープ ID もデバイスもない、ノードやリンクの
+  その経路も作り、要求が足す IPv6 の経路（IPv4 と同じくゲートウェイのあるものも）、
+  IPv6 の TCP と UDP、その近隣も受け取りますが、代理のエントリは `EOPNOTSUPP` です。
+  IPv6 のゲートウェイの近隣の状態は、Linux の `rt6_check_neigh` が同じメトリックの
+  経路の間でするようには引き当てを左右せず、Linux がマルチパスの兄弟にする、
+  同じメトリックでゲートウェイのある二つの経路は、今のところ `EOPNOTSUPP` です。
+  スコープ ID もデバイスもない、ノードやリンクの
   グループへの UDP の connect は、Linux でマルチキャストのインターフェースがないときと
   同じく `EINVAL` です（ここにはそれがありません）。リンクローカルのアドレスから
   受け付けた接続はデバイスを持たないので、その名前にはスコープ ID が付きません。
@@ -997,7 +994,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   経路を無視する設定）を、Linux の組み込みの値と同じく 0 として伝えます。MTU が 1280
   より小さい veth の端にも `ipv6/conf/<デバイス>` のファイルがありますが、Linux では
   IPv6 がないのでありません（IPv6 のアドレスは、Linux と同じく作りません）。経路は
-  `lo` か veth の端（IPv4 ではゲートウェイのない経路）を通るか、拒むかです。マルチパスの経路、
+  `lo` か veth の端を通るか、拒むかです。マルチパスの経路、
   カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の
   種類（IPv6 ではブロードキャストも）は `EOPNOTSUPP` です。ポリシーのルール

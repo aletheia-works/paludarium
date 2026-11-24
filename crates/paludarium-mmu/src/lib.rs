@@ -7523,6 +7523,22 @@ impl MemoryView {
         }
         Some(vma)
     }
+    /// The file of the VMA [`Self::vma_from`] gives for `addr` (Linux's
+    /// `vm_file`), for reading it as perf's `build_id_parse_nofault` does;
+    /// `None` for a VMA of no file of its own.
+    #[must_use]
+    pub fn vma_source(&self, addr: u64) -> Option<Arc<dyn PageSource>> {
+        let data = self.data.upgrade()?;
+        let _serialization = self
+            .serialization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (vma, source) = data
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .vma_from(addr)?;
+        vma.file.filter(|file| file.source).and(source)
+    }
     /// Runs `f` on the space, if it still lives, under its locks.
     fn with_data<T>(&self, f: impl FnOnce(&AddressSpaceData) -> T) -> Option<T> {
         let data = self.data.upgrade()?;

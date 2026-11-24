@@ -23,6 +23,7 @@
 //! `PERF_FLAG_FD_OUTPUT` make an event write to another's buffer
 //! ([`buffer::set_output`]).
 mod buffer;
+mod build_id;
 mod sample;
 mod side_band;
 
@@ -151,6 +152,7 @@ mod bit {
     pub const NAMESPACES: u32 = 28;
     pub const AUX_OUTPUT: u32 = 31;
     pub const TEXT_POKE: u32 = 33;
+    pub const BUILD_ID: u32 = 34;
     pub const INHERIT_THREAD: u32 = 35;
     pub const REMOVE_ON_EXEC: u32 = 36;
     pub const SIGTRAP: u32 = 37;

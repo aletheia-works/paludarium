@@ -4844,7 +4844,14 @@ kernel.
   length and offset (a file's, and the address of private anonymous
   memory), and for `MMAP2` its file's device and inode, its protection and
   sharing, and the name `d_path` gives (`[heap]`, `[stack]`, `//anon`,
-  `/dev/zero (deleted)` for shared anonymous memory); `PERF_RECORD_COMM`
+  `/dev/zero (deleted)` for shared anonymous memory). With `build_id`, as
+  `perf record` asks by default, an `MMAP2` record of an ELF executable
+  or shared object gives its GNU build ID in place of the device and inode
+  (`PERF_RECORD_MISC_MMAP_BUILD_ID`: its size, three zero bytes and 20
+  bytes), as Linux's `build_id_parse_nofault` finds it in the first 256
+  program headers' `PT_NOTE`s; none comes of secret memory or of a page a
+  tmpfs file or memfd does not hold, as Linux reads only the page cache;
+  `PERF_RECORD_COMM`
   (`comm`) of `PR_SET_NAME`, of a write to `/proc/<pid>/comm` (to the events
   that count the writer, of the thread it renames) and of `execve`
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack

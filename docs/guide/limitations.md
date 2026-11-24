@@ -321,7 +321,10 @@ verified.
   first writes a position-independent program's or interpreter's first
   segment as long as the whole image, before it trims it; a stack that
   grows down as the program touches it writes none; a mapping's inode
-  generation is 0 and no build ID is given (`build_id`); `mprotect` writes
+  generation is 0; a build ID is read from a file whose page cache the
+  emulator does not keep (a host's, or one of the in-memory file system from
+  start-up) as if its pages were all cached, where Linux gives none for a
+  page it has not read or has evicted; `mprotect` writes
   one record of each VMA as it ends up, where Linux writes one each time it
   changes one, of the VMA as merged so far; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's

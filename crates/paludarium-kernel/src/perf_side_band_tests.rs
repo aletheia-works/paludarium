@@ -754,3 +754,83 @@ fn perf_side_band_comm_records_writes_to_comm() {
         ],
     );
 }
+
+/// A 64-bit ELF executable whose one `PT_NOTE` holds the GNU build ID
+/// `id`.
+fn elf_with_build_id(id: &[u8; 20]) -> Vec<u8> {
+    let mut b = vec![0u8; 0x100];
+    b[..4].copy_from_slice(b"\x7fELF");
+    b[4] = 2;
+    b[16..18].copy_from_slice(&2u16.to_le_bytes());
+    b[32..40].copy_from_slice(&64u64.to_le_bytes());
+    b[56..58].copy_from_slice(&1u16.to_le_bytes());
+    b[64..68].copy_from_slice(&4u32.to_le_bytes());
+    b[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+    b[96..104].copy_from_slice(&36u64.to_le_bytes());
+    b.extend(4u32.to_le_bytes());
+    b.extend(20u32.to_le_bytes());
+    b.extend(3u32.to_le_bytes());
+    b.extend(b"GNU\0");
+    b.extend(id);
+    b.resize(2 * 4096, 0);
+    b
+}
+
+/// With `build_id`, an `MMAP2` record of an ELF file gives the file's GNU
+/// build ID in place of its device and inode (`PERF_RECORD_MISC_MMAP_BUILD_ID`),
+/// as Linux's `perf_event_mmap_output` does; one of another file gives the
+/// device and inode, and so does an event without `build_id`.
+#[test]
+fn mmap2_records_give_the_build_id_an_event_asks_for() {
+    const ATTR_BUILD_ID: u64 = 1 << 34;
+    const MISC_MMAP_BUILD_ID: u64 = 1 << 14;
+    let mut env = Env::new();
+    let id: [u8; 20] = std::array::from_fn(|i| i as u8 + 0xa0);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (b"/tmp/build-id-elf".to_vec(), elf_with_build_id(&id)),
+        (b"/tmp/build-id-text".to_vec(), vec![b'x'; 4096]),
+    ];
+    let mut fds = Vec::new();
+    for (path, bytes) in &files {
+        let fd = env.open(path, O_RDWR | O_CREAT | O_EXCL, 0o600);
+        assert!(fd >= 0, "{fd}");
+        for chunk in bytes.chunks(4096) {
+            assert_eq!(env.write(fd, chunk), chunk.len() as i64);
+        }
+        fds.push(fd);
+    }
+    let (with, with_page) = env
+        .open_side_band(0, -1, ATTR_MMAP2 | ATTR_MMAP_DATA | ATTR_BUILD_ID)
+        .unwrap();
+    let (without, without_page) = env
+        .open_side_band(0, -1, ATTR_MMAP2 | ATTR_MMAP_DATA)
+        .unwrap();
+    env.ioctl(with, IOC_ENABLE);
+    env.ioctl(without, IOC_ENABLE);
+    let elf = env.mmap(4096, PROT_READ, MAP_PRIVATE, fds[0], 0);
+    let text = env.mmap(4096, PROT_READ, MAP_PRIVATE, fds[1], 0);
+    env.ioctl(with, IOC_DISABLE);
+    env.ioctl(without, IOC_DISABLE);
+    for (page, asks) in [(with_page, true), (without_page, false)] {
+        let mut seen = Vec::new();
+        env.each_record(page, |_, record| {
+            if record[0] as u32 == RECORD_MMAP2 && (record[2] == elf || record[2] == text) {
+                seen.push(record.to_vec());
+            }
+        });
+        assert_eq!(seen.len(), 2, "{asks}");
+        for record in seen {
+            let misc = (record[0] >> 32) & 0xffff;
+            let is_elf = record[2] == elf;
+            if asks && is_elf {
+                assert_ne!(misc & MISC_MMAP_BUILD_ID, 0);
+                // Its size, three zeros, then the 20 bytes.
+                let bytes: Vec<u8> = record[5..8].iter().flat_map(|w| w.to_le_bytes()).collect();
+                assert_eq!(bytes[..4], [20, 0, 0, 0]);
+                assert_eq!(bytes[4..], id[..]);
+            } else {
+                assert_eq!(misc & MISC_MMAP_BUILD_ID, 0, "{asks} {is_elf}");
+            }
+        }
+    }
+}

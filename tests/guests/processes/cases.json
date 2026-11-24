@@ -73,6 +73,7 @@
     {"name":"veth-neigh","binary":"veth-neigh"},
     {"name":"veth-ipv6","binary":"veth-ipv6"},
     {"name":"veth-ipv4-gateway","binary":"veth-ipv4-gateway"},
+    {"name":"veth-ipv4-ecmp","binary":"veth-ipv4-ecmp"},
     {"name":"veth-ipv6-gateway","binary":"veth-ipv6-gateway"},
     {"name":"veth-ipv6-ecmp","binary":"veth-ipv6-ecmp"},
     {"name":"veth-ipv6-scope","binary":"veth-ipv6-scope"},

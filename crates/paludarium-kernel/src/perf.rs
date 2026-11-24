@@ -2082,6 +2082,64 @@ mod tests {
     }
 
     #[test]
+    fn another_thread_s_new_mask_moves_what_the_thread_counts_at_once() {
+        let host = paludarium_host::testing::RecordingHost::default();
+        let group = Arc::new(ThreadGroup::default());
+        let mut state = crate::ThreadState::default();
+        paludarium_mmu::faults::bind(Arc::clone(&state.cpu.used) as _);
+        let on = |counter, cpu| {
+            let target = Target::Thread {
+                group: Arc::clone(&group),
+                tid: 5,
+            };
+            let event = of_counter_on(None, target, Attr::default(), counter, cpu);
+            event.enable();
+            event
+        };
+        let mut space = paludarium_mmu::AddressSpace::new();
+        let mut fault = || {
+            let page = space
+                .map(
+                    None,
+                    4096,
+                    paludarium_mmu::Prot::READ_WRITE,
+                    paludarium_mmu::MappingKind::Anonymous,
+                )
+                .unwrap();
+            space.write_u64(page, 1).unwrap();
+        };
+        crate::account_cpu(&host, &group, &mut state, 5);
+        let faults = [0, 1].map(|cpu| on(Counter::Faults, cpu));
+        let switches = [0, 1].map(|cpu| on(Counter::Switches, cpu));
+        let migrations = [0, 1].map(|cpu| on(Counter::Migrations, cpu));
+        let counts = |events: &[Arc<Event>; 2]| events.each_ref().map(|e| e.values().0);
+        let _ = paludarium_host::switches::take();
+        // A fault and a sleep on CPU 0; then another thread moves it to
+        // CPU 1, before it makes a system call.
+        fault();
+        paludarium_host::switches::sleep(&mut false);
+        group.set_affinity(5, vec![0b10]);
+        fault();
+        assert_eq!(counts(&faults), [1, 1]);
+        // Its next account counts the sleep where it slept and the
+        // migration where it came.
+        crate::account_cpu(&host, &group, &mut state, 5);
+        assert_eq!(counts(&switches), [1, 0]);
+        assert_eq!(counts(&migrations), [0, 1]);
+        assert_eq!(counts(&faults), [1, 1]);
+        // A thread on a virtual CPU of `rseq` stays where it is.
+        state.on_cpu = Some(crate::rseq::OnCpu {
+            cpu: 1,
+            cid: 0,
+            runner: 0,
+        });
+        crate::account_cpu(&host, &group, &mut state, 5);
+        group.set_affinity(5, vec![0b1]);
+        fault();
+        assert_eq!(counts(&faults), [1, 2]);
+    }
+
+    #[test]
     fn a_new_task_inherits_groups_with_inherit_and_gives_them_back_at_its_end() {
         let events = Events::default();
         let (group, child_group) = (

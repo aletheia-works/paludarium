@@ -33,6 +33,7 @@ musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie 
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-neigh" "$here/veth-neigh.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6" "$here/veth-ipv6.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv4-gateway" "$here/veth-ipv4-gateway.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv4-ecmp" "$here/veth-ipv4-ecmp.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-gateway" "$here/veth-ipv6-gateway.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-ecmp" "$here/veth-ipv6-ecmp.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-scope" "$here/veth-ipv6-scope.c"

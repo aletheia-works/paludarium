@@ -415,7 +415,7 @@ jobs:
           lscpu > target/encodings-guests/cpu.txt
       # Builds the guests from source, runs each natively and under the
       # emulator, compares stdout/stderr/exit status and prints the run times.
-      # diff_events, diff_threads and diff_files run the emulator's binary,
+      # diff_events and diff_threads run the emulator's binary,
       # target/debug/paludarium, as a program.
       - name: Build the emulator's binary
         run: cargo build --locked -p paludarium

@@ -1282,6 +1282,9 @@ impl ThreadGroup {
             .get(&tid)
             .cloned()
     }
+    /// `sched_setaffinity`'s new mask for thread `tid`: what the thread
+    /// counts from now is its new lowest CPU's ([`crate::Usage::moved_to`]),
+    /// though it looks the CPU up again only at its next account.
     pub(crate) fn set_affinity(&self, tid: u32, mask: Vec<u64>) {
         self.affinity
             .lock()
@@ -1289,6 +1292,9 @@ impl ThreadGroup {
             .insert(tid, mask);
         self.affinity_changes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(usage) = self.last_thread_usage(tid) {
+            usage.moved_to(self.lowest_cpu(tid));
+        }
     }
     /// Changes with every [`Self::set_affinity`].
     pub(crate) fn affinity_generation(&self) -> u64 {

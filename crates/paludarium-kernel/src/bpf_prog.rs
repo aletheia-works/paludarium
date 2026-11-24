@@ -747,24 +747,16 @@ impl Attached {
     }
 }
 
-/// `sizeof(struct skb_shared_info)` on x86-64, at the end of every skb head.
-pub(crate) const SKB_SHARED_INFO: usize = 320;
-/// `SKB_MAX_ALLOC` on x86-64: four pages less `skb_shared_info`, the most
-/// an AF_UNIX datagram keeps in its linear part.
-const SKB_MAX_ALLOC: usize = 4 * 4096 - SKB_SHARED_INFO;
-/// `MAX_SKB_FRAGS` pages, the most of a datagram in pages.
-const MAX_SKB_FRAGS_SIZE: usize = 17 * 4096;
-
 /// How many of an AF_UNIX datagram's `len` bytes `unix_dgram_sendmsg` puts
-/// in page fragments: none up to [`SKB_MAX_ALLOC`], else what is past it in
-/// whole pages, at most [`MAX_SKB_FRAGS_SIZE`] of them.
+/// in page fragments: none up to `SKB_MAX_ALLOC` ([`crate::skb::MAX_ALLOC`]),
+/// the most it keeps in its linear part, else what is past it in whole
+/// pages, at most `MAX_SKB_FRAGS` of them ([`crate::skb::MAX_FRAGS_SIZE`]).
 pub(crate) fn unix_paged(len: usize) -> usize {
-    if len <= SKB_MAX_ALLOC {
+    use crate::skb::{MAX_ALLOC, MAX_FRAGS_SIZE, PAGE};
+    if len <= MAX_ALLOC {
         return 0;
     }
-    (len - SKB_MAX_ALLOC)
-        .min(MAX_SKB_FRAGS_SIZE)
-        .next_multiple_of(4096)
+    (len - MAX_ALLOC).min(MAX_FRAGS_SIZE).next_multiple_of(PAGE)
 }
 
 /// How many of an AF_UNIX message's `len` bytes are in its linear part:

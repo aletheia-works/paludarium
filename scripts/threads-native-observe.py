@@ -11,6 +11,11 @@ import struct
 import subprocess
 from pathlib import Path
 
+# `PALUDARIUM_TEST_JIT=N` (`mise run test:diff:jit`) runs the emulator with
+# its native JIT (`--jit=N`), which the command compiles in the background,
+# while the harness compiles on the running thread.
+JIT = [f"--jit={n}"] if (n := os.environ.get("PALUDARIUM_TEST_JIT", "")).isdigit() else []
+
 
 def run(command, prefix, timeout=30):
     child = subprocess.Popen(
@@ -64,7 +69,8 @@ def main():
         )
         if args.emulator:
             emulated = run(
-                [str(args.emulator.resolve()), str(guest.resolve())], args.out / f"emulated-{case}"
+                [str(args.emulator.resolve()), *JIT, str(guest.resolve())],
+                args.out / f"emulated-{case}",
             )
             result["emulated"] = emulated
             if native != emulated:

@@ -2752,7 +2752,25 @@ kernel.
     the named end's link, which must be up, and refuses one that is an
     address of the namespace, a broadcast or a group (`EINVAL`). Its
     packets go to the gateway's neighbour where a route of link scope
-    reaches the gateway (`rt_uses_gateway`), else to their destination's. An output lookup that goes through an end leaves from its first
+    reaches the gateway (`rt_uses_gateway`), else to their destination's.
+    A route's `RTA_MULTIPATH` makes one route of its next hops
+    (`fib_get_nhs`), each checked as a route's next hop of its own device,
+    gateway and flags (`fib_check_nh`), with its weight (`rtnh_hops` + 1):
+    `EINVAL` for data past them, a hop `RTNH_F_DEAD` or
+    `RTNH_F_LINKDOWN`, a gateway shorter than an address, a first hop not
+    of the request's `RTA_OIF` or `RTA_GATEWAY`, a kind that rejects, and
+    more than one of host scope. Dumps and notifications give its hops in
+    `RTA_MULTIPATH`, each with its flags, weight less one, device and
+    gateway, and its `rtm_flags` the route's own, `RTNH_F_LINKDOWN` where
+    all its hops are; one of one hop is a route of one. Another of other
+    hops or weights is another route; the same again is `EEXIST`. A hop
+    whose end goes down turns `RTNH_F_DEAD` and `RTNH_F_LINKDOWN`,
+    without a word, which lookups pass over, until the end comes up
+    (`fib_sync_down_dev`, `fib_sync_up`); one without its carrier
+    `RTNH_F_LINKDOWN`; a route whose hops are all dead goes, as one does
+    through an end that goes away. A removal naming a device or gateway
+    matches a route's first hop, and one with `RTA_MULTIPATH` each of its
+    hops in turn (`fib_nh_match`). An output lookup that goes through an end leaves from its first
     primary address, else from the first of the other devices' in the
     order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
     without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
@@ -3139,10 +3157,10 @@ kernel.
     a local one goes out through `lo`. A multicast one is `EMSGSIZE`, as
     Linux's multicast routing knows no device of the reply it fills
     (`ip6mr_get_route`). The source, the flow label (`RTA_FLOWLABEL`)
-    and the protocol choose among a multipath route's hops, as
-    `fib6_select_path` hashes them; the mark, the user ID and the ports
-    choose among policy rules, which there are none of, so they change
-    nothing.
+    and the protocol choose among an IPv6 multipath route's hops, as
+    `fib6_select_path` hashes them, and of an IPv4 one's a lookup takes
+    the first not dead; the mark, the user ID and the ports choose among
+    policy rules, which there are none of, so they change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed
@@ -4831,7 +4849,8 @@ kernel.
   each, counts and runs only while the thread is on that CPU
   (`event_filter_match`), and is enabled all the while; a migration counts
   on the CPU the thread comes to, and `sched_setaffinity` moves the thread
-  before it returns. Branch sampling or the XMM registers of one is
+  before it returns, another thread's too (a sleep it made before counts
+  where it slept). Branch sampling or the XMM registers of one is
   `EOPNOTSUPP`. Hardware, cache and raw events are `ENOENT`, as on a machine without a
   PMU. An event of another process needs `CAP_PERFMON` or to be able to
   read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the

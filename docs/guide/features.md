@@ -5205,7 +5205,9 @@ kernel.
   random value, then 0) and a window scale of 10, for `tcp_rmem[2]`'s 32
   MiB; the IP header, MAC
   header and `__sk_buff` fields as a UDP datagram's (above), with the
-  socket's own flow hash and `SKF_AD_PAY_OFFSET` 40. An accepted socket
+  connecting socket's flow hash, which `connect` gives it and each SYN
+  sent again draws anew (`sk_rethink_txhash`), and `SKF_AD_PAY_OFFSET`
+  40; a SYN sent again is the connecting socket's, with its options. An accepted socket
   takes the listener's filter and its lock, as `sk_clone_lock` copies
   them.
 

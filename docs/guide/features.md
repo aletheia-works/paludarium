@@ -606,7 +606,16 @@ kernel.
   same description changes the lease's type. A lease taken gives the
   description an owner if it has none, and `F_UNLCK` takes the owner and
   the `F_SETSIG` signal away (`f_delown`); `F_UNLCK` with no lease is
-  `EAGAIN`. `F_GETLEASE` gives the description's lease type, or `F_UNLCK`.
+  `EAGAIN`. `F_GETLEASE` gives the description's lease type (the one it is
+  to become, while it is being broken), or `F_UNLCK`. An open or a
+  `truncate` that conflicts with a lease breaks it as `__break_lease` does,
+  the opener's own leases too: an open for reading only a write lease, which
+  is to become a read lease, and any other both kinds, which are to go. The
+  break signals the holder once (`SIGIO`, or the `F_SETSIG` signal with
+  `POLL_MSG`), and the opener waits for the holder, its access counted
+  already; a wait of `/proc/sys/fs/lease-break-time` seconds (0 or less has
+  no end) downgrades or removes the lease itself, `O_NONBLOCK` gives
+  `EWOULDBLOCK` instead, and a signal ends the wait (`ERESTARTSYS`).
   `/proc/sys/fs/leases-enable` (1 at first) and `/proc/sys/fs/lease-break-time`
   (45 at first) are root's files of mode 0644, which take any `int`
   (`proc_dointvec`).

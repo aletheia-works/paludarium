@@ -11397,6 +11397,266 @@ static int file_leases_case(void) {
     rmdir(dir);
     return 0;
 }
+/* Opens and truncates that break leases, as __break_lease does: in one case
+ * with the above, as both write the machine's lease sysctls. */
+static void lease_signal(const char *what, int fd) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGRTMIN);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    struct timespec patience = {5, 0};
+    int got = sigtimedwait(&set, &info, &patience);
+    const char *name = got == SIGIO ? "io" : got == SIGRTMIN ? "rt" : "none";
+    int named = got == SIGRTMIN && info.si_fd == fd;
+    long band = got == SIGRTMIN ? (long)info.si_band : 0;
+    printf("%s signal=%s code=%d fd=%d band=%ld\n", what, name, info.si_code, named, band);
+}
+static void lease_no_signal(const char *what) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGRTMIN);
+    struct timespec none = {0, 0};
+    int got = sigtimedwait(&set, NULL, &none);
+    printf("%s signal=%s\n", what, got < 0 ? "none" : "some");
+}
+/* An open of path, closed at once. */
+static int lease_open(const char *path, int flags) {
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return -errno;
+    close(fd);
+    return 0;
+}
+static volatile sig_atomic_t lease_alarms;
+static void lease_alarm(int signal) {
+    (void)signal;
+    lease_alarms++;
+}
+/* A child that opens path with flags (or truncates it to 1 byte, if flags is
+ * -1) and tells what came of it, with a SIGALRM after 100 ms if alarm_flags
+ * is not -1. It holds no lease's description. */
+static pid_t lease_child(const char *path, int flags, int alarm_flags, int held, int *from) {
+    int ends[2];
+    fflush(stdout);
+    if (pipe(ends)) return -1;
+    pid_t child = fork();
+    if (child == 0) {
+        close(held);
+        close(ends[0]);
+        if (alarm_flags != -1) {
+            struct sigaction act;
+            memset(&act, 0, sizeof act);
+            act.sa_handler = lease_alarm;
+            act.sa_flags = alarm_flags;
+            sigaction(SIGALRM, &act, NULL);
+            struct itimerval once = {{0, 0}, {0, 100000}};
+            setitimer(ITIMER_REAL, &once, NULL);
+        }
+        int result = flags == -1 ? (truncate(path, 1) ? -errno : 0) : lease_open(path, flags);
+        int told[2] = {result, (int)lease_alarms};
+        _exit(write(ends[1], told, sizeof told) == sizeof told ? 0 : 1);
+    }
+    close(ends[1]);
+    *from = ends[0];
+    return child;
+}
+/* Whether the child has told nothing 50 ms on. */
+static int lease_waiting(int from) {
+    struct pollfd p = {from, POLLIN, 0};
+    return poll(&p, 1, 50) == 0;
+}
+static void lease_told(const char *what, pid_t child, int from) {
+    int told[2] = {-1000, -1000};
+    ssize_t n = read(from, told, sizeof told);
+    close(from);
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("%s result=%d alarms=%d whole=%d exit=%d\n", what, told[0], told[1], n == sizeof told, status);
+}
+static int lease_seconds(const char *value) {
+    int s = open("/proc/sys/fs/lease-break-time", O_WRONLY);
+    if (s < 0) return -errno;
+    int result = write(s, value, strlen(value)) < 0 ? -errno : 0;
+    close(s);
+    return result;
+}
+static int lease_breaks_case(void) {
+    char dir[] = "/tmp/breaks-XXXXXX";
+    if (!mkdtemp(dir)) return 1;
+    char path[64];
+    snprintf(path, sizeof path, "%s/f", dir);
+    int made = open(path, O_RDWR | O_CREAT, 0644);
+    if (made < 0 || write(made, "lease", 5) != 5) return 2;
+    close(made);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGRTMIN);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    int get, from;
+    /* What breaks no write lease. */
+    int rd = open(path, O_RDONLY);
+    printf("write lease=%d\n", lease_errno(rd, F_WRLCK));
+    fcntl(rd, F_SETSIG, SIGRTMIN);
+    int path_only = lease_open(path, O_PATH);
+    int taken = lease_open(path, O_RDWR | O_CREAT | O_EXCL);
+    int directory = lease_open(path, O_RDONLY | O_DIRECTORY);
+    int negative = truncate(path, -1) ? -errno : 0;
+    struct stat st;
+    stat(path, &st);
+    get = fcntl(rd, F_GETLEASE);
+    printf("unbroken path=%d excl=%d dir=%d negative=%d get=%d\n", path_only, taken, directory, negative, get);
+    lease_no_signal("unbroken");
+    /* A reader asks for a downgrade, once. */
+    int reader = lease_open(path, O_RDONLY | O_NONBLOCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("reader=%d get=%d\n", reader, get);
+    lease_signal("reader", rd);
+    int again = lease_open(path, O_RDONLY | O_NONBLOCK);
+    printf("reader again=%d\n", again);
+    lease_no_signal("reader again");
+    /* Then a writer asks for all of it. */
+    int writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("writer=%d get=%d\n", writer, get);
+    lease_signal("writer", rd);
+    int rdwr = lease_open(path, O_RDWR | O_NONBLOCK);
+    printf("rdwr=%d\n", rdwr);
+    lease_no_signal("rdwr");
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", rd);
+    int through = lease_open(link, O_RDONLY | O_NONBLOCK);
+    printf("through fd=%d\n", through);
+    /* A downgrade lets readers in; the writer's break still stands. */
+    int down = lease_errno(rd, F_RDLCK);
+    get = fcntl(rd, F_GETLEASE);
+    reader = lease_open(path, O_RDONLY | O_NONBLOCK);
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    printf("down=%d get=%d reader=%d writer=%d\n", down, get, reader, writer);
+    lease_no_signal("down");
+    int two = open(path, O_RDONLY);
+    int beside = lease_errno(two, F_RDLCK);
+    close(two);
+    printf("beside=%d\n", beside);
+    int unlck = lease_errno(rd, F_UNLCK);
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    printf("unlck=%d writer=%d\n", unlck, writer);
+    /* Two read leases: a reader that empties the file breaks none, and a
+       writer both. */
+    two = open(path, O_RDONLY);
+    int one_lease = lease_errno(rd, F_RDLCK);
+    int two_lease = lease_errno(two, F_RDLCK);
+    reader = lease_open(path, O_RDONLY | O_TRUNC | O_NONBLOCK);
+    stat(path, &st);
+    printf("two leases=%d %d truncating reader=%d size=%ld\n", one_lease, two_lease, reader, (long)st.st_size);
+    lease_no_signal("truncating reader");
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    int get_one = fcntl(rd, F_GETLEASE);
+    int get_two = fcntl(two, F_GETLEASE);
+    printf("two writer=%d get=%d %d\n", writer, get_one, get_two);
+    /* SIGIO is pending once, whoever sent it. */
+    lease_signal("two", rd);
+    lease_no_signal("two");
+    close(two);
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    printf("one closed writer=%d\n", writer);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("one unlck=%d\n", unlck);
+    /* A writer waits for F_UNLCK, its access counted. */
+    int lease = lease_errno(rd, F_RDLCK);
+    pid_t child = lease_child(path, O_WRONLY, -1, rd, &from);
+    lease_signal("blocked writer", rd);
+    int waiting = lease_waiting(from);
+    int relock = lease_errno(rd, F_RDLCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("blocked writer lease=%d waiting=%d relock=%d get=%d\n", lease, waiting, relock, get);
+    printf("blocked writer unlck=%d\n", lease_errno(rd, F_UNLCK));
+    lease_told("blocked writer", child, from);
+    /* A reader waits for the downgrade, its access counted. */
+    lease = lease_errno(rd, F_WRLCK);
+    child = lease_child(path, O_RDONLY, -1, rd, &from);
+    lease_signal("blocked reader", rd);
+    waiting = lease_waiting(from);
+    relock = lease_errno(rd, F_WRLCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("blocked reader lease=%d waiting=%d relock=%d get=%d\n", lease, waiting, relock, get);
+    printf("blocked reader down=%d\n", lease_errno(rd, F_RDLCK));
+    lease_told("blocked reader", child, from);
+    get = fcntl(rd, F_GETLEASE);
+    printf("blocked reader get=%d\n", get);
+    /* truncate waits for the last close. */
+    child = lease_child(path, -1, -1, rd, &from);
+    lease_signal("truncate", rd);
+    waiting = lease_waiting(from);
+    stat(path, &st);
+    printf("truncate waiting=%d size=%ld\n", waiting, (long)st.st_size);
+    close(rd);
+    lease_told("truncate", child, from);
+    stat(path, &st);
+    printf("truncate size=%ld\n", (long)st.st_size);
+    /* A signal ends the wait, or its handler runs the open again. */
+    rd = open(path, O_RDONLY);
+    lease = lease_errno(rd, F_RDLCK);
+    child = lease_child(path, O_WRONLY, 0, rd, &from);
+    lease_signal("interrupted", rd);
+    lease_told("interrupted", child, from);
+    child = lease_child(path, -1, 0, rd, &from);
+    lease_told("interrupted truncate", child, from);
+    child = lease_child(path, O_WRONLY, SA_RESTART, rd, &from);
+    struct pollfd wait = {from, POLLIN, 0};
+    int early = poll(&wait, 1, 400);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("restarted lease=%d early=%d unlck=%d\n", lease, early, unlck);
+    lease_told("restarted", child, from);
+    lease_no_signal("restarted");
+    /* The wait's end: a writer takes the lease away, with its owner, and a
+       reader makes it a read lease. */
+    printf("seconds=%d\n", lease_seconds("1\n"));
+    lease = lease_errno(rd, F_RDLCK);
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    child = lease_child(path, O_WRONLY, -1, rd, &from);
+    lease_told("timed writer", child, from);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    long took = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+    lease_signal("timed writer", rd);
+    get = fcntl(rd, F_GETLEASE);
+    int owner = fcntl(rd, F_GETOWN);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("timed writer lease=%d second=%d get=%d owner=%d unlck=%d\n", lease, took >= 900 && took < 10000, get, owner, unlck);
+    lease = lease_errno(rd, F_WRLCK);
+    child = lease_child(path, O_RDONLY, -1, rd, &from);
+    lease_told("timed reader", child, from);
+    lease_signal("timed reader", rd);
+    get = fcntl(rd, F_GETLEASE);
+    owner = fcntl(rd, F_GETOWN) == getpid();
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("timed reader lease=%d get=%d owner=%d unlck=%d\n", lease, get, owner, unlck);
+    /* No time to wait is no end. */
+    printf("seconds=%d\n", lease_seconds("0\n"));
+    lease = lease_errno(rd, F_RDLCK);
+    child = lease_child(path, O_WRONLY, -1, rd, &from);
+    struct pollfd endless = {from, POLLIN, 0};
+    early = poll(&endless, 1, 1500);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("endless lease=%d early=%d unlck=%d\n", lease, early, unlck);
+    lease_told("endless", child, from);
+    lease_signal("endless", rd);
+    printf("seconds=%d\n", lease_seconds("45\n"));
+    /* A removed file, opened again through its descriptor. */
+    unlink(path);
+    lease = lease_errno(rd, F_RDLCK);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", rd);
+    through = lease_open(link, O_WRONLY | O_NONBLOCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("removed lease=%d through=%d get=%d\n", lease, through, get);
+    lease_signal("removed", rd);
+    close(rd);
+    rmdir(dir);
+    return 0;
+}
 /* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
  * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
  * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
@@ -38102,7 +38362,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
-    if (!strcmp(mode, "file-leases")) return file_leases_case();
+    if (!strcmp(mode, "file-leases")) {
+        int failed = file_leases_case();
+        return failed ? failed : lease_breaks_case();
+    }
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();

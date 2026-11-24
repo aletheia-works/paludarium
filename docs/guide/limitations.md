@@ -1041,12 +1041,12 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **File leases, in part**: an open or a truncate that conflicts with a
-  lease does not break it yet, where Linux's `__break_lease` signals the
-  holder and makes the opener wait up to `/proc/sys/fs/lease-break-time`
-  seconds (or fail with `EWOULDBLOCK` under `O_NONBLOCK`), then takes the
-  lease away or makes it a read lease. Delegations (`F_GETDELEG` and
-  `F_SETDELEG`) are `EINVAL`.
+- **File leases, in part**: the opens `execve` makes of a program, its
+  interpreter and its script, and those of the descriptors fanotify's events
+  give, break no lease, where Linux's do. A lease is broken before
+  `FAN_OPEN_PERM` is asked, where Linux breaks it after, and after
+  Landlock's check of a `truncate`, where Linux breaks it before.
+  Delegations (`F_GETDELEG` and `F_SETDELEG`) are `EINVAL`.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes, as no file system here
   reports errors. Linux's ext4 reports them, and since 7.0 its XFS, Btrfs,

@@ -1995,6 +1995,26 @@ impl Processes {
             .unwrap_or_else(PoisonError::into_inner)
             .set(file, owner);
     }
+    /// The owner of the open description at address `file`, if it has one.
+    pub(crate) fn file_owner_at(&self, file: usize) -> FileOwner {
+        self.file_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .at(file)
+            .map_or_else(FileOwner::default, |owner| *owner)
+    }
+    /// Makes `owner` the owner of the open description at address `file`,
+    /// if it has had one.
+    pub(crate) fn set_file_owner_at(&self, file: usize, owner: FileOwner) {
+        if let Some(kept) = self
+            .file_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .at(file)
+        {
+            *kept = owner;
+        }
+    }
     /// Whether `pidfd_send_signal` from `caller` may signal process `pid`.
     fn may_signal(&self, caller: u32, sender: TaskIds, pid: u32, number: i32) -> Result<(), Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);

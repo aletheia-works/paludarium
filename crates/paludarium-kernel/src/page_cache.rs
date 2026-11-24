@@ -474,7 +474,7 @@ impl PageCaches {
     }
     /// A description of `key` open for reading only, counted while the
     /// guard lives.
-    fn read_access(self: &Arc<Self>, key: Key) -> ReadAccess {
+    pub(crate) fn read_access(self: &Arc<Self>, key: Key) -> ReadAccess {
         *self
             .reads
             .lock()
@@ -1167,6 +1167,12 @@ impl FileHandle for CoherentFile {
     /// The file opened again, in step with the same page cache, which
     /// `O_TRUNC` empties as an open by path does.
     fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        // `do_dentry_open`'s `break_lease`.
+        if crate::leases::any(&self.caches)
+            && let Some(key) = self.key()
+        {
+            crate::leases::check(&self.caches, key, flags)?;
+        }
         let file = CoherentFile {
             inner: self.inner.reopen(flags)?,
             caches: Arc::clone(&self.caches),
@@ -1439,6 +1445,8 @@ impl HostFs for CoherentFs {
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         const O_NOFOLLOW: u32 = 0o400000;
         const O_CREAT: u32 = 0o100;
+        const O_EXCL: u32 = 0o200;
+        const O_DIRECTORY: u32 = 0o200000;
         let follow = flags & O_NOFOLLOW == 0;
         // The file the path names before the open, with its device: looked
         // up once, at the first check that needs it, and shared by those
@@ -1490,6 +1498,19 @@ impl HostFs for CoherentFs {
             }
         {
             return Err(EROFS);
+        }
+        // `do_dentry_open`'s `break_lease`, unless the open fails before it:
+        // on a name taken, a file that is no directory, or a read-only
+        // mount.
+        if flags & O_PATH == 0
+            && crate::leases::any(&self.caches)
+            && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL
+            && flags & O_DIRECTORY == 0
+            && let Ok((device, stat)) = lookup()
+            && stat.mode & 0o170000 == REGULAR
+            && (flags & 3 == 0 || !self.inner.read_only(path, follow).mount)
+        {
+            crate::leases::check(&self.caches, (device, stat.inode), flags)?;
         }
         let quiet = quiet_now();
         let inner = match self.inner.open(path, flags, mode) {

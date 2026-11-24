@@ -215,8 +215,8 @@ mod linux {
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, the file-leases case, which writes
-            // fs.leases-enable and becomes an unprivileged user, as the
-            // emulator's guest starts as root.
+            // fs.leases-enable and fs.lease-break-time and becomes an
+            // unprivileged user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"

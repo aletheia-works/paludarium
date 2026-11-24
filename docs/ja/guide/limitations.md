@@ -876,10 +876,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルをほかのときに解放したり残したりもします。
 - **dnotify の一部**：`/proc/sys/fs/dir-notify-enable` はないので、Linux の既定の 1 と
   同じく、dnotify はいつも使えます。
-- **ファイルのリースの一部**：リースとぶつかる open や truncate は、まだリースを破りません。
-  Linux の `__break_lease` は持ち主にシグナルを送り、開く側を
-  `/proc/sys/fs/lease-break-time` 秒まで待たせて（`O_NONBLOCK` なら `EWOULDBLOCK`）、
-  リースを外すか読み込みのリースにします。委任（`F_GETDELEG` と `F_SETDELEG`）は `EINVAL` です。
+- **ファイルのリースの一部**：`execve` がプログラム、そのインタープリター、スクリプトを開くときと、
+  fanotify のイベントが渡すディスクリプターを開くときは、Linux と違ってリースを破りません。
+  リースは `FAN_OPEN_PERM` を尋ねる前に破ります（Linux では尋ねた後）。`truncate` では
+  Landlock の検査の後に破ります（Linux では前）。
+  委任（`F_GETDELEG` と `F_SETDELEG`）は `EINVAL` です。
 - **fanotify の一部**：`FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。`FAN_FS_ERROR` は
   来ません。ここにはエラーを知らせるファイルシステムがないためです。Linux では ext4 が

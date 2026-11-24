@@ -530,7 +530,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   です。同じ記述からもう一度頼むと、リースの種類が変わります。リースを取ると、持ち主の
   ない記述は呼んだプロセスを持ち主にし、`F_UNLCK` は持ち主と `F_SETSIG` のシグナルを
   外します（`f_delown`）。リースがないときの `F_UNLCK` は `EAGAIN` です。`F_GETLEASE` は
-  その記述のリースの種類か `F_UNLCK` を返します。`/proc/sys/fs/leases-enable`（最初は 1）と
+  その記述のリースの種類（破られている間は、これからなる種類）か `F_UNLCK` を返します。
+  リースとぶつかる open や `truncate` は、`__break_lease` と同じくリースを破ります。開く側
+  自身のリースも破ります。読み込みだけの open は書き込みのリースを破って読み込みのリースに
+  させ、ほかはどちらのリースも破って外させます。破るときは持ち主に一度だけシグナル
+  （`SIGIO` か、`F_SETSIG` のシグナルと `POLL_MSG`）を送り、開く側は、読み書きの数に
+  先に数えられてから持ち主を待ちます。`/proc/sys/fs/lease-break-time` 秒（0 以下なら
+  終わりはありません）待つと、リースを読み込みのリースにするか外します。`O_NONBLOCK` なら
+  待たずに `EWOULDBLOCK` で、シグナルは待ちを終わらせます（`ERESTARTSYS`）。
+  `/proc/sys/fs/leases-enable`（最初は 1）と
   `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
   も受け取ります（`proc_dointvec`）。
 

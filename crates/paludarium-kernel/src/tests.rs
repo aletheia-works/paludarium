@@ -2790,7 +2790,9 @@ fn a_lease_is_taken_changed_and_given_back_as_fs_locks_does() {
     assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
     let dup = f.ret(32, &[rd]);
     assert_eq!(f.ret(72, &[dup, 1025]), 1);
-    // A second reader keeps a write lease from another description.
+    // A second reader keeps a write lease from another description. A
+    // write lease would break for it.
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
     let two = f.ret(2, &[path, 0, 0]);
     assert_eq!(f.ret(72, &[two, 1024, 1]), errno(Errno::EAGAIN));
     // F_UNLCK takes the owner and the signal away.
@@ -2820,6 +2822,82 @@ fn a_lease_is_taken_changed_and_given_back_as_fs_locks_does() {
     f.mem.read(GuestAddr(DATA + 0x80), &mut ends).unwrap();
     let pipe = u64::from(u32::from_le_bytes(ends));
     assert_eq!(f.ret(72, &[pipe, 1024, 0]), errno(Errno::EINVAL));
+}
+/// Opens and truncates that break a lease, as Linux's `__break_lease` does.
+#[test]
+fn an_open_or_truncate_that_conflicts_breaks_a_lease() {
+    const NONBLOCK: u64 = 0o4000;
+    const SIGIO: u64 = 29;
+    let mut f = fixture();
+    // Each break's SIGIO stays pending.
+    f.thread.state.signal_mask |= 1 << (SIGIO - 1);
+    let path = put(&mut f, 0, b"/tmp/leased");
+    let made = f.ret(2, &[path, 0o102, 0o644]);
+    assert_eq!(f.ret(3, &[made]), 0);
+    let rd = f.ret(2, &[path, 0, 0]);
+    // A write lease: what breaks none.
+    assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
+    let path_only = f.ret(2, &[path, 0o10000000, 0]);
+    assert_eq!(f.ret(3, &[path_only]), 0);
+    assert_eq!(f.ret(2, &[path, 0o302, 0o644]), errno(Errno::EEXIST));
+    assert_eq!(f.ret(2, &[path, 0o200000, 0]), errno(Errno::ENOTDIR));
+    assert_eq!(f.ret(76, &[path, u64::MAX]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(72, &[rd, 1025]), 1);
+    let pending = |f: &mut Fixture| {
+        assert_eq!(f.ret(127, &[DATA + 0x100, 8]), 0);
+        let mut set = [0; 8];
+        f.mem.read(GuestAddr(DATA + 0x100), &mut set).unwrap();
+        u64::from_le_bytes(set)
+    };
+    assert_eq!(pending(&mut f), 0);
+    // A reader's break downgrades it, a writer's takes it away.
+    assert_eq!(f.ret(2, &[path, NONBLOCK, 0]), errno(Errno::EAGAIN));
+    assert_eq!(pending(&mut f), 1 << (SIGIO - 1));
+    assert_eq!(f.ret(72, &[rd, 1025]), 0);
+    assert_eq!(f.ret(2, &[path, NONBLOCK | 1, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    // A downgrade lets readers in, and the writer's break stands.
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(2, &[path, NONBLOCK | 2, 0]), errno(Errno::EAGAIN));
+    let two = f.ret(2, &[path, NONBLOCK, 0]);
+    assert_eq!(f.ret(72, &[two, 1024, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(3, &[two]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    // None left: a writer opens, and truncate works.
+    let rw = f.ret(2, &[path, NONBLOCK | 2, 0]);
+    assert_eq!(f.ret(3, &[rw]), 0);
+    assert_eq!(f.ret(76, &[path, 3]), 0);
+    // A lease of a file opened again through its descriptor, live and
+    // removed.
+    let fd = format!("/proc/self/fd/{rd}");
+    let link = put(&mut f, 0x40, fd.as_bytes());
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(2, &[link, NONBLOCK | 1, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(87, &[path]), 0);
+    assert_eq!(f.ret(2, &[link, NONBLOCK | 1, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    // A wait of lease-break-time seconds takes the lease away.
+    let sysctl = put(&mut f, 0x80, b"/proc/sys/fs/lease-break-time");
+    let seconds = f.ret(2, &[sysctl, 1, 0]);
+    let one = put(&mut f, 0xc0, b"1");
+    assert_eq!(f.ret(1, &[seconds, one, 1]), 1);
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    let late = f.ret(2, &[link, 1, 0]);
+    assert!(late < 100);
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 9]), 0);
+    assert_eq!(f.ret(3, &[late]), 0);
+    // A cancellation ends the wait, as a signal does.
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    f.kernel
+        .cancellation
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(f.ret(2, &[link, 1, 0]), errno(Errno(4)));
 }
 #[test]
 fn syscall_flock_cancel() {

@@ -377,6 +377,10 @@ impl Machine {
     pub(crate) fn leases_enable(&self) -> i32 {
         self.leases_enable.load(Ordering::SeqCst)
     }
+    /// The seconds an opener waits for a lease's break (`lease_break_time`).
+    pub(crate) fn lease_break_time(&self) -> i32 {
+        self.lease_break_time.load(Ordering::SeqCst)
+    }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
         self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
@@ -396,7 +400,7 @@ impl Machine {
             Kernel::PerfEventMlockKb => self.perf_event_mlock_kb(),
             Kernel::PerfEventParanoid => self.perf_event_paranoid(),
             Kernel::LeasesEnable => self.leases_enable(),
-            Kernel::LeaseBreakTime => self.lease_break_time.load(Ordering::SeqCst),
+            Kernel::LeaseBreakTime => self.lease_break_time(),
             _ => self.unprivileged_bpf_disabled(),
         })
     }

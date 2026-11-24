@@ -379,6 +379,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             }
             c.process.signal_mask = c.mem.read_u64(GuestAddr(a[4])).map_err(|_| Errno::EFAULT)?
                 & !((1 << 8) | (1 << 18));
+            crate::userfaultfd::mask_changed(c.process.signal_mask);
         }
         let result = (|| {
             // The epoll descriptor too, as `fdget` takes it (EBADF for `O_PATH`).
@@ -432,6 +433,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             c.process.wait_restore_mask = Some(old_mask);
         } else {
             c.process.signal_mask = old_mask;
+            crate::userfaultfd::mask_changed(c.process.signal_mask);
         }
         result
     })();

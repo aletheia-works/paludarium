@@ -4053,8 +4053,11 @@ impl AddressSpaceData {
                 });
             }
             // A page a `userfaultfd` waits for (`handle_userfault`): the
-            // kernel takes the fault of an instruction, and a system call's
-            // copy is `EFAULT`, as with `UFFD_USER_MODE_ONLY`.
+            // kernel takes the fault of an instruction; a system call's
+            // copy goes to the thread's resolver first ([`faults::resolve`],
+            // with the space unlocked), which waits, and is `EFAULT` only
+            // when it does not (`UFFD_USER_MODE_ONLY`, `UFFD_FEATURE_SIGBUS`,
+            // a released context, a fatal signal).
             if matches!(access, Access::Read | Access::Write | Access::Fetch)
                 && self.userfault_waits(directory, page).is_some()
             {

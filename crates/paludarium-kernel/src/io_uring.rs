@@ -2924,6 +2924,7 @@ fn wait(
             .read_u64(GuestAddr(sigmask))
             .map_err(|_| Errno::EFAULT)?
             & !((1 << 8) | (1 << 18));
+        crate::userfaultfd::mask_changed(c.process.signal_mask);
     }
     let result = loop {
         let ticket = c.files.readiness.token.value();
@@ -2960,6 +2961,7 @@ fn wait(
         c.process.wait_restore_mask = Some(old_mask);
     } else {
         c.process.signal_mask = old_mask;
+        crate::userfaultfd::mask_changed(c.process.signal_mask);
     }
     if ring.completions() != 0 {
         return Ok(());

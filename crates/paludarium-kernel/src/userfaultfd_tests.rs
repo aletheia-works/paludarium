@@ -1309,3 +1309,93 @@ fn a_system_call_s_copy_waits_for_the_page_with_the_space_unlocked() {
     assert_eq!(f.ret(WRITE, &[writer, SRC, 5]), 5);
     assert_eq!(f.ret(READ, &[reader, AREA + PAGE, 5]), errno(Errno::EFAULT));
 }
+
+#[test]
+fn a_copy_under_ppoll_s_temporary_mask_ends_for_a_fatal_signal_it_unblocks() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const READ: u64 = 0;
+    const IOCTL: u64 = 16;
+    const RT_SIGPROCMASK: u64 = 14;
+    const CLONE: u64 = 56;
+    const TGKILL: u64 = 234;
+    const PPOLL: u64 = 271;
+    const THREAD: u64 = 0x50f00;
+    const SIGTERM: u64 = 15;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    // SIGTERM is blocked, but ppoll's mask lets it in.
+    f.mem
+        .write(
+            GuestAddr(DATA + 0x4000),
+            &(1u64 << (SIGTERM - 1)).to_le_bytes(),
+        )
+        .unwrap();
+    assert_eq!(f.ret(RT_SIGPROCMASK, &[0, DATA + 0x4000, 0, 8]), 0);
+    f.mem.write(GuestAddr(DATA + 0x4100), &[0u8; 24]).unwrap();
+    let main_tid = u64::from(f.thread.tid);
+    let pid = u64::from(f.thread.state.pid);
+    let child = f.ret(CLONE, &[THREAD, DATA + 0x7000, 0, 0, 0]);
+    assert!((child as i64) > 0, "{child:#x}");
+    let (mut kernel, mut thread) = f.kernel.take_child().unwrap();
+    let done = AtomicBool::new(false);
+    let (main_kernel, main_thread, mem) = (&mut f.kernel, &mut f.thread, &f.mem);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..300 {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprintln!("the copy never ended");
+            std::process::abort();
+        });
+        scope.spawn(move || {
+            let mut call = |number: u64, args: &[u64]| {
+                thread.cpu.gpr[reg::RAX] = number;
+                let regs = [reg::RDI, reg::RSI, reg::RDX, reg::R10, reg::R8, reg::R9];
+                for (r, v) in regs.iter().zip(args) {
+                    thread.cpu.gpr[*r] = *v;
+                }
+                let reason = ExitReason::Syscall {
+                    rip: GuestAddr(0x1000),
+                };
+                kernel.handle(&mut thread, mem, reason);
+                thread.cpu.gpr[reg::RAX]
+            };
+            let message = DATA + 0x6000;
+            while call(READ, &[fd, message, 32]) as i64 == -11 {
+                std::thread::yield_now();
+            }
+            assert_eq!(call(TGKILL, &[pid, main_tid, SIGTERM]), 0);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Entries of fd -1, which poll passes over, should the copy have
+            // waited on.
+            mem.write(GuestAddr(SRC), &[0xff; PAGE as usize]).unwrap();
+            let copy = DATA + 0x5000;
+            let words: Vec<u8> = [AREA, SRC, PAGE, 0, 0]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            mem.write(GuestAddr(copy), &words).unwrap();
+            call(IOCTL, &[fd, COPY, copy]);
+        });
+        // ppoll's copy of its entries from the registered page waits, with
+        // ppoll's own mask, under which SIGTERM, with no handler, is fatal.
+        let regs = [reg::RDI, reg::RSI, reg::RDX, reg::R10, reg::R8];
+        let args = [AREA, 1, DATA + 0x4100, DATA + 0x4100, 8];
+        main_thread.cpu.gpr[reg::RAX] = PPOLL;
+        for (r, v) in regs.iter().zip(args) {
+            main_thread.cpu.gpr[*r] = v;
+        }
+        let reason = ExitReason::Syscall {
+            rip: GuestAddr(0x1000),
+        };
+        main_kernel.handle(main_thread, mem, reason);
+        done.store(true, Ordering::SeqCst);
+        // The copy failed rather than poll the filled page's entries.
+        assert_eq!(main_thread.cpu.gpr[reg::RAX], errno(Errno::EFAULT));
+    });
+}

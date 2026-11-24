@@ -3553,6 +3553,7 @@ impl Kernel {
             cancellation: inbox.wake_token(),
             inbox,
             group,
+            copies: None,
             processes: self.processes.clone(),
             pending_child: None,
             spawn_memory: child_mem,

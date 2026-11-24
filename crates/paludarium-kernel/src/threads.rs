@@ -2709,6 +2709,7 @@ impl Kernel {
             cancellation: inbox.wake_token(),
             inbox: inbox.clone(),
             group: self.group.clone(),
+            copies: None,
             pending_child: None,
             processes: self.processes.clone(),
             spawn_memory: None,

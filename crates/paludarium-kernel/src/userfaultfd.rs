@@ -582,17 +582,60 @@ pub(crate) struct KernelCopies {
     /// What the thread waits on: its files' readiness.
     pub(crate) hub: Arc<ReadinessHub>,
     pub(crate) host: Arc<dyn paludarium_host::Host>,
-    /// The thread's inbox and signal mask, for the signals that end the
-    /// wait; the wait cannot take them in, nor wake for them, as the inbox's
-    /// wake token stays set until the call returns and takes them in.
+    /// The thread's inbox, for the signals that end the wait (with the
+    /// call's signal mask, [`CALL`]); the wait cannot take them in, nor wake
+    /// for them, as the inbox's wake token stays set until the call returns
+    /// and takes them in.
     pub(crate) inbox: Arc<crate::inbox::SignalInbox>,
-    pub(crate) mask: u64,
     /// Where `RLIMIT_STACK` and `RLIMIT_MEMLOCK` are, and whether the
     /// thread has `CAP_IPC_LOCK`, for a growth, as the kernel's
     /// `stack_limits` reads them for an instruction's.
     pub(crate) processes: Arc<crate::processes::Processes>,
     pub(crate) pid: u32,
-    pub(crate) ipc_lock: bool,
+}
+
+thread_local! {
+    /// The signal mask of the system call the host thread runs, as it is
+    /// now (`ppoll`, `pselect6`, `epoll_pwait`, `io_pgetevents` and
+    /// `io_uring_enter` set a temporary one, under which Linux's copies
+    /// fault too), and whether its thread has `CAP_IPC_LOCK`.
+    static CALL: core::cell::Cell<(u64, bool)> = const { core::cell::Cell::new((0, false)) };
+}
+
+/// A system call starts with `mask` and `ipc_lock`; what was there.
+pub(crate) fn enter_call(mask: u64, ipc_lock: bool) -> (u64, bool) {
+    CALL.with(|call| call.replace((mask, ipc_lock)))
+}
+
+/// What [`enter_call`] returned, back.
+pub(crate) fn leave_call(was: (u64, bool)) {
+    CALL.with(|call| call.set(was));
+}
+
+/// The call's signal mask is now `mask`.
+pub(crate) fn mask_changed(mask: u64) {
+    CALL.with(|call| call.set((mask, call.get().1)));
+}
+
+impl KernelCopies {
+    /// Whether it serves a call of thread `tid` of process `pid` in `mem`,
+    /// with these files, group and inbox: it is kept from call to call.
+    pub(crate) fn serves(
+        &self,
+        mem: &paludarium_mmu::AddressSpace,
+        group: &Arc<crate::ThreadGroup>,
+        hub: &Arc<ReadinessHub>,
+        inbox: &Arc<crate::inbox::SignalInbox>,
+        pid: u32,
+        tid: u32,
+    ) -> bool {
+        self.mem.is_of(mem)
+            && Arc::ptr_eq(&self.group, group)
+            && Arc::ptr_eq(&self.hub, hub)
+            && Arc::ptr_eq(&self.inbox, inbox)
+            && self.pid == pid
+            && self.tid == tid
+    }
 }
 
 impl paludarium_mmu::faults::Resolver for KernelCopies {
@@ -601,7 +644,8 @@ impl paludarium_mmu::faults::Resolver for KernelCopies {
         const RLIMIT_STACK: usize = 3;
         const RLIMIT_MEMLOCK: usize = 8;
         let stack = self.processes.soft_limit(self.pid, RLIMIT_STACK);
-        let lock = if self.ipc_lock {
+        let (_, ipc_lock) = CALL.with(core::cell::Cell::get);
+        let lock = if ipc_lock {
             u64::MAX
         } else {
             self.processes.soft_limit(self.pid, RLIMIT_MEMLOCK) >> 12
@@ -627,7 +671,8 @@ impl paludarium_mmu::faults::Resolver for KernelCopies {
 impl KernelCopies {
     /// `fatal_signal_pending`.
     fn fatal(&self) -> bool {
-        self.group.fatal_pending(&self.inbox, self.mask)
+        self.group
+            .fatal_pending(&self.inbox, CALL.with(core::cell::Cell::get).0)
     }
     fn still_faults(&self, id: u64, access: &Access) -> bool {
         self.mem

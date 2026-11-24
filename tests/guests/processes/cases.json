@@ -441,6 +441,7 @@
     {"name":"generated-changes","binary":"process"},
     {"name":"tmpfs-limits","binary":"process"},
     {"name":"shmem-fault-charge","binary":"process"},
+    {"name":"shmem-populate","binary":"process"},
     {"name":"tmpfs-huge","binary":"process"},
     {"name":"generated-noexec","binary":"process"},
     {"name":"exec-truncated","binary":"process"},

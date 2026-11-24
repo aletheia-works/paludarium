@@ -860,9 +860,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先）があれば `ENOMEM` を返します。書き込めるプライベートなマッピングのページは、
   Linux の `populate_vma_page_range` と同じく書き込んで取り込みます（`FOLL_WRITE`）。
   そこにあるファイルのページは自分だけのコピーになり、そのあとのファイルへの書き込みは
-  見えなくなります。`MAP_POPULATE`、`MAP_LOCKED`、`MCL_CURRENT` の `mlockall`、
-  ロックしたプライベートなマッピングを書き込めるようにする `mprotect` も同じです。
-  `MLOCK_ONFAULT` や `MCL_ONFAULT` のロックは何も取り込みません。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
+  見えなくなります。ほかのマッピングのページは読んで取り込みます（`FOLL_FORCE`）。
+  shmem のファイル（memfd、tmpfs マウントのファイル）のページはそれでファイルのものになり、
+  すぐにそのブロックに数えます。`MAP_POPULATE`（`MAP_NONBLOCK` なし）、`MAP_LOCKED`、
+  `MCL_CURRENT` の `mlockall`、ロックしたマッピングを広げる `mremap` も同じように取り込み
+  ますが（`mm_populate`）、取り込めないページは無視します。そのページでそのマッピングの分を
+  やめるので、tmpfs マウントの大きさを超える `mmap` も、入るページだけで成功します。
+  ロックしたプライベートなマッピングを書き込めるようにする `mprotect` は、ページを書き込んで
+  取り込みます。`MLOCK_ONFAULT` や `MCL_ONFAULT` のロックは何も取り込まず、アクセスの
+  できないマッピング、`memfd_secret` のファイルのもの、`VM_IO` か `VM_PFNMAP` のもの
+  （perf のリング）も取り込みません。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
   （マップしているもの全部が収まらなければ `ENOMEM`）、`MCL_FUTURE` で新しいマッピングを
   ロックします。そのあとの `mmap`、`brk`、広がる `mremap` には、`MAP_LOCKED` と同じく
   空きが要ります（`EAGAIN`。`brk` は区切りを変えません）。`munlockall` はどちらも

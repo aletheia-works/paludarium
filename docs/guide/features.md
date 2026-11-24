@@ -958,10 +958,18 @@ kernel.
   end of its file). A writable private mapping's pages are brought in by
   writing them, as Linux's `populate_vma_page_range` does (`FOLL_WRITE`):
   a page of a file there becomes a copy of its own, which no longer shows
-  the file's later writes. `MAP_POPULATE`, `MAP_LOCKED`, `mlockall` with
-  `MCL_CURRENT` and an `mprotect` that makes a locked private mapping
-  writable do the same; a lock with `MLOCK_ONFAULT` or `MCL_ONFAULT` brings
-  nothing in. `mlockall` locks every mapping with `MCL_CURRENT`
+  the file's later writes. Any other mapping's pages are brought in by
+  reading them (`FOLL_FORCE`), which takes a page of a shmem file (a
+  memfd, a tmpfs mount's file) into the file, so that it counts in its
+  blocks at once. `MAP_POPULATE` (without `MAP_NONBLOCK`), `MAP_LOCKED`,
+  `mlockall` with `MCL_CURRENT` and a growing `mremap` of a locked mapping
+  bring their pages in the same way (`mm_populate`), but ignore a page that
+  cannot be: it ends its mapping's, so that an `mmap` past a tmpfs mount's
+  size still succeeds with the pages that fit. An `mprotect` that makes a
+  locked private mapping writable writes its pages in. A lock with
+  `MLOCK_ONFAULT` or `MCL_ONFAULT` brings nothing in, and nor does a
+  mapping without access, one of a `memfd_secret` file, or one that is
+  `VM_IO` or `VM_PFNMAP` (a perf ring). `mlockall` locks every mapping with `MCL_CURRENT`
   (`ENOMEM` when all that is mapped does not fit) and every new one with
   `MCL_FUTURE`, which `mmap`, `brk` and a growing `mremap` then need room
   for (`EAGAIN`; `brk` keeps the break), as `MAP_LOCKED` does; `munlockall`

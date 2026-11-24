@@ -14894,6 +14894,105 @@ static int tmpfs_huge_case(void) {
     return 0;
 }
 
+/* The shmem-populate case: MAP_POPULATE (without MAP_NONBLOCK), MAP_LOCKED,
+   mlock and the growth of a locked mapping by mremap bring a shared or
+   private mapping's pages of a memfd in, as Linux's mm_populate reads them,
+   so the file counts them at once. On a full tmpfs mount, mmap's population
+   stops at the first page that does not fit and mmap still succeeds, and
+   mlock gives ENOMEM, as __mm_populate's EFAULT is for it. Mounted, as
+   shmem-fault-charge's, in a user and mount namespace of its own. */
+static char sp_base[] = "/tmp/paludarium-shmem-populate-XXXXXX";
+static long sp_map(int fd, long len, int prot, int flags) {
+    char *map = mmap(NULL, len, prot, flags, fd, 0);
+    long blocks = map == MAP_FAILED ? -errno : sf_blocks(fd);
+    if (map != MAP_FAILED) munmap(map, len);
+    return blocks;
+}
+static int sp_memfd(void) {
+    int fd = memfd_create("populate", 0);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return -1;
+    return fd;
+}
+static int sp_inner(const char *m) {
+    printf("mount=%d\n", tl_err(mount("none", m, "tmpfs", 0, "size=8k")));
+    char path[320];
+    snprintf(path, sizeof path, "%s/f", m);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return 80;
+    char *map = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+    printf("populate=%d blocks=%ld\n", map == MAP_FAILED ? -errno : 0, sf_blocks(fd));
+    if (map == MAP_FAILED) return 81;
+    touch("past", map + 2 * 4096, 0);
+    munmap(map, 4 * 4096);
+    close(fd);
+    unlink(path);
+    fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || ftruncate(fd, 4 * 4096)) return 82;
+    map = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) return 83;
+    int locked = tl_err(mlock(map, 4 * 4096));
+    printf("mlock=%d blocks=%ld\n", locked, sf_blocks(fd));
+    munmap(map, 4 * 4096);
+    close(fd);
+    unlink(path);
+    printf("umount=%d\n", tl_err(umount(m)));
+    return 0;
+}
+static int shmem_populate_case(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = on_bus;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, NULL)) return 84;
+    int rw = PROT_READ | PROT_WRITE, fd;
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("populate=%ld\n", sp_map(fd, 4 * 4096, rw, MAP_SHARED | MAP_POPULATE));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("nonblock=%ld\n", sp_map(fd, 4 * 4096, rw, MAP_SHARED | MAP_POPULATE | MAP_NONBLOCK));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("locked=%ld\n", sp_map(fd, 4 * 4096, rw, MAP_SHARED | MAP_LOCKED));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    printf("private=%ld\n", sp_map(fd, 4 * 4096, PROT_READ, MAP_PRIVATE | MAP_POPULATE));
+    close(fd);
+    if ((fd = sp_memfd()) < 0) return 85;
+    char *map = mmap(NULL, 2 * 4096, rw, MAP_SHARED | MAP_LOCKED, fd, 0);
+    if (map == MAP_FAILED) return 86;
+    long before = sf_blocks(fd);
+    char *grown = mremap(map, 2 * 4096, 4 * 4096, MREMAP_MAYMOVE);
+    printf("mremap=%d blocks=%ld %ld\n", grown == MAP_FAILED ? -errno : 0, before, sf_blocks(fd));
+    munmap(grown == MAP_FAILED ? map : grown, 4 * 4096);
+    close(fd);
+    if (!mkdtemp(sp_base)) return 87;
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", sp_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char ids[64];
+        snprintf(ids, sizeof ids, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", ids);
+        snprintf(ids, sizeof ids, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", ids));
+        _exit(sp_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(sp_base) == 0);
+    return 0;
+}
+
 /* The generated-changes case: the path calls that change or go to a file
    the kernel generates in /dev or /proc, by its own path. chdir and fchdir
    make a directory there the working directory, which relative paths and
@@ -36638,6 +36737,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
+    if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();

@@ -7109,6 +7109,61 @@ mod proc_other {
         let own = format!("/proc/{pid}/task/42/status");
         assert_eq!(cap_eff(read(&mut k, &mut t, &m, &own).unwrap()), 0);
     }
+    /// `smaps_rollup` sums every VMA under one `[rollup]` line, for the
+    /// reader's own process and another's, and its open is `ESRCH` once the
+    /// other has no memory left, as Linux's `smaps_rollup_open` finds no
+    /// `mm`.
+    #[test]
+    fn smaps_rollup_sums_the_vmas_and_is_esrch_without_memory() {
+        let (mut k, mut t, m) = setup();
+        let own = String::from_utf8(read(&mut k, &mut t, &m, "/proc/self/smaps_rollup").unwrap())
+            .unwrap();
+        assert!(own.lines().next().unwrap().ends_with(" [rollup]"), "{own}");
+        assert!(
+            own.contains("\nPss_Anon:") && own.ends_with(" kB\n"),
+            "{own}"
+        );
+        let (mut zombie, zt, zm) = fork(&mut k, &mut t, &m);
+        let path = format!("/proc/{}/smaps_rollup", zt.tid);
+        assert!(read(&mut k, &mut t, &m, &path).is_ok());
+        finish(&mut zombie, &zt, &zm, ExitStatus::Exited(0));
+        assert_eq!(
+            read(&mut k, &mut t, &m, &path),
+            Err(Errno(3).to_syscall_return())
+        );
+    }
+    /// A zombie keeps its `pid` and `user` links until it is reaped, as
+    /// Linux's `pidns_get` and `userns_get` take them from its PID and
+    /// credentials, while the others and `pid_for_children`, which need the
+    /// `nsproxy` it gave up, are gone.
+    #[test]
+    fn a_zombie_keeps_its_pid_and_user_namespace_links() {
+        let (mut k, mut t, m) = setup();
+        let link = |k: &mut Kernel, t: &mut Thread, path: &str| {
+            m.write(GuestAddr(DATA), format!("{path}\0").as_bytes())
+                .unwrap();
+            let n = syscall(k, t, &m, 89, [DATA, DATA + 1024, 256, 0, 0, 0]);
+            if n >= 1 << 20 {
+                return Err(n);
+            }
+            let mut target = vec![0; n as usize];
+            m.read(GuestAddr(DATA + 1024), &mut target).unwrap();
+            Ok::<_, u64>(target)
+        };
+        let (mut zombie, zt, zm) = fork(&mut k, &mut t, &m);
+        finish(&mut zombie, &zt, &zm, ExitStatus::Exited(0));
+        let pid = zt.tid;
+        for name in ["pid", "user"] {
+            let own = link(&mut k, &mut t, &format!("/proc/self/ns/{name}"));
+            assert!(own.is_ok(), "{name}");
+            assert_eq!(link(&mut k, &mut t, &format!("/proc/{pid}/ns/{name}")), own);
+        }
+        let enoent = Err(Errno::ENOENT.to_syscall_return());
+        for name in ["net", "mnt", "uts", "pid_for_children"] {
+            let path = format!("/proc/{pid}/ns/{name}");
+            assert_eq!(link(&mut k, &mut t, &path), enoent, "{path}");
+        }
+    }
     /// An undumpable process is readable only with `CAP_SYS_PTRACE` in the
     /// user namespace its program runs in (Linux's `task_still_dumpable`),
     /// not in the one its credentials moved to: after `unshare` of a user

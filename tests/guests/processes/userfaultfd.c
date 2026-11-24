@@ -66,6 +66,7 @@
 #include <sys/mman.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -303,6 +304,45 @@ static void on_segv(int sig, siginfo_t *info, void *context) {
     siglongjmp(refused, 1);
 }
 
+/* /dev/userfaultfd (userfaultfd_misc): a root misc device of mode 0600,
+   whose only operation, USERFAULTFD_IOC_NEW, makes a context of the flags
+   it is given with no capability; and vm.unprivileged_userfaultfd, read
+   alone, as the native run's is the runner's own. */
+static void dev_calls(void) {
+    int dev = open("/dev/userfaultfd", O_RDWR | O_CLOEXEC);
+    printf("dev open: %d\n", dev >= 0);
+    if (dev < 0) return;
+    struct stat st;
+    fstat(dev, &st);
+    printf("dev mode: 0%o uid %u major %u\n", st.st_mode, st.st_uid, major(st.st_rdev));
+    int made = ioctl(dev, _IO(0xAA, 0x00), O_CLOEXEC | O_NONBLOCK);
+    printf("dev new: %d\n", made >= 0);
+    printf("dev new F_GETFL: 0%o\n", fcntl(made, F_GETFL));
+    struct uffdio_api api = {UFFD_API, 0, 0};
+    printf("dev new API: %s\n", err(ioctl(made, UFFDIO_API, &api)));
+    close(made);
+    printf("dev new bad flags: %s\n", err(ioctl(dev, _IO(0xAA, 0x00), 0x10)));
+    printf("dev other ioctl: %s\n", err(ioctl(dev, _IO(0xAA, 0x01), 0)));
+    char byte;
+    printf("dev read: %s\n", err(read(dev, &byte, 1)));
+    printf("dev write: %s\n", err(write(dev, &byte, 1)));
+    close(dev);
+    /* Another user may not open it. */
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(1000, 1000, 1000)) _exit(2);
+        _exit(open("/dev/userfaultfd", O_RDWR) < 0 && errno == EACCES ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("dev other user: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    int sysctl = open("/proc/sys/vm/unprivileged_userfaultfd", O_RDONLY);
+    char text[8] = {0};
+    long n = read(sysctl, text, sizeof text);
+    close(sysctl);
+    printf("sysctl: %ld bytes, a bit %d\n", n, n == 2 && (text[0] == '0' || text[0] == '1') && text[1] == '\n');
+}
+
 /* The calls' errors and their order. */
 static int case_calls(void) {
     printf("bad flags: %s\n", err(uffd(0x10)));
@@ -436,6 +476,7 @@ static int case_calls(void) {
     printf("unregister all: %s\n", err(unreg(fd, base, 8 * PAGE)));
     vma("all", base, base + 2 * PAGE);
     close(fd);
+    dev_calls();
     return 0;
 }
 

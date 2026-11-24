@@ -453,6 +453,18 @@ const FORMS: &[&[u8]] = &[
     &[0xf3, 0x48, 0xa5],
     &[0xf2, 0xa4],
     &[0x64, 0xf3, 0x48, 0xa5],
+    // string stores, once and repeated, forward or, with DF set, back; an
+    // fs override does not apply to rdi
+    &[0xaa],
+    &[0x66, 0xab],
+    &[0xab],
+    &[0x48, 0xab],
+    &[0xf3, 0xaa],
+    &[0xf3, 0x66, 0xab],
+    &[0xf3, 0xab],
+    &[0xf3, 0x48, 0xab],
+    &[0xf2, 0xaa],
+    &[0x64, 0xf3, 0x48, 0xab],
     // div and idiv of a register
     &[0x48, 0xf7, 0xf3],
     &[0xf7, 0xf1],
@@ -668,7 +680,7 @@ fn runs_of_forms_do_what_the_interpreter_does() {
     }
 }
 
-/// Runs `code`, one string move, compiled from `state` and steps the
+/// Runs `code`, one string move or store, compiled from `state` and steps the
 /// interpreter once from the same state, and checks that both ran it once
 /// to the same state and memory. Returns the state.
 fn one_step_of(
@@ -719,6 +731,48 @@ fn a_repeated_move_that_faults_after_an_iteration_ends_its_step_there() {
     let state = one_step_of(&code, &state, &fast, &slow);
     assert_eq!(state.rip, GuestAddr(CODE));
     assert_eq!(state.gpr[reg::RCX], 2);
+    assert_eq!(state.gpr[reg::RDI], DATA + DATA_LEN as u64);
+    // The next iteration faults at once: the code runs nothing.
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let compiled = compiler.compile(&forms(&code)).unwrap();
+    let mut again = state.clone();
+    assert_eq!(
+        compiled.run(&mut again, &fast, fast.code_generation_cached()),
+        0
+    );
+    assert_eq!(again, state);
+    assert!(step(&mut state.clone(), &slow).is_err());
+}
+
+#[test]
+fn a_repeated_store_runs_its_iterations_of_a_step_then_runs_again() {
+    // rep stosb, to the stack.
+    let code = [0xf3, 0xaa];
+    let (fast, slow) = (space(&code, &[0; DATA_LEN]), space(&code, &[0; DATA_LEN]));
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    state.gpr[reg::RAX] = 0x5a;
+    state.gpr[reg::RDI] = STACK - STACK_LEN as u64;
+    state.gpr[reg::RCX] = REP_CHUNK + 100;
+    let state = one_step_of(&code, &state, &fast, &slow);
+    assert_eq!(state.rip, GuestAddr(CODE));
+    assert_eq!(state.gpr[reg::RCX], 100);
+    let state = one_step_of(&code, &state, &fast, &slow);
+    assert_eq!(state.rip, GuestAddr(CODE + 2));
+    assert_eq!(state.gpr[reg::RCX], 0);
+}
+
+#[test]
+fn a_repeated_store_that_faults_after_an_iteration_ends_its_step_there() {
+    // rep stosd to the last 8 bytes of the data and on.
+    let code = [0xf3, 0xab];
+    let (fast, slow) = (space(&code, &[7; DATA_LEN]), space(&code, &[7; DATA_LEN]));
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    state.gpr[reg::RAX] = 0xdead_beef;
+    state.gpr[reg::RDI] = DATA + DATA_LEN as u64 - 8;
+    state.gpr[reg::RCX] = 5;
+    let state = one_step_of(&code, &state, &fast, &slow);
+    assert_eq!(state.rip, GuestAddr(CODE));
+    assert_eq!(state.gpr[reg::RCX], 3);
     assert_eq!(state.gpr[reg::RDI], DATA + DATA_LEN as u64);
     // The next iteration faults at once: the code runs nothing.
     let compiler = NativeCompiler::new(1, false).unwrap();

@@ -125,6 +125,14 @@ CI run produces them afresh on an x86-64 Linux runner.
   `tests/guests/processes/cases.json` lists, so that a case cannot be listed
   and never run.
 
+- `scripts/ci-changes.py --self-test`, which every pull request runs, checks
+  that each differential test of `crates/paludarium-harness/tests` runs
+  somewhere. `diff_programs`, `diff_windows`, `diff_macos` and `diff_jit` run
+  in workflows of their own. Every other one is in `mise run test:diff` and
+  the `differential` jobs of `ci.yml` and `quality.yml`. `diff_events`,
+  `diff_threads` and `diff_files` run the emulator's binary, which those jobs
+  build first (`cargo build -p paludarium`).
+
 - The network cases (`diff_network`) serve the guest from the test itself, on
   127.0.0.1, so that native Linux and the emulator talk to the same server;
   the emulator may reach only that server's port and one that nothing

@@ -523,6 +523,46 @@ static void touch(int pages) {
     for (int i = 0; i < pages; i++) p[(size_t)i * 4096] = 1;
 }
 
+/* Events of this thread on CPU 0 and on CPU 1 (task-clock, page-faults
+   and cpu-migrations), while it runs on CPU 1 and then is moved to CPU 0:
+   each counts only while it runs on its CPU (event_filter_match), but is
+   enabled all the while, and the migration counts on the CPU it comes
+   to. */
+static void per_cpu(void) {
+    static const uint64_t configs[3] = {1, 2, 4};
+    static const char *const names[3] = {"task-clock", "page-faults", "cpu-migrations"};
+    int fds[3][2];
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) {
+            struct attr a = software(configs[i]);
+            a.read_format = FORMAT_ENABLED | FORMAT_RUNNING;
+            fds[i][cpu] = (int)open_event(&a, 0, cpu, -1, 0);
+        }
+    spin();
+    touch(8);
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(0, &one);
+    sched_setaffinity(0, sizeof one, &one);
+    spin();
+    touch(8);
+    uint64_t values[3][2][3];
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) ioctl(fds[i][cpu], IOC_DISABLE, 0);
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++)
+            if (read(fds[i][cpu], values[i][cpu], sizeof values[i][cpu]) != sizeof values[i][cpu])
+                memset(values[i][cpu], 0xff, sizeof values[i][cpu]);
+    for (int i = 0; i < 2; i++)
+        say("%s on cpu 0: counted %d running less %d; on cpu 1: counted %d running less %d", names[i],
+            values[i][0][0] > 0 && values[i][0][0] != (uint64_t)-1, values[i][0][2] < values[i][0][1],
+            values[i][1][0] > 0 && values[i][1][0] != (uint64_t)-1, values[i][1][2] < values[i][1][1]);
+    say("cpu-migrations on cpu 0 %llu on cpu 1 %llu", (unsigned long long)values[2][0][0],
+        (unsigned long long)values[2][1][0]);
+    for (int i = 0; i < 3; i++)
+        for (int cpu = 0; cpu < 2; cpu++) close(fds[i][cpu]);
+}
+
 static int case_software(void) {
     int faults = open_software(2, 0), minor = open_software(5, 0), major = open_software(6, 0);
     int user_faults = open_software(2, EXCLUDE_KERNEL), kernel_faults = open_software(2, EXCLUDE_USER);
@@ -570,6 +610,7 @@ static int case_software(void) {
         say("moved %ld: migrations %d user %d", moved, h - g >= 1, count(user_migrations) - ug == 0);
         for (int i = 0; i < 3; i++) usleep(1000);
         say("kept: migrations %d", count(migrations) - h == 0);
+        per_cpu();
     } else {
         say("fewer than two cpus");
     }
@@ -623,6 +664,25 @@ static int case_gup(void) {
     gup_step("mlock", faults, 3, fresh_pages(32), local);
     gup_step("process_vm_readv", faults, 4, fresh_pages(32), local);
     gup_step("process_vm_writev", faults, 5, fresh_pages(32), local);
+    return 0;
+}
+
+/* The perf-ring-gup case: a ring is VM_IO | VM_PFNMAP, which
+   get_user_pages refuses (check_vma_flags): process_vm_readv and
+   process_vm_writev pin nothing of it (EFAULT), and MADV_POPULATE_READ is
+   EINVAL (FOLL_MADV_POPULATE), while the task's own reads see it. */
+static int case_ring_gup(void) {
+    int fd = open_software(9, 0);
+    char *ring = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    say("open %d mapped %d", fd >= 0, ring != MAP_FAILED);
+    if (ring == MAP_FAILED) return 0;
+    /* The task's own read of the user page: its compat_version, 0. */
+    say("own read: compat %u", ((volatile uint32_t *)ring)[1]);
+    static char local[16];
+    struct iovec mine = {local, sizeof local}, theirs = {ring, sizeof local};
+    say("process_vm_readv %ld", TRY(syscall(SYS_process_vm_readv, getpid(), &mine, 1, &theirs, 1, 0)));
+    say("process_vm_writev %ld", TRY(syscall(SYS_process_vm_writev, getpid(), &mine, 1, &theirs, 1, 0)));
+    say("populate read %ld", TRY(madvise(ring, 4096, 22 /* MADV_POPULATE_READ */)));
     return 0;
 }
 
@@ -1503,6 +1563,98 @@ static void say_record(const uint64_t *record, void *with) {
     }
 }
 
+#define ATTR_BUILD_ID (1ULL << 34)
+#define MISC_MMAP_BUILD_ID (1 << 14)
+
+/* The GNU build ID in the ELF notes of the file at `path` (its first
+   64 KiB), as the guest reads it itself: its size, 0 for none. */
+static int own_build_id(const char *path, unsigned char id[20]) {
+    static unsigned char b[65536];
+    int fd = open(path, O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, b, sizeof b);
+    if (fd >= 0) close(fd);
+    if (n < 64 || memcmp(b, "\x7f" "ELF", 4) || b[4] != 2) return 0;
+    uint64_t phoff;
+    uint16_t phnum;
+    memcpy(&phoff, b + 32, 8);
+    memcpy(&phnum, b + 56, 2);
+    for (unsigned i = 0; i < phnum && phoff + (i + 1) * 56 <= (uint64_t)n; i++) {
+        const unsigned char *ph = b + phoff + i * 56;
+        uint32_t type;
+        uint64_t off, size;
+        memcpy(&type, ph, 4);
+        memcpy(&off, ph + 8, 8);
+        memcpy(&size, ph + 32, 8);
+        if (type != 4 || off + size > (uint64_t)n) continue;
+        for (uint64_t at = off; at + 12 <= off + size;) {
+            uint32_t namesz, descsz, kind;
+            memcpy(&namesz, b + at, 4);
+            memcpy(&descsz, b + at + 4, 4);
+            memcpy(&kind, b + at + 8, 4);
+            uint64_t desc = at + 12 + ((namesz + 3) & ~3u);
+            if (kind == 3 && namesz == 4 && !memcmp(b + at + 12, "GNU", 4) && descsz && descsz <= 20) {
+                memcpy(id, b + desc, descsz);
+                return (int)descsz;
+            }
+            at = desc + ((descsz + 3) & ~3u);
+        }
+    }
+    return 0;
+}
+
+/* What build_ids compares its MMAP2 records with. */
+struct build_ids {
+    char *elf, *text;
+    unsigned char id[20];
+    int size;
+    struct stat text_stat;
+};
+
+static void see_build_id(const uint64_t *record, void *with) {
+    struct build_ids *b = with;
+    if ((uint32_t)record[0] != RECORD_MMAP2) return;
+    char *at = (char *)record[2];
+    unsigned misc = (unsigned)(record[0] >> 32) & 0xffff;
+    const unsigned char *bytes = (const unsigned char *)(record + 5);
+    if (at == b->elf)
+        say("build id: elf misc %d size %d zeros %d match %d", !!(misc & MISC_MMAP_BUILD_ID), bytes[0],
+            !bytes[1] && !bytes[2] && !bytes[3], b->size && bytes[0] == b->size && !memcmp(bytes + 4, b->id, b->size));
+    else if (at == b->text) {
+        const uint32_t *words = (const uint32_t *)bytes;
+        say("build id: text misc %d device %d inode %d", !!(misc & MISC_MMAP_BUILD_ID),
+            words[0] == major(b->text_stat.st_dev) && words[1] == minor(b->text_stat.st_dev),
+            *(const uint64_t *)(words + 2) == (uint64_t)b->text_stat.st_ino);
+    }
+}
+
+/* With build_id, an MMAP2 record of an ELF file gives its GNU build ID in
+   place of the device and inode (PERF_RECORD_MISC_MMAP_BUILD_ID): of the
+   guest's own file, mapped again, whose first page its execve read into
+   the page cache, as build_id_parse_nofault reads no other; and one of
+   another file gives its device and inode. */
+static void build_ids(void) {
+    struct build_ids b;
+    memset(&b, 0, sizeof b);
+    b.size = own_build_id("/proc/self/exe", b.id);
+    say("build id: own %d", b.size);
+    void *page;
+    int fd = open_side_band(0, -1, ATTR_MMAP2 | ATTR_MMAP_DATA | ATTR_BUILD_ID, &page);
+    say("build id: open %d", fd >= 0);
+    if (fd < 0) return;
+    int self = open("/proc/self/exe", O_RDONLY);
+    char path[] = "/tmp/perf-build-id-XXXXXX";
+    int text = mkstemp(path);
+    write(text, "not an ELF\n", 11);
+    fstat(text, &b.text_stat);
+    ioctl(fd, IOC_ENABLE, 0);
+    b.elf = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, self, 0);
+    b.text = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, text, 0);
+    ioctl(fd, IOC_DISABLE, 0);
+    uint64_t tail = 0;
+    each_record(page, &tail, see_build_id, &b);
+    unlink(path);
+}
+
 static int case_side_band(void) {
     struct expected e;
     memset(&e, 0, sizeof e);
@@ -1575,6 +1727,7 @@ static int case_side_band(void) {
     e.mmap_records = 0;
     each_record(exec_only, &tail, say_record, &e);
     say("exec only records %d", e.mmap_records);
+    build_ids();
     return 0;
 }
 
@@ -1698,6 +1851,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-prctl")) return case_prctl();
     if (!strcmp(mode, "perf-inherit")) return case_inherit();
     if (!strcmp(mode, "perf-software")) return case_software();
+    if (!strcmp(mode, "perf-ring-gup")) return case_ring_gup();
     if (!strcmp(mode, "perf-gup")) return case_gup();
     if (!strcmp(mode, "perf-mmap")) return case_mmap();
     if (!strcmp(mode, "perf-output")) return case_output();

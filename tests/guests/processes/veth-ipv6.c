@@ -11,7 +11,9 @@
    on an end takes them too, and on again makes them; an end whose MTU is
    below 1280 has none. The addresses and
    routes are dumped (IPv6's, of the ends), and what RTNLGRP_IPV6_IFADDR
-   and RTNLGRP_IPV6_ROUTE hear is shown in its order. */
+   and RTNLGRP_IPV6_ROUTE hear is shown in its order; as vb comes up,
+   each device's in its order, as vb's address and va's carrier are taken
+   by two work queues, which run in either order. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -280,12 +282,15 @@ static void dump(int fd, unsigned short type, const char *label) {
     }
     printf("%s: %s: no end\n", side, label);
 }
-/* Prints what the member `watch` heard since, in its order. */
-static void heard(int watch, const char *label) {
+/* Prints what the member `watch` heard since, in its order; or, where
+   `by_device`, each device's in its order, the devices by index. */
+static void heard_as(int watch, const char *label, int by_device) {
     static unsigned char buf[65536];
+    static char lines[256][200];
+    int count = 0, lost = 0;
     for (;;) {
         long n = recv(watch, buf, sizeof buf, MSG_DONTWAIT);
-        if (n <= 0) return;
+        if (n <= 0) break;
         for (long at = 0; at + (long)sizeof(struct nl_header) <= n;) {
             const struct nl_header *h = (const void *)(buf + at);
             if (h->len < sizeof *h || at + h->len > n) break;
@@ -294,12 +299,35 @@ static void heard(int watch, const char *label) {
             int index;
             memcpy(&index, body + 4, 4);
             if (describe(h, line, sizeof line) &&
-                (h->type == RTM_NEWROUTE || h->type == RTM_DELROUTE || index >= A_INDEX))
-                printf("%s: %s: %s\n", side, label, line);
+                (h->type == RTM_NEWROUTE || h->type == RTM_DELROUTE || index >= A_INDEX)) {
+                if (!by_device)
+                    printf("%s: %s: %s\n", side, label, line);
+                else if (count < 256)
+                    snprintf(lines[count++], sizeof lines[0], "%s", line);
+                else
+                    lost++;
+            }
             at += (h->len + 3) & ~3u;
         }
     }
+    if (lost) printf("%s: %s: %d more not shown\n", side, label, lost);
+    /* What a line's device is: its "dev=" number. */
+    long devices[256];
+    for (int i = 0; i < count; i++) {
+        const char *dev = strstr(lines[i], "dev=");
+        devices[i] = dev ? strtol(dev + 4, NULL, 10) : 0;
+    }
+    for (long last = -1;;) {
+        long next = -1;
+        for (int i = 0; i < count; i++)
+            if (devices[i] > last && (next < 0 || devices[i] < next)) next = devices[i];
+        if (next < 0) break;
+        for (int i = 0; i < count; i++)
+            if (devices[i] == next) printf("%s: %s: %s\n", side, label, lines[i]);
+        last = next;
+    }
 }
+static void heard(int watch, const char *label) { heard_as(watch, label, 0); }
 /* A member of RTNLGRP_LINK and RTNLGRP_IPV6_ROUTE that the waits below
    read, apart from what `heard` shows. */
 static int events = -1;
@@ -438,13 +466,20 @@ int main(int argc, char **argv) {
     set_up(ctl, 1, "up lo");
     drain();
     set_up(ctl, A_INDEX, "up va");
+    /* va's permanent address takes its prefix route, without a carrier
+       (RTNH_F_LINKDOWN), as it comes up. */
+    heard(watch, "heard");
     set_up(ctl, B_INDEX, "up vb");
     carrier(links, A_INDEX);
     /* vb's address, not checked, is done in Linux's work queue. */
     wait_for("fe80::ff:fe00:b", 0, "vb's link-local address");
     dump(ctl, RTM_GETADDR, "addresses, up");
     dump(ctl, RTM_GETROUTE, "routes, up");
-    heard(watch, "heard");
+    /* That address is done by addrconf_dad_work on addrconf_wq, and va's
+       carrier made ready by linkwatch_work on system_dfl_wq; both are
+       queued as vb comes up and run once its request is done, in no order
+       Linux keeps. So each device's is shown in its order. */
+    heard_as(watch, "heard", 1);
     wait_for("fe80::ff:fe00:a", 0, "va's link-local address");
     dump(ctl, RTM_GETADDR, "addresses, checked");
     dump(ctl, RTM_GETROUTE, "routes, checked");

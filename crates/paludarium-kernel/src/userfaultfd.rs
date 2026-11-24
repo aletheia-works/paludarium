@@ -426,18 +426,23 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }
 
-/// `userfaultfd(flags)`, as Linux checks it: one that also takes the
-/// kernel's own faults needs `CAP_SYS_PTRACE`, as
-/// `vm.unprivileged_userfaultfd` is 0 (`EPERM`), before its flags are
+/// `userfaultfd(flags)`, as Linux checks it (`userfaultfd_syscall_allowed`):
+/// one that also takes the kernel's own faults needs `CAP_SYS_PTRACE` unless
+/// `vm.unprivileged_userfaultfd` is 1 (`EPERM`), before its flags are
 /// checked (`EINVAL`).
 pub(crate) fn sys_userfaultfd(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    outcome(create(c, a[0] as u32))
+    let flags = a[0] as u32;
+    if flags & USER_MODE_ONLY == 0
+        && !c.process.credentials.capable(CAP_SYS_PTRACE)
+        && !c.processes.sysctls.unprivileged_userfaultfd()
+    {
+        return outcome(Err(Errno::EPERM));
+    }
+    outcome(create(c, flags))
 }
 
+/// `new_userfaultfd`: a context of `flags` (`EINVAL` for any other).
 fn create(c: &mut Context<'_>, flags: u32) -> Result<u64, Errno> {
-    if flags & USER_MODE_ONLY == 0 && !c.process.credentials.capable(CAP_SYS_PTRACE) {
-        return Err(Errno::EPERM);
-    }
     if flags & !(O_CLOEXEC | O_NONBLOCK | USER_MODE_ONLY) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -709,14 +714,87 @@ fn hand_over(
     }
 }
 
+/// `USERFAULTFD_IOC_NEW`, `_IO(0xAA, 0x00)`.
+const IOC_NEW: u32 = 0xaa00;
+
+/// An open `/dev/userfaultfd` (`userfaultfd_misc`), whose only operation is
+/// its ioctl ([`ioctl`]): whoever may open it, as its mode allows, makes
+/// contexts that take the kernel's faults too, with no capability. It has
+/// no `read` or `write` (`EINVAL`), and seeks nowhere (`noop_llseek`).
+pub(crate) struct Device {
+    flags: AtomicU32,
+}
+
+impl Device {
+    pub(crate) fn new(flags: u32) -> Self {
+        Self {
+            flags: AtomicU32::new(flags & !O_CLOEXEC),
+        }
+    }
+}
+
+impl FileHandle for Device {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn read_at(&self, _: u64, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn write_at(&self, _: u64, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+        Ok(0)
+    }
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(crate::devices::stat(crate::devices::Entry::Userfaultfd))
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::SeqCst)
+    }
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.flags.store(
+            (self.flags() & 3) | (flags & !3 & !O_CLOEXEC),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
+    /// No `poll`: `DEFAULT_POLLMASK`.
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        Ok((crate::events::IN | crate::events::OUT, 1, 1))
+    }
+}
+
 /// An ioctl of a context, if `file` is one's (`userfaultfd_ioctl`): any but
-/// `UFFDIO_API` is `EINVAL` before it, as is one it does not know.
+/// `UFFDIO_API` is `EINVAL` before it, as is one it does not know. Of
+/// `/dev/userfaultfd` (`userfaultfd_dev_ioctl`), `USERFAULTFD_IOC_NEW` makes
+/// a context of the flags in the low 32 bits of `arg`, as `new_userfaultfd`
+/// takes an `int`, and any other is `EINVAL`.
 pub(crate) fn ioctl(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     cmd: u64,
     arg: u64,
 ) -> Option<Result<u64, Errno>> {
+    if file.as_any().is_some_and(|any| any.is::<Device>()) {
+        return Some(if cmd as u32 == IOC_NEW {
+            create(c, arg as u32)
+        } else {
+            Err(Errno::EINVAL)
+        });
+    }
     let context = Arc::clone(&of(file)?.context);
     let cmd = cmd as u32;
     if cmd != UFFDIO_API && !context.initialized() {

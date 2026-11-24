@@ -1,5 +1,6 @@
 //! `/dev`: the character devices null, zero, full, random and urandom, each
-//! a kernel object, the links into `/proc/self/fd` that Linux systems have
+//! a kernel object, and `userfaultfd` ([`crate::userfaultfd::Device`]), the
+//! links into `/proc/self/fd` that Linux systems have
 //! there (`fd`, `stdin`, `stdout`, `stderr`), and the pseudo-terminals'
 //! `ptmx` and devpts directory `pts` ([`crate::pty`]).
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat, Host};
@@ -36,11 +37,20 @@ pub(crate) enum Entry {
     Mqueue,
     /// A name in `/dev/mqueue` ([`crate::mqueue::mounted_name`]).
     Queue,
+    /// `/dev/userfaultfd`, a misc device (`userfaultfd_misc`).
+    Userfaultfd,
 }
+
+/// The misc devices' major number (`MISC_MAJOR`).
+const MISC_MAJOR: u64 = 10;
+/// `/dev/userfaultfd`'s minor number: Linux gives it one at boot
+/// (`MISC_DYNAMIC_MINOR`), which differs from kernel to kernel, so nothing
+/// should depend on this one.
+const USERFAULTFD_MINOR: u64 = 122;
 /// The names in `/dev`, sorted as it lists them. Each has the inode number
 /// two more than its place here, and `/dev` itself has 1, so that `stat` and
 /// `getdents` agree.
-const NAMES: [(&[u8], Entry); 12] = [
+const NAMES: [(&[u8], Entry); 13] = [
     (b"fd", Entry::Link(b"/proc/self/fd")),
     (b"full", Entry::Device(Kind::Full)),
     (b"mqueue", Entry::Mqueue),
@@ -52,6 +62,7 @@ const NAMES: [(&[u8], Entry); 12] = [
     (b"stdin", Entry::Link(b"/proc/self/fd/0")),
     (b"stdout", Entry::Link(b"/proc/self/fd/1")),
     (b"urandom", Entry::Device(Kind::Urandom)),
+    (b"userfaultfd", Entry::Userfaultfd),
     (b"zero", Entry::Device(Kind::Zero)),
 ];
 const DIRECTORY_INODE: u64 = 1;
@@ -139,6 +150,16 @@ pub(crate) fn stat(entry: Entry) -> FileStat {
             ..crate::pty::ptmx_stat(devpts)
         },
         Entry::Pts => crate::pty::directory_stat(),
+        // Root's, 0600 as devtmpfs makes a misc device with no mode of its
+        // own: whoever may open it makes contexts that take the kernel's
+        // faults.
+        Entry::Userfaultfd => FileStat {
+            inode: inode(entry),
+            mode: 0o020_600,
+            links: 1,
+            rdev: MISC_MAJOR << 8 | USERFAULTFD_MINOR,
+            ..FileStat::default()
+        },
         // A slave's own, which `crate::pty::slave_stat` gives; the
         // queues' own, which `crate::mqueue` gives.
         Entry::Slave(_) | Entry::Mqueue | Entry::Queue => FileStat::default(),

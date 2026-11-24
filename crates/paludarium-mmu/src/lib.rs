@@ -769,6 +769,14 @@ pub struct Usage {
     /// (`Pss`), and that of the dirty pages (`Pss_Dirty`).
     pub pss: u64,
     pub pss_dirty: u64,
+    /// [`Usage::pss`] split by what each page is, as `smaps_account` sums
+    /// it for `smaps_rollup`: anonymous (`Pss_Anon`), shmem's, a page of
+    /// shared memory of no file, a shmem file or System V shared memory
+    /// (Linux's `PageSwapBacked`, `Pss_Shmem`), or another file's
+    /// (`Pss_File`).
+    pub pss_anon: u64,
+    pub pss_file: u64,
+    pub pss_shmem: u64,
 }
 
 impl Usage {
@@ -1484,6 +1492,18 @@ pub enum Placement {
     Exactly(GuestAddr),
     /// At the hint if it is free, else wherever there is room.
     Near(Option<GuestAddr>),
+    /// As `Near`, but where there is room the mapping is placed `offset`
+    /// past a multiple of `size` (a power of two), as Linux's
+    /// `shmem_get_unmapped_area` places a mapping of a file that may have
+    /// huge folios: unless it is shorter than `size`, starts at an
+    /// offset into its first `size` and ends within the second, or is
+    /// placed so already. Without room for `size` more it goes where
+    /// `Near` would.
+    Aligned {
+        hint: Option<GuestAddr>,
+        size: u64,
+        offset: u64,
+    },
 }
 
 /// What a mapping [`AddressSpace::map_backed`] makes shows.
@@ -2823,6 +2843,27 @@ impl AddressSpaceData {
             .any(|(_, mapping)| mapping.prot.contains(Prot::EXEC))
     }
 
+    /// Whether `get_user_pages` refuses the page, as Linux's
+    /// `check_vma_flags` does with `-EFAULT`: a mapping of no pages
+    /// (`VM_IO | VM_PFNMAP`, a `perf` ring's) or a `memfd_secret` file's
+    /// (`vma_is_secretmem`), with `FOLL_FORCE` or not.
+    fn gup_refused(&self, page: u64) -> bool {
+        self.shared_at(page)
+            .and_then(|shared| shared.pages.source.as_ref())
+            .is_some_and(|source| {
+                source.secret() || source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0
+            })
+    }
+    /// Whether a page of `[start, end)` is one `get_user_pages` refuses
+    /// ([`Self::gup_refused`]): the shared mappings that overlap it, as
+    /// they never overlap each other.
+    fn gup_refused_in(&self, start: u64, end: u64) -> bool {
+        self.shared
+            .range(..end)
+            .rev()
+            .take_while(|(_, shared)| shared.end > start)
+            .any(|(&from, _)| self.gup_refused(from.max(start)))
+    }
     fn shared_at(&self, page: u64) -> Option<&SharedMapping> {
         self.shared
             .range(..=page)
@@ -3275,6 +3316,19 @@ impl AddressSpaceData {
                 usage.pss += pss;
                 if dirty {
                     usage.pss_dirty += pss;
+                }
+                let swap_backed = match self.shared_at(page) {
+                    Some(shared) => shared.pages.source.as_ref().is_none_or(|s| s.shmem_file()),
+                    None => self
+                        .backing_at(page)
+                        .is_some_and(|backing| backing.source.shmem_file()),
+                };
+                if anonymous {
+                    usage.pss_anon += pss;
+                } else if swap_backed {
+                    usage.pss_shmem += pss;
+                } else {
+                    usage.pss_file += pss;
                 }
                 match (maps >= 2, dirty) {
                     (true, false) => usage.shared_clean += 1,
@@ -4710,6 +4764,39 @@ impl AddressSpaceData {
             start = m.end().checked_next_multiple_of(align)?;
         }
         (start.checked_add(len)? <= limit).then_some(start)
+    }
+    /// Where a mapping of `len` bytes with no hint goes `offset` past a
+    /// multiple of `size` ([`Placement::Aligned`]): the free area
+    /// [`Self::find_free`] gives, or one found for `size` less a page more
+    /// and moved up to the offset (`shmem_get_unmapped_area`). `None`
+    /// where the ordinary choice has no room either.
+    fn aligned_area(&self, len: u64, size: u64, offset: u64) -> Option<u64> {
+        let len = GuestAddr(len).page_align_up()?.0;
+        let addr = self.find_free(len)?;
+        if len < size
+            || (offset != 0 && offset.saturating_add(len) < 2 * size)
+            || addr & (size - 1) == offset
+        {
+            return Some(addr);
+        }
+        let Some(inflated) = len
+            .checked_add(size - PAGE_SIZE)
+            .and_then(|wide| self.find_free(wide))
+        else {
+            return Some(addr);
+        };
+        let within = inflated & (size - 1);
+        let mut at = inflated - within + offset;
+        if within > offset {
+            at += size;
+        }
+        Some(
+            if at > (USER_ADDRESS_LIMIT - PAGE_SIZE).saturating_sub(len) {
+                addr
+            } else {
+                at
+            },
+        )
     }
     fn find_free(&self, len: u64) -> Option<u64> {
         if let Some(base) = self.bottom_up {
@@ -7523,6 +7610,22 @@ impl MemoryView {
         }
         Some(vma)
     }
+    /// The file of the VMA [`Self::vma_from`] gives for `addr` (Linux's
+    /// `vm_file`), for reading it as perf's `build_id_parse_nofault` does;
+    /// `None` for a VMA of no file of its own.
+    #[must_use]
+    pub fn vma_source(&self, addr: u64) -> Option<Arc<dyn PageSource>> {
+        let data = self.data.upgrade()?;
+        let _serialization = self
+            .serialization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (vma, source) = data
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .vma_from(addr)?;
+        vma.file.filter(|file| file.source).and(source)
+    }
     /// Runs `f` on the space, if it still lives, under its locks.
     fn with_data<T>(&self, f: impl FnOnce(&AddressSpaceData) -> T) -> Option<T> {
         let data = self.data.upgrade()?;
@@ -7543,7 +7646,9 @@ impl MemoryView {
     /// Copies the space's memory at `addr` into `buf`, as Linux's
     /// `process_vm_readv` pins another task's pages: page by page, up to the
     /// first page that is not mapped with `PROT_READ` (`VM_READ`, which
-    /// `PROT_WRITE` or `PROT_EXEC` alone does not give) or does not read.
+    /// `PROT_WRITE` or `PROT_EXEC` alone does not give), that
+    /// `get_user_pages` refuses (a `perf` ring's, a `memfd_secret` file's),
+    /// or that does not read.
     /// Its faults are through `get_user_pages` ([`faults::through_gup`]).
     /// How many bytes were copied, or `None` once the space is gone.
     #[must_use]
@@ -7558,6 +7663,7 @@ impl MemoryView {
                     .mapping_at(page)
                     .is_some_and(|m| m.prot.contains(Prot::READ));
                 if !readable
+                    || data.gup_refused(page)
                     || data
                         .read(GuestAddr(page + offset as u64), &mut buf[range.clone()])
                         .is_err()
@@ -7571,8 +7677,9 @@ impl MemoryView {
     }
     /// Copies `buf` into the space at `addr`, as Linux's
     /// `process_vm_writev` pins another task's pages for writing: page by
-    /// page, up to the first page that may not be written. Its faults are
-    /// through `get_user_pages` ([`faults::through_gup`]). How many bytes
+    /// page, up to the first page that may not be written or that
+    /// `get_user_pages` refuses (a `perf` ring's, a `memfd_secret` file's).
+    /// Its faults are through `get_user_pages` ([`faults::through_gup`]). How many bytes
     /// were copied, or `None` once the space is gone.
     #[must_use]
     pub fn write_pages(&self, addr: u64, buf: &[u8]) -> Option<usize> {
@@ -7588,6 +7695,9 @@ impl MemoryView {
         let mut copied = 0;
         for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
             let at = GuestAddr(page + offset as u64);
+            if guard.gup_refused(page) {
+                break;
+            }
             match guard.write_with(at, &buf[range.clone()], Access::Write) {
                 Ok(first) => {
                     if first {
@@ -7603,17 +7713,20 @@ impl MemoryView {
     /// Copies the space's memory at `addr` into `buf` as `ptrace` reads it
     /// (Linux's `access_remote_vm` with `FOLL_FORCE`): page by page, any
     /// mapped page whatever its protection, up to the first that is not
-    /// mapped or is a guard. How many bytes were copied, or `None` once the
-    /// space is gone.
+    /// mapped, is a guard, or that `get_user_pages` refuses (a `perf`
+    /// ring's, a `memfd_secret` file's: `access_remote_vm` then copies
+    /// nothing, as neither has `vm_ops->access`). How many bytes were
+    /// copied, or `None` once the space is gone.
     #[must_use]
     pub fn read_forced(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
         self.with_data(|data| {
             let mut copied = 0;
             for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
                 let at = GuestAddr(page + offset as u64);
-                if data
-                    .read_with(at, &mut buf[range.clone()], Access::Dump)
-                    .is_err()
+                if data.gup_refused(page)
+                    || data
+                        .read_with(at, &mut buf[range.clone()], Access::Dump)
+                        .is_err()
                 {
                     break;
                 }
@@ -7627,7 +7740,9 @@ impl MemoryView {
     /// private page whatever its protection, which gets a copy of its own,
     /// and a shared one only if it may be written. The store moves the code
     /// generation on as any store does, so a breakpoint written into code
-    /// is seen. How many bytes were copied, or `None` once the space is gone.
+    /// is seen. A page `get_user_pages` refuses ends it, as in
+    /// [`Self::read_forced`]. How many bytes were copied, or `None` once
+    /// the space is gone.
     #[must_use]
     pub fn write_forced(&self, addr: u64, buf: &[u8]) -> Option<usize> {
         let data = self.data.upgrade()?;
@@ -7639,6 +7754,9 @@ impl MemoryView {
         let mut copied = 0;
         for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
             let at = GuestAddr(page + offset as u64);
+            if guard.gup_refused(page) {
+                break;
+            }
             match guard.write_with(at, &buf[range.clone()], Access::ForceWrite) {
                 Ok(first) => {
                     if first {
@@ -8062,7 +8180,7 @@ impl AddressSpace {
                 data.map(Some(at), len, prot, kind)?
             }
             Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
-            Placement::Near(hint) => {
+            Placement::Near(hint) | Placement::Aligned { hint, .. } => {
                 // A hint within the guard gap below a mapping that grows
                 // down is not taken (`vm_start_gap`).
                 let hint = hint.filter(|hint| {
@@ -8073,7 +8191,13 @@ impl AddressSpace {
                 });
                 match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
                     Some(at) => at,
-                    None => data.map(None, len, prot, kind)?,
+                    None => match placement {
+                        Placement::Aligned { size, offset, .. } => {
+                            let at = data.aligned_area(len, size, offset);
+                            data.map(at.map(GuestAddr), len, prot, kind)?
+                        }
+                        _ => data.map(None, len, prot, kind)?,
+                    },
                 }
             }
         };
@@ -8734,6 +8858,13 @@ impl AddressSpace {
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
     }
+    /// Whether `get_user_pages` refuses a page of `[start, end)`
+    /// (`check_vma_flags`): one of a mapping of no pages (`VM_IO |
+    /// VM_PFNMAP`, a `perf` ring's) or of a `memfd_secret` file.
+    #[must_use]
+    pub fn refuses_gup(&self, start: u64, end: u64) -> bool {
+        self.locked().gup_refused_in(start, end)
+    }
     /// The shared mappings of the space, by address.
     #[must_use]
     pub fn shared_fragments(&self) -> Vec<SharedFragment> {
@@ -9273,6 +9404,60 @@ mod tests {
             .read_for_dump(GuestAddr(at.0 + 300), &mut buf)
             .unwrap();
         assert_eq!(buf, [300, 301, 302, 303].map(pattern));
+    }
+
+    #[test]
+    fn get_user_pages_refuses_a_ring_of_no_pages_and_a_secret_file() {
+        /// A `perf` ring's pages (`VM_IO | VM_PFNMAP`) or a `memfd_secret`
+        /// file's.
+        struct Refused(bool);
+        impl PageSource for Refused {
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+                buf.fill(7);
+                Ok(buf.len())
+            }
+            fn secret(&self) -> bool {
+                self.0
+            }
+            fn vma_flags(&self, flags: u64) -> u64 {
+                if self.0 {
+                    flags
+                } else {
+                    flags | vm::IO | vm::PFNMAP
+                }
+            }
+        }
+        for secret in [false, true] {
+            let space = AddressSpace::new();
+            let at = space
+                .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+                .unwrap();
+            let pages = SharedPages::new().with_source(Arc::new(Refused(secret)));
+            space
+                .share_pages(at, 2 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+                .unwrap();
+            // The space's own accesses reach it, as the task's do.
+            assert_eq!(byte(&space, at.0 + 1), 7);
+            assert!(space.refuses_gup(at.0 + PAGE_SIZE, at.0 + 2 * PAGE_SIZE));
+            // A range that only ends in it is refused too.
+            assert!(space.refuses_gup(at.0 - PAGE_SIZE, at.0 + 1));
+            assert!(!space.refuses_gup(at.0 - PAGE_SIZE, at.0));
+            let view = space.view();
+            let mut buf = [0u8; 8];
+            // `process_vm_readv` and `process_vm_writev` pin nothing of it;
+            // `ptrace`'s `FOLL_FORCE` does not get past it either.
+            assert_eq!(view.read_pages(at.0, &mut buf), Some(0));
+            assert_eq!(view.write_pages(at.0, &buf), Some(0));
+            assert_eq!(view.read_forced(at.0, &mut buf), Some(0));
+            assert_eq!(view.write_forced(at.0, &buf), Some(0));
+        }
+        // Anonymous shared memory is no such mapping.
+        let space = AddressSpace::new();
+        let at = space
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        assert!(!space.refuses_gup(at.0, at.0 + PAGE_SIZE));
+        assert_eq!(space.view().read_pages(at.0, &mut [0u8; 8]), Some(8));
     }
 
     #[test]

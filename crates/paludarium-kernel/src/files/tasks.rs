@@ -111,8 +111,9 @@ impl Task {
         !self.view.zombie
     }
     /// It still has what a task gives up at its exit: memory, descriptors,
-    /// directories and namespaces. A zombie process does not, nor a leader
-    /// that ended before its other threads.
+    /// directories and the namespaces of its `nsproxy` (not its PID and user
+    /// ones, which it keeps until it is reaped, [`namespace`]). A zombie
+    /// process does not, nor a leader that ended before its other threads.
     fn holds(&self) -> bool {
         self.live() && !self.gone
     }

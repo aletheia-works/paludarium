@@ -45,9 +45,10 @@ verified.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used. A
-  program's own segments and its interpreter's are named by the path it was
-  started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  program's own segments and its interpreter's are named by the path the
+  file had when it was started, with its symbolic links resolved and
+  `(deleted)` once nothing links it, but not after a rename, which Linux
+  follows. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
@@ -1041,9 +1042,12 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
-  `EINVAL`, where Linux takes a read or write lease and signals its holder
-  when another open or truncate breaks it.
+- **File leases, in part**: an open or a truncate that conflicts with a
+  lease does not break it yet, where Linux's `__break_lease` signals the
+  holder and makes the opener wait up to `/proc/sys/fs/lease-break-time`
+  seconds (or fail with `EWOULDBLOCK` under `O_NONBLOCK`), then takes the
+  lease away or makes it a read lease. Delegations (`F_GETDELEG` and
+  `F_SETDELEG`) are `EINVAL`.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes, as no file system here
   reports errors. Linux's ext4 reports them, and since 7.0 its XFS, Btrfs,
@@ -1355,8 +1359,8 @@ verified.
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. Its `NT_FILE`
   note names a mapped file by the path it had when it was mapped, and the
-  program by the path it was started by, where Linux follows a rename and
-  resolves symbolic links.
+  program by the path it had when it was started (resolved, `(deleted)`
+  once removed), where Linux follows a rename.
 - **Memory limit**: a write beyond the limit ends the process that made it,
   where Linux's OOM killer picks the process using the most memory.
 - **The native JIT**: it is experimental and off unless `--jit` asks for it,

@@ -132,6 +132,7 @@ mod linux {
         // Linux writes the core the cases read only with the kernel's
         // default core_pattern, which CI sets.
         if mode == "core-dump"
+            || mode == "exec-names"
             || mode == "core-dump-faults"
             || mode == "core-mappings"
             || mode == "core-credentials"
@@ -213,10 +214,13 @@ mod linux {
             // which reads a child's stat as another user, and the pagemap
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
-            // on its own mounts, as the emulator's guest starts as root.
+            // on its own mounts, the file-leases case, which writes
+            // fs.leases-enable and becomes an unprivileged user, as the
+            // emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
+                    | "file-leases"
                     | "permissions"
                     | "setuid"
                     | "signal-permissions"
@@ -648,6 +652,7 @@ mod linux {
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
+        processes_file_leases => ("file-leases","process"),
         processes_smaps_flags => ("smaps-flags","process"),
         processes_mrelease_fatal => ("mrelease-fatal","process"),
         processes_madvise_guard => ("madvise-guard","process"),
@@ -907,6 +912,7 @@ mod linux {
         processes_proc_own_files => ("proc-own-files","process"),
         processes_proc_other_files => ("proc-other-files","process"),
         processes_page_faults => ("page-faults","process"),
+        processes_exec_names => ("exec-names","process"),
         processes_context_switches => ("context-switches","process"),
         processes_proc_stat_counts => ("proc-stat-counts","process"),
         processes_proc_stat_sched => ("proc-stat-sched","process"),

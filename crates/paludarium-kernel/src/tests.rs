@@ -2721,6 +2721,58 @@ fn syscall_fcntl_owner() {
     assert_eq!(f.ret(3, &[fd]), 0);
     assert_eq!(f.ret(5, &[dup, DATA + 100]), 0);
 }
+/// `F_SETLEASE` and `F_GETLEASE`, as Linux's `fs/locks.c` takes and gives
+/// them back.
+#[test]
+fn a_lease_is_taken_changed_and_given_back_as_fs_locks_does() {
+    let mut f = fixture();
+    let path = put(&mut f, 0, b"/tmp/leased");
+    let made = f.ret(2, &[path, 0o102, 0o644]);
+    assert_eq!(f.ret(3, &[made]), 0);
+    let rd = f.ret(2, &[path, 0, 0]);
+    // None yet; a bad type; F_UNLCK with none.
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 1024, 5]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), errno(Errno::EAGAIN));
+    // A read lease gives the description its owner.
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(72, &[rd, 1025]), 0);
+    assert_ne!(f.ret(72, &[rd, 9]), 0);
+    // The only open may take a write lease; a dup shares it.
+    assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
+    let dup = f.ret(32, &[rd]);
+    assert_eq!(f.ret(72, &[dup, 1025]), 1);
+    // A second reader keeps a write lease from another description.
+    let two = f.ret(2, &[path, 0, 0]);
+    assert_eq!(f.ret(72, &[two, 1024, 1]), errno(Errno::EAGAIN));
+    // F_UNLCK takes the owner and the signal away.
+    assert_eq!(f.ret(72, &[rd, 10, 5]), 0);
+    assert_eq!(f.ret(72, &[dup, 1024, 2]), 0);
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 9]), 0);
+    assert_eq!(f.ret(72, &[rd, 11]), 0);
+    // A writer keeps out read leases, and its own is refused.
+    let rw = f.ret(2, &[path, 2, 0]);
+    assert_eq!(f.ret(72, &[rw, 1024, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[two, 1024, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(3, &[rw]), 0);
+    // A description's last close gives its lease back.
+    assert_eq!(f.ret(72, &[two, 1024, 0]), 0);
+    assert_eq!(f.ret(3, &[two]), 0);
+    assert_eq!(f.ret(3, &[dup]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    // A directory and a pipe take none.
+    let tmp = put(&mut f, 0x40, b"/tmp");
+    let dir = f.ret(2, &[tmp, 0o200000, 0]);
+    assert_eq!(f.ret(72, &[dir, 1024, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(72, &[dir, 1025]), 2);
+    assert_eq!(f.ret(22, &[DATA + 0x80]), 0);
+    let mut ends = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x80), &mut ends).unwrap();
+    let pipe = u64::from(u32::from_le_bytes(ends));
+    assert_eq!(f.ret(72, &[pipe, 1024, 0]), errno(Errno::EINVAL));
+}
 #[test]
 fn syscall_flock_cancel() {
     let mut f = fixture();

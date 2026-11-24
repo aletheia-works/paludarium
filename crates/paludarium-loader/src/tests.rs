@@ -70,6 +70,7 @@ fn start<'a>(argv: &'a [Vec<u8>], envp: &'a [Vec<u8>]) -> StartInfo<'a> {
         random: [7; 16],
         ids: [1, 2, 3, 4],
         secure: true,
+        program: None,
     }
 }
 
@@ -245,6 +246,29 @@ fn segments_map_the_executable_by_its_path_at_their_file_offsets() {
     let mut mem = AddressSpace::new();
     load_bytes(&simple_exec(), &start(&[], &[]), &mut mem).unwrap();
     assert_eq!(mem.mapped_file(GuestAddr(0x401000)).unwrap().name, None);
+    // A `Named` keep names them as it is asked, each time.
+    let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&deleted);
+    let keep: Keep = Arc::new(Named {
+        name: Arc::new(move || {
+            Some(if seen.load(std::sync::atomic::Ordering::SeqCst) {
+                b"/real (deleted)".to_vec()
+            } else {
+                b"/real".to_vec()
+            })
+        }),
+        keep: None,
+    });
+    let mut mem = AddressSpace::new();
+    let named = StartInfo {
+        program: Some(&keep),
+        ..start(&[], &[])
+    };
+    load(&fs, b"/prog", &named, &mut mem).unwrap();
+    let name = |mem: &AddressSpace| mem.view().vma_from(0x401000).unwrap().file.unwrap().name;
+    assert_eq!(name(&mem).as_deref(), Some(&b"/real"[..]));
+    deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(name(&mem).as_deref(), Some(&b"/real (deleted)"[..]));
 }
 
 #[test]

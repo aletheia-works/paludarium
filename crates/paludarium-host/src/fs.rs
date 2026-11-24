@@ -76,6 +76,12 @@ pub trait FileHandle: Send + Sync {
     fn notify_event(&self, _mask: u32) -> bool {
         false
     }
+    /// Whether a lease may be taken on this open file (`F_SETLEASE`), as a
+    /// file system with `setlease` lets one: the kernel's files of a mounted
+    /// file system and memfds, not pseudo files.
+    fn leasable(&self) -> bool {
+        false
+    }
     /// The flags of its open this description keeps among its status
     /// flags, which an open by path drops (`O_CLOEXEC` of one fanotify
     /// opened, as `dentry_open` keeps all it is given).

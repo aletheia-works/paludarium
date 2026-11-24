@@ -221,6 +221,26 @@ mod tests {
     }
 
     #[test]
+    fn sizes_are_cut_to_linux_s_32_bits() {
+        // A 64-bit `p_filesz` with high bits set is read as its low 32,
+        // as Linux's `Elf32_Word note_size` takes it.
+        let notes = note(3, b"GNU\0", &[4; 20]);
+        let mut bytes = elf64(ET_DYN, &notes, 0x200);
+        let filesz = 64 + 56 + 32;
+        let size = (1u64 << 32) | notes.len() as u64;
+        bytes[filesz..filesz + 8].copy_from_slice(&size.to_le_bytes());
+        let file = File { bytes, held: all };
+        assert_eq!(parse(&file), Some((20, [4; 20])));
+        // Notes that end past 4 GiB, which Linux's `u32` `note_end` cannot
+        // hold, are searched for none.
+        let mut bytes = elf64(ET_DYN, &notes, 0x200);
+        let offset = 64 + 56 + 8;
+        bytes[offset..offset + 8].copy_from_slice(&(u64::from(u32::MAX) - 8).to_le_bytes());
+        let file = File { bytes, held: all };
+        assert_eq!(parse(&file), None);
+    }
+
+    #[test]
     fn a_32_bit_elf_has_one_too() {
         let mut b = vec![0; 0x100];
         b[..4].copy_from_slice(b"\x7fELF");

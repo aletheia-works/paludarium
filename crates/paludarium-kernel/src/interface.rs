@@ -89,8 +89,9 @@ pub(crate) const F_CREATE: u16 = 0x400;
 pub(crate) const F_APPEND: u16 = 0x800;
 /// `RTNH_F_DEAD` and `RTNH_F_LINKDOWN`, which no request may set.
 const NEXTHOP_DEAD: u32 = 0x1 | 0x10;
-/// `RTNH_F_DEAD` and `RTNH_F_LINKDOWN` alone.
+/// `RTNH_F_DEAD` alone.
 const NEXTHOP_DEAD_ONLY: u32 = 0x1;
+/// `RTNH_F_LINKDOWN` alone.
 const NEXTHOP_LINKDOWN: u32 = 0x10;
 /// An IPv6 route's metric when its request names none
 /// (`IP6_RT_PRIO_USER`), and an address's prefix route's
@@ -574,6 +575,7 @@ impl Route4 {
             onlink: hop.onlink,
             linkdown: hop.linkdown,
             uses_gateway: hop.uses_gateway,
+            weight: hop.weight,
             ..self.clone()
         }
     }

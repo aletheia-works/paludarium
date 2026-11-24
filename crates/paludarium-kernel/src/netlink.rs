@@ -4800,7 +4800,8 @@ fn input6(
 /// past `RTN_MAX`; for IPv6, `EINVAL` for `RTA_FLOWLABEL`, `RTA_VIA` and a
 /// destination shorter than its prefix, then, adding (`fib6_config_validate`),
 /// for `RTM_F_CLONED`, a kind past `RTN_MAX` and a prefix or source prefix
-/// past 128. IPv6 multipath routes, IPv4 next hops through `RTA_VIA` ([`nexthops4`]), encapsulations, nexthop objects, realms, expiries,
+/// past 128. IPv6 multipath routes, IPv4 next hops through `RTA_VIA`
+/// ([`nexthops4`]), encapsulations, nexthop objects, realms, expiries,
 /// source prefixes and router preferences are
 /// `EOPNOTSUPP`. A route added takes the metrics `RTA_METRICS` holds
 /// ([`convert_metrics`]); an IPv4 one removed must have those it names
@@ -4987,7 +4988,8 @@ fn change_route(
     let (dst, prefsrc) = (ip(dst).unwrap_or(Ipv4Addr::UNSPECIFIED), ip(prefsrc));
     let gateway = ip(gateway).filter(|g| !g.is_unspecified());
     let multipath = multipath.map(|value| nexthops4(network, value));
-    if multipath.as_ref().is_some_and(|m| m.unsupported) {
+    // Adding, a hop not supported here is that hop's error, in turn.
+    if !add && multipath.as_ref().is_some_and(|m| m.unsupported) {
         return Err(EOPNOTSUPP);
     }
     if add {
@@ -5045,7 +5047,8 @@ fn change_route(
 /// `RTNH_F_DEAD` or `RTNH_F_LINKDOWN`, for both `RTA_GATEWAY` and
 /// `RTA_VIA`, for a gateway shorter than an address and an `RTA_FLOW`
 /// shorter than 4 bytes. One through an IPv6 gateway (`RTA_VIA`), of a
-/// realm (`RTA_FLOW`) or an encapsulation is not supported. A gateway of
+/// realm (`RTA_FLOW`) or an encapsulation is not supported
+/// (`EOPNOTSUPP`, in its turn among the hops' errors). A gateway of
 /// 0.0.0.0 is none. What a removal matches (`fib_nh_match`) is each's
 /// device and gateway.
 fn nexthops4(network: &Network, value: &[u8]) -> Nexthops4 {
@@ -5103,10 +5106,14 @@ fn nexthops4(network: &Network, value: &[u8]) -> Nexthops4 {
         } else {
             None
         };
-        unsupported |= find(RTA_VIA).is_some()
+        let unsupported_hop = find(RTA_VIA).is_some()
             || find(RTA_FLOW).is_some()
             || find(RTA_ENCAP).is_some()
             || find(RTA_ENCAP_TYPE).is_some();
+        unsupported |= unsupported_hop;
+        // Linux reads the hops in turn: this one's error, else, for what
+        // is not supported here, `EOPNOTSUPP`, before a later one's.
+        let error = error.or(unsupported_hop.then_some(EOPNOTSUPP));
         hop.gateway = gateway
             .and_then(|g| g.first_chunk::<4>())
             .map(|g| core::net::Ipv4Addr::from(*g))

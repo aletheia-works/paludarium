@@ -4904,6 +4904,16 @@ fn change_route(
     } else {
         network.is_up()
     };
+    // The devices that are down, for the one an IPv4 gateway is reached
+    // through, which a route with none goes through.
+    let down: Vec<u32> = {
+        let devices = network.devices();
+        devices
+            .iter()
+            .filter(|d| !d.veth.as_ref().map_or_else(|| network.is_up(), |v| v.up))
+            .map(|d| d.index.unsigned_abs())
+            .collect()
+    };
     let mut addresses = network.addresses();
     // Linux converts the metrics later, where the error is told of
     // ([`extack::raise`]).
@@ -4963,7 +4973,13 @@ fn change_route(
                 request: header.flags,
                 metrics: converted,
             },
-            up,
+            &|device| {
+                if device == 0 {
+                    network.is_up()
+                } else {
+                    !down.contains(&device)
+                }
+            },
         );
     }
     addresses.del_route4(&Select4 {

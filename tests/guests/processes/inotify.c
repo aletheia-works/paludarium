@@ -1718,6 +1718,35 @@ static int case_unmount(void) {
     drain(one, "detached");
     close(held);
     drain(one, "closed");
+    /* The order the files go in (`fsnotify_unmount_inodes`): the newest
+       connector first, each made with the file's first mark of any group
+       (another instance's, dnotify's, fanotify's), not this instance's. */
+    printf("tmpfs=%ld\n", e(mount("none", at("m"), "tmpfs", 0, NULL)));
+    const char *names[] = {"m/x", "m/y", "m/z", "m/v", "m/w"};
+    for (int i = 0; i < 5; i++) touch(at(names[i]));
+    mkdir(at("m/d"), 0755);
+    int three = inotify_init1(IN_NONBLOCK), four = inotify_init1(IN_NONBLOCK);
+    long first = e(inotify_add_watch(four, at("m/x"), IN_MODIFY));
+    long wy = e(inotify_add_watch(three, at("m/y"), IN_MODIFY));
+    long wx = e(inotify_add_watch(three, at("m/x"), IN_MODIFY));
+    int dirfd = open(at("m/d"), O_RDONLY | O_DIRECTORY);
+    long notify = e(fcntl(dirfd, F_NOTIFY, DN_CREATE));
+    long wz = e(inotify_add_watch(three, at("m/z"), IN_MODIFY));
+    long wd2 = e(inotify_add_watch(three, at("m/d"), IN_MODIFY));
+    int fan = syscall(SYS_fanotify_init, 0x2, O_RDONLY);
+    long marked = e(syscall(SYS_fanotify_mark, fan, 1, 0x20ULL, AT_FDCWD, at("m/w")));
+    long wv = e(inotify_add_watch(three, at("m/v"), IN_MODIFY));
+    long ww = e(inotify_add_watch(three, at("m/w"), IN_MODIFY));
+    printf("order first=%ld y=%ld x=%ld notify=%ld z=%ld d=%ld fan=%d marked=%ld v=%ld w=%ld\n", first, wy, wx, notify,
+           wz, wd2, fan >= 0, marked, wv, ww);
+    printf("detach=%ld\n", e(umount2(at("m"), MNT_DETACH)));
+    drain(three, "order still");
+    close(dirfd);
+    drain(three, "order");
+    drain(four, "order other");
+    if (fan >= 0) close(fan);
+    close(three);
+    close(four);
     close(one);
     close(two);
     remove_all();

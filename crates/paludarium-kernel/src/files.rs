@@ -5470,7 +5470,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         Ok(pipe.size())
                     }
                 }
-                4 => crate::fasync::set_flags(c, &d.file, a[0], a[2] as u32).map(|()| 0),
+                4 => {
+                    let direct = direct_io(&*d.file, &d.path, d.opened);
+                    crate::fasync::set_flags(c, &d.file, a[0], a[2] as u32, direct).map(|()| 0)
+                }
                 // F_NOTIFY: dnotify.
                 1026 => crate::dnotify::fcntl(c, &d, a[0], a[2] as u32),
                 // The owner and signal of signal-driven I/O.
@@ -6392,6 +6395,33 @@ pub(crate) struct StandardFile {
     /// watcher looks only now and then, and must not miss what comes next.
     refused: std::sync::atomic::AtomicBool,
 }
+/// `O_DIRECT`.
+pub(crate) const O_DIRECT: u32 = 0o40000;
+/// `O_NOATIME`.
+pub(crate) const O_NOATIME: u32 = 0o1000000;
+/// Whether an open file description has Linux's `FMODE_CAN_ODIRECT`,
+/// which `O_DIRECT` needs at `open` (`do_dentry_open`, `EINVAL`) and at
+/// `F_SETFL` (`setfl`): a regular file of a disk file system or tmpfs,
+/// whose address space has `direct_IO` or whose open sets it
+/// (`ext4_file_open`, `shmem_file_open`), opened by `path`. A memfd has
+/// it only once opened again by a path, as `memfd_create` makes its file
+/// with no open; `/proc`'s files and `/dev`'s own, mqueue's queues, a
+/// pidfd and every file that is not regular have none.
+pub(crate) fn direct_io(file: &dyn FileHandle, path: &[u8], opened: bool) -> bool {
+    if file
+        .as_any()
+        .is_some_and(|any| any.is::<crate::memfd::Memfd>())
+    {
+        return opened;
+    }
+    opened
+        && !path.is_empty()
+        && !generated(path)
+        && !crate::mqueue::is_queue(file)
+        && file
+            .stat()
+            .is_ok_and(|stat| stat.mode & 0o170000 == 0o100000)
+}
 /// The flags `F_SETFL` changes (Linux's `SETFL_MASK` but `O_ASYNC`, which
 /// only a file with `fasync` keeps): `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`
 /// and `O_NOATIME`.
@@ -6947,6 +6977,13 @@ pub(crate) fn open_at(
                     crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
                 }
             })?;
+            // `do_dentry_open`: `O_DIRECT` without `FMODE_CAN_ODIRECT` is
+            // refused once the file is open (a FIFO too, unlike
+            // `F_SETFL`), so a file it created stays, with no `IN_OPEN`.
+            // An `O_PATH` open has none of the flags (`build_open_flags`).
+            if flags & (O_PATH | O_DIRECT) == O_DIRECT && !direct_io(&*opened.0, &opened.1, true) {
+                return Err(Errno::EINVAL);
+            }
             let landlock = match landlock {
                 Some(rights) => rights,
                 None => landlock_after_open(c, &p, flags)?,
@@ -7346,9 +7383,10 @@ fn open_path(
         const O_DIRECTORY: u32 = 0o200000;
         match entry {
             crate::devices::Entry::Pts if flags & 3 != 0 => return Err(Errno::EISDIR),
-            crate::devices::Entry::Pts => {
-                Arc::new(crate::proc::OwnDirectory::new(crate::pty::directory_stat()))
-            }
+            crate::devices::Entry::Pts => Arc::new(crate::proc::OwnDirectory::opened(
+                flags,
+                crate::pty::directory_stat(),
+            )),
             crate::devices::Entry::Slave(None) => return Err(Errno::ENOENT),
             crate::devices::Entry::Mqueue => crate::mqueue::MountedRoot::open(c, flags)?,
             crate::devices::Entry::Queue => {
@@ -7364,7 +7402,8 @@ fn open_path(
             crate::devices::Entry::Slave(Some(n)) => crate::pty::open_named(c, n, flags)?,
             // A directory opens only for reading, a device not as one.
             crate::devices::Entry::Directory if flags & 3 != 0 => return Err(Errno::EISDIR),
-            crate::devices::Entry::Directory => Arc::new(crate::proc::OwnDirectory::new(
+            crate::devices::Entry::Directory => Arc::new(crate::proc::OwnDirectory::opened(
+                flags,
                 crate::devices::directory_stat(),
             )),
             crate::devices::Entry::Device(_) if flags & O_DIRECTORY != 0 => {
@@ -7399,7 +7438,10 @@ fn open_path(
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
         }
-        Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
+        Arc::new(crate::proc::OwnDirectory::opened(
+            flags,
+            crate::proc::directory_stat(),
+        ))
     } else if let Some(path) = task_path(c, p) {
         let task = tasks::find(c, &path)?;
         let link = tasks::link(&task, path.entry).is_some();
@@ -7572,7 +7614,7 @@ fn open_path(
             if flags & 3 != 0 {
                 return Err(Errno::EISDIR);
             }
-            let directory = crate::proc::OwnDirectory::new(stat);
+            let directory = crate::proc::OwnDirectory::opened(flags, stat);
             // The process's or thread's directory and its `ns` take their
             // owner at each `fstat` (`pid_getattr`); the others their
             // inode's, as the files do.
@@ -7598,7 +7640,10 @@ fn open_path(
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
         }
-        Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
+        Arc::new(crate::proc::OwnDirectory::opened(
+            flags,
+            crate::proc::directory_stat(),
+        ))
     } else if let Some(entry) = crate::proc::system_entry(p) {
         system_file(c, entry, flags)
     } else if let Some(entry) = own_entry(c, p) {
@@ -7651,25 +7696,34 @@ fn open_path(
             }
             // Its owner at each `fstat` (`pid_getattr`).
             crate::proc::OwnEntry::Directory => Arc::new(
-                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::directory_stat()))
-                    .owned_by(tasks::own_live_owner(
-                        c.processes,
-                        c.process.pid,
-                        c.process.pid,
-                        true,
-                    )),
+                crate::proc::OwnDirectory::opened(
+                    flags,
+                    own_stat(c, crate::proc::directory_stat()),
+                )
+                .owned_by(tasks::own_live_owner(
+                    c.processes,
+                    c.process.pid,
+                    c.process.pid,
+                    true,
+                )),
             ),
             crate::proc::OwnEntry::Descriptors => Arc::new(
-                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::descriptors_stat()))
-                    .owned_by(Arc::new(move || {
-                        *owner.lock().unwrap_or_else(PoisonError::into_inner)
-                    })),
+                crate::proc::OwnDirectory::opened(
+                    flags,
+                    own_stat(c, crate::proc::descriptors_stat()),
+                )
+                .owned_by(Arc::new(move || {
+                    *owner.lock().unwrap_or_else(PoisonError::into_inner)
+                })),
             ),
             crate::proc::OwnEntry::DescriptorInfos => Arc::new(
-                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::directory_stat()))
-                    .owned_by(Arc::new(move || {
-                        *owner.lock().unwrap_or_else(PoisonError::into_inner)
-                    })),
+                crate::proc::OwnDirectory::opened(
+                    flags,
+                    own_stat(c, crate::proc::directory_stat()),
+                )
+                .owned_by(Arc::new(move || {
+                    *owner.lock().unwrap_or_else(PoisonError::into_inner)
+                })),
             ),
             // Opened above while the descriptor is open.
             crate::proc::OwnEntry::DescriptorInfo(_) => return Err(Errno::ENOENT),
@@ -7806,9 +7860,13 @@ fn reopen_descriptor(
         .as_any()
         .is_some_and(|v| v.is::<crate::processes::PidFd>());
     let stat = d.file.stat()?;
-    // `may_open` of the inode the link leads to.
-    if !matches!(stat.mode & 0o170000, 0o040000 | 0o120000) {
-        attributes::may_open(&stat, flags)?;
+    // `may_open` of the inode the link leads to, as `permissions::open`
+    // has it: none for `O_PATH` or a symbolic link, and for a directory
+    // only when it is not opened to write, which is `EISDIR` first; a
+    // directory's `O_NOATIME` is checked too.
+    let kind = stat.mode & 0o170000;
+    if flags & O_PATH == 0 && kind != 0o120000 && !(kind == 0o040000 && flags & 3 != 0) {
+        attributes::may_open(&c.process.credentials, &stat, flags)?;
     }
     // A FIFO a path opened: its node opened again, at the same dentry.
     if stat.mode & 0o170000 == 0o010000

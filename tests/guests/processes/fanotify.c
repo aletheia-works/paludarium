@@ -1713,6 +1713,41 @@ static int case_superblock_marks(void) {
     return 0;
 }
 
+/* Reads and writes of a FIFO, which `__fsnotify_parent` keeps from its
+   directory's interest (they are not on the directory's file system), yet
+   tells a group that needs the parent's name of with it; a regular file's
+   beside them. */
+static int case_fifo_names(void) {
+    make_base("fifo-names");
+    printf("mkfifo=%ld\n", e(mkfifo(at("f"), 0644)));
+    touch(at("h"));
+    remember();
+    unsigned report = FAN_NONBLOCK | FAN_REPORT_DFID_NAME | FAN_REPORT_FID;
+    int sb = fan_init(report, O_RDONLY);
+    printf("sb=%ld\n", fan_mark(sb, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_ACCESS | FAN_MODIFY, AT_FDCWD, base));
+    int dir = fan_init(report, O_RDONLY);
+    printf("dir=%ld\n", fan_mark(dir, FAN_MARK_ADD, FAN_ACCESS | FAN_MODIFY | FAN_EVENT_ON_CHILD, AT_FDCWD, base));
+    int own = fan_init(report, O_RDONLY);
+    printf("own=%ld %ld\n", fan_mark(own, FAN_MARK_ADD, FAN_ACCESS | FAN_MODIFY, AT_FDCWD, at("f")),
+           fan_mark(own, FAN_MARK_ADD, FAN_ACCESS | FAN_MODIFY, AT_FDCWD, at("h")));
+    int plain = fan_init(FAN_NONBLOCK, O_RDONLY);
+    printf("plain=%ld\n", fan_mark(plain, FAN_MARK_ADD, FAN_ACCESS | FAN_MODIFY | FAN_EVENT_ON_CHILD, AT_FDCWD, base));
+
+    char c = 0;
+    int fifo = open(at("f"), O_RDWR | O_NONBLOCK);
+    printf("fifo write=%ld read=%ld\n", e(write(fifo, "x", 1)), e(read(fifo, &c, 1)));
+    close(fifo);
+    int file = open(at("h"), O_RDWR);
+    printf("file write=%ld read=%ld\n", e(write(file, "x", 1)), e(pread(file, &c, 1, 0)));
+    close(file);
+    show_fid_events("sb", sb);
+    show_fid_events("dir", dir);
+    show_fid_events("own", own);
+    printf("plain events=%d\n", drain(plain));
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1721,6 +1756,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-marks")) return case_marks();
     if (!strcmp(mode, "fanotify-events")) return case_events();
     if (!strcmp(mode, "fanotify-fid")) return case_fid();
+    if (!strcmp(mode, "fanotify-fifo-names")) return case_fifo_names();
     if (!strcmp(mode, "fanotify-pidfd")) return case_pidfd();
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();

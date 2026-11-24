@@ -235,9 +235,12 @@ impl FileHandle for MemFile {
     fn flags(&self) -> u32 {
         lock(&self.state).1
     }
+    /// `F_SETFL`: `O_APPEND`, `O_NONBLOCK`, `O_DIRECT` and `O_NOATIME`
+    /// change, as Linux's `setfl` keeps them.
     fn set_flags(&self, f: u32) -> Result<(), Errno> {
+        const SETFL: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
         let mut s = lock(&self.state);
-        s.1 = (s.1 & !3072) | (f & 3072);
+        s.1 = (s.1 & !SETFL) | (f & SETFL);
         Ok(())
     }
     fn with_xattrs(&self, f: &mut dyn FnMut(&mut paludarium_host::Xattrs)) -> Result<(), Errno> {

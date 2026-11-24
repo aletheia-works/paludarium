@@ -1971,6 +1971,12 @@ pub trait PageSource: Send + Sync {
     fn shmem(&self) -> bool {
         false
     }
+    /// Whether a mapping of the file that `mremap` moves goes at a 2 MiB
+    /// boundary, as one of a file of a tmpfs mount with `huge=` does
+    /// (`shmem_get_unmapped_area`, [`Placement::Aligned`]).
+    fn huge_placement(&self) -> bool {
+        false
+    }
     /// Whether the file's memory is shmem's (Linux's `shmem_file`), which
     /// `MADV_COLLAPSE` takes: that of a [`Self::shmem`] file, and of System V
     /// shared memory, whose VMAs are not shmem's.
@@ -5502,6 +5508,28 @@ impl AddressSpaceData {
         if how.keep_old && fixed {
             return Err(Errno::EINVAL);
         }
+        // Where a move goes: for a file that may have huge folios, shared
+        // or private, at the 2 MiB boundary its offset at `addr` agrees
+        // with, as `vrm_set_new_addr` asks the file
+        // (`shmem_get_unmapped_area`).
+        let huge = self
+            .shared_at(addr.0)
+            .and_then(|shared| {
+                shared
+                    .pages
+                    .source()
+                    .map(|source| (source.clone(), shared.shift))
+            })
+            .or_else(|| {
+                self.backing_at(addr.0)
+                    .map(|backing| (backing.source.clone(), backing.shift))
+            })
+            .filter(|(source, _)| source.huge_placement())
+            .map(|(_, shift)| addr.0.wrapping_add(shift) & (BLOCK_SIZE - 1));
+        let free_for = |data: &Self, len: u64| match huge {
+            Some(offset) => data.aligned_area(len, BLOCK_SIZE, offset),
+            None => data.find_free(len),
+        };
         // A shrink may cross the end of the VMA: only what stays must not.
         let kept = old_len.min(new_len);
         let (_, region_end) = self.region_at(addr.0).ok_or(Errno::EFAULT)?;
@@ -5524,7 +5552,7 @@ impl AddressSpaceData {
             } else if hint != 0 && hint >= MMAP_MIN_ADDR && !self.overlaps(hint, hint + new_len) {
                 hint
             } else {
-                self.find_free(new_len).ok_or(Errno::ENOMEM)?
+                free_for(self, new_len).ok_or(Errno::ENOMEM)?
             };
             if old_len > new_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
@@ -5575,7 +5603,7 @@ impl AddressSpaceData {
         if !how.may_move {
             return Err(Errno::ENOMEM);
         }
-        let to = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
+        let to = free_for(self, new_len).ok_or(Errno::ENOMEM)?;
         if !moves(new_len) {
             return Err(Errno::EINVAL);
         }

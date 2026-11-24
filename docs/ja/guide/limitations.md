@@ -735,8 +735,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   tmpfs マウントのファイルや memfd に持ち込むページは `shmem_fault` が課金するように
   そのブロックに数え（`huge=` のあるマウントでは大きな folio のほかのページとともに）、
   マウントの大きさを超えるページは `SIGBUS` です。まだそうしないのは次のことです。
-  `mremap` はそのファイルのマッピングをほかのものと同じ場所に動かします。Linux は
-  `mmap` と同じく 2 MiB の境目に置きます。
   大きな folio は 1 ページずつマップするので、`/proc/<pid>/smaps` と `/proc/meminfo` は
   それを `ShmemPmdMapped`、`FilePmdMapped`、`ShmemHugePages` に数えず、フォールトは
   folio 全体ではなくまわりのページだけをマップします（`Rss` にもそれだけを数えます）。大きな folio はいつも取れます。Linux はメモリーにそれほど

@@ -15510,8 +15510,9 @@ static int th_inner(const char *m) {
 /* The tmpfs-huge-placement case: a mapping of a file of a tmpfs mount with
    huge= goes at a 2 MiB boundary, or one page past one for an offset of one
    page, as shmem_get_unmapped_area places it, unless a free hint is given;
-   so a fault of it advised MADV_HUGEPAGE takes a 512-page folio. Only what
-   holds for every layout is printed. */
+   so a fault of it advised MADV_HUGEPAGE takes a 512-page folio. A move by
+   mremap goes there too (vrm_set_new_addr asks the file). Only what holds
+   for every layout is printed. */
 static int thp_inner(const char *m) {
     long huge = 2 << 20;
     if (th_mount(m, "huge=always")) return 0;
@@ -15523,6 +15524,13 @@ static int thp_inner(const char *m) {
     if (a == MAP_FAILED || b == MAP_FAILED) return 81;
     printf("aligned=%d offset=%d\n", ((uintptr_t)a & (huge - 1)) == 0,
            ((uintptr_t)b & (huge - 1)) == 4096);
+    /* MREMAP_DONTUNMAP: a move that leaves the old mapping. */
+    char *ma = mremap(a, 2 * huge, 2 * huge, MREMAP_MAYMOVE | 4);
+    char *mb = mremap(b, 2 * huge, 2 * huge, MREMAP_MAYMOVE | 4);
+    if (ma == MAP_FAILED || mb == MAP_FAILED) return 84;
+    printf("moved=%d moved-offset=%d\n", ((uintptr_t)ma & (huge - 1)) == 0,
+           ((uintptr_t)mb & (huge - 1)) == 4096);
+    munmap(ma, 2 * huge), munmap(mb, 2 * huge);
     char *free_area = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (free_area == MAP_FAILED) return 82;
     munmap(free_area, 4 * huge);

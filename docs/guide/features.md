@@ -2096,7 +2096,8 @@ kernel.
   `MAP_FIXED` places a mapping of such a file of 2 MiB or more, unless
   at a free hint, at a 2 MiB boundary, or as far past one as its offset
   is past one (`shmem_get_unmapped_area`), so that a fault of it can take
-  a 512-page folio. The files are held as `shmem`
+  a 512-page folio; `mremap` moves one there too, shared or private
+  (`vrm_set_new_addr` asks the file). The files are held as `shmem`
   counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,

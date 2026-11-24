@@ -517,10 +517,35 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、待つ側がまだ動き出す前でもその待ちはすぐ数えられなくなります。ロックはゲストだけのもので、ホストの
   プログラムからは見えず、ゲストからもホストのロックは見えません。
 
-- パイプは Linux と同じく 64 KiB を持ちます。`fcntl` の `F_SETPIPE_SZ` と
-  `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。大きさは
-  1 ページ以上の 2 のべき乗で、読まれていないデータより小さくすると `EBUSY`、
-  2³¹ を超えると `EINVAL` です。
+- ファイルのリース（`fcntl` の `F_SETLEASE` と `F_GETLEASE`）を、Linux の `fs/locks.c` と
+  同じく取り、返します。通常のファイル（マウントしたファイルシステムのファイルか memfd）の
+  開いた記述に、読み込みか書き込みのリースを、`F_UNLCK` かその記述の最後のクローズ
+  （`locks_remove_file`）まで掛けます。リースは `fcntl_setlease` の順に断ります。
+  ディレクトリか知らない種類（`EINVAL`）、持ち主が呼んだ側のファイルシステムのユーザー ID で
+  なく `CAP_LEASE` もないファイル（`EACCES`）、パイプや `/proc` のファイルのようにリースを
+  取れないファイル（`EINVAL`）、ぶつかる open（`lease_open_conflict`、`EAGAIN`。読み込みの
+  リースには書くために開いたどの記述も、書き込みのリースにはほかの読み書きのために開いた
+  記述か、そのファイルから動くプログラムがぶつかります）、書き込みのリースのときのほかの
+  記述のリース（`EAGAIN`）、`/proc/sys/fs/leases-enable` が 0 の間の新しいリース（`EINVAL`）
+  です。同じ記述からもう一度頼むと、リースの種類が変わります。リースを取ると、持ち主の
+  ない記述は呼んだプロセスを持ち主にし、`F_UNLCK` は持ち主と `F_SETSIG` のシグナルを
+  外します（`f_delown`）。リースがないときの `F_UNLCK` は `EAGAIN` です。`F_GETLEASE` は
+  その記述のリースの種類か `F_UNLCK` を返します。`/proc/sys/fs/leases-enable`（最初は 1）と
+  `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
+  も受け取ります（`proc_dointvec`）。
+
+- パイプは Linux と同じく 1 ページのバッファーを 16 個（64 KiB）持ちます。`fcntl` の
+  `F_SETPIPE_SZ` と `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。
+  大きさは 1 ページ以上の 2 のべき乗で、使っているバッファーより少なくすると `EBUSY`、
+  2³¹ を超えると `EINVAL` です。書き込みのうちページに満たない分は、`anon_pipe_write`
+  と同じく、空きのある最後のバッファーに加わり、残りは新しいバッファーに入ります。
+  `splice`、`tee`、`vmsplice` は、書き込みの加わらない自分のバッファーを作ります。
+
+- パイプのパケットモード：`O_DIRECT` の書き込み端（`pipe2`、または `F_SETFL`。
+  `F_GETFL` にも表れます）は、1 ページごとに 1 つのパケットとして書き、読み込みは
+  パケットの終わりで止まって、残りを捨てます。パケットは 1 つで 1 バッファーを使うので、
+  どれほど小さくても 16 個でパイプはいっぱいになります。別のパイプへの `splice` と `tee`
+  はパケットを保ち、ファイルへの splice はパケットをまたいでバイトを取ります。
 
 - `SOCK_DGRAM` の組は、`SOCK_SEQPACKET` と同じくメッセージの区切りを保ちますが、
   ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
@@ -1005,7 +1030,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   さばくためのファイルを、Linux の `fs/userfaultfd.c` と同じに作ります。カーネル自身の
   フォールトも届くもの（`UFFD_USER_MODE_ONLY` なし）には、`vm.unprivileged_userfaultfd`
   が 1 でなければ `CAP_SYS_PTRACE` が要り（`EPERM`）、これはフラグ（`EINVAL`）より
-  先に確かめます。root のモード 0600 の misc デバイス `/dev/userfaultfd`
+  先に確かめます。そのフォールトは命令のときと同じく届きます。システムコール自身の
+  登録したページとのコピーはページを待ち、Linux がカーネルのフォールトをやり直すので
+  （`fault_signal_pending`）、致命的でないシグナルでは待ち終わらず、ページが埋まると
+  コピーが進みます。SIGKILL、プロセスの終了、コンテキストの解放は待ちを `EFAULT` で
+  終わらせ、`UFFD_USER_MODE_ONLY` と `UFFD_FEATURE_SIGBUS` はすぐに `EFAULT` です。root のモード 0600 の misc デバイス `/dev/userfaultfd`
   （`userfaultfd_misc`。マイナー番号は Linux が起動時に決めます）は、ただ一つの操作である
   ioctl `USERFAULTFD_IOC_NEW` で、引数の下位 32 ビットのフラグのものを、ケーパビリティ
   なしで作ります。デバイスを開ける者は作れるからです。ほかの ioctl、`read`、`write` は
@@ -1464,8 +1493,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - 下に伸びるマッピング（メインのスタックか、`mmap` が `MAP_GROWSDOWN` で作った
   プライベートな匿名メモリで、`VmFlags` は `gd` を示します）は、Linux の
   `expand_downwards` と同じように伸びます。その下のマップされていないページへの
-  アクセスや、そこへのシグナルフレームの書き込みで、そのページまで下に伸び、アクセスは
-  やり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
+  アクセスや、そこへのシグナルフレームの書き込み、システムコール自身のそこへのコピー
+  （`do_user_addr_fault` はカーネルのアクセスも同じに扱います）で、そのページまで下に
+  伸び、アクセスはやり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
   上の 256 ページの guard gap（`stack_guard_gap`）の中、VMA 全体で `RLIMIT_STACK` を
   超えるところ、ロックされていれば `CAP_IPC_LOCK` なしで `RLIMIT_MEMLOCK` を超える
   ところへは伸びず、そのアクセスは `SIGSEGV` になります。その下の gap には、ヒントでも、
@@ -1830,7 +1860,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`shmem_unused_huge_shrink`）、だめならそのページだけを数えます。`MAP_FIXED` なしの
   `mmap` は、そういうファイルの 2 MiB 以上のマッピングを、空いているヒントのとき
   のほかは 2 MiB の境目に置くか、オフセットが境目を越える分だけ越えたところに置きます
-  （`shmem_get_unmapped_area`）。そのフォールトは 512 ページの folio を取れます。長いシンボリックリンク
+  （`shmem_get_unmapped_area`）。そのフォールトは 512 ページの folio を取れます。`mremap` が
+  動かすマッピングも、共有でもプライベートでも同じ場所に置きます（`vrm_set_new_addr` が
+  ファイルに尋ねます）。長いシンボリックリンク
   （127 バイトを超えるもの）は 1 ページを使い、新しい inode とファイルの 2 つめ以降の
   名前（`link`）はそれぞれ inode を 1 つ使います（残っていなければ `ENOSPC`）。消した
   けれどまだ開いているファイルは、最後に閉じるまでその分を持ちます。マウントし直すと
@@ -2384,7 +2416,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     名前の端のリンク上にあるものとし（端は上がっていなければなりません）、名前空間の
     アドレス、ブロードキャスト、グループのものは断ります（`EINVAL`）。パケットは、
     リンクスコープの経路がゲートウェイに届くときはゲートウェイの近隣へ
-    （`rt_uses_gateway`）、ほかは宛先の近隣へ出ていきます。端を
+    （`rt_uses_gateway`）、ほかは宛先の近隣へ出ていきます。経路の `RTA_MULTIPATH` は、
+    そのネクストホップを一つの経路にします（`fib_get_nhs`）。それぞれ自分のデバイス、
+    ゲートウェイ、フラグで経路のネクストホップと同じく確かめ（`fib_check_nh`）、重み
+    （`rtnh_hops` + 1）を持ちます。ネクストホップの後のデータ、`RTNH_F_DEAD` か
+    `RTNH_F_LINKDOWN` のホップ、アドレスより短いゲートウェイ、リクエストの `RTA_OIF` や
+    `RTA_GATEWAY` と違う最初のホップ、拒む種類、ホストスコープで二つ以上は `EINVAL` です。
+    ダンプと通知は、ホップを `RTA_MULTIPATH` に、それぞれのフラグ、重みから 1 引いたもの、
+    デバイス、ゲートウェイとともに入れ、`rtm_flags` は経路自身のもの（ホップがすべて
+    `RTNH_F_LINKDOWN` ならそれも）です。ホップが一つなら一つの経路と同じです。ホップや
+    重みの違うものは別の経路で、同じものをもう一度足すと `EEXIST` です。端が下がると、
+    そのホップは何も伝えずに `RTNH_F_DEAD` と `RTNH_F_LINKDOWN` になり、端が上がるまで
+    引き当てに飛ばされます（`fib_sync_down_dev`、`fib_sync_up`）。キャリアがなければ
+    `RTNH_F_LINKDOWN` です。ホップがすべて dead になった経路は、端がなくなったときと同じく
+    消えます。デバイスかゲートウェイを名前で挙げる削除は経路の最初のホップと、
+    `RTA_MULTIPATH` のある削除はそのホップを順に一つずつ比べます（`fib_nh_match`）。端を
     通る出力の経路の検索は、端の最初のプライマリアドレスから、なければほかのデバイスの
     作られた順で最初のものから出て（`inet_select_addr`）、その端を `RTA_OIF` に、
     `RTCF_LOCAL` なしで答えます。`lo` から端へ転送する検索もその端を答え、送り元を
@@ -2701,9 +2747,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     マルチキャストの宛先（`rt6_need_strict`）だけで、ローカルのものは `lo` から出ます。
     マルチキャストのものは、Linux のマルチキャストルーティングが埋める答えのデバイスを
     知らない（`ip6mr_get_route`）ので `EMSGSIZE` です。送り元、フローラベル（`RTA_FLOWLABEL`）、
-    プロトコルは、`fib6_select_path` がハッシュするのと同じくマルチパスの経路のホップを
-    選びます。マーク、ユーザー ID、ポートはポリシーのルールを選ぶためのもので、ルールは
-    ないので何も変えません。
+    プロトコルは、`fib6_select_path` がハッシュするのと同じく IPv6 のマルチパスの経路の
+    ホップを選びます。IPv4 のものは、引き当てが dead でない最初のホップを取ります。マーク、
+    ユーザー ID、ポートはポリシーのルールを選ぶためのもので、ルールはないので何も
+    変えません。
   - **経路のメトリクス:** IPv4 と IPv6 の経路は、`RTA_METRICS` が持つメトリクス
     （`ip route add ... mtu 1400` が送るもの）を、`ip_metrics_convert` と同じく読んで
     保ちます。種類を順に読み、0 の種類は飛ばします。`RTAX_MTU` は 65520 に、`RTAX_ADVMSS`
@@ -3249,20 +3296,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
-  `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、`smaps_rollup`、
+  `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mem`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、`smaps_rollup`、
   `pagemap`、`wchan`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。この root は、そのプログラムが動くユーザー名前空間の
   root で、その名前空間が root を対応づけていなければ最初の名前空間の root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
   プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ`、`auxv`、`pagemap`、`io`、`personality`、`syscall` は 0400、`comm` は 0644、`clear_refs`
-  は 0200、ほかのファイルは 0444）を示します。
+  その持ち主とモード（`environ`、`auxv`、`pagemap`、`io`、`personality`、`syscall` は 0400、`comm` は 0644、`mem` は 0600、
+  `clear_refs` は 0200、ほかのファイルは 0444）を示します。
   開いたファイルの `fstat` は、そのパスを最後に探したとき（どのプロセスの open や `stat` でも）の
   持ち主を示します。Linux の inode と同じで、開いたファイルが押さえるパスを探すたびに新しく
   なります（`pid_revalidate`）。開いたディレクトリとその `ns` の `fstat` は、Linux の
   `pid_getattr` と同じくその時点の持ち主を示します。開くときは Linux の `generic_permission` と同じくその
   持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
-  `EACCES` で、ダンプできないプロセスが `environ`、`auxv`、`pagemap` を読むために開いても
+  `EACCES` で、ダンプできないプロセスが `environ`、`auxv`、`pagemap`、`mem` を読むために開いても
   `EACCES` です。書き込み用に開いたもの（root のもの）への書き込みは `EINVAL` です。ただし `comm` への書き込みは、
   Linux の `comm_write` と同じくスレッドの名前を変えます。書き手がそのスレッドのプロセスのものなら、
   最初の 15 バイト（NUL まで）を名前にして、書いた数をすべて返します（スレッドは次のシステムコールで
@@ -3301,7 +3348,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`personality`（0400）、`comm`、
-  `syscall`（0400）、`maps`、`clear_refs`（0200）、`smaps`、`smaps_rollup`、`pagemap`（0400）、`wchan`、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `syscall`（0400）、`maps`、`mem`（0600）、`clear_refs`（0200）、`smaps`、`smaps_rollup`、`pagemap`（0400）、`wchan`、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
@@ -3320,7 +3367,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>` と `/proc/self` でも同じです。`fd` と `fdinfo` は何も並べないので、
   `/proc/self/fd/<n>` や `/dev/fd/<n>` を通した `execveat` は `ENOENT` です。`maps`、`smaps`、
   `cmdline` は何も読めず、ディレクトリー以外のファイルはゾンビのものと同じく root の
-  もの（制限事項を参照）なので、`environ`、`auxv`、`pagemap` は `EACCES`（root には
+  もの（制限事項を参照）なので、`environ`、`auxv`、`pagemap`、`mem` は `EACCES`（root には
   `ESRCH`）です。`smaps_rollup` は、Linux の `smaps_rollup_open` と同じく、どの読み手にも
   `ESRCH` です。`exe`、`cwd`、`root` と
   ほかの `ns` のリンクは `ENOENT`、`mountinfo` は `EINVAL` です。`statm` はすべて 0、
@@ -3331,7 +3378,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`smaps_rollup`、`pagemap`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`smaps_rollup`、`pagemap`、`mem`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
@@ -3344,7 +3391,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じで（ダンプできないプロセスのディレクトリ（0555）もそのプロセスのものです）、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
   ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
   `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
-  `auxv`、`pagemap` を読むには持ち主か `CAP_DAC_OVERRIDE` が要ります。開いたものの `fstat` は、
+  `auxv`、`pagemap`、`mem` を読むには持ち主か `CAP_DAC_OVERRIDE` が要ります。開いたものの `fstat` は、
   このプロセス自身のもの（前述）と同じく持ち主を示します。`statm` と `limits` は、Linux と同じく誰でも読めます。
   `fd` そのものを読むことと中を探すことは、Linux の
   `proc_fd_permission` と同じくそのモード（0500）が許す読み手だけができます。`fd` と
@@ -3356,7 +3403,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルのマウントと、そのプロセスが持つレコードロックを示します。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
-  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`smaps_rollup`、`pagemap`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`smaps_rollup`、`pagemap`、`mem`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、Linux が動いていない
   タスクをそう見せるのと同じく、スレッドが待ちで眠っている間（パイプ、futex、タイマーなど
@@ -3367,7 +3414,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux の `proc_mem_open` はメモリのあるプロセスについてだけ読み手を確かめるので、
   ゾンビの `maps` と `smaps` は、モードが許すどの読み手も開けます。Linux の `__mem_open` と
   `pagemap_open` は、読み手を確かめる前にメモリのないプロセスを断るので、ゾンビの
-  `environ`、`auxv`、`pagemap` は、モードが許すどの読み手にも開けません（`ESRCH`）。
+  `environ`、`auxv`、`pagemap`、`mem` は、モードが許すどの読み手にも開けません（`ESRCH`）。
   ゾンビの `smaps_rollup` も、Linux の `smaps_rollup_open` と同じく、どの読み手にも開けません
   （`ESRCH`）。ほかのスレッドより先に終わったリーダーも同じです。
   ゾンビのディレクトリー以外のファイルは、CI ランナーのカーネルと同じく root のもの
@@ -3770,6 +3817,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ユーザー空間にあること（`EFAULT`）、長さがあればバッファーがあること（`EINVAL`）です。
   - ほかの ioctl は `ENOTTY` で、アドレス空間がなくなったあとのスキャンは `ESRCH` です。
 
+- `/proc/<pid>/mem`（モード 0600、大きさ 0。スレッドのものも）は、Linux の `mem_rw` が
+  `FOLL_FORCE` 付きの `access_remote_vm` でするのと同じく、位置が示すアドレスでタスクの
+  メモリを読み書きします。保護がどうであってもページに届き、プライベートなページには
+  そのページだけの写しを作って書き、1 ページずつ進みます。1 バイトも動かせない呼び出し
+  （ページがない、`get_user_pages` が拒む `perf` のリングや `memfd_secret` のファイルのページ）は
+  `EIO` で、途中で止まった呼び出しはそこまでの数を返します。`lseek` は `SEEK_SET` と
+  `SEEK_CUR` だけを受け付け（`EINVAL`）、位置は符号なしです（`FOP_UNSIGNED_OFFSET`）。
+  `lseek` は `i64::MAX` を超えて進め、そこでの読み書きはそのアドレスのバイトを動かします。
+  `pread64` と `pwrite64` は、Linux v7.0 と同じくそのような位置を拒みます（`EINVAL`、
+  制限事項を参照）。開くとそのときのタスクのメモリを取ってそれを持ち続けるので、
+  `execve` やタスクの終わりの後は、そのメモリがなくなり何も動きません。読み手自身のメモリか、アタッチできるタスクの
+  もの（`PTRACE_MODE_ATTACH` とファイルシステムの ID での `mm_access`。`EACCES`）で、
+  メモリのないタスク（ゾンビ）は `ESRCH` です。
+
 - `/proc/<pid>/clear_refs`（モード 0200、大きさ 0。スレッドのものも）は、Linux の
   `clear_refs_write` と同じく、書き込みの先頭の多くて 12 バイト（書き込みはこれを返します）を、
   `kstrtoint` が 10 進で読むとおりに数として読みます（前後の空白を除き、符号と改行 1 つまで。
@@ -4143,8 +4204,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。
   `perf record` が CPU ごとに開くような、一つの CPU のスレッドのイベントは、スレッドが
   その CPU にいる間だけ数えて動き（`event_filter_match`）、有効な時間はその間ずっと
-  進みます。移動はスレッドが移った先の CPU で数え、`sched_setaffinity` は戻る前に
-  スレッドを移します。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
+  進みます。移動はスレッドが移った先の CPU で数え、`sched_setaffinity` は、ほかの
+  スレッドのものも、戻る前にスレッドを移します（その前に眠ったことは眠った CPU で
+  数えます）。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
   キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
   イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
   要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った
@@ -5170,7 +5232,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決めます
     （`rt_tos2priority`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
     設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
-    （閉じているか待ち受けている間は `EINVAL`）。
+    （閉じているか待ち受けている間は `EINVAL`）。`SO_BINDTODEVICE` はデバイスの名前を
+    15 バイトまで取り（ないデバイスは `ENODEV`）、なしか空の名前ならデバイスなしです。
+    `SO_BINDTOIFINDEX` はインデックスを取ります（負なら `EINVAL`、ほかはどれでも受け付け
+    ます）。`CAP_NET_RAW` がなければ、デバイスに結び付いたソケットはそのままです（`EPERM`、
+    `sock_bindtoindex_locked`）。読み出すと、`SO_BINDTODEVICE` は名前が丸ごと入る大きさに
+    名前を返し（それより小さければ `EINVAL`、デバイスのないインデックスなら `ENODEV`）、
+    デバイスなしなら何も返しません。結び付いたソケットはそのデバイスから入ってきたものだけを
+    受け取ります。デバイスなしのものは何でも受け取り、そのデバイスに結び付いたものは、
+    デバイスなしのものより先で、接続済みのものより後に選ばれます（`compute_score`）。
+    名前空間自身のアドレスへのパケットは、IPv4 でも IPv6 でも、そのアドレスのデバイス
+    （そのローカル経路のもの、なければ `lo`）から入ってきます。IPv4 の
+    パケットは、そのデバイスを通る経路だけで進み、どれも通らなければ、そのデバイスの
+    リンク上にあるものとしてそこから出ます。224.0.0.0/24 のグループと limited broadcast の
+    アドレスは、そのままそこから出ます（`ip_route_output_key_hash_rcu`）。デバイスが
+    なくなれば `ENODEV`、落ちている間は `ENETUNREACH` です。受け付けた接続は、
+    リスナーと同じデバイスに結び付きます。
   - **`TCP_INFO`** は、Linux の 280 バイトの `struct tcp_info` を、渡された大きさの分だけ
     返します（`tcp_get_info`）。リスナーは状態、待っている接続とバックログ、まだ接続して
     いないソケットは Linux の既定値、ハンドシェイク中は再送の回数（タイムアウトは
@@ -5227,7 +5304,8 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   ほかのアドレスは `EADDRNOTAVAIL`、`bind` 済みなら `EINVAL`、両方が覆うアドレスで
   ほかのソケット（待ち受け、それが受け付けた接続、クライアント）がポートを持って
   いれば `EADDRINUSE` です。ただし、両方が `SO_REUSEADDR` を付けていて相手が待ち
-  受けていないとき、両方が `SO_REUSEPORT` を付けているときは共有できます。`::` の
+  受けていないとき、両方が `SO_REUSEPORT` を付けているとき、二つが別のデバイスに結び付いて
+  いるとき（`inet_bind_conflict`、`udp_lib_lport_inuse`）は共有できます。`::` の
   IPv6 のソケットは、`IPV6_V6ONLY` でなければ IPv4 のポートも持ちます。`::` でも
   IPv4 のものでもない IPv6 のアドレスに `bind` すると、`__inet6_bind` と同じく
   `IPV6_V6ONLY` が付きます。リンクローカルのアドレスと、ノードかリンクのグループ

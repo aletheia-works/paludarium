@@ -123,9 +123,11 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   `crates/paludarium-harness/tests` の差分テストがどれもどこかで動くかを確かめます。
   `diff_programs`、`diff_windows`、`diff_macos`、`diff_jit` はそれぞれのワークフローで
   動き、ほかはすべて `mise run test:diff` と、`ci.yml` と `quality.yml` の
-  `differential` ジョブにあります。`diff_events`、`diff_threads`、`diff_files` は
-  エミュレーターのバイナリーを動かすので、そのジョブは先にそれをビルドします
-  （`cargo build -p paludarium`）。
+  `differential` ジョブと、`mise run test:diff:jit` と `ci.yml` の `differential-jit`
+  ジョブにあります。`diff_events` と `diff_threads` はエミュレーターのバイナリーを動かすので、
+  そのジョブは先にそれをビルドします（`cargo build -p paludarium`）。JIT ありでは
+  `--jit=N` で動かし、バックグラウンドでコンパイルします。ハーネス自身のゲストは、
+  それを動かすスレッドでコンパイルします。
 
 - ネットワークのケース（`diff_network`）では、テスト自身が 127.0.0.1 でゲストの相手を
   します。そのため、native の Linux とエミュレータは同じサーバーと話します。

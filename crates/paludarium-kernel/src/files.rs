@@ -2753,6 +2753,11 @@ fn positioned(
     offset: u64,
     write: bool,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
+    // A position past `i64::MAX` is a negative one, `EINVAL` before the
+    // descriptor is looked at, as Linux v7.0's `ksys_pread64` and
+    // `ksys_pwrite64` refuse it for every file. Linux master takes it for a
+    // file of unsigned offsets (`/proc/<pid>/mem`); this follows v7.0 until
+    // the CI runners' kernel has that change.
     if (offset as i64) < 0 {
         return Err(Errno::EINVAL);
     }
@@ -2770,11 +2775,19 @@ fn positioned(
     }
     Ok(file)
 }
+/// Whether the file's positions are unsigned (Linux's
+/// `FOP_UNSIGNED_OFFSET`, `unsigned_offsets`): `/proc/<pid>/mem`'s, whose
+/// positions are addresses.
+fn unsigned_offsets(file: &Arc<dyn FileHandle>) -> bool {
+    file.as_any()
+        .is_some_and(|file| file.is::<crate::proc::MemFile>())
+}
 /// Where reads of a regular file stop: at its size, but for /proc's files,
 /// which say 0 as Linux's do and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
         file.is::<crate::proc::PagemapFile>()
+            || file.is::<crate::proc::MemFile>()
             || crate::sysctl::is_file(file)
             || crate::seq::is_file(file)
             || file.is::<crate::proc::GeneratedFile>()
@@ -2793,11 +2806,21 @@ fn request(
     offset: u64,
     read: bool,
 ) -> Result<usize, Errno> {
-    if (count as i64) < 0
-        || offset
-            .checked_add(count)
-            .is_none_or(|end| end > i64::MAX as u64)
-    {
+    // As Linux's `rw_verify_area`: a file of unsigned offsets takes a
+    // negative position, and an end past `i64::MAX`, unless the count
+    // would carry it past the last byte (`EOVERFLOW`).
+    let unsigned = unsigned_offsets(file);
+    if (count as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (offset as i64) < 0 {
+        if !unsigned {
+            return Err(Errno::EINVAL);
+        }
+        if count >= offset.wrapping_neg() {
+            return Err(Errno::EOVERFLOW);
+        }
+    } else if offset.saturating_add(count) > i64::MAX as u64 && !unsigned {
         return Err(Errno::EINVAL);
     }
     let len = usize::try_from(count)
@@ -2900,7 +2923,10 @@ fn size_limited_by(
         return Ok(len);
     }
     let metadata = file.stat()?;
-    if metadata.mode & 0o170000 != 0o100000 {
+    // Only a regular file's size is limited; `/proc/<pid>/mem` stats as one,
+    // but its positions are addresses, and Linux's `mem_write` makes no
+    // `generic_write_checks`.
+    if metadata.mode & 0o170000 != 0o100000 || unsigned_offsets(file) {
         return Ok(len);
     }
     let room = size_room(c, start(&metadata)?)?;
@@ -5196,7 +5222,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?
             };
-            if flags & !(crate::events::NONBLOCK | crate::events::CLOEXEC) != 0 {
+            // `__do_pipe_flags`: O_DIRECT makes packets.
+            if flags & !(crate::events::NONBLOCK | crate::events::CLOEXEC | O_DIRECT) != 0 {
                 return Err(Errno::EINVAL);
             }
             c.mem
@@ -5476,6 +5503,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 }
                 // F_NOTIFY: dnotify.
                 1026 => crate::dnotify::fcntl(c, &d, a[0], a[2] as u32),
+                // F_SETLEASE and F_GETLEASE.
+                1024 => crate::leases::set(c, &d, a[2]),
+                1025 => Ok(crate::leases::get(c, &d)),
                 // The owner and signal of signal-driven I/O.
                 8..=11 | 15 | 16 => crate::fasync::fcntl(c, &d.file, a[1], a[2]),
                 // Byte-range locks: F_GETLK, F_SETLK, F_SETLKW and their OFD forms.
@@ -7555,6 +7585,9 @@ fn open_path(
         }
         if path.entry == crate::proc::TaskEntry::Pagemap {
             return Ok((tasks::pagemap(&task, flags, owner)?, p.to_vec()));
+        }
+        if path.entry == crate::proc::TaskEntry::Mem {
+            return Ok((tasks::mem(c, &task, flags, owner)?, p.to_vec()));
         }
         if path.entry == crate::proc::TaskEntry::Io {
             return Ok((tasks::io(c.processes, &task, flags, owner), p.to_vec()));

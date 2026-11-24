@@ -6,6 +6,8 @@
 //! and the IP header before it.
 
 use crate::bpf_interp::{Packet, Skb};
+// `SKB_MAX_ALLOC`: past it `__ip_append_data` puts the bytes in pages.
+use crate::skb::MAX_ALLOC;
 use crate::sockets::Filter;
 use core::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -20,8 +22,6 @@ const LOOPED: u32 = 5;
 /// The loopback's index (`LOOPBACK_IFINDEX`) and MTU.
 const LO_INDEX: u32 = 1;
 const LO_MTU: usize = 65_536;
-/// `SKB_MAX_ALLOC`: past it `__ip_append_data` puts the bytes in pages.
-const MAX_ALLOC: usize = 16_384 - crate::bpf_prog::SKB_SHARED_INFO;
 /// `sysctl_ip_default_ttl` and IPv6's `hop_limit`.
 const HOPS: u8 = 64;
 /// `IPPROTO_UDP` and `IPPROTO_TCP`.

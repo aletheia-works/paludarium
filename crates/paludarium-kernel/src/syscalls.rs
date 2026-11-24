@@ -2192,6 +2192,7 @@ fn with_wait_mask(
     let old_mask = c.process.signal_mask;
     if let Some(mask) = mask {
         c.process.signal_mask = mask & !unblockable();
+        crate::userfaultfd::mask_changed(c.process.signal_mask);
     }
     let result = call(c);
     if mask.is_some() {
@@ -2199,6 +2200,7 @@ fn with_wait_mask(
             c.process.wait_restore_mask = Some(old_mask);
         } else {
             c.process.signal_mask = old_mask;
+            crate::userfaultfd::mask_changed(c.process.signal_mask);
         }
     }
     result

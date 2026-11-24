@@ -7380,6 +7380,95 @@ static int rename_names_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The proc-mem case: /proc/<pid>/mem reads and writes a task's memory at
+   the address its position gives, as fs/proc/base.c's mem_rw does through
+   access_remote_vm with FOLL_FORCE: a read-only page is written, a call
+   that moves no byte is EIO, lseek takes no SEEK_END, positions are
+   unsigned (FOP_UNSIGNED_OFFSET), and the file is 0600. Another process's
+   is opened as ptrace would attach (mm_access, PTRACE_MODE_ATTACH), and a
+   zombie's, which has no memory, is ESRCH. It runs as root, for the
+   pagemap line. */
+static long pm_errno(long r) { return r < 0 ? -errno : r; }
+static int proc_mem_case(void) {
+    const long page = sysconf(_SC_PAGESIZE);
+    static char word[16] = "original";
+    int fd = open("/proc/self/mem", O_RDWR);
+    printf("open: %d\n", fd >= 0);
+    if (fd < 0) return 1;
+    char buf[16] = {0};
+    long own = pm_errno(pread(fd, buf, 8, (off_t)(uintptr_t)word));
+    printf("own read: %ld %s\n", own, buf);
+    printf("own write: %ld\n", pm_errno(pwrite(fd, "replaced", 8, (off_t)(uintptr_t)word)));
+    printf("word now: %.8s\n", word);
+    /* RLIMIT_FSIZE does not limit it: mem_write makes no
+       generic_write_checks, so no EFBIG and no SIGXFSZ at an address past
+       the limit. */
+    struct rlimit fsize, small = {4096, RLIM_INFINITY};
+    getrlimit(RLIMIT_FSIZE, &fsize);
+    small.rlim_max = fsize.rlim_max;
+    setrlimit(RLIMIT_FSIZE, &small);
+    long limited = pm_errno(pwrite(fd, "replaced", 8, (off_t)(uintptr_t)word));
+    setrlimit(RLIMIT_FSIZE, &fsize);
+    printf("write past RLIMIT_FSIZE: %ld\n", limited);
+    char *ro = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long forced = pm_errno(pwrite(fd, "F", 1, (off_t)(uintptr_t)ro));
+    printf("read-only write: %ld byte=%c\n", forced, ro[0]);
+    char *gone = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(gone, (size_t)page);
+    printf("unmapped read: %ld\n", pm_errno(pread(fd, buf, 8, (off_t)(uintptr_t)gone)));
+    printf("high read: %ld\n", pm_errno(syscall(SYS_pread64, fd, buf, 8, (long)(1UL << 63))));
+    long end = pm_errno(lseek(fd, 0, SEEK_END));
+    int set = lseek(fd, (off_t)(uintptr_t)word, SEEK_SET) == (off_t)(uintptr_t)word;
+    printf("lseek end: %ld set: %d\n", end, set);
+    memset(buf, 0, sizeof buf);
+    long at = pm_errno(read(fd, buf, 8));
+    printf("read at position: %ld %s\n", at, buf);
+    struct stat st;
+    fstat(fd, &st);
+    printf("mode: %o\n", (unsigned)(st.st_mode & 07777));
+    close(fd);
+    /* pagemap (0400) has no write operation, but root opens it for
+       writing, and F_GETFL shows the mode it was opened with (f_flags). */
+    int map = open("/proc/self/pagemap", O_RDWR);
+    printf("pagemap rdwr: open=%d accmode=%d\n", map >= 0,
+           map < 0 ? -errno : fcntl(map, F_GETFL) & O_ACCMODE);
+    if (map >= 0) close(map);
+
+    /* A child's memory, at the same address after fork. */
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 2;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        memcpy(word, "in-child", 8);
+        char c = 1;
+        if (write(ready[1], &c, 1) != 1) _exit(90);
+        if (read(done[0], &c, 1) != 1) _exit(91);
+        _exit(memcmp(word, "patched!", 8) == 0 ? 0 : 92);
+    }
+    char c;
+    if (read(ready[0], &c, 1) != 1) return 3;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/mem", child);
+    int theirs = open(path, O_RDWR);
+    memset(buf, 0, sizeof buf);
+    long got = theirs < 0 ? -errno : pm_errno(pread(theirs, buf, 8, (off_t)(uintptr_t)word));
+    long put = theirs < 0 ? -errno : pm_errno(pwrite(theirs, "patched!", 8, (off_t)(uintptr_t)word));
+    printf("child: open %d read %ld %s write %ld\n", theirs >= 0, got, buf, put);
+    if (write(done[1], &c, 1) != 1) return 4;
+    siginfo_t info;
+    waitid(P_PID, child, &info, WEXITED | WNOWAIT);
+    printf("child saw it: %d\n", info.si_code == CLD_EXITED && info.si_status == 0);
+    int zombie = open(path, O_RDONLY);
+    printf("zombie: %d\n", zombie < 0 ? -errno : 0);
+    if (theirs >= 0) {
+        memset(buf, 0, sizeof buf);
+        printf("after exit: %ld\n", pm_errno(pread(theirs, buf, 8, (off_t)(uintptr_t)word)));
+        close(theirs);
+    }
+    waitpid(child, NULL, 0);
+    return 0;
+}
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
    faults a task took (mm/memory.c mm_account_fault, current->min_flt),
    its own accesses' and those of get_user_pages for it: mlock's
@@ -11331,6 +11420,126 @@ static int mrelease_fatal_case(void) {
     }
     return 0;
 }
+/* File leases (F_SETLEASE, F_GETLEASE), as fs/locks.c takes and gives
+ * them back. No open or truncate here meets a lease that it would break. */
+static int lease_errno(int fd, int arg) {
+    return fcntl(fd, F_SETLEASE, arg) < 0 ? -errno : 0;
+}
+static int file_leases_case(void) {
+    char dir[] = "/tmp/leases-XXXXXX";
+    if (!mkdtemp(dir)) return 1;
+    char path[64];
+    snprintf(path, sizeof path, "%s/f", dir);
+    int made = open(path, O_RDWR | O_CREAT, 0644);
+    if (made < 0 || write(made, "x", 1) != 1) return 2;
+    close(made);
+    /* Each call is its own statement: printf's arguments have no order. */
+    int rd = open(path, O_RDONLY);
+    int get = fcntl(rd, F_GETLEASE);
+    int unlck = lease_errno(rd, F_UNLCK);
+    int bad = lease_errno(rd, 5);
+    printf("none get=%d unlck=%d bad=%d\n", get, unlck, bad);
+    int owner_before = fcntl(rd, F_GETOWN);
+    int read_lease = lease_errno(rd, F_RDLCK);
+    get = fcntl(rd, F_GETLEASE);
+    int owner_self = fcntl(rd, F_GETOWN) == getpid();
+    printf("owner before=%d read=%d get=%d owner-self=%d\n", owner_before, read_lease, get, owner_self);
+    /* The only open: the lease becomes a write lease. */
+    int upgrade = lease_errno(rd, F_WRLCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("upgrade=%d get=%d\n", upgrade, get);
+    /* A dup shares the description, and its lease. */
+    int dup_rd = dup(rd);
+    int dup_get = fcntl(dup_rd, F_GETLEASE);
+    int dup_unlck = lease_errno(dup_rd, F_UNLCK);
+    get = fcntl(rd, F_GETLEASE);
+    int owner = fcntl(rd, F_GETOWN);
+    int sig = fcntl(rd, F_GETSIG);
+    int again = lease_errno(rd, F_UNLCK);
+    printf("dup get=%d unlck=%d get=%d owner=%d sig=%d again=%d\n", dup_get, dup_unlck, get, owner, sig, again);
+    /* No lease now: the opens below break none. Leases they refuse. */
+    if (fcntl(rd, F_GETLEASE) != F_UNLCK) return 5;
+    int rw = open(path, O_RDWR);
+    int rw_read = lease_errno(rw, F_RDLCK);
+    int rw_write = lease_errno(rw, F_WRLCK);
+    printf("rw read=%d write-beside-reader=%d\n", rw_read, rw_write);
+    printf("reader beside writer=%d\n", lease_errno(rd, F_RDLCK));
+    close(dup_rd);
+    close(rd);
+    int alone = lease_errno(rw, F_WRLCK);
+    get = fcntl(rw, F_GETLEASE);
+    unlck = lease_errno(rw, F_UNLCK);
+    printf("rw alone write=%d get=%d unlck=%d\n", alone, get, unlck);
+    close(rw);
+    /* A description's close gives its lease back. A read lease breaks
+       for no read-only open. */
+    int one = open(path, O_RDONLY);
+    printf("one read=%d\n", lease_errno(one, F_RDLCK));
+    int two = open(path, O_RDONLY);
+    int two_write = lease_errno(two, F_WRLCK);
+    int two_read = lease_errno(two, F_RDLCK);
+    printf("two write=%d read=%d\n", two_write, two_read);
+    printf("two unlck=%d\n", lease_errno(two, F_UNLCK));
+    close(one);
+    int after_write = lease_errno(two, F_WRLCK);
+    int after_unlck = lease_errno(two, F_UNLCK);
+    printf("after close write=%d unlck=%d\n", after_write, after_unlck);
+    close(two);
+    /* Files that take none. */
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    int dir_lease = lease_errno(d, F_RDLCK);
+    get = fcntl(d, F_GETLEASE);
+    printf("dir=%d get=%d\n", dir_lease, get);
+    close(d);
+    int pipes[2];
+    if (pipe(pipes)) return 3;
+    printf("pipe=%d\n", lease_errno(pipes[0], F_RDLCK));
+    close(pipes[0]);
+    close(pipes[1]);
+    int status = open("/proc/self/status", O_RDONLY);
+    printf("proc=%d\n", lease_errno(status, F_RDLCK));
+    close(status);
+    int path_only = open(path, O_PATH);
+    get = fcntl(path_only, F_GETLEASE);
+    int path_errno = errno;
+    printf("o_path get=%d errno=%d\n", get, path_errno);
+    close(path_only);
+    /* The sysctls, and another user's file. */
+    char buf[32] = {0};
+    int s = open("/proc/sys/fs/lease-break-time", O_RDONLY);
+    long n = s < 0 ? -errno : read(s, buf, sizeof buf - 1);
+    printf("lease-break-time=%ld %s", n, n > 0 ? buf : "\n");
+    if (s >= 0) close(s);
+    memset(buf, 0, sizeof buf);
+    s = open("/proc/sys/fs/leases-enable", O_RDWR);
+    n = s < 0 ? -errno : pread(s, buf, sizeof buf - 1, 0);
+    printf("leases-enable=%ld %s", n, n > 0 ? buf : "\n");
+    if (s >= 0) {
+        printf("disable=%ld\n", (long)pwrite(s, "0\n", 2, 0));
+        int off = open(path, O_RDONLY);
+        printf("disabled read=%d\n", lease_errno(off, F_RDLCK));
+        close(off);
+        printf("enable=%ld\n", (long)pwrite(s, "1\n", 2, 0));
+        close(s);
+    }
+    int theirs = open(path, O_RDONLY);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534)) _exit(4);
+        int other = lease_errno(theirs, F_RDLCK);
+        int other_get = fcntl(theirs, F_GETLEASE);
+        printf("other user=%d get=%d\n", other, other_get);
+        fflush(stdout);
+        _exit(0);
+    }
+    int wstatus;
+    waitpid(child, &wstatus, 0);
+    printf("child=%d\n", WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
+    close(theirs);
+    unlink(path);
+    rmdir(dir);
+    return 0;
+}
 /* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
  * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
  * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
@@ -11871,6 +12080,17 @@ static int grows_down_case(void) {
     grows_touch("below", g, g - page, 1);
     grows_touch("far-below", g, g - 9 * page, 0);
     smaps_show("grown", g, SMAPS_SIZE);
+    /* A system call's copy below it grows it as well, as
+     * do_user_addr_fault grows it for a kernel access (expand_stack). */
+    int pipes[2];
+    if (pipe(pipes)) return 79;
+    write(pipes[1], "grown", 5);
+    char *low = (char *)grows_start(g) - page;
+    long got = read(pipes[0], low + 8, 5);
+    printf("copy-below: read %ld grown-to-it=%d bytes %.5s\n", got, grows_start(g) == (uintptr_t)low,
+           got == 5 ? low + 8 : "-----");
+    close(pipes[0]);
+    close(pipes[1]);
     /* PROT_GROWSDOWN reaches down to the start of the VMA. */
     printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
     grows_touch("read-only", g, g - page, 1);
@@ -14410,6 +14630,119 @@ static int setfl_checks_case(void) {
     return 0;
 }
 
+/* A pipe's packet mode (O_DIRECT, fs/pipe.c's is_packetized) and its
+   buffers: a packetized write makes a buffer of a page at most for each
+   page it writes, which no write merges into; a read ends at the end of a
+   packet and drops what it did not take. A pipe holds 16 buffers, so 16
+   packets fill it however small they are, while other writes merge into
+   the last buffer where it has room. splice and tee move or copy buffers,
+   packets kept, and a splice out of a pipe takes bytes across them. Each
+   value is a count or the errno. */
+static long pp_write(int fd, const char *s, size_t n) {
+    long r = write(fd, s, n);
+    return r < 0 ? -errno : r;
+}
+static void pp_reads(const char *name, int fd, size_t want, int times) {
+    printf("%s:", name);
+    for (int i = 0; i < times; i++) {
+        char buf[16384];
+        long r = read(fd, buf, want);
+        if (r < 0) {
+            printf(" %d", -errno);
+        } else {
+            printf(" %ld", r);
+            if (r > 0 && r <= 8) printf("=%.*s", (int)r, buf);
+        }
+    }
+    printf("\n");
+}
+static int pipe_packets_case(void) {
+    int p[2];
+    if (pipe2(p, O_DIRECT | O_NONBLOCK)) {
+        printf("pipe2 O_DIRECT: %d\n", errno);
+        return 1;
+    }
+    printf("flags read-direct=%d write-direct=%d\n", !!(fcntl(p[0], F_GETFL) & O_DIRECT),
+           !!(fcntl(p[1], F_GETFL) & O_DIRECT));
+    long w1 = pp_write(p[1], "abc", 3);
+    long w2 = pp_write(p[1], "defgh", 5);
+    long w3 = pp_write(p[1], "i", 1);
+    printf("writes %ld %ld %ld\n", w1, w2, w3);
+    /* A read of nothing leaves the packet at the front as it is. */
+    char none[1];
+    long zero = read(p[0], none, 0);
+    printf("zero %ld\n", zero < 0 ? -errno : zero);
+    pp_reads("reads", p[0], 100, 4);
+    printf("write %ld\n", pp_write(p[1], "jklmn", 5));
+    pp_reads("short", p[0], 2, 1);
+    pp_reads("after-short", p[0], 100, 1);
+    static char big[20000];
+    memset(big, 'x', sizeof big);
+    printf("big %ld\n", pp_write(p[1], big, 10000));
+    pp_reads("big-reads", p[0], 8192, 4);
+    long ones[17];
+    for (int i = 0; i < 17; i++) ones[i] = pp_write(p[1], "z", 1);
+    printf("ones first=%ld sixteenth=%ld seventeenth=%ld\n", ones[0], ones[15], ones[16]);
+    printf("resize-busy %d\n", fcntl(p[0], F_SETPIPE_SZ, 4096) < 0 ? errno : 0);
+    for (int i = 0; i < 16; i++) {
+        char c;
+        if (read(p[0], &c, 1) != 1) break;
+    }
+    close(p[0]);
+    close(p[1]);
+
+    /* Plain writes merge into the last buffer where it has room: 4097
+       bytes at a time until a full pipe refuses. */
+    if (pipe2(p, O_NONBLOCK)) return 1;
+    printf("plain:");
+    long total = 0;
+    for (int i = 0; i < 40; i++) {
+        long r = pp_write(p[1], big, 4097);
+        printf(" %ld", r);
+        if (r < 0) break;
+        total += r;
+    }
+    printf(" total=%ld\n", total);
+    close(p[0]);
+    close(p[1]);
+
+    /* O_DIRECT of the writing description only, set and cleared. */
+    if (pipe2(p, O_NONBLOCK)) return 1;
+    printf("setfl %d", fcntl(p[1], F_SETFL, O_DIRECT | O_NONBLOCK) < 0 ? errno : 0);
+    printf(" read-direct=%d write-direct=%d\n", !!(fcntl(p[0], F_GETFL) & O_DIRECT),
+           !!(fcntl(p[1], F_GETFL) & O_DIRECT));
+    pp_write(p[1], "ab", 2);
+    pp_write(p[1], "cd", 2);
+    fcntl(p[1], F_SETFL, O_NONBLOCK);
+    pp_write(p[1], "ef", 2);
+    pp_write(p[1], "gh", 2);
+    pp_reads("mixed", p[0], 100, 4);
+    close(p[0]);
+    close(p[1]);
+
+    /* splice and tee between pipes keep packets; a splice to a file takes
+       bytes across them. */
+    int q[2], r2[2];
+    if (pipe2(p, O_DIRECT | O_NONBLOCK) || pipe2(q, O_NONBLOCK) || pipe2(r2, O_NONBLOCK)) return 1;
+    pp_write(p[1], "abc", 3);
+    pp_write(p[1], "de", 2);
+    long teed = tee(p[0], r2[1], 100, SPLICE_F_NONBLOCK);
+    long spliced = splice(p[0], NULL, q[1], NULL, 100, SPLICE_F_NONBLOCK);
+    printf("tee %ld splice %ld\n", teed < 0 ? -errno : teed, spliced < 0 ? -errno : spliced);
+    pp_reads("teed", r2[0], 100, 3);
+    pp_reads("spliced", q[0], 100, 3);
+    pp_write(p[1], "fgh", 3);
+    pp_write(p[1], "ij", 2);
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-pipe-packets-%d", getpid());
+    int file = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    long out = splice(p[0], NULL, file, NULL, 100, SPLICE_F_NONBLOCK);
+    printf("to-file %ld size %ld\n", out < 0 ? -errno : out, (long)lseek(file, 0, SEEK_END));
+    close(file);
+    unlink(path);
+    return 0;
+}
+
 /* The setattrs case: mount_setattr and open_tree_attr (Linux master's) in a
    mount namespace of a user namespace of its own: the checks of a struct
    mount_attr, a mount's flags set and cleared with the mounts below it,
@@ -15772,8 +16105,9 @@ static int th_inner(const char *m) {
 /* The tmpfs-huge-placement case: a mapping of a file of a tmpfs mount with
    huge= goes at a 2 MiB boundary, or one page past one for an offset of one
    page, as shmem_get_unmapped_area places it, unless a free hint is given;
-   so a fault of it advised MADV_HUGEPAGE takes a 512-page folio. Only what
-   holds for every layout is printed. */
+   so a fault of it advised MADV_HUGEPAGE takes a 512-page folio. A move by
+   mremap goes there too (vrm_set_new_addr asks the file). Only what holds
+   for every layout is printed. */
 static int thp_inner(const char *m) {
     long huge = 2 << 20;
     if (th_mount(m, "huge=always")) return 0;
@@ -15785,6 +16119,18 @@ static int thp_inner(const char *m) {
     if (a == MAP_FAILED || b == MAP_FAILED) return 81;
     printf("aligned=%d offset=%d\n", ((uintptr_t)a & (huge - 1)) == 0,
            ((uintptr_t)b & (huge - 1)) == 4096);
+    /* MREMAP_DONTUNMAP: a move that leaves the old mapping. */
+    char *ma = mremap(a, 2 * huge, 2 * huge, MREMAP_MAYMOVE | 4);
+    char *mb = mremap(b, 2 * huge, 2 * huge, MREMAP_MAYMOVE | 4);
+    if (ma == MAP_FAILED || mb == MAP_FAILED) return 84;
+    printf("moved=%d moved-offset=%d\n", ((uintptr_t)ma & (huge - 1)) == 0,
+           ((uintptr_t)mb & (huge - 1)) == 4096);
+    /* A grow that has to move: a page right after it is taken. */
+    mmap(ma + 2 * huge, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    char *grown = mremap(ma, 2 * huge, 3 * huge, MREMAP_MAYMOVE);
+    if (grown == MAP_FAILED) return 85;
+    printf("grown=%d aligned=%d\n", grown != ma, ((uintptr_t)grown & (huge - 1)) == 0);
+    munmap(grown, 3 * huge), munmap(mb, 2 * huge);
     char *free_area = mmap(NULL, 4 * huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (free_area == MAP_FAILED) return 82;
     munmap(free_area, 4 * huge);
@@ -37899,6 +38245,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
+    if (!strcmp(mode, "file-leases")) return file_leases_case();
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
@@ -37936,6 +38283,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "setfl-kinds")) return setfl_kinds_case();
     if (!strcmp(mode, "setattrs")) return setattrs_case();
     if (!strcmp(mode, "setfl-checks")) return setfl_checks_case();
+    if (!strcmp(mode, "pipe-packets")) return pipe_packets_case();
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
@@ -38454,6 +38802,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "exec-names-child")) return exec_names_child();
     if (!strcmp(mode, "rename-names")) return rename_names_case();
     if (!strcmp(mode, "rename-names-child")) return rename_names_child();
+    if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();

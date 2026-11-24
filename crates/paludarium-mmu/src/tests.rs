@@ -2387,3 +2387,94 @@ fn an_aligned_placement_puts_a_mapping_at_its_offset_past_a_boundary() {
         assert_eq!(place(&m, Some(hint), 2 * HUGE, 0), hint.0, "{bottom_up}");
     }
 }
+
+/// A file of a tmpfs mount with `huge=`, whose mappings `mremap` moves to a
+/// 2 MiB boundary.
+struct HugeFile(u64);
+
+impl PageSource for HugeFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let n = buf
+            .len()
+            .min(usize::try_from(self.0.saturating_sub(offset)).unwrap_or(0));
+        buf[..n].fill(0);
+        Ok(n)
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.0)
+    }
+    fn huge_placement(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_moved_mapping_of_a_huge_file_goes_at_its_offset_past_a_boundary() {
+    const HUGE: u64 = 2 << 20;
+    let m = AddressSpace::new();
+    let file: Arc<dyn PageSource> = Arc::new(HugeFile(8 * HUGE));
+    let pages = SharedPages::new().with_source(file.clone());
+    let cache = SharedPages::new().with_source(file);
+    let moved = |at: GuestAddr, len: u64| {
+        m.remap_shared(
+            at,
+            len,
+            len,
+            Remap {
+                may_move: true,
+                fixed: false,
+                keep_old: true,
+                new_addr: GuestAddr(0),
+            },
+        )
+        .unwrap()
+        .0
+    };
+    // Shared, at offset 0 and at one page in.
+    let at = m
+        .map_shared(None, 2 * HUGE, Prot::READ, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 2 * HUGE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    assert_eq!(moved(at, 2 * HUGE) % HUGE, 0);
+    let at = m
+        .map_shared(None, 2 * HUGE, Prot::READ, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 2 * HUGE, &pages, PAGE_SIZE, SharedWrites::Allowed)
+        .unwrap();
+    assert_eq!(moved(at, 2 * HUGE) % HUGE, PAGE_SIZE);
+    // Private, which the file's page cache backs.
+    let at = m
+        .map_shared(None, 2 * HUGE, Prot::READ, MappingKind::File)
+        .unwrap();
+    m.back_with_cache(at, 2 * HUGE, &cache, 0).unwrap();
+    assert_eq!(moved(at, 2 * HUGE) % HUGE, 0);
+    // A grow that has to move, the old mapping gone.
+    let at = m
+        .map_shared(None, 2 * HUGE, Prot::READ, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 2 * HUGE, &pages, PAGE_SIZE, SharedWrites::Allowed)
+        .unwrap();
+    m.map_shared(
+        Some(GuestAddr(at.0 + 2 * HUGE)),
+        PAGE_SIZE,
+        Prot::NONE,
+        MappingKind::Anonymous,
+    )
+    .ok();
+    let grown = m
+        .remap_shared(
+            at,
+            2 * HUGE,
+            3 * HUGE,
+            Remap {
+                may_move: true,
+                fixed: false,
+                keep_old: false,
+                new_addr: GuestAddr(0),
+            },
+        )
+        .unwrap();
+    assert_ne!(grown, at);
+    assert_eq!(grown.0 % HUGE, PAGE_SIZE);
+}

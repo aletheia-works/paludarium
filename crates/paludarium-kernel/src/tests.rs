@@ -2157,6 +2157,8 @@ fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_on
     assert_ne!(u64::from_le_bytes(entry) & 1 << 63, 0);
     let root = f.ret(2, &[path, 2]);
     assert!(root < 1 << 32, "{root:#x}");
+    // F_GETFL shows the mode it was opened with, though it has no write.
+    assert_eq!(f.ret(72, &[root, 3]) & 3, 2);
     // Without CAP_DAC_OVERRIDE: EACCES for writing, as its mode is 0400.
     // The change of IDs makes the process undumpable, whose files root owns:
     // PR_SET_DUMPABLE gives them back.
@@ -2164,6 +2166,52 @@ fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_on
     assert_eq!(f.ret(157, &[4, 1]), 0);
     assert_eq!(f.ret(2, &[path, 2]), errno(Errno::EACCES));
     assert!(f.ret(2, &[path, 0]) < 1 << 32);
+}
+#[test]
+fn proc_mem_reads_and_writes_the_process_memory_through_the_system_calls() {
+    let mut f = fixture();
+    let (path, buf) = (DATA, DATA + 0x400);
+    f.mem.write(GuestAddr(path), b"/proc/self/mem\0").unwrap();
+    f.mem.write(GuestAddr(buf), b"secret").unwrap();
+    let fd = f.ret(2, &[path, 2]);
+    assert!(fd < 1 << 32, "{fd:#x}");
+    // pread64 at the address of `buf`, pwrite64 over it.
+    assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, buf]), 6);
+    let mut read = [0; 6];
+    f.mem.read(GuestAddr(buf + 0x800), &mut read).unwrap();
+    assert_eq!(&read, b"secret");
+    f.mem.write(GuestAddr(buf + 0x900), b"public").unwrap();
+    assert_eq!(f.ret(18, &[fd, buf + 0x900, 6, buf]), 6);
+    f.mem.read(GuestAddr(buf), &mut read).unwrap();
+    assert_eq!(&read, b"public");
+    // RLIMIT_FSIZE does not limit it, as `mem_write` makes no
+    // `generic_write_checks`: setrlimit(RLIMIT_FSIZE, one page), then a
+    // write at an address past it.
+    let limit = DATA + 0xc00;
+    f.mem.write_u64(GuestAddr(limit), 0x1000).unwrap();
+    f.mem.write_u64(GuestAddr(limit + 8), 0x1000).unwrap();
+    assert_eq!(f.ret(160, &[1, limit]), 0);
+    assert_eq!(f.ret(18, &[fd, buf + 0x900, 6, buf]), 6);
+    // Nothing is mapped at 16 KiB: EIO. lseek from the end: EINVAL.
+    assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, 0x4000]), errno(Errno::EIO));
+    // pread64 at a position past i64::MAX is EINVAL, as Linux v7.0's
+    // `ksys_pread64` refuses it for every file.
+    assert_eq!(
+        f.ret(17, &[fd, buf + 0x800, 6, 1 << 63]),
+        errno(Errno::EINVAL)
+    );
+    // The file position is unsigned (FOP_UNSIGNED_OFFSET): a read there is
+    // at an address with nothing there.
+    assert_eq!(f.ret(8, &[fd, 1 << 63, 0]), 1 << 63);
+    assert_eq!(f.ret(0, &[fd, buf + 0x800, 6]), errno(Errno::EIO));
+    assert_eq!(f.ret(8, &[fd, 0, 2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(8, &[fd, buf, 0]), buf);
+    // 0600, as Linux's.
+    let st = DATA + 0x1000 - 144;
+    assert_eq!(f.ret(5, &[fd, st]), 0);
+    let mut mode = [0; 4];
+    f.mem.read(GuestAddr(st + 24), &mut mode).unwrap();
+    assert_eq!(u32::from_le_bytes(mode) & 0o7777, 0o600);
 }
 #[test]
 fn own_proc_files_are_the_process_owners_and_open_as_their_modes_let() {
@@ -2720,6 +2768,58 @@ fn syscall_fcntl_owner() {
     assert_eq!(f.ret(72, &[dup, 1]), 1);
     assert_eq!(f.ret(3, &[fd]), 0);
     assert_eq!(f.ret(5, &[dup, DATA + 100]), 0);
+}
+/// `F_SETLEASE` and `F_GETLEASE`, as Linux's `fs/locks.c` takes and gives
+/// them back.
+#[test]
+fn a_lease_is_taken_changed_and_given_back_as_fs_locks_does() {
+    let mut f = fixture();
+    let path = put(&mut f, 0, b"/tmp/leased");
+    let made = f.ret(2, &[path, 0o102, 0o644]);
+    assert_eq!(f.ret(3, &[made]), 0);
+    let rd = f.ret(2, &[path, 0, 0]);
+    // None yet; a bad type; F_UNLCK with none.
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 1024, 5]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), errno(Errno::EAGAIN));
+    // A read lease gives the description its owner.
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(72, &[rd, 1025]), 0);
+    assert_ne!(f.ret(72, &[rd, 9]), 0);
+    // The only open may take a write lease; a dup shares it.
+    assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
+    let dup = f.ret(32, &[rd]);
+    assert_eq!(f.ret(72, &[dup, 1025]), 1);
+    // A second reader keeps a write lease from another description.
+    let two = f.ret(2, &[path, 0, 0]);
+    assert_eq!(f.ret(72, &[two, 1024, 1]), errno(Errno::EAGAIN));
+    // F_UNLCK takes the owner and the signal away.
+    assert_eq!(f.ret(72, &[rd, 10, 5]), 0);
+    assert_eq!(f.ret(72, &[dup, 1024, 2]), 0);
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 9]), 0);
+    assert_eq!(f.ret(72, &[rd, 11]), 0);
+    // A writer keeps out read leases, and its own is refused.
+    let rw = f.ret(2, &[path, 2, 0]);
+    assert_eq!(f.ret(72, &[rw, 1024, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[two, 1024, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(3, &[rw]), 0);
+    // A description's last close gives its lease back.
+    assert_eq!(f.ret(72, &[two, 1024, 0]), 0);
+    assert_eq!(f.ret(3, &[two]), 0);
+    assert_eq!(f.ret(3, &[dup]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    // A directory and a pipe take none.
+    let tmp = put(&mut f, 0x40, b"/tmp");
+    let dir = f.ret(2, &[tmp, 0o200000, 0]);
+    assert_eq!(f.ret(72, &[dir, 1024, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(72, &[dir, 1025]), 2);
+    assert_eq!(f.ret(22, &[DATA + 0x80]), 0);
+    let mut ends = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x80), &mut ends).unwrap();
+    let pipe = u64::from(u32::from_le_bytes(ends));
+    assert_eq!(f.ret(72, &[pipe, 1024, 0]), errno(Errno::EINVAL));
 }
 #[test]
 fn syscall_flock_cancel() {
@@ -4508,6 +4608,35 @@ mod mprotect_order {
         // pkey_mprotect with no key is the same.
         assert_eq!(f.ret(329, &[stack, 4096, 1 | GROWSDOWN, u64::MAX]), 0);
         assert_eq!(prot_at(&f, stack), Prot::READ);
+    }
+
+    /// A system call's copy into the room below a mapping that grows down
+    /// grows it, as Linux's `do_user_addr_fault` grows it for a kernel
+    /// access (`lock_mm_and_find_vma`'s `expand_stack`).
+    #[test]
+    fn a_system_call_s_copy_grows_a_map_growsdown_mapping() {
+        const MAP_GROWSDOWN: u64 = 0x100;
+        const PRIVATE_FIXED: u64 = 0x02 | 0x10 | 0x20;
+        let mut f = fixture();
+        let at = 0x60_0000;
+        let flags = PRIVATE_FIXED | MAP_GROWSDOWN;
+        assert_eq!(f.ret(9, &[at, 0x2000, 3, flags, u64::MAX, 0]), at);
+        assert_eq!(f.ret(293, &[DATA, 0]), 0);
+        let mut fds = [0u8; 8];
+        f.mem.read(GuestAddr(DATA), &mut fds).unwrap();
+        let reader = u64::from(u32::from_le_bytes(fds[..4].try_into().unwrap()));
+        let writer = u64::from(u32::from_le_bytes(fds[4..].try_into().unwrap()));
+        f.mem.write(GuestAddr(DATA + 0x100), b"grown").unwrap();
+        assert_eq!(f.ret(1, &[writer, DATA + 0x100, 5]), 5);
+        // Read into the page below its start: the mapping takes it.
+        assert_eq!(f.ret(0, &[reader, at - 0x1000 + 8, 5]), 5);
+        assert_eq!(
+            f.mem.vma_at(GuestAddr(at)),
+            Some((GuestAddr(at - 0x1000), 0x3000))
+        );
+        let mut got = [0u8; 5];
+        f.mem.read(GuestAddr(at - 0x1000 + 8), &mut got).unwrap();
+        assert_eq!(&got, b"grown");
     }
 
     #[test]

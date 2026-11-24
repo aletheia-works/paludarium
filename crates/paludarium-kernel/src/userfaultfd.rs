@@ -16,8 +16,8 @@
 //! a signal comes; then the instruction runs again, as Linux's
 //! `handle_userfault` gives `VM_FAULT_RETRY`. With `UFFD_FEATURE_SIGBUS`
 //! the fault raises SIGBUS instead. A system call's own copy to or from
-//! such a page is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where Linux
-//! waits as for an instruction unless that flag was given.
+//! such a page waits as an instruction does ([`KernelCopies`]), unless the
+//! context took `UFFD_USER_MODE_ONLY` (`EFAULT`).
 //!
 //! `UFFDIO_POISON` poisons pages that have none: an access to one raises
 //! SIGBUS (`BUS_MCEERR_AR`), registered or not, as Linux's poison marker
@@ -563,6 +563,214 @@ pub(crate) fn fault(c: &mut Context<'_>, id: u64, access: Access) -> Option<bool
     state.pending.retain(|w| !Arc::ptr_eq(w, &waiting));
     state.read.retain(|w| !Arc::ptr_eq(w, &waiting));
     Some(false)
+}
+
+/// What a kernel access to user memory needs to resolve its fault with no
+/// [`Context`] at hand ([`paludarium_mmu::faults::Resolver`]), as a system
+/// call's copy to or from user memory meets one: Linux's
+/// `do_user_addr_fault` serves it as it does an instruction's, growing a
+/// mapping that grows down (`expand_stack`) and waiting for a `userfaultfd`
+/// (`handle_userfault`), unless the context took `UFFD_USER_MODE_ONLY` or
+/// `UFFD_FEATURE_SIGBUS`, or was released (`EFAULT`). Its wait goes on
+/// through a signal that is not fatal, as `fault_signal_pending` ends a
+/// kernel fault's retries only for a fatal one, and ends for a SIGKILL or
+/// the process's exit, which fails the access too.
+pub(crate) struct KernelCopies {
+    pub(crate) mem: MemoryView,
+    pub(crate) group: Arc<crate::ThreadGroup>,
+    pub(crate) tid: u32,
+    /// What the thread waits on: its files' readiness.
+    pub(crate) hub: Arc<ReadinessHub>,
+    pub(crate) host: Arc<dyn paludarium_host::Host>,
+    /// The thread's inbox, for the signals that end the wait (with the
+    /// call's signal mask, [`CALL`]); the wait cannot take them in, nor wake
+    /// for them, as the inbox's wake token stays set until the call returns
+    /// and takes them in.
+    pub(crate) inbox: Arc<crate::inbox::SignalInbox>,
+    /// Where `RLIMIT_STACK` and `RLIMIT_MEMLOCK` are, and whether the
+    /// thread has `CAP_IPC_LOCK`, for a growth, as the kernel's
+    /// `stack_limits` reads them for an instruction's.
+    pub(crate) processes: Arc<crate::processes::Processes>,
+    pub(crate) pid: u32,
+}
+
+thread_local! {
+    /// The signal mask of the system call the host thread runs, as it is
+    /// now (`ppoll`, `pselect6`, `epoll_pwait`, `io_pgetevents` and
+    /// `io_uring_enter` set a temporary one, under which Linux's copies
+    /// fault too), and whether its thread has `CAP_IPC_LOCK`.
+    static CALL: core::cell::Cell<(u64, bool)> = const { core::cell::Cell::new((0, false)) };
+}
+
+/// A system call starts with `mask` and `ipc_lock`; what was there.
+pub(crate) fn enter_call(mask: u64, ipc_lock: bool) -> (u64, bool) {
+    CALL.with(|call| call.replace((mask, ipc_lock)))
+}
+
+/// What [`enter_call`] returned, back.
+pub(crate) fn leave_call(was: (u64, bool)) {
+    CALL.with(|call| call.set(was));
+}
+
+/// The call's signal mask is now `mask`.
+pub(crate) fn mask_changed(mask: u64) {
+    CALL.with(|call| call.set((mask, call.get().1)));
+}
+
+impl KernelCopies {
+    /// Whether it serves a call of thread `tid` of process `pid` in `mem`,
+    /// with these files, group and inbox: it is kept from call to call.
+    pub(crate) fn serves(
+        &self,
+        mem: &paludarium_mmu::AddressSpace,
+        group: &Arc<crate::ThreadGroup>,
+        hub: &Arc<ReadinessHub>,
+        inbox: &Arc<crate::inbox::SignalInbox>,
+        pid: u32,
+        tid: u32,
+    ) -> bool {
+        self.mem.is_of(mem)
+            && Arc::ptr_eq(&self.group, group)
+            && Arc::ptr_eq(&self.hub, hub)
+            && Arc::ptr_eq(&self.inbox, inbox)
+            && self.pid == pid
+            && self.tid == tid
+    }
+}
+
+impl paludarium_mmu::faults::Resolver for KernelCopies {
+    fn resolve(&self, addr: u64, write: bool) -> bool {
+        let at = GuestAddr(addr);
+        const RLIMIT_STACK: usize = 3;
+        const RLIMIT_MEMLOCK: usize = 8;
+        let stack = self.processes.soft_limit(self.pid, RLIMIT_STACK);
+        let (_, ipc_lock) = CALL.with(core::cell::Cell::get);
+        let lock = if ipc_lock {
+            u64::MAX
+        } else {
+            self.processes.soft_limit(self.pid, RLIMIT_MEMLOCK) >> 12
+        };
+        if self.mem.grow_down(at, stack, lock) {
+            return true;
+        }
+        let Some((id, reason)) = self.mem.userfault_for(at, write, false) else {
+            return false;
+        };
+        self.wait(
+            id,
+            Access {
+                address: addr,
+                write,
+                fetch: false,
+                reason,
+            },
+        )
+    }
+}
+
+impl KernelCopies {
+    /// `fatal_signal_pending`.
+    fn fatal(&self) -> bool {
+        self.group
+            .fatal_pending(&self.inbox, CALL.with(core::cell::Cell::get).0)
+    }
+    fn still_faults(&self, id: u64, access: &Access) -> bool {
+        self.mem
+            .userfault_for(GuestAddr(access.address), access.write, false)
+            == Some((id, access.reason))
+    }
+    /// `handle_userfault` for a kernel access: whether it may be tried
+    /// again, once the page is filled, the protection ended, or the wait
+    /// woken; not when the context refuses the kernel's faults, is
+    /// released or gone, or a fatal signal came.
+    fn wait(&self, id: u64, access: Access) -> bool {
+        let Some(context) = find(id) else {
+            return false;
+        };
+        if context.flags & USER_MODE_ONLY != 0
+            || context.features() & FEATURE_SIGBUS != 0
+            || context.released.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        if !self.still_faults(id, &access) {
+            return true;
+        }
+        let features = context.features();
+        let thread = if features & FEATURE_THREAD_ID != 0 {
+            self.group.namespaces(self.tid).pid.number(self.tid)
+        } else {
+            0
+        };
+        let waiting = Arc::new(Waiting {
+            address: if features & FEATURE_EXACT_ADDRESS != 0 {
+                access.address
+            } else {
+                access.address & !(PAGE - 1)
+            },
+            flags: if access.write {
+                PAGEFAULT_FLAG_WRITE
+            } else {
+                0
+            } | match access.reason {
+                UserfaultReason::Missing => 0,
+                UserfaultReason::Minor => PAGEFAULT_FLAG_MINOR,
+                UserfaultReason::Protected => PAGEFAULT_FLAG_WP,
+            },
+            thread,
+            woken: AtomicBool::new(false),
+            hub: Arc::clone(&self.hub),
+        });
+        {
+            let mut state = context.state();
+            if context.released.load(Ordering::SeqCst) {
+                return false;
+            }
+            if !self.still_faults(id, &access) {
+                return true;
+            }
+            state.pending.push_back(Arc::clone(&waiting));
+            state.epoch += 1;
+        }
+        context.hub.changed();
+        // `TASK_INTERRUPTIBLE`, but a kernel fault is retried after a
+        // signal that is not fatal, and waits again.
+        // So it checks for them every 10 ms rather than being woken.
+        let never = Arc::new(AtomicBool::new(false));
+        let mut fatal = false;
+        loop {
+            let ticket = self.hub.token.value();
+            if waiting.woken.load(Ordering::SeqCst) || context.released.load(Ordering::SeqCst) {
+                break;
+            }
+            if self.fatal() {
+                fatal = true;
+                break;
+            }
+            let now = self
+                .host
+                .clock(paludarium_host::ClockId::Monotonic)
+                .unwrap_or(0);
+            let end = Some((
+                paludarium_host::ClockId::Monotonic,
+                now.saturating_add(10_000_000),
+            ));
+            match self.host.wait_on(&self.hub.token, ticket, end, &never) {
+                Err(e) if e == Errno::ENOSYS => {
+                    let _ = self.host.wait_until(
+                        paludarium_host::ClockId::Monotonic,
+                        now.saturating_add(1_000_000),
+                        &never,
+                    );
+                }
+                _ => {}
+            }
+        }
+        let mut state = context.state();
+        state.pending.retain(|w| !Arc::ptr_eq(w, &waiting));
+        state.read.retain(|w| !Arc::ptr_eq(w, &waiting));
+        !fatal && !context.released.load(Ordering::SeqCst)
+    }
 }
 
 /// `read(2)` of a context into `out`, if `file` is one's.

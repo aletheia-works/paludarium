@@ -62,8 +62,11 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`). A page of a host file
   that `write` filled is clean (see "Pages `write` filled" below).
-- **No `/proc/<pid>/mem`**: a task's memory is read and written through
-  `ptrace` and `process_vm_readv` and `process_vm_writev` only.
+- **`/proc/<pid>/mem`'s offsets past `i64::MAX`**: `pread64` and
+  `pwrite64` refuse them (`EINVAL`), as Linux v7.0's `ksys_pread64` and
+  `ksys_pwrite64` do for every file, where Linux master takes them for a
+  file of unsigned offsets (`FOP_UNSIGNED_OFFSET`). This follows v7.0
+  until the runners' kernel has master's change.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
@@ -168,9 +171,6 @@ verified.
   no device for it to stand for. A FIFO in a mounted host directory can be
   made on Linux hosts only, and connects only the guest's own openers, not
   host programs that open the same node.
-- **A pipe's packet mode**: `F_SETFL` takes `O_DIRECT` on a pipe or FIFO,
-  as Linux does, but the emulator has no packet mode: its writes are not
-  kept apart as packets, and `F_GETFL` does not show `O_DIRECT`.
 - **`O_DIRECT`'s alignment**: a read or write of a file opened with
   `O_DIRECT` goes through as any other. On a disk file system such as
   ext4, Linux refuses a buffer, offset or length that is not aligned to its
@@ -273,12 +273,9 @@ verified.
   file on the host, so a mapping of it counts it among the clean pages in
   `smaps`. On Linux it stays dirty in the page cache until writeback, and
   `smaps` counts it among the dirty ones until then.
-- **Mappings that grow down**: such a mapping grows when the guest's own
-  code touches a page below it or a signal frame is written there
-  ([features](./features#system-calls)), but not when a system call reads or
-  writes there: the call gives `EFAULT`, where Linux's copy of user memory
-  grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
-  growth, as it does not stop `mmap`.
+- **Mappings that grow down**: `RLIMIT_AS` does not stop the growth of
+  such a mapping ([features](./features#system-calls)), as it does not stop
+  `mmap`.
 - **Page-fault counts**: `ru_minflt` counts each fault as it is taken, as
   Linux does, from a thread's first fault, before its first system call.
   `execve`'s loader fills the pages of the program's segments
@@ -298,10 +295,10 @@ verified.
   counts it in `page-faults`; a context switch is a sleep of the thread,
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
   to another); and a thread without `rseq` moves to
-  another CPU only when a new CPU mask changes the lowest CPU it allows,
-  at once for its own `sched_setaffinity` and at its next system call for
-  another thread's, so that until then its events of one CPU count what it
-  does to the CPU it was on, where Linux has moved it already.
+  another CPU only when a new CPU mask changes the lowest CPU it allows.
+  When another thread's `sched_setaffinity` moves it, its faults count on
+  the new CPU at once, but the CPU time it runs until its next system call
+  counts to the old one, where Linux has moved it already.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where
   Linux takes each at its occurrence: they show the thread's address,
@@ -868,9 +865,7 @@ verified.
   `nr_blocks` and `nr_inodes`, and a page a fault brings into a file of a
   tmpfs mount or a memfd counts in its blocks, as `shmem_fault` charges
   it, one past the mount's size being a `SIGBUS`, with a large folio's
-  others on a mount with `huge=`. Not yet so: `mremap` moves a mapping of
-  such a file where it would move any, where Linux places it at a 2 MiB
-  boundary as `mmap` does; a large folio is mapped a
+  others on a mount with `huge=`. Not yet so: a large folio is mapped a
   page at a time, so `/proc/<pid>/smaps` and `/proc/meminfo` count no
   `ShmemPmdMapped`, `FilePmdMapped` or `ShmemHugePages` for it and a
   fault maps (and counts in `Rss`) only the pages around it, not the whole
@@ -1036,18 +1031,22 @@ verified.
   page `UFFDIO_ZEROPAGE` gives a private mapping of a shmem file is a
   page of zeros of its own, which
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
-  zero page. A system call's own
-  copy to or from a missing page of a registered range, or to a
-  write-protected one without `UFFD_FEATURE_WP_ASYNC`, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
-  Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
+  zero page. A copy to or from a registered page by another process's
+  `process_vm_readv` or `process_vm_writev`, or by another
+  `get_user_pages` caller, stays `EFAULT`, where Linux's `get_user_pages`
+  reaches `handle_userfault` too, which does not check whose `mm` faults.
+  A `UFFDIO_MOVE` source
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
-  `EINVAL`, where Linux takes a read or write lease and signals its holder
-  when another open or truncate breaks it.
+- **File leases, in part**: an open or a truncate that conflicts with a
+  lease does not break it yet, where Linux's `__break_lease` signals the
+  holder and makes the opener wait up to `/proc/sys/fs/lease-break-time`
+  seconds (or fail with `EWOULDBLOCK` under `O_NONBLOCK`), then takes the
+  lease away or makes it a read lease. Delegations (`F_GETDELEG` and
+  `F_SETDELEG`) are `EINVAL`.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes, as no file system here
   reports errors. Linux's ext4 reports them, and since 7.0 its XFS, Btrfs,
@@ -1088,9 +1087,9 @@ verified.
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
-  gave. A socket's device steers only its IPv6 datagrams and connects,
-  and two sockets on one port conflict whatever their devices, where
-  Linux's on different devices do not. Neighbour discovery makes none of
+  gave. Bound to `lo`, an IPv4 socket's packet to an address no route
+  through `lo` takes is `ENETUNREACH`, where Linux sends it, on link, and
+  drops it. Neighbour discovery makes none of
   the neighbours of the groups router solicitation, MLD reports and
   duplicate address detection send to (`ff02::2`, `ff02::16`, the
   solicited-node ones), no advertisement unasked, and no redirect; the
@@ -1170,10 +1169,12 @@ verified.
   Linux is built. A veth end whose MTU is below 1280 still has the files
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
-  A
-  route goes through `lo`, a veth end or rejects: IPv4 multipath
-  routes, encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
-  and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
+  A route goes through `lo` or a veth end, or rejects; of an IPv4
+  multipath route's next hops, a lookup takes the first not dead, where
+  Linux picks one by a hash of the flow (`fib_select_multipath`). An IPv4
+  next hop through an IPv6 gateway (`RTA_VIA`), encapsulations, nexthop
+  objects, realms, expiries, source prefixes, router preferences and the
+  anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
   namespace a connection or datagram to an address no local route has is
@@ -1279,7 +1280,7 @@ verified.
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
   With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
-  not have (an IPv4 multipath route, say, or a link of a kind) carries no
+  not have (an IPv4 next hop through `RTA_VIA`, say, or a link of a kind) carries no
   message, as Linux would take it; an IPv6 route replaced without
   `NLM_F_CREATE` that is not there is told of
   ("Can not replace route - no match found") only where its prefix has
@@ -1397,6 +1398,12 @@ verified.
   quit, and waits up to 15 seconds for it to exit. A Safari already running,
   such as your own, is never asked. A Safari that does not quit is logged, not
   killed.
+- safaridriver exits at startup, with no message, if it starts while the
+  previous driver's helper process is still connected to `webinspectord`, or
+  while `webinspectord` is exiting after its last client left. So after
+  safaridriver stops, the test driver waits up to 15 seconds for that helper
+  and each `webinspectord` to exit. One that keeps running, such as a
+  `webinspectord` serving another client, is logged, not killed.
 
 ## Found a problem?
 

@@ -351,6 +351,8 @@ const IFF_UP: u16 = 0x1;
 const IFF_LOOPBACK: u16 = 0x8;
 const IFF_RUNNING: u16 = 0x40;
 const ENODEV: Errno = Errno(19);
+/// `CAP_NET_RAW`, which rebinding a socket to a device needs.
+const CAP_NET_RAW: u64 = 1 << 13;
 impl Network {
     pub(crate) fn new(policy: NetworkPolicy) -> Self {
         Self {
@@ -406,7 +408,8 @@ impl Network {
     /// Through a device `oif` other than 0, which a scope ID or the socket's
     /// device gives, an IPv6 destination's route is looked up strictly
     /// through it (`RT6_LOOKUP_F_IFACE`), a local one too, and `ENETUNREACH`
-    /// where none goes. An IPv4 one goes as through any.
+    /// where none goes. An IPv4 one goes through it as
+    /// [`Self::route4_through`] routes it.
     ///
     /// Of an IPv6 multipath route, the hop the flow takes: from `from`, of
     /// the protocol `proto`, with no flow label, as the guest's sockets
@@ -441,6 +444,12 @@ impl Network {
                 _ if self.isolated => Err(ENETUNREACH),
                 _ => Ok(Dest::Away),
             };
+        }
+        if let IpAddr::V4(ip) = to.ip()
+            && oif != 0
+            && !ip.is_unspecified()
+        {
+            return self.route4_through(to, ip, oif, now);
         }
         if let (Some(IpAddr::V4(src)), IpAddr::V4(ip)) = (from.map(plain), to.ip())
             && !src.is_unspecified()
@@ -794,6 +803,27 @@ impl Network {
             IpAddr::V4(_) => 0,
         }
     }
+    /// The device a packet to this namespace's own `to` comes in on: its
+    /// local route's, the address's device, as an IPv6 one comes in on its
+    /// route's `rt6i_idev` (`ip6_rcv_core`) and an IPv4 one's `rt_iif` is
+    /// that route's device (`ip_route_output_key_hash_rcu` sets `orig_oif`
+    /// to it); `lo` for none.
+    fn arrival_device(&self, to: SocketAddr, now: Option<u64>) -> u32 {
+        let device = match plain(to.ip()) {
+            ip @ IpAddr::V6(_) => self.local_device(ip, now),
+            IpAddr::V4(ip) => self
+                .addresses_at(now)
+                .lookup4(ip)
+                .ok()
+                .filter(|r| r.kind == crate::interface::Kind::Local)
+                .map_or(0, |r| r.oif),
+        };
+        if device == 0 {
+            crate::netdev::LOOPBACK_OIF
+        } else {
+            device
+        }
+    }
     /// The index the peer of this namespace's veth end `index` has in its
     /// own namespace, where a packet out through the end comes in; 0 for
     /// none.
@@ -803,6 +833,67 @@ impl Network {
             .and_then(|d| d.veth.as_ref()?.peer.as_ref().map(|p| p.index))
             .and_then(|i| u32::try_from(i).ok())
             .unwrap_or(0)
+    }
+    /// Where an IPv4 packet to `to` (its address `ip`) goes through the
+    /// device `oif`, as `ip_route_output_key_hash_rcu` routes it with one
+    /// named: `ENODEV` for none of it, `ENETUNREACH` while it is down; to
+    /// a local group (224.0.0.0/24) or the limited broadcast address out
+    /// through it at once; else by the tables' routes through it only,
+    /// and where none goes, out through it, on link. Through `lo` that
+    /// goes nowhere, which is `ENETUNREACH`, where Linux drops it.
+    fn route4_through(
+        &self,
+        to: SocketAddr,
+        ip: Ipv4Addr,
+        oif: u32,
+        now: Option<u64>,
+    ) -> Result<Dest, Errno> {
+        use crate::interface::Kind;
+        let lo = oif == crate::netdev::LOOPBACK_OIF;
+        let index = i32::try_from(oif).map_err(|_| ENODEV)?;
+        let up = {
+            let devices = self.devices();
+            let device = devices.by_index(index).ok_or(ENODEV)?;
+            device.veth.as_ref().map_or_else(|| self.is_up(), |v| v.up)
+        };
+        if !up {
+            return Err(ENETUNREACH);
+        }
+        let cast = if ip.is_broadcast() {
+            Cast::Broadcast
+        } else if ip.is_multicast() {
+            Cast::Multicast
+        } else {
+            Cast::Unicast
+        };
+        if !lo && (u32::from(ip) & 0xffff_ff00 == 0xe000_0000 || ip.is_broadcast()) {
+            return Ok(Dest::Veth(index, cast));
+        }
+        match self.addresses_at(now).lookup4_flow(ip, 0, oif) {
+            Ok(route) if route.kind == Kind::Local => {
+                if self.is_up() {
+                    Ok(Dest::Here(to))
+                } else {
+                    Err(ENETUNREACH)
+                }
+            }
+            Ok(route)
+                if matches!(route.kind, Kind::Unicast | Kind::Broadcast)
+                    && route.oif != crate::netdev::LOOPBACK_OIF =>
+            {
+                let index = i32::try_from(route.oif).map_err(|_| ENETUNREACH)?;
+                let cast = if route.kind == Kind::Broadcast {
+                    Cast::Broadcast
+                } else {
+                    cast
+                };
+                Ok(Dest::Veth(index, cast))
+            }
+            Ok(_) => Err(ENETUNREACH),
+            Err(_) if lo => Err(ENETUNREACH),
+            // On link, through it.
+            Err(_) => Ok(Dest::Veth(index, cast)),
+        }
     }
     /// The flow of a packet from `from` (the address a socket is bound
     /// to, none for an unbound one) of the protocol `proto`, which chooses
@@ -823,7 +914,7 @@ impl Network {
     /// scope reaches it, else `to` itself (`rt_nexthop`).
     fn next_hop4(&self, index: i32, to: Ipv4Addr, now: Option<u64>) -> Ipv4Addr {
         self.addresses_at(now)
-            .lookup4(to)
+            .lookup4_flow(to, 0, index.unsigned_abs())
             .ok()
             .filter(|r| i64::from(r.oif) == i64::from(index) && r.uses_gateway)
             .and_then(|r| r.gateway)
@@ -995,7 +1086,10 @@ impl Network {
         to: SocketAddr,
         now: Option<u64>,
     ) -> Vec<Arc<InetSocket>> {
-        let mut receivers = self.ports(true).broadcast_receivers(to, from);
+        // Its own copy comes in on the end it went out through.
+        let mut receivers = self
+            .ports(true)
+            .broadcast_receivers(to, from, index.unsigned_abs());
         let (IpAddr::V4(src), IpAddr::V4(dst)) = (from.ip(), to.ip()) else {
             return receivers;
         };
@@ -1033,7 +1127,11 @@ impl Network {
                     || addresses.validate_source4_on(src, 0, 0, rpf, at).is_ok())
         };
         if arrives {
-            receivers.extend(there.ports(true).broadcast_receivers(to, from));
+            receivers.extend(
+                there
+                    .ports(true)
+                    .broadcast_receivers(to, from, at.unsigned_abs()),
+            );
         }
         receivers
     }
@@ -1102,8 +1200,37 @@ impl Network {
     /// The address a connection or datagram to `to` on the loopback leaves
     /// from at `now`: its route's preferred source.
     pub(crate) fn source(&self, to: SocketAddr, now: Option<u64>) -> IpAddr {
+        self.source_through(to, 0, now)
+    }
+    /// [`Self::source`] of a packet through the device `oif` (any for 0):
+    /// for IPv4, as `ip_route_output_key_hash_rcu` takes it with a device
+    /// named, an address of the device's (`inet_select_addr`) of link
+    /// scope to a local group or the limited broadcast address, of any
+    /// scope to another group, and to an address no route through it
+    /// takes, on link; else its route's.
+    pub(crate) fn source_through(&self, to: SocketAddr, oif: u32, now: Option<u64>) -> IpAddr {
+        use crate::interface::{SCOPE_LINK, SCOPE_UNIVERSE};
         let order = self.devices().order();
-        self.addresses_at(now).source(to.ip(), &order)
+        let addresses = self.addresses_at(now);
+        if let (IpAddr::V4(ip), Ok(index)) = (plain(to.ip()), i32::try_from(oif))
+            && oif != 0
+        {
+            let local_group = u32::from(ip) & 0xffff_ff00 == 0xe000_0000 || ip.is_broadcast();
+            let picked = if local_group {
+                addresses.select4(index, None, SCOPE_LINK, &order)
+            } else if ip.is_multicast() {
+                addresses.select4(index, None, SCOPE_UNIVERSE, &order)
+            } else {
+                match addresses.lookup4_flow(ip, 0, oif) {
+                    Ok(route) => addresses.source4(&route, ip, &order),
+                    Err(_) => addresses.select4(index, None, SCOPE_LINK, &order),
+                }
+            };
+            if let Some(picked) = picked {
+                return IpAddr::V4(picked);
+            }
+        }
+        addresses.source(to.ip(), &order)
     }
     /// Whether a socket may bind to `ip`: the unspecified address, an IPv4
     /// multicast or limited broadcast one, one a local or broadcast route
@@ -1519,12 +1646,10 @@ struct Datagram {
 /// page fragments. An IPv6 datagram too long for the loopback's MTU comes
 /// as two fragments, reassembled.
 fn truesize(len: usize, ipv4: bool) -> usize {
-    const SKB: usize = 256;
+    use crate::skb::{MAX_ALLOC, SHARED_INFO, SKB};
     // `SKB_SMALL_HEAD_SIZE`, which `MAX_HEADER` sizes: 704 bytes on the CI
     // runner's kernel, built with Hyper-V's networking (640 on Docker's).
     const SMALL_HEAD: usize = 704;
-    const SHARED_INFO: usize = 320;
-    const MAX_ALLOC: usize = 16_384 - SHARED_INFO;
     const MTU: usize = 65_536;
     // The IP and UDP headers, and the link header's room and the tail's
     // (IPv4) or the fragment header's (IPv6).
@@ -1568,6 +1693,8 @@ struct Syn {
     notify: crate::loopback::Notify,
     from: SocketAddr,
     to: SocketAddr,
+    /// The device it comes in on there.
+    dif: u32,
     /// The veth end it goes out through, or `None` on the loopback.
     veth: Option<i32>,
     /// The connecting socket, whose SYN each try is.
@@ -2604,7 +2731,7 @@ impl InetSocket {
     ) -> Result<SocketAddr, Errno> {
         let bound = self.autobind(s, options)?;
         let ip = if bound.ip().is_unspecified() || s.device_source {
-            self.network.source(to, self.now())
+            self.network.source_through(to, options.device, self.now())
         } else {
             bound.ip()
         };
@@ -2726,7 +2853,10 @@ impl InetSocket {
                     // dropped where it comes.
                     Reach::Unanswered | Reach::Dropped => return Ok(bytes.len()),
                 };
-            let receiver = there.ports(true).receiver(plain_to, from);
+            let receiver =
+                there
+                    .ports(true)
+                    .receiver(plain_to, from, self.network.peer_index(index));
             // ICMP's port unreachable comes back, where answers come, through
             // the peer's neighbour of `from`.
             if receiver.is_none() && answered {
@@ -2770,7 +2900,8 @@ impl InetSocket {
             drop(s);
             let now = self.now();
             self.network.output(dest.ip(), now);
-            let receiver = self.ports().receiver(dest, from);
+            let dif = self.network.arrival_device(dest, now);
+            let receiver = self.ports().receiver(dest, from, dif);
             if let Some(receiver) = receiver {
                 let iif = self.network.local_device(dest.ip(), now);
                 receiver.deliver_on(from, bytes, iif, &sent, arrival::Way::Loopback);
@@ -3026,6 +3157,7 @@ impl InetSocket {
             pooled: self.datagram && options.reuse_port,
             listening: false,
             peer: None,
+            device: options.device,
             owner: Weak::clone(&self.this),
             time_wait: None,
         }
@@ -3288,6 +3420,7 @@ impl InetSocket {
                 &stream,
                 (&syn.link, &syn.notify),
                 ends,
+                syn.dif,
             ) {
                 Knock::Full => {}
                 Knock::Taken => {
@@ -3318,8 +3451,9 @@ impl InetSocket {
         stream: &Arc<Stream>,
         link: (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
         (from, to, veth): (SocketAddr, SocketAddr, Option<i32>),
+        dif: u32,
     ) -> Knock {
-        let Some(listener) = there.ports(false).listener(from, to) else {
+        let Some(listener) = there.ports(false).listener(from, to, dif) else {
             return Knock::Refused;
         };
         // The SYN sent again is the client's, with a new flow hash, as
@@ -3482,7 +3616,8 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        if !self.ports().listens(to) {
+        let dif = self.network.arrival_device(to, self.now());
+        if !self.ports().listens(to, dif) {
             return Ok(None);
         }
         // Which of the sockets sharing the port takes it hangs on the port
@@ -3584,7 +3719,13 @@ impl InetSocket {
         veth: Option<i32>,
     ) -> Option<Arc<Stream>> {
         let loopback = veth.is_none();
-        let Some(listener) = there.ports(false).listener(from, to) else {
+        // The device it comes in on there: the peer of the end it goes out
+        // through, or on the loopback its address's.
+        let dif = match veth {
+            Some(index) => self.network.peer_index(index),
+            None => self.network.arrival_device(to, self.now()),
+        };
+        let Some(listener) = there.ports(false).listener(from, to, dif) else {
             // The listener closed meanwhile, or none was there: the
             // refused connect gives back the port it took.
             self.give_back(s, bound);
@@ -3643,6 +3784,7 @@ impl InetSocket {
                 notify: self.urgent_notify(),
                 from,
                 to,
+                dif,
                 veth,
                 client: Weak::clone(&self.this),
                 start,
@@ -3664,7 +3806,7 @@ impl InetSocket {
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
-        let source = self.network.source(to, self.now());
+        let source = self.network.source_through(to, options.device, self.now());
         let mut ports = self.ports();
         // One bound to a broadcast or multicast address takes its route's
         // source as its name too (`tcp_v4_connect`:
@@ -4806,7 +4948,9 @@ fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
 /// most 127 probes), `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
 /// `IPV6_V6ONLY`, and the filter options (`SO_ATTACH_FILTER`,
 /// `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and `SO_ATTACH_BPF`, as
-/// [`crate::sockets::set_filter`] takes them). `SO_PASSCRED`, `SO_PASSSEC`,
+/// [`crate::sockets::set_filter`] takes them), and the device the socket
+/// is bound to (`SO_BINDTODEVICE`, `SO_BINDTOIFINDEX`, [`bind_to_device`]).
+/// `SO_PASSCRED`, `SO_PASSSEC`,
 /// `SO_PASSPIDFD` and `SO_PASSRIGHTS` are EOPNOTSUPP, as Linux takes them
 /// only on AF_UNIX (`sk_may_scm_recv` adds netlink and Bluetooth for the
 /// first two). Any other option is ENOPROTOOPT. Only
@@ -4848,6 +4992,29 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             )
             .unwrap_or(Err(ENOPROTOOPT));
         }
+        // `SO_BINDTODEVICE` (`sock_setbindtodevice`): a device's name, not
+        // an `int`, of at most 15 bytes, none or empty for no device;
+        // `ENODEV` for a name the namespace has no device of.
+        (1, 25) => {
+            let Ok(len) = usize::try_from(len as u32 as i32) else {
+                return Err(Errno::EINVAL);
+            };
+            let mut name = vec![0; len.min(15)];
+            c.mem
+                .read(GuestAddr(at), &mut name)
+                .map_err(|_| Errno::EFAULT)?;
+            let index = if name.first().is_none_or(|&b| b == 0) {
+                0
+            } else {
+                socket
+                    .network
+                    .devices()
+                    .by_name(&name)
+                    .map(|d| d.index.unsigned_abs())
+                    .ok_or(ENODEV)?
+            };
+            bind_to_device(c, socket, &mut options, index.cast_signed())?;
+        }
         (1, 20 | 21 | 66 | 67) => {
             if (len as u32 as i32) < 16 {
                 return Err(Errno::EINVAL);
@@ -4876,7 +5043,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             let seconds = i32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
             options.linger = (on != 0).then_some(seconds);
         }
-        (1, 2 | 6 | 7 | 8 | 9 | 10 | 12 | 15)
+        (1, 2 | 6 | 7 | 8 | 9 | 10 | 12 | 15 | 62)
         | (6, 1 | 4 | 5 | 6 | 12 | 18)
         | (0, 1)
         | (41, 26) => {
@@ -4908,6 +5075,8 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (1, 9) => options.keep_alive = value != 0,
                 (1, 10) => options.out_of_band_inline = value != 0,
                 (1, 12) => options.priority = value,
+                // `SO_BINDTOIFINDEX`, of any index not negative.
+                (1, 62) => bind_to_device(c, socket, &mut options, value)?,
                 (6, _) if !tcp => return Err(ENOPROTOOPT),
                 (6, 1) => {
                     options.no_delay = value != 0;
@@ -4956,6 +5125,29 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
     }
     Ok(0)
 }
+/// Binds `socket` to the device of `index` (0 for none), as
+/// `sock_bindtoindex_locked`: `EPERM` for one bound to a device already,
+/// without `CAP_NET_RAW` in the user namespace that owns its network
+/// namespace; `EINVAL` for a negative index, whatever there is of it.
+fn bind_to_device(
+    c: &Context<'_>,
+    socket: &InetSocket,
+    options: &mut Options,
+    index: i32,
+) -> Result<(), Errno> {
+    if options.device != 0
+        && !c
+            .process
+            .credentials
+            .capable_in(CAP_NET_RAW, socket.network.owner())
+    {
+        return Err(Errno::EPERM);
+    }
+    let index = u32::try_from(index).map_err(|_| Errno::EINVAL)?;
+    options.device = index;
+    socket.ports().set_device(&socket.this, index);
+    Ok(())
+}
 /// Sizes a loopback connection's buffers by the `SO_SNDBUF` and `SO_RCVBUF`
 /// the guest set, roughly as Linux bounds them: what waits to be sent by
 /// the doubled `SO_SNDBUF` (`sk_wmem_queued`), and what has arrived by half
@@ -4975,7 +5167,8 @@ fn size_buffers(stream: &Stream, options: &Options) {
         set(options.receive_buffer_set, options.receive_buffer / 2),
     );
 }
-/// `getsockopt` of an inet socket: the options [`set_option`] keeps, and
+/// `getsockopt` of an inet socket: the options [`set_option`] keeps (the
+/// device as `SO_BINDTODEVICE`'s name and `SO_BINDTOIFINDEX`'s index), and
 /// `SO_TYPE`, `SO_ERROR` (which takes the pending error), `SO_ACCEPTCONN`,
 /// `SO_PROTOCOL`, `SO_DOMAIN`, `SO_GET_FILTER` (the classic filter, as
 /// [`crate::sockets::get_filter`] gives it) and `SO_BPF_EXTENSIONS`. A
@@ -5021,6 +5214,23 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             let s = socket.lock();
             socket.tcp_info(&s, socket.now()).bytes().to_vec()
         }
+        // `SO_BINDTODEVICE` (`sock_getbindtodevice`): nothing for no device,
+        // else its name and NUL, in room for a whole name (`EINVAL` for
+        // less), and `ENODEV` for an index the namespace has no device of.
+        (1, 25) if options.device == 0 => Vec::new(),
+        (1, 25) => {
+            if room < 16 {
+                return Err(Errno::EINVAL);
+            }
+            let mut name = socket
+                .network
+                .devices()
+                .by_index(options.device.cast_signed())
+                .map(|d| d.name.clone())
+                .ok_or(ENODEV)?;
+            name.push(0);
+            name
+        }
         (1, 13) => {
             let mut linger = [0; 8];
             linger[..4].copy_from_slice(&i32::from(options.linger.is_some()).to_le_bytes());
@@ -5045,6 +5255,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (1, 10) => i32::from(options.out_of_band_inline),
                 (1, 12) => options.priority,
                 (1, 15) => i32::from(options.reuse_port),
+                (1, 62) => options.device.cast_signed(),
                 (1, 30) => i32::from(socket.lock().listen.is_some()),
                 (1, 44) => i32::from(socket.with_filter(|slot| slot.locked)),
                 // `SO_BPF_EXTENSIONS`: `SKF_AD_MAX` (`bpf_tell_extensions`).

@@ -425,6 +425,10 @@ pub(crate) struct Binding {
     pub(crate) listening: bool,
     /// A connected UDP socket's peer, the only sender it receives from.
     pub(crate) peer: Option<SocketAddr>,
+    /// The device the socket is bound to (`sk_bound_dev_if`), 0 for none:
+    /// it takes only what comes in on it, and shares its port with sockets
+    /// bound to others.
+    pub(crate) device: u32,
     pub(crate) owner: Weak<InetSocket>,
     /// A closed connection's hold in `TIME_WAIT`, after its socket has
     /// gone.
@@ -483,11 +487,19 @@ impl Binding {
             (false, false) => a == b,
         }
     }
+    /// Whether the two may meet on a port by their devices: one of them
+    /// bound to none, or both to the same (`inet_bind_conflict`,
+    /// `udp_lib_lport_inuse`).
+    fn devices_meet(&self, other: &Binding) -> bool {
+        self.device == 0 || other.device == 0 || self.device == other.device
+    }
     /// Whether `self` may not take its port beside `other`, as Linux's
-    /// `inet_bind_conflict`: both with `SO_REUSEADDR` share it unless
-    /// `other` listens, and both with `SO_REUSEPORT` always.
+    /// `inet_bind_conflict`: two bound to other devices share it; both
+    /// with `SO_REUSEADDR` share it unless `other` listens, and both with
+    /// `SO_REUSEPORT` always.
     fn conflicts(&self, other: &Binding) -> bool {
         self.overlaps(other)
+            && self.devices_meet(other)
             && !(self.reuse_address && other.reuse_address && !other.listening)
             && !(self.reuse_port && other.reuse_port)
     }
@@ -495,11 +507,13 @@ impl Binding {
         self.time_wait.is_none() && Weak::ptr_eq(&self.owner, owner)
     }
     /// Whether `other` is in `self`'s group: of the same family, on the
-    /// same address and port.
+    /// same address, port and device (`inet_reuseport_add_sock`,
+    /// `udp_reuseport_add_sock`).
     fn pools_with(&self, other: &Binding) -> bool {
         self.pooled
             && other.pooled
             && self.address == other.address
+            && self.device == other.device
             && self.v6 == other.v6
             && self.v6_only == other.v6_only
             && self.listening == other.listening
@@ -621,7 +635,11 @@ impl Ports {
                 let offset = (usize::from(self.next - EPHEMERAL.start()) + i) % count;
                 let port = EPHEMERAL.start() + offset as u16;
                 binding.address.set_port(port);
-                (!self.bindings.iter().any(|other| binding.overlaps(other))).then_some(port)
+                (!self
+                    .bindings
+                    .iter()
+                    .any(|other| binding.overlaps(other) && binding.devices_meet(other)))
+                .then_some(port)
             });
             let port = free.ok_or(EADDRINUSE)?;
             self.next = if port == *EPHEMERAL.end() {
@@ -685,6 +703,15 @@ impl Ports {
             }
         }
     }
+    /// `owner` is now bound to the device `device` (0 for none), which
+    /// Linux checks no conflict of (`sock_bindtoindex_locked`).
+    pub(crate) fn set_device(&mut self, owner: &Weak<InetSocket>, device: u32) {
+        for binding in &mut self.bindings {
+            if binding.is(owner) {
+                binding.device = device;
+            }
+        }
+    }
     /// `owner` stopped listening.
     pub(crate) fn stop_listening(&mut self, owner: &Weak<InetSocket>) {
         for binding in &mut self.bindings {
@@ -739,22 +766,36 @@ impl Ports {
     /// The listener a connection from `from` to `to` reaches, as Linux's
     /// `__inet_lookup_listener`: one bound to that address before one bound
     /// to every address, and an IPv4 socket before an IPv6 one; among equals
-    /// the first to bind, or one of its group ([`pick`]).
-    pub(crate) fn listener(&mut self, from: SocketAddr, to: SocketAddr) -> Option<Arc<InetSocket>> {
+    /// the first to bind, or one of its group ([`pick`]). It comes in on
+    /// the device `dif`: one bound to another takes it not, one bound to it
+    /// ranks before one of another family bound to none
+    /// (`compute_score`).
+    pub(crate) fn listener(
+        &mut self,
+        from: SocketAddr,
+        to: SocketAddr,
+        dif: u32,
+    ) -> Option<Arc<InetSocket>> {
         self.live();
-        let best = self.best_listener(to)?;
+        let best = self.best_listener(to, dif)?;
         self.shared(best, from, to, |_| true).owner.upgrade()
     }
-    /// Whether a socket listens where a connection to `to` reaches.
-    pub(crate) fn listens(&mut self, to: SocketAddr) -> bool {
+    /// Whether a socket listens where a connection to `to` in on `dif`
+    /// reaches.
+    pub(crate) fn listens(&mut self, to: SocketAddr, dif: u32) -> bool {
         self.live();
-        self.best_listener(to).is_some()
+        self.best_listener(to, dif).is_some()
     }
-    /// The listener that ranks first for `to`, before its group.
-    fn best_listener(&self, to: SocketAddr) -> Option<&Binding> {
+    /// The listener that ranks first for `to` in on `dif`, before its
+    /// group.
+    fn best_listener(&self, to: SocketAddr, dif: u32) -> Option<&Binding> {
         let ip = to.ip();
         let score = |binding: &Binding| {
-            if !binding.listening || binding.address.port() != to.port() || !binding.carries(ip) {
+            if !binding.listening
+                || binding.address.port() != to.port()
+                || !binding.carries(ip)
+                || (binding.device != 0 && binding.device != dif)
+            {
                 return None;
             }
             let bound = binding.address.ip();
@@ -765,9 +806,12 @@ impl Ports {
             } else {
                 return None;
             };
-            Some((exact, !binding.v6))
+            // `compute_score`: 2 bound to the device, else 1, and one more
+            // for IPv4.
+            let rank = if binding.device != 0 { 2 } else { 1 } + u8::from(!binding.v6);
+            Some((exact, rank))
         };
-        let mut best: Option<((bool, bool), &Binding)> = None;
+        let mut best: Option<((bool, u8), &Binding)> = None;
         for binding in &self.bindings {
             if let Some(found) = score(binding)
                 && best.is_none_or(|(score, _)| found > score)
@@ -806,29 +850,45 @@ impl Ports {
             .unwrap_or(best)
     }
     /// The UDP socket a datagram from `from` to `to` reaches, as Linux's
-    /// `compute_score` ranks them: a connected one only from its peer, and
-    /// one bound to that address, connected, or IPv4, before others; among
+    /// `compute_score` ranks them: a connected one only from its peer; one
+    /// bound to that address before others, then one connected, one bound
+    /// to the device, or IPv4; among
     /// equals the last to bind, which Linux's hash holds first, or one of its
-    /// group that is not connected ([`pick`]).
-    pub(crate) fn receiver(&mut self, to: SocketAddr, from: SocketAddr) -> Option<Arc<InetSocket>> {
+    /// group that is not connected ([`pick`]). It comes in on the device
+    /// `dif`: one bound to another takes it not, and one bound to it ranks
+    /// after a connected one, before any other.
+    pub(crate) fn receiver(
+        &mut self,
+        to: SocketAddr,
+        from: SocketAddr,
+        dif: u32,
+    ) -> Option<Arc<InetSocket>> {
         self.live();
         let ip = to.ip();
         let score = |binding: &Binding| {
-            if binding.address.port() != to.port() || !binding.carries(ip) {
+            if binding.address.port() != to.port()
+                || !binding.carries(ip)
+                || (binding.device != 0 && binding.device != dif)
+            {
                 return None;
             }
             let mut score = if binding.v6 { 1 } else { 2 };
             let bound = binding.address.ip();
+            // One bound to the address first, as Linux looks those up
+            // before the wildcard ones (`__udp4_lib_lookup`).
             if !bound.is_unspecified() {
                 if bound != ip {
                     return None;
                 }
-                score += 4;
+                score += 32;
             }
             if let Some(peer) = binding.peer {
                 if peer != from {
                     return None;
                 }
+                score += 16;
+            }
+            if binding.device != 0 {
                 score += 8;
             }
             Some(score)
@@ -853,12 +913,14 @@ impl Ports {
     /// each taking a copy, as Linux's `__udp4_lib_mcast_deliver` finds
     /// them (`__udp_is_mcast_sock`): of `to`'s port, bound to the
     /// unspecified address or to `to`, connected to none or to `from`,
-    /// and not `IPV6_V6ONLY`. A connected one bound to the unspecified
-    /// address has taken its route's source by then, so takes none.
+    /// and not `IPV6_V6ONLY`, bound to no device or to `dif`, which it
+    /// comes in on. A connected one bound to the unspecified address has
+    /// taken its route's source by then, so takes none.
     pub(crate) fn broadcast_receivers(
         &mut self,
         to: SocketAddr,
         from: SocketAddr,
+        dif: u32,
     ) -> Vec<Arc<InetSocket>> {
         self.live();
         let ip = to.ip();
@@ -869,6 +931,7 @@ impl Ports {
                     && binding.carries(ip)
                     && (binding.address.ip().is_unspecified() || binding.address.ip() == ip)
                     && binding.peer.is_none_or(|peer| peer == from)
+                    && (binding.device == 0 || binding.device == dif)
             })
             .filter_map(|binding| binding.owner.upgrade())
             .collect()
@@ -908,6 +971,7 @@ mod tests {
             pooled: false,
             listening: false,
             peer: None,
+            device: 0,
             owner: Weak::new(),
             time_wait: None,
         }
@@ -936,6 +1000,31 @@ mod tests {
         assert!(!binding("127.0.0.1:81", false).overlaps(&local));
     }
 
+    #[test]
+    fn sockets_bound_to_other_devices_share_a_port_and_listeners_rank_by_device() {
+        let on = |device, listening| Binding {
+            device,
+            listening,
+            ..binding("0.0.0.0:80", false)
+        };
+        assert!(!on(1000, false).conflicts(&on(1001, false)));
+        assert!(on(1000, false).conflicts(&on(1000, false)));
+        assert!(on(0, false).conflicts(&on(1000, false)));
+        assert!(on(1000, false).conflicts(&on(0, false)));
+        let mut ports = Ports::default();
+        for device in [0, 1000] {
+            let mut listener = on(device, true);
+            listener.v6 = device == 0;
+            ports.bindings.push(listener);
+        }
+        let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        // Bound to the device it comes in on, before IPv6 bound to none;
+        // one bound to another takes it not.
+        assert_eq!(ports.best_listener(to, 1000).map(|b| b.device), Some(1000));
+        assert_eq!(ports.best_listener(to, 1001).map(|b| b.device), Some(0));
+        ports.bindings.retain(|b| b.device != 0);
+        assert!(ports.best_listener(to, 1001).is_none());
+    }
     #[test]
     fn reuse_shares_a_port_only_beside_no_listener() {
         let reusing = |listening| Binding {

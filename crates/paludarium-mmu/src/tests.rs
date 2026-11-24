@@ -2486,6 +2486,14 @@ fn only_anonymous_memory_takes_a_name() {
         mem.set_anon_name(file, file.0 + PAGE_SIZE, Some(b"f")),
         Err(Errno::EBADF)
     );
+    // The refused call left no name: the next one takes the first slot.
+    let anon = mem
+        .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    mem.set_anon_name(anon, anon.0 + PAGE_SIZE, Some(b"a"))
+        .unwrap();
+    let id = mem.mappings().find(|m| m.start == anon).unwrap().anon_name;
+    assert_eq!(id, Some(AnonName(0)));
     let shared = mem
         .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
         .unwrap();

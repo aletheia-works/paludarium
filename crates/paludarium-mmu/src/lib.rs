@@ -183,14 +183,23 @@ struct AnonNames {
 }
 
 impl AnonNames {
+    /// The id `name` has, if it has one.
+    fn known(&self, name: &[u8]) -> Option<AnonName> {
+        self.ids.get(name).map(|&id| AnonName(id))
+    }
     /// The id of `name`, given its own slot if it has none, after the
-    /// names none of `live` holds are let go once the table has grown to a
-    /// power of two of 64 or more.
-    fn intern(&mut self, name: &[u8], live: &std::collections::HashSet<AnonName>) -> AnonName {
-        if let Some(&id) = self.ids.get(name) {
-            return AnonName(id);
+    /// names none of `live()` holds are let go once the table has grown to
+    /// a power of two of 64 or more. `live` runs only then.
+    fn intern(
+        &mut self,
+        name: &[u8],
+        live: impl FnOnce() -> std::collections::HashSet<AnonName>,
+    ) -> AnonName {
+        if let Some(id) = self.known(name) {
+            return id;
         }
         if self.by_id.len() >= 64 && self.by_id.len().is_power_of_two() {
+            let live = live();
             for (id, slot) in self.by_id.iter_mut().enumerate() {
                 let id = AnonName(u32::try_from(id).unwrap_or(u32::MAX));
                 if !live.contains(&id)
@@ -5800,10 +5809,9 @@ impl AddressSpaceData {
     /// with `EBADF` (`vma_is_anon_shmem`), after those before it; a hole in
     /// the range is `ENOMEM` once the rest has it.
     pub fn set_anon_name(&mut self, addr: u64, end: u64, name: Option<&[u8]>) -> Result<(), Errno> {
-        let name = name.map(|name| {
-            let live = self.mappings.values().filter_map(|m| m.anon_name).collect();
-            self.anon_names.intern(name, &live)
-        });
+        // The name's id, taken only once a mapping is to hold it: a call
+        // that names nothing (EBADF, ENOMEM first) leaves no new name.
+        let mut id = name.and_then(|name| self.anon_names.known(name));
         let starts: Vec<u64> = self
             .mappings
             .range(..end)
@@ -5829,14 +5837,22 @@ impl AddressSpaceData {
             if file {
                 return Err(Errno::EBADF);
             }
-            if m.anon_name == name {
+            if m.anon_name == id && (name.is_none() || id.is_some()) {
                 continue;
+            }
+            if let Some(name) = name
+                && id.is_none()
+            {
+                let mappings = &self.mappings;
+                id = Some(self.anon_names.intern(name, || {
+                    mappings.values().filter_map(|m| m.anon_name).collect()
+                }));
             }
             let (from, to) = (start.max(addr), m.end().min(end));
             self.split_at(from);
             self.split_at(to);
             for (_, m) in self.mappings.range_mut(from..to) {
-                m.anon_name = name;
+                m.anon_name = id;
             }
         }
         if hole || covered < end {

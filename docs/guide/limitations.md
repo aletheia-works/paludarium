@@ -1007,10 +1007,13 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: when a superblock goes, an instance's watches
-  hear `IN_UNMOUNT` the newest watch first, where Linux takes the files the
-  newest first that any instance began to watch, so the orders can differ
-  when instances watch the same files. `/proc/self/fdinfo` lists an epoll's files by
+- **inotify, in part**: when a superblock goes, its files' watches hear
+  `IN_UNMOUNT` in the order the files got their first mark of any group, as
+  on Linux; but the dnotify mark a one-shot watch leaves on its directory
+  after its signal goes at the end of a descriptor table only through the
+  files that asked for a watch, where Linux's goes through any descriptor
+  of the directory, so a directory may keep its place in that order
+  longer. `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and

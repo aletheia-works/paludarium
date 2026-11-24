@@ -5376,8 +5376,11 @@ kernel.
   mount left keeps it, and a detached one goes with the last file open on
   it), each watch on one of its files hears `IN_UNMOUNT`, with `IN_ISDIR`
   for a directory, whatever it asked for, then goes with `IN_IGNORED`, as
-  Linux's `fsnotify_sb_delete` ends them; an instance's watches go the
-  newest first. Each instance queues its events, merging one into the same
+  Linux's `fsnotify_sb_delete` ends them. The files go as
+  `fsnotify_unmount_inodes` takes them, the newest connector first: the
+  order in which they got the first of the marks of any group (an
+  inotify instance's, dnotify's or fanotify's) that they still hold, not
+  the order one instance watched them. Each instance queues its events, merging one into the same
   event (descriptor, mask and name) just before it unless that one is
   `IN_IGNORED` or a move, and after 16384 queues one `IN_Q_OVERFLOW` (with
   descriptor -1) until it is read. A read gives as many whole

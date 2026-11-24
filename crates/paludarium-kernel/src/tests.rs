@@ -8203,6 +8203,70 @@ mod inotify {
             [(wd, 0x2000, &b""[..]), (wd, 0x8000, b"")]
         );
     }
+    /// `fsnotify_unmount_inodes` takes the files by their connectors, the
+    /// newest first: a file's comes with its first mark of any group
+    /// (another instance's, dnotify's, fanotify's), not with this
+    /// instance's watch.
+    #[test]
+    fn a_superblocks_end_follows_when_its_files_were_first_marked() {
+        let mut f = fixture();
+        let none = put(&f, DATA, b"none");
+        let tmpfs = put(&f, DATA + 0x10, b"tmpfs");
+        let m = put(&f, DATA + 0x20, b"/tmp/m");
+        let names = ["x", "y", "z", "v", "w"];
+        let mut paths = Vec::new();
+        assert_eq!(f.ret(83, &[m, 0o755]), 0);
+        assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+        for (at, name) in names.iter().enumerate() {
+            let path = put(
+                &f,
+                DATA + 0x40 + 0x20 * at as u64,
+                format!("/tmp/m/{name}").as_bytes(),
+            );
+            let d = f.ret(2, &[path, 0o101, 0o600]);
+            assert_eq!(f.ret(3, &[d]), 0);
+            paths.push(path);
+        }
+        let [x, y, z, v, w] = paths[..] else {
+            unreachable!()
+        };
+        let d = put(&f, DATA + 0x100, b"/tmp/m/d");
+        assert_eq!(f.ret(83, &[d, 0o755]), 0);
+        let one = f.ret(INIT1, &[IN_NONBLOCK]);
+        let two = f.ret(INIT1, &[IN_NONBLOCK]);
+        // Another instance marks x first.
+        f.ret(ADD, &[two, x, 0x2]);
+        let wy = f.ret(ADD, &[one, y, 0x2]) as i32;
+        let wx = f.ret(ADD, &[one, x, 0x2]) as i32;
+        // dnotify marks d (`F_NOTIFY`, `DN_CREATE`) before this instance.
+        let dir = f.ret(2, &[d, 0o200000, 0]);
+        assert_eq!(f.ret(72, &[dir, 1026, 0x4]), 0);
+        let wz = f.ret(ADD, &[one, z, 0x2]) as i32;
+        let wd = f.ret(ADD, &[one, d, 0x2]) as i32;
+        // A fanotify group marks w (`FAN_OPEN`) before this instance.
+        let fan = f.ret(300, &[0x2, 0, 0, 0, 0, 0]);
+        assert_eq!(f.ret(301, &[fan, 1, 0x20, -100i64 as u64, w, 0]), 0);
+        let wv = f.ret(ADD, &[one, v, 0x2]) as i32;
+        let ww = f.ret(ADD, &[one, w, 0x2]) as i32;
+        // Detached, the superblock goes with the directory's descriptor,
+        // whose close takes dnotify's mark off; the instance's keeps d's
+        // connector.
+        assert_eq!(f.ret(166, &[m, 2]), 0);
+        assert_eq!(f.ret(3, &[dir]), 0);
+        let mut expected = Vec::new();
+        for (wd, mask) in [
+            (wv, 0x2000),
+            (ww, 0x2000),
+            (wz, 0x2000),
+            (wd, 0x4000_2000),
+            (wy, 0x2000),
+            (wx, 0x2000),
+        ] {
+            expected.push((wd, mask, &b""[..]));
+            expected.push((wd, 0x8000, &b""[..]));
+        }
+        assert_eq!(masks(&events(&mut f, one)), expected);
+    }
     #[test]
     fn a_descriptor_is_heard_of_where_renames_took_its_file() {
         let mut f = fixture();

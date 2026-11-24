@@ -3092,9 +3092,10 @@ kernel.
     destination (`rt6_need_strict`), and the route's gateway and device;
     a local one goes out through `lo`. A multicast one is `EMSGSIZE`, as
     Linux's multicast routing knows no device of the reply it fills
-    (`ip6mr_get_route`). The mark, the user ID, the protocol and the ports choose among
-    policy rules and multipath routes, which there are none of, so they
-    change nothing.
+    (`ip6mr_get_route`). The mark, the user ID, the protocol and the
+    ports choose among policy rules, which there are none of, and among
+    an IPv4 multipath route's hops, of which a lookup takes the first not
+    dead, so they change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed

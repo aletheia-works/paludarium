@@ -1088,9 +1088,7 @@ verified.
   connect"; a CI kernel without that fix keeps the device the scope ID
   gave. A socket's device steers only its IPv6 datagrams and connects,
   and two sockets on one port conflict whatever their devices, where
-  Linux's on different devices do not. Of an IPv4 multipath route's
-  next hops, a lookup takes the first not dead, where Linux picks one by
-  a hash of the flow (`fib_select_multipath`). Neighbour discovery makes none of
+  Linux's on different devices do not. Neighbour discovery makes none of
   the neighbours of the groups router solicitation, MLD reports and
   duplicate address detection send to (`ff02::2`, `ff02::16`, the
   solicited-node ones), no advertisement unasked, and no redirect; the
@@ -1170,10 +1168,12 @@ verified.
   Linux is built. A veth end whose MTU is below 1280 still has the files
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
-  A
-  route goes through `lo`, a veth end or rejects: IPv6 multipath routes,
-  an IPv4 next hop through an IPv6 gateway (`RTA_VIA`), encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
-  and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
+  A route goes through `lo` or a veth end, or rejects; of an IPv4
+  multipath route's next hops, a lookup takes the first not dead, where
+  Linux picks one by a hash of the flow (`fib_select_multipath`). IPv6
+  multipath routes, an IPv4 next hop through an IPv6 gateway
+  (`RTA_VIA`), encapsulations, nexthop objects, realms, expiries, source
+  prefixes, router preferences and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
   namespace a connection or datagram to an address no local route has is
@@ -1279,7 +1279,7 @@ verified.
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
   With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
-  not have (a multipath route, say, or a link of a kind) carries no
+  not have (an IPv6 multipath route, say, or a link of a kind) carries no
   message, as Linux would take it; an IPv6 route replaced without
   `NLM_F_CREATE` that is not there is told of
   ("Can not replace route - no match found") only where its prefix has

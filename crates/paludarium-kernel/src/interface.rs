@@ -539,8 +539,11 @@ pub(crate) struct Route4 {
     /// Its `fib_info`'s metrics, which tell two routes apart as
     /// `fib_find_info` does.
     pub metrics: Metrics,
-    /// Its one next hop's weight, which tells two routes apart
-    /// (`nh_comp`); 1 but for one of an `RTA_MULTIPATH` of one next hop.
+    /// Its next hop's weight (`fib_nh_weight`), as its other next hop
+    /// fields: of its one next hop, or a multipath route's first, which
+    /// `hops` has too, or in a lookup's answer of the hop it took; 1 but
+    /// for one of an `RTA_MULTIPATH` of one next hop, whose weight tells
+    /// it apart from another route (`nh_comp`).
     pub weight: u16,
     /// A multipath route's next hops, in order (`fib_nh`); none for one
     /// of a single next hop.
@@ -578,6 +581,26 @@ impl Route4 {
             weight: hop.weight,
             ..self.clone()
         }
+    }
+    /// Whether `other` is the same route, as `fib_find_info` and `nh_comp`
+    /// compare them: whatever their next hops' and its own
+    /// `RTNH_F_DEAD` and `RTNH_F_LINKDOWN` (`RTNH_COMPARE_MASK`).
+    fn same_info(&self, other: &Route4) -> bool {
+        let masked = |r: &Route4| Route4 {
+            linkdown: false,
+            fib_flags: r.fib_flags & !NEXTHOP_DEAD,
+            hops: r
+                .hops
+                .iter()
+                .map(|h| Hop4 {
+                    dead: false,
+                    linkdown: false,
+                    ..*h
+                })
+                .collect(),
+            ..r.clone()
+        };
+        masked(self) == masked(other)
     }
     /// Its next hop's fields back to its first's, once `hops` changed.
     fn first_again(&mut self) {
@@ -2598,7 +2621,7 @@ impl Addresses {
             let run = (first..end)
                 .find(|&i| !alike(&self.routes4[i]))
                 .unwrap_or(end);
-            let matched = (first..run).find(|&i| self.routes4[i] == new);
+            let matched = (first..run).find(|&i| self.routes4[i].same_info(&new));
             if flags & F_REPLACE != 0 {
                 return match matched {
                     Some(i) if i == first => Ok(None),
@@ -4539,6 +4562,16 @@ mod tests {
             a.add_multipath4(&wrong, Some(&both), &up).map(|_| ()),
             Err(Errno::EINVAL)
         );
+        // Its hops down one after the other, it is not down as a whole,
+        // and is still the same route as one asked for now, which is.
+        a.set_carrier(1000, false);
+        a.set_carrier(1001, false);
+        assert_eq!(
+            a.add_multipath4(&ask, Some(&both), &up).map(|_| ()),
+            Err(Errno::EEXIST)
+        );
+        a.set_carrier(1000, true);
+        a.set_carrier(1001, true);
         let host = Ask4 {
             scope: SCOPE_HOST,
             ..ask

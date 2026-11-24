@@ -674,9 +674,11 @@ pub(crate) enum FileName {
 /// A mapped file as the MMU reads it ([`paludarium_mmu::PageSource`]), with
 /// the size its page cache keeps and the name it shows.
 pub(crate) struct FilePages {
+    /// Dropped first, before `file`, so that the file's release, once the
+    /// last mapping goes, finds no place of it kept (`held`) and evicts it.
+    name: Option<FileName>,
     file: Arc<dyn FileHandle>,
     cache: Arc<FileCache>,
-    name: Option<FileName>,
     /// The file is a `memfd_secret` file, whose own handle `file` is not.
     secret: bool,
     /// What the pages of a `memfd_secret` file charge as faults bring
@@ -693,9 +695,9 @@ impl FilePages {
         charge: Option<Arc<crate::memfd::SecretCharge>>,
     ) -> Arc<Self> {
         Arc::new(FilePages {
+            name,
             file: Arc::clone(file),
             cache: Arc::clone(cache),
-            name,
             secret,
             charge,
         })

@@ -2925,7 +2925,10 @@ fn size_limited_by(
         return Ok(len);
     }
     let metadata = file.stat()?;
-    if metadata.mode & 0o170000 != 0o100000 {
+    // Only a regular file's size is limited; `/proc/<pid>/mem` stats as one,
+    // but its positions are addresses, and Linux's `mem_write` makes no
+    // `generic_write_checks`.
+    if metadata.mode & 0o170000 != 0o100000 || unsigned_offsets(file) {
         return Ok(len);
     }
     let room = size_room(c, start(&metadata)?)?;

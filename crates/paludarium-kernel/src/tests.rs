@@ -2184,6 +2184,14 @@ fn proc_mem_reads_and_writes_the_process_memory_through_the_system_calls() {
     assert_eq!(f.ret(18, &[fd, buf + 0x900, 6, buf]), 6);
     f.mem.read(GuestAddr(buf), &mut read).unwrap();
     assert_eq!(&read, b"public");
+    // RLIMIT_FSIZE does not limit it, as `mem_write` makes no
+    // `generic_write_checks`: setrlimit(RLIMIT_FSIZE, one page), then a
+    // write at an address past it.
+    let limit = DATA + 0xc00;
+    f.mem.write_u64(GuestAddr(limit), 0x1000).unwrap();
+    f.mem.write_u64(GuestAddr(limit + 8), 0x1000).unwrap();
+    assert_eq!(f.ret(160, &[1, limit]), 0);
+    assert_eq!(f.ret(18, &[fd, buf + 0x900, 6, buf]), 6);
     // Nothing is mapped at 16 KiB: EIO. lseek from the end: EINVAL.
     assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, 0x4000]), errno(Errno::EIO));
     // Its offsets are unsigned (FOP_UNSIGNED_OFFSET): one past i64::MAX is

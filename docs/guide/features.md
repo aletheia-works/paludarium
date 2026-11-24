@@ -3764,7 +3764,7 @@ kernel.
   the open directory and its `ns`, the owner at that moment, as Linux's
   `pid_getattr` asks it. An open checks the mode for that owner, as Linux's
   `generic_permission` does, so opening one for writing is `EACCES` without
-  `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv` or `pagemap` once the
+  `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv`, `pagemap` or `mem` once the
   process is not dumpable; a write to one opened for writing (root's) is
   `EINVAL`, but to `comm`, which renames the thread as Linux's
   `comm_write` does: to its first 15 bytes, up to a NUL, taking the whole
@@ -3833,7 +3833,7 @@ kernel.
   as in `task/<pid>`. Its `fd` and `fdinfo` list nothing, so `execveat`
   through `/proc/self/fd/<n>` or `/dev/fd/<n>` is `ENOENT`; `maps`, `smaps` and
   `cmdline` read nothing; its files but its directory are root's, as a
-  zombie's are (see limitations), so `environ`, `auxv` and `pagemap` are
+  zombie's are (see limitations), so `environ`, `auxv`, `pagemap` and `mem` are
   `EACCES`, and `ESRCH` for root; `smaps_rollup` is `ESRCH` for any reader
   (`smaps_rollup_open`); `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
@@ -3845,7 +3845,7 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `exe`, `cwd`,
+  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `mem`, `exe`, `cwd`,
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
@@ -3861,7 +3861,7 @@ kernel.
   file's mode for that owner before anything else, as Linux's
   `generic_permission` does (`EACCES`): writing needs `CAP_DAC_OVERRIDE`
   but for `comm`, `uid_map`, `gid_map` and `setgroups` (0644), and
-  reading `environ`, `auxv` or `pagemap` needs the owner or
+  reading `environ`, `auxv`, `pagemap` or `mem` needs the owner or
   `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner as this
   process's own do (above). `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
   and looked in as its mode (0500) lets the reader, as Linux's
@@ -3875,7 +3875,7 @@ kernel.
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
-  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
+  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `mem`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
@@ -3886,7 +3886,7 @@ kernel.
   `maps` and `smaps` are empty, and open for any reader their mode lets,
   as Linux's `proc_mem_open` checks the reader only of a process with
   memory; its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
-  `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
+  `environ`, `auxv`, `pagemap` and `mem` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
   process with no memory before they check the reader, nor does its
   `smaps_rollup` (`ESRCH` for any reader, `smaps_rollup_open`), as for a

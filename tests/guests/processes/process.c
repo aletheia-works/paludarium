@@ -7138,6 +7138,16 @@ static int proc_mem_case(void) {
     printf("own read: %ld %s\n", own, buf);
     printf("own write: %ld\n", pm_errno(pwrite(fd, "replaced", 8, (off_t)(uintptr_t)word)));
     printf("word now: %.8s\n", word);
+    /* RLIMIT_FSIZE does not limit it: mem_write makes no
+       generic_write_checks, so no EFBIG and no SIGXFSZ at an address past
+       the limit. */
+    struct rlimit fsize, small = {4096, RLIM_INFINITY};
+    getrlimit(RLIMIT_FSIZE, &fsize);
+    small.rlim_max = fsize.rlim_max;
+    setrlimit(RLIMIT_FSIZE, &small);
+    long limited = pm_errno(pwrite(fd, "replaced", 8, (off_t)(uintptr_t)word));
+    setrlimit(RLIMIT_FSIZE, &fsize);
+    printf("write past RLIMIT_FSIZE: %ld\n", limited);
     char *ro = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     long forced = pm_errno(pwrite(fd, "F", 1, (off_t)(uintptr_t)ro));
     printf("read-only write: %ld byte=%c\n", forced, ro[0]);

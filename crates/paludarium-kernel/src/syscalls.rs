@@ -2090,8 +2090,8 @@ pub(crate) fn woke(events: u32, before: (u64, u64), now: (u64, u64)) -> bool {
         || (before.1 != now.1 && events & OUTPUT_KEYS != 0)
 }
 
-/// What a `poll` of the `nfds` entries at `fds` waits for ([`wait_ready`]),
-/// unless their array cannot be read.
+/// What a `poll` of the `nfds` entries at `fds` waits for ([`wait_ready`]):
+/// nothing for a set without a keyed file, or an array that cannot be read.
 fn poll_keys(c: &Context<'_>, fds: u64, nfds: u64) -> Option<Vec<Watched>> {
     let mut keys = Vec::new();
     for n in 0..nfds {
@@ -2106,7 +2106,8 @@ fn poll_keys(c: &Context<'_>, fds: u64, nfds: u64) -> Option<Vec<Watched>> {
         let events = u16::from_le_bytes([entry[4], entry[5]]);
         keys.push((u32::from(events), fd, file_key(c, fd)));
     }
-    Some(keys)
+    // A set without a keyed file waits as before, keeping nothing.
+    keys.iter().any(|w| w.2.is_some()).then_some(keys)
 }
 
 /// The generations of the file of `fd`, if it is open and has keyed
@@ -2331,7 +2332,7 @@ fn select(
                 keys.push((u32::from(events), fd as i32, file_key(c, fd as i32)));
             }
         }
-        Some(keys)
+        keys.iter().any(|w| w.2.is_some()).then_some(keys)
     };
     let count = wait_ready(
         c,

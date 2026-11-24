@@ -12,7 +12,9 @@ musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie 
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/fanotify" "$here/fanotify.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/userfaultfd" "$here/userfaultfd.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/aio" "$here/aio.c"
-musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/perf" "$here/perf.c"
+# A build ID of its own for perf-side-band's MMAP2 records, which musl-gcc's
+# link spec may leave out.
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -Wl,--build-id=sha1 -o "$out/perf" "$here/perf.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/bpf" "$here/bpf.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/bpf-prog" "$here/bpf-prog.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/ptrace" "$here/ptrace.c"
@@ -33,6 +35,7 @@ musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie 
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv4-gateway" "$here/veth-ipv4-gateway.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv4-ecmp" "$here/veth-ipv4-ecmp.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-gateway" "$here/veth-ipv6-gateway.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-ecmp" "$here/veth-ipv6-ecmp.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-scope" "$here/veth-ipv6-scope.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-traffic" "$here/veth-ipv6-traffic.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/x87" "$here/x87.c" -lm

@@ -769,6 +769,14 @@ pub struct Usage {
     /// (`Pss`), and that of the dirty pages (`Pss_Dirty`).
     pub pss: u64,
     pub pss_dirty: u64,
+    /// [`Usage::pss`] split by what each page is, as `smaps_account` sums
+    /// it for `smaps_rollup`: anonymous (`Pss_Anon`), shmem's, a page of
+    /// shared memory of no file, a shmem file or System V shared memory
+    /// (Linux's `PageSwapBacked`, `Pss_Shmem`), or another file's
+    /// (`Pss_File`).
+    pub pss_anon: u64,
+    pub pss_file: u64,
+    pub pss_shmem: u64,
 }
 
 impl Usage {
@@ -3308,6 +3316,19 @@ impl AddressSpaceData {
                 usage.pss += pss;
                 if dirty {
                     usage.pss_dirty += pss;
+                }
+                let swap_backed = match self.shared_at(page) {
+                    Some(shared) => shared.pages.source.as_ref().is_none_or(|s| s.shmem_file()),
+                    None => self
+                        .backing_at(page)
+                        .is_some_and(|backing| backing.source.shmem_file()),
+                };
+                if anonymous {
+                    usage.pss_anon += pss;
+                } else if swap_backed {
+                    usage.pss_shmem += pss;
+                } else {
+                    usage.pss_file += pss;
                 }
                 match (maps >= 2, dirty) {
                     (true, false) => usage.shared_clean += 1,
@@ -7588,6 +7609,22 @@ impl MemoryView {
             vma.flags = source.vma_flags(vma.flags);
         }
         Some(vma)
+    }
+    /// The file of the VMA [`Self::vma_from`] gives for `addr` (Linux's
+    /// `vm_file`), for reading it as perf's `build_id_parse_nofault` does;
+    /// `None` for a VMA of no file of its own.
+    #[must_use]
+    pub fn vma_source(&self, addr: u64) -> Option<Arc<dyn PageSource>> {
+        let data = self.data.upgrade()?;
+        let _serialization = self
+            .serialization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (vma, source) = data
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .vma_from(addr)?;
+        vma.file.filter(|file| file.source).and(source)
     }
     /// Runs `f` on the space, if it still lives, under its locks.
     fn with_data<T>(&self, f: impl FnOnce(&AddressSpaceData) -> T) -> Option<T> {

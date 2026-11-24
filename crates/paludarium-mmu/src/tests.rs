@@ -1090,6 +1090,48 @@ impl PageSource for Shmem {
 }
 
 #[test]
+fn usage_splits_pss_by_what_each_page_is_as_smaps_account_does() {
+    let mut m = AddressSpace::new();
+    let view = m.view();
+    let pss_split = |at: u64, pages: u64| {
+        let usage = view.usage(at, at + pages * PAGE_SIZE).unwrap();
+        assert_eq!(usage.pss, usage.pss_anon + usage.pss_file + usage.pss_shmem);
+        (usage.pss_anon, usage.pss_file, usage.pss_shmem)
+    };
+    let page = PAGE_SIZE << Usage::PSS_SHIFT;
+    // A written page of private memory is anonymous.
+    let anonymous = m
+        .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    m.write(anonymous, b"x").unwrap();
+    assert_eq!(pss_split(anonymous.0, 1), (page, 0, 0));
+    // Shared memory of no file is shmem's.
+    let shared = m
+        .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    m.mark_shared(shared, PAGE_SIZE).unwrap();
+    m.write(shared, b"x").unwrap();
+    assert_eq!(pss_split(shared.0, 1), (0, 0, page));
+    // A shared mapping of a file: shmem's for a shmem file, the file's
+    // otherwise.
+    for (shmem, split) in [(true, (0, 0, page)), (false, (0, page, 0))] {
+        let source: Arc<dyn PageSource> = Arc::new(Shmem {
+            size: PAGE_SIZE,
+            held: vec![0],
+            shmem,
+        });
+        let pages = SharedPages::new().with_source(source);
+        let at = m
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        m.share_pages(at, PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+            .unwrap();
+        m.read(at, &mut [0]).unwrap();
+        assert_eq!(pss_split(at.0, 1), split, "shmem {shmem}");
+    }
+}
+
+#[test]
 fn a_userfaultfd_registers_shmem_files_and_waits_for_their_holes() {
     let file = |shmem| -> Arc<dyn PageSource> {
         Arc::new(Shmem {

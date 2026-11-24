@@ -42,7 +42,10 @@
 //! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
 //! `bpf_unpriv_handler`.
 //!
-//! `/proc/sys/vm` has `drop_caches` alone, as `fs/drop_caches.c` has it:
+//! `/proc/sys/vm` has `unprivileged_userfaultfd`, the machine's as the perf
+//! ones are, 0 or 1 (`proc_dointvec_minmax`), which lets [`crate::userfaultfd`]
+//! take the kernel's faults for anyone; and `drop_caches`, as
+//! `fs/drop_caches.c` has it:
 //! root's, of mode 0200, which no one opens to read (`EACCES`) and only root
 //! to write; a write takes an `int` from 1 to 4, and each that goes through
 //! drops as its value says, 2 evicting the evictable fanotify marks of the
@@ -247,6 +250,9 @@ pub(crate) enum Kernel {
     Shmmax,
     Shmmni,
     UnprivilegedBpfDisabled,
+    /// `vm.unprivileged_userfaultfd`, the machine's as the perf ones are,
+    /// though under `/proc/sys/vm`.
+    UnprivilegedUserfaultfd,
 }
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
@@ -288,6 +294,7 @@ impl Kernel {
                 | Self::PerfEventMlockKb
                 | Self::PerfEventParanoid
                 | Self::UnprivilegedBpfDisabled
+                | Self::UnprivilegedUserfaultfd
         )
     }
     /// Whether it is one of the IPC namespace's next IDs.
@@ -307,6 +314,7 @@ pub(crate) struct Machine {
     perf_event_mlock_kb: AtomicI32,
     perf_event_paranoid: AtomicI32,
     unprivileged_bpf_disabled: AtomicI32,
+    unprivileged_userfaultfd: AtomicI32,
     drop_caches: AtomicI32,
 }
 
@@ -318,6 +326,7 @@ impl Default for Machine {
             perf_event_mlock_kb: AtomicI32::new(crate::perf::MLOCK_KB),
             perf_event_paranoid: AtomicI32::new(crate::perf::PARANOID),
             unprivileged_bpf_disabled: AtomicI32::new(crate::bpf::UNPRIVILEGED_DISABLED),
+            unprivileged_userfaultfd: AtomicI32::new(0),
             drop_caches: AtomicI32::new(0),
         }
     }
@@ -353,8 +362,14 @@ impl Machine {
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
         self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
     }
+    /// Whether `userfaultfd` takes the kernel's faults for anyone
+    /// (`sysctl_unprivileged_userfaultfd`), 0 at first.
+    pub(crate) fn unprivileged_userfaultfd(&self) -> bool {
+        self.unprivileged_userfaultfd.load(Ordering::SeqCst) != 0
+    }
     fn line(&self, file: Kernel) -> Vec<u8> {
         line(match file {
+            Kernel::UnprivilegedUserfaultfd => self.unprivileged_userfaultfd.load(Ordering::SeqCst),
             Kernel::PerfCpuTimeMaxPercent => self.perf_cpu_time_max_percent.load(Ordering::SeqCst),
             Kernel::PerfEventMaxSampleRate => {
                 self.perf_event_max_sample_rate.load(Ordering::SeqCst)
@@ -399,6 +414,12 @@ impl Machine {
                 let (value, consumed) = parse(buf, Some((1, i32::MAX)))?;
                 self.perf_event_max_sample_rate
                     .store(value, Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            // `proc_dointvec_minmax` from 0 to 1.
+            Kernel::UnprivilegedUserfaultfd => {
+                let (value, consumed) = parse(buf, Some((0, 1)))?;
+                self.unprivileged_userfaultfd.store(value, Ordering::SeqCst);
                 return Ok(consumed);
             }
             _ => {}
@@ -499,6 +520,7 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
         b"/vm" => Some(Entry::Directory(Directory::Vm)),
         b"/vm/drop_caches" => Some(Entry::DropCaches),
+        b"/vm/unprivileged_userfaultfd" => Some(Entry::Kernel(Kernel::UnprivilegedUserfaultfd)),
         _ => {
             if let Some(rest) = rest.strip_prefix(b"/net")
                 && (rest.is_empty() || rest.starts_with(b"/"))
@@ -553,7 +575,10 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
             (b"net", DT_DIR),
             (b"vm", DT_DIR),
         ],
-        Directory::Vm => vec![(b"drop_caches", DT_REG)],
+        Directory::Vm => vec![
+            (b"drop_caches", DT_REG),
+            (b"unprivileged_userfaultfd", DT_REG),
+        ],
         Directory::Net => vec![(b"ipv4", DT_DIR), (b"ipv6", DT_DIR)],
         Directory::Ipv4 => vec![(b"conf", DT_DIR), (b"ip_forward", DT_REG)],
         Directory::Ipv6 => vec![(b"conf", DT_DIR)],
@@ -632,7 +657,11 @@ fn child(
             b"vm" => dir(Directory::Vm),
             _ => None,
         },
-        Directory::Vm => (name == b"drop_caches").then_some(Entry::DropCaches),
+        Directory::Vm => match name {
+            b"drop_caches" => Some(Entry::DropCaches),
+            b"unprivileged_userfaultfd" => Some(Entry::Kernel(Kernel::UnprivilegedUserfaultfd)),
+            _ => None,
+        },
         Directory::Net => match name {
             b"ipv4" => dir(Directory::Ipv4),
             b"ipv6" => dir(Directory::Ipv6),
@@ -738,7 +767,8 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         | Kernel::PerfEventMaxSampleRate
         | Kernel::PerfEventMlockKb
         | Kernel::PerfEventParanoid
-        | Kernel::UnprivilegedBpfDisabled => Vec::new(),
+        | Kernel::UnprivilegedBpfDisabled
+        | Kernel::UnprivilegedUserfaultfd => Vec::new(),
     }
 }
 
@@ -816,7 +846,8 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
         | Kernel::PerfEventMaxSampleRate
         | Kernel::PerfEventMlockKb
         | Kernel::PerfEventParanoid
-        | Kernel::UnprivilegedBpfDisabled => Err(Errno::EINVAL),
+        | Kernel::UnprivilegedBpfDisabled
+        | Kernel::UnprivilegedUserfaultfd => Err(Errno::EINVAL),
     }
 }
 
@@ -1718,7 +1749,7 @@ mod tests {
             lookup(b"/proc/sys/vm/drop_caches", None),
             Some(Entry::DropCaches)
         );
-        assert_eq!(entries_of(Directory::Vm, None).len(), 3);
+        assert_eq!(entries_of(Directory::Vm, None).len(), 4);
         assert_eq!(entries_of(Directory::Kernel, None).len(), 19);
         assert_eq!(lookup(b"/proc/system", None), None);
         assert_eq!(entries_of(Directory::Mqueue, None).len(), 7);

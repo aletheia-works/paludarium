@@ -1117,8 +1117,13 @@ kernel.
 - `userfaultfd` makes a file through which a thread handles the faults of
   others on memory it registered, as Linux's `fs/userfaultfd.c`. One that
   the kernel's own faults reach as well (without `UFFD_USER_MODE_ONLY`)
-  needs `CAP_SYS_PTRACE` (`EPERM`, as `vm.unprivileged_userfaultfd` is 0),
-  checked before the flags (`EINVAL`). The file is
+  needs `CAP_SYS_PTRACE` unless `vm.unprivileged_userfaultfd` is 1
+  (`EPERM`), checked before the flags (`EINVAL`). `/dev/userfaultfd`, a
+  misc device of root's of mode 0600 (`userfaultfd_misc`, whose minor
+  number Linux gives at boot), makes one with its only operation, the
+  ioctl `USERFAULTFD_IOC_NEW`, of the flags in the low 32 bits of its
+  argument and with no capability, as whoever may open the device may make
+  them; any other ioctl, `read` and `write` are `EINVAL`. The file is
   `anon_inode:[userfaultfd]`, open for reading, and belongs to the address
   space it was made in, whoever holds it. It is an anonymous inode of its
   own (`anon_inode_create_getfile`), as a fork's file a read hands over is:
@@ -1785,6 +1790,11 @@ kernel.
     request whose file became ready there goes on. Then the requests are
     cancelled, and its task work and theirs run, so each completes with
     `ECANCELED` before the new program runs.
+  - A whole process's exit (`exit_group` or a fatal signal) cancels the
+    requests its threads submitted in the same way, after the exit event
+    of ptrace and before the thread is exiting, as Linux master's
+    `io_task_group_exiting` asks: a link's next request still waiting to
+    run then runs as usual.
   - A ring whose last descriptor and mapping close lets go of its waiting
     requests and the files they hold, as Linux master does before `close`
     returns, so a pipe whose only reader was such a request takes no more
@@ -2838,14 +2848,42 @@ kernel.
     on the named end's link (`ENODEV` without one, `ENETDOWN` while it is
     down). A route with a gateway goes out to the gateway's neighbour
     entry, and a dump, a notification and a lookup give it as
-    `RTA_GATEWAY`. Another route with a gateway of the same metric would
-    be its multipath sibling (`rt6_qualify_for_ecmp`), which is
-    `EOPNOTSUPP` for now; one of the same device and gateway is `EEXIST`, and
-    `RTM_DELROUTE` with a gateway removes only a route through it. Turning `disable_ipv6` on for an end
+    `RTA_GATEWAY`. Another route with a gateway of the same metric is its
+    multipath sibling (`rt6_qualify_for_ecmp`, `fib6_add_rt2node`): it
+    goes after the routes of that metric, and is told of with all the hops
+    of its route in `RTA_MULTIPATH`, from itself on, without
+    `NLM_F_EXCL` and with the request's `NLM_F_APPEND`. A dump tells of a
+    multipath route once, its hops in the order they came, and passes over
+    a route of the metric without a gateway that came between them
+    (`fib6_dump_node`); `RTM_F_FIB_MATCH` gives the hops from the one a
+    lookup took. One of the same device and gateway is `EEXIST`, and
+    `NLM_F_REPLACE` takes away all of a multipath route's hops but the new
+    one. `RTM_DELROUTE` with a gateway removes only a route through it;
+    without one, a multipath route goes with all its hops, told of in one
+    message (`__ip6_del_rt_siblings`). A request's `RTA_MULTIPATH` adds
+    or removes each of its next hops, with the device and gateway each
+    names, else the request's, and its weight (`rtnh_hops`, given back in
+    dumps), as `ip6_route_multipath_add` and `ip6_route_multipath_del`
+    do: none, a gateway shorter than an address, or a hop added without a
+    gateway is `EINVAL`, and one twice `EEXIST`; all are checked before any
+    goes in, and one message tells of those put in. Where one then fails,
+    those put in are told of, then go, each told of. A removal takes each
+    hop alone, and gives the last error. A lookup takes the hop the flow's
+    hash falls to, each hop living taking a share of the hashes by its
+    weight (`fib6_select_path`, `rt6_multipath_rebalance`), with the
+    namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
+    the source, the destination, the flow label and the protocol; a
+    socket's packets hash as it is bound, `::` unbound, with no flow
+    label. Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
-    Going down, or away, it loses its IPv6 routes, told of in the order of
-    a dump, then its addresses (`addrconf_ifdown`).
+    Going down, it loses its IPv6 routes, told of in the order of a dump,
+    but a multipath route's hop, which turns `RTNH_F_DEAD` and
+    `RTNH_F_LINKDOWN` without a word, and which lookups pass over until
+    the end is ready again (`fib6_ifdown`, `rt6_sync_up`), unless the
+    devices of all its route's hops are then down, when all of it goes;
+    then its addresses (`addrconf_ifdown`). Going away, it loses what is
+    left of them.
   - **Netconf of veth ends:** each end's settings
     are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
     `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their
@@ -3092,10 +3130,11 @@ kernel.
     destination (`rt6_need_strict`), and the route's gateway and device;
     a local one goes out through `lo`. A multicast one is `EMSGSIZE`, as
     Linux's multicast routing knows no device of the reply it fills
-    (`ip6mr_get_route`). The mark, the user ID, the protocol and the
-    ports choose among policy rules, which there are none of, and among
-    an IPv4 multipath route's hops, of which a lookup takes the first not
-    dead, so they change nothing.
+    (`ip6mr_get_route`). The source, the flow label (`RTA_FLOWLABEL`)
+    and the protocol choose among an IPv6 multipath route's hops, as
+    `fib6_select_path` hashes them, and of an IPv4 one's a lookup takes
+    the first not dead; the mark, the user ID and the ports choose among
+    policy rules, which there are none of, so they change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed
@@ -3729,7 +3768,7 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
-  `clear_refs`, `smaps`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them: root of the user namespace its program runs in, or the first
@@ -3754,7 +3793,14 @@ kernel.
   `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
-  unmarked; `maps` and `smaps` name a mapped file the same way. `status`
+  unmarked; `maps` and `smaps` name a mapped file the same way.
+  `smaps_rollup` is what `smaps` counts of every VMA summed under one line,
+  from the first VMA's start to the last one's end with no flags, file or
+  name but `[rollup]`, as Linux's `show_smaps_rollup` makes it: `Pss` is
+  summed before it is rounded to kB and split by what each page is
+  (`Pss_Anon`, `Pss_File`, and `Pss_Shmem` for shared memory of no file, a
+  tmpfs file, a memfd or System V shared memory), and its open is `ESRCH`
+  for a task with no memory left. `status`
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
   capabilities and so on) and, of the memory ones, the locked memory
   (`VmLck`), the peak of the resident memory (`VmHWM`) and the resident
@@ -3784,7 +3830,7 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
-  `comm`, `syscall` (0400), `maps`, `clear_refs` (0200), `smaps`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
+  `comm`, `syscall` (0400), `maps`, `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
   `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
@@ -3806,8 +3852,8 @@ kernel.
   through `/proc/self/fd/<n>` or `/dev/fd/<n>` is `ENOENT`; `maps`, `smaps` and
   `cmdline` read nothing; its files but its directory are root's, as a
   zombie's are (see limitations), so `environ`, `auxv` and `pagemap` are
-  `EACCES`, and `ESRCH` for root;
-  `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
+  `EACCES`, and `ESRCH` for root; `smaps_rollup` is `ESRCH` for any reader
+  (`smaps_rollup_open`); `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
   `FDSize` of 0; and `stat` has no sizes or addresses. A zombie process keeps
   its `pid` and `user` links too until it is reaped, as Linux's `pidns_get`
@@ -3817,7 +3863,7 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `pagemap`, `exe`, `cwd`,
+  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `exe`, `cwd`,
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
@@ -3847,7 +3893,7 @@ kernel.
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
-  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
+  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is blocked in a wait (for a pipe,
@@ -3860,7 +3906,9 @@ kernel.
   memory; its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
   `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
-  process with no memory before they check the reader. Its files but its
+  process with no memory before they check the reader, nor does its
+  `smaps_rollup` (`ESRCH` for any reader, `smaps_rollup_open`), as for a
+  leader that ended before its other threads. Its files but its
   directory are root's, as on the CI runners' kernel (see limitations), so
   their mode lets only root open them, and any other reader gets `EACCES`.
 
@@ -4070,8 +4118,11 @@ kernel.
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
 
-- `/proc/sys/vm` has `drop_caches` alone, so its listing differs from
-  Linux's, which has the rest of the `vm` sysctls too. As Linux's
+- `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
+  its listing differs from Linux's, which has the rest of the `vm` sysctls
+  too. `unprivileged_userfaultfd` is the machine's, 0 at first, root's of
+  mode 0644, which only root opens to write, and takes 0 or 1
+  (`proc_dointvec_minmax`, else `EINVAL`). As Linux's
   `fs/drop_caches.c` has it, the file is root's, of mode 0200: no one may
   open it to read, root included (`EACCES`, as `test_perm` gives root the
   owner's bits), and only root may open it to write. A write takes one
@@ -4396,7 +4447,10 @@ kernel.
   `st_rdev` (1:3, 1:5, 1:7, 1:8, 1:9): `null` reads nothing, `zero` and
   `full` read zeros, `random` and `urandom` read the host's random bytes,
   and `full` refuses writes with `ENOSPC` while the others take them. A
-  mapping of `zero` is anonymous memory, shared with `MAP_SHARED`. `fd`,
+  mapping of `zero` is anonymous memory, shared with `MAP_SHARED`.
+  `userfaultfd` is root's misc device (10:122, mode 0600), which opens for
+  whoever its mode lets (`EACCES`) and makes `userfaultfd` contexts (see
+  `userfaultfd` above). `fd`,
   `stdin`, `stdout` and `stderr` are links (0777) to `/proc/self/fd` and its
   first three entries, followed by `open`, `stat` and paths through them
   (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, and with `O_PATH` opens
@@ -4880,7 +4934,14 @@ kernel.
   length and offset (a file's, and the address of private anonymous
   memory), and for `MMAP2` its file's device and inode, its protection and
   sharing, and the name `d_path` gives (`[heap]`, `[stack]`, `//anon`,
-  `/dev/zero (deleted)` for shared anonymous memory); `PERF_RECORD_COMM`
+  `/dev/zero (deleted)` for shared anonymous memory). With `build_id`, as
+  `perf record` asks by default, an `MMAP2` record of an ELF executable
+  or shared object gives its GNU build ID in place of the device and inode
+  (`PERF_RECORD_MISC_MMAP_BUILD_ID`: its size, three zero bytes and 20
+  bytes), as Linux's `build_id_parse_nofault` finds it in the first 256
+  program headers' `PT_NOTE`s; none comes of secret memory or of a page a
+  tmpfs file or memfd does not hold, as Linux reads only the page cache;
+  `PERF_RECORD_COMM`
   (`comm`) of `PR_SET_NAME`, of a write to `/proc/<pid>/comm` (to the events
   that count the writer, of the thread it renames) and of `execve`
   (`PERF_RECORD_MISC_COMM_EXEC`), which then writes the new program's stack
@@ -5337,6 +5398,24 @@ kernel.
     `SKF_AD_HATYPE` `ARPHRD_LOOPBACK` or `ARPHRD_ETHER` and
     `SKF_AD_PAY_OFFSET` 8. The helpers run as the sending task, in whose
     context Linux's softirq runs the receive.
+
+- On a TCP listener, IPv4 or IPv6, the filter runs on each SYN that
+  comes to it through the loopback or a veth pair, as `tcp_v4_rcv` and
+  `tcp_v6_rcv` run `tcp_filter` before `tcp_v4_do_rcv` takes it, and so
+  before the accept queue's check: a SYN it drops counts in the
+  listener's `sk_drops` and is sent again on the handshake's schedule,
+  as one a full queue dropped. The SYN is Linux 7.0's: a 40-byte TCP
+  header with a random sequence number, the window that half the
+  receive buffer holds rounded down to the MSS, and the options MSS (the
+  device's MTU less the headers), SACK permitted, the timestamps (a
+  random value, then 0) and a window scale of 10, for `tcp_rmem[2]`'s 32
+  MiB; the IP header, MAC
+  header and `__sk_buff` fields as a UDP datagram's (above), with the
+  connecting socket's flow hash, which `connect` gives it and each SYN
+  sent again draws anew (`sk_rethink_txhash`), and `SKF_AD_PAY_OFFSET`
+  40; a SYN sent again is the connecting socket's, with its options. An accepted socket
+  takes the listener's filter and its lock, as `sk_clone_lock` copies
+  them.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it

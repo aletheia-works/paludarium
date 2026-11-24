@@ -4082,6 +4082,18 @@ impl AddressSpaceData {
             return;
         }
         let shared = self.shared_at(page).map(|mapping| mapping.pages.stores());
+        // A page its memory keeps read-only ([`PageSource::writable`]) is
+        // remembered for reads alone, so that each write goes to `check`.
+        let read_only = self.shared_at(page).is_some_and(|mapping| {
+            mapping
+                .pages
+                .source()
+                .is_some_and(|source| !source.writable(page.wrapping_add(mapping.shift)))
+        });
+        let mut prot = p.cached_access();
+        if read_only {
+            prot = Prot(prot.0 & !Prot::WRITE.0);
+        }
         // A file mapping without a file, or whose file has no end, has no end
         // to check, as in `check`. One whose file does not say where it keeps
         // its size stays out.
@@ -4110,7 +4122,7 @@ impl AddressSpaceData {
             }
             thread.tlb.insert(TlbEntry {
                 page,
-                prot: p.cached_access(),
+                prot,
                 frame: TlbFrame::of(&p.frame),
                 fetched: Arc::clone(&p.frame.fetched),
                 cow: p.cow,
@@ -5022,11 +5034,13 @@ impl AddressSpaceData {
         Ok(())
     }
 
-    /// Whether `[start, end)` ends inside `m` where its memory may not be
-    /// split ([`Self::refuses_split`]).
+    /// Whether `[start, end)` ends in `m` where its memory may not be split
+    /// ([`Self::refuses_split`]). The VMA is the shared mapping's, which
+    /// `refuses_split` looks at: `m` may be a part of it, as the mappings
+    /// split where nothing about them changed.
     fn splits_refused(&self, m: &Mapping, start: u64, end: u64) -> bool {
-        (m.start.0 < start && self.refuses_split(start))
-            || (m.end() > end && self.refuses_split(end))
+        let within = |at: u64| m.start.0 <= at && at <= m.end();
+        (within(start) && self.refuses_split(start)) || (within(end) && self.refuses_split(end))
     }
 
     /// Takes `[addr, end)` out of the space, its mappings, memory and pages,
@@ -5587,7 +5601,7 @@ impl AddressSpaceData {
             // be (`madvise_update_vma`).
             let mut advised = m;
             advise(&mut advised);
-            if advised != m && self.splits_refused(&m, from, to) {
+            if advised != m && self.splits_refused(&m, addr, end) {
                 return Err(Errno::EINVAL);
             }
             self.split_at(from);
@@ -9937,9 +9951,17 @@ mod tests {
             .unwrap();
         let mid = GuestAddr(at.0 + PAGE_SIZE);
         let end = at.0 + len;
+        // A part that would not change takes the call first, which leaves
+        // the VMA whole for those after.
+        assert_eq!(
+            space.protect_shared(at, PAGE_SIZE, Prot::READ_WRITE),
+            Ok(())
+        );
         // The first page takes a write; another's is a bus error, and it
-        // reads as it was.
+        // reads as it was, though a read remembered it first.
         space.write(at, b"x").unwrap();
+        let mut first = [0];
+        space.read(mid, &mut first).unwrap();
         let fault = space.write(mid, b"x").unwrap_err();
         assert!(fault.bus && fault.write);
         let mut b = [1];

@@ -5871,8 +5871,9 @@ kernel.
     signal (`NT_SIGINFO`), the auxiliary vector its exec saved (Linux's
     `saved_auxv`, whatever the program did to its stack), the mapped files
     (`NT_FILE`:
-    each VMA that maps a file, by its path, followed by `(deleted)` once
-    unlinked, and shared anonymous memory as `/dev/zero (deleted)`, as Linux
+    each VMA that maps a file, where renames have moved it, followed by
+    `(deleted)` once the name it has is removed, as in `/proc/<pid>/maps`,
+    and shared anonymous memory as `/dev/zero (deleted)`, as Linux
     names it) and the memory. It has no `NT_X86_XSTATE` note, as Linux writes
     none on a CPU without XSAVE, which the virtual CPU is. The memory is
     chosen as Linux's `vma_dump_size` chooses it with the default

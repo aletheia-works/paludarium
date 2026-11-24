@@ -45,6 +45,9 @@ verified.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used.
+  A rename that a process under `chroot` makes does not move the names
+  of the files it moves in the maps, a core's `NT_FILE` note and
+  `/proc/<pid>/exe`, where Linux's `d_move` moves them whatever the root.
   `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as

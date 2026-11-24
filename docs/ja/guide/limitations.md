@@ -40,6 +40,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **`/proc/self/maps` の一部**：エミュレーターには vDSO も `vsyscall` のページも
   ないので、`[vvar]`、`[vdso]`、`[vsyscall]` の行はありません。スタックの VMA は
   初めから全体の大きさで、Linux のように使うにつれて伸びません。
+  `chroot` したプロセスがファイルの名前を変えても、マップ、コアの `NT_FILE` ノート、
+  `/proc/<pid>/exe` のそのファイルの名前は動きません。Linux の `d_move` はルートに
+  関係なく動かします。
   `[anon:<名前>]` の名前（`PR_SET_VMA`）はありません。
 - **`/proc/self/smaps` と `smaps_rollup` の一部**：数える値は、エミュレーターのページのエントリーから
   出します。`Referenced` は数えたページすべてです。読み込んだプログラムの

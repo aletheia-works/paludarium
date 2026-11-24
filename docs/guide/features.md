@@ -962,7 +962,7 @@ kernel.
   (`EINVAL`, after the VMAs before it took the advice) and `msync` with
   `MS_INVALIDATE` (`EBUSY`); `MADV_DONTNEED_LOCKED` takes it. A `fork`ed
   child has no lock, nor does the old range `MREMAP_DONTUNMAP` leaves, and
-  the rings of AIO and `io_uring` are never locked. Unknown flags of
+  the rings of AIO, `io_uring` and perf events are never locked. Unknown flags of
   `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
   memory stays in place without more being done.
 
@@ -996,8 +996,8 @@ kernel.
   one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
   takes only private anonymous memory, memory core mm does not back, as
   the rings of AIO, `io_uring` and perf events, takes no `MADV_DOFORK` or
-  `MADV_DODUMP`, and a perf ring buffer takes a change of only a part of
-  it none), and a hole in the range gives
+  `MADV_DODUMP`, and a perf ring buffer takes no change to only a part of
+  it), and a hole in the range gives
   `ENOMEM` after the rest has taken it. A `fork`ed child gets no mapping
   `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
   its pages, as new zero-filled memory; it keeps that flag and
@@ -1088,7 +1088,7 @@ kernel.
   process when it moves. A file mapping grows over more of the file, whose
   pages it reads when they are first touched, and moving a range that spans
   several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
-  `EFAULT`. The rings of AIO and `io_uring` are fixed mappings
+  `EFAULT`. The rings of AIO, `io_uring` and perf events are fixed mappings
   (`VM_DONTEXPAND`): they do not grow (`EFAULT`) or stay behind a move
   (`MREMAP_DONTUNMAP`, `EINVAL`), and an AIO ring moves only whole, as
   Linux master's `aio_ring_mremap` has it (`EINVAL` once the target is

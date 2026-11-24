@@ -5261,7 +5261,11 @@ impl AddressSpaceData {
         if !keep_old && old_len > 0 {
             // `remap` moves pages of one VMA only, whose mapping at `old` it
             // found not sealed, and sealed mappings make VMAs of their own:
-            // nothing here is sealed, so the unmap cannot fail.
+            // nothing here is sealed. Nor is it a part of memory that may not
+            // be split ([`PageSource::splits`]): `remap` refused that before
+            // the move with `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and the move
+            // without either only grows, which such memory, a fixed mapping,
+            // does not (`EFAULT`). So the unmap cannot fail.
             let unmapped = self.unmap(GuestAddr(old), old_len);
             debug_assert!(unmapped.is_ok(), "{unmapped:?}");
         }

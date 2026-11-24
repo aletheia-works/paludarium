@@ -863,7 +863,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MADV_PAGEOUT`、`MADV_REMOVE`、`MADV_GUARD_INSTALL` を断り（`EINVAL`。前の VMA は
   指定を受けたあとです）、`MS_INVALIDATE` の `msync` も断ります（`EBUSY`）。
   `MADV_DONTNEED_LOCKED` は受け付けます。`fork` の子と、`MREMAP_DONTUNMAP` が残す元の
-  範囲はロックされず、AIO と `io_uring` のリングもロックされません。`mlock2` と
+  範囲はロックされず、AIO、`io_uring`、perf イベントのリングもロックされません。`mlock2` と
   `mlockall` の未知のフラグは `EINVAL` です。スワップアウトは起きないので、ほかに
   何もしなくてもメモリはそのまま残ります。
 
@@ -978,7 +978,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   続きの上へ広げられ、そのページは初めて触れたときに読み込みます。また、複数の
   マッピングにまたがる範囲を
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
-  AIO と `io_uring` のリングは固定のマッピング（`VM_DONTEXPAND`）で、広げられず
+  AIO、`io_uring`、perf イベントのリングは固定のマッピング（`VM_DONTEXPAND`）で、広げられず
   （`EFAULT`）、動かして元を残すこともできません（`MREMAP_DONTUNMAP`、`EINVAL`）。
   AIO のリングは、Linux master の `aio_ring_mremap` と同じく丸ごとでなければ動かせず
   （行き先を空け、縮めて落とす分を外したあとで `EINVAL`）、コンテキストも一緒に移ります。

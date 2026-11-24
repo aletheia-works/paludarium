@@ -1048,6 +1048,7 @@ mod linux {
         processes_leader_zombie_task => ("leader-zombie-task","process"),
         processes_ptrace_stop_exit_code => ("ptrace-stop-exit-code","process"),
         processes_gone_leader_files => ("gone-leader-files","process"),
+        processes_smaps_rollup => ("smaps-rollup","process"),
         processes_thread_caps_status => ("thread-caps-status","process"),
         processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),

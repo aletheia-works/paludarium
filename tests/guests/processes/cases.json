@@ -466,6 +466,7 @@
     {"name":"leader-zombie-task","binary":"process"},
     {"name":"ptrace-stop-exit-code","binary":"process"},
     {"name":"gone-leader-files","binary":"process"},
+    {"name":"smaps-rollup","binary":"process"},
     {"name":"thread-caps-status","binary":"process"},
     {"name":"proc-stat-exit-code","binary":"process"},
     {"name":"proc-fd-links","binary":"process"},

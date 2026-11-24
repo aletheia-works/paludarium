@@ -3615,7 +3615,7 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
-  `clear_refs`, `smaps`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them; the directory, `task` and `fdinfo` (0555) are the process's
@@ -3639,7 +3639,14 @@ kernel.
   `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
-  unmarked; `maps` and `smaps` name a mapped file the same way. `status`
+  unmarked; `maps` and `smaps` name a mapped file the same way.
+  `smaps_rollup` is what `smaps` counts of every VMA summed under one line,
+  from the first VMA's start to the last one's end with no flags, file or
+  name but `[rollup]`, as Linux's `show_smaps_rollup` makes it: `Pss` is
+  summed before it is rounded to kB and split by what each page is
+  (`Pss_Anon`, `Pss_File`, and `Pss_Shmem` for shared memory of no file, a
+  tmpfs file, a memfd or System V shared memory), and its open is `ESRCH`
+  for a task with no memory left. `status`
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
   capabilities and so on) and, of the memory ones, the locked memory
   (`VmLck`), the peak of the resident memory (`VmHWM`) and the resident
@@ -3669,7 +3676,7 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
-  `comm`, `syscall` (0400), `maps`, `clear_refs` (0200), `smaps`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
+  `comm`, `syscall` (0400), `maps`, `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
   `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was

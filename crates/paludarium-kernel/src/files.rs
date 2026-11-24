@@ -7487,9 +7487,9 @@ fn open_path(
             let file = crate::proc::mounts_file(view, mountinfo, at_read);
             return Ok((Arc::new(file), p.to_vec()));
         }
-        if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
+        if let crate::proc::TaskEntry::Maps(kind) = path.entry {
             return Ok((
-                tasks::maps(&task, smaps, flags, c.files.root(), owner),
+                tasks::maps(&task, kind, flags, c.files.root(), owner),
                 p.to_vec(),
             ));
         }
@@ -7682,16 +7682,20 @@ fn open_path(
             | crate::proc::OwnEntry::Exe
             | crate::proc::OwnEntry::Cwd
             | crate::proc::OwnEntry::Root => return Err(Errno::ENOENT),
-            crate::proc::OwnEntry::Maps | crate::proc::OwnEntry::Smaps => {
-                Arc::new(crate::proc::maps_file(
-                    c.mem.view(),
-                    c.group.start_stack(),
-                    flags,
-                    c.files.root(),
-                    entry == crate::proc::OwnEntry::Smaps,
-                    owner,
-                ))
-            }
+            crate::proc::OwnEntry::Maps
+            | crate::proc::OwnEntry::Smaps
+            | crate::proc::OwnEntry::SmapsRollup => Arc::new(crate::proc::maps_file(
+                c.mem.view(),
+                c.group.start_stack(),
+                flags,
+                c.files.root(),
+                match entry {
+                    crate::proc::OwnEntry::Smaps => crate::proc::MapsKind::Smaps,
+                    crate::proc::OwnEntry::SmapsRollup => crate::proc::MapsKind::Rollup,
+                    _ => crate::proc::MapsKind::Maps,
+                },
+                owner,
+            )),
             crate::proc::OwnEntry::Pagemap => {
                 Arc::new(crate::proc::PagemapFile::open(c.mem.view(), flags, owner))
             }
@@ -8862,7 +8866,9 @@ fn other_generated_stat(
         crate::proc::OwnEntry::Exe | crate::proc::OwnEntry::Cwd | crate::proc::OwnEntry::Root => {
             return None;
         }
-        crate::proc::OwnEntry::Maps | crate::proc::OwnEntry::Smaps => crate::proc::stat(0),
+        crate::proc::OwnEntry::Maps
+        | crate::proc::OwnEntry::Smaps
+        | crate::proc::OwnEntry::SmapsRollup => crate::proc::stat(0),
         crate::proc::OwnEntry::Pagemap => crate::proc::private_stat(0),
         crate::proc::OwnEntry::Descriptor(n) => {
             let d = c.files.descriptor(u64::from(n)).ok()?;

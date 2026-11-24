@@ -47,9 +47,8 @@ verified.
   VMA has its full size from the start, where Linux's grows as it is used. A
   program's own segments and its interpreter's are named by the path it was
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
-  do not exist.
-- **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
+  symbolic links. `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+- **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. The
   pages that `MAP_POPULATE`, `MAP_LOCKED` or a lock would read in of a

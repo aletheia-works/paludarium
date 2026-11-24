@@ -39,6 +39,11 @@ pub(crate) struct PageCaches {
     /// many descriptions have it open for writing; below, how many programs
     /// run from it (or are being loaded from it).
     writes: Mutex<HashMap<Key, i64>>,
+    /// Linux's `i_readcount` of each file that has one: how many
+    /// descriptions have it open for reading only.
+    reads: Mutex<HashMap<Key, u64>>,
+    /// The leases on the machine's files (`F_SETLEASE`).
+    pub(crate) leases: Mutex<Vec<crate::leases::Lease>>,
     /// The machine's inotify watches, which its files' changes are told to.
     pub(crate) notify: Arc<crate::inotify::Notifier>,
     /// Whether any of the machine's files was ever made immutable or
@@ -204,6 +209,29 @@ impl Drop for WriteAccess {
         // removed one ends once no process runs it, as with a last close.
         if self.change < 0 && self.caches.notify.waiting() && !self.caches.held(self.key) {
             self.caches.notify.last_closed(self.key);
+        }
+    }
+}
+
+/// One count of [`PageCaches`]' `reads`, given back when dropped: a
+/// description open for reading only (Linux's `i_readcount_inc`).
+pub(crate) struct ReadAccess {
+    caches: Arc<PageCaches>,
+    key: Key,
+}
+
+impl Drop for ReadAccess {
+    fn drop(&mut self) {
+        let mut reads = self
+            .caches
+            .reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = reads.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                reads.remove(&self.key);
+            }
         }
     }
 }
@@ -423,6 +451,40 @@ impl PageCaches {
     }
     pub(crate) fn write_access(self: &Arc<Self>, key: Key) -> Result<WriteAccess, Errno> {
         self.count(key, 1)
+    }
+    /// Linux's `i_writecount` of `key`: above zero, the descriptions open
+    /// for writing; below, the programs running from it.
+    pub(crate) fn write_count(&self, key: Key) -> i64 {
+        self.writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+    /// Linux's `i_readcount` of `key`: the descriptions open for reading
+    /// only.
+    pub(crate) fn read_count(&self, key: Key) -> u64 {
+        self.reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+    /// A description of `key` open for reading only, counted while the
+    /// guard lives.
+    fn read_access(self: &Arc<Self>, key: Key) -> ReadAccess {
+        *self
+            .reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key)
+            .or_insert(0) += 1;
+        ReadAccess {
+            caches: Arc::clone(self),
+            key,
+        }
     }
     /// Write access to `key` denied while the guard lives, which a
     /// description open for writing refuses (ETXTBSY), as Linux's
@@ -825,6 +887,9 @@ pub(crate) struct CoherentFile {
     /// The write access a description open for writing holds, which a
     /// program run from the file refuses while it lasts.
     write: Option<WriteAccess>,
+    /// The count a description open for reading only holds of its file's
+    /// readers (`i_readcount`), which a write lease looks at.
+    read: Option<ReadAccess>,
     /// What its mount's count of writers holds for it while it lasts
     /// (`mnt_get_write_access`).
     writer: Option<paludarium_vfs::MountPin>,
@@ -884,6 +949,8 @@ impl Drop for CoherentFile {
                 crate::inotify::CLOSE_NOWRITE
             });
         }
+        // `locks_remove_file`: its leases go with it.
+        crate::leases::closed(&self.caches, std::ptr::from_ref(self).cast::<()>().addr());
         // `__fput` lets go of the dentry after `fsnotify_close`: a file
         // removed meanwhile ends with its last description.
         let caches = &self.caches;
@@ -924,6 +991,7 @@ impl CoherentFile {
             key: OnceLock::new(),
             write: None,
             writer: None,
+            read: None,
             opened: None,
             held: AtomicBool::new(false),
             access_perm: false,
@@ -963,6 +1031,13 @@ impl CoherentFile {
     /// while a program runs from the file. A memfd's own descriptor has none,
     /// as `memfd_create` makes its file without `do_dentry_open`.
     pub(crate) fn writing(mut self, flags: u32) -> Result<Self, Errno> {
+        // `i_readcount_inc`: a description open for reading only.
+        if flags & O_PATH == 0
+            && flags & 3 == 0
+            && let Some(key) = self.key()
+        {
+            self.read = Some(self.caches.read_access(key));
+        }
         if flags & O_PATH == 0
             && flags & 3 != 0
             && let Some(key) = self.key()
@@ -1060,6 +1135,7 @@ impl CoherentFile {
                 key: key.map_or_else(OnceLock::new, OnceLock::from),
                 write: None,
                 writer: None,
+                read: None,
                 opened: None,
                 held: AtomicBool::new(false),
                 access_perm: false,
@@ -1098,6 +1174,7 @@ impl FileHandle for CoherentFile {
                 .map_or_else(OnceLock::new, OnceLock::from),
             write: None,
             writer: None,
+            read: None,
             opened: None,
             held: AtomicBool::new(false),
             access_perm: false,
@@ -1114,6 +1191,9 @@ impl FileHandle for CoherentFile {
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         self.inner.as_any()
+    }
+    fn leasable(&self) -> bool {
+        true
     }
     fn notify_event(&self, mask: u32) -> bool {
         // The open its permission events let through has its `IN_OPEN`
@@ -1432,6 +1512,7 @@ impl HostFs for CoherentFs {
             key: OnceLock::new(),
             write: None,
             writer: None,
+            read: None,
             opened: None,
             held: AtomicBool::new(false),
             access_perm: false,

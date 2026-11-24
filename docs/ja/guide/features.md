@@ -517,6 +517,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、待つ側がまだ動き出す前でもその待ちはすぐ数えられなくなります。ロックはゲストだけのもので、ホストの
   プログラムからは見えず、ゲストからもホストのロックは見えません。
 
+- ファイルのリース（`fcntl` の `F_SETLEASE` と `F_GETLEASE`）を、Linux の `fs/locks.c` と
+  同じく取り、返します。通常のファイル（マウントしたファイルシステムのファイルか memfd）の
+  開いた記述に、読み込みか書き込みのリースを、`F_UNLCK` かその記述の最後のクローズ
+  （`locks_remove_file`）まで掛けます。リースは `fcntl_setlease` の順に断ります。
+  ディレクトリか知らない種類（`EINVAL`）、持ち主が呼んだ側のファイルシステムのユーザー ID で
+  なく `CAP_LEASE` もないファイル（`EACCES`）、パイプや `/proc` のファイルのようにリースを
+  取れないファイル（`EINVAL`）、ぶつかる open（`lease_open_conflict`、`EAGAIN`。読み込みの
+  リースには書くために開いたどの記述も、書き込みのリースにはほかの読み書きのために開いた
+  記述か、そのファイルから動くプログラムがぶつかります）、書き込みのリースのときのほかの
+  記述のリース（`EAGAIN`）、`/proc/sys/fs/leases-enable` が 0 の間の新しいリース（`EINVAL`）
+  です。同じ記述からもう一度頼むと、リースの種類が変わります。リースを取ると、持ち主の
+  ない記述は呼んだプロセスを持ち主にし、`F_UNLCK` は持ち主と `F_SETSIG` のシグナルを
+  外します（`f_delown`）。リースがないときの `F_UNLCK` は `EAGAIN` です。`F_GETLEASE` は
+  その記述のリースの種類か `F_UNLCK` を返します。`/proc/sys/fs/leases-enable`（最初は 1）と
+  `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
+  も受け取ります（`proc_dointvec`）。
+
 - パイプは Linux と同じく 64 KiB を持ちます。`fcntl` の `F_SETPIPE_SZ` と
   `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。大きさは
   1 ページ以上の 2 のべき乗で、読まれていないデータより小さくすると `EBUSY`、

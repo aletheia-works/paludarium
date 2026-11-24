@@ -87,6 +87,7 @@
     {"name":"madvise-fork","binary":"process"},
     {"name":"madvise-remove","binary":"process"},
     {"name":"lock-state","binary":"process"},
+    {"name":"file-leases","binary":"process"},
     {"name":"smaps-flags","binary":"process"},
     {"name":"madvise-guard","binary":"process"},
     {"name":"grows-down","binary":"process"},

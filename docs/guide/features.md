@@ -590,6 +590,27 @@ kernel.
   locks are the guest's own: a program on the host does not see them, nor
   they its.
 
+- File leases (`fcntl`'s `F_SETLEASE` and `F_GETLEASE`), as Linux's
+  `fs/locks.c` takes and gives them back: a read or write lease on an open
+  description of a regular file (a file of a mounted file system or a
+  memfd), until `F_UNLCK` or the description's last close
+  (`locks_remove_file`). A lease is refused in `fcntl_setlease`'s order: a
+  directory or an unknown type (`EINVAL`), a file whose owner is not the
+  caller's file system user ID without `CAP_LEASE` (`EACCES`), a file that
+  takes none, as a pipe or a `/proc` file (`EINVAL`), a conflicting open
+  (`lease_open_conflict`, `EAGAIN`: for a read lease, any description open
+  for writing; for a write lease, any other description open for reading or
+  writing, or a program running from the file), another description's lease
+  beside a write lease (`EAGAIN`), and a new lease while
+  `/proc/sys/fs/leases-enable` is 0 (`EINVAL`). Asking again through the
+  same description changes the lease's type. A lease taken gives the
+  description an owner if it has none, and `F_UNLCK` takes the owner and
+  the `F_SETSIG` signal away (`f_delown`); `F_UNLCK` with no lease is
+  `EAGAIN`. `F_GETLEASE` gives the description's lease type, or `F_UNLCK`.
+  `/proc/sys/fs/leases-enable` (1 at first) and `/proc/sys/fs/lease-break-time`
+  (45 at first) are root's files of mode 0644, which take any `int`
+  (`proc_dointvec`).
+
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
   `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.

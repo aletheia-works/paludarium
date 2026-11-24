@@ -4641,19 +4641,19 @@ fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let release: &[u8] = if personality & UNAME26 != 0 {
         b"2.6.72-paludarium"
     } else {
-        b"6.12.0-paludarium"
+        crate::namespaces::RELEASE
     };
     let machine: &[u8] = if personality & 0xff == PER_LINUX32 {
         b"i686"
     } else {
-        b"x86_64"
+        crate::namespaces::MACHINE
     };
     let names = c.group.namespaces(c.tid).uts.names();
     let fields: [&[u8]; 6] = [
-        b"Linux",
+        crate::namespaces::SYSNAME,
         &names.host,
         release,
-        b"#1 SMP PREEMPT_DYNAMIC",
+        crate::namespaces::VERSION,
         machine,
         &names.domain,
     ];

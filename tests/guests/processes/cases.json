@@ -409,6 +409,7 @@
     {"name":"ipc-sysctl","binary":"process"},
     {"name":"sysvipc-proc","binary":"process"},
     {"name":"kernel-sysctl","binary":"process"},
+    {"name":"uts-sysctl","binary":"process"},
     {"name":"net-sysctl","binary":"process"},
     {"name":"rseq","binary":"process"},
     {"name":"pkey","binary":"process"},

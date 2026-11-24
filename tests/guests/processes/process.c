@@ -24757,6 +24757,237 @@ static int kernel_sysctl_case(void) {
     if (held >= 0) close(held);
     return 0;
 }
+/* The uts-sysctl case's files, under /proc/sys/kernel. */
+static int us_open(const char *name, int flags) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/sys/kernel/%s", name);
+    return open(path, flags | O_CLOEXEC);
+}
+/* Prints what a read of `want` at `at` gives, newlines as "\n". */
+static void us_read_at(const char *label, int fd, size_t want, off_t at) {
+    char text[128] = {0};
+    long n = pread(fd, text, want, at);
+    printf(" %s=%ld:", label, n < 0 ? -errno : n);
+    for (long i = 0; i < n; i++) {
+        if (text[i] == '\n') printf("\\n");
+        else putchar(text[i]);
+    }
+}
+static void us_show(const char *label) {
+    printf("%s:", label);
+    const char *names[] = {"hostname", "domainname"};
+    for (int i = 0; i < 2; i++) {
+        int fd = us_open(names[i], O_RDONLY);
+        us_read_at(names[i], fd, 100, 0);
+        close(fd);
+    }
+    struct utsname u;
+    uname(&u);
+    printf(" uname=%s,%s\n", u.nodename, u.domainname);
+}
+static long us_write(int fd, const char *text, size_t n) {
+    long r = write(fd, text, n);
+    return r < 0 ? -errno : r;
+}
+static long us_pwrite(int fd, const char *text, size_t n, off_t at) {
+    long r = pwrite(fd, text, n, at);
+    return r < 0 ? -errno : r;
+}
+/* The uts-sysctl case: the six files of /proc/sys/kernel that show the
+   reader's UTS namespace (kernel/utsname_sysctl.c), as root, in a UTS
+   namespace of its own so that the machine's names stay. What they show of
+   the kernel is compared with uname only. */
+static int uts_sysctl_case(void) {
+    if (unshare(CLONE_NEWUTS)) {
+        printf("unshare: %d\n", errno);
+        return 1;
+    }
+    sethostname("outer", 5);
+    setdomainname("outer.domain", 12);
+    static const char *names[] = {"arch", "domainname", "hostname", "osrelease", "ostype", "version"};
+    struct utsname u;
+    uname(&u);
+    const char *fields[] = {u.machine, u.domainname, u.nodename, u.release, u.sysname, u.version};
+    for (int i = 0; i < 6; i++) {
+        char path[96], text[128] = {0};
+        snprintf(path, sizeof path, "/proc/sys/kernel/%s", names[i]);
+        struct stat st = {0};
+        long stated = stat(path, &st) ? -errno : 0;
+        int fd = us_open(names[i], O_RDONLY);
+        long n = fd < 0 ? -errno : read(fd, text, sizeof text - 1);
+        long again = fd < 0 ? -errno : read(fd, text + (n > 0 ? n : 0), sizeof text - 1 - (n > 0 ? n : 0));
+        size_t length = strlen(fields[i]);
+        int same = n == (long)length + 1 && !memcmp(text, fields[i], length) && text[length] == '\n';
+        if (fd >= 0) close(fd);
+        int w = us_open(names[i], O_WRONLY);
+        int written = w < 0 ? -errno : 0;
+        if (w >= 0) close(w);
+        int rw = us_open(names[i], O_RDWR);
+        int both = rw < 0 ? -errno : 0;
+        if (rw >= 0) close(rw);
+        printf("%s: stat=%ld mode=%o uid=%d gid=%d size=%ld uname=%d again=%ld write=%d both=%d\n", names[i], stated,
+               st.st_mode, st.st_uid, st.st_gid, (long)st.st_size, same, again, written, both);
+    }
+    DIR *d = opendir("/proc/sys/kernel");
+    printf("listed:");
+    for (struct dirent *e; d && (e = readdir(d));) {
+        for (int i = 0; i < 6; i++) {
+            if (!strcmp(e->d_name, names[i])) printf(" %s", e->d_name);
+        }
+    }
+    printf("\n");
+    if (d) closedir(d);
+
+    int fd = us_open("hostname", O_RDWR);
+    printf("reads:");
+    us_read_at("3", fd, 3, 0);
+    us_read_at("5", fd, 5, 0);
+    us_read_at("6", fd, 6, 0);
+    us_read_at("from2", fd, 100, 2);
+    us_read_at("from5", fd, 100, 5);
+    us_read_at("from6", fd, 100, 6);
+    printf("\n");
+    long first = us_write(fd, "ab", 2);
+    long second = us_write(fd, "cd\nxyz", 6);
+    printf("writes %ld %ld at=%ld\n", first, second, (long)lseek(fd, 0, SEEK_CUR));
+    us_show("continued");
+    /* What a name leaves of the one before it. */
+    sethostname("0123456789", 10);
+    long over = us_pwrite(fd, "xy", 2, 0);
+    uname(&u);
+    printf("residue %ld:", over);
+    for (int i = 0; i < 12; i++) printf(" %02x", (unsigned char)u.nodename[i]);
+    printf("\n");
+    sethostname("q", 1);
+    uname(&u);
+    printf("sethostname:");
+    for (int i = 0; i < 12; i++) printf(" %02x", (unsigned char)u.nodename[i]);
+    printf("\n");
+    sethostname("ab\0cd", 5);
+    us_show("with-nul");
+    sethostname("host", 4);
+    long end = us_pwrite(fd, "s", 1, 4);
+    long past = us_pwrite(fd, "no", 2, 9);
+    long middle = us_pwrite(fd, "OU\0x", 4, 1);
+    printf("pwrites end=%ld past=%ld middle=%ld\n", end, past, middle);
+    us_show("after-pwrites");
+    lseek(fd, 50, SEEK_SET);
+    long unread = us_write(fd, "zz", 2);
+    printf("past-position %ld at=%ld\n", unread, (long)lseek(fd, 0, SEEK_CUR));
+    lseek(fd, 0, SEEK_SET);
+    char longer[100];
+    memset(longer, 'n', sizeof longer);
+    long all = us_write(fd, longer, sizeof longer);
+    uname(&u);
+    long length = strlen(u.nodename);
+    long full = us_pwrite(fd, "m", 1, 64);
+    printf("long %ld at=%ld length=%ld at-end=%ld\n", all, (long)lseek(fd, 0, SEEK_CUR), length, full);
+    char back[80];
+    long n = pread(fd, back, sizeof back, 0);
+    long blank = us_pwrite(fd, "\n", 1, 0);
+    long nothing = us_pwrite(fd, "", 0, 0);
+    printf("read-long %ld blank=%ld nothing=%ld\n", n, blank, nothing);
+    us_show("blank");
+    struct iovec parts[2] = {{"io", 2}, {"vec\n", 4}};
+    lseek(fd, 0, SEEK_SET);
+    long vec = writev(fd, parts, 2);
+    printf("writev %ld at=%ld\n", vec < 0 ? -errno : vec, (long)lseek(fd, 0, SEEK_CUR));
+    int dom = us_open("domainname", O_WRONLY);
+    long domain = us_write(dom, "new.domain\n", 11);
+    close(dom);
+    printf("domain %ld\n", domain);
+    us_show("after-writev");
+    long refused = us_open("arch", O_WRONLY);
+    printf("arch-write %ld\n", refused < 0 ? -errno : 0L);
+
+    /* A personality changes uname's machine and release, not the files. */
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        char before[2][128] = {{0}}, after[2][128] = {{0}};
+        for (int turn = 0; turn < 2; turn++) {
+            for (int i = 0; i < 2; i++) {
+                int f = us_open(i ? "osrelease" : "arch", O_RDONLY);
+                long r = read(f, turn ? after[i] : before[i], 127);
+                if (r < 0) printf("read: %d\n", errno);
+                close(f);
+            }
+            /* UNAME26 and PER_LINUX32. */
+            syscall(SYS_personality, 0x20008UL);
+        }
+        uname(&u);
+        printf("personality machine=%s arch-same=%d release-same=%d\n", u.machine, !strcmp(before[0], after[0]),
+               !strcmp(before[1], after[1]));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("personality", reaped(other));
+
+    /* The namespace is the reader's and the writer's, not the opener's, and
+       root writes its own without CAP_SYS_ADMIN. */
+    sethostname("outer", 5);
+    fflush(stdout);
+    other = child();
+    if (other == 0) {
+        if (unshare(CLONE_NEWUTS)) _exit(90);
+        sethostname("inner", 5);
+        printf("inherited:");
+        us_read_at("inner", fd, 100, 0);
+        printf(" write=%ld", us_pwrite(fd, "child\n", 6, 0));
+        us_read_at("inner", fd, 100, 0);
+        printf("\n");
+        us_show("child");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("inherited", reaped(other));
+    us_show("parent");
+    fflush(stdout);
+    other = child();
+    if (other == 0) {
+        long dropped = caps_set(0, 0, 0) ? -errno : 0;
+        long name = sethostname("no", 2) ? -errno : 0;
+        long w = us_pwrite(fd, "capless\n", 8, 0);
+        int again = us_open("hostname", O_WRONLY);
+        printf("no-capabilities capset=%ld sethostname=%ld write=%ld open=%d\n", dropped, name, w,
+               again < 0 ? -errno : 0);
+        fflush(stdout);
+        _exit(0);
+    }
+    result("no-capabilities", reaped(other));
+    us_show("after-capless");
+
+    /* Another user may read them and write none, nor through root's
+       descriptor, nor with CAP_SYS_ADMIN over the namespace as the root of
+       the user namespace that owns it. */
+    fflush(stdout);
+    other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        long through = us_pwrite(fd, "other", 5, 0);
+        int r = us_open("hostname", O_RDONLY), w = us_open("hostname", O_WRONLY);
+        printf("other read=%d write=%d through=%ld\n", r < 0 ? -errno : 0, w < 0 ? -errno : 0, through);
+        prctl(PR_SET_DUMPABLE, 1);
+        long made = unshare(CLONE_NEWUSER | CLONE_NEWUTS) ? -errno : 0;
+        int group = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", "0 65534 1");
+        long name = sethostname("namespaced", 10) ? -errno : 0;
+        r = us_open("hostname", O_RDONLY);
+        w = us_open("hostname", O_WRONLY);
+        printf("user-namespace unshare=%ld setgroups=%d uids=%d uid=%d sethostname=%ld read=%d write=%d", made, group,
+               uids, (int)getuid(), name, r < 0 ? -errno : 0, w < 0 ? -errno : 0);
+        us_read_at("hostname", r, 100, 0);
+        struct stat st = {0};
+        fstat(r, &st);
+        printf(" owner=%d:%d through=%ld\n", (int)st.st_uid, (int)st.st_gid, us_pwrite(fd, "other", 5, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("other", reaped(other));
+    us_show("last");
+    close(fd);
+    return 0;
+}
 /* The net-sysctl case's files, under /proc/sys/net. */
 static long ns_read(const char *name) {
     char path[128], text[32] = {0};
@@ -38081,6 +38312,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
+    if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "net-sysctl")) return net_sysctl_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();

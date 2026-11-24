@@ -3592,8 +3592,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `unprivileged_bpf_disabled` は開いた者ではなく書き手に `CAP_SYS_ADMIN` を求めます。
   孤児を消すのは `shm_rmid_forced` を設定する書き込みだけで、Linux master の
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
-  `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
+  `/proc/sys/kernel` にあるのはこれらと次の 6 つだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+
+- `/proc/sys/kernel` には、Linux の `kernel/utsname_sysctl.c` と同じく、UTS 名前空間の名前も
+  あります。`arch`、`ostype`、`osrelease`、`version`（root のモード 0444）と、`hostname`、
+  `domainname`（0644）で、それぞれ `uname` が答えるものと改行です。`uname` の答えを変える
+  personality は、これらを変えません。名前空間は、ファイルを開いた者ではなく、読み書きする
+  スレッドのもので、`--mount` が与える同じ名前のファイルは見えません。`hostname` と
+  `domainname` を書くために開けるのは root（どのユーザー名前空間の外でもユーザー ID が 0）
+  だけで（`EACCES`）、`CAP_SYS_ADMIN` の有無は問わず、書き込みのときにもう一度確かめます
+  （`EPERM`）。ユーザー名前空間の root にできるのは `sethostname` だけです。これらは文字列です
+  （`proc_dostring`）。読み込みはファイルの位置から続きます。書き込みは全体を受け取り、NUL か
+  改行までのバイトをそのオフセットに、全部で 64 バイトまで置き、その後ろに NUL を置きます。
+  その NUL より後ろには前の名前のバイトが残り、`uname` もそれを答えます。`sethostname` は
+  それを消します。名前の終わりより後ろへの書き込みは何も変えません。
 
 - `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
   ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は

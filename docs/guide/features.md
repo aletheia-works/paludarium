@@ -4159,9 +4159,25 @@ kernel.
   now is `EPERM`, though the open let it, and `unprivileged_bpf_disabled`
   asks the writer, not the opener, for `CAP_SYS_ADMIN`. Only a write that
   sets `shm_rmid_forced` removes orphans, as Linux master's handler; 7.0's
-  did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
-  `/proc/sys` lists its entries by name, as Linux's tree of them keeps
-  them.
+  did so at a read of it set too. `/proc/sys/kernel` lists only these and the
+  six below, and each directory of `/proc/sys` lists its entries by name, as
+  Linux's tree of them keeps them.
+
+- `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
+  `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`
+  (root's, mode 0444) and `hostname` and `domainname` (0644), each what
+  `uname` gives and a newline; a personality, which changes what `uname`
+  gives, does not change them. The namespace is that of the thread that
+  reads or writes, not of the one that opened the file, and a file of that
+  name that `--mount` gives does not show. Only root (user ID 0 outside any
+  user namespace) may open `hostname` and `domainname` to write (`EACCES`),
+  with or without `CAP_SYS_ADMIN`, and a write is checked again (`EPERM`);
+  the root of a user namespace has `sethostname` alone. They are strings
+  (`proc_dostring`): a read goes on from where the file is, and a write is
+  taken whole, its bytes up to a NUL or newline put at its offset, 64 in all
+  at most, with a NUL after them. The bytes of the old name past that NUL
+  stay, and `uname` gives them too, where `sethostname` clears them. A write
+  past the end of the name changes nothing.
 
 - `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
   its listing differs from Linux's, which has the rest of the `vm` sysctls

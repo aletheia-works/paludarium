@@ -116,7 +116,10 @@ verified.
   process's directory they are `ENOENT`, where Linux shows root `stack`
   and the rest. `wchan` is `0` for a waiting task too, where Linux names the
   kernel function it waits in for a reader that may read the task: there are
-  no kernel functions here to name. `io` does not count what Linux's
+  no kernel functions here to name. `poll` finds the files of `/proc/sys`
+  always ready and `epoll_ctl` refuses them (`EPERM`), where Linux takes them
+  and gives `POLLERR` and `POLLPRI` once `hostname` or `domainname` changed.
+  `io` does not count what Linux's
   `kernel_read` and `kernel_write` count for the process (`execve` reading its
   program and interpreter, a core dump's writes), and a read or write that
   fails with an errno Linux gives both before and in the file's operation

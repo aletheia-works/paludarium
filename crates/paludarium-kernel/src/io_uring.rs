@@ -358,7 +358,10 @@ pub(crate) struct Polls {
     armed: Mutex<Vec<Armed>>,
     count: std::sync::atomic::AtomicUsize,
     /// Task work that came for a thread that exited, which runs once no
-    /// ring's lock is held (`io_fallback_tw` queuing it for a worker).
+    /// ring's lock is held (`io_fallback_tw` queuing it for a worker): at
+    /// the next [`complete_ready`], which every call's checkpoint, every
+    /// wait and every thread's exit runs, so before the call that queued it
+    /// returns.
     fallback: Mutex<Vec<(std::sync::Weak<dyn FileHandle>, Deferred)>>,
     /// Every ring, which a thread's `execve` or exit looks through for its
     /// requests (`tctx->xa`).
@@ -1082,15 +1085,17 @@ impl Ring {
                 }
             }
             OP_ASYNC_CANCEL => {
-                // `io_async_cancel_prep`: `IORING_ASYNC_CANCEL_ANY` matches
-                // any file and operation.
+                // `io_async_cancel_prep`, as Linux 7.0 (the CI kernel) has it:
+                // `IORING_ASYNC_CANCEL_ANY` matches any file and operation,
+                // and the operation is the low byte of `len`. Linux master
+                // also refuses one past `IORING_OP_LAST` (`EINVAL`), which
+                // matches nothing here.
                 let cancel_flags = u32_at(sqe, 28);
                 let op = u32_at(sqe, 24);
                 if u64_at(sqe, 8) != 0
                     || int_at(44) != 0
                     || cancel_flags & !CANCEL_FLAGS != 0
                     || cancel_flags & CANCEL_ANY != 0 && cancel_flags & (CANCEL_FD | CANCEL_OP) != 0
-                    || cancel_flags & CANCEL_OP != 0 && op >= u32::from(OP_LAST)
                 {
                     return fail(request, Errno::EINVAL);
                 }
@@ -1805,8 +1810,11 @@ pub(crate) fn complete_ready(polls: &Polls) {
     }
 }
 
-/// [`complete_ready`] but for the work of threads that exited, as a
-/// submission holding its ring's lock arms a request.
+/// Moves the requests whose files are ready to task work, as
+/// [`complete_ready`] does, without running [`Polls::fallback`]: [`arm`]
+/// calls it holding its ring's lock, which that work may need. What it
+/// leaves there runs at the next [`complete_ready`], which the checkpoint
+/// after the call that armed the request runs before the call returns.
 fn wake(polls: &Polls) {
     if polls.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return;
@@ -1815,6 +1823,9 @@ fn wake(polls: &Polls) {
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
         let (woken, waiting): (Vec<Armed>, Vec<Armed>) = std::mem::take(&mut *armed)
             .into_iter()
+            // A ring that closed lets go of its requests and the files they
+            // hold here, at the checkpoint of the `close` (or `munmap`) that
+            // let go of it last, before that call returns.
             .filter(|a| a.ring.strong_count() != 0)
             .partition(|a| ready(&a.polled, a.mask));
         *armed = waiting;

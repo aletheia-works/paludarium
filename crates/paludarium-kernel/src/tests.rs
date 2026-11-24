@@ -5721,14 +5721,16 @@ mod io_uring {
             batch(&mut f, &r, &[cancel(9, 0, 2, read as i32)]),
             [(9, 0), (1, -125)]
         );
-        // An operation past `IORING_OP_LAST`, as Linux master refuses it.
+        // An operation past `IORING_OP_LAST` matches no request, as on
+        // Linux 7.0; Linux master's `io_async_cancel_prep` refuses it
+        // (`EINVAL`).
         let mut past_last = cancel(9, 0, 32, 0);
         past_last[24..28].copy_from_slice(&255u32.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &past_last), -2);
         for refused in [
             cancel(9, 0, 1 << 6, 0),
             cancel(9, 0, 4 | 2, 0),
             cancel(9, 0, 4 | 32, 0),
-            past_last,
         ] {
             assert_eq!(one(&mut f, &r, &refused), -22);
         }

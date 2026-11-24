@@ -1738,8 +1738,8 @@ kernel.
     is cancelled too: it stays findable until the work runs. The bytes stay
     in the file.
   - `IORING_OP_ASYNC_CANCEL` refuses unknown flags, `_ANY` with `_FD` or
-    `_OP`, an operation past `IORING_OP_LAST`, and an `off` or
-    `splice_fd_in` (`EINVAL`). A descriptor that is not open is `EBADF`.
+    `_OP`, and an `off` or `splice_fd_in` (`EINVAL`), as Linux 7.0's
+    `io_async_cancel_prep` does. A descriptor that is not open is `EBADF`.
   - `IORING_REGISTER_SYNC_CANCEL` takes one `struct
     io_uring_sync_cancel_reg`. Its padding must be zero, and it gives the
     count, 0 or `ENOENT` itself. It never waits, as nothing it finds is

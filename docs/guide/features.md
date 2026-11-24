@@ -1780,6 +1780,11 @@ kernel.
     request whose file became ready there goes on. Then the requests are
     cancelled, and its task work and theirs run, so each completes with
     `ECANCELED` before the new program runs.
+  - A whole process's exit (`exit_group` or a fatal signal) cancels the
+    requests its threads submitted in the same way, after the exit event
+    of ptrace and before the thread is exiting, as Linux master's
+    `io_task_group_exiting` asks: a link's next request still waiting to
+    run then runs as usual.
   - A ring whose last descriptor and mapping close lets go of its waiting
     requests and the files they hold, as Linux master does before `close`
     returns, so a pipe whose only reader was such a request takes no more

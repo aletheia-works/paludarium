@@ -1695,7 +1695,7 @@ impl Kernel {
     /// (`PTRACE_O_EXITKILL`); as a traced thread other than its process's
     /// leader, its tracer learns of the exit and waits for it, as for a
     /// child. A leader's exit is its process's ([`crate::Processes::finish`]).
-    pub(crate) fn ptrace_exit(&mut self, thread: &Thread, status: ExitStatus) {
+    pub(crate) fn ptrace_exit_event(&mut self, thread: &Thread, status: ExitStatus) {
         if !self.processes.traces.any() {
             return;
         }
@@ -1712,6 +1712,15 @@ impl Kernel {
             };
             let mut exiting = thread.clone();
             self.ptrace_event(&mut exiting, PTRACE_EVENT_EXIT, code);
+        }
+    }
+
+    /// The rest of an exiting thread's ptrace: its tracees are let go of
+    /// (killed with `PTRACE_O_EXITKILL`), and its tracer told of a traced
+    /// thread's exit.
+    pub(crate) fn ptrace_exit(&mut self, thread: &Thread, status: ExitStatus) {
+        if !self.processes.traces.any() {
+            return;
         }
         let tracees: Vec<(u32, u32, bool)> = self
             .processes

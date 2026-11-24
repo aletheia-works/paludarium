@@ -4365,8 +4365,9 @@ kernel.
   `memfd_secret` file's, which `get_user_pages` refuses) is `EIO`, and one
   that stops later gives what it moved. `lseek` takes `SEEK_SET` and
   `SEEK_CUR` only (`EINVAL`), and its positions are unsigned
-  (`FOP_UNSIGNED_OFFSET`): `pread64` and `pwrite64` take one past
-  `i64::MAX`, `EOVERFLOW` for a count that would wrap past the end. An open
+  (`FOP_UNSIGNED_OFFSET`): `lseek` goes past `i64::MAX`, and a read or
+  write there moves bytes at that address; `pread64` and `pwrite64` refuse
+  such an offset (`EINVAL`), as Linux v7.0 does (see limitations). An open
   takes the memory the task has then, which the file keeps: after an
   `execve` or the end of the task, that memory is gone and nothing moves.
   It is the reader's own

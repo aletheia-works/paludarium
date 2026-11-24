@@ -2753,14 +2753,12 @@ fn positioned(
     offset: u64,
     write: bool,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
-    // A position past `i64::MAX` is a negative one, which only a file of
-    // unsigned offsets takes (`FOP_UNSIGNED_OFFSET`).
-    if (offset as i64) < 0
-        && !c
-            .files
-            .descriptor(fd)
-            .is_ok_and(|d| unsigned_offsets(&d.file))
-    {
+    // A position past `i64::MAX` is a negative one, `EINVAL` before the
+    // descriptor is looked at, as Linux v7.0's `ksys_pread64` and
+    // `ksys_pwrite64` refuse it for every file. Linux master takes it for a
+    // file of unsigned offsets (`/proc/<pid>/mem`); this follows v7.0 until
+    // the CI runners' kernel has that change.
+    if (offset as i64) < 0 {
         return Err(Errno::EINVAL);
     }
     let file = c.files.descriptor(fd)?.file;

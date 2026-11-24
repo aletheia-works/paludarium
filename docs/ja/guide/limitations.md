@@ -56,6 +56,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
   `ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
   `write` で埋めたホストのファイルのページはクリーンです（下の「`write` で埋めたページ」）。
+- **`/proc/<pid>/mem` の `i64::MAX` を超える位置**：`pread64` と `pwrite64` は、
+  Linux v7.0 の `ksys_pread64` と `ksys_pwrite64` がどのファイルでもするのと同じく、
+  これを拒みます（`EINVAL`）。Linux master は符号なしの位置のファイル
+  （`FOP_UNSIGNED_OFFSET`）では受け付けます。ランナーのカーネルに master の変更が入るまで、
+  v7.0 に従います。
 - **`/proc/<pid>/pagemap` の一部**：エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
   読み込んだプログラムのセグメントやファイルのプライベートな
   マッピングのページは、ページではなくマッピングに書き込むまでファイルのもの（ビット 61）

@@ -2194,14 +2194,16 @@ fn proc_mem_reads_and_writes_the_process_memory_through_the_system_calls() {
     assert_eq!(f.ret(18, &[fd, buf + 0x900, 6, buf]), 6);
     // Nothing is mapped at 16 KiB: EIO. lseek from the end: EINVAL.
     assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, 0x4000]), errno(Errno::EIO));
-    // Its offsets are unsigned (FOP_UNSIGNED_OFFSET): one past i64::MAX is
-    // an address with nothing there, and a count that wraps past the end
-    // is EOVERFLOW.
-    assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, 1 << 63]), errno(Errno::EIO));
+    // pread64 at a position past i64::MAX is EINVAL, as Linux v7.0's
+    // `ksys_pread64` refuses it for every file.
     assert_eq!(
-        f.ret(17, &[fd, buf + 0x800, 6, u64::MAX - 2]),
-        errno(Errno::EOVERFLOW)
+        f.ret(17, &[fd, buf + 0x800, 6, 1 << 63]),
+        errno(Errno::EINVAL)
     );
+    // The file position is unsigned (FOP_UNSIGNED_OFFSET): a read there is
+    // at an address with nothing there.
+    assert_eq!(f.ret(8, &[fd, 1 << 63, 0]), 1 << 63);
+    assert_eq!(f.ret(0, &[fd, buf + 0x800, 6]), errno(Errno::EIO));
     assert_eq!(f.ret(8, &[fd, 0, 2]), errno(Errno::EINVAL));
     assert_eq!(f.ret(8, &[fd, buf, 0]), buf);
     // 0600, as Linux's.

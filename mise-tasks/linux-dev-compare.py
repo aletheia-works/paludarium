@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -92,9 +93,7 @@ def compare(base, head):
 def run(checkout, tests, names=()):
     """Runs the selected suites, or only the cases `names` of them, in the
     container for `checkout`; returns its log."""
-    command = [
-        "bash",
-        str(checkout / "mise-tasks" / "linux-dev.sh"),
+    test = [
         "cargo",
         "test",
         "--locked",
@@ -103,6 +102,15 @@ def run(checkout, tests, names=()):
         "paludarium-harness",
         *[arg for suite in tests for arg in ("--test", suite)],
         *(("--", "--exact", *names) if names else ()),
+    ]
+    # diff_events, diff_threads and diff_files run the emulator's binary, as
+    # `mise run test:diff` builds it first.
+    command = [
+        "bash",
+        str(checkout / "mise-tasks" / "linux-dev.sh"),
+        "bash",
+        "-c",
+        "cargo build --locked -p paludarium && " + shlex.join(test),
     ]
     print(f"running {' '.join(tests)} in {checkout}", file=sys.stderr, flush=True)
     # One stream, so that cargo's "Running" lines stay before their tests.

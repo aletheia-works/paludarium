@@ -144,6 +144,9 @@ impl<T: Clone> EpochCache<T> {
         paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::LruUpdates, 1);
         let key = (space, rip);
         entries.remove(&key);
+        // A full cache looks for the oldest stamp among its 1024 entries,
+        // under the exclusive lock: a miss pays it, and a miss also extracts,
+        // emits and compiles a block, which costs far more than the scan.
         if entries.len() >= 1024
             && let Some(oldest) = entries
                 .iter()

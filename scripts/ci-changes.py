@@ -515,6 +515,7 @@ def self_test():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     jobs = check_gates(workflow)
     check_narrowing(workflow)
+    check_differential_lists()
     good = (
         "on: push\njobs:\n  a:\n    runs-on: x\n  b:\n    needs: [a, quick]\n"
         "    if: ${{ !cancelled() && needs.quick.result == 'success' && true }}\n"
@@ -547,6 +548,65 @@ def self_test():
     print(
         f"ci-changes ready: {len(cases)} paths, {len(jobs)} jobs and {fuzz_cases} fuzz selections checked"
     )
+
+
+# The harness's differential tests that a workflow of their own runs: the
+# fixed programs, the Windows and macOS hosts, and the native JIT's cases.
+OWN_WORKFLOWS = {
+    "diff_programs": ".github/workflows/programs.yml",
+    "diff_windows": ".github/workflows/quality.yml",
+    "diff_macos": ".github/workflows/macos-quality.yml",
+    "diff_jit": ".github/workflows/quality.yml",
+}
+# Where each of the others runs: mise's test:diff and the differential jobs
+# of ci.yml (every pull request) and quality.yml (nightly), each read up to
+# the next task or job.
+DIFFERENTIAL_LISTS = (
+    ("mise.toml", r'(?ms)^\[tasks\."test:diff"\]\n(.*?)(?=^\[|\Z)'),
+    (".github/workflows/ci.yml", r"(?ms)^  differential:\n(.*?)(?=^  \S|\Z)"),
+    (".github/workflows/quality.yml", r"(?ms)^  differential:\n(.*?)(?=^  \S|\Z)"),
+)
+
+
+def differential_gaps(tests, read):
+    """Each of the harness's differential `tests` and a list that does not run it."""
+    gaps = []
+    for name in sorted(tests):
+        if name in OWN_WORKFLOWS:
+            lists = [(OWN_WORKFLOWS[name], r"(?s)(.*)")]
+        else:
+            lists = DIFFERENTIAL_LISTS
+        for path, part in lists:
+            found = re.search(part, read(path))
+            if not found or not re.search(rf"--test {re.escape(name)}(?!\w)", found.group(1)):
+                gaps.append(f"{name} in {path}")
+    return gaps
+
+
+def check_differential_lists():
+    """Every differential test of the harness runs somewhere: one missing
+    from every list compares nothing, as diff_events, diff_threads and
+    diff_files did from October to November 2026."""
+    tests = {
+        p.stem
+        for p in (ROOT / "crates/paludarium-harness/tests").glob("*.rs")
+        if p.stem.startswith(("diff_", "parallel_"))
+    }
+    gaps = differential_gaps(tests, lambda path: (ROOT / path).read_text(encoding="utf-8"))
+    if gaps:
+        raise AssertionError("differential tests no job runs: " + ", ".join(gaps))
+    lists = {
+        "mise.toml": '[tasks."test:diff"]\nrun = "cargo test --test diff_a --test diff_ab"\n[tasks.x]\n',
+        ".github/workflows/ci.yml": "  differential:\n    run: cargo test --test diff_a\n  later:\n    --test diff_b\n",
+        ".github/workflows/quality.yml": "  differential:\n    --test diff_a --test diff_b\n",
+    }
+    if differential_gaps({"diff_a"}, lists.__getitem__) != []:
+        raise AssertionError("a test every list runs must pass")
+    if differential_gaps({"diff_b"}, lists.__getitem__) != [
+        "diff_b in mise.toml",
+        "diff_b in .github/workflows/ci.yml",
+    ]:
+        raise AssertionError("a test missing from a list, or only in another job, must be refused")
 
 
 def check_narrowing(workflow):

@@ -7,7 +7,8 @@
    context switches and CPU migrations a thread makes, with and without
    exclude_user and exclude_kernel; and mmap of an event's ring buffer:
    its user page, the sizes and mappings it takes, its AUX area, a fork's
-   child, which has none of it, and the pages a user may lock; and
+   child, which has none of it, the pages a user may lock, and the rules
+   of its VM_PFNMAP mapping (pfn_rules); and
    output to another event's buffer, with PERF_EVENT_IOC_SET_OUTPUT and
    PERF_FLAG_FD_OUTPUT; and the side-band records an event asks for:
    MMAP and MMAP2 of mmap, mprotect, brk and shmat, COMM of
@@ -41,6 +42,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
@@ -691,6 +693,80 @@ static void map_past_limit(int fd) {
         map_event(fd, over + 1, PROT_READ, MAP_SHARED, 0, NULL));
 }
 
+static sigjmp_buf fault_jump;
+static void on_fault(int number) {
+    siglongjmp(fault_jump, number);
+}
+
+/* The signal a write of the byte at `at` (as it is) raises: 0 for none. */
+static int write_signal(volatile char *at) {
+    struct sigaction a, bus, segv;
+    memset(&a, 0, sizeof a);
+    a.sa_handler = on_fault;
+    a.sa_flags = SA_NODEFER;
+    sigaction(SIGBUS, &a, &bus);
+    sigaction(SIGSEGV, &a, &segv);
+    int number = sigsetjmp(fault_jump, 1);
+    if (number == 0) *at = *at;
+    sigaction(SIGBUS, &bus, NULL);
+    sigaction(SIGSEGV, &segv, NULL);
+    return number;
+}
+
+/* VmLck of /proc/self/status, in kB: -1 if not there. */
+static long locked_kb(void) {
+    FILE *status = fopen("/proc/self/status", "r");
+    if (!status) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof line, status))
+        if (sscanf(line, "VmLck: %ld", &kb) == 1) break;
+    fclose(status);
+    return kb;
+}
+
+/* What mremap gives: 0 or -errno. */
+static long remapped(void *at) {
+    return at == MAP_FAILED ? -errno : 0;
+}
+
+/* Linux's rules for a ring buffer's mapping of 9 pages at `page`, a
+   VM_PFNMAP and VM_IO one (perf_mmap_vmops): its data pages are mapped
+   read-only (perf_mmap_pfn_mkwrite's SIGBUS), and no part of it is
+   unmapped, mapped over, moved, given another protection or other flags,
+   or sealed on its own (perf_mmap_may_split's EINVAL); but a part that
+   would not change takes the call. As memory core mm does not back, it
+   takes no MADV_DOFORK or MADV_DODUMP, gives no pages to MADV_DONTNEED,
+   and mlock leaves it unlocked. */
+static void pfn_rules(char *page) {
+    say("write user page %d data page %d", write_signal(page + 8), write_signal(page + 4096));
+    say("munmap first %ld", TRY(munmap(page, 4096)));
+    say("munmap last %ld", TRY(munmap(page + 8 * 4096, 4096)));
+    say("map over %ld", remapped(mmap(page + 4096, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0)));
+    say("mprotect part %ld", TRY(mprotect(page, 4096, PROT_READ)));
+    say("mprotect part same %ld", TRY(mprotect(page, 4096, PROT_READ | PROT_WRITE)));
+    say("mremap shrink %ld", remapped(mremap(page, 9 * 4096, 4096, 0)));
+    char *target = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    say("mremap part %ld",
+        remapped(mremap(page + 4096, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, target)));
+    munmap(target, 4096);
+    say("madvise random part %ld", TRY(madvise(page, 4096, MADV_RANDOM)));
+    say("madvise dontdump part %ld", TRY(madvise(page, 4096, MADV_DONTDUMP)));
+    say("madvise dofork %ld", TRY(madvise(page, 9 * 4096, MADV_DOFORK)));
+    say("madvise dodump %ld", TRY(madvise(page, 9 * 4096, MADV_DODUMP)));
+    say("madvise dontneed %ld", TRY(madvise(page, 9 * 4096, MADV_DONTNEED)));
+    say("madvise dontneed locked %ld", TRY(madvise(page, 9 * 4096, 24 /* MADV_DONTNEED_LOCKED */)));
+    say("mseal part %ld", TRY(syscall(462 /* mseal */, page, 4096, 0)));
+    long before = locked_kb();
+    say("mlock %ld", TRY(mlock(page, 9 * 4096)));
+    say("locked %d", locked_kb() == before);
+    munlock(page, 9 * 4096);
+    /* All of it takes the calls. */
+    say("mprotect whole %ld", TRY(mprotect(page, 9 * 4096, PROT_READ | PROT_WRITE)));
+    say("madvise random whole %ld", TRY(madvise(page, 9 * 4096, MADV_RANDOM)));
+    madvise(page, 9 * 4096, MADV_NORMAL);
+}
+
 static int case_mmap(void) {
     int fd = open_software(2, EXCLUDE_KERNEL | EXCLUDE_HV);
     say("open %d", fd >= 0);
@@ -724,6 +800,7 @@ static int case_mmap(void) {
     int zeros = 1;
     for (size_t i = 4096; i < 9 * 4096; i += 512) zeros &= ((volatile char *)page)[i] == 0;
     say("data zeros %d", zeros);
+    pfn_rules(page);
 
     /* Another size while mapped, and the AUX area, which a software event
        has none of once Linux's checks pass. */

@@ -1676,6 +1676,17 @@ impl ThreadGroup {
             .find(|(owner, _)| *owner == tid)
             .map_or(0, |(_, used)| used.minor_faults())
     }
+    /// The account of thread `tid`, its latest, live or not: where its
+    /// faults count.
+    pub(crate) fn usage_of(&self, tid: u32) -> Option<Arc<crate::Usage>> {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|(owner, _)| *owner == tid)
+            .map(|(_, used)| Arc::clone(used))
+    }
     /// The minor faults of its reaped children and theirs
     /// (`RUSAGE_CHILDREN`).
     pub(crate) fn children_faults(&self) -> u64 {
@@ -2316,6 +2327,10 @@ impl Kernel {
     /// Writes the core of `dump` to `core` in the working directory. Once the
     /// file is made the process counts as dumped, even if the core is cut at
     /// the limit, as Linux's binfmt_elf sets `has_dumped` before it writes.
+    /// Its reads of the memory fault as the dumping thread's: Linux's
+    /// `vfs_coredump` runs in the thread that took the signal, while the
+    /// others wait (`coredump_wait`), so `get_dump_page`'s faults count to
+    /// its `min_flt`, whichever thread here is the last to exit.
     fn write_core(&self, dump: &crate::coredump::Dump, mem: &AddressSpace) {
         let pid = self.process.pid;
         let Some(identity) = self.processes.core_identity(
@@ -2331,16 +2346,22 @@ impl Kernel {
             return;
         };
         self.processes.set_dumped(pid);
-        crate::coredump::write(dump, &identity, mem, &mut |piece| {
-            let mut at = 0;
-            while at < piece.len() {
-                match file.write(&piece[at..]) {
-                    Ok(0) | Err(_) => return false,
-                    Ok(n) => at += n,
+        let write = || {
+            crate::coredump::write(dump, &identity, mem, &mut |piece| {
+                let mut at = 0;
+                while at < piece.len() {
+                    match file.write(&piece[at..]) {
+                        Ok(0) | Err(_) => return false,
+                        Ok(n) => at += n,
+                    }
                 }
-            }
-            true
-        });
+                true
+            });
+        };
+        match self.group.usage_of(dump.dumper) {
+            Some(dumper) => paludarium_mmu::faults::counted_to(dumper, write),
+            None => write(),
+        }
     }
     pub(crate) fn sync_actions(&mut self, thread: &mut Thread) {
         let actions = self.group.shared_actions();

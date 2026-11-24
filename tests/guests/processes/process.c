@@ -3098,6 +3098,63 @@ static pid_t core_child(rlim_t limit, int dumpable, int thread, int signal) {
     else *(volatile int *)0 = 1;
     _exit(70);
 }
+/* The core-dump-faults case: a core's faults count to the thread that
+   dumps it. Linux's get_signal calls vfs_coredump in the thread that took
+   the signal while the others wait (coredump_wait), and get_dump_page
+   faults in each page of shared anonymous memory never touched. The
+   leader, with a thread parked beside it, maps 64 such pages, writes its
+   own minor faults so far to a pipe, and raises SIGABRT at itself; its zombie's
+   /proc/<pid>/task/<pid>/stat then shows the dump's faults. */
+static unsigned long stat_minflt(const char *path) {
+    char buf[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    long n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *end = strrchr(buf, ')');
+    unsigned long minflt = 0;
+    if (!end || sscanf(end + 2, "%*c %*d %*d %*d %*d %*d %*u %lu", &minflt) != 1) return 0;
+    return minflt;
+}
+static int core_dump_faults_case(void) {
+    char dir[] = "/tmp/core-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    int fds[2];
+    if (pipe(fds)) return 81;
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit r;
+        getrlimit(RLIMIT_CORE, &r);
+        r.rlim_cur = r.rlim_max;
+        setrlimit(RLIMIT_CORE, &r);
+        char *shared = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        pthread_t t;
+        if (shared == MAP_FAILED || pthread_create(&t, NULL, core_parked, NULL)) _exit(71);
+        struct rusage usage;
+        getrusage(RUSAGE_THREAD, &usage);
+        long before = usage.ru_minflt;
+        if (write(fds[1], &before, sizeof before) != sizeof before) _exit(72);
+        raise(SIGABRT);
+        _exit(70);
+    }
+    close(fds[1]);
+    long before = -1;
+    if (read(fds[0], &before, sizeof before) != sizeof before) before = -1;
+    siginfo_t info;
+    waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, pid);
+    unsigned long leader = stat_minflt(path);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("dumped=%d core=%d leader-faulted-64=%d\n", info.si_code == CLD_DUMPED,
+           WCOREDUMP(status) ? 1 : 0, before >= 0 && leader >= (unsigned long)before + 64);
+    unlink("core");
+    if (chdir("/") || rmdir(dir)) return 82;
+    return 0;
+}
 /* A little-endian field of the core, or 0 past its end. */
 static const unsigned char *core_bytes;
 static uint64_t core_size;
@@ -16712,6 +16769,42 @@ static int smaps_rollup_case(void) {
     printf("zombie open=%d read=%d\n", fd >= 0 ? 0 : -errno, got < 0 ? -errno : (int)got);
     if (fd >= 0) close(fd);
     waitpid(kid, NULL, 0);
+    return 0;
+}
+
+/* The zombie-ns-links case: a zombie keeps its pid and user links until it
+   is reaped, as Linux's pidns_get and userns_get take them from its PID and
+   credentials, while the links that need the nsproxy it gave up at its exit
+   (exit_task_namespaces), pid_for_children among them, are ENOENT. The
+   parent waits for the child with WNOWAIT, so it stays a zombie, and compares
+   its links with its own. */
+static int zombie_ns_links_case(void) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) _exit(0);
+    siginfo_t info;
+    if (waitid(P_PID, (id_t)kid, &info, WEXITED | WNOWAIT)) return 2;
+    static const char *const kept[] = {"pid", "user"};
+    for (size_t i = 0; i < sizeof kept / sizeof *kept; i++) {
+        char path[64], own[128], its[128];
+        snprintf(path, sizeof path, "/proc/self/ns/%s", kept[i]);
+        int own_error = glf_link(path, own, sizeof own);
+        snprintf(path, sizeof path, "/proc/%d/ns/%s", (int)kid, kept[i]);
+        int its_error = glf_link(path, its, sizeof its);
+        printf("%s own=%d zombie=%d same=%d\n", kept[i], own_error, its_error,
+               !own_error && !its_error && !strcmp(own, its));
+    }
+    static const char *const gone[] = {"net", "mnt", "uts", "ipc", "cgroup",
+                                       "time", "pid_for_children", "time_for_children"};
+    for (size_t i = 0; i < sizeof gone / sizeof *gone; i++) {
+        char path[64], target[128];
+        snprintf(path, sizeof path, "/proc/%d/ns/%s", (int)kid, gone[i]);
+        printf("%s=%d\n", gone[i], glf_link(path, target, sizeof target));
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("wait=%#x\n", status);
     return 0;
 }
 
@@ -35030,6 +35123,7 @@ int main(int argc, char **argv) {
         result("death-code", found[1]);
         return 0;
     }
+    if (!strcmp(mode, "core-dump-faults")) return core_dump_faults_case();
     if (!strcmp(mode, "core-dump")) {
         /* A core-dumping signal writes `core` in the working directory when
            RLIMIT_CORE allows a page and the process is dumpable; wait then
@@ -37499,6 +37593,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
     if (!strcmp(mode, "smaps-rollup")) return smaps_rollup_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
+    if (!strcmp(mode, "zombie-ns-links")) return zombie_ns_links_case();
     if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);
     if (!strcmp(mode, "userns-nondumpable-target")) return userns_nondumpable_target();
     if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);

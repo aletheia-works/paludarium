@@ -977,7 +977,7 @@ kernel.
   (`EINVAL`, after the VMAs before it took the advice) and `msync` with
   `MS_INVALIDATE` (`EBUSY`); `MADV_DONTNEED_LOCKED` takes it. A `fork`ed
   child has no lock, nor does the old range `MREMAP_DONTUNMAP` leaves, and
-  the rings of AIO and `io_uring` are never locked. Unknown flags of
+  the rings of AIO, `io_uring` and perf events are never locked. Unknown flags of
   `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
   memory stays in place without more being done.
 
@@ -1009,7 +1009,10 @@ kernel.
   of the range (no page here depends on the last ones), which then split from and merge with
   their neighbours as Linux's do (`/proc/<pid>/maps`). They go VMA by VMA:
   one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
-  takes only private anonymous memory), and a hole in the range gives
+  takes only private anonymous memory, memory core mm does not back, as
+  the rings of AIO, `io_uring` and perf events, takes no `MADV_DOFORK` or
+  `MADV_DODUMP`, and a perf ring buffer takes no change to only a part of
+  it), and a hole in the range gives
   `ENOMEM` after the rest has taken it. A `fork`ed child gets no mapping
   `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
   its pages, as new zero-filled memory; it keeps that flag and
@@ -1100,7 +1103,7 @@ kernel.
   process when it moves. A file mapping grows over more of the file, whose
   pages it reads when they are first touched, and moving a range that spans
   several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
-  `EFAULT`. The rings of AIO and `io_uring` are fixed mappings
+  `EFAULT`. The rings of AIO, `io_uring` and perf events are fixed mappings
   (`VM_DONTEXPAND`): they do not grow (`EFAULT`) or stay behind a move
   (`MREMAP_DONTUNMAP`, `EINVAL`), and an AIO ring moves only whole, as
   Linux master's `aio_ring_mremap` has it (`EINVAL` once the target is
@@ -2753,7 +2756,15 @@ kernel.
     address as a broadcast one (the limited one, or one its routes make
     so) from a source its reverse path filtering takes
     (`ip_route_input_slow`). A socket connected from the unspecified
-    address has taken its route's source, and takes none. A group or the
+    address has taken its route's source, and takes none. An IPv4 socket
+    bound to a broadcast or multicast address keeps it as its name, which
+    a UDP connect leaves, but sends from its route's source (`inet_bind`),
+    and a TCP connection takes that source as its name too
+    (`tcp_v4_connect`). An IPv6 socket bound to such an IPv4-mapped
+    address keeps it as its IPv4 source (`__inet6_bind`), so its routes to
+    IPv4 fail: `EINVAL` from a group or the limited broadcast address,
+    `ENETUNREACH` from a subnet's, for UDP's `sendto` and `connect` and
+    TCP's `connect`. A group or the
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).
@@ -3780,7 +3791,10 @@ kernel.
   `EACCES`, and `ESRCH` for root; `smaps_rollup` is `ESRCH` for any reader
   (`smaps_rollup_open`); `exe`, `cwd`, `root` and its other `ns` links are `ENOENT`; `mountinfo` is
   `EINVAL`; `statm` is zeros; `status` has no `Vm` lines or `Umask` and an
-  `FDSize` of 0; and `stat` has no sizes or addresses. `/proc/thread-self` is
+  `FDSize` of 0; and `stat` has no sizes or addresses. A zombie process keeps
+  its `pid` and `user` links too until it is reaped, as Linux's `pidns_get`
+  and `userns_get` take them from its PID and credentials, while its other
+  `ns` links and `pid_for_children` are `ENOENT`. `/proc/thread-self` is
   a link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
@@ -4473,8 +4487,10 @@ kernel.
   `mlock`'s, `mlockall`'s and `MAP_POPULATE`'s population,
   `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`, `process_vm_readv` and
   `process_vm_writev` (counted to the caller), a tracer's `PTRACE_PEEKDATA`
-  and `PTRACE_POKEDATA` (counted to the tracer) and a core dump's (which leaves anonymous memory
-  never touched a hole, with no fault). `RUSAGE_SELF` gives the sum of the
+  and `PTRACE_POKEDATA` (counted to the tracer) and a core dump's (counted
+  to the thread the signal ended, which dumps while the others wait,
+  regardless of which thread exits last; it leaves private anonymous memory never touched
+  a hole, with no fault). `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts
   from none, and an `execve` keeps them. `ru_nvcsw` counts the voluntary
@@ -4772,8 +4788,15 @@ kernel.
   closed; its last unmapping frees the buffer and its charges. It is a
   mapping of the event's file, which `/proc/<pid>/maps` and the `MMAP2`
   records name `anon_inode:[perf_event]` with the device and inode its
-  descriptor's `fstat` gives, the anonymous inodes' one. The user
-  page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
+  descriptor's `fstat` gives, the anonymous inodes' one. It keeps
+  Linux's rules for a `VM_PFNMAP` mapping (`perf_mmap_vmops`): its data
+  pages are read-only, a write to one raising `SIGBUS`; no part of it is
+  unmapped, mapped over, moved, given another protection or other flags,
+  or sealed on its own (`EINVAL`), though a part that the call would not
+  change takes it; and as memory core mm does not back, it takes no
+  `MADV_DOFORK` or `MADV_DODUMP`, gives `MADV_DONTNEED` and
+  `MADV_DONTNEED_LOCKED` no pages (`EINVAL`), and stays unlocked through
+  `mlock`. The user page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
   offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
   index 0, and the count and times enabled and running between two bumps
   of the sequence lock. `PERF_EVENT_IOC_SET_OUTPUT`, and

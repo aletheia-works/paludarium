@@ -1439,58 +1439,75 @@ impl Emitter<'_, '_> {
         }
     }
 
-    /// One element of a string move ([`Fast::MoveString`]) of `size` bytes:
-    /// from `[rsi]` at the base of `segment` to `[rdi]`, both then moved on
-    /// by `step`. Goes to `failed` when the load or the store fails, before
+    /// One element of a string move or store of `size` bytes to `[rdi]`,
+    /// which then moves on by `step`. A move ([`Fast::MoveString`], with
+    /// the `source` segment) loads it from `[rsi]` at that segment's base,
+    /// and moves rsi on too; a store ([`Fast::StoreString`], with none)
+    /// takes rax. Goes to `failed` when the load or the store fails, before
     /// any register changes; otherwise gives 1 when either saw the code
     /// change, else 0.
-    fn move_element(
+    fn string_element(
         &mut self,
         size: u8,
-        segment: Segment,
+        source: Option<Segment>,
         step: Value,
         failed: cranelift_codegen::ir::Block,
     ) -> Value {
-        let rsi = self.gpr(6);
         let rdi = self.gpr(7);
-        let source = match segment {
-            Segment::Fs => self.b.ins().iadd(rsi, self.fs_base),
-            Segment::Gs => self.b.ins().iadd(rsi, self.gs_base),
-            Segment::None => rsi,
+        let (v, loaded) = match source {
+            Some(segment) => {
+                let rsi = self.gpr(6);
+                let address = match segment {
+                    Segment::Fs => self.b.ins().iadd(rsi, self.fs_base),
+                    Segment::Gs => self.b.ins().iadd(rsi, self.gs_base),
+                    Segment::None => rsi,
+                };
+                let (v, loaded) = self.load(address, size);
+                let stored_block = self.b.create_block();
+                let is_failed = self.b.ins().icmp_imm_s(IntCC::Equal, loaded, FAILED);
+                self.b.ins().brif(is_failed, failed, &[], stored_block, &[]);
+                self.b.switch_to_block(stored_block);
+                (v, Some(loaded))
+            }
+            None => (self.gpr(0), None),
         };
-        let (v, loaded) = self.load(source, size);
-        let stored_block = self.b.create_block();
-        let is_failed = self.b.ins().icmp_imm_s(IntCC::Equal, loaded, FAILED);
-        self.b.ins().brif(is_failed, failed, &[], stored_block, &[]);
-        self.b.switch_to_block(stored_block);
         let stored = self.store(rdi, size, v);
         let moved = self.b.create_block();
         let is_failed = self.b.ins().icmp_imm_s(IntCC::Equal, stored, FAILED);
         self.b.ins().brif(is_failed, failed, &[], moved, &[]);
         self.b.switch_to_block(moved);
-        let rsi = self.b.ins().iadd(rsi, step);
-        self.set_gpr(6, rsi);
+        if source.is_some() {
+            let rsi = self.gpr(6);
+            let rsi = self.b.ins().iadd(rsi, step);
+            self.set_gpr(6, rsi);
+        }
         let rdi = self.b.ins().iadd(rdi, step);
         self.set_gpr(7, rdi);
-        let a = self.b.ins().icmp_imm_s(IntCC::Equal, loaded, CODE_CHANGED);
-        let b = self.b.ins().icmp_imm_s(IntCC::Equal, stored, CODE_CHANGED);
-        let either = self.b.ins().bor(a, b);
-        self.b.ins().uextend(I64, either)
+        let changed = self.b.ins().icmp_imm_s(IntCC::Equal, stored, CODE_CHANGED);
+        let changed = match loaded {
+            Some(loaded) => {
+                let read = self.b.ins().icmp_imm_s(IntCC::Equal, loaded, CODE_CHANGED);
+                self.b.ins().bor(read, changed)
+            }
+            None => changed,
+        };
+        self.b.ins().uextend(I64, changed)
     }
 
-    /// [`Fast::MoveString`], the `n`th instruction, at `rip`, with `next`
-    /// after it. Repeated, it runs as the interpreter's `string` does: it
-    /// ends when RCX is 0, and otherwise leaves at `rip` after
-    /// [`REP_CHUNK`] iterations, or when an iteration after the first
-    /// fails, counting the instruction as run; when the first fails, it
-    /// leaves before the instruction, which then gives the fault. The code
-    /// may change under it: it then goes on to the end of the instruction,
-    /// as the interpreter does, and leaves after it.
-    fn move_string(
+    /// [`Fast::MoveString`] (from the `source` segment) or
+    /// [`Fast::StoreString`] (with none), the `n`th instruction, at `rip`,
+    /// with `next` after it. Repeated, it runs as the interpreter's `string`
+    /// does: it ends when RCX is 0, and otherwise leaves at `rip` after
+    /// [`REP_CHUNK`] iterations, or when an iteration after the first fails,
+    /// counting the instruction as run; when the first fails, it leaves
+    /// before the instruction, which then gives the fault. The code may
+    /// change under it: it then goes on to the end of the instruction, as
+    /// the interpreter does, and leaves after it.
+    fn string(
         &mut self,
         size: u8,
         repeat: bool,
-        segment: Segment,
+        source: Option<Segment>,
         n: usize,
         rip: u64,
         next: u64,
@@ -1503,7 +1520,7 @@ impl Emitter<'_, '_> {
         let step = self.b.ins().select(down, back, forward);
         if !repeat {
             let failed = self.b.create_block();
-            let changed = self.move_element(size, segment, step, failed);
+            let changed = self.string_element(size, source, step, failed);
             let done = self.b.create_block();
             self.b.ins().jump(done, &[]);
             self.b.switch_to_block(failed);
@@ -1536,7 +1553,7 @@ impl Emitter<'_, '_> {
         self.b.ins().jump(body, &[]);
 
         self.b.switch_to_block(body);
-        let moved = self.move_element(size, segment, step, failed);
+        let moved = self.string_element(size, source, step, failed);
         let rcx = self.gpr(1);
         let rcx = self.b.ins().iadd_imm_s(rcx, -1);
         self.set_gpr(1, rcx);
@@ -1919,7 +1936,8 @@ impl Emitter<'_, '_> {
                 size,
                 repeat,
                 segment,
-            } => self.move_string(size, repeat, segment, n, rip, next),
+            } => self.string(size, repeat, Some(segment), n, rip, next),
+            Fast::StoreString { size, repeat } => self.string(size, repeat, None, n, rip, next),
             Fast::Bswap(dst) => {
                 let v = self.read(dst);
                 let r = if dst.size() == 8 {

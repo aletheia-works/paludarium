@@ -135,9 +135,7 @@ verified.
   which outlives the memory, so those files stay the task's and their open
   is `ESRCH`; paludarium follows that once the runners run 7.2 or later, and
   the `gone-leader-files` case and the unit test
-  `a_task_without_memory_has_its_files_owned_by_root` change with it. A
-  zombie process has no `ns` links yet, where Linux's `pid` and `user` links
-  still resolve (`pidns_get` and `userns_get` need no `nsproxy`).
+  `a_task_without_memory_has_its_files_owned_by_root` change with it.
   `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
@@ -284,9 +282,7 @@ verified.
   maps the file and counts the faults as the program first touches the
   pages, a read fault for several of them at once (`fault_around_bytes`);
   these faults are no `perf` event. No fault is major (`ru_majflt` is 0),
-  as every page of a file is taken to be in the page cache. A core dump's faults count to the
-  last thread to exit, where Linux counts them to the thread that dumps.
-  `/proc/<pid>/stat`'s
+  as every page of a file is taken to be in the page cache. `/proc/<pid>/stat`'s
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
@@ -337,15 +333,9 @@ verified.
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
-  mapping's are the error here. Until the memory manager knows Linux's
-  rules for the mapping (`VM_PFNMAP`), a write to a data page lands, where
-  Linux raises `SIGBUS`; a part of the mapping may be unmapped, moved or
-  given another protection, where Linux refuses to split it (`EINVAL`); and
-  `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
-  (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
-  mapping unlocked. `inherit_stat` is taken, but an inherited event's end
-  sends no read record, as nothing is recorded. An event of a task on one
-  CPU counts on any, and the cgroup mode
+  mapping's are the error here. `inherit_stat` is taken, but an inherited
+  event's end sends no read record, as nothing is recorded. An event of a
+  task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2

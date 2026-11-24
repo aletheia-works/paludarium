@@ -1154,9 +1154,17 @@ kernel.
   instruction's do: a system call's own copy to or from a registered page
   waits for it, through any signal that is not fatal, as Linux retries a
   kernel fault (`fault_signal_pending`), and the copy goes on once the page
-  is filled; a SIGKILL, the process's exit or the context's release ends
+  is filled or the context released; a SIGKILL or the process's exit ends
   the wait with `EFAULT`, as does `UFFD_USER_MODE_ONLY` or
-  `UFFD_FEATURE_SIGBUS` at once. `/dev/userfaultfd`, a
+  `UFFD_FEATURE_SIGBUS` at once. A futex word's read waits with the futex
+  queues free. `get_user_pages` waits too where it may drop the space's
+  lock: for `process_vm_readv` and `process_vm_writev`, in the other task's
+  memory and with a buffer's pages faulted in before any is copied, for
+  `MADV_POPULATE_READ`, `MADV_POPULATE_WRITE`, `mlock` and what else brings
+  locked pages in, and for a shared futex's key; it fails where it may not,
+  as for `ptrace` and `/proc/<pid>/mem` (`EIO`), a core dump (a hole),
+  `FUTEX_WAKE_OP`'s word (`EFAULT`) and what `mprotect` brings in (its error
+  ignored). `/dev/userfaultfd`, a
   misc device of root's of mode 0600 (`userfaultfd_misc`, whose minor
   number Linux gives at boot), makes one with its only operation, the
   ioctl `USERFAULTFD_IOC_NEW`, of the flags in the low 32 bits of its

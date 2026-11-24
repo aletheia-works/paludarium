@@ -1034,11 +1034,7 @@ verified.
   page `UFFDIO_ZEROPAGE` gives a private mapping of a shmem file is a
   page of zeros of its own, which
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
-  zero page. A copy to or from a registered page by another process's
-  `process_vm_readv` or `process_vm_writev`, or by another
-  `get_user_pages` caller, stays `EFAULT`, where Linux's `get_user_pages`
-  reaches `handle_userfault` too, which does not check whose `mm` faults.
-  A `UFFDIO_MOVE` source
+  zero page. A `UFFDIO_MOVE` source
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise.

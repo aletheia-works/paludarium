@@ -1033,8 +1033,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先に確かめます。そのフォールトは命令のときと同じく届きます。システムコール自身の
   登録したページとのコピーはページを待ち、Linux がカーネルのフォールトをやり直すので
   （`fault_signal_pending`）、致命的でないシグナルでは待ち終わらず、ページが埋まると
-  コピーが進みます。SIGKILL、プロセスの終了、コンテキストの解放は待ちを `EFAULT` で
-  終わらせ、`UFFD_USER_MODE_ONLY` と `UFFD_FEATURE_SIGBUS` はすぐに `EFAULT` です。root のモード 0600 の misc デバイス `/dev/userfaultfd`
+  コピーが進みます。コンテキストの解放でも進みます。SIGKILL とプロセスの終了は待ちを `EFAULT` で
+  終わらせ、`UFFD_USER_MODE_ONLY` と `UFFD_FEATURE_SIGBUS` はすぐに `EFAULT` です。futex の
+  ワードの読み出しは、futex のキューを空けて待ちます。`get_user_pages` も、アドレス空間の
+  ロックを手放せるところでは待ちます。`process_vm_readv` と `process_vm_writev`（相手のタスクの
+  メモリで待ち、バッファーのページをすべて先にフォールトさせてからコピーします）、
+  `MADV_POPULATE_READ`、`MADV_POPULATE_WRITE`、`mlock` などのロックしたページの用意、共有の
+  futex のキーです。手放せないところでは失敗します。`ptrace` と `/proc/<pid>/mem` は `EIO`、
+  コアダンプはホール、`FUTEX_WAKE_OP` のワードは `EFAULT`、`mprotect` によるページの用意は
+  （エラーを無視して）そこまでです。root のモード 0600 の misc デバイス `/dev/userfaultfd`
   （`userfaultfd_misc`。マイナー番号は Linux が起動時に決めます）は、ただ一つの操作である
   ioctl `USERFAULTFD_IOC_NEW` で、引数の下位 32 ビットのフラグのものを、ケーパビリティ
   なしで作ります。デバイスを開ける者は作れるからです。ほかの ioctl、`read`、`write` は

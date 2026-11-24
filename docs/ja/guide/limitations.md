@@ -869,10 +869,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ホストの tmpfs のファイルはここで持っていません。shmem のファイルの
   プライベートなマッピングに `UFFDIO_ZEROPAGE` が入れるゼロページは、そのマッピング
   自身のゼロのページで、`/proc/<pid>/pagemap` と `smaps` もそう数えます。Linux は
-  そのゼロページを対応付けます。ほかのプロセスの `process_vm_readv` や
-  `process_vm_writev`、ほかの `get_user_pages` の呼び出し元による登録したページとの
-  コピーは `EFAULT` のままです。Linux の `get_user_pages` も `handle_userfault` に届き、
-  そこはどの `mm` のフォルトかを確かめません。`UFFDIO_MOVE` の
+  そのゼロページを対応付けます。`UFFDIO_MOVE` の
   動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。

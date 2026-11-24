@@ -1644,6 +1644,7 @@ fn sys_rt_sigsuspend(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         let mask = c.mem.read_u64(GuestAddr(a[0])).map_err(|_| Errno::EFAULT)?;
         let old_mask = c.process.signal_mask;
         c.process.signal_mask = mask & !unblockable();
+        crate::userfaultfd::mask_changed(c.process.signal_mask);
         let result = wait_for_signal(c);
         // The checkpoint installs the signal's frame (saving the original
         // mask) and then restores it, also when no handler runs.
@@ -3032,7 +3033,7 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, lock: Option<paludarium_mmu:
                 let faulted = if write {
                     write_in(c.mem, page).is_err()
                 } else {
-                    c.mem.read_for_dump(GuestAddr(page), &mut [0]).is_err()
+                    read_in(c.mem, page).is_err()
                 };
                 if faulted {
                     return err(Errno::ENOMEM);
@@ -3491,7 +3492,7 @@ fn populate_range_in(mem: &AddressSpace, start: u64, end: u64) {
             let faulted = if write {
                 write_in(mem, page).is_err()
             } else {
-                mem.read_for_dump(GuestAddr(page), &mut [0]).is_err()
+                read_in(mem, page).is_err()
             };
             if faulted {
                 break;
@@ -3503,9 +3504,11 @@ fn populate_range_in(mem: &AddressSpace, start: u64, end: u64) {
 
 /// Brings the pages of `[start, end)` in by writing them ([`write_in`]),
 /// in each private mapping there that may be written ([`writes_in`]), as
-/// Linux's `populate_vma_page_range` does with `FOLL_WRITE`, and leaves
-/// the others: a page that cannot be written in (past the end of its file)
-/// is passed over, as `mm_populate` ignores the errors. Each such mapping
+/// Linux's `populate_vma_page_range` does with `FOLL_WRITE` for
+/// `mprotect_fixup`, and leaves the others: a page that cannot be written
+/// in (past the end of its file) ends its mapping's, whose error is
+/// ignored, and so does one a `userfaultfd` should fill, as the space's
+/// lock is kept (`locked` null, so no `FOLL_UNLOCKABLE`). Each such mapping
 /// is marked written first ([`mark_written_for`]).
 fn write_range_in(mem: &AddressSpace, start: u64, end: u64) {
     let mappings: Vec<_> = mem
@@ -3515,10 +3518,11 @@ fn write_range_in(mem: &AddressSpace, start: u64, end: u64) {
     for m in mappings {
         let mut page = m.start.0.max(start);
         mark_written_for(mem, page);
-        while page < m.end().min(end) {
-            let _ = write_in(mem, page);
-            page += 4096;
-        }
+        paludarium_mmu::faults::through_gup_locked(|| {
+            while page < m.end().min(end) && write_page(mem, page).is_ok() {
+                page += 4096;
+            }
+        });
     }
 }
 
@@ -3538,14 +3542,24 @@ fn mark_written_for(mem: &AddressSpace, page: u64) {
 /// `faultin_page_range`), so its fault is no `perf` event
 /// ([`paludarium_mmu::faults::through_gup`]).
 fn write_in(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> {
-    paludarium_mmu::faults::through_gup(|| {
-        mem.atomic(
-            GuestAddr(page),
-            paludarium_mmu::AtomicWidth::W8,
-            paludarium_mmu::AtomicOp::Add(0),
-        )
-    })
+    paludarium_mmu::faults::through_gup(|| write_page(mem, page))
+}
+
+/// [`write_in`], as the caller goes through `get_user_pages`.
+fn write_page(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> {
+    mem.atomic(
+        GuestAddr(page),
+        paludarium_mmu::AtomicWidth::W8,
+        paludarium_mmu::AtomicOp::Add(0),
+    )
     .map(drop)
+}
+
+/// Brings the page at `page` in by reading it whatever its protection, as
+/// `populate_vma_page_range` does with `FOLL_FORCE`
+/// ([`AddressSpace::populate`]).
+fn read_in(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> {
+    paludarium_mmu::faults::through_gup(|| mem.populate(GuestAddr(page)))
 }
 
 /// `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` of `[addr, end)`, as
@@ -3555,7 +3569,8 @@ fn write_in(mem: &AddressSpace, page: u64) -> Result<(), paludarium_mmu::Fault> 
 /// `memfd_secret` file's, or a mapping of no pages, `VM_IO | VM_PFNMAP`,
 /// such as a `perf` ring), with `EINVAL`, and one that cannot be brought in (past the end of its file,
 /// `SIGBUS`) with `EFAULT`, or poisoned (`UFFDIO_POISON`) with `EHWPOISON`,
-/// after the pages before it. A read maps what a read would (the zero page of
+/// after the pages before it. One a `userfaultfd` fills is waited for, with
+/// the space unlocked: its mapping is looked up again after. A read maps what a read would (the zero page of
 /// private anonymous memory); a write breaks copy-on-write as a write
 /// would, and leaves the bytes as they are. Both go through
 /// `get_user_pages` without `FOLL_FORCE` (`faultin_page_range`), so their
@@ -3586,7 +3601,16 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
             match faulted {
                 // `VM_FAULT_HWPOISON` is `EHWPOISON`.
                 Some(fault) if fault.poison => return Err(Errno(133)),
-                Some(_) => return Err(Errno::EFAULT),
+                Some(_) => {
+                    let now = mem.mappings().find(|m| m.start.0 <= at && at < m.end());
+                    return Err(match now {
+                        None => Errno::ENOMEM,
+                        Some(m) if !m.prot.contains(needed) || mem.refuses_gup(at, at + 4096) => {
+                            Errno::EINVAL
+                        }
+                        Some(_) => Errno::EFAULT,
+                    });
+                }
                 None => {}
             }
             at += 4096;
@@ -3798,15 +3822,19 @@ fn zero_user(mem: &AddressSpace, ptr: u64, len: u64) -> Result<u64, Errno> {
 /// at most `bytecount` bytes and at most the whole table's, and zeros up
 /// to `bytecount`, which it gives.
 fn read_ldt(mem: &AddressSpace, ptr: u64, bytecount: u64) -> Result<u64, Errno> {
-    let ldt = mem
+    // Copied out with its lock let go, as a signal's return and a segment
+    // load take it, and the copy may wait for a `userfaultfd`.
+    let mut bytes: Vec<u8> = mem
         .ldt()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if ldt.is_empty() {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .flat_map(|d| d.to_le_bytes())
+        .collect();
+    if bytes.is_empty() {
         return Ok(0);
     }
     let bytecount = bytecount.min(LDT_ENTRIES * 8);
-    let mut bytes: Vec<u8> = ldt.iter().flat_map(|d| d.to_le_bytes()).collect();
     bytes.resize(bytecount as usize, 0);
     mem.write(GuestAddr(ptr), &bytes)
         .map_err(|_| Errno::EFAULT)?;

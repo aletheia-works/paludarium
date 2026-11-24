@@ -7927,6 +7927,61 @@ mod inotify {
         );
     }
     #[test]
+    fn a_fifos_reads_and_writes_carry_its_name_to_a_group_that_needs_it() {
+        // `__fsnotify_parent`: the directory's interest does not count for
+        // a FIFO's read or write, but a filesystem mark of a group reporting
+        // the parent's name still has it, without `FAN_EVENT_ON_CHILD`.
+        let mut f = fixture();
+        let q = put(&f, DATA, b"/tmp/q");
+        let p = put(&f, DATA + 0x20, b"/tmp/q/p");
+        let byte = put(&f, DATA + 0x40, b"x");
+        assert_eq!(f.ret(83, &[q, 0o700]), 0);
+        assert_eq!(f.ret(133, &[p, 0o010644, 0]), 0);
+        // FAN_NONBLOCK | FAN_REPORT_DFID_NAME | FAN_REPORT_FID.
+        let sb = f.ret(300, &[0xe02, 0, 0, 0, 0, 0]);
+        let dir = f.ret(300, &[0xe02, 0, 0, 0, 0, 0]);
+        // FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_ACCESS | FAN_MODIFY.
+        assert_eq!(f.ret(301, &[sb, 0x101, 3, -100i64 as u64, q, 0]), 0);
+        // FAN_MARK_ADD on the directory, with FAN_EVENT_ON_CHILD.
+        assert_eq!(f.ret(301, &[dir, 1, 0x800_0003, -100i64 as u64, q, 0]), 0);
+        let fifo = f.ret(2, &[p, 0o4002, 0]);
+        assert_eq!(f.ret(1, &[fifo, byte, 1]), 1);
+        assert_eq!(f.ret(0, &[fifo, DATA + 0x60, 1]), 1);
+        let buf = DATA + 0x100;
+        let n = f.ret(0, &[sb, buf, 4096]);
+        let mut bytes = vec![0; n as usize];
+        f.mem.read(GuestAddr(buf), &mut bytes).unwrap();
+        let mut seen = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let meta = u16::from_le_bytes(bytes[at + 6..at + 8].try_into().unwrap()) as usize;
+            let mask = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap());
+            let mut names = Vec::new();
+            let mut info = at + meta;
+            while info < at + len {
+                let kind = bytes[info];
+                let info_len =
+                    u16::from_le_bytes(bytes[info + 2..info + 4].try_into().unwrap()) as usize;
+                if kind == 2 {
+                    let handle = info + 12;
+                    let size =
+                        u32::from_le_bytes(bytes[handle..handle + 4].try_into().unwrap()) as usize;
+                    let name = &bytes[handle + 8 + size..info + info_len];
+                    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                    names.push(name[..end].to_vec());
+                }
+                info += info_len;
+            }
+            seen.push((mask, names));
+            at += len;
+        }
+        // The write and the read merge into one event, as both have the same
+        // file, directory and name (`fanotify_should_merge`).
+        assert_eq!(seen, [(3, vec![b"p".to_vec()])]);
+        assert_eq!(f.ret(0, &[dir, buf, 4096]), errno(Errno::EAGAIN));
+    }
+    #[test]
     fn the_calls_are_checked_in_linuxs_order() {
         let mut f = fixture();
         assert_eq!(f.ret(INIT1, &[1]), errno(Errno::EINVAL));

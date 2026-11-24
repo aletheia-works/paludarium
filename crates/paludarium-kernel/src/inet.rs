@@ -493,11 +493,12 @@ impl Network {
         }
     }
     /// What a packet from `from` to `to` out through this namespace's veth
-    /// end `index` finds at `now`, its neighbour first
-    /// ([`crate::interface::Addresses::neigh_output`]):
-    /// - Nothing answers, as nobody answers ARP for `to`
+    /// end `index` finds at `now`, its neighbour first, its route's gateway
+    /// or else `to` ([`Self::next_hop4`],
+    /// [`crate::interface::Addresses::neigh_output`]):
+    /// - Nothing answers, as nobody answers ARP for that neighbour
     ///   ([`Reach::Unanswered`]), unless the end has its carrier, so that
-    ///   its peer is up (`veth_xmit`), `to` is an address of the peer's
+    ///   its peer is up (`veth_xmit`), the neighbour is an address of the peer's
     ///   namespace (`arp_process`: its local routes have it), and the peer
     ///   takes a packet from `from` in on it, as `ip_route_input` checks
     ///   the source with its reverse path filtering
@@ -510,26 +511,28 @@ impl Network {
     ///   peer drops it, as it does a martian from 0.0.0.0.
     /// - The packet comes there, and the answer back ([`Reach::Answered`])
     ///   only when the peer's namespace routes `from` back out through its
-    ///   end, without a gateway, and this namespace takes the answer from
-    ///   `to` in on its end, at its address `from`; else that answer goes
-    ///   nowhere ([`Reach::OneWay`]).
+    ///   end, to a next hop that is this namespace's (but a loopback
+    ///   address), and this namespace takes the answer from `to` in on its
+    ///   end, at its address `from`; else that answer goes nowhere
+    ///   ([`Reach::OneWay`]).
     fn reach(&self, index: i32, from: IpAddr, to: IpAddr, now: Option<u64>) -> Reach {
         let (from, to) = match (plain(from), plain(to)) {
             (IpAddr::V4(from), IpAddr::V4(to)) => (from, to),
             (IpAddr::V6(from), IpAddr::V6(to)) => return self.reach6(index, from, to, now),
             _ => return Reach::Unanswered,
         };
+        let hop = self.next_hop4(index, to, now);
         let Some(Arp {
             peer,
             answer,
             own_mac,
             own_rpf,
-        }) = self.arp(index, from, to, now)
+        }) = self.arp(index, from, hop, now)
         else {
             return Reach::Unanswered;
         };
         let at = now.unwrap_or(0);
-        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, to, answer, at);
+        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
         self.later(events);
         if asked
             && answer.is_some()
@@ -560,23 +563,29 @@ impl Network {
                 && addresses
                     .validate_source4_on(from, 0, 0, their_rpf, peer_index)
                     .is_ok();
-            let back = addresses.lookup4(from).is_ok_and(|r| {
-                r.kind == crate::interface::Kind::Unicast
-                    && i64::from(r.oif) == i64::from(peer_index)
-                    && r.gateway.is_none()
-            });
+            let back = addresses
+                .lookup4(from)
+                .ok()
+                .filter(|r| {
+                    r.kind == crate::interface::Kind::Unicast
+                        && i64::from(r.oif) == i64::from(peer_index)
+                })
+                .map(|r| r.gateway.filter(|_| r.uses_gateway).unwrap_or(from));
             (arrives, back)
         };
         if !arrives {
             return Reach::Dropped;
         }
-        let back = back && {
+        // The answer's next hop must be this end's, as ARP finds it.
+        let back = back.is_some_and(|hop| {
             let addresses = self.addresses_at(now);
             addresses.local4(from)
+                && !hop.is_loopback()
+                && addresses.local4(hop)
                 && addresses
                     .validate_source4_on(to, 0, 0, own_rpf, index)
                     .is_ok()
-        };
+        });
         if back {
             Reach::Answered(there)
         } else {
@@ -773,6 +782,17 @@ impl Network {
             .and_then(|d| d.veth.as_ref()?.peer.as_ref().map(|p| p.index))
             .and_then(|i| u32::try_from(i).ok())
             .unwrap_or(0)
+    }
+    /// The neighbour an IPv4 packet to `to` out through the veth end
+    /// `index` goes to at `now`: its route's gateway, where a route of link
+    /// scope reaches it, else `to` itself (`rt_nexthop`).
+    fn next_hop4(&self, index: i32, to: Ipv4Addr, now: Option<u64>) -> Ipv4Addr {
+        self.addresses_at(now)
+            .lookup4(to)
+            .ok()
+            .filter(|r| i64::from(r.oif) == i64::from(index) && r.uses_gateway)
+            .and_then(|r| r.gateway)
+            .unwrap_or(to)
     }
     /// The neighbour a packet to `to` out through the veth end `index`
     /// goes to at `now`: its route's gateway, else `to` itself

@@ -556,6 +556,14 @@ kernel.
   `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
 
+- `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`
+  check them. `O_DIRECT` needs a regular file of a disk file system or
+  tmpfs, or a memfd opened again by a path (`EINVAL` for a directory, a
+  device, a FIFO, a socket, an anonymous inode or a file of `/proc`);
+  `F_SETFL` also takes it on a pipe or FIFO. `O_NOATIME` needs the file's
+  owner or `CAP_FOWNER` (`EPERM`), at `open` and when `F_SETFL` newly
+  sets it.
+
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
   locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a descriptor table owns (a
   process's, which its threads and a child cloned with `CLONE_FILES` share,
@@ -2629,7 +2637,15 @@ kernel.
     `RTNH_F_LINKDOWN` (`fib_check_nh_nongw`, `NETDEV_CHANGE`). A route the
     guest adds through an end without a gateway is taken as well
     (`ENETDOWN` while the end is down, `ENODEV` for a device there is
-    not). An output lookup that goes through an end leaves from its first
+    not), and one with a gateway (`RTA_GATEWAY`) goes through the end it
+    names or else the one the gateway's route goes through, as
+    `fib_check_nh_v4_gw` checks it: a route of link scope or narrower,
+    unicast or local, must reach it, through that end if named, and that
+    end must be up (`ENETDOWN`); `RTNH_F_ONLINK` takes the gateway to be on
+    the named end's link, which must be up, and refuses one that is an
+    address of the namespace, a broadcast or a group (`EINVAL`). Its
+    packets go to the gateway's neighbour where a route of link scope
+    reaches the gateway (`rt_uses_gateway`), else to their destination's. An output lookup that goes through an end leaves from its first
     primary address, else from the first of the other devices' in the
     order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
     without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
@@ -2893,7 +2909,7 @@ kernel.
     table and, from the first time `lo` is up with it (for one added while
     down, if it is permanent), a unicast prefix route in the main table, of
     its priority or else metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
-    through `lo` or a veth end (for IPv4 without a gateway) or of a kind without a device (`blackhole`, `unreachable`,
+    through `lo` or a veth end or of a kind without a device (`blackhole`, `unreachable`,
     `prohibit`, `throw`) to any table, with its metric, protocol, scope,
     TOS, preferred source and a gateway (on link too), as
     `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
@@ -5451,7 +5467,11 @@ kernel.
   The groups hear what inotify watches hear, by the same hooks, as Linux's
   `fsnotify` sends it: the file's, its mount's and its file system's marks,
   its directory's when it watches its children, and for `FAN_RENAME` the
-  new directory's. An event is queued as `fanotify_handle_event` makes it:
+  new directory's. A FIFO's or device's read or write is not its
+  directory's, as `__fsnotify_parent` keeps it from the directory's
+  interest, but a group that needs the directory and name hears of it with
+  them, without `FAN_EVENT_ON_CHILD`. An event is queued as
+  `fanotify_handle_event` makes it:
   without a FID mode only the open, access, modification and close of a
   regular file or directory, with a descriptor of it opened again with the
   group's flags, which `F_GETFL` shows with `O_CLOEXEC` and which a

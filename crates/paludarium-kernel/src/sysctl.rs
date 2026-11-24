@@ -988,7 +988,8 @@ pub(crate) fn open(
     let (value, writers) = match entry {
         Entry::Directory(_) if flags & 3 != 0 => return Err(Errno::EISDIR),
         Entry::Directory(_) => {
-            return Ok(Arc::new(crate::proc::OwnDirectory::new(
+            return Ok(Arc::new(crate::proc::OwnDirectory::opened(
+                flags,
                 crate::proc::directory_stat(),
             )));
         }

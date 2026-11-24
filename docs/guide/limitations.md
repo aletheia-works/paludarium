@@ -169,6 +169,13 @@ verified.
   no device for it to stand for. A FIFO in a mounted host directory can be
   made on Linux hosts only, and connects only the guest's own openers, not
   host programs that open the same node.
+- **A pipe's packet mode**: `F_SETFL` takes `O_DIRECT` on a pipe or FIFO,
+  as Linux does, but the emulator has no packet mode: its writes are not
+  kept apart as packets, and `F_GETFL` does not show `O_DIRECT`.
+- **`O_DIRECT`'s alignment**: a read or write of a file opened with
+  `O_DIRECT` goes through as any other. On a disk file system such as
+  ext4, Linux refuses a buffer, offset or length that is not aligned to its
+  block size (`EINVAL`); the emulator does not.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.
@@ -1037,9 +1044,7 @@ verified.
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
-  dnotify is always on, as with Linux's default of 1. A FIFO's or device's
-  read or write does not reach its directory's watch, as with fanotify
-  below.
+  dnotify is always on, as with Linux's default of 1.
 - **File leases, not yet**: `fcntl`'s `F_SETLEASE` and `F_GETLEASE` give
   `EINVAL`, where Linux takes a read or write lease and signals its holder
   when another open or truncate breaks it.
@@ -1061,8 +1066,7 @@ verified.
   is judged by the
   fanotify marks alone, where Linux's counts inotify's too. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
-  it had, which fails once it is gone, and a FIFO's or device's read or
-  write is told of without its directory and name.
+  it had, which fails once it is gone.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the
@@ -1073,12 +1077,12 @@ verified.
   make. A veth end takes IPv4 addresses and routes, and TCP and UDP go
   across a pair to an address of the peer's namespace; it takes IPv6
   addresses, makes its link-local one and its routes, and takes IPv6
-  routes a request adds, with a gateway too, and IPv6's TCP and UDP and
-  its neighbours, but no proxy entry and no IPv4 route through a gateway,
-  each `EOPNOTSUPP`. An IPv6 gateway's neighbour state does not steer a
-  lookup, as Linux's `rt6_check_neigh` does among routes of one metric,
-  and two routes with gateways of one metric, which Linux makes
-  multipath siblings, are `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
+  routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
+  and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
+  gateway's neighbour state does not steer a lookup, as Linux's
+  `rt6_check_neigh` does among routes of one metric, and two routes with
+  gateways of one metric, which Linux makes multipath siblings, are
+  `EOPNOTSUPP` for now. A UDP connect to a group of the node or the
   link without a scope ID or a device is `EINVAL`, as Linux's is with no
   multicast interface, which none is here. A connection accepted from a
   link-local address has no device, so its names have no scope ID. A UDP
@@ -1168,7 +1172,7 @@ verified.
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
   A
-  route goes through `lo`, a veth end (for IPv4 without a gateway) or rejects: multipath routes,
+  route goes through `lo`, a veth end or rejects: multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup

@@ -13397,6 +13397,110 @@ static int contexts_case(void) {
     return 0;
 }
 
+/* O_DIRECT and O_NOATIME, as open (do_dentry_open, may_open) and F_SETFL
+   (setfl) check them. O_DIRECT needs FMODE_CAN_ODIRECT, which a regular
+   file of a disk file system or tmpfs has, and a memfd only once opened
+   again by a path; a directory, a FIFO, a device and /proc's files have
+   none (EINVAL). F_SETFL still lets a FIFO have it, as a pipe's packet
+   mode, while open does not. O_NOATIME needs the file's owner or
+   CAP_FOWNER (EPERM), here a file of the child's own and root's "/"; a
+   child of root drops to user 1000 first, so every line is the same for
+   any user. Each value is 0 or the errno, then
+   whether F_GETFL shows the flag. */
+static void direct_line(const char *name, int fd, int flag) {
+    if (fd < 0) {
+        printf("%s: open=%d\n", name, errno);
+        return;
+    }
+    printf("%s: open=0 set=%d\n", name, !!(fcntl(fd, F_GETFL) & flag));
+    close(fd);
+}
+static void setfl_line(const char *name, int fd, int flag) {
+    if (fd < 0) {
+        printf("%s: open=%d\n", name, errno);
+        return;
+    }
+    int r = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | flag);
+    printf("%s: setfl=%d set=%d\n", name, r < 0 ? errno : 0, !!(fcntl(fd, F_GETFL) & flag));
+}
+static int setfl_checks_case(void) {
+    char dir[64], file[96], fifo[96], made[96], shm[64], link[64];
+    snprintf(dir, sizeof dir, "/tmp/paludarium-setfl-%d", getpid());
+    snprintf(file, sizeof file, "%s/f", dir);
+    snprintf(fifo, sizeof fifo, "%s/p", dir);
+    snprintf(made, sizeof made, "%s/made", dir);
+    snprintf(shm, sizeof shm, "/dev/shm/paludarium-setfl-%d", getpid());
+    mkdir(dir, 0755);
+    close(open(file, O_CREAT | O_WRONLY, 0644));
+    mkfifo(fifo, 0644);
+
+    direct_line("open-file", open(file, O_RDWR | O_DIRECT), O_DIRECT);
+    direct_line("open-created", open(made, O_RDWR | O_CREAT | O_DIRECT, 0644), O_DIRECT);
+    printf("created-stays=%d\n", access(made, F_OK) == 0);
+    direct_line("open-shm", open(shm, O_RDWR | O_CREAT | O_DIRECT, 0644), O_DIRECT);
+    direct_line("open-directory", open(dir, O_RDONLY | O_DIRECTORY | O_DIRECT), O_DIRECT);
+    /* O_PATH keeps none of the other flags, so O_DIRECT is not checked. */
+    direct_line("open-path", open(dir, O_PATH | O_DIRECT), O_DIRECT);
+    direct_line("open-fifo", open(fifo, O_RDWR | O_DIRECT), O_DIRECT);
+    direct_line("open-null", open("/dev/null", O_RDWR | O_DIRECT), O_DIRECT);
+    direct_line("open-proc", open("/proc/self/status", O_RDONLY | O_DIRECT), O_DIRECT);
+    int memfd = (int)syscall(SYS_memfd_create, "setfl", 0);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", memfd);
+    direct_line("open-memfd-again", open(link, O_RDWR | O_DIRECT), O_DIRECT);
+
+    setfl_line("setfl-file", open(file, O_RDWR), O_DIRECT);
+    setfl_line("setfl-shm", open(shm, O_RDWR), O_DIRECT);
+    setfl_line("setfl-directory", open(dir, O_RDONLY | O_DIRECTORY), O_DIRECT);
+    /* A FIFO's O_DIRECT is a pipe's packet mode, whose F_GETFL this case
+       does not compare. */
+    int fifo_fd = open(fifo, O_RDWR);
+    printf("setfl-fifo: setfl=%d\n", fcntl(fifo_fd, F_SETFL, O_RDWR | O_DIRECT) < 0 ? errno : 0);
+    close(fifo_fd);
+    int ends[2];
+    if (pipe(ends)) return 1;
+    printf("setfl-pipe: setfl=%d\n", fcntl(ends[0], F_SETFL, O_DIRECT) < 0 ? errno : 0);
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 1;
+    setfl_line("setfl-socket", pair[0], O_DIRECT);
+    setfl_line("setfl-eventfd", eventfd(0, 0), O_DIRECT);
+    setfl_line("setfl-null", open("/dev/null", O_RDWR), O_DIRECT);
+    setfl_line("setfl-proc", open("/proc/self/status", O_RDONLY), O_DIRECT);
+    setfl_line("setfl-memfd", memfd, O_DIRECT);
+    setfl_line("setfl-memfd-again", open(link, O_RDWR), O_DIRECT);
+    fflush(stdout);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (geteuid() == 0 && (setgroups(0, NULL) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)))
+            _exit(2);
+        char own[64];
+        snprintf(own, sizeof own, "/tmp/paludarium-setfl-own-%d", getpid());
+        close(open(own, O_CREAT | O_WRONLY, 0644));
+        direct_line("noatime-own", open(own, O_RDONLY | O_NOATIME), O_NOATIME);
+        direct_line("noatime-other", open("/", O_RDONLY | O_DIRECTORY | O_NOATIME), O_NOATIME);
+        /* The same directory again, through its link in /proc/self/fd. */
+        int root = open("/", O_RDONLY | O_DIRECTORY);
+        char again[64];
+        snprintf(again, sizeof again, "/proc/self/fd/%d", root);
+        direct_line("noatime-other-again", open(again, O_RDONLY | O_DIRECTORY | O_NOATIME), O_NOATIME);
+        close(root);
+        setfl_line("setfl-noatime-own", open(own, O_RDONLY), O_NOATIME);
+        setfl_line("setfl-noatime-other", open("/", O_RDONLY | O_DIRECTORY), O_NOATIME);
+        unlink(own);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = -1;
+    waitpid(pid, &status, 0);
+    printf("child=%d\n", status);
+    unlink(file);
+    unlink(made);
+    unlink(fifo);
+    unlink(shm);
+    rmdir(dir);
+    return 0;
+}
+
 /* The setattrs case: mount_setattr and open_tree_attr (Linux master's) in a
    mount namespace of a user namespace of its own: the checks of a struct
    mount_attr, a mount's flags set and cleared with the mounts below it,
@@ -23670,6 +23774,11 @@ static int setfl_kinds_case(void) {
     opened_nonblock("clear-refs", open("/proc/self/clear_refs", O_WRONLY | O_NONBLOCK));
     opened_nonblock("sysvipc-msg", open("/proc/sysvipc/msg", O_RDONLY | O_NONBLOCK));
     opened_nonblock("sysctl", open("/proc/sys/kernel/perf_event_paranoid", O_RDONLY | O_NONBLOCK));
+    opened_nonblock("proc", open("/proc", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("proc-pid", open("/proc/self", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("proc-fd", open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("dev", open("/dev", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    opened_nonblock("dev-pts", open("/dev/pts", O_RDONLY | O_DIRECTORY | O_NONBLOCK));
     return 0;
 }
 
@@ -36527,6 +36636,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "contexts")) return contexts_case();
     if (!strcmp(mode, "setfl-kinds")) return setfl_kinds_case();
     if (!strcmp(mode, "setattrs")) return setattrs_case();
+    if (!strcmp(mode, "setfl-checks")) return setfl_checks_case();
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();

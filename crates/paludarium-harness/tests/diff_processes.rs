@@ -181,7 +181,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv6-gateway, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv6-gateway, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -269,6 +269,7 @@ mod linux {
                     | "fanotify-marks"
                     | "fanotify-events"
                     | "fanotify-fid"
+                    | "fanotify-fifo-names"
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
                     | "fanotify-mounts"
@@ -396,6 +397,7 @@ mod linux {
                     | "mapped-source"
                     | "veth-neigh"
                     | "veth-ipv6"
+                    | "veth-ipv4-gateway"
                     | "veth-ipv6-gateway"
                     | "veth-ipv6-scope"
                     | "veth-ipv6-traffic"
@@ -626,6 +628,7 @@ mod linux {
         mapped_source => ("mapped-source","mapped-source"),
         veth_neigh => ("veth-neigh","veth-neigh"),
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),
+        veth_ipv4_gateway => ("veth-ipv4-gateway","veth-ipv4-gateway"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_ipv6_scope => ("veth-ipv6-scope","veth-ipv6-scope"),
         veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
@@ -763,6 +766,7 @@ mod linux {
         fanotify_marks => ("fanotify-marks","fanotify"),
         fanotify_events => ("fanotify-events","fanotify"),
         fanotify_fid => ("fanotify-fid","fanotify"),
+        fanotify_fifo_names => ("fanotify-fifo-names","fanotify"),
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         fanotify_mounts => ("fanotify-mounts","fanotify"),
@@ -1019,6 +1023,7 @@ mod linux {
         processes_contexts => ("contexts","process"),
         processes_setfl_kinds => ("setfl-kinds","process"),
         processes_setattrs => ("setattrs","process"),
+        processes_setfl_checks => ("setfl-checks","process"),
         processes_mount_flags => ("mount-flags","process"),
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),

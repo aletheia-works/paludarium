@@ -91,6 +91,35 @@ async function untilSafariExited() {
   return wait;
 }
 
+// Ending a session (DELETE /session, or closing its last window) leaves the Safari that safaridriver launched for it
+// running: it does not exit on its own, so each later session found it there (#947's runs: 14 of 14 never exited in
+// the 15 s wait and were killed). After a session, or a request for one that failed (safaridriver may have launched a
+// Safari by then), each Safari that the pgrep before the request did not list is asked to quit: one launched for the
+// session, or one started by someone else in between, but never a Safari running already, such as the person's own. It
+// is asked through
+// NSRunningApplication's terminate, the same quit request as choosing Quit Safari, and its exit is awaited as an event
+// within safariExit.waitMs. Nothing is killed here: a Safari that does not quit is logged with exited:false, and the
+// next session's exit wait then reports it as never exited.
+const QUIT_SAFARI = 'ObjC.import("AppKit"); function run(argv) { const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(argv[0])); return app.isNil() ? "gone" : String(app.terminate); }';
+function askToQuit(pid) {
+  const asker = spawn("/usr/bin/osascript", ["-l", "JavaScript", "-e", QUIT_SAFARI, String(pid)], { stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  for (const stream of [asker.stdout, asker.stderr]) stream.on("data", bytes => { out += bytes; });
+  return new Promise(resolve => {
+    const bound = setTimeout(() => asker.kill("SIGKILL"), 10000);
+    asker.once("close", (code, signal) => { clearTimeout(bound); resolve(code === 0 ? out.trim() : `osascript ${code ?? signal}: ${out.trim()}`); });
+    asker.once("error", error => { clearTimeout(bound); resolve(String(error)); });
+  });
+}
+async function quitLaunched(pids) {
+  const start = Date.now();
+  return Promise.all(pids.map(async pid => {
+    const answer = await askToQuit(pid);
+    const exited = await exitOf(pid, Math.max(0, start + safariExit.waitMs - Date.now())) || !running(pid);
+    return { pid, answer, exited, waited_ms: Date.now() - start };
+  }));
+}
+
 async function safari(url, timeout) {
   let first;
   const started = Date.now();
@@ -164,6 +193,10 @@ async function safariAttempt(url, timeout) {
     let cleanupError;
     try { if (sessionId) await webdriverRequest(base, "DELETE", `/session/${sessionId}`); }
     catch (error) { cleanupError = error; }
+    if (sessionRequestedAfter !== null) {
+      const launched = (await safariPids()).filter(pid => !exitWait.pids.includes(pid));
+      if (launched.length > 0) console.error(JSON.stringify({ safari_quit: await quitLaunched(launched) }));
+    }
     await stopDriver(driver);
     if (cleanupError) {
       if (failure) failure.message += `; cleanup: ${cleanupError}`;

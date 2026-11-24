@@ -447,6 +447,20 @@ impl PageSource for Pages {
     fn linked(&self) -> bool {
         false
     }
+    /// The event's file, as `d_path` names it: an anonymous inode's
+    /// (`anon_inode_getfile`'s `[perf_event]`), which `/proc/<pid>/maps`
+    /// and the `MMAP` records give.
+    fn name(&self) -> Option<Vec<u8>> {
+        Some(b"anon_inode:[perf_event]".to_vec())
+    }
+    /// The device and inode the event's descriptor's `fstat` gives: the
+    /// anonymous inodes' one.
+    fn identity(&self) -> (u64, u64) {
+        (
+            crate::files::Internal::AnonInodes.device(),
+            crate::files::anon_inode(),
+        )
+    }
 }
 
 const CAP_IPC_LOCK: u64 = 1 << 14;

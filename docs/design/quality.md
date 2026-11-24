@@ -66,6 +66,16 @@ CI run produces them afresh on an x86-64 Linux runner.
   `kernel.apparmor_restrict_unprivileged_userns` is 1, so CI sets it to 0
   with `sysctl`; elsewhere the case differs from such a host's native run.
 
+- Whether Linux gets a large folio for a tmpfs page depends on its free
+  memory, unless it may reclaim and compact for it: under the default
+  `defrag=madvise`, only for a fault of a mapping advised `MADV_HUGEPAGE`
+  (`vma_thp_gfp_mask`). So the `tmpfs-huge` case takes each large folio
+  from such a fault, and tries a write, `fallocate` and an unadvised fault
+  only on a mount of one page, where no larger folio fits whatever the
+  memory. That a write, `fallocate`, `huge=within_size` and an unadvised
+  fault on `huge=always` take a large folio is checked by the in-memory
+  file system's unit tests alone.
+
 - The native side must be a real x86-64 Linux. Docker on an Arm Mac runs
   x86-64 programs under QEMU's user-mode emulation, which handles signals
   itself, so there even native results can differ from Linux: a stopped and
@@ -236,7 +246,8 @@ every test passing.
   `bpf_tests.rs`, `bpf_prog_tests.rs`, `mqueue_tests.rs`, `pty_tests.rs`,
   `mctp_tests.rs`, `seccomp_tests.rs`, `signalfd_tests.rs`,
   `sock_diag_tests.rs`, `extack_tests.rs`, `mempolicy_tests.rs`,
-  `context_tests.rs`, `perf_sample_tests.rs` and `perf_side_band_tests.rs` in
+  `context_tests.rs`, `tasks_tests.rs`, `perf_sample_tests.rs` and
+  `perf_side_band_tests.rs` in
   `crates/paludarium-kernel/src/`) make a differential guest's calls in
   the same order and compare its lines with what the guest prints on
   native Linux: as printed on Linux 7.0, or as printed under the emulator

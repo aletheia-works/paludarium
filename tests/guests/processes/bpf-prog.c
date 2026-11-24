@@ -79,6 +79,23 @@
    BPF_F_TEST_RND_HI32 the 32-bit results' upper halves. Then what
    SO_ATTACH_BPF charges the socket for a program, after its rewrites, at
    the edge of net.core.optmem_max.
+   bpf-prog-udp: in a network namespace of its own, with its loopback up,
+   socket filters on UDP sockets of the loopback, IPv4 and
+   IPv6, and an IPv4 datagram to a dual-stack IPv6 socket: the options'
+   errors, SO_LOCK_FILTER and SO_BPF_EXTENSIONS, as on an AF_UNIX socket;
+   what a filter keeps
+   (always the UDP header, and of the rest what it says), and what is then
+   queued (FIONREAD); the fields of struct __sk_buff that it reads, of an
+   unconnected socket and of a connected one with SO_PRIORITY (the hash
+   only as set or 0, as both kernels draw it at random); the bytes before
+   the data with bpf_skb_load_bytes_relative, from the loopback's MAC
+   header and from the network header, to the linear part's end, which
+   for a datagram in pages is the UDP header's (the IPv4 ID and header
+   checksum, the IPv6 flow label and the ports, random, are not printed);
+   classic loads of the ancillary fields and of the headers, which reach
+   the bytes in pages too; and that a
+   datagram takes of the receive buffer what it took as it came, however
+   little of it the filter kept.
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -105,13 +122,18 @@
    prunes) are not printed. The case runs as root, as the guest does:
    loading needs CAP_BPF and CAP_PERFMON. */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -2493,6 +2515,308 @@ static int case_rewrites(void) {
     return 0;
 }
 
+/* bpf-prog-udp: filters on UDP sockets of the loopback. */
+#define UDP_PAYLOAD 40000
+static unsigned char udp_out[UDP_PAYLOAD], udp_in[UDP_PAYLOAD];
+
+/* A UDP socket of `family` bound to the loopback (or, `any`, to every
+   address) at a port of its own, whose address goes to `to`. */
+static int udp_bound(int family, int any, struct sockaddr_storage *to, socklen_t *len) {
+    int s = socket(family, SOCK_DGRAM, 0);
+    memset(to, 0, sizeof *to);
+    if (family == AF_INET) {
+        struct sockaddr_in *a = (struct sockaddr_in *)to;
+        a->sin_family = AF_INET;
+        a->sin_addr.s_addr = htonl(any ? INADDR_ANY : INADDR_LOOPBACK);
+        *len = sizeof *a;
+    } else {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)to;
+        a->sin6_family = AF_INET6;
+        a->sin6_addr = any ? in6addr_any : in6addr_loopback;
+        *len = sizeof *a;
+    }
+    if (s < 0 || bind(s, (struct sockaddr *)to, *len) || getsockname(s, (struct sockaddr *)to, len)) return -1;
+    return s;
+}
+
+/* Sends `len` bytes from s to `to` and receives them on r: the send's
+   result, and the count received (or -errno) with its first bytes. */
+static void udp_through(const char *name, int s, int r, const struct sockaddr_storage *to, socklen_t tolen,
+                        size_t len) {
+    long sent = sendto(s, udp_out, len, 0, (const struct sockaddr *)to, tolen);
+    if (sent < 0) sent = -errno;
+    long got = recv(r, udp_in, sizeof udp_in, MSG_DONTWAIT);
+    printf("%s sent %ld received %ld", name, sent, got < 0 ? -errno : got);
+    for (long i = 0; i < got && i < 4; i++) printf(" %u", udp_in[i]);
+    putchar('\n');
+    fflush(stdout);
+}
+
+/* The array map's value at key 0, `size` bytes of it, into `out`. */
+static long value0(int fd, void *out) {
+    uint32_t key = 0;
+    struct {
+        uint32_t map_fd, pad;
+        uint64_t key, value, flags;
+    } a = {(uint32_t)fd, 0, (uintptr_t)&key, (uintptr_t)out, 0};
+    return bpf(1, &a, sizeof a);
+}
+
+/* A filter that copies struct __sk_buff's fields into the map's value,
+   one u32 each, and keeps the datagram. */
+#define FIELD(i, off) LDX_W(1, 6, off), STX_W(0, 1, 4 * (i))
+static const int field_offsets[] = {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 68, 84, 164, 176};
+static const char *const field_names[] = {"len", "pkt_type", "mark", "queue_mapping", "protocol",
+                                          "vlan_present", "vlan_tci", "vlan_proto", "priority",
+                                          "ingress_ifindex", "ifindex", "tc_index", "hash", "napi_id",
+                                          "gso_segs", "gso_size"};
+static int fields_filter(int m) {
+    return PROGRAM(MOV_REG(6, 1), KEY4(m), CALL(LOOKUP), JEQ(0, 0, 32), FIELD(0, 0), FIELD(1, 4), FIELD(2, 8),
+                   FIELD(3, 12), FIELD(4, 16), FIELD(5, 20), FIELD(6, 24), FIELD(7, 28), FIELD(8, 32),
+                   FIELD(9, 36), FIELD(10, 40), FIELD(11, 44), FIELD(12, 68), FIELD(13, 84), FIELD(14, 164),
+                   FIELD(15, 176), MOV(0, -1), EXIT());
+}
+static void say_fields(const char *name, int m) {
+    uint32_t v[16] = {0};
+    long r = value0(m, v);
+    printf("%s lookup %ld:", name, r);
+    /* The hash is random, or 0. */
+    for (int i = 0; i < 16; i++)
+        if (i == 12)
+            printf(" %s %s", field_names[i], v[i] ? "set" : "0");
+        else
+            printf(" %s %u", field_names[i], v[i]);
+    putchar('\n');
+    fflush(stdout);
+}
+
+/* A filter that copies `len` bytes from the MAC header (start 0) or the
+   network header (1) into the map's value, the helper's result after
+   them at 64, and keeps the datagram. */
+static int headers_filter(int m, int start, int len) {
+    return PROGRAM(MOV_REG(6, 1), KEY4(m), CALL(LOOKUP), JEQ(0, 0, 8), MOV_REG(7, 0), MOV_REG(1, 6), MOV(2, 0),
+                   MOV_REG(3, 7), MOV(4, len), MOV(5, start), CALL(LOAD_BYTES_RELATIVE), STX_W(7, 0, 64), MOV(0, -1),
+                   EXIT());
+}
+/* The bytes the filter copied, with those that are random in both
+   kernels (the IPv4 ID and header checksum, the IPv6 flow label, and the
+   ports) as "..". */
+static void say_headers(const char *name, int m, int len, int mac, int v6) {
+    unsigned char v[72] = {0};
+    long r = value0(m, v);
+    int32_t result;
+    memcpy(&result, v + 64, 4);
+    printf("%s lookup %ld result %d:", name, r, result);
+    int ip = mac ? 14 : 0, udp = ip + (v6 ? 40 : 20);
+    for (int i = 0; i < len; i++) {
+        int masked = (!v6 && (i == ip + 4 || i == ip + 5 || i == ip + 10 || i == ip + 11)) ||
+                     (v6 && i >= ip + 1 && i <= ip + 3) || (i >= udp && i < udp + 4);
+        if (masked)
+            printf(" ..");
+        else
+            printf(" %02x", v[i]);
+    }
+    putchar('\n');
+    fflush(stdout);
+}
+
+/* A classic filter that keeps A + `add` bytes after loading A with
+   `load`: the received count shows A + `add` - 8 (up to what was sent),
+   and a load that fails drops the datagram. */
+static void classic_load(const char *name, int s, int r, const struct sockaddr_storage *to, socklen_t tolen,
+                         size_t len, struct sf load, int add) {
+    struct sf f[] = {load, S(C_ALU_K(C_ADD), add), S(C_RET_A, 0)};
+    int a = attach_classic(r, f, COUNT(f));
+    long sent = sendto(s, udp_out, len, 0, (const struct sockaddr *)to, tolen);
+    long got = recv(r, udp_in, sizeof udp_in, MSG_DONTWAIT);
+    say("%s attach %d sent %ld A %ld", name, a, sent < 0 ? -errno : sent, got < 0 ? -errno : got);
+}
+
+static void udp_family(int family) {
+    const char *f = family == AF_INET ? "v4" : "v6";
+    int v6 = family == AF_INET6;
+    char name[96];
+    struct sockaddr_storage to;
+    socklen_t tolen;
+    int r = udp_bound(family, 0, &to, &tolen);
+    int s = socket(family, SOCK_DGRAM, 0);
+    say("%s sockets %d", f, r >= 0 && s >= 0);
+
+    /* The options, as on any socket. */
+    int drop = PROGRAM(MOV(0, 0), EXIT());
+    say("%s attach len 2 %d", f, setsockopt(r, SOL_SOCKET, SO_ATTACH_BPF, &drop, 2) ? -errno : 0);
+    say("%s attach no fd %d", f, attach(r, 1000));
+    say("%s detach none %d", f, option(r, SO_DETACH_FILTER, 0));
+    snprintf(name, sizeof name, "%s get filter none", f);
+    get(name, r, SO_GET_FILTER);
+    snprintf(name, sizeof name, "%s lock filter", f);
+    get(name, r, SO_LOCK_FILTER);
+    snprintf(name, sizeof name, "%s bpf extensions", f);
+    get(name, r, SO_BPF_EXTENSIONS);
+
+    /* What a filter keeps: the UDP header always, of what it says. */
+    snprintf(name, sizeof name, "%s no filter", f);
+    udp_through(name, s, r, &to, tolen, 20);
+    say("%s attach drop %d", f, attach(r, drop));
+    snprintf(name, sizeof name, "%s get filter bpf", f);
+    get(name, r, SO_GET_FILTER);
+    snprintf(name, sizeof name, "%s drop", f);
+    udp_through(name, s, r, &to, tolen, 20);
+    int keeps[] = {1, 8, 11, 28, -1};
+    for (unsigned i = 0; i < COUNT(keeps); i++) {
+        int keep = PROGRAM(MOV(0, keeps[i]), EXIT());
+        say("%s attach keep %d %d", f, keeps[i], attach(r, keep));
+        snprintf(name, sizeof name, "%s keep %d", f, keeps[i]);
+        udp_through(name, s, r, &to, tolen, 20);
+        close(keep);
+    }
+    /* What is queued is what was kept (FIONREAD). */
+    int keep11 = PROGRAM(MOV(0, 11), EXIT());
+    attach(r, keep11);
+    sendto(s, udp_out, 20, 0, (struct sockaddr *)&to, tolen);
+    int queued = -1;
+    int asked = ioctl(r, FIONREAD, &queued) ? -errno : 0;
+    say("%s queued after keep 11 %d %d", f, asked, queued);
+    recv(r, udp_in, sizeof udp_in, MSG_DONTWAIT);
+
+    /* The fields of struct __sk_buff: unconnected, and connected. */
+    int fm = map(2, 4, 64, 1, 0);
+    int fields = fields_filter(fm);
+    say("%s attach fields %d", f, attach(r, fields));
+    snprintf(name, sizeof name, "%s fields", f);
+    udp_through(name, s, r, &to, tolen, 20);
+    say_fields(name, fm);
+    int c = socket(family, SOCK_DGRAM, 0);
+    int priority = 3;
+    setsockopt(c, SOL_SOCKET, SO_PRIORITY, &priority, sizeof priority);
+    say("%s connect %d", f, connect(c, (struct sockaddr *)&to, tolen) ? -errno : 0);
+    snprintf(name, sizeof name, "%s connected fields", f);
+    udp_through(name, c, r, &to, tolen, 300);
+    say_fields(name, fm);
+
+    /* The headers, from the MAC header (the loopback's, of zeros) and
+       the network header, to the linear part's end. */
+    int hm = map(2, 4, 72, 1, 0);
+    int all = v6 ? 62 : 42;
+    int mac = headers_filter(hm, 0, all);
+    say("%s attach mac %d", f, attach(r, mac));
+    snprintf(name, sizeof name, "%s mac", f);
+    udp_through(name, s, r, &to, tolen, 20);
+    say_headers(name, hm, all, 1, v6);
+    int net = headers_filter(hm, 1, all - 14);
+    say("%s attach net %d", f, attach(r, net));
+    snprintf(name, sizeof name, "%s net", f);
+    udp_through(name, s, r, &to, tolen, 20);
+    say_headers(name, hm, all - 14, 0, v6);
+    int past = headers_filter(hm, 1, all - 14 + 20 + 1);
+    say("%s attach past %d", f, attach(r, past));
+    snprintf(name, sizeof name, "%s past the end", f);
+    udp_through(name, s, r, &to, tolen, 20);
+    say_headers(name, hm, 0, 0, v6);
+    /* A datagram whose bytes go in pages: the headers alone are linear. */
+    int linear = headers_filter(hm, 1, all - 14);
+    attach(r, linear);
+    snprintf(name, sizeof name, "%s paged", f);
+    udp_through(name, s, r, &to, tolen, 20000);
+    say_headers(name, hm, all - 14, 0, v6);
+    int beyond = headers_filter(hm, 1, all - 14 + 1);
+    attach(r, beyond);
+    snprintf(name, sizeof name, "%s paged past the headers", f);
+    udp_through(name, s, r, &to, tolen, 20000);
+    say_headers(name, hm, 0, 0, v6);
+
+    /* Classic loads: the ancillary fields, and the headers. */
+    int ip = v6 ? 40 : 20;
+    struct {
+        const char *name;
+        size_t len;
+        struct sf load;
+        int add;
+    } loads[] = {
+        {"protocol", UDP_PAYLOAD, S(C_LD_W_ABS, AD(0)), 8},
+        {"pkttype", UDP_PAYLOAD, S(C_LD_W_ABS, AD(4)), 8},
+        {"ifindex", UDP_PAYLOAD, S(C_LD_W_ABS, AD(8)), 8},
+        {"mark", UDP_PAYLOAD, S(C_LD_W_ABS, AD(20)), 8},
+        {"queue", UDP_PAYLOAD, S(C_LD_W_ABS, AD(24)), 8},
+        {"hatype", UDP_PAYLOAD, S(C_LD_W_ABS, AD(28)), 8},
+        {"vlan tag present", UDP_PAYLOAD, S(C_LD_W_ABS, AD(48)), 8},
+        {"payload offset", UDP_PAYLOAD, S(C_LD_W_ABS, AD(52)), 8},
+        /* 308, the UDP header and 300 bytes, less 290. */
+        {"len", 300, S(C_LD_LEN, 0), -290},
+        {"udp length", 300, S(C_LD_H_ABS, 4), -290},
+        {"next header", 300, S(C_LD_B_ABS, NET(v6 ? 6 : 9)), 8},
+        {"ethertype", UDP_PAYLOAD, S(C_LD_H_ABS, LL(12)), 8},
+        {"destination mac", 300, S(C_LD_W_ABS, LL(0)), 8},
+        {"before the mac header", 300, S(C_LD_B_ABS, LL(-1)), 8},
+        {"payload byte", 300, S(C_LD_B_ABS, NET(ip + 8)), 8},
+        {"paged byte", 20000, S(C_LD_B_ABS, 10000), 8},
+        {"paged last header byte", 20000, S(C_LD_B_ABS, NET(ip + 7)), 8},
+        {"paged payload by net", 20000, S(C_LD_B_ABS, NET(ip + 8)), 8},
+    };
+    for (unsigned i = 0; i < COUNT(loads); i++) {
+        snprintf(name, sizeof name, "%s classic %s", f, loads[i].name);
+        classic_load(name, s, r, &to, tolen, loads[i].len, loads[i].load, loads[i].add);
+    }
+    snprintf(name, sizeof name, "%s get filter classic", f);
+    get_classic(name, r, 3);
+
+    /* SO_LOCK_FILTER keeps the filter. */
+    say("%s lock %d", f, option(r, SO_LOCK_FILTER, 1));
+    say("%s attach locked %d", f, attach(r, drop));
+    say("%s detach locked %d", f, option(r, SO_DETACH_FILTER, 0));
+    say("%s unlock locked %d", f, option(r, SO_LOCK_FILTER, 0));
+
+    /* A datagram takes of the receive buffer what it took as it came,
+       however much the filter kept: the second of these does not fit. */
+    struct sockaddr_storage small_to;
+    socklen_t small_len;
+    int small = udp_bound(family, 0, &small_to, &small_len);
+    int one = 1;
+    setsockopt(small, SOL_SOCKET, SO_RCVBUF, &one, sizeof one);
+    int keep8 = PROGRAM(MOV(0, 8), EXIT());
+    say("%s small attach %d", f, attach(small, keep8));
+    for (int i = 0; i < 3; i++) sendto(s, udp_out, 3000, 0, (struct sockaddr *)&small_to, small_len);
+    int n = 0;
+    long got;
+    while ((got = recv(small, udp_in, sizeof udp_in, MSG_DONTWAIT)) >= 0) n++;
+    say("%s small received %d then %d", f, n, -errno);
+
+    int fds[] = {r, s, c, small, drop, keep11, fields, fm, mac, net, past, linear, beyond, hm, keep8};
+    for (unsigned i = 0; i < COUNT(fds); i++) close(fds[i]);
+}
+
+static int case_udp(void) {
+    for (size_t i = 0; i < sizeof udp_out; i++) udp_out[i] = (unsigned char)(i * 7 + 3);
+    /* A network namespace of its own, whose loopback it brings up: the
+       emulator gives internet sockets to a guest without a network only
+       there. */
+    say("unshare %d", unshare(CLONE_NEWNET) ? -errno : 0);
+    {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof ifr);
+        strcpy(ifr.ifr_name, "lo");
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        int r = ioctl(u, SIOCGIFFLAGS, &ifr) ? -errno : 0;
+        ifr.ifr_flags |= IFF_UP;
+        say("lo %d up %d", r, ioctl(u, SIOCSIFFLAGS, &ifr) ? -errno : 0);
+        close(u);
+    }
+    udp_family(AF_INET);
+    udp_family(AF_INET6);
+    /* An IPv4 datagram to a dual-stack IPv6 socket is IPv4's. */
+    struct sockaddr_storage any;
+    socklen_t anylen;
+    int r = udp_bound(AF_INET6, 1, &any, &anylen);
+    int fm = map(2, 4, 64, 1, 0);
+    say("dual attach %d", attach(r, fields_filter(fm)));
+    struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = ((struct sockaddr_in6 *)&any)->sin6_port,
+                             .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    udp_through("dual", s, r, (struct sockaddr_storage *)&to, sizeof to, 20);
+    say_fields("dual fields", fm);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -2507,5 +2831,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-ldabs")) return case_ldabs();
     if (!strcmp(mode, "bpf-prog-calls")) return case_calls();
     if (!strcmp(mode, "bpf-prog-rewrites")) return case_rewrites();
+    if (!strcmp(mode, "bpf-prog-udp")) return case_udp();
     return 2;
 }

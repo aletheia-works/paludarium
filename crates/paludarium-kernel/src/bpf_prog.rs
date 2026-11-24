@@ -715,7 +715,9 @@ impl Attached {
         }
     }
 
-    fn run(
+    /// Runs the program on `packet`: the bytes of it to keep, or 0 to
+    /// drop it.
+    pub(crate) fn run(
         &self,
         packet: &crate::bpf_interp::Packet<'_>,
         kernel: &mut dyn crate::bpf_interp::Kernel,
@@ -773,8 +775,25 @@ pub(crate) struct Receiving<'a> {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     /// The socket the message is for, and its owner (`sk_uid`).
-    pub(crate) socket: Option<Arc<crate::unix::UnixSocket>>,
+    pub(crate) socket: FilterSocket,
     pub(crate) owner: u32,
+}
+
+/// The socket a filter runs for (`skb->sk`).
+#[derive(Clone)]
+pub(crate) enum FilterSocket {
+    Unix(std::sync::Weak<crate::unix::UnixSocket>),
+    Inet(std::sync::Weak<crate::inet::InetSocket>),
+}
+
+impl FilterSocket {
+    /// Its cookie (`__sock_gen_cookie`), or 0 when it is gone.
+    fn cookie(&self) -> u64 {
+        match self {
+            FilterSocket::Unix(s) => s.upgrade().map_or(0, |s| s.cookie()),
+            FilterSocket::Inet(s) => s.upgrade().map_or(0, |s| s.cookie()),
+        }
+    }
 }
 
 impl crate::bpf_interp::Kernel for Receiving<'_> {
@@ -809,7 +828,7 @@ impl crate::bpf_interp::Kernel for Receiving<'_> {
         u64::from(self.gid) << 32 | u64::from(self.uid)
     }
     fn socket_cookie(&mut self) -> u64 {
-        self.socket.as_ref().map_or(0, |s| s.cookie())
+        self.socket.cookie()
     }
     fn socket_uid(&mut self) -> u32 {
         self.owner
@@ -829,10 +848,7 @@ pub(crate) fn sk_filter(
     buf: &[u8],
     kernel: &mut Receiving<'_>,
 ) -> Option<usize> {
-    let packet = crate::bpf_interp::Packet {
-        data: buf,
-        linear: unix_linear(buf.len()),
-    };
+    let packet = crate::bpf_interp::Packet::message(buf, unix_linear(buf.len()));
     match program.run(&packet, kernel) {
         0 => None,
         keep => Some(buf.len().min(keep as usize)),

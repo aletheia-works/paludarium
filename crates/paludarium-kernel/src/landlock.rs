@@ -88,6 +88,8 @@ pub(crate) struct Ruleset {
     scoped: u64,
     rules: Mutex<BTreeMap<Object, u64>>,
     ports: Mutex<BTreeMap<u16, u64>>,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 
 /// An enforced stack of rulesets (Linux's domain).
@@ -648,9 +650,11 @@ impl FileHandle for Ruleset {
         Err(Errno::ENOSYS)
     }
     fn flags(&self) -> u32 {
-        2
+        self.status.of(2)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }
@@ -711,6 +715,7 @@ pub(crate) fn sys_create_ruleset(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64
         return Err(Errno(42)); // ENOMSG
     }
     let ruleset = Arc::new(Ruleset {
+        status: Default::default(),
         handled,
         handled_net,
         scoped,

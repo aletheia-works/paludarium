@@ -501,3 +501,114 @@ fn an_object_file_holds_its_object_until_its_last_name_goes() {
     fs.unlink(b"/p", false).unwrap();
     assert_eq!(Arc::strong_count(&object), 1);
 }
+mod huge_folios {
+    use super::*;
+    use crate::contents::Huge;
+    fn mounted(huge: Huge, pages: u64) -> MemFs {
+        let fs = MemFs::new();
+        fs.mark_shmem();
+        fs.usage().set_limits(pages, 0);
+        fs.usage().set_huge(huge);
+        fs
+    }
+    fn blocks(f: &Arc<dyn FileHandle>) -> u64 {
+        f.stat().unwrap().blocks.unwrap()
+    }
+    #[test]
+    fn the_shown_options_give_the_policy() {
+        assert_eq!(
+            Huge::shown_in(",size=8k,inode64,huge=within_size"),
+            Huge::WithinSize
+        );
+        assert_eq!(Huge::shown_in(",inode64"), Huge::Never);
+        assert_eq!(Huge::shown_in(",huge=always,noswap"), Huge::Always);
+    }
+    #[test]
+    fn a_write_takes_a_whole_folio_or_its_page_alone_when_that_does_not_fit() {
+        let fs = mounted(Huge::Always, 1024);
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        assert_eq!(f.write(b"x"), Ok(1));
+        assert_eq!(blocks(&f), 512 * 8);
+        // Its folio's other pages are data, reading zeros.
+        assert_eq!(f.seek(0, 4), Ok(1));
+        let small = mounted(Huge::Always, 256);
+        let g = small.open(b"/a", 66, 0o644).unwrap();
+        assert_eq!(g.write(b"x"), Ok(1));
+        assert_eq!(blocks(&g), 8);
+        // A page next to one the file has takes the largest free extent.
+        assert_eq!(g.write_at(2 * 4096, b"y"), Ok(1));
+        assert_eq!(blocks(&g), 3 * 8);
+        let never = mounted(Huge::Never, 1024);
+        let h = never.open(b"/a", 66, 0o644).unwrap();
+        assert_eq!(h.write(b"x"), Ok(1));
+        assert_eq!(blocks(&h), 8);
+    }
+    #[test]
+    fn within_size_takes_a_folio_the_size_or_the_write_covers() {
+        let fs = mounted(Huge::WithinSize, 0);
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        assert_eq!(f.write(b"x"), Ok(1));
+        assert_eq!(blocks(&f), 8);
+        f.truncate(4 << 20).unwrap();
+        assert_eq!(f.write_at(2 << 20, b"x"), Ok(1));
+        assert_eq!(blocks(&f), (1 + 512) * 8);
+        let g = fs.open(b"/b", 66, 0o644).unwrap();
+        assert_eq!(g.write(&[1; 64 << 10]), Ok(64 << 10));
+        assert_eq!(blocks(&g), 16 * 8);
+    }
+    #[test]
+    fn a_fault_takes_the_folio_its_mapping_fits_and_advises() {
+        let fs = mounted(Huge::Advise, 0);
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        f.truncate(4 << 20).unwrap();
+        assert_eq!(f.fault(0, 9, None), Ok(()));
+        assert_eq!(blocks(&f), 8);
+        assert_eq!(f.fault(2 << 20, 9, Some(true)), Ok(()));
+        assert_eq!(blocks(&f), (1 + 512) * 8);
+        let always = mounted(Huge::Always, 0);
+        let g = always.open(b"/a", 66, 0o644).unwrap();
+        g.truncate(4 << 20).unwrap();
+        assert_eq!(g.fault(0, 4, None), Ok(()));
+        assert_eq!(blocks(&g), 16 * 8);
+        assert_eq!(g.fault(2 << 20, 9, Some(false)), Ok(()));
+        assert_eq!(blocks(&g), 17 * 8);
+    }
+    #[test]
+    fn a_folio_that_does_not_fit_splits_another_files_past_its_end() {
+        let fs = mounted(Huge::Always, 600);
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        assert_eq!(f.write(b"x"), Ok(1));
+        assert_eq!(blocks(&f), 512 * 8);
+        let g = fs.open(b"/b", 66, 0o644).unwrap();
+        assert_eq!(g.write(&[1; 2 << 20]), Ok(2 << 20));
+        assert_eq!((blocks(&f), blocks(&g)), (8, 512 * 8));
+        // A folio within its file's size stays.
+        let h = fs.open(b"/c", 66, 0o644).unwrap();
+        assert_eq!(h.write(b"z"), Ok(1));
+        assert_eq!(blocks(&h), 8);
+    }
+    #[test]
+    fn fallocate_takes_folios_and_gives_them_back_when_the_range_does_not_fit() {
+        let fs = mounted(Huge::Always, 1024);
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        assert_eq!(f.allocate(0, 4096), Ok(()));
+        assert_eq!(blocks(&f), 512 * 8);
+        let g = fs.open(b"/b", 66, 0o644).unwrap();
+        assert_eq!(g.allocate(0, 1024 * 4096), Err(Errno(28)));
+        assert_eq!(blocks(&g), 0);
+        assert_eq!(g.allocate(0, 1025 * 4096), Err(Errno(28)));
+    }
+    #[test]
+    fn a_page_written_back_or_charged_past_the_size_is_enospc() {
+        let fs = mounted(Huge::Never, 1);
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        f.truncate(3 * 4096).unwrap();
+        assert_eq!(f.charge(0, 4096), Ok(()));
+        assert_eq!(f.charge(4096, 4096), Err(Errno(28)));
+        assert_eq!(f.write_back(2 * 4096, b"x"), Err(Errno(28)));
+        assert_eq!(f.write_back(0, b"x"), Ok(()));
+        assert_eq!(f.fault(4096, 0, None), Err(Errno(28)));
+        // Pages that fit only in part are ENOSPC too.
+        assert_eq!(f.write_back(0, &[1; 2 * 4096]), Err(Errno(28)));
+    }
+}

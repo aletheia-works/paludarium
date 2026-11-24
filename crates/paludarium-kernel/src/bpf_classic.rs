@@ -340,10 +340,13 @@ fn extension(k: u32, out: &mut Vec<Insn>) -> bool {
             out.push(ldx(op::DW, reg::TMP, reg::CTX, field::DEV));
             out.push(jmp_imm(op::JNE, reg::TMP, 0, 1));
             out.push(exit());
-            // `dev->ifindex` and `dev->type`, which no AF_UNIX message
-            // reaches.
-            let size = if which == ad::IFINDEX { op::W } else { op::H };
-            out.push(ldx(size, reg::A, reg::TMP, 0));
+            // `dev->ifindex` and `dev->type`.
+            let (size, at) = if which == ad::IFINDEX {
+                (op::W, 0)
+            } else {
+                (op::H, field::DEV_TYPE)
+            };
+            out.push(ldx(size, reg::A, reg::TMP, at));
         }
         ad::RXHASH => out.push(ldx(op::W, reg::A, reg::CTX, field::HASH)),
         ad::ALU_XOR_X => out.push(alu32_reg(op::XOR, reg::A, reg::X)),
@@ -641,7 +644,7 @@ mod tests {
             maps: &[],
             loads: &BTreeMap::new(),
         };
-        let packet = Packet { data, linear };
+        let packet = Packet::message(data, linear);
         crate::bpf_interp::run(&program, &packet, &mut Quiet).map(|r| r & 0xffff_ffff)
     }
 

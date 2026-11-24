@@ -979,12 +979,15 @@ pub(crate) struct OwnDirectory {
     /// Who owns it at each `fstat`, for a process's directory, as Linux's
     /// `pid_getattr` asks `task_dump_owner` then.
     owner: Option<LiveOwner>,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 /// The owner of a process's directory as it is now.
 pub(crate) type LiveOwner = Arc<dyn Fn() -> (u32, u32) + Send + Sync>;
 impl OwnDirectory {
     pub(crate) fn new(stat: FileStat) -> Self {
         Self {
+            status: Default::default(),
             stat,
             position: Mutex::new(0),
             owner: None,
@@ -1037,9 +1040,11 @@ impl FileHandle for OwnDirectory {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        0o200000
+        self.status.of(0o200000)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }
@@ -1184,6 +1189,8 @@ pub(crate) struct GeneratedFile {
     stat: Option<FileStat>,
     /// The owner its inode has now ([`Owners`]), over `stat`'s.
     owner: Option<Owner>,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 /// The write operation of `comm` of thread `tid` of process `pid`, of
 /// `group`, as Linux's `comm_write`: it renames the thread to the first 15
@@ -1262,6 +1269,7 @@ impl GeneratedFile {
     }
     fn failing_writes(content: Vec<u8>, flags: u32, error: Errno, entry: bool) -> Self {
         Self {
+            status: crate::files::StatusFlags::opened(flags),
             content,
             position: Mutex::new(0),
             write_error: (flags & 3 != 0).then_some(error),
@@ -1339,9 +1347,11 @@ impl FileHandle for GeneratedFile {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        0
+        self.status.of(0)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }
@@ -1538,10 +1548,13 @@ pub(crate) struct PagemapFile {
     position: Mutex<u64>,
     /// Its inode's owner, as `fstat` shows it.
     owner: Owner,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 impl PagemapFile {
     pub(crate) fn open(memory: MemoryView, flags: u32, owner: Owner) -> Self {
         Self {
+            status: crate::files::StatusFlags::opened(flags),
             memory,
             writable: flags & 3 != 0,
             position: Mutex::new(0),
@@ -1623,9 +1636,11 @@ impl FileHandle for PagemapFile {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        0
+        self.status.of(0)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }
@@ -1650,10 +1665,13 @@ pub(crate) struct ClearRefsFile {
     writable: bool,
     /// Its inode's owner, as `fstat` shows it.
     owner: Owner,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 impl ClearRefsFile {
     pub(crate) fn open(memory: CurrentMemory, flags: u32, owner: Owner) -> Self {
         Self {
+            status: crate::files::StatusFlags::opened(flags),
             memory,
             access: flags & 3,
             readable: flags & 3 != 1,
@@ -1755,9 +1773,11 @@ impl FileHandle for ClearRefsFile {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        self.access
+        self.status.of(self.access)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }

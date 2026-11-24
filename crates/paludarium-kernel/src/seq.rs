@@ -81,10 +81,13 @@ pub(crate) struct SeqFile {
     /// ([`crate::proc::Owners`]).
     owner: Option<crate::proc::Owner>,
     state: Mutex<State>,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 impl SeqFile {
     pub(crate) fn open(records: Box<dyn Records>, flags: u32) -> Self {
         Self {
+            status: crate::files::StatusFlags::opened(flags),
             records,
             access: flags & 3,
             writable: flags & 3 != 0,
@@ -311,9 +314,11 @@ impl FileHandle for SeqFile {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        self.access
+        self.status.of(self.access)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }

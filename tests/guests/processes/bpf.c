@@ -1641,6 +1641,8 @@ static void anon_inode(int fd, void *at) {
     int efd = eventfd(0, EFD_CLOEXEC), pfd = epoll_create1(EPOLL_CLOEXEC);
     if (efd < 0 || pfd < 0 || fstat(fd, &map) || fstat(efd, &event) || fstat(pfd, &poll)) {
         say("anon inode %d", -errno);
+        if (efd >= 0) close(efd);
+        if (pfd >= 0) close(pfd);
         return;
     }
     unsigned long start, inode = 0;

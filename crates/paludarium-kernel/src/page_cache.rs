@@ -730,20 +730,19 @@ impl paludarium_mmu::PageSource for FilePages {
         Arc::as_ptr(&self.file).cast::<()>() as usize
     }
     /// A `memfd_secret` page charges its creator; a page of a shmem file (a
-    /// memfd) that neither the file nor its page cache holds yet becomes
-    /// the file's own, as `shmem_fault` allocates and charges its folio for
-    /// a read fault too, and a failure to (`ENOSPC`) makes the fault a
-    /// `SIGBUS`. A page the cache has is one Linux's page cache has, so
-    /// charged already: one a `userfaultfd` filled reaches the file when it
-    /// is written back.
-    fn admit(&self, offset: u64) -> bool {
+    /// memfd, a tmpfs mount's file) that neither the file nor its page
+    /// cache holds yet becomes the file's own, as `shmem_fault` allocates
+    /// and charges its folio for a read fault too (a large one where the
+    /// mount's `huge=` and `fit` allow), and a failure to (`ENOSPC`) makes
+    /// the fault a `SIGBUS`. A page the cache has is one Linux's page cache
+    /// has, so charged already, as a `userfaultfd` fill charges its page.
+    fn admit(&self, offset: u64, fit: paludarium_mmu::HugeFit) -> bool {
         if let Some(charge) = &self.charge {
             return charge.admit(offset);
         }
         !self.shmem()
-            || self.holds(offset)
             || self.cache.pages.contains(offset)
-            || self.file.allocate(offset, PAGE_SIZE).is_ok()
+            || self.file.fault(offset, fit.order, fit.advised).is_ok()
     }
     fn secret(&self) -> bool {
         self.secret
@@ -752,10 +751,11 @@ impl paludarium_mmu::PageSource for FilePages {
     fn shmem(&self) -> bool {
         !self.secret && self.file.shmem_pages()
     }
-    /// A memfd's holes that `MADV_COLLAPSE` fills are its own pages then.
+    /// A shmem file's holes that `MADV_COLLAPSE` or a `userfaultfd` fills
+    /// are its own pages then.
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         if self.shmem() {
-            self.file.allocate(offset, len)
+            self.file.charge(offset, len)
         } else {
             Ok(())
         }
@@ -1280,6 +1280,12 @@ impl FileHandle for CoherentFile {
     }
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         self.inner.allocate(offset, len)
+    }
+    fn charge(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        self.inner.charge(offset, len)
+    }
+    fn fault(&self, offset: u64, order: u8, advised: Option<bool>) -> Result<(), Errno> {
+        self.inner.fault(offset, order, advised)
     }
     fn write_back(&self, offset: u64, buf: &[u8]) -> Result<(), Errno> {
         self.inner.write_back(offset, buf)

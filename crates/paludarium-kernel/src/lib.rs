@@ -98,6 +98,8 @@ mod sockets;
 mod syscalls;
 mod sysctl;
 mod syslog;
+#[cfg(test)]
+mod tasks_tests;
 mod tcp_info;
 mod threads;
 mod timerfd;

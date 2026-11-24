@@ -322,6 +322,12 @@ impl FileHandle for Memfd {
         }
         self.file.allocate(offset, len)
     }
+    fn charge(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        self.file.charge(offset, len)
+    }
+    fn fault(&self, offset: u64, order: u8, advised: Option<bool>) -> Result<(), Errno> {
+        self.file.fault(offset, order, advised)
+    }
     /// A shared mapping's pages reach the file whatever the seals, as the
     /// mapping existed before them or was made read-only by them.
     fn write_back(&self, offset: u64, buf: &[u8]) -> Result<(), Errno> {

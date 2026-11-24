@@ -118,7 +118,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX sockets (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX and UDP sockets (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -540,6 +540,10 @@ kernel.
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+  `F_SETFL` changes only `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`, `O_NOATIME`
+  and, on a file that signals, `O_ASYNC`; the access mode and the other
+  flags stay, as Linux's `setfl` keeps them. BPF maps and programs still
+  ignore it.
 
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
   reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,
@@ -551,6 +555,14 @@ kernel.
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
   `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
+
+- `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`
+  check them. `O_DIRECT` needs a regular file of a disk file system or
+  tmpfs, or a memfd opened again by a path (`EINVAL` for a directory, a
+  device, a FIFO, a socket, an anonymous inode or a file of `/proc`);
+  `F_SETFL` also takes it on a pipe or FIFO. `O_NOATIME` needs the file's
+  owner or `CAP_FOWNER` (`EPERM`), at `open` and when `F_SETFL` newly
+  sets it.
 
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
   locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a descriptor table owns (a
@@ -1987,8 +1999,18 @@ kernel.
   for none left), which an unlinked file still open keeps until its last
   close; a remount changes the limits. Its files, and those of `/dev/shm`,
   are shmem's: a fault of a mapping of one brings its page in (a `SIGBUS`
-  past the size), `userfaultfd` registers their mappings and
-  `MADV_COLLAPSE` takes them, as for a memfd. The files are held as `shmem`
+  past the size), `userfaultfd` registers their mappings, a fill of one
+  of their pages past the size is `ENOMEM`, and `MADV_COLLAPSE` takes
+  them, as for a memfd. With `huge=always`, `within_size` or `advise`, a
+  page that a write, a fault or `fallocate` brings in comes with a large
+  folio's others, as `shmem_get_folio_gfp` takes one: the largest aligned
+  extent of up to 512 pages in which the file has no page yet, which for
+  `within_size` the size or the write's end covers and for `advise` lies
+  in a mapping `MADV_HUGEPAGE` advised, and which a fault's mapping holds
+  at offsets aligned as its addresses are, unless it was advised
+  `MADV_NOHUGEPAGE`. It is charged whole, after the large folio at the
+  end of a file that runs past its end is split to make room
+  (`shmem_unused_huge_shrink`), or else the page alone. The files are held as `shmem`
   counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,
@@ -3251,7 +3273,8 @@ kernel.
     traffic class, and while listening or closed its `IPV6_V6ONLY`, its
     mark to `CAP_NET_ADMIN`, its priority as its class, its cgroup, its
     options (`inet_diag_sockopt`), its memory (a UDP socket's datagrams
-    charged in pages, as `udp_rmem_schedule` does, its buffers, and a
+    charged in pages, as `udp_rmem_schedule` does, its buffers, a UDP
+    socket's datagrams that its filter or its full buffer dropped, and a
     listener's handshakes that a full queue dropped), a TCP socket's
     `tcp_info` (`INET_DIAG_INFO`, which `ss -i` shows), and its
     congestion control (`cubic`). A hold in `TIME_WAIT` tells
@@ -3669,9 +3692,11 @@ kernel.
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
   has the same files but `task`, of that thread: its name, its signal masks,
-  its ID as `Pid` with the process's as `Tgid`, and its own
-  `voluntary_ctxt_switches` (the times it went to sleep; the process's
-  `status` shows the leader's, as Linux's `task_context_switch_counts`). A
+  its ID as `Pid` with the process's as `Tgid`, its own credentials (the
+  process's `status`, `/proc/self/status` too, shows the leader's, as Linux's
+  `proc_pid_status`), and its own `voluntary_ctxt_switches` (the times it
+  went to sleep; the process's `status` shows the leader's, as Linux's
+  `task_context_switch_counts`). A
   leader that ended before the other threads stays first in `task` as a
   zombie, `Z` in its `stat` and `status`, and `Threads` and `num_threads`
   count it until the process ends, as Linux keeps a delayed group leader.
@@ -4367,8 +4392,10 @@ kernel.
   and in the kernel's accesses for it: a system call's copies, a signal
   frame, an `rseq` area's update), each as it is taken, and the faults of the reads and writes
   through `get_user_pages` made for it, which `perf` does not count:
-  `mlock`'s population, a tracer's `PTRACE_PEEKDATA` and `PTRACE_POKEDATA`
-  (counted to the tracer) and a core dump's (which leaves anonymous memory
+  `mlock`'s, `mlockall`'s and `MAP_POPULATE`'s population,
+  `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`, `process_vm_readv` and
+  `process_vm_writev` (counted to the caller), a tracer's `PTRACE_PEEKDATA`
+  and `PTRACE_POKEDATA` (counted to the tracer) and a core dump's (which leaves anonymous memory
   never touched a hole, with no fault). `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts
@@ -4660,7 +4687,10 @@ kernel.
   too and never given back, as in Linux master. The mapping is not copied
   to a `fork`ed child nor held in a core dump (`VM_DONTCOPY`,
   `VM_DONTDUMP`), and keeps the event counting though its descriptors are
-  closed; its last unmapping frees the buffer and its charges. The user
+  closed; its last unmapping frees the buffer and its charges. It is a
+  mapping of the event's file, which `/proc/<pid>/maps` and the `MMAP2`
+  records name `anon_inode:[perf_event]` with the device and inode its
+  descriptor's `fstat` gives, the anonymous inodes' one. The user
   page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
   offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
   index 0, and the count and times enabled and running between two bumps
@@ -5139,6 +5169,45 @@ kernel.
     instructions as attached and their number in `*len`, in blocks: a
     `*len` of 0 only asks for it, and one short of it is `EINVAL`.
   - `SO_BPF_EXTENSIONS` gives 64 (`SKF_AD_MAX`).
+
+- On a UDP socket, IPv4 or IPv6, a filter takes the same options and runs
+  on each datagram that comes to it through the loopback or a veth pair, as
+  Linux's `udp_queue_rcv_one_skb` and `udpv6_queue_rcv_one_skb` run
+  `sk_filter_trim_cap`: before the receive buffer's check, so that a
+  datagram it drops is never queued. 0 drops it, and any other value keeps
+  that many bytes from the UDP header on, the header always: what is
+  received (and `FIONREAD`) is the rest. The datagram takes of the receive
+  buffer what it took as it came. A drop, the filter's or the full
+  buffer's, counts in `sk_drops` (`INET_DIAG_SKMEMINFO`). The filter runs
+  on the `sk_buff` Linux 7.0 makes:
+  - `skb->data` is at the UDP header, with the IP header before it
+    (`SKF_NET_OFF`, `BPF_HDR_START_NET`) and the MAC header before that
+    (`SKF_LL_OFF`, `BPF_HDR_START_MAC`): the loopback's Ethernet header of
+    zeros, a veth end's from its address to its peer's (or to the
+    broadcast address), and for a broadcast's copy looped back on the
+    sending end (`dev_loopback_xmit`) the network header itself.
+    `BPF_LD_ABS` and `BPF_LD_IND` from a header reach the datagram's end;
+    `bpf_skb_load_bytes_relative` the linear part's, which is the whole
+    datagram unless
+    `__ip_append_data` or `__ip6_append_data` puts it in pages (past
+    `SKB_MAX_ALLOC` with the headers and the room they reserve), when it is
+    the UDP header's.
+  - The IPv4 header has `IP_TOS`, `DF`, a TTL of 64 and a connected
+    socket's IDs from the random one `connect` gives (else a random one);
+    the IPv6 header a hop limit of 64 and the auto flow label of the
+    datagram's hash. The UDP checksum is the pseudo-header's, as the device
+    takes the rest (`CHECKSUM_PARTIAL`), or the whole one for a datagram
+    that goes in fragments.
+  - The context's `len` is the UDP header's and the payload's; `protocol`
+    is `ETH_P_IP` or `ETH_P_IPV6`; `pkt_type` `PACKET_HOST`,
+    `PACKET_BROADCAST` or `PACKET_LOOPBACK`; `ifindex` and
+    `ingress_ifindex` the loopback's (1) or the veth end it came in on;
+    `priority` the sender's `SO_PRIORITY`, or 0 across a veth pair
+    (`____dev_forward_skb`); `hash` a connected socket's `sk_txhash`, the
+    flow's for IPv6, else 0; the rest 0. Classic loads see the same, with
+    `SKF_AD_HATYPE` `ARPHRD_LOOPBACK` or `ARPHRD_ETHER` and
+    `SKF_AD_PAY_OFFSET` 8. The helpers run as the sending task, in whose
+    context Linux's softirq runs the receive.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it

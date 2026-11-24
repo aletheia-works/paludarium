@@ -1049,6 +1049,7 @@ pub(crate) fn open(
     }
     let net_admin = writers.net_admin(credentials);
     Ok(Arc::new(SettingFile {
+        status: crate::files::StatusFlags::opened(flags),
         value,
         admin: credentials.capable(crate::credentials::CAP_SYS_ADMIN),
         net_admin,
@@ -1394,6 +1395,8 @@ struct SettingFile {
     stat: FileStat,
     position: Mutex<u64>,
     flags: u32,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
 }
 
 impl SettingFile {
@@ -1497,9 +1500,11 @@ impl FileHandle for SettingFile {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        self.flags
+        self.status.of(self.flags)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
         Ok(())
     }
 }

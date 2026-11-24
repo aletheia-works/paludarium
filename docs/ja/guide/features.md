@@ -100,7 +100,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX のソケットにアタッチします（下を参照） |
+| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX と UDP のソケットにアタッチします（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -479,6 +479,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `O_DIRECTORY`、`O_NOFOLLOW`、`O_PATH` だけを持ちます。パイプ、ソケット、カーネル
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
+  `F_SETFL` が変えるのは `O_APPEND`、`O_NONBLOCK`、`O_DIRECT`、`O_NOATIME` と、
+  シグナルを送れるファイルでの `O_ASYNC` だけで、アクセスモードとほかのフラグは
+  Linux の `setfl` と同じく残ります。BPF のマップとプログラムは、まだこれを無視します。
 
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
   読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`splice`、`tee`、`vmsplice`、`fsync`、
@@ -487,6 +490,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
   `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
   `close` は受け付け、`*at` の呼び出しではディレクトリになります。
+
+- `O_DIRECT` と `O_NOATIME` は、Linux の `open` と `F_SETFL` と同じく確かめます。
+  `O_DIRECT` には、ディスクのファイルシステムか tmpfs の通常のファイル、またはパスで開き直した
+  memfd が要ります（ディレクトリ、デバイス、FIFO、ソケット、匿名 inode、`/proc` のファイルは
+  `EINVAL`）。`F_SETFL` はパイプと FIFO の `O_DIRECT` も受け付けます。`O_NOATIME` には、
+  `open` のときと `F_SETFL` で新たに付けるときに、ファイルの所有者か `CAP_FOWNER` が要ります
+  （`EPERM`）。
 
 - `fcntl` のバイト範囲のロックを、Linux の `fs/locks.c` と同じく扱います。記述子の表
   （Linux の `files_struct` と同じく、プロセスのもので、そのスレッドと `CLONE_FILES` で
@@ -1740,8 +1750,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   超える最初のページで止まり（短い書き込み。何も入らなければ `ENOSPC`）、`fallocate` は
   範囲をすべて割り当てるか何も割り当てません（`ENOSPC`）。そのファイルと `/dev/shm` の
   ファイルは shmem のもので、マッピングのフォールトはページを持ち込み（大きさを超えれば
-  `SIGBUS`）、`userfaultfd` はそのマッピングを登録し、`MADV_COLLAPSE` はまとめます。
-  memfd と同じです。長いシンボリックリンク
+  `SIGBUS`）、`userfaultfd` はそのマッピングを登録し、大きさを超えるページを埋めると
+  `ENOMEM` で、`MADV_COLLAPSE` はまとめます。memfd と同じです。`huge=always`、
+  `within_size`、`advise` では、書き込み、フォールト、`fallocate` が持ち込むページは、
+  `shmem_get_folio_gfp` と同じく大きな folio のほかのページとともに来ます。ファイルが
+  まだページを持たない、そろった 512 ページまでのいちばん大きな区間で、`within_size` では
+  大きさか書き込みの終わりが覆うもの、`advise` では `MADV_HUGEPAGE` を受けたマッピングの
+  もの、フォールトではマッピングがアドレスと同じくそろったオフセットで持つもの
+  （`MADV_NOHUGEPAGE` を受けていないもの）です。まとめて数え、入らなければ、終わりを
+  越えるファイルの終わりの大きな folio を分けて場所を空けてから
+  （`shmem_unused_huge_shrink`）、だめならそのページだけを数えます。長いシンボリックリンク
   （127 バイトを超えるもの）は 1 ページを使い、新しい inode とファイルの 2 つめ以降の
   名前（`link`）はそれぞれ inode を 1 つ使います（残っていなければ `ENOSPC`）。消した
   けれどまだ開いているファイルは、最後に閉じるまでその分を持ちます。マウントし直すと
@@ -2809,7 +2827,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     クラス、待ち受け中か閉じていれば `IPV6_V6ONLY` を伝えます。続けて、`CAP_NET_ADMIN`
     にはマーク、クラスとして優先度、cgroup、オプション（`inet_diag_sockopt`）、メモリ
     （UDP のソケットのデータグラムは `udp_rmem_schedule` と同じくページ単位で数えたもの、
-    バッファー、リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの
+    バッファー、UDP のソケットのフィルターかいっぱいのバッファーが落としたデータグラムの数、
+    リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの
     `tcp_info`（`ss -i` が見せる `INET_DIAG_INFO`）と輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
     については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
@@ -3181,8 +3200,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
   `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` 以外の同じファイルが
   あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
-  プロセスの ID、スレッド自身の `voluntary_ctxt_switches`。眠った回数で、プロセスの
-  `status` は Linux の `task_context_switch_counts` と同じくリーダーのものを示します）を
+  プロセスの ID、スレッド自身の資格情報（プロセスの `status` は `/proc/self/status` も
+  含め、Linux の `proc_pid_status` と同じくリーダーのものを示します）、スレッド自身の
+  `voluntary_ctxt_switches`。眠った回数で、プロセスの `status` は Linux の
+  `task_context_switch_counts` と同じくリーダーのものを示します）を
   示します。ほかのスレッドより先に終わったリーダーは、Linux が遅れたグループリーダーを残す
   のと同じく、プロセスが終わるまでゾンビとして `task` の先頭に残り、`stat` と `status` では
   `Z` で、`Threads` と `num_threads` にも数えます。そのリーダーには、Linux の `exit_mm`、
@@ -3789,7 +3810,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピングのページに書いたとき（自身のコードでも、システムコールのコピーやシグナル
   フレーム、`rseq` の領域の更新のようなカーネルのアクセスでも。起きたときに数えます）と、
   `get_user_pages` がそのスレッドのために読み書きしてフォールトしたときです。後者は
-  `perf` は数えません。`mlock` が取り込むとき、トレーサーの `PTRACE_PEEKDATA` と
+  `perf` は数えません。`mlock`、`mlockall`、`MAP_POPULATE` が取り込むとき、
+  `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE`、`process_vm_readv` と
+  `process_vm_writev`（呼び出し元に数えます）、トレーサーの `PTRACE_PEEKDATA` と
   `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（一度も触れていない無名メモリは
   穴として残し、フォールトしません）です。`RUSAGE_SELF` はプロセスのスレッドの合計、
   `RUSAGE_THREAD` はそのスレッドのもの、`RUSAGE_CHILDREN` と wait は CPU 時間と同じく
@@ -4039,7 +4062,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   master と同じくユーザーに課され、返されません。マッピングは `fork` した子に写されず、
   コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ディスクリプタが閉じられても
   イベントを数え続けさせます。最後にアンマップされると、バッファと課したものは
-  なくなります。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
+  なくなります。これはイベントのファイルのマッピングで、`/proc/<pid>/maps` と `MMAP2`
+  の記録は、ディスクリプタの `fstat` が示すデバイスと inode（無名 inode のもの）を付けて
+  `anon_inode:[perf_event]` と示します。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
   `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
   `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
   数と有効な時間と動いた時間があります。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに
@@ -4433,6 +4458,40 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ブロック単位で `*len` に返します。`*len` が 0 なら数だけを問い合わせ、足りなければ
     `EINVAL` です。
   - `SO_BPF_EXTENSIONS` は 64（`SKF_AD_MAX`）を返します。
+
+- UDP のソケット（IPv4 と IPv6）でも、フィルターは同じオプションを取り、ループバックか
+  veth ペアを通って届くデータグラムごとに、Linux の `udp_queue_rcv_one_skb` と
+  `udpv6_queue_rcv_one_skb` が `sk_filter_trim_cap` を動かすのと同じく動きます。受信
+  バッファの確認の前なので、捨てたデータグラムはキューに入りません。0 なら捨て、それ以外の
+  値なら UDP ヘッダから数えてその数のバイトを残し、ヘッダはいつも残します。受け取るもの
+  （と `FIONREAD`）はその残りです。データグラムは、届いたときの大きさの分だけ受信
+  バッファを使います。フィルターによるものも、バッファがいっぱいなためのものも、捨てた
+  数は `sk_drops`（`INET_DIAG_SKMEMINFO`）に数えます。フィルターは Linux 7.0 が作る
+  `sk_buff` の上で動きます。
+  - `skb->data` は UDP ヘッダにあり、その前に IP ヘッダ（`SKF_NET_OFF`、
+    `BPF_HDR_START_NET`）、さらにその前に MAC ヘッダ（`SKF_LL_OFF`、
+    `BPF_HDR_START_MAC`）があります。MAC ヘッダは、ループバックではゼロの Ethernet
+    ヘッダ、veth の端ではそのアドレスから相手のアドレス（かブロードキャストアドレス）への
+    もの、送った端で折り返すブロードキャストの写し（`dev_loopback_xmit`）ではネットワーク
+    ヘッダそのものです。ヘッダからの `BPF_LD_ABS` と `BPF_LD_IND` はデータグラムの終わり
+    まで、`bpf_skb_load_bytes_relative` は線形部分の終わりまで届きます。線形部分は
+    データグラム全体ですが、`__ip_append_data` か `__ip6_append_data` がページに置く
+    とき（ヘッダと確保する余白を合わせて `SKB_MAX_ALLOC` を超えるとき）は UDP ヘッダの
+    終わりまでです。
+  - IPv4 のヘッダには `IP_TOS`、`DF`、64 の TTL と、接続したソケットなら `connect` が
+    決める乱数から続く ID（ほかは乱数）が入ります。IPv6 のヘッダには 64 のホップ限度と、
+    データグラムのハッシュから作る自動のフローラベルが入ります。UDP のチェックサムは、
+    残りをデバイスが計算する擬似ヘッダの分だけ（`CHECKSUM_PARTIAL`）で、フラグメントに
+    分けて送るデータグラムでは全体のものです。
+  - コンテキストの `len` は UDP ヘッダとペイロードの長さ、`protocol` は `ETH_P_IP` か
+    `ETH_P_IPV6`、`pkt_type` は `PACKET_HOST`、`PACKET_BROADCAST` か
+    `PACKET_LOOPBACK`、`ifindex` と `ingress_ifindex` はループバック（1）か、届いた veth
+    の端、`priority` は送り手の `SO_PRIORITY` で、veth ペアを越えると 0
+    （`____dev_forward_skb`）、`hash` は接続したソケットの `sk_txhash`、IPv6 ではフロー
+    のもの、ほかは 0 で、残りは 0 です。古典的な読み出しも同じものを見て、`SKF_AD_HATYPE`
+    は `ARPHRD_LOOPBACK` か `ARPHRD_ETHER`、`SKF_AD_PAY_OFFSET` は 8 です。ヘルパーは
+    送ったタスクとして動きます。Linux のソフト割り込みが受信をそのコンテキストで動かすため
+    です。
 
 - 古典的なフィルター（`SO_ATTACH_FILTER`、`struct sock_fprog`。ほかの大きさは `EINVAL`）は、
   Linux の `bpf_check_classic` と同じく確かめ、`bpf_convert_filter` と同じく命令ごとに

@@ -136,7 +136,11 @@ verified.
   commit 6b1c66c9 ("exec_state: relocate dumpable information"). From 7.2,
   `task_dump_owner` takes the owner from the dumpable flag in `exec_state`,
   which outlives the memory, so those files stay the task's and their open
-  is `ESRCH`; paludarium follows that once the runners run 7.2 or later.
+  is `ESRCH`; paludarium follows that once the runners run 7.2 or later, and
+  the `gone-leader-files` case and the unit test
+  `a_task_without_memory_has_its_files_owned_by_root` change with it. A
+  zombie process has no `ns` links yet, where Linux's `pid` and `user` links
+  still resolve (`pidns_get` and `userns_get` need no `nsproxy`).
   `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
@@ -165,6 +169,13 @@ verified.
   no device for it to stand for. A FIFO in a mounted host directory can be
   made on Linux hosts only, and connects only the guest's own openers, not
   host programs that open the same node.
+- **A pipe's packet mode**: `F_SETFL` takes `O_DIRECT` on a pipe or FIFO,
+  as Linux does, but the emulator has no packet mode: its writes are not
+  kept apart as packets, and `F_GETFL` does not show `O_DIRECT`.
+- **`O_DIRECT`'s alignment**: a read or write of a file opened with
+  `O_DIRECT` goes through as any other. On a disk file system such as
+  ext4, Linux refuses a buffer, offset or length that is not aligned to its
+  block size (`EINVAL`); the emulator does not.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.
@@ -278,9 +289,7 @@ verified.
   these faults are no `perf` event. No fault is major (`ru_majflt` is 0),
   as every page of a file is taken to be in the page cache. A core dump's faults count to the
   last thread to exit, where Linux counts them to the thread that dumps.
-  `process_vm_readv`, `process_vm_writev`, `MADV_POPULATE_READ` and
-  `MADV_POPULATE_WRITE` count their faults in `perf`'s `page-faults` too,
-  where Linux's `get_user_pages` gives no `perf` event. `/proc/<pid>/stat`'s
+  `/proc/<pid>/stat`'s
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
@@ -337,12 +346,9 @@ verified.
   given another protection, where Linux refuses to split it (`EINVAL`); and
   `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
   (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
-  mapping unlocked. `/proc/<pid>/maps` does not yet name the mapping
-  `anon_inode:[perf_event]` with the anonymous inodes' device and inode, as
-  Linux does (it shows no name, device or inode), and the `MMAP` records
-  are not yet checked against what Linux writes of it. `inherit_stat` is taken, but an
-  inherited event's end sends no read record, as nothing is recorded. An
-  event of a task on one CPU counts on any, and the cgroup mode
+  mapping unlocked. `inherit_stat` is taken, but an inherited event's end
+  sends no read record, as nothing is recorded. An event of a task on one
+  CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
@@ -366,12 +372,18 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps and socket filters on AF_UNIX sockets only**: `bpf` makes
+- **BPF, maps and socket filters on AF_UNIX and UDP sockets only**: `bpf` makes
   arrays, hashes, LRU hashes, longest-prefix-match tries, queues, stacks,
   bloom filters, and arrays and hashes of maps, and loads socket filters,
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
-  or packet socket; on an internet socket the options are `ENOPROTOOPT`.
+  or packet socket and on a UDP socket. A TCP socket takes the options as
+  Linux does, but its filter does not run yet. On a UDP socket no
+  filter runs on the DNS stub's answers, which come through no device
+  here; a datagram that Linux sends in fragments across a veth pair comes
+  whole, though its filter sees the reassembled one's linear part and
+  checksum; the IPv4 ID, the IPv6 flow label and `skb->hash` are random,
+  as on Linux, but not drawn as Linux draws them.
   No JIT compiles a program: the interpreter runs it. Of the helpers'
   values, the processor is 0, a network namespace's cookie is 1 (the
   initial one's) in every namespace, the boot and coarse clocks are the
@@ -854,11 +866,18 @@ verified.
   `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
   `nr_blocks` and `nr_inodes`, and a page a fault brings into a file of a
   tmpfs mount or a memfd counts in its blocks, as `shmem_fault` charges
-  it, one past the mount's size being a `SIGBUS`. Not yet charged that way
-  are the pages `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills, which go back to
-  the file whatever its size (no `ENOMEM` past it); a mount whose `huge=`
-  is not `never` charges a page at a time, where Linux takes a huge page
-  whole; and the pages `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring
+  it, one past the mount's size being a `SIGBUS`, with a large folio's
+  others on a mount with `huge=`. Not yet so: `mmap` places a mapping of
+  such a file where it would place any (`shmem_get_unmapped_area` puts
+  one of 2 MiB or more at a 2 MiB boundary), so only a mapping a program
+  places itself takes 2 MiB folios on a fault; a large folio is mapped a
+  page at a time, so `/proc/<pid>/smaps` and `/proc/meminfo` count no
+  `ShmemPmdMapped`, `FilePmdMapped` or `ShmemHugePages` for it and a
+  fault maps (and counts in `Rss`) only the pages around it, not the whole
+  folio; a large folio always comes, where Linux
+  takes a smaller one when memory has no free extent so large; and none
+  is split under memory pressure but to make room for another. The pages
+  `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring
   into a shared mapping count only once touched. Its extended attributes
   take none of the inodes' room (`ENOSPC` from `setxattr` past it, as
   `shmem_xattr_handler_set` counts them, does not happen); the root from
@@ -867,7 +886,7 @@ verified.
   flags, `sync`, `dirsync` and `mand`; no mount here holds a
   device node but a host directory's (`mknod` of one is `EPERM`), so
   `nodev` only refuses those;
-  `huge`, `mpol`, `noswap` and the quota options are taken, checked as
+  `mpol`, `noswap` and the quota options are taken, checked as
   Linux checks them (a remount that turns on `noswap` or quotas, or
   changes a quota limit, is `EINVAL`) and shown, but do nothing, and
   `casefold` and `strict_encoding` are `EINVAL`, as from a
@@ -958,8 +977,6 @@ verified.
   a file before it runs it under `SECBIT_EXEC_RESTRICT_FILE`, is `EINVAL`:
   the securebits for those checks are kept and shown, but nothing here acts
   on them.
-  `/proc/self/status` shows the calling thread's credentials, where Linux
-  shows the thread group leader's.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
   these differences:
@@ -967,8 +984,8 @@ verified.
     socket goes, where Linux's garbage collector closes them a little
     later, from a work queue.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
-  whose effect is not modelled, where Linux takes them: filters and the
-  other options Linux has. No security module is modelled, so `SO_PASSSEC`
+  whose effect is not modelled, where Linux takes them: filters on sockets
+  other than AF_UNIX and internet ones, and the other options Linux has. No security module is modelled, so `SO_PASSSEC`
   brings no `SCM_SECURITY` and `SO_PEERSEC` is `ENOPROTOOPT`, as on a Linux
   without one; with SELinux, Linux gives the sender's or peer's context, and
   with AppArmor `SO_PEERSEC` gives the peer's label. `SO_RCVTIMEO` and
@@ -1381,6 +1398,12 @@ verified.
   never for a third time. It retries nothing else, no test and no result, and
   each retry is logged with its error and timing. These failures come and go,
   so a run that passes does not show they are gone.
+- Ending a WebDriver session leaves running the Safari that safaridriver
+  launched for it. So after each session, and after a failed request for one,
+  the test driver asks each Safari that was not running before the request to
+  quit, and waits up to 15 seconds for it to exit. A Safari already running,
+  such as your own, is never asked. A Safari that does not quit is logged, not
+  killed.
 
 ## Found a problem?
 

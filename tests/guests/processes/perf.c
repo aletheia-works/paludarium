@@ -39,6 +39,7 @@
 #include <sys/sysmacros.h>
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -570,6 +571,56 @@ static int case_software(void) {
     } else {
         say("fewer than two cpus");
     }
+    return 0;
+}
+
+/* The perf-gup case: a fault through get_user_pages (handle_mm_fault with
+   no registers) counts to the task's min_flt and is no perf event. Each
+   step brings 32 fresh pages in: MADV_POPULATE_READ, MADV_POPULATE_WRITE,
+   MAP_POPULATE, mlock, process_vm_readv and process_vm_writev. */
+static long thread_minflt(void) {
+    struct rusage usage;
+    getrusage(RUSAGE_THREAD, &usage);
+    return usage.ru_minflt;
+}
+
+static char *fresh_pages(int pages) {
+    return mmap(NULL, (size_t)pages * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+
+static void gup_step(const char *name, int faults, int step, char *pages, char *local) {
+    uint64_t before = count(faults);
+    long minflt = thread_minflt();
+    long result = 0;
+    struct iovec mine = {local, 32 * 4096}, theirs = {pages, 32 * 4096};
+    switch (step) {
+    case 0: result = TRY(madvise(pages, 32 * 4096, 22 /* MADV_POPULATE_READ */)); break;
+    case 1: result = TRY(madvise(pages, 32 * 4096, 23 /* MADV_POPULATE_WRITE */)); break;
+    case 2:
+        pages = mmap(NULL, 32 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        result = pages == MAP_FAILED ? -errno : 0;
+        break;
+    case 3: result = TRY(mlock(pages, 32 * 4096)); break;
+    case 4: result = TRY(syscall(SYS_process_vm_readv, getpid(), &mine, 1, &theirs, 1, 0)); break;
+    case 5: result = TRY(syscall(SYS_process_vm_writev, getpid(), &mine, 1, &theirs, 1, 0)); break;
+    }
+    uint64_t events = count(faults) - before;
+    long counted = thread_minflt() - minflt;
+    say("%s %ld: min_flt %d perf %d", name, result, counted >= 32, events <= 4);
+}
+
+static int case_gup(void) {
+    int faults = open_software(2, 0);
+    say("open %d", faults >= 0);
+    /* The local side of process_vm's copies has its frames already. */
+    char *local = fresh_pages(32);
+    memset(local, 1, 32 * 4096);
+    gup_step("populate read", faults, 0, fresh_pages(32), local);
+    gup_step("populate write", faults, 1, fresh_pages(32), local);
+    gup_step("map populate", faults, 2, NULL, local);
+    gup_step("mlock", faults, 3, fresh_pages(32), local);
+    gup_step("process_vm_readv", faults, 4, fresh_pages(32), local);
+    gup_step("process_vm_writev", faults, 5, fresh_pages(32), local);
     return 0;
 }
 
@@ -1256,13 +1307,16 @@ static int case_throttle(void) {
 /* What the cases compare the records with. */
 struct expected {
     pid_t pid, tid, child, parent;
-    char *anon, *exec_at, *shm, *heap, *shared;
+    char *anon, *exec_at, *shm, *heap, *shared, *ring;
     size_t anon_len;
     const char *path, *self;
     struct stat file;
     /* The device and inode /proc/self/maps gives the shared mapping. */
     unsigned shared_major, shared_minor;
     unsigned long shared_inode;
+    /* The same of another event's ring buffer. */
+    unsigned ring_major, ring_minor;
+    unsigned long ring_inode;
     int mmap_records;
 };
 
@@ -1280,6 +1334,26 @@ static int maps_identity(const char *at, unsigned *major_, unsigned *minor_, uns
     }
     fclose(maps);
     return found;
+}
+
+/* Whether the line of the mapping at `at` in /proc/self/maps names it
+   `name`. */
+static int maps_names(const char *at, const char *name) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512];
+    int named = 0;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long start;
+        int path = 0;
+        if (sscanf(line, "%lx-%*x %*s %*x %*x:%*x %*u %n", &start, &path) < 1 || start != (unsigned long)at || !path)
+            continue;
+        line[strcspn(line, "\n")] = 0;
+        named = !strcmp(line + path, name);
+        break;
+    }
+    fclose(maps);
+    return named;
 }
 
 /* An MMAP or MMAP2 record's name, at `words` 64-bit words in. */
@@ -1306,6 +1380,7 @@ static void say_record(const uint64_t *record, void *with) {
         else if (!strcmp(name, "//anon")) what = "anon";
         else if (!strcmp(name, "/dev/zero (deleted)")) what = name;
         else if (!strncmp(name, "/SYSV", 5)) what = name;
+        else if (!strcmp(name, "anon_inode:[perf_event]")) what = name;
         else if (name[0] == '[') what = name;
         say("%s %s data %d ids %d", mmap2 ? "mmap2" : "mmap", what, !!(misc & MISC_DATA),
             ids[0] == (uint32_t)e->pid && ids[1] == (uint32_t)e->tid);
@@ -1326,6 +1401,11 @@ static void say_record(const uint64_t *record, void *with) {
             if (e->shared && at == e->shared)
                 say("  shared device %d inode %d", words[0] == e->shared_major && words[1] == e->shared_minor,
                     *(const uint64_t *)(words + 2) == (uint64_t)e->shared_inode);
+            /* A ring buffer's file: the event's anonymous inode. */
+            if (e->ring && at == e->ring)
+                say("  ring offset %llu len %llu device %d inode %d", (unsigned long long)pgoff,
+                    (unsigned long long)len, words[0] == e->ring_major && words[1] == e->ring_minor,
+                    *(const uint64_t *)(words + 2) == (uint64_t)e->ring_inode);
         }
         e->mmap_records++;
     } else if (type == RECORD_COMM) {
@@ -1391,8 +1471,22 @@ static int case_side_band(void) {
     int status;
     waitpid(child, &status, 0);
     e.child = child;
+    /* Another event's ring buffer, a shared mapping of its file. */
+    struct attr ring_attr = software(9);
+    ring_attr.flags |= DISABLED;
+    int ring = (int)open_event(&ring_attr, 0, -1, -1, 0);
+    void *ring_at = NULL;
+    if (ring >= 0 && map_event(ring, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &ring_at) >= 0) e.ring = ring_at;
     ioctl(fd, IOC_DISABLE, 0);
     ioctl(exec_fd, IOC_DISABLE, 0);
+    /* Its line in /proc/self/maps: the anonymous inode `fstat` gives. */
+    struct stat ring_stat;
+    int ring_found = e.ring && maps_identity(e.ring, &e.ring_major, &e.ring_minor, &e.ring_inode) &&
+                     !fstat(ring, &ring_stat);
+    say("ring in maps %d as fstat %d named %d", ring_found,
+        ring_found && e.ring_major == major(ring_stat.st_dev) && e.ring_minor == minor(ring_stat.st_dev) &&
+            e.ring_inode == (unsigned long)ring_stat.st_ino,
+        ring_found && maps_names(e.ring, "anon_inode:[perf_event]"));
     shmdt(e.shm);
     shmctl(id, IPC_RMID, NULL);
     unlink(path);
@@ -1527,6 +1621,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-prctl")) return case_prctl();
     if (!strcmp(mode, "perf-inherit")) return case_inherit();
     if (!strcmp(mode, "perf-software")) return case_software();
+    if (!strcmp(mode, "perf-gup")) return case_gup();
     if (!strcmp(mode, "perf-mmap")) return case_mmap();
     if (!strcmp(mode, "perf-output")) return case_output();
     if (!strcmp(mode, "perf-sample")) return case_sample();

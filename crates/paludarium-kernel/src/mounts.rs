@@ -1569,6 +1569,7 @@ fn new_tmpfs(
     }
     built_tmpfs(c, options, sb_flags, mount_flags)
 }
+
 /// `do_new_mount` of a BPF file system: its options (`bpf_parse_param`,
 /// after the common superblock flags), CAP_SYS_ADMIN in the caller's user
 /// namespace (`mount_capable`, as it is `FS_USERNS_MOUNT`), then
@@ -1592,6 +1593,7 @@ fn new_bpffs(
     }
     options.built(c, sb_flags, mount_flags)
 }
+
 /// The tmpfs on `/dev/shm` from start-up, as systemd mounts it
 /// (`mount_setup`): `mode=01777`, `nosuid`, `nodev` and `strictatime`, its
 /// root owned by root, with the size and inodes a tmpfs has by default, its

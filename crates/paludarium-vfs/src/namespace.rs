@@ -1597,6 +1597,7 @@ impl NamespacedFs {
         state.read_only.store(new.read_only, Ordering::SeqCst);
         let usage = new.fs.usage();
         usage.set_limits(new.settings.blocks, new.settings.inodes);
+        usage.set_huge(Huge::shown_in(&new.settings.super_options));
         let sb = Arc::new(Superblock {
             memory: Arc::new(new.fs.shared()),
             kind: new.kind,
@@ -2793,6 +2794,7 @@ impl NamespacedFs {
                     let mut settings = lock(&sb.settings);
                     if let Some(new) = configure(Some((&settings, used, files)))? {
                         sb.usage.set_limits(new.blocks, new.inodes);
+                        sb.usage.set_huge(Huge::shown_in(&new.super_options));
                         *settings = new;
                     }
                 }

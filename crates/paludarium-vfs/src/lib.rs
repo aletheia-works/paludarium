@@ -3,9 +3,9 @@
 pub use paludarium_host::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
 use paludarium_types::Errno;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 mod contents;
-use contents::{Contents, Usage};
+use contents::{Contents, Huge, Usage, Vma};
 pub const PATH_MAX: usize = 4096;
 pub const NAME_MAX: usize = 255;
 pub const DEFAULT_MODE: u32 = 0o755;
@@ -394,6 +394,14 @@ impl Drop for Charge {
     }
 }
 impl Node {
+    /// A file's large folio past its end split, what that frees
+    /// ([`Contents::split_end`]).
+    fn split_end(&mut self) -> u64 {
+        match &mut self.kind {
+            Kind::File(contents) => contents.split_end(),
+            _ => 0,
+        }
+    }
     fn stat(&self, id: u64) -> FileStat {
         FileStat {
             inode: id,
@@ -507,9 +515,12 @@ impl Tree {
         let links = if matches!(kind, Kind::Dir(_)) { 2 } else { 1 };
         let id = self.next;
         self.next += 1;
-        self.nodes.insert(
-            id,
-            Arc::new(Mutex::new(Node {
+        let node = Arc::new_cyclic(|me| {
+            let mut kind = kind;
+            if let Kind::File(contents) = &mut kind {
+                contents.set_node(me.clone() as Weak<dyn contents::Shrink>);
+            }
+            Mutex::new(Node {
                 kind,
                 mode,
                 owner: (0, 0),
@@ -520,8 +531,9 @@ impl Tree {
                 mtime_ns,
                 clock: self.clock.clone(),
                 _charge: charge,
-            })),
-        );
+            })
+        });
+        self.nodes.insert(id, node);
         Ok(id)
     }
     fn resolve(&self, path: &[u8], follow: bool) -> Result<u64, Errno> {

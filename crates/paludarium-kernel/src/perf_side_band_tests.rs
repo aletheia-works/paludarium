@@ -122,6 +122,10 @@ struct Expected {
     shared_major: u32,
     shared_minor: u32,
     shared_inode: u64,
+    ring: u64,
+    ring_major: u32,
+    ring_minor: u32,
+    ring_inode: u64,
     mmap_records: u32,
 }
 
@@ -254,8 +258,8 @@ impl Env {
     }
 
     /// The guest's `maps_identity`: the device and inode of the mapping at
-    /// `at` in `/proc/self/maps`.
-    fn maps_identity(&mut self, at: u64) -> Option<(u32, u32, u64)> {
+    /// `at` in `/proc/self/maps`, and (its `maps_names`) its name.
+    fn maps_identity(&mut self, at: u64) -> Option<(u32, u32, u64, String)> {
         let fd = self.open(b"/proc/self/maps", 0, 0);
         assert!(fd >= 0, "{fd}");
         let mut text = Vec::new();
@@ -282,6 +286,7 @@ impl Env {
                 u32::from_str_radix(major, 16).ok()?,
                 u32::from_str_radix(minor, 16).ok()?,
                 inode.parse().ok()?,
+                fields.collect::<Vec<_>>().join(" "),
             ))
         })
     }
@@ -367,6 +372,7 @@ fn say_record(env: &mut Env, e: &mut Expected, record: &[u64]) {
             "anon".to_string()
         } else if name == b"/dev/zero (deleted)"
             || name.starts_with(b"/SYSV")
+            || name == b"anon_inode:[perf_event]"
             || name.starts_with(b"[")
         {
             String::from_utf8(name).unwrap()
@@ -411,6 +417,13 @@ fn say_record(env: &mut Env, e: &mut Expected, record: &[u64]) {
                     "  shared device {} inode {}",
                     (major == e.shared_major && minor == e.shared_minor) as i32,
                     (inode == e.shared_inode) as i32
+                ));
+            }
+            if e.ring != 0 && start == e.ring {
+                env.say(format!(
+                    "  ring offset {pgoff} len {len} device {} inode {}",
+                    (major == e.ring_major && minor == e.ring_minor) as i32,
+                    (inode == e.ring_inode) as i32
                 ));
             }
         }
@@ -528,7 +541,7 @@ fn perf_side_band_records_mappings_names_and_a_child() {
     // the three MMAP2 records it prints here (two of anonymous memory and
     // one of the heap); this reads it with `read` into its own memory.
     let identity = env.maps_identity(e.shared);
-    if let Some((major, minor, inode)) = identity {
+    if let Some((major, minor, inode, _)) = identity {
         (e.shared_major, e.shared_minor, e.shared_inode) = (major, minor, inode);
     }
     env.say(format!("shared in maps {}", identity.is_some() as i32));
@@ -546,8 +559,33 @@ fn perf_side_band_records_mappings_names_and_a_child() {
     let child = env.fork_and_exit(0);
     env.wait(child);
     e.child = child as u32;
+    // Another event's ring buffer, a shared mapping of its file.
+    env.put(ATTR, &side_band_attr(0));
+    let ring = env.call(PERF_EVENT_OPEN, [ATTR, 0, u64::MAX, u64::MAX, 0, 0]);
+    assert!(ring >= 0, "{ring}");
+    e.ring = env.mmap(2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, ring, 0);
     env.ioctl(fd, IOC_DISABLE);
     env.ioctl(exec_fd, IOC_DISABLE);
+    // Its line in /proc/self/maps: the anonymous inode `fstat` gives.
+    let identity = env.maps_identity(e.ring);
+    let found = identity.is_some() as i32;
+    assert_eq!(env.call(FSTAT, [ring as u64, ARG, 0, 0, 0, 0]), 0);
+    let (dev_major, dev_minor) = paludarium_types::device_numbers(env.long(ARG));
+    let ring_ino = env.long(ARG + 8);
+    let (as_fstat, named) = match identity {
+        Some((major, minor, inode, name)) => {
+            (e.ring_major, e.ring_minor, e.ring_inode) = (major, minor, inode);
+            (
+                (major, minor, inode) == (dev_major, dev_minor, ring_ino),
+                name == "anon_inode:[perf_event]",
+            )
+        }
+        None => (false, false),
+    };
+    env.say(format!(
+        "ring in maps {found} as fstat {} named {}",
+        as_fstat as i32, named as i32
+    ));
     assert_eq!(env.call(SHMDT, [shm as u64, 0, 0, 0, 0, 0]), 0);
     assert_eq!(env.call(SHMCTL, [id as u64, IPC_RMID, 0, 0, 0, 0]), 0);
     let at = env.path(&path);
@@ -564,6 +602,7 @@ fn perf_side_band_records_mappings_names_and_a_child() {
         &[
             "open 1 1",
             "shared in maps 1",
+            "ring in maps 1 as fstat 1 named 1",
             "all:",
             "mmap2 anon data 1 ids 1",
             "  anon covers 1 offset is address 1 len 1",
@@ -586,6 +625,9 @@ fn perf_side_band_records_mappings_names_and_a_child() {
             "comm exec 0 ids 1 name side-band",
             "fork child 1 parent 1 by parent",
             "exit child 1 parent 1 by child",
+            "mmap2 anon_inode:[perf_event] data 1 ids 1",
+            "  prot 3 flags 1",
+            "  ring offset 0 len 8192 device 1 inode 1",
             "exec only:",
             "mmap file data 0 ids 1",
             "  exec offset 4096 len 4096",

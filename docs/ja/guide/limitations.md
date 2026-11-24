@@ -120,8 +120,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （"exec_state: relocate dumpable information"）より前の動きです。7.2 からは
   `task_dump_owner` が、メモリーより長く残る `exec_state` の dumpable フラグから持ち主を
   決めるので、これらのファイルはタスクのもののままで、開くと `ESRCH` です。ランナーが
-  7.2 以降になったら paludarium もそれに合わせます。`meminfo` は `sysinfo` と同じ固定の
-  4 GiB を、何も使っていないものとして返します。
+  7.2 以降になったら paludarium もそれに合わせ、`gone-leader-files` のケースと単体テスト
+  `a_task_without_memory_has_its_files_owned_by_root` もそのとき変わります。ゾンビの
+  プロセスにはまだ `ns` のリンクがありません。Linux では `pid` と `user` のリンクは
+  引き続き解決できます（`pidns_get` と `userns_get` は `nsproxy` を使いません）。
+  `meminfo` は `sysinfo` と同じ固定の 4 GiB を、何も使っていないものとして返します。
 - **自分のルートの一部**：生成される `/proc` や `/dev`（またはその中のディレクトリ）への
   `chroot` は `EINVAL` を返します。Linux はそこをルートにします。`mount` は `proc`
   ファイルシステムをマウントせず、`/proc` や `/dev` に何もマウントしないため、新しいルートの
@@ -144,6 +147,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ブロックデバイスの `mknod` は `EPERM` です。paludarium には、それが表すデバイスがないから
   です。マウントしたホストのディレクトリに FIFO を作れるのは Linux のホストだけで、つながる
   のはゲストの中で開いたものだけです。同じノードを開いたホストのプログラムにはつながりません。
+- **パイプのパケットモード**：`F_SETFL` は Linux と同じくパイプと FIFO の `O_DIRECT` を
+  受け付けますが、エミュレーターにはパケットモードがありません。書き込みはパケットごとに
+  分かれず、`F_GETFL` にも `O_DIRECT` は表れません。
+- **`O_DIRECT` のアラインメント**：`O_DIRECT` で開いたファイルの読み書きも、ほかと同じように
+  通ります。ext4 などのディスクのファイルシステムでは、Linux はブロックの大きさに揃っていない
+  バッファー、オフセット、長さを拒みます（`EINVAL`）が、エミュレーターは拒みません。
 - **ネットワーク**：許可の一覧（`--allow-net`、`Config::with_network`、ブラウザでは
   [中継](./relay) の要る JavaScript の `network` の指定）がなければ、
   `socket()` はどのファミリーにも `EAFNOSUPPORT` を返します。一覧があっても、使えるのは
@@ -244,9 +253,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `perf` のイベントにしません。ファイルのページはすべて
   ページキャッシュにあるとみなすので、メジャーフォールトはありません（`ru_majflt` は 0）。
   コアダンプのフォールトは最後に終了するスレッドに数えます。Linux はダンプするスレッドに
-  数えます。`process_vm_readv`、`process_vm_writev`、`MADV_POPULATE_READ`、
-  `MADV_POPULATE_WRITE` は、フォールトを `perf` の `page-faults` にも数えます。Linux の
-  `get_user_pages` は `perf` のイベントにしません。`/proc/<pid>/stat` の `minflt` と
+  数えます。`/proc/<pid>/stat` の `minflt` と
   `cminflt` も同じ数を読むので、同じ制限があります。
 - **perf のイベントの一部**：数えるのはソフトウェアのイベントだけです。cgroup の切り替え、
   トレースポイント、ブレークポイント、kprobe、uprobe は `ENOENT` で、ハードウェアの
@@ -297,11 +304,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マッピングの一部をアンマップ、移動、保護の変更でき、Linux は分割を断ります
   （`EINVAL`）。`MADV_DOFORK` で子に渡せ、Linux は `VM_IO` に対して断ります
   （`EINVAL`）。`mlock` でロックでき、Linux は `VM_SPECIAL` のマッピングをロックしません。
-  `/proc/<pid>/maps` はこのマッピングを、Linux のように無名 inode のデバイスと inode を付けた
-  `anon_inode:[perf_event]` とはまだ示さず（名前、デバイス、inode のどれも示しません）、`MMAP` の
-  記録も Linux がそれについて書くものとはまだ照らし合わせていません。`inherit_stat` は
-  受け付けますが、記録するものがないので、引き継いだイベントの終わりに読み取りの記録は
-  送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
+  `inherit_stat` は受け付けますが、記録するものがないので、引き継いだイベントの終わりに
+  読み取りの記録は送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。ioctl の `SET_FILTER`、`SET_BPF`、
   `QUERY_BPF`、`MODIFY_ATTRIBUTES` は `ENOTTY` です。`remove_on_exec` は、
   Linux master が 7.2 から（037a3c43edfb）するように、イベントをグループから外し、そうした
@@ -321,12 +325,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
   `E2BIG` を返します。`kernel.perf_event_paranoid` は
   最初 Linux の 2 です（Debian と Ubuntu のカーネルの既定はそれより大きい）。
-- **BPF はマップと、AF_UNIX のソケットだけのソケットフィルター**：`bpf` が作るのは配列、
+- **BPF はマップと、AF_UNIX と UDP のソケットだけのソケットフィルター**：`bpf` が作るのは配列、
   ハッシュ、LRU ハッシュ、最長一致のトライ、キュー、スタック、ブルームフィルタ、マップの
   配列とマップのハッシュで、読み込むのはソケットフィルターだけです。ソケットフィルターは、
   `SO_ATTACH_BPF` でも古典的なものを `SO_ATTACH_FILTER` でアタッチしても、AF_UNIX の
-  データグラムかパケットのソケットでだけ動きます。インターネットのソケットではこれらの
-  オプションは `ENOPROTOOPT` です。JIT はなく、インタープリタが動かします。ヘルパーの値は、プロセッサが
+  データグラムかパケットのソケットと、UDP のソケットでだけ動きます。TCP のソケットは
+  Linux と同じくオプションを受け付けますが、フィルターはまだ動きません。UDP のソケット
+  では、ここではどのデバイスも通らない DNS スタブの答えにはフィルターは動きません。
+  Linux が veth ペアにフラグメントに分けて送るデータグラムはひとまとまりで届きます。
+  ただしフィルターが見る線形部分とチェックサムは、組み立て直したもののとおりです。IPv4
+  の ID、IPv6 のフローラベルと `skb->hash` は Linux と同じく乱数ですが、Linux と同じ
+  引き方ではありません。JIT はなく、インタープリタが動かします。ヘルパーの値は、プロセッサが
   0、ネットワーク名前空間のクッキーはどの名前空間でも 1（最初のもの）、起動時からの時計と
   粗い時計は単調時計、`CLOCK_TAI` は実時間です。検証器の書き換えは、命令の数を数えるだけで
   行いません。インタープリタは読み込んだままの命令を動かします。Linux の検証器は、決して
@@ -722,17 +731,22 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ルートからではありません。`MS_RDONLY`（`EROFS`）、`noexec`、`nodev`、`nosuid` は
   効かせ、tmpfs のマウントの `size`、`nr_blocks`、`nr_inodes` も効かせます。フォールトが
   tmpfs マウントのファイルや memfd に持ち込むページは `shmem_fault` が課金するように
-  そのブロックに数え、マウントの大きさを超えるページは `SIGBUS` です。まだそう数えない
-  のは、`UFFDIO_COPY` や `UFFDIO_ZEROPAGE` が埋めるページで、大きさにかかわらずファイル
-  に戻ります（超えても `ENOMEM` になりません）。`huge=` が `never` でないマウントも
-  1 ページずつ数え、Linux のように巨大ページをまとめて取ることはありません。
-  `MAP_POPULATE`、`MAP_LOCKED`、ロックが共有マッピングに持ち込むはずのページは、触れた
+  そのブロックに数え（`huge=` のあるマウントでは大きな folio のほかのページとともに）、
+  マウントの大きさを超えるページは `SIGBUS` です。まだそうしないのは次のことです。
+  `mmap` はそのファイルのマッピングをほかのものと同じ場所に置きます
+  （`shmem_get_unmapped_area` は 2 MiB 以上のものを 2 MiB の境目に置きます）。そのため
+  フォールトで 2 MiB の folio を取るのは、プログラムが自分で置いたマッピングだけです。
+  大きな folio は 1 ページずつマップするので、`/proc/<pid>/smaps` と `/proc/meminfo` は
+  それを `ShmemPmdMapped`、`FilePmdMapped`、`ShmemHugePages` に数えず、フォールトは
+  folio 全体ではなくまわりのページだけをマップします（`Rss` にもそれだけを数えます）。大きな folio はいつも取れます。Linux はメモリーにそれほど
+  大きな空きがなければ小さいものを取ります。メモリーが足りなくなって分けることはなく、
+  ほかのものの場所を空けるときだけ分けます。`MAP_POPULATE`、`MAP_LOCKED`、ロックが共有マッピングに持ち込むはずのページは、触れた
   ときに初めて数えます。拡張属性は inode の分を使いません（`shmem_xattr_handler_set` のように数えて、超えたときの `setxattr` の
   `ENOSPC` にはなりません）。起動したときからあるルートには、`fallocate` の上限（返す
   メモリーの大きさ）のほかに上限がありません。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが
   持つデバイスノードはホストのディレクトリのものだけなので（その `mknod` は `EPERM`）、
   `nodev` が断るのもそれだけです。
-  `huge`、`mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
+  `mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
   （マウントし直しで `noswap` やクォータを有効にしたり、クォータの上限を変えたりすると
   `EINVAL`）表示しますが、何もせず、
   `casefold` と `strict_encoding` は、`CONFIG_UNICODE` なしのカーネルと同じく `EINVAL`
@@ -815,8 +829,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `execveat` の `AT_EXECVE_CHECK`（Linux 6.14）は `EINVAL` です。これはユーザー空間が
   `SECBIT_EXEC_RESTRICT_FILE` のもとでファイルを実行する前に確かめるためのものです。
   その確かめのための securebits は保って示しますが、ここでは何もそれに従いません。
-  `/proc/self/status` は呼んだスレッドの資格情報を示しますが、Linux はスレッド
-  グループのリーダーのものを示します。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
   `SCM_RIGHTS` でディスクリプタを、`SCM_CREDENTIALS` で資格情報を受け渡します。
   違いは次のとおりです。
@@ -824,8 +836,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     すぐに閉じられます。Linux のガベージコレクタは、ワークキューから少しあとに
     閉じます。
 - **ソケットのオプション**：`setsockopt` は、効き目を再現していないオプションを
-  `ENOPROTOOPT` で断ります。Linux は受け付けます。フィルターなど Linux にある
-  ほかのオプションです。セキュリティモジュールは再現していないので、`SO_PASSSEC` は
+  `ENOPROTOOPT` で断ります。Linux は受け付けます。AF_UNIX とインターネット以外の
+  ソケットのフィルターなど、Linux にあるほかのオプションです。セキュリティモジュールは再現していないので、`SO_PASSSEC` は
   `SCM_SECURITY` を運ばず、`SO_PEERSEC` は `ENOPROTOOPT` です。モジュールのない
   Linux と同じです。SELinux のある Linux は送り手や相手のコンテキストを渡し、
   AppArmor のある Linux は `SO_PEERSEC` で相手のラベルを渡します。
@@ -1173,6 +1185,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   どちらかで失敗したときにはもう 1 回だけ頼みます。3 回目はありません。ほかのもの（テストやその結果）は
   やり直さず、やり直すたびにそのエラーと時間をログに残します。この失敗は出たり出なかったりするので、
   通った実行があっても、なくなったことにはなりません。
+- WebDriver のセッションを終えても、safaridriver がそのセッションのために起動した Safari は動き続けます。
+  そのため、テストのドライバーはセッションのたびに（セッションを頼んで失敗したときも）、頼む前には動いていなかった
+  Safari に終了を頼み、終わるまで最大 15 秒待ちます。もとから動いていた Safari（自分で使っている Safari など）には
+  頼みません。終わらない Safari はログに残し、強制終了はしません。
 
 ## 不具合を見つけたら
 

@@ -2753,7 +2753,14 @@ fn positioned(
     offset: u64,
     write: bool,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
-    if (offset as i64) < 0 {
+    // A position past `i64::MAX` is a negative one, which only a file of
+    // unsigned offsets takes (`FOP_UNSIGNED_OFFSET`).
+    if (offset as i64) < 0
+        && !c
+            .files
+            .descriptor(fd)
+            .is_ok_and(|d| unsigned_offsets(&d.file))
+    {
         return Err(Errno::EINVAL);
     }
     let file = c.files.descriptor(fd)?.file;
@@ -2770,11 +2777,19 @@ fn positioned(
     }
     Ok(file)
 }
+/// Whether the file's positions are unsigned (Linux's
+/// `FOP_UNSIGNED_OFFSET`, `unsigned_offsets`): `/proc/<pid>/mem`'s, whose
+/// positions are addresses.
+fn unsigned_offsets(file: &Arc<dyn FileHandle>) -> bool {
+    file.as_any()
+        .is_some_and(|file| file.is::<crate::proc::MemFile>())
+}
 /// Where reads of a regular file stop: at its size, but for /proc's files,
 /// which say 0 as Linux's do and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
         file.is::<crate::proc::PagemapFile>()
+            || file.is::<crate::proc::MemFile>()
             || crate::sysctl::is_file(file)
             || crate::seq::is_file(file)
             || file.is::<crate::proc::GeneratedFile>()
@@ -2793,11 +2808,21 @@ fn request(
     offset: u64,
     read: bool,
 ) -> Result<usize, Errno> {
-    if (count as i64) < 0
-        || offset
-            .checked_add(count)
-            .is_none_or(|end| end > i64::MAX as u64)
-    {
+    // As Linux's `rw_verify_area`: a file of unsigned offsets takes a
+    // negative position, and an end past `i64::MAX`, unless the count
+    // would carry it past the last byte (`EOVERFLOW`).
+    let unsigned = unsigned_offsets(file);
+    if (count as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (offset as i64) < 0 {
+        if !unsigned {
+            return Err(Errno::EINVAL);
+        }
+        if count >= offset.wrapping_neg() {
+            return Err(Errno::EOVERFLOW);
+        }
+    } else if offset.saturating_add(count) > i64::MAX as u64 && !unsigned {
         return Err(Errno::EINVAL);
     }
     let len = usize::try_from(count)
@@ -7555,6 +7580,9 @@ fn open_path(
         }
         if path.entry == crate::proc::TaskEntry::Pagemap {
             return Ok((tasks::pagemap(&task, flags, owner)?, p.to_vec()));
+        }
+        if path.entry == crate::proc::TaskEntry::Mem {
+            return Ok((tasks::mem(c, &task, flags, owner)?, p.to_vec()));
         }
         if path.entry == crate::proc::TaskEntry::Io {
             return Ok((tasks::io(c.processes, &task, flags, owner), p.to_vec()));

@@ -217,6 +217,7 @@ mod linux {
             let as_root = matches!(
                 mode,
                 "credentials"
+                    | "proc-mem"
                     | "permissions"
                     | "setuid"
                     | "signal-permissions"
@@ -908,6 +909,7 @@ mod linux {
         processes_proc_other_files => ("proc-other-files","process"),
         processes_page_faults => ("page-faults","process"),
         processes_context_switches => ("context-switches","process"),
+        processes_proc_mem => ("proc-mem","process"),
         processes_proc_stat_counts => ("proc-stat-counts","process"),
         processes_proc_stat_sched => ("proc-stat-sched","process"),
         processes_page_faults_live => ("page-faults-live","process"),

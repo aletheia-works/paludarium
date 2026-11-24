@@ -7118,6 +7118,85 @@ static int context_switches_case(void) {
     fflush(stdout);
     _exit(0);
 }
+/* The proc-mem case: /proc/<pid>/mem reads and writes a task's memory at
+   the address its position gives, as fs/proc/base.c's mem_rw does through
+   access_remote_vm with FOLL_FORCE: a read-only page is written, a call
+   that moves no byte is EIO, lseek takes no SEEK_END, positions are
+   unsigned (FOP_UNSIGNED_OFFSET), and the file is 0600. Another process's
+   is opened as ptrace would attach (mm_access, PTRACE_MODE_ATTACH), and a
+   zombie's, which has no memory, is ESRCH. It runs as root, for the
+   pagemap line. */
+static long pm_errno(long r) { return r < 0 ? -errno : r; }
+static int proc_mem_case(void) {
+    const long page = sysconf(_SC_PAGESIZE);
+    static char word[16] = "original";
+    int fd = open("/proc/self/mem", O_RDWR);
+    printf("open: %d\n", fd >= 0);
+    if (fd < 0) return 1;
+    char buf[16] = {0};
+    long own = pm_errno(pread(fd, buf, 8, (off_t)(uintptr_t)word));
+    printf("own read: %ld %s\n", own, buf);
+    printf("own write: %ld\n", pm_errno(pwrite(fd, "replaced", 8, (off_t)(uintptr_t)word)));
+    printf("word now: %.8s\n", word);
+    char *ro = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long forced = pm_errno(pwrite(fd, "F", 1, (off_t)(uintptr_t)ro));
+    printf("read-only write: %ld byte=%c\n", forced, ro[0]);
+    char *gone = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(gone, (size_t)page);
+    printf("unmapped read: %ld\n", pm_errno(pread(fd, buf, 8, (off_t)(uintptr_t)gone)));
+    printf("high read: %ld\n", pm_errno(syscall(SYS_pread64, fd, buf, 8, (long)(1UL << 63))));
+    long end = pm_errno(lseek(fd, 0, SEEK_END));
+    int set = lseek(fd, (off_t)(uintptr_t)word, SEEK_SET) == (off_t)(uintptr_t)word;
+    printf("lseek end: %ld set: %d\n", end, set);
+    memset(buf, 0, sizeof buf);
+    long at = pm_errno(read(fd, buf, 8));
+    printf("read at position: %ld %s\n", at, buf);
+    struct stat st;
+    fstat(fd, &st);
+    printf("mode: %o\n", (unsigned)(st.st_mode & 07777));
+    close(fd);
+    /* pagemap (0400) has no write operation, but root opens it for
+       writing, and F_GETFL shows the mode it was opened with (f_flags). */
+    int map = open("/proc/self/pagemap", O_RDWR);
+    printf("pagemap rdwr: open=%d accmode=%d\n", map >= 0,
+           map < 0 ? -errno : fcntl(map, F_GETFL) & O_ACCMODE);
+    if (map >= 0) close(map);
+
+    /* A child's memory, at the same address after fork. */
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 2;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        memcpy(word, "in-child", 8);
+        char c = 1;
+        if (write(ready[1], &c, 1) != 1) _exit(90);
+        if (read(done[0], &c, 1) != 1) _exit(91);
+        _exit(memcmp(word, "patched!", 8) == 0 ? 0 : 92);
+    }
+    char c;
+    if (read(ready[0], &c, 1) != 1) return 3;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/mem", child);
+    int theirs = open(path, O_RDWR);
+    memset(buf, 0, sizeof buf);
+    long got = theirs < 0 ? -errno : pm_errno(pread(theirs, buf, 8, (off_t)(uintptr_t)word));
+    long put = theirs < 0 ? -errno : pm_errno(pwrite(theirs, "patched!", 8, (off_t)(uintptr_t)word));
+    printf("child: open %d read %ld %s write %ld\n", theirs >= 0, got, buf, put);
+    if (write(done[1], &c, 1) != 1) return 4;
+    siginfo_t info;
+    waitid(P_PID, child, &info, WEXITED | WNOWAIT);
+    printf("child saw it: %d\n", info.si_code == CLD_EXITED && info.si_status == 0);
+    int zombie = open(path, O_RDONLY);
+    printf("zombie: %d\n", zombie < 0 ? -errno : 0);
+    if (theirs >= 0) {
+        memset(buf, 0, sizeof buf);
+        printf("after exit: %ld\n", pm_errno(pread(theirs, buf, 8, (off_t)(uintptr_t)word)));
+        close(theirs);
+    }
+    waitpid(child, NULL, 0);
+    return 0;
+}
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
    faults a task took (mm/memory.c mm_account_fault, current->min_flt),
    its own accesses' and those of get_user_pages for it: mlock's
@@ -38127,6 +38206,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
     if (!strcmp(mode, "context-switches")) return context_switches_case();
+    if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();

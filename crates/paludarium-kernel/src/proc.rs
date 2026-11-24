@@ -117,7 +117,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 29] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 30] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -133,6 +133,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 29] = [
     (b"stat", 8),
     (b"statm", 8),
     (b"maps", 8),
+    (b"mem", 8),
     (b"cwd", 10),
     (b"root", 10),
     (b"exe", 10),
@@ -149,7 +150,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 29] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 29] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 30] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -165,6 +166,7 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 29] = [
     (b"stat", 8),
     (b"statm", 8),
     (b"maps", 8),
+    (b"mem", 8),
     (b"cwd", 10),
     (b"root", 10),
     (b"exe", 10),
@@ -206,6 +208,8 @@ pub(crate) enum TaskEntry {
     Maps(MapsKind),
     /// `pagemap`, the entry of each page of its address space.
     Pagemap,
+    /// `mem`, the bytes of its address space ([`MemFile`]).
+    Mem,
     /// `clear_refs`, which a write clears its pages' soft-dirty bits with
     /// ([`ClearRefsFile`]).
     ClearRefs,
@@ -291,6 +295,7 @@ pub(crate) fn task_path(
         b"smaps" => TaskEntry::Maps(MapsKind::Smaps),
         b"smaps_rollup" => TaskEntry::Maps(MapsKind::Rollup),
         b"pagemap" => TaskEntry::Pagemap,
+        b"mem" => TaskEntry::Mem,
         b"clear_refs" => TaskEntry::ClearRefs,
         b"io" => TaskEntry::Io,
         b"personality" => TaskEntry::Personality,
@@ -328,14 +333,14 @@ pub(crate) fn task_path(
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
         // The process's own `ns`, user namespace files, mount tables,
-        // `auxv`, `limits`, `statm`, `io`, `personality`, `wchan` and
-        // `syscall` are here (`/proc/self/mountinfo`
+        // `auxv`, `limits`, `statm`, `io`, `personality`, `wchan`,
+        // `syscall` and `mem` are here (`/proc/self/mountinfo`
         // and `mounts` are [`mount_table`]'s); the rest of its own directory
         // is `own_entry`'s.
         [b"ns", ..]
         | [
             b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
-            | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan" | b"syscall",
+            | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan" | b"syscall" | b"mem",
         ] => (None, entry(&parts)),
         _ if pid == own && !own_leader_gone => return None,
         [] => (None, TaskEntry::Directory),
@@ -1627,6 +1632,9 @@ const PAGEMAP_END: u64 = (1 << 47) - 4096;
 /// the space is gone or past the end of user space.
 pub(crate) struct PagemapFile {
     memory: MemoryView,
+    /// The access mode it was opened with (`O_ACCMODE`), which `F_GETFL`
+    /// shows though it has no write operation (Linux's `f_flags`).
+    access: u32,
     writable: bool,
     position: Mutex<u64>,
     /// Its inode's owner, as `fstat` shows it.
@@ -1639,6 +1647,7 @@ impl PagemapFile {
         Self {
             status: crate::files::StatusFlags::opened(flags),
             memory,
+            access: flags & 3,
             writable: flags & 3 != 0,
             position: Mutex::new(0),
             owner,
@@ -1719,7 +1728,142 @@ impl FileHandle for PagemapFile {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        self.status.of(0)
+        self.status.of(self.access)
+    }
+    /// `F_SETFL`, as Linux's `setfl`.
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.set(flags);
+        Ok(())
+    }
+}
+
+/// `/proc/<pid>/mem`, as Linux's `mem_rw` serves it: the bytes of the
+/// address space it was opened on, at the address a position gives, read
+/// and written as `ptrace` reads and writes them (`access_remote_vm` with
+/// `FOLL_FORCE`, as `proc_mem_foll_force` gives by default:
+/// [`MemoryView::read_forced`] and [`MemoryView::write_forced`]), a page
+/// at a time. A call that moves no byte is `EIO`, one that stops later
+/// gives what it moved, and once the space is gone nothing moves. Every
+/// position is taken, as `FOP_UNSIGNED_OFFSET` lets it.
+pub(crate) struct MemFile {
+    memory: MemoryView,
+    /// The access mode it was opened with (`O_ACCMODE`).
+    access: u32,
+    readable: bool,
+    writable: bool,
+    position: Mutex<u64>,
+    /// Its inode's owner, as `fstat` shows it.
+    owner: Owner,
+    /// What `F_SETFL` set on it ([`crate::files::StatusFlags`]).
+    status: crate::files::StatusFlags,
+}
+impl MemFile {
+    pub(crate) fn open(memory: MemoryView, flags: u32, owner: Owner) -> Self {
+        Self {
+            status: crate::files::StatusFlags::opened(flags),
+            memory,
+            access: flags & 3,
+            readable: flags & 3 != 1,
+            writable: flags & 3 != 0,
+            position: Mutex::new(0),
+            owner,
+        }
+    }
+    /// Moves `len` bytes at `addr` through `copy`, a page at most at a
+    /// time, as `mem_rw`'s loop does: `None` once the space is gone.
+    fn transfer(
+        &self,
+        addr: u64,
+        len: usize,
+        mut copy: impl FnMut(u64, std::ops::Range<usize>) -> Option<usize>,
+    ) -> Result<usize, Errno> {
+        let mut done = 0;
+        while done < len {
+            let this = (len - done).min(4096);
+            let at = addr.wrapping_add(done as u64);
+            let Some(moved) = copy(at, done..done + this) else {
+                break;
+            };
+            if moved == 0 {
+                return if done == 0 { Err(Errno::EIO) } else { Ok(done) };
+            }
+            done += moved;
+            if moved < this {
+                break;
+            }
+        }
+        Ok(done)
+    }
+}
+impl FileHandle for MemFile {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = self.read_at(*position, buf)?;
+        *position = position.wrapping_add(count as u64);
+        Ok(count)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        if !self.readable {
+            return Err(Errno::EBADF);
+        }
+        // Gone: `mmget_not_zero` fails before anything is copied.
+        if self.memory.mappings().is_none() {
+            return Ok(0);
+        }
+        let len = buf.len();
+        self.transfer(offset, len, |at, range| {
+            self.memory.read_forced(at, &mut buf[range])
+        })
+    }
+    fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = self.write_at(*position, buf)?;
+        *position = position.wrapping_add(count as u64);
+        Ok(count)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+        if !self.writable {
+            return Err(Errno::EBADF);
+        }
+        if self.memory.mappings().is_none() {
+            return Ok(0);
+        }
+        self.transfer(offset, buf.len(), |at, range| {
+            self.memory.write_forced(at, &buf[range])
+        })
+    }
+    /// As Linux's `mem_lseek`: from the start or the current position, to
+    /// any position, never from the end.
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
+        let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        *position = match whence {
+            0 => offset as u64,
+            1 => position.wrapping_add_signed(offset),
+            _ => return Err(Errno::EINVAL),
+        };
+        Ok(*position)
+    }
+    /// Size 0 and only its owner may read or write it, as Linux's (0600).
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(owned(
+            FileStat {
+                mode: 0o100_600,
+                ..stat(0)
+            },
+            &self.owner,
+        ))
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn flags(&self) -> u32 {
+        self.status.of(self.access)
     }
     /// `F_SETFL`, as Linux's `setfl`.
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
@@ -1948,6 +2092,56 @@ mod tests {
             .iter()
             .map(|b| u64::from_le_bytes(*b))
             .collect()
+    }
+
+    #[test]
+    fn mem_reads_and_writes_as_ptrace_does_and_is_eio_where_nothing_moves() {
+        let mut mem = AddressSpace::new();
+        mem.map(
+            Some(GuestAddr(0x10000)),
+            0x2000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.map(
+            Some(GuestAddr(0x12000)),
+            0x1000,
+            Prot::READ,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.write(GuestAddr(0x10ffc), b"abcdefgh").unwrap();
+        let file = MemFile::open(mem.view(), 2, Arc::default());
+        // Across a page boundary, from any position.
+        let mut buf = [0u8; 8];
+        assert_eq!(file.read_at(0x10ffc, &mut buf), Ok(8));
+        assert_eq!(&buf, b"abcdefgh");
+        // A read-only page is written, as FOLL_FORCE writes it.
+        assert_eq!(file.write_at(0x12000, b"forced"), Ok(6));
+        let mut forced = [0u8; 6];
+        mem.read(GuestAddr(0x12000), &mut forced).unwrap();
+        assert_eq!(&forced, b"forced");
+        // A read that runs off the mapped pages gives what it moved; one
+        // that moves nothing is EIO.
+        let mut long = [0u8; 0x2000];
+        assert_eq!(file.read_at(0x12000, &mut long), Ok(0x1000));
+        assert_eq!(file.read_at(0x20000, &mut buf), Err(Errno::EIO));
+        assert_eq!(file.write_at(u64::MAX - 3, b"x"), Err(Errno::EIO));
+        // The position is the address; no seek from the end.
+        assert_eq!(file.seek(0x10ffc, 0), Ok(0x10ffc));
+        assert_eq!(file.read(&mut buf[..4]), Ok(4));
+        assert_eq!(file.seek(0, 1), Ok(0x11000));
+        assert_eq!(file.seek(0, 2), Err(Errno::EINVAL));
+        // Read-only and write-only descriptors.
+        let reader = MemFile::open(mem.view(), 0, Arc::default());
+        assert_eq!(reader.write_at(0x10000, b"x"), Err(Errno::EBADF));
+        let writer = MemFile::open(mem.view(), 1, Arc::default());
+        assert_eq!(writer.read_at(0x10000, &mut buf), Err(Errno::EBADF));
+        assert_eq!(file.stat().map(|s| s.mode), Ok(0o100_600));
+        // Once the space is gone, nothing moves.
+        drop(mem);
+        assert_eq!(reader.read_at(0x10000, &mut buf), Ok(0));
     }
 
     #[test]

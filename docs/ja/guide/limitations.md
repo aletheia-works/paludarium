@@ -55,8 +55,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
   `ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
   `write` で埋めたホストのファイルのページはクリーンです（下の「`write` で埋めたページ」）。
-- **`/proc/<pid>/mem` はありません**：タスクのメモリは `ptrace` と `process_vm_readv`、
-  `process_vm_writev` でだけ読み書きします。
 - **`/proc/<pid>/pagemap` の一部**：エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
   読み込んだプログラムのセグメントやファイルのプライベートな
   マッピングのページは、ページではなくマッピングに書き込むまでファイルのもの（ビット 61）

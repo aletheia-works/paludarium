@@ -2157,6 +2157,8 @@ fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_on
     assert_ne!(u64::from_le_bytes(entry) & 1 << 63, 0);
     let root = f.ret(2, &[path, 2]);
     assert!(root < 1 << 32, "{root:#x}");
+    // F_GETFL shows the mode it was opened with, though it has no write.
+    assert_eq!(f.ret(72, &[root, 3]) & 3, 2);
     // Without CAP_DAC_OVERRIDE: EACCES for writing, as its mode is 0400.
     // The change of IDs makes the process undumpable, whose files root owns:
     // PR_SET_DUMPABLE gives them back.
@@ -2164,6 +2166,42 @@ fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_on
     assert_eq!(f.ret(157, &[4, 1]), 0);
     assert_eq!(f.ret(2, &[path, 2]), errno(Errno::EACCES));
     assert!(f.ret(2, &[path, 0]) < 1 << 32);
+}
+#[test]
+fn proc_mem_reads_and_writes_the_process_memory_through_the_system_calls() {
+    let mut f = fixture();
+    let (path, buf) = (DATA, DATA + 0x400);
+    f.mem.write(GuestAddr(path), b"/proc/self/mem\0").unwrap();
+    f.mem.write(GuestAddr(buf), b"secret").unwrap();
+    let fd = f.ret(2, &[path, 2]);
+    assert!(fd < 1 << 32, "{fd:#x}");
+    // pread64 at the address of `buf`, pwrite64 over it.
+    assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, buf]), 6);
+    let mut read = [0; 6];
+    f.mem.read(GuestAddr(buf + 0x800), &mut read).unwrap();
+    assert_eq!(&read, b"secret");
+    f.mem.write(GuestAddr(buf + 0x900), b"public").unwrap();
+    assert_eq!(f.ret(18, &[fd, buf + 0x900, 6, buf]), 6);
+    f.mem.read(GuestAddr(buf), &mut read).unwrap();
+    assert_eq!(&read, b"public");
+    // Nothing is mapped at 16 KiB: EIO. lseek from the end: EINVAL.
+    assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, 0x4000]), errno(Errno::EIO));
+    // Its offsets are unsigned (FOP_UNSIGNED_OFFSET): one past i64::MAX is
+    // an address with nothing there, and a count that wraps past the end
+    // is EOVERFLOW.
+    assert_eq!(f.ret(17, &[fd, buf + 0x800, 6, 1 << 63]), errno(Errno::EIO));
+    assert_eq!(
+        f.ret(17, &[fd, buf + 0x800, 6, u64::MAX - 2]),
+        errno(Errno::EOVERFLOW)
+    );
+    assert_eq!(f.ret(8, &[fd, 0, 2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(8, &[fd, buf, 0]), buf);
+    // 0600, as Linux's.
+    let st = DATA + 0x1000 - 144;
+    assert_eq!(f.ret(5, &[fd, st]), 0);
+    let mut mode = [0; 4];
+    f.mem.read(GuestAddr(st + 24), &mut mode).unwrap();
+    assert_eq!(u32::from_le_bytes(mode) & 0o7777, 0o600);
 }
 #[test]
 fn own_proc_files_are_the_process_owners_and_open_as_their_modes_let() {

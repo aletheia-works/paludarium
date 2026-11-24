@@ -7237,6 +7237,115 @@ static int exec_names_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The vma-names case: prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME) names
+   anonymous memory as mm/madvise.c's set_anon_vma_name does, and
+   /proc/self/maps shows it as fs/proc/task_mmu.c's get_vma_name does:
+   [anon:<name>], [anon_shmem:<name>] for shared anonymous memory, and
+   [heap] over a name. A name splits its VMAs, keeps their lock, survives
+   fork, and is refused for a file (EBADF), a bad character or 80 bytes
+   (EINVAL); a hole is ENOMEM once the rest is named. */
+static long vn_name(void *at, size_t size, const char *name) {
+    long r = syscall(SYS_prctl, 0x53564d41, 0, (unsigned long)at, size, (unsigned long)name);
+    return r < 0 ? -errno : r;
+}
+/* The name column of the maps line holding `at`, and how many lines in
+   [from, to) carry `name`. */
+static void vn_line(uintptr_t at, char *out, size_t size) {
+    out[0] = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    while (maps && fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && at >= start && at < end) {
+            char *name = strrchr(line, ' ');
+            line[strcspn(line, "\n")] = 0;
+            snprintf(out, size, "%s", name && name[1] ? name + 1 : "");
+            /* A name may hold spaces: from the column Linux pads to. */
+            if (strlen(line) > 73) snprintf(out, size, "%s", line + 73);
+            break;
+        }
+    }
+    if (maps) fclose(maps);
+}
+static int vn_count(uintptr_t from, uintptr_t to, const char *name) {
+    int n = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    while (maps && fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && start >= from && end <= to && strstr(line, name)) n++;
+    }
+    if (maps) fclose(maps);
+    return n;
+}
+static int vma_names_case(void) {
+    const long page = sysconf(_SC_PAGESIZE);
+    char seen[256];
+    char *a = mmap(NULL, (size_t)(4 * page), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 80;
+    printf("name: %ld\n", vn_name(a + page, (size_t)(2 * page), "case-a"));
+    vn_line((uintptr_t)(a + page), seen, sizeof seen);
+    printf("named: %s\n", seen);
+    vn_line((uintptr_t)a, seen, sizeof seen);
+    printf("before it: [%s]\n", seen);
+    /* A partly locked range: the lock splits it, and the name keeps both. */
+    printf("mlock: %d\n", mlock(a + 2 * page, (size_t)page));
+    printf("rename: %ld\n", vn_name(a, (size_t)(4 * page), "case-b"));
+    printf("named pieces: %d\n", vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]"));
+    munlock(a + 2 * page, (size_t)page);
+    printf("after munlock: %d\n", vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]"));
+    /* What Linux refuses. */
+    printf("bad char: %ld %ld %ld\n", vn_name(a, (size_t)page, "a[b"), vn_name(a, (size_t)page, "a$b"),
+           vn_name(a, (size_t)page, "a\tb"));
+    char longest[81];
+    memset(longest, 'x', 80);
+    longest[80] = 0;
+    printf("80 bytes: %ld\n", vn_name(a, (size_t)page, longest));
+    longest[79] = 0;
+    printf("79 bytes: %ld\n", vn_name(a, (size_t)page, longest));
+    printf("unaligned: %ld\n", vn_name(a + 1, (size_t)page, "x"));
+    printf("other option: %ld\n", syscall(SYS_prctl, 0x53564d41, 1, (unsigned long)a, page, "x") < 0 ? -errno : 0L);
+    int fd = open("/proc/self/exe", O_RDONLY);
+    char *file = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    printf("file: %ld\n", vn_name(file, (size_t)page, "x"));
+    /* A hole: ENOMEM, the mapped page before it named. */
+    char *h = mmap(NULL, (size_t)(3 * page), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(h + page, (size_t)page);
+    printf("hole: %ld\n", vn_name(h, (size_t)(3 * page), "case-h"));
+    vn_line((uintptr_t)h, seen, sizeof seen);
+    printf("before the hole: %s\n", seen);
+    /* Shared anonymous memory, and the heap over a name. */
+    char *s = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    printf("shared: %ld\n", vn_name(s, (size_t)page, "case-s"));
+    vn_line((uintptr_t)s, seen, sizeof seen);
+    printf("shared named: %s\n", seen);
+    /* musl's sbrk takes no increment: brk itself, for two pages. */
+    uintptr_t brk_at = (uintptr_t)syscall(SYS_brk, 0);
+    uintptr_t grown = (uintptr_t)syscall(SYS_brk, brk_at + 2 * (uintptr_t)page);
+    char *heap = (char *)((brk_at + page - 1) & ~(uintptr_t)(page - 1));
+    if (grown >= (uintptr_t)heap + page) {
+        long r = vn_name(heap, (size_t)page, "case-heap");
+        vn_line((uintptr_t)heap, seen, sizeof seen);
+        printf("heap: %ld %s\n", r, seen);
+    } else {
+        printf("heap: brk did not grow\n");
+    }
+    /* A fork keeps it; NULL clears it. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        vn_line((uintptr_t)(a + page), seen, sizeof seen);
+        _exit(strcmp(seen, "[anon:case-b]") == 0 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child sees it: %d\n", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("clear: %ld\n", vn_name(a, (size_t)(4 * page), NULL));
+    vn_line((uintptr_t)(a + page), seen, sizeof seen);
+    printf("cleared: [%s]\n", seen);
+    return 0;
+}
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
    faults a task took (mm/memory.c mm_account_fault, current->min_flt),
    its own accesses' and those of get_user_pages for it: mlock's
@@ -38430,6 +38539,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "context-switches")) return context_switches_case();
     if (!strcmp(mode, "exec-names")) return exec_names_case();
     if (!strcmp(mode, "exec-names-child")) return exec_names_child();
+    if (!strcmp(mode, "vma-names")) return vma_names_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();
     if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();

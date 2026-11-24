@@ -2596,6 +2596,14 @@ impl Kernel {
             // int too) lets any process attach, and anything else is the
             // number of a task in the caller's PID namespace (`EINVAL` for
             // none). It is the process's, whichever thread sets it.
+            // PR_SET_VMA: only PR_SET_VMA_ANON_NAME (0), as Linux's
+            // `prctl_set_vma` takes, which names `[a[2], a[2] + a[3])`.
+            0x5356_4d41 => {
+                if a[1] != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                return set_anon_vma_name(mem, a[2], a[3], a[4]).map(|()| 0);
+            }
             0x5961_6d61 => {
                 let ptracer = if a[1] == 0 {
                     None
@@ -5262,6 +5270,40 @@ pub(crate) fn clone3_args(
         [flags | exit_signal, top, parent_tid, child_tid, tls, 0],
         set_tid,
     ))
+}
+/// `set_anon_vma_name(addr, size, name)`, as Linux's `mm/madvise.c` gives
+/// it: the name, unless `name` is 0, which clears it, is read as
+/// `strndup_user` reads it, 80 bytes at most with its NUL (`EINVAL` past
+/// them, `EFAULT` where it cannot be read), and may hold only printable
+/// ASCII but `` \`$[] `` (`EINVAL`); then `madvise_set_anon_name` takes a
+/// page-aligned start (`EINVAL`) and a size rounded up to pages (`EINVAL`
+/// where that wraps), and names each VMA of the range
+/// ([`paludarium_mmu::AddressSpace::set_anon_name`]).
+fn set_anon_vma_name(mem: &AddressSpace, addr: u64, size: u64, name: u64) -> Result<(), Errno> {
+    let name = if name == 0 {
+        None
+    } else {
+        let bytes = read_string(mem, name, 80, Errno::EINVAL)?;
+        if bytes
+            .iter()
+            .any(|&b| !(0x20..0x7f).contains(&b) || b"\\`$[]".contains(&b))
+        {
+            return Err(Errno::EINVAL);
+        }
+        Some(paludarium_mmu::AnonName::new(&bytes))
+    };
+    if !addr.is_multiple_of(4096) {
+        return Err(Errno::EINVAL);
+    }
+    let len = size.wrapping_add(4095) & !4095;
+    if size != 0 && len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    if end == addr {
+        return Ok(());
+    }
+    mem.set_anon_name(GuestAddr(addr), end, name)
 }
 fn read_string(
     mem: &AddressSpace,

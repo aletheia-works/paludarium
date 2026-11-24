@@ -12158,3 +12158,70 @@ mod context_switches {
         assert_eq!(nvcsw(&f, at), 0);
     }
 }
+
+mod vma_names {
+    use super::*;
+
+    const PR_SET_VMA: u64 = 0x5356_4d41;
+
+    /// prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, size, name).
+    fn name(f: &mut Fixture, addr: u64, size: u64, name: u64) -> u64 {
+        f.ret(157, &[PR_SET_VMA, 0, addr, size, name])
+    }
+
+    #[test]
+    fn pr_set_vma_names_anonymous_memory_as_linux_checks_it() {
+        let mut f = fixture();
+        let text = |f: &Fixture, at: u64, s: &[u8]| {
+            f.mem.write(GuestAddr(at), &[s, b"\0"].concat()).unwrap();
+            at
+        };
+        // mmap(NULL, 3 pages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS).
+        let at = f.ret(9, &[0, 0x3000, 3, 0x22, u64::MAX, 0]);
+        let good = text(&f, DATA, b"jemalloc pages");
+        assert_eq!(name(&mut f, at, 0x1001, good), 0);
+        let vma = f.mem.view().vma_from(at).unwrap();
+        assert_eq!(
+            (vma.end, vma.anon_name.as_deref()),
+            (at + 0x2000, Some(&b"jemalloc pages"[..]))
+        );
+        // Its line in /proc/self/maps: open, then read it whole.
+        let maps = text(&f, DATA + 0x400, b"/proc/self/maps");
+        let fd = f.ret(2, &[maps, 0]);
+        let n = f.ret(0, &[fd, DATA + 0x800, 0x800]);
+        let mut buf = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x800), &mut buf).unwrap();
+        let listing = String::from_utf8_lossy(&buf);
+        let line = listing
+            .lines()
+            .find(|l| l.starts_with(&format!("{at:08x}-")))
+            .unwrap_or_default();
+        assert!(line.ends_with(" [anon:jemalloc pages]"), "{listing}");
+        // A character outside printable ASCII or among \`$[] is EINVAL, as
+        // are a name of 80 bytes before its NUL, a start off a page, and
+        // another PR_SET_VMA option.
+        for bad in [&b"a[b"[..], b"a$b", b"a`b", b"a\\b", b"a]b", b"a\tb"] {
+            let at_bad = text(&f, DATA + 0x100, bad);
+            assert_eq!(
+                name(&mut f, at, 0x1000, at_bad),
+                errno(Errno::EINVAL),
+                "{bad:?}"
+            );
+        }
+        let long = text(&f, DATA + 0x200, &[b'x'; 80]);
+        assert_eq!(name(&mut f, at, 0x1000, long), errno(Errno::EINVAL));
+        let longest = text(&f, DATA + 0x300, &[b'x'; 79]);
+        assert_eq!(name(&mut f, at, 0x1000, longest), 0);
+        assert_eq!(name(&mut f, at + 1, 0x1000, good), errno(Errno::EINVAL));
+        assert_eq!(
+            f.ret(157, &[PR_SET_VMA, 1, at, 0x1000, good]),
+            errno(Errno::EINVAL)
+        );
+        // A name that cannot be read is EFAULT; a size of 0 does nothing.
+        assert_eq!(name(&mut f, at, 0x1000, 0x10), errno(Errno::EFAULT));
+        assert_eq!(name(&mut f, at, 0, good), 0);
+        // NULL clears it.
+        assert_eq!(name(&mut f, at, 0x3000, 0), 0);
+        assert_eq!(f.mem.view().vma_from(at).unwrap().anon_name, None);
+    }
+}

@@ -159,6 +159,53 @@ pub struct Mapping {
     /// VMA (`VMA_STICKY_FLAGS`), and `pagemap` shows each of its pages
     /// soft-dirty ([`AddressSpaceData::spread_soft_dirty`]).
     pub soft_dirty: bool,
+    /// The name `prctl(PR_SET_VMA_ANON_NAME)` gave its anonymous memory
+    /// (Linux's `anon_vma_name`), which `/proc/<pid>/maps` shows as
+    /// `[anon:<name>]` and which splits, `fork` and `mremap` keep.
+    pub anon_name: Option<AnonName>,
+}
+
+/// A name `prctl(PR_SET_VMA_ANON_NAME)` gave anonymous memory
+/// ([`Mapping::anon_name`]): one of the names the machine was given, which
+/// it keeps while it runs, so that a mapping stays `Copy` and two mappings
+/// of one name compare equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AnonName(u32);
+
+/// The names given, by id, and each name's id ([`AnonName`]).
+#[derive(Default)]
+struct AnonNames {
+    by_id: Vec<Arc<[u8]>>,
+    ids: std::collections::HashMap<Arc<[u8]>, u32>,
+}
+
+/// The names given ([`AnonName`]), each once.
+static ANON_NAMES: std::sync::LazyLock<Mutex<AnonNames>> = std::sync::LazyLock::new(Mutex::default);
+
+impl AnonName {
+    /// The name `name`, the same one each time it is given.
+    #[must_use]
+    pub fn new(name: &[u8]) -> Self {
+        let mut names = ANON_NAMES.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(&id) = names.ids.get(name) {
+            return AnonName(id);
+        }
+        let id = u32::try_from(names.by_id.len()).unwrap_or(u32::MAX);
+        let name: Arc<[u8]> = Arc::from(name);
+        names.by_id.push(Arc::clone(&name));
+        names.ids.insert(name, id);
+        AnonName(id)
+    }
+    /// The name's bytes.
+    #[must_use]
+    pub fn bytes(self) -> Arc<[u8]> {
+        let names = ANON_NAMES.lock().unwrap_or_else(PoisonError::into_inner);
+        names
+            .by_id
+            .get(self.0 as usize)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(&b""[..]))
+    }
 }
 
 /// The `userfaultfd` a mapping reports its faults to, and why
@@ -746,6 +793,9 @@ pub struct Vma {
     pub heap: bool,
     /// Linux's `vm_flags` of it ([`vm`]).
     pub flags: u64,
+    /// The name `prctl(PR_SET_VMA_ANON_NAME)` gave it
+    /// ([`Mapping::anon_name`]).
+    pub anon_name: Option<Arc<[u8]>>,
 }
 
 /// What a VMA's pages hold, as Linux's `smaps_account` counts them, in
@@ -4613,6 +4663,7 @@ impl AddressSpaceData {
             identity: (0, self.shared_at(start).map_or(0, |shared| shared.pages.id)),
             heap: start < self.current_break.0 && end > self.initial_break.0,
             flags: self.vma_flags(start, end),
+            anon_name: mapping.anon_name.map(AnonName::bytes),
         };
         Some((vma, source))
     }
@@ -4998,6 +5049,7 @@ impl AddressSpaceData {
                 userfault: None,
                 no_exec: false,
                 soft_dirty: kind != MappingKind::Stack,
+                anon_name: None,
             },
         );
         Ok(GuestAddr(start))
@@ -5218,6 +5270,7 @@ impl AddressSpaceData {
             && a.grows_down == b.grows_down
             && a.userfault == b.userfault
             && a.no_exec == b.no_exec
+            && a.anon_name == b.anon_name
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -5714,6 +5767,61 @@ impl AddressSpaceData {
             }
             self.split_unmergeable_shared_where_changed(from);
             self.split_unmergeable_shared_where_changed(to);
+        }
+        if hole || covered < end {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)` of `[addr, end)`, as
+    /// Linux's `madvise_set_anon_name` walks its VMAs in turn: each takes
+    /// `name` (none clears it), split where the range starts and ends
+    /// within it, which keeps every other state of it (its lock, its
+    /// `userfaultfd`); one with a file but shared anonymous memory ends it
+    /// with `EBADF` (`vma_is_anon_shmem`), after those before it; a hole in
+    /// the range is `ENOMEM` once the rest has it.
+    pub fn set_anon_name(
+        &mut self,
+        addr: u64,
+        end: u64,
+        name: Option<AnonName>,
+    ) -> Result<(), Errno> {
+        let starts: Vec<u64> = self
+            .mappings
+            .range(..end)
+            .filter(|(_, m)| m.end() > addr)
+            .map(|(&start, _)| start)
+            .collect();
+        let mut covered = addr;
+        let mut hole = false;
+        for start in starts {
+            let Some(&m) = self.mappings.get(&start) else {
+                continue;
+            };
+            hole |= m.start.0 > covered;
+            covered = covered.max(m.end());
+            // Only anonymous memory is named: a loaded program's segments
+            // and a file's mappings have a file (`vm_file`), and so has shared
+            // memory of a file, where shared anonymous memory's is shmem's.
+            let file = matches!(m.kind, MappingKind::File | MappingKind::ElfSegment)
+                || self.backing_at(start).is_some()
+                || self
+                    .shared_at(start)
+                    .is_some_and(|shared| shared.pages.source.is_some());
+            if file {
+                return Err(Errno::EBADF);
+            }
+            if m.anon_name == name {
+                continue;
+            }
+            let (from, to) = (start.max(addr), m.end().min(end));
+            self.split_at(from);
+            self.split_at(to);
+            for (_, m) in self.mappings.range_mut(from..to) {
+                m.anon_name = name;
+            }
         }
         if hole || covered < end {
             Err(Errno::ENOMEM)
@@ -8774,6 +8882,15 @@ impl AddressSpace {
             data.userfault_fault_in(addr);
         }
         found
+    }
+    /// See [`AddressSpaceData::set_anon_name`].
+    pub fn set_anon_name(
+        &self,
+        addr: GuestAddr,
+        end: u64,
+        name: Option<AnonName>,
+    ) -> Result<(), Errno> {
+        self.locked().set_anon_name(addr.0, end, name)
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {

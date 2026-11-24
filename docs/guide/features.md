@@ -5803,8 +5803,19 @@ kernel.
   process attach, and another value, taken as an `int`, names a task in the
   caller's PID namespace (`EINVAL` for none) whose process, and its
   descendants, may attach while that task is there. It is the process's,
-  whichever thread sets it, and a child does not inherit it. Other options
-  give `EINVAL`.
+  whichever thread sets it, and a child does not inherit it.
+  `PR_SET_VMA` with `PR_SET_VMA_ANON_NAME` names anonymous memory, as
+  Linux's `set_anon_vma_name` does: a name of up to 80 bytes with its NUL
+  (`EINVAL` past them, `EFAULT` where it cannot be read), of printable
+  ASCII but `` \`$[] `` (`EINVAL`), or none to clear it, from a
+  page-aligned start (`EINVAL`) over a size rounded up to pages. Each VMA
+  of the range takes it, split where the range starts and ends within it
+  with its lock and `userfaultfd` kept, a file's mapping ending it with
+  `EBADF` and a hole with `ENOMEM` once the rest has it. `/proc/<pid>/maps`
+  and `smaps` show it as `[anon:<name>]`, and as `[anon_shmem:<name>]` for
+  shared anonymous memory, the heap and the stack keeping their own names;
+  VMAs of different names do not merge, and a `fork`ed child keeps them.
+  Other options give `EINVAL`.
 
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,

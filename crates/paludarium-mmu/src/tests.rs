@@ -2387,3 +2387,87 @@ fn an_aligned_placement_puts_a_mapping_at_its_offset_past_a_boundary() {
         assert_eq!(place(&m, Some(hint), 2 * HUGE, 0), hint.0, "{bottom_up}");
     }
 }
+
+#[test]
+fn a_name_splits_its_vmas_and_keeps_their_lock_and_userfaultfd() {
+    // Private anonymous memory: six pages, two of them locked and one
+    // registered with a userfaultfd.
+    let mut mem = AddressSpace::new();
+    let base = mem
+        .map(
+            None,
+            6 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    let page = |n: u64| base.0 + n * PAGE_SIZE;
+    mem.lock(GuestAddr(page(2)), page(4), Some(Lock::Populated))
+        .unwrap();
+    mem.view()
+        .userfault_register(page(4), page(5), 7, 1)
+        .unwrap();
+    let name = AnonName::new(b"heap-of-x");
+    mem.set_anon_name(GuestAddr(page(1)), page(5), Some(name))
+        .unwrap();
+    let at = |mem: &AddressSpace, n: u64| {
+        mem.mappings()
+            .find(|m| m.start.0 <= page(n) && page(n) < m.end())
+            .unwrap()
+    };
+    // Named from page 1 to 5, each piece with the state it had.
+    assert_eq!(at(&mem, 0).anon_name, None);
+    assert_eq!(at(&mem, 1).anon_name, Some(name));
+    assert_eq!(at(&mem, 1).locked, None);
+    assert_eq!(
+        (at(&mem, 2).anon_name, at(&mem, 2).locked),
+        (Some(name), Some(Lock::Populated))
+    );
+    assert_eq!(at(&mem, 3).locked, Some(Lock::Populated));
+    assert_eq!(at(&mem, 4).anon_name, Some(name));
+    assert!(at(&mem, 4).userfault.is_some());
+    assert_eq!(at(&mem, 5).anon_name, None);
+    // The VMA maps shows: the named part apart from its unnamed neighbours.
+    let vma = mem.view().vma_from(page(1)).unwrap();
+    assert_eq!(vma.anon_name.as_deref(), Some(&b"heap-of-x"[..]));
+    assert_eq!(mem.view().vma_from(page(0)).unwrap().anon_name, None);
+    // A fork keeps it; clearing it gives the VMAs back their merge.
+    let child = mem.fork();
+    assert_eq!(at(&child, 1).anon_name, Some(name));
+    mem.set_anon_name(GuestAddr(page(1)), page(2), None)
+        .unwrap();
+    assert_eq!(at(&mem, 1).anon_name, None);
+    assert_eq!(mem.view().vma_from(page(0)).unwrap().end, page(2));
+    // A hole is ENOMEM once what is mapped is named; the same name is the
+    // same id.
+    assert_eq!(
+        mem.set_anon_name(
+            GuestAddr(page(5)),
+            page(7),
+            Some(AnonName::new(b"heap-of-x"))
+        ),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!(at(&mem, 5).anon_name, Some(name));
+}
+
+#[test]
+fn only_anonymous_memory_takes_a_name() {
+    let mut mem = AddressSpace::new();
+    let file = mem
+        .map(None, PAGE_SIZE, Prot::READ, MappingKind::File)
+        .unwrap();
+    assert_eq!(
+        mem.set_anon_name(file, file.0 + PAGE_SIZE, Some(AnonName::new(b"f"))),
+        Err(Errno::EBADF)
+    );
+    let shared = mem
+        .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    mem.set_anon_name(shared, shared.0 + PAGE_SIZE, Some(AnonName::new(b"s")))
+        .unwrap();
+    assert_eq!(
+        mem.view().vma_from(shared.0).unwrap().anon_name.as_deref(),
+        Some(&b"s"[..])
+    );
+}

@@ -191,6 +191,10 @@ mod linux {
         case("tcp-info");
     }
     #[test]
+    fn network_tcp_segments() {
+        case("tcp-segments");
+    }
+    #[test]
     fn network_listen_errors() {
         case("listen-errors");
     }

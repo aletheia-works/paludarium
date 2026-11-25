@@ -14,6 +14,7 @@
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::interface::Flow6;
+use crate::loopback::segments::Push;
 use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::{Timeout, Timestamps};
 use crate::syscalls::Context;
@@ -93,6 +94,7 @@ const MSG_CTRUNC: u32 = 0x8;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_WAITALL: u64 = 0x100;
 const MSG_NOSIGNAL: u64 = 0x4000;
+const MSG_MORE: u64 = 0x8000;
 /// The DNS port, whose datagrams the stub answers.
 const DNS: u16 = 53;
 /// How long a resolved name is reused before it is looked up again.
@@ -2252,9 +2254,10 @@ impl InetSocket {
     }
     /// `write` for the task whose real user and group IDs are `ids`.
     pub(crate) fn write_as(&self, buf: &[u8], ids: (u32, u32)) -> Result<usize, Errno> {
-        self.send(buf, None, false, ids)
+        self.send(buf, None, Push::default(), ids)
     }
-    /// Sends `bytes`, the last of them `urgent` (`MSG_OOB`): a TCP socket
+    /// Sends `bytes` as `push` says, the last of them urgent with
+    /// `MSG_OOB`: a TCP socket
     /// never connected, or shut down for sending, is `EPIPE`; a failed one
     /// gives its pending error first. Only the guest's own loopback carries
     /// the urgent byte as such. A datagram goes to `to`, or the peer, for
@@ -2264,12 +2267,13 @@ impl InetSocket {
         &self,
         bytes: &[u8],
         to: Option<SocketAddr>,
-        urgent: bool,
+        push: Push,
         ids: (u32, u32),
     ) -> Result<usize, Errno> {
         if self.datagram {
             return self.send_datagram(bytes, to, ids);
         }
+        let no_delay = self.options().no_delay;
         let mut s = self.lock();
         s.note();
         let Some(stream) = s.stream.clone() else {
@@ -2280,6 +2284,9 @@ impl InetSocket {
         // which Linux's `sk_stream_wait_connect` refuses without
         // `SOCKWQ_ASYNC_NOSPACE`.
         let was_open = stream.phase() == Phase::Open;
+        if let Some((link, side)) = Self::joined(&s) {
+            link.sending(side, Push { no_delay, ..push });
+        }
         let written = stream.write(bytes);
         if let Ok(n) = written
             && n > 0
@@ -2288,7 +2295,7 @@ impl InetSocket {
             s.counts.wrote = self.now();
         }
         if let (Ok(n), Some((link, side))) = (&written, Self::joined(&s)) {
-            let last = bytes[..*n].last().copied().filter(|_| urgent);
+            let last = bytes[..*n].last().copied().filter(|_| push.urgent);
             link.wrote(side, *n, last);
         }
         match written {
@@ -4071,7 +4078,7 @@ impl FileHandle for InetSocket {
             self.uid.load(Ordering::SeqCst),
             self.gid.load(Ordering::SeqCst),
         );
-        self.send(buf, None, false, ids)
+        self.send(buf, None, Push::default(), ids)
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)
@@ -4379,7 +4386,7 @@ impl InetSocket {
                 match (ready.write_closed, ready.read_closed) {
                     (false, false) => TCP_ESTABLISHED,
                     (false, true) => TCP_CLOSE_WAIT,
-                    (true, false) if unsent > 0 => TCP_FIN_WAIT1,
+                    (true, false) if unsent > 0 || Self::end_waits(&s) => TCP_FIN_WAIT1,
                     (true, false) => TCP_FIN_WAIT2,
                     (true, true) if unsent > 0 => TCP_LAST_ACK,
                     (true, true) => {
@@ -4445,6 +4452,10 @@ impl InetSocket {
             })
             .map(|syn| (syn.tries as u8, syn.next()))
     }
+    /// Whether this side's end has gone and waits for its acknowledgement.
+    fn end_waits(s: &State) -> bool {
+        Self::joined(s).is_some_and(|(link, side)| link.segments(side).end_waits)
+    }
     /// What `tcp_get_info` tells of this socket at `now`, on the host's
     /// monotonic clock: a listener's queue, a handshake's tries, or what
     /// its connection has carried (see [`tcp_info`]).
@@ -4481,7 +4492,7 @@ impl InetSocket {
             Phase::Open => match (ready.write_closed, ready.read_closed) {
                 (false, false) => TCP_ESTABLISHED,
                 (false, true) => TCP_CLOSE_WAIT,
-                (true, false) if unsent > 0 => TCP_FIN_WAIT1,
+                (true, false) if unsent > 0 || Self::end_waits(s) => TCP_FIN_WAIT1,
                 (true, false) => TCP_FIN_WAIT2,
                 (true, true) if unsent > 0 => TCP_LAST_ACK,
                 (true, true) => TCP_CLOSE,
@@ -4499,6 +4510,7 @@ impl InetSocket {
             since_sent: since(counts.wrote.or(counts.opened)),
             since_received: since(counts.came.or(counts.opened)),
             rcv_wscale: counts.rcv_wscale,
+            segments: Self::joined(s).map(|(link, side)| link.segments(side)),
         };
         let in_flight = u32::from(matches!(state, TCP_FIN_WAIT1 | TCP_LAST_ACK));
         TcpInfo::connected(state, &carried, in_flight)
@@ -4882,7 +4894,14 @@ fn send(
         bytes,
         flags & MSG_NOSIGNAL != 0,
         flags & MSG_DONTWAIT != 0,
-        |part| socket.send(part, to, flags & MSG_OOB != 0, ids),
+        |part| {
+            let push = Push {
+                more: flags & MSG_MORE != 0,
+                urgent: flags & MSG_OOB != 0,
+                ..Push::default()
+            };
+            socket.send(part, to, push, ids)
+        },
     )
 }
 /// Receives for recvfrom or recvmsg: `MSG_PEEK` keeps the bytes, and on
@@ -5080,8 +5099,12 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, _) if !tcp => return Err(ENOPROTOOPT),
                 (6, 1) => {
                     options.no_delay = value != 0;
-                    if let Some(stream) = &socket.lock().stream {
+                    let s = socket.lock();
+                    if let Some(stream) = &s.stream {
                         stream.set_nodelay(value != 0);
+                    }
+                    if let Some((link, side)) = InetSocket::joined(&s) {
+                        link.set_no_delay(side, value != 0);
                     }
                 }
                 (6, 4 | 5) if !(1..=32767).contains(&value) => return Err(Errno::EINVAL),
@@ -5089,7 +5112,12 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, 5) => options.keep_interval = value,
                 (6, 6) if !(1..=127).contains(&value) => return Err(Errno::EINVAL),
                 (6, 6) => options.keep_count = value,
-                (6, 12) => options.quick_ack = value != 0,
+                (6, 12) => {
+                    options.quick_ack = value != 0;
+                    if let Some((link, side)) = InetSocket::joined(&socket.lock()) {
+                        link.set_quick(side, value);
+                    }
+                }
                 (6, 18) if value < 0 => return Err(Errno::EINVAL),
                 (6, 18) => options.user_timeout = value,
                 // A new type of service sets the priority too

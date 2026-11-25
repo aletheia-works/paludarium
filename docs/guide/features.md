@@ -6095,9 +6095,16 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `tcp_syn_linear_timeouts`; a connection, its state, options
     (timestamps, SACK and window scaling), window scales (10, or less for a
     receive buffer the guest set), the bytes it sent, had acknowledged and
-    received with its handshake and ends, those not sent yet, its data
-    segments and the times since data went and came. A UDP socket has no
-    TCP options (`EOPNOTSUPP`).
+    received with its handshake and ends, those not sent yet, its segments
+    and the times since data went and came. On the loopback the segments are
+    those Linux sends: each write its own, held while a small one waits for
+    its acknowledgement (Nagle's algorithm, unless `TCP_NODELAY` or urgent
+    data) or for `MSG_MORE`'s next (up to 201 ms); the first 16
+    acknowledgements at once, then with the data a side replies with, on a
+    read, or after 40 ms (`TCP_QUICKACK` sets which); at most 10 in flight
+    at first; a tail loss probe, which sends the last again; and the end,
+    with the data held before it. `FIN_WAIT1` lasts until the end is
+    acknowledged. A UDP socket has no TCP options (`EOPNOTSUPP`).
   - **Timestamps**: every UDP datagram is stamped as it comes, and
     `recvmsg` gives that time as Linux's `udp_recvmsg` does
     (`sock_recv_timestamp`), however late the receiver took the options:

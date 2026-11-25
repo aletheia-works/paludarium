@@ -250,14 +250,21 @@ verified.
     and the slow start threshold, congestion window, path MTU, advertised
     MSS and reordering Linux starts with. What Linux's TCP measures or
     tunes takes the values of a loopback connection in the simplest case:
-    the round trip (30 µs) and the timeout, rates and pacing it gives, the
-    send and receive MSS and windows, which never grow, and segment counts
-    of the bytes sent and received in 32 KiB segments, one acknowledgement
-    for each; the window scale its handshake offered stays; times
-    since data came count from its read. Beyond a handshake's tries nothing
-    is retransmitted or lost, so those counts are 0; the peer's window scale is taken as Linux's
-    default, whatever buffer it set; and a connection the host made is
-    told the same way as one on the loopback.
+    the round trip (30 µs) and the timeout, rates and pacing it gives, and
+    the windows, which never grow, so the send MSS stays 32 KiB and no
+    acknowledgement goes for a grown window; the window scale its handshake
+    offered stays; times since data came count from its read. The segments
+    are Linux's ([Network](./features#network)) while the
+    reader keeps up with writes of at most 536 bytes; larger ones and a
+    full window take more or fewer than Linux, and a connection across a
+    veth pair is counted as one on the loopback. The counts alone wait: data
+    that Nagle's algorithm, `MSG_MORE` or a loss holds back on Linux reaches
+    the peer at once here, and `SIOCOUTQ` and the readiness of both sides
+    say so. Beyond a handshake's tries and the segments a loss probe sends
+    again, nothing is retransmitted or lost; the peer's window scale is taken as Linux's
+    default, whatever buffer it set; and a connection the host made has
+    its segments estimated, in 32 KiB segments with one acknowledgement
+    for each.
 - **File mappings**: a file mapping shows the file's page cache as on Linux
   (a `MAP_PRIVATE` one in the pages it has not written), but the stores of a
   `MAP_SHARED` mapping reach the file on the host only when the guest reads

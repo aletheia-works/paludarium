@@ -3436,8 +3436,8 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 c,
                 &file,
                 ring,
-                min_complete,
-                LOCAL_TW_DEFAULT_MAX.max(min_complete),
+                at_least(min_complete),
+                LOCAL_TW_DEFAULT_MAX.max(at_least(min_complete)),
             );
         }
     }
@@ -3446,7 +3446,7 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             c,
             &file,
             ring,
-            min_complete.min(ring.cq_entries),
+            (min_complete as i32).min(ring.cq_entries as i32) as u32,
             flags,
             a[4],
             a[5],
@@ -3458,11 +3458,67 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     Ok(u64::from(submitted))
 }
 
+/// The completions `min_complete` asks for, an `int` of which a negative one
+/// asks for none.
+fn at_least(min_complete: u32) -> u32 {
+    (min_complete as i32).max(0) as u32
+}
+
+/// Linux's `struct ext_arg`: what a wait for completions is given
+/// (`io_get_ext_arg`).
+struct WaitArg {
+    sigmask: u64,
+    sigsz: u64,
+    /// The least time to wait for all the completions, in nanoseconds
+    /// (`min_wait_usec`).
+    min_time: u64,
+    /// The timeout, a `ktime_t`.
+    timeout: Option<i64>,
+}
+
+fn wait_arg(c: &Context<'_>, flags: u32, argp: u64, argsz: u64) -> Result<WaitArg, Errno> {
+    if flags & ENTER_EXT_ARG == 0 {
+        return Ok(WaitArg {
+            sigmask: argp,
+            sigsz: argsz,
+            min_time: 0,
+            timeout: None,
+        });
+    }
+    // struct io_uring_getevents_arg.
+    if argsz != 24 {
+        return Err(Errno::EINVAL);
+    }
+    let mut arg = [0; 24];
+    c.mem
+        .read(GuestAddr(argp), &mut arg)
+        .map_err(|_| Errno::EFAULT)?;
+    let ts = u64_at(&arg, 16);
+    let timeout = if ts == 0 {
+        None
+    } else {
+        let mut timespec = [0; 16];
+        c.mem
+            .read(GuestAddr(ts), &mut timespec)
+            .map_err(|_| Errno::EFAULT)?;
+        let (sec, nsec) = (u64_at(&timespec, 0) as i64, u64_at(&timespec, 8) as i64);
+        // `timespec64_to_ktime`.
+        Some(sec.saturating_mul(1_000_000_000).saturating_add(nsec))
+    };
+    Ok(WaitArg {
+        sigmask: u64_at(&arg, 0),
+        sigsz: u64::from(u32_at(&arg, 8)),
+        min_time: u64::from(u32_at(&arg, 12)) * 1000,
+        timeout,
+    })
+}
+
 /// Linux's `io_cqring_wait`: it runs the ring's own task work and the
 /// thread's, then is done once the program has `min` completions to
 /// consume, else it waits, with the signal mask it was given, for a signal
 /// (`EINTR`) or the timeout (`ETIME`), running task work that comes. An
-/// `IORING_OP_TIMEOUT` done as it waits ends it too. Completions in the
+/// `IORING_OP_TIMEOUT` done as it waits ends it too, and once the
+/// `min_wait_usec` passed, so does any completion. Completions in the
 /// queue by then make it succeed whatever ended the wait.
 fn wait(
     c: &mut Context<'_>,
@@ -3473,27 +3529,12 @@ fn wait(
     argp: u64,
     argsz: u64,
 ) -> Result<(), Errno> {
-    let (sigmask, sigsz, ts) = if flags & ENTER_EXT_ARG != 0 {
-        // struct io_uring_getevents_arg.
-        if argsz != 24 {
-            return Err(Errno::EINVAL);
-        }
-        let mut arg = [0; 24];
-        c.mem
-            .read(GuestAddr(argp), &mut arg)
-            .map_err(|_| Errno::EFAULT)?;
-        (
-            u64_at(&arg, 0),
-            u64::from(u32_at(&arg, 8)),
-            u64_at(&arg, 16),
-        )
-    } else {
-        (argp, argsz, 0)
-    };
+    let arg = wait_arg(c, flags, argp, argsz)?;
     if ring.flags & SETUP_DEFER_TASKRUN != 0 && ring.submitter.is_some_and(|t| t != c.tid) {
         return Err(EEXIST);
     }
     if local_pending(ring) {
+        let min = at_least(min);
         run_local(c, file, ring, min, LOCAL_TW_DEFAULT_MAX.max(min));
     }
     if task_work_due(c.inbox) {
@@ -3506,76 +3547,88 @@ fn wait(
     if ring.completions() >= min {
         return Ok(());
     }
-    // How many more it waits for (`nr_wait`), as much task work as its
-    // ring's own runs at a time while it waits.
-    let wanted = min - ring.completions();
+    let first = ring.load_u32(CQ_TAIL);
+    // The queue's tail it waits for, and how much task work of the ring's
+    // own it runs at a time meanwhile, as many completions as it lacks.
+    let mut target = ring.load_u32(CQ_HEAD).wrapping_add(min);
+    let mut wanted = target.wrapping_sub(first);
     let timeouts = timeout::done(ring);
-    let started = ring.load_u32(CQ_TAIL);
-    let mut ran = false;
-    let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
-    let deadline = if ts == 0 {
-        None
-    } else {
-        let mut timespec = [0; 16];
-        c.mem
-            .read(GuestAddr(ts), &mut timespec)
-            .map_err(|_| Errno::EFAULT)?;
-        let (sec, nsec) = (u64_at(&timespec, 0) as i64, u64_at(&timespec, 8) as i64);
-        let nanos = sec
-            .saturating_mul(1_000_000_000)
-            .saturating_add(nsec)
-            .max(0) as u64;
-        Some(if flags & ENTER_ABS_TIMER != 0 {
-            nanos
-        } else {
-            now.saturating_add(nanos)
+    let start = c.host.clock(paludarium_host::ClockId::Monotonic)? as i64;
+    // `KTIME_MAX` is no timeout.
+    let deadline = arg
+        .timeout
+        .map(|time| {
+            if flags & ENTER_ABS_TIMER != 0 {
+                time
+            } else {
+                time.wrapping_add(start)
+            }
         })
-    };
+        .filter(|end| *end != i64::MAX);
+    let mut least = (arg.min_time != 0).then(|| start.saturating_add(arg.min_time as i64));
     let old_mask = c.process.signal_mask;
-    if sigmask != 0 {
-        if sigsz != 8 {
+    if arg.sigmask != 0 {
+        if arg.sigsz != 8 {
             return Err(Errno::EINVAL);
         }
         c.process.signal_mask = c
             .mem
-            .read_u64(GuestAddr(sigmask))
+            .read_u64(GuestAddr(arg.sigmask))
             .map_err(|_| Errno::EFAULT)?
             & !((1 << 8) | (1 << 18));
         crate::userfaultfd::mask_changed(c.process.signal_mask);
     }
+    // Whether it is to sleep anew, rather than sleeps on.
+    let mut fresh = true;
+    let mut ran = false;
     let result = loop {
         let ticket = c.files.readiness.token.value();
-        if local_pending(ring) {
-            run_local(c, file, ring, wanted, wanted);
-            ran = true;
-            continue;
-        }
-        if task_work_due(c.inbox) {
-            run_task_work(c);
-            ran = true;
+        if run_waiting(c, file, ring, wanted) {
+            (fresh, ran) = (true, true);
+            wanted = target.wrapping_sub(ring.load_u32(CQ_TAIL));
             continue;
         }
         // `io_should_wake`. A timeout of another thread's counts once that
         // thread posts its completion, which is what wakes Linux's wait.
-        if ring.completions() >= min
-            || (timeout::done(ring) != timeouts && (ran || ring.load_u32(CQ_TAIL) != started))
+        let tail = ring.load_u32(CQ_TAIL);
+        if tail.wrapping_sub(target) as i32 >= 0
+            || (timeout::done(ring) != timeouts && (ran || tail != first))
         {
             break Ok(());
         }
-        if deadline.is_some_and(|end| {
-            c.host
-                .clock(paludarium_host::ClockId::Monotonic)
-                .is_ok_and(|now| now >= end)
-        }) {
+        let now = match c.host.clock(paludarium_host::ClockId::Monotonic) {
+            Ok(now) => now as i64,
+            Err(e) => break Err(e),
+        };
+        // Linux master looks at the timeout before it arms the timer of
+        // either time, which then is the only one there is.
+        if (fresh || least.is_none()) && deadline.is_some_and(|end| now >= end) {
             break Err(ETIME);
+        }
+        if least.is_some_and(|least| now >= least) {
+            // `io_cqring_min_timer_wakeup`, which compares the time itself
+            // with the timeout's end.
+            if deadline.is_none_or(|end| arg.min_time as i64 >= end)
+                || tail != first
+                || ring.completions() != 0
+            {
+                break Err(ETIME);
+            }
+            least = None;
+            target = first.wrapping_add(1);
+            continue;
         }
         // Task work that comes as it waits runs here, and ends no wait
         // (`io_cqring_wait_schedule` checks `task_sigpending`).
-        if let Err(e) = crate::events::wait_for(c, ticket, deadline, false) {
+        let end = least.or(deadline).map(|end| end.max(0) as u64);
+        if let Err(e) = crate::events::wait_for(c, ticket, end, false) {
             break Err(e);
         }
+        fresh = false;
     };
-    if sigmask != 0
+    // Whatever ends it, it runs the work that came.
+    run_waiting(c, file, ring, wanted);
+    if arg.sigmask != 0
         && result == Err(Errno(4))
         && crate::signals::next_pending(c.process, true).is_some()
     {
@@ -3590,6 +3643,21 @@ fn wait(
         return Ok(());
     }
     result
+}
+
+/// Runs the ring's own task work, `wanted` of it at a time, and the
+/// thread's, if there is any, and moves completions without room to the
+/// queue.
+fn run_waiting(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wanted: u32) -> bool {
+    let (local, task) = (local_pending(ring), task_work_due(c.inbox));
+    if local {
+        run_local(c, file, ring, wanted, wanted);
+    }
+    if task {
+        run_task_work(c);
+    }
+    ring.flush(&mut ring.state());
+    local || task
 }
 
 /// `io_uring_register(fd, opcode, arg, nr_args)`: only

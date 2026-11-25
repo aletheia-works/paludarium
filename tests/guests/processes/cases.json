@@ -574,6 +574,7 @@
     {"name":"io-uring-net","binary":"process"},
     {"name":"io-uring-placement","binary":"process"},
     {"name":"io-uring-timeout","binary":"process"},
+    {"name":"io-uring-min-wait","binary":"process"},
     {"name":"io-uring-poll-add","binary":"process"},
     {"name":"io-uring-fs","binary":"process"},
     {"name":"io-uring-message","binary":"process"},

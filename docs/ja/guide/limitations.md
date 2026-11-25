@@ -547,8 +547,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   リングのどの領域でもないオフセットのマッピングは、差分テストを走らせるカーネルである
   Linux 7.0 と同じく `ENOMEM` です。Linux master の `io_uring_get_unmapped_area` は `EINVAL` を
   返します。テストを走らせるカーネルが追いつけば master に合わせます。
-  機能は Linux 6.12 のものなので、待ちの `min_wait_usec` は何も変えないのに
-  `IORING_FEAT_MIN_TIMEOUT` を報告します。疑似端末の読み出しは、パイプの読み出しのように
+  機能は Linux 6.12 のものです。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに
   `EINVAL` で失敗します。`IORING_ASYNC_CANCEL_OP` と `IORING_OP_LAST` 以降の操作を持つ

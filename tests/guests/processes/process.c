@@ -12216,6 +12216,60 @@ static int io_uring_timeout_case(void) {
     return 0;
 }
 
+/* A wait's min_wait_usec (struct io_uring_getevents_arg). */
+static void umw_wait(struct uring *u, unsigned submit, unsigned min, unsigned usec,
+                     struct timespec *ts, long least_ms, const char *label) {
+    struct {
+        unsigned long sigmask;
+        unsigned sigmask_sz, min_wait_usec;
+        unsigned long ts;
+    } arg = {0, 0, usec, (unsigned long)ts};
+    struct timespec from, to;
+    clock_gettime(CLOCK_MONOTONIC, &from);
+    long r = uring_enter(u->fd, submit, min, 1 | 8, &arg, sizeof arg);
+    int e = errno;
+    clock_gettime(CLOCK_MONOTONIC, &to);
+    errno = e;
+    uring_show(label, r);
+    uring_reap(u, label);
+    long ms = (to.tv_sec - from.tv_sec) * 1000 + (to.tv_nsec - from.tv_nsec) / 1000000;
+    printf("%s: waited=%d\n", label, ms >= least_ms && ms < 50000);
+}
+
+static int io_uring_min_wait_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    int p[2];
+    if (pipe(p)) return 81;
+    char buf[8];
+    struct timespec later = {0, 60 * 1000 * 1000}, never = {100, 0}, now = {0, 0};
+
+    /* Nothing comes: the least time ends it, else the timeout. */
+    umw_wait(&u, 0, 1, 20000, NULL, 20, "least");
+    umw_wait(&u, 0, 1, 20000, &later, 60, "timeout");
+    umw_wait(&u, 0, 1, 0, &now, 0, "at-once");
+    umw_wait(&u, 0, 0, 20000, &never, 0, "none");
+    /* Fewer completions are enough once the least time passed. */
+    uring_push(&u, 0, 1);
+    umw_wait(&u, 1, 2, 20000, &never, 20, "fewer");
+    uring_push(&u, 0, 1);
+    umw_wait(&u, 1, 2, 20000, NULL, 20, "fewer-no-timeout");
+    uring_push(&u, 0, 1);
+    uring_push(&u, 0, 2);
+    umw_wait(&u, 2, 2, 100000000, &never, 0, "all");
+    /* Those that come after it end the wait at once: a linked timeout, which
+       ends no wait by itself, and the read it cancels. */
+    pw_read(&u, 1, p[0], buf, sizeof buf, 0)[1] = 4;
+    uto_timeout(&u, 15, 2, &later, 0, 0);
+    umw_wait(&u, 2, 4, 10000, &never, 60, "after");
+    /* The timeout is read even if nothing is to wait for; a negative number
+       of completions is there. */
+    umw_wait(&u, 0, 0, 0, (struct timespec *)8, 0, "unmapped");
+    uring_show("negative", uring_enter(u.fd, 0, 0xffffffff, 1, NULL, 0));
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's polls: IORING_OP_POLL_ADD and _POLL_REMOVE. */
 static unsigned char *up_add(struct uring *u, unsigned long data, int fd, unsigned events,
                              unsigned flags) {
@@ -44048,6 +44102,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-held-buffer")) return io_uring_held_buffer_case();
     if (!strcmp(mode, "io-uring-net")) return io_uring_net_case();
     if (!strcmp(mode, "io-uring-timeout")) return io_uring_timeout_case();
+    if (!strcmp(mode, "io-uring-min-wait")) return io_uring_min_wait_case();
     if (!strcmp(mode, "io-uring-poll-add")) return io_uring_poll_add_case();
     if (!strcmp(mode, "io-uring-fs")) return io_uring_fs_case();
     if (!strcmp(mode, "io-uring-message")) return io_uring_message_case();

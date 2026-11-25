@@ -1669,6 +1669,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - `IORING_SETUP_DEFER_TASKRUN` のリングは、そのリングで `io_uring_enter` が待つときだけ、
     待ちがそれ以上を求めない限り一度に 20 個（`IO_LOCAL_TW_DEFAULT_MAX`）実行します。
 
+  `io_uring_enter` の待ちは、求めた数の完了、待つあいだに終わった `IORING_OP_TIMEOUT`
+  （`cq_timeouts`）、シグナル、タイムアウトで終わります。`min_wait_usec` があれば、その時間が
+  過ぎたときにはもっと少ない完了でも終わり、過ぎた後は最初の完了で終わります。完了もタイムアウトも
+  なければ、そのとき `ETIME` で終わります（`io_cqring_min_timer_wakeup`）。
+
   `IORING_SETUP_TASKRUN_FLAG` があれば、`IORING_SQ_TASKRUN` が待っているものがあることを
   示します。`IOSQE_CQE_SKIP_SUCCESS` 付きの要求が失敗したリンクは、残りを完了なしで取り消し
   ます（`REQ_F_SKIP_LINK_CQES`）。

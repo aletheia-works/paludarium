@@ -6831,6 +6831,94 @@ mod io_uring {
         assert_eq!(reap(&mut f, &r), [(6, -62)]);
     }
 
+    /// A wait's `struct io_uring_getevents_arg` with `min_wait_usec` and,
+    /// but for `None`, a timeout of `nanos`.
+    fn wait_min(
+        f: &mut Fixture,
+        r: &Ring,
+        submit: u64,
+        min: u64,
+        usec: u32,
+        nanos: Option<i64>,
+    ) -> u64 {
+        let (arg, ts) = (DATA + 0x600, DATA + 0x640);
+        f.mem.write(GuestAddr(arg), &[0; 24]).unwrap();
+        f.mem
+            .write(GuestAddr(arg + 12), &usec.to_le_bytes())
+            .unwrap();
+        if let Some(nanos) = nanos {
+            f.mem.write_u64(GuestAddr(arg + 16), ts).unwrap();
+            f.mem.write_u64(GuestAddr(ts), 0).unwrap();
+            f.mem.write_u64(GuestAddr(ts + 8), nanos as u64).unwrap();
+        }
+        f.ret(426, &[r.fd, submit, min, GETEVENTS | 1 << 3, arg, 24])
+    }
+
+    #[test]
+    fn a_wait_ends_with_any_completion_after_its_least_time() {
+        const MS: u64 = 1_000_000;
+        let mut f = fixture();
+        at_time(&f, 0);
+        let r = ring(&mut f);
+        let now = |f: &Fixture| f.host.clock(paludarium_host::ClockId::Monotonic).unwrap();
+        let etime = errno(Errno(62));
+        // Nothing comes: with no timeout the least time ends it, else the
+        // timeout does, which a shorter one waits for too.
+        assert_eq!(wait_min(&mut f, &r, 0, 1, 20_000, None), etime);
+        assert_eq!(now(&f), 20 * MS);
+        assert_eq!(
+            wait_min(&mut f, &r, 0, 1, 20_000, Some(50 * MS as i64)),
+            etime
+        );
+        assert_eq!(now(&f), 70 * MS);
+        assert_eq!(
+            wait_min(&mut f, &r, 0, 1, 20_000, Some(10 * MS as i64)),
+            etime
+        );
+        assert_eq!(now(&f), 90 * MS);
+        // One that passed is looked at first.
+        assert_eq!(wait_min(&mut f, &r, 0, 1, 20_000, Some(-5)), etime);
+        assert_eq!(now(&f), 90 * MS);
+        // Fewer completions than asked are enough once the least time
+        // passed, not before.
+        let slot = u32_at(&f, r.rings + 4) & 3;
+        push(&mut f, &r, slot, &nop(7, 0, 0, 0, 0));
+        assert_eq!(
+            wait_min(&mut f, &r, 1, 2, 20_000, Some(1000 * MS as i64)),
+            1
+        );
+        assert_eq!(now(&f), 110 * MS);
+        assert_eq!(reap(&mut f, &r), [(7, 0)]);
+        // One that comes after it ends the wait at once: a read's linked
+        // timeout, which ends no wait by itself.
+        let (at, ends, buf) = (DATA + 0x100, DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let mut reads = rw(22, u64::from(u32_at(&f, ends)), u64::MAX, buf, 8);
+        reads[1] = 4;
+        let link = timeout(&f, LINK_TIMEOUT, 2, at, 60 * MS, 0, 0);
+        for e in [reads, link] {
+            let slot = u32_at(&f, r.rings + 4) & 3;
+            push(&mut f, &r, slot, &e);
+        }
+        assert_eq!(
+            wait_min(&mut f, &r, 2, 4, 20_000, Some(1000 * MS as i64)),
+            2
+        );
+        assert_eq!(now(&f), 170 * MS);
+        assert_eq!(reap(&mut f, &r), [(2, -62), (1, -125)]);
+        // The timeout is read before anything else, and a negative number of
+        // completions is there at once.
+        f.mem.write_u64(GuestAddr(DATA + 0x610), 8).unwrap();
+        assert_eq!(
+            f.ret(426, &[r.fd, 0, 0, GETEVENTS | 1 << 3, DATA + 0x600, 24]),
+            errno(Errno::EFAULT)
+        );
+        assert_eq!(f.ret(426, &[r.fd, 0, 0xffff_ffff, GETEVENTS, 0, 0]), 0);
+        // `KTIME_MAX` from now is past.
+        assert_eq!(wait_min(&mut f, &r, 0, 1, 0, Some(i64::MAX)), etime);
+        assert_eq!(now(&f), 170 * MS);
+    }
+
     #[test]
     fn a_timeout_completes_after_its_number_of_completions() {
         let mut f = fixture();

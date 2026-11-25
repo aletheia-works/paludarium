@@ -1901,6 +1901,12 @@ kernel.
     `io_uring_enter` waits on that ring, 20 at a time unless the wait wants
     more (`IO_LOCAL_TW_DEFAULT_MAX`).
 
+  A wait in `io_uring_enter` ends with the completions it asked for, an
+  `IORING_OP_TIMEOUT` done meanwhile (`cq_timeouts`), a signal, or its
+  timeout. With `min_wait_usec`, fewer completions end it once that time
+  passed, and so does the first one after it; with none and no timeout it
+  ends then with `ETIME` (`io_cqring_min_timer_wakeup`).
+
   With `IORING_SETUP_TASKRUN_FLAG`, `IORING_SQ_TASKRUN` shows that some
   waits. A link whose request fails with `IOSQE_CQE_SKIP_SUCCESS` cancels
   the rest without their completions (`REQ_F_SKIP_LINK_CQES`).

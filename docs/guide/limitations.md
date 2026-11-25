@@ -659,8 +659,7 @@ verified.
   Linux master's `io_uring_get_unmapped_area` gives `EINVAL`. This follows
   master once the test runners' kernel does.
   The features are Linux
-  6.12's, so `IORING_FEAT_MIN_TIMEOUT` is reported though a wait's
-  `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
+  6.12's. A pseudo-terminal's read waits in
   `io_uring_enter` instead of waiting for its file as a pipe's read does. A file that is never read (an epoll instance, a ring)
   fails with `EINVAL` at once, where Linux first waits for it to be ready.
   An `IORING_OP_ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_OP` and an

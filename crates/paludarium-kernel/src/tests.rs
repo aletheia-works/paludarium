@@ -3112,7 +3112,7 @@ fn populating_a_writable_private_file_mapping_copies_its_pages() {
         f.mem
             .mappings()
             .find(|m| m.start.0 == at)
-            .is_some_and(|m| m.written)
+            .is_some_and(|m| m.anon_vma.is_some())
     };
     let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2, fd, 4096]);
     assert!(!written(&f, at));

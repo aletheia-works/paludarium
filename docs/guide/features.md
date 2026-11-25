@@ -4359,7 +4359,16 @@ kernel.
   position only (`EINVAL` from the end), and its size is 0. A descriptor
   shows the address space it was opened on, which a forked child reading it
   sees too, and nothing once no thread uses that space, as after an `execve`.
-  It cannot be mapped (`ENODEV`).
+  It cannot be mapped (`ENODEV`). Its lines are Linux's VMAs, merged as
+  `is_mergeable_anon_vma` and `can_vma_merge_right` merge them: two that
+  differ in nothing else are one only if their private memory has one
+  `anon_vma`, or one of them none. A VMA takes an `anon_vma` at its first
+  write (`mlock`'s faults included): that of the VMA after it, or else of
+  the one before it, if they differ in no more than protection, name and
+  which `userfaultfd` they are registered with, or else one of its own. A
+  `fork`ed child's VMAs each have one of their own, which none without one
+  merges with; and anonymous memory that `mremap` moves once written keeps
+  its page offset (`vm_pgoff`), so it merges with nothing there.
 
 - `/proc/self/smaps` follows each line of `maps` with Linux's `show_smap`
   block, read as `maps` is: the size, what the pages hold (`Rss`, `Pss`,
@@ -5998,9 +6007,9 @@ kernel.
     none on a CPU without XSAVE, which the virtual CPU is. The memory is
     chosen as Linux's `vma_dump_size` chooses it with the default
     `coredump_filter`: a private mapping is there whole once a page of its VMA
-    was written (Linux's `anon_vma`, which a split, `MADV_DONTNEED` and `fork`
-    keep, a mapping merging with the VMA shares, and bringing a writable one's
-    pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault), and nothing of it otherwise, but the
+    was written (Linux's `anon_vma`, which a split and `MADV_DONTNEED`
+    keep, a mapping merging with the VMA shares, a `fork`ed child's VMA has
+    its own of, and bringing a writable one's pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault), and nothing of it otherwise, but the
     first page of a file mapping from the start of an ELF file; a shared
     mapping is there whole when no name links its file (an anonymous one, a
     memfd, a file unlinked since), and nothing of it otherwise. Whether a

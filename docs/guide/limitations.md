@@ -48,12 +48,7 @@ verified.
   program's own segments and its interpreter's are named by the path the
   file had when it was started, with its symbolic links resolved and
   `(deleted)` once nothing links it, but not after a rename, which Linux
-  follows. Maps can show fewer VMAs than Linux after a merge: Linux merges
-  two VMAs only where their `anon_vma`s are compatible
-  (`is_mergeable_anon_vma`), and the emulator does not model `anon_vma`
-  identity, so it merges neighbours that Linux keeps apart, such as after
-  `munlock` of a page `mlock` populated next to a piece written while it was
-  part of another VMA.
+  follows.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
@@ -783,12 +778,9 @@ verified.
     would run it in that segment or fault.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache.
-  - Adjacent private VMAs merge once their flags agree again (after
-    `munlock`, for one), whatever their `anon_vma`s. Linux merges them only
-    when they share one or one of them has none. A VMA gets its `anon_vma` on its first write, and
-    takes a neighbour's only if their flags agreed then
-    (`anon_vma_compatible`), so pieces written while apart may stay
-    separate VMAs in `/proc/<pid>/maps`.
+  - Adjacent VMAs never written that a `fork`ed child's lost locks or
+    `userfaultfd` registrations make alike are one VMA in
+    `/proc/<pid>/maps`, where Linux merges none at a `fork`.
   - `mmap` with
     `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
     `RLIMIT_MEMLOCK` (`EAGAIN`) before it finds room for the mapping

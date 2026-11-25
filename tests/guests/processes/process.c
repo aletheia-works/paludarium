@@ -7293,14 +7293,9 @@ static int vma_names_case(void) {
     printf("rename: %ld\n", vn_name(a, (size_t)(4 * page), "case-b"));
     printf("named pieces: %d\n", vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]"));
     munlock(a + 2 * page, (size_t)page);
-    /* Every line of the range still carries the name. How many lines there
-       are depends on anon_vma identity, which Linux's VMA merge checks and
-       the emulator does not model (see limitations: "/proc/self/maps"): on
-       Linux the first page can share the anon_vma of memory musl's fopen
-       mapped right below it and wrote, which keeps it apart from page 2's. */
-    printf("after munlock: all named %d\n",
-           vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]") ==
-               vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), " "));
+    /* How many lines there are is anon_vma identity (vma-merges): what
+       musl's fopen maps may lie right below the range. */
+    printf("after munlock: %d\n", vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]"));
     /* What Linux refuses. */
     printf("bad char: %ld %ld %ld\n", vn_name(a, (size_t)page, "a[b"), vn_name(a, (size_t)page, "a$b"),
            vn_name(a, (size_t)page, "a\tb"));
@@ -7440,6 +7435,131 @@ static int proc_mem_case(void) {
         close(theirs);
     }
     waitpid(child, NULL, 0);
+    return 0;
+}
+/* The vma-merges case: which VMAs merge again, as mm/vma.c's
+   is_mergeable_anon_vma, can_vma_merge_right and find_mergeable_anon_vma
+   have it. Each range lies between two guard pages, so that nothing else
+   merges with it, and is shown as the pages of each line of maps. */
+static long vm_page;
+static char *vm_range(int pages) {
+    char *at = mmap(NULL, (size_t)((pages + 2) * vm_page), PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (at == MAP_FAILED) return NULL;
+    at += vm_page;
+    if (mprotect(at, (size_t)(pages * vm_page), PROT_READ | PROT_WRITE)) return NULL;
+    return at;
+}
+static void vm_show(const char *what, char *at, int pages) {
+    static char text[65536];
+    size_t size = 0;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    long n;
+    while (fd >= 0 && size < sizeof text - 1 &&
+           (n = read(fd, text + size, sizeof text - 1 - size)) > 0)
+        size += (size_t)n;
+    if (fd >= 0) close(fd);
+    text[size] = 0;
+    printf("%s:", what);
+    for (char *line = text; line && *line;) {
+        unsigned long start, end, from = (unsigned long)at, to = from + (unsigned long)(pages * vm_page);
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && start < to && end > from)
+            printf(" %ld-%ld", (long)(start - from) / vm_page, (long)(end - from) / vm_page);
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    printf("\n");
+}
+static void vm_touch(char *at) { *(volatile char *)at = 1; }
+static int vma_merges_case(void) {
+    vm_page = sysconf(_SC_PAGESIZE);
+    /* stdout's buffer and fd 1's state first: nothing else is mapped. */
+    printf("start\n");
+    fflush(stdout);
+    char *a = vm_range(4);
+    if (!a) return 80;
+    /* A page mlock faults in, between untouched ones, merges again. */
+    if (mlock(a + 2 * vm_page, (size_t)vm_page)) return 81;
+    vm_show("locked", a, 4);
+    munlock(a + 2 * vm_page, (size_t)vm_page);
+    vm_show("unlocked", a, 4);
+    /* Two pieces first written apart stay apart; the one between, never
+       written, goes with the one before it. */
+    a = vm_range(4);
+    mlock(a + 2 * vm_page, (size_t)vm_page);
+    vm_touch(a);
+    munlock(a + 2 * vm_page, (size_t)vm_page);
+    vm_show("written apart", a, 4);
+    a = vm_range(3);
+    mlock2(a + vm_page, (size_t)vm_page, 1);
+    vm_touch(a);
+    vm_touch(a + 2 * vm_page);
+    munlock(a + vm_page, (size_t)vm_page);
+    vm_show("none between two", a, 3);
+    /* A neighbour that differs in its protection alone is shared with, the
+       one after first; one that is locked is not. */
+    a = vm_range(3);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE | PROT_EXEC);
+    vm_touch(a + 2 * vm_page);
+    vm_touch(a);
+    vm_touch(a + vm_page);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("shared with the next", a, 3);
+    a = vm_range(2);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE | PROT_EXEC);
+    vm_touch(a);
+    vm_touch(a + vm_page);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("shared with the one before", a, 2);
+    /* Memory moved by mremap merges where it goes only if never written. */
+    for (int written = 0; written < 2; written++) {
+        char *to = vm_range(2), *from = vm_range(1);
+        munmap(to + vm_page, (size_t)vm_page);
+        if (written) vm_touch(from);
+        if (mremap(from, (size_t)vm_page, (size_t)vm_page, MREMAP_MAYMOVE | MREMAP_FIXED,
+                   to + vm_page) == MAP_FAILED) return 82;
+        vm_show(written ? "moved written" : "moved unwritten", to, 2);
+    }
+    /* MREMAP_DONTUNMAP leaves a whole VMA without its anon_vma. */
+    a = vm_range(2);
+    vm_touch(a);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ);
+    vm_touch(a);
+    if (mremap(a, (size_t)vm_page, (size_t)vm_page, MREMAP_MAYMOVE | 4, 0) == MAP_FAILED) return 83;
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("left behind", a, 2);
+    /* munmap and mprotect of part of a named VMA: both parts keep it. */
+    a = vm_range(4);
+    long named = vn_name(a, (size_t)(4 * vm_page), "part");
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ);
+    munmap(a + 2 * vm_page, (size_t)vm_page);
+    printf("named parts: %ld %d\n", named,
+           vn_count((uintptr_t)a, (uintptr_t)(a + 4 * vm_page), "[anon:part]"));
+    /* A forked child's VMAs each have an anon_vma of their own, and what it
+       maps next to one does not merge with it. */
+    a = vm_range(5);
+    munmap(a + 4 * vm_page, (size_t)vm_page);
+    vm_touch(a);
+    mprotect(a + 2 * vm_page, (size_t)vm_page, PROT_READ);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        mprotect(a + 2 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+        vm_show("child", a, 4);
+        if (mmap(a + 4 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) _exit(84);
+        vm_show("child with more", a, 5);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    mprotect(a + 2 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("parent", a, 4);
+    if (mmap(a + 4 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return 85;
+    vm_show("parent with more", a, 5);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
@@ -39511,6 +39631,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "exec-names")) return exec_names_case();
     if (!strcmp(mode, "exec-names-child")) return exec_names_child();
     if (!strcmp(mode, "vma-names")) return vma_names_case();
+    if (!strcmp(mode, "vma-merges")) return vma_merges_case();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();

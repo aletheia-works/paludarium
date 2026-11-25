@@ -2750,6 +2750,7 @@ impl Kernel {
             inbox: inbox.clone(),
             group: self.group.clone(),
             copies: None,
+            armed: false,
             pending_child: None,
             processes: self.processes.clone(),
             spawn_memory: None,

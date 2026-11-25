@@ -3623,6 +3623,7 @@ impl Kernel {
             inbox,
             group,
             copies: None,
+            armed: false,
             processes: self.processes.clone(),
             pending_child: None,
             spawn_memory: child_mem,

@@ -196,8 +196,13 @@ impl Env {
         t.cpu.gpr[reg::R9] = a[5];
         self.k
             .handle(t, &self.m, ExitReason::Syscall { rip: t.cpu.rip });
-        // A signal the call returns to runs the guest's handler, which
-        // returns through the restorer's rt_sigreturn.
+        self.handlers();
+        self.t.cpu.gpr[reg::RAX] as i64
+    }
+
+    /// A signal the kernel returns to runs the guest's handler, which
+    /// returns through the restorer's rt_sigreturn.
+    fn handlers(&mut self) {
         while self.t.cpu.rip == GuestAddr(HANDLER) {
             let number = self.t.cpu.gpr[reg::RDI];
             let mut info = [0; 40];
@@ -211,7 +216,32 @@ impl Env {
             self.k
                 .handle(t, &self.m, ExitReason::Syscall { rip: t.cpu.rip });
         }
-        self.t.cpu.gpr[reg::RAX] as i64
+    }
+
+    /// A store of the guest's code at `at`, whose fault the kernel sees
+    /// where an event samples it, as an instruction's that then runs again.
+    /// How many faults it took so.
+    fn store(&mut self, at: u64) -> u32 {
+        for taken in 0.. {
+            let Err(fault) = self.m.write(GuestAddr(at), &[1]) else {
+                return taken;
+            };
+            assert!(taken < 3 && fault.mapped && fault.write, "{fault:?}");
+            let gpr = self.t.cpu.gpr;
+            let rip = self.t.cpu.rip;
+            let reason = ExitReason::PageFault {
+                rip,
+                addr: fault.addr,
+                write: true,
+                fetch: false,
+                mapped: true,
+                present: fault.present,
+            };
+            self.k.handle(&mut self.t, &self.m, reason);
+            self.handlers();
+            assert_eq!((self.t.cpu.gpr, self.t.cpu.rip), (gpr, rip));
+        }
+        unreachable!()
     }
 
     /// The guest's `on_io` and `on_trap`.
@@ -348,7 +378,7 @@ impl Env {
         );
         assert!(p > 0, "{p}");
         for i in 0..pages {
-            self.m.write(GuestAddr(p as u64 + i * 4096), &[1]).unwrap();
+            self.store(p as u64 + i * 4096);
         }
     }
 
@@ -582,11 +612,6 @@ fn perf_sample_records_faults_loses_pauses_and_writes_backward() {
     );
 }
 
-/// perf-wakeup up to its child: poll without a buffer and with one,
-/// `wakeup_events` and `wakeup_watermark`, `O_ASYNC` signals of each
-/// overflow, `PERF_EVENT_IOC_REFRESH`, and `sigtrap`'s `SIGTRAP`, taken
-/// and blocked. The child whose event hangs up when it ends stays with the
-/// differential tests.
 /// An event of a CPU counts and samples what any thread does there while it
 /// is enabled, and nothing of another CPU.
 #[test]
@@ -645,6 +670,11 @@ fn an_event_of_a_cpu_counts_and_samples_what_runs_there() {
     assert_eq!(samples(&e, here).len(), 7);
 }
 
+/// perf-wakeup up to its child: poll without a buffer and with one,
+/// `wakeup_events` and `wakeup_watermark`, `O_ASYNC` signals of each
+/// overflow, `PERF_EVENT_IOC_REFRESH`, and `sigtrap`'s `SIGTRAP`, taken
+/// and blocked. The child whose event hangs up when it ends stays with the
+/// differential tests.
 #[test]
 fn perf_wakeup_polls_signals_refreshes_and_traps() {
     let mut e = Env::new();

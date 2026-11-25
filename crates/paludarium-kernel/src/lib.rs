@@ -884,6 +884,9 @@ pub struct Kernel {
     group: Arc<ThreadGroup>,
     /// What resolves its calls' faulting copies ([`KernelCopies`]).
     copies: Option<Arc<userfaultfd::KernelCopies>>,
+    /// Its thread's faults are refused, for an event to sample each at its
+    /// instruction ([`paludarium_mmu::faults::arm`]).
+    armed: bool,
     pending_child: Option<(Box<Kernel>, Thread)>,
     processes: Arc<Processes>,
     spawn_memory: Option<Arc<AddressSpace>>,
@@ -940,6 +943,7 @@ impl Kernel {
             inbox: Arc::new(SignalInbox::default()),
             group,
             copies: None,
+            armed: false,
             pending_child: None,
             processes,
             spawn_memory: None,
@@ -1476,6 +1480,18 @@ impl Kernel {
         if sampling {
             self.perf_samples(thread, mem);
         }
+        // A fault of its own code that an event samples stops the thread at
+        // its instruction.
+        if sampling || self.armed {
+            self.armed = sampling
+                && perf::samples_faults(
+                    &self.processes.perf_events,
+                    &self.group,
+                    thread.tid,
+                    thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+                );
+            paludarium_mmu::faults::arm(self.armed);
+        }
         if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
             self.group.expire_timer(&mut thread.state, now);
         }
@@ -1843,6 +1859,24 @@ impl Kernel {
                 reason,
             };
             return self.userfault(thread, mem, context, access);
+        }
+        // One a sampling event is to see ([`paludarium_mmu::faults::arm`]):
+        // the page is brought in, and the samples and signals are those of
+        // the instruction, which then runs again, as Linux's return from the
+        // fault runs the task work of its overflow first.
+        if let ExitReason::PageFault {
+            rip,
+            addr,
+            write,
+            fetch,
+            mapped: true,
+            ..
+        } = reason
+            && self.armed
+            && mem.touch(addr, write, fetch)
+        {
+            thread.cpu.rip = rip;
+            return self.checkpoint(thread, mem);
         }
         let fault = match reason {
             ExitReason::PageFault {

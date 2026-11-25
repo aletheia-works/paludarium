@@ -14,7 +14,9 @@
 //! next record that fits follows a `PERF_RECORD_LOST` of them
 //! ([`super::buffer::Buffer::output`]).
 //!
-//! The emulator counts what a thread did as of its system calls
+//! A fault of a thread's own code that an event samples stops it at its
+//! instruction ([`samples_faults`]), and is sampled there. For the rest,
+//! the emulator counts what a thread did as of its system calls
 //! ([`crate::Usage`]), so the samples are taken there too ([`overflow`]),
 //! of the thread as it makes the call: its registers, its stack and the
 //! frames its `rbp` chain leads to. An occurrence in the thread's own code
@@ -500,6 +502,31 @@ pub(crate) fn overflow(
         .into_iter()
         .filter_map(|event| event.take_samples(task, &usage, per_tick))
         .collect()
+}
+
+/// Whether an enabled event samples the faults of the code of thread `tid`
+/// of `group`, which is on `cpu`.
+pub(crate) fn samples_faults(
+    events: &Events,
+    group: &crate::ThreadGroup,
+    tid: u32,
+    cpu: u32,
+) -> bool {
+    let wants = |event: &Event| {
+        event.counter == Counter::Faults
+            && event.attr.sampling()
+            && !event.attr.flag(bit::EXCLUDE_USER)
+            && (event.cpu < 0 || u32::try_from(event.cpu) == Ok(cpu))
+            && {
+                let state = lock(&event.state);
+                state.enabled && !state.paused && !state.removed
+            }
+    };
+    let lists = lock(&events.lists);
+    let mut of_cpu = lists.cpu_sampling.iter().filter_map(super::event);
+    let mut of_task = lists.counting.iter().filter_map(super::event);
+    of_cpu.any(|event| wants(&event))
+        || of_task.any(|event| event.counts(group, tid) && wants(&event))
 }
 
 /// Whether any event of the machine samples, for the checkpoints that

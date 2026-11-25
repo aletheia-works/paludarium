@@ -317,7 +317,9 @@ verified.
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
-  are hardware events even on a host with a PMU. A thread's context
+  are hardware events even on a host with a PMU: cycles and cache misses
+  mean nothing here, and the x86-64 test machines, which are virtual, have
+  no PMU to compare a count of instructions with. A thread's context
   switches and CPU migrations are those it last accounted, at its latest
   system call; its CPU time is looked at as the event is read, and its page
   faults count as they are taken. An event of
@@ -327,13 +329,15 @@ verified.
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
   to another); and a thread without `rseq` moves to
   another CPU only when a new CPU mask changes the lowest CPU it allows.
-  A sampling event's samples are taken as its thread enters a system call,
-  or reaches the emulator's checkpoint, of what it did since then, where
-  Linux takes each at its occurrence: they show the thread's instruction,
-  registers, stack and frames as of then (a fault's own address is its
-  own, but 0 for one before the thread's last 4096), and one of the kernel
-  (a fault in a system call, a switch or a migration) has the instruction
-  0 and no kernel frames. `freq` follows the rate at those points,
+  A fault of a thread's own code is sampled, and signalled, at its
+  instruction, as on Linux. A sampling event's other samples are taken as
+  its thread enters or leaves a system call, or reaches the emulator's
+  checkpoint, of what it did since then, where Linux takes each at its
+  occurrence: they show the thread's instruction, registers, stack and
+  frames as of then (a fault's own address is its own, but 0 for one
+  before the thread's last 4096), and one of the kernel (a fault in a
+  system call, a switch or a migration) has the instruction 0 and no
+  kernel frames. `freq` follows the rate at those points,
   not at each tick. A `cpu-clock` or `task-clock` event is throttled at
   `perf_event_max_sample_rate` over `HZ` (1000) interrupts in a tick, as
   Linux's hrtimer events are, the ticks being those of its own count, and
@@ -362,10 +366,7 @@ verified.
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
   failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
-  written. The overflows
-  of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
-  each time the thread returns to its code; its `si_addr` is the first
-  fault's. When `REFRESH`'s last overflow disables the event, its count
+  written. When `REFRESH`'s last overflow disables the event, its count
   stops there, but its times (a clock's apart) and its group's other
   events go on up to that point. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them

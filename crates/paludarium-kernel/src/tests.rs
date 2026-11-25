@@ -2892,7 +2892,13 @@ fn an_open_or_truncate_that_conflicts_breaks_a_lease() {
     assert_eq!(f.ret(72, &[rd, 1024, 2]), errno(Errno::EAGAIN));
     assert_eq!(f.ret(72, &[rd, 9]), 0);
     assert_eq!(f.ret(3, &[late]), 0);
-    // A cancellation ends the wait, as a signal does.
+    // A cancellation ends the wait, as a signal does. The calls that wait
+    // run again after one (ERESTARTSYS); ftruncate does not wait.
+    for number in [2, 76, 85, 257, 304, 437] {
+        assert!(crate::signals::restarts_without_handler(number, &[0; 6]));
+        assert!(crate::signals::restarts_with_handler(number));
+    }
+    assert!(!crate::signals::restarts_without_handler(77, &[0; 6]));
     assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
     f.kernel
         .cancellation

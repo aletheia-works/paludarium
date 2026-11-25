@@ -1220,10 +1220,14 @@ verified.
   Linux takes the first one's for IPv4, which a host may have changed
   (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
   takes `accept_local`, `send_redirects`, `shared_media` and
-  `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward` and
-  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default`,
+  `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward`,
+  `fib_multipath_hash_seed` and the `forwarding`, `rp_filter`,
+  `accept_dad` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
+  A write of `fib_multipath_hash_seed` is taken whole and leaves the file
+  where it was, as Linux 7.0 to 7.2 do; master takes what it reads and
+  moves the file on (`proc_vec`).
   IPv6's `forwarding` joins no router anycast address, and an end made
   while `default`'s is on is in all three all-routers groups, where
   Linux's is in ff02::2 alone; a

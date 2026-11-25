@@ -1348,10 +1348,8 @@ pub(crate) struct Addresses {
     /// The veth ends IPv6 has made ready (`IF_READY`), up with their
     /// carrier, by index.
     ready6: Vec<i32>,
-    /// The namespace's key for the hash that chooses among a multipath
-    /// route's hops, random as Linux's `mp_seed` is where no
-    /// `fib_multipath_hash_seed` is set.
-    multipath_seed: std::hash::RandomState,
+    /// The seed of the hash that chooses among a multipath route's hops.
+    pub multipath_seed: crate::multipath::Seed,
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -1398,7 +1396,7 @@ impl Addresses {
             neighbours: Vec::new(),
             proxies: Vec::new(),
             ready6: Vec::new(),
-            multipath_seed: std::hash::RandomState::new(),
+            multipath_seed: crate::multipath::Seed::default(),
         }
     }
     /// A packet goes out through the loopback to `next` at `now`, as
@@ -3862,9 +3860,7 @@ impl Addresses {
         if total == 0 {
             return matched;
         }
-        // Shifted down a bit, as `fib_multipath_hash` gives it.
-        let hash =
-            (core::hash::BuildHasher::hash_one(&self.multipath_seed, (src, ip)) & 0xffff_ffff) >> 1;
+        let hash = u64::from(self.multipath_seed.hash4(src, ip));
         let order = order.filter(|_| !src.is_unspecified());
         let mut weight = 0u64;
         let mut best: Option<(u8, Hop4)> = None;
@@ -4090,21 +4086,8 @@ impl Addresses {
         if total == 0 {
             return matched;
         }
-        // `rt6_multipath_hash`: of the flow's addresses, label and
-        // protocol, shifted down a bit.
-        let key = (
-            flow.src.unwrap_or(Ipv6Addr::UNSPECIFIED),
-            ip,
-            flow.label,
-            flow.proto,
-        );
-        let hash = i64::from(
-            u32::try_from(
-                core::hash::BuildHasher::hash_one(&self.multipath_seed, key) & u64::from(u32::MAX),
-            )
-            .unwrap_or(0)
-                >> 1,
-        );
+        let src = flow.src.unwrap_or(Ipv6Addr::UNSPECIFIED);
+        let hash = i64::from(self.multipath_seed.hash6(src, ip, flow.label, flow.proto));
         let mut weight = 0u64;
         for hop in hops {
             if hop.dead {

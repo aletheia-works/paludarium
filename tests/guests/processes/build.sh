@@ -40,6 +40,7 @@ musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie 
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-answers" "$here/veth-answers.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv4-via" "$here/veth-ipv4-via.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-source" "$here/veth-ipv6-source.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-hash-seed" "$here/veth-hash-seed.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-gateway" "$here/veth-ipv6-gateway.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-ipv6-ecmp" "$here/veth-ipv6-ecmp.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/veth-bindtodevice" "$here/veth-bindtodevice.c"

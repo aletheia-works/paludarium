@@ -430,6 +430,7 @@ mod linux {
                     | "veth-answers"
                     | "veth-ipv4-via"
                     | "veth-ipv6-source"
+                    | "veth-hash-seed"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-multicast"
@@ -680,6 +681,7 @@ mod linux {
         veth_answers => ("veth-answers","veth-answers"),
         veth_ipv4_via => ("veth-ipv4-via","veth-ipv4-via"),
         veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
+        veth_hash_seed => ("veth-hash-seed","veth-hash-seed"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_multicast => ("veth-multicast","veth-multicast"),

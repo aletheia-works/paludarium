@@ -1031,10 +1031,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   切ったところから始まります。Linux の新しい名前空間は IPv4 の設定を最初の名前空間から
   受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
   フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
-  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward` と、`all`、`default`、`lo`、veth の端の
-  `forwarding`、`rp_filter`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
+  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward`、
+  `fib_multipath_hash_seed` と、`all`、`default`、`lo`、veth の端の
+  `forwarding`、`rp_filter`、`accept_dad`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
   最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
-  そこから始まります。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
+  そこから始まります。`fib_multipath_hash_seed` への書き込みは、Linux 7.0 から 7.2 と同じく
+  全部を取り、ファイルの位置を動かしません。master は読んだ分だけを取り、位置を進めます
+  （`proc_vec`）。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
   加わりません。`default` のものが入っている間に作った端は、全ルーターのグループ 3 つすべてに
   入っていますが、Linux では ff02::2 だけです。`all` のものに書くと、デバイスのものを
   インデックスの順に伝えますが、Linux は増えた順です。netconf の通知は、ファイルのない

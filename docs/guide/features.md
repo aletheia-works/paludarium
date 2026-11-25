@@ -2987,9 +2987,11 @@ kernel.
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
     hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
     source and destination falls to, each hop living taking a share of the
-    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), with
-    the namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
-    them; before the hash, one whose device's own source is the lookup's;
+    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), as
+    `fib_multipath_hash_policy` 0 hashes them
+    (`fib_multipath_hash_from_keys`), by the machine's random seed, every
+    namespace's, or `net.ipv4.fib_multipath_hash_seed`, with which each
+    flow's hop is Linux's; before the hash, one whose device's own source is the lookup's;
     through a device named, the first through it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
@@ -3162,8 +3164,8 @@ kernel.
     those put in are told of, then go, each told of. A removal takes each
     hop alone, and gives the last error. A lookup takes the hop the flow's
     hash falls to, each hop living taking a share of the hashes by its
-    weight (`fib6_select_path`, `rt6_multipath_rebalance`), with the
-    namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
+    weight (`fib6_select_path`, `rt6_multipath_rebalance`), by the same
+    seed as IPv4's, as `fib_multipath_hash_policy` 0 hashes
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
     label, and one unbound takes the source of the hop that gives
@@ -4497,7 +4499,8 @@ kernel.
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
-  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`. They and their
+  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`, and
+  `ipv4/fib_multipath_hash_seed`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write
@@ -4532,6 +4535,9 @@ kernel.
     IPv6's own `RTM_NEWLINK` (`RTNLGRP_IPV6_IFINFO`), as `NETDEV_UP`
     does. While it is on, `lo` coming up takes no IPv6 and a new IPv6
     address is `EACCES` (`addrconf_add_dev`).
+  - `fib_multipath_hash_seed` takes an unsigned `int` as
+    `proc_douintvec_minmax` does (the rest of the write taken with it), 0
+    for the machine's random seed, as a new namespace has it.
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
 

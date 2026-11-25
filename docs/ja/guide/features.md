@@ -2592,8 +2592,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `RTA_MULTIPATH` のある削除はそのホップを順に一つずつ比べます（`fib_nh_match`）。
     引き当ては、送り元と宛先のハッシュが落ちるホップを取ります。生きているホップは
     それぞれ重みに応じてハッシュを分け合い（`fib_select_multipath`、`fib_rebalance`）、
-    名前空間ごとの乱数の鍵で、`fib_multipath_hash_policy` 0 と同じくその二つをハッシュ
-    します。デバイス自身の送り元が引き当ての送り元であるホップは、ハッシュより先に
+    `fib_multipath_hash_policy` 0 と同じくその二つをハッシュします
+    （`fib_multipath_hash_from_keys`）。種は、どの名前空間でも同じマシンの乱数か
+    `net.ipv4.fib_multipath_hash_seed` で、後者ではどのフローのホップも Linux と同じです。デバイス自身の送り元が引き当ての送り元であるホップは、ハッシュより先に
     選ばれます。デバイスを名前で挙げれば、それを通る最初のホップです。bind していない
     ソケットは、送り元なしのハッシュで決まるホップの送り元を使い、接続と UDP の connect は、
     続けてその送り元から経路を引き当てます（`ip_route_connect`）。パケットは、その送り元への
@@ -2735,8 +2736,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     確かめ、入れたものを一つのメッセージで伝えます。そのあとで一つが失敗すると、入れたものを
     伝えてから、一つずつ伝えて消します。削除はホップを一つずつ消し、最後のエラーを返します。
     引き当ては、フローのハッシュが落ちるホップを取ります。生きているホップはそれぞれ重みに
-    応じてハッシュを分け合い（`fib6_select_path`、`rt6_multipath_rebalance`）、名前空間ごとの
-    乱数の鍵で、`fib_multipath_hash_policy` 0 と同じく送り元、宛先、フローラベル、
+    応じてハッシュを分け合い（`fib6_select_path`、`rt6_multipath_rebalance`）、IPv4 と同じ種で、
+    `fib_multipath_hash_policy` 0 と同じく送り元、宛先、フローラベル、
     プロトコルをハッシュします。ソケットのパケットは、結び付いたアドレス（なければ `::`）
     で、フローラベルなしでハッシュします。何にもバインドしていないソケットの送り元は、
     そうして選んだホップのものです（`ip6_dst_lookup_tail`）。答えは自分の引き当てで選ばれる端を通って返ります。
@@ -3871,7 +3872,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
   `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
-  `ipv6/conf/<デバイス>/accept_dad`、`disable_ipv6`、`forwarding` です。ファイルとディレクトリは、
+  `ipv6/conf/<デバイス>/accept_dad`、`disable_ipv6`、`forwarding`、
+  `ipv4/fib_multipath_hash_seed` です。ファイルとディレクトリは、
   ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
   書き込みで開けるのは、root と、その名前空間への `CAP_NET_ADMIN` を持つものです
   （`net_ctl_permissions`。開けなければ `EACCES`、書き込みのときに書けなければ
@@ -3902,6 +3904,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `NETDEV_UP` と同じく `::1` が戻り、IPv6 自身の `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を
     知らせます。入っている間は、`lo` が上がっても IPv6 は何もせず、新しい IPv6 の
     アドレスは `EACCES` です（`addrconf_add_dev`）。
+  - `fib_multipath_hash_seed` は、`proc_douintvec_minmax` と同じく符号なしの `int` を取り
+    （書き込みの残りも一緒に取ります）、0 はマシンの乱数の種です。新しい名前空間では 0 です。
   - リンクの `IFLA_AF_SPEC` の IPv4 と IPv6 の設定にこれらが出ます。IPv6 は
     `disable_ipv6` が切れているときだけ準備ができています。
 

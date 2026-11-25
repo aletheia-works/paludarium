@@ -136,12 +136,15 @@ impl Directory {
 }
 
 /// A file of `/proc/sys/net`, of the caller's network namespace
-/// ([`crate::netconf`]): `ipv4/ip_forward` (`all`'s forwarding),
+/// ([`crate::netconf`]): `ipv4/fib_multipath_hash_seed` ([`crate::multipath`]),
+/// `ipv4/ip_forward` (`all`'s forwarding),
 /// `ipv4/conf/<device>/forwarding` and `rp_filter`, and
 /// `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Net {
     IpForward,
+    /// `fib_multipath_hash_seed`.
+    HashSeed,
     Forwarding(Target),
     RpFilter(Target),
     DisableIpv6(Target),
@@ -662,6 +665,7 @@ fn net_entry(rest: &[u8], network: &crate::inet::Network) -> Option<Entry> {
         b"/ipv6" => return directory(Directory::Ipv6),
         b"/ipv4/conf" => return directory(Directory::Conf4),
         b"/ipv6/conf" => return directory(Directory::Conf6),
+        b"/ipv4/fib_multipath_hash_seed" => return Some(Entry::Net(Net::HashSeed)),
         b"/ipv4/ip_forward" => return Some(Entry::Net(Net::IpForward)),
         _ => {}
     }
@@ -780,7 +784,11 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
             (b"unprivileged_userfaultfd", DT_REG),
         ],
         Directory::Net => vec![(b"ipv4", DT_DIR), (b"ipv6", DT_DIR)],
-        Directory::Ipv4 => vec![(b"conf", DT_DIR), (b"ip_forward", DT_REG)],
+        Directory::Ipv4 => vec![
+            (b"conf", DT_DIR),
+            (b"fib_multipath_hash_seed", DT_REG),
+            (b"ip_forward", DT_REG),
+        ],
         Directory::Ipv6 => vec![(b"conf", DT_DIR)],
         Directory::Conf4 | Directory::Conf6 => devices
             .iter()
@@ -871,6 +879,7 @@ fn child(
         },
         Directory::Ipv4 => match name {
             b"conf" => dir(Directory::Conf4),
+            b"fib_multipath_hash_seed" => Some(Entry::Net(Net::HashSeed)),
             b"ip_forward" => Some(Entry::Net(Net::IpForward)),
             _ => None,
         },
@@ -1136,7 +1145,7 @@ fn shown(c: &Context<'_>, entry: Entry) -> FileStat {
                 gid,
                 ..crate::proc::stat(
                     c.network()
-                        .map_or(0, |network| line(net_value(&network, file)).len()),
+                        .map_or(0, |network| net_line(&network, file).len()),
                 )
             }
         }
@@ -1196,11 +1205,19 @@ fn line(value: i32) -> Vec<u8> {
     format!("{value}\n").into_bytes()
 }
 
-/// What a file of `/proc/sys/net` of `network` shows: 0 for a device it
-/// no longer has.
+/// The line a file of `/proc/sys/net` of `network` shows.
+fn net_line(network: &crate::inet::Network, file: Net) -> Vec<u8> {
+    if file == Net::HashSeed {
+        return format!("{}\n", network.addresses().multipath_seed.user).into_bytes();
+    }
+    line(net_value(network, file))
+}
+
+/// What a file of `/proc/sys/net` of `network`, of an `int`, shows: 0 for a
+/// device it no longer has.
 fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
     let target = match file {
-        Net::IpForward => Target::All,
+        Net::IpForward | Net::HashSeed => Target::All,
         Net::Forwarding(target)
         | Net::RpFilter(target)
         | Net::DisableIpv6(target)
@@ -1211,6 +1228,7 @@ fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
         return 0;
     };
     match file {
+        Net::HashSeed => 0,
         Net::IpForward | Net::Forwarding(_) => conf4.forwarding,
         Net::RpFilter(_) => conf4.rp_filter,
         Net::DisableIpv6(_) => conf6.disable_ipv6,
@@ -1418,6 +1436,9 @@ impl NetFile {
     /// it: what the write returns.
     /// - IPv4's `forwarding` (`devinet_sysctl_forward`) is `EPERM` without
     ///   `CAP_NET_ADMIN`, then takes an `int` as `proc_dointvec` does.
+    /// - `fib_multipath_hash_seed` (`proc_fib_multipath_hash_seed`) takes
+    ///   an unsigned `int`, and the rest with it, as
+    ///   `proc_douintvec_minmax` does ([`parse_uint`]).
     /// - `rp_filter` (`devinet_conf_proc`) takes one so, and marks the
     ///   device as set whatever comes of it.
     /// - IPv6's (`addrconf_sysctl_disable`, `addrconf_sysctl_forward`) take
@@ -1436,6 +1457,16 @@ impl NetFile {
             Ok(by)
         };
         match self.file {
+            Net::HashSeed => {
+                // `do_proc_douintvec_w` moves the file on only past the
+                // start, where it sets nothing.
+                if *position != 0 {
+                    return advance(position, buf.len());
+                }
+                let seed = parse_uint(buf)?;
+                self.network.addresses().multipath_seed.user = seed;
+                Ok(buf.len())
+            }
             Net::IpForward | Net::Forwarding(_) => {
                 if !net_admin {
                     return Err(Errno::EPERM);
@@ -1533,7 +1564,7 @@ impl Value {
             Self::Fanotify(registry, file) => fanotify_line(&registry.limits, *file),
             Self::Kernel(ipc, file) => kernel_line(ipc, *file),
             Self::Machine(machine, file) => machine.line(*file),
-            Self::Net(net) => line(net_value(&net.network, net.file)),
+            Self::Net(net) => net_line(&net.network, net.file),
             Self::DropCaches(machine, _) => line(machine.drop_caches()),
             // A string, read by [`Uts::read`].
             Self::Uts(_) => Vec::new(),
@@ -1876,6 +1907,17 @@ fn parse(buf: &[u8], bounds: Option<(i32, i32)>) -> Result<(i32, usize), Errno> 
         return Err(Errno::EINVAL);
     }
     Ok((value, consumed))
+}
+
+/// One `unsigned int` written to a sysctl, as Linux's
+/// `do_proc_douintvec_w` reads it ([`scan`]), whatever comes after it:
+/// `EINVAL` as [`scan`] gives it, for a negative one and for one an
+/// `unsigned int` cannot hold.
+fn parse_uint(buf: &[u8]) -> Result<u32, Errno> {
+    match scan(buf)? {
+        (false, value, _) => u32::try_from(value).map_err(|_| Errno::EINVAL),
+        (true, ..) => Err(Errno::EINVAL),
+    }
 }
 
 /// The `int`s of a vector written to a sysctl, as Linux's

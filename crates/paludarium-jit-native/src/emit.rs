@@ -678,6 +678,40 @@ impl Emitter<'_, '_> {
         self.set_word(w + 1, high);
     }
 
+    /// The words of `high:low` shifted by `count` bytes, zeros coming in.
+    fn shift_bytes(&mut self, low: Value, high: Value, count: u8, left: bool) -> (Value, Value) {
+        // Going left, the word zeros come into first is the low one.
+        let (first, second) = if left { (low, high) } else { (high, low) };
+        let bits = i64::from(count % 8) * 8;
+        let zero = self.constant(0);
+        let toward = |x: &mut Self, v: Value| {
+            if left {
+                x.b.ins().ishl_imm_s(v, bits)
+            } else {
+                x.b.ins().ushr_imm_s(v, bits)
+            }
+        };
+        let (first, second) = match count {
+            0 => (first, second),
+            1..=7 => {
+                let carried = if left {
+                    self.b.ins().ushr_imm_s(first, 64 - bits)
+                } else {
+                    self.b.ins().ishl_imm_s(first, 64 - bits)
+                };
+                let moved = toward(self, second);
+                (toward(self, first), self.b.ins().bor(moved, carried))
+            }
+            8..=15 => (zero, toward(self, first)),
+            _ => (zero, zero),
+        };
+        if left {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
     /// `op` of [`Fast::XmmPacked`] or [`Fast::XmmPackedLoad`] on xmm
     /// register `dst` and the two words of the other operand, as
     /// `sse::packed` has it.
@@ -790,6 +824,10 @@ impl Emitter<'_, '_> {
                 let up = self.b.ins().ishl_imm_s(dwords[3], 32);
                 (low, self.b.ins().bor(dwords[2], up))
             }
+            Mnemonic::Shufpd => (
+                if imm & 1 == 0 { a0 } else { a1 },
+                if imm & 2 == 0 { b0 } else { b1 },
+            ),
             Mnemonic::Pshuflw => (self.shuffle_words(b0, imm), b1),
             Mnemonic::Pshufhw => (b0, self.shuffle_words(b1, imm)),
             Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd => {
@@ -827,6 +865,9 @@ impl Emitter<'_, '_> {
                     }
                     (out[0], out[1])
                 }
+            }
+            Mnemonic::Pslldq | Mnemonic::Psrldq => {
+                self.shift_bytes(a0, a1, imm, op == Mnemonic::Pslldq)
             }
             _ => unreachable!("the packed forms hold only these operations"),
         };
@@ -1735,7 +1776,7 @@ impl Emitter<'_, '_> {
             }
             // Aligned, so the two words are of one page: a failure of either
             // is the failure of the whole.
-            Fast::XmmPackedLoad { op, dst, mem } => {
+            Fast::XmmPackedLoad { op, dst, mem, imm } => {
                 let address = self.linear(&mem);
                 self.unless_misaligned(address, n, rip);
                 let (low, low_status) = self.load(address, 8);
@@ -1743,7 +1784,7 @@ impl Emitter<'_, '_> {
                 let address = self.b.ins().iadd_imm_s(address, 8);
                 let (high, high_status) = self.load(address, 8);
                 self.unless_failed(high_status, n, rip);
-                self.packed(op, dst, (low, high), 0);
+                self.packed(op, dst, (low, high), imm);
                 // Neither is FAILED, so this is CODE_CHANGED if either is.
                 let status = self.b.ins().bor(low_status, high_status);
                 self.unless_changed(status, n + 1, next);
@@ -1779,6 +1820,20 @@ impl Emitter<'_, '_> {
                 self.set_word(XMM + 2 * usize::from(dst), v);
                 self.set_word(XMM + 2 * usize::from(dst) + 1, zero);
             }
+            Fast::XmmLoadHalf { dst, mem, high } => {
+                let address = self.linear(&mem);
+                let (v, status) = self.load(address, 8);
+                self.unless_failed(status, n, rip);
+                self.set_word(XMM + 2 * usize::from(dst) + usize::from(high), v);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::XmmStoreHigh { mem, src } => {
+                let v = self.word(XMM + 2 * usize::from(src) + 1);
+                let address = self.linear(&mem);
+                let status = self.store(address, 8, v);
+                self.unless_failed(status, n, rip);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::XmmStoreScalar { mem, src, size } => {
                 let v = self.word(XMM + 2 * usize::from(src));
                 let v = self.masked(v, size);
@@ -1795,6 +1850,21 @@ impl Emitter<'_, '_> {
                 self.write(dst, low);
                 self.set_carry_overflow(overflow);
             }
+            Fast::ImulLoad { dst, mem, factor } => {
+                let size = dst.size();
+                let address = self.linear(&mem);
+                let (v, status) = self.load(address, size);
+                self.unless_failed(status, n, rip);
+                let v = self.masked(v, size);
+                let b = match factor {
+                    Some(factor) => self.source(Source::Immediate(i64::from(factor) as u64), size),
+                    None => self.read(dst),
+                };
+                let (low, _, overflow) = self.multiply(v, b, size, true);
+                self.write(dst, low);
+                self.set_carry_overflow(overflow);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::Pop(r) => {
                 let rsp = self.gpr(4);
                 let (v, status) = self.load(rsp, 8);
@@ -1802,6 +1872,15 @@ impl Emitter<'_, '_> {
                 let up = self.b.ins().iadd_imm_s(rsp, 8);
                 self.set_gpr(4, up);
                 self.set_gpr(r, v);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::Leave => {
+                let rbp = self.gpr(5);
+                let (v, status) = self.load(rbp, 8);
+                self.unless_failed(status, n, rip);
+                let up = self.b.ins().iadd_imm_s(rbp, 8);
+                self.set_gpr(4, up);
+                self.set_gpr(5, v);
                 self.unless_changed(status, n + 1, next);
             }
             Fast::Jcc { condition, target } => {

@@ -113,7 +113,8 @@ out:
 
 - `nop` and `endbr64`;
 - moves between registers and memory, and `movzx` from memory;
-- `lea`, `push` of a register, an immediate or 8 bytes of memory, and `pop`;
+- `lea`, `push` of a register, an immediate or 8 bytes of memory, `pop` and
+  `leave`;
 - direct branches, `call` and `ret`, and `jmp` and `call` through a 64-bit
   register or 8 bytes of memory;
 - `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test` between registers,
@@ -129,16 +130,19 @@ out:
   size, `bt`, `bts`, `btr` and `btc` of a register by a register or an
   immediate, and `bswap` of a 32- or 64-bit register;
 - `mul` and `imul` of a register into rdx:rax, `div` and `idiv` of rdx:rax by a
-  register, and `imul` of two registers or of a register and an immediate;
+  register, and `imul` of a register and a register or memory, or of either and
+  an immediate;
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
   registers and memory, `pxor` and `xorps` of xmm registers, `movd` and `movq`
   between xmm registers and general ones or memory, `movq` between xmm
-  registers, and the SSE2 `movsd` between xmm registers and memory;
+  registers, the SSE2 `movsd` between xmm registers and memory, and `movlps`,
+  `movlpd`, `movhps` and `movhpd`;
 - `pshufd`, `pshuflw`, `pshufhw`, the `punpckl` and `punpckh` unpacks,
   `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`,
-  `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` and `pcmpeqd` of xmm
-  registers, `pxor` and `pcmpeqb` of one and 16 bytes of memory, `pslld` and
-  `psrld` of one by an immediate, and `pmovmskb`;
+  `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw`, `pcmpeqd` and
+  `shufpd` of xmm registers, `pxor`, `pcmpeqb` and `shufpd` of one and 16 bytes
+  of memory, `pslld`, `psrld`, `pslldq` and `psrldq` of one by an immediate, and
+  `pmovmskb`;
 - the string moves `movsb`, `movsw`, `movsd` and `movsq`, and the string
   stores `stosb`, `stosw`, `stosd` and `stosq`, with `rep` or without, of 64-bit
   addresses;

@@ -17,7 +17,7 @@ use paludarium_mmu::AtomicOp;
 
 use super::{Exec, Result, Stop, atomic_width};
 use crate::alu::{self, sign_extend, size_mask};
-use crate::state::{CpuState, flag};
+use crate::state::{CpuState, flag, reg};
 
 /// An arithmetic or logic operation of [`Fast`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -380,21 +380,22 @@ pub enum Fast {
     /// `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`,
     /// `psubq`, `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` or
     /// `pcmpeqd` of xmm register `src` into `dst`, `pshufd`, `pshuflw` or
-    /// `pshufhw` of `src` into `dst` by `imm`, or `pslld` or `psrld` of
-    /// `dst` by `imm` (`src` is `dst`), as [`crate::sse::packed`] has
-    /// them.
+    /// `pshufhw` of `src` into `dst` by `imm`, `shufpd` of `dst` and `src`
+    /// by `imm`, or `pslld`, `psrld`, `pslldq` or `psrldq` of `dst` by `imm`
+    /// (`src` is `dst`), as [`crate::sse::packed`] has them.
     XmmPacked {
         op: Mnemonic,
         dst: u8,
         src: u8,
         imm: u8,
     },
-    /// `pxor` or `pcmpeqb` of 16 bytes of memory, at a 16-byte aligned
-    /// address, into xmm register `dst`.
+    /// `pxor`, `pcmpeqb` or `shufpd` (by `imm`) of 16 bytes of memory, at a
+    /// 16-byte aligned address, into xmm register `dst`.
     XmmPackedLoad {
         op: Mnemonic,
         dst: u8,
         mem: Address,
+        imm: u8,
     },
     /// `pmovmskb r, xmm`: the top bit of each byte of `src`.
     Pmovmskb {
@@ -416,8 +417,20 @@ pub enum Fast {
         mem: Address,
         size: u8,
     },
-    /// `movd` (`size` 4), or `movq` or `movsd` (8), of an xmm register into
-    /// memory: its low `size` bytes.
+    /// `movlps` or `movlpd`, or `movhps` or `movhpd` (`high`), of 8 bytes of
+    /// memory into that half of an xmm register, which keeps the other.
+    XmmLoadHalf {
+        dst: u8,
+        mem: Address,
+        high: bool,
+    },
+    /// `movhps` or `movhpd` of the high half of an xmm register into memory.
+    XmmStoreHigh {
+        mem: Address,
+        src: u8,
+    },
+    /// `movd` (`size` 4), or `movq`, `movsd`, `movlps` or `movlpd` (8), of an
+    /// xmm register into memory: its low `size` bytes.
     XmmStoreScalar {
         mem: Address,
         src: u8,
@@ -441,8 +454,17 @@ pub enum Fast {
         a: Register,
         b: Source,
     },
+    /// `imul r, [m]`, of `dst` by the memory, or `imul r, [m], imm`, of the
+    /// memory by `factor`.
+    ImulLoad {
+        dst: Register,
+        mem: Address,
+        factor: Option<i32>,
+    },
     /// `pop r64`.
     Pop(u8),
+    /// `leave` of 64 bits.
+    Leave,
     Jcc {
         condition: Condition,
         target: u64,
@@ -673,6 +695,19 @@ impl Fast {
         let (a, b) = (i.operand(0), i.operand(1));
         if i.mnemonic == Mnemonic::Imul && b.is_some() {
             let dst = gpr(a)?;
+            if memory(b).is_some() {
+                return Some(Self::ImulLoad {
+                    dst,
+                    mem: address(b).filter(|mem| mem.size == dst.size())?,
+                    factor: match i.operand(2) {
+                        None => None,
+                        // The instruction holds at most 32 bits of it, which
+                        // it sign-extends.
+                        Some(Operand::Immediate(v)) => Some(v as i32),
+                        Some(_) => return None,
+                    },
+                });
+            }
             let src = gpr(b)?;
             if src.size() != dst.size() {
                 return None;
@@ -686,11 +721,19 @@ impl Fast {
         }
         if matches!(
             i.mnemonic,
-            Mnemonic::Pshufd | Mnemonic::Pshuflw | Mnemonic::Pshufhw
+            Mnemonic::Pshufd | Mnemonic::Pshuflw | Mnemonic::Pshufhw | Mnemonic::Shufpd
         ) {
             let Some(Operand::Immediate(imm)) = i.operand(2) else {
                 return None;
             };
+            if i.mnemonic == Mnemonic::Shufpd && memory(b).is_some() {
+                return Some(Self::XmmPackedLoad {
+                    op: i.mnemonic,
+                    dst: xmm(a)?,
+                    mem: address(b).filter(|m| m.size == 16)?,
+                    imm: imm as u8,
+                });
+            }
             return Some(Self::XmmPacked {
                 op: i.mnemonic,
                 dst: xmm(a)?,
@@ -706,6 +749,7 @@ impl Fast {
                 op: i.mnemonic,
                 dst: xmm(a)?,
                 mem: address(b).filter(|m| m.size == 16)?,
+                imm: 0,
             },
             Mnemonic::Punpcklbw
             | Mnemonic::Punpcklwd
@@ -734,7 +778,7 @@ impl Fast {
                 src: xmm(b)?,
                 imm: 0,
             },
-            Mnemonic::Pslld | Mnemonic::Psrld => {
+            Mnemonic::Pslld | Mnemonic::Psrld | Mnemonic::Pslldq | Mnemonic::Psrldq => {
                 let dst = xmm(a)?;
                 let Some(Operand::Immediate(count)) = b else {
                     return None;
@@ -812,6 +856,16 @@ impl Fast {
                 let sized = |o: Option<Operand>| address(o).filter(|mem| mem.size == 8);
                 match (xmm(a), sized(b), sized(a), xmm(b)) {
                     (Some(dst), Some(mem), _, _) => Self::XmmLoadScalar { dst, mem, size: 8 },
+                    (_, _, Some(mem), Some(src)) => Self::XmmStoreScalar { mem, src, size: 8 },
+                    _ => return None,
+                }
+            }
+            Mnemonic::Movlps | Mnemonic::Movlpd | Mnemonic::Movhps | Mnemonic::Movhpd => {
+                let high = matches!(i.mnemonic, Mnemonic::Movhps | Mnemonic::Movhpd);
+                let sized = |o: Option<Operand>| address(o).filter(|mem| mem.size == 8);
+                match (xmm(a), sized(b), sized(a), xmm(b)) {
+                    (Some(dst), Some(mem), _, _) => Self::XmmLoadHalf { dst, mem, high },
+                    (_, _, Some(mem), Some(src)) if high => Self::XmmStoreHigh { mem, src },
                     (_, _, Some(mem), Some(src)) => Self::XmmStoreScalar { mem, src, size: 8 },
                     _ => return None,
                 }
@@ -929,6 +983,7 @@ impl Fast {
                 _ => Self::Push(gpr64(a)?),
             },
             Mnemonic::Pop if i.implicit_size == 8 && b.is_none() => Self::Pop(gpr64(a)?),
+            Mnemonic::Leave if i.implicit_size == 8 => Self::Leave,
             Mnemonic::Jcc(condition) => Self::Jcc {
                 condition,
                 target: branch(a)?,
@@ -1269,7 +1324,7 @@ pub(crate) fn execute(
             x.s.xmm[usize::from(dst)] = v;
             next
         }
-        Fast::XmmPackedLoad { op, dst, mem } => {
+        Fast::XmmPackedLoad { op, dst, mem, imm } => {
             let address = x.fast_linear(&mem);
             if !address.0.is_multiple_of(16) {
                 return Err(Stop::GeneralProtection);
@@ -1278,7 +1333,7 @@ pub(crate) fn execute(
             x.mem.read(address, &mut bytes)?;
             let a = x.s.xmm[usize::from(dst)];
             let b = u128::from_le_bytes(bytes);
-            let Some(v) = crate::sse::packed(op, a, b, 0, x.s.xmm[0]) else {
+            let Some(v) = crate::sse::packed(op, a, b, imm, x.s.xmm[0]) else {
                 return Err(Stop::Invalid);
             };
             x.s.xmm[usize::from(dst)] = v;
@@ -1303,6 +1358,22 @@ pub(crate) fn execute(
             x.s.xmm[usize::from(dst)] = u128::from(v & size_mask(size));
             next
         }
+        Fast::XmmLoadHalf { dst, mem, high } => {
+            let v = u128::from(x.load(x.fast_linear(&mem), 8)?);
+            let low = u128::from(u64::MAX);
+            let register = &mut x.s.xmm[usize::from(dst)];
+            *register = if high {
+                (*register & low) | (v << 64)
+            } else {
+                (*register & !low) | v
+            };
+            next
+        }
+        Fast::XmmStoreHigh { mem, src } => {
+            let v = (x.s.xmm[usize::from(src)] >> 64) as u64;
+            x.store(x.fast_linear(&mem), 8, v)?;
+            next
+        }
         Fast::XmmStoreScalar { mem, src, size } => {
             let v = x.s.xmm[usize::from(src)] as u64 & size_mask(size);
             x.store(x.fast_linear(&mem), size, v)?;
@@ -1318,9 +1389,29 @@ pub(crate) fn execute(
             x.set_status(flag::CF | flag::OF, f);
             next
         }
+        Fast::ImulLoad { dst, mem, factor } => {
+            let size = dst.size();
+            let v = x.load(x.fast_linear(&mem), size)? & size_mask(size);
+            let (a, b) = match factor {
+                Some(factor) => (v, i64::from(factor) as u64 & size_mask(size)),
+                None => (x.read_reg(dst) & size_mask(size), v),
+            };
+            let (r, overflow) = alu::imul(a, b, size);
+            x.write_reg(dst, r);
+            let f = if overflow { flag::CF | flag::OF } else { 0 };
+            x.set_status(flag::CF | flag::OF, f);
+            next
+        }
         Fast::Pop(r) => {
             let v = x.pop(8)?;
             x.s.gpr[usize::from(r)] = v;
+            next
+        }
+        Fast::Leave => {
+            let rbp = x.s.gpr[reg::RBP];
+            let v = x.load(GuestAddr(rbp), 8)?;
+            x.s.gpr[reg::RSP] = rbp.wrapping_add(8);
+            x.s.gpr[reg::RBP] = v;
             next
         }
         Fast::Jcc { condition, target } => {

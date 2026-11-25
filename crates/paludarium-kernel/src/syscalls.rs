@@ -2785,7 +2785,8 @@ fn check_mappable(
     // Neither a file that is not regular nor one that /proc generates can
     // be read at an offset, which a mapping needs.
     // A BPF map's file maps by its own `mmap` ([`crate::bpf::mmap`]).
-    let readable = regular && file.read_at(0, &mut []) != Err(Errno::ENODEV);
+    let readable =
+        regular && !crate::proc::unmappable(file) && file.read_at(0, &mut []) != Err(Errno::ENODEV);
     if !readable && !is_zero_device(file) && !crate::bpf::is_map(file) {
         return Err(Errno::ENODEV);
     }

@@ -2168,6 +2168,27 @@ fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_on
     assert!(f.ret(2, &[path, 0]) < 1 << 32);
 }
 #[test]
+fn proc_files_read_at_an_offset_do_not_map() {
+    let mut f = fixture();
+    for path in [
+        &b"/proc/self/mem\0"[..],
+        b"/proc/self/pagemap\0",
+        b"/proc/self/clear_refs\0",
+    ] {
+        f.mem.write(GuestAddr(DATA), path).unwrap();
+        let fd = f.ret(2, &[DATA, 2]);
+        assert!(fd < 1 << 32, "{fd:#x}");
+        // PROT_READ, MAP_PRIVATE and MAP_SHARED.
+        for flags in [2, 1] {
+            assert_eq!(
+                f.ret(9, &[0, 4096, 1, flags, fd, 0]),
+                errno(Errno::ENODEV),
+                "{path:?}"
+            );
+        }
+    }
+}
+#[test]
 fn proc_mem_reads_and_writes_the_process_memory_through_the_system_calls() {
     let mut f = fixture();
     let (path, buf) = (DATA, DATA + 0x400);

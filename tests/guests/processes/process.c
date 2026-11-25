@@ -7466,6 +7466,19 @@ static int proc_mem_case(void) {
     printf("pagemap rdwr: open=%d accmode=%d\n", map >= 0,
            map < 0 ? -errno : fcntl(map, F_GETFL) & O_ACCMODE);
     if (map >= 0) close(map);
+    /* None of /proc's files that a read takes at an offset has an mmap. */
+    const char *unmappable[] = {"mem", "pagemap", "clear_refs"};
+    for (int i = 0; i < 3; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "/proc/self/%s", unmappable[i]);
+        int no = open(name, O_RDWR);
+        void *private = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE, no, 0);
+        int first = private == MAP_FAILED ? -errno : 0;
+        void *shared = mmap(NULL, (size_t)page, PROT_READ, MAP_SHARED, no, 0);
+        printf("mmap of %s: open=%d %d %d\n", unmappable[i], no >= 0, first,
+               shared == MAP_FAILED ? -errno : 0);
+        if (no >= 0) close(no);
+    }
 
     /* A child's memory, at the same address after fork. */
     int ready[2], done[2];

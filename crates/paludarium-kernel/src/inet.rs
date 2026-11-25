@@ -13,7 +13,7 @@
 //! socket listens reaches it in the kernel, whatever the policy allows.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
-use crate::interface::Flow6;
+use crate::interface::{Flow6, Route6};
 use crate::loopback::segments::Push;
 use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::{Timeout, Timestamps};
@@ -458,7 +458,6 @@ impl Network {
         proto: u8,
         now: Option<u64>,
     ) -> Result<Dest, Errno> {
-        let flow = Self::flow6(from, proto);
         let to = if oif != 0 && to.is_ipv6() && !from.is_some_and(|ip| plain(ip).is_ipv4()) {
             crate::loopback::destination(to).unwrap_or(to)
         } else {
@@ -469,16 +468,7 @@ impl Network {
             && !ip.is_unspecified()
         {
             use crate::interface::Kind;
-            let strict = strict
-                || from.is_none_or(|ip| ip.is_unspecified())
-                || ip.is_multicast()
-                || ip.is_unicast_link_local()
-                || ip.is_loopback();
-            let route = if strict {
-                self.addresses_at(now).lookup6_flow(ip, oif, &flow)?
-            } else {
-                self.addresses_at(now).lookup6_preferring(ip, oif, &flow)?
-            };
+            let (route, _) = self.route6(ip, from, (oif, strict), proto, now)?;
             return match route.kind {
                 Kind::Local if self.is_up() => Ok(Dest::Here(to)),
                 Kind::Unicast | Kind::Multicast if route.oif != crate::netdev::LOOPBACK_OIF => {
@@ -546,7 +536,7 @@ impl Network {
                 // IPv6's unicast routes through a veth end, and the
                 // multicast one each end has (`addrconf_add_mroute`).
                 if let IpAddr::V6(ip) = to.ip()
-                    && let Ok(route) = self.addresses_at(now).lookup6_flow(ip, 0, &flow)
+                    && let Ok((route, _)) = self.route6(ip, from, (0, false), proto, now)
                     && matches!(route.kind, Kind::Unicast | Kind::Multicast)
                     && route.oif != crate::netdev::LOOPBACK_OIF
                     && let Ok(index) = i32::try_from(route.oif)
@@ -565,6 +555,66 @@ impl Network {
                 }
             }
         }
+    }
+    /// The IPv6 route of [`Self::route`] to `ip`, and the state of the
+    /// tables it was found in.
+    fn route6(
+        &self,
+        ip: Ipv6Addr,
+        from: Option<IpAddr>,
+        (oif, strict): (u32, bool),
+        proto: u8,
+        now: Option<u64>,
+    ) -> Result<(Route6, u64), Errno> {
+        let flow = Self::flow6(from, proto);
+        let strict = oif == 0
+            || strict
+            || from.is_none_or(|ip| ip.is_unspecified())
+            || ip.is_multicast()
+            || ip.is_unicast_link_local()
+            || ip.is_loopback();
+        let addresses = self.addresses_at(now);
+        let route = if strict {
+            addresses.lookup6_flow(ip, oif, &flow)?
+        } else {
+            addresses.lookup6_preferring(ip, oif, &flow)?
+        };
+        Ok((route, addresses.serial6()))
+    }
+    /// The route to the IPv6 address of `dest`, which [`Self::route`] gave
+    /// for `to` from `from`, as a connected UDP socket keeps it.
+    fn kept6(
+        &self,
+        dest: Dest,
+        to: SocketAddr,
+        from: Option<IpAddr>,
+        through: (u32, bool),
+        now: Option<u64>,
+    ) -> Option<Kept6> {
+        let to = match dest {
+            Dest::Here(to) => to,
+            Dest::Veth(..) => to,
+            Dest::Away => return None,
+        };
+        let IpAddr::V6(ip) = to.ip() else {
+            return None;
+        };
+        let (route, serial) = self.route6(ip, from, through, FLOW_UDP, now).ok()?;
+        Some(Kept6 {
+            dest,
+            route,
+            serial,
+            from,
+        })
+    }
+    /// Whether a packet through `oif` (any for 0) takes the route `kept` at
+    /// `now` (`ip6_dst_check`, `ip6_sk_dst_check`).
+    fn takes_kept6(&self, kept: &Kept6, oif: u32, now: Option<u64>) -> bool {
+        let device = match kept.dest {
+            Dest::Veth(index, _) => index.unsigned_abs(),
+            _ => crate::netdev::LOOPBACK_OIF,
+        };
+        (oif == 0 || oif == device) && self.addresses_at(now).keeps6(&kept.route, kept.serial)
     }
     /// What a packet from `from` to `to` out through this namespace's veth
     /// end `index` finds at `now`, its neighbour first, its route's gateway
@@ -1760,6 +1810,8 @@ struct State {
     /// which its binding has too ([`Binding::old_peer`]): kept here, as the
     /// disconnect may unbind the socket, for the next bind or autobind.
     old_peer: Option<IpAddr>,
+    /// A connected IPv6 socket's route, which its sends take while it holds.
+    kept6: Option<Kept6>,
     queries: VecDeque<Query>,
     /// Datagrams other guest sockets sent this one on the loopback.
     inbox: VecDeque<Datagram>,
@@ -1895,7 +1947,19 @@ impl Syn {
         self.start.saturating_add(seconds * 1_000_000_000)
     }
 }
+/// The route a connected IPv6 UDP socket keeps (`sk_dst_cache`,
+/// `ip6_sk_dst_store_flow`): where it goes, the route and the state of the
+/// tables it was found in, and the source it was looked up with, which
+/// chose its hop.
+#[derive(Clone, Copy)]
+struct Kept6 {
+    dest: Dest,
+    route: Route6,
+    serial: u64,
+    from: Option<IpAddr>,
+}
 /// Where a connection or datagram goes ([`Network::route`]).
+#[derive(Clone, Copy)]
 enum Dest {
     /// To an address of its own namespace, through the loopback.
     Here(SocketAddr),
@@ -2867,6 +2931,7 @@ impl InetSocket {
             if self.family == Family::V6 {
                 s.old_peer = peer.map(|peer| peer.ip()).or(s.old_peer);
             }
+            s.kept6 = None;
             let bindings = State {
                 bound: s.bound.take(),
                 port_locked: s.port_locked,
@@ -2938,16 +3003,20 @@ impl InetSocket {
             IpAddr::V4(_) => device,
         };
         let through = (oif, device != 0);
-        match self
+        let route = self
             .network
-            .route(to, source, through, FLOW_UDP, self.now())?
-        {
+            .route(to, source, through, FLOW_UDP, self.now())?;
+        // `ip6_datagram_dst_update`; IPv4's is looked up again from the
+        // source, which gives what a send's own lookup does.
+        let kept = self.network.kept6(route, to, source, through, self.now());
+        match route {
             Dest::Here(to) => {
                 let from = self.datagram_source(s, to, oif, options)?;
                 let name = name(from);
                 self.ports().connect(&self.this, name, Some(to));
                 s.bound = Some(name);
                 s.peer = Some(to);
+                s.kept6 = kept;
             }
             // Out through a veth end, from the address its route leaves
             // from, which Linux's `__mkroute_output` takes from no
@@ -2971,6 +3040,7 @@ impl InetSocket {
                 self.ports().connect(&self.this, name, Some(to));
                 s.bound = Some(name);
                 s.peer = Some(to);
+                s.kept6 = kept;
             }
             Dest::Away => {
                 // Off the loopback the port moves to the host's address the
@@ -3121,6 +3191,7 @@ impl InetSocket {
     ) -> Result<usize, Errno> {
         let options = *self.options();
         let mut s = self.lock();
+        let connected = to.is_none();
         let to = to.or(s.peer).ok_or(EDESTADDRREQ)?;
         let sendable = |s: &mut State| match s.error.take() {
             Some(error) => Err(error),
@@ -3155,16 +3226,37 @@ impl InetSocket {
             (_, IpAddr::V4(_)) => options.device,
         };
         let through = (oif, options.device != 0);
-        let flow = Flow {
+        let mut flow = Flow {
             src: s.source(),
             oif,
             proto: FLOW_UDP,
             bound: options.device,
             port: None,
         };
-        let route = self
-            .network
-            .route(plain_to, source, through, FLOW_UDP, self.now())?;
+        // A connected socket's send takes the route it keeps, if that holds,
+        // or keeps the one it looks up (`ip6_sk_dst_lookup_flow`): but one to
+        // a group, where the socket has no device of its own.
+        let own = options.device != 0 || options.pktinfo_device != 0;
+        let keeps = connected && plain_to.is_ipv6() && (own || !plain_to.ip().is_multicast());
+        let now = self.now();
+        let kept = s
+            .kept6
+            .filter(|kept| keeps && self.network.takes_kept6(kept, oif, now));
+        let route = match kept {
+            Some(kept) => {
+                flow.src = kept.from;
+                kept.dest
+            }
+            None => {
+                let route = self
+                    .network
+                    .route(plain_to, source, through, FLOW_UDP, now)?;
+                if keeps {
+                    s.kept6 = self.network.kept6(route, plain_to, source, through, now);
+                }
+                route
+            }
+        };
         if let Dest::Veth(index, cast) = route {
             let v6 = plain_to.is_ipv6();
             if self.family == Family::V6 && options.v6_only && !v6 {
@@ -5922,6 +6014,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (0, 1) if options.type_of_service != value & 0xfc => {
                     options.type_of_service = value & 0xfc;
                     options.priority = tos_priority(value);
+                    socket.lock().kept6 = None;
                 }
                 (0, 1) => {}
                 (41, 26) if socket.family == Family::V6 => {
@@ -5969,6 +6062,7 @@ fn bind_to_device(
     }
     let index = u32::try_from(index).map_err(|_| Errno::EINVAL)?;
     options.device = index;
+    socket.lock().kept6 = None;
     socket.ports().set_device(&socket.this, index);
     Ok(())
 }

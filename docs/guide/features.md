@@ -6374,7 +6374,9 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     read, or after 40 ms (`TCP_QUICKACK` sets which); at most 10 in flight
     at first; a tail loss probe, which sends the last again; and the end,
     with the data held before it. `FIN_WAIT1` lasts until the end is
-    acknowledged. A UDP socket has no TCP options (`EOPNOTSUPP`).
+    acknowledged. What is held reaches the peer, with its time, when it
+    does on Linux, whether or not a call is made then: `SIGIO` for it ends
+    a sleep. A UDP socket has no TCP options (`EOPNOTSUPP`).
   - **Timestamps**: every UDP datagram is stamped as it comes, and
     `recvmsg` gives that time as Linux's `udp_recvmsg` does
     (`sock_recv_timestamp`), however late the receiver took the options:
@@ -6504,7 +6506,8 @@ one only with an `--allow-net`.
   connection as Linux's do, roughly: what waits to be sent holds up to the
   doubled `SO_SNDBUF`, and what has arrived up to half of the doubled
   `SO_RCVBUF`, so a small one makes a sender wait or `EAGAIN` early. One
-  not set holds 256 KiB. `SIOCOUTQ` and `FIONREAD` count the two.
+  not set holds 256 KiB. `SIOCOUTQ` counts what waits to be sent or
+  acknowledged, and `FIONREAD` what has arrived.
 - **Urgent data**, as Linux's TCP keeps it: the last byte of a `MSG_OOB`
   send is urgent and reaches the peer with the bytes before it. Reads
   stop before its mark, which `SIOCATMARK` reports and `FIONREAD` counts

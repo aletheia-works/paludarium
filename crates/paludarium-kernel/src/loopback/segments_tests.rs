@@ -9,12 +9,12 @@ const PLAIN: Push = Push {
 };
 
 fn flows() -> Flows {
-    Flows::new(65_483, 0)
+    Flows::new(65_483, Some(0))
 }
 /// `side` writes `len` bytes at `now`, as `push` says.
 fn write(f: &mut Flows, side: usize, len: u64, push: Push, now: u64) {
     f.sending(side, push);
-    f.write(side, len, now);
+    f.write(side, len, false, now);
 }
 fn of(f: &mut Flows, side: usize, ms: u64) -> [u32; 6] {
     let c = f.counts(side, ms * MS);
@@ -150,19 +150,99 @@ fn a_write_past_the_mss_is_cut() {
     }
 }
 
+/// What has come to `side` since it was last asked, and when.
+fn came(f: &mut Flows, side: usize) -> Vec<(u64, u64)> {
+    core::iter::from_fn(|| f.arrival(side)).collect()
+}
+
 #[test]
-fn a_read_of_bytes_held_brings_them_all() {
+fn data_held_comes_when_its_acknowledgement_does() {
     let mut f = flows();
-    write(&mut f, 0, 1_000_000, PLAIN, 0);
-    assert!(f.counts(0, 0).held > 0);
-    f.read(1, 1_000_000, 0);
-    let c = f.counts(1, 0);
-    assert_eq!((c.received, f.counts(0, 0).held), (1_000_000, 0));
-    let c = f.counts(0, 120 * MS);
-    assert_eq!((c.unacked, c.acked), (0, 1_000_000));
-    // Nothing is left to bring.
-    f.read(1, 5, 0);
-    assert_eq!(f.counts(1, 0).received, 1_000_000);
+    small(&mut f, 17);
+    assert_eq!(f.wake(), None);
+    assert_eq!(came(&mut f, 1), [(17, 0)]);
+    small(&mut f, 3);
+    // The delayed acknowledgement of the seventeenth lets the rest go.
+    assert_eq!(f.wake(), Some(40 * MS));
+    assert_eq!(came(&mut f, 1), []);
+    f.advance(39 * MS);
+    assert_eq!(f.arrived(), [false; 2]);
+    // Found late, it came when it was due.
+    f.advance(90 * MS);
+    assert_eq!(came(&mut f, 1), [(3, 40 * MS)]);
+    assert_eq!(f.wake(), None);
+    assert_eq!((f.moved(1), f.written(0)), (20, 20));
+    // A read acknowledges, which lets it go now.
+    let mut f = flows();
+    small(&mut f, 20);
+    assert_eq!(came(&mut f, 1), [(17, 0)]);
+    f.read(1, 17, 5 * MS);
+    assert_eq!(came(&mut f, 1), [(3, 5 * MS)]);
+    // `MSG_MORE` waits for its timer.
+    let mut f = flows();
+    let more = Push {
+        more: true,
+        ..PLAIN
+    };
+    write(&mut f, 0, 100, more, 0);
+    assert_eq!(f.wake(), Some(RTO));
+    f.advance(RTO);
+    assert_eq!(came(&mut f, 1), [(100, RTO)]);
+    // An end takes what waits along.
+    let mut f = flows();
+    small(&mut f, 20);
+    f.end(0, 7 * MS);
+    assert_eq!(came(&mut f, 1), [(17, 0), (3, 7 * MS)]);
+    assert_eq!(f.ended(1), Some(7 * MS));
+    assert_eq!(f.ended(1), None);
+    // A write that fills its buffer is all sent.
+    let mut f = flows();
+    small(&mut f, 20);
+    f.write(0, 1, true, 0);
+    assert_eq!(came(&mut f, 1), [(21, 0)]);
+}
+
+#[test]
+fn a_full_window_holds_data_until_a_read() {
+    let mut f = flows();
+    f.window(1, 1000, 0);
+    write(&mut f, 0, 1500, PLAIN, 0);
+    assert_eq!(came(&mut f, 1), [(1000, 0)]);
+    // No timer sends it.
+    assert_eq!(f.counts(0, 500 * MS).held, 500);
+    assert_eq!(f.wake(), None);
+    f.read(1, 600, 500 * MS);
+    f.window(1, 1600, 500 * MS);
+    assert_eq!(came(&mut f, 1), [(500, 500 * MS)]);
+    // Neither does an end pass it.
+    let mut f = flows();
+    f.window(1, 10, 0);
+    write(&mut f, 0, 20, PLAIN, 0);
+    f.end(0, 0);
+    assert_eq!(came(&mut f, 1), [(10, 0)]);
+    assert_eq!(f.ended(1), None);
+    assert_eq!(f.counts(0, 0).queued, 11);
+    f.window(1, 20, 0);
+    assert_eq!(came(&mut f, 1), [(10, 0)]);
+    assert_eq!(f.ended(1), Some(0));
+}
+
+#[test]
+fn without_a_clock_nothing_waits() {
+    let mut f = Flows::new(65_483, None);
+    small(&mut f, 100);
+    write(
+        &mut f,
+        0,
+        9,
+        Push {
+            more: true,
+            ..PLAIN
+        },
+        0,
+    );
+    assert_eq!(came(&mut f, 1), [(109, 0)]);
+    assert_eq!(f.wake(), None);
 }
 
 #[test]
@@ -276,7 +356,7 @@ fn a_reset_is_heard() {
 
 #[test]
 fn a_veth_s_mss_is_its_mtu_s() {
-    let mut f = Flows::new(1448, 0);
+    let mut f = Flows::new(1448, Some(0));
     write(&mut f, 0, 4000, PLAIN, 0);
     let c = f.counts(0, 120 * MS);
     assert_eq!((c.data_segs_out, c.snd_mss, c.held), (3, 1448, 0));

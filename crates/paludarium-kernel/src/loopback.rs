@@ -10,6 +10,7 @@
 //! [`Ports`] keeps what each TCP or UDP socket holds a local port with, as
 //! Linux's bind buckets and UDP hash do, for `bind`'s conflicts and to find
 //! a connection's listener or a datagram's receiver.
+use crate::deadlines::{Deadlines, Due, NEVER};
 use crate::inet::InetSocket;
 use core::hash::{Hash, Hasher};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -73,8 +74,13 @@ pub(crate) struct Link {
     /// The urgent byte toward each side, and what tells each of its arrival.
     urgent: Mutex<[Urgent; 2]>,
     notify: [Notify; 2],
-    /// The segments the bytes take on Linux.
+    /// The segments the bytes take on Linux, which say when they reach the
+    /// peer. Locked after `ends`.
     flows: Mutex<Flows>,
+    this: Weak<Link>,
+    /// When its timers are next to be run, changed with `flows` locked.
+    armed: AtomicU64,
+    deadlines: Arc<Deadlines>,
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -85,16 +91,19 @@ struct Ends {
 impl Link {
     /// Joins a connecting `client` stream to a new `server` one and opens
     /// both, the server's first: `client` from `client_local`, `server` from
-    /// `server_local`. `host`'s clock times each side's end, and `notify`
-    /// tells each side of an urgent byte.
+    /// `server_local`. `host`'s clock times the segments and each side's
+    /// end, `deadlines` run the connection's timers, `notify` tells each
+    /// side of an urgent byte, and `mtu` is the devices' it goes through.
     pub(crate) fn join(
         client: &Arc<Stream>,
         server: &Arc<Stream>,
         (client_local, server_local): (SocketAddr, SocketAddr),
-        host: &Arc<dyn paludarium_host::Host>,
+        (host, deadlines): (&Arc<dyn paludarium_host::Host>, &Arc<Deadlines>),
         notify: [Notify; 2],
+        mtu: usize,
     ) -> Arc<Self> {
-        let link = Arc::new(Self {
+        let now = host.clock(paludarium_host::ClockId::Monotonic).ok();
+        let link = Arc::new_cyclic(|this| Self {
             ends: Mutex::new(Some(Ends {
                 streams: [Arc::clone(client), Arc::clone(server)],
                 ended: [false; 2],
@@ -105,9 +114,12 @@ impl Link {
             urgent: Mutex::default(),
             notify,
             flows: Mutex::new(Flows::new(
-                crate::tcp_info::advertised_mss(client_local.is_ipv4()),
-                micros(host),
+                crate::tcp_info::advertised_mss(client_local.is_ipv4(), mtu),
+                now.map(|now| now / 1000),
             )),
+            this: Weak::clone(this),
+            armed: AtomicU64::new(NEVER),
+            deadlines: Arc::clone(deadlines),
         });
         client.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
         server.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
@@ -128,7 +140,7 @@ impl Link {
             .take();
         self.first.store(RESET, Ordering::SeqCst);
         let Some(ends) = ends else { return };
-        self.flows().reset(side, self.micros());
+        self.reset_flows(side, self.micros());
         let (own, peer) = (&ends.streams[side], &ends.streams[1 - side]);
         if !gone(peer) {
             let waiting = ends.ended[side] && !peer.readiness().write_closed;
@@ -174,57 +186,130 @@ impl Link {
         let peer = self.ended[1 - side].load(Ordering::SeqCst);
         (peer != NOT_ENDED).then(|| peer.saturating_add(TIME_WAIT))
     }
-    /// Moves what each side sends to the other, as far as the other's
-    /// buffer takes it, and each side's end once its bytes have gone. A
-    /// side that sends to a closed peer gets a reset, as Linux's peer
-    /// answers data after its close (`tcp_rcv_state_process`).
+    /// Runs the timers that are due, and moves what has gone from each side
+    /// to the other, as far as the other's buffer takes it, and each side's
+    /// end after its bytes ([`Flows`]). A side that sends to a closed peer
+    /// gets a reset, as Linux's peer answers data after its close
+    /// (`tcp_rcv_state_process`).
     fn pump(&self) {
         let mut guard = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(ends) = guard.as_mut() else { return };
+        let now = self.micros();
+        let arrived = {
+            let mut flows = self.flows();
+            flows.advance(now);
+            for from in 0..2 {
+                let (own, peer) = (&ends.streams[from], &ends.streams[1 - from]);
+                if matches!(own.phase(), Phase::Failed(_)) {
+                    continue;
+                }
+                let edge = if gone(peer) {
+                    u64::MAX
+                } else {
+                    flows.moved(1 - from) + peer.room() as u64
+                };
+                flows.window(1 - from, edge, now);
+                let ready = own.readiness();
+                let queued = flows.moved(1 - from) + own.queued().1 as u64;
+                let wrote = queued.saturating_sub(flows.written(from));
+                flows.write(from, wrote, !ready.writable, now);
+                if ready.write_closed {
+                    flows.end(from, now);
+                }
+            }
+            self.arm(&flows);
+            flows.arrived()
+        };
         for from in 0..2 {
             let (own, peer) = (&ends.streams[from], &ends.streams[1 - from]);
-            if matches!(own.phase(), Phase::Failed(_)) {
+            if !arrived[1 - from] || matches!(own.phase(), Phase::Failed(_)) {
                 continue;
             }
-            if gone(peer) {
-                if own.queued().1 > 0 {
+            loop {
+                let Some((len, at)) = self.flows().arrival(1 - from) else {
+                    break;
+                };
+                if gone(peer) {
                     // The closed side answers with a reset, which ends its
                     // `TIME_WAIT` too.
                     self.first.store(RESET, Ordering::SeqCst);
-                    let lost = own.take(usize::MAX).len() as u64;
-                    let now = self.micros();
-                    let mut flows = self.flows();
-                    flows.write(from, lost, now);
-                    flows.reset(1 - from, now);
-                    drop(flows);
+                    own.take(usize::MAX);
+                    self.reset_flows(1 - from, now);
                     own.fail(if ends.ended[1 - from] {
                         Errno::EPIPE
                     } else {
                         ECONNRESET
                     });
-                } else if own.finished().0 || own.finished().1 {
-                    // The end still reaches the closed side's hold.
-                    self.end(&mut ends.ended, from);
+                    break;
                 }
-                continue;
+                let bytes = own.take(len as usize);
+                peer.receive_late(&bytes, now.saturating_sub(at) * 1000);
+                self.delivered(1 - from, bytes.len());
             }
-            let room = peer.room();
-            if room > 0 {
-                let bytes = own.take(room);
-                if !bytes.is_empty() {
-                    peer.receive(&bytes);
-                    self.delivered(1 - from, bytes.len());
+            let ended = self.flows().ended(1 - from);
+            if let Some(at) = ended
+                && !matches!(own.phase(), Phase::Failed(_))
+            {
+                // The end still reaches a closed side's hold.
+                self.end(&mut ends.ended, from, at);
+                if !gone(peer) {
+                    peer.end();
                 }
-            }
-            let (shut, closed) = own.finished();
-            if (shut || (closed && own.queued().1 == 0)) && !ends.ended[from] {
-                self.end(&mut ends.ended, from);
-                peer.end();
             }
         }
         if ends.streams.iter().all(|stream| stream.finished().1) {
             *guard = None;
         }
+    }
+    /// `side` was reset, at `now`.
+    fn reset_flows(&self, side: usize, now: u64) {
+        let mut flows = self.flows();
+        flows.reset(side, now);
+        self.arm(&flows);
+    }
+    /// Sets when the connection's timers are next to be run.
+    fn arm(&self, flows: &Flows) {
+        let at = flows.wake().map_or(NEVER, |at| at.saturating_mul(1000));
+        let old = self.armed.swap(at, Ordering::SeqCst);
+        if old != at {
+            self.deadlines.set(self.id(), (old, at), &self.this());
+        }
+    }
+    fn this(&self) -> Weak<dyn Due> {
+        Weak::clone(&self.this) as Weak<dyn Due>
+    }
+    /// What names the link among the deadlines.
+    fn id(&self) -> usize {
+        core::ptr::from_ref(self).addr()
+    }
+    /// Does `f` with the flows, and moves what it let go.
+    fn with_flows<R>(&self, f: impl FnOnce(&mut Flows, u64) -> R) -> R {
+        let (result, arrived) = {
+            let mut flows = self.flows();
+            let result = f(&mut flows, self.micros());
+            self.arm(&flows);
+            (result, flows.arrived() != [false; 2])
+        };
+        if arrived {
+            self.pump();
+        }
+        result
+    }
+}
+impl Due for Link {
+    fn run(&self) {
+        // Taken out of the table.
+        {
+            let _flows = self.flows();
+            self.armed.store(NEVER, Ordering::SeqCst);
+        }
+        self.pump();
+    }
+}
+impl Drop for Link {
+    fn drop(&mut self) {
+        let armed = self.armed.load(Ordering::SeqCst);
+        self.deadlines.set(self.id(), (armed, NEVER), &self.this());
     }
 }
 impl Link {
@@ -241,15 +326,15 @@ impl Link {
     }
     /// `side`'s `TCP_NODELAY` was set or cleared.
     pub(crate) fn set_no_delay(&self, side: usize, on: bool) {
-        self.flows().set_no_delay(side, on, self.micros());
+        self.with_flows(|flows, now| flows.set_no_delay(side, on, now));
     }
     /// `side`'s `TCP_QUICKACK` was set to `value`.
     pub(crate) fn set_quick(&self, side: usize, value: i32) {
-        self.flows().set_quick(side, value, self.micros());
+        self.with_flows(|flows, now| flows.set_quick(side, value, now));
     }
     /// The segments `side` has sent and received.
     pub(crate) fn segments(&self, side: usize) -> Counts {
-        self.flows().counts(side, self.micros())
+        self.with_flows(|flows, now| flows.counts(side, now))
     }
     fn urgent(&self) -> MutexGuard<'_, [Urgent; 2]> {
         self.urgent.lock().unwrap_or_else(PoisonError::into_inner)
@@ -276,7 +361,6 @@ impl Link {
     }
     /// `count` more bytes reached `to`.
     fn delivered(&self, to: usize, count: usize) {
-        self.flows().write(1 - to, count as u64, self.micros());
         let arrived = {
             let mut all = self.urgent();
             all[to].delivered += count as u64;
@@ -363,7 +447,7 @@ impl Link {
             way.stale = None;
         }
         drop(all);
-        self.flows().read(side, count as u64, self.micros());
+        self.with_flows(|flows, now| flows.read(side, count as u64, now));
     }
     /// The urgent byte waiting for `side`'s `MSG_OOB`, which a read without
     /// `peek` takes (`tcp_recv_urg`).
@@ -392,20 +476,15 @@ impl Link {
             None => (false, false, None),
         }
     }
-    /// `from`'s end has reached the other side now.
-    fn end(&self, ended: &mut [bool; 2], from: usize) {
+    /// `from`'s end reached the other side at `at`, in microseconds.
+    fn end(&self, ended: &mut [bool; 2], from: usize, at: u64) {
         if ended[from] {
             return;
         }
         ended[from] = true;
-        self.flows().end(from, self.micros());
         // Without the host's clock the end counts as long past, so that no
         // hold waits on it.
-        let now = self
-            .host
-            .clock(paludarium_host::ClockId::Monotonic)
-            .unwrap_or(0);
-        self.ended[from].store(now, Ordering::SeqCst);
+        self.ended[from].store(at.saturating_mul(1000), Ordering::SeqCst);
         let _ =
             self.first
                 .compare_exchange(NO_SIDE, from as u8, Ordering::SeqCst, Ordering::SeqCst);

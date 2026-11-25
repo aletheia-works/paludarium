@@ -976,6 +976,7 @@ fn sleep_until(
         _ => None,
     };
     let _target_sleeping = target.as_deref().map(crate::ThreadGroup::cpu_sleep);
+    let _until = group.sleeping(c.inbox);
     // A process signal sent after this count can set the wake the drain
     // below clears, even one the drain before the wait takes in: a later
     // count tells that wake from an interruption once the wait ends. The

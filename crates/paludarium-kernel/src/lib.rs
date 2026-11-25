@@ -111,6 +111,7 @@ mod sockets;
 mod syscalls;
 mod sysctl;
 mod syslog;
+mod targets;
 #[cfg(test)]
 mod tasks_tests;
 mod tcp_info;
@@ -795,6 +796,8 @@ pub struct ThreadState {
     pub clear_child_tid: u64,
     pub exit_status: Option<ExitStatus>,
     pub(crate) pending: Vec<signals::PendingSignal>,
+    /// How it takes the process's signals in.
+    pub(crate) seat: targets::Seat,
     /// The signals [`signals::queue`] has made pending here that Linux would
     /// have queued ([`signals::wakes`]), each of which its `signalfd_notify`
     /// wakes a signal file for.
@@ -1430,6 +1433,19 @@ impl Kernel {
 
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
+        let next = self.checkpoint_once(thread, mem);
+        // What a handler's mask blocks is told before the handler runs.
+        self.group.settle_mask(&mut thread.state);
+        if let Some(tif) = thread.state.seat.tif() {
+            tif.set_halted(next == Next::Stopped);
+            tif.set_held(
+                !thread.state.pending.is_empty()
+                    && signals::next_pending(&thread.state, false).is_some(),
+            );
+        }
+        next
+    }
+    fn checkpoint_once(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Its writes to user memory, a signal frame's and the rseq area's,
         // are the kernel's work for the thread on its way back to user space
         // (`get_signal`, `rseq_handle_notify_resume`): their faults are the
@@ -1456,6 +1472,10 @@ impl Kernel {
             return Next::Exit(ExitStatus::Exited(0));
         }
         self.group.register(thread.tid, Arc::clone(&self.inbox));
+        thread
+            .state
+            .seat
+            .take(self.inbox.tif(), thread.state.signal_mask);
         if let Some(status) = self.group.status() {
             return Next::Exit(status);
         }
@@ -1472,6 +1492,12 @@ impl Kernel {
         self.sync_actions(thread);
         self.group.drain_process(&mut thread.state);
         self.inbox.drain(&mut thread.state);
+        // `get_signal` takes the process's too, for a thread with one of its
+        // own.
+        if !thread.state.pending.is_empty() && signals::next_pending(&thread.state, false).is_some()
+        {
+            self.group.take_process(&mut thread.state);
+        }
         if thread.state.pending.iter().any(|s| s.number == 18) {
             self.group.job_continue();
         }
@@ -1815,6 +1841,10 @@ impl Kernel {
         // A caller that did not finish the last exec finishes it now.
         self.exec_finished();
         self.group.register(thread.tid, Arc::clone(&self.inbox));
+        thread
+            .state
+            .seat
+            .take(self.inbox.tif(), thread.state.signal_mask);
         // Running the `vsyscall` page, which Linux emulates before it looks
         // for a VMA (`do_user_addr_fault`).
         if let Some(address) = vsyscall::entered(&reason) {

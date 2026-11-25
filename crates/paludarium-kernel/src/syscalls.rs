@@ -1663,6 +1663,27 @@ pub(crate) fn wait_for_signal(c: &mut Context<'_>) -> Result<u64, Errno> {
     }
 }
 
+/// The signals a thread waits for while it lives, which it does not block
+/// meanwhile (`real_blocked`); then it looks again (`recalc_sigpending`).
+struct Waited(Option<std::sync::Arc<crate::targets::Tif>>);
+impl Waited {
+    fn new(process: &ThreadState, set: u64) -> Self {
+        let tif = process.seat.tif().cloned();
+        if let Some(tif) = &tif {
+            tif.wait_for(set);
+        }
+        Self(tif)
+    }
+}
+impl Drop for Waited {
+    fn drop(&mut self) {
+        if let Some(tif) = &self.0 {
+            tif.wait_for(0);
+            tif.set_look();
+        }
+    }
+}
+
 /// `rt_sigtimedwait(set, info, timeout, sigsetsize)`: takes the lowest
 /// pending signal in `set`, blocked or not, and returns its number; EAGAIN
 /// once `timeout` passes, EINTR when another signal can be delivered.
@@ -1681,16 +1702,26 @@ fn sys_rt_sigtimedwait(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         };
         let start = c.host.clock(ClockId::Monotonic)?;
         let deadline = timeout.map(|t| start.saturating_add(t));
+        // Those it waits for it blocks no more, and it looks at the process's
+        // once, then as one of them chooses it.
+        let _waited = Waited::new(c.process, set);
+        let mut looks = true;
         loop {
-            c.group.drain_process(c.process);
             let now = c.host.clock(ClockId::Monotonic)?;
+            c.group.expire_due(now);
+            looks |= c.process.seat.looks();
+            c.group.drain_process(c.process);
             c.group.expire_timer(c.process, now);
             // After the timers, so a SIGEV_THREAD_ID signal to this thread is seen.
             c.inbox.drain(c.process);
             // The thread's own queue first, then the process's shared one.
             let found = signals::lowest_in(&c.process.pending, set)
                 .map(|index| c.process.pending.remove(index))
-                .or_else(|| c.group.take_process_signal(set));
+                .or_else(|| {
+                    std::mem::take(&mut looks)
+                        .then(|| c.group.take_process_signal(set))
+                        .flatten()
+                });
             if let Some(signal) = found {
                 if a[1] != 0 {
                     c.mem

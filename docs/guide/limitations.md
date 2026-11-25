@@ -666,11 +666,6 @@ verified.
     before any range (`EINVAL`), as Linux master does; the CI's kernel
     checks it with each range, so with no ranges, or only empty ones, it
     gives 0 there.
-  - A fatal signal other than SIGKILL marks a process as dying for
-    `process_mrelease` as it is sent even when the only thread that does
-    not block it already has a signal pending and is not running, or is
-    exiting. Linux's `wants_signal` passes over such a thread, so Linux
-    marks the process only once one of its threads takes the signal.
   - In a child of `fork`, `move_pages` shows a page of a program's own
     ELF segment that the loader wrote and nothing wrote since as there,
     where Linux copies no page table of a VMA without an `anon_vma`
@@ -1047,6 +1042,11 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
+- **A POSIX timer's signal, in part**: a timer on a clock of real time
+  sends to the process's leader first, where Linux's `posixtimer_get_target`
+  sends to a thread of the process that its interrupt finds running. One
+  whose signal is ignored is dropped as it is taken, where Linux keeps it
+  aside until it is no longer ignored.
 - **inotify, in part**: when a superblock goes, its files' watches hear
   `IN_UNMOUNT` in the order the files got their first mark of any group, as
   on Linux; but the dnotify mark a one-shot watch leaves on its directory

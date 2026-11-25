@@ -23,7 +23,7 @@ use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::MountChange;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, Weak};
 
 // The events, as `include/uapi/linux/fanotify.h` numbers them (the same
@@ -941,6 +941,7 @@ fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<
     let Some(id) = group.upgrade().and_then(|g| g.ask(event)) else {
         return Ok(());
     };
+    let _sleeps = c.inbox.tif().sleep_killable();
     loop {
         let ticket = c.files.readiness.token.value();
         let Some(strong) = group.upgrade() else {
@@ -950,26 +951,29 @@ fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<
             return answer;
         }
         let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
-        c.group.expire_timer(c.process, now);
+        c.group.expire_due(now);
+        c.group.pass_process(c.process);
         let _ = c.inbox.drain(c.process);
         if fatal(c) {
             strong.cancel(id);
             return Err(Errno(4));
         }
         drop(strong);
+        // A signal it does not take keeps its inbox's wake set.
+        let never = AtomicBool::new(false);
         let end = Some((
             paludarium_host::ClockId::Monotonic,
             now.saturating_add(10_000_000),
         ));
         match c
             .host
-            .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
+            .wait_on(&c.files.readiness.token, ticket, end, &never)
         {
             Err(e) if e == Errno::ENOSYS => {
                 c.host.wait_until(
                     paludarium_host::ClockId::Monotonic,
                     now.saturating_add(1_000_000),
-                    c.cancellation,
+                    &never,
                 )?;
             }
             result => {
@@ -982,7 +986,9 @@ fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<
 /// Whether the task is to die (`fatal_signal_pending`): its group exits, or
 /// a fatal signal is pending ([`crate::signals::fatal`]).
 pub(crate) fn fatal(c: &Context<'_>) -> bool {
-    c.group.status().is_some() || crate::signals::fatal_pending(c.process)
+    crate::signals::fatal_pending(c.process)
+        || c.group.killed()
+        || c.group.fatal_pending(c.inbox, c.process.signal_mask)
 }
 
 impl Registry {

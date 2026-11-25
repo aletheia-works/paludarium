@@ -462,6 +462,7 @@
     {"name":"ignored-signal-wait","binary":"process"},
     {"name":"mmsg","binary":"process"},
     {"name":"itimer","binary":"process"},
+    {"name":"signal-threads","binary":"signal-threads"},
     {"name":"timer-waits-plain","binary":"timer-waits"},
     {"name":"timer-waits-restart","binary":"timer-waits"},
     {"name":"timer-waits-default","binary":"timer-waits"},

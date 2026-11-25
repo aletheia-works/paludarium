@@ -1093,6 +1093,7 @@ mod linux {
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
+        processes_signal_threads => ("signal-threads","signal-threads"),
         processes_timer_waits_plain => ("timer-waits-plain","timer-waits"),
         processes_timer_waits_restart => ("timer-waits-restart","timer-waits"),
         processes_timer_waits_default => ("timer-waits-default","timer-waits"),

@@ -528,6 +528,11 @@ kernel.
   host that cannot tell (Windows) keeps it always readable. The output
   streams are always writable. A pipe's read end is readable only with unread data, and only hung up once
   its writers are gone, as Linux's `pipe_poll` reports.
+  A file without a poll of its own (a regular file, a directory, `/dev/null`,
+  `/dev/zero`, `/dev/full` and `/dev/urandom`, a file of a process's `/proc`
+  directory) gives `POLLIN`, `POLLOUT`, `POLLRDNORM` and `POLLWRNORM`
+  (`DEFAULT_POLLMASK`) and `epoll_ctl` refuses it (`EPERM`); `/dev/random`
+  gives `POLLIN` and `POLLRDNORM`.
 
 - `ppoll`, `select` and `pselect6` wait the same way. They write the time
   left back to their timeout (not a zero one), as Linux does, and `ppoll` and
@@ -554,7 +559,7 @@ kernel.
   epoll descriptor or the target), `epoll_wait` and `fcntl`
   (but for `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_DUPFD_QUERY`, `F_GETFD`,
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
-  `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
+  `select` finds it ready in every set. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
 
 - `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`

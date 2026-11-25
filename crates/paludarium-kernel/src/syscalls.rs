@@ -2353,10 +2353,19 @@ fn select(
                     .enumerate()
                     .filter(|&(kind, _)| wanted[kind][word] & bit != 0)
                     .fold(0, |events, (_, event)| events | event);
-                let mask = revents(c, fd as i32, events);
-                for (kind, ready) in [POLLIN | 0x18, POLLOUT | 0x8, POLLPRI]
-                    .into_iter()
-                    .enumerate()
+                let mask = if path_only(c, fd as i32) {
+                    POLLNVAL
+                } else {
+                    revents(c, fd as i32, events)
+                };
+                // `POLLIN_SET`, `POLLOUT_SET` and `POLLEX_SET`.
+                for (kind, ready) in [
+                    POLLIN | 0x18 | POLLNVAL,
+                    POLLOUT | 0x8 | POLLNVAL,
+                    POLLPRI | POLLNVAL,
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     if wanted[kind][word] & bit != 0 && mask & ready != 0 {
                         found[kind][word] |= bit;
@@ -2413,17 +2422,21 @@ fn revents_by(c: &Context<'_>, fd: i32, events: u16, poll: bool) -> u16 {
                     }
                     (mask as u16) & (events | 0x18)
                 }
-                Err(_) => d.file.stat().map_or(POLLNVAL, |stat| {
-                    if stat.mode & 0o170000 == 0o100000 {
-                        events & (POLLIN | POLLOUT)
-                    } else {
-                        0
-                    }
-                }),
+                // A file with no poll.
+                Err(_) => crate::events::DEFAULT_POLLMASK as u16 & events,
             },
             Err(_) => POLLNVAL,
         },
     }
+}
+
+/// Whether `fd` is open with `O_PATH`: `poll` and `select` take it as Linux's
+/// `fdget` does, which refuses it (POLLNVAL), though `select` finds it open.
+fn path_only(c: &Context<'_>, fd: i32) -> bool {
+    fd >= 0
+        && c.files
+            .descriptor(fd as u64)
+            .is_ok_and(|d| d.file.flags() & O_PATH != 0)
 }
 
 /// One pass over the `pollfd` array, writing each `revents`; returns how
@@ -2436,13 +2449,7 @@ fn poll_once(c: &mut Context<'_>, fds: u64, nfds: u64) -> Result<u64, Errno> {
         c.mem.read(at, &mut entry).map_err(|_| Errno::EFAULT)?;
         let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let events = u16::from_le_bytes([entry[4], entry[5]]);
-        // `poll` takes the descriptor as Linux's `fdget` does, which refuses
-        // an `O_PATH` one (POLLNVAL); `select` finds it open, and ready.
-        let path_only = fd >= 0
-            && c.files
-                .descriptor(fd as u64)
-                .is_ok_and(|d| d.file.flags() & O_PATH != 0);
-        let revents = if path_only {
+        let revents = if path_only(c, fd) {
             POLLNVAL
         } else {
             revents(c, fd, events)

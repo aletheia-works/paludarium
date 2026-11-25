@@ -467,6 +467,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   は、どれもそう見ます。それを見分けられないホスト（Windows）では、いつも読めると
   します。出力はいつも書けます。パイプの読み出し側は、読まれていないデータがあるときだけ読めるとし、書き手が
   いなくなると切断だけを示します。Linux の `pipe_poll` と同じです。
+  自身のポーリングを持たないファイル（普通のファイル、ディレクトリ、`/dev/null`、`/dev/zero`、
+  `/dev/full`、`/dev/urandom`、プロセスの `/proc` のディレクトリのファイル）は `POLLIN`、
+  `POLLOUT`、`POLLRDNORM`、`POLLWRNORM` を返し（`DEFAULT_POLLMASK`）、`epoll_ctl` は拒みます
+  （`EPERM`）。`/dev/random` は `POLLIN` と `POLLRDNORM` を返します。
 
 - `ppoll`・`select`・`pselect6` も同じように待ちます。Linux と同じく、残りの時間を
   タイムアウトの引数に書き戻し（0 のタイムアウトには書き戻しません）、`ppoll` と
@@ -489,7 +493,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `fdatasync`、`syncfs`、`sync_file_range`、`fadvise64`、`readahead`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
-  `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
+  `select` はどの集合でも準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
   `close` は受け付け、`*at` の呼び出しではディレクトリになります。
 
 - `O_DIRECT` と `O_NOATIME` は、Linux の `open` と `F_SETFL` と同じく確かめます。

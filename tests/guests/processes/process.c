@@ -25573,6 +25573,53 @@ static int uts_sysctl_poll_case(void) {
     }
     return 0;
 }
+/* The poll-default case: the files whose file operations have no poll, which
+   vfs_poll gives DEFAULT_POLLMASK (POLLIN, POLLOUT, POLLRDNORM and
+   POLLWRNORM), and which epoll_ctl refuses; with poll and select, each bit
+   alone and all of them. */
+static void pd_show(const char *name, int fd) {
+    static const int each[] = {POLLIN, POLLPRI, POLLOUT, POLLRDNORM, POLLRDBAND, POLLWRNORM, POLLWRBAND, 0};
+    if (fd < 0) {
+        printf("%s: open %d\n", name, errno);
+        return;
+    }
+    printf("%s: all=%#x", name, us_poll(fd, US_ALL));
+    for (int i = 0; i < 8; i++) printf(" %#x=%#x", each[i], us_poll(fd, each[i]));
+    fd_set sets[3];
+    for (int i = 0; i < 3; i++) {
+        FD_ZERO(&sets[i]);
+        FD_SET(fd, &sets[i]);
+    }
+    struct timeval now = {0, 0};
+    int r = select(fd + 1, &sets[0], &sets[1], &sets[2], &now);
+    printf(" select=%d:%d%d%d", r, !!FD_ISSET(fd, &sets[0]), !!FD_ISSET(fd, &sets[1]), !!FD_ISSET(fd, &sets[2]));
+    int ep = epoll_create1(0);
+    printf(" epoll=%d\n", us_add(ep, fd, EPOLLIN, 1));
+    close(ep);
+    close(fd);
+}
+static int poll_default_case(void) {
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-poll-default-%d", getpid());
+    int made = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    pd_show("regular", made);
+    pd_show("read-only", open(path, O_RDONLY));
+    pd_show("write-only", open(path, O_WRONLY));
+    pd_show("path-only", open(path, O_PATH));
+    unlink(path);
+    pd_show("directory", open("/tmp", O_RDONLY | O_DIRECTORY));
+    pd_show("memfd", memfd_create("poll", 0));
+    pd_show("null", open("/dev/null", O_RDWR));
+    pd_show("zero", open("/dev/zero", O_RDWR));
+    pd_show("full", open("/dev/full", O_RDWR));
+    pd_show("random", open("/dev/random", O_RDONLY));
+    pd_show("urandom", open("/dev/urandom", O_RDONLY));
+    pd_show("status", open("/proc/self/status", O_RDONLY));
+    pd_show("comm", open("/proc/self/comm", O_RDWR));
+    pd_show("proc-directory", open("/proc/self", O_RDONLY | O_DIRECTORY));
+    pd_show("namespace", open("/proc/self/ns/uts", O_RDONLY));
+    return 0;
+}
 /* The net-sysctl case's files, under /proc/sys/net. */
 static long ns_read(const char *name) {
     char path[128], text[32] = {0};
@@ -38928,6 +38975,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
+    if (!strcmp(mode, "poll-default")) return poll_default_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();
     if (!strcmp(mode, "net-sysctl")) return net_sysctl_case();

@@ -1684,7 +1684,9 @@ struct State {
     link: Option<(Arc<OnceLock<Arc<Link>>>, usize)>,
     // UDP.
     peer: Option<SocketAddr>,
-    /// What [`Binding::old_peer`] has, while the socket has no port too.
+    /// The address of the peer an IPv6 socket had before it disconnected,
+    /// which its binding has too ([`Binding::old_peer`]): kept here, as the
+    /// disconnect may unbind the socket, for the next bind or autobind.
     old_peer: Option<IpAddr>,
     queries: VecDeque<Query>,
     /// Datagrams other guest sockets sent this one on the loopback.
@@ -2733,7 +2735,9 @@ impl InetSocket {
     /// and takes datagrams only from it, from that port on the source
     /// address of the route: the loopback's, or elsewhere the host's
     /// (`inet_dgram_connect`, `ip4_datagram_connect`). AF_UNSPEC disconnects
-    /// (`__udp_disconnect`), keeping only what the guest bound itself.
+    /// (`__udp_disconnect`), keeping the port and address the guest bound
+    /// itself, no device, and of an IPv6 socket its peer's address
+    /// ([`State::old_peer`]).
     fn connect_datagram(&self, address: Option<SocketAddr>) -> Result<u64, Errno> {
         if address.is_none() {
             // The options' lock comes before the state's.

@@ -2586,5 +2586,23 @@ fn a_thp_placement_pads_by_2_mib_and_keeps_top_down_mappings_together() {
         // A hint with room for the padded area is taken.
         let hint = GuestAddr(0x2000_3000);
         assert_eq!(place(&m, Some(hint), 2 * HUGE, 0), hint.0, "{bottom_up}");
+        // Not one whose padded area reaches into the guard gap below a
+        // mapping that grows down, though the mapping itself would not.
+        let top = 0x4000_0000;
+        let stack = m
+            .map_backed(
+                Placement::Exactly(GuestAddr(top)),
+                PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+                Backing::None,
+            )
+            .unwrap();
+        m.grow_new_down(stack, top + PAGE_SIZE);
+        let hint = GuestAddr(top - 3 * HUGE);
+        assert_ne!(place(&m, Some(hint), 2 * HUGE, 0), hint.0, "{bottom_up}");
+        // With the padded area ending where the gap starts, it is taken.
+        let hint = GuestAddr(top - 3 * HUGE - STACK_GUARD_GAP);
+        assert_eq!(place(&m, Some(hint), 2 * HUGE, 0), hint.0, "{bottom_up}");
     }
 }

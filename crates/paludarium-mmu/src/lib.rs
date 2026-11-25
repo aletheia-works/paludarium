@@ -5068,6 +5068,12 @@ impl AddressSpaceData {
                     .checked_add(padded)
                     .is_some_and(|stop| stop <= USER_ADDRESS_LIMIT - PAGE_SIZE)
                 && !self.overlaps(at, at + padded)
+                // Linux looks for the longer area's guard gap too.
+                && self
+                    .mappings
+                    .range(at..)
+                    .next()
+                    .is_none_or(|(_, m)| at + padded <= m.start_gap())
         };
         let found = match hint {
             Some(hint) if free_at(hint) => return Some(hint),

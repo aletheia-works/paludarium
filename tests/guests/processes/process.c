@@ -16038,8 +16038,8 @@ static int tmpfs_huge_placement_case(void) {
    so does an mremap move to such a length; a free hint is taken as it is; a
    private mapping of /dev/zero of 2 MiB or more goes at a boundary whatever
    its length. A reserve of 64 MiB is mapped and unmapped first, so that
-   each lands in the same free area natively and emulated. Only what holds
-   for every layout is printed. */
+   each lands in the same free area natively and emulated. below= holds in
+   the top-down layout, which the case runs in; the rest holds in any. */
 static int anon_thp_placement_case(void) {
     long huge = 2 << 20;
     int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;

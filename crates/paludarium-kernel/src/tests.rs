@@ -3325,6 +3325,47 @@ fn mremap_flags_and_msync_arguments() {
     );
 }
 #[test]
+fn nothing_is_mapped_below_mmap_min_addr_without_cap_sys_rawio() {
+    let mut f = fixture();
+    let (mmap, mremap, at) = (syscalls::nr::MMAP, syscalls::nr::MREMAP, 0x6000_0000);
+    let root = f.thread.state.credentials.clone();
+    // With it they are, there and at 0, and moved there.
+    assert_eq!(f.ret(mmap, &[0, 4096, 3, 0x32, u64::MAX, 0]), 0);
+    assert_eq!(f.ret(mmap, &[at, 8192, 3, 0x32, u64::MAX, 0]), at);
+    assert_eq!(f.ret(mremap, &[at, 4096, 4096, 3, 0x1000]), 0x1000);
+    f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+    let eperm = errno(Errno::EPERM);
+    for low in [0, 0xf000] {
+        for flags in [0x32, 0x10_0022] {
+            assert_eq!(f.ret(mmap, &[low, 4096, 3, flags, u64::MAX, 0]), eperm);
+        }
+    }
+    assert_eq!(
+        f.ret(mmap, &[0x1001, 4096, 3, 0x32, u64::MAX, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(mmap, &[0x1000, 1 << 57, 3, 0x32, u64::MAX, 0]),
+        errno(Errno::ENOMEM)
+    );
+    assert_eq!(f.ret(mmap, &[0x10000, 4096, 3, 0x32, u64::MAX, 0]), 0x10000);
+    // A move unmaps its target and shrinks its source before it is refused,
+    // and what is there stays.
+    let source = at + 0x10_0000;
+    assert_eq!(f.ret(mmap, &[source, 8192, 3, 0x32, u64::MAX, 0]), source);
+    assert_eq!(f.ret(mremap, &[source, 8192, 4096, 3, 0x1000]), eperm);
+    let starts = |f: &Fixture| {
+        f.mem
+            .mappings()
+            .map(|m| (m.start.0, m.length))
+            .collect::<Vec<_>>()
+    };
+    assert!(starts(&f).contains(&(source, 4096)));
+    assert!(!starts(&f).iter().any(|&(start, _)| start == 0x1000));
+    // Without MREMAP_FIXED, a free address asked for is refused as well.
+    assert_eq!(f.ret(mremap, &[source, 4096, 4096, 5, 0x2000]), eperm);
+}
+#[test]
 fn clone3_arguments_follow_linux() {
     let f = fixture();
     let put = |words: &[u64]| {

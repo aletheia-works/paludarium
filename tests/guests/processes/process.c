@@ -17013,6 +17013,67 @@ static int mmap_32bit_case(void) {
     close(fd), close(zero);
     return 0;
 }
+/* The mmap-low case: without CAP_SYS_RAWIO nothing is mapped below
+   mmap_min_addr (64 KiB): a fixed mmap, an mremap there and a shmat there are
+   EPERM (cap_mmap_addr), the mremap once its target is gone and its source
+   has shrunk. An unaligned address is EINVAL and a length past the end of
+   the address space ENOMEM before it; a file's own refusal comes after it. */
+static int low_error(const void *at) {
+    return at == MAP_FAILED || at == (void *)-1 ? errno : 0;
+}
+static int mmap_low_case(void) {
+    long page = 4096;
+    int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 80;
+    uintptr_t at[] = {0, 0x1000, 0xf000, 0x1001};
+    for (int i = 0; i < 4; i++) {
+        int fixed = low_error(mmap((void *)at[i], page, rw, anon | MAP_FIXED, -1, 0));
+        /* musl's mmap gives ENOMEM for this EPERM at 0. */
+        int kept = low_error((void *)syscall(SYS_mmap, at[i], page, rw,
+                                             anon | MAP_FIXED_NOREPLACE, -1L, 0L));
+        printf("%#lx: fixed=%d noreplace=%d\n", (unsigned long)at[i], fixed, kept);
+    }
+    printf("long=%d\n", low_error(mmap((void *)0x1000, 1UL << 57, rw, anon | MAP_FIXED, -1, 0)));
+    int null = open("/dev/null", O_RDWR), zero = open("/dev/zero", O_RDWR);
+    printf("device=%d\n", low_error(mmap((void *)0x1000, page, rw, MAP_PRIVATE, null, 0)));
+    printf("low device=%d\n",
+           low_error(mmap((void *)0x1000, page, rw, MAP_PRIVATE | MAP_FIXED, null, 0)));
+    printf("low zero=%d\n",
+           low_error(mmap((void *)0x1000, page, rw, MAP_PRIVATE | MAP_FIXED, zero, 0)));
+    /* The lowest address is free to map; a mapping below it that would
+       replace some of it is refused, and leaves it. */
+    char *min = mmap((void *)0x10000, 2 * page, rw, anon | MAP_FIXED, -1, 0);
+    printf("min=%d\n", low_error(min));
+    if (min == MAP_FAILED) return 81;
+    *min = 5;
+    int over = low_error(mmap((void *)0xf000, 2 * page, rw, anon | MAP_FIXED, -1, 0));
+    printf("over=%d kept=%d\n", over, *min);
+    char *a = mmap(NULL, 3 * page, rw, anon, -1, 0);
+    if (a == MAP_FAILED) return 82;
+    *a = 7;
+    int how = MREMAP_MAYMOVE | MREMAP_FIXED;
+    unsigned char in;
+    int moved = low_error(mremap(a, 3 * page, page, how, (void *)0x1000));
+    int first = mincore(a, page, &in), second = mincore(a + page, page, &in);
+    printf("mremap=%d first=%d shrunk=%d value=%d\n", moved, first, second ? errno : 0, *a);
+    moved = low_error(mremap(a, page, 2 * page, how, (void *)0xf000));
+    first = mincore(min, page, &in);
+    printf("mremap over=%d target=%d value=%d\n", moved, first ? errno : 0, *a);
+    int keep = MREMAP_MAYMOVE | MREMAP_DONTUNMAP;
+    printf("dontunmap=%d\n", low_error(mremap(a, page, page, keep, (void *)0x1000)));
+    printf("dontunmap nowhere=%d\n", low_error(mremap(a, page, page, keep, NULL)));
+    int id = shmget(IPC_PRIVATE, page, 0600);
+    if (id < 0) return 83;
+    printf("shmat=%d\n", low_error(shmat(id, (void *)0x1000, 0)));
+    printf("shmat remap=%d\n", low_error(shmat(id, (void *)0x1000, SHM_REMAP)));
+    printf("shmat round=%d\n", low_error(shmat(id, (void *)0x1001, SHM_RND)));
+    printf("shmat zero=%d\n", low_error(shmat(id, (void *)0x10, SHM_RND)));
+    printf("shmat unaligned=%d\n", low_error(shmat(id, (void *)0x1001, 0)));
+    shmctl(id, IPC_RMID, NULL);
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -40115,6 +40176,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
     if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
+    if (!strcmp(mode, "mmap-low")) return mmap_low_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

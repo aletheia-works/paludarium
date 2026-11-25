@@ -1082,6 +1082,7 @@ mod linux {
         processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),
         processes_anon_thp_placement => ("anon-thp-placement","process"),
         processes_mmap_32bit => ("mmap-32bit","process"),
+        processes_mmap_low => ("mmap-low","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),

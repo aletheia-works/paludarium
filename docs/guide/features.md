@@ -1753,7 +1753,9 @@ kernel.
   with the placements at a 2 MiB boundary there too, or `ENOMEM`.
   `MAP_FIXED` overrides it, and `mremap` does not keep to it. The mapping
   of an `io_uring` ring does not follow it yet. A hint below
-  `mmap_min_addr` (64 KiB) is taken as that address.
+  `mmap_min_addr` (64 KiB) is taken as that address; a fixed mapping
+  below it, a move there by `mremap` (once its target is unmapped and its
+  source shrunk) and a `shmat` there give `EPERM` without `CAP_SYS_RAWIO`.
 
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even

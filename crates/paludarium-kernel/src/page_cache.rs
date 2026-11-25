@@ -116,28 +116,37 @@ type Open = (Weak<dyn FileHandle>, Device, OnceLock<Key>);
 
 /// Where an open description's file is, as Linux's dentry keeps it, which
 /// inotify reports its events at: the path it was opened at, its symbolic
-/// links resolved once a rename or a removal first looks at it, moved by
+/// links resolved, from the root it was opened from, once a rename or a
+/// removal first looks at it, moved by
 /// each rename of the file or of a directory above it, and unlinked once an
 /// `unlink`, an `rmdir` or a rename onto it took that name away.
 #[derive(Default)]
 pub(crate) struct Place {
     path: Vec<u8>,
-    resolved: bool,
+    /// The file system that resolves the path, until it has.
+    unresolved: Option<Arc<dyn FileSystem>>,
     unlinked: bool,
 }
 impl Place {
+    /// The place of an open of `path` in `fs`.
+    fn new(fs: &Arc<dyn FileSystem>, path: &[u8]) -> Self {
+        Place {
+            path: path.to_vec(),
+            unresolved: Some(Arc::clone(fs)),
+            unlinked: false,
+        }
+    }
     /// Where the file is now, and whether that name was taken away.
     pub(crate) fn at(place: &Mutex<Self>) -> (Vec<u8>, bool) {
         let place = place.lock().unwrap_or_else(PoisonError::into_inner);
         (place.path.clone(), place.unlinked)
     }
-    /// Resolves the symbolic links of the path in `fs`, the first time.
-    fn resolve(&mut self, fs: &dyn HostFs) {
-        if !self.resolved {
-            self.resolved = true;
-            if let Some(path) = crate::files::resolved_in(fs, &self.path) {
-                self.path = path;
-            }
+    /// Resolves the symbolic links of the path, the first time.
+    fn resolve(&mut self) {
+        if let Some(fs) = self.unresolved.take()
+            && let Some(path) = crate::files::resolved_in(&*fs, &self.path)
+        {
+            self.path = path;
         }
     }
 }
@@ -247,14 +256,15 @@ impl Drop for ReadAccess {
 
 impl PageCaches {
     /// The place of an open of file `key` the kernel keeps itself, at
-    /// `path`, which renames and removals move from now on, and which holds
-    /// the file while it lasts.
-    pub(crate) fn keep_place(&self, key: Key, path: &[u8]) -> Arc<Mutex<Place>> {
-        let place = Arc::new(Mutex::new(Place {
-            path: path.to_vec(),
-            resolved: false,
-            unlinked: false,
-        }));
+    /// `path` in `fs`, which renames and removals move from now on, and
+    /// which holds the file while it lasts.
+    pub(crate) fn keep_place(
+        &self,
+        fs: &Arc<dyn FileSystem>,
+        key: Key,
+        path: &[u8],
+    ) -> Arc<Mutex<Place>> {
+        let place = Arc::new(Mutex::new(Place::new(fs, path)));
         let _use = self.notify.fan.using();
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         // Those let go are dropped here too, not only at a rename, once
@@ -303,16 +313,18 @@ impl PageCaches {
                 .get(&key)
                 .is_some_and(|&count| count < 0)
     }
-    /// The places of the open descriptions of the machine's files in `fs`,
-    /// each once (a reopen shares its description's), and each resolved the
-    /// first time a change of names looks at it, before the change.
-    fn places(&self, fs: &Arc<dyn FileSystem>) -> Vec<Arc<Mutex<Place>>> {
+    /// The places of the open descriptions of the machine's files in `whole`,
+    /// through whichever root of it they were opened, each once (a reopen
+    /// shares its description's), and each resolved the first time a change
+    /// of names looks at it, before the change, from the root it was opened
+    /// from.
+    fn places(&self, whole: &Arc<dyn FileSystem>) -> Vec<Arc<Mutex<Place>>> {
         let mut places: Vec<_> = {
             let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
             opens
                 .values()
                 .filter_map(|(_, device, _)| match device {
-                    Device::Mount(mount, _, place, _) if Arc::ptr_eq(mount, fs) => {
+                    Device::Mount(_, _, place, _, of) if Arc::ptr_eq(of, whole) => {
                         Some(Arc::clone(place))
                     }
                     _ => None,
@@ -329,15 +341,23 @@ impl PageCaches {
         places.sort_by_key(|place| Arc::as_ptr(place).addr());
         places.dedup_by(|a, b| Arc::ptr_eq(a, b));
         for place in &places {
-            let mut place = place.lock().unwrap_or_else(PoisonError::into_inner);
-            place.resolve(&**fs);
+            place
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .resolve();
         }
         places
     }
-    /// What a rename from `old` to `new` in `fs` will move, unless it names
-    /// one file twice and so does nothing.
-    fn before_rename(&self, fs: &Arc<dyn FileSystem>, old: &[u8], new: &[u8]) -> Option<Moving> {
-        let mut places = self.places(fs);
+    /// What a rename from `old` to `new` in `fs`, a root of `whole`, will
+    /// move, unless it names one file twice and so does nothing.
+    fn before_rename(
+        &self,
+        fs: &Arc<dyn FileSystem>,
+        whole: &Arc<dyn FileSystem>,
+        old: &[u8],
+        new: &[u8],
+    ) -> Option<Moving> {
+        let mut places = self.places(whole);
         if places.is_empty() {
             return None;
         }
@@ -871,13 +891,15 @@ impl paludarium_mmu::PageSource for FilePages {
 /// Where a file handle's device comes from.
 enum Device {
     /// The mount holding the path it was opened at: the file system, the
-    /// mount's device then, where the file is, and what keeps the mount in
-    /// use while the description lasts (as Linux's `f_path` holds it).
+    /// mount's device then, where the file is, what keeps the mount in
+    /// use while the description lasts (as Linux's `f_path` holds it), and
+    /// the file system whole, whose names a root of it (`chroot`) shares.
     Mount(
         Arc<dyn FileSystem>,
         u64,
         Arc<Mutex<Place>>,
         Option<paludarium_vfs::MountPin>,
+        Arc<dyn FileSystem>,
     ),
     /// A device of its own (a memfd's).
     Fixed(u64),
@@ -892,9 +914,13 @@ impl Device {
     /// reopen), which shares its place.
     fn copy(&self) -> Device {
         match self {
-            Device::Mount(fs, device, place, pin) => {
-                Device::Mount(Arc::clone(fs), *device, Arc::clone(place), pin.clone())
-            }
+            Device::Mount(fs, device, place, pin, whole) => Device::Mount(
+                Arc::clone(fs),
+                *device,
+                Arc::clone(place),
+                pin.clone(),
+                Arc::clone(whole),
+            ),
             Device::Fixed(device) => Device::Fixed(*device),
         }
     }
@@ -1070,7 +1096,7 @@ impl CoherentFile {
             self.write = Some(self.caches.write_access(key)?);
             // `file_get_write_access`: then the mount's (`EROFS` on a
             // read-only one).
-            if let Device::Mount(fs, _, place, _) = &self.device {
+            if let Device::Mount(fs, _, place, ..) = &self.device {
                 let path = place
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1126,7 +1152,7 @@ impl CoherentFile {
             return;
         };
         let (place, device) = match &self.device {
-            Device::Mount(fs, device, place, _) => {
+            Device::Mount(fs, device, place, ..) => {
                 let place = place.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     Some((Arc::clone(fs), place.path.clone(), place.unlinked)),
@@ -1254,16 +1280,16 @@ impl FileHandle for CoherentFile {
     /// its file system, which is another place on a mount.
     fn guest_path_hint(&self) -> Option<Vec<u8>> {
         match &self.device {
-            Device::Mount(_, _, place, _) => Some(Place::at(place).0),
+            Device::Mount(_, _, place, ..) => Some(Place::at(place).0),
             Device::Fixed(_) => self.inner.guest_path_hint(),
         }
     }
     fn dentry_path(&self) -> Option<(Vec<u8>, bool)> {
-        let Device::Mount(fs, _, place, _) = &self.device else {
+        let Device::Mount(_, _, place, ..) = &self.device else {
             return None;
         };
         let mut place = place.lock().unwrap_or_else(PoisonError::into_inner);
-        place.resolve(&**fs);
+        place.resolve();
         Some((place.path.clone(), place.unlinked))
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -1419,21 +1445,30 @@ impl FileHandle for CoherentFile {
 /// passed on unchanged.
 pub(crate) struct CoherentFs {
     inner: Arc<dyn FileSystem>,
+    /// The file system `inner` is a root of (`chroot`), or `inner`: what a
+    /// change of names through either moves.
+    whole: Arc<dyn FileSystem>,
     caches: Arc<PageCaches>,
 }
 
 impl CoherentFs {
     pub(crate) fn new(inner: Arc<dyn FileSystem>, caches: Arc<PageCaches>) -> Self {
-        CoherentFs { inner, caches }
+        let whole = Arc::clone(&inner);
+        CoherentFs {
+            inner,
+            whole,
+            caches,
+        }
     }
 }
 
 impl FileSystem for CoherentFs {
     fn rooted(&self, root: &[u8]) -> Option<Arc<dyn FileSystem>> {
-        Some(Arc::new(CoherentFs::new(
-            self.inner.rooted(root)?,
-            Arc::clone(&self.caches),
-        )))
+        Some(Arc::new(CoherentFs {
+            inner: self.inner.rooted(root)?,
+            whole: Arc::clone(&self.whole),
+            caches: Arc::clone(&self.caches),
+        }))
     }
     fn mounts(&self) -> Vec<MountPoint> {
         self.inner.mounts()
@@ -1556,12 +1591,9 @@ impl HostFs for CoherentFs {
             device: Device::Mount(
                 Arc::clone(&self.inner),
                 self.inner.device(path),
-                Arc::new(Mutex::new(Place {
-                    path: path.to_vec(),
-                    resolved: false,
-                    unlinked: false,
-                })),
+                Arc::new(Mutex::new(Place::new(&self.inner, path))),
                 self.inner.mount_pin(path),
+                Arc::clone(&self.whole),
             ),
             key: OnceLock::new(),
             write: None,
@@ -1617,7 +1649,7 @@ impl HostFs for CoherentFs {
     fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
         let notify = &self.caches.notify;
         let removed = notify.before_removal(&*self.inner, path);
-        let places = self.caches.places(&self.inner);
+        let places = self.caches.places(&self.whole);
         let entry = (!places.is_empty())
             .then(|| entry_path(&*self.inner, path))
             .flatten();
@@ -1652,7 +1684,9 @@ impl HostFs for CoherentFs {
     fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
         let notify = &self.caches.notify;
         let moved = notify.before_rename(&*self.inner, old, new);
-        let places = self.caches.before_rename(&self.inner, old, new);
+        let places = self
+            .caches
+            .before_rename(&self.inner, &self.whole, old, new);
         self.inner.rename(old, new)?;
         if let Some(places) = places {
             PageCaches::renamed(&places, false);
@@ -1665,7 +1699,9 @@ impl HostFs for CoherentFs {
     fn rename_with(&self, old: &[u8], new: &[u8], flags: u32) -> Result<(), Errno> {
         let notify = &self.caches.notify;
         let moved = notify.before_rename(&*self.inner, old, new);
-        let places = self.caches.before_rename(&self.inner, old, new);
+        let places = self
+            .caches
+            .before_rename(&self.inner, &self.whole, old, new);
         self.inner.rename_with(old, new, flags)?;
         if let Some(places) = places {
             PageCaches::renamed(&places, flags & crate::inotify::EXCHANGE != 0);

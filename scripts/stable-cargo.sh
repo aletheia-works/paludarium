@@ -2,10 +2,12 @@
 # Runs the cargo of the stable Rust that rust-version in Cargo.toml names,
 # with its arguments: the toolchain of CI's "clippy (stable Rust of
 # rust-version)" job. mise sets RUSTUP_TOOLCHAIN to the pinned nightly, and
-# its cargo wrapper sets it back for any cargo it runs, so this resolves
-# that release's own cargo from rustup and runs it with RUSTUP_TOOLCHAIN set
-# to the release. The release, with clippy and the targets in
-# STABLE_TARGETS (space-separated), is installed when it is missing.
+# its cargo wrapper sets it back for any cargo it runs, so this names the
+# release: `cargo +<release>`, which a wrapper that caches (mbx) keeps to, or,
+# where the cargo on PATH does not take it, that release's own cargo from
+# rustup, run with RUSTUP_TOOLCHAIN set to the release. The release, with
+# clippy and the targets in STABLE_TARGETS (space-separated), is installed
+# when it is missing.
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$root/Cargo.toml")
@@ -23,6 +25,12 @@ for target in ${STABLE_TARGETS:-}; do
     rustup target add --toolchain "$version" "$target"
   fi
 done
+case $(cargo "+$version" --version 2>/dev/null) in
+  "cargo $version "*)
+    unset RUSTC
+    exec cargo "+$version" "$@"
+    ;;
+esac
 bin=$(dirname "$cargo")
 export RUSTUP_TOOLCHAIN="$version" PATH="$bin:$PATH" RUSTC="$bin/rustc"
 exec "$cargo" "$@"

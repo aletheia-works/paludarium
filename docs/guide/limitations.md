@@ -42,18 +42,12 @@ verified.
   makes no access, and a real CPU may fault (an AMD EPYC does, and exits with
   `SIGSEGV`). A fault on a later byte also leaves the earlier ones written, which
   has not been compared with a real CPU.
-- **`/proc/self/maps`, in part**: the emulator has no `vsyscall` page, so the
-  `[vsyscall]` line is not there. The stack's
-  VMA has its full size from the start, where Linux's grows as it is used.
-  A rename that a process under `chroot` makes does not move the names
-  of the files it moves in the maps, a core's `NT_FILE` note and
-  `/proc/<pid>/exe`, where Linux's `d_move` moves them whatever the root.
-  Maps can show fewer VMAs than Linux after a merge: Linux merges
-  two VMAs only where their `anon_vma`s are compatible
-  (`is_mergeable_anon_vma`), and the emulator does not model `anon_vma`
-  identity, so it merges neighbours that Linux keeps apart, such as after
-  `munlock` of a page `mlock` populated next to a piece written while it was
-  part of another VMA.
+- **`/proc/self/maps`, in part**: the stack's VMA has its full size from the
+  start, where Linux's grows as it is used.
+  A rename does not move the names of files that were opened in another
+  mount namespace, or by a process that entered this one apart (`unshare`
+  and `setns` each begin anew), in the maps, a core's `NT_FILE` note and
+  `/proc/<pid>/exe`, where Linux's `d_move` moves them in each.
 - **The vDSO, in part**: its functions make their system calls, as Linux's
   vDSO does only when no clock can be read from user space, so a seccomp
   filter, a ptrace tracer's syscall stops and syscall counts see a call
@@ -131,7 +125,7 @@ verified.
   with no network has files of no device.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/cpuinfo`, `/proc/net` and a process's `net`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
@@ -221,8 +215,8 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Multicast datagrams reach no one, nor do broadcast ones but through a
-    veth end (below). A datagram is always
+    IPv6 multicast datagrams reach no one, nor do broadcast ones but through
+    a veth end (below). A datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
     `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer
@@ -556,15 +550,19 @@ verified.
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
+  `IORING_REGISTER_BUFFERS2`, `IORING_REGISTER_BUFFERS_UPDATE`,
   `IORING_REGISTER_FILES`, `IORING_UNREGISTER_FILES`,
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
   `IORING_REGISTER_PBUF_STATUS`, `IORING_REGISTER_SYNC_CANCEL`,
   `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS` (the others
-  give `EINVAL`). So no personality can be registered, buffers cannot be
-  updated, and buffers cannot be registered with
-  `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
+  give `EINVAL`). So no personality can be registered.
+  `IORING_REGISTER_BUFFERS_UPDATE` reads each slot's `iovec`
+  before its tag and refuses `IORING_RSRC_UPDATE_EXTENDED`, as Linux 7.0,
+  the kernel the differential tests run on, does; Linux master reads the
+  tag first and takes that flag's `struct io_uring_regbuf_desc`s. This
+  follows master once the test runners' kernel does. A process's
   whole exit cancels the requests its threads submitted that wait for
   their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
   the kernel the differential tests run on, cancels them only once their
@@ -801,12 +799,9 @@ verified.
     would run it in that segment or fault.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache.
-  - Adjacent private VMAs merge once their flags agree again (after
-    `munlock`, for one), whatever their `anon_vma`s. Linux merges them only
-    when they share one or one of them has none. A VMA gets its `anon_vma` on its first write, and
-    takes a neighbour's only if their flags agreed then
-    (`anon_vma_compatible`), so pieces written while apart may stay
-    separate VMAs in `/proc/<pid>/maps`.
+  - Adjacent VMAs never written that a `fork`ed child's lost locks or
+    `userfaultfd` registrations make alike are one VMA in
+    `/proc/<pid>/maps`, where Linux merges none at a `fork`.
   - `mmap` with
     `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
     `RLIMIT_MEMLOCK` (`EAGAIN`) before it finds room for the mapping
@@ -1129,8 +1124,15 @@ verified.
   Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
   solicitation nor MLD report. Traffic through
   an end moves no counters; a namespace forwards nothing
-  on to another; and a multicast destination through an end reaches no
-  one, as no socket joins a group (`IP_ADD_MEMBERSHIP`, `IPV6_ADD_MEMBERSHIP`). ICMP's port unreachable is not rate limited
+  on to another; and an IPv6 multicast destination through an end reaches
+  no one, as no socket joins such a group (`IPV6_ADD_MEMBERSHIP`). An IPv4
+  group is one of the guest's namespaces alone: the first has no device to
+  the host's network, so no route to one, and joining one there without
+  naming a device is `ENODEV`.
+  No IGMP or MLD packet is sent: nothing in the guest would see one, as
+  raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
+  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) are
+  `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,
@@ -1231,10 +1233,7 @@ verified.
   `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
-  lookup while `lo` is down is `ENETUNREACH` too. A route lookup's answer
-  for a multicast address is local (`RTCF_LOCAL`) only for 224.0.0.1, the
-  group `lo` is a member of while up, as no socket here joins a group,
-  where Linux's is local for each group a socket joined on `lo` too. A
+  lookup while `lo` is down is `ENETUNREACH` too. A
   lookup's `rta_cacheinfo` counts one reference, where Linux counts the
   other users of the cached route too.
   `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the

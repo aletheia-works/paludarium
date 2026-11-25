@@ -3652,6 +3652,14 @@ mod core_dumps {
             .expect("the data mapping");
         assert_eq!(size, PAGE_SIZE as usize);
         assert_eq!(u64_at(&core, offset + 256), MAGIC);
+        // The gate area comes last, whole, of zeros.
+        let &(kind, offset, address, size) = segments.last().unwrap();
+        assert_eq!(
+            (kind, address, size),
+            (1, 0xffff_ffff_ff60_0000, PAGE_SIZE as usize)
+        );
+        assert_eq!(core.len(), offset + size);
+        assert!(core[offset..].iter().all(|&b| b == 0));
     }
     /// The child takes other IDs, stays dumpable and ends by SIGSEGV.
     fn end_as_user(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> u32 {

@@ -5,6 +5,10 @@
 //! budget of instructions, the kernel handles each stop, and between budget
 //! slices the loop checks whether [`Session::kill`] was requested.
 #![forbid(unsafe_code)]
+// Proving that `Kernel` is `Send` walks every type it holds, its child
+// `Kernel`s' among them, and io_uring's registered buffers (their pinned
+// pages) take it past the default depth of 128.
+#![recursion_limit = "256"]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

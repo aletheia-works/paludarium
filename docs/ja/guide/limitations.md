@@ -37,18 +37,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   アクセスしませんが、実際の CPU はフォールトすることがあります（AMD EPYC ではフォールト
   し、`SIGSEGV` で終わります）。後ろのバイトでフォールトすると前のバイトは書かれたまま
   ですが、これは実際の CPU と比べていません。
-- **`/proc/self/maps` の一部**：エミュレーターには `vsyscall` のページがないので、
-  `[vsyscall]` の行はありません。スタックの VMA は
+- **`/proc/self/maps` の一部**：スタックの VMA は
   初めから全体の大きさで、Linux のように使うにつれて伸びません。
-  `chroot` したプロセスがファイルの名前を変えても、マップ、コアの `NT_FILE` ノート、
-  `/proc/<pid>/exe` のそのファイルの名前は動きません。Linux の `d_move` はルートに
-  関係なく動かします。
-  マージの後、マップは Linux より少ない VMA を示すことが
-  あります。Linux は `anon_vma` が合う VMA どうしだけをまとめますが
-  （`is_mergeable_anon_vma`）、エミュレーターは `anon_vma` の区別を再現しないので、
-  別の VMA の一部だったときに書き込まれたかけらの隣で、`mlock` が中身を入れたページを
-  `munlock` した後のように、
-  Linux が分けておく隣どうしもまとめます。
+  ファイルの名前を変えても、別のマウント名前空間で開かれたものと、この名前空間に別に入った
+  （`unshare` と `setns` はそのつど分かれます）プロセスが開いたものの名前は、マップ、コアの
+  `NT_FILE` ノート、`/proc/<pid>/exe` では動きません。Linux の `d_move` はどれも動かします。
 - **vDSO の一部**：その関数はシステムコールを呼びます。Linux の vDSO がそうするのは、
   ユーザー空間から読める時計がないときだけです。そのため、Linux の速い経路ならシステム
   コールを呼ばないところでも、seccomp のフィルター、ptrace のトレーサーのシステムコール
@@ -119,7 +112,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `tcp`、`udp`、`unix`、`igmp`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、
   `dev` のものは 0 です。ネットワークのないセッションのファイルには、デバイスがありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
-  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
+  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、`/proc/net` とプロセスの `net`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
   `vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前
@@ -193,7 +186,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ソケットは、すべてのアドレスでポートを持ったままで、Linux は経路の送り元のアドレスで取ります。そのため `getsockname` は
     未指定のアドレスを返し、そのポートをループバックのアドレスで `bind` すると
     `EADDRINUSE` になります（Linux では `bind` できます）。
-    マルチキャストのデータグラムはどこにも届かず、ブロードキャストのものも veth の端を
+    IPv6 のマルチキャストのデータグラムはどこにも届かず、ブロードキャストのものも veth の端を
     通るもの（後述）のほかは届きません。データグラムには
     いつも届いた時刻を付けます。Linux がそうするのは、マシンのどこかのソケットが
     タイムスタンプを取っている間だけで、どれも取っていなければ、`SO_TIMESTAMP` などで
@@ -470,15 +463,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
-  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_FILES`、
+  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
+  `IORING_REGISTER_BUFFERS_UPDATE`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
   `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、
   `IORING_REGISTER_SYNC_CANCEL`、`IORING_REGISTER_RING_FDS`、
   `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。そのため、
-  パーソナリティは登録できず、バッファーは更新できません。タグを付ける
-  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。プロセス全体が
+  パーソナリティは登録できません。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
+  カーネルである Linux 7.0 と同じく、スロットごとに `iovec` をタグより先に読み、
+  `IORING_RSRC_UPDATE_EXTENDED` を断ります。Linux master はタグを先に読み、そのフラグの
+  `struct io_uring_regbuf_desc` を受け付けます。テストを走らせるカーネルが追いつけば master に
+  合わせます。プロセス全体が
   終わると、そのスレッドが投入してファイルを待っている要求は、Linux master の
   `io_task_group_exiting` と同じく取り消されます。差分テストを走らせるカーネルである
   Linux 7.0 は、ひとりで終わるスレッドのときと同じく、ファイルの準備ができてから取り消します。
@@ -673,11 +670,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     セグメントで動くか、フォールトします。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。
-  - 隣り合うプライベートの VMA は、（`munlock` のあとなど）フラグがまたそろえば、
-    `anon_vma` によらずつながります。Linux は同じ `anon_vma` を持つか、片方が持たないときだけつなげます。
-    VMA は最初の書き込みで `anon_vma` を得て、そのとき隣とフラグがそろっていたときだけ
-    隣のものを使う（`anon_vma_compatible`）ので、離れている間に書き込んだかけらは、
-    `/proc/<pid>/maps` で別の VMA のまま残ることがあります。
+  - `fork` した子がロックや `userfaultfd` の登録を失って同じになった、書き込まれたことのない
+    隣り合う VMA は、`/proc/<pid>/maps` で 1 つの VMA になります。Linux は `fork` では
+    まとめません。
   - `MAP_LOCKED` の
     `mmap` は、マッピングの場所を探し（`ENOMEM`）ファイルを確かめる前に、`can_do_mlock`
     （`EPERM`）と `RLIMIT_MEMLOCK` の空き（`EAGAIN`）を確かめます。Linux はそれらを先にします。`mremap` は、
@@ -955,8 +950,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ランダムな遅れの後、1 から 2 秒で終わります。リンクローカルのアドレスはいつも
   Ethernet のアドレスから作り（EUI-64、`addr_gen_mode` 0）、IPv6 はルーター要請も
   MLD の報告も送りません。端を通る通信は
-  カウンタを動かしません。名前空間は別の名前空間へ転送せず、ソケットがグループに
-  加わらないので（`IP_ADD_MEMBERSHIP`、`IPV6_ADD_MEMBERSHIP`）、端を通るマルチキャストの宛先には何も届きません。ICMP の port unreachable の頻度を
+  カウンタを動かしません。名前空間は別の名前空間へ転送せず、ソケットが IPv6 のグループに
+  加わらないので（`IPV6_ADD_MEMBERSHIP`）、端を通る IPv6 のマルチキャストの宛先には何も
+  届きません。IPv4 のグループはゲストの名前空間の中だけのものです。最初の名前空間には
+  ホストのネットワークへのデバイスがなく、グループへの経路もないので、デバイスを指さずに
+  入ろうとすると `ENODEV` です。IGMP と MLD のパケットは送りません。raw ソケットは `EPERM` で、パケット
+  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。送り元のフィルター
+  （`IP_ADD_SOURCE_MEMBERSHIP`、`IP_MSFILTER`、`MCAST_*`）は `ENOPROTOOPT` です。ICMP の port unreachable の頻度を
   抑えないので（`icmpv4_xrlim_allow`、`icmpv6_xrlim_allow`）、相手の閉じたポートへのデータグラムのたびに、
   接続したソケットの次の送信は `ECONNREFUSED` になります。組を通る接続は、端が
   落ちても、消えても、移っても、使っていたアドレスや経路が消えても続きます。Linux では
@@ -1040,10 +1040,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   端のもの）への接続とデータグラムは `ENETUNREACH` です。Linux では送り出されて捨てられます。`lo` のアドレスでない、
   接頭辞の中の IPv6 のアドレスへのものも `ENETUNREACH` です。Linux では接頭辞の経路が
   そこへ送って捨てます。`lo` が落ちている間の IPv6 の経路の引き当ても
-  `ENETUNREACH` です。マルチキャストアドレスの経路の引き当ての答えがローカル
-  （`RTCF_LOCAL`）になるのは、`lo` が上がっている間に入っているグループ 224.0.0.1 だけです。
-  ここではソケットがグループに入らないためです。Linux では、ソケットが `lo` で入った
-  グループでもローカルになります。引き当ての
+  `ENETUNREACH` です。引き当ての
   `rta_cacheinfo` は参照を 1 つと数えます。Linux はキャッシュされた経路を使うほかのものも
   数えます。`RTM_F_NOTIFY` は、その引き当ての答えにだけ印を付けます。Linux はキャッシュ
   された経路に印を付けるので、その経路を通るあとの引き当てにも印が付きます。通知はリンクとその IPv6 の情報、アドレス、経路、近隣、

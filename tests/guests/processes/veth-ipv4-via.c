@@ -586,6 +586,11 @@ int main(int argc, char **argv) {
     add(ctl, "fe80::ff:fe00:d", VC, "through one of vc, down");
     add(ctl, "fe80::ff:fe00:d", 77, "through one of no device");
     add(ctl, "10.0.0.9", VC, "through an IPv4 via of another device");
+    /* An IPv4 via of 0.0.0.0 is a gateway still (`fib_gw_from_via`
+       sets its family), where RTA_GATEWAY's is none. */
+    add(ctl, "0.0.0.0", VA, "through an IPv4 via of 0.0.0.0");
+    add(ctl, "0.0.0.0", 0, "through an IPv4 via of 0.0.0.0, of no device");
+    route(ctl, RTM_NEWROUTE, "0.0.0.0", VA, 1, 0, 4, "on link, through an IPv4 via of 0.0.0.0");
     route(ctl, RTM_NEWROUTE, "2001:db8:9::1", VC, 1, 0, 4, "on link, on vc");
     route(ctl, RTM_NEWROUTE, "2001:db8:9::1", 0, 1, 0, 4, "on link, of no device");
     route(ctl, RTM_NEWROUTE, "2001:db8::2", 0, 1, 254, 0, "of host scope");
@@ -635,8 +640,10 @@ int main(int argc, char **argv) {
     const struct hop twice[] = {{"2001:db8::2", "10.0.0.2", 0}, {NULL, "10.0.0.2", VA}};
     const struct hop wrong[] = {{NULL, "10.0.0.2", 0}, {NULL, "10.0.0.2", 0}};
     const struct hop other[] = {{"2001:db8::3", NULL, 0}, {NULL, "10.0.0.2", 0}};
+    const struct hop zero[] = {{"0.0.0.0", NULL, VA}};
     const struct hop any_hop[] = {{"2001:db8::2", NULL, 0}, {NULL, NULL, 0}};
     multipath(ctl, RTM_NEWROUTE, twice, 2, "a hop with a gateway and a via");
+    multipath(ctl, RTM_NEWROUTE, zero, 1, "a hop through an IPv4 via of 0.0.0.0");
     multipath(ctl, RTM_NEWROUTE, other, 1, "one hop through 2001:db8::3");
     dump(RTM_GETROUTE, "routes");
     multipath(ctl, RTM_DELROUTE, both, 1, "remove one through 2001:db8::2");

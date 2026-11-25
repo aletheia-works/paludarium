@@ -3142,7 +3142,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MADV_DONTNEED` は `EINVAL` で、`[vvar]` のページ 1 と 3、および `[vvar_vclock]` の
   ページはバスエラー（`BUS_ADRERR`）、`[vvar]` のページ 0 と 2 は 0 として読めます。
   `[vdso]` は書き込めるようにでき（そのときは写しになり、`/proc/<pid>/mem` で書いたときも
-  同じです）、`mremap` で動かせますが、大きくはできません（`EFAULT`）。`statm` と `VmSize` はこの三つを数え、`fork` しても
+  同じです）、`mremap` で動かせますが、大きくはできません（`EFAULT`）。三つとも分割は
+  できず、一部への `munmap`、`mprotect`、`mremap`、`mseal` などで分割になるものは
+  `EINVAL` です。`statm` と `VmSize` はこの三つを数え、`fork` しても
   同じ場所に残り、Linux の `always_dump_vma` が特別なマッピングをそうするように、
   コアには全体が入ります。
 

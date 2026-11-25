@@ -473,6 +473,10 @@ impl PageSource for VdsoPages {
     fn fixed(&self) -> bool {
         true
     }
+    /// Linux's `special_mapping_split`.
+    fn splits(&self) -> bool {
+        false
+    }
     fn vma_flags(&self, flags: u64) -> u64 {
         (flags & !vm::ACCOUNT) | vm::DONTEXPAND
     }
@@ -508,6 +512,10 @@ impl PageSource for VvarPages {
     }
     fn fixed(&self) -> bool {
         true
+    }
+    /// Linux's `special_mapping_split`.
+    fn splits(&self) -> bool {
+        false
     }
     fn admit(&self, offset: u64, _: paludarium_mmu::HugeFit) -> bool {
         self.readable.contains(&(offset / PAGE as u64))

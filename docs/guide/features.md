@@ -3642,7 +3642,8 @@ kernel.
   `[vvar_vclock]`'s are a bus error (`BUS_ADRERR`), and its pages 0 and 2
   read as zeros. `[vdso]` may be made writable, which copies it (so does a
   write through `/proc/<pid>/mem`), and moved by `mremap`, but not grown
-  (`EFAULT`). `statm` and `VmSize` count the
+  (`EFAULT`). None of the three is split: an `munmap`, `mprotect`, `mremap`,
+  `mseal` or the like of a part of one that would split it is `EINVAL`. `statm` and `VmSize` count the
   three, a `fork` keeps them where they are, and a core holds them whole,
   as Linux's `always_dump_vma` dumps a special mapping.
 

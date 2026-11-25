@@ -17712,7 +17712,8 @@ static int thread_caps_status_case(void) {
    does here, and gets what the system calls give. [vvar]'s pages 1 and 3
    (and [vvar_vclock]'s page 1) are a bus error, nothing in [vvar] may be
    made writable or reached from outside the process (VM_IO | VM_PFNMAP),
-   and the vDSO may be moved but not grown. Linux 7.2 makes [vvar]
+   and the vDSO may be moved but not grown, nor any of them split
+   (special_mapping_split). Linux 7.2 makes [vvar]
    VM_MIXEDMAP (vdso_install_vvar_mapping, c27e727c9a60) and maps zeros for
    its pages 1 and 3 (43648f9f3a67): this is the test machines' 7.0's. statm counts the three areas,
    and a fork keeps them where they are. The bytes of [vvar], Linux's time
@@ -17869,6 +17870,46 @@ static void vdm_in_child(const char *what, int op) {
         } else if (op == 11) {
             r = mprotect((void *)vvar.start, vvar_size, PROT_NONE);
             if (!r) r = mlock((void *)vvar.start, vvar_size);
+        } else if (op == 12) {
+            r = munmap((void *)vdso.start, 4096);
+        } else if (op == 13) {
+            /* From the page before [vdso]. */
+            r = munmap((void *)(vdso.start - 4096), 8192);
+        } else if (op == 14) {
+            r = mprotect((void *)vdso.start, 4096, PROT_READ);
+        } else if (op == 15) {
+            r = mprotect((void *)vdso.start, 4096, PROT_READ | PROT_EXEC);
+        } else if (op == 16) {
+            r = mremap((void *)vdso.start, vdso_size, 4096, 0) == MAP_FAILED ? -1 : 0;
+        } else if (op == 17) {
+            char *to = mmap(NULL, 8192, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            r = mremap((void *)vvar.start, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, to) == MAP_FAILED ? -1 : 0;
+        } else if (op == 18) {
+            r = mmap((void *)(vdso.start + 4096), 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) ==
+                        MAP_FAILED ? -1 : 0;
+        } else if (op == 19) {
+            r = syscall(462 /* mseal */, vdso.start, 4096, 0);
+        } else if (op == 20) {
+            r = madvise((void *)vdso.start, 4096, MADV_DONTDUMP);
+        } else if (op == 21) {
+            r = madvise((void *)vvar.start, 4096, MADV_DONTDUMP);
+        } else if (op == 22) {
+            r = madvise((void *)vdso.start, 4096, MADV_DONTNEED);
+        } else if (op == 23) {
+            r = mlock((void *)vdso.start, 4096);
+        } else if (op == 24) {
+            r = prctl(0x53564d41 /* PR_SET_VMA */, 0, vdso.start, 4096, "name");
+        } else if (op == 25) {
+            r = prctl(0x53564d41, 0, vdso.start, vdso_size, "name");
+            vdm_scan();
+            printf("  named still=%d\n", vdm_areas[2].start == vdso.start);
+        }
+        if (op >= 12 && r) {
+            int wrong = errno;
+            vdm_scan();
+            printf("  whole still=%d\n", vdm_areas[0].start == vvar.start && vdm_areas[2].start == vdso.start &&
+                                                 vdm_areas[2].end == vdso.end);
+            errno = wrong;
         }
         printf("%s r=%ld errno=%d\n", what, r, r < 0 ? errno : 0);
         fflush(stdout);
@@ -17949,8 +17990,12 @@ static int vdso_mappings_case(void) {
     const char *const ops[] = {"mprotect [vdso] rwx", "mprotect [vvar] rw", "munmap [vdso]", "munmap [vvar]",
                                "mremap [vdso] same size", "mremap [vdso] grow", "mremap [vvar] same size",
                                "madvise DONTNEED [vvar]", "madvise DONTNEED [vdso]", "mlock [vvar]", "mlock [vdso]",
-                               "mlock [vvar] PROT_NONE"};
-    for (int op = 0; op < 12; op++) vdm_in_child(ops[op], op);
+                               "mlock [vvar] PROT_NONE", "munmap [vdso] part", "munmap across [vdso]'s start",
+                               "mprotect [vdso] part", "mprotect [vdso] part, same", "mremap [vdso] shrink",
+                               "mremap [vvar] part", "mmap over [vdso] part", "mseal [vdso] part",
+                               "madvise DONTDUMP [vdso] part", "madvise DONTDUMP [vvar] part",
+                               "madvise DONTNEED [vdso] part", "mlock [vdso] part", "name [vdso] part", "name [vdso]"};
+    for (int op = 0; op < 26; op++) vdm_in_child(ops[op], op);
     /* From outside: no get_user_pages of [vvar] (VM_IO | VM_PFNMAP, and
        special_mapping_vmops has no access), which /proc/<pid>/mem says as
        EIO; a forced write to [vdso] (VM_MAYWRITE) copies its page. */

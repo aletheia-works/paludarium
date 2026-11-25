@@ -1085,11 +1085,10 @@ verified.
   routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
   and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
   gateway's neighbour state does not steer a lookup, as Linux's
-  `rt6_check_neigh` does among routes of one metric. A UDP connect to a
-  group of the node or the
-  link without a scope ID or a device is `EINVAL`, as Linux's is with no
-  multicast interface, which none is here. A connection accepted from a
-  link-local address has no device, so its names have no scope ID. A UDP
+  `rt6_check_neigh` does among routes of one metric. Of an IPv6 multipath
+  route's hops through the device asked for, the flow's hash picks one, as
+  Linux 7.0 does; Linux master takes the hop the lookup found
+  (`have_oif_match` in `ip6_pol_route`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID

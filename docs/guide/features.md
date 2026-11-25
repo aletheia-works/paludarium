@@ -6134,7 +6134,10 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     through it; a group of 224.0.0.0/24 or the limited broadcast address
     straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`
     once it has gone, `ENETUNREACH` while it is down. A connection
-    accepted is bound as its listener. Of an IPv6 socket,
+    accepted is bound as its listener, or, where that has no device, one
+    from a link-local address to the device it came in on
+    (`tcp_v6_init_req`), which is also the `IPV6_MULTICAST_IF` of any one
+    accepted on an IPv6 socket (`tcp_v6_syn_recv_sock`). Of an IPv6 socket,
     `IPV6_MULTICAST_IF` (not of TCP, `ENOPROTOOPT`) and `IPV6_UNICAST_IF`
     (in network byte order) take the index of a device (`ENODEV` and
     `EADDRNOTAVAIL` for one there is not), 0 for none, and `IPV6_PKTINFO`
@@ -6144,8 +6147,9 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     without a scope ID, and a UDP `connect`, go through the socket's own
     device, else `IPV6_PKTINFO`'s, else `IPV6_MULTICAST_IF`'s to a group
     and `IPV6_UNICAST_IF`'s to another address (`udpv6_sendmsg`,
-    `ip6_datagram_flow_key_init`): strictly where the socket is bound to no
-    address, or the destination is a group, a link-local address or `::1`;
+    `ip6_datagram_flow_key_init`): strictly where the socket has a device or
+    is bound to no address, or the destination is a group, a link-local
+    address or `::1`;
     else through it rather than another, among the routes of one prefix
     and metric (`rt6_score_route`). Connecting a socket of no device to a
     group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks

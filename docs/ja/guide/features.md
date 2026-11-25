@@ -5285,7 +5285,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     リンク上にあるものとしてそこから出ます。224.0.0.0/24 のグループと limited broadcast の
     アドレスは、そのままそこから出ます（`ip_route_output_key_hash_rcu`）。デバイスが
     なくなれば `ENODEV`、落ちている間は `ENETUNREACH` です。受け付けた接続は、
-    リスナーと同じデバイスに結び付きます。IPv6 のソケットの `IPV6_MULTICAST_IF`（TCP では
+    リスナーと同じデバイスに結び付きます。リスナーにデバイスがなければ、リンクローカルの
+    アドレスからの接続は、入ってきたデバイスに結び付きます（`tcp_v6_init_req`）。IPv6 の
+    ソケットで受け付けた接続の `IPV6_MULTICAST_IF` は、どれも入ってきたデバイスです
+    （`tcp_v6_syn_recv_sock`）。IPv6 のソケットの `IPV6_MULTICAST_IF`（TCP では
     `ENOPROTOOPT`）と `IPV6_UNICAST_IF`（ネットワークバイトオーダー）は、デバイスの
     インデックスを取り（ないデバイスは `ENODEV` と `EADDRNOTAVAIL`）、0 ならなしです。
     `IPV6_PKTINFO`（設定のみ。UDP の送信と同じく、アドレスは使いません）はどのインデックスも
@@ -5294,7 +5297,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスへの UDP のデータグラムと UDP の `connect` は、ソケット自身のデバイス、なければ
     `IPV6_PKTINFO` のもの、なければグループへは `IPV6_MULTICAST_IF` のもの、ほかのアドレスへは
     `IPV6_UNICAST_IF` のものを通ります（`udpv6_sendmsg`、`ip6_datagram_flow_key_init`）。
-    ソケットがアドレスに結び付いていないとき、宛先がグループ、リンクローカル、`::1` の
+    ソケットがデバイスを持つとき、アドレスに結び付いていないとき、宛先がグループ、リンクローカル、`::1` の
     ときは厳密に通り、ほかは、プレフィックスとメトリックが同じ経路の中でそれを優先する
     だけです（`rt6_score_route`）。デバイスのないソケットをリンクのグループに `connect`
     すると、`IPV6_MULTICAST_IF` のものがソケットのデバイスになります。送るたびに経路を

@@ -3548,7 +3548,7 @@ impl InetSocket {
             listen.drops += 1;
             return Knock::Full;
         }
-        let child = listener.child((theirs, locked, filtering), stream, link, from, to);
+        let child = listener.child((theirs, locked, filtering), stream, link, (from, to, dif));
         listen.ready.push_back(child);
         listen.arrivals += 1;
         drop(state);
@@ -3562,18 +3562,28 @@ impl InetSocket {
         self.hub.changed();
     }
     /// The accepted side of a connection from `stream` at `from` to this
-    /// listener at `to`, joined to it through `link`. It takes this
-    /// socket's options and whether the guest bound its port (`locked`), as
-    /// Linux's `sk_clone_lock` copies them with `sk_userlocks`, and holds
-    /// the listener's port on `to`.
+    /// listener at `to`, which came in on the device `dif`, joined to it
+    /// through `link`. It takes this socket's options and whether the guest
+    /// bound its port (`locked`), as Linux's `sk_clone_lock` copies them
+    /// with `sk_userlocks`, and holds the listener's port on `to`. From a
+    /// link-local address, `dif` is its device where the listener has none
+    /// (`tcp_v6_init_req`); an IPv6 one's `IPV6_MULTICAST_IF` is `dif`, not
+    /// the listener's (`tcp_v6_syn_recv_sock`, `tcp_v6_mapped_child_init`).
     fn child(
         &self,
-        (options, locked, filtering): (Options, bool, crate::sockets::FilterSlot),
+        (mut options, locked, filtering): (Options, bool, crate::sockets::FilterSlot),
         stream: &Arc<Stream>,
         (link, notify): (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
-        from: SocketAddr,
-        to: SocketAddr,
+        (from, to, dif): (SocketAddr, SocketAddr, u32),
     ) -> Arc<InetSocket> {
+        if self.family == Family::V6 {
+            options.multicast_device = dif;
+            if options.device == 0
+                && matches!(from.ip(), IpAddr::V6(ip) if ip.is_unicast_link_local())
+            {
+                options.device = dif;
+            }
+        }
         let child = InetSocket::new(self.family, false, &self.network, &self.host, &self.hub, 0);
         *child.options() = options;
         // `sk_clone_lock` copies the listener's `sk_uid`.
@@ -3827,8 +3837,7 @@ impl InetSocket {
                 (theirs, locked, filtering),
                 &stream,
                 (&link, &notify),
-                from,
-                to,
+                (from, to, dif),
             );
             listen.ready.push_back(child);
             listen.arrivals += 1;
@@ -4916,6 +4925,7 @@ fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> 
             Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         });
+        let peer = scoped(peer, child.options().device);
         if let Err(e) = write_address(c, &encode_address(socket.family, peer), a[1], a[2]) {
             c.files.unreserve(fd);
             return Err(e);

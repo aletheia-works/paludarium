@@ -137,7 +137,8 @@ out:
 - `pshufd`, `pshuflw`, `pshufhw`, the `punpckl` and `punpckh` unpacks,
   `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`,
   `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` and `pcmpeqd` of xmm
-  registers, `pslld` and `psrld` of one by an immediate, and `pmovmskb`;
+  registers, `pxor` and `pcmpeqb` of one and 16 bytes of memory, `pslld` and
+  `psrld` of one by an immediate, and `pmovmskb`;
 - the string moves `movsb`, `movsw`, `movsd` and `movsq`, and the string
   stores `stosb`, `stosw`, `stosd` and `stosq`, with `rep` or without, of 64-bit
   addresses;

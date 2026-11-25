@@ -7,6 +7,10 @@
 //! exceptions end the process with the matching signal; the core emulator
 //! records signal registrations but never delivers signals.
 #![forbid(unsafe_code)]
+// Proving that `Kernel` is `Send` walks every type it holds, its child
+// `Kernel`s' among them, and io_uring's registered buffers (their pinned
+// pages) take it past the default depth of 128.
+#![recursion_limit = "256"]
 
 mod admin;
 mod arguments;
@@ -112,6 +116,7 @@ mod timers;
 mod unix;
 mod userfaultfd;
 mod users;
+mod vsyscall;
 pub use processes::Processes;
 pub use threads::ThreadGroup;
 
@@ -198,9 +203,9 @@ impl Default for AltStack {
 }
 
 /// A guest thread's CPU time: the host thread's CPU time (or, where the host
-/// cannot measure it, wall time) since the guest thread's start, published for the thread group's total, with what else it has used
-/// ([`Usage`]). A clone starts again from zero, as a new Linux thread or
-/// process does.
+/// cannot measure it, wall time) since the guest thread's start, published
+/// for the thread group's total, with what else it has used ([`Usage`]). A
+/// clone starts again from zero, as a new Linux thread or process does.
 #[derive(Debug, Default)]
 pub(crate) struct CpuAccount {
     base: Option<u64>,
@@ -257,6 +262,11 @@ pub(crate) struct Usage {
     /// Its faults, switches and migrations on each CPU, for the `perf`
     /// events of one CPU ([`CpuCounts`]).
     pub(crate) per_cpu_counts: std::sync::Mutex<CpuCounts>,
+    /// The latest faults of its own code and of the kernel's accesses for
+    /// it, by their numbers in the counts and their addresses, once some
+    /// `perf` event asks for them.
+    fault_addresses:
+        std::sync::Mutex<[std::collections::VecDeque<(u64, paludarium_mmu::faults::At)>; 2]>,
     /// It runs on a virtual CPU of `rseq`, which no CPU mask moves.
     pub(crate) virtual_cpu: std::sync::atomic::AtomicBool,
 }
@@ -504,6 +514,31 @@ impl Usage {
         let on = time.ran.get(cpu as usize).copied().unwrap_or(0);
         (self.cpu_time(), on)
     }
+    /// The addresses of the latest `n` of its first `counted` faults of its
+    /// own code or of the `kernel`'s accesses for it, 0 for one that is not
+    /// known.
+    pub(crate) fn fault_addresses(
+        &self,
+        kernel: bool,
+        counted: u64,
+        n: u64,
+    ) -> Vec<paludarium_mmu::faults::At> {
+        let addresses = self
+            .fault_addresses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latest = &addresses[usize::from(kernel)];
+        // Those before are gone.
+        let known = n.min(FAULT_ADDRESSES as u64);
+        let mut out =
+            vec![paludarium_mmu::faults::At::default(); usize::try_from(n - known).unwrap_or(0)];
+        out.extend((0..known).map(|i| {
+            let nth = counted.saturating_sub(known - 1 - i);
+            let at = latest.binary_search_by_key(&nth, |&(nth, _)| nth);
+            at.map_or_else(|_| paludarium_mmu::faults::At::default(), |at| latest[at].1)
+        }));
+        out
+    }
     /// Adds its CPU time on each CPU to `sums`.
     pub(crate) fn add_times(&self, sums: &mut Vec<u64>) {
         let time = self.time();
@@ -535,7 +570,21 @@ impl paludarium_mmu::faults::Sink for Usage {
     fn forced(&self) -> &std::sync::atomic::AtomicU64 {
         &self.forced_faults
     }
+    fn fault(&self, kernel: bool, nth: u64, at: paludarium_mmu::faults::At) {
+        let mut addresses = self
+            .fault_addresses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latest = &mut addresses[usize::from(kernel)];
+        if latest.len() == FAULT_ADDRESSES {
+            latest.pop_front();
+        }
+        latest.push_back((nth, at));
+    }
 }
+/// How many of a thread's latest faults keep their addresses, for the
+/// samples its next system call takes of them.
+const FAULT_ADDRESSES: usize = 4096;
 
 /// While it lives, the calling host thread's kernel accesses that fault are
 /// resolved by a [`userfaultfd::KernelCopies`], with the call's signal mask
@@ -1131,6 +1180,29 @@ impl Kernel {
         number: u64,
         notify: &seccomp::Notify,
     ) -> Option<Next> {
+        let reply = self.listener_reply(thread, mem, number, notify);
+        thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
+        thread.state.restart = None;
+        match reply {
+            seccomp::Reply::Continue => return None,
+            seccomp::Reply::Return(value) => thread.cpu.gpr[reg::RAX] = value,
+            seccomp::Reply::Interrupted { always } => {
+                thread.cpu.gpr[reg::RAX] = paludarium_types::Errno(4).to_syscall_return();
+                thread.state.restart = Some(number);
+                thread.state.seccomp_restart = Some(always);
+            }
+        }
+        Some(self.checkpoint(thread, mem))
+    }
+
+    /// What the listener `notify` names answers for the call `number`.
+    pub(crate) fn listener_reply(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        number: u64,
+        notify: &seccomp::Notify,
+    ) -> seccomp::Reply {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
         proc::enter(
@@ -1155,18 +1227,7 @@ impl Kernel {
         };
         let reply = seccomp::notify(&mut ctx, notify);
         self.inbox.drain(&mut thread.state);
-        thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
-        thread.state.restart = None;
-        match reply {
-            seccomp::Reply::Continue => return None,
-            seccomp::Reply::Return(value) => thread.cpu.gpr[reg::RAX] = value,
-            seccomp::Reply::Interrupted { always } => {
-                thread.cpu.gpr[reg::RAX] = paludarium_types::Errno(4).to_syscall_return();
-                thread.state.restart = Some(number);
-                thread.state.seccomp_restart = Some(always);
-            }
-        }
-        Some(self.checkpoint(thread, mem))
+        reply
     }
 
     /// The fault of `thread` on a page the `userfaultfd` numbered `context`
@@ -1296,6 +1357,43 @@ impl Kernel {
         });
     }
 
+    /// Has the calling host thread's kernel accesses that fault served for
+    /// `thread` while what it returns lives. Its resolver is kept from call
+    /// to call, while it serves the same thread.
+    fn resolve_copies(&mut self, thread: &Thread) -> KernelCopies {
+        let copies = match &self.copies {
+            Some(copies)
+                if copies.serves(
+                    &self.group,
+                    &self.files.readiness,
+                    &self.inbox,
+                    self.process.pid,
+                    thread.tid,
+                ) =>
+            {
+                Arc::clone(copies)
+            }
+            _ => {
+                let copies = Arc::new(userfaultfd::KernelCopies {
+                    group: Arc::clone(&self.group),
+                    tid: thread.tid,
+                    hub: Arc::clone(&self.files.readiness),
+                    host: Arc::clone(&self.host),
+                    inbox: Arc::clone(&self.inbox),
+                    processes: Arc::clone(&self.processes),
+                    pid: self.process.pid,
+                });
+                self.copies = Some(Arc::clone(&copies));
+                copies
+            }
+        };
+        KernelCopies::install(
+            copies,
+            thread.state.signal_mask,
+            thread.state.credentials.capable(1 << 14),
+        )
+    }
+
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Its writes to user memory, a signal frame's and the rseq area's,
@@ -1303,6 +1401,9 @@ impl Kernel {
         // (`get_signal`, `rseq_handle_notify_resume`): their faults are the
         // kernel's, wherever it is called from.
         let _faults = KernelFaults::enter(&thread.state);
+        // And they are served as a system call's copies are: the frame of a
+        // signal grows a stack, and waits for a `userfaultfd`.
+        let _copies = self.resolve_copies(thread);
         // As in `handle`: a wait here shows the thread asleep.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         // A traced thread's clone goes on once the new task has started.
@@ -1632,38 +1733,7 @@ impl Kernel {
         let _faults = KernelFaults::enter(&thread.state);
         // And its accesses that fault are served as an instruction's are: a
         // mapping that grows down grows, and a `userfaultfd` is waited for.
-        // Its resolver is kept from call to call, while it serves this one.
-        let copies = match &self.copies {
-            Some(copies)
-                if copies.serves(
-                    &self.group,
-                    &self.files.readiness,
-                    &self.inbox,
-                    self.process.pid,
-                    thread.tid,
-                ) =>
-            {
-                Arc::clone(copies)
-            }
-            _ => {
-                let copies = Arc::new(userfaultfd::KernelCopies {
-                    group: Arc::clone(&self.group),
-                    tid: thread.tid,
-                    hub: Arc::clone(&self.files.readiness),
-                    host: Arc::clone(&self.host),
-                    inbox: Arc::clone(&self.inbox),
-                    processes: Arc::clone(&self.processes),
-                    pid: self.process.pid,
-                });
-                self.copies = Some(Arc::clone(&copies));
-                copies
-            }
-        };
-        let _copies = KernelCopies::install(
-            copies,
-            thread.state.signal_mask,
-            thread.state.credentials.capable(1 << 14),
-        );
+        let _copies = self.resolve_copies(thread);
         // What it waits for in the host while it handles the stop shows it
         // as sleeping (`/proc/<pid>/stat`), and nothing else does.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
@@ -1699,6 +1769,11 @@ impl Kernel {
         // A caller that did not finish the last exec finishes it now.
         self.exec_finished();
         self.group.register(thread.tid, Arc::clone(&self.inbox));
+        // Running the `vsyscall` page, which Linux emulates before it looks
+        // for a VMA (`do_user_addr_fault`).
+        if let Some(address) = vsyscall::entered(&reason) {
+            return self.vsyscall(thread, mem, address);
+        }
         // A fault below a mapping that grows down extends it, and the
         // instruction runs again, as Linux's `lock_mm_and_find_vma` expands
         // the stack VMA before it handles the fault. So it does when the
@@ -1762,7 +1837,9 @@ impl Kernel {
                     trap: 14,
                     error: 4
                         | (u64::from(write) * 2)
-                        | u64::from(present)
+                        // Above user space always a protection fault, to
+                        // hide the kernel's layout (`sanitize_error_code`).
+                        | u64::from(present || addr.0 >= vsyscall::TASK_SIZE_MAX)
                         | (u64::from(fetch) * 16),
                     synchronous: true,
                     timer: None,

@@ -2098,6 +2098,205 @@ static int case_gup(void) {
     return 0;
 }
 
+static volatile sig_atomic_t frame_handled;
+
+static void on_frame(int sig) {
+    (void)sig;
+    frame_handled = 1;
+}
+
+static volatile int frame_done;
+
+/* Takes a signal on an alternate stack no page of which is there. */
+static void *frame(void *stack) {
+    stack_t alt = {.ss_sp = stack, .ss_size = 16 * PAGE, .ss_flags = 0};
+    sigaltstack(&alt, NULL);
+    syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR2);
+    alt.ss_flags = SS_DISABLE;
+    sigaltstack(&alt, NULL);
+    frame_done = 1;
+    return NULL;
+}
+
+/* What waits for a pipe a vmsplice to the page `to` holds: its FIONREAD,
+   F_GETPIPE_SZ and the close of its other end (pipe_release), not a poll. */
+static void held_pipe(int fd, char *to, const char *src) {
+    int pipes[2], unread = -1;
+    pipe(pipes);
+    write(pipes[1], "uvwxyz", 6);
+    struct iovec part = {to, 3};
+    struct sys calls[4] = {
+        {SYS_vmsplice, {pipes[0], (long)&part, 1, 0, 0, 0}, -100, 0, 0},
+        {SYS_ioctl, {pipes[0], FIONREAD, (long)&unread, 0, 0, 0}, -100, 0, 0},
+        {SYS_fcntl, {pipes[0], 1032 /* F_GETPIPE_SZ */, 0, 0, 0, 0}, -100, 0, 0},
+        {SYS_close, {pipes[1], 0, 0, 0, 0, 0}, -100, 0, 0},
+    };
+    pthread_t threads[4];
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&threads[i], NULL, make, &calls[i]);
+        if (i == 0)
+            printf("held polled: %d\n", wait_message(fd));
+        while (!calls[i].tid)
+            usleep(1000);
+    }
+    struct uffd_msg msg;
+    read(fd, &msg, sizeof msg);
+    usleep(100000);
+    struct pollfd p = {pipes[0], POLLIN, 0};
+    printf("held: FIONREAD %ld size %ld close %ld", calls[1].ret, calls[2].ret, calls[3].ret);
+    int n = poll(&p, 1, 0);
+    printf(" poll %d %#x\n", n, (unsigned)p.revents);
+    copy(fd, to, src, PAGE, 0, NULL);
+    for (int i = 0; i < 4; i++)
+        pthread_join(threads[i], NULL);
+    printf("let go: vmsplice %ld FIONREAD %ld %d size %ld close %ld", calls[0].ret, calls[1].ret, unread,
+           calls[2].ret, calls[3].ret);
+    n = poll(&p, 1, 0);
+    printf(" poll %d %#x\n", n, (unsigned)p.revents);
+    close(pipes[0]);
+}
+
+/* A process killed as its vmsplice (`spliced`) or read holds a pipe lets go
+   of it: the bytes are there for another's read. */
+static void killed_holder(int spliced) {
+    int pipes[2], blocked[2];
+    pipe(pipes);
+    pipe(blocked);
+    write(pipes[1], "klmnop", 6);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        int fd = ready(O_NONBLOCK, 0);
+        char *page = anon(PAGE);
+        reg(fd, page, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+        struct iovec part = {page, 3};
+        struct sys call = {SYS_vmsplice, {pipes[0], (long)&part, 1, 0, 0, 0}, 0, 0, 0};
+        if (!spliced)
+            call = (struct sys){SYS_read, {pipes[0], (long)page, 3, 0, 0, 0}, 0, 0, 0};
+        pthread_t thread;
+        pthread_create(&thread, NULL, make, &call);
+        wait_message(fd);
+        write(blocked[1], "b", 1);
+        for (;;)
+            pause();
+    }
+    char buf[8] = "";
+    read(blocked[0], buf, 1);
+    kill(kid, SIGKILL);
+    int status = 0;
+    long reaped = waitpid(kid, &status, 0);
+    memset(buf, 0, sizeof buf);
+    long n = read(pipes[0], buf, 6);
+    printf("%s killed: %d signal %d left %ld %s\n", spliced ? "vmsplice" : "read", reaped == kid,
+           WTERMSIG(status), n, buf);
+    for (int i = 0; i < 2; i++) {
+        close(pipes[i]);
+        close(blocked[i]);
+    }
+}
+
+/* A read copies out and a write copies in with the pipe held: another
+   waits for them. What cannot be copied stays in the pipe. */
+static void held_copies(int fd, char *to, const char *src) {
+    int pipes[2];
+    pipe(pipes);
+    for (int writes = 0; writes < 2; writes++) {
+        char buf[16] = "";
+        write(pipes[1], "stuvwx", 6);
+        struct sys first = {writes ? SYS_write : SYS_read, {pipes[writes], (long)to + writes * PAGE, 3}, 0, 0, 0};
+        struct sys second = {writes ? SYS_write : SYS_read, {pipes[writes], (long)(writes ? "!" : buf), writes ? 1 : 3}, -100, 0, 0};
+        pthread_t threads[2];
+        pthread_create(&threads[0], NULL, make, &first);
+        printf("copy polled: %d\n", wait_message(fd));
+        struct uffd_msg msg;
+        read(fd, &msg, sizeof msg);
+        pthread_create(&threads[1], NULL, make, &second);
+        while (!second.tid)
+            usleep(1000);
+        usleep(100000);
+        printf("%s waits: %d", writes ? "write" : "read", second.ret == -100);
+        copy(fd, to + writes * PAGE, src, PAGE, 0, NULL);
+        pthread_join(threads[0], NULL);
+        pthread_join(threads[1], NULL);
+        printf(" first %ld second %ld %s\n", first.ret, second.ret, writes ? "" : buf);
+    }
+    char buf[4096];
+    printf("left %ld\n", (long)read(pipes[0], buf, sizeof buf));
+    /* A bad buffer past the bytes there is no matter. */
+    write(pipes[1], "yz0123", 6);
+    struct iovec parts[2] = {{buf, 3}, {(char *)8, 64}};
+    printf("readv part: %s", err(readv(pipes[0], parts, 2)));
+    parts[0].iov_len = 6;
+    printf(" whole %ld\n", (long)readv(pipes[0], parts, 2));
+    parts[0].iov_len = 4096;
+    printf("writev part: %ld", (long)writev(pipes[1], parts, 2));
+    parts[0].iov_len = 100;
+    printf(" %s", err(writev(pipes[1], parts, 2)));
+    printf(" left %ld\n", (long)read(pipes[0], buf, sizeof buf));
+    close(pipes[0]);
+    close(pipes[1]);
+}
+
+/* Copies of the kernel's that wait with something held, or on the way back
+   to the program. */
+static int case_held(void) {
+    int fd = ready(O_NONBLOCK, 0);
+    char *base = anon(32 * PAGE);
+    reg(fd, base, 32 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+    /* vmsplice holds its pipe as it copies (pipe_lock): a read meanwhile
+       takes what comes after. */
+    int pipes[2];
+    pipe(pipes);
+    write(pipes[1], "abcdef", 6);
+    struct iovec to = {base + 8, 3};
+    struct sys splice = {SYS_vmsplice, {pipes[0], (long)&to, 1, 0, 0, 0}, 0, 0, 0};
+    char buf[8] = "";
+    struct sys reader = {SYS_read, {pipes[0], (long)buf, 3, 0, 0, 0}, 0, 0, 0};
+    pthread_t splicer, second;
+    pthread_create(&splicer, NULL, make, &splice);
+    printf("vmsplice polled: %d\n", wait_message(fd));
+    struct uffd_msg msg;
+    read(fd, &msg, sizeof msg);
+    pthread_create(&second, NULL, make, &reader);
+    while (!reader.tid)
+        usleep(1000);
+    usleep(100000);
+    char src[PAGE];
+    memset(src, 0, sizeof src);
+    copy(fd, base, src, PAGE, 0, NULL);
+    pthread_join(splicer, NULL);
+    pthread_join(second, NULL);
+    printf("vmsplice: %ld %s read: %ld %s\n", splice.ret, base + 8, reader.ret, buf);
+    /* What cannot be copied stays in the pipe, a buffer at a time. */
+    write(pipes[1], "ghijkl", 6);
+    struct iovec parts[2] = {{buf, 3}, {(char *)1, 3}};
+    printf("vmsplice part: %s", err(syscall(SYS_vmsplice, pipes[0], parts, 2, 0)));
+    memset(buf, 0, sizeof buf);
+    printf(" left %ld %s\n", (long)read(pipes[0], buf, 6), buf);
+    held_pipe(fd, base + 20 * PAGE, src);
+    killed_holder(1);
+    killed_holder(0);
+    held_copies(fd, base + 21 * PAGE, src);
+    /* A signal's frame. */
+    struct sigaction sa = {0};
+    sa.sa_handler = on_frame;
+    sa.sa_flags = SA_ONSTACK;
+    sigaction(SIGUSR2, &sa, NULL);
+    pthread_t framed;
+    pthread_create(&framed, NULL, frame, base + PAGE);
+    int faults = 0;
+    while (!frame_done) {
+        struct pollfd p = {fd, POLLIN, 0};
+        if (poll(&p, 1, 10) != 1 || read(fd, &msg, sizeof msg) != sizeof msg)
+            continue;
+        faults++;
+        copy(fd, (char *)(uintptr_t)(msg.address & ~(uint64_t)(PAGE - 1)), src, PAGE, 0, NULL);
+    }
+    pthread_join(framed, NULL);
+    printf("frame: handled %d faulted %d\n", (int)frame_handled, faults > 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2106,6 +2305,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-faults")) return case_faults();
     if (!strcmp(mode, "userfaultfd-signals")) return case_signals();
     if (!strcmp(mode, "userfaultfd-gup")) return case_gup();
+    if (!strcmp(mode, "userfaultfd-held")) return case_held();
     if (!strcmp(mode, "userfaultfd-sigbus")) return case_sigbus();
     if (!strcmp(mode, "userfaultfd-shared")) return case_shared();
     if (!strcmp(mode, "userfaultfd-wp")) return case_wp();

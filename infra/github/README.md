@@ -20,9 +20,10 @@ The repository and GitHub's default labels existed before this module and are
 adopted by `import` blocks in `main.tf`, so the first apply starts from an
 empty state without a seed.
 
-The main ruleset requires every check of `ci.yml` and `check / Commitlint`.
-Keep `local.required_checks` equal to the job check names whenever a job in
-`ci.yml` is added, removed or renamed.
+The main ruleset requires `check / Commitlint` and `ci-ok`, the job of `ci.yml`
+that passes when every other job passed or was not needed. A job added to
+`ci.yml` goes into `ci-ok`'s `needs`; `local.required_checks` changes only when
+one of these two check names does.
 
 The `release` environment is the one `docs/release.md` (step 2) and release
 preflight require: administrator bypass off and deployments limited to

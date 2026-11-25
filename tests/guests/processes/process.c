@@ -18,12 +18,14 @@
 #include <sys/auxv.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <stddef.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
 #include <sys/sendfile.h>
 #include <sys/resource.h>
+#include <sys/ptrace.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
@@ -5430,6 +5432,36 @@ static int futex_shared_cases(void) {
     volatile unsigned *second = (volatile unsigned *)(file + 4096 + 8);
     futex_shared_show("file-other-mapping", second, second, fd);
 
+    /* A read-only anonymous page is no shared word's (EFAULT), written or
+       not, and a read-only private mapping's page of a file is the file's. */
+    char *own = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (own == MAP_FAILED) return 87;
+    own[0] = 1;
+    mprotect(own, 2 * 4096, PROT_READ);
+    for (int i = 0; i < 2; i++) {
+        volatile unsigned *at = (volatile unsigned *)(own + i * 4096);
+        long waited = futex_call(at, 0, 7);
+        int wait_errno = errno;
+        long woken = futex_call(at, 1, 1);
+        int wake_errno = errno;
+        long alone = futex_call(at, 128, 7);
+        printf("read-only anonymous %d: wait %ld errno %d wake %ld errno %d private %ld errno %d\n", i, waited,
+               wait_errno, woken, wake_errno, alone, errno);
+    }
+    munmap(own, 2 * 4096);
+    *second = 0;
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        char *page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 4096);
+        _exit(page == MAP_FAILED ? 2 : futex_call((volatile unsigned *)(page + 8), 0, 0) == 0 ? 0 : 1);
+    }
+    long read_woke;
+    while ((read_woke = futex_call(second, 1, 1)) == 0) sched_yield();
+    int read_status;
+    waitpid(reader, &read_status, 0);
+    printf("read-only private file: wake=%ld child status=%d\n", read_woke, read_status);
+
     /* A process-shared robust mutex whose owner ends while the parent waits:
        the end's wake reaches the parent, which gets EOWNERDEAD. */
     pthread_mutex_t *mutex = (pthread_mutex_t *)(anonymous + 64);
@@ -7469,14 +7501,9 @@ static int vma_names_case(void) {
     printf("rename: %ld\n", vn_name(a, (size_t)(4 * page), "case-b"));
     printf("named pieces: %d\n", vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]"));
     munlock(a + 2 * page, (size_t)page);
-    /* Every line of the range still carries the name. How many lines there
-       are depends on anon_vma identity, which Linux's VMA merge checks and
-       the emulator does not model (see limitations: "/proc/self/maps"): on
-       Linux the first page can share the anon_vma of memory musl's fopen
-       mapped right below it and wrote, which keeps it apart from page 2's. */
-    printf("after munlock: all named %d\n",
-           vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]") ==
-               vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), " "));
+    /* How many lines there are is anon_vma identity (vma-merges): what
+       musl's fopen maps may lie right below the range. */
+    printf("after munlock: %d\n", vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]"));
     /* What Linux refuses. */
     printf("bad char: %ld %ld %ld\n", vn_name(a, (size_t)page, "a[b"), vn_name(a, (size_t)page, "a$b"),
            vn_name(a, (size_t)page, "a\tb"));
@@ -7744,6 +7771,131 @@ static int proc_mem_case(void) {
         close(theirs);
     }
     waitpid(child, NULL, 0);
+    return 0;
+}
+/* The vma-merges case: which VMAs merge again, as mm/vma.c's
+   is_mergeable_anon_vma, can_vma_merge_right and find_mergeable_anon_vma
+   have it. Each range lies between two guard pages, so that nothing else
+   merges with it, and is shown as the pages of each line of maps. */
+static long vm_page;
+static char *vm_range(int pages) {
+    char *at = mmap(NULL, (size_t)((pages + 2) * vm_page), PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (at == MAP_FAILED) return NULL;
+    at += vm_page;
+    if (mprotect(at, (size_t)(pages * vm_page), PROT_READ | PROT_WRITE)) return NULL;
+    return at;
+}
+static void vm_show(const char *what, char *at, int pages) {
+    static char text[65536];
+    size_t size = 0;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    long n;
+    while (fd >= 0 && size < sizeof text - 1 &&
+           (n = read(fd, text + size, sizeof text - 1 - size)) > 0)
+        size += (size_t)n;
+    if (fd >= 0) close(fd);
+    text[size] = 0;
+    printf("%s:", what);
+    for (char *line = text; line && *line;) {
+        unsigned long start, end, from = (unsigned long)at, to = from + (unsigned long)(pages * vm_page);
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && start < to && end > from)
+            printf(" %ld-%ld", (long)(start - from) / vm_page, (long)(end - from) / vm_page);
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    printf("\n");
+}
+static void vm_touch(char *at) { *(volatile char *)at = 1; }
+static int vma_merges_case(void) {
+    vm_page = sysconf(_SC_PAGESIZE);
+    /* stdout's buffer and fd 1's state first: nothing else is mapped. */
+    printf("start\n");
+    fflush(stdout);
+    char *a = vm_range(4);
+    if (!a) return 80;
+    /* A page mlock faults in, between untouched ones, merges again. */
+    if (mlock(a + 2 * vm_page, (size_t)vm_page)) return 81;
+    vm_show("locked", a, 4);
+    munlock(a + 2 * vm_page, (size_t)vm_page);
+    vm_show("unlocked", a, 4);
+    /* Two pieces first written apart stay apart; the one between, never
+       written, goes with the one before it. */
+    a = vm_range(4);
+    mlock(a + 2 * vm_page, (size_t)vm_page);
+    vm_touch(a);
+    munlock(a + 2 * vm_page, (size_t)vm_page);
+    vm_show("written apart", a, 4);
+    a = vm_range(3);
+    mlock2(a + vm_page, (size_t)vm_page, 1);
+    vm_touch(a);
+    vm_touch(a + 2 * vm_page);
+    munlock(a + vm_page, (size_t)vm_page);
+    vm_show("none between two", a, 3);
+    /* A neighbour that differs in its protection alone is shared with, the
+       one after first; one that is locked is not. */
+    a = vm_range(3);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE | PROT_EXEC);
+    vm_touch(a + 2 * vm_page);
+    vm_touch(a);
+    vm_touch(a + vm_page);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("shared with the next", a, 3);
+    a = vm_range(2);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE | PROT_EXEC);
+    vm_touch(a);
+    vm_touch(a + vm_page);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("shared with the one before", a, 2);
+    /* Memory moved by mremap merges where it goes only if never written. */
+    for (int written = 0; written < 2; written++) {
+        char *to = vm_range(2), *from = vm_range(1);
+        munmap(to + vm_page, (size_t)vm_page);
+        if (written) vm_touch(from);
+        if (mremap(from, (size_t)vm_page, (size_t)vm_page, MREMAP_MAYMOVE | MREMAP_FIXED,
+                   to + vm_page) == MAP_FAILED) return 82;
+        vm_show(written ? "moved written" : "moved unwritten", to, 2);
+    }
+    /* MREMAP_DONTUNMAP leaves a whole VMA without its anon_vma. */
+    a = vm_range(2);
+    vm_touch(a);
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ);
+    vm_touch(a);
+    if (mremap(a, (size_t)vm_page, (size_t)vm_page, MREMAP_MAYMOVE | 4, 0) == MAP_FAILED) return 83;
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("left behind", a, 2);
+    /* munmap and mprotect of part of a named VMA: both parts keep it. */
+    a = vm_range(4);
+    long named = vn_name(a, (size_t)(4 * vm_page), "part");
+    mprotect(a + vm_page, (size_t)vm_page, PROT_READ);
+    munmap(a + 2 * vm_page, (size_t)vm_page);
+    printf("named parts: %ld %d\n", named,
+           vn_count((uintptr_t)a, (uintptr_t)(a + 4 * vm_page), "[anon:part]"));
+    /* A forked child's VMAs each have an anon_vma of their own, and what it
+       maps next to one does not merge with it. */
+    a = vm_range(5);
+    munmap(a + 4 * vm_page, (size_t)vm_page);
+    vm_touch(a);
+    mprotect(a + 2 * vm_page, (size_t)vm_page, PROT_READ);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        mprotect(a + 2 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+        vm_show("child", a, 4);
+        if (mmap(a + 4 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) _exit(84);
+        vm_show("child with more", a, 5);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    mprotect(a + 2 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE);
+    vm_show("parent", a, 4);
+    if (mmap(a + 4 * vm_page, (size_t)vm_page, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return 85;
+    vm_show("parent with more", a, 5);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
 /* The page-faults case: getrusage's and wait4's ru_minflt count the
@@ -10925,6 +11077,109 @@ static int io_uring_exit_case(const char *self) {
     return 0;
 }
 
+/* IORING_REGISTER_RING_FDS: a thread registers ring descriptors, which
+   io_uring_enter and io_uring_register then find by index
+   (IORING_ENTER_REGISTERED_RING, IORING_REGISTER_USE_REGISTERED_RING). The
+   table is the thread's: a new thread and a forked child have no io_uring
+   context, nor has a thread after execve (EINVAL). */
+struct urf_update {
+    unsigned offset, resv;
+    unsigned long data;
+};
+
+static long urf_register(struct uring *u, unsigned op, struct urf_update *up, unsigned n) {
+    return syscall(427, u->fd, op, up, n);
+}
+
+static void *urf_thread(void *arg) {
+    int *fds = arg;
+    uring_show("thread-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    /* A submission it may not make gives it none; one of nothing does. */
+    uring_show("thread-single-issuer", uring_enter(fds[0], 1, 0, 0, NULL, 0));
+    uring_show("thread-still-none", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-waits-none", uring_enter(fds[1], 0, 0, 1, NULL, 0));
+    uring_show("thread-none-yet", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-submits-nothing", uring_enter(fds[1], 1, 0, 0, NULL, 0));
+    uring_show("thread-has-one", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    return NULL;
+}
+
+static int io_uring_ring_fds_case(const char *self) {
+    uring_show("no-context", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    uring_show("empty-slot", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("past-table", uring_enter(16, 0, 0, 1 << 4, NULL, 0));
+    struct urf_update up[2];
+    memset(up, 0, sizeof up);
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register-none", urf_register(&u, 20, up, 0));
+    uring_show("register-many", urf_register(&u, 20, up, 17));
+    up[0].resv = 1;
+    uring_show("register-resv", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){16, 0, (unsigned long)u.fd};
+    uring_show("register-past", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 999};
+    uring_show("register-badf", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 1};
+    uring_show("register-not-ring", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register", urf_register(&u, 20, up, 1));
+    printf("offset: %u\n", up[0].offset);
+    up[0] = (struct urf_update){3, 0, (unsigned long)u.fd};
+    up[1] = (struct urf_update){0, 0, (unsigned long)u.fd};
+    uring_show("register-busy-second", urf_register(&u, 20, up, 2));
+    tw_nop(&u, 5, 0, 0, 0);
+    uring_show("enter-registered", uring_enter(3, 1, 1, 1 << 4 | 1, NULL, 0));
+    uring_reap(&u, "enter-registered");
+    unsigned char probe[16 + 8];
+    memset(probe, 0, sizeof probe);
+    uring_show("register-registered", syscall(427, 0, 8 | (1U << 31), probe, 1));
+
+    /* A new thread and a forked child have no io_uring context. */
+    pthread_t t;
+    struct uring single;
+    if (uring_open_flags(&single, 8, 1 << 12)) return 81;
+    int rings[2] = {single.fd, u.fd};
+    pthread_create(&t, NULL, urf_thread, rings);
+    pthread_join(t, NULL);
+    close(single.fd);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        uring_show("child-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+
+    /* execve takes the context away. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        struct uring mine;
+        if (uring_open(&mine, 8)) _exit(1);
+        struct urf_update one = {0xffffffff, 0, (unsigned long)mine.fd};
+        if (urf_register(&mine, 20, &one, 1) != 1) _exit(2);
+        char *args[] = {"process", "io-uring-ring-fds-exec", (char *)self, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(3);
+    }
+    waitpid(child, &status, 0);
+    printf("exec-child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    up[0] = (struct urf_update){0, 0, 1};
+    uring_show("unregister-data", urf_register(&u, 21, up, 1));
+    up[0] = (struct urf_update){0, 0, 0};
+    up[1] = (struct urf_update){3, 0, 0};
+    uring_show("unregister", urf_register(&u, 21, up, 2));
+    uring_show("after-unregister", uring_enter(3, 0, 0, 1 << 4, NULL, 0));
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's registered buffers keep the pages they had when they were
    registered (io_pin_pages, FOLL_LONGTERM): a fixed transfer moves them
    after munmap, a new mapping at the address sees none of it, and a page
@@ -11103,6 +11358,176 @@ static int io_uring_held_tag_case(void) {
     printf("write: %ld\n", (long)write(c[1], "ef", 2));
     uring_reap(&u, "replaced-done");
     printf("read: %.2s\n", buf);
+    close(u.fd);
+    return 0;
+}
+
+/* IORING_REGISTER_BUFFERS2 and _BUFFERS_UPDATE: buffers with tags. A
+   tag is the user_data of a completion of 0 once nothing holds its
+   buffer: once an update replaces it, or the buffers are unregistered,
+   the last slot first. A failed registration posts none, and an update
+   gives how many slots it updated. */
+struct ub2_register {
+    unsigned nr, flags;
+    unsigned long resv2, data, tags;
+};
+
+struct ub2_update {
+    unsigned offset, resv;
+    unsigned long data, tags;
+    unsigned nr, resv2;
+};
+
+static long ub2_register(struct uring *u, struct ub2_register *rr, unsigned size) {
+    return syscall(427, u->fd, 15, rr, size);
+}
+
+static long ub2_update(struct uring *u, struct ub2_update *up, unsigned size) {
+    return syscall(427, u->fd, 16, up, size);
+}
+
+static int io_uring_buffers2_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    char *page = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 81;
+    int fd = open("buffers2", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 82;
+    unlink("buffers2");
+    struct iovec iov[2];
+    unsigned long tags[2];
+    struct ub2_register rr;
+    struct ub2_update up;
+
+    /* io_register_rsrc's checks. */
+    memset(&rr, 0, sizeof rr);
+    rr.nr = 2;
+    uring_show("size", ub2_register(&u, &rr, sizeof rr - 1));
+    rr.nr = 0;
+    uring_show("no-count", ub2_register(&u, &rr, sizeof rr));
+    rr.nr = 2;
+    rr.flags = 2;
+    uring_show("unknown-flag", ub2_register(&u, &rr, sizeof rr));
+    rr.flags = 1;
+    rr.data = (unsigned long)iov;
+    uring_show("sparse-with-data", ub2_register(&u, &rr, sizeof rr));
+    rr.flags = 0;
+    rr.resv2 = 1;
+    uring_show("resv2", ub2_register(&u, &rr, sizeof rr));
+    rr.resv2 = 0;
+    memset(&up, 0, sizeof up);
+    up.nr = 1;
+    up.data = (unsigned long)iov;
+    uring_show("update-none", ub2_update(&u, &up, sizeof up));
+
+    /* A failed registration posts no tag; a tag on an empty slot fails. */
+    iov[0] = (struct iovec){page, 4096};
+    iov[1] = (struct iovec){NULL, 1};
+    tags[0] = 4;
+    tags[1] = 5;
+    rr.data = (unsigned long)iov;
+    rr.tags = (unsigned long)tags;
+    uring_show("register-bad", ub2_register(&u, &rr, sizeof rr));
+    iov[1] = (struct iovec){NULL, 0};
+    uring_show("register-tag-empty", ub2_register(&u, &rr, sizeof rr));
+    uring_reap(&u, "no-tags");
+
+    /* A sparse table, then the update's checks. */
+    memset(&rr, 0, sizeof rr);
+    rr.nr = 2;
+    rr.flags = 1;
+    uring_show("sparse", ub2_register(&u, &rr, sizeof rr));
+    uring_show("again", ub2_register(&u, &rr, sizeof rr));
+    up = (struct ub2_update){0, 0, (unsigned long)iov, (unsigned long)tags, 1, 0};
+    uring_show("update-size", ub2_update(&u, &up, sizeof up - 1));
+    up.nr = 0;
+    uring_show("update-no-count", ub2_update(&u, &up, sizeof up));
+    up.nr = 2;
+    up.offset = 1;
+    uring_show("update-past", ub2_update(&u, &up, sizeof up));
+    up.offset = 0xffffffff;
+    up.nr = 1;
+    uring_show("update-wraps", ub2_update(&u, &up, sizeof up));
+    up.offset = 0;
+    up.resv = 1;
+    uring_show("update-resv", ub2_update(&u, &up, sizeof up));
+    up.resv = 0;
+    iov[0] = (struct iovec){NULL, 0};
+    tags[0] = 7;
+    uring_show("update-tag-empty", ub2_update(&u, &up, sizeof up));
+
+    /* A tagged buffer moves bytes; replacing it posts its tag. */
+    iov[0] = (struct iovec){page, 4096};
+    tags[0] = 9;
+    up.offset = 1;
+    uring_show("update", ub2_update(&u, &up, sizeof up));
+    memcpy(page, "tag!", 4);
+    unsigned char *sqe = uring_push(&u, 5, 1);
+    memcpy(sqe + 4, &fd, 4);
+    unsigned long a = (unsigned long)page;
+    memcpy(sqe + 16, &a, 8);
+    unsigned len = 4;
+    memcpy(sqe + 24, &len, 4);
+    unsigned short index = 1;
+    memcpy(sqe + 40, &index, 2);
+    up_submit(&u, "write-fixed");
+    iov[0] = (struct iovec){page, 16};
+    iov[1] = (struct iovec){NULL, 1};
+    tags[0] = 0;
+    tags[1] = 0;
+    up.offset = 0;
+    up.nr = 2;
+    uring_show("update-partial", ub2_update(&u, &up, sizeof up));
+    uring_reap(&u, "partial");
+    up.offset = 1;
+    up.nr = 1;
+    uring_show("update-replace", ub2_update(&u, &up, sizeof up));
+    uring_reap(&u, "replaced");
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    uring_reap(&u, "unregistered");
+
+    /* Unregistering posts the tags of what is left, the last slot first. */
+    iov[0] = (struct iovec){page, 16};
+    iov[1] = (struct iovec){page + 4096, 16};
+    tags[0] = 3;
+    tags[1] = 6;
+    memset(&rr, 0, sizeof rr);
+    rr.nr = 2;
+    rr.data = (unsigned long)iov;
+    rr.tags = (unsigned long)tags;
+    uring_show("register-tags", ub2_register(&u, &rr, sizeof rr));
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    uring_reap(&u, "unregister-tags");
+    close(fd);
+    close(u.fd);
+    munmap(page, 2 * 4096);
+    return 0;
+}
+
+/* A request that waits for its file keeps its registered buffer
+   (req->buf_node): it goes on though its slot is updated meanwhile, and the
+   buffer's tag posts after its completion (io_put_rsrc_node). */
+static int io_uring_held_buffer_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int p[2];
+    if (pipe(p)) return 81;
+    char *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 82;
+    struct iovec iov = {page, 4096};
+    unsigned long tag = 31;
+    struct ub2_register rr = {1, 0, 0, (unsigned long)&iov, (unsigned long)&tag};
+    uring_show("register", ub2_register(&u, &rr, sizeof rr));
+    pw_read(&u, 3, p[0], page, 4, 0)[0] = 4;
+    tw_submit(&u, 1, 0, "armed");
+    iov = (struct iovec){NULL, 0};
+    struct ub2_update up = {0, 0, (unsigned long)&iov, 0, 1, 0};
+    uring_show("update", ub2_update(&u, &up, sizeof up));
+    uring_reap(&u, "updated");
+    printf("write: %ld\n", (long)write(p[1], "efgh", 4));
+    uring_reap(&u, "done");
+    printf("page: %.4s\n", page);
+    munmap(page, 4096);
     close(u.fd);
     return 0;
 }
@@ -12259,6 +12684,182 @@ static int lease_breaks_case(void) {
     rmdir(dir);
     return 0;
 }
+/* /proc/locks: the lines of this case's two files, as lock_get_status prints
+ * them, without their numbers, which other processes' locks move. */
+static struct stat plocks_files[2];
+static pid_t plocks_child;
+static void plocks_line(const char *line) {
+    const char *at = strstr(line, ": ");
+    if (!at || strlen(at) < 20) return;
+    at += 2;
+    int pid, used = 0;
+    unsigned major_number, minor_number;
+    unsigned long inode;
+    char kind[16], start[32], end[32];
+    if (sscanf(at + 17, "%15s %d %x:%x:%lu %31s %31s%n", kind, &pid, &major_number, &minor_number, &inode, start, end, &used) != 7) return;
+    for (int i = 0; i < 2; i++) {
+        struct stat *st = &plocks_files[i];
+        if (st->st_ino != inode || major(st->st_dev) != major_number || minor(st->st_dev) != minor_number) continue;
+        const char *who = pid == getpid() ? "self" : pid == -1 ? "none" : plocks_child && pid == plocks_child ? "child" : "other";
+        printf("  [%.17s] %s %s %c %s %s%s", at, kind, who, 'f' + i, start, end, at[17 + used] == '\n' ? "\n" : "!\n");
+    }
+}
+static void plocks_show(const char *what, const char *path) {
+    printf("%s\n", what);
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        printf("  open=%d\n", errno);
+        return;
+    }
+    char line[256];
+    long last = 0;
+    int ordered = 1;
+    int locks = !strcmp(path, "/proc/locks");
+    while (fgets(line, sizeof line, file)) {
+        if (!locks && strncmp(line, "lock:\t", 6)) continue;
+        const char *text = locks ? line : line + 6;
+        long id = strtol(text, NULL, 10);
+        /* A waiter's line has its lock's number. */
+        ordered &= id >= last;
+        last = id;
+        if (!locks) printf("  %ld\n", id);
+        plocks_line(text);
+    }
+    fclose(file);
+    printf("  ordered=%d\n", ordered);
+}
+static int plocks_set(int fd, int command, short type, long start, long length) {
+    struct flock lock = {.l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = length};
+    return fcntl(fd, command, &lock) < 0 ? -errno : 0;
+}
+static int plocks_pin(int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    return sched_setaffinity(0, sizeof set, &set) ? -errno : 0;
+}
+static int proc_locks_case(void) {
+    signal(SIGIO, SIG_IGN);
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof allowed, &allowed)) return 1;
+    int cpus[2] = {-1, -1}, count = 0;
+    for (int i = 0; i < CPU_SETSIZE && count < 2; i++)
+        if (CPU_ISSET(i, &allowed)) cpus[count++] = i;
+    if (plocks_pin(cpus[0])) return 2;
+    char dir[] = "/tmp/plocks-XXXXXX";
+    if (!mkdtemp(dir)) return 3;
+    char f[64], g[64], info[64];
+    snprintf(f, sizeof f, "%s/f", dir);
+    snprintf(g, sizeof g, "%s/g", dir);
+    int one = open(f, O_RDWR | O_CREAT, 0644), two = open(f, O_RDWR), three = open(f, O_RDWR);
+    int leased = open(g, O_RDWR | O_CREAT, 0644);
+    close(leased);
+    leased = open(g, O_RDONLY);
+    if (one < 0 || two < 0 || three < 0 || leased < 0) return 4;
+    if (stat(f, &plocks_files[0]) || stat(g, &plocks_files[1])) return 5;
+    struct stat st;
+    stat("/proc/locks", &st);
+    int past_stat = stat("/proc/locks/", &(struct stat){0}) ? errno : 0;
+    int rest = open("/proc/locks", O_RDONLY);
+    int written = write(rest, "x", 1) < 0 ? errno : 0;
+    close(rest);
+    printf("mode=%o size=%ld owner=%d:%d links=%ld past=%d written=%d\n", st.st_mode, (long)st.st_size, st.st_uid == 0,
+           st.st_gid == 0, (long)st.st_nlink, past_stat, written);
+    int listed = 0;
+    DIR *names = opendir("/proc");
+    for (struct dirent *e; names && (e = readdir(names));) listed += !strcmp(e->d_name, "locks") && e->d_type == DT_REG;
+    if (names) closedir(names);
+    printf("in /proc=%d\n", listed);
+    plocks_show("none", "/proc/locks");
+    int posix = plocks_set(one, F_SETLK, F_WRLCK, 0, 10);
+    int read_lock = plocks_set(one, F_SETLK, F_RDLCK, 20, 10);
+    int ofd = plocks_set(two, F_OFD_SETLK, F_WRLCK, 100, 1);
+    int shared = flock(three, LOCK_SH) ? -errno : 0;
+    int lease = lease_errno(leased, F_RDLCK);
+    printf("taken posix=%d read=%d ofd=%d flock=%d lease=%d\n", posix, read_lock, ofd, shared, lease);
+    plocks_show("taken", "/proc/locks");
+    /* A merge keeps the first lock's place; a split's left piece is new. */
+    printf("merge=%d\n", plocks_set(two, F_SETLK, F_WRLCK, 10, 5));
+    plocks_show("merged", "/proc/locks");
+    printf("split=%d\n", plocks_set(one, F_SETLK, F_UNLCK, 3, 2));
+    plocks_show("split", "/proc/locks");
+    /* A lock of the other kind replaces what it covers, then merges. */
+    printf("replace=%d\n", plocks_set(three, F_SETLK, F_RDLCK, 5, 15));
+    plocks_show("replaced", "/proc/locks");
+    /* In the way of the other description's lock, then short of it. */
+    printf("to end=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 50, 0));
+    printf("short of it=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 50, 40));
+    printf("middle=%d\n", plocks_set(two, F_SETLK, F_RDLCK, 60, 10));
+    plocks_show("middle", "/proc/locks");
+    /* A change of flock's kind is a new lock, the same kind is not. */
+    int same = flock(three, LOCK_SH) ? -errno : 0;
+    plocks_show("flock again", "/proc/locks");
+    int exclusive = flock(three, LOCK_EX) ? -errno : 0;
+    printf("flock same=%d exclusive=%d\n", same, exclusive);
+    plocks_show("flock changed", "/proc/locks");
+    /* A lease, broken: fdinfo shows it after the record locks. */
+    printf("leased posix=%d\n", plocks_set(leased, F_SETLK, F_RDLCK, 7, 1));
+    snprintf(info, sizeof info, "/proc/self/fdinfo/%d", leased);
+    plocks_show("leased", info);
+    printf("break=%d\n", open(g, O_WRONLY | O_NONBLOCK) < 0 ? -errno : 0);
+    plocks_show("broken", info);
+    plocks_show("broken", "/proc/locks");
+    printf("downgrade from write: unlck=%d\n", lease_errno(leased, F_UNLCK));
+    printf("write lease=%d\n", lease_errno(leased, F_WRLCK));
+    printf("read break=%d\n", open(g, O_RDONLY | O_NONBLOCK) < 0 ? -errno : 0);
+    plocks_show("read break", info);
+    for (int i = 0; i < 2; i++) {
+        snprintf(info, sizeof info, "/proc/self/fdinfo/%d", i ? three : one);
+        plocks_show(i ? "fdinfo three" : "fdinfo one", info);
+    }
+    close(leased);
+    plocks_set(one, F_SETLK, F_UNLCK, 0, 0);
+    /* A child's locks: its record lock goes with it, and the flock lock of
+       a description it shares stays, as the child's. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 6;
+    fflush(stdout);
+    plocks_child = fork();
+    if (plocks_child == 0) {
+        char byte;
+        int result = plocks_set(two, F_SETLK, F_WRLCK, 200, 1);
+        if (flock(three, LOCK_SH)) _exit(1);
+        if (write(ready[1], "x", 1) != 1 || read(go[0], &byte, 1) != 1) _exit(2);
+        _exit(result ? 3 : 0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 7;
+    plocks_show("child", "/proc/locks");
+    if (write(go[1], "x", 1) != 1) return 8;
+    int status;
+    waitpid(plocks_child, &status, 0);
+    printf("child=%d\n", status);
+    plocks_show("child gone", "/proc/locks");
+    flock(three, LOCK_UN);
+    close(two);
+    /* By CPU, the latest of each first. */
+    if (count == 2) {
+        int later = open(f, O_RDWR), latest = open(f, O_RDWR);
+        flock(three, LOCK_SH);
+        int moved = plocks_pin(cpus[1]);
+        flock(later, LOCK_SH);
+        plocks_set(later, F_OFD_SETLK, F_RDLCK, 1, 1);
+        int back = plocks_pin(cpus[0]);
+        flock(latest, LOCK_SH);
+        plocks_set(latest, F_OFD_SETLK, F_RDLCK, 2, 1);
+        printf("moved=%d back=%d\n", moved, back);
+        plocks_show("cpus", "/proc/locks");
+        close(later);
+        close(latest);
+    }
+    close(one);
+    close(three);
+    plocks_show("closed", "/proc/locks");
+    unlink(f);
+    unlink(g);
+    rmdir(dir);
+    return 0;
+}
 /* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
  * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
  * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
@@ -12810,6 +13411,43 @@ static int grows_down_case(void) {
            got == 5 ? low + 8 : "-----");
     close(pipes[0]);
     close(pipes[1]);
+    /* So do /proc/<pid>/mem and ptrace (__access_remote_vm's expand_stack),
+     * within the limit. */
+    int mem = open("/proc/self/mem", O_RDWR);
+    low -= page;
+    char byte[8] = "zz";
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low + 8);
+    printf("mem-read-below: %ld grown-to-it=%d bytes %d %d\n", got, grows_start(g) == (uintptr_t)low, byte[0],
+           byte[1]);
+    low -= 2 * page;
+    got = pwrite(mem, "mem", 3, (off_t)(uintptr_t)low + 8);
+    printf("mem-write-below: %ld grown-to-it=%d\n", got, grows_start(g) == (uintptr_t)low);
+    struct rlimit mem_limit, mem_small;
+    getrlimit(RLIMIT_STACK, &mem_limit);
+    mem_small = mem_limit;
+    mem_small.rlim_cur = (rlim_t)(g + 2 * page - low);
+    setrlimit(RLIMIT_STACK, &mem_small);
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low - 8);
+    printf("mem-past-limit: %ld errno=%d\n", got, got < 0 ? errno : 0);
+    setrlimit(RLIMIT_STACK, &mem_limit);
+    close(mem);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        raise(SIGSTOP);
+        _exit(grows_start(g) == (uintptr_t)low - 3 * 4096 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, child, low - page, NULL);
+    printf("peek-below: %ld errno=%d\n", word, errno);
+    long poked = ptrace(PTRACE_POKEDATA, child, low - 3 * page, (void *)1L);
+    printf("poke-below: %ld\n", poked);
+    ptrace(PTRACE_CONT, child, NULL, NULL);
+    waitpid(child, &status, 0);
+    printf("child-grown: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     /* PROT_GROWSDOWN reaches down to the start of the VMA. */
     printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
     grows_touch("read-only", g, g - page, 1);
@@ -16894,6 +17532,69 @@ static int tmpfs_huge_placement_case(void) {
     printf("cleaned=%d\n", rmdir(th_base) == 0);
     return 0;
 }
+/* The mmap-32bit case: MAP_32BIT looks for room from 1 GiB (and up to 32 MiB
+   more, at random) up to 2 GiB, or takes a free hint that ends by 2 GiB, as
+   find_start_end has it, whatever is mapped: anonymous memory, a file, or
+   what transparent huge pages fit. MAP_FIXED overrides it, and mremap does
+   not keep to it. A hint below mmap_min_addr (64 KiB) is that. The hint
+   below 1 GiB stays clear of the heap, which brk may have put there. */
+static int low_area(const char *at, size_t len) {
+    return at != MAP_FAILED && (uintptr_t)at >= 0x40000000 && (uintptr_t)at <= 0x80000000 - len;
+}
+static int mmap_32bit_case(void) {
+    long page = 4096, huge = 2 << 20;
+    int rw = PROT_READ | PROT_WRITE, low = MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT;
+    char *a = mmap(NULL, page, rw, low, -1, 0);
+    if (a == MAP_FAILED) return 80;
+    printf("low=%d start=%d\n", low_area(a, page), (uintptr_t)a < 0x42000000);
+    *a = 1;
+    uintptr_t heap = (uintptr_t)sbrk(0);
+    char *below = (char *)(heap > 0x1c000000 && heap < 0x24000000 ? 0x30000000L : 0x20000000L);
+    char *hints[] = {below, (char *)0x60000000L, (char *)0x7ffff000L};
+    for (int i = 0; i < 3; i++)
+        printf("hint=%d\n", mmap(hints[i], page, rw, low, -1, 0) == hints[i]);
+    char *c = mmap(a, page, rw, low, -1, 0);
+    printf("busy: low=%d other=%d\n", low_area(c, page), c != a);
+    char *past = (char *)0x100000000L, *over = (char *)0x7fffd000L;
+    char *d = mmap(past, page, rw, low, -1, 0), *e = mmap(over, 4 * page, rw, low, -1, 0);
+    printf("past: low=%d over: low=%d\n", low_area(d, page), low_area(e, 4 * page));
+    char *high = mmap(NULL, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *fixed = mmap(high, page, rw, low | MAP_FIXED, -1, 0);
+    printf("plain-high=%d fixed=%d\n", (uintptr_t)high >= 0x80000000, fixed == high);
+    char *thp = mmap(NULL, 2 * huge, rw, low, -1, 0);
+    printf("thp: low=%d aligned=%d\n", low_area(thp, 2 * huge), !((uintptr_t)thp & (huge - 1)));
+    int zero = open("/dev/zero", O_RDWR);
+    char *z = mmap(NULL, 2 * huge + page, rw, MAP_PRIVATE | MAP_32BIT, zero, 0);
+    printf("zero: low=%d aligned=%d\n", low_area(z, 2 * huge + page), !((uintptr_t)z & (huge - 1)));
+    char *s = mmap(NULL, huge, rw, MAP_SHARED | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    printf("shared: low=%d\n", low_area(s, huge));
+    int fd = memfd_create("low", 0);
+    if (fd < 0 || ftruncate(fd, page)) return 81;
+    char *f = mmap(NULL, page, rw, MAP_SHARED | MAP_32BIT, fd, 0);
+    char *g = mmap(NULL, page, rw, MAP_PRIVATE | MAP_32BIT, fd, 0);
+    printf("file: low=%d private: low=%d\n", low_area(f, page), low_area(g, page));
+    mmap(a + page, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    char *grown = mremap(a, page, 2 * page, MREMAP_MAYMOVE);
+    printf("moved: high=%d kept=%d\n", (uintptr_t)grown >= 0x80000000, grown != MAP_FAILED && *grown);
+    /* One of 448 MiB fits below the page at 0x60000000 (what is mapped so far
+       lies within 48 MiB of 1 GiB), one above it, and no third. */
+    size_t len = 0x1c000000;
+    char *big = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    char *big2 = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("big: low=%d %d\n", low_area(big, len), low_area(big2, len));
+    errno = 0;
+    char *none = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("full: failed=%d errno=%d\n", none == MAP_FAILED, errno);
+    errno = 0;
+    none = mmap(NULL, 0x80001000, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("long: failed=%d errno=%d\n", none == MAP_FAILED, errno);
+    char *min = mmap((char *)0x1000L, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("min=%#lx\n", (unsigned long)min);
+    char *unit = mmap((char *)0x10L, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("under-a-page: high=%d\n", (uintptr_t)unit >= 0x80000000);
+    close(fd), close(zero);
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -18173,6 +18874,658 @@ static int thread_caps_status_case(void) {
     int status = 0;
     waitpid(kid, &status, 0);
     printf("wait=%#x\n", status);
+    return 0;
+}
+
+/* The vdso-mappings case: as Linux's map_vdso maps them at exec, below the
+   other mappings and above nothing but the stack, [vvar] (4 pages),
+   [vvar_vclock] (2) and [vdso] (2) lie together, private and read-only but
+   [vdso] executable, of no file, and AT_SYSINFO_EHDR is the vDSO's start,
+   first in the auxiliary vector. A C library finds the vDSO's functions by
+   its dynamic symbols and their version, LINUX_2.6, as musl's __vdsosym
+   does here, and gets what the system calls give. [vvar]'s pages 1 and 3
+   (and [vvar_vclock]'s page 1) are a bus error, nothing in [vvar] may be
+   made writable or reached from outside the process (VM_IO | VM_PFNMAP),
+   and the vDSO may be moved but not grown, nor any of them split
+   (special_mapping_split). Linux 7.2 makes [vvar]
+   VM_MIXEDMAP (vdso_install_vvar_mapping, c27e727c9a60) and maps zeros for
+   its pages 1 and 3 (43648f9f3a67): this is the test machines' 7.0's. statm counts the three areas,
+   and a fork keeps them where they are. The bytes of [vvar], Linux's time
+   data, and whether [vvar_vclock]'s page 0 can be read, which depends on
+   the machine's clock, are not printed. */
+struct vdm_area {
+    unsigned long start, end;
+    char perms[8], rest[64];
+};
+static struct vdm_area vdm_areas[3];
+static const char *const vdm_names[3] = {"[vvar]", "[vvar_vclock]", "[vdso]"};
+static unsigned long vdm_stack_start, vdm_after_vdso;
+
+static void vdm_scan(void) {
+    memset(vdm_areas, 0, sizeof vdm_areas);
+    vdm_stack_start = vdm_after_vdso = 0;
+    char buffer[16384];
+    if (proc_read("/proc/self/maps", buffer, sizeof buffer) <= 0) return;
+    int previous_was_vdso = 0;
+    for (char *line = buffer; *line;) {
+        char *next = strchr(line, '\n');
+        if (next) *next = 0;
+        unsigned long start, end, offset;
+        char perms[8], dev[16], inode[32], name[256] = "";
+        int fields = sscanf(line, "%lx-%lx %7s %lx %15s %31s %255s", &start, &end, perms, &offset, dev, inode, name);
+        if (fields >= 6) {
+            if (previous_was_vdso) vdm_after_vdso = start;
+            previous_was_vdso = 0;
+            for (int i = 0; i < 3; i++)
+                if (!strcmp(name, vdm_names[i])) {
+                    vdm_areas[i].start = start;
+                    vdm_areas[i].end = end;
+                    snprintf(vdm_areas[i].perms, sizeof vdm_areas[i].perms, "%s", perms);
+                    snprintf(vdm_areas[i].rest, sizeof vdm_areas[i].rest, "%lx %s %s", offset, dev, inode);
+                    previous_was_vdso = i == 2;
+                }
+            if (!strcmp(name, "[stack]")) vdm_stack_start = start;
+        }
+        if (!next) break;
+        line = next + 1;
+    }
+}
+
+static const void *vdm_symbol(const char *wanted) {
+    const unsigned char *image = (const unsigned char *)getauxval(AT_SYSINFO_EHDR);
+    if (!image) return NULL;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(image + eh->e_phoff);
+    const Elf64_Dyn *dyn = NULL;
+    long bias = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) dyn = (const Elf64_Dyn *)(image + ph[i].p_offset);
+        if (ph[i].p_type == PT_LOAD) bias = (long)ph[i].p_offset - (long)ph[i].p_vaddr;
+    }
+    const char *strings = NULL;
+    const Elf64_Sym *symbols = NULL;
+    const uint32_t *hash = NULL;
+    const uint16_t *versym = NULL;
+    const unsigned char *verdef = NULL;
+    for (; dyn && dyn->d_tag != DT_NULL; dyn++) {
+        const unsigned char *at = image + bias + dyn->d_un.d_ptr;
+        if (dyn->d_tag == DT_STRTAB) strings = (const char *)at;
+        if (dyn->d_tag == DT_SYMTAB) symbols = (const Elf64_Sym *)at;
+        if (dyn->d_tag == DT_HASH) hash = (const uint32_t *)at;
+        if (dyn->d_tag == DT_VERSYM) versym = (const uint16_t *)at;
+        if (dyn->d_tag == DT_VERDEF) verdef = at;
+    }
+    if (!strings || !symbols || !hash || !versym || !verdef) return NULL;
+    for (uint32_t i = 1; i < hash[1]; i++) {
+        const Elf64_Sym *sym = &symbols[i];
+        if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC || !sym->st_shndx) continue;
+        if (strcmp(strings + sym->st_name, wanted)) continue;
+        for (const unsigned char *vd = verdef;;) {
+            const Elf64_Verdef *d = (const Elf64_Verdef *)vd;
+            if (d->vd_ndx == (versym[i] & 0x7fff)) {
+                const Elf64_Verdaux *a = (const Elf64_Verdaux *)(vd + d->vd_aux);
+                if (!strcmp(strings + a->vda_name, "LINUX_2.6")) return image + bias + sym->st_value;
+                break;
+            }
+            if (!d->vd_next) break;
+            vd += d->vd_next;
+        }
+    }
+    return NULL;
+}
+
+static sigjmp_buf vdm_jump;
+static volatile int vdm_signal, vdm_code, vdm_at_target;
+static volatile unsigned long vdm_target;
+static void vdm_on_signal(int number, siginfo_t *info, void *context) {
+    (void)context;
+    vdm_signal = number;
+    vdm_code = info->si_code;
+    vdm_at_target = (unsigned long)info->si_addr == vdm_target;
+    siglongjmp(vdm_jump, 1);
+}
+
+static void vdm_read(const char *what, unsigned long address) {
+    struct sigaction action = {.sa_sigaction = vdm_on_signal, .sa_flags = SA_SIGINFO | SA_NODEFER};
+    struct sigaction old_bus, old_segv;
+    sigaction(SIGBUS, &action, &old_bus);
+    sigaction(SIGSEGV, &action, &old_segv);
+    vdm_target = address;
+    if (sigsetjmp(vdm_jump, 1)) {
+        printf("read %s signal=%d code=%d addr==target=%d\n", what, vdm_signal, vdm_code, vdm_at_target);
+    } else {
+        volatile unsigned char byte = *(volatile unsigned char *)address;
+        (void)byte;
+        printf("read %s ok\n", what);
+    }
+    sigaction(SIGBUS, &old_bus, NULL);
+    sigaction(SIGSEGV, &old_segv, NULL);
+}
+
+/* `op` (one of the operations below) in a child, its result and errno. */
+static void vdm_in_child(const char *what, int op) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return;
+    if (kid == 0) {
+        struct vdm_area vvar = vdm_areas[0], vdso = vdm_areas[2];
+        size_t vvar_size = vvar.end - vvar.start, vdso_size = vdso.end - vdso.start;
+        long r = -1;
+        errno = 0;
+        if (op == 0) {
+            r = mprotect((void *)vdso.start, vdso_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+            if (!r) *(volatile char *)vdso.start = *(volatile char *)vdso.start;
+        } else if (op == 1) {
+            r = mprotect((void *)vvar.start, vvar_size, PROT_READ | PROT_WRITE);
+        } else if (op == 2) {
+            r = munmap((void *)vdso.start, vdso_size);
+        } else if (op == 3) {
+            r = munmap((void *)vvar.start, vvar_size);
+        } else if (op == 4 || op == 6) {
+            unsigned long from = op == 4 ? vdso.start : vvar.start;
+            size_t size = op == 4 ? vdso_size : vvar_size;
+            char *to = mmap(NULL, size + 0x10000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            void *moved = mremap((void *)from, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, to + 0x8000);
+            r = moved == MAP_FAILED ? -1 : 0;
+            if (!r) {
+                vdm_scan();
+                printf("  moved, named still=%d\n", vdm_areas[op == 4 ? 2 : 0].start == (unsigned long)(to + 0x8000));
+            }
+        } else if (op == 5) {
+            r = mremap((void *)vdso.start, vdso_size, vdso_size + 4096, MREMAP_MAYMOVE) == MAP_FAILED ? -1 : 0;
+        } else if (op == 7) {
+            r = madvise((void *)vvar.start, vvar_size, MADV_DONTNEED);
+        } else if (op == 8) {
+            r = madvise((void *)vdso.start, vdso_size, MADV_DONTNEED);
+        } else if (op == 9) {
+            r = mlock((void *)vvar.start, vvar_size);
+        } else if (op == 10) {
+            r = mlock((void *)vdso.start, vdso_size);
+        } else if (op == 11) {
+            r = mprotect((void *)vvar.start, vvar_size, PROT_NONE);
+            if (!r) r = mlock((void *)vvar.start, vvar_size);
+        } else if (op == 12) {
+            r = munmap((void *)vdso.start, 4096);
+        } else if (op == 13) {
+            /* From the page before [vdso]. */
+            r = munmap((void *)(vdso.start - 4096), 8192);
+        } else if (op == 14) {
+            r = mprotect((void *)vdso.start, 4096, PROT_READ);
+        } else if (op == 15) {
+            r = mprotect((void *)vdso.start, 4096, PROT_READ | PROT_EXEC);
+        } else if (op == 16) {
+            r = mremap((void *)vdso.start, vdso_size, 4096, 0) == MAP_FAILED ? -1 : 0;
+        } else if (op == 17) {
+            char *to = mmap(NULL, 8192, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            r = mremap((void *)vvar.start, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, to) == MAP_FAILED ? -1 : 0;
+        } else if (op == 18) {
+            r = mmap((void *)(vdso.start + 4096), 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) ==
+                        MAP_FAILED ? -1 : 0;
+        } else if (op == 19) {
+            r = syscall(462 /* mseal */, vdso.start, 4096, 0);
+        } else if (op == 20) {
+            r = madvise((void *)vdso.start, 4096, MADV_DONTDUMP);
+        } else if (op == 21) {
+            r = madvise((void *)vvar.start, 4096, MADV_DONTDUMP);
+        } else if (op == 22) {
+            r = madvise((void *)vdso.start, 4096, MADV_DONTNEED);
+        } else if (op == 23) {
+            r = mlock((void *)vdso.start, 4096);
+        } else if (op == 24) {
+            r = prctl(0x53564d41 /* PR_SET_VMA */, 0, vdso.start, 4096, "name");
+        } else if (op == 25) {
+            r = prctl(0x53564d41, 0, vdso.start, vdso_size, "name");
+            vdm_scan();
+            printf("  named still=%d\n", vdm_areas[2].start == vdso.start);
+        }
+        if (op >= 12 && r) {
+            int wrong = errno;
+            vdm_scan();
+            printf("  whole still=%d\n", vdm_areas[0].start == vvar.start && vdm_areas[2].start == vdso.start &&
+                                                 vdm_areas[2].end == vdso.end);
+            errno = wrong;
+        }
+        printf("%s r=%ld errno=%d\n", what, r, r < 0 ? errno : 0);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    if (!WIFEXITED(status)) printf("%s child status=%#x\n", what, status);
+}
+
+static int vdso_mappings_case(void) {
+    vdm_scan();
+    for (int i = 0; i < 3; i++)
+        printf("%s found=%d pages=%lu perms=%s rest=%s\n", vdm_names[i], vdm_areas[i].start != 0,
+               (vdm_areas[i].end - vdm_areas[i].start) / 4096, vdm_areas[i].perms, vdm_areas[i].rest);
+    printf("together=%d below-stack=%d next-is-stack=%d\n",
+           vdm_areas[0].end == vdm_areas[1].start && vdm_areas[1].end == vdm_areas[2].start,
+           vdm_areas[2].end <= vdm_stack_start, vdm_after_vdso == vdm_stack_start);
+    unsigned long auxv[2] = {0};
+    int fd = open("/proc/self/auxv", O_RDONLY);
+    if (fd >= 0) {
+        if (read(fd, auxv, sizeof auxv) != sizeof auxv) auxv[0] = 0;
+        close(fd);
+    }
+    printf("AT_SYSINFO_EHDR is [vdso]=%d first=%d\n", getauxval(AT_SYSINFO_EHDR) == vdm_areas[2].start,
+           auxv[0] == AT_SYSINFO_EHDR && auxv[1] == vdm_areas[2].start);
+    /* The VmFlags of each area. */
+    char smaps[65536];
+    if (proc_read("/proc/self/smaps", smaps, sizeof smaps) > 0)
+        for (int i = 0; i < 3; i++) {
+            char head[32];
+            snprintf(head, sizeof head, "%lx-", vdm_areas[i].start);
+            char *at = strstr(smaps, head);
+            char *flags = at ? strstr(at, "VmFlags:") : NULL;
+            if (flags) printf("%s %.*s\n", vdm_names[i], (int)strcspn(flags, "\n"), flags);
+        }
+    /* The functions, against the system calls. */
+    typedef long (*fn3)(long, long, long);
+    const char *const functions[] = {"__vdso_clock_gettime", "__vdso_gettimeofday", "__vdso_time", "__vdso_getcpu",
+                                     "__vdso_clock_getres", "clock_gettime", "time"};
+    for (size_t i = 0; i < sizeof functions / sizeof *functions; i++)
+        printf("symbol %s found=%d\n", functions[i], vdm_symbol(functions[i]) != NULL);
+    fn3 gettime = (fn3)vdm_symbol("__vdso_clock_gettime");
+    fn3 gettimeofday_fn = (fn3)vdm_symbol("__vdso_gettimeofday");
+    fn3 time_fn = (fn3)vdm_symbol("__vdso_time");
+    fn3 getcpu_fn = (fn3)vdm_symbol("__vdso_getcpu");
+    fn3 getres = (fn3)vdm_symbol("__vdso_clock_getres");
+    if (gettime && gettimeofday_fn && time_fn && getcpu_fn && getres) {
+        struct timespec a = {0}, b = {0};
+        long r1 = gettime(CLOCK_MONOTONIC, (long)&a, 0);
+        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &b);
+        struct timeval tv = {0};
+        long r2 = gettimeofday_fn((long)&tv, 0, 0);
+        long seconds = time_fn(0, 0, 0);
+        unsigned cpu = 99, node = 99, raw_cpu = 98, raw_node = 98;
+        long r3 = getcpu_fn((long)&cpu, (long)&node, 0);
+        syscall(SYS_getcpu, &raw_cpu, &raw_node, NULL);
+        struct timespec res = {0}, raw_res = {0};
+        long r4 = getres(CLOCK_REALTIME, (long)&res, 0);
+        syscall(SYS_clock_getres, CLOCK_REALTIME, &raw_res);
+        long einval = gettime(-1, (long)&a, 0);
+        printf("clock_gettime r=%ld within=%d gettimeofday r=%ld near=%d time near=%d\n", r1,
+               b.tv_sec - a.tv_sec >= 0 && b.tv_sec - a.tv_sec <= 1, r2, labs(tv.tv_sec - (long)time(NULL)) <= 1,
+               labs(seconds - (long)syscall(SYS_time, NULL)) <= 1);
+        printf("getcpu r=%ld same=%d clock_getres r=%ld same=%d bad clock=%ld\n", r3,
+               cpu == raw_cpu && node == raw_node, r4, res.tv_sec == raw_res.tv_sec && res.tv_nsec == raw_res.tv_nsec,
+               einval);
+    }
+    /* Reads. */
+    for (int page = 0; page < 4; page++) {
+        char what[32];
+        snprintf(what, sizeof what, "[vvar] page %d", page);
+        vdm_read(what, vdm_areas[0].start + (unsigned long)page * 4096);
+    }
+    vdm_read("[vvar_vclock] page 1", vdm_areas[1].start + 4096);
+    vdm_read("[vdso] page 0", vdm_areas[2].start);
+    /* What may be done to them. */
+    const char *const ops[] = {"mprotect [vdso] rwx", "mprotect [vvar] rw", "munmap [vdso]", "munmap [vvar]",
+                               "mremap [vdso] same size", "mremap [vdso] grow", "mremap [vvar] same size",
+                               "madvise DONTNEED [vvar]", "madvise DONTNEED [vdso]", "mlock [vvar]", "mlock [vdso]",
+                               "mlock [vvar] PROT_NONE", "munmap [vdso] part", "munmap across [vdso]'s start",
+                               "mprotect [vdso] part", "mprotect [vdso] part, same", "mremap [vdso] shrink",
+                               "mremap [vvar] part", "mmap over [vdso] part", "mseal [vdso] part",
+                               "madvise DONTDUMP [vdso] part", "madvise DONTDUMP [vvar] part",
+                               "madvise DONTNEED [vdso] part", "mlock [vdso] part", "name [vdso] part", "name [vdso]"};
+    for (int op = 0; op < 26; op++) vdm_in_child(ops[op], op);
+    /* From outside: no get_user_pages of [vvar] (VM_IO | VM_PFNMAP, and
+       special_mapping_vmops has no access), which /proc/<pid>/mem says as
+       EIO; a forced write to [vdso] (VM_MAYWRITE) copies its page. */
+    for (int i = 0; i < 3; i += 2) {
+        char byte;
+        struct iovec local = {&byte, 1}, remote = {(void *)vdm_areas[i].start, 1};
+        errno = 0;
+        long v = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        printf("%s process_vm_readv=%ld errno=%d\n", vdm_names[i], v, v < 0 ? errno : 0);
+    }
+    fflush(stdout);
+    pid_t writer = fork();
+    if (writer == 0) {
+        int mem = open("/proc/self/mem", O_RDWR);
+        printf("mem open=%d\n", mem >= 0);
+        for (int i = 0; i < 3; i += 2) {
+            /* e_ident's padding, in [vdso]. */
+            unsigned char byte = 0xee;
+            off_t at = (off_t)(vdm_areas[i].start + 15);
+            errno = 0;
+            long got = pread(mem, &byte, 1, at);
+            printf("%s mem read=%ld errno=%d\n", vdm_names[i], got, got < 0 ? errno : 0);
+            byte = 'x';
+            errno = 0;
+            long put = pwrite(mem, &byte, 1, at);
+            printf("%s mem write=%ld errno=%d\n", vdm_names[i], put, put < 0 ? errno : 0);
+        }
+        /* One that begins in [vvar_vclock] moves nothing. */
+        char two[2];
+        errno = 0;
+        long across = pread(mem, two, 2, (off_t)(vdm_areas[2].start - 1));
+        printf("mem read across=%ld errno=%d\n", across, across < 0 ? errno : 0);
+        printf("[vdso] byte now=%#x\n", *(volatile unsigned char *)(vdm_areas[2].start + 15));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(writer, NULL, 0);
+    printf("parent's byte=%#x\n", *(volatile unsigned char *)(vdm_areas[2].start + 15));
+    fflush(stdout);
+    pid_t traced = fork();
+    if (traced == 0) {
+        syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    waitpid(traced, NULL, 0);
+    for (int i = 0; i < 3; i += 2) {
+        long word = 0;
+        errno = 0;
+        long r = syscall(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, traced, vdm_areas[i].start, &word);
+        printf("%s PTRACE_PEEKDATA r=%ld errno=%d\n", vdm_names[i], r, r < 0 ? errno : 0);
+    }
+    kill(traced, SIGKILL);
+    waitpid(traced, NULL, 0);
+    /* Counting: statm's size is every line of maps but [vsyscall]. */
+    char maps[16384], statm[256];
+    unsigned long total = 0, gate = 0, size_pages = 0;
+    if (proc_read("/proc/self/maps", maps, sizeof maps) > 0)
+        for (char *line = maps; line && *line;) {
+            unsigned long start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                char *eol = strchr(line, '\n');
+                size_t length = eol ? (size_t)(eol - line) : strlen(line);
+                if (memmem(line, length, "[vsyscall]", 10)) gate += end - start;
+                else total += end - start;
+            }
+            line = strchr(line, '\n');
+            if (line) line++;
+        }
+    if (proc_read("/proc/self/statm", statm, sizeof statm) > 0) sscanf(statm, "%lu", &size_pages);
+    printf("statm counts the areas=%d\n", size_pages * 4096 == total);
+    (void)gate;
+    /* A fork keeps them. */
+    unsigned long vdso = vdm_areas[2].start;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        vdm_scan();
+        printf("child keeps [vdso]=%d\n", vdm_areas[2].start == vdso && getauxval(AT_SYSINFO_EHDR) == vdso);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, NULL, 0);
+    return 0;
+}
+
+/* The vsyscall-entries case: the gate area [vsyscall] (execute only, as
+   CONFIG_LEGACY_VSYSCALL_XONLY makes it) is the last line of maps and smaps,
+   and running one of its three entries is emulate_vsyscall's call: the
+   result in rax, no other register changed, at the caller. Anywhere else in
+   it, a stack that cannot be read or a pointer the call cannot write is
+   SIGSEGV from the kernel; a pointer past user space, or a read of the page,
+   SIGSEGV with its address. Seccomp sees the call with the entry's address,
+   and no system call's stop is made. */
+#define VSC_PAGE 0xffffffffff600000UL
+struct vsc_insn {
+    unsigned short code;
+    unsigned char jt, jf;
+    unsigned k;
+};
+static sigjmp_buf vsc_jump;
+static char vsc_stack[65536];
+
+static void vsc_on_signal(int signal, siginfo_t *info, void *context) {
+    greg_t *regs = ((ucontext_t *)context)->uc_mcontext.gregs;
+    unsigned long rip = (unsigned long)regs[REG_RIP];
+    if (signal == SIGSYS) {
+        printf("  SIGSYS code=%d at=%#lx call=%d rax=%lld left=%d\n", info->si_code,
+               (unsigned long)info->si_call_addr - VSC_PAGE, info->si_syscall, (long long)regs[REG_RAX],
+               rip < VSC_PAGE);
+        return;
+    }
+    printf("  SIGSEGV code=%d addr=%#lx", info->si_code, (unsigned long)info->si_addr);
+    if (info->si_code != 128)
+        printf(" trap=%lld err=%lld cr2=%#llx", (long long)regs[REG_TRAPNO], (long long)regs[REG_ERR],
+               (unsigned long long)regs[REG_CR2]);
+    if (rip >= VSC_PAGE) printf(" rip=%#lx rax=%lld", rip - VSC_PAGE, (long long)regs[REG_RAX]);
+    printf("\n");
+    siglongjmp(vsc_jump, 1);
+}
+
+static long vsc_call(unsigned long entry, unsigned long a, unsigned long b) {
+    return ((long (*)(unsigned long, unsigned long, unsigned long))(VSC_PAGE + entry))(a, b, 0x1234);
+}
+
+static void vsc_bad(const char *what, unsigned long entry, unsigned long a, unsigned long b) {
+    printf("%s\n", what);
+    if (!sigsetjmp(vsc_jump, 1)) printf("  r=%ld\n", vsc_call(entry, a, b));
+}
+
+/* What `op` does in a child, with a filter that gives `action` for `nr`. */
+static int vsc_filtered(const char *what, unsigned action, unsigned nr, unsigned long entry, unsigned long a) {
+    printf("%s\n", what);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        struct vsc_insn code[] = {{0x20, 0, 0, 0}, {0x15, 0, 3, nr}, {0x20, 0, 0, 8},
+                                  {0x15, 0, 1, (unsigned)(VSC_PAGE + entry)}, {0x06, 0, 0, action}, {0x06, 0, 0, 0x7fff0000}};
+        struct {
+            unsigned short len;
+            struct vsc_insn *filter;
+        } program = {sizeof code / sizeof *code, code};
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if (syscall(SYS_seccomp, 1, 0, &program)) _exit(91);
+        if (!sigsetjmp(vsc_jump, 1)) printf("  r=%ld\n", vsc_call(entry, a, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("  child exited=%d signal=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return 0;
+}
+
+/* The same filter's SECCOMP_RET_TRACE with a tracer: what the event shows,
+   and what a tracer's change (`op`) comes to. */
+static int vsc_traced(const char *what, int op) {
+    printf("%s\n", what);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        struct vsc_insn code[] = {{0x20, 0, 0, 0}, {0x15, 0, 1, SYS_time}, {0x06, 0, 0, 0x7ff00007}, {0x06, 0, 0, 0x7fff0000}};
+        struct {
+            unsigned short len;
+            struct vsc_insn *filter;
+        } program = {sizeof code / sizeof *code, code};
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if (syscall(SYS_seccomp, 1, 0, &program)) _exit(91);
+        syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
+        raise(SIGSTOP);
+        long r = vsc_call(0x400, 0, 0);
+        _exit(r == -38 ? 2 : r == 7777 ? 3 : r > 1000000 ? 4 : 5);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    syscall(SYS_ptrace, 0x4200 /* PTRACE_SETOPTIONS */, kid, 0, 0x80 /* TRACESECCOMP */);
+    syscall(SYS_ptrace, 7 /* PTRACE_CONT */, kid, 0, 0);
+    waitpid(kid, &status, 0);
+    if (WIFSTOPPED(status)) {
+        unsigned long regs[27] = {0}, message = 0;
+        syscall(SYS_ptrace, 12 /* PTRACE_GETREGS */, kid, 0, regs);
+        syscall(SYS_ptrace, 0x4201 /* PTRACE_GETEVENTMSG */, kid, 0, &message);
+        printf("  stop=%#x message=%lu orig_rax=%ld rax=%ld rip=%#lx\n", status >> 8, message, (long)regs[15],
+               (long)regs[10], regs[16] - VSC_PAGE);
+        if (op == 1) regs[15] = SYS_getcpu;
+        if (op == 2) regs[15] = (unsigned long)-1, regs[10] = 7777;
+        if (op == 3) regs[16] += 1;
+        if (op) syscall(SYS_ptrace, 13 /* PTRACE_SETREGS */, kid, 0, regs);
+        syscall(SYS_ptrace, 7, kid, 0, 0);
+        waitpid(kid, &status, 0);
+    }
+    if (WIFSTOPPED(status)) {
+        printf("  stopped again=%#x\n", status >> 8);
+        kill(kid, SIGKILL);
+        waitpid(kid, &status, 0);
+    }
+    printf("  exited=%d signal=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return 0;
+}
+
+static int vsyscall_entries_case(void) {
+    /* maps and smaps. */
+    static char text[1 << 18];
+    if (proc_read("/proc/self/maps", text, sizeof text) <= 0) return 1;
+    char *line = strstr(text, "ffffffffff600000");
+    printf("maps: %s", line ? line : "none\n");
+    if (proc_read("/proc/self/smaps", text, sizeof text) <= 0) return 1;
+    line = strstr(text, "ffffffffff600000");
+    for (char *at = line ? line : text + strlen(text); *at;) {
+        size_t length = strcspn(at, "\n");
+        /* The protection keys' line is the CPU's. */
+        if (strncmp(at, "ProtectionKey:", 14)) printf("smaps: %.*s\n", (int)length, at);
+        at += length + (at[length] == '\n');
+    }
+
+    /* The entries, on one CPU. */
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(sched_getcpu(), &one);
+    sched_setaffinity(0, sizeof one, &one);
+    struct timeval tv = {0}, now = {0};
+    struct timezone zone = {-1, -1};
+    long r = vsc_call(0, (unsigned long)&tv, (unsigned long)&zone);
+    syscall(SYS_gettimeofday, &now, NULL);
+    printf("gettimeofday r=%ld near=%d zone=%d,%d\n", r, now.tv_sec - tv.tv_sec >= 0 && now.tv_sec - tv.tv_sec <= 2,
+           zone.tz_minuteswest, zone.tz_dsttime);
+    printf("gettimeofday nulls r=%ld\n", vsc_call(0, 0, 0));
+    long seconds = 0;
+    r = vsc_call(0x400, (unsigned long)&seconds, 0);
+    printf("time r=stored %d near=%d\n", r == seconds, labs(r - (long)syscall(SYS_time, NULL)) <= 2);
+    unsigned cpu = 99, node = 99, raw_cpu = 98, raw_node = 98;
+    r = vsc_call(0x800, (unsigned long)&cpu, (unsigned long)&node);
+    syscall(SYS_getcpu, &raw_cpu, &raw_node, NULL);
+    printf("getcpu r=%ld same=%d\n", r, cpu == raw_cpu && node == raw_node);
+    /* Every other register keeps its value, rcx and r11 too. */
+    unsigned long rax = 0, rcx = 0x11, rdx = 0x22, r8, r9, r10, r11, rdi = 0, rsi = 0;
+    asm volatile("mov $0x44, %%r8\n mov $0x55, %%r9\n mov $0x66, %%r10\n mov $0x33, %%r11\n"
+                 "call *%%rax\n"
+                 "mov %%r8, %[r8]\n mov %%r9, %[r9]\n mov %%r10, %[r10]\n mov %%r11, %[r11]\n"
+                 : "=a"(rax), "+c"(rcx), "+d"(rdx), "+D"(rdi), "+S"(rsi), [r8] "=m"(r8), [r9] "=m"(r9), [r10] "=m"(r10),
+                   [r11] "=m"(r11)
+                 : "0"(VSC_PAGE + 0x800)
+                 : "r8", "r9", "r10", "r11", "cc", "memory");
+    printf("registers rax=%lu rcx=%#lx rdx=%#lx rdi=%lu rsi=%lu r8=%#lx r9=%#lx r10=%#lx r11=%#lx\n", rax, rcx, rdx, rdi,
+           rsi, r8, r9, r10, r11);
+
+    /* What is SIGSEGV. */
+    struct sigaction action = {.sa_sigaction = vsc_on_signal, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER};
+    stack_t alternate = {.ss_sp = vsc_stack, .ss_size = sizeof vsc_stack};
+    sigaltstack(&alternate, NULL);
+    sigaction(SIGSEGV, &action, NULL);
+    sigaction(SIGSYS, &action, NULL);
+    static const unsigned long nowhere[] = {1, 0x10, 0x401, 0x7ff, 0xc00, 0xfff};
+    for (size_t i = 0; i < sizeof nowhere / sizeof *nowhere; i++) {
+        char what[32];
+        snprintf(what, sizeof what, "entry +%#lx", nowhere[i]);
+        vsc_bad(what, nowhere[i], 0, 0);
+    }
+    static const long before[2] __attribute__((aligned(4096))) = {1, 2};
+    vsc_bad("time, unmapped", 0x400, 8, 0);
+    vsc_bad("time, read-only", 0x400, (unsigned long)before, 0);
+    vsc_bad("time, past user space", 0x400, -4096UL, 0);
+    vsc_bad("time, the page", 0x400, VSC_PAGE, 0);
+    vsc_bad("gettimeofday, unmapped zone", 0, 0, 8);
+    vsc_bad("gettimeofday, zone past user space", 0, 8, -4096UL);
+    vsc_bad("getcpu, past user space", 0x800, -8UL, 0);
+    printf("no stack\n");
+    if (!sigsetjmp(vsc_jump, 1))
+        asm volatile("mov $8, %%rsp\n jmp *%0\n" : : "a"(VSC_PAGE + 0x400), "D"(0L) : "memory");
+    printf("read\n");
+    if (!sigsetjmp(vsc_jump, 1)) printf("  r=%d\n", *(volatile char *)(VSC_PAGE + 0x400));
+    printf("write\n");
+    if (!sigsetjmp(vsc_jump, 1)) *(volatile char *)(VSC_PAGE + 0x400) = 1;
+
+    /* Seccomp. */
+    if (vsc_filtered("seccomp errno", 0x00050000 | 13, SYS_time, 0x400, 0) ||
+        vsc_filtered("seccomp errno, EFAULT", 0x00050000 | 14, SYS_time, 0x400, 0) ||
+        vsc_filtered("seccomp trap", 0x00030000 | 5, SYS_getcpu, 0x800, 0) ||
+        vsc_filtered("seccomp trace, no tracer", 0x7ff00000, SYS_time, 0x400, 0) ||
+        vsc_filtered("seccomp log", 0x7ffc0000, SYS_getcpu, 0x800, 0) ||
+        vsc_filtered("seccomp kill", 0x80000000, SYS_getcpu, 0x800, 0) ||
+        vsc_filtered("seccomp errno, past user space", 0x00050000 | 13, SYS_time, 0x400, -4096UL))
+        return 2;
+    printf("seccomp strict\n");
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        prctl(PR_SET_SECCOMP, 1);
+        vsc_call(0x400, 0, 0);
+        syscall(SYS_exit, 0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("  signal=%d\n", WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+
+    /* Tracers. */
+    if (vsc_traced("trace", 0) || vsc_traced("trace, another call", 1) || vsc_traced("trace, no call", 2) ||
+        vsc_traced("trace, moved", 3))
+        return 3;
+    printf("system call stops:");
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        syscall(SYS_ptrace, 0, 0, 0, 0);
+        raise(SIGSTOP);
+        syscall(SYS_getppid);
+        vsc_call(0x400, 0, 0);
+        vsc_call(0x800, 0, 0);
+        syscall(SYS_exit_group, 0);
+    }
+    waitpid(kid, &status, 0);
+    for (;;) {
+        syscall(SYS_ptrace, 24 /* PTRACE_SYSCALL */, kid, 0, 0);
+        waitpid(kid, &status, 0);
+        if (!WIFSTOPPED(status)) break;
+        unsigned long regs[27] = {0};
+        syscall(SYS_ptrace, 12, kid, 0, regs);
+        if (WSTOPSIG(status) == SIGTRAP && (regs[15] == SYS_getppid || regs[15] == SYS_exit_group || regs[15] == SYS_time || regs[15] == SYS_getcpu))
+            printf(" %ld", (long)regs[15]);
+    }
+    printf("\n");
+
+    /* From outside. */
+    char byte;
+    struct iovec local = {&byte, 1}, remote = {(void *)VSC_PAGE, 1};
+    r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    printf("process_vm_readv=%ld errno=%d\n", r, r < 0 ? errno : 0);
+    int mem = open("/proc/self/mem", O_RDWR);
+    off_t at = lseek(mem, (off_t)VSC_PAGE, SEEK_SET);
+    r = read(mem, &byte, 1);
+    printf("mem seek=%d read=%ld errno=%d\n", at == (off_t)VSC_PAGE, r, r < 0 ? errno : 0);
+    kid = fork();
+    if (kid == 0) {
+        syscall(SYS_ptrace, 0, 0, 0, 0);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    waitpid(kid, &status, 0);
+    long word = 0;
+    r = syscall(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, kid, VSC_PAGE, &word);
+    printf("PTRACE_PEEKDATA r=%ld errno=%d\n", r, r < 0 ? errno : 0);
+    kill(kid, SIGKILL);
+    waitpid(kid, &status, 0);
+    printf("fork: ");
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        printf("getcpu r=%ld\n", vsc_call(0x800, (unsigned long)&cpu, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, &status, 0);
     return 0;
 }
 
@@ -37383,6 +38736,12 @@ int main(int argc, char **argv) {
         printf("program: file=%d\n", name && start == text_start && pgoff == text_pgoff &&
                                           same_path(name, (const char *)getauxval(AT_EXECFN)));
         printf("xstate: as-cpu=%d\n", osxsave ? xstate == 1 && xstate_whole : !xstate);
+        /* The gate area, the last segment: whole, of zeros. */
+        uint64_t gate = le(32, 8) + 56 * (le(56, 2) - 1);
+        printf("gate: at=%#llx flags=%llu filesz=%llu memsz=%llu in-file=%d word=%llu\n",
+               (unsigned long long)le(gate + 16, 8), (unsigned long long)le(gate + 4, 4),
+               (unsigned long long)le(gate + 32, 8), (unsigned long long)le(gate + 40, 8),
+               le(gate + 8, 8) + le(gate + 32, 8) <= core_size, (unsigned long long)le(le(gate + 8, 8), 8));
 #undef CORE_HOLDS
         free(b);
         unlink("core");
@@ -39567,6 +40926,7 @@ int main(int argc, char **argv) {
         int failed = file_leases_case();
         return failed ? failed : lease_breaks_case();
     }
+    if (!strcmp(mode, "proc-locks")) return proc_locks_case();
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
@@ -39616,6 +40976,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
+    if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
@@ -39647,6 +41008,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-stop-exit-code")) return ptrace_stop_exit_code_case();
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
     if (!strcmp(mode, "smaps-rollup")) return smaps_rollup_case();
+    if (!strcmp(mode, "vdso-mappings")) return vdso_mappings_case();
+    if (!strcmp(mode, "vsyscall-entries")) return vsyscall_entries_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
     if (!strcmp(mode, "zombie-ns-links")) return zombie_ns_links_case();
     if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);
@@ -39681,8 +41044,15 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds")) return io_uring_ring_fds_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds-exec")) {
+        uring_show("exec-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        return 0;
+    }
     if (!strcmp(mode, "io-uring-pinned")) return io_uring_pinned_case();
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
+    if (!strcmp(mode, "io-uring-buffers2")) return io_uring_buffers2_case();
+    if (!strcmp(mode, "io-uring-held-buffer")) return io_uring_held_buffer_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;
@@ -40130,6 +41500,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "vma-names")) return vma_names_case();
     if (!strcmp(mode, "chroot-names")) return chroot_names_case();
     if (!strcmp(mode, "chroot-names-child")) return chroot_names_child();
+    if (!strcmp(mode, "vma-merges")) return vma_merges_case();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();

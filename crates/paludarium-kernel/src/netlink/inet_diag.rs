@@ -69,6 +69,8 @@ struct Request {
     destination_port: u16,
     source: [u8; 16],
     destination: [u8; 16],
+    /// The device (`idiag_if`) a segment or datagram looked up came in on.
+    device: u32,
     cookie: u64,
 }
 impl Request {
@@ -96,6 +98,7 @@ impl Request {
             destination_port: u16::from_be_bytes([payload[id + 2], payload[id + 3]]),
             source,
             destination,
+            device: word(id + 36),
             cookie: u64::from(word(id + 40)) | u64::from(word(id + 44)) << 32,
         }
     }
@@ -257,8 +260,9 @@ impl NetlinkSocket {
     /// `udp_diag_dump_one` look it up: TCP as a segment from the request's
     /// destination to its source would find it, a connection before a
     /// listener; UDP as a datagram from its source to its destination
-    /// would, the addresses swapped "for historical reasons". A cookie that
-    /// does not match is `ENOENT` for TCP and `ESTALE` for UDP.
+    /// would, the addresses swapped "for historical reasons"; in on the
+    /// request's device, so that a socket bound to another is not found. A
+    /// cookie that does not match is `ENOENT` for TCP and `ESTALE` for UDP.
     fn exact(&self, request: &Request) -> Result<Entry, Errno> {
         let udp = request.protocol == IPPROTO_UDP;
         let v6 = match request.family {
@@ -283,16 +287,23 @@ impl NetlinkSocket {
         };
         let mut entries = self.network.diag(self.now());
         let best = if udp {
-            best(&entries, |entry| udp_score(entry, v6, source, destination))
+            best(&entries, |entry| {
+                udp_score(entry, v6, source, destination, request.device)
+            })
         } else {
             best(&entries, |entry| {
                 (entry.table == Table::Connected
                     && covers(entry, v6)
+                    && takes(entry, request.device)
                     && plain(entry.local) == plain(source)
                     && entry.peer.map(plain) == Some(plain(destination)))
                 .then_some(16)
             })
-            .or_else(|| best(&entries, |entry| listener_score(entry, v6, source)))
+            .or_else(|| {
+                best(&entries, |entry| {
+                    listener_score(entry, v6, source, request.device)
+                })
+            })
         };
         let entry = entries.swap_remove(best.ok_or(ENOENT)?);
         // `sock_diag_check_cookie`.
@@ -319,7 +330,7 @@ impl NetlinkSocket {
         out.extend_from_slice(&entry.peer.map_or(0, |peer| peer.port()).to_be_bytes());
         out.extend_from_slice(&address_bytes(entry.local.ip(), entry.v6));
         out.extend_from_slice(&address_bytes(peer_ip(entry), entry.v6));
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&entry.device.to_le_bytes());
         out.extend_from_slice(&entry.cookie.to_le_bytes());
         // `jiffies_delta_to_msecs`, which takes a past time as 0.
         let expires = match (entry.timer.2, now) {
@@ -451,6 +462,11 @@ fn plain(address: SocketAddr) -> SocketAddr {
 fn covers(entry: &Entry, v6: bool) -> bool {
     plain(entry.local).is_ipv4() != v6
 }
+/// Whether `entry`'s socket takes what comes in on `device`
+/// (`inet_sk_bound_dev_eq`): its own, or any where it has none.
+fn takes(entry: &Entry, device: u32) -> bool {
+    entry.device == 0 || entry.device == device
+}
 /// The index of the entry `score` ranks highest, the first among equals.
 fn best(entries: &[Entry], score: impl Fn(&Entry) -> Option<u32>) -> Option<usize> {
     let mut found: Option<(u32, usize)> = None;
@@ -463,13 +479,16 @@ fn best(entries: &[Entry], score: impl Fn(&Entry) -> Option<u32>) -> Option<usiz
     }
     found.map(|(_, i)| i)
 }
-/// How a TCP listener ranks for a connection to `to`, as Linux's
-/// `compute_score` and its two passes do: bound to that address before
-/// bound to every one, and IPv4 before IPv6. An IPv6-only socket takes no
-/// IPv4.
-fn listener_score(entry: &Entry, v6: bool, to: SocketAddr) -> Option<u32> {
+/// How a TCP listener ranks for a connection to `to` in on `device`, as
+/// Linux's `compute_score` and its two passes do: bound to that address
+/// before bound to every one, then bound to the device, and IPv4 before
+/// IPv6, each as much. An IPv6-only socket takes no IPv4.
+fn listener_score(entry: &Entry, v6: bool, to: SocketAddr, device: u32) -> Option<u32> {
     let full = entry.full.as_ref()?;
     if entry.udp || entry.table != Table::Listening || entry.local.port() != to.port() {
+        return None;
+    }
+    if !takes(entry, device) {
         return None;
     }
     if !v6 && entry.v6 && full.v6_only {
@@ -486,14 +505,21 @@ fn listener_score(entry: &Entry, v6: bool, to: SocketAddr) -> Option<u32> {
     } else {
         return None;
     };
-    Some(u32::from(exact) * 4 + u32::from(!entry.v6) + 1)
+    Some(u32::from(exact) * 4 + u32::from(entry.device != 0) + u32::from(!entry.v6) + 1)
 }
-/// How a UDP socket ranks for a datagram from `from` to `to`, as Linux's
-/// UDP `compute_score`: IPv4 before IPv6, then bound to that address, and
-/// connected to `from`.
-fn udp_score(entry: &Entry, v6: bool, from: SocketAddr, to: SocketAddr) -> Option<u32> {
+/// How a UDP socket ranks for a datagram from `from` to `to` in on
+/// `device`, as Linux's UDP `compute_score` and its two passes do: bound to
+/// that address before bound to every one, then connected to `from`, then
+/// bound to the device, then IPv4 before IPv6.
+fn udp_score(
+    entry: &Entry,
+    v6: bool,
+    from: SocketAddr,
+    to: SocketAddr,
+    device: u32,
+) -> Option<u32> {
     let full = entry.full.as_ref()?;
-    if !entry.udp || entry.local.port() != to.port() {
+    if !entry.udp || entry.local.port() != to.port() || !takes(entry, device) {
         return None;
     }
     if (v6 && !entry.v6) || (!v6 && entry.v6 && full.v6_only) {
@@ -505,6 +531,9 @@ fn udp_score(entry: &Entry, v6: bool, from: SocketAddr, to: SocketAddr) -> Optio
         if bound != plain(to).ip() {
             return None;
         }
+        score += 16;
+    }
+    if entry.device != 0 {
         score += 4;
     }
     if let Some(peer) = entry.peer {
@@ -524,6 +553,7 @@ struct FilterEntry {
     destination: [u8; 16],
     source_port: u16,
     destination_port: u16,
+    device: u32,
     port_locked: bool,
     cgroup: u64,
 }
@@ -534,6 +564,7 @@ fn filter_entry(entry: &Entry) -> FilterEntry {
         destination: address_bytes(peer_ip(entry), entry.v6),
         source_port: entry.local.port(),
         destination_port: entry.peer.map_or(0, |peer| peer.port()),
+        device: entry.device,
         port_locked: entry.full.as_ref().is_some_and(|full| full.port_locked),
         cgroup: if entry.full.is_some() { ROOT_CGROUP } else { 0 },
     }
@@ -682,7 +713,8 @@ fn run(code: &[u8], entry: &FilterEntry) -> bool {
             BC_AUTO => !entry.port_locked,
             BC_S_COND | BC_D_COND => host_matches(code, at, kind == BC_S_COND, entry),
             BC_DEV_COND => {
-                u32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap_or_default()) == 0
+                u32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap_or_default())
+                    == entry.device
             }
             BC_MARK_COND => {
                 u32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap_or_default()) == 0
@@ -756,6 +788,7 @@ mod tests {
             destination: address_bytes(IpAddr::V4(Ipv4Addr::LOCALHOST), false),
             source_port,
             destination_port,
+            device: 0,
             port_locked: true,
             cgroup: ROOT_CGROUP,
         }
@@ -772,6 +805,20 @@ mod tests {
         assert!(run(&code, &entry(1500, 0)));
         assert!(!run(&code, &entry(999, 0)));
         assert!(!run(&code, &entry(2001, 0)));
+    }
+
+    #[test]
+    fn device_tests_compare_the_bound_device() {
+        let code = |device: u32| {
+            let mut code = op_bytes(BC_DEV_COND, 8, 12);
+            code.extend_from_slice(&device.to_le_bytes());
+            code
+        };
+        assert_eq!(audit(&code(3), false), Ok(()));
+        let mut bound = entry(1, 2);
+        assert!(run(&code(0), &bound) && !run(&code(3), &bound));
+        bound.device = 3;
+        assert!(run(&code(3), &bound) && !run(&code(0), &bound));
     }
 
     #[test]

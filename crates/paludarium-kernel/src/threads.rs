@@ -2295,6 +2295,7 @@ impl Kernel {
             notify.dn.release_table(table, &closed, &notify.fan);
         }
         crate::mqueue::exited(&closed, self.process.pid);
+        closed.iter().for_each(crate::sockets::closing);
         drop(closed);
         crate::aio::complete_ready(&self.processes.aio, &self.files.readiness);
         crate::io_uring::complete_ready(&self.processes.io_uring);

@@ -1539,7 +1539,8 @@ mod exec {
         assert_eq!(em.bottom_up(), Some(0x2aaa_aaaa_b000));
         let first = syscall(&mut k, &mut t, &em, 9, [0, 4096, 3, 0x22, u64::MAX, 0]);
         let second = syscall(&mut k, &mut t, &em, 9, [0, 4096, 3, 0x22, u64::MAX, 0]);
-        assert_eq!((first, second), (0x2aaa_aaaa_b000, 0x2aaa_aaaa_c000));
+        // The vDSO and its data took the first eight pages at exec.
+        assert_eq!((first, second), (0x2aaa_aaab_3000, 0x2aaa_aaab_4000));
         // The flag stays for the next exec; without it, top-down again.
         assert_eq!(
             syscall(&mut k, &mut t, &em, 135, [0, 0, 0, 0, 0, 0]),
@@ -3651,6 +3652,14 @@ mod core_dumps {
             .expect("the data mapping");
         assert_eq!(size, PAGE_SIZE as usize);
         assert_eq!(u64_at(&core, offset + 256), MAGIC);
+        // The gate area comes last, whole, of zeros.
+        let &(kind, offset, address, size) = segments.last().unwrap();
+        assert_eq!(
+            (kind, address, size),
+            (1, 0xffff_ffff_ff60_0000, PAGE_SIZE as usize)
+        );
+        assert_eq!(core.len(), offset + size);
+        assert!(core[offset..].iter().all(|&b| b == 0));
     }
     /// The child takes other IDs, stays dumpable and ends by SIGSEGV.
     fn end_as_user(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> u32 {
@@ -6944,6 +6953,7 @@ mod proc_other {
             auxv: [(0, 0); paludarium_loader::AUXV_ENTRIES],
             code: (0x40_1000, 0x40_2345),
             data: (0x40_3000, 0x40_3100),
+            vdso: 0,
             fails: false,
         }
     }

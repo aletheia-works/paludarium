@@ -498,6 +498,8 @@ pub(crate) struct Waiting {
     pub(crate) local: SocketAddr,
     pub(crate) peer: SocketAddr,
     pub(crate) v6: bool,
+    /// The device its socket was bound to (`tw_bound_dev_if`).
+    pub(crate) device: u32,
     pub(crate) cookie: u64,
     /// Its `tw_substate`: `TCP_FIN_WAIT2` until the other side's end has
     /// come, then `TCP_TIME_WAIT`; `TCP_FIN_WAIT1` while its bytes still go.
@@ -663,6 +665,7 @@ impl Ports {
                     local: binding.address,
                     peer: wait.peer,
                     v6: binding.v6,
+                    device: binding.device,
                     cookie: wait.cookie,
                     state,
                     until: wait.link.holds_until(wait.side, wait.closed),
@@ -831,6 +834,12 @@ impl Ports {
     pub(crate) fn listens(&mut self, to: SocketAddr, dif: u32) -> bool {
         self.live();
         self.best_listener(to, dif).is_some()
+    }
+    /// The device the listener a connection to `to` in on `dif` reaches is
+    /// bound to, 0 for none.
+    pub(crate) fn listener_device(&mut self, to: SocketAddr, dif: u32) -> u32 {
+        self.live();
+        self.best_listener(to, dif).map_or(0, |b| b.device)
     }
     /// The listener that ranks first for `to` in on `dif`, before its
     /// group.

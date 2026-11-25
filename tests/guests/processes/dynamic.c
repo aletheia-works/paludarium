@@ -25,7 +25,8 @@ extern void _start(void);
 extern char __executable_start;
 static __thread int local = 5;
 
-/* The program and libc; Linux also gives a vDSO, which the emulator has not. */
+/* The program, libc and what else the C library counts, as glibc counts the
+   vDSO. */
 static int objects;
 static int count_object(struct dl_phdr_info *info, size_t size, void *unused) {
     (void)size;

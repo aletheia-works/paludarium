@@ -228,7 +228,7 @@ pub(crate) struct Runner {
     /// Its concurrency ID, or [`NONE`] after another thread took its CPU.
     cid: AtomicU32,
     /// It runs guest code now.
-    running: AtomicBool,
+    pub(crate) running: AtomicBool,
     /// How many times it has left its CPU.
     stints: AtomicU64,
     /// How many times `membarrier` has asked it to abort its critical
@@ -273,7 +273,7 @@ impl Drop for Runner {
 
 /// A [`Kernel`]'s runner, and the CPU mask it last read for its thread.
 pub(crate) struct Seat {
-    runner: Arc<Runner>,
+    pub(crate) runner: Arc<Runner>,
     /// Shared, so that each entry takes it without copying it.
     mask: Option<Arc<[u64]>>,
     /// The [`crate::ThreadGroup::affinity_generation`] `mask` was read in.
@@ -319,42 +319,66 @@ impl Kernel {
                 handled: 0,
             });
         }
-        let Some(moved) = self.take_cpu(thread) else {
-            // The thread is to end, or the process: the checkpoint says so.
-            return self.checkpoint(thread, mem);
-        };
-        let Some(seat) = self.seat.as_mut() else {
-            return Next::Resume;
-        };
-        let runner = &seat.runner;
-        let requested = runner.requested.load(Ordering::SeqCst);
-        let restart = moved || requested != seat.handled;
-        seat.handled = requested;
+        loop {
+            let Some((on, moved)) = self.take_seat(thread) else {
+                // The thread is to end, or the process: the checkpoint says
+                // so.
+                return self.checkpoint(thread, mem);
+            };
+            let Some(seat) = self.seat.as_mut() else {
+                return Next::Resume;
+            };
+            let requested = seat.runner.requested.load(Ordering::SeqCst);
+            let restart = moved || requested != seat.handled;
+            seat.handled = requested;
+            if !restart && !std::mem::take(&mut thread.state.rseq_notify) {
+                return Next::Resume;
+            }
+            thread.state.rseq_notify = false;
+            let bring = |thread: &mut Thread| {
+                let mut rip = thread.cpu.rip.0;
+                let result = fixup(mem, &registration, &mut rip, restart)
+                    .and_then(|()| update(mem, &registration, on));
+                thread.cpu.rip = GuestAddr(rip);
+                result
+            };
+            // First with faults that cannot wait (`rseq_exit_user_update`
+            // has `pagefault_disable`), then, off the CPU, with those that
+            // can (`rseq_slowpath_update_usr`).
+            if paludarium_mmu::faults::unresolved(|| bring(thread)).is_ok() {
+                return Next::Resume;
+            }
+            self.leave_cpu();
+            let copies = self.resolve_copies(thread);
+            let result = bring(thread);
+            drop(copies);
+            if result.is_err() {
+                signals::queue(&mut thread.state, forced_sigsegv());
+                // A thread that stops (or ends) here runs no guest code, so
+                // it has no CPU while it waits.
+                return match self.checkpoint(thread, mem) {
+                    Next::Resume if self.take_seat(thread).is_none() => {
+                        self.checkpoint(thread, mem)
+                    }
+                    next => next,
+                };
+            }
+            // It may come back to another CPU, which the area then shows.
+            thread.state.rseq_notify = true;
+        }
+    }
+
+    /// [`Self::take_cpu`], with where the thread then is.
+    fn take_seat(&mut self, thread: &mut Thread) -> Option<(OnCpu, bool)> {
+        let moved = self.take_cpu(thread)?;
+        let runner = &self.seat.as_ref()?.runner;
         let on = OnCpu {
             cpu: runner.cpu.load(Ordering::SeqCst),
             cid: runner.cid.load(Ordering::SeqCst),
             runner: runner.id,
         };
         thread.state.on_cpu = Some(on);
-        if !restart && !std::mem::take(&mut thread.state.rseq_notify) {
-            return Next::Resume;
-        }
-        thread.state.rseq_notify = false;
-        let mut rip = thread.cpu.rip.0;
-        let result = fixup(mem, &registration, &mut rip, restart)
-            .and_then(|()| update(mem, &registration, on));
-        thread.cpu.rip = GuestAddr(rip);
-        if result.is_err() {
-            signals::queue(&mut thread.state, forced_sigsegv());
-            let next = self.checkpoint(thread, mem);
-            // A thread that stops (or ends) here runs no guest code, so it
-            // must not keep the CPU while it waits.
-            if next != Next::Resume {
-                self.leave_cpu();
-            }
-            return next;
-        }
-        Next::Resume
+        Some((on, moved))
     }
 
     /// Takes a CPU for the thread: its own when no other thread has run on

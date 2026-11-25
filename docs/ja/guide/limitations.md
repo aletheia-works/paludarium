@@ -462,7 +462,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
   `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、
-  `IORING_REGISTER_SYNC_CANCEL` だけです（ほかは `EINVAL`）。そのため、リングの記述子と
+  `IORING_REGISTER_SYNC_CANCEL`、`IORING_REGISTER_RING_FDS`、
+  `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。そのため、
   パーソナリティは登録できません。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
   カーネルである Linux 7.0 と同じく、スロットごとに `iovec` をタグより先に読み、
   `IORING_RSRC_UPDATE_EXTENDED` を断ります。Linux master はタグを先に読み、そのフラグの
@@ -473,8 +474,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Linux 7.0 は、ひとりで終わるスレッドのときと同じく、ファイルの準備ができてから取り消します。
   登録したバッファーのヒュージページは 4 KiB のページごとに RLIMIT_MEMLOCK を数えます
   （Linux は 1 回だけ数えます）。リングは共有でしかマップできません（`MAP_PRIVATE` は `EINVAL`）。
-  機能は Linux 6.12 のものなので、リングの記述子は登録できないのに
-  `IORING_FEAT_REG_REG_RING` を、待ちの `min_wait_usec` は何も変えないのに
+  機能は Linux 6.12 のものなので、待ちの `min_wait_usec` は何も変えないのに
   `IORING_FEAT_MIN_TIMEOUT` を報告します。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。
   読めないファイル（epoll のインスタンス、リング）は、Linux が先に準備を待つところで、すぐに

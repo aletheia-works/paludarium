@@ -4564,6 +4564,7 @@ impl Kernel {
             crate::mqueue::closed(&c, &descriptor);
             crate::dnotify::closed(&c, &descriptor);
             crate::inet::linger(&mut c, &descriptor.file);
+            crate::sockets::closing(&descriptor.file);
         }
     }
     /// Replaces the program; returns the descriptors it closed

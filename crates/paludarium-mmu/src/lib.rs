@@ -367,6 +367,9 @@ pub mod faults {
     /// tried again.
     pub trait Resolver: Send + Sync {
         fn resolve(&self, space: &super::MemoryView, addr: u64, write: bool, gup: bool) -> bool;
+        /// Grows the mapping of `space` above `addr` down to it, as Linux's
+        /// `expand_stack` does for the calling thread; whether it did.
+        fn grow(&self, space: &super::MemoryView, addr: u64) -> bool;
     }
 
     /// Resolves the calling host thread's kernel accesses that fault with
@@ -404,6 +407,13 @@ pub mod faults {
             return false;
         };
         resolver.resolve(&space(), fault.addr.0, fault.write, gup != Gup::No)
+    }
+
+    /// Grows a mapping of the space `space` views down to `addr`, as the
+    /// calling host thread's resolver can; whether it grew.
+    pub(crate) fn grow(space: &super::MemoryView, addr: u64) -> bool {
+        let resolver = RESOLVER.with(|r| r.borrow().clone());
+        KERNEL.with(Cell::get) && resolver.is_some_and(|resolver| resolver.grow(space, addr))
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
@@ -8271,57 +8281,75 @@ impl MemoryView {
     /// Copies the space's memory at `addr` into `buf` as `ptrace` reads it
     /// (Linux's `access_remote_vm` with `FOLL_FORCE`): page by page, any
     /// mapped page whatever its protection, up to the first that is not
-    /// mapped, is a guard, or that `get_user_pages` refuses (a `perf`
-    /// ring's, a `memfd_secret` file's: `access_remote_vm` then copies
-    /// nothing, as neither has `vm_ops->access`). How many bytes were
-    /// copied, or `None` once the space is gone.
+    /// mapped and that no mapping grows down to for the calling thread
+    /// (`expand_stack`), is a guard, or that `get_user_pages` refuses (a
+    /// `perf` ring's, a `memfd_secret` file's: `access_remote_vm` then
+    /// copies nothing, as neither has `vm_ops->access`). How many bytes
+    /// were copied, or `None` once the space is gone.
     #[must_use]
     pub fn read_forced(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
-        self.with_data(|data| {
-            let mut copied = 0;
-            for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
-                let at = GuestAddr(page + offset as u64);
-                if data.gup_refused(page)
-                    || data
-                        .read_with(at, &mut buf[range.clone()], Access::Dump)
-                        .is_err()
-                {
-                    break;
-                }
-                copied = range.end;
+        let mut copied = 0;
+        for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
+            let at = GuestAddr(page + offset as u64);
+            let read = self.forced(page, at, |data| {
+                data.read_with(at, &mut buf[range.clone()], Access::Dump)
+                    .is_ok()
+            })?;
+            if !read {
+                break;
             }
-            copied
-        })
+            copied = range.end;
+        }
+        Some(copied)
+    }
+    /// Runs `f`, a forced access to the page at `page` by its byte at `at`,
+    /// once the page is mapped, as `__access_remote_vm` expands a stack for
+    /// it; whether it succeeded, not so for a page `get_user_pages` refuses
+    /// or one not mapped. `None` once the space is gone.
+    fn forced(
+        &self,
+        page: u64,
+        at: GuestAddr,
+        mut f: impl FnMut(&mut AddressSpaceGuard<'_>) -> bool,
+    ) -> Option<bool> {
+        loop {
+            let done = self.with_guard(|data| {
+                data.mapping_at(page)?;
+                Some(!data.gup_refused(page) && f(data))
+            })?;
+            match done {
+                Some(done) => return Some(done),
+                None if faults::grow(self, at.0) => {}
+                None => return Some(false),
+            }
+        }
     }
     /// Copies `buf` into the space at `addr` as `ptrace` writes it (Linux's
     /// `access_remote_vm` with `FOLL_FORCE | FOLL_WRITE`): page by page, a
     /// private page whatever its protection, which gets a copy of its own,
     /// and a shared one only if it may be written. The store moves the code
     /// generation on as any store does, so a breakpoint written into code
-    /// is seen. A page `get_user_pages` refuses ends it, as in
-    /// [`Self::read_forced`]. How many bytes were copied, or `None` once
-    /// the space is gone.
+    /// is seen. What is not mapped, and a page `get_user_pages` refuses, is
+    /// as in [`Self::read_forced`]. How many bytes were copied, or `None`
+    /// once the space is gone.
     #[must_use]
     pub fn write_forced(&self, addr: u64, buf: &[u8]) -> Option<usize> {
-        let data = self.data.upgrade()?;
-        let serialization = lock_spinning(&self.serialization);
-        let mut guard = AddressSpaceGuard {
-            data: lock_spinning(&data),
-            _serialization: serialization,
-        };
         let mut copied = 0;
         for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
             let at = GuestAddr(page + offset as u64);
-            if guard.gup_refused(page) {
-                break;
-            }
-            match guard.write_with(at, &buf[range.clone()], Access::ForceWrite) {
-                Ok(first) => {
-                    if first {
-                        guard.mark_written(at, range.len() as u64);
+            let written = self.forced(page, at, |data| {
+                match data.write_with(at, &buf[range.clone()], Access::ForceWrite) {
+                    Ok(first) => {
+                        if first {
+                            data.mark_written(at, range.len() as u64);
+                        }
+                        true
                     }
+                    Err(_) => false,
                 }
-                Err(_) => break,
+            })?;
+            if !written {
+                break;
             }
             copied = range.end;
         }
@@ -8906,6 +8934,18 @@ impl AddressSpace {
         self.locked()
             .shared_at(addr.0)
             .map(|shared| (shared.pages.id, addr.0.wrapping_add(shared.shift)))
+    }
+    /// The page cache a private mapping of a file shows at `addr`, by the
+    /// id and the offset that [`Self::shared_offset`] gives for a shared
+    /// mapping of it; `None` for one that has its own copy of the file.
+    #[must_use]
+    pub fn cache_offset(&self, addr: GuestAddr) -> Option<(u64, u64)> {
+        let data = self.locked();
+        let backing = data.backing_at(addr.0)?;
+        Some((
+            backing.cache.as_ref()?.id,
+            addr.0.wrapping_add(backing.shift),
+        ))
     }
     /// The file the mapping at `addr` maps, for a core's `NT_FILE` note.
     pub fn mapped_file(&self, addr: GuestAddr) -> Option<MappedFile> {

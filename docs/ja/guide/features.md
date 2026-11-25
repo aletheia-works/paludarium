@@ -167,11 +167,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ソケットへの送信は、`splice_to_socket` と同じく、ほかのファイルと同様にそれ自身の
   `O_NONBLOCK` のとおりに読み書きします。
   バイトはコピーするので、`SPLICE_F_MOVE`、`SPLICE_F_GIFT`、`SPLICE_F_MORE` は何も
-  変えません。ここでのパイプは Linux のページのバッファーではなくバイトを持ち、大きさの
-  分だけバイトを受け取ります。Linux は 1 バイトのバッファーも容量の 1 ページと数えるので、
-  一部が埋まったパイプや、ページ単位でない `vmsplice` のバッファーでは、ここのほうが
-  多く受け取ることがあります。また、Linux のパイプのロックと違い、あるスレッドの呼び出しは、
-  別のスレッドによる同じパイプの読み込みに対して不可分ではありません。
+  変えません。呼び出しは、Linux のパイプのロックと同じく、同じパイプのほかの読み手や
+  書き手に対して不可分です。コピーが（`userfaultfd` やソケットの空きを）待つ間は、その
+  パイプの読み込み、書き込み、`FIONREAD`、`F_GETPIPE_SZ`、`F_SETPIPE_SZ`、片方の端の
+  クローズも、Linux の `mutex_lock` と同じく、どんなシグナルが来ても待ちます。poll は
+  待ちません。同じパイプを使わないとページを埋められないなら、Linux と同じく埋まることは
+  ありません。致命的なシグナルは、コピーの待ちを終わらせます。`read`、`readv`、`write`、`writev` と、その io_uring と
+  aio の要求も、パイプを押さえたまま、パイプのバッファーを 1 つずつコピーします
+  （`anon_pipe_read`、`anon_pipe_write`）。read や `vmsplice` がすべてはコピーできない
+  バッファーはパイプに残り、write がコピーできないバッファーは、それまでの分で write を
+  終わらせます。read のバッファーは、そこにあるバイトの分だけ書ければ足ります。
   パイプの代わりであるホストの標準のストリームは、`splice` のどちらの端にもなれます
   （オフセットを渡すと `ESPIPE`）。`tee` と `vmsplice` はゲスト自身のパイプだけを受け付け、
   標準のストリームは受け付けません。
@@ -404,7 +409,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どのプロセスの待ち手にも、どこにマップしていても届きます。それ以外のワードと private の操作は、
   このプロセスのアドレス空間とアドレスを指すので、private の wake はほかのプロセスに届きません。
   プロセス間で共有する mutex とセマフォ（Python の `multiprocessing`）も、持ち主が終わった
-  robust futex の wake も、こうして動きます。wake は、0 以下の数を頼まれても待ち手を 1 つ起こします
+  robust futex の wake も、こうして動きます。読み込み専用の無名ページへの shared の操作は
+  `EFAULT` で、読み込み専用のプライベートなマッピングにあるファイルのページでは、共有マッピングの
+  ものと同じくそのファイルを指します。wake は、0 以下の数を頼まれても待ち手を 1 つ起こします
   （Linux は比べる前に数えるからです）。private の wake はワードのページを見ません。Linux の
   ナノ秒に収まらない長さのタイムアウトは `KTIME_MAX` まで待ちます。requeue は、`val` 個の待ち手を
   起こし、さらに最大 `val2` 個（Linux と同じくタイムアウトの引数から読みます）を `uaddr2` の
@@ -1047,7 +1054,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`fault_signal_pending`）、致命的でないシグナルでは待ち終わらず、ページが埋まると
   コピーが進みます。コンテキストの解放でも進みます。SIGKILL とプロセスの終了は待ちを `EFAULT` で
   終わらせ、`UFFD_USER_MODE_ONLY` と `UFFD_FEATURE_SIGBUS` はすぐに `EFAULT` です。futex の
-  ワードの読み出しは、futex のキューを空けて待ちます。`get_user_pages` も、アドレス空間の
+  ワードの読み出しは、futex のキューを空けて待ちます。プログラムに戻る途中でカーネルが書く
+  シグナルのフレームと `rseq` の領域も待ち、`rseq` の領域はスレッドを CPU から降ろして
+  待ちます。終了するスレッドの `clear_child_tid` のワードと robust リストは待ちません
+  （`PF_EXITING`）。`get_user_pages` も、アドレス空間の
   ロックを手放せるところでは待ちます。`process_vm_readv` と `process_vm_writev`（相手のタスクの
   メモリで待ち、バッファーのページをすべて先にフォールトさせてからコピーします）、
   `MADV_POPULATE_READ`、`MADV_POPULATE_WRITE`、`mlock` などのロックしたページの用意、共有の
@@ -1513,8 +1523,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プライベートな匿名メモリで、`VmFlags` は `gd` を示します）は、Linux の
   `expand_downwards` と同じように伸びます。その下のマップされていないページへの
   アクセスや、そこへのシグナルフレームの書き込み、システムコール自身のそこへのコピー
-  （`do_user_addr_fault` はカーネルのアクセスも同じに扱います）で、そのページまで下に
-  伸び、アクセスはやり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
+  （`do_user_addr_fault` はカーネルのアクセスも同じに扱います）、`ptrace` や
+  `/proc/<pid>/mem` のそこへのアクセス（`__access_remote_vm`。アクセスする側の上限の
+  中で）で、そのページまで下に伸び、アクセスはやり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
   上の 256 ページの guard gap（`stack_guard_gap`）の中、VMA 全体で `RLIMIT_STACK` を
   超えるところ、ロックされていれば `CAP_IPC_LOCK` なしで `RLIMIT_MEMLOCK` を超える
   ところへは伸びず、そのアクセスは `SIGSEGV` になります。その下の gap には、ヒントでも、
@@ -1723,6 +1734,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   タグを投稿しません。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。
+
+- `IORING_REGISTER_RING_FDS` は、Linux の `io_ringfd_register` と同じく、呼んだスレッドの
+  ためにリングの記述子を登録します。1 から 16 個の `struct io_uring_rsrc_update`（`EINVAL`）は、
+  それぞれ予約した欄が 0 で（`EINVAL`）、リングの記述子（`EBADF`、`EOPNOTSUPP`）と 16 個の
+  スロットの 1 つ、`-1` なら最初の空き（越えれば `EINVAL`、空きがなければ `EBUSY`）を指し、
+  そのスロットを書き戻します。登録した数を返します。`IORING_ENTER_REGISTERED_RING` の
+  `io_uring_enter` と `IORING_REGISTER_USE_REGISTERED_RING` の `io_uring_register` は、
+  そのあとスロットでリングを指します。空のスロットは `EBADF`、表を越えるスロットと、io_uring の
+  文脈がないスレッドからのものは `EINVAL` です。スレッドは、リングを作るか、投入するか、記述子を
+  登録すると文脈を持ちます。新しいスレッドと fork した子は持ちません。
+  `IORING_UNREGISTER_RING_FDS` はスロットを空にし（予約した欄、データ、表を越えるスロットは
+  `EINVAL`）、`execve` とスレッドの終わりはすべてを空にし（`io_uring_unreg_ringfd`）、
+  文脈もなくします。
 
 - `IORING_REGISTER_FILES` は、差分テストのカーネルである Linux 7.0 の
   `io_sqe_files_register` と同じくリングのファイルを登録します（更新と割り当て範囲も 7.0 の
@@ -3021,13 +3045,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`EINVAL`。`CAP_NET_ADMIN` のないマークの条件は `EPERM`）。ダンプでなければ、
     アドレスとポートが指す 1 つのソケットに、Linux と同じ引き方で答えます。TCP では接続、
     なければリスナーで、ないものと cookie が合わないものは `ENOENT` です。UDP では送り元
-    から宛先へのデータグラムが届くソケットで、cookie が合わなければ `ESTALE` です。古い
+    から宛先へのデータグラムが届くソケットで、cookie が合わなければ `ESTALE` です。どちらも、
+    求められたデバイス（`idiag_if`）から入ってくるものとして引くので、別のデバイスに
+    結び付いたソケットは見つかりません。古い
     `TCPDIAG_GETSOCK` は、両方のファミリーの TCP に同じことをします。`SOCK_DESTROY` は、
     `CONFIG_INET_DIAG_DESTROY` なしで作ったカーネルと同じく `EOPNOTSUPP` です。短すぎる
     リクエストは `EINVAL` です。
   - **TCP と UDP について伝えること:** ソケットごとに、状態（ハンドシェイクがリスナーの
     空きを待つあいだは `TCP_SYN_SENT`、そのあとは接続の端の状態、または `TCP_LISTEN`）、
-    アドレスとポート（IPv6 のソケットでは IPv4 のものを対応させた形）、cookie、タイマー
+    アドレスとポート（IPv6 のソケットでは IPv4 のものを対応させた形）、結び付いたデバイス、
+    cookie、タイマー
     （ハンドシェイクの再送、キープアライブ、`TIME_WAIT` のもの）、キュー（リスナーなら
     待つ接続とバックログ）、netlink ソケットを作った側のユーザー名前空間での所有者、
     inode（まだ accept されていない接続は 0）を伝えます。そのあと `inet_sk_diag_fill` の
@@ -3038,7 +3065,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     バッファー、UDP のソケットのフィルターかいっぱいのバッファーが落としたデータグラムの数、
     リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの
     `tcp_info`（`ss -i` が見せる `INET_DIAG_INFO`）と輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
-    については、アドレス、状態、タイマーだけを伝えます。
+    については、アドレス、デバイス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
     グループは 32 です。誰でも入れますが、何も届きません。
 

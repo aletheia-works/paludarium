@@ -24,6 +24,7 @@
 #include <sys/shm.h>
 #include <sys/sendfile.h>
 #include <sys/resource.h>
+#include <sys/ptrace.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
@@ -5430,6 +5431,36 @@ static int futex_shared_cases(void) {
     volatile unsigned *second = (volatile unsigned *)(file + 4096 + 8);
     futex_shared_show("file-other-mapping", second, second, fd);
 
+    /* A read-only anonymous page is no shared word's (EFAULT), written or
+       not, and a read-only private mapping's page of a file is the file's. */
+    char *own = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (own == MAP_FAILED) return 87;
+    own[0] = 1;
+    mprotect(own, 2 * 4096, PROT_READ);
+    for (int i = 0; i < 2; i++) {
+        volatile unsigned *at = (volatile unsigned *)(own + i * 4096);
+        long waited = futex_call(at, 0, 7);
+        int wait_errno = errno;
+        long woken = futex_call(at, 1, 1);
+        int wake_errno = errno;
+        long alone = futex_call(at, 128, 7);
+        printf("read-only anonymous %d: wait %ld errno %d wake %ld errno %d private %ld errno %d\n", i, waited,
+               wait_errno, woken, wake_errno, alone, errno);
+    }
+    munmap(own, 2 * 4096);
+    *second = 0;
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        char *page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 4096);
+        _exit(page == MAP_FAILED ? 2 : futex_call((volatile unsigned *)(page + 8), 0, 0) == 0 ? 0 : 1);
+    }
+    long read_woke;
+    while ((read_woke = futex_call(second, 1, 1)) == 0) sched_yield();
+    int read_status;
+    waitpid(reader, &read_status, 0);
+    printf("read-only private file: wake=%ld child status=%d\n", read_woke, read_status);
+
     /* A process-shared robust mutex whose owner ends while the parent waits:
        the end's wake reaches the parent, which gets EOWNERDEAD. */
     pthread_mutex_t *mutex = (pthread_mutex_t *)(anonymous + 64);
@@ -10810,6 +10841,109 @@ static int io_uring_exit_case(const char *self) {
     return 0;
 }
 
+/* IORING_REGISTER_RING_FDS: a thread registers ring descriptors, which
+   io_uring_enter and io_uring_register then find by index
+   (IORING_ENTER_REGISTERED_RING, IORING_REGISTER_USE_REGISTERED_RING). The
+   table is the thread's: a new thread and a forked child have no io_uring
+   context, nor has a thread after execve (EINVAL). */
+struct urf_update {
+    unsigned offset, resv;
+    unsigned long data;
+};
+
+static long urf_register(struct uring *u, unsigned op, struct urf_update *up, unsigned n) {
+    return syscall(427, u->fd, op, up, n);
+}
+
+static void *urf_thread(void *arg) {
+    int *fds = arg;
+    uring_show("thread-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    /* A submission it may not make gives it none; one of nothing does. */
+    uring_show("thread-single-issuer", uring_enter(fds[0], 1, 0, 0, NULL, 0));
+    uring_show("thread-still-none", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-waits-none", uring_enter(fds[1], 0, 0, 1, NULL, 0));
+    uring_show("thread-none-yet", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-submits-nothing", uring_enter(fds[1], 1, 0, 0, NULL, 0));
+    uring_show("thread-has-one", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    return NULL;
+}
+
+static int io_uring_ring_fds_case(const char *self) {
+    uring_show("no-context", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    uring_show("empty-slot", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("past-table", uring_enter(16, 0, 0, 1 << 4, NULL, 0));
+    struct urf_update up[2];
+    memset(up, 0, sizeof up);
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register-none", urf_register(&u, 20, up, 0));
+    uring_show("register-many", urf_register(&u, 20, up, 17));
+    up[0].resv = 1;
+    uring_show("register-resv", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){16, 0, (unsigned long)u.fd};
+    uring_show("register-past", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 999};
+    uring_show("register-badf", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 1};
+    uring_show("register-not-ring", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register", urf_register(&u, 20, up, 1));
+    printf("offset: %u\n", up[0].offset);
+    up[0] = (struct urf_update){3, 0, (unsigned long)u.fd};
+    up[1] = (struct urf_update){0, 0, (unsigned long)u.fd};
+    uring_show("register-busy-second", urf_register(&u, 20, up, 2));
+    tw_nop(&u, 5, 0, 0, 0);
+    uring_show("enter-registered", uring_enter(3, 1, 1, 1 << 4 | 1, NULL, 0));
+    uring_reap(&u, "enter-registered");
+    unsigned char probe[16 + 8];
+    memset(probe, 0, sizeof probe);
+    uring_show("register-registered", syscall(427, 0, 8 | (1U << 31), probe, 1));
+
+    /* A new thread and a forked child have no io_uring context. */
+    pthread_t t;
+    struct uring single;
+    if (uring_open_flags(&single, 8, 1 << 12)) return 81;
+    int rings[2] = {single.fd, u.fd};
+    pthread_create(&t, NULL, urf_thread, rings);
+    pthread_join(t, NULL);
+    close(single.fd);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        uring_show("child-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+
+    /* execve takes the context away. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        struct uring mine;
+        if (uring_open(&mine, 8)) _exit(1);
+        struct urf_update one = {0xffffffff, 0, (unsigned long)mine.fd};
+        if (urf_register(&mine, 20, &one, 1) != 1) _exit(2);
+        char *args[] = {"process", "io-uring-ring-fds-exec", (char *)self, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(3);
+    }
+    waitpid(child, &status, 0);
+    printf("exec-child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    up[0] = (struct urf_update){0, 0, 1};
+    uring_show("unregister-data", urf_register(&u, 21, up, 1));
+    up[0] = (struct urf_update){0, 0, 0};
+    up[1] = (struct urf_update){3, 0, 0};
+    uring_show("unregister", urf_register(&u, 21, up, 2));
+    uring_show("after-unregister", uring_enter(3, 0, 0, 1 << 4, NULL, 0));
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's registered buffers keep the pages they had when they were
    registered (io_pin_pages, FOLL_LONGTERM): a fixed transfer moves them
    after munmap, a new mapping at the address sees none of it, and a page
@@ -12865,6 +12999,43 @@ static int grows_down_case(void) {
            got == 5 ? low + 8 : "-----");
     close(pipes[0]);
     close(pipes[1]);
+    /* So do /proc/<pid>/mem and ptrace (__access_remote_vm's expand_stack),
+     * within the limit. */
+    int mem = open("/proc/self/mem", O_RDWR);
+    low -= page;
+    char byte[8] = "zz";
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low + 8);
+    printf("mem-read-below: %ld grown-to-it=%d bytes %d %d\n", got, grows_start(g) == (uintptr_t)low, byte[0],
+           byte[1]);
+    low -= 2 * page;
+    got = pwrite(mem, "mem", 3, (off_t)(uintptr_t)low + 8);
+    printf("mem-write-below: %ld grown-to-it=%d\n", got, grows_start(g) == (uintptr_t)low);
+    struct rlimit mem_limit, mem_small;
+    getrlimit(RLIMIT_STACK, &mem_limit);
+    mem_small = mem_limit;
+    mem_small.rlim_cur = (rlim_t)(g + 2 * page - low);
+    setrlimit(RLIMIT_STACK, &mem_small);
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low - 8);
+    printf("mem-past-limit: %ld errno=%d\n", got, got < 0 ? errno : 0);
+    setrlimit(RLIMIT_STACK, &mem_limit);
+    close(mem);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        raise(SIGSTOP);
+        _exit(grows_start(g) == (uintptr_t)low - 3 * 4096 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, child, low - page, NULL);
+    printf("peek-below: %ld errno=%d\n", word, errno);
+    long poked = ptrace(PTRACE_POKEDATA, child, low - 3 * page, (void *)1L);
+    printf("poke-below: %ld\n", poked);
+    ptrace(PTRACE_CONT, child, NULL, NULL);
+    waitpid(child, &status, 0);
+    printf("child-grown: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     /* PROT_GROWSDOWN reaches down to the start of the VMA. */
     printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
     grows_touch("read-only", g, g - page, 1);
@@ -39736,6 +39907,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds")) return io_uring_ring_fds_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds-exec")) {
+        uring_show("exec-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        return 0;
+    }
     if (!strcmp(mode, "io-uring-pinned")) return io_uring_pinned_case();
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-buffers2")) return io_uring_buffers2_case();

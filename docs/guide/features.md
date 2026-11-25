@@ -193,12 +193,19 @@ kernel.
   read does not wait with `SPLICE_F_NONBLOCK` either, while a socket's send,
   as `splice_to_socket` makes it, and other files read and write as their
   own `O_NONBLOCK` says. `SPLICE_F_MOVE`, `SPLICE_F_GIFT` and `SPLICE_F_MORE` change
-  nothing, as the bytes are copied. A pipe here holds bytes, not Linux's
-  page buffers: it takes as many bytes as its size, where Linux counts a
-  buffer, even of one byte, as a whole page of the capacity (a partly full
-  pipe, or the buffers of `vmsplice` that are not whole pages, may take
-  more here than on Linux). One thread's call is not atomic against
-  another's read of the same pipe, as Linux's pipe lock makes it.
+  nothing, as the bytes are copied. A call is atomic against the other
+  readers and writers of its pipe, as Linux's pipe lock makes it: while its
+  copy waits (for a `userfaultfd`, or the room of a socket), a read of the
+  pipe, a write to it, its `FIONREAD`, `F_GETPIPE_SZ` and `F_SETPIPE_SZ`,
+  and the close of one of its ends, wait for it too, whatever signal comes,
+  as Linux's `mutex_lock` does; a poll does not. A fill of the page that
+  needs the same pipe never comes, as on Linux; a fatal signal ends the
+  copy's wait. `read`, `readv`, `write`, `writev` and their io_uring and
+  aio requests copy with the pipe held too (`anon_pipe_read`,
+  `anon_pipe_write`), a pipe's buffer at a time: one that a read or a
+  `vmsplice` cannot copy whole stays in the pipe, and one a write cannot
+  copy ends it with those before. Only the bytes there need their part of a
+  read's buffer.
   The host's standard streams, which stand for pipes, can be either end of
   a `splice` (an offset for one is `ESPIPE`), but not of `tee` or
   `vmsplice`, which take only the guest's own pipes.
@@ -457,7 +464,9 @@ kernel.
   process's address space and the address, so a private wake never reaches
   another process. Process-shared mutexes and semaphores (Python's
   `multiprocessing`) work this way, as does the wake of a robust futex whose
-  owner ends. A wake wakes one waiter even when asked for 0 or fewer, as
+  owner ends. A shared operation on a read-only anonymous page is `EFAULT`,
+  and on a read-only private mapping's page of a file it names the file, as
+  a shared mapping's does. A wake wakes one waiter even when asked for 0 or fewer, as
   Linux counts before it compares, and a private one does not look at the
   word's page. A timeout too long for Linux's nanoseconds waits until
   `KTIME_MAX`. A requeue wakes `val` waiters and moves up to `val2` more (the
@@ -1171,7 +1180,10 @@ kernel.
   is filled or the context released; a SIGKILL or the process's exit ends
   the wait with `EFAULT`, as does `UFFD_USER_MODE_ONLY` or
   `UFFD_FEATURE_SIGBUS` at once. A futex word's read waits with the futex
-  queues free. `get_user_pages` waits too where it may drop the space's
+  queues free. The frame of a signal and an `rseq` area, which the kernel
+  writes on the way back to the program, are waited for too, an `rseq` area
+  with the thread off its CPU; `clear_child_tid`'s word and the robust list
+  of an exiting thread are not (`PF_EXITING`). `get_user_pages` waits too where it may drop the space's
   lock: for `process_vm_readv` and `process_vm_writev`, in the other task's
   memory and with a buffer's pages faulted in before any is copied, for
   `MADV_POPULATE_READ`, `MADV_POPULATE_WRITE`, `mlock` and what else brings
@@ -1711,8 +1723,10 @@ kernel.
 - A mapping that grows down, the main stack or private anonymous memory that
   `mmap` made with `MAP_GROWSDOWN` (`VmFlags` shows `gd`), grows as Linux's
   `expand_downwards` makes it: an access to an unmapped page below it, a
-  signal frame written there, or a system call's own copy there (as
-  `do_user_addr_fault` serves a kernel access), extends it down to that
+  signal frame written there, a system call's own copy there (as
+  `do_user_addr_fault` serves a kernel access), or an access of `ptrace` or
+  `/proc/<pid>/mem` there (`__access_remote_vm`, within the limits of the
+  one who makes it), extends it down to that
   page, and the access is made again. It does not grow below `mmap_min_addr` (64 KiB), within the
   guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
   grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,
@@ -1967,6 +1981,22 @@ kernel.
   posts no tag. `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
+
+- `IORING_REGISTER_RING_FDS` registers ring descriptors for the calling
+  thread, as Linux's `io_ringfd_register` does: 1 to 16 `struct
+  io_uring_rsrc_update`s (`EINVAL`), each with no reserved field
+  (`EINVAL`), naming a ring's descriptor (`EBADF`, `EOPNOTSUPP`) and a slot
+  of 16, or the first free one for `-1` (`EINVAL` past them, `EBUSY` for
+  none free), which is written back. It gives how many it registered.
+  `io_uring_enter` with `IORING_ENTER_REGISTERED_RING`, and
+  `io_uring_register` with `IORING_REGISTER_USE_REGISTERED_RING`, then name
+  the ring by its slot: an empty one is `EBADF`, and one past the table, or
+  any from a thread with no io_uring context, `EINVAL`. A thread has one
+  once it made a ring, submitted to one or registered a descriptor; a new
+  thread and a forked child have none. `IORING_UNREGISTER_RING_FDS` empties
+  slots (`EINVAL` for a reserved field, data or a slot past the table), and
+  `execve` and the thread's exit empty them all (`io_uring_unreg_ringfd`),
+  and take its context away.
 
 - `IORING_REGISTER_FILES` registers a ring's files as Linux 7.0's
   `io_sqe_files_register` does, the kernel the differential tests run on
@@ -3511,14 +3541,16 @@ kernel.
     ports, as Linux looks it up: for TCP the connection, else the
     listener, `ENOENT` for none or for a cookie that does not match; for
     UDP the socket a datagram from the source to the destination reaches,
-    `ESTALE` for a cookie that does not match. The old `TCPDIAG_GETSOCK`
+    `ESTALE` for a cookie that does not match; each as what comes in on
+    the device asked for (`idiag_if`) finds it, so never a socket bound to
+    another. The old `TCPDIAG_GETSOCK`
     does the same for TCP of both families, and `SOCK_DESTROY` is
     `EOPNOTSUPP`, as in a kernel built without
     `CONFIG_INET_DIAG_DESTROY`. A request too short is `EINVAL`.
   - **What it tells of TCP and UDP:** each socket's state (`TCP_SYN_SENT`
     while a handshake waits for room in its listener, then that of the
     connection's end, or `TCP_LISTEN`), its addresses and ports (IPv4 ones
-    mapped on an IPv6 socket), its cookie, its timer (a handshake's
+    mapped on an IPv6 socket), the device it is bound to, its cookie, its timer (a handshake's
     retransmission, keepalive, or `TIME_WAIT`'s), its queues (a listener's
     waiting connections and backlog), its owner as the user namespace of
     whoever made the netlink socket shows it, and its inode (0 for a
@@ -3532,7 +3564,7 @@ kernel.
     listener's handshakes that a full queue dropped), a TCP socket's
     `tcp_info` (`INET_DIAG_INFO`, which `ss -i` shows), and its
     congestion control (`cubic`). A hold in `TIME_WAIT` tells
-    its addresses, state and timer alone.
+    its addresses, device, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
     `sock_diag` 32, which anyone may join, and which hear nothing.
 

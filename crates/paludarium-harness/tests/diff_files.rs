@@ -5,8 +5,14 @@ mod support;
 use paludarium_harness::{compare, run_emulated, run_native, workspace_root};
 /// Builds the files guests into `out` once for the whole test binary. A
 /// second build while another test runs a guest would rewrite a running
-/// program (`ETXTBSY`, "Text file busy"), so every test goes through this.
+/// program (`ETXTBSY`, "Text file busy"), or leave it missing or not yet
+/// executable for another, so every test goes through this. A child that
+/// [`support::bounded`] starts has none of its own: its parent built them, and
+/// other cases run them beside it.
 fn build(out: &std::path::Path) {
+    if std::env::var_os("PALUDARIUM_FILES_CHILD").is_some() {
+        return;
+    }
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     BUILT.get_or_init(|| {
         assert!(
@@ -29,9 +35,7 @@ fn case(name_arg: &'static str, id: usize) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let out = workspace_root().join("target/guests/files");
     let name = name_arg;
-    if std::env::var("PALUDARIUM_FILES_CHILD").is_err() {
-        build(&out);
-    }
+    build(&out);
     support::bounded(name, || {
         let name = format!("files-{id}");
         let path = out.join(&name);

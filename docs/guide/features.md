@@ -1836,7 +1836,10 @@ kernel.
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
   `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
   `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, the polls `IORING_OP_POLL_ADD` and
-  `_POLL_REMOVE`, and the socket requests
+  `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
+  `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
+  socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
   `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
@@ -2014,6 +2017,19 @@ kernel.
   `IORING_TIMEOUT_IMMEDIATE_ARG`. A cancellation finds the timeouts after
   the requests that wait for their files, but none by a file, and no linked
   one. `execve` and a whole process's exit cancel the thread's.
+
+- The file requests run as the calls they stand for, as Linux's do. Their
+  entries are checked as Linux checks them (`EINVAL`, `EBADF` for
+  `IOSQE_FIXED_FILE` on one that names a path), and their names, and
+  `struct open_how`, are read as the entry is taken (`EFAULT`,
+  `ENAMETOOLONG`, `ENOENT` for an empty one), so what a request before it in
+  its link writes there does not change them. An open that would not create
+  or cut a file does not wait, as Linux's first try (`O_NONBLOCK`) does
+  not: a FIFO opens to be read at once. An open can go in a registered slot
+  (`file_index`, `IORING_FILE_INDEX_ALLOC`), which a close can empty, and a
+  ring cannot be closed (`EBADF`). As on Linux, a call that fails fails its
+  link only for an open, a close and an `IORING_OP_FADVISE`, or if its
+  descriptor is not open; an `IORING_OP_FSYNC` does not either.
 
 - The polls are Linux master's (`io_uring/poll.c`). `IORING_OP_POLL_ADD`
   completes with the events its file has of those it asks for and the ones

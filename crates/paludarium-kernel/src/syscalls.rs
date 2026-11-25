@@ -3298,6 +3298,13 @@ fn sys_set_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    match madvise(c, a) {
+        Ok(v) => ok(v),
+        Err(e) => err(e),
+    }
+}
+
+pub(crate) fn madvise(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (mem, credentials) = (c.mem, c.process.credentials.clone());
     let mut removing = |from, to| crate::userfaultfd::remove(c, from, to);
     let mut poisoned = None;
@@ -3313,10 +3320,7 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if let Some(page) = poisoned {
         signals::queue(c.process, poisoned_sigbus(page));
     }
-    match result {
-        Ok(()) => ok(0),
-        Err(e) => err(e),
-    }
+    result.map(|()| 0)
 }
 
 /// `madvise(addr, len, advice)` on `mem`, which `process_madvise` gives

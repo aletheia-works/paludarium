@@ -559,7 +559,10 @@ verified.
   `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
   `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, `IORING_OP_TIMEOUT`,
   `_TIMEOUT_REMOVE`, `_LINK_TIMEOUT`, `IORING_OP_POLL_ADD`,
-  `_POLL_REMOVE`, and the single-shot socket requests
+  `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
+  `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
+  single-shot socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
   and `_RECV` run; the other operations complete with `EOPNOTSUPP`. Of the
   socket requests, a multishot accept or receive, a bundle
@@ -570,9 +573,11 @@ verified.
   differential tests run on; Linux master moves the bytes of a registered
   buffer. This follows master once the test runners' kernel does. A
   receive with `MSG_WAITALL` whose datagram was cut does not fail its
-  link, where Linux's does. An `IORING_OP_SHUTDOWN` runs while
-  `io_uring_enter` takes it, where Linux's runs in a worker, so its
-  completion can come before those Linux posts first. A timeout expires at
+  link, where Linux's does. An `IORING_OP_SHUTDOWN`, an `IORING_OP_FSYNC`
+  and a file request run while `io_uring_enter` takes them, where Linux
+  runs them, but for a close and some opens and advice, in a worker, so
+  their completions can come before those Linux posts first, and an open of
+  a FIFO that may create it waits there. A timeout expires at
   the checkpoints where its process can run: one due while every thread
   sleeps in `nanosleep` completes as the sleep ends, where Linux's timer
   completes it then. A thread that exits alone leaves its polls of rings

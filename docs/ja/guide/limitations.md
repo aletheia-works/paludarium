@@ -471,16 +471,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
-  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`
+  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
+  `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
+  `_LINKAT`、`_FTRUNCATE`、それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`
   だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの受け付けと
   受信、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   `IORING_RECVSEND_FIXED_BUF` を付けた送受信は、差分テストを走らせるカーネルである Linux 7.0 と
   同じく `EINVAL` です。Linux master は登録したバッファーのバイトを動かします。テストを走らせる
   カーネルが追いつけば master に合わせます。`MSG_WAITALL` の受信でデータグラムが切り詰められても
-  リンクは失敗しません（Linux では失敗します）。`IORING_OP_SHUTDOWN` は、Linux ではワーカーで
-  実行するところを `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れる
-  ものより先に来ることがあります。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
+  リンクは失敗しません（Linux では失敗します）。`IORING_OP_SHUTDOWN`、`IORING_OP_FSYNC` と
+  ファイルの要求は、Linux では close と一部の open や advice を除いてワーカーで実行するところを
+  `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れるものより先に来ることが
+  あります。FIFO を作るかもしれない open はそこで待ちます。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
   来ます。すべてのスレッドが `nanosleep` で眠るあいだに期限が来たものは、眠りが終わるときに
   完了します（Linux のタイマーはその時点で完了させます）。単独で終了するスレッドは、リングを待つポーリングを
   残します（Linux は取り消します）。自分の要求にポーリングされるリングは、その要求が終わるまで

@@ -17,6 +17,7 @@ use super::{
     Chosen, POLL_IN_EVENTS, POLL_OUT_EVENTS, POLL_UNMASK, Ring, Waits, Work, file_of, give_back,
     int_at, select, u16_at, u32_at, u64_at,
 };
+use crate::files::Descriptor;
 use crate::syscalls::Context;
 
 pub(super) const OP_ACCEPT: u8 = 13;
@@ -407,7 +408,7 @@ fn socket(
         Err(e) => return -e.0,
     };
     if slot != 0 {
-        return install_fixed(ring, socket, slot);
+        return install_fixed(ring, Descriptor::unnamed(socket, false), slot);
     }
     to_res(
         c.files
@@ -416,13 +417,13 @@ fn socket(
     )
 }
 
-/// `io_fixed_fd_install`: `file` goes in registered slot `slot` (one past
+/// `io_fixed_fd_install`: `opened` goes in registered slot `slot` (one past
 /// its index), emptying it, or in a free one with
 /// `IORING_FILE_INDEX_ALLOC`, whose index it gives: with no free slot, or
 /// no registered files, that is `ENFILE`; otherwise no registered files
 /// are `ENXIO` and a slot past them `EINVAL`. A ring is `EBADF`. The file
 /// is let go of on an error.
-fn install_fixed(ring: &Ring, file: Arc<dyn FileHandle>, slot: u32) -> i32 {
+pub(super) fn install_fixed(ring: &Ring, opened: Descriptor, slot: u32) -> i32 {
     let mut registered = ring
         .files
         .lock()
@@ -437,7 +438,7 @@ fn install_fixed(ring: &Ring, file: Arc<dyn FileHandle>, slot: u32) -> i32 {
     } else {
         slot - 1
     };
-    if file.as_any().is_some_and(|v| v.is::<Ring>()) {
+    if opened.file.as_any().is_some_and(|v| v.is::<Ring>()) {
         return -Errno::EBADF.0;
     }
     let Some(files) = registered.as_mut() else {
@@ -447,7 +448,7 @@ fn install_fixed(ring: &Ring, file: Arc<dyn FileHandle>, slot: u32) -> i32 {
         return -Errno::EINVAL.0;
     }
     let gone = files.clear(index);
-    files.set(index, crate::files::Descriptor::unnamed(file, false), 0);
+    files.set(index, opened, 0);
     drop(registered);
     ring.put_nodes(gone);
     if alloc { index as i32 } else { 0 }
@@ -506,7 +507,7 @@ fn accept(
                         .fill(fd, crate::files::Descriptor::unnamed(child, cloexec));
                     fd as i32
                 }
-                None => install_fixed(ring, child, slot),
+                None => install_fixed(ring, Descriptor::unnamed(child, false), slot),
             };
             Issued::Done(res, cflags, res < 0)
         }

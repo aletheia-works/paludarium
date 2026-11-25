@@ -1412,10 +1412,39 @@ fn descriptor_directory(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errn
             .is_ok_and(|now| now.inode == stat.inode);
     if named { Ok(path) } else { Err(Errno::ENOENT) }
 }
+thread_local! {
+    static NAMES: std::cell::RefCell<Vec<(u64, Vec<u8>)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+/// Runs `f`, in which the strings at the addresses `names` has are those
+/// read before: an io_uring request reads its names as it is prepared, and
+/// runs later.
+pub(crate) fn with_names<T>(names: &[(u64, Vec<u8>)], f: impl FnOnce() -> T) -> T {
+    struct Restore(Vec<(u64, Vec<u8>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NAMES.with(|read| read.replace(std::mem::take(&mut self.0)));
+        }
+    }
+    let _restore = Restore(NAMES.with(|read| read.replace(names.to_vec())));
+    f()
+}
+fn read_before(addr: u64) -> Option<Vec<u8>> {
+    NAMES.with(|read| {
+        let read = read.borrow();
+        read.iter()
+            .find(|(at, _)| *at == addr)
+            .map(|(_, name)| name.clone())
+    })
+}
 /// The NUL-terminated string at `addr`, of at most 4096 bytes.
 pub(crate) fn string(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     if addr == 0 {
         return Err(Errno::EFAULT);
+    }
+    if let Some(name) = read_before(addr) {
+        return Ok(name);
     }
     let mut b = Vec::new();
     for i in 0..4096 {
@@ -3131,14 +3160,22 @@ fn copy_bytes(
 /// keeps the size, `FALLOC_FL_PUNCH_HOLE` frees the pages it covers, and the
 /// other modes give `EOPNOTSUPP`.
 fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let d = c.files.descriptor(a[0])?;
+    fallocate_open(c, &d, a[1] as u32, (a[2] as i64, a[3] as i64))
+}
+/// `vfs_fallocate` of the range from `offset` of `len` bytes.
+pub(crate) fn fallocate_open(
+    c: &mut Context<'_>,
+    d: &Descriptor,
+    mode: u32,
+    (offset, len): (i64, i64),
+) -> Result<u64, Errno> {
     const KEEP_SIZE: u32 = 0x01;
     const PUNCH_HOLE: u32 = 0x02;
     // PUNCH_HOLE, COLLAPSE_RANGE, ZERO_RANGE, INSERT_RANGE, UNSHARE_RANGE
     // and WRITE_ZEROES; plain allocation is no bit.
     const MODE_MASK: u32 = 0xfa;
     const EOPNOTSUPP: Errno = Errno(95);
-    let d = c.files.descriptor(a[0])?;
-    let (mode, offset, len) = (a[1] as u32, a[2] as i64, a[3] as i64);
     if offset < 0 || len <= 0 {
         return Err(Errno::EINVAL);
     }
@@ -5828,33 +5865,18 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 }
             }
         }
-        76 | 77 => {
-            // `do_sys_truncate` and `do_sys_ftruncate`: a negative length
-            // before the path or the descriptor.
-            if a[1] > i64::MAX as u64 {
-                return Err(Errno::EINVAL);
+        // `do_sys_truncate` and `do_sys_ftruncate`: a negative length before
+        // the path or the descriptor.
+        76 | 77 if a[1] > i64::MAX as u64 => Err(Errno::EINVAL),
+        77 => {
+            let d = c.files.descriptor(a[0])?;
+            if d.file.flags() & O_PATH != 0 {
+                return Err(Errno::EBADF);
             }
-            let f = if n == 77 {
-                let file = io_descriptor(c, a[0])?;
-                // `do_ftruncate`: an append-only file is not truncated
-                // (EPERM), after the description's EINVAL, before
-                // Landlock's right.
-                if file.flags() & 3 != 0
-                    && let Ok(stat) = file.stat()
-                    && stat.mode & 0o170000 == 0o100000
-                    && attributes::append_only(&stat)
-                {
-                    return Err(Errno::EPERM);
-                }
-                // Landlock's right kept from the open (`hook_file_truncate`),
-                // for a description open for writing.
-                if file.flags() & 3 != 0
-                    && c.files.descriptor(a[0])?.landlock & crate::landlock::TRUNCATE == 0
-                {
-                    return Err(Errno::EACCES);
-                }
-                file
-            } else {
+            ftruncate_open(c, &d, a[1])
+        }
+        76 => {
+            let f = {
                 let (p, found) = looked_up_linked(c, (-100i32) as u64, a[0], true)?;
                 // Landlock's TRUNCATE on the file (`hook_path_truncate`).
                 if let Some(target) = landlock_target(c, &p, true) {
@@ -5910,17 +5932,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     }
                 }
             };
-            // Growing a file past RLIMIT_FSIZE raises SIGXFSZ (inode_newsize_ok).
-            if a[1] > c.group.fsize() && f.stat()?.size < a[1] {
-                crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
-                return Err(Errno(27));
-            }
-            f.truncate(a[1])?;
-            if n == 77 {
-                crate::mqueue::truncated(c, &*f);
-            }
-            crate::permissions::remove_set_ids(&c.process.credentials, &*f);
-            Ok(0)
+            truncate_to(c, &f, a[1], false)
         }
         79 => {
             // From the process's root, as Linux's `prepend_path` gives it,
@@ -6409,18 +6421,63 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(0)
         }
         // fadvise64: a hint, checked as Linux checks it
-        221 => {
-            let file = io_descriptor(c, a[0])?;
-            if file.stat()?.mode & 0o170000 == 0o010000 {
-                return Err(Errno(29)); // ESPIPE
-            }
-            if (a[2] as i64) < 0 || a[3] > 5 {
-                return Err(Errno::EINVAL);
-            }
-            Ok(0)
-        }
+        221 => fadvise(&io_descriptor(c, a[0])?, a[1], a[2], a[3]),
         _ => Err(Errno::ENOSYS),
     }
+}
+/// `do_ftruncate`.
+pub(crate) fn ftruncate_open(c: &mut Context<'_>, d: &Descriptor, len: u64) -> Result<u64, Errno> {
+    // An append-only file is not truncated (EPERM), after the description's
+    // EINVAL, before Landlock's right.
+    if d.file.flags() & 3 != 0
+        && let Ok(stat) = d.file.stat()
+        && stat.mode & 0o170000 == 0o100000
+        && attributes::append_only(&stat)
+    {
+        return Err(Errno::EPERM);
+    }
+    // Landlock's right kept from the open (`hook_file_truncate`), for a
+    // description open for writing.
+    if d.file.flags() & 3 != 0 && d.landlock & crate::landlock::TRUNCATE == 0 {
+        return Err(Errno::EACCES);
+    }
+    truncate_to(c, &d.file, len, true)
+}
+fn truncate_to(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    len: u64,
+    by_descriptor: bool,
+) -> Result<u64, Errno> {
+    if len > i64::MAX as u64 {
+        return Err(Errno::EINVAL);
+    }
+    // Growing a file past RLIMIT_FSIZE raises SIGXFSZ (inode_newsize_ok).
+    if len > c.group.fsize() && file.stat()?.size < len {
+        crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
+        return Err(Errno(27));
+    }
+    file.truncate(len)?;
+    if by_descriptor {
+        crate::mqueue::truncated(c, &**file);
+    }
+    crate::permissions::remove_set_ids(&c.process.credentials, &**file);
+    Ok(0)
+}
+/// `vfs_fadvise`.
+pub(crate) fn fadvise(
+    file: &Arc<dyn FileHandle>,
+    _offset: u64,
+    len: u64,
+    advice: u64,
+) -> Result<u64, Errno> {
+    if file.stat()?.mode & 0o170000 == 0o010000 {
+        return Err(Errno(29)); // ESPIPE
+    }
+    if (len as i64) < 0 || advice > 5 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
 }
 /// Blocking stream writes preserve partial progress across readiness retries.
 /// No descriptor-table, stream-state or guest-memory lock spans a Host wait.
@@ -7370,6 +7427,22 @@ pub(crate) fn open_at(
     mode: u32,
     resolve: u64,
 ) -> Result<u64, Errno> {
+    let (fd, opened) = open_with(c, dir, raw, flags, mode, resolve, true)?;
+    let fd = fd.ok_or(Errno::EBADF)?;
+    c.files.fill(fd, opened);
+    Ok(u64::from(fd))
+}
+/// [`open_at`], the open file not in the table yet: with `reserve`, the
+/// descriptor taken for it.
+pub(crate) fn open_with(
+    c: &mut Context<'_>,
+    dir: u64,
+    raw: Vec<u8>,
+    flags: u64,
+    mode: u32,
+    resolve: u64,
+    reserve: bool,
+) -> Result<(Option<u32>, Descriptor), Errno> {
     let p = c.files.named(dir, raw.clone())?;
     let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
     let flags = path_flags(flags);
@@ -7406,7 +7479,9 @@ pub(crate) fn open_at(
     };
     // Linux takes the descriptor before it opens, so with none free
     // nothing is opened or created.
-    let fd = c.files.reserve(c.group.nofile())?;
+    let fd = reserve
+        .then(|| c.files.reserve(c.group.nofile()))
+        .transpose()?;
     let credentials = &c.process.credentials;
     let opened = match crate::bpf_fs::lookup(c, &p)
         .and_then(|()| crate::permissions::open(c.files, credentials, dir, &raw, flags))
@@ -7454,7 +7529,7 @@ pub(crate) fn open_at(
     match opened {
         Ok(((file, path), landlock)) => {
             let cloexec = flags & 0x80000 != 0;
-            c.files.fill(
+            Ok((
                 fd,
                 Descriptor {
                     shown,
@@ -7465,11 +7540,12 @@ pub(crate) fn open_at(
                     listed: Arc::default(),
                     landlock,
                 },
-            );
-            Ok(u64::from(fd))
+            ))
         }
         Err(error) => {
-            c.files.unreserve(fd);
+            if let Some(fd) = fd {
+                c.files.unreserve(fd);
+            }
             Err(error)
         }
     }
@@ -7486,7 +7562,7 @@ const RESOLVE_CACHED: u64 = 0x20;
 /// `EINVAL` and above a page `E2BIG`. What a later version adds must be zero
 /// (`E2BIG`), which `check_zeroed_user` reads a page at a time up to the
 /// first byte that is not, before the first version is copied.
-pub(super) fn copy_struct(
+pub(crate) fn copy_struct(
     c: &Context<'_>,
     addr: u64,
     size: u64,
@@ -7528,6 +7604,19 @@ pub(super) fn copy_struct(
 /// `O_NOFOLLOW` and `O_CLOEXEC` are all `EINVAL`.
 fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     const OPEN_HOW_SIZE_VER0: u64 = 24;
+    let how = copy_struct(c, a[2], a[3], OPEN_HOW_SIZE_VER0)?;
+    let field = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let (flags, resolve, raw) = open_how(c, (field(0), field(1), field(2)), a[1])?;
+    open_at(c, a[0], raw, flags, field(1) as u32, resolve)
+}
+/// The checks of [`openat2`]'s `struct open_how`, its flags, mode and
+/// `RESOLVE_*` flags, then the path at `at`: the flags and resolve flags
+/// the open takes, and the path.
+pub(crate) fn open_how(
+    c: &Context<'_>,
+    (flags, mode, resolve): (u64, u64, u64),
+    at: u64,
+) -> Result<(u64, u64, Vec<u8>), Errno> {
     const O_CREAT: u64 = 0o100;
     const O_TRUNC: u64 = 0o1000;
     const O_DSYNC: u64 = 0o10000;
@@ -7541,9 +7630,6 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // `O_CREAT` to `__O_TMPFILE`.
     const VALID_OPEN_FLAGS: u64 = 0o37777703;
     const VALID_RESOLVE_FLAGS: u64 = 0x3f;
-    let how = copy_struct(c, a[2], a[3], OPEN_HOW_SIZE_VER0)?;
-    let field = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
-    let (flags, mode, resolve) = (field(0), field(1), field(2));
     let mut flags = flags;
     if flags & !O_CLOEXEC & !VALID_OPEN_FLAGS != 0 || resolve & !VALID_RESOLVE_FLAGS != 0 {
         return Err(Errno::EINVAL);
@@ -7578,11 +7664,11 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // With `RESOLVE_*` flags its own walk meets each magic link, which they
     // may refuse; without, the path is taken as `openat` takes it.
     let raw = if resolve & !RESOLVE_CACHED == 0 {
-        path(c, a[1])?
+        path(c, at)?
     } else {
-        string(c, a[1])?
+        string(c, at)?
     };
-    open_at(c, a[0], raw, flags, mode as u32, resolve & !RESOLVE_CACHED)
+    Ok((flags, resolve & !RESOLVE_CACHED, raw))
 }
 /// The mount `path` is on, for `RESOLVE_NO_XDEV`: procfs, devtmpfs and
 /// devpts, which Linux mounts at `/proc`, `/dev` and `/dev/pts`, or the

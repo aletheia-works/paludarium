@@ -1617,7 +1617,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
-  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、それにソケットの要求
+  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、ファイルの要求
+  `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
+  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
@@ -1759,6 +1761,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_TIMEOUT_IMMEDIATE_ARG` ではエントリーの中にあります。取り消しは、ファイルを待つ要求の
   あとにタイムアウトを探しますが、ファイルでは見つけず、リンクしたものも見つけません。`execve` と
   プロセス全体の終了は、そのスレッドのものを取り消します。
+
+- ファイルの要求は、Linux と同じく、それぞれが表す呼び出しとして実行します。エントリーは Linux と
+  同じく調べ（`EINVAL`。パスを使うものの `IOSQE_FIXED_FILE` は `EBADF`）、名前と `struct open_how` は
+  エントリーを取るときに読むので（`EFAULT`、`ENAMETOOLONG`、空なら `ENOENT`）、同じリンクの前の
+  要求がそこに書いても変わりません。ファイルを作ったり切り詰めたりしない open は、Linux の最初の
+  試み（`O_NONBLOCK`）と同じく待たないので、FIFO は読み取り用ならすぐに開きます。open は登録した
+  スロットに入れることもでき（`file_index`、`IORING_FILE_INDEX_ALLOC`）、close はそれを空にします。
+  リングは close できません（`EBADF`）。Linux と同じく、失敗した呼び出しがリンクを失敗させるのは、
+  open、close、`IORING_OP_FADVISE` と、記述子が開いていない場合だけです。`IORING_OP_FSYNC` も
+  失敗させません。
 
 - ポーリングは Linux master のもの（`io_uring/poll.c`）です。`IORING_OP_POLL_ADD` は、求めた
   イベントと、どのポーリングも終わらせるイベント（`POLLERR`、`POLLHUP`、`POLLNVAL`、読み手には

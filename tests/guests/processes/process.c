@@ -12295,6 +12295,217 @@ static int io_uring_poll_add_case(void) {
     return 0;
 }
 
+/* io_uring's file requests. Linux runs most of them in a worker, so each
+   one runs alone or in a link. */
+static int uf_run(struct uring *u, unsigned n, const char *label) {
+    uring_show(label, uring_enter(u->fd, n, n, 1, NULL, 0));
+    return unet_reap(u, label, 0);
+}
+
+static int io_uring_fs_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    char dir[] = "/tmp/uring-fs-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 81;
+    unsigned char *sqe;
+    char buf[64];
+    static const char empty[] = "";
+    const unsigned cwd = AT_FDCWD;
+
+    /* The preparation. */
+    static const unsigned char ops[] = {17, 18, 19, 21, 24, 25, 28, 35, 36, 37, 38, 39, 55};
+    for (unsigned i = 0; i < sizeof ops; i++) {
+        sqe = unet_push(&u, ops[i], ops[i], AT_FDCWD, (long)"a", (long)"a", 24, 0, 0);
+        sqe[40] = 1;
+        uf_run(&u, 1, "buf-index");
+        unet_push(&u, ops[i], ops[i], AT_FDCWD, (long)"a", (long)"a", 24, 0, 1);
+        uf_run(&u, 1, "ioprio");
+    }
+    static const struct {
+        unsigned char op, off;
+    } named[] = {{18, 0}, {21, 1}, {35, 1}, {36, 0}, {37, 0}, {38, 1}, {39, 1}};
+    for (unsigned i = 0; i < sizeof named / sizeof *named; i++) {
+        unsigned long off = named[i].off ? (unsigned long)"b" : 0;
+        unet_push(&u, named[i].op, 1, AT_FDCWD, off, (long)empty, 0, 0, 0);
+        uf_run(&u, 1, "empty");
+        unet_push(&u, named[i].op, 1, AT_FDCWD, off, 0, 0, 0, 0);
+        uf_run(&u, 1, "null");
+        unet_push(&u, named[i].op, 1, AT_FDCWD, off, (long)"a", 0, 0, 0)[1] = 1;
+        uf_run(&u, 1, "fixed");
+    }
+    static const unsigned char close_bad[] = {8, 16, 24, 28};
+    for (unsigned i = 0; i < sizeof close_bad; i++) {
+        unet_push(&u, 19, 1, 99, 0, 0, 0, 0, 0)[close_bad[i]] = 1;
+        uf_run(&u, 1, "close-refused");
+    }
+    unet_push(&u, 19, 1, 1, 0, 0, 0, 0, 0)[44] = 1;
+    uf_run(&u, 1, "close-slot-fd");
+    unet_push(&u, 19, 1, 0, 0, 0, 0, 0, 0)[44] = 1;
+    uf_run(&u, 1, "close-slot-none");
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_CLOEXEC, 0)[44] = 1;
+    uf_run(&u, 1, "open-slot-cloexec");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"a", 0, 1, 0);
+    uf_run(&u, 1, "unlink-flags");
+    unet_push(&u, 37, 1, AT_FDCWD, 0, (long)"a", 0, 1, 0);
+    uf_run(&u, 1, "mkdir-flags");
+    unet_push(&u, 38, 1, AT_FDCWD, (long)"b", (long)"a", 1, 0, 0);
+    uf_run(&u, 1, "symlink-len");
+    unet_push(&u, 55, 1, 0, 0, 0, 1, 0, 0);
+    uf_run(&u, 1, "ftruncate-len");
+    unet_push(&u, 17, 1, 0, 0, 1, 0, 1, 0);
+    uf_run(&u, 1, "fallocate-flags");
+    unet_push(&u, 3, 1, 0, -1, 0, 0, 0, 0);
+    uf_run(&u, 1, "fsync-negative");
+
+    /* The calls. */
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0600, O_RDWR | O_CREAT | O_EXCL, 0);
+    int fd = uf_run(&u, 1, "create");
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0600, O_RDWR | O_CREAT | O_EXCL, 0);
+    uf_run(&u, 1, "create-again");
+    unet_push(&u, 55, 1, fd, 100, 0, 0, 0, 0);
+    uf_run(&u, 1, "ftruncate");
+    unet_push(&u, 17, 1, fd, 0, 200, 0, 0, 0);
+    uf_run(&u, 1, "fallocate");
+    unet_push(&u, 17, 1, fd, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "fallocate-none");
+    struct statx st;
+    memset(&st, 0, sizeof st);
+    unet_push(&u, 21, 1, AT_FDCWD, (long)&st, (long)"a", STATX_SIZE | STATX_MODE, 0, 0);
+    uf_run(&u, 1, "statx");
+    printf("size %llu mode %o\n", (unsigned long long)st.stx_size, st.stx_mode);
+    memset(&st, 0, sizeof st);
+    unet_push(&u, 21, 1, fd, (long)&st, (long)empty, STATX_SIZE, AT_EMPTY_PATH, 0);
+    uf_run(&u, 1, "statx-empty");
+    printf("size %llu\n", (unsigned long long)st.stx_size);
+    unet_push(&u, 21, 1, fd, (long)&st, 0, STATX_SIZE, AT_EMPTY_PATH, 0);
+    uf_run(&u, 1, "statx-empty-null");
+    unet_push(&u, 21, 1, AT_FDCWD, 8, (long)"a", STATX_SIZE, 0, 0);
+    uf_run(&u, 1, "statx-unmapped");
+    unet_push(&u, 21, 1, AT_FDCWD, (long)&st, (long)"a", 1u << 31, 0, 0);
+    uf_run(&u, 1, "statx-mask");
+    unet_push(&u, 24, 1, fd, 0, 0, 10, 1, 0);
+    uf_run(&u, 1, "fadvise");
+    unet_push(&u, 24, 1, fd, 0, 0, 10, 9, 0);
+    uf_run(&u, 1, "fadvise-bad");
+    char *page = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    page[0] = page[4096] = 1;
+    unet_push(&u, 25, 1, -1, 0, (long)page, 4096, MADV_DONTNEED, 0);
+    uf_run(&u, 1, "madvise");
+    printf("page %d %d\n", page[0], page[4096]);
+    unet_push(&u, 25, 1, -1, 8192, (long)page, 1, MADV_DONTNEED, 0);
+    uf_run(&u, 1, "madvise-long");
+    printf("page %d %d\n", page[0], page[4096]);
+    unet_push(&u, 25, 1, -1, 0, (long)page, 4096, 99, 0);
+    uf_run(&u, 1, "madvise-bad");
+    unet_push(&u, 39, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 0, 0);
+    uf_run(&u, 1, "link");
+    unet_push(&u, 39, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 0, 0);
+    uf_run(&u, 1, "link-again");
+    unet_push(&u, 39, 1, AT_FDCWD, (long)"c", (long)"a", cwd, 1, 0);
+    uf_run(&u, 1, "link-flags");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"b", 0, 0, 0);
+    uf_run(&u, 1, "unlink");
+    unet_push(&u, 35, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 0, 0);
+    uf_run(&u, 1, "rename");
+    unet_push(&u, 35, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 8, 0);
+    uf_run(&u, 1, "rename-flags");
+    unet_push(&u, 38, 1, AT_FDCWD, (long)"a", (long)"b", 0, 0, 0);
+    uf_run(&u, 1, "symlink");
+    unet_push(&u, 37, 1, AT_FDCWD, 0, (long)"d", 0700, 0, 0);
+    uf_run(&u, 1, "mkdir");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"d", 0, 0, 0);
+    uf_run(&u, 1, "unlink-directory");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"d", 0, AT_REMOVEDIR, 0);
+    uf_run(&u, 1, "rmdir");
+
+    /* openat2, and descriptors that cannot be closed here. */
+    unsigned long how[4] = {O_RDONLY, 0, 0, 0};
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 23, 0, 0);
+    uf_run(&u, 1, "openat2-size");
+    unet_push(&u, 28, 1, AT_FDCWD, 8, (long)"a", 24, 0, 0);
+    uf_run(&u, 1, "openat2-unmapped");
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 32, 0, 0);
+    int second = uf_run(&u, 1, "openat2");
+    how[3] = 1;
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 32, 0, 0);
+    uf_run(&u, 1, "openat2-newer");
+    how[1] = 1;
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 24, 0, 0);
+    uf_run(&u, 1, "openat2-mode");
+    unet_push(&u, 19, 1, second, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "close");
+    unet_push(&u, 19, 1, second, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "close-again");
+    unet_push(&u, 19, 1, u.fd, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "close-ring");
+
+    /* A FIFO opens without waiting, and not for long. */
+    mkfifo("fifo", 0600);
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"fifo", 0, O_RDONLY, 0);
+    second = uf_run(&u, 1, "fifo");
+    printf("nonblock %d\n", (fcntl(second, F_GETFL) & O_NONBLOCK) != 0);
+    close(second);
+
+    /* Registered slots, links, and names that change. */
+    int slots[2] = {-1, -1};
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    sqe[44] = 1;
+    uf_run(&u, 1, "slot-unregistered");
+    syscall(427, u.fd, 2, slots, 2);
+    if (pwrite(fd, "other", 5, 0) != 5) return 82;
+    char name[8] = "a";
+    sqe = pw_read(&u, 1, fd, name, 5, 0);
+    sqe[1] = 4;
+    sqe = unet_push(&u, 18, 2, AT_FDCWD, 0, (long)name, 0, O_RDONLY, 0);
+    sqe[44] = 1;
+    sqe[1] = 4;
+    sqe = pw_read(&u, 3, 0, buf, 5, 0);
+    sqe[1] = 1;
+    uf_run(&u, 3, "slot");
+    printf("%.5s %.5s\n", name, buf);
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    memset(sqe + 44, 0xff, 4);
+    uf_run(&u, 1, "slot-any");
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    memset(sqe + 44, 0xff, 4);
+    uf_run(&u, 1, "slot-full");
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    sqe[44] = 3;
+    uf_run(&u, 1, "slot-past");
+    sqe = unet_push(&u, 24, 1, 1, 0, 0, 10, 1, 0);
+    sqe[1] = 1;
+    uf_run(&u, 1, "fadvise-slot");
+    for (int i = 1; i < 4; i++) {
+        unet_push(&u, 19, 1, 0, 0, 0, 0, 0, 0)[44] = i;
+        uf_run(&u, 1, "close-slot");
+        unet_push(&u, 19, 1, 0, 0, 0, 0, 0, 0)[44] = i;
+        uf_run(&u, 1, "close-slot-empty");
+    }
+    unet_push(&u, 37, 1, AT_FDCWD, 0, (long)"a", 0700, 0, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "mkdir-link");
+    int event = eventfd(0, 0);
+    unet_push(&u, 3, 1, event, 0, 0, 0, 0, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "fsync-link");
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"none", 0, O_RDONLY, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "open-link");
+    unet_push(&u, 55, 1, 99, 0, 0, 0, 0, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "ftruncate-badf-link");
+    unet_push(&u, 24, 1, fd, 0, 0, 0, 9, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "fadvise-link");
+    unlink("a");
+    unlink("b");
+    unlink("fifo");
+    chdir("/");
+    rmdir(dir);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -42660,6 +42871,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-net")) return io_uring_net_case();
     if (!strcmp(mode, "io-uring-timeout")) return io_uring_timeout_case();
     if (!strcmp(mode, "io-uring-poll-add")) return io_uring_poll_add_case();
+    if (!strcmp(mode, "io-uring-fs")) return io_uring_fs_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

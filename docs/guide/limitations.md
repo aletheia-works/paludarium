@@ -46,7 +46,8 @@ verified.
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used.
   A rename does not move the names of files that were opened in another
-  mount namespace in the maps, a core's `NT_FILE` note and
+  mount namespace, or by a process that entered this one apart (`unshare`
+  and `setns` each begin anew), in the maps, a core's `NT_FILE` note and
   `/proc/<pid>/exe`, where Linux's `d_move` moves them in each.
   Maps can show fewer VMAs than Linux after a merge: Linux merges
   two VMAs only where their `anon_vma`s are compatible

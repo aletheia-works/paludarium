@@ -5145,7 +5145,9 @@ kernel.
   them to the enabled events of the CPU (pid -1) of the thread that makes
   them, whatever process it is of, and then to those that count the thread,
   the latest first, each with that thread's `sample_id` (`EXIT` goes to the
-  thread's first): `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
+  thread's first), those of mappings while an event with `mmap` or
+  `mmap_data` is open, enabled or not (`nr_mmap_events`, which `mmap2` alone
+  does not raise): `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
   (`mmap2`) of an executable mapping, and with `mmap_data` of any other
   (`PERF_RECORD_MISC_MMAP_DATA`), as `mmap`, `brk`'s growth, `shmat`,
   `remap_file_pages` and `mprotect` (of each VMA whose protection it

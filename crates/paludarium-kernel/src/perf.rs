@@ -549,6 +549,9 @@ struct Lists {
     counting: Vec<Erased>,
     /// Those of a CPU that ask for side-band records (`pmu_sb_events`).
     side_band: Vec<Erased>,
+    /// The opened ones that ask for them, of a thread or a CPU, enabled or
+    /// not, while they are open (`account_event`).
+    asking: Vec<Erased>,
 }
 
 /// A reference that holds an [`Event`] or a [`ThreadGroup`] by no
@@ -612,8 +615,10 @@ impl Events {
         lists.on_exec.retain(|event| event.strong_count() > 0);
         lists.counting.retain(|event| event.strong_count() > 0);
         lists.side_band.retain(|event| event.strong_count() > 0);
+        lists.asking.retain(|event| event.strong_count() > 0);
         if side_band::asks(&event.attr) {
             self.side_band.store(true, Ordering::Relaxed);
+            lists.asking.push(erase(event));
             if matches!(event.target, Target::Cpu) {
                 lists.side_band.push(erase(event));
             }

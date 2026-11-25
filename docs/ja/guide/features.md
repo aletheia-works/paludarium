@@ -4436,7 +4436,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   持たせます。それを求めるイベントは、`perf_iterate_sb` が渡すように、サイドバンドの記録を
   受け取ります。記録を作るスレッドの CPU の有効なイベント（pid が -1。どのプロセスの
   スレッドでも）、次にそのスレッドを数えるイベントの順で（`EXIT` はスレッドのものが先）、
-  どちらも新しいものからで、そのスレッドの `sample_id` が付きます。実行できるマッピングの `PERF_RECORD_MMAP`（`mmap`）か
+  どちらも新しいものからで、そのスレッドの `sample_id` が付きます。マッピングの記録は、有効か
+  どうかによらず `mmap` か `mmap_data` のあるイベントが開いている間だけです（`nr_mmap_events`。
+  `mmap2` だけでは数えられません）。実行できるマッピングの `PERF_RECORD_MMAP`（`mmap`）か
   `MMAP2`（`mmap2`）と、`mmap_data` ではほかのマッピングのもの
   （`PERF_RECORD_MISC_MMAP_DATA`）を、`mmap`、`brk` が伸ばしたとき、`shmat`、
   `remap_file_pages`、`mprotect`（保護を変えた VMA ごとに順に）が残した、隣と合わさった

@@ -652,7 +652,14 @@ fn an_event_of_a_cpu_takes_the_records_of_what_runs_there() {
     let (_, off) = env.open_side_band(-1, 0, flags).unwrap();
     env.ioctl(fd, IOC_ENABLE);
     env.ioctl(other_fd, IOC_ENABLE);
+    // `mmap2` alone has no mapping recorded, but with an event with `mmap`
+    // open, enabled or not.
     let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
+    env.mmap(4096, PROT_READ | PROT_EXEC, anonymous, -1, 0);
+    let (counted, unused) = env.open_side_band(0, -1, ATTR_MMAP).unwrap();
+    env.mmap(3 * 4096, PROT_READ | PROT_EXEC, anonymous, -1, 0);
+    assert_eq!(env.call(11, [unused, 9 * 4096, 0, 0, 0, 0]), 0);
+    assert_eq!(env.call(CLOSE, [counted as u64, 0, 0, 0, 0, 0]), 0);
     env.mmap(4096, PROT_READ | PROT_EXEC, anonymous, -1, 0);
     let name = env.path(b"side-band-cpu");
     assert_eq!(env.call(PRCTL, [PR_SET_NAME, name, 0, 0, 0, 0]), 0);

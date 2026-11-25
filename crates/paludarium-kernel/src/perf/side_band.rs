@@ -46,6 +46,26 @@ pub(crate) fn wanted(events: &Events) -> bool {
     events.side_band.load(Ordering::Relaxed)
 }
 
+/// Whether an event that asks for any of `kinds` is open on the machine,
+/// enabled or not (`nr_mmap_events` and the others).
+fn open(events: &Events, kinds: &[u32]) -> bool {
+    wanted(events)
+        && lock(&events.lists)
+            .asking
+            .iter()
+            .filter_map(super::event)
+            .any(|event| kinds.iter().any(|&kind| event.attr.flag(kind)))
+}
+/// Whether the records of mappings are written (`perf_event_mmap`), which
+/// `mmap2` alone does not have done.
+fn maps(events: &Events) -> bool {
+    open(events, &[bit::MMAP, bit::MMAP_DATA])
+}
+/// Whether those of tasks are (`perf_event_task`).
+fn tasks(events: &Events) -> bool {
+    open(events, &[bit::COMM, bit::MMAP, bit::MMAP_DATA, bit::TASK])
+}
+
 /// The enabled events of the CPU of `who`, and then those that count thread
 /// `tid` of `group`, that `wants` picks (`perf_iterate_sb`).
 fn receivers(
@@ -179,6 +199,9 @@ pub(super) fn fork(
     child_pid: u32,
     child_tid: u32,
 ) {
+    if !tasks(events) {
+        return;
+    }
     for event in receivers(events, group, who.tid, who, asks) {
         // `pid`, `ppid`, `tid`, `ptid`.
         let mut body = event.pid_tid_of(child_pid, who.pid).to_vec();
@@ -193,12 +216,18 @@ pub(super) fn fork(
 /// gives as both the parent process and thread (`real_parent`). First to
 /// the events that count it, alone.
 pub(super) fn exit(events: &Events, group: &ThreadGroup, who: &Who, ppid: u32) {
+    if !tasks(events) {
+        return;
+    }
     for event in of_task(events, group, who.tid, who, asks) {
         exited(&event, who, ppid);
     }
 }
 /// The same, to the events of its CPU.
 pub(super) fn exit_on_cpu(events: &Events, who: &Who, ppid: u32) {
+    if !tasks(events) {
+        return;
+    }
     for event in on_cpu(events, who, asks) {
         exited(&event, who, ppid);
     }
@@ -341,6 +370,9 @@ impl Space<'_> {
     /// The enabled events that count the thread and want some record of a
     /// mapping, `None` for none.
     fn receivers(&self, events: &Events) -> Option<Vec<Arc<Event>>> {
+        if !maps(events) {
+            return None;
+        }
         let wants = |attr: &super::Attr| {
             attr.flag(bit::MMAP) || attr.flag(bit::MMAP2) || attr.flag(bit::MMAP_DATA)
         };
@@ -495,6 +527,9 @@ pub(super) fn exec(events: &Events, space: &Space<'_>, counted: u32, name: &[u8]
         name,
         true,
     );
+    if !maps(events) {
+        return;
+    }
     let wants = |attr: &super::Attr| {
         attr.flag(bit::MMAP) || attr.flag(bit::MMAP2) || attr.flag(bit::MMAP_DATA)
     };

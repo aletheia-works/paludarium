@@ -1834,7 +1834,16 @@ static int case_side_band_cpu(void) {
     fflush(stdout);
     ioctl(fd, IOC_ENABLE, 0);
     ioctl(other_fd, IOC_ENABLE, 0);
+    /* Linux writes the records of mappings only while an event with mmap or
+       mmap_data is open (nr_mmap_events), whether it is enabled or not, so
+       not with mmap2 alone: none of the first mapping. */
+    mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 0);
+    void *unused;
+    int counted = open_side_band(0, -1, ATTR_MMAP, &unused);
     e.exec_at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 4096);
+    munmap(unused, 9 * 4096);
+    close(counted);
+    mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 0);
     prctl(PR_SET_NAME, "side-band-cpu", 0, 0, 0);
     pid_t child = fork();
     if (child == 0) _exit(0);

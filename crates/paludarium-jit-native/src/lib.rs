@@ -93,6 +93,9 @@ mod native {
         /// Whether to report the statistics on standard error
         /// (`PALUDARIUM_JIT_STATS` set).
         report: bool,
+        /// Makes [`Machine::fill`] panic.
+        #[cfg(test)]
+        panics: std::sync::atomic::AtomicBool,
     }
 
     impl Machine {
@@ -112,6 +115,8 @@ mod native {
 
         /// Compiles `forms` into `block`.
         fn fill(&self, forms: &[Form], block: &PendingBlock) {
+            #[cfg(test)]
+            assert!(!self.panics.load(Ordering::Relaxed), "the compile fails");
             let started = std::time::Instant::now();
             let code = self.machine_code(forms).and_then(|bytes| Code::new(&bytes));
             let s = &self.statistics;
@@ -149,7 +154,8 @@ mod native {
 
     impl Worker {
         /// Hands `job` to the thread, starting it first if need be; false
-        /// when it cannot be had.
+        /// when it cannot be had. A panic in `job` ends the thread, which
+        /// then drops the jobs it has not done and cannot be had again.
         fn send(&self, job: Job) -> bool {
             let mut queue = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             if queue.is_none() {
@@ -245,6 +251,8 @@ mod native {
                     isa,
                     statistics: Statistics::default(),
                     report: std::env::var_os("PALUDARIUM_JIT_STATS").is_some(),
+                    #[cfg(test)]
+                    panics: std::sync::atomic::AtomicBool::new(false),
                 }),
                 threshold: threshold.max(1),
                 kept: Mutex::new(HashMap::new()),
@@ -256,6 +264,12 @@ mod native {
         #[cfg(test)]
         pub(crate) fn machine_code(&self, forms: &[Form]) -> Option<Vec<u8>> {
             self.machine.machine_code(forms)
+        }
+
+        /// Whether compiling panics from now on.
+        #[cfg(test)]
+        pub(crate) fn set_panics(&self, panics: bool) {
+            self.machine.panics.store(panics, Ordering::Relaxed);
         }
     }
 
@@ -291,8 +305,8 @@ mod native {
             // No lock is held here that the thread needs: `kept`'s is
             // released above, and `fill` takes none.
             let machine = self.machine.clone();
-            let (forms, pending) = (forms.to_vec(), block.clone());
-            let fill = move || machine.fill(&forms, &pending);
+            let (forms, pending) = (forms.to_vec(), Unfilled(block.clone()));
+            let fill = move || machine.fill(&forms, &pending.0);
             if self.background {
                 if !self.worker.send(Box::new(fill)) {
                     let _ = block.code.set(None);
@@ -314,6 +328,18 @@ mod native {
     pub(crate) struct PendingBlock {
         code: OnceLock<Option<Code>>,
         len: usize,
+    }
+
+    /// A block whose compile has not ended: when its job panics or is
+    /// dropped, compiling it has failed, and the same forms are turned down
+    /// again.
+    struct Unfilled(Arc<PendingBlock>);
+
+    impl Drop for Unfilled {
+        fn drop(&mut self) {
+            // Nothing once it is filled.
+            let _ = self.0.code.set(None);
+        }
     }
 
     impl CompiledBlock for PendingBlock {

@@ -975,6 +975,23 @@ fn a_compile_that_panics_fails_the_thread_that_waits_and_only_it() {
     assert_ne!(ran.recv().unwrap(), caller);
 }
 
+#[test]
+fn a_block_whose_compile_panics_is_turned_down_again() {
+    // mov eax, 0x12345678
+    let failing = forms(&[0xb8, 0x78, 0x56, 0x34, 0x12]);
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    compiler.set_panics(true);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compiler.compile(&failing).is_some()
+    }));
+    let panic = failed.expect_err("the waiter did not fail");
+    assert_eq!(panic.downcast_ref(), Some(&"the compile fails"));
+    compiler.set_panics(false);
+    assert!(compiler.compile(&failing).is_none());
+    // Other blocks still compile.
+    assert!(compiler.compile(&forms(&[0xb8, 1, 2, 3, 4])).is_some());
+}
+
 /// Guest threads compile at once, some the same blocks, and none waits
 /// forever.
 #[test]

@@ -682,6 +682,7 @@ mod linux {
         processes_madvise_collapse => ("madvise-collapse","process"),
         processes_madvise_collapse_shmem => ("madvise-collapse-shmem","process"),
         processes_madvise_fork => ("madvise-fork","process"),
+        processes_mmap_types => ("mmap-types","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
         processes_file_leases => ("file-leases","process"),

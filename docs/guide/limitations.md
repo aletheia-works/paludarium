@@ -73,7 +73,7 @@ verified.
   shows the same pages.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`). A page of a host file
+  `ht` (`MAP_HUGETLB`). A page of a host file
   that `write` filled is clean (see "Pages `write` filled" below).
 - **`/proc/<pid>/mem`'s offsets past `i64::MAX`**: `pread64` and
   `pwrite64` refuse them (`EINVAL`), as Linux v7.0's `ksys_pread64` and
@@ -81,9 +81,9 @@ verified.
   file of unsigned offsets (`FOP_UNSIGNED_OFFSET`). This follows v7.0
   until the runners' kernel has master's change.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
-  emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
-  private file mapping, is a file's (bit 61) until the mapping was
-  written, not until the page was. The frame number is 0 for every reader, also one
+  emulator's page entries, as `smaps`'s counts do. A page of a loaded
+  program's segment, which has no page cache, is a file's (bit 61) until
+  the mapping was written, not until the page was. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
 - **`PAGEMAP_SCAN`, in part**:

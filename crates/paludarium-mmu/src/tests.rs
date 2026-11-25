@@ -1765,6 +1765,35 @@ fn a_fork_leaves_out_a_pinned_page_the_child_does_not_get() {
 }
 
 #[test]
+fn droppable_memory_is_wiped_in_a_child_and_never_dumped_for_good() {
+    let mut m = AddressSpace::new();
+    let at = m
+        .map(
+            None,
+            2 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    let end = at.0 + 2 * PAGE_SIZE;
+    m.drop_new(at, end);
+    m.write(at, b"d").unwrap();
+    let mapping = m.mappings().find(|m| m.start == at).unwrap();
+    assert!(mapping.droppable && mapping.no_reserve && mapping.wipe_on_fork && mapping.dont_dump);
+    // Not charged against overcommit, as `VM_NORESERVE` makes it.
+    assert!(!mapping.account);
+    for advice in [FlagAdvice::KeepOnFork, FlagAdvice::DoDump] {
+        assert_eq!(m.advise_flags(at, end, advice), Err(Errno::EINVAL));
+    }
+    // `mlock` leaves it as it is, and a child gets none of its pages.
+    m.lock(at, end, Some(Lock::Populated)).unwrap();
+    let mapping = m.mappings().find(|m| m.start == at).unwrap();
+    assert_eq!((mapping.locked, mapping.length), (None, 2 * PAGE_SIZE));
+    let child = m.fork().unwrap();
+    assert_eq!(child.resident_pages(), (0, 0));
+}
+
+#[test]
 fn a_child_and_a_moved_mapping_keep_the_registrations_whose_events_they_give() {
     const WP: u64 = 1 << 57;
     let mut m = AddressSpace::new();

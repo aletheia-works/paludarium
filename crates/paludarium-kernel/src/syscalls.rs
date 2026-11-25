@@ -2467,6 +2467,36 @@ fn poll_once(c: &mut Context<'_>, fds: u64, nfds: u64) -> Result<u64, Errno> {
 
 const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
+/// `MAP_SHARED` whose other flags must all be known (`EOPNOTSUPP`).
+const MAP_SHARED_VALIDATE: u64 = 0x03;
+/// Anonymous memory whose pages Linux may drop under memory pressure.
+const MAP_DROPPABLE: u64 = 0x08;
+/// The bits of a mapping's type, of which one value is taken.
+const MAP_TYPE: u64 = 0x0f;
+const MAP_HUGETLB: u64 = 0x4_0000;
+/// The flags `MAP_SHARED_VALIDATE` takes of any file here (Linux's
+/// `LEGACY_MAP_MASK`): those of before it, with `MAP_UNINITIALIZED`,
+/// `MAP_ABOVE4G` and the huge page sizes of 2 MiB and 1 GiB. Not
+/// `MAP_FIXED_NOREPLACE`, nor `MAP_SYNC`, which only a file of DAX would
+/// add (`FOP_MMAP_SYNC`).
+const LEGACY_MAP_MASK: u64 = MAP_SHARED
+    | MAP_PRIVATE
+    | MAP_FIXED
+    | MAP_ANONYMOUS
+    | 0x800 // MAP_DENYWRITE
+    | 0x1000 // MAP_EXECUTABLE
+    | 0x400_0000 // MAP_UNINITIALIZED
+    | MAP_GROWSDOWN
+    | MAP_LOCKED
+    | MAP_NORESERVE
+    | MAP_POPULATE
+    | MAP_NONBLOCK
+    | MAP_STACK
+    | MAP_HUGETLB
+    | MAP_32BIT
+    | 0x80 // MAP_ABOVE4G
+    | 21 << 26 // MAP_HUGE_2MB
+    | 30 << 26; // MAP_HUGE_1GB
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
@@ -2523,15 +2553,30 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         read_implies_exec(c.process, prot)
     };
     let file = descriptor.as_ref().map(|d| d.file.clone());
-    if len == 0 || !matches!(flags & (MAP_SHARED | MAP_PRIVATE), MAP_SHARED | MAP_PRIVATE) {
+    // A file maps shared, shared with its flags validated, or private;
+    // anonymous memory shared, private or droppable (`do_mmap`).
+    // /dev/zero is a file there.
+    let kinds: &[u64] = if file.is_some() {
+        &[MAP_SHARED, MAP_SHARED_VALIDATE, MAP_PRIVATE]
+    } else {
+        &[MAP_SHARED, MAP_PRIVATE, MAP_DROPPABLE]
+    };
+    if len == 0 || !kinds.contains(&(flags & MAP_TYPE)) {
         return err(Errno::EINVAL);
     }
+    let droppable = flags & MAP_TYPE == MAP_DROPPABLE;
+    // `MAP_SHARED_VALIDATE` refuses a flag it does not know; `MAP_SHARED`
+    // drops it.
+    let unknown = flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !LEGACY_MAP_MASK != 0;
     // A ring of io_uring maps its own pages.
     if let Some(file) = &file
         && file
             .as_any()
             .is_some_and(|v| v.is::<crate::io_uring::Ring>())
     {
+        if unknown {
+            return err(Errno::EOPNOTSUPP);
+        }
         return match crate::io_uring::mmap(
             c,
             file,
@@ -2563,6 +2608,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len, noexec)
     {
         return err(e);
+    }
+    if event && unknown {
+        return err(Errno::EOPNOTSUPP);
     }
     // A mapping of /dev/zero is anonymous memory (shared with MAP_SHARED),
     // as Linux's mmap_zero makes it.
@@ -2649,8 +2697,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         return err(Errno::EAGAIN);
     }
     // Only private anonymous memory grows down (a file's is refused in
-    // `check_mappable`).
-    if flags & (MAP_GROWSDOWN | MAP_SHARED) == MAP_GROWSDOWN | MAP_SHARED {
+    // `check_mappable`). Droppable memory is neither locked nor of huge
+    // pages either.
+    if flags & (MAP_GROWSDOWN | MAP_SHARED) == MAP_GROWSDOWN | MAP_SHARED
+        || droppable && flags & (MAP_GROWSDOWN | MAP_LOCKED | MAP_HUGETLB) != 0
+    {
         return err(Errno::EINVAL);
     }
     // An event's ring buffer maps its own pages (`perf_mmap`).
@@ -2756,6 +2807,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             if flags & MAP_GROWSDOWN != 0 {
                 c.mem.grow_new_down(a, end);
             }
+            if droppable {
+                c.mem.drop_new(a, end);
+            }
             // A new VMA is soft-dirty, and so is the one it merged with
             // (`__mmap_complete`).
             c.mem.mapped(a, end);
@@ -2815,7 +2869,8 @@ fn sys_remap_file_pages(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 const O_PATH: u32 = 0o10000000;
 
-/// The `mmap` checks of a file, in Linux's order: a shared mapping that
+/// The `mmap` checks of a file, in Linux's order: after its size, a flag
+/// `MAP_SHARED_VALIDATE` does not know is `EOPNOTSUPP`; a shared mapping that
 /// writes needs a file open for reading and writing, any mapping one open
 /// for reading, and a memfd sealed against writes refuses a shared mapping
 /// that writes (seal_check_write).
@@ -2831,6 +2886,9 @@ fn check_mappable(
     // A regular file's mapping must end within the largest file size.
     if regular && i64::MAX as u64 - len.min(i64::MAX as u64) < offset {
         return Err(Errno::EOVERFLOW);
+    }
+    if flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !LEGACY_MAP_MASK != 0 {
+        return Err(Errno::EOPNOTSUPP);
     }
     let access = file.flags() & 3;
     let shared_write = flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE);

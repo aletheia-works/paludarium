@@ -982,6 +982,24 @@ kernel.
   backing cannot be attached, the new mapping goes and what it replaced stays
   gone.
 
+- `mmap` takes the types of `do_mmap` (`MAP_TYPE`, four bits): a file, and
+  `/dev/zero`, maps `MAP_SHARED`, `MAP_SHARED_VALIDATE` or `MAP_PRIVATE`;
+  anonymous memory `MAP_SHARED`, `MAP_PRIVATE` or `MAP_DROPPABLE`; any other
+  value is `EINVAL`. `MAP_SHARED_VALIDATE` is `MAP_SHARED` that refuses a
+  flag Linux's `LEGACY_MAP_MASK` does not hold (`EOPNOTSUPP`, after the
+  file's size is checked and before its access): `MAP_SYNC`, which no file
+  here supports, `MAP_FIXED_NOREPLACE`, the huge page size's bit 31, which
+  neither 2 MiB's nor 1 GiB's has, and any unknown bit, also above bit 31;
+  `MAP_SHARED` drops them. `MAP_DROPPABLE` memory is private anonymous memory with
+  `VM_DROPPABLE` (`VmFlags: dp`), `VM_NORESERVE`, `VM_WIPEONFORK` and
+  `VM_DONTDUMP`: a `fork`ed child gets it with none of its pages and a core
+  holds none of it, for good (`MADV_KEEPONFORK` and `MADV_DODUMP` are
+  `EINVAL`). It may not be `MAP_LOCKED`, `MAP_GROWSDOWN` or `MAP_HUGETLB`
+  (`EINVAL`), `mlock` and `munlock` leave it as it is (one `mlockall`'s
+  `MCL_FUTURE` locked stays locked), `MADV_MERGEABLE` passes it by, and a
+  `userfaultfd` does not register it (`EINVAL`). Linux drops its pages under
+  memory pressure, which the emulator never has, so they stay.
+
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and
@@ -3833,15 +3851,15 @@ kernel.
   read as zeros. `[vdso]` may be made writable, which copies it (so does a
   write through `/proc/<pid>/mem`), and moved by `mremap`, but not grown
   (`EFAULT`). None of the three is split: an `munmap`, `mprotect`, `mremap`,
-  `mseal` or the like of a part of one that would split it is `EINVAL`. `statm` and `VmSize` count the
-  three, a `fork` keeps them where they are, and a core holds them whole,
-  as Linux's `always_dump_vma` dumps a special mapping.
+  `mseal` or the like of a part of one that would split it is `EINVAL`.
+  `statm` counts the three, a `fork` keeps them where they are, and a core
+  holds them whole, as Linux's `always_dump_vma` dumps a special mapping.
 
 - The `vsyscall` page is Linux's default (`CONFIG_LEGACY_VSYSCALL_XONLY`):
   a gate area at `ffffffffff600000`, no mapping of the process, which is the
   last line of `maps` and `smaps` (`--xp`, `VmFlags: ex`) and the last
-  segment of a core (zeros), and which `statm`, `VmSize` and `smaps_rollup`
-  leave out. It can be run but not read (`SIGSEGV`, `SEGV_MAPERR`). Its
+  segment of a core (zeros), and which `statm` and `smaps_rollup` leave
+  out. It can be run but not read (`SIGSEGV`, `SEGV_MAPERR`). Its
   entries `+0x000` (`gettimeofday`), `+0x400` (`time`) and `+0x800`
   (`getcpu`) do what `emulate_vsyscall` does: seccomp sees the call with the
   entry's address, and a tracer its `PTRACE_EVENT_SECCOMP`, but no system
@@ -4343,7 +4361,8 @@ kernel.
   may open to write. Both are unsigned longs, as Linux's
   `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
   (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
-  `/proc/sys/fs` lists only these, `fanotify`, `inotify` and `mqueue`.
+  `/proc/sys/fs` lists only these, `fanotify`, `inotify`, `mqueue`,
+  `lease-break-time` and `leases-enable`.
 
 - `/proc/sys/fs/inotify` has the machine's inotify limits, root's regular
   files of mode 0644 that only root (user ID 0 outside any user namespace)
@@ -4640,7 +4659,8 @@ kernel.
   secret memory, the charge (`ac`, which private memory that was writable
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never
   written gives back as it stops being writable), `nh` of a `MAP_STACK`
-  mapping, the seal (`sl`), and `sd` (`VM_SOFTDIRTY`) on every VMA
+  mapping, `nr`, `wf`, `dd` and `dp` of a `MAP_DROPPABLE` one, the seal
+  (`sl`), and `sd` (`VM_SOFTDIRTY`) on every VMA
   `clear_refs` has not cleared since it was made, but the initial stack:
   one that merges with a new VMA has it again, as Linux's sticky flags.
 

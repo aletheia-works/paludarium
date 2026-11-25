@@ -4907,8 +4907,9 @@ kernel.
   forked child starts from zero, and an `execve` keeps both. Their
   `ru_minflt` counts the minor faults, as Linux's `mm_account_fault` adds
   them to the task: a thread's first read or write of a page and its write
-  to a page `fork` shares or of a private mapping of a file (in its own code
-  and in the kernel's accesses for it: a system call's copies, a signal
+  to a page `fork` shares or of a private mapping of a file (in its own code,
+  where an instruction that reads and writes its operand takes one, a write,
+  as x86-64's do, and in the kernel's accesses for it: a system call's copies, a signal
   frame, an `rseq` area's update), each as it is taken, and the faults of the reads and writes
   through `get_user_pages` made for it, which `perf` does not count:
   `mlock`'s, `mlockall`'s and `MAP_POPULATE`'s population,

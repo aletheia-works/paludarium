@@ -2679,6 +2679,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     でもグループに入っているものと、`IPV6_MULTICAST_ALL` が入ったものに届きます
     （`inet6_mc_check`）。受け付けた接続の `IPV6_MULTICAST_HOPS` は 64 です
     （`tcp_v6_syn_recv_sock`）。
+  - **送信元フィルター:** グループに入ったソケットは、そのフィルターが通すものを受け取ります。
+    フィルターの送信元からのもの（`MCAST_INCLUDE`）か、ほかのすべてからのもの
+    （`MCAST_EXCLUDE`。入ったときは送信元なしです）です。IPv4 の
+    `IP_ADD_SOURCE_MEMBERSHIP`、`IP_DROP_SOURCE_MEMBERSHIP`、`IP_BLOCK_SOURCE`、
+    `IP_UNBLOCK_SOURCE`、`IP_MSFILTER`（`getsockopt` でも読めます）と、両方のファミリーの
+    `MCAST_JOIN_SOURCE_GROUP`、`MCAST_LEAVE_SOURCE_GROUP`、`MCAST_BLOCK_SOURCE`、
+    `MCAST_UNBLOCK_SOURCE`、`MCAST_MSFILTER` が、これを変えます。`MCAST_JOIN_GROUP` と
+    `MCAST_LEAVE_GROUP` もあります。どれも TCP のソケットでも使えます。送信元のあるフィルターの
+    種類は変わらず（`EINVAL`）、同じ送信元を足すことも、ないものを除くこともできません
+    （`EADDRNOTAVAIL`）。送信元は IPv4 で 10、IPv6 で 64 までです（`ENOBUFS`）。何も通さなくなった
+    `MCAST_INCLUDE` のものは、グループから出ます（`ip_mc_source`、`ip_mc_msfilter`、
+    `ip6_mc_source`、`ip6_mc_msfilter`）。Linux の master と同じく、最後の送信元の除外を
+    やめた IPv6 のフィルターは種類を変えられます（Linux 7.0 は断り、IPv4 は今も断ります）。デバイスは、
+    そこで入っているどれかが通す送信元からのものと、除外するもののどれかが挙げていない
+    送信元からのものを受け取ります（`ip_check_mc_rcu`、`ipv6_chk_mcast_addr`）。
+    受け取らないものは、`IP_MULTICAST_ALL` や `IPV6_MULTICAST_ALL` が入ったソケットにも届かず、
+    送り手自身にも戻りません。
   - **組を通る IPv6:** IPv6 の経路（ユニキャストのもの、またはマルチキャストの
     `ff00::/8`）が端から出る接続とデータグラムは、経路の優先する送り元か、
     `ipv6_dev_get_saddr` が選ぶアドレスから出ます。選ぶのは、グループとリンクローカルの
@@ -2917,7 +2934,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ビットと比べ、答えは合った経路の TOS を返します。マルチキャストアドレスと制限
     ブロードキャストアドレスの IPv4 の答えは、`__mkroute_output` が作るのと同じく、
     マルチキャストかブロードキャストの種類です（`RTCF_MULTICAST` か `RTCF_BROADCAST` で、
-    ブロードキャストアドレスと、デバイスが入っているグループには
+    ブロードキャストアドレスと、デバイスが入っていてその送り元を受け取るグループには
     `RTCF_LOCAL` も付きます）。`RTM_F_FIB_MATCH` で返す表の項目も、その種類になります。
     出力デバイスなしでループバックの送り元を指したとき、および `lo` を通してローカルの
     グループ（224.0.0.0/24）かブロードキャストアドレスへ向かうときは、表を引かずに作ります
@@ -2931,7 +2948,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     入ってきたパケットと同じく経路を引き（`ip_route_input_slow`、
     `ip6_route_input_lookup`）、答えには `RTA_IIF` にそのデバイスを入れます。IPv4 は martian を捨てます（`EINVAL`）。マルチキャスト、限定ブロード
     キャスト、ループバック、0.0.0.0 の送り元、ループバックか 0.0.0.0 の宛先、デバイスが
-    入っていないグループ、名前空間自身のアドレスの送り元です。要求がローカルの経路を
+    入っていないか、そのフィルターが送り元を除くグループ、名前空間自身のアドレスの送り元です。要求がローカルの経路を
     足したあとは、引き当てでユニキャストでない経路が見つかる送り元も捨てます
     （`fib_validate_source`）。ローカル、ブロードキャスト、マルチキャストの宛先には、
     その型のローカルの経路（`RTCF_LOCAL`、`RTCF_BROADCAST`、`RTCF_MULTICAST`）を、

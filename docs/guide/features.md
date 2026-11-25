@@ -3094,6 +3094,26 @@ kernel.
     none or its sender, that is a member of the group, on whatever device,
     or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
     connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
+  - **Source filters:** a membership takes what its filter lets in: from its
+    sources (`MCAST_INCLUDE`) or from all others (`MCAST_EXCLUDE`, of no
+    sources as a join leaves it). IPv4's `IP_ADD_SOURCE_MEMBERSHIP`,
+    `IP_DROP_SOURCE_MEMBERSHIP`, `IP_BLOCK_SOURCE`, `IP_UNBLOCK_SOURCE` and
+    `IP_MSFILTER` (which `getsockopt` reads too) change it, as do
+    `MCAST_JOIN_SOURCE_GROUP`, `MCAST_LEAVE_SOURCE_GROUP`,
+    `MCAST_BLOCK_SOURCE`, `MCAST_UNBLOCK_SOURCE` and `MCAST_MSFILTER` of
+    both families, beside `MCAST_JOIN_GROUP` and `MCAST_LEAVE_GROUP`; TCP
+    sockets take them too. A filter with sources stays of its mode
+    (`EINVAL`), a source is added once and taken away once
+    (`EADDRNOTAVAIL`), there are at most 10 of IPv4's and 64 of IPv6's
+    (`ENOBUFS`), and a membership that includes none ends (`ip_mc_source`,
+    `ip_mc_msfilter`, `ip6_mc_source`, `ip6_mc_msfilter`). As on Linux
+    master, an IPv6 filter whose last blocked source goes may change its
+    mode, which Linux 7.0 refuses, as IPv4's still does. A device takes
+    from a source what any membership on it includes, or what one that
+    excludes does not name (`ip_check_mc_rcu`, `ipv6_chk_mcast_addr`):
+    what it does not take reaches no socket, one that has
+    `IP_MULTICAST_ALL` or `IPV6_MULTICAST_ALL` on neither, and a sender's
+    own copy of it does not come back.
   - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
     unicast one, or the multicast `ff00::/8`) goes out through an end
     leaves from the route's preferred source, or the address
@@ -3385,7 +3405,8 @@ kernel.
     the route that matched. An IPv4 answer for a multicast or the limited
     broadcast address is of the multicast or broadcast type, as
     `__mkroute_output` makes it (`RTCF_MULTICAST` or `RTCF_BROADCAST`, and
-    `RTCF_LOCAL` for the broadcast address and a group the device is in),
+    `RTCF_LOCAL` for the broadcast address and a group the device is in and
+    takes that source's packets to),
     and with `RTM_F_FIB_MATCH` the table's
     entry takes that type too; from a source of the loopback's and no
     device, and through `lo` to a local group (224.0.0.0/24) or the
@@ -3402,7 +3423,7 @@ kernel.
     the device as `RTA_IIF`. IPv4 drops martians
     (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
     source, a loopback or 0.0.0.0 destination, a group the device has not
-    joined, and a source of the namespace's own, or with a local route a
+    joined or whose source its filters keep out, and a source of the namespace's own, or with a local route a
     request added, one a lookup finds a route to that is not unicast
     (`fib_validate_source`). A local, broadcast or multicast destination
     gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,

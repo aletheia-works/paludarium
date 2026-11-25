@@ -4489,7 +4489,7 @@ fn lookup(
             RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST,
         )
     } else if ip.is_multicast() {
-        let member = i32::try_from(out).is_ok_and(|out| network.in_group4(out, ip));
+        let member = i32::try_from(out).is_ok_and(|out| network.in_group4(out, source, ip));
         let local = if member { RTCF_LOCAL } else { 0 };
         (RTN_MULTICAST, RTM_F_CLONED | RTCF_MULTICAST | local)
     } else if kind == Kind::Broadcast {
@@ -4610,7 +4610,12 @@ fn input4(
     let (code, flags, route) = if ip.is_multicast() {
         // `ip_route_input_mc`, for a group the device has joined
         // (`ip_check_mc_rcu`), after `ip_mc_validate_source`.
-        if !input.groups4.has(ip) || martian(src) || src.is_loopback() {
+        if !input
+            .groups4
+            .takes(ip, (!src.is_unspecified()).then_some(src))
+            || martian(src)
+            || src.is_loopback()
+        {
             return Err(Errno::EINVAL);
         }
         let local_group = crate::multicast::local_group(ip);

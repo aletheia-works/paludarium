@@ -203,8 +203,8 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Multicast datagrams reach no one, nor do broadcast ones but through a
-    veth end (below). A datagram is always
+    IPv6 multicast datagrams reach no one, nor do broadcast ones but through
+    a veth end (below). A datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
     `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer

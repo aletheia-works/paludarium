@@ -582,7 +582,10 @@ verified.
   files are ready, as for a thread that exits alone. A huge page of a
   registered buffer charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where
   Linux charges it once. A ring maps only shared (`MAP_PRIVATE` gives
-  `EINVAL`).
+  `EINVAL`). An offset that no region of a ring has gives its mapping
+  `ENOMEM`, as on Linux 7.0, the kernel the differential tests run on;
+  Linux master's `io_uring_get_unmapped_area` gives `EINVAL`. This follows
+  master once the test runners' kernel does.
   The features are Linux
   6.12's, so `IORING_FEAT_MIN_TIMEOUT` is reported though a wait's
   `min_wait_usec` changes nothing. A pseudo-terminal's read waits in

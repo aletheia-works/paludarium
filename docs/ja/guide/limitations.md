@@ -493,6 +493,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Linux 7.0 は、ひとりで終わるスレッドのときと同じく、ファイルの準備ができてから取り消します。
   登録したバッファーのヒュージページは 4 KiB のページごとに RLIMIT_MEMLOCK を数えます
   （Linux は 1 回だけ数えます）。リングは共有でしかマップできません（`MAP_PRIVATE` は `EINVAL`）。
+  リングのどの領域でもないオフセットのマッピングは、差分テストを走らせるカーネルである
+  Linux 7.0 と同じく `ENOMEM` です。Linux master の `io_uring_get_unmapped_area` は `EINVAL` を
+  返します。テストを走らせるカーネルが追いつけば master に合わせます。
   機能は Linux 6.12 のものなので、待ちの `min_wait_usec` は何も変えないのに
   `IORING_FEAT_MIN_TIMEOUT` を報告します。疑似端末の読み出しは、パイプの読み出しのように
   ファイルを待つのではなく、`io_uring_enter` の中で待ちます。

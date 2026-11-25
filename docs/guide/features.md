@@ -1768,8 +1768,7 @@ kernel.
   does, in either layout: at a free hint that ends by 2 GiB, else in the
   lowest room from 1 GiB up (Linux starts up to 32 MiB higher, at random),
   with the placements at a 2 MiB boundary there too, or `ENOMEM`.
-  `MAP_FIXED` overrides it, and `mremap` does not keep to it. The mapping
-  of an `io_uring` ring does not follow it yet. A hint below
+  `MAP_FIXED` overrides it, and `mremap` does not keep to it. A hint below
   `mmap_min_addr` (64 KiB) is taken as that address; a fixed mapping
   below it, a move there by `mremap` (once its target is unmapped and its
   source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone

@@ -538,6 +538,7 @@
     {"name":"io-uring-buffers2","binary":"process"},
     {"name":"io-uring-held-buffer","binary":"process"},
     {"name":"io-uring-net","binary":"process"},
+    {"name":"io-uring-placement","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

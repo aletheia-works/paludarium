@@ -1107,7 +1107,10 @@ verified.
   `rt6_check_neigh` does among routes of one metric. Of an IPv6 multipath
   route's hops through the device asked for, the flow's hash picks one, as
   Linux 7.0 does; Linux master takes the hop the lookup found
-  (`have_oif_match` in `ip6_pol_route`). A UDP
+  (`have_oif_match` in `ip6_pol_route`). An IPv6 packet's
+  answer comes back only through the end the packet went out through, so
+  that one a multipath route sends back through another end is lost,
+  where Linux's comes. A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
@@ -1193,9 +1196,7 @@ verified.
   Linux is built. A veth end whose MTU is below 1280 still has the files
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
-  A route goes through `lo` or a veth end, or rejects; of an IPv4
-  multipath route's next hops, a lookup takes the first not dead, where
-  Linux picks one by a hash of the flow (`fib_select_multipath`). An IPv4
+  A route goes through `lo` or a veth end, or rejects; an IPv4
   next hop through an IPv6 gateway (`RTA_VIA`), encapsulations, nexthop
   objects, realms, expiries, source prefixes, router preferences and the
   anycast, multicast and NAT kinds (and broadcast for IPv6) are

@@ -835,6 +835,12 @@ impl Ports {
         self.live();
         self.best_listener(to, dif).is_some()
     }
+    /// The device the listener a connection to `to` in on `dif` reaches is
+    /// bound to, 0 for none.
+    pub(crate) fn listener_device(&mut self, to: SocketAddr, dif: u32) -> u32 {
+        self.live();
+        self.best_listener(to, dif).map_or(0, |b| b.device)
+    }
     /// The listener that ranks first for `to` in on `dif`, before its
     /// group.
     fn best_listener(&self, to: SocketAddr, dif: u32) -> Option<&Binding> {

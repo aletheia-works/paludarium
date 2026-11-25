@@ -2882,7 +2882,18 @@ kernel.
     `RTNH_F_LINKDOWN`; a route whose hops are all dead goes, as one does
     through an end that goes away. A removal naming a device or gateway
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
-    hops in turn (`fib_nh_match`). An output lookup that goes through an end leaves from its first
+    hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
+    source and destination falls to, each hop living taking a share of the
+    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), with
+    the namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
+    them; before the hash, one whose device's own source is the lookup's;
+    through a device named, the first through it. A socket not bound takes
+    the source of the hop it hashes to with no source, and a connection or
+    a UDP connect then looks its route up from that source
+    (`ip_route_connect`). A packet may come in on the device of any hop of
+    the route back to its source (`fib_info_nh_uses_dev`), and its answer
+    goes back by a lookup of its own, through whichever end that takes, or
+    the one its listener is bound to. An output lookup that goes through an end leaves from its first
     primary address, else from the first of the other devices' in the
     order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
     without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
@@ -3270,9 +3281,9 @@ kernel.
     Linux's multicast routing knows no device of the reply it fills
     (`ip6mr_get_route`). The source, the flow label (`RTA_FLOWLABEL`)
     and the protocol choose among an IPv6 multipath route's hops, as
-    `fib6_select_path` hashes them, and of an IPv4 one's a lookup takes
-    the first not dead; the mark, the user ID and the ports choose among
-    policy rules, which there are none of, so they change nothing.
+    `fib6_select_path` hashes them, and the source among an IPv4 one's, as
+    `fib_select_path` does, for an input route by the hash alone; the
+    mark, the user ID and the ports choose among policy rules, which there are none of, so they change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed

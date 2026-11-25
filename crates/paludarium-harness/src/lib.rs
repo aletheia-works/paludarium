@@ -175,9 +175,9 @@ pub fn run_native_within(
 
 /// `session` with the native JIT when `PALUDARIUM_TEST_JIT=N` asks for it,
 /// compiling the blocks run N times (1: every block, the first time it
-/// runs) on the thread that runs them, so that a block runs compiled from
-/// the entry that reaches N, for `mise run test:diff:jit`. A test that
-/// makes a session of its own passes it through this too.
+/// runs) while the thread that runs them waits, so that a block runs
+/// compiled from the entry that reaches N, for `mise run test:diff:jit`. A
+/// test that makes a session of its own passes it through this too.
 pub fn with_test_jit(session: Session) -> Result<Session, String> {
     match std::env::var("PALUDARIUM_TEST_JIT")
         .ok()

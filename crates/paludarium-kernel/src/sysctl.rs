@@ -46,6 +46,11 @@
 //! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
 //! `bpf_unpriv_handler`.
 //!
+//! `/proc/sys/kernel` also shows the names of the UTS namespace of who
+//! reads or writes ([`Uts`]), as `kernel/utsname_sysctl.c` has them: strings
+//! (`proc_dostring`), of which only root may write `hostname` and
+//! `domainname`.
+//!
 //! `/proc/sys/vm` has `unprivileged_userfaultfd`, the machine's as the perf
 //! ones are, 0 or 1 (`proc_dointvec_minmax`), which lets [`crate::userfaultfd`]
 //! take the kernel's faults for anyone; and `drop_caches`, as
@@ -70,6 +75,7 @@
 //! file has an inode of its own and a size of 0 ([`stat`]), so, as on
 //! Linux, `copy_file_range` never writes one: from another filesystem it is
 //! `EXDEV`, and from a sysctl it copies nothing.
+use crate::events::ReadinessHub;
 use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
 use crate::namespaces::Namespace;
@@ -78,8 +84,8 @@ use crate::syscalls::Context;
 use crate::users::Ids as Kind;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat};
 use paludarium_types::Errno;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -234,6 +240,141 @@ const FANOTIFY: [(&[u8], Fanotify); 4] = [
     (b"watchdog_timeout", Fanotify::WatchdogTimeout),
 ];
 
+/// A file of `/proc/sys/kernel` that shows a field of the reader's UTS
+/// namespace (`uts_kern_table`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Uts {
+    Arch,
+    Domainname,
+    Hostname,
+    Osrelease,
+    Ostype,
+    Version,
+}
+
+impl Uts {
+    /// Whether it is one `sethostname` or `setdomainname` sets too, of mode
+    /// 0644; the others are 0444.
+    fn writable(self) -> bool {
+        matches!(self, Self::Hostname | Self::Domainname)
+    }
+    /// The field in `namespace`, up to its first NUL.
+    fn value(self, namespace: &Namespace) -> Vec<u8> {
+        let mut value = match self {
+            Self::Arch => crate::namespaces::MACHINE.to_vec(),
+            Self::Osrelease => crate::namespaces::RELEASE.to_vec(),
+            Self::Ostype => crate::namespaces::SYSNAME.to_vec(),
+            Self::Version => crate::namespaces::VERSION.to_vec(),
+            Self::Hostname => namespace.names().host,
+            Self::Domainname => namespace.names().domain,
+        };
+        value.truncate(value.iter().position(|&b| b == 0).unwrap_or(value.len()));
+        value
+    }
+    /// A read of `buf` at `position`, as `_proc_do_string` gives it: what is
+    /// left of the string, and a newline if it all fits with one more byte.
+    fn read(self, namespace: &Namespace, buf: &mut [u8], position: &mut u64) -> usize {
+        let value = self.value(namespace);
+        let Some(rest) = usize::try_from(*position)
+            .ok()
+            .and_then(|at| value.get(at..))
+        else {
+            return 0;
+        };
+        let mut count = rest.len().min(buf.len());
+        buf[..count].copy_from_slice(&rest[..count]);
+        if let Some(end) = buf.get_mut(count) {
+            *end = b'\n';
+            count += 1;
+        }
+        *position += count as u64;
+        count
+    }
+    /// A write of `buf` at `position`, as `proc_do_uts_string` takes it with
+    /// `sysctl_writes_strict`: all of it, up to a NUL or newline, into the
+    /// name at that offset, 64 bytes at most, and a NUL after it, which
+    /// leaves the bytes past that as they were; past the name's end nothing,
+    /// the position as it was.
+    fn write(self, namespace: &Namespace, buf: &[u8], position: &mut u64) -> usize {
+        namespace.change_name(self == Self::Domainname, |name| {
+            let mut field = [0; crate::namespaces::NAME_LENGTH + 1];
+            field[..name.len()].copy_from_slice(name);
+            let length = field.iter().position(|&b| b == 0).unwrap_or(0);
+            let Some(start) = usize::try_from(*position).ok().filter(|&at| at <= length) else {
+                return buf.len();
+            };
+            *position += buf.len() as u64;
+            let room = crate::namespaces::NAME_LENGTH - start;
+            let taken = buf
+                .iter()
+                .take(room)
+                .take_while(|&&b| !matches!(b, 0 | b'\n'))
+                .count();
+            field[start..start + taken].copy_from_slice(&buf[..taken]);
+            field[start + taken] = 0;
+            let end = field.iter().rposition(|&b| b != 0).map_or(0, |at| at + 1);
+            *name = field[..end].to_vec();
+            buf.len()
+        })
+    }
+}
+
+/// An open file of `/proc/sys/kernel` that shows a UTS namespace's field.
+struct UtsFile {
+    file: Uts,
+    processes: Weak<crate::processes::Processes>,
+    machine: Arc<Machine>,
+    hub: Arc<ReadinessHub>,
+    /// The change it was open at or last told a poll of, which Linux keeps
+    /// in `filp->private_data`, so a `dup` and a child share it.
+    seen: AtomicU64,
+}
+
+impl UtsFile {
+    fn opened(c: &Context<'_>, file: Uts) -> Self {
+        let machine = Arc::clone(&c.processes.sysctls);
+        Self {
+            file,
+            processes: Arc::downgrade(c.processes),
+            hub: Arc::clone(&c.files.readiness),
+            seen: AtomicU64::new(machine.uts_events(file == Uts::Domainname)),
+            machine,
+        }
+    }
+    /// The UTS namespace of the thread whose system call runs, which
+    /// Linux's `get_uts` takes from `current`.
+    fn namespace(&self) -> Result<Arc<Namespace>, Errno> {
+        const ESRCH: Errno = Errno(3);
+        let (pid, tid) = crate::proc::caller();
+        let group = self
+            .processes
+            .upgrade()
+            .and_then(|processes| processes.group_of(pid))
+            .ok_or(ESRCH)?;
+        Ok(Arc::clone(&group.namespaces(tid).uts))
+    }
+    fn read(&self, buf: &mut [u8], position: &mut u64) -> Result<usize, Errno> {
+        Ok(self.file.read(&*self.namespace()?, buf, position))
+    }
+    /// [`Uts::write`], which tells of a change whatever it wrote, as
+    /// `proc_do_uts_string` does.
+    fn write(&self, buf: &[u8], position: &mut u64) -> Result<usize, Errno> {
+        let written = self.file.write(&*self.namespace()?, buf, position);
+        self.machine
+            .uts_changed(self.file == Uts::Domainname, &self.hub);
+        Ok(written)
+    }
+    /// How often what it shows changed: never, but for the two whose table
+    /// entry has a `poll`.
+    fn changes(&self) -> u64 {
+        if self.file.writable() {
+            self.machine.uts_events(self.file == Uts::Domainname)
+        } else {
+            self.seen.load(Ordering::SeqCst)
+        }
+    }
+}
+
 /// A file of `/proc/sys/kernel`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kernel {
@@ -266,30 +407,45 @@ pub(crate) enum Kernel {
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
 /// name).
-const KERNEL: [(&[u8], Kernel); 17] = [
-    (b"auto_msgmni", Kernel::AutoMsgmni),
-    (b"msg_next_id", Kernel::MsgNextId),
-    (b"msgmax", Kernel::Msgmax),
-    (b"msgmnb", Kernel::Msgmnb),
-    (b"msgmni", Kernel::Msgmni),
-    (b"perf_cpu_time_max_percent", Kernel::PerfCpuTimeMaxPercent),
+const KERNEL: [(&[u8], Entry); 23] = [
+    (b"arch", Entry::Uts(Uts::Arch)),
+    (b"auto_msgmni", Entry::Kernel(Kernel::AutoMsgmni)),
+    (b"domainname", Entry::Uts(Uts::Domainname)),
+    (b"hostname", Entry::Uts(Uts::Hostname)),
+    (b"msg_next_id", Entry::Kernel(Kernel::MsgNextId)),
+    (b"msgmax", Entry::Kernel(Kernel::Msgmax)),
+    (b"msgmnb", Entry::Kernel(Kernel::Msgmnb)),
+    (b"msgmni", Entry::Kernel(Kernel::Msgmni)),
+    (b"osrelease", Entry::Uts(Uts::Osrelease)),
+    (b"ostype", Entry::Uts(Uts::Ostype)),
+    (
+        b"perf_cpu_time_max_percent",
+        Entry::Kernel(Kernel::PerfCpuTimeMaxPercent),
+    ),
     (
         b"perf_event_max_sample_rate",
-        Kernel::PerfEventMaxSampleRate,
+        Entry::Kernel(Kernel::PerfEventMaxSampleRate),
     ),
-    (b"perf_event_mlock_kb", Kernel::PerfEventMlockKb),
-    (b"perf_event_paranoid", Kernel::PerfEventParanoid),
-    (b"sem", Kernel::Sem),
-    (b"sem_next_id", Kernel::SemNextId),
-    (b"shm_next_id", Kernel::ShmNextId),
-    (b"shm_rmid_forced", Kernel::ShmRmidForced),
-    (b"shmall", Kernel::Shmall),
-    (b"shmmax", Kernel::Shmmax),
-    (b"shmmni", Kernel::Shmmni),
+    (
+        b"perf_event_mlock_kb",
+        Entry::Kernel(Kernel::PerfEventMlockKb),
+    ),
+    (
+        b"perf_event_paranoid",
+        Entry::Kernel(Kernel::PerfEventParanoid),
+    ),
+    (b"sem", Entry::Kernel(Kernel::Sem)),
+    (b"sem_next_id", Entry::Kernel(Kernel::SemNextId)),
+    (b"shm_next_id", Entry::Kernel(Kernel::ShmNextId)),
+    (b"shm_rmid_forced", Entry::Kernel(Kernel::ShmRmidForced)),
+    (b"shmall", Entry::Kernel(Kernel::Shmall)),
+    (b"shmmax", Entry::Kernel(Kernel::Shmmax)),
+    (b"shmmni", Entry::Kernel(Kernel::Shmmni)),
     (
         b"unprivileged_bpf_disabled",
-        Kernel::UnprivilegedBpfDisabled,
+        Entry::Kernel(Kernel::UnprivilegedBpfDisabled),
     ),
+    (b"version", Entry::Uts(Uts::Version)),
 ];
 
 impl Kernel {
@@ -329,6 +485,9 @@ pub(crate) struct Machine {
     drop_caches: AtomicI32,
     leases_enable: AtomicI32,
     lease_break_time: AtomicI32,
+    /// How often `kernel.hostname` and `kernel.domainname` changed, in any
+    /// UTS namespace (`hostname_poll`, `domainname_poll`).
+    uts_events: [AtomicU64; 2],
 }
 
 impl Default for Machine {
@@ -343,6 +502,7 @@ impl Default for Machine {
             drop_caches: AtomicI32::new(0),
             leases_enable: AtomicI32::new(1),
             lease_break_time: AtomicI32::new(45),
+            uts_events: Default::default(),
         }
     }
 }
@@ -373,9 +533,23 @@ impl Machine {
         const HZ: u64 = 1_000_000_000 / crate::threads::TICK_NSEC;
         self.perf_event_max_sample_rate().div_ceil(HZ)
     }
+    /// How often the host name, or with `domain` the domain name, changed.
+    fn uts_events(&self, domain: bool) -> u64 {
+        self.uts_events[usize::from(domain)].load(Ordering::SeqCst)
+    }
+    /// The host name, or with `domain` the domain name, of a UTS namespace
+    /// changed: who waits for its file hears of it (`uts_proc_notify`).
+    pub(crate) fn uts_changed(&self, domain: bool, hub: &ReadinessHub) {
+        self.uts_events[usize::from(domain)].fetch_add(1, Ordering::SeqCst);
+        hub.changed();
+    }
     /// Whether new leases may be taken (`leases_enable`).
     pub(crate) fn leases_enable(&self) -> i32 {
         self.leases_enable.load(Ordering::SeqCst)
+    }
+    /// The seconds an opener waits for a lease's break (`lease_break_time`).
+    pub(crate) fn lease_break_time(&self) -> i32 {
+        self.lease_break_time.load(Ordering::SeqCst)
     }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
@@ -396,7 +570,7 @@ impl Machine {
             Kernel::PerfEventMlockKb => self.perf_event_mlock_kb(),
             Kernel::PerfEventParanoid => self.perf_event_paranoid(),
             Kernel::LeasesEnable => self.leases_enable(),
-            Kernel::LeaseBreakTime => self.lease_break_time.load(Ordering::SeqCst),
+            Kernel::LeaseBreakTime => self.lease_break_time(),
             _ => self.unprivileged_bpf_disabled(),
         })
     }
@@ -472,6 +646,7 @@ pub(crate) enum Entry {
     Inotify(Inotify),
     Fanotify(Fanotify),
     Kernel(Kernel),
+    Uts(Uts),
     Net(Net),
     /// `/proc/sys/vm/drop_caches`.
     DropCaches,
@@ -556,7 +731,7 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
                 return KERNEL
                     .iter()
                     .find(|(known, _)| *known == name)
-                    .map(|&(_, file)| Entry::Kernel(file));
+                    .map(|&(_, entry)| entry);
             }
             if let Some(name) = rest.strip_prefix(b"/fs/fanotify/") {
                 return FANOTIFY
@@ -736,7 +911,7 @@ fn child(
         Directory::Mqueue => find(&SETTINGS.map(|(n, s)| (n, Entry::Setting(s)))),
         Directory::Inotify => find(&INOTIFY.map(|(n, f)| (n, Entry::Inotify(f)))),
         Directory::Fanotify => find(&FANOTIFY.map(|(n, f)| (n, Entry::Fanotify(f)))),
-        Directory::Kernel => find(&KERNEL.map(|(n, f)| (n, Entry::Kernel(f)))),
+        Directory::Kernel => find(&KERNEL),
     }
 }
 
@@ -982,6 +1157,14 @@ fn shown(c: &Context<'_>, entry: Entry) -> FileStat {
             mode: 0o100_200,
             ..crate::proc::stat(0)
         },
+        Entry::Uts(file) => FileStat {
+            mode: if file.writable() {
+                0o100_644
+            } else {
+                0o100_444
+            },
+            ..crate::proc::stat(0)
+        },
         Entry::Kernel(file) if !file.ipc() => FileStat {
             mode: 0o100_644,
             ..crate::proc::stat(c.processes.sysctls.line(file).len())
@@ -1065,6 +1248,16 @@ pub(crate) fn open(
         Entry::Kernel(file) if !file.ipc() => (
             Value::Machine(Arc::clone(&c.processes.sysctls), file),
             Writers::Root,
+        ),
+        // Root's, whose fields are the namespace's of who reads or writes
+        // them; `test_perm` as for an aio file.
+        Entry::Uts(file) => (
+            Value::Uts(UtsFile::opened(c, file)),
+            if file.writable() {
+                Writers::Root
+            } else {
+                Writers::None
+            },
         ),
         // Mode 0200: `test_perm` gives root the owner's bits, which do not
         // let it read, and everyone else none.
@@ -1204,6 +1397,8 @@ enum Value {
     Kernel(Arc<Namespace>, Kernel),
     /// The machine's.
     Machine(Arc<Machine>, Kernel),
+    /// The UTS namespace's of the thread whose call it is.
+    Uts(UtsFile),
     Net(NetFile),
     /// The machine's `vm.drop_caches`, which drops from its caches.
     DropCaches(Arc<Machine>, Arc<crate::page_cache::PageCaches>),
@@ -1340,6 +1535,8 @@ impl Value {
             Self::Machine(machine, file) => machine.line(*file),
             Self::Net(net) => line(net_value(&net.network, net.file)),
             Self::DropCaches(machine, _) => line(machine.drop_caches()),
+            // A string, read by [`Uts::read`].
+            Self::Uts(_) => Vec::new(),
         }
     }
     /// What follows a write that went through, one past the start too:
@@ -1383,8 +1580,8 @@ impl Value {
                 machine.drop_caches.store(value, Ordering::SeqCst);
                 Ok(consumed)
             }
-            // Taken whole by [`NetFile::take`].
-            Self::Net(_) => Err(Errno::EINVAL),
+            // Taken whole by [`NetFile::take`] and [`Uts::write`].
+            Self::Net(_) | Self::Uts(_) => Err(Errno::EINVAL),
             Self::Aio(limits, _) => {
                 let (negative, value, consumed) = scan(buf)?;
                 if negative {
@@ -1439,6 +1636,33 @@ impl Value {
             }
         }
     }
+}
+
+/// `EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM`.
+const DEFAULT_POLLMASK: u32 = 0x145;
+/// `EPOLLIN | EPOLLRDNORM | EPOLLERR | EPOLLPRI`, what a poll gives of a
+/// changed name.
+const CHANGED_POLLMASK: u32 = 0x4b;
+
+/// A poll looked at `file` and found its generation at `generation`
+/// ([`FileHandle::readiness`]): if it is a file of `/proc/sys` whose name
+/// changed, the poll told of that, and the next one does not again.
+pub(crate) fn polled(file: &dyn FileHandle, generation: u64) {
+    if let Some(setting) = file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<SettingFile>())
+        && let Value::Uts(uts) = &setting.value
+    {
+        uts.seen.store(generation - 1, Ordering::SeqCst);
+    }
+}
+
+/// Whether `file` is a file of `/proc/sys` whose poll adds no waiter: its
+/// table entry has no `poll`.
+pub(crate) fn never_wakes(file: &dyn FileHandle) -> bool {
+    file.as_any()
+        .and_then(|any| any.downcast_ref::<SettingFile>())
+        .is_some_and(|setting| !matches!(&setting.value, Value::Uts(uts) if uts.file.writable()))
 }
 
 /// Whether `file` is an open file of `/proc/sys`, whose size of 0 does not
@@ -1498,6 +1722,9 @@ impl SettingFile {
     }
     fn take(&self, buf: &[u8], admin: bool, net_admin: bool) -> Result<usize, Errno> {
         let mut position = self.position();
+        if let Value::Uts(uts) = &self.value {
+            return uts.write(buf, &mut position);
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -1517,13 +1744,32 @@ impl SettingFile {
 }
 
 impl FileHandle for SettingFile {
+    /// `proc_sys_poll`: always ready (`DEFAULT_POLLMASK`), but for a host or
+    /// domain name that changed since this file was open or a poll last
+    /// told of it ([`polled`]). The changes are the wake-ups' generation.
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        let Value::Uts(uts) = &self.value else {
+            return Ok((DEFAULT_POLLMASK, 1, 1));
+        };
+        let changes = uts.changes();
+        let mask = if changes == uts.seen.load(Ordering::SeqCst) {
+            DEFAULT_POLLMASK
+        } else {
+            CHANGED_POLLMASK
+        };
+        Ok((mask, changes + 1, changes + 1))
+    }
     /// The value and a newline, as much as fits, from the start; nothing
-    /// from anywhere else (`__do_proc_dointvec`).
+    /// from anywhere else (`__do_proc_dointvec`). A string is read from
+    /// where the file is ([`Uts::read`]).
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         if self.flags & 3 == 1 {
             return Err(Errno::EBADF);
         }
         let mut position = self.position();
+        if let Value::Uts(uts) = &self.value {
+            return uts.read(buf, &mut position);
+        }
         if *position != 0 || buf.is_empty() {
             return Ok(0);
         }
@@ -1783,9 +2029,49 @@ mod tests {
             Some(Entry::DropCaches)
         );
         assert_eq!(entries_of(Directory::Vm, None).len(), 4);
-        assert_eq!(entries_of(Directory::Kernel, None).len(), 19);
+        assert_eq!(entries_of(Directory::Kernel, None).len(), 25);
         assert_eq!(lookup(b"/proc/system", None), None);
         assert_eq!(entries_of(Directory::Mqueue, None).len(), 7);
+    }
+
+    #[test]
+    fn a_uts_name_is_read_and_written_as_linux_does() {
+        let namespaces = crate::namespaces::Namespaces::default();
+        let uts = &namespaces.uts;
+        let read = |file: Uts, len: usize, mut at: u64| {
+            let mut buf = vec![b'.'; len];
+            let count = file.read(uts, &mut buf, &mut at);
+            (buf[..count].to_vec(), at)
+        };
+        let write = |file: Uts, text: &[u8], mut at: u64| (file.write(uts, text, &mut at), at);
+        assert_eq!(read(Uts::Ostype, 99, 0), (b"Linux\n".to_vec(), 6));
+        // The newline only with room for it, and from the end of the name.
+        assert_eq!(read(Uts::Ostype, 5, 0), (b"Linux".to_vec(), 5));
+        assert_eq!(read(Uts::Ostype, 5, 5), (b"\n".to_vec(), 6));
+        assert_eq!(read(Uts::Ostype, 5, 3), (b"ux\n".to_vec(), 6));
+        assert_eq!(read(Uts::Ostype, 5, 6), (vec![], 6));
+        assert_eq!(read(Uts::Ostype, 0, 0), (vec![], 0));
+        assert_eq!(read(Uts::Hostname, 99, 0).0, b"paludarium\n");
+        assert_eq!(read(Uts::Domainname, 99, 0).0, b"(none)\n");
+        // A write ends at a newline, takes all it was given, and leaves the
+        // bytes past the NUL.
+        assert_eq!(write(Uts::Hostname, b"abc\ndef", 0), (7, 7));
+        assert_eq!(read(Uts::Hostname, 99, 0).0, b"abc\n");
+        assert_eq!(uts.names().host, b"abc\0darium");
+        assert_eq!(write(Uts::Hostname, b"xy\0z", 3), (4, 7));
+        assert_eq!(read(Uts::Hostname, 99, 0).0, b"abcxy\n");
+        // Past the end, nothing, and the position stays.
+        assert_eq!(write(Uts::Hostname, b"no", 6), (2, 6));
+        assert_eq!(read(Uts::Hostname, 99, 0).0, b"abcxy\n");
+        // 64 bytes at most, taken whole.
+        assert_eq!(write(Uts::Domainname, &[b'd'; 100], 0), (100, 100));
+        let mut full = vec![b'd'; 64];
+        assert_eq!(uts.names().domain, full);
+        assert_eq!(write(Uts::Domainname, b"e", 64), (1, 65));
+        full.push(b'\n');
+        assert_eq!(read(Uts::Domainname, 99, 0).0, full);
+        assert_eq!(write(Uts::Domainname, b"\n", 0), (1, 1));
+        assert_eq!(read(Uts::Domainname, 99, 0).0, b"\n");
     }
 
     #[test]

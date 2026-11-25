@@ -3881,6 +3881,28 @@ impl Addresses {
             .min_by_key(|r| (Reverse(r.len), r.metric))
             .map(|r| self.path6(*r, ip, oif, flow))
     }
+    /// [`Self::lookup6_in`], not strict: through the device `oif` only
+    /// rather than another, among the routes of the longest prefix and the
+    /// lowest metric (`rt6_score_route`); one through it is no other hop of
+    /// its multipath route (`have_oif_match`).
+    fn lookup6_in_preferring(
+        &self,
+        table: u32,
+        ip: Ipv6Addr,
+        oif: u32,
+        flow: &Flow6,
+    ) -> Option<Route6> {
+        let matched = self
+            .routes6
+            .iter()
+            .filter(|r| r.table == table && r.covers(ip) && !r.dead)
+            .min_by_key(|r| (Reverse(r.len), r.metric, r.oif != oif))?;
+        Some(if matched.oif == oif {
+            *matched
+        } else {
+            self.path6(*matched, ip, 0, flow)
+        })
+    }
     /// The hop of the multipath route of `matched` a flow to `ip` takes,
     /// as `fib6_select_path` chooses it: by the flow's hash, each hop
     /// taking the share of the hashes its weight gives it, in the order
@@ -3961,8 +3983,24 @@ impl Addresses {
         oif: u32,
         flow: &Flow6,
     ) -> Result<Route6, Errno> {
+        Self::first6(|table| self.lookup6_in(table, ip, oif, flow))
+    }
+    /// [`Self::lookup6_flow`], not strict: through the device `oif` rather
+    /// than another ([`Self::lookup6_in_preferring`]).
+    pub(crate) fn lookup6_preferring(
+        &self,
+        ip: Ipv6Addr,
+        oif: u32,
+        flow: &Flow6,
+    ) -> Result<Route6, Errno> {
+        Self::first6(|table| self.lookup6_in_preferring(table, ip, oif, flow))
+    }
+    /// The route `lookup` finds in the local table, then in the main one,
+    /// where the first has none or a throw route; a rejecting route's
+    /// error; `ENETUNREACH` for none.
+    fn first6(lookup: impl Fn(u32) -> Option<Route6>) -> Result<Route6, Errno> {
         for table in [TABLE_LOCAL, TABLE_MAIN] {
-            if let Some(route) = self.lookup6_in(table, ip, oif, flow) {
+            if let Some(route) = lookup(table) {
                 match route.kind.error() {
                     Some(Errno::EAGAIN) => {}
                     Some(e) => return Err(e),
@@ -4145,19 +4183,23 @@ impl Addresses {
                     }),
                 Err(_) => Ipv4Addr::LOCALHOST,
             }),
-            // Out through a veth end, the route's preferred source or
-            // what `ipv6_dev_get_saddr` picks for its device
-            // ([`Self::select6`]); `::` where there is none.
-            IpAddr::V6(ip) => IpAddr::V6(match self.lookup6(ip) {
-                Ok(r) if r.oif != LOOPBACK_OIF => r
-                    .prefsrc
-                    .or_else(|| self.select6(i32::try_from(r.oif).unwrap_or(0), ip, order))
-                    .unwrap_or(Ipv6Addr::UNSPECIFIED),
-                r => r
-                    .ok()
-                    .and_then(|r| self.source6(&r, ip))
-                    .unwrap_or(Ipv6Addr::LOCALHOST),
-            }),
+            IpAddr::V6(ip) => IpAddr::V6(self.source6_through(ip, 0, order)),
+        }
+    }
+    /// The address a packet to the IPv6 address `ip` through the device
+    /// `oif` (any for 0) leaves from: out through a veth end, its route's
+    /// preferred source or what `ipv6_dev_get_saddr` picks for the route's
+    /// device ([`Self::select6`]); `::` where there is none.
+    pub(crate) fn source6_through(&self, ip: Ipv6Addr, oif: u32, order: &[i32]) -> Ipv6Addr {
+        match self.lookup6_on(ip, oif) {
+            Ok(r) if r.oif != LOOPBACK_OIF => r
+                .prefsrc
+                .or_else(|| self.select6(i32::try_from(r.oif).unwrap_or(0), ip, order))
+                .unwrap_or(Ipv6Addr::UNSPECIFIED),
+            r => r
+                .ok()
+                .and_then(|r| self.source6(&r, ip))
+                .unwrap_or(Ipv6Addr::LOCALHOST),
         }
     }
 }
@@ -5448,6 +5490,17 @@ mod tests {
             Err(ENETUNREACH)
         );
         assert_eq!(a.lookup6_on(ip6("2001:db8::2"), 1000).unwrap().oif, 1000);
+        // Not strictly, another's where none goes through it, and its own
+        // of two of one prefix and metric.
+        let flow = Flow6::default();
+        let through = |a: &Addresses, ip, oif| a.lookup6_preferring(ip, oif, &flow).unwrap().oif;
+        assert_eq!(through(&a, ip6("2001:db8::2"), 1), 1000);
+        let mut second = V6::new(ip6("2001:db8::9"), 64);
+        second.index = 1002;
+        a.add_v6(second, Lifetimes::FOREVER, false, true, None, 0)
+            .unwrap();
+        assert_eq!(through(&a, ip6("2001:db8::2"), 1002), 1002);
+        assert_eq!(through(&a, ip6("2001:db8::2"), 1000), 1000);
     }
     #[test]
     fn ipv6_multipath_siblings_dump_once_die_with_their_device_and_go_together() {

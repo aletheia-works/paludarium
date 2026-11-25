@@ -2453,6 +2453,123 @@ fn an_aligned_placement_puts_a_mapping_at_its_offset_past_a_boundary() {
     }
 }
 
+#[test]
+fn a_name_splits_its_vmas_and_keeps_their_lock_and_userfaultfd() {
+    // Private anonymous memory: six pages, two of them locked and one
+    // registered with a userfaultfd.
+    let mut mem = AddressSpace::new();
+    let base = mem
+        .map(
+            None,
+            6 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    let page = |n: u64| base.0 + n * PAGE_SIZE;
+    mem.lock(GuestAddr(page(2)), page(4), Some(Lock::Populated))
+        .unwrap();
+    mem.view()
+        .userfault_register(page(4), page(5), 7, 1)
+        .unwrap();
+    mem.set_anon_name(GuestAddr(page(1)), page(5), Some(b"heap-of-x"))
+        .unwrap();
+    let at = |mem: &AddressSpace, n: u64| {
+        mem.mappings()
+            .find(|m| m.start.0 <= page(n) && page(n) < m.end())
+            .unwrap()
+    };
+    let named = |mem: &AddressSpace, n: u64| {
+        mem.view()
+            .vma_from(page(n))
+            .unwrap()
+            .anon_name
+            .map(|name| name.to_vec())
+    };
+    let x = Some(b"heap-of-x".to_vec());
+    // Named from page 1 to 5, each piece with the state it had.
+    assert_eq!(named(&mem, 0), None);
+    assert_eq!((named(&mem, 1), at(&mem, 1).locked), (x.clone(), None));
+    assert_eq!(
+        (named(&mem, 2), at(&mem, 2).locked),
+        (x.clone(), Some(Lock::Populated))
+    );
+    assert_eq!(at(&mem, 3).locked, Some(Lock::Populated));
+    assert_eq!(named(&mem, 4), x);
+    assert!(at(&mem, 4).userfault.is_some());
+    assert_eq!(named(&mem, 5), None);
+    // Pieces of one name hold one id.
+    assert_eq!(at(&mem, 1).anon_name, at(&mem, 2).anon_name);
+    // A fork keeps it; clearing it gives the VMAs back their merge.
+    let child = mem.fork().unwrap();
+    assert_eq!(named(&child, 1), x);
+    mem.set_anon_name(GuestAddr(page(1)), page(2), None)
+        .unwrap();
+    assert_eq!(named(&mem, 1), None);
+    assert_eq!(mem.view().vma_from(page(0)).unwrap().end, page(2));
+    // A hole is ENOMEM once what is mapped is named.
+    assert_eq!(
+        mem.set_anon_name(GuestAddr(page(5)), page(7), Some(b"heap-of-x")),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!(named(&mem, 5), x);
+    assert_eq!(named(&child, 1), x);
+}
+
+#[test]
+fn names_no_mapping_holds_are_let_go_as_the_table_grows() {
+    let mut mem = AddressSpace::new();
+    let at = mem
+        .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    // A name a counter changes: each replaces the last, and the table
+    // takes back the slots of those no mapping holds.
+    for n in 0..1000 {
+        mem.set_anon_name(at, at.0 + PAGE_SIZE, Some(format!("n{n}").as_bytes()))
+            .unwrap();
+    }
+    assert_eq!(
+        mem.view().vma_from(at.0).unwrap().anon_name.as_deref(),
+        Some(&b"n999"[..])
+    );
+    let id = mem
+        .mappings()
+        .find(|m| m.start == at)
+        .unwrap()
+        .anon_name
+        .unwrap();
+    assert!(id.0 < 128, "{id:?}");
+}
+
+#[test]
+fn only_anonymous_memory_takes_a_name() {
+    let mut mem = AddressSpace::new();
+    let file = mem
+        .map(None, PAGE_SIZE, Prot::READ, MappingKind::File)
+        .unwrap();
+    assert_eq!(
+        mem.set_anon_name(file, file.0 + PAGE_SIZE, Some(b"f")),
+        Err(Errno::EBADF)
+    );
+    // The refused call left no name: the next one takes the first slot.
+    let anon = mem
+        .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    mem.set_anon_name(anon, anon.0 + PAGE_SIZE, Some(b"a"))
+        .unwrap();
+    let id = mem.mappings().find(|m| m.start == anon).unwrap().anon_name;
+    assert_eq!(id, Some(AnonName(0)));
+    let shared = mem
+        .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    mem.set_anon_name(shared, shared.0 + PAGE_SIZE, Some(b"s"))
+        .unwrap();
+    assert_eq!(
+        mem.view().vma_from(shared.0).unwrap().anon_name.as_deref(),
+        Some(&b"s"[..])
+    );
+}
+
 /// A file of a tmpfs mount with `huge=`, whose mappings `mremap` moves to a
 /// 2 MiB boundary.
 struct HugeFile(u64);

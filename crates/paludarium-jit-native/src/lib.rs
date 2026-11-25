@@ -34,9 +34,11 @@ pub fn compiler(threshold: u16) -> Option<Arc<dyn Compiler>> {
     compiler_with(threshold, true)
 }
 
-/// [`compiler`], compiling on the thread that runs the block instead when
-/// `background` is false, so that a block runs compiled from the entry that
-/// reaches the threshold (as the differential tests want).
+/// [`compiler`], but when `background` is false the thread that runs the
+/// block waits for its code, so that a block runs compiled from the entry
+/// that reaches the threshold (as the differential tests want). The code is
+/// compiled on the JIT's own thread either way: the host CPU time of the
+/// thread that runs the block is its guest thread's.
 #[must_use]
 pub fn compiler_with(threshold: u16, background: bool) -> Option<Arc<dyn Compiler>> {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -53,6 +55,7 @@ pub fn compiler_with(threshold: u16, background: bool) -> Option<Arc<dyn Compile
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native {
     use std::collections::HashMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -83,13 +86,16 @@ mod native {
     /// it, it forgets them all.
     const MAX_KEPT: usize = 1 << 16;
 
-    /// What compiles: shared with the background thread.
+    /// What compiles: shared with the thread that does.
     struct Machine {
         isa: OwnedTargetIsa,
         statistics: Statistics,
         /// Whether to report the statistics on standard error
         /// (`PALUDARIUM_JIT_STATS` set).
         report: bool,
+        /// Makes [`Machine::fill`] panic.
+        #[cfg(test)]
+        panics: std::sync::atomic::AtomicBool,
     }
 
     impl Machine {
@@ -109,6 +115,8 @@ mod native {
 
         /// Compiles `forms` into `block`.
         fn fill(&self, forms: &[Form], block: &PendingBlock) {
+            #[cfg(test)]
+            assert!(!self.panics.load(Ordering::Relaxed), "the compile fails");
             let started = std::time::Instant::now();
             let code = self.machine_code(forms).and_then(|bytes| Code::new(&bytes));
             let s = &self.statistics;
@@ -137,7 +145,58 @@ mod native {
         }
     }
 
-    type Job = (Vec<Form>, Arc<PendingBlock>);
+    type Job = Box<dyn FnOnce() + Send>;
+
+    /// The JIT's own thread, which does the jobs in turn and ends with the
+    /// `Worker`; it starts with the first job.
+    #[derive(Default)]
+    pub(crate) struct Worker(Mutex<Option<Sender<Job>>>);
+
+    impl Worker {
+        /// Hands `job` to the thread, starting it first if need be; false
+        /// when it cannot be had. A panic in `job` ends the thread, which
+        /// then drops the jobs it has not done and cannot be had again.
+        fn send(&self, job: Job) -> bool {
+            let mut queue = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if queue.is_none() {
+                let (sender, receiver) = mpsc::channel::<Job>();
+                let started = std::thread::Builder::new()
+                    .name("paludarium-jit".into())
+                    .spawn(move || {
+                        for job in receiver {
+                            job();
+                        }
+                    });
+                if started.is_err() {
+                    return false;
+                }
+                *queue = Some(sender);
+            }
+            queue.as_ref().is_some_and(|q| q.send(job).is_ok())
+        }
+
+        /// Does `work` on the thread and waits for its end; false when the
+        /// thread cannot be had. `work` may not call this. When `work`
+        /// panics, so does this, and the thread goes on to the next job.
+        ///
+        /// The wait is not one of the host's that count as the guest
+        /// thread's context switches (`paludarium_host::switches`).
+        pub(crate) fn run(&self, work: impl FnOnce() + Send + 'static) -> bool {
+            let (done, ended) = mpsc::sync_channel(1);
+            let job = move || {
+                let _ = done.send(catch_unwind(AssertUnwindSafe(work)));
+            };
+            if !self.send(Box::new(job)) {
+                return false;
+            }
+            match ended.recv() {
+                Ok(Ok(())) => true,
+                Ok(Err(panic)) => resume_unwind(panic),
+                // The thread has gone and dropped the job.
+                Err(_) => false,
+            }
+        }
+    }
 
     pub(crate) struct NativeCompiler {
         machine: Arc<Machine>,
@@ -147,9 +206,11 @@ mod native {
         /// makes the interpreter decode every block again, mostly to the
         /// same forms; their code is the same, so it is reused.
         kept: Mutex<HashMap<Vec<Form>, Arc<PendingBlock>>>,
-        /// Where blocks go to be compiled in the background, when they do;
-        /// the thread starts with the first.
-        queue: Option<Mutex<Option<Sender<Job>>>>,
+        /// What compiles blocks.
+        worker: Worker,
+        /// Whether [`Compiler::compile`] leaves a block to `worker` without
+        /// waiting for its code.
+        background: bool,
     }
 
     impl NativeCompiler {
@@ -190,10 +251,13 @@ mod native {
                     isa,
                     statistics: Statistics::default(),
                     report: std::env::var_os("PALUDARIUM_JIT_STATS").is_some(),
+                    #[cfg(test)]
+                    panics: std::sync::atomic::AtomicBool::new(false),
                 }),
                 threshold: threshold.max(1),
                 kept: Mutex::new(HashMap::new()),
-                queue: background.then(|| Mutex::new(None)),
+                worker: Worker::default(),
+                background,
             })
         }
 
@@ -202,26 +266,10 @@ mod native {
             self.machine.machine_code(forms)
         }
 
-        /// Hands `job` to the background thread, starting it first if
-        /// need be; false when it cannot be had.
-        fn send(&self, queue: &Mutex<Option<Sender<Job>>>, job: Job) -> bool {
-            let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
-            if queue.is_none() {
-                let (sender, receiver) = mpsc::channel::<Job>();
-                let machine = self.machine.clone();
-                let started = std::thread::Builder::new()
-                    .name("paludarium-jit".into())
-                    .spawn(move || {
-                        for (forms, block) in receiver {
-                            machine.fill(&forms, &block);
-                        }
-                    });
-                if started.is_err() {
-                    return false;
-                }
-                *queue = Some(sender);
-            }
-            queue.as_ref().is_some_and(|q| q.send(job).is_ok())
+        /// Whether compiling panics from now on.
+        #[cfg(test)]
+        pub(crate) fn set_panics(&self, panics: bool) {
+            self.machine.panics.store(panics, Ordering::Relaxed);
         }
     }
 
@@ -254,17 +302,21 @@ mod native {
                 kept.insert(forms.to_vec(), block.clone());
                 block
             };
-            match &self.queue {
-                Some(queue) => {
-                    if !self.send(queue, (forms.to_vec(), block.clone())) {
-                        let _ = block.code.set(None);
-                        return None;
-                    }
+            // No lock is held here that the thread needs: `kept`'s is
+            // released above, and `fill` takes none.
+            let machine = self.machine.clone();
+            let (forms, pending) = (forms.to_vec(), Unfilled(block.clone()));
+            let fill = move || machine.fill(&forms, &pending.0);
+            if self.background {
+                if !self.worker.send(Box::new(fill)) {
+                    let _ = block.code.set(None);
+                    return None;
                 }
-                None => {
-                    self.machine.fill(forms, &block);
-                    block.code.get()?.as_ref()?;
+            } else {
+                if !self.worker.run(fill) {
+                    let _ = block.code.set(None);
                 }
+                block.code.get()?.as_ref()?;
             }
             Some(block)
         }
@@ -276,6 +328,18 @@ mod native {
     pub(crate) struct PendingBlock {
         code: OnceLock<Option<Code>>,
         len: usize,
+    }
+
+    /// A block whose compile has not ended: when its job panics or is
+    /// dropped, compiling it has failed, and the same forms are turned down
+    /// again.
+    struct Unfilled(Arc<PendingBlock>);
+
+    impl Drop for Unfilled {
+        fn drop(&mut self) {
+            // Nothing once it is filled.
+            let _ = self.0.code.set(None);
+        }
     }
 
     impl CompiledBlock for PendingBlock {

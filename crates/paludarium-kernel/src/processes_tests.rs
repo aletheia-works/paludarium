@@ -4522,6 +4522,59 @@ mod shm {
         String::from_utf8(text).unwrap()
     }
 
+    /// Files of that name in the guest's file system, as `--mount /:/`
+    /// gives it the host's `/proc`, are not the ones a guest reads.
+    #[test]
+    fn a_uts_sysctl_shows_the_namespace_not_a_file_of_its_name() {
+        let (mut k, mut t, m) = setup();
+        let fs = k.files.fs();
+        for directory in [&b"/proc"[..], b"/proc/sys", b"/proc/sys/kernel"] {
+            match fs.mkdir(directory, 0o755) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        let names = [
+            "arch",
+            "domainname",
+            "hostname",
+            "osrelease",
+            "ostype",
+            "version",
+        ];
+        for name in names {
+            let path = format!("/proc/sys/kernel/{name}");
+            let file = fs.open(path.as_bytes(), 0o102, 0o644).unwrap();
+            file.write(b"host\n").unwrap();
+        }
+        let shown = |k: &mut Kernel, t: &mut Thread| {
+            names.map(|name| read_proc(k, t, &m, &format!("/proc/sys/kernel/{name}")))
+        };
+        let first = [
+            "x86_64\n",
+            "(none)\n",
+            "paludarium\n",
+            "6.12.0-paludarium\n",
+            "Linux\n",
+            "#1 SMP PREEMPT_DYNAMIC\n",
+        ];
+        assert_eq!(shown(&mut k, &mut t), first);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "hostname", b"guest\n"), 6);
+        assert_eq!(shown(&mut k, &mut t)[2], "guest\n");
+        // A user of no privilege may not write it, and the file beneath
+        // stays as it was.
+        let user = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        t.state.credentials = user;
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "hostname", b"other\n"),
+            Errno::EACCES.to_syscall_return()
+        );
+        let mut beneath = [0; 16];
+        let file = fs.open(b"/proc/sys/kernel/hostname", 0, 0).unwrap();
+        assert_eq!(file.read(&mut beneath), Ok(5));
+        assert_eq!(&beneath[..5], b"host\n");
+    }
+
     #[test]
     fn proc_sysvipc_lists_the_namespace_s_objects_as_linux_prints_them() {
         let (mut k, mut t, m) = setup();

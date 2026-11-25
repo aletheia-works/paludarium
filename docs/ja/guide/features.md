@@ -530,7 +530,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   です。同じ記述からもう一度頼むと、リースの種類が変わります。リースを取ると、持ち主の
   ない記述は呼んだプロセスを持ち主にし、`F_UNLCK` は持ち主と `F_SETSIG` のシグナルを
   外します（`f_delown`）。リースがないときの `F_UNLCK` は `EAGAIN` です。`F_GETLEASE` は
-  その記述のリースの種類か `F_UNLCK` を返します。`/proc/sys/fs/leases-enable`（最初は 1）と
+  その記述のリースの種類（破られている間は、これからなる種類）か `F_UNLCK` を返します。
+  リースとぶつかる open や `truncate` は、`__break_lease` と同じくリースを破ります。開く側
+  自身のリースも破ります。読み込みだけの open は書き込みのリースを破って読み込みのリースに
+  させ、ほかはどちらのリースも破って外させます。破るときは持ち主に一度だけシグナル
+  （`SIGIO` か、`F_SETSIG` のシグナルと `POLL_MSG`）を送り、開く側は、読み書きの数に
+  先に数えられてから持ち主を待ちます。`/proc/sys/fs/lease-break-time` 秒（0 以下なら
+  終わりはありません）待つと、リースを読み込みのリースにするか外します。`O_NONBLOCK` なら
+  待たずに `EWOULDBLOCK` で、シグナルは待ちを終わらせます（`ERESTARTSYS`）。
+  `/proc/sys/fs/leases-enable`（最初は 1）と
   `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
   も受け取ります（`proc_dointvec`）。
 
@@ -1571,6 +1579,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     割り込みません。
   - 提供バッファーを選んだ読み出しは、待つあいだそれを保ちます（`REQ_F_BUFFER_SELECTED`）。
     リングのバッファーはリングの先頭に残り、読み出しが続くときにもう一度選ばれます。
+  - 待つ要求は、見つけたファイルを保ち（`req->file`）、そのあいだに記述子が閉じられても
+    スロットが更新されても、それで続きます。そのような要求が持っているあいだに更新で
+    スロットから外れた登録ファイルは、その要求が完了したとき、その完了のあとにタグを
+    投稿します（`io_put_rsrc_node`）。
 
 - `IORING_OP_ASYNC_CANCEL` と `IORING_REGISTER_SYNC_CANCEL` は、Linux master の
   `io_uring/cancel.c` と `io_poll_cancel` と同じく、そのリングでファイルを待つ要求を取り消します。
@@ -3601,8 +3613,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `unprivileged_bpf_disabled` は開いた者ではなく書き手に `CAP_SYS_ADMIN` を求めます。
   孤児を消すのは `shm_rmid_forced` を設定する書き込みだけで、Linux master の
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
-  `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
+  `/proc/sys/kernel` にあるのはこれらと次の 6 つだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+
+- `/proc/sys/kernel` には、Linux の `kernel/utsname_sysctl.c` と同じく、UTS 名前空間の名前も
+  あります。`arch`、`ostype`、`osrelease`、`version`（root のモード 0444）と、`hostname`、
+  `domainname`（0644）で、それぞれ `uname` が答えるものと改行です。`uname` の答えを変える
+  personality は、これらを変えません。名前空間は、ファイルを開いた者ではなく、読み書きする
+  スレッドのもので、`--mount` が与える同じ名前のファイルは見えません。`hostname` と
+  `domainname` を書くために開けるのは root（どのユーザー名前空間の外でもユーザー ID が 0）
+  だけで（`EACCES`）、`CAP_SYS_ADMIN` の有無は問わず、書き込みのときにもう一度確かめます
+  （`EPERM`）。ユーザー名前空間の root にできるのは `sethostname` だけです。これらは文字列です
+  （`proc_dostring`）。読み込みはファイルの位置から続きます。書き込みは全体を受け取り、NUL か
+  改行までのバイトをそのオフセットに、全部で 64 バイトまで置き、その後ろに NUL を置きます。
+  その NUL より後ろには前の名前のバイトが残り、`uname` もそれを答えます。`sethostname` は
+  それを消します。名前の終わりより後ろへの書き込みは何も変えません。`poll`、`select`、
+  `epoll` は、`proc_sys_poll` と同じく `/proc/sys` のファイルを受け付け、いつも用意が
+  できています。どの UTS 名前空間でも、`sethostname`、`setdomainname`、または拒まれない
+  ファイルへの書き込みで `hostname` か `domainname` が変わると、開いたファイルごとに最初の
+  ポーリングが、`POLLOUT` のない `POLLIN`、`POLLRDNORM`、`POLLERR`、`POLLPRI` を返します。
+  見たかどうかは `dup` と子で共有します。それを見張る epoll のポーリングも、見たことになります。
 
 - `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
   ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は
@@ -5045,6 +5075,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセスもアタッチできるようになります。ほかの値は `int` として、呼び出し元の PID 名前空間の
   タスクを指します（なければ `EINVAL`）。そのタスクがある間、そのプロセスとその子孫が
   アタッチできます。どのスレッドが設定してもプロセスのもので、子には受け継がれません。
+  `PR_SET_VMA` の `PR_SET_VMA_ANON_NAME` は、Linux の `set_anon_vma_name` と同じく無名メモリに
+  名前を付けます。名前は NUL まで含めて 80 バイトまで（超えると `EINVAL`、読めなければ
+  `EFAULT`）の、`` \`$[] `` を除く表示できる ASCII で（`EINVAL`）、なければ名前を消します。
+  ページ境界の開始アドレス（`EINVAL`）から、ページ単位に切り上げた大きさの範囲の VMA が
+  それぞれ名前を受け取ります。範囲が VMA の途中で始まったり終わったりすればそこで分け、
+  ロックと `userfaultfd` は保ちます。ファイルのマッピングに着くと `EBADF` で、穴があれば
+  ほかに名前を付けてから `ENOMEM` です。`/proc/<pid>/maps` と `smaps` はこれを
+  `[anon:<名前>]`、共有の無名メモリでは `[anon_shmem:<名前>]` と示し、ヒープとスタックは
+  それぞれの名前のままです。名前の違う VMA はまとまらず、`fork` した子も名前を保ちます。
   ほかの指定には `EINVAL` を返します。
 
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって
@@ -5255,7 +5294,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     リンク上にあるものとしてそこから出ます。224.0.0.0/24 のグループと limited broadcast の
     アドレスは、そのままそこから出ます（`ip_route_output_key_hash_rcu`）。デバイスが
     なくなれば `ENODEV`、落ちている間は `ENETUNREACH` です。受け付けた接続は、
-    リスナーと同じデバイスに結び付きます。
+    リスナーと同じデバイスに結び付きます。IPv6 のソケットの `IPV6_MULTICAST_IF`（TCP では
+    `ENOPROTOOPT`）と `IPV6_UNICAST_IF`（ネットワークバイトオーダー）は、デバイスの
+    インデックスを取り（ないデバイスは `ENODEV` と `EADDRNOTAVAIL`）、0 ならなしです。
+    `IPV6_PKTINFO`（設定のみ。UDP の送信と同じく、アドレスは使いません）はどのインデックスも
+    取ります。ソケットが結び付いたデバイスと違えばどれも `EINVAL` で、`IPV6_UNICAST_IF` は
+    結び付いていればどのデバイスでも `EINVAL` です（`do_ipv6_setsockopt`）。スコープ ID のない
+    アドレスへの UDP のデータグラムと UDP の `connect` は、ソケット自身のデバイス、なければ
+    `IPV6_PKTINFO` のもの、なければグループへは `IPV6_MULTICAST_IF` のもの、ほかのアドレスへは
+    `IPV6_UNICAST_IF` のものを通ります（`udpv6_sendmsg`、`ip6_datagram_flow_key_init`）。
+    ソケットがアドレスに結び付いていないとき、宛先がグループ、リンクローカル、`::1` の
+    ときは厳密に通り、ほかは、プレフィックスとメトリックが同じ経路の中でそれを優先する
+    だけです（`rt6_score_route`）。デバイスのないソケットをリンクのグループに `connect`
+    すると、`IPV6_MULTICAST_IF` のものがソケットのデバイスになります。送るたびに経路を
+    引きますが、Linux の接続済みのソケットは、これらのオプションが 0 に戻っても、持っている
+    経路を使い続けます（`ip6_sk_dst_lookup_flow`）。
   - **`TCP_INFO`** は、Linux の 280 バイトの `struct tcp_info` を、渡された大きさの分だけ
     返します（`tcp_get_info`）。リスナーは状態、待っている接続とバックログ、まだ接続して
     いないソケットは Linux の既定値、ハンドシェイク中は再送の回数（タイムアウトは
@@ -5325,7 +5378,8 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `getpeername` は、スコープ ID の要るアドレスに、ソケットのデバイスをスコープ ID として
   付けます。`recvfrom` は、データグラムが入ってきたデバイスを付けます。UDP の `sendto`
   は、スコープ ID の要るアドレスならそのデバイスを、なければソケットのデバイスを、
-  厳密に通ります（それを通る経路がなければ `ENETUNREACH`）。UDP と TCP の `connect`
+  厳密に通ります（それを通る経路がなければ `ENETUNREACH`）。アドレスに結び付いて
+  いなければ、そのデバイスのアドレスから送ります。UDP と TCP の `connect`
   も同じで、スコープ ID がソケットのデバイスになります。`connect` が失敗しても、TCP では
   残り、UDP では Linux master と同じく元に戻ります。
   ソケットが持つデバイスと違うスコープ ID と、ソケットにデバイスがなくスコープ ID も

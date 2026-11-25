@@ -727,17 +727,33 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .push((tid, used));
     }
-    /// The process's CPU time: the sum of its threads' latest accounts.
+    /// The process's CPU time now: the sum of its threads', each brought up
+    /// to now ([`crate::Usage::sample`]).
     pub(crate) fn process_cpu(&self) -> u64 {
+        self.sum_cpu(|used| {
+            used.sample();
+        })
+    }
+    /// The process's CPU time as of its threads' latest accounts, for what
+    /// looks at it at every system call and checkpoint, as Linux's
+    /// `fastpath_timer_check` looks at the `cputimer` its threads add to as
+    /// they run.
+    fn accounted_cpu(&self) -> u64 {
+        self.sum_cpu(|_| ())
+    }
+    fn sum_cpu(&self, look: impl Fn(&crate::Usage)) -> u64 {
         self.cpu
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|(_, used)| used.cpu.load(Ordering::SeqCst))
+            .map(|(_, used)| {
+                look(used);
+                used.cpu_time()
+            })
             .fold(0u64, u64::saturating_add)
     }
     /// Adds what the process's threads, live or exited, have used to
-    /// `times`, as of each one's latest account.
+    /// `times`, the CPU time brought up to now.
     pub(crate) fn add_cpu_times(&self, times: &mut crate::proc::CpuTimes) {
         for (_, used) in self
             .cpu
@@ -745,35 +761,32 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
         {
+            used.sample();
             times.add(used);
         }
     }
-    /// The CPU time of thread `tid` while it is live, as of its latest
-    /// account (0 before its first).
+    /// The CPU time of thread `tid` now, while it is live (0 before it has
+    /// started).
     pub(crate) fn thread_cpu(&self, tid: u32) -> Option<u64> {
         if !self.has_member(tid) {
             return None;
         }
-        Some(
-            self.cpu
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .rev()
-                .find(|(owner, _)| *owner == tid)
-                .map_or(0, |(_, used)| used.cpu.load(Ordering::SeqCst)),
-        )
+        Some(self.last_thread_cpu(tid).unwrap_or(0))
     }
-    /// The CPU time thread `tid` last accounted, live or not: what a perf
-    /// event of it keeps once it has exited.
+    /// The CPU time thread `tid` has used, live or not: what `/proc` shows
+    /// of one.
     pub(crate) fn last_thread_cpu(&self, tid: u32) -> Option<u64> {
-        self.cpu
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .rev()
-            .find(|(owner, _)| *owner == tid)
-            .map(|(_, used)| used.cpu.load(Ordering::SeqCst))
+        let used = self.last_thread_usage(tid)?;
+        used.sample();
+        Some(used.cpu_time())
+    }
+    /// The CPU time of live thread `tid` as of its latest account, as
+    /// [`Self::accounted_cpu`].
+    fn accounted_thread_cpu(&self, tid: u32) -> Option<u64> {
+        self.has_member(tid).then(|| {
+            self.last_thread_usage(tid)
+                .map_or(0, |used| used.cpu_time())
+        })
     }
     /// What thread `tid` last accounted ([`crate::Usage`]), live or not.
     pub(crate) fn last_thread_usage(&self, tid: u32) -> Option<Arc<crate::Usage>> {
@@ -827,7 +840,7 @@ impl ThreadGroup {
             return;
         }
         let pid = self.cpu_watched_as.load(Ordering::SeqCst);
-        let cpu = self.process_cpu();
+        let cpu = self.accounted_cpu();
         let watchers: Vec<_> = self
             .cpu_watchers
             .lock()
@@ -972,7 +985,7 @@ impl ThreadGroup {
             .cpu_timers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let now = self.process_cpu();
+        let now = self.accounted_cpu();
         let send = |number| {
             let _ = self
                 .process_inbox
@@ -1146,7 +1159,7 @@ impl ThreadGroup {
         // The CPU times of the process and its live threads, taken before
         // the timers are locked.
         let cpu = self.posix_cpu_armed.load(Ordering::SeqCst).then(|| {
-            let process = self.process_cpu();
+            let process = self.accounted_cpu();
             let live: Vec<u32> = self
                 .members
                 .lock()
@@ -1156,7 +1169,7 @@ impl ThreadGroup {
                 .collect();
             let threads: BTreeMap<u32, u64> = live
                 .into_iter()
-                .filter_map(|tid| self.thread_cpu(tid).map(|used| (tid, used)))
+                .filter_map(|tid| self.accounted_thread_cpu(tid).map(|used| (tid, used)))
                 .collect();
             (process, threads)
         });
@@ -2346,6 +2359,9 @@ impl Kernel {
             .leave_sem_undo_list(thread.tid, self.process.pid, self.wall_seconds());
         // exit_shm: the segments it made are orphans now.
         self.group.leave_shm(thread.tid);
+        // Its CPU time is told for good, to the perf events that count it
+        // and to the wait for its process (`__exit_signal`).
+        thread.state.cpu.used.retire();
         // perf_event_exit_task: the events it opened have no owner.
         let who = crate::perf::Who {
             pid: self.process.pid,

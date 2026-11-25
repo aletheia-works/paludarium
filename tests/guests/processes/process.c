@@ -23165,6 +23165,97 @@ static int cpu_clock_ids_case(void) {
            after_none, last, next);
     return 0;
 }
+/* The CPU time of a thread and of a process that run without a system call
+ * or a fault, as another thread and the parent see it: it goes on
+ * (kernel/sched/core.c's task_sched_runtime for a thread's clock, and for a
+ * process's what its threads' ticks added). Looked at for at most 20 s, for
+ * a busy machine; what is printed holds whatever the speed. */
+static volatile int cr_stop, cr_ready;
+static void *cr_spin(void *arg) {
+    (void)arg;
+    ci_tid = syscall(SYS_gettid);
+    cr_ready = 1;
+    while (!cr_stop) {
+    }
+    return NULL;
+}
+static long cr_clock(clockid_t id) {
+    struct timespec t;
+    return syscall(SYS_clock_gettime, id, &t) ? -1 : ct_ns(t);
+}
+/* utime and stime of a stat file, in ns. */
+static long cr_stat(const char *path) {
+    char text[1024];
+    int fd = open(path, O_RDONLY);
+    long n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    text[n] = 0;
+    unsigned long user = 0, system = 0;
+    char *at = strrchr(text, ')');
+    if (!at || sscanf(at + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &user, &system) != 2)
+        return -1;
+    return (long)(user + system) * 10000000L;
+}
+static long cr_rusage(const char *none) {
+    (void)none;
+    struct rusage use;
+    getrusage(RUSAGE_SELF, &use);
+    return (use.ru_utime.tv_sec + use.ru_stime.tv_sec) * 1000000000L +
+           (use.ru_utime.tv_usec + use.ru_stime.tv_usec) * 1000L;
+}
+/* Whether what `look` (or the clock) shows grows by 50 ms, never back. */
+static int cr_grows(long (*look)(const char *), const char *path, clockid_t id) {
+    long first = look ? look(path) : cr_clock(id), last = first;
+    for (int i = 0; i < 10000; i++) {
+        struct timespec pause = {0, 2000000};
+        nanosleep(&pause, NULL);
+        long now = look ? look(path) : cr_clock(id);
+        if (now < last || first < 0) return -1;
+        last = now;
+        if (now - first >= 50000000L) return 1;
+    }
+    return 0;
+}
+static int cpu_clock_running_case(void) {
+    char path[64];
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, cr_spin, NULL)) return 80;
+    while (!cr_ready) sched_yield();
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", ci_tid);
+    printf("thread: clock=%d process=%d getrusage=%d stat=%d process-stat=%d\n",
+           cr_grows(NULL, NULL, CI_CLOCK(ci_tid, 1, 2)), cr_grows(NULL, NULL, CLOCK_PROCESS_CPUTIME_ID),
+           cr_grows(cr_rusage, NULL, 0), cr_grows(cr_stat, path, 0), cr_grows(cr_stat, "/proc/self/stat", 0));
+    long own = cr_clock(CI_CLOCK(ci_tid, 1, 2));
+    cr_stop = 1;
+    pthread_join(thread, NULL);
+    printf("thread ended: process has its time=%d\n", cr_clock(CLOCK_PROCESS_CPUTIME_ID) >= own);
+    fflush(stdout);
+    int ready[2];
+    if (pipe(ready)) return 81;
+    pid_t kid = fork();
+    if (kid == 0) {
+        write(ready[1], "r", 1);
+        for (;;) {
+        }
+    }
+    char c;
+    read(ready[0], &c, 1);
+    snprintf(path, sizeof path, "/proc/%d/stat", kid);
+    printf("child: clock=%d stat=%d\n", cr_grows(NULL, NULL, CI_CLOCK(kid, 0, 2)), cr_grows(cr_stat, path, 0));
+    /* Killed, it made no system call to account its time at. */
+    own = cr_clock(CI_CLOCK(kid, 0, 2));
+    kill(kid, SIGKILL);
+    struct rusage use;
+    int status = 0;
+    long reaped_pid = wait4(kid, &status, 0, &use);
+    long waited = use.ru_utime.tv_sec * 1000000000L + use.ru_utime.tv_usec * 1000L +
+                  use.ru_stime.tv_sec * 1000000000L + use.ru_stime.tv_usec * 1000L;
+    /* A rusage counts in microseconds, each of the two cut to one. */
+    printf("child killed: waited=%d signal=%d rusage has its time=%d\n", reaped_pid == kid,
+           WIFSIGNALED(status) ? WTERMSIG(status) : -1, waited + 2000 >= own);
+    return 0;
+}
 /* A POSIX timer on another process's CPU clock, by number: the child's
  * checkpoints expire it, as Linux's tick of that process does, and the
  * signal comes to the process that made it. What is printed holds whatever
@@ -38971,6 +39062,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "pidfd-fdinfo")) return pidfd_fdinfo_case();
     if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
+    if (!strcmp(mode, "cpu-clock-running")) return cpu_clock_running_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "yama")) return yama_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();

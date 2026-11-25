@@ -563,11 +563,14 @@ static void per_cpu(void) {
         for (int cpu = 0; cpu < 2; cpu++) close(fds[i][cpu]);
 }
 
-/* What remote_move's mover needs: the thread to move, and the flag it sets
-   once it has. */
+/* What remote_move's mover needs: the thread to move, its task-clock on
+   each CPU, and the flag it sets once it has, with whether that clock went
+   on on CPU 0 and stood still on CPU 1 from then. */
 struct mover {
     pid_t tid;
     volatile int go, moved;
+    int clocks[2];
+    int ran, stood;
 };
 
 static void *move_to_cpu_0(void *with) {
@@ -577,6 +580,14 @@ static void *move_to_cpu_0(void *with) {
     CPU_ZERO(&zero);
     CPU_SET(0, &zero);
     sched_setaffinity(m->tid, sizeof zero, &zero);
+    uint64_t from[2] = {count(m->clocks[0]), count(m->clocks[1])};
+    /* At most 10 s, for a busy machine. */
+    for (int i = 0; i < 10000 && !m->ran; i++) {
+        struct timespec ms = {0, 1000000};
+        nanosleep(&ms, NULL);
+        m->ran = count(m->clocks[0]) - from[0] >= 20000000;
+    }
+    m->stood = count(m->clocks[1]) == from[1];
     m->moved = 1;
     return NULL;
 }
@@ -585,7 +596,7 @@ static void *move_to_cpu_0(void *with) {
    returns (__set_cpus_allowed_ptr): pinned to CPU 1, this thread spins
    without a system call while another moves it to CPU 0, then writes
    pages it mapped before, still without one; its page faults count on
-   CPU 0's event, none on CPU 1's. */
+   CPU 0's event, none on CPU 1's, and so does the time it runs. */
 static void remote_move(void) {
     cpu_set_t one;
     CPU_ZERO(&one);
@@ -597,7 +608,11 @@ static void remote_move(void) {
         fds[cpu] = (int)open_event(&a, 0, cpu, -1, 0);
     }
     char *pages = mmap(NULL, 8 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    struct mover m = {(pid_t)syscall(SYS_gettid), 0, 0};
+    struct mover m = {.tid = (pid_t)syscall(SYS_gettid)};
+    for (int cpu = 0; cpu < 2; cpu++) {
+        struct attr a = software(1);
+        m.clocks[cpu] = (int)open_event(&a, 0, cpu, -1, 0);
+    }
     pthread_t mover;
     pthread_create(&mover, NULL, move_to_cpu_0, &m);
     uint64_t before[2] = {count(fds[0]), count(fds[1])};
@@ -607,6 +622,9 @@ static void remote_move(void) {
     uint64_t after[2] = {count(fds[0]), count(fds[1])};
     pthread_join(mover, NULL);
     say("remote move: faults on cpu 0 %d on cpu 1 %d", after[0] - before[0] >= 8, after[1] - before[1] == 0);
+    say("remote move: task-clock on cpu 0 %d on cpu 1 %d", m.ran, !m.stood);
+    close(m.clocks[0]);
+    close(m.clocks[1]);
     close(fds[0]);
     close(fds[1]);
     munmap(pages, 8 * 4096);

@@ -431,19 +431,10 @@ pub(crate) struct CpuTimes {
     pub(crate) switches: u64,
 }
 impl CpuTimes {
-    /// Adds what one thread has used, as of its latest account.
+    /// Adds what one thread has used, as of the latest look at it.
     pub(crate) fn add(&mut self, used: &crate::Usage) {
         use std::sync::atomic::Ordering::SeqCst;
-        let per_cpu = used
-            .per_cpu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.per_cpu.len() < per_cpu.len() {
-            self.per_cpu.resize(per_cpu.len(), 0);
-        }
-        for (sum, &time) in self.per_cpu.iter_mut().zip(per_cpu.iter()) {
-            *sum = sum.saturating_add(time);
-        }
+        used.add_times(&mut self.per_cpu);
         self.switches = self.switches.saturating_add(used.switches.load(SeqCst));
     }
 }

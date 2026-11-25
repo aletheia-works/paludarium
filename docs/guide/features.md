@@ -4303,8 +4303,9 @@ kernel.
 - `/proc/stat` is in the format of Linux's `show_stat`.
   - A `cpu` line and one for each CPU `sched_getaffinity` reports give, in
     clock ticks, the CPU time every thread has run, the reaped processes'
-    included, so the counts only grow. A thread's time between two system
-    calls counts to the CPU it was on at the first. It is all user time, as
+    included, so the counts only grow. A thread's time counts to the CPU it
+    was on at its latest system call, or to the one another thread's
+    `sched_setaffinity` moved it to since. It is all user time, as
     in `getrusage` and `times`, and the other times are 0, idle too, as
     `/proc/uptime` counts no idle time.
   - `intr 0`; `ctxt`, the times threads went to sleep; `btime`, the
@@ -4636,11 +4637,16 @@ kernel.
     `EBUSY`.
 
 - CPU time is the host thread's CPU time (user and system together) from a
-  guest thread's first system call, where the host can measure it (Linux,
+  guest thread's start to its end, where the host can measure it (Linux,
   macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.
   `CLOCK_THREAD_CPUTIME_ID` reads the thread's, and `CLOCK_PROCESS_CPUTIME_ID`
-  the sum of the process's threads, each as of its latest system call. A
-  child starts from zero, and its time joins its parent's children's when it
+  the sum of the process's threads. A thread's clock read by another thread,
+  a process's, `/proc`, `getrusage`, `times`, a wait's rusage and a `perf`
+  clock show what a thread that runs without a system call has used by
+  then, as `task_sched_runtime` does, and a thread that ended its last time;
+  none of them goes back. What the emulator's own threads use, such as the
+  JIT's that compiles in the background, is no guest thread's and is not
+  counted. A child starts from zero, and its time joins its parent's children's when it
   is waited for. `getrusage`, `times` and the rusage of `wait4` and `waitid`
   report it all as user time, as the emulator's work for system calls runs
   in the host's user space. Their `ru_maxrss` is the peak resident size in
@@ -4904,8 +4910,8 @@ kernel.
   each, counts and runs only while the thread is on that CPU
   (`event_filter_match`), and is enabled all the while; a migration counts
   on the CPU the thread comes to, and `sched_setaffinity` moves the thread
-  before it returns, another thread's too (a sleep it made before counts
-  where it slept). Branch sampling or the XMM registers of one is
+  before it returns, another thread's too: its faults and the time it runs
+  are the new CPU's at once (a sleep it made before counts where it slept). Branch sampling or the XMM registers of one is
   `EOPNOTSUPP`. Hardware, cache and raw events are `ENOENT`, as on a machine without a
   PMU. An event of another process needs `CAP_PERFMON` or to be able to
   read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the

@@ -134,6 +134,7 @@ mod linux {
         if mode == "core-dump"
             || mode == "exec-names"
             || mode == "rename-names"
+            || mode == "chroot-names"
             || mode == "core-dump-faults"
             || mode == "core-mappings"
             || mode == "core-credentials"

@@ -5191,7 +5191,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     exec が保存した補助ベクトル（Linux の `saved_auxv`。プログラムがスタックに何をしても
     変わりません）、マップしたファイル（`NT_FILE`）、メモリが入ります。`NT_FILE` は
     ファイルをマップした VMA ごとに、`/proc/<pid>/maps` と同じく名前の変更について動いた
-    パスを示し、その名前が消されるとパスの後に `(deleted)` を付けます。共有の無名メモリは、Linux と同じく
+    パスを、プロセスのルートの下ならそのルートから示し、その名前が消されるとパスの後に
+    `(deleted)` を付けます。共有の無名メモリは、Linux と同じく
     `/dev/zero (deleted)` と示します。`NT_X86_XSTATE` ノートはありません。Linux は
     XSAVE のない CPU では書かず、仮想 CPU には XSAVE がないからです。メモリは、
     Linux の `vma_dump_size` が既定の `coredump_filter` で選ぶのと同じように

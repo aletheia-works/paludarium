@@ -7566,6 +7566,11 @@ static int chroot_names_child(void) {
     if (map == MAP_FAILED) return 73;
     uint64_t at = (uintptr_t)map;
     if (write(11, &at, sizeof at) != sizeof at || read(10, &byte, 1) != 1) return 74;
+    /* A core names the program from its process's root. */
+    char seen[4096];
+    int dumped = rn_core_name((uintptr_t)&chroot_names_child, seen, sizeof seen);
+    printf("core under chroot: dumped=%d named=%d\n", dumped, !strcmp(seen, "/prog2"));
+    fflush(stdout);
     return 0;
 }
 static int chroot_names_case(void) {

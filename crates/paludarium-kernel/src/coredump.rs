@@ -566,6 +566,38 @@ mod coredump_tests {
     }
 
     #[test]
+    fn the_files_note_names_a_file_under_the_root_from_it() {
+        struct At(&'static [u8]);
+        impl PageSource for At {
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+                Ok(buf.len())
+            }
+            fn name(&self) -> Option<Vec<u8>> {
+                Some(self.0.to_vec())
+            }
+        }
+        let mut mem = AddressSpace::new();
+        let mut vmas = Vec::new();
+        for (n, name) in [&b"/jail/file"[..], b"/jail/gone (deleted)", b"/jailed/file"]
+            .into_iter()
+            .enumerate()
+        {
+            let at = GuestAddr(0x10_0000 + 2 * PAGE * n as u64);
+            mem.map(Some(at), PAGE, Prot::READ, MappingKind::File)
+                .unwrap();
+            let pages = SharedPages::new().with_source(Arc::new(At(name)));
+            mem.back_with_cache(at, PAGE, &pages, 0).unwrap();
+        }
+        vmas.extend(mem.mappings());
+        let names = |root: &[u8]| files(&mem, &vmas, root)[16 + 3 * 24..].to_vec();
+        assert_eq!(names(b"/jail"), b"/file\0/gone (deleted)\0/jailed/file\0");
+        assert_eq!(
+            names(b"/"),
+            b"/jail/file\0/jail/gone (deleted)\0/jailed/file\0"
+        );
+    }
+
+    #[test]
     fn each_part_of_a_split_file_mapping_names_its_own_page() {
         let mut mem = AddressSpace::new();
         let file = mem

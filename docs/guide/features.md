@@ -6041,7 +6041,7 @@ kernel.
     (`NT_FILE`:
     each VMA that maps a file, where renames have moved it, followed by
     `(deleted)` once the name it has is removed, as in `/proc/<pid>/maps`,
-    and shared anonymous memory as `/dev/zero (deleted)`, as Linux
+    from the process's root when it is under it, and shared anonymous memory as `/dev/zero (deleted)`, as Linux
     names it) and the memory. It has no `NT_X86_XSTATE` note, as Linux writes
     none on a CPU without XSAVE, which the virtual CPU is. The memory is
     chosen as Linux's `vma_dump_size` chooses it with the default

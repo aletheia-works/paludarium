@@ -556,7 +556,8 @@ impl Network {
     /// What a packet from `from` to `to` out through this namespace's veth
     /// end `index` finds at `now`, its neighbour first, its route's gateway
     /// or else `to` ([`Self::next_hop4`],
-    /// [`crate::interface::Addresses::neigh_output`]):
+    /// [`crate::interface::Addresses::neigh_output`]), one of IPv6 as
+    /// [`Self::reach6`] says:
     /// - Nothing answers, as nobody answers ARP for that neighbour
     ///   ([`Reach::Unanswered`]), unless the end has its carrier, so that
     ///   its peer is up (`veth_xmit`), the neighbour is an address of the peer's
@@ -581,34 +582,18 @@ impl Network {
             }
             _ => return Reach::Unanswered,
         };
-        let hop = self.next_hop4(index, to, flow, now);
-        let Some(Arp {
-            peer,
-            answer,
-            own_mac,
-        }) = self.arp(index, from, hop, now)
-        else {
-            return Reach::Unanswered;
+        let lladdr = match self.next_hop4(index, to, flow, now) {
+            IpAddr::V4(hop) => self.neighbour4(index, from, hop, now),
+            IpAddr::V6(hop) => self.neighbour6(index, None, hop, now),
         };
-        let at = now.unwrap_or(0);
-        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
-        self.later(events);
-        if asked
-            && answer.is_some()
-            && !from.is_unspecified()
-            && let Some((there, peer_index, ..)) = &peer
-        {
-            let events = there
-                .addresses_at(now)
-                .neigh_learn(*peer_index, from, own_mac, at);
-            there.later(events);
-        }
         let Some(lladdr) = lladdr else {
             return Reach::Unanswered;
         };
-        let Some((there, peer_index, _, their_rpf)) = peer.filter(|p| p.2 == lladdr) else {
+        let peer = self.veth_peer(index).and_then(|(peer, _)| peer);
+        let Some((there, peer_index, _)) = peer.filter(|p| p.2 == lladdr) else {
             return Reach::Dropped;
         };
+        let their_rpf = there.rp_filter(peer_index);
         // From no address (where no address fits, as `inet_select_addr`
         // finds none) the packet is a martian there
         // (`ip_route_input_slow`).
@@ -635,6 +620,98 @@ impl Network {
         };
         let back = self.back4(&there, from, to, &answer, now);
         Self::answered(there, flow, answer.oif, back)
+    }
+    /// The Ethernet address of the IPv4 neighbour `hop` of the veth end
+    /// `index`, for a packet from `from` at `now`, which resolves it as
+    /// [`Self::reach`] says; none where nothing answers.
+    fn neighbour4(
+        &self,
+        index: i32,
+        from: Ipv4Addr,
+        hop: Ipv4Addr,
+        now: Option<u64>,
+    ) -> Option<[u8; 6]> {
+        let Arp {
+            peer,
+            answer,
+            own_mac,
+        } = self.arp(index, from, hop, now)?;
+        let at = now.unwrap_or(0);
+        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
+        self.later(events);
+        if asked
+            && answer.is_some()
+            && !from.is_unspecified()
+            && let Some((there, peer_index, _)) = &peer
+        {
+            let events = there
+                .addresses_at(now)
+                .neigh_learn(*peer_index, from, own_mac, at);
+            there.later(events);
+        }
+        lladdr
+    }
+    /// [`Self::neighbour4`] of an IPv6 neighbour, as [`Self::reach6`] says;
+    /// with no `from`, as an IPv4 packet's through a gateway of IPv6 has
+    /// none of the end's, from the end's link-local address
+    /// (`ndisc_solicit`).
+    fn neighbour6(
+        &self,
+        index: i32,
+        from: Option<Ipv6Addr>,
+        hop: Ipv6Addr,
+        now: Option<u64>,
+    ) -> Option<[u8; 6]> {
+        let Nd {
+            peer,
+            answer,
+            own_mac,
+            asker,
+        } = self.nd(index, from, hop, now)?;
+        let at = now.unwrap_or(0);
+        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
+        self.later(events);
+        if asked {
+            self.solicit(index, asker, hop, at);
+        }
+        if asked && answer.is_some() {
+            Self::teach6(peer.as_ref(), asker, own_mac, at);
+        }
+        lladdr
+    }
+    /// The peer of this namespace's veth end `index`, if the end has its
+    /// carrier, with its namespace, index and Ethernet address; and the
+    /// end's own Ethernet address. `None` for no such end.
+    #[allow(clippy::type_complexity)]
+    fn veth_peer(&self, index: i32) -> Option<(Option<(Arc<Network>, i32, [u8; 6])>, [u8; 6])> {
+        let (peer, own_mac) = {
+            let devices = self.devices();
+            let veth = devices.by_index(index).and_then(|d| d.veth.as_ref())?;
+            let peer = veth
+                .peer
+                .clone()
+                .filter(|_| veth.carrier)
+                .and_then(|p| p.network.upgrade().map(|n| (n, p.index)));
+            (peer, veth.mac)
+        };
+        let peer = peer.and_then(|(there, at)| {
+            let mac = there
+                .devices()
+                .by_index(at)
+                .and_then(|d| d.veth.as_ref())
+                .map(|v| v.mac)?;
+            Some((there, at, mac))
+        });
+        Some((peer, own_mac))
+    }
+    /// [`Self::veth_peer`], where the peer takes IPv6.
+    fn nd_peer(&self, index: i32) -> Option<(Arc<Network>, i32, [u8; 6])> {
+        self.veth_peer(index)?.0.filter(|(there, at, _)| {
+            there.devices().by_index(*at).is_some_and(|device| {
+                device.conf6.disable_ipv6 == 0
+                    && device.veth.as_ref().is_some_and(|v| v.mtu >= 1280)
+            })
+        })
     }
     /// The device named in the route lookup of an answer from this
     /// namespace's address `to` to a packet of the flow `flow`, which came
@@ -700,9 +777,12 @@ impl Network {
         let own = self.own_end(there, back)?;
         let rpf = self.rp_filter(own);
         let addresses = self.addresses_at(now);
+        let found = match hop {
+            IpAddr::V4(hop) => !hop.is_loopback() && addresses.local4(hop),
+            IpAddr::V6(hop) => addresses.nd_target(own, hop),
+        };
         let comes = addresses.local4(from)
-            && !hop.is_loopback()
-            && addresses.local4(hop)
+            && found
             && addresses.validate_source4_on(to, 0, 0, rpf, own).is_ok();
         comes.then_some((back, own))
     }
@@ -716,40 +796,21 @@ impl Network {
             .max(devices.all4.rp_filter)
     }
     /// What ARP finds out through this namespace's veth end `index` for
-    /// `to`, asked from `from`: the peer, if the end has its carrier,
-    /// with its namespace, index, Ethernet address and reverse path
-    /// filtering; the address of the peer's that answers, if it does, as
-    /// `arp_process` takes no request for a loopback address (with
-    /// `route_localnet` off) and asks the route in from `from`, which a
-    /// request from 0.0.0.0 skips; and the end's own address and reverse
-    /// path filtering. `None` for no such end.
+    /// `to`, asked from `from`: the peer and the end's own Ethernet address
+    /// ([`Self::veth_peer`]); and the address of the peer's that answers,
+    /// if it does, as `arp_process` takes no request for a loopback address
+    /// (with `route_localnet` off) and asks the route in from `from`, which
+    /// a request from 0.0.0.0 skips. `None` for no such end.
     fn arp(&self, index: i32, from: Ipv4Addr, to: Ipv4Addr, now: Option<u64>) -> Option<Arp> {
-        let (peer, own_mac) = {
-            let devices = self.devices();
-            let veth = devices.by_index(index).and_then(|d| d.veth.as_ref())?;
-            let peer = veth
-                .peer
-                .clone()
-                .filter(|_| veth.carrier)
-                .and_then(|p| p.network.upgrade().map(|n| (n, p.index)));
-            (peer, veth.mac)
-        };
-        let peer = peer.and_then(|(there, at)| {
-            let mac = there
-                .devices()
-                .by_index(at)
-                .and_then(|d| d.veth.as_ref())
-                .map(|v| v.mac)?;
-            let their_rpf = there.rp_filter(at);
-            Some((there, at, mac, their_rpf))
-        });
-        let answer = peer.as_ref().and_then(|(there, at, mac, their_rpf)| {
+        let (peer, own_mac) = self.veth_peer(index)?;
+        let answer = peer.as_ref().and_then(|(there, at, mac)| {
+            let their_rpf = there.rp_filter(*at);
             let addresses = there.addresses_at(now);
             let answers = !to.is_loopback()
                 && addresses.local4(to)
                 && (from.is_unspecified()
                     || addresses
-                        .validate_source4_on(from, 0, 0, *their_rpf, *at)
+                        .validate_source4_on(from, 0, 0, their_rpf, *at)
                         .is_ok());
             answers.then_some(*mac)
         });
@@ -824,27 +885,10 @@ impl Network {
         now: Option<u64>,
     ) -> Reach {
         let hop = self.next_hop6(index, to, &Self::flow6(flow.src, flow.proto), now);
-        let Some(Nd {
-            peer,
-            answer,
-            own_mac,
-            asker,
-        }) = self.nd(index, Some(from), hop, now)
-        else {
+        let Some(lladdr) = self.neighbour6(index, Some(from), hop, now) else {
             return Reach::Unanswered;
         };
-        let at = now.unwrap_or(0);
-        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
-        self.later(events);
-        if asked {
-            self.solicit(index, asker, hop, at);
-        }
-        if asked && answer.is_some() {
-            Self::teach6(peer.as_ref(), asker, own_mac, at);
-        }
-        let Some(lladdr) = lladdr else {
-            return Reach::Unanswered;
-        };
+        let peer = self.nd_peer(index);
         let Some((there, peer_index, _)) = peer.filter(|p| p.2 == lladdr) else {
             return Reach::Dropped;
         };
@@ -1020,14 +1064,14 @@ impl Network {
     /// `index` goes to at `now`, of the flow `flow`: its route's gateway,
     /// that of the hop of a multipath route [`Self::route`] took, where a
     /// route of link scope reaches it, else `to` itself (`rt_nexthop`).
-    fn next_hop4(&self, index: i32, to: Ipv4Addr, flow: &Flow, now: Option<u64>) -> Ipv4Addr {
+    fn next_hop4(&self, index: i32, to: Ipv4Addr, flow: &Flow, now: Option<u64>) -> IpAddr {
         let order = self.devices().order();
         self.addresses_at(now)
             .output4(to, 0, flow.oif, source4(flow.src), &order)
             .ok()
             .filter(|r| i64::from(r.oif) == i64::from(index) && r.uses_gateway)
             .and_then(|r| r.gateway)
-            .unwrap_or(to)
+            .unwrap_or(IpAddr::V4(to))
     }
     /// The neighbour a packet of the flow `flow` to `to` out through the
     /// veth end `index` goes to at `now`: the gateway of its route through
@@ -1050,25 +1094,8 @@ impl Network {
     /// address of its end not tentative (`ndisc_recv_ns`); and the end's
     /// own address. `None` for no such end.
     fn nd(&self, index: i32, from: Option<Ipv6Addr>, to: Ipv6Addr, now: Option<u64>) -> Option<Nd> {
-        let (peer, own_mac) = {
-            let devices = self.devices();
-            let veth = devices.by_index(index).and_then(|d| d.veth.as_ref())?;
-            let peer = veth
-                .peer
-                .clone()
-                .filter(|_| veth.carrier)
-                .and_then(|p| p.network.upgrade().map(|n| (n, p.index)));
-            (peer, veth.mac)
-        };
-        let peer = peer.and_then(|(there, at)| {
-            let mac = {
-                let devices = there.devices();
-                let device = devices.by_index(at)?;
-                let veth = device.veth.as_ref()?;
-                (device.conf6.disable_ipv6 == 0 && veth.mtu >= 1280).then_some(veth.mac)?
-            };
-            Some((there, at, mac))
-        });
+        let (_, own_mac) = self.veth_peer(index)?;
+        let peer = self.nd_peer(index);
         let asker = self
             .addresses_at(now)
             .ns_source(index, from.filter(|f| !f.is_unspecified()));
@@ -1888,7 +1915,7 @@ enum Reach {
 }
 /// What ARP finds out through a veth end ([`Network::arp`]).
 struct Arp {
-    peer: Option<(Arc<Network>, i32, [u8; 6], i32)>,
+    peer: Option<(Arc<Network>, i32, [u8; 6])>,
     answer: Option<[u8; 6]>,
     own_mac: [u8; 6],
 }

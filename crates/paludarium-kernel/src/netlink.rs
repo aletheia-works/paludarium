@@ -4013,9 +4013,7 @@ fn ipv4_route_of(
         let mut nest = Vec::new();
         for hop in &route.hops {
             let mut attrs = Vec::new();
-            if let Some(gateway) = hop.gateway {
-                attribute(&mut attrs, RTA_GATEWAY, &gateway.octets());
-            }
+            put_gateway4(&mut attrs, hop.gateway);
             let flags = (if hop.dead { RTNH_F_DEAD } else { 0 })
                 | (if hop.linkdown { RTNH_F_LINKDOWN } else { 0 })
                 | if hop.onlink { RTNH_F_ONLINK } else { 0 };
@@ -4029,13 +4027,26 @@ fn ipv4_route_of(
         attribute(&mut body, RTA_MULTIPATH, &nest);
         return message(kind, flags, seq, port, &body);
     }
-    if let Some(gateway) = route.gateway {
-        attribute(&mut body, RTA_GATEWAY, &gateway.octets());
-    }
+    put_gateway4(&mut body, route.gateway);
     if route.oif != 0 {
         attribute(&mut body, RTA_OIF, &route.oif.to_le_bytes());
     }
     message(kind, flags, seq, port, &body)
+}
+/// The gateway of an IPv4 route's next hop: `RTA_GATEWAY`, or `RTA_VIA` of
+/// an IPv6 one (`fib_nexthop_info`, `rt_fill_info`).
+fn put_gateway4(body: &mut Vec<u8>, gateway: Option<core::net::IpAddr>) {
+    use core::net::IpAddr;
+    match gateway {
+        Some(IpAddr::V4(gateway)) => attribute(body, RTA_GATEWAY, &gateway.octets()),
+        Some(IpAddr::V6(gateway)) => {
+            // `struct rtvia`.
+            let mut via = u16::from(AF_INET6).to_le_bytes().to_vec();
+            via.extend_from_slice(&gateway.octets());
+            attribute(body, RTA_VIA, &via);
+        }
+        None => {}
+    }
 }
 /// An IPv6 route as `rt6_fill_node` gives it at `now`, as a message of
 /// `kind` with `flags`, with the next hops `hops` of a multipath route
@@ -4381,7 +4392,7 @@ fn lookup(
     let (kind, matched_tos, gateway, table, metrics): (
         Kind,
         u8,
-        Option<Ipv4Addr>,
+        Option<core::net::IpAddr>,
         Option<u32>,
         crate::interface::Metrics,
     );
@@ -4510,9 +4521,7 @@ fn lookup(
     if source != named {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
-    if let Some(gateway) = gateway {
-        attribute(&mut body, RTA_GATEWAY, &gateway.octets());
-    }
+    put_gateway4(&mut body, gateway);
     put_metrics(&mut body, &metrics);
     // The mark it names, but 0, as `rt_fill_info` gives it; an invalid
     // user ID (-1) is left out (`uid_valid`).
@@ -4707,9 +4716,7 @@ fn input4(
     attribute(&mut body, RTA_OIF, &out.to_le_bytes());
     // A forwarded one has its route's next hop (`rt_set_nexthop`).
     if let Some(route) = route.filter(|r| r.kind == Kind::Unicast) {
-        if let Some(gateway) = route.gateway.filter(|_| route.uses_gateway) {
-            attribute(&mut body, RTA_GATEWAY, &gateway.octets());
-        }
+        put_gateway4(&mut body, route.gateway.filter(|_| route.uses_gateway));
         put_metrics(&mut body, &route.metrics);
     }
     if input.mark != 0 {
@@ -4876,8 +4883,7 @@ fn input6(
 /// past `RTN_MAX`; for IPv6, `EINVAL` for `RTA_FLOWLABEL`, `RTA_VIA` and a
 /// destination shorter than its prefix, then, adding (`fib6_config_validate`),
 /// for `RTM_F_CLONED`, a kind past `RTN_MAX` and a prefix or source prefix
-/// past 128. IPv4 next hops through `RTA_VIA` ([`nexthops4`]),
-/// encapsulations, nexthop objects, realms, expiries,
+/// past 128. Encapsulations, nexthop objects, realms, expiries,
 /// source prefixes and router preferences are
 /// `EOPNOTSUPP`. A route added takes the metrics `RTA_METRICS` holds
 /// ([`convert_metrics`]); an IPv4 one removed must have those it names
@@ -4920,6 +4926,7 @@ fn change_route_told(
     let mut dst = None;
     let mut prefsrc = None;
     let mut gateway = None;
+    let mut via = None;
     let mut oif = 0;
     let mut priority = 0;
     let mut metrics = None;
@@ -4987,7 +4994,8 @@ fn change_route_told(
             RTA_PREF if v6 => unsupported |= value.first().is_some_and(|&p| p == 1 || p == 3),
             RTA_METRICS => metrics = Some(value),
             RTA_MULTIPATH => multipath = Some(value),
-            RTA_FLOW | RTA_VIA | RTA_ENCAP | RTA_EXPIRES | RTA_NH_ID => {
+            RTA_VIA => via = Some(gateway_of_via(value)?),
+            RTA_FLOW | RTA_ENCAP | RTA_EXPIRES | RTA_NH_ID => {
                 unsupported = true;
             }
             _ => {}
@@ -5064,11 +5072,7 @@ fn change_route_told(
             gateway: ip(gateway),
             onlink: flags & RTNH_F_ONLINK != 0,
             device: network.has_device(oif),
-            ipv6_off: i32::try_from(oif)
-                .ok()
-                .and_then(|i| ipv6_device(network, i))
-                .filter(|d| d.has)
-                .map(|d| d.disabled),
+            ipv6_off: ipv6_off(network, oif),
             request: header.flags,
             metrics: converted,
         };
@@ -5090,11 +5094,7 @@ fn change_route_told(
                         gateway: hop.gateway.map(Ipv6Addr::from).or(ask.gateway),
                         onlink: ask.onlink || hop.flags & RTNH_F_ONLINK != 0,
                         device: network.has_device(oif),
-                        ipv6_off: i32::try_from(oif)
-                            .ok()
-                            .and_then(|i| ipv6_device(network, i))
-                            .filter(|d| d.has)
-                            .map(|d| d.disabled),
+                        ipv6_off: ipv6_off(network, oif),
                         metrics: ask.metrics,
                         ..ask
                     };
@@ -5124,7 +5124,17 @@ fn change_route_told(
         raw.map(|r| Ipv4Addr::from(<[u8; 4]>::try_from(r).unwrap_or_default()))
     };
     let (dst, prefsrc) = (ip(dst).unwrap_or(Ipv4Addr::UNSPECIFIED), ip(prefsrc));
-    let gateway = ip(gateway).filter(|g| !g.is_unspecified());
+    // `rtm_to_fib_config` checks the prefix first.
+    if gateway.is_some() && via.is_some() {
+        crate::interface::prefix4(dst, dst_len)?;
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Nexthop configuration can not contain both GATEWAY and VIA",
+        ));
+    }
+    let gateway = via.or(ip(gateway)
+        .filter(|g| !g.is_unspecified())
+        .map(core::net::IpAddr::V4));
     let multipath = multipath.map(|value| nexthops4(network, value));
     // Adding, a hop not supported here is that hop's error, in turn.
     if !add && multipath.as_ref().is_some_and(|m| m.unsupported) {
@@ -5149,6 +5159,7 @@ fn change_route_told(
                 gateway,
                 oif,
                 device: oif != 0 && device_state(network, oif).is_some(),
+                ipv6_off: ipv6_off(network, oif),
                 flags,
                 request: header.flags,
                 metrics: converted,
@@ -5179,12 +5190,41 @@ fn change_route_told(
         multipath: multipath.map(|m| m.listed),
     })
 }
+/// The gateway an `RTA_VIA` names, as `fib_gw_from_via` reads its
+/// `struct rtvia`: `EINVAL` for one without a family, of a family but IPv4
+/// and IPv6, and of an address of another length.
+fn gateway_of_via(value: &[u8]) -> Result<core::net::IpAddr, Errno> {
+    use core::net::IpAddr;
+    let invalid = |text| extack::message(Errno::EINVAL, text);
+    let Some((family, address)) = value.split_first_chunk::<2>() else {
+        return Err(invalid("Invalid attribute length for RTA_VIA"));
+    };
+    match u16::from_le_bytes(*family) {
+        2 => <[u8; 4]>::try_from(address)
+            .map(IpAddr::from)
+            .map_err(|_| invalid("Invalid IPv4 address in RTA_VIA")),
+        10 => <[u8; 16]>::try_from(address)
+            .map(IpAddr::from)
+            .map_err(|_| invalid("Invalid IPv6 address in RTA_VIA")),
+        _ => Err(invalid("Unsupported address family in RTA_VIA")),
+    }
+}
+/// The IPv6 of the device `oif`, as [`crate::interface::Ask6::ipv6_off`]
+/// has it.
+fn ipv6_off(network: &Network, oif: u32) -> Option<bool> {
+    i32::try_from(oif)
+        .ok()
+        .and_then(|i| ipv6_device(network, i))
+        .filter(|d| d.has)
+        .map(|d| d.disabled)
+}
 /// The next hops of an IPv4 route's `RTA_MULTIPATH` `value`, as
 /// `fib_count_nexthops` counts them (`EINVAL` for data past the last
 /// `rtnh_ok` one) and `fib_get_nhs` reads them: `EINVAL` for one
 /// `RTNH_F_DEAD` or `RTNH_F_LINKDOWN`, for both `RTA_GATEWAY` and
-/// `RTA_VIA`, for a gateway shorter than an address and an `RTA_FLOW`
-/// shorter than 4 bytes. One through an IPv6 gateway (`RTA_VIA`), of a
+/// `RTA_VIA`, for a gateway shorter than an address, as
+/// [`gateway_of_via`], and an `RTA_FLOW`
+/// shorter than 4 bytes. One of a
 /// realm (`RTA_FLOW`) or an encapsulation is not supported
 /// (`EOPNOTSUPP`, in its turn among the hops' errors). A gateway of
 /// 0.0.0.0 is none. What a removal matches (`fib_nh_match`) is each's
@@ -5219,17 +5259,21 @@ fn nexthops4(network: &Network, value: &[u8]) -> Nexthops4 {
             weight: u16::from(rtnh[3]) + 1,
             oif,
             device: oif != 0 && device_state(network, oif).is_some(),
+            ipv6_off: ipv6_off(network, oif),
             gateway: None,
+            via: false,
+            broken: false,
         };
         let attrs = attributes(&rtnh[8..]);
         let find = |kind: u16| attrs.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v);
         let gateway = find(RTA_GATEWAY);
+        let via = find(RTA_VIA).map(gateway_of_via);
         let error = if hop.flags & 0x11 != 0 {
             Some(extack::message(
                 Errno::EINVAL,
                 "Invalid flags for nexthop - can not contain DEAD or LINKDOWN",
             ))
-        } else if gateway.is_some() && find(RTA_VIA).is_some() {
+        } else if gateway.is_some() && via.is_some() {
             Some(extack::message(
                 Errno::EINVAL,
                 "Nexthop configuration can not contain both GATEWAY and VIA",
@@ -5239,24 +5283,33 @@ fn nexthops4(network: &Network, value: &[u8]) -> Nexthops4 {
                 Errno::EINVAL,
                 "Invalid IPv4 address in RTA_GATEWAY",
             ))
+        } else if let Some(Err(error)) = via {
+            Some(error)
         } else if find(RTA_FLOW).is_some_and(|f| f.len() < 4) {
             Some(extack::message(Errno::EINVAL, "Invalid RTA_FLOW"))
         } else {
             None
         };
-        let unsupported_hop = find(RTA_VIA).is_some()
-            || find(RTA_FLOW).is_some()
-            || find(RTA_ENCAP).is_some()
-            || find(RTA_ENCAP_TYPE).is_some();
+        let unsupported_hop =
+            find(RTA_FLOW).is_some() || find(RTA_ENCAP).is_some() || find(RTA_ENCAP_TYPE).is_some();
         unsupported |= unsupported_hop;
         // Linux reads the hops in turn: this one's error, else, for what
         // is not supported here, `EOPNOTSUPP`, before a later one's.
         let error = error.or(unsupported_hop.then_some(EOPNOTSUPP));
-        hop.gateway = gateway
+        hop.via = via.is_some();
+        hop.broken = (gateway.is_some() && via.is_some())
+            || gateway.is_some_and(|g| g.len() < 4)
+            || matches!(via, Some(Err(_)));
+        let named = gateway
             .and_then(|g| g.first_chunk::<4>())
-            .map(|g| core::net::Ipv4Addr::from(*g))
-            .filter(|g| !g.is_unspecified());
+            .map(|g| core::net::IpAddr::from(*g));
+        hop.gateway = via.and_then(Result::ok).or(named);
+        // A removal compares a gateway of 0.0.0.0, which an addition takes
+        // for none.
         listed.push(hop);
+        if !hop.via {
+            hop.gateway = named.filter(|g| !g.is_unspecified());
+        }
         if let Ok(list) = hops.as_mut() {
             match error {
                 Some(e) => hops = Err(e),

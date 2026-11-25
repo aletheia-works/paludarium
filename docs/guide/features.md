@@ -2938,6 +2938,14 @@ kernel.
     address of the namespace, a broadcast or a group (`EINVAL`). Its
     packets go to the gateway's neighbour where a route of link scope
     reaches the gateway (`rt_uses_gateway`), else to their destination's.
+    A gateway may be one of IPv6 (`RTA_VIA`, `fib_gw_from_via`; one of IPv4
+    there is as in `RTA_GATEWAY`, and both are `EINVAL`): it is checked as
+    an IPv6 route's (`fib_check_nh_v6_gw`), by the IPv6 table of the
+    route's number, then the local and main ones, its end needs IPv6 on
+    (`EACCES`), and a next hop made without its carrier is not
+    `RTNH_F_LINKDOWN`. The packets go to its neighbour, which neighbour
+    discovery finds from the end's link-local address, and dumps,
+    notifications and lookups give it as `RTA_VIA`.
     A route's `RTA_MULTIPATH` makes one route of its next hops
     (`fib_get_nhs`), each checked as a route's next hop of its own device,
     gateway and flags (`fib_check_nh`), with its weight (`rtnh_hops` + 1):

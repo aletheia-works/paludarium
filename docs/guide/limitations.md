@@ -121,7 +121,7 @@ verified.
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/cpuinfo`, `/proc/net` and a process's `net`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
@@ -211,8 +211,8 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Multicast datagrams reach no one, nor do broadcast ones but through a
-    veth end (below). A datagram is always
+    IPv6 multicast datagrams reach no one, nor do broadcast ones but through
+    a veth end (below). A datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
     `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer
@@ -1120,8 +1120,15 @@ verified.
   Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
   solicitation nor MLD report. Traffic through
   an end moves no counters; a namespace forwards nothing
-  on to another; and a multicast destination through an end reaches no
-  one, as no socket joins a group (`IP_ADD_MEMBERSHIP`, `IPV6_ADD_MEMBERSHIP`). ICMP's port unreachable is not rate limited
+  on to another; and an IPv6 multicast destination through an end reaches
+  no one, as no socket joins such a group (`IPV6_ADD_MEMBERSHIP`). An IPv4
+  group is one of the guest's namespaces alone: the first has no device to
+  the host's network, so no route to one, and joining one there without
+  naming a device is `ENODEV`.
+  No IGMP or MLD packet is sent: nothing in the guest would see one, as
+  raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
+  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) are
+  `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,
@@ -1222,10 +1229,7 @@ verified.
   `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
-  lookup while `lo` is down is `ENETUNREACH` too. A route lookup's answer
-  for a multicast address is local (`RTCF_LOCAL`) only for 224.0.0.1, the
-  group `lo` is a member of while up, as no socket here joins a group,
-  where Linux's is local for each group a socket joined on `lo` too. A
+  lookup while `lo` is down is `ENETUNREACH` too. A
   lookup's `rta_cacheinfo` counts one reference, where Linux counts the
   other users of the cached route too.
   `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the

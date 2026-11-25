@@ -80,6 +80,7 @@ mod mqueue;
 #[cfg(test)]
 mod mqueue_tests;
 mod msg;
+mod multicast;
 mod namespaces;
 mod page_cache;
 mod pagemap_scan;

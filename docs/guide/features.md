@@ -2974,6 +2974,26 @@ kernel.
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).
+  - **IPv4 multicast groups:** a UDP socket joins and leaves a group with
+    `IP_ADD_MEMBERSHIP` and `IP_DROP_MEMBERSHIP` (`ip_mreqn` or `ip_mreq`),
+    on the device of an index, of an address, or of the route to the group
+    (`ENODEV` for none): `EINVAL` for no group, `EADDRINUSE` as a member
+    there, `ENOBUFS` past 20, `EADDRNOTAVAIL` to leave as none, and
+    `EPROTO` of TCP (`__ip_mc_join_group`, `ip_mc_leave_group`); closing it
+    leaves all. A device is in a group while a socket of its namespace is
+    a member there, and in 224.0.0.1 while it is up. A datagram to a group
+    goes out through the socket's device, else `IP_MULTICAST_IF`'s, else
+    that of the source's address, else the route's, from the socket's
+    address, else `IP_MULTICAST_IF`'s. Where the device is in the group it
+    comes back too, unless `IP_MULTICAST_LOOP` is off (which an IPv6
+    socket's send does not heed), and goes no further with an
+    `IP_MULTICAST_TTL` of 0 (`ip_mc_output`); across the pair, the peer's
+    namespace takes it where its end is in the group
+    (`ip_route_input_mc`); and through `lo` it comes back where `lo` is.
+    There it reaches each UDP socket of its port that a broadcast would,
+    and that is a member on that device or has `IP_MULTICAST_ALL` on
+    (`ip_mc_sf_allow`). An accepted connection's `IP_MULTICAST_TTL` is 64
+    (`tcp_v4_syn_recv_sock`).
   - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
     unicast one, or the multicast `ff00::/8`) goes out through an end
     leaves from the route's preferred source, or the address
@@ -3260,8 +3280,8 @@ kernel.
     the route that matched. An IPv4 answer for a multicast or the limited
     broadcast address is of the multicast or broadcast type, as
     `__mkroute_output` makes it (`RTCF_MULTICAST` or `RTCF_BROADCAST`, and
-    `RTCF_LOCAL` for the broadcast address and a group `lo` is a member
-    of, 224.0.0.1 while it is up), and with `RTM_F_FIB_MATCH` the table's
+    `RTCF_LOCAL` for the broadcast address and a group the device is in),
+    and with `RTM_F_FIB_MATCH` the table's
     entry takes that type too; from a source of the loopback's and no
     device, and through `lo` to a local group (224.0.0.0/24) or the
     broadcast address, it is made with no table looked in (of TOS 0 and no
@@ -3277,7 +3297,7 @@ kernel.
     the device as `RTA_IIF`. IPv4 drops martians
     (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
     source, a loopback or 0.0.0.0 destination, a group the device has not
-    joined (224.0.0.1 is joined while it is up), and a source of the namespace's own, or with a local route a
+    joined, and a source of the namespace's own, or with a local route a
     request added, one a lookup finds a route to that is not unicast
     (`fib_validate_source`). A local, broadcast or multicast destination
     gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,

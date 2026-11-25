@@ -629,6 +629,8 @@ fn switch(
                 carrier(v, true);
             }
         });
+        // `ip_mc_up`, of `NETDEV_UP`.
+        network.change_group4(index, crate::multicast::ALL_HOSTS, true);
         if peer_up && let Some((n, i)) = &peer {
             change(n, *i, |v| carrier(v, true));
             let list = super::device_changed4(n, *i, true, true);
@@ -662,6 +664,8 @@ fn switch(
             v.up = false;
             carrier(v, false);
         });
+        // `ip_mc_down`, of `NETDEV_DOWN`.
+        network.change_group4(index, crate::multicast::ALL_HOSTS, false);
         // `__dev_notify_flags` tells of the change before `NETDEV_DOWN`
         // flushes the end's neighbours; the peer's go as the link watch
         // finds its carrier gone, before it tells of that
@@ -908,6 +912,8 @@ pub(super) fn move_to(
     let peer = device.veth.as_ref().and_then(|v| v.peer.clone());
     let settings = {
         let mut devices = to.devices();
+        // `ip_mc_destroy_dev`, with the old namespace's `in_device`.
+        device.groups4 = crate::multicast::Groups::default();
         device.conf4 = devices.default4;
         device.conf6 = devices.default6;
         let settings = crate::netconf::registered(&device);

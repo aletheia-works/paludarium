@@ -15,15 +15,17 @@ use std::sync::{Arc, OnceLock};
 /// `ARPHRD_ETHER` and `ARPHRD_LOOPBACK`, a device's type.
 const ETHER: u16 = 1;
 const LOOPBACK: u16 = 772;
-/// `PACKET_HOST`, `PACKET_BROADCAST` and `PACKET_LOOPBACK`.
+/// `PACKET_HOST`, `PACKET_BROADCAST`, `PACKET_MULTICAST` and
+/// `PACKET_LOOPBACK`.
 const HOST: u32 = 0;
 const BROADCAST: u32 = 1;
+const MULTICAST: u32 = 2;
 const LOOPED: u32 = 5;
 /// The loopback's index (`LOOPBACK_IFINDEX`) and MTU.
 const LO_INDEX: u32 = 1;
 const LO_MTU: usize = 65_536;
 /// `sysctl_ip_default_ttl` and IPv6's `hop_limit`.
-const HOPS: u8 = 64;
+pub(super) const HOPS: u8 = 64;
 /// `IPPROTO_UDP` and `IPPROTO_TCP`.
 const UDP: u8 = 17;
 const TCP: u8 = 6;
@@ -54,6 +56,8 @@ pub(super) struct Sent {
     /// The sending task's real user and group IDs: the receive runs in
     /// its context, in the softirq that the send raises.
     pub(super) ids: (u32, u32),
+    /// An IPv4 packet's time to live.
+    pub(super) ttl: u8,
 }
 
 /// How a datagram comes to a socket.
@@ -69,7 +73,7 @@ pub(super) enum Way {
         dst: [u8; 6],
         mtu: usize,
     },
-    /// A broadcast's copy that `ip_mc_output` loops back on the sending
+    /// A broadcast's or a group's copy that `ip_mc_output` loops back on the sending
     /// veth end `index` (`dev_loopback_xmit`), of MTU `mtu`.
     Looped { index: u32, mtu: usize },
 }
@@ -103,6 +107,7 @@ impl Sent {
             hash,
             priority,
             ids,
+            ttl: HOPS,
         }
     }
 
@@ -191,6 +196,8 @@ impl Sent {
             pkt_type: match way {
                 Way::Loopback => HOST,
                 Way::Veth { dst, .. } if dst == [0xff; 6] => BROADCAST,
+                // `eth_type_trans`: a group's address has its low bit set.
+                Way::Veth { dst, .. } if dst[0] & 1 != 0 => MULTICAST,
                 Way::Veth { .. } => HOST,
                 Way::Looped { .. } => LOOPED,
             },
@@ -313,7 +320,7 @@ impl Sent {
         h.extend(((20 + len) as u16).to_be_bytes());
         h.extend(id.to_be_bytes());
         h.extend(if whole { [0x40, 0] } else { [0, 0] });
-        h.extend([HOPS, proto, 0, 0]);
+        h.extend([self.ttl, proto, 0, 0]);
         h.extend(from.octets());
         h.extend(to.octets());
         let check = !fold(add(0, &h));

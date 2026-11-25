@@ -174,9 +174,6 @@ const RTCF_BROADCAST: u32 = 0x1000_0000;
 const RTCF_MULTICAST: u32 = 0x2000_0000;
 /// `RTN_MULTICAST`, the type of a looked-up route to a multicast address.
 const RTN_MULTICAST: u8 = 5;
-/// `IGMP_ALL_HOSTS`, the one group `lo` is a member of while it is up
-/// (`ip_mc_up`), as no socket here joins one.
-const ALL_HOSTS: core::net::Ipv4Addr = core::net::Ipv4Addr::new(224, 0, 0, 1);
 /// The mark `RTM_F_NOTIFY` leaves on a looked-up route.
 const RTCF_NOTIFY: u32 = 0x0001_0000;
 const RTA_OIF: u16 = 4;
@@ -4222,23 +4219,22 @@ fn lookup(
         label: flowlabel & 0x000f_ffff,
         proto: proto.unwrap_or(0),
     };
-    // The device it comes in on alone, before the addresses: whether it
-    // is up, its forwarding, and the reverse path filtering that counts.
+    // The device it comes in on alone, before the addresses: the groups it
+    // has joined, its forwarding, and the reverse path filtering that counts.
     let device = {
         let devices = network.devices();
         let index = i32::try_from(iif).unwrap_or(0);
         devices.by_index(index).map(|d| {
-            let up = d.veth.as_ref().map_or_else(|| network.is_up(), |v| v.up);
             (
                 index,
-                up,
+                d.groups4.clone(),
                 d.conf4.forwarding != 0,
                 d.conf4.rp_filter.max(devices.all4.rp_filter),
             )
         })
     };
     let addresses = network.addresses();
-    if let Some((index, up, forwarding, rp_filter)) = device.filter(|_| iif != 0) {
+    if let Some((index, groups4, forwarding, rp_filter)) = device.filter(|_| iif != 0) {
         let input = Input {
             tos,
             flags: request_flags,
@@ -4246,7 +4242,7 @@ fn lookup(
             uid: asked_uid,
             reply: (seq, port),
             iif: index,
-            up,
+            groups4,
             forwarding,
             rp_filter,
         };
@@ -4476,16 +4472,14 @@ fn lookup(
     // it goes through `lo`, and through a veth end only for a broadcast.
     // Its type is broadcast for the limited broadcast address, multicast
     // for a multicast one, and else the table's; a multicast one is local
-    // only to a group the device is a member of (`ip_check_mc_rcu`), as
-    // each is of 224.0.0.1 while up (`ip_mc_up`).
-    let out_up = device_state(network, out).is_some_and(|(_, up)| up);
+    // only to a group the device is a member of (`ip_check_mc_rcu`).
     let (code, mut flags) = if ip.is_broadcast() {
         (
             Kind::Broadcast.code(),
             RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST,
         )
     } else if ip.is_multicast() {
-        let member = ip == ALL_HOSTS && out_up;
+        let member = i32::try_from(out).is_ok_and(|out| network.in_group4(out, ip));
         let local = if member { RTCF_LOCAL } else { 0 };
         (RTN_MULTICAST, RTM_F_CLONED | RTCF_MULTICAST | local)
     } else if kind == Kind::Broadcast {
@@ -4544,9 +4538,9 @@ struct Input {
     uid: Option<u32>,
     reply: (u32, u32),
     /// The device it comes in on (`RTA_IIF`), `lo` or a veth end, and
-    /// whether that is up.
+    /// the IPv4 groups it has joined.
     iif: i32,
-    up: bool,
+    groups4: crate::multicast::Groups,
     /// That device's `forwarding` (`IN_DEV_FORWARD`), and the reverse path
     /// filtering that counts, `all`'s or the device's, the larger
     /// (`IN_DEV_RPFILTER`), as `/proc/sys/net` sets them.
@@ -4608,10 +4602,10 @@ fn input4(
     let (code, flags, route) = if ip.is_multicast() {
         // `ip_route_input_mc`, for a group the device has joined
         // (`ip_check_mc_rcu`), after `ip_mc_validate_source`.
-        if ip != ALL_HOSTS || !input.up || martian(src) || src.is_loopback() {
+        if !input.groups4.has(ip) || martian(src) || src.is_loopback() {
             return Err(Errno::EINVAL);
         }
-        let local_group = u32::from(ip) & 0xffff_ff00 == 0xe000_0000;
+        let local_group = crate::multicast::local_group(ip);
         if src.is_unspecified() && !local_group || !src.is_unspecified() && !valid(src) {
             return Err(Errno::EINVAL);
         }
@@ -8705,6 +8699,7 @@ mod tests {
         {
             v.up = up;
         }
+        network.change_group4(1000, crate::multicast::ALL_HOSTS, up);
     }
     #[test]
     fn a_veth_ends_ipv4_addresses_are_its_own_in_dumps_and_lookups() {

@@ -5138,8 +5138,9 @@ kernel.
   VMAs with no file and 3 those of VMAs with one (shared memory's too):
   `smaps` and `smaps_rollup` leave a page out of `Referenced` until its
   next access, an instruction fetch too. A `fork`ed child has referenced
-  none of the pages it gets (`pte_mkold`). It has no read operation (`EINVAL`, `EBADF` on a descriptor
-  open only for writing), and `lseek` leaves it at 0.
+  none of the pages it gets (`pte_mkold`). It has no read operation
+  (`EINVAL`, `EBADF` on a descriptor open only for writing), and `lseek`
+  leaves it at 0.
 
 - `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
   Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open

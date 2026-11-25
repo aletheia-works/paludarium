@@ -547,9 +547,11 @@ mod linux {
             ) {
                 host.measure_cpu_time();
             }
-            let session =
-                paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap())
-                    .unwrap();
+            let session = paludarium_harness::with_test_jit(
+                Session::new(config, host.clone()).unwrap(),
+                &host,
+            )
+            .unwrap();
             let start = Instant::now();
             let status = session.run().unwrap();
             let emulated = Outcome {

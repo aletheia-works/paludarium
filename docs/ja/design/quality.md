@@ -261,7 +261,8 @@ ripgrep の検索、coreutils のケースをすべて両方で動かし、JIT �
 差分テストを `PALUDARIUM_TEST_JIT=1` でも動かします。このとき `diff_core`、
 `diff_instructions`、`parallel_instructions`、`diff_signals_time`、`diff_terminal`、
 `diff_encodings`、`diff_network`、`diff_files`、`diff_processes` のゲストは、すべての
-ブロックを最初の実行でコンパイルして動き、それを動かすスレッドはコードができるのを待ちます。`diff_events` と `diff_threads` の
+ブロックを最初の実行でコンパイルして動き、それを動かすスレッドはコードができるのを待ちます
+（そのあいだ、テストのホストの仮想の時計は、ほかのスレッドが眠る時間を飛び越しません）。`diff_events` と `diff_threads` の
 ゲストは、コマンドの `--jit=1` で動き、バックグラウンドでコンパイルします。ゲストの
 プログラムを動かさずにインタプリタを直接呼ぶケースは、JIT なしと同じに動きます。
 ファジングの対象 `jit_native` は、任意の命令のバイト列について、コンパイルした

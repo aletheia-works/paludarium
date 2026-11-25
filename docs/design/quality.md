@@ -396,7 +396,8 @@ pull request the `differential-jit` job also runs the differential tests with
 `parallel_instructions`, `diff_signals_time`, `diff_terminal`,
 `diff_encodings`, `diff_network`, `diff_files` and `diff_processes` then run
 with every block compiled the first time it runs, while the thread that runs
-it waits, and those of `diff_events` and `diff_threads` with the command's
+it waits (and the test host's virtual clock does not jump over what others
+sleep for), and those of `diff_events` and `diff_threads` with the command's
 `--jit=1`, which compiles in the background. The cases that call the
 interpreter itself rather than run a guest program run as without it. The
 `jit_native` fuzz target compares compiled code with the interpreter for

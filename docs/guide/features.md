@@ -1859,7 +1859,11 @@ kernel.
     stay in the file. Task work the thread still has as it exits runs so
     too: a request whose file became ready fails with `ECANCELED`, a
     link's next request with `EFAULT` (`io_should_terminate_tw`), and an
-    `IORING_NOP_TW` completes.
+    `IORING_NOP_TW` completes. Work that comes for a thread that is gone
+    while another thread holds the ring waits for that thread, and no other
+    call waits for it, as Linux's worker alone waits for `uring_lock`. A
+    ring that closes first drops it, with the files its requests hold,
+    where Linux runs it as cancelled, which no one can see.
   - `execve` cancels every request the thread submitted that waits for its
     file, one whose file became ready too (`io_uring_task_cancel`), on the
     old image's memory, as `io_uring_cancel_generic` loops. The task work of

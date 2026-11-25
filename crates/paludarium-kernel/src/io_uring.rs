@@ -2091,7 +2091,9 @@ pub(crate) fn cancel_all_task(c: &mut Context<'_>) {
 /// work it still has runs as an exiting task's does ([`run_terminated`]),
 /// as will any added later. A whole process's exit ran
 /// [`cancel_all_task`] first; a request of a thread that exits alone waits
-/// on, and fails once its file is ready.
+/// on, and fails once its file is ready. Here the thread waits for a ring
+/// another holds, as Linux's `exit_task_work` takes `uring_lock` in the
+/// thread that exits: no worker runs this work.
 pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
     let work = {
         let mut task_work = inbox.task_work();

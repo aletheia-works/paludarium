@@ -5864,6 +5864,35 @@ kernel.
   takes the listener's filter and its lock, as `sk_clone_lock` copies
   them.
 
+- On a TCP connection on the loopback or across a veth pair, the filter
+  runs on each segment that comes to its socket, data, acknowledgements,
+  ends and resets, as `tcp_v4_rcv` and `tcp_v6_rcv` run `tcp_filter`: until
+  the socket is closed and its end acknowledged.
+  - It sees the TCP header, 32 bytes with the timestamps and more with SACK
+    blocks, and the data after it: sequence numbers from a random first one,
+    the flags (`PSH` on a write's last, `URG` and its pointer up to an
+    urgent byte), the window the side offers, scaled, the pseudo-header's
+    checksum and the `sk_buff` fields, with `gso_segs` and `gso_size`.
+    Classic loads see the same, with `SKF_AD_PAY_OFFSET` where the data
+    starts.
+  - 0 drops the segment, which is then not counted (`tcpi_segs_in`). Any
+    other value keeps that many bytes from the TCP header on, the header
+    always: the data past them has not come, and an end on the segment
+    comes with what is kept of it.
+  - What was dropped or cut is sent again as Linux 7.0 sends it: by a tail
+    loss probe; on a SACK of something sent later (RACK); or at the
+    retransmission timeout, 201 ms that doubles, the small segments at the
+    head joined into one (`tcp_retrans_try_collapse`). It comes at its time,
+    whether or not a call is made then. `tcp_info` tells of it:
+    the recovery's state, the segments lost, SACKed and sent again, the
+    congestion window and its threshold (cubic's, with proportional rate
+    reduction), the timeouts, the duplicates the peer told of (D-SACK),
+    which may undo the reduction, and those that came out of order.
+  - A connection ends with `ETIMEDOUT` after `TCP_USER_TIMEOUT`, else after
+    15 timeouts (`tcp_retries2`), or 8 for one whose socket has closed. A
+    reset that is dropped leaves the connection open; each segment it
+    sends then gets another.
+
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it
   and converted as `bpf_convert_filter` converts it, instruction for
@@ -6456,9 +6485,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_LINGER`,
     `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
     the host), `TCP_CORK` (which does not), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
-    `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
-    with Linux's defaults and
-    range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
+    `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read
+    only), `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
     `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
     `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and

@@ -23,6 +23,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -362,6 +363,392 @@ static void held(int l, int port) {
             }
             close(c);
             close(s);
+            break;
+        }
+    }
+}
+/* tcp-loss: filters on what comes to a connection's side, the data from
+   the payload on (SO_ATTACH_FILTER; a packet starts at its TCP header). */
+struct sock_filter {
+    unsigned short code;
+    unsigned char jt, jf;
+    unsigned k;
+};
+struct sock_fprog {
+    unsigned short len;
+    struct sock_filter *filter;
+};
+enum { BPF_LD = 0, BPF_ALU = 4, BPF_JMP = 5, BPF_RET = 6, BPF_MISC = 7, BPF_TAX = 0, BPF_TXA = 0x80 };
+enum { BPF_W = 0, BPF_B = 0x10, BPF_ABS = 0x20, BPF_IND = 0x40, BPF_LEN = 0x80, BPF_K = 0, BPF_X = 8, BPF_A = 0x10 };
+enum { BPF_ADD = 0, BPF_SUB = 0x10, BPF_AND = 0x50, BPF_RSH = 0x70, BPF_JEQ = 0x10, BPF_JSET = 0x40 };
+#define LOSS_HEAD                                                              \
+    {BPF_LD | BPF_B | BPF_ABS, 0, 0, 12}, {BPF_ALU | BPF_RSH | BPF_K, 0, 0, 2}, \
+        {BPF_ALU | BPF_AND | BPF_K, 0, 0, 0x3c}, {BPF_MISC | BPF_TAX, 0, 0, 0}, \
+        {BPF_LD | BPF_W | BPF_LEN, 0, 0, 0}, {BPF_ALU | BPF_SUB | BPF_X, 0, 0, 0}
+#define LOSS_KEEP {BPF_RET | BPF_K, 0, 0, 0xffffffff}
+#define LOSS_DROP {BPF_RET | BPF_K, 0, 0, 0}
+static struct sock_filter loss_data[] = {LOSS_HEAD, {BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0}, LOSS_KEEP, LOSS_DROP};
+/* Data that starts with an A. */
+static struct sock_filter loss_first[] = {LOSS_HEAD, {BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 0},
+                                          {BPF_LD | BPF_B | BPF_IND, 0, 0, 0}, {BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 'A'},
+                                          LOSS_KEEP, LOSS_DROP};
+/* Keeps ten bytes of it. */
+static struct sock_filter loss_cut[] = {LOSS_HEAD, {BPF_JMP | BPF_JEQ | BPF_K, 3, 0, 0},
+                                        {BPF_MISC | BPF_TXA, 0, 0, 0}, {BPF_ALU | BPF_ADD | BPF_K, 0, 0, 10},
+                                        {BPF_RET | BPF_A, 0, 0, 0}, LOSS_KEEP};
+/* An acknowledgement alone; an end; a reset; anything. */
+static struct sock_filter loss_acks[] = {LOSS_HEAD, {BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0},
+                                         {BPF_LD | BPF_B | BPF_ABS, 0, 0, 13}, {BPF_JMP | BPF_JSET | BPF_K, 0, 1, 1},
+                                         LOSS_KEEP, LOSS_DROP};
+static struct sock_filter loss_end[] = {{BPF_LD | BPF_B | BPF_ABS, 0, 0, 13}, {BPF_JMP | BPF_JSET | BPF_K, 0, 1, 1},
+                                        LOSS_DROP, LOSS_KEEP};
+static struct sock_filter loss_reset[] = {{BPF_LD | BPF_B | BPF_ABS, 0, 0, 13}, {BPF_JMP | BPF_JSET | BPF_K, 0, 1, 4},
+                                          LOSS_DROP, LOSS_KEEP};
+static struct sock_filter loss_all[] = {LOSS_DROP};
+#define LOSS(fd, f) loss_attach(fd, f, sizeof f / sizeof *f)
+static char loss_out[8192];
+/* Whether the step is to be done again, because a timer ran before what it
+   looks for could be seen: told by the counts, not by the time. */
+static int loss_len, loss_again;
+static long long loss_start;
+#define LOSS_WATCHDOG 10000
+enum { UNACKED = 24, SACKED = 28, TOTAL = 100, ACKED = 120, RECEIVED = 128 };
+static void loss_say(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    loss_len += vsnprintf(loss_out + loss_len, sizeof loss_out - loss_len, format, args);
+    va_end(args);
+}
+static void loss_attach(int fd, struct sock_filter *f, int len) {
+    struct sock_fprog p = {len, f};
+    if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &p, sizeof p)) loss_say("  attach errno=%d\n", errno);
+}
+static void loss_lift(int fd) {
+    if (setsockopt(fd, SOL_SOCKET, SO_DETACH_FILTER, &fd, sizeof fd)) loss_say("  detach errno=%d\n", errno);
+}
+static unsigned loss_word(int fd, int at) {
+    unsigned char raw[512];
+    socklen_t len;
+    tcp_info_raw(fd, raw, 512, &len);
+    return info_word(raw, at);
+}
+/* Waits until `fd`'s tcp_info has `value` at `at`; past it, which only a
+   count can go, the step is done again. */
+static void loss_wait(int fd, int at, unsigned value) {
+    long long end = clock_ms(CLOCK_MONOTONIC) + LOSS_WATCHDOG;
+    for (;;) {
+        unsigned now = loss_word(fd, at);
+        if (now == value) return;
+        if (at != UNACKED && now > value) {
+            loss_again = 1;
+            return;
+        }
+        if (clock_ms(CLOCK_MONOTONIC) > end) {
+            loss_say("  %d never %u\n", at, value);
+            return;
+        }
+        struct timespec t = {0, 5000000};
+        nanosleep(&t, NULL);
+    }
+}
+static void loss_info(const char *name, int fd, const int *at) {
+    unsigned char raw[512];
+    socklen_t len;
+    tcp_info_raw(fd, raw, 512, &len);
+    loss_say("  %s state=%u ca=%u retransmits=%u backoff=%u", name, raw[0], raw[1], raw[2], raw[4]);
+    for (; *at; at++)
+        if (*at > 0) loss_say(" %d:%u", *at, info_word(raw, *at));
+        else loss_say(" %d:%llu", -*at, info_long(raw, -*at));
+    loss_say("\n");
+}
+/* Both sides, once the client has sent `total` segments again, and not yet
+   one more. */
+static void loss_both(unsigned total, int c, int s) {
+    static const int sent[] = {24, 28, 32, 36, 80, 76, 100, 136, 140, 156, 192, 216, 220, 144, 240, -120, -200, -208, 0};
+    static const int came[] = {136, 140, 152, 224, -128, 0};
+    loss_wait(c, TOTAL, total);
+    loss_say(" sent again %u\n", total);
+    loss_info("server", s, came);
+    loss_info("client", c, sent);
+    loss_again |= loss_word(c, TOTAL) != total;
+}
+static void loss_send(int c, char byte, int len) {
+    static char bytes[4000];
+    memset(bytes, byte, len);
+    int n = send(c, bytes, len, MSG_NOSIGNAL);
+    if (n != len) loss_say("  send=%d errno=%d\n", n, errno);
+}
+/* Reads what waits: its length and first byte, and whether its time is at
+   least `early` milliseconds after the step's start (no timer runs before
+   its time) and `before` before now. */
+static void loss_read(int s, int early, int before) {
+    char bytes[4000], control[64];
+    struct iovec iov = {bytes, sizeof bytes};
+    struct msghdr m = {0};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = control;
+    m.msg_controllen = sizeof control;
+    unsigned char raw[512];
+    socklen_t len;
+    tcp_info_raw(s, raw, 512, &len);
+    long long now = clock_ms(CLOCK_REALTIME), mono = clock_ms(CLOCK_MONOTONIC);
+    int n = recvmsg(s, &m, MSG_DONTWAIT);
+    if (n < 0) {
+        loss_say("  recv=-1 errno=%d\n", errno);
+        loss_again |= before > 0;
+        return;
+    }
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    loss_say("  recv=%d %c", n, n > 0 ? bytes[0] : '-');
+    if (n > 0 && h) {
+        struct timespec t;
+        memcpy(&t, CMSG_DATA(h), sizeof t);
+        long long came = t.tv_sec * 1000LL + t.tv_nsec / 1000000, ago = info_word(raw, 52);
+        loss_again |= now - came < before || ago < before;
+        loss_say(" early=%d", came - (now - (mono - loss_start)) < early - 5 || mono - ago - loss_start < early - 5);
+    }
+    loss_say("\n");
+}
+static void loss_error(int fd) {
+    int error = 0;
+    socklen_t len = sizeof error;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len);
+    loss_say("  error=%d\n", error);
+}
+static void loss_poll(int fd, int events) {
+    struct pollfd p = {fd, events, 0};
+    int r = poll(&p, 1, LOSS_WATCHDOG);
+    loss_say("  poll=%d %x\n", r, r > 0 ? p.revents : 0);
+}
+/* An address of the loopback no connection has been to. Linux keeps, per
+   network namespace, the round trip and the reordering that a connection's
+   end leaves for its two addresses (`tcp_metrics`), and the next one starts
+   with them, also another program's: its first timeout follows. */
+static struct sockaddr_in fresh_to(int port) {
+    static unsigned host;
+    if (!host) {
+        struct timespec t;
+        clock_gettime(CLOCK_REALTIME, &t);
+        host = 0x10000 + (t.tv_sec % 8000 * 1000000 + t.tv_nsec / 1000) % 0xe00000;
+    }
+    struct sockaddr_in a = to(port);
+    a.sin_addr.s_addr = htonl(0x7f000000 | host++);
+    return a;
+}
+/* A listener on every address, and a client of it on one of its own. */
+static int fresh_listener(int *port) {
+    int fd = tcp(0);
+    struct sockaddr_in a = {.sin_family = AF_INET};
+    socklen_t len = sizeof a;
+    if (bind(fd, (void *)&a, sizeof a) || listen(fd, 8)) printf("listen failed errno=%d\n", errno);
+    getsockname(fd, (void *)&a, &len);
+    *port = ntohs(a.sin_port);
+    return fd;
+}
+static int fresh_client(int port, int *result) {
+    int fd = tcp(0);
+    struct sockaddr_in a = fresh_to(port);
+    errno = 0;
+    *result = connect(fd, (void *)&a, sizeof a) ? errno : 0;
+    return fd;
+}
+static void loss_step(int step, int c, int s) {
+    struct timespec little = {0, 1000000};
+    switch (step) {
+    case 0:
+        /* Dropped each time: a probe, then timeouts. */
+        LOSS(s, loss_data);
+        loss_send(c, 'A', 100);
+        loss_both(1, c, s);
+        loss_both(2, c, s);
+        loss_lift(s);
+        loss_wait(s, RECEIVED, 100);
+        loss_wait(c, UNACKED, 0);
+        loss_both(3, c, s);
+        loss_read(s, 750, 0);
+        loss_send(c, 'B', 10);
+        loss_wait(s, RECEIVED, 110);
+        loss_wait(c, UNACKED, 0);
+        loss_both(3, c, s);
+        break;
+    case 1:
+        /* Two, which go again as one while no one calls. */
+        LOSS(s, loss_data);
+        loss_send(c, 'A', 100);
+        loss_send(c, 'B', 100);
+        loss_both(1, c, s);
+        loss_read(s, 0, 0);
+        loss_lift(s);
+        {
+            struct timespec t = {1, 0};
+            nanosleep(&t, NULL);
+        }
+        loss_read(s, 190, 100);
+        loss_wait(c, UNACKED, 0);
+        loss_both(2, c, s);
+        break;
+    case 2:
+        /* A gap, told of by what comes after it. */
+        LOSS(s, loss_first);
+        loss_send(c, 'A', 100);
+        nanosleep(&little, NULL);
+        for (int n = 0; n < 4; n++) loss_send(c, 'B', 100);
+        loss_wait(c, TOTAL, 1);
+        loss_again |= loss_word(c, SACKED) != 1 || loss_word(c, UNACKED) != 2;
+        loss_both(1, c, s);
+        loss_read(s, 0, 0);
+        loss_lift(s);
+        loss_wait(s, RECEIVED, 500);
+        loss_wait(c, UNACKED, 0);
+        loss_both(2, c, s);
+        loss_read(s, 190, 0);
+        break;
+    case 3:
+        /* Ten bytes at a time. */
+        LOSS(s, loss_cut);
+        loss_send(c, 'A', 100);
+        loss_wait(s, RECEIVED, 10);
+        loss_wait(c, ACKED, 11);
+        loss_both(0, c, s);
+        loss_read(s, 0, 0);
+        loss_wait(s, RECEIVED, 20);
+        loss_wait(c, ACKED, 21);
+        loss_both(1, c, s);
+        loss_read(s, 190, 0);
+        loss_lift(s);
+        loss_wait(s, RECEIVED, 100);
+        loss_wait(c, UNACKED, 0);
+        loss_both(2, c, s);
+        loss_read(s, 390, 0);
+        break;
+    case 4:
+        /* Acknowledgements are lost, and the data goes again. */
+        LOSS(c, loss_acks);
+        loss_send(c, 'A', 100);
+        loss_wait(s, RECEIVED, 100);
+        loss_read(s, 0, 0);
+        loss_wait(s, 136, 1);
+        loss_both(0, c, s);
+        loss_wait(s, 136, 2);
+        loss_both(1, c, s);
+        loss_lift(c);
+        loss_wait(c, UNACKED, 0);
+        loss_both(2, c, s);
+        loss_read(s, 0, 0);
+        break;
+    case 5:
+        LOSS(s, loss_end);
+        shutdown(c, SHUT_WR);
+        loss_both(1, c, s);
+        loss_read(s, 0, 0);
+        loss_lift(s);
+        loss_poll(s, POLLIN | POLLRDHUP);
+        loss_read(s, 0, 0);
+        loss_wait(c, UNACKED, 0);
+        loss_both(2, c, s);
+        break;
+    case 6: {
+        /* The end comes with what is kept of its segment. */
+        char bytes[30];
+        memset(bytes, 'A', sizeof bytes);
+        LOSS(s, loss_cut);
+        send(c, bytes, sizeof bytes, MSG_MORE);
+        shutdown(c, SHUT_WR);
+        loss_poll(s, POLLIN | POLLRDHUP);
+        loss_read(s, 0, 0);
+        loss_read(s, 0, 0);
+        loss_wait(c, ACKED, 12);
+        loss_both(0, c, s);
+        loss_wait(s, 140, 4);
+        loss_both(1, c, s);
+        break;
+    }
+    case 7:
+        /* A reset dropped: sent again for each segment. */
+        LOSS(c, loss_reset);
+        loss_send(c, 'A', 5);
+        loss_wait(s, RECEIVED, 5);
+        loss_wait(c, UNACKED, 0);
+        close(s);
+        loss_send(c, 'B', 5);
+        loss_wait(c, TOTAL, 1);
+        loss_read(c, 0, 0);
+        loss_error(c);
+        loss_lift(c);
+        loss_poll(c, 0);
+        loss_error(c);
+        loss_read(c, 0, 0);
+        break;
+    case 8: {
+        int timeout = 300;
+        setsockopt(c, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, sizeof timeout);
+        LOSS(s, loss_all);
+        loss_send(c, 'A', 100);
+        loss_poll(c, 0);
+        loss_say("  early=%d\n", clock_ms(CLOCK_MONOTONIC) - loss_start < 295);
+        loss_error(c);
+        loss_read(c, 0, 0);
+        int n = send(c, "B", 1, MSG_NOSIGNAL);
+        loss_say("  send=%d errno=%d\n", n, n < 0 ? errno : 0);
+        break;
+    }
+    case 9: {
+        /* The accepted side has the listener's. */
+        int port, result;
+        int other = fresh_listener(&port);
+        LOSS(other, loss_data);
+        int c2 = fresh_client(port, &result), s2 = accept(other, NULL, NULL), on = 1;
+        setsockopt(s2, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
+        loss_say("  connect=%d accept=%d\n", result, s2 >= 0);
+        loss_send(c2, 'A', 100);
+        loss_wait(c2, TOTAL, 1);
+        loss_read(s2, 0, 0);
+        loss_lift(s2);
+        loss_poll(s2, POLLIN);
+        loss_read(s2, 190, 0);
+        close(c2);
+        close(s2);
+        close(other);
+        break;
+    }
+    case 10:
+        /* Data after the other side's close: its reset is dropped too. */
+        LOSS(c, loss_reset);
+        close(s);
+        loss_poll(c, POLLIN);
+        loss_read(c, 0, 0);
+        loss_send(c, 'A', 5);
+        loss_error(c);
+        loss_wait(c, TOTAL, 1);
+        loss_error(c);
+        loss_lift(c);
+        {
+            struct pollfd p = {c, 0, 0};
+            poll(&p, 1, LOSS_WATCHDOG);
+        }
+        loss_error(c);
+        loss_send(c, 'B', 5);
+        break;
+    }
+}
+/* Every line is decided by counts and conditions; what a timer could have
+   changed before it was seen is told by a count past the one it waits for,
+   and the step is then done again. */
+static void lost(int l, int port) {
+    int result, on = 1;
+    for (int step = 0; step < 11; step++) {
+        for (int tries = 0; tries < 50; tries++) {
+            int c = fresh_client(port, &result), s = accept(l, NULL, NULL);
+            setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
+            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+            loss_len = loss_again = 0;
+            loss_start = clock_ms(CLOCK_MONOTONIC);
+            loss_step(step, c, s);
+            close(c);
+            if (step != 7 && step != 10) close(s);
+            if (loss_again && tries < 49) continue;
+            printf(" step %d%s\n%s", step, loss_again ? " given up" : "", loss_out);
             break;
         }
     }
@@ -1322,6 +1709,13 @@ int main(int argc, char **argv) {
         close(small);
         close(l);
         close(u);
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-loss")) {
+        int port;
+        int l = fresh_listener(&port);
+        lost(l, port);
+        close(l);
         return 0;
     }
     if (!strcmp(mode, "tcp-cork")) {

@@ -5024,6 +5024,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SKF_AD_PAY_OFFSET` は 40 です。送り直す SYN も、接続するソケットのオプションで作ります。受け入れたソケットは、`sk_clone_lock`
   がコピーするのと同じく、待ち受けソケットのフィルターとそのロックを引き継ぎます。
 
+- ループバックか veth ペアをまたぐ TCP の接続では、フィルターは、`tcp_v4_rcv` と
+  `tcp_v6_rcv` が `tcp_filter` を動かすのと同じく、ソケットに届くセグメント（データ、
+  確認応答、終わり、リセット）ごとに動きます。ソケットを閉じ、その終わりに確認応答が来るまでです。
+  - 見えるのは、TCP ヘッダ（タイムスタンプ付きで 32 バイト、SACK のブロックがあればそれ以上）と、
+    その後のデータです。シーケンス番号は乱数の初期値から数え、フラグ（書き込みの最後の `PSH`、緊急の
+    バイトまでの `URG` とそのポインタ）、その側が示すウィンドウ（スケールしたもの）、擬似ヘッダの
+    チェックサム、`gso_segs` と `gso_size` を含む `sk_buff` のフィールドがあります。古典的な
+    読み出しも同じものを見て、`SKF_AD_PAY_OFFSET` はデータの始まりです。
+  - 0 はセグメントを捨て、捨てたものは数えません（`tcpi_segs_in`）。ほかの値は TCP ヘッダから
+    そのバイト数を残し、ヘッダは必ず残します。その先のデータは届いておらず、セグメントの終わりは
+    残したものと一緒に届きます。
+  - 捨てたり切り詰めたりしたものは、Linux 7.0 のとおりに送り直されます。末尾の損失プローブ、
+    後に送ったものの SACK（RACK）、または 201 ms から倍になる再送タイムアウトによるもので、
+    先頭の小さいセグメントは 1 つにまとめます（`tcp_retrans_try_collapse`）。呼び出しが
+    あってもなくても、その時刻に届きます。`tcp_info` は、回復の状態、失われた・SACK
+    された・送り直したセグメント、輻輳ウィンドウとそのしきい値（cubic のもので、減らし方は
+    比例レート削減）、タイムアウト、相手が知らせた重複（D-SACK。減らしたウィンドウを戻す
+    ことがあります）、順序どおりでなく届いたものを返します。
+  - 接続は `TCP_USER_TIMEOUT` の後、なければ 15 回のタイムアウトの後（`tcp_retries2`、
+    ソケットを閉じたものは 8 回）、`ETIMEDOUT` で終わります。リセットを捨てると接続は開いたまま
+    で、その後に送るセグメントごとにまたリセットが来ます。
+
 - 古典的なフィルター（`SO_ATTACH_FILTER`、`struct sock_fprog`。ほかの大きさは `EINVAL`）は、
   Linux の `bpf_check_classic` と同じく確かめ、`bpf_convert_filter` と同じく命令ごとに
   変換し、変換したものをインタープリタが動かします。
@@ -5543,11 +5565,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `SO_ACCEPTCONN`、`SO_KEEPALIVE`、`SO_REUSEADDR`、`SO_REUSEPORT`、`SO_SNDBUF`、
     `SO_RCVBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`SO_LINGER`、`SO_PRIORITY`、
     `SO_BROADCAST`、`SO_OOBINLINE`、`TCP_NODELAY`（ホストにも伝えます）、
-    `TCP_CORK`（ホストには伝えません）、
-    `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
-    `TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、`IP_TOS`、`IPV6_V6ONLY`。
-    既定値と範囲の確かめ方は Linux と
-    同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
+    `TCP_CORK`（ホストには伝えません）、`TCP_KEEPIDLE`、`TCP_KEEPINTVL`、
+    `TCP_KEEPCNT`、`TCP_QUICKACK`、`TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、
+    `IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
     2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決めます
     （`rt_tos2priority`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
     設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
@@ -5593,9 +5613,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     バイト、受け取ったバイト（ハンドシェイクと終わりを含む）、まだ送っていないバイト、
     セグメント、データを最後に送ってから・受け取ってからの時間を返します。ループバックの
     セグメントは Linux が送るとおりです。書き込みごとに 1 つですが、小さいものが確認応答を
-    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` や `TCP_CORK` の続きを
-    待つ間（201 ms まで、または `TCP_CORK` を外すか `TCP_NODELAY` を設定するまで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
-    一緒に、または読んだとき、または 40 ms 後です（`TCP_QUICKACK` で選べます）。はじめは
+    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE`
+    や `TCP_CORK` の続きを待つ間（201 ms まで、または `TCP_CORK` を外すか
+    `TCP_NODELAY` を設定するまで）は留まります。確認応答は、最初の 16 個はすぐに、
+    その後は返事のデータと一緒に、または読んだとき、または 40 ms 後です（`TCP_QUICKACK` で選べます）。はじめは
     確認応答のないものを 10 個まで送れます。末尾の損失プローブは最後のものを送り直します。
     終わりは、その前に留まっていたデータと一緒に送ります。終わりの確認応答が来るまでは
     `FIN_WAIT1` です。留まっているデータは、そのときに呼び出しがあってもなくても、Linux と同じ

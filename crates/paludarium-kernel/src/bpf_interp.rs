@@ -149,6 +149,8 @@ pub(crate) mod classic {
         pub const INGRESS_IFINDEX: i16 = 36;
         pub const IFINDEX: i16 = 40;
         pub const HASH: i16 = 68;
+        pub const GSO_SEGS: i16 = 164;
+        pub const GSO_SIZE: i16 = 176;
         pub const DATA: i16 = 192;
         pub const DATA_LEN: i16 = 200;
         pub const DEV: i16 = 208;
@@ -233,6 +235,8 @@ pub(crate) struct Skb {
     /// header starts, from `skb->data`, or 0 when the flow dissector does
     /// not know the protocol.
     pub(crate) payload_offset: u32,
+    /// `gso_segs` and `gso_size`.
+    pub(crate) gso: (u32, u32),
 }
 
 impl<'a> Packet<'a> {
@@ -329,6 +333,8 @@ pub(crate) fn run(
     put(classic::field::INGRESS_IFINDEX, skb.ingress_ifindex);
     put(classic::field::IFINDEX, skb.device.map_or(0, |d| d.0));
     put(classic::field::HASH, skb.hash);
+    put(classic::field::GSO_SEGS, skb.gso.0);
+    put(classic::field::GSO_SIZE, skb.gso.1);
     if skb.device.is_some() {
         let at = classic::field::DEV as usize;
         context[at..at + 8].copy_from_slice(&address(DEVICE, 0).to_le_bytes());

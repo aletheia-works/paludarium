@@ -16,7 +16,13 @@
    its random IPv4 ID and checksum, which are not printed), and the IP
    header's TTL and protocol. A broadcast's sendto returns once it has been delivered, and
    the carrier, which Linux's link watch may change a little later, is
-   waited for on RTNLGRP_LINK. */
+   waited for on RTNLGRP_LINK.
+   Then B listens on port 7002, and for each of the same values, as the
+   segments of a connection have them, takes a connection of A's, attaches
+   a filter that keeps as many bytes of a segment's data as the value, and
+   reads what comes of the 2,000 bytes A sends, two segments that go as one
+   (GSO), which "len" is of. Only that one's data starts with an A, so what
+   goes again is dropped, and what comes does not depend on when. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -274,12 +280,49 @@ static void receive(int fd, const char *how, int i) {
         printf("%s: %s %s=%ld\n", side, how, loads[i].name, n);
 }
 
+static const struct {
+    const char *name;
+    unsigned short code;
+    int k, add;
+} segments[] = {
+    {"ifindex", LD_W_ABS, AD(8), 0},
+    {"hatype", LD_W_ABS, AD(28), 8},
+    {"pkttype", LD_W_ABS, AD(4), 8},
+    {"payload offset", LD_W_ABS, AD(52), 0},
+    {"mac 0", LD_B_ABS, LL(0), 8},
+    {"mac 5", LD_B_ABS, LL(5), 8},
+    {"mac 6", LD_B_ABS, LL(6), 8},
+    {"mac 11", LD_B_ABS, LL(11), 8},
+    {"mac 12 less 1000", LD_H_ABS, LL(12), -1000},
+    {"ttl", LD_B_ABS, NET(8), 0},
+    {"header length", LD_B_ABS, 12, 0},
+    {"window", LD_H_ABS, 14, 0},
+    {"len less 1000", 0x80, 0, -1000},
+};
+#define SEGMENTS (int)(sizeof segments / sizeof segments[0])
+/* A connection that comes to `l`, with the filter for `i`. */
+static int take(int l, int i) {
+    struct pollfd ready = {.fd = l, .events = POLLIN};
+    poll(&ready, 1, 10000);
+    int s = accept(l, NULL, NULL);
+    struct sf f[] = {{LD_B_ABS, 0, 0, 12}, {0x74, 0, 0, 2},    {0x54, 0, 0, 0x3c},
+                     {0x07, 0, 0, 0},      {0x80, 0, 0, 0},    {0x1c, 0, 0, 0},
+                     {0x15, 6, 0, 0},      {0x50, 0, 0, 0},    {0x15, 0, 5, 'A'},
+                     {segments[i].code, 0, 0, (unsigned)segments[i].k},
+                     {0x04, 0, 0, (unsigned)segments[i].add},  {0x0c, 0, 0, 0},
+                     {0x16, 0, 0, 0},      {0x06, 0, 0, 0xffffffff}, {0x06, 0, 0, 0}};
+    struct fprog p = {sizeof f / sizeof *f, f};
+    long r = result(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &p, sizeof p));
+    if (s < 0 || r) printf("B: accept=%d attach %s=%ld\n", s, segments[i].name, r);
+    return s;
+}
+
 /* B: makes its namespace, then does what A writes to `in`, a letter and
    a load's number at a time, writing back to `out` when done. */
 static void child(int in, int out) {
     side = "B";
     if (unshare(CLONE_NEWNET) < 0) printf("B: unshare=%d\n", -errno);
-    int ctl = route_socket(0), links = route_socket(1), fd = -1;
+    int ctl = route_socket(0), links = route_socket(1), fd = -1, l = -1, s = -1;
     fflush(stdout);
     if (write(out, "r", 1) != 1) _exit(2);
     for (char command[2]; read(in, command, 2) == 2;) {
@@ -294,6 +337,20 @@ static void child(int in, int out) {
         } else if (command[0] == 'r') {
             receive(fd, "unicast", command[1]);
             receive(fd, "broadcast", command[1]);
+        } else if (command[0] == 'l') {
+            l = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in a = at("10.77.0.2", 7002);
+            printf("B: bind=%ld", result(bind(l, (void *)&a, sizeof a)));
+            printf(" listen=%ld\n", result(listen(l, 8)));
+        } else if (command[0] == 't') {
+            s = take(l, command[1]);
+        } else if (command[0] == 's') {
+            static char buf[4000];
+            struct pollfd ready = {.fd = s, .events = POLLIN};
+            poll(&ready, 1, 10000);
+            printf("B: segment %s=%ld\n", segments[(int)command[1]].name,
+                   result(recv(s, buf, sizeof buf, MSG_DONTWAIT)));
+            close(s);
         } else if (command[0] == 'x') {
             fflush(stdout);
             _exit(0);
@@ -364,6 +421,19 @@ int main(int argc, char **argv) {
         if (u != (long)sizeof payload || c != (long)sizeof payload) printf("A: sendto=%ld %ld\n", u, c);
         receive(own, "looped", i);
         B_DOES('r', i);
+    }
+
+    B_DOES('l', 0);
+    struct sockaddr_in there = at("10.77.0.2", 7002);
+    static char bytes[2000] = "A";
+    for (int i = 0; i < SEGMENTS; i++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        long r = result(connect(c, (void *)&there, sizeof there));
+        B_DOES('t', i);
+        long n = result(send(c, bytes, sizeof bytes, 0));
+        if (r || n != (long)sizeof bytes) printf("A: connect=%ld send=%ld\n", r, n);
+        B_DOES('s', i);
+        close(c);
     }
 
     fflush(stdout);

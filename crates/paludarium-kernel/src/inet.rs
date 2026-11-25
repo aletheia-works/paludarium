@@ -2721,6 +2721,13 @@ impl InetSocket {
                     s.eof_read = false;
                     s.counts = Counts::new(self.now(), &options);
                     s.connection = Connection::Connecting;
+                    if let Some((link, side)) = Self::joined(&s) {
+                        link.set_sender(side, self.sender(&options));
+                        link.set_user_timeout(side, options.user_timeout as u32);
+                        if s.filtering.filter.is_some() {
+                            self.tapped(&options, &s);
+                        }
+                    }
                     // The stub's own stream is open at once.
                     if address.port() == DNS && !loopback {
                         stream.connected(None);
@@ -3933,6 +3940,9 @@ impl InetSocket {
         listen.ready.push_back(child);
         listen.arrivals += 1;
         drop(state);
+        if let Some(client) = client {
+            client.opened();
+        }
         listener.arrived();
         Knock::Taken
     }
@@ -3993,6 +4003,10 @@ impl InetSocket {
             mtu,
         );
         let _ = link.set(Arc::clone(&joined));
+        if options.user_timeout > 0 {
+            joined.set_user_timeout(1, options.user_timeout as u32);
+        }
+        joined.set_sender(1, self.sender(&options));
         let own_link = Arc::new(OnceLock::new());
         let _ = own_link.set(joined);
         self.ports().hold(Binding {
@@ -4016,8 +4030,98 @@ impl InetSocket {
             }),
             locked: filtering.locked,
         };
+        if s.filtering.filter.is_some() {
+            child.tapped(&options, &s);
+        }
         drop(s);
         child
+    }
+    /// Has the segments that come to this connected socket, whose state is
+    /// `s`, pass its filter from now on (`tcp_filter`).
+    fn tapped(&self, options: &Options, s: &State) {
+        let Some((link, side)) = Self::joined(s) else {
+            return;
+        };
+        let (Some(filter), Some(stream), Some(bound)) =
+            (s.filtering.filter.clone(), s.stream.as_ref(), s.bound)
+        else {
+            link.set_tap(
+                side,
+                None::<
+                    fn(
+                        Weak<Stream>,
+                        Weak<Link>,
+                        crate::loopback::Names,
+                    ) -> Arc<dyn crate::loopback::segments::Tap>,
+                >,
+            );
+            return;
+        };
+        let (peer, own) = (stream.peer(), bound);
+        let (peer, own) = (
+            SocketAddr::new(plain(peer.ip()), peer.port()),
+            SocketAddr::new(plain(own.ip()), own.port()),
+        );
+        let way = self.network.way(own.ip(), peer, self.now());
+        let ids = (
+            self.uid.load(Ordering::SeqCst),
+            self.gid.load(Ordering::SeqCst),
+        );
+        let hash = u32::from_le_bytes(self.random()).max(1);
+        let sent = arrival::Sent::new(
+            peer,
+            own,
+            options.type_of_service as u8,
+            None,
+            hash,
+            options.priority as u32,
+            ids,
+        );
+        let (_, _, wscale) = arrival::syn_window(options.receive_buffer, way, own.is_ipv4());
+        let id = std::sync::atomic::AtomicU16::new(u16::from_le_bytes(self.random()));
+        let host = Arc::clone(&self.host);
+        link.set_tap(
+            side,
+            Some(move |stream, link, names| {
+                Arc::new(arrival::Listening {
+                    filter,
+                    sent,
+                    way,
+                    from: 1 - side,
+                    stream,
+                    link,
+                    wscale,
+                    names,
+                    id,
+                    host,
+                }) as Arc<dyn crate::loopback::segments::Tap>
+            }),
+        );
+    }
+    /// Its connection has opened, or its filter changed.
+    fn opened(&self) {
+        let options = *self.options();
+        let s = self.lock();
+        self.joins(&options, &s);
+        self.tapped(&options, &s);
+    }
+    /// Tells its connection, if its state `s` has one, of its `options`.
+    fn joins(&self, options: &Options, s: &State) {
+        if let Some((link, side)) = Self::joined(s) {
+            link.set_user_timeout(side, options.user_timeout as u32);
+            link.set_sender(side, self.sender(options));
+        }
+    }
+    /// What its segments go with.
+    fn sender(&self, options: &Options) -> crate::loopback::Sender {
+        crate::loopback::Sender {
+            priority: options.priority as u32,
+            tos: options.type_of_service as u8,
+            ids: (
+                self.uid.load(Ordering::SeqCst),
+                self.gid.load(Ordering::SeqCst),
+            ),
+        }
     }
     /// Whether the listener's filter keeps the SYN of a connection from
     /// this socket at `from` to it at `to`, in the namespace `there`, out
@@ -4893,7 +4997,7 @@ impl InetSocket {
                     (false, true) => TCP_CLOSE_WAIT,
                     (true, false) if unsent > 0 || Self::end_waits(&s) => TCP_FIN_WAIT1,
                     (true, false) => TCP_FIN_WAIT2,
-                    (true, true) if unsent > 0 => TCP_LAST_ACK,
+                    (true, true) if unsent > 0 || Self::end_waits(&s) => TCP_LAST_ACK,
                     (true, true) => {
                         closed(&mut entries);
                         let released =
@@ -5002,7 +5106,7 @@ impl InetSocket {
                 (false, true) => TCP_CLOSE_WAIT,
                 (true, false) if unsent > 0 || Self::end_waits(s) => TCP_FIN_WAIT1,
                 (true, false) => TCP_FIN_WAIT2,
-                (true, true) if unsent > 0 => TCP_LAST_ACK,
+                (true, true) if unsent > 0 || Self::end_waits(s) => TCP_LAST_ACK,
                 (true, true) => TCP_CLOSE,
             },
         };
@@ -5636,8 +5740,8 @@ fn set_multicast4(
 }
 /// `setsockopt` of an inet socket: the `SOL_SOCKET` options a client sets,
 /// `IPPROTO_TCP`'s `TCP_NODELAY`, keepalive timing (1 to 32767 seconds, at
-/// most 127 probes), `TCP_CORK`, `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
-/// `IPV6_V6ONLY`, and the filter options (`SO_ATTACH_FILTER`,
+/// most 127 probes), `TCP_CORK`, `TCP_QUICKACK` and `TCP_USER_TIMEOUT`,
+/// `IP_TOS` and `IPV6_V6ONLY`, and the filter options (`SO_ATTACH_FILTER`,
 /// `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and `SO_ATTACH_BPF`, as
 /// [`crate::sockets::set_filter`] takes them), and the device the socket
 /// is bound to (`SO_BINDTODEVICE`, `SO_BINDTOIFINDEX`, [`bind_to_device`]),
@@ -5679,15 +5783,13 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         // not its options', holds the filter.
         (1, 26 | 27 | 44 | 50) => {
             let value = option_int(c, at, len)?;
-            return crate::sockets::set_filter(
-                c,
-                socket,
-                name as u32,
-                at,
-                len as u32 as i32,
-                value,
-            )
-            .unwrap_or(Err(ENOPROTOOPT));
+            let set =
+                crate::sockets::set_filter(c, socket, name as u32, at, len as u32 as i32, value)
+                    .unwrap_or(Err(ENOPROTOOPT));
+            if set.is_ok() && matches!(name, 26 | 27 | 50) {
+                socket.opened();
+            }
+            return set;
         }
         // `SO_BINDTODEVICE` (`sock_setbindtodevice`): a device's name, not
         // an `int`, of at most 15 bytes, none or empty for no device;
@@ -5886,7 +5988,10 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 }
                 (1, 9) => options.keep_alive = value != 0,
                 (1, 10) => options.out_of_band_inline = value != 0,
-                (1, 12) => options.priority = value,
+                (1, 12) => {
+                    options.priority = value;
+                    socket.joins(&options, &socket.lock());
+                }
                 // `SO_BINDTOIFINDEX`, of any index not negative.
                 (1, 62) => bind_to_device(c, socket, &mut options, value)?,
                 (6, _) if !tcp => return Err(ENOPROTOOPT),
@@ -5919,12 +6024,16 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     }
                 }
                 (6, 18) if value < 0 => return Err(Errno::EINVAL),
-                (6, 18) => options.user_timeout = value,
+                (6, 18) => {
+                    options.user_timeout = value;
+                    socket.joins(&options, &socket.lock());
+                }
                 // A new type of service sets the priority too
                 // (`__ip_sock_set_tos`, `rt_tos2priority`).
                 (0, 1) if options.type_of_service != value & 0xfc => {
                     options.type_of_service = value & 0xfc;
                     options.priority = tos_priority(value);
+                    socket.joins(&options, &socket.lock());
                 }
                 (0, 1) => {}
                 (41, 26) if socket.family == Family::V6 => {

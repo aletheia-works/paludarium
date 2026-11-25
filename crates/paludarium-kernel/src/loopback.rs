@@ -21,10 +21,11 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 pub(crate) mod segments;
-use segments::{Counts, Flows, Push};
+use segments::{Counts, Flows, Push, Tap, Verdict};
 
 const EADDRINUSE: Errno = Errno(98);
 const ECONNRESET: Errno = Errno(104);
+const ETIMEDOUT: Errno = Errno(110);
 /// Linux's default `net.ipv4.ip_local_port_range`.
 const EPHEMERAL: core::ops::RangeInclusive<u16> = 32768..=60999;
 /// How long the side that closed a connection first keeps its port, in
@@ -78,9 +79,30 @@ pub(crate) struct Link {
     /// peer. Locked after `ends`.
     flows: Mutex<Flows>,
     this: Weak<Link>,
+    /// The two streams, for the filters, which see what the other side
+    /// sends; and the connection's first sequence numbers and timestamps,
+    /// each side's, once a filter looks.
+    streams: [Weak<Stream>; 2],
+    names: OnceLock<Names>,
+    senders: [Mutex<Sender>; 2],
     /// When its timers are next to be run, changed with `flows` locked.
     armed: AtomicU64,
     deadlines: Arc<Deadlines>,
+}
+/// What a connection's segments count from: each side's initial sequence
+/// number and timestamp offset.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Names {
+    pub(crate) first: [u32; 2],
+    pub(crate) stamps: [u32; 2],
+}
+/// What a side's segments go with, which a filter sees: its `SO_PRIORITY`
+/// and `IP_TOS`, and the owner and group of the socket.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Sender {
+    pub(crate) priority: u32,
+    pub(crate) tos: u8,
+    pub(crate) ids: (u32, u32),
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -118,6 +140,9 @@ impl Link {
                 now.map(|now| now / 1000),
             )),
             this: Weak::clone(this),
+            streams: [Arc::downgrade(client), Arc::downgrade(server)],
+            names: OnceLock::new(),
+            senders: Default::default(),
             armed: AtomicU64::new(NEVER),
             deadlines: Arc::clone(deadlines),
         });
@@ -133,14 +158,18 @@ impl Link {
     /// `EPIPE` once it has had this side's end and not shut its own
     /// (`tcp_reset` in `TCP_CLOSE_WAIT`), after the bytes it holds.
     pub(crate) fn reset(&self, side: usize) {
-        let ends = self
-            .ends
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let mut guard = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
         self.first.store(RESET, Ordering::SeqCst);
-        let Some(ends) = ends else { return };
-        self.reset_flows(side, self.micros());
+        let Some(ends) = guard.as_ref() else { return };
+        if !self.reset_flows(side, self.micros()) {
+            // The peer's filter dropped it, so it stays connected.
+            let own = Arc::clone(&ends.streams[side]);
+            drop(guard);
+            own.close();
+            return;
+        }
+        let Some(ends) = guard.take() else { return };
+        drop(guard);
         let (own, peer) = (&ends.streams[side], &ends.streams[1 - side]);
         if !gone(peer) {
             let waiting = ends.ended[side] && !peer.readiness().write_closed;
@@ -195,12 +224,19 @@ impl Link {
         let mut guard = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(ends) = guard.as_mut() else { return };
         let now = self.micros();
-        let arrived = {
+        let (arrived, over) = {
             let mut flows = self.flows();
+            if flows.lossy() {
+                for (side, stream) in ends.streams.iter().enumerate() {
+                    if stream.finished().1 {
+                        flows.closed(side);
+                    }
+                }
+            }
             flows.advance(now);
             for from in 0..2 {
                 let (own, peer) = (&ends.streams[from], &ends.streams[1 - from]);
-                if matches!(own.phase(), Phase::Failed(_)) {
+                if matches!(own.phase(), Phase::Failed(_)) || flows.dead(from) {
                     continue;
                 }
                 let edge = if gone(peer) {
@@ -218,7 +254,7 @@ impl Link {
                 }
             }
             self.arm(&flows);
-            flows.arrived()
+            (flows.arrived(), flows.over())
         };
         for from in 0..2 {
             let (own, peer) = (&ends.streams[from], &ends.streams[1 - from]);
@@ -226,23 +262,36 @@ impl Link {
                 continue;
             }
             loop {
-                let Some((len, at)) = self.flows().arrival(1 - from) else {
-                    break;
+                let closed = gone(peer);
+                // The bytes leave the sender as they count as moved, which
+                // a filter looks at too.
+                let (bytes, at) = {
+                    let mut flows = self.flows();
+                    let Some((len, at)) = flows.arrival(1 - from) else {
+                        break;
+                    };
+                    let bytes = if closed {
+                        Vec::new()
+                    } else {
+                        own.take(len as usize)
+                    };
+                    flows.gave(1 - from, &bytes);
+                    (bytes, at)
                 };
-                if gone(peer) {
+                if closed {
                     // The closed side answers with a reset, which ends its
                     // `TIME_WAIT` too.
                     self.first.store(RESET, Ordering::SeqCst);
-                    own.take(usize::MAX);
-                    self.reset_flows(1 - from, now);
-                    own.fail(if ends.ended[1 - from] {
-                        Errno::EPIPE
-                    } else {
-                        ECONNRESET
-                    });
+                    if self.reset_flows(1 - from, now) {
+                        own.take(usize::MAX);
+                        own.fail(if ends.ended[1 - from] {
+                            Errno::EPIPE
+                        } else {
+                            ECONNRESET
+                        });
+                    }
                     break;
                 }
-                let bytes = own.take(len as usize);
                 peer.receive_late(&bytes, now.saturating_sub(at) * 1000);
                 self.delivered(1 - from, bytes.len());
             }
@@ -257,15 +306,43 @@ impl Link {
                 }
             }
         }
-        if ends.streams.iter().all(|stream| stream.finished().1) {
+        for side in if over { 0..2 } else { 0..0 } {
+            let (verdict, dead) = {
+                let mut flows = self.flows();
+                (flows.verdict(side), flows.dead(side))
+            };
+            if dead {
+                self.first.store(RESET, Ordering::SeqCst);
+            }
+            if let Some(verdict) = verdict {
+                self.over(ends, side, verdict);
+            }
+        }
+        if ends.streams.iter().all(|stream| stream.finished().1) && !self.flows().losing() {
             *guard = None;
         }
     }
-    /// `side` was reset, at `now`.
-    fn reset_flows(&self, side: usize, now: u64) {
+    /// The connection is over for `side`: a reset came to it (`tcp_reset`),
+    /// or what it sent was never acknowledged (`tcp_write_err`).
+    fn over(&self, ends: &Ends, side: usize, verdict: Verdict) {
+        self.first.store(RESET, Ordering::SeqCst);
+        let own = &ends.streams[side];
+        let waiting = ends.ended[1 - side] && !own.readiness().write_closed;
+        own.take(usize::MAX);
+        if !gone(own) {
+            own.fail(match verdict {
+                Verdict::TimedOut => ETIMEDOUT,
+                Verdict::Reset if waiting => Errno::EPIPE,
+                Verdict::Reset => ECONNRESET,
+            });
+        }
+    }
+    /// `side` was reset, at `now`; whether the other side hears.
+    fn reset_flows(&self, side: usize, now: u64) -> bool {
         let mut flows = self.flows();
-        flows.reset(side, now);
+        let heard = flows.reset(side, now);
         self.arm(&flows);
+        heard
     }
     /// Sets when the connection's timers are next to be run.
     fn arm(&self, flows: &Flows) {
@@ -331,6 +408,45 @@ impl Link {
     /// `side`'s `TCP_CORK` was set or cleared.
     pub(crate) fn set_cork(&self, side: usize, on: bool) {
         self.with_flows(|flows, now| flows.set_cork(side, on, now));
+    }
+    /// `side`'s `TCP_USER_TIMEOUT` was set to `ms` milliseconds.
+    pub(crate) fn set_user_timeout(&self, side: usize, ms: u32) {
+        self.with_flows(|flows, now| flows.set_user_timeout(side, ms, now));
+    }
+    /// What `side`'s segments go with from now on.
+    pub(crate) fn set_sender(&self, side: usize, sender: Sender) {
+        *self.senders[side]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = sender;
+    }
+    pub(crate) fn sender(&self, side: usize) -> Sender {
+        *self.senders[side]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `side`'s filter is now the one `make` makes of the stream that sends
+    /// to it, the connection and its names, or none.
+    pub(crate) fn set_tap(
+        &self,
+        side: usize,
+        make: Option<impl FnOnce(Weak<Stream>, Weak<Link>, Names) -> Arc<dyn Tap>>,
+    ) {
+        let tap = make.map(|make| {
+            let names = *self.names.get_or_init(|| {
+                let mut random = [0; 16];
+                let _ = self.host.random_bytes(&mut random);
+                let word = |at: usize| {
+                    u32::from_le_bytes([random[at], random[at + 1], random[at + 2], random[at + 3]])
+                };
+                Names {
+                    first: [word(0), word(4)],
+                    stamps: [word(8), word(12)],
+                }
+            });
+            let sender = Weak::clone(&self.streams[1 - side]);
+            make(sender, Weak::clone(&self.this), names)
+        });
+        self.with_flows(|flows, now| flows.tap(side, tap, now));
     }
     /// `side`'s `TCP_QUICKACK` was set to `value`.
     pub(crate) fn set_quick(&self, side: usize, value: i32) {

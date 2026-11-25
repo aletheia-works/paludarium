@@ -209,6 +209,10 @@ mod linux {
         case("tcp-cork");
     }
     #[test]
+    fn network_tcp_loss() {
+        case("tcp-loss");
+    }
+    #[test]
     fn network_listen_errors() {
         case("listen-errors");
     }

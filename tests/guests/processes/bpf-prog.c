@@ -147,6 +147,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PROG_LOAD 5
@@ -2982,6 +2983,216 @@ static int case_tcp(void) {
     return 0;
 }
 
+/* bpf-prog-segments: a connected socket's filter on the segments that come
+   to it. Nothing printed depends on when: what comes is waited for, and
+   what must not come is looked for once the client's tcp_info says that its
+   segment went again, so that the first was dropped. */
+#define SEG_WATCHDOG 10000
+static unsigned char seg_out[60000], seg_in[60000];
+/* A connection to the listener `l`: its two sides. */
+static void seg_pair(int family, int l, const struct sockaddr_storage *at, socklen_t len, int *c, int *s) {
+    *c = socket(family, SOCK_STREAM, 0);
+    if (connect(*c, (const struct sockaddr *)at, len)) say("pair connect %d", -errno);
+    struct pollfd ready = {.fd = l, .events = POLLIN};
+    poll(&ready, 1, 2000);
+    *s = accept(l, NULL, NULL);
+    if (*s < 0) say("pair accept %d", -errno);
+}
+/* The first `want` bytes that come to `s`, or what there is at its end. */
+static long seg_read(int s, long want) {
+    long all = 0, n = 0;
+    while (all < want) {
+        struct pollfd ready = {.fd = s, .events = POLLIN};
+        if (poll(&ready, 1, SEG_WATCHDOG) <= 0) return -ETIMEDOUT;
+        n = recv(s, seg_in + all, sizeof seg_in - all, MSG_DONTWAIT);
+        if (n <= 0) break;
+        all += n;
+    }
+    return n < 0 ? -errno : all;
+}
+/* Waits until `fd`'s tcp_info has `value` at `at`, or more. */
+static void seg_wait(const char *name, int fd, int at, uint32_t value) {
+    for (int i = 0; i < SEG_WATCHDOG / 5; i++) {
+        uint32_t info[70];
+        socklen_t len = sizeof info;
+        memset(info, 0, sizeof info);
+        getsockopt(fd, IPPROTO_TCP, 11, info, &len);
+        if (value ? info[at / 4] >= value : !info[at / 4]) return;
+        struct timespec little = {0, 5000000};
+        nanosleep(&little, NULL);
+    }
+    say("%s: %d never %u", name, at, value);
+}
+#define SEG_UNACKED 24
+#define SEG_RETRANS 100
+/* A filter on the server's side that keeps as many bytes of a segment's
+   data as `load` gives, and `add`; what comes of 300 bytes. Only the first
+   segment's data starts as it does, so what is sent again is dropped. */
+static void seg_load(const char *name, int family, int l, const struct sockaddr_storage *at, socklen_t len,
+                     struct sf load, int add) {
+    int c, s;
+    seg_pair(family, l, at, len, &c, &s);
+    struct sf f[] = {
+        S(C_LD_B_ABS, 12), S(C_ALU_K(C_RSH), 2), S(C_ALU_K(C_AND), 0x3c), S(C_TAX, 0), S(C_LD_LEN, 0),
+        S(C_ALU_X(C_SUB), 0), SJ(C_JEQ_K, 6, 0, 0), S(C_LD_B_IND, 0), SJ(C_JEQ_K, 0, 5, 0xff),
+        load, S(C_ALU_K(C_ADD), add), S(C_ALU_X(C_ADD), 0), S(C_RET_A, 0), S(C_RET_K, 0xffffffff),
+        S(C_RET_K, 0),
+    };
+    int r = attach_classic(s, f, COUNT(f));
+    if (r) say("%s attach %d", name, r);
+    unsigned char marked[300];
+    memcpy(marked, seg_out, sizeof marked);
+    marked[0] = 0xff;
+    send(c, marked, sizeof marked, 0);
+    say("%s kept %ld", name, seg_read(s, 1));
+    close(s);
+    close(c);
+}
+/* A filter on the server's side that keeps a segment with the flag `flag`
+   only where `load` gives `value`, and every other; whether the client's
+   end or urgent byte comes. */
+static void seg_check(const char *name, int family, int l, const struct sockaddr_storage *at, socklen_t len, int flag,
+                      struct sf load, uint32_t value, int kept) {
+    int c, s;
+    seg_pair(family, l, at, len, &c, &s);
+    struct sf f[] = {
+        S(C_LD_B_ABS, 13), SJ(C_JSET_K, 0, 3, flag), load, SJ(C_JEQ_K, 1, 0, value), S(C_RET_K, 0),
+        S(C_RET_K, 0xffffffff),
+    };
+    int r = attach_classic(s, f, COUNT(f));
+    if (r) say("%s attach %d", name, r);
+    if (flag == 0x20)
+        send(c, seg_out, 5, MSG_OOB);
+    else
+        shutdown(c, SHUT_WR);
+    if (kept) {
+        say("%s came %ld", name, seg_read(s, 1));
+    } else {
+        seg_wait(name, c, SEG_RETRANS, 1);
+        long n = recv(s, seg_in, sizeof seg_in, MSG_DONTWAIT);
+        say("%s came %ld", name, n < 0 ? -errno : n);
+    }
+    close(s);
+    close(c);
+}
+static void seg_family(int family) {
+    const char *f = family == AF_INET ? "v4" : "v6";
+    int v6 = family == AF_INET6, ip = v6 ? 40 : 20;
+    char name[96];
+    struct sockaddr_storage at;
+    socklen_t len;
+    int l = tcp_listener(family, &at, &len), c, s;
+    say("%s listener %d", f, l >= 0);
+    struct {
+        const char *name;
+        struct sf load;
+        int add;
+    } loads[] = {
+        /* 0x80, 32 bytes; PSH and ACK; the window, scaled. */
+        {"header length", S(C_LD_B_ABS, 12), 0},
+        {"flags", S(C_LD_B_ABS, 13), 0},
+        {"window", S(C_LD_H_ABS, 14), 0},
+        {"urgent pointer", S(C_LD_H_ABS, 18), 8},
+        {"timestamps", S(C_LD_H_ABS, 20), 0},
+        {"timestamps' length", S(C_LD_H_ABS, 22), -2000},
+        {"len", S(C_LD_LEN, 0), -290},
+        {"first byte", S(C_LD_B_ABS, 32), 1},
+        {"a byte", S(C_LD_B_ABS, 35), 1},
+        {"protocol", S(C_LD_W_ABS, AD(0)), v6 ? -0x86d0 : -0x7f0},
+        {"pkttype", S(C_LD_W_ABS, AD(4)), 8},
+        {"ifindex", S(C_LD_W_ABS, AD(8)), 8},
+        {"mark", S(C_LD_W_ABS, AD(20)), 8},
+        {"hatype", S(C_LD_W_ABS, AD(28)), -700},
+        {"payload offset", S(C_LD_W_ABS, AD(52)), 0},
+        {"ip length", S(C_LD_H_ABS, NET(v6 ? 4 : 2)), -300},
+        {"ip protocol", S(C_LD_B_ABS, NET(v6 ? 6 : 9)), 0},
+        {"hops", S(C_LD_B_ABS, NET(v6 ? 7 : 8)), 0},
+        {"version or fragment", S(C_LD_B_ABS, NET(v6 ? 0 : 6)), 0},
+        {"a byte from the network header", S(C_LD_B_ABS, NET(ip + 32 + 3)), 1},
+        {"ethertype", S(C_LD_H_ABS, LL(12)), v6 ? -0x86d0 : -0x7f0},
+    };
+    for (unsigned i = 0; i < COUNT(loads); i++) {
+        snprintf(name, sizeof name, "%s %s", f, loads[i].name);
+        seg_load(name, family, l, &at, len, loads[i].load, loads[i].add);
+    }
+    struct {
+        const char *name;
+        int flag;
+        struct sf load;
+        uint32_t value;
+        int kept;
+    } checks[] = {
+        {"end's flags", 1, S(C_LD_B_ABS, 13), 0x11, 1},
+        {"end's length", 1, S(C_LD_LEN, 0), 32, 1},
+        {"end's other length", 1, S(C_LD_LEN, 0), 31, 0},
+        {"urgent flags", 0x20, S(C_LD_B_ABS, 13), 0x38, 1},
+        {"urgent pointer set", 0x20, S(C_LD_H_ABS, 18), 5, 1},
+        {"urgent length", 0x20, S(C_LD_LEN, 0), 37, 1},
+    };
+    for (unsigned i = 0; i < COUNT(checks); i++) {
+        snprintf(name, sizeof name, "%s %s", f, checks[i].name);
+        seg_check(name, family, l, &at, len, checks[i].flag, checks[i].load, checks[i].value,
+                  checks[i].kept);
+    }
+
+    /* The context's fields, of a small segment and of one of many. */
+    static const int lengths[] = {300, 60000};
+    for (unsigned i = 0; i < COUNT(lengths); i++) {
+        seg_pair(family, l, &at, len, &c, &s);
+        int m = map(2, 4, 64, 1, 0);
+        snprintf(name, sizeof name, "%s fields of %d", f, lengths[i]);
+        say("%s attach %d", name, attach(s, fields_filter(m)));
+        int priority = 3;
+        setsockopt(c, SOL_SOCKET, SO_PRIORITY, &priority, sizeof priority);
+        send(c, seg_out, lengths[i], 0);
+        say("%s read %ld", name, seg_read(s, lengths[i]));
+        say_fields(name, m);
+        close(m);
+        close(s);
+        close(c);
+    }
+    /* An acknowledgement's, at the other side, and a reset's. */
+    for (int reset = 0; reset < 2; reset++) {
+        seg_pair(family, l, &at, len, &c, &s);
+        int m = map(2, 4, 64, 1, 0);
+        snprintf(name, sizeof name, "%s fields of %s", f, reset ? "a reset" : "an acknowledgement");
+        say("%s attach %d", name, attach(c, fields_filter(m)));
+        if (reset) {
+            struct linger now = {1, 0};
+            setsockopt(s, SOL_SOCKET, SO_LINGER, &now, sizeof now);
+            close(s);
+            say("%s read %ld", name, seg_read(c, 1));
+        } else {
+            send(c, seg_out, 300, 0);
+            say("%s read %ld", name, seg_read(s, 300));
+            seg_wait(name, c, SEG_UNACKED, 0);
+            close(s);
+        }
+        say_fields(name, m);
+        close(m);
+        close(c);
+    }
+    /* A locked filter, and what comes whole. */
+    seg_pair(family, l, &at, len, &c, &s);
+    int lock = 1;
+    struct sf all[] = {S(C_RET_K, 0xffffffff)};
+    say("%s attach all %d", f, attach_classic(s, all, COUNT(all)));
+    say("%s lock %d", f, setsockopt(s, SOL_SOCKET, SO_LOCK_FILTER, &lock, sizeof lock) ? -errno : 0);
+    send(c, seg_out, 300, 0);
+    say("%s read %ld", f, seg_read(s, 300));
+    say("%s bytes %d", f, memcmp(seg_in, seg_out, 300));
+    close(c);
+    close(s);
+    close(l);
+}
+static int case_segments(void) {
+    for (size_t i = 0; i < sizeof seg_out; i++) seg_out[i] = (unsigned char)(i * 7 + 3);
+    own_network();
+    seg_family(AF_INET);
+    seg_family(AF_INET6);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -2998,5 +3209,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-rewrites")) return case_rewrites();
     if (!strcmp(mode, "bpf-prog-udp")) return case_udp();
     if (!strcmp(mode, "bpf-prog-tcp")) return case_tcp();
+    if (!strcmp(mode, "bpf-prog-segments")) return case_segments();
     return 2;
 }

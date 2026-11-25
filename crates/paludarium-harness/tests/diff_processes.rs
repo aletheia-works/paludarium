@@ -323,6 +323,7 @@ mod linux {
                     | "perf-wakeup"
                     | "perf-side-band"
                     | "perf-inherit-stat"
+                    | "perf-side-band-cpu"
                     | "perf-side-band-comm"
                     | "perf-throttle"
                     | "perf-side-band-exec"
@@ -746,6 +747,7 @@ mod linux {
         perf_wakeup => ("perf-wakeup","perf"),
         perf_side_band => ("perf-side-band","perf"),
         perf_inherit_stat => ("perf-inherit-stat","perf"),
+        perf_side_band_cpu => ("perf-side-band-cpu","perf"),
         perf_side_band_comm => ("perf-side-band-comm","perf"),
         perf_throttle => ("perf-throttle","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),

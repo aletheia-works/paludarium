@@ -4556,7 +4556,8 @@ kernel.
   the task's memory at the address its position gives, as Linux's `mem_rw`
   does through `access_remote_vm` with `FOLL_FORCE`: a page whatever its
   protection, a private one written to a copy of its own, a page at a time.
-  A call that moves no byte (no page there, a `perf` ring's or a
+  A call that moves no byte (no page there, nor a stack the caller can grow
+  down to it, a `perf` ring's or a
   `memfd_secret` file's, which `get_user_pages` refuses) is `EIO`, and one
   that stops later gives what it moved. `lseek` takes `SEEK_SET` and
   `SEEK_CUR` only (`EINVAL`), and its positions are unsigned
@@ -5139,10 +5140,12 @@ kernel.
   `sigtrap`, an overflow sends the thread SIGTRAP of `TRAP_PERF` with
   `sig_data` and the event's type in `si_perf_data` and `si_perf_type`, the
   fault's address in `si_addr` as a sample has it with
-  `PERF_SAMPLE_ADDR`, and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event of a task
+  `PERF_SAMPLE_ADDR`, and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event
   that asks for them takes side-band records, as `perf_iterate_sb` gives
-  them to the enabled events that count the thread that makes them, each
-  with that thread's `sample_id`: `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
+  them to the enabled events of the CPU (pid -1) of the thread that makes
+  them, whatever process it is of, and then to those that count the thread,
+  the latest first, each with that thread's `sample_id` (`EXIT` goes to the
+  thread's first): `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
   (`mmap2`) of an executable mapping, and with `mmap_data` of any other
   (`PERF_RECORD_MISC_MMAP_DATA`), as `mmap`, `brk`'s growth, `shmat`,
   `remap_file_pages` and `mprotect` (of each VMA whose protection it

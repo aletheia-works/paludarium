@@ -345,7 +345,7 @@ verified.
   for samples that take too long (`perf_sample_event_took`), which
   `perf_cpu_time_max_percent` sets the limit of; and no other event is
   throttled, as no other event here is an hrtimer's or the hardware's. An
-  event of a CPU takes no samples, nor any side-band record. Of those, an `execve` writes the new program's mappings once it
+  event of a CPU takes no samples. Of the side-band records, an `execve` writes the new program's mappings once it
   has loaded it, the stack's two first and the rest by address: the
   temporary stack's is placed at the top of 4-level user space with the
   length of the arguments' pages, where Linux gives where it was. Linux
@@ -1031,6 +1031,12 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
+- **Shared futexes in a program's read-only segments**: a word in a
+  read-only private mapping of a file is the file's (`get_futex_key`), but
+  in the segments `execve` maps, of the program and its interpreter, which
+  have their own copy of the file, it is its address in the process: a wake
+  by another process, or through another mapping of the file, does not find
+  its waiters.
 - **userfaultfd, in part**: missing pages, write protection and the minor
   faults of shmem are registered. A discard tells of all its ranges
   before it drops the pages of any, where Linux tells and drops VMA by VMA,

@@ -2,8 +2,8 @@
 //! to the buffers of the events that ask for them: `PERF_RECORD_MMAP` and
 //! `MMAP2` of a mapping (`perf_event_mmap`), `COMM` of a new name
 //! (`perf_event_comm`), and `FORK` and `EXIT` of a task
-//! (`perf_event_task`). Each goes to the enabled events that count the
-//! thread that writes it (`perf_iterate_sb`), through the buffer that
+//! (`perf_event_task`). Each goes to the enabled events of the CPU of the
+//! thread that writes it and those that count it (`perf_iterate_sb`), through the buffer that
 //! event writes to, with the `sample_id` of that thread.
 
 use super::sample::{Who, header, put};
@@ -46,10 +46,36 @@ pub(crate) fn wanted(events: &Events) -> bool {
     events.side_band.load(Ordering::Relaxed)
 }
 
-/// The enabled events that count thread `tid` of `group` and that `wants`
-/// picks, on the CPU of `who` (`perf_iterate_ctx`'s state and
-/// `event_filter_match`).
+/// The enabled events of the CPU of `who`, and then those that count thread
+/// `tid` of `group`, that `wants` picks (`perf_iterate_sb`).
 fn receivers(
+    events: &Events,
+    group: &ThreadGroup,
+    tid: u32,
+    who: &Who,
+    wants: impl Fn(&super::Attr) -> bool,
+) -> Vec<Arc<Event>> {
+    let mut all = on_cpu(events, who, &wants);
+    all.extend(of_task(events, group, tid, who, wants));
+    all
+}
+/// Those of the events of the CPU (`perf_iterate_sb_cpu`), the latest
+/// first, as `attach_sb_event` puts each before the others.
+fn on_cpu(events: &Events, who: &Who, wants: impl Fn(&super::Attr) -> bool) -> Vec<Arc<Event>> {
+    if !wanted(events) {
+        return Vec::new();
+    }
+    lock(&events.lists)
+        .side_band
+        .iter()
+        .rev()
+        .filter_map(super::event)
+        .filter(|event| wants(&event.attr) && takes(event, who))
+        .collect()
+}
+/// Those that count thread `tid` of `group` (`perf_iterate_ctx`), the
+/// latest first, as `list_add_event` puts each before the others.
+fn of_task(
     events: &Events,
     group: &ThreadGroup,
     tid: u32,
@@ -62,17 +88,19 @@ fn receivers(
     lock(&events.lists)
         .counting
         .iter()
+        .rev()
         .filter_map(super::event)
-        .filter(|event| {
-            wants(&event.attr)
-                && event.counts(group, tid)
-                && (event.cpu < 0 || event.cpu as u32 == who.cpu)
-                && {
-                    let state = lock(&event.state);
-                    state.enabled && !state.removed
-                }
-        })
+        .filter(|event| wants(&event.attr) && event.counts(group, tid) && takes(event, who))
         .collect()
+}
+/// Whether `event` takes records that `who` writes: it is enabled, and of
+/// the CPU `who` is on if it is of one (`event_filter_match`).
+fn takes(event: &Event, who: &Who) -> bool {
+    if event.cpu >= 0 && event.cpu as u32 != who.cpu {
+        return false;
+    }
+    let state = lock(&event.state);
+    state.enabled && !state.removed
 }
 
 impl Event {
@@ -162,15 +190,25 @@ pub(super) fn fork(
 
 /// `perf_event_exit_task`'s `PERF_RECORD_EXIT`: thread `who` of `group`
 /// ends, a thread of the process whose parent is `ppid`, which the record
-/// gives as both the parent process and thread (`real_parent`).
+/// gives as both the parent process and thread (`real_parent`). First to
+/// the events that count it, alone.
 pub(super) fn exit(events: &Events, group: &ThreadGroup, who: &Who, ppid: u32) {
-    for event in receivers(events, group, who.tid, who, asks) {
-        // `pid`, `ppid`, `tid`, `ptid`.
-        let mut body = event.pid_tid_of(who.pid, ppid).to_vec();
-        body.extend_from_slice(&event.pid_tid_of(who.tid, ppid));
-        put(&mut body, event.clock_now());
-        event.side_band(RECORD_EXIT, 0, &body, who);
+    for event in of_task(events, group, who.tid, who, asks) {
+        exited(&event, who, ppid);
     }
+}
+/// The same, to the events of its CPU.
+pub(super) fn exit_on_cpu(events: &Events, who: &Who, ppid: u32) {
+    for event in on_cpu(events, who, asks) {
+        exited(&event, who, ppid);
+    }
+}
+fn exited(event: &Arc<Event>, who: &Who, ppid: u32) {
+    // `pid`, `ppid`, `tid`, `ptid`.
+    let mut body = event.pid_tid_of(who.pid, ppid).to_vec();
+    body.extend_from_slice(&event.pid_tid_of(who.tid, ppid));
+    put(&mut body, event.clock_now());
+    event.side_band(RECORD_EXIT, 0, &body, who);
 }
 
 /// What a VMA's records say of it: `perf_event_mmap_event`'s.

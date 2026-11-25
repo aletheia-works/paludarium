@@ -3935,7 +3935,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `FOLL_FORCE` 付きの `access_remote_vm` でするのと同じく、位置が示すアドレスでタスクの
   メモリを読み書きします。保護がどうであってもページに届き、プライベートなページには
   そのページだけの写しを作って書き、1 ページずつ進みます。1 バイトも動かせない呼び出し
-  （ページがない、`get_user_pages` が拒む `perf` のリングや `memfd_secret` のファイルのページ）は
+  （ページがなく、呼び出し元がそこまで伸ばせるスタックもない、`get_user_pages` が拒む `perf` のリングや `memfd_secret` のファイルのページ）は
   `EIO` で、途中で止まった呼び出しはそこまでの数を返します。`lseek` は `SEEK_SET` と
   `SEEK_CUR` だけを受け付け（`EINVAL`）、位置は符号なしです（`FOP_UNSIGNED_OFFSET`）。
   `lseek` は `i64::MAX` を超えて進め、そこでの読み書きはそのアドレスのバイトを動かします。
@@ -4433,9 +4433,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `si_code`、`si_band`、`si_fd` を持ちます。`sigtrap` では、オーバーフローはスレッドに
   `TRAP_PERF` の SIGTRAP を送り、`si_perf_data` と `si_perf_type` に `sig_data` と
   イベントの型を、`si_addr` に（`PERF_SAMPLE_ADDR` のサンプルと同じ）フォルトのアドレスを、スレッドがそれをブロックしていれば `TRAP_PERF_FLAG_ASYNC` を
-  持たせます。それを求めるタスクのイベントは、`perf_iterate_sb` が記録を作るスレッドを
-  数える有効なイベントへ渡すように、サイドバンドの記録を、そのスレッドの `sample_id` を
-  付けて受け取ります。実行できるマッピングの `PERF_RECORD_MMAP`（`mmap`）か
+  持たせます。それを求めるイベントは、`perf_iterate_sb` が渡すように、サイドバンドの記録を
+  受け取ります。記録を作るスレッドの CPU の有効なイベント（pid が -1。どのプロセスの
+  スレッドでも）、次にそのスレッドを数えるイベントの順で（`EXIT` はスレッドのものが先）、
+  どちらも新しいものからで、そのスレッドの `sample_id` が付きます。実行できるマッピングの `PERF_RECORD_MMAP`（`mmap`）か
   `MMAP2`（`mmap2`）と、`mmap_data` ではほかのマッピングのもの
   （`PERF_RECORD_MISC_MMAP_DATA`）を、`mmap`、`brk` が伸ばしたとき、`shmat`、
   `remap_file_pages`、`mprotect`（保護を変えた VMA ごとに順に）が残した、隣と合わさった

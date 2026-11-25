@@ -1641,7 +1641,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、ファイルの要求
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
   `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、それにソケットの要求
-  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
@@ -1806,7 +1806,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   もう一度ポーリングさせます。
 
 - ソケットの要求は Linux 7.0 の単発のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
-  `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。どれも Linux と同じく準備し、
+  `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。最後の 2 つは
+  `msghdr` とその iovec を準備のときに読むので（`io_msg_copy_hdr`。`EFAULT`、`EINVAL`、
+  `EMSGSIZE`）、待つ要求にはもう要りません。`MSG_WAITALL` の受信は、メッセージや補助データが
+  切り詰められるとリンクを失敗させます。どれも Linux と同じく準備し、
   エントリーを調べ（`EINVAL`）、次に接続や送信のアドレスを読み（`move_addr_to_kernel`。128 バイトを
   超えれば `EINVAL`、読めなければ `EFAULT`）、バッファーがユーザー空間にあるかを調べます
   （`EFAULT`）。実行は Linux がその場で実行するのと同じく待たずに行います。待つはずの要求

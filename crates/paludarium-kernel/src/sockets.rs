@@ -1032,6 +1032,15 @@ pub(crate) fn is_stream(file: &Arc<dyn FileHandle>) -> bool {
     endpoint(file).is_some_and(|socket| matches!(socket.pair.kind, SOCK_STREAM | SOCK_SEQPACKET))
 }
 
+/// Whether `file` is a stream socket, whose receive `MSG_TRUNC` has drop the
+/// bytes rather than tell a message's whole length.
+pub(crate) fn is_byte_stream(file: &Arc<dyn FileHandle>) -> bool {
+    if let Some(socket) = crate::inet::of(file) {
+        return !socket.is_datagram();
+    }
+    endpoint(file).is_some_and(|socket| socket.pair.kind == SOCK_STREAM)
+}
+
 /// `accept` and `accept4` (`__sys_accept4`): the descriptor is looked up
 /// (`EBADF`), the flags checked (`EINVAL`), and the new descriptor taken
 /// (`EMFILE`) before anything is accepted, or the file found to be no
@@ -1364,6 +1373,7 @@ const CMSG_HEADER: usize = 16;
 const MAX_CONTROL: u64 = 128 * 1024;
 
 /// A `struct user_msghdr`, as Linux's `__copy_msghdr` checks it.
+#[derive(Clone, Default)]
 pub(crate) struct MessageHeader {
     /// `msg_name` when it and `msg_namelen` are both non-zero.
     pub(crate) name: Option<(u64, usize)>,
@@ -1376,6 +1386,24 @@ pub(crate) struct MessageHeader {
     pub(crate) control: u64,
     pub(crate) control_len: u64,
 }
+thread_local! {
+    static READ_BEFORE: std::cell::RefCell<Option<(u64, MessageHeader)>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+/// Runs `f`, in which the `msghdr` at `at` is `header`, read before: an
+/// io_uring request reads its message as it is prepared, and runs later.
+pub(crate) fn with_header<T>(at: u64, header: &MessageHeader, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(u64, MessageHeader)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_BEFORE.with(|read| read.replace(self.0.take()));
+        }
+    }
+    let now = Some((at, header.clone()));
+    let _restore = Restore(READ_BEFORE.with(|read| read.replace(now)));
+    f()
+}
 /// Reads the `msghdr` at `at` (EFAULT): a negative `msg_namelen` with a name
 /// is EINVAL, a longer one counts as `sockaddr_storage`'s 128 bytes, and
 /// more than 1024 iovecs are EMSGSIZE.
@@ -1384,6 +1412,26 @@ pub(crate) fn message_header(
     at: u64,
     write: bool,
 ) -> Result<MessageHeader, Errno> {
+    message_header_with(c, at, write, true)
+}
+/// [`message_header`], whose iovecs are read with `vectors`.
+pub(crate) fn message_header_with(
+    c: &Context<'_>,
+    at: u64,
+    write: bool,
+    vectors: bool,
+) -> Result<MessageHeader, Errno> {
+    let before = READ_BEFORE.with(|read| read.borrow().clone());
+    if let Some((_, header)) = before.filter(|(read, _)| *read == at) {
+        if write {
+            for &(base, len) in &header.iov {
+                c.mem
+                    .check_write(GuestAddr(base), len)
+                    .map_err(|_| Errno::EFAULT)?;
+            }
+        }
+        return Ok(header);
+    }
     let mut raw = [0; 56];
     c.mem
         .read(GuestAddr(at), &mut raw)
@@ -1402,7 +1450,9 @@ pub(crate) fn message_header(
     // which a failed copy would leave in place. sendmsg's are only checked as
     // access_ok does, as they are copied after the address is checked: that
     // check is iovecs_checked's own, so the closure does nothing more.
-    let iov = if write {
+    let iov = if !vectors {
+        Vec::new()
+    } else if write {
         crate::files::iovecs(c, word(16), word(24), true)?
     } else {
         crate::files::iovecs_checked(c.mem, word(16), word(24), |_, _| Ok(()))?

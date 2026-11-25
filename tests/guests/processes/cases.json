@@ -564,6 +564,7 @@
     {"name":"io-uring-timeout","binary":"process"},
     {"name":"io-uring-poll-add","binary":"process"},
     {"name":"io-uring-fs","binary":"process"},
+    {"name":"io-uring-message","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

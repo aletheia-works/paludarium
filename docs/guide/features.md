@@ -1865,8 +1865,8 @@ kernel.
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
   socket requests
-  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
-  `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
@@ -2071,8 +2071,12 @@ kernel.
   `user_data` (`IORING_POLL_UPDATE_USER_DATA`), with which it polls again.
 
 - The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
-  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
-  `_RECV`. Each is prepared as Linux prepares it, which checks its entry
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. The last two read their `msghdr` and
+  its iovecs as they are prepared (`io_msg_copy_hdr`: `EFAULT`, `EINVAL`,
+  `EMSGSIZE`), so one that waits needs them no more. A receive with
+  `MSG_WAITALL` whose message or ancillary data was cut fails its link. Each
+  is prepared as Linux prepares it, which checks its entry
   (`EINVAL`), then reads a connect's or a send's address
   (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a
   buffer in the user half (`EFAULT`). It runs as Linux runs it inline,

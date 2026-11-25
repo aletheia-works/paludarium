@@ -1,6 +1,6 @@
 //! io_uring's single-shot socket requests, as Linux's `io_uring/net.c`
 //! has them: `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
-//! `_SEND` and `_RECV`.
+//! `_SEND`, `_RECV`, `_SENDMSG` and `_RECVMSG`.
 //!
 //! The preparation checks are Linux 7.0's, which the differential tests
 //! run on. A request is issued as Linux issues it inline, nonblocking
@@ -11,15 +11,18 @@
 use std::sync::Arc;
 
 use paludarium_host::FileHandle;
-use paludarium_types::Errno;
+use paludarium_types::{Errno, GuestAddr};
 
 use super::{
     Chosen, POLL_IN_EVENTS, POLL_OUT_EVENTS, POLL_UNMASK, Ring, Waits, Work, file_of, give_back,
     int_at, select, u16_at, u32_at, u64_at,
 };
 use crate::files::Descriptor;
+use crate::sockets::MessageHeader;
 use crate::syscalls::Context;
 
+pub(super) const OP_SENDMSG: u8 = 9;
+pub(super) const OP_RECVMSG: u8 = 10;
 pub(super) const OP_ACCEPT: u8 = 13;
 pub(super) const OP_CONNECT: u8 = 16;
 pub(super) const OP_SEND: u8 = 26;
@@ -48,6 +51,8 @@ const CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
 /// `IORING_FILE_INDEX_ALLOC`: a free registered slot.
 const FILE_INDEX_ALLOC: u32 = u32::MAX;
 
+const MSG_CTRUNC: u32 = 0x8;
+const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u32 = 0x40;
 const MSG_WAITALL: u32 = 0x100;
 const MSG_ERRQUEUE: u32 = 0x2000;
@@ -113,6 +118,8 @@ enum Op {
         to: Option<(u64, u16)>,
         group: Option<u16>,
         done: u64,
+        /// The `msghdr` of an `IORING_OP_SENDMSG` or `_RECVMSG`, at `buf`.
+        message: Option<Box<MessageHeader>>,
     },
 }
 
@@ -198,8 +205,9 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 seen_aborted: false,
             }
         }
-        OP_SEND | OP_RECV => {
-            let send = opcode == OP_SEND;
+        OP_SEND | OP_RECV | OP_SENDMSG | OP_RECVMSG => {
+            let send = matches!(opcode, OP_SEND | OP_SENDMSG);
+            let message = matches!(opcode, OP_SENDMSG | OP_RECVMSG);
             // `io_recvmsg_prep` takes no address.
             if !send && off != 0 {
                 return Err(Errno::EINVAL);
@@ -228,13 +236,18 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
             }
             // Bundles, vectored sends, a send's selected buffer and a
             // selected buffer that a receive fills whole are not there yet.
-            if ioprio & (RECVSEND_BUNDLE | SEND_VECTORIZED) != 0
+            // A message is no bundle, and its iovecs are vectored anyway.
+            let vectored = ioprio & SEND_VECTORIZED != 0 && !message;
+            if ioprio & RECVSEND_BUNDLE != 0
+                || vectored
                 || select && (send || msg_flags & MSG_WAITALL != 0)
             {
                 return Err(Errno::EINVAL);
             }
-            // `__pad3[0]`.
-            if send && u16_at(sqe, 46) != 0 {
+            // `__pad3[0]`, and what a message has none of.
+            if send && !message && u16_at(sqe, 46) != 0
+                || send && message && (off != 0 || file_index != 0)
+            {
                 return Err(Errno::EINVAL);
             }
             Op::Transfer {
@@ -246,6 +259,7 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 to: (send && off != 0).then(|| (off, u16_at(sqe, 44))),
                 group: select.then_some(buf_index),
                 done: 0,
+                message: message.then(Box::default),
             }
         }
         _ => return Err(super::EOPNOTSUPP),
@@ -274,8 +288,15 @@ pub(super) fn prepare_memory(c: &Context<'_>, net: &mut Net) -> Result<(), Errno
             buf,
             to,
             group,
+            send,
+            ref mut message,
             ..
         } => {
+            if let Some(message) = message {
+                **message = read_message(c, buf, send, group.is_some())?;
+                *len = message.iov.first().map_or(0, |&(_, len)| len as u32);
+                return Ok(());
+            }
             if let Some((at, to_len)) = to {
                 crate::inet::read_raw(c, at, u64::from(to_len))?;
             }
@@ -287,6 +308,38 @@ pub(super) fn prepare_memory(c: &Context<'_>, net: &mut Net) -> Result<(), Errno
         _ => {}
     }
     Ok(())
+}
+
+/// What a message's preparation reads (`io_msg_copy_hdr`): the `msghdr`
+/// (`EFAULT`, `EINVAL`, `EMSGSIZE`), a send's address
+/// (`move_addr_to_kernel`, `EFAULT`), and the iovecs (`__import_iovec`); of
+/// a receive that selects a buffer, which has one at most (`EINVAL`), the
+/// length alone.
+fn read_message(
+    c: &Context<'_>,
+    at: u64,
+    send: bool,
+    selects: bool,
+) -> Result<MessageHeader, Errno> {
+    let mut header = crate::sockets::message_header_with(c, at, false, !selects)?;
+    if send && let Some((name, len)) = header.name {
+        let mut address = vec![0; len];
+        c.mem
+            .read(GuestAddr(name), &mut address)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    if selects {
+        let [vector, count] = crate::syscalls::read_words::<2>(c.mem, at + 16)?;
+        if count > 1 {
+            return Err(Errno::EINVAL);
+        }
+        let len = match count {
+            0 => 0,
+            _ => crate::syscalls::read_words::<2>(c.mem, vector)?[1],
+        };
+        header.iov = vec![(0, len as u32 as usize)];
+    }
+    Ok(header)
 }
 
 /// What issuing a request came to: a result with its completion's flags
@@ -568,9 +621,8 @@ fn connect(c: &mut Context<'_>, op: &mut Op, file: &Arc<dyn FileHandle>) -> Issu
 /// (`MSG_DONTWAIT`) at most once (`sendto`, `recvfrom`), and waits for the
 /// socket on `EAGAIN`. With `MSG_WAITALL`, a stream or sequenced-packet
 /// socket that moved fewer bytes than were left waits to move the rest
-/// (`io_net_retry`, `done_io`); any other short transfer fails (but not a
-/// whole datagram that was cut, which Linux's fails too: `MSG_TRUNC` of
-/// the receive is not seen here). A receive
+/// (`io_net_retry`, `done_io`); any other short transfer fails, and so does
+/// a receive whose message or ancillary data was cut. A receive
 /// may select a provided buffer first (`ENOBUFS`), which goes back to its
 /// group when the receive waits or moved nothing (`io_kbuf_recycle`, as
 /// Linux master has it), and tells whether more waits to be read
@@ -595,6 +647,7 @@ fn transfer(
         to,
         group,
         done,
+        message,
     } = op
     else {
         unreachable!()
@@ -629,21 +682,58 @@ fn transfer(
         ),
         None => (*buf, *len),
     };
-    let wanted = if *msg_flags & MSG_WAITALL != 0 {
-        u64::from(count)
-    } else {
-        0
+    if let Some(message) = message
+        && chosen.is_some()
+    {
+        message.iov = vec![(at, count as usize)];
+    }
+    let total = match message {
+        Some(message) => message.iov.iter().map(|&(_, len)| len as u64).sum(),
+        None => u64::from(count),
     };
-    let (to_at, to_len) = to.map_or((0, 0), |(at, len)| (at, u64::from(len)));
-    let a = [
-        0,
-        at,
-        u64::from(count),
-        u64::from(call_flags),
-        to_at,
-        to_len,
-    ];
-    let result = crate::sockets::route_file(c, if send { 44 } else { 45 }, a, file);
+    let whole = *msg_flags & MSG_WAITALL != 0;
+    // A receive with ancillary data is not gone on with.
+    let wanted = match message {
+        Some(message) if !send && message.control_len != 0 => 0,
+        _ if whole => total,
+        _ => 0,
+    };
+    // Whether a message was cut, which fails a receive of the whole:
+    // `MSG_TRUNC` has it tell its length.
+    let lengths = whole && !send && message.is_none() && !crate::sockets::is_byte_stream(file);
+    let asked = if lengths {
+        call_flags | MSG_TRUNC
+    } else {
+        call_flags
+    };
+    let mut cut = false;
+    let result = if let Some(message) = message {
+        let a = [0, *buf, u64::from(asked), 0, 0, 0];
+        let result = crate::sockets::with_header(*buf, message, || {
+            crate::sockets::route_file(c, if send { 46 } else { 47 }, a, file)
+        });
+        if whole && !send && result.is_ok() {
+            let mut flags = [0; 4];
+            cut = c
+                .mem
+                .read(GuestAddr(buf.wrapping_add(48)), &mut flags)
+                .is_ok()
+                && u32::from_le_bytes(flags) & (MSG_TRUNC | MSG_CTRUNC) != 0;
+        }
+        result
+    } else {
+        let (to_at, to_len) = to.map_or((0, 0), |(at, len)| (at, u64::from(len)));
+        let a = [0, at, u64::from(count), u64::from(asked), to_at, to_len];
+        let result = crate::sockets::route_file(c, if send { 44 } else { 45 }, a, file);
+        match result {
+            Ok(n) if lengths && n > u64::from(count) => {
+                cut = true;
+                let told = *msg_flags & MSG_TRUNC != 0;
+                Ok(if told { n } else { u64::from(count) })
+            }
+            result => result,
+        }
+    };
     let inq = if send || result.is_err() {
         None
     } else {
@@ -661,13 +751,20 @@ fn transfer(
             Ok(n) if n > 0 && crate::sockets::is_stream(file) => {
                 // A selected buffer is never filled whole: the preparation
                 // refused that.
-                *buf = buf.wrapping_add(n);
-                *len -= n as u32;
+                match message {
+                    Some(message) => go_on(message, n, send),
+                    None => {
+                        *buf = buf.wrapping_add(n);
+                        *len -= n as u32;
+                    }
+                }
                 *done += n;
                 return Issued::Again(mask);
             }
             _ => failed = true,
         }
+    } else if cut {
+        failed = true;
     }
     let res = match result {
         Ok(n) => (n + *done) as i32,
@@ -686,6 +783,22 @@ fn transfer(
         cflags |= CQE_F_SOCK_NONEMPTY;
     }
     Issued::Done(res, cflags, failed)
+}
+
+/// What is left of a message after `n` bytes of it, a send's without its
+/// ancillary data, which went.
+fn go_on(message: &mut MessageHeader, n: u64, send: bool) {
+    let mut n = n as usize;
+    message.iov.retain_mut(|(base, len)| {
+        let here = n.min(*len);
+        *base = base.wrapping_add(here as u64);
+        *len -= here;
+        n -= here;
+        *len != 0
+    });
+    if send {
+        (message.control, message.control_len) = (0, 0);
+    }
 }
 
 /// `io_kbuf_recycle`: a provided buffer goes back to the front of its

@@ -12295,6 +12295,177 @@ static int io_uring_poll_add_case(void) {
     return 0;
 }
 
+/* io_uring's messages: IORING_OP_SENDMSG and _RECVMSG. */
+static int um_run(struct uring *u, unsigned n, unsigned wait, const char *label) {
+    uring_show(label, uring_enter(u->fd, n, wait, 1, NULL, 0));
+    return unet_reap(u, label, 0);
+}
+
+static unsigned char *um_push(struct uring *u, unsigned char op, unsigned long data, int fd,
+                              struct msghdr *msg, unsigned flags, unsigned short prio) {
+    return unet_push(u, op, data, fd, 0, (long)msg, 1, flags, prio);
+}
+
+static int io_uring_message_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    int stream[2], gram[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, stream) || socketpair(AF_UNIX, SOCK_DGRAM, 0, gram))
+        return 81;
+    char out[16] = "hello world", one[4] = {0}, two[64] = {0};
+    struct iovec send_iov[2] = {{out, 5}, {out + 5, 6}};
+    struct iovec receive_iov[2] = {{one, 3}, {two, sizeof two}};
+    struct msghdr send = {.msg_iov = send_iov, .msg_iovlen = 2};
+    struct msghdr receive = {.msg_iov = receive_iov, .msg_iovlen = 2};
+    unsigned char *sqe;
+
+    /* The preparation. */
+    static const unsigned char bad[] = {8, 44};
+    for (unsigned i = 0; i < sizeof bad; i++) {
+        um_push(&u, 9, 1, stream[0], &send, 0, 0)[bad[i]] = 1;
+        um_run(&u, 1, 1, "send-refused");
+        um_push(&u, 10, 1, stream[0], &receive, 0, 0)[bad[i]] = 1;
+        um_run(&u, 1, 1, "receive-refused");
+    }
+    um_push(&u, 9, 1, stream[0], &send, 0, 16);
+    um_run(&u, 1, 1, "send-bundle");
+    um_push(&u, 10, 1, stream[0], &receive, 0, 16);
+    um_run(&u, 1, 1, "receive-bundle");
+    um_push(&u, 9, 1, stream[0], &send, 0, 0)[27] = 0x80;
+    um_run(&u, 1, 1, "send-length");
+    um_push(&u, 9, 1, stream[0], (struct msghdr *)8, 0, 0);
+    um_run(&u, 1, 1, "send-unmapped");
+    um_push(&u, 10, 1, stream[0], (struct msghdr *)8, 0, 0);
+    um_run(&u, 1, 1, "receive-unmapped");
+    struct msghdr many = {.msg_iov = send_iov, .msg_iovlen = 2000};
+    um_push(&u, 9, 1, stream[0], &many, 0, 0);
+    um_run(&u, 1, 1, "send-many");
+    struct msghdr named = {.msg_name = (void *)8, .msg_namelen = 4, .msg_iov = send_iov,
+                           .msg_iovlen = 1};
+    um_push(&u, 9, 1, gram[0], &named, 0, 0);
+    um_run(&u, 1, 1, "send-name-unmapped");
+    struct msghdr iov = {.msg_iov = (struct iovec *)8, .msg_iovlen = 1};
+    um_push(&u, 10, 1, stream[0], &iov, 0, 0);
+    um_run(&u, 1, 1, "receive-iov-unmapped");
+    um_push(&u, 9, 1, stream[0], &send, 0, 0)[1] = 1 << 5;
+    um_run(&u, 1, 1, "send-select");
+    um_push(&u, 9, 1, 0, &send, 0, 0);
+    um_run(&u, 1, 1, "send-no-socket");
+    um_push(&u, 10, 1, 0, &receive, 0, 0);
+    um_run(&u, 1, 1, "receive-no-socket");
+
+    /* A receive that waits has its header and iovecs, which may go. */
+    um_push(&u, 10, 1, stream[1], &receive, 0, 0);
+    um_run(&u, 1, 0, "receive-waits");
+    receive_iov[0].iov_base = receive_iov[1].iov_base = NULL;
+    um_push(&u, 9, 2, stream[0], &send, 0, 0);
+    um_run(&u, 1, 2, "sent");
+    printf("%.3s %.8s %zu\n", one, two, (size_t)receive.msg_controllen);
+    receive_iov[0] = (struct iovec){one, 3};
+    receive_iov[1] = (struct iovec){two, 12};
+
+    /* MSG_WAITALL, and not waiting. */
+    memset(two, 0, sizeof two);
+    um_push(&u, 10, 1, stream[1], &receive, MSG_WAITALL, 0);
+    um_run(&u, 1, 0, "whole-waits");
+    write(stream[0], "hello", 5);
+    um_run(&u, 0, 0, "whole-part");
+    write(stream[0], " world and", 10);
+    um_run(&u, 0, 1, "whole");
+    printf("%.3s %.12s\n", one, two);
+    um_push(&u, 10, 1, stream[1], &receive, MSG_DONTWAIT, 0);
+    um_run(&u, 1, 1, "nowait");
+
+    /* Descriptors and credentials. */
+    union {
+        struct cmsghdr header;
+        char space[CMSG_SPACE(sizeof(int))];
+    } control;
+    memset(&control, 0, sizeof control);
+    send.msg_control = &control;
+    send.msg_controllen = sizeof control;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&send);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &stream[0], sizeof(int));
+    um_push(&u, 9, 1, gram[0], &send, 0, 0);
+    um_run(&u, 1, 1, "rights-sent");
+    memset(&control, 0, sizeof control);
+    receive.msg_control = &control;
+    receive.msg_controllen = sizeof control;
+    um_push(&u, 10, 1, gram[1], &receive, MSG_CMSG_CLOEXEC, 0);
+    um_run(&u, 1, 1, "rights");
+    cmsg = CMSG_FIRSTHDR(&receive);
+    int passed = -1;
+    if (cmsg) memcpy(&passed, CMSG_DATA(cmsg), sizeof passed);
+    printf("type %d cloexec %d flags %#x\n", cmsg ? cmsg->cmsg_type : -1,
+           fcntl(passed, F_GETFD), receive.msg_flags);
+    close(passed);
+
+    /* What is cut fails a receive of the whole, and its link. */
+    receive.msg_control = NULL;
+    receive.msg_controllen = 0;
+    receive.msg_iovlen = 1;
+    static const unsigned flags[] = {0, MSG_WAITALL, MSG_WAITALL | MSG_TRUNC, MSG_TRUNC};
+    for (unsigned i = 0; i < sizeof flags / sizeof *flags; i++) {
+        write(gram[0], "hello", 5);
+        um_push(&u, 10, 1, gram[1], &receive, flags[i], 0)[1] = 4;
+        uring_push(&u, 0, 2);
+        um_run(&u, 2, 2, "cut");
+        write(gram[0], "hello", 5);
+        sqe = unet_push(&u, 27, 1, gram[1], 0, (long)one, 3, flags[i], 0);
+        sqe[1] = 4;
+        uring_push(&u, 0, 2);
+        um_run(&u, 2, 2, "cut-receive");
+    }
+    write(gram[0], "hel", 3);
+    sqe = unet_push(&u, 27, 1, gram[1], 0, (long)one, 3, MSG_WAITALL, 0);
+    sqe[1] = 4;
+    uring_push(&u, 0, 2);
+    um_run(&u, 2, 2, "whole-receive");
+    write(gram[0], "he", 2);
+    um_push(&u, 10, 1, gram[1], &receive, MSG_WAITALL, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    um_run(&u, 2, 2, "short");
+
+    /* A selected buffer, for which the iovec gives the length alone. */
+    char pool[32];
+    sqe = unet_push(&u, 31, 1, 1, 0, (long)pool, 32, 0, 0);
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "provided");
+    write(gram[0], "selected", 8);
+    receive_iov[0] = (struct iovec){NULL, 6};
+    sqe = um_push(&u, 10, 1, gram[1], &receive, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "select");
+    printf("%.6s flags %#x\n", pool, receive.msg_flags);
+    receive.msg_iovlen = 2;
+    sqe = um_push(&u, 10, 1, gram[1], &receive, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "select-two");
+    receive.msg_iovlen = 0;
+    sqe = um_push(&u, 10, 1, gram[1], &receive, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "select-none");
+
+    /* The end. */
+    receive.msg_iovlen = 1;
+    receive_iov[0] = (struct iovec){one, 3};
+    close(stream[0]);
+    um_push(&u, 10, 1, stream[1], &receive, 0, 0);
+    um_run(&u, 1, 1, "end");
+    send.msg_control = NULL;
+    send.msg_controllen = 0;
+    um_push(&u, 9, 1, stream[1], &send, 0, 0);
+    um_run(&u, 1, 1, "broken");
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's file requests. Linux runs most of them in a worker, so each
    one runs alone or in a link. */
 static int uf_run(struct uring *u, unsigned n, const char *label) {
@@ -43505,6 +43676,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-timeout")) return io_uring_timeout_case();
     if (!strcmp(mode, "io-uring-poll-add")) return io_uring_poll_add_case();
     if (!strcmp(mode, "io-uring-fs")) return io_uring_fs_case();
+    if (!strcmp(mode, "io-uring-message")) return io_uring_message_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

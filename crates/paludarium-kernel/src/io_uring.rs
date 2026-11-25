@@ -10,7 +10,7 @@
 //! `_FADVISE`, `_MADVISE`, `_RENAMEAT`, `_UNLINKAT`, `_MKDIRAT`,
 //! `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE` ([`fs`]), and the single-shot
 //! socket requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
-//! `_SEND` and `_RECV` ([`net`]). The others answer
+//! `_SEND`, `_RECV`, `_SENDMSG` and `_RECVMSG` ([`net`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
@@ -139,7 +139,7 @@ const OP_EPOLL_CTL: u8 = 29;
 const OP_PROVIDE_BUFFERS: u8 = 31;
 const OP_REMOVE_BUFFERS: u8 = 32;
 /// The operations implemented.
-const OPS: [u8; 24] = [
+const OPS: [u8; 26] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
@@ -157,6 +157,8 @@ const OPS: [u8; 24] = [
     net::OP_CONNECT,
     net::OP_SEND,
     net::OP_RECV,
+    net::OP_SENDMSG,
+    net::OP_RECVMSG,
     net::OP_SHUTDOWN,
     net::OP_SOCKET,
     timeout::OP_TIMEOUT,
@@ -1176,10 +1178,14 @@ impl Ring {
             if flags & !SQE_VALID_FLAGS != 0 {
                 return fail(request, Errno::EINVAL);
             }
-            // Only the reads, sends and receives select a buffer
+            // Only the reads, sends and receives, but no `IORING_OP_SENDMSG`,
+            // select a buffer
             // (`buffer_select`).
             if flags & IOSQE_BUFFER_SELECT != 0
-                && !matches!(opcode, OP_READ | OP_READV | net::OP_SEND | net::OP_RECV)
+                && !matches!(
+                    opcode,
+                    OP_READ | OP_READV | net::OP_SEND | net::OP_RECV | net::OP_RECVMSG
+                )
             {
                 return fail(request, EOPNOTSUPP);
             }
@@ -1196,8 +1202,11 @@ impl Ring {
         );
         // Only the transfers take a priority, and an accept, a send and a
         // receive their flags there (`ioprio`).
-        let takes_ioprio =
-            transfer || matches!(opcode, net::OP_ACCEPT | net::OP_SEND | net::OP_RECV);
+        let takes_ioprio = transfer
+            || matches!(
+                opcode,
+                net::OP_ACCEPT | net::OP_SEND | net::OP_RECV | net::OP_SENDMSG | net::OP_RECVMSG
+            );
         if supported(opcode) && !takes_ioprio && u16::from_le_bytes([sqe[2], sqe[3]]) != 0 {
             return fail(request, Errno::EINVAL);
         }
@@ -1320,7 +1329,9 @@ impl Ring {
             | net::OP_ACCEPT
             | net::OP_CONNECT
             | net::OP_SEND
-            | net::OP_RECV => match net::prepare(opcode, flags, sqe) {
+            | net::OP_RECV
+            | net::OP_SENDMSG
+            | net::OP_RECVMSG => match net::prepare(opcode, flags, sqe) {
                 Ok(work) => work,
                 Err(e) => return fail(request, e),
             },

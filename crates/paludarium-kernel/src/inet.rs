@@ -14,6 +14,7 @@
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::interface::Flow6;
+use crate::loopback::segments::Push;
 use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::{Timeout, Timestamps};
 use crate::syscalls::Context;
@@ -93,6 +94,7 @@ const MSG_CTRUNC: u32 = 0x8;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_WAITALL: u64 = 0x100;
 const MSG_NOSIGNAL: u64 = 0x4000;
+const MSG_MORE: u64 = 0x8000;
 /// The DNS port, whose datagrams the stub answers.
 const DNS: u16 = 53;
 /// How long a resolved name is reused before it is looked up again.
@@ -2296,9 +2298,10 @@ impl InetSocket {
     }
     /// `write` for the task whose real user and group IDs are `ids`.
     pub(crate) fn write_as(&self, buf: &[u8], ids: (u32, u32)) -> Result<usize, Errno> {
-        self.send(buf, None, false, ids)
+        self.send(buf, None, Push::default(), ids)
     }
-    /// Sends `bytes`, the last of them `urgent` (`MSG_OOB`): a TCP socket
+    /// Sends `bytes` as `push` says, the last of them urgent with
+    /// `MSG_OOB`: a TCP socket
     /// never connected, or shut down for sending, is `EPIPE`; a failed one
     /// gives its pending error first. Only the guest's own loopback carries
     /// the urgent byte as such. A datagram goes to `to`, or the peer, for
@@ -2308,12 +2311,13 @@ impl InetSocket {
         &self,
         bytes: &[u8],
         to: Option<SocketAddr>,
-        urgent: bool,
+        push: Push,
         ids: (u32, u32),
     ) -> Result<usize, Errno> {
         if self.datagram {
             return self.send_datagram(bytes, to, ids);
         }
+        let no_delay = self.options().no_delay;
         let mut s = self.lock();
         s.note();
         let Some(stream) = s.stream.clone() else {
@@ -2324,6 +2328,9 @@ impl InetSocket {
         // which Linux's `sk_stream_wait_connect` refuses without
         // `SOCKWQ_ASYNC_NOSPACE`.
         let was_open = stream.phase() == Phase::Open;
+        if let Some((link, side)) = Self::joined(&s) {
+            link.sending(side, Push { no_delay, ..push });
+        }
         let written = stream.write(bytes);
         if let Ok(n) = written
             && n > 0
@@ -2332,7 +2339,7 @@ impl InetSocket {
             s.counts.wrote = self.now();
         }
         if let (Ok(n), Some((link, side))) = (&written, Self::joined(&s)) {
-            let last = bytes[..*n].last().copied().filter(|_| urgent);
+            let last = bytes[..*n].last().copied().filter(|_| push.urgent);
             link.wrote(side, *n, last);
         }
         match written {
@@ -3548,7 +3555,7 @@ impl InetSocket {
             listen.drops += 1;
             return Knock::Full;
         }
-        let child = listener.child((theirs, locked, filtering), stream, link, from, to);
+        let child = listener.child((theirs, locked, filtering), stream, link, (from, to, dif));
         listen.ready.push_back(child);
         listen.arrivals += 1;
         drop(state);
@@ -3562,18 +3569,28 @@ impl InetSocket {
         self.hub.changed();
     }
     /// The accepted side of a connection from `stream` at `from` to this
-    /// listener at `to`, joined to it through `link`. It takes this
-    /// socket's options and whether the guest bound its port (`locked`), as
-    /// Linux's `sk_clone_lock` copies them with `sk_userlocks`, and holds
-    /// the listener's port on `to`.
+    /// listener at `to`, which came in on the device `dif`, joined to it
+    /// through `link`. It takes this socket's options and whether the guest
+    /// bound its port (`locked`), as Linux's `sk_clone_lock` copies them
+    /// with `sk_userlocks`, and holds the listener's port on `to`. From a
+    /// link-local address, `dif` is its device where the listener has none
+    /// (`tcp_v6_init_req`); an IPv6 one's `IPV6_MULTICAST_IF` is `dif`, not
+    /// the listener's (`tcp_v6_syn_recv_sock`, `tcp_v6_mapped_child_init`).
     fn child(
         &self,
-        (options, locked, filtering): (Options, bool, crate::sockets::FilterSlot),
+        (mut options, locked, filtering): (Options, bool, crate::sockets::FilterSlot),
         stream: &Arc<Stream>,
         (link, notify): (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
-        from: SocketAddr,
-        to: SocketAddr,
+        (from, to, dif): (SocketAddr, SocketAddr, u32),
     ) -> Arc<InetSocket> {
+        if self.family == Family::V6 {
+            options.multicast_device = dif;
+            if options.device == 0
+                && matches!(from.ip(), IpAddr::V6(ip) if ip.is_unicast_link_local())
+            {
+                options.device = dif;
+            }
+        }
         let child = InetSocket::new(self.family, false, &self.network, &self.host, &self.hub, 0);
         *child.options() = options;
         // `sk_clone_lock` copies the listener's `sk_uid`.
@@ -3827,8 +3844,7 @@ impl InetSocket {
                 (theirs, locked, filtering),
                 &stream,
                 (&link, &notify),
-                from,
-                to,
+                (from, to, dif),
             );
             listen.ready.push_back(child);
             listen.arrivals += 1;
@@ -4138,7 +4154,7 @@ impl FileHandle for InetSocket {
             self.uid.load(Ordering::SeqCst),
             self.gid.load(Ordering::SeqCst),
         );
-        self.send(buf, None, false, ids)
+        self.send(buf, None, Push::default(), ids)
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)
@@ -4456,7 +4472,7 @@ impl InetSocket {
                 match (ready.write_closed, ready.read_closed) {
                     (false, false) => TCP_ESTABLISHED,
                     (false, true) => TCP_CLOSE_WAIT,
-                    (true, false) if unsent > 0 => TCP_FIN_WAIT1,
+                    (true, false) if unsent > 0 || Self::end_waits(&s) => TCP_FIN_WAIT1,
                     (true, false) => TCP_FIN_WAIT2,
                     (true, true) if unsent > 0 => TCP_LAST_ACK,
                     (true, true) => {
@@ -4522,6 +4538,10 @@ impl InetSocket {
             })
             .map(|syn| (syn.tries as u8, syn.next()))
     }
+    /// Whether this side's end has gone and waits for its acknowledgement.
+    fn end_waits(s: &State) -> bool {
+        Self::joined(s).is_some_and(|(link, side)| link.segments(side).end_waits)
+    }
     /// What `tcp_get_info` tells of this socket at `now`, on the host's
     /// monotonic clock: a listener's queue, a handshake's tries, or what
     /// its connection has carried (see [`tcp_info`]).
@@ -4558,7 +4578,7 @@ impl InetSocket {
             Phase::Open => match (ready.write_closed, ready.read_closed) {
                 (false, false) => TCP_ESTABLISHED,
                 (false, true) => TCP_CLOSE_WAIT,
-                (true, false) if unsent > 0 => TCP_FIN_WAIT1,
+                (true, false) if unsent > 0 || Self::end_waits(s) => TCP_FIN_WAIT1,
                 (true, false) => TCP_FIN_WAIT2,
                 (true, true) if unsent > 0 => TCP_LAST_ACK,
                 (true, true) => TCP_CLOSE,
@@ -4576,6 +4596,7 @@ impl InetSocket {
             since_sent: since(counts.wrote.or(counts.opened)),
             since_received: since(counts.came.or(counts.opened)),
             rcv_wscale: counts.rcv_wscale,
+            segments: Self::joined(s).map(|(link, side)| link.segments(side)),
         };
         let in_flight = u32::from(matches!(state, TCP_FIN_WAIT1 | TCP_LAST_ACK));
         TcpInfo::connected(state, &carried, in_flight)
@@ -4921,6 +4942,7 @@ fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> 
             Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         });
+        let peer = scoped(peer, child.options().device);
         if let Err(e) = write_address(c, &encode_address(socket.family, peer), a[1], a[2]) {
             c.files.unreserve(fd);
             return Err(e);
@@ -4959,7 +4981,14 @@ fn send(
         bytes,
         flags & MSG_NOSIGNAL != 0,
         flags & MSG_DONTWAIT != 0,
-        |part| socket.send(part, to, flags & MSG_OOB != 0, ids),
+        |part| {
+            let push = Push {
+                more: flags & MSG_MORE != 0,
+                urgent: flags & MSG_OOB != 0,
+                ..Push::default()
+            };
+            socket.send(part, to, push, ids)
+        },
     )
 }
 /// Receives for recvfrom or recvmsg: `MSG_PEEK` keeps the bytes, and on
@@ -5043,9 +5072,10 @@ fn option6_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
 /// only on AF_UNIX (`sk_may_scm_recv` adds netlink and Bluetooth for the
 /// first two). Any other option is ENOPROTOOPT. Only
 /// `TCP_NODELAY` reaches the host; the rest are kept for getsockopt.
+/// The options are locked once the value is read: the copy may wait for a
+/// `userfaultfd`, and a TCP socket's readiness takes them.
 fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u64, Errno> {
     let (level, name, at, len) = (a[1], a[2], a[3], a[4]);
-    let mut options = socket.options();
     let tcp = !socket.datagram;
     match (level, name) {
         (1, _) if Timestamps::is_option(name as u32) => {
@@ -5058,7 +5088,10 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 let s = socket.lock();
                 s.listen.is_some() || matches!(s.connection, Connection::Unconnected)
             };
-            options.timestamps.set(name as u32, value, unconnected)?;
+            socket
+                .options()
+                .timestamps
+                .set(name as u32, value, unconnected)?;
         }
         (1, 16 | 34 | 76 | 83) => {
             option_int(c, at, len)?;
@@ -5069,7 +5102,6 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         // not its options', holds the filter.
         (1, 26 | 27 | 44 | 50) => {
             let value = option_int(c, at, len)?;
-            drop(options);
             return crate::sockets::set_filter(
                 c,
                 socket,
@@ -5101,7 +5133,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     .map(|d| d.index.unsigned_abs())
                     .ok_or(ENODEV)?
             };
-            bind_to_device(c, socket, &mut options, index.cast_signed())?;
+            bind_to_device(c, socket, &mut socket.options(), index.cast_signed())?;
         }
         // `IPV6_MULTICAST_IF` (`do_ipv6_setsockopt`, before the socket's
         // lock): not for TCP (`ENOPROTOOPT`); a device of the namespace
@@ -5114,6 +5146,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             if (len as u32 as i32) < 4 {
                 return Err(Errno::EINVAL);
             }
+            let mut options = socket.options();
             if value != 0 {
                 if !socket.network.has_device(value) {
                     return Err(ENODEV);
@@ -5134,6 +5167,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 return Err(Errno::EINVAL);
             }
             let index = u32::from_be_bytes(value.to_le_bytes());
+            let mut options = socket.options();
             if index != 0 {
                 if !socket.network.has_device(index) {
                     return Err(EADDRNOTAVAIL);
@@ -5158,6 +5192,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 .read(GuestAddr(at), &mut raw)
                 .map_err(|_| Errno::EFAULT)?;
             let index = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+            let mut options = socket.options();
             if options.device != 0 && options.device != index {
                 return Err(Errno::EINVAL);
             }
@@ -5173,6 +5208,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 .map_err(|_| Errno::EFAULT)?;
             let word = |i: usize| i64::from_le_bytes(raw[i..i + 8].try_into().unwrap_or_default());
             let timeout = Timeout::from_timeval(word(0), word(8))?;
+            let mut options = socket.options();
             if matches!(name, 20 | 66) {
                 options.receive_timeout = timeout;
             } else {
@@ -5189,13 +5225,14 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 .map_err(|_| Errno::EFAULT)?;
             let on = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
             let seconds = i32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-            options.linger = (on != 0).then_some(seconds);
+            socket.options().linger = (on != 0).then_some(seconds);
         }
         (1, 2 | 6 | 7 | 8 | 9 | 10 | 12 | 15 | 62)
         | (6, 1 | 4 | 5 | 6 | 12 | 18)
         | (0, 1)
         | (41, 26) => {
             let value = option_int(c, at, len)?;
+            let mut options = socket.options();
             match (level, name) {
                 (1, 2 | 15) => {
                     if name == 2 {
@@ -5228,8 +5265,12 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, _) if !tcp => return Err(ENOPROTOOPT),
                 (6, 1) => {
                     options.no_delay = value != 0;
-                    if let Some(stream) = &socket.lock().stream {
+                    let s = socket.lock();
+                    if let Some(stream) = &s.stream {
                         stream.set_nodelay(value != 0);
+                    }
+                    if let Some((link, side)) = InetSocket::joined(&s) {
+                        link.set_no_delay(side, value != 0);
                     }
                 }
                 (6, 4 | 5) if !(1..=32767).contains(&value) => return Err(Errno::EINVAL),
@@ -5237,7 +5278,12 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, 5) => options.keep_interval = value,
                 (6, 6) if !(1..=127).contains(&value) => return Err(Errno::EINVAL),
                 (6, 6) => options.keep_count = value,
-                (6, 12) => options.quick_ack = value != 0,
+                (6, 12) => {
+                    options.quick_ack = value != 0;
+                    if let Some((link, side)) = InetSocket::joined(&socket.lock()) {
+                        link.set_quick(side, value);
+                    }
+                }
                 (6, 18) if value < 0 => return Err(Errno::EINVAL),
                 (6, 18) => options.user_timeout = value,
                 // A new type of service sets the priority too
@@ -5261,8 +5307,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         _ => return Err(ENOPROTOOPT),
     }
     if tcp && level == 1 && matches!(name, 7 | 8) {
-        let now = *options;
-        drop(options);
+        let now = *socket.options();
         let stream = {
             let s = socket.lock();
             s.link.as_ref().and(s.stream.clone())

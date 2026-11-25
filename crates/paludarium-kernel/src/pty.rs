@@ -2143,7 +2143,12 @@ fn terminal_ioctl(
             let bytes = terminal.lock().termios.encode(request == TCGETS2);
             write_bytes(c, arg, &bytes)
         }
-        TCGETA => write_bytes(c, arg, &terminal.lock().termios.termio()),
+        TCGETA => {
+            // Copied out with the terminal's lock let go, as Linux holds
+            // none: the copy may wait for a `userfaultfd`.
+            let bytes = terminal.lock().termios.termio();
+            write_bytes(c, arg, &bytes)
+        }
         TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 | TCSETA | TCSETAW | TCSETAF => {
             check_change(c, &terminal, SIGTTOU)?;
             let termio = matches!(request, TCSETA | TCSETAW | TCSETAF);

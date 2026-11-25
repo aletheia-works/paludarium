@@ -4,7 +4,11 @@
    missing pages: the messages a read gives, UFFDIO_COPY, UFFDIO_ZEROPAGE,
    UFFDIO_WAKE and UFFDIO_UNREGISTER ending the wait, the features
    THREAD_ID, EXACT_ADDRESS and SIGBUS, a signal during the wait, closing
-   the file, fork, and shared anonymous memory; and write protection:
+   the file, fork, and shared anonymous memory; the kernel's own faults
+   (get_user_pages): process_vm_readv and process_vm_writev, whose pages
+   fault in before any is copied, MADV_POPULATE_READ and _WRITE, mlock,
+   futex words, /proc/self/mem and ptrace, which do not wait, another
+   process's memory, and a copy whose userfaultfd is closed; and write protection:
    UFFDIO_REGISTER_MODE_WP (the `uw` of smaps), UFFDIO_WRITEPROTECT and
    UFFDIO_COPY_MODE_WP, the faults of writes to protected pages, which
    end with the protection, and what mprotect, fork and unregistering do
@@ -64,10 +68,12 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/ptrace.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1922,6 +1928,176 @@ static int case_events(void) {
     return 0;
 }
 
+/* A system call another thread makes. */
+struct sys {
+    long nr, args[6], ret;
+    int error;
+    volatile pid_t tid;
+};
+
+static void *make(void *with) {
+    struct sys *s = with;
+    s->tid = (pid_t)syscall(SYS_gettid);
+    errno = 0;
+    s->ret = syscall(s->nr, s->args[0], s->args[1], s->args[2], s->args[3], s->args[4], s->args[5]);
+    s->error = errno;
+    return NULL;
+}
+
+/* Makes `s` in a thread, and fills the page of `base` its fault names with
+   `fill` `times` times, or with 0 unmaps the page and wakes it, or with no `fill`
+   closes `fd`. */
+static void served(const char *name, int fd, char *base, struct sys s, char fill, int times) {
+    pthread_t thread;
+    pthread_create(&thread, NULL, make, &s);
+    while (!s.tid)
+        usleep(1000);
+    char src[PAGE];
+    memset(src, fill, sizeof src);
+    for (int i = 0; i < times || (!times && !i); i++) {
+        printf("%s polled: %d\n", name, wait_message(fd));
+        struct uffd_msg msg;
+        long n = read(fd, &msg, sizeof msg);
+        long at = (long)(msg.address - (uintptr_t)base);
+        printf("%s fault: %ld flags %#llx at %ld thread %d\n", name, n, (unsigned long long)msg.flags,
+               at, msg.ptid == (uint32_t)s.tid);
+        /* The queues of futexes are free meanwhile. */
+        int other = 0;
+        syscall(SYS_futex, &other, 129 /* FUTEX_WAKE_PRIVATE */, 1, NULL, NULL, 0);
+        if (times)
+            printf("%s fill: %s\n", name, err(copy(fd, base + at, src, PAGE, 0, NULL)));
+        else if (fill) {
+            /* The unmap leaves the wait, as the context has no events. */
+            printf("%s unmap: %s\n", name, err(munmap(base + at, PAGE)));
+            ioctl(fd, UFFDIO_WAKE, &(struct uffdio_range){(uintptr_t)base + at, PAGE});
+        } else
+            close(fd);
+    }
+    pthread_join(thread, NULL);
+    printf("%s: %ld %s\n", name, s.ret, s.ret < 0 ? strerror(s.error) : "");
+}
+
+/* Another process's memory: process_vm_readv waits for the page there,
+   whose handler is in that process, and ptrace's peek and poke fail. */
+static void other_process(void) {
+    char *base = anon(2 * PAGE);
+    int up[2];
+    pipe(up);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int fd = ready(O_NONBLOCK, 0);
+        reg(fd, base, 2 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        write(up[1], "r", 1);
+        wait_message(fd);
+        struct uffd_msg msg;
+        char src[PAGE];
+        memset(src, 'c', sizeof src);
+        if (read(fd, &msg, sizeof msg) == sizeof msg)
+            copy(fd, (char *)(uintptr_t)msg.address, src, PAGE, 0, NULL);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    char buf[8] = "";
+    read(up[0], buf, 1);
+    struct iovec local = {buf, 4}, remote = {base, 4};
+    printf("other readv: %s", err(process_vm_readv(child, &local, 1, &remote, 1, 0)));
+    printf(" %s\n", buf);
+    int status;
+    waitpid(child, &status, 0);
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, child, base + PAGE, NULL);
+    printf("peek: %ld %s\n", word, strerror(errno));
+    printf("poke: %s\n", err(ptrace(PTRACE_POKEDATA, child, base + PAGE, NULL)));
+    errno = 0;
+    word = ptrace(PTRACE_PEEKDATA, child, base, NULL);
+    printf("peek filled: %#lx %s\n", word, strerror(errno));
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+    close(up[0]);
+    close(up[1]);
+}
+
+static int case_gup(void) {
+    int fd = ready(O_NONBLOCK, UFFD_FEATURE_THREAD_ID);
+    char *base = anon(16 * PAGE);
+    printf("register: %s\n", err(reg(fd, base, 16 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    char buf[8] = "outside";
+    struct iovec local = {buf, 6}, remote = {base + 8, 6};
+    long pid = getpid();
+    struct sys readv = {SYS_process_vm_readv, {pid, (long)&local, 1, (long)&remote, 1, 0}, 0, 0, 0};
+    struct sys writev = {SYS_process_vm_writev, {pid, (long)&local, 1, (long)&remote, 1, 0}, 0, 0, 0};
+    served("readv", fd, base, readv, 'r', 1);
+    printf("buf: %s\n", buf);
+    remote.iov_base = base + PAGE + 8;
+    served("writev", fd, base, writev, 'w', 1);
+    printf("page: %.4s\n", base + PAGE + 10);
+    /* Every page of the remote buffer faults in, whatever room is left. */
+    remote = (struct iovec){base + PAGE, 3 * PAGE};
+    served("readv whole", fd, base, readv, 'a', 2);
+    struct sys populate = {SYS_madvise, {(long)base + 4 * PAGE, PAGE, MADV_POPULATE_READ, 0, 0, 0}, 0, 0, 0};
+    served("populate read", fd, base, populate, 'p', 1);
+    populate.args[0] += PAGE;
+    populate.args[2] = MADV_POPULATE_READ + 1;
+    served("populate write", fd, base, populate, 'q', 1);
+    struct sys lock = {SYS_mlock, {(long)base + 6 * PAGE, 2 * PAGE, 0, 0, 0, 0}, 0, 0, 0};
+    served("mlock", fd, base, lock, 'l', 2);
+    printf("pages: %c %c %c %c\n", base[4 * PAGE], base[5 * PAGE], base[6 * PAGE], base[7 * PAGE]);
+    munlock(base + 6 * PAGE, 2 * PAGE);
+    populate.args[0] = (long)base + 8 * PAGE;
+    served("populate unmapped", fd, base, populate, 'u', 0);
+    /* A futex word: FUTEX_WAIT's read of a private one, a shared one's key,
+       and FUTEX_WAKE_OP, whose fault does not wait. */
+    struct sys futex = {SYS_futex, {(long)base + 9 * PAGE, 128, 7, 0, 0, 0}, 0, 0, 0};
+    served("futex wait", fd, base, futex, 'f', 1);
+    futex = (struct sys){SYS_futex, {(long)base + 10 * PAGE, 132, 1, 1, (long)base, 7}, 0, 0, 0};
+    served("futex requeue", fd, base, futex, 'f', 1);
+    futex = (struct sys){SYS_futex, {(long)base + 11 * PAGE, 1, 1, 0, 0, 0}, 0, 0, 0};
+    served("futex wake shared", fd, base, futex, 'f', 1);
+    printf("futex wake op: %s\n",
+           err(syscall(SYS_futex, base, 133, 1, 1, base + 12 * PAGE, 0)));
+    /* /proc/self/mem does not wait. */
+    int mem = open("/proc/self/mem", O_RDWR);
+    off_t at = (off_t)(uintptr_t)base + 12 * PAGE;
+    printf("mem read: %s\n", err(pread(mem, buf, 4, at)));
+    printf("mem write: %s\n", err(pwrite(mem, buf, 4, at)));
+    int pipes[2];
+    pipe(pipes);
+    struct sys out = {SYS_write, {pipes[1], (long)base + 12 * PAGE, 4, 0, 0, 0}, 0, 0, 0};
+    served("closed", fd, base, out, 0, 0);
+    printf("closed byte: %d\n", base[12 * PAGE]);
+    /* A context of user faults alone. */
+    int user = ready(O_NONBLOCK | UFFD_USER_MODE_ONLY, 0);
+    char *other = anon(4 * PAGE);
+    reg(user, other, 4 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+    remote = (struct iovec){other, 6};
+    printf("user readv: %s\n", err(process_vm_readv((pid_t)pid, &local, 1, &remote, 1, 0)));
+    printf("user writev: %s\n", err(process_vm_writev((pid_t)pid, &local, 1, &remote, 1, 0)));
+    printf("user populate read: %s\n", err(madvise(other, PAGE, MADV_POPULATE_READ)));
+    printf("user populate write: %s\n", err(madvise(other, PAGE, MADV_POPULATE_READ + 1)));
+    printf("user mlock: %s\n", err(mlock(other, PAGE)));
+    munlock(other, PAGE);
+    printf("user futex: %s\n", err(syscall(SYS_futex, other, 0, 7, NULL, NULL, 0)));
+    unsigned char in = 1;
+    mincore(other, PAGE, &in);
+    printf("user missing: %d\n", !(in & 1));
+    /* A forced write meets write protection, and a forced read does not. */
+    int wp = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP);
+    char *guarded = anon(PAGE);
+    memcpy(guarded, "here", 4);
+    reg(wp, guarded, PAGE, UFFDIO_REGISTER_MODE_WP, NULL);
+    printf("protect: %s\n", err(protect(wp, guarded, PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    at = (off_t)(uintptr_t)guarded;
+    printf("mem read protected: %s\n", err(pread(mem, buf, 4, at)));
+    printf("mem write protected: %s\n", err(pwrite(mem, "over", 4, at)));
+    printf("unprotect: %s\n", err(protect(wp, guarded, PAGE, 0)));
+    printf("mem write: %s", err(pwrite(mem, "over", 4, at)));
+    printf(" %.4s\n", guarded);
+    other_process();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1929,6 +2105,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-calls")) return case_calls();
     if (!strcmp(mode, "userfaultfd-faults")) return case_faults();
     if (!strcmp(mode, "userfaultfd-signals")) return case_signals();
+    if (!strcmp(mode, "userfaultfd-gup")) return case_gup();
     if (!strcmp(mode, "userfaultfd-sigbus")) return case_sigbus();
     if (!strcmp(mode, "userfaultfd-shared")) return case_shared();
     if (!strcmp(mode, "userfaultfd-wp")) return case_wp();

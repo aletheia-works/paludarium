@@ -2168,6 +2168,27 @@ fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_on
     assert!(f.ret(2, &[path, 0]) < 1 << 32);
 }
 #[test]
+fn proc_files_read_at_an_offset_do_not_map() {
+    let mut f = fixture();
+    for path in [
+        &b"/proc/self/mem\0"[..],
+        b"/proc/self/pagemap\0",
+        b"/proc/self/clear_refs\0",
+    ] {
+        f.mem.write(GuestAddr(DATA), path).unwrap();
+        let fd = f.ret(2, &[DATA, 2]);
+        assert!(fd < 1 << 32, "{fd:#x}");
+        // PROT_READ, MAP_PRIVATE and MAP_SHARED.
+        for flags in [2, 1] {
+            assert_eq!(
+                f.ret(9, &[0, 4096, 1, flags, fd, 0]),
+                errno(Errno::ENODEV),
+                "{path:?}"
+            );
+        }
+    }
+}
+#[test]
 fn proc_mem_reads_and_writes_the_process_memory_through_the_system_calls() {
     let mut f = fixture();
     let (path, buf) = (DATA, DATA + 0x400);
@@ -5410,6 +5431,40 @@ mod io_uring {
     }
 
     #[test]
+    fn a_registered_buffer_keeps_its_pages_past_munmap() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let vec = DATA + 0x100;
+        let page = f.ret(9, &[0, 4096, 3, 0x22, u64::MAX, 0]);
+        f.mem.write(GuestAddr(page), b"old!").unwrap();
+        iovecs(&f, vec, &[(page, 4096)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), 0);
+        f.mem.write(GuestAddr(DATA), b"/b\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        // A write moves the pinned page, which nothing maps any more.
+        assert_eq!(f.ret(11, &[page, 4096]), 0);
+        assert_eq!(one(&mut f, &r, &fixed(WRITE_FIXED, fd, 0, page, 4, 0)), 4);
+        assert_eq!(f.ret(17, &[fd, DATA + 0x200, 4, 0]), 4);
+        assert_eq!(bytes(&f, DATA + 0x200, 4), b"old!");
+        // A read lands there too, not in a new mapping at the address.
+        assert_eq!(f.ret(9, &[page, 4096, 3, 0x32, u64::MAX, 0]), page);
+        assert_eq!(one(&mut f, &r, &fixed(READ_FIXED, fd, 0, page, 4, 0)), 4);
+        assert_eq!(bytes(&f, page, 4), [0; 4]);
+        // A page made read-only takes a read through the pin.
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        iovecs(&f, vec, &[(page, 4096)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), 0);
+        assert_eq!(f.ret(10, &[page, 4096, 1]), 0);
+        assert_eq!(one(&mut f, &r, &fixed(READ_FIXED, fd, 0, page, 4, 0)), 4);
+        assert_eq!(bytes(&f, page, 4), b"old!");
+        // PROT_NONE is refused.
+        let none = f.ret(9, &[0, 4096, 0, 0x22, u64::MAX, 0]);
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        iovecs(&f, vec, &[(none, 4096)]);
+        assert_eq!(f.ret(427, &[r.fd, 0, vec, 1]), errno(Errno::EFAULT));
+    }
+
+    #[test]
     fn a_write_that_would_wait_is_heard_of_only_with_nowait() {
         let mut f = fixture();
         let r = ring(&mut f);
@@ -6156,6 +6211,70 @@ mod io_uring {
         assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
         assert_eq!(reap(&mut f, &r), [(1, -125)]);
         assert_eq!(f.ret(0, &[read, buf, 8]), 2);
+    }
+
+    /// A thread whose call queues an exited thread's work does not wait for
+    /// a ring another thread holds, which may wait for a page it is to fill:
+    /// Linux's worker runs the work (`io_fallback_req_func`).
+    #[test]
+    fn an_exited_threads_work_waits_for_its_ring_alone() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        assert_eq!(
+            child_submits_and_exits(&mut f, &r, &rw(READ, read, HERE, buf, 8), false),
+            []
+        );
+        let file = f.kernel.files.descriptor(r.fd).unwrap().file;
+        let held = crate::io_uring::hold(&file);
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), []);
+        drop(held);
+        // The next checkpoint, as the holder's own call has one.
+        f.ret(39, &[]);
+        assert_eq!(reap(&mut f, &r), [(1, -125)]);
+    }
+
+    /// A ring that closes with such work left lets go of the file the
+    /// request holds before the call that let go of the ring returns, as
+    /// Linux's `io_ring_ctx_wait_and_kill` does (`flush_delayed_work`).
+    #[test]
+    fn a_ring_that_closes_drops_the_work_left_for_its_holder() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        fds(&f, DATA + 0x400, &[read as i32]);
+        assert_eq!(f.ret(427, &[r.fd, 2, DATA + 0x400, 1]), 0);
+        assert_eq!(
+            child_submits_and_exits(&mut f, &r, &on_slot(READ, 0, HERE, buf, 8), false),
+            []
+        );
+        // SIGPIPE is ignored, so a write without a reader gives EPIPE.
+        f.mem.write(GuestAddr(DATA + 0x100), &[0; 32]).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(13, &[13, DATA + 0x100, 0, 8]), 0);
+        let file = f.kernel.files.descriptor(r.fd).unwrap().file;
+        let held = crate::io_uring::hold(&file);
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(f.ret(3, &[read]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        assert_eq!(f.ret(11, &[r.rings, r.array + 16]), 0);
+        assert_eq!(f.ret(11, &[r.sqes, 4096]), 0);
+        assert_eq!(f.ret(3, &[r.fd]), 0);
+        // The request still holds the pipe's only reader.
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        drop(held);
+        drop(file);
+        f.ret(39, &[]);
+        assert_eq!(f.ret(1, &[write, DATA, 2]), errno(Errno::EPIPE));
     }
 
     #[test]
@@ -7611,6 +7730,40 @@ mod inotify {
         let n = f.ret(1, &[fd, BUF, text.len() as u64]);
         assert_eq!(f.ret(3, &[fd]), 0);
         n
+    }
+    #[test]
+    fn the_last_mapping_of_an_unlinked_file_lets_it_go() {
+        let mut f = fixture();
+        // A watched file of one page, mapped, its descriptor closed, then
+        // unlinked: the mapping holds it (`vm_file`), so it is only
+        // IN_ATTRIB until the mapping goes, and then IN_DELETE_SELF and
+        // IN_IGNORED, as the mapping's name lets go before its file.
+        let path = put(&f, DATA + 0x400, b"/held-map");
+        let fd = f.ret(2, &[path, 0o102, 0o644]);
+        assert!(fd < 1 << 32, "{fd:#x}");
+        assert_eq!(f.ret(77, &[fd, 0x1000]), 0);
+        let ifd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let wd = f.ret(ADD, &[ifd, path, 0xfff]);
+        assert!((wd as i64) > 0, "{wd:#x}");
+        let at = f.ret(9, &[0, 0x1000, 1, 1, fd, 0]);
+        assert!(at < 1 << 47, "{at:#x}");
+        assert_eq!(f.ret(3, &[fd]), 0);
+        let _ = events(&mut f, ifd);
+        assert_eq!(f.ret(87, &[path]), 0);
+        let unlinked = events(&mut f, ifd);
+        assert!(
+            masks(&unlinked)
+                .iter()
+                .all(|&(_, mask, _)| mask & 0x8400 == 0),
+            "{unlinked:?}"
+        );
+        assert_eq!(f.ret(11, &[at, 0x1000]), 0);
+        let unmapped = events(&mut f, ifd);
+        let got: Vec<u32> = masks(&unmapped).iter().map(|&(_, mask, _)| mask).collect();
+        assert!(
+            got.contains(&0x400) && got.contains(&0x8000),
+            "{unmapped:?}"
+        );
     }
     #[test]
     fn an_async_instance_signals_its_owner_for_each_event_it_queues() {
@@ -12369,6 +12522,51 @@ mod context_switches {
         assert_eq!(f.mem.read_u64(GuestAddr(at + 136)).unwrap(), 0);
         assert_eq!(f.ret(98, &[u64::MAX, at]), 0);
         assert_eq!(nvcsw(&f, at), 0);
+    }
+}
+
+mod mapping_names {
+    use super::*;
+
+    /// The name the VMA at `at` shows in `/proc/self/maps` and a core.
+    fn name(f: &Fixture, at: u64) -> Option<Vec<u8>> {
+        f.mem.view().vma_from(at)?.file?.name
+    }
+
+    #[test]
+    fn a_mapped_file_is_named_where_renames_move_it_and_marked_once_removed() {
+        let mut f = fixture();
+        let path = |f: &Fixture, at: u64, p: &[u8]| {
+            f.mem.write(GuestAddr(at), &[p, b"\0"].concat()).unwrap();
+            at
+        };
+        // mkdir("/dir"), open("/dir/file", O_RDWR | O_CREAT), one page.
+        let dir = path(&f, DATA, b"/dir");
+        assert_eq!(f.ret(83, &[dir, 0o755]), 0);
+        let file = path(&f, DATA + 0x100, b"/dir/file");
+        let fd = f.ret(2, &[file, 0o102, 0o644]);
+        assert!(fd < 1 << 32, "{fd:#x}");
+        assert_eq!(f.ret(77, &[fd, 0x1000]), 0);
+        for (flags, label) in [(1u64, "shared"), (2, "private")] {
+            let at = f.ret(9, &[0, 0x1000, 1, flags, fd, 0]);
+            assert!(at < 1 << 47, "{label}: {at:#x}");
+            assert_eq!(name(&f, at).as_deref(), Some(&b"/dir/file"[..]), "{label}");
+        }
+        let shared = f.ret(9, &[0, 0x1000, 1, 1, fd, 0]);
+        // rename("/dir/file", "/dir/moved"), then rename("/dir", "/top").
+        let moved = path(&f, DATA + 0x200, b"/dir/moved");
+        assert_eq!(f.ret(82, &[file, moved]), 0);
+        assert_eq!(name(&f, shared).as_deref(), Some(&b"/dir/moved"[..]));
+        let top = path(&f, DATA + 0x300, b"/top");
+        assert_eq!(f.ret(82, &[dir, top]), 0);
+        assert_eq!(name(&f, shared).as_deref(), Some(&b"/top/moved"[..]));
+        // unlink("/top/moved"): the name it has then, marked.
+        let gone = path(&f, DATA + 0x400, b"/top/moved");
+        assert_eq!(f.ret(87, &[gone]), 0);
+        assert_eq!(
+            name(&f, shared).as_deref(),
+            Some(&b"/top/moved (deleted)"[..])
+        );
     }
 }
 

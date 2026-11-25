@@ -528,6 +528,11 @@ kernel.
   host that cannot tell (Windows) keeps it always readable. The output
   streams are always writable. A pipe's read end is readable only with unread data, and only hung up once
   its writers are gone, as Linux's `pipe_poll` reports.
+  A file without a poll of its own (a regular file, a directory, `/dev/null`,
+  `/dev/zero`, `/dev/full` and `/dev/urandom`, a file of a process's `/proc`
+  directory) gives `POLLIN`, `POLLOUT`, `POLLRDNORM` and `POLLWRNORM`
+  (`DEFAULT_POLLMASK`) and `epoll_ctl` refuses it (`EPERM`); `/dev/random`
+  gives `POLLIN` and `POLLRDNORM`.
 
 - `ppoll`, `select` and `pselect6` wait the same way. They write the time
   left back to their timeout (not a zero one), as Linux does, and `ppoll` and
@@ -554,7 +559,7 @@ kernel.
   epoll descriptor or the target), `epoll_wait` and `fcntl`
   (but for `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_DUPFD_QUERY`, `F_GETFD`,
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
-  `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
+  `select` finds it ready in every set. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
 
 - `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`
@@ -1163,9 +1168,17 @@ kernel.
   instruction's do: a system call's own copy to or from a registered page
   waits for it, through any signal that is not fatal, as Linux retries a
   kernel fault (`fault_signal_pending`), and the copy goes on once the page
-  is filled; a SIGKILL, the process's exit or the context's release ends
+  is filled or the context released; a SIGKILL or the process's exit ends
   the wait with `EFAULT`, as does `UFFD_USER_MODE_ONLY` or
-  `UFFD_FEATURE_SIGBUS` at once. `/dev/userfaultfd`, a
+  `UFFD_FEATURE_SIGBUS` at once. A futex word's read waits with the futex
+  queues free. `get_user_pages` waits too where it may drop the space's
+  lock: for `process_vm_readv` and `process_vm_writev`, in the other task's
+  memory and with a buffer's pages faulted in before any is copied, for
+  `MADV_POPULATE_READ`, `MADV_POPULATE_WRITE`, `mlock` and what else brings
+  locked pages in, and for a shared futex's key; it fails where it may not,
+  as for `ptrace` and `/proc/<pid>/mem` (`EIO`), a core dump (a hole),
+  `FUTEX_WAKE_OP`'s word (`EFAULT`) and what `mprotect` brings in (its error
+  ignored). `/dev/userfaultfd`, a
   misc device of root's of mode 0600 (`userfaultfd_misc`, whose minor
   number Linux gives at boot), makes one with its only operation, the
   ioctl `USERFAULTFD_IOC_NEW`, of the flags in the low 32 bits of its
@@ -1709,6 +1722,17 @@ kernel.
   and shared memory cannot grow down (`EINVAL`). The main stack's VMA starts
   at 8 MiB, so with a larger `RLIMIT_STACK` it grows past that.
 
+- Private anonymous memory of whole 2 MiB that `mmap` places without a
+  hint goes at a 2 MiB boundary, as Linux's `thp_get_unmapped_area_vmflags`
+  places it: where `mmap` finds room for 2 MiB more, at the boundary above
+  that room's start when it is one in the top-down layout (so that one
+  such mapping lies right below the last), else at the next one. A move
+  by `mremap` to a length of whole 2 MiB, with no hint, goes there too, and
+  so does a private mapping of `/dev/zero` of any length that reaches 2 MiB
+  past the first boundary after its offset, at the boundary its offset
+  agrees with (`get_unmapped_area_zero`), or at the hint when the longer
+  room fits there.
+
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or
@@ -1900,12 +1924,23 @@ kernel.
     one with no length is an empty slot;
   - a length of 1 byte to 1 GiB (`EFAULT`), and no end past the address
     space (`EOVERFLOW`);
-  - writable pages (`EFAULT`);
+  - its pages pinned for writing (`io_pin_pages`, `FOLL_LONGTERM`), as
+    `check_vma_flags` allows them: `EFAULT` for a page not mapped or not
+    writable, of a `perf` ring or a `memfd_secret` file, or of a shared
+    mapping of a disk file (one whose pages are written back; shared
+    memory, a memfd and tmpfs are pinned, and a private file mapping's copy
+    is);
   - room under RLIMIT_MEMLOCK (`ENOMEM`), shared with the user's other
     rings and `memfd_secret` pages, unless the ring's maker had
     `CAP_IPC_LOCK`.
 
-  A failure registers none of them. `IORING_UNREGISTER_BUFFERS` takes no
+  A failure registers none of them. A fixed transfer moves the pinned
+  pages, whatever maps the address now: after `munmap` it moves the old
+  pages, which a new mapping there does not show, and a page made
+  read-only still takes a read. A process that shares the ring moves the
+  registering process's pages; `fork` gives the child a copy of a pinned
+  private page, so the parent's later writes are what the ring moves
+  (`page_needs_cow_for_dma`). `IORING_UNREGISTER_BUFFERS` takes no
   argument (`EINVAL`) and needs buffers (`ENXIO`). `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
@@ -4349,12 +4384,15 @@ kernel.
   offset in the file, the file's device and inode as `stat` gives them (the
   device as glibc's `major` and `minor` take it apart), and
   the name in Linux's column: the file's path, with a newline in it as
-  `\012`, followed by a space and `(deleted)` once nothing names it, `/memfd:<name> (deleted)`,
+  `\012`, where renames of it or of a directory above it have moved it
+  (`d_move`), followed by a space and `(deleted)` once the name it has is
+  removed, `/memfd:<name> (deleted)`,
   `/dev/zero (deleted)` for shared anonymous memory, `[heap]` or `[stack]`.
   A program's segments and its interpreter's are named as
   `/proc/self/exe` names the program, as Linux's `d_path` of the file:
-  by its path with symbolic links resolved, and `(deleted)` once nothing
-  links it.
+  by its path with symbolic links resolved, moved by renames, and
+  `(deleted)` once that name is removed. A core's `NT_FILE` note names
+  them all the same way.
   It is made as it is read, as Linux's `seq_file` makes it: a read gathers
   whole lines up to a page, goes on from the VMA it found next, and sees the
   mappings of that moment, `lseek` goes from the start or the current
@@ -4469,7 +4507,8 @@ kernel.
   It is the reader's own
   or one it may attach to (`mm_access` with `PTRACE_MODE_ATTACH` and the
   filesystem IDs: `EACCES`), and a task with no memory (a zombie) is
-  `ESRCH`.
+  `ESRCH`. It cannot be mapped, nor can `pagemap` or `clear_refs`
+  (`ENODEV`).
 
 - `/proc/<pid>/clear_refs` (mode 0200, size 0, a thread's too), as Linux's
   `clear_refs_write`: a write's first 12 bytes at most, which is what it
@@ -5994,8 +6033,9 @@ kernel.
     signal (`NT_SIGINFO`), the auxiliary vector its exec saved (Linux's
     `saved_auxv`, whatever the program did to its stack), the mapped files
     (`NT_FILE`:
-    each VMA that maps a file, by its path, followed by `(deleted)` once
-    unlinked, and shared anonymous memory as `/dev/zero (deleted)`, as Linux
+    each VMA that maps a file, where renames have moved it, followed by
+    `(deleted)` once the name it has is removed, as in `/proc/<pid>/maps`,
+    and shared anonymous memory as `/dev/zero (deleted)`, as Linux
     names it) and the memory. It has no `NT_X86_XSTATE` note, as Linux writes
     none on a CPU without XSAVE, which the virtual CPU is. The memory is
     chosen as Linux's `vma_dump_size` chooses it with the default
@@ -6136,7 +6176,10 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     through it; a group of 224.0.0.0/24 or the limited broadcast address
     straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`
     once it has gone, `ENETUNREACH` while it is down. A connection
-    accepted is bound as its listener. Of an IPv6 socket,
+    accepted is bound as its listener, or, where that has no device, one
+    from a link-local address to the device it came in on
+    (`tcp_v6_init_req`), which is also the `IPV6_MULTICAST_IF` of any one
+    accepted on an IPv6 socket (`tcp_v6_syn_recv_sock`). Of an IPv6 socket,
     `IPV6_MULTICAST_IF` (not of TCP, `ENOPROTOOPT`) and `IPV6_UNICAST_IF`
     (in network byte order) take the index of a device (`ENODEV` and
     `EADDRNOTAVAIL` for one there is not), 0 for none, and `IPV6_PKTINFO`
@@ -6146,8 +6189,9 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     without a scope ID, and a UDP `connect`, go through the socket's own
     device, else `IPV6_PKTINFO`'s, else `IPV6_MULTICAST_IF`'s to a group
     and `IPV6_UNICAST_IF`'s to another address (`udpv6_sendmsg`,
-    `ip6_datagram_flow_key_init`): strictly where the socket is bound to no
-    address, or the destination is a group, a link-local address or `::1`;
+    `ip6_datagram_flow_key_init`): strictly where the socket has a device or
+    is bound to no address, or the destination is a group, a link-local
+    address or `::1`;
     else through it rather than another, among the routes of one prefix
     and metric (`rt6_score_route`). Connecting a socket of no device to a
     group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks
@@ -6160,9 +6204,16 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `tcp_syn_linear_timeouts`; a connection, its state, options
     (timestamps, SACK and window scaling), window scales (10, or less for a
     receive buffer the guest set), the bytes it sent, had acknowledged and
-    received with its handshake and ends, those not sent yet, its data
-    segments and the times since data went and came. A UDP socket has no
-    TCP options (`EOPNOTSUPP`).
+    received with its handshake and ends, those not sent yet, its segments
+    and the times since data went and came. On the loopback the segments are
+    those Linux sends: each write its own, held while a small one waits for
+    its acknowledgement (Nagle's algorithm, unless `TCP_NODELAY` or urgent
+    data) or for `MSG_MORE`'s next (up to 201 ms); the first 16
+    acknowledgements at once, then with the data a side replies with, on a
+    read, or after 40 ms (`TCP_QUICKACK` sets which); at most 10 in flight
+    at first; a tail loss probe, which sends the last again; and the end,
+    with the data held before it. `FIN_WAIT1` lasts until the end is
+    acknowledged. A UDP socket has no TCP options (`EOPNOTSUPP`).
   - **Timestamps**: every UDP datagram is stamped as it comes, and
     `recvmsg` gives that time as Linux's `udp_recvmsg` does
     (`sock_recv_timestamp`), however late the receiver took the options:

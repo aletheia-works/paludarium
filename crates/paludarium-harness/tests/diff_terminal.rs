@@ -80,7 +80,8 @@ fn case(name: &'static str, id: usize) {
             .with_file("/prog", binary)
             .with_file("/regular", b"fixture".to_vec());
         let session =
-            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap()).unwrap();
+            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap(), &host)
+                .unwrap();
         let status = session.run().unwrap();
         println!(
             "u9 {id}: native={text:?}, emulated={status:?}/{:02x?}/{:02x?}, stop={:?}",

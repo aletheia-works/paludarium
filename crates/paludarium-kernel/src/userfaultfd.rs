@@ -571,12 +571,13 @@ pub(crate) fn fault(c: &mut Context<'_>, id: u64, access: Access) -> Option<bool
 /// `do_user_addr_fault` serves it as it does an instruction's, growing a
 /// mapping that grows down (`expand_stack`) and waiting for a `userfaultfd`
 /// (`handle_userfault`), unless the context took `UFFD_USER_MODE_ONLY` or
-/// `UFFD_FEATURE_SIGBUS`, or was released (`EFAULT`). Its wait goes on
-/// through a signal that is not fatal, as `fault_signal_pending` ends a
-/// kernel fault's retries only for a fatal one, and ends for a SIGKILL or
-/// the process's exit, which fails the access too.
+/// `UFFD_FEATURE_SIGBUS` (`EFAULT`). Its wait goes on through a signal
+/// that is not fatal, as `fault_signal_pending` ends a kernel fault's
+/// retries only for a fatal one, and ends for a SIGKILL or the process's
+/// exit, which fails the access too; an access whose context is released
+/// is made again, of a page no longer registered. One through
+/// `get_user_pages` waits alike (`FAULT_FLAG_KILLABLE`), but grows nothing.
 pub(crate) struct KernelCopies {
-    pub(crate) mem: MemoryView,
     pub(crate) group: Arc<crate::ThreadGroup>,
     pub(crate) tid: u32,
     /// What the thread waits on: its files' readiness.
@@ -618,19 +619,17 @@ pub(crate) fn mask_changed(mask: u64) {
 }
 
 impl KernelCopies {
-    /// Whether it serves a call of thread `tid` of process `pid` in `mem`,
-    /// with these files, group and inbox: it is kept from call to call.
+    /// Whether it serves a call of thread `tid` of process `pid`, with
+    /// these files, group and inbox: it is kept from call to call.
     pub(crate) fn serves(
         &self,
-        mem: &paludarium_mmu::AddressSpace,
         group: &Arc<crate::ThreadGroup>,
         hub: &Arc<ReadinessHub>,
         inbox: &Arc<crate::inbox::SignalInbox>,
         pid: u32,
         tid: u32,
     ) -> bool {
-        self.mem.is_of(mem)
-            && Arc::ptr_eq(&self.group, group)
+        Arc::ptr_eq(&self.group, group)
             && Arc::ptr_eq(&self.hub, hub)
             && Arc::ptr_eq(&self.inbox, inbox)
             && self.pid == pid
@@ -639,24 +638,32 @@ impl KernelCopies {
 }
 
 impl paludarium_mmu::faults::Resolver for KernelCopies {
-    fn resolve(&self, addr: u64, write: bool) -> bool {
+    fn resolve(&self, space: &MemoryView, addr: u64, write: bool, gup: bool) -> bool {
         let at = GuestAddr(addr);
-        const RLIMIT_STACK: usize = 3;
-        const RLIMIT_MEMLOCK: usize = 8;
-        let stack = self.processes.soft_limit(self.pid, RLIMIT_STACK);
-        let (_, ipc_lock) = CALL.with(core::cell::Cell::get);
-        let lock = if ipc_lock {
-            u64::MAX
+        if gup {
+            // `__get_user_pages` faults no page in with a fatal signal
+            // pending.
+            if self.fatal() {
+                return false;
+            }
         } else {
-            self.processes.soft_limit(self.pid, RLIMIT_MEMLOCK) >> 12
-        };
-        if self.mem.grow_down(at, stack, lock) {
-            return true;
+            const RLIMIT_STACK: usize = 3;
+            const RLIMIT_MEMLOCK: usize = 8;
+            let stack = self.processes.soft_limit(self.pid, RLIMIT_STACK);
+            let lock = if CALL.with(core::cell::Cell::get).1 {
+                u64::MAX
+            } else {
+                self.processes.soft_limit(self.pid, RLIMIT_MEMLOCK) >> 12
+            };
+            if space.grow_down(at, stack, lock) {
+                return true;
+            }
         }
-        let Some((id, reason)) = self.mem.userfault_for(at, write, false) else {
+        let Some((id, reason)) = space.userfault_for(at, write, false) else {
             return false;
         };
         self.wait(
+            space,
             id,
             Access {
                 address: addr,
@@ -674,26 +681,28 @@ impl KernelCopies {
         self.group
             .fatal_pending(&self.inbox, CALL.with(core::cell::Cell::get).0)
     }
-    fn still_faults(&self, id: u64, access: &Access) -> bool {
-        self.mem
-            .userfault_for(GuestAddr(access.address), access.write, false)
+    fn still_faults(space: &MemoryView, id: u64, access: &Access) -> bool {
+        space.userfault_for(GuestAddr(access.address), access.write, false)
             == Some((id, access.reason))
     }
     /// `handle_userfault` for a kernel access: whether it may be tried
     /// again, once the page is filled, the protection ended, or the wait
-    /// woken; not when the context refuses the kernel's faults, is
-    /// released or gone, or a fatal signal came.
-    fn wait(&self, id: u64, access: Access) -> bool {
+    /// woken, or the context released, whose registrations are then about
+    /// to end (`VM_FAULT_RETRY`); not when the context refuses the kernel's
+    /// faults, or a fatal signal came.
+    fn wait(&self, space: &MemoryView, id: u64, access: Access) -> bool {
         let Some(context) = find(id) else {
-            return false;
+            // Released and gone, or its registration would still be there.
+            return !Self::still_faults(space, id, &access);
         };
-        if context.flags & USER_MODE_ONLY != 0
-            || context.features() & FEATURE_SIGBUS != 0
-            || context.released.load(Ordering::SeqCst)
-        {
+        if context.flags & USER_MODE_ONLY != 0 || context.features() & FEATURE_SIGBUS != 0 {
             return false;
         }
-        if !self.still_faults(id, &access) {
+        if context.released.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+            return !self.fatal();
+        }
+        if !Self::still_faults(space, id, &access) {
             return true;
         }
         let features = context.features();
@@ -723,10 +732,7 @@ impl KernelCopies {
         });
         {
             let mut state = context.state();
-            if context.released.load(Ordering::SeqCst) {
-                return false;
-            }
-            if !self.still_faults(id, &access) {
+            if context.released.load(Ordering::SeqCst) || !Self::still_faults(space, id, &access) {
                 return true;
             }
             state.pending.push_back(Arc::clone(&waiting));
@@ -769,7 +775,7 @@ impl KernelCopies {
         let mut state = context.state();
         state.pending.retain(|w| !Arc::ptr_eq(w, &waiting));
         state.read.retain(|w| !Arc::ptr_eq(w, &waiting));
-        !fatal && !context.released.load(Ordering::SeqCst)
+        !fatal
     }
 }
 

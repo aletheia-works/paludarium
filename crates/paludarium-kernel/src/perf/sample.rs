@@ -1072,7 +1072,8 @@ fn read_user(mem: &AddressSpace, at: u64, len: usize) -> Vec<u8> {
         let in_page = (PAGE - addr % PAGE) as usize;
         let n = in_page.min(len - out.len());
         let mut chunk = vec![0; n];
-        if mem.read(GuestAddr(addr), &mut chunk).is_err() {
+        let read = paludarium_mmu::faults::unresolved(|| mem.read(GuestAddr(addr), &mut chunk));
+        if read.is_err() {
             break;
         }
         out.extend(chunk);

@@ -177,15 +177,18 @@ pub fn run_native_within(
 /// compiling the blocks run N times (1: every block, the first time it
 /// runs) while the thread that runs them waits, so that a block runs
 /// compiled from the entry that reaches N, for `mise run test:diff:jit`. A
-/// test that makes a session of its own passes it through this too.
-pub fn with_test_jit(session: Session) -> Result<Session, String> {
+/// test that makes a session of its own passes it through this too, with
+/// its `host`, whose virtual clock then waits for that compiling
+/// ([`RecordingHost::hold_jumps`]).
+pub fn with_test_jit(session: Session, host: &RecordingHost) -> Result<Session, String> {
     match std::env::var("PALUDARIUM_TEST_JIT")
         .ok()
         .and_then(|n| n.parse::<u16>().ok())
     {
         Some(threshold) => {
-            let compiler = paludarium_jit_native::compiler_with(threshold, false)
+            let (compiler, waits) = paludarium_jit_native::waiting_compiler(threshold)
                 .ok_or("PALUDARIUM_TEST_JIT: this host has no JIT")?;
+            host.hold_jumps(Arc::new(move || waits.counts()));
             Ok(session.with_compiler(compiler))
         }
         None => Ok(session),
@@ -212,7 +215,10 @@ pub fn run_emulated(
     argv.extend(args.iter().map(|a| a.as_bytes().to_vec()));
     let config = Config::new(guest_path.clone(), argv).with_file(guest_path, content);
     let host = Arc::new(RecordingHost::new());
-    let session = with_test_jit(Session::new(config, host.clone()).map_err(|e| e.to_string())?)?;
+    let session = with_test_jit(
+        Session::new(config, host.clone()).map_err(|e| e.to_string())?,
+        &host,
+    )?;
     let session = Arc::new(session);
     let started = Instant::now();
     let runner = {

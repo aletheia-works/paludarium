@@ -115,6 +115,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
+- **`/proc/net` の一部**：あるのは `arp`、`dev`、`if_inet6`、`ipv6_route`、`route` だけです。
+  `tcp`、`udp`、`unix`、`igmp`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、
+  `dev` のものは 0 です。ネットワークのないセッションのファイルには、デバイスがありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、

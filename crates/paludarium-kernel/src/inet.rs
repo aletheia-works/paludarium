@@ -346,6 +346,10 @@ pub(crate) struct Network {
     /// The user namespace that owns its network namespace, whose
     /// `CAP_NET_ADMIN` changes it; none for the first one's.
     owner: Option<Arc<crate::namespaces::Namespace>>,
+    /// Whose the files of its `/proc/net` are: that namespace's root as it
+    /// was mapped when the network namespace was made, else the first's
+    /// (`proc_net_ns_init`).
+    pub(crate) proc_owner: (u32, u32),
 }
 /// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
 /// `IFF_UP` and `IFF_RUNNING` while it is up.
@@ -375,6 +379,7 @@ impl Network {
             mctp: crate::mctp::Endpoints::default(),
             sockets: Mutex::default(),
             owner: None,
+            proc_owner: (0, 0),
         }
     }
     /// A new network namespace's network: only a loopback, down and without
@@ -384,6 +389,13 @@ impl Network {
         Self {
             isolated: true,
             owner: Some(Arc::clone(owner)),
+            proc_owner: {
+                use crate::users::Ids;
+                (
+                    owner.kernel_of(Ids::User, 0).unwrap_or(0),
+                    owner.kernel_of(Ids::Group, 0).unwrap_or(0),
+                )
+            },
             up: AtomicBool::new(false),
             ever_up: AtomicBool::new(false),
             addresses: Mutex::new(crate::interface::Addresses::isolated()),

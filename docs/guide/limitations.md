@@ -125,6 +125,10 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
+- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route` and
+  `route` alone; `tcp`, `udp`, `unix`, `igmp`, `snmp`, `sockstat` and the rest
+  are `ENOENT`, and no counter is kept, so those of `dev` are 0. A session
+  with no network has files of no device.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,

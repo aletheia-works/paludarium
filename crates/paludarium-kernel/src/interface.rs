@@ -3652,6 +3652,14 @@ impl Addresses {
         }
         entries
     }
+    /// The IPv6 tables, in the order a dump goes through them.
+    pub(crate) fn tables6(&self) -> Vec<u32> {
+        table_order(&self.tables6)
+    }
+    /// The IPv6 addresses.
+    pub(crate) fn v6(&self) -> &[V6] {
+        &self.v6
+    }
     /// Whether IPv4 has made the table `table` (`fib_get_table`).
     pub(crate) fn has_table4(&self, table: u32) -> bool {
         self.tables4.contains(&table)

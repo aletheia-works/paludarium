@@ -122,6 +122,13 @@ impl SeqFile {
             ..Self::open(records, flags)
         }
     }
+    /// The same, for a system-wide file that `owner` owns.
+    pub(crate) fn owned_by(self, owner: crate::proc::Owner) -> Self {
+        Self {
+            owner: Some(owner),
+            ..self
+        }
+    }
     /// The same, with `writer` as its write operation, as `comm`,
     /// `uid_map`, `gid_map` and `setgroups` have one.
     pub(crate) fn writing(self, writer: Writer) -> Self {

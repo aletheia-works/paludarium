@@ -3375,7 +3375,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
@@ -3800,6 +3800,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     秒数で、`ps` はこれで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running`
     （`/proc/<pid>/stat` が `R` と示す実行中のスレッドの数で、読んでいるスレッドを含みます）、
     `procs_blocked 0`、0 が並ぶ `softirq` の行です。
+
+- `/proc/net` は `self/net` へのリンクです。`/proc/<pid>/net` とスレッドのものには、タスクの
+  ネットワーク名前空間のファイルがあります。名前は、そのときタスクが持つ名前空間から引き
+  （`get_proc_task_net`）、誰でも読めます。ゾンビのものは `ENOENT` で、そのディレクトリの一覧は
+  `EINVAL` です。開いたファイルは、開いたときの名前空間のままです。どれも 0444 で、ネットワーク
+  名前空間を持つユーザー名前空間のルート（ネットワーク名前空間を作ったときの対応によるもので、
+  なければ最初の名前空間のルート。`proc_net_ns_init`）のもので、読むためだけに開け（`EACCES`、`seq_open_net`）、
+  読むたびに作ります。
+  - `dev`（`dev_seq_show`）はデバイスで、カウンタは 0 です。`if_inet6`（`if6_seq_show`）は IPv6 の
+    アドレス、`route`（`fib_route_seq_show`）は IPv4 の main の表で、表がなければ空です。
+    `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
+    `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
+  - ほかの名前は、`--mount /:/` でも `ENOENT` です。ホストのソケットとデバイスは、ゲストの
+    ものではありません。
 
 - `/proc/sysvipc` には `msg`、`sem`、`shm` がこの順に並びます。どれも 64 ビットのカーネルでの
   Linux の `sysvipc_*_proc_show` と同じ形式です。

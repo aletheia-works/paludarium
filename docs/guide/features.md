@@ -3906,7 +3906,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
+  `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
@@ -4402,6 +4402,23 @@ kernel.
     time; `processes`, the IDs handed out; `procs_running`, the threads
     running as `/proc/<pid>/stat` shows them (`R`), the reader included;
     `procs_blocked 0`; and a `softirq` line of zeros.
+
+- `/proc/net` is a link to `self/net`; `/proc/<pid>/net`, and a thread's,
+  holds the files of the task's network namespace, whose names are looked
+  up in the one it has then (`get_proc_task_net`), by any reader: `ENOENT`
+  for a zombie's, whose directory lists nothing (`EINVAL`). A file open stays
+  with the namespace it was opened in. Each is 0444 and the root's of the
+  user namespace that owns the network namespace, as that mapped it when
+  the network namespace was made, else the first's (`proc_net_ns_init`),
+  opens for reading only (`EACCES`, `seq_open_net`), and is made as it is
+  read:
+  - `dev` (`dev_seq_show`), the devices, with counters of 0; `if_inet6`
+    (`if6_seq_show`), the IPv6 addresses; `route` (`fib_route_seq_show`),
+    IPv4's main table, nothing while there is none; `ipv6_route`
+    (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
+    and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - Any other name there is `ENOENT`, with `--mount /:/` too: the host's
+    sockets and devices are not the guest's.
 
 - `/proc/sysvipc` holds `msg`, `sem` and `shm`, listed in that order, each in
   the format of Linux's `sysvipc_*_proc_show` on a 64-bit kernel.

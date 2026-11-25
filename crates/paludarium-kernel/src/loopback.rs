@@ -817,7 +817,7 @@ impl Ports {
     /// to every address, and an IPv4 socket before an IPv6 one; among equals
     /// the first to bind, or one of its group ([`pick`]). It comes in on
     /// the device `dif`: one bound to another takes it not, one bound to it
-    /// ranks before one of another family bound to none
+    /// ranks before one bound to none, by as much as IPv4 before IPv6
     /// (`compute_score`).
     pub(crate) fn listener(
         &mut self,

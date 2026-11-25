@@ -1910,7 +1910,7 @@ kernel.
   thread and a forked child have none. `IORING_UNREGISTER_RING_FDS` empties
   slots (`EINVAL` for a reserved field, data or a slot past the table), and
   `execve` and the thread's exit empty them all (`io_uring_unreg_ringfd`),
-  leaving its context.
+  and take its context away.
 
 - `IORING_REGISTER_FILES` registers a ring's files as Linux 7.0's
   `io_sqe_files_register` does, the kernel the differential tests run on

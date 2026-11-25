@@ -1674,8 +1674,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   文脈がないスレッドからのものは `EINVAL` です。スレッドは、リングを作るか、投入するか、記述子を
   登録すると文脈を持ちます。新しいスレッドと fork した子は持ちません。
   `IORING_UNREGISTER_RING_FDS` はスロットを空にし（予約した欄、データ、表を越えるスロットは
-  `EINVAL`）、`execve` とスレッドの終わりはすべてを空にします（`io_uring_unreg_ringfd`）。
-  文脈は残ります。
+  `EINVAL`）、`execve` とスレッドの終わりはすべてを空にし（`io_uring_unreg_ringfd`）、
+  文脈もなくします。
 
 - `IORING_REGISTER_FILES` は、差分テストのカーネルである Linux 7.0 の
   `io_sqe_files_register` と同じくリングのファイルを登録します（更新と割り当て範囲も 7.0 の

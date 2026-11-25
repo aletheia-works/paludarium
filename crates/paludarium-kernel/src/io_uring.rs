@@ -349,7 +349,7 @@ pub(crate) struct TaskWork {
     exited: bool,
     /// The thread has an io_uring context (`current->io_uring`), which
     /// making a ring, submitting to one or registering a ring descriptor
-    /// gives it, and neither `fork` nor `clone` copies.
+    /// gives it, neither `fork` nor `clone` copies, and `execve` takes away.
     context: bool,
     /// The rings it registered (`tctx->registered_rings`,
     /// `IORING_REGISTER_RING_FDS`), which `io_uring_enter` and
@@ -1934,9 +1934,11 @@ fn live_rings(polls: &Polls) -> Vec<Arc<dyn FileHandle>> {
 }
 
 /// The thread calls `execve` (`io_uring_task_cancel`, before the new image
-/// replaces its memory): [`cancel_all_task`].
+/// replaces its memory): [`cancel_all_task`], after which its io_uring
+/// context goes (`__io_uring_free`).
 pub(crate) fn exec_task(c: &mut Context<'_>) {
     cancel_all_task(c);
+    c.inbox.task_work().context = false;
 }
 
 /// `io_uring_cancel_generic` with `cancel_all`, which `execve` and a whole

@@ -10509,7 +10509,7 @@ static int io_uring_exit_case(const char *self) {
    io_uring_enter and io_uring_register then find by index
    (IORING_ENTER_REGISTERED_RING, IORING_REGISTER_USE_REGISTERED_RING). The
    table is the thread's: a new thread and a forked child have no io_uring
-   context (EINVAL), and execve empties it, keeping the context (EBADF). */
+   context, nor has a thread after execve (EINVAL). */
 struct urf_update {
     unsigned offset, resv;
     unsigned long data;
@@ -10571,7 +10571,7 @@ static int io_uring_ring_fds_case(const char *self) {
     int status;
     waitpid(child, &status, 0);
 
-    /* execve empties the table and keeps the context. */
+    /* execve takes the context away. */
     fflush(stdout);
     child = fork();
     if (child == 0) {

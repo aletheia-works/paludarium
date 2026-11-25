@@ -193,7 +193,7 @@ impl Closing {
         node: &FileStat,
         flags: u32,
     ) -> Self {
-        let place = caches.keep_place((device, node.inode), path);
+        let place = caches.keep_place(fs, (device, node.inode), path);
         Self::open_at(caches, fs, place, device, node, flags)
     }
     /// Another open of this file's dentry, as through `/proc/self/fd`, with
@@ -251,7 +251,7 @@ impl Closing {
         device: u64,
         node: &FileStat,
     ) -> Self {
-        let place = caches.keep_place((device, node.inode), path);
+        let place = caches.keep_place(fs, (device, node.inode), path);
         let mut closing = Self::unopened(caches, fs, place, device, node, 0);
         closing.ask_exec();
         closing

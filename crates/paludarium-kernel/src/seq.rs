@@ -20,6 +20,24 @@ pub(crate) trait Records: Send + Sync {
     /// the index of the one after that (`start` or `next`, then `show`);
     /// `None` past the last; an error is what `show` failed with.
     fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno>;
+    /// The records as they are now, for those whose `start` locks them until
+    /// `stop`; otherwise each is as it is when it is reached.
+    fn held(&self) -> Option<Box<dyn Records>> {
+        None
+    }
+}
+
+/// The records of a [`Records::held`]: each index's, or nothing for one that
+/// `show` skips.
+pub(crate) struct Held(pub Vec<Vec<u8>>);
+impl Records for Held {
+    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
+        let shown = (0..)
+            .zip(&self.0)
+            .skip(usize::try_from(index).unwrap_or(usize::MAX))
+            .find(|(_, record)| !record.is_empty());
+        Ok(shown.map(|(at, record)| (record.clone(), at + 1)))
+    }
 }
 
 /// Records that are the lines of a text made again for each record, as
@@ -146,8 +164,10 @@ impl SeqFile {
     fn gather(&self, state: &mut State, wanted: usize) -> Result<(), Errno> {
         state.pending.clear();
         state.from = 0;
+        let held = self.records.held();
+        let records = held.as_deref().unwrap_or(&*self.records);
         loop {
-            let (record, after) = match self.records.record(state.next) {
+            let (record, after) = match records.record(state.next) {
                 Ok(Some(record)) => record,
                 Ok(None) => return Ok(()),
                 Err(e) if state.pending.is_empty() => return Err(e),
@@ -176,8 +196,10 @@ impl SeqFile {
         if offset == 0 {
             return Ok(());
         }
+        let held = self.records.held();
+        let records = held.as_deref().unwrap_or(&*self.records);
         let mut reached = 0;
-        while let Some((record, after)) = self.records.record(state.next)? {
+        while let Some((record, after)) = records.record(state.next)? {
             state.next = after;
             let length = record.len() as u64;
             if reached + length > offset {
@@ -473,5 +495,32 @@ mod tests {
             Default::default(),
         );
         assert_eq!(other.not_seq_opened().write_at(0, b"x"), Err(Errno::ENODEV));
+    }
+    /// Records held for each gather: reaching one by itself takes the first
+    /// away.
+    struct Changing(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl Records for Changing {
+        fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
+            let mut now = self.0.lock().unwrap();
+            now.remove(0);
+            Held(now.clone()).record(index)
+        }
+        fn held(&self) -> Option<Box<dyn Records>> {
+            Some(Box::new(Held(self.0.lock().unwrap().clone())))
+        }
+    }
+    #[test]
+    fn held_records_stay_for_a_whole_gather() {
+        let list = [&b"a\n"[..], b"", b"b\n", b"c\n"].map(<[u8]>::to_vec);
+        let list = Arc::new(Mutex::new(list.to_vec()));
+        let file = SeqFile::open(Box::new(Changing(Arc::clone(&list))), 0);
+        let mut buf = [0; 16];
+        let n = file.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"a\nb\nc\n");
+        // The next read starts where the last gather ended.
+        list.lock().unwrap().push(b"d\n".to_vec());
+        let n = file.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"d\n");
+        assert_eq!(file.read(&mut buf), Ok(0));
     }
 }

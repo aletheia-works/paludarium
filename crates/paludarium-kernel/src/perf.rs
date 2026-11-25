@@ -139,6 +139,7 @@ mod bit {
     pub const MMAP: u32 = 8;
     pub const COMM: u32 = 9;
     pub const FREQ: u32 = 10;
+    pub const INHERIT_STAT: u32 = 11;
     pub const TASK: u32 = 13;
     pub const WATERMARK: u32 = 14;
     pub const MMAP_DATA: u32 = 17;
@@ -613,6 +614,9 @@ impl Events {
             if event.attr.sampling() {
                 self.sampling.store(true, Ordering::Relaxed);
             }
+            if event.attr.sampling() && event.shows_address() {
+                paludarium_mmu::faults::trace_addresses();
+            }
             if side_band::asks(&event.attr) {
                 self.side_band.store(true, Ordering::Relaxed);
             }
@@ -907,7 +911,16 @@ impl Event {
     }
     /// `sync_child_event`: an inherited event's task ends, and the event
     /// it comes from takes its count and times.
-    fn give_back(self: &Arc<Self>) {
+    /// With `inherit_stat`, first `PERF_RECORD_READ` of them, written by the
+    /// task `who`, which it is (`perf_event_read_event`).
+    fn give_back(self: &Arc<Self>, who: &Who) {
+        if self.attr.flag(bit::INHERIT_STAT) {
+            let mut body = self.pid_tid_of(who.pid, who.tid).to_vec();
+            for value in self.sample_read() {
+                body.extend(value.to_le_bytes());
+            }
+            self.side_band(RECORD_READ, 0, &body, who);
+        }
         let Some(parent) = self.parent.as_ref().and_then(event) else {
             return;
         };
@@ -1348,12 +1361,17 @@ pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, who: &Who, ppid:
         });
         gone
     };
-    for event in counting {
+    // `task_ctx_sched_out`, and then one by one, the latest first, as
+    // `list_add_event` puts each before the others.
+    for event in counting.iter().filter(|event| event.parent.is_some()) {
+        event.set_enabled(false);
+    }
+    for event in counting.into_iter().rev() {
         if event.parent.is_some() {
             // An inherited event goes, giving back what it counted
-            // (`perf_event_exit_event` with a parent).
-            event.set_enabled(false);
-            event.give_back();
+            // (`perf_event_exit_event` with a parent, `DETACH_GROUP`).
+            event.give_back(who);
+            event.detach();
         } else {
             event.disable();
             event.settle().removed = true;
@@ -1363,6 +1381,7 @@ pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, who: &Who, ppid:
     }
 }
 
+const RECORD_READ: u32 = 8;
 const CLONE_THREAD: u64 = 0x10000;
 const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
 
@@ -1459,23 +1478,32 @@ pub(crate) fn exec(
     new_tid: u32,
     image: Option<(&Space<'_>, &[u8])>,
 ) {
-    exec_events(events, group, tid, new_tid);
+    let who = image.map_or(
+        Who {
+            pid: new_tid,
+            tid: new_tid,
+            cpu: 0,
+        },
+        |(space, _)| space.who,
+    );
+    exec_events(events, group, tid, &who);
     if let Some((space, name)) = image {
         side_band::exec(events, space, tid, name);
     }
 }
 
-fn exec_events(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32) {
+fn exec_events(events: &Events, group: &ThreadGroup, tid: u32, who: &Who) {
     let mut lists = lock(&events.lists);
     lists
         .owned
         .retain(|owned| !owned.of(group) || owned.tid == tid);
     for owned in &mut lists.owned {
         if owned.of(group) {
-            owned.tid = new_tid;
+            owned.tid = who.tid;
         }
     }
     let mut removed = Vec::new();
+    let mut inherited = Vec::new();
     lists.on_exec.retain(|waiting| {
         let Some(event) = event(waiting) else {
             return false;
@@ -1486,9 +1514,7 @@ fn exec_events(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32) {
                 tid: target_tid,
             } if *target_tid == tid && std::ptr::eq(Arc::as_ptr(target), group) => {
                 if event.attr.flag(bit::REMOVE_ON_EXEC) && event.parent.is_some() {
-                    // An inherited one goes, giving back what it counted.
-                    event.set_enabled(false);
-                    event.give_back();
+                    inherited.push(event);
                 } else if event.attr.flag(bit::REMOVE_ON_EXEC) {
                     // `perf_event_exit_event` with `DETACH_GROUP`, after
                     // `perf_remove_from_owner`, as Linux master since 7.2's
@@ -1513,6 +1539,13 @@ fn exec_events(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32) {
             .iter()
             .any(|&gone| std::ptr::addr_eq(owned.event.as_ptr(), gone))
     });
+    drop(lists);
+    // An inherited one goes, giving back what it counted.
+    for event in inherited.into_iter().rev() {
+        event.set_enabled(false);
+        event.give_back(who);
+        event.detach();
+    }
 }
 
 /// The thread of system call `c` that writes a record.
@@ -2289,6 +2322,35 @@ mod tests {
         assert!(!leader.enabled());
         let state = lock(&other.state);
         assert!(!state.removed && state.enabled);
+    }
+
+    #[test]
+    fn the_latest_faults_keep_their_addresses_by_their_numbers() {
+        use paludarium_mmu::faults::{At, Sink};
+        let at = |addr| At {
+            addr,
+            present: addr & 0x1000 != 0,
+        };
+        let addresses = |usage: &crate::Usage, kernel, counted, n| {
+            let found = usage.fault_addresses(kernel, counted, n);
+            assert!(found.iter().all(|&f| f.addr == 0 || f == at(f.addr)));
+            found.iter().map(|f| f.addr).collect::<Vec<_>>()
+        };
+        let usage = crate::Usage::default();
+        for nth in 1..=5 {
+            usage.fault(false, nth, at(0x1000 * nth));
+        }
+        usage.fault(true, 1, at(0xf000));
+        // The last three of the first four, and those of the kernel's.
+        assert_eq!(addresses(&usage, false, 4, 3), [0x2000, 0x3000, 0x4000]);
+        assert_eq!(addresses(&usage, true, 1, 1), [0xf000]);
+        // One that came before any was told, and those long gone.
+        assert_eq!(addresses(&usage, true, 2, 2), [0xf000, 0]);
+        for nth in 6..=6000 {
+            usage.fault(false, nth, at(0x1000 * nth));
+        }
+        let all = addresses(&usage, false, 6000, 6000);
+        assert_eq!((all.len(), all[0], all[5999]), (6000, 0, 6000 * 0x1000));
     }
 
     #[test]

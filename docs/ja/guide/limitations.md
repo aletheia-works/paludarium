@@ -37,18 +37,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   アクセスしませんが、実際の CPU はフォールトすることがあります（AMD EPYC ではフォールト
   し、`SIGSEGV` で終わります）。後ろのバイトでフォールトすると前のバイトは書かれたまま
   ですが、これは実際の CPU と比べていません。
-- **`/proc/self/maps` の一部**：エミュレーターには `vsyscall` のページがないので、
-  `[vsyscall]` の行はありません。スタックの VMA は
+- **`/proc/self/maps` の一部**：スタックの VMA は
   初めから全体の大きさで、Linux のように使うにつれて伸びません。
-  `chroot` したプロセスがファイルの名前を変えても、マップ、コアの `NT_FILE` ノート、
-  `/proc/<pid>/exe` のそのファイルの名前は動きません。Linux の `d_move` はルートに
-  関係なく動かします。
-  マージの後、マップは Linux より少ない VMA を示すことが
-  あります。Linux は `anon_vma` が合う VMA どうしだけをまとめますが
-  （`is_mergeable_anon_vma`）、エミュレーターは `anon_vma` の区別を再現しないので、
-  別の VMA の一部だったときに書き込まれたかけらの隣で、`mlock` が中身を入れたページを
-  `munlock` した後のように、
-  Linux が分けておく隣どうしもまとめます。
+  ファイルの名前を変えても、別のマウント名前空間で開かれたものと、この名前空間に別に入った
+  （`unshare` と `setns` はそのつど分かれます）プロセスが開いたものの名前は、マップ、コアの
+  `NT_FILE` ノート、`/proc/<pid>/exe` では動きません。Linux の `d_move` はどれも動かします。
 - **vDSO の一部**：その関数はシステムコールを呼びます。Linux の vDSO がそうするのは、
   ユーザー空間から読める時計がないときだけです。そのため、Linux の速い経路ならシステム
   コールを呼ばないところでも、seccomp のフィルター、ptrace のトレーサーのシステムコール
@@ -291,9 +284,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   新しい CPU マスクで許す最も小さい CPU が変わったときだけです。サンプリングする
   イベントのサンプルは、Linux では起きるたびに取りますが、ここではスレッドがシステム
   コールに入るとき、またはエミュレーターのチェックポイントに来たときに、それまでの分を
-  取ります。そのためサンプルのアドレス、レジスタ、スタック、フレームはそのときのもので、
-  フォルトのアドレスは 0、カーネルのもの（システムコール中のフォルト、スイッチ、
-  マイグレーション）はアドレス 0 でカーネルのフレームがありません。`freq` はティックごと
+  取ります。そのためサンプルの命令、レジスタ、スタック、フレームはそのときのもので
+  （フォルトのアドレスはそのフォルトのものですが、スレッドの最後の 4096 より前のものは
+  0 です）、カーネルのもの（システムコール中のフォルト、スイッチ、マイグレーション）は
+  命令が 0 でカーネルのフレームがありません。`freq` はティックごと
   ではなく、そのときの速さに従います。`cpu-clock` と `task-clock` のイベントは、Linux の
   hrtimer のイベントと同じく、ティックの割り込みが `perf_event_max_sample_rate` を `HZ`
   （1000）で割った数になると抑えられ、次のティック、もう一度有効にされたとき、周期を
@@ -312,21 +306,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   inode の世代は 0 です。エミュレーターがページキャッシュを持たないファイル（ホストのものや、
   起動時からのメモリー上のファイルシステムのもの）からは、ページがすべてキャッシュにある
   ものとしてビルド ID を読みます。Linux は読んでいないか追い出したページからは与えません。
-  `mprotect` は最後の VMA
-  ごとに記録を一つ書きます。Linux は VMA を変えるたびに、そこまで合わさった VMA を
-  書きます。ホストが始められなかったスレッドには `FORK` と `EXIT` の記録を書き、
+  ホストが始められなかったスレッドには `FORK` と `EXIT` の記録を書き、
   `EXIT` は CPU 0 のものとします。Linux の失敗した `clone` はどちらも書きません。
   `NAMESPACES`、`CGROUP`、`KSYMBOL`、`BPF_EVENT`、`TEXT_POKE`、`SWITCH`、
   `AUX` の記録は書きません。そうしたときのオーバーフローは、
   `sigtrap` では SIGTRAP を一つ送ります。Linux はスレッドが自分のコードへ戻るたびに
-  一つ送ります。その `si_addr` は 0 で、Linux はフォルトのアドレスを与えます。
-  `REFRESH` の最後のオーバーフローがイベントを無効にするとき、そのときまでの後の分も
-  数えます。Linux はそこで数えるのを止めます。ユーザーページの数と
+  一つ送ります。その `si_addr` は最初のフォルトのものです。
+  `REFRESH` の最後のオーバーフローがイベントを無効にするとき、数えるのはそこで止まりますが、
+  その時間（時計のものを除きます）と、グループのほかのイベントは、そのときまで進みます。ユーザーページの数と
   時間は、`mmap`、イベントの有効化、リセットのときのもので、Linux はイベントが
   スケジュールされるたびに更新します。`cap_user_time` は設定しません。マッピングの
   確認と置き場所の確認の両方が失敗するときは、ここではマッピングの確認のエラーに
-  なります。`inherit_stat` は受け付けますが、記録するものがないので、引き継いだ
-  イベントの終わりに読み取りの記録は送りません。cgroup の
+  なります。cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。ioctl の `SET_FILTER`、`SET_BPF`、
   `QUERY_BPF`、`MODIFY_ATTRIBUTES` は `ENOTTY` です。`remove_on_exec` は、
   Linux master が 7.2 から（037a3c43edfb）するように、イベントをグループから外し、そうした
@@ -469,15 +460,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL` だけで、ほかの操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
-  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_FILES`、
+  `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
+  `IORING_REGISTER_BUFFERS_UPDATE`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
   `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、
   `IORING_REGISTER_SYNC_CANCEL`、`IORING_REGISTER_RING_FDS`、
   `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。そのため、
-  パーソナリティは登録できず、バッファーは更新できません。タグを付ける
-  `IORING_REGISTER_BUFFERS2` でバッファーを登録することもできません。プロセス全体が
+  パーソナリティは登録できません。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
+  カーネルである Linux 7.0 と同じく、スロットごとに `iovec` をタグより先に読み、
+  `IORING_RSRC_UPDATE_EXTENDED` を断ります。Linux master はタグを先に読み、そのフラグの
+  `struct io_uring_regbuf_desc` を受け付けます。テストを走らせるカーネルが追いつけば master に
+  合わせます。プロセス全体が
   終わると、そのスレッドが投入してファイルを待っている要求は、Linux master の
   `io_task_group_exiting` と同じく取り消されます。差分テストを走らせるカーネルである
   Linux 7.0 は、ひとりで終わるスレッドのときと同じく、ファイルの準備ができてから取り消します。
@@ -569,7 +564,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     どれもプロセスの CPU 時間のすべてを数えます。ここではそのすべてがユーザーの時間だからです
     （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えず、`RLIMIT_CPU` は数えます）。WebAssembly のように
     ホストがスレッドの CPU 時間を測れないところでは、それは経過時間なので、スレッドが
-    眠ったり待ったりした時間も、起きたときから数えます。タイマーを確かめるのは、
+    眠ったり待ったりした時間も、起きたときにまとめて数えます。タイマーを確かめるのは、
     Linux のようにティックごとではなく、スレッドがシステムコールをするときと、命令を
     100,000 個実行するごとです。ティックは CI ランナーの `CONFIG_HZ` に合わせて 1 ms と
     します。CPU 時間の時計の POSIX タイマーも、同じように数えて確かめます。プロセスの
@@ -672,11 +667,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     セグメントで動くか、フォールトします。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。
-  - 隣り合うプライベートの VMA は、（`munlock` のあとなど）フラグがまたそろえば、
-    `anon_vma` によらずつながります。Linux は同じ `anon_vma` を持つか、片方が持たないときだけつなげます。
-    VMA は最初の書き込みで `anon_vma` を得て、そのとき隣とフラグがそろっていたときだけ
-    隣のものを使う（`anon_vma_compatible`）ので、離れている間に書き込んだかけらは、
-    `/proc/<pid>/maps` で別の VMA のまま残ることがあります。
+  - `fork` した子がロックや `userfaultfd` の登録を失って同じになった、書き込まれたことのない
+    隣り合う VMA は、`/proc/<pid>/maps` で 1 つの VMA になります。Linux は `fork` では
+    まとめません。
   - `MAP_LOCKED` の
     `mmap` は、マッピングの場所を探し（`ENOMEM`）ファイルを確かめる前に、`can_do_mlock`
     （`EPERM`）と `RLIMIT_MEMLOCK` の空き（`EAGAIN`）を確かめます。Linux はそれらを先にします。`mremap` は、
@@ -891,6 +884,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルをほかのときに解放したり残したりもします。
 - **dnotify の一部**：`/proc/sys/fs/dir-notify-enable` はないので、Linux の既定の 1 と
   同じく、dnotify はいつも使えます。
+- **`/proc/locks` の一部**：ロックを待つものの行（`-> `）はありません。PID は読む側の PID
+  名前空間のものです（Linux では `/proc` をマウントした名前空間のもの）。ホストのプログラムが
+  ホストのファイルに掛けた `flock` のロックは、ゲストのロックとぶつかりますが、並びません。
 - **ファイルのリースの一部**：`execve` がプログラム、そのインタープリター、スクリプトを開くときと、
   fanotify のイベントが渡すディスクリプターを開くときは、Linux と違ってリースを破りません。
   リースは `FAN_OPEN_PERM` を尋ねる前に破ります（Linux では尋ねた後）。`truncate` では
@@ -935,6 +931,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   経路の間でするようには引き当てを左右しません。IPv6 のマルチパスの経路のネクストホップのうち、
   求められたデバイスを通るものは、Linux 7.0 と同じくフローのハッシュで一つを選びます。
   Linux master は、引き当てたネクストホップを使います（`ip6_pol_route` の `have_oif_match`）。
+  IPv6 のパケットの答えは、パケットが出た端を通ってだけ返るので、マルチパスの経路が別の端から
+  返す答えは失われます（Linux では届きます）。
   経路のない UDP の connect は、Linux master が "ipv6: fix device binding after failed
   datagram connect" からするように、ソケットのデバイスを元に戻します。その修正のない
   CI のカーネルでは、スコープ ID が与えたデバイスが残ります。
@@ -1005,9 +1003,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   経路を無視する設定）を、Linux の組み込みの値と同じく 0 として伝えます。MTU が 1280
   より小さい veth の端にも `ipv6/conf/<デバイス>` のファイルがありますが、Linux では
   IPv6 がないのでありません（IPv6 のアドレスは、Linux と同じく作りません）。経路は
-  `lo` か veth の端を通るか、拒むかです。IPv4 のマルチパスの経路のネクストホップは、引き当てが
-  dead でない最初のものを取ります。Linux はフローのハッシュで一つを選びます
-  （`fib_select_multipath`）。IPv6 のゲートウェイを通る IPv4 のネクストホップ（`RTA_VIA`）、
+  `lo` か veth の端を通るか、拒むかです。IPv6 のゲートウェイを通る IPv4 のネクストホップ（`RTA_VIA`）、
   カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の
   種類（IPv6 ではブロードキャストも）は `EOPNOTSUPP` です。ポリシーのルール

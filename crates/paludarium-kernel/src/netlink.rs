@@ -4099,7 +4099,7 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
 /// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
 /// (none is `0.0.0.0` or `::`), by the routing tables
-/// ([`crate::interface::Addresses::lookup4_flow`] and `lookup6`): `EINVAL`
+/// ([`crate::interface::Addresses::output4`] and `lookup6`): `EINVAL`
 /// for a request shorter than an `rtmsg`; an IPv6 source or destination
 /// shorter than 16 bytes is `EINVAL` (an IPv4 one is the policy's
 /// `ERANGE`), and a longer one counts as its first bytes; `EOPNOTSUPP` for
@@ -4374,6 +4374,14 @@ fn lookup(
         }
     }
     let lookup_table = request_flags & RTM_F_LOOKUP_TABLE != 0;
+    // `__mkroute_output` sends a loopback source out of no other device
+    // (with `route_localnet` off).
+    let made = |source: Ipv4Addr, out: u32| {
+        if source.is_loopback() && out != LOOPBACK_OIF {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    };
     // The route's kind, the TOS it matched, its gateway, the table it came
     // from (none for a route no table gave) and its metrics.
     let (kind, matched_tos, gateway, table, metrics): (
@@ -4393,19 +4401,31 @@ fn lookup(
         out = LOOPBACK_OIF;
         (kind, matched_tos, gateway, table, metrics) = (Kind::Local, 0, None, None, NO_METRICS);
     } else if direct {
+        made(source, out)?;
         // No table gave it, so `RTM_F_FIB_MATCH` has no entry to give.
         if fib_match {
             return Err(EHOSTUNREACH);
         }
         (kind, matched_tos, gateway, table, metrics) = (Kind::Unicast, 0, None, None, NO_METRICS);
     } else {
-        match addresses.lookup4_flow(ip, tos, oif) {
+        match addresses.output4(ip, tos, oif, Some(source), &order) {
             Ok(route) => {
                 let from = if route.table == TABLE_LOCAL {
                     TABLE_MAIN
                 } else {
                     route.table
                 };
+                if source.is_unspecified()
+                    && let Some(picked) = addresses.source4(&route, ip, &order)
+                {
+                    source = picked;
+                }
+                out = if route.kind == Kind::Local {
+                    LOOPBACK_OIF
+                } else {
+                    route.oif
+                };
+                made(source, out)?;
                 if fib_match {
                     let named = if lookup_table { from } else { TABLE_MAIN };
                     let mut answer = ipv4_route_of(RTM_NEWROUTE, &route, named, seq, port, 0);
@@ -4418,16 +4438,6 @@ fn lookup(
                     }
                     return Ok(answer);
                 }
-                if source.is_unspecified()
-                    && let Some(picked) = addresses.source4(&route, ip, &order)
-                {
-                    source = picked;
-                }
-                out = if route.kind == Kind::Local {
-                    LOOPBACK_OIF
-                } else {
-                    route.oif
-                };
                 // `__mkroute_output` drops the route's `fib_info`, and so
                 // its metrics and gateway, for the limited broadcast
                 // address, and for a multicast one when the route is
@@ -4441,14 +4451,15 @@ fn lookup(
             }
             // With a device named, the destination is taken to be on link.
             Err(_) if oif != 0 => {
-                if fib_match {
-                    return Err(EHOSTUNREACH);
-                }
                 if source.is_unspecified()
                     && let Some(picked) =
                         addresses.select4(oif.cast_signed(), None, SCOPE_LINK, &order)
                 {
                     source = picked;
+                }
+                made(source, out)?;
+                if fib_match {
+                    return Err(EHOSTUNREACH);
                 }
                 (kind, matched_tos, gateway, table, metrics) =
                     (Kind::Unicast, 0, None, None, NO_METRICS);
@@ -4640,6 +4651,7 @@ fn input4(
             // `__mkroute_input`, out through the route's device: a redirect
             // is asked only out through the device it came in on.
             _ => {
+                let route = addresses.path4(route, ip, src, None);
                 let redirect = addresses
                     .validate_source4_on(src, input.tos, route.oif, input.rp_filter, input.iif)
                     .map_err(|()| Errno::EINVAL)?;

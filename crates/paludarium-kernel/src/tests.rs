@@ -3133,7 +3133,7 @@ fn populating_a_writable_private_file_mapping_copies_its_pages() {
         f.mem
             .mappings()
             .find(|m| m.start.0 == at)
-            .is_some_and(|m| m.written)
+            .is_some_and(|m| m.anon_vma.is_some())
     };
     let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2, fd, 4096]);
     assert!(!written(&f, at));
@@ -5471,6 +5471,99 @@ mod io_uring {
         assert_eq!(one(&mut f, &r, &rd), -14);
     }
 
+    /// A `struct io_uring_rsrc_register` at `at`.
+    fn rsrc_register(f: &Fixture, at: u64, count: u32, flags: u32, data: u64, tags: u64) {
+        let mut rr = [0u8; 32];
+        rr[..4].copy_from_slice(&count.to_le_bytes());
+        rr[4..8].copy_from_slice(&flags.to_le_bytes());
+        rr[16..24].copy_from_slice(&data.to_le_bytes());
+        rr[24..].copy_from_slice(&tags.to_le_bytes());
+        f.mem.write(GuestAddr(at), &rr).unwrap();
+    }
+
+    /// A `struct io_uring_rsrc_update2` at `at`.
+    fn rsrc_update(f: &Fixture, at: u64, offset: u32, data: u64, tags: u64, count: u32) {
+        let mut up = [0u8; 32];
+        up[..4].copy_from_slice(&offset.to_le_bytes());
+        up[8..16].copy_from_slice(&data.to_le_bytes());
+        up[16..24].copy_from_slice(&tags.to_le_bytes());
+        up[24..28].copy_from_slice(&count.to_le_bytes());
+        f.mem.write(GuestAddr(at), &up).unwrap();
+    }
+
+    #[test]
+    fn registered_buffers_carry_tags_and_take_updates() {
+        const BUFFERS2: u64 = 15;
+        const UPDATE: u64 = 16;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (arg, vec, tags, buf) = (DATA + 0x100, DATA + 0x180, DATA + 0x1c0, DATA + 0x800);
+        let tag_list = |f: &Fixture, list: &[u64]| {
+            for (i, t) in list.iter().enumerate() {
+                f.mem.write_u64(GuestAddr(tags + 8 * i as u64), *t).unwrap();
+            }
+        };
+        // `io_register_rsrc`'s checks.
+        rsrc_register(&f, arg, 2, 0, 0, 0);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 31]), errno(Errno::EINVAL));
+        for (count, flags, data) in [(0, 0, 0), (2, 2, 0), (2, 1, vec)] {
+            rsrc_register(&f, arg, count, flags, data, 0);
+            assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), errno(Errno::EINVAL));
+        }
+        // Updating no table.
+        rsrc_update(&f, arg, 0, vec, 0, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), errno(ENXIO));
+        // A failed registration posts no tag.
+        iovecs(&f, vec, &[(buf, 0x100), (0x40_0000, 1)]);
+        tag_list(&f, &[4, 5]);
+        rsrc_register(&f, arg, 2, 0, vec, tags);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), errno(Errno::EFAULT));
+        assert_eq!(reap(&mut f, &r), []);
+        // A sparse table of two.
+        rsrc_register(&f, arg, 2, 1, 0, 0);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), 0);
+        // The update's checks.
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 31]), errno(Errno::EINVAL));
+        for (offset, count, e) in [
+            (0, 0, Errno::EINVAL),
+            (1, 2, Errno::EINVAL),
+            (u32::MAX, 1, EOVERFLOW),
+        ] {
+            rsrc_update(&f, arg, offset, vec, 0, count);
+            assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), errno(e));
+        }
+        // A tag on an empty slot, then a buffer with one.
+        iovecs(&f, vec, &[(0, 0)]);
+        tag_list(&f, &[7]);
+        rsrc_update(&f, arg, 0, vec, tags, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), errno(Errno::EINVAL));
+        iovecs(&f, vec, &[(buf, 0x100)]);
+        tag_list(&f, &[9]);
+        rsrc_update(&f, arg, 1, vec, tags, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), 1);
+        f.mem.write(GuestAddr(DATA), b"/t\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        f.mem.write(GuestAddr(buf), b"tag!").unwrap();
+        assert_eq!(one(&mut f, &r, &fixed(WRITE_FIXED, fd, 0, buf, 4, 1)), 4);
+        // Replacing it posts its tag; a partial update gives how many it did.
+        iovecs(&f, vec, &[(buf, 0x10), (0x40_0000, 1)]);
+        tag_list(&f, &[0, 0]);
+        rsrc_update(&f, arg, 0, vec, tags, 2);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), []);
+        rsrc_update(&f, arg, 1, vec, tags, 1);
+        assert_eq!(f.ret(427, &[r.fd, UPDATE, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), [(9, 0)]);
+        // Unregistering posts the tags of what is left, the last slot first.
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        iovecs(&f, vec, &[(buf, 0x10), (buf + 0x10, 0x10)]);
+        tag_list(&f, &[3, 6]);
+        rsrc_register(&f, arg, 2, 0, vec, tags);
+        assert_eq!(f.ret(427, &[r.fd, BUFFERS2, arg, 32]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 1, 0, 0]), 0);
+        assert_eq!(reap(&mut f, &r), [(6, 0), (3, 0)]);
+    }
+
     #[test]
     fn a_registered_buffer_keeps_its_pages_past_munmap() {
         let mut f = fixture();
@@ -6517,26 +6610,6 @@ mod io_uring {
         );
     }
 
-    /// A `struct io_uring_rsrc_register` at `at`.
-    fn rsrc_register(f: &Fixture, at: u64, count: u32, flags: u32, data: u64, tags: u64) {
-        let mut rr = [0u8; 32];
-        rr[..4].copy_from_slice(&count.to_le_bytes());
-        rr[4..8].copy_from_slice(&flags.to_le_bytes());
-        rr[16..24].copy_from_slice(&data.to_le_bytes());
-        rr[24..].copy_from_slice(&tags.to_le_bytes());
-        f.mem.write(GuestAddr(at), &rr).unwrap();
-    }
-
-    /// A `struct io_uring_rsrc_update2` at `at`.
-    fn rsrc_update(f: &Fixture, at: u64, offset: u32, data: u64, tags: u64, count: u32) {
-        let mut up = [0u8; 32];
-        up[..4].copy_from_slice(&offset.to_le_bytes());
-        up[8..16].copy_from_slice(&data.to_le_bytes());
-        up[16..24].copy_from_slice(&tags.to_le_bytes());
-        up[24..28].copy_from_slice(&count.to_le_bytes());
-        f.mem.write(GuestAddr(at), &up).unwrap();
-    }
-
     #[test]
     fn a_tag_waits_for_the_request_that_waits_for_its_file() {
         let mut f = fixture();
@@ -6567,6 +6640,25 @@ mod io_uring {
         f.mem.write(GuestAddr(DATA), b"ab").unwrap();
         assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
         assert_eq!(reap(&mut f, &r), [(1, 2), (21, 0)]);
+        // So is its registered buffer, which it goes on to.
+        iovecs(&f, list, &[(buf, 0x100)]);
+        f.mem.write_u64(GuestAddr(tags), 31).unwrap();
+        rsrc_register(&f, arg, 1, 0, list, tags);
+        assert_eq!(f.ret(427, &[r.fd, 15, arg, 32]), 0);
+        let e = fixed(READ_FIXED, read, u64::MAX, buf, 2, 0);
+        assert_eq!(batch(&mut f, &r, &[e]), []);
+        iovecs(&f, list, &[(0, 0)]);
+        rsrc_update(&f, arg, 0, list, 0, 1);
+        assert_eq!(f.ret(427, &[r.fd, 16, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), []);
+        f.mem.write(GuestAddr(DATA), b"cd").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        let done = reap(&mut f, &r);
+        assert_eq!(done[0].1, 2);
+        assert_eq!(done[1..], [(31, 0)]);
+        let mut read_back = [0; 2];
+        f.mem.read(GuestAddr(buf), &mut read_back).unwrap();
+        assert_eq!(&read_back, b"cd");
     }
 
     #[test]
@@ -8163,6 +8255,58 @@ mod inotify {
         assert_eq!(f.ret(3, &[c]), 0);
         assert_eq!(f.ret(73, &[a, 2 | 4]), 0);
         assert_eq!(extra(&mut f, a)[0], flock("WRITE"));
+    }
+    #[test]
+    fn proc_locks_lists_record_locks_flocks_and_leases_and_fdinfo_the_lease() {
+        let mut f = fixture();
+        let path = put(&f, DATA, b"/tmp/listed");
+        let locks = put(&f, DATA + 0x40, b"/proc/locks");
+        let made = f.ret(2, &[path, 0o102, 0o600]);
+        assert_eq!(f.ret(3, &[made]), 0);
+        let fd = f.ret(2, &[path, 0, 0]);
+        let fs = &f.kernel.files.fs();
+        let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
+        let (major, minor) = paludarium_types::device_numbers(device);
+        let ino = fs.metadata(b"/tmp/listed", true).unwrap().inode;
+        let at = format!("{major:02x}:{minor:02x}:{ino}");
+        let read = |f: &mut Fixture| {
+            let list = f.ret(2, &[locks, 0, 0]);
+            let n = f.ret(0, &[list, DATA + 0x400, 0x400]);
+            assert_eq!(f.ret(3, &[list]), 0);
+            let mut text = vec![0; n as usize];
+            f.mem.read(GuestAddr(DATA + 0x400), &mut text).unwrap();
+            String::from_utf8(text).unwrap()
+        };
+        assert_eq!(read(&mut f), "");
+        assert_eq!(f.ret(73, &[fd, 1]), 0);
+        let raw = [0u8; 32];
+        f.mem.write(GuestAddr(DATA + 0x100), &raw).unwrap();
+        assert_eq!(f.ret(72, &[fd, 6, DATA + 0x100]), 0);
+        assert_eq!(f.ret(72, &[fd, 1024, 0]), 0);
+        let posix = format!("POSIX  ADVISORY  READ 1 {at} 0 EOF\n");
+        let flock = format!("FLOCK  ADVISORY  READ 1 {at} 0 EOF\n");
+        let lease = |state: &str| format!("LEASE  {state} 1 {at} 0 EOF\n");
+        assert_eq!(
+            read(&mut f),
+            format!("1: {}2: {posix}3: {flock}", lease("ACTIVE    READ"))
+        );
+        assert_eq!(
+            extra(&mut f, fd),
+            [
+                format!("lock:\t1: {}", flock.trim_end()),
+                format!("lock:\t2: {}", posix.trim_end()),
+                format!("lock:\t3: {}", lease("ACTIVE    READ").trim_end()),
+            ]
+        );
+        // Broken by a writer, it is to go; SIGIO stays blocked.
+        f.thread.state.signal_mask |= 1 << 28;
+        assert_eq!(f.ret(2, &[path, 0o4001, 0]), errno(Errno::EAGAIN));
+        assert_eq!(
+            read(&mut f),
+            format!("1: {}2: {posix}3: {flock}", lease("BREAKING  UNLCK"))
+        );
+        assert_eq!(f.ret(3, &[fd]), 0);
+        assert_eq!(read(&mut f), "");
     }
     #[test]
     fn name_to_handle_at_gives_tmpfs_handles_and_others_identifiers() {
@@ -10651,6 +10795,93 @@ fn seccomp_listener_answers_a_waiting_call() {
     assert_eq!(f.ret(3, &[fd]), 0);
     assert_eq!(f.ret(39, &[]), errno(Errno::ENOSYS));
 }
+/// The thread runs the `vsyscall` page at `entry` with `args`, called from
+/// 0x1234; what it does next.
+fn vsyscall(f: &mut Fixture, entry: u64, args: [u64; 2]) -> Next {
+    let stack = DATA + 0x800;
+    f.mem.write_u64(GuestAddr(stack), 0x1234).unwrap();
+    f.thread.cpu.gpr[reg::RSP] = stack;
+    f.thread.cpu.gpr[reg::RDI] = args[0];
+    f.thread.cpu.gpr[reg::RSI] = args[1];
+    f.thread.cpu.gpr[reg::RDX] = 0x77;
+    let rip = GuestAddr(crate::vsyscall::START + entry);
+    let reason = ExitReason::PageFault {
+        rip,
+        addr: rip,
+        write: false,
+        fetch: true,
+        mapped: false,
+        present: false,
+    };
+    f.kernel.handle(&mut f.thread, &f.mem, reason)
+}
+#[test]
+fn vsyscall_entries_make_their_call_and_return() {
+    let mut f = fixture();
+    for (entry, args) in [
+        (0, [DATA, DATA + 0x20]),
+        (0x400, [DATA, 0]),
+        (0x800, [DATA, DATA + 4]),
+    ] {
+        assert_eq!(vsyscall(&mut f, entry, args), Next::Resume);
+        assert_eq!(f.thread.cpu.rip, GuestAddr(0x1234));
+        assert_eq!(f.thread.cpu.gpr[reg::RSP], DATA + 0x808);
+        assert_eq!(f.thread.cpu.gpr[reg::RDX], 0x77);
+        if entry == 0x400 {
+            let time = f.mem.read_u64(GuestAddr(DATA)).unwrap();
+            assert_eq!(f.thread.cpu.gpr[reg::RAX], time);
+        } else {
+            assert_eq!(f.thread.cpu.gpr[reg::RAX], 0);
+        }
+    }
+    let segv = Next::Exit(ExitStatus::Signaled(signal::SIGSEGV));
+    // No entry, a pointer that cannot be written, and one past user space.
+    for (entry, at) in [(0x10, 0), (0xc00, 0), (0x400, 8), (0x400, u64::MAX - 8)] {
+        let mut f = fixture();
+        assert_eq!(vsyscall(&mut f, entry, [at, 0]), segv);
+    }
+}
+#[test]
+fn vsyscall_calls_go_through_seccomp() {
+    // time is ERRNO(EACCES), getcpu TRAP, gettimeofday the listener's.
+    let mut f = fixture();
+    seccomp_program(
+        &f,
+        &[
+            (0x20, 0, 0, 0),
+            (0x15, 0, 1, 201),
+            (0x06, 0, 0, 0x0005_000d),
+            (0x15, 0, 1, 309),
+            (0x06, 0, 0, 0x0003_0005),
+            (0x15, 0, 1, 96),
+            (0x06, 0, 0, 0x7fc0_0000),
+            (0x06, 0, 0, 0x7fff_0000),
+        ],
+    );
+    let fd = f.ret(317, &[1, 8, DATA]);
+    assert!((3..1024).contains(&fd), "{fd}");
+    assert_eq!(vsyscall(&mut f, 0x400, [0, 0]), Next::Resume);
+    assert_eq!(f.thread.cpu.gpr[reg::RAX], errno(Errno::EACCES));
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x1234));
+    let file = f.kernel.files.descriptor(fd).unwrap().file;
+    let helper = std::thread::spawn(move || {
+        for _ in 0..10_000 {
+            if crate::seccomp::answer_oldest(&file, 77) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    });
+    assert_eq!(vsyscall(&mut f, 0, [0, 0]), Next::Resume);
+    assert!(helper.join().unwrap());
+    assert_eq!(f.thread.cpu.gpr[reg::RAX], 77);
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x1234));
+    assert_eq!(
+        vsyscall(&mut f, 0x800, [0, 0]),
+        Next::Exit(ExitStatus::Signaled(31))
+    );
+}
 #[test]
 fn seccomp_strict_mode_allows_four_calls_and_kills_for_the_rest() {
     let mut f = fixture();
@@ -12682,6 +12913,49 @@ mod mapping_names {
             name(&f, shared).as_deref(),
             Some(&b"/top/moved (deleted)"[..])
         );
+    }
+
+    #[test]
+    fn a_rename_from_another_root_moves_the_name_too() {
+        let mut f = fixture();
+        let path = |f: &Fixture, n: u64, p: &[u8]| {
+            let at = DATA + 0x100 * n;
+            f.mem.write(GuestAddr(at), &[p, b"\0"].concat()).unwrap();
+            at
+        };
+        let map = |f: &mut Fixture, file: u64, flags: u64| {
+            let fd = f.ret(2, &[file, flags, 0o644]);
+            assert!(fd < 1 << 32, "{fd:#x}");
+            if flags != 0 {
+                assert_eq!(f.ret(77, &[fd, 0x1000]), 0);
+            }
+            f.ret(9, &[0, 0x1000, 1, 2, fd, 0])
+        };
+        let jail = path(&f, 0, b"/jail");
+        assert_eq!(f.ret(83, &[jail, 0o755]), 0);
+        let file = path(&f, 1, b"/jail/file");
+        let outside = map(&mut f, file, 0o102);
+        assert_eq!(name(&f, outside).as_deref(), Some(&b"/jail/file"[..]));
+        // chroot("/jail"); then rename("/file", "/moved") from there.
+        assert_eq!(f.ret(161, &[jail]), 0);
+        let (inner, moved) = (path(&f, 2, b"/file"), path(&f, 3, b"/moved"));
+        assert_eq!(f.ret(82, &[inner, moved]), 0);
+        assert_eq!(name(&f, outside).as_deref(), Some(&b"/jail/moved"[..]));
+        // Opened there through an absolute symbolic link, which starts at
+        // that root, and renamed once more.
+        let link = path(&f, 4, b"/link");
+        assert_eq!(f.ret(88, &[moved, link]), 0);
+        let inside = map(&mut f, link, 0);
+        assert_eq!(name(&f, inside).as_deref(), Some(&b"/jail/moved"[..]));
+        let last = path(&f, 5, b"/last");
+        assert_eq!(f.ret(82, &[moved, last]), 0);
+        for at in [outside, inside] {
+            assert_eq!(name(&f, at).as_deref(), Some(&b"/jail/last"[..]));
+        }
+        assert_eq!(f.ret(87, &[last]), 0);
+        for at in [outside, inside] {
+            assert_eq!(name(&f, at).as_deref(), Some(&b"/jail/last (deleted)"[..]));
+        }
     }
 }
 

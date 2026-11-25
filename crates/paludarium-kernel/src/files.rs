@@ -3477,7 +3477,6 @@ pub(crate) fn iovecs_checked(
     }
     Ok(segments)
 }
-/// Copies `bytes` into the guest buffers of `segments`, in order.
 /// The memory an aio or io_uring transfer moves bytes to or from: the
 /// program's, at the addresses of `segments` as they are mapped at the
 /// time, or `len` bytes from `at` of a registered buffer's pinned pages
@@ -3540,6 +3539,7 @@ impl Memory<'_> {
     }
 }
 
+/// Copies `bytes` into the guest buffers of `segments`, in order.
 pub(crate) fn scatter(
     c: &Context<'_>,
     segments: &[(u64, usize)],

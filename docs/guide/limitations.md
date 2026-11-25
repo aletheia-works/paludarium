@@ -557,8 +557,8 @@ verified.
   taken as one that can be polled, which decides when a read uses a ring's
   buffer and whether a transfer waits for it. A ring of buffers in the
   program's memory is not pinned, unlike a registered buffer: the kernel
-  reads and writes it through its mapping at each use, so a read that finds it unmapped fails with `EFAULT`, where Linux uses
-  the pages it pinned.
+  reads and writes it through its mapping at each use, so a read that finds
+  it unmapped fails with `EFAULT`, where Linux uses the pages it pinned.
 - **Native AIO, in part**: every read, write and sync runs as `io_submit`
   takes it, as Linux's buffered I/O does; one of a file opened with
   `O_DIRECT` does not run in the background as on Linux, and a sync's event

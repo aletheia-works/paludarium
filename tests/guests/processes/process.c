@@ -7116,6 +7116,22 @@ static void nvcsw_sleep(int times) {
         nanosleep(&t, NULL);
     }
 }
+/* Waits until zombie `pid` has left its CPU for the last time and its stack
+   is gone, for up to 2 s. A wait for it returns once exit_notify has made it
+   a zombie, before do_task_dead: until then its syscall file reads
+   "running", and between its last switch (which its nvcsw counts) and
+   finish_task_switch's put_task_stack the registers it was killed with. */
+static void zombie_settled(pid_t pid) {
+    char path[64], text[256];
+    snprintf(path, sizeof path, "/proc/%d/syscall", (int)pid);
+    for (int i = 0; i < 2000; i++) {
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (n == 11 && !memcmp(text, "-1 0x0 0x0\n", 11)) return;
+        usleep(1000);
+    }
+}
 static int context_switches_case(void) {
     fflush(stdout);
     pid_t measuring = fork();
@@ -7139,6 +7155,9 @@ static int context_switches_case(void) {
     }
     struct rusage usage;
     siginfo_t info;
+    waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT);
+    /* Its last switch, as it ends, is counted too. */
+    zombie_settled(child);
     memset(&usage, 0, sizeof usage);
     syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, &usage);
     long zombie = usage.ru_nvcsw;
@@ -21353,6 +21372,7 @@ static int proc_syscall_case(void) {
     kill(kid, SIGKILL);
     siginfo_t info;
     waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    zombie_settled(kid);
     psc_path("zombie", path);
     printf("status=%d\n", reaped(kid));
     psc_show("reaped", held);

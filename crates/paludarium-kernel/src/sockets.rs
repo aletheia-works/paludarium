@@ -2182,6 +2182,17 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .set(name, value, false)
             .map(|()| 0);
     }
+    // What an option of more than an `int` has is read before the lock is
+    // taken: the copy may wait for a `userfaultfd`.
+    let raw = match name {
+        SO_LINGER if len < 8 => return Err(Errno::EINVAL),
+        SO_LINGER => read_words(c, a[3], 8)?,
+        SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW if len < 16 => {
+            return Err(Errno::EINVAL);
+        }
+        SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW => read_words(c, a[3], 16)?,
+        _ => Vec::new(),
+    };
     let mut options = socket
         .options
         .lock()
@@ -2213,18 +2224,10 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             options.receive_buffer = buffer_size(value, name == SO_RCVBUFFORCE, MIN_RECEIVE_BUFFER);
         }
         SO_LINGER => {
-            if len < 8 {
-                return Err(Errno::EINVAL);
-            }
-            let raw = read_words(c, a[3], 8)?;
             let seconds = i32::from_le_bytes(raw[4..8].try_into().map_err(|_| Errno::EFAULT)?);
             options.linger = on.then_some(seconds);
         }
         SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW => {
-            if len < 16 {
-                return Err(Errno::EINVAL);
-            }
-            let raw = read_words(c, a[3], 16)?;
             let word = |at: usize| {
                 raw.get(at..at + 8)
                     .and_then(|b| b.try_into().ok())

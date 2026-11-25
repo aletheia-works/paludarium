@@ -467,6 +467,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   は、どれもそう見ます。それを見分けられないホスト（Windows）では、いつも読めると
   します。出力はいつも書けます。パイプの読み出し側は、読まれていないデータがあるときだけ読めるとし、書き手が
   いなくなると切断だけを示します。Linux の `pipe_poll` と同じです。
+  自身のポーリングを持たないファイル（普通のファイル、ディレクトリ、`/dev/null`、`/dev/zero`、
+  `/dev/full`、`/dev/urandom`、プロセスの `/proc` のディレクトリのファイル）は `POLLIN`、
+  `POLLOUT`、`POLLRDNORM`、`POLLWRNORM` を返し（`DEFAULT_POLLMASK`）、`epoll_ctl` は拒みます
+  （`EPERM`）。`/dev/random` は `POLLIN` と `POLLRDNORM` を返します。
 
 - `ppoll`・`select`・`pselect6` も同じように待ちます。Linux と同じく、残りの時間を
   タイムアウトの引数に書き戻し（0 のタイムアウトには書き戻しません）、`ppoll` と
@@ -489,7 +493,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `fdatasync`、`syncfs`、`sync_file_range`、`fadvise64`、`readahead`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
-  `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
+  `select` はどの集合でも準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
   `close` は受け付け、`*at` の呼び出しではディレクトリになります。
 
 - `O_DIRECT` と `O_NOATIME` は、Linux の `open` と `F_SETFL` と同じく確かめます。
@@ -1041,8 +1045,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先に確かめます。そのフォールトは命令のときと同じく届きます。システムコール自身の
   登録したページとのコピーはページを待ち、Linux がカーネルのフォールトをやり直すので
   （`fault_signal_pending`）、致命的でないシグナルでは待ち終わらず、ページが埋まると
-  コピーが進みます。SIGKILL、プロセスの終了、コンテキストの解放は待ちを `EFAULT` で
-  終わらせ、`UFFD_USER_MODE_ONLY` と `UFFD_FEATURE_SIGBUS` はすぐに `EFAULT` です。root のモード 0600 の misc デバイス `/dev/userfaultfd`
+  コピーが進みます。コンテキストの解放でも進みます。SIGKILL とプロセスの終了は待ちを `EFAULT` で
+  終わらせ、`UFFD_USER_MODE_ONLY` と `UFFD_FEATURE_SIGBUS` はすぐに `EFAULT` です。futex の
+  ワードの読み出しは、futex のキューを空けて待ちます。`get_user_pages` も、アドレス空間の
+  ロックを手放せるところでは待ちます。`process_vm_readv` と `process_vm_writev`（相手のタスクの
+  メモリで待ち、バッファーのページをすべて先にフォールトさせてからコピーします）、
+  `MADV_POPULATE_READ`、`MADV_POPULATE_WRITE`、`mlock` などのロックしたページの用意、共有の
+  futex のキーです。手放せないところでは失敗します。`ptrace` と `/proc/<pid>/mem` は `EIO`、
+  コアダンプはホール、`FUTEX_WAKE_OP` のワードは `EFAULT`、`mprotect` によるページの用意は
+  （エラーを無視して）そこまでです。root のモード 0600 の misc デバイス `/dev/userfaultfd`
   （`userfaultfd_misc`。マイナー番号は Linux が起動時に決めます）は、ただ一つの操作である
   ioctl `USERFAULTFD_IOC_NEW` で、引数の下位 32 ビットのフラグのものを、ケーパビリティ
   なしで作ります。デバイスを開ける者は作れるからです。ほかの ioctl、`read`、`write` は
@@ -1512,6 +1523,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スタックの VMA は 8 MiB から始まるので、それより大きい `RLIMIT_STACK` ではそれを
   超えて伸びます。
 
+- `mmap` がヒントなしで置く、2 MiB の倍数のプライベートな anonymous メモリは、Linux の
+  `thp_get_unmapped_area_vmflags` と同じく 2 MiB の境目に置きます。`mmap` が 2 MiB 多く
+  空きを見つけたところで、上から下に置くレイアウトではその空きの始まりが境目なら一つ上の
+  境目に（そのため、そういうマッピングは前のもののすぐ下に来ます）、そうでなければ次の
+  境目に置きます。ヒントなしの `mremap` が 2 MiB の倍数の長さに動かすものも同じです。
+  `/dev/zero` のプライベートなマッピングは、長さにかかわらず、最初の境目を 2 MiB 以上
+  越えるなら、オフセットのそろう境目に置きます（`get_unmapped_area_zero`）。長い空きが
+  ヒントに入るならヒントに置きます。
+
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて
   いません。`pkey_alloc` は `ENOSPC` で、フラグや `PKEY_DISABLE_ACCESS` と
@@ -1667,11 +1687,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - それぞれの `iovec`（`EFAULT`。長さが負なら `EINVAL`）。長さのない null は空のスロットです。
   - 長さが 1 バイトから 1 GiB であること（`EFAULT`）と、終わりがアドレス空間を越えないこと
     （`EOVERFLOW`）。
-  - 書き込めるページであること（`EFAULT`）。
+  - ページを書き込み用に固定できること（`io_pin_pages`、`FOLL_LONGTERM`）。
+    `check_vma_flags` のとおり、マップされていないか書き込めないページ、`perf` のリングか
+    `memfd_secret` のファイルのページ、ディスクのファイル（ページを書き戻すもの）の共有
+    マッピングのページは `EFAULT` です。共有メモリ、memfd、tmpfs は固定でき、ファイルの
+    プライベートなマッピングはそのコピーを固定します。
   - RLIMIT_MEMLOCK の空き（`ENOMEM`）。ユーザーのほかのリングと `memfd_secret` のページと
     共有です。リングを作ったときに `CAP_IPC_LOCK` があれば数えません。
 
-  失敗すると何も登録しません。`IORING_UNREGISTER_BUFFERS` は引数を取らず（`EINVAL`）、
+  失敗すると何も登録しません。固定バッファーの転送は、いまそのアドレスに何がマップされて
+  いても、固定したページを動かします。`munmap` のあとは古いページを動かし、そこに新しく
+  マップしたものには見えません。読み出し専用にしたページも読み出しを受けます。リングを共有
+  するプロセスは登録したプロセスのページを動かします。`fork` は固定したプライベートな
+  ページのコピーを子に渡すので、リングが動かすのは親がそのあと書いたものです
+  （`page_needs_cow_for_dma`）。`IORING_UNREGISTER_BUFFERS` は引数を取らず（`EINVAL`）、
   登録がなければ `ENXIO` です。`IORING_OP_READ_FIXED` と `_WRITE_FIXED` は、ファイルを
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。
@@ -3764,11 +3793,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   分割も Linux と同じです。項目は、範囲、保護、`s` か `p`、ファイル内のオフセット、
   `stat` と同じファイルのデバイス（glibc の `major` と `minor` と同じく分けます）と inode、
   Linux と同じ桁に置く名前です。名前は
-  ファイルのパス（中の改行は `\012` で、どこからも指されなくなれば空白と `(deleted)` が
-  付きます）、`/memfd:<名前> (deleted)`、共有の無名メモリの `/dev/zero (deleted)`、
+  ファイルのパス（中の改行は `\012` で、ファイルやその上のディレクトリの名前の変更に
+  ついて動き（`d_move`）、その名前が消されると空白と `(deleted)` が付きます）、`/memfd:<名前> (deleted)`、共有の無名メモリの `/dev/zero (deleted)`、
   `[heap]`、`[stack]` です。プログラムとインタープリターのセグメントは、Linux の
   ファイルの `d_path` と同じく、`/proc/self/exe` がプログラムを示すのと同じ名前で示します。
-  シンボリックリンクを解決したパスで、ファイルを指す名前がなくなると `(deleted)` が付きます。
+  シンボリックリンクを解決したパスで、名前の変更について動き、その名前が消されると
+  `(deleted)` が付きます。コアの `NT_FILE` ノートも同じ名前で示します。
   Linux の `seq_file` と同じく、読むときに内容を作ります。
   `read` は 1 ページまでの行全体を集め、次に見つけた VMA から続け、その時点の
   マッピングを示します。`lseek` は先頭か現在位置からだけで（末尾からは `EINVAL`）、
@@ -3868,7 +3898,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   制限事項を参照）。開くとそのときのタスクのメモリを取ってそれを持ち続けるので、
   `execve` やタスクの終わりの後は、そのメモリがなくなり何も動きません。読み手自身のメモリか、アタッチできるタスクの
   もの（`PTRACE_MODE_ATTACH` とファイルシステムの ID での `mm_access`。`EACCES`）で、
-  メモリのないタスク（ゾンビ）は `ESRCH` です。
+  メモリのないタスク（ゾンビ）は `ESRCH` です。これも、`pagemap` と `clear_refs` も、
+  マップはできません（`ENODEV`）。
 
 - `/proc/<pid>/clear_refs`（モード 0200、大きさ 0。スレッドのものも）は、Linux の
   `clear_refs_write` と同じく、書き込みの先頭の多くて 12 バイト（書き込みはこれを返します）を、
@@ -5161,8 +5192,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     プロセスとそのリーダーの実ユーザー、実グループ（`NT_PRPSINFO`）、致命的なシグナル（`NT_SIGINFO`）、
     exec が保存した補助ベクトル（Linux の `saved_auxv`。プログラムがスタックに何をしても
     変わりません）、マップしたファイル（`NT_FILE`）、メモリが入ります。`NT_FILE` は
-    ファイルをマップした VMA ごとにそのパスを示し、unlink されたファイルには
-    パスの後に `(deleted)` を付けます。共有の無名メモリは、Linux と同じく
+    ファイルをマップした VMA ごとに、`/proc/<pid>/maps` と同じく名前の変更について動いた
+    パスを示し、その名前が消されるとパスの後に `(deleted)` を付けます。共有の無名メモリは、Linux と同じく
     `/dev/zero (deleted)` と示します。`NT_X86_XSTATE` ノートはありません。Linux は
     XSAVE のない CPU では書かず、仮想 CPU には XSAVE がないからです。メモリは、
     Linux の `vma_dump_size` が既定の `coredump_filter` で選ぶのと同じように
@@ -5295,7 +5326,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     リンク上にあるものとしてそこから出ます。224.0.0.0/24 のグループと limited broadcast の
     アドレスは、そのままそこから出ます（`ip_route_output_key_hash_rcu`）。デバイスが
     なくなれば `ENODEV`、落ちている間は `ENETUNREACH` です。受け付けた接続は、
-    リスナーと同じデバイスに結び付きます。IPv6 のソケットの `IPV6_MULTICAST_IF`（TCP では
+    リスナーと同じデバイスに結び付きます。リスナーにデバイスがなければ、リンクローカルの
+    アドレスからの接続は、入ってきたデバイスに結び付きます（`tcp_v6_init_req`）。IPv6 の
+    ソケットで受け付けた接続の `IPV6_MULTICAST_IF` は、どれも入ってきたデバイスです
+    （`tcp_v6_syn_recv_sock`）。IPv6 のソケットの `IPV6_MULTICAST_IF`（TCP では
     `ENOPROTOOPT`）と `IPV6_UNICAST_IF`（ネットワークバイトオーダー）は、デバイスの
     インデックスを取り（ないデバイスは `ENODEV` と `EADDRNOTAVAIL`）、0 ならなしです。
     `IPV6_PKTINFO`（設定のみ。UDP の送信と同じく、アドレスは使いません）はどのインデックスも
@@ -5304,7 +5338,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスへの UDP のデータグラムと UDP の `connect` は、ソケット自身のデバイス、なければ
     `IPV6_PKTINFO` のもの、なければグループへは `IPV6_MULTICAST_IF` のもの、ほかのアドレスへは
     `IPV6_UNICAST_IF` のものを通ります（`udpv6_sendmsg`、`ip6_datagram_flow_key_init`）。
-    ソケットがアドレスに結び付いていないとき、宛先がグループ、リンクローカル、`::1` の
+    ソケットがデバイスを持つとき、アドレスに結び付いていないとき、宛先がグループ、リンクローカル、`::1` の
     ときは厳密に通り、ほかは、プレフィックスとメトリックが同じ経路の中でそれを優先する
     だけです（`rt6_score_route`）。デバイスのないソケットをリンクのグループに `connect`
     すると、`IPV6_MULTICAST_IF` のものがソケットのデバイスになります。送るたびに経路を
@@ -5317,8 +5351,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     オプション（タイムスタンプ、SACK、ウィンドウスケーリング）、ウィンドウスケール（10、
     ゲストが受信バッファーを設定していればそれ以下）、送ったバイト、確認応答を受けた
     バイト、受け取ったバイト（ハンドシェイクと終わりを含む）、まだ送っていないバイト、
-    データのセグメント、データを最後に送ってから・受け取ってからの時間を返します。UDP の
-    ソケットには TCP のオプションがありません（`EOPNOTSUPP`）。
+    セグメント、データを最後に送ってから・受け取ってからの時間を返します。ループバックの
+    セグメントは Linux が送るとおりです。書き込みごとに 1 つですが、小さいものが確認応答を
+    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` の続きを
+    待つ間（201 ms まで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
+    一緒に、または読んだとき、または 40 ms 後です（`TCP_QUICKACK` で選べます）。はじめは
+    確認応答のないものを 10 個まで送れます。末尾の損失プローブは最後のものを送り直します。
+    終わりは、その前に留まっていたデータと一緒に送ります。終わりの確認応答が来るまでは
+    `FIN_WAIT1` です。UDP のソケットには TCP のオプションがありません（`EOPNOTSUPP`）。
   - **タイムスタンプ**：`recvmsg` は、Linux の `udp_recvmsg`（`sock_recv_timestamp`）と同じく、
     UDP のデータグラムに届いた時刻を付けます。受け手がいつオプションを設定したかによりません。
     `SO_TIMESTAMP` などの制御メッセージを付け、`SO_TIMESTAMPING` のフラグがソフトウェアの

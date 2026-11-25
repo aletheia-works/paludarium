@@ -363,7 +363,8 @@ pub(crate) struct Polls {
     /// ring's lock is held (`io_fallback_tw` queuing it for a worker): at
     /// the next [`complete_ready`], which every call's checkpoint, every
     /// wait and every thread's exit runs, so before the call that queued it
-    /// returns.
+    /// returns. Work of a ring another thread holds stays for that thread to
+    /// run once it lets go ([`run_fallback`]).
     fallback: Mutex<Vec<(std::sync::Weak<dyn FileHandle>, Deferred)>>,
     /// Every ring, which a thread's `execve` or exit looks through for its
     /// requests (`tctx->xa`).
@@ -664,11 +665,21 @@ impl Files {
     }
 }
 
+/// The part of a registered buffer a request moves
+/// ([`Ring::registered`]).
+struct Registered {
+    pages: Arc<paludarium_mmu::Pinned>,
+    at: usize,
+    len: usize,
+}
+
 /// A ring's registered buffers: each slot's address and length, or none
 /// for a slot registered empty, and the pages they charge, which they give
 /// back as they go.
 struct Buffers {
-    slots: Vec<Option<(u64, u64)>>,
+    /// Each registered buffer: its address and length, and its pages,
+    /// pinned (`io_pin_pages`), which a request holds while it moves them.
+    slots: Vec<Option<(u64, u64, Arc<paludarium_mmu::Pinned>)>>,
     charged: Option<(Arc<crate::memfd::SecretPages>, u32)>,
     pages: u64,
 }
@@ -826,6 +837,20 @@ impl Ring {
 
     fn store_u32(&self, at: u64, value: u32) {
         self.rings.store(at, &value.to_le_bytes());
+    }
+    /// Its lock, held across a submission or a run of its task work.
+    fn submitting(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.submitting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// [`Self::submitting`], if no one holds it.
+    fn try_submitting(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.submitting.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1368,13 +1393,25 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
     };
     if transfer.registered {
         let within = ring.registered(transfer.buf_index, transfer.addr, transfer.len);
-        let wanted = within.as_ref().map_or(0, |&within| asked(&[within]));
-        let result = within.and_then(|within| issue(c, transfer, &opened, &[within]));
+        let wanted = within.as_ref().map_or(0, |within| within.len as u64);
+        let result = within.and_then(|within| {
+            let memory = crate::files::Memory::Pinned {
+                pages: &within.pages,
+                at: within.at,
+                len: within.len,
+            };
+            issue(c, transfer, &opened, memory)
+        });
         let poll = waits(&result, None);
         return (result, 0, poll, wanted);
     }
     if !transfer.select {
-        let result = issue(c, transfer, &opened, &transfer.segments);
+        let result = issue(
+            c,
+            transfer,
+            &opened,
+            crate::files::Memory::Guest(&transfer.segments),
+        );
         let poll = waits(&result, None);
         return (result, 0, poll, asked(&transfer.segments));
     }
@@ -1387,8 +1424,10 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
         },
     };
     let len = u64::from(chosen.len).min(crate::files::MAX_RW_COUNT as u64);
-    let result = crate::sockets::access_ok_u64(chosen.addr, len)
-        .and_then(|()| issue(c, transfer, &opened, &[(chosen.addr, len as usize)]));
+    let result = crate::sockets::access_ok_u64(chosen.addr, len).and_then(|()| {
+        let segment = [(chosen.addr, len as usize)];
+        issue(c, transfer, &opened, crate::files::Memory::Guest(&segment))
+    });
     // A read that waits keeps a provided buffer; a ring's stays at the
     // ring's head (`io_kbuf_recycle`, as a file that can be polled uses it
     // only once its read is done) and is chosen again as the read goes on.
@@ -1435,7 +1474,7 @@ fn issue(
     c: &mut Context<'_>,
     transfer: &Transfer,
     opened: &crate::files::Descriptor,
-    segments: &[(u64, usize)],
+    memory: crate::files::Memory<'_>,
 ) -> Result<u64, Errno> {
     let file = &opened.file;
     if file.flags() & 3 == if transfer.write { 0 } else { 1 } {
@@ -1446,7 +1485,7 @@ fn issue(
         return Err(Errno::EINVAL);
     }
     let result =
-        crate::files::ring_transfer(c, file, transfer.write, segments, transfer.offset, flags)?;
+        crate::files::ring_transfer(c, file, transfer.write, memory, transfer.offset, flags)?;
     // A write that would wait waits for its file ([`arm`]), and its watches
     // hear of it only once it ends; one that asked for `RWF_NOWAIT` ends at
     // once, and they hear of it.
@@ -1816,15 +1855,50 @@ fn ready(file: &Arc<dyn FileHandle>, mask: u32) -> bool {
 /// ([`crate::SignalInbox::notify_signal`]).
 pub(crate) fn complete_ready(polls: &Polls) {
     wake(polls);
-    let fallback = std::mem::take(
-        &mut *polls
+    run_fallback(polls);
+}
+
+/// Runs [`Polls::fallback`], but leaves the work of a ring whose lock is
+/// held, as Linux's worker waits for it (`io_fallback_req_func`, master's
+/// `io_tctx_fallback_work`) and no other task does: its holder may wait for a
+/// page that this thread is to fill. The holder runs it after it lets go:
+/// each holder then comes here, or to [`complete_ready`] at the end of its
+/// call or as it waits. The work of a ring that closed is dropped, and with
+/// it the files its requests hold: no one sees its completions.
+fn run_fallback(polls: &Polls) {
+    let queue = || {
+        polls
             .fallback
             .lock()
-            .unwrap_or_else(PoisonError::into_inner),
-    );
-    for (file, work) in fallback {
-        if let Some(file) = file.upgrade() {
-            run_terminated(&file, work);
+            .unwrap_or_else(PoisonError::into_inner)
+    };
+    loop {
+        let work = std::mem::take(&mut *queue());
+        let (mut busy, mut ran) = (Vec::new(), false);
+        for (weak, work) in work {
+            let Some(file) = weak.upgrade() else {
+                continue;
+            };
+            let Ok(ring) = downcast(&file) else {
+                continue;
+            };
+            match ring.try_submitting() {
+                Some(_submitting) => {
+                    run_terminated(ring, work);
+                    ran = true;
+                }
+                None => busy.push((weak, work)),
+            }
+        }
+        let held: Vec<_> = busy.iter().filter_map(|(weak, _)| weak.upgrade()).collect();
+        // Before what came meanwhile.
+        queue().splice(0..0, busy);
+        // A holder that let go before the work was back may not have seen it.
+        let free = held
+            .iter()
+            .any(|file| downcast(file).is_ok_and(|ring| ring.try_submitting().is_some()));
+        if !ran && !free {
+            return;
         }
     }
 }
@@ -1990,8 +2064,11 @@ pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
     };
     inbox.clear_notify_if_idle();
     for (file, work) in work {
-        if let Some(file) = file.upgrade() {
-            run_terminated(&file, work);
+        if let Some(file) = file.upgrade()
+            && let Ok(ring) = downcast(&file)
+        {
+            let _submitting = ring.submitting();
+            run_terminated(ring, work);
         }
     }
 }
@@ -2001,15 +2078,9 @@ pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
 /// exited (`io_should_terminate_tw`): a request that waited for its file
 /// fails with `ECANCELED` (`io_poll_check_events`), a link's next request
 /// or one that found its file ready with `EFAULT` (`io_req_task_submit`),
-/// and the rest completes as it would. What it leaves runs so too.
-fn run_terminated(file: &Arc<dyn FileHandle>, work: Deferred) {
-    let Ok(ring) = downcast(file) else {
-        return;
-    };
-    let _submitting = ring
-        .submitting
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+/// and the rest completes as it would. What it leaves runs so too. The
+/// ring's lock is held.
+fn run_terminated(ring: &Ring, work: Deferred) {
     let mut pending = vec![work];
     while !pending.is_empty() {
         ring.begin();
@@ -2455,22 +2526,17 @@ pub(crate) fn run_task_work(c: &mut Context<'_>) {
             current = Some(Arc::clone(&file));
         }
         if let Ok(ring) = downcast(&file) {
-            let _submitting = ring
-                .submitting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let _submitting = ring.submitting();
             run_deferred(c, &file, ring, work);
         }
     }
+    run_fallback(&c.processes.io_uring);
 }
 
 fn end_task_work(c: &mut Context<'_>, file: &Arc<dyn FileHandle>) {
     if let Ok(ring) = downcast(file) {
         ring.mark_taskrun(false);
-        let _submitting = ring
-            .submitting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _submitting = ring.submitting();
         flush_batch(c, file, ring);
     }
 }
@@ -2505,10 +2571,7 @@ fn run_local(
         ring.mark_taskrun(true);
         false
     };
-    let _submitting = ring
-        .submitting
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let _submitting = ring.submitting();
     ring.mark_taskrun(false);
     let mut min = i64::from(min_events);
     let mut ran = 0;
@@ -2615,6 +2678,11 @@ fn ring_of(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
         return Err(EOPNOTSUPP);
     }
     Ok(d.file)
+}
+
+#[cfg(test)]
+pub(crate) fn hold(file: &Arc<dyn FileHandle>) -> std::sync::MutexGuard<'_, ()> {
+    downcast(file).unwrap().submitting()
 }
 
 fn downcast(file: &Arc<dyn FileHandle>) -> Result<&Ring, Errno> {
@@ -2820,10 +2888,7 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             return Err(EEXIST);
         }
         {
-            let _submitting = ring
-                .submitting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let _submitting = ring.submitting();
             ring.flush(&mut ring.state());
             submitted = submit(c, &file, ring, to_submit);
         }
@@ -3411,9 +3476,14 @@ fn register_buffers(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> R
         {
             return Err(EOVERFLOW);
         }
-        c.mem
-            .check_write(GuestAddr(base), len as usize)
-            .map_err(|_| Errno::EFAULT)?;
+        // `io_pin_pages`, then `io_buffer_account_pin`.
+        let pinned = c.mem.pin(GuestAddr(base), len as usize).map_err(|e| {
+            if e == EOVERFLOW {
+                EOVERFLOW
+            } else {
+                Errno::EFAULT
+            }
+        })?;
         let pages = (base % 4096 + len).div_ceil(4096);
         if let Some((charged, user)) = &buffers.charged
             && !charged.charge(*user, pages, limit)
@@ -3421,7 +3491,7 @@ fn register_buffers(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> R
             return Err(Errno::ENOMEM);
         }
         buffers.pages += pages;
-        buffers.slots.push(Some((base, len)));
+        buffers.slots.push(Some((base, len, Arc::new(pinned))));
     }
     *registered = Some(buffers);
     Ok(0)
@@ -3578,17 +3648,21 @@ impl Ring {
     /// as `io_import_reg_buf` finds them: none registered there, a range
     /// that wraps or leaves the buffer, or more than `MAX_RW_COUNT`, is
     /// `EFAULT` (`validate_fixed_range`).
-    fn registered(&self, index: u16, addr: u64, len: u32) -> Result<(u64, usize), Errno> {
+    fn registered(&self, index: u16, addr: u64, len: u32) -> Result<Registered, Errno> {
         let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
-        let (base, size) = buffers
+        let (base, size, pages) = buffers
             .as_ref()
-            .and_then(|buffers| buffers.slots.get(usize::from(index)).copied().flatten())
+            .and_then(|buffers| buffers.slots.get(usize::from(index)).cloned().flatten())
             .ok_or(Errno::EFAULT)?;
         let end = addr.checked_add(u64::from(len)).ok_or(Errno::EFAULT)?;
         if addr < base || end > base + size || len as usize > crate::files::MAX_RW_COUNT {
             return Err(Errno::EFAULT);
         }
-        Ok((addr, len as usize))
+        Ok(Registered {
+            pages,
+            at: (addr - base) as usize,
+            len: len as usize,
+        })
     }
 }
 

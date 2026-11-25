@@ -19,6 +19,9 @@ use std::hash::DefaultHasher;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
+pub(crate) mod segments;
+use segments::{Counts, Flows, Push};
+
 const EADDRINUSE: Errno = Errno(98);
 const ECONNRESET: Errno = Errno(104);
 /// Linux's default `net.ipv4.ip_local_port_range`.
@@ -70,6 +73,8 @@ pub(crate) struct Link {
     /// The urgent byte toward each side, and what tells each of its arrival.
     urgent: Mutex<[Urgent; 2]>,
     notify: [Notify; 2],
+    /// The segments the bytes take on Linux.
+    flows: Mutex<Flows>,
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -99,6 +104,10 @@ impl Link {
             host: Arc::clone(host),
             urgent: Mutex::default(),
             notify,
+            flows: Mutex::new(Flows::new(
+                crate::tcp_info::advertised_mss(client_local.is_ipv4()),
+                micros(host),
+            )),
         });
         client.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
         server.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
@@ -119,6 +128,7 @@ impl Link {
             .take();
         self.first.store(RESET, Ordering::SeqCst);
         let Some(ends) = ends else { return };
+        self.flows().reset(side, self.micros());
         let (own, peer) = (&ends.streams[side], &ends.streams[1 - side]);
         if !gone(peer) {
             let waiting = ends.ended[side] && !peer.readiness().write_closed;
@@ -181,7 +191,12 @@ impl Link {
                     // The closed side answers with a reset, which ends its
                     // `TIME_WAIT` too.
                     self.first.store(RESET, Ordering::SeqCst);
-                    own.take(usize::MAX);
+                    let lost = own.take(usize::MAX).len() as u64;
+                    let now = self.micros();
+                    let mut flows = self.flows();
+                    flows.write(from, lost, now);
+                    flows.reset(1 - from, now);
+                    drop(flows);
                     own.fail(if ends.ended[1 - from] {
                         Errno::EPIPE
                     } else {
@@ -213,6 +228,29 @@ impl Link {
     }
 }
 impl Link {
+    fn flows(&self) -> MutexGuard<'_, Flows> {
+        self.flows.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The host's monotonic clock, in microseconds.
+    fn micros(&self) -> u64 {
+        micros(&self.host)
+    }
+    /// What `side`'s writes go with from now on.
+    pub(crate) fn sending(&self, side: usize, push: Push) {
+        self.flows().sending(side, push);
+    }
+    /// `side`'s `TCP_NODELAY` was set or cleared.
+    pub(crate) fn set_no_delay(&self, side: usize, on: bool) {
+        self.flows().set_no_delay(side, on, self.micros());
+    }
+    /// `side`'s `TCP_QUICKACK` was set to `value`.
+    pub(crate) fn set_quick(&self, side: usize, value: i32) {
+        self.flows().set_quick(side, value, self.micros());
+    }
+    /// The segments `side` has sent and received.
+    pub(crate) fn segments(&self, side: usize) -> Counts {
+        self.flows().counts(side, self.micros())
+    }
     fn urgent(&self) -> MutexGuard<'_, [Urgent; 2]> {
         self.urgent.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -238,6 +276,7 @@ impl Link {
     }
     /// `count` more bytes reached `to`.
     fn delivered(&self, to: usize, count: usize) {
+        self.flows().write(1 - to, count as u64, self.micros());
         let arrived = {
             let mut all = self.urgent();
             all[to].delivered += count as u64;
@@ -323,6 +362,8 @@ impl Link {
         if way.stale.is_some_and(|at| at < way.copied) {
             way.stale = None;
         }
+        drop(all);
+        self.flows().read(side, count as u64, self.micros());
     }
     /// The urgent byte waiting for `side`'s `MSG_OOB`, which a read without
     /// `peek` takes (`tcp_recv_urg`).
@@ -357,6 +398,7 @@ impl Link {
             return;
         }
         ended[from] = true;
+        self.flows().end(from, self.micros());
         // Without the host's clock the end counts as long past, so that no
         // hold waits on it.
         let now = self
@@ -395,6 +437,10 @@ impl Driver for Link {
     fn kick(&self) {
         self.pump();
     }
+}
+/// `host`'s monotonic clock, in microseconds; 0 without one.
+fn micros(host: &Arc<dyn paludarium_host::Host>) -> u64 {
+    host.clock(paludarium_host::ClockId::Monotonic).unwrap_or(0) / 1000
 }
 /// Whether `stream`'s socket has closed it or it was reset.
 fn gone(stream: &Stream) -> bool {

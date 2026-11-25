@@ -72,8 +72,17 @@ const NO_NODE: u32 = u32::MAX;
 /// word (`EINVAL`), and lies below `TASK_SIZE_MAX` (`EFAULT`); a node word
 /// names node 0, the only one here, or none, which becomes node 0 (`EINVAL`,
 /// and `EFAULT` when it cannot be read or written); and a shared word's page
-/// is there (`EFAULT`), where a private one's is not looked at.
-fn checked_key(mem: &AddressSpace, addr: u64, private: bool, numa: bool) -> Result<Key, Errno> {
+/// is brought in through `get_user_pages_fast`, to be written
+/// (`FOLL_WRITE`) or, unless `write` (`FUTEX_WRITE`), else to be read
+/// (`EFAULT`), which waits for a `userfaultfd`, where a private one's is
+/// not looked at.
+fn checked_key(
+    mem: &AddressSpace,
+    addr: u64,
+    private: bool,
+    numa: bool,
+    write: bool,
+) -> Result<Key, Errno> {
     let size = if numa { 8 } else { 4 };
     if !addr.is_multiple_of(size) {
         return Err(Errno::EINVAL);
@@ -94,8 +103,11 @@ fn checked_key(mem: &AddressSpace, addr: u64, private: bool, numa: bool) -> Resu
         }
     }
     if !private {
-        mem.check_read(GuestAddr(addr), 4)
-            .map_err(|_| Errno::EFAULT)?;
+        let (view, page) = (mem.view(), addr & !4095);
+        let brought = |write| view.fault_in_pages(page, 1, write) == Some(1);
+        if !brought(true) && (write || !brought(false)) {
+            return Err(Errno::EFAULT);
+        }
     }
     Ok(key(mem, addr, private))
 }
@@ -131,6 +143,33 @@ fn wake_queue(
 /// `FUTEX_OP_OPARG_SHIFT`, the bit of an encoded operation that makes its
 /// argument a shift of 1.
 const OPARG_SHIFT: u32 = 8 << 28;
+/// A locked instruction on the word at `addr`, as Linux's
+/// `arch_futex_atomic_op_inuser` and `futex_cmpxchg_value_locked` with
+/// `fault_in_user_writeable`: that faults the page in through
+/// `fixup_user_fault` with the space's lock kept, so a `userfaultfd` is not
+/// waited for.
+fn atomic(
+    mem: &AddressSpace,
+    addr: u64,
+    operation: AtomicOp,
+) -> Result<paludarium_mmu::AtomicResult, paludarium_mmu::Fault> {
+    paludarium_mmu::faults::through_gup_locked(|| {
+        mem.atomic(GuestAddr(addr), AtomicWidth::W32, operation)
+    })
+}
+/// The word at `addr` as the holder of the queues reads it
+/// (`futex_get_value_locked`): `None` when it faults, for its caller to let
+/// the queues go, read it ([`get_user`]) and start again.
+fn value_locked(mem: &AddressSpace, addr: u64) -> Option<u32> {
+    let mut bytes = [0; 4];
+    paludarium_mmu::faults::unresolved(|| mem.read(GuestAddr(addr), &mut bytes)).ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+/// Linux's `get_user` of the word at `addr`, which may wait.
+fn get_user(mem: &AddressSpace, addr: u64) -> Result<(), Errno> {
+    mem.read(GuestAddr(addr), &mut [0; 4])
+        .map_err(|_| Errno::EFAULT)
+}
 /// The operation `FUTEX_WAKE_OP` encodes, done on the word at `addr` as
 /// Linux's `futex_atomic_op_inuser` and x86's `arch_futex_atomic_op_inuser`
 /// do: bits 28 to 30 the operation (set, add, or, and-not, xor; any other
@@ -157,10 +196,8 @@ fn futex_op(mem: &AddressSpace, addr: u64, encoded: u32) -> Result<bool, Errno> 
         4 => AtomicOp::Xor(value),
         _ => return Err(Errno::ENOSYS),
     };
-    let old = mem
-        .atomic(GuestAddr(addr), AtomicWidth::W32, operation)
-        .map_err(|_| Errno::EFAULT)?
-        .old as u32 as i32;
+    // Its fault is `fault_in_user_writeable`'s, which waits for nothing.
+    let old = atomic(mem, addr, operation).map_err(|_| Errno::EFAULT)?.old as u32 as i32;
     match encoded >> 24 & 15 {
         0 => Ok(old == cmparg),
         1 => Ok(old != cmparg),
@@ -212,19 +249,24 @@ impl Futexes {
         mem: &AddressSpace,
         words: &[Word],
     ) -> Result<Vec<Arc<Waiter>>, Errno> {
-        let keys = words
-            .iter()
-            .map(|w| checked_key(mem, w.addr, w.private, w.numa))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
-        for word in words {
-            let mut bytes = [0; 4];
-            mem.read(GuestAddr(word.addr), &mut bytes)
-                .map_err(|_| Errno::EFAULT)?;
-            if u32::from_le_bytes(bytes) != word.value {
-                return Err(Errno::EAGAIN);
+        let (keys, mut queues) = 'retry: loop {
+            let keys = words
+                .iter()
+                .map(|w| checked_key(mem, w.addr, w.private, w.numa, false))
+                .collect::<Result<Vec<_>, _>>()?;
+            let queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+            for word in words {
+                let Some(value) = value_locked(mem, word.addr) else {
+                    drop(queues);
+                    get_user(mem, word.addr)?;
+                    continue 'retry;
+                };
+                if value != word.value {
+                    return Err(Errno::EAGAIN);
+                }
             }
-        }
+            break (keys, queues);
+        };
         let token = Arc::new(WaitToken::default());
         let waiters = words
             .iter()
@@ -275,7 +317,7 @@ impl Futexes {
         if mask == 0 {
             return Err(Errno::EINVAL);
         }
-        let key = checked_key(mem, addr, private, numa)?;
+        let key = checked_key(mem, addr, private, numa, false)?;
         if strict && count == 0 {
             return Ok(0);
         }
@@ -300,12 +342,8 @@ impl Futexes {
         wake2: i32,
         op: u32,
     ) -> Result<u64, Errno> {
-        let first_key = checked_key(mem, first, private, false)?;
-        let second_key = checked_key(mem, second, private, false)?;
-        if !private {
-            mem.check_write(GuestAddr(second), 4)
-                .map_err(|_| Errno::EFAULT)?;
-        }
+        let first_key = checked_key(mem, first, private, false, false)?;
+        let second_key = checked_key(mem, second, private, false, true)?;
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
         let held = futex_op(mem, second, op)?;
         let mut woke = wake_queue(&mut queues, first_key, wake, u32::MAX);
@@ -335,17 +373,22 @@ impl Futexes {
         if wake < 0 || requeue < 0 {
             return Err(Errno::EINVAL);
         }
-        let first = checked_key(mem, from.0, from.1, from.2)?;
-        let second = checked_key(mem, to.0, to.1, to.2)?;
-        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(value) = compare {
-            let mut bytes = [0; 4];
-            mem.read(GuestAddr(from.0), &mut bytes)
-                .map_err(|_| Errno::EFAULT)?;
-            if u32::from_le_bytes(bytes) != value {
-                return Err(Errno::EAGAIN);
+        let (first, second, mut queues) = loop {
+            let first = checked_key(mem, from.0, from.1, from.2, false)?;
+            let second = checked_key(mem, to.0, to.1, to.2, false)?;
+            let queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(value) = compare else {
+                break (first, second, queues);
+            };
+            match value_locked(mem, from.0) {
+                Some(found) if found != value => return Err(Errno::EAGAIN),
+                Some(_) => break (first, second, queues),
+                None => {
+                    drop(queues);
+                    get_user(mem, from.0)?;
+                }
             }
-        }
+        };
         let Some(queue) = queues.remove(&first) else {
             return Ok(0);
         };
@@ -431,16 +474,15 @@ fn futex_death(
         if value & FUTEX_TID_MASK != tid {
             return Some(());
         }
-        let result = mem
-            .atomic(
-                GuestAddr(addr),
-                AtomicWidth::W32,
-                AtomicOp::CompareExchange {
-                    expected: u128::from(value),
-                    replacement: u128::from(value & FUTEX_WAITERS | FUTEX_OWNER_DIED),
-                },
-            )
-            .ok()?;
+        let result = atomic(
+            mem,
+            addr,
+            AtomicOp::CompareExchange {
+                expected: u128::from(value),
+                replacement: u128::from(value & FUTEX_WAITERS | FUTEX_OWNER_DIED),
+            },
+        )
+        .ok()?;
         if result.exchanged {
             if !pi && value & FUTEX_WAITERS != 0 {
                 let _ = futexes.wake(mem, addr, false, 1, u32::MAX);

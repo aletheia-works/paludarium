@@ -1888,6 +1888,14 @@ impl FileHandle for MemFile {
     }
 }
 
+/// Whether `file` is one of `/proc`'s files that a read takes at an offset,
+/// which have no `mmap` (`ENODEV`), as no file `/proc` generates has.
+pub(crate) fn unmappable(file: &dyn FileHandle) -> bool {
+    file.as_any().is_some_and(|any| {
+        any.is::<PagemapFile>() || any.is::<MemFile>() || any.is::<ClearRefsFile>()
+    })
+}
+
 /// The address space `clear_refs` acts on at a write: the task's then,
 /// `None` once it has none (a zombie), or `ESRCH` once it is gone.
 pub(crate) type CurrentMemory = Arc<dyn Fn() -> Result<Option<MemoryView>, Errno> + Send + Sync>;

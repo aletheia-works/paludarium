@@ -100,7 +100,7 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 - レジスタからの `movzx`、レジスタまたはメモリからの `movsx` と `movsxd`、`cbw`、`cwde`、`cdqe`、16 ビットか 32 ビットのレジスタへの `lea`
 - レジスタと（`lock` なしの）メモリに対する `inc`、`dec`、`neg`、`not`
 - `setcc` と `cmovcc`
-- レジスタから同じ大きさのレジスタへの `tzcnt`、`lzcnt`、`popcnt`、`bsf`、`bsr`、レジスタのレジスタか即値による `bt`、32 ビットか 64 ビットのレジスタの `bswap`
+- レジスタから同じ大きさのレジスタへの `tzcnt`、`lzcnt`、`popcnt`、`bsf`、`bsr`、レジスタのレジスタか即値による `bt`、`bts`、`btr`、`btc`、32 ビットか 64 ビットのレジスタの `bswap`
 - レジスタによる rdx:rax への `mul` と `imul`、rdx:rax のレジスタによる `div` と `idiv`、2 つのレジスタまたはレジスタと即値の `imul`
 - xmm レジスタとメモリの間の `movaps`、`movups`、`movdqa`、`movdqu`、`movapd`、`movupd`、xmm レジスタどうしの `pxor` と `xorps`、xmm レジスタと汎用レジスタまたはメモリの間の `movd` と `movq`、xmm レジスタどうしの `movq`、xmm レジスタとメモリの間の SSE2 の `movsd`
 - xmm レジスタどうしの `pshufd`、`pshuflw`、`pshufhw`、`punpckl` と `punpckh` の各アンパック、`packuswb`、`packsswb`、`packssdw`、`paddd`、`psubd`、`paddq`、`psubq`、`pmuludq`、`pand`、`por`、`pandn`、`pcmpeqb`、`pcmpeqw`、`pcmpeqd`、即値による `pslld` と `psrld`、`pmovmskb`

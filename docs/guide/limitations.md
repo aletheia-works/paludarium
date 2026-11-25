@@ -123,10 +123,15 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route` and
-  `route` alone; `tcp`, `udp`, `unix`, `igmp`, `snmp`, `sockstat` and the rest
-  are `ENOENT`, and no counter is kept, so those of `dev` are 0. A session
-  with no network has files of no device.
+- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route`,
+  `route` and those of the sockets (see [features](./features)) alone; `igmp`,
+  `snmp`, `sockstat` and the rest are `ENOENT`, and no counter is kept, so
+  those of `dev` are 0. A session with no network has files of no device and
+  no Internet socket. Of a socket, its address in the kernel is 0, its
+  references are the same for each of a kind, the memory its unsent
+  datagrams and messages take is 0, and so is a TCP connection's `quick` with
+  `pingpong`; no timer shows while it waits for an acknowledgement. `netlink` leaves out
+  the kernel's own sockets, whose port is 0.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,

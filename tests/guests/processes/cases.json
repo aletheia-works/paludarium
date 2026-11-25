@@ -90,6 +90,7 @@
     {"name":"veth-ipv6-scope","binary":"veth-ipv6-scope"},
     {"name":"veth-ipv6-traffic","binary":"veth-ipv6-traffic"},
     {"name":"proc-net","binary":"proc-net"},
+    {"name":"proc-net-sockets","binary":"proc-net-sockets"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

@@ -4612,6 +4612,15 @@ kernel.
     0 (`fib_flag_trans`); `ipv6_route`
     (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - `tcp`, `tcp6`, `udp` and `udp6`, the sockets `sock_diag` tells of, but
+    for TCP ones bound alone, in the format of Linux 7.0's `tcp4_seq_show` and
+    the like: first the listeners, then the connections, with those in
+    `TIME_WAIT`. `unix` (`unix_seq_show`) has a connection not yet accepted
+    too, and `netlink` (`netlink_native_seq_show`) the sockets that are
+    bound. Owners show as the opener's user namespace has them.
+  - `raw`, `raw6`, `icmp`, `icmp6` and `packet`, of kinds of socket there are
+    none of, hold their header alone. There is no `udplite`, as Linux has no
+    UDP-Lite any more.
   - Any other name there is `ENOENT`, with `--mount /:/` too: the host's
     sockets and devices are not the guest's.
 

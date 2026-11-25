@@ -418,7 +418,38 @@ pub(crate) struct Ports {
     /// Its IDs of its peers ([`nsid`]).
     ids: nsid::Ids,
 }
+/// What `/proc/net/netlink` shows of a socket that is bound.
+pub(crate) struct Shown {
+    pub(crate) protocol: u32,
+    pub(crate) port: u32,
+    /// The first 32 groups it is a member of.
+    pub(crate) groups: u32,
+    /// What waits to be received takes.
+    pub(crate) received: usize,
+    /// A dump runs (`cb_running`).
+    pub(crate) dumping: bool,
+    pub(crate) inode: u64,
+}
 impl Ports {
+    /// What `/proc/net/netlink` shows: the sockets bound, protocol by
+    /// protocol.
+    pub(crate) fn shown(&self) -> Vec<Shown> {
+        [&self.route, &self.diag, &self.generic]
+            .into_iter()
+            .flat_map(Table::members)
+            .filter_map(|socket| {
+                let s = socket.state.lock().unwrap_or_else(PoisonError::into_inner);
+                Some(Shown {
+                    protocol: socket.protocol,
+                    port: s.port?,
+                    groups: s.groups as u32,
+                    received: s.queued + s.charged,
+                    dumping: s.done.is_some(),
+                    inode: socket.inode,
+                })
+            })
+            .collect()
+    }
     fn table(&self, protocol: u32) -> &Table {
         match protocol {
             NETLINK_GENERIC => &self.generic,

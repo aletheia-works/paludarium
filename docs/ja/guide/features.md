@@ -3968,6 +3968,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     IPv6 のゲートウェイ（`RTA_VIA`）は 00000000 で、その先頭 4 バイトが 0 でなければ `RTF_GATEWAY` です（`fib_flag_trans`）。
     `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
     `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
+  - `tcp`、`tcp6`、`udp`、`udp6` は、`sock_diag` が伝えるソケットで、バインドしただけの TCP の
+    ものを除きます。形式は Linux 7.0 の `tcp4_seq_show` などと同じで、待ち受けるもの、続けて
+    `TIME_WAIT` のものを含む接続の順です。`unix`（`unix_seq_show`）には、まだ受け付けていない
+    接続もあり、`netlink`（`netlink_native_seq_show`）には、バインドしたソケットがあります。
+    所有者は、開いたプロセスのユーザー名前空間での ID です。
+  - `raw`、`raw6`、`icmp`、`icmp6`、`packet` は、ここにない種類のソケットのもので、見出しだけ
+    です。Linux から UDP-Lite がなくなったので、`udplite` はありません。
   - ほかの名前は、`--mount /:/` でも `ENOENT` です。ホストのソケットとデバイスは、ゲストの
     ものではありません。
 

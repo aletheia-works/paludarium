@@ -493,6 +493,7 @@ impl PipeEnd {
     }
     /// `F_GETPIPE_SZ`.
     pub(crate) fn size(&self) -> u64 {
+        let _held = self.hold();
         self.endpoint.pair.window() as u64
     }
     /// `F_SETPIPE_SZ`, as Linux's `pipe_set_size`: the size rounds up to a
@@ -504,6 +505,7 @@ impl PipeEnd {
             return Err(Errno::EINVAL);
         }
         let size = size.max(4096).next_power_of_two() as usize;
+        let _held = self.hold();
         let sides = self
             .endpoint
             .pair
@@ -542,6 +544,27 @@ impl PipeEnd {
     /// Whether `other` is a description of this same pipe.
     pub(crate) fn same_pipe(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.endpoint.pair, &other.endpoint.pair)
+    }
+    /// Takes the pipe for what looks at its bytes or its room and then
+    /// moves some, as Linux holds `pipe->mutex` meanwhile: the copies of
+    /// `splice` and `vmsplice` may wait with it held, for a `userfaultfd`
+    /// or for a file's data or room, and then everything else that moves
+    /// the pipe's bytes, `FIONREAD`, `F_SETPIPE_SZ` and the close of an end
+    /// ([`closing`]) wait for it, though a signal does not end their wait
+    /// (`mutex_lock`); a poll does not. Not held while the pipe itself is
+    /// waited for (`pipe_wait_readable`).
+    pub(crate) fn hold(&self) -> Held<'_> {
+        self.endpoint.pair.hold()
+    }
+    /// Takes this pipe and another, in the order everyone takes the two
+    /// (`pipe_double_lock`).
+    pub(crate) fn hold_both<'a>(&'a self, other: &'a Self) -> [Held<'a>; 2] {
+        let (one, two) = (&self.endpoint.pair, &other.endpoint.pair);
+        if Arc::as_ptr(one) < Arc::as_ptr(two) {
+            [one.hold(), two.hold()]
+        } else {
+            [two.hold(), one.hold()]
+        }
     }
     /// The bytes waiting to be read.
     pub(crate) fn unread_bytes(&self) -> usize {
@@ -614,6 +637,14 @@ impl PipeEnd {
     pub(crate) fn has_writers(&self) -> bool {
         !self.endpoint.lock_sides()[1 - self.read_side()].closed
     }
+    /// The bytes of the first buffer, at most `len`; none with no unread
+    /// bytes.
+    pub(crate) fn first_buffer(&self, len: usize) -> Option<usize> {
+        self.endpoint.lock_sides()[self.read_side()]
+            .pipe_bufs
+            .front()
+            .map(|buf| buf.len.min(len))
+    }
     /// Copies the first unread bytes into `buf`, leaving them in the pipe,
     /// and returns how many there were.
     pub(crate) fn peek(&self, buf: &mut [u8]) -> usize {
@@ -632,6 +663,7 @@ impl FileHandle for PipeEnd {
     }
     fn read(&self, bytes: &mut [u8]) -> Result<usize, Errno> {
         if self.reader {
+            let _held = self.hold();
             self.endpoint.read(bytes)
         } else {
             Err(Errno::EBADF)
@@ -639,6 +671,7 @@ impl FileHandle for PipeEnd {
     }
     fn write(&self, bytes: &[u8]) -> Result<usize, Errno> {
         let packet = self.direct.load(Ordering::SeqCst);
+        let _held = self.hold();
         self.write_laid(bytes, PipeLayout::Write { packet })
     }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
@@ -1139,6 +1172,18 @@ fn socket(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
     }
     Ok(file)
 }
+/// A pipe held ([`PipeEnd::hold`]).
+pub(crate) type Held<'a> = std::sync::MutexGuard<'a, ()>;
+/// `file` leaves a descriptor table, for good once its caller lets go of
+/// it: the last close of a pipe's description waits for what holds the pipe
+/// (`pipe_release`). Not called with a table or the space locked.
+pub(crate) fn closing(file: &Arc<dyn FileHandle>) {
+    if Arc::strong_count(file) == 1
+        && let Some(pipe) = pipe(file)
+    {
+        drop(pipe.hold());
+    }
+}
 /// The pipe description `file` is, which keeps its own owner and `O_ASYNC`.
 pub(crate) fn pipe(file: &Arc<dyn FileHandle>) -> Option<&PipeEnd> {
     file.as_any()?.downcast_ref::<PipeEnd>()
@@ -1233,6 +1278,7 @@ pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Resul
         return Some(if outgoing {
             Err(Errno::ENOTTY)
         } else {
+            let _held = pipe.hold();
             Ok(end.lock_sides()[side].bytes.len())
         });
     }
@@ -3057,10 +3103,24 @@ struct Pair {
     window: AtomicUsize,
     /// The pair is a pipe, whose `O_ASYNC` signals differ from a socket's.
     pipe: AtomicBool,
+    /// Held by what moves a pipe's bytes ([`PipeEnd::hold`]).
+    held: Mutex<()>,
     /// The host, whose real-time clock gives messages their timestamps.
     clock: std::sync::OnceLock<Arc<dyn paludarium_host::Host>>,
 }
 impl Pair {
+    /// [`PipeEnd::hold`], the wait for which shows the thread asleep.
+    fn hold(&self) -> Held<'_> {
+        match self.held.try_lock() {
+            Ok(held) => return held,
+            Err(std::sync::TryLockError::Poisoned(held)) => return held.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let mut waiting = paludarium_host::blocked::Waiting::new();
+        waiting.sleep();
+        paludarium_host::switches::sleep(&mut false);
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     /// Whether end `side` may send as Linux's `unix_writable` sees it.
     fn writable(&self, side: usize) -> bool {
         (self.sent[side].load(Ordering::SeqCst) + 1) * 4
@@ -3367,6 +3427,7 @@ impl SocketPairEnd {
             kind: kind & 0xf,
             window: AtomicUsize::new(SEND_WINDOW),
             pipe: AtomicBool::new(false),
+            held: Mutex::default(),
             clock: std::sync::OnceLock::new(),
             sides: Mutex::new(std::array::from_fn(|side| Side {
                 inode: inodes[side],

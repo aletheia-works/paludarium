@@ -75,7 +75,8 @@ const NO_NODE: u32 = u32::MAX;
 /// is faulted in through `get_user_pages_fast`, which waits for a
 /// `userfaultfd`, to be written (`FOLL_WRITE`) or, where that fails and
 /// unless `write` (`FUTEX_WRITE`), to be read, with `EFAULT` where neither
-/// can be. A private word's page is not looked at.
+/// can be, or where one that is only read is not a file's or shared
+/// memory's. A private word's page is not looked at.
 fn checked_key(
     mem: &AddressSpace,
     addr: u64,
@@ -105,8 +106,19 @@ fn checked_key(
     if !private {
         let (view, page) = (mem.view(), addr & !4095);
         let brought = |write| view.fault_in_pages(page, 1, write) == Some(1);
-        if !brought(true) && (write || !brought(false)) {
-            return Err(Errno::EFAULT);
+        if !brought(true) {
+            if write || !brought(false) {
+                return Err(Errno::EFAULT);
+            }
+            // "A RO anonymous page will never change", nor does the zero
+            // page; a private file mapping's is the file's own.
+            let file = |entry: &u64| entry & paludarium_mmu::pagemap::FILE != 0;
+            if !view.pagemap(page, 1).is_some_and(|e| e.iter().all(file)) {
+                return Err(Errno::EFAULT);
+            }
+            if let Some((memory, offset)) = mem.cache_offset(GuestAddr(addr)) {
+                return Ok(Key::Memory { memory, offset });
+            }
         }
     }
     Ok(key(mem, addr, private))

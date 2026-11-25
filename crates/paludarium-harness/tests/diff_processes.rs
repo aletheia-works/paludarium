@@ -296,6 +296,7 @@ mod linux {
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
                     | "userfaultfd-gup"
+                    | "userfaultfd-held"
                     | "userfaultfd-sigbus"
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
@@ -810,6 +811,7 @@ mod linux {
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
         userfaultfd_gup => ("userfaultfd-gup","userfaultfd"),
+        userfaultfd_held => ("userfaultfd-held","userfaultfd"),
         userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),

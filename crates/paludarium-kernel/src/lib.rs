@@ -1108,6 +1108,43 @@ impl Kernel {
         });
     }
 
+    /// Has the calling host thread's kernel accesses that fault served for
+    /// `thread` while what it returns lives. Its resolver is kept from call
+    /// to call, while it serves the same thread.
+    fn resolve_copies(&mut self, thread: &Thread) -> KernelCopies {
+        let copies = match &self.copies {
+            Some(copies)
+                if copies.serves(
+                    &self.group,
+                    &self.files.readiness,
+                    &self.inbox,
+                    self.process.pid,
+                    thread.tid,
+                ) =>
+            {
+                Arc::clone(copies)
+            }
+            _ => {
+                let copies = Arc::new(userfaultfd::KernelCopies {
+                    group: Arc::clone(&self.group),
+                    tid: thread.tid,
+                    hub: Arc::clone(&self.files.readiness),
+                    host: Arc::clone(&self.host),
+                    inbox: Arc::clone(&self.inbox),
+                    processes: Arc::clone(&self.processes),
+                    pid: self.process.pid,
+                });
+                self.copies = Some(Arc::clone(&copies));
+                copies
+            }
+        };
+        KernelCopies::install(
+            copies,
+            thread.state.signal_mask,
+            thread.state.credentials.capable(1 << 14),
+        )
+    }
+
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Its writes to user memory, a signal frame's and the rseq area's,
@@ -1115,6 +1152,9 @@ impl Kernel {
         // (`get_signal`, `rseq_handle_notify_resume`): their faults are the
         // kernel's, wherever it is called from.
         let _faults = KernelFaults::enter(&thread.state);
+        // And they are served as a system call's copies are: the frame of a
+        // signal grows a stack, and waits for a `userfaultfd`.
+        let _copies = self.resolve_copies(thread);
         // As in `handle`: a wait here shows the thread asleep.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         // A traced thread's clone goes on once the new task has started.
@@ -1444,38 +1484,7 @@ impl Kernel {
         let _faults = KernelFaults::enter(&thread.state);
         // And its accesses that fault are served as an instruction's are: a
         // mapping that grows down grows, and a `userfaultfd` is waited for.
-        // Its resolver is kept from call to call, while it serves this one.
-        let copies = match &self.copies {
-            Some(copies)
-                if copies.serves(
-                    &self.group,
-                    &self.files.readiness,
-                    &self.inbox,
-                    self.process.pid,
-                    thread.tid,
-                ) =>
-            {
-                Arc::clone(copies)
-            }
-            _ => {
-                let copies = Arc::new(userfaultfd::KernelCopies {
-                    group: Arc::clone(&self.group),
-                    tid: thread.tid,
-                    hub: Arc::clone(&self.files.readiness),
-                    host: Arc::clone(&self.host),
-                    inbox: Arc::clone(&self.inbox),
-                    processes: Arc::clone(&self.processes),
-                    pid: self.process.pid,
-                });
-                self.copies = Some(Arc::clone(&copies));
-                copies
-            }
-        };
-        let _copies = KernelCopies::install(
-            copies,
-            thread.state.signal_mask,
-            thread.state.credentials.capable(1 << 14),
-        );
+        let _copies = self.resolve_copies(thread);
         // What it waits for in the host while it handles the stop shows it
         // as sleeping (`/proc/<pid>/stat`), and nothing else does.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());

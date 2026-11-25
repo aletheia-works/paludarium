@@ -24,6 +24,7 @@
 #include <sys/shm.h>
 #include <sys/sendfile.h>
 #include <sys/resource.h>
+#include <sys/ptrace.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
@@ -5429,6 +5430,36 @@ static int futex_shared_cases(void) {
     if (file == MAP_FAILED) return 82;
     volatile unsigned *second = (volatile unsigned *)(file + 4096 + 8);
     futex_shared_show("file-other-mapping", second, second, fd);
+
+    /* A read-only anonymous page is no shared word's (EFAULT), written or
+       not, and a read-only private mapping's page of a file is the file's. */
+    char *own = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (own == MAP_FAILED) return 87;
+    own[0] = 1;
+    mprotect(own, 2 * 4096, PROT_READ);
+    for (int i = 0; i < 2; i++) {
+        volatile unsigned *at = (volatile unsigned *)(own + i * 4096);
+        long waited = futex_call(at, 0, 7);
+        int wait_errno = errno;
+        long woken = futex_call(at, 1, 1);
+        int wake_errno = errno;
+        long alone = futex_call(at, 128, 7);
+        printf("read-only anonymous %d: wait %ld errno %d wake %ld errno %d private %ld errno %d\n", i, waited,
+               wait_errno, woken, wake_errno, alone, errno);
+    }
+    munmap(own, 2 * 4096);
+    *second = 0;
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        char *page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 4096);
+        _exit(page == MAP_FAILED ? 2 : futex_call((volatile unsigned *)(page + 8), 0, 0) == 0 ? 0 : 1);
+    }
+    long read_woke;
+    while ((read_woke = futex_call(second, 1, 1)) == 0) sched_yield();
+    int read_status;
+    waitpid(reader, &read_status, 0);
+    printf("read-only private file: wake=%ld child status=%d\n", read_woke, read_status);
 
     /* A process-shared robust mutex whose owner ends while the parent waits:
        the end's wake reaches the parent, which gets EOWNERDEAD. */
@@ -12373,6 +12404,43 @@ static int grows_down_case(void) {
            got == 5 ? low + 8 : "-----");
     close(pipes[0]);
     close(pipes[1]);
+    /* So do /proc/<pid>/mem and ptrace (__access_remote_vm's expand_stack),
+     * within the limit. */
+    int mem = open("/proc/self/mem", O_RDWR);
+    low -= page;
+    char byte[8] = "zz";
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low + 8);
+    printf("mem-read-below: %ld grown-to-it=%d bytes %d %d\n", got, grows_start(g) == (uintptr_t)low, byte[0],
+           byte[1]);
+    low -= 2 * page;
+    got = pwrite(mem, "mem", 3, (off_t)(uintptr_t)low + 8);
+    printf("mem-write-below: %ld grown-to-it=%d\n", got, grows_start(g) == (uintptr_t)low);
+    struct rlimit mem_limit, mem_small;
+    getrlimit(RLIMIT_STACK, &mem_limit);
+    mem_small = mem_limit;
+    mem_small.rlim_cur = (rlim_t)(g + 2 * page - low);
+    setrlimit(RLIMIT_STACK, &mem_small);
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low - 8);
+    printf("mem-past-limit: %ld errno=%d\n", got, got < 0 ? errno : 0);
+    setrlimit(RLIMIT_STACK, &mem_limit);
+    close(mem);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        raise(SIGSTOP);
+        _exit(grows_start(g) == (uintptr_t)low - 3 * 4096 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, child, low - page, NULL);
+    printf("peek-below: %ld errno=%d\n", word, errno);
+    long poked = ptrace(PTRACE_POKEDATA, child, low - 3 * page, (void *)1L);
+    printf("poke-below: %ld\n", poked);
+    ptrace(PTRACE_CONT, child, NULL, NULL);
+    waitpid(child, &status, 0);
+    printf("child-grown: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     /* PROT_GROWSDOWN reaches down to the start of the VMA. */
     printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
     grows_touch("read-only", g, g - page, 1);

@@ -193,12 +193,15 @@ kernel.
   read does not wait with `SPLICE_F_NONBLOCK` either, while a socket's send,
   as `splice_to_socket` makes it, and other files read and write as their
   own `O_NONBLOCK` says. `SPLICE_F_MOVE`, `SPLICE_F_GIFT` and `SPLICE_F_MORE` change
-  nothing, as the bytes are copied. A pipe here holds bytes, not Linux's
-  page buffers: it takes as many bytes as its size, where Linux counts a
-  buffer, even of one byte, as a whole page of the capacity (a partly full
-  pipe, or the buffers of `vmsplice` that are not whole pages, may take
-  more here than on Linux). One thread's call is not atomic against
-  another's read of the same pipe, as Linux's pipe lock makes it.
+  nothing, as the bytes are copied. A call is atomic against the other
+  readers and writers of its pipe, as Linux's pipe lock makes it: while its
+  copy waits (for a `userfaultfd`, or the room of a socket), a read of the
+  pipe, a write to it, its `FIONREAD`, `F_GETPIPE_SZ` and `F_SETPIPE_SZ`,
+  and the close of one of its ends, wait for it too, whatever signal comes,
+  as Linux's `mutex_lock` does; a poll does not. A fill of the page that
+  needs the same pipe never comes, as on Linux; a fatal signal ends the
+  copy's wait. A pipe's buffer that `vmsplice`
+  cannot copy whole stays in the pipe.
   The host's standard streams, which stand for pipes, can be either end of
   a `splice` (an offset for one is `ESPIPE`), but not of `tee` or
   `vmsplice`, which take only the guest's own pipes.
@@ -457,7 +460,9 @@ kernel.
   process's address space and the address, so a private wake never reaches
   another process. Process-shared mutexes and semaphores (Python's
   `multiprocessing`) work this way, as does the wake of a robust futex whose
-  owner ends. A wake wakes one waiter even when asked for 0 or fewer, as
+  owner ends. A shared operation on a read-only anonymous page is `EFAULT`,
+  and on a read-only private mapping's page of a file it names the file, as
+  a shared mapping's does. A wake wakes one waiter even when asked for 0 or fewer, as
   Linux counts before it compares, and a private one does not look at the
   word's page. A timeout too long for Linux's nanoseconds waits until
   `KTIME_MAX`. A requeue wakes `val` waiters and moves up to `val2` more (the
@@ -1166,7 +1171,10 @@ kernel.
   is filled or the context released; a SIGKILL or the process's exit ends
   the wait with `EFAULT`, as does `UFFD_USER_MODE_ONLY` or
   `UFFD_FEATURE_SIGBUS` at once. A futex word's read waits with the futex
-  queues free. `get_user_pages` waits too where it may drop the space's
+  queues free. The frame of a signal and an `rseq` area, which the kernel
+  writes on the way back to the program, are waited for too, an `rseq` area
+  with the thread off its CPU; `clear_child_tid`'s word and the robust list
+  of an exiting thread are not (`PF_EXITING`). `get_user_pages` waits too where it may drop the space's
   lock: for `process_vm_readv` and `process_vm_writev`, in the other task's
   memory and with a buffer's pages faulted in before any is copied, for
   `MADV_POPULATE_READ`, `MADV_POPULATE_WRITE`, `mlock` and what else brings
@@ -1706,8 +1714,10 @@ kernel.
 - A mapping that grows down, the main stack or private anonymous memory that
   `mmap` made with `MAP_GROWSDOWN` (`VmFlags` shows `gd`), grows as Linux's
   `expand_downwards` makes it: an access to an unmapped page below it, a
-  signal frame written there, or a system call's own copy there (as
-  `do_user_addr_fault` serves a kernel access), extends it down to that
+  signal frame written there, a system call's own copy there (as
+  `do_user_addr_fault` serves a kernel access), or an access of `ptrace` or
+  `/proc/<pid>/mem` there (`__access_remote_vm`, within the limits of the
+  one who makes it), extends it down to that
   page, and the access is made again. It does not grow below `mmap_min_addr` (64 KiB), within the
   guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
   grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,

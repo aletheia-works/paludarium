@@ -235,6 +235,7 @@
     {"name":"userfaultfd-faults","binary":"userfaultfd"},
     {"name":"userfaultfd-signals","binary":"userfaultfd"},
     {"name":"userfaultfd-gup","binary":"userfaultfd"},
+    {"name":"userfaultfd-held","binary":"userfaultfd"},
     {"name":"userfaultfd-sigbus","binary":"userfaultfd"},
     {"name":"userfaultfd-shared","binary":"userfaultfd"},
     {"name":"userfaultfd-wp","binary":"userfaultfd"},

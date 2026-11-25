@@ -3180,6 +3180,7 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         crate::mqueue::closed(c, &descriptor);
         crate::dnotify::closed(c, &descriptor);
         crate::inet::linger(c, &descriptor.file);
+        crate::sockets::closing(&descriptor.file);
     }
     Ok(0)
 }
@@ -5356,6 +5357,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             crate::mqueue::closed(c, &closed);
             crate::dnotify::closed(c, &closed);
             crate::inet::linger(c, &closed.file);
+            crate::sockets::closing(&closed.file);
             Ok(0)
         }
         4 | 6 | 262 => {
@@ -5438,6 +5440,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 crate::mqueue::closed(c, &closed);
                 crate::dnotify::closed(c, &closed);
                 crate::inet::linger(c, &closed.file);
+                crate::sockets::closing(&closed.file);
             }
             Ok(u64::from(new))
         }

@@ -1145,6 +1145,7 @@ fn install(c: &mut Context<'_>, addfd: &AddFd) -> Result<u32, Errno> {
         crate::mqueue::closed(c, &closed);
         crate::dnotify::closed(c, &closed);
         crate::inet::linger(c, &closed.file);
+        crate::sockets::closing(&closed.file);
     }
     Ok(at)
 }

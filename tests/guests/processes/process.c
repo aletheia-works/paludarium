@@ -18,6 +18,7 @@
 #include <sys/auxv.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <stddef.h>
 #include <sys/mman.h>
@@ -12278,6 +12279,182 @@ static int lease_breaks_case(void) {
     rmdir(dir);
     return 0;
 }
+/* /proc/locks: the lines of this case's two files, as lock_get_status prints
+ * them, without their numbers, which other processes' locks move. */
+static struct stat plocks_files[2];
+static pid_t plocks_child;
+static void plocks_line(const char *line) {
+    const char *at = strstr(line, ": ");
+    if (!at || strlen(at) < 20) return;
+    at += 2;
+    int pid, used = 0;
+    unsigned major_number, minor_number;
+    unsigned long inode;
+    char kind[16], start[32], end[32];
+    if (sscanf(at + 17, "%15s %d %x:%x:%lu %31s %31s%n", kind, &pid, &major_number, &minor_number, &inode, start, end, &used) != 7) return;
+    for (int i = 0; i < 2; i++) {
+        struct stat *st = &plocks_files[i];
+        if (st->st_ino != inode || major(st->st_dev) != major_number || minor(st->st_dev) != minor_number) continue;
+        const char *who = pid == getpid() ? "self" : pid == -1 ? "none" : plocks_child && pid == plocks_child ? "child" : "other";
+        printf("  [%.17s] %s %s %c %s %s%s", at, kind, who, 'f' + i, start, end, at[17 + used] == '\n' ? "\n" : "!\n");
+    }
+}
+static void plocks_show(const char *what, const char *path) {
+    printf("%s\n", what);
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        printf("  open=%d\n", errno);
+        return;
+    }
+    char line[256];
+    long last = 0;
+    int ordered = 1;
+    int locks = !strcmp(path, "/proc/locks");
+    while (fgets(line, sizeof line, file)) {
+        if (!locks && strncmp(line, "lock:\t", 6)) continue;
+        const char *text = locks ? line : line + 6;
+        long id = strtol(text, NULL, 10);
+        /* A waiter's line has its lock's number. */
+        ordered &= id >= last;
+        last = id;
+        if (!locks) printf("  %ld\n", id);
+        plocks_line(text);
+    }
+    fclose(file);
+    printf("  ordered=%d\n", ordered);
+}
+static int plocks_set(int fd, int command, short type, long start, long length) {
+    struct flock lock = {.l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = length};
+    return fcntl(fd, command, &lock) < 0 ? -errno : 0;
+}
+static int plocks_pin(int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    return sched_setaffinity(0, sizeof set, &set) ? -errno : 0;
+}
+static int proc_locks_case(void) {
+    signal(SIGIO, SIG_IGN);
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof allowed, &allowed)) return 1;
+    int cpus[2] = {-1, -1}, count = 0;
+    for (int i = 0; i < CPU_SETSIZE && count < 2; i++)
+        if (CPU_ISSET(i, &allowed)) cpus[count++] = i;
+    if (plocks_pin(cpus[0])) return 2;
+    char dir[] = "/tmp/plocks-XXXXXX";
+    if (!mkdtemp(dir)) return 3;
+    char f[64], g[64], info[64];
+    snprintf(f, sizeof f, "%s/f", dir);
+    snprintf(g, sizeof g, "%s/g", dir);
+    int one = open(f, O_RDWR | O_CREAT, 0644), two = open(f, O_RDWR), three = open(f, O_RDWR);
+    int leased = open(g, O_RDWR | O_CREAT, 0644);
+    close(leased);
+    leased = open(g, O_RDONLY);
+    if (one < 0 || two < 0 || three < 0 || leased < 0) return 4;
+    if (stat(f, &plocks_files[0]) || stat(g, &plocks_files[1])) return 5;
+    struct stat st;
+    stat("/proc/locks", &st);
+    int past_stat = stat("/proc/locks/", &(struct stat){0}) ? errno : 0;
+    int rest = open("/proc/locks", O_RDONLY);
+    int written = write(rest, "x", 1) < 0 ? errno : 0;
+    close(rest);
+    printf("mode=%o size=%ld owner=%d:%d links=%ld past=%d written=%d\n", st.st_mode, (long)st.st_size, st.st_uid == 0,
+           st.st_gid == 0, (long)st.st_nlink, past_stat, written);
+    int listed = 0;
+    DIR *names = opendir("/proc");
+    for (struct dirent *e; names && (e = readdir(names));) listed += !strcmp(e->d_name, "locks") && e->d_type == DT_REG;
+    if (names) closedir(names);
+    printf("in /proc=%d\n", listed);
+    plocks_show("none", "/proc/locks");
+    int posix = plocks_set(one, F_SETLK, F_WRLCK, 0, 10);
+    int read_lock = plocks_set(one, F_SETLK, F_RDLCK, 20, 10);
+    int ofd = plocks_set(two, F_OFD_SETLK, F_WRLCK, 100, 1);
+    int shared = flock(three, LOCK_SH) ? -errno : 0;
+    int lease = lease_errno(leased, F_RDLCK);
+    printf("taken posix=%d read=%d ofd=%d flock=%d lease=%d\n", posix, read_lock, ofd, shared, lease);
+    plocks_show("taken", "/proc/locks");
+    /* A merge keeps the first lock's place; a split's left piece is new. */
+    printf("merge=%d\n", plocks_set(two, F_SETLK, F_WRLCK, 10, 5));
+    plocks_show("merged", "/proc/locks");
+    printf("split=%d\n", plocks_set(one, F_SETLK, F_UNLCK, 3, 2));
+    plocks_show("split", "/proc/locks");
+    /* A lock of the other kind replaces what it covers, then merges. */
+    printf("replace=%d\n", plocks_set(three, F_SETLK, F_RDLCK, 5, 15));
+    plocks_show("replaced", "/proc/locks");
+    /* In the way of the other description's lock, then short of it. */
+    printf("to end=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 50, 0));
+    printf("short of it=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 50, 40));
+    printf("middle=%d\n", plocks_set(two, F_SETLK, F_RDLCK, 60, 10));
+    plocks_show("middle", "/proc/locks");
+    /* A change of flock's kind is a new lock, the same kind is not. */
+    int same = flock(three, LOCK_SH) ? -errno : 0;
+    plocks_show("flock again", "/proc/locks");
+    int exclusive = flock(three, LOCK_EX) ? -errno : 0;
+    printf("flock same=%d exclusive=%d\n", same, exclusive);
+    plocks_show("flock changed", "/proc/locks");
+    /* A lease, broken: fdinfo shows it after the record locks. */
+    printf("leased posix=%d\n", plocks_set(leased, F_SETLK, F_RDLCK, 7, 1));
+    snprintf(info, sizeof info, "/proc/self/fdinfo/%d", leased);
+    plocks_show("leased", info);
+    printf("break=%d\n", open(g, O_WRONLY | O_NONBLOCK) < 0 ? -errno : 0);
+    plocks_show("broken", info);
+    plocks_show("broken", "/proc/locks");
+    printf("downgrade from write: unlck=%d\n", lease_errno(leased, F_UNLCK));
+    printf("write lease=%d\n", lease_errno(leased, F_WRLCK));
+    printf("read break=%d\n", open(g, O_RDONLY | O_NONBLOCK) < 0 ? -errno : 0);
+    plocks_show("read break", info);
+    for (int i = 0; i < 2; i++) {
+        snprintf(info, sizeof info, "/proc/self/fdinfo/%d", i ? three : one);
+        plocks_show(i ? "fdinfo three" : "fdinfo one", info);
+    }
+    close(leased);
+    plocks_set(one, F_SETLK, F_UNLCK, 0, 0);
+    /* A child's locks: its record lock goes with it, and the flock lock of
+       a description it shares stays, as the child's. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 6;
+    fflush(stdout);
+    plocks_child = fork();
+    if (plocks_child == 0) {
+        char byte;
+        int result = plocks_set(two, F_SETLK, F_WRLCK, 200, 1);
+        if (flock(three, LOCK_SH)) _exit(1);
+        if (write(ready[1], "x", 1) != 1 || read(go[0], &byte, 1) != 1) _exit(2);
+        _exit(result ? 3 : 0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 7;
+    plocks_show("child", "/proc/locks");
+    if (write(go[1], "x", 1) != 1) return 8;
+    int status;
+    waitpid(plocks_child, &status, 0);
+    printf("child=%d\n", status);
+    plocks_show("child gone", "/proc/locks");
+    flock(three, LOCK_UN);
+    close(two);
+    /* By CPU, the latest of each first. */
+    if (count == 2) {
+        int later = open(f, O_RDWR), latest = open(f, O_RDWR);
+        flock(three, LOCK_SH);
+        int moved = plocks_pin(cpus[1]);
+        flock(later, LOCK_SH);
+        plocks_set(later, F_OFD_SETLK, F_RDLCK, 1, 1);
+        int back = plocks_pin(cpus[0]);
+        flock(latest, LOCK_SH);
+        plocks_set(latest, F_OFD_SETLK, F_RDLCK, 2, 1);
+        printf("moved=%d back=%d\n", moved, back);
+        plocks_show("cpus", "/proc/locks");
+        close(later);
+        close(latest);
+    }
+    close(one);
+    close(three);
+    plocks_show("closed", "/proc/locks");
+    unlink(f);
+    unlink(g);
+    rmdir(dir);
+    return 0;
+}
 /* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
  * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
  * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
@@ -16948,6 +17125,69 @@ static int tmpfs_huge_placement_case(void) {
     printf("status=%d\n", reaped(child));
     rmdir(m);
     printf("cleaned=%d\n", rmdir(th_base) == 0);
+    return 0;
+}
+/* The mmap-32bit case: MAP_32BIT looks for room from 1 GiB (and up to 32 MiB
+   more, at random) up to 2 GiB, or takes a free hint that ends by 2 GiB, as
+   find_start_end has it, whatever is mapped: anonymous memory, a file, or
+   what transparent huge pages fit. MAP_FIXED overrides it, and mremap does
+   not keep to it. A hint below mmap_min_addr (64 KiB) is that. The hint
+   below 1 GiB stays clear of the heap, which brk may have put there. */
+static int low_area(const char *at, size_t len) {
+    return at != MAP_FAILED && (uintptr_t)at >= 0x40000000 && (uintptr_t)at <= 0x80000000 - len;
+}
+static int mmap_32bit_case(void) {
+    long page = 4096, huge = 2 << 20;
+    int rw = PROT_READ | PROT_WRITE, low = MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT;
+    char *a = mmap(NULL, page, rw, low, -1, 0);
+    if (a == MAP_FAILED) return 80;
+    printf("low=%d start=%d\n", low_area(a, page), (uintptr_t)a < 0x42000000);
+    *a = 1;
+    uintptr_t heap = (uintptr_t)sbrk(0);
+    char *below = (char *)(heap > 0x1c000000 && heap < 0x24000000 ? 0x30000000L : 0x20000000L);
+    char *hints[] = {below, (char *)0x60000000L, (char *)0x7ffff000L};
+    for (int i = 0; i < 3; i++)
+        printf("hint=%d\n", mmap(hints[i], page, rw, low, -1, 0) == hints[i]);
+    char *c = mmap(a, page, rw, low, -1, 0);
+    printf("busy: low=%d other=%d\n", low_area(c, page), c != a);
+    char *past = (char *)0x100000000L, *over = (char *)0x7fffd000L;
+    char *d = mmap(past, page, rw, low, -1, 0), *e = mmap(over, 4 * page, rw, low, -1, 0);
+    printf("past: low=%d over: low=%d\n", low_area(d, page), low_area(e, 4 * page));
+    char *high = mmap(NULL, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *fixed = mmap(high, page, rw, low | MAP_FIXED, -1, 0);
+    printf("plain-high=%d fixed=%d\n", (uintptr_t)high >= 0x80000000, fixed == high);
+    char *thp = mmap(NULL, 2 * huge, rw, low, -1, 0);
+    printf("thp: low=%d aligned=%d\n", low_area(thp, 2 * huge), !((uintptr_t)thp & (huge - 1)));
+    int zero = open("/dev/zero", O_RDWR);
+    char *z = mmap(NULL, 2 * huge + page, rw, MAP_PRIVATE | MAP_32BIT, zero, 0);
+    printf("zero: low=%d aligned=%d\n", low_area(z, 2 * huge + page), !((uintptr_t)z & (huge - 1)));
+    char *s = mmap(NULL, huge, rw, MAP_SHARED | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    printf("shared: low=%d\n", low_area(s, huge));
+    int fd = memfd_create("low", 0);
+    if (fd < 0 || ftruncate(fd, page)) return 81;
+    char *f = mmap(NULL, page, rw, MAP_SHARED | MAP_32BIT, fd, 0);
+    char *g = mmap(NULL, page, rw, MAP_PRIVATE | MAP_32BIT, fd, 0);
+    printf("file: low=%d private: low=%d\n", low_area(f, page), low_area(g, page));
+    mmap(a + page, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    char *grown = mremap(a, page, 2 * page, MREMAP_MAYMOVE);
+    printf("moved: high=%d kept=%d\n", (uintptr_t)grown >= 0x80000000, grown != MAP_FAILED && *grown);
+    /* One of 448 MiB fits below the page at 0x60000000 (what is mapped so far
+       lies within 48 MiB of 1 GiB), one above it, and no third. */
+    size_t len = 0x1c000000;
+    char *big = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    char *big2 = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("big: low=%d %d\n", low_area(big, len), low_area(big2, len));
+    errno = 0;
+    char *none = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("full: failed=%d errno=%d\n", none == MAP_FAILED, errno);
+    errno = 0;
+    none = mmap(NULL, 0x80001000, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("long: failed=%d errno=%d\n", none == MAP_FAILED, errno);
+    char *min = mmap((char *)0x1000L, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("min=%#lx\n", (unsigned long)min);
+    char *unit = mmap((char *)0x10L, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("under-a-page: high=%d\n", (uintptr_t)unit >= 0x80000000);
+    close(fd), close(zero);
     return 0;
 }
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
@@ -40002,6 +40242,7 @@ int main(int argc, char **argv) {
         int failed = file_leases_case();
         return failed ? failed : lease_breaks_case();
     }
+    if (!strcmp(mode, "proc-locks")) return proc_locks_case();
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
@@ -40051,6 +40292,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
+    if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

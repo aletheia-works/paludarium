@@ -35,7 +35,9 @@
 //! (`ERESTARTSYS`).
 
 use crate::files::Descriptor;
+use crate::namespaces::Namespace;
 use crate::page_cache::{Key, PageCaches, ReadAccess, WriteAccess};
+use crate::record_locks::{Link, Status};
 use crate::syscalls::Context;
 use paludarium_host::{ClockId, FileHandle};
 use paludarium_types::Errno;
@@ -60,6 +62,10 @@ pub(crate) struct Lease {
     file: usize,
     /// `F_RDLCK` or `F_WRLCK`.
     kind: u64,
+    /// The process that took it (`flc_pid`).
+    pid: u32,
+    /// Its place in `/proc/locks`.
+    link: Link,
     /// The descriptor it was last set through (`fa_fd`), which its signal
     /// names.
     fd: i32,
@@ -79,6 +85,8 @@ impl Lease {
             key,
             file,
             kind,
+            pid: 0,
+            link: Link::default(),
             fd,
             unlock_pending: false,
             downgrade_pending: false,
@@ -97,6 +105,27 @@ impl Lease {
     /// `write`, breaks it.
     fn conflicts(&self, key: Key, write: bool) -> bool {
         self.key == key && (write || self.kind == F_WRLCK)
+    }
+    pub(crate) fn link(&self) -> Link {
+        self.link
+    }
+    /// What `/proc/locks` shows of it (`lock_get_status`).
+    pub(crate) fn status(&self, space: &Namespace) -> Status {
+        Status {
+            class: if self.unlock_pending || self.downgrade_pending {
+                "LEASE  BREAKING "
+            } else {
+                "LEASE  ACTIVE   "
+            },
+            kind: match self.target() {
+                F_RDLCK => "READ",
+                F_WRLCK => "WRITE",
+                _ => "UNLCK",
+            },
+            pid: space.number(self.pid) as i32,
+            key: self.key,
+            range: (0, i64::MAX as u64),
+        }
     }
     /// `target_leasetype`.
     fn target(&self) -> u64 {
@@ -239,7 +268,11 @@ pub(crate) fn set(c: &Context<'_>, fd: u64, d: &Descriptor, arg: u64) -> Result<
                 if c.processes.sysctls.leases_enable() == 0 {
                     return Err(Errno::EINVAL);
                 }
-                list.push(Lease::new(key, file, arg, fd as i32));
+                list.push(Lease {
+                    pid: c.process.pid,
+                    link: c.processes.locks().link(crate::syscalls::cpu(c)),
+                    ..Lease::new(key, file, arg, fd as i32)
+                });
             }
         }
     }
@@ -404,6 +437,17 @@ fn break_lease(c: &mut Context<'_>, key: Key, flags: u32) -> Result<(), Errno> {
         disown(c, &gone);
     }
     Ok(())
+}
+
+/// Every file's leases.
+pub(crate) fn all(caches: &PageCaches) -> Vec<Lease> {
+    leases(caches).clone()
+}
+
+/// The lease the description `file` holds.
+pub(crate) fn of(caches: &PageCaches, file: &Arc<dyn FileHandle>) -> Option<Lease> {
+    let file = address(file);
+    leases(caches).iter().find(|l| l.file == file).copied()
 }
 
 /// `locks_remove_file`: the description at `file` goes, and its leases.

@@ -29,6 +29,9 @@ const FAULT_AROUND_PAGES: u64 = 16;
 
 /// Lowest address handed out for mappings without a fixed address.
 pub const MMAP_MIN_ADDR: u64 = 0x10000;
+/// Where `MAP_32BIT` looks for room, from the lowest address up
+/// (`find_start_end`, without its random start).
+const LOW_AREA: std::ops::Range<u64> = 0x4000_0000..0x8000_0000;
 /// Linux's default `stack_guard_gap`, 256 pages: a mapping that grows down
 /// does not grow within it of the mapping below, and no new mapping is placed
 /// within it below one (`vm_start_gap`).
@@ -332,6 +335,29 @@ pub mod faults {
         fn user(&self) -> &AtomicU64;
         fn kernel(&self) -> &AtomicU64;
         fn forced(&self) -> &AtomicU64;
+        /// A fault that made its count `nth`, of the kernel's accesses or
+        /// the thread's own code's, `at`, which is told where
+        /// [`trace_addresses`] asked for it.
+        fn fault(&self, kernel: bool, nth: u64, at: At) {
+            let _ = (kernel, nth, at);
+        }
+    }
+
+    /// Where a fault was, and whether the page was there before it, as it
+    /// is for a write to one that is to be copied.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct At {
+        pub addr: u64,
+        pub present: bool,
+    }
+
+    /// Whether the sinks are told the faults' addresses.
+    static ADDRESSES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// From now on every [`Sink`] of the process is told its faults'
+    /// addresses ([`Sink::fault`]).
+    pub fn trace_addresses() {
+        ADDRESSES.store(true, Ordering::SeqCst);
     }
 
     std::thread_local! {
@@ -417,35 +443,39 @@ pub mod faults {
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
-    /// when the host thread is not bound.
-    fn add(forced: bool) -> bool {
+    /// when the host thread is not bound. It was `at` there.
+    fn add(forced: bool, at: At) -> bool {
         SINK.with(|sink| {
             let sink = sink.borrow();
             let Some(counts) = sink.as_ref() else {
                 return false;
             };
+            let kernel = KERNEL.with(Cell::get);
             let field = if forced {
                 counts.forced()
-            } else if KERNEL.with(Cell::get) {
+            } else if kernel {
                 counts.kernel()
             } else {
                 counts.user()
             };
-            field.fetch_add(1, Ordering::SeqCst);
+            let nth = field.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            if !forced && ADDRESSES.load(Ordering::Relaxed) {
+                counts.fault(kernel, nth, at);
+            }
             true
         })
     }
 
-    pub(crate) fn count() {
+    pub(crate) fn count(addr: u64, present: bool) {
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
-        } else if !add(false) {
+        } else if !add(false, At { addr, present }) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
     }
 
     pub(crate) fn count_forced() {
-        if !add(true) {
+        if !add(true, At::default()) {
             FORCED.with(|forced| forced.set(forced.get().wrapping_add(1)));
         }
     }
@@ -1792,6 +1822,20 @@ pub enum Placement {
         hint: Option<GuestAddr>,
         offset: u64,
     },
+    /// In the first 2 GiB, where `fit` places it (`MAP_32BIT`): at the hint
+    /// if it ends there by 2 GiB, else from 1 GiB up, in either layout.
+    Low { hint: Option<GuestAddr>, fit: Fit },
+}
+
+/// How [`Placement::Low`] places a mapping in its area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    /// As [`Placement::Near`].
+    Near,
+    /// As [`Placement::Aligned`].
+    Aligned { size: u64, offset: u64 },
+    /// As [`Placement::Thp`].
+    Thp { offset: u64 },
 }
 
 /// What a mapping [`AddressSpace::map_backed`] makes shows.
@@ -4618,7 +4662,7 @@ impl AddressSpaceData {
         self.check(&directory, addr, buf.len(), access, true)?;
         // A successful lazy read installs the logical zero-page entry without
         // allocating its byte frame, matching subsequent Linux fault metadata.
-        for (page, _, _) in chunks(addr, buf.len()) {
+        for (page, offset, _) in chunks(addr, buf.len()) {
             if ready(&directory, page) {
                 continue;
             }
@@ -4628,7 +4672,7 @@ impl AddressSpaceData {
                 if let Some(entry) = table.pages.get_mut(slot) {
                     let missing = entry.is_none();
                     if missing && matches!(access, Access::Read | Access::Fetch) {
-                        faults::count();
+                        faults::count(page + offset as u64, false);
                     } else if missing && access == Access::Dump {
                         faults::count_forced();
                     }
@@ -4788,7 +4832,7 @@ impl AddressSpaceData {
         }
         let mut directory = self.write_directory();
         self.check(&directory, addr, len, access, true)?;
-        for (page, _, _) in chunks(addr, len) {
+        for (page, offset, _) in chunks(addr, len) {
             let Some(prot) = self.mapping_at(page).map(|m| m.prot) else {
                 return Err(Fault {
                     addr: GuestAddr(page),
@@ -4810,7 +4854,8 @@ impl AddressSpaceData {
                 })
             {
                 if access == Access::Write {
-                    faults::count();
+                    let present = table.pages.get(slot).is_some_and(Option::is_some);
+                    faults::count(page + offset as u64, present);
                 } else {
                     faults::count_forced();
                 }
@@ -5128,7 +5173,10 @@ impl AddressSpaceData {
     /// The lowest address from `from`, a multiple of `align` (a power of
     /// two), with `len` free bytes below TASK_SIZE.
     fn lowest_gap(&self, from: u64, len: u64, align: u64) -> Option<u64> {
-        let limit = USER_ADDRESS_LIMIT - PAGE_SIZE;
+        self.lowest_gap_below(USER_ADDRESS_LIMIT - PAGE_SIZE, from, len, align)
+    }
+    /// [`Self::lowest_gap`] that ends by `limit`.
+    fn lowest_gap_below(&self, limit: u64, from: u64, len: u64, align: u64) -> Option<u64> {
         let mut start = from.checked_next_multiple_of(align)?;
         for (_, m) in self.mappings.range(..limit) {
             if m.end() <= start {
@@ -5146,9 +5194,9 @@ impl AddressSpaceData {
     /// [`Self::find_free`] gives, or one found for `size` less a page more
     /// and moved up to the offset (`shmem_get_unmapped_area`). `None`
     /// where the ordinary choice has no room either.
-    fn aligned_area(&self, len: u64, size: u64, offset: u64) -> Option<u64> {
+    fn aligned_area(&self, len: u64, size: u64, offset: u64, low: bool) -> Option<u64> {
         let len = GuestAddr(len).page_align_up()?.0;
-        let addr = self.find_free(len)?;
+        let addr = self.free_area(len, low)?;
         if len < size
             || (offset != 0 && offset.saturating_add(len) < 2 * size)
             || addr & (size - 1) == offset
@@ -5157,7 +5205,7 @@ impl AddressSpaceData {
         }
         let Some(inflated) = len
             .checked_add(size - PAGE_SIZE)
-            .and_then(|wide| self.find_free(wide))
+            .and_then(|wide| self.free_area(wide, low))
         else {
             return Some(addr);
         };
@@ -5177,7 +5225,7 @@ impl AddressSpaceData {
     /// Where memory that may take transparent huge pages goes
     /// ([`Placement::Thp`], Linux's `__thp_get_unmapped_area`): `None`
     /// where it goes as any other would.
-    fn thp_area(&self, len: u64, hint: Option<u64>, offset: u64) -> Option<u64> {
+    fn thp_area(&self, len: u64, hint: Option<u64>, offset: u64, low: bool) -> Option<u64> {
         let size = BLOCK_SIZE;
         let len = GuestAddr(len).page_align_up()?.0;
         let end = offset.checked_add(len)?;
@@ -5187,11 +5235,14 @@ impl AddressSpaceData {
         }
         let padded = len.checked_add(size)?;
         offset.checked_add(padded)?;
+        let limit = if low {
+            LOW_AREA.end
+        } else {
+            USER_ADDRESS_LIMIT - PAGE_SIZE
+        };
         let free_at = |at: u64| {
             at >= MMAP_MIN_ADDR
-                && at
-                    .checked_add(padded)
-                    .is_some_and(|stop| stop <= USER_ADDRESS_LIMIT - PAGE_SIZE)
+                && at.checked_add(padded).is_some_and(|stop| stop <= limit)
                 && !self.overlaps(at, at + padded)
                 // Linux looks for the longer area's guard gap too.
                 && self
@@ -5202,7 +5253,7 @@ impl AddressSpaceData {
         };
         let found = match hint {
             Some(hint) if free_at(hint) => return Some(hint),
-            _ => self.find_free(padded)?,
+            _ => self.free_area(padded, low)?,
         };
         let below = offset.wrapping_sub(found) & (size - 1);
         Some(if self.bottom_up.is_none() && below == 0 {
@@ -5210,6 +5261,15 @@ impl AddressSpaceData {
         } else {
             found + below
         })
+    }
+    /// Where `len` bytes with no hint go: in the first 2 GiB with `low`
+    /// (`MAP_32BIT`), else where [`Self::find_free`] puts them.
+    fn free_area(&self, len: u64, low: bool) -> Option<u64> {
+        if low {
+            self.lowest_gap_below(LOW_AREA.end, LOW_AREA.start, len, PAGE_SIZE)
+        } else {
+            self.find_free(len)
+        }
     }
     fn find_free(&self, len: u64) -> Option<u64> {
         if let Some(base) = self.bottom_up {
@@ -5960,10 +6020,10 @@ impl AddressSpaceData {
         // (`__get_unmapped_area`'s `thp_get_unmapped_area_vmflags`).
         let anonymous = self.shared_at(addr.0).is_none() && self.backing_at(addr.0).is_none();
         let free_for = |data: &Self, len: u64, hinted: bool| match huge {
-            Some(offset) => data.aligned_area(len, BLOCK_SIZE, offset),
-            None if anonymous && !hinted && len.is_multiple_of(BLOCK_SIZE) => {
-                data.thp_area(len, None, 0).or_else(|| data.find_free(len))
-            }
+            Some(offset) => data.aligned_area(len, BLOCK_SIZE, offset, false),
+            None if anonymous && !hinted && len.is_multiple_of(BLOCK_SIZE) => data
+                .thp_area(len, None, 0, false)
+                .or_else(|| data.find_free(len)),
             None => data.find_free(len),
         };
         // A shrink may cross the end of the VMA: only what stays must not.
@@ -8829,35 +8889,54 @@ impl AddressSpace {
                 data.map(Some(at), len, prot, kind)?
             }
             Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
-            Placement::Near(hint)
-            | Placement::Aligned { hint, .. }
-            | Placement::Thp { hint, .. } => {
+            Placement::Near(_)
+            | Placement::Aligned { .. }
+            | Placement::Thp { .. }
+            | Placement::Low { .. } => {
+                let (hint, fit, low) = match placement {
+                    Placement::Aligned { hint, size, offset } => {
+                        (hint, Fit::Aligned { size, offset }, false)
+                    }
+                    Placement::Thp { hint, offset } => (hint, Fit::Thp { offset }, false),
+                    Placement::Low { hint, fit } => (hint, fit, true),
+                    Placement::Near(hint) => (hint, Fit::Near, false),
+                    Placement::Replacing(_) | Placement::Exactly(_) => (None, Fit::Near, false),
+                };
                 // A hint within the guard gap below a mapping that grows
                 // down is not taken (`vm_start_gap`).
                 let hint = hint.filter(|hint| {
-                    data.mappings
-                        .range(hint.0..)
-                        .next()
-                        .is_none_or(|(_, m)| hint.0.saturating_add(len) <= m.start_gap())
+                    (!low || hint.0.saturating_add(len) <= LOW_AREA.end)
+                        && data
+                            .mappings
+                            .range(hint.0..)
+                            .next()
+                            .is_none_or(|(_, m)| hint.0.saturating_add(len) <= m.start_gap())
                 });
-                let thp = match placement {
-                    Placement::Thp { offset, .. } => {
-                        data.thp_area(len, hint.map(|hint| hint.0), offset)
-                    }
-                    _ => None,
+                let thp = match fit {
+                    Fit::Thp { offset } => data.thp_area(len, hint.map(|hint| hint.0), offset, low),
+                    Fit::Near | Fit::Aligned { .. } => None,
                 };
                 if let Some(at) = thp {
                     data.map(Some(GuestAddr(at)), len, prot, kind)?
                 } else {
                     match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
                         Some(at) => at,
-                        None => match placement {
-                            Placement::Aligned { size, offset, .. } => {
-                                let at = data.aligned_area(len, size, offset);
-                                data.map(at.map(GuestAddr), len, prot, kind)?
+                        None => {
+                            let at = match fit {
+                                Fit::Aligned { size, offset } => {
+                                    data.aligned_area(len, size, offset, low)
+                                }
+                                Fit::Near | Fit::Thp { .. } if low => {
+                                    let len = GuestAddr(len).page_align_up();
+                                    len.and_then(|len| data.free_area(len.0, true))
+                                }
+                                Fit::Near | Fit::Thp { .. } => None,
+                            };
+                            if low && at.is_none() {
+                                return Err(Errno::ENOMEM);
                             }
-                            _ => data.map(None, len, prot, kind)?,
-                        },
+                            data.map(at.map(GuestAddr), len, prot, kind)?
+                        }
                     }
                 }
             }

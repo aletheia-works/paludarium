@@ -8124,6 +8124,58 @@ mod inotify {
         assert_eq!(extra(&mut f, a)[0], flock("WRITE"));
     }
     #[test]
+    fn proc_locks_lists_record_locks_flocks_and_leases_and_fdinfo_the_lease() {
+        let mut f = fixture();
+        let path = put(&f, DATA, b"/tmp/listed");
+        let locks = put(&f, DATA + 0x40, b"/proc/locks");
+        let made = f.ret(2, &[path, 0o102, 0o600]);
+        assert_eq!(f.ret(3, &[made]), 0);
+        let fd = f.ret(2, &[path, 0, 0]);
+        let fs = &f.kernel.files.fs();
+        let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
+        let (major, minor) = paludarium_types::device_numbers(device);
+        let ino = fs.metadata(b"/tmp/listed", true).unwrap().inode;
+        let at = format!("{major:02x}:{minor:02x}:{ino}");
+        let read = |f: &mut Fixture| {
+            let list = f.ret(2, &[locks, 0, 0]);
+            let n = f.ret(0, &[list, DATA + 0x400, 0x400]);
+            assert_eq!(f.ret(3, &[list]), 0);
+            let mut text = vec![0; n as usize];
+            f.mem.read(GuestAddr(DATA + 0x400), &mut text).unwrap();
+            String::from_utf8(text).unwrap()
+        };
+        assert_eq!(read(&mut f), "");
+        assert_eq!(f.ret(73, &[fd, 1]), 0);
+        let raw = [0u8; 32];
+        f.mem.write(GuestAddr(DATA + 0x100), &raw).unwrap();
+        assert_eq!(f.ret(72, &[fd, 6, DATA + 0x100]), 0);
+        assert_eq!(f.ret(72, &[fd, 1024, 0]), 0);
+        let posix = format!("POSIX  ADVISORY  READ 1 {at} 0 EOF\n");
+        let flock = format!("FLOCK  ADVISORY  READ 1 {at} 0 EOF\n");
+        let lease = |state: &str| format!("LEASE  {state} 1 {at} 0 EOF\n");
+        assert_eq!(
+            read(&mut f),
+            format!("1: {}2: {posix}3: {flock}", lease("ACTIVE    READ"))
+        );
+        assert_eq!(
+            extra(&mut f, fd),
+            [
+                format!("lock:\t1: {}", flock.trim_end()),
+                format!("lock:\t2: {}", posix.trim_end()),
+                format!("lock:\t3: {}", lease("ACTIVE    READ").trim_end()),
+            ]
+        );
+        // Broken by a writer, it is to go; SIGIO stays blocked.
+        f.thread.state.signal_mask |= 1 << 28;
+        assert_eq!(f.ret(2, &[path, 0o4001, 0]), errno(Errno::EAGAIN));
+        assert_eq!(
+            read(&mut f),
+            format!("1: {}2: {posix}3: {flock}", lease("BREAKING  UNLCK"))
+        );
+        assert_eq!(f.ret(3, &[fd]), 0);
+        assert_eq!(read(&mut f), "");
+    }
+    #[test]
     fn name_to_handle_at_gives_tmpfs_handles_and_others_identifiers() {
         let mut f = fixture();
         let file = put(&f, DATA, b"/tmp/handled");

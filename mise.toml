@@ -14,6 +14,11 @@ experimental = true
 # Rust is the nightly pinned in rust-toolchain.toml. Reading it here makes mise set
 # RUSTUP_TOOLCHAIN to that pin, so a global `rust` in mise does not override it.
 idiomatic_version_file_enable_tools = ["rust"]
+# GitHub sometimes refuses a download for some seconds. mise retries a transient
+# failure (5xx, 408, 429, network errors; not a 404 or a wrong checksum) after
+# about 0.2, 1, 4, 15 and 15 seconds with jitter: about half a minute for each
+# request of an install, where its default of 3 retries waits about 5 seconds.
+http_retries = 5
 
 [tools]
 # Rust. CI runs plain Cargo, so mbx (mr-boxington) is not wrapped here: mise-action

@@ -5,6 +5,10 @@ on:
   # squash-merge commit's header.
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  # A merge queue (none is set up) waits for this required check too. The pull
+  # request's run checked its commits and title; the reusable workflow's checks
+  # run on pull_request, push and workflow_dispatch only, so here it passes.
+  merge_group:
   push:
     branches:
       - main

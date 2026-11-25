@@ -2662,6 +2662,76 @@ fn a_moved_mapping_of_a_huge_file_goes_at_its_offset_past_a_boundary() {
 }
 
 #[test]
+fn a_low_placement_stays_in_the_first_2_gib_in_either_layout() {
+    const HUGE: u64 = 2 << 20;
+    const GIB: u64 = 1 << 30;
+    let place = |m: &AddressSpace, hint: Option<u64>, len: u64, fit: Fit| {
+        let hint = hint.map(GuestAddr);
+        m.map_backed(
+            Placement::Low { hint, fit },
+            len,
+            Prot::READ,
+            MappingKind::Anonymous,
+            Backing::None,
+        )
+        .map(|at| at.0)
+    };
+    for bottom_up in [false, true] {
+        let mut m = AddressSpace::new();
+        if bottom_up {
+            m.set_bottom_up(Some(GuestAddr(0x1000_1000)));
+        }
+        // From 1 GiB up.
+        assert_eq!(place(&m, None, PAGE_SIZE, Fit::Near), Ok(GIB));
+        assert_eq!(place(&m, None, 1, Fit::Near), Ok(GIB + PAGE_SIZE));
+        // At a hint that ends by 2 GiB, below 1 GiB too.
+        let last = 2 * GIB - PAGE_SIZE;
+        for hint in [GIB / 2, last] {
+            assert_eq!(place(&m, Some(hint), PAGE_SIZE, Fit::Near), Ok(hint));
+        }
+        // Not one in use, past 2 GiB or over it.
+        let mut next = GIB + 2 * PAGE_SIZE;
+        for (hint, len) in [(GIB, 1), (8 * GIB, 1), (last - PAGE_SIZE, 3 * PAGE_SIZE)] {
+            assert_eq!(place(&m, Some(hint), len, Fit::Near), Ok(next), "{hint:#x}");
+            next += len.next_multiple_of(PAGE_SIZE);
+        }
+        // Aligned in the same area: the THP rule's 2 MiB more on an aligned
+        // start only in the top-down layout, which the search itself is not.
+        let thp = Fit::Thp { offset: 0 };
+        assert_eq!(place(&m, None, HUGE, thp), Ok(GIB + HUGE));
+        let aligned = Fit::Aligned {
+            size: HUGE,
+            offset: PAGE_SIZE,
+        };
+        let at = place(&m, None, 2 * HUGE, aligned).unwrap();
+        assert_eq!(at % HUGE, PAGE_SIZE);
+        assert!(at > GIB && at < 2 * GIB);
+        // Nothing above when it is full.
+        for fit in [Fit::Near, thp, aligned] {
+            assert_eq!(place(&m, None, GIB, fit), Err(Errno::ENOMEM));
+            assert_eq!(place(&m, None, 4 * GIB, fit), Err(Errno::ENOMEM));
+        }
+        assert!(place(&m, None, u64::MAX, Fit::Near).is_err());
+    }
+    // The boundary above an aligned start, in the top-down layout only.
+    for (bottom_up, at) in [(false, GIB + HUGE), (true, GIB)] {
+        let mut m = AddressSpace::new();
+        if bottom_up {
+            m.set_bottom_up(Some(GuestAddr(0x1000_1000)));
+        }
+        assert_eq!(place(&m, None, HUGE, Fit::Thp { offset: 0 }), Ok(at));
+        // A hint whose padded area ends at 2 GiB, not one a page higher.
+        let hint = 2 * GIB - 2 * HUGE;
+        let thp = Fit::Thp { offset: 0 };
+        let moved = place(&m, Some(hint), HUGE + PAGE_SIZE, thp).unwrap();
+        assert_ne!(moved, hint, "{bottom_up}");
+        assert_eq!(moved % HUGE, 0);
+        let hint = hint - PAGE_SIZE;
+        assert_eq!(place(&m, Some(hint), HUGE + PAGE_SIZE, thp), Ok(hint));
+    }
+}
+
+#[test]
 fn a_thp_placement_pads_by_2_mib_and_keeps_top_down_mappings_together() {
     const HUGE: u64 = 2 << 20;
     let place = |m: &AddressSpace, hint: Option<GuestAddr>, len: u64, offset: u64| {

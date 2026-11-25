@@ -1059,6 +1059,7 @@ static int case_output(void) {
     return 0;
 }
 
+#define SAMPLE_ADDR (1ULL << 3)
 #define SAMPLE_CALLCHAIN (1ULL << 5)
 #define SAMPLE_ID (1ULL << 6)
 #define SAMPLE_PERIOD (1ULL << 8)
@@ -1100,6 +1101,64 @@ static void faults_while_enabled(int fd, int pages) {
     ioctl(fd, IOC_ENABLE, 0);
     touch(pages);
     ioctl(fd, IOC_DISABLE, 0);
+}
+
+/* With SAMPLE_ADDR a sample shows its fault's address. */
+static void fault_addresses(void) {
+    int fd = open_sampling(SAMPLE_ADDR | SAMPLE_PERIOD, 0);
+    void *page = NULL;
+    map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    char *at = mmap(NULL, 5 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ioctl(fd, IOC_ENABLE, 0);
+    for (int i = 0; i < 5; i++) at[i * 4096 + 7 * i + 1] = 1;
+    ioctl(fd, IOC_DISABLE, 0);
+    int found = 0;
+    uint64_t head = PAGE_U64(page, 1024);
+    for (uint64_t off = 0; off < head; off += 24) {
+        uint64_t r[3];
+        copy_record(page, 8 * 4096, off, r, 3);
+        for (int i = 0; i < 5; i++)
+            if (r[1] == (uint64_t)(uintptr_t)(at + i * 4096 + 7 * i + 1)) found |= 1 << i;
+    }
+    say("fault addresses %#x", found);
+    munmap(page, 9 * 4096);
+    close(fd);
+}
+
+#define SAMPLE_DATA_PAGE_SIZE (1ULL << 22)
+
+/* The page size of each fault's address: a page-faults sample is taken
+   before the fault is handled (do_user_addr_fault), so that a first touch
+   has no page yet, and a minor-faults one after it (mm_account_fault). */
+static void fault_page_sizes(uint64_t config) {
+    struct attr a = software(config);
+    a.sample_period = 1;
+    a.sample_type = SAMPLE_ADDR | SAMPLE_DATA_PAGE_SIZE;
+    a.flags |= DISABLED;
+    int fd = (int)open_event(&a, 0, -1, -1, 0);
+    void *page = NULL;
+    map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    char *at = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ioctl(fd, IOC_ENABLE, 0);
+    at[8] = 1;
+    sink += (uint64_t)at[4096];
+    at[4096 + 16] = 1;
+    ioctl(fd, IOC_DISABLE, 0);
+    /* The first write, the read of the zero page, and the write to it. */
+    long sizes[3] = {-1, -1, -1};
+    uint64_t head = PAGE_U64(page, 1024);
+    for (uint64_t off = 0; off < head; off += 24) {
+        uint64_t r[3];
+        copy_record(page, 8 * 4096, off, r, 3);
+        uint64_t where = r[1] - (uint64_t)(uintptr_t)at;
+        if (where == 8) sizes[0] = (long)r[2];
+        if (where == 4096) sizes[1] = (long)r[2];
+        if (where == 4096 + 16) sizes[2] = (long)r[2];
+    }
+    say("page sizes of %s: first write %ld read %ld then write %ld", config == 5 ? "minor-faults" : "page-faults",
+        sizes[0], sizes[1], sizes[2]);
+    munmap(page, 9 * 4096);
+    close(fd);
 }
 
 static int case_sample(void) {
@@ -1148,6 +1207,10 @@ static int case_sample(void) {
     say("pid %d", (uint32_t)r[3] == (uint32_t)getpid());
     copy_record(page, 4096, head + 32, r, 1);
     say("then sample %d", (uint32_t)r[0] == RECORD_SAMPLE);
+
+    fault_addresses();
+    fault_page_sizes(2);
+    fault_page_sizes(5);
 
     /* Paused, it takes nothing and counts it lost. */
     PAGE_U64(page, 1032) = PAGE_U64(page, 1024);
@@ -1227,10 +1290,13 @@ static void on_io(int number, siginfo_t *info, void *context) {
     if (info->si_code == POLL_HUP) io_hup++;
     io_alike &= info->si_fd == io_fd && (info->si_code == POLL_HUP || info->si_band == (POLLIN | POLLRDNORM));
 }
+static void *volatile trap_wanted;
+static volatile int trap_seen;
 static void on_trap(int number, siginfo_t *info, void *context) {
     (void)number;
     (void)context;
     trap_count++;
+    trap_seen |= trap_wanted && info->si_addr == trap_wanted;
     const unsigned char *raw = (const unsigned char *)info;
     trap_alike &= info->si_code == 6 && *(const uint64_t *)(raw + 24) == 0x1234 && *(const uint32_t *)(raw + 32) == 1 &&
                   *(const uint32_t *)(raw + 36) == 0;
@@ -1308,7 +1374,10 @@ static int case_wakeup(void) {
         (int)(PAGE_U64(page, 1024) / 24));
     touch(2);
     ioctl(fd, IOC_ID, &(uint64_t){0});
-    say("after: signals %d", io_count);
+    /* The count stops at the last of them. */
+    uint64_t counted[2] = {0, 0};
+    read(fd, counted, sizeof counted);
+    say("after: signals %d count %llu", io_count, (unsigned long long)counted[0]);
     struct attr counting = software(2);
     say("refresh counting %ld", TRY(ioctl((int)open_event(&counting, 0, -1, -1, 0), IOC_REFRESH, 1)));
     struct attr inherited = software(2);
@@ -1332,6 +1401,13 @@ static int case_wakeup(void) {
     trap_alike = 1;
     faults_while_enabled(fd, 2);
     say("sigtrap>=1 %d alike %d", trap_count >= 1, trap_alike);
+    /* Its si_addr is the fault's address. */
+    char *pages = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    trap_wanted = pages + 123;
+    ioctl(fd, IOC_ENABLE, 0);
+    pages[123] = 1;
+    ioctl(fd, IOC_DISABLE, 0);
+    say("sigtrap address %d", trap_seen);
     /* Blocked, it waits, flagged as late. */
     sigset_t trap, old;
     sigemptyset(&trap);
@@ -1512,7 +1588,7 @@ static int case_throttle(void) {
 /* What the cases compare the records with. */
 struct expected {
     pid_t pid, tid, child, parent;
-    char *anon, *exec_at, *shm, *heap, *shared, *ring;
+    char *anon, *exec_at, *shm, *heap, *shared, *ring, *three;
     size_t anon_len;
     const char *path, *self;
     struct stat file;
@@ -1589,6 +1665,8 @@ static void say_record(const uint64_t *record, void *with) {
         if (at <= e->anon && at + len > e->anon)
             say("  anon covers %d offset is address %d len %d", at + len >= e->anon + e->anon_len,
                 pgoff == start, len == 4096 || len >= e->anon_len);
+        if (e->three && at >= e->three && at < e->three + 3 * 4096)
+            say("  three from %d len %d", (int)((at - e->three) / 4096), (int)(len / 4096));
         if (at == e->exec_at)
             say("  exec offset %llu len %llu", (unsigned long long)pgoff, (unsigned long long)len);
         if (e->heap && at <= e->heap && at + len > e->heap)
@@ -1720,6 +1798,70 @@ static void build_ids(void) {
     unlink(path);
 }
 
+#define INHERIT_STAT (1ULL << 11)
+#define RECORD_READ 8
+
+struct reads {
+    pid_t child;
+    uint64_t ids[2];
+};
+
+static void see_read(const uint64_t *record, void *with) {
+    const struct reads *e = with;
+    uint32_t type = (uint32_t)record[0];
+    if (type != RECORD_READ) return;
+    const uint32_t *ids = (const uint32_t *)(record + 1);
+    /* The group's events, each with its ID, then the sample_id. */
+    int n = (int)record[2];
+    say("read size %d child %d nr %d", (int)(record[0] >> 48),
+        ids[0] == (uint32_t)e->child && ids[1] == (uint32_t)e->child, n);
+    for (int i = 0; i < n && i < 2; i++)
+        say("  counted %d id %d", record[3 + 2 * i] >= 3, record[4 + 2 * i] == e->ids[0]   ? 0
+                                                          : record[4 + 2 * i] == e->ids[1] ? 1
+                                                                                          : -1);
+}
+
+/* inherit_stat: the end of a task writes PERF_RECORD_READ of each event it
+   inherited, the latest first, each then out of its group. With
+   SAMPLE_READ, Linux swaps no contexts of parent and child (since 6.12),
+   so that the child ends with the inherited ones. */
+static int case_inherit_stat(void) {
+    cpu_set_t first;
+    CPU_ZERO(&first);
+    CPU_SET(0, &first);
+    sched_setaffinity(0, sizeof first, &first);
+    struct reads e;
+    int fds[2];
+    void *page = NULL;
+    for (int i = 0; i < 2; i++) {
+        struct attr a = software(2);
+        a.sample_type = SAMPLE_READ | SAMPLE_TID;
+        a.read_format = FORMAT_GROUP | FORMAT_ID;
+        a.flags |= INHERIT | INHERIT_STAT | SAMPLE_ID_ALL;
+        fds[i] = (int)open_event(&a, 0, 0, i ? fds[0] : -1, 0);
+        if (fds[i] < 0) {
+            say("open %d: %d", i, errno);
+            return 1;
+        }
+        if (i == 0)
+            map_event(fds[0], 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+        else
+            say("output %ld", TRY(ioctl(fds[1], IOC_SET_OUTPUT, fds[0])));
+        ioctl(fds[i], IOC_ID, &e.ids[i]);
+    }
+    fflush(stdout);
+    e.child = fork();
+    if (e.child == 0) {
+        touch(5);
+        _exit(0);
+    }
+    int status;
+    waitpid(e.child, &status, 0);
+    uint64_t tail = 0;
+    each_record(page, &tail, see_read, &e);
+    return 0;
+}
+
 static int case_side_band(void) {
     struct expected e;
     memset(&e, 0, sizeof e);
@@ -1745,6 +1887,9 @@ static int case_side_band(void) {
     if (fd < 0 || exec_fd < 0) return 1;
     int id = shmget(IPC_PRIVATE, 8192, IPC_CREAT | 0600);
     char *old_break = (char *)syscall(SYS_brk, 0);
+    /* Three pages that merge with nothing around them. */
+    e.three = (char *)mmap(NULL, 5 * 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) + 4096;
+    mprotect(e.three, 3 * 4096, PROT_READ | PROT_WRITE);
     ioctl(fd, IOC_ENABLE, 0);
     ioctl(exec_fd, IOC_ENABLE, 0);
     e.anon_len = 3 * 4096;
@@ -1756,6 +1901,13 @@ static int case_side_band(void) {
         e.shared && maps_identity(e.shared, &e.shared_major, &e.shared_minor, &e.shared_inode));
     mprotect(e.anon, 4096, PROT_READ);
     mprotect(e.anon, 4096, PROT_READ);
+    /* One record of each VMA an mprotect changes, as merged so far: the
+       first with the page that is read-only already, then all three. */
+    mprotect(e.three + 4096, 4096, PROT_READ);
+    mprotect(e.three, 3 * 4096, PROT_READ);
+    /* And each alone, then with those before. */
+    mprotect(e.three, 4096, PROT_READ | PROT_EXEC);
+    mprotect(e.three, 3 * 4096, PROT_READ | PROT_WRITE);
     char *new_break = old_break + 3 * 4096;
     e.heap = (char *)syscall(SYS_brk, new_break) == new_break ? new_break - 1 : NULL;
     e.shm = shmat(id, NULL, 0);
@@ -1923,6 +2075,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-sample")) return case_sample();
     if (!strcmp(mode, "perf-wakeup")) return case_wakeup();
     if (!strcmp(mode, "perf-side-band")) return case_side_band();
+    if (!strcmp(mode, "perf-inherit-stat")) return case_inherit_stat();
     if (!strcmp(mode, "perf-side-band-comm")) return case_side_band_comm();
     if (!strcmp(mode, "perf-throttle")) return case_throttle();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);

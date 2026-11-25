@@ -30,6 +30,7 @@ use paludarium_cpu::{CpuState, reg};
 use paludarium_host::ClockId;
 use paludarium_host::FileHandle;
 use paludarium_mmu::AddressSpace;
+use paludarium_mmu::faults::At;
 use paludarium_types::{GuestAddr, USER_ADDRESS_LIMIT};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -211,29 +212,45 @@ impl Sampler {
             self.left = self.period.max(HRTIMER_MIN) as i64;
         }
     }
-    /// The overflows of `n` more occurrences of a software event:
-    /// `perf_swevent_event`, one at a time, with `perf_swevent_overflow`
-    /// and `perf_swevent_set_period`, as runs of samples of a period.
-    fn occurrences(&mut self, mut n: u64, period_field: bool, freq: bool, out: &mut Runs) {
+    /// The overflows of `n` more occurrences of a software event, up to
+    /// `limit` of them, which it takes them from: `perf_swevent_event`, one
+    /// at a time, with `perf_swevent_overflow` and
+    /// `perf_swevent_set_period`. Gives the occurrences left once `limit`
+    /// is used up, which the event that it disables does not count.
+    fn occurrences(
+        &mut self,
+        n: u64,
+        period_field: bool,
+        freq: bool,
+        limit: &mut u64,
+        out: &mut Vec<Overflow>,
+    ) -> u64 {
         // With PERF_SAMPLE_PERIOD and no `freq`, each occurrence is a
         // sample, of a period of 1; so it is with a period of 1.
-        if period_field && !freq {
-            run(out, 1, n);
-            return;
+        if period_field && !freq || self.period == 1 && !freq {
+            let period = if period_field { 1 } else { self.last_period };
+            let taken = n.min(*limit);
+            *limit -= taken;
+            if taken != 0 {
+                out.push(Overflow {
+                    period,
+                    n: taken,
+                    at: 0,
+                    each: true,
+                });
+            }
+            return n - taken;
         }
-        if self.period == 1 && !freq {
-            run(out, self.last_period, n);
-            return;
-        }
-        while n > 0 {
+        let mut at = 0;
+        while at < n {
             if self.left < -1 {
-                let step = n.min((-1 - self.left) as u64);
+                let step = (n - at).min((-1 - self.left) as u64);
                 self.left += step as i64;
-                n -= step;
+                at += step;
                 continue;
             }
             self.left += 1;
-            n -= 1;
+            at += 1;
             if self.left < 0 {
                 continue;
             }
@@ -243,8 +260,21 @@ impl Sampler {
             self.last_period = self.period;
             let nr = (period + self.left as u64) / period;
             self.left -= (nr * period) as i64;
-            run(out, period, nr);
+            let taken = nr.min(*limit);
+            *limit -= taken;
+            if taken != 0 {
+                out.push(Overflow {
+                    period,
+                    n: taken,
+                    at: at - 1,
+                    each: false,
+                });
+            }
+            if *limit == 0 {
+                break;
+            }
         }
+        n - at
     }
     /// The times a clock's hrtimer fires in `ns` more nanoseconds of its
     /// count, each a sample of the last period, as `perf_swevent_hrtimer`
@@ -255,8 +285,15 @@ impl Sampler {
     /// its hrtimer started with a whole period. With an UNTHROTTLE that is
     /// to be written first ([`Self::scheduled_in`]), into `out`; the
     /// nanoseconds the event was throttled in, which its count leaves out,
-    /// as `cpu_clock_event_stop` stops it.
-    fn ticks(&mut self, ns: u64, per_tick: u64, out: &mut Vec<Fire>) -> u64 {
+    /// as `cpu_clock_event_stop` stops it, and those after the sample that
+    /// uses `limit` up, at which it is disabled.
+    fn ticks(
+        &mut self,
+        ns: u64,
+        per_tick: u64,
+        limit: &mut u64,
+        out: &mut Vec<Fire>,
+    ) -> (u64, u64) {
         if std::mem::take(&mut self.unthrottled) {
             out.push(Fire::Unthrottle);
         }
@@ -266,7 +303,15 @@ impl Sampler {
         // No tick can hold that many: none throttles.
         let never = TICK_NSEC.div_ceil(step) < per_tick;
         let mut stopped = 0;
+        let mut unused = 0;
         loop {
+            if *limit == 0 {
+                // Enabled again, its hrtimer starts with a whole period.
+                unused = end - self.at;
+                self.throttled = false;
+                self.left = step as i64;
+                break;
+            }
             if self.throttled {
                 let tick = self.seq.saturating_add(1).saturating_mul(TICK_NSEC);
                 if tick > end {
@@ -302,7 +347,9 @@ impl Sampler {
                 until_end
                     .min(in_tick)
                     .min(per_tick.saturating_sub(before).max(1))
-            };
+            }
+            .min(*limit);
+            *limit -= n;
             let last = first + (n - 1) * step;
             let last_jiffy = last / TICK_NSEC;
             self.interrupts = if last_jiffy == jiffy {
@@ -326,7 +373,7 @@ impl Sampler {
             self.left = step as i64;
         }
         self.at = end;
-        stopped
+        (stopped, unused)
     }
     /// `perf_adjust_period`: the period moves an eighth of the way to the
     /// one that gives the frequency, at `count` occurrences in `nsec`.
@@ -351,8 +398,16 @@ impl Sampler {
     }
 }
 
-/// Samples as runs of a period and how many have it.
-type Runs = Vec<(u64, u64)>;
+/// `n` overflows of a software event, the samples of `period`, at the
+/// occurrence `at` of those it was told of, or, with `each`, at it and those
+/// after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Overflow {
+    period: u64,
+    n: u64,
+    at: u64,
+    each: bool,
+}
 
 /// `fire` after the others, samples of the period of the last ones with
 /// them.
@@ -364,16 +419,6 @@ fn push(out: &mut Vec<Fire>, fire: Fire) {
         return;
     }
     out.push(fire);
-}
-
-fn run(out: &mut Runs, period: u64, n: u64) {
-    if n == 0 {
-        return;
-    }
-    match out.last_mut() {
-        Some((last, count)) if *last == period => *count += n,
-        _ => out.push((period, n)),
-    }
 }
 
 /// Where an event's `O_ASYNC` signals go: the registration `F_SETFL`
@@ -469,17 +514,25 @@ impl Event {
     /// Its overflows since they were last taken, their samples and the
     /// signals they send, and its `sigtrap`.
     fn take_samples(self: &Arc<Self>, task: &Task<'_>, per_tick: u64) -> Option<PendingSignal> {
-        let occurred = {
+        let (occurred, tally) = {
             let state = self.settle();
             if state.removed {
                 return None;
             }
-            state.occurred
+            (state.occurred, state.tally)
         };
         let period_field = self.attr.sample_type & PERIOD != 0;
-        // What it gives in order, each in user mode or in the kernel.
-        let mut fires: Vec<(Fire, bool)> = Vec::new();
-        let stopped = {
+        // `event_limit`: the overflow that brings it to 0 is the last, and
+        // disables the event (`POLL_HUP`).
+        let limited = self.event_limit.load(Ordering::Relaxed);
+        let mut limit = u64::try_from(limited)
+            .ok()
+            .filter(|&limit| limit != 0)
+            .unwrap_or(u64::MAX);
+        // What it gives in order, each in user mode or in the kernel, with
+        // the address of its fault.
+        let mut fires: Vec<(Fire, bool, At)> = Vec::new();
+        let (stopped, unused) = {
             let mut sampler = lock(&self.sampler);
             let freq = sampler.freq();
             let new = [
@@ -497,12 +550,17 @@ impl Event {
                 // throttles nothing.
                 let exclude = self.attr.flag(bit::EXCLUDE_USER);
                 let mut ticks = Vec::new();
-                let per_tick = if exclude { u64::MAX } else { per_tick };
-                let stopped = sampler.ticks(new[0] + new[1], per_tick, &mut ticks);
+                let mut none = u64::MAX;
+                let (per_tick, limit) = if exclude {
+                    (u64::MAX, &mut none)
+                } else {
+                    (per_tick, &mut limit)
+                };
+                let ended = sampler.ticks(new[0] + new[1], per_tick, limit, &mut ticks);
                 if !exclude {
-                    fires.extend(ticks.into_iter().map(|fire| (fire, true)));
+                    fires.extend(ticks.into_iter().map(|fire| (fire, true, At::default())));
                 }
-                stopped
+                ended
             } else {
                 if freq {
                     let now = self.clock_now();
@@ -515,21 +573,30 @@ impl Event {
                     sampler.freq_time = now;
                     sampler.freq_count = count;
                 }
-                let mut user = Runs::new();
-                let mut kernel = Runs::new();
-                sampler.occurrences(new[0], period_field, freq, &mut user);
-                sampler.occurrences(new[1], period_field, freq, &mut kernel);
-                let samples = |runs: Runs, user_mode| {
-                    runs.into_iter()
-                        .map(move |(period, n)| (Fire::Samples(period, n), user_mode))
-                };
-                fires.extend(samples(user, true).chain(samples(kernel, false)));
-                0
+                let mut unused = 0;
+                for (mode, n) in new.into_iter().enumerate() {
+                    if limit == 0 {
+                        unused += n;
+                        continue;
+                    }
+                    let mut overflows = Vec::new();
+                    unused +=
+                        sampler.occurrences(n, period_field, freq, &mut limit, &mut overflows);
+                    let counted = [tally.0, tally.1][mode];
+                    self.fires(&overflows, mode == 1, (counted, n), &mut fires);
+                }
+                (0, unused)
             }
         };
-        if stopped > 0 {
+        if stopped + unused > 0 {
             let mut state = lock(&self.state);
-            state.count = state.count.saturating_sub(stopped);
+            state.count = state.count.saturating_sub(stopped + unused);
+            // A clock stops where its last sample was taken, and so do its
+            // times; when the other counters' last came is not known.
+            if self.counter == Counter::Clock {
+                state.enabled_time = state.enabled_time.saturating_sub(unused);
+                state.running_time = state.running_time.saturating_sub(unused);
+            }
         }
         if fires.is_empty() {
             return None;
@@ -541,41 +608,35 @@ impl Event {
         } else {
             self.attr.wakeup
         };
+        let hung_up = limit == 0;
         let mut overflows = 0;
-        let mut hung_up = false;
         let mut woken = false;
-        // The samples of one period are alike: written together.
-        'runs: for (fire, user_mode) in fires {
-            let (period, mut copies) = match fire {
+        let mut address = None;
+        // The samples of one period and address are alike: written together.
+        for (fire, user_mode, at) in fires {
+            let (period, copies) = match fire {
                 Fire::Samples(period, copies) => (period, copies),
                 Fire::Throttle | Fire::Unthrottle => {
                     self.log_throttle(fire == Fire::Unthrottle, &task.who());
                     continue;
                 }
             };
-            // `event_limit`: the overflow that brings it to 0 is the
-            // last, and disables the event (`POLL_HUP`).
-            let limit = self.event_limit.load(Ordering::Relaxed);
-            if limit > 0 && copies >= limit as u64 {
-                copies = limit as u64;
-                self.event_limit.store(0, Ordering::Relaxed);
-                hung_up = true;
-            } else if limit != 0 {
-                self.event_limit
-                    .store(limit.wrapping_sub(copies as i32), Ordering::Relaxed);
-            }
             overflows += copies;
+            // `pending_addr`: the first overflow's, until the thread
+            // returns to its code.
+            address.get_or_insert(at.addr);
             if let Some(rb) = &rb {
-                let (record, spill) = self.sample(task, user_mode, period);
+                let (record, spill) = self.sample(task, user_mode, period, at);
                 let trailer = top.id_sample(task);
                 woken |= rb.output(&top, &record, &spill, copies, &trailer, wakeup_events);
-            }
-            if hung_up {
-                break 'runs;
             }
         }
         if overflows == 0 {
             return None;
+        }
+        if limited != 0 {
+            self.event_limit
+                .fetch_sub(overflows as i32, Ordering::Relaxed);
         }
         if hung_up {
             self.set_enabled(false);
@@ -584,7 +645,51 @@ impl Event {
         // it writes through too.
         let extra = woken && self.parent.is_some();
         top.signal_owner(overflows, hung_up, extra);
-        self.attr.flag(bit::SIGTRAP).then(|| self.sigtrap(task))
+        self.attr
+            .flag(bit::SIGTRAP)
+            .then(|| self.sigtrap(task, address.unwrap_or(0)))
+    }
+    /// The samples of `overflows`, of the last `n` occurrences in its
+    /// thread's own code or in the `kernel`, which has had `counted` of
+    /// them: one for each where they show
+    /// their faults' addresses ([`Self::shows_address`]).
+    fn fires(
+        &self,
+        overflows: &[Overflow],
+        kernel: bool,
+        (counted, n): (u64, u64),
+        out: &mut Vec<(Fire, bool, At)>,
+    ) {
+        if !self.shows_address() {
+            let mut fires = Vec::new();
+            for overflow in overflows {
+                push(&mut fires, Fire::Samples(overflow.period, overflow.n));
+            }
+            out.extend(fires.into_iter().map(|fire| (fire, !kernel, At::default())));
+            return;
+        }
+        let addresses = match &self.target {
+            super::Target::Thread { group, tid } => group
+                .last_thread_usage(*tid)
+                .map(|usage| usage.fault_addresses(kernel, counted, n))
+                .unwrap_or_default(),
+            super::Target::Cpu => Vec::new(),
+        };
+        for overflow in overflows {
+            let runs = if overflow.each { overflow.n } else { 1 };
+            for i in 0..runs {
+                let at = usize::try_from(overflow.at + i).unwrap_or(usize::MAX);
+                let address = addresses.get(at).copied().unwrap_or_default();
+                let copies = if overflow.each { 1 } else { overflow.n };
+                out.push((Fire::Samples(overflow.period, copies), !kernel, address));
+            }
+        }
+    }
+    /// Whether its samples or its SIGTRAP show the addresses of faults.
+    pub(super) fn shows_address(&self) -> bool {
+        self.counter == Counter::Faults
+            && (self.attr.sample_type & (ADDR | DATA_PAGE_SIZE) != 0
+                || self.attr.flag(bit::SIGTRAP))
     }
     /// `perf_log_throttle`: `PERF_RECORD_THROTTLE`, or `UNTHROTTLE`, of the
     /// group's leader, which throttles and unthrottles with its group
@@ -629,11 +734,12 @@ impl Event {
     }
     /// `send_sig_perf`: SIGTRAP of `TRAP_PERF` for the thread, with
     /// `sig_data` and the event's type, and the flag that it came late if
-    /// the thread blocks it. A fault's address is not known here (0).
-    fn sigtrap(&self, task: &Task<'_>) -> PendingSignal {
+    /// the thread blocks it, and the `address` of the fault it is for.
+    fn sigtrap(&self, task: &Task<'_>, address: u64) -> PendingSignal {
         let mut info = [0; 48];
         info[0..4].copy_from_slice(&SIGTRAP.to_le_bytes());
         info[8..12].copy_from_slice(&TRAP_PERF.to_le_bytes());
+        info[16..24].copy_from_slice(&address.to_le_bytes());
         info[24..32].copy_from_slice(&self.attr.sig_data.to_le_bytes());
         info[32..36].copy_from_slice(&self.attr.kind.to_le_bytes());
         let flags = if task.blocks_sigtrap {
@@ -760,10 +866,17 @@ impl Event {
         }
     }
     /// `perf_prepare_sample` and `perf_output_sample`: a sample of `task`,
-    /// in user mode or in the kernel, of `period`. Past the record come
+    /// in user mode or in the kernel, of `period` and, for a `fault`, of where
+    /// it was. Past the record come
     /// the bytes Linux writes beyond the size it gave it: a user stack's
     /// dump of nothing still ends with its dynamic size.
-    fn sample(self: &Arc<Self>, task: &Task<'_>, user: bool, period: u64) -> (Vec<u8>, Vec<u8>) {
+    fn sample(
+        self: &Arc<Self>,
+        task: &Task<'_>,
+        user: bool,
+        period: u64,
+        fault: At,
+    ) -> (Vec<u8>, Vec<u8>) {
         let st = self.attr.sample_type;
         let regs = task.regs;
         let ip = if user { regs.rip.0 } else { 0 };
@@ -787,7 +900,7 @@ impl Event {
             put(&mut out, self.clock_now());
         }
         if st & ADDR != 0 {
-            put(&mut out, 0);
+            put(&mut out, fault.addr);
         }
         if st & ID != 0 {
             put(&mut out, self.id);
@@ -878,12 +991,23 @@ impl Event {
         if st & CGROUP != 0 {
             put(&mut out, ROOT_CGROUP);
         }
+        // `perf_get_page_size`: 0 for an address with no page.
+        let page_size = |at: u64| {
+            let present = at != 0 && task.mem.resident(GuestAddr(at)) == Some(true);
+            if present { PAGE } else { 0 }
+        };
         if st & DATA_PAGE_SIZE != 0 {
-            put(&mut out, 0);
+            // Of a `page-faults` sample, taken before the fault is handled
+            // (`do_user_addr_fault`), and of a `minor-faults` one, after.
+            let size = match (self.attr.config, fault.present) {
+                (super::SW_PAGE_FAULTS, false) => 0,
+                (super::SW_PAGE_FAULTS, true) => PAGE,
+                _ => page_size(fault.addr),
+            };
+            put(&mut out, size);
         }
         if st & CODE_PAGE_SIZE != 0 {
-            let present = ip != 0 && task.mem.resident(GuestAddr(ip)) == Some(true);
-            put(&mut out, if present { PAGE } else { 0 });
+            put(&mut out, page_size(ip));
         }
         if st & AUX != 0 {
             put(&mut out, 0);
@@ -895,7 +1019,7 @@ impl Event {
     /// `perf_output_read`: the values a sample reads, the event's own
     /// count with what ended children gave back (but only its own with
     /// `inherit`), and its times as of now.
-    fn sample_read(self: &Arc<Self>) -> Vec<u64> {
+    pub(super) fn sample_read(self: &Arc<Self>) -> Vec<u64> {
         use super::FORMAT_TOTAL_TIME_RUNNING;
         use super::{FORMAT_GROUP, FORMAT_ID, FORMAT_LOST, FORMAT_TOTAL_TIME_ENABLED};
         let format = self.attr.read_format;
@@ -1097,15 +1221,80 @@ pub(super) fn header(out: &mut Vec<u8>, kind: u32, misc: u16, size: usize) {
 mod tests {
     use super::*;
 
+    /// The samples of `n` more occurrences, as how many of a period.
+    fn runs(sampler: &mut Sampler, n: u64, period_field: bool, out: &mut Vec<(u64, u64)>) {
+        let mut overflows = Vec::new();
+        let mut limit = u64::MAX;
+        let left = sampler.occurrences(n, period_field, false, &mut limit, &mut overflows);
+        assert_eq!(left, 0);
+        for o in overflows {
+            match out.last_mut() {
+                Some((period, n)) if *period == o.period => *n += o.n,
+                _ => out.push((o.period, o.n)),
+            }
+        }
+    }
+    /// [`Sampler::ticks`] with no limit.
+    fn ticks(sampler: &mut Sampler, ns: u64, per_tick: u64, out: &mut Vec<Fire>) -> u64 {
+        let mut limit = u64::MAX;
+        sampler.ticks(ns, per_tick, &mut limit, out).0
+    }
+
+    #[test]
+    fn a_limit_stops_the_occurrences_at_the_overflow_that_uses_it_up() {
+        let mut sampler = Sampler::of_period(3, Counter::Faults);
+        let (mut limit, mut out) = (2, Vec::new());
+        assert_eq!(
+            sampler.occurrences(10, false, false, &mut limit, &mut out),
+            4
+        );
+        assert_eq!(limit, 0);
+        let at = |at| Overflow {
+            period: 3,
+            n: 1,
+            at,
+            each: false,
+        };
+        assert_eq!(out, [at(2), at(5)]);
+        // Each occurrence one of a period of 1.
+        let mut sampler = Sampler::of_period(1, Counter::Faults);
+        let (mut limit, mut out) = (4, Vec::new());
+        assert_eq!(
+            sampler.occurrences(3, false, false, &mut limit, &mut out),
+            0
+        );
+        assert_eq!(
+            sampler.occurrences(3, false, false, &mut limit, &mut out),
+            2
+        );
+        assert_eq!(out.iter().map(|o| o.n).collect::<Vec<_>>(), [3, 1]);
+    }
+
+    #[test]
+    fn a_limit_stops_a_clock_at_the_sample_that_uses_it_up() {
+        let mut sampler = Sampler::of_period(10_000, Counter::Clock);
+        let (mut limit, mut out) = (3, Vec::new());
+        let ended = sampler.ticks(MS / 2, PER_TICK, &mut limit, &mut out);
+        assert_eq!(ended, (0, MS / 2 - 30_000));
+        assert_eq!(out, [Fire::Samples(10_000, 3)]);
+        // Enabled again, it starts with a whole period.
+        out.clear();
+        limit = u64::MAX;
+        assert_eq!(sampler.ticks(9_999, PER_TICK, &mut limit, &mut out), (0, 0));
+        assert!(out.is_empty());
+        sampler.ticks(1, PER_TICK, &mut limit, &mut out);
+        assert_eq!(out, [Fire::Samples(10_000, 1)]);
+    }
+
     #[test]
     fn a_period_overflows_at_its_last_occurrence() {
         let mut sampler = Sampler::of_period(3, Counter::Faults);
-        let mut out = Runs::new();
-        sampler.occurrences(2, false, false, &mut out);
+        let mut out = Vec::new();
+        runs(&mut sampler, 2, false, &mut out);
         assert!(out.is_empty());
-        sampler.occurrences(1, false, false, &mut out);
+        runs(&mut sampler, 1, false, &mut out);
         assert_eq!(out, [(3, 1)]);
-        sampler.occurrences(7, false, false, &mut out);
+        runs(&mut sampler, 7, false, &mut out);
         assert_eq!(out, [(3, 3)]);
         assert_eq!(sampler.left, -2);
     }
@@ -1113,8 +1302,8 @@ mod tests {
     #[test]
     fn the_period_field_makes_each_occurrence_a_sample() {
         let mut sampler = Sampler::of_period(1000, Counter::Faults);
-        let mut out = Runs::new();
-        sampler.occurrences(3, true, false, &mut out);
+        let mut out = Vec::new();
+        runs(&mut sampler, 3, true, &mut out);
         assert_eq!(out, [(1, 3)]);
     }
 
@@ -1122,13 +1311,13 @@ mod tests {
     fn a_new_period_overflows_at_the_next_occurrence() {
         let mut sampler = Sampler::of_period(4, Counter::Faults);
         sampler.set_period(4, Counter::Faults, true);
-        let mut out = Runs::new();
-        sampler.occurrences(1, false, false, &mut out);
+        let mut out = Vec::new();
+        runs(&mut sampler, 1, false, &mut out);
         assert_eq!(out, [(4, 1)]);
         // `period_left` is 1 - 4 then: three more overflow again.
-        sampler.occurrences(2, false, false, &mut out);
+        runs(&mut sampler, 2, false, &mut out);
         assert_eq!(out, [(4, 1)]);
-        sampler.occurrences(1, false, false, &mut out);
+        runs(&mut sampler, 1, false, &mut out);
         assert_eq!(out, [(4, 2)]);
     }
 
@@ -1141,11 +1330,11 @@ mod tests {
     fn a_clock_fires_first_after_its_period_then_every_10_us_at_least() {
         let mut sampler = Sampler::of_period(1000, Counter::Clock);
         let mut out = Vec::new();
-        assert_eq!(sampler.ticks(999, PER_TICK, &mut out), 0);
+        assert_eq!(ticks(&mut sampler, 999, PER_TICK, &mut out), 0);
         assert!(out.is_empty());
-        sampler.ticks(1, PER_TICK, &mut out);
+        ticks(&mut sampler, 1, PER_TICK, &mut out);
         assert_eq!(out, [Fire::Samples(1000, 1)]);
-        sampler.ticks(25_000, PER_TICK, &mut out);
+        ticks(&mut sampler, 25_000, PER_TICK, &mut out);
         assert_eq!(out, [Fire::Samples(1000, 3)]);
         assert_eq!(sampler.left, 5000);
     }
@@ -1157,7 +1346,7 @@ mod tests {
         let mut sampler = Sampler::of_period(10_000, Counter::Clock);
         let mut out = Vec::new();
         // Its count stops from that interrupt, at 1990 us.
-        assert_eq!(sampler.ticks(2 * MS - 1, PER_TICK, &mut out), 9999);
+        assert_eq!(ticks(&mut sampler, 2 * MS - 1, PER_TICK, &mut out), 9999);
         assert_eq!(
             out,
             [
@@ -1168,10 +1357,10 @@ mod tests {
         );
         // The third tick unthrottles it, its hrtimer started again then.
         out.clear();
-        assert_eq!(sampler.ticks(1, PER_TICK, &mut out), 1);
+        assert_eq!(ticks(&mut sampler, 1, PER_TICK, &mut out), 1);
         assert_eq!(out, [Fire::Unthrottle]);
         out.clear();
-        sampler.ticks(10_000, PER_TICK, &mut out);
+        ticks(&mut sampler, 10_000, PER_TICK, &mut out);
         assert_eq!(out, [Fire::Samples(10_000, 1)]);
     }
 
@@ -1180,7 +1369,7 @@ mod tests {
         // `perf_event_max_sample_rate` 1: one interrupt a tick at most.
         let mut sampler = Sampler::of_period(100_000, Counter::Clock);
         let mut out = Vec::new();
-        let stopped = sampler.ticks(3 * MS + MS / 2, 1, &mut out);
+        let stopped = ticks(&mut sampler, 3 * MS + MS / 2, 1, &mut out);
         let once = [Fire::Throttle, Fire::Samples(100_000, 1)];
         let mut wanted = Vec::new();
         for _ in 0..3 {
@@ -1198,7 +1387,7 @@ mod tests {
     fn a_clock_that_no_tick_can_fill_is_never_throttled() {
         let mut sampler = Sampler::of_period(100_000, Counter::Clock);
         let mut out = Vec::new();
-        assert_eq!(sampler.ticks(1000 * MS, PER_TICK, &mut out), 0);
+        assert_eq!(ticks(&mut sampler, 1000 * MS, PER_TICK, &mut out), 0);
         assert_eq!(out, [Fire::Samples(100_000, 10_000)]);
     }
 
@@ -1206,12 +1395,12 @@ mod tests {
     fn a_throttled_clock_taken_in_again_is_unthrottled_with_a_whole_period() {
         let mut sampler = Sampler::of_period(100_000, Counter::Clock);
         let mut out = Vec::new();
-        sampler.ticks(200_000, 1, &mut out);
+        ticks(&mut sampler, 200_000, 1, &mut out);
         assert_eq!(out, [Fire::Throttle, Fire::Samples(100_000, 1)]);
         // Enabled again, or its period set, before the next tick.
         sampler.scheduled_in();
         out.clear();
-        sampler.ticks(100_000, 1, &mut out);
+        ticks(&mut sampler, 100_000, 1, &mut out);
         // Its next interrupt is in the same tick as the one that throttled
         // it: the second in it, which throttles it again.
         assert_eq!(
@@ -1222,7 +1411,7 @@ mod tests {
         let mut free = Sampler::of_period(100_000, Counter::Clock);
         free.scheduled_in();
         out.clear();
-        free.ticks(1, 1, &mut out);
+        ticks(&mut free, 1, 1, &mut out);
         assert!(out.is_empty());
     }
 

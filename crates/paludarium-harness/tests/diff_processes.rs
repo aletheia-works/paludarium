@@ -323,6 +323,7 @@ mod linux {
                     | "perf-sample"
                     | "perf-wakeup"
                     | "perf-side-band"
+                    | "perf-inherit-stat"
                     | "perf-side-band-comm"
                     | "perf-throttle"
                     | "perf-side-band-exec"
@@ -676,6 +677,7 @@ mod linux {
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
         processes_file_leases => ("file-leases","process"),
+        processes_proc_locks => ("proc-locks","process"),
         processes_smaps_flags => ("smaps-flags","process"),
         processes_mrelease_fatal => ("mrelease-fatal","process"),
         processes_madvise_guard => ("madvise-guard","process"),
@@ -746,6 +748,7 @@ mod linux {
         perf_sample => ("perf-sample","perf"),
         perf_wakeup => ("perf-wakeup","perf"),
         perf_side_band => ("perf-side-band","perf"),
+        perf_inherit_stat => ("perf-inherit-stat","perf"),
         perf_side_band_comm => ("perf-side-band-comm","perf"),
         perf_throttle => ("perf-throttle","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
@@ -1083,6 +1086,7 @@ mod linux {
         processes_tmpfs_huge => ("tmpfs-huge","process"),
         processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),
         processes_anon_thp_placement => ("anon-thp-placement","process"),
+        processes_mmap_32bit => ("mmap-32bit","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),

@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sched.h>
 #include <stdio.h>
@@ -236,6 +237,23 @@ static double seconds(void) {
 }
 /* How long something took, in whole seconds, between 2 and 5 or not. */
 static const char *about_three(double took) { return took >= 2.0 && took < 5.0 ? "about 3 s" : "not 3 s"; }
+/* The state of a connect an ICMP error ends, once that error is all in
+   place. In SYN_SENT, Linux's tcp_v4_err first queues the ICMP on the
+   error queue (ip_icmp_error), which wakes a poll, and only then sets
+   SO_ERROR, the state and the shutdown (tcp_done_with_error): a poll or a
+   getsockopt in between sees POLLERR alone, or no SO_ERROR yet. It does
+   all that holding the socket's lock, which TCP_INFO takes too, after it
+   has read the state, so a TCP_INFO that tells CLOSE comes after all of
+   it. Waits 2 s at most. */
+static int ended(int fd) {
+    struct tcp_info info = {0};
+    for (int i = 0; i < 2000; i++) {
+        socklen_t len = sizeof info;
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) || info.tcpi_state == TCP_CLOSE) break;
+        nanosleep(&(struct timespec){.tv_nsec = 1000000}, 0);
+    }
+    return info.tcpi_state;
+}
 static void receive(int fd, const char *label) {
     char buf[64] = {0};
     struct pollfd ready = {.fd = fd, .events = POLLIN};
@@ -386,6 +404,7 @@ int main(int argc, char **argv) {
     printf("A: connect from none to nobody=%ld\n", result(connect(zero, (void *)&to, sizeof to)));
     waiting = (struct pollfd){.fd = zero, .events = POLLIN | POLLOUT};
     printf("A: poll for 4 s=%d\n", poll(&waiting, 1, 4000));
+    printf("A: state=%d\n", ended(zero));
     int lost = 0;
     socklen_t size = sizeof lost;
     getsockopt(zero, SOL_SOCKET, SO_ERROR, &lost, &size);
@@ -449,7 +468,10 @@ int main(int argc, char **argv) {
     printf("A: nonblocking connect to nobody=%ld\n", result(connect(c, (void *)&to, sizeof to)));
     struct pollfd p = {.fd = c, .events = POLLIN | POLLOUT};
     printf("A: poll=%d\n", poll(&p, 1, 10000));
-    printf("A: revents=%#x, it took %s\n", p.revents, about_three(seconds() - start));
+    printf("A: POLLERR=%d, it took %s\n", !!(p.revents & POLLERR), about_three(seconds() - start));
+    printf("A: state=%d\n", ended(c));
+    printf("A: poll again=%d\n", poll(&p, 1, 0));
+    printf("A: revents=%#x\n", p.revents);
     int error = 0;
     socklen_t len = sizeof error;
     getsockopt(c, SOL_SOCKET, SO_ERROR, &error, &len);

@@ -602,7 +602,13 @@ kernel.
   unlocking, changing or closing it ends the wait there at once, as
   `locks_wake_up_blocks` does, even before the waiter runs again. The
   locks are the guest's own: a program on the host does not see them, nor
-  they its.
+  they its. `/proc/locks` lists the record locks, the `flock` locks and the
+  leases as `locks_show` prints them: those of each CPU in turn (as `getcpu`
+  numbers it where the lock was taken), the latest first, a merged lock at
+  its first one's place and a split one's left piece as new
+  (`posix_lock_inode`), without those of processes outside the reader's PID
+  namespace. `/proc/<pid>/fdinfo` lists a description's own, its lease last
+  (`show_fd_locks`).
 
 - File leases (`fcntl`'s `F_SETLEASE` and `F_GETLEASE`), as Linux's
   `fs/locks.c` takes and gives them back: a read or write lease on an open
@@ -1746,6 +1752,14 @@ kernel.
   past the first boundary after its offset, at the boundary its offset
   agrees with (`get_unmapped_area_zero`), or at the hint when the longer
   room fits there.
+
+- `MAP_32BIT` puts a mapping in the first 2 GiB, as Linux's `find_start_end`
+  does, in either layout: at a free hint that ends by 2 GiB, else in the
+  lowest room from 1 GiB up (Linux starts up to 32 MiB higher, at random),
+  with the placements at a 2 MiB boundary there too, or `ENOMEM`.
+  `MAP_FIXED` overrides it, and `mremap` does not keep to it. The mapping
+  of an `io_uring` ring does not follow it yet. A hint below
+  `mmap_min_addr` (64 KiB) is taken as that address.
 
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
@@ -3905,8 +3919,8 @@ kernel.
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
 
-- The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
+- The other `/proc` entries are `/proc/loadavg`, `/proc/locks` (above),
+  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
@@ -4362,10 +4376,13 @@ kernel.
   reaped, then its numbers in each namespace below down to its own. The other kinds add Linux's lines
   too. After the first four come `lock:` lines (`show_fd_locks`): the
   description's `flock` lock, then each record lock set through it that the
-  process's table or the description owns, by where they start, numbered from 1
-  across both. Each has `FLOCK`, `POSIX` or `OFDLCK`, `READ` or `WRITE`, the
-  ID of the process that set it (-1 for a description's record lock), the device and inode, and the range
-  (`0 EOF` for a `flock` lock). Asking again for the kind of `flock` lock a
+  process's table or the description owns, in the file's order (each owner's
+  together by where they start, the owners as they first locked the file), then
+  its lease, numbered from 1 across all. Each has `FLOCK`, `POSIX`, `OFDLCK` or
+  `LEASE`, `READ` or `WRITE` (for a lease being broken, `BREAKING` and the type
+  it is to have, which can be `UNLCK`), the ID of the process that set it (-1 for a
+  description's record lock), the device and inode, and the range (`0 EOF` for
+  a `flock` lock or a lease). Asking again for the kind of `flock` lock a
   description has keeps it as it was, and a change of kind drops the old
   one first, even when the new one conflicts, as `flock_lock_inode` does.
   A lock merged into another
@@ -4439,7 +4456,7 @@ kernel.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
 
-- These system files (`loadavg`, `meminfo`, `stat`, `uptime` and
+- These system files (`loadavg`, `locks`, `meminfo`, `stat`, `uptime` and
   `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
   read goes on to the end of what they hold. So is every file of a process's
   or a thread's directory (`stat` and `fstat` alike), as Linux's
@@ -5036,7 +5053,8 @@ kernel.
   `freq` a new frequency) that starts over; `REFRESH` is `EINVAL` for an
   event that does not sample or that new tasks inherit, and else allows
   that many more overflows and enables the event (`event_limit`): the
-  last of them disables it and signals `POLL_HUP`. `enable_on_exec` enables a disabled
+  last of them disables it, its count stopped there, and signals
+  `POLL_HUP`. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
   `remove_on_exec` takes one out then for good, as Linux master does: it
   counts no more, keeps its last count and times to be read, has no owner
@@ -5053,7 +5071,10 @@ kernel.
   from `CLONE_CLEAR_SIGHAND`. A read of the opened event adds in the
   inherited ones and what those of tasks that ended gave back, counts and
   times, a group's member by member (`ECHILD` for a group whose members
-  changed since a task inherited it). Its `ENABLE`, `DISABLE` and `RESET`
+  changed since a task inherited it). With `inherit_stat`, the end of a
+  task writes `PERF_RECORD_READ` of each event it inherited, with the count
+  and times that event alone has (`perf_event_read_event`), the latest
+  first, each then out of its group. Its `ENABLE`, `DISABLE` and `RESET`
   (which keeps what ended tasks gave back), and the `prctl` below, reach
   the inherited events too. `prctl`'s
   `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
@@ -5142,15 +5163,16 @@ kernel.
   file's owner (`F_SETOWN`) with `POLL_IN`, `F_SETSIG`'s signal carrying
   `si_code`, `si_band` and `si_fd`, with or without a buffer; and with
   `sigtrap`, an overflow sends the thread SIGTRAP of `TRAP_PERF` with
-  `sig_data` and the event's type in `si_perf_data` and `si_perf_type`,
-  and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event of a task
+  `sig_data` and the event's type in `si_perf_data` and `si_perf_type`, the
+  fault's address in `si_addr` as a sample has it with
+  `PERF_SAMPLE_ADDR`, and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event of a task
   that asks for them takes side-band records, as `perf_iterate_sb` gives
   them to the enabled events that count the thread that makes them, each
   with that thread's `sample_id`: `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
   (`mmap2`) of an executable mapping, and with `mmap_data` of any other
   (`PERF_RECORD_MISC_MMAP_DATA`), as `mmap`, `brk`'s growth, `shmat`,
   `remap_file_pages` and `mprotect` (of each VMA whose protection it
-  changed) leave the VMA, merged with its neighbours, with its address,
+  changed, in turn) leave the VMA, merged with its neighbours, with its address,
   length and offset (a file's, and the address of private anonymous
   memory), and for `MMAP2` its file's device and inode, its protection and
   sharing, and the name `d_path` gives (`[heap]`, `[stack]`, `//anon`,

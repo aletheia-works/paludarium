@@ -12,8 +12,11 @@
 # Actions are pinned by commit SHA and the default token is read-only.
 name: CI
 
+# A merge queue (none is set up) runs it on merge_group: the stable clippy and the
+# production wasm on the merged code, as ci-ok (scripts/ci-changes.py).
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
@@ -47,6 +50,7 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.groups.outputs.rust }}
+      compile: ${{ steps.groups.outputs.compile }}
       unit: ${{ steps.groups.outputs.unit }}
       dependencies: ${{ steps.groups.outputs.dependencies }}
       fuzz: ${{ steps.groups.outputs.fuzz }}
@@ -75,13 +79,14 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          if [ "$EVENT" != pull_request ]; then
-            python3 scripts/ci-changes.py --all
-          else
-            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
-              --jq '.[] | .filename, (.previous_filename // empty)' |
-              python3 scripts/ci-changes.py
-          fi
+          case "$EVENT" in
+            pull_request)
+              gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+                --jq '.[] | .filename, (.previous_filename // empty)' |
+                python3 scripts/ci-changes.py ;;
+            merge_group) python3 scripts/ci-changes.py --merge-group ;;
+            *) python3 scripts/ci-changes.py --all ;;
+          esac
 
   wasm-programs:
     needs: [changes, quick]
@@ -260,7 +265,7 @@ jobs:
   stable-clippy:
     name: clippy (stable Rust of rust-version)
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.compile == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

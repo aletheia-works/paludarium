@@ -334,10 +334,11 @@ verified.
   another CPU only when a new CPU mask changes the lowest CPU it allows.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where
-  Linux takes each at its occurrence: they show the thread's address,
-  registers, stack and frames as of then, a fault's address is 0, and one
-  of the kernel (a fault in a system call, a switch or a migration) has the
-  address 0 and no kernel frames. `freq` follows the rate at those points,
+  Linux takes each at its occurrence: they show the thread's instruction,
+  registers, stack and frames as of then (a fault's own address is its
+  own, but 0 for one before the thread's last 4096), and one of the kernel
+  (a fault in a system call, a switch or a migration) has the instruction
+  0 and no kernel frames. `freq` follows the rate at those points,
   not at each tick. A `cpu-clock` or `task-clock` event is throttled at
   `perf_event_max_sample_rate` over `HZ` (1000) interrupts in a tick, as
   Linux's hrtimer events are, the ticks being those of its own count, and
@@ -358,23 +359,20 @@ verified.
   generation is 0; a build ID is read from a file whose page cache the
   emulator does not keep (a host's, or one of the in-memory file system from
   start-up) as if its pages were all cached, where Linux gives none for a
-  page it has not read or has evicted; `mprotect` writes
-  one record of each VMA as it ends up, where Linux writes one each time it
-  changes one, of the VMA as merged so far; a thread the host cannot
+  page it has not read or has evicted; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
   failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
   written. The overflows
   of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
-  each time the thread returns to its code, and its `si_addr` is 0, where
-  Linux gives a fault's address. When `REFRESH`'s last overflow disables
-  the event, the occurrences after it up to that point are still counted,
-  where Linux stops the count at it. Its user page shows the count and times as of the
+  each time the thread returns to its code; its `si_addr` is the first
+  fault's. When `REFRESH`'s last overflow disables the event, its count
+  stops there, but its times (a clock's apart) and its group's other
+  events go on up to that point. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
-  mapping's are the error here. `inherit_stat` is taken, but an inherited
-  event's end sends no read record, as nothing is recorded. The cgroup mode
+  mapping's are the error here. The cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
@@ -673,7 +671,8 @@ verified.
     (Linux's `ITIMER_VIRTUAL` leaves out the system time; its `RLIMIT_CPU`
     counts it). Where the host
     cannot measure a thread's CPU time, as in WebAssembly, that is wall time,
-    so they also count the time a thread sleeps or waits, from its wake on. They are looked
+    so they also count the time a thread sleeps or waits, all of it once it
+    wakes. They are looked
     at as a thread makes a system call and every 100,000 instructions it
     runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. POSIX timers on the CPU-time clocks count
@@ -1062,6 +1061,11 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
+- **`/proc/locks`, in part**: the lines of those that wait for a lock
+  (`-> `) are not there. PIDs are those of the reader's PID namespace, where
+  Linux's are those of the one `/proc` was mounted in. A `flock` lock a
+  program on the host holds on a file of the host is not listed, though it
+  conflicts with the guest's.
 - **File leases, in part**: the opens `execve` makes of a program, its
   interpreter and its script, and those of the descriptors fanotify's events
   give, break no lease, where Linux's do. A lease is broken before

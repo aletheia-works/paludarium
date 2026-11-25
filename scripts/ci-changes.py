@@ -676,15 +676,24 @@ def check_narrowing(workflow):
 def runs_on_merge_group(condition, needs_groups=MERGE_GROUP):
     """Whether a job with this condition runs in a merge queue's run.
 
-    The conditions name pull_request, a group of the changes job, or both, which
-    must all hold; ci.yml's checks of quick's result pass in such a run.
+    It reads the terms ci.yml's conditions join with &&, and refuses any other,
+    so that a new kind of condition is not taken to mean what it does not.
     """
-    if "pull_request" in condition:
-        return False
-    groups = re.findall(r"needs\.changes\.outputs\.([a-z_]+)", condition)
-    if not groups:
-        raise AssertionError(f"not a condition of groups, for a merge queue's run: {condition}")
-    return all(g in needs_groups for g in groups)
+    condition = re.sub(r"^\$\{\{ (.*) \}\}$", r"\1", condition)
+    runs = True
+    for term in condition.split(" && "):
+        group = re.fullmatch(r"needs\.changes\.outputs\.([a-z_]+) == 'true'", term)
+        if group:
+            runs &= group.group(1) in needs_groups
+        elif (
+            term == "github.event_name == 'pull_request'"
+            or term == "needs.changes.outputs.fuzz_targets != '[]'"
+        ):
+            runs = False
+        # It is cancelled only as any run is, and quick's checks pass in it.
+        elif term not in ("!cancelled()", "needs.quick.result == 'success'"):
+            raise AssertionError(f"not a condition known for a merge queue's run: {term}")
+    return runs
 
 
 def check_merge_group(workflow):
@@ -732,6 +741,17 @@ def check_merge_group(workflow):
     ):
         if runs_on_merge_group(text) != refusal:
             raise AssertionError(f"runs_on_merge_group({text})")
+    for text in (
+        "github.event_name != 'pull_request' && needs.changes.outputs.compile == 'true'",
+        "needs.changes.outputs.compile == 'true' || always()",
+        "needs.changes.outputs.compile != 'true'",
+        "",
+    ):
+        try:
+            runs_on_merge_group(text)
+        except AssertionError:
+            continue
+        raise AssertionError(f"runs_on_merge_group took {text!r}")
 
 
 def fuzz_self_test():

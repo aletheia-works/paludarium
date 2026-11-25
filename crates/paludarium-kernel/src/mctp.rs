@@ -1140,11 +1140,24 @@ fn allocate_tag(
         return Err(Errno::EINVAL);
     }
     let now = now(c);
-    let mut t = socket.network.mctp.lock(now);
-    let tag = t.allocate(&socket.this, net, ANY, peer, true, now)?;
+    let tag = socket
+        .network
+        .mctp
+        .lock(now)
+        .allocate(&socket.this, net, ANY, peer, true, now)?;
     raw[if v2 { 8 } else { 1 }] = tag | TAG_OWNER | TAG_PREALLOC;
+    // Copied out with the keys' lock let go: the copy may wait for a
+    // `userfaultfd`.
     if c.mem.write(GuestAddr(arg), &raw).is_err() {
-        t.keys.remove(0);
+        // Its own key, which no other of the peer has the tag of.
+        let peer = if peer == NULL { ANY } else { peer };
+        socket.network.mctp.lock(now).keys.retain(|k| {
+            !(k.socket.ptr_eq(&socket.this)
+                && k.manual
+                && k.net == net
+                && k.peer == peer
+                && k.tag == tag)
+        });
         return Err(Errno::EFAULT);
     }
     Ok(0)

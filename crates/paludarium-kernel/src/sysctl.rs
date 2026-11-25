@@ -75,6 +75,7 @@
 //! file has an inode of its own and a size of 0 ([`stat`]), so, as on
 //! Linux, `copy_file_range` never writes one: from another filesystem it is
 //! `EXDEV`, and from a sysctl it copies nothing.
+use crate::events::ReadinessHub;
 use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
 use crate::namespaces::Namespace;
@@ -83,7 +84,7 @@ use crate::syscalls::Context;
 use crate::users::Ids as Kind;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat};
 use paludarium_types::Errno;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 const DT_DIR: u8 = 4;
@@ -318,16 +319,60 @@ impl Uts {
     }
 }
 
-/// The UTS namespace of the thread whose system call runs, which Linux's
-/// `get_uts` takes from `current`.
-fn current_uts(processes: &Weak<crate::processes::Processes>) -> Result<Arc<Namespace>, Errno> {
-    const ESRCH: Errno = Errno(3);
-    let (pid, tid) = crate::proc::caller();
-    let group = processes
-        .upgrade()
-        .and_then(|processes| processes.group_of(pid))
-        .ok_or(ESRCH)?;
-    Ok(Arc::clone(&group.namespaces(tid).uts))
+/// An open file of `/proc/sys/kernel` that shows a UTS namespace's field.
+struct UtsFile {
+    file: Uts,
+    processes: Weak<crate::processes::Processes>,
+    machine: Arc<Machine>,
+    hub: Arc<ReadinessHub>,
+    /// The change it was open at or last told a poll of, which Linux keeps
+    /// in `filp->private_data`, so a `dup` and a child share it.
+    seen: AtomicU64,
+}
+
+impl UtsFile {
+    fn opened(c: &Context<'_>, file: Uts) -> Self {
+        let machine = Arc::clone(&c.processes.sysctls);
+        Self {
+            file,
+            processes: Arc::downgrade(c.processes),
+            hub: Arc::clone(&c.files.readiness),
+            seen: AtomicU64::new(machine.uts_events(file == Uts::Domainname)),
+            machine,
+        }
+    }
+    /// The UTS namespace of the thread whose system call runs, which
+    /// Linux's `get_uts` takes from `current`.
+    fn namespace(&self) -> Result<Arc<Namespace>, Errno> {
+        const ESRCH: Errno = Errno(3);
+        let (pid, tid) = crate::proc::caller();
+        let group = self
+            .processes
+            .upgrade()
+            .and_then(|processes| processes.group_of(pid))
+            .ok_or(ESRCH)?;
+        Ok(Arc::clone(&group.namespaces(tid).uts))
+    }
+    fn read(&self, buf: &mut [u8], position: &mut u64) -> Result<usize, Errno> {
+        Ok(self.file.read(&*self.namespace()?, buf, position))
+    }
+    /// [`Uts::write`], which tells of a change whatever it wrote, as
+    /// `proc_do_uts_string` does.
+    fn write(&self, buf: &[u8], position: &mut u64) -> Result<usize, Errno> {
+        let written = self.file.write(&*self.namespace()?, buf, position);
+        self.machine
+            .uts_changed(self.file == Uts::Domainname, &self.hub);
+        Ok(written)
+    }
+    /// How often what it shows changed: never, but for the two whose table
+    /// entry has a `poll`.
+    fn changes(&self) -> u64 {
+        if self.file.writable() {
+            self.machine.uts_events(self.file == Uts::Domainname)
+        } else {
+            self.seen.load(Ordering::SeqCst)
+        }
+    }
 }
 
 /// A file of `/proc/sys/kernel`.
@@ -440,6 +485,9 @@ pub(crate) struct Machine {
     drop_caches: AtomicI32,
     leases_enable: AtomicI32,
     lease_break_time: AtomicI32,
+    /// How often `kernel.hostname` and `kernel.domainname` changed, in any
+    /// UTS namespace (`hostname_poll`, `domainname_poll`).
+    uts_events: [AtomicU64; 2],
 }
 
 impl Default for Machine {
@@ -454,6 +502,7 @@ impl Default for Machine {
             drop_caches: AtomicI32::new(0),
             leases_enable: AtomicI32::new(1),
             lease_break_time: AtomicI32::new(45),
+            uts_events: Default::default(),
         }
     }
 }
@@ -484,9 +533,23 @@ impl Machine {
         const HZ: u64 = 1_000_000_000 / crate::threads::TICK_NSEC;
         self.perf_event_max_sample_rate().div_ceil(HZ)
     }
+    /// How often the host name, or with `domain` the domain name, changed.
+    fn uts_events(&self, domain: bool) -> u64 {
+        self.uts_events[usize::from(domain)].load(Ordering::SeqCst)
+    }
+    /// The host name, or with `domain` the domain name, of a UTS namespace
+    /// changed: who waits for its file hears of it (`uts_proc_notify`).
+    pub(crate) fn uts_changed(&self, domain: bool, hub: &ReadinessHub) {
+        self.uts_events[usize::from(domain)].fetch_add(1, Ordering::SeqCst);
+        hub.changed();
+    }
     /// Whether new leases may be taken (`leases_enable`).
     pub(crate) fn leases_enable(&self) -> i32 {
         self.leases_enable.load(Ordering::SeqCst)
+    }
+    /// The seconds an opener waits for a lease's break (`lease_break_time`).
+    pub(crate) fn lease_break_time(&self) -> i32 {
+        self.lease_break_time.load(Ordering::SeqCst)
     }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
@@ -507,7 +570,7 @@ impl Machine {
             Kernel::PerfEventMlockKb => self.perf_event_mlock_kb(),
             Kernel::PerfEventParanoid => self.perf_event_paranoid(),
             Kernel::LeasesEnable => self.leases_enable(),
-            Kernel::LeaseBreakTime => self.lease_break_time.load(Ordering::SeqCst),
+            Kernel::LeaseBreakTime => self.lease_break_time(),
             _ => self.unprivileged_bpf_disabled(),
         })
     }
@@ -1189,7 +1252,7 @@ pub(crate) fn open(
         // Root's, whose fields are the namespace's of who reads or writes
         // them; `test_perm` as for an aio file.
         Entry::Uts(file) => (
-            Value::Uts(Arc::downgrade(c.processes), file),
+            Value::Uts(UtsFile::opened(c, file)),
             if file.writable() {
                 Writers::Root
             } else {
@@ -1335,7 +1398,7 @@ enum Value {
     /// The machine's.
     Machine(Arc<Machine>, Kernel),
     /// The UTS namespace's of the thread whose call it is.
-    Uts(Weak<crate::processes::Processes>, Uts),
+    Uts(UtsFile),
     Net(NetFile),
     /// The machine's `vm.drop_caches`, which drops from its caches.
     DropCaches(Arc<Machine>, Arc<crate::page_cache::PageCaches>),
@@ -1473,7 +1536,7 @@ impl Value {
             Self::Net(net) => line(net_value(&net.network, net.file)),
             Self::DropCaches(machine, _) => line(machine.drop_caches()),
             // A string, read by [`Uts::read`].
-            Self::Uts(..) => Vec::new(),
+            Self::Uts(_) => Vec::new(),
         }
     }
     /// What follows a write that went through, one past the start too:
@@ -1518,7 +1581,7 @@ impl Value {
                 Ok(consumed)
             }
             // Taken whole by [`NetFile::take`] and [`Uts::write`].
-            Self::Net(_) | Self::Uts(..) => Err(Errno::EINVAL),
+            Self::Net(_) | Self::Uts(_) => Err(Errno::EINVAL),
             Self::Aio(limits, _) => {
                 let (negative, value, consumed) = scan(buf)?;
                 if negative {
@@ -1573,6 +1636,33 @@ impl Value {
             }
         }
     }
+}
+
+/// `EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM`.
+const DEFAULT_POLLMASK: u32 = 0x145;
+/// `EPOLLIN | EPOLLRDNORM | EPOLLERR | EPOLLPRI`, what a poll gives of a
+/// changed name.
+const CHANGED_POLLMASK: u32 = 0x4b;
+
+/// A poll looked at `file` and found its generation at `generation`
+/// ([`FileHandle::readiness`]): if it is a file of `/proc/sys` whose name
+/// changed, the poll told of that, and the next one does not again.
+pub(crate) fn polled(file: &dyn FileHandle, generation: u64) {
+    if let Some(setting) = file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<SettingFile>())
+        && let Value::Uts(uts) = &setting.value
+    {
+        uts.seen.store(generation - 1, Ordering::SeqCst);
+    }
+}
+
+/// Whether `file` is a file of `/proc/sys` whose poll adds no waiter: its
+/// table entry has no `poll`.
+pub(crate) fn never_wakes(file: &dyn FileHandle) -> bool {
+    file.as_any()
+        .and_then(|any| any.downcast_ref::<SettingFile>())
+        .is_some_and(|setting| !matches!(&setting.value, Value::Uts(uts) if uts.file.writable()))
 }
 
 /// Whether `file` is an open file of `/proc/sys`, whose size of 0 does not
@@ -1632,14 +1722,14 @@ impl SettingFile {
     }
     fn take(&self, buf: &[u8], admin: bool, net_admin: bool) -> Result<usize, Errno> {
         let mut position = self.position();
+        if let Value::Uts(uts) = &self.value {
+            return uts.write(buf, &mut position);
+        }
         if buf.is_empty() {
             return Ok(0);
         }
         if let Value::Net(net) = &self.value {
             return net.take(buf, &mut position, net_admin);
-        }
-        if let Value::Uts(processes, file) = &self.value {
-            return Ok(file.write(&*current_uts(processes)?, buf, &mut position));
         }
         // `sysctl_writes_strict`: a write past the start is taken whole and
         // changes nothing.
@@ -1654,6 +1744,21 @@ impl SettingFile {
 }
 
 impl FileHandle for SettingFile {
+    /// `proc_sys_poll`: always ready (`DEFAULT_POLLMASK`), but for a host or
+    /// domain name that changed since this file was open or a poll last
+    /// told of it ([`polled`]). The changes are the wake-ups' generation.
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        let Value::Uts(uts) = &self.value else {
+            return Ok((DEFAULT_POLLMASK, 1, 1));
+        };
+        let changes = uts.changes();
+        let mask = if changes == uts.seen.load(Ordering::SeqCst) {
+            DEFAULT_POLLMASK
+        } else {
+            CHANGED_POLLMASK
+        };
+        Ok((mask, changes + 1, changes + 1))
+    }
     /// The value and a newline, as much as fits, from the start; nothing
     /// from anywhere else (`__do_proc_dointvec`). A string is read from
     /// where the file is ([`Uts::read`]).
@@ -1662,10 +1767,8 @@ impl FileHandle for SettingFile {
             return Err(Errno::EBADF);
         }
         let mut position = self.position();
-        if let Value::Uts(processes, file) = &self.value
-            && !buf.is_empty()
-        {
-            return Ok(file.read(&*current_uts(processes)?, buf, &mut position));
+        if let Value::Uts(uts) = &self.value {
+            return uts.read(buf, &mut position);
         }
         if *position != 0 || buf.is_empty() {
             return Ok(0);

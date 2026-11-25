@@ -487,6 +487,7 @@ mod tests {
             identity: (0x803, 42),
             heap: false,
             flags,
+            anon_name: None,
         }
     }
 

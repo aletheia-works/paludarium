@@ -128,6 +128,23 @@ pub(crate) const OUT: u32 = 4;
 pub(crate) const NONBLOCK: u32 = 0x800;
 pub(crate) const CLOEXEC: u32 = 0x80000;
 
+/// One poll of `file`, as Linux's `vfs_poll`: its readiness, and what a poll
+/// of it changes. An epoll polls the files it watches
+/// ([`crate::epoll::EpollInstance::poll`]), and a file of `/proc/sys` whose
+/// name changed tells of it once ([`crate::sysctl::polled`]). Looking alone,
+/// [`FileHandle::readiness`] changes nothing.
+pub(crate) fn poll_file(file: &dyn FileHandle) -> Result<(u32, u64, u64), Errno> {
+    if let Some(epoll) = file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::epoll::EpollInstance>())
+    {
+        return Ok(epoll.poll());
+    }
+    let ready = file.readiness()?;
+    crate::sysctl::polled(file, ready.1);
+    Ok(ready)
+}
+
 #[derive(Default)]
 pub(crate) struct ReadinessHub {
     pub token: WaitToken,

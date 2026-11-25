@@ -1995,6 +1995,26 @@ impl Processes {
             .unwrap_or_else(PoisonError::into_inner)
             .set(file, owner);
     }
+    /// The owner of the open description at address `file`, if it has one.
+    pub(crate) fn file_owner_at(&self, file: usize) -> FileOwner {
+        self.file_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .at(file)
+            .map_or_else(FileOwner::default, |owner| *owner)
+    }
+    /// Makes `owner` the owner of the open description at address `file`,
+    /// if it has had one.
+    pub(crate) fn set_file_owner_at(&self, file: usize, owner: FileOwner) {
+        if let Some(kept) = self
+            .file_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .at(file)
+        {
+            *kept = owner;
+        }
+    }
     /// Whether `pidfd_send_signal` from `caller` may signal process `pid`.
     fn may_signal(&self, caller: u32, sender: TaskIds, pid: u32, number: i32) -> Result<(), Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2586,11 +2606,20 @@ impl Kernel {
     /// `prctl(option, ...)`: PR_SET/GET_NAME, PR_SET/GET_SECCOMP and the
     /// capability module's options ([`crate::credentials::Credentials::prctl`])
     /// per thread, Yama's PR_SET_PTRACER, PR_SET/GET_PDEATHSIG,
-    /// PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER and
-    /// PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux
+    /// PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER,
+    /// PR_SET/GET_NO_NEW_PRIVS and PR_SET_VMA ([`set_anon_vma_name`]); any
+    /// other option is EINVAL, as Linux
     /// gives for options it does not know.
     fn prctl(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         match a[0] {
+            // PR_SET_VMA: only PR_SET_VMA_ANON_NAME (0), as Linux's
+            // `prctl_set_vma` takes, which names `[a[2], a[2] + a[3])`.
+            0x5356_4d41 => {
+                if a[1] != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                return set_anon_vma_name(mem, a[2], a[3], a[4]).map(|()| 0);
+            }
             // Yama's PR_SET_PTRACER (`yama_task_prctl`), which reads no
             // other argument: 0 clears it, PR_SET_PTRACER_ANY (-1 as an
             // int too) lets any process attach, and anything else is the
@@ -5265,6 +5294,40 @@ pub(crate) fn clone3_args(
         [flags | exit_signal, top, parent_tid, child_tid, tls, 0],
         set_tid,
     ))
+}
+/// `set_anon_vma_name(addr, size, name)`, as Linux's `mm/madvise.c` gives
+/// it: the name, unless `name` is 0, which clears it, is read as
+/// `strndup_user` reads it, 80 bytes at most with its NUL (`EINVAL` past
+/// them, `EFAULT` where it cannot be read), and may hold only printable
+/// ASCII but `` \`$[] `` (`EINVAL`); then `madvise_set_anon_name` takes a
+/// page-aligned start (`EINVAL`) and a size rounded up to pages (`EINVAL`
+/// where that wraps), and names each VMA of the range
+/// ([`paludarium_mmu::AddressSpace::set_anon_name`]).
+fn set_anon_vma_name(mem: &AddressSpace, addr: u64, size: u64, name: u64) -> Result<(), Errno> {
+    let name = if name == 0 {
+        None
+    } else {
+        let bytes = read_string(mem, name, 80, Errno::EINVAL)?;
+        if bytes
+            .iter()
+            .any(|&b| !(0x20..0x7f).contains(&b) || b"\\`$[]".contains(&b))
+        {
+            return Err(Errno::EINVAL);
+        }
+        Some(bytes)
+    };
+    if !addr.is_multiple_of(4096) {
+        return Err(Errno::EINVAL);
+    }
+    let len = size.wrapping_add(4095) & !4095;
+    if size != 0 && len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    if end == addr {
+        return Ok(());
+    }
+    mem.set_anon_name(GuestAddr(addr), end, name.as_deref())
 }
 fn read_string(
     mem: &AddressSpace,

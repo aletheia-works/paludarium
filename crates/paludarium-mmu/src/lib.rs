@@ -159,6 +159,75 @@ pub struct Mapping {
     /// VMA (`VMA_STICKY_FLAGS`), and `pagemap` shows each of its pages
     /// soft-dirty ([`AddressSpaceData::spread_soft_dirty`]).
     pub soft_dirty: bool,
+    /// The name `prctl(PR_SET_VMA_ANON_NAME)` gave its anonymous memory
+    /// (Linux's `anon_vma_name`), which `/proc/<pid>/maps` shows as
+    /// `[anon:<name>]` and which splits, `fork` and `mremap` keep.
+    pub anon_name: Option<AnonName>,
+}
+
+/// A name `prctl(PR_SET_VMA_ANON_NAME)` gave anonymous memory
+/// ([`Mapping::anon_name`]): its slot in its address space's names
+/// ([`AnonNames`]), so that a mapping stays `Copy` and two mappings of one
+/// name compare equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AnonName(u32);
+
+/// The names an address space's mappings were given ([`AnonName`]), each
+/// once: copied to a `fork`ed child, and gone with the space. A name no
+/// mapping holds any more is let go as the table grows, its slot taken
+/// again.
+#[derive(Clone, Debug, Default)]
+struct AnonNames {
+    by_id: Vec<Option<Arc<[u8]>>>,
+    ids: std::collections::HashMap<Arc<[u8]>, u32>,
+}
+
+impl AnonNames {
+    /// The id `name` has, if it has one.
+    fn known(&self, name: &[u8]) -> Option<AnonName> {
+        self.ids.get(name).map(|&id| AnonName(id))
+    }
+    /// The id of `name`, given its own slot if it has none, after the
+    /// names none of `live()` holds are let go once the table has grown to
+    /// a power of two of 64 or more. `live` runs only then.
+    fn intern(
+        &mut self,
+        name: &[u8],
+        live: impl FnOnce() -> std::collections::HashSet<AnonName>,
+    ) -> AnonName {
+        if let Some(id) = self.known(name) {
+            return id;
+        }
+        if self.by_id.len() >= 64 && self.by_id.len().is_power_of_two() {
+            let live = live();
+            for (id, slot) in self.by_id.iter_mut().enumerate() {
+                let id = AnonName(u32::try_from(id).unwrap_or(u32::MAX));
+                if !live.contains(&id)
+                    && let Some(gone) = slot.take()
+                {
+                    self.ids.remove(&gone);
+                }
+            }
+        }
+        let name: Arc<[u8]> = Arc::from(name);
+        let id = match self.by_id.iter().position(Option::is_none) {
+            Some(free) => {
+                self.by_id[free] = Some(Arc::clone(&name));
+                free
+            }
+            None => {
+                self.by_id.push(Some(Arc::clone(&name)));
+                self.by_id.len() - 1
+            }
+        };
+        let id = u32::try_from(id).unwrap_or(u32::MAX);
+        self.ids.insert(name, id);
+        AnonName(id)
+    }
+    /// The bytes of the name `id` is, if it is one of the names here.
+    fn bytes(&self, id: AnonName) -> Option<Arc<[u8]>> {
+        self.by_id.get(id.0 as usize).cloned().flatten()
+    }
 }
 
 /// The `userfaultfd` a mapping reports its faults to, and why
@@ -776,6 +845,9 @@ pub struct Vma {
     pub heap: bool,
     /// Linux's `vm_flags` of it ([`vm`]).
     pub flags: u64,
+    /// The name `prctl(PR_SET_VMA_ANON_NAME)` gave it
+    /// ([`Mapping::anon_name`]).
+    pub anon_name: Option<Arc<[u8]>>,
 }
 
 /// What a VMA's pages hold, as Linux's `smaps_account` counts them, in
@@ -2817,6 +2889,8 @@ struct AddressSpaceData {
     /// How a new mapping is locked: `mlockall` with `MCL_FUTURE` (Linux's
     /// `def_flags`), which neither `fork` nor `exec` keeps.
     future_lock: Option<Lock>,
+    /// The names its mappings were given ([`AnonNames`]).
+    anon_names: AnonNames,
     /// What the frames are charged to; shared with the spaces forked from
     /// this one and the ones its exec starts.
     meter: Option<Arc<MemoryMeter>>,
@@ -2926,6 +3000,7 @@ impl AddressSpaceData {
             poisons: PageRanges::default(),
             uffd_markers: PageRanges::default(),
             future_lock: None,
+            anon_names: AnonNames::default(),
             code: Arc::default(),
             mappings: BTreeMap::new(),
             initial_break: GuestAddr(0),
@@ -3929,6 +4004,7 @@ impl AddressSpaceData {
         let mut copy = Self::new();
         copy.meter = self.meter.clone();
         copy.mappings = self.mappings.clone();
+        copy.anon_names = self.anon_names.clone();
         copy.shared = self.shared.clone();
         copy.backing = self.backing.clone();
         // Linux's `VM_COPY_ON_FORK` has `VM_MAYBE_GUARD`: the child gets the
@@ -4852,6 +4928,7 @@ impl AddressSpaceData {
             identity: (0, self.shared_at(start).map_or(0, |shared| shared.pages.id)),
             heap: start < self.current_break.0 && end > self.initial_break.0,
             flags: self.vma_flags(start, end),
+            anon_name: mapping.anon_name.and_then(|id| self.anon_names.bytes(id)),
         };
         Some((vma, source))
     }
@@ -5237,6 +5314,7 @@ impl AddressSpaceData {
                 userfault: None,
                 no_exec: false,
                 soft_dirty: kind != MappingKind::Stack,
+                anon_name: None,
             },
         );
         Ok(GuestAddr(start))
@@ -5457,6 +5535,7 @@ impl AddressSpaceData {
             && a.grows_down == b.grows_down
             && a.userfault == b.userfault
             && a.no_exec == b.no_exec
+            && a.anon_name == b.anon_name
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -5975,6 +6054,67 @@ impl AddressSpaceData {
             }
             self.split_unmergeable_shared_where_changed(from);
             self.split_unmergeable_shared_where_changed(to);
+        }
+        if hole || covered < end {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)` of `[addr, end)`, as
+    /// Linux's `madvise_set_anon_name` walks its VMAs in turn: each takes
+    /// `name` (none clears it), split where the range starts and ends
+    /// within it, which keeps every other state of it (its lock, its
+    /// `userfaultfd`); one with a file but shared anonymous memory ends it
+    /// with `EBADF` (`vma_is_anon_shmem`), after those before it; a hole in
+    /// the range is `ENOMEM` once the rest has it.
+    pub fn set_anon_name(&mut self, addr: u64, end: u64, name: Option<&[u8]>) -> Result<(), Errno> {
+        // The name's id, taken only once a mapping is to hold it: a call
+        // that names nothing (EBADF, ENOMEM first) leaves no new name.
+        let mut id = name.and_then(|name| self.anon_names.known(name));
+        let starts: Vec<u64> = self
+            .mappings
+            .range(..end)
+            .filter(|(_, m)| m.end() > addr)
+            .map(|(&start, _)| start)
+            .collect();
+        let mut covered = addr;
+        let mut hole = false;
+        for start in starts {
+            let Some(&m) = self.mappings.get(&start) else {
+                continue;
+            };
+            hole |= m.start.0 > covered;
+            covered = covered.max(m.end());
+            // Only anonymous memory is named: a loaded program's segments
+            // and a file's mappings have a file (`vm_file`), and so has shared
+            // memory of a file, where shared anonymous memory's is shmem's.
+            let file = matches!(m.kind, MappingKind::File | MappingKind::ElfSegment)
+                || self.backing_at(start).is_some()
+                || self
+                    .shared_at(start)
+                    .is_some_and(|shared| shared.pages.source.is_some());
+            if file {
+                return Err(Errno::EBADF);
+            }
+            if m.anon_name == id && (name.is_none() || id.is_some()) {
+                continue;
+            }
+            if let Some(name) = name
+                && id.is_none()
+            {
+                let mappings = &self.mappings;
+                id = Some(self.anon_names.intern(name, || {
+                    mappings.values().filter_map(|m| m.anon_name).collect()
+                }));
+            }
+            let (from, to) = (start.max(addr), m.end().min(end));
+            self.split_at(from);
+            self.split_at(to);
+            for (_, m) in self.mappings.range_mut(from..to) {
+                m.anon_name = id;
+            }
         }
         if hole || covered < end {
             Err(Errno::ENOMEM)
@@ -9096,6 +9236,15 @@ impl AddressSpace {
             data.userfault_fault_in(addr);
         }
         found
+    }
+    /// See [`AddressSpaceData::set_anon_name`].
+    pub fn set_anon_name(
+        &self,
+        addr: GuestAddr,
+        end: u64,
+        name: Option<&[u8]>,
+    ) -> Result<(), Errno> {
+        self.locked().set_anon_name(addr.0, end, name)
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {

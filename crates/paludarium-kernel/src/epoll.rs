@@ -1,6 +1,6 @@
 //! Kernel epoll interests use (descriptor number, open-description identity).
 //! Weak description references do not prolong a guest's last open descriptor.
-use crate::events::{IN, OUT, ReadinessHub};
+use crate::events::{IN, OUT, ReadinessHub, poll_file};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
@@ -29,12 +29,23 @@ struct Interest {
     seen: (u64, u64),
 }
 impl Interest {
+    /// What it would report as its file is, without polling that.
     fn ready(&self) -> Option<(u32, u64, u64)> {
+        self.reported(self.file.upgrade()?.readiness().ok()?)
+    }
+    /// Its file, polled, is at `generations`: a changed `/proc/sys` name
+    /// wakes it anew, so what it reported before is no longer held against
+    /// an edge.
+    fn hear(&mut self, file: &dyn FileHandle, generations: (u64, u64)) {
+        if generations != self.seen && file.as_any().is_some_and(crate::sysctl::is_file) {
+            self.previous = 0;
+        }
+    }
+    /// What it reports of its file's `ready` state.
+    fn reported(&self, (mask, input, output): (u32, u64, u64)) -> Option<(u32, u64, u64)> {
         if !self.enabled {
             return None;
         }
-        let file = self.file.upgrade()?;
-        let (mask, input, output) = file.readiness().ok()?;
         let mask = mask & (self.events | 0x18) & !(ET | ONESHOT);
         let edges = (mask & IN != 0 && input != self.input_epoch)
             || (mask & OUT != 0 && output != self.output_epoch)
@@ -164,7 +175,7 @@ impl EpollInstance {
             _ => {
                 // Linux's `ep_insert` and `ep_modify` poll the file once,
                 // and list it if it is ready.
-                let (mask, input, output) = file.readiness()?;
+                let (mask, input, output) = poll_file(&*file)?;
                 if events & OUT != 0 && mask & OUT == 0 {
                     crate::sockets::polled_full(&file);
                 }
@@ -188,6 +199,27 @@ impl EpollInstance {
         self.hub.changed();
         Ok(())
     }
+    /// A poll of the epoll itself, which polls the files it watches until
+    /// one is ready, as Linux's `__ep_eventpoll_poll` does: what it gives is
+    /// what [`FileHandle::readiness`] gives.
+    pub(crate) fn poll(&self) -> (u32, u64, u64) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let ready = state.interests.values_mut().filter(|i| i.enabled).any(|i| {
+            let Some(file) = i.file.upgrade() else {
+                return false;
+            };
+            let Ok(ready) = poll_file(&*file) else {
+                return false;
+            };
+            i.hear(&*file, (ready.1, ready.2));
+            i.reported(ready).is_some()
+        });
+        (
+            u32::from(ready) * IN,
+            u64::from(self.hub.token.value()) + 1,
+            0,
+        )
+    }
     pub fn collect(&self, max: usize) -> Vec<(u32, u64)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.interests.retain(|_, i| i.file.strong_count() != 0);
@@ -209,10 +241,17 @@ impl EpollInstance {
             // the list, or once it woke the interest for what it waits for
             // (`ep_poll_callback`'s key).
             let mut unlisted = false;
+            let mut polled = None;
             if let Some(file) = i.file.upgrade()
-                && let Ok((mask, input, output)) = file.readiness()
+                && let Ok((mask, input, output)) = if i.enabled {
+                    poll_file(&*file)
+                } else {
+                    file.readiness()
+                }
             {
+                polled = Some((mask, input, output));
                 let woken = (input, output) != i.seen;
+                i.hear(&*file, (input, output));
                 let keyed_woken = crate::syscalls::woke(i.events, i.seen, (input, output));
                 unlisted = file.keyed_wakeups() && !i.listed && !keyed_woken;
                 i.seen = (input, output);
@@ -224,7 +263,7 @@ impl EpollInstance {
             if unlisted {
                 continue;
             }
-            if let Some((mask, input, output)) = i.ready() {
+            if let Some((mask, input, output)) = polled.and_then(|ready| i.reported(ready)) {
                 // A level-triggered report goes back on the list.
                 i.listed = i.events & (ET | ONESHOT) == 0;
                 out.push((mask, i.data));

@@ -2603,8 +2603,6 @@ fn submit(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wanted: 
     total - left
 }
 
-/// The ring behind descriptor `fd`: `EBADF` without one (or for `O_PATH`),
-/// `EOPNOTSUPP` for another file.
 /// The ring `fd` names, as `io_uring_register_get_file` finds it: with
 /// `registered`, the thread's registered ring of that index, which a thread
 /// without an io_uring context or an index past the table is `EINVAL`, and
@@ -2723,6 +2721,8 @@ fn unregister_all_rings(inbox: &crate::SignalInbox) {
     drop(rings);
 }
 
+/// The ring behind descriptor `fd`: `EBADF` without one (or for `O_PATH`),
+/// `EOPNOTSUPP` for another file.
 fn ring_of(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
     let d = c.files.descriptor(fd)?;
     if d.file.flags() & 0o10000000 != 0 {

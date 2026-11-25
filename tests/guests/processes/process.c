@@ -10645,6 +10645,12 @@ static void up_file(int fd, const char *label) {
     printf("%s: %ld %.*s\n", label, n, n > 0 ? (int)n : 0, got);
 }
 
+/* A write to a file may run in a worker, so it waits for its completion. */
+static void up_submit(struct uring *u, const char *label) {
+    uring_show(label, uring_enter(u->fd, 1, 1, 1, NULL, 0));
+    uring_reap(u, label);
+}
+
 static int io_uring_pinned_case(void) {
     struct uring u;
     if (uring_open(&u, 8)) return 80;
@@ -10662,14 +10668,14 @@ static int io_uring_pinned_case(void) {
     char *again = mmap(p, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (again != p) return 83;
     up_fixed(&u, 1, 5, fd, 0, p, 4);
-    tw_submit(&u, 1, 1, "write-unmapped");
+    up_submit(&u, "write-unmapped");
     up_file(fd, "file");
     if (pwrite(fd, "new?", 4, 0) != 4) return 84;
     up_fixed(&u, 2, 4, fd, 0, p, 4);
-    tw_submit(&u, 1, 1, "read-unmapped");
+    up_submit(&u, "read-unmapped");
     printf("mapping: %d\n", p[0]);
     up_fixed(&u, 3, 5, fd, 4, p, 4);
-    tw_submit(&u, 1, 1, "write-back");
+    up_submit(&u, "write-back");
     up_file(fd, "file");
     uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
 
@@ -10678,7 +10684,7 @@ static int io_uring_pinned_case(void) {
     uring_show("register", syscall(427, u.fd, 0, &iov, 1));
     mprotect(p, 4096, PROT_READ);
     up_fixed(&u, 4, 4, fd, 0, p, 4);
-    tw_submit(&u, 1, 1, "read-read-only");
+    up_submit(&u, "read-read-only");
     printf("mapping: %.4s\n", p);
     uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
     munmap(p, 4096);
@@ -10706,7 +10712,7 @@ static int io_uring_pinned_case(void) {
     iov = (struct iovec){shm, 4096};
     uring_show("register-memfd", syscall(427, u.fd, 0, &iov, 1));
     up_fixed(&u, 5, 4, fd, 4, shm, 4);
-    tw_submit(&u, 1, 1, "read-memfd");
+    up_submit(&u, "read-memfd");
     char seen[4];
     printf("memfd: %ld %.4s\n", (long)pread(mfd, seen, 4, 0), seen);
     uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
@@ -10732,7 +10738,7 @@ static int io_uring_pinned_case(void) {
         if (read(go[0], &byte, 1) != 1) _exit(1);
         printf("child-page: %.4s\n", p);
         up_fixed(&u, 6, 5, fd, 8, p, 4);
-        tw_submit(&u, 1, 1, "child-write");
+        up_submit(&u, "child-write");
         fflush(stdout);
         _exit(0);
     }

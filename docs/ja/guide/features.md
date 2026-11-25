@@ -3746,7 +3746,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - セグメントやキューの PID は、`IPC_STAT` が返すものも、そのプロセスがなくなっても見えます。
     オブジェクトがその `struct pid` を持ち続けるためです。
 
-- これらのシステムのファイル（`loadavg`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
+- これらのシステムのファイル（`loadavg`、`locks`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
   サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。
   プロセスやスレッドのディレクトリのファイルも、Linux の `proc_pid_make_inode` が残すとおり、
   読み込みが何を返しても（`stat` でも `fstat` でも）サイズは 0 です。

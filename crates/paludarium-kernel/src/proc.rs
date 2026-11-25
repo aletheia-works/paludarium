@@ -5,7 +5,8 @@
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, its `ns` directory of links
 //! to its namespaces, and its `maps`, which is generated as it is read, as
-//! `/proc/sysvipc`'s `msg`, `sem` and `shm` are ([`crate::seq`]).
+//! `/proc/locks` and `/proc/sysvipc`'s `msg`, `sem` and `shm` are
+//! ([`crate::seq`]).
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
 use paludarium_types::Errno;

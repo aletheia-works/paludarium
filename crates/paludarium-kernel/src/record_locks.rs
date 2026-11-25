@@ -639,14 +639,24 @@ struct ProcRecords {
     caches: Arc<crate::page_cache::PageCaches>,
     space: Arc<Namespace>,
 }
-impl crate::seq::Records for ProcRecords {
-    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
+impl ProcRecords {
+    fn now(&self) -> crate::seq::Held {
         let leases = crate::leases::all(&self.caches);
         let all = self.processes.locks().all(&leases, &self.space);
-        let shown = (0..)
-            .zip(all)
-            .find(|(at, (_, status))| *at >= index && status.pid != 0);
-        Ok(shown.map(|(at, (_, status))| (status.line(at + 1).into_bytes(), at + 1)))
+        let line = |(id, (_, status)): (u64, (Link, Status))| match status.pid {
+            0 => Vec::new(),
+            _ => status.line(id).into_bytes(),
+        };
+        crate::seq::Held((1..).zip(all).map(line).collect())
+    }
+}
+impl crate::seq::Records for ProcRecords {
+    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
+        self.now().record(index)
+    }
+    /// `locks_start`'s `file_rwsem` and `blocked_lock_lock`.
+    fn held(&self) -> Option<Box<dyn crate::seq::Records>> {
+        Some(Box::new(self.now()))
     }
 }
 

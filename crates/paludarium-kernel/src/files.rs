@@ -5515,15 +5515,18 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         73 => {
             let d = c.files.descriptor(a[0])?;
-            let key = crate::record_locks::key(c, &d).unwrap_or_default();
+            // A file that cannot be told by its inode is not listed.
+            let key = crate::record_locks::key(c, &d).ok();
             loop {
                 let result = d.file.flock(a[1] as u32);
-                c.processes.locks().flocked(
-                    (&d.file, key),
-                    (c.process.pid, crate::syscalls::cpu(c)),
-                    a[1] as u32,
-                    result,
-                );
+                if let Some(key) = key {
+                    c.processes.locks().flocked(
+                        (&d.file, key),
+                        (c.process.pid, crate::syscalls::cpu(c)),
+                        a[1] as u32,
+                        result,
+                    );
+                }
                 match result {
                     Ok(()) => return Ok(0),
                     Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => pause_for_lock(c)?,

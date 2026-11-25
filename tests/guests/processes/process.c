@@ -11898,7 +11898,17 @@ static int proc_locks_case(void) {
     if (stat(f, &plocks_files[0]) || stat(g, &plocks_files[1])) return 5;
     struct stat st;
     stat("/proc/locks", &st);
-    printf("mode=%o size=%ld\n", st.st_mode, (long)st.st_size);
+    int past_stat = stat("/proc/locks/", &(struct stat){0}) ? errno : 0;
+    int rest = open("/proc/locks", O_RDONLY);
+    int written = write(rest, "x", 1) < 0 ? errno : 0;
+    close(rest);
+    printf("mode=%o size=%ld owner=%d:%d links=%ld past=%d written=%d\n", st.st_mode, (long)st.st_size, st.st_uid == 0,
+           st.st_gid == 0, (long)st.st_nlink, past_stat, written);
+    int listed = 0;
+    DIR *names = opendir("/proc");
+    for (struct dirent *e; names && (e = readdir(names));) listed += !strcmp(e->d_name, "locks") && e->d_type == DT_REG;
+    if (names) closedir(names);
+    printf("in /proc=%d\n", listed);
     plocks_show("none", "/proc/locks");
     int posix = plocks_set(one, F_SETLK, F_WRLCK, 0, 10);
     int read_lock = plocks_set(one, F_SETLK, F_RDLCK, 20, 10);

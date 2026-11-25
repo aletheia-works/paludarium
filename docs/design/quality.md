@@ -315,7 +315,9 @@ instead. `ci-ok`, the required check, needs every job itself, so a job
 skipped because the quick stage failed cannot make it pass;
 `scripts/ci-changes.py --self-test` refuses a `ci.yml` where it does not.
 Dependency Review runs only on pull requests that change a Cargo or npm
-manifest or lockfile, a workflow or a local action.
+manifest or lockfile, a workflow or a local action. A merge queue's run
+(`merge_group`; no queue is set up) compiles only: the stable clippy, for
+Linux, macOS and Windows, and the production wasm. Every other job is skipped.
 
 Two kinds of job run only when the change can reach what they test, as
 macOS runners can be scarce. The unit test jobs (Linux, macOS and Windows)

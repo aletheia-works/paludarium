@@ -184,7 +184,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, inet-diag-device, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-multicast, veth-ipv6-accept, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, inet-diag-device, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv4-hash, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-multicast, veth-ipv6-accept, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -322,6 +322,7 @@ mod linux {
                     | "perf-sample"
                     | "perf-wakeup"
                     | "perf-side-band"
+                    | "perf-inherit-stat"
                     | "perf-side-band-comm"
                     | "perf-throttle"
                     | "perf-side-band-exec"
@@ -413,6 +414,7 @@ mod linux {
                     | "veth-ipv6"
                     | "veth-ipv4-gateway"
                     | "veth-ipv4-ecmp"
+                    | "veth-ipv4-hash"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-multicast"
@@ -657,6 +659,7 @@ mod linux {
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),
         veth_ipv4_gateway => ("veth-ipv4-gateway","veth-ipv4-gateway"),
         veth_ipv4_ecmp => ("veth-ipv4-ecmp","veth-ipv4-ecmp"),
+        veth_ipv4_hash => ("veth-ipv4-hash","veth-ipv4-hash"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_multicast => ("veth-multicast","veth-multicast"),
@@ -676,6 +679,7 @@ mod linux {
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
         processes_file_leases => ("file-leases","process"),
+        processes_proc_locks => ("proc-locks","process"),
         processes_smaps_flags => ("smaps-flags","process"),
         processes_mrelease_fatal => ("mrelease-fatal","process"),
         processes_madvise_guard => ("madvise-guard","process"),
@@ -746,6 +750,7 @@ mod linux {
         perf_sample => ("perf-sample","perf"),
         perf_wakeup => ("perf-wakeup","perf"),
         perf_side_band => ("perf-side-band","perf"),
+        perf_inherit_stat => ("perf-inherit-stat","perf"),
         perf_side_band_comm => ("perf-side-band-comm","perf"),
         perf_throttle => ("perf-throttle","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
@@ -1083,6 +1088,7 @@ mod linux {
         processes_tmpfs_huge => ("tmpfs-huge","process"),
         processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),
         processes_anon_thp_placement => ("anon-thp-placement","process"),
+        processes_mmap_32bit => ("mmap-32bit","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),
@@ -1110,6 +1116,7 @@ mod linux {
         processes_ptrace_stop_exit_code => ("ptrace-stop-exit-code","process"),
         processes_gone_leader_files => ("gone-leader-files","process"),
         processes_smaps_rollup => ("smaps-rollup","process"),
+        processes_vdso_mappings => ("vdso-mappings","process"),
         processes_thread_caps_status => ("thread-caps-status","process"),
         processes_zombie_ns_links => ("zombie-ns-links","process"),
         processes_userns_nondumpable_read => ("userns-nondumpable-read","process"),

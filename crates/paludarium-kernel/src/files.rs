@@ -5709,11 +5709,16 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         73 => {
             let d = c.files.descriptor(a[0])?;
+            // A file that cannot be told by its inode is not listed.
+            let key = crate::record_locks::key(c, &d).ok();
             loop {
                 let result = d.file.flock(a[1] as u32);
-                c.processes
-                    .locks()
-                    .flocked(&d.file, c.process.pid, a[1] as u32, result);
+                c.processes.locks().flocked(
+                    (&d.file, key),
+                    (c.process.pid, crate::syscalls::cpu(c)),
+                    a[1] as u32,
+                    result,
+                );
                 match result {
                     Ok(()) => return Ok(0),
                     Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => pause_for_lock(c)?,
@@ -9414,6 +9419,9 @@ fn system_file(
                 .clock(paludarium_host::ClockId::Monotonic)
                 .unwrap_or(0),
         ),
+        crate::proc::SystemEntry::Locks => {
+            return Arc::new(crate::record_locks::proc_file(c, flags));
+        }
         crate::proc::SystemEntry::SysvipcMsg => return Arc::new(crate::msg::proc_file(c, flags)),
         crate::proc::SystemEntry::SysvipcSem => return Arc::new(crate::sem::proc_file(c, flags)),
         crate::proc::SystemEntry::SysvipcShm => return Arc::new(crate::shm::proc_file(c, flags)),

@@ -42,8 +42,8 @@ verified.
   makes no access, and a real CPU may fault (an AMD EPYC does, and exits with
   `SIGSEGV`). A fault on a later byte also leaves the earlier ones written, which
   has not been compared with a real CPU.
-- **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
-  so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
+- **`/proc/self/maps`, in part**: the emulator has no `vsyscall` page, so the
+  `[vsyscall]` line is not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used.
   A rename that a process under `chroot` makes does not move the names
   of the files it moves in the maps, a core's `NT_FILE` note and
@@ -54,6 +54,20 @@ verified.
   identity, so it merges neighbours that Linux keeps apart, such as after
   `munlock` of a page `mlock` populated next to a piece written while it was
   part of another VMA.
+- **The vDSO, in part**: its functions make their system calls, as Linux's
+  vDSO does only when no clock can be read from user space, so a seccomp
+  filter, a ptrace tracer's syscall stops and syscall counts see a call
+  where Linux's fast path makes none. `[vvar]` holds zeros, where Linux's
+  holds the time, which nothing here reads. `__vdso_getrandom` and
+  `__vdso_sgx_enter_enclave` (and their weak aliases) are not there: the
+  first's contract, the opaque state a C library asks it for, is not a
+  system call's, and SGX is not emulated; a C library falls back to
+  `getrandom(2)`. `smaps` counts a touched page of `[vdso]` as the process's
+  own (`Private_Clean`), where Linux's is shared by every process
+  (`Shared_Clean`, `Pss` 0). `[vvar]` is the test machines' Linux 7.0's:
+  since 7.2 it is `VM_MIXEDMAP` instead of `VM_IO | VM_PFNMAP` (c27e727c9a60),
+  so `mlock` fills it and `get_user_pages` may reach it, and its pages 1 and 3
+  hold zeros (43648f9f3a67) instead of being a bus error.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
@@ -316,10 +330,11 @@ verified.
   another CPU only when a new CPU mask changes the lowest CPU it allows.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where
-  Linux takes each at its occurrence: they show the thread's address,
-  registers, stack and frames as of then, a fault's address is 0, and one
-  of the kernel (a fault in a system call, a switch or a migration) has the
-  address 0 and no kernel frames. `freq` follows the rate at those points,
+  Linux takes each at its occurrence: they show the thread's instruction,
+  registers, stack and frames as of then (a fault's own address is its
+  own, but 0 for one before the thread's last 4096), and one of the kernel
+  (a fault in a system call, a switch or a migration) has the instruction
+  0 and no kernel frames. `freq` follows the rate at those points,
   not at each tick. A `cpu-clock` or `task-clock` event is throttled at
   `perf_event_max_sample_rate` over `HZ` (1000) interrupts in a tick, as
   Linux's hrtimer events are, the ticks being those of its own count, and
@@ -340,23 +355,20 @@ verified.
   generation is 0; a build ID is read from a file whose page cache the
   emulator does not keep (a host's, or one of the in-memory file system from
   start-up) as if its pages were all cached, where Linux gives none for a
-  page it has not read or has evicted; `mprotect` writes
-  one record of each VMA as it ends up, where Linux writes one each time it
-  changes one, of the VMA as merged so far; a thread the host cannot
+  page it has not read or has evicted; a thread the host cannot
   start gets `FORK` and `EXIT` records, the latter on CPU 0, where Linux's
   failed `clone` writes neither; and `NAMESPACES`, `CGROUP`,
   `KSYMBOL`, `BPF_EVENT`, `TEXT_POKE`, `SWITCH` and `AUX` records are not
-  written. With no vDSO, no record of one is written either. The overflows
+  written. The overflows
   of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
-  each time the thread returns to its code, and its `si_addr` is 0, where
-  Linux gives a fault's address. When `REFRESH`'s last overflow disables
-  the event, the occurrences after it up to that point are still counted,
-  where Linux stops the count at it. Its user page shows the count and times as of the
+  each time the thread returns to its code; its `si_addr` is the first
+  fault's. When `REFRESH`'s last overflow disables the event, its count
+  stops there, but its times (a clock's apart) and its group's other
+  events go on up to that point. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
-  mapping's are the error here. `inherit_stat` is taken, but an inherited
-  event's end sends no read record, as nothing is recorded. The cgroup mode
+  mapping's are the error here. The cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
   `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
@@ -655,7 +667,8 @@ verified.
     (Linux's `ITIMER_VIRTUAL` leaves out the system time; its `RLIMIT_CPU`
     counts it). Where the host
     cannot measure a thread's CPU time, as in WebAssembly, that is wall time,
-    so they also count the time a thread sleeps or waits, from its wake on. They are looked
+    so they also count the time a thread sleeps or waits, all of it once it
+    wakes. They are looked
     at as a thread makes a system call and every 100,000 instructions it
     runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. POSIX timers on the CPU-time clocks count
@@ -1044,6 +1057,11 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
+- **`/proc/locks`, in part**: the lines of those that wait for a lock
+  (`-> `) are not there. PIDs are those of the reader's PID namespace, where
+  Linux's are those of the one `/proc` was mounted in. A `flock` lock a
+  program on the host holds on a file of the host is not listed, though it
+  conflicts with the guest's.
 - **File leases, in part**: the opens `execve` makes of a program, its
   interpreter and its script, and those of the descriptors fanotify's events
   give, break no lease, where Linux's do. A lease is broken before
@@ -1085,7 +1103,10 @@ verified.
   `rt6_check_neigh` does among routes of one metric. Of an IPv6 multipath
   route's hops through the device asked for, the flow's hash picks one, as
   Linux 7.0 does; Linux master takes the hop the lookup found
-  (`have_oif_match` in `ip6_pol_route`). A UDP
+  (`have_oif_match` in `ip6_pol_route`). An IPv6 packet's
+  answer comes back only through the end the packet went out through, so
+  that one a multipath route sends back through another end is lost,
+  where Linux's comes. A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
@@ -1178,9 +1199,7 @@ verified.
   Linux is built. A veth end whose MTU is below 1280 still has the files
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
-  A route goes through `lo` or a veth end, or rejects; of an IPv4
-  multipath route's next hops, a lookup takes the first not dead, where
-  Linux picks one by a hash of the flow (`fib_select_multipath`). An IPv4
+  A route goes through `lo` or a veth end, or rejects; an IPv4
   next hop through an IPv6 gateway (`RTA_VIA`), encapsulations, nexthop
   objects, realms, expiries, source prefixes, router preferences and the
   anycast, multicast and NAT kinds (and broadcast for IPv6) are

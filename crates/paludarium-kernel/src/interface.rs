@@ -3732,6 +3732,80 @@ impl Addresses {
     pub(crate) fn lookup4_flow(&self, ip: Ipv4Addr, tos: u8, oif: u32) -> Result<Route4, Errno> {
         self.lookup4_in(ip, SCOPE_UNIVERSE, oif, tos)
     }
+    /// The route a packet of `tos` to `ip` from `src` (none for a source not
+    /// chosen yet) leaves by, through `oif` where one is named, as
+    /// `ip_route_output_key_hash_rcu` finds it: [`Self::lookup4_flow`]'s,
+    /// of a multipath one the hop [`Self::path4`] takes, but where `oif`
+    /// is named, which chooses the hop itself (`fib_select_path`). The
+    /// devices come in `order`, as [`Self::select4`] takes them.
+    pub(crate) fn output4(
+        &self,
+        ip: Ipv4Addr,
+        tos: u8,
+        oif: u32,
+        src: Option<Ipv4Addr>,
+        order: &[i32],
+    ) -> Result<Route4, Errno> {
+        let route = self.lookup4_flow(ip, tos, oif)?;
+        if oif != 0 || route.kind == Kind::Local {
+            return Ok(route);
+        }
+        let src = src.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        Ok(self.path4(route, ip, src, Some(order)))
+    }
+    /// The route `matched` of a packet from `src` to `ip`, of a multipath
+    /// one the next hop `fib_select_multipath` takes by the hash of the two
+    /// (`fib_multipath_hash`, of `fib_multipath_hash_policy` 0): each hop
+    /// takes the share of the hashes its weight gives it, in their order, a
+    /// dead one none (`fib_rebalance`). One whose device's own source
+    /// ([`Self::select4`], `nh_saddr`) is `src` comes before the others,
+    /// then the first that takes the hash; with no `src`, and for a
+    /// forwarded packet (no `order`), only the hash counts.
+    pub(crate) fn path4(
+        &self,
+        matched: Route4,
+        ip: Ipv4Addr,
+        src: Ipv4Addr,
+        order: Option<&[i32]>,
+    ) -> Route4 {
+        let total: u64 = matched
+            .hops
+            .iter()
+            .filter(|h| !h.dead)
+            .map(|h| u64::from(h.weight))
+            .sum();
+        if total == 0 {
+            return matched;
+        }
+        // Shifted down a bit, as `fib_multipath_hash` gives it.
+        let hash =
+            (core::hash::BuildHasher::hash_one(&self.multipath_seed, (src, ip)) & 0xffff_ffff) >> 1;
+        let order = order.filter(|_| !src.is_unspecified());
+        let mut weight = 0u64;
+        let mut best: Option<(u8, Hop4)> = None;
+        for &hop in matched.hops.iter().filter(|h| !h.dead) {
+            weight += u64::from(hop.weight);
+            // `fib_rebalance`: `DIV_ROUND_CLOSEST_ULL(weight << 31, total)
+            // - 1`, the last hash the hop takes.
+            let takes = hash < ((weight << 31) + total / 2) / total;
+            let own = order.is_some_and(|order| {
+                i32::try_from(hop.oif).is_ok_and(|index| {
+                    self.select4(index, hop.gateway, matched.scope, order) == Some(src)
+                })
+            });
+            let score = 2 * u8::from(own) + u8::from(takes);
+            if best.is_none_or(|(held, _)| held < score) {
+                best = Some((score, hop));
+                if score == 3 || order.is_none() && score == 1 {
+                    break;
+                }
+            }
+        }
+        match best {
+            Some((_, hop)) => matched.through(hop),
+            None => matched,
+        }
+    }
     /// Whether a packet in on `lo` from `src` may come, as
     /// `fib_validate_source` checks it with reverse path filtering off, as
     /// a namespace has it: from none of the namespace's addresses; or,
@@ -3756,8 +3830,9 @@ impl Addresses {
     /// - Else as `__fib_validate_source`, looking `src` up. None found is
     ///   dropped with `rpf`, and taken without; a local one is dropped
     ///   (`accept_local` is 0), as is one of another kind than unicast. A
-    ///   unicast one through `dev` is taken, `true` but for one through a
-    ///   gateway, whose next hop is of link scope. One through another
+    ///   unicast one through `dev`, by any of a multipath one's next hops
+    ///   (`fib_info_nh_uses_dev`), is taken, `true` but for one whose first
+    ///   next hop not dead is a gateway, of link scope. One through another
     ///   device is taken without `rpf`, or loosely (2), when `dev` has no
     ///   address, else dropped strictly (1); loosely, a lookup through
     ///   `dev` decides, as the first one did, and gives `false` where it
@@ -3782,7 +3857,9 @@ impl Addresses {
         match self.lookup4_flow(src, tos, 0) {
             Err(_) => last_resort,
             Ok(route) if route.kind != Kind::Unicast => Err(()),
-            Ok(route) if route.oif == dev_oif => Ok(route.gateway.is_none()),
+            Ok(route) if route.oif == dev_oif || route.hops.iter().any(|h| h.oif == dev_oif) => {
+                Ok(route.gateway.is_none())
+            }
             Ok(_) if !self.v4.iter().any(|a| a.index == dev) => last_resort,
             Ok(_) if rpf == 1 => Err(()),
             Ok(_) => Ok(self
@@ -4173,7 +4250,7 @@ impl Addresses {
     /// `ipv6_dev_get_saddr` none at all), else `127.0.0.1` or `::1`.
     pub(crate) fn source(&self, to: IpAddr, order: &[i32]) -> IpAddr {
         match to {
-            IpAddr::V4(ip) => IpAddr::V4(match self.lookup4(ip) {
+            IpAddr::V4(ip) => IpAddr::V4(match self.output4(ip, 0, 0, None, order) {
                 Ok(r) => self
                     .source4(&r, ip, order)
                     .unwrap_or(if r.oif == LOOPBACK_OIF {
@@ -5013,6 +5090,104 @@ mod tests {
         assert_eq!(a.del_route4(&backwards).map(|_| ()), Err(ESRCH));
         let forwards = select(vec![hop("10.0.0.2", 1000, 1), hop("10.1.0.2", 0, 1)]);
         assert!(a.del_route4(&forwards).is_ok());
+    }
+    #[test]
+    fn ipv4_multipath_flows_take_hops_by_hash_weight_and_source() {
+        let mut a = Addresses::isolated();
+        for (ip, index) in [("10.0.0.1", 1000), ("10.1.0.1", 1001)] {
+            let end = V4 {
+                index,
+                ..v4(ip, 24)
+            };
+            a.add_v4(end, Lifetimes::FOREVER, false, true, 0).unwrap();
+        }
+        let hop = |via: &str, oif, weight| NextHop4 {
+            flags: 0,
+            weight,
+            oif,
+            device: true,
+            gateway: Some(via.parse().unwrap()),
+        };
+        let up = |_: u32| true;
+        for (dst, hops) in [
+            (
+                "10.2.0.0",
+                [hop("10.0.0.2", 1000, 1), hop("10.1.0.2", 1001, 3)],
+            ),
+            (
+                "10.3.0.0",
+                [hop("10.0.0.2", 1000, 1), hop("10.0.0.3", 1000, 1)],
+            ),
+        ] {
+            let ask = Ask4 {
+                scope: SCOPE_UNIVERSE,
+                oif: 0,
+                device: false,
+                ..ask4(dst, 16, 1, 0x600)
+            };
+            let hops = Multipath4 {
+                counted: Ok(()),
+                hops: Ok(hops.to_vec()),
+            };
+            a.add_multipath4(&ask, Some(&hops), &up).unwrap();
+        }
+        let order = [1, 1000, 1001];
+        let ip = |text: &str| text.parse::<Ipv4Addr>().unwrap();
+        // How many of 4096 destinations the hop of weight 3 takes, and of
+        // the same device's two hops the second.
+        let share = |a: &Addresses, net: [u8; 2], src: Option<Ipv4Addr>, oif, via: &str| {
+            (0..4096u16)
+                .filter(|n| {
+                    let [hi, lo] = n.to_be_bytes();
+                    let to = Ipv4Addr::new(net[0], net[1], hi, lo);
+                    let route = a.output4(to, 0, oif, src, &order).unwrap();
+                    assert_eq!(a.output4(to, 0, oif, src, &order).unwrap(), route);
+                    route.gateway == Some(ip(via))
+                })
+                .count()
+        };
+        // 3 in 4 within 332 of 4096 (1 in 2 within 384, below), which a
+        // random key misses with a chance under 1e-22 (Hoeffding:
+        // 2 e^(-2 d^2 / 4096)).
+        let heavy = share(&a, [10, 2], None, 0, "10.1.0.2");
+        assert!((2740..3404).contains(&heavy), "{heavy}");
+        // A hop's own source before the hash, another's by the hash.
+        let (own, other) = (Some(ip("10.0.0.1")), Some(ip("10.1.0.1")));
+        assert_eq!(share(&a, [10, 2], own, 0, "10.0.0.2"), 4096);
+        assert_eq!(share(&a, [10, 2], other, 0, "10.1.0.2"), 4096);
+        for src in [None, own, other] {
+            let second = share(&a, [10, 3], src, 0, "10.0.0.3");
+            assert!((1664..2432).contains(&second), "{second}");
+        }
+        // A device named chooses itself.
+        assert_eq!(share(&a, [10, 2], other, 1000, "10.0.0.2"), 4096);
+        // A forwarded packet's hop, by the hash alone.
+        let route = a.lookup4(ip("10.2.0.9")).unwrap();
+        let taken = (0..4096u16)
+            .filter(|n| {
+                let [hi, lo] = n.to_be_bytes();
+                let to = Ipv4Addr::new(10, 2, hi, lo);
+                a.path4(route.clone(), to, ip("10.0.0.1"), None).oif == 1001
+            })
+            .count();
+        assert!((2740..3404).contains(&taken), "{taken}");
+        // Its source is that of the hop it takes, and it may come in on
+        // the device of any.
+        for n in 1..=254u8 {
+            let to = Ipv4Addr::new(10, 2, 0, n);
+            let route = a.output4(to, 0, 0, None, &order).unwrap();
+            let src = if route.oif == 1000 { own } else { other };
+            assert_eq!(Some(a.source(IpAddr::V4(to), &order)), src.map(IpAddr::V4));
+        }
+        for dev in [1000, 1001] {
+            assert_eq!(
+                a.validate_source4_on(ip("10.2.0.9"), 0, 0, 1, dev),
+                Ok(false)
+            );
+        }
+        // A dead hop takes none.
+        a.device_down4(1001);
+        assert_eq!(share(&a, [10, 2], None, 0, "10.0.0.2"), 4096);
     }
     #[test]
     fn ipv4_gateways_take_the_device_their_route_goes_through() {

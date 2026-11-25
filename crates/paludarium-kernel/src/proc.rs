@@ -5,7 +5,8 @@
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, its `ns` directory of links
 //! to its namespaces, and its `maps`, which is generated as it is read, as
-//! `/proc/sysvipc`'s `msg`, `sem` and `shm` are ([`crate::seq`]).
+//! `/proc/locks` and `/proc/sysvipc`'s `msg`, `sem` and `shm` are
+//! ([`crate::seq`]).
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
 use paludarium_types::Errno;
@@ -353,6 +354,8 @@ pub(crate) fn task_path(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SystemEntry {
     Loadavg,
+    /// `/proc/locks` ([`crate::record_locks::proc_file`]).
+    Locks,
     Meminfo,
     Stat,
     Uptime,
@@ -364,6 +367,7 @@ pub(crate) enum SystemEntry {
 pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
     match path {
         b"/proc/loadavg" => Some(SystemEntry::Loadavg),
+        b"/proc/locks" => Some(SystemEntry::Locks),
         b"/proc/meminfo" => Some(SystemEntry::Meminfo),
         b"/proc/stat" => Some(SystemEntry::Stat),
         b"/proc/uptime" => Some(SystemEntry::Uptime),
@@ -3021,6 +3025,7 @@ mod generated_tests {
         assert_eq!(entry(b"/proc/self/root"), Some(OwnEntry::Root));
         assert_eq!(entry(b"/proc/8/stat"), None);
         assert_eq!(system_entry(b"/proc/loadavg"), Some(SystemEntry::Loadavg));
+        assert_eq!(system_entry(b"/proc/locks"), Some(SystemEntry::Locks));
         assert_eq!(system_entry(b"/proc/meminfo"), Some(SystemEntry::Meminfo));
         assert_eq!(system_entry(b"/proc/stat"), Some(SystemEntry::Stat));
         assert_eq!(system_entry(b"/proc/uptime"), Some(SystemEntry::Uptime));

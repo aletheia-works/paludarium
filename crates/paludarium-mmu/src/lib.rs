@@ -29,6 +29,9 @@ const FAULT_AROUND_PAGES: u64 = 16;
 
 /// Lowest address handed out for mappings without a fixed address.
 pub const MMAP_MIN_ADDR: u64 = 0x10000;
+/// Where `MAP_32BIT` looks for room, from the lowest address up
+/// (`find_start_end`, without its random start).
+const LOW_AREA: std::ops::Range<u64> = 0x4000_0000..0x8000_0000;
 /// Linux's default `stack_guard_gap`, 256 pages: a mapping that grows down
 /// does not grow within it of the mapping below, and no new mapping is placed
 /// within it below one (`vm_start_gap`).
@@ -332,6 +335,29 @@ pub mod faults {
         fn user(&self) -> &AtomicU64;
         fn kernel(&self) -> &AtomicU64;
         fn forced(&self) -> &AtomicU64;
+        /// A fault that made its count `nth`, of the kernel's accesses or
+        /// the thread's own code's, `at`, which is told where
+        /// [`trace_addresses`] asked for it.
+        fn fault(&self, kernel: bool, nth: u64, at: At) {
+            let _ = (kernel, nth, at);
+        }
+    }
+
+    /// Where a fault was, and whether the page was there before it, as it
+    /// is for a write to one that is to be copied.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct At {
+        pub addr: u64,
+        pub present: bool,
+    }
+
+    /// Whether the sinks are told the faults' addresses.
+    static ADDRESSES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// From now on every [`Sink`] of the process is told its faults'
+    /// addresses ([`Sink::fault`]).
+    pub fn trace_addresses() {
+        ADDRESSES.store(true, Ordering::SeqCst);
     }
 
     std::thread_local! {
@@ -417,35 +443,39 @@ pub mod faults {
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
-    /// when the host thread is not bound.
-    fn add(forced: bool) -> bool {
+    /// when the host thread is not bound. It was `at` there.
+    fn add(forced: bool, at: At) -> bool {
         SINK.with(|sink| {
             let sink = sink.borrow();
             let Some(counts) = sink.as_ref() else {
                 return false;
             };
+            let kernel = KERNEL.with(Cell::get);
             let field = if forced {
                 counts.forced()
-            } else if KERNEL.with(Cell::get) {
+            } else if kernel {
                 counts.kernel()
             } else {
                 counts.user()
             };
-            field.fetch_add(1, Ordering::SeqCst);
+            let nth = field.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            if !forced && ADDRESSES.load(Ordering::Relaxed) {
+                counts.fault(kernel, nth, at);
+            }
             true
         })
     }
 
-    pub(crate) fn count() {
+    pub(crate) fn count(addr: u64, present: bool) {
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
-        } else if !add(false) {
+        } else if !add(false, At { addr, present }) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
     }
 
     pub(crate) fn count_forced() {
-        if !add(true) {
+        if !add(true, At::default()) {
             FORCED.with(|forced| forced.set(forced.get().wrapping_add(1)));
         }
     }
@@ -1792,6 +1822,20 @@ pub enum Placement {
         hint: Option<GuestAddr>,
         offset: u64,
     },
+    /// In the first 2 GiB, where `fit` places it (`MAP_32BIT`): at the hint
+    /// if it ends there by 2 GiB, else from 1 GiB up, in either layout.
+    Low { hint: Option<GuestAddr>, fit: Fit },
+}
+
+/// How [`Placement::Low`] places a mapping in its area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    /// As [`Placement::Near`].
+    Near,
+    /// As [`Placement::Aligned`].
+    Aligned { size: u64, offset: u64 },
+    /// As [`Placement::Thp`].
+    Thp { offset: u64 },
 }
 
 /// What a mapping [`AddressSpace::map_backed`] makes shows.
@@ -2235,8 +2279,8 @@ pub trait PageSource: Send + Sync {
         true
     }
     /// Whether a VMA of this memory may be split (the VMA's
-    /// `vm_ops->may_split`): a perf event's ring buffer's may not, so that
-    /// an `munmap`, `mprotect`, `mremap`, `madvise` or `mseal` that would
+    /// `vm_ops->may_split`): a perf event's ring buffer's and the vDSO's
+    /// (`special_mapping_split`) may not, so that an `munmap`, `mprotect`, `mremap`, `madvise` or `mseal` that would
     /// split it is `EINVAL`.
     fn splits(&self) -> bool {
         true
@@ -3150,6 +3194,17 @@ impl AddressSpaceData {
             .is_some_and(|source| {
                 source.secret() || source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0
             })
+            || self.special_backing(page).is_some()
+    }
+    /// The source of a private mapping at `page` that core mm does not back
+    /// with pages of its own (`VM_IO | VM_PFNMAP`), as the vDSO's data,
+    /// Linux's `[vvar]`, is a special mapping: its accesses ask the source
+    /// to [`PageSource::admit`] each page, and `get_user_pages`, `madvise`
+    /// and `mremap` treat it as they treat a perf ring.
+    fn special_backing(&self, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
+        let backing = self.backing_at(page)?;
+        (backing.cache.is_none() && backing.source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0)
+            .then(|| (&backing.source, page.wrapping_add(backing.shift)))
     }
     /// Whether a page of `[start, end)` is one `get_user_pages` refuses
     /// ([`Self::gup_refused`]): the shared mappings that overlap it, as
@@ -4481,10 +4536,10 @@ impl AddressSpaceData {
 
     /// The memory an access to the page at `page` asks to take the page in
     /// ([`PageSource::admit`]), and the page's offset in it: a shared
-    /// mapping's, or the shmem page cache a private mapping shows where it
-    /// has no copy of its own, as Linux's `shmem_fault` brings the page
-    /// into the file for a private mapping's read and copy-on-write faults
-    /// too.
+    /// mapping's, a private special mapping's ([`Self::special_backing`]),
+    /// or the shmem page cache a private mapping shows where it has no copy
+    /// of its own, as Linux's `shmem_fault` brings the page into the file
+    /// for a private mapping's read and copy-on-write faults too.
     fn admitting(&self, directory: &Directory, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
         if let Some(shared) = self.shared_at(page) {
             return shared
@@ -4492,6 +4547,9 @@ impl AddressSpaceData {
                 .source
                 .as_ref()
                 .map(|source| (source, page.wrapping_add(shared.shift)));
+        }
+        if let Some(special) = self.special_backing(page) {
+            return Some(special);
         }
         let backing = self.backing_at(page)?;
         (backing.cache.is_some()
@@ -4604,7 +4662,7 @@ impl AddressSpaceData {
         self.check(&directory, addr, buf.len(), access, true)?;
         // A successful lazy read installs the logical zero-page entry without
         // allocating its byte frame, matching subsequent Linux fault metadata.
-        for (page, _, _) in chunks(addr, buf.len()) {
+        for (page, offset, _) in chunks(addr, buf.len()) {
             if ready(&directory, page) {
                 continue;
             }
@@ -4614,7 +4672,7 @@ impl AddressSpaceData {
                 if let Some(entry) = table.pages.get_mut(slot) {
                     let missing = entry.is_none();
                     if missing && matches!(access, Access::Read | Access::Fetch) {
-                        faults::count();
+                        faults::count(page + offset as u64, false);
                     } else if missing && access == Access::Dump {
                         faults::count_forced();
                     }
@@ -4774,7 +4832,7 @@ impl AddressSpaceData {
         }
         let mut directory = self.write_directory();
         self.check(&directory, addr, len, access, true)?;
-        for (page, _, _) in chunks(addr, len) {
+        for (page, offset, _) in chunks(addr, len) {
             let Some(prot) = self.mapping_at(page).map(|m| m.prot) else {
                 return Err(Fault {
                     addr: GuestAddr(page),
@@ -4796,7 +4854,8 @@ impl AddressSpaceData {
                 })
             {
                 if access == Access::Write {
-                    faults::count();
+                    let present = table.pages.get(slot).is_some_and(Option::is_some);
+                    faults::count(page + offset as u64, present);
                 } else {
                     faults::count_forced();
                 }
@@ -5114,7 +5173,10 @@ impl AddressSpaceData {
     /// The lowest address from `from`, a multiple of `align` (a power of
     /// two), with `len` free bytes below TASK_SIZE.
     fn lowest_gap(&self, from: u64, len: u64, align: u64) -> Option<u64> {
-        let limit = USER_ADDRESS_LIMIT - PAGE_SIZE;
+        self.lowest_gap_below(USER_ADDRESS_LIMIT - PAGE_SIZE, from, len, align)
+    }
+    /// [`Self::lowest_gap`] that ends by `limit`.
+    fn lowest_gap_below(&self, limit: u64, from: u64, len: u64, align: u64) -> Option<u64> {
         let mut start = from.checked_next_multiple_of(align)?;
         for (_, m) in self.mappings.range(..limit) {
             if m.end() <= start {
@@ -5132,9 +5194,9 @@ impl AddressSpaceData {
     /// [`Self::find_free`] gives, or one found for `size` less a page more
     /// and moved up to the offset (`shmem_get_unmapped_area`). `None`
     /// where the ordinary choice has no room either.
-    fn aligned_area(&self, len: u64, size: u64, offset: u64) -> Option<u64> {
+    fn aligned_area(&self, len: u64, size: u64, offset: u64, low: bool) -> Option<u64> {
         let len = GuestAddr(len).page_align_up()?.0;
-        let addr = self.find_free(len)?;
+        let addr = self.free_area(len, low)?;
         if len < size
             || (offset != 0 && offset.saturating_add(len) < 2 * size)
             || addr & (size - 1) == offset
@@ -5143,7 +5205,7 @@ impl AddressSpaceData {
         }
         let Some(inflated) = len
             .checked_add(size - PAGE_SIZE)
-            .and_then(|wide| self.find_free(wide))
+            .and_then(|wide| self.free_area(wide, low))
         else {
             return Some(addr);
         };
@@ -5163,7 +5225,7 @@ impl AddressSpaceData {
     /// Where memory that may take transparent huge pages goes
     /// ([`Placement::Thp`], Linux's `__thp_get_unmapped_area`): `None`
     /// where it goes as any other would.
-    fn thp_area(&self, len: u64, hint: Option<u64>, offset: u64) -> Option<u64> {
+    fn thp_area(&self, len: u64, hint: Option<u64>, offset: u64, low: bool) -> Option<u64> {
         let size = BLOCK_SIZE;
         let len = GuestAddr(len).page_align_up()?.0;
         let end = offset.checked_add(len)?;
@@ -5173,11 +5235,14 @@ impl AddressSpaceData {
         }
         let padded = len.checked_add(size)?;
         offset.checked_add(padded)?;
+        let limit = if low {
+            LOW_AREA.end
+        } else {
+            USER_ADDRESS_LIMIT - PAGE_SIZE
+        };
         let free_at = |at: u64| {
             at >= MMAP_MIN_ADDR
-                && at
-                    .checked_add(padded)
-                    .is_some_and(|stop| stop <= USER_ADDRESS_LIMIT - PAGE_SIZE)
+                && at.checked_add(padded).is_some_and(|stop| stop <= limit)
                 && !self.overlaps(at, at + padded)
                 // Linux looks for the longer area's guard gap too.
                 && self
@@ -5188,7 +5253,7 @@ impl AddressSpaceData {
         };
         let found = match hint {
             Some(hint) if free_at(hint) => return Some(hint),
-            _ => self.find_free(padded)?,
+            _ => self.free_area(padded, low)?,
         };
         let below = offset.wrapping_sub(found) & (size - 1);
         Some(if self.bottom_up.is_none() && below == 0 {
@@ -5196,6 +5261,15 @@ impl AddressSpaceData {
         } else {
             found + below
         })
+    }
+    /// Where `len` bytes with no hint go: in the first 2 GiB with `low`
+    /// (`MAP_32BIT`), else where [`Self::find_free`] puts them.
+    fn free_area(&self, len: u64, low: bool) -> Option<u64> {
+        if low {
+            self.lowest_gap_below(LOW_AREA.end, LOW_AREA.start, len, PAGE_SIZE)
+        } else {
+            self.find_free(len)
+        }
     }
     fn find_free(&self, len: u64) -> Option<u64> {
         if let Some(base) = self.bottom_up {
@@ -5492,6 +5566,13 @@ impl AddressSpaceData {
             .is_some_and(|(_, shared)| {
                 at < shared.end && shared.pages.source().is_some_and(|source| !source.splits())
             })
+            || self
+                .backing
+                .range(..at)
+                .next_back()
+                .is_some_and(|(_, backing)| {
+                    at < backing.end && backing.cache.is_none() && !backing.source.splits()
+                })
     }
     /// Whether the VMA at `addr` is one of Linux's `VM_SPECIAL`, memory core
     /// mm does not back: a fixed mapping ([`PageSource::fixed`]) or one of
@@ -5502,6 +5583,17 @@ impl AddressSpaceData {
             .is_some_and(|source| {
                 source.fixed() || source.vma_flags(0) & (vm::IO | vm::PFNMAP | vm::MIXEDMAP) != 0
             })
+            || self.private_special(addr).is_some()
+    }
+    /// The source of a private mapping at `addr` that is one of Linux's
+    /// `VM_SPECIAL` ([`Self::special`]), as the vDSO and its data are
+    /// special mappings: fixed ([`PageSource::fixed`], `VM_DONTEXPAND`) or
+    /// of no pages of its own ([`Self::special_backing`]).
+    fn private_special(&self, addr: u64) -> Option<&Arc<dyn PageSource>> {
+        let backing = self.backing_at(addr)?;
+        (backing.cache.is_none()
+            && (backing.source.fixed() || backing.source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0))
+            .then_some(&backing.source)
     }
     /// Whether the VMA at `addr` is a `VM_PFNMAP` one, whose pages
     /// `MADV_DONTNEED` may not drop (`madvise_dontneed_free_valid_vma`).
@@ -5509,6 +5601,7 @@ impl AddressSpaceData {
         self.shared_at(addr)
             .and_then(|shared| shared.pages.source())
             .is_some_and(|source| source.vma_flags(0) & vm::PFNMAP != 0)
+            || self.special_backing(addr).is_some()
     }
     /// The first mapping of `[addr, end)` whose pages `MADV_DONTNEED` may
     /// not drop: a `VM_PFNMAP` one, or with `locked` a locked one too.
@@ -5898,7 +5991,8 @@ impl AddressSpaceData {
         // behind a move (`check_prep_vma`)...
         let source = self
             .shared_at(addr.0)
-            .and_then(|shared| shared.pages.source().cloned());
+            .and_then(|shared| shared.pages.source().cloned())
+            .or_else(|| self.private_special(addr.0).cloned());
         let fixed = source.as_ref().is_some_and(|source| source.fixed());
         if how.keep_old && fixed {
             return Err(Errno::EINVAL);
@@ -5926,10 +6020,10 @@ impl AddressSpaceData {
         // (`__get_unmapped_area`'s `thp_get_unmapped_area_vmflags`).
         let anonymous = self.shared_at(addr.0).is_none() && self.backing_at(addr.0).is_none();
         let free_for = |data: &Self, len: u64, hinted: bool| match huge {
-            Some(offset) => data.aligned_area(len, BLOCK_SIZE, offset),
-            None if anonymous && !hinted && len.is_multiple_of(BLOCK_SIZE) => {
-                data.thp_area(len, None, 0).or_else(|| data.find_free(len))
-            }
+            Some(offset) => data.aligned_area(len, BLOCK_SIZE, offset, false),
+            None if anonymous && !hinted && len.is_multiple_of(BLOCK_SIZE) => data
+                .thp_area(len, None, 0, false)
+                .or_else(|| data.find_free(len)),
             None => data.find_free(len),
         };
         // A shrink may cross the end of the VMA: only what stays must not.
@@ -6115,6 +6209,14 @@ impl AddressSpaceData {
             if matches!(advice, FlagAdvice::DoFork | FlagAdvice::DoDump) && self.special(start) {
                 return Err(Errno::EINVAL);
             }
+            // One that is never dumped keeps its flags.
+            if advice == FlagAdvice::DontDump
+                && self
+                    .private_special(start)
+                    .is_some_and(|source| source.vma_flags(0) & vm::DONTDUMP != 0)
+            {
+                continue;
+            }
             let ksm = self.shared_at(start).is_none();
             let advise = |m: &mut Mapping| match advice {
                 FlagAdvice::DontFork => m.dont_fork = true,
@@ -6157,7 +6259,9 @@ impl AddressSpaceData {
     /// `name` (none clears it), split where the range starts and ends
     /// within it, which keeps every other state of it (its lock, its
     /// `userfaultfd`); one with a file but shared anonymous memory ends it
-    /// with `EBADF` (`vma_is_anon_shmem`), after those before it; a hole in
+    /// with `EBADF` (`vma_is_anon_shmem`), after those before it, and one
+    /// that may not be split there with `EINVAL`; a special mapping has no
+    /// file (it takes the name, and shows its own); a hole in
     /// the range is `ENOMEM` once the rest has it.
     pub fn set_anon_name(&mut self, addr: u64, end: u64, name: Option<&[u8]>) -> Result<(), Errno> {
         // The name's id, taken only once a mapping is to hold it: a call
@@ -6180,8 +6284,9 @@ impl AddressSpaceData {
             // Only anonymous memory is named: a loaded program's segments
             // and a file's mappings have a file (`vm_file`), and so has shared
             // memory of a file, where shared anonymous memory's is shmem's.
-            let file = matches!(m.kind, MappingKind::File | MappingKind::ElfSegment)
-                || self.backing_at(start).is_some()
+            let file = self.private_special(start).is_none()
+                && (matches!(m.kind, MappingKind::File | MappingKind::ElfSegment)
+                    || self.backing_at(start).is_some())
                 || self
                     .shared_at(start)
                     .is_some_and(|shared| shared.pages.source.is_some());
@@ -6190,6 +6295,9 @@ impl AddressSpaceData {
             }
             if m.anon_name == id && (name.is_none() || id.is_some()) {
                 continue;
+            }
+            if self.splits_refused(&m, addr, end) {
+                return Err(Errno::EINVAL);
             }
             if let Some(name) = name
                 && id.is_none()
@@ -7732,6 +7840,16 @@ impl AddressSpaceData {
                 denied = Some(Errno::EACCES);
                 break;
             }
+            // A special mapping its memory keeps from being written, as
+            // the vDSO's data, Linux's `[vvar]`, has no `VM_MAYWRITE`.
+            if prot.contains(Prot::WRITE)
+                && self
+                    .private_special(m.start.0)
+                    .is_some_and(|source| source.vma_flags(vm::MAYWRITE) & vm::MAYWRITE == 0)
+            {
+                denied = Some(Errno::EACCES);
+                break;
+            }
             // A sealed one keeps its protection, even the same one
             // (`mprotect_fixup`).
             if m.sealed {
@@ -8771,35 +8889,54 @@ impl AddressSpace {
                 data.map(Some(at), len, prot, kind)?
             }
             Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
-            Placement::Near(hint)
-            | Placement::Aligned { hint, .. }
-            | Placement::Thp { hint, .. } => {
+            Placement::Near(_)
+            | Placement::Aligned { .. }
+            | Placement::Thp { .. }
+            | Placement::Low { .. } => {
+                let (hint, fit, low) = match placement {
+                    Placement::Aligned { hint, size, offset } => {
+                        (hint, Fit::Aligned { size, offset }, false)
+                    }
+                    Placement::Thp { hint, offset } => (hint, Fit::Thp { offset }, false),
+                    Placement::Low { hint, fit } => (hint, fit, true),
+                    Placement::Near(hint) => (hint, Fit::Near, false),
+                    Placement::Replacing(_) | Placement::Exactly(_) => (None, Fit::Near, false),
+                };
                 // A hint within the guard gap below a mapping that grows
                 // down is not taken (`vm_start_gap`).
                 let hint = hint.filter(|hint| {
-                    data.mappings
-                        .range(hint.0..)
-                        .next()
-                        .is_none_or(|(_, m)| hint.0.saturating_add(len) <= m.start_gap())
+                    (!low || hint.0.saturating_add(len) <= LOW_AREA.end)
+                        && data
+                            .mappings
+                            .range(hint.0..)
+                            .next()
+                            .is_none_or(|(_, m)| hint.0.saturating_add(len) <= m.start_gap())
                 });
-                let thp = match placement {
-                    Placement::Thp { offset, .. } => {
-                        data.thp_area(len, hint.map(|hint| hint.0), offset)
-                    }
-                    _ => None,
+                let thp = match fit {
+                    Fit::Thp { offset } => data.thp_area(len, hint.map(|hint| hint.0), offset, low),
+                    Fit::Near | Fit::Aligned { .. } => None,
                 };
                 if let Some(at) = thp {
                     data.map(Some(GuestAddr(at)), len, prot, kind)?
                 } else {
                     match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
                         Some(at) => at,
-                        None => match placement {
-                            Placement::Aligned { size, offset, .. } => {
-                                let at = data.aligned_area(len, size, offset);
-                                data.map(at.map(GuestAddr), len, prot, kind)?
+                        None => {
+                            let at = match fit {
+                                Fit::Aligned { size, offset } => {
+                                    data.aligned_area(len, size, offset, low)
+                                }
+                                Fit::Near | Fit::Thp { .. } if low => {
+                                    let len = GuestAddr(len).page_align_up();
+                                    len.and_then(|len| data.free_area(len.0, true))
+                                }
+                                Fit::Near | Fit::Thp { .. } => None,
+                            };
+                            if low && at.is_none() {
+                                return Err(Errno::ENOMEM);
                             }
-                            _ => data.map(None, len, prot, kind)?,
-                        },
+                            data.map(at.map(GuestAddr), len, prot, kind)?
+                        }
                     }
                 }
             }
@@ -11086,6 +11223,73 @@ mod tests {
         fn writable(&self, offset: u64) -> bool {
             offset == 0
         }
+    }
+
+    /// A private special mapping, as the vDSO is one.
+    struct Special;
+    impl PageSource for Special {
+        fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            buf.fill(7);
+            Ok(buf.len())
+        }
+        fn size(&self) -> Option<u64> {
+            Some(2 * PAGE_SIZE)
+        }
+        fn name(&self) -> Option<Vec<u8>> {
+            Some(b"[special]".to_vec())
+        }
+        fn fixed(&self) -> bool {
+            true
+        }
+        fn splits(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_private_special_mapping_is_not_split_either() {
+        let mut space = AddressSpace::new();
+        let len = 2 * PAGE_SIZE;
+        let at = GuestAddr(0x10_0000);
+        let other = GuestAddr(at.0 + len);
+        for start in [at, other] {
+            space
+                .map(Some(start), len, Prot::READ_EXEC, MappingKind::ElfSegment)
+                .unwrap();
+            space
+                .back_with_file(start, len, Arc::new(Special), 0)
+                .unwrap();
+        }
+        let mid = GuestAddr(at.0 + PAGE_SIZE);
+        let whole = |space: &AddressSpace| {
+            let vma = space.view().vma_from(at.0).unwrap();
+            (vma.start, vma.end) == (at.0, other.0)
+        };
+        assert_eq!(space.unmap_shared(at, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(space.unmap_shared(mid, len), Err(Errno::EINVAL));
+        assert_eq!(
+            space.protect_shared(mid, PAGE_SIZE, Prot::READ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(space.seal_shared(at, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(
+            space.advise_flags(at, mid.0, FlagAdvice::DontDump),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            space.set_anon_name(at, mid.0, Some(b"name")),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(space.protect_shared(at, PAGE_SIZE, Prot::READ_EXEC), Ok(()));
+        assert!(whole(&space));
+        // It has no file, so it takes a name and shows its own.
+        assert_eq!(space.set_anon_name(at, other.0, Some(b"name")), Ok(()));
+        assert!(whole(&space));
+        let vma = space.view().vma_from(at.0).unwrap();
+        assert_eq!(vma.file.unwrap().name.as_deref(), Some(&b"[special]"[..]));
+        // The whole of two goes.
+        space.unmap_shared(at, 2 * len).unwrap();
+        assert!(space.view().vma_from(at.0).is_none());
     }
 
     #[test]

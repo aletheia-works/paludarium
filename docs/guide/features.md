@@ -6567,7 +6567,7 @@ one only with an `--allow-net`.
   change the call and its arguments, or set `orig_rax` to -1 to skip it,
   leaving the `rax` it wants; at an exit `rax` has what the call returned,
   which the tracer may change. A signal the tracer resumes a syscall stop
-  with is sent to the process from the kernel (`SI_KERNEL`).
+  with is sent to the thread from the kernel (`SI_KERNEL`).
   `PTRACE_GET_SYSCALL_INFO`
   describes the stop as Linux's `struct ptrace_syscall_info` does: the call
   and its arguments at an entry, the return value and whether it is an

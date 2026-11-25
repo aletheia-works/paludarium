@@ -5660,7 +5660,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   コールで、トレーサーはシステムコールと引数を変えられ、`orig_rax` を -1 にすると、`rax` を
   残したい値にしたまま実行を飛ばします。出口では `rax` が戻り値で、トレーサーはそれを変え
   られます。システムコール停止をシグナル付きで再開すると、そのシグナルはカーネルから
-  （`SI_KERNEL`）プロセスに送られます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
+  （`SI_KERNEL`）そのスレッドに送られます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
   同じく停止を示します。入口ではシステムコールと引数、出口では戻り値とエラーかどうか、
   ほかの停止や `PTRACE_O_TRACESYSGOOD` なしでは命令ポインタとスタックポインタだけです。
   `PTRACE_SET_SYSCALL_INFO` はシステムコール、引数、戻り値を変えます。種類の違う停止、

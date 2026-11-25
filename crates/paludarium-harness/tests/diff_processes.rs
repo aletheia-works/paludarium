@@ -876,6 +876,7 @@ mod linux {
         ptrace_seccomp => ("ptrace-seccomp","ptrace-requests"),
         ptrace_arch_rseq => ("ptrace-arch-rseq","ptrace-requests"),
         ptrace_syscall_signal => ("ptrace-syscall-signal","ptrace-requests"),
+        ptrace_syscall_signal_thread => ("ptrace-syscall-signal-thread","ptrace-requests"),
         ptrace_exit_core => ("ptrace-exit-core","ptrace-requests"),
         trap_flag => ("trap-flag","single-step"),
         trap_flag_syscall => ("trap-flag-syscall","single-step"),

@@ -561,6 +561,7 @@
     {"name":"ptrace-seccomp","binary":"ptrace-requests"},
     {"name":"ptrace-arch-rseq","binary":"ptrace-requests"},
     {"name":"ptrace-syscall-signal","binary":"ptrace-requests"},
+    {"name":"ptrace-syscall-signal-thread","binary":"ptrace-requests"},
     {"name":"ptrace-exit-core","binary":"ptrace-requests"},
     {"name":"trap-flag","binary":"single-step"},
     {"name":"trap-flag-syscall","binary":"single-step"},

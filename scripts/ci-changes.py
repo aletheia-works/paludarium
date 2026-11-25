@@ -11,6 +11,11 @@ test jobs: a crate they test, or a file outside the crates their sources name
 by a relative path. "safari" is the Safari row of the wasm programs: the
 "wasm" group without the changes that only reach crates the Wasm module does
 not link.
+
+A merge queue's merge_group event has no changed files to read: the pull
+requests in it passed on their own, and the queue asks whether main still
+builds with them together. It needs the jobs that compile what each platform
+compiles ("compile", the stable clippy, and production_wasm) and no other.
 """
 
 import argparse
@@ -36,6 +41,10 @@ GROUPS = (
 )
 ALL = frozenset(GROUPS)
 NONE = frozenset()
+# The groups a merge_group event needs, and the job each of the two starts:
+# "compile" is the stable clippy, which the rust group needs too.
+MERGE_GROUP = frozenset({"production_wasm", "compile"})
+MERGE_JOBS = frozenset({"stable-clippy", "production-wasm"})
 # The pull-request files API lists at most 3000 files; a longer list may be cut.
 API_LIMIT = 3000
 ROOT = Path(__file__).resolve().parent.parent
@@ -204,6 +213,15 @@ def needed(paths):
     if not paths or len(paths) >= API_LIMIT:
         return ALL
     return frozenset().union(*(groups_for(p) for p in paths))
+
+
+def outputs(groups, fuzz):
+    """The lines the changes job outputs: each group, and the fuzz targets."""
+    lines = [f"{g}={'true' if g in groups else 'false'}" for g in GROUPS]
+    compile_needed = "rust" in groups or "compile" in groups
+    lines.append(f"compile={'true' if compile_needed else 'false'}")
+    lines.append(f"fuzz_targets={json.dumps(fuzz, separators=(',', ':'))}")
+    return lines
 
 
 def pr_fuzz_targets(text=None):
@@ -515,6 +533,7 @@ def self_test():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     jobs = check_gates(workflow)
     check_narrowing(workflow)
+    check_merge_group(workflow)
     check_differential_lists()
     good = (
         "on: push\njobs:\n  a:\n    runs-on: x\n  b:\n    needs: [a, quick]\n"
@@ -654,6 +673,67 @@ def check_narrowing(workflow):
             raise AssertionError(f"{source} builds a path at run time: add what it reads")
 
 
+def runs_on_merge_group(condition, needs_groups=MERGE_GROUP):
+    """Whether a job with this condition runs in a merge queue's run.
+
+    The conditions name pull_request, a group of the changes job, or both, which
+    must all hold; ci.yml's checks of quick's result pass in such a run.
+    """
+    if "pull_request" in condition:
+        return False
+    groups = re.findall(r"needs\.changes\.outputs\.([a-z_]+)", condition)
+    if not groups:
+        raise AssertionError(f"not a condition of groups, for a merge queue's run: {condition}")
+    return all(g in needs_groups for g in groups)
+
+
+def check_merge_group(workflow):
+    """A merge queue's run compiles what the merged code may break, and no more."""
+    if not re.search(r"(?m)^  merge_group:$", workflow.split("\njobs:\n", 1)[0]):
+        raise AssertionError("ci.yml must run on merge_group")
+    commitlint = (ROOT / ".github/workflows/commitlint.yml").read_text(encoding="utf-8")
+    if not re.search(r"(?m)^  merge_group:$", commitlint.split("\njobs:\n", 1)[0]):
+        raise AssertionError("commitlint.yml must run on merge_group: its check is required")
+    if "merge_group) python3 scripts/ci-changes.py --merge-group ;;" not in workflow:
+        raise AssertionError("the changes job must give a merge_group event --merge-group")
+    if "      compile: ${{ steps.groups.outputs.compile }}\n" not in workflow:
+        raise AssertionError("changes must output compile")
+    jobs = workflow_jobs(workflow)
+    if jobs["stable-clippy"][1] != "needs.changes.outputs.compile == 'true'":
+        raise AssertionError("stable-clippy must run if and only if the compile group is needed")
+    # The two gates run in every run, and changes has no condition.
+    runs = {
+        job
+        for job, (_, condition) in jobs.items()
+        if job not in ("changes", "quick", "ci-ok") and runs_on_merge_group(condition)
+    }
+    if runs != MERGE_JOBS:
+        raise AssertionError(f"a merge queue's run would run {sorted(runs)}")
+    compile_line = "compile=true"
+    if (
+        compile_line not in outputs(frozenset({"rust"}), [])
+        or compile_line not in outputs(MERGE_GROUP, [])
+        or compile_line in outputs(frozenset({"docs", "programs"}), [])
+        or "rust=true" in outputs(MERGE_GROUP, [])
+    ):
+        raise AssertionError("compile is what the rust group and a merge queue's run need")
+    for text, refusal in (
+        ("github.event_name == 'pull_request' && needs.changes.outputs.docs == 'true'", False),
+        ("needs.changes.outputs.rust == 'true'", False),
+        ("needs.changes.outputs.compile == 'true'", True),
+        (
+            "${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.production_wasm == 'true' }}",
+            True,
+        ),
+        (
+            "${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.fuzz == 'true' && needs.changes.outputs.compile == 'true' }}",
+            False,
+        ),
+    ):
+        if runs_on_merge_group(text) != refusal:
+            raise AssertionError(f"runs_on_merge_group({text})")
+
+
 def fuzz_self_test():
     targets = pr_fuzz_targets()
     bins = re.findall(r'^name = "([a-z0-9_]+)"$', (ROOT / "fuzz/Cargo.toml").read_text(), re.M)
@@ -729,16 +809,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--all", action="store_true", help="need every group (push to main)")
+    parser.add_argument(
+        "--merge-group",
+        action="store_true",
+        help="need what a merge queue's merge_group event does",
+    )
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return
-    paths = None if args.all else sys.stdin.read().splitlines()
-    groups = ALL if args.all else needed(paths)
     targets = pr_fuzz_targets()
-    fuzz = targets if args.all else fuzz_selection(paths, targets)
-    lines = [f"{g}={'true' if g in groups else 'false'}" for g in GROUPS]
-    lines.append(f"fuzz_targets={json.dumps(fuzz, separators=(',', ':'))}")
+    if args.merge_group:
+        groups, fuzz = MERGE_GROUP, []
+    elif args.all:
+        groups, fuzz = ALL, targets
+    else:
+        paths = sys.stdin.read().splitlines()
+        groups, fuzz = needed(paths), fuzz_selection(paths, targets)
+    lines = outputs(groups, fuzz)
     print("\n".join(lines))
     output = os.environ.get("GITHUB_OUTPUT")
     if output:

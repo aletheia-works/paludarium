@@ -7312,6 +7312,95 @@ mod io_uring {
         assert_eq!(batch(&mut f, &r, &[poll_remove(2, 1, 0, 0, 0)]), [(2, -2)]);
     }
 
+    #[test]
+    fn a_multishot_accept_takes_each_connection() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let name = DATA + 0x100;
+        f.mem.write(GuestAddr(name), &[1, 0, 0, b'm']).unwrap();
+        let listener = f.ret(41, &[1, 1, 0]);
+        assert_eq!(f.ret(49, &[listener, name, 4]), 0);
+        assert_eq!(f.ret(50, &[listener, 8]), 0);
+        let mut accept = fs(13, listener as i32, 0, 0, 0, 0);
+        accept[2] = 1;
+        submit_only(&mut f, &r, &[accept]);
+        assert_eq!(reap_flags(&mut f, &r), []);
+        let connect = |f: &mut Fixture| {
+            let socket = f.ret(41, &[1, 1, 0]);
+            assert_eq!(f.ret(42, &[socket, name, 4]), 0);
+            socket
+        };
+        let mut last = connect(&mut f);
+        for _ in 0..2 {
+            let done = reap_flags(&mut f, &r);
+            assert_eq!(done, [(1, last as i32 + 1, MORE)]);
+            last = connect(&mut f);
+        }
+        assert_eq!(reap_flags(&mut f, &r), [(1, last as i32 + 1, MORE)]);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(4, 1, 0, 0)]),
+            [(4, 0), (1, -125)]
+        );
+        // A slot must be any free one.
+        accept[44] = 1;
+        assert_eq!(one(&mut f, &r, &accept), -22);
+    }
+
+    #[test]
+    fn a_multishot_receive_goes_on_until_its_end() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        assert_eq!(f.ret(53, &[1, 1, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        let mut receive = rw(27, b, 0, 0, 0);
+        receive[2] = 2;
+        assert_eq!(one(&mut f, &r, &receive), -22);
+        receive[1] = 1 << 5;
+        receive[40] = 3;
+        let mut refused = receive;
+        refused[29] = 1;
+        assert_eq!(one(&mut f, &r, &refused), -22);
+        // Without a buffer it ends.
+        assert_eq!(f.ret(1, &[a, DATA, 4]), 4);
+        assert_eq!(one(&mut f, &r, &receive), -105);
+        assert_eq!(one(&mut f, &r, &provide(4, DATA + 0x800, 4, 3, 0)), 0);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 4, MORE | 1)]);
+        assert_eq!(f.ret(1, &[a, DATA, 6]), 6);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 4, MORE | 5 | 1 << 16), (1, 2, MORE | 1 | 2 << 16)]
+        );
+        assert_eq!(f.ret(1, &[a, DATA, 6]), 6);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 4, MORE | 5 | 3 << 16), (1, -105, 0)]
+        );
+        // Its last buffer taken with nothing more to read, it waits, and
+        // ends once there is.
+        assert_eq!(one(&mut f, &r, &provide(1, DATA + 0x800, 4, 3, 0)), 0);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 2, MORE | 1)]);
+        assert_eq!(f.ret(1, &[a, DATA, 2]), 2);
+        assert_eq!(reap_flags(&mut f, &r), [(1, -105, 0)]);
+        // Up to a limit, then to the end.
+        assert_eq!(one(&mut f, &r, &provide(4, DATA + 0x800, 4, 3, 0)), 0);
+        receive[44] = 3;
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 2, MORE | 1)]);
+        assert_eq!(f.ret(1, &[a, DATA, 4]), 4);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 4, 1 | 1 << 16)]);
+        receive[44] = 0;
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(f.ret(3, &[a]), 0);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 0, 0)]);
+    }
+
     /// A `struct user_msghdr` at `at`, with the iovecs `iov`, put after it,
     /// and `control_len` bytes of control after them.
     fn msghdr(f: &Fixture, at: u64, iov: &[(u64, u64)], control_len: u64) {
@@ -7933,8 +8022,7 @@ mod io_uring {
             (with(net(RECV, a, 0, buf, 1, WAITALL, 2), 1, &[1 << 5]), -22),
             (with(net(RECV, a, 0, buf, 1, 0, 0), 44, &[1]), -22),
             (net(RECV, a, 0, 1 << 63, 1, 0, 0), -14),
-            // A multishot receive, and a whole selected buffer, not yet.
-            (with(net(RECV, a, 0, 0, 1, 0, 2), 1, &[1 << 5]), -22),
+            // A whole selected buffer is not there yet.
             (with(net(RECV, a, 0, 0, 1, WAITALL, 0), 1, &[1 << 5]), -22),
         ] {
             assert_eq!(one(&mut f, &r, &e), res, "{:?}", &e[..48]);

@@ -1805,11 +1805,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベント（`IORING_POLL_UPDATE_EVENTS`）や `user_data`（`IORING_POLL_UPDATE_USER_DATA`）を与えて
   もう一度ポーリングさせます。
 
-- ソケットの要求は Linux 7.0 の単発のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
+- ソケットの要求は Linux 7.0 のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
   `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。最後の 2 つは
   `msghdr` とその iovec を準備のときに読むので（`io_msg_copy_hdr`。`EFAULT`、`EINVAL`、
   `EMSGSIZE`）、待つ要求にはもう要りません。`MSG_WAITALL` の受信は、メッセージや補助データが
-  切り詰められるとリンクを失敗させます。どれも Linux と同じく準備し、
+  切り詰められるとリンクを失敗させます。`IORING_ACCEPT_MULTISHOT` と `IORING_RECV_MULTISHOT` では、
+  accept と `IORING_OP_RECV` が、接続ごと、または埋めたバッファーごとに `IORING_CQE_F_MORE` 付きの
+  完了を投稿して次を待ちます。エラー、終わり、受信の上限（`optlen`）、バッファー切れ（`ENOBUFS`）、
+  キューの空き切れで終わります。ソケットにまだあるとき（`IORING_CQE_F_SOCK_NONEMPTY`）や、
+  AF_UNIX の待ち受けのように分からないときはすぐ続け、そうでなければまずソケットを待ちます。
+  そのため、最後のバッファーを使った受信が `ENOBUFS` で終わるのは、次のバイトが来たときです。
+  どれも Linux と同じく準備し、
   エントリーを調べ（`EINVAL`）、次に接続や送信のアドレスを読み（`move_addr_to_kernel`。128 バイトを
   超えれば `EINVAL`、読めなければ `EFAULT`）、バッファーがユーザー空間にあるかを調べます
   （`EFAULT`）。実行は Linux がその場で実行するのと同じく待たずに行います。待つはずの要求

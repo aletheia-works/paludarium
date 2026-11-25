@@ -1,4 +1,4 @@
-//! io_uring's single-shot socket requests, as Linux's `io_uring/net.c`
+//! io_uring's socket requests, as Linux's `io_uring/net.c`
 //! has them: `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
 //! `_SEND`, `_RECV`, `_SENDMSG` and `_RECVMSG`.
 //!
@@ -79,7 +79,64 @@ pub(super) struct Net {
     /// The file it found before it waited, which it goes on with
     /// (`req->file`).
     pub(super) found: Option<crate::files::Descriptor>,
+    /// Whether it posts a completion and goes on (`REQ_F_APOLL_MULTISHOT`),
+    /// and for a receive that may take no more than so many bytes in all
+    /// (`IORING_RECV_MSHOT_LIM`), how many are left.
+    multishot: bool,
+    limit: Option<u32>,
+    /// A multishot request that posted while its socket had nothing more,
+    /// as far as it knew, which waits for its socket before it goes on
+    /// (`IOU_RETRY`), and how many times it went on at once
+    /// (`nr_multishot_loops`).
+    wait: bool,
+    loops: u32,
 }
+
+impl Net {
+    /// Whether it goes on after `res`, which it posts: an accept after any
+    /// connection, a receive after any bytes but the last it may take.
+    pub(super) fn goes_on(&mut self, res: i32) -> bool {
+        if !self.multishot {
+            return false;
+        }
+        if matches!(self.op, Op::Accept { .. }) {
+            return res >= 0;
+        }
+        if res > 0
+            && let Some(limit) = &mut self.limit
+        {
+            *limit = limit.saturating_sub(res as u32);
+        }
+        res > 0 && self.limit != Some(0)
+    }
+
+    /// After a completion posted with `flags`, whether it goes on at once,
+    /// as `io_accept` and `io_recv_finish` do while their socket has more
+    /// or does not say (a receive retries `MULTISHOT_MAX_RETRY` times, then
+    /// is requeued, which here goes on at once too); else it waits for its
+    /// socket.
+    pub(super) fn posted(&mut self, flags: u32) {
+        let Some(file) = self.found.as_ref().map(|found| Arc::clone(&found.file)) else {
+            return;
+        };
+        let unknown = match self.op {
+            // Only TCP tells whether more connections wait (`is_empty`).
+            Op::Accept { .. } => crate::inet::of(&file).is_none(),
+            _ => crate::sockets::inq_hint(&file).is_none(),
+        };
+        let again = flags & CQE_F_SOCK_NONEMPTY != 0 || unknown;
+        if again && !matches!(self.op, Op::Accept { .. }) {
+            self.loops += 1;
+            if self.loops > MULTISHOT_MAX_RETRY {
+                self.loops = 0;
+            }
+        }
+        self.wait = !again;
+    }
+}
+
+/// `MULTISHOT_MAX_RETRY`.
+const MULTISHOT_MAX_RETRY: u32 = 32;
 
 enum Op {
     /// `how`, as `shutdown` takes it.
@@ -127,8 +184,8 @@ enum Op {
 /// `io_socket_prep`, `io_accept_prep`, `io_connect_prep` and
 /// `io_sendmsg_prep` or `io_recvmsg_prep` with `io_send_setup`), but for
 /// what it reads of the caller's memory ([`prepare_memory`]). The
-/// operations of multishot requests, bundles and vectored sends, and a
-/// send's selected buffer, are not there yet (`EINVAL`).
+/// operations of multishot receives of messages, bundles and vectored
+/// sends, and a send's selected buffer, are not there yet (`EINVAL`).
 pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Errno> {
     let fixed = sqe_flags & super::IOSQE_FIXED_FILE != 0;
     let select = sqe_flags & super::IOSQE_BUFFER_SELECT != 0;
@@ -139,6 +196,7 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
         u32_at(sqe, 28),
     );
     let (ioprio, buf_index, file_index) = (u16_at(sqe, 2), u16_at(sqe, 40), u32_at(sqe, 44));
+    let (mut multishot, mut limit) = (false, None);
     let op = match opcode {
         OP_SHUTDOWN => {
             if off != 0 || addr != 0 || rw_flags != 0 || buf_index != 0 || file_index != 0 {
@@ -181,10 +239,7 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
             if rw_flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
                 return Err(Errno::EINVAL);
             }
-            // Multishot accepts are not there yet.
-            if ioprio & ACCEPT_MULTISHOT != 0 {
-                return Err(Errno::EINVAL);
-            }
+            multishot = ioprio & ACCEPT_MULTISHOT != 0;
             Op::Accept {
                 addr,
                 addrlen: off,
@@ -227,11 +282,14 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
                 if !select || msg_flags & MSG_WAITALL != 0 {
                     return Err(Errno::EINVAL);
                 }
-                // Multishot receives are not there yet.
-                return Err(Errno::EINVAL);
-            }
-            // Only a multishot receive takes `optlen`.
-            if !send && file_index != 0 {
+                // A message's are not there yet.
+                if message {
+                    return Err(Errno::EINVAL);
+                }
+                multishot = true;
+                limit = (file_index != 0).then_some(file_index);
+            } else if !send && file_index != 0 {
+                // Only a multishot receive takes `optlen`.
                 return Err(Errno::EINVAL);
             }
             // Bundles, vectored sends, a send's selected buffer and a
@@ -270,6 +328,10 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
         op,
         polled: false,
         found: None,
+        multishot,
+        limit,
+        wait: false,
+        loops: 0,
     })))
 }
 
@@ -374,12 +436,35 @@ pub(super) fn run(
             Err(e) => return (-e.0, 0, true, None),
         },
     };
+    if net.multishot {
+        net.found = Some(opened.clone());
+    }
     let file = Arc::clone(&opened.file);
     let nowait = match &net.op {
         Op::Accept { iou, .. } => iou & ACCEPT_DONTWAIT != 0,
         Op::Transfer { msg_flags, .. } => msg_flags & MSG_DONTWAIT != 0,
         _ => false,
     };
+    if std::mem::take(&mut net.wait) {
+        // `IOU_RETRY`: it waits for its socket, as one that waited before.
+        let mask = match net.op {
+            Op::Transfer { msg_flags, .. } if msg_flags & MSG_ERRQUEUE != 0 => {
+                POLL_IN_EVENTS & !POLLIN
+            }
+            _ => POLL_IN_EVENTS,
+        };
+        return (
+            0,
+            0,
+            false,
+            Some(Waits {
+                file,
+                mask: POLL_UNMASK | mask,
+                kept: None,
+                found: (opened, None),
+            }),
+        );
+    }
     let issued = match &mut net.op {
         Op::Shutdown { how } => {
             let res = to_res(crate::sockets::route_file(

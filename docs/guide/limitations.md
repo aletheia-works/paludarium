@@ -586,10 +586,10 @@ verified.
   `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
-  single-shot socket requests
+  socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations complete with `EOPNOTSUPP`. Of the
-  socket requests, a multishot accept or receive, a bundle
+  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
   one are not there yet (`EINVAL`). A send or a receive with

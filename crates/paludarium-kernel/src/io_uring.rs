@@ -8,9 +8,10 @@
 //! `IORING_OP_POLL_ADD` and `_POLL_REMOVE` ([`poll`]), the file requests
 //! `IORING_OP_OPENAT`, `_OPENAT2`, `_CLOSE`, `_STATX`, `_FALLOCATE`,
 //! `_FADVISE`, `_MADVISE`, `_RENAMEAT`, `_UNLINKAT`, `_MKDIRAT`,
-//! `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE` ([`fs`]), and the single-shot
-//! socket requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
-//! `_SEND`, `_RECV`, `_SENDMSG` and `_RECVMSG` ([`net`]). The others answer
+//! `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE` ([`fs`]), and the socket
+//! requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
+//! `_SEND`, `_RECV`, `_SENDMSG` and `_RECVMSG`, with multishot accepts and
+//! receives ([`net`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
@@ -250,6 +251,8 @@ const OFF_PBUF_RING: u64 = 0x8000_0000;
 const OFF_PBUF_SHIFT: u64 = 16;
 /// `MAX_BIDS_PER_BGID`: a buffer's ID is 16 bits of a completion.
 const MAX_BIDS_PER_BGID: u64 = 1 << 16;
+/// `IORING_CQE_F_MORE`: the request posts more completions.
+const CQE_F_MORE: u32 = 1 << 1;
 const CQE_F_BUFFER: u32 = 1;
 const CQE_F_BUF_MORE: u32 = 1 << 4;
 const CQE_BUFFER_SHIFT: u32 = 16;
@@ -2027,17 +2030,42 @@ fn issue_link(
         poll::add(c, file, ring, chain, held);
         return;
     }
-    let (res, flags, failed, waits) = match &mut request.work {
-        Work::PollRemove(remove) => {
-            let res = poll::remove(c, file, ring, remove).map_or_else(|e| -e.0, |v| v as i32);
-            (res, 0, res < 0, None)
-        }
-        work => run(c, ring, work),
-    };
-    let split_held = || {
+    let mut mark = mark;
+    let split_held = |mark: usize| {
         let mut state = ring.state();
         let at = mark.min(state.held.len());
         state.held.split_off(at)
+    };
+    let (res, flags, failed, waits) = loop {
+        let done = match &mut request.work {
+            Work::PollRemove(remove) => {
+                let res = poll::remove(c, file, ring, remove).map_or_else(|e| -e.0, |v| v as i32);
+                (res, 0, res < 0, None)
+            }
+            work => run(c, ring, work),
+        };
+        if let (res, flags, _, None) = done
+            && let Work::Net(net) = &mut request.work
+            && net.goes_on(res)
+        {
+            // The completions of the batch go first (`io_req_post_cqe`),
+            // and what it holds goes on with it.
+            let held = split_held(mark);
+            flush_batch(c, file, ring);
+            ring.begin();
+            let posted = ring.post_aux(request.user_data, res, flags | CQE_F_MORE);
+            let mut state = ring.state();
+            mark = state.held.len();
+            state.held.extend(held);
+            drop(state);
+            if posted {
+                if let Work::Net(net) = &mut request.work {
+                    net.posted(flags);
+                }
+                continue;
+            }
+        }
+        break done;
     };
     if let Some(waits) = waits {
         match &mut request.work {
@@ -2052,7 +2080,7 @@ fn issue_link(
             _ => {}
         }
         chain.insert(0, request);
-        let held = split_held();
+        let held = split_held(mark);
         arm(c, file, ring, waits, chain, held);
         return;
     }
@@ -2065,7 +2093,7 @@ fn issue_link(
         next: Vec::new(),
     };
     if matches!(request.work, Work::Nop { tw: true, .. }) {
-        let held = split_held();
+        let held = split_held(mark);
         queue(
             c,
             file,

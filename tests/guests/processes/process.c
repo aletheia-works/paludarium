@@ -12466,6 +12466,107 @@ static int io_uring_message_case(void) {
     return 0;
 }
 
+/* io_uring's multishot requests: IORING_ACCEPT_MULTISHOT and
+   IORING_RECV_MULTISHOT. */
+static int um_connect(struct sockaddr_un *name, socklen_t len) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    printf("connect %d\n", connect(fd, (struct sockaddr *)name, len));
+    return fd;
+}
+
+static void um_provide(struct uring *u, char *pool, int count) {
+    unet_push(u, 31, 99, count, 0, (long)pool, 4, 0, 0)[40] = 3;
+    um_run(u, 1, 1, "provide");
+}
+
+static int io_uring_multishot_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    struct sockaddr_un name = {.sun_family = AF_UNIX};
+    snprintf(name.sun_path + 1, sizeof name.sun_path - 1, "uring-multishot-%d", getpid());
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name.sun_path + 1);
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (bind(listener, (struct sockaddr *)&name, len) || listen(listener, 8)) return 81;
+    unsigned char *sqe;
+    int slots[2] = {-1, -1};
+
+    /* Accepts, waiting or not. */
+    unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    um_run(&u, 1, 0, "accept-waits");
+    int first = um_connect(&name, len);
+    um_run(&u, 0, 1, "accept");
+    int second = um_connect(&name, len);
+    um_run(&u, 0, 1, "accept-again");
+    unet_push(&u, 14, 2, 0, 0, 1, 0, 0, 0);
+    um_run(&u, 1, 2, "accept-cancelled");
+    close(um_connect(&name, len));
+    close(um_connect(&name, len));
+    unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    um_run(&u, 1, 2, "accept-both");
+    unet_push(&u, 14, 2, 0, 0, 1, 0, 0, 0);
+    um_run(&u, 1, 2, "accept-both-cancelled");
+    unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1 | 2);
+    um_run(&u, 1, 1, "accept-nowait");
+    sqe = unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    sqe[44] = 1;
+    um_run(&u, 1, 1, "accept-slot");
+    syscall(427, u.fd, 2, slots, 2);
+    sqe = unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    memset(sqe + 44, 0xff, 4);
+    um_run(&u, 1, 0, "accept-slots");
+    for (int i = 0; i < 3; i++) {
+        close(um_connect(&name, len));
+        um_run(&u, 0, 1, "accept-slot-any");
+    }
+
+    /* Receives. */
+    char pool[16];
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 82;
+    unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    um_run(&u, 1, 1, "receive-no-select");
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, MSG_WAITALL, 2);
+    sqe[1] = 1 << 5;
+    um_run(&u, 1, 1, "receive-whole");
+    write(pair[0], "abcd", 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "receive-no-buffer");
+    um_provide(&u, pool, 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "receive");
+    write(pair[0], "ef", 2);
+    um_run(&u, 0, 1, "receive-more");
+    write(pair[0], "ghijkl", 6);
+    um_run(&u, 0, 2, "receive-two");
+    write(pair[0], "mn", 2);
+    um_run(&u, 0, 1, "receive-out");
+    um_provide(&u, pool, 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 3, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "receive-length");
+    write(pair[0], "opqrs", 5);
+    um_run(&u, 0, 2, "receive-three");
+    unet_push(&u, 14, 2, 0, 0, 1, 0, 0, 0);
+    um_run(&u, 1, 2, "receive-cancelled");
+    um_provide(&u, pool, 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    sqe[1] = 1 << 5 | 1 << 2;
+    sqe[40] = 3;
+    uring_push(&u, 0, 5);
+    um_run(&u, 2, 0, "receive-linked");
+    close(pair[0]);
+    um_run(&u, 0, 2, "receive-end");
+    close(first);
+    close(second);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's file requests. Linux runs most of them in a worker, so each
    one runs alone or in a link. */
 static int uf_run(struct uring *u, unsigned n, const char *label) {
@@ -43677,6 +43778,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-poll-add")) return io_uring_poll_add_case();
     if (!strcmp(mode, "io-uring-fs")) return io_uring_fs_case();
     if (!strcmp(mode, "io-uring-message")) return io_uring_message_case();
+    if (!strcmp(mode, "io-uring-multishot")) return io_uring_multishot_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

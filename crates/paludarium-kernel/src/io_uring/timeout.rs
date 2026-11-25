@@ -13,8 +13,9 @@ use paludarium_host::{ClockId, FileHandle, Host};
 use paludarium_types::{Errno, GuestAddr};
 
 use super::{
-    CANCEL_FD, CancelKey, Deferred, Done, ECANCELED, ETIME, Hashed, Polls, Request, Ring, Work,
-    add_work, cancel, cancel_matches, downcast, finish, int_at, live_rings, u16_at, u32_at, u64_at,
+    CANCEL_FD, CQE_F_MORE, CancelKey, Deferred, Done, ECANCELED, ETIME, Hashed, Polls, Request,
+    Ring, Work, add_work, cancel, cancel_matches, downcast, finish, int_at, live_rings, u16_at,
+    u32_at, u64_at,
 };
 use crate::syscalls::Context;
 
@@ -34,8 +35,6 @@ const IMMEDIATE_ARG: u32 = 1 << 7;
 const CLOCK_MASK: u32 = BOOTTIME | REALTIME;
 const UPDATE_MASK: u32 = UPDATE | LINK_UPDATE;
 
-/// `IORING_CQE_F_MORE`: the request posts more completions.
-const CQE_F_MORE: u32 = 1 << 1;
 const KTIME_MAX: u64 = i64::MAX as u64;
 
 /// An `IORING_OP_TIMEOUT` or `_LINK_TIMEOUT` (`struct io_timeout` and

@@ -2070,13 +2070,21 @@ kernel.
   queued), or gives it new events (`IORING_POLL_UPDATE_EVENTS`) or
   `user_data` (`IORING_POLL_UPDATE_USER_DATA`), with which it polls again.
 
-- The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
+- The socket requests are Linux 7.0's (`io_uring/net.c`):
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG`. The last two read their `msghdr` and
   its iovecs as they are prepared (`io_msg_copy_hdr`: `EFAULT`, `EINVAL`,
   `EMSGSIZE`), so one that waits needs them no more. A receive with
-  `MSG_WAITALL` whose message or ancillary data was cut fails its link. Each
-  is prepared as Linux prepares it, which checks its entry
+  `MSG_WAITALL` whose message or ancillary data was cut fails its link.
+  With `IORING_ACCEPT_MULTISHOT` and `IORING_RECV_MULTISHOT`, an accept and
+  an `IORING_OP_RECV` post a completion with `IORING_CQE_F_MORE` for each
+  connection or each buffer filled, and wait for the next: until an error,
+  the end, a receive's limit (`optlen`), no buffer (`ENOBUFS`) or no room in
+  the queue. It goes on at once while its socket has more
+  (`IORING_CQE_F_SOCK_NONEMPTY`) or does not say, as an AF_UNIX listener
+  does not, and otherwise waits for the socket first, so a receive whose
+  last buffer went fails with `ENOBUFS` only when more bytes come. Each is
+  prepared as Linux prepares it, which checks its entry
   (`EINVAL`), then reads a connect's or a send's address
   (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a
   buffer in the user half (`EFAULT`). It runs as Linux runs it inline,

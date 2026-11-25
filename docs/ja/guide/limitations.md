@@ -488,9 +488,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
-  `_LINKAT`、`_FTRUNCATE`、それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
-  だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの受け付けと
-  受信、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
+  `_LINKAT`、`_FTRUNCATE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
+  だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
+  `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   `IORING_RECVSEND_FIXED_BUF` を付けた送受信は、差分テストを走らせるカーネルである Linux 7.0 と
   同じく `EINVAL` です。Linux master は登録したバッファーのバイトを動かします。テストを走らせる

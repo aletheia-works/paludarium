@@ -6680,8 +6680,10 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     the host), `TCP_CORK` (which does not), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
     `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read
     only), `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
-    `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
-    `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
+    `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS`, of TCP
+    without its bits of ECN, sets `SO_PRIORITY` from its TOS bits too
+    (`rt_tos2priority`), and takes one byte for an `int` (`do_ip_setsockopt`).
+    `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
     while it is closed or listening). `SO_BINDTODEVICE` takes a device's

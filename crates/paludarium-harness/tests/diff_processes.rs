@@ -424,6 +424,7 @@ mod linux {
                     | "veth-filter"
                     | "veth-broadcast-source"
                     | "mapped-source"
+                    | "ip-options"
                     | "udp-disconnect"
                     | "veth-neigh"
                     | "veth-ipv6"
@@ -678,6 +679,7 @@ mod linux {
         veth_filter => ("veth-filter","veth-filter"),
         veth_broadcast_source => ("veth-broadcast-source","veth-broadcast-source"),
         mapped_source => ("mapped-source","mapped-source"),
+        ip_options => ("ip-options","ip-options"),
         udp_disconnect => ("udp-disconnect","udp-disconnect"),
         veth_neigh => ("veth-neigh","veth-neigh"),
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),

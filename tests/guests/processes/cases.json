@@ -71,6 +71,7 @@
     {"name":"veth-filter","binary":"veth-filter"},
     {"name":"veth-broadcast-source","binary":"veth-broadcast-source"},
     {"name":"mapped-source","binary":"mapped-source"},
+    {"name":"ip-options","binary":"ip-options"},
     {"name":"udp-disconnect","binary":"udp-disconnect"},
     {"name":"veth-neigh","binary":"veth-neigh"},
     {"name":"veth-ipv6","binary":"veth-ipv6"},

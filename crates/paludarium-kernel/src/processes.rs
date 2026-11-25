@@ -259,6 +259,8 @@ pub struct Processes {
     /// What the processes that have been reaped used, which `/proc/stat`
     /// goes on counting, as Linux's per-CPU counts keep a task's time.
     reaped_times: Mutex<crate::proc::CpuTimes>,
+    /// The same of what they counted on each CPU ([`crate::CpuCounts`]).
+    reaped_counts: Mutex<Vec<[u64; 4]>>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -290,6 +292,7 @@ impl Processes {
             bpf_progs: Arc::default(),
             perf_events: crate::perf::Events::default(),
             reaped_times: Mutex::default(),
+            reaped_counts: Mutex::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -378,6 +381,32 @@ impl Processes {
             entry.group.add_cpu_times(&mut times);
         }
         times
+    }
+    /// What every process's threads counted on `cpu`, those reaped included,
+    /// as [`crate::CpuCounts`] orders it.
+    pub(crate) fn counts_on(&self, cpu: u32) -> [u64; 4] {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut counts = self
+            .reaped_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(cpu as usize)
+            .copied()
+            .unwrap_or_default();
+        for used in entries.values().flat_map(|entry| entry.group.usages()) {
+            for (sum, count) in counts.iter_mut().zip(used.counts_on(cpu)) {
+                *sum = sum.saturating_add(count);
+            }
+        }
+        counts
+    }
+    /// The accounts of every process's threads but those reaped.
+    pub(crate) fn usages(&self) -> Vec<Arc<crate::Usage>> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .values()
+            .flat_map(|entry| entry.group.usages())
+            .collect()
     }
     /// The live threads that are running, as `/proc/<pid>/stat` shows them
     /// (`R`): neither asleep in a wait, other than `reader`, which is
@@ -1381,6 +1410,15 @@ impl Processes {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
+        {
+            let mut counts = self
+                .reaped_counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for used in entry.group.usages() {
+                used.add_counts(&mut counts);
+            }
+        }
         // Its tasks are no longer traced (`__ptrace_unlink`).
         self.traces.forget_process(pid);
         entry.space.leave(pid);

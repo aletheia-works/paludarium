@@ -765,6 +765,15 @@ impl ThreadGroup {
             times.add(used);
         }
     }
+    /// The accounts of the process's threads, live or exited.
+    pub(crate) fn usages(&self) -> Vec<Arc<crate::Usage>> {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, used)| Arc::clone(used))
+            .collect()
+    }
     /// The CPU time of thread `tid` now, while it is live (0 before it has
     /// started).
     pub(crate) fn thread_cpu(&self, tid: u32) -> Option<u64> {

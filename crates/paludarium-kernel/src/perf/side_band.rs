@@ -3,8 +3,9 @@
 //! `MMAP2` of a mapping (`perf_event_mmap`), `COMM` of a new name
 //! (`perf_event_comm`), and `FORK` and `EXIT` of a task
 //! (`perf_event_task`). Each goes to the enabled events of the CPU of the
-//! thread that writes it and those that count it (`perf_iterate_sb`), through the buffer that
-//! event writes to, with the `sample_id` of that thread.
+//! thread that writes it and those that count it (`perf_iterate_sb`),
+//! through the buffer that event writes to, with the `sample_id` of that
+//! thread.
 
 use super::sample::{Who, header, put};
 use super::{Event, Events, bit, lock};
@@ -367,8 +368,9 @@ pub(crate) struct Space<'a> {
 }
 
 impl Space<'_> {
-    /// The enabled events that count the thread and want some record of a
-    /// mapping, `None` for none.
+    /// The enabled events of the thread's CPU and those that count it that
+    /// want some record of a mapping, `None` for none or while no event with
+    /// `mmap` or `mmap_data` is open.
     fn receivers(&self, events: &Events) -> Option<Vec<Arc<Event>>> {
         if !maps(events) {
             return None;

@@ -321,7 +321,7 @@ verified.
   switches and CPU migrations are those it last accounted, at its latest
   system call; its CPU time is looked at as the event is read, and its page
   faults count as they are taken. An event of
-  a CPU counts the time that passes, and no faults, switches or migrations.
+  a CPU counts those of every thread there, with the same limits.
   A fault that ends in `SIGSEGV` or `SIGBUS` is not counted, where Linux
   counts it in `page-faults`; a context switch is a sleep of the thread,
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
@@ -344,7 +344,11 @@ verified.
   for samples that take too long (`perf_sample_event_took`), which
   `perf_cpu_time_max_percent` sets the limit of; and no other event is
   throttled, as no other event here is an hrtimer's or the hardware's. An
-  event of a CPU takes no samples. Of the side-band records, an `execve` writes the new program's mappings once it
+  event of a CPU takes a thread's samples as that thread enters a system
+  call or reaches a checkpoint too, so that what it did there after its
+  last one before the event is disabled is counted but has no samples; its
+  `cpu-clock` or `task-clock` samples only the time the guest's threads ran
+  on the CPU, where Linux samples the idle task too. Of the side-band records, an `execve` writes the new program's mappings once it
   has loaded it, the stack's two first and the rest by address: the
   temporary stack's is placed at the top of 4-level user space with the
   length of the arguments' pages, where Linux gives where it was. Linux

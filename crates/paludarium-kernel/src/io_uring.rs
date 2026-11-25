@@ -1902,7 +1902,7 @@ fn complete(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, mut ch
         });
         return;
     }
-    issue_link(c, file, ring, chain);
+    issue_link(c, file, ring, chain, Vec::new());
 }
 
 /// Whether the request before `chain` in its link has a linked timeout
@@ -1916,13 +1916,21 @@ fn has_link_timeout(chain: &[Request]) -> bool {
 /// Runs the first request of a link (`io_issue_sqe`): its completion goes
 /// in the batch, or for an `IORING_NOP_TW` in task work with the
 /// registered files it found; a transfer that would wait waits for its
-/// file ([`arm`]).
+/// file ([`arm`]). `held` is what it held as it waited.
 fn issue_link(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     ring: &Ring,
     mut chain: Vec<Request>,
+    held: Vec<Arc<Node>>,
 ) {
+    // What it held as it waited, it holds still if it waits again.
+    let mark = {
+        let mut state = ring.state();
+        let mark = state.held.len();
+        state.held.extend(held);
+        mark
+    };
     let mut request = chain.remove(0);
     // Its linked timeout starts as it is issued (`__io_prep_linked_timeout`).
     if has_link_timeout(&chain) {
@@ -1934,7 +1942,6 @@ fn issue_link(
         timeout::arm(c, ring, chain);
         return;
     }
-    let mark = ring.state().held.len();
     let (res, flags, failed, waits) = run(c, ring, &mut request.work);
     let split_held = || {
         let mut state = ring.state();
@@ -2628,15 +2635,14 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
             ring.complete(finish(done, flags, failed, rest));
         }
         Deferred::Submit(chain, held) => {
-            ring.state().held.extend(held);
-            issue_link(c, file, ring, chain);
+            issue_link(c, file, ring, chain, held);
         }
         Deferred::Poll { id, chain, held } => {
-            ring.state().held.extend(held);
             if ring.unhash(id) {
+                ring.state().held.extend(held);
                 fail_request(ring, chain, ECANCELED);
             } else {
-                issue_link(c, file, ring, chain);
+                issue_link(c, file, ring, chain, held);
             }
         }
         Deferred::Fail { chain, skip } => fail_rest(ring, chain, skip),

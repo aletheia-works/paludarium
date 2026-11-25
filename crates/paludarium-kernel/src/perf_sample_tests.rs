@@ -587,6 +587,64 @@ fn perf_sample_records_faults_loses_pauses_and_writes_backward() {
 /// overflow, `PERF_EVENT_IOC_REFRESH`, and `sigtrap`'s `SIGTRAP`, taken
 /// and blocked. The child whose event hangs up when it ends stays with the
 /// differential tests.
+/// An event of a CPU counts and samples what any thread does there while it
+/// is enabled, and nothing of another CPU.
+#[test]
+fn an_event_of_a_cpu_counts_and_samples_what_runs_there() {
+    let mut e = Env::new();
+    e.m.write(GuestAddr(ARG), &1u64.to_le_bytes()).unwrap();
+    assert_eq!(e.call(203, [0, 8, ARG, 0, 0, 0]), 0);
+    let mut fds = Vec::new();
+    for cpu in 0..2 {
+        let mut a = Attr::software(2);
+        a.sample_period = 1;
+        a.sample_type = SAMPLE_TID | 1 << 3;
+        a.flags |= DISABLED;
+        e.m.write(GuestAddr(ATTR), &a.bytes()).unwrap();
+        let fd = e.call(PERF_EVENT_OPEN, [ATTR, u64::MAX, cpu, u64::MAX, 0, 0]);
+        assert!(fd >= 0, "{fd}");
+        let page = e.map(fd, 3, PROT_READ | PROT_WRITE);
+        fds.push((fd, page));
+    }
+    // What the thread did before it was enabled is none of its.
+    e.touch(4);
+    let count = |e: &mut Env, fd: i64| {
+        assert_eq!(e.call(READ, [fd as u64, ARG, 8, 0, 0, 0]), 8);
+        e.long(ARG)
+    };
+    for &(fd, _) in &fds {
+        e.ioctl(fd, IOC_ENABLE, 0);
+    }
+    e.touch(5);
+    for &(fd, _) in &fds {
+        e.ioctl(fd, IOC_DISABLE, 0);
+    }
+    e.touch(3);
+    let counts: Vec<u64> = fds.iter().map(|&(fd, _)| count(&mut e, fd)).collect();
+    assert_eq!(counts, [5, 0]);
+    let samples = |e: &Env, page: i64| {
+        (0..e.head(page) / 24)
+            .map(|i| e.record(page, 8192, i * 24, 3))
+            .collect::<Vec<_>>()
+    };
+    let (_, here) = fds[0];
+    let seen = samples(&e, here);
+    assert_eq!(seen.len(), 5);
+    for (i, sample) in seen.iter().enumerate() {
+        assert_eq!(sample[0] as u32, RECORD_SAMPLE);
+        assert_eq!(sample[1], 1 | 1 << 32);
+        assert_eq!(sample[2], seen[0][2] + i as u64 * 4096);
+    }
+    assert!(samples(&e, fds[1].1).is_empty());
+    // Enabled again, it takes only what comes then; a reaped process's
+    // counts stay the CPU's.
+    e.ioctl(fds[0].0, IOC_ENABLE, 0);
+    e.touch(2);
+    e.ioctl(fds[0].0, IOC_DISABLE, 0);
+    assert_eq!(count(&mut e, fds[0].0), 7);
+    assert_eq!(samples(&e, here).len(), 7);
+}
+
 #[test]
 fn perf_wakeup_polls_signals_refreshes_and_traps() {
     let mut e = Env::new();

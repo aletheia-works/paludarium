@@ -66,6 +66,33 @@ pub(super) struct Sent {
     pub(super) ttl: u8,
 }
 
+/// What a SYN, or the SYN-ACK that acknowledges it, goes with: its sequence
+/// number, what it acknowledges, its timestamp and the one it echoes.
+#[derive(Clone, Copy)]
+pub(super) struct Shake {
+    seq: u32,
+    ack: Option<u32>,
+    stamps: (u32, u32),
+}
+impl Shake {
+    /// A SYN at `now`, in microseconds.
+    pub(super) fn syn(names: &Names, now: u64) -> Self {
+        Self {
+            seq: names.first[0],
+            ack: None,
+            stamps: (names.stamp(0, now), 0),
+        }
+    }
+    /// The SYN-ACK at `now`, in microseconds, of a SYN that went at `echo`.
+    pub(super) fn answer(names: &Names, now: u64, echo: u64) -> Self {
+        Self {
+            seq: names.first[1],
+            ack: Some(names.first[0].wrapping_add(1)),
+            stamps: (names.stamp(1, now), names.stamp(0, echo)),
+        }
+    }
+}
+
 /// How a datagram comes to a socket.
 #[derive(Clone, Copy)]
 pub(super) enum Way {
@@ -147,15 +174,17 @@ impl Sent {
     /// Runs the listener's `filter` on the SYN of a connection to it that
     /// came `way`, with a receive window of `window` bytes and an MSS of
     /// `mss`: whether the filter keeps it (`tcp_filter` in `tcp_v4_rcv`
-    /// and `tcp_v6_rcv`, before `tcp_v4_do_rcv` takes it).
+    /// and `tcp_v6_rcv`, before `tcp_v4_do_rcv` takes it). Or the
+    /// client's on the SYN-ACK, as `shake` says.
     pub(super) fn syn_kept(
         &self,
         filter: &Filter,
         way: Way,
         window: (u16, u16, u8),
+        shake: Shake,
         host: &Arc<dyn paludarium_host::Host>,
     ) -> bool {
-        let data = self.syn(window, host);
+        let data = self.syn(window, shake);
         let len = data.len();
         self.run(filter, &data, (TCP, len, true), (len, (1, 0)), way, host)
             .is_some()
@@ -282,34 +311,28 @@ impl Sent {
         }
     }
 
-    /// A connection's SYN (`tcp_connect`): a random first sequence number,
-    /// the window `window`, unscaled, and `tcp_syn_options`' options in
-    /// `tcp_options_write`'s order, MSS `mss`, SACK permitted with the
-    /// timestamps (a random first value, and 0), and the window scale
-    /// `wscale`.
+    /// A connection's SYN (`tcp_connect`) or SYN-ACK
+    /// (`tcp_make_synack`): the first sequence number, the window `window`,
+    /// unscaled, and `tcp_syn_options`' options in `tcp_options_write`'s
+    /// order, MSS `mss`, SACK permitted with the timestamps, and the window
+    /// scale `wscale`.
     /// Its checksum is the pseudo-header's (`CHECKSUM_PARTIAL`,
     /// `__tcp_v4_send_check`).
-    fn syn(
-        &self,
-        (window, mss, wscale): (u16, u16, u8),
-        host: &Arc<dyn paludarium_host::Host>,
-    ) -> Vec<u8> {
-        let mut random = [0; 8];
-        let _ = host.random_bytes(&mut random);
+    fn syn(&self, (window, mss, wscale): (u16, u16, u8), shake: Shake) -> Vec<u8> {
         let mut h = Vec::with_capacity(40);
         h.extend(self.from.port().to_be_bytes());
         h.extend(self.to.port().to_be_bytes());
-        h.extend(&random[..4]);
-        h.extend([0, 0, 0, 0]);
-        // 40 bytes (`doff` 10), and SYN.
-        h.extend([0xa0, 0x02]);
+        h.extend(shake.seq.to_be_bytes());
+        h.extend(shake.ack.unwrap_or(0).to_be_bytes());
+        // 40 bytes (`doff` 10), and SYN, with ACK in the answer.
+        h.extend([0xa0, if shake.ack.is_some() { 0x12 } else { 0x02 }]);
         h.extend(window.to_be_bytes());
         h.extend([0, 0, 0, 0]);
         h.extend([2, 4]);
         h.extend(mss.to_be_bytes());
         h.extend([4, 2, 8, 10]);
-        h.extend(&random[4..]);
-        h.extend([0, 0, 0, 0]);
+        h.extend(shake.stamps.0.to_be_bytes());
+        h.extend(shake.stamps.1.to_be_bytes());
         h.extend([1, 3, 3, wscale]);
         let check = fold(self.pseudo(TCP, h.len()));
         h[16..18].copy_from_slice(&check.to_be_bytes());
@@ -362,6 +385,8 @@ pub(super) struct Listening {
     pub(super) stream: Weak<Stream>,
     pub(super) link: Weak<Link>,
     pub(super) wscale: u8,
+    /// The window, MSS and window scale of a SYN-ACK.
+    pub(super) syn: (u16, u16, u8),
     pub(super) names: Names,
     pub(super) id: AtomicU16,
     pub(super) host: Arc<dyn paludarium_host::Host>,
@@ -369,7 +394,12 @@ pub(super) struct Listening {
 
 impl Tap for Listening {
     fn keep(&self, segment: &Segment<'_>) -> Option<u32> {
-        let mut data = self.header(segment);
+        let mut data = if segment.syn {
+            let shake = Shake::answer(&self.names, segment.at, segment.echo);
+            self.sent.syn(self.syn, shake)
+        } else {
+            self.header(segment)
+        };
         let header = data.len();
         self.payload(segment, &mut data);
         let segments = match segment {
@@ -444,11 +474,8 @@ impl Listening {
         h.extend(urgent.unwrap_or(0).to_be_bytes());
         if !bare {
             h.extend([1, 1, 8, 10]);
-            // Milliseconds, each side's from an offset of its own.
-            let stamp =
-                |side: usize, at: u64| self.names.stamps[side].wrapping_add((at / 1000) as u32);
-            h.extend(stamp(from, segment.at).to_be_bytes());
-            h.extend(stamp(to, segment.echo).to_be_bytes());
+            h.extend(self.names.stamp(from, segment.at).to_be_bytes());
+            h.extend(self.names.stamp(to, segment.echo).to_be_bytes());
             if !segment.sacks.is_empty() {
                 h.extend([1, 1, 5, 2 + 8 * segment.sacks.len() as u8]);
                 for &(start, end) in segment.sacks {

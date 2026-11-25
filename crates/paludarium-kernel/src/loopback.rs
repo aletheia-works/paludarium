@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 pub(crate) mod segments;
-use segments::{Counts, Flows, Push, Tap, Verdict};
+use segments::{Counts, Flows, Push, Request, Tap, Verdict};
 
 const EADDRINUSE: Errno = Errno(98);
 const ECONNRESET: Errno = Errno(104);
@@ -84,11 +84,20 @@ pub(crate) struct Link {
     /// each side's, once a filter looks.
     streams: [Weak<Stream>; 2],
     names: OnceLock<Names>,
+    /// Whether it is a request of its listener's ([`Request`]): 0 for never,
+    /// else [`REQUEST`], [`DROPPED`] or, opened, its place in the order
+    /// requests opened in, from [`FIRST`] on; and what tells the listener.
+    request: AtomicU64,
+    opens: OnceLock<Notify>,
     senders: [Mutex<Sender>; 2],
     /// When its timers are next to be run, changed with `flows` locked.
     armed: AtomicU64,
     deadlines: Arc<Deadlines>,
 }
+/// [`Link::request`]'s values.
+const REQUEST: u64 = 1;
+const DROPPED: u64 = 2;
+const FIRST: u64 = 3;
 /// What a connection's segments count from: each side's initial sequence
 /// number and timestamp offset.
 #[derive(Clone, Copy, Debug, Default)]
@@ -103,6 +112,27 @@ pub(crate) struct Sender {
     pub(crate) priority: u32,
     pub(crate) tos: u8,
     pub(crate) ids: (u32, u32),
+}
+impl Names {
+    /// Random ones, from `host`.
+    pub(crate) fn new(host: &Arc<dyn paludarium_host::Host>) -> Self {
+        let mut random = [0; 16];
+        let _ = host.random_bytes(&mut random);
+        let mut words = [0; 4];
+        for (word, bytes) in words.iter_mut().zip(random.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
+        }
+        let [a, b, c, d] = words;
+        Self {
+            first: [a, b],
+            stamps: [c, d],
+        }
+    }
+    /// `side`'s timestamp at `micros`: milliseconds, each side's from an
+    /// offset of its own.
+    pub(crate) fn stamp(&self, side: usize, micros: u64) -> u32 {
+        self.stamps[side].wrapping_add((micros / 1000) as u32)
+    }
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -122,7 +152,7 @@ impl Link {
         (client_local, server_local): (SocketAddr, SocketAddr),
         (host, deadlines): (&Arc<dyn paludarium_host::Host>, &Arc<Deadlines>),
         notify: [Notify; 2],
-        mtu: usize,
+        (mtu, names): (usize, Option<Names>),
     ) -> Arc<Self> {
         let now = host.clock(paludarium_host::ClockId::Monotonic).ok();
         let link = Arc::new_cyclic(|this| Self {
@@ -141,7 +171,9 @@ impl Link {
             )),
             this: Weak::clone(this),
             streams: [Arc::downgrade(client), Arc::downgrade(server)],
-            names: OnceLock::new(),
+            names: names.map_or_else(OnceLock::new, OnceLock::from),
+            request: AtomicU64::new(0),
+            opens: OnceLock::new(),
             senders: Default::default(),
             armed: AtomicU64::new(NEVER),
             deadlines: Arc::clone(deadlines),
@@ -344,8 +376,23 @@ impl Link {
         self.arm(&flows);
         heard
     }
-    /// Sets when the connection's timers are next to be run.
+    /// Sets when the connection's timers are next to be run, and tells of a
+    /// request that has opened or been dropped.
     fn arm(&self, flows: &Flows) {
+        if self.request.load(Ordering::SeqCst) == REQUEST {
+            static ORDER: AtomicU64 = AtomicU64::new(FIRST);
+            match flows.request() {
+                Request::Never | Request::Waits { .. } => {}
+                Request::Dropped => self.request.store(DROPPED, Ordering::SeqCst),
+                Request::Opened => {
+                    let place = ORDER.fetch_add(1, Ordering::SeqCst);
+                    self.request.store(place, Ordering::SeqCst);
+                    if let Some(opens) = self.opens.get() {
+                        opens();
+                    }
+                }
+            }
+        }
         let at = flows.wake().map_or(NEVER, |at| at.saturating_mul(1000));
         let old = self.armed.swap(at, Ordering::SeqCst);
         if old != at {
@@ -413,6 +460,40 @@ impl Link {
     pub(crate) fn set_user_timeout(&self, side: usize, ms: u32) {
         self.with_flows(|flows, now| flows.set_user_timeout(side, ms, now));
     }
+    /// Ends the handshake, with the server's filter its listener's: whether
+    /// the connection is open at once. Else it is a request, and `opens`
+    /// tells when it has opened.
+    pub(crate) fn handshake(&self, opens: Notify) -> bool {
+        let _ = self.opens.set(opens);
+        let mut flows = self.flows();
+        flows.handshake(self.micros());
+        let waits = flows.request() != Request::Never;
+        if waits {
+            self.request.store(REQUEST, Ordering::SeqCst);
+        }
+        self.arm(&flows);
+        !waits
+    }
+    /// Whether it is a request still, and once opened its place among them.
+    pub(crate) fn requested(&self) -> (bool, Option<u64>) {
+        let request = self.request.load(Ordering::SeqCst);
+        (request == REQUEST, (request >= FIRST).then_some(request))
+    }
+    /// When a request's SYN-ACK next goes again, on the host's monotonic
+    /// clock, and how often it has.
+    pub(crate) fn waits(&self) -> Option<(u64, u32)> {
+        match self.flows().request() {
+            Request::Waits { at, tries } => Some((at.saturating_mul(1000), tries)),
+            _ => None,
+        }
+    }
+    /// The listener of a request has closed.
+    pub(crate) fn forget(&self) {
+        let mut flows = self.flows();
+        flows.forget(true);
+        self.first.store(RESET, Ordering::SeqCst);
+        self.arm(&flows);
+    }
     /// What `side`'s segments go with from now on.
     pub(crate) fn set_sender(&self, side: usize, sender: Sender) {
         *self.senders[side]
@@ -432,17 +513,7 @@ impl Link {
         make: Option<impl FnOnce(Weak<Stream>, Weak<Link>, Names) -> Arc<dyn Tap>>,
     ) {
         let tap = make.map(|make| {
-            let names = *self.names.get_or_init(|| {
-                let mut random = [0; 16];
-                let _ = self.host.random_bytes(&mut random);
-                let word = |at: usize| {
-                    u32::from_le_bytes([random[at], random[at + 1], random[at + 2], random[at + 3]])
-                };
-                Names {
-                    first: [word(0), word(4)],
-                    stamps: [word(8), word(12)],
-                }
-            });
+            let names = *self.names.get_or_init(|| Names::new(&self.host));
             let sender = Weak::clone(&self.streams[1 - side]);
             make(sender, Weak::clone(&self.this), names)
         });

@@ -1609,6 +1609,25 @@ fn a_dropped_handshake_is_tried_again_until_it_times_out() {
     assert_eq!(f.ret(3, [closed, 0, 0, 0, 0, 0]), 0);
     assert_eq!(readable(&mut f, listener), 1);
     assert_eq!(syns(&f), 0);
+    // The tries run at their times though no one looks at a socket.
+    let deadlines = Arc::clone(&f.kernel.files.readiness.deadlines);
+    let alone = nonblocking(&mut f, port);
+    assert_eq!(deadlines.next(), Some(8 * SECOND));
+    deadlines.run(|| Some(8 * SECOND - 1));
+    assert_eq!(deadlines.next(), Some(8 * SECOND));
+    at(&mut f, 8);
+    deadlines.run(|| Some(8 * SECOND));
+    assert_eq!((syns(&f), deadlines.next()), (1, Some(9 * SECOND)));
+    assert_eq!(f.ret(3, [alone, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(syns(&f), 0);
+    // A late run makes every try due by then.
+    at(&mut f, 7);
+    let late = nonblocking(&mut f, port);
+    at(&mut f, 9);
+    deadlines.run(|| Some(9 * SECOND));
+    assert_eq!((syns(&f), deadlines.next()), (1, Some(10 * SECOND)));
+    assert_eq!(f.ret(3, [late, 0, 0, 0, 0, 0]), 0);
+    at(&mut f, 7);
     // Never given room, it gives up at 131 seconds with ETIMEDOUT.
     let given_up = nonblocking(&mut f, port);
     at(&mut f, 7 + 130);

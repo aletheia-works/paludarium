@@ -5863,6 +5863,18 @@ kernel.
   40; a SYN sent again is the connecting socket's, with its options. An accepted socket
   takes the listener's filter and its lock, as `sk_clone_lock` copies
   them.
+  - The SYN-ACK that answers is the client's filter's to keep: dropped, the
+    client goes on trying. The connection goes on from the sequence numbers
+    and timestamps of the two.
+  - The handshake's last acknowledgement is the listener's again. Dropped,
+    the client is connected and the listener has a request (`SYN_RECV` to
+    `sock_diag`), with nothing to accept: the SYN-ACK goes again after 1
+    second, then 2, 4, 8 and 16 more, and the client answers it
+    (`tcp_send_challenge_ack`). The first segment that the listener's filter
+    of that time keeps, data and an end too, opens the connection, which is
+    accepted in that order; a reset drops the request, as 63 seconds do.
+    What comes after that, or after the listener has closed, is answered
+    with a reset.
 
 - On a TCP connection on the loopback or across a veth pair, the filter
   runs on each segment that comes to its socket, data, acknowledgements,

@@ -753,6 +753,249 @@ static void lost(int l, int port) {
         }
     }
 }
+/* tcp-handshake: filters on a handshake's last acknowledgement, which its
+   listener's filter sees, and on its SYN-ACK, which the client's sees. */
+static struct sock_filter loss_synack[] = {{BPF_LD | BPF_B | BPF_ABS, 0, 0, 13}, {BPF_JMP | BPF_JSET | BPF_K, 0, 1, 2},
+                                           LOSS_DROP, LOSS_KEEP};
+/* A bare acknowledgement; all but a SYN. */
+static struct sock_filter loss_bare[] = {{BPF_LD | BPF_B | BPF_ABS, 0, 0, 13}, {BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0x10},
+                                         LOSS_DROP, LOSS_KEEP};
+static struct sock_filter loss_late[] = {{BPF_LD | BPF_B | BPF_ABS, 0, 0, 13}, {BPF_JMP | BPF_JSET | BPF_K, 1, 0, 2},
+                                         LOSS_DROP, LOSS_KEEP};
+static int loss_accept(int l) {
+    int s = accept4(l, NULL, NULL, SOCK_NONBLOCK);
+    loss_say("  accept=%d errno=%d\n", s >= 0 ? 0 : -1, s >= 0 ? 0 : errno);
+    return s;
+}
+/* Both sides, once `in` segments have come to the client, and not yet one
+   more, as a SYN-ACK that went again is. */
+static void shake_both(int c, int s, unsigned in) {
+    loss_wait(c, 140, in);
+    static const int sent[] = {24, 80, 100, 136, 140, 156, 192, -120, -200, 0};
+    static const int came[] = {100, 136, 140, 152, 192, -128, 0};
+    loss_info("client", c, sent);
+    if (s >= 0) loss_info("server", s, came);
+    loss_again |= loss_word(c, 140) != in;
+}
+/* What `sock_diag` tells of the requests (`TCP_SYN_RECV`) of `port`. */
+static void shake_requests(int port) {
+    struct {
+        unsigned len;
+        unsigned short type, flags;
+        unsigned seq, pid;
+        unsigned char family, protocol, ext, pad;
+        unsigned states, id[12];
+    } ask = {sizeof ask, 20 /* SOCK_DIAG_BY_FAMILY */, 0x301 /* NLM_F_REQUEST | NLM_F_DUMP */, 1, 0, AF_INET,
+             IPPROTO_TCP, 0, 0, 1 << 3, {0}};
+    int fd = socket(16 /* AF_NETLINK */, SOCK_RAW, 4 /* NETLINK_SOCK_DIAG */), found = 0;
+    if (send(fd, &ask, sizeof ask, 0) != sizeof ask) loss_say("  diag errno=%d\n", errno);
+    for (int done = 0; !done;) {
+        static unsigned char in[16384] __attribute__((aligned(8)));
+        int got = recv(fd, in, sizeof in, 0);
+        if (got <= 0) break;
+        for (int at = 0; at + 16 <= got;) {
+            unsigned *header = (unsigned *)(in + at), *tail = header + 4 + 13;
+            unsigned char *body = in + at + 16;
+            unsigned short type = header[1] & 0xffff;
+            if (type != 20) {
+                done = 1;
+                break;
+            }
+            if ((body[4] << 8 | body[5]) == port) {
+                found++;
+                loss_say("  request state=%d timer=%d retrans=%d expires=%d queues=%u,%u uid=%u inode=%u\n", body[1], body[2],
+                         body[3], (int)tail[0] > 0 && (int)tail[0] <= (1000 << body[3]) + 20, tail[1], tail[2], tail[3],
+                         tail[4]);
+            }
+            at += (header[0] + 3) & ~3u;
+        }
+    }
+    close(fd);
+    loss_say("  requests=%d\n", found);
+}
+static void shake_step(int step, int l, int port) {
+    int result, c, s;
+    switch (step) {
+    case 0:
+        /* Connected for the client alone, until data comes. */
+        LOSS(l, loss_bare);
+        c = fresh_client(port, &result);
+        loss_say("  connect=%d\n", result);
+        loss_accept(l);
+        shake_both(c, -1, 1);
+        loss_send(c, 'A', 5);
+        loss_wait(c, UNACKED, 0);
+        s = loss_accept(l);
+        shake_both(c, s, 2);
+        loss_read(s, 0, 0);
+        close(s);
+        close(c);
+        break;
+    case 1:
+        /* The SYN-ACK goes again, and its answer is dropped too; lifted,
+           the next one's is not. */
+        LOSS(l, loss_bare);
+        c = fresh_client(port, &result);
+        loss_wait(c, 140, 2);
+        loss_accept(l);
+        shake_both(c, -1, 2);
+        loss_lift(l);
+        loss_again |= loss_word(c, 140) != 2;
+        loss_poll(l, POLLIN);
+        s = loss_accept(l);
+        loss_wait(s, 140, 2);
+        shake_both(c, s, 3);
+        loss_send(c, 'A', 5);
+        loss_wait(s, RECEIVED, 5);
+        loss_wait(c, UNACKED, 0);
+        shake_both(c, s, 4);
+        close(s);
+        close(c);
+        break;
+    case 2:
+        /* An end opens it too. */
+        LOSS(l, loss_bare);
+        c = fresh_client(port, &result);
+        loss_accept(l);
+        shutdown(c, SHUT_WR);
+        loss_wait(c, UNACKED, 0);
+        s = loss_accept(l);
+        loss_read(s, 0, 0);
+        shake_both(c, s, 2);
+        close(s);
+        close(c);
+        break;
+    case 3: {
+        /* A reset drops the request: there is nothing to accept. */
+        struct linger now = {1, 0};
+        LOSS(l, loss_bare);
+        c = fresh_client(port, &result);
+        setsockopt(c, SOL_SOCKET, SO_LINGER, &now, sizeof now);
+        close(c);
+        loss_lift(l);
+        /* A connection after it is the first. */
+        c = fresh_client(port, &result);
+        loss_poll(l, POLLIN);
+        s = loss_accept(l);
+        loss_accept(l);
+        loss_send(c, 'B', 5);
+        loss_wait(s, RECEIVED, 5);
+        loss_read(s, 0, 0);
+        close(s);
+        close(c);
+        break;
+    }
+    case 4: {
+        /* Data the listener's filter drops opens nothing, and goes again. */
+        LOSS(l, loss_late);
+        c = fresh_client(port, &result);
+        loss_say("  connect=%d\n", result);
+        loss_send(c, 'A', 5);
+        loss_wait(c, TOTAL, 1);
+        loss_accept(l);
+        loss_lift(l);
+        loss_poll(l, POLLIN);
+        s = loss_accept(l);
+        /* What opened it, the data or the answer to a SYN-ACK that went
+           again, depends on when. */
+        loss_wait(s, RECEIVED, 5);
+        loss_say("  data segments=%u\n", loss_word(s, 152));
+        loss_read(s, 0, 0);
+        close(s);
+        close(c);
+        break;
+    }
+    case 5: {
+        /* The listener gone, what comes is answered with a reset. */
+        int port2, other = fresh_listener(&port2);
+        LOSS(other, loss_late);
+        c = fresh_client(port2, &result);
+        close(other);
+        loss_send(c, 'A', 5);
+        loss_poll(c, 0);
+        loss_error(c);
+        close(c);
+        break;
+    }
+    case 6: {
+        /* The SYN-ACK dropped: the client goes on trying. */
+        struct sockaddr_in a = fresh_to(port);
+        c = tcp(SOCK_NONBLOCK);
+        LOSS(c, loss_synack);
+        loss_say("  connect=%d", connect(c, (void *)&a, sizeof a));
+        loss_say(" errno=%d\n", errno);
+        loss_wait(c, TOTAL, 1);
+        loss_accept(l);
+        loss_lift(c);
+        loss_poll(c, POLLOUT);
+        loss_error(c);
+        loss_poll(l, POLLIN);
+        s = loss_accept(l);
+        loss_send(c, 'A', 5);
+        loss_wait(s, RECEIVED, 5);
+        loss_read(s, 0, 0);
+        close(s);
+        close(c);
+        break;
+    }
+    case 7:
+        /* The request, before and after its SYN-ACK goes again. */
+        LOSS(l, loss_bare);
+        c = fresh_client(port, &result);
+        shake_requests(port);
+        loss_again |= loss_word(c, 140) != 1;
+        loss_wait(c, 140, 2);
+        shake_requests(port);
+        loss_again |= loss_word(c, 140) != 2;
+        loss_lift(l);
+        loss_poll(l, POLLIN);
+        shake_requests(port);
+        s = loss_accept(l);
+        close(s);
+        close(c);
+        break;
+    case 8: {
+        /* A thread in accept is all that waits for the SYN-ACK to go again,
+           and then for a SYN that does. */
+        struct timeval most = {10, 0};
+        setsockopt(l, SOL_SOCKET, SO_RCVTIMEO, &most, sizeof most);
+        fcntl(l, F_SETFL, 0);
+        LOSS(l, loss_bare);
+        c = fresh_client(port, &result);
+        loss_lift(l);
+        s = accept(l, NULL, NULL);
+        loss_say("  connect=%d accept=%d\n", result, s >= 0);
+        close(s);
+        close(c);
+        struct sockaddr_in a = fresh_to(port);
+        c = tcp(SOCK_NONBLOCK);
+        LOSS(c, loss_synack);
+        loss_say("  connect=%d", connect(c, (void *)&a, sizeof a));
+        loss_say(" errno=%d\n", errno);
+        loss_lift(c);
+        s = accept(l, NULL, NULL);
+        loss_say("  accept=%d\n", s >= 0);
+        close(s);
+        close(c);
+        break;
+    }
+    }
+}
+static void shaken(void) {
+    for (int step = 0; step < 9; step++) {
+        for (int tries = 0; tries < 50; tries++) {
+            int port, l = fresh_listener(&port);
+            fcntl(l, F_SETFL, O_NONBLOCK);
+            loss_len = loss_again = 0;
+            loss_start = clock_ms(CLOCK_MONOTONIC);
+            shake_step(step, l, port);
+            close(l);
+            if (loss_again && tries < 49) continue;
+            printf(" step %d%s\n%s", step, loss_again ? " given up" : "", loss_out);
+            break;
+        }
+    }
+}
 /* TCP_CORK: parts of a segment wait until it is cleared, 200 ms pass, the
    end comes or TCP_NODELAY is set. A step the machine took too long for is
    done again. */
@@ -1709,6 +1952,10 @@ int main(int argc, char **argv) {
         close(small);
         close(l);
         close(u);
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-handshake")) {
+        shaken();
         return 0;
     }
     if (!strcmp(mode, "tcp-loss")) {

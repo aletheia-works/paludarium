@@ -213,6 +213,10 @@ mod linux {
         case("tcp-loss");
     }
     #[test]
+    fn network_tcp_handshake() {
+        case("tcp-handshake");
+    }
+    #[test]
     fn network_listen_errors() {
         case("listen-errors");
     }

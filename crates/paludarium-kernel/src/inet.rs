@@ -11,6 +11,7 @@
 //! On the guest's own loopback a TCP socket also binds, listens and accepts
 //! ([`crate::loopback`]): a connection to a loopback address where a guest
 //! socket listens reaches it in the kernel, whatever the policy allows.
+use crate::deadlines::{Due, NEVER};
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::interface::Flow6;
@@ -1778,6 +1779,9 @@ struct State {
     /// gives too and a disconnect keeps.
     ip_id: u16,
     txhash: u32,
+    /// A connection's first sequence numbers and timestamps, once a filter
+    /// may look at its handshake.
+    names: Option<crate::loopback::Names>,
 }
 
 /// What a TCP connection has carried, for `tcp_info`: from its handshake's
@@ -1855,6 +1859,9 @@ struct Listen {
     arrivals: u64,
     /// The handshakes a full queue dropped (`tcp_listendrop`).
     drops: u32,
+    /// The handshakes whose last acknowledgement the listener's filter has
+    /// dropped so far, and those since opened that no one has looked at.
+    requests: Vec<Arc<InetSocket>>,
 }
 /// A loopback connection whose handshake found the listener's queue full,
 /// which Linux drops (`tcp_conn_request`): the client sends it again at
@@ -1969,15 +1976,48 @@ impl Listen {
             ready: VecDeque::new(),
             arrivals: 0,
             drops: 0,
+            requests: Vec::new(),
         }
     }
     fn has_room(&self) -> bool {
-        self.ready.len() <= self.backlog
+        self.waiting() <= self.backlog
+    }
+    /// The requests that have opened.
+    fn opened(&self) -> usize {
+        let opened = |child: &&Arc<InetSocket>| child.requested().1.is_some();
+        self.requests.iter().filter(opened).count()
+    }
+    /// The connections that wait to be accepted.
+    fn waiting(&self) -> usize {
+        self.ready.len() + self.opened()
+    }
+    /// Puts the requests that have opened in the queue, in order, and forgets
+    /// those that were dropped.
+    fn settle(&mut self) {
+        if self.requests.is_empty() {
+            return;
+        }
+        let mut opened: Vec<(u64, Arc<InetSocket>)> = Vec::new();
+        self.requests.retain(|child| {
+            let (waits, place) = child.requested();
+            opened.extend(place.map(|place| (place, Arc::clone(child))));
+            waits
+        });
+        opened.sort_by_key(|(place, _)| *place);
+        self.arrivals += opened.len() as u64;
+        self.ready
+            .extend(opened.into_iter().map(|(_, child)| child));
     }
     /// Ends listening, as Linux's `inet_csk_listen_stop`: each connection
     /// not yet accepted is reset. One whose handshake was dropped learns at
     /// its next try.
     fn stop(self) {
+        for child in self.requests {
+            match child.requested() {
+                (_, Some(_)) => child.abort(),
+                _ => child.forget(),
+            }
+        }
         for child in self.ready {
             child.abort();
         }
@@ -2613,7 +2653,7 @@ impl InetSocket {
         };
         let mut options = *self.options();
         let wait = crate::sockets::wait_for(c, self.timeout(false))?;
-        self.retry_syns();
+        self.settle();
         let stream = {
             let mut s = self.lock();
             s.note();
@@ -2749,7 +2789,7 @@ impl InetSocket {
         };
         loop {
             let ticket = c.files.readiness.token.value();
-            self.retry_syns();
+            self.settle();
             match stream.phase() {
                 Phase::Open => {
                     self.lock().connection = Connection::Connected;
@@ -3748,7 +3788,7 @@ impl InetSocket {
         let backlog = (backlog as u32).min(SOMAXCONN) as usize;
         let options = *self.options();
         // Tries due before this listener began meet what was there.
-        self.retry_syns();
+        self.settle();
         let mut s = self.lock();
         if s.stream.is_some() {
             return Err(Errno::EINVAL);
@@ -3781,12 +3821,13 @@ impl InetSocket {
         let wait = crate::sockets::wait_for(c, self.timeout(true))?;
         loop {
             let ticket = c.files.readiness.token.value();
-            self.retry_syns();
+            self.settle();
             let child = {
                 let mut s = self.lock();
                 let Some(listen) = s.listen.as_mut() else {
                     return Err(Errno::EINVAL);
                 };
+                listen.settle();
                 listen
                     .ready
                     .pop_front()
@@ -3808,7 +3849,7 @@ impl InetSocket {
     /// order of their tries: each reaches the listener at its address then,
     /// is dropped again while its queue is full, and is refused where none
     /// listens; after the last try the client gives up with `ETIMEDOUT`.
-    /// Called with no socket's state locked.
+    /// Run at their times ([`Due`]), with no socket's state locked.
     fn retry_syns(&self) {
         let Some(now) = self.now() else { return };
         let failing: Vec<(Weak<Stream>, u64, Errno)> = self
@@ -3888,13 +3929,28 @@ impl InetSocket {
             }
         }
         if !syns.is_empty() {
+            let clients: Vec<_> = syns
+                .iter()
+                .filter_map(|syn| Some((syn.client.upgrade()?, syn.next())))
+                .collect();
             let mut kept = self
                 .network
                 .syns
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             kept.extend(syns);
+            for (client, at) in &clients {
+                client.try_at(*at);
+            }
+            drop(kept);
         }
+    }
+    /// Its connection's next try, or failure, is at `at`. Called with the
+    /// lock held of where that is kept.
+    fn try_at(&self, at: u64) {
+        let this = Weak::clone(&self.this) as Weak<dyn Due>;
+        let id = core::ptr::from_ref(self).addr();
+        self.hub.deadlines.set(id, (NEVER, at), &this);
     }
     /// A handshake from `stream` at `from` to `to` on the loopback, or out
     /// through a veth end to the namespace `there`: the listener there
@@ -3916,14 +3972,22 @@ impl InetSocket {
         // (`sk_rethink_txhash`).
         let kept = client.is_none_or(|client| {
             let options = *client.options();
-            let hash = {
+            let (hash, names) = {
                 let mut s = client.lock();
                 s.txhash = u32::from_le_bytes(client.random()).max(1);
-                s.txhash
+                let filtered = s.filtering.filter.is_some();
+                (s.txhash, client.names(&mut s, &listener, filtered))
             };
-            client.syn_kept(&listener, there, (from, to, veth), &options, hash)
+            client.syn_kept(&listener, there, (from, to, veth), &options, (hash, names))
         });
         let theirs = *listener.options();
+        // The client's filter may drop the answer, which then comes again
+        // with its next try.
+        let (answered, names) = client.map_or((true, None), |client| {
+            let s = client.lock();
+            let answered = client.answer_kept(&s, (from, to), theirs.receive_buffer);
+            (answered, s.names)
+        });
         let mut state = listener.lock();
         let locked = state.port_locked;
         let filtering = state.filtering.clone();
@@ -3936,14 +4000,28 @@ impl InetSocket {
             listen.drops += 1;
             return Knock::Full;
         }
-        let child = listener.child((theirs, locked, filtering), stream, link, (from, to, dif));
-        listen.ready.push_back(child);
-        listen.arrivals += 1;
+        if !answered {
+            return Knock::Full;
+        }
+        let (child, open) = listener.child(
+            (theirs, locked, filtering),
+            stream,
+            link,
+            (from, to, dif, names),
+        );
+        if open {
+            listen.ready.push_back(child);
+            listen.arrivals += 1;
+        } else {
+            listen.requests.push(child);
+        }
         drop(state);
         if let Some(client) = client {
             client.opened();
         }
-        listener.arrived();
+        if open {
+            listener.arrived();
+        }
         Knock::Taken
     }
     /// A connection came to this listener: `POLL_IN` and a wake, as
@@ -3965,8 +4043,8 @@ impl InetSocket {
         (mut options, locked, filtering): (Options, bool, crate::sockets::FilterSlot),
         stream: &Arc<Stream>,
         (link, notify): (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
-        (from, to, dif): (SocketAddr, SocketAddr, u32),
-    ) -> Arc<InetSocket> {
+        (from, to, dif, names): (SocketAddr, SocketAddr, u32, Option<crate::loopback::Names>),
+    ) -> (Arc<InetSocket>, bool) {
         // `tcp_v4_syn_recv_sock`: the hops the handshake's last segment had.
         if plain(from.ip()).is_ipv4() {
             options.multicast4 = (dif, Ipv4Addr::UNSPECIFIED);
@@ -4000,7 +4078,7 @@ impl InetSocket {
             (from, to),
             (&self.host, &self.hub.deadlines),
             [Arc::clone(notify), child.urgent_notify()],
-            mtu,
+            (mtu, names),
         );
         let _ = link.set(Arc::clone(&joined));
         if options.user_timeout > 0 {
@@ -4008,7 +4086,7 @@ impl InetSocket {
         }
         joined.set_sender(1, self.sender(&options));
         let own_link = Arc::new(OnceLock::new());
-        let _ = own_link.set(joined);
+        let _ = own_link.set(Arc::clone(&joined));
         self.ports().hold(Binding {
             locked,
             link: Some((Arc::clone(&own_link), 1)),
@@ -4024,17 +4102,37 @@ impl InetSocket {
         // `sk_clone_lock` copies the listener's filter, which it charges
         // again (`sk_filter_charge`), and its lock (`SOCK_FILTER_LOCKED`).
         s.filtering = crate::sockets::FilterSlot {
-            filter: filtering.filter.map(|f| crate::sockets::Filter {
-                socket: crate::bpf_prog::FilterSocket::Inet(Weak::clone(&child.this)),
-                ..f
-            }),
+            filter: filtering.filter.map(|f| child.own_filter(f)),
             locked: filtering.locked,
         };
-        if s.filtering.filter.is_some() {
+        // The listener's filter sees the handshake's last acknowledgement.
+        let filtered = s.filtering.filter.is_some();
+        if filtered {
             child.tapped(&options, &s);
         }
         drop(s);
-        child
+        let open = !filtered || joined.handshake(self.request_notify());
+        (child, open)
+    }
+    /// What tells this listener that a request of its has opened.
+    fn request_notify(&self) -> crate::loopback::Notify {
+        let this = Weak::clone(&self.this);
+        Arc::new(move || {
+            if let Some(listener) = this.upgrade() {
+                listener.arrived();
+            }
+        })
+    }
+    /// Whether this accepted socket's connection is a request yet, and
+    /// opened its place among them ([`Link::requested`]).
+    fn requested(&self) -> (bool, Option<u64>) {
+        Self::joined(&self.lock()).map_or((false, None), |(link, _)| link.requested())
+    }
+    /// Its listener closed with it a request.
+    fn forget(&self) {
+        if let Some((link, _)) = Self::joined(&self.lock()) {
+            link.forget();
+        }
     }
     /// Has the segments that come to this connected socket, whose state is
     /// `s`, pass its filter from now on (`tcp_filter`).
@@ -4077,7 +4175,8 @@ impl InetSocket {
             options.priority as u32,
             ids,
         );
-        let (_, _, wscale) = arrival::syn_window(options.receive_buffer, way, own.is_ipv4());
+        let window = arrival::syn_window(options.receive_buffer, way, own.is_ipv4());
+        let wscale = window.2;
         let id = std::sync::atomic::AtomicU16::new(u16::from_le_bytes(self.random()));
         let host = Arc::clone(&self.host);
         link.set_tap(
@@ -4091,6 +4190,7 @@ impl InetSocket {
                     stream,
                     link,
                     wscale,
+                    syn: window,
                     names,
                     id,
                     host,
@@ -4098,12 +4198,49 @@ impl InetSocket {
             }),
         );
     }
-    /// Its connection has opened, or its filter changed.
+    /// Its connection has opened, or its filter changed, which a listener's
+    /// requests have too.
     fn opened(&self) {
         let options = *self.options();
         let s = self.lock();
+        if let Some(listen) = &s.listen {
+            for child in &listen.requests {
+                let options = *child.options();
+                let mut of = child.lock();
+                if Self::joined(&of).is_some_and(|(link, _)| link.requested().0) {
+                    of.filtering.filter = s.filtering.filter.clone().map(|f| child.own_filter(f));
+                    child.tapped(&options, &of);
+                }
+            }
+        }
         self.joins(&options, &s);
         self.tapped(&options, &s);
+    }
+    /// A filter of its listener's, as its own.
+    fn own_filter(&self, filter: crate::sockets::Filter) -> crate::sockets::Filter {
+        crate::sockets::Filter {
+            socket: crate::bpf_prog::FilterSocket::Inet(Weak::clone(&self.this)),
+            ..filter
+        }
+    }
+    /// Whether this connecting socket's filter keeps the SYN-ACK that comes
+    /// from `to` to it at `from`, from a listener of receive buffer
+    /// `rcvbuf`; `s` is its state.
+    fn answer_kept(&self, s: &State, (from, to): (SocketAddr, SocketAddr), rcvbuf: i32) -> bool {
+        let (Some(filter), Some(names)) = (&s.filtering.filter, s.names) else {
+            return true;
+        };
+        let (from, to) = (
+            SocketAddr::new(plain(from.ip()), from.port()),
+            SocketAddr::new(plain(to.ip()), to.port()),
+        );
+        let way = self.network.way(from.ip(), to, self.now());
+        let hash = u32::from_le_bytes(self.random()).max(1);
+        let sent = arrival::Sent::new(to, from, 0, None, hash, 0, (0, 0));
+        let window = arrival::syn_window(rcvbuf, way, from.is_ipv4());
+        let now = self.now().unwrap_or(0) / 1000;
+        let shake = arrival::Shake::answer(&names, now, now);
+        sent.syn_kept(filter, way, window, shake, &self.host)
     }
     /// Tells its connection, if its state `s` has one, of its `options`.
     fn joins(&self, options: &Options, s: &State) {
@@ -4135,9 +4272,9 @@ impl InetSocket {
         there: &Network,
         (from, to, veth): (SocketAddr, SocketAddr, Option<i32>),
         options: &Options,
-        hash: u32,
+        (hash, names): (u32, Option<crate::loopback::Names>),
     ) -> bool {
-        let Some(filter) = listener.lock().filtering.filter.clone() else {
+        let (Some(filter), Some(names)) = (listener.lock().filtering.filter.clone(), names) else {
             return true;
         };
         let way = match veth {
@@ -4171,7 +4308,22 @@ impl InetSocket {
             ids,
         );
         let window = arrival::syn_window(options.receive_buffer, way, to.is_ipv4());
-        sent.syn_kept(&filter, way, window, &self.host)
+        let now = self.now().unwrap_or(0) / 1000;
+        let shake = arrival::Shake::syn(&names, now);
+        sent.syn_kept(&filter, way, window, shake, &self.host)
+    }
+    /// The names of the connection this socket, whose state is `s`, makes to
+    /// `listener`, for the filters that look: none where there is none.
+    fn names(
+        &self,
+        s: &mut State,
+        listener: &InetSocket,
+        filtered: bool,
+    ) -> Option<crate::loopback::Names> {
+        if s.names.is_none() && (filtered || listener.lock().filtering.filter.is_some()) {
+            s.names = Some(crate::loopback::Names::new(&self.host));
+        }
+        s.names
     }
     /// A connection to `to` on the guest's loopback, when a guest socket
     /// listens there: in its listener's queue, or, when that is full, to be
@@ -4272,16 +4424,21 @@ impl InetSocket {
         stream.set_clock(realtime(&self.host));
         size_buffers(&stream, options);
         match self.now() {
-            Some(now) => self
-                .network
-                .fails
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((
-                    Arc::downgrade(&stream),
-                    now.saturating_add(failing.0 * 1_000_000_000),
-                    failing.1,
-                )),
+            Some(now) => {
+                let at = now.saturating_add(failing.0 * 1_000_000_000);
+                let mut fails = self
+                    .network
+                    .fails
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                fails.retain(|(stream, ..)| {
+                    stream
+                        .upgrade()
+                        .is_some_and(|s| s.phase() == Phase::Connecting)
+                });
+                fails.push((Arc::downgrade(&stream), at, failing.1));
+                self.try_at(at);
+            }
             // Without the host's clock no time passes: it fails at once.
             None => stream.fail(failing.1),
         }
@@ -4327,7 +4484,16 @@ impl InetSocket {
         // `tcp_v4_connect` and `tcp_v6_connect` give the socket its flow
         // hash (`sk_set_txhash`), which its SYN goes with.
         s.txhash = u32::from_le_bytes(self.random()).max(1);
-        let kept = self.syn_kept(&listener, there, (from, to, veth), options, s.txhash);
+        s.names = None;
+        let filtered = s.filtering.filter.is_some();
+        let names = self.names(s, &listener, filtered);
+        let kept = self.syn_kept(
+            &listener,
+            there,
+            (from, to, veth),
+            options,
+            (s.txhash, names),
+        );
         let theirs = *listener.options();
         let mut state = listener.lock();
         let locked = state.port_locked;
@@ -4341,35 +4507,46 @@ impl InetSocket {
         s.link = Some((Arc::clone(&link), 0));
         self.ports().attach(&self.this, (&link, 0));
         // The listener's filter runs before its queue is checked, and a
-        // SYN it drops is tried again as one a full queue dropped.
-        let arrived = kept && listen.has_room();
+        // SYN it drops is tried again as one a full queue dropped; so is one
+        // whose answer the client's filter drops.
+        let taken = kept && listen.has_room();
+        let arrived = taken && self.answer_kept(s, (from, to), theirs.receive_buffer);
+        let mut open = false;
         if arrived {
             // The listener's answer goes back out through the loopback.
             if loopback {
                 self.network.output(from.ip(), self.now());
             }
             let notify = self.urgent_notify();
-            let child = listener.child(
+            let child;
+            (child, open) = listener.child(
                 (theirs, locked, filtering),
                 &stream,
                 (&link, &notify),
-                (from, to, dif),
+                (from, to, dif, names),
             );
-            listen.ready.push_back(child);
-            listen.arrivals += 1;
-        } else {
+            if open {
+                listen.ready.push_back(child);
+                listen.arrivals += 1;
+            } else {
+                listen.requests.push(child);
+            }
+        } else if !taken {
             listen.drops += 1;
         }
         drop(state);
-        if arrived {
+        if open {
             listener.arrived();
+        }
+        if arrived {
+            // Its client's side goes on from here.
         } else if let Some(start) = self.now() {
             let mut syns = self
                 .network
                 .syns
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            syns.push(Syn {
+            let syn = Syn {
                 stream: Arc::downgrade(&stream),
                 there: Arc::downgrade(there),
                 link,
@@ -4381,7 +4558,11 @@ impl InetSocket {
                 client: Weak::clone(&self.this),
                 start,
                 tries: 0,
-            });
+            };
+            // Those whose client has gone or stopped connecting are forgotten.
+            syns.retain(|syn| syn.waiting().is_some());
+            self.try_at(syn.next());
+            syns.push(syn);
         } else {
             // Without the host's clock no try can come: the client gives up
             // at once, rather than wait for ever.
@@ -4532,6 +4713,19 @@ impl Drop for InetSocket {
         let s = std::mem::take(&mut *self.lock());
         self.network.drop4(&s.groups4);
         self.network.drop6(&s.groups6);
+        // Its connection's tries go with it.
+        if let Some(stream) = &s.stream
+            && stream.phase() == Phase::Connecting
+        {
+            let network = &self.network;
+            let syns = network.syns.lock();
+            let mut syns = syns.unwrap_or_else(PoisonError::into_inner);
+            syns.retain(|syn| !core::ptr::eq(syn.stream.as_ptr(), Arc::as_ptr(stream)));
+            drop(syns);
+            let fails = network.fails.lock();
+            let mut fails = fails.unwrap_or_else(PoisonError::into_inner);
+            fails.retain(|fail| !core::ptr::eq(fail.0.as_ptr(), Arc::as_ptr(stream)));
+        }
         if let Some(listen) = s.listen {
             listen.stop();
         }
@@ -4592,14 +4786,14 @@ impl FileHandle for InetSocket {
                 | (u32::from(s.read_shut && s.write_shut) * POLLHUP);
             return Ok((OUT | (u32::from(ready) * IN) | error | ends, s.received, 0));
         }
-        self.retry_syns();
         self.settle();
         let inline = self.options().out_of_band_inline;
         let mut s = self.lock();
         // A listener is readable while a connection waits, and no more
         // (`inet_csk_listen_poll`).
         if let Some(listen) = &s.listen {
-            return Ok((u32::from(!listen.ready.is_empty()) * IN, listen.arrivals, 0));
+            let arrivals = listen.arrivals + listen.opened() as u64;
+            return Ok((u32::from(listen.waiting() > 0) * IN, arrivals, 0));
         }
         // The stream's readiness is read before its phase, and the failure
         // is noted only when that phase is failed. A host connection moves
@@ -4828,6 +5022,7 @@ pub(crate) struct Full {
 }
 const TCP_ESTABLISHED: u8 = 1;
 const TCP_SYN_SENT: u8 = 2;
+const TCP_SYN_RECV: u8 = 3;
 const TCP_FIN_WAIT1: u8 = 4;
 const TCP_FIN_WAIT2: u8 = 5;
 const TCP_TIME_WAIT: u8 = 6;
@@ -4853,7 +5048,6 @@ impl Network {
         // The handshakes whose time has come have been sent again, as
         // Linux's retransmission timer does on its own.
         if let Some(socket) = sockets.first() {
-            socket.retry_syns();
             socket.settle();
         }
         let mut entries: Vec<Entry> = sockets.iter().flat_map(|socket| socket.diag(now)).collect();
@@ -4952,7 +5146,7 @@ impl InetSocket {
         };
         if let Some(listen) = &s.listen {
             return vec![Entry {
-                queues: (listen.ready.len() as u32, listen.backlog as u32),
+                queues: (listen.waiting() as u32, listen.backlog as u32),
                 ..entry(TCP_LISTEN, Table::Listening, 0)
             }];
         }
@@ -4968,7 +5162,10 @@ impl InetSocket {
         // FIN counts until a read meets it, and this side's SYN or FIN
         // until its peer has it.
         let (unread, unsent) = stream.queued();
-        let unacked = Self::joined(&s).map(|(link, side)| link.segments(side).queued);
+        let joined = Self::joined(&s);
+        let request = joined.as_ref().filter(|(_, side)| *side == 1);
+        let request = request.and_then(|(link, _)| link.waits());
+        let unacked = joined.map(|(link, side)| link.segments(side).queued);
         let peer_ended = stream.readiness().read_closed && stream.phase() == Phase::Open;
         let unread = unread + usize::from(peer_ended && !s.eof_read);
         let queues = (unread as u32, unsent as u32);
@@ -4989,6 +5186,14 @@ impl InetSocket {
             Phase::Failed(_) => {
                 closed(&mut entries);
                 return entries;
+            }
+            Phase::Open if let Some((at, tries)) = request => {
+                return vec![Entry {
+                    peer: Some(stream.peer()),
+                    timer: (IDIAG_TIMER_ON, tries as u8, Some(at)),
+                    full: None,
+                    ..entry(TCP_SYN_RECV, Table::Connected, 0)
+                }];
             }
             Phase::Open => {
                 let ready = stream.readiness();
@@ -5047,6 +5252,24 @@ impl InetSocket {
     }
 }
 
+impl Due for InetSocket {
+    /// The tries that are due, after which its own goes at its next time:
+    /// this may have come early, for one that had gone.
+    fn run(&self) {
+        self.retry_syns();
+        let syns = self
+            .network
+            .syns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let own = syns
+            .iter()
+            .find(|syn| core::ptr::eq(syn.client.as_ptr(), self));
+        if let Some(syn) = own {
+            self.try_at(syn.next());
+        }
+    }
+}
 impl InetSocket {
     /// How many times the dropped handshake of `stream` has been sent
     /// again, and when it goes next.
@@ -5080,7 +5303,7 @@ impl InetSocket {
             _ => 0,
         };
         if let Some(listen) = &s.listen {
-            return TcpInfo::listening(listen.ready.len() as u32, listen.backlog as u32);
+            return TcpInfo::listening(listen.waiting() as u32, listen.backlog as u32);
         }
         let Some(stream) = &s.stream else {
             return TcpInfo::unconnected(TCP_CLOSE, uptime);
@@ -6147,6 +6370,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             timeout.timeval().to_vec()
         }
         (6, 11) => {
+            socket.settle();
             let s = socket.lock();
             socket.tcp_info(&s, socket.now()).bytes().to_vec()
         }

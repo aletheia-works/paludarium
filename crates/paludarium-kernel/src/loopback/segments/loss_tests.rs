@@ -1,7 +1,7 @@
 //! Segments that a filter drops or cuts, with the numbers a native Linux
 //! 7.0.14 gave for the same writes, reads and filters.
 
-use super::{Counts, Flows, MS, Push, Segment, Tap, Verdict};
+use super::{Counts, Flows, MS, Push, Request, Segment, Tap, Verdict};
 use std::sync::{Arc, Mutex};
 
 type Rule = fn(&Segment<'_>) -> Option<u32>;
@@ -507,4 +507,55 @@ fn large_segments_dropped_are_sent_again_one_by_one() {
         ]
     );
     assert_eq!(r.receiver(), [2, 4, 2, 0, 60_000]);
+}
+
+/// Drops what acknowledges and no more.
+const DROP_BARE: Rule = |s| (s.len > 0 || s.fin || s.syn || s.reset).then_some(s.len);
+
+#[test]
+fn a_request_waits_for_an_acknowledgement() {
+    let mut r = Run::new();
+    r.filter(1, Some(DROP_BARE));
+    r.flows.handshake(r.now);
+    assert!(matches!(r.flows.request(), Request::Waits { tries: 0, .. }));
+    // Its SYN-ACK goes again after 1 and 3 seconds, and the client answers.
+    r.until(1_500);
+    assert_eq!(r.sender()[10..12], [3, 2]);
+    r.filter(1, None);
+    r.until(3_500);
+    assert_eq!(r.flows.request(), Request::Opened);
+    assert_eq!(r.sender()[10..12], [4, 3]);
+    assert_eq!(r.receiver(), [0, 2, 0, 0, 0]);
+    assert_eq!(r.counts(1).retransmitted, 2);
+}
+
+#[test]
+fn data_opens_a_request() {
+    let mut r = Run::new();
+    r.filter(1, Some(DROP_BARE));
+    r.flows.handshake(r.now);
+    r.write(5);
+    assert_eq!(r.flows.request(), Request::Opened);
+    assert_eq!(r.receiver(), [1, 2, 1, 0, 5]);
+}
+
+#[test]
+fn a_request_is_dropped_by_a_reset_or_in_time() {
+    let mut r = Run::new();
+    r.filter(1, Some(DROP_BARE));
+    r.flows.handshake(r.now);
+    assert!(r.flows.reset(0, r.now));
+    assert_eq!(r.flows.request(), Request::Dropped);
+
+    let mut r = Run::new();
+    r.filter(1, Some(DROP_BARE));
+    r.flows.handshake(r.now);
+    // 1 + 2 + 4 + 8 + 16 + 32 seconds.
+    r.until(62_900);
+    assert!(matches!(r.flows.request(), Request::Waits { tries: 5, .. }));
+    r.until(63_100);
+    assert_eq!(r.flows.request(), Request::Dropped);
+    // What comes then is answered with a reset.
+    r.write(5);
+    assert_eq!(r.flows.verdict(0), Some(Verdict::Reset));
 }

@@ -412,11 +412,13 @@ verified.
   bloom filters, and arrays and hashes of maps, and loads socket filters,
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
-  or packet socket, on a UDP socket, on the SYNs that come to a TCP
-  listener and on the segments of a connection on the loopback or across a
-  veth pair. No filter runs yet on the handshake's last ACK, so one that
-  keeps a SYN but drops that ACK does otherwise on Linux; the SYN's sequence
-  number and timestamp are not those its connection goes on from; and data
+  or packet socket, on a UDP socket, and on the segments of a handshake and
+  connection on the loopback or across a veth pair. A handshake whose SYN-ACK
+  the client's filter drops leaves no request with the listener, whose
+  SYN-ACK so comes again only with the client's SYN; a request that opens is
+  taken though the queue has filled up since its SYN; what a filter asks of
+  the socket (`bpf_get_socket_cookie`) is the connection's while that is a
+  request, where Linux's is the listener's; and data
   that goes again after it has come, where no filter saw it before, reads
   as zeros. A connection the host made has no segments here, and its filter
   never runs. On a UDP socket no

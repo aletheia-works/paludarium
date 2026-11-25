@@ -24,6 +24,11 @@ const MS: u64 = 1000;
 /// `TCP_ATO_MIN`, and what a delayed acknowledgement waits on a path whose
 /// round trip is short (`TCP_DELACK_MIN`).
 const DELAY: u64 = 40 * MS;
+/// `TCP_TIMEOUT_INIT`, `sysctl_tcp_synack_retries` and
+/// `sysctl_tcp_invalid_ratelimit`.
+const SYNACK: u64 = 1000 * MS;
+const SYNACK_RETRIES: u32 = 5;
+const CHALLENGE: u64 = 500 * MS;
 /// `TCP_RTO_MIN`, and the timeout of a short path.
 const RTO_MIN: u64 = 200 * MS;
 const RTO: u64 = 201 * MS;
@@ -128,6 +133,8 @@ struct Packet {
     push: bool,
     fin: bool,
     reset: bool,
+    /// The SYN-ACK, sent again.
+    syn: bool,
     ack: u64,
     /// When it went, and the time it echoes (its timestamps).
     at: u64,
@@ -155,6 +162,7 @@ pub(crate) struct Segment<'a> {
     pub(crate) push: bool,
     pub(crate) fin: bool,
     pub(crate) reset: bool,
+    pub(crate) syn: bool,
     /// Where the urgent data ends, if it is past `start`.
     pub(crate) urgent: Option<u64>,
     /// The window offered, unscaled.
@@ -175,6 +183,21 @@ pub(crate) trait Tap: Send + Sync {
     /// How many bytes of the segment's data the filter keeps; `None` when it
     /// drops the segment.
     fn keep(&self, segment: &Segment<'_>) -> Option<u32>;
+}
+
+/// The server's side of a handshake whose last acknowledgement its
+/// listener's filter may drop (`struct request_sock`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// The handshake ended at once, as it does with no filter.
+    Never,
+    /// Until `at` the SYN-ACK, sent again `tries` times, waits.
+    Waits {
+        at: u64,
+        tries: u32,
+    },
+    Opened,
+    Dropped,
 }
 
 /// Why a connection ended for a side.
@@ -507,6 +530,9 @@ pub(crate) struct Flows {
     taps: [Option<Arc<dyn Tap>>; 2],
     behind: [VecDeque<u8>; 2],
     dead: [bool; 2],
+    request: Request,
+    /// When the client last challenged a SYN-ACK (`last_oow_ack_time`).
+    challenged: Option<u64>,
     verdicts: [Option<Verdict>; 2],
     /// No clock runs, so nothing may wait for a timer.
     timeless: bool,
@@ -549,6 +575,8 @@ impl Flows {
             taps: [None, None],
             behind: Default::default(),
             dead: [false; 2],
+            request: Request::Never,
+            challenged: None,
             verdicts: [None; 2],
             timeless: now.is_none(),
             arrivals: Default::default(),
@@ -635,7 +663,7 @@ impl Flows {
     /// When a timer may next send data that waits, or that was lost; none
     /// while none does.
     pub(crate) fn wake(&self) -> Option<u64> {
-        let tapped = self.taps.iter().any(Option::is_some);
+        let tapped = self.tapped() || matches!(self.request, Request::Waits { .. });
         let waits = |(side, s): (usize, &Side)| {
             let peer = &self.sides[1 - side];
             (s.written > s.next && (s.window() > 0 || !s.blocked))
@@ -647,6 +675,70 @@ impl Flows {
             .then(|| self.due())
             .flatten()
             .map(|(at, ..)| at)
+    }
+    /// The handshake's last acknowledgement comes to the server's side,
+    /// whose filter is its listener's: until one is kept, the connection is
+    /// the client's alone.
+    pub(crate) fn handshake(&mut self, now: u64) {
+        self.advance(now);
+        let mut packet = self.bare(0);
+        if self.passes(&mut packet) {
+            return;
+        }
+        self.sides[1].counts.segs_in = 1;
+        self.request = Request::Waits {
+            at: self.now + SYNACK,
+            tries: 0,
+        };
+    }
+    pub(crate) fn request(&self) -> Request {
+        self.request
+    }
+    /// The request is dropped: the server's side has no socket, nor, its
+    /// listener `gone`, a filter.
+    pub(crate) fn forget(&mut self, gone: bool) {
+        self.request = Request::Dropped;
+        self.dead[1] = true;
+        if gone {
+            self.taps[1] = None;
+        }
+        self.stop(1);
+    }
+    /// `reqsk_timer_handler`: the SYN-ACK goes again, or the request is
+    /// dropped.
+    fn request_timer(&mut self) {
+        let Request::Waits { at, tries } = self.request else {
+            return;
+        };
+        if tries >= SYNACK_RETRIES {
+            self.forget(false);
+            return;
+        }
+        self.request = Request::Waits {
+            at: at + (SYNACK << (tries + 1)),
+            tries: tries + 1,
+        };
+        let mut packet = self.bare(1);
+        packet.syn = true;
+        self.wire.push_back(packet);
+    }
+    /// A segment of `side`'s with nothing in it but its acknowledgement.
+    fn bare(&self, side: usize) -> Packet {
+        let s = &self.sides[side];
+        Packet {
+            to: 1 - side,
+            len: 0,
+            segments: 1,
+            end: s.next,
+            push: false,
+            fin: false,
+            reset: false,
+            syn: false,
+            ack: s.came,
+            at: self.now,
+            echo: s.recent,
+            sacks: None,
+        }
     }
     /// Whether something one side sent is lost and will be sent again.
     pub(crate) fn losing(&self) -> bool {
@@ -750,22 +842,14 @@ impl Flows {
     pub(crate) fn reset(&mut self, side: usize, now: u64) -> bool {
         self.advance(now);
         self.sides[side].counts.segs_out += 1;
-        let mut packet = Packet {
-            to: 1 - side,
-            len: 0,
-            segments: 1,
-            end: self.sides[side].next,
-            push: false,
-            fin: false,
-            reset: true,
-            ack: self.sides[side].came,
-            at: self.now,
-            echo: self.sides[side].recent,
-            sacks: None,
-        };
+        let mut packet = self.bare(side);
+        packet.reset = true;
         let heard = self.passes(&mut packet);
         self.stop(side);
         if heard {
+            if side == 0 && matches!(self.request, Request::Waits { .. }) {
+                self.forget(false);
+            }
             self.sides[1 - side].counts.segs_in += 1;
             self.stop(1 - side);
         } else {
@@ -851,29 +935,34 @@ impl Flows {
         if now <= self.now {
             return;
         }
-        while let Some((at, side, ack)) = self.due().filter(|&(at, ..)| at <= now) {
+        while let Some((at, side, timer)) = self.due().filter(|&(at, ..)| at <= now) {
             self.now = self.now.max(at);
-            if ack {
-                self.acknowledge_late(side);
-            } else {
-                self.retransmit_timer(side);
+            match timer {
+                0 => self.retransmit_timer(side),
+                1 => self.acknowledge_late(side),
+                _ => self.request_timer(),
             }
             self.deliver();
         }
         self.now = now;
     }
-    /// The next timer: its time, its side, and whether it is the delayed
-    /// acknowledgement's.
-    fn due(&self) -> Option<(u64, usize, bool)> {
+    /// The next timer: its time, its side, and whether it is the sender's
+    /// (0), the delayed acknowledgement's (1) or the request's (2).
+    fn due(&self) -> Option<(u64, usize, u8)> {
+        let request = match self.request {
+            Request::Waits { at, .. } => Some((at, 1, 2)),
+            _ => None,
+        };
         self.sides
             .iter()
             .enumerate()
             .flat_map(|(side, s)| {
                 [
-                    s.pending.timer.map(|at| (at, side, true)),
-                    s.timer.map(|(_, at)| (at, side, false)),
+                    s.pending.timer.map(|at| (at, side, 1)),
+                    s.timer.map(|(_, at)| (at, side, 0)),
                 ]
             })
+            .chain([request])
             .flatten()
             .min()
     }
@@ -1203,6 +1292,7 @@ impl Flows {
             push: flags.0,
             fin: flags.1,
             reset: false,
+            syn: false,
             ack: s.came,
             at: now,
             echo: s.recent,
@@ -1218,7 +1308,11 @@ impl Flows {
     /// call runs.
     fn deliver(&mut self) {
         while let Some(mut packet) = self.wire.pop_front() {
-            if !self.passes(&mut packet) || self.unheard(&packet) {
+            if !self.passes(&mut packet) || !self.opens(&packet) || self.unheard(&packet) {
+                continue;
+            }
+            if packet.syn {
+                self.challenge(packet.to);
                 continue;
             }
             let counts = &mut self.sides[packet.to].counts;
@@ -1276,6 +1370,7 @@ impl Flows {
             push: packet.push,
             fin: packet.fin,
             reset: packet.reset,
+            syn: packet.syn,
             urgent: (s.urgent > s.una && s.urgent > start).then_some(s.urgent),
             window,
             at: packet.at,
@@ -1297,6 +1392,33 @@ impl Flows {
             }
         }
         true
+    }
+    /// Whether `packet` may go on to the side it comes to, which it opens if
+    /// that is a request (`tcp_check_req`); a reset drops one.
+    fn opens(&mut self, packet: &Packet) -> bool {
+        let Request::Waits { tries, .. } = self.request else {
+            return true;
+        };
+        if packet.to == 0 {
+            return true;
+        }
+        if packet.reset {
+            self.forget(false);
+            return false;
+        }
+        self.request = Request::Opened;
+        self.sides[1].counts.retransmitted = tries;
+        true
+    }
+    /// A SYN-ACK comes to `side`, which is connected: it answers with an
+    /// acknowledgement, not often (`tcp_send_challenge_ack`).
+    fn challenge(&mut self, side: usize) {
+        self.sides[side].counts.segs_in += 1;
+        let now = self.now;
+        if self.challenged.is_none_or(|at| now >= at + CHALLENGE) {
+            self.challenged = Some(now);
+            self.send_ack(side);
+        }
     }
     /// Whether `packet` comes to a side with no socket, which answers with
     /// a reset (`tcp_v4_send_reset`), or is a reset.
@@ -1337,6 +1459,7 @@ impl Flows {
             push: false,
             fin: false,
             reset: true,
+            syn: false,
             ack: self.sides[side].came,
             at: 0,
             echo: 0,

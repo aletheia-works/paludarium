@@ -183,7 +183,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, inet-diag-device, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -372,6 +372,7 @@ mod linux {
                     | "generic-netlink"
                     | "sock-diag"
                     | "inet-diag"
+                    | "inet-diag-device"
                     | "ext-ack-netlink"
                     | "ext-ack-addresses"
                     | "ext-ack-monitor"
@@ -610,6 +611,7 @@ mod linux {
         processes_generic_netlink => ("generic-netlink","process"),
         processes_sock_diag => ("sock-diag","process"),
         processes_inet_diag => ("inet-diag","process"),
+        inet_diag_device => ("inet-diag-device","inet-diag-device"),
         processes_ext_ack_netlink => ("ext-ack-netlink","process"),
         processes_ext_ack_addresses => ("ext-ack-addresses","process"),
         processes_ext_ack_monitor => ("ext-ack-monitor","process"),

@@ -3439,14 +3439,16 @@ kernel.
     ports, as Linux looks it up: for TCP the connection, else the
     listener, `ENOENT` for none or for a cookie that does not match; for
     UDP the socket a datagram from the source to the destination reaches,
-    `ESTALE` for a cookie that does not match. The old `TCPDIAG_GETSOCK`
+    `ESTALE` for a cookie that does not match; each as what comes in on
+    the device asked for (`idiag_if`) finds it, so never a socket bound to
+    another. The old `TCPDIAG_GETSOCK`
     does the same for TCP of both families, and `SOCK_DESTROY` is
     `EOPNOTSUPP`, as in a kernel built without
     `CONFIG_INET_DIAG_DESTROY`. A request too short is `EINVAL`.
   - **What it tells of TCP and UDP:** each socket's state (`TCP_SYN_SENT`
     while a handshake waits for room in its listener, then that of the
     connection's end, or `TCP_LISTEN`), its addresses and ports (IPv4 ones
-    mapped on an IPv6 socket), its cookie, its timer (a handshake's
+    mapped on an IPv6 socket), the device it is bound to, its cookie, its timer (a handshake's
     retransmission, keepalive, or `TIME_WAIT`'s), its queues (a listener's
     waiting connections and backlog), its owner as the user namespace of
     whoever made the netlink socket shows it, and its inode (0 for a
@@ -3460,7 +3462,7 @@ kernel.
     listener's handshakes that a full queue dropped), a TCP socket's
     `tcp_info` (`INET_DIAG_INFO`, which `ss -i` shows), and its
     congestion control (`cubic`). A hold in `TIME_WAIT` tells
-    its addresses, state and timer alone.
+    its addresses, device, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
     `sock_diag` 32, which anyone may join, and which hear nothing.
 

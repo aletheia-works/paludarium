@@ -38,6 +38,7 @@
     {"name":"generic-netlink","binary":"process"},
     {"name":"sock-diag","binary":"process"},
     {"name":"inet-diag","binary":"process"},
+    {"name":"inet-diag-device","binary":"inet-diag-device"},
     {"name":"ext-ack-netlink","binary":"process"},
     {"name":"ext-ack-addresses","binary":"process"},
     {"name":"ext-ack-monitor","binary":"process"},

@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -425,6 +426,84 @@ static void ll_bind(const char *name, int domain, int type, const void *address,
     close(s);
 }
 static void on_alarm(int signal) { (void)signal; alarms++; }
+/* A ring of 8 entries (io_uring_setup) with its rings and entries mapped,
+   for the io_uring mode. */
+struct ring {
+    int fd;
+    unsigned char *rings, *sqes;
+    unsigned array, sq_entries, cq_entries;
+};
+static unsigned *ring_u32(unsigned char *base, unsigned at) { return (unsigned *)(base + at); }
+static int ring_open(struct ring *r) {
+    unsigned char p[120];
+    memset(p, 0, sizeof p);
+    long fd = syscall(425, 8, p);
+    if (fd < 0) return -1;
+    r->fd = (int)fd;
+    r->sq_entries = *ring_u32(p, 0);
+    r->cq_entries = *ring_u32(p, 4);
+    r->array = *ring_u32(p, 64);
+    r->rings = mmap(NULL, r->array + 4 * r->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED, r->fd, 0);
+    r->sqes = mmap(NULL, 64 * r->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED, r->fd, 0x10000000);
+    return r->rings == MAP_FAILED || r->sqes == MAP_FAILED ? -1 : 0;
+}
+/* Waits for any of `events` on `fd`, at most 5 s. */
+static void awaited(const char *name, int fd, short events) {
+    struct pollfd p = {.fd = fd, .events = events};
+    int n = poll(&p, 1, 5000);
+    printf("  %s poll=%d\n", name, n);
+}
+/* An entry: `op` on `fd` with `off`, `addr`, `len` and `rw` flags. */
+static void ring_push(struct ring *r, unsigned char op, unsigned long data, int fd, unsigned long off,
+                      unsigned long addr, unsigned len, unsigned rw) {
+    unsigned tail = *ring_u32(r->rings, 4);
+    unsigned slot = tail & (r->sq_entries - 1);
+    unsigned char *sqe = r->sqes + 64 * slot;
+    memset(sqe, 0, 64);
+    sqe[0] = op;
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 8, &off, 8);
+    memcpy(sqe + 16, &addr, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 28, &rw, 4);
+    memcpy(sqe + 32, &data, 8);
+    *ring_u32(r->rings, r->array + 4 * slot) = slot;
+    __atomic_store_n(ring_u32(r->rings, 4), tail + 1, __ATOMIC_RELEASE);
+}
+/* The last result of each user_data. */
+static int ring_result[64];
+/* Submits `submit` entries, waits for `wait` completions, and prints
+   those there, by user_data, with their flags; with `fds`, a descriptor
+   as "fd". It gives the result of the last one printed. */
+static int ring_run(struct ring *r, unsigned submit, unsigned wait, const char *label, int fds) {
+    syscall(426, r->fd, submit, wait, 1, NULL, 0);
+    unsigned head = *ring_u32(r->rings, 8);
+    unsigned tail = __atomic_load_n(ring_u32(r->rings, 12), __ATOMIC_ACQUIRE);
+    unsigned long datas[8];
+    int results[8];
+    unsigned flags[8], n = 0;
+    for (; head != tail && n < 8; head++, n++) {
+        unsigned char *cqe = r->rings + 64 + 16 * (head & (r->cq_entries - 1));
+        memcpy(&datas[n], cqe, 8);
+        memcpy(&results[n], cqe + 8, 4);
+        memcpy(&flags[n], cqe + 12, 4);
+    }
+    __atomic_store_n(ring_u32(r->rings, 8), head, __ATOMIC_RELEASE);
+    printf("  %s:", label);
+    int last = 0;
+    for (unsigned long data = 0; data < 64; data++) {
+        for (unsigned i = 0; i < n; i++) {
+            if (datas[i] != data) continue;
+            if (fds && results[i] > 2)
+                printf(" %lu=fd/%#x", data, flags[i]);
+            else
+                printf(" %lu=%d/%#x", data, results[i], flags[i]);
+            last = ring_result[data] = results[i];
+        }
+    }
+    printf("\n");
+    return last;
+}
 
 int main(int argc, char **argv) {
     if (argc < 4) return 99;
@@ -1116,6 +1195,78 @@ int main(int argc, char **argv) {
         close(c);
         close(s);
         close(l);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-io-uring")) {
+        /* io_uring's socket requests on the loopback: a socket, accepts of
+           connections that wait (IORING_CQE_F_SOCK_NONEMPTY while more do)
+           and one that waits for its connection, a connect in progress, a
+           refused one, sends and receives (one that waits, one that waits
+           for the whole length, what is left to read), and a shutdown. */
+        struct ring r;
+        if (ring_open(&r)) return 80;
+        int l = ring_run(&r, (ring_push(&r, 45, 1, AF_INET, SOCK_STREAM, 0, 0, 0), 1), 1, "socket", 1);
+        struct sockaddr_in a = to(0);
+        call("bind", bind(l, (void *)&a, sizeof a));
+        socklen_t len = sizeof a;
+        getsockname(l, (void *)&a, &len);
+        call("listen", listen(l, 4));
+        int result;
+        int c1 = client(ntohs(a.sin_port), 0, &result);
+        int c2 = client(ntohs(a.sin_port), 0, &result);
+        awaited("queued", l, POLLIN);
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof peer;
+        ring_push(&r, 13, 2, l, (unsigned long)&peer_len, (unsigned long)&peer, 0, SOCK_CLOEXEC);
+        int s1 = ring_run(&r, 1, 1, "accept-more", 1);
+        printf("  peer len=%u family=%d addr=%#x cloexec=%d\n", (unsigned)peer_len, peer.sin_family,
+               ntohl(peer.sin_addr.s_addr), fcntl(s1, F_GETFD) & FD_CLOEXEC);
+        ring_push(&r, 13, 3, l, 0, 0, 0, SOCK_NONBLOCK);
+        int s2 = ring_run(&r, 1, 1, "accept-last", 1);
+        printf("  nonblock=%d\n", (fcntl(s2, F_GETFL) & O_NONBLOCK) != 0);
+        close(s1);
+        close(s2);
+        close(c1);
+        close(c2);
+        ring_push(&r, 13, 4, l, 0, 0, 0, 0);
+        ring_run(&r, 1, 0, "accept-waits", 0);
+        int c = ring_run(&r, (ring_push(&r, 45, 5, AF_INET, SOCK_STREAM, 0, 0, 0), 1), 1, "socket", 1);
+        ring_push(&r, 16, 6, c, sizeof a, (unsigned long)&a, 0, 0);
+        ring_run(&r, 1, 2, "connect-accepted", 1);
+        int s = ring_result[4];
+        struct sockaddr_in closed = to(closed_port);
+        int refused = ring_run(&r, (ring_push(&r, 45, 7, AF_INET, SOCK_STREAM, 0, 0, 0), 1), 1, "socket", 1);
+        ring_push(&r, 16, 8, refused, sizeof closed, (unsigned long)&closed, 0, 0);
+        ring_run(&r, 1, 1, "connect-refused", 0);
+        ring_push(&r, 16, 9, c, sizeof a, (unsigned long)&a, 0, 0);
+        ring_run(&r, 1, 1, "connect-again", 0);
+        char got[16] = {0};
+        ring_push(&r, 26, 10, s, 0, (unsigned long)"hello", 5, 0);
+        ring_run(&r, 1, 1, "send", 0);
+        awaited("sent", c, POLLIN);
+        ring_push(&r, 27, 11, c, 0, (unsigned long)got, 3, 0);
+        ring_run(&r, 1, 1, "recv-part", 0);
+        ring_push(&r, 27, 12, c, 0, (unsigned long)got + 3, 8, 0);
+        ring_run(&r, 1, 1, "recv-rest", 0);
+        print_bytes("received", got, 5);
+        ring_push(&r, 27, 13, c, 0, (unsigned long)got, 8, MSG_DONTWAIT);
+        ring_run(&r, 1, 1, "recv-dontwait", 0);
+        ring_push(&r, 27, 14, c, 0, (unsigned long)got, 8, 0);
+        ring_run(&r, 1, 0, "recv-waits", 0);
+        call("write", (int)write(s, "ab", 2));
+        ring_run(&r, 0, 1, "recv-woken", 0);
+        ring_push(&r, 27, 15, c, 0, (unsigned long)got, 4, MSG_WAITALL);
+        ring_run(&r, 1, 0, "waitall-waits", 0);
+        call("write", (int)write(s, "cd", 2));
+        usleep(100000);
+        call("write", (int)write(s, "ef", 2));
+        ring_run(&r, 0, 1, "waitall-whole", 0);
+        print_bytes("received", got, 4);
+        ring_push(&r, 34, 16, s, 0, 0, SHUT_WR, 0);
+        ring_run(&r, 1, 1, "shutdown", 0);
+        awaited("shut", c, POLLRDHUP);
+        ring_push(&r, 27, 17, c, 0, (unsigned long)got, 8, 0);
+        ring_run(&r, 1, 1, "recv-end", 0);
         return 0;
     }
     if (!strcmp(mode, "listen-errors")) {

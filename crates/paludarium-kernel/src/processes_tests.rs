@@ -2696,6 +2696,37 @@ mod namespaces {
         );
     }
     #[test]
+    fn o_path_opens_a_generated_file_s_path_alone_whatever_else_it_asks() {
+        const O_PATH: u64 = 0o10000000;
+        let (mut k, mut t, m) = setup();
+        let mut call = |n, a| syscall(&mut k, &mut t, &m, n, a);
+        for path in [
+            "/proc",
+            "/proc/self/status",
+            "/dev",
+            "/dev/null",
+            "/dev/ptmx",
+        ] {
+            m.write(GuestAddr(DATA), format!("{path}\0").as_bytes())
+                .unwrap();
+            // With O_RDWR, O_CREAT and O_TRUNC.
+            let fd = call(2, [DATA, O_PATH | 0o1102, 0, 0, 0, 0]);
+            assert!(fd < 1024, "{path}: {}", fd as i64);
+            assert_eq!(call(72, [fd, 3, 0, 0, 0, 0]), O_PATH, "{path}");
+            let read = call(0, [fd, DATA + 512, 1, 0, 0, 0]);
+            assert_eq!(read, Errno::EBADF.to_syscall_return(), "{path}");
+            assert_eq!(call(3, [fd, 0, 0, 0, 0, 0]), 0);
+        }
+        // No pseudo-terminal was made, and a file is no directory.
+        m.write(GuestAddr(DATA), b"/dev/pts/0\0").unwrap();
+        let missing = call(2, [DATA, O_PATH, 0, 0, 0, 0]);
+        assert_eq!(missing, Errno::ENOENT.to_syscall_return());
+        m.write(GuestAddr(DATA), b"/proc/uptime\0").unwrap();
+        let directory = call(2, [DATA, 0o200000, 0, 0, 0, 0]);
+        assert_eq!(directory, Errno::ENOTDIR.to_syscall_return());
+    }
+
+    #[test]
     fn setns_enters_the_namespaces_of_a_file_or_a_process() {
         let (mut k, mut t, m) = setup();
         k.group.register(1, Arc::new(SignalInbox::default()));

@@ -901,6 +901,7 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
                 fixed: true,
                 keep_old: false,
                 new_addr: GuestAddr(0xa0000),
+                low: false,
             },
         )
         .unwrap();
@@ -1844,6 +1845,7 @@ fn a_child_and_a_moved_mapping_keep_the_registrations_whose_events_they_give() {
                 fixed: true,
                 keep_old: false,
                 new_addr: GuestAddr(0xa0000),
+                low: false,
             },
         )
         .unwrap();
@@ -1870,6 +1872,7 @@ fn a_child_and_a_moved_mapping_keep_the_registrations_whose_events_they_give() {
                 fixed: true,
                 keep_old: false,
                 new_addr: a,
+                low: false,
             },
         )
         .unwrap();
@@ -2607,6 +2610,7 @@ fn a_moved_mapping_of_a_huge_file_goes_at_its_offset_past_a_boundary() {
                 fixed: false,
                 keep_old: true,
                 new_addr: GuestAddr(0),
+                low: false,
             },
         )
         .unwrap()
@@ -2654,6 +2658,7 @@ fn a_moved_mapping_of_a_huge_file_goes_at_its_offset_past_a_boundary() {
                 fixed: false,
                 keep_old: false,
                 new_addr: GuestAddr(0),
+                low: false,
             },
         )
         .unwrap();
@@ -2791,6 +2796,7 @@ fn memory_moved_once_written_keeps_its_page_offset() {
             fixed: true,
             keep_old: false,
             new_addr: GuestAddr(to + PAGE_SIZE),
+            low: false,
         };
         mem.remap_shared(GuestAddr(at), PAGE_SIZE, PAGE_SIZE, how)
             .unwrap();

@@ -27,6 +27,7 @@ mod signals;
 mod skb;
 pub use inbox::SignalInbox;
 mod aio;
+mod blocked;
 mod bpf;
 mod bpf_classic;
 mod bpf_fs;

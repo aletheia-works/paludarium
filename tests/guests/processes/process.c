@@ -16779,6 +16779,69 @@ static int tmpfs_huge_placement_case(void) {
     printf("cleaned=%d\n", rmdir(th_base) == 0);
     return 0;
 }
+/* The mmap-32bit case: MAP_32BIT looks for room from 1 GiB (and up to 32 MiB
+   more, at random) up to 2 GiB, or takes a free hint that ends by 2 GiB, as
+   find_start_end has it, whatever is mapped: anonymous memory, a file, or
+   what transparent huge pages fit. MAP_FIXED overrides it, and mremap does
+   not keep to it. A hint below mmap_min_addr (64 KiB) is that. The hint
+   below 1 GiB stays clear of the heap, which brk may have put there. */
+static int low_area(const char *at, size_t len) {
+    return at != MAP_FAILED && (uintptr_t)at >= 0x40000000 && (uintptr_t)at <= 0x80000000 - len;
+}
+static int mmap_32bit_case(void) {
+    long page = 4096, huge = 2 << 20;
+    int rw = PROT_READ | PROT_WRITE, low = MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT;
+    char *a = mmap(NULL, page, rw, low, -1, 0);
+    if (a == MAP_FAILED) return 80;
+    printf("low=%d start=%d\n", low_area(a, page), (uintptr_t)a < 0x42000000);
+    *a = 1;
+    uintptr_t heap = (uintptr_t)sbrk(0);
+    char *below = (char *)(heap > 0x1c000000 && heap < 0x24000000 ? 0x30000000L : 0x20000000L);
+    char *hints[] = {below, (char *)0x60000000L, (char *)0x7ffff000L};
+    for (int i = 0; i < 3; i++)
+        printf("hint=%d\n", mmap(hints[i], page, rw, low, -1, 0) == hints[i]);
+    char *c = mmap(a, page, rw, low, -1, 0);
+    printf("busy: low=%d other=%d\n", low_area(c, page), c != a);
+    char *past = (char *)0x100000000L, *over = (char *)0x7fffd000L;
+    char *d = mmap(past, page, rw, low, -1, 0), *e = mmap(over, 4 * page, rw, low, -1, 0);
+    printf("past: low=%d over: low=%d\n", low_area(d, page), low_area(e, 4 * page));
+    char *high = mmap(NULL, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *fixed = mmap(high, page, rw, low | MAP_FIXED, -1, 0);
+    printf("plain-high=%d fixed=%d\n", (uintptr_t)high >= 0x80000000, fixed == high);
+    char *thp = mmap(NULL, 2 * huge, rw, low, -1, 0);
+    printf("thp: low=%d aligned=%d\n", low_area(thp, 2 * huge), !((uintptr_t)thp & (huge - 1)));
+    int zero = open("/dev/zero", O_RDWR);
+    char *z = mmap(NULL, 2 * huge + page, rw, MAP_PRIVATE | MAP_32BIT, zero, 0);
+    printf("zero: low=%d aligned=%d\n", low_area(z, 2 * huge + page), !((uintptr_t)z & (huge - 1)));
+    char *s = mmap(NULL, huge, rw, MAP_SHARED | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    printf("shared: low=%d\n", low_area(s, huge));
+    int fd = memfd_create("low", 0);
+    if (fd < 0 || ftruncate(fd, page)) return 81;
+    char *f = mmap(NULL, page, rw, MAP_SHARED | MAP_32BIT, fd, 0);
+    char *g = mmap(NULL, page, rw, MAP_PRIVATE | MAP_32BIT, fd, 0);
+    printf("file: low=%d private: low=%d\n", low_area(f, page), low_area(g, page));
+    mmap(a + page, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    char *grown = mremap(a, page, 2 * page, MREMAP_MAYMOVE);
+    printf("moved: high=%d kept=%d\n", (uintptr_t)grown >= 0x80000000, grown != MAP_FAILED && *grown);
+    /* One of 448 MiB fits below the page at 0x60000000 (what is mapped so far
+       lies within 48 MiB of 1 GiB), one above it, and no third. */
+    size_t len = 0x1c000000;
+    char *big = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    char *big2 = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("big: low=%d %d\n", low_area(big, len), low_area(big2, len));
+    errno = 0;
+    char *none = mmap(NULL, len, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("full: failed=%d errno=%d\n", none == MAP_FAILED, errno);
+    errno = 0;
+    none = mmap(NULL, 0x80001000, PROT_NONE, low | MAP_NORESERVE, -1, 0);
+    printf("long: failed=%d errno=%d\n", none == MAP_FAILED, errno);
+    char *min = mmap((char *)0x1000L, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("min=%#lx\n", (unsigned long)min);
+    char *unit = mmap((char *)0x10L, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("under-a-page: high=%d\n", (uintptr_t)unit >= 0x80000000);
+    close(fd), close(zero);
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -39409,6 +39472,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
+    if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

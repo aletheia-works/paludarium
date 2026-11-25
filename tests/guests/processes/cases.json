@@ -467,6 +467,7 @@
     {"name":"tmpfs-huge","binary":"process"},
     {"name":"tmpfs-huge-placement","binary":"process"},
     {"name":"anon-thp-placement","binary":"process"},
+    {"name":"mmap-32bit","binary":"process"},
     {"name":"generated-noexec","binary":"process"},
     {"name":"exec-truncated","binary":"process"},
     {"name":"dev-shm","binary":"process"},

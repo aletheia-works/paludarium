@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use paludarium_cpu::CpuState;
 use paludarium_host::{ClockId, FileHandle, Host, WaitOutcome};
-use paludarium_mmu::{AddressSpace, Backing, MappingKind, Placement, Prot, Remap};
+use paludarium_mmu::{AddressSpace, Backing, Fit, MappingKind, Placement, Prot, Remap};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 
 use crate::signals::SleepClock;
@@ -2476,6 +2476,7 @@ const MAP_NONBLOCK: u64 = 0x10000;
 const MAP_NORESERVE: u64 = 0x4000;
 const MAP_STACK: u64 = 0x2_0000;
 const MAP_GROWSDOWN: u64 = 0x100;
+const MAP_32BIT: u64 = 0x40;
 
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
@@ -2571,14 +2572,15 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             Placement::Exactly(at)
         }
     } else {
-        // Linux rounds a non-fixed hint down to its page boundary.
-        let hint = GuestAddr(addr & !4095);
-        let hint = (hint.0 != 0).then_some(hint);
+        // Linux rounds a non-fixed hint down to its page boundary, and one
+        // below `mmap_min_addr` up to that (`round_hint_to_min`).
+        let hint = addr & !4095;
+        let hint = (hint != 0).then(|| GuestAddr(hint.max(paludarium_mmu::MMAP_MIN_ADDR)));
         // A file of a tmpfs mount with `huge=` goes at the 2 MiB boundary
         // its offset agrees with (`shmem_get_unmapped_area`).
         const HUGE: u64 = 2 << 20;
         let private = flags & MAP_SHARED == 0;
-        match &file {
+        let placement = match &file {
             Some(file) if file.huge_placement() => Placement::Aligned {
                 hint,
                 size: HUGE,
@@ -2596,6 +2598,22 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 Placement::Thp { hint, offset: 0 }
             }
             _ => Placement::Near(hint),
+        };
+        // `MAP_32BIT` looks in the first 2 GiB instead (`find_start_end`).
+        match placement {
+            _ if flags & MAP_32BIT == 0 => placement,
+            Placement::Aligned { size, offset, .. } => Placement::Low {
+                hint,
+                fit: Fit::Aligned { size, offset },
+            },
+            Placement::Thp { offset, .. } => Placement::Low {
+                hint,
+                fit: Fit::Thp { offset },
+            },
+            _ => Placement::Low {
+                hint,
+                fit: Fit::Near,
+            },
         }
     };
     // A locked mapping, by MAP_LOCKED or `mlockall`'s MCL_FUTURE, needs

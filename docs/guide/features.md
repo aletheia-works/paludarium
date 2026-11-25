@@ -1733,6 +1733,14 @@ kernel.
   agrees with (`get_unmapped_area_zero`), or at the hint when the longer
   room fits there.
 
+- `MAP_32BIT` puts a mapping in the first 2 GiB, as Linux's `find_start_end`
+  does, in either layout: at a free hint that ends by 2 GiB, else in the
+  lowest room from 1 GiB up (Linux starts up to 32 MiB higher, at random),
+  with the placements at a 2 MiB boundary there too, or `ENOMEM`.
+  `MAP_FIXED` overrides it, and `mremap` does not keep to it. The mapping
+  of an `io_uring` ring does not follow it yet. A hint below
+  `mmap_min_addr` (64 KiB) is taken as that address.
+
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or

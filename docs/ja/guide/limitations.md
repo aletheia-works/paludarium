@@ -106,9 +106,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc` に届きます。ほかのプロセスのディレクトリでは、それらは `ENOENT` です。Linux は
   root に `stack` なども見せます。`wchan` は、待っているタスクでも `0` です。Linux は、タスクを
   読める読み手には待っているカーネルの関数の名前を見せますが、ここには名前を付けるカーネルの
-  関数がありません。`/proc/sys` のファイルは、`poll` ではいつも用意ができていて、`epoll_ctl` は
-  拒みます（`EPERM`）。Linux は受け付け、`hostname` か `domainname` が変わると `POLLERR` と
-  `POLLPRI` を返します。`io` は、Linux の `kernel_read` と `kernel_write` が
+  関数がありません。`hostname` と `domainname` をいくつか見張る epoll 自身のポーリングは、
+  用意のできたものが 1 つ見つかるまで、記述子の番号の順に見ます。Linux は変わった順に見るので、
+  いくつか変わっていると、見たことになるものが違うことがあります。`io` は、Linux の `kernel_read` と `kernel_write` が
   そのプロセスに数えるもの（`execve` がプログラムとインタープリターを読むこと、コアダンプの
   書き込み）を数えません。また、Linux がファイルの操作の前でも中でも返す errno
   （`EINVAL`、`EFAULT`。eventfd に小さすぎるバッファを渡したときなど）で失敗した読み書きは、

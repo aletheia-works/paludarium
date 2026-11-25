@@ -4177,7 +4177,13 @@ kernel.
   taken whole, its bytes up to a NUL or newline put at its offset, 64 in all
   at most, with a NUL after them. The bytes of the old name past that NUL
   stay, and `uname` gives them too, where `sethostname` clears them. A write
-  past the end of the name changes nothing.
+  past the end of the name changes nothing. `poll`, `select` and `epoll` take
+  the files of `/proc/sys`, as `proc_sys_poll` does, and find them ready;
+  after a change of `hostname` or `domainname`, by `sethostname`,
+  `setdomainname` or a write to the file that is not refused, in any UTS
+  namespace, the first poll of each open file description gives `POLLIN`,
+  `POLLRDNORM`, `POLLERR` and `POLLPRI` and no `POLLOUT`. A `dup` and a child
+  share what it has seen, and a poll of an epoll that watches it is one too.
 
 - `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
   its listing differs from Linux's, which has the rest of the `vm` sysctls

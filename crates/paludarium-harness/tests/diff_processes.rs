@@ -258,6 +258,7 @@ mod linux {
                     | "sysvipc-proc"
                     | "kernel-sysctl"
                     | "uts-sysctl"
+                    | "uts-sysctl-poll"
                     | "net-sysctl"
                     | "mqueue-calls"
                     | "mqueue-limits"
@@ -1012,6 +1013,7 @@ mod linux {
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
         processes_uts_sysctl => ("uts-sysctl","process"),
+        processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),
         processes_net_sysctl => ("net-sysctl","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),

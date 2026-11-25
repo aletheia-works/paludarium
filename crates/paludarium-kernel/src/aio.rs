@@ -601,12 +601,13 @@ pub(crate) fn complete_ready(limits: &Limits, hub: &crate::events::ReadinessHub)
 
 /// What `vfs_poll` gives of `file`, and how many wait queues its poll adds
 /// a waiter to: none for a file without `poll` (a regular file, a
-/// directory), which gives `DEFAULT_POLLMASK`; two for a FIFO open to read
-/// and write and for a terminal, which wait on a queue for each. A pipe or
+/// directory), which gives `DEFAULT_POLLMASK`, and for a file of `/proc/sys`
+/// whose table entry has none; two for a FIFO open to read and write and for
+/// a terminal, which wait on a queue for each. A pipe or
 /// socket that is readable is `POLLRDNORM` too, and one that takes a write
 /// `POLLWRNORM`, as Linux's `pipe_poll` and `unix_poll` say.
 pub(crate) fn polled(file: &Arc<dyn FileHandle>) -> (u32, u32) {
-    let Ok((mut mask, _, _)) = file.readiness() else {
+    let Ok((mut mask, _, _)) = crate::events::poll_file(&**file) else {
         return (DEFAULT_POLLMASK, 0);
     };
     let kind = file.stat().map_or(0, |stat| stat.mode & S_IFMT);
@@ -618,7 +619,9 @@ pub(crate) fn polled(file: &Arc<dyn FileHandle>) -> (u32, u32) {
             mask |= POLLWRNORM;
         }
     }
-    let queues = if (kind == S_IFIFO && file.flags() & 3 == 2) || kind == S_IFCHR {
+    let queues = if crate::sysctl::never_wakes(&**file) {
+        0
+    } else if (kind == S_IFIFO && file.flags() & 3 == 2) || kind == S_IFCHR {
         2
     } else {
         1

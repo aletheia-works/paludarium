@@ -3606,7 +3606,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`proc_dostring`）。読み込みはファイルの位置から続きます。書き込みは全体を受け取り、NUL か
   改行までのバイトをそのオフセットに、全部で 64 バイトまで置き、その後ろに NUL を置きます。
   その NUL より後ろには前の名前のバイトが残り、`uname` もそれを答えます。`sethostname` は
-  それを消します。名前の終わりより後ろへの書き込みは何も変えません。
+  それを消します。名前の終わりより後ろへの書き込みは何も変えません。`poll`、`select`、
+  `epoll` は、`proc_sys_poll` と同じく `/proc/sys` のファイルを受け付け、いつも用意が
+  できています。どの UTS 名前空間でも、`sethostname`、`setdomainname`、または拒まれない
+  ファイルへの書き込みで `hostname` か `domainname` が変わると、開いたファイルごとに最初の
+  ポーリングが、`POLLOUT` のない `POLLIN`、`POLLRDNORM`、`POLLERR`、`POLLPRI` を返します。
+  見たかどうかは `dup` と子で共有します。それを見張る epoll のポーリングも、見たことになります。
 
 - `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
   ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は

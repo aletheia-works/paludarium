@@ -2037,7 +2037,7 @@ fn wait_ready(
                     .any(
                         |(&(events, fd, before), &(_, _, now))| match (before, now) {
                             (Some(before), Some(now)) => woke(events, before, now),
-                            _ => revents(c, fd, events as u16) != 0,
+                            _ => revents_by(c, fd, events as u16, false) != 0,
                         },
                     )
             }
@@ -2315,7 +2315,7 @@ fn select(
     for fd in 0..n {
         let bit = 1u64 << (fd % 64);
         if wanted.iter().any(|set| set[(fd / 64) as usize] & bit != 0)
-            && revents(c, fd as i32, 0) == POLLNVAL
+            && revents_by(c, fd as i32, 0, false) == POLLNVAL
         {
             return Err(Errno::EBADF);
         }
@@ -2379,7 +2379,20 @@ fn select(
 /// The poll events of descriptor `fd` among `events` (with POLLERR and
 /// POLLHUP always), POLLNVAL for one that is not open, 0 for a negative fd.
 /// Asking for POLLOUT of a full datagram socket notes it (`polled_full`).
+/// It polls the file ([`crate::events::poll_file`]).
 fn revents(c: &Context<'_>, fd: i32, events: u16) -> u16 {
+    revents_by(c, fd, events, true)
+}
+
+/// [`revents`], which polls the file only with `poll` and else just looks.
+fn revents_by(c: &Context<'_>, fd: i32, events: u16, poll: bool) -> u16 {
+    let state = |file: &std::sync::Arc<dyn FileHandle>| {
+        if poll {
+            crate::events::poll_file(&**file)
+        } else {
+            file.readiness()
+        }
+    };
     match fd {
         fd if fd < 0 => 0,
         // The host's standard input is readable with bytes to read, and at
@@ -2393,7 +2406,7 @@ fn revents(c: &Context<'_>, fd: i32, events: u16) -> u16 {
         },
         1 | 2 if c.files.uses_original_stdio(fd as u64) => events & POLLOUT,
         _ => match c.files.descriptor(fd as u64) {
-            Ok(d) => match d.file.readiness() {
+            Ok(d) => match state(&d.file) {
                 Ok((mask, _, _)) => {
                     if events & POLLOUT != 0 && mask as u16 & POLLOUT == 0 {
                         crate::sockets::polled_full(&d.file);
@@ -4695,6 +4708,7 @@ fn set_uts_name(c: &mut Context<'_>, a: [u64; 6], host: bool) -> Outcome {
     } else {
         uts.set_domain(&name);
     }
+    c.processes.sysctls.uts_changed(!host, &c.files.readiness);
     ok(0)
 }
 fn sys_sethostname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

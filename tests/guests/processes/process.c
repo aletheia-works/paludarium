@@ -24988,6 +24988,166 @@ static int uts_sysctl_case(void) {
     close(fd);
     return 0;
 }
+/* What a poll for `events` (without waiting) gives of `fd`. */
+static int us_poll(int fd, int events) {
+    struct pollfd p = {fd, events, 0};
+    int r = poll(&p, 1, 0);
+    return r < 0 ? -errno : p.revents;
+}
+#define US_ALL (POLLIN | POLLOUT | POLLPRI | POLLRDNORM | POLLWRNORM | POLLRDBAND | POLLWRBAND)
+/* Prints what epoll_wait gives of `ep`, waiting `ms`. */
+static void us_epoll(const char *label, int ep, int ms) {
+    struct epoll_event got[4];
+    int n = epoll_wait(ep, got, 4, ms);
+    printf(" %s=%d", label, n < 0 ? -errno : n);
+    for (int i = 0; i < n; i++) printf(":%d/%#x", (int)got[i].data.u32, got[i].events);
+}
+static int us_add(int ep, int fd, unsigned events, int data) {
+    struct epoll_event e = {.events = events, .data.u32 = data};
+    return epoll_ctl(ep, EPOLL_CTL_ADD, fd, &e) ? -errno : 0;
+}
+/* The uts-sysctl-poll case: proc_sys_poll. A file of /proc/sys is always
+   ready; hostname and domainname give EPOLLERR and EPOLLPRI, and no
+   EPOLLOUT, at the first poll after a change, in whatever UTS namespace,
+   which the open file description then has seen. As root, in a UTS
+   namespace of its own. */
+static int uts_sysctl_poll_case(void) {
+    if (unshare(CLONE_NEWUTS)) {
+        printf("unshare: %d\n", errno);
+        return 1;
+    }
+    sethostname("first", 5);
+    int host = us_open("hostname", O_RDWR), other = us_open("hostname", O_RDONLY);
+    int domain = us_open("domainname", O_RDWR), type = us_open("ostype", O_RDONLY);
+    int sem = us_open("sem", O_RDONLY);
+    int same = dup(host);
+    printf("at-open host=%#x domain=%#x ostype=%#x sem=%#x\n", us_poll(host, US_ALL), us_poll(domain, US_ALL),
+           us_poll(type, US_ALL), us_poll(sem, US_ALL));
+    sethostname("second", 6);
+    int first = us_poll(host, US_ALL), again = us_poll(host, US_ALL);
+    int through_dup = us_poll(same, US_ALL), opened = us_poll(other, US_ALL), seen = us_poll(other, US_ALL);
+    printf("sethostname first=%#x again=%#x dup=%#x other=%#x seen=%#x domain=%#x ostype=%#x\n", first, again,
+           through_dup, opened, seen, us_poll(domain, US_ALL), us_poll(type, US_ALL));
+    setdomainname("d", 1);
+    int domain_first = us_poll(domain, POLLPRI), host_too = us_poll(host, POLLPRI);
+    printf("setdomainname domain=%#x host=%#x again=%#x\n", domain_first, host_too, us_poll(domain, POLLPRI));
+    /* A poll for something else tells of it too, and has seen it. */
+    sethostname("third", 5);
+    int only_out = us_poll(host, POLLOUT), then = us_poll(host, POLLOUT);
+    printf("pollout %#x then %#x\n", only_out, then);
+    /* Writes tell, of what they change or not; a refused one does not. */
+    us_poll(other, 0);
+    long wrote = us_pwrite(host, "w", 1, 0);
+    int after_write = us_poll(other, POLLPRI), writer = us_poll(host, POLLPRI);
+    long past = us_pwrite(host, "w", 1, 40);
+    int after_past = us_poll(other, POLLPRI);
+    long none = us_pwrite(host, "", 0, 0);
+    int after_none = us_poll(other, POLLPRI);
+    long too_long = sethostname("x", 65) ? -errno : 0;
+    int after_refused = us_poll(other, POLLPRI);
+    printf("writes %ld=%#x writer=%#x past %ld=%#x none %ld=%#x refused %ld=%#x\n", wrote, after_write, writer, past,
+           after_past, none, after_none, too_long, after_refused);
+    char text[80];
+    sethostname("fourth", 6);
+    long n = pread(other, text, sizeof text, 0);
+    int after_read = us_poll(other, POLLPRI);
+    printf("read %ld poll=%#x\n", n, after_read);
+    /* Another namespace's change tells too; a child's poll is the parent's. */
+    us_poll(host, 0);
+    us_poll(other, 0);
+    fflush(stdout);
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWUTS)) _exit(90);
+        sethostname("inner", 5);
+        printf("child host=%#x\n", us_poll(host, POLLPRI));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("child", reaped(pid));
+    int by_child = us_poll(host, POLLPRI), unpolled = us_poll(other, POLLPRI);
+    printf("parent host=%#x other=%#x\n", by_child, unpolled);
+    /* select. */
+    sethostname("fifth", 5);
+    for (int turn = 0; turn < 2; turn++) {
+        fd_set sets[3];
+        for (int i = 0; i < 3; i++) {
+            FD_ZERO(&sets[i]);
+            FD_SET(host, &sets[i]);
+        }
+        struct timeval now = {0, 0};
+        int r = select(host + 1, &sets[0], &sets[1], &sets[2], &now);
+        printf("select %d read=%d write=%d except=%d\n", r, !!FD_ISSET(host, &sets[0]), !!FD_ISSET(host, &sets[1]),
+               !!FD_ISSET(host, &sets[2]));
+    }
+    /* epoll: level- and edge-triggered, one-shot, the other files. */
+    us_poll(other, 0);
+    int ep = epoll_create1(0), edge = epoll_create1(0);
+    int added = us_add(ep, host, EPOLLPRI, 1);
+    int edged = us_add(edge, other, EPOLLPRI | EPOLLET, 2);
+    int plain = us_add(ep, type, EPOLLPRI, 3);
+    printf("epoll add=%d edge=%d ostype=%d", added, edged, plain);
+    us_epoll("idle", ep, 0);
+    sethostname("sixth", 5);
+    us_epoll("level", ep, 0);
+    us_epoll("level-again", ep, 0);
+    us_epoll("edge", edge, 0);
+    us_epoll("edge-again", edge, 0);
+    sethostname("seventh", 7);
+    us_epoll("edge-next", edge, 0);
+    us_epoll("edge-next-again", edge, 0);
+    us_epoll("level-next", ep, 0);
+    printf("\n");
+    struct epoll_event once = {.events = EPOLLIN | EPOLLPRI | EPOLLONESHOT, .data.u32 = 4};
+    int modified = epoll_ctl(ep, EPOLL_CTL_MOD, host, &once) ? -errno : 0;
+    sethostname("eighth", 6);
+    printf("one-shot mod=%d", modified);
+    us_epoll("first", ep, 0);
+    sethostname("ninth", 5);
+    us_epoll("second", ep, 0);
+    printf(" poll=%#x\n", us_poll(host, POLLPRI));
+    /* An epoll's own poll polls what it watches, and so has seen it. */
+    int outer = epoll_create1(0);
+    us_poll(other, 0);
+    int inner_added = us_add(outer, edge, EPOLLIN, 5);
+    printf("nested add=%d", inner_added);
+    us_epoll("idle", outer, 0);
+    sethostname("tenth", 5);
+    us_epoll("outer", outer, 0);
+    us_epoll("inner", edge, 0);
+    sethostname("eleventh", 8);
+    printf(" poll-inner=%#x", us_poll(edge, POLLIN));
+    us_epoll("inner", edge, 0);
+    printf("\n");
+    /* A change wakes a wait. */
+    us_poll(host, 0);
+    us_poll(other, 0);
+    int ready[2];
+    if (pipe(ready)) return 1;
+    for (int way = 0; way < 2; way++) {
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            char byte;
+            if (read(ready[0], &byte, 1) != 1) _exit(91);
+            usleep(50000);
+            sethostname(way ? "late2" : "late1", 5);
+            _exit(0);
+        }
+        if (write(ready[1], "r", 1) != 1) return 1;
+        if (way) {
+            printf("wait");
+            us_epoll("edge", edge, 5000);
+            printf("\n");
+        } else {
+            struct pollfd p = {host, POLLPRI, 0};
+            int r = poll(&p, 1, 5000);
+            printf("wait poll=%d:%#x\n", r, p.revents);
+        }
+        result("waker", reaped(pid));
+    }
+    return 0;
+}
 /* The net-sysctl case's files, under /proc/sys/net. */
 static long ns_read(const char *name) {
     char path[128], text[32] = {0};
@@ -38344,6 +38504,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
+    if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();
     if (!strcmp(mode, "net-sysctl")) return net_sysctl_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();

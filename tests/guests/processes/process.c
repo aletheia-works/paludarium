@@ -7529,6 +7529,116 @@ static int vma_names_case(void) {
     printf("cleared: [%s]\n", seen);
     return 0;
 }
+/* The chroot-names case: renames made under one root move the names of
+   files opened under another, as d_move moves the dentry whatever the
+   root. The child, a copy of this program run in a chroot, renames what
+   its parent mapped and its own program; the parent renames what the child
+   mapped, through a symbolic link that starts at the child's root. As root,
+   for chroot. */
+static int cn_maps_name(pid_t pid, uint64_t at, char *out, size_t size) {
+    out[0] = 0;
+    char name[64], line[4096];
+    snprintf(name, sizeof name, "/proc/%d/maps", (int)pid);
+    FILE *maps = fopen(name, "r");
+    if (!maps) return 0;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && at >= start && at < end) {
+            char *path = strchr(line, '/');
+            if (path) {
+                path[strcspn(path, "\n")] = 0;
+                snprintf(out, size, "%s", path);
+            }
+            break;
+        }
+    }
+    fclose(maps);
+    return out[0] != 0;
+}
+static int chroot_names_child(void) {
+    char byte = 0;
+    if (rename("/data", "/data2") || rename("/prog", "/prog2")) return 70;
+    if (write(11, &byte, 1) != 1 || read(10, &byte, 1) != 1) return 71;
+    if (symlink("/data2", "/link")) return 72;
+    int fd = open("/link", O_RDONLY);
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 73;
+    uint64_t at = (uintptr_t)map;
+    if (write(11, &at, sizeof at) != sizeof at || read(10, &byte, 1) != 1) return 74;
+    return 0;
+}
+static int chroot_names_case(void) {
+    char dir[] = "/tmp/chroot-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char jail[64], data[80], data2[80], data3[80], prog[80], prog2[80], lnk[80], seen[4096];
+    snprintf(jail, sizeof jail, "%s/jail", dir);
+    snprintf(data, sizeof data, "%s/data", jail);
+    snprintf(data2, sizeof data2, "%s/data2", jail);
+    snprintf(data3, sizeof data3, "%s/data3", jail);
+    snprintf(prog, sizeof prog, "%s/prog", jail);
+    snprintf(prog2, sizeof prog2, "%s/prog2", jail);
+    snprintf(lnk, sizeof lnk, "%s/link", jail);
+    if (mkdir(jail, 0755)) return 81;
+    int fd = open(data, O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ftruncate(fd, 4096)) return 82;
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 83;
+    int from = open("/proc/self/exe", O_RDONLY), to = open(prog, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    if (from < 0 || to < 0) return 84;
+    char buf[65536], byte = 0;
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return 85;
+    close(from);
+    close(to);
+    int go[2], done[2];
+    if (pipe(go) || pipe(done)) return 86;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int in = fcntl(go[0], F_DUPFD, 20), out = fcntl(done[1], F_DUPFD, 20);
+        close(go[0]); close(go[1]); close(done[0]); close(done[1]);
+        dup2(in, 10);
+        dup2(out, 11);
+        close(in);
+        close(out);
+        if (chroot(jail) || chdir("/")) _exit(87);
+        char *argv[] = {"/prog", "chroot-names-child", "/prog", NULL};
+        execv("/prog", argv);
+        _exit(88);
+    }
+    close(go[0]);
+    close(done[1]);
+    if (read(done[0], &byte, 1) != 1) return 89;
+    cn_maps_name(getpid(), (uintptr_t)map, seen, sizeof seen);
+    printf("mapping renamed under chroot: %d\n", !strcmp(seen, data2));
+    char exe[64];
+    snprintf(exe, sizeof exe, "/proc/%d/exe", (int)child);
+    n = readlink(exe, seen, sizeof seen - 1);
+    seen[n < 0 ? 0 : n] = 0;
+    printf("program renamed under chroot: %d\n", !strcmp(seen, prog2));
+    uint64_t at = 0;
+    if (write(go[1], &byte, 1) != 1 || read(done[0], &at, sizeof at) != sizeof at) return 90;
+    cn_maps_name(child, at, seen, sizeof seen);
+    printf("child's mapping: %d\n", !strcmp(seen, data2));
+    if (rename(data2, data3)) return 91;
+    cn_maps_name(child, at, seen, sizeof seen);
+    printf("renamed from outside: %d\n", !strcmp(seen, data3));
+    cn_maps_name(getpid(), (uintptr_t)map, seen, sizeof seen);
+    printf("and the parent's: %d\n", !strcmp(seen, data3));
+    if (write(go[1], &byte, 1) != 1) return 92;
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    unlink(lnk);
+    unlink(data3);
+    unlink(prog2);
+    rmdir(jail);
+    rmdir(dir);
+    return 0;
+}
 /* The proc-mem case: /proc/<pid>/mem reads and writes a task's memory at
    the address its position gives, as fs/proc/base.c's mem_rw does through
    access_remote_vm with FOLL_FORCE: a read-only page is written, a call
@@ -40013,6 +40123,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rename-names")) return rename_names_case();
     if (!strcmp(mode, "rename-names-child")) return rename_names_child();
     if (!strcmp(mode, "vma-names")) return vma_names_case();
+    if (!strcmp(mode, "chroot-names")) return chroot_names_case();
+    if (!strcmp(mode, "chroot-names-child")) return chroot_names_child();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();

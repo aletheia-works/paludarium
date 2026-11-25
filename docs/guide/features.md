@@ -4391,7 +4391,9 @@ kernel.
   `/proc/self/exe` names the program, as Linux's `d_path` of the file:
   by its path with symbolic links resolved, moved by renames, and
   `(deleted)` once that name is removed. A core's `NT_FILE` note names
-  them all the same way.
+  them all the same way. A rename moves a name whichever root (`chroot`) it
+  is made under, and a name under the reader's root, or the dumping
+  process's, is shown from it, as `d_path` shows it.
   It is made as it is read, as Linux's `seq_file` makes it: a read gathers
   whole lines up to a page, goes on from the VMA it found next, and sees the
   mappings of that moment, `lseek` goes from the start or the current

@@ -12568,6 +12568,49 @@ mod mapping_names {
             Some(&b"/top/moved (deleted)"[..])
         );
     }
+
+    #[test]
+    fn a_rename_from_another_root_moves_the_name_too() {
+        let mut f = fixture();
+        let path = |f: &Fixture, n: u64, p: &[u8]| {
+            let at = DATA + 0x100 * n;
+            f.mem.write(GuestAddr(at), &[p, b"\0"].concat()).unwrap();
+            at
+        };
+        let map = |f: &mut Fixture, file: u64, flags: u64| {
+            let fd = f.ret(2, &[file, flags, 0o644]);
+            assert!(fd < 1 << 32, "{fd:#x}");
+            if flags != 0 {
+                assert_eq!(f.ret(77, &[fd, 0x1000]), 0);
+            }
+            f.ret(9, &[0, 0x1000, 1, 2, fd, 0])
+        };
+        let jail = path(&f, 0, b"/jail");
+        assert_eq!(f.ret(83, &[jail, 0o755]), 0);
+        let file = path(&f, 1, b"/jail/file");
+        let outside = map(&mut f, file, 0o102);
+        assert_eq!(name(&f, outside).as_deref(), Some(&b"/jail/file"[..]));
+        // chroot("/jail"); then rename("/file", "/moved") from there.
+        assert_eq!(f.ret(161, &[jail]), 0);
+        let (inner, moved) = (path(&f, 2, b"/file"), path(&f, 3, b"/moved"));
+        assert_eq!(f.ret(82, &[inner, moved]), 0);
+        assert_eq!(name(&f, outside).as_deref(), Some(&b"/jail/moved"[..]));
+        // Opened there through an absolute symbolic link, which starts at
+        // that root, and renamed once more.
+        let link = path(&f, 4, b"/link");
+        assert_eq!(f.ret(88, &[moved, link]), 0);
+        let inside = map(&mut f, link, 0);
+        assert_eq!(name(&f, inside).as_deref(), Some(&b"/jail/moved"[..]));
+        let last = path(&f, 5, b"/last");
+        assert_eq!(f.ret(82, &[moved, last]), 0);
+        for at in [outside, inside] {
+            assert_eq!(name(&f, at).as_deref(), Some(&b"/jail/last"[..]));
+        }
+        assert_eq!(f.ret(87, &[last]), 0);
+        for at in [outside, inside] {
+            assert_eq!(name(&f, at).as_deref(), Some(&b"/jail/last (deleted)"[..]));
+        }
+    }
 }
 
 mod vma_names {

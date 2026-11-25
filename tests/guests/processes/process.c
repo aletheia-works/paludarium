@@ -14242,6 +14242,68 @@ static void cr_lines(const char *label, int dir, const char *name) {
     close(fd);
     printf("%s: %d lines\n", label, lines);
 }
+/* What a `..` finds that climbs above the new root as written: after a
+   symbolic link it goes up from the link's target, and what is not there,
+   no directory or not searched stops the walk where Linux stops it. The
+   child is in the new root, its working directory there too. */
+static void cr_climb(void) {
+    mkdir("/d/e/g", 0755);
+    cr_put("/d", "f", "mid");
+    cr_put("/d/e", "f", "low");
+    const char *links[][2] = {{"/d/e/g", "over"},   {"d/e/g", "deep"},       {"../d/e/g", "d/side"},
+                              {"loop", "loop"},     {"/d/none", "d/gone"},   {"../../..", "d/out"},
+                              {"over/..", "chain"}, {"./d/./e/../e/g", "dots"}, {"f", "file"}};
+    for (unsigned i = 0; i < 9; i++)
+        if (symlink(links[i][0], links[i][1])) printf("symlink %s errno=%d\n", links[i][1], errno);
+    const char *paths[] = {
+        "/over/../../f", "/over/../f", "/over/../../../f", "/over/../../../../f", "/over/../../../../d/f",
+        "/deep/../../f", "/../deep/../../f", "deep/../../f", "../deep/../../f", "/d/../../deep/../f",
+        "/d/side/../../../f", "/d/side/../../../../d/f", "/dots/../../f", "/chain/../../f", "/chain/../f",
+        "/chain/../../../over/../f", "/d/out/../../f", "/d/out/../../../d/f", "/over/../../side/../../../../over/../f", "/d/side/../../../../over/../../f",
+        "/over/.././../f", "//over//..//..//f", "/over/../../../f/", "/over/../../../f/.", "/over/../../side/../f",
+        "/none/../../f", "/over/none/../../../../f", "/f/../../f", "/over/../../f/../../../../f", "/loop/../../f",
+        "/d/gone/../../../f", "/file/../../f", "/locked/../../f", "/locked/none/../../../f", "/over/../../../locked/../../f",
+        "/none/../..", "/f/../..", "/loop/../..", "/over/../../", "/over/../../loop", "/over/../../../loop",
+    };
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++) cr_read(paths[i], paths[i]);
+    struct stat st;
+    const char *all[] = {"/over/../..", "/over/../../side", "/deep/../../gone", "/none/../../over", "/f/../../over"};
+    for (unsigned i = 0; i < 5; i++) {
+        int r = lstat(all[i], &st);
+        printf("lstat %s: %d %o\n", all[i], r ? errno : 0, r ? 0 : st.st_mode & S_IFMT);
+    }
+    int fd = open("/over/../../made", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    printf("made: %d %d\n", fd < 0 ? errno : 0, access("/d/made", F_OK) ? errno : 0);
+    close(fd);
+    fd = open("/none/../../unmade", O_WRONLY | O_CREAT, 0644);
+    printf("unmade: %d %d\n", fd < 0 ? errno : 0, access("/unmade", F_OK) ? errno : 0);
+    printf("rename: %d", rename("/over/../../made", "/deep/../../moved") ? errno : 0);
+    printf(" link: %d", link("/over/../../moved", "/over/../../hard") ? errno : 0);
+    printf(" unlink: %d %d", unlink("/over/../../moved") ? errno : 0, unlink("/d/hard") ? errno : 0);
+    printf(" mkdir: %d", mkdir("/over/../../new", 0755) ? errno : 0);
+    printf(" again: %d", mkdir("/over/../../new/", 0755) ? errno : 0);
+    printf(" rmdir: %d %d", rmdir("/over/../../../new") ? errno : 0, rmdir("/over/../../new") ? errno : 0);
+    printf(" rmdir-up: %d unlink-up: %d\n", rmdir("/over/../..") ? errno : 0, unlink("/over/../..") ? errno : 0);
+    printf("chdir: %d", chdir("/over/../..") ? errno : 0);
+    cr_cwd(" over");
+    printf("chdir none: %d f: %d loop: %d\n", chdir("/none/../..") ? errno : 0, chdir("/f/../..") ? errno : 0,
+           chdir("/loop/../..") ? errno : 0);
+    int d = open("/over", O_RDONLY | O_DIRECTORY);
+    char buf[8] = {0};
+    fd = openat(d, "../../f", O_RDONLY);
+    printf("openat: %d %s\n", fd < 0 ? errno : 0, read(fd, buf, 7) > 0 ? buf : "");
+    close(fd);
+    fd = openat(d, "../../../d/side/../../../../over/../f", O_RDONLY);
+    memset(buf, 0, sizeof buf);
+    printf("openat up: %d %s\n", fd < 0 ? errno : 0, read(fd, buf, 7) > 0 ? buf : "");
+    close(fd);
+    close(d);
+    if (chdir("/")) printf("chdir errno=%d\n", errno);
+    for (unsigned i = 0; i < 9; i++) unlink(links[i][1]);
+    unlink("/d/f");
+    unlink("/d/e/f");
+    printf("climbed: %d\n", rmdir("/d/e/g") ? errno : 0);
+}
 static int chroot_exec_case(void) {
     cr_cwd("exec");
     cr_read("exec /f", "/f");
@@ -14354,6 +14416,7 @@ static int chroot_case(const char *self) {
         if (chdir("/")) _exit(92);
         cr_cwd("root");
         cr_read("../f at root", "../f");
+        cr_climb();
         int d = open("/d", O_RDONLY | O_DIRECTORY);
         if (d < 0 || fchdir(d)) _exit(93);
         close(d);

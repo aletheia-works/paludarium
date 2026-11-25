@@ -12379,6 +12379,118 @@ fn chroot_keeps_paths_to_the_new_root() {
     let p = s(&mut f, 0, b"/none");
     assert_eq!(f.ret(161, &[p]), errno(Errno::ENOENT));
 }
+/// A `..` that climbs above the root as written goes up from the target of
+/// the symbolic link before it, and a walk that ends early ends there, as
+/// Linux's `link_path_walk` does.
+#[test]
+fn a_dotdot_after_a_link_climbs_from_its_target_in_a_root() {
+    let mut f = fixture();
+    let s = |f: &mut Fixture, at: u64, text: &[u8]| -> u64 {
+        let mut bytes = text.to_vec();
+        bytes.push(0);
+        f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+        DATA + at
+    };
+    for dir in ["/jail", "/jail/d", "/jail/d/e", "/jail/d/e/g", "/d"] {
+        let p = s(&mut f, 0, dir.as_bytes());
+        assert_eq!(f.ret(83, &[p, 0o755]), 0);
+    }
+    let files = [
+        ("/f", "out"),
+        ("/jail/f", "in"),
+        ("/jail/d/f", "mid"),
+        ("/jail/d/e/f", "low"),
+    ];
+    for (path, text) in files {
+        let p = s(&mut f, 0, path.as_bytes());
+        let fd = f.ret(2, &[p, 0o101, 0o644]);
+        let data = s(&mut f, 0x100, text.as_bytes());
+        assert_eq!(f.ret(1, &[fd, data, text.len() as u64]), text.len() as u64);
+        f.ret(3, &[fd]);
+    }
+    let links = [
+        ("/d/e/g", "/jail/over"),
+        ("d/e/g", "/jail/deep"),
+        ("over/..", "/jail/chain"),
+        ("loop", "/jail/loop"),
+        ("/d/none", "/jail/gone"),
+        ("f", "/jail/file"),
+    ];
+    for (target, link) in links {
+        let (target, link) = (
+            s(&mut f, 0, target.as_bytes()),
+            s(&mut f, 0x80, link.as_bytes()),
+        );
+        assert_eq!(f.ret(88, &[target, link]), 0);
+    }
+    let p = s(&mut f, 0, b"/jail");
+    assert_eq!(f.ret(161, &[p]), 0);
+    let p = s(&mut f, 0, b"/");
+    assert_eq!(f.ret(80, &[p]), 0);
+    let mut read = |path: &str| -> String {
+        let p = s(&mut f, 0, path.as_bytes());
+        let fd = f.ret(2, &[p, 0, 0]);
+        if (fd as i64) < 0 {
+            return format!("errno {}", -(fd as i64));
+        }
+        let n = f.ret(0, &[fd, DATA + 0x200, 16]);
+        let mut out = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x200), &mut out).unwrap();
+        f.ret(3, &[fd]);
+        String::from_utf8(out).unwrap()
+    };
+    for (path, found) in [
+        ("/over/../../f", "mid"),
+        ("/deep/../../f", "mid"),
+        ("../deep/../../f", "mid"),
+        ("/../over/../f", "low"),
+        ("/over/../../../f", "in"),
+        ("/over/../../../../f", "in"),
+        ("/chain/../../over/../f", "low"),
+        ("/over/.././/../f", "mid"),
+        ("/over/../../f/", "errno 20"),
+        ("/over/../../f/.", "errno 20"),
+        ("/none/../../f", "errno 2"),
+        ("/f/../../f", "errno 20"),
+        ("/file/../../f", "errno 20"),
+        ("/loop/../../f", "errno 40"),
+        ("/gone/../../f", "errno 2"),
+        ("/f/../..", "errno 20"),
+        ("/over/../../../loop", "errno 40"),
+    ] {
+        assert_eq!(read(path), found, "{path}");
+    }
+    // A name made or removed there, and a working directory.
+    let made = s(&mut f, 0, b"/over/../../made");
+    assert_eq!(f.ret(83, &[made, 0o755]), 0);
+    let p = s(&mut f, 0x80, b"/d/made");
+    assert_eq!(f.ret(84, &[p]), 0);
+    for (path, result) in [
+        (&b"/none/../.."[..], errno(Errno::ENOENT)),
+        (b"/f/../..", errno(Errno::ENOTDIR)),
+        (b"/over/../..", 0),
+    ] {
+        let p = s(&mut f, 0, path);
+        assert_eq!(f.ret(80, &[p]), result);
+    }
+    let n = f.ret(79, &[DATA + 0x1000, 256]);
+    let mut out = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x1000), &mut out).unwrap();
+    assert_eq!(out, b"/d\0");
+    // An unsearched directory refuses before a missing name in it.
+    let p = s(&mut f, 0, b"/d/e");
+    assert_eq!(f.ret(90, &[p, 0o600]), 0);
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    for path in [&b"/d/e/none/../../../../f"[..], b"/d/e/../../../f"] {
+        let p = s(&mut f, 0, path);
+        assert_eq!(f.ret(2, &[p, 0, 0]), errno(Errno::EACCES));
+    }
+}
 /// `/proc/self/root` is the root, and the links read from the reader's
 /// root, as Linux's `d_path` gives them.
 #[test]

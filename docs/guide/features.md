@@ -2199,7 +2199,10 @@ kernel.
   permission on the directory (`EACCES`), then `CAP_SYS_CHROOT` in the
   caller's user namespace (`EPERM`). An absolute path or symbolic link then
   starts at the root and `..` stays there, for exec and its interpreters
-  too. The working directory stays where it was, and from one outside the
+  too. In a path that climbs above the root as written, a `..` after a
+  symbolic link goes up from the link's target, and a name that is not
+  there or is no directory ends the walk, as Linux's `link_path_walk` does.
+  The working directory stays where it was, and from one outside the
   root a path goes anywhere, as on Linux. `getcwd` gives a working directory
   from the root, or, when it is not under the root, its path from the
   machine's root after `(unreachable)`. A child of `fork` keeps the root, a

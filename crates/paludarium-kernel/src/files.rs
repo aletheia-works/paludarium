@@ -1008,10 +1008,92 @@ impl Files {
         }
         match paludarium_vfs::normalize_in(&root, &joined) {
             Ok(kept) if paludarium_vfs::normalize_path(&joined).ok() != Some(kept.clone()) => {
-                Ok(kept)
+                Ok(self.climbed(&root, &joined))
             }
             _ => Ok(joined),
         }
+    }
+    /// The path `joined`, whose `..` would leave `root` as written, with
+    /// everything up to its last `..` walked as Linux walks it: a `..`
+    /// after a symbolic link goes up from the link's target, and one at
+    /// the root stays. A walk that ends early (a name that is not there or
+    /// is no directory, too many links) gives a path that ends at the same
+    /// name, for the call's own lookup to report, after the permissions on
+    /// the way.
+    fn climbed(&self, root: &[u8], joined: &[u8]) -> Vec<u8> {
+        const DIRECTORY: u32 = 0o040000;
+        const SYMLINK: u32 = 0o120000;
+        let names = |path: &[u8]| -> std::collections::VecDeque<Vec<u8>> {
+            path.split(|&b| b == b'/')
+                .filter(|part| !part.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect()
+        };
+        let fs = self.fs();
+        let mut left = names(joined);
+        let mut ups = left.iter().filter(|part| *part == b"..").count();
+        // Of a link's target, how many names are still to be walked.
+        let mut linked = 0_usize;
+        let mut links = 0;
+        let mut at = b"/".to_vec();
+        while ups > 0 || linked > 0 {
+            let Some(part) = left.pop_front() else {
+                break;
+            };
+            let written = linked == 0;
+            linked = linked.saturating_sub(1);
+            let up = part == b"..";
+            if up && written {
+                ups -= 1;
+            }
+            let here = fs.metadata(&at, false);
+            if here.is_ok_and(|stat| stat.mode & 0o170000 == DIRECTORY) {
+                if up {
+                    if at != root && at != b"/" {
+                        let parent = at.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        at.truncate(parent.max(1));
+                    }
+                    continue;
+                }
+                if part == b"." {
+                    continue;
+                }
+                let next = child_of(&at, &part);
+                match fs.metadata(&next, false) {
+                    Ok(stat) if stat.mode & 0o170000 == SYMLINK && links < 40 => {
+                        links += 1;
+                        if let Ok(target) = fs.readlink(&next)
+                            && !target.is_empty()
+                        {
+                            if target[0] == b'/' {
+                                at = root.to_vec();
+                            }
+                            let target = names(&target);
+                            linked += target.len();
+                            for part in target.into_iter().rev() {
+                                left.push_front(part);
+                            }
+                            continue;
+                        }
+                    }
+                    Ok(stat) if stat.mode & 0o170000 != SYMLINK => {
+                        at = next;
+                        continue;
+                    }
+                    _ => {}
+                }
+                at = next;
+            }
+            // The walk ends here: nothing below is a name to go up from.
+            left.retain(|part| part != b"..");
+            at.extend_from_slice(b"/.");
+            break;
+        }
+        let mut path = left.iter().fold(at, |at, part| child_of(&at, part));
+        if !left.is_empty() && joined.last() == Some(&b'/') {
+            path.push(b'/');
+        }
+        path
     }
     fn joined(&self, root: &[u8], dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
         if p.is_empty() {

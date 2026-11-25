@@ -1272,15 +1272,18 @@ impl Network {
         events
     }
     /// The address a packet to `to` of the protocol `proto` leaves from at
-    /// `now`, from a socket bound to none, through the device `oif` (any for
-    /// 0): its route's source, of an IPv6 multipath route's the one of the
-    /// hop the packet takes. Through a device, for IPv4, as `ip_route_output_key_hash_rcu` takes it with a device
-    /// named, an address of the device's (`inet_select_addr`) of link
-    /// scope to a local group or the limited broadcast address, of any
-    /// scope to another group, and to an address no route through it
-    /// takes, on link; else its route's. For IPv6, its route's through the
-    /// device (`ip6_route_get_saddr`), looked up strictly, as no source is
-    /// chosen yet.
+    /// `now`, from a socket bound to none: its route's source.
+    ///
+    /// For IPv4 through a device `oif` other than 0, as
+    /// `ip_route_output_key_hash_rcu` takes it with a device named: an
+    /// address of the device's (`inet_select_addr`) of link scope to a local
+    /// group or the limited broadcast address, of any scope to another
+    /// group, and to an address no route through it takes, on link; else
+    /// its route's.
+    ///
+    /// For IPv6, its route's through the device, if one is named
+    /// (`ip6_route_get_saddr`), looked up strictly, as no source is chosen
+    /// yet; of a multipath route, the source of the hop the packet takes.
     pub(crate) fn source_through(
         &self,
         to: SocketAddr,

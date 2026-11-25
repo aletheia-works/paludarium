@@ -13,6 +13,7 @@
 //! comes, and `SIOCMCTPALLOCTAG` keeps one until `SIOCMCTPDROPTAG`.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::inet::Network;
+use crate::skb::{SHARED_INFO, truesize};
 use crate::sockets::Timeout;
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat};
@@ -188,18 +189,6 @@ fn bucket(kind: u8, local: u8, peer: u8) -> u32 {
 /// `mctp_address_matches`.
 fn matches(pattern: u8, eid: u8) -> bool {
     pattern == eid || pattern == ANY
-}
-/// The `truesize` of a buffer `alloc_skb` makes for `len` bytes with
-/// `GFP_KERNEL` on x86-64: the `sk_buff` (256 bytes) and its head, which
-/// holds the bytes and the `skb_shared_info` (320) in the small head cache
-/// (640 bytes) when it fits, else in the smallest power of two that does.
-fn truesize(len: usize) -> usize {
-    let head = len.next_multiple_of(64) + 320;
-    256 + if head <= 640 {
-        640
-    } else {
-        head.next_power_of_two()
-    }
 }
 
 impl Endpoints {
@@ -657,7 +646,7 @@ impl MctpSocket {
         // `sock_alloc_send_skb`: the header room, the type and the bytes,
         // in a head `kmalloc` can make (`ENOBUFS`).
         let head = LL_RESERVED + HEADER + 1 + len;
-        if head.next_multiple_of(64) + 320 > KMALLOC_MAX {
+        if head.next_multiple_of(64) + SHARED_INFO > KMALLOC_MAX {
             return Err(ENOBUFS);
         }
         let mut message = Vec::with_capacity(1 + len);
@@ -1195,8 +1184,9 @@ mod tests {
             bucket(1, 9, 0xff),
             (0x00ff_0901u32.wrapping_mul(0x61c8_8647)) >> 25
         );
-        assert_eq!(truesize(21 + 5), 896);
-        assert_eq!(truesize(21 + 400), 1280);
+        assert_eq!(truesize(21 + 5), 960);
+        assert_eq!(truesize(21 + 363), 960);
+        assert_eq!(truesize(21 + 364), 1280);
         assert_eq!(truesize(20 + 65532), 256 + 131_072);
     }
 
@@ -1256,7 +1246,7 @@ mod tests {
             src: 8,
             flags,
             data,
-            size: 896,
+            size: truesize(LL_RESERVED + HEADER + 1),
             net: 1,
             ifindex: 0,
         };
@@ -1303,7 +1293,7 @@ mod tests {
             s.queue.back().map(|m| m.bytes.clone()),
             Some(b"\x01xyz".to_vec())
         );
-        assert_eq!(s.held, 896 * 4);
+        assert_eq!(s.held, 960 * 4);
         drop(s);
         assert!(t.keys.is_empty());
         // Eight tags for a peer, then none; an answer to one frees it.
@@ -1336,7 +1326,7 @@ mod tests {
             src: 8,
             tag: 8,
             ifindex: 0,
-            size: 896,
+            size: truesize(LL_RESERVED + HEADER + 1),
         };
         for _ in 0..3 {
             assert_eq!(socket.queue(message()), Ok(()));

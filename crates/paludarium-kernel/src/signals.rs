@@ -404,8 +404,10 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         | 278 => true,
         // fcntl's F_SETLKW and F_OFD_SETLKW.
         72 => matches!(args[1], 7 | 38),
-        // open, openat and openat2, which wait only to open a FIFO.
-        2 | 257 | 437 => true,
+        // open, creat, openat, open_by_handle_at and openat2, which wait to
+        // open a FIFO or for a lease's break, and truncate, which waits for
+        // the break.
+        2 | 76 | 85 | 257 | 304 | 437 => true,
         // poll with no timeout, and ppoll, select and pselect6 always: they
         // write the time left back to their timeout, so a restart goes on.
         7 => (args[2] as i32) < 0,

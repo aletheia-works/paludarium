@@ -336,6 +336,15 @@ impl Owners {
             .map(|&(_, owner)| owner)
             .unwrap_or_default()
     }
+    /// The owner of the description at address `file`, while it is open.
+    pub(crate) fn at(&mut self, file: usize) -> Option<&mut FileOwner> {
+        self.0
+            .iter_mut()
+            .find(|(entry, _)| {
+                entry.strong_count() != 0 && entry.as_ptr().cast::<()>().addr() == file
+            })
+            .map(|(_, owner)| owner)
+    }
     pub(crate) fn set(&mut self, file: &Arc<dyn FileHandle>, owner: FileOwner) {
         self.0.retain(|(entry, _)| entry.strong_count() != 0);
         match self.0.iter_mut().find(|(entry, _)| Self::same(entry, file)) {
@@ -363,7 +372,11 @@ mod tests {
         };
         owners.set(&first, owner);
         assert_eq!(owners.get(&first), owner);
+        let address = Arc::as_ptr(&first).cast::<()>().addr();
+        owners.at(address).unwrap().id = 8;
+        assert_eq!(owners.get(&first).id, 8);
         drop(first);
+        assert!(owners.at(address).is_none());
         let other = file();
         assert_eq!(owners.get(&other), FileOwner::default());
         assert!(owners.0.is_empty());

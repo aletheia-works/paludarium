@@ -703,8 +703,10 @@ struct State {
     /// in order, which they hold until their completions are posted
     /// (`io_free_batch_list`).
     held: Vec<Arc<Node>>,
-    /// Files no slot holds any more that a request of the running
-    /// submission still does.
+    /// Registered files no slot holds any more that a request still does:
+    /// one of the running batch, or one that waits for its file ([`arm`]).
+    /// Each posts its tag once nothing holds it, at the end of the batch it
+    /// is let go of in ([`Ring::end`]).
     retired: Vec<Arc<Node>>,
 }
 
@@ -796,6 +798,9 @@ struct Transfer {
     /// The provided buffer it chose before it waited for its file, which it
     /// reads to as it goes on.
     kept: Option<Chosen>,
+    /// The file it found before it waited for it (`req->file`): it goes on
+    /// with it, whatever its descriptor or slot holds by then.
+    found: Option<crate::files::Descriptor>,
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
@@ -857,13 +862,14 @@ impl Ring {
         }
     }
 
-    /// Lets go of registered files no slot holds (`io_put_rsrc_node`): one
-    /// a request of the running submission holds waits for its completion,
-    /// and the others post their tags now, in order.
+    /// Lets go of registered files no slot holds (`io_put_rsrc_node`): one a
+    /// request holds, of the running submission or one that waits for its
+    /// file, waits for that request's completion ([`State::retired`]), and
+    /// the others post their tags now, in order.
     fn put_nodes(&self, gone: impl IntoIterator<Item = Arc<Node>>) {
         let mut state = self.state();
         for node in gone {
-            if Arc::strong_count(&node) > 1 && state.deferred.is_some() {
+            if Arc::strong_count(&node) > 1 {
                 state.retired.push(node);
             } else if node.tag != 0 {
                 self.post(&mut state, node.tag, 0, 0);
@@ -904,8 +910,12 @@ impl Ring {
                 }
             }
         }
+        // What nothing holds now posts its tag; what a request that waits
+        // for its file holds waits on, for the batch its completion ends.
         for retired in std::mem::take(&mut state.retired) {
-            if retired.tag != 0 {
+            if Arc::strong_count(&retired) > 1 {
+                state.retired.push(retired);
+            } else if retired.tag != 0 {
                 self.post(&mut state, retired.tag, 0, 0);
             }
         }
@@ -1035,6 +1045,7 @@ impl Ring {
                 segments: Vec::new(),
                 metadata: false,
                 kept: None,
+                found: None,
             })),
             OP_FSYNC => {
                 // `io_fsync_prep`.
@@ -1330,12 +1341,16 @@ struct Waits {
     file: Arc<dyn FileHandle>,
     mask: u32,
     kept: Option<Chosen>,
+    found: crate::files::Descriptor,
 }
 
 fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferred {
-    let opened = match file_of(c, ring, transfer.fd, transfer.fixed) {
-        Ok(opened) => opened,
-        Err(e) => return (Err(e), 0, None, 0),
+    let opened = match &transfer.found {
+        Some(opened) => opened.clone(),
+        None => match file_of(c, ring, transfer.fd, transfer.fixed) {
+            Ok(opened) => opened,
+            Err(e) => return (Err(e), 0, None, 0),
+        },
     };
     let asked = |segments: &[(u64, usize)]| segments.iter().map(|&(_, len)| len as u64).sum();
     let waits = |result: &Result<u64, Errno>, kept: Option<Chosen>| {
@@ -1348,6 +1363,7 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
                     POLL_IN_EVENTS
                 },
             kept,
+            found: opened.clone(),
         })
     };
     if transfer.registered {
@@ -1713,6 +1729,7 @@ fn issue_link(
     if let Some(waits) = waits {
         if let Work::Transfer(transfer) = &mut request.work {
             transfer.kept = waits.kept;
+            transfer.found = Some(waits.found.clone());
         }
         chain.insert(0, request);
         let held = split_held();

@@ -2790,7 +2790,9 @@ fn a_lease_is_taken_changed_and_given_back_as_fs_locks_does() {
     assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
     let dup = f.ret(32, &[rd]);
     assert_eq!(f.ret(72, &[dup, 1025]), 1);
-    // A second reader keeps a write lease from another description.
+    // A second reader keeps a write lease from another description. A
+    // write lease would break for it.
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
     let two = f.ret(2, &[path, 0, 0]);
     assert_eq!(f.ret(72, &[two, 1024, 1]), errno(Errno::EAGAIN));
     // F_UNLCK takes the owner and the signal away.
@@ -2820,6 +2822,88 @@ fn a_lease_is_taken_changed_and_given_back_as_fs_locks_does() {
     f.mem.read(GuestAddr(DATA + 0x80), &mut ends).unwrap();
     let pipe = u64::from(u32::from_le_bytes(ends));
     assert_eq!(f.ret(72, &[pipe, 1024, 0]), errno(Errno::EINVAL));
+}
+/// Opens and truncates that break a lease, as Linux's `__break_lease` does.
+#[test]
+fn an_open_or_truncate_that_conflicts_breaks_a_lease() {
+    const NONBLOCK: u64 = 0o4000;
+    const SIGIO: u64 = 29;
+    let mut f = fixture();
+    // Each break's SIGIO stays pending.
+    f.thread.state.signal_mask |= 1 << (SIGIO - 1);
+    let path = put(&mut f, 0, b"/tmp/leased");
+    let made = f.ret(2, &[path, 0o102, 0o644]);
+    assert_eq!(f.ret(3, &[made]), 0);
+    let rd = f.ret(2, &[path, 0, 0]);
+    // A write lease: what breaks none.
+    assert_eq!(f.ret(72, &[rd, 1024, 1]), 0);
+    let path_only = f.ret(2, &[path, 0o10000000, 0]);
+    assert_eq!(f.ret(3, &[path_only]), 0);
+    assert_eq!(f.ret(2, &[path, 0o302, 0o644]), errno(Errno::EEXIST));
+    assert_eq!(f.ret(2, &[path, 0o200000, 0]), errno(Errno::ENOTDIR));
+    assert_eq!(f.ret(76, &[path, u64::MAX]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(72, &[rd, 1025]), 1);
+    let pending = |f: &mut Fixture| {
+        assert_eq!(f.ret(127, &[DATA + 0x100, 8]), 0);
+        let mut set = [0; 8];
+        f.mem.read(GuestAddr(DATA + 0x100), &mut set).unwrap();
+        u64::from_le_bytes(set)
+    };
+    assert_eq!(pending(&mut f), 0);
+    // A reader's break downgrades it, a writer's takes it away.
+    assert_eq!(f.ret(2, &[path, NONBLOCK, 0]), errno(Errno::EAGAIN));
+    assert_eq!(pending(&mut f), 1 << (SIGIO - 1));
+    assert_eq!(f.ret(72, &[rd, 1025]), 0);
+    assert_eq!(f.ret(2, &[path, NONBLOCK | 1, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    // A downgrade lets readers in, and the writer's break stands.
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(2, &[path, NONBLOCK | 2, 0]), errno(Errno::EAGAIN));
+    let two = f.ret(2, &[path, NONBLOCK, 0]);
+    assert_eq!(f.ret(72, &[two, 1024, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(3, &[two]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    // None left: a writer opens, and truncate works.
+    let rw = f.ret(2, &[path, NONBLOCK | 2, 0]);
+    assert_eq!(f.ret(3, &[rw]), 0);
+    assert_eq!(f.ret(76, &[path, 3]), 0);
+    // A lease of a file opened again through its descriptor, live and
+    // removed.
+    let fd = format!("/proc/self/fd/{rd}");
+    let link = put(&mut f, 0x40, fd.as_bytes());
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(2, &[link, NONBLOCK | 1, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    assert_eq!(f.ret(87, &[path]), 0);
+    assert_eq!(f.ret(2, &[link, NONBLOCK | 1, 0]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), 0);
+    // A wait of lease-break-time seconds takes the lease away.
+    let sysctl = put(&mut f, 0x80, b"/proc/sys/fs/lease-break-time");
+    let seconds = f.ret(2, &[sysctl, 1, 0]);
+    let one = put(&mut f, 0xc0, b"1");
+    assert_eq!(f.ret(1, &[seconds, one, 1]), 1);
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    let late = f.ret(2, &[link, 1, 0]);
+    assert!(late < 100);
+    assert_eq!(f.ret(72, &[rd, 1025]), 2);
+    assert_eq!(f.ret(72, &[rd, 1024, 2]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(72, &[rd, 9]), 0);
+    assert_eq!(f.ret(3, &[late]), 0);
+    // A cancellation ends the wait, as a signal does. The calls that wait
+    // run again after one (ERESTARTSYS); ftruncate does not wait.
+    for number in [2, 76, 85, 257, 304, 437] {
+        assert!(crate::signals::restarts_without_handler(number, &[0; 6]));
+        assert!(crate::signals::restarts_with_handler(number));
+    }
+    assert!(!crate::signals::restarts_without_handler(77, &[0; 6]));
+    assert_eq!(f.ret(72, &[rd, 1024, 0]), 0);
+    f.kernel
+        .cancellation
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(f.ret(2, &[link, 1, 0]), errno(Errno(4)));
 }
 #[test]
 fn syscall_flock_cancel() {
@@ -6271,6 +6355,58 @@ mod io_uring {
             batch(&mut f, &r, &[head, nop(13, 0, 0, 0, 0)]),
             [(12, -9), (13, -125)]
         );
+    }
+
+    /// A `struct io_uring_rsrc_register` at `at`.
+    fn rsrc_register(f: &Fixture, at: u64, count: u32, flags: u32, data: u64, tags: u64) {
+        let mut rr = [0u8; 32];
+        rr[..4].copy_from_slice(&count.to_le_bytes());
+        rr[4..8].copy_from_slice(&flags.to_le_bytes());
+        rr[16..24].copy_from_slice(&data.to_le_bytes());
+        rr[24..].copy_from_slice(&tags.to_le_bytes());
+        f.mem.write(GuestAddr(at), &rr).unwrap();
+    }
+
+    /// A `struct io_uring_rsrc_update2` at `at`.
+    fn rsrc_update(f: &Fixture, at: u64, offset: u32, data: u64, tags: u64, count: u32) {
+        let mut up = [0u8; 32];
+        up[..4].copy_from_slice(&offset.to_le_bytes());
+        up[8..16].copy_from_slice(&data.to_le_bytes());
+        up[16..24].copy_from_slice(&tags.to_le_bytes());
+        up[24..28].copy_from_slice(&count.to_le_bytes());
+        f.mem.write(GuestAddr(at), &up).unwrap();
+    }
+
+    #[test]
+    fn a_tag_waits_for_the_request_that_waits_for_its_file() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, list, tags, arg, buf) = (
+            DATA + 0x300,
+            DATA + 0x100,
+            DATA + 0x180,
+            DATA + 0x1c0,
+            DATA + 0x800,
+        );
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        fds(&f, list, &[read as i32]);
+        f.mem.write_u64(GuestAddr(tags), 21).unwrap();
+        rsrc_register(&f, arg, 1, 0, list, tags);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), 0);
+        // A read of the registered pipe waits, holding the file.
+        let mut e = rw(READ, 0, HERE, buf, 8);
+        e[1] = 1;
+        assert_eq!(batch(&mut f, &r, &[e]), []);
+        // An update takes it from its slot: the tag waits for the read.
+        fds(&f, list, &[-1]);
+        rsrc_update(&f, arg, 0, list, 0, 1);
+        assert_eq!(f.ret(427, &[r.fd, 14, arg, 32]), 1);
+        assert_eq!(reap(&mut f, &r), []);
+        // Its completion, then the tag (`io_put_rsrc_node`).
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 2), (21, 0)]);
     }
 
     #[test]
@@ -12233,5 +12369,72 @@ mod context_switches {
         assert_eq!(f.mem.read_u64(GuestAddr(at + 136)).unwrap(), 0);
         assert_eq!(f.ret(98, &[u64::MAX, at]), 0);
         assert_eq!(nvcsw(&f, at), 0);
+    }
+}
+
+mod vma_names {
+    use super::*;
+
+    const PR_SET_VMA: u64 = 0x5356_4d41;
+
+    /// prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, size, name).
+    fn name(f: &mut Fixture, addr: u64, size: u64, name: u64) -> u64 {
+        f.ret(157, &[PR_SET_VMA, 0, addr, size, name])
+    }
+
+    #[test]
+    fn pr_set_vma_names_anonymous_memory_as_linux_checks_it() {
+        let mut f = fixture();
+        let text = |f: &Fixture, at: u64, s: &[u8]| {
+            f.mem.write(GuestAddr(at), &[s, b"\0"].concat()).unwrap();
+            at
+        };
+        // mmap(NULL, 3 pages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS).
+        let at = f.ret(9, &[0, 0x3000, 3, 0x22, u64::MAX, 0]);
+        let good = text(&f, DATA, b"jemalloc pages");
+        assert_eq!(name(&mut f, at, 0x1001, good), 0);
+        let vma = f.mem.view().vma_from(at).unwrap();
+        assert_eq!(
+            (vma.end, vma.anon_name.as_deref()),
+            (at + 0x2000, Some(&b"jemalloc pages"[..]))
+        );
+        // Its line in /proc/self/maps: open, then read it whole.
+        let maps = text(&f, DATA + 0x400, b"/proc/self/maps");
+        let fd = f.ret(2, &[maps, 0]);
+        let n = f.ret(0, &[fd, DATA + 0x800, 0x800]);
+        let mut buf = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x800), &mut buf).unwrap();
+        let listing = String::from_utf8_lossy(&buf);
+        let line = listing
+            .lines()
+            .find(|l| l.starts_with(&format!("{at:08x}-")))
+            .unwrap_or_default();
+        assert!(line.ends_with(" [anon:jemalloc pages]"), "{listing}");
+        // A character outside printable ASCII or among \`$[] is EINVAL, as
+        // are a name of 80 bytes before its NUL, a start off a page, and
+        // another PR_SET_VMA option.
+        for bad in [&b"a[b"[..], b"a$b", b"a`b", b"a\\b", b"a]b", b"a\tb"] {
+            let at_bad = text(&f, DATA + 0x100, bad);
+            assert_eq!(
+                name(&mut f, at, 0x1000, at_bad),
+                errno(Errno::EINVAL),
+                "{bad:?}"
+            );
+        }
+        let long = text(&f, DATA + 0x200, &[b'x'; 80]);
+        assert_eq!(name(&mut f, at, 0x1000, long), errno(Errno::EINVAL));
+        let longest = text(&f, DATA + 0x300, &[b'x'; 79]);
+        assert_eq!(name(&mut f, at, 0x1000, longest), 0);
+        assert_eq!(name(&mut f, at + 1, 0x1000, good), errno(Errno::EINVAL));
+        assert_eq!(
+            f.ret(157, &[PR_SET_VMA, 1, at, 0x1000, good]),
+            errno(Errno::EINVAL)
+        );
+        // A name that cannot be read is EFAULT; a size of 0 does nothing.
+        assert_eq!(name(&mut f, at, 0x1000, 0x10), errno(Errno::EFAULT));
+        assert_eq!(name(&mut f, at, 0, good), 0);
+        // NULL clears it.
+        assert_eq!(name(&mut f, at, 0x3000, 0), 0);
+        assert_eq!(f.mem.view().vma_from(at).unwrap().anon_name, None);
     }
 }

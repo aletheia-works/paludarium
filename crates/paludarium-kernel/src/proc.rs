@@ -1397,16 +1397,32 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
     // A file's name as `d_path` gives it: from the root when it is under
     // it, else from the machine's root.
     let seen;
+    let anon;
     let name: &[u8] = match &vma.file {
         Some(file) if file.source => {
             let name = file.name.as_deref().unwrap_or_default();
             seen = crate::files::seen_from(root, name);
             seen.as_deref().unwrap_or(name)
         }
-        Some(_) => b"/dev/zero (deleted)",
+        // Shared anonymous memory named by `PR_SET_VMA_ANON_NAME`
+        // (`[anon_shmem:<name>]`), and private memory but the heap and the
+        // stack (`[anon:<name>]`), as Linux's `get_vma_name` gives them.
+        Some(_) => match &vma.anon_name {
+            Some(given) => {
+                anon = [&b"[anon_shmem:"[..], given, b"]"].concat();
+                &anon
+            }
+            None => b"/dev/zero (deleted)",
+        },
         None if vma.heap => b"[heap]",
         None if vma.start <= start_stack && vma.end >= start_stack => b"[stack]",
-        None => b"",
+        None => match &vma.anon_name {
+            Some(given) => {
+                anon = [&b"[anon:"[..], given, b"]"].concat();
+                &anon
+            }
+            None => b"",
+        },
     };
     if !name.is_empty() {
         line.resize(line.len().max(MAPS_NAME_COLUMN), b' ');
@@ -2492,6 +2508,7 @@ mod tests {
             identity: (0x0812, 9),
             heap: false,
             flags: 0,
+            anon_name: None,
         };
         let line = map_line(&vma, 0, b"/");
         let text = std::str::from_utf8(&line).unwrap();

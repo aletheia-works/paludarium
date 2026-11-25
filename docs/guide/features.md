@@ -606,7 +606,16 @@ kernel.
   same description changes the lease's type. A lease taken gives the
   description an owner if it has none, and `F_UNLCK` takes the owner and
   the `F_SETSIG` signal away (`f_delown`); `F_UNLCK` with no lease is
-  `EAGAIN`. `F_GETLEASE` gives the description's lease type, or `F_UNLCK`.
+  `EAGAIN`. `F_GETLEASE` gives the description's lease type (the one it is
+  to become, while it is being broken), or `F_UNLCK`. An open or a
+  `truncate` that conflicts with a lease breaks it as `__break_lease` does,
+  the opener's own leases too: an open for reading only a write lease, which
+  is to become a read lease, and any other both kinds, which are to go. The
+  break signals the holder once (`SIGIO`, or the `F_SETSIG` signal with
+  `POLL_MSG`), and the opener waits for the holder, its access counted
+  already; a wait of `/proc/sys/fs/lease-break-time` seconds (0 or less has
+  no end) downgrades or removes the lease itself, `O_NONBLOCK` gives
+  `EWOULDBLOCK` instead, and a signal ends the wait (`ERESTARTSYS`).
   `/proc/sys/fs/leases-enable` (1 at first) and `/proc/sys/fs/lease-break-time`
   (45 at first) are root's files of mode 0644, which take any `int`
   (`proc_dointvec`).
@@ -1786,6 +1795,11 @@ kernel.
   - A read that chose a provided buffer keeps it while it waits
     (`REQ_F_BUFFER_SELECTED`). A ring's buffer stays at the ring's head and
     is chosen again as the read goes on.
+  - A request that waits keeps the file it found (`req->file`), and goes on
+    with it though its descriptor is closed or its slot is updated
+    meanwhile. A registered file that an update takes from its slot while
+    such a request holds it posts its tag once that request completes, after
+    its completion (`io_put_rsrc_node`).
 
 - `IORING_OP_ASYNC_CANCEL` and `IORING_REGISTER_SYNC_CANCEL` cancel the
   requests of their ring that wait for their files, as Linux master's
@@ -4180,9 +4194,31 @@ kernel.
   now is `EPERM`, though the open let it, and `unprivileged_bpf_disabled`
   asks the writer, not the opener, for `CAP_SYS_ADMIN`. Only a write that
   sets `shm_rmid_forced` removes orphans, as Linux master's handler; 7.0's
-  did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
-  `/proc/sys` lists its entries by name, as Linux's tree of them keeps
-  them.
+  did so at a read of it set too. `/proc/sys/kernel` lists only these and the
+  six below, and each directory of `/proc/sys` lists its entries by name, as
+  Linux's tree of them keeps them.
+
+- `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
+  `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`
+  (root's, mode 0444) and `hostname` and `domainname` (0644), each what
+  `uname` gives and a newline; a personality, which changes what `uname`
+  gives, does not change them. The namespace is that of the thread that
+  reads or writes, not of the one that opened the file, and a file of that
+  name that `--mount` gives does not show. Only root (user ID 0 outside any
+  user namespace) may open `hostname` and `domainname` to write (`EACCES`),
+  with or without `CAP_SYS_ADMIN`, and a write is checked again (`EPERM`);
+  the root of a user namespace has `sethostname` alone. They are strings
+  (`proc_dostring`): a read goes on from where the file is, and a write is
+  taken whole, its bytes up to a NUL or newline put at its offset, 64 in all
+  at most, with a NUL after them. The bytes of the old name past that NUL
+  stay, and `uname` gives them too, where `sethostname` clears them. A write
+  past the end of the name changes nothing. `poll`, `select` and `epoll` take
+  the files of `/proc/sys`, as `proc_sys_poll` does, and find them ready;
+  after a change of `hostname` or `domainname`, by `sethostname`,
+  `setdomainname` or a write to the file that is not refused, in any UTS
+  namespace, the first poll of each open file description gives `POLLIN`,
+  `POLLRDNORM`, `POLLERR` and `POLLPRI` and no `POLLOUT`. A `dup` and a child
+  share what it has seen, and a poll of an epoll that watches it is one too.
 
 - `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
   its listing differs from Linux's, which has the rest of the `vm` sysctls
@@ -5880,8 +5916,19 @@ kernel.
   process attach, and another value, taken as an `int`, names a task in the
   caller's PID namespace (`EINVAL` for none) whose process, and its
   descendants, may attach while that task is there. It is the process's,
-  whichever thread sets it, and a child does not inherit it. Other options
-  give `EINVAL`.
+  whichever thread sets it, and a child does not inherit it.
+  `PR_SET_VMA` with `PR_SET_VMA_ANON_NAME` names anonymous memory, as
+  Linux's `set_anon_vma_name` does: a name of up to 80 bytes with its NUL
+  (`EINVAL` past them, `EFAULT` where it cannot be read), of printable
+  ASCII but `` \`$[] `` (`EINVAL`), or none to clear it, from a
+  page-aligned start (`EINVAL`) over a size rounded up to pages. Each VMA
+  of the range takes it, split where the range starts and ends within it
+  with its lock and `userfaultfd` kept, a file's mapping ending it with
+  `EBADF` and a hole with `ENOMEM` once the rest has it. `/proc/<pid>/maps`
+  and `smaps` show it as `[anon:<name>]`, and as `[anon_shmem:<name>]` for
+  shared anonymous memory, the heap and the stack keeping their own names;
+  VMAs of different names do not merge, and a `fork`ed child keeps them.
+  Other options give `EINVAL`.
 
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,
@@ -6108,7 +6155,23 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     through it; a group of 224.0.0.0/24 or the limited broadcast address
     straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`
     once it has gone, `ENETUNREACH` while it is down. A connection
-    accepted is bound as its listener.
+    accepted is bound as its listener. Of an IPv6 socket,
+    `IPV6_MULTICAST_IF` (not of TCP, `ENOPROTOOPT`) and `IPV6_UNICAST_IF`
+    (in network byte order) take the index of a device (`ENODEV` and
+    `EADDRNOTAVAIL` for one there is not), 0 for none, and `IPV6_PKTINFO`
+    (set only, its address unused, as UDP sends) any; each `EINVAL` for
+    one other than the device the socket is bound to, `IPV6_UNICAST_IF`
+    for any then (`do_ipv6_setsockopt`). A UDP datagram to an address
+    without a scope ID, and a UDP `connect`, go through the socket's own
+    device, else `IPV6_PKTINFO`'s, else `IPV6_MULTICAST_IF`'s to a group
+    and `IPV6_UNICAST_IF`'s to another address (`udpv6_sendmsg`,
+    `ip6_datagram_flow_key_init`): strictly where the socket is bound to no
+    address, or the destination is a group, a link-local address or `::1`;
+    else through it rather than another, among the routes of one prefix
+    and metric (`rt6_score_route`). Connecting a socket of no device to a
+    group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks
+    its route up, where Linux's connected socket keeps the one it has
+    (`ip6_sk_dst_lookup_flow`) when one of these options goes back to 0.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
     as the room asks (`tcp_get_info`): a listener's state, connections
     waiting and backlog; a socket that has not connected, Linux's
@@ -6186,7 +6249,8 @@ one only with an `--allow-net`.
   that needs one, and `recvfrom` the device a datagram came in on. UDP's
   `sendto` goes through the scope ID's device, for an address that needs
   one, else the socket's, strictly (`ENETUNREACH` where no route goes
-  through it), and `connect`, UDP's and TCP's, the same way: the scope ID
+  through it), from an address of that device's where it is bound to
+  none, and `connect`, UDP's and TCP's, the same way: the scope ID
   becomes the socket's device, which a TCP socket keeps though the connect
   fails and a UDP one does not, as Linux master puts it back; `EINVAL`
   for one other than the device the socket has, or for none where the

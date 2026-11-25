@@ -38,6 +38,7 @@
 use crate::events::{IN, NONBLOCK, OUT, ReadinessHub};
 use crate::namespaces::Namespace;
 use crate::processes::Processes;
+use crate::skb::{SKB, SMALL_HEAD};
 use crate::syscalls::{Context, Outcome};
 use crate::users::Ids as Kind;
 use paludarium_host::{ClockId, FileHandle, FileStat, WaitOutcome, WaitToken};
@@ -99,9 +100,8 @@ const NOTIFY_COOKIE_LEN: usize = 32;
 /// What the cookie's buffer takes of its socket's receive buffer, its
 /// `truesize` on x86-64 Linux 7.0: `alloc_skb(NOTIFY_COOKIE_LEN)` takes its
 /// head, with the `skb_shared_info`, from the small head cache
-/// (`SKB_SMALL_HEAD_SIZE`, 704 bytes on the CI runner's kernel, as
-/// [`crate::inet`]'s datagrams count it), and 256 bytes for the `sk_buff`.
-const COOKIE_TRUESIZE: usize = 256 + 704;
+/// ([`SMALL_HEAD`]), beside the `sk_buff`.
+const COOKIE_TRUESIZE: usize = SKB + SMALL_HEAD;
 const NOTIFY_WOKENUP: u8 = 1;
 const NOTIFY_REMOVED: u8 = 2;
 /// `si_code` of a queue's notification.

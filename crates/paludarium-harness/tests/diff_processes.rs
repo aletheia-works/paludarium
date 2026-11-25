@@ -183,7 +183,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -215,8 +215,8 @@ mod linux {
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, the file-leases case, which writes
-            // fs.leases-enable and becomes an unprivileged user, as the
-            // emulator's guest starts as root.
+            // fs.leases-enable and fs.lease-break-time and becomes an
+            // unprivileged user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -257,6 +257,8 @@ mod linux {
                     | "ipc-sysctl"
                     | "sysvipc-proc"
                     | "kernel-sysctl"
+                    | "uts-sysctl"
+                    | "uts-sysctl-poll"
                     | "net-sysctl"
                     | "mqueue-calls"
                     | "mqueue-limits"
@@ -409,6 +411,7 @@ mod linux {
                     | "veth-ipv4-ecmp"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
+                    | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
                     | "veth-ipv6-scope"
                     | "veth-ipv6-traffic"
@@ -647,6 +650,7 @@ mod linux {
         veth_ipv4_ecmp => ("veth-ipv4-ecmp","veth-ipv4-ecmp"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
+        veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
         veth_ipv6_scope => ("veth-ipv6-scope","veth-ipv6-scope"),
         veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
@@ -920,6 +924,7 @@ mod linux {
         processes_proc_own_files => ("proc-own-files","process"),
         processes_proc_other_files => ("proc-other-files","process"),
         processes_page_faults => ("page-faults","process"),
+        processes_vma_names => ("vma-names","process"),
         processes_exec_names => ("exec-names","process"),
         processes_context_switches => ("context-switches","process"),
         processes_proc_mem => ("proc-mem","process"),
@@ -1010,6 +1015,8 @@ mod linux {
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
+        processes_uts_sysctl => ("uts-sysctl","process"),
+        processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),
         processes_net_sysctl => ("net-sysctl","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
@@ -1109,6 +1116,7 @@ mod linux {
         processes_io_uring_ring_poll => ("io-uring-ring-poll","process"),
         processes_io_uring_cancel => ("io-uring-cancel","process"),
         processes_io_uring_exit => ("io-uring-exit","process"),
+        processes_io_uring_held_tag => ("io-uring-held-tag","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

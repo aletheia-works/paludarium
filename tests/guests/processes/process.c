@@ -7237,6 +7237,122 @@ static int exec_names_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The vma-names case: prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME) names
+   anonymous memory as mm/madvise.c's set_anon_vma_name does, and
+   /proc/self/maps shows it as fs/proc/task_mmu.c's get_vma_name does:
+   [anon:<name>], [anon_shmem:<name>] for shared anonymous memory, and
+   [heap] over a name. A name splits its VMAs, keeps their lock, survives
+   fork, and is refused for a file (EBADF), a bad character or 80 bytes
+   (EINVAL); a hole is ENOMEM once the rest is named. */
+static long vn_name(void *at, size_t size, const char *name) {
+    long r = syscall(SYS_prctl, 0x53564d41, 0, (unsigned long)at, size, (unsigned long)name);
+    return r < 0 ? -errno : r;
+}
+/* The name column of the maps line holding `at`, and how many lines in
+   [from, to) carry `name`. */
+static void vn_line(uintptr_t at, char *out, size_t size) {
+    out[0] = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    while (maps && fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && at >= start && at < end) {
+            char *name = strrchr(line, ' ');
+            line[strcspn(line, "\n")] = 0;
+            snprintf(out, size, "%s", name && name[1] ? name + 1 : "");
+            /* A name may hold spaces: from the column Linux pads to. */
+            if (strlen(line) > 73) snprintf(out, size, "%s", line + 73);
+            break;
+        }
+    }
+    if (maps) fclose(maps);
+}
+static int vn_count(uintptr_t from, uintptr_t to, const char *name) {
+    int n = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    while (maps && fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && start >= from && end <= to && strstr(line, name)) n++;
+    }
+    if (maps) fclose(maps);
+    return n;
+}
+static int vma_names_case(void) {
+    const long page = sysconf(_SC_PAGESIZE);
+    char seen[256];
+    char *a = mmap(NULL, (size_t)(4 * page), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 80;
+    printf("name: %ld\n", vn_name(a + page, (size_t)(2 * page), "case-a"));
+    vn_line((uintptr_t)(a + page), seen, sizeof seen);
+    printf("named: %s\n", seen);
+    vn_line((uintptr_t)a, seen, sizeof seen);
+    printf("before it: [%s]\n", seen);
+    /* A partly locked range: the lock splits it, and the name keeps both. */
+    printf("mlock: %d\n", mlock(a + 2 * page, (size_t)page));
+    printf("rename: %ld\n", vn_name(a, (size_t)(4 * page), "case-b"));
+    printf("named pieces: %d\n", vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]"));
+    munlock(a + 2 * page, (size_t)page);
+    /* Every line of the range still carries the name. How many lines there
+       are depends on anon_vma identity, which Linux's VMA merge checks and
+       the emulator does not model (see limitations: "/proc/self/maps"): on
+       Linux the first page can share the anon_vma of memory musl's fopen
+       mapped right below it and wrote, which keeps it apart from page 2's. */
+    printf("after munlock: all named %d\n",
+           vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), "[anon:case-b]") ==
+               vn_count((uintptr_t)a, (uintptr_t)(a + 4 * page), " "));
+    /* What Linux refuses. */
+    printf("bad char: %ld %ld %ld\n", vn_name(a, (size_t)page, "a[b"), vn_name(a, (size_t)page, "a$b"),
+           vn_name(a, (size_t)page, "a\tb"));
+    char longest[81];
+    memset(longest, 'x', 80);
+    longest[80] = 0;
+    printf("80 bytes: %ld\n", vn_name(a, (size_t)page, longest));
+    longest[79] = 0;
+    printf("79 bytes: %ld\n", vn_name(a, (size_t)page, longest));
+    printf("unaligned: %ld\n", vn_name(a + 1, (size_t)page, "x"));
+    printf("other option: %ld\n", syscall(SYS_prctl, 0x53564d41, 1, (unsigned long)a, page, "x") < 0 ? -errno : 0L);
+    int fd = open("/proc/self/exe", O_RDONLY);
+    char *file = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    printf("file: %ld\n", vn_name(file, (size_t)page, "x"));
+    /* A hole: ENOMEM, the mapped page before it named. */
+    char *h = mmap(NULL, (size_t)(3 * page), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(h + page, (size_t)page);
+    printf("hole: %ld\n", vn_name(h, (size_t)(3 * page), "case-h"));
+    vn_line((uintptr_t)h, seen, sizeof seen);
+    printf("before the hole: %s\n", seen);
+    /* Shared anonymous memory, and the heap over a name. */
+    char *s = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    printf("shared: %ld\n", vn_name(s, (size_t)page, "case-s"));
+    vn_line((uintptr_t)s, seen, sizeof seen);
+    printf("shared named: %s\n", seen);
+    /* musl's sbrk takes no increment: brk itself, for two pages. */
+    uintptr_t brk_at = (uintptr_t)syscall(SYS_brk, 0);
+    uintptr_t grown = (uintptr_t)syscall(SYS_brk, brk_at + 2 * (uintptr_t)page);
+    char *heap = (char *)((brk_at + page - 1) & ~(uintptr_t)(page - 1));
+    if (grown >= (uintptr_t)heap + page) {
+        long r = vn_name(heap, (size_t)page, "case-heap");
+        vn_line((uintptr_t)heap, seen, sizeof seen);
+        printf("heap: %ld %s\n", r, seen);
+    } else {
+        printf("heap: brk did not grow\n");
+    }
+    /* A fork keeps it; NULL clears it. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        vn_line((uintptr_t)(a + page), seen, sizeof seen);
+        _exit(strcmp(seen, "[anon:case-b]") == 0 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child sees it: %d\n", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("clear: %ld\n", vn_name(a, (size_t)(4 * page), NULL));
+    vn_line((uintptr_t)(a + page), seen, sizeof seen);
+    printf("cleared: [%s]\n", seen);
+    return 0;
+}
 /* The proc-mem case: /proc/<pid>/mem reads and writes a task's memory at
    the address its position gives, as fs/proc/base.c's mem_rw does through
    access_remote_vm with FOLL_FORCE: a read-only page is written, a call
@@ -10505,6 +10621,55 @@ static int io_uring_exit_case(const char *self) {
     return 0;
 }
 
+/* A request that waits for its file keeps the file it found (req->file):
+   it goes on though its descriptor is closed or its slot is updated
+   meanwhile, and the tag of the file an update took posts after its
+   completion (io_put_rsrc_node). */
+static int io_uring_held_tag_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int a[2], b[2];
+    char buf[8];
+    if (pipe(a) || pipe(b)) return 81;
+
+    /* A registered file. */
+    int fds[1] = {a[0]};
+    unsigned long tags[1] = {21};
+    struct uf_register2 rr = {1, 0, 0, (unsigned long)fds, (unsigned long)tags};
+    uring_show("register-files", syscall(427, u.fd, 13, &rr, sizeof rr));
+    unsigned char *sqe = pw_read(&u, 1, 0, buf, sizeof buf, 0);
+    sqe[1] = 1;
+    tw_submit(&u, 1, 0, "armed-fixed-file");
+    fds[0] = -1;
+    struct uf_update2 up = {0, 0, (unsigned long)fds, 0, 1, 0};
+    uring_show("update-files", syscall(427, u.fd, 14, &up, sizeof up));
+    uring_reap(&u, "updated");
+    printf("write: %ld\n", (long)write(a[1], "ab", 2));
+    uring_reap(&u, "file-done");
+
+    /* A descriptor closed while its read waits. */
+    pw_read(&u, 2, b[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-fd");
+    close(b[0]);
+    printf("write: %ld\n", (long)write(b[1], "cd", 2));
+    uring_reap(&u, "closed-done");
+    printf("read: %.2s\n", buf);
+
+    /* A descriptor that names another file once its read goes on. */
+    int c[2], d[2];
+    if (pipe(c) || pipe(d)) return 82;
+    pw_read(&u, 3, c[0], buf, sizeof buf, 0);
+    tw_submit(&u, 1, 0, "armed-replaced");
+    if (dup2(d[0], c[0]) != c[0]) return 83;
+    printf("write: %ld\n", (long)write(d[1], "gh", 2));
+    uring_reap(&u, "replaced-other");
+    printf("write: %ld\n", (long)write(c[1], "ef", 2));
+    uring_reap(&u, "replaced-done");
+    printf("read: %.2s\n", buf);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -11394,6 +11559,266 @@ static int file_leases_case(void) {
     printf("child=%d\n", WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
     close(theirs);
     unlink(path);
+    rmdir(dir);
+    return 0;
+}
+/* Opens and truncates that break leases, as __break_lease does: in one case
+ * with the above, as both write the machine's lease sysctls. */
+static void lease_signal(const char *what, int fd) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGRTMIN);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    struct timespec patience = {5, 0};
+    int got = sigtimedwait(&set, &info, &patience);
+    const char *name = got == SIGIO ? "io" : got == SIGRTMIN ? "rt" : "none";
+    int named = got == SIGRTMIN && info.si_fd == fd;
+    long band = got == SIGRTMIN ? (long)info.si_band : 0;
+    printf("%s signal=%s code=%d fd=%d band=%ld\n", what, name, info.si_code, named, band);
+}
+static void lease_no_signal(const char *what) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGRTMIN);
+    struct timespec none = {0, 0};
+    int got = sigtimedwait(&set, NULL, &none);
+    printf("%s signal=%s\n", what, got < 0 ? "none" : "some");
+}
+/* An open of path, closed at once. */
+static int lease_open(const char *path, int flags) {
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return -errno;
+    close(fd);
+    return 0;
+}
+static volatile sig_atomic_t lease_alarms;
+static void lease_alarm(int signal) {
+    (void)signal;
+    lease_alarms++;
+}
+/* A child that opens path with flags (or truncates it to 1 byte, if flags is
+ * -1) and tells what came of it, with a SIGALRM after 100 ms if alarm_flags
+ * is not -1. It holds no lease's description. */
+static pid_t lease_child(const char *path, int flags, int alarm_flags, int held, int *from) {
+    int ends[2];
+    fflush(stdout);
+    if (pipe(ends)) return -1;
+    pid_t child = fork();
+    if (child == 0) {
+        close(held);
+        close(ends[0]);
+        if (alarm_flags != -1) {
+            struct sigaction act;
+            memset(&act, 0, sizeof act);
+            act.sa_handler = lease_alarm;
+            act.sa_flags = alarm_flags;
+            sigaction(SIGALRM, &act, NULL);
+            struct itimerval once = {{0, 0}, {0, 100000}};
+            setitimer(ITIMER_REAL, &once, NULL);
+        }
+        int result = flags == -1 ? (truncate(path, 1) ? -errno : 0) : lease_open(path, flags);
+        int told[2] = {result, (int)lease_alarms};
+        _exit(write(ends[1], told, sizeof told) == sizeof told ? 0 : 1);
+    }
+    close(ends[1]);
+    *from = ends[0];
+    return child;
+}
+/* Whether the child has told nothing 50 ms on. */
+static int lease_waiting(int from) {
+    struct pollfd p = {from, POLLIN, 0};
+    return poll(&p, 1, 50) == 0;
+}
+static void lease_told(const char *what, pid_t child, int from) {
+    int told[2] = {-1000, -1000};
+    ssize_t n = read(from, told, sizeof told);
+    close(from);
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("%s result=%d alarms=%d whole=%d exit=%d\n", what, told[0], told[1], n == sizeof told, status);
+}
+static int lease_seconds(const char *value) {
+    int s = open("/proc/sys/fs/lease-break-time", O_WRONLY);
+    if (s < 0) return -errno;
+    int result = write(s, value, strlen(value)) < 0 ? -errno : 0;
+    close(s);
+    return result;
+}
+static int lease_breaks_case(void) {
+    char dir[] = "/tmp/breaks-XXXXXX";
+    if (!mkdtemp(dir)) return 1;
+    char path[64];
+    snprintf(path, sizeof path, "%s/f", dir);
+    int made = open(path, O_RDWR | O_CREAT, 0644);
+    if (made < 0 || write(made, "lease", 5) != 5) return 2;
+    close(made);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGRTMIN);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    int get, from;
+    /* What breaks no write lease. */
+    int rd = open(path, O_RDONLY);
+    printf("write lease=%d\n", lease_errno(rd, F_WRLCK));
+    fcntl(rd, F_SETSIG, SIGRTMIN);
+    int path_only = lease_open(path, O_PATH);
+    int taken = lease_open(path, O_RDWR | O_CREAT | O_EXCL);
+    int directory = lease_open(path, O_RDONLY | O_DIRECTORY);
+    int negative = truncate(path, -1) ? -errno : 0;
+    struct stat st;
+    stat(path, &st);
+    get = fcntl(rd, F_GETLEASE);
+    printf("unbroken path=%d excl=%d dir=%d negative=%d get=%d\n", path_only, taken, directory, negative, get);
+    lease_no_signal("unbroken");
+    /* A reader asks for a downgrade, once. */
+    int reader = lease_open(path, O_RDONLY | O_NONBLOCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("reader=%d get=%d\n", reader, get);
+    lease_signal("reader", rd);
+    int again = lease_open(path, O_RDONLY | O_NONBLOCK);
+    printf("reader again=%d\n", again);
+    lease_no_signal("reader again");
+    /* Then a writer asks for all of it. */
+    int writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("writer=%d get=%d\n", writer, get);
+    lease_signal("writer", rd);
+    int rdwr = lease_open(path, O_RDWR | O_NONBLOCK);
+    printf("rdwr=%d\n", rdwr);
+    lease_no_signal("rdwr");
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", rd);
+    int through = lease_open(link, O_RDONLY | O_NONBLOCK);
+    printf("through fd=%d\n", through);
+    /* A downgrade lets readers in; the writer's break still stands. */
+    int down = lease_errno(rd, F_RDLCK);
+    get = fcntl(rd, F_GETLEASE);
+    reader = lease_open(path, O_RDONLY | O_NONBLOCK);
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    printf("down=%d get=%d reader=%d writer=%d\n", down, get, reader, writer);
+    lease_no_signal("down");
+    int two = open(path, O_RDONLY);
+    int beside = lease_errno(two, F_RDLCK);
+    close(two);
+    printf("beside=%d\n", beside);
+    int unlck = lease_errno(rd, F_UNLCK);
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    printf("unlck=%d writer=%d\n", unlck, writer);
+    /* Two read leases: a reader that empties the file breaks none, and a
+       writer both. */
+    two = open(path, O_RDONLY);
+    int one_lease = lease_errno(rd, F_RDLCK);
+    int two_lease = lease_errno(two, F_RDLCK);
+    reader = lease_open(path, O_RDONLY | O_TRUNC | O_NONBLOCK);
+    stat(path, &st);
+    printf("two leases=%d %d truncating reader=%d size=%ld\n", one_lease, two_lease, reader, (long)st.st_size);
+    lease_no_signal("truncating reader");
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    int get_one = fcntl(rd, F_GETLEASE);
+    int get_two = fcntl(two, F_GETLEASE);
+    printf("two writer=%d get=%d %d\n", writer, get_one, get_two);
+    /* SIGIO is pending once, whoever sent it. */
+    lease_signal("two", rd);
+    lease_no_signal("two");
+    close(two);
+    writer = lease_open(path, O_WRONLY | O_NONBLOCK);
+    printf("one closed writer=%d\n", writer);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("one unlck=%d\n", unlck);
+    /* A writer waits for F_UNLCK, its access counted. */
+    int lease = lease_errno(rd, F_RDLCK);
+    pid_t child = lease_child(path, O_WRONLY, -1, rd, &from);
+    lease_signal("blocked writer", rd);
+    int waiting = lease_waiting(from);
+    int relock = lease_errno(rd, F_RDLCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("blocked writer lease=%d waiting=%d relock=%d get=%d\n", lease, waiting, relock, get);
+    printf("blocked writer unlck=%d\n", lease_errno(rd, F_UNLCK));
+    lease_told("blocked writer", child, from);
+    /* A reader waits for the downgrade, its access counted. */
+    lease = lease_errno(rd, F_WRLCK);
+    child = lease_child(path, O_RDONLY, -1, rd, &from);
+    lease_signal("blocked reader", rd);
+    waiting = lease_waiting(from);
+    relock = lease_errno(rd, F_WRLCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("blocked reader lease=%d waiting=%d relock=%d get=%d\n", lease, waiting, relock, get);
+    printf("blocked reader down=%d\n", lease_errno(rd, F_RDLCK));
+    lease_told("blocked reader", child, from);
+    get = fcntl(rd, F_GETLEASE);
+    printf("blocked reader get=%d\n", get);
+    /* truncate waits for the last close. */
+    child = lease_child(path, -1, -1, rd, &from);
+    lease_signal("truncate", rd);
+    waiting = lease_waiting(from);
+    stat(path, &st);
+    printf("truncate waiting=%d size=%ld\n", waiting, (long)st.st_size);
+    close(rd);
+    lease_told("truncate", child, from);
+    stat(path, &st);
+    printf("truncate size=%ld\n", (long)st.st_size);
+    /* A signal ends the wait, or its handler runs the open again. */
+    rd = open(path, O_RDONLY);
+    lease = lease_errno(rd, F_RDLCK);
+    child = lease_child(path, O_WRONLY, 0, rd, &from);
+    lease_signal("interrupted", rd);
+    lease_told("interrupted", child, from);
+    child = lease_child(path, -1, 0, rd, &from);
+    lease_told("interrupted truncate", child, from);
+    child = lease_child(path, O_WRONLY, SA_RESTART, rd, &from);
+    struct pollfd wait = {from, POLLIN, 0};
+    int early = poll(&wait, 1, 400);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("restarted lease=%d early=%d unlck=%d\n", lease, early, unlck);
+    lease_told("restarted", child, from);
+    lease_no_signal("restarted");
+    /* The wait's end: a writer takes the lease away, with its owner, and a
+       reader makes it a read lease. */
+    printf("seconds=%d\n", lease_seconds("1\n"));
+    lease = lease_errno(rd, F_RDLCK);
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    child = lease_child(path, O_WRONLY, -1, rd, &from);
+    lease_told("timed writer", child, from);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    long took = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+    lease_signal("timed writer", rd);
+    get = fcntl(rd, F_GETLEASE);
+    int owner = fcntl(rd, F_GETOWN);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("timed writer lease=%d second=%d get=%d owner=%d unlck=%d\n", lease, took >= 900 && took < 10000, get, owner, unlck);
+    lease = lease_errno(rd, F_WRLCK);
+    child = lease_child(path, O_RDONLY, -1, rd, &from);
+    lease_told("timed reader", child, from);
+    lease_signal("timed reader", rd);
+    get = fcntl(rd, F_GETLEASE);
+    owner = fcntl(rd, F_GETOWN) == getpid();
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("timed reader lease=%d get=%d owner=%d unlck=%d\n", lease, get, owner, unlck);
+    /* No time to wait is no end. */
+    printf("seconds=%d\n", lease_seconds("0\n"));
+    lease = lease_errno(rd, F_RDLCK);
+    child = lease_child(path, O_WRONLY, -1, rd, &from);
+    struct pollfd endless = {from, POLLIN, 0};
+    early = poll(&endless, 1, 1500);
+    unlck = lease_errno(rd, F_UNLCK);
+    printf("endless lease=%d early=%d unlck=%d\n", lease, early, unlck);
+    lease_told("endless", child, from);
+    lease_signal("endless", rd);
+    printf("seconds=%d\n", lease_seconds("45\n"));
+    /* A removed file, opened again through its descriptor. */
+    unlink(path);
+    lease = lease_errno(rd, F_RDLCK);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", rd);
+    through = lease_open(link, O_WRONLY | O_NONBLOCK);
+    get = fcntl(rd, F_GETLEASE);
+    printf("removed lease=%d through=%d get=%d\n", lease, through, get);
+    lease_signal("removed", rd);
+    close(rd);
     rmdir(dir);
     return 0;
 }
@@ -25091,6 +25516,397 @@ static int kernel_sysctl_case(void) {
     if (held >= 0) close(held);
     return 0;
 }
+/* The uts-sysctl case's files, under /proc/sys/kernel. */
+static int us_open(const char *name, int flags) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/sys/kernel/%s", name);
+    return open(path, flags | O_CLOEXEC);
+}
+/* Prints what a read of `want` at `at` gives, newlines as "\n". */
+static void us_read_at(const char *label, int fd, size_t want, off_t at) {
+    char text[128] = {0};
+    long n = pread(fd, text, want, at);
+    printf(" %s=%ld:", label, n < 0 ? -errno : n);
+    for (long i = 0; i < n; i++) {
+        if (text[i] == '\n') printf("\\n");
+        else putchar(text[i]);
+    }
+}
+static void us_show(const char *label) {
+    printf("%s:", label);
+    const char *names[] = {"hostname", "domainname"};
+    for (int i = 0; i < 2; i++) {
+        int fd = us_open(names[i], O_RDONLY);
+        us_read_at(names[i], fd, 100, 0);
+        close(fd);
+    }
+    struct utsname u;
+    uname(&u);
+    printf(" uname=%s,%s\n", u.nodename, u.domainname);
+}
+static long us_write(int fd, const char *text, size_t n) {
+    long r = write(fd, text, n);
+    return r < 0 ? -errno : r;
+}
+static long us_pwrite(int fd, const char *text, size_t n, off_t at) {
+    long r = pwrite(fd, text, n, at);
+    return r < 0 ? -errno : r;
+}
+/* The uts-sysctl case: the six files of /proc/sys/kernel that show the
+   reader's UTS namespace (kernel/utsname_sysctl.c), as root, in a UTS
+   namespace of its own so that the machine's names stay. What they show of
+   the kernel is compared with uname only. */
+static int uts_sysctl_case(void) {
+    if (unshare(CLONE_NEWUTS)) {
+        printf("unshare: %d\n", errno);
+        return 1;
+    }
+    sethostname("outer", 5);
+    setdomainname("outer.domain", 12);
+    static const char *names[] = {"arch", "domainname", "hostname", "osrelease", "ostype", "version"};
+    struct utsname u;
+    uname(&u);
+    const char *fields[] = {u.machine, u.domainname, u.nodename, u.release, u.sysname, u.version};
+    for (int i = 0; i < 6; i++) {
+        char path[96], text[128] = {0};
+        snprintf(path, sizeof path, "/proc/sys/kernel/%s", names[i]);
+        struct stat st = {0};
+        long stated = stat(path, &st) ? -errno : 0;
+        int fd = us_open(names[i], O_RDONLY);
+        long n = fd < 0 ? -errno : read(fd, text, sizeof text - 1);
+        long again = fd < 0 ? -errno : read(fd, text + (n > 0 ? n : 0), sizeof text - 1 - (n > 0 ? n : 0));
+        size_t length = strlen(fields[i]);
+        int same = n == (long)length + 1 && !memcmp(text, fields[i], length) && text[length] == '\n';
+        if (fd >= 0) close(fd);
+        int w = us_open(names[i], O_WRONLY);
+        int written = w < 0 ? -errno : 0;
+        if (w >= 0) close(w);
+        int rw = us_open(names[i], O_RDWR);
+        int both = rw < 0 ? -errno : 0;
+        if (rw >= 0) close(rw);
+        printf("%s: stat=%ld mode=%o uid=%d gid=%d size=%ld uname=%d again=%ld write=%d both=%d\n", names[i], stated,
+               st.st_mode, st.st_uid, st.st_gid, (long)st.st_size, same, again, written, both);
+    }
+    DIR *d = opendir("/proc/sys/kernel");
+    printf("listed:");
+    for (struct dirent *e; d && (e = readdir(d));) {
+        for (int i = 0; i < 6; i++) {
+            if (!strcmp(e->d_name, names[i])) printf(" %s", e->d_name);
+        }
+    }
+    printf("\n");
+    if (d) closedir(d);
+
+    int fd = us_open("hostname", O_RDWR);
+    printf("reads:");
+    us_read_at("3", fd, 3, 0);
+    us_read_at("5", fd, 5, 0);
+    us_read_at("6", fd, 6, 0);
+    us_read_at("from2", fd, 100, 2);
+    us_read_at("from5", fd, 100, 5);
+    us_read_at("from6", fd, 100, 6);
+    printf("\n");
+    long first = us_write(fd, "ab", 2);
+    long second = us_write(fd, "cd\nxyz", 6);
+    printf("writes %ld %ld at=%ld\n", first, second, (long)lseek(fd, 0, SEEK_CUR));
+    us_show("continued");
+    /* What a name leaves of the one before it. */
+    sethostname("0123456789", 10);
+    long over = us_pwrite(fd, "xy", 2, 0);
+    uname(&u);
+    printf("residue %ld:", over);
+    for (int i = 0; i < 12; i++) printf(" %02x", (unsigned char)u.nodename[i]);
+    printf("\n");
+    sethostname("q", 1);
+    uname(&u);
+    printf("sethostname:");
+    for (int i = 0; i < 12; i++) printf(" %02x", (unsigned char)u.nodename[i]);
+    printf("\n");
+    sethostname("ab\0cd", 5);
+    us_show("with-nul");
+    sethostname("host", 4);
+    long end = us_pwrite(fd, "s", 1, 4);
+    long past = us_pwrite(fd, "no", 2, 9);
+    long middle = us_pwrite(fd, "OU\0x", 4, 1);
+    printf("pwrites end=%ld past=%ld middle=%ld\n", end, past, middle);
+    us_show("after-pwrites");
+    lseek(fd, 50, SEEK_SET);
+    long unread = us_write(fd, "zz", 2);
+    printf("past-position %ld at=%ld\n", unread, (long)lseek(fd, 0, SEEK_CUR));
+    lseek(fd, 0, SEEK_SET);
+    char longer[100];
+    memset(longer, 'n', sizeof longer);
+    long all = us_write(fd, longer, sizeof longer);
+    uname(&u);
+    long length = strlen(u.nodename);
+    long full = us_pwrite(fd, "m", 1, 64);
+    printf("long %ld at=%ld length=%ld at-end=%ld\n", all, (long)lseek(fd, 0, SEEK_CUR), length, full);
+    char back[80];
+    long n = pread(fd, back, sizeof back, 0);
+    long blank = us_pwrite(fd, "\n", 1, 0);
+    long nothing = us_pwrite(fd, "", 0, 0);
+    printf("read-long %ld blank=%ld nothing=%ld\n", n, blank, nothing);
+    us_show("blank");
+    struct iovec parts[2] = {{"io", 2}, {"vec\n", 4}};
+    lseek(fd, 0, SEEK_SET);
+    long vec = writev(fd, parts, 2);
+    printf("writev %ld at=%ld\n", vec < 0 ? -errno : vec, (long)lseek(fd, 0, SEEK_CUR));
+    int dom = us_open("domainname", O_WRONLY);
+    long domain = us_write(dom, "new.domain\n", 11);
+    close(dom);
+    printf("domain %ld\n", domain);
+    us_show("after-writev");
+    long refused = us_open("arch", O_WRONLY);
+    printf("arch-write %ld\n", refused < 0 ? -errno : 0L);
+
+    /* A personality changes uname's machine and release, not the files. */
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        char before[2][128] = {{0}}, after[2][128] = {{0}};
+        for (int turn = 0; turn < 2; turn++) {
+            for (int i = 0; i < 2; i++) {
+                int f = us_open(i ? "osrelease" : "arch", O_RDONLY);
+                long r = read(f, turn ? after[i] : before[i], 127);
+                if (r < 0) printf("read: %d\n", errno);
+                close(f);
+            }
+            /* UNAME26 and PER_LINUX32. */
+            syscall(SYS_personality, 0x20008UL);
+        }
+        uname(&u);
+        printf("personality machine=%s arch-same=%d release-same=%d\n", u.machine, !strcmp(before[0], after[0]),
+               !strcmp(before[1], after[1]));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("personality", reaped(other));
+
+    /* The namespace is the reader's and the writer's, not the opener's, and
+       root writes its own without CAP_SYS_ADMIN. */
+    sethostname("outer", 5);
+    fflush(stdout);
+    other = child();
+    if (other == 0) {
+        if (unshare(CLONE_NEWUTS)) _exit(90);
+        sethostname("inner", 5);
+        printf("inherited:");
+        us_read_at("inner", fd, 100, 0);
+        printf(" write=%ld", us_pwrite(fd, "child\n", 6, 0));
+        us_read_at("inner", fd, 100, 0);
+        printf("\n");
+        us_show("child");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("inherited", reaped(other));
+    us_show("parent");
+    fflush(stdout);
+    other = child();
+    if (other == 0) {
+        long dropped = caps_set(0, 0, 0) ? -errno : 0;
+        long name = sethostname("no", 2) ? -errno : 0;
+        long w = us_pwrite(fd, "capless\n", 8, 0);
+        int again = us_open("hostname", O_WRONLY);
+        printf("no-capabilities capset=%ld sethostname=%ld write=%ld open=%d\n", dropped, name, w,
+               again < 0 ? -errno : 0);
+        fflush(stdout);
+        _exit(0);
+    }
+    result("no-capabilities", reaped(other));
+    us_show("after-capless");
+
+    /* Another user may read them and write none, nor through root's
+       descriptor, nor with CAP_SYS_ADMIN over the namespace as the root of
+       the user namespace that owns it. */
+    fflush(stdout);
+    other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        long through = us_pwrite(fd, "other", 5, 0);
+        int r = us_open("hostname", O_RDONLY), w = us_open("hostname", O_WRONLY);
+        printf("other read=%d write=%d through=%ld\n", r < 0 ? -errno : 0, w < 0 ? -errno : 0, through);
+        prctl(PR_SET_DUMPABLE, 1);
+        long made = unshare(CLONE_NEWUSER | CLONE_NEWUTS) ? -errno : 0;
+        int group = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", "0 65534 1");
+        long name = sethostname("namespaced", 10) ? -errno : 0;
+        r = us_open("hostname", O_RDONLY);
+        w = us_open("hostname", O_WRONLY);
+        printf("user-namespace unshare=%ld setgroups=%d uids=%d uid=%d sethostname=%ld read=%d write=%d", made, group,
+               uids, (int)getuid(), name, r < 0 ? -errno : 0, w < 0 ? -errno : 0);
+        us_read_at("hostname", r, 100, 0);
+        struct stat st = {0};
+        fstat(r, &st);
+        printf(" owner=%d:%d through=%ld\n", (int)st.st_uid, (int)st.st_gid, us_pwrite(fd, "other", 5, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("other", reaped(other));
+    us_show("last");
+    close(fd);
+    return 0;
+}
+/* What a poll for `events` (without waiting) gives of `fd`. */
+static int us_poll(int fd, int events) {
+    struct pollfd p = {fd, events, 0};
+    int r = poll(&p, 1, 0);
+    return r < 0 ? -errno : p.revents;
+}
+#define US_ALL (POLLIN | POLLOUT | POLLPRI | POLLRDNORM | POLLWRNORM | POLLRDBAND | POLLWRBAND)
+/* Prints what epoll_wait gives of `ep`, waiting `ms`. */
+static void us_epoll(const char *label, int ep, int ms) {
+    struct epoll_event got[4];
+    int n = epoll_wait(ep, got, 4, ms);
+    printf(" %s=%d", label, n < 0 ? -errno : n);
+    for (int i = 0; i < n; i++) printf(":%d/%#x", (int)got[i].data.u32, got[i].events);
+}
+static int us_add(int ep, int fd, unsigned events, int data) {
+    struct epoll_event e = {.events = events, .data.u32 = data};
+    return epoll_ctl(ep, EPOLL_CTL_ADD, fd, &e) ? -errno : 0;
+}
+/* The uts-sysctl-poll case: proc_sys_poll. A file of /proc/sys is always
+   ready; hostname and domainname give EPOLLERR and EPOLLPRI, and no
+   EPOLLOUT, at the first poll after a change, in whatever UTS namespace,
+   which the open file description then has seen. As root, in a UTS
+   namespace of its own. */
+static int uts_sysctl_poll_case(void) {
+    if (unshare(CLONE_NEWUTS)) {
+        printf("unshare: %d\n", errno);
+        return 1;
+    }
+    sethostname("first", 5);
+    int host = us_open("hostname", O_RDWR), other = us_open("hostname", O_RDONLY);
+    int domain = us_open("domainname", O_RDWR), type = us_open("ostype", O_RDONLY);
+    int sem = us_open("sem", O_RDONLY);
+    int same = dup(host);
+    printf("at-open host=%#x domain=%#x ostype=%#x sem=%#x\n", us_poll(host, US_ALL), us_poll(domain, US_ALL),
+           us_poll(type, US_ALL), us_poll(sem, US_ALL));
+    sethostname("second", 6);
+    int first = us_poll(host, US_ALL), again = us_poll(host, US_ALL);
+    int through_dup = us_poll(same, US_ALL), opened = us_poll(other, US_ALL), seen = us_poll(other, US_ALL);
+    printf("sethostname first=%#x again=%#x dup=%#x other=%#x seen=%#x domain=%#x ostype=%#x\n", first, again,
+           through_dup, opened, seen, us_poll(domain, US_ALL), us_poll(type, US_ALL));
+    setdomainname("d", 1);
+    int domain_first = us_poll(domain, POLLPRI), host_too = us_poll(host, POLLPRI);
+    printf("setdomainname domain=%#x host=%#x again=%#x\n", domain_first, host_too, us_poll(domain, POLLPRI));
+    /* A poll for something else tells of it too, and has seen it. */
+    sethostname("third", 5);
+    int only_out = us_poll(host, POLLOUT), then = us_poll(host, POLLOUT);
+    printf("pollout %#x then %#x\n", only_out, then);
+    /* Writes tell, of what they change or not; a refused one does not. */
+    us_poll(other, 0);
+    long wrote = us_pwrite(host, "w", 1, 0);
+    int after_write = us_poll(other, POLLPRI), writer = us_poll(host, POLLPRI);
+    long past = us_pwrite(host, "w", 1, 40);
+    int after_past = us_poll(other, POLLPRI);
+    long none = us_pwrite(host, "", 0, 0);
+    int after_none = us_poll(other, POLLPRI);
+    long too_long = sethostname("x", 65) ? -errno : 0;
+    int after_refused = us_poll(other, POLLPRI);
+    printf("writes %ld=%#x writer=%#x past %ld=%#x none %ld=%#x refused %ld=%#x\n", wrote, after_write, writer, past,
+           after_past, none, after_none, too_long, after_refused);
+    char text[80];
+    sethostname("fourth", 6);
+    long n = pread(other, text, sizeof text, 0);
+    int after_read = us_poll(other, POLLPRI);
+    printf("read %ld poll=%#x\n", n, after_read);
+    /* Another namespace's change tells too; a child's poll is the parent's. */
+    us_poll(host, 0);
+    us_poll(other, 0);
+    fflush(stdout);
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWUTS)) _exit(90);
+        sethostname("inner", 5);
+        printf("child host=%#x\n", us_poll(host, POLLPRI));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("child", reaped(pid));
+    int by_child = us_poll(host, POLLPRI), unpolled = us_poll(other, POLLPRI);
+    printf("parent host=%#x other=%#x\n", by_child, unpolled);
+    /* select. */
+    sethostname("fifth", 5);
+    for (int turn = 0; turn < 2; turn++) {
+        fd_set sets[3];
+        for (int i = 0; i < 3; i++) {
+            FD_ZERO(&sets[i]);
+            FD_SET(host, &sets[i]);
+        }
+        struct timeval now = {0, 0};
+        int r = select(host + 1, &sets[0], &sets[1], &sets[2], &now);
+        printf("select %d read=%d write=%d except=%d\n", r, !!FD_ISSET(host, &sets[0]), !!FD_ISSET(host, &sets[1]),
+               !!FD_ISSET(host, &sets[2]));
+    }
+    /* epoll: level- and edge-triggered, one-shot, the other files. */
+    us_poll(other, 0);
+    int ep = epoll_create1(0), edge = epoll_create1(0);
+    int added = us_add(ep, host, EPOLLPRI, 1);
+    int edged = us_add(edge, other, EPOLLPRI | EPOLLET, 2);
+    int plain = us_add(ep, type, EPOLLPRI, 3);
+    printf("epoll add=%d edge=%d ostype=%d", added, edged, plain);
+    us_epoll("idle", ep, 0);
+    sethostname("sixth", 5);
+    us_epoll("level", ep, 0);
+    us_epoll("level-again", ep, 0);
+    us_epoll("edge", edge, 0);
+    us_epoll("edge-again", edge, 0);
+    sethostname("seventh", 7);
+    us_epoll("edge-next", edge, 0);
+    us_epoll("edge-next-again", edge, 0);
+    us_epoll("level-next", ep, 0);
+    printf("\n");
+    struct epoll_event once = {.events = EPOLLIN | EPOLLPRI | EPOLLONESHOT, .data.u32 = 4};
+    int modified = epoll_ctl(ep, EPOLL_CTL_MOD, host, &once) ? -errno : 0;
+    sethostname("eighth", 6);
+    printf("one-shot mod=%d", modified);
+    us_epoll("first", ep, 0);
+    sethostname("ninth", 5);
+    us_epoll("second", ep, 0);
+    printf(" poll=%#x\n", us_poll(host, POLLPRI));
+    /* An epoll's own poll polls what it watches, and so has seen it. */
+    int outer = epoll_create1(0);
+    us_poll(other, 0);
+    int inner_added = us_add(outer, edge, EPOLLIN, 5);
+    printf("nested add=%d", inner_added);
+    us_epoll("idle", outer, 0);
+    sethostname("tenth", 5);
+    us_epoll("outer", outer, 0);
+    us_epoll("inner", edge, 0);
+    sethostname("eleventh", 8);
+    printf(" poll-inner=%#x", us_poll(edge, POLLIN));
+    us_epoll("inner", edge, 0);
+    printf("\n");
+    /* A change wakes a wait. */
+    us_poll(host, 0);
+    us_poll(other, 0);
+    int ready[2];
+    if (pipe(ready)) return 1;
+    for (int way = 0; way < 2; way++) {
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            char byte;
+            if (read(ready[0], &byte, 1) != 1) _exit(91);
+            usleep(50000);
+            sethostname(way ? "late2" : "late1", 5);
+            _exit(0);
+        }
+        if (write(ready[1], "r", 1) != 1) return 1;
+        if (way) {
+            printf("wait");
+            us_epoll("edge", edge, 5000);
+            printf("\n");
+        } else {
+            struct pollfd p = {host, POLLPRI, 0};
+            int r = poll(&p, 1, 5000);
+            printf("wait poll=%d:%#x\n", r, p.revents);
+        }
+        result("waker", reaped(pid));
+    }
+    return 0;
+}
 /* The net-sysctl case's files, under /proc/sys/net. */
 static long ns_read(const char *name) {
     char path[128], text[32] = {0};
@@ -28835,6 +29651,37 @@ int main(int argc, char **argv) {
             ext.base.eid = 0;
             mctp_send(f, &ext, sizeof ext, 5, "ext null");
             mctp_receive(a, 0, 100, "any got");
+            close(f);
+            /* What a message takes of a receive buffer (its truesize): how
+               many the smallest buffer and twice it take, for messages
+               around the sizes of the small head cache and the next head,
+               then through a gateway's route of MTU 68, in packets. */
+            int g = socket(45, SOCK_DGRAM, 0), h = socket(45, SOCK_DGRAM, 0);
+            name = mctp_name(0, 0xff, 6, 0);
+            printf("bind any type 6=%ld\n", netns_result(bind(h, (void *)&name, sizeof name)));
+            struct mctp_tag_ctl near = {.peer = 8}, far = {.peer = 20};
+            printf("alloc near=%ld\n", netns_result(ioctl(g, 0x89e0, &near)));
+            printf("alloc far=%ld\n", netns_result(ioctl(g, 0x89e0, &far)));
+            for (int buffer = 1; buffer <= 2304; buffer += 2303) {
+                static const int lens[] = {0, 1, 299, 300, 363, 364, 683, 684, -191, -255, -319};
+                int set = setsockopt(h, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof buffer);
+                int got = 0;
+                len = sizeof got;
+                getsockopt(h, SOL_SOCKET, SO_RCVBUF, &got, &len);
+                printf("set=%d rcvbuf=%d\n", set, got);
+                for (size_t i = 0; i < sizeof lens / sizeof *lens; i++) {
+                    static unsigned char bytes[700];
+                    /* A negative length goes in packets. */
+                    int packets = lens[i] < 0, size = packets ? -lens[i] : lens[i];
+                    name = packets ? mctp_name(0, 20, 6, far.tag) : mctp_name(0, 8, 6, near.tag);
+                    int sent = 0, came = 0;
+                    long last = 0;
+                    while (sent < 20 && (last = netns_result(sendto(g, bytes, size, 0, (void *)&name, sizeof name))) >= 0)
+                        sent++;
+                    while (came < 20 && recv(h, bytes, sizeof bytes, MSG_DONTWAIT) == size) came++;
+                    printf("%s%d: sent=%d last=%ld came=%d\n", packets ? "packets of " : "", size, sent, last, came);
+                }
+            }
             fflush(stdout);
             _exit(0);
         }
@@ -38415,6 +39262,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
+    if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
+    if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();
     if (!strcmp(mode, "net-sysctl")) return net_sysctl_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
@@ -38436,7 +39285,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
-    if (!strcmp(mode, "file-leases")) return file_leases_case();
+    if (!strcmp(mode, "file-leases")) {
+        int failed = file_leases_case();
+        return failed ? failed : lease_breaks_case();
+    }
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
@@ -38550,6 +39402,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;
@@ -38992,6 +39845,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "context-switches")) return context_switches_case();
     if (!strcmp(mode, "exec-names")) return exec_names_case();
     if (!strcmp(mode, "exec-names-child")) return exec_names_child();
+    if (!strcmp(mode, "vma-names")) return vma_names_case();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);
     if (!strcmp(mode, "ptrace-stop-signal")) return ptrace_stop_signal_case();

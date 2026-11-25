@@ -6,7 +6,8 @@ use paludarium_decoder::decode;
 use paludarium_mmu::{AddressSpace, MappingKind, Prot, Userfault};
 use paludarium_types::{GuestAddr, PAGE_SIZE};
 
-use crate::native::NativeCompiler;
+use crate::exec::thread_cpu_time;
+use crate::native::{NativeCompiler, Worker};
 
 const CODE: u64 = 0x40_0000;
 const DATA: u64 = 0x60_0000;
@@ -917,6 +918,98 @@ fn a_block_compiled_in_the_background_runs_once_it_is_ready() {
     let again = compiler.compile(&forms(&code)).unwrap();
     let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
     assert_eq!(again.run(&mut state, &memory, generation), 2);
+}
+
+/// The host CPU time of a thread that waits for its blocks' code is its
+/// guest thread's, so what it compiles may not show there. Both sides are
+/// CPU time, which other threads of a busy machine do not add to.
+#[test]
+fn a_thread_that_waits_for_code_is_not_charged_for_compiling_it() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    // mov eax, imm32 and additions, another block for each `imm32`.
+    let block = |n: u32| {
+        let mut code = vec![0xb8];
+        code.extend_from_slice(&n.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x01, 0xd8].repeat(30));
+        forms(&code)
+    };
+    // The first blocks run the compiler's code cold, which costs the side
+    // that compiles first many times what the other pays, so they are left
+    // out.
+    const COLD: u32 = 10;
+    let (mut compiling, mut charged) = (0, 0);
+    let mut blocks = 0;
+    while blocks < COLD + 20 || compiling < 50_000_000 {
+        let forms = block(blocks);
+        blocks += 1;
+        // What compiling it takes on this thread, then what having it
+        // compiled does.
+        let start = thread_cpu_time();
+        assert!(compiler.machine_code(&forms).is_some());
+        let compiled_here = thread_cpu_time();
+        assert!(compiler.compile(&forms).is_some());
+        let end = thread_cpu_time();
+        if blocks > COLD {
+            compiling += compiled_here - start;
+            charged += end - compiled_here;
+        }
+    }
+    let blocks = blocks - COLD;
+    assert!(
+        charged < compiling / 2,
+        "{blocks} blocks took {compiling} ns to compile, and the thread that waited {charged} ns"
+    );
+}
+
+#[test]
+fn a_compile_that_panics_fails_the_thread_that_waits_and_only_it() {
+    let worker = Worker::default();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        worker.run(|| panic!("the compile fails"))
+    }));
+    let panic = failed.expect_err("the waiter did not fail");
+    assert_eq!(panic.downcast_ref(), Some(&"the compile fails"));
+    let caller = std::thread::current().id();
+    let (sender, ran) = std::sync::mpsc::channel();
+    assert!(worker.run(move || sender.send(std::thread::current().id()).unwrap()));
+    assert_ne!(ran.recv().unwrap(), caller);
+}
+
+#[test]
+fn a_block_whose_compile_panics_is_turned_down_again() {
+    // mov eax, 0x12345678
+    let failing = forms(&[0xb8, 0x78, 0x56, 0x34, 0x12]);
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    compiler.set_panics(true);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compiler.compile(&failing).is_some()
+    }));
+    let panic = failed.expect_err("the waiter did not fail");
+    assert_eq!(panic.downcast_ref(), Some(&"the compile fails"));
+    compiler.set_panics(false);
+    assert!(compiler.compile(&failing).is_none());
+    // Other blocks still compile.
+    assert!(compiler.compile(&forms(&[0xb8, 1, 2, 3, 4])).is_some());
+}
+
+/// Guest threads compile at once, some the same blocks, and none waits
+/// forever.
+#[test]
+fn threads_that_compile_at_once_all_go_on() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    std::thread::scope(|scope| {
+        for thread in 0..8u32 {
+            let compiler = &compiler;
+            scope.spawn(move || {
+                for n in 0..40u32 {
+                    let mut code = vec![0xb8];
+                    let shared = if n % 2 == 0 { 0 } else { thread << 16 };
+                    code.extend_from_slice(&(shared | n).to_le_bytes());
+                    assert!(compiler.compile(&forms(&code)).is_some());
+                }
+            });
+        }
+    });
 }
 
 #[test]

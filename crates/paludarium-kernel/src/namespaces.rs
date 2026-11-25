@@ -163,6 +163,13 @@ pub(crate) struct UtsNames {
     pub domain: Vec<u8>,
 }
 
+/// The fields of a UTS namespace's names that nothing changes, as `uname`
+/// and `/proc/sys/kernel` show them: the host's kernel is not revealed.
+pub(crate) const SYSNAME: &[u8] = b"Linux";
+pub(crate) const RELEASE: &[u8] = b"6.12.0-paludarium";
+pub(crate) const VERSION: &[u8] = b"#1 SMP PREEMPT_DYNAMIC";
+pub(crate) const MACHINE: &[u8] = b"x86_64";
+
 /// One namespace: its kind, the inode number that names it, and, for a UTS
 /// namespace, its names.
 #[derive(Debug)]
@@ -287,6 +294,17 @@ impl Namespace {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .domain = name.to_vec();
+    }
+    /// Changes the names in one step, as a write to
+    /// `/proc/sys/kernel/hostname` or `domainname` does: `change` gets the
+    /// host's, or with `domain` the domain's.
+    pub(crate) fn change_name<T>(&self, domain: bool, change: impl FnOnce(&mut Vec<u8>) -> T) -> T {
+        let mut names = self.names.lock().unwrap_or_else(PoisonError::into_inner);
+        change(if domain {
+            &mut names.domain
+        } else {
+            &mut names.host
+        })
     }
 }
 

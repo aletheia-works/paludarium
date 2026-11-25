@@ -353,6 +353,8 @@ pub(crate) fn task_path(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SystemEntry {
     Loadavg,
+    /// `/proc/locks` ([`crate::record_locks::proc_file`]).
+    Locks,
     Meminfo,
     Stat,
     Uptime,
@@ -364,6 +366,7 @@ pub(crate) enum SystemEntry {
 pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
     match path {
         b"/proc/loadavg" => Some(SystemEntry::Loadavg),
+        b"/proc/locks" => Some(SystemEntry::Locks),
         b"/proc/meminfo" => Some(SystemEntry::Meminfo),
         b"/proc/stat" => Some(SystemEntry::Stat),
         b"/proc/uptime" => Some(SystemEntry::Uptime),
@@ -3022,6 +3025,7 @@ mod generated_tests {
         assert_eq!(entry(b"/proc/self/root"), Some(OwnEntry::Root));
         assert_eq!(entry(b"/proc/8/stat"), None);
         assert_eq!(system_entry(b"/proc/loadavg"), Some(SystemEntry::Loadavg));
+        assert_eq!(system_entry(b"/proc/locks"), Some(SystemEntry::Locks));
         assert_eq!(system_entry(b"/proc/meminfo"), Some(SystemEntry::Meminfo));
         assert_eq!(system_entry(b"/proc/stat"), Some(SystemEntry::Stat));
         assert_eq!(system_entry(b"/proc/uptime"), Some(SystemEntry::Uptime));

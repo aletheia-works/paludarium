@@ -588,7 +588,13 @@ kernel.
   unlocking, changing or closing it ends the wait there at once, as
   `locks_wake_up_blocks` does, even before the waiter runs again. The
   locks are the guest's own: a program on the host does not see them, nor
-  they its.
+  they its. `/proc/locks` lists the record locks, the `flock` locks and the
+  leases as `locks_show` prints them: those of each CPU in turn (as `getcpu`
+  numbers it where the lock was taken), the latest first, a merged lock at
+  its first one's place and a split one's left piece as new
+  (`posix_lock_inode`), without those of processes outside the reader's PID
+  namespace. `/proc/<pid>/fdinfo` lists a description's own, its lease last
+  (`show_fd_locks`).
 
 - File leases (`fcntl`'s `F_SETLEASE` and `F_GETLEASE`), as Linux's
   `fs/locks.c` takes and gives them back: a read or write lease on an open
@@ -3816,8 +3822,8 @@ kernel.
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
 
-- The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
+- The other `/proc` entries are `/proc/loadavg`, `/proc/locks` (above),
+  `/proc/meminfo`, `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:

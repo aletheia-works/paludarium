@@ -4954,14 +4954,20 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     ok(0)
 }
 
+/// The CPU the calling thread runs on.
+pub(crate) fn cpu(c: &Context<'_>) -> u32 {
+    let cpu = c.process.on_cpu.map(|on| on.cpu);
+    cpu.unwrap_or_else(|| c.group.lowest_cpu(c.tid))
+}
+
 /// `getcpu(cpu, node, cache)`: the CPU the thread runs on, and NUMA node 0,
 /// each written where its pointer is not NULL; `EFAULT` when one cannot be
 /// written, as Linux, which still writes the other. The cache is ignored,
 /// as on Linux. A thread with `rseq` runs on a virtual CPU, the one its area
-/// shows; another on none, so it reports the lowest its mask allows.
+/// shows; another on none, so it reports the lowest its mask allows
+/// ([`cpu`]).
 fn sys_getcpu(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let cpu = c.process.on_cpu.map(|on| on.cpu);
-    let cpu = cpu.unwrap_or_else(|| c.group.lowest_cpu(c.tid));
+    let cpu = cpu(c);
     let mut failed = false;
     for (address, value) in [(a[0], cpu), (a[1], 0)] {
         if address != 0 {

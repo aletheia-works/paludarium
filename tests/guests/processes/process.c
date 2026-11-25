@@ -12138,6 +12138,163 @@ static int io_uring_timeout_case(void) {
     return 0;
 }
 
+/* io_uring's polls: IORING_OP_POLL_ADD and _POLL_REMOVE. */
+static unsigned char *up_add(struct uring *u, unsigned long data, int fd, unsigned events,
+                             unsigned flags) {
+    return unet_push(u, 6, data, fd, 0, 0, flags, events, 0);
+}
+
+static unsigned char *up_remove(struct uring *u, unsigned long data, unsigned long old,
+                                unsigned long new, unsigned events, unsigned flags) {
+    return unet_push(u, 7, data, 0, new, old, flags, events, 0);
+}
+
+static void up_run(struct uring *u, unsigned submit, unsigned wait, const char *label) {
+    uring_show(label, uring_enter(u->fd, submit, wait, 1, NULL, 0));
+    unet_reap(u, label, 0);
+}
+
+static int io_uring_poll_add_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    int p[2], pair[2];
+    if (pipe2(p, O_NONBLOCK) || socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 81;
+    char buf[64];
+    unsigned char *sqe;
+
+    /* The preparation. */
+    static const unsigned char add_bad[][2] = {{40, 1}, {8, 1}, {16, 1}, {24, 2}, {24, 8}, {2, 1}};
+    for (unsigned i = 0; i < sizeof add_bad / sizeof *add_bad; i++) {
+        up_add(&u, 1, p[0], POLLIN, 0)[add_bad[i][0]] = add_bad[i][1];
+        up_run(&u, 1, 1, "add-refused");
+    }
+    up_add(&u, 1, p[0], POLLIN, 1)[1] = 1 << 6;
+    up_run(&u, 1, 1, "multi-skip");
+    up_add(&u, 1, 99, POLLIN, 0);
+    up_run(&u, 1, 1, "badf");
+    static const unsigned char remove_bad[][2] = {{40, 1}, {44, 1}, {24, 8}, {24, 1},
+                                                  {8, 1},  {28, 1}, {2, 1}};
+    for (unsigned i = 0; i < sizeof remove_bad / sizeof *remove_bad; i++) {
+        up_remove(&u, 1, 5, 0, 0, 0)[remove_bad[i][0]] = remove_bad[i][1];
+        up_run(&u, 1, 1, "remove-refused");
+    }
+    up_remove(&u, 1, 5, 0, 0, 0);
+    up_run(&u, 1, 1, "remove-none");
+
+    /* Events there already, and files without poll. */
+    up_add(&u, 1, p[1], POLLOUT, 0);
+    up_run(&u, 1, 1, "writable");
+    up_add(&u, 1, p[1], POLLOUT | POLLWRNORM | POLLIN, 0);
+    up_run(&u, 1, 1, "writable-norm");
+    int file = open("/proc/self/exe", O_RDONLY);
+    up_add(&u, 1, file, POLLIN | POLLOUT | POLLRDNORM, 0);
+    up_run(&u, 1, 1, "file");
+    up_add(&u, 1, file, POLLIN, 1);
+    up_run(&u, 1, 1, "file-multi");
+    up_add(&u, 1, file, POLLPRI, 0);
+    up_run(&u, 1, 1, "file-none");
+
+    /* Waiting, with a link, and once its descriptor is closed. */
+    up_add(&u, 1, p[0], POLLIN, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    up_run(&u, 2, 0, "waits");
+    printf("write: %ld\n", (long)write(p[1], "abc", 3));
+    up_run(&u, 0, 2, "ready");
+    printf("read: %ld\n", (long)read(p[0], buf, sizeof buf));
+    int again = dup(p[0]);
+    up_add(&u, 1, again, POLLRDNORM, 0);
+    up_run(&u, 1, 0, "waits-dup");
+    close(again);
+    printf("write: %ld\n", (long)write(p[1], "abc", 3));
+    up_run(&u, 0, 1, "ready-closed");
+    printf("read: %ld\n", (long)read(p[0], buf, sizeof buf));
+    up_add(&u, 1, pair[0], POLLIN | POLLPRI, 0);
+    up_run(&u, 1, 0, "waits-socket");
+    printf("write: %ld\n", (long)write(pair[1], "a", 1));
+    up_run(&u, 0, 1, "ready-socket");
+    printf("read: %ld\n", (long)read(pair[0], buf, sizeof buf));
+
+    /* Removing, updating and cancelling. */
+    up_add(&u, 1, p[0], POLLIN, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    up_run(&u, 2, 0, "to-remove");
+    up_remove(&u, 3, 1, 0, 0, 0);
+    up_run(&u, 1, 3, "removed");
+    up_add(&u, 1, p[0], POLLIN, 0);
+    up_run(&u, 1, 0, "to-update");
+    up_remove(&u, 3, 1, 7, POLLRDNORM, 2 | 4);
+    up_run(&u, 1, 1, "updated");
+    up_remove(&u, 3, 1, 0, 0, 0);
+    up_run(&u, 1, 1, "old-data");
+    printf("write: %ld\n", (long)write(p[1], "abc", 3));
+    up_run(&u, 0, 1, "ready-updated");
+    up_add(&u, 1, p[0], POLLPRI, 0);
+    up_run(&u, 1, 0, "to-update-ready");
+    up_remove(&u, 3, 1, 0, POLLIN, 2);
+    up_run(&u, 1, 2, "updated-ready");
+    printf("read: %ld\n", (long)read(p[0], buf, sizeof buf));
+    up_add(&u, 1, p[0], POLLIN, 0);
+    up_add(&u, 2, p[0], POLLIN, 0);
+    unet_push(&u, 14, 3, p[0], 0, 0, 0, 1 | 2, 0);
+    up_run(&u, 3, 3, "cancelled-all");
+    up_add(&u, 1, p[0], POLLIN, 0)[1] = 4;
+    uto_timeout(&u, 15, 2, &uto_short, 0, 0);
+    up_run(&u, 2, 2, "linked-timeout");
+
+    /* A multishot poll. */
+    up_add(&u, 1, p[0], POLLIN, 1);
+    up_run(&u, 1, 0, "multi");
+    for (int i = 0; i < 2; i++) {
+        printf("write: %ld\n", (long)write(p[1], "abc", 3));
+        up_run(&u, 0, 1, "multi-ready");
+    }
+    printf("read: %ld\n", (long)read(p[0], buf, sizeof buf));
+    up_run(&u, 0, 0, "multi-read");
+    up_remove(&u, 3, 1, 5, 0, 4);
+    up_run(&u, 1, 1, "multi-data");
+    printf("write: %ld\n", (long)write(p[1], "abc", 3));
+    up_run(&u, 0, 1, "multi-ready");
+    up_add(&u, 6, p[0], POLLIN, 1);
+    up_run(&u, 1, 2, "multi-at-once");
+    up_remove(&u, 3, 6, 0, 0, 0);
+    up_run(&u, 1, 2, "multi-removed");
+    for (int i = 0; i < 9; i++) write(p[1], "a", 1);
+    up_run(&u, 0, 0, "multi-full");
+    up_run(&u, 0, 1, "multi-last");
+    up_remove(&u, 3, 5, 0, 0, 0);
+    up_run(&u, 1, 1, "multi-gone");
+    up_add(&u, 1, pair[0], POLLIN | POLLOUT, 1);
+    up_run(&u, 1, 1, "multi-socket");
+    printf("write: %ld\n", (long)write(pair[1], "a", 1));
+    up_run(&u, 0, 1, "multi-socket-in");
+    close(pair[1]);
+    up_run(&u, 0, 1, "multi-socket-hup");
+    up_remove(&u, 3, 1, 0, 0, 0);
+    up_run(&u, 1, 2, "multi-socket-removed");
+    int event = eventfd(0, EFD_NONBLOCK);
+    unsigned long one = 1;
+    up_add(&u, 1, event, POLLIN | POLLOUT, 1);
+    up_run(&u, 1, 1, "multi-event");
+    printf("write: %ld\n", (long)write(event, &one, 8));
+    up_run(&u, 0, 1, "multi-event-in");
+    close(event);
+    unet_push(&u, 14, 3, 0, 0, 0, 0, 4, 0);
+    up_run(&u, 1, 2, "multi-event-cancelled");
+
+    /* The hang-up. */
+    while (read(p[0], buf, sizeof buf) > 0) continue;
+    up_add(&u, 1, p[0], 0, 0);
+    up_run(&u, 1, 0, "waits-hup");
+    close(p[1]);
+    up_run(&u, 0, 1, "hup");
+    up_add(&u, 1, p[0], POLLIN, 1);
+    up_run(&u, 1, 1, "hup-multi");
+    unet_push(&u, 14, 3, 0, 0, 1, 0, 0, 0);
+    up_run(&u, 1, 2, "hup-multi-cancelled");
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -42432,6 +42589,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-held-buffer")) return io_uring_held_buffer_case();
     if (!strcmp(mode, "io-uring-net")) return io_uring_net_case();
     if (!strcmp(mode, "io-uring-timeout")) return io_uring_timeout_case();
+    if (!strcmp(mode, "io-uring-poll-add")) return io_uring_poll_add_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

@@ -4,7 +4,8 @@
 //! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`,
 //! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
 //! `IORING_OP_ASYNC_CANCEL` ([`cancel`]), the timeouts `IORING_OP_TIMEOUT`,
-//! `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT` ([`timeout`]), and the single-shot
+//! `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT` ([`timeout`]), the polls
+//! `IORING_OP_POLL_ADD` and `_POLL_REMOVE` ([`poll`]), and the single-shot
 //! socket requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
 //! `_SEND` and `_RECV` ([`net`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
@@ -46,6 +47,7 @@ use paludarium_types::{Errno, GuestAddr};
 use crate::syscalls::{Context, Outcome, err, ok};
 
 mod net;
+mod poll;
 mod timeout;
 
 /// The most submission queue entries, and completion queue entries.
@@ -133,7 +135,7 @@ const OP_EPOLL_CTL: u8 = 29;
 const OP_PROVIDE_BUFFERS: u8 = 31;
 const OP_REMOVE_BUFFERS: u8 = 32;
 /// The operations implemented.
-const OPS: [u8; 22] = [
+const OPS: [u8; 24] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
@@ -156,6 +158,8 @@ const OPS: [u8; 22] = [
     timeout::OP_TIMEOUT,
     timeout::OP_TIMEOUT_REMOVE,
     timeout::OP_LINK_TIMEOUT,
+    poll::OP_POLL_ADD,
+    poll::OP_POLL_REMOVE,
 ];
 /// `IORING_OP_LAST` of Linux 6.12, after `IORING_OP_LISTEN`.
 const OP_LAST: u8 = 58;
@@ -263,6 +267,7 @@ const OP_SUPPORTED: u16 = 1;
 
 const ETIME: Errno = Errno(62);
 const ECANCELED: Errno = Errno(125);
+const EALREADY: Errno = Errno(114);
 const EOPNOTSUPP: Errno = Errno(95);
 const EEXIST: Errno = Errno(17);
 const ENOBUFS: Errno = Errno(105);
@@ -421,6 +426,19 @@ struct Armed {
     mask: u32,
     chain: Vec<Request>,
     held: Vec<Arc<Node>>,
+    /// How an `IORING_OP_POLL_ADD` waits; nothing for a request that runs
+    /// again once its file is ready.
+    watch: Option<poll::Watch>,
+}
+
+impl Armed {
+    fn is(&self, ring: &Ring, id: u64) -> bool {
+        self.id == id && std::ptr::addr_eq(self.ring.as_ptr(), std::ptr::from_ref(ring))
+    }
+    /// Its task work runs on its own, and sees that it was cancelled.
+    fn queued(&self) -> bool {
+        self.watch.as_ref().is_some_and(poll::Watch::queued)
+    }
 }
 
 /// Task work: what is left of a request, or of its link, until it runs.
@@ -448,6 +466,11 @@ enum Deferred {
         chain: Vec<Request>,
         held: Vec<Arc<Node>>,
     },
+    /// `io_poll_task_func`: a poll that waits no more ([`poll::finished`]).
+    Polled(Box<Armed>),
+    /// `io_poll_task_func`: a multishot poll that waits on has events
+    /// ([`poll::more`]).
+    PollMore { id: u64 },
     /// `io_req_tw_fail_links`: the rest of a link that failed completes,
     /// each with the error it failed to prepare with or `ECANCELED`, and
     /// none posts with `REQ_F_SKIP_LINK_CQES`.
@@ -836,6 +859,10 @@ enum Work {
     Timeout(Box<timeout::Timeout>),
     /// `IORING_OP_TIMEOUT_REMOVE`.
     TimeoutRemove(Box<timeout::Remove>),
+    /// `IORING_OP_POLL_ADD` ([`poll`]).
+    Poll(Box<poll::Poll>),
+    /// `IORING_OP_POLL_REMOVE`.
+    PollRemove(Box<poll::Remove>),
     /// `IORING_OP_ASYNC_CANCEL`: what it looks for, and whether its `fd` is
     /// a registered one (`IOSQE_FIXED_FILE`).
     Cancel {
@@ -1288,6 +1315,12 @@ impl Ring {
             },
             timeout::OP_TIMEOUT | timeout::OP_TIMEOUT_REMOVE | timeout::OP_LINK_TIMEOUT => {
                 match timeout::prepare(opcode, fixed, sqe) {
+                    Ok(work) => work,
+                    Err(e) => return fail(request, e),
+                }
+            }
+            poll::OP_POLL_ADD | poll::OP_POLL_REMOVE => {
+                match poll::prepare(opcode, flags, fixed, sqe) {
                     Ok(work) => work,
                     Err(e) => return fail(request, e),
                 }
@@ -1819,7 +1852,13 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
             bgid,
             bid,
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
-        Work::Transfer(_) | Work::Net(_) | Work::Timeout(_) | Work::Nop { .. } | Work::None => 0,
+        Work::Transfer(_)
+        | Work::Net(_)
+        | Work::Timeout(_)
+        | Work::Poll(_)
+        | Work::PollRemove(_)
+        | Work::Nop { .. }
+        | Work::None => 0,
     };
     (res, 0, res < 0, None)
 }
@@ -1942,7 +1981,23 @@ fn issue_link(
         timeout::arm(c, ring, chain);
         return;
     }
-    let (res, flags, failed, waits) = run(c, ring, &mut request.work);
+    if matches!(request.work, Work::Poll(_)) {
+        chain.insert(0, request);
+        let held = {
+            let mut state = ring.state();
+            let at = mark.min(state.held.len());
+            state.held.split_off(at)
+        };
+        poll::add(c, file, ring, chain, held);
+        return;
+    }
+    let (res, flags, failed, waits) = match &mut request.work {
+        Work::PollRemove(remove) => {
+            let res = poll::remove(c, file, ring, remove).map_or_else(|e| -e.0, |v| v as i32);
+            (res, 0, res < 0, None)
+        }
+        work => run(c, ring, work),
+    };
     let split_held = || {
         let mut state = ring.state();
         let at = mark.min(state.held.len());
@@ -2027,6 +2082,7 @@ fn arm(
             mask: waits.mask,
             chain,
             held,
+            watch: None,
         });
     polls
         .count
@@ -2079,7 +2135,7 @@ fn run_fallback(polls: &Polls) {
             };
             match ring.try_submitting() {
                 Some(_submitting) => {
-                    run_terminated(ring, work);
+                    run_terminated(polls, ring, work);
                     ran = true;
                 }
                 None => busy.push((weak, work)),
@@ -2107,40 +2163,53 @@ fn wake(polls: &Polls) {
     if polls.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return;
     }
-    let woken: Vec<Armed> = {
+    // The requests that go on, and the multishot polls that have events, by
+    // where their task work goes.
+    let mut woken = Vec::new();
+    {
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
-        let (woken, waiting): (Vec<Armed>, Vec<Armed>) = std::mem::take(&mut *armed)
-            .into_iter()
+        let mut waiting = Vec::with_capacity(armed.len());
+        for mut a in std::mem::take(&mut *armed) {
             // A ring that closed lets go of its requests and the files they
             // hold here, at the checkpoint of the `close` (or `munmap`) that
             // let go of it last, before that call returns.
-            .filter(|a| a.ring.strong_count() != 0)
-            .partition(|a| ready(&a.polled, a.mask));
+            if a.ring.strong_count() == 0 {
+                continue;
+            }
+            let ring = std::sync::Weak::clone(&a.ring);
+            match poll::look(&mut a) {
+                poll::Look::Waits => waiting.push(a),
+                poll::Look::More => {
+                    let work = Deferred::PollMore { id: a.id };
+                    woken.push((ring, Arc::clone(&a.inbox), Arc::clone(&a.hub), work));
+                    waiting.push(a);
+                }
+                poll::Look::Goes => {
+                    let (inbox, hub) = (Arc::clone(&a.inbox), Arc::clone(&a.hub));
+                    let work = if a.watch.is_some() {
+                        Deferred::Polled(Box::new(a))
+                    } else {
+                        Deferred::Poll {
+                            id: a.id,
+                            chain: a.chain,
+                            held: a.held,
+                        }
+                    };
+                    woken.push((ring, inbox, hub, work));
+                }
+            }
+        }
         *armed = waiting;
         polls
             .count
             .store(armed.len(), std::sync::atomic::Ordering::SeqCst);
-        woken
-    };
-    for armed in woken {
-        let Some(file) = armed.ring.upgrade() else {
-            continue;
-        };
-        let Ok(ring) = downcast(&file) else {
-            continue;
-        };
-        add_work(
-            polls,
-            &file,
-            ring,
-            &armed.inbox,
-            Some(&armed.hub),
-            Deferred::Poll {
-                id: armed.id,
-                chain: armed.chain,
-                held: armed.held,
-            },
-        );
+    }
+    for (ring, inbox, hub, work) in woken {
+        if let Some(file) = ring.upgrade()
+            && let Ok(ring) = downcast(&file)
+        {
+            add_work(polls, &file, ring, &inbox, Some(&hub), work);
+        }
     }
 }
 
@@ -2176,7 +2245,7 @@ pub(crate) fn cancel_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>) {
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
         let (cancelled, kept) = std::mem::take(&mut *armed)
             .into_iter()
-            .partition(|a| Arc::ptr_eq(&a.inbox, inbox));
+            .partition(|a| Arc::ptr_eq(&a.inbox, inbox) && !a.queued());
         *armed = kept;
         polls
             .count
@@ -2264,7 +2333,7 @@ pub(crate) fn cancel_all_task(c: &mut Context<'_>) {
 /// on, and fails once its file is ready. Here the thread waits for a ring
 /// another holds, as Linux's `exit_task_work` takes `uring_lock` in the
 /// thread that exits: no worker runs this work.
-pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
+pub(crate) fn exit_task(polls: &Polls, inbox: &Arc<crate::SignalInbox>) {
     unregister_all_rings(inbox);
     let work = {
         let mut task_work = inbox.task_work();
@@ -2277,7 +2346,7 @@ pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
             && let Ok(ring) = downcast(&file)
         {
             let _submitting = ring.submitting();
-            run_terminated(ring, work);
+            run_terminated(polls, ring, work);
         }
     }
 }
@@ -2289,7 +2358,7 @@ pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
 /// or one that found its file ready with `EFAULT` (`io_req_task_submit`),
 /// and the rest completes as it would. What it leaves runs so too. The
 /// ring's lock is held.
-fn run_terminated(ring: &Ring, work: Deferred) {
+fn run_terminated(polls: &Polls, ring: &Ring, work: Deferred) {
     let mut pending = vec![work];
     while !pending.is_empty() {
         ring.begin();
@@ -2304,6 +2373,11 @@ fn run_terminated(ring: &Ring, work: Deferred) {
                     ring.unhash(id);
                     fail_request(ring, chain, ECANCELED);
                 }
+                Deferred::Polled(armed) => {
+                    ring.unhash(armed.id);
+                    poll::cancelled(ring, *armed);
+                }
+                Deferred::PollMore { id } => poll::end(polls, ring, id),
                 Deferred::Complete {
                     done,
                     held,
@@ -2409,6 +2483,19 @@ impl Ring {
             .iter()
             .position(|h| h.id == id)
             .is_some_and(|at| cancels.hashed.remove(at).cancelled)
+    }
+
+    /// Whether a cancellation found a request whose task work is to run.
+    fn is_cancelled(&self, id: u64) -> bool {
+        let cancels = self.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+        cancels.hashed.iter().any(|h| h.id == id && h.cancelled)
+    }
+
+    /// `io_poll_find`: the latest `IORING_OP_POLL_ADD` of `user_data`.
+    fn find_poll(&self, user_data: u64) -> Option<u64> {
+        let cancels = self.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = |h: &&Hashed| h.opcode == poll::OP_POLL_ADD && h.user_data == user_data;
+        cancels.hashed.iter().rev().find(found).map(|h| h.id)
     }
 }
 
@@ -2525,10 +2612,9 @@ fn cancel_polls(
     let stopped: Vec<Armed> = {
         let polls = &c.processes.io_uring;
         let mut armed = polls.armed.lock().unwrap_or_else(PoisonError::into_inner);
-        let (mut stopped, waiting): (Vec<Armed>, Vec<Armed>) =
-            std::mem::take(&mut *armed).into_iter().partition(|a| {
-                std::ptr::addr_eq(a.ring.as_ptr(), ring as *const Ring) && found.contains(&a.id)
-            });
+        let (mut stopped, waiting): (Vec<Armed>, Vec<Armed>) = std::mem::take(&mut *armed)
+            .into_iter()
+            .partition(|a| found.contains(&a.id) && a.is(ring, a.id) && !a.queued());
         *armed = waiting;
         polls
             .count
@@ -2645,6 +2731,8 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
                 issue_link(c, file, ring, chain, held);
             }
         }
+        Deferred::Polled(armed) => poll::finished(c, file, ring, *armed),
+        Deferred::PollMore { id } => poll::more(c, file, ring, id),
         Deferred::Fail { chain, skip } => fail_rest(ring, chain, skip),
         Deferred::Timeout(chain) => timeout::run_expired(c, file, ring, chain),
         Deferred::LinkTimeout { request, head } => {

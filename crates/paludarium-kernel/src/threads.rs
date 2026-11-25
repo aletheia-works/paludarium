@@ -2310,7 +2310,7 @@ impl Kernel {
         // Its tracees are let go of, and its tracer told, before it goes.
         self.ptrace_exit(thread, status);
         // What task work it still has runs as an exiting task's.
-        crate::io_uring::exit_task(&self.inbox);
+        crate::io_uring::exit_task(&self.processes.io_uring, &self.inbox);
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).

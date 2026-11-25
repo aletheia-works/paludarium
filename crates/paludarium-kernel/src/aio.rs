@@ -647,7 +647,7 @@ fn polled_by_a_worker(file: &Arc<dyn FileHandle>) -> bool {
 /// for; taking a write likewise gives the writer's key. A file whose
 /// wake-ups carry no key (a hang-up, a timerfd, ...) is polled again, and
 /// gives what is ready among `events`.
-fn woken(file: &Arc<dyn FileHandle>, mask: u32, events: u32) -> u32 {
+pub(crate) fn woken(file: &Arc<dyn FileHandle>, mask: u32, events: u32) -> u32 {
     const POLLPRI: u32 = 0x2;
     const POLLRDBAND: u32 = 0x80;
     const POLLWRBAND: u32 = 0x200;

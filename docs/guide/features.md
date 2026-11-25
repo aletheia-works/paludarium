@@ -1831,7 +1831,8 @@ kernel.
   `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
   `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
-  `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, and the socket requests
+  `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, the polls `IORING_OP_POLL_ADD` and
+  `_POLL_REMOVE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
   `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
@@ -2009,6 +2010,20 @@ kernel.
   `IORING_TIMEOUT_IMMEDIATE_ARG`. A cancellation finds the timeouts after
   the requests that wait for their files, but none by a file, and no linked
   one. `execve` and a whole process's exit cancel the thread's.
+
+- The polls are Linux master's (`io_uring/poll.c`). `IORING_OP_POLL_ADD`
+  completes with the events its file has of those it asks for and the ones
+  that end any poll (`POLLERR`, `POLLHUP`, `POLLNVAL`, and `POLLRDHUP` for a
+  reader), or waits for them, holding its file. The events a wake-up tells
+  of are those of its key: a socket polled for both directions that gets
+  bytes reports `POLLIN` alone. With `IORING_POLL_ADD_MULTI` it posts a
+  completion with `IORING_CQE_F_MORE` for the events there and then for each
+  wake-up, those before its task work runs as one, until the queue has no
+  room. A file without `poll` completes at once (`EINVAL` without the
+  events). `IORING_OP_POLL_REMOVE` ends the latest poll of a `user_data`
+  with `ECANCELED` (`ENOENT` for none, `EALREADY` for one whose task work is
+  queued), or gives it new events (`IORING_POLL_UPDATE_EVENTS`) or
+  `user_data` (`IORING_POLL_UPDATE_USER_DATA`), with which it polls again.
 
 - The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and

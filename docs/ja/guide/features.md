@@ -1613,7 +1613,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
-  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、それにソケットの要求
+  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
@@ -1755,6 +1755,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_TIMEOUT_IMMEDIATE_ARG` ではエントリーの中にあります。取り消しは、ファイルを待つ要求の
   あとにタイムアウトを探しますが、ファイルでは見つけず、リンクしたものも見つけません。`execve` と
   プロセス全体の終了は、そのスレッドのものを取り消します。
+
+- ポーリングは Linux master のもの（`io_uring/poll.c`）です。`IORING_OP_POLL_ADD` は、求めた
+  イベントと、どのポーリングも終わらせるイベント（`POLLERR`、`POLLHUP`、`POLLNVAL`、読み手には
+  `POLLRDHUP`）のうちファイルにあるもので完了し、なければファイルを持ったまま待ちます。起こされて
+  報告するイベントは、その起床のキーのものです。たとえば両方向を求めたソケットにバイトが届くと
+  `POLLIN` だけを報告します。`IORING_POLL_ADD_MULTI` では、すでにあるイベントと、そのあとの起床
+  ごとに、`IORING_CQE_F_MORE` 付きの完了を、キューに空きがなくなるまで投稿します。タスクワークが
+  走る前の起床は 1 つにまとめます。`poll` のないファイルではすぐに完了します（求めたイベントが
+  なければ `EINVAL`）。`IORING_OP_POLL_REMOVE` は、ある `user_data` の最後のポーリングを
+  `ECANCELED` で終わらせるか（なければ `ENOENT`、タスクワークを待つものは `EALREADY`）、新しい
+  イベント（`IORING_POLL_UPDATE_EVENTS`）や `user_data`（`IORING_POLL_UPDATE_USER_DATA`）を与えて
+  もう一度ポーリングさせます。
 
 - ソケットの要求は Linux 7.0 の単発のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
   `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。どれも Linux と同じく準備し、

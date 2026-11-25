@@ -5116,7 +5116,7 @@ mod io_uring {
         // An operation 6.12 lacks, then one it has but is not implemented:
         // each ends the submission after itself.
         push(&mut f, &r, 0, &sqe(200, 1));
-        push(&mut f, &r, 1, &sqe(6, 2));
+        push(&mut f, &r, 1, &sqe(47, 2));
         push(&mut f, &r, 2, &sqe(0, 3));
         assert_eq!(f.ret(426, &[r.fd, 3, 0, 0]), 1);
         assert_eq!(f.ret(426, &[r.fd, 2, 0, 0]), 1);
@@ -5226,7 +5226,8 @@ mod io_uring {
         assert_eq!(
             supported,
             [
-                0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15, 16, 20, 22, 23, 26, 27, 29, 31, 32, 34, 45
+                0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 20, 22, 23, 26, 27, 29, 31, 32, 34,
+                45
             ]
         );
         // A probe that is not zeroed, buffers without an argument, another
@@ -7067,6 +7068,170 @@ mod io_uring {
         assert_eq!(f.ret(427, &[r.fd, UNRING_FDS, update, 2]), 2);
         assert_eq!(f.ret(426, &[0, 0, 0, 1 << 4]), errno(Errno::EBADF));
         assert_eq!(f.ret(426, &[3, 0, 0, 1 << 4]), errno(Errno::EBADF));
+    }
+
+    /// An `IORING_OP_POLL_ADD` of `events` on `fd`.
+    fn poll_add(data: u64, fd: u64, events: u32, flags: u32) -> [u8; 64] {
+        let mut e = sqe(6, data);
+        e[4..8].copy_from_slice(&(fd as i32).to_le_bytes());
+        e[24..28].copy_from_slice(&flags.to_le_bytes());
+        e[28..32].copy_from_slice(&events.to_le_bytes());
+        e
+    }
+
+    /// An `IORING_OP_POLL_REMOVE` of the poll of `old`.
+    fn poll_remove(data: u64, old: u64, new: u64, events: u32, flags: u32) -> [u8; 64] {
+        let mut e = sqe(7, data);
+        e[8..16].copy_from_slice(&new.to_le_bytes());
+        e[16..24].copy_from_slice(&old.to_le_bytes());
+        e[24..28].copy_from_slice(&flags.to_le_bytes());
+        e[28..32].copy_from_slice(&events.to_le_bytes());
+        e
+    }
+
+    /// The completions not yet consumed, with their flags.
+    fn reap_flags(f: &mut Fixture, r: &Ring) -> Vec<(u64, i32, u32)> {
+        let (mut head, tail) = (u32_at(f, r.rings + 8), u32_at(f, r.rings + 12));
+        let mut out = Vec::new();
+        while head != tail {
+            let at = r.rings + 64 + 16 * u64::from(head & 7);
+            let data = u64::from(u32_at(f, at));
+            out.push((data, u32_at(f, at + 8) as i32, u32_at(f, at + 12)));
+            head = head.wrapping_add(1);
+        }
+        f.mem
+            .write(GuestAddr(r.rings + 8), &head.to_le_bytes())
+            .unwrap();
+        out
+    }
+
+    fn a_pipe(f: &mut Fixture, at: u64) -> (u64, u64) {
+        assert_eq!(f.ret(293, &[at, 0x800]), 0);
+        (u64::from(u32_at(f, at)), u64::from(u32_at(f, at + 4)))
+    }
+
+    const MULTI: u32 = 1;
+
+    #[test]
+    fn polls_are_prepared_as_linux_does() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (read, write) = a_pipe(&mut f, DATA + 0x300);
+        for (at, value) in [(40, 1), (8, 1), (16, 1), (24, 2), (24, 8)] {
+            let mut e = poll_add(1, read, 1, 0);
+            e[at] = value;
+            assert_eq!(one(&mut f, &r, &e), -22, "add {at}");
+        }
+        let mut e = poll_add(1, read, 1, MULTI);
+        e[1] = 1 << 6;
+        assert_eq!(one(&mut f, &r, &e), -22);
+        assert_eq!(one(&mut f, &r, &poll_add(1, 99, 1, 0)), -9);
+        // remove: buf_index, splice_fd_in, the flags, what no update takes.
+        for (at, value) in [(40, 1), (44, 1), (24, 8), (24, 1), (8, 1), (28, 1)] {
+            let mut e = poll_remove(1, 5, 0, 0, 0);
+            e[at] = value;
+            assert_eq!(one(&mut f, &r, &e), -22, "remove {at}");
+        }
+        assert_eq!(one(&mut f, &r, &poll_remove(1, 5, 0, 0, 0)), -2);
+        // One that has events completes at once, with what it asked for.
+        assert_eq!(one(&mut f, &r, &poll_add(1, write, 4, 0)), 4);
+        assert_eq!(one(&mut f, &r, &poll_add(1, write, 0x104, 0)), 0x104);
+        // A file without poll: its events, or EINVAL without one asked for.
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let file = f.ret(2, &[DATA, 0o102, 0o600]);
+        assert_eq!(one(&mut f, &r, &poll_add(1, file, 5, 0)), 5);
+        assert_eq!(one(&mut f, &r, &poll_add(1, file, 5, MULTI)), 5);
+        assert_eq!(one(&mut f, &r, &poll_add(1, file, 2, 0)), -22);
+    }
+
+    #[test]
+    fn a_poll_waits_for_its_events_and_is_removed_or_updated() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (read, write) = a_pipe(&mut f, DATA + 0x300);
+        assert_eq!(batch(&mut f, &r, &[poll_add(1, read, 1, 0)]), []);
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 1)]);
+        assert_eq!(f.ret(0, &[read, DATA + 0x800, 8]), 2);
+        // Removed, it ends after the request that removed it.
+        let polls = [poll_add(2, read, 1, 0), poll_add(2, read, 0x40, 0)];
+        assert_eq!(batch(&mut f, &r, &polls), []);
+        let remove = poll_remove(3, 2, 0, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[remove]), [(3, 0), (2, -125)]);
+        // The latest went first: the one left waits for POLLIN.
+        let update = poll_remove(4, 2, 7, 0x41, 2 | 4);
+        assert_eq!(batch(&mut f, &r, &[update]), [(4, 0)]);
+        assert_eq!(batch(&mut f, &r, &[remove]), [(3, -2)]);
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(7, 0x41)]);
+        // An update to events its file has completes it.
+        assert_eq!(batch(&mut f, &r, &[poll_add(8, read, 2, 0)]), []);
+        let update = poll_remove(9, 8, 0, 1, 2);
+        assert_eq!(batch(&mut f, &r, &[update]), [(9, 0), (8, 1)]);
+        // A cancellation, then the writer's end.
+        assert_eq!(f.ret(0, &[read, DATA + 0x800, 8]), 2);
+        assert_eq!(batch(&mut f, &r, &[poll_add(1, read, 1, 0)]), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(2, 1, 0, 0)]),
+            [(2, 0), (1, -125)]
+        );
+        assert_eq!(batch(&mut f, &r, &[poll_add(1, read, 1, 0)]), []);
+        assert_eq!(f.ret(3, &[write]), 0);
+        assert_eq!(reap(&mut f, &r), [(1, 0x10)]);
+    }
+
+    #[test]
+    fn a_multishot_poll_reports_each_wake_up() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (read, write) = a_pipe(&mut f, DATA + 0x300);
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        submit_only(&mut f, &r, &[poll_add(1, read, 1, MULTI)]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 1, MORE)]);
+        f.ret(39, &[]);
+        assert_eq!(reap_flags(&mut f, &r), []);
+        for _ in 0..2 {
+            assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+            assert_eq!(reap_flags(&mut f, &r), [(1, 1, MORE)]);
+        }
+        // Its writer gone, it reports the hang-up with what is left.
+        assert_eq!(f.ret(3, &[write]), 0);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 0x11, MORE)]);
+        assert_eq!(
+            batch(&mut f, &r, &[poll_remove(2, 1, 0, 0, 0)]),
+            [(2, 0), (1, -125)]
+        );
+        // Both ways, a wake-up for one reports that one alone.
+        let pair = DATA + 0x300;
+        assert_eq!(f.ret(53, &[1, 1, 0, pair]), 0);
+        let (a, b) = (u64::from(u32_at(&f, pair)), u64::from(u32_at(&f, pair + 4)));
+        submit_only(&mut f, &r, &[poll_add(3, a, 5, MULTI)]);
+        assert_eq!(reap_flags(&mut f, &r), [(3, 4, MORE)]);
+        assert_eq!(f.ret(1, &[b, DATA, 1]), 1);
+        assert_eq!(reap_flags(&mut f, &r), [(3, 1, MORE)]);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(4, 3, 0, 0)]),
+            [(4, 0), (3, -125)]
+        );
+    }
+
+    #[test]
+    fn a_multishot_poll_without_room_ends() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (read, write) = a_pipe(&mut f, DATA + 0x300);
+        submit_only(&mut f, &r, &[poll_add(1, read, 1, MULTI)]);
+        for _ in 0..9 {
+            assert_eq!(f.ret(1, &[write, DATA, 1]), 1);
+        }
+        let mut expected = vec![(1, 1, 2); 8];
+        assert_eq!(reap_flags(&mut f, &r), expected);
+        // The ninth, kept for room, is its last.
+        assert_eq!(f.ret(426, &[r.fd, 0, 1, GETEVENTS]), 0);
+        expected = vec![(1, 1, 0)];
+        assert_eq!(reap_flags(&mut f, &r), expected);
+        assert_eq!(batch(&mut f, &r, &[poll_remove(2, 1, 0, 0, 0)]), [(2, -2)]);
     }
 
     /// A request that finds its file taken and waits again still holds its

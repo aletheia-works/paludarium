@@ -502,11 +502,11 @@ impl Locks {
     /// `flock_lock_inode` changes a description's lock: an unlock, or a
     /// change of kind, drops the old lock first, even when the new one then
     /// conflicts (`EAGAIN`); asking again for the kind it has keeps the lock
-    /// as it was, with the process that set it. `key` is its file and `cpu`
-    /// the CPU the process runs on.
+    /// as it was, with the process that set it. `key` is its file, without
+    /// which a new lock is not listed, and `cpu` the CPU the process runs on.
     pub(crate) fn flocked(
         &self,
-        (file, key): (&Arc<dyn FileHandle>, Key),
+        (file, key): (&Arc<dyn FileHandle>, Option<Key>),
         (pid, cpu): (u32, u32),
         op: u32,
         result: Result<(), Errno>,
@@ -535,7 +535,7 @@ impl Locks {
         if let Some(i) = had {
             flocks.remove(i);
         }
-        if let (Some(kind), Ok(())) = (kind, result) {
+        if let (Some(kind), Some(key), Ok(())) = (kind, key, result) {
             flocks.push(Flock {
                 file: this,
                 key,
@@ -1093,5 +1093,25 @@ mod tests {
         assert!(!deadlock(&locks, 1, 1));
         locks.release_table(2);
         assert!(locks.table().waiting.is_empty());
+    }
+
+    #[test]
+    fn a_flock_lock_of_an_unknown_file_is_not_listed_and_its_unlock_is() {
+        const LOCK_SH: u32 = 1;
+        const LOCK_EX: u32 = 2;
+        const LOCK_UN: u32 = 8;
+        let locks = Locks::default();
+        let file = paludarium_vfs::MemFs::new().open(b"/f", 66, 0o600).unwrap();
+        let flock = |key, op| {
+            locks.flocked((&file, key), (1, 0), op, Ok(()));
+            locks.flock_of(&file)
+        };
+        assert_eq!(flock(None, LOCK_SH), None);
+        assert_eq!(flock(Some(KEY), LOCK_SH), Some((Kind::Read, 1)));
+        // The kind it has stays, and a change of kind drops the old lock.
+        assert_eq!(flock(None, LOCK_SH), Some((Kind::Read, 1)));
+        assert_eq!(flock(None, LOCK_EX), None);
+        assert_eq!(flock(Some(KEY), LOCK_EX), Some((Kind::Write, 1)));
+        assert_eq!(flock(None, LOCK_UN), None);
     }
 }

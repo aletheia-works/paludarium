@@ -5519,14 +5519,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let key = crate::record_locks::key(c, &d).ok();
             loop {
                 let result = d.file.flock(a[1] as u32);
-                if let Some(key) = key {
-                    c.processes.locks().flocked(
-                        (&d.file, key),
-                        (c.process.pid, crate::syscalls::cpu(c)),
-                        a[1] as u32,
-                        result,
-                    );
-                }
+                c.processes.locks().flocked(
+                    (&d.file, key),
+                    (c.process.pid, crate::syscalls::cpu(c)),
+                    a[1] as u32,
+                    result,
+                );
                 match result {
                     Ok(()) => return Ok(0),
                     Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => pause_for_lock(c)?,

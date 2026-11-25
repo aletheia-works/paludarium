@@ -4279,10 +4279,13 @@ kernel.
   reaped, then its numbers in each namespace below down to its own. The other kinds add Linux's lines
   too. After the first four come `lock:` lines (`show_fd_locks`): the
   description's `flock` lock, then each record lock set through it that the
-  process's table or the description owns, by where they start, numbered from 1
-  across both. Each has `FLOCK`, `POSIX` or `OFDLCK`, `READ` or `WRITE`, the
-  ID of the process that set it (-1 for a description's record lock), the device and inode, and the range
-  (`0 EOF` for a `flock` lock). Asking again for the kind of `flock` lock a
+  process's table or the description owns, in the file's order (each owner's
+  together by where they start, the owners as they first locked the file), then
+  its lease, numbered from 1 across all. Each has `FLOCK`, `POSIX`, `OFDLCK` or
+  `LEASE`, `READ` or `WRITE` (for a lease being broken, `BREAKING` and the type
+  it is to have, which can be `UNLCK`), the ID of the process that set it (-1 for a
+  description's record lock), the device and inode, and the range (`0 EOF` for
+  a `flock` lock or a lease). Asking again for the kind of `flock` lock a
   description has keeps it as it was, and a change of kind drops the old
   one first, even when the new one conflicts, as `flock_lock_inode` does.
   A lock merged into another

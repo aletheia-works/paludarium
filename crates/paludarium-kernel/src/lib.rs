@@ -277,11 +277,20 @@ impl core::fmt::Debug for CpuClock {
             .finish_non_exhaustive()
     }
 }
-/// The wall time, where the host cannot measure CPU time.
-struct WallClock(Arc<dyn Host>);
+/// The wall time, where the host cannot measure CPU time, of a thread that
+/// is not asleep in a wait: what it slept counts at its own next account,
+/// and other threads see none of it meanwhile, as a sleeping thread uses no
+/// CPU.
+struct WallClock {
+    host: Arc<dyn Host>,
+    asleep: Arc<std::sync::atomic::AtomicBool>,
+}
 impl paludarium_host::ThreadCpuClock for WallClock {
     fn read(&self) -> Option<u64> {
-        self.0.clock(paludarium_host::ClockId::Monotonic).ok()
+        if self.asleep.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        self.host.clock(paludarium_host::ClockId::Monotonic).ok()
     }
 }
 /// What the host shows of the calling thread's CPU time: the wall time
@@ -602,7 +611,10 @@ impl Kernel {
         let clock = match self.host.thread_cpu_clock() {
             // The host measures it only for the calling thread.
             None if self.host.thread_cpu_time().is_ok() => None,
-            None => Some(Arc::new(WallClock(Arc::clone(&self.host))) as _),
+            None => Some(Arc::new(WallClock {
+                host: Arc::clone(&self.host),
+                asleep: Arc::clone(self.inbox.blocked_flag()),
+            }) as _),
             clock => clock,
         };
         *used

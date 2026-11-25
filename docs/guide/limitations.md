@@ -652,7 +652,7 @@ verified.
     (Linux's `ITIMER_VIRTUAL` leaves out the system time; its `RLIMIT_CPU`
     counts it). Where the host
     cannot measure a thread's CPU time, as in WebAssembly, that is wall time,
-    so they also count the time a thread sleeps or waits. They are looked
+    so they also count the time a thread sleeps or waits, from its wake on. They are looked
     at as a thread makes a system call and every 100,000 instructions it
     runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. POSIX timers on the CPU-time clocks count

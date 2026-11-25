@@ -186,6 +186,14 @@ fn a_thread_s_clock_starts_with_it_and_ends_with_it() {
             host.set_clock(Monotonic, 8 * MS);
             std::thread::scope(|s| assert!(s.spawn(|| used.sample()).join().unwrap()));
             assert_eq!(used.cpu_time(), 3 * MS);
+            // Asleep in a wait, its time stands still for the others.
+            kernel.inbox.blocked_flag().store(true, SeqCst);
+            host.set_clock(Monotonic, 20 * MS);
+            std::thread::scope(|s| assert!(!s.spawn(|| used.sample()).join().unwrap()));
+            assert_eq!(used.cpu_time(), 3 * MS);
+            kernel.inbox.blocked_flag().store(false, SeqCst);
+            std::thread::scope(|s| assert!(s.spawn(|| used.sample()).join().unwrap()));
+            assert_eq!(used.cpu_time(), 15 * MS);
         }
         drop(clock);
         assert!(used.clock.lock().unwrap().is_none());

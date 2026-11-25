@@ -6074,6 +6074,70 @@ mod io_uring {
         assert_eq!(f.ret(0, &[read, buf, 8]), 2);
     }
 
+    /// A thread whose call queues an exited thread's work does not wait for
+    /// a ring another thread holds, which may wait for a page it is to fill:
+    /// Linux's worker runs the work (`io_fallback_req_func`).
+    #[test]
+    fn an_exited_threads_work_waits_for_its_ring_alone() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        assert_eq!(
+            child_submits_and_exits(&mut f, &r, &rw(READ, read, HERE, buf, 8), false),
+            []
+        );
+        let file = f.kernel.files.descriptor(r.fd).unwrap().file;
+        let held = crate::io_uring::hold(&file);
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(reap(&mut f, &r), []);
+        drop(held);
+        // The next checkpoint, as the holder's own call has one.
+        f.ret(39, &[]);
+        assert_eq!(reap(&mut f, &r), [(1, -125)]);
+    }
+
+    /// A ring that closes with such work left lets go of the file the
+    /// request holds before the call that let go of the ring returns, as
+    /// Linux's `io_ring_ctx_wait_and_kill` does (`flush_delayed_work`).
+    #[test]
+    fn a_ring_that_closes_drops_the_work_left_for_its_holder() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (ends, buf) = (DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        fds(&f, DATA + 0x400, &[read as i32]);
+        assert_eq!(f.ret(427, &[r.fd, 2, DATA + 0x400, 1]), 0);
+        assert_eq!(
+            child_submits_and_exits(&mut f, &r, &on_slot(READ, 0, HERE, buf, 8), false),
+            []
+        );
+        // SIGPIPE is ignored, so a write without a reader gives EPIPE.
+        f.mem.write(GuestAddr(DATA + 0x100), &[0; 32]).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(13, &[13, DATA + 0x100, 0, 8]), 0);
+        let file = f.kernel.files.descriptor(r.fd).unwrap().file;
+        let held = crate::io_uring::hold(&file);
+        f.mem.write(GuestAddr(DATA), b"ab").unwrap();
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        assert_eq!(f.ret(3, &[read]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        assert_eq!(f.ret(11, &[r.rings, r.array + 16]), 0);
+        assert_eq!(f.ret(11, &[r.sqes, 4096]), 0);
+        assert_eq!(f.ret(3, &[r.fd]), 0);
+        // The request still holds the pipe's only reader.
+        assert_eq!(f.ret(1, &[write, DATA, 2]), 2);
+        drop(held);
+        drop(file);
+        f.ret(39, &[]);
+        assert_eq!(f.ret(1, &[write, DATA, 2]), errno(Errno::EPIPE));
+    }
+
     #[test]
     fn a_ring_that_closes_lets_go_of_the_reads_that_wait() {
         let mut f = fixture();

@@ -363,7 +363,8 @@ pub(crate) struct Polls {
     /// ring's lock is held (`io_fallback_tw` queuing it for a worker): at
     /// the next [`complete_ready`], which every call's checkpoint, every
     /// wait and every thread's exit runs, so before the call that queued it
-    /// returns.
+    /// returns. Work of a ring another thread holds stays for that thread to
+    /// run once it lets go ([`run_fallback`]).
     fallback: Mutex<Vec<(std::sync::Weak<dyn FileHandle>, Deferred)>>,
     /// Every ring, which a thread's `execve` or exit looks through for its
     /// requests (`tctx->xa`).
@@ -821,6 +822,20 @@ impl Ring {
 
     fn store_u32(&self, at: u64, value: u32) {
         self.rings.store(at, &value.to_le_bytes());
+    }
+    /// Its lock, held across a submission or a run of its task work.
+    fn submitting(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.submitting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// [`Self::submitting`], if no one holds it.
+    fn try_submitting(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.submitting.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1799,15 +1814,50 @@ fn ready(file: &Arc<dyn FileHandle>, mask: u32) -> bool {
 /// ([`crate::SignalInbox::notify_signal`]).
 pub(crate) fn complete_ready(polls: &Polls) {
     wake(polls);
-    let fallback = std::mem::take(
-        &mut *polls
+    run_fallback(polls);
+}
+
+/// Runs [`Polls::fallback`], but leaves the work of a ring whose lock is
+/// held, as Linux's worker waits for it (`io_fallback_req_func`, master's
+/// `io_tctx_fallback_work`) and no other task does: its holder may wait for a
+/// page that this thread is to fill. The holder runs it after it lets go:
+/// each holder then comes here, or to [`complete_ready`] at the end of its
+/// call or as it waits. The work of a ring that closed is dropped, and with
+/// it the files its requests hold: no one sees its completions.
+fn run_fallback(polls: &Polls) {
+    let queue = || {
+        polls
             .fallback
             .lock()
-            .unwrap_or_else(PoisonError::into_inner),
-    );
-    for (file, work) in fallback {
-        if let Some(file) = file.upgrade() {
-            run_terminated(&file, work);
+            .unwrap_or_else(PoisonError::into_inner)
+    };
+    loop {
+        let work = std::mem::take(&mut *queue());
+        let (mut busy, mut ran) = (Vec::new(), false);
+        for (weak, work) in work {
+            let Some(file) = weak.upgrade() else {
+                continue;
+            };
+            let Ok(ring) = downcast(&file) else {
+                continue;
+            };
+            match ring.try_submitting() {
+                Some(_submitting) => {
+                    run_terminated(ring, work);
+                    ran = true;
+                }
+                None => busy.push((weak, work)),
+            }
+        }
+        let held: Vec<_> = busy.iter().filter_map(|(weak, _)| weak.upgrade()).collect();
+        // Before what came meanwhile.
+        queue().splice(0..0, busy);
+        // A holder that let go before the work was back may not have seen it.
+        let free = held
+            .iter()
+            .any(|file| downcast(file).is_ok_and(|ring| ring.try_submitting().is_some()));
+        if !ran && !free {
+            return;
         }
     }
 }
@@ -1973,8 +2023,11 @@ pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
     };
     inbox.clear_notify_if_idle();
     for (file, work) in work {
-        if let Some(file) = file.upgrade() {
-            run_terminated(&file, work);
+        if let Some(file) = file.upgrade()
+            && let Ok(ring) = downcast(&file)
+        {
+            let _submitting = ring.submitting();
+            run_terminated(ring, work);
         }
     }
 }
@@ -1984,15 +2037,9 @@ pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
 /// exited (`io_should_terminate_tw`): a request that waited for its file
 /// fails with `ECANCELED` (`io_poll_check_events`), a link's next request
 /// or one that found its file ready with `EFAULT` (`io_req_task_submit`),
-/// and the rest completes as it would. What it leaves runs so too.
-fn run_terminated(file: &Arc<dyn FileHandle>, work: Deferred) {
-    let Ok(ring) = downcast(file) else {
-        return;
-    };
-    let _submitting = ring
-        .submitting
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+/// and the rest completes as it would. What it leaves runs so too. The
+/// ring's lock is held.
+fn run_terminated(ring: &Ring, work: Deferred) {
     let mut pending = vec![work];
     while !pending.is_empty() {
         ring.begin();
@@ -2438,22 +2485,17 @@ pub(crate) fn run_task_work(c: &mut Context<'_>) {
             current = Some(Arc::clone(&file));
         }
         if let Ok(ring) = downcast(&file) {
-            let _submitting = ring
-                .submitting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let _submitting = ring.submitting();
             run_deferred(c, &file, ring, work);
         }
     }
+    run_fallback(&c.processes.io_uring);
 }
 
 fn end_task_work(c: &mut Context<'_>, file: &Arc<dyn FileHandle>) {
     if let Ok(ring) = downcast(file) {
         ring.mark_taskrun(false);
-        let _submitting = ring
-            .submitting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _submitting = ring.submitting();
         flush_batch(c, file, ring);
     }
 }
@@ -2488,10 +2530,7 @@ fn run_local(
         ring.mark_taskrun(true);
         false
     };
-    let _submitting = ring
-        .submitting
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let _submitting = ring.submitting();
     ring.mark_taskrun(false);
     let mut min = i64::from(min_events);
     let mut ran = 0;
@@ -2598,6 +2637,11 @@ fn ring_of(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
         return Err(EOPNOTSUPP);
     }
     Ok(d.file)
+}
+
+#[cfg(test)]
+pub(crate) fn hold(file: &Arc<dyn FileHandle>) -> std::sync::MutexGuard<'_, ()> {
+    downcast(file).unwrap().submitting()
 }
 
 fn downcast(file: &Arc<dyn FileHandle>) -> Result<&Ring, Errno> {
@@ -2803,10 +2847,7 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             return Err(EEXIST);
         }
         {
-            let _submitting = ring
-                .submitting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let _submitting = ring.submitting();
             ring.flush(&mut ring.state());
             submitted = submit(c, &file, ring, to_submit);
         }

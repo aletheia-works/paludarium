@@ -18,6 +18,11 @@ use std::sync::Arc;
 /// socket that more data comes.
 const SPLICE_F_ALL: u32 = 0xf;
 const SPLICE_F_NONBLOCK: u32 = 2;
+/// With this, not in any program's flags, a splice or tee does not wait for
+/// what holds a pipe ([`PipeEnd::hold`]): it ends with [`HELD`].
+pub(crate) const TRY_HOLD: u32 = 1 << 30;
+/// Another call holds the pipe, which no program sees.
+pub(crate) const HELD: Errno = Errno(512);
 const EPIPE: Errno = Errno(32);
 const CHARACTER: u32 = 0o020000;
 const BLOCK: u32 = 0o060000;
@@ -114,15 +119,36 @@ fn spliced_buffers(start: Option<u64>, len: usize) -> Vec<PipeBuf> {
     }
     bufs
 }
+/// Whether a call waits for a pipe's data or room, and for what holds one.
+#[derive(Clone, Copy)]
+struct How {
+    nonblock: bool,
+    try_hold: bool,
+}
+impl How {
+    fn new(flags: u32, nonblock: bool) -> Self {
+        Self {
+            nonblock: nonblock || flags & SPLICE_F_NONBLOCK != 0,
+            try_hold: flags & TRY_HOLD != 0,
+        }
+    }
+    fn hold(self, pipe: &PipeEnd) -> Result<crate::sockets::Held<'_>, Errno> {
+        if self.try_hold {
+            pipe.try_hold().ok_or(HELD)
+        } else {
+            Ok(pipe.hold())
+        }
+    }
+}
 /// [`wait_for_space`], the pipe then held so that the room stays.
 fn space<'a>(
     c: &mut Context<'_>,
     output: &'a PipeEnd,
-    nonblock: bool,
+    how: How,
 ) -> Result<crate::sockets::Held<'a>, Errno> {
     loop {
-        wait_for_space(c, output, nonblock)?;
-        let held = output.hold();
+        wait_for_space(c, output, how.nonblock)?;
+        let held = how.hold(output)?;
         if output.room() > 0 {
             return Ok(held);
         }
@@ -201,7 +227,7 @@ pub(super) fn splice(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// Linux's `do_splice`: the input must be readable and the output writable
 /// (EBADF), and one of them a pipe (EINVAL); two pipes must differ. Returns
 /// the bytes moved and the new value of the offset passed, if any.
-fn do_splice(
+pub(crate) fn do_splice(
     c: &mut Context<'_>,
     input: &Arc<dyn FileHandle>,
     off_in: Option<u64>,
@@ -213,14 +239,13 @@ fn do_splice(
     if !readable(input) || !writable(output) {
         return Err(Errno::EBADF);
     }
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     match (pipe(input), pipe(output)) {
         (Some(from), Some(to)) => {
             if from.same_pipe(to) {
                 return Err(Errno::EINVAL);
             }
-            let nonblock = nonblock || nonblocking(input) || nonblocking(output);
-            Ok((pipe_to_pipe(c, input, from, to, len, nonblock)?, None))
+            let how = How::new(flags, nonblocking(input) || nonblocking(output));
+            Ok((pipe_to_pipe(c, input, from, to, len, how)?, None))
         }
         (Some(from), None) => {
             let start = match off_out {
@@ -235,17 +260,8 @@ fn do_splice(
             if !spliceable(output)? {
                 return Err(Errno::EINVAL);
             }
-            let nonblock = nonblock || nonblocking(input);
-            let sent = from_pipe(
-                c,
-                input,
-                from,
-                output,
-                start,
-                off_out.is_some(),
-                len,
-                nonblock,
-            )?;
+            let how = How::new(flags, nonblocking(input));
+            let sent = from_pipe(c, input, from, output, start, off_out.is_some(), len, how)?;
             let end = start + sent;
             if off_out.is_none() && positioned(output) {
                 output.seek(end as i64, 0)?;
@@ -260,8 +276,8 @@ fn do_splice(
             };
             verify_area(start, len)?;
             super::access_permission(c, input)?;
-            let nonblock = nonblock || nonblocking(output);
-            let read = to_pipe(c, input, start, off_in.is_some(), to, len, nonblock)?;
+            let how = How::new(flags, nonblocking(output));
+            let read = to_pipe(c, input, start, off_in.is_some(), to, len, how)?;
             let end = start + read;
             if off_in.is_none() && input.stat()?.mode & 0o170000 == REGULAR {
                 input.seek(end as i64, 0)?;
@@ -285,15 +301,19 @@ fn from_pipe(
     start: u64,
     at_offset: bool,
     len: u64,
-    nonblock: bool,
+    how: How,
 ) -> Result<u64, Errno> {
     let kind = output.stat()?.mode & 0o170000;
     let mut done = 0;
     while done < len {
-        if !wait_for_data(c, from, nonblock, done)? {
+        if !wait_for_data(c, from, how.nonblock, done)? {
             break;
         }
-        let _held = from.hold();
+        let _held = match how.hold(from) {
+            Ok(held) => held,
+            Err(_) if done > 0 => break,
+            Err(error) => return Err(error),
+        };
         let unread = from.unread_bytes();
         if unread == 0 {
             // Another reader took it.
@@ -349,9 +369,9 @@ fn to_pipe(
     at_offset: bool,
     to: &PipeEnd,
     len: u64,
-    nonblock: bool,
+    how: How,
 ) -> Result<u64, Errno> {
-    let _held = space(c, to, nonblock)?;
+    let _held = space(c, to, how)?;
     let len = len.min(to.room() as u64);
     verify_area(start, len)?;
     let len = len.min(MAX_RW_COUNT as u64);
@@ -373,7 +393,7 @@ fn to_pipe(
         } else {
             let stream = crate::sockets::endpoint(input)
                 .is_some_and(crate::sockets::SocketPairEnd::raises_sigpipe);
-            read_waiting(c, input, &mut piece, nonblock && stream)?
+            read_waiting(c, input, &mut piece, how.nonblock && stream)?
         };
         piece.truncate(read);
         piece
@@ -393,10 +413,10 @@ fn pipe_to_pipe(
     from: &PipeEnd,
     to: &PipeEnd,
     len: u64,
-    nonblock: bool,
+    how: How,
 ) -> Result<u64, Errno> {
     loop {
-        let count = link(c, from, to, len, nonblock, Some(input))?;
+        let count = link(c, from, to, len, how, Some(input))?;
         if let Some(count) = count {
             return Ok(count as u64);
         }
@@ -415,17 +435,87 @@ pub(super) fn tee(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let input = file(c, a[0])?;
     let output = file(c, a[1])?;
-    if !readable(&input) || !writable(&output) {
-        return Err(Errno::EBADF);
-    }
-    let (Some(from), Some(to)) = (pipe(&input), pipe(&output)) else {
+    do_tee(c, &input, &output, len, flags)
+}
+/// Linux's `do_tee`.
+pub(crate) fn do_tee(
+    c: &mut Context<'_>,
+    input: &Arc<dyn FileHandle>,
+    output: &Arc<dyn FileHandle>,
+    len: u64,
+    flags: u32,
+) -> Result<u64, Errno> {
+    check(input, None, output, None, true)?;
+    let (Some(from), Some(to)) = (pipe(input), pipe(output)) else {
         return Err(Errno::EINVAL);
     };
-    if from.same_pipe(to) {
-        return Err(Errno::EINVAL);
+    let how = How::new(flags, nonblocking(input) || nonblocking(output));
+    Ok(link(c, from, to, len, how, None)?.unwrap_or(0) as u64)
+}
+/// The pipes of a splice or tee, for a request that waits until nothing
+/// holds them: readable once nothing does.
+pub(crate) struct Unheld(pub Arc<dyn FileHandle>, pub Arc<dyn FileHandle>);
+impl FileHandle for Unheld {
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        let free = [&self.0, &self.1]
+            .into_iter()
+            .all(|file| pipe(file).is_none_or(|pipe| pipe.try_hold().is_some()));
+        Ok((if free { crate::events::IN } else { 0 }, 0, 0))
     }
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0 || nonblocking(&input) || nonblocking(&output);
-    Ok(link(c, from, to, len, nonblock, None)?.unwrap_or(0) as u64)
+    fn read(&self, _buf: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn write(&self, _buf: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn seek(&self, _offset: i64, _whence: u32) -> Result<u64, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn stat(&self) -> Result<paludarium_host::FileStat, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn truncate(&self, _size: u64) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+    fn flock(&self, _op: u32) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+    fn flags(&self) -> u32 {
+        0
+    }
+    fn set_flags(&self, _flags: u32) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+}
+/// The first checks of `do_splice` and `do_tee` (`tee`), which look at no
+/// data: the input is readable and the output writable (EBADF), no pipe has
+/// an offset (ESPIPE), and one of them is a pipe, or with `tee` both are, and
+/// not the same one (EINVAL).
+pub(crate) fn check(
+    input: &Arc<dyn FileHandle>,
+    off_in: Option<u64>,
+    output: &Arc<dyn FileHandle>,
+    off_out: Option<u64>,
+    tee: bool,
+) -> Result<(), Errno> {
+    if !readable(input) || !writable(output) {
+        return Err(Errno::EBADF);
+    }
+    let pipes = (pipe(input), pipe(output));
+    if pipes.0.is_some() && off_in.is_some() || pipes.1.is_some() && off_out.is_some() {
+        return Err(Errno::ESPIPE);
+    }
+    match pipes {
+        (Some(from), Some(to)) if !from.same_pipe(to) => Ok(()),
+        (Some(_), None) | (None, Some(_)) if !tee => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+/// Whether a splice or tee of these waits for data or room: not with
+/// SPLICE_F_NONBLOCK, or a pipe open with `O_NONBLOCK`.
+pub(crate) fn waits(input: &Arc<dyn FileHandle>, output: &Arc<dyn FileHandle>, flags: u32) -> bool {
+    let nonblock = |file| pipe(file).is_some() && nonblocking(file);
+    flags & SPLICE_F_NONBLOCK == 0 && !nonblock(input) && !nonblock(output)
 }
 /// What `ipipe_prep`, `opipe_prep` and then `link_pipe` or the loop of
 /// `splice_pipe_to_pipe` do: wait for data in `from` (none, with no writer,
@@ -439,7 +529,7 @@ fn link(
     from: &PipeEnd,
     to: &PipeEnd,
     len: u64,
-    nonblock: bool,
+    how: How,
     input: Option<&Arc<dyn FileHandle>>,
 ) -> Result<Option<usize>, Errno> {
     let retry = input.is_some();
@@ -448,7 +538,7 @@ fn link(
         if from.unread_bytes() > 0 || !from.has_writers() {
             break;
         }
-        if nonblock {
+        if how.nonblock {
             return Err(Errno::EAGAIN);
         }
         wait(c, ticket)?;
@@ -461,7 +551,7 @@ fn link(
         if !to.has_readers() {
             return Err(broken_pipe(c));
         }
-        if nonblock {
+        if how.nonblock {
             return Err(Errno::EAGAIN);
         }
         wait(c, ticket)?;
@@ -469,7 +559,11 @@ fn link(
     if !to.has_readers() {
         return Err(broken_pipe(c));
     }
-    let _held = from.hold_both(to);
+    let _held = if how.try_hold {
+        [from.try_hold().ok_or(HELD)?, to.try_hold().ok_or(HELD)?]
+    } else {
+        from.hold_both(to)
+    };
     let unread = from.unread_bytes();
     if unread == 0 && !from.has_writers() {
         return Ok(Some(0));
@@ -527,7 +621,7 @@ fn to_pipe_from_guest(
     segments: &[(u64, usize)],
     nonblock: bool,
 ) -> Result<u64, Errno> {
-    let _held = space(c, to, nonblock)?;
+    let _held = space(c, to, How::new(0, nonblock))?;
     let mut room = to.room();
     let mut bytes = Vec::new();
     // A buffer for each page of the guest's the bytes lie in

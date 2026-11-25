@@ -1649,7 +1649,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、ファイルの要求
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
-  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、それにソケットの要求
+  `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE` と
+  `_TEE`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
@@ -1801,6 +1802,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リングは close できません（`EBADF`）。Linux と同じく、失敗した呼び出しがリンクを失敗させるのは、
   open、close、`IORING_OP_FADVISE` と、記述子が開いていない場合だけです。`IORING_OP_FSYNC` も
   失敗させません。
+
+- `IORING_OP_SPLICE` と `_TEE` は `splice` と `tee` と同じくバイトを移すか写します。オフセットは
+  エントリーにあり（-1 ならファイルの位置）、`SPLICE_F_FD_IN_FIXED` では入力が登録したファイルです。
+  待つはずの要求はファイルを待ちます。ただし `SPLICE_F_NONBLOCK` やパイプの `O_NONBLOCK` では
+  `EAGAIN` です。頼んだより少ないバイトを移した要求は、リンクを失敗させます。
 
 - ポーリングは Linux master のもの（`io_uring/poll.c`）です。`IORING_OP_POLL_ADD` は、求めた
   イベントと、どのポーリングも終わらせるイベント（`POLLERR`、`POLLHUP`、`POLLNVAL`、読み手には

@@ -5355,7 +5355,7 @@ mod io_uring {
             supported,
             [
                 0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 31, 32, 34, 35, 36, 37, 38, 39, 45, 55
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 45, 55
             ]
         );
         // A probe that is not zeroed, buffers without an argument, another
@@ -7449,6 +7449,116 @@ mod io_uring {
         submit_only(&mut f, &r, &[receive]);
         assert_eq!(f.ret(3, &[a]), 0);
         assert_eq!(reap_flags(&mut f, &r), [(1, 0, 0)]);
+    }
+
+    /// A splice (30) or tee (33) of `len` bytes from `input` to `out`.
+    fn splice(opcode: u8, data: u64, input: u64, out: u64, len: u32, flags: u32) -> [u8; 64] {
+        let off = if opcode == 30 { u64::MAX } else { 0 };
+        let mut e = fs(opcode, out as i32, off, off, len, flags);
+        e[32..40].copy_from_slice(&data.to_le_bytes());
+        e[44..48].copy_from_slice(&(input as u32).to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn splices_move_bytes_and_wait_for_them() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (from, into) = a_pipe(&mut f, DATA + 0x300);
+        let (read, write) = a_pipe(&mut f, DATA + 0x308);
+        for (fd, flags) in [(from, 0), (into, 0), (read, 0), (write, 0)]
+            .iter()
+            .copied()
+        {
+            assert_eq!(f.ret(72, &[fd, 4, flags]), 0);
+        }
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let file = f.ret(2, &[DATA, 0o102, 0o600]);
+        f.mem.write(GuestAddr(DATA + 0x200), b"hello").unwrap();
+        assert_eq!(f.ret(1, &[into, DATA + 0x200, 5]), 5);
+        // Copied, then moved: fewer bytes than asked for fail the link.
+        let mut tee = splice(33, 1, from, write, 8, 0);
+        tee[1] = 1 << 2;
+        let after = nop(9, 0, 0, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[tee, after]), [(1, 5), (9, -125)]);
+        assert_eq!(f.ret(0, &[read, DATA + 0x800, 8]), 5);
+        let mut to_file = splice(30, 1, from, file, 5, 0);
+        to_file[8..16].copy_from_slice(&3u64.to_le_bytes());
+        to_file[1] = 1 << 2;
+        assert_eq!(batch(&mut f, &r, &[to_file, after]), [(1, 5), (9, 0)]);
+        assert_eq!(f.ret(17, &[file, DATA + 0x800, 8, 0]), 8);
+        assert_eq!(bytes(&f, DATA + 0x800, 8), b"\0\0\0hello");
+        // Waiting for data, or not.
+        assert_eq!(batch(&mut f, &r, &[splice(30, 2, from, write, 5, 0)]), []);
+        assert_eq!(f.ret(1, &[into, DATA + 0x200, 5]), 5);
+        assert_eq!(reap(&mut f, &r), [(2, 5)]);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, from, write, 5, 2)), -11);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, from, write, 0, 0)), 0);
+        // What is refused.
+        assert_eq!(one(&mut f, &r, &splice(30, 1, from, write, 5, 16)), -22);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, 99, write, 5, 0)), -9);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, into, write, 5, 0)), -9);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, file, file, 5, 0)), -22);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, from, into, 5, 0)), -22);
+        let mut offset = splice(30, 1, from, write, 5, 0);
+        offset[16..24].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &offset), -29);
+        let mut offset = splice(33, 1, from, write, 5, 0);
+        offset[8] = 1;
+        assert_eq!(one(&mut f, &r, &offset), -22);
+        // A registered input.
+        fds(&f, DATA + 0x400, &[from as i32]);
+        assert_eq!(f.ret(427, &[r.fd, 2, DATA + 0x400, 1]), 0);
+        assert_eq!(f.ret(1, &[into, DATA + 0x200, 5]), 5);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, 0, write, 5, 1 << 31)), 5);
+        assert_eq!(one(&mut f, &r, &splice(30, 1, 1, write, 5, 1 << 31)), -9);
+    }
+
+    /// What Linux's worker waits for with a pipe's mutex taken, the request
+    /// waits for, not the thread that submits it.
+    #[test]
+    fn a_splice_waits_for_what_holds_its_pipe() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (from, into) = a_pipe(&mut f, DATA + 0x300);
+        let (read, write) = a_pipe(&mut f, DATA + 0x308);
+        for (data, opcode, fd) in [(1, 33, from), (2, 33, write), (3, 30, from), (4, 30, write)] {
+            assert_eq!(f.ret(1, &[into, DATA + 0x200, 5]), 5);
+            let file = f.kernel.files.descriptor(fd).unwrap().file;
+            let held = crate::sockets::pipe(&file).unwrap().hold();
+            let e = splice(opcode, data, from, write, 5, 0);
+            assert_eq!(batch(&mut f, &r, &[e]), []);
+            // It is found by its output, as `req->file` is.
+            if data == 4 {
+                let other = cancel(8, 0, 2 | 1, from as i32);
+                assert_eq!(batch(&mut f, &r, &[other]), [(8, 0)]);
+            }
+            drop(held);
+            assert_eq!(f.ret(39, &[]), 1);
+            assert_eq!(reap(&mut f, &r), [(data, 5)]);
+            assert_eq!(f.ret(0, &[read, DATA + 0x800, 8]), 5);
+            if opcode == 33 {
+                assert_eq!(f.ret(0, &[from, DATA + 0x800, 8]), 5);
+            }
+        }
+        // A file's splice into one, and one cancelled meanwhile.
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let file = f.ret(2, &[DATA, 0o102, 0o600]);
+        assert_eq!(f.ret(1, &[file, DATA + 0x200, 5]), 5);
+        let pipe = f.kernel.files.descriptor(write).unwrap().file;
+        let held = crate::sockets::pipe(&pipe).unwrap().hold();
+        let mut e = splice(30, 5, file, write, 5, 0);
+        e[16..24].copy_from_slice(&0u64.to_le_bytes());
+        let mut gone = e;
+        gone[32] = 6;
+        assert_eq!(batch(&mut f, &r, &[e, gone]), []);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(7, 6, 0, 0)]),
+            [(7, 0), (6, -125)]
+        );
+        drop(held);
+        assert_eq!(f.ret(39, &[]), 1);
+        assert_eq!(reap(&mut f, &r), [(5, 5)]);
     }
 
     /// A `struct user_msghdr` at `at`, with the iovecs `iov`, put after it,

@@ -1,7 +1,7 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
 pub(crate) mod attributes;
-mod splice;
+pub(crate) mod splice;
 mod tasks;
 mod xattrs;
 use paludarium_host::{ClockId, FileHandle, FileStat};

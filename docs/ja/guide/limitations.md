@@ -504,7 +504,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
-  `_LINKAT`、`_FTRUNCATE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
+  `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
   だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
   `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
@@ -517,7 +517,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （Linux では失敗します）。`IORING_OP_SHUTDOWN`、`IORING_OP_FSYNC` と
   ファイルの要求は、Linux では close と一部の open や advice を除いてワーカーで実行するところを
   `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れるものより先に来ることが
-  あります。FIFO を作るかもしれない open はそこで待ちます。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
+  あります。FIFO を作るかもしれない open はそこで待ちます。待っている `IORING_OP_SPLICE` の
+  取り消しは、ファイルを待つ要求と同じです（Linux はワーカーに割り込みます）。ソケットへの
+  splice は、途中からそこで待つことがあります。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
   来ます。すべてのスレッドが `nanosleep` で眠るあいだに期限が来たものは、眠りが終わるときに
   完了します（Linux のタイマーはその時点で完了させます）。単独で終了するスレッドは、リングを待つポーリングを
   残します（Linux は取り消します）。自分の要求にポーリングされるリングは、その要求が終わるまで

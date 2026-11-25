@@ -11,7 +11,8 @@
 //! `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE` ([`fs`]), and the socket
 //! requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
 //! `_SEND`, `_RECV`, `_SENDMSG` and `_RECVMSG`, with multishot accepts and
-//! receives ([`net`]). The others answer
+//! receives ([`net`]), and `IORING_OP_SPLICE` and `_TEE` ([`splice`]). The
+//! others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
@@ -53,6 +54,7 @@ use crate::syscalls::{Context, Outcome, err, ok};
 mod fs;
 mod net;
 mod poll;
+mod splice;
 mod timeout;
 
 /// The most submission queue entries, and completion queue entries.
@@ -140,7 +142,7 @@ const OP_EPOLL_CTL: u8 = 29;
 const OP_PROVIDE_BUFFERS: u8 = 31;
 const OP_REMOVE_BUFFERS: u8 = 32;
 /// The operations implemented.
-const OPS: [u8; 26] = [
+const OPS: [u8; 28] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
@@ -167,6 +169,8 @@ const OPS: [u8; 26] = [
     timeout::OP_LINK_TIMEOUT,
     poll::OP_POLL_ADD,
     poll::OP_POLL_REMOVE,
+    splice::OP_SPLICE,
+    splice::OP_TEE,
 ];
 /// Whether operation `opcode` runs.
 fn supported(opcode: u8) -> bool {
@@ -874,6 +878,8 @@ enum Work {
     TimeoutRemove(Box<timeout::Remove>),
     /// A file request ([`fs`]).
     Fs(Box<fs::Fs>),
+    /// `IORING_OP_SPLICE` and `_TEE` ([`splice`]).
+    Splice(Box<splice::Splice>),
     /// `IORING_OP_POLL_ADD` ([`poll`]).
     Poll(Box<poll::Poll>),
     /// `IORING_OP_POLL_REMOVE`.
@@ -1348,6 +1354,10 @@ impl Ring {
                 Ok(work) => work,
                 Err(e) => return fail(request, e),
             },
+            splice::OP_SPLICE | splice::OP_TEE => match splice::prepare(opcode, flags, sqe) {
+                Ok(work) => work,
+                Err(e) => return fail(request, e),
+            },
             poll::OP_POLL_ADD | poll::OP_POLL_REMOVE => {
                 match poll::prepare(opcode, flags, fixed, sqe) {
                     Ok(work) => work,
@@ -1806,6 +1816,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
     let result = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
     match work {
         Work::Net(net) => return net::run(c, ring, net),
+        Work::Splice(splice) => return splice::run(c, ring, splice),
         Work::Fs(fs) => {
             let (res, failed) = fs::run(c, ring, fs);
             return (res, 0, failed, None);
@@ -1890,6 +1901,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
             bid,
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
         Work::Fs(_)
+        | Work::Splice(_)
         | Work::Fsync { .. }
         | Work::Transfer(_)
         | Work::Net(_)
@@ -2132,7 +2144,8 @@ fn arm(
     }
     let polls = &c.processes.io_uring;
     let (polled, mask) = (Arc::clone(&waits.file), waits.mask);
-    let id = ring.hash(&chain[0], &polled, c.inbox);
+    // Its own file (`req->file`), by which a cancellation finds it.
+    let id = ring.hash(&chain[0], &waits.found.0.file, c.inbox);
     polls
         .armed
         .lock()

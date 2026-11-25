@@ -578,6 +578,7 @@
     {"name":"io-uring-fs","binary":"process"},
     {"name":"io-uring-message","binary":"process"},
     {"name":"io-uring-multishot","binary":"process"},
+    {"name":"io-uring-splice","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

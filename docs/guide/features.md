@@ -1873,8 +1873,8 @@ kernel.
   `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, the polls `IORING_OP_POLL_ADD` and
   `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
-  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
-  socket requests
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
+  `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
@@ -2065,6 +2065,13 @@ kernel.
   ring cannot be closed (`EBADF`). As on Linux, a call that fails fails its
   link only for an open, a close and an `IORING_OP_FADVISE`, or if its
   descriptor is not open; an `IORING_OP_FSYNC` does not either.
+
+- `IORING_OP_SPLICE` and `_TEE` move and copy bytes as `splice` and `tee`
+  do, with offsets in the entry (-1 for the file's position) and a
+  registered input with `SPLICE_F_FD_IN_FIXED`. One that would wait waits
+  for its file, unless `SPLICE_F_NONBLOCK` or a pipe's `O_NONBLOCK`
+  (`EAGAIN`), and one that moves fewer bytes than it asked for fails its
+  link.
 
 - The polls are Linux master's (`io_uring/poll.c`). `IORING_OP_POLL_ADD`
   completes with the events its file has of those it asks for and the ones

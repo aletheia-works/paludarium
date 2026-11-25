@@ -12645,6 +12645,102 @@ static int io_uring_multishot_case(void) {
     return 0;
 }
 
+/* io_uring's IORING_OP_SPLICE and _TEE, which Linux runs in a worker. */
+static unsigned char *us_push(struct uring *u, unsigned char op, unsigned long data, int in,
+                              long off_in, int out, long off_out, unsigned len, unsigned flags) {
+    unsigned char *sqe = unet_push(u, op, data, out, off_out, off_in, len, flags, 0);
+    memcpy(sqe + 44, &in, 4);
+    return sqe;
+}
+
+static int io_uring_splice_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    int from[2], to[2], pair[2];
+    if (pipe(from) || pipe(to) || socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 81;
+    char path[] = "/tmp/uring-splice-XXXXXX", buf[32];
+    int file = mkstemp(path);
+    unlink(path);
+    unsigned char *sqe;
+
+    /* What is refused. */
+    us_push(&u, 30, 1, from[0], -1, to[1], -1, 5, 16);
+    um_run(&u, 1, 1, "flags");
+    us_push(&u, 33, 1, from[0], 1, to[1], 0, 5, 0);
+    um_run(&u, 1, 1, "tee-offset");
+    us_push(&u, 33, 1, from[0], 0, to[1], 1, 5, 0);
+    um_run(&u, 1, 1, "tee-offset-out");
+    us_push(&u, 30, 1, 99, -1, to[1], -1, 5, 0);
+    um_run(&u, 1, 1, "badf-in");
+    us_push(&u, 30, 1, from[0], -1, 99, -1, 5, 0);
+    um_run(&u, 1, 1, "badf-out");
+    us_push(&u, 30, 1, from[1], -1, to[1], -1, 5, 0);
+    um_run(&u, 1, 1, "write-end");
+    us_push(&u, 30, 1, file, -1, file, -1, 5, 0);
+    um_run(&u, 1, 1, "no-pipe");
+    us_push(&u, 30, 1, from[0], -1, from[1], -1, 5, 0);
+    um_run(&u, 1, 1, "same-pipe");
+    us_push(&u, 30, 1, from[0], 0, to[1], -1, 5, 0);
+    um_run(&u, 1, 1, "pipe-offset");
+    us_push(&u, 30, 1, from[0], -1, to[1], -1, 0, 0);
+    um_run(&u, 1, 1, "nothing");
+    us_push(&u, 30, 1, from[0], -1, to[1], -1, 5, SPLICE_F_NONBLOCK);
+    um_run(&u, 1, 1, "nonblock");
+
+    /* A copy, a move, and fewer bytes than asked for. */
+    write(from[1], "hello", 5);
+    us_push(&u, 33, 1, from[0], 0, to[1], 0, 8, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    um_run(&u, 2, 2, "tee");
+    printf("read %ld\n", (long)read(to[0], buf, sizeof buf));
+    us_push(&u, 30, 1, from[0], -1, file, 3, 5, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    um_run(&u, 2, 2, "to-file");
+    memset(buf, 1, sizeof buf);
+    printf("read %ld %d%d%d %.5s\n", (long)pread(file, buf, sizeof buf, 0), buf[0], buf[1], buf[2],
+           buf + 3);
+    us_push(&u, 30, 1, file, 4, to[1], -1, 32, 0);
+    um_run(&u, 1, 1, "from-file");
+    long got = read(to[0], buf, sizeof buf);
+    printf("read %ld %.*s\n", got, (int)got, buf);
+    printf("position %ld\n", (long)lseek(file, 0, SEEK_CUR));
+    us_push(&u, 30, 1, file, -1, to[1], -1, 4, 0);
+    um_run(&u, 1, 1, "from-position");
+    printf("read %ld position %ld\n", (long)read(to[0], buf, sizeof buf),
+           (long)lseek(file, 0, SEEK_CUR));
+
+    /* Waiting. */
+    us_push(&u, 30, 1, from[0], -1, to[1], -1, 5, 0);
+    um_run(&u, 1, 0, "waits");
+    write(from[1], "again", 5);
+    um_run(&u, 0, 1, "waited");
+    got = read(to[0], buf, sizeof buf);
+    printf("read %ld %.*s\n", got, (int)got, buf);
+    us_push(&u, 30, 1, pair[0], -1, to[1], -1, 5, 0);
+    um_run(&u, 1, 0, "waits-socket");
+    write(pair[1], "bytes", 5);
+    um_run(&u, 0, 1, "waited-socket");
+    got = read(to[0], buf, sizeof buf);
+    printf("read %ld %.*s\n", got, (int)got, buf);
+
+    /* Registered files, and the end. */
+    int slots[2] = {from[0], to[1]};
+    syscall(427, u.fd, 2, slots, 2);
+    write(from[1], "fixed", 5);
+    sqe = us_push(&u, 30, 1, 0, -1, 1, -1, 5, 1u << 31);
+    sqe[1] = 1;
+    um_run(&u, 1, 1, "fixed");
+    got = read(to[0], buf, sizeof buf);
+    printf("read %ld %.*s\n", got, (int)got, buf);
+    us_push(&u, 30, 1, 5, -1, to[1], -1, 5, 1u << 31);
+    um_run(&u, 1, 1, "fixed-none");
+    close(from[1]);
+    us_push(&u, 30, 1, from[0], -1, to[1], -1, 5, 0);
+    um_run(&u, 1, 1, "end");
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's file requests. Linux runs most of them in a worker, so each
    one runs alone or in a link. */
 static int uf_run(struct uring *u, unsigned n, const char *label) {
@@ -43956,6 +44052,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-fs")) return io_uring_fs_case();
     if (!strcmp(mode, "io-uring-message")) return io_uring_message_case();
     if (!strcmp(mode, "io-uring-multishot")) return io_uring_multishot_case();
+    if (!strcmp(mode, "io-uring-splice")) return io_uring_splice_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

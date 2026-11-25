@@ -1227,6 +1227,7 @@ mod linux {
         processes_io_uring_fs => ("io-uring-fs","process"),
         processes_io_uring_message => ("io-uring-message","process"),
         processes_io_uring_multishot => ("io-uring-multishot","process"),
+        processes_io_uring_splice => ("io-uring-splice","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

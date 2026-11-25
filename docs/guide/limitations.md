@@ -603,8 +603,8 @@ verified.
   `_TIMEOUT_REMOVE`, `_LINK_TIMEOUT`, `IORING_OP_POLL_ADD`,
   `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
-  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
-  socket requests
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
+  `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations complete with `EOPNOTSUPP`. Of the
   socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
@@ -623,7 +623,9 @@ verified.
   and a file request run while `io_uring_enter` takes them, where Linux
   runs them, but for a close and some opens and advice, in a worker, so
   their completions can come before those Linux posts first, and an open of
-  a FIFO that may create it waits there. A timeout expires at
+  a FIFO that may create it waits there. An `IORING_OP_SPLICE` that waits is
+  cancelled as a request that waits for its file, where Linux interrupts
+  its worker, and a splice to a socket can wait there for part of it. A timeout expires at
   the checkpoints where its process can run: one due while every thread
   sleeps in `nanosleep` completes as the sleep ends, where Linux's timer
   completes it then. A thread that exits alone leaves its polls of rings

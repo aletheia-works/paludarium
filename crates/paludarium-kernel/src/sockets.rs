@@ -556,6 +556,10 @@ impl PipeEnd {
     pub(crate) fn hold(&self) -> Held<'_> {
         self.endpoint.pair.hold()
     }
+    /// [`Self::hold`], if nothing holds the pipe.
+    pub(crate) fn try_hold(&self) -> Option<Held<'_>> {
+        self.endpoint.pair.try_hold()
+    }
     /// Takes this pipe and another, in the order everyone takes the two
     /// (`pipe_double_lock`).
     pub(crate) fn hold_both<'a>(&'a self, other: &'a Self) -> [Held<'a>; 2] {
@@ -3434,12 +3438,18 @@ struct Pair {
     clock: std::sync::OnceLock<Arc<dyn paludarium_host::Host>>,
 }
 impl Pair {
+    /// [`PipeEnd::try_hold`].
+    fn try_hold(&self) -> Option<Held<'_>> {
+        match self.held.try_lock() {
+            Ok(held) => Some(held),
+            Err(std::sync::TryLockError::Poisoned(held)) => Some(held.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
     /// [`PipeEnd::hold`], the wait for which shows the thread asleep.
     fn hold(&self) -> Held<'_> {
-        match self.held.try_lock() {
-            Ok(held) => return held,
-            Err(std::sync::TryLockError::Poisoned(held)) => return held.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {}
+        if let Some(held) = self.try_hold() {
+            return held;
         }
         let mut waiting = paludarium_host::blocked::Waiting::new();
         waiting.sleep();

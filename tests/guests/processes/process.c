@@ -24,6 +24,7 @@
 #include <sys/shm.h>
 #include <sys/sendfile.h>
 #include <sys/resource.h>
+#include <sys/ptrace.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
@@ -5430,6 +5431,36 @@ static int futex_shared_cases(void) {
     volatile unsigned *second = (volatile unsigned *)(file + 4096 + 8);
     futex_shared_show("file-other-mapping", second, second, fd);
 
+    /* A read-only anonymous page is no shared word's (EFAULT), written or
+       not, and a read-only private mapping's page of a file is the file's. */
+    char *own = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (own == MAP_FAILED) return 87;
+    own[0] = 1;
+    mprotect(own, 2 * 4096, PROT_READ);
+    for (int i = 0; i < 2; i++) {
+        volatile unsigned *at = (volatile unsigned *)(own + i * 4096);
+        long waited = futex_call(at, 0, 7);
+        int wait_errno = errno;
+        long woken = futex_call(at, 1, 1);
+        int wake_errno = errno;
+        long alone = futex_call(at, 128, 7);
+        printf("read-only anonymous %d: wait %ld errno %d wake %ld errno %d private %ld errno %d\n", i, waited,
+               wait_errno, woken, wake_errno, alone, errno);
+    }
+    munmap(own, 2 * 4096);
+    *second = 0;
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        char *page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 4096);
+        _exit(page == MAP_FAILED ? 2 : futex_call((volatile unsigned *)(page + 8), 0, 0) == 0 ? 0 : 1);
+    }
+    long read_woke;
+    while ((read_woke = futex_call(second, 1, 1)) == 0) sched_yield();
+    int read_status;
+    waitpid(reader, &read_status, 0);
+    printf("read-only private file: wake=%ld child status=%d\n", read_woke, read_status);
+
     /* A process-shared robust mutex whose owner ends while the parent waits:
        the end's wake reaches the parent, which gets EOWNERDEAD. */
     pthread_mutex_t *mutex = (pthread_mutex_t *)(anonymous + 64);
@@ -10810,6 +10841,109 @@ static int io_uring_exit_case(const char *self) {
     return 0;
 }
 
+/* IORING_REGISTER_RING_FDS: a thread registers ring descriptors, which
+   io_uring_enter and io_uring_register then find by index
+   (IORING_ENTER_REGISTERED_RING, IORING_REGISTER_USE_REGISTERED_RING). The
+   table is the thread's: a new thread and a forked child have no io_uring
+   context, nor has a thread after execve (EINVAL). */
+struct urf_update {
+    unsigned offset, resv;
+    unsigned long data;
+};
+
+static long urf_register(struct uring *u, unsigned op, struct urf_update *up, unsigned n) {
+    return syscall(427, u->fd, op, up, n);
+}
+
+static void *urf_thread(void *arg) {
+    int *fds = arg;
+    uring_show("thread-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    /* A submission it may not make gives it none; one of nothing does. */
+    uring_show("thread-single-issuer", uring_enter(fds[0], 1, 0, 0, NULL, 0));
+    uring_show("thread-still-none", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-waits-none", uring_enter(fds[1], 0, 0, 1, NULL, 0));
+    uring_show("thread-none-yet", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-submits-nothing", uring_enter(fds[1], 1, 0, 0, NULL, 0));
+    uring_show("thread-has-one", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    return NULL;
+}
+
+static int io_uring_ring_fds_case(const char *self) {
+    uring_show("no-context", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    uring_show("empty-slot", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("past-table", uring_enter(16, 0, 0, 1 << 4, NULL, 0));
+    struct urf_update up[2];
+    memset(up, 0, sizeof up);
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register-none", urf_register(&u, 20, up, 0));
+    uring_show("register-many", urf_register(&u, 20, up, 17));
+    up[0].resv = 1;
+    uring_show("register-resv", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){16, 0, (unsigned long)u.fd};
+    uring_show("register-past", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 999};
+    uring_show("register-badf", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, 1};
+    uring_show("register-not-ring", urf_register(&u, 20, up, 1));
+    up[0] = (struct urf_update){0xffffffff, 0, (unsigned long)u.fd};
+    uring_show("register", urf_register(&u, 20, up, 1));
+    printf("offset: %u\n", up[0].offset);
+    up[0] = (struct urf_update){3, 0, (unsigned long)u.fd};
+    up[1] = (struct urf_update){0, 0, (unsigned long)u.fd};
+    uring_show("register-busy-second", urf_register(&u, 20, up, 2));
+    tw_nop(&u, 5, 0, 0, 0);
+    uring_show("enter-registered", uring_enter(3, 1, 1, 1 << 4 | 1, NULL, 0));
+    uring_reap(&u, "enter-registered");
+    unsigned char probe[16 + 8];
+    memset(probe, 0, sizeof probe);
+    uring_show("register-registered", syscall(427, 0, 8 | (1U << 31), probe, 1));
+
+    /* A new thread and a forked child have no io_uring context. */
+    pthread_t t;
+    struct uring single;
+    if (uring_open_flags(&single, 8, 1 << 12)) return 81;
+    int rings[2] = {single.fd, u.fd};
+    pthread_create(&t, NULL, urf_thread, rings);
+    pthread_join(t, NULL);
+    close(single.fd);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        uring_show("child-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+
+    /* execve takes the context away. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        struct uring mine;
+        if (uring_open(&mine, 8)) _exit(1);
+        struct urf_update one = {0xffffffff, 0, (unsigned long)mine.fd};
+        if (urf_register(&mine, 20, &one, 1) != 1) _exit(2);
+        char *args[] = {"process", "io-uring-ring-fds-exec", (char *)self, NULL};
+        char *env[] = {NULL};
+        execve(self, args, env);
+        _exit(3);
+    }
+    waitpid(child, &status, 0);
+    printf("exec-child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    up[0] = (struct urf_update){0, 0, 1};
+    uring_show("unregister-data", urf_register(&u, 21, up, 1));
+    up[0] = (struct urf_update){0, 0, 0};
+    up[1] = (struct urf_update){3, 0, 0};
+    uring_show("unregister", urf_register(&u, 21, up, 2));
+    uring_show("after-unregister", uring_enter(3, 0, 0, 1 << 4, NULL, 0));
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's registered buffers keep the pages they had when they were
    registered (io_pin_pages, FOLL_LONGTERM): a fixed transfer moves them
    after munmap, a new mapping at the address sees none of it, and a page
@@ -12695,6 +12829,43 @@ static int grows_down_case(void) {
            got == 5 ? low + 8 : "-----");
     close(pipes[0]);
     close(pipes[1]);
+    /* So do /proc/<pid>/mem and ptrace (__access_remote_vm's expand_stack),
+     * within the limit. */
+    int mem = open("/proc/self/mem", O_RDWR);
+    low -= page;
+    char byte[8] = "zz";
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low + 8);
+    printf("mem-read-below: %ld grown-to-it=%d bytes %d %d\n", got, grows_start(g) == (uintptr_t)low, byte[0],
+           byte[1]);
+    low -= 2 * page;
+    got = pwrite(mem, "mem", 3, (off_t)(uintptr_t)low + 8);
+    printf("mem-write-below: %ld grown-to-it=%d\n", got, grows_start(g) == (uintptr_t)low);
+    struct rlimit mem_limit, mem_small;
+    getrlimit(RLIMIT_STACK, &mem_limit);
+    mem_small = mem_limit;
+    mem_small.rlim_cur = (rlim_t)(g + 2 * page - low);
+    setrlimit(RLIMIT_STACK, &mem_small);
+    got = pread(mem, byte, 2, (off_t)(uintptr_t)low - 8);
+    printf("mem-past-limit: %ld errno=%d\n", got, got < 0 ? errno : 0);
+    setrlimit(RLIMIT_STACK, &mem_limit);
+    close(mem);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        raise(SIGSTOP);
+        _exit(grows_start(g) == (uintptr_t)low - 3 * 4096 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, child, low - page, NULL);
+    printf("peek-below: %ld errno=%d\n", word, errno);
+    long poked = ptrace(PTRACE_POKEDATA, child, low - 3 * page, (void *)1L);
+    printf("poke-below: %ld\n", poked);
+    ptrace(PTRACE_CONT, child, NULL, NULL);
+    waitpid(child, &status, 0);
+    printf("child-grown: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     /* PROT_GROWSDOWN reaches down to the start of the VMA. */
     printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
     grows_touch("read-only", g, g - page, 1);
@@ -23521,6 +23692,97 @@ static int cpu_clock_ids_case(void) {
     long last = ci_r(syscall(SYS_timer_create, CLOCK_MONOTONIC, NULL, &next));
     printf("timer_create: own=%ld dynamic=%ld none=%ld id=%d last=%ld next=%d\n", own, dynamic, none,
            after_none, last, next);
+    return 0;
+}
+/* The CPU time of a thread and of a process that run without a system call
+ * or a fault, as another thread and the parent see it: it goes on
+ * (kernel/sched/core.c's task_sched_runtime for a thread's clock, and for a
+ * process's what its threads' ticks added). Looked at for at most 20 s, for
+ * a busy machine; what is printed holds whatever the speed. */
+static volatile int cr_stop, cr_ready;
+static void *cr_spin(void *arg) {
+    (void)arg;
+    ci_tid = syscall(SYS_gettid);
+    cr_ready = 1;
+    while (!cr_stop) {
+    }
+    return NULL;
+}
+static long cr_clock(clockid_t id) {
+    struct timespec t;
+    return syscall(SYS_clock_gettime, id, &t) ? -1 : ct_ns(t);
+}
+/* utime and stime of a stat file, in ns. */
+static long cr_stat(const char *path) {
+    char text[1024];
+    int fd = open(path, O_RDONLY);
+    long n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    text[n] = 0;
+    unsigned long user = 0, system = 0;
+    char *at = strrchr(text, ')');
+    if (!at || sscanf(at + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &user, &system) != 2)
+        return -1;
+    return (long)(user + system) * 10000000L;
+}
+static long cr_rusage(const char *none) {
+    (void)none;
+    struct rusage use;
+    getrusage(RUSAGE_SELF, &use);
+    return (use.ru_utime.tv_sec + use.ru_stime.tv_sec) * 1000000000L +
+           (use.ru_utime.tv_usec + use.ru_stime.tv_usec) * 1000L;
+}
+/* Whether what `look` (or the clock) shows grows by 50 ms, never back. */
+static int cr_grows(long (*look)(const char *), const char *path, clockid_t id) {
+    long first = look ? look(path) : cr_clock(id), last = first;
+    for (int i = 0; i < 10000; i++) {
+        struct timespec pause = {0, 2000000};
+        nanosleep(&pause, NULL);
+        long now = look ? look(path) : cr_clock(id);
+        if (now < last || first < 0) return -1;
+        last = now;
+        if (now - first >= 50000000L) return 1;
+    }
+    return 0;
+}
+static int cpu_clock_running_case(void) {
+    char path[64];
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, cr_spin, NULL)) return 80;
+    while (!cr_ready) sched_yield();
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", ci_tid);
+    printf("thread: clock=%d process=%d getrusage=%d stat=%d process-stat=%d\n",
+           cr_grows(NULL, NULL, CI_CLOCK(ci_tid, 1, 2)), cr_grows(NULL, NULL, CLOCK_PROCESS_CPUTIME_ID),
+           cr_grows(cr_rusage, NULL, 0), cr_grows(cr_stat, path, 0), cr_grows(cr_stat, "/proc/self/stat", 0));
+    long own = cr_clock(CI_CLOCK(ci_tid, 1, 2));
+    cr_stop = 1;
+    pthread_join(thread, NULL);
+    printf("thread ended: process has its time=%d\n", cr_clock(CLOCK_PROCESS_CPUTIME_ID) >= own);
+    fflush(stdout);
+    int ready[2];
+    if (pipe(ready)) return 81;
+    pid_t kid = fork();
+    if (kid == 0) {
+        write(ready[1], "r", 1);
+        for (;;) {
+        }
+    }
+    char c;
+    read(ready[0], &c, 1);
+    snprintf(path, sizeof path, "/proc/%d/stat", kid);
+    printf("child: clock=%d stat=%d\n", cr_grows(NULL, NULL, CI_CLOCK(kid, 0, 2)), cr_grows(cr_stat, path, 0));
+    /* Killed, it made no system call to account its time at. */
+    own = cr_clock(CI_CLOCK(kid, 0, 2));
+    kill(kid, SIGKILL);
+    struct rusage use;
+    int status = 0;
+    long reaped_pid = wait4(kid, &status, 0, &use);
+    long waited = use.ru_utime.tv_sec * 1000000000L + use.ru_utime.tv_usec * 1000L +
+                  use.ru_stime.tv_sec * 1000000000L + use.ru_stime.tv_usec * 1000L;
+    /* A rusage counts in microseconds, each of the two cut to one. */
+    printf("child killed: waited=%d signal=%d rusage has its time=%d\n", reaped_pid == kid,
+           WIFSIGNALED(status) ? WTERMSIG(status) : -1, waited + 2000 >= own);
     return 0;
 }
 /* A POSIX timer on another process's CPU clock, by number: the child's
@@ -39377,6 +39639,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "pidfd-fdinfo")) return pidfd_fdinfo_case();
     if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
+    if (!strcmp(mode, "cpu-clock-running")) return cpu_clock_running_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "yama")) return yama_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
@@ -39474,6 +39737,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds")) return io_uring_ring_fds_case(self);
+    if (!strcmp(mode, "io-uring-ring-fds-exec")) {
+        uring_show("exec-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+        return 0;
+    }
     if (!strcmp(mode, "io-uring-pinned")) return io_uring_pinned_case();
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {

@@ -6529,6 +6529,80 @@ mod io_uring {
     }
 
     #[test]
+    fn a_thread_registers_ring_descriptors_and_uses_them_by_index() {
+        const RING_FDS: u64 = 20;
+        const UNRING_FDS: u64 = 21;
+        const USE_REGISTERED: u64 = 1 << 31;
+        let mut f = fixture();
+        let update = DATA + 0x100;
+        let entry = |f: &Fixture, i: u64, offset: u32, resv: u32, data: u64| {
+            let at = update + 16 * i;
+            f.mem.write(GuestAddr(at), &offset.to_le_bytes()).unwrap();
+            f.mem.write(GuestAddr(at + 4), &resv.to_le_bytes()).unwrap();
+            f.mem.write_u64(GuestAddr(at + 8), data).unwrap();
+        };
+        // No io_uring context yet: EINVAL, as for an index past the table.
+        assert_eq!(f.ret(426, &[0, 0, 0, 1 << 4]), errno(Errno::EINVAL));
+        let r = ring(&mut f);
+        assert_eq!(f.ret(426, &[0, 0, 0, 1 << 4]), errno(Errno::EBADF));
+        assert_eq!(f.ret(426, &[16, 0, 0, 1 << 4]), errno(Errno::EINVAL));
+        // The registration's checks.
+        entry(&f, 0, u32::MAX, 0, r.fd);
+        for count in [0, 17] {
+            assert_eq!(
+                f.ret(427, &[r.fd, RING_FDS, update, count]),
+                errno(Errno::EINVAL)
+            );
+        }
+        entry(&f, 0, u32::MAX, 1, r.fd);
+        assert_eq!(
+            f.ret(427, &[r.fd, RING_FDS, update, 1]),
+            errno(Errno::EINVAL)
+        );
+        entry(&f, 0, 16, 0, r.fd);
+        assert_eq!(
+            f.ret(427, &[r.fd, RING_FDS, update, 1]),
+            errno(Errno::EINVAL)
+        );
+        entry(&f, 0, u32::MAX, 0, 999);
+        assert_eq!(
+            f.ret(427, &[r.fd, RING_FDS, update, 1]),
+            errno(Errno::EBADF)
+        );
+        entry(&f, 0, u32::MAX, 0, 1);
+        assert_eq!(f.ret(427, &[r.fd, RING_FDS, update, 1]), errno(Errno(95)));
+        // The first free slot, written back; then a taken one is EBUSY, and
+        // a batch stops there, giving how many it did.
+        entry(&f, 0, u32::MAX, 0, r.fd);
+        assert_eq!(f.ret(427, &[r.fd, RING_FDS, update, 1]), 1);
+        assert_eq!(u32_at(&f, update), 0);
+        entry(&f, 0, 3, 0, r.fd);
+        entry(&f, 1, 0, 0, r.fd);
+        assert_eq!(f.ret(427, &[r.fd, RING_FDS, update, 2]), 1);
+        entry(&f, 0, 0, 0, r.fd);
+        assert_eq!(f.ret(427, &[r.fd, RING_FDS, update, 1]), errno(EBUSY));
+        // By index: a submission, and a register call.
+        let slot = u32_at(&f, r.rings + 4) & 3;
+        push(&mut f, &r, slot, &nop(5, 0, 0, 0, 0));
+        assert_eq!(f.ret(426, &[3, 1, 1, 1 << 4 | GETEVENTS]), 1);
+        assert_eq!(reap(&mut f, &r), [(5, 0)]);
+        let probe = DATA + 0x400;
+        f.mem.write(GuestAddr(probe), &[0; 16 + 8]).unwrap();
+        assert_eq!(f.ret(427, &[0, 8 | USE_REGISTERED, probe, 1]), 0);
+        // Unregistering checks its entries, then empties the slots.
+        entry(&f, 0, 0, 0, r.fd);
+        assert_eq!(
+            f.ret(427, &[r.fd, UNRING_FDS, update, 1]),
+            errno(Errno::EINVAL)
+        );
+        entry(&f, 0, 0, 0, 0);
+        entry(&f, 1, 3, 0, 0);
+        assert_eq!(f.ret(427, &[r.fd, UNRING_FDS, update, 2]), 2);
+        assert_eq!(f.ret(426, &[0, 0, 0, 1 << 4]), errno(Errno::EBADF));
+        assert_eq!(f.ret(426, &[3, 0, 0, 1 << 4]), errno(Errno::EBADF));
+    }
+
+    #[test]
     fn tagged_files_post_their_tags_once_let_go() {
         let mut f = fixture();
         let r = ring(&mut f);

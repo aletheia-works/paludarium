@@ -64,6 +64,8 @@ mod netlink;
 pub use inet::{InvalidRule, NetworkPolicy};
 #[cfg(test)]
 mod context_tests;
+#[cfg(test)]
+mod cpu_clock_tests;
 mod futex;
 mod memfd;
 mod mempolicy;
@@ -196,8 +198,7 @@ impl Default for AltStack {
 }
 
 /// A guest thread's CPU time: the host thread's CPU time (or, where the host
-/// cannot measure it, wall time) since the guest thread's first system call,
-/// published for the thread group's total, with what else it has used
+/// cannot measure it, wall time) since the guest thread's start, published for the thread group's total, with what else it has used
 /// ([`Usage`]). A clone starts again from zero, as a new Linux thread or
 /// process does.
 #[derive(Debug, Default)]
@@ -226,7 +227,9 @@ impl PartialEq for CpuAccount {
 }
 impl Eq for CpuAccount {}
 
-/// What a guest thread has used: its CPU time in nanoseconds, the times it
+/// What a guest thread has used: its CPU time in nanoseconds, as of its
+/// latest system call or of the latest look at its clock
+/// ([`Usage::sample`]), the times it
 /// went to sleep ([`paludarium_host::switches`]) and the times it moved to
 /// another CPU, as of its latest system call, and the page faults its
 /// accesses take ([`paludarium_mmu::faults`]), in its own code and in the
@@ -236,7 +239,13 @@ impl Eq for CpuAccount {}
 /// to its `min_flt` but are no `perf` event.
 #[derive(Debug, Default)]
 pub(crate) struct Usage {
-    pub(crate) cpu: std::sync::atomic::AtomicU64,
+    /// Grows only, under [`Self::time`]'s lock.
+    cpu: std::sync::atomic::AtomicU64,
+    /// Its clock, from its start ([`Kernel::start_thread`]) to its end
+    /// ([`Self::retire`]).
+    clock: std::sync::Mutex<Option<CpuClock>>,
+    /// Where its CPU time went.
+    time: std::sync::Mutex<TimeOnCpus>,
     pub(crate) faults: std::sync::atomic::AtomicU64,
     pub(crate) kernel_faults: std::sync::atomic::AtomicU64,
     pub(crate) forced_faults: std::sync::atomic::AtomicU64,
@@ -245,15 +254,84 @@ pub(crate) struct Usage {
     /// The CPU it was last seen on (Linux's `task_cpu`), which
     /// `/proc/<pid>/stat` gives as `processor`.
     pub(crate) last_cpu: std::sync::atomic::AtomicU32,
-    /// Its CPU time in nanoseconds on each CPU, by the CPU's number: what
-    /// it ran between two accounts counts to the CPU it was seen on at the
-    /// first, for `/proc/stat`'s `cpuN` lines.
-    pub(crate) per_cpu: std::sync::Mutex<Vec<u64>>,
     /// Its faults, switches and migrations on each CPU, for the `perf`
     /// events of one CPU ([`CpuCounts`]).
     pub(crate) per_cpu_counts: std::sync::Mutex<CpuCounts>,
     /// It runs on a virtual CPU of `rseq`, which no CPU mask moves.
     pub(crate) virtual_cpu: std::sync::atomic::AtomicBool,
+}
+
+/// The clock of a running thread's CPU time, which other threads read too.
+struct CpuClock {
+    clock: Arc<dyn paludarium_host::ThreadCpuClock>,
+    /// What it showed as the thread started.
+    base: u64,
+    /// The host thread whose time it is.
+    owner: std::thread::ThreadId,
+}
+impl core::fmt::Debug for CpuClock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CpuClock")
+            .field("base", &self.base)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+/// The wall time, where the host cannot measure CPU time, of a thread that
+/// is not asleep in a wait: what it slept counts at its own next account,
+/// and other threads see none of it meanwhile, as a sleeping thread uses no
+/// CPU.
+struct WallClock {
+    host: Arc<dyn Host>,
+    asleep: Arc<std::sync::atomic::AtomicBool>,
+}
+impl paludarium_host::ThreadCpuClock for WallClock {
+    fn read(&self) -> Option<u64> {
+        if self.asleep.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        self.host.clock(paludarium_host::ClockId::Monotonic).ok()
+    }
+}
+/// What the host shows of the calling thread's CPU time: the wall time
+/// where it cannot measure it.
+fn host_cpu_time(host: &dyn Host) -> u64 {
+    host.thread_cpu_time()
+        .or_else(|_| host.clock(paludarium_host::ClockId::Monotonic))
+        .unwrap_or(0)
+}
+
+/// A thread's CPU time on each CPU.
+#[derive(Debug, Default)]
+struct TimeOnCpus {
+    /// In nanoseconds, by the CPU's number: what it ran between two looks
+    /// at its time counts to the CPU it was on at the first, for
+    /// `/proc/stat`'s `cpuN` lines.
+    ran: Vec<u64>,
+    /// The CPU it is on.
+    on: Option<u32>,
+    /// What it ran before it was first seen on one, which is that one's.
+    before: u64,
+}
+impl TimeOnCpus {
+    fn add(&mut self, ran: u64) {
+        let Some(cpu) = self.on else {
+            self.before = self.before.saturating_add(ran);
+            return;
+        };
+        let cpu = cpu as usize;
+        if self.ran.len() <= cpu {
+            self.ran.resize(cpu + 1, 0);
+        }
+        self.ran[cpu] = self.ran[cpu].saturating_add(ran);
+    }
+    fn arrive(&mut self, cpu: u32) {
+        self.on = Some(cpu);
+        let before = std::mem::take(&mut self.before);
+        if before != 0 {
+            self.add(before);
+        }
+    }
 }
 
 /// What a thread's [`Usage`] counted on each CPU: its faults in its own
@@ -270,6 +348,69 @@ pub(crate) struct CpuCounts {
 }
 
 impl Usage {
+    fn time(&self) -> std::sync::MutexGuard<'_, TimeOnCpus> {
+        self.time
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Its CPU time in nanoseconds, as of the latest look at it.
+    pub(crate) fn cpu_time(&self) -> u64 {
+        self.cpu.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Its CPU time is `used` now, which counts to the CPU it is on from
+    /// the latest look at it. The thread and those that look at its clock
+    /// all tell it so, in any order: it is the most that one of them saw.
+    /// Returns it.
+    fn ran(&self, used: u64) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut time = self.time();
+        let before = self.cpu.load(SeqCst);
+        if used <= before {
+            return before;
+        }
+        self.cpu.store(used, SeqCst);
+        time.add(used - before);
+        used
+    }
+    /// Brings its CPU time up to now from its clock, as Linux's
+    /// `task_sched_runtime` does for a task that runs, and tells whether it
+    /// could: not once it has ended, nor where the host has no such clock.
+    /// Its own thread has no need to, as each system call accounts it
+    /// ([`account_cpu`]).
+    pub(crate) fn sample(&self) -> bool {
+        // The lock is held as the clock is read, so that the thread does
+        // not end meanwhile ([`Self::retire`]).
+        let clock = self
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(clock) = clock.as_ref() else {
+            return false;
+        };
+        if clock.owner == std::thread::current().id() {
+            return false;
+        }
+        let Some(now) = clock.clock.read() else {
+            return false;
+        };
+        self.ran(now.saturating_sub(clock.base));
+        true
+    }
+    /// The calling thread, whose it is, ends: its CPU time is what it is
+    /// now, and its clock, which a host could give to another thread after
+    /// this one, is let go of.
+    fn retire(&self) {
+        let clock = self
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(clock) = clock
+            && let Some(now) = clock.clock.read()
+        {
+            self.ran(now.saturating_sub(clock.base));
+        }
+    }
     /// Its faults, switches and migrations, as [`CpuCounts`] orders them.
     fn counts(&self) -> [u64; 4] {
         use std::sync::atomic::Ordering::SeqCst;
@@ -309,8 +450,13 @@ impl Usage {
     /// returns (`__set_cpus_allowed_ptr`), so what it counts from now is
     /// that CPU's, and its next account counts the migration there. One on
     /// a virtual CPU of `rseq` stays where it is.
+    /// Where its clock can be read, the CPU time it runs from now is that
+    /// CPU's too.
     pub(crate) fn moved_to(&self, cpu: u32) {
         if !self.virtual_cpu.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.sample() {
+                self.time().arrive(cpu);
+            }
             self.arrive(cpu);
         }
     }
@@ -351,14 +497,22 @@ impl Usage {
         }
         on
     }
-    /// Its CPU time in nanoseconds on `cpu`, as of its latest account.
-    pub(crate) fn time_on(&self, cpu: u32) -> u64 {
-        self.per_cpu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(cpu as usize)
-            .copied()
-            .unwrap_or(0)
+    /// Its CPU time in nanoseconds and what of it was on `cpu`, as of the
+    /// latest look at it.
+    pub(crate) fn time_on(&self, cpu: u32) -> (u64, u64) {
+        let time = self.time();
+        let on = time.ran.get(cpu as usize).copied().unwrap_or(0);
+        (self.cpu_time(), on)
+    }
+    /// Adds its CPU time on each CPU to `sums`.
+    pub(crate) fn add_times(&self, sums: &mut Vec<u64>) {
+        let time = self.time();
+        if sums.len() < time.ran.len() {
+            sums.resize(time.ran.len(), 0);
+        }
+        for (sum, &ran) in sums.iter_mut().zip(&time.ran) {
+            *sum = sum.saturating_add(ran);
+        }
     }
     /// Its minor faults (Linux's `min_flt`): every fault it took, its own
     /// code's, the kernel's for it and those through `get_user_pages`.
@@ -442,11 +596,66 @@ impl Kernel {
     /// The calling host thread runs `thread` from now on: its faults count
     /// to it from the first one, as Linux's `mm_account_fault` counts each
     /// to `current`, and they show in `/proc` and `getrusage` before its
-    /// first system call.
-    pub fn start_thread(&self, thread: &mut Thread) {
-        register_usage(&self.group, thread.tid, &mut thread.state.cpu);
-        paludarium_mmu::faults::bind(Arc::clone(&thread.state.cpu.used) as _);
+    /// first system call. Its CPU time starts, and other threads may look at
+    /// it while what this returns lives, at most as long as the host thread
+    /// ([`Self::finish_thread`] ends it earlier).
+    #[must_use]
+    pub fn start_thread(&self, thread: &mut Thread) -> ThreadClock {
+        let account = &mut thread.state.cpu;
+        register_usage(&self.group, thread.tid, account);
+        let used = Arc::clone(&account.used);
+        paludarium_mmu::faults::bind(Arc::clone(&used) as _);
+        let base = start_account(&*self.host, &self.group, account, thread.tid, || {
+            host_cpu_time(&*self.host)
+        });
+        let clock = match self.host.thread_cpu_clock() {
+            // The host measures it only for the calling thread.
+            None if self.host.thread_cpu_time().is_ok() => None,
+            None => Some(Arc::new(WallClock {
+                host: Arc::clone(&self.host),
+                asleep: Arc::clone(self.inbox.blocked_flag()),
+            }) as _),
+            clock => clock,
+        };
+        *used
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = clock.map(|clock| CpuClock {
+            clock,
+            base,
+            owner: std::thread::current().id(),
+        });
+        ThreadClock(used)
     }
+}
+
+/// While it lives, other threads may look at the CPU time of the guest
+/// thread the host thread that made it runs ([`Kernel::start_thread`]).
+#[derive(Debug)]
+pub struct ThreadClock(Arc<Usage>);
+impl Drop for ThreadClock {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
+
+/// The host's reading the thread's CPU time counts from: `now`'s, the first
+/// time.
+fn start_account(
+    host: &dyn Host,
+    group: &ThreadGroup,
+    account: &mut CpuAccount,
+    tid: u32,
+    now: impl FnOnce() -> u64,
+) -> u64 {
+    *account.base.get_or_insert_with(|| {
+        // A thread no clone made, the first process's, was made about now.
+        group.set_started(
+            tid,
+            host.clock(paludarium_host::ClockId::Monotonic).unwrap_or(0),
+        );
+        now()
+    })
 }
 
 /// Brings the thread's CPU time and [`Usage`] up to date and returns its
@@ -460,24 +669,13 @@ pub(crate) fn account_cpu(
     tid: u32,
 ) -> u64 {
     use std::sync::atomic::Ordering;
-    let now = host
-        .thread_cpu_time()
-        .or_else(|_| host.clock(paludarium_host::ClockId::Monotonic))
-        .unwrap_or(0);
+    let now = host_cpu_time(host);
     let on_cpu = state.on_cpu.map(|on| on.cpu);
     let account = &mut state.cpu;
     register_usage(group, tid, account);
-    let base = *account.base.get_or_insert_with(|| {
-        // A thread no clone made, the first process's, was made about now.
-        group.set_started(
-            tid,
-            host.clock(paludarium_host::ClockId::Monotonic).unwrap_or(0),
-        );
-        now
-    });
-    let used = now.saturating_sub(base);
+    let base = start_account(host, group, account, tid, || now);
     let usage = &account.used;
-    let ran = used.saturating_sub(usage.cpu.swap(used, Ordering::SeqCst));
+    let used = usage.ran(now.saturating_sub(base));
     let switches = paludarium_host::switches::take();
     if switches != 0 {
         usage.switches.fetch_add(switches, Ordering::SeqCst);
@@ -505,17 +703,7 @@ pub(crate) fn account_cpu(
     if was.is_some_and(|was| was != seen.0) {
         usage.migrations.fetch_add(1, Ordering::SeqCst);
     }
-    if ran != 0 {
-        let cpu = was.unwrap_or(seen.0) as usize;
-        let mut per_cpu = usage
-            .per_cpu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if per_cpu.len() <= cpu {
-            per_cpu.resize(cpu + 1, 0);
-        }
-        per_cpu[cpu] = per_cpu[cpu].saturating_add(ran);
-    }
+    usage.time().arrive(seen.0);
     used
 }
 
@@ -1108,6 +1296,43 @@ impl Kernel {
         });
     }
 
+    /// Has the calling host thread's kernel accesses that fault served for
+    /// `thread` while what it returns lives. Its resolver is kept from call
+    /// to call, while it serves the same thread.
+    fn resolve_copies(&mut self, thread: &Thread) -> KernelCopies {
+        let copies = match &self.copies {
+            Some(copies)
+                if copies.serves(
+                    &self.group,
+                    &self.files.readiness,
+                    &self.inbox,
+                    self.process.pid,
+                    thread.tid,
+                ) =>
+            {
+                Arc::clone(copies)
+            }
+            _ => {
+                let copies = Arc::new(userfaultfd::KernelCopies {
+                    group: Arc::clone(&self.group),
+                    tid: thread.tid,
+                    hub: Arc::clone(&self.files.readiness),
+                    host: Arc::clone(&self.host),
+                    inbox: Arc::clone(&self.inbox),
+                    processes: Arc::clone(&self.processes),
+                    pid: self.process.pid,
+                });
+                self.copies = Some(Arc::clone(&copies));
+                copies
+            }
+        };
+        KernelCopies::install(
+            copies,
+            thread.state.signal_mask,
+            thread.state.credentials.capable(1 << 14),
+        )
+    }
+
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Its writes to user memory, a signal frame's and the rseq area's,
@@ -1115,6 +1340,9 @@ impl Kernel {
         // (`get_signal`, `rseq_handle_notify_resume`): their faults are the
         // kernel's, wherever it is called from.
         let _faults = KernelFaults::enter(&thread.state);
+        // And they are served as a system call's copies are: the frame of a
+        // signal grows a stack, and waits for a `userfaultfd`.
+        let _copies = self.resolve_copies(thread);
         // As in `handle`: a wait here shows the thread asleep.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         // A traced thread's clone goes on once the new task has started.
@@ -1444,38 +1672,7 @@ impl Kernel {
         let _faults = KernelFaults::enter(&thread.state);
         // And its accesses that fault are served as an instruction's are: a
         // mapping that grows down grows, and a `userfaultfd` is waited for.
-        // Its resolver is kept from call to call, while it serves this one.
-        let copies = match &self.copies {
-            Some(copies)
-                if copies.serves(
-                    &self.group,
-                    &self.files.readiness,
-                    &self.inbox,
-                    self.process.pid,
-                    thread.tid,
-                ) =>
-            {
-                Arc::clone(copies)
-            }
-            _ => {
-                let copies = Arc::new(userfaultfd::KernelCopies {
-                    group: Arc::clone(&self.group),
-                    tid: thread.tid,
-                    hub: Arc::clone(&self.files.readiness),
-                    host: Arc::clone(&self.host),
-                    inbox: Arc::clone(&self.inbox),
-                    processes: Arc::clone(&self.processes),
-                    pid: self.process.pid,
-                });
-                self.copies = Some(Arc::clone(&copies));
-                copies
-            }
-        };
-        let _copies = KernelCopies::install(
-            copies,
-            thread.state.signal_mask,
-            thread.state.credentials.capable(1 << 14),
-        );
+        let _copies = self.resolve_copies(thread);
         // What it waits for in the host while it handles the stop shows it
         // as sleeping (`/proc/<pid>/stat`), and nothing else does.
         let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());

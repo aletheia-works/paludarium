@@ -132,7 +132,8 @@ verified.
   (`EINVAL`, `EFAULT`: an eventfd's too small a buffer) is taken as refused
   before it, so not counted.
   `/proc/stat` counts all CPU time as user time, as `getrusage` does, each
-  thread's to the CPU it was on at its system calls, and none as idle; it
+  thread's to the CPU it was on at its system calls or that another thread's
+  `sched_setaffinity` moved it to since, and none as idle; it
   counts no interrupts or softirqs, and as context switches only the times
   threads went to sleep, as nothing preempts a guest thread, so `status` shows
   those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`,
@@ -303,18 +304,16 @@ verified.
   `minflt` and `cminflt` read the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
-  are hardware events even on a host with a PMU. A thread's CPU time,
-  context switches and CPU migrations are those it last accounted, at its
-  latest system call; its page faults count as they are taken. An event of
+  are hardware events even on a host with a PMU. A thread's context
+  switches and CPU migrations are those it last accounted, at its latest
+  system call; its CPU time is looked at as the event is read, and its page
+  faults count as they are taken. An event of
   a CPU counts the time that passes, and no faults, switches or migrations.
   A fault that ends in `SIGSEGV` or `SIGBUS` is not counted, where Linux
   counts it in `page-faults`; a context switch is a sleep of the thread,
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
   to another); and a thread without `rseq` moves to
   another CPU only when a new CPU mask changes the lowest CPU it allows.
-  When another thread's `sched_setaffinity` moves it, its faults count on
-  the new CPU at once, but the CPU time it runs until its next system call
-  counts to the old one, where Linux has moved it already.
   A sampling event's samples are taken as its thread enters a system call,
   or reaches the emulator's checkpoint, of what it did since then, where
   Linux takes each at its occurrence: they show the thread's address,
@@ -545,10 +544,11 @@ verified.
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
-  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the
-  others give `EINVAL`). So no ring descriptor or personality can be
-  registered, buffers cannot be updated, and buffers cannot be registered
-  with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
+  `IORING_REGISTER_PBUF_STATUS`, `IORING_REGISTER_SYNC_CANCEL`,
+  `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS` (the others
+  give `EINVAL`). So no personality can be registered, buffers cannot be
+  updated, and buffers cannot be registered with
+  `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
   whole exit cancels the requests its threads submitted that wait for
   their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
   the kernel the differential tests run on, cancels them only once their
@@ -557,9 +557,8 @@ verified.
   Linux charges it once. A ring maps only shared (`MAP_PRIVATE` gives
   `EINVAL`).
   The features are Linux
-  6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
-  descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
-  wait's `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
+  6.12's, so `IORING_FEAT_MIN_TIMEOUT` is reported though a wait's
+  `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
   `io_uring_enter` instead of waiting for its file as a pipe's read does. A file that is never read (an epoll instance, a ring)
   fails with `EINVAL` at once, where Linux first waits for it to be ready.
   An `IORING_OP_ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_OP` and an
@@ -656,7 +655,7 @@ verified.
     (Linux's `ITIMER_VIRTUAL` leaves out the system time; its `RLIMIT_CPU`
     counts it). Where the host
     cannot measure a thread's CPU time, as in WebAssembly, that is wall time,
-    so they also count the time a thread sleeps or waits. They are looked
+    so they also count the time a thread sleeps or waits, from its wake on. They are looked
     at as a thread makes a system call and every 100,000 instructions it
     runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. POSIX timers on the CPU-time clocks count
@@ -665,15 +664,14 @@ verified.
     wall time, the sleep counts its own time too, so a process alone ends
     it after the wall time it asked for.
     A timer on another process's CPU time is looked at as that process's
-    threads make system calls, the same way, and so is a sleep on another
-    task's CPU clock. Another process's CPU time,
-    read or set from outside it, is each of its threads' as of that thread's
-    last account (its last system call, while nothing timed that process),
-    as a thread's CPU time can only be measured by the thread itself: a
-    timer set on it counts from there, so its first expiry can come early
-    by what the process ran since then without a system call, and
-    `timer_gettime` can show more time left, where Linux samples the
-    running threads at once.
+    threads make system calls, the same way. A process's CPU time, read or
+    set from any of its threads or from outside it, is each running
+    thread's as of then, where Linux counts all but the calling thread's as
+    of its last tick, at most a millisecond before on the CI runners (a
+    thread's own clock is exact on Linux too); so it can be ahead of
+    Linux's by as much. A thread's CPU time is as fine as the host shows
+    another thread's: 1 ns on Linux, 1 µs on macOS, and on Windows its
+    scheduler's tick, about 15.6 ms.
   - The time cannot be set: `settimeofday`, `clock_settime` and an
     `adjtimex` or `clock_adjtime` that changes something give `EPERM` even
     to a caller with `CAP_SYS_TIME`, where Linux sets the clock, its time

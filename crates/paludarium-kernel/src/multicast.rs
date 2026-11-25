@@ -1,10 +1,11 @@
-//! IPv4 multicast groups (Linux's `igmp.c`): the groups each device has
-//! joined, which say what comes in through it (`ip_check_mc_rcu`), and the
-//! memberships of each socket, which make a device join and leave. No IGMP
-//! packet is sent, as nothing here would see one.
+//! Multicast groups (Linux's `igmp.c` and IPv6's `mcast.c`): the groups each
+//! device has joined, which say what comes in through it
+//! (`ip_check_mc_rcu`, `ipv6_chk_mcast_addr`), and the memberships of each
+//! socket, which make a device join and leave. No IGMP or MLD packet is
+//! sent, as nothing here would see one.
 
 use crate::inet::Network;
-use core::net::{IpAddr, Ipv4Addr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use paludarium_types::Errno;
 
 const EADDRINUSE: Errno = Errno(98);
@@ -18,23 +19,30 @@ pub(crate) const ALL_HOSTS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
 /// The most memberships a socket has (`net.ipv4.igmp_max_memberships`).
 const MAX_MEMBERSHIPS: usize = 20;
 
-/// The groups a device has joined (`in_dev->mc_list`), the newest first,
-/// each with how many times it has been.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Groups {
-    list: Vec<(Ipv4Addr, u32)>,
+/// The groups a device has joined (`in_dev->mc_list`, `idev->mc_list`), the
+/// newest first, each with how many times it has been. Of IPv6's, those that
+/// sockets joined ([`Network::in_group6`] has the rest).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Groups<A> {
+    list: Vec<(A, u32)>,
 }
-impl Groups {
-    /// The device joins `group` once more (`ip_mc_inc_group`).
-    pub(crate) fn join(&mut self, group: Ipv4Addr) {
+impl<A> Default for Groups<A> {
+    fn default() -> Self {
+        Self { list: Vec::new() }
+    }
+}
+impl<A: Copy + PartialEq> Groups<A> {
+    /// The device joins `group` once more (`ip_mc_inc_group`,
+    /// `__ipv6_dev_mc_inc`).
+    pub(crate) fn join(&mut self, group: A) {
         match self.list.iter_mut().find(|(g, _)| *g == group) {
             Some((_, users)) => *users += 1,
             None => self.list.insert(0, (group, 1)),
         }
     }
     /// The device leaves `group` once, for good with its last user
-    /// (`ip_mc_dec_group`).
-    pub(crate) fn leave(&mut self, group: Ipv4Addr) {
+    /// (`ip_mc_dec_group`, `__ipv6_dev_mc_dec`).
+    pub(crate) fn leave(&mut self, group: A) {
         self.list.retain_mut(|(g, users)| {
             if *g == group {
                 *users -= 1;
@@ -42,8 +50,8 @@ impl Groups {
             *users > 0
         });
     }
-    /// Whether the device takes what goes to `group` (`ip_check_mc_rcu`).
-    pub(crate) fn has(&self, group: Ipv4Addr) -> bool {
+    /// Whether the device has joined `group` (`ip_check_mc_rcu`).
+    pub(crate) fn has(&self, group: A) -> bool {
         self.list.iter().any(|(g, _)| *g == group)
     }
 }
@@ -79,6 +87,38 @@ pub(crate) fn allows(memberships: &[Membership], all: bool, group: Ipv4Addr, dif
     all || memberships
         .iter()
         .any(|m| m.group == group && u32::try_from(m.index) == Ok(dif))
+}
+
+/// An IPv6 membership a socket asks for or has (`struct ipv6_mreq`): the
+/// group, and the device's index.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Membership6 {
+    pub(crate) group: Ipv6Addr,
+    pub(crate) index: i32,
+}
+impl Membership6 {
+    /// Reads an `ipv6_mreq`.
+    pub(crate) fn read(raw: &[u8; 20]) -> Self {
+        let mut group = [0; 16];
+        group.copy_from_slice(&raw[..16]);
+        Self {
+            group: group.into(),
+            index: i32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]),
+        }
+    }
+}
+
+/// Whether a socket of `memberships` takes a datagram to the IPv6 group
+/// `group`, on whatever device: as a member, or, as none, while it takes
+/// every group's (`IPV6_MULTICAST_ALL`), as `inet6_mc_check` decides with no
+/// source filter.
+pub(crate) fn allows6(memberships: &[Membership6], all: bool, group: Ipv6Addr) -> bool {
+    all || memberships.iter().any(|m| m.group == group)
+}
+/// The scope of an IPv6 group (`IPV6_ADDR_MC_SCOPE`): 1 is the interface's
+/// own.
+pub(crate) fn scope6(group: Ipv6Addr) -> u8 {
+    group.octets()[1] & 0xf
 }
 
 impl Network {
@@ -209,13 +249,10 @@ impl Network {
         group: Ipv4Addr,
         now: Option<u64>,
     ) -> bool {
-        let rp_filter = {
-            let devices = self.devices();
-            let Some(device) = devices.by_index(index).filter(|d| d.groups4.has(group)) else {
-                return false;
-            };
-            device.conf4.rp_filter.max(devices.all4.rp_filter)
-        };
+        if !self.in_group4(index, group) {
+            return false;
+        }
+        let rp_filter = self.rp_filter(index);
         if src.is_multicast() || src.is_broadcast() || src.is_loopback() {
             return false;
         }
@@ -225,6 +262,133 @@ impl Network {
         self.addresses_at(now)
             .validate_source4_on(src, 0, 0, rp_filter, index)
             .is_ok()
+    }
+}
+impl Network {
+    /// Whether the device `index` is in the IPv6 group `group`
+    /// (`ipv6_chk_mcast_addr`): as one a socket joined, the all-nodes groups
+    /// every device with IPv6 is in (`ipv6_add_dev`), the solicited-node
+    /// group of an address of a veth end's (`addrconf_join_solict`), or the
+    /// all-routers groups of one that forwards (`dev_forward_change`).
+    pub(crate) fn in_group6(&self, index: i32, group: Ipv6Addr, now: Option<u64>) -> bool {
+        let (joined, veth, routes) = {
+            let devices = self.devices();
+            let Some(device) = devices.by_index(index) else {
+                return false;
+            };
+            (
+                device.groups6.has(group),
+                device.veth.is_some(),
+                device.conf6.forwarding != 0,
+            )
+        };
+        let first = group.segments()[0];
+        let nodes = |id: u16| group.segments() == [first, 0, 0, 0, 0, 0, 0, id];
+        joined
+            || nodes(1) && matches!(first, 0xff01 | 0xff02)
+            || veth && routes && nodes(2) && matches!(first, 0xff01 | 0xff02 | 0xff05)
+            || veth && self.addresses_at(now).solicits6(index, group)
+    }
+    /// Whether the device `index` has IPv6 at all (`in6_dev_get`): not a
+    /// veth end of an MTU below 1280.
+    fn has_ipv6(&self, index: i32) -> bool {
+        self.devices()
+            .by_index(index)
+            .is_some_and(|d| d.veth.as_ref().is_none_or(|v| v.mtu >= 1280))
+    }
+    /// Joins the IPv6 group `group` on the device `index`, or leaves it.
+    fn change_group6(&self, index: i32, group: Ipv6Addr, join: bool) {
+        if let Some(device) = self.devices().by_index_mut(index) {
+            if join {
+                device.groups6.join(group);
+            } else {
+                device.groups6.leave(group);
+            }
+        }
+    }
+    /// A socket of `memberships` joins the IPv6 group `asked`
+    /// (`__ipv6_sock_mc_join`): `EINVAL` for no group, `EADDRINUSE` as a
+    /// member there, or anywhere for no device named, `ENODEV` for none
+    /// there is or routes to the group, `EINVAL` for one without IPv6.
+    pub(crate) fn join6(
+        &self,
+        memberships: &mut Vec<Membership6>,
+        asked: Membership6,
+        now: Option<u64>,
+    ) -> Result<(), Errno> {
+        if !asked.group.is_multicast() {
+            return Err(Errno::EINVAL);
+        }
+        if memberships
+            .iter()
+            .any(|m| m.group == asked.group && (asked.index == 0 || m.index == asked.index))
+        {
+            return Err(EADDRINUSE);
+        }
+        let index = if asked.index != 0 {
+            self.has_device(asked.index).then_some(asked.index)
+        } else {
+            let route = self.addresses_at(now).lookup6(asked.group).ok();
+            route.and_then(|route| i32::try_from(route.oif).ok())
+        };
+        let index = index.ok_or(ENODEV)?;
+        if !self.has_ipv6(index) {
+            return Err(Errno::EINVAL);
+        }
+        memberships.insert(0, Membership6 { index, ..asked });
+        self.change_group6(index, asked.group, true);
+        Ok(())
+    }
+    /// A socket of `memberships` leaves the IPv6 group `asked`
+    /// (`ipv6_sock_mc_drop`), on the device it names or the newest there is:
+    /// `EINVAL` for no group, `EADDRNOTAVAIL` as no member.
+    pub(crate) fn leave6(
+        &self,
+        memberships: &mut Vec<Membership6>,
+        asked: Membership6,
+    ) -> Result<(), Errno> {
+        if !asked.group.is_multicast() {
+            return Err(Errno::EINVAL);
+        }
+        let at = memberships
+            .iter()
+            .position(|m| m.group == asked.group && (asked.index == 0 || m.index == asked.index))
+            .ok_or(EADDRNOTAVAIL)?;
+        let left = memberships.remove(at);
+        self.change_group6(left.index, left.group, false);
+        Ok(())
+    }
+    /// A socket of `memberships` that goes leaves them all
+    /// (`__ipv6_sock_mc_close`).
+    pub(crate) fn drop6(&self, memberships: &[Membership6]) {
+        for m in memberships {
+            self.change_group6(m.index, m.group, false);
+        }
+    }
+    /// Whether a packet from `src` to the IPv6 group `group` in through the
+    /// veth end `index` comes here: of a scope past the interface's and not
+    /// from a loopback address (`ip6_rcv_core`), where a multicast route
+    /// takes the group on that end (`ip6_route_input`) and the end is in it
+    /// (`ip6_mc_input`).
+    pub(crate) fn takes_group6(
+        &self,
+        index: i32,
+        src: Ipv6Addr,
+        group: Ipv6Addr,
+        now: Option<u64>,
+    ) -> bool {
+        if scope6(group) <= 1 || src.is_loopback() || src.is_multicast() {
+            return false;
+        }
+        let routed = self
+            .addresses_at(now)
+            .lookup6_flow(
+                group,
+                index.unsigned_abs(),
+                &crate::interface::Flow6::default(),
+            )
+            .is_ok_and(|route| route.kind == crate::interface::Kind::Multicast);
+        routed && self.has_ipv6(index) && self.in_group6(index, group, now)
     }
 }
 /// Whether `group` is one of the local network's, 224.0.0.0/24
@@ -312,6 +476,53 @@ mod tests {
         assert_eq!(network.join4(&mut mine, asked(1), None), Err(ENOBUFS));
         network.drop4(&mine);
         assert!(!network.in_group4(1, Ipv4Addr::new(239, 0, 0, 0)));
+    }
+
+    #[test]
+    fn ipv6_sockets_join_and_leave_on_lo() {
+        let network = Network::new(crate::inet::NetworkPolicy::default());
+        let nodes: Ipv6Addr = "ff02::1".parse().unwrap();
+        let asked = |group: &str, index| Membership6 {
+            group: group.parse().unwrap(),
+            index,
+        };
+        let mut mine = Vec::new();
+        assert!(network.in_group6(1, nodes, None));
+        // No member of a group the device is in.
+        assert_eq!(
+            network.leave6(&mut mine, asked("ff02::1", 1)),
+            Err(EADDRNOTAVAIL)
+        );
+        assert_eq!(network.join6(&mut mine, asked("ff02::1", 1), None), Ok(()));
+        assert_eq!(network.leave6(&mut mine, asked("ff02::1", 0)), Ok(()));
+        assert!(network.in_group6(1, nodes, None));
+        let group = asked("ff05::7", 1);
+        assert_eq!(network.join6(&mut mine, group, None), Ok(()));
+        for index in [0, 1] {
+            let again = Membership6 { index, ..group };
+            assert_eq!(network.join6(&mut mine, again, None), Err(EADDRINUSE));
+        }
+        assert_eq!(
+            network.join6(&mut mine, asked("ff05::7", 9), None),
+            Err(ENODEV)
+        );
+        assert_eq!(
+            network.join6(&mut mine, asked("::1", 1), None),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            network.leave6(&mut mine, asked("::1", 1)),
+            Err(Errno::EINVAL)
+        );
+        assert!(network.in_group6(1, group.group, None));
+        assert!(allows6(&mine, false, group.group) && !allows6(&mine, false, nodes));
+        network.drop6(&mine);
+        assert!(!network.in_group6(1, group.group, None));
+        // A loopback has no solicited-node nor all-routers group.
+        for other in ["ff02::2", "ff02::1:ff00:1", "ff05::1", "ff02::1:0:1"] {
+            assert!(!network.in_group6(1, other.parse().unwrap(), None));
+        }
+        assert_eq!(scope6("ff15::1".parse().unwrap()), 5);
     }
 
     #[test]

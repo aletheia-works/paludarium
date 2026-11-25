@@ -56,7 +56,7 @@ pub(super) struct Sent {
     /// The sending task's real user and group IDs: the receive runs in
     /// its context, in the softirq that the send raises.
     pub(super) ids: (u32, u32),
-    /// An IPv4 packet's time to live.
+    /// Its time to live, or hop limit.
     pub(super) ttl: u8,
 }
 
@@ -336,7 +336,7 @@ impl Sent {
         let mut h = label.to_be_bytes().to_vec();
         h[0] = 0x60;
         h.extend((len as u16).to_be_bytes());
-        h.extend([proto, HOPS]);
+        h.extend([proto, self.ttl]);
         h.extend(v6(self.from.ip()));
         h.extend(v6(self.to.ip()));
         h

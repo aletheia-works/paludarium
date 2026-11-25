@@ -216,8 +216,8 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    IPv6 multicast datagrams reach no one, nor do broadcast ones but through
-    a veth end (below). A datagram is always
+    Broadcast datagrams reach no one but through a veth end (below). A
+    datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
     `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer
@@ -1157,15 +1157,13 @@ verified.
   Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
   solicitation nor MLD report. Traffic through
   an end moves no counters; a namespace forwards nothing
-  on to another; and an IPv6 multicast destination through an end reaches
-  no one, as no socket joins such a group (`IPV6_ADD_MEMBERSHIP`). An IPv4
-  group is one of the guest's namespaces alone: the first has no device to
-  the host's network, so no route to one, and joining one there without
-  naming a device is `ENODEV`.
+  on to another. A multicast group is one of the guest's namespaces alone:
+  the first has no device to the host's network, so no route to one, and
+  joining one there without naming a device is `ENODEV`.
   No IGMP or MLD packet is sent: nothing in the guest would see one, as
   raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
-  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) are
-  `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
+  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) and
+  anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,
@@ -1223,7 +1221,9 @@ verified.
   the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
-  IPv6's `forwarding` joins no router multicast or anycast address, and a
+  IPv6's `forwarding` joins no router anycast address, and an end made
+  while `default`'s is on is in all three all-routers groups, where
+  Linux's is in ff02::2 alone; a
   write of `all`'s tells of the devices in the order of their indices,
   where Linux's goes in the order they came. A netconf notification gives
   the settings that have no file (proxy ARP and NDP, multicast and

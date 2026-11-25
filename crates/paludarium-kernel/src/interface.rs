@@ -4144,6 +4144,17 @@ impl Addresses {
     pub(crate) fn local4(&self, ip: Ipv4Addr) -> bool {
         self.tables4.contains(&TABLE_LOCAL) && self.addr_type4(ip, TABLE_LOCAL) == Kind::Local
     }
+    /// Whether `group` is the solicited-node group of an IPv6 address of the
+    /// device `index` (`addrconf_addr_solict_mult`).
+    pub(crate) fn solicits6(&self, index: i32, group: Ipv6Addr) -> bool {
+        const PREFIX: [u8; 13] = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff];
+        let group = group.octets();
+        group[..13] == PREFIX
+            && self
+                .v6
+                .iter()
+                .any(|a| a.index == index && a.address.octets()[13..] == group[13..])
+    }
     /// Whether `ip` is an IPv6 address of this namespace's, and not
     /// tentative: one that `ipv6_chk_addr` finds, banning
     /// `IFA_F_TENTATIVE`, as a bind (`__inet6_bind`) and a packet's

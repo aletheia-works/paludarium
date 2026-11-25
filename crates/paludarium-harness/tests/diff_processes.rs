@@ -426,6 +426,7 @@ mod linux {
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-multicast"
+                    | "veth-ipv6-multicast"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -673,6 +674,7 @@ mod linux {
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_multicast => ("veth-multicast","veth-multicast"),
+        veth_ipv6_multicast => ("veth-ipv6-multicast","veth-ipv6-multicast"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),

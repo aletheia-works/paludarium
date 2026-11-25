@@ -4538,7 +4538,7 @@ struct Input {
     /// The device it comes in on (`RTA_IIF`), `lo` or a veth end, and
     /// the IPv4 groups it has joined.
     iif: i32,
-    groups4: crate::multicast::Groups,
+    groups4: crate::multicast::Groups<core::net::Ipv4Addr>,
     /// That device's `forwarding` (`IN_DEV_FORWARD`), and the reverse path
     /// filtering that counts, `all`'s or the device's, the larger
     /// (`IN_DEV_RPFILTER`), as `/proc/sys/net` sets them.

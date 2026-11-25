@@ -1073,8 +1073,11 @@ impl Ports {
     /// them (`__udp_is_mcast_sock`): of `to`'s port, bound to the
     /// unspecified address or to `to`, connected to none or to `from`,
     /// and not `IPV6_V6ONLY`, bound to no device or to `dif`, which it
-    /// comes in on. A connected one bound to the unspecified address has
-    /// taken its route's source by then, so takes none.
+    /// comes in on; an IPv6 datagram also passes only one whose kept
+    /// address of an old peer ([`Binding::old_peer`]) is `from`'s, as
+    /// `__udp_v6_is_mcast_sock` checks `sk_v6_daddr`. A connected one bound
+    /// to the unspecified address has taken its route's source by then, so
+    /// takes none.
     pub(crate) fn broadcast_receivers(
         &mut self,
         to: SocketAddr,
@@ -1090,6 +1093,10 @@ impl Ports {
                     && binding.carries(ip)
                     && (binding.address.ip().is_unspecified() || binding.address.ip() == ip)
                     && binding.peer.is_none_or(|peer| peer == from)
+                    && match (binding.peer, binding.old_peer, from.ip()) {
+                        (None, Some(old), IpAddr::V6(_)) => old == from.ip(),
+                        _ => true,
+                    }
                     && (binding.device == 0 || binding.device == dif)
             })
             .filter_map(|binding| binding.owner.upgrade())

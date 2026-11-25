@@ -3041,9 +3041,28 @@ kernel.
     namespace takes it where its end is in the group
     (`ip_route_input_mc`); and through `lo` it comes back where `lo` is.
     There it reaches each UDP socket of its port that a broadcast would,
-    and that is a member on that device or has `IP_MULTICAST_ALL` on
-    (`ip_mc_sf_allow`). An accepted connection's `IP_MULTICAST_TTL` is 64
+    and that is a member on that device or has `IP_MULTICAST_ALL` on, as
+    an IPv4 one begins with and an IPv6 one does not (`ip_mc_sf_allow`,
+    `inet6_create`). An accepted connection's `IP_MULTICAST_TTL` is 64
     (`tcp_v4_syn_recv_sock`).
+  - **IPv6 multicast groups:** an IPv6 UDP socket joins and leaves a group
+    with `IPV6_ADD_MEMBERSHIP` and `IPV6_DROP_MEMBERSHIP`, on the device of
+    an index or that of the route to it (0): `EINVAL` for no group or a
+    device without IPv6, `ENODEV` for none, `EADDRINUSE` as a member there
+    (anywhere, for 0), `EADDRNOTAVAIL` to leave as none, and `EPROTO` of
+    TCP (`__ipv6_sock_mc_join`, `ipv6_sock_mc_drop`). Every device is in
+    ff01::1 and ff02::1, a veth end in the solicited-node groups of its
+    addresses, and one that forwards in ff01::2, ff02::2 and ff05::2. A
+    datagram to a group comes back where its device is in the group,
+    unless `IPV6_MULTICAST_LOOP` is off, and then with an
+    `IPV6_MULTICAST_HOPS` of 0 goes no further; one to a group of the
+    interface's scope (ff01::/16) never does (`ip6_finish_output2`).
+    Across the pair it comes where the end is in the group
+    (`ip6_mc_input`). There it reaches each IPv6 UDP socket of its port
+    bound to `::` or the group, not to another device, and connected to
+    none or its sender, that is a member of the group, on whatever device,
+    or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
+    connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
   - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
     unicast one, or the multicast `ff00::/8`) goes out through an end
     leaves from the route's preferred source, or the address
@@ -3060,8 +3079,8 @@ kernel.
     does, with ICMPv6's port unreachable and address unreachable
     (`EHOSTUNREACH`, 3 seconds on), but without reverse path filtering;
     and one from `::1` goes out, to be dropped there. A datagram holds
-    65527 bytes at most (`EMSGSIZE`), TCP takes no group (`ENETUNREACH`),
-    and a datagram to one reaches no one.
+    65527 bytes at most (`EMSGSIZE`), and TCP takes no group
+    (`ENETUNREACH`).
   - **IPv6 of veth ends:** an end up with its carrier is made ready as
     `addrconf_dev_config` does, once until it goes down: the multicast
     route `ff00::/8` (local table, metric 256), then the prefix route
@@ -6604,7 +6623,8 @@ one only with an `--allow-net`.
   `AF_UNSPEC` disconnects it, keeping only the port and address the guest
   bound itself, and no device (`__udp_disconnect`). An IPv6 socket keeps its
   peer's address too (`sk_v6_daddr`), which `sock_diag` tells with port 0: it
-  takes an IPv6 datagram from that address alone, and any IPv4 one, until it
+  takes an IPv6 datagram from that address alone, one to a group too
+  (`__udp_v6_is_mcast_sock`), and any IPv4 one, until it
   connects again. A datagram holds up to 65507 bytes over IPv4 and 65527 over
   IPv6 (`EMSGSIZE`), may be empty, and is cut to the reader's buffer
   (`MSG_TRUNC`); `FIONREAD` gives the first one's length. Each takes of the

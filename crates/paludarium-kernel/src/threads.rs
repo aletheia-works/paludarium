@@ -2434,8 +2434,9 @@ impl Kernel {
             return;
         };
         self.processes.set_dumped(pid);
+        let root = self.files.root();
         let write = || {
-            crate::coredump::write(dump, &identity, mem, &mut |piece| {
+            crate::coredump::write(dump, &identity, mem, &root, &mut |piece| {
                 let mut at = 0;
                 while at < piece.len() {
                     match file.write(&piece[at..]) {

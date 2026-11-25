@@ -2661,6 +2661,144 @@ fn a_moved_mapping_of_a_huge_file_goes_at_its_offset_past_a_boundary() {
     assert_eq!(grown.0 % HUGE, PAGE_SIZE);
 }
 
+/// The VMAs of `mem` in `[start, end)`, as pages from `start`.
+fn vmas(mem: &AddressSpace, start: u64, end: u64) -> Vec<(u64, u64)> {
+    let view = mem.view();
+    let mut found = Vec::new();
+    let mut at = start;
+    while let Some(vma) = view.vma_from(at).filter(|v| v.start < end) {
+        found.push((
+            vma.start.saturating_sub(start) / PAGE_SIZE,
+            (vma.end.min(end) - start) / PAGE_SIZE,
+        ));
+        at = vma.end;
+    }
+    found
+}
+/// Private anonymous memory at `at`, of `pages` pages.
+fn private(mem: &mut AddressSpace, at: u64, pages: u64) {
+    mem.map(
+        Some(GuestAddr(at)),
+        pages * PAGE_SIZE,
+        Prot::READ_WRITE,
+        MappingKind::Anonymous,
+    )
+    .unwrap();
+    mem.mapped(GuestAddr(at), at + pages * PAGE_SIZE);
+}
+/// Locks, or unlocks, the page at `at`, populating a locked one.
+fn lock_page(mem: &mut AddressSpace, at: u64, lock: bool) {
+    let held = lock.then_some(Lock::Populated);
+    mem.lock(GuestAddr(at), at + PAGE_SIZE, held).unwrap();
+    if lock {
+        mem.mark_written(GuestAddr(at), PAGE_SIZE);
+    }
+}
+
+#[test]
+fn a_page_written_while_apart_merges_with_neighbours_that_were_not() {
+    let mut mem = AddressSpace::new();
+    let at = 0x10_0000;
+    private(&mut mem, at, 4);
+    lock_page(&mut mem, at + 2 * PAGE_SIZE, true);
+    let end = at + 4 * PAGE_SIZE;
+    assert_eq!(vmas(&mem, at, end), [(0, 2), (2, 3), (3, 4)]);
+    lock_page(&mut mem, at + 2 * PAGE_SIZE, false);
+    assert_eq!(vmas(&mem, at, end), [(0, 4)]);
+    // Now of one VMA, all of it has that VMA's `anon_vma`.
+    assert!(mem.mappings().all(|m| m.anon_vma.is_some()));
+}
+
+#[test]
+fn vmas_of_two_anon_vmas_stay_apart_and_one_of_none_goes_with_the_first() {
+    let mut mem = AddressSpace::new();
+    let at = 0x10_0000;
+    let end = at + 4 * PAGE_SIZE;
+    private(&mut mem, at, 4);
+    // Page 2 is written apart, then page 0: two `anon_vma`s, as a locked
+    // page's VMA shares none with an unlocked one.
+    lock_page(&mut mem, at + 2 * PAGE_SIZE, true);
+    mem.write_u64(GuestAddr(at), 1).unwrap();
+    lock_page(&mut mem, at + 2 * PAGE_SIZE, false);
+    assert_eq!(vmas(&mem, at, end), [(0, 2), (2, 4)]);
+
+    // Between two of them, one of none merges with the one before it.
+    let mut mem = AddressSpace::new();
+    private(&mut mem, at, 3);
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    mem.lock(page(1), at + 2 * PAGE_SIZE, Some(Lock::OnFault))
+        .unwrap();
+    mem.write_u64(page(0), 1).unwrap();
+    mem.write_u64(page(2), 1).unwrap();
+    mem.lock(page(1), at + 2 * PAGE_SIZE, None).unwrap();
+    assert_eq!(vmas(&mem, at, at + 3 * PAGE_SIZE), [(0, 2), (2, 3)]);
+}
+
+#[test]
+fn a_vma_takes_the_anon_vma_of_a_neighbour_that_differs_in_protection_alone() {
+    let mut mem = AddressSpace::new();
+    let at = 0x10_0000;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    private(&mut mem, at, 3);
+    mem.protect(page(1), PAGE_SIZE, Prot::READ_WRITE.union(Prot::EXEC))
+        .unwrap();
+    mem.write_u64(page(2), 1).unwrap();
+    mem.write_u64(page(0), 1).unwrap();
+    // Page 1 takes the one after it, which page 0 could not take.
+    mem.write_u64(page(1), 1).unwrap();
+    let held: Vec<_> = mem.mappings().map(|m| m.anon_vma.unwrap()).collect();
+    assert_eq!(held[1], held[2]);
+    assert_ne!(held[0], held[1]);
+    mem.protect(page(1), PAGE_SIZE, Prot::READ_WRITE).unwrap();
+    assert_eq!(vmas(&mem, at, at + 3 * PAGE_SIZE), [(0, 1), (1, 3)]);
+}
+
+#[test]
+fn a_forked_child_s_vmas_have_anon_vmas_of_their_own() {
+    let mut mem = AddressSpace::new();
+    let at = 0x10_0000;
+    let end = at + 4 * PAGE_SIZE;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    private(&mut mem, at, 4);
+    // One `anon_vma` for all four, then three VMAs of it.
+    mem.write_u64(page(0), 1).unwrap();
+    mem.protect(page(2), PAGE_SIZE, Prot::READ).unwrap();
+    let mut child = mem.fork().unwrap();
+    mem.protect(page(2), PAGE_SIZE, Prot::READ_WRITE).unwrap();
+    assert_eq!(vmas(&mem, at, end), [(0, 4)]);
+    child.protect(page(2), PAGE_SIZE, Prot::READ_WRITE).unwrap();
+    assert_eq!(vmas(&child, at, end), [(0, 2), (2, 3), (3, 4)]);
+    // Nor does new memory merge with one that came by fork.
+    private(&mut child, end, 1);
+    assert_eq!(vmas(&child, at, end + PAGE_SIZE).len(), 4);
+    private(&mut mem, end, 1);
+    assert_eq!(vmas(&mem, at, end + PAGE_SIZE), [(0, 5)]);
+}
+
+#[test]
+fn memory_moved_once_written_keeps_its_page_offset() {
+    let at = 0x10_0000;
+    let to = 0x20_0000;
+    for written in [false, true] {
+        let mut mem = AddressSpace::new();
+        private(&mut mem, to, 1);
+        private(&mut mem, at, 1);
+        if written {
+            mem.write_u64(GuestAddr(at), 1).unwrap();
+        }
+        let how = Remap {
+            may_move: true,
+            fixed: true,
+            keep_old: false,
+            new_addr: GuestAddr(to + PAGE_SIZE),
+        };
+        mem.remap_shared(GuestAddr(at), PAGE_SIZE, PAGE_SIZE, how)
+            .unwrap();
+        let merged = vmas(&mem, to, to + 2 * PAGE_SIZE).len() == 1;
+        assert_eq!(merged, !written);
+    }
+}
+
 #[test]
 fn a_low_placement_stays_in_the_first_2_gib_in_either_layout() {
     const HUGE: u64 = 2 << 20;

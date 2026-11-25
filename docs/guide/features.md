@@ -1847,11 +1847,12 @@ kernel.
   - A read that chose a provided buffer keeps it while it waits
     (`REQ_F_BUFFER_SELECTED`). A ring's buffer stays at the ring's head and
     is chosen again as the read goes on.
-  - A request that waits keeps the file it found (`req->file`), and goes on
-    with it though its descriptor is closed or its slot is updated
-    meanwhile. A registered file that an update takes from its slot while
-    such a request holds it posts its tag once that request completes, after
-    its completion (`io_put_rsrc_node`).
+  - A request that waits keeps the file it found and its registered buffer
+    (`req->file`, `req->buf_node`), and goes on with them though its
+    descriptor is closed or its slots are updated meanwhile. A registered
+    file or buffer that an update takes from its slot while such a request
+    holds it posts its tag once that request completes, after its
+    completion (`io_put_rsrc_node`).
 
 - `IORING_OP_ASYNC_CANCEL` and `IORING_REGISTER_SYNC_CANCEL` cancel the
   requests of their ring that wait for their files, as Linux master's
@@ -1887,7 +1888,11 @@ kernel.
     stay in the file. Task work the thread still has as it exits runs so
     too: a request whose file became ready fails with `ECANCELED`, a
     link's next request with `EFAULT` (`io_should_terminate_tw`), and an
-    `IORING_NOP_TW` completes.
+    `IORING_NOP_TW` completes. Work that comes for a thread that is gone
+    while another thread holds the ring waits for that thread, and no other
+    call waits for it, as Linux's worker alone waits for `uring_lock`. A
+    ring that closes first drops it, with the files its requests hold,
+    where Linux runs it as cancelled, which no one can see.
   - `execve` cancels every request the thread submitted that waits for its
     file, one whose file became ready too (`io_uring_task_cancel`), on the
     old image's memory, as `io_uring_cancel_generic` loops. The task work of
@@ -1969,7 +1974,25 @@ kernel.
   registering process's pages; `fork` gives the child a copy of a pinned
   private page, so the parent's later writes are what the ring moves
   (`page_needs_cow_for_dma`). `IORING_UNREGISTER_BUFFERS` takes no
-  argument (`EINVAL`) and needs buffers (`ENXIO`). `IORING_OP_READ_FIXED` and
+  argument (`EINVAL`) and needs buffers (`ENXIO`).
+
+  `IORING_REGISTER_BUFFERS2` registers them with tags, as Linux 7.0's
+  `io_register_rsrc` does. Its `struct io_uring_rsrc_register` must be
+  whole (`EINVAL`), with a count, no reserved field and no flag but
+  `IORING_RSRC_REGISTER_SPARSE`, which takes no `iovec`s and leaves every
+  slot empty. Each slot's tag is read after its `iovec` (`EFAULT`), and an
+  empty slot may have none (`EINVAL`). `IORING_REGISTER_BUFFERS_UPDATE`
+  (`io_register_rsrc_update`) puts new buffers, or none, in a run of
+  slots: a whole `struct io_uring_rsrc_update2` with a count and no
+  reserved field (`EINVAL`), an offset and count that do not wrap
+  (`EOVERFLOW`), buffers (`ENXIO`) and slots that are there (`EINVAL`).
+  It gives how many slots it updated, or the first slot's error. A buffer
+  that leaves its slot, by an update or as the buffers are unregistered
+  (the last slot first), posts its tag, if not 0, as the `user_data` of a
+  completion of 0 once nothing holds it, and gives its RLIMIT_MEMLOCK
+  pages back. A fixed transfer, or a NOP with `IORING_NOP_FIXED_BUFFER`,
+  holds its buffer until its completion is posted. A failed registration
+  posts no tag. `IORING_OP_READ_FIXED` and
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
 
@@ -2952,6 +2975,26 @@ kernel.
     limited broadcast address from a socket bound to an end's address
     needs no route: it goes out through that end
     (`ip_route_output_key_hash_rcu`).
+  - **IPv4 multicast groups:** a UDP socket joins and leaves a group with
+    `IP_ADD_MEMBERSHIP` and `IP_DROP_MEMBERSHIP` (`ip_mreqn` or `ip_mreq`),
+    on the device of an index, of an address, or of the route to the group
+    (`ENODEV` for none): `EINVAL` for no group, `EADDRINUSE` as a member
+    there, `ENOBUFS` past 20, `EADDRNOTAVAIL` to leave as none, and
+    `EPROTO` of TCP (`__ip_mc_join_group`, `ip_mc_leave_group`); closing it
+    leaves all. A device is in a group while a socket of its namespace is
+    a member there, and in 224.0.0.1 while it is up. A datagram to a group
+    goes out through the socket's device, else `IP_MULTICAST_IF`'s, else
+    that of the source's address, else the route's, from the socket's
+    address, else `IP_MULTICAST_IF`'s. Where the device is in the group it
+    comes back too, unless `IP_MULTICAST_LOOP` is off (which an IPv6
+    socket's send does not heed), and goes no further with an
+    `IP_MULTICAST_TTL` of 0 (`ip_mc_output`); across the pair, the peer's
+    namespace takes it where its end is in the group
+    (`ip_route_input_mc`); and through `lo` it comes back where `lo` is.
+    There it reaches each UDP socket of its port that a broadcast would,
+    and that is a member on that device or has `IP_MULTICAST_ALL` on
+    (`ip_mc_sf_allow`). An accepted connection's `IP_MULTICAST_TTL` is 64
+    (`tcp_v4_syn_recv_sock`).
   - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
     unicast one, or the multicast `ff00::/8`) goes out through an end
     leaves from the route's preferred source, or the address
@@ -3241,8 +3284,8 @@ kernel.
     the route that matched. An IPv4 answer for a multicast or the limited
     broadcast address is of the multicast or broadcast type, as
     `__mkroute_output` makes it (`RTCF_MULTICAST` or `RTCF_BROADCAST`, and
-    `RTCF_LOCAL` for the broadcast address and a group `lo` is a member
-    of, 224.0.0.1 while it is up), and with `RTM_F_FIB_MATCH` the table's
+    `RTCF_LOCAL` for the broadcast address and a group the device is in),
+    and with `RTM_F_FIB_MATCH` the table's
     entry takes that type too; from a source of the loopback's and no
     device, and through `lo` to a local group (224.0.0.0/24) or the
     broadcast address, it is made with no table looked in (of TOS 0 and no
@@ -3258,7 +3301,7 @@ kernel.
     the device as `RTA_IIF`. IPv4 drops martians
     (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
     source, a loopback or 0.0.0.0 destination, a group the device has not
-    joined (224.0.0.1 is joined while it is up), and a source of the namespace's own, or with a local route a
+    joined, and a source of the namespace's own, or with a local route a
     request added, one a lookup finds a route to that is not unicast
     (`fib_validate_source`). A local, broadcast or multicast destination
     gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,
@@ -3743,6 +3786,21 @@ kernel.
   `mseal` or the like of a part of one that would split it is `EINVAL`. `statm` and `VmSize` count the
   three, a `fork` keeps them where they are, and a core holds them whole,
   as Linux's `always_dump_vma` dumps a special mapping.
+
+- The `vsyscall` page is Linux's default (`CONFIG_LEGACY_VSYSCALL_XONLY`):
+  a gate area at `ffffffffff600000`, no mapping of the process, which is the
+  last line of `maps` and `smaps` (`--xp`, `VmFlags: ex`) and the last
+  segment of a core (zeros), and which `statm`, `VmSize` and `smaps_rollup`
+  leave out. It can be run but not read (`SIGSEGV`, `SEGV_MAPERR`). Its
+  entries `+0x000` (`gettimeofday`), `+0x400` (`time`) and `+0x800`
+  (`getcpu`) do what `emulate_vsyscall` does: seccomp sees the call with the
+  entry's address, and a tracer its `PTRACE_EVENT_SECCOMP`, but no system
+  call's stop is made; then the result is in `rax` and the thread at its
+  caller, with no other register changed. Any other address there, a stack
+  that cannot be read and a pointer the call cannot write are `SIGSEGV` from
+  the kernel (`SI_KERNEL`); a pointer past user space is `SEGV_MAPERR` at
+  it. Reads from outside give `EFAULT` (`process_vm_readv`) and `EIO`
+  (`/proc/<pid>/mem`, `PTRACE_PEEKDATA`).
 
 - Files are checked as Linux checks them (`generic_permission`): the
   owner's permission bits apply to the owner, the group's to a member of the
@@ -4478,14 +4536,25 @@ kernel.
   `/proc/self/exe` names the program, as Linux's `d_path` of the file:
   by its path with symbolic links resolved, moved by renames, and
   `(deleted)` once that name is removed. A core's `NT_FILE` note names
-  them all the same way.
+  them all the same way. A rename moves a name whichever root (`chroot`) it
+  is made under, and a name under the reader's root, or the dumping
+  process's, is shown from it, as `d_path` shows it.
   It is made as it is read, as Linux's `seq_file` makes it: a read gathers
   whole lines up to a page, goes on from the VMA it found next, and sees the
   mappings of that moment, `lseek` goes from the start or the current
   position only (`EINVAL` from the end), and its size is 0. A descriptor
   shows the address space it was opened on, which a forked child reading it
   sees too, and nothing once no thread uses that space, as after an `execve`.
-  It cannot be mapped (`ENODEV`).
+  It cannot be mapped (`ENODEV`). Its lines are Linux's VMAs, merged as
+  `is_mergeable_anon_vma` and `can_vma_merge_right` merge them: two that
+  differ in nothing else are one only if their private memory has one
+  `anon_vma`, or one of them none. A VMA takes an `anon_vma` at its first
+  write (`mlock`'s faults included): that of the VMA after it, or else of
+  the one before it, if they differ in no more than protection, name and
+  which `userfaultfd` they are registered with, or else one of its own. A
+  `fork`ed child's VMAs each have one of their own, which none without one
+  merges with; and anonymous memory that `mremap` moves once written keeps
+  its page offset (`vm_pgoff`), so it merges with nothing there.
 
 - `/proc/self/smaps` follows each line of `maps` with Linux's `show_smap`
   block, read as `maps` is: the size, what the pages hold (`Rss`, `Pss`,
@@ -6131,15 +6200,16 @@ kernel.
     (`NT_FILE`:
     each VMA that maps a file, where renames have moved it, followed by
     `(deleted)` once the name it has is removed, as in `/proc/<pid>/maps`,
-    and shared anonymous memory as `/dev/zero (deleted)`, as Linux
-    names it) and the memory. It has no `NT_X86_XSTATE` note, as Linux writes
-    none on a CPU without XSAVE, which the virtual CPU is. The memory is
+    from the process's root when it is under it, and shared anonymous
+    memory as `/dev/zero (deleted)`, as Linux names it) and the memory. It
+    has no `NT_X86_XSTATE` note, as Linux writes none on a CPU without XSAVE, which the virtual CPU is. The memory is
     chosen as Linux's `vma_dump_size` chooses it with the default
     `coredump_filter`: a private mapping is there whole once a page of its VMA
-    was written (Linux's `anon_vma`, which a split, `MADV_DONTNEED` and `fork`
-    keep, a mapping merging with the VMA shares, and bringing a writable one's
-    pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault), and nothing of it otherwise, but the
-    first page of a file mapping from the start of an ELF file; a shared
+    was written (Linux's `anon_vma`, which a split and `MADV_DONTNEED` keep,
+    a mapping merging with the VMA shares, and bringing a writable one's
+    pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault;
+    a `fork`ed child's VMAs each get their own), and nothing of it otherwise,
+    but the first page of a file mapping from the start of an ELF file; a shared
     mapping is there whole when no name links its file (an anonymous one, a
     memfd, a file unlinked since), and nothing of it otherwise. Whether a
     mapping can be read matters only for that ELF header's page: Linux reads

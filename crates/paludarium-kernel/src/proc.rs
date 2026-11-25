@@ -1409,6 +1409,7 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
             }
             None => b"/dev/zero (deleted)",
         },
+        None if vma.start == crate::vsyscall::START => b"[vsyscall]",
         None if vma.heap => b"[heap]",
         None if vma.start <= start_stack && vma.end >= start_stack => b"[stack]",
         None => match &vma.anon_name {
@@ -1600,10 +1601,16 @@ impl crate::seq::Records for Maps {
         if self.kind == MapsKind::Rollup {
             return Ok((next == 0).then(|| (rollup_lines(&self.memory), MAPS_END)));
         }
-        let Some(vma) = self.memory.vma_from(next) else {
-            return Ok(None);
+        // The gate area comes after the last VMA, while there is a space
+        // (`proc_get_vma`).
+        let (vma, after) = match self.memory.vma_from(next) {
+            Some(vma) => {
+                let after = self.memory.vma_from(vma.end);
+                (vma, after.map_or(crate::vsyscall::START, |v| v.start))
+            }
+            None if self.memory.mappings().is_some() => (crate::vsyscall::vma(), MAPS_END),
+            None => return Ok(None),
         };
-        let after = self.memory.vma_from(vma.end).map_or(MAPS_END, |v| v.start);
         let mut line = map_line(&vma, self.start_stack, &self.root);
         if self.kind == MapsKind::Smaps {
             let usage = self.memory.usage(vma.start, vma.end).unwrap_or_default();
@@ -2095,8 +2102,10 @@ mod tests {
             format!(
                 "00001000-00002000 r--p 00000000 00:00 0 \n\
                  00005000-00007000 rw-p 00000000 00:00 0 \n\
-                 7fff0000-7fff1000 rw-p 00000000 00:00 0 {}[stack]\n",
-                " ".repeat(MAPS_NAME_COLUMN - 40 + 1)
+                 7fff0000-7fff1000 rw-p 00000000 00:00 0 {}[stack]\n\
+                 ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 {}[vsyscall]\n",
+                " ".repeat(MAPS_NAME_COLUMN - 40 + 1),
+                " ".repeat(MAPS_NAME_COLUMN - 56 + 1)
             )
         );
     }
@@ -2391,7 +2400,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert_eq!(blocks.len(), 4, "{text}");
+        assert_eq!(blocks.len(), 5, "{text}");
         // The locked page is a VMA of its own, and all of it is locked.
         assert!(text.contains("00007000-00008000 rw-p"), "{text}");
         assert!(
@@ -2403,7 +2412,11 @@ mod tests {
             "{text}"
         );
         // The initial stack is not soft-dirty.
-        assert!(text.ends_with("VmFlags: rd wr mr mw me gd ac \n"), "{text}");
+        assert!(text.contains("VmFlags: rd wr mr mw me gd ac \n"), "{text}");
+        // The gate area, of no pages, comes last.
+        assert!(blocks[3].contains("[vsyscall]\nSize:                  4 kB\n"));
+        assert!(blocks[3].contains("Rss:                   0 kB\n"));
+        assert!(text.ends_with("VmFlags: ex \n"), "{text}");
     }
 
     #[test]
@@ -2578,11 +2591,11 @@ mod tests {
         map(0x40000);
         let lines = String::from_utf8(read_all(&file, 7)).unwrap();
         let starts: Vec<&str> = lines.lines().map(|line| &line[..8]).collect();
-        assert_eq!(starts[1..], ["00030000", "00040000"], "{lines}");
+        assert_eq!(starts[1..], ["00030000", "00040000", "ffffffff"], "{lines}");
         // Going back reads them all.
         assert_eq!(file.seek(0, 0).unwrap(), 0);
         let all = read_all(&file, 4096);
-        assert_eq!(String::from_utf8_lossy(&all).lines().count(), 4);
+        assert_eq!(String::from_utf8_lossy(&all).lines().count(), 5);
         assert_eq!(&all[..10], &buf);
     }
 
@@ -2607,7 +2620,8 @@ mod tests {
             Owner::default(),
         );
         let whole = read_all(&file, 1 << 16);
-        assert_eq!(whole.len(), 200 * 41);
+        // And the gate area's line.
+        assert_eq!(whole.len(), 200 * 41 + MAPS_NAME_COLUMN + 12);
         file.seek(0, 0).unwrap();
         let mut big = vec![0; 1 << 16];
         let first = file.read(&mut big).unwrap();

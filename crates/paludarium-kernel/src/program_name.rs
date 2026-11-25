@@ -45,7 +45,7 @@ impl ProgramName {
         let place = fs.metadata(&path, false).ok().map(|stat| {
             files
                 .caches
-                .keep_place((fs.device(&path), stat.inode), &path)
+                .keep_place(&fs, (fs.device(&path), stat.inode), &path)
         });
         let file =
             crate::inotify::unnoticed(|| crate::page_cache::nonotify(0, || fs.open(&path, 0, 0)))

@@ -107,10 +107,17 @@ pub struct Mapping {
     pub length: u64,
     pub prot: Prot,
     pub kind: MappingKind,
-    /// A page of it was written, or of the Linux VMA it was part of then:
-    /// Linux's `anon_vma`, which the VMA keeps through splits, `fork` and
-    /// `mremap`, and which a core dump writes a private mapping whole for.
-    pub written: bool,
+    /// Linux's `anon_vma`, which the Linux VMA it was part of was given when
+    /// a page of it was first written: it keeps it through splits and
+    /// `mremap`, and one of its own replaces it in a `fork`ed child. VMAs of
+    /// two do not merge, and a core dump writes a private mapping whole for
+    /// it.
+    pub anon_vma: Option<AnonVma>,
+    /// How far, with wrapping, the page offset Linux gives private
+    /// anonymous memory (`vm_pgoff`, where it was first) is from its
+    /// address: what `mremap` moved it by once it had an `anon_vma`. VMAs
+    /// merge only where it is the same.
+    pub moved: u64,
     /// `mseal` sealed it (Linux's `VM_SEALED`): it is not unmapped, moved,
     /// resized or given another protection (EPERM), and its anonymous
     /// read-only pages are not discarded.
@@ -166,6 +173,36 @@ pub struct Mapping {
     /// (Linux's `anon_vma_name`), which `/proc/<pid>/maps` shows as
     /// `[anon:<name>]` and which splits, `fork` and `mremap` keep.
     pub anon_name: Option<AnonName>,
+}
+
+/// The `anon_vma` of a Linux VMA ([`Mapping::anon_vma`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnonVma {
+    id: u64,
+    /// The VMA came by `fork` (`vma_is_fork_child`: its `anon_vma_chain`
+    /// also has its parent's), or was split from one that did: it does not
+    /// merge with one that has no `anon_vma`, and gives its own to none.
+    forked: bool,
+}
+
+impl AnonVma {
+    /// One no VMA of any address space has.
+    fn fresh(forked: bool) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        AnonVma {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            forked,
+        }
+    }
+    /// Linux v7.0's `is_mergeable_anon_vma` of two VMAs: those of one, of
+    /// none, or of one and none unless the one came by `fork`.
+    fn mergeable(a: Option<Self>, b: Option<Self>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(one), None) | (None, Some(one)) => !one.forked,
+            (Some(a), Some(b)) => a.id == b.id,
+        }
+    }
 }
 
 /// A name `prctl(PR_SET_VMA_ANON_NAME)` gave anonymous memory
@@ -875,7 +912,7 @@ pub enum PageState {
 /// ([`AddressSpace::core_state`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreState {
-    /// A page of the VMA was written ([`Mapping::written`]).
+    /// A page of the VMA was written ([`Mapping::anon_vma`]).
     pub written: bool,
     /// The VMA is a shared mapping.
     pub shared: bool,
@@ -3654,7 +3691,7 @@ impl AddressSpaceData {
     /// frame of its own is anonymous, and dirty, as Linux's is once written;
     /// a loaded program's segment, whose frames hold what was read from its
     /// file, counts its pages so once the segment was written
-    /// ([`Mapping::written`]). The page cache's pages are dirty when a store
+    /// ([`Mapping::anon_vma`]). The page cache's pages are dirty when a store
     /// changed them since they were written back. A page that more than one
     /// entry maps ([`FrameCell::maps`]) is shared, and counts in `pss` for
     /// its share, as `smaps_account` takes the precise map count.
@@ -3680,7 +3717,7 @@ impl AddressSpaceData {
                 if bytes.is_none() && !entry.file && !shared {
                     continue;
                 }
-                let written = self.mapping_at(page).is_some_and(|m| m.written);
+                let written = self.mapping_at(page).is_some_and(|m| m.anon_vma.is_some());
                 let anonymous = !shared && !entry.cache && (!entry.file || written);
                 let dirty =
                     anonymous || (shared && bytes.is_some_and(|b| b.dirty.load(Ordering::Acquire)));
@@ -3786,7 +3823,7 @@ impl AddressSpaceData {
         if pte.frame.get().is_none() && !pte.file && !shared {
             return (entry, true);
         }
-        if shared || pte.cache || (pte.file && !mapping.written) {
+        if shared || pte.cache || (pte.file && mapping.anon_vma.is_none()) {
             entry |= pagemap::FILE;
         }
         if pte.frame.maps() == 1 {
@@ -4215,6 +4252,7 @@ impl AddressSpaceData {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner) = directory;
         copy.drop_refaultable_pages();
+        copy.fork_anon_vmas();
         copy.resident = AtomicU64::new(copy.resident_walk());
         // A child's VMAs are not locked (`dup_mmap` clears `VMA_LOCKED_MASK`).
         // Nor registered with a `userfaultfd` (`dup_userfaultfd`), unless it
@@ -4248,7 +4286,7 @@ impl AddressSpaceData {
                 copy.poisons.clear(m.start.0, m.end());
                 copy.bump_code_generation();
                 if let Some(child) = copy.mappings.get_mut(&m.start.0) {
-                    child.written = false;
+                    child.anon_vma = None;
                 }
             }
         }
@@ -4266,9 +4304,28 @@ impl AddressSpaceData {
         self.code.generation.fetch_add(1, Ordering::Release);
     }
 
+    /// Gives each Linux VMA of a forked child that has an `anon_vma` one of
+    /// its own (`anon_vma_fork`), which the VMAs that shared one in the
+    /// parent do not share.
+    fn fork_anon_vmas(&mut self) {
+        let mut at = self.mappings.keys().next().copied();
+        while let Some(start) = at {
+            let Some((first, last)) = self.region_at(start) else {
+                break;
+            };
+            let mut own = None;
+            for (_, m) in self.mappings.range_mut(first..last) {
+                if m.anon_vma.is_some() {
+                    m.anon_vma = Some(*own.get_or_insert_with(|| AnonVma::fresh(true)));
+                }
+            }
+            at = self.mappings.range(last..).next().map(|(&s, _)| s);
+        }
+    }
+
     /// Drops the page entries of a forked child that Linux's `fork` does not
     /// copy (`vma_needs_copy`): those of a VMA with no `anon_vma`
-    /// ([`Mapping::written`]), no guards (`VM_MAYBE_GUARD`) and no
+    /// ([`Mapping::anon_vma`]), no guards (`VM_MAYBE_GUARD`) and no
     /// registration for write protection the child keeps (`VM_UFFD_WP`),
     /// which a fault fills again. Such an entry is one of shared memory, a page of
     /// the file's page cache, or one with no contents of private
@@ -4282,10 +4339,9 @@ impl AddressSpaceData {
             let Some((first, last)) = self.region_at(start) else {
                 break;
             };
-            let copies = self
-                .mappings
-                .range(first..last)
-                .any(|(_, m)| m.written || m.maybe_guard || m.keeps_protection_on_fork());
+            let copies = self.mappings.range(first..last).any(|(_, m)| {
+                m.anon_vma.is_some() || m.maybe_guard || m.keeps_protection_on_fork()
+            });
             if !copies {
                 regions.push((first, last, self.shared_at(first).is_some()));
             }
@@ -4948,7 +5004,8 @@ impl AddressSpaceData {
         }
     }
     /// Marks the private mappings `[addr, addr+len)` touches written, each
-    /// with the whole Linux VMA it is part of ([`Mapping::written`]).
+    /// with the whole Linux VMA it is part of, which takes an `anon_vma` if
+    /// it has none ([`Mapping::anon_vma`]).
     pub fn mark_written(&mut self, addr: GuestAddr, len: u64) {
         let end = addr.0.saturating_add(len);
         let mut at = addr.0;
@@ -4964,12 +5021,118 @@ impl AddressSpaceData {
             if self.shared_at(m.start.0).is_none()
                 && let Some((first, last)) = self.region_at(m.start.0)
             {
-                for (_, mapping) in self.mappings.range_mut(first..last) {
-                    mapping.written = true;
-                }
+                self.prepare_anon_vma(first, last);
             }
             at = m.end();
         }
+    }
+
+    /// Gives the Linux VMA `[first, last)` an `anon_vma` if it has none, as
+    /// `__anon_vma_prepare` does: that of the VMA after it, or else of the
+    /// one before it, if the two could share one (`reusable_anon_vma`,
+    /// `anon_vma_compatible`), or else one of its own.
+    fn prepare_anon_vma(&mut self, first: u64, last: u64) {
+        let held = self
+            .mappings
+            .range(first..last)
+            .find_map(|(_, m)| m.anon_vma);
+        let anon_vma = held
+            .or_else(|| {
+                let (a, b) = (self.mapping_at(last - 1)?, self.mappings.get(&last)?);
+                self.shares_anon_vma(a, b).then_some(b.anon_vma)?
+            })
+            .or_else(|| {
+                let a = self.mapping_at(first.checked_sub(1)?)?;
+                let b = self.mappings.get(&first)?;
+                self.shares_anon_vma(a, b).then_some(a.anon_vma)?
+            })
+            .unwrap_or_else(|| AnonVma::fresh(false));
+        for (_, m) in self.mappings.range_mut(first..last) {
+            m.anon_vma.get_or_insert(anon_vma);
+        }
+    }
+
+    /// Whether adjacent VMAs `a` and `b`, one of which has an `anon_vma`, may
+    /// share it, as `anon_vma_compatible` has it: they differ in no more than
+    /// their protection, their names and which `userfaultfd` they are
+    /// registered with; and it did not come by `fork`.
+    fn shares_anon_vma(&self, a: &Mapping, b: &Mapping) -> bool {
+        let modes = |m: &Mapping| {
+            m.userfault.map_or(0, |u| {
+                u.modes & (Userfault::MISSING | Userfault::WP | Userfault::MINOR)
+            })
+        };
+        let alike = Mapping {
+            prot: a.prot,
+            anon_name: a.anon_name,
+            userfault: a.userfault,
+            anon_vma: a.anon_vma,
+            ..*b
+        };
+        a.end() == b.start.0
+            && [a, b].iter().all(|m| m.anon_vma.is_none_or(|v| !v.forked))
+            && modes(a) == modes(b)
+            && self.mergeable(a, &alike)
+    }
+
+    /// Gives the pieces of `[start, end)` and the two next to it that a merge
+    /// made one Linux VMA the one `anon_vma` that VMA then has
+    /// (`dup_anon_vma`): a piece without one takes its neighbour's, the one
+    /// before it first, as a VMA that could merge with either of two that
+    /// cannot with each other merges with the one before
+    /// (`can_vma_merge_right`). Called once a change of mappings that Linux
+    /// merges after is done.
+    fn merge_anon_vmas(&mut self, start: u64, end: u64) {
+        let before = start.saturating_sub(1);
+        let mut pieces: Vec<u64> = self
+            .mapping_at(before)
+            .map(|m| m.start.0)
+            .into_iter()
+            .collect();
+        pieces.extend(self.mappings.range(before..=end).map(|(&s, _)| s));
+        pieces.dedup();
+        let take = |this: &mut Self, from: u64, to: u64| {
+            let (Some(&a), Some(&b)) = (this.mappings.get(&from), this.mappings.get(&to)) else {
+                return;
+            };
+            let (first, second) = if from < to { (a, b) } else { (b, a) };
+            if a.anon_vma.is_some()
+                && b.anon_vma.is_none()
+                && first.end() == second.start.0
+                && this.mergeable(&first, &second)
+                && let Some((first, last)) = this.region_of_none(to)
+            {
+                for (_, m) in this.mappings.range_mut(first..last) {
+                    m.anon_vma = a.anon_vma;
+                }
+            }
+        };
+        for pair in pieces.windows(2) {
+            take(self, pair[0], pair[1]);
+        }
+        for pair in pieces.windows(2).rev() {
+            take(self, pair[1], pair[0]);
+        }
+    }
+
+    /// The run of pieces around the one at `start`, of one Linux VMA, that
+    /// have no `anon_vma`.
+    fn region_of_none(&self, start: u64) -> Option<(u64, u64)> {
+        let mut first = *self.mappings.get(&start)?;
+        let mut last = first;
+        while let Some((_, m)) = self.mappings.range(..first.start.0).next_back() {
+            if m.end() != first.start.0 || m.anon_vma.is_some() || !self.mergeable(m, &first) {
+                break;
+            }
+            first = *m;
+        }
+        while let Some(m) = self.mappings.get(&last.end()) {
+            if m.anon_vma.is_some() || !self.mergeable(&last, m) {
+                break;
+            }
+            last = *m;
+        }
+        Some((first.start.0, last.end()))
     }
 
     /// The core dump's view of the Linux VMA at `addr`: written when any
@@ -4978,9 +5141,11 @@ impl AddressSpaceData {
     /// shared mapping there, returned with it, tells that once the lock is
     /// released.
     fn core_state(&self, addr: u64) -> (CoreState, Option<Arc<dyn PageSource>>) {
-        let written = self
-            .region_at(addr)
-            .is_some_and(|(first, last)| self.mappings.range(first..last).any(|(_, m)| m.written));
+        let written = self.region_at(addr).is_some_and(|(first, last)| {
+            self.mappings
+                .range(first..last)
+                .any(|(_, m)| m.anon_vma.is_some())
+        });
         let shared = self.shared_at(addr).is_some();
         let file = self.file_at(addr);
         let state = CoreState {
@@ -5455,7 +5620,8 @@ impl AddressSpaceData {
                 length: end - start,
                 prot,
                 kind,
-                written: false,
+                anon_vma: None,
+                moved: 0,
                 sealed: false,
                 dont_fork: false,
                 wipe_on_fork: false,
@@ -5712,6 +5878,8 @@ impl AddressSpaceData {
             && a.userfault == b.userfault
             && a.no_exec == b.no_exec
             && a.anon_name == b.anon_name
+            && a.moved == b.moved
+            && AnonVma::mergeable(a.anon_vma, b.anon_vma)
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -5730,6 +5898,13 @@ impl AddressSpaceData {
                 }
                 _ => false,
             }
+    }
+
+    /// Ends a change of the mappings in `[start, end)` that Linux merges VMAs
+    /// after.
+    fn merged(&mut self, start: u64, end: u64) {
+        self.merge_anon_vmas(start, end);
+        self.spread_soft_dirty(start, end);
     }
 
     /// Gives `VM_SOFTDIRTY` to every mapping of a Linux VMA that holds or
@@ -5849,6 +6024,14 @@ impl AddressSpaceData {
         };
         let shared = self.shared_at(old).cloned();
         let backing = self.backing_at(old).cloned();
+        let whole = self.region_at(old) == Some((old, old + old_len));
+        // `copy_vma`: anonymous memory no page of which was written takes its
+        // page offset from its new address, and any other keeps its own.
+        let moved = if mapping.anon_vma.is_some() && shared.is_none() && backing.is_none() {
+            mapping.moved.wrapping_add(old).wrapping_sub(to)
+        } else {
+            0
+        };
         let pages = self.take_pages(old, old + old_len, keep_old && shared.is_some());
         // The guard markers move with the page tables, and leave the old
         // range even when `MREMAP_DONTUNMAP` keeps it.
@@ -5867,6 +6050,11 @@ impl AddressSpaceData {
             self.split_at(old + old_len);
             for (_, m) in self.mappings.range_mut(old..old + old_len) {
                 m.locked = None;
+                // A whole VMA is left without its `anon_vma`
+                // (`dontunmap_complete`).
+                if whole {
+                    m.anon_vma = None;
+                }
             }
         }
         if !keep_old && old_len > 0 {
@@ -5910,6 +6098,7 @@ impl AddressSpaceData {
                 start: GuestAddr(to),
                 length: new_len,
                 userfault,
+                moved,
                 ..mapping
             },
         );
@@ -6802,7 +6991,7 @@ impl AddressSpaceData {
     /// `anon_vma` ([`Self::userfault_prepare_fill`]).
     pub fn userfault_fill_unprepared(&self, start: u64) -> bool {
         self.mapping_at(start)
-            .is_some_and(|m| !m.written && self.shared_at(start).is_none())
+            .is_some_and(|m| m.anon_vma.is_none() && self.shared_at(start).is_none())
     }
 
     /// Marks the private mapping at `start` written, with the Linux VMA it
@@ -7347,7 +7536,7 @@ impl AddressSpaceData {
     /// (`VM_DONTEXPAND`). An install drops the pages of the range, as
     /// Linux's `zap_vma_range` does, but keeps the guards already there,
     /// and gives private anonymous memory its `anon_vma`
-    /// ([`Mapping::written`]). A hole gives `ENOMEM` once the rest is done.
+    /// ([`Mapping::anon_vma`]). A hole gives `ENOMEM` once the rest is done.
     pub fn guard(&mut self, addr: u64, end: u64, install: bool) -> Result<(), Errno> {
         let fragments: Vec<Mapping> = self
             .mappings
@@ -7473,7 +7662,7 @@ impl AddressSpaceData {
     /// `TVA_FORCED_COLLAPSE`, `EINVAL`): without `MADV_NOHUGEPAGE`, with
     /// room for an aligned 2 MiB extent, and either private anonymous
     /// memory with an `anon_vma` (a page of it was written,
-    /// [`Mapping::written`]) or a mapping of shmem's page cache
+    /// [`Mapping::anon_vma`]) or a mapping of shmem's page cache
     /// ([`Self::collapse_shmem_vma`]). A regular file's mapping is refused
     /// here, which Linux takes by rules that changed after v6.12 and by the
     /// state of the host's page cache.
@@ -7506,7 +7695,7 @@ impl AddressSpaceData {
         let written = self
             .mappings
             .range(vma_start..vma_end)
-            .any(|(_, m)| m.written);
+            .any(|(_, m)| m.anon_vma.is_some());
         if !written {
             return Err(Errno::EINVAL);
         }
@@ -7764,7 +7953,7 @@ impl AddressSpaceData {
         if pte.frame.get().is_none() && !pte.file && !shared {
             return Err(EBUSY);
         }
-        if shared || pte.cache || (pte.file && !mapping.written) {
+        if shared || pte.cache || (pte.file && mapping.anon_vma.is_none()) {
             return Err(Errno::EIO);
         }
         drop(directory);
@@ -8567,7 +8756,7 @@ impl MemoryView {
     ) -> Result<(), Errno> {
         self.with_data_mut(|data| {
             let result = data.userfault_register(start, end, context, modes);
-            data.spread_soft_dirty(start, end);
+            data.merged(start, end);
             result
         })
         .unwrap_or(Err(Errno::ENOMEM))
@@ -8582,7 +8771,7 @@ impl MemoryView {
     ) -> Result<Vec<(u64, u64)>, Errno> {
         self.with_data_mut(|data| {
             let result = data.userfault_unregister(start, end, context);
-            data.spread_soft_dirty(start, end);
+            data.merged(start, end);
             result
         })
         .unwrap_or(Err(Errno::ENOMEM))
@@ -8591,7 +8780,7 @@ impl MemoryView {
     pub fn userfault_release(&self, context: u64) {
         self.with_data_mut(|data| {
             data.userfault_release(context);
-            data.spread_soft_dirty(0, USER_ADDRESS_LIMIT);
+            data.merged(0, USER_ADDRESS_LIMIT);
         });
     }
     /// See [`AddressSpaceData::userfault_registrations`]; none once the
@@ -9025,7 +9214,7 @@ impl AddressSpace {
         Some(execute())
     }
     /// Marks `[addr, addr+len)` written, as Linux's write faults do when it
-    /// populates a writable private mapping ([`Mapping::written`]).
+    /// populates a writable private mapping ([`Mapping::anon_vma`]).
     pub fn mark_written(&self, addr: GuestAddr, len: u64) {
         self.locked().mark_written(addr, len);
     }
@@ -9522,7 +9711,7 @@ impl AddressSpace {
     /// is soft-dirty, and so is the Linux VMA it merged with
     /// ([`AddressSpaceData::spread_soft_dirty`]).
     pub fn mapped(&self, addr: GuestAddr, end: u64) {
-        self.locked().spread_soft_dirty(addr.0, end);
+        self.locked().merged(addr.0, end);
     }
     pub fn unmap(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.unmap_shared(addr, len)
@@ -9534,7 +9723,7 @@ impl AddressSpace {
     pub fn seal_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let mut data = self.locked();
         let result = data.seal(addr, len);
-        data.spread_soft_dirty(addr.0, addr.0.saturating_add(len));
+        data.merged(addr.0, addr.0.saturating_add(len));
         result
     }
     /// See [`AddressSpaceData::removals`]: the memory to free, which the
@@ -9570,20 +9759,23 @@ impl AddressSpace {
         end: u64,
         name: Option<&[u8]>,
     ) -> Result<(), Errno> {
-        self.locked().set_anon_name(addr.0, end, name)
+        let mut data = self.locked();
+        let result = data.set_anon_name(addr.0, end, name);
+        data.merged(addr.0, end);
+        result
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
         let mut data = self.locked();
         let result = data.advise_flags(addr.0, end, advice);
-        data.spread_soft_dirty(addr.0, end);
+        data.merged(addr.0, end);
         result
     }
     /// See [`AddressSpaceData::lock`].
     pub fn lock(&self, addr: GuestAddr, end: u64, lock: Option<Lock>) -> Result<(), Errno> {
         let mut data = self.locked();
         let result = data.lock(addr.0, end, lock);
-        data.spread_soft_dirty(addr.0, end);
+        data.merged(addr.0, end);
         result
     }
     /// See [`AddressSpaceData::lock_new`].
@@ -9609,7 +9801,7 @@ impl AddressSpace {
     pub fn lock_all(&self, current: Option<Option<Lock>>, future: Option<Lock>) {
         let mut data = self.locked();
         data.lock_all(current, future);
-        data.spread_soft_dirty(0, USER_ADDRESS_LIMIT);
+        data.merged(0, USER_ADDRESS_LIMIT);
     }
     /// See [`AddressSpaceData::first_locked`].
     pub fn first_locked(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
@@ -9644,7 +9836,7 @@ impl AddressSpace {
     pub fn guard(&self, addr: GuestAddr, end: u64, install: bool) -> Result<(), Errno> {
         let mut data = self.locked();
         let result = data.guard(addr.0, end, install);
-        data.spread_soft_dirty(addr.0, end);
+        data.merged(addr.0, end);
         result
     }
     /// Whether `[addr, end)` has a guard page (`MADV_GUARD_INSTALL`), where
@@ -9770,7 +9962,7 @@ impl AddressSpace {
         let mut data = self.locked();
         let result = data.remap(addr, old_len, new_len, how);
         if let Ok(at) = result {
-            data.spread_soft_dirty(at.0, at.0.saturating_add(new_len));
+            data.merged(at.0, at.0.saturating_add(new_len));
         }
         result
     }
@@ -9781,7 +9973,7 @@ impl AddressSpace {
     pub fn protect_shared(&self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         let mut data = self.locked();
         let result = data.protect(addr, len, prot);
-        data.spread_soft_dirty(addr.0, addr.0.saturating_add(len));
+        data.merged(addr.0, addr.0.saturating_add(len));
         result
     }
     pub fn set_initial_break(&mut self, addr: GuestAddr) {
@@ -9805,7 +9997,7 @@ impl AddressSpace {
         let before = data.current_break().0;
         let after = data.set_break(addr);
         if after.0 > before {
-            data.spread_soft_dirty(before, after.0);
+            data.merged(before, after.0);
         }
         after
     }
@@ -10690,7 +10882,7 @@ mod tests {
         assert_eq!(space.read_u64(at(2)).unwrap(), 3);
         let kept: Vec<_> = child
             .mappings()
-            .map(|m| (m.start.0, m.wipe_on_fork, m.dont_dump, m.written))
+            .map(|m| (m.start.0, m.wipe_on_fork, m.dont_dump, m.anon_vma.is_some()))
             .collect();
         assert_eq!(
             kept,

@@ -197,6 +197,8 @@ const RWF_NOWAIT: u32 = 8;
 
 const REGISTER_BUFFERS: u64 = 0;
 const UNREGISTER_BUFFERS: u64 = 1;
+const REGISTER_BUFFERS2: u64 = 15;
+const REGISTER_BUFFERS_UPDATE: u64 = 16;
 const REGISTER_FILES: u64 = 2;
 const UNREGISTER_FILES: u64 = 3;
 const REGISTER_FILES_UPDATE: u64 = 6;
@@ -622,8 +624,48 @@ struct Chosen {
 /// holds it, a tag that is not 0 is the `user_data` of a completion of 0
 /// ([`Ring::put_nodes`]).
 struct Node {
-    file: crate::files::Descriptor,
+    held: Held,
     tag: u64,
+}
+
+/// What a [`Node`] holds: a registered file, or a registered buffer.
+enum Held {
+    File(crate::files::Descriptor),
+    Buffer(RegisteredBuffer),
+}
+
+impl Node {
+    fn file(&self) -> Option<&crate::files::Descriptor> {
+        match &self.held {
+            Held::File(file) => Some(file),
+            Held::Buffer(_) => None,
+        }
+    }
+    fn buffer(&self) -> Option<&RegisteredBuffer> {
+        match &self.held {
+            Held::Buffer(buffer) => Some(buffer),
+            Held::File(_) => None,
+        }
+    }
+}
+
+/// A registered buffer (`struct io_mapped_ubuf`): its address and length,
+/// its pages, pinned (`io_pin_pages`), and the pages of RLIMIT_MEMLOCK it
+/// charges, which it gives back once nothing holds it (`io_buffer_unmap`).
+struct RegisteredBuffer {
+    base: u64,
+    len: u64,
+    pages: Arc<paludarium_mmu::Pinned>,
+    charged: Option<(Arc<crate::memfd::SecretPages>, u32)>,
+    count: u64,
+}
+
+impl Drop for RegisteredBuffer {
+    fn drop(&mut self) {
+        if let Some((pages, user)) = &self.charged {
+            pages.release(*user, self.count);
+        }
+    }
 }
 
 /// A ring's registered files: the slots of its `count` that hold an open
@@ -651,7 +693,13 @@ impl Files {
     /// Puts `file` in the empty `slot`; the next free one is looked for
     /// past it (`io_file_bitmap_set`).
     fn set(&mut self, slot: u32, file: crate::files::Descriptor, tag: u64) {
-        self.slots.insert(slot, Arc::new(Node { file, tag }));
+        self.slots.insert(
+            slot,
+            Arc::new(Node {
+                held: Held::File(file),
+                tag,
+            }),
+        );
         self.hint = slot + 1;
     }
 
@@ -685,23 +733,11 @@ struct Registered {
     len: usize,
 }
 
-/// A ring's registered buffers: each slot's address and length, or none
-/// for a slot registered empty, and the pages they charge, which they give
-/// back as they go.
+/// A ring's registered buffers (`ctx->buf_table`): each slot's buffer, or
+/// none for a slot registered empty. A request holds the buffer it moves
+/// while it runs (`io_req_assign_buf_node`).
 struct Buffers {
-    /// Each registered buffer: its address and length, and its pages,
-    /// pinned (`io_pin_pages`), which a request holds while it moves them.
-    slots: Vec<Option<(u64, u64, Arc<paludarium_mmu::Pinned>)>>,
-    charged: Option<(Arc<crate::memfd::SecretPages>, u32)>,
-    pages: u64,
-}
-
-impl Drop for Buffers {
-    fn drop(&mut self) {
-        if let Some((pages, user)) = &self.charged {
-            pages.release(*user, self.pages);
-        }
-    }
+    slots: Vec<Option<Arc<Node>>>,
 }
 
 #[derive(Default)]
@@ -726,10 +762,10 @@ struct State {
     /// in order, which they hold until their completions are posted
     /// (`io_free_batch_list`).
     held: Vec<Arc<Node>>,
-    /// Registered files no slot holds any more that a request still does:
-    /// one of the running batch, or one that waits for its file ([`arm`]).
-    /// Each posts its tag once nothing holds it, at the end of the batch it
-    /// is let go of in ([`Ring::end`]).
+    /// Registered files and buffers no slot holds any more that a request
+    /// still does: one of the running batch, or one that waits for its
+    /// file ([`arm`]). Each posts its tag once nothing holds it, at the
+    /// end of the batch it is let go of in ([`Ring::end`]).
     retired: Vec<Arc<Node>>,
 }
 
@@ -821,9 +857,10 @@ struct Transfer {
     /// The provided buffer it chose before it waited for its file, which it
     /// reads to as it goes on.
     kept: Option<Chosen>,
-    /// The file it found before it waited for it (`req->file`): it goes on
-    /// with it, whatever its descriptor or slot holds by then.
-    found: Option<crate::files::Descriptor>,
+    /// The file it found before it waited for it, and the registered buffer
+    /// (`req->file`, `req->buf_node`): it goes on with them, whatever its
+    /// descriptor or slots hold by then.
+    found: Option<(crate::files::Descriptor, Option<Arc<Node>>)>,
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
@@ -899,10 +936,10 @@ impl Ring {
         }
     }
 
-    /// Lets go of registered files no slot holds (`io_put_rsrc_node`): one a
-    /// request holds, of the running submission or one that waits for its
-    /// file, waits for that request's completion ([`State::retired`]), and
-    /// the others post their tags now, in order.
+    /// Lets go of registered files and buffers no slot holds
+    /// (`io_put_rsrc_node`): one a request holds, of the running submission
+    /// or one that waits for its file, waits for that request's completion
+    /// ([`State::retired`]), and the others post their tags now, in order.
     fn put_nodes(&self, gone: impl IntoIterator<Item = Arc<Node>>) {
         let mut state = self.state();
         for node in gone {
@@ -1333,7 +1370,7 @@ fn file_of(
             .as_ref()
             .and_then(|files| files.slots.get(&(fd as u32)).cloned())
             .ok_or(Errno::EBADF)?;
-        let file = node.file.clone();
+        let file = node.file().cloned().ok_or(Errno::EBADF)?;
         let mut state = ring.state();
         if state.deferred.is_some() {
             state.held.push(node);
@@ -1378,16 +1415,21 @@ struct Waits {
     file: Arc<dyn FileHandle>,
     mask: u32,
     kept: Option<Chosen>,
-    found: crate::files::Descriptor,
+    found: (crate::files::Descriptor, Option<Arc<Node>>),
 }
 
 fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferred {
-    let opened = match &transfer.found {
-        Some(opened) => opened.clone(),
+    let (opened, buffer) = match &transfer.found {
+        Some((opened, buffer)) => (opened.clone(), buffer.clone()),
         None => match file_of(c, ring, transfer.fd, transfer.fixed) {
-            Ok(opened) => opened,
+            Ok(opened) => (opened, None),
             Err(e) => return (Err(e), 0, None, 0),
         },
+    };
+    let buffer = if transfer.registered {
+        buffer.or_else(|| ring.buffer_node(transfer.buf_index))
+    } else {
+        None
     };
     let asked = |segments: &[(u64, usize)]| segments.iter().map(|&(_, len)| len as u64).sum();
     let waits = |result: &Result<u64, Errno>, kept: Option<Chosen>| {
@@ -1400,11 +1442,14 @@ fn transfer(c: &mut Context<'_>, ring: &Ring, transfer: &Transfer) -> Transferre
                     POLL_IN_EVENTS
                 },
             kept,
-            found: opened.clone(),
+            found: (opened.clone(), buffer.clone()),
         })
     };
     if transfer.registered {
-        let within = ring.registered(transfer.buf_index, transfer.addr, transfer.len);
+        let within = buffer
+            .as_ref()
+            .ok_or(Errno::EFAULT)
+            .and_then(|node| within(node, transfer.addr, transfer.len));
         let wanted = within.as_ref().map_or(0, |within| within.len as u64);
         let result = within.and_then(|within| {
             let memory = crate::files::Memory::Pinned {
@@ -2072,7 +2117,9 @@ pub(crate) fn cancel_all_task(c: &mut Context<'_>) {
 /// work it still has runs as an exiting task's does ([`run_terminated`]),
 /// as will any added later. A whole process's exit ran
 /// [`cancel_all_task`] first; a request of a thread that exits alone waits
-/// on, and fails once its file is ready.
+/// on, and fails once its file is ready. Here the thread waits for a ring
+/// another holds, as Linux's `exit_task_work` takes `uring_lock` in the
+/// thread that exits: no worker runs this work.
 pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
     unregister_all_rings(inbox);
     let work = {
@@ -2373,7 +2420,7 @@ fn sync_cancel(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno>
                     files
                         .slots
                         .get(&(key.fd as u32))
-                        .map(|n| Arc::clone(&n.file.file))
+                        .and_then(|n| n.file().map(|d| Arc::clone(&d.file)))
                 })
                 .ok_or(Errno::EBADF)?
         } else {
@@ -3211,15 +3258,21 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     match opcode {
         REGISTER_PROBE => probe(c, a),
         REGISTER_BUFFERS if a[2] == 0 => Err(Errno::EFAULT),
-        REGISTER_BUFFERS => register_buffers(c, ring, a[2], a[3] as u32),
+        REGISTER_BUFFERS => register_buffers(c, ring, a[2], a[3] as u32, 0),
+        REGISTER_BUFFERS2 => register_buffers2(c, ring, a[2], a[3] as u32),
+        REGISTER_BUFFERS_UPDATE => register_buffers_update(c, ring, a[2], a[3] as u32),
         UNREGISTER_BUFFERS if a[2] != 0 || a[3] as u32 != 0 => Err(Errno::EINVAL),
-        UNREGISTER_BUFFERS => ring
-            .buffers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .map(|_| 0)
-            .ok_or(ENXIO),
+        UNREGISTER_BUFFERS => {
+            let gone = ring
+                .buffers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .ok_or(ENXIO)?;
+            // `io_rsrc_data_free` lets go of the last slot first.
+            ring.put_nodes(gone.slots.into_iter().rev().flatten());
+            Ok(0)
+        }
         REGISTER_FILES if a[2] == 0 => Err(Errno::EFAULT),
         REGISTER_FILES => register_files(c, ring, a[2], a[3] as u32, 0),
         REGISTER_FILES2 => register_files2(c, ring, a[2], a[3] as u32),
@@ -3313,7 +3366,13 @@ fn register_files(
         if is_ring(&d) {
             return Err(Errno::EBADF);
         }
-        files.slots.insert(index, Arc::new(Node { file: d, tag }));
+        files.slots.insert(
+            index,
+            Arc::new(Node {
+                held: Held::File(d),
+                tag,
+            }),
+        );
     }
     *registered = Some(files);
     Ok(0)
@@ -3550,22 +3609,96 @@ fn file_alloc_range(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, E
     Ok(0)
 }
 
-/// `IORING_REGISTER_BUFFERS`, as Linux's `io_sqe_buffers_register`: none
-/// registered yet (`EBUSY`), 1 to `IORING_MAX_REG_BUFFERS` of them
-/// (`EINVAL`), then each `iovec` in turn (`EFAULT`, `EINVAL` for a negative
-/// length), as `io_sqe_buffer_register` takes it:
+/// The `iovec` at `at` (`EFAULT`), as `iovec_from_user` takes one: a
+/// negative length is `EINVAL`.
+fn read_iovec(c: &Context<'_>, at: u64) -> Result<(u64, u64), Errno> {
+    let mut iovec = [0; 16];
+    c.mem
+        .read(GuestAddr(at), &mut iovec)
+        .map_err(|_| Errno::EFAULT)?;
+    let (base, len) = (u64_at(&iovec, 0), u64_at(&iovec, 8));
+    if (len as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((base, len))
+}
+
+/// A buffer as `io_sqe_buffer_register` registers one, tagged `tag`:
 ///
-/// - A null address with no length registers an empty slot; one with a
-///   length is `EFAULT`.
+/// - A null address with no length is an empty slot, which a tag may not
+///   have (`EINVAL`); one with a length is `EFAULT`.
 /// - No length or more than 1 GiB is `EFAULT`, and an end past the address
 ///   space `EOVERFLOW` (`io_validate_user_buf_range`).
-/// - Its pages must be writable (`EFAULT`, as `pin_user_pages_fast` with
-///   `FOLL_WRITE`).
+/// - Its pages are pinned for writing (`io_pin_pages`). The long-term pin
+///   refuses (`EFAULT`) a page not mapped or not writable, and a shared
+///   mapping of a disk file, of a `memfd_secret` or of a perf event's ring.
 /// - They charge the ring's user, within RLIMIT_MEMLOCK (`ENOMEM`), unless
 ///   the ring's maker had `CAP_IPC_LOCK` (`io_buffer_account_pin`).
-///
-/// A failure registers none of them.
-fn register_buffers(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> Result<u64, Errno> {
+fn buffer_node(
+    c: &Context<'_>,
+    ring: &Ring,
+    (base, len): (u64, u64),
+    tag: u64,
+) -> Result<Option<Arc<Node>>, Errno> {
+    if base == 0 {
+        if len != 0 {
+            return Err(Errno::EFAULT);
+        }
+        return if tag == 0 {
+            Ok(None)
+        } else {
+            Err(Errno::EINVAL)
+        };
+    }
+    if len > MAX_BUFFER || len == 0 {
+        return Err(Errno::EFAULT);
+    }
+    // The end, page-aligned, must not wrap, as `io_pin_pages` checks
+    // again for the end of the last page.
+    if base.checked_add(len.next_multiple_of(4096)).is_none()
+        || base.checked_add(len + 4095).is_none()
+    {
+        return Err(EOVERFLOW);
+    }
+    let pinned = c.mem.pin(GuestAddr(base), len as usize).map_err(|e| {
+        if e == EOVERFLOW {
+            EOVERFLOW
+        } else {
+            Errno::EFAULT
+        }
+    })?;
+    let count = (base % 4096 + len).div_ceil(4096);
+    let limit = c.processes.soft_limit(c.process.pid, 8) >> 12;
+    if let Some((charged, user)) = &ring.charged
+        && !charged.charge(*user, count, limit)
+    {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(Some(Arc::new(Node {
+        held: Held::Buffer(RegisteredBuffer {
+            base,
+            len,
+            pages: Arc::new(pinned),
+            charged: ring.charged.clone(),
+            count,
+        }),
+        tag,
+    })))
+}
+
+/// `IORING_REGISTER_BUFFERS`, and `_BUFFERS2` with `tags`, as Linux 7.0's
+/// `io_sqe_buffers_register`: none registered yet (`EBUSY`), 1 to
+/// `IORING_MAX_REG_BUFFERS` of them (`EINVAL`), then each `iovec` in turn
+/// ([`read_iovec`]; with no `iovec`s, as `_BUFFERS2` may ask, every slot
+/// empty), its tag (`EFAULT`), and the buffer ([`buffer_node`]). A
+/// failure registers none of them, and posts no tag.
+fn register_buffers(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    arg: u64,
+    count: u32,
+    tags: u64,
+) -> Result<u64, Errno> {
     let mut registered = ring.buffers.lock().unwrap_or_else(PoisonError::into_inner);
     if registered.is_some() {
         return Err(EBUSY);
@@ -3575,55 +3708,102 @@ fn register_buffers(c: &mut Context<'_>, ring: &Ring, arg: u64, count: u32) -> R
     }
     let mut buffers = Buffers {
         slots: Vec::with_capacity(count as usize),
-        charged: ring.charged.clone(),
-        pages: 0,
     };
-    let limit = c.processes.soft_limit(c.process.pid, 8) >> 12;
-    for index in 0..u64::from(count) {
-        let mut iovec = [0; 16];
-        c.mem
-            .read(GuestAddr(arg + 16 * index), &mut iovec)
-            .map_err(|_| Errno::EFAULT)?;
-        let (base, len) = (u64_at(&iovec, 0), u64_at(&iovec, 8));
-        if (len as i64) < 0 {
-            return Err(Errno::EINVAL);
-        }
-        if base == 0 {
-            if len != 0 {
-                return Err(Errno::EFAULT);
-            }
-            buffers.slots.push(None);
-            continue;
-        }
-        if len > MAX_BUFFER || len == 0 {
-            return Err(Errno::EFAULT);
-        }
-        // The end, page-aligned, must not wrap, as `io_pin_pages` checks
-        // again for the end of the last page.
-        if base.checked_add(len.next_multiple_of(4096)).is_none()
-            || base.checked_add(len + 4095).is_none()
-        {
-            return Err(EOVERFLOW);
-        }
-        // `io_pin_pages`, then `io_buffer_account_pin`.
-        let pinned = c.mem.pin(GuestAddr(base), len as usize).map_err(|e| {
-            if e == EOVERFLOW {
-                EOVERFLOW
-            } else {
-                Errno::EFAULT
-            }
-        })?;
-        let pages = (base % 4096 + len).div_ceil(4096);
-        if let Some((charged, user)) = &buffers.charged
-            && !charged.charge(*user, pages, limit)
-        {
-            return Err(Errno::ENOMEM);
-        }
-        buffers.pages += pages;
-        buffers.slots.push(Some((base, len, Arc::new(pinned))));
+    for index in 0..count {
+        let iovec = if arg == 0 {
+            (0, 0)
+        } else {
+            read_iovec(c, arg + 16 * u64::from(index))?
+        };
+        let tag = read_tag(c, tags, index)?;
+        buffers.slots.push(buffer_node(c, ring, iovec, tag)?);
     }
     *registered = Some(buffers);
     Ok(0)
+}
+
+/// `IORING_REGISTER_BUFFERS2`, as Linux's `io_register_rsrc`: `size` is
+/// that of a `struct io_uring_rsrc_register` (`EINVAL`), which is read
+/// (`EFAULT`) and must have a count, no reserved field and no flag but
+/// `IORING_RSRC_REGISTER_SPARSE`, which takes no `iovec`s (`EINVAL`); then
+/// as [`register_buffers`] with its tags.
+fn register_buffers2(c: &mut Context<'_>, ring: &Ring, arg: u64, size: u32) -> Result<u64, Errno> {
+    if size != 32 {
+        return Err(Errno::EINVAL);
+    }
+    let mut rr = [0; 32];
+    c.mem
+        .read(GuestAddr(arg), &mut rr)
+        .map_err(|_| Errno::EFAULT)?;
+    let (count, flags, data) = (u32_at(&rr, 0), u32_at(&rr, 4), u64_at(&rr, 16));
+    if count == 0
+        || u64_at(&rr, 8) != 0
+        || flags & !RSRC_REGISTER_SPARSE != 0
+        || flags & RSRC_REGISTER_SPARSE != 0 && data != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    register_buffers(c, ring, data, count, u64_at(&rr, 24))
+}
+
+/// `IORING_REGISTER_BUFFERS_UPDATE`, as Linux 7.0's
+/// `io_register_rsrc_update` and `__io_sqe_buffers_update`: `size` is that
+/// of a `struct io_uring_rsrc_update2` (`EINVAL`), which is read (`EFAULT`)
+/// and must have a count and no reserved field (`EINVAL`; Linux master
+/// takes `IORING_RSRC_UPDATE_EXTENDED` there); an offset and count that
+/// wrap are `EOVERFLOW`, no buffers `ENXIO`, and slots past the last
+/// `EINVAL`. Then each slot in turn: its `iovec`, its tag (both `EFAULT`;
+/// master reads the tag first) and the buffer ([`buffer_node`]), an empty
+/// `iovec` emptying it. What the slot held goes, and its tag posts once
+/// nothing holds it ([`Ring::put_nodes`]). It gives how many it updated,
+/// or the error of the first if none.
+fn register_buffers_update(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    arg: u64,
+    size: u32,
+) -> Result<u64, Errno> {
+    if size != 32 {
+        return Err(Errno::EINVAL);
+    }
+    let mut up = [0; 32];
+    c.mem
+        .read(GuestAddr(arg), &mut up)
+        .map_err(|_| Errno::EFAULT)?;
+    let (offset, data, tags, count) = (
+        u32_at(&up, 0),
+        u64_at(&up, 8),
+        u64_at(&up, 16),
+        u32_at(&up, 24),
+    );
+    if count == 0 || u32_at(&up, 4) != 0 || u32_at(&up, 28) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    offset.checked_add(count).ok_or(EOVERFLOW)?;
+    let mut registered = ring.buffers.lock().unwrap_or_else(PoisonError::into_inner);
+    let buffers = registered.as_mut().ok_or(ENXIO)?;
+    if (offset + count) as usize > buffers.slots.len() {
+        return Err(Errno::EINVAL);
+    }
+    let mut done = 0;
+    let mut gone = Vec::new();
+    let failed = (|| -> Result<(), Errno> {
+        while done < count {
+            let iovec = read_iovec(c, data + 16 * u64::from(done))?;
+            let tag = read_tag(c, tags, done)?;
+            let node = buffer_node(c, ring, iovec, tag)?;
+            let slot = &mut buffers.slots[(offset + done) as usize];
+            gone.extend(std::mem::replace(slot, node));
+            done += 1;
+        }
+        Ok(())
+    })();
+    drop(registered);
+    ring.put_nodes(gone);
+    match failed {
+        Err(e) if done == 0 => Err(e),
+        _ => Ok(u64::from(done)),
+    }
 }
 
 /// `IORING_REGISTER_PBUF_RING`, as Linux's `io_register_pbuf_ring` reads
@@ -3767,32 +3947,41 @@ fn pbuf_status(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno>
 impl Ring {
     /// Whether registered buffer `index` is there (`io_find_buf_node`).
     fn has_buffer(&self, index: u16) -> bool {
-        let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
-        buffers
-            .as_ref()
-            .is_some_and(|buffers| matches!(buffers.slots.get(usize::from(index)), Some(Some(_))))
+        self.buffer_node(index).is_some()
     }
 
-    /// The `len` bytes at `addr` of a request's registered buffer `index`,
-    /// as `io_import_reg_buf` finds them: none registered there, a range
-    /// that wraps or leaves the buffer, or more than `MAX_RW_COUNT`, is
-    /// `EFAULT` (`validate_fixed_range`).
-    fn registered(&self, index: u16, addr: u64, len: u32) -> Result<Registered, Errno> {
-        let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
-        let (base, size, pages) = buffers
+    /// The buffer of slot `index`, which the running request holds from
+    /// now on (`io_find_buf_node`, `io_req_assign_buf_node`).
+    fn buffer_node(&self, index: u16) -> Option<Arc<Node>> {
+        let node = self
+            .buffers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .and_then(|buffers| buffers.slots.get(usize::from(index)).cloned().flatten())
-            .ok_or(Errno::EFAULT)?;
-        let end = addr.checked_add(u64::from(len)).ok_or(Errno::EFAULT)?;
-        if addr < base || end > base + size || len as usize > crate::files::MAX_RW_COUNT {
-            return Err(Errno::EFAULT);
+            .and_then(|buffers| buffers.slots.get(usize::from(index)).cloned().flatten())?;
+        let mut state = self.state();
+        if state.deferred.is_some() {
+            state.held.push(Arc::clone(&node));
         }
-        Ok(Registered {
-            pages,
-            at: (addr - base) as usize,
-            len: len as usize,
-        })
+        Some(node)
     }
+}
+
+/// The `len` bytes at `addr` of the registered buffer `node`, as
+/// `io_import_reg_buf` finds them: a range that wraps or leaves the buffer,
+/// or more than `MAX_RW_COUNT`, is `EFAULT` (`validate_fixed_range`).
+fn within(node: &Node, addr: u64, len: u32) -> Result<Registered, Errno> {
+    let buffer = node.buffer().ok_or(Errno::EFAULT)?;
+    let (base, size, pages) = (buffer.base, buffer.len, Arc::clone(&buffer.pages));
+    let end = addr.checked_add(u64::from(len)).ok_or(Errno::EFAULT)?;
+    if addr < base || end > base + size || len as usize > crate::files::MAX_RW_COUNT {
+        return Err(Errno::EFAULT);
+    }
+    Ok(Registered {
+        pages,
+        at: (addr - base) as usize,
+        len: len as usize,
+    })
 }
 
 /// `IORING_REGISTER_PROBE`: what each operation is, and whether it runs.

@@ -23,7 +23,10 @@ http_retries = 5
 [tools]
 # Rust. CI runs plain Cargo, so mbx (mr-boxington) is not wrapped here: mise-action
 # exports this file's command wrappers to CI's PATH. Enable it per machine with
-# `mise use --global --tool-option mr_boxington=true rust mr-boxington`.
+# `mise use --global mr-boxington`, `mbx setup --global`, which adds [wrappers.cargo] to
+# the global config, and `mbx settings set learned_incremental false`, without which
+# a release build can differ from plain Cargo's. The global `rust`'s mr_boxington option
+# does nothing here: rust-toolchain.toml, read in place of that `rust`, has no such option.
 cargo-deny = "latest"
 "aqua:taiki-e/cargo-llvm-cov" = "latest"
 # The npm package, its tests and the documentation site.

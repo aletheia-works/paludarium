@@ -1,17 +1,22 @@
 //! `struct tcp_info`, as Linux's `tcp_get_info` fills it for
 //! `getsockopt(TCP_INFO)` and `INET_DIAG_INFO`.
 //!
-//! The guest's loopback carries bytes, not segments, so what Linux's TCP
-//! counts of its own (round trips, rates, windows, segments) takes the
+//! The guest's loopback carries bytes, whose segments
+//! [`crate::loopback::segments`] counts as Linux would send them. What
+//! Linux's TCP measures of its own (round trips, rates, windows) takes the
 //! values Linux gives a loopback connection in the simplest case: the
 //! state, options, window scale, listener's queue, congestion window and
-//! threshold, reordering, path MTU, advertised MSS, byte counts and bytes
-//! waiting are the connection's own.
+//! threshold, reordering, path MTU, advertised MSS, byte and segment counts
+//! and bytes waiting are the connection's own.
+
+use crate::loopback::segments::Counts;
 
 /// `sizeof(struct tcp_info)`.
 pub(crate) const LEN: usize = 280;
 /// The MSS the loopback's MTU gives, with timestamps (`advmss`).
 pub(crate) const ADVMSS: u32 = 65_483;
+/// The same of IPv6.
+const ADVMSS_V6: u32 = 65_464;
 /// What a connection sends per segment, as Linux bounds it to half the
 /// window its loopback peer first offers (`tcp_bound_to_half_wnd`).
 pub(crate) const SND_MSS: u32 = 32_768;
@@ -77,6 +82,8 @@ pub(crate) struct TcpInfo {
     pub(crate) reordering: u32,
     pub(crate) rcv_space: u32,
     pub(crate) total_retrans: u32,
+    pub(crate) bytes_retrans: u64,
+    pub(crate) dsack_dups: u32,
     pub(crate) pacing_rate: u64,
     pub(crate) max_pacing_rate: u64,
     pub(crate) bytes_acked: u64,
@@ -114,6 +121,8 @@ pub(crate) struct Carried {
     pub(crate) since_received: u32,
     /// This side's receive window scale.
     pub(crate) rcv_wscale: u8,
+    /// The segments of a loopback connection; a host's are estimated.
+    pub(crate) segments: Option<Counts>,
 }
 
 impl TcpInfo {
@@ -148,6 +157,8 @@ impl TcpInfo {
             reordering: REORDERING,
             rcv_space: 0,
             total_retrans: 0,
+            bytes_retrans: 0,
+            dsack_dups: 0,
             pacing_rate: u64::MAX,
             max_pacing_rate: u64::MAX,
             bytes_acked: 0,
@@ -197,19 +208,44 @@ impl TcpInfo {
             ..Self::unconnected(2, uptime)
         }
     }
+    /// What a host's connection counts as: its data each way in segments of
+    /// [`SND_MSS`], however the guest split its writes and reads, with an
+    /// acknowledgement for each, and its end with the state.
+    fn estimated(carried: &Carried, in_flight: u32) -> Counts {
+        let (sent, received) = (segments(carried.sent), segments(carried.received));
+        Counts {
+            segs_out: if carried.accepted { 0 } else { 2 } + sent + received,
+            segs_in: if carried.accepted { 2 } else { 1 } + received + sent,
+            data_segs_out: sent,
+            data_segs_in: received,
+            delivered: 1 + sent + u32::from(carried.fin_sent),
+            unacked: in_flight,
+            sent: carried.sent,
+            acked: carried.sent,
+            received: carried.received,
+            end_acked: carried.fin_sent,
+            end_came: carried.fin_received,
+            ato: if carried.received > 0 { ATO } else { 0 },
+            snd_mss: SND_MSS,
+            rcv_mss: if carried.received > u64::from(DEFAULT_MSS) {
+                SND_MSS
+            } else {
+                DEFAULT_MSS
+            },
+            ..Counts::default()
+        }
+    }
     /// A connection in `state` that has carried `carried`, with `in_flight`
-    /// segments not yet acknowledged (its end).
+    /// segments of a host's connection not yet acknowledged (its end).
     pub(crate) fn connected(state: u8, carried: &Carried, in_flight: u32) -> Self {
+        let counts = carried
+            .segments
+            .unwrap_or_else(|| Self::estimated(carried, in_flight));
         let syn = u64::from(!carried.accepted);
-        let fin = u64::from(carried.fin_sent);
         // `tcp_update_pacing_rate` in slow start: twice the congestion
         // window a round trip.
         let pacing = u64::from(SND_MSS) * 2_000_000 * u64::from(CWND) / u64::from(RTT);
         let since_ack = carried.since_sent.min(carried.since_received);
-        // The data each way in segments of [`SND_MSS`], however the guest
-        // split its writes and reads.
-        let segments_out = segments(carried.sent);
-        let segments_in = segments(carried.received);
         Self {
             state,
             retransmits: 0,
@@ -218,14 +254,10 @@ impl TcpInfo {
             wscale: (wscale(RMEM_MAX), carried.rcv_wscale),
             app_limited: true,
             rto: RTO,
-            ato: if carried.received > 0 { ATO } else { 0 },
-            snd_mss: SND_MSS,
-            rcv_mss: if carried.received > u64::from(DEFAULT_MSS) {
-                SND_MSS
-            } else {
-                DEFAULT_MSS
-            },
-            unacked: in_flight,
+            ato: counts.ato,
+            snd_mss: counts.snd_mss,
+            rcv_mss: counts.rcv_mss,
+            unacked: counts.unacked,
             sacked: 0,
             last_data_sent: carried.since_sent,
             last_data_recv: carried.since_received,
@@ -239,26 +271,26 @@ impl TcpInfo {
             advmss: ADVMSS,
             reordering: REORDERING,
             rcv_space: ADVMSS,
-            total_retrans: 0,
+            total_retrans: counts.retransmitted,
+            bytes_retrans: counts.resent,
+            dsack_dups: counts.retransmitted,
             pacing_rate: pacing,
             max_pacing_rate: u64::MAX,
-            bytes_acked: syn + carried.sent + fin,
-            bytes_received: carried.received + u64::from(carried.fin_received),
-            // The handshake's segments, then an acknowledgement for each
-            // segment of data.
-            segs_out: if carried.accepted { 0 } else { 2 } + segments_out + segments_in,
-            segs_in: if carried.accepted { 2 } else { 1 } + segments_in + segments_out,
-            notsent_bytes: u32::try_from(carried.unsent).unwrap_or(u32::MAX),
+            bytes_acked: syn + counts.acked + u64::from(counts.end_acked),
+            bytes_received: counts.received + u64::from(counts.end_came),
+            segs_out: counts.segs_out,
+            segs_in: counts.segs_in,
+            notsent_bytes: u32::try_from(carried.unsent + counts.held).unwrap_or(u32::MAX),
             min_rtt: RTT,
-            data_segs_in: segments_in,
-            data_segs_out: segments_out,
-            delivery_rate: if segments_out > 0 {
+            data_segs_in: counts.data_segs_in,
+            data_segs_out: counts.data_segs_out,
+            delivery_rate: if counts.data_segs_out > 0 {
                 carried.sent.min(u64::from(SND_MSS)) * 1_000_000 / u64::from(RTT)
             } else {
                 0
             },
-            delivered: 1 + segments_out + u32::from(carried.fin_sent),
-            bytes_sent: carried.sent,
+            delivered: counts.delivered,
+            bytes_sent: counts.sent,
             snd_wnd: WINDOW,
             rcv_wnd: WINDOW,
             total_rto: 0,
@@ -292,6 +324,8 @@ impl TcpInfo {
             reordering: REORDERING,
             rcv_space: 0,
             total_retrans: 0,
+            bytes_retrans: 0,
+            dsack_dups: 0,
             pacing_rate: u64::MAX,
             max_pacing_rate: u64::MAX,
             bytes_acked: 0,
@@ -346,6 +380,7 @@ impl TcpInfo {
             (152, self.data_segs_in),
             (156, self.data_segs_out),
             (192, self.delivered),
+            (216, self.dsack_dups),
             (228, self.snd_wnd),
             (232, self.rcv_wnd),
         ];
@@ -359,6 +394,7 @@ impl TcpInfo {
             (128, self.bytes_received),
             (160, self.delivery_rate),
             (200, self.bytes_sent),
+            (208, self.bytes_retrans),
         ];
         for (at, value) in longs {
             out[at..at + 8].copy_from_slice(&value.to_le_bytes());
@@ -368,6 +404,10 @@ impl TcpInfo {
     }
 }
 
+/// The MSS an IPv4 or IPv6 loopback connection advertises.
+pub(crate) fn advertised_mss(v4: bool) -> u32 {
+    if v4 { ADVMSS } else { ADVMSS_V6 }
+}
 /// The segments `bytes` take, of [`SND_MSS`] each.
 fn segments(bytes: u64) -> u32 {
     u32::try_from(bytes.div_ceil(u64::from(SND_MSS))).unwrap_or(u32::MAX)

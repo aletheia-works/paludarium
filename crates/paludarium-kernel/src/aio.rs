@@ -39,6 +39,7 @@ use paludarium_host::FileHandle;
 use paludarium_mmu::{AddressSpace, PageSource, SharedPages};
 use paludarium_types::{Errno, GuestAddr};
 
+use crate::events::DEFAULT_POLLMASK;
 use crate::syscalls::{Context, Outcome, err, ok};
 
 /// `struct aio_ring`: its fields, then the events after it.
@@ -88,8 +89,6 @@ const POLLERR: u32 = 0x8;
 const POLLHUP: u32 = 0x10;
 const POLLRDNORM: u32 = 0x40;
 const POLLWRNORM: u32 = 0x100;
-/// What `vfs_poll` gives of a file without `poll` (`DEFAULT_POLLMASK`).
-const DEFAULT_POLLMASK: u32 = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;

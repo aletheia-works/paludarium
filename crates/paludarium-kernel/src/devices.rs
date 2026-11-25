@@ -273,8 +273,14 @@ impl FileHandle for Device {
         );
         Ok(())
     }
+    /// `random_poll`, the only device here with a poll: `POLLIN` and
+    /// `POLLRDNORM`, its pool being ready. The others can join no epoll, and
+    /// are always ready to poll (`DEFAULT_POLLMASK`).
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
-        Ok((crate::events::IN | crate::events::OUT, 1, 1))
+        match self.kind {
+            Kind::Random => Ok((0x41, 1, 1)),
+            _ => Err(Errno::EPERM),
+        }
     }
 }
 #[cfg(test)]
@@ -319,7 +325,11 @@ mod device_tests {
     #[test]
     fn readiness_and_empty_write() {
         let file = null(2);
-        assert_eq!(file.readiness().unwrap().0, 5);
+        assert_eq!(file.readiness(), Err(Errno::EPERM));
+        assert_eq!(
+            Device::new(Kind::Random, 0, None).readiness(),
+            Ok((0x41, 1, 1))
+        );
         assert_eq!(file.write(b""), Ok(0));
     }
     #[test]

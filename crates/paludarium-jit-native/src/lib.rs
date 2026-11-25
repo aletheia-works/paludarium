@@ -19,6 +19,7 @@ mod exec;
 mod tests;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use paludarium_cpu::compile::Compiler;
 
@@ -32,6 +33,60 @@ pub const DEFAULT_THRESHOLD: u16 = 300;
 #[must_use]
 pub fn compiler(threshold: u16) -> Option<Arc<dyn Compiler>> {
     compiler_with(threshold, true)
+}
+
+/// The requests for code that a guest thread waits for (synchronous mode
+/// only), for a test's clock that should not pass while one does.
+#[derive(Debug, Default)]
+pub struct Waits {
+    started: AtomicU64,
+    waiting: AtomicUsize,
+}
+
+impl Waits {
+    /// How many have been made, and how many wait now.
+    #[must_use]
+    pub fn counts(&self) -> (u64, usize) {
+        (
+            self.started.load(Ordering::SeqCst),
+            self.waiting.load(Ordering::SeqCst),
+        )
+    }
+    /// One more request, which waits until the guard drops, whatever it
+    /// comes to.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn begin(&self) -> Waiting<'_> {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        self.started.fetch_add(1, Ordering::SeqCst);
+        Waiting(self)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct Waiting<'a>(&'a Waits);
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// [`compiler_with`]`(threshold, false)`, with the counts of its requests.
+#[must_use]
+pub fn waiting_compiler(threshold: u16) -> Option<(Arc<dyn Compiler>, Arc<Waits>)> {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        native::NativeCompiler::new(threshold, false).map(|compiler| {
+            let waits = compiler.waits();
+            (Arc::new(compiler) as Arc<dyn Compiler>, waits)
+        })
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    {
+        let _ = threshold;
+        None
+    }
 }
 
 /// [`compiler`], but when `background` is false the thread that runs the
@@ -67,8 +122,8 @@ mod native {
     use paludarium_cpu::compile::{CompiledBlock, Compiler, Form};
     use paludarium_mmu::AddressSpace;
 
-    use crate::emit;
     use crate::exec::{self, Code, Context};
+    use crate::{Waits, emit};
 
     /// Counts of what the compiler did, for measuring.
     #[derive(Default)]
@@ -150,14 +205,18 @@ mod native {
     /// The JIT's own thread, which does the jobs in turn and ends with the
     /// `Worker`; it starts with the first job.
     #[derive(Default)]
-    pub(crate) struct Worker(Mutex<Option<Sender<Job>>>);
+    pub(crate) struct Worker {
+        queue: Mutex<Option<Sender<Job>>>,
+        /// The requests that wait.
+        waits: Arc<Waits>,
+    }
 
     impl Worker {
         /// Hands `job` to the thread, starting it first if need be; false
         /// when it cannot be had. A panic in `job` ends the thread, which
         /// then drops the jobs it has not done and cannot be had again.
         fn send(&self, job: Job) -> bool {
-            let mut queue = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
             if queue.is_none() {
                 let (sender, receiver) = mpsc::channel::<Job>();
                 let started = std::thread::Builder::new()
@@ -175,6 +234,10 @@ mod native {
             queue.as_ref().is_some_and(|q| q.send(job).is_ok())
         }
 
+        pub(crate) fn waits(&self) -> Arc<Waits> {
+            self.waits.clone()
+        }
+
         /// Does `work` on the thread and waits for its end; false when the
         /// thread cannot be had. `work` may not call this. When `work`
         /// panics, so does this, and the thread goes on to the next job.
@@ -182,6 +245,7 @@ mod native {
         /// The wait is not one of the host's that count as the guest
         /// thread's context switches (`paludarium_host::switches`).
         pub(crate) fn run(&self, work: impl FnOnce() + Send + 'static) -> bool {
+            let _waiting = self.waits.begin();
             let (done, ended) = mpsc::sync_channel(1);
             let job = move || {
                 let _ = done.send(catch_unwind(AssertUnwindSafe(work)));
@@ -259,6 +323,10 @@ mod native {
                 worker: Worker::default(),
                 background,
             })
+        }
+
+        pub(crate) fn waits(&self) -> Arc<Waits> {
+            self.worker.waits()
         }
 
         #[cfg(test)]

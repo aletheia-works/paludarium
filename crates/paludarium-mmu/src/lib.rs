@@ -339,17 +339,34 @@ pub mod faults {
         static FORCED: Cell<u64> = const { Cell::new(0) };
         static SINK: RefCell<Option<Arc<dyn Sink>>> = const { RefCell::new(None) };
         static KERNEL: Cell<bool> = const { Cell::new(false) };
-        static GUP: Cell<bool> = const { Cell::new(false) };
+        static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
     }
 
+    /// Whether an access goes through `get_user_pages`, and how.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Gup {
+        /// It is a copy, whose fault the CPU takes.
+        No,
+        /// Its fault may drop the space's lock and try again
+        /// (`FAULT_FLAG_ALLOW_RETRY`): `FOLL_UNLOCKABLE`, as `process_vm_rw`,
+        /// `mm_populate`, `MADV_POPULATE` and `pin_user_pages_fast` have it.
+        Unlockable,
+        /// Its fault may not: `ptrace`'s, a core dump's, `mprotect`'s.
+        Locked,
+    }
+
     /// What a kernel access to user memory that faults may do before it
-    /// fails, as Linux's `do_user_addr_fault` serves the kernel's faults as
-    /// it does an instruction's: grow a mapping that grows down, or wait for
-    /// a `userfaultfd` to fill the page. It is asked with no lock of the
-    /// space held, and says whether the access may be tried again.
+    /// fails: for a copy (`gup` false), what an instruction's fault may, as
+    /// Linux's `do_user_addr_fault` serves the kernel's faults so, which is
+    /// to grow a mapping that grows down or to wait for a `userfaultfd` to
+    /// fill the page; for one through `get_user_pages`, only the wait, as
+    /// `gup_vma_lookup` expands no stack. `space` is the one it accesses,
+    /// which is not the thread's own for `process_vm_readv`'s. It is asked
+    /// with no lock of the space held, and says whether the access may be
+    /// tried again.
     pub trait Resolver: Send + Sync {
-        fn resolve(&self, addr: u64, write: bool) -> bool;
+        fn resolve(&self, space: &super::MemoryView, addr: u64, write: bool, gup: bool) -> bool;
     }
 
     /// Resolves the calling host thread's kernel accesses that fault with
@@ -358,18 +375,35 @@ pub mod faults {
         RESOLVER.with(|r| std::mem::replace(&mut *r.borrow_mut(), resolver))
     }
 
-    /// Whether the kernel's access that took `fault` may be tried again,
-    /// as the calling host thread's resolver says; an instruction's access,
-    /// one through `get_user_pages` and a bus error are not resolved here.
-    pub(crate) fn resolve(fault: &super::Fault) -> bool {
-        if !KERNEL.with(Cell::get) || GUP.with(Cell::get) || fault.bus || fault.fetch {
+    /// Runs `f` with the calling host thread's faults not resolved, as
+    /// Linux's `pagefault_disable` has an access fail at once that would
+    /// wait: for one made under a lock another thread may need meanwhile.
+    pub fn unresolved<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Arc<dyn Resolver>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_resolver(self.0.take());
+            }
+        }
+        let _restore = Restore(set_resolver(None));
+        f()
+    }
+
+    /// Whether the kernel's access to the space `space` views that took
+    /// `fault` may be tried again, as the calling host thread's resolver
+    /// says; an instruction's access, one through `get_user_pages` that may
+    /// not drop the lock ([`through_gup_locked`]) and a bus error are not
+    /// resolved here.
+    pub(crate) fn resolve(space: impl FnOnce() -> super::MemoryView, fault: &super::Fault) -> bool {
+        let gup = GUP.with(Cell::get);
+        if !KERNEL.with(Cell::get) || gup == Gup::Locked || fault.bus || fault.fetch {
             return false;
         }
         // Taken out first, so that what it does may itself access memory.
         let Some(resolver) = RESOLVER.with(|r| r.borrow().clone()) else {
             return false;
         };
-        resolver.resolve(fault.addr.0, fault.write)
+        resolver.resolve(&space(), fault.addr.0, fault.write, gup != Gup::No)
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
@@ -393,7 +427,7 @@ pub mod faults {
     }
 
     pub(crate) fn count() {
-        if GUP.with(Cell::get) {
+        if GUP.with(Cell::get) != Gup::No {
             count_forced();
         } else if !add(false) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
@@ -461,15 +495,27 @@ pub mod faults {
     /// checks of a read or a write, but `handle_mm_fault` is passed no
     /// registers, so their faults count to the task's `min_flt` with no
     /// `perf` event ([`Sink::forced`], [`take_forced`]), as Linux's
-    /// `mm_account_fault` counts them.
+    /// `mm_account_fault` counts them. A fault may drop the space's lock
+    /// and try again (`FOLL_UNLOCKABLE`), so it waits for a `userfaultfd`.
     pub fn through_gup<T>(f: impl FnOnce() -> T) -> T {
-        struct Restore(bool);
+        through(Gup::Unlockable, f)
+    }
+
+    /// [`through_gup`], with the space's lock kept: a page that a
+    /// `userfaultfd` should fill fails (`handle_userfault` without
+    /// `FAULT_FLAG_ALLOW_RETRY`), as for `mprotect`'s population.
+    pub fn through_gup_locked<T>(f: impl FnOnce() -> T) -> T {
+        through(Gup::Locked, f)
+    }
+
+    fn through<T>(how: Gup, f: impl FnOnce() -> T) -> T {
+        struct Restore(Gup);
         impl Drop for Restore {
             fn drop(&mut self) {
                 GUP.with(|gup| gup.set(self.0));
             }
         }
-        let _restore = Restore(GUP.with(|gup| gup.replace(true)));
+        let _restore = Restore(GUP.with(|gup| gup.replace(how)));
         f()
     }
 
@@ -1722,6 +1768,18 @@ pub enum Placement {
     Aligned {
         hint: Option<GuestAddr>,
         size: u64,
+        offset: u64,
+    },
+    /// Where Linux's `__thp_get_unmapped_area` puts memory that may take
+    /// transparent huge pages, private anonymous memory of whole 2 MiB
+    /// (with no hint, `offset` 0) and a private mapping of `/dev/zero`: in
+    /// an area 2 MiB longer, at the boundary its `offset` agrees with, the
+    /// boundary above the start in the top-down layout when that start is
+    /// one; at the hint if the longer area fits there. Without a whole
+    /// 2 MiB past its first boundary, or room for the longer area, it goes
+    /// where `Near` would.
+    Thp {
+        hint: Option<GuestAddr>,
         offset: u64,
     },
 }
@@ -3093,54 +3151,28 @@ impl AddressSpaceData {
             .take_while(|(_, shared)| shared.end > start)
             .any(|(&from, _)| self.gup_refused(from.max(start)))
     }
-    /// Linux's `pin_user_pages` with `FOLL_WRITE | FOLL_LONGTERM`
-    /// ([`AddressSpace::pin`]).
-    fn pin(&self, addr: GuestAddr, len: usize) -> Result<Pinned, Errno> {
-        if len == 0 {
-            return Err(Errno::EINVAL);
-        }
-        let end = addr.0.checked_add(len as u64).ok_or(Errno::EOVERFLOW)?;
-        let start = addr.0 - addr.0 % PAGE_SIZE;
-        // `check_vma_flags`: a mapping of no pages or of a `memfd_secret`
-        // file, then a shared mapping of a file whose pages are written back
-        // (`writable_file_mapping_allowed`), which shared memory, a memfd and
-        // tmpfs are not.
+    /// Pins the page at `page` for writing, for [`AddressSpace::pin`]: `None`
+    /// where `check_vma_flags` refuses it, which a mapping of no pages or of
+    /// a `memfd_secret` file is, and a shared mapping of a file whose pages
+    /// are written back (`writable_file_mapping_allowed`), which shared
+    /// memory, a memfd and tmpfs are not. The page faults in to be written,
+    /// which breaks its copy-on-write and gives it its own contents.
+    fn pin_page(&mut self, page: u64) -> Option<Result<PinnedFrame, Fault>> {
         let written_back = self
-            .shared
-            .range(..end)
-            .rev()
-            .take_while(|(_, shared)| shared.end > start)
-            .any(|(_, shared)| {
-                shared
-                    .pages
-                    .source
-                    .as_ref()
-                    .is_some_and(|source| !source.shmem_file())
-            });
-        if self.gup_refused_in(start, end) || written_back {
-            return Err(Errno::EFAULT);
+            .shared_at(page)
+            .and_then(|shared| shared.pages.source.as_ref())
+            .is_some_and(|source| !source.shmem_file());
+        if written_back || self.gup_refused(page) {
+            return None;
         }
-        // The pages fault in to be written, which breaks their copy-on-write
-        // and gives each its own contents; a page that may not be written
-        // (read-only, `PROT_NONE`, none at all) is `EFAULT`.
-        faults::through_gup(|| self.prepare_write(addr, len, Access::Write))
-            .map_err(|_| Errno::EFAULT)?;
-        let directory = self.read_directory();
-        let mut frames = Vec::new();
-        for (page, _, _) in chunks(addr, len) {
-            let entry = lookup(&directory, page).ok_or(Errno::EFAULT)?;
-            let shared = self.shared_at(page).map(|shared| shared.pages.clone());
-            frames.push(PinnedFrame::new(
-                Arc::clone(&entry.frame),
-                shared,
-                Arc::clone(&self.code),
-            ));
+        match self.prepare_write(GuestAddr(page), 1, Access::Write) {
+            Ok(true) => self.mark_written(GuestAddr(page), 1),
+            Ok(false) => {}
+            Err(fault) => return Some(Err(fault)),
         }
-        Ok(Pinned {
-            frames,
-            offset: page_offset(addr.0),
-            len,
-        })
+        let frame = Arc::clone(&lookup(&self.read_directory(), page)?.frame);
+        let shared = self.shared_at(page).map(|shared| shared.pages.clone());
+        Some(Ok(PinnedFrame::new(frame, shared, Arc::clone(&self.code))))
     }
     fn shared_at(&self, page: u64) -> Option<&SharedMapping> {
         self.shared
@@ -4339,10 +4371,10 @@ impl AddressSpaceData {
             // copy goes to the thread's resolver first ([`faults::resolve`],
             // with the space unlocked), which waits, and is `EFAULT` only
             // when it does not (`UFFD_USER_MODE_ONLY`, `UFFD_FEATURE_SIGBUS`,
-            // a released context, a fatal signal).
-            if matches!(access, Access::Read | Access::Write | Access::Fetch)
-                && self.userfault_waits(directory, page).is_some()
-            {
+            // a fatal signal). One through `get_user_pages` goes there if it
+            // may drop the lock, a population's included, and fails if not
+            // (`ptrace`'s, a core dump's).
+            if access != Access::Setup && self.userfault_waits(directory, page).is_some() {
                 return Err(Fault {
                     mapped: true,
                     present: false,
@@ -4395,12 +4427,16 @@ impl AddressSpaceData {
             }
             // A write to a page with a uffd-wp marker, which the kernel
             // takes to its `userfaultfd` ([`Self::userfault_for`]); with
-            // `WP_ASYNC` the page faults in without the protection.
-            if access == Access::Write
-                && lookup(directory, page).is_none()
-                && self.uffd_marked(page)
-                && !self.wp_async(page)
-            {
+            // `WP_ASYNC` the page faults in without the protection. A forced
+            // write meets an entry's protection here too, as
+            // `can_follow_write_pte` never overrides it.
+            let protected = match lookup(directory, page) {
+                Some(p) => access == Access::ForceWrite && p.uffd_wp,
+                None => {
+                    matches!(access, Access::Write | Access::ForceWrite) && self.uffd_marked(page)
+                }
+            };
+            if protected && !self.wp_async(page) {
                 return Err(Fault {
                     mapped: true,
                     present: false,
@@ -5113,6 +5149,43 @@ impl AddressSpaceData {
                 at
             },
         )
+    }
+    /// Where memory that may take transparent huge pages goes
+    /// ([`Placement::Thp`], Linux's `__thp_get_unmapped_area`): `None`
+    /// where it goes as any other would.
+    fn thp_area(&self, len: u64, hint: Option<u64>, offset: u64) -> Option<u64> {
+        let size = BLOCK_SIZE;
+        let len = GuestAddr(len).page_align_up()?.0;
+        let end = offset.checked_add(len)?;
+        let first = offset.checked_next_multiple_of(size)?;
+        if end <= first || end - first < size {
+            return None;
+        }
+        let padded = len.checked_add(size)?;
+        offset.checked_add(padded)?;
+        let free_at = |at: u64| {
+            at >= MMAP_MIN_ADDR
+                && at
+                    .checked_add(padded)
+                    .is_some_and(|stop| stop <= USER_ADDRESS_LIMIT - PAGE_SIZE)
+                && !self.overlaps(at, at + padded)
+                // Linux looks for the longer area's guard gap too.
+                && self
+                    .mappings
+                    .range(at..)
+                    .next()
+                    .is_none_or(|(_, m)| at + padded <= m.start_gap())
+        };
+        let found = match hint {
+            Some(hint) if free_at(hint) => return Some(hint),
+            _ => self.find_free(padded)?,
+        };
+        let below = offset.wrapping_sub(found) & (size - 1);
+        Some(if self.bottom_up.is_none() && below == 0 {
+            found + size
+        } else {
+            found + below
+        })
     }
     fn find_free(&self, len: u64) -> Option<u64> {
         if let Some(base) = self.bottom_up {
@@ -5838,8 +5911,15 @@ impl AddressSpaceData {
             })
             .filter(|(source, _)| source.huge_placement())
             .map(|(_, shift)| addr.0.wrapping_add(shift) & (BLOCK_SIZE - 1));
-        let free_for = |data: &Self, len: u64| match huge {
+        // Private anonymous memory moved without a hint to a length of
+        // whole 2 MiB goes where transparent huge pages fit it
+        // (`__get_unmapped_area`'s `thp_get_unmapped_area_vmflags`).
+        let anonymous = self.shared_at(addr.0).is_none() && self.backing_at(addr.0).is_none();
+        let free_for = |data: &Self, len: u64, hinted: bool| match huge {
             Some(offset) => data.aligned_area(len, BLOCK_SIZE, offset),
+            None if anonymous && !hinted && len.is_multiple_of(BLOCK_SIZE) => {
+                data.thp_area(len, None, 0).or_else(|| data.find_free(len))
+            }
             None => data.find_free(len),
         };
         // A shrink may cross the end of the VMA: only what stays must not.
@@ -5864,7 +5944,7 @@ impl AddressSpaceData {
             } else if hint != 0 && hint >= MMAP_MIN_ADDR && !self.overlaps(hint, hint + new_len) {
                 hint
             } else {
-                free_for(self, new_len).ok_or(Errno::ENOMEM)?
+                free_for(self, new_len, hint != 0).ok_or(Errno::ENOMEM)?
             };
             if old_len > new_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
@@ -5915,7 +5995,7 @@ impl AddressSpaceData {
         if !how.may_move {
             return Err(Errno::ENOMEM);
         }
-        let to = free_for(self, new_len).ok_or(Errno::ENOMEM)?;
+        let to = free_for(self, new_len, false).ok_or(Errno::ENOMEM)?;
         if !moves(new_len) {
             return Err(Errno::EINVAL);
         }
@@ -8087,26 +8167,74 @@ impl MemoryView {
     /// How many bytes were copied, or `None` once the space is gone.
     #[must_use]
     pub fn read_pages(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
-        faults::through_gup(|| self.read_pages_in(addr, buf))
-    }
-    fn read_pages_in(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
-        self.with_data(|data| {
+        faults::through_gup(|| {
             let mut copied = 0;
             for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
-                let readable = data
-                    .mapping_at(page)
-                    .is_some_and(|m| m.prot.contains(Prot::READ));
-                if !readable
-                    || data.gup_refused(page)
-                    || data
-                        .read(GuestAddr(page + offset as u64), &mut buf[range.clone()])
-                        .is_err()
-                {
+                let at = GuestAddr(page + offset as u64);
+                let read = self.retried(|data| {
+                    let readable = data
+                        .mapping_at(page)
+                        .is_some_and(|m| m.prot.contains(Prot::READ));
+                    (readable && !data.gup_refused(page))
+                        .then(|| data.read(at, &mut buf[range.clone()]))
+                })?;
+                if !read {
                     break;
                 }
                 copied = range.end;
             }
-            copied
+            Some(copied)
+        })
+    }
+    /// Runs `f`, an access through `get_user_pages` to one page, until it
+    /// succeeds or its fault is not resolved ([`faults::Resolver`]), with
+    /// the space unlocked between: whether it succeeded, not so where it is
+    /// refused (`None`). `None` once the space is gone.
+    fn retried(
+        &self,
+        mut f: impl FnMut(&mut AddressSpaceGuard<'_>) -> Option<Result<(), Fault>>,
+    ) -> Option<bool> {
+        loop {
+            match self.with_guard(&mut f)? {
+                Some(Ok(())) => return Some(true),
+                Some(Err(fault)) if faults::resolve(|| self.clone(), &fault) => {}
+                _ => return Some(false),
+            }
+        }
+    }
+    /// Faults the `pages` pages from the one at `page` in, to be read or
+    /// with `write` written, as Linux's `pin_user_pages_remote` does for
+    /// `process_vm_rw`: how many were, up to the first that
+    /// [`Self::read_pages`] or [`Self::write_pages`] would stop at. `None`
+    /// once the space is gone.
+    #[must_use]
+    pub fn fault_in_pages(&self, page: u64, pages: u64, write: bool) -> Option<u64> {
+        faults::through_gup(|| {
+            for n in 0..pages {
+                let Some(page) = page.checked_add(n * PAGE_SIZE) else {
+                    return Some(n);
+                };
+                let at = GuestAddr(page);
+                let done = self.retried(|data| {
+                    if data.gup_refused(page) {
+                        return None;
+                    }
+                    if write {
+                        return Some(data.prepare_write(at, 1, Access::Write).map(|first| {
+                            if first {
+                                data.mark_written(at, 1);
+                            }
+                        }));
+                    }
+                    data.mapping_at(page)
+                        .is_some_and(|m| m.prot.contains(Prot::READ))
+                        .then(|| data.read(at, &mut [0]))
+                })?;
+                if !done {
+                    return Some(n);
+                }
+            }
+            Some(pages)
         })
     }
     /// Copies `buf` into the space at `addr`, as Linux's
@@ -8117,32 +8245,28 @@ impl MemoryView {
     /// were copied, or `None` once the space is gone.
     #[must_use]
     pub fn write_pages(&self, addr: u64, buf: &[u8]) -> Option<usize> {
-        faults::through_gup(|| self.write_pages_in(addr, buf))
-    }
-    fn write_pages_in(&self, addr: u64, buf: &[u8]) -> Option<usize> {
-        let data = self.data.upgrade()?;
-        let serialization = lock_spinning(&self.serialization);
-        let mut guard = AddressSpaceGuard {
-            data: lock_spinning(&data),
-            _serialization: serialization,
-        };
-        let mut copied = 0;
-        for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
-            let at = GuestAddr(page + offset as u64);
-            if guard.gup_refused(page) {
-                break;
-            }
-            match guard.write_with(at, &buf[range.clone()], Access::Write) {
-                Ok(first) => {
-                    if first {
-                        guard.mark_written(at, range.len() as u64);
+        faults::through_gup(|| {
+            let mut copied = 0;
+            for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
+                let at = GuestAddr(page + offset as u64);
+                let written = self.retried(|data| {
+                    if data.gup_refused(page) {
+                        return None;
                     }
+                    let written = data.write_with(at, &buf[range.clone()], Access::Write);
+                    Some(written.map(|first| {
+                        if first {
+                            data.mark_written(at, range.len() as u64);
+                        }
+                    }))
+                })?;
+                if !written {
+                    break;
                 }
-                Err(_) => break,
+                copied = range.end;
             }
-            copied = range.end;
-        }
-        Some(copied)
+            Some(copied)
+        })
     }
     /// Copies the space's memory at `addr` into `buf` as `ptrace` reads it
     /// (Linux's `access_remote_vm` with `FOLL_FORCE`): page by page, any
@@ -8619,7 +8743,9 @@ impl AddressSpace {
                 data.map(Some(at), len, prot, kind)?
             }
             Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
-            Placement::Near(hint) | Placement::Aligned { hint, .. } => {
+            Placement::Near(hint)
+            | Placement::Aligned { hint, .. }
+            | Placement::Thp { hint, .. } => {
                 // A hint within the guard gap below a mapping that grows
                 // down is not taken (`vm_start_gap`).
                 let hint = hint.filter(|hint| {
@@ -8628,15 +8754,25 @@ impl AddressSpace {
                         .next()
                         .is_none_or(|(_, m)| hint.0.saturating_add(len) <= m.start_gap())
                 });
-                match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
-                    Some(at) => at,
-                    None => match placement {
-                        Placement::Aligned { size, offset, .. } => {
-                            let at = data.aligned_area(len, size, offset);
-                            data.map(at.map(GuestAddr), len, prot, kind)?
-                        }
-                        _ => data.map(None, len, prot, kind)?,
-                    },
+                let thp = match placement {
+                    Placement::Thp { offset, .. } => {
+                        data.thp_area(len, hint.map(|hint| hint.0), offset)
+                    }
+                    _ => None,
+                };
+                if let Some(at) = thp {
+                    data.map(Some(GuestAddr(at)), len, prot, kind)?
+                } else {
+                    match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
+                        Some(at) => at,
+                        None => match placement {
+                            Placement::Aligned { size, offset, .. } => {
+                                let at = data.aligned_area(len, size, offset);
+                                data.map(at.map(GuestAddr), len, prot, kind)?
+                            }
+                            _ => data.map(None, len, prot, kind)?,
+                        },
+                    }
                 }
             }
         };
@@ -8848,7 +8984,7 @@ impl AddressSpace {
             // The lock goes before the fault is resolved ([`faults::Resolver`]).
             let result = self.locked().read(addr, buf);
             match result {
-                Err(fault) if faults::resolve(&fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
                 result => return result,
             }
         }
@@ -8895,6 +9031,19 @@ impl AddressSpace {
     pub fn read_for_dump(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().read_for_dump(addr, buf)
     }
+    /// Brings the page at `addr` in by reading it whatever its protection,
+    /// as Linux's `populate_vma_page_range` does (`FOLL_FORCE`), through
+    /// `get_user_pages` as [`faults::through_gup`] (or, for a call made in
+    /// [`faults::through_gup_locked`], that).
+    pub fn populate(&self, addr: GuestAddr) -> Result<(), Fault> {
+        loop {
+            let result = self.locked().read_for_dump(addr, &mut [0]);
+            match result {
+                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                result => return result,
+            }
+        }
+    }
     /// Reads guest memory for a core dump, leaving the holes Linux's
     /// `FOLL_DUMP` leaves ([`AddressSpaceData::read_for_core`]).
     pub fn read_for_core(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
@@ -8907,7 +9056,7 @@ impl AddressSpace {
             }
             let result = Self::write_locked(self.locked(), addr, buf);
             match result {
-                Err(fault) if faults::resolve(&fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
                 result => return result,
             }
         }
@@ -9028,7 +9177,7 @@ impl AddressSpace {
                 data.check(&data.read_directory(), addr, len, access, false)
             };
             match result {
-                Err(fault) if faults::resolve(&fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
                 result => return result,
             }
         }
@@ -9343,9 +9492,50 @@ impl AddressSpace {
     /// `memfd_secret` file, or of a shared mapping of a file whose pages are
     /// written back (a disk file's, not shared memory, a memfd or tmpfs);
     /// `EINVAL` for none and `EOVERFLOW` for a range past the end. The
-    /// pages fault in to be written, which breaks their copy-on-write.
+    /// pages fault in to be written, which breaks their copy-on-write, one
+    /// after another: one whose fault a `userfaultfd` takes is waited for
+    /// with the space unlocked (`gup_fast_fallback` passes
+    /// `FOLL_UNLOCKABLE`) and those before it pinned. So it is called with
+    /// no lock a filling thread may need.
     pub fn pin(&self, addr: GuestAddr, len: usize) -> Result<Pinned, Errno> {
-        self.locked().pin(addr, len)
+        /// Linux's `TASK_SIZE_MAX`.
+        const USER_END: u64 = (1 << 47) - PAGE_SIZE;
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = addr.0.checked_add(len as u64).ok_or(Errno::EOVERFLOW)?;
+        if end > USER_END {
+            return Err(Errno::EFAULT);
+        }
+        let mut pages = chunks(addr, len).map(|(page, _, _)| page).peekable();
+        let mut frames = Vec::new();
+        faults::through_gup(|| {
+            while let Some(&first) = pages.peek() {
+                let mut space = self.locked();
+                let mut page = first;
+                let fault = loop {
+                    match space.pin_page(page).ok_or(Errno::EFAULT)? {
+                        Ok(frame) => frames.push(frame),
+                        Err(fault) => break Some(fault),
+                    }
+                    pages.next();
+                    match pages.peek() {
+                        Some(&next) => page = next,
+                        None => break None,
+                    }
+                };
+                drop(space);
+                if fault.is_some_and(|fault| !faults::resolve(|| self.view(), &fault)) {
+                    return Err(Errno::EFAULT);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(Pinned {
+            frames,
+            offset: page_offset(addr.0),
+            len,
+        })
     }
     /// The shared mappings of the space, by address.
     #[must_use]
@@ -9454,30 +9644,43 @@ impl AddressSpace {
         operation: AtomicOp,
     ) -> Result<AtomicResult, Fault> {
         let size = width.bytes();
-        let result = if page_offset(addr.0) % WORD_BYTES + size <= WORD_BYTES {
-            match self.atomic_unlocked(addr, size, operation) {
-                Some(result) => result,
-                None => {
-                    // Not a read and then a write under the locks: a store
-                    // or a locked instruction of another thread, which takes
-                    // none, could come between them.
-                    let mut data = self.locked();
-                    let first = data.prepare_write(addr, size, Access::Write)?;
-                    let result = data.update(addr, size, operation)?;
-                    if first {
-                        data.mark_written(addr, size as u64);
-                    }
-                    result
+        let result = loop {
+            let result = if page_offset(addr.0) % WORD_BYTES + size <= WORD_BYTES {
+                match self.atomic_unlocked(addr, size, operation) {
+                    Some(result) => Ok(result),
+                    None => self.atomic_locked(addr, size, operation),
                 }
+            } else {
+                self.atomic_spanning(addr, size, operation)
+            };
+            match result {
+                Ok(result) => break result,
+                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) => return Err(fault),
             }
-        } else {
-            self.atomic_spanning(addr, size, operation)?
         };
         // A locked instruction is a full fence. Earlier loads and stores
         // already come before its store, which releases them. But an
         // `Acquire` load after it may pass it on Arm, and Go's scheduler, for
         // one, depends on it not.
         std::sync::atomic::fence(Ordering::SeqCst);
+        Ok(result)
+    }
+    /// [`Self::atomic`] within one word under the locks: not a read and then
+    /// a write, as a store or a locked instruction of another thread, which
+    /// takes none, could come between them.
+    fn atomic_locked(
+        &self,
+        addr: GuestAddr,
+        size: usize,
+        operation: AtomicOp,
+    ) -> Result<AtomicResult, Fault> {
+        let mut data = self.locked();
+        let first = data.prepare_write(addr, size, Access::Write)?;
+        let result = data.update(addr, size, operation)?;
+        if first {
+            data.mark_written(addr, size as u64);
+        }
         Ok(result)
     }
     /// [`Self::atomic`] within one word through this thread's [`ThreadTlb`];
@@ -9973,6 +10176,42 @@ mod tests {
             .unwrap();
         space.pin(shared, PAGE_BYTES).unwrap().write(9, b"s");
         assert_eq!(byte(&space, shared.0 + 9), b's');
+    }
+
+    #[test]
+    fn a_pin_faults_its_pages_in_one_after_another() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        // The second page refused, the first is in all the same, written
+        // (`anon_vma_prepare`) and let go of.
+        space
+            .protect_shared(GuestAddr(at.0 + PAGE_SIZE), PAGE_SIZE, Prot::READ)
+            .unwrap();
+        let _ = faults::take_forced();
+        assert!(!space.core_state(at).written);
+        assert_eq!(space.pin(at, PAGE_BYTES + 1).err(), Some(Errno::EFAULT));
+        assert_eq!(faults::take_forced(), 1);
+        assert!(space.core_state(at).written);
+        assert_eq!(space.resident(at), Some(true));
+        let data = space.locked();
+        let pins =
+            lookup(&data.read_directory(), at.0).map(|p| p.frame.pins.load(Ordering::SeqCst));
+        assert_eq!(pins, Some(0));
+        drop(data);
+        // A range past the user addresses faults nothing in.
+        let top = GuestAddr((1 << 47) - PAGE_SIZE);
+        assert_eq!(space.pin(top, 1).err(), Some(Errno::EFAULT));
+        assert_eq!(
+            space.pin(GuestAddr(u64::MAX), 1).err(),
+            Some(Errno::EOVERFLOW)
+        );
     }
 
     #[test]

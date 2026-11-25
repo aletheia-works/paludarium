@@ -152,9 +152,11 @@ fn run_mounted(
     let host = std::sync::Arc::new(MountedHost {
         record: RecordingHost::new(),
     });
-    let session =
-        paludarium_harness::with_test_jit(paludarium::Session::new(config, host.clone()).unwrap())
-            .unwrap();
+    let session = paludarium_harness::with_test_jit(
+        paludarium::Session::new(config, host.clone()).unwrap(),
+        &host.record,
+    )
+    .unwrap();
     let start = std::time::Instant::now();
     let status = session.run().unwrap();
     let stop = session.termination_detail();
@@ -230,6 +232,7 @@ fn host_signed_mtime_stat_fstat() {
             });
             let session = paludarium_harness::with_test_jit(
                 paludarium::Session::new(config, host.clone()).unwrap(),
+                &host.record,
             )
             .unwrap();
             let start = std::time::Instant::now();

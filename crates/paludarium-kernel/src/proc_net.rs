@@ -147,7 +147,7 @@ fn route(network: Option<&Network>, now: Option<u64>) -> String {
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT";
     let _ = writeln!(out, "{head:<127}");
     for r in routes {
-        if r.table != TABLE_MAIN || matches!(r.kind, Kind::Broadcast) {
+        if r.table != TABLE_MAIN || matches!(r.kind, Kind::Broadcast | Kind::Multicast) {
             continue;
         }
         let hop = r.next_hops().first().cloned();

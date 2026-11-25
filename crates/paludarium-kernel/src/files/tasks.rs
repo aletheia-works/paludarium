@@ -1053,7 +1053,7 @@ pub(super) fn namespace(
 
 /// `net/<file>` of the task, opened with `flags`, of the network its
 /// namespace has then (`get_proc_task_net`); `ENOENT` once it has none, and
-/// `EACCES` to write (`seq_open_net`).
+/// `EACCES` to write (`seq_open_net`), which `O_PATH` does not ask.
 pub(super) fn net_file(
     c: &Context<'_>,
     task: &Task,
@@ -1065,7 +1065,7 @@ pub(super) fn net_file(
     if flags & O_DIRECTORY != 0 {
         return Err(Errno::ENOTDIR);
     }
-    if flags & 3 != 0 {
+    if flags & 3 != 0 && flags & super::O_PATH == 0 {
         return Err(Errno::EACCES);
     }
     // The first one's is the session's, if it has one.

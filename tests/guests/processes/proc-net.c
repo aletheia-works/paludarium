@@ -285,6 +285,7 @@ int main(int argc, char **argv) {
     opened("/proc/net", O_RDONLY | O_NOFOLLOW, "the link");
     opened("/proc/net", O_RDWR, "the directory to write");
     opened("/proc/net/dev", O_RDWR, "a file to write");
+    opened("/proc/net/dev", O_PATH | O_RDWR, "a file's path to write");
     opened("/proc/net/dev", O_RDONLY | O_DIRECTORY, "a file as a directory");
     opened("/proc/net/none-such", O_RDONLY | O_CREAT, "a file to make");
     int dir = open("/proc/net", O_RDONLY | O_DIRECTORY);

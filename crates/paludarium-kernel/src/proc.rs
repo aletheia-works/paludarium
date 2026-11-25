@@ -262,9 +262,10 @@ pub(crate) struct TaskPath {
 }
 /// The path under `/proc/<pid>` of a process other than `own`, the reader,
 /// under `task` of any process, under `/proc/thread-self`, the reading
-/// thread `own_tid`'s, or `/proc/net` and under it, the reader's; `None` for the rest of the reader's own directory,
-/// which [`own_entry`] finds, unless `own_leader_gone`: then the reader's
-/// process directory is its zombie leader's, found here as another's is.
+/// thread `own_tid`'s, or `/proc/net` and under it, the reader's; `None` for
+/// the rest of the reader's own directory, which [`own_entry`] finds, unless
+/// `own_leader_gone`: then the reader's process directory is its zombie
+/// leader's, found here as another's is.
 /// The path is taken as it reads, `.` and `..` included.
 pub(crate) fn task_path(
     path: &[u8],

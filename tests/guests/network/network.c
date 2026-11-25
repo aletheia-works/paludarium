@@ -242,11 +242,11 @@ static void held_read(const char *step, int s, long long start, int early, int l
            now - came >= late, ago >= late && ago <= now - start - early + 1);
 }
 static void held_signal(int number) { (void)number; }
-/* Holds data back while the first thread sleeps, and goes. */
+/* Holds data back once the first thread is about to sleep, and goes. */
+static int held_pipe[2];
 static void *held_thread(void *c) {
-    struct timespec t = {0, 100000000};
-    nanosleep(&t, NULL);
-    send(*(int *)c, "held", 4, MSG_MORE);
+    char byte;
+    if (read(held_pipe[0], &byte, 1) == 1) send(*(int *)c, "held", 4, MSG_MORE);
     return NULL;
 }
 /* What Nagle's algorithm, MSG_MORE and a delayed acknowledgement hold back
@@ -324,15 +324,30 @@ static void held(int l, int port) {
                 sigaction(SIGIO, &a, NULL);
                 fcntl(s, F_SETOWN, getpid());
                 fcntl(s, F_SETFL, O_ASYNC);
-                if (step == 8) {
-                    pthread_sigmask(SIG_BLOCK, &io, NULL);
-                    if (pthread_create(&other, NULL, held_thread, &c)) exit(70);
-                    pthread_sigmask(SIG_UNBLOCK, &io, NULL);
-                }
                 struct timespec t = {10, 0}, rest = {0, 0};
-                call("nanosleep", nanosleep(&t, &rest));
+                int slept = 0;
+                /* The emulator's test clock may pass the whole sleep before
+                   the other thread has run. */
+                for (int n = 0; n < 20 && !slept; n++) {
+                    if (step == 8) {
+                        if (pipe(held_pipe)) exit(70);
+                        pthread_sigmask(SIG_BLOCK, &io, NULL);
+                        if (pthread_create(&other, NULL, held_thread, &c)) exit(70);
+                        pthread_sigmask(SIG_UNBLOCK, &io, NULL);
+                        if (write(held_pipe[1], "g", 1) != 1) exit(70);
+                    }
+                    slept = nanosleep(&t, &rest);
+                    int error = errno;
+                    if (step == 8) {
+                        pthread_join(other, NULL);
+                        close(held_pipe[0]);
+                        close(held_pipe[1]);
+                        if (!slept) while (recv(s, bytes, sizeof bytes, 0) < 0) {}
+                    }
+                    errno = error;
+                }
+                call("nanosleep", slept);
                 printf("  rest=%d\n", rest.tv_sec >= 8);
-                if (step == 8) pthread_join(other, NULL);
                 ioctl(s, FIONREAD, &in);
                 printf("  in=%d\n", in);
             }

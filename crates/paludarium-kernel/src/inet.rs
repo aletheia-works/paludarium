@@ -5112,6 +5112,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             if (len as u32 as i32) < 4 {
                 return Err(Errno::EINVAL);
             }
+            let mut options = socket.options();
             if value != 0 {
                 if !socket.network.has_device(value) {
                     return Err(ENODEV);
@@ -5132,6 +5133,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 return Err(Errno::EINVAL);
             }
             let index = u32::from_be_bytes(value.to_le_bytes());
+            let mut options = socket.options();
             if index != 0 {
                 if !socket.network.has_device(index) {
                     return Err(EADDRNOTAVAIL);
@@ -5156,6 +5158,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 .read(GuestAddr(at), &mut raw)
                 .map_err(|_| Errno::EFAULT)?;
             let index = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+            let mut options = socket.options();
             if options.device != 0 && options.device != index {
                 return Err(Errno::EINVAL);
             }

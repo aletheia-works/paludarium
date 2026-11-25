@@ -17666,6 +17666,75 @@ static int generated_noexec_case(void) {
     return 0;
 }
 
+/* The file-code case: code run from a private mapping of a file's page.
+   While nothing wrote the mapping, it shows the page cache's page, so a
+   pwrite to the file shows in what the code returns; a truncation that
+   leaves the page past the end makes a fetch SIGBUS, and once the file
+   grows again the page shows the file's bytes. A write to the mapping
+   first gives it a copy of its own, which a pwrite no longer changes, but
+   which a truncation drops too (unmap_mapping_range with even_cows).
+   Each run calls the code 5000 times, well past the native JIT's
+   threshold of 300 entries; its four instructions before the ret are
+   ones the WebAssembly JIT translates, which it does for a block of three
+   or more at the first entry. */
+static sigjmp_buf fc_return;
+static volatile int fc_code;
+static volatile uintptr_t fc_addr;
+static void fc_on_bus(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)context;
+    fc_code = info->si_code;
+    fc_addr = (uintptr_t)info->si_addr;
+    siglongjmp(fc_return, 1);
+}
+/* mov eax, value; add rax, 1; sub rax, 1; add rax, 0; ret */
+static int fc_put(int fd, int value) {
+    unsigned char code[18] = {0xb8, value, 0, 0, 0, 0x48, 0x83, 0xc0, 1, 0x48,
+                              0x83, 0xe8, 1, 0x48, 0x83, 0xc0, 0, 0xc3};
+    return pwrite(fd, code, sizeof code, 0) == (ssize_t)sizeof code ? 0 : -1;
+}
+static void fc_run(const char *name, void *at) {
+    int (*volatile code)(void) = (int (*)(void))at;
+    if (sigsetjmp(fc_return, 1)) {
+        printf("%s: sigbus code=%d at=%d\n", name, fc_code, fc_addr == (uintptr_t)at);
+        return;
+    }
+    int value = 0;
+    for (int i = 0; i < 5000; i++) value = code();
+    printf("%s: returned=%d\n", name, value);
+}
+static int file_code_case(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = fc_on_bus;
+    action.sa_flags = SA_SIGINFO | SA_NODEFER;
+    if (sigaction(SIGBUS, &action, NULL)) return 91;
+    char file[] = "/tmp/paludarium-file-code-XXXXXX";
+    int fd = mkstemp(file);
+    if (fd < 0) return 92;
+    if (ftruncate(fd, 4096) || fc_put(fd, 1)) return 93;
+    char *shown = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    char *copied = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    if (shown == MAP_FAILED || copied == MAP_FAILED) return 94;
+    fc_run("shown first", shown);
+    fc_run("copied first", copied);
+    copied[100] = 1;
+    if (fc_put(fd, 2)) return 95;
+    fc_run("shown after pwrite", shown);
+    fc_run("copied after pwrite", copied);
+    if (ftruncate(fd, 0)) return 96;
+    fc_run("shown after truncate", shown);
+    fc_run("copied after truncate", copied);
+    if (ftruncate(fd, 4096) || fc_put(fd, 3)) return 97;
+    fc_run("shown after growing", shown);
+    fc_run("copied after growing", copied);
+    printf("copied byte=%d\n", copied[100]);
+    munmap(shown, 4096);
+    munmap(copied, 4096);
+    close(fd);
+    unlink(file);
+    return 0;
+}
+
 /* The exec-truncated case: execve of a small ELF program cut short at
    chosen lengths, as Linux's binfmt_elf takes it. The program has a text
    segment of two pages from offset 0 (its code in the first, a byte it
@@ -42115,6 +42184,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
+    if (!strcmp(mode, "file-code")) return file_code_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
     if (!strcmp(mode, "tree-namespace")) return tree_namespace_case();
     if (!strcmp(mode, "beneath")) return beneath_case();

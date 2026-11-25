@@ -1124,6 +1124,7 @@ mod linux {
         processes_mmap_low => ("mmap-low","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
+        processes_file_code => ("file-code","process"),
         processes_dev_shm => ("dev-shm","process"),
         processes_tree_namespace => ("tree-namespace","process"),
         processes_beneath => ("beneath","process"),

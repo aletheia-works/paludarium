@@ -547,10 +547,9 @@ mod linux {
             ) {
                 host.measure_cpu_time();
             }
-            // Not with_test_jit yet: compiling on the thread that runs a block
-            // counts in its CPU clock, so cpu-timer's thread timer fires
-            // (thread other=1, Linux 0).
-            let session = Session::new(config, host.clone()).unwrap();
+            let session =
+                paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap())
+                    .unwrap();
             let start = Instant::now();
             let status = session.run().unwrap();
             let emulated = Outcome {

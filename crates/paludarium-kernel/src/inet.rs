@@ -577,11 +577,10 @@ impl Network {
         let (from, to) = match (plain(from), plain(to)) {
             (IpAddr::V4(from), IpAddr::V4(to)) => (from, to),
             (IpAddr::V6(from), IpAddr::V6(to)) => {
-                return self.reach6(index, from, to, &Self::flow6(flow.src, flow.proto), now);
+                return self.reach6(index, from, to, flow, now);
             }
             _ => return Reach::Unanswered,
         };
-        let bound = flow.oif;
         let hop = self.next_hop4(index, to, flow, now);
         let Some(Arp {
             peer,
@@ -627,27 +626,45 @@ impl Network {
         if !arrives {
             return Reach::Dropped;
         }
-        // A listener's answer goes out through the device it is bound to
-        // (`inet_csk_route_req`).
-        let oif = flow.port.map_or(0, |port| {
-            there.ports(false).listener_device(
-                SocketAddr::new(IpAddr::V4(to), port),
-                peer_index.unsigned_abs(),
-            )
-        });
-        let flow = Flow {
+        let answer = Flow {
             src: Some(IpAddr::V4(to)),
-            oif,
+            oif: there.answer_oif(IpAddr::V4(to), flow, peer_index),
             proto: flow.proto,
+            bound: 0,
             port: None,
         };
-        match self.back4(&there, from, to, &flow, now) {
-            // To a socket bound to the device it comes in on.
-            Some((back, own)) if bound == 0 || bound == own.unsigned_abs() => {
-                Reach::Answered(there, Back { index: back, oif })
+        let back = self.back4(&there, from, to, &answer, now);
+        Self::answered(there, flow, answer.oif, back)
+    }
+    /// The device named in the route lookup of an answer from this
+    /// namespace's address `to` to a packet of the flow `flow`, which came
+    /// in on the device `index`: the one its listener is bound to
+    /// (`inet_csk_route_req`), 0 for none.
+    fn answer_oif(&self, to: IpAddr, flow: &Flow, index: i32) -> u32 {
+        flow.port.map_or(0, |port| {
+            self.ports(false)
+                .listener_device(SocketAddr::new(to, port), index.unsigned_abs())
+        })
+    }
+    /// What a packet of the flow `flow` that comes to `there` finds, whose
+    /// answer, routed with the device `oif` named, goes out through the
+    /// first end of `back` there and comes in on the second, if it comes: a
+    /// socket bound to a device takes it in on that alone.
+    fn answered(there: Arc<Network>, flow: &Flow, oif: u32, back: Option<(i32, i32)>) -> Reach {
+        match back {
+            Some((index, own)) if flow.bound == 0 || flow.bound == own.unsigned_abs() => {
+                Reach::Answered(there, Back { index, oif })
             }
             _ => Reach::OneWay(there),
         }
+    }
+    /// The peer of the veth end `index` of `there`, where it is this
+    /// namespace's and the end has its carrier.
+    fn own_end(&self, there: &Network, index: i32) -> Option<i32> {
+        let devices = there.devices();
+        let veth = devices.by_index(index)?.veth.as_ref()?;
+        let peer = veth.peer.as_ref().filter(|_| veth.carrier)?;
+        core::ptr::eq(peer.network.as_ptr(), self).then_some(peer.index)
     }
     /// The veth end of `there` an answer from its address `to` to `from`,
     /// of the flow `flow`, goes out through, and the one of this namespace
@@ -680,15 +697,7 @@ impl Network {
             }
         };
         let hop = there.next_hop4(back, from, flow, now);
-        let own = {
-            let devices = there.devices();
-            let veth = devices.by_index(back)?.veth.as_ref()?;
-            let peer = veth.peer.as_ref().filter(|_| veth.carrier)?;
-            if !core::ptr::eq(peer.network.as_ptr(), self) {
-                return None;
-            }
-            peer.index
-        };
+        let own = self.own_end(there, back)?;
         let rpf = self.rp_filter(own);
         let addresses = self.addresses_at(now);
         let comes = addresses.local4(from)
@@ -804,19 +813,17 @@ impl Network {
     ///   or the peer's namespace has not `to`, not tentative (no local
     ///   route: `ip6_route_input`, and no forwarding).
     /// - The packet comes there, and the answer back ([`Reach::Answered`])
-    ///   only when the peer's namespace routes `from` back out through its
-    ///   end, this namespace has `from`, not tentative, and this end has
-    ///   that route's next hop; else that answer goes nowhere
-    ///   ([`Reach::OneWay`]).
+    ///   only where that namespace's comes to this one ([`Self::back6`]);
+    ///   else that answer goes nowhere ([`Reach::OneWay`]).
     fn reach6(
         &self,
         index: i32,
         from: Ipv6Addr,
         to: Ipv6Addr,
-        flow: &Flow6,
+        flow: &Flow,
         now: Option<u64>,
     ) -> Reach {
-        let hop = self.next_hop6(index, to, flow, now);
+        let hop = self.next_hop6(index, to, &Self::flow6(flow.src, flow.proto), now);
         let Some(Nd {
             peer,
             answer,
@@ -844,35 +851,47 @@ impl Network {
         if from.is_loopback() || to.is_loopback() {
             return Reach::Dropped;
         }
-        let (arrives, back) = {
-            let addresses = there.addresses_at(now);
-            // The answer's flow, from `to`.
-            let answer = Self::flow6(Some(IpAddr::V6(to)), flow.proto);
-            let back = addresses
-                .lookup6_flow(from, 0, &answer)
-                .ok()
-                .filter(|r| {
-                    r.kind == crate::interface::Kind::Unicast
-                        && i64::from(r.oif) == i64::from(peer_index)
-                })
-                .map(|r| r.gateway.unwrap_or(from));
-            (addresses.local6(to), back)
-        };
-        if !arrives {
+        if !there.addresses_at(now).local6(to) {
             return Reach::Dropped;
         }
-        // The answer's next hop must be this end's, as neighbour discovery
-        // finds it.
-        let back = back.is_some_and(|hop| {
-            let addresses = self.addresses_at(now);
-            addresses.local6(from) && addresses.nd_target(index, hop)
-        });
-        if back {
-            let index = peer_index;
-            Reach::Answered(there, Back { index, oif: 0 })
-        } else {
-            Reach::OneWay(there)
-        }
+        // To a link-local address the answer goes out through the device
+        // the packet came in on, where the listener is bound to none
+        // (`tcp_v6_init_req`, `icmp6_send`).
+        let oif = match there.answer_oif(IpAddr::V6(to), flow, peer_index) {
+            0 if from.is_unicast_link_local() => peer_index.unsigned_abs(),
+            oif => oif,
+        };
+        let back = self.back6(&there, from, to, oif, flow.proto, now);
+        Self::answered(there, flow, oif, back)
+    }
+    /// [`Self::back4`] of an IPv6 answer of the protocol `proto`, routed
+    /// with the device `oif` named (0 for none): its next hop must be an
+    /// address of the end it comes in on, as neighbour discovery finds it
+    /// ([`crate::interface::Addresses::nd_target`]), and this namespace must
+    /// have `from`, not tentative. An ICMPv6 error of Linux's takes the hop
+    /// of the packet it tells of (`icmp6_send`), whose flow label is random,
+    /// and from 7.2 TCP's answer its own random one
+    /// (`ip6_ecmp_set_mp_hash`); here both take the answer's flow's.
+    fn back6(
+        &self,
+        there: &Network,
+        from: Ipv6Addr,
+        to: Ipv6Addr,
+        oif: u32,
+        proto: u8,
+        now: Option<u64>,
+    ) -> Option<(i32, i32)> {
+        let flow = Self::flow6(Some(IpAddr::V6(to)), proto);
+        let route = there
+            .addresses_at(now)
+            .lookup6_flow(from, oif, &flow)
+            .ok()
+            .filter(|r| r.kind == crate::interface::Kind::Unicast)?;
+        let back = i32::try_from(route.oif).ok()?;
+        let own = self.own_end(there, back)?;
+        let hop = route.gateway.unwrap_or(from);
+        let addresses = self.addresses_at(now);
+        (addresses.local6(from) && addresses.nd_target(own, hop)).then_some((back, own))
     }
     /// The device a packet to this namespace's own address `ip` comes in on:
     /// that of its local route, which for an IPv6 one is its address's
@@ -1142,6 +1161,7 @@ impl Network {
             src: Some(to),
             oif: answer.oif,
             proto,
+            bound: 0,
             port: None,
         };
         let _ = self.reach(answer.index, to, from, &flow, now);
@@ -1575,10 +1595,10 @@ impl Network {
 /// ICMP datagram is `EACCES`, as outside `net.ipv4.ping_group_range`; a raw
 /// socket is `EPERM`; any other type `ESOCKTNOSUPPORT`.
 pub(crate) fn socket(
-    c: &mut Context<'_>,
+    c: &Context<'_>,
     a: [u64; 6],
     network: &Arc<Network>,
-) -> Result<u64, Errno> {
+) -> Result<Arc<dyn FileHandle>, Errno> {
     let flags = a[1] as u32 & (NONBLOCK | CLOEXEC);
     let family = if a[0] == u64::from(AF_INET) {
         Family::V4
@@ -1608,9 +1628,7 @@ pub(crate) fn socket(
         options.send_buffer = 212_992;
         options.receive_buffer = 212_992;
     }
-    c.files
-        .install(socket, flags & CLOEXEC != 0, c.group.nofile())
-        .map(u64::from)
+    Ok(socket)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1848,6 +1866,8 @@ struct Flow {
     src: Option<IpAddr>,
     oif: u32,
     proto: u8,
+    /// The device the socket is bound to, 0 for none.
+    bound: u32,
     /// The port a TCP connection goes to, whose listener's answer goes out
     /// through the device that is bound to; else answers go by their route
     /// alone.
@@ -2299,6 +2319,10 @@ impl InetSocket {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Whether this is a UDP socket, not a TCP one.
+    pub(crate) fn is_datagram(&self) -> bool {
+        self.datagram
+    }
     /// Takes the pending error (`sock_error`), as `SO_ERROR` does.
     pub(crate) fn take_error(&self) -> Option<Errno> {
         let mut s = self.lock();
@@ -2481,14 +2505,20 @@ impl InetSocket {
     }
 
     /// Starts connecting to `address`, or goes on with a connection already
-    /// started; waits for it unless the socket is nonblocking. As Linux's
+    /// started; waits for it unless the socket is nonblocking or `nowait`
+    /// (an io_uring request's issue, as `O_NONBLOCK`). As Linux's
     /// `__inet_stream_connect`: `EISCONN` once connected or listening,
     /// `EALREADY` while still connecting, `EINPROGRESS` when a nonblocking
     /// one starts, and the pending error, or `ECONNABORTED`, when it failed.
     /// A loopback address where a guest socket listens is reached in the
     /// kernel; one where none does is refused, unless the policy allows the
     /// host's.
-    fn connect(&self, c: &mut Context<'_>, address: Option<SocketAddr>) -> Result<u64, Errno> {
+    fn connect(
+        &self,
+        c: &mut Context<'_>,
+        address: Option<SocketAddr>,
+        nowait: bool,
+    ) -> Result<u64, Errno> {
         if self.datagram {
             return self.connect_datagram(address);
         }
@@ -2615,7 +2645,7 @@ impl InetSocket {
                     // the answer only once connect has returned, even on its
                     // loopback, so a nonblocking one is in progress however
                     // soon its listener, or the host, opens the connection.
-                    if self.nonblocking() {
+                    if nowait || self.nonblocking() {
                         return Err(EINPROGRESS);
                     }
                     EINPROGRESS
@@ -2642,7 +2672,7 @@ impl InetSocket {
                     self.renew(&mut s);
                     return Err(error);
                 }
-                Phase::Connecting if self.nonblocking() => return Err(pending),
+                Phase::Connecting if nowait || self.nonblocking() => return Err(pending),
                 // Past `SO_SNDTIMEO`, Linux's `__inet_stream_connect` gives
                 // the error of the state it found: `EALREADY` once one was
                 // in progress.
@@ -3042,6 +3072,7 @@ impl InetSocket {
             src: s.source(),
             oif,
             proto: FLOW_UDP,
+            bound: options.device,
             port: None,
         };
         let route = self
@@ -3627,9 +3658,10 @@ impl InetSocket {
     }
     /// The first connection waiting on this listener, as Linux's
     /// `inet_csk_accept`: `EINVAL` unless listening (`EOPNOTSUPP` for UDP),
-    /// `EAGAIN` when none waits and the socket is nonblocking, or once
-    /// `SO_RCVTIMEO` has passed.
-    fn accept(&self, c: &mut Context<'_>) -> Result<Arc<InetSocket>, Errno> {
+    /// `EAGAIN` when none waits and the socket is nonblocking or `nowait`
+    /// (as `connect`), or once `SO_RCVTIMEO` has passed. With the
+    /// connection, whether more still wait (`arg->is_empty`).
+    fn accept(&self, c: &mut Context<'_>, nowait: bool) -> Result<(Arc<InetSocket>, bool), Errno> {
         if self.datagram {
             return Err(EOPNOTSUPP);
         }
@@ -3642,12 +3674,15 @@ impl InetSocket {
                 let Some(listen) = s.listen.as_mut() else {
                     return Err(Errno::EINVAL);
                 };
-                listen.ready.pop_front()
+                listen
+                    .ready
+                    .pop_front()
+                    .map(|child| (child, !listen.ready.is_empty()))
             };
-            if let Some(child) = child {
-                return Ok(child);
+            if let Some(accepted) = child {
+                return Ok(accepted);
             }
-            if self.nonblocking() {
+            if nowait || self.nonblocking() {
                 return Err(Errno::EAGAIN);
             }
             let Some(deadline) = wait.deadline(c)? else {
@@ -4002,6 +4037,7 @@ impl InetSocket {
             },
             oif: options.device,
             proto: FLOW_TCP,
+            bound: options.device,
             port: Some(to.port()),
         };
         let failing = match self
@@ -5043,8 +5079,7 @@ pub(crate) fn dispatch(
         // connect
         42 => {
             let raw = read_raw(c, a[1], a[2])?;
-            socket.landlock(c, &raw, crate::landlock::CONNECT_TCP)?;
-            socket.connect(c, parse_address(socket.family, &raw)?)
+            connect_raw(c, socket, &raw, false)
         }
         // accept and accept4
         43 | 288 => accept(c, socket, a, if number == 288 { a[3] } else { 0 }),
@@ -5187,33 +5222,69 @@ fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> 
         return Err(Errno::EINVAL);
     }
     let fd = c.files.reserve(c.group.nofile())?;
-    let child = match socket.accept(c) {
-        Ok(child) => child,
+    let child = match accepted(c, socket, a[1], a[2], flags, false) {
+        Ok((child, _)) => child,
         Err(e) => {
             c.files.unreserve(fd);
             return Err(e);
         }
     };
+    let cloexec = flags & u64::from(CLOEXEC) != 0;
+    c.files
+        .fill(fd, crate::files::Descriptor::unnamed(child, cloexec));
+    Ok(u64::from(fd))
+}
+/// The connection `accept` takes on `socket`, made the caller's, with
+/// `SOCK_NONBLOCK` of `flags` and its peer's address written to `at` (none
+/// when 0) within the room `len` gives; with whether more wait. `nowait` is
+/// as for [`InetSocket::accept`].
+fn accepted(
+    c: &mut Context<'_>,
+    socket: &InetSocket,
+    at: u64,
+    len: u64,
+    flags: u64,
+    nowait: bool,
+) -> Result<(Arc<InetSocket>, bool), Errno> {
+    let (child, more) = socket.accept(c, nowait)?;
     child.own(c);
     child.embryo.store(false, Ordering::SeqCst);
     if flags & u64::from(NONBLOCK) != 0 {
         child.flags.store(2 | NONBLOCK, Ordering::SeqCst);
     }
-    if a[1] != 0 {
+    if at != 0 {
         let peer = child.remote().unwrap_or(match socket.family {
             Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         });
         let peer = scoped(peer, child.options().device);
-        if let Err(e) = write_address(c, &encode_address(socket.family, peer), a[1], a[2]) {
-            c.files.unreserve(fd);
-            return Err(e);
-        }
+        write_address(c, &encode_address(socket.family, peer), at, len)?;
     }
-    let cloexec = flags & u64::from(CLOEXEC) != 0;
-    c.files
-        .fill(fd, crate::files::Descriptor::unnamed(child, cloexec));
-    Ok(u64::from(fd))
+    Ok((child, more))
+}
+/// An io_uring accept on `file` (`crate::sockets::accept_file`).
+pub(crate) fn accept_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    at: u64,
+    len: u64,
+    flags: u64,
+    nowait: bool,
+) -> Result<(Arc<dyn FileHandle>, bool), Errno> {
+    let socket = of(file).ok_or(ENOTSOCK)?;
+    let (child, more) = accepted(c, socket, at, len, flags, nowait)?;
+    Ok((child, more))
+}
+/// `connect` of `socket` to the address `raw`, as Landlock allows it;
+/// `nowait` is as for [`InetSocket::connect`].
+pub(crate) fn connect_raw(
+    c: &mut Context<'_>,
+    socket: &InetSocket,
+    raw: &[u8],
+    nowait: bool,
+) -> Result<u64, Errno> {
+    socket.landlock(c, raw, crate::landlock::CONNECT_TCP)?;
+    socket.connect(c, parse_address(socket.family, raw)?, nowait)
 }
 /// What a receive returns: with `MSG_TRUNC`, a datagram's whole length.
 fn returned(received: &Received, flags: u64, datagram: bool) -> usize {

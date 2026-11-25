@@ -434,7 +434,7 @@ pub(crate) struct MctpSocket {
 /// `socket(AF_MCTP, type, protocol)`, as Linux's `mctp_pf_create`: protocol
 /// 0 alone (`EPROTONOSUPPORT`), then `SOCK_DGRAM` alone (`ESOCKTNOSUPPORT`).
 /// Without a network there is none (`EAFNOSUPPORT`).
-pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+pub(crate) fn socket(c: &Context<'_>, a: [u64; 6]) -> Result<Arc<dyn FileHandle>, Errno> {
     let kind = create(c, a)?;
     let credentials = &c.process.credentials;
     let network = c.network().ok_or(EAFNOSUPPORT)?;
@@ -453,9 +453,7 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             ..State::default()
         }),
     });
-    c.files
-        .install(socket, kind & CLOEXEC != 0, c.group.nofile())
-        .map(u64::from)
+    Ok(socket)
 }
 /// The checks of `socket` and `socketpair` for `AF_MCTP`, as
 /// `__sys_socket` and `__sock_create` make them before `mctp_pf_create`:

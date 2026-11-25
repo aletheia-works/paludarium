@@ -2,15 +2,17 @@
 //! `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL` (the one libuv batches its
 //! `epoll_ctl` calls with), and the file transfers `IORING_OP_READ`,
 //! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`,
-//! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, and
-//! `IORING_OP_ASYNC_CANCEL` ([`cancel`]). The others answer
+//! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
+//! `IORING_OP_ASYNC_CANCEL` ([`cancel`]), and the single-shot socket
+//! requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
+//! and `_RECV` ([`net`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
 //! `IORING_REGISTER_FILES` (or `_FILES2`, with tags) the files a request
 //! with `IOSQE_FIXED_FILE` names by their index, and
-//! `IORING_REGISTER_PBUF_RING` a ring of the buffers a read with
-//! `IOSQE_BUFFER_SELECT` chooses from, as it does from provided ones. The
+//! `IORING_REGISTER_PBUF_RING` a ring of the buffers a read or a receive
+//! with `IOSQE_BUFFER_SELECT` chooses from, as it does from provided ones. The
 //! registered files, their updates and their allocation range are checked
 //! as Linux 7.0's `io_uring/rsrc.c`, `register.c` and `filetable.c` check
 //! them, the provided buffers and their rings as its `kbuf.c` does, and a
@@ -41,6 +43,8 @@ use paludarium_mmu::{PageSource, SharedPages};
 use paludarium_types::{Errno, GuestAddr};
 
 use crate::syscalls::{Context, Outcome, err, ok};
+
+mod net;
 
 /// The most submission queue entries, and completion queue entries.
 const MAX_ENTRIES: u32 = 32768;
@@ -127,7 +131,7 @@ const OP_EPOLL_CTL: u8 = 29;
 const OP_PROVIDE_BUFFERS: u8 = 31;
 const OP_REMOVE_BUFFERS: u8 = 32;
 /// The operations implemented.
-const OPS: [u8; 13] = [
+const OPS: [u8; 19] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
@@ -141,6 +145,12 @@ const OPS: [u8; 13] = [
     OP_EPOLL_CTL,
     OP_PROVIDE_BUFFERS,
     OP_REMOVE_BUFFERS,
+    net::OP_ACCEPT,
+    net::OP_CONNECT,
+    net::OP_SEND,
+    net::OP_RECV,
+    net::OP_SHUTDOWN,
+    net::OP_SOCKET,
 ];
 /// `IORING_OP_LAST` of Linux 6.12, after `IORING_OP_LISTEN`.
 const OP_LAST: u8 = 58;
@@ -613,6 +623,9 @@ struct Chosen {
     bid: u16,
     addr: u64,
     len: u32,
+    /// The provided buffer's whole length, which it has again if it goes
+    /// back to its group.
+    size: u32,
     ring: bool,
     committed: bool,
     more: bool,
@@ -796,6 +809,8 @@ enum Work {
         event: (u32, u64),
     },
     Transfer(Box<Transfer>),
+    /// A socket request ([`net`]).
+    Net(Box<net::Net>),
     /// `IORING_OP_ASYNC_CANCEL`: what it looks for, and whether its `fd` is
     /// a registered one (`IOSQE_FIXED_FILE`).
     Cancel {
@@ -868,6 +883,17 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
         .get(at..at + 4)
         .and_then(|b| b.try_into().ok())
         .map_or(0, u32::from_le_bytes)
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    bytes
+        .get(at..at + 2)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0, u16::from_le_bytes)
+}
+
+fn int_at(bytes: &[u8], at: usize) -> i32 {
+    u32_at(bytes, at) as i32
 }
 
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -1075,8 +1101,11 @@ impl Ring {
             if flags & !SQE_VALID_FLAGS != 0 {
                 return fail(request, Errno::EINVAL);
             }
-            // Only the reads select a buffer (`buffer_select`).
-            if flags & IOSQE_BUFFER_SELECT != 0 && !matches!(opcode, OP_READ | OP_READV) {
+            // Only the reads, sends and receives select a buffer
+            // (`buffer_select`).
+            if flags & IOSQE_BUFFER_SELECT != 0
+                && !matches!(opcode, OP_READ | OP_READV | net::OP_SEND | net::OP_RECV)
+            {
                 return fail(request, EOPNOTSUPP);
             }
             if flags & IOSQE_CQE_SKIP_SUCCESS != 0 {
@@ -1090,15 +1119,18 @@ impl Ring {
             opcode,
             OP_READ | OP_WRITE | OP_READV | OP_WRITEV | OP_READ_FIXED | OP_WRITE_FIXED
         );
-        // Only the transfers take a priority (`ioprio`).
-        if OPS.contains(&opcode) && !transfer && u16::from_le_bytes([sqe[2], sqe[3]]) != 0 {
+        // Only the transfers take a priority, and an accept, a send and a
+        // receive their flags there (`ioprio`).
+        let takes_ioprio =
+            transfer || matches!(opcode, net::OP_ACCEPT | net::OP_SEND | net::OP_RECV);
+        if OPS.contains(&opcode) && !takes_ioprio && u16::from_le_bytes([sqe[2], sqe[3]]) != 0 {
             return fail(request, Errno::EINVAL);
         }
         // No personality is ever registered.
         if u16::from_le_bytes([sqe[42], sqe[43]]) != 0 {
             return fail(request, Errno::EINVAL);
         }
-        let int_at = |at: usize| u32_at(sqe, at) as i32;
+        let int_at = |at: usize| int_at(sqe, at);
         let fixed = flags & IOSQE_FIXED_FILE != 0;
         request.work = match opcode {
             _ if transfer => Work::Transfer(Box::new(Transfer {
@@ -1207,6 +1239,15 @@ impl Ring {
                     event: (0, 0),
                 }
             }
+            net::OP_SHUTDOWN
+            | net::OP_SOCKET
+            | net::OP_ACCEPT
+            | net::OP_CONNECT
+            | net::OP_SEND
+            | net::OP_RECV => match net::prepare(opcode, flags, sqe) {
+                Ok(work) => work,
+                Err(e) => return fail(request, e),
+            },
             _ => return fail(request, EOPNOTSUPP),
         };
         request
@@ -1280,6 +1321,7 @@ fn prepare_memory(c: &Context<'_>, request: &mut Request, addr: u64) {
                 .map_err(|_| Errno::EFAULT)
         }
         Work::Transfer(transfer) => prepare_transfer(c, transfer),
+        Work::Net(net) => net::prepare_memory(c, net),
         _ => Ok(()),
     };
     if let Err(e) = result {
@@ -1586,6 +1628,7 @@ fn select(
                 bid: buffer.bid,
                 addr: buffer.addr,
                 len: cut(buffer.len),
+                size: buffer.len,
                 ring: false,
                 committed: true,
                 more: false,
@@ -1601,6 +1644,7 @@ fn select(
                 bid,
                 addr,
                 len: cut(size),
+                size,
                 ring: true,
                 committed: false,
                 more: false,
@@ -1649,9 +1693,10 @@ fn give_back(c: &Context<'_>, ring: &Ring, chosen: &Chosen, result: &Result<u64,
 /// Runs a request and gives its result, its completion's flags and
 /// whether it failed (`req_set_fail`), which a negative result does, or
 /// what a transfer that would wait waits for.
-fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool, Option<Waits>) {
+fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Option<Waits>) {
     let result = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
     match work {
+        Work::Net(net) => return net::run(c, ring, net),
         Work::Transfer(work) => {
             // A transfer of fewer bytes than it asked for fails its link too
             // (`__io_complete_rw_common`), though its result is the count.
@@ -1662,7 +1707,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool, Option
         }
         // `io_nop`, as Linux master has it: a file it does not find is
         // `EBADF`, then a registered buffer `EFAULT`, else its result.
-        &Work::Nop {
+        &mut Work::Nop {
             result,
             file,
             buffer,
@@ -1679,7 +1724,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool, Option
         }
         _ => {}
     }
-    let res = match work {
+    let res = match &*work {
         &Work::EpollCtl {
             epfd,
             op,
@@ -1727,7 +1772,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &Work) -> (i32, u32, bool, Option
             bgid,
             bid,
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
-        Work::Transfer(_) | Work::Nop { .. } | Work::None => 0,
+        Work::Transfer(_) | Work::Net(_) | Work::Nop { .. } | Work::None => 0,
     };
     (res, 0, res < 0, None)
 }
@@ -1816,16 +1861,23 @@ fn issue_link(
 ) {
     let mut request = chain.remove(0);
     let mark = ring.state().held.len();
-    let (res, flags, failed, waits) = run(c, ring, &request.work);
+    let (res, flags, failed, waits) = run(c, ring, &mut request.work);
     let split_held = || {
         let mut state = ring.state();
         let at = mark.min(state.held.len());
         state.held.split_off(at)
     };
     if let Some(waits) = waits {
-        if let Work::Transfer(transfer) = &mut request.work {
-            transfer.kept = waits.kept;
-            transfer.found = Some(waits.found.clone());
+        match &mut request.work {
+            Work::Transfer(transfer) => {
+                transfer.kept = waits.kept;
+                transfer.found = Some(waits.found.clone());
+            }
+            Work::Net(net) => {
+                net.polled = true;
+                net.found = Some(waits.found.0.clone());
+            }
+            _ => {}
         }
         chain.insert(0, request);
         let held = split_held();
@@ -2178,7 +2230,8 @@ fn run_terminated(ring: &Ring, work: Deferred) {
 }
 
 /// `io_req_defer_failed`: the first request of `chain` fails with `e`,
-/// using a provided buffer it kept (`io_put_kbuf`), and so does its link.
+/// using a provided buffer it kept (`io_put_kbuf`), and so does its link. A
+/// socket's gives what it moved instead ([`net::failed`]).
 fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
     let request = chain.remove(0);
     let flags = match &request.work {
@@ -2187,9 +2240,13 @@ fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
         }),
         _ => 0,
     };
+    let res = match &request.work {
+        Work::Net(net) => net::failed(net, e),
+        _ => -e.0,
+    };
     let done = Done {
         user_data: request.user_data,
-        res: -e.0,
+        res,
         flags,
         post: true,
         next: None,

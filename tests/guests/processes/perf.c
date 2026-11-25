@@ -1798,6 +1798,73 @@ static void build_ids(void) {
     unlink(path);
 }
 
+/* The records of this process and its child, by the `sample_id` that ends
+   each: a CPU's event takes those of every task there. */
+static void say_own_record(const uint64_t *record, void *with) {
+    struct expected *e = with;
+    uint32_t by = (uint32_t)record[(record[0] >> 48) / 8 - 1];
+    if (by == (uint32_t)e->pid || by == (uint32_t)e->child) say_record(record, with);
+}
+
+/* The side-band records of an event of a CPU (pid -1): of whatever runs
+   there (perf_iterate_sb_cpu), here the process and its child. One of
+   another CPU, and one that is not enabled, take none of them. */
+static int case_side_band_cpu(void) {
+    struct expected e;
+    memset(&e, 0, sizeof e);
+    e.pid = e.parent = getpid();
+    e.tid = (pid_t)syscall(SYS_gettid);
+    char path[] = "/tmp/perf-side-band-XXXXXX";
+    int file = mkstemp(path);
+    static char zeros[2 * 4096];
+    write(file, zeros, sizeof zeros);
+    fstat(file, &e.file);
+    e.path = path;
+    cpu_set_t first;
+    CPU_ZERO(&first);
+    CPU_SET(0, &first);
+    sched_setaffinity(0, sizeof first, &first);
+    void *here, *other, *off;
+    uint64_t flags = ATTR_MMAP2 | ATTR_COMM | ATTR_TASK;
+    int fd = open_side_band(-1, 0, flags, &here);
+    int other_fd = open_side_band(-1, 1, flags, &other);
+    int off_fd = open_side_band(-1, 0, flags, &off);
+    say("open %d %d %d", fd >= 0, other_fd >= 0, off_fd >= 0);
+    if (fd < 0 || other_fd < 0 || off_fd < 0) return 1;
+    fflush(stdout);
+    ioctl(fd, IOC_ENABLE, 0);
+    ioctl(other_fd, IOC_ENABLE, 0);
+    /* Linux writes the records of mappings only while an event with mmap or
+       mmap_data is open (nr_mmap_events), whether it is enabled or not, so
+       not with mmap2 alone: none of the first mapping. */
+    mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 0);
+    void *unused;
+    int counted = open_side_band(0, -1, ATTR_MMAP, &unused);
+    e.exec_at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 4096);
+    munmap(unused, 9 * 4096);
+    close(counted);
+    mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file, 0);
+    prctl(PR_SET_NAME, "side-band-cpu", 0, 0, 0);
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    int status;
+    waitpid(child, &status, 0);
+    e.child = child;
+    ioctl(fd, IOC_DISABLE, 0);
+    ioctl(other_fd, IOC_DISABLE, 0);
+    unlink(path);
+    uint64_t tail = 0;
+    say("here:");
+    each_record(here, &tail, say_own_record, &e);
+    say("other:");
+    tail = 0;
+    each_record(other, &tail, say_own_record, &e);
+    say("off:");
+    tail = 0;
+    each_record(off, &tail, say_own_record, &e);
+    return 0;
+}
+
 #define INHERIT_STAT (1ULL << 11)
 #define RECORD_READ 8
 
@@ -2076,6 +2143,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-wakeup")) return case_wakeup();
     if (!strcmp(mode, "perf-side-band")) return case_side_band();
     if (!strcmp(mode, "perf-inherit-stat")) return case_inherit_stat();
+    if (!strcmp(mode, "perf-side-band-cpu")) return case_side_band_cpu();
     if (!strcmp(mode, "perf-side-band-comm")) return case_side_band_comm();
     if (!strcmp(mode, "perf-throttle")) return case_throttle();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);

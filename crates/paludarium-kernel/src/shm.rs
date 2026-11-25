@@ -552,6 +552,9 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         {
             return Err(ENOMEM);
         }
+        if crate::syscalls::below_min(c, addr, len) {
+            return Err(Errno::EPERM);
+        }
         Placement::Replacing(GuestAddr(addr))
     } else {
         Placement::Near(None)

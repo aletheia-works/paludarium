@@ -894,57 +894,11 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// The socket call `number` on the socket family of descriptor `a[0]`.
 fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
     (|| match number {
-        // AF_INET and AF_INET6, with a network, AF_UNIX, AF_NETLINK and
-        // AF_MCTP.
-        41 if a[0] == 1 => crate::unix::socket(c, a),
-        41 if a[0] == 16 => crate::netlink::socket(c, a),
-        41 if a[0] == crate::mctp::AF_MCTP => crate::mctp::socket(c, a),
-        41 => match c.network() {
-            Some(network) if matches!(a[0], 2 | 10) => {
-                if a[1] as u32 & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                crate::inet::socket(c, a, &network)
-            }
-            _ => Err(Errno(97)),
-        },
-        42..=52 | 54 | 55 | 288
-            if c.files
-                .descriptor(a[0])
-                .is_ok_and(|d| crate::inet::of(&d.file).is_some()) =>
-        {
-            let file = c.files.descriptor(a[0])?.file;
-            crate::inet::dispatch(c, number, a, &file)
-        }
-        42..=52 | 54 | 55 | 288
-            if c.files
-                .descriptor(a[0])
-                .is_ok_and(|d| crate::netlink::of(&d.file).is_some()) =>
-        {
-            let file = c.files.descriptor(a[0])?.file;
-            crate::netlink::dispatch(c, number, a, &file)
-        }
-        42..=52 | 54 | 55 | 288
-            if c.files
-                .descriptor(a[0])
-                .is_ok_and(|d| crate::mctp::of(&d.file).is_some()) =>
-        {
-            let file = c.files.descriptor(a[0])?.file;
-            crate::mctp::dispatch(c, number, a, &file)
-        }
-        42 | 43 | 49 | 50 | 51 | 52 | 288
-            if let Some(socket) = c
-                .files
-                .descriptor(a[0])
-                .ok()
-                .and_then(|d| endpoint(&d.file).and_then(SocketPairEnd::unix)) =>
-        {
-            crate::unix::dispatch(c, number, a, &socket)
-        }
-        // Every AF_UNIX socket is one of those: anything else is no socket.
-        42 | 43 | 49 | 50 | 51 | 52 | 288 => {
-            c.files.descriptor(a[0])?;
-            Err(Errno(88))
+        41 => {
+            let socket = make(c, a)?;
+            c.files
+                .install(socket, a[1] as u32 & CLOEXEC != 0, c.group.nofile())
+                .map(u64::from)
         }
         53 => {
             if a[0] == crate::mctp::AF_MCTP {
@@ -977,10 +931,54 @@ fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
                 .map_err(|_| Errno::EFAULT)?;
             Ok(0)
         }
+        _ => match c.files.descriptor(a[0]) {
+            Ok(d) => route_file(c, number, a, &d.file),
+            // `setsockopt` and `getsockopt` look the descriptor up in their
+            // own order.
+            Err(_) if matches!(number, 54 | 55) => {
+                if number == 54 {
+                    set_option(c, a)
+                } else {
+                    get_option(c, a)
+                }
+            }
+            // `sendto` and `recvfrom` check their buffer first.
+            Err(e) if matches!(number, 44 | 45) => {
+                user_buffer(a[1], a[2])?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        },
+    })()
+}
+
+/// The socket call `number` on `file`, the socket of descriptor `a[0]` or
+/// a request's file (`crate::io_uring`), by its family.
+pub(crate) fn route_file(
+    c: &mut Context<'_>,
+    number: u64,
+    a: [u64; 6],
+    file: &Arc<dyn FileHandle>,
+) -> Result<u64, Errno> {
+    match number {
+        42..=52 | 54 | 55 | 288 if crate::inet::of(file).is_some() => {
+            crate::inet::dispatch(c, number, a, file)
+        }
+        42..=52 | 54 | 55 | 288 if crate::netlink::of(file).is_some() => {
+            crate::netlink::dispatch(c, number, a, file)
+        }
+        42..=52 | 54 | 55 | 288 if crate::mctp::of(file).is_some() => {
+            crate::mctp::dispatch(c, number, a, file)
+        }
+        42 | 43 | 49 | 50 | 51 | 52 | 288
+            if let Some(socket) = endpoint(file).and_then(SocketPairEnd::unix) =>
+        {
+            crate::unix::dispatch(c, number, a, &socket)
+        }
+        // Every AF_UNIX socket is one of those: anything else is no socket.
+        42 | 43 | 49 | 50 | 51 | 52 | 288 => Err(Errno(88)),
         48 => {
-            let d = c.files.descriptor(a[0])?;
-            let socket = d
-                .file
+            let socket = file
                 .as_any()
                 .and_then(|v| v.downcast_ref::<SocketPairEnd>())
                 .ok_or(Errno(88))?;
@@ -989,12 +987,122 @@ fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
         }
         54 => set_option(c, a),
         55 => get_option(c, a),
-        44 => send_to(c, a),
-        45 => receive_from(c, a),
-        46 => send_message(c, a),
-        47 => receive_message(c, a),
+        44 => send_to_file(c, file, a),
+        45 => receive_from_file(c, file, a),
+        46 => send_message_file(c, file, a),
+        47 => receive_message_file(c, file, a),
         _ => Err(Errno::ENOSYS),
-    })()
+    }
+}
+
+/// The socket `socket` makes (`__sys_socket_file`): `AF_INET` and
+/// `AF_INET6`, with a network, `AF_UNIX`, `AF_NETLINK` and `AF_MCTP`.
+pub(crate) fn make(c: &Context<'_>, a: [u64; 6]) -> Result<Arc<dyn FileHandle>, Errno> {
+    match a[0] {
+        1 => crate::unix::socket(c, a),
+        16 => crate::netlink::socket(c, a),
+        crate::mctp::AF_MCTP => crate::mctp::socket(c, a),
+        2 | 10 => {
+            let network = c.network().ok_or(Errno(97))?;
+            if a[1] as u32 & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            crate::inet::socket(c, a, &network)
+        }
+        _ => Err(Errno(97)),
+    }
+}
+
+/// Whether `file` is a socket (`sock_from_file`).
+pub(crate) fn is_socket(file: &Arc<dyn FileHandle>) -> bool {
+    crate::inet::of(file).is_some()
+        || crate::netlink::of(file).is_some()
+        || crate::mctp::of(file).is_some()
+        || file.as_any().is_some_and(|v| v.is::<SocketPairEnd>())
+}
+
+/// Whether `file` is a stream or a sequenced-packet socket, which an
+/// io_uring request with `MSG_WAITALL` goes on with after a short transfer
+/// (`io_net_retry`).
+pub(crate) fn is_stream(file: &Arc<dyn FileHandle>) -> bool {
+    if let Some(socket) = crate::inet::of(file) {
+        return !socket.is_datagram();
+    }
+    endpoint(file).is_some_and(|socket| matches!(socket.pair.kind, SOCK_STREAM | SOCK_SEQPACKET))
+}
+
+/// `accept` on the socket `file` for an io_uring request, `nowait` as
+/// `O_NONBLOCK`: the connection, made as `flags` (`SOCK_NONBLOCK`) say,
+/// with its peer's address written to `at` within the room at `len`, and
+/// whether more wait (`arg->is_empty`, which only TCP tells). A netlink or
+/// MCTP socket has no `accept` (`EOPNOTSUPP`), and a file that is no
+/// socket is `ENOTSOCK`.
+pub(crate) fn accept_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    at: u64,
+    len: u64,
+    flags: u64,
+    nowait: bool,
+) -> Result<(Arc<dyn FileHandle>, bool), Errno> {
+    if crate::inet::of(file).is_some() {
+        return crate::inet::accept_file(c, file, at, len, flags, nowait);
+    }
+    if let Some(socket) = endpoint(file).and_then(SocketPairEnd::unix) {
+        return crate::unix::accept_file(c, &socket, at, len, flags, nowait).map(|f| (f, false));
+    }
+    if crate::netlink::of(file).is_some() || crate::mctp::of(file).is_some() {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Err(Errno(88))
+}
+
+/// `connect` of the socket `file` for an io_uring request
+/// (`__sys_connect_file`), `nowait` as `O_NONBLOCK`, to the address `raw`
+/// its preparation read from `at` (`len` bytes). A netlink or MCTP
+/// socket, which never waits to connect, reads it again.
+pub(crate) fn connect_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    raw: &[u8],
+    at: u64,
+    len: u64,
+    nowait: bool,
+) -> Result<u64, Errno> {
+    if let Some(socket) = crate::inet::of(file) {
+        return crate::inet::connect_raw(c, socket, raw, nowait);
+    }
+    if let Some(socket) = endpoint(file).and_then(SocketPairEnd::unix) {
+        return socket.connect(c, raw, nowait);
+    }
+    route_file(c, 42, [0, at, len, 0, 0, 0], file)
+}
+
+/// Takes the pending error of the socket `file` (`sock_error`), 0 for
+/// none, as an io_uring connect that was in progress completes with.
+pub(crate) fn take_error(file: &Arc<dyn FileHandle>) -> i32 {
+    crate::inet::of(file)
+        .and_then(crate::inet::InetSocket::take_error)
+        .map_or(0, |e| -e.0)
+}
+
+/// What a receive left to be read (`msg->msg_inq`), which an io_uring
+/// receive's completion tells with `IORING_CQE_F_SOCK_NONEMPTY`: TCP's
+/// unread bytes, or 1 once the peer finished (`tcp_inq_hint`), and an
+/// AF_UNIX stream's (`u->inq_len`); `None` for any other socket, which
+/// does not tell.
+pub(crate) fn inq_hint(file: &Arc<dyn FileHandle>) -> Option<usize> {
+    if let Some(socket) = crate::inet::of(file) {
+        if socket.is_datagram() {
+            return None;
+        }
+        let queued = socket.queued(false).unwrap_or(0);
+        let finished = crate::aio::polled(file).0 & 0x2000 != 0;
+        return Some(if queued == 0 && finished { 1 } else { queued });
+    }
+    let socket = endpoint(file)?;
+    socket.unix()?;
+    (socket.pair.kind == SOCK_STREAM).then(|| socket.lock_sides()[socket.side].bytes.len())
 }
 
 /// `MSG_WAITFORONE`, `MSG_CMSG_COMPAT`, and `UIO_MAXIOV`, where `sendmmsg`
@@ -1304,6 +1412,13 @@ pub(crate) fn closing(file: &Arc<dyn FileHandle>) {
         drop(pipe.hold());
     }
 }
+/// `file`, if it is a socket end ([`socket`] for a file already looked up).
+fn socket_file(file: &Arc<dyn FileHandle>) -> Result<Arc<dyn FileHandle>, Errno> {
+    if !file.as_any().is_some_and(|v| v.is::<SocketPairEnd>()) {
+        return Err(Errno(88));
+    }
+    Ok(Arc::clone(file))
+}
 /// The pipe description `file` is, which keeps its own owner and `O_ASYNC`.
 pub(crate) fn pipe(file: &Arc<dyn FileHandle>) -> Option<&PipeEnd> {
     file.as_any()?.downcast_ref::<PipeEnd>()
@@ -1576,9 +1691,13 @@ pub(crate) fn access_ok_u64(at: u64, len: u64) -> Result<(), Errno> {
 /// with one buffer and no control messages. As `move_addr_to_kernel`, an
 /// address longer than `sockaddr_storage`'s 128 bytes, or negative, is EINVAL
 /// and one of no bytes is none.
-fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+fn send_to_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    a: [u64; 6],
+) -> Result<u64, Errno> {
     let len = user_buffer(a[1], a[2])?;
-    let file = socket(c, a[0])?;
+    let file = socket_file(file)?;
     let mut address = Vec::new();
     if a[4] != 0 {
         let len = usize::try_from(a[5] as u32 as i32)
@@ -1630,9 +1749,13 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// with one buffer and no control buffer, so the descriptors a message passes
 /// close. With `addr`, the sender's address goes there ([`put_address`]),
 /// after the data is taken.
-fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+fn receive_from_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    a: [u64; 6],
+) -> Result<u64, Errno> {
     let len = user_buffer(a[1], a[2])?;
-    let file = socket(c, a[0])?;
+    let file = socket_file(file)?;
     let socket = as_socket(&file)?;
     socket.check_out_of_band(a[3])?;
     c.mem
@@ -1671,8 +1794,12 @@ pub(crate) fn read(
 /// flags `MSG_NOSIGNAL`, `MSG_DONTWAIT` and, on a stream, `MSG_OOB` act
 /// ([`send_bytes`]); `MSG_OOB` is EOPNOTSUPP on the other kinds, and the rest
 /// are ignored, as Linux's AF_UNIX sockets ignore them.
-fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
-    let file = socket(c, a[0])?;
+fn send_message_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    a: [u64; 6],
+) -> Result<u64, Errno> {
+    let file = socket_file(file)?;
     let header = message_header(c, a[1], false)?;
     let mut address = Vec::new();
     if let Some((name, len)) = header.name {
@@ -1738,8 +1865,12 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 }
 /// `recvmsg(fd, msg, flags)` on a socket pair, with timestamps,
 /// `SCM_RIGHTS`, `SCM_CREDENTIALS` and the flags of [`receive_with`].
-fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
-    let file = socket(c, a[0])?;
+fn receive_message_file(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    a: [u64; 6],
+) -> Result<u64, Errno> {
+    let file = socket_file(file)?;
     let header = message_header(c, a[1], true)?;
     let socket = as_socket(&file)?;
     socket.check_out_of_band(a[2])?;

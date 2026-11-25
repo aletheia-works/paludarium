@@ -8,7 +8,7 @@
 //! `/proc/locks` and `/proc/sysvipc`'s `msg`, `sem` and `shm` are
 //! ([`crate::seq`]).
 use paludarium_host::{FileHandle, FileStat};
-use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
+use paludarium_mmu::{MemoryView, Prot, Referenced, Usage, Vma, vm};
 use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -796,13 +796,15 @@ pub(crate) fn descriptors_stat() -> FileStat {
     }
 }
 /// The `lstat` of a link in `fd`: user permissions for the descriptor's
-/// access (read gives r-x, write -wx), and size 64, as Linux shows them.
-pub(crate) fn link_stat(access: u32) -> FileStat {
+/// access (read gives r-x, write -wx, and `O_PATH` neither), from its
+/// `flags`, and size 64, as Linux shows them.
+pub(crate) fn link_stat(flags: u32) -> FileStat {
     let mut mode = 0o120_000;
-    if access != 1 {
+    let opened = flags & crate::files::O_PATH == 0;
+    if opened && flags & 3 != 1 {
         mode |= 0o500;
     }
-    if access != 0 {
+    if opened && flags & 3 != 0 {
         mode |= 0o300;
     }
     FileStat {
@@ -992,7 +994,7 @@ pub(crate) struct OwnDirectory {
 pub(crate) type LiveOwner = Arc<dyn Fn() -> (u32, u32) + Send + Sync>;
 impl OwnDirectory {
     /// The directory an open with `flags` made, which keeps the open's
-    /// flags that `F_SETFL` changes, as Linux's `f_flags` does.
+    /// flags, as Linux's `f_flags` does.
     pub(crate) fn opened(flags: u32, stat: FileStat) -> Self {
         Self {
             status: crate::files::StatusFlags::opened(flags),
@@ -1048,7 +1050,7 @@ impl FileHandle for OwnDirectory {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        self.status.of(0o200000)
+        self.status.of(0)
     }
     /// `F_SETFL`, as Linux's `setfl`.
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
@@ -1492,7 +1494,7 @@ fn smap_usage_lines(usage: &Usage, locked: u64, rollup: bool) -> String {
         ("Shared_Dirty:   ", kb(usage.shared_dirty)),
         ("Private_Clean:  ", kb(usage.private_clean)),
         ("Private_Dirty:  ", kb(usage.private_dirty)),
-        ("Referenced:     ", kb(usage.resident)),
+        ("Referenced:     ", kb(usage.referenced)),
         ("Anonymous:      ", kb(usage.anonymous)),
         ("KSM:            ", 0),
         ("LazyFree:       ", 0),
@@ -1534,6 +1536,7 @@ fn rollup_lines(memory: &MemoryView) -> Vec<u8> {
             locked += usage.pss;
         }
         total.resident += usage.resident;
+        total.referenced += usage.referenced;
         total.shared_clean += usage.shared_clean;
         total.shared_dirty += usage.shared_dirty;
         total.private_clean += usage.private_clean;
@@ -1909,7 +1912,9 @@ pub(crate) type CurrentMemory = Arc<dyn Fn() -> Result<Option<MemoryView>, Errno
 /// clears the soft-dirty bits ([`MemoryView::clear_soft_dirty`]) and 5
 /// (`CLEAR_REFS_MM_HIWATER_RSS`) makes the peak of the resident pages
 /// those resident now ([`MemoryView::reset_peak_resident`]); 1 to 3 clear
-/// referenced bits, which are not kept. It has no read operation.
+/// the referenced bits of all pages, of those of VMAs with no file or of
+/// those with one ([`MemoryView::clear_referenced`]). It has no read
+/// operation.
 pub(crate) struct ClearRefsFile {
     memory: CurrentMemory,
     /// The access mode it was opened with (`O_ACCMODE`).
@@ -1997,6 +2002,15 @@ impl FileHandle for ClearRefsFile {
         }
         if let Some(memory) = (self.memory)()? {
             match kind {
+                1 => {
+                    memory.clear_referenced(Referenced::All);
+                }
+                2 => {
+                    memory.clear_referenced(Referenced::Anonymous);
+                }
+                3 => {
+                    memory.clear_referenced(Referenced::File);
+                }
                 4 => {
                     memory.clear_soft_dirty();
                 }
@@ -2274,6 +2288,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, SOFT_DIRTY, 0]
         );
+    }
+
+    #[test]
+    fn clear_refs_1_to_3_make_smaps_show_no_page_as_referenced_until_its_next_access() {
+        let mut mem = AddressSpace::new();
+        mem.map(
+            Some(GuestAddr(0x10000)),
+            0x2000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.write(GuestAddr(0x10000), b"x").unwrap();
+        mem.write(GuestAddr(0x11000), b"x").unwrap();
+        let referenced = || {
+            let text = String::from_utf8(rollup_lines(&mem.view())).unwrap();
+            let line = text.lines().find(|l| l.starts_with("Referenced:")).unwrap();
+            line.split_whitespace().nth(1).unwrap().to_owned()
+        };
+        let view = mem.view();
+        let current: CurrentMemory = Arc::new(move || Ok(Some(view.clone())));
+        let clear = ClearRefsFile::open(current, 1, Arc::default());
+        assert_eq!(referenced(), "8");
+        // Those of VMAs with a file only.
+        assert_eq!(clear.write(b"3"), Ok(1));
+        assert_eq!(referenced(), "8");
+        for kind in [b"1", b"2"] {
+            assert_eq!(clear.write(kind), Ok(1));
+            assert_eq!(referenced(), "0");
+            mem.read(GuestAddr(0x10000), &mut [0]).unwrap();
+            assert_eq!(referenced(), "4");
+        }
     }
 
     #[test]
@@ -3021,6 +3067,7 @@ mod descriptor_tests {
         }
         assert_eq!(link_stat(0).mode, 0o120_500);
         assert_eq!(link_stat(2).mode, 0o120_700);
+        assert_eq!(link_stat(crate::files::O_PATH).mode, 0o120_000);
     }
 }
 

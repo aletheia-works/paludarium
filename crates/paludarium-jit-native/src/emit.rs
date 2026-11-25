@@ -174,6 +174,14 @@ impl Emitter<'_, '_> {
         self.b.switch_to_block(go_on);
     }
 
+    /// Goes on in a new block when `address` is 16-byte aligned, and leaves
+    /// with `count` run at `rip` otherwise.
+    fn unless_misaligned(&mut self, address: Value, count: usize, rip: u64) {
+        let low = self.b.ins().band_imm_s(address, 15);
+        let off = self.b.ins().icmp_imm_s(IntCC::NotEqual, low, 0);
+        self.leave_if(off, count, rip);
+    }
+
     /// Leaves after the instruction just emitted, the `count`th, when
     /// `status` says the code changed.
     fn unless_changed(&mut self, status: Value, count: usize, next: u64) {
@@ -502,11 +510,7 @@ impl Emitter<'_, '_> {
         rip: u64,
     ) -> Value {
         if aligned {
-            let low = self.b.ins().band_imm_s(address, 15);
-            let off = self.b.ins().icmp_imm_s(IntCC::NotEqual, low, 0);
-            let wide = self.b.ins().uextend(I64, off);
-            // FAILED is 1: a misaligned address fails as the helper would.
-            self.unless_failed(wide, count, rip);
+            self.unless_misaligned(address, count, rip);
         }
         let slot = self.xmm_slot(n);
         let callee = self.constant(helper as i64);
@@ -674,11 +678,11 @@ impl Emitter<'_, '_> {
         self.set_word(w + 1, high);
     }
 
-    /// `op` of [`Fast::XmmPacked`] on xmm registers `dst` and `src`, as
+    /// `op` of [`Fast::XmmPacked`] or [`Fast::XmmPackedLoad`] on xmm
+    /// register `dst` and the two words of the other operand, as
     /// `sse::packed` has it.
-    fn packed(&mut self, op: Mnemonic, dst: u8, src: u8, imm: u8) {
+    fn packed(&mut self, op: Mnemonic, dst: u8, (b0, b1): (Value, Value), imm: u8) {
         let (a0, a1) = self.xmm_words(dst);
-        let (b0, b1) = self.xmm_words(src);
         let (low, high) = match op {
             Mnemonic::Punpcklqdq => (a0, b0),
             Mnemonic::Punpckhqdq => (a1, b1),
@@ -711,6 +715,7 @@ impl Emitter<'_, '_> {
             ),
             Mnemonic::Paddq => (self.b.ins().iadd(a0, b0), self.b.ins().iadd(a1, b1)),
             Mnemonic::Psubq => (self.b.ins().isub(a0, b0), self.b.ins().isub(a1, b1)),
+            Mnemonic::Pxor => (self.b.ins().bxor(a0, b0), self.b.ins().bxor(a1, b1)),
             Mnemonic::Pand => (self.b.ins().band(a0, b0), self.b.ins().band(a1, b1)),
             Mnemonic::Por => (self.b.ins().bor(a0, b0), self.b.ins().bor(a1, b1)),
             Mnemonic::Pandn => (self.b.ins().band_not(b0, a0), self.b.ins().band_not(b1, a1)),
@@ -823,7 +828,7 @@ impl Emitter<'_, '_> {
                     (out[0], out[1])
                 }
             }
-            _ => unreachable!("XmmPacked holds only these operations"),
+            _ => unreachable!("the packed forms hold only these operations"),
         };
         self.set_xmm_words(dst, low, high);
     }
@@ -1724,7 +1729,25 @@ impl Emitter<'_, '_> {
                     self.set_word(XMM + 2 * usize::from(dst) + half, v);
                 }
             }
-            Fast::XmmPacked { op, dst, src, imm } => self.packed(op, dst, src, imm),
+            Fast::XmmPacked { op, dst, src, imm } => {
+                let b = self.xmm_words(src);
+                self.packed(op, dst, b, imm);
+            }
+            // Aligned, so the two words are of one page: a failure of either
+            // is the failure of the whole.
+            Fast::XmmPackedLoad { op, dst, mem } => {
+                let address = self.linear(&mem);
+                self.unless_misaligned(address, n, rip);
+                let (low, low_status) = self.load(address, 8);
+                self.unless_failed(low_status, n, rip);
+                let address = self.b.ins().iadd_imm_s(address, 8);
+                let (high, high_status) = self.load(address, 8);
+                self.unless_failed(high_status, n, rip);
+                self.packed(op, dst, (low, high), 0);
+                // Neither is FAILED, so this is CODE_CHANGED if either is.
+                let status = self.b.ins().bor(low_status, high_status);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::Pmovmskb { dst, src } => {
                 let (low, high) = self.xmm_words(src);
                 let low = self.byte_signs(low);

@@ -1,9 +1,9 @@
 //! Compiled code does what the interpreter does: each form, and runs of
 //! forms, from random states, compared with `paludarium_cpu::step`.
-use paludarium_cpu::compile::{Compiler, Fast, Form, REP_CHUNK};
-use paludarium_cpu::{CpuState, flag, reg, step};
+use paludarium_cpu::compile::{Compiler, Fast, Form, REP_CHUNK, run_compiled};
+use paludarium_cpu::{CpuState, DecodeCache, flag, reg, step};
 use paludarium_decoder::decode;
-use paludarium_mmu::{AddressSpace, MappingKind, Prot, Userfault};
+use paludarium_mmu::{AddressSpace, MappingKind, Prot, Referenced, Userfault};
 use paludarium_types::{GuestAddr, PAGE_SIZE};
 
 use crate::exec::thread_cpu_time;
@@ -377,6 +377,12 @@ const FORMS: &[&[u8]] = &[
     &[0x66, 0x0f, 0x75, 0xc1],
     &[0x66, 0x0f, 0x76, 0xc1],
     &[0x66, 0x44, 0x0f, 0x76, 0xc8],
+    // pxor and pcmpeqb of memory
+    &[0x66, 0x0f, 0xef, 0x03],
+    &[0x66, 0x44, 0x0f, 0xef, 0x44, 0x24, 0xf0],
+    &[0x66, 0x0f, 0x74, 0x03],
+    &[0x66, 0x44, 0x0f, 0x74, 0x4c, 0xcb, 0x08],
+    &[0x64, 0x66, 0x0f, 0x74, 0x03],
     // SSE packs and the other unpacks
     &[0x66, 0x0f, 0x67, 0xc1],
     &[0x66, 0x0f, 0x67, 0xc0],
@@ -1070,15 +1076,20 @@ fn threads_that_compile_at_once_all_go_on() {
 }
 
 #[test]
-fn an_sse_move_that_fails_runs_nothing() {
+fn an_sse_access_that_fails_runs_nothing() {
     let compiler = NativeCompiler::new(1, false).unwrap();
     // movaps [rbx], xmm0 at the code, then misaligned; movaps xmm0, [rbx]
-    // unmapped.
+    // misaligned; movups xmm0, [rbx] unmapped; pxor and pcmpeqb xmm0, [rbx]
+    // misaligned, then unmapped.
     for (code, rbx) in [
         (&[0x0f, 0x29, 0x03][..], CODE),
         (&[0x0f, 0x29, 0x03][..], DATA + 8),
         (&[0x0f, 0x28, 0x03][..], DATA + 8),
         (&[0x0f, 0x10, 0x03][..], 0x1000),
+        (&[0x66, 0x0f, 0xef, 0x03][..], DATA + 8),
+        (&[0x66, 0x0f, 0xef, 0x03][..], 0x1000),
+        (&[0x66, 0x0f, 0x74, 0x03][..], DATA + 8),
+        (&[0x66, 0x0f, 0x74, 0x03][..], 0x1000),
     ] {
         let compiled = compiler.compile(&forms(code)).unwrap();
         let memory = space(code, &[]);
@@ -1094,6 +1105,54 @@ fn an_sse_move_that_fails_runs_nothing() {
         assert_eq!(state, before);
         let (_, data) = contents(&memory);
         assert!(data.iter().all(|&b| b == 0));
+    }
+}
+
+/// `pxor` and `pcmpeqb` of memory that shares some bytes with the register:
+/// random ones are seldom equal, and a random address is seldom aligned.
+#[test]
+fn a_packed_operation_of_aligned_memory_does_what_the_interpreter_does() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    for code in [
+        &[0x66, 0x0f, 0xef, 0x03][..],
+        &[0x66, 0x44, 0x0f, 0xef, 0x03][..],
+        &[0x66, 0x0f, 0x74, 0x03][..],
+        &[0x66, 0x44, 0x0f, 0x74, 0x03][..],
+    ] {
+        let compiled = compiler.compile(&forms(code)).unwrap();
+        for round in 0..200 {
+            let mut before = state(&mut random);
+            // The last 16 bytes of a page too.
+            let offset = if round % 3 == 0 {
+                PAGE_SIZE - 16
+            } else {
+                random.next() % (DATA_LEN as u64 / 16) * 16
+            };
+            before.gpr[reg::RBX] = DATA + offset;
+            let mut data = vec![0; DATA_LEN];
+            let at = usize::try_from(offset).unwrap();
+            data[at..at + 16]
+                .copy_from_slice(&before.xmm[if code[1] == 0x44 { 8 } else { 0 }].to_le_bytes());
+            for byte in &mut data[at..at + 16] {
+                // Each byte the same, one bit apart, or another.
+                match random.next() % 3 {
+                    0 => {}
+                    1 => *byte ^= 1 << (random.next() % 8),
+                    _ => *byte = random.next() as u8,
+                }
+            }
+            let memory = space(code, &data);
+            if round % 2 == 0 {
+                warm(&memory);
+            }
+            let mut fast = before.clone();
+            let ran = compiled.run(&mut fast, &memory, memory.code_generation_cached());
+            assert_eq!(ran, 1, "{code:02x?} from {before:x?}");
+            let mut slow = before.clone();
+            step(&mut slow, &memory).unwrap();
+            assert_eq!(fast, slow, "{code:02x?} from {before:x?}");
+        }
     }
 }
 
@@ -1195,6 +1254,41 @@ fn a_store_after_clear_refs_makes_the_page_soft_dirty_again() {
     });
     assert_eq!((ran, word, cleared), (2, 0x5555, Some(0)));
     assert_eq!(soft_dirty(&memory), 1);
+}
+
+#[test]
+fn an_access_after_clear_refs_references_the_page_again() {
+    let referenced = |m: &AddressSpace| m.view().usage(DATA, DATA + PAGE_SIZE).unwrap().referenced;
+    let mut cleared = None;
+    let (ran, word, memory) = store_after(|m| {
+        assert!(m.view().clear_referenced(Referenced::All));
+        cleared = Some(referenced(m));
+    });
+    assert_eq!((ran, word, cleared), (2, 0x5555, Some(0)));
+    assert_eq!(referenced(&memory), 1);
+}
+
+#[test]
+fn a_compiled_loop_references_its_code_after_clear_refs() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    // inc rax; jmp to it
+    let memory = space(&[0x48, 0xff, 0xc0, 0xeb, 0xfb], &[]);
+    let referenced = || {
+        memory
+            .view()
+            .usage(CODE, CODE + PAGE_SIZE)
+            .unwrap()
+            .referenced
+    };
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    let mut cache = DecodeCache::new();
+    for _ in 0..3 {
+        run_compiled(&mut state, &memory, 1000, &mut cache, &compiler);
+        assert_eq!(referenced(), 1);
+        assert!(memory.view().clear_referenced(Referenced::All));
+        assert_eq!(referenced(), 0);
+    }
+    assert_eq!(state.gpr[reg::RAX], 1500);
 }
 
 #[test]

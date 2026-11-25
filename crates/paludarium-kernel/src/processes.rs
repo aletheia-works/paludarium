@@ -1355,11 +1355,11 @@ impl Processes {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = self.send(&mut entries, pid, None, signal);
     }
-    /// `number` from the kernel (`SI_KERNEL`) to process `pid`, as Linux's
-    /// `send_sig` with `SEND_SIG_PRIV` sends it.
-    pub(crate) fn signal_from_kernel(&self, pid: u32, number: i32) {
+    /// `number` from the kernel (`SI_KERNEL`) to thread `tid` of process
+    /// `pid`, as Linux's `send_sig` with `SEND_SIG_PRIV` sends it.
+    pub(crate) fn signal_from_kernel(&self, pid: u32, tid: u32, number: i32) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = self.send(&mut entries, pid, None, Self::from_kernel(number));
+        let _ = self.send(&mut entries, pid, Some(tid), Self::from_kernel(number));
     }
     /// Whether a process other than `init` is in PID namespace `space` or
     /// one nested in it.

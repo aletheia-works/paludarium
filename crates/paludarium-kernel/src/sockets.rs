@@ -493,6 +493,7 @@ impl PipeEnd {
     }
     /// `F_GETPIPE_SZ`.
     pub(crate) fn size(&self) -> u64 {
+        let _held = self.hold();
         self.endpoint.pair.window() as u64
     }
     /// `F_SETPIPE_SZ`, as Linux's `pipe_set_size`: the size rounds up to a
@@ -504,6 +505,7 @@ impl PipeEnd {
             return Err(Errno::EINVAL);
         }
         let size = size.max(4096).next_power_of_two() as usize;
+        let _held = self.hold();
         let sides = self
             .endpoint
             .pair
@@ -542,6 +544,27 @@ impl PipeEnd {
     /// Whether `other` is a description of this same pipe.
     pub(crate) fn same_pipe(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.endpoint.pair, &other.endpoint.pair)
+    }
+    /// Takes the pipe for what looks at its bytes or its room and then
+    /// moves some, as Linux holds `pipe->mutex` meanwhile: the copies of
+    /// `splice` and `vmsplice` may wait with it held, for a `userfaultfd`
+    /// or for a file's data or room, and then everything else that moves
+    /// the pipe's bytes, `FIONREAD`, `F_SETPIPE_SZ` and the close of an end
+    /// ([`closing`]) wait for it, though a signal does not end their wait
+    /// (`mutex_lock`); a poll does not. Not held while the pipe itself is
+    /// waited for (`pipe_wait_readable`).
+    pub(crate) fn hold(&self) -> Held<'_> {
+        self.endpoint.pair.hold()
+    }
+    /// Takes this pipe and another, in the order everyone takes the two
+    /// (`pipe_double_lock`).
+    pub(crate) fn hold_both<'a>(&'a self, other: &'a Self) -> [Held<'a>; 2] {
+        let (one, two) = (&self.endpoint.pair, &other.endpoint.pair);
+        if Arc::as_ptr(one) < Arc::as_ptr(two) {
+            [one.hold(), two.hold()]
+        } else {
+            [two.hold(), one.hold()]
+        }
     }
     /// The bytes waiting to be read.
     pub(crate) fn unread_bytes(&self) -> usize {
@@ -614,17 +637,144 @@ impl PipeEnd {
     pub(crate) fn has_writers(&self) -> bool {
         !self.endpoint.lock_sides()[1 - self.read_side()].closed
     }
+    /// The bytes of the first buffer, at most `len`; none with no unread
+    /// bytes.
+    pub(crate) fn first_buffer(&self, len: usize) -> Option<usize> {
+        self.endpoint.lock_sides()[self.read_side()]
+            .pipe_bufs
+            .front()
+            .map(|buf| buf.len.min(len))
+    }
     /// Copies the first unread bytes into `buf`, leaving them in the pipe,
     /// and returns how many there were.
     pub(crate) fn peek(&self, buf: &mut [u8]) -> usize {
         let sides = self.endpoint.lock_sides();
         let bytes = &sides[self.read_side()].bytes;
         let count = buf.len().min(bytes.len());
-        for (d, s) in buf[..count].iter_mut().zip(bytes.iter()) {
-            *d = *s;
-        }
+        let (first, rest) = bytes.as_slices();
+        let first = &first[..first.len().min(count)];
+        buf[..first.len()].copy_from_slice(first);
+        buf[first.len()..count].copy_from_slice(&rest[..count - first.len()]);
         count
     }
+    /// A read of at most `want` bytes, not none, to `memory` (of `mem`), as `anon_pipe_read` makes it with the pipe held: buffer by
+    /// buffer of the pipe, up to the end of a packet, and one whose bytes
+    /// cannot all be copied stays, which is `EFAULT` before any other. An
+    /// empty pipe is `EAGAIN`, or 0 with no writer.
+    pub(crate) fn read_to(
+        &self,
+        mem: &paludarium_mmu::AddressSpace,
+        memory: crate::files::Memory<'_>,
+        want: usize,
+    ) -> Result<usize, Errno> {
+        if !self.reader {
+            return Err(Errno::EBADF);
+        }
+        let _held = self.hold();
+        let (lens, dropped) = {
+            let sides = self.endpoint.lock_sides();
+            let own = &sides[self.endpoint.side];
+            let (taken, dropped) = own.pipe_read_plan(want);
+            let mut left = taken;
+            let lens: Vec<usize> = own
+                .pipe_bufs
+                .iter()
+                .map(|buf| {
+                    let n = buf.len.min(left);
+                    left -= n;
+                    n
+                })
+                .take_while(|&n| n != 0)
+                .collect();
+            (lens, dropped)
+        };
+        if lens.is_empty() {
+            return if self.has_writers() {
+                Err(Errno::EAGAIN)
+            } else {
+                Ok(0)
+            };
+        }
+        let mut piece = Vec::new();
+        let total = lens.iter().sum();
+        piece.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
+        piece.resize(total, 0);
+        self.peek(&mut piece);
+        let mut done = 0;
+        for len in lens {
+            if !memory.store(mem, done, &piece[done..done + len]) {
+                break;
+            }
+            done += len;
+        }
+        if done == 0 {
+            return Err(Errno::EFAULT);
+        }
+        let dropped = if done == total { dropped } else { 0 };
+        self.endpoint.take_read(done + dropped);
+        Ok(done)
+    }
+    /// A write of `memory` (of `mem`) from its byte `done` to `total`, as `anon_pipe_write` makes it with the pipe held: as
+    /// many of the pipe's buffers as there is room for, each put in once it
+    /// is copied; one that cannot be copied whole ends it, and is `EFAULT`
+    /// before any other. A full pipe is `EAGAIN`, and one no one reads
+    /// `EPIPE`.
+    pub(crate) fn write_from(
+        &self,
+        mem: &paludarium_mmu::AddressSpace,
+        memory: crate::files::Memory<'_>,
+        done: usize,
+        total: usize,
+    ) -> Result<usize, Errno> {
+        let packet = self.direct.load(Ordering::SeqCst);
+        if self.reader && self.writer.is_none() {
+            return Err(Errno::EBADF);
+        }
+        let _held = self.hold();
+        if !self.has_readers() {
+            return Err(Errno(32));
+        }
+        let (merged, new) = self.endpoint.lock_sides()[self.read_side()].pipe_plan(
+            &PipeLayout::Write { packet },
+            total - done,
+            self.endpoint.pair.slots(),
+        );
+        let merged = Some(merged).filter(|&len| len != 0).into_iter();
+        let lens: Vec<usize> = merged.chain(new.iter().map(|buf| buf.len)).collect();
+        if lens.is_empty() {
+            return Err(Errno::EAGAIN);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve(lens.iter().sum())
+            .map_err(|_| Errno::ENOMEM)?;
+        for len in lens {
+            let start = bytes.len();
+            bytes.resize(start + len, 0);
+            if !memory.load(mem, done + start, &mut bytes[start..]) {
+                bytes.truncate(start);
+                break;
+            }
+        }
+        if bytes.is_empty() {
+            return Err(Errno::EFAULT);
+        }
+        self.write_laid(&bytes, PipeLayout::Write { packet })
+    }
+}
+/// Where the `len` bytes from `skip` on of the buffers `segments` lie.
+pub(crate) fn spans(
+    segments: &[(u64, usize)],
+    mut skip: usize,
+    mut len: usize,
+) -> impl Iterator<Item = (GuestAddr, usize)> {
+    segments.iter().filter_map(move |&(base, length)| {
+        let within = skip.min(length);
+        skip -= within;
+        let n = len.min(length - within);
+        len -= n;
+        (n != 0).then(|| (GuestAddr(base.wrapping_add(within as u64)), n))
+    })
 }
 impl FileHandle for PipeEnd {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -632,6 +782,8 @@ impl FileHandle for PipeEnd {
     }
     fn read(&self, bytes: &mut [u8]) -> Result<usize, Errno> {
         if self.reader {
+            // A read of nothing does not take the pipe (`anon_pipe_read`).
+            let _held = (!bytes.is_empty()).then(|| self.hold());
             self.endpoint.read(bytes)
         } else {
             Err(Errno::EBADF)
@@ -639,6 +791,7 @@ impl FileHandle for PipeEnd {
     }
     fn write(&self, bytes: &[u8]) -> Result<usize, Errno> {
         let packet = self.direct.load(Ordering::SeqCst);
+        let _held = (!bytes.is_empty()).then(|| self.hold());
         self.write_laid(bytes, PipeLayout::Write { packet })
     }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
@@ -1139,6 +1292,18 @@ fn socket(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
     }
     Ok(file)
 }
+/// A pipe held ([`PipeEnd::hold`]).
+pub(crate) type Held<'a> = std::sync::MutexGuard<'a, ()>;
+/// `file` leaves a descriptor table, for good once its caller lets go of
+/// it: the last close of a pipe's description waits for what holds the pipe
+/// (`pipe_release`). Not called with a table or the space locked.
+pub(crate) fn closing(file: &Arc<dyn FileHandle>) {
+    if Arc::strong_count(file) == 1
+        && let Some(pipe) = pipe(file)
+    {
+        drop(pipe.hold());
+    }
+}
 /// The pipe description `file` is, which keeps its own owner and `O_ASYNC`.
 pub(crate) fn pipe(file: &Arc<dyn FileHandle>) -> Option<&PipeEnd> {
     file.as_any()?.downcast_ref::<PipeEnd>()
@@ -1233,6 +1398,7 @@ pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Resul
         return Some(if outgoing {
             Err(Errno::ENOTTY)
         } else {
+            let _held = pipe.hold();
             Ok(end.lock_sides()[side].bytes.len())
         });
     }
@@ -3057,10 +3223,24 @@ struct Pair {
     window: AtomicUsize,
     /// The pair is a pipe, whose `O_ASYNC` signals differ from a socket's.
     pipe: AtomicBool,
+    /// Held by what moves a pipe's bytes ([`PipeEnd::hold`]).
+    held: Mutex<()>,
     /// The host, whose real-time clock gives messages their timestamps.
     clock: std::sync::OnceLock<Arc<dyn paludarium_host::Host>>,
 }
 impl Pair {
+    /// [`PipeEnd::hold`], the wait for which shows the thread asleep.
+    fn hold(&self) -> Held<'_> {
+        match self.held.try_lock() {
+            Ok(held) => return held,
+            Err(std::sync::TryLockError::Poisoned(held)) => return held.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let mut waiting = paludarium_host::blocked::Waiting::new();
+        waiting.sleep();
+        paludarium_host::switches::sleep(&mut false);
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     /// Whether end `side` may send as Linux's `unix_writable` sees it.
     fn writable(&self, side: usize) -> bool {
         (self.sent[side].load(Ordering::SeqCst) + 1) * 4
@@ -3367,6 +3547,7 @@ impl SocketPairEnd {
             kind: kind & 0xf,
             window: AtomicUsize::new(SEND_WINDOW),
             pipe: AtomicBool::new(false),
+            held: Mutex::default(),
             clock: std::sync::OnceLock::new(),
             sides: Mutex::new(std::array::from_fn(|side| Side {
                 inode: inodes[side],
@@ -4107,10 +4288,31 @@ impl SocketPairEnd {
     /// no read's packet ends ([`PipeEnd::take`]), and tells the writer.
     fn take_raw(&self, side: usize, count: usize) {
         let mut sides = self.lock_sides();
-        let own = &mut sides[side];
+        Self::drop_front(&mut sides[side], count);
+        sides[1 - side].output_epoch = sides[1 - side].output_epoch.wrapping_add(1);
+        drop(sides);
+        self.pair.hub.changed();
+    }
+    /// Takes the first `count` bytes of this pipe's read end, copied out by
+    /// a read ([`PipeEnd::read_to`]), and tells the writer as one does.
+    fn take_read(&self, count: usize) {
+        let mut sides = self.lock_sides();
+        let own = &mut sides[self.side];
+        let full = own.pipe_bufs.len() >= self.pair.slots();
+        if Self::drop_front(own, count) || full {
+            let peer = &mut sides[1 - self.side];
+            peer.output_epoch = peer.output_epoch.wrapping_add(1);
+        }
+        drop(sides);
+        self.pair.hub.changed();
+    }
+    /// Drops the first `count` bytes of a pipe's `own`; whether some write's
+    /// last byte was among them.
+    fn drop_front(own: &mut Side, count: usize) -> bool {
         let count = count.min(own.bytes.len());
         own.bytes.drain(..count);
         let mut rest = count;
+        let mut ended = false;
         while rest > 0
             && let Some(front) = own.writes.front_mut()
         {
@@ -4119,12 +4321,11 @@ impl SocketPairEnd {
             rest -= n;
             if front.len == 0 {
                 own.writes.pop_front();
+                ended = true;
             }
         }
         own.pipe_take(count);
-        sides[1 - side].output_epoch = sides[1 - side].output_epoch.wrapping_add(1);
-        drop(sides);
-        self.pair.hub.changed();
+        ended
     }
 }
 impl Drop for SocketPairEnd {

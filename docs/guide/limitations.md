@@ -544,10 +544,11 @@ verified.
   `IORING_REGISTER_FILES_UPDATE`, `IORING_REGISTER_FILE_ALLOC_RANGE`,
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
-  `IORING_REGISTER_PBUF_STATUS` and `IORING_REGISTER_SYNC_CANCEL` (the
-  others give `EINVAL`). So no ring descriptor or personality can be
-  registered, buffers cannot be updated, and buffers cannot be registered
-  with `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
+  `IORING_REGISTER_PBUF_STATUS`, `IORING_REGISTER_SYNC_CANCEL`,
+  `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS` (the others
+  give `EINVAL`). So no personality can be registered, buffers cannot be
+  updated, and buffers cannot be registered with
+  `IORING_REGISTER_BUFFERS2`, which gives them tags. A process's
   whole exit cancels the requests its threads submitted that wait for
   their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
   the kernel the differential tests run on, cancels them only once their
@@ -556,9 +557,8 @@ verified.
   Linux charges it once. A ring maps only shared (`MAP_PRIVATE` gives
   `EINVAL`).
   The features are Linux
-  6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
-  descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
-  wait's `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
+  6.12's, so `IORING_FEAT_MIN_TIMEOUT` is reported though a wait's
+  `min_wait_usec` changes nothing. A pseudo-terminal's read waits in
   `io_uring_enter` instead of waiting for its file as a pipe's read does. A file that is never read (an epoll instance, a ring)
   fails with `EINVAL` at once, where Linux first waits for it to be ready.
   An `IORING_OP_ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_OP` and an

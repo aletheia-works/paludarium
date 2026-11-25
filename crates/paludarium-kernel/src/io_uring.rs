@@ -206,6 +206,8 @@ const REGISTER_PROBE: u64 = 8;
 const REGISTER_PBUF_RING: u64 = 22;
 const UNREGISTER_PBUF_RING: u64 = 23;
 const REGISTER_SYNC_CANCEL: u64 = 24;
+const REGISTER_RING_FDS: u64 = 20;
+const UNREGISTER_RING_FDS: u64 = 21;
 const REGISTER_FILE_ALLOC_RANGE: u64 = 25;
 const REGISTER_PBUF_STATUS: u64 = 26;
 /// `IOU_PBUF_RING_MMAP`: the kernel gives the ring's pages, which the
@@ -345,6 +347,16 @@ pub(crate) struct TaskWork {
     /// The thread exited (`PF_EXITING`): work added from then on runs at
     /// once as Linux's `io_fallback_tw` runs it ([`run_terminated`]).
     exited: bool,
+    /// The thread has an io_uring context (`current->io_uring`), which
+    /// making a ring, submitting to one or registering a ring descriptor
+    /// gives it, neither `fork` nor `clone` copies, and `execve` takes away.
+    context: bool,
+    /// The rings it registered (`tctx->registered_rings`,
+    /// `IORING_REGISTER_RING_FDS`), which `io_uring_enter` and
+    /// `io_uring_register` find by index with `IORING_ENTER_REGISTERED_RING`
+    /// and `IORING_REGISTER_USE_REGISTERED_RING`; `execve` and the thread's
+    /// exit let go of them (`io_uring_unreg_ringfd`).
+    rings: [Option<Arc<dyn FileHandle>>; RINGFD_REG_MAX as usize],
 }
 
 impl TaskWork {
@@ -2013,9 +2025,11 @@ fn live_rings(polls: &Polls) -> Vec<Arc<dyn FileHandle>> {
 }
 
 /// The thread calls `execve` (`io_uring_task_cancel`, before the new image
-/// replaces its memory): [`cancel_all_task`].
+/// replaces its memory): [`cancel_all_task`], after which its io_uring
+/// context goes (`__io_uring_free`).
 pub(crate) fn exec_task(c: &mut Context<'_>) {
     cancel_all_task(c);
+    c.inbox.task_work().context = false;
 }
 
 /// `io_uring_cancel_generic` with `cancel_all`, which `execve` and a whole
@@ -2024,8 +2038,10 @@ pub(crate) fn exec_task(c: &mut Context<'_>) {
 /// `IORING_SETUP_DEFER_TASKRUN` rings the thread submits to runs
 /// (`io_run_local_work`), the requests it submitted that wait are
 /// cancelled ([`cancel_task`]), its own task work runs, and the rings'
-/// again.
+/// again. Its registered ring descriptors go first (`__io_uring_cancel`'s
+/// `io_uring_unreg_ringfd`).
 pub(crate) fn cancel_all_task(c: &mut Context<'_>) {
+    unregister_all_rings(c.inbox);
     let own: Vec<Arc<dyn FileHandle>> = live_rings(&c.processes.io_uring)
         .into_iter()
         .filter(|file| {
@@ -2051,12 +2067,14 @@ pub(crate) fn cancel_all_task(c: &mut Context<'_>) {
     run_own(c);
 }
 
-/// The thread `inbox` belongs to exits (`do_exit`, `PF_EXITING`): the task
+/// The thread `inbox` belongs to exits (`do_exit`, `PF_EXITING`): its
+/// registered ring descriptors go (`io_uring_unreg_ringfd`), and the task
 /// work it still has runs as an exiting task's does ([`run_terminated`]),
 /// as will any added later. A whole process's exit ran
 /// [`cancel_all_task`] first; a request of a thread that exits alone waits
 /// on, and fails once its file is ready.
 pub(crate) fn exit_task(inbox: &Arc<crate::SignalInbox>) {
+    unregister_all_rings(inbox);
     let work = {
         let mut task_work = inbox.task_work();
         task_work.exited = true;
@@ -2667,6 +2685,124 @@ fn submit(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wanted: 
     total - left
 }
 
+/// The ring `fd` names, as `io_uring_register_get_file` finds it: with
+/// `registered`, the thread's registered ring of that index, which a thread
+/// without an io_uring context or an index past the table is `EINVAL`, and
+/// an empty one `EBADF`; else the ring of descriptor `fd` ([`ring_of`]).
+fn ring_file(c: &Context<'_>, fd: u64, registered: bool) -> Result<Arc<dyn FileHandle>, Errno> {
+    if !registered {
+        return ring_of(c, fd);
+    }
+    let task = c.inbox.task_work();
+    if !task.context || fd as u32 >= RINGFD_REG_MAX {
+        return Err(Errno::EINVAL);
+    }
+    task.rings[fd as u32 as usize].clone().ok_or(Errno::EBADF)
+}
+
+/// Gives the running thread an io_uring context (`__io_uring_add_tctx_node`).
+fn give_context(c: &Context<'_>) {
+    c.inbox.task_work().context = true;
+}
+
+/// `IORING_REGISTER_RING_FDS`, as Linux's `io_ringfd_register`: 1 to 16
+/// `struct io_uring_rsrc_update`s at `arg` (`EINVAL`), each in turn read
+/// (`EFAULT`) with no reserved field (`EINVAL`): the ring of descriptor
+/// `data` (`EBADF`, or `EOPNOTSUPP` for another file) goes in the slot
+/// `offset` names, or the first free one for `u32::MAX` (`EINVAL` past the
+/// table, `EBUSY` for none free), and the slot is written back to `offset`
+/// (`EFAULT`, which lets go of it). It gives how many it registered, or the
+/// first one's error.
+fn register_ring_fds(c: &Context<'_>, arg: u64, count: u32) -> Result<u64, Errno> {
+    if count == 0 || count > RINGFD_REG_MAX {
+        return Err(Errno::EINVAL);
+    }
+    give_context(c);
+    let mut done = 0;
+    let failed = (|| -> Result<(), Errno> {
+        while done < count {
+            let at = GuestAddr(arg.wrapping_add(16 * u64::from(done)));
+            let mut update = [0u8; 16];
+            c.mem.read(at, &mut update).map_err(|_| Errno::EFAULT)?;
+            let (offset, data) = (u32_at(&update, 0), u64_at(&update, 8));
+            if u32_at(&update, 4) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let (start, end) = match offset {
+                u32::MAX => (0, RINGFD_REG_MAX),
+                offset if offset >= RINGFD_REG_MAX => return Err(Errno::EINVAL),
+                offset => (offset, offset + 1),
+            };
+            let d = fget(c, data as u32 as i32)?;
+            if !is_ring(&d) {
+                return Err(EOPNOTSUPP);
+            }
+            let slot = {
+                let mut task = c.inbox.task_work();
+                let slot = (start..end)
+                    .find(|&slot| task.rings[slot as usize].is_none())
+                    .ok_or(EBUSY)?;
+                task.rings[slot as usize] = Some(d.file);
+                slot
+            };
+            if c.mem.write(at, &slot.to_le_bytes()).is_err() {
+                c.inbox.task_work().rings[slot as usize] = None;
+                return Err(Errno::EFAULT);
+            }
+            done += 1;
+        }
+        Ok(())
+    })();
+    match failed {
+        Err(e) if done == 0 => Err(e),
+        _ => Ok(u64::from(done)),
+    }
+}
+
+/// `IORING_UNREGISTER_RING_FDS`, as Linux's `io_ringfd_unregister`: 1 to 16
+/// `struct io_uring_rsrc_update`s (`EINVAL`); nothing for a thread without
+/// an io_uring context; each read in turn (`EFAULT`), with no reserved
+/// field, no `data` and a slot in the table (`EINVAL`), empties its slot.
+/// It gives how many it took, or the first one's error.
+fn unregister_ring_fds(c: &Context<'_>, arg: u64, count: u32) -> Result<u64, Errno> {
+    if count == 0 || count > RINGFD_REG_MAX {
+        return Err(Errno::EINVAL);
+    }
+    if !c.inbox.task_work().context {
+        return Ok(0);
+    }
+    let mut done = 0;
+    let failed = (|| -> Result<(), Errno> {
+        while done < count {
+            let mut update = [0u8; 16];
+            c.mem
+                .read(
+                    GuestAddr(arg.wrapping_add(16 * u64::from(done))),
+                    &mut update,
+                )
+                .map_err(|_| Errno::EFAULT)?;
+            let offset = u32_at(&update, 0);
+            if u32_at(&update, 4) != 0 || u64_at(&update, 8) != 0 || offset >= RINGFD_REG_MAX {
+                return Err(Errno::EINVAL);
+            }
+            c.inbox.task_work().rings[offset as usize] = None;
+            done += 1;
+        }
+        Ok(())
+    })();
+    match failed {
+        Err(e) if done == 0 => Err(e),
+        _ => Ok(u64::from(done)),
+    }
+}
+
+/// Lets go of the thread's registered rings (`io_uring_unreg_ringfd`), as
+/// it calls `execve` or exits.
+fn unregister_all_rings(inbox: &crate::SignalInbox) {
+    let rings = std::mem::take(&mut inbox.task_work().rings);
+    drop(rings);
+}
+
 /// The ring behind descriptor `fd`: `EBADF` without one (or for `O_PATH`),
 /// `EOPNOTSUPP` for another file.
 fn ring_of(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
@@ -2841,7 +2977,10 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(Arc::downgrade(&file));
-    c.files.install(file, true, c.group.nofile())
+    let fd = c.files.install(file, true, c.group.nofile())?;
+    // `io_uring_create` gives its thread a context.
+    give_context(c);
+    Ok(fd)
 }
 
 /// Zeroed pages the kernel gives for `len` bytes, which a mapping of the
@@ -2872,21 +3011,16 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & !ENTER_KNOWN != 0 {
         return Err(Errno::EINVAL);
     }
-    // No ring descriptor is ever registered.
-    if flags & ENTER_REGISTERED_RING != 0 {
-        return Err(if a[0] as u32 >= RINGFD_REG_MAX {
-            Errno::EINVAL
-        } else {
-            Errno::EBADF
-        });
-    }
-    let file = ring_of(c, a[0])?;
+    let file = ring_file(c, a[0], flags & ENTER_REGISTERED_RING != 0)?;
     let ring = downcast(&file)?;
     let mut submitted = 0;
     if to_submit != 0 {
+        // `__io_uring_add_tctx_node_from_submit`: the submitter, then the
+        // context, though no entry may be there to take.
         if ring.submitter.is_some_and(|tid| tid != c.tid) {
             return Err(EEXIST);
         }
+        give_context(c);
         {
             let _submitting = ring.submitting();
             ring.flush(&mut ring.state());
@@ -3069,14 +3203,7 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if opcode >= REGISTER_LAST {
         return Err(Errno::EINVAL);
     }
-    if registered {
-        return Err(if a[0] as u32 >= RINGFD_REG_MAX {
-            Errno::EINVAL
-        } else {
-            Errno::EBADF
-        });
-    }
-    let file = ring_of(c, a[0])?;
+    let file = ring_file(c, a[0], registered)?;
     let ring = downcast(&file)?;
     if ring.submitter.is_some_and(|tid| tid != c.tid) {
         return Err(EEXIST);
@@ -3122,6 +3249,8 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         REGISTER_PBUF_STATUS => pbuf_status(c, ring, a[2]),
         REGISTER_SYNC_CANCEL if a[2] == 0 || a[3] as u32 != 1 => Err(Errno::EINVAL),
         REGISTER_SYNC_CANCEL => sync_cancel(c, ring, a[2]),
+        REGISTER_RING_FDS => register_ring_fds(c, a[2], a[3] as u32),
+        UNREGISTER_RING_FDS => unregister_ring_fds(c, a[2], a[3] as u32),
         _ => Err(Errno::EINVAL),
     }
 }

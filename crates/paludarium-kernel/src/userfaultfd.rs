@@ -646,18 +646,8 @@ impl paludarium_mmu::faults::Resolver for KernelCopies {
             if self.fatal() {
                 return false;
             }
-        } else {
-            const RLIMIT_STACK: usize = 3;
-            const RLIMIT_MEMLOCK: usize = 8;
-            let stack = self.processes.soft_limit(self.pid, RLIMIT_STACK);
-            let lock = if CALL.with(core::cell::Cell::get).1 {
-                u64::MAX
-            } else {
-                self.processes.soft_limit(self.pid, RLIMIT_MEMLOCK) >> 12
-            };
-            if space.grow_down(at, stack, lock) {
-                return true;
-            }
+        } else if paludarium_mmu::faults::Resolver::grow(self, space, addr) {
+            return true;
         }
         let Some((id, reason)) = space.userfault_for(at, write, false) else {
             return false;
@@ -672,6 +662,17 @@ impl paludarium_mmu::faults::Resolver for KernelCopies {
                 reason,
             },
         )
+    }
+    fn grow(&self, space: &MemoryView, addr: u64) -> bool {
+        const RLIMIT_STACK: usize = 3;
+        const RLIMIT_MEMLOCK: usize = 8;
+        let stack = self.processes.soft_limit(self.pid, RLIMIT_STACK);
+        let lock = if CALL.with(core::cell::Cell::get).1 {
+            u64::MAX
+        } else {
+            self.processes.soft_limit(self.pid, RLIMIT_MEMLOCK) >> 12
+        };
+        space.grow_down(GuestAddr(addr), stack, lock)
     }
 }
 

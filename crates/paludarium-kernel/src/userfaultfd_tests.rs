@@ -1723,3 +1723,338 @@ fn a_pin_waits_for_a_userfaultfd_with_its_earlier_pages_pinned() {
     assert_eq!(refused.err(), Some(Errno::EFAULT));
     assert_eq!(f.mem.resident(GuestAddr(AREA + PAGE)), Some(false));
 }
+
+/// A `vmsplice` from a pipe holds it as it copies (`pipe_lock`), so a read
+/// meanwhile takes the bytes after, none of them twice.
+#[test]
+fn a_read_waits_for_a_vmsplice_of_its_pipe_that_waits() {
+    const PIPE2: u64 = 293;
+    const WRITE: u64 = 1;
+    const VMSPLICE: u64 = 278;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    assert_eq!(f.ret(PIPE2, &[ARG, 0]), 0);
+    let fds = f.mem.read_u64(GuestAddr(ARG)).unwrap();
+    let (reader, writer) = (fds & 0xffff_ffff, fds >> 32);
+    f.mem.write(GuestAddr(DATA + 0x4000), b"abcdef").unwrap();
+    assert_eq!(f.ret(WRITE, &[writer, DATA + 0x4000, 6]), 6);
+    f.mem.write_u64(GuestAddr(DATA + 0x4100), AREA).unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 0x4108), 3).unwrap();
+    let file = f.kernel.files.descriptor(reader).unwrap().file;
+    let mut read = None;
+    let args = [reader, DATA + 0x4100, 1, 0];
+    let n = served(&mut f, fd, VMSPLICE, &args, |call, mem, address| {
+        let other = std::thread::spawn(move || {
+            let mut bytes = [0; 8];
+            let n = file.read(&mut bytes).unwrap();
+            bytes[..n].to_vec()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!other.is_finished());
+        fill(call, mem, fd, address);
+        read = Some(other);
+    });
+    assert_eq!(n, 3);
+    let mut got = [0; 3];
+    f.mem.read(GuestAddr(AREA), &mut got).unwrap();
+    assert_eq!(&got, b"abc");
+    assert_eq!(read.unwrap().join().unwrap(), b"def");
+    // A pipe's buffer that cannot all be written stays in the pipe.
+    assert_eq!(f.ret(WRITE, &[writer, DATA + 0x4000, 6]), 6);
+    f.mem
+        .write_u64(GuestAddr(DATA + 0x4100), DATA + 0x4200)
+        .unwrap();
+    for (at, word) in [(0x4110, 8), (0x4118, 3)] {
+        f.mem.write_u64(GuestAddr(DATA + at), word).unwrap();
+    }
+    let args = [reader, DATA + 0x4100, 2, 0];
+    assert_eq!(f.ret(VMSPLICE, &args), errno(Errno::EFAULT));
+    assert_eq!(f.ret(READ, &[reader, DATA + 0x4200, 8]), 6);
+}
+
+/// Its `FIONREAD`, `F_GETPIPE_SZ` and the last close of its other end wait
+/// for what holds a pipe, and a poll does not.
+#[test]
+fn what_looks_at_a_held_pipe_waits_and_a_poll_does_not() {
+    const PIPE2: u64 = 293;
+    const VMSPLICE: u64 = 278;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    assert_eq!(f.ret(PIPE2, &[ARG, 0]), 0);
+    let fds = f.mem.read_u64(GuestAddr(ARG)).unwrap();
+    let (reader, writer) = (fds & 0xffff_ffff, fds >> 32);
+    f.mem.write(GuestAddr(DATA + 0x4000), b"abcdef").unwrap();
+    assert_eq!(f.ret(1, &[writer, DATA + 0x4000, 6]), 6);
+    f.mem.write_u64(GuestAddr(DATA + 0x4100), AREA).unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 0x4108), 3).unwrap();
+    let file = f.kernel.files.descriptor(reader).unwrap().file;
+    let mut other = f.kernel.files.fds.lock().unwrap();
+    let last = other.remove(&(writer as u32)).unwrap().file;
+    drop(other);
+    let again = last.reopen(1).unwrap();
+    let mut waiting = Vec::new();
+    let args = [reader, DATA + 0x4100, 1, 0];
+    let n = served(&mut f, fd, VMSPLICE, &args, |call, mem, address| {
+        let end = Arc::clone(&file);
+        waiting.push(std::thread::spawn(move || {
+            crate::sockets::queued(&end, false).unwrap().unwrap() as u64
+        }));
+        let end = Arc::clone(&file);
+        waiting.push(std::thread::spawn(move || {
+            crate::sockets::pipe(&end).unwrap().size()
+        }));
+        waiting.push(std::thread::spawn(move || {
+            crate::sockets::closing(&last);
+            drop(last);
+            0
+        }));
+        let write = Arc::clone(&again);
+        // A write of nothing does not.
+        assert_eq!(write.write(b""), Ok(0));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(waiting.iter().all(|thread| !thread.is_finished()));
+        assert_ne!(file.readiness().unwrap().0 & 1, 0);
+        // One of several descriptors of a description is not its close.
+        crate::sockets::closing(&file);
+        fill(call, mem, fd, address);
+    });
+    assert_eq!(n, 3);
+    let got: Vec<u64> = waiting.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(got, [3, 65536, 0]);
+}
+
+/// A read of a pipe copies its bytes out, and a write copies its bytes in,
+/// with the pipe held (`anon_pipe_read`, `anon_pipe_write`): another read or
+/// write waits for theirs, and what cannot be copied stays where it is.
+#[test]
+fn a_pipe_s_reads_and_writes_copy_with_it_held() {
+    const PIPE2: u64 = 293;
+    const WRITE: u64 = 1;
+    const READV: u64 = 19;
+    const WRITEV: u64 = 20;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, 2 * PAGE), 0);
+    assert_eq!(f.ret(PIPE2, &[ARG, 0]), 0);
+    let fds = f.mem.read_u64(GuestAddr(ARG)).unwrap();
+    let (reader, writer) = (fds & 0xffff_ffff, fds >> 32);
+    f.mem.write(GuestAddr(DATA + 0x4000), b"abcdef").unwrap();
+    f.mem.write(GuestAddr(SRC), b"in the page").unwrap();
+    assert_eq!(f.ret(WRITE, &[writer, DATA + 0x4000, 6]), 6);
+    let [out, input] = [reader, writer].map(|n| f.kernel.files.descriptor(n).unwrap().file);
+    let mut other = None;
+    let n = served(
+        &mut f,
+        fd,
+        READ,
+        &[reader, AREA, 3],
+        |call, mem, address| {
+            let thread = std::thread::spawn(move || {
+                let mut bytes = [0; 8];
+                let n = out.read(&mut bytes).unwrap();
+                bytes[..n].to_vec()
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!thread.is_finished());
+            fill(call, mem, fd, address);
+            other = Some(thread);
+        },
+    );
+    assert_eq!(n, 3);
+    assert_eq!(other.unwrap().join().unwrap(), b"def");
+    let mut got = [0; 6];
+    f.mem.read(GuestAddr(AREA), &mut got).unwrap();
+    assert_eq!(&got, b"abcthe");
+    let mut other = None;
+    let n = served(
+        &mut f,
+        fd,
+        WRITE,
+        &[writer, AREA + PAGE, 11],
+        |call, mem, address| {
+            let thread = std::thread::spawn(move || input.write(b"!"));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!thread.is_finished());
+            fill(call, mem, fd, address);
+            other = Some(thread);
+        },
+    );
+    assert_eq!(n, 11);
+    assert_eq!(other.unwrap().join().unwrap(), Ok(1));
+    assert_eq!(f.ret(READ, &[reader, DATA + 0x4200, 64]), 12);
+    f.mem.read(GuestAddr(DATA + 0x4200), &mut got).unwrap();
+    assert_eq!(&got, b"in the");
+    // Only what is copied needs its buffer: a bad one past the bytes there
+    // is no matter, and one in their way leaves the pipe's buffer.
+    assert_eq!(f.ret(WRITE, &[writer, DATA + 0x4000, 6]), 6);
+    for (at, word) in [
+        (0x4100, DATA + 0x4200),
+        (0x4108, 3),
+        (0x4110, 8),
+        (0x4118, 64),
+    ] {
+        f.mem.write_u64(GuestAddr(DATA + at), word).unwrap();
+    }
+    let vector = DATA + 0x4100;
+    assert_eq!(f.ret(READV, &[reader, vector, 2]), errno(Errno::EFAULT));
+    f.mem.write_u64(GuestAddr(DATA + 0x4108), 6).unwrap();
+    assert_eq!(f.ret(READV, &[reader, vector, 2]), 6);
+    // A write ends with the pages copied before one that cannot be.
+    for (at, word) in [(0x4108, 4096), (0x4118, 100)] {
+        f.mem.write_u64(GuestAddr(DATA + at), word).unwrap();
+    }
+    assert_eq!(f.ret(WRITEV, &[writer, vector, 2]), 4096);
+    f.mem.write_u64(GuestAddr(DATA + 0x4108), 100).unwrap();
+    assert_eq!(f.ret(WRITEV, &[writer, vector, 2]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(READ, &[reader, DATA + 0x2000, 8192]), 4096);
+    assert_eq!(f.ret(WRITE, &[writer, 8, 0]), 0);
+    assert_eq!(f.ret(READ, &[reader, 8, 0]), 0);
+}
+
+/// The frame of a signal waits for a `userfaultfd`, as the copies of
+/// `setup_rt_frame` do, and grows a mapping that grows down.
+#[test]
+fn a_signal_s_frame_waits_for_a_userfaultfd() {
+    const SIGACTION: u64 = 13;
+    const KILL: u64 = 62;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, 8 * PAGE), 0);
+    for (at, word) in [(0, 0x7000u64), (8, 0x0400_0000), (16, 0x7100), (24, 0)] {
+        f.mem
+            .write_u64(GuestAddr(DATA + 0x4000 + at), word)
+            .unwrap();
+    }
+    assert_eq!(f.ret(SIGACTION, &[10, DATA + 0x4000, 0, 8]), 0);
+    // Delivered by the checkpoint below, not by a system call before it.
+    f.thread.state.signal_mask = 1 << 9;
+    assert_eq!(f.ret(KILL, &[1, 10]), 0);
+    f.thread.cpu.gpr[reg::RSP] = AREA + 8 * PAGE;
+    let checkpoint = |kernel: &mut Kernel, thread: &mut Thread, mem: &AddressSpace| {
+        thread.state.signal_mask = 0;
+        kernel.checkpoint(thread, mem)
+    };
+    let mut filled = 0;
+    let next = served_by(&mut f, fd, checkpoint, |call, mem, address| {
+        assert!((AREA..AREA + 8 * PAGE).contains(&address));
+        filled = address & !(PAGE - 1);
+        fill(call, mem, fd, address);
+        // The frame may reach into another page.
+        let message = DATA + 0x6000;
+        for _ in 0..100 {
+            if call(READ, &[fd, message, 32]) == 32 {
+                let address = mem.read_u64(GuestAddr(message + 16)).unwrap();
+                fill(call, mem, fd, address);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    assert_eq!(next, Next::Resume);
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x7000));
+    assert_eq!(f.mem.resident(GuestAddr(filled)), Some(true));
+}
+
+/// What a thread's `rseq` area needs on the way back to the program waits
+/// too (`rseq_slowpath_update_usr`), with the thread off its CPU meanwhile.
+#[test]
+fn an_rseq_area_waits_for_a_userfaultfd_off_the_cpu() {
+    const RSEQ: u64 = 334;
+    const DONTNEED: u64 = 4;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.ret(RSEQ, &[AREA, 32, 0, 0x5305_3053]), 0);
+    assert_eq!(f.kernel.enter_cpu(&mut f.thread, &f.mem), Next::Resume);
+    let runner = Arc::clone(&f.kernel.seat.as_ref().unwrap().runner);
+    assert!(runner.running.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(f.ret(MADVISE, &[AREA, PAGE, DONTNEED]), 0);
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    f.thread.state.rseq_notify = true;
+    let enter = |kernel: &mut Kernel, thread: &mut Thread, mem: &AddressSpace| {
+        kernel.enter_cpu(thread, mem)
+    };
+    let seen = Arc::clone(&runner);
+    let next = served_by(&mut f, fd, enter, |call, mem, address| {
+        assert_eq!(address & !(PAGE - 1), AREA);
+        assert!(!seen.running.load(std::sync::atomic::Ordering::SeqCst));
+        fill(call, mem, fd, address);
+    });
+    assert_eq!(next, Next::Resume);
+    assert!(runner.running.load(std::sync::atomic::Ordering::SeqCst));
+    let mut area = [0; 8];
+    f.mem.read(GuestAddr(AREA), &mut area).unwrap();
+    let cpu = f.thread.state.on_cpu.unwrap().cpu;
+    assert_eq!(area[..4], cpu.to_le_bytes());
+    assert_eq!(area[4..], cpu.to_le_bytes());
+}
+
+/// `/proc/<pid>/mem` and `ptrace` expand a stack for their accesses
+/// (`__access_remote_vm`), within the caller's `RLIMIT_STACK`.
+#[test]
+fn a_forced_access_below_a_mapping_that_grows_down_grows_it() {
+    const OPEN: u64 = 2;
+    const MMAP: u64 = 9;
+    const PREAD: u64 = 17;
+    const PWRITE: u64 = 18;
+    let mut f = fixture();
+    let at = 0x6000_0000;
+    // MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | MAP_GROWSDOWN.
+    assert_eq!(f.ret(MMAP, &[at, PAGE, 3, 0x132, u64::MAX, 0]), at);
+    let path = DATA + 0x4000;
+    f.mem.write(GuestAddr(path), b"/proc/self/mem\0").unwrap();
+    let memory = f.ret(OPEN, &[path, 2, 0]);
+    assert!((memory as i64) >= 0, "{memory:#x}");
+    let buf = DATA + 0x4100;
+    assert_eq!(f.ret(PREAD, &[memory, buf, 4, at - PAGE + 8]), 4);
+    let grown = |f: &Fixture| f.mem.vma_at(GuestAddr(at)).unwrap().0;
+    assert_eq!(grown(&f), GuestAddr(at - PAGE));
+    // Across two pages below it.
+    assert_eq!(f.ret(PWRITE, &[memory, buf, 4, at - 2 * PAGE - 2]), 4);
+    assert_eq!(grown(&f), GuestAddr(at - 3 * PAGE));
+    // Farther than RLIMIT_STACK lets it.
+    let far = at - (1 << 30);
+    assert_eq!(f.ret(PREAD, &[memory, buf, 4, far]), errno(Errno::EIO));
+    assert_eq!(grown(&f), GuestAddr(at - 3 * PAGE));
+}
+
+/// A shared futex word on a read-only anonymous page, written or not, is
+/// `EFAULT`, and one in a read-only private mapping of a file is the
+/// file's, as a shared mapping's is (`get_futex_key`).
+#[test]
+fn a_read_only_page_holds_a_shared_futex_only_of_a_file() {
+    const MMAP: u64 = 9;
+    const MPROTECT: u64 = 10;
+    const MEMFD: u64 = 319;
+    const TRUNCATE: u64 = 77;
+    const WAIT: u64 = 0;
+    const WAKE: u64 = 1;
+    let mut f = fixture();
+    let (efault, eagain) = (errno(Errno::EFAULT), errno(Errno::EAGAIN));
+    f.mem.write(GuestAddr(AREA), &[1]).unwrap();
+    assert_eq!(f.ret(MPROTECT, &[AREA, 2 * PAGE, 1]), 0);
+    for word in [AREA, AREA + PAGE] {
+        assert_eq!(f.ret(FUTEX, &[word, WAIT, 7, 0]), efault);
+        assert_eq!(f.ret(FUTEX, &[word, WAKE, 1]), efault);
+        assert_eq!(f.ret(FUTEX, &[word, WAIT | 128, 7, 0]), eagain);
+        assert_eq!(f.ret(FUTEX, &[word, WAKE | 128, 1]), 0);
+    }
+    f.mem.write(GuestAddr(DATA), b"word\0").unwrap();
+    let fd = f.ret(MEMFD, &[DATA, 0]);
+    assert_eq!(f.ret(TRUNCATE, &[fd, PAGE]), 0);
+    let private = f.ret(MMAP, &[0, PAGE, 1, 2, fd, 0]);
+    let shared = f.ret(MMAP, &[0, PAGE, 3, 1, fd, 0]);
+    assert_eq!(f.ret(FUTEX, &[private, WAIT, 7, 0]), eagain);
+    assert_eq!(f.ret(FUTEX, &[private, WAKE, 1]), 0);
+    let word = GuestAddr(private);
+    f.mem.read(word, &mut [0]).unwrap();
+    assert_eq!(
+        f.mem.cache_offset(word),
+        f.mem.shared_offset(GuestAddr(shared))
+    );
+}

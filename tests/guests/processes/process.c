@@ -17062,8 +17062,12 @@ static int mmap_low_case(void) {
     first = mincore(min, page, &in);
     printf("mremap over=%d target=%d value=%d\n", moved, first ? errno : 0, *a);
     int keep = MREMAP_MAYMOVE | MREMAP_DONTUNMAP;
-    printf("dontunmap=%d\n", low_error(mremap(a, page, page, keep, (void *)0x1000)));
-    printf("dontunmap nowhere=%d\n", low_error(mremap(a, page, page, keep, NULL)));
+    /* musl's mremap passes no address without MREMAP_FIXED. A free one is
+       taken (arch_get_unmapped_area_topdown), so it is refused as well. */
+    printf("dontunmap=%d", low_error((void *)syscall(SYS_mremap, a, page, page, keep, 0x2000L)));
+    printf(" value=%d\n", *a);
+    printf("dontunmap nowhere=%d\n",
+           low_error((void *)syscall(SYS_mremap, a, page, page, keep, 0L)));
     int id = shmget(IPC_PRIVATE, page, 0600);
     if (id < 0) return 83;
     printf("shmat=%d\n", low_error(shmat(id, (void *)0x1000, 0)));

@@ -332,6 +332,21 @@ pub mod faults {
         fn user(&self) -> &AtomicU64;
         fn kernel(&self) -> &AtomicU64;
         fn forced(&self) -> &AtomicU64;
+        /// A fault that made its count `nth`, of the kernel's accesses or
+        /// the thread's own code's, at `addr`, which is told where
+        /// [`trace_addresses`] asked for it.
+        fn fault(&self, kernel: bool, nth: u64, addr: u64) {
+            let _ = (kernel, nth, addr);
+        }
+    }
+
+    /// Whether the sinks are told the faults' addresses.
+    static ADDRESSES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// From now on every [`Sink`] of the process is told its faults'
+    /// addresses ([`Sink::fault`]).
+    pub fn trace_addresses() {
+        ADDRESSES.store(true, Ordering::SeqCst);
     }
 
     std::thread_local! {
@@ -407,35 +422,39 @@ pub mod faults {
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
-    /// when the host thread is not bound.
-    fn add(forced: bool) -> bool {
+    /// when the host thread is not bound. `addr` is where it was.
+    fn add(forced: bool, addr: u64) -> bool {
         SINK.with(|sink| {
             let sink = sink.borrow();
             let Some(counts) = sink.as_ref() else {
                 return false;
             };
+            let kernel = KERNEL.with(Cell::get);
             let field = if forced {
                 counts.forced()
-            } else if KERNEL.with(Cell::get) {
+            } else if kernel {
                 counts.kernel()
             } else {
                 counts.user()
             };
-            field.fetch_add(1, Ordering::SeqCst);
+            let nth = field.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            if !forced && ADDRESSES.load(Ordering::Relaxed) {
+                counts.fault(kernel, nth, addr);
+            }
             true
         })
     }
 
-    pub(crate) fn count() {
+    pub(crate) fn count(addr: u64) {
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
-        } else if !add(false) {
+        } else if !add(false, addr) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
     }
 
     pub(crate) fn count_forced() {
-        if !add(true) {
+        if !add(true, 0) {
             FORCED.with(|forced| forced.set(forced.get().wrapping_add(1)));
         }
     }
@@ -4594,7 +4613,7 @@ impl AddressSpaceData {
         self.check(&directory, addr, buf.len(), access, true)?;
         // A successful lazy read installs the logical zero-page entry without
         // allocating its byte frame, matching subsequent Linux fault metadata.
-        for (page, _, _) in chunks(addr, buf.len()) {
+        for (page, offset, _) in chunks(addr, buf.len()) {
             if ready(&directory, page) {
                 continue;
             }
@@ -4604,7 +4623,7 @@ impl AddressSpaceData {
                 if let Some(entry) = table.pages.get_mut(slot) {
                     let missing = entry.is_none();
                     if missing && matches!(access, Access::Read | Access::Fetch) {
-                        faults::count();
+                        faults::count(page + offset as u64);
                     } else if missing && access == Access::Dump {
                         faults::count_forced();
                     }
@@ -4764,7 +4783,7 @@ impl AddressSpaceData {
         }
         let mut directory = self.write_directory();
         self.check(&directory, addr, len, access, true)?;
-        for (page, _, _) in chunks(addr, len) {
+        for (page, offset, _) in chunks(addr, len) {
             let Some(prot) = self.mapping_at(page).map(|m| m.prot) else {
                 return Err(Fault {
                     addr: GuestAddr(page),
@@ -4786,7 +4805,7 @@ impl AddressSpaceData {
                 })
             {
                 if access == Access::Write {
-                    faults::count();
+                    faults::count(page + offset as u64);
                 } else {
                     faults::count_forced();
                 }

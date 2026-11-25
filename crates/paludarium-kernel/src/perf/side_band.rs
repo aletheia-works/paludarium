@@ -400,8 +400,10 @@ pub(crate) fn protections(
 /// `vm_flags`' protection bits.
 const PROTECTION: u64 = vm::READ | vm::WRITE | vm::EXEC;
 
-/// `mprotect_fixup`'s `perf_event_mmap`: each VMA over `start..end` whose
-/// protection the call changed, as it now is, merged with its neighbours.
+/// `mprotect_fixup`'s `perf_event_mmap`, one for each VMA over `start..end`
+/// whose protection the call changed, as it was then: merged with those
+/// before it, which the call is done with, and with the next only if that
+/// had the new protection already.
 pub(crate) fn reprotected(
     events: &Events,
     space: &Space<'_>,
@@ -415,11 +417,25 @@ pub(crate) fn reprotected(
     let Some(receivers) = space.receivers(events) else {
         return;
     };
-    let changed = space.vmas(start, end).into_iter().filter(|vma| {
-        before.iter().any(|&(from, to, flags)| {
-            from < vma.end && to > vma.start && flags != vma.flags & PROTECTION
-        })
-    });
+    let now = space.vmas(start, end);
+    let changed = before
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(from, to, flags))| {
+            let vma = now.iter().find(|vma| vma.start <= from && vma.end >= to)?;
+            if flags == vma.flags & PROTECTION {
+                return None;
+            }
+            let next = before.get(i + 1).filter(|next| next.0 == to);
+            let end = match next {
+                // Still to be changed, or another VMA for good.
+                Some(next) if next.2 != vma.flags & PROTECTION || vma.end == to => to,
+                // The range may end within it.
+                Some(next) if next.1 < end => next.1,
+                Some(_) | None => vma.end,
+            };
+            Some(Vma { end, ..vma.clone() })
+        });
     space.write(&receivers, changed, None);
 }
 

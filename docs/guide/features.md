@@ -4965,7 +4965,8 @@ kernel.
   `freq` a new frequency) that starts over; `REFRESH` is `EINVAL` for an
   event that does not sample or that new tasks inherit, and else allows
   that many more overflows and enables the event (`event_limit`): the
-  last of them disables it and signals `POLL_HUP`. `enable_on_exec` enables a disabled
+  last of them disables it, its count stopped there, and signals
+  `POLL_HUP`. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
   `remove_on_exec` takes one out then for good, as Linux master does: it
   counts no more, keeps its last count and times to be read, has no owner
@@ -4982,7 +4983,10 @@ kernel.
   from `CLONE_CLEAR_SIGHAND`. A read of the opened event adds in the
   inherited ones and what those of tasks that ended gave back, counts and
   times, a group's member by member (`ECHILD` for a group whose members
-  changed since a task inherited it). Its `ENABLE`, `DISABLE` and `RESET`
+  changed since a task inherited it). With `inherit_stat`, the end of a
+  task writes `PERF_RECORD_READ` of each event it inherited, with the count
+  and times that event alone has (`perf_event_read_event`), the latest
+  first, each then out of its group. Its `ENABLE`, `DISABLE` and `RESET`
   (which keeps what ended tasks gave back), and the `prctl` below, reach
   the inherited events too. `prctl`'s
   `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
@@ -5071,15 +5075,16 @@ kernel.
   file's owner (`F_SETOWN`) with `POLL_IN`, `F_SETSIG`'s signal carrying
   `si_code`, `si_band` and `si_fd`, with or without a buffer; and with
   `sigtrap`, an overflow sends the thread SIGTRAP of `TRAP_PERF` with
-  `sig_data` and the event's type in `si_perf_data` and `si_perf_type`,
-  and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event of a task
+  `sig_data` and the event's type in `si_perf_data` and `si_perf_type`, the
+  fault's address in `si_addr` as a sample has it with
+  `PERF_SAMPLE_ADDR`, and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event of a task
   that asks for them takes side-band records, as `perf_iterate_sb` gives
   them to the enabled events that count the thread that makes them, each
   with that thread's `sample_id`: `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
   (`mmap2`) of an executable mapping, and with `mmap_data` of any other
   (`PERF_RECORD_MISC_MMAP_DATA`), as `mmap`, `brk`'s growth, `shmat`,
   `remap_file_pages` and `mprotect` (of each VMA whose protection it
-  changed) leave the VMA, merged with its neighbours, with its address,
+  changed, in turn) leave the VMA, merged with its neighbours, with its address,
   length and offset (a file's, and the address of private anonymous
   memory), and for `MMAP2` its file's device and inode, its protection and
   sharing, and the name `d_path` gives (`[heap]`, `[stack]`, `//anon`,

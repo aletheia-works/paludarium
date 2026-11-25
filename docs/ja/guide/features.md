@@ -4284,8 +4284,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   は `EINVAL` で、サンプリングするイベントには新しい周期（`freq` なら新しい頻度）を
   与え、周期は初めからになります。`REFRESH` は、サンプリングしないか、新しい
   タスクが引き継ぐイベントでは `EINVAL` で、そうでなければその数だけオーバーフローを
-  許してイベントを有効にします（`event_limit`）。その最後でイベントは無効になり、
-  `POLL_HUP` を知らせます。`enable_on_exec` は、`perf stat` が使うように、無効な
+  許してイベントを有効にします（`event_limit`）。その最後でイベントは無効になり、数えるのも
+  そこで止まり、`POLL_HUP` を知らせます。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
   イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
   持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
@@ -4298,7 +4298,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   元のものと同じく有効か無効になります。`inherit_thread` は新しいプロセスには、`sigtrap` は
   `CLONE_CLEAR_SIGHAND` では引き継がせません。開いたイベントの読み込みは、引き継いだ
   イベントと、終わったタスクのものが返したものを、数と時間に加えます。グループではメンバー
-  ごとです（タスクが引き継いだあとでメンバーが変わったグループは `ECHILD`）。その `ENABLE`、
+  ごとです（タスクが引き継いだあとでメンバーが変わったグループは `ECHILD`）。`inherit_stat`
+  では、タスクの終わりに、引き継いだイベントごとに、そのイベントだけの数と時間の
+  `PERF_RECORD_READ` を書きます（`perf_event_read_event`）。新しいものから順で、書いた
+  イベントはグループを離れます。その `ENABLE`、
   `DISABLE`、`RESET`（終わったタスクが返したものは残します）と下の `prctl` は、引き継いだ
   イベントにも及びます。
   `prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
@@ -4375,13 +4378,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルの持ち主（`F_SETOWN`）へ `POLL_IN` を知らせ、`F_SETSIG` のシグナルは
   `si_code`、`si_band`、`si_fd` を持ちます。`sigtrap` では、オーバーフローはスレッドに
   `TRAP_PERF` の SIGTRAP を送り、`si_perf_data` と `si_perf_type` に `sig_data` と
-  イベントの型を、スレッドがそれをブロックしていれば `TRAP_PERF_FLAG_ASYNC` を
+  イベントの型を、`si_addr` に（`PERF_SAMPLE_ADDR` のサンプルと同じ）フォルトのアドレスを、スレッドがそれをブロックしていれば `TRAP_PERF_FLAG_ASYNC` を
   持たせます。それを求めるタスクのイベントは、`perf_iterate_sb` が記録を作るスレッドを
   数える有効なイベントへ渡すように、サイドバンドの記録を、そのスレッドの `sample_id` を
   付けて受け取ります。実行できるマッピングの `PERF_RECORD_MMAP`（`mmap`）か
   `MMAP2`（`mmap2`）と、`mmap_data` ではほかのマッピングのもの
   （`PERF_RECORD_MISC_MMAP_DATA`）を、`mmap`、`brk` が伸ばしたとき、`shmat`、
-  `remap_file_pages`、`mprotect`（保護を変えた VMA ごと）が残した、隣と合わさった
+  `remap_file_pages`、`mprotect`（保護を変えた VMA ごとに順に）が残した、隣と合わさった
   VMA について書きます。アドレス、長さ、オフセット（ファイルのもの、プライベートな
   無名メモリーではアドレス）を、`MMAP2` ではさらにファイルのデバイスと inode、保護と
   共有、`d_path` が与える名前（`[heap]`、`[stack]`、`//anon`、共有の無名メモリーでは

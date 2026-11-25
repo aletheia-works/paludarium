@@ -198,9 +198,9 @@ impl Default for AltStack {
 }
 
 /// A guest thread's CPU time: the host thread's CPU time (or, where the host
-/// cannot measure it, wall time) since the guest thread's start, published for the thread group's total, with what else it has used
-/// ([`Usage`]). A clone starts again from zero, as a new Linux thread or
-/// process does.
+/// cannot measure it, wall time) since the guest thread's start, published
+/// for the thread group's total, with what else it has used ([`Usage`]). A
+/// clone starts again from zero, as a new Linux thread or process does.
 #[derive(Debug, Default)]
 pub(crate) struct CpuAccount {
     base: Option<u64>,
@@ -257,6 +257,10 @@ pub(crate) struct Usage {
     /// Its faults, switches and migrations on each CPU, for the `perf`
     /// events of one CPU ([`CpuCounts`]).
     pub(crate) per_cpu_counts: std::sync::Mutex<CpuCounts>,
+    /// The latest faults of its own code and of the kernel's accesses for
+    /// it, by their numbers in the counts and their addresses, once some
+    /// `perf` event asks for them.
+    fault_addresses: std::sync::Mutex<[std::collections::VecDeque<(u64, u64)>; 2]>,
     /// It runs on a virtual CPU of `rseq`, which no CPU mask moves.
     pub(crate) virtual_cpu: std::sync::atomic::AtomicBool,
 }
@@ -504,6 +508,25 @@ impl Usage {
         let on = time.ran.get(cpu as usize).copied().unwrap_or(0);
         (self.cpu_time(), on)
     }
+    /// The addresses of the latest `n` of its first `counted` faults of its
+    /// own code or of the `kernel`'s accesses for it, 0 for one that is not
+    /// known.
+    pub(crate) fn fault_addresses(&self, kernel: bool, counted: u64, n: u64) -> Vec<u64> {
+        let addresses = self
+            .fault_addresses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latest = &addresses[usize::from(kernel)];
+        // Those before are gone.
+        let known = n.min(FAULT_ADDRESSES as u64);
+        let mut out = vec![0; usize::try_from(n - known).unwrap_or(0)];
+        out.extend((0..known).map(|i| {
+            let nth = counted.saturating_sub(known - 1 - i);
+            let at = latest.binary_search_by_key(&nth, |&(nth, _)| nth);
+            at.map_or(0, |at| latest[at].1)
+        }));
+        out
+    }
     /// Adds its CPU time on each CPU to `sums`.
     pub(crate) fn add_times(&self, sums: &mut Vec<u64>) {
         let time = self.time();
@@ -535,7 +558,21 @@ impl paludarium_mmu::faults::Sink for Usage {
     fn forced(&self) -> &std::sync::atomic::AtomicU64 {
         &self.forced_faults
     }
+    fn fault(&self, kernel: bool, nth: u64, addr: u64) {
+        let mut addresses = self
+            .fault_addresses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latest = &mut addresses[usize::from(kernel)];
+        if latest.len() == FAULT_ADDRESSES {
+            latest.pop_front();
+        }
+        latest.push_back((nth, addr));
+    }
 }
+/// How many of a thread's latest faults keep their addresses, for the
+/// samples its next system call takes of them.
+const FAULT_ADDRESSES: usize = 4096;
 
 /// While it lives, the calling host thread's kernel accesses that fault are
 /// resolved by a [`userfaultfd::KernelCopies`], with the call's signal mask

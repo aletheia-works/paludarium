@@ -51,6 +51,12 @@ RESULT = re.compile(r"^test (\S+) \.\.\. (?:.*?)(ok|FAILED|ignored)\s*$")
 # or the next line runs on after it ("test x ... oktest y ... "). The
 # outcome follows "... " at once, so it needs no word boundary after it.
 GLUED = re.compile(r"test (\S+) \.\.\. (ok|FAILED|ignored)")
+# A case whose outcome did not follow on its line: a child's lines came in
+# between, and the outcome stands alone on a later one.
+OPEN = re.compile(r"^test (\S+) \.\.\. ")
+ALONE = re.compile(r"^(ok|FAILED|ignored)$")
+# A name in libtest's closing list, "failures:" and then one name per line.
+LISTED = re.compile(r"^    (\S+)$")
 
 
 def results(log):
@@ -58,19 +64,48 @@ def results(log):
 
     A suite that runs its cases in child processes prints their lines too,
     which can run into the parent's: a result counts at the start of a line
-    (with whatever the case printed before its outcome) and within one. A
+    (with whatever the case printed before its outcome) and within one. One
+    alone on its line is that of the one case still without an outcome, if
+    there is just one. As a guest can print such a line too, a case in
+    libtest's list of failures has failed whatever its lines say; cargo's
+    line for the next suite can come before that list, as it is on stderr. A
     case counts as failed when any line for it says so."""
-    suite = "?"
+    suite = before = "?"
     seen = {}
+    waiting = set()
+    listing = False
     for line in log.splitlines():
         running = RUNNING.match(line)
         if running:
-            suite = Path(running.group(1)).stem.split("-")[0]
+            before, suite = suite, Path(running.group(1)).stem.split("-")[0]
+            waiting.clear()
+            listing = False
+            continue
+        if line == "failures:":
+            listing = True
             continue
         found = [(m.group(1), m.group(2)) for m in GLUED.finditer(line)]
         start = RESULT.match(line)
+        opened = OPEN.match(line)
+        listed = LISTED.match(line) if listing else None
         if start:
             found.append((start.group(1), start.group(2)))
+        elif opened:
+            # A child's own line for a case can come after its outcome.
+            if f"{suite}::{opened.group(1)}" not in seen:
+                waiting.add(opened.group(1))
+        elif listed:
+            name = listed.group(1)
+            ran = f"{before}::{name}"
+            if ran in seen and f"{suite}::{name}" not in seen and name not in waiting:
+                seen[ran] = "FAILED"
+            else:
+                found.append((name, "FAILED"))
+        elif ALONE.match(line) and len(waiting) == 1:
+            found.append((waiting.pop(), line))
+        elif line.strip():
+            listing = False
+        waiting.difference_update(name for name, _ in found)
         for name, outcome in found:
             key = f"{suite}::{name}"
             if seen.get(key) != "FAILED":
@@ -211,6 +246,40 @@ def self_test():
             "test linux::processes_select ... select: native Exited(0) [1]; stop None",
             "test linux::processes_select ... FAILED",
             "test linux::clone_vm ... ignored",
+            "     Running tests/diff_events.rs (target/debug/deps/diff_events-89abcdef)",
+            "test event_fault ... ok",
+            "test event_fault ... ",
+            "test event_poll ... case 60: exit=-9 words=()",
+            "case 76: exit=0 words=(0, 0, 1, 0)",
+            "ok",
+            # A guest's "ok" between a case and its outcome, "FAILED" here.
+            "test event_wait ... case 61: exit=0",
+            "ok",
+            "FAILED",
+            # Which of two it belongs to is not known.
+            "test event_one ... case 1: exit=0",
+            "test event_two ... case 2: exit=0",
+            "ok",
+            "",
+            "failures:",
+            "",
+            "---- event_wait stdout ----",
+            "    not_a_case",
+            "",
+            "failures:",
+            "    event_wait",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored",
+            "    not_a_case",
+            # The next suite's line came before the list.
+            "     Running tests/diff_threads.rs (target/debug/deps/diff_threads-0a1b2c3d)",
+            "test timer_cancel ... FAILED",
+            "failures:",
+            "     Running tests/diff_jit.rs (target/debug/deps/diff_jit-4e5f6a7b)",
+            "failures:",
+            "    timer_cancel",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored",
         )
     )
     found = results(log)
@@ -219,6 +288,10 @@ def self_test():
         "diff_network::linux::network_udp_rcvbuf": "FAILED",
         "diff_processes::linux::processes_select": "FAILED",
         "diff_processes::linux::clone_vm": "ignored",
+        "diff_events::event_fault": "ok",
+        "diff_events::event_poll": "ok",
+        "diff_events::event_wait": "FAILED",
+        "diff_threads::timer_cancel": "FAILED",
     }, found
     base = {"a": "ok", "b": "FAILED", "c": "FAILED", "d": "ok"}
     head = {"a": "FAILED", "b": "ok", "c": "FAILED", "e": "ok", "f": "FAILED"}

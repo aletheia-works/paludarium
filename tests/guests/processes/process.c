@@ -7237,6 +7237,182 @@ static int exec_names_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The rename-names case: a file's name in /proc/self/maps, /proc/self/exe
+   and a core's NT_FILE note is where the file is now, as Linux's d_path
+   of the dentry, which d_move moves on each rename (of the file, or of a
+   directory above it), gives it, with " (deleted)" once the name it then
+   has is removed. */
+static int rn_maps_name(uint64_t at, char *out, size_t size) {
+    out[0] = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[4096];
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && at >= start && at < end) {
+            char *path = strchr(line, '/');
+            if (path) {
+                path[strcspn(path, "\n")] = 0;
+                snprintf(out, size, "%s", path);
+            }
+            break;
+        }
+    }
+    fclose(maps);
+    return out[0] != 0;
+}
+/* The NT_FILE name a core of a forked child gives the code at `at`. */
+static int rn_core_name(uint64_t at, char *out, size_t size) {
+    out[0] = 0;
+    struct rlimit r;
+    getrlimit(RLIMIT_CORE, &r);
+    r.rlim_cur = r.rlim_max;
+    setrlimit(RLIMIT_CORE, &r);
+    fflush(stdout);
+    pid_t dumper = fork();
+    if (dumper == 0) {
+        raise(SIGABRT);
+        _exit(75);
+    }
+    int status = 0;
+    waitpid(dumper, &status, 0);
+    int fd = open("core", O_RDONLY);
+    struct stat st;
+    unsigned char *core = NULL;
+    long got = 0, n;
+    if (fd >= 0 && fstat(fd, &st) == 0 && (core = malloc((size_t)st.st_size + 1)))
+        while (got < st.st_size && (n = read(fd, core + got, (size_t)(st.st_size - got))) > 0) got += n;
+    if (fd >= 0) close(fd);
+    unlink("core");
+    core_bytes = core;
+    core_size = core ? (uint64_t)got : 0;
+    uint64_t files = 0;
+    for (int k = 0; core && got >= 64 && k < (int)le(56, 2); k++) {
+        uint64_t h = le(32, 8) + 56 * (uint64_t)k, offset = le(h + 8, 8), filesz = le(h + 32, 8);
+        if (le(h, 4) != 4) continue;
+        for (uint64_t q = offset; q + 12 <= offset + filesz && q + 12 <= core_size;) {
+            uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
+            uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
+            if (type == 0x46494c45 && !files) files = desc;
+            q = desc + ((descsz + 3) & ~3ULL);
+        }
+    }
+    uint64_t start, end, pgoff;
+    const char *named = file_entry(files, at, &start, &end, &pgoff);
+    if (named) snprintf(out, size, "%s", named);
+    free(core);
+    core_bytes = NULL;
+    core_size = 0;
+    return WCOREDUMP(status) ? 1 : 0;
+}
+static int rename_names_child(void) {
+    char exe[4096] = {0}, now[4096], seen[4096];
+    if (readlink("/proc/self/exe", exe, sizeof exe - 1) < 0) return 70;
+    char *slash = strrchr(exe, '/');
+    if (!slash) return 71;
+    /* The program renames its own file within its directory. */
+    snprintf(now, sizeof now, "%.*s/prog-moved", (int)(slash - exe), exe);
+    if (rename(exe, now)) return 72;
+    char link[4096] = {0};
+    if (readlink("/proc/self/exe", link, sizeof link - 1) < 0) return 73;
+    printf("exe after rename: %d\n", !strcmp(link, now));
+    rn_maps_name((uintptr_t)&rename_names_child, seen, sizeof seen);
+    printf("maps after rename: %d\n", !strcmp(seen, now));
+    *strrchr(now, '/') = 0;
+    if (chdir(now)) return 74;
+    snprintf(now + strlen(now), sizeof now - strlen(now), "/prog-moved");
+    int dumped = rn_core_name((uintptr_t)&rename_names_child, seen, sizeof seen);
+    printf("core after rename: dumped=%d named=%d\n", dumped, !strcmp(seen, now));
+    unlink(now);
+    fflush(stdout);
+    return 0;
+}
+static int rename_names_case(void) {
+    char dir[] = "/tmp/rename-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char d1[64], d2[64], data[80], data2[80], moved[80], prog[80];
+    snprintf(d1, sizeof d1, "%s/d1", dir);
+    snprintf(d2, sizeof d2, "%s/d2", dir);
+    snprintf(data, sizeof data, "%s/data", d1);
+    snprintf(data2, sizeof data2, "%s/data2", d1);
+    snprintf(moved, sizeof moved, "%s/data2", d2);
+    if (mkdir(d1, 0755)) return 81;
+    int fd = open(data, O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ftruncate(fd, 4096)) return 82;
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 83;
+    char seen[4096];
+    if (rename(data, data2)) return 84;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping after file rename: %d\n", !strcmp(seen, data2));
+    if (rename(d1, d2)) return 85;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping after directory rename: %d\n", !strcmp(seen, moved));
+    if (unlink(moved)) return 86;
+    char marked[128];
+    snprintf(marked, sizeof marked, "%s (deleted)", moved);
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping after unlink: %d\n", !strcmp(seen, marked));
+    munmap(map, 4096);
+    /* Mapped once the name it was opened by is gone, another link left:
+       that name, marked, whichever file takes it later. */
+    char one[80], two[80], via[80];
+    snprintf(one, sizeof one, "%s/one", d2);
+    snprintf(two, sizeof two, "%s/two", d2);
+    snprintf(via, sizeof via, "%s/via", d2);
+    fd = open(one, O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ftruncate(fd, 4096) || link(one, two) || unlink(one)) return 90;
+    map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 91;
+    snprintf(marked, sizeof marked, "%s (deleted)", one);
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping of a removed name: %d\n", !strcmp(seen, marked));
+    fd = open(one, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return 92;
+    close(fd);
+    if (rename(one, via)) return 93;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("after another file took it: %d\n", !strcmp(seen, marked));
+    munmap(map, 4096);
+    unlink(via);
+    /* Opened through a symbolic link: the file's own name. */
+    if (symlink("two", via)) return 94;
+    fd = open(via, O_RDONLY);
+    map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 95;
+    rn_maps_name((uintptr_t)map, seen, sizeof seen);
+    printf("mapping through a link: %d\n", !strcmp(seen, two));
+    munmap(map, 4096);
+    unlink(via);
+    unlink(two);
+    /* A copy of this program, run from d2, renames itself. */
+    snprintf(prog, sizeof prog, "%s/prog", d2);
+    int from = open("/proc/self/exe", O_RDONLY), to = open(prog, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    if (from < 0 || to < 0) return 87;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return 88;
+    close(from);
+    close(to);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char *argv[] = {prog, "rename-names-child", prog, NULL};
+        execv(prog, argv);
+        _exit(89);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    unlink(prog);
+    rmdir(d2);
+    rmdir(dir);
+    return 0;
+}
 /* The vma-names case: prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME) names
    anonymous memory as mm/madvise.c's set_anon_vma_name does, and
    /proc/self/maps shows it as fs/proc/task_mmu.c's get_vma_name does:
@@ -7406,6 +7582,19 @@ static int proc_mem_case(void) {
     printf("pagemap rdwr: open=%d accmode=%d\n", map >= 0,
            map < 0 ? -errno : fcntl(map, F_GETFL) & O_ACCMODE);
     if (map >= 0) close(map);
+    /* None of /proc's files that a read takes at an offset has an mmap. */
+    const char *unmappable[] = {"mem", "pagemap", "clear_refs"};
+    for (int i = 0; i < 3; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "/proc/self/%s", unmappable[i]);
+        int no = open(name, O_RDWR);
+        void *private = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE, no, 0);
+        int first = private == MAP_FAILED ? -errno : 0;
+        void *shared = mmap(NULL, (size_t)page, PROT_READ, MAP_SHARED, no, 0);
+        printf("mmap of %s: open=%d %d %d\n", unmappable[i], no >= 0, first,
+               shared == MAP_FAILED ? -errno : 0);
+        if (no >= 0) close(no);
+    }
 
     /* A child's memory, at the same address after fork. */
     int ready[2], done[2];
@@ -10617,6 +10806,139 @@ static int io_uring_exit_case(const char *self) {
     }
     printf("closed: epipe=%d\n", epipe);
     signal(SIGPIPE, SIG_DFL);
+    close(u.fd);
+    return 0;
+}
+
+/* io_uring's registered buffers keep the pages they had when they were
+   registered (io_pin_pages, FOLL_LONGTERM): a fixed transfer moves them
+   after munmap, a new mapping at the address sees none of it, and a page
+   made read-only still takes a read. Registering refuses what a long-term
+   pin refuses: no access, and a shared mapping of a disk file; a memfd's
+   is pinned. A forked child that shares the ring moves the parent's
+   pinned page, which the parent's later writes reach. */
+static unsigned char *up_fixed(struct uring *u, unsigned long data, unsigned char op, int fd,
+                               long offset, void *addr, unsigned len) {
+    unsigned char *sqe = uring_push(u, op, data);
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 8, &offset, 8);
+    unsigned long a = (unsigned long)addr;
+    memcpy(sqe + 16, &a, 8);
+    memcpy(sqe + 24, &len, 4);
+    return sqe;
+}
+
+static void up_file(int fd, const char *label) {
+    char got[16];
+    long n = pread(fd, got, sizeof got, 0);
+    printf("%s: %ld %.*s\n", label, n, n > 0 ? (int)n : 0, got);
+}
+
+/* A write to a file may run in a worker, so it waits for its completion. */
+static void up_submit(struct uring *u, const char *label) {
+    uring_show(label, uring_enter(u->fd, 1, 1, 1, NULL, 0));
+    uring_reap(u, label);
+}
+
+static int io_uring_pinned_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int fd = open("pinned", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 81;
+    unlink("pinned");
+
+    /* After munmap: the buffer is still the old page. */
+    char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 82;
+    memcpy(p, "old!", 4);
+    struct iovec iov = {p, 4096};
+    uring_show("register", syscall(427, u.fd, 0, &iov, 1));
+    munmap(p, 4096);
+    char *again = mmap(p, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (again != p) return 83;
+    up_fixed(&u, 1, 5, fd, 0, p, 4);
+    up_submit(&u, "write-unmapped");
+    up_file(fd, "file");
+    if (pwrite(fd, "new?", 4, 0) != 4) return 84;
+    up_fixed(&u, 2, 4, fd, 0, p, 4);
+    up_submit(&u, "read-unmapped");
+    printf("mapping: %d\n", p[0]);
+    up_fixed(&u, 3, 5, fd, 4, p, 4);
+    up_submit(&u, "write-back");
+    up_file(fd, "file");
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+
+    /* A page made read-only still takes a read. */
+    memset(p, 0, 4096);
+    uring_show("register", syscall(427, u.fd, 0, &iov, 1));
+    mprotect(p, 4096, PROT_READ);
+    up_fixed(&u, 4, 4, fd, 0, p, 4);
+    up_submit(&u, "read-read-only");
+    printf("mapping: %.4s\n", p);
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(p, 4096);
+
+    /* What a long-term pin refuses, and what it takes. */
+    char *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    iov = (struct iovec){none, 4096};
+    uring_show("register-prot-none", syscall(427, u.fd, 0, &iov, 1));
+    munmap(none, 4096);
+    if (ftruncate(fd, 4096)) return 85;
+    char *disk = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (disk == MAP_FAILED) return 86;
+    iov = (struct iovec){disk, 4096};
+    uring_show("register-shared-file", syscall(427, u.fd, 0, &iov, 1));
+    munmap(disk, 4096);
+    char *privfile = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    iov = (struct iovec){privfile, 4096};
+    uring_show("register-private-file", syscall(427, u.fd, 0, &iov, 1));
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(privfile, 4096);
+    int mfd = (int)syscall(319, "pinned", 0);
+    if (mfd < 0 || ftruncate(mfd, 4096)) return 87;
+    char *shm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (shm == MAP_FAILED) return 88;
+    iov = (struct iovec){shm, 4096};
+    uring_show("register-memfd", syscall(427, u.fd, 0, &iov, 1));
+    up_fixed(&u, 5, 4, fd, 4, shm, 4);
+    up_submit(&u, "read-memfd");
+    char seen[4];
+    printf("memfd: %ld %.4s\n", (long)pread(mfd, seen, 4, 0), seen);
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(shm, 4096);
+    close(mfd);
+    char *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    iov = (struct iovec){shared, 4096};
+    uring_show("register-shared-anon", syscall(427, u.fd, 0, &iov, 1));
+    uring_show("unregister", syscall(427, u.fd, 1, NULL, 0));
+    munmap(shared, 4096);
+
+    /* fork: the child's fixed write moves the parent's page. */
+    p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(p, "AAAA", 4);
+    iov = (struct iovec){p, 4096};
+    uring_show("register", syscall(427, u.fd, 0, &iov, 1));
+    int go[2];
+    if (pipe(go)) return 89;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char byte;
+        if (read(go[0], &byte, 1) != 1) _exit(1);
+        printf("child-page: %.4s\n", p);
+        up_fixed(&u, 6, 5, fd, 8, p, 4);
+        up_submit(&u, "child-write");
+        fflush(stdout);
+        _exit(0);
+    }
+    memcpy(p, "BBBB", 4);
+    if (write(go[1], "g", 1) != 1) return 90;
+    int status;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    char got[4];
+    printf("file+8: %ld %.4s\n", (long)pread(fd, got, 4, 8), got);
+    close(fd);
     close(u.fd);
     return 0;
 }
@@ -16455,6 +16777,42 @@ static int tmpfs_huge_placement_case(void) {
     printf("status=%d\n", reaped(child));
     rmdir(m);
     printf("cleaned=%d\n", rmdir(th_base) == 0);
+    return 0;
+}
+/* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
+   no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
+   places it, a second one right below the first in the top-down layout, and
+   so does an mremap move to such a length; a free hint is taken as it is; a
+   private mapping of /dev/zero of 2 MiB or more goes at a boundary whatever
+   its length. A reserve of 64 MiB is mapped and unmapped first, so that
+   each lands in the same free area natively and emulated. below= holds in
+   the top-down layout, which the case runs in; the rest holds in any. */
+static int anon_thp_placement_case(void) {
+    long huge = 2 << 20;
+    int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    char *reserve = mmap(NULL, 32 * huge, PROT_NONE, anon, -1, 0);
+    if (reserve == MAP_FAILED) return 80;
+    munmap(reserve, 32 * huge);
+    char *a = mmap(NULL, 2 * huge, rw, anon, -1, 0);
+    char *b = mmap(NULL, 2 * huge, rw, anon, -1, 0);
+    if (a == MAP_FAILED || b == MAP_FAILED) return 81;
+    printf("aligned=%d below=%d\n", ((uintptr_t)a & (huge - 1)) == 0, b + 2 * huge == a);
+    char *hint = reserve + 4 * huge + 4096;
+    char *c = mmap(hint, 2 * huge, rw, anon, -1, 0);
+    printf("hint=%d\n", c == hint);
+    char *d = mmap(NULL, huge, rw, anon, -1, 0);
+    if (c == MAP_FAILED || d == MAP_FAILED) return 82;
+    mmap(d + huge, 4096, PROT_NONE, anon | MAP_FIXED_NOREPLACE, -1, 0);
+    char *grown = mremap(d, huge, 2 * huge, MREMAP_MAYMOVE);
+    if (grown == MAP_FAILED) return 83;
+    printf("moved=%d aligned=%d\n", grown != d, ((uintptr_t)grown & (huge - 1)) == 0);
+    int zero = open("/dev/zero", O_RDWR);
+    char *z = zero < 0 ? MAP_FAILED : mmap(NULL, 3 * huge, rw, MAP_PRIVATE, zero, 0);
+    if (z == MAP_FAILED) return 84;
+    printf("zero=%d\n", ((uintptr_t)z & (huge - 1)) == 0);
+    munmap(a, 2 * huge), munmap(b, 2 * huge), munmap(c, 2 * huge), munmap(grown, 2 * huge);
+    munmap(z, 3 * huge);
+    close(zero);
     return 0;
 }
 static int tmpfs_huge_case(void) {
@@ -25950,6 +26308,53 @@ static int uts_sysctl_poll_case(void) {
         }
         result("waker", reaped(pid));
     }
+    return 0;
+}
+/* The poll-default case: the files whose file operations have no poll, which
+   vfs_poll gives DEFAULT_POLLMASK (POLLIN, POLLOUT, POLLRDNORM and
+   POLLWRNORM), and which epoll_ctl refuses; with poll and select, each bit
+   alone and all of them. */
+static void pd_show(const char *name, int fd) {
+    static const int each[] = {POLLIN, POLLPRI, POLLOUT, POLLRDNORM, POLLRDBAND, POLLWRNORM, POLLWRBAND, 0};
+    if (fd < 0) {
+        printf("%s: open %d\n", name, errno);
+        return;
+    }
+    printf("%s: all=%#x", name, us_poll(fd, US_ALL));
+    for (int i = 0; i < 8; i++) printf(" %#x=%#x", each[i], us_poll(fd, each[i]));
+    fd_set sets[3];
+    for (int i = 0; i < 3; i++) {
+        FD_ZERO(&sets[i]);
+        FD_SET(fd, &sets[i]);
+    }
+    struct timeval now = {0, 0};
+    int r = select(fd + 1, &sets[0], &sets[1], &sets[2], &now);
+    printf(" select=%d:%d%d%d", r, !!FD_ISSET(fd, &sets[0]), !!FD_ISSET(fd, &sets[1]), !!FD_ISSET(fd, &sets[2]));
+    int ep = epoll_create1(0);
+    printf(" epoll=%d\n", us_add(ep, fd, EPOLLIN, 1));
+    close(ep);
+    close(fd);
+}
+static int poll_default_case(void) {
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-poll-default-%d", getpid());
+    int made = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    pd_show("regular", made);
+    pd_show("read-only", open(path, O_RDONLY));
+    pd_show("write-only", open(path, O_WRONLY));
+    pd_show("path-only", open(path, O_PATH));
+    unlink(path);
+    pd_show("directory", open("/tmp", O_RDONLY | O_DIRECTORY));
+    pd_show("memfd", memfd_create("poll", 0));
+    pd_show("null", open("/dev/null", O_RDWR));
+    pd_show("zero", open("/dev/zero", O_RDWR));
+    pd_show("full", open("/dev/full", O_RDWR));
+    pd_show("random", open("/dev/random", O_RDONLY));
+    pd_show("urandom", open("/dev/urandom", O_RDONLY));
+    pd_show("status", open("/proc/self/status", O_RDONLY));
+    pd_show("comm", open("/proc/self/comm", O_RDWR));
+    pd_show("proc-directory", open("/proc/self", O_RDONLY | O_DIRECTORY));
+    pd_show("namespace", open("/proc/self/ns/uts", O_RDONLY));
     return 0;
 }
 /* The net-sysctl case's files, under /proc/sys/net. */
@@ -39307,6 +39712,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
+    if (!strcmp(mode, "poll-default")) return poll_default_case();
     if (!strcmp(mode, "uts-sysctl")) return uts_sysctl_case();
     if (!strcmp(mode, "uts-sysctl-poll")) return uts_sysctl_poll_case();
     if (!strcmp(mode, "net-sysctl")) return net_sysctl_case();
@@ -39381,6 +39787,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "shmem-populate")) return shmem_populate_case();
     if (!strcmp(mode, "tmpfs-huge")) return tmpfs_huge_case();
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
+    if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
@@ -39447,6 +39854,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-ring-poll")) return io_uring_ring_poll_case();
     if (!strcmp(mode, "io-uring-cancel")) return io_uring_cancel_case();
     if (!strcmp(mode, "io-uring-exit")) return io_uring_exit_case(self);
+    if (!strcmp(mode, "io-uring-pinned")) return io_uring_pinned_case();
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
@@ -39890,6 +40298,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "context-switches")) return context_switches_case();
     if (!strcmp(mode, "exec-names")) return exec_names_case();
     if (!strcmp(mode, "exec-names-child")) return exec_names_child();
+    if (!strcmp(mode, "rename-names")) return rename_names_case();
+    if (!strcmp(mode, "rename-names-child")) return rename_names_child();
     if (!strcmp(mode, "vma-names")) return vma_names_case();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);

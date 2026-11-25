@@ -165,6 +165,16 @@ static void tcp_info(const char *name, int fd, unsigned bytes, const int *at) {
     }
     putchar('\n');
 }
+/* tcp-segments: both sides' counts of segments sent, received, sent and
+   received with data, delivered, unacknowledged and sent again, and the
+   bytes not sent, once what may wait (TCP_DELACK_MIN's 40 ms) has gone. */
+static void segment_counts(const char *step, int c, int s) {
+    static const int at[] = {136, 140, 156, 152, 192, 24, 100, 144, -200, -208, 0};
+    poll(NULL, 0, 120);
+    printf(" %s\n", step);
+    tcp_info("client", c, 0x1, at);
+    tcp_info("server", s, 0x1, at);
+}
 /* A TCP socket listening with `backlog` on 127.0.0.1, at a port it takes,
    which `port` gets. */
 static int listener(int backlog, int *port) {
@@ -981,6 +991,131 @@ int main(int argc, char **argv) {
         close(small);
         close(l);
         close(u);
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-segments")) {
+        /* The segments a loopback connection takes (tcp_write_xmit and
+           __tcp_ack_snd_check), as tcp_info counts them. Writes of at most
+           536 bytes leave the windows as they are. */
+        static char bytes[40000];
+        int port, result, on = 1, off = 0;
+        int l = listener(8, &port);
+        static const int writes[] = {1, 2, 15, 16, 17, 18, 30};
+        for (size_t i = 0; i < sizeof writes / sizeof *writes; i++) {
+            /* Sixteen are acknowledged at once; the next waits, and the
+               ones after it are held for its acknowledgement (Nagle). */
+            int c = client(port, 0, &result), s = accept(l, NULL, NULL);
+            for (int n = 0; n < writes[i]; n++) send(c, bytes, 1, 0);
+            printf(" writes %d\n", writes[i]);
+            segment_counts("written", c, s);
+            call("read", recv(s, bytes, sizeof bytes, 0));
+            segment_counts("read", c, s);
+            close(c);
+            close(s);
+        }
+        static const int lengths[] = {100, 300, 536};
+        for (size_t i = 0; i < sizeof lengths / sizeof *lengths; i++) {
+            /* Each read before the next is written. */
+            int c = client(port, 0, &result), s = accept(l, NULL, NULL);
+            for (int n = 0; n < 25; n++) {
+                send(c, bytes, lengths[i], 0);
+                recv(s, bytes, sizeof bytes, 0);
+            }
+            printf(" length %d\n", lengths[i]);
+            segment_counts("read each", c, s);
+            close(c);
+            close(s);
+        }
+        /* TCP_NODELAY: each write is a segment, and a loss probe sends the
+           last again before their acknowledgement; set late, it sends what
+           is held. */
+        int c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+        for (int n = 0; n < 16; n++) send(c, bytes, 1, 0);
+        segment_counts("nodelay", c, s);
+        for (int n = 0; n < 4; n++) send(c, bytes, 1, 0);
+        segment_counts("nodelay probe", c, s);
+        close(c);
+        close(s);
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        for (int n = 0; n < 20; n++) send(c, bytes, 1, 0);
+        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+        segment_counts("nodelay late", c, s);
+        close(c);
+        close(s);
+        /* MSG_MORE: held for a write without it, or for 200 ms. */
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        for (int n = 0; n < 3; n++) send(c, bytes, 100, MSG_MORE);
+        segment_counts("more", c, s);
+        send(c, bytes, 100, 0);
+        segment_counts("more pushed", c, s);
+        send(c, bytes, 100, MSG_MORE);
+        poll(NULL, 0, 300);
+        segment_counts("more late", c, s);
+        close(c);
+        close(s);
+        /* Replies carry acknowledgements, and the side that replies delays
+           its own. */
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        for (int n = 0; n < 5; n++) {
+            send(c, bytes, 10, 0);
+            recv(s, bytes, sizeof bytes, 0);
+            send(s, bytes, 20, 0);
+            recv(c, bytes, sizeof bytes, 0);
+        }
+        segment_counts("replies", c, s);
+        for (int n = 0; n < 5; n++) send(c, bytes, 1, 0);
+        segment_counts("after replies", c, s);
+        close(c);
+        close(s);
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        for (int n = 0; n < 5; n++) {
+            send(c, bytes, 1, 0);
+            send(s, bytes, 1, 0);
+        }
+        segment_counts("both ways", c, s);
+        close(c);
+        close(s);
+        /* TCP_QUICKACK off and on. */
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, &off, sizeof off);
+        for (int n = 0; n < 5; n++) send(c, bytes, 1, 0);
+        segment_counts("quickack off", c, s);
+        setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, &on, sizeof on);
+        for (int n = 0; n < 5; n++) send(c, bytes, 1, 0);
+        segment_counts("quickack on", c, s);
+        close(c);
+        close(s);
+        /* Urgent data, and a write past the MSS. */
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        send(c, bytes, 10, 0);
+        send(c, bytes, 3, MSG_OOB);
+        send(c, bytes, 10, 0);
+        segment_counts("urgent", c, s);
+        close(c);
+        close(s);
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        call("send", send(c, bytes, 40000, 0));
+        segment_counts("past the mss", c, s);
+        close(c);
+        close(s);
+        /* The ends, alone and with data held. */
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        shutdown(c, SHUT_WR);
+        segment_counts("end", c, s);
+        send(s, bytes, 5, 0);
+        segment_counts("answered", c, s);
+        shutdown(s, SHUT_WR);
+        segment_counts("both ended", c, s);
+        close(c);
+        close(s);
+        c = client(port, 0, &result), s = accept(l, NULL, NULL);
+        send(c, bytes, 10, MSG_MORE);
+        shutdown(c, SHUT_WR);
+        segment_counts("end with data", c, s);
+        close(c);
+        close(s);
+        close(l);
         return 0;
     }
     if (!strcmp(mode, "listen-errors")) {

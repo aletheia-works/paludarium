@@ -260,12 +260,12 @@ ripgrep の検索、coreutils のケースをすべて両方で動かし、JIT �
 その命令で fault を起こすことも求めます。プルリクエストごとに、`differential-jit` ジョブが
 差分テストを `PALUDARIUM_TEST_JIT=1` でも動かします。このとき `diff_core`、
 `diff_instructions`、`parallel_instructions`、`diff_signals_time`、`diff_terminal`、
-`diff_encodings`、`diff_network`、`diff_files` のゲストは、すべてのブロックを、最初の
-実行で、それを動かすスレッドでコンパイルして動きます。`diff_events` と `diff_threads` の
+`diff_encodings`、`diff_network`、`diff_files`、`diff_processes` のゲストは、すべての
+ブロックを最初の実行でコンパイルして動き、それを動かすスレッドはコードができるのを待ちます
+（そのあいだ、テストのホストの仮想の時計は、ほかのスレッドが眠る時間を飛び越しません）。`diff_events` と `diff_threads` の
 ゲストは、コマンドの `--jit=1` で動き、バックグラウンドでコンパイルします。ゲストの
 プログラムを動かさずにインタプリタを直接呼ぶケースは、JIT なしと同じに動きます。
-`diff_processes` も、今はすべて JIT なしで動きます。ブロックを動かすスレッドで
-コンパイルすると、その時間もそのスレッドの CPU の時計に数えられるからです（`cpu-timer`）。ファジングの対象 `jit_native` は、任意の命令のバイト列について、コンパイルした
+ファジングの対象 `jit_native` は、任意の命令のバイト列について、コンパイルした
 コードとインタプリタを比べます。単体テストの実行の半分は、スレッドの TLB のスロットを埋めてから
 始めるので、コンパイルしたコードはスロットを通して読み書きします。MMU のテストは、`mprotect`、
 `fork`、`clear_refs`、`UFFDIO_WRITEPROTECT` の後に、スロットがどのページの読み書きを許すかを

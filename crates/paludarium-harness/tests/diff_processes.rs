@@ -133,6 +133,7 @@ mod linux {
         // default core_pattern, which CI sets.
         if mode == "core-dump"
             || mode == "exec-names"
+            || mode == "rename-names"
             || mode == "core-dump-faults"
             || mode == "core-mappings"
             || mode == "core-credentials"
@@ -183,7 +184,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-accept, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -295,6 +296,7 @@ mod linux {
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
+                    | "userfaultfd-gup"
                     | "userfaultfd-sigbus"
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
@@ -411,6 +413,7 @@ mod linux {
                     | "veth-ipv4-ecmp"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
+                    | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
                     | "veth-ipv6-scope"
@@ -547,10 +550,11 @@ mod linux {
             ) {
                 host.measure_cpu_time();
             }
-            // Not with_test_jit yet: compiling on the thread that runs a block
-            // counts in its CPU clock, so cpu-timer's thread timer fires
-            // (thread other=1, Linux 0).
-            let session = Session::new(config, host.clone()).unwrap();
+            let session = paludarium_harness::with_test_jit(
+                Session::new(config, host.clone()).unwrap(),
+                &host,
+            )
+            .unwrap();
             let start = Instant::now();
             let status = session.run().unwrap();
             let emulated = Outcome {
@@ -650,6 +654,7 @@ mod linux {
         veth_ipv4_ecmp => ("veth-ipv4-ecmp","veth-ipv4-ecmp"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
+        veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
         veth_ipv6_scope => ("veth-ipv6-scope","veth-ipv6-scope"),
@@ -808,6 +813,7 @@ mod linux {
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
+        userfaultfd_gup => ("userfaultfd-gup","userfaultfd"),
         userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
@@ -926,6 +932,7 @@ mod linux {
         processes_page_faults => ("page-faults","process"),
         processes_vma_names => ("vma-names","process"),
         processes_exec_names => ("exec-names","process"),
+        processes_rename_names => ("rename-names","process"),
         processes_context_switches => ("context-switches","process"),
         processes_proc_mem => ("proc-mem","process"),
         processes_proc_stat_counts => ("proc-stat-counts","process"),
@@ -1015,6 +1022,7 @@ mod linux {
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
+        processes_poll_default => ("poll-default","process"),
         processes_uts_sysctl => ("uts-sysctl","process"),
         processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),
         processes_net_sysctl => ("net-sysctl","process"),
@@ -1066,6 +1074,7 @@ mod linux {
         processes_shmem_populate => ("shmem-populate","process"),
         processes_tmpfs_huge => ("tmpfs-huge","process"),
         processes_tmpfs_huge_placement => ("tmpfs-huge-placement","process"),
+        processes_anon_thp_placement => ("anon-thp-placement","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_dev_shm => ("dev-shm","process"),
@@ -1116,6 +1125,7 @@ mod linux {
         processes_io_uring_ring_poll => ("io-uring-ring-poll","process"),
         processes_io_uring_cancel => ("io-uring-cancel","process"),
         processes_io_uring_exit => ("io-uring-exit","process"),
+        processes_io_uring_pinned => ("io-uring-pinned","process"),
         processes_io_uring_held_tag => ("io-uring-held-tag","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),

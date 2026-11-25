@@ -1272,8 +1272,13 @@ fn tcp_info_tells_listeners_and_connections() {
     assert_eq!(f.ret(48, [client, 1, 0, 0, 0, 0]), 0);
     let (_, raw) = tcp_info(&mut f, server, 512);
     assert_eq!((raw[0], long(&raw, 128), word(&raw, 152)), (8, 101, 1));
+    // Its end is acknowledged 40 ms later, as Linux's `TCP_CLOSE_WAIT` side
+    // delays it.
     let (_, raw) = tcp_info(&mut f, client, 512);
-    assert_eq!(raw[0], 5);
+    assert_eq!((raw[0], word(&raw, 24)), (4, 1));
+    f.host.now.fetch_add(40_000_000, Ordering::SeqCst);
+    let (_, raw) = tcp_info(&mut f, client, 512);
+    assert_eq!((raw[0], word(&raw, 24)), (5, 0));
     // The window scale its handshake offered stays, whatever buffer comes
     // after.
     f.mem

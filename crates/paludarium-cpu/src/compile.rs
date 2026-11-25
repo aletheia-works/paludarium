@@ -15,7 +15,7 @@ use std::sync::Arc;
 use paludarium_mmu::AddressSpace;
 use paludarium_types::ExitReason;
 
-pub use crate::exec::{Address, Alu, Count, Fast, REP_CHUNK, Shift, Source, Unary};
+pub use crate::exec::{Address, Alu, Bit, Count, Fast, REP_CHUNK, Shift, Source, Unary};
 use crate::{
     CpuState, DecodeCache, MAX_COMPILED, NOT_COMPILED, decode_block, execute_decoded,
     fetch_for_state,

@@ -8,6 +8,10 @@ use paludarium_types::{Errno, Error};
 
 use crate::{ClockId, Host, StdinState, StreamId, TerminalInfo, WaitOutcome};
 
+/// How many times what a guest thread waits for began, and how many such
+/// waits there are now.
+pub type Busy = std::sync::Arc<dyn Fn() -> (u64, usize) + Send + Sync>;
+
 struct Streams {
     terminals: [Option<TerminalInfo>; 3],
     monotonic: u64,
@@ -34,6 +38,9 @@ struct Streams {
     /// The NTP state [`Host::ntp_state`] gives in place of the machine's
     /// ([`RecordingHost::set_ntp_state`]).
     ntp: Option<Option<crate::NtpState>>,
+    /// What may keep a wait from jumping
+    /// ([`RecordingHost::hold_jumps`]).
+    busy: Option<Busy>,
 }
 
 impl Default for Streams {
@@ -54,6 +61,7 @@ impl Default for Streams {
             cpu_time: false,
             mounts: false,
             ntp: None,
+            busy: None,
         }
     }
 }
@@ -68,6 +76,9 @@ impl Streams {
 /// The real time, in nanoseconds, a wait on the virtual clock gives other
 /// threads to wake it before it jumps to its deadline.
 const GRACE: u64 = 10_000_000;
+/// The longest that [`Busy`] keeps a wait from jumping, in real time.
+#[cfg(not(target_arch = "wasm32"))]
+const HELD: std::time::Duration = std::time::Duration::from_secs(5);
 /// Whether `cancel` is set within `nanos` of real time.
 #[cfg(not(target_arch = "wasm32"))]
 fn cancelled_within(cancel: &std::sync::atomic::AtomicBool, nanos: u64) -> bool {
@@ -142,6 +153,40 @@ impl RecordingHost {
     /// differential tests of guests that use one.
     pub fn enable_network(&self) {
         self.lock().network = true;
+    }
+    /// Starts a wait's grace again while a guest thread waits for what `busy`
+    /// counts, which slows it in real time though not on the virtual clock:
+    /// the native JIT's synchronous compiling, in the differential tests.
+    pub fn hold_jumps(&self, busy: Busy) {
+        self.lock().busy = Some(busy);
+    }
+    /// Waits a grace as `wait` does, whose result says whether it ended early;
+    /// again while a request of [`RecordingHost::hold_jumps`] was made in it,
+    /// or waits at its start or end. It says so once the time held reaches
+    /// [`HELD`], and goes on as if none had been.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn grace(&self, mut wait: impl FnMut() -> bool) -> bool {
+        let Some(busy) = self.lock().busy.clone() else {
+            return wait();
+        };
+        let started = std::time::Instant::now();
+        loop {
+            let (before, waiting) = busy();
+            if wait() {
+                return true;
+            }
+            let (after, waits) = busy();
+            if before == after && waiting == 0 && waits == 0 {
+                return false;
+            }
+            if started.elapsed() >= HELD {
+                eprintln!(
+                    "paludarium: the virtual clock was held for {HELD:?} of real time while guest \
+                     threads waited for compiling, and then jumped"
+                );
+                return false;
+            }
+        }
     }
     /// Measures each thread's CPU time on the native host, for the
     /// differential tests of guests that wait for CPU time to pass, which
@@ -259,7 +304,7 @@ impl Host for RecordingHost {
             crate::switches::sleep(&mut false);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if cancelled_within(cancel, remaining.min(GRACE)) {
+        if self.grace(|| cancelled_within(cancel, remaining.min(GRACE))) {
             return Ok(WaitOutcome::Interrupted);
         }
         #[cfg(target_arch = "wasm32")]
@@ -283,7 +328,14 @@ impl Host for RecordingHost {
         if token.value() == expected && !cancel.load(std::sync::atomic::Ordering::SeqCst) {
             waiting.sleep();
             crate::switches::sleep(&mut false);
-            crate::threads::wait_briefly(token, expected, GRACE);
+            let brief = || {
+                crate::threads::wait_briefly(token, expected, GRACE);
+                token.value() != expected || cancel.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            self.grace(brief);
+            #[cfg(target_arch = "wasm32")]
+            brief();
         }
         if token.value() != expected {
             return Ok(WaitOutcome::Complete);
@@ -422,6 +474,39 @@ mod tests {
             host.clock(ClockId::Realtime),
             Ok(1_700_000_000_000_000_000 + 10_101_000_000_000)
         );
+    }
+
+    /// A wait does not jump while requests it is held for are being made or
+    /// wait, and does once they end.
+    #[test]
+    fn a_wait_is_held_while_what_it_is_held_for_goes_on() {
+        let end = Duration::from_millis(60);
+        for waits in [true, false] {
+            let host = RecordingHost::new();
+            let start = Instant::now();
+            let begun = std::sync::atomic::AtomicU64::new(0);
+            host.hold_jumps(Arc::new(move || {
+                let on = start.elapsed() < end;
+                if on && !waits {
+                    begun.fetch_add(1, Ordering::SeqCst);
+                }
+                (begun.load(Ordering::SeqCst), usize::from(on && waits))
+            }));
+            let outcome = if waits {
+                host.wait_until(ClockId::Monotonic, 1_000_000_000, &AtomicBool::new(false))
+            } else {
+                let token = crate::WaitToken::default();
+                host.wait_on(
+                    &token,
+                    token.value(),
+                    Some((ClockId::Monotonic, 1_000_000_000)),
+                    &AtomicBool::new(false),
+                )
+            };
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(start.elapsed() >= end, "{:?}", start.elapsed());
+            assert_eq!(host.clock(ClockId::Monotonic), Ok(1_000_000_000));
+        }
     }
 
     /// A wake another thread gives once the sleep has started ends it,

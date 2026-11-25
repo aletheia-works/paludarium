@@ -8,6 +8,8 @@ use paludarium_types::{Errno, GuestAddr};
 const PAGE: u64 = 4096;
 /// Linux's `UIO_MAXIOV`.
 const MAX_SEGMENTS: u64 = 1024;
+/// Linux's `PVM_MAX_USER_PAGES`: the pages pinned at once.
+const MAX_PINNED: u64 = 1024;
 
 /// The calls' checks before the task is looked up, in Linux's order:
 /// `flags` must be 0 (`EINVAL`); the local iovec array is read as
@@ -128,11 +130,14 @@ impl Local<'_> {
 }
 
 /// Copies between the caller's memory `mem` and the task's `target`, as
-/// Linux's `process_vm_rw_core`: each remote buffer in turn, a page of it
-/// at a time, while the caller's buffers have room. A remote page that may
-/// not be read (or, with `write`, written) ends the copy with `EFAULT`, as
-/// does a local page that cannot take or give its bytes; the bytes copied
-/// before are the result if there are any.
+/// Linux's `process_vm_rw_core`: each remote buffer in turn, while the
+/// caller's buffers have room. As `process_vm_rw_single_vec` pins a buffer's
+/// pages before it copies them, they are faulted in first
+/// ([`MemoryView::fault_in_pages`], which waits for a `userfaultfd` as the
+/// caller), at most [`MAX_PINNED`] at once and whatever the room left for
+/// them. A remote page that may not be read (or, with `write`, written)
+/// ends the copy with `EFAULT`, as does a local page that cannot take or
+/// give its bytes; the bytes copied before are the result if there are any.
 pub(crate) fn transfer(
     mem: &AddressSpace,
     target: &MemoryView,
@@ -153,41 +158,52 @@ pub(crate) fn transfer(
     let mut copied = 0u64;
     let mut failed = false;
     'remote: for &(base, length) in &segments.remote {
+        if length == 0 {
+            continue;
+        }
         let (mut at, mut left) = (base, length);
-        while left > 0 {
-            let room = local.left;
-            if room == 0 {
-                break 'remote;
-            }
-            let n = (PAGE - at % PAGE).min(left).min(room) as usize;
-            let mut page = vec![0; n];
-            let done = if write {
-                let taken = local.take(&mut page);
-                let written = target.write_pages(at, &page[..taken]).unwrap_or(0);
-                if written < taken {
-                    // The remote page would not be pinned: nothing of it.
-                    failed = true;
-                    break 'remote;
-                }
-                taken
-            } else {
-                if target.read_pages(at, &mut page).unwrap_or(0) < n {
-                    failed = true;
-                    break 'remote;
-                }
-                local.put(&page)
-            };
-            copied += done as u64;
-            if done < n {
+        let mut page = base - base % PAGE;
+        let mut pages = base.wrapping_add(length - 1) / PAGE;
+        pages = pages.wrapping_sub(base / PAGE).wrapping_add(1);
+        while pages > 0 && local.left > 0 {
+            let pinned = target
+                .fault_in_pages(page, pages.min(MAX_PINNED), write)
+                .unwrap_or(0);
+            if pinned == 0 {
                 failed = true;
                 break 'remote;
             }
-            left -= n as u64;
-            let Some(next) = at.checked_add(n as u64) else {
-                failed = true;
-                break 'remote;
-            };
-            at = next;
+            let mut bytes = (pinned * PAGE - at % PAGE).min(left);
+            left -= bytes;
+            pages -= pinned;
+            page = page.wrapping_add(pinned * PAGE);
+            while bytes > 0 && local.left > 0 {
+                let n = (PAGE - at % PAGE).min(bytes).min(local.left) as usize;
+                let mut copy = vec![0; n];
+                let done = if write {
+                    let taken = local.take(&mut copy);
+                    let written = target.write_pages(at, &copy[..taken]).unwrap_or(0);
+                    if written < taken {
+                        // It was taken away since it was faulted in.
+                        failed = true;
+                        break 'remote;
+                    }
+                    taken
+                } else {
+                    if target.read_pages(at, &mut copy).unwrap_or(0) < n {
+                        failed = true;
+                        break 'remote;
+                    }
+                    local.put(&copy)
+                };
+                copied += done as u64;
+                if done < n {
+                    failed = true;
+                    break 'remote;
+                }
+                bytes -= n as u64;
+                at = at.wrapping_add(n as u64);
+            }
         }
     }
     if copied == 0 && failed {

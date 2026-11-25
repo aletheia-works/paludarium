@@ -75,7 +75,7 @@
 //! file has an inode of its own and a size of 0 ([`stat`]), so, as on
 //! Linux, `copy_file_range` never writes one: from another filesystem it is
 //! `EXDEV`, and from a sysctl it copies nothing.
-use crate::events::ReadinessHub;
+use crate::events::{DEFAULT_POLLMASK, ReadinessHub};
 use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
 use crate::namespaces::Namespace;
@@ -1638,8 +1638,6 @@ impl Value {
     }
 }
 
-/// `EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM`.
-const DEFAULT_POLLMASK: u32 = 0x145;
 /// `EPOLLIN | EPOLLRDNORM | EPOLLERR | EPOLLPRI`, what a poll gives of a
 /// changed name.
 const CHANGED_POLLMASK: u32 = 0x4b;

@@ -1399,3 +1399,327 @@ fn a_copy_under_ppoll_s_temporary_mask_ends_for_a_fatal_signal_it_unblocks() {
         assert_eq!(main_thread.cpu.gpr[reg::RAX], errno(Errno::EFAULT));
     });
 }
+
+/// What a handler thread calls system calls with.
+type Call<'a> = &'a mut dyn FnMut(u64, &[u64]) -> u64;
+
+const READ: u64 = 0;
+const CLOSE: u64 = 3;
+const IOCTL: u64 = 16;
+const MADVISE: u64 = 28;
+const MLOCK: u64 = 149;
+const FUTEX: u64 = 202;
+const PROCESS_VM_READV: u64 = 310;
+const PROCESS_VM_WRITEV: u64 = 311;
+
+/// The result of the system call `number` made while `server` runs as
+/// another thread of the process, once the call's fault on `fd` is read.
+fn served(
+    f: &mut Fixture,
+    fd: u64,
+    number: u64,
+    args: &[u64],
+    server: impl FnOnce(Call<'_>, &AddressSpace, u64) + Send,
+) -> u64 {
+    let main = |kernel: &mut Kernel, thread: &mut Thread, mem: &AddressSpace| {
+        thread.cpu.gpr[reg::RAX] = number;
+        let regs = [reg::RDI, reg::RSI, reg::RDX, reg::R10, reg::R8, reg::R9];
+        for (r, v) in regs.iter().zip(args) {
+            thread.cpu.gpr[*r] = *v;
+        }
+        let reason = ExitReason::Syscall {
+            rip: GuestAddr(0x1000),
+        };
+        kernel.handle(thread, mem, reason);
+        thread.cpu.gpr[reg::RAX]
+    };
+    served_by(f, fd, main, server)
+}
+
+/// [`served`], for what `main` does as the main thread.
+fn served_by<T>(
+    f: &mut Fixture,
+    fd: u64,
+    main: impl FnOnce(&mut Kernel, &mut Thread, &AddressSpace) -> T,
+    server: impl FnOnce(Call<'_>, &AddressSpace, u64) + Send,
+) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const THREAD: u64 = 0x50f00;
+    let child = f.ret(56, &[THREAD, DATA + 0x7000, 0, 0, 0]);
+    assert!((child as i64) > 0, "{child:#x}");
+    let (mut kernel, mut thread) = f.kernel.take_child().unwrap();
+    let done = AtomicBool::new(false);
+    let (main_kernel, main_thread, mem) = (&mut f.kernel, &mut f.thread, &f.mem);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..300 {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprintln!("the served access never ended");
+            std::process::abort();
+        });
+        let server = scope.spawn(move || {
+            let mut call = |number: u64, args: &[u64]| {
+                thread.cpu.gpr[reg::RAX] = number;
+                let regs = [reg::RDI, reg::RSI, reg::RDX, reg::R10, reg::R8, reg::R9];
+                for (r, v) in regs.iter().zip(args) {
+                    thread.cpu.gpr[*r] = *v;
+                }
+                let reason = ExitReason::Syscall {
+                    rip: GuestAddr(0x1000),
+                };
+                kernel.handle(&mut thread, mem, reason);
+                thread.cpu.gpr[reg::RAX]
+            };
+            let message = DATA + 0x6000;
+            while call(READ, &[fd, message, 32]) as i64 == -11 {
+                std::thread::yield_now();
+            }
+            let address = mem.read_u64(GuestAddr(message + 16)).unwrap();
+            server(&mut call, mem, address);
+        });
+        let ret = main(main_kernel, main_thread, mem);
+        server.join().unwrap();
+        done.store(true, Ordering::SeqCst);
+        ret
+    })
+}
+
+/// Fills the page `address` names with the one at [`SRC`], as a handler.
+fn fill(call: Call<'_>, mem: &AddressSpace, fd: u64, address: u64) {
+    let copy = DATA + 0x5000;
+    let words: Vec<u8> = [address & !(PAGE - 1), SRC, PAGE, 0, 0]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    mem.write(GuestAddr(copy), &words).unwrap();
+    assert_eq!(call(IOCTL, &[fd, COPY, copy]), 0);
+}
+
+/// `get_user_pages` waits for a `userfaultfd` where it may drop the space's
+/// lock (`FOLL_UNLOCKABLE`): `process_vm_rw`'s, whose pages fault in before
+/// any of the buffer is copied, `MADV_POPULATE_READ`'s and `_WRITE`'s, and
+/// `mlock`'s.
+#[test]
+fn get_user_pages_waits_for_a_userfaultfd() {
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, 8 * PAGE), 0);
+    f.mem.write(GuestAddr(SRC), b"filled").unwrap();
+    let (local, remote) = (DATA + 0x4000, DATA + 0x4100);
+    let iovec = |f: &Fixture, at: u64, base: u64, len: u64| {
+        f.mem.write(GuestAddr(at), &base.to_le_bytes()).unwrap();
+        f.mem.write(GuestAddr(at + 8), &len.to_le_bytes()).unwrap();
+    };
+    let pid = u64::from(f.thread.state.pid);
+    // A read of the second page's first bytes.
+    iovec(&f, local, DATA + 0x4200, 6);
+    iovec(&f, remote, AREA + PAGE, 6);
+    let vm = [pid, local, 1, remote, 1, 0];
+    let n = served(&mut f, fd, PROCESS_VM_READV, &vm, |call, mem, address| {
+        assert_eq!(address, AREA + PAGE);
+        fill(call, mem, fd, address);
+    });
+    assert_eq!(n, 6);
+    let mut got = [0; 6];
+    f.mem.read(GuestAddr(DATA + 0x4200), &mut got).unwrap();
+    assert_eq!(&got, b"filled");
+    // A write to the third page, before any of which its fault is taken.
+    f.mem.write(GuestAddr(DATA + 0x4200), b"over").unwrap();
+    iovec(&f, local, DATA + 0x4200, 4);
+    iovec(&f, remote, AREA + 2 * PAGE, 4);
+    let n = served(&mut f, fd, PROCESS_VM_WRITEV, &vm, |call, mem, address| {
+        assert_eq!(address, AREA + 2 * PAGE);
+        fill(call, mem, fd, address);
+    });
+    assert_eq!(n, 4);
+    f.mem.read(GuestAddr(AREA + 2 * PAGE), &mut got).unwrap();
+    assert_eq!(&got, b"overed");
+    // The whole buffer's pages are faulted in, whatever room is left.
+    iovec(&f, remote, AREA + 2 * PAGE, 2 * PAGE);
+    let n = served(&mut f, fd, PROCESS_VM_READV, &vm, |call, mem, address| {
+        assert_eq!(address, AREA + 3 * PAGE);
+        fill(call, mem, fd, address);
+    });
+    assert_eq!(n, 4);
+    for (page, number, args) in [
+        (4, MADVISE, [AREA + 4 * PAGE, PAGE, 22]),
+        (5, MADVISE, [AREA + 5 * PAGE, PAGE, 23]),
+        (6, MLOCK, [AREA + 6 * PAGE, PAGE, 0]),
+    ] {
+        let ret = served(&mut f, fd, number, &args, |call, mem, address| {
+            assert_eq!(address, AREA + page * PAGE);
+            fill(call, mem, fd, address);
+        });
+        assert_eq!(ret, 0, "{page}");
+        f.mem.read(GuestAddr(AREA + page * PAGE), &mut got).unwrap();
+        assert_eq!(&got, b"filled");
+    }
+    // A mapping taken away while it waits is ENOMEM to MADV_POPULATE.
+    let args = [AREA + 7 * PAGE, PAGE, 22];
+    let ret = served(&mut f, fd, MADVISE, &args, |call, mem, _| {
+        assert_eq!(call(11, &[AREA + 7 * PAGE, PAGE]), 0);
+        for (at, word) in [(0, AREA + 7 * PAGE), (8, PAGE)] {
+            mem.write_u64(GuestAddr(DATA + 0x5000 + at), word).unwrap();
+        }
+        assert_eq!(call(IOCTL, &[fd, WAKE, DATA + 0x5000]), 0);
+    });
+    assert_eq!(ret, errno(Errno::ENOMEM));
+}
+
+/// An access through `get_user_pages` that keeps the space's lock fails on a
+/// page a `userfaultfd` should fill: `/proc/<pid>/mem`'s (`EIO`), which
+/// leaves the page missing, and `mprotect`'s population, whose error is
+/// ignored. One that may drop it fails where the context takes no kernel
+/// fault: `mlock` with `ENOMEM`, and the others with `EFAULT`.
+#[test]
+fn get_user_pages_fails_where_a_userfaultfd_may_not_be_waited_for() {
+    const OPEN: u64 = 2;
+    const PREAD: u64 = 17;
+    const PWRITE: u64 = 18;
+    let mut f = fixture();
+    let fd = f.ready(1 | NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, 8 * PAGE), 0);
+    let path = DATA + 0x4000;
+    f.mem.write(GuestAddr(path), b"/proc/self/mem\0").unwrap();
+    let memory = f.ret(OPEN, &[path, 2, 0]);
+    assert!((memory as i64) >= 0, "{memory:#x}");
+    let eio = errno(Errno::EIO);
+    assert_eq!(f.ret(PREAD, &[memory, DATA + 0x4100, 4, AREA]), eio);
+    assert_eq!(f.ret(PWRITE, &[memory, DATA + 0x4100, 4, AREA]), eio);
+    assert_eq!(f.mem.resident(GuestAddr(AREA)), Some(false));
+    for (at, value) in [(0, DATA + 0x4100), (8, 4), (16, AREA), (24, 4)] {
+        f.mem
+            .write_u64(GuestAddr(DATA + 0x4200 + at), value)
+            .unwrap();
+    }
+    let pid = u64::from(f.thread.state.pid);
+    let vm = [pid, DATA + 0x4200, 1, DATA + 0x4210, 1, 0];
+    let efault = errno(Errno::EFAULT);
+    assert_eq!(f.ret(PROCESS_VM_READV, &vm), efault);
+    assert_eq!(f.ret(PROCESS_VM_WRITEV, &vm), efault);
+    assert_eq!(f.ret(MADVISE, &[AREA, PAGE, 22]), efault);
+    assert_eq!(f.ret(MADVISE, &[AREA, PAGE, 23]), efault);
+    assert_eq!(f.ret(MLOCK, &[AREA, PAGE]), errno(Errno::ENOMEM));
+    assert_eq!(f.mem.resident(GuestAddr(AREA)), Some(false));
+    // A forced write meets write protection too.
+    let wp = f.ready(1 | NONBLOCK, 0);
+    assert_eq!(f.ioctl(fd, UNREGISTER, &[AREA, 8 * PAGE]).0, 0);
+    f.mem.write(GuestAddr(AREA), b"here").unwrap();
+    assert_eq!(f.ioctl(wp, REGISTER, &[AREA, PAGE, 2, 0]).0, 0);
+    assert_eq!(f.ioctl(wp, WRITEPROTECT, &[AREA, PAGE, 1]).0, 0);
+    assert_eq!(f.ret(PREAD, &[memory, DATA + 0x4100, 4, AREA]), 4);
+    assert_eq!(f.ret(PWRITE, &[memory, DATA + 0x4100, 4, AREA]), eio);
+    assert_eq!(f.ioctl(wp, WRITEPROTECT, &[AREA, PAGE, 0]).0, 0);
+    assert_eq!(f.ret(PWRITE, &[memory, DATA + 0x4100, 4, AREA]), 4);
+}
+
+/// A copy that waits goes on once the context is closed, as its page is no
+/// longer registered (`VM_FAULT_RETRY`): it reads zeros.
+#[test]
+fn a_copy_goes_on_when_its_userfaultfd_is_closed() {
+    const PIPE2: u64 = 293;
+    const WRITE: u64 = 1;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    assert_eq!(f.ret(PIPE2, &[ARG, 0]), 0);
+    let writer = f.mem.read_u64(GuestAddr(ARG)).unwrap() >> 32;
+    let n = served(&mut f, fd, WRITE, &[writer, AREA, 5], |call, _, _| {
+        assert_eq!(call(CLOSE, &[fd]), 0);
+    });
+    assert_eq!(n, 5);
+    assert_eq!(f.userfault(AREA), None);
+}
+
+/// A futex word in a registered page is waited for with the queues free, as
+/// Linux drops the bucket's lock before `get_user`: the thread that fills
+/// the page wakes another word meanwhile. A shared word's key waits too
+/// (`get_user_pages_fast`), and `FUTEX_WAKE_OP` of a private word does not
+/// (`fault_in_user_writeable`): `EFAULT`.
+#[test]
+fn a_futex_word_is_waited_for_with_the_queues_free() {
+    const WAKE: u64 = 1;
+    const WAIT_PRIVATE: u64 = 128;
+    const WAKE_PRIVATE: u64 = 129;
+    const CMP_REQUEUE_PRIVATE: u64 = 132;
+    const WAKE_OP_PRIVATE: u64 = 133;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, 8 * PAGE), 0);
+    let word = DATA + 0x4000;
+    let eagain = errno(Errno::EAGAIN);
+    for (page, args, expected) in [
+        (0, [AREA, WAIT_PRIVATE, 7, 0, 0, 0], eagain),
+        (1, [AREA + PAGE, CMP_REQUEUE_PRIVATE, 1, 1, word, 7], eagain),
+        (2, [AREA + 2 * PAGE, WAKE, 1, 0, 0, 0], 0),
+    ] {
+        let ret = served(&mut f, fd, FUTEX, &args, |call, mem, address| {
+            assert_eq!(address, AREA + page * PAGE);
+            assert_eq!(call(FUTEX, &[word, WAKE_PRIVATE, 1, 0, 0, 0]), 0);
+            fill(call, mem, fd, address);
+        });
+        assert_eq!(ret, expected, "{page}");
+    }
+    let op = [word, WAKE_OP_PRIVATE, 1, 1, AREA + 3 * PAGE, 0];
+    assert_eq!(f.ret(FUTEX, &op), errno(Errno::EFAULT));
+    assert_eq!(f.mem.resident(GuestAddr(AREA + 3 * PAGE)), Some(false));
+}
+
+/// A pin of pages (`pin_user_pages_fast` with `FOLL_LONGTERM`) waits for a
+/// `userfaultfd` with the space unlocked and the pages before the fault
+/// pinned, which it holds though their addresses are mapped anew meanwhile;
+/// it fails where the context takes no kernel fault.
+#[test]
+fn a_pin_waits_for_a_userfaultfd_with_its_earlier_pages_pinned() {
+    const DONTNEED: u64 = 4;
+    let mut f = fixture();
+    f.kernel.cancellation = f.kernel.inbox.wake_token();
+    let fd = f.ready(NONBLOCK, 0);
+    f.mem.write(GuestAddr(AREA), b"first").unwrap();
+    assert_eq!(f.register(fd, AREA + PAGE, PAGE), 0);
+    f.mem.write(GuestAddr(SRC), b"filled").unwrap();
+    let pin = |kernel: &mut Kernel, thread: &mut Thread, mem: &AddressSpace| {
+        let copies = Arc::new(userfaultfd::KernelCopies {
+            group: Arc::clone(&kernel.group),
+            tid: thread.tid,
+            hub: Arc::clone(&kernel.files.readiness),
+            host: Arc::clone(&kernel.host),
+            inbox: Arc::clone(&kernel.inbox),
+            processes: Arc::clone(&kernel.processes),
+            pid: kernel.process.pid,
+        });
+        let _faults = KernelFaults::enter(&thread.state);
+        let _copies = KernelCopies::install(copies, 0, false);
+        mem.pin(GuestAddr(AREA), 3 * PAGE as usize)
+    };
+    let pinned = served_by(&mut f, fd, pin, |call, mem, address| {
+        assert_eq!(address, AREA + PAGE);
+        assert_eq!(call(MADVISE, &[AREA, PAGE, DONTNEED]), 0);
+        mem.write(GuestAddr(AREA), b"again").unwrap();
+        fill(call, mem, fd, address);
+    })
+    .unwrap();
+    let mut got = [0; 6];
+    pinned.read(0, &mut got[..5]);
+    assert_eq!(&got[..5], b"first");
+    pinned.read(PAGE as usize, &mut got);
+    assert_eq!(&got, b"filled");
+    pinned.write(PAGE as usize, b"p");
+    f.mem.read(GuestAddr(AREA + PAGE), &mut got).unwrap();
+    assert_eq!(&got, b"pilled");
+    drop(pinned);
+    assert_eq!(f.ret(MADVISE, &[AREA + PAGE, PAGE, DONTNEED]), 0);
+    assert_eq!(f.ret(CLOSE, &[fd]), 0);
+    let user = f.ready(1 | NONBLOCK, 0);
+    assert_eq!(f.register(user, AREA + PAGE, PAGE), 0);
+    let refused = pin(&mut f.kernel, &mut f.thread, &f.mem);
+    assert_eq!(refused.err(), Some(Errno::EFAULT));
+    assert_eq!(f.mem.resident(GuestAddr(AREA + PAGE)), Some(false));
+}

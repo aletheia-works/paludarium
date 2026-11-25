@@ -48,7 +48,12 @@ verified.
   A rename that a process under `chroot` makes does not move the names
   of the files it moves in the maps, a core's `NT_FILE` note and
   `/proc/<pid>/exe`, where Linux's `d_move` moves them whatever the root.
-  `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  Maps can show fewer VMAs than Linux after a merge: Linux merges
+  two VMAs only where their `anon_vma`s are compatible
+  (`is_mergeable_anon_vma`), and the emulator does not model `anon_vma`
+  identity, so it merges neighbours that Linux keeps apart, such as after
+  `munlock` of a page `mlock` populated next to a piece written while it was
+  part of another VMA.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
@@ -116,7 +121,10 @@ verified.
   process's directory they are `ENOENT`, where Linux shows root `stack`
   and the rest. `wchan` is `0` for a waiting task too, where Linux names the
   kernel function it waits in for a reader that may read the task: there are
-  no kernel functions here to name. `io` does not count what Linux's
+  no kernel functions here to name. `poll` finds the files of `/proc/sys`
+  always ready and `epoll_ctl` refuses them (`EPERM`), where Linux takes them
+  and gives `POLLERR` and `POLLPRI` once `hostname` or `domainname` changed.
+  `io` does not count what Linux's
   `kernel_read` and `kernel_write` count for the process (`execve` reading its
   program and interpreter, a core dump's writes), and a read or write that
   fails with an errno Linux gives both before and in the file's operation
@@ -779,7 +787,7 @@ verified.
     file, where Linux asks its page cache.
   - Adjacent private VMAs merge once their flags agree again (after
     `munlock`, for one), whatever their `anon_vma`s. Linux merges them only
-    when they share one. A VMA gets its `anon_vma` on its first write, and
+    when they share one or one of them has none. A VMA gets its `anon_vma` on its first write, and
     takes a neighbour's only if their flags agreed then
     (`anon_vma_compatible`), so pieces written while apart may stay
     separate VMAs in `/proc/<pid>/maps`.
@@ -1041,12 +1049,12 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **File leases, in part**: an open or a truncate that conflicts with a
-  lease does not break it yet, where Linux's `__break_lease` signals the
-  holder and makes the opener wait up to `/proc/sys/fs/lease-break-time`
-  seconds (or fail with `EWOULDBLOCK` under `O_NONBLOCK`), then takes the
-  lease away or makes it a read lease. Delegations (`F_GETDELEG` and
-  `F_SETDELEG`) are `EINVAL`.
+- **File leases, in part**: the opens `execve` makes of a program, its
+  interpreter and its script, and those of the descriptors fanotify's events
+  give, break no lease, where Linux's do. A lease is broken before
+  `FAN_OPEN_PERM` is asked, where Linux breaks it after, and after
+  Landlock's check of a `truncate`, where Linux breaks it before.
+  Delegations (`F_GETDELEG` and `F_SETDELEG`) are `EINVAL`.
 - **fanotify, in part**: `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here
   allows it), and `FAN_FS_ERROR` never comes, as no file system here
   reports errors. Linux's ext4 reports them, and since 7.0 its XFS, Btrfs,

@@ -16,6 +16,23 @@ pub(crate) const MAX_ALLOC: usize = 4 * PAGE - SHARED_INFO;
 pub(crate) const MAX_HEAD: usize = PAGE - SHARED_INFO;
 /// `MAX_SKB_FRAGS` pages, the most of a buffer in page fragments.
 pub(crate) const MAX_FRAGS_SIZE: usize = 17 * PAGE;
+/// `SKB_SMALL_HEAD_CACHE_SIZE`, the small head cache's heads, which
+/// `MAX_HEADER` sizes: 704 bytes on the CI runner's kernel, built with
+/// Hyper-V's networking (640 on Docker's).
+pub(crate) const SMALL_HEAD: usize = 704;
+
+/// The `truesize` of a buffer `alloc_skb` makes for `len` bytes: the
+/// `sk_buff` and its head, which holds the bytes and the `skb_shared_info`
+/// in the small head cache when it fits, else in the smallest power of two
+/// that does.
+pub(crate) fn truesize(len: usize) -> usize {
+    let head = len.next_multiple_of(64) + SHARED_INFO;
+    SKB + if head <= SMALL_HEAD {
+        SMALL_HEAD
+    } else {
+        head.next_power_of_two()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -26,5 +43,14 @@ mod tests {
         assert_eq!(MAX_ALLOC, 16_064);
         assert_eq!(MAX_HEAD, 3776);
         assert_eq!(MAX_FRAGS_SIZE, 69_632);
+    }
+
+    #[test]
+    fn a_head_is_small_or_a_power_of_two() {
+        assert_eq!(truesize(0), 960);
+        assert_eq!(truesize(384), 960);
+        assert_eq!(truesize(385), 1280);
+        assert_eq!(truesize(704), 1280);
+        assert_eq!(truesize(705), 2304);
     }
 }

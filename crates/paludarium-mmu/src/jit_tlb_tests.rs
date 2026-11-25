@@ -72,7 +72,7 @@ fn a_fetch_from_another_page_leaves_the_slot_of_this_one_writing() {
 fn a_page_that_fork_shares_is_not_written_through_its_slot() {
     let m = space(Prot::READ_WRITE);
     m.jit_write_value(GuestAddr(AT), 8, 5).unwrap();
-    let child = m.fork();
+    let child = m.fork().unwrap();
     assert!(!m.jit_slot(AT).0);
     assert_eq!(m.jit_read_value(GuestAddr(AT), 8), Ok(5));
     assert_eq!(m.jit_slot(AT), (true, AT, NO_PAGE));

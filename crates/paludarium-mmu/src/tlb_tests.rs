@@ -142,7 +142,7 @@ fn fork_keeps_the_parent_and_the_child_apart() {
     let parent = space(1, Prot::READ_WRITE);
     parent.write(GuestAddr(AT), &[1]).unwrap();
     assert_eq!(used(&parent, AT), 1);
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     // Writes after the fork copy the page for the space that makes them.
     parent.write(GuestAddr(AT), &[2]).unwrap();
     assert_eq!(byte(&child, AT), 1);
@@ -162,7 +162,7 @@ fn a_page_only_read_before_fork_gets_a_frame_in_each_space() {
     // The parent reads the page, so that it has an entry but no contents.
     let parent = space(1, Prot::READ_WRITE);
     assert_eq!(used(&parent, AT), 0);
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     child.write(GuestAddr(AT), &[7]).unwrap();
     assert_eq!(byte(&parent, AT), 0);
     assert_eq!(used(&child, AT), 7);
@@ -175,7 +175,7 @@ fn a_page_only_read_before_fork_gets_a_frame_in_each_space() {
 fn a_page_shared_after_fork_is_read_through_its_copy() {
     let parent = space(1, Prot::READ_WRITE);
     parent.write(GuestAddr(AT), &[1]).unwrap();
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     // The child holds the frame it shares with the parent; the parent's
     // write copies it for the parent alone.
     assert_eq!(used(&child, AT), 1);
@@ -192,7 +192,7 @@ fn a_loader_write_across_pages_after_fork_is_read_from_the_copies() {
     parent
         .write_initial(GuestAddr(AT + PAGE_SIZE), &[2])
         .unwrap();
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     assert_eq!(used(&parent, AT + PAGE_SIZE - 1), 0);
     assert_eq!(used(&parent, AT + PAGE_SIZE), 2);
     // A write across both pages, which copies the frames shared with the
@@ -212,7 +212,7 @@ fn a_mapping_made_shared_before_fork_stays_shared() {
     parent.write(GuestAddr(AT), &[1]).unwrap();
     assert_eq!(used(&parent, AT), 1);
     parent.mark_shared(GuestAddr(AT), PAGE_SIZE).unwrap();
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     assert_eq!(used(&parent, AT), 1);
     child.write(GuestAddr(AT), &[2]).unwrap();
     assert_eq!(byte(&parent, AT), 2);
@@ -580,7 +580,7 @@ fn no_store_without_a_lock_lands_in_a_child_after_fork_returns() {
         let child = std::sync::OnceLock::new();
         no_store_lands_after(
             |space| {
-                let _ = child.set(space.fork());
+                let _ = child.set(space.fork().unwrap());
             },
             |_| child.get().unwrap().read_u64(GuestAddr(AT)).unwrap(),
             &space,

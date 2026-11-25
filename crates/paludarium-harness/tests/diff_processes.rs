@@ -216,8 +216,8 @@ mod linux {
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, the file-leases case, which writes
-            // fs.leases-enable and becomes an unprivileged user, as the
-            // emulator's guest starts as root.
+            // fs.leases-enable and fs.lease-break-time and becomes an
+            // unprivileged user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -258,6 +258,7 @@ mod linux {
                     | "ipc-sysctl"
                     | "sysvipc-proc"
                     | "kernel-sysctl"
+                    | "uts-sysctl"
                     | "net-sysctl"
                     | "mqueue-calls"
                     | "mqueue-limits"
@@ -545,6 +546,9 @@ mod linux {
             ) {
                 host.measure_cpu_time();
             }
+            // Not with_test_jit yet: compiling on the thread that runs a block
+            // counts in its CPU clock, so cpu-timer's thread timer fires
+            // (thread other=1, Linux 0).
             let session = Session::new(config, host.clone()).unwrap();
             let start = Instant::now();
             let status = session.run().unwrap();
@@ -918,6 +922,7 @@ mod linux {
         processes_proc_own_files => ("proc-own-files","process"),
         processes_proc_other_files => ("proc-other-files","process"),
         processes_page_faults => ("page-faults","process"),
+        processes_vma_names => ("vma-names","process"),
         processes_exec_names => ("exec-names","process"),
         processes_rename_names => ("rename-names","process"),
         processes_context_switches => ("context-switches","process"),
@@ -1009,6 +1014,7 @@ mod linux {
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
+        processes_uts_sysctl => ("uts-sysctl","process"),
         processes_net_sysctl => ("net-sysctl","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),

@@ -189,8 +189,8 @@ hundreds of microseconds, rather than with LLVM, which is far slower to
 compile with and is not a Rust library. It compiles the forms the
 interpreter already works out when it decodes, not instructions of its own,
 so each instruction it compiles has one meaning, the interpreter's, which
-unit tests from random states, a fuzz target and the differential tests with
-every block compiled check.
+unit tests from random states, a fuzz target and the differential tests
+([most with every block compiled](./quality#the-native-jit)) check.
 
 It is a crate of its own because it needs `unsafe`, to map code and call it, and
 every other crate but the host's forbids it. Compiling happens on a thread of
@@ -225,8 +225,8 @@ CI's own records, so anyone can check it:
    the JIT (the `jit` run of `distro-programs.yml`), with every case giving
    native Linux's result. One failure starts the count again. The two
    complement each other: the first compiles every block the first time it
-   runs, over the differential tests; the second uses the default threshold,
-   over Debian's real programs.
+   runs, over [most of the differential tests](./quality#the-native-jit); the
+   second uses the default threshold, over Debian's real programs.
 2. **Fuzzing.** The nightly `jit_native` fuzz target, which compares compiled
    code with the interpreter for arbitrary instruction bytes, found nothing in
    each of those 14 nights. The target exists already, so no new one is needed.

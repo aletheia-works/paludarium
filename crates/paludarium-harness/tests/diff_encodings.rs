@@ -159,8 +159,10 @@ fn bounded_reaches_ignored_tests() {
 #[ignore = "Explicit native-only collection; does not assert emulator agreement"]
 fn native_observation() {
     support::bounded("native_observation", || {
+        // Not in `target/encodings-guests`, where `fresh_native_differential`
+        // builds and runs the same guests beside it (`--include-ignored`).
         let root = paludarium_harness::workspace_root();
-        let output = root.join("target/encodings-guests");
+        let output = root.join("target/encodings-observation");
         assert!(
             std::process::Command::new("bash")
                 .arg(root.join("tests/guests/encodings/build.sh"))

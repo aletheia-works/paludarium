@@ -5504,8 +5504,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 // F_NOTIFY: dnotify.
                 1026 => crate::dnotify::fcntl(c, &d, a[0], a[2] as u32),
                 // F_SETLEASE and F_GETLEASE.
-                1024 => crate::leases::set(c, &d, a[2]),
-                1025 => Ok(crate::leases::get(c, &d)),
+                1024 => crate::leases::set(c, a[0], &d, a[2]),
+                1025 => crate::leases::get(c, &d),
                 // The owner and signal of signal-driven I/O.
                 8..=11 | 15 | 16 => crate::fasync::fcntl(c, &d.file, a[1], a[2]),
                 // Byte-range locks: F_GETLK, F_SETLK, F_SETLKW and their OFD forms.
@@ -5528,13 +5528,17 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
         }
         76 | 77 => {
+            // `do_sys_truncate` and `do_sys_ftruncate`: a negative length
+            // before the path or the descriptor.
+            if a[1] > i64::MAX as u64 {
+                return Err(Errno::EINVAL);
+            }
             let f = if n == 77 {
                 let file = io_descriptor(c, a[0])?;
                 // `do_ftruncate`: an append-only file is not truncated
-                // (EPERM), after the length and the description's
-                // EINVAL, before Landlock's right.
-                if a[1] <= i64::MAX as u64
-                    && file.flags() & 3 != 0
+                // (EPERM), after the description's EINVAL, before
+                // Landlock's right.
+                if file.flags() & 3 != 0
                     && let Ok(stat) = file.stat()
                     && stat.mode & 0o170000 == 0o100000
                     && attributes::append_only(&stat)
@@ -5564,7 +5568,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         crate::permissions::truncate(&c.process.credentials, &stat, || {
                             crate::permissions::want_write(c.files, &path, follow)
                         })?;
-                        crate::inotify::unnoticed(|| c.files.fs().open(&path, 1, 0))?
+                        crate::leases::breaking(c, 1, |c| {
+                            crate::inotify::unnoticed(|| c.files.fs().open(&path, 1, 0))
+                        })?
                     }
                     Some(Followed::File(d)) => {
                         crate::permissions::truncate(
@@ -5572,16 +5578,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                             &d.file.stat()?,
                             || crate::permissions::want_write(c.files, &d.path, false),
                         )?;
-                        crate::inotify::unnoticed(|| d.file.reopen(1))?
+                        crate::leases::breaking(c, 1, |_| {
+                            crate::inotify::unnoticed(|| d.file.reopen(1))
+                        })?
                     }
                     None => {
                         if let Some(changed) = change_generated(c, &p, true, Change::Size) {
-                            // A negative length is `EINVAL` before all else.
-                            return if a[1] > i64::MAX as u64 {
-                                Err(Errno::EINVAL)
-                            } else {
-                                changed
-                            };
+                            return changed;
                         }
                         let writable = || crate::permissions::want_write(c.files, &p, true);
                         match found.file {
@@ -5600,13 +5603,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                                 }
                             }
                         }
-                        crate::inotify::unnoticed(|| c.files.fs().open(&p, 1, 0))?
+                        crate::leases::breaking(c, 1, |c| {
+                            crate::inotify::unnoticed(|| c.files.fs().open(&p, 1, 0))
+                        })?
                     }
                 }
             };
-            if a[1] > i64::MAX as u64 {
-                return Err(Errno::EINVAL);
-            }
             // Growing a file past RLIMIT_FSIZE raises SIGXFSZ (inode_newsize_ok).
             if a[1] > c.group.fsize() && f.stat()?.size < a[1] {
                 crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
@@ -7839,7 +7841,9 @@ fn open_path(
             let key = (device(c, p), node.inode);
             return Ok((crate::fifo::open(c, p, key, &node, flags)?, p.to_vec()));
         }
-        let file = match c.files.fs().open(p, flags, mode & !c.files.umask()) {
+        let file = match crate::leases::breaking(c, flags, |c| {
+            c.files.fs().open(p, flags, mode & !c.files.umask())
+        }) {
             // A link on the way to a file the kernel generates.
             Err(e) => {
                 let target = generated_target(c, p, flags & O_NOFOLLOW == 0, e)?;
@@ -7898,12 +7902,19 @@ fn reopen_descriptor(
     {
         // An open for writing counts as a writer, as through
         // `do_dentry_open`, unlike `memfd_create`'s own descriptor.
-        let file = crate::page_cache::CoherentFile::with_device(
-            memfd.reopen(flags)?,
-            Arc::clone(&c.files.caches),
-            crate::memfd::device(memfd),
-        )
-        .writing(flags)?;
+        let device = crate::memfd::device(memfd);
+        let file = crate::leases::breaking(c, flags, |c| {
+            let caches = &c.files.caches;
+            if crate::leases::any(caches) {
+                crate::leases::check(caches, (device, memfd.stat()?.inode), flags)?;
+            }
+            crate::page_cache::CoherentFile::with_device(
+                memfd.reopen(flags)?,
+                Arc::clone(caches),
+                device,
+            )
+            .writing(flags)
+        })?;
         return Ok((Arc::new(file), Vec::new()));
     }
     let is_pidfd = d
@@ -7941,11 +7952,15 @@ fn reopen_descriptor(
         // process's root or mount namespace) is not this one's to open:
         // the link leads to the file itself.
         _ if !std::ptr::addr_eq(Arc::as_ptr(&h.fs), Arc::as_ptr(&c.files.fs())) => {
-            Ok((d.file.reopen(flags)?, d.path.clone()))
+            let file = crate::leases::breaking(c, flags, |_| d.file.reopen(flags))?;
+            Ok((file, d.path.clone()))
         }
         _ => match current_path_in(&*h.fs, &d, stat.inode) {
             Some(path) => open_path(c, &path, flags, mode),
-            None => Ok((d.file.reopen(flags)?, d.path.clone())),
+            None => {
+                let file = crate::leases::breaking(c, flags, |_| d.file.reopen(flags))?;
+                Ok((file, d.path.clone()))
+            }
         },
     }
 }

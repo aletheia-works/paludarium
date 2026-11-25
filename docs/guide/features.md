@@ -606,7 +606,16 @@ kernel.
   same description changes the lease's type. A lease taken gives the
   description an owner if it has none, and `F_UNLCK` takes the owner and
   the `F_SETSIG` signal away (`f_delown`); `F_UNLCK` with no lease is
-  `EAGAIN`. `F_GETLEASE` gives the description's lease type, or `F_UNLCK`.
+  `EAGAIN`. `F_GETLEASE` gives the description's lease type (the one it is
+  to become, while it is being broken), or `F_UNLCK`. An open or a
+  `truncate` that conflicts with a lease breaks it as `__break_lease` does,
+  the opener's own leases too: an open for reading only a write lease, which
+  is to become a read lease, and any other both kinds, which are to go. The
+  break signals the holder once (`SIGIO`, or the `F_SETSIG` signal with
+  `POLL_MSG`), and the opener waits for the holder, its access counted
+  already; a wait of `/proc/sys/fs/lease-break-time` seconds (0 or less has
+  no end) downgrades or removes the lease itself, `O_NONBLOCK` gives
+  `EWOULDBLOCK` instead, and a signal ends the wait (`ERESTARTSYS`).
   `/proc/sys/fs/leases-enable` (1 at first) and `/proc/sys/fs/lease-break-time`
   (45 at first) are root's files of mode 0644, which take any `int`
   (`proc_dointvec`).
@@ -4159,9 +4168,25 @@ kernel.
   now is `EPERM`, though the open let it, and `unprivileged_bpf_disabled`
   asks the writer, not the opener, for `CAP_SYS_ADMIN`. Only a write that
   sets `shm_rmid_forced` removes orphans, as Linux master's handler; 7.0's
-  did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
-  `/proc/sys` lists its entries by name, as Linux's tree of them keeps
-  them.
+  did so at a read of it set too. `/proc/sys/kernel` lists only these and the
+  six below, and each directory of `/proc/sys` lists its entries by name, as
+  Linux's tree of them keeps them.
+
+- `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
+  `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`
+  (root's, mode 0444) and `hostname` and `domainname` (0644), each what
+  `uname` gives and a newline; a personality, which changes what `uname`
+  gives, does not change them. The namespace is that of the thread that
+  reads or writes, not of the one that opened the file, and a file of that
+  name that `--mount` gives does not show. Only root (user ID 0 outside any
+  user namespace) may open `hostname` and `domainname` to write (`EACCES`),
+  with or without `CAP_SYS_ADMIN`, and a write is checked again (`EPERM`);
+  the root of a user namespace has `sethostname` alone. They are strings
+  (`proc_dostring`): a read goes on from where the file is, and a write is
+  taken whole, its bytes up to a NUL or newline put at its offset, 64 in all
+  at most, with a NUL after them. The bytes of the old name past that NUL
+  stay, and `uname` gives them too, where `sethostname` clears them. A write
+  past the end of the name changes nothing.
 
 - `/proc/sys/vm` has `drop_caches` and `unprivileged_userfaultfd` alone, so
   its listing differs from Linux's, which has the rest of the `vm` sysctls
@@ -4434,7 +4459,8 @@ kernel.
   It is the reader's own
   or one it may attach to (`mm_access` with `PTRACE_MODE_ATTACH` and the
   filesystem IDs: `EACCES`), and a task with no memory (a zombie) is
-  `ESRCH`.
+  `ESRCH`. It cannot be mapped, nor can `pagemap` or `clear_refs`
+  (`ENODEV`).
 
 - `/proc/<pid>/clear_refs` (mode 0200, size 0, a thread's too), as Linux's
   `clear_refs_write`: a write's first 12 bytes at most, which is what it
@@ -5862,8 +5888,19 @@ kernel.
   process attach, and another value, taken as an `int`, names a task in the
   caller's PID namespace (`EINVAL` for none) whose process, and its
   descendants, may attach while that task is there. It is the process's,
-  whichever thread sets it, and a child does not inherit it. Other options
-  give `EINVAL`.
+  whichever thread sets it, and a child does not inherit it.
+  `PR_SET_VMA` with `PR_SET_VMA_ANON_NAME` names anonymous memory, as
+  Linux's `set_anon_vma_name` does: a name of up to 80 bytes with its NUL
+  (`EINVAL` past them, `EFAULT` where it cannot be read), of printable
+  ASCII but `` \`$[] `` (`EINVAL`), or none to clear it, from a
+  page-aligned start (`EINVAL`) over a size rounded up to pages. Each VMA
+  of the range takes it, split where the range starts and ends within it
+  with its lock and `userfaultfd` kept, a file's mapping ending it with
+  `EBADF` and a hole with `ENOMEM` once the rest has it. `/proc/<pid>/maps`
+  and `smaps` show it as `[anon:<name>]`, and as `[anon_shmem:<name>]` for
+  shared anonymous memory, the heap and the stack keeping their own names;
+  VMAs of different names do not merge, and a `fork`ed child keeps them.
+  Other options give `EINVAL`.
 
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,

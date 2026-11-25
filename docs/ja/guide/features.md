@@ -530,7 +530,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   です。同じ記述からもう一度頼むと、リースの種類が変わります。リースを取ると、持ち主の
   ない記述は呼んだプロセスを持ち主にし、`F_UNLCK` は持ち主と `F_SETSIG` のシグナルを
   外します（`f_delown`）。リースがないときの `F_UNLCK` は `EAGAIN` です。`F_GETLEASE` は
-  その記述のリースの種類か `F_UNLCK` を返します。`/proc/sys/fs/leases-enable`（最初は 1）と
+  その記述のリースの種類（破られている間は、これからなる種類）か `F_UNLCK` を返します。
+  リースとぶつかる open や `truncate` は、`__break_lease` と同じくリースを破ります。開く側
+  自身のリースも破ります。読み込みだけの open は書き込みのリースを破って読み込みのリースに
+  させ、ほかはどちらのリースも破って外させます。破るときは持ち主に一度だけシグナル
+  （`SIGIO` か、`F_SETSIG` のシグナルと `POLL_MSG`）を送り、開く側は、読み書きの数に
+  先に数えられてから持ち主を待ちます。`/proc/sys/fs/lease-break-time` 秒（0 以下なら
+  終わりはありません）待つと、リースを読み込みのリースにするか外します。`O_NONBLOCK` なら
+  待たずに `EWOULDBLOCK` で、シグナルは待ちを終わらせます（`ERESTARTSYS`）。
+  `/proc/sys/fs/leases-enable`（最初は 1）と
   `/proc/sys/fs/lease-break-time`（最初は 45）は root のモード 0644 のファイルで、どの `int`
   も受け取ります（`proc_dointvec`）。
 
@@ -3592,8 +3600,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `unprivileged_bpf_disabled` は開いた者ではなく書き手に `CAP_SYS_ADMIN` を求めます。
   孤児を消すのは `shm_rmid_forced` を設定する書き込みだけで、Linux master の
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
-  `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
+  `/proc/sys/kernel` にあるのはこれらと次の 6 つだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+
+- `/proc/sys/kernel` には、Linux の `kernel/utsname_sysctl.c` と同じく、UTS 名前空間の名前も
+  あります。`arch`、`ostype`、`osrelease`、`version`（root のモード 0444）と、`hostname`、
+  `domainname`（0644）で、それぞれ `uname` が答えるものと改行です。`uname` の答えを変える
+  personality は、これらを変えません。名前空間は、ファイルを開いた者ではなく、読み書きする
+  スレッドのもので、`--mount` が与える同じ名前のファイルは見えません。`hostname` と
+  `domainname` を書くために開けるのは root（どのユーザー名前空間の外でもユーザー ID が 0）
+  だけで（`EACCES`）、`CAP_SYS_ADMIN` の有無は問わず、書き込みのときにもう一度確かめます
+  （`EPERM`）。ユーザー名前空間の root にできるのは `sethostname` だけです。これらは文字列です
+  （`proc_dostring`）。読み込みはファイルの位置から続きます。書き込みは全体を受け取り、NUL か
+  改行までのバイトをそのオフセットに、全部で 64 バイトまで置き、その後ろに NUL を置きます。
+  その NUL より後ろには前の名前のバイトが残り、`uname` もそれを答えます。`sethostname` は
+  それを消します。名前の終わりより後ろへの書き込みは何も変えません。
 
 - `/proc/sys/vm` にあるのは `drop_caches` と `unprivileged_userfaultfd` だけなので、
   ほかの `vm` の sysctl もある Linux とは一覧が違います。`unprivileged_userfaultfd` は
@@ -3829,7 +3850,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   制限事項を参照）。開くとそのときのタスクのメモリを取ってそれを持ち続けるので、
   `execve` やタスクの終わりの後は、そのメモリがなくなり何も動きません。読み手自身のメモリか、アタッチできるタスクの
   もの（`PTRACE_MODE_ATTACH` とファイルシステムの ID での `mm_access`。`EACCES`）で、
-  メモリのないタスク（ゾンビ）は `ESRCH` です。
+  メモリのないタスク（ゾンビ）は `ESRCH` です。これも、`pagemap` と `clear_refs` も、
+  マップはできません（`ENODEV`）。
 
 - `/proc/<pid>/clear_refs`（モード 0200、大きさ 0。スレッドのものも）は、Linux の
   `clear_refs_write` と同じく、書き込みの先頭の多くて 12 バイト（書き込みはこれを返します）を、
@@ -5037,6 +5059,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセスもアタッチできるようになります。ほかの値は `int` として、呼び出し元の PID 名前空間の
   タスクを指します（なければ `EINVAL`）。そのタスクがある間、そのプロセスとその子孫が
   アタッチできます。どのスレッドが設定してもプロセスのもので、子には受け継がれません。
+  `PR_SET_VMA` の `PR_SET_VMA_ANON_NAME` は、Linux の `set_anon_vma_name` と同じく無名メモリに
+  名前を付けます。名前は NUL まで含めて 80 バイトまで（超えると `EINVAL`、読めなければ
+  `EFAULT`）の、`` \`$[] `` を除く表示できる ASCII で（`EINVAL`）、なければ名前を消します。
+  ページ境界の開始アドレス（`EINVAL`）から、ページ単位に切り上げた大きさの範囲の VMA が
+  それぞれ名前を受け取ります。範囲が VMA の途中で始まったり終わったりすればそこで分け、
+  ロックと `userfaultfd` は保ちます。ファイルのマッピングに着くと `EBADF` で、穴があれば
+  ほかに名前を付けてから `ENOMEM` です。`/proc/<pid>/maps` と `smaps` はこれを
+  `[anon:<名前>]`、共有の無名メモリでは `[anon_shmem:<名前>]` と示し、ヒープとスタックは
+  それぞれの名前のままです。名前の違う VMA はまとまらず、`fork` した子も名前を保ちます。
   ほかの指定には `EINVAL` を返します。
 
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって

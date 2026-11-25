@@ -51,7 +51,7 @@ Within mise, `target/release` is on `PATH`.
 |---|---|
 | `mise run test` | Unit tests of every crate (Linux, macOS, Windows) |
 | `mise run test:diff` | Differential tests (x86-64 Linux only) |
-| `mise run test:diff:jit` | The same, with the native JIT compiling every block the first time it runs (x86-64 Linux only) |
+| `mise run test:diff:jit` | The same, with the native JIT in [the suites that use it](docs/design/quality.md#the-native-jit) (x86-64 Linux only) |
 | `mise run coverage` | The core and workspace line-coverage gates of CI; each fails under 80 % (x86-64 Linux) |
 | `mise run fuzz <target> [--seconds N]` | One target in `fuzz/fuzz_targets/` with the nightly's settings (x86-64 Linux) |
 | `mise run deny` | `cargo deny --locked check` |

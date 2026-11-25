@@ -113,7 +113,7 @@ fn it_tells_spaces_apart_whatever_their_layout() {
 fn it_counts_another_space_s_writes_to_shared_memory() {
     let parent = space();
     parent.mark_shared(GuestAddr(CODE), PAGE_SIZE).unwrap();
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     let before = cached(&parent);
     child.write(GuestAddr(CODE), &[0xc3]).unwrap();
     assert_ne!(cached(&parent), before);
@@ -124,7 +124,7 @@ fn it_reads_another_space_afresh() {
     let first = space();
     first.write(GuestAddr(CODE), &[0x90]).unwrap();
     cached(&first);
-    let second = first.fork();
+    let second = first.fork().unwrap();
     second.write(GuestAddr(CODE), &[0xc3]).unwrap();
     cached(&second);
     cached(&AddressSpace::new());
@@ -154,7 +154,7 @@ fn it_takes_no_lock_while_the_space_is_not_borrowed_mutably() {
 fn it_ignores_another_space_s_writes_to_shared_data() {
     let parent = space();
     parent.mark_shared(GuestAddr(DATA), PAGE_SIZE).unwrap();
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     let before = cached(&parent);
     // Neither space may run code from the page, so nothing decoded is stale.
     child.write(GuestAddr(DATA), &[0xc3]).unwrap();
@@ -165,7 +165,7 @@ fn it_ignores_another_space_s_writes_to_shared_data() {
 fn it_counts_shared_memory_made_executable_later() {
     let mut parent = space();
     parent.mark_shared(GuestAddr(DATA), PAGE_SIZE).unwrap();
-    let child = parent.fork();
+    let child = parent.fork().unwrap();
     cached(&parent);
     parent
         .protect(GuestAddr(DATA), PAGE_SIZE, Prot::READ_EXEC)
@@ -273,7 +273,7 @@ fn a_copy_of_fetched_code_keeps_its_mark() {
             parent.write(GuestAddr(CODE), &[0x90]).unwrap();
         }
         fetch(&parent, CODE);
-        let child = parent.fork();
+        let child = parent.fork().unwrap();
         // A VMA never written has no `anon_vma`: the child gets none of its
         // page tables, as Linux's `vma_needs_copy`, and fetches the page
         // again before running it.

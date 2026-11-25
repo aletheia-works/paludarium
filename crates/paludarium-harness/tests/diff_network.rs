@@ -97,7 +97,8 @@ mod linux {
         .with_network(policy);
         let host = Arc::new(RecordingHost::new());
         host.enable_network();
-        let session = Session::new(config, host.clone()).unwrap();
+        let session =
+            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap()).unwrap();
         let start = Instant::now();
         let status = session.run().unwrap();
         Outcome {
@@ -313,7 +314,8 @@ mod linux {
         .with_file("/network", bytes);
         let host = Arc::new(RecordingHost::new());
         host.enable_network();
-        let session = Session::new(config, host.clone()).unwrap();
+        let session =
+            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap()).unwrap();
         session.run().unwrap();
         assert_eq!(host.stdout(), b"socket failed errno=97\n");
     }

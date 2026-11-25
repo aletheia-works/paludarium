@@ -2190,7 +2190,7 @@ mod tests {
             ]
         );
         // `fork` shares the written page until either writes it.
-        let child = mem.fork();
+        let child = mem.fork().unwrap();
         assert_eq!(pagemap_entries(&file, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
         let theirs = PagemapFile::open(child.view(), 0, Arc::default());
         assert_eq!(pagemap_entries(&theirs, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
@@ -2253,7 +2253,7 @@ mod tests {
         // Each page `fork` copies keeps its bit.
         assert_eq!(clear.write(b"4"), Ok(1));
         mem.write(GuestAddr(0x11000), b"z").unwrap();
-        let child = mem.fork();
+        let child = mem.fork().unwrap();
         let theirs = PagemapFile::open(child.view(), 0, Arc::default());
         assert_eq!(
             pagemap_entries(&theirs, 0x10000, 3)

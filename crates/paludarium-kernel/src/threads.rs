@@ -342,14 +342,7 @@ impl ThreadGroup {
         if self.traced() {
             return false;
         }
-        // SIGCHLD, SIGCONT, SIGURG and SIGWINCH are ignored by default, and
-        // SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU stop; SIGQUIT, SIGILL,
-        // SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ and
-        // SIGSYS dump a core, which their taker starts.
-        const NOT_AT_SEND: [i32; 18] = [
-            17, 18, 23, 28, 19, 20, 21, 22, 3, 4, 5, 6, 7, 8, 11, 24, 25, 31,
-        ];
-        if !(1..=64).contains(&number) || NOT_AT_SEND.contains(&number) || self.is_stopped() {
+        if !signals::kills_at_send(number) || self.is_stopped() {
             return false;
         }
         let default = self
@@ -1152,8 +1145,16 @@ impl ThreadGroup {
     pub(crate) fn timer_generation(&self) -> u64 {
         self.timer_generation.load(Ordering::SeqCst)
     }
+    /// [`Self::expire_due`], whose signals `local` then takes in with the
+    /// process's others.
     pub(crate) fn expire_timer(&self, local: &mut ThreadState, now: u64) {
-        self.discards.apply(local);
+        local.timer = self.expire_due(now);
+        local.posix_deadline = self.posix_deadline();
+        self.drain_process(local);
+    }
+    /// Queues the signals of the process's timers due at `now`, for its
+    /// threads to take in; its interval timer after it.
+    pub(crate) fn expire_due(&self, now: u64) -> signals::RealTimer {
         self.expire_cpu_timers();
         self.expire_watchers();
         // The CPU times of the process and its live threads, taken before
@@ -1173,42 +1174,39 @@ impl ThreadGroup {
                 .collect();
             (process, threads)
         });
-        {
-            let mut pending = self
-                .process_pending
+        let mut pending = self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        signals::expire_timer(&mut pending, now);
+        let mut timers = self.timers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut directed = timers.expire(&mut pending, now);
+        if let Some((process, threads)) = &cpu {
+            directed.extend(
+                timers.expire_cpu(&mut pending, *process, |tid| threads.get(&tid).copied()),
+            );
+            self.posix_cpu_armed
+                .store(timers.cpu_armed(), Ordering::SeqCst);
+        }
+        drop(timers);
+        let timer = pending.timer;
+        drop(pending);
+        // A thread that has exited loses its timer's signal, as on Linux.
+        for (tid, signal) in directed {
+            let inbox = self
+                .members
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            signals::expire_timer(&mut pending, now);
-            let mut timers = self.timers.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut directed = timers.expire(&mut pending, now);
-            if let Some((process, threads)) = &cpu {
-                directed.extend(
-                    timers.expire_cpu(&mut pending, *process, |tid| threads.get(&tid).copied()),
-                );
-                self.posix_cpu_armed
-                    .store(timers.cpu_armed(), Ordering::SeqCst);
-            }
-            drop(timers);
-            local.timer = pending.timer;
-            drop(pending);
-            // A thread that has exited loses its timer's signal, as on Linux.
-            for (tid, signal) in directed {
-                let inbox = self
-                    .members
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&tid)
+                .cloned();
+            if let Some((id, overrun)) = inbox.and_then(|inbox| inbox.send_timer(signal)) {
+                self.timers
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .get(&tid)
-                    .cloned();
-                if let Some((id, overrun)) = inbox.and_then(|inbox| inbox.send_timer(signal)) {
-                    self.timers
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .set_overrun(id, overrun);
-                }
+                    .set_overrun(id, overrun);
             }
         }
-        local.posix_deadline = self.posix_deadline();
-        self.drain_process(local);
+        timer
     }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
         inbox.attach(Arc::clone(&self.discards), Arc::clone(&self.arrivals));
@@ -2080,11 +2078,8 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let fatal = |number: i32| {
-            number == 9
-                || (1..=64).contains(&number)
-                    && mask & (1u64 << (number - 1)) == 0
-                    && actions.get(&number).map_or(0, |a| a.handler) == 0
-                    && !matches!(number, 17..=23 | 28)
+            let action = actions.get(&number).copied().unwrap_or_default();
+            signals::fatal(number, mask, action)
         };
         if self
             .process_pending

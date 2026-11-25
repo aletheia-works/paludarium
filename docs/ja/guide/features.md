@@ -4239,7 +4239,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   そこで止めます。`getitimer` は Linux の `itimer_get_remtime` と同じく、残りの時間を
   マイクロ秒に切り捨てて返します。設定中で時間が来たタイマーは 1 µs、残りが 1 µs に満たない
   タイマーは 0 と見せます。`alarm` は Linux の `alarm_setitimer` と同じく、間隔なしの秒単位で
-  設定し、残っていた秒数を四捨五入して返します（設定中だったなら少なくとも 1）。
+  設定し、残っていた秒数を四捨五入して返します（設定中だったなら少なくとも 1）。シグナルで終わる
+  待ちは、`wait4` と `waitid` のものも含め、タイマーのシグナルが来ると終わります。致命的なシグナル
+  だけで終わる待ち（`vfork` の親、fanotify の許可イベント、`WAIT_KILLABLE_RECV` の seccomp の
+  リスナー、`userfaultfd` へのカーネル自身の待ち）も、タイマーのものなら終わりますが、コアを
+  ダンプするシグナルでは終わりません（`complete_signal` はそれ以外を `SIGKILL` にします）。
 
 - プロセスの CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は、Linux の
   `check_cpu_itimer` と同じく、プロセスのスレッドが合わせてその時間を使うと、カーネルから

@@ -311,6 +311,40 @@ mod process {
             Errno::EINVAL.to_syscall_return()
         );
     }
+    /// A wait for a child, `waitid`'s (`WEXITED`) too, ends as the interval
+    /// timer expires.
+    #[test]
+    fn a_timer_ends_a_wait_for_a_child() {
+        use paludarium_host::ClockId;
+        for (n, a) in [(61, [u64::MAX, 0, 0, 0, 0, 0]), (247, [0, 0, 0, 4, 0, 0])] {
+            let host = Arc::new(paludarium_host::testing::RecordingHost::new());
+            let mut k = Kernel::new(Arc::clone(&host) as Arc<dyn paludarium_host::Host>);
+            let mut t = Thread::new(
+                1,
+                CpuState::new(GuestAddr(0x400000), GuestAddr(DATA + PAGE_SIZE)),
+            );
+            let m = AddressSpace::new();
+            let _child = fork(&mut k, &mut t, &m);
+            let now = paludarium_host::Host::clock(&*host, ClockId::Monotonic).unwrap();
+            let deadline = now + 25_000_000;
+            k.group.set_timer(signals::RealTimer {
+                deadline: Some(deadline),
+                interval: 0,
+            });
+            t.cpu.gpr[reg::RAX] = n;
+            for (register, value) in [reg::RDI, reg::RSI, reg::RDX, reg::R10, reg::R8, reg::R9]
+                .into_iter()
+                .zip(a)
+            {
+                t.cpu.gpr[register] = value;
+            }
+            let rip = t.cpu.rip;
+            let next = k.handle(&mut t, &m, ExitReason::Syscall { rip });
+            assert_eq!(next, Next::Exit(ExitStatus::Signaled(14)));
+            let now = paludarium_host::Host::clock(&*host, ClockId::Monotonic).unwrap();
+            assert!((deadline..deadline + 10_000_000).contains(&now));
+        }
+    }
     #[test]
     fn timer_on_another_process_cpu_clock() {
         use paludarium_host::ClockId;

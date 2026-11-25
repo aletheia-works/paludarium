@@ -4912,7 +4912,12 @@ kernel.
   whose time is up shows 1 µs, and one with less than 1 µs left shows 0.
   `alarm` sets it to whole seconds with no interval and returns the seconds
   that were left, rounded to the nearest and at least 1 while it was armed,
-  as Linux's `alarm_setitimer`.
+  as Linux's `alarm_setitimer`. Any wait a signal ends, `wait4`'s and
+  `waitid`'s too, ends as a timer's signal comes. The waits only a fatal
+  signal ends (a `vfork` parent's, a fanotify permission event's, a seccomp
+  listener's with `WAIT_KILLABLE_RECV` and the kernel's own for a
+  `userfaultfd`) end for a timer's too, but not for a signal that dumps core
+  (`complete_signal` makes the others `SIGKILL`).
 
 - The interval timers of the process's CPU time, `ITIMER_VIRTUAL` and
   `ITIMER_PROF`, send `SIGVTALRM` and `SIGPROF` from the kernel

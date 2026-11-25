@@ -1431,7 +1431,7 @@ impl Kernel {
             {
                 self.processes.traces.lock().remove(&child);
             }
-            return self.wait_vfork(kill);
+            return self.wait_vfork(thread, kill);
         }
         let tid = thread.tid;
         let number = |kernel: &Self, child: u32| {
@@ -1451,7 +1451,7 @@ impl Kernel {
             let message = number(self, child);
             self.ptrace_event(thread, event, message);
         }
-        self.wait_vfork(kill)?;
+        self.wait_vfork(thread, kill)?;
         if let Some(Cloned {
             flags,
             child: Some(child),

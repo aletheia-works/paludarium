@@ -217,11 +217,13 @@ mod linux {
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, the file-leases case, which writes
             // fs.leases-enable and fs.lease-break-time and becomes an
-            // unprivileged user, as the emulator's guest starts as root.
+            // unprivileged user, and the timer-waits case, which makes a
+            // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
                     | "file-leases"
+                    | "timer-waits"
                     | "proc-mem"
                     | "permissions"
                     | "setuid"
@@ -1062,6 +1064,7 @@ mod linux {
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
+        processes_timer_waits => ("timer-waits","timer-waits"),
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),

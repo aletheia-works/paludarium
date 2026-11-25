@@ -449,6 +449,7 @@
     {"name":"ignored-signal-wait","binary":"process"},
     {"name":"mmsg","binary":"process"},
     {"name":"itimer","binary":"process"},
+    {"name":"timer-waits","binary":"timer-waits"},
     {"name":"cpu-itimer","binary":"process"},
     {"name":"rlimit-cpu","binary":"process"},
     {"name":"cpu-timer","binary":"process"},

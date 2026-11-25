@@ -30,6 +30,7 @@ use paludarium_cpu::{CpuState, reg};
 use paludarium_host::ClockId;
 use paludarium_host::FileHandle;
 use paludarium_mmu::AddressSpace;
+use paludarium_mmu::faults::At;
 use paludarium_types::{GuestAddr, USER_ADDRESS_LIMIT};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -530,7 +531,7 @@ impl Event {
             .unwrap_or(u64::MAX);
         // What it gives in order, each in user mode or in the kernel, with
         // the address of its fault.
-        let mut fires: Vec<(Fire, bool, u64)> = Vec::new();
+        let mut fires: Vec<(Fire, bool, At)> = Vec::new();
         let (stopped, unused) = {
             let mut sampler = lock(&self.sampler);
             let freq = sampler.freq();
@@ -557,7 +558,7 @@ impl Event {
                 };
                 let ended = sampler.ticks(new[0] + new[1], per_tick, limit, &mut ticks);
                 if !exclude {
-                    fires.extend(ticks.into_iter().map(|fire| (fire, true, 0)));
+                    fires.extend(ticks.into_iter().map(|fire| (fire, true, At::default())));
                 }
                 ended
             } else {
@@ -612,7 +613,7 @@ impl Event {
         let mut woken = false;
         let mut address = None;
         // The samples of one period and address are alike: written together.
-        for (fire, user_mode, addr) in fires {
+        for (fire, user_mode, at) in fires {
             let (period, copies) = match fire {
                 Fire::Samples(period, copies) => (period, copies),
                 Fire::Throttle | Fire::Unthrottle => {
@@ -623,9 +624,9 @@ impl Event {
             overflows += copies;
             // `pending_addr`: the first overflow's, until the thread
             // returns to its code.
-            address.get_or_insert(addr);
+            address.get_or_insert(at.addr);
             if let Some(rb) = &rb {
-                let (record, spill) = self.sample(task, user_mode, period, addr);
+                let (record, spill) = self.sample(task, user_mode, period, at);
                 let trailer = top.id_sample(task);
                 woken |= rb.output(&top, &record, &spill, copies, &trailer, wakeup_events);
             }
@@ -657,14 +658,14 @@ impl Event {
         overflows: &[Overflow],
         kernel: bool,
         (counted, n): (u64, u64),
-        out: &mut Vec<(Fire, bool, u64)>,
+        out: &mut Vec<(Fire, bool, At)>,
     ) {
         if !self.shows_address() {
             let mut fires = Vec::new();
             for overflow in overflows {
                 push(&mut fires, Fire::Samples(overflow.period, overflow.n));
             }
-            out.extend(fires.into_iter().map(|fire| (fire, !kernel, 0)));
+            out.extend(fires.into_iter().map(|fire| (fire, !kernel, At::default())));
             return;
         }
         let addresses = match &self.target {
@@ -678,7 +679,7 @@ impl Event {
             let runs = if overflow.each { overflow.n } else { 1 };
             for i in 0..runs {
                 let at = usize::try_from(overflow.at + i).unwrap_or(usize::MAX);
-                let address = addresses.get(at).copied().unwrap_or(0);
+                let address = addresses.get(at).copied().unwrap_or_default();
                 let copies = if overflow.each { 1 } else { overflow.n };
                 out.push((Fire::Samples(overflow.period, copies), !kernel, address));
             }
@@ -865,8 +866,8 @@ impl Event {
         }
     }
     /// `perf_prepare_sample` and `perf_output_sample`: a sample of `task`,
-    /// in user mode or in the kernel, of `period` and, for a fault, of its
-    /// `address`. Past the record come
+    /// in user mode or in the kernel, of `period` and, for a `fault`, of where
+    /// it was. Past the record come
     /// the bytes Linux writes beyond the size it gave it: a user stack's
     /// dump of nothing still ends with its dynamic size.
     fn sample(
@@ -874,7 +875,7 @@ impl Event {
         task: &Task<'_>,
         user: bool,
         period: u64,
-        address: u64,
+        fault: At,
     ) -> (Vec<u8>, Vec<u8>) {
         let st = self.attr.sample_type;
         let regs = task.regs;
@@ -899,7 +900,7 @@ impl Event {
             put(&mut out, self.clock_now());
         }
         if st & ADDR != 0 {
-            put(&mut out, address);
+            put(&mut out, fault.addr);
         }
         if st & ID != 0 {
             put(&mut out, self.id);
@@ -996,7 +997,14 @@ impl Event {
             if present { PAGE } else { 0 }
         };
         if st & DATA_PAGE_SIZE != 0 {
-            put(&mut out, page_size(address));
+            // Of a `page-faults` sample, taken before the fault is handled
+            // (`do_user_addr_fault`), and of a `minor-faults` one, after.
+            let size = match (self.attr.config, fault.present) {
+                (super::SW_PAGE_FAULTS, false) => 0,
+                (super::SW_PAGE_FAULTS, true) => PAGE,
+                _ => page_size(fault.addr),
+            };
+            put(&mut out, size);
         }
         if st & CODE_PAGE_SIZE != 0 {
             put(&mut out, page_size(ip));

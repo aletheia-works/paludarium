@@ -2326,21 +2326,30 @@ mod tests {
 
     #[test]
     fn the_latest_faults_keep_their_addresses_by_their_numbers() {
-        use paludarium_mmu::faults::Sink;
+        use paludarium_mmu::faults::{At, Sink};
+        let at = |addr| At {
+            addr,
+            present: addr & 0x1000 != 0,
+        };
+        let addresses = |usage: &crate::Usage, kernel, counted, n| {
+            let found = usage.fault_addresses(kernel, counted, n);
+            assert!(found.iter().all(|&f| f.addr == 0 || f == at(f.addr)));
+            found.iter().map(|f| f.addr).collect::<Vec<_>>()
+        };
         let usage = crate::Usage::default();
         for nth in 1..=5 {
-            usage.fault(false, nth, 0x1000 * nth);
+            usage.fault(false, nth, at(0x1000 * nth));
         }
-        usage.fault(true, 1, 0xf000);
+        usage.fault(true, 1, at(0xf000));
         // The last three of the first four, and those of the kernel's.
-        assert_eq!(usage.fault_addresses(false, 4, 3), [0x2000, 0x3000, 0x4000]);
-        assert_eq!(usage.fault_addresses(true, 1, 1), [0xf000]);
+        assert_eq!(addresses(&usage, false, 4, 3), [0x2000, 0x3000, 0x4000]);
+        assert_eq!(addresses(&usage, true, 1, 1), [0xf000]);
         // One that came before any was told, and those long gone.
-        assert_eq!(usage.fault_addresses(true, 2, 2), [0xf000, 0]);
+        assert_eq!(addresses(&usage, true, 2, 2), [0xf000, 0]);
         for nth in 6..=6000 {
-            usage.fault(false, nth, 0x1000 * nth);
+            usage.fault(false, nth, at(0x1000 * nth));
         }
-        let all = usage.fault_addresses(false, 6000, 6000);
+        let all = addresses(&usage, false, 6000, 6000);
         assert_eq!((all.len(), all[0], all[5999]), (6000, 0, 6000 * 0x1000));
     }
 

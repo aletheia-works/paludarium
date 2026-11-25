@@ -1125,6 +1125,42 @@ static void fault_addresses(void) {
     close(fd);
 }
 
+#define SAMPLE_DATA_PAGE_SIZE (1ULL << 22)
+
+/* The page size of each fault's address: a page-faults sample is taken
+   before the fault is handled (do_user_addr_fault), so that a first touch
+   has no page yet, and a minor-faults one after it (mm_account_fault). */
+static void fault_page_sizes(uint64_t config) {
+    struct attr a = software(config);
+    a.sample_period = 1;
+    a.sample_type = SAMPLE_ADDR | SAMPLE_DATA_PAGE_SIZE;
+    a.flags |= DISABLED;
+    int fd = (int)open_event(&a, 0, -1, -1, 0);
+    void *page = NULL;
+    map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    char *at = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ioctl(fd, IOC_ENABLE, 0);
+    at[8] = 1;
+    sink += (uint64_t)at[4096];
+    at[4096 + 16] = 1;
+    ioctl(fd, IOC_DISABLE, 0);
+    /* The first write, the read of the zero page, and the write to it. */
+    long sizes[3] = {-1, -1, -1};
+    uint64_t head = PAGE_U64(page, 1024);
+    for (uint64_t off = 0; off < head; off += 24) {
+        uint64_t r[3];
+        copy_record(page, 8 * 4096, off, r, 3);
+        uint64_t where = r[1] - (uint64_t)(uintptr_t)at;
+        if (where == 8) sizes[0] = (long)r[2];
+        if (where == 4096) sizes[1] = (long)r[2];
+        if (where == 4096 + 16) sizes[2] = (long)r[2];
+    }
+    say("page sizes of %s: first write %ld read %ld then write %ld", config == 5 ? "minor-faults" : "page-faults",
+        sizes[0], sizes[1], sizes[2]);
+    munmap(page, 9 * 4096);
+    close(fd);
+}
+
 static int case_sample(void) {
     /* Each fault is a sample of the fields asked for, in Linux's order. */
     int fd = open_sampling(SAMPLE_IDENTIFIER | SAMPLE_TID | SAMPLE_PERIOD | SAMPLE_ID | SAMPLE_STREAM_ID, 0);
@@ -1173,6 +1209,8 @@ static int case_sample(void) {
     say("then sample %d", (uint32_t)r[0] == RECORD_SAMPLE);
 
     fault_addresses();
+    fault_page_sizes(2);
+    fault_page_sizes(5);
 
     /* Paused, it takes nothing and counts it lost. */
     PAGE_U64(page, 1032) = PAGE_U64(page, 1024);

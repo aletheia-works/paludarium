@@ -333,11 +333,19 @@ pub mod faults {
         fn kernel(&self) -> &AtomicU64;
         fn forced(&self) -> &AtomicU64;
         /// A fault that made its count `nth`, of the kernel's accesses or
-        /// the thread's own code's, at `addr`, which is told where
+        /// the thread's own code's, `at`, which is told where
         /// [`trace_addresses`] asked for it.
-        fn fault(&self, kernel: bool, nth: u64, addr: u64) {
-            let _ = (kernel, nth, addr);
+        fn fault(&self, kernel: bool, nth: u64, at: At) {
+            let _ = (kernel, nth, at);
         }
+    }
+
+    /// Where a fault was, and whether the page was there before it, as it
+    /// is for a write to one that is to be copied.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct At {
+        pub addr: u64,
+        pub present: bool,
     }
 
     /// Whether the sinks are told the faults' addresses.
@@ -422,8 +430,8 @@ pub mod faults {
     }
 
     /// Adds a fault to the bound sink's count `forced` or not; `false`
-    /// when the host thread is not bound. `addr` is where it was.
-    fn add(forced: bool, addr: u64) -> bool {
+    /// when the host thread is not bound. It was `at` there.
+    fn add(forced: bool, at: At) -> bool {
         SINK.with(|sink| {
             let sink = sink.borrow();
             let Some(counts) = sink.as_ref() else {
@@ -439,22 +447,22 @@ pub mod faults {
             };
             let nth = field.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
             if !forced && ADDRESSES.load(Ordering::Relaxed) {
-                counts.fault(kernel, nth, addr);
+                counts.fault(kernel, nth, at);
             }
             true
         })
     }
 
-    pub(crate) fn count(addr: u64) {
+    pub(crate) fn count(addr: u64, present: bool) {
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
-        } else if !add(false, addr) {
+        } else if !add(false, At { addr, present }) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
     }
 
     pub(crate) fn count_forced() {
-        if !add(true, 0) {
+        if !add(true, At::default()) {
             FORCED.with(|forced| forced.set(forced.get().wrapping_add(1)));
         }
     }
@@ -4623,7 +4631,7 @@ impl AddressSpaceData {
                 if let Some(entry) = table.pages.get_mut(slot) {
                     let missing = entry.is_none();
                     if missing && matches!(access, Access::Read | Access::Fetch) {
-                        faults::count(page + offset as u64);
+                        faults::count(page + offset as u64, false);
                     } else if missing && access == Access::Dump {
                         faults::count_forced();
                     }
@@ -4805,7 +4813,8 @@ impl AddressSpaceData {
                 })
             {
                 if access == Access::Write {
-                    faults::count(page + offset as u64);
+                    let present = table.pages.get(slot).is_some_and(Option::is_some);
+                    faults::count(page + offset as u64, present);
                 } else {
                     faults::count_forced();
                 }

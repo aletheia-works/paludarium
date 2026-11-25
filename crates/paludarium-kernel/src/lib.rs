@@ -260,7 +260,8 @@ pub(crate) struct Usage {
     /// The latest faults of its own code and of the kernel's accesses for
     /// it, by their numbers in the counts and their addresses, once some
     /// `perf` event asks for them.
-    fault_addresses: std::sync::Mutex<[std::collections::VecDeque<(u64, u64)>; 2]>,
+    fault_addresses:
+        std::sync::Mutex<[std::collections::VecDeque<(u64, paludarium_mmu::faults::At)>; 2]>,
     /// It runs on a virtual CPU of `rseq`, which no CPU mask moves.
     pub(crate) virtual_cpu: std::sync::atomic::AtomicBool,
 }
@@ -511,7 +512,12 @@ impl Usage {
     /// The addresses of the latest `n` of its first `counted` faults of its
     /// own code or of the `kernel`'s accesses for it, 0 for one that is not
     /// known.
-    pub(crate) fn fault_addresses(&self, kernel: bool, counted: u64, n: u64) -> Vec<u64> {
+    pub(crate) fn fault_addresses(
+        &self,
+        kernel: bool,
+        counted: u64,
+        n: u64,
+    ) -> Vec<paludarium_mmu::faults::At> {
         let addresses = self
             .fault_addresses
             .lock()
@@ -519,11 +525,12 @@ impl Usage {
         let latest = &addresses[usize::from(kernel)];
         // Those before are gone.
         let known = n.min(FAULT_ADDRESSES as u64);
-        let mut out = vec![0; usize::try_from(n - known).unwrap_or(0)];
+        let mut out =
+            vec![paludarium_mmu::faults::At::default(); usize::try_from(n - known).unwrap_or(0)];
         out.extend((0..known).map(|i| {
             let nth = counted.saturating_sub(known - 1 - i);
             let at = latest.binary_search_by_key(&nth, |&(nth, _)| nth);
-            at.map_or(0, |at| latest[at].1)
+            at.map_or_else(|_| paludarium_mmu::faults::At::default(), |at| latest[at].1)
         }));
         out
     }
@@ -558,7 +565,7 @@ impl paludarium_mmu::faults::Sink for Usage {
     fn forced(&self) -> &std::sync::atomic::AtomicU64 {
         &self.forced_faults
     }
-    fn fault(&self, kernel: bool, nth: u64, addr: u64) {
+    fn fault(&self, kernel: bool, nth: u64, at: paludarium_mmu::faults::At) {
         let mut addresses = self
             .fault_addresses
             .lock()
@@ -567,7 +574,7 @@ impl paludarium_mmu::faults::Sink for Usage {
         if latest.len() == FAULT_ADDRESSES {
             latest.pop_front();
         }
-        latest.push_back((nth, addr));
+        latest.push_back((nth, at));
     }
 }
 /// How many of a thread's latest faults keep their addresses, for the

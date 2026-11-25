@@ -56,8 +56,12 @@ struct answer {
 
 /* The process's real-time timer expires in each kind of wait: its handler set
  * without SA_RESTART (plain), with it (restart), or not at all (default).
- * What ends the wait comes a second after the start, unless the timer's
- * signal ended it before: `ended` tells which. */
+ * Nothing else ends a wait the timer is to end: what would is held back until
+ * the waiter is done, and only a watchdog ends it before, which `ended` tells.
+ * A wait that runs again (restart) ends once the handler ran. One that no
+ * handler ends (a vfork's, and those only a fatal signal ends) is ended 1.5
+ * seconds after the timer is set, which by then has expired, so its `ended` is
+ * 1. The timer goes on every 300 ms, for a waiter that is late to its wait. */
 #define WAITS 33
 #define VFORK 29
 #define UFFD 30
@@ -71,24 +75,40 @@ static const char *const names[WAITS] = {
     "userfaultfd-read", "fanotify-open", "seccomp-killable"};
 struct slot {
     char line[160];
-    volatile int ended, word, ready;
+    volatile int ended, word, ready, armed, fired, told, sent;
 };
-static volatile sig_atomic_t fired;
 static struct slot *slot;
 static int in[2], full[2], pair[2], listener, event, timer, file, sem, queue, watch, signals, poller;
 static int notify = -1;
 static char *page;
 static char path[64], fifo[64];
-static void alarmed(int sig) { (void)sig; fired++; }
+static void alarmed(int sig) { (void)sig; slot->fired = 1; }
 static void other(int sig) { (void)sig; }
 static void ms(long n) {
     struct timespec t = {n / 1000, n % 1000 * 1000000};
     while (nanosleep(&t, &t) && errno == EINTR) {}
 }
+static int way, kind;
+static int killable(int what) { return what >= VFORK; }
+/* Waits for what ends the wait, or for the waiter to be done with it. */
+static void until(void) {
+    int n = 0;
+    while (!slot->armed) ms(1);
+    for (; !slot->told && n < 2400; n++) {
+        if (killable(kind) && way < 2 && n == 300) break;
+        if (!killable(kind) && way == 1 && slot->fired) return;
+        if (kind == VFORK && way == SIGQUIT && slot->sent) {
+            ms(300);
+            break;
+        }
+        ms(5);
+    }
+    if (slot->told) _exit(0);
+    slot->ended = 1;
+}
 static int vforked(void *arg) {
-    ms(900);
-    *(volatile int *)arg = 1;
-    ms(100);
+    (void)arg;
+    until();
     _exit(0);
 }
 static void set_up(int what, int n) {
@@ -150,7 +170,7 @@ static long wait_in(int what) {
     int status;
     siginfo_t info;
     uint64_t value;
-    struct timespec part = {0, 800000000}, two = {2, 0};
+    struct timespec part = {20, 0}, two = {20, 0};
     sigset_t set;
     struct flock lock = {.l_type = F_WRLCK};
     struct sembuf op = {0, -1, 0};
@@ -170,7 +190,7 @@ static long wait_in(int what) {
     case 3: return syscall(SYS_rt_sigsuspend, &set, 8L);
     case 4: return syscall(SYS_nanosleep, &part, NULL);
     case 5: return syscall(SYS_clock_nanosleep, (long)CLOCK_MONOTONIC, 0L, &part, NULL);
-    case 6: return poll(&p, 1, 2000);
+    case 6: return poll(&p, 1, 20000);
     case 7:
         FD_ZERO(&fds);
         FD_SET(in[0], &fds);
@@ -199,8 +219,7 @@ static long wait_in(int what) {
     case 27: return syscall(SYS_semtimedop, sem, &op, 1L, &two);
     case 28: return syscall(SYS_ppoll, &p, 1L, &two, NULL, 0L);
     case VFORK:
-        return clone(vforked, stack + sizeof stack, CLONE_VM | CLONE_VFORK | SIGCHLD,
-                     (void *)&slot->ended) > 0 ? 1 : -1;
+        return clone(vforked, stack + sizeof stack, CLONE_VM | CLONE_VFORK | SIGCHLD, NULL) > 0 ? 1 : -1;
     case UFFD: return read(in[0], page, 1);
     case FANOTIFY: return open(path, O_RDONLY) >= 0 ? 0 : -1;
     case SECCOMP: return syscall(SYS_getppid);
@@ -229,9 +248,8 @@ static void help(int what, pid_t waiter) {
     }
     slot->ready = 1;
     if (what == SECCOMP) ioctl(notify, SECCOMP_IOCTL_NOTIF_RECV, got);
-    ms(900);
-    if (what != VFORK) slot->ended = 1;
-    ms(100);
+    if (what == VFORK) _exit(0);
+    until();
     switch (what) {
     case 2: case 3: kill(waiter, SIGUSR1); break;
     case 6: case 7: case 8: case 9: case 26: case 28: write(in[1], "x", 1); break;
@@ -249,6 +267,7 @@ static void help(int what, pid_t waiter) {
         connect(socket(AF_UNIX, SOCK_STREAM, 0), (void *)&name, length);
         break;
     case 21: write(event, &one, 8); break;
+    case 22: timerfd_settime(timer, 0, &(struct itimerspec){{0, 0}, {0, 1}}, NULL); break;
     case 23: close(open(path, O_WRONLY)); break;
     case 25: close(open(fifo, O_WRONLY)); break;
     case UFFD: {
@@ -265,19 +284,20 @@ static void help(int what, pid_t waiter) {
     _exit(0);
 }
 /* way: 0 plain, 1 restart, 2 default; another is a signal sent instead. */
-static void run(int what, int way, int n) {
+static void run(int what, int n) {
     const char *const ways[] = {"plain", "restart", "default"};
     char sent[16];
     snprintf(sent, sizeof sent, "signal-%d", way);
     const char *how = way < 3 ? ways[way] : sent;
+    kind = what;
     set_up(what, n);
     pid_t waiter = fork();
     if (!waiter) {
         struct rlimit none = {0, 0};
         setrlimit(RLIMIT_CORE, &none);
         if (what == UFFD) register_page();
-        pid_t self = getpid(), helper = fork();
-        if (!helper) help(what, self);
+        pid_t self = getpid();
+        if (!fork()) help(what, self);
         while (!slot->ready) ms(1);
         if (what == SECCOMP) close(notify);
         struct sigaction action = {.sa_handler = other};
@@ -285,43 +305,48 @@ static void run(int what, int way, int n) {
         action.sa_handler = alarmed;
         action.sa_flags = way == 1 ? SA_RESTART : 0;
         if (way < 2) sigaction(SIGALRM, &action, NULL);
-        if (what == 22) timerfd_settime(timer, 0, &(struct itimerspec){{0, 0}, {1, 0}}, NULL);
+        if (what == 22) timerfd_settime(timer, 0, &(struct itimerspec){{0, 0}, {20, 0}}, NULL);
         if (way < 3) {
-            setitimer(ITIMER_REAL, &(struct itimerval){{0, 0}, {0, 200000}}, NULL);
+            setitimer(ITIMER_REAL, &(struct itimerval){{0, 300000}, {0, 600000}}, NULL);
         } else if (!fork()) {
-            ms(200);
+            ms(600);
             kill(self, way);
+            slot->sent = 1;
             _exit(0);
         }
+        slot->armed = 1;
         long r = wait_in(what);
         int error = errno;
         snprintf(slot->line, sizeof slot->line, "%s %s: r=%ld errno=%d fired=%d ended=%d\n", names[what],
-                 how, r, r < 0 ? error : 0, fired, slot->ended);
-        kill(helper, SIGKILL);
+                 how, r, r < 0 ? error : 0, slot->fired, slot->ended);
+        slot->told = 1;
         _exit(0);
     }
     int status;
     waitpid(waiter, &status, 0);
     int ended = slot->ended;
+    slot->told = 1;
     if (WIFSIGNALED(status))
         snprintf(slot->line, sizeof slot->line, "%s %s: killed by %d ended=%d\n", names[what], how,
                  WTERMSIG(status), ended);
     clean_up();
 }
-int main(void) {
-    int count = 3 * WAITS + 2;
+int main(int argc, char **argv) {
+    /* timer-waits-plain, -restart or -default. */
+    const char *mode = argc > 1 ? argv[1] : "";
+    way = strstr(mode, "restart") ? 1 : strstr(mode, "default") ? 2 : 0;
+    int count = way == 2 ? WAITS + 2 : WAITS;
     struct slot *slots = mmap(NULL, count * sizeof *slots, PROT_READ | PROT_WRITE,
                               MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     setvbuf(stdout, NULL, _IOLBF, 0);
     for (int at = 0; at < count;) {
-        int first = at;
-        for (; at < count && at < first + 20; at++) {
+        int end = at + 18;
+        for (; at < count && at < end; at++) {
             slot = &slots[at];
-            /* A fatal signal ends a vfork's wait, but not one that dumps core. */
-            int what = at < 3 * WAITS ? at / 3 : VFORK;
-            int way = at < 3 * WAITS ? at % 3 : at == 3 * WAITS ? SIGTERM : SIGQUIT;
             if (!fork()) {
-                run(what, way, at);
+                /* A fatal signal ends a vfork's wait, but not one that dumps core. */
+                if (at >= WAITS) way = at == WAITS ? SIGTERM : SIGQUIT;
+                run(at < WAITS ? at : VFORK, at);
                 _exit(0);
             }
         }

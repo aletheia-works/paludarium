@@ -6007,10 +6007,11 @@ kernel.
     none on a CPU without XSAVE, which the virtual CPU is. The memory is
     chosen as Linux's `vma_dump_size` chooses it with the default
     `coredump_filter`: a private mapping is there whole once a page of its VMA
-    was written (Linux's `anon_vma`, which a split and `MADV_DONTNEED`
-    keep, a mapping merging with the VMA shares, a `fork`ed child's VMA has
-    its own of, and bringing a writable one's pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault), and nothing of it otherwise, but the
-    first page of a file mapping from the start of an ELF file; a shared
+    was written (Linux's `anon_vma`, which a split and `MADV_DONTNEED` keep,
+    a mapping merging with the VMA shares, and bringing a writable one's
+    pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault;
+    a `fork`ed child's VMAs each get their own), and nothing of it otherwise,
+    but the first page of a file mapping from the start of an ELF file; a shared
     mapping is there whole when no name links its file (an anonymous one, a
     memfd, a file unlinked since), and nothing of it otherwise. Whether a
     mapping can be read matters only for that ELF header's page: Linux reads

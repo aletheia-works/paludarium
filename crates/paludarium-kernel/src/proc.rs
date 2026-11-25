@@ -796,13 +796,15 @@ pub(crate) fn descriptors_stat() -> FileStat {
     }
 }
 /// The `lstat` of a link in `fd`: user permissions for the descriptor's
-/// access (read gives r-x, write -wx), and size 64, as Linux shows them.
-pub(crate) fn link_stat(access: u32) -> FileStat {
+/// access (read gives r-x, write -wx, and `O_PATH` neither), from its
+/// `flags`, and size 64, as Linux shows them.
+pub(crate) fn link_stat(flags: u32) -> FileStat {
     let mut mode = 0o120_000;
-    if access != 1 {
+    let opened = flags & crate::files::O_PATH == 0;
+    if opened && flags & 3 != 1 {
         mode |= 0o500;
     }
-    if access != 0 {
+    if opened && flags & 3 != 0 {
         mode |= 0o300;
     }
     FileStat {
@@ -992,7 +994,7 @@ pub(crate) struct OwnDirectory {
 pub(crate) type LiveOwner = Arc<dyn Fn() -> (u32, u32) + Send + Sync>;
 impl OwnDirectory {
     /// The directory an open with `flags` made, which keeps the open's
-    /// flags that `F_SETFL` changes, as Linux's `f_flags` does.
+    /// flags, as Linux's `f_flags` does.
     pub(crate) fn opened(flags: u32, stat: FileStat) -> Self {
         Self {
             status: crate::files::StatusFlags::opened(flags),
@@ -1048,7 +1050,7 @@ impl FileHandle for OwnDirectory {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        self.status.of(0o200000)
+        self.status.of(0)
     }
     /// `F_SETFL`, as Linux's `setfl`.
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
@@ -3021,6 +3023,7 @@ mod descriptor_tests {
         }
         assert_eq!(link_stat(0).mode, 0o120_500);
         assert_eq!(link_stat(2).mode, 0o120_700);
+        assert_eq!(link_stat(crate::files::O_PATH).mode, 0o120_000);
     }
 }
 

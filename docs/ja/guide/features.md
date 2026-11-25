@@ -490,7 +490,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   開いたファイルと memfd には `O_LARGEFILE` を加えます。`O_PATH` のファイルは
   `O_DIRECTORY`、`O_NOFOLLOW`、`O_PATH` だけを持ちます。パイプ、ソケット、カーネル
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
-  除いて `O_LARGEFILE` がありません。
+  除いて `O_LARGEFILE` がありません。`/proc` と `/dev` のファイルも、開いたときの
+  `O_DIRECTORY`、`O_NOFOLLOW`、`O_SYNC` を持ち、ディレクトリでないものに `O_DIRECTORY` を
+  付けると `ENOTDIR` です。
   `F_SETFL` が変えるのは `O_APPEND`、`O_NONBLOCK`、`O_DIRECT`、`O_NOATIME` と、
   シグナルを送れるファイルでの `O_ASYNC` だけで、アクセスモードとほかのフラグは
   Linux の `setfl` と同じく残ります。
@@ -501,7 +503,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
   `select` はどの集合でも準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
-  `close` は受け付け、`*at` の呼び出しではディレクトリになります。
+  `close` は受け付け、`*at` の呼び出しではディレクトリになります。これを付けて開くときに効く
+  フラグは `O_DIRECTORY`、`O_NOFOLLOW`、`O_CLOEXEC` だけです（`build_open_how`）。アクセス
+  モードは何も求めず（`EISDIR`、`EROFS`、`ETXTBSY`、`EACCES` になりません）、`O_CREAT` と
+  `O_TRUNC` は何もしません。
 
 - `O_DIRECT` と `O_NOATIME` は、Linux の `open` と `F_SETFL` と同じく確かめます。
   `O_DIRECT` には、ディスクのファイルシステムか tmpfs の通常のファイル、またはパスで開き直した
@@ -4035,7 +4040,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `/proc/self/fd`（モード 0500。大きさは Linux の `proc_fd_getattr` と同じく開いている
   ディスクリプタの数）は、`.`、`..` と、開いているディスクリプタごとのリンクを並べます。名前は番号で、Linux と同じく先頭に 0 のない形で読みます。各リンクの
-  `lstat` は、ユーザーのビットでディスクリプタのアクセスを示し、大きさは 64 です。`stat`
+  `lstat` は、ユーザーのビットでディスクリプタのアクセスを示し（`O_PATH` ではなし）、大きさは 64 です。`stat`
   はリンクをたどってファイルを示します。`readlink` は Linux と同じ名前を返します。
   `.`、`..` とシンボリックリンクを解決したファイルのパス（このプロセスのものは
   `/proc/<pid>/…`、procfs のルートは `/proc`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに

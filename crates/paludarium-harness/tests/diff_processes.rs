@@ -225,6 +225,7 @@ mod linux {
                     | "file-leases"
                     | "proc-mem"
                     | "chroot-names"
+                    | "path-flags"
                     | "permissions"
                     | "setuid"
                     | "signal-permissions"
@@ -949,6 +950,7 @@ mod linux {
         processes_exec_names => ("exec-names","process"),
         processes_rename_names => ("rename-names","process"),
         processes_chroot_names => ("chroot-names","process"),
+        processes_path_flags => ("path-flags","process"),
         processes_context_switches => ("context-switches","process"),
         processes_proc_mem => ("proc-mem","process"),
         processes_proc_stat_counts => ("proc-stat-counts","process"),

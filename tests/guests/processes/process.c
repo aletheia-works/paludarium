@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <stddef.h>
 #include <sys/mman.h>
@@ -28063,6 +28064,152 @@ static int setfl_kinds_case(void) {
     return 0;
 }
 
+/* What an open of `path` with O_PATH and `flags` gives: the errno, or its
+   F_GETFL, whether it refuses a read (EBADF) and the access its link in
+   /proc/self/fd shows. */
+static void pf_open(const char *path, int flags) {
+    errno = 0;
+    int fd = open(path, O_PATH | flags, 0600);
+    if (fd < 0) {
+        printf(" e%d", errno);
+        return;
+    }
+    char link[64], byte;
+    struct stat st;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    errno = 0;
+    ssize_t n = read(fd, &byte, 1);
+    int refused = n < 0 ? errno : 0;
+    int shown = lstat(link, &st) ? -1 : (int)(st.st_mode & 0777);
+    printf(" %#o/%d/%o", fcntl(fd, F_GETFL), refused, shown);
+    close(fd);
+}
+/* The path-flags case: O_PATH beats every flag but O_DIRECTORY, O_NOFOLLOW
+   and O_CLOEXEC (build_open_how), so an access mode, O_CREAT, O_TRUNC and
+   the others change nothing of an open with it: no directory is EISDIR, no
+   read-only file system EROFS, no running program ETXTBSY, nothing is made
+   or emptied, no lease breaks and no one is told. */
+static void pf_lease(int signal) { (void)signal; }
+static int path_flags_case(const char *self) {
+    char dir[] = "/tmp/path-flags-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char file[64], missing[64], fifo[64], link[64];
+    snprintf(file, sizeof file, "%s/file", dir);
+    snprintf(missing, sizeof missing, "%s/missing", dir);
+    snprintf(fifo, sizeof fifo, "%s/fifo", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    int fd = open(file, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || write(fd, "data", 4) != 4 || mkfifo(fifo, 0600) || symlink("file", link)) return 81;
+    close(fd);
+    const struct {
+        const char *name;
+        const char *path;
+    } paths[] = {
+        {"file", file},
+        {"missing", missing},
+        {"directory", dir},
+        {"fifo", fifo},
+        {"link", link},
+        {"program", self},
+        {"/proc", "/proc"},
+        {"/proc/self", "/proc/self"},
+        {"/proc/self/fd", "/proc/self/fd"},
+        {"/proc/self/fdinfo", "/proc/self/fdinfo"},
+        {"/proc/self/ns", "/proc/self/ns"},
+        {"/proc/self/task", "/proc/self/task"},
+        {"/proc/1", "/proc/1"},
+        {"/proc/self/status", "/proc/self/status"},
+        {"/proc/self/mem", "/proc/self/mem"},
+        {"/proc/self/clear_refs", "/proc/self/clear_refs"},
+        {"/proc/self/exe", "/proc/self/exe"},
+        {"/proc/self/cwd", "/proc/self/cwd"},
+        {"/proc/uptime", "/proc/uptime"},
+        {"/proc/sys", "/proc/sys"},
+        {"/proc/sys/kernel/ostype", "/proc/sys/kernel/ostype"},
+        {"/proc/sysvipc", "/proc/sysvipc"},
+        {"/dev", "/dev"},
+        {"/dev/null", "/dev/null"},
+        {"/dev/pts", "/dev/pts"},
+        {"/dev/shm", "/dev/shm"},
+        {"/dev/fd", "/dev/fd"},
+        {"/dev/ptmx", "/dev/ptmx"},
+        {"/proc/self/ns/uts", "/proc/self/ns/uts"},
+    };
+    static const int flags[] = {
+        O_WRONLY,        O_RDWR,
+        O_ACCMODE,       O_CREAT,
+        O_CREAT | O_EXCL, O_CREAT | O_DIRECTORY,
+        O_RDWR | O_TRUNC, O_RDWR | O_APPEND | O_NONBLOCK | O_SYNC | O_DIRECT,
+        O_RDWR | O_TMPFILE, O_WRONLY | O_DIRECTORY,
+        O_RDWR | O_NOFOLLOW, O_RDWR | O_CLOEXEC | O_NOATIME,
+    };
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        printf("%s:", paths[i].name);
+        for (size_t j = 0; j < sizeof flags / sizeof flags[0]; j++) pf_open(paths[i].path, flags[j]);
+        putchar('\n');
+    }
+    /* Without O_PATH: a directory keeps the flags of its open, and a file
+       is none (O_DIRECTORY). */
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        if (strncmp(paths[i].path, "/proc", 5) && strcmp(paths[i].path, "/dev") &&
+            strcmp(paths[i].path, "/dev/pts") && strcmp(paths[i].path, "/dev/null"))
+            continue;
+        printf("opened %s:", paths[i].name);
+        static const int plain[] = {O_RDONLY, O_DIRECTORY, O_NONBLOCK | O_CLOEXEC, O_SYNC};
+        for (size_t j = 0; j < sizeof plain / sizeof plain[0]; j++) {
+            errno = 0;
+            int opened = open(paths[i].path, plain[j]);
+            if (opened < 0) {
+                printf(" e%d", errno);
+                continue;
+            }
+            printf(" %#o", fcntl(opened, F_GETFL));
+            close(opened);
+        }
+        putchar('\n');
+    }
+    struct stat st;
+    printf("size=%d missing=%d\n", stat(file, &st) ? -1 : (int)st.st_size, access(missing, F_OK));
+    /* A descriptor's own file, again. */
+    fd = open(file, O_RDONLY);
+    char of[64];
+    snprintf(of, sizeof of, "/proc/self/fd/%d", fd);
+    printf("descriptor:");
+    for (size_t j = 0; j < sizeof flags / sizeof flags[0]; j++) pf_open(of, flags[j]);
+    putchar('\n');
+    /* A lease holds, and inotify sees no open. */
+    signal(SIGIO, pf_lease);
+    int watch = inotify_init1(IN_NONBLOCK);
+    if (watch < 0 || inotify_add_watch(watch, file, IN_ALL_EVENTS) < 0) return 82;
+    printf("lease=%d", fcntl(fd, F_SETLEASE, F_RDLCK));
+    int path = open(file, O_PATH | O_RDWR | O_TRUNC);
+    printf(" open=%d held=%d", path >= 0, fcntl(fd, F_GETLEASE));
+    char events[256];
+    errno = 0;
+    ssize_t n = read(watch, events, sizeof events);
+    printf(" events=%zd errno=%d\n", n, errno);
+    close(path);
+    close(watch);
+    close(fd);
+    /* A read-only mount. */
+    if (unshare(CLONE_NEWNS) || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) ||
+        mount(dir, dir, NULL, MS_BIND, NULL) ||
+        mount(NULL, dir, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL)) {
+        printf("mount errno=%d\n", errno);
+    } else {
+        printf("read-only:");
+        pf_open(file, O_RDWR);
+        pf_open(file, O_WRONLY | O_TRUNC);
+        pf_open(missing, O_CREAT | O_RDWR);
+        putchar('\n');
+        umount(dir);
+    }
+    unlink(file);
+    unlink(fifo);
+    unlink(link);
+    rmdir(dir);
+    return 0;
+}
 int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
@@ -41498,6 +41645,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rename-names")) return rename_names_case();
     if (!strcmp(mode, "rename-names-child")) return rename_names_child();
     if (!strcmp(mode, "vma-names")) return vma_names_case();
+    if (!strcmp(mode, "path-flags")) return path_flags_case(self);
     if (!strcmp(mode, "chroot-names")) return chroot_names_case();
     if (!strcmp(mode, "chroot-names-child")) return chroot_names_child();
     if (!strcmp(mode, "vma-merges")) return vma_merges_case();

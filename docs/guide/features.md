@@ -556,6 +556,9 @@ kernel.
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+  The files of `/proc` and `/dev` keep `O_DIRECTORY`, `O_NOFOLLOW` and
+  `O_SYNC` of their open too, and one that is no directory is `ENOTDIR`
+  with `O_DIRECTORY`.
   `F_SETFL` changes only `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`, `O_NOATIME`
   and, on a file that signals, `O_ASYNC`; the access mode and the other
   flags stay, as Linux's `setfl` keeps them.
@@ -569,7 +572,10 @@ kernel.
   (but for `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_DUPFD_QUERY`, `F_GETFD`,
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
   `select` finds it ready in every set. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
-  take it, and it is a directory for the `*at` calls.
+  take it, and it is a directory for the `*at` calls. Of the flags of an
+  open with it, only `O_DIRECTORY`, `O_NOFOLLOW` and `O_CLOEXEC` count
+  (`build_open_how`): an access mode asks nothing (no `EISDIR`, `EROFS`,
+  `ETXTBSY` or `EACCES`), and `O_CREAT` and `O_TRUNC` do nothing.
 
 - `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`
   check them. `O_DIRECT` needs a regular file of a disk file system or
@@ -4678,7 +4684,7 @@ kernel.
 - `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
   Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
-  link's `lstat` shows the descriptor's access in its user bits and size 64,
+  link's `lstat` shows the descriptor's access in its user bits (none for `O_PATH`) and size 64,
   and `stat` follows it to the file. `readlink` gives Linux's names: the
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries, `/proc` for procfs's root), followed by a space and `(deleted)` once

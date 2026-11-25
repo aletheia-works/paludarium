@@ -101,6 +101,7 @@
     {"name":"smaps-flags","binary":"process"},
     {"name":"madvise-guard","binary":"process"},
     {"name":"grows-down","binary":"process"},
+    {"name":"read-modify-write","binary":"read-modify-write"},
     {"name":"fork-page-tables","binary":"process"},
     {"name":"mrelease","binary":"process"},
     {"name":"mrelease-fatal","binary":"process"},

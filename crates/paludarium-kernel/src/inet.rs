@@ -1271,20 +1271,23 @@ impl Network {
         events.extend(fresh);
         events
     }
-    /// The address a connection or datagram to `to` on the loopback leaves
-    /// from at `now`: its route's preferred source.
-    pub(crate) fn source(&self, to: SocketAddr, now: Option<u64>) -> IpAddr {
-        self.source_through(to, 0, now)
-    }
-    /// [`Self::source`] of a packet through the device `oif` (any for 0):
-    /// for IPv4, as `ip_route_output_key_hash_rcu` takes it with a device
+    /// The address a packet to `to` of the protocol `proto` leaves from at
+    /// `now`, from a socket bound to none, through the device `oif` (any for
+    /// 0): its route's source, of an IPv6 multipath route's the one of the
+    /// hop the packet takes. Through a device, for IPv4, as `ip_route_output_key_hash_rcu` takes it with a device
     /// named, an address of the device's (`inet_select_addr`) of link
     /// scope to a local group or the limited broadcast address, of any
     /// scope to another group, and to an address no route through it
     /// takes, on link; else its route's. For IPv6, its route's through the
     /// device (`ip6_route_get_saddr`), looked up strictly, as no source is
     /// chosen yet.
-    pub(crate) fn source_through(&self, to: SocketAddr, oif: u32, now: Option<u64>) -> IpAddr {
+    pub(crate) fn source_through(
+        &self,
+        to: SocketAddr,
+        oif: u32,
+        proto: u8,
+        now: Option<u64>,
+    ) -> IpAddr {
         use crate::interface::{SCOPE_LINK, SCOPE_UNIVERSE};
         let order = self.devices().order();
         let addresses = self.addresses_at(now);
@@ -1307,7 +1310,8 @@ impl Network {
             }
         }
         if let IpAddr::V6(ip) = to.ip() {
-            return IpAddr::V6(addresses.source6_through(ip, oif, &order));
+            let flow = Self::flow6(None, proto);
+            return IpAddr::V6(addresses.source6_through(ip, oif, &flow, &order));
         }
         addresses.source(to.ip(), &order)
     }
@@ -2537,7 +2541,7 @@ impl InetSocket {
                                 // to the address the connection leaves from.
                                 let from = match s.bound.map(|b| b.ip()).or(s.address) {
                                     Some(ip) if !ip.is_unspecified() => ip,
-                                    _ => self.network.source(to, self.now()),
+                                    _ => self.network.source_through(to, 0, FLOW_TCP, self.now()),
                                 };
                                 self.network.output(from, self.now());
                                 return self.refused(&mut s, address);
@@ -2866,7 +2870,7 @@ impl InetSocket {
     ) -> Result<SocketAddr, Errno> {
         let bound = self.autobind(s, options)?;
         let ip = if bound.ip().is_unspecified() || s.device_source {
-            self.network.source_through(to, oif, self.now())
+            self.network.source_through(to, oif, FLOW_UDP, self.now())
         } else {
             bound.ip()
         };
@@ -3989,7 +3993,9 @@ impl InetSocket {
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
-        let source = self.network.source_through(to, options.device, self.now());
+        let source = self
+            .network
+            .source_through(to, options.device, FLOW_TCP, self.now());
         let mut ports = self.ports();
         // One bound to a broadcast or multicast address takes its route's
         // source as its name too (`tcp_v4_connect`:

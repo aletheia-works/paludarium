@@ -3046,7 +3046,8 @@ kernel.
     namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
-    label. Turning `disable_ipv6` on for an end
+    label, and one unbound takes the source of the hop that gives
+    (`ip6_dst_lookup_tail`). Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
     Going down, it loses its IPv6 routes, told of in the order of a dump,

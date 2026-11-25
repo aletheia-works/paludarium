@@ -4,8 +4,9 @@
 //! acknowledgements, then `tcp_send_delayed_ack`'s 40 ms), and the tail loss
 //! probe of a write whose acknowledgement waits. The bytes themselves move
 //! at once ([`super::Link`]); this only counts, in Linux 7.0's order, the
-//! segments that would have carried them. master's rules are the same, but
-//! that it caps `ato` at 200 ms, not at the retransmission timeout.
+//! segments that would have carried them. Master has the same rules, except
+//! that it caps the delayed acknowledgement's time (`ato`) at 200 ms, where
+//! 7.0 caps it at the retransmission timeout.
 //!
 //! The windows do not grow here (`tcp_grow_window`), and nothing is lost but
 //! what a probe sends again.
@@ -300,11 +301,10 @@ impl Flows {
         // `tcp_bound_to_half_wnd`: the client has only the SYN-ACK's window
         // until the server's first segment.
         let bound = advertised.min(WINDOW / 2);
-        let first = advertised.min(advertised / 2).max(1);
         let first = if advertised < WINDOW / 2 {
             bound
         } else {
-            first
+            advertised / 2
         };
         let mut sides = [
             Side::new(first, bound, advertised),
@@ -518,6 +518,8 @@ impl Flows {
         if s.written > s.next {
             self.transmit(side, Nagle::Push, true);
             let s = &mut self.sides[side];
+            // A probe sets the retransmission timer (`tcp_rearm_rto`), not the
+            // probe timer, which `transmit` set.
             s.timer = None;
             s.probe = Some((s.next, false));
             return;

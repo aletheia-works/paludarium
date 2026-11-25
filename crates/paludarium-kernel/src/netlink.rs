@@ -7698,7 +7698,7 @@ mod tests {
         assert!(!has(&found, RTA_PREFSRC));
         // The device: ENODEV but for lo. Where the tables give an error, a
         // route on link through it, of no table, from no address of link
-        // scope; none matches it, and 0.0.0.0/8 is EINVAL.
+        // scope; none matches it.
         let through = |to: [u8; 4], flags: u32, oif: u32| {
             get(
                 AF_INET,

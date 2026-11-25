@@ -1103,10 +1103,15 @@ verified.
   `rt6_check_neigh` does among routes of one metric. Of an IPv6 multipath
   route's hops through the device asked for, the flow's hash picks one, as
   Linux 7.0 does; Linux master takes the hop the lookup found
-  (`have_oif_match` in `ip6_pol_route`). An IPv6 packet's
-  answer comes back only through the end the packet went out through, so
-  that one a multipath route sends back through another end is lost,
-  where Linux's comes. A UDP
+  (`have_oif_match` in `ip6_pol_route`). An IPv6 connection
+  takes a multipath route's hop by the hash of its addresses and protocol,
+  as Linux 7.0 and 7.1 do, and its answers by theirs; from 7.2 Linux takes
+  it by the connection's own random hash and takes another as a segment
+  sent again draws a new one (`ip6_ecmp_set_mp_hash`,
+  `sk_rethink_txhash`), but here a connection's path is settled as it
+  opens, so a hop whose answers do not come back fails it. An ICMPv6 error
+  takes the hop of its own flow, where Linux's takes that of the packet
+  it tells of (`icmp6_send`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID

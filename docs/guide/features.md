@@ -2893,9 +2893,10 @@ kernel.
     (`ip_route_connect`). A packet may come in on the device of any hop of
     the route back to its source (`fib_info_nh_uses_dev`), and its answer
     goes back by a lookup of its own, through whichever end that takes, or
-    the one its listener is bound to. An output lookup that goes through an end leaves from its first
-    primary address, else from the first of the other devices' in the
-    order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
+    the one its listener is bound to. An output lookup that goes through
+    an end leaves from its first primary address, else from the first of
+    the other devices' in the order they were made
+    (`inet_select_addr`), and names it as `RTA_OIF`,
     without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
     its source checked as `__fib_validate_source` does (strict reverse
     path filtering drops one whose route goes out through another device).
@@ -2914,16 +2915,16 @@ kernel.
     nobody listens on answers with a reset (`ECONNREFUSED`), and a UDP
     port nobody has with ICMP's port unreachable, which a connected socket
     learns of. Answers come back only where the peer's namespace routes
-    the source back out through its end and this one takes them in on its
-    own. To a destination nobody answers ARP for, a connection fails with
+    the source out through an end whose peer is this one's, which takes
+    them in there. To a destination nobody answers ARP for, a connection fails with
     `EHOSTUNREACH` once ARP gives up, 3 seconds later (three probes a
     second apart, `mcast_probes`), as ICMP's host unreachable tells it
     over the loopback (with `ETIMEDOUT` after the handshake's tries where
     the loopback is down, and where answers come back to no one), and a
     datagram is dropped, as is one to a loopback address, which
     `arp_process` takes no request for. A connection or datagram from a
-    loopback address out through an end is `EINVAL`
-    (`__mkroute_output`); where no address of a scope to fit is there
+    loopback address out through an end is `EINVAL`, and a route lookup
+    of one too (`__mkroute_output`); where no address of a scope to fit is there
     (`inet_select_addr`), it leaves from 0.0.0.0, which ARP asks from too
     and the peer answers, and the peer drops what comes as a martian, so
     a connection times out (`ETIMEDOUT`) and a datagram is lost. TCP
@@ -3023,7 +3024,10 @@ kernel.
     namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
-    label. Turning `disable_ipv6` on for an end
+    label. An answer goes back by a lookup of its own, through whichever
+    end that takes: the one its listener is bound to, or to a link-local
+    address the one the packet came in on (`inet6_csk_route_req`,
+    `icmp6_send`). Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
     Going down, it loses its IPv6 routes, told of in the order of a dump,
@@ -3283,7 +3287,8 @@ kernel.
     and the protocol choose among an IPv6 multipath route's hops, as
     `fib6_select_path` hashes them, and the source among an IPv4 one's, as
     `fib_select_path` does, for an input route by the hash alone; the
-    mark, the user ID and the ports choose among policy rules, which there are none of, so they change nothing.
+    mark, the user ID and the ports choose among policy rules, which
+    there are none of, so they change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed

@@ -568,11 +568,10 @@ impl Network {
         let (from, to) = match (plain(from), plain(to)) {
             (IpAddr::V4(from), IpAddr::V4(to)) => (from, to),
             (IpAddr::V6(from), IpAddr::V6(to)) => {
-                return self.reach6(index, from, to, &Self::flow6(flow.src, flow.proto), now);
+                return self.reach6(index, from, to, flow, now);
             }
             _ => return Reach::Unanswered,
         };
-        let bound = flow.oif;
         let hop = self.next_hop4(index, to, flow, now);
         let Some(Arp {
             peer,
@@ -618,27 +617,45 @@ impl Network {
         if !arrives {
             return Reach::Dropped;
         }
-        // A listener's answer goes out through the device it is bound to
-        // (`inet_csk_route_req`).
-        let oif = flow.port.map_or(0, |port| {
-            there.ports(false).listener_device(
-                SocketAddr::new(IpAddr::V4(to), port),
-                peer_index.unsigned_abs(),
-            )
-        });
-        let flow = Flow {
+        let answer = Flow {
             src: Some(IpAddr::V4(to)),
-            oif,
+            oif: there.answer_oif(IpAddr::V4(to), flow, peer_index),
             proto: flow.proto,
+            bound: 0,
             port: None,
         };
-        match self.back4(&there, from, to, &flow, now) {
-            // To a socket bound to the device it comes in on.
-            Some((back, own)) if bound == 0 || bound == own.unsigned_abs() => {
-                Reach::Answered(there, Back { index: back, oif })
+        let back = self.back4(&there, from, to, &answer, now);
+        Self::answered(there, flow, answer.oif, back)
+    }
+    /// The device named in the route lookup of an answer from this
+    /// namespace's address `to` to a packet of the flow `flow`, which came
+    /// in on the device `index`: the one its listener is bound to
+    /// (`inet_csk_route_req`), 0 for none.
+    fn answer_oif(&self, to: IpAddr, flow: &Flow, index: i32) -> u32 {
+        flow.port.map_or(0, |port| {
+            self.ports(false)
+                .listener_device(SocketAddr::new(to, port), index.unsigned_abs())
+        })
+    }
+    /// What a packet of the flow `flow` that comes to `there` finds, whose
+    /// answer, routed with the device `oif` named, goes out through the
+    /// first end of `back` there and comes in on the second, if it comes: a
+    /// socket bound to a device takes it in on that alone.
+    fn answered(there: Arc<Network>, flow: &Flow, oif: u32, back: Option<(i32, i32)>) -> Reach {
+        match back {
+            Some((index, own)) if flow.bound == 0 || flow.bound == own.unsigned_abs() => {
+                Reach::Answered(there, Back { index, oif })
             }
             _ => Reach::OneWay(there),
         }
+    }
+    /// The peer of the veth end `index` of `there`, where it is this
+    /// namespace's and the end has its carrier.
+    fn own_end(&self, there: &Network, index: i32) -> Option<i32> {
+        let devices = there.devices();
+        let veth = devices.by_index(index)?.veth.as_ref()?;
+        let peer = veth.peer.as_ref().filter(|_| veth.carrier)?;
+        core::ptr::eq(peer.network.as_ptr(), self).then_some(peer.index)
     }
     /// The veth end of `there` an answer from its address `to` to `from`,
     /// of the flow `flow`, goes out through, and the one of this namespace
@@ -671,15 +688,7 @@ impl Network {
             }
         };
         let hop = there.next_hop4(back, from, flow, now);
-        let own = {
-            let devices = there.devices();
-            let veth = devices.by_index(back)?.veth.as_ref()?;
-            let peer = veth.peer.as_ref().filter(|_| veth.carrier)?;
-            if !core::ptr::eq(peer.network.as_ptr(), self) {
-                return None;
-            }
-            peer.index
-        };
+        let own = self.own_end(there, back)?;
         let rpf = self.rp_filter(own);
         let addresses = self.addresses_at(now);
         let comes = addresses.local4(from)
@@ -795,19 +804,17 @@ impl Network {
     ///   or the peer's namespace has not `to`, not tentative (no local
     ///   route: `ip6_route_input`, and no forwarding).
     /// - The packet comes there, and the answer back ([`Reach::Answered`])
-    ///   only when the peer's namespace routes `from` back out through its
-    ///   end, this namespace has `from`, not tentative, and this end has
-    ///   that route's next hop; else that answer goes nowhere
-    ///   ([`Reach::OneWay`]).
+    ///   only where that namespace's comes to this one ([`Self::back6`]);
+    ///   else that answer goes nowhere ([`Reach::OneWay`]).
     fn reach6(
         &self,
         index: i32,
         from: Ipv6Addr,
         to: Ipv6Addr,
-        flow: &Flow6,
+        flow: &Flow,
         now: Option<u64>,
     ) -> Reach {
-        let hop = self.next_hop6(index, to, flow, now);
+        let hop = self.next_hop6(index, to, &Self::flow6(flow.src, flow.proto), now);
         let Some(Nd {
             peer,
             answer,
@@ -835,35 +842,47 @@ impl Network {
         if from.is_loopback() || to.is_loopback() {
             return Reach::Dropped;
         }
-        let (arrives, back) = {
-            let addresses = there.addresses_at(now);
-            // The answer's flow, from `to`.
-            let answer = Self::flow6(Some(IpAddr::V6(to)), flow.proto);
-            let back = addresses
-                .lookup6_flow(from, 0, &answer)
-                .ok()
-                .filter(|r| {
-                    r.kind == crate::interface::Kind::Unicast
-                        && i64::from(r.oif) == i64::from(peer_index)
-                })
-                .map(|r| r.gateway.unwrap_or(from));
-            (addresses.local6(to), back)
-        };
-        if !arrives {
+        if !there.addresses_at(now).local6(to) {
             return Reach::Dropped;
         }
-        // The answer's next hop must be this end's, as neighbour discovery
-        // finds it.
-        let back = back.is_some_and(|hop| {
-            let addresses = self.addresses_at(now);
-            addresses.local6(from) && addresses.nd_target(index, hop)
-        });
-        if back {
-            let index = peer_index;
-            Reach::Answered(there, Back { index, oif: 0 })
-        } else {
-            Reach::OneWay(there)
-        }
+        // To a link-local address the answer goes out through the device
+        // the packet came in on, where the listener is bound to none
+        // (`tcp_v6_init_req`, `icmp6_send`).
+        let oif = match there.answer_oif(IpAddr::V6(to), flow, peer_index) {
+            0 if from.is_unicast_link_local() => peer_index.unsigned_abs(),
+            oif => oif,
+        };
+        let back = self.back6(&there, from, to, oif, flow.proto, now);
+        Self::answered(there, flow, oif, back)
+    }
+    /// [`Self::back4`] of an IPv6 answer of the protocol `proto`, routed
+    /// with the device `oif` named (0 for none): its next hop must be an
+    /// address of the end it comes in on, as neighbour discovery finds it
+    /// ([`crate::interface::Addresses::nd_target`]), and this namespace must
+    /// have `from`, not tentative. An ICMPv6 error of Linux's takes the hop
+    /// of the packet it tells of (`icmp6_send`), whose flow label is random,
+    /// and from 7.2 TCP's answer its own random one
+    /// (`ip6_ecmp_set_mp_hash`); here both take the answer's flow's.
+    fn back6(
+        &self,
+        there: &Network,
+        from: Ipv6Addr,
+        to: Ipv6Addr,
+        oif: u32,
+        proto: u8,
+        now: Option<u64>,
+    ) -> Option<(i32, i32)> {
+        let flow = Self::flow6(Some(IpAddr::V6(to)), proto);
+        let route = there
+            .addresses_at(now)
+            .lookup6_flow(from, oif, &flow)
+            .ok()
+            .filter(|r| r.kind == crate::interface::Kind::Unicast)?;
+        let back = i32::try_from(route.oif).ok()?;
+        let own = self.own_end(there, back)?;
+        let hop = route.gateway.unwrap_or(from);
+        let addresses = self.addresses_at(now);
+        (addresses.local6(from) && addresses.nd_target(own, hop)).then_some((back, own))
     }
     /// The device a packet to this namespace's own address `ip` comes in on:
     /// that of its local route, which for an IPv6 one is its address's
@@ -1130,6 +1149,7 @@ impl Network {
             src: Some(to),
             oif: answer.oif,
             proto,
+            bound: 0,
             port: None,
         };
         let _ = self.reach(answer.index, to, from, &flow, now);
@@ -1814,6 +1834,8 @@ struct Flow {
     src: Option<IpAddr>,
     oif: u32,
     proto: u8,
+    /// The device the socket is bound to, 0 for none.
+    bound: u32,
     /// The port a TCP connection goes to, whose listener's answer goes out
     /// through the device that is bound to; else answers go by their route
     /// alone.
@@ -2918,6 +2940,7 @@ impl InetSocket {
             src: s.source(),
             oif,
             proto: FLOW_UDP,
+            bound: options.device,
             port: None,
         };
         let route = self
@@ -3843,6 +3866,7 @@ impl InetSocket {
             },
             oif: options.device,
             proto: FLOW_TCP,
+            bound: options.device,
             port: Some(to.port()),
         };
         let failing = match self

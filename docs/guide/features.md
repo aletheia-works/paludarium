@@ -556,6 +556,9 @@ kernel.
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+  The files of `/proc` and `/dev` keep `O_DIRECTORY`, `O_NOFOLLOW` and
+  `O_SYNC` of their open too, and one that is no directory is `ENOTDIR`
+  with `O_DIRECTORY`.
   `F_SETFL` changes only `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`, `O_NOATIME`
   and, on a file that signals, `O_ASYNC`; the access mode and the other
   flags stay, as Linux's `setfl` keeps them.
@@ -569,7 +572,10 @@ kernel.
   (but for `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_DUPFD_QUERY`, `F_GETFD`,
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
   `select` finds it ready in every set. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
-  take it, and it is a directory for the `*at` calls.
+  take it, and it is a directory for the `*at` calls. Of the flags of an
+  open with it, only `O_DIRECTORY`, `O_NOFOLLOW` and `O_CLOEXEC` count
+  (`build_open_how`): an access mode asks nothing (no `EISDIR`, `EROFS`,
+  `ETXTBSY` or `EACCES`), and `O_CREAT` and `O_TRUNC` do nothing.
 
 - `O_DIRECT` and `O_NOATIME` are checked as Linux's `open` and `F_SETFL`
   check them. `O_DIRECT` needs a regular file of a disk file system or
@@ -596,17 +602,22 @@ kernel.
   `unshare(CLONE_FILES)` or `CLOSE_RANGE_UNSHARE` of a table another task
   shares gives the caller a copy that owns none of them. A description's go
   when its last descriptor closes. `F_SETLKW` waits until the range is free,
-  `EDEADLK` when the record locks of tables waiting for each other (up to
-  10) would close a cycle. A
-  wait counts for that only while the lock it waits for stays as it was:
-  unlocking, changing or closing it ends the wait there at once, as
-  `locks_wake_up_blocks` does, even before the waiter runs again. The
+  `EDEADLK` when that would close a cycle of owners that wait for each
+  other's record locks (`posix_locks_deadlock`, through up to 11 waits). A
+  wait counts for that only while the lock it waits for stays:
+  unlocking, cutting or closing it ends the wait there at once, as
+  `locks_wake_up_blocks` does, even before the waiter runs again. A wait
+  for a record lock or a `flock` lock that conflicts with an earlier one
+  for the same lock is behind that one, which gets the lock first
+  (`__locks_insert_block`). The
   locks are the guest's own: a program on the host does not see them, nor
   they its. `/proc/locks` lists the record locks, the `flock` locks and the
   leases as `locks_show` prints them: those of each CPU in turn (as `getcpu`
   numbers it where the lock was taken), the latest first, a merged lock at
   its first one's place and a split one's left piece as new
-  (`posix_lock_inode`), without those of processes outside the reader's PID
+  (`posix_lock_inode`), each with those that wait for it (`-> `, deeper for
+  one behind another), opens that break a lease too, without those of
+  processes outside the reader's PID
   namespace. `/proc/<pid>/fdinfo` lists a description's own, its lease last
   (`show_fd_locks`).
 
@@ -1759,7 +1770,10 @@ kernel.
   with the placements at a 2 MiB boundary there too, or `ENOMEM`.
   `MAP_FIXED` overrides it, and `mremap` does not keep to it. The mapping
   of an `io_uring` ring does not follow it yet. A hint below
-  `mmap_min_addr` (64 KiB) is taken as that address.
+  `mmap_min_addr` (64 KiB) is taken as that address; a fixed mapping
+  below it, a move there by `mremap` (once its target is unmapped and its
+  source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone
+  too) and a `shmat` there give `EPERM` without `CAP_SYS_RAWIO`.
 
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
@@ -1794,8 +1808,9 @@ kernel.
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
   `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
-  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, and
-  `IORING_OP_ASYNC_CANCEL`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
+  `IORING_OP_ASYNC_CANCEL`, and the socket requests `IORING_OP_SHUTDOWN`,
+  `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
@@ -1950,6 +1965,38 @@ kernel.
   file here takes (`EINVAL`). `IORING_OP_FSYNC` takes only
   `IORING_FSYNC_DATASYNC`.
 
+- The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
+  `_RECV`. Each is prepared as Linux prepares it, which checks its entry
+  (`EINVAL`), then reads a connect's or a send's address
+  (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a
+  buffer in the user half (`EFAULT`). It runs as Linux runs it inline,
+  without waiting: one that would wait (`EAGAIN`, or a connect in
+  progress) waits for its socket, holding the file it found, and runs
+  again once the socket is ready, unless it asked not to (`MSG_DONTWAIT`,
+  `IORING_ACCEPT_DONTWAIT`), when it completes with `EAGAIN`.
+  `IORING_RECVSEND_POLL_FIRST` and `IORING_ACCEPT_POLL_FIRST` wait first.
+  A send adds `MSG_NOSIGNAL`. With `MSG_WAITALL`, a stream or
+  sequenced-packet socket's send or receive goes on to its whole length
+  and gives all it moved; one that fails on the way, as it asked not to
+  wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A
+  receive may select a provided buffer
+  (`ENOBUFS`), which goes back to its group while the receive waits, or if
+  it read nothing, as Linux master's `io_recv` gives it back. A receive
+  has `IORING_CQE_F_SOCK_NONEMPTY` while bytes are left on a TCP socket
+  (or once its peer finished, as `tcp_inq_hint` tells) or an AF_UNIX
+  stream, and an accept while more TCP connections wait. A new socket or
+  connection goes at the lowest free descriptor, which it takes first
+  (`EMFILE`), or in a registered slot (`file_index`, one past the slot's
+  index, or a free one with `IORING_FILE_INDEX_ALLOC`, `ENFILE` when there
+  is none; `ENXIO` with no registered files, `EINVAL` past them), which
+  `SOCK_CLOEXEC` cannot go with. A connect in progress completes with the
+  socket's error once it has one, or with 0 once it is connected. As
+  Linux master has it, a receive checks for a socket (`ENOTSOCK`) before
+  `IORING_RECVSEND_POLL_FIRST` waits, and a nonblocking socket's connect
+  that gives `EAGAIN` (an AF_UNIX listener's full backlog) completes with
+  it, where Linux 7.0 waits for the socket and tries again.
+
 - `IORING_REGISTER_BUFFERS` registers a ring's buffers as Linux's
   `io_sqe_buffers_register` does. It checks in this order:
   - none registered yet (`EBUSY`), and 1 to 16384 of them (`EINVAL`);
@@ -2058,8 +2105,8 @@ kernel.
     or after them if a request of that submission holds the file. A
     registration that fails posts no tag.
 
-- A ring keeps groups of buffers that a read with `IOSQE_BUFFER_SELECT`
-  chooses one of, the group that `buf_group` names, as Linux's
+- A ring keeps groups of buffers that a read or a socket's receive with
+  `IOSQE_BUFFER_SELECT` chooses one of, the group that `buf_group` names, as Linux's
   `io_uring/kbuf.c` does. The read is of its length at most, or of the whole
   buffer, and its completion has `IORING_CQE_F_BUFFER` and the buffer's ID
   in the top 16 bits of its flags. A group with none left, or none, is
@@ -2199,7 +2246,10 @@ kernel.
   permission on the directory (`EACCES`), then `CAP_SYS_CHROOT` in the
   caller's user namespace (`EPERM`). An absolute path or symbolic link then
   starts at the root and `..` stays there, for exec and its interpreters
-  too. The working directory stays where it was, and from one outside the
+  too. In a path that climbs above the root as written, a `..` after a
+  symbolic link goes up from the link's target, and a name that is not
+  there or is no directory ends the walk, as Linux's `link_path_walk` does.
+  The working directory stays where it was, and from one outside the
   root a path goes anywhere, as on Linux. `getcwd` gives a working directory
   from the root, or, when it is not under the root, its path from the
   machine's root after `(unreachable)`. A child of `fork` keeps the root, a
@@ -2916,9 +2966,10 @@ kernel.
     (`ip_route_connect`). A packet may come in on the device of any hop of
     the route back to its source (`fib_info_nh_uses_dev`), and its answer
     goes back by a lookup of its own, through whichever end that takes, or
-    the one its listener is bound to. An output lookup that goes through an end leaves from its first
-    primary address, else from the first of the other devices' in the
-    order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
+    the one its listener is bound to. An output lookup that goes through
+    an end leaves from its first primary address, else from the first of
+    the other devices' in the order they were made
+    (`inet_select_addr`), and names it as `RTA_OIF`,
     without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
     its source checked as `__fib_validate_source` does (strict reverse
     path filtering drops one whose route goes out through another device).
@@ -2937,16 +2988,16 @@ kernel.
     nobody listens on answers with a reset (`ECONNREFUSED`), and a UDP
     port nobody has with ICMP's port unreachable, which a connected socket
     learns of. Answers come back only where the peer's namespace routes
-    the source back out through its end and this one takes them in on its
-    own. To a destination nobody answers ARP for, a connection fails with
+    the source out through an end whose peer is this one's, which takes
+    them in there. To a destination nobody answers ARP for, a connection fails with
     `EHOSTUNREACH` once ARP gives up, 3 seconds later (three probes a
     second apart, `mcast_probes`), as ICMP's host unreachable tells it
     over the loopback (with `ETIMEDOUT` after the handshake's tries where
     the loopback is down, and where answers come back to no one), and a
     datagram is dropped, as is one to a loopback address, which
     `arp_process` takes no request for. A connection or datagram from a
-    loopback address out through an end is `EINVAL`
-    (`__mkroute_output`); where no address of a scope to fit is there
+    loopback address out through an end is `EINVAL`, and a route lookup
+    of one too (`__mkroute_output`); where no address of a scope to fit is there
     (`inet_select_addr`), it leaves from 0.0.0.0, which ARP asks from too
     and the peer answers, and the peer drops what comes as a martian, so
     a connection times out (`ETIMEDOUT`) and a datagram is lost. TCP
@@ -3067,7 +3118,10 @@ kernel.
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
     label, and one unbound takes the source of the hop that gives
-    (`ip6_dst_lookup_tail`). Turning `disable_ipv6` on for an end
+    (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
+    through whichever end that takes: the one its listener is bound to, or
+    to a link-local address the one the packet came in on
+    (`inet6_csk_route_req`, `icmp6_send`). Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
     Going down, it loses its IPv6 routes, told of in the order of a dump,
@@ -3327,7 +3381,8 @@ kernel.
     and the protocol choose among an IPv6 multipath route's hops, as
     `fib6_select_path` hashes them, and the source among an IPv4 one's, as
     `fib_select_path` does, for an input route by the hash alone; the
-    mark, the user ID and the ports choose among policy rules, which there are none of, so they change nothing.
+    mark, the user ID and the ports choose among policy rules, which
+    there are none of, so they change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed
@@ -4646,7 +4701,8 @@ kernel.
   the task's memory at the address its position gives, as Linux's `mem_rw`
   does through `access_remote_vm` with `FOLL_FORCE`: a page whatever its
   protection, a private one written to a copy of its own, a page at a time.
-  A call that moves no byte (no page there, a `perf` ring's or a
+  A call that moves no byte (no page there, nor a stack the caller can grow
+  down to it, a `perf` ring's or a
   `memfd_secret` file's, which `get_user_pages` refuses) is `EIO`, and one
   that stops later gives what it moved. `lseek` takes `SEEK_SET` and
   `SEEK_CUR` only (`EINVAL`), and its positions are unsigned
@@ -4672,14 +4728,17 @@ kernel.
   and `UFFDIO_MOVE` for the page they map, and a `fork`ed child keeps each
   page's bit. 5 (`CLEAR_REFS_MM_HIWATER_RSS`) makes the peak of the
   resident memory (`status`' `VmHWM`) the resident memory now, as
-  `reset_mm_hiwater_rss` does. 1 to 3 are taken and change nothing shown
-  (see Limitations). It has no read operation (`EINVAL`, `EBADF` on a descriptor
+  `reset_mm_hiwater_rss` does. 1 makes every page unreferenced, 2 those of
+  VMAs with no file and 3 those of VMAs with one (shared memory's too):
+  `smaps` and `smaps_rollup` leave a page out of `Referenced` until its
+  next access, an instruction fetch too. A `fork`ed child has referenced
+  none of the pages it gets (`pte_mkold`). It has no read operation (`EINVAL`, `EBADF` on a descriptor
   open only for writing), and `lseek` leaves it at 0.
 
 - `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
   Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
-  link's `lstat` shows the descriptor's access in its user bits and size 64,
+  link's `lstat` shows the descriptor's access in its user bits (none for `O_PATH`) and size 64,
   and `stat` follows it to the file. `readlink` gives Linux's names: the
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries, `/proc` for procfs's root), followed by a space and `(deleted)` once
@@ -5229,10 +5288,14 @@ kernel.
   `sigtrap`, an overflow sends the thread SIGTRAP of `TRAP_PERF` with
   `sig_data` and the event's type in `si_perf_data` and `si_perf_type`, the
   fault's address in `si_addr` as a sample has it with
-  `PERF_SAMPLE_ADDR`, and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event of a task
+  `PERF_SAMPLE_ADDR`, and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. An event
   that asks for them takes side-band records, as `perf_iterate_sb` gives
-  them to the enabled events that count the thread that makes them, each
-  with that thread's `sample_id`: `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
+  them to the enabled events of the CPU (pid -1) of the thread that makes
+  them, whatever process it is of, and then to those that count the thread,
+  the latest first, each with that thread's `sample_id` (`EXIT` goes to the
+  thread's first), those of mappings while an event with `mmap` or
+  `mmap_data` is open, enabled or not (`nr_mmap_events`, which `mmap2` alone
+  does not raise): `PERF_RECORD_MMAP` (`mmap`) or `MMAP2`
   (`mmap2`) of an executable mapping, and with `mmap_data` of any other
   (`PERF_RECORD_MISC_MMAP_DATA`), as `mmap`, `brk`'s growth, `shmat`,
   `remap_file_pages` and `mprotect` (of each VMA whose protection it
@@ -6638,7 +6701,7 @@ one only with an `--allow-net`.
   change the call and its arguments, or set `orig_rax` to -1 to skip it,
   leaving the `rax` it wants; at an exit `rax` has what the call returned,
   which the tracer may change. A signal the tracer resumes a syscall stop
-  with is sent to the process from the kernel (`SI_KERNEL`).
+  with is sent to the thread from the kernel (`SI_KERNEL`).
   `PTRACE_GET_SYSCALL_INFO`
   describes the stop as Linux's `struct ptrace_syscall_info` does: the call
   and its arguments at an entry, the return value and whether it is an

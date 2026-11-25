@@ -1008,10 +1008,92 @@ impl Files {
         }
         match paludarium_vfs::normalize_in(&root, &joined) {
             Ok(kept) if paludarium_vfs::normalize_path(&joined).ok() != Some(kept.clone()) => {
-                Ok(kept)
+                Ok(self.climbed(&root, &joined))
             }
             _ => Ok(joined),
         }
+    }
+    /// The path `joined`, whose `..` would leave `root` as written, with
+    /// everything up to its last `..` walked as Linux walks it: a `..`
+    /// after a symbolic link goes up from the link's target, and one at
+    /// the root stays. A walk that ends early (a name that is not there or
+    /// is no directory, too many links) gives a path that ends at the same
+    /// name, for the call's own lookup to report, after the permissions on
+    /// the way.
+    fn climbed(&self, root: &[u8], joined: &[u8]) -> Vec<u8> {
+        const DIRECTORY: u32 = 0o040000;
+        const SYMLINK: u32 = 0o120000;
+        let names = |path: &[u8]| -> std::collections::VecDeque<Vec<u8>> {
+            path.split(|&b| b == b'/')
+                .filter(|part| !part.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect()
+        };
+        let fs = self.fs();
+        let mut left = names(joined);
+        let mut ups = left.iter().filter(|part| *part == b"..").count();
+        // Of a link's target, how many names are still to be walked.
+        let mut linked = 0_usize;
+        let mut links = 0;
+        let mut at = b"/".to_vec();
+        while ups > 0 || linked > 0 {
+            let Some(part) = left.pop_front() else {
+                break;
+            };
+            let written = linked == 0;
+            linked = linked.saturating_sub(1);
+            let up = part == b"..";
+            if up && written {
+                ups -= 1;
+            }
+            let here = fs.metadata(&at, false);
+            if here.is_ok_and(|stat| stat.mode & 0o170000 == DIRECTORY) {
+                if up {
+                    if at != root && at != b"/" {
+                        let parent = at.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        at.truncate(parent.max(1));
+                    }
+                    continue;
+                }
+                if part == b"." {
+                    continue;
+                }
+                let next = child_of(&at, &part);
+                match fs.metadata(&next, false) {
+                    Ok(stat) if stat.mode & 0o170000 == SYMLINK && links < 40 => {
+                        links += 1;
+                        if let Ok(target) = fs.readlink(&next)
+                            && !target.is_empty()
+                        {
+                            if target[0] == b'/' {
+                                at = root.to_vec();
+                            }
+                            let target = names(&target);
+                            linked += target.len();
+                            for part in target.into_iter().rev() {
+                                left.push_front(part);
+                            }
+                            continue;
+                        }
+                    }
+                    Ok(stat) if stat.mode & 0o170000 != SYMLINK => {
+                        at = next;
+                        continue;
+                    }
+                    _ => {}
+                }
+                at = next;
+            }
+            // The walk ends here: nothing below is a name to go up from.
+            left.retain(|part| part != b"..");
+            at.extend_from_slice(b"/.");
+            break;
+        }
+        let mut path = left.iter().fold(at, |at, part| child_of(&at, part));
+        if !left.is_empty() && joined.last() == Some(&b'/') {
+            path.push(b'/');
+        }
+        path
     }
     fn joined(&self, root: &[u8], dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
         if p.is_empty() {
@@ -4762,6 +4844,7 @@ fn open_by_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             // `file_open_root` of the file itself: as the last component of
             // an open, `O_CREAT` finds it there (`EEXIST` with `O_EXCL`,
             // `EISDIR` for a directory), and a symbolic link is not followed.
+            let flags = path_flags(flags);
             if flags & O_CREAT != 0 {
                 if flags & O_EXCL != 0 {
                     return Err(Errno::EEXIST);
@@ -5711,18 +5794,28 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let d = c.files.descriptor(a[0])?;
             // A file that cannot be told by its inode is not listed.
             let key = crate::record_locks::key(c, &d).ok();
+            let processes = Arc::clone(c.processes);
+            let locks = processes.locks();
+            let request = (a[1] & 4 == 0).then(|| locks.blocked().request());
             loop {
                 let result = d.file.flock(a[1] as u32);
-                c.processes.locks().flocked(
+                locks.flocked(
                     (&d.file, key),
                     (c.process.pid, crate::syscalls::cpu(c)),
                     a[1] as u32,
                     result,
+                    request.as_ref(),
                 );
+                let Some(request) = &request else {
+                    return result.map(|()| 0);
+                };
                 match result {
                     Ok(()) => return Ok(0),
-                    Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => pause_for_lock(c)?,
+                    Err(e) if e == Errno::EAGAIN => pause_for_lock(c)?,
                     Err(e) => return Err(e),
+                }
+                while request.behind() {
+                    pause_for_lock(c)?;
                 }
             }
         }
@@ -6527,7 +6620,7 @@ impl LinkPath {
                     .descriptor(u64::from(n))
                     .map_err(|_| Errno::ENOENT)?;
                 return Ok(Some(Self {
-                    stat: crate::proc::link_stat(d.file.flags() & 3),
+                    stat: crate::proc::link_stat(d.file.flags()),
                     target: LinkTarget::Task(pinned()),
                 }));
             }
@@ -6622,6 +6715,82 @@ impl FileHandle for LinkPath {
         Err(Errno::EBADF)
     }
 }
+/// The descriptor `O_PATH` gives for a file whose own kind knows no such
+/// open, as the files of `/proc` do: only its path, with `file` for what
+/// `fstat` and the descriptor's link show of it.
+pub(crate) struct PathOnly {
+    file: Shown,
+    /// The open's, of which [`path_flags`] keeps four.
+    flags: u32,
+}
+/// What a [`PathOnly`] shows.
+enum Shown {
+    File(Arc<dyn FileHandle>),
+    /// Of a file that is not opened, as an open of it has an effect.
+    Stat(FileStat),
+}
+impl PathOnly {
+    fn of(file: Arc<dyn FileHandle>, flags: u32) -> Arc<dyn FileHandle> {
+        if flags & O_PATH == 0 || file.flags() & O_PATH != 0 {
+            return file;
+        }
+        let file = Shown::File(file);
+        Arc::new(Self { file, flags })
+    }
+}
+impl FileHandle for PathOnly {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        match &self.file {
+            Shown::File(file) => file.as_any(),
+            Shown::Stat(_) => None,
+        }
+    }
+    fn guest_path_hint(&self) -> Option<Vec<u8>> {
+        match &self.file {
+            Shown::File(file) => file.guest_path_hint(),
+            Shown::Stat(_) => None,
+        }
+    }
+    fn dentry_path(&self) -> Option<(Vec<u8>, bool)> {
+        match &self.file {
+            Shown::File(file) => file.dentry_path(),
+            Shown::Stat(_) => None,
+        }
+    }
+    fn file_system(&self) -> Option<u64> {
+        match &self.file {
+            Shown::File(file) => file.file_system(),
+            Shown::Stat(_) => None,
+        }
+    }
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn stat(&self) -> Result<FileStat, Errno> {
+        match &self.file {
+            Shown::File(file) => file.stat(),
+            Shown::Stat(stat) => Ok(*stat),
+        }
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+    fn flags(&self) -> u32 {
+        self.flags
+    }
+    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+}
 pub(crate) struct StandardFile {
     host: Arc<dyn paludarium_host::Host>,
     channel: u32,
@@ -6678,24 +6847,32 @@ const SETFL_FLAGS: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
 pub(crate) fn setfl(before: u32, asked: u32) -> u32 {
     (before & !SETFL_FLAGS) | (asked & SETFL_FLAGS)
 }
-/// The flags `F_SETFL` last set on a file whose other flags are fixed, as
-/// Linux's `setfl` keeps them in its `f_flags`: [`StatusFlags::of`] puts
-/// them over the fixed ones.
+/// The flags of a file whose other flags are fixed: those `F_SETFL` last
+/// set, and those of its open that stay, as Linux's `f_flags` keeps them.
+/// [`StatusFlags::of`] puts them over the fixed ones.
 #[derive(Default)]
-pub(crate) struct StatusFlags(AtomicU32);
+pub(crate) struct StatusFlags {
+    set: AtomicU32,
+    kept: u32,
+}
 impl StatusFlags {
-    /// The flags an open with `flags` left that `F_SETFL` changes, as
-    /// Linux keeps them in `f_flags` from the open.
+    /// `O_DIRECTORY`, `O_NOFOLLOW` and `O_SYNC` with its `O_DSYNC`.
+    const KEPT: u32 = 0o200000 | 0o400000 | 0o4010000;
+    /// The flags an open with `flags` left, as Linux keeps them in
+    /// `f_flags` from the open.
     pub(crate) fn opened(flags: u32) -> Self {
-        Self(AtomicU32::new(flags & SETFL_FLAGS))
+        Self {
+            set: AtomicU32::new(flags & SETFL_FLAGS),
+            kept: flags & Self::KEPT,
+        }
     }
-    /// The file's flags, `fixed` with what `F_SETFL` set.
+    /// The file's flags, `fixed` with what its open kept and `F_SETFL` set.
     pub(crate) fn of(&self, fixed: u32) -> u32 {
-        setfl(fixed, self.0.load(Ordering::SeqCst))
+        setfl(fixed | self.kept, self.set.load(Ordering::SeqCst))
     }
     /// `F_SETFL` asks for `asked`, of which [`SETFL_FLAGS`] are kept.
     pub(crate) fn set(&self, asked: u32) {
-        self.0.store(asked & SETFL_FLAGS, Ordering::SeqCst);
+        self.set.store(asked & SETFL_FLAGS, Ordering::SeqCst);
     }
 }
 /// What `F_GETFL` gives for `d`, as Linux keeps a file's `f_flags`: the open
@@ -7162,6 +7339,18 @@ mod files_tests {
     }
 }
 
+/// The flags of an open, as Linux's `build_open_how` takes them: `O_PATH`
+/// beats all but `O_DIRECTORY`, `O_NOFOLLOW` and `O_CLOEXEC`, the access
+/// mode too. (`openat2` refuses the others, `EINVAL`, before it comes here.)
+fn path_flags(flags: u32) -> u32 {
+    const O_DIRECTORY: u32 = 0o200000;
+    const O_NOFOLLOW: u32 = 0o400000;
+    const O_CLOEXEC: u32 = 0o2000000;
+    if flags & O_PATH == 0 {
+        return flags;
+    }
+    flags & (O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC)
+}
 /// `open`, `creat` and `openat` of `raw` from `dir`, and `openat2` with its
 /// `RESOLVE_*` flags `resolve` ([`resolve_scoped`]).
 pub(crate) fn open_at(
@@ -7174,12 +7363,15 @@ pub(crate) fn open_at(
 ) -> Result<u64, Errno> {
     let p = c.files.named(dir, raw.clone())?;
     let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
+    let flags = path_flags(flags);
     if flags & 3 == 3 {
         return Err(Errno::EINVAL);
     }
     // A file the kernel generates, through a bind mount of it: its own
     // path, and the place its link in `/proc/self/fd` names.
     const O_NOFOLLOW: u32 = 0o400000;
+    const O_DIRECTORY: u32 = 0o200000;
+    const O_TMPFILE: u32 = 0o20000000 | O_DIRECTORY;
     let (p, mut shown) = match generated_place(c, &p, flags & O_NOFOLLOW == 0) {
         Some((file, shown)) => (file, Some(shown)),
         None => (p, None),
@@ -7216,7 +7408,17 @@ pub(crate) fn open_at(
             // `do_dentry_open` calls `security_file_open` first), waits for
             // the groups' answers, then its `IN_OPEN`; a file refused or
             // denied goes, never opened, and tells nothing.
-            let (opened, pending) = crate::fanotify::asked_by(c, |c| open_path(c, &p, flags, mode));
+            let (opened, pending) = crate::fanotify::asked_by(c, |c| {
+                let (file, path) = open_path(c, &p, flags, mode)?;
+                // A generated file that is no directory, as `do_open` refuses
+                // it (an `O_TMPFILE` open has `O_DIRECTORY` too).
+                if flags & O_TMPFILE == O_DIRECTORY
+                    && file.stat().is_ok_and(|s| s.mode & 0o170000 != 0o040000)
+                {
+                    return Err(Errno::ENOTDIR);
+                }
+                Ok((PathOnly::of(file, flags), path))
+            });
             let opened = opened.inspect(|_| {
                 if let Some(parent) = created {
                     crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
@@ -7623,6 +7825,19 @@ fn open_path(
         && let Some(file) = crate::pty::open_controlling(c, flags)
     {
         return Ok((file?, p.to_vec()));
+    }
+    // An open of a pseudo-terminal, or of `userfaultfd`'s device, makes or
+    // changes something, which an open of its path does not.
+    if flags & O_PATH != 0
+        && let Some(
+            crate::devices::Entry::Ptmx { .. }
+            | crate::devices::Entry::Slave(Some(_))
+            | crate::devices::Entry::Userfaultfd,
+        ) = crate::devices::entry(p)
+    {
+        let (stat, ..) = generated_stat(c, p, true)?.ok_or(Errno::ENOENT)?;
+        let file = Shown::Stat(stat);
+        return Ok((Arc::new(PathOnly { file, flags }), p.to_vec()));
     }
     let file: Arc<dyn FileHandle> = if let Some(entry) = crate::devices::entry(p) {
         const O_DIRECTORY: u32 = 0o200000;
@@ -9227,7 +9442,7 @@ fn other_generated_stat(
                     descriptor_block_size(c, &d),
                 ));
             }
-            crate::proc::link_stat(d.file.flags() & 3)
+            crate::proc::link_stat(d.file.flags())
         }
     };
     let stat = own_stat(c, stat);

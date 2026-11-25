@@ -607,7 +607,7 @@ fn bpf_capable(credentials: &crate::credentials::Credentials) -> bool {
 /// `SOCK_RAW` or `SOCK_DGRAM` (`ESOCKTNOSUPPORT`), and only `NETLINK_ROUTE`,
 /// `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT`). Without a
 /// network there is none (`EAFNOSUPPORT`).
-pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+pub(crate) fn socket(c: &Context<'_>, a: [u64; 6]) -> Result<Arc<dyn FileHandle>, Errno> {
     let kind = a[1] as u32;
     if a[1] > u64::from(u32::MAX) || kind & !(NONBLOCK | CLOEXEC | 0xf) != 0 || kind & 0xf >= 11 {
         return Err(Errno::EINVAL);
@@ -658,9 +658,7 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(Arc::downgrade(&socket));
-    c.files
-        .install(socket, kind & CLOEXEC != 0, c.group.nofile())
-        .map(u64::from)
+    Ok(socket)
 }
 
 /// The netlink socket of `file`, if it is one.
@@ -7693,7 +7691,7 @@ mod tests {
         assert!(!has(&found, RTA_PREFSRC));
         // The device: ENODEV but for lo. Where the tables give an error, a
         // route on link through it, of no table, from no address of link
-        // scope; none matches it, and 0.0.0.0/8 is EINVAL.
+        // scope; none matches it.
         let through = |to: [u8; 4], flags: u32, oif: u32| {
             get(
                 AF_INET,

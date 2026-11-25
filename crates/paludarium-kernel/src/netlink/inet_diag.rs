@@ -536,11 +536,17 @@ fn udp_score(
     if entry.device != 0 {
         score += 4;
     }
-    if let Some(peer) = entry.peer {
-        if plain(peer) != plain(from) {
-            return None;
+    match entry.peer.map(plain) {
+        // The address of a peer an IPv6 socket had, which IPv4 does not ask.
+        Some(old) if old.port() == 0 => {
+            if v6 && old.ip() != plain(from).ip() {
+                return None;
+            }
+            score += u32::from(v6) * 4;
         }
-        score += 8;
+        Some(peer) if peer != plain(from) => return None,
+        Some(_) => score += 8,
+        None => {}
     }
     Some(score)
 }

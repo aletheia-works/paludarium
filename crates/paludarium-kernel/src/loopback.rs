@@ -471,6 +471,10 @@ pub(crate) struct Binding {
     pub(crate) listening: bool,
     /// A connected UDP socket's peer, the only sender it receives from.
     pub(crate) peer: Option<SocketAddr>,
+    /// The address of the peer an IPv6 UDP socket had before it
+    /// disconnected, which it keeps (`sk_v6_daddr`): the only one it takes
+    /// an IPv6 datagram from. IPv4's as such.
+    pub(crate) old_peer: Option<IpAddr>,
     /// The device the socket is bound to (`sk_bound_dev_if`), 0 for none:
     /// it takes only what comes in on it, and shares its port with sockets
     /// bound to others.
@@ -792,20 +796,33 @@ impl Ports {
     }
     /// `owner`, a UDP socket, connected from `address` to `peer`, or with
     /// `None` disconnected, as a TCP socket is that disconnects; on another
-    /// address it leaves its group, as Linux's `udp_lib_rehash`.
+    /// address it leaves its group, and comes after the rest, as Linux's
+    /// `udp_lib_rehash`.
     pub(crate) fn connect(
         &mut self,
         owner: &Weak<InetSocket>,
         address: SocketAddr,
         peer: Option<SocketAddr>,
     ) {
+        let mut moved = false;
         for binding in &mut self.bindings {
             if binding.is(owner) {
-                binding.pooled &= binding.address == address;
+                moved = binding.address != address;
+                binding.pooled &= !moved;
                 binding.address = address;
                 binding.peer = peer;
                 binding.link = None;
             }
+        }
+        if moved {
+            self.bindings.sort_by_key(|binding| binding.is(owner));
+        }
+    }
+    /// `owner`, an IPv6 UDP socket, disconnected from a peer of the address
+    /// `ip`, which it keeps ([`Binding::old_peer`]).
+    pub(crate) fn keep_peer(&mut self, owner: &Weak<InetSocket>, ip: Option<IpAddr>) {
+        for binding in self.bindings.iter_mut().filter(|b| b.is(owner)) {
+            binding.old_peer = ip;
         }
     }
     /// `owner` gave its port up.
@@ -910,8 +927,11 @@ impl Ports {
     /// to the device, or IPv4; among
     /// equals the last to bind, which Linux's hash holds first, or one of its
     /// group that is not connected ([`pick`]). It comes in on the device
-    /// `dif`: one bound to another takes it not, and one bound to it ranks
-    /// after a connected one, before any other.
+    /// `dif`: one bound to another does not take it, and one bound to it
+    /// ranks after a connected one, before any other but one that keeps the
+    /// address of a peer it had ([`Binding::old_peer`]), which takes an IPv6
+    /// datagram from that address alone, and ranks as one bound to a device;
+    /// both together rank as one connected.
     pub(crate) fn receiver(
         &mut self,
         to: SocketAddr,
@@ -942,6 +962,11 @@ impl Ports {
                     return None;
                 }
                 score += 16;
+            } else if let (Some(old), IpAddr::V6(_)) = (binding.old_peer, from.ip()) {
+                if old != from.ip() {
+                    return None;
+                }
+                score += 8;
             }
             if binding.device != 0 {
                 score += 8;
@@ -1026,6 +1051,7 @@ mod tests {
             pooled: false,
             listening: false,
             peer: None,
+            old_peer: None,
             device: 0,
             owner: Weak::new(),
             time_wait: None,

@@ -6515,7 +6515,10 @@ one only with an `--allow-net`.
   port stays on every address). It receives only from its
   peer, and
   `AF_UNSPEC` disconnects it, keeping only the port and address the guest
-  bound itself. A datagram holds up to 65507 bytes over IPv4 and 65527 over
+  bound itself, and no device (`__udp_disconnect`). An IPv6 socket keeps its
+  peer's address too (`sk_v6_daddr`), which `sock_diag` tells with port 0: it
+  takes an IPv6 datagram from that address alone, and any IPv4 one, until it
+  connects again. A datagram holds up to 65507 bytes over IPv4 and 65527 over
   IPv6 (`EMSGSIZE`), may be empty, and is cut to the reader's buffer
   (`MSG_TRUNC`); `FIONREAD` gives the first one's length. Each takes of the
   receive buffer what x86-64 Linux 7.0 counts as its `sk_buff`'s

@@ -1656,6 +1656,8 @@ struct State {
     link: Option<(Arc<OnceLock<Arc<Link>>>, usize)>,
     // UDP.
     peer: Option<SocketAddr>,
+    /// What [`Binding::old_peer`] has, while the socket has no port too.
+    old_peer: Option<IpAddr>,
     queries: VecDeque<Query>,
     /// Datagrams other guest sockets sent this one on the loopback.
     inbox: VecDeque<Datagram>,
@@ -2689,10 +2691,17 @@ impl InetSocket {
     /// (`inet_dgram_connect`, `ip4_datagram_connect`). AF_UNSPEC disconnects
     /// (`__udp_disconnect`), keeping only what the guest bound itself.
     fn connect_datagram(&self, address: Option<SocketAddr>) -> Result<u64, Errno> {
+        if address.is_none() {
+            // The options' lock comes before the state's.
+            self.put_device(0);
+        }
         let options = *self.options();
         let mut s = self.lock();
         let Some(address) = address else {
-            s.peer = None;
+            let peer = s.peer.take();
+            if self.family == Family::V6 {
+                s.old_peer = peer.map(|peer| peer.ip()).or(s.old_peer);
+            }
             let bindings = State {
                 bound: s.bound.take(),
                 port_locked: s.port_locked,
@@ -2702,6 +2711,7 @@ impl InetSocket {
                 ..State::default()
             };
             self.keep_locked(&mut s, &bindings);
+            self.ports().keep_peer(&self.this, s.old_peer);
             return Ok(0);
         };
         // Linux binds the port first, before it looks the route up.
@@ -2842,7 +2852,10 @@ impl InetSocket {
         // Linux's autobind finds no free port with EAGAIN.
         let bound = self
             .ports()
-            .bind(self.binding(every, options))
+            .bind(Binding {
+                old_peer: s.old_peer,
+                ..self.binding(every, options)
+            })
             .map_err(|_| Errno::EAGAIN)?;
         s.bound = Some(bound);
         Ok(bound)
@@ -3303,6 +3316,7 @@ impl InetSocket {
             pooled: self.datagram && options.reuse_port,
             listening: false,
             peer: None,
+            old_peer: None,
             device: options.device,
             owner: Weak::clone(&self.this),
             time_wait: None,
@@ -3423,6 +3437,7 @@ impl InetSocket {
         options.v6_only |= only;
         s.bound = Some(self.ports().bind(Binding {
             locked: address.port() != 0,
+            old_peer: s.old_peer,
             ..self.binding(address, &options)
         })?);
         s.port_locked = address.port() != 0;
@@ -4376,6 +4391,8 @@ pub(crate) struct Entry {
     pub(crate) table: Table,
     /// Its own address, IPv4 as such even on an IPv6 socket, and its peer's.
     pub(crate) local: SocketAddr,
+    /// The peer, or with port 0 the address an IPv6 UDP socket keeps of one
+    /// it had.
     pub(crate) peer: Option<SocketAddr>,
     /// The device it is bound to (`sk_bound_dev_if`), 0 for none.
     pub(crate) device: u32,
@@ -4501,7 +4518,7 @@ impl InetSocket {
                 },
                 table: Table::Connected,
                 local,
-                peer: s.peer,
+                peer: s.peer.or(s.old_peer.map(|ip| SocketAddr::new(ip, 0))),
                 device: options.device,
                 cookie: self.cookie(),
                 timer: (0, 0, None),

@@ -385,9 +385,10 @@ jobs:
           path: target/encodings-guests/
           retention-days: 7
 
-  # The same differential tests with the native JIT compiling every block the
-  # first time it runs, so that compiled code, not the interpreter, runs the
-  # guests' instructions (docs/design/quality.md).
+  # The same differential tests with the native JIT, in the suites that use it
+  # (docs/design/quality.md), most of them with every block compiled the first
+  # time it runs, so that compiled code, not the interpreter, runs the guests'
+  # instructions.
   differential-jit:
     name: differential tests with the native JIT (x86-64 Linux)
     needs: [changes, quick]
@@ -429,7 +430,7 @@ jobs:
       # from PALUDARIUM_TEST_JIT.
       - name: Build the emulator's binary
         run: cargo build --locked -p paludarium
-      - name: Differential tests, every block compiled the first time it runs
+      - name: Differential tests with the native JIT
         env:
           PALUDARIUM_TEST_JIT: "1"
         run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network --test diff_events --test diff_threads --test diff_files -- --nocapture

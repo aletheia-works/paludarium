@@ -79,7 +79,8 @@ fn case(name: &'static str, id: usize) {
             .with_env("TERMINAL_TEST", "value with spaces")
             .with_file("/prog", binary)
             .with_file("/regular", b"fixture".to_vec());
-        let session = Session::new(config, host.clone()).unwrap();
+        let session =
+            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap()).unwrap();
         let status = session.run().unwrap();
         println!(
             "u9 {id}: native={text:?}, emulated={status:?}/{:02x?}/{:02x?}, stop={:?}",

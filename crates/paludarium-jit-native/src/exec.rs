@@ -291,3 +291,16 @@ impl Drop for Code {
         }
     }
 }
+
+/// The calling thread's CPU time in nanoseconds.
+#[cfg(test)]
+pub(crate) fn thread_cpu_time() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a timespec the call may write.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut time) };
+    assert_eq!(result, 0);
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}

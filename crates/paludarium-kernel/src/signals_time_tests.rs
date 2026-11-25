@@ -1463,6 +1463,6 @@ fn modify_ldt_writes_and_reads_the_local_descriptor_table() {
     assert_eq!(f.ret(n, &[0, DATA + 256, 24]), 24);
     assert_eq!(entry(&f, 2), 0);
     // A child of fork has a copy.
-    let child = f.mem.fork();
+    let child = f.mem.fork().unwrap();
     assert_eq!(child.ldt().lock().unwrap().len(), 3);
 }

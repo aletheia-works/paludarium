@@ -133,8 +133,9 @@ CI run produces them afresh on an x86-64 Linux runner.
   `mise run test:diff:jit` and the `differential-jit` job of `ci.yml`.
   `diff_events` and `diff_threads` run the emulator's binary, which those
   jobs build first (`cargo build -p paludarium`); with the JIT it runs with
-  `--jit=N`, which compiles in the background, where the harness's own
-  guests compile on the thread that runs them.
+  `--jit=N`, which compiles in the background. The harness's own guests wait
+  for their code, which the JIT's own thread compiles there too, so that a
+  guest thread's CPU time has no compiling in it.
 
 - The network cases (`diff_network`) serve the guest from the test itself, on
   127.0.0.1, so that native Linux and the emulator talk to the same server;
@@ -390,15 +391,22 @@ The native JIT has no semantics of its own either. Its unit tests run every
 form it compiles, and random runs of them, from random registers, flags and
 memory, and compare the registers, flags and memory with the interpreter's;
 a stop before an instruction must be one the interpreter faults on. On every
-pull request the differential tests also run with every block compiled the
-first time it runs (`PALUDARIUM_TEST_JIT=1`, the `differential-jit` job), and
-the `jit_native` fuzz target compares compiled code with the interpreter for
-arbitrary instruction bytes. Half of the unit tests' runs start with the slots
-of the thread's TLB filled, so that compiled code loads and stores through
-them, and the MMU's tests check which pages a slot lets it read and write
-after `mprotect`, `fork`, `clear_refs` and `UFFDIO_WRITEPROTECT`. Stores
-through a slot that a load just filled again after `mprotect` and
-`UFFDIO_WRITEPROTECT` must fault, and one after `clear_refs` must set the
+pull request the `differential-jit` job also runs the differential tests with
+`PALUDARIUM_TEST_JIT=1`. The guests of `diff_core`, `diff_instructions`,
+`parallel_instructions`, `diff_signals_time`, `diff_terminal`,
+`diff_encodings`, `diff_network` and `diff_files` then run with every block
+compiled the first time it runs, on the thread that runs it, and those of
+`diff_events` and `diff_threads` with the command's `--jit=1`, which compiles
+in the background. The cases that call the interpreter itself rather than run
+a guest program run as without it, and so does all of `diff_processes` for
+now: a block's compilation on the thread that runs it counts in that thread's
+CPU clock (`cpu-timer`). The `jit_native` fuzz target compares compiled
+code with the interpreter for arbitrary instruction bytes. Half of the unit
+tests' runs start with the slots of the thread's TLB filled, so that compiled
+code loads and stores through them, and the MMU's tests check which pages a
+slot lets it read and write after `mprotect`, `fork`, `clear_refs` and
+`UFFDIO_WRITEPROTECT`. Stores through a slot that a load just filled again
+after `mprotect` and `UFFDIO_WRITEPROTECT` must fault, and one after `clear_refs` must set the
 soft-dirty bit again.
 
 ### How speed is measured

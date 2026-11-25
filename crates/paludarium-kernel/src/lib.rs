@@ -27,6 +27,7 @@ mod signals;
 mod skb;
 pub use inbox::SignalInbox;
 mod aio;
+mod blocked;
 mod bpf;
 mod bpf_classic;
 mod bpf_fs;
@@ -80,6 +81,7 @@ mod mqueue;
 #[cfg(test)]
 mod mqueue_tests;
 mod msg;
+mod multicast;
 mod namespaces;
 mod page_cache;
 mod pagemap_scan;

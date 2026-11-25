@@ -115,6 +115,7 @@ fn mremap_moves_a_page_it_holds() {
                 fixed: true,
                 keep_old: false,
                 new_addr: GuestAddr(0x4000_0000),
+                low: false,
             },
         )
         .unwrap();

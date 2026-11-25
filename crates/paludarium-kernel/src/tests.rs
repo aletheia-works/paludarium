@@ -3325,6 +3325,47 @@ fn mremap_flags_and_msync_arguments() {
     );
 }
 #[test]
+fn nothing_is_mapped_below_mmap_min_addr_without_cap_sys_rawio() {
+    let mut f = fixture();
+    let (mmap, mremap, at) = (syscalls::nr::MMAP, syscalls::nr::MREMAP, 0x6000_0000);
+    let root = f.thread.state.credentials.clone();
+    // With it they are, there and at 0, and moved there.
+    assert_eq!(f.ret(mmap, &[0, 4096, 3, 0x32, u64::MAX, 0]), 0);
+    assert_eq!(f.ret(mmap, &[at, 8192, 3, 0x32, u64::MAX, 0]), at);
+    assert_eq!(f.ret(mremap, &[at, 4096, 4096, 3, 0x1000]), 0x1000);
+    f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+    let eperm = errno(Errno::EPERM);
+    for low in [0, 0xf000] {
+        for flags in [0x32, 0x10_0022] {
+            assert_eq!(f.ret(mmap, &[low, 4096, 3, flags, u64::MAX, 0]), eperm);
+        }
+    }
+    assert_eq!(
+        f.ret(mmap, &[0x1001, 4096, 3, 0x32, u64::MAX, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(mmap, &[0x1000, 1 << 57, 3, 0x32, u64::MAX, 0]),
+        errno(Errno::ENOMEM)
+    );
+    assert_eq!(f.ret(mmap, &[0x10000, 4096, 3, 0x32, u64::MAX, 0]), 0x10000);
+    // A move unmaps its target and shrinks its source before it is refused,
+    // and what is there stays.
+    let source = at + 0x10_0000;
+    assert_eq!(f.ret(mmap, &[source, 8192, 3, 0x32, u64::MAX, 0]), source);
+    assert_eq!(f.ret(mremap, &[source, 8192, 4096, 3, 0x1000]), eperm);
+    let starts = |f: &Fixture| {
+        f.mem
+            .mappings()
+            .map(|m| (m.start.0, m.length))
+            .collect::<Vec<_>>()
+    };
+    assert!(starts(&f).contains(&(source, 4096)));
+    assert!(!starts(&f).iter().any(|&(start, _)| start == 0x1000));
+    // Without MREMAP_FIXED, a free address asked for is refused as well.
+    assert_eq!(f.ret(mremap, &[source, 4096, 4096, 5, 0x2000]), eperm);
+}
+#[test]
 fn clone3_arguments_follow_linux() {
     let f = fixture();
     let put = |words: &[u64]| {
@@ -5182,7 +5223,12 @@ mod io_uring {
         let supported: Vec<u64> = (0..58)
             .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
             .collect();
-        assert_eq!(supported, [0, 1, 2, 3, 4, 5, 14, 20, 22, 23, 29, 31, 32]);
+        assert_eq!(
+            supported,
+            [
+                0, 1, 2, 3, 4, 5, 13, 14, 16, 20, 22, 23, 26, 27, 29, 31, 32, 34, 45
+            ]
+        );
         // A probe that is not zeroed, buffers without an argument, another
         // operation, another file.
         assert_eq!(f.ret(427, &[r.fd, 8, probe, 1]), errno(Errno::EINVAL));
@@ -6951,6 +6997,377 @@ mod io_uring {
         assert_eq!(f.ret(426, &[r.fd, 0, 1, GETEVENTS]), 0);
         assert_eq!(reap(&mut f, &r), [(2, 0)]);
         assert_eq!(u32_at(&f, r.rings + 36) & TASKRUN, 0);
+    }
+
+    const ACCEPT: u8 = 13;
+    const CONNECT: u8 = 16;
+    const SEND: u8 = 26;
+    const RECV: u8 = 27;
+    const SHUTDOWN: u8 = 34;
+    const SOCKET: u8 = 45;
+    const NONEMPTY: u32 = 1 << 2;
+    const DONTWAIT: u32 = 0x40;
+    const WAITALL: u32 = 0x100;
+
+    /// A socket request: `opcode` on `fd` with `off`, `addr`, `len`,
+    /// `rw_flags` and `ioprio`.
+    fn net(
+        opcode: u8,
+        fd: u64,
+        off: u64,
+        addr: u64,
+        len: u32,
+        rw_flags: u32,
+        ioprio: u16,
+    ) -> [u8; 64] {
+        let mut e = rw(opcode, fd, off, addr, len);
+        e[28..32].copy_from_slice(&rw_flags.to_le_bytes());
+        e[2..4].copy_from_slice(&ioprio.to_le_bytes());
+        e
+    }
+
+    /// `e` with `at` set to `value`.
+    fn with(mut e: [u8; 64], at: usize, value: &[u8]) -> [u8; 64] {
+        e[at..at + value.len()].copy_from_slice(value);
+        e
+    }
+
+    /// A connected AF_UNIX pair of `kind`.
+    fn unix_pair(f: &mut Fixture, kind: u64) -> (u64, u64) {
+        let at = DATA + 0x1f00;
+        assert_eq!(f.ret(53, &[1, kind, 0, at]), 0);
+        (u64::from(u32_at(f, at)), u64::from(u32_at(f, at + 4)))
+    }
+
+    #[test]
+    fn socket_requests_check_their_entries_as_linux_7_0_does() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (a, _) = unix_pair(&mut f, 1);
+        let buf = DATA + 0x800;
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &[1, 0, 0, b'n'])
+            .unwrap();
+        for (e, res) in [
+            (net(SHUTDOWN, a, 1, 0, 1, 0, 0), -22),
+            (net(SHUTDOWN, a, 0, 1, 1, 0, 0), -22),
+            (net(SHUTDOWN, a, 0, 0, 1, 1, 0), -22),
+            (with(net(SHUTDOWN, a, 0, 0, 1, 0, 0), 40, &[1]), -22),
+            (with(net(SHUTDOWN, a, 0, 0, 1, 0, 0), 44, &[1]), -22),
+            // SHUTDOWN takes no priority, and selects no buffer.
+            (net(SHUTDOWN, a, 0, 0, 1, 0, 1), -22),
+            (with(net(SHUTDOWN, a, 0, 0, 1, 0, 0), 1, &[1 << 5]), -95),
+            (net(SOCKET, 1, 1, 1, 0, 0, 0), -22),
+            (net(SOCKET, 1, 1, 0, 0, 1, 0), -22),
+            (
+                with(net(SOCKET, 1, 1 | 0o2_000_000, 0, 0, 0, 0), 44, &[1]),
+                -22,
+            ),
+            (net(SOCKET, 1, 1 | 0x10, 0, 0, 0, 0), -22),
+            (net(ACCEPT, a, 0, 0, 1, 0, 0), -22),
+            (with(net(ACCEPT, a, 0, 0, 0, 0, 0), 40, &[1]), -22),
+            (net(ACCEPT, a, 0, 0, 0, 0, 8), -22),
+            (with(net(ACCEPT, a, 0, 0, 0, 0o2_000_000, 0), 44, &[1]), -22),
+            (with(net(ACCEPT, a, 0, 0, 0, 0, 1), 44, &[1]), -22),
+            (net(ACCEPT, a, 0, 0, 0, 1, 0), -22),
+            // A multishot accept is not there yet.
+            (net(ACCEPT, a, 0, 0, 0, 0, 1), -22),
+            (net(CONNECT, a, 4, DATA + 0x100, 1, 0, 0), -22),
+            (net(CONNECT, a, 4, DATA + 0x100, 0, 1, 0), -22),
+            (
+                with(net(CONNECT, a, 4, DATA + 0x100, 0, 0, 0), 44, &[1]),
+                -22,
+            ),
+            (net(CONNECT, a, 129, DATA + 0x100, 0, 0, 0), -22),
+            (
+                net(CONNECT, a, u64::from(u32::MAX), DATA + 0x100, 0, 0, 0),
+                -22,
+            ),
+            (net(CONNECT, a, 4, 1 << 40, 0, 0, 0), -14),
+            (net(SEND, a, 0, buf, u32::MAX, 0, 0), -22),
+            // IORING_RECVSEND_FIXED_BUF is Linux master's.
+            (net(SEND, a, 0, buf, 1, 0, 4), -22),
+            (net(SEND, a, 0, buf, 1, 0, 8), -22),
+            (with(net(SEND, a, 0, buf, 1, 0, 0), 46, &[1]), -22),
+            (net(SEND, a, 0, 1 << 63, 1, 0, 0), -14),
+            (
+                with(net(SEND, a, DATA + 0x100, buf, 1, 0, 0), 44, &[129]),
+                -22,
+            ),
+            (with(net(SEND, a, 1 << 40, buf, 1, 0, 0), 44, &[4]), -14),
+            // Bundles, vectored and selecting sends are not there yet.
+            (net(SEND, a, 0, buf, 1, 0, 16), -22),
+            (net(SEND, a, 0, buf, 1, 0, 32), -22),
+            (with(net(SEND, a, 0, buf, 1, 0, 0), 1, &[1 << 5]), -22),
+            (net(RECV, a, 1, buf, 1, 0, 0), -22),
+            (net(RECV, a, 0, buf, u32::MAX, 0, 0), -22),
+            (net(RECV, a, 0, buf, 1, 0, 4), -22),
+            (net(RECV, a, 0, buf, 1, 0, 2), -22),
+            (with(net(RECV, a, 0, buf, 1, WAITALL, 2), 1, &[1 << 5]), -22),
+            (with(net(RECV, a, 0, buf, 1, 0, 0), 44, &[1]), -22),
+            (net(RECV, a, 0, 1 << 63, 1, 0, 0), -14),
+            // A multishot receive, and a whole selected buffer, not yet.
+            (with(net(RECV, a, 0, 0, 1, 0, 2), 1, &[1 << 5]), -22),
+            (with(net(RECV, a, 0, 0, 1, WAITALL, 0), 1, &[1 << 5]), -22),
+        ] {
+            assert_eq!(one(&mut f, &r, &e), res, "{:?}", &e[..48]);
+        }
+        // The probe has them.
+        let probe = DATA + 0x1000;
+        f.mem.write(GuestAddr(probe), &[0; 16 + 8 * 58]).unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 8, probe, 58]), 0);
+        for op in [ACCEPT, CONNECT, SEND, RECV, SHUTDOWN, SOCKET] {
+            let at = probe + 16 + 8 * u64::from(op);
+            assert_eq!(bytes(&f, at, 4), [op, 0, 1, 0], "{op}");
+        }
+    }
+
+    #[test]
+    fn sends_and_receives_go_on_once_their_socket_is_ready() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (a, b) = unix_pair(&mut f, 1);
+        let (put, got) = (DATA + 0x100, DATA + 0x200);
+        f.mem.write(GuestAddr(put), b"hello").unwrap();
+        assert_eq!(one(&mut f, &r, &net(SEND, a, 0, put, 5, 0, 0)), 5);
+        // A stream tells what is left.
+        assert_eq!(
+            one_flags(&mut f, &r, &net(RECV, b, 0, got, 3, 0, 0)),
+            (3, NONEMPTY)
+        );
+        assert_eq!(
+            one_flags(&mut f, &r, &net(RECV, b, 0, got + 3, 8, 0, 0)),
+            (2, 0)
+        );
+        assert_eq!(bytes(&f, got, 5), b"hello");
+        // Nothing to read: it waits, unless MSG_DONTWAIT.
+        assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 8, DONTWAIT, 0)), -11);
+        assert_eq!(batch(&mut f, &r, &[net(RECV, b, 0, got, 8, 0, 0)]), []);
+        assert_eq!(f.ret(1, &[a, put, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 2)]);
+        // MSG_WAITALL on a stream goes on to the whole length.
+        assert_eq!(
+            batch(&mut f, &r, &[net(RECV, b, 0, got, 4, WAITALL, 0)]),
+            []
+        );
+        assert_eq!(f.ret(1, &[a, put, 2]), 2);
+        assert_eq!(reap(&mut f, &r), []);
+        assert_eq!(f.ret(1, &[a, put + 2, 2]), 2);
+        assert_eq!(reap(&mut f, &r), [(1, 4)]);
+        assert_eq!(bytes(&f, got, 4), b"hell");
+        // One that cannot wait for the rest, or is cancelled as it waits,
+        // gives what it read.
+        assert_eq!(f.ret(1, &[a, put, 2]), 2);
+        let both = DONTWAIT | WAITALL;
+        assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 4, both, 0)), 2);
+        assert_eq!(
+            batch(&mut f, &r, &[net(RECV, b, 0, got, 4, WAITALL, 0)]),
+            []
+        );
+        assert_eq!(f.ret(1, &[a, put, 3]), 3);
+        assert_eq!(reap(&mut f, &r), []);
+        assert_eq!(batch(&mut f, &r, &[cancel(9, 1, 0, 0)]), [(9, 0), (1, 3)]);
+        // IORING_RECVSEND_POLL_FIRST waits first, then reads what is there.
+        assert_eq!(f.ret(1, &[a, put, 1]), 1);
+        assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 8, 0, 1)), 1);
+        // With MSG_DONTWAIT too, it gives EAGAIN.
+        assert_eq!(f.ret(1, &[a, put, 1]), 1);
+        assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 8, DONTWAIT, 1)), -11);
+        assert_eq!(f.ret(0, &[b, got, 8]), 1);
+        // A file that is no socket, as Linux master checks it first.
+        let ends = DATA + 0x300;
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let read = u64::from(u32_at(&f, ends));
+        assert_eq!(one(&mut f, &r, &net(RECV, read, 0, got, 8, 0, 1)), -88);
+        assert_eq!(one(&mut f, &r, &net(SEND, read, 0, put, 1, 0, 0)), -88);
+        assert_eq!(one(&mut f, &r, &net(SHUTDOWN, read, 0, 0, 1, 0, 0)), -88);
+        assert_eq!(one(&mut f, &r, &net(ACCEPT, read, 0, 0, 0, 0, 0)), -88);
+        assert_eq!(one(&mut f, &r, &net(RECV, 99, 0, got, 8, 0, 0)), -9);
+        // A datagram tells nothing of what is left.
+        let (c, d) = unix_pair(&mut f, 2);
+        assert_eq!(one(&mut f, &r, &net(SEND, c, 0, put, 2, 0, 0)), 2);
+        assert_eq!(one(&mut f, &r, &net(SEND, c, 0, put, 2, 0, 0)), 2);
+        assert_eq!(
+            one_flags(&mut f, &r, &net(RECV, d, 0, got, 8, 0, 0)),
+            (2, 0)
+        );
+        // A shutdown: the peer reads the end, and a send is EPIPE (no
+        // SIGPIPE: MSG_NOSIGNAL).
+        assert_eq!(one(&mut f, &r, &net(SHUTDOWN, a, 0, 0, 1, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 8, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &net(SEND, a, 0, put, 1, 0, 0)), -32);
+        assert_eq!(one(&mut f, &r, &net(SHUTDOWN, a, 0, 0, 7, 0, 0)), -22);
+    }
+
+    #[test]
+    fn a_receive_gives_back_its_provided_buffer_while_it_waits() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let (a, b) = unix_pair(&mut f, 1);
+        let (put, buf) = (DATA + 0x100, DATA + 0x800);
+        let receive = with(net(RECV, b, 0, 0, 0, 0, 0), 1, &[1 << 5]);
+        let receive = with(receive, 40, &4u16.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &receive), -105);
+        assert_eq!(one(&mut f, &r, &provide(1, buf, 8, 4, 3)), 0);
+        assert_eq!(batch(&mut f, &r, &[receive]), []);
+        // It is in the group again, so another may take it.
+        assert_eq!(one(&mut f, &r, &remove(1, 4)), 1);
+        assert_eq!(one(&mut f, &r, &provide(1, buf, 8, 4, 5)), 0);
+        f.mem.write(GuestAddr(put), b"abc").unwrap();
+        assert_eq!(f.ret(1, &[a, put, 3]), 3);
+        let head = u32_at(&f, r.rings + 8);
+        let at = r.rings + 64 + 16 * u64::from(head & 7);
+        assert_eq!(
+            (u32_at(&f, at + 8) as i32, u32_at(&f, at + 12)),
+            (3, BUFFER | 5 << 16)
+        );
+        assert_eq!(reap(&mut f, &r).len(), 1);
+        assert_eq!(bytes(&f, buf, 3), b"abc");
+        // One that reads the end gives it back too.
+        assert_eq!(one(&mut f, &r, &provide(1, buf, 8, 4, 6)), 0);
+        assert_eq!(f.ret(48, &[a, 1]), 0);
+        assert_eq!(one_flags(&mut f, &r, &receive), (0, 0));
+        assert_eq!(one(&mut f, &r, &remove(1, 4)), 1);
+    }
+
+    /// `bind` and `listen` of a new AF_UNIX stream socket at the abstract
+    /// name `n`, whose address is at `DATA + 0x100`.
+    fn listener(f: &mut Fixture, r: &Ring, backlog: u64) -> u64 {
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &[1, 0, 0, b'n'])
+            .unwrap();
+        let fd = one(f, r, &net(SOCKET, 1, 1, 0, 0, 0, 0));
+        assert!(fd >= 0, "{fd}");
+        let fd = fd as u64;
+        assert_eq!(f.ret(49, &[fd, DATA + 0x100, 4]), 0);
+        assert_eq!(f.ret(50, &[fd, backlog]), 0);
+        fd
+    }
+
+    #[test]
+    fn accepts_and_connects_go_on_once_their_socket_is_ready() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let server = listener(&mut f, &r, 4);
+        // None waiting.
+        assert_eq!(one(&mut f, &r, &net(ACCEPT, server, 0, 0, 0, 0, 2)), -11);
+        assert_eq!(
+            one(&mut f, &r, &net(ACCEPT, server, 0, 0, 0, 0, 2 | 4)),
+            -11
+        );
+        // One waits, and takes the connection that comes, with its peer's
+        // address (an unnamed socket's family alone).
+        let (name, size) = (DATA + 0x400, DATA + 0x480);
+        f.mem.write(GuestAddr(size), &16u32.to_le_bytes()).unwrap();
+        let mut take = net(ACCEPT, server, size, name, 0, 0o2_000_000, 0);
+        take[32..40].copy_from_slice(&7u64.to_le_bytes());
+        assert_eq!(batch(&mut f, &r, &[take]), []);
+        let client = one(&mut f, &r, &net(SOCKET, 1, 1, 0, 0, 0, 0)) as u64;
+        let slot = u32_at(&f, r.rings + 4) & 3;
+        push(
+            &mut f,
+            &r,
+            slot,
+            &net(CONNECT, client, 4, DATA + 0x100, 0, 0, 0),
+        );
+        assert_eq!(f.ret(426, &[r.fd, 1, 2, GETEVENTS]), 1);
+        let done = reap(&mut f, &r);
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert_eq!(done[0], (1, 0));
+        let (user_data, accepted) = done[1];
+        assert_eq!(user_data, 7);
+        assert!(accepted > client as i32, "{accepted}");
+        assert_eq!(u32_at(&f, size), 2);
+        // SOCK_CLOEXEC.
+        assert_eq!(f.ret(72, &[accepted as u64, 1]), 1);
+        assert_eq!(
+            one(&mut f, &r, &net(CONNECT, client, 4, DATA + 0x100, 0, 0, 0)),
+            -106
+        );
+        // A nonblocking client whose listener's backlog is full completes
+        // with EAGAIN, as Linux master's does.
+        let full = listener_named(&mut f, &r, b'm', 0);
+        let one_client = one(&mut f, &r, &net(SOCKET, 1, 1 | 0o4000, 0, 0, 0, 0)) as u64;
+        assert_eq!(
+            one(
+                &mut f,
+                &r,
+                &net(CONNECT, one_client, 4, DATA + 0x100, 0, 0, 0)
+            ),
+            0
+        );
+        let other = one(&mut f, &r, &net(SOCKET, 1, 1 | 0o4000, 0, 0, 0, 0)) as u64;
+        assert_eq!(
+            one(&mut f, &r, &net(CONNECT, other, 4, DATA + 0x100, 0, 0, 0)),
+            -11
+        );
+        assert!(one(&mut f, &r, &net(ACCEPT, full, 0, 0, 0, 0, 0)) >= 0);
+    }
+
+    /// [`listener`] at the abstract name `name`.
+    fn listener_named(f: &mut Fixture, r: &Ring, name: u8, backlog: u64) -> u64 {
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &[1, 0, 0, name])
+            .unwrap();
+        let fd = one(f, r, &net(SOCKET, 1, 1, 0, 0, 0, 0)) as u64;
+        assert_eq!(f.ret(49, &[fd, DATA + 0x100, 4]), 0);
+        assert_eq!(f.ret(50, &[fd, backlog]), 0);
+        fd
+    }
+
+    #[test]
+    fn sockets_and_connections_go_in_registered_slots() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let list = DATA + 0x500;
+        let in_slot = |slot: u32| with(net(SOCKET, 1, 1, 0, 0, 0, 0), 44, &slot.to_le_bytes());
+        // No registered files.
+        assert_eq!(one(&mut f, &r, &in_slot(1)), -6);
+        assert_eq!(one(&mut f, &r, &in_slot(u32::MAX)), -23);
+        fds(&f, list, &[-1, -1]);
+        assert_eq!(f.ret(427, &[r.fd, 2, list, 2]), 0);
+        assert_eq!(one(&mut f, &r, &in_slot(3)), -22);
+        let before = f.ret(32, &[0]);
+        assert_eq!(one(&mut f, &r, &in_slot(2)), 0);
+        assert_eq!(one(&mut f, &r, &in_slot(u32::MAX)), 0);
+        assert_eq!(one(&mut f, &r, &in_slot(u32::MAX)), -23);
+        // No descriptor stayed.
+        assert_eq!(f.ret(32, &[0]), before + 1);
+        // Nor is one needed: RLIMIT_NOFILE does not refuse a slot.
+        let limit = DATA + 0x600;
+        assert_eq!(f.ret(97, &[7, limit]), 0);
+        let soft = f.mem.read_u64(GuestAddr(limit)).unwrap();
+        f.mem.write_u64(GuestAddr(limit), 1).unwrap();
+        assert_eq!(f.ret(160, &[7, limit]), 0);
+        assert_eq!(one(&mut f, &r, &net(SOCKET, 1, 1, 0, 0, 0, 0)), -24);
+        assert_eq!(one(&mut f, &r, &in_slot(2)), 0);
+        f.mem.write_u64(GuestAddr(limit), soft).unwrap();
+        assert_eq!(f.ret(160, &[7, limit]), 0);
+        // Slot 1 listens; a connection to it goes in slot 0.
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &[1, 0, 0, b'k'])
+            .unwrap();
+        let server = listener_named(&mut f, &r, b'k', 4);
+        let client = one(&mut f, &r, &net(SOCKET, 1, 1, 0, 0, 0, 0)) as u64;
+        assert_eq!(
+            one(&mut f, &r, &net(CONNECT, client, 4, DATA + 0x100, 0, 0, 0)),
+            0
+        );
+        let accept = with(net(ACCEPT, server, 0, 0, 0, 0, 0), 44, &1u32.to_le_bytes());
+        assert_eq!(one(&mut f, &r, &accept), 0);
+        let (put, got) = (DATA + 0x200, DATA + 0x300);
+        f.mem.write(GuestAddr(put), b"xy").unwrap();
+        let mut send = net(SEND, 0, 0, put, 2, 0, 0);
+        send[1] = 1;
+        assert_eq!(one(&mut f, &r, &send), 2);
+        assert_eq!(f.ret(0, &[client, got, 8]), 2);
+        // A connection SOCK_CLOEXEC cannot go in a slot.
+        let cloexec = with(
+            net(ACCEPT, server, 0, 0, 0, 0o2_000_000, 0),
+            44,
+            &1u32.to_le_bytes(),
+        );
+        assert_eq!(one(&mut f, &r, &cloexec), -22);
     }
 }
 
@@ -12413,6 +12830,118 @@ fn chroot_keeps_paths_to_the_new_root() {
     let p = s(&mut f, 0, b"/none");
     assert_eq!(f.ret(161, &[p]), errno(Errno::ENOENT));
 }
+/// A `..` that climbs above the root as written goes up from the target of
+/// the symbolic link before it, and a walk that ends early ends there, as
+/// Linux's `link_path_walk` does.
+#[test]
+fn a_dotdot_after_a_link_climbs_from_its_target_in_a_root() {
+    let mut f = fixture();
+    let s = |f: &mut Fixture, at: u64, text: &[u8]| -> u64 {
+        let mut bytes = text.to_vec();
+        bytes.push(0);
+        f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+        DATA + at
+    };
+    for dir in ["/jail", "/jail/d", "/jail/d/e", "/jail/d/e/g", "/d"] {
+        let p = s(&mut f, 0, dir.as_bytes());
+        assert_eq!(f.ret(83, &[p, 0o755]), 0);
+    }
+    let files = [
+        ("/f", "out"),
+        ("/jail/f", "in"),
+        ("/jail/d/f", "mid"),
+        ("/jail/d/e/f", "low"),
+    ];
+    for (path, text) in files {
+        let p = s(&mut f, 0, path.as_bytes());
+        let fd = f.ret(2, &[p, 0o101, 0o644]);
+        let data = s(&mut f, 0x100, text.as_bytes());
+        assert_eq!(f.ret(1, &[fd, data, text.len() as u64]), text.len() as u64);
+        f.ret(3, &[fd]);
+    }
+    let links = [
+        ("/d/e/g", "/jail/over"),
+        ("d/e/g", "/jail/deep"),
+        ("over/..", "/jail/chain"),
+        ("loop", "/jail/loop"),
+        ("/d/none", "/jail/gone"),
+        ("f", "/jail/file"),
+    ];
+    for (target, link) in links {
+        let (target, link) = (
+            s(&mut f, 0, target.as_bytes()),
+            s(&mut f, 0x80, link.as_bytes()),
+        );
+        assert_eq!(f.ret(88, &[target, link]), 0);
+    }
+    let p = s(&mut f, 0, b"/jail");
+    assert_eq!(f.ret(161, &[p]), 0);
+    let p = s(&mut f, 0, b"/");
+    assert_eq!(f.ret(80, &[p]), 0);
+    let mut read = |path: &str| -> String {
+        let p = s(&mut f, 0, path.as_bytes());
+        let fd = f.ret(2, &[p, 0, 0]);
+        if (fd as i64) < 0 {
+            return format!("errno {}", -(fd as i64));
+        }
+        let n = f.ret(0, &[fd, DATA + 0x200, 16]);
+        let mut out = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x200), &mut out).unwrap();
+        f.ret(3, &[fd]);
+        String::from_utf8(out).unwrap()
+    };
+    for (path, found) in [
+        ("/over/../../f", "mid"),
+        ("/deep/../../f", "mid"),
+        ("../deep/../../f", "mid"),
+        ("/../over/../f", "low"),
+        ("/over/../../../f", "in"),
+        ("/over/../../../../f", "in"),
+        ("/chain/../../over/../f", "low"),
+        ("/over/.././/../f", "mid"),
+        ("/over/../../f/", "errno 20"),
+        ("/over/../../f/.", "errno 20"),
+        ("/none/../../f", "errno 2"),
+        ("/f/../../f", "errno 20"),
+        ("/file/../../f", "errno 20"),
+        ("/loop/../../f", "errno 40"),
+        ("/gone/../../f", "errno 2"),
+        ("/f/../..", "errno 20"),
+        ("/over/../../../loop", "errno 40"),
+    ] {
+        assert_eq!(read(path), found, "{path}");
+    }
+    // A name made or removed there, and a working directory.
+    let made = s(&mut f, 0, b"/over/../../made");
+    assert_eq!(f.ret(83, &[made, 0o755]), 0);
+    let p = s(&mut f, 0x80, b"/d/made");
+    assert_eq!(f.ret(84, &[p]), 0);
+    for (path, result) in [
+        (&b"/none/../.."[..], errno(Errno::ENOENT)),
+        (b"/f/../..", errno(Errno::ENOTDIR)),
+        (b"/over/../..", 0),
+    ] {
+        let p = s(&mut f, 0, path);
+        assert_eq!(f.ret(80, &[p]), result);
+    }
+    let n = f.ret(79, &[DATA + 0x1000, 256]);
+    let mut out = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x1000), &mut out).unwrap();
+    assert_eq!(out, b"/d\0");
+    // An unsearched directory refuses before a missing name in it.
+    let p = s(&mut f, 0, b"/d/e");
+    assert_eq!(f.ret(90, &[p, 0o600]), 0);
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    for path in [&b"/d/e/none/../../../../f"[..], b"/d/e/../../../f"] {
+        let p = s(&mut f, 0, path);
+        assert_eq!(f.ret(2, &[p, 0, 0]), errno(Errno::EACCES));
+    }
+}
 /// `/proc/self/root` is the root, and the links read from the reader's
 /// root, as Linux's `d_path` gives them.
 #[test]
@@ -12906,6 +13435,49 @@ mod mapping_names {
             name(&f, shared).as_deref(),
             Some(&b"/top/moved (deleted)"[..])
         );
+    }
+
+    #[test]
+    fn a_rename_from_another_root_moves_the_name_too() {
+        let mut f = fixture();
+        let path = |f: &Fixture, n: u64, p: &[u8]| {
+            let at = DATA + 0x100 * n;
+            f.mem.write(GuestAddr(at), &[p, b"\0"].concat()).unwrap();
+            at
+        };
+        let map = |f: &mut Fixture, file: u64, flags: u64| {
+            let fd = f.ret(2, &[file, flags, 0o644]);
+            assert!(fd < 1 << 32, "{fd:#x}");
+            if flags != 0 {
+                assert_eq!(f.ret(77, &[fd, 0x1000]), 0);
+            }
+            f.ret(9, &[0, 0x1000, 1, 2, fd, 0])
+        };
+        let jail = path(&f, 0, b"/jail");
+        assert_eq!(f.ret(83, &[jail, 0o755]), 0);
+        let file = path(&f, 1, b"/jail/file");
+        let outside = map(&mut f, file, 0o102);
+        assert_eq!(name(&f, outside).as_deref(), Some(&b"/jail/file"[..]));
+        // chroot("/jail"); then rename("/file", "/moved") from there.
+        assert_eq!(f.ret(161, &[jail]), 0);
+        let (inner, moved) = (path(&f, 2, b"/file"), path(&f, 3, b"/moved"));
+        assert_eq!(f.ret(82, &[inner, moved]), 0);
+        assert_eq!(name(&f, outside).as_deref(), Some(&b"/jail/moved"[..]));
+        // Opened there through an absolute symbolic link, which starts at
+        // that root, and renamed once more.
+        let link = path(&f, 4, b"/link");
+        assert_eq!(f.ret(88, &[moved, link]), 0);
+        let inside = map(&mut f, link, 0);
+        assert_eq!(name(&f, inside).as_deref(), Some(&b"/jail/moved"[..]));
+        let last = path(&f, 5, b"/last");
+        assert_eq!(f.ret(82, &[moved, last]), 0);
+        for at in [outside, inside] {
+            assert_eq!(name(&f, at).as_deref(), Some(&b"/jail/last"[..]));
+        }
+        assert_eq!(f.ret(87, &[last]), 0);
+        for at in [outside, inside] {
+            assert_eq!(name(&f, at).as_deref(), Some(&b"/jail/last (deleted)"[..]));
+        }
     }
 }
 

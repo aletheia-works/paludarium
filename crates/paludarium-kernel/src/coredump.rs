@@ -82,13 +82,15 @@ impl Identity {
     }
 }
 
-/// Writes the core through `emit`, in the pieces Linux writes it in, and
+/// Writes the core, of a process whose root is `root`, through `emit`, in
+/// the pieces Linux writes it in, and
 /// returns whether all of it fit under the limit and was written. A piece that would pass
 /// the limit is not written, nor anything after it.
 pub(crate) fn write(
     dump: &Dump,
     who: &Identity,
     mem: &AddressSpace,
+    root: &[u8],
     emit: &mut dyn FnMut(&[u8]) -> bool,
 ) -> bool {
     let mappings: Vec<Mapping> = mem.mappings().collect();
@@ -111,7 +113,7 @@ pub(crate) fn write(
         segments.push((vma, dump_length(mem, &vma, first_elf == Some(start))));
     }
     let vmas: Vec<Mapping> = segments.iter().map(|&(vma, _)| vma).collect();
-    let notes = notes(dump, who, mem, &files(mem, &vmas));
+    let notes = notes(dump, who, mem, &files(mem, &vmas, root));
     let count = segments.len() + 2;
     let notes_offset = 64 + 56 * count as u64;
     let notes_size: u64 = notes.iter().map(|n| n.len() as u64).sum();
@@ -478,8 +480,10 @@ fn arguments(who: &Identity, mem: &AddressSpace) -> Vec<u8> {
 /// The `NT_FILE` note of the VMAs that map a file, as Linux's
 /// `fill_files_note` lists them: their count, the page size, the start,
 /// end and page offset in its file of each, then their paths. Shared
-/// anonymous memory maps the file Linux names `/dev/zero (deleted)`.
-fn files(mem: &AddressSpace, vmas: &[Mapping]) -> Vec<u8> {
+/// anonymous memory maps the file Linux names `/dev/zero (deleted)`. A path
+/// is as `d_path` gives it: from `root` when it is under it, else from the
+/// machine's root.
+fn files(mem: &AddressSpace, vmas: &[Mapping], root: &[u8]) -> Vec<u8> {
     let mut count = 0u64;
     let mut ranges = Vec::new();
     let mut names = Vec::new();
@@ -488,7 +492,7 @@ fn files(mem: &AddressSpace, vmas: &[Mapping]) -> Vec<u8> {
             continue;
         };
         let name = match file.name {
-            Some(name) => name,
+            Some(name) => crate::files::seen_from(root, &name).unwrap_or(name),
             None if !file.source => b"/dev/zero (deleted)".to_vec(),
             None => continue,
         };
@@ -573,13 +577,45 @@ mod coredump_tests {
         mem.mark_shared(shared, PAGE).unwrap();
         let vmas: Vec<Mapping> = mem.mappings().collect();
         assert_eq!(vmas.len(), 3);
-        let note = files(&mem, &vmas);
+        let note = files(&mem, &vmas, b"/");
         let word = |i: usize| u64::from_le_bytes(note[8 * i..8 * i + 8].try_into().unwrap());
         assert_eq!((word(0), word(1)), (2, PAGE));
         // Lowest first: the shared memory was placed last, below the rest.
         assert_eq!((word(2), word(3), word(4)), (shared.0, shared.0 + PAGE, 0));
         assert_eq!((word(5), word(6), word(7)), (file.0, file.0 + 2 * PAGE, 2));
         assert_eq!(&note[64..], b"/dev/zero (deleted)\0/data\0");
+    }
+
+    #[test]
+    fn the_files_note_names_a_file_under_the_root_from_it() {
+        struct At(&'static [u8]);
+        impl PageSource for At {
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+                Ok(buf.len())
+            }
+            fn name(&self) -> Option<Vec<u8>> {
+                Some(self.0.to_vec())
+            }
+        }
+        let mut mem = AddressSpace::new();
+        let mut vmas = Vec::new();
+        for (n, name) in [&b"/jail/file"[..], b"/jail/gone (deleted)", b"/jailed/file"]
+            .into_iter()
+            .enumerate()
+        {
+            let at = GuestAddr(0x10_0000 + 2 * PAGE * n as u64);
+            mem.map(Some(at), PAGE, Prot::READ, MappingKind::File)
+                .unwrap();
+            let pages = SharedPages::new().with_source(Arc::new(At(name)));
+            mem.back_with_cache(at, PAGE, &pages, 0).unwrap();
+        }
+        vmas.extend(mem.mappings());
+        let names = |root: &[u8]| files(&mem, &vmas, root)[16 + 3 * 24..].to_vec();
+        assert_eq!(names(b"/jail"), b"/file\0/gone (deleted)\0/jailed/file\0");
+        assert_eq!(
+            names(b"/"),
+            b"/jail/file\0/jail/gone (deleted)\0/jailed/file\0"
+        );
     }
 
     #[test]
@@ -595,7 +631,7 @@ mod coredump_tests {
             .unwrap();
         let vmas: Vec<Mapping> = mem.mappings().collect();
         assert_eq!(vmas.len(), 2);
-        let note = files(&mem, &vmas);
+        let note = files(&mem, &vmas, b"/");
         let word = |i: usize| u64::from_le_bytes(note[8 * i..8 * i + 8].try_into().unwrap());
         assert_eq!(word(0), 2);
         assert_eq!((word(2), word(3), word(4)), (file.0, file.0 + PAGE, 2));
@@ -629,7 +665,7 @@ mod coredump_tests {
             length,
             ..first
         };
-        let note = files(&mem, &[vma]);
+        let note = files(&mem, &[vma], b"/");
         let word = |i: usize| u64::from_le_bytes(note[8 * i..8 * i + 8].try_into().unwrap());
         assert_eq!(word(0), 1);
         assert_eq!((word(2), word(3), word(4)), (low.0, low.0 + 2 * PAGE, 1));

@@ -2478,6 +2478,17 @@ const MAP_STACK: u64 = 0x2_0000;
 const MAP_GROWSDOWN: u64 = 0x100;
 const MAP_32BIT: u64 = 0x40;
 
+/// Whether a mapping of `len` bytes at `addr` is refused for lying below
+/// `mmap_min_addr` (`cap_mmap_addr`): one that fits in what a program may
+/// map, without CAP_SYS_RAWIO in the first user namespace.
+pub(crate) fn below_min(c: &Context<'_>, addr: u64, len: u64) -> bool {
+    let fits = len
+        .checked_next_multiple_of(4096)
+        .and_then(|len| addr.checked_add(len))
+        .is_some_and(|end| end <= USER_ADDRESS_LIMIT - 4096);
+    addr < paludarium_mmu::MMAP_MIN_ADDR && fits && !c.process.credentials.may_map_low()
+}
+
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
     let Some(prot) = Prot::from_bits(prot) else {
@@ -2537,6 +2548,12 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             }
             Err(e) => err(e),
         };
+    }
+    // A fixed mapping below `mmap_min_addr`, in what a program may map,
+    // needs CAP_SYS_RAWIO (`security_mmap_addr`), before its file is asked.
+    if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 && addr & 4095 == 0 && below_min(c, addr, len)
+    {
+        return err(Errno::EPERM);
     }
     let event = file
         .as_ref()
@@ -3988,6 +4005,7 @@ fn sys_mremap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         fixed: flags & MREMAP_FIXED != 0,
         keep_old: flags & MREMAP_DONTUNMAP != 0,
         new_addr: GuestAddr(new_addr),
+        low: c.process.credentials.may_map_low(),
     };
     let keep_old = how.keep_old;
     // A locked VMA that grows must fit under RLIMIT_MEMLOCK

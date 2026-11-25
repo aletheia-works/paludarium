@@ -1565,6 +1565,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   によるそこへの移動（移動先をアンマップし、元を縮めたあと。`MREMAP_DONTUNMAP` だけで求めた空き
   アドレスへも）と、そこへの `shmat` は、`CAP_SYS_RAWIO` がなければ `EPERM` です。
 
+- `MAP_HUGETLB` は、ヒュージページのプールが空（`vm.nr_hugepages` が 0）の Linux と同じように
+  マップします。Linux が先にする確認のあと `ENOMEM` で、固定のマッピングはそのとき置き換える
+  範囲をすでにアンマップしています。`MAP_NORESERVE` があれば成功し、アクセスすると `SIGBUS`
+  になります。このマッピングは 2 MiB の境目に置かれ、分割、`mremap`、破棄も境目でだけできます
+  （ほかは `EINVAL`）。広げることはできず、`smaps` には `ht` と 2 MiB のページが出ます。仮想 CPU に
+  1 GiB のページはないので、大きさは 2 MiB だけです（ほかは `EINVAL`）。このフラグを付けたファイルの
+  マッピングは `EINVAL` です。
+
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて
   いません。`pkey_alloc` は `ENOSPC` で、フラグや `PKEY_DISABLE_ACCESS` と

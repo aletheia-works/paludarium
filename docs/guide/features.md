@@ -1774,6 +1774,15 @@ kernel.
   source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone
   too) and a `shmat` there give `EPERM` without `CAP_SYS_RAWIO`.
 
+- `MAP_HUGETLB` maps as on a Linux whose pool of huge pages is empty
+  (`vm.nr_hugepages` 0): `ENOMEM`, after the checks Linux makes first, when
+  a fixed mapping has unmapped what it would replace. With `MAP_NORESERVE`
+  it succeeds, and an access raises `SIGBUS`. Such a mapping goes at a 2 MiB
+  boundary, is split, remapped and dropped only on one (`EINVAL`), cannot
+  grow, and shows `ht` and its 2 MiB pages in `smaps`. The only size is
+  2 MiB (another is `EINVAL`), as the virtual CPU has no 1 GiB pages, and a
+  file with the flag is `EINVAL`.
+
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or

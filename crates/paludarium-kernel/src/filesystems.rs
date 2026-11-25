@@ -5,11 +5,20 @@ use paludarium_types::{Errno, GuestAddr};
 use crate::syscalls::{Context, Outcome};
 
 /// The types of the files the emulator gives, as their `statfs` names them:
-/// tmpfs, `/proc`, sockets, the BPF file system, pipes, pseudo-terminals,
-/// POSIX message queues and the host's files (ext4's), in the order Linux
-/// registers them (its boot's initcalls). Linux has many more.
-pub(crate) const TYPES: [&[u8]; 8] = [
-    b"tmpfs", b"proc", b"sockfs", b"bpf", b"pipefs", b"devpts", b"ext4", b"mqueue",
+/// tmpfs, `/proc`, sockets, the BPF file system, pipes, huge pages,
+/// pseudo-terminals, POSIX message queues and the host's files (ext4's), in
+/// the order Linux registers them (its boot's initcalls). Linux has many
+/// more.
+pub(crate) const TYPES: [&[u8]; 9] = [
+    b"tmpfs",
+    b"proc",
+    b"sockfs",
+    b"bpf",
+    b"pipefs",
+    b"hugetlbfs",
+    b"devpts",
+    b"ext4",
+    b"mqueue",
 ];
 
 /// `PATH_MAX`, the longest name `sysfs` reads, its NUL included.

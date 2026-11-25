@@ -65,8 +65,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルシステムごとに大きさを決める大きなフォリオがありません。`pagemap` も同じ
   ページを示します。ヒュージページもプロテクションキーも
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
+  `dp`（`MAP_DROPPABLE`）がありません。
   `write` で埋めたホストのファイルのページはクリーンです（下の「`write` で埋めたページ」）。
+- **ヒュージページ**：hugetlbfs のプールは空で、増やせません。`/proc/sys/vm/nr_hugepages`
+  （書き込む先）も `/sys/kernel/mm/hugepages` もなく、`sysfs` は `hugetlbfs` を並べますが
+  マウントはできません（`ENODEV`）。`MFD_HUGETLB` と `SHM_HUGETLB` は、hugetlbfs のない
+  カーネルと同じく `ENOSYS` です。プールが空の Linux では memfd は作られ、セグメントは `EPERM` か
+  `ENOMEM` です。1 GiB のページの `MAP_HUGETLB` は、それのない CPU と同じく `EINVAL` で、
+  差分テストは比べません。`userfaultfd` はこのマッピングを登録せず、`maps` でのデバイスは 0 です。
 - **`/proc/<pid>/mem` の `i64::MAX` を超える位置**：`pread64` と `pwrite64` は、
   Linux v7.0 の `ksys_pread64` と `ksys_pwrite64` がどのファイルでもするのと同じく、
   これを拒みます（`EINVAL`）。Linux master は符号なしの位置のファイル
@@ -620,7 +626,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `syslog` が読むカーネルのログはいつも空です。Linux のログには起動時のメッセージが
     あります。`kernel.dmesg_restrict` はいつも 1 です（`/proc/sys/kernel/dmesg_restrict`、
     `/proc/kmsg`、`/dev/kmsg` はありません）。`sysfs` が知っているファイルシステムの種類は
-    7 つだけで、Linux には何十もあります。そのため、順は同じでも番号は Linux と違います。
+    9 つだけで、Linux には何十もあります。そのため、順は同じでも番号は Linux と違います。
     AppArmor も SELinux もありません。`lsm_list_modules` が並べるのは 4 つのモジュールで、
     Linux が AppArmor のコンテキストを返すところで、`lsm_get_self_attr` は属性を見つけません。
   - カーネルはいつも integrity でロックダウンしています。Secure Boot でない Linux は

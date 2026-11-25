@@ -18341,6 +18341,144 @@ static int io_uring_placement_case(void) {
     }
     return 0;
 }
+/* The mmap-hugetlb case: MAP_HUGETLB with no huge page in the pool, as
+   Linux starts (nr_hugepages 0). A mapping that would reserve pages is
+   ENOMEM, after what do_mmap and hugetlbfs check first, and a fixed one has
+   unmapped what it replaces by then. MAP_NORESERVE maps, and an access is
+   SIGBUS; the VMA is split, remapped and dropped only on 2 MiB. */
+#define HUGE_2M (2ul << 20)
+static void huge_smaps(const char *label, char *at) {
+    char line[512], *tail;
+    FILE *f = fopen("/proc/self/smaps", "r");
+    int in = 0;
+    unsigned long start, end;
+    printf("%s:", label);
+    while (f && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\n")] = 0;
+        if (sscanf(line, "%lx-%lx ", &start, &end) == 2) {
+            in = start == (uintptr_t)at;
+            if (in && (tail = strchr(line, '/'))) printf(" size=%lu name=%s", end - start, tail);
+        } else if (in && (strstr(line, "PageSize:") || strstr(line, "VmFlags:"))) {
+            char *p = strchr(line, ':') + 1;
+            printf(" [%.*s=%s]", (int)(strcspn(line, ":")), line, p + strspn(p, " "));
+        }
+    }
+    printf("\n");
+    if (f) fclose(f);
+}
+static int mmap_hugetlb_case(void) {
+    long page = 4096;
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    int huge = anon | MAP_HUGETLB, none = huge | MAP_NORESERVE;
+    char line[256];
+    FILE *f = fopen("/proc/meminfo", "r");
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "HugePages_Total", 15)) printf("%s", line);
+    if (f) fclose(f);
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 80;
+    struct sigaction action = {.sa_flags = SA_SIGINFO};
+    action.sa_sigaction = on_bus;
+    sigaction(SIGBUS, &action, NULL);
+    printf("plain=%d", low_error(mmap(NULL, HUGE_2M, rw, huge, -1, 0)));
+    printf(" shared=%d", low_error(mmap(NULL, HUGE_2M, rw, MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0)));
+    printf(" byte=%d", low_error(mmap(NULL, 1, rw, huge, -1, 0)));
+    printf(" empty=%d", low_error(mmap(NULL, 0, rw, huge, -1, 0)));
+    printf(" long=%d\n", low_error(mmap(NULL, 1ul << 57, rw, huge, -1, 0)));
+    int sizes[] = {1, 12, 20, 21, 22, 29, 63};
+    for (int i = 0; i < 7; i++)
+        printf("size-%d=%d\n", sizes[i],
+               low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw,
+                                         (unsigned long)none | (unsigned long)sizes[i] << 26, -1L, 0L)));
+    int zero = open("/dev/zero", O_RDWR), self = open("/proc/self/exe", O_RDONLY);
+    printf("file=%d", low_error(mmap(NULL, HUGE_2M, PROT_READ, MAP_PRIVATE | MAP_HUGETLB, self, 0)));
+    printf(" zero=%d", low_error(mmap(NULL, HUGE_2M, rw, MAP_PRIVATE | MAP_HUGETLB, zero, 0)));
+    printf(" closed=%d\n", low_error(mmap(NULL, HUGE_2M, rw, MAP_PRIVATE | MAP_HUGETLB, -1, 0)));
+    /* A room of 8 MiB on a 2 MiB boundary. */
+    char *room = mmap(NULL, 10 * HUGE_2M, PROT_NONE, anon, -1, 0);
+    if (room == MAP_FAILED) return 81;
+    room = (char *)(((uintptr_t)room + HUGE_2M - 1) & ~(HUGE_2M - 1));
+    printf("unaligned=%d", low_error(mmap(room + page, HUGE_2M, rw, none | MAP_FIXED, -1, 0)));
+    printf(" in-use=%d", low_error(mmap(room, HUGE_2M, rw, none | MAP_FIXED_NOREPLACE, -1, 0)));
+    printf(" low=%d", low_error(mmap(NULL, HUGE_2M, rw, none | MAP_FIXED, -1, 0)));
+    printf(" grows=%d", low_error(mmap(NULL, HUGE_2M, rw, none | MAP_GROWSDOWN, -1, 0)));
+    printf(" offset=%d", low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw, none, -1L, 4096L)));
+    printf(" whole=%d", low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw, none, -1L, HUGE_2M)));
+    printf(" far=%d\n",
+           low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw, none, -1L, 0x7ffffffffffff000L)));
+    unsigned char in;
+    for (int i = 0; i < 2; i++) {
+        char *at = room + (size_t)(i + 1) * 2 * HUGE_2M;
+        int e = low_error((void *)syscall(SYS_mmap, at, HUGE_2M, rw, (i ? none : huge) | MAP_FIXED,
+                                          -1L, i ? 4096L : 0L));
+        int there = mincore(at, page, &in) ? errno : 0;
+        printf("replace=%d there=%d before=%d after=%d\n", e, there,
+               mincore(at - page, page, &in) ? errno : 0, mincore(at + HUGE_2M, page, &in) ? errno : 0);
+    }
+    char *hinted = mmap(room + 4 * HUGE_2M + page, HUGE_2M, rw, none, -1, 0);
+    printf("hint-busy: aligned=%d there=%d\n", (uintptr_t)hinted % HUGE_2M == 0, hinted == room + 5 * HUGE_2M);
+    munmap(hinted, HUGE_2M);
+    munmap(room + 6 * HUGE_2M, 2 * HUGE_2M);
+    hinted = mmap(room + 5 * HUGE_2M + page, HUGE_2M + 1, rw, none, -1, 0);
+    printf("hint-free: there=%d\n", hinted == room + 6 * HUGE_2M);
+    munmap(hinted, 2 * HUGE_2M);
+    char *low = mmap(NULL, HUGE_2M, rw, none | MAP_32BIT, -1, 0);
+    printf("32bit: low=%d aligned=%d\n", low_area(low, HUGE_2M), (uintptr_t)low % HUGE_2M == 0);
+    for (int shared = 0; shared < 2; shared++) {
+        int flags = (none & ~MAP_PRIVATE) | (shared ? MAP_SHARED : MAP_PRIVATE);
+        char *a = mmap(NULL, 3 * HUGE_2M - page, rw, flags, -1, 0);
+        printf("%s: error=%d aligned=%d\n", shared ? "shared" : "private", low_error(a),
+               (uintptr_t)a % HUGE_2M == 0);
+        if (a == MAP_FAILED) return 82;
+        huge_smaps("vma", a);
+        touch("read", a, 0);
+        touch("write", a + HUGE_2M + 5, 1);
+        errno = 0;
+        long r = read(zero, a, 1);
+        printf("kernel=%ld errno=%d", r, errno);
+        in = 9;
+        r = mincore(a, page, &in);
+        printf(" mincore=%ld in=%d\n", r, in & 1);
+        printf("munmap=%d", munmap(a, page) ? errno : 0);
+        printf(" tail=%d", munmap(a + 3 * HUGE_2M - page, page) ? errno : 0);
+        printf(" mprotect=%d", mprotect(a, page, PROT_READ) ? errno : 0);
+        printf(" part=%d\n", mprotect(a + HUGE_2M, HUGE_2M, PROT_READ) ? errno : 0);
+        int advice[] = {MADV_DONTNEED, MADV_FREE, MADV_HUGEPAGE, MADV_DOFORK, MADV_DODUMP,
+                        MADV_WIPEONFORK, 20, 21, 102, 103};
+        for (int i = 0; i < 10; i++) {
+            int first = madvise(a, page, advice[i]) ? errno : 0;
+            printf("madvise-%d=%d %d\n", advice[i], first, madvise(a + page, page, advice[i]) ? errno : 0);
+        }
+        printf("mremap: same=%d", low_error(mremap(a, HUGE_2M, page, 0)) );
+        printf(" grow=%d", low_error(mremap(a, HUGE_2M, HUGE_2M + page, MREMAP_MAYMOVE)));
+        int how = MREMAP_MAYMOVE | MREMAP_FIXED;
+        printf(" unaligned=%d", low_error(mremap(a, HUGE_2M, HUGE_2M, how, room + page)));
+        printf(" within=%d", low_error(mremap(a + page, HUGE_2M, HUGE_2M, how, room)));
+        printf(" keep=%d", low_error((void *)syscall(SYS_mremap, a, HUGE_2M, HUGE_2M,
+                                                     MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0L)));
+        char *to = mremap(a, page, page, how, room);
+        printf(" move=%d there=%d\n", low_error(to), to == room);
+        if (to == room) {
+            huge_smaps("moved", to);
+            touch("moved", to, 0);
+        }
+        printf("gone=%d\n", mincore(a, page, &in) ? errno : 0);
+        printf("munmap=%d", munmap(a + HUGE_2M, HUGE_2M) ? errno : 0);
+        printf(" %d\n", munmap(a + 2 * HUGE_2M, HUGE_2M) ? errno : 0);
+    }
+    fflush(stdout);
+    char *child = mmap(NULL, HUGE_2M, rw, none, -1, 0);
+    pid_t kid = fork();
+    if (kid == 0) {
+        touch("child", child, 1);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, NULL, 0);
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -25145,9 +25283,10 @@ static int kernel_info_worker(void) {
     /* sysfs(option, arg1, arg2) */
     long count = pn(syscall(139, 3L, 0L, 0L));
     printf("sysfs-count-positive=%d\n", count > 0);
-    const char *names[] = {"tmpfs", "proc", "sockfs", "pipefs", "devpts", "ext4", "mqueue"};
+    const char *names[] = {"tmpfs",  "proc",   "sockfs", "pipefs",
+                           "hugetlbfs", "devpts", "ext4",   "mqueue"};
     long last = -1;
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 8; i++) {
         long index = pn(syscall(139, 1L, names[i], 0L));
         char name[64] = "";
         long got = index >= 0 ? pn(syscall(139, 2L, index, name)) : index;
@@ -41871,6 +42010,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
     if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "mmap-low")) return mmap_low_case();
+    if (!strcmp(mode, "mmap-hugetlb")) return mmap_hugetlb_case();
     if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();

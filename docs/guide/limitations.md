@@ -73,8 +73,17 @@ verified.
   shows the same pages.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`). A page of a host file
+  `dp` (`MAP_DROPPABLE`). A page of a host file
   that `write` filled is clean (see "Pages `write` filled" below).
+- **Huge pages**: the pool of hugetlbfs is empty and cannot be filled. There
+  is no `/proc/sys/vm/nr_hugepages` (so no write to it), no
+  `/sys/kernel/mm/hugepages`, and `hugetlbfs` cannot be mounted (`ENODEV`),
+  though `sysfs` lists it. `MFD_HUGETLB` and `SHM_HUGETLB` give `ENOSYS`, as
+  from a kernel without hugetlbfs, where Linux with an empty pool makes a
+  memfd, and gives `EPERM` or `ENOMEM` for a segment. `MAP_HUGETLB` of
+  1 GiB pages is `EINVAL`, as on a CPU without them; the differential tests
+  do not compare it. `userfaultfd` does not register such a mapping, and
+  the mapping's device in `maps` is 0.
 - **`/proc/<pid>/mem`'s offsets past `i64::MAX`**: `pread64` and
   `pwrite64` refuse them (`EINVAL`), as Linux v7.0's `ksys_pread64` and
   `ksys_pwrite64` do for every file, where Linux master takes them for a
@@ -732,7 +741,7 @@ verified.
   - The kernel log that `syslog` reads is always empty, where Linux's holds
     its boot messages, and `kernel.dmesg_restrict` is always 1 (there is no
     `/proc/sys/kernel/dmesg_restrict`, `/proc/kmsg` or `/dev/kmsg`).
-    `sysfs` knows only seven file system types, where Linux has dozens, so
+    `sysfs` knows only nine file system types, where Linux has dozens, so
     their indexes differ from Linux's though not their order. There is no
     AppArmor or SELinux: `lsm_list_modules` lists four modules, and
     `lsm_get_self_attr` finds no attribute where Linux gives AppArmor's

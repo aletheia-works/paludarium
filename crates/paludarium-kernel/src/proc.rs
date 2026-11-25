@@ -1438,19 +1438,24 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
 }
 /// The lines `smaps` writes after a VMA's line of `maps`, as Linux's
 /// `show_smap` does: its size, what its pages hold ([`smap_usage_lines`]),
-/// and its flags. No page here is huge, and the CPU has no protection keys,
-/// which leaves out `ProtectionKey`.
+/// and its flags. No page here is huge but those a hugetlbfs VMA would have,
+/// and the CPU has no protection keys, which leaves out `ProtectionKey`.
 fn smap_lines(vma: &Vma, usage: Usage) -> Vec<u8> {
     let locked = if vma.flags & vm::LOCKED != 0 {
         usage.pss
     } else {
         0
     };
+    let page = if vma.flags & vm::HUGETLB != 0 {
+        crate::hugetlb::HUGE_PAGE >> 10
+    } else {
+        4
+    };
     let mut out = String::new();
     for (name, value) in [
         ("Size:           ", (vma.end - vma.start) >> 10),
-        ("KernelPageSize: ", 4),
-        ("MMUPageSize:    ", 4),
+        ("KernelPageSize: ", page),
+        ("MMUPageSize:    ", page),
     ] {
         out.push_str(&format!("{name}{value:8} kB\n"));
     }

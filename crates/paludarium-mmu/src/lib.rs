@@ -639,6 +639,7 @@ pub mod vm {
     pub const LOCKONFAULT: u64 = 1 << 19;
     pub const ACCOUNT: u64 = 1 << 20;
     pub const NORESERVE: u64 = 1 << 21;
+    pub const HUGETLB: u64 = 1 << 22;
     pub const WIPEONFORK: u64 = 1 << 25;
     pub const DONTDUMP: u64 = 1 << 26;
     pub const UFFD_MISSING: u64 = 1 << 9;
@@ -2350,6 +2351,12 @@ pub trait PageSource: Send + Sync {
     /// split it is `EINVAL`.
     fn splits(&self) -> bool {
         true
+    }
+    /// The size of the pages a VMA of this memory maps (Linux's
+    /// `vma_kernel_pagesize`): more than 4 KiB for hugetlbfs's, whose VMAs
+    /// are split, remapped and dropped only on their boundaries.
+    fn page_size(&self) -> u64 {
+        PAGE_SIZE
     }
     /// Whether a write to the page at `offset` makes it writable (the
     /// VMA's `vm_ops->pfn_mkwrite`): `false` makes the write a bus error
@@ -5769,15 +5776,27 @@ impl AddressSpaceData {
             .range(..at)
             .next_back()
             .is_some_and(|(_, shared)| {
-                at < shared.end && shared.pages.source().is_some_and(|source| !source.splits())
+                at < shared.end
+                    && shared.pages.source().is_some_and(|source| {
+                        !source.splits() || !at.is_multiple_of(source.page_size())
+                    })
             })
             || self
                 .backing
                 .range(..at)
                 .next_back()
                 .is_some_and(|(_, backing)| {
-                    at < backing.end && backing.cache.is_none() && !backing.source.splits()
+                    at < backing.end
+                        && (backing.cache.is_none() && !backing.source.splits()
+                            || !at.is_multiple_of(backing.source.page_size()))
                 })
+    }
+    /// The size of the pages the VMA at `addr` maps ([`PageSource::page_size`]).
+    fn page_size_at(&self, addr: u64) -> u64 {
+        self.shared_at(addr)
+            .and_then(|shared| shared.pages.source())
+            .or_else(|| self.backing_at(addr).map(|backing| &backing.source))
+            .map_or(PAGE_SIZE, |source| source.page_size())
     }
     /// Whether the VMA at `addr` is one of Linux's `VM_SPECIAL`, memory core
     /// mm does not back: a fixed mapping ([`PageSource::fixed`]) or one of
@@ -5796,7 +5815,7 @@ impl AddressSpaceData {
     /// of no pages of its own ([`Self::special_backing`]).
     fn private_special(&self, addr: u64) -> Option<&Arc<dyn PageSource>> {
         let backing = self.backing_at(addr)?;
-        (backing.cache.is_none()
+        ((backing.cache.is_none() || backing.source.page_size() != PAGE_SIZE)
             && (backing.source.fixed() || backing.source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0))
             .then_some(&backing.source)
     }
@@ -5812,7 +5831,12 @@ impl AddressSpaceData {
     /// not drop: a `VM_PFNMAP` one, or with `locked` a locked one too.
     pub fn first_undiscardable(&self, addr: u64, end: u64, locked: bool) -> Option<Mapping> {
         self.mappings.range(..end).map(|(_, m)| *m).find(|m| {
-            m.end() > addr && ((locked && m.locked.is_some()) || self.pfn_mapped(m.start.0))
+            m.end() > addr
+                && ((locked && m.locked.is_some())
+                    || self.pfn_mapped(m.start.0)
+                    || !addr
+                        .max(m.start.0)
+                        .is_multiple_of(self.page_size_at(m.start.0)))
         })
     }
 
@@ -6245,6 +6269,21 @@ impl AddressSpaceData {
         if self.mapping_at(addr.0).ok_or(Errno::EFAULT)?.sealed {
             return Err(Errno::EPERM);
         }
+        // Whole huge pages, which are not grown (`align_hugetlb`).
+        let page_size = self.page_size_at(addr.0);
+        let (old_len, new_len) = if page_size == PAGE_SIZE {
+            (old_len, new_len)
+        } else {
+            let align = |len: u64| len.checked_next_multiple_of(page_size);
+            match (align(old_len), align(new_len)) {
+                (Some(old), Some(new))
+                    if new <= old && (addr.0 | how.new_addr.0).is_multiple_of(page_size) =>
+                {
+                    (old, new)
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        };
         if new_addr.is_none() && new_len <= old_len {
             if new_len < old_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
@@ -6478,8 +6517,12 @@ impl AddressSpaceData {
             }
             // Memory core mm does not back is neither copied into a child
             // nor dumped again (`VM_SPECIAL` in Linux 7.0, not
-            // `vma_is_mm_backed` in master: the same for every memory here).
-            if matches!(advice, FlagAdvice::DoFork | FlagAdvice::DoDump) && self.special(start) {
+            // `vma_is_mm_backed` in master: the same for every memory here),
+            // but for hugetlbfs's, which may be dumped.
+            let huge = self.page_size_at(start) != PAGE_SIZE;
+            if (advice == FlagAdvice::DoFork || advice == FlagAdvice::DoDump && !huge)
+                && self.special(start)
+            {
                 return Err(Errno::EINVAL);
             }
             // One that is never dumped keeps its flags.
@@ -7581,6 +7624,18 @@ impl AddressSpaceData {
             .find(|m| m.end() > addr && m.locked.is_some())
     }
 
+    /// The first mapping of `[addr, end)` whose pages `MADV_COLD` and
+    /// `MADV_PAGEOUT` do not take: a locked, `VM_PFNMAP` or hugetlbfs one
+    /// (`can_madv_lru_vma`).
+    pub fn first_off_lru(&self, addr: u64, end: u64) -> Option<Mapping> {
+        self.mappings.range(..end).map(|(_, m)| *m).find(|m| {
+            m.end() > addr
+                && (m.locked.is_some()
+                    || self.pfn_mapped(m.start.0)
+                    || self.page_size_at(m.start.0) != PAGE_SIZE)
+        })
+    }
+
     /// Whether the mapping at `addr` refuses to have its pages discarded
     /// ([`Self::refuses_discard`]).
     pub fn refuses_discard_at(&self, addr: u64) -> bool {
@@ -7616,9 +7671,9 @@ impl AddressSpaceData {
     /// `[addr, end)`, VMA by VMA as Linux's `madvise_walk_vmas`, up to the
     /// first that refuses: a sealed one whose pages may not be discarded
     /// installs none (`EPERM`, `can_madvise_modify`), and the rings of AIO
-    /// and `io_uring` take neither (`EINVAL`), as Linux's
-    /// `is_valid_guard_vma` refuses a VMA that is not `vma_is_mm_backed`
-    /// (`VM_DONTEXPAND`). An install drops the pages of the range, as
+    /// and `io_uring`, huge pages and the vDSO's data take neither
+    /// (`EINVAL`), as Linux's `is_valid_guard_vma` refuses a VMA that is not
+    /// `vma_is_mm_backed` (`VM_DONTEXPAND`) or is hugetlbfs's. An install drops the pages of the range, as
     /// Linux's `zap_vma_range` does, but keeps the guards already there,
     /// and gives private anonymous memory its `anon_vma`
     /// ([`Mapping::anon_vma`]). A hole gives `ENOMEM` once the rest is done.
@@ -7640,6 +7695,7 @@ impl AddressSpaceData {
             let fixed = self
                 .shared_at(m.start.0)
                 .and_then(|shared| shared.pages.source())
+                .or_else(|| self.private_special(m.start.0))
                 .is_some_and(|source| source.fixed());
             if fixed {
                 return Err(Errno::EINVAL);
@@ -9897,6 +9953,10 @@ impl AddressSpace {
     /// See [`AddressSpaceData::first_locked`].
     pub fn first_locked(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
         self.locked().first_locked(addr.0, end)
+    }
+    /// See [`AddressSpaceData::first_off_lru`].
+    pub fn first_off_lru(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
+        self.locked().first_off_lru(addr.0, end)
     }
     /// See [`AddressSpaceData::first_undiscardable`].
     pub fn first_undiscardable(&self, addr: GuestAddr, end: u64, locked: bool) -> Option<Mapping> {

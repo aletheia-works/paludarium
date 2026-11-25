@@ -3366,6 +3366,83 @@ fn nothing_is_mapped_below_mmap_min_addr_without_cap_sys_rawio() {
     assert_eq!(f.ret(mremap, &[source, 4096, 4096, 5, 0x2000]), eperm);
 }
 #[test]
+fn huge_pages_come_from_an_empty_pool() {
+    const HUGE: u64 = 2 << 20;
+    let mut f = fixture();
+    let (mmap, mremap, at) = (syscalls::nr::MMAP, syscalls::nr::MREMAP, 0x6000_0000);
+    let (huge, none) = (0x4_0022, 0x4_4022);
+    let map = |f: &mut Fixture, at: u64, len: u64, flags: u64, offset: u64| {
+        f.ret(mmap, &[at, len, 3, flags, u64::MAX, offset])
+    };
+    for (flags, expected) in [
+        (huge, Errno::ENOMEM),
+        (huge | 21 << 26, Errno::ENOMEM),
+        (none | 20 << 26, Errno::EINVAL),
+        (none | 0x100, Errno::EINVAL),
+    ] {
+        assert_eq!(map(&mut f, 0, 1, flags, 0), errno(expected));
+    }
+    assert_eq!(map(&mut f, 0, 0, none, 0), errno(Errno::EINVAL));
+    assert_eq!(
+        map(&mut f, at + 4096, 1, none | 0x10, 0),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(map(&mut f, 0, 1, none, 4096), errno(Errno::EINVAL));
+    assert_eq!(
+        map(&mut f, 0, 1, none, i64::MAX as u64 & !4095),
+        errno(Errno::EOVERFLOW)
+    );
+    // What a refused fixed mapping replaces is gone.
+    assert_eq!(map(&mut f, at, 2 * HUGE, 0x32, 0), at);
+    assert_eq!(map(&mut f, at, 1, huge | 0x10, 0), errno(Errno::ENOMEM));
+    let first = f.mem.mappings().find(|m| m.end() > at).unwrap();
+    assert_eq!((first.start.0, first.end()), (at + HUGE, at + 2 * HUGE));
+    assert_eq!(
+        map(&mut f, at + HUGE, 1, none | 0x10_0000, 0),
+        errno(Errno::EEXIST)
+    );
+    for shared in [false, true] {
+        let flags = if shared { none ^ 3 } else { none };
+        assert_eq!(map(&mut f, at, 2 * HUGE - 4096, flags | 0x10, 0), at);
+        let mut byte = [0];
+        assert!(f.mem.read(GuestAddr(at), &mut byte).unwrap_err().bus);
+        assert!(f.mem.write(GuestAddr(at + HUGE), &byte).unwrap_err().bus);
+        let vma = f.mem.view().vma_from(at).unwrap();
+        assert_eq!((vma.start, vma.end), (at, at + 2 * HUGE));
+        let expected = paludarium_mmu::vm::HUGETLB
+            | paludarium_mmu::vm::DONTEXPAND
+            | paludarium_mmu::vm::NORESERVE;
+        let mask = expected | paludarium_mmu::vm::ACCOUNT;
+        assert_eq!(vma.flags & mask, expected);
+        let einval = errno(Errno::EINVAL);
+        assert_eq!(f.ret(syscalls::nr::MUNMAP, &[at, 4096]), einval);
+        assert_eq!(f.ret(syscalls::nr::MPROTECT, &[at, 4096, 1]), einval);
+        for advice in [4, 11, 20, 21, 102, 103] {
+            assert_eq!(f.ret(28, &[at + 4096, 4096, advice]), einval);
+        }
+        for advice in [4, 17] {
+            assert_eq!(f.ret(28, &[at, 4096, advice]), 0);
+        }
+        // Grown, moved off a boundary, or left behind by a move.
+        assert_eq!(f.ret(mremap, &[at, HUGE, HUGE + 1, 1, 0]), einval);
+        assert_eq!(
+            f.ret(mremap, &[at, HUGE, HUGE, 3, at + 4096 + 4 * HUGE]),
+            einval
+        );
+        assert_eq!(f.ret(mremap, &[at, HUGE, HUGE, 5, 0]), einval);
+        assert_eq!(f.ret(mremap, &[at, 1, 1, 3, at + 4 * HUGE]), at + 4 * HUGE);
+        let moved = f.mem.view().vma_from(at + 4 * HUGE).unwrap();
+        assert_eq!((moved.start, moved.end), (at + 4 * HUGE, at + 5 * HUGE));
+        assert!(
+            f.mem
+                .read(GuestAddr(moved.start), &mut byte)
+                .unwrap_err()
+                .bus
+        );
+        assert_eq!(f.ret(syscalls::nr::MUNMAP, &[at + HUGE, HUGE]), 0);
+    }
+}
+#[test]
 fn clone3_arguments_follow_linux() {
     let f = fixture();
     let put = |words: &[u64]| {
@@ -11361,7 +11438,7 @@ mod kernel_info {
         let mut f = fixture();
         let einval = errno(Errno::EINVAL);
         let count = f.ret(139, &[3, 0, 0]);
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
         f.mem.write(GuestAddr(BUF), b"proc\0").unwrap();
         let proc = f.ret(139, &[1, BUF, 0]);
         assert_eq!(proc, 1);

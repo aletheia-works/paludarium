@@ -51,6 +51,7 @@ mod fasync;
 mod fifo;
 mod files;
 mod filesystems;
+mod hugetlb;
 mod inet;
 mod interface;
 mod io_accounting;

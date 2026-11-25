@@ -126,8 +126,8 @@ out:
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`;
 - `setcc` and `cmovcc`;
 - `tzcnt`, `lzcnt`, `popcnt`, `bsf` and `bsr` of a register into one of its
-  size, `bt` of a register by a register or an immediate, and `bswap` of a
-  32- or 64-bit register;
+  size, `bt`, `bts`, `btr` and `btc` of a register by a register or an
+  immediate, and `bswap` of a 32- or 64-bit register;
 - `mul` and `imul` of a register into rdx:rax, `div` and `idiv` of rdx:rax by a
   register, and `imul` of two registers or of a register and an immediate;
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm

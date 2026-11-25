@@ -657,15 +657,14 @@ impl PipeEnd {
         buf[first.len()..count].copy_from_slice(&rest[..count - first.len()]);
         count
     }
-    /// A read of at most `want` bytes, not none, to the buffers `segments`
-    /// of `mem`, as `anon_pipe_read` makes it with the pipe held: buffer by
+    /// A read of at most `want` bytes, not none, to `memory` (of `mem`), as `anon_pipe_read` makes it with the pipe held: buffer by
     /// buffer of the pipe, up to the end of a packet, and one whose bytes
     /// cannot all be copied stays, which is `EFAULT` before any other. An
     /// empty pipe is `EAGAIN`, or 0 with no writer.
     pub(crate) fn read_to(
         &self,
         mem: &paludarium_mmu::AddressSpace,
-        segments: &[(u64, usize)],
+        memory: crate::files::Memory<'_>,
         want: usize,
     ) -> Result<usize, Errno> {
         if !self.reader {
@@ -703,15 +702,7 @@ impl PipeEnd {
         self.peek(&mut piece);
         let mut done = 0;
         for len in lens {
-            let bytes = &piece[done..done + len];
-            let mut copied = 0;
-            for (at, n) in spans(segments, done, len) {
-                if mem.write(at, &bytes[copied..copied + n]).is_err() {
-                    break;
-                }
-                copied += n;
-            }
-            if copied < len {
+            if !memory.store(mem, done, &piece[done..done + len]) {
                 break;
             }
             done += len;
@@ -723,8 +714,7 @@ impl PipeEnd {
         self.endpoint.take_read(done + dropped);
         Ok(done)
     }
-    /// A write of the buffers `segments` of `mem` from `done` bytes of them
-    /// to `total` on, as `anon_pipe_write` makes it with the pipe held: as
+    /// A write of `memory` (of `mem`) from its byte `done` to `total`, as `anon_pipe_write` makes it with the pipe held: as
     /// many of the pipe's buffers as there is room for, each put in once it
     /// is copied; one that cannot be copied whole ends it, and is `EFAULT`
     /// before any other. A full pipe is `EAGAIN`, and one no one reads
@@ -732,7 +722,7 @@ impl PipeEnd {
     pub(crate) fn write_from(
         &self,
         mem: &paludarium_mmu::AddressSpace,
-        segments: &[(u64, usize)],
+        memory: crate::files::Memory<'_>,
         done: usize,
         total: usize,
     ) -> Result<usize, Errno> {
@@ -760,15 +750,8 @@ impl PipeEnd {
             .map_err(|_| Errno::ENOMEM)?;
         for len in lens {
             let start = bytes.len();
-            let mut at = start;
             bytes.resize(start + len, 0);
-            for (from, n) in spans(segments, done + start, len) {
-                if mem.read(from, &mut bytes[at..at + n]).is_err() {
-                    break;
-                }
-                at += n;
-            }
-            if at < start + len {
+            if !memory.load(mem, done + start, &mut bytes[start..]) {
                 bytes.truncate(start);
                 break;
             }

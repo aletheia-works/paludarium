@@ -2354,10 +2354,19 @@ fn select(
                     .enumerate()
                     .filter(|&(kind, _)| wanted[kind][word] & bit != 0)
                     .fold(0, |events, (_, event)| events | event);
-                let mask = revents(c, fd as i32, events);
-                for (kind, ready) in [POLLIN | 0x18, POLLOUT | 0x8, POLLPRI]
-                    .into_iter()
-                    .enumerate()
+                let mask = if path_only(c, fd as i32) {
+                    POLLNVAL
+                } else {
+                    revents(c, fd as i32, events)
+                };
+                // `POLLIN_SET`, `POLLOUT_SET` and `POLLEX_SET`.
+                for (kind, ready) in [
+                    POLLIN | 0x18 | POLLNVAL,
+                    POLLOUT | 0x8 | POLLNVAL,
+                    POLLPRI | POLLNVAL,
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     if wanted[kind][word] & bit != 0 && mask & ready != 0 {
                         found[kind][word] |= bit;
@@ -2414,17 +2423,21 @@ fn revents_by(c: &Context<'_>, fd: i32, events: u16, poll: bool) -> u16 {
                     }
                     (mask as u16) & (events | 0x18)
                 }
-                Err(_) => d.file.stat().map_or(POLLNVAL, |stat| {
-                    if stat.mode & 0o170000 == 0o100000 {
-                        events & (POLLIN | POLLOUT)
-                    } else {
-                        0
-                    }
-                }),
+                // A file with no poll.
+                Err(_) => crate::events::DEFAULT_POLLMASK as u16 & events,
             },
             Err(_) => POLLNVAL,
         },
     }
+}
+
+/// Whether `fd` is open with `O_PATH`: `poll` and `select` take it as Linux's
+/// `fdget` does, which refuses it (POLLNVAL), though `select` finds it open.
+fn path_only(c: &Context<'_>, fd: i32) -> bool {
+    fd >= 0
+        && c.files
+            .descriptor(fd as u64)
+            .is_ok_and(|d| d.file.flags() & O_PATH != 0)
 }
 
 /// One pass over the `pollfd` array, writing each `revents`; returns how
@@ -2437,13 +2450,7 @@ fn poll_once(c: &mut Context<'_>, fds: u64, nfds: u64) -> Result<u64, Errno> {
         c.mem.read(at, &mut entry).map_err(|_| Errno::EFAULT)?;
         let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let events = u16::from_le_bytes([entry[4], entry[5]]);
-        // `poll` takes the descriptor as Linux's `fdget` does, which refuses
-        // an `O_PATH` one (POLLNVAL); `select` finds it open, and ready.
-        let path_only = fd >= 0
-            && c.files
-                .descriptor(fd as u64)
-                .is_ok_and(|d| d.file.flags() & O_PATH != 0);
-        let revents = if path_only {
+        let revents = if path_only(c, fd) {
             POLLNVAL
         } else {
             revents(c, fd, events)
@@ -2541,6 +2548,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
     // A mapping of /dev/zero is anonymous memory (shared with MAP_SHARED),
     // as Linux's mmap_zero makes it.
+    let zero = file.as_ref().is_some_and(|f| is_zero_device(f.as_ref()));
     let file = file.filter(|f| !is_zero_device(f.as_ref()));
     let kind = if file.is_some() {
         MappingKind::File
@@ -2569,12 +2577,24 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // A file of a tmpfs mount with `huge=` goes at the 2 MiB boundary
         // its offset agrees with (`shmem_get_unmapped_area`).
         const HUGE: u64 = 2 << 20;
+        let private = flags & MAP_SHARED == 0;
         match &file {
             Some(file) if file.huge_placement() => Placement::Aligned {
                 hint,
                 size: HUGE,
                 offset: offset & (HUGE - 1),
             },
+            // Private anonymous memory of whole 2 MiB with no hint, and a
+            // private mapping of /dev/zero, go where transparent huge
+            // pages fit them (`thp_get_unmapped_area_vmflags`,
+            // `get_unmapped_area_zero`).
+            None if private && zero => Placement::Thp { hint, offset },
+            None if private
+                && hint.is_none()
+                && len.wrapping_add(4095) & !4095 & (HUGE - 1) == 0 =>
+            {
+                Placement::Thp { hint, offset: 0 }
+            }
             _ => Placement::Near(hint),
         }
     };
@@ -2670,7 +2690,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 prot,
                 kind,
                 Backing::Cache {
-                    pages: &cache.map_private(file, crate::files::mapped_path(c, d)),
+                    pages: &cache.map_private(file, crate::files::mapped_name(c, d)),
                     offset,
                 },
             )
@@ -2799,7 +2819,8 @@ fn check_mappable(
     // Neither a file that is not regular nor one that /proc generates can
     // be read at an offset, which a mapping needs.
     // A BPF map's file maps by its own `mmap` ([`crate::bpf::mmap`]).
-    let readable = regular && file.read_at(0, &mut []) != Err(Errno::ENODEV);
+    let readable =
+        regular && !crate::proc::unmappable(file) && file.read_at(0, &mut []) != Err(Errno::ENODEV);
     if !readable && !is_zero_device(file) && !crate::bpf::is_map(file) {
         return Err(Errno::ENODEV);
     }
@@ -2864,9 +2885,10 @@ fn shared_file(
         (true, false) => paludarium_mmu::SharedWrites::Allowed,
     };
     let may_write = writes == paludarium_mmu::SharedWrites::Allowed;
-    let pages = file_cache(c, d, file)?.map(
+    let cache = file_cache(c, d, file)?;
+    let pages = cache.map(
         &crate::memfd::pages_source(file),
-        crate::files::mapped_path(c, d),
+        crate::files::mapped_name(c, d),
         offset,
         len,
         may_write,

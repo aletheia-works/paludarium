@@ -70,6 +70,12 @@ pub trait FileHandle: Send + Sync {
     fn guest_path_hint(&self) -> Option<Vec<u8>> {
         None
     }
+    /// Where the file is now and whether that name was taken away, as the
+    /// dentry the description was opened by tells it (`d_path`): none for a
+    /// handle that does not follow its file's renames and removals.
+    fn dentry_path(&self) -> Option<(Vec<u8>, bool)> {
+        None
+    }
     /// Tells the kernel's inotify watches of `mask` on this open file
     /// itself (`fsnotify_file`), for a handle that knows where its file is
     /// now; false leaves it to the caller.

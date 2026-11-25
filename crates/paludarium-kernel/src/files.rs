@@ -3478,6 +3478,106 @@ pub(crate) fn iovecs_checked(
     }
     Ok(segments)
 }
+/// The memory an aio or io_uring transfer moves bytes to or from: the
+/// program's, at the addresses of `segments` as they are mapped at the
+/// time, or `len` bytes from `at` of a registered buffer's pinned pages
+/// ([`paludarium_mmu::Pinned`]), whatever maps them now.
+#[derive(Clone, Copy)]
+pub(crate) enum Memory<'a> {
+    Guest(&'a [(u64, usize)]),
+    Pinned {
+        pages: &'a paludarium_mmu::Pinned,
+        at: usize,
+        len: usize,
+    },
+}
+
+impl Memory<'_> {
+    fn total(&self) -> usize {
+        match self {
+            Memory::Guest(segments) => segments.iter().map(|&(_, length)| length).sum(),
+            Memory::Pinned { len, .. } => *len,
+        }
+    }
+    /// Checks that the first `len` bytes may be written (`EFAULT`), which
+    /// pinned pages always may.
+    fn writable_prefix(&self, c: &Context<'_>, len: usize) -> Result<(), Errno> {
+        match self {
+            Memory::Guest(segments) => writable_prefix(c, segments, len),
+            Memory::Pinned { .. } => Ok(()),
+        }
+    }
+    /// Stores `bytes` from its byte `at` on; whether all of them were.
+    pub(crate) fn store(&self, mem: &AddressSpace, at: usize, bytes: &[u8]) -> bool {
+        match self {
+            Memory::Guest(segments) => {
+                let mut done = 0;
+                crate::sockets::spans(segments, at, bytes.len()).all(|(to, n)| {
+                    let piece = &bytes[done..done + n];
+                    done += n;
+                    mem.write(to, piece).is_ok()
+                }) && done == bytes.len()
+            }
+            Memory::Pinned {
+                pages, at: from, ..
+            } => {
+                pages.write(from + at, bytes);
+                true
+            }
+        }
+    }
+    /// Loads `bytes` from its byte `at` on; whether all of them were.
+    pub(crate) fn load(&self, mem: &AddressSpace, at: usize, bytes: &mut [u8]) -> bool {
+        match self {
+            Memory::Guest(segments) => {
+                let (mut done, len) = (0, bytes.len());
+                crate::sockets::spans(segments, at, len).all(|(from, n)| {
+                    let piece = &mut bytes[done..done + n];
+                    done += n;
+                    mem.read(from, piece).is_ok()
+                }) && done == len
+            }
+            Memory::Pinned {
+                pages, at: from, ..
+            } => {
+                pages.read(from + at, bytes);
+                true
+            }
+        }
+    }
+    /// Stores `bytes` from the start.
+    fn scatter(&self, c: &Context<'_>, bytes: &[u8]) -> Result<(), Errno> {
+        match self {
+            Memory::Guest(segments) => scatter(c, segments, bytes),
+            Memory::Pinned { pages, at, len } => {
+                pages.write(*at, &bytes[..bytes.len().min(*len)]);
+                Ok(())
+            }
+        }
+    }
+    /// Appends every byte to `bytes`.
+    fn gather(&self, c: &Context<'_>, bytes: &mut Vec<u8>) -> Result<(), Errno> {
+        bytes.try_reserve(self.total()).map_err(|_| Errno::ENOMEM)?;
+        match self {
+            Memory::Guest(segments) => {
+                for &(base, length) in *segments {
+                    let start = bytes.len();
+                    bytes.resize(start + length, 0);
+                    c.mem
+                        .read(GuestAddr(base), &mut bytes[start..])
+                        .map_err(|_| Errno::EFAULT)?;
+                }
+            }
+            Memory::Pinned { pages, at, len } => {
+                let start = bytes.len();
+                bytes.resize(start + len, 0);
+                pages.read(*at, &mut bytes[start..]);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Copies `bytes` into the guest buffers of `segments`, in order.
 pub(crate) fn scatter(
     c: &Context<'_>,
@@ -3646,10 +3746,11 @@ pub(crate) fn aio_transfer(
     offset: u64,
     flags: u32,
 ) -> i64 {
+    let memory = Memory::Guest(segments);
     let result = if write {
-        aio_write(c, file, segments, offset, flags)
+        aio_write(c, file, memory, offset, flags)
     } else {
-        aio_read(c, file, segments, offset, flags)
+        aio_read(c, file, memory, offset, flags)
     };
     result.map_or_else(|e| -i64::from(e.0), |count| count as i64)
 }
@@ -3676,7 +3777,7 @@ pub(crate) fn ring_transfer(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     write: bool,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     offset: u64,
     flags: u32,
 ) -> Result<Result<u64, Errno>, Errno> {
@@ -3690,10 +3791,7 @@ pub(crate) fn ring_transfer(
         (true, false) => None,
         (false, _) => Some(offset),
     };
-    let total = segments
-        .iter()
-        .map(|&(_, length)| length as u64)
-        .sum::<u64>();
+    let total = memory.total() as u64;
     if let Some(at) = at
         && ((at as i64) < 0 || (at as i64).checked_add(total as i64).is_none())
     {
@@ -3705,9 +3803,9 @@ pub(crate) fn ring_transfer(
     ring_operation(file, write)?;
     let transfer = |c: &mut Context<'_>, at: u64, flags: u32| {
         if write {
-            aio_write(c, file, segments, at, flags)
+            aio_write(c, file, memory, at, flags)
         } else {
-            aio_read(c, file, segments, at, flags)
+            aio_read(c, file, memory, at, flags)
         }
     };
     Ok(match at {
@@ -3776,54 +3874,46 @@ fn writable_prefix(
 fn aio_read(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     offset: u64,
     flags: u32,
 ) -> Result<u64, Errno> {
-    let total = segments.iter().map(|&(_, length)| length).sum::<usize>();
+    let total = memory.total();
     if total == 0 {
         return Ok(0);
     }
-    if let Some(result) = pipe_read(c, file, segments, flags & RWF_NOWAIT != 0) {
+    if let Some(result) = pipe_read(c, file, memory, flags & RWF_NOWAIT != 0) {
         return result;
     }
     let (b, count) = if aio_positioned(file) {
         let len = request(file, total as u64, offset, true)?;
-        writable_prefix(c, segments, len)?;
+        memory.writable_prefix(c, len)?;
         let mut b = buffer(len)?;
         let count = read_at(file, offset, &mut b)?;
         (b, count)
     } else {
-        writable_prefix(c, segments, total)?;
+        memory.writable_prefix(c, total)?;
         let mut b = buffer(total)?;
         let count = read_waiting(c, file, &mut b, flags & RWF_NOWAIT != 0)?;
         (b, count)
     };
-    scatter(c, segments, &b[..count])?;
+    memory.scatter(c, &b[..count])?;
     Ok(count as u64)
 }
 
 fn aio_write(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     offset: u64,
     flags: u32,
 ) -> Result<u64, Errno> {
-    let total = segments.iter().map(|&(_, length)| length).sum::<usize>();
     let (nosignal, nowait) = (flags & RWF_NOSIGNAL != 0, flags & RWF_NOWAIT != 0);
-    if let Some(written) = pipe_write(c, file, segments, total, nosignal, nowait) {
+    if let Some(written) = pipe_write(c, file, memory, memory.total(), nosignal, nowait) {
         return sync_written(file, flags, written?);
     }
     let mut bytes = Vec::new();
-    bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
-    for &(base, length) in segments {
-        let start = bytes.len();
-        bytes.resize(start + length, 0);
-        c.mem
-            .read(GuestAddr(base), &mut bytes[start..])
-            .map_err(|_| Errno::EFAULT)?;
-    }
+    memory.gather(c, &mut bytes)?;
     if bytes.is_empty() {
         return Ok(0);
     }
@@ -3939,7 +4029,7 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     if total > 0 {
         access_permission(c, &file)?;
     }
-    if let Some(result) = pipe_read(c, &file, &segments, flags & RWF_NOWAIT != 0) {
+    if let Some(result) = pipe_read(c, &file, Memory::Guest(&segments), flags & RWF_NOWAIT != 0) {
         return result;
     }
     let mut b = buffer(len)?;
@@ -4004,7 +4094,7 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
         let written = pipe_write(
             c,
             &file,
-            &segments,
+            Memory::Guest(&segments),
             total,
             nosignal,
             flags & RWF_NOWAIT != 0,
@@ -4139,22 +4229,22 @@ pub(crate) fn access_permission(
     });
     answered.map(|_| ())
 }
-/// A read of the pipe `file` to the buffers `segments`, which are copied to
-/// with the pipe held ([`crate::sockets::PipeEnd::read_to`]), so that what
+/// A read of the pipe `file` to `memory`, which is copied to with the pipe
+/// held ([`crate::sockets::PipeEnd::read_to`]), so that what
 /// cannot be copied stays in it; `None` for another file.
 fn pipe_read(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     nowait: bool,
 ) -> Option<Result<u64, Errno>> {
     let pipe = crate::sockets::pipe(file)?;
-    let want = segments.iter().map(|&(_, length)| length).sum();
+    let want = memory.total();
     if want == 0 {
         return Some(Ok(0));
     }
     let mem = c.mem;
-    let result = wait_for_read(c, file, nowait, || pipe.read_to(mem, segments, want));
+    let result = wait_for_read(c, file, nowait, || pipe.read_to(mem, memory, want));
     // A pipe read signals the writer as it ends, with data or not, unless a
     // signal interrupts it, as Linux's `pipe_read`.
     if matches!(result, Ok(_) | Err(Errno::EAGAIN | Errno::EFAULT)) {
@@ -4162,13 +4252,13 @@ fn pipe_read(
     }
     Some(result.map(|count| count as u64))
 }
-/// A write to the pipe `file` of the first `total` bytes of the buffers
-/// `segments`, which are copied from with the pipe held
+/// A write to the pipe `file` of the first `total` bytes of `memory`, which
+/// are copied from with the pipe held
 /// ([`crate::sockets::PipeEnd::write_from`]); `None` for another file.
 fn pipe_write(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
-    segments: &[(u64, usize)],
+    memory: Memory<'_>,
     total: usize,
     nosignal: bool,
     dontwait: bool,
@@ -4179,7 +4269,7 @@ fn pipe_write(
     }
     let mem = c.mem;
     let written = write_total(c, file, total, nosignal, dontwait, |done| {
-        pipe.write_from(mem, segments, done, total)
+        pipe.write_from(mem, memory, done, total)
     });
     if written.is_ok() {
         crate::permissions::remove_set_ids(&c.process.credentials, &**file);
@@ -5392,13 +5482,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 }
                 crate::sockets::access_ok_u64(a[1], a[2])?;
                 let segments = [(a[1], len)];
+                let memory = Memory::Guest(&segments);
                 if n == 0 {
                     access_permission(c, &d.file)?;
                 }
                 let done = if n == 0 {
-                    pipe_read(c, &d.file, &segments, false)
+                    pipe_read(c, &d.file, memory, false)
                 } else {
-                    pipe_write(c, &d.file, &segments, len, false, false)
+                    pipe_write(c, &d.file, memory, len, false, false)
                 };
                 return done.unwrap_or(Err(Errno::EBADF));
             }
@@ -8852,6 +8943,17 @@ pub(crate) fn seen_from(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
 /// The path `d` was opened by, made plain.
 fn opened_path(d: &Descriptor) -> Vec<u8> {
     paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
+}
+/// What a mapping of `d`'s file shows: where the file is now, as its
+/// description tells it, which the mapping holds (`d_path` of `vm_file`'s
+/// dentry), or a memfd's fixed name: no other file that maps is without a
+/// place (those of the machine's file systems all have one, and no other
+/// handle that reads at an offset maps).
+pub(crate) fn mapped_name(c: &Context<'_>, d: &Descriptor) -> Option<crate::page_cache::FileName> {
+    if d.file.dentry_path().is_some() {
+        return Some(crate::page_cache::FileName::Moving);
+    }
+    mapped_path(c, d).map(crate::page_cache::FileName::Fixed)
 }
 /// The path of the file `d` holds, for a mapping of it to name: where the
 /// file is now, or where it was opened if no name reaches it there (the

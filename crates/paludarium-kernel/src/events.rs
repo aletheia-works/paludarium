@@ -128,6 +128,11 @@ pub(crate) const OUT: u32 = 4;
 pub(crate) const NONBLOCK: u32 = 0x800;
 pub(crate) const CLOEXEC: u32 = 0x80000;
 
+/// What a poll gives of a file without one of its own, as a regular file or
+/// a directory (`DEFAULT_POLLMASK`): `POLLIN`, `POLLOUT`, `POLLRDNORM` and
+/// `POLLWRNORM`.
+pub(crate) const DEFAULT_POLLMASK: u32 = 0x145;
+
 /// One poll of `file`, as Linux's `vfs_poll`: its readiness, and what a poll
 /// of it changes. An epoll polls the files it watches
 /// ([`crate::epoll::EpollInstance::poll`]), and a file of `/proc/sys` whose

@@ -44,11 +44,11 @@ verified.
   has not been compared with a real CPU.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
-  VMA has its full size from the start, where Linux's grows as it is used. A
-  program's own segments and its interpreter's are named by the path the
-  file had when it was started, with its symbolic links resolved and
-  `(deleted)` once nothing links it, but not after a rename, which Linux
-  follows. Maps can show fewer VMAs than Linux after a merge: Linux merges
+  VMA has its full size from the start, where Linux's grows as it is used.
+  A rename that a process under `chroot` makes does not move the names
+  of the files it moves in the maps, a core's `NT_FILE` note and
+  `/proc/<pid>/exe`, where Linux's `d_move` moves them whatever the root.
+  Maps can show fewer VMAs than Linux after a merge: Linux merges
   two VMAs only where their `anon_vma`s are compatible
   (`is_mergeable_anon_vma`), and the emulator does not model `anon_vma`
   identity, so it merges neighbours that Linux keeps apart, such as after
@@ -259,14 +259,21 @@ verified.
     and the slow start threshold, congestion window, path MTU, advertised
     MSS and reordering Linux starts with. What Linux's TCP measures or
     tunes takes the values of a loopback connection in the simplest case:
-    the round trip (30 µs) and the timeout, rates and pacing it gives, the
-    send and receive MSS and windows, which never grow, and segment counts
-    of the bytes sent and received in 32 KiB segments, one acknowledgement
-    for each; the window scale its handshake offered stays; times
-    since data came count from its read. Beyond a handshake's tries nothing
-    is retransmitted or lost, so those counts are 0; the peer's window scale is taken as Linux's
-    default, whatever buffer it set; and a connection the host made is
-    told the same way as one on the loopback.
+    the round trip (30 µs) and the timeout, rates and pacing it gives, and
+    the windows, which never grow, so the send MSS stays 32 KiB and no
+    acknowledgement goes for a grown window; the window scale its handshake
+    offered stays; times since data came count from its read. The segments
+    are Linux's ([Network](./features#network)) while the
+    reader keeps up with writes of at most 536 bytes; larger ones and a
+    full window take more or fewer than Linux, and a connection across a
+    veth pair is counted as one on the loopback. The counts alone wait: data
+    that Nagle's algorithm, `MSG_MORE` or a loss holds back on Linux reaches
+    the peer at once here, and `SIOCOUTQ` and the readiness of both sides
+    say so. Beyond a handshake's tries and the segments a loss probe sends
+    again, nothing is retransmitted or lost; the peer's window scale is taken as Linux's
+    default, whatever buffer it set; and a connection the host made has
+    its segments estimated, in 32 KiB segments with one acknowledgement
+    for each.
 - **File mappings**: a file mapping shows the file's page cache as on Linux
   (a `MAP_PRIVATE` one in the pages it has not written), but the stores of a
   `MAP_SHARED` mapping reach the file on the host only when the guest reads
@@ -545,14 +552,10 @@ verified.
   whole exit cancels the requests its threads submitted that wait for
   their files, as Linux master's `io_task_group_exiting` does. Linux 7.0,
   the kernel the differential tests run on, cancels them only once their
-  files are ready, as for a thread that exits alone. A registered buffer's
-  pages are not pinned: a fixed transfer moves the memory at its address as that
-  is mapped then, so it fails with `EFAULT` once the buffer is unmapped or
-  made read-only, and a process that shares the ring moves its own memory.
-  Linux moves the pages it pinned. A shared mapping of a disk file can be
-  registered, where Linux's long-term pin refuses it (`EFAULT`), and a huge
-  page charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where Linux
-  charges it once. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`).
+  files are ready, as for a thread that exits alone. A huge page of a
+  registered buffer charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where
+  Linux charges it once. A ring maps only shared (`MAP_PRIVATE` gives
+  `EINVAL`).
   The features are Linux
   6.12's, so `IORING_FEAT_REG_REG_RING` is reported though no ring
   descriptor can be registered, and `IORING_FEAT_MIN_TIMEOUT` though a
@@ -566,10 +569,10 @@ verified.
   the test runners' kernel does.
   A file without a position (a pipe, a socket, a terminal, an eventfd) is
   taken as one that can be polled, which decides when a read uses a ring's
-  buffer and whether a transfer waits for it. A ring of buffers in the program's memory is not
-  pinned either: the kernel reads and writes it through its mapping at each
-  use, so a read that finds it unmapped fails with `EFAULT`, where Linux uses
-  the pages it pinned.
+  buffer and whether a transfer waits for it. A ring of buffers in the
+  program's memory is not pinned, unlike a registered buffer: the kernel
+  reads and writes it through its mapping at each use, so a read that finds
+  it unmapped fails with `EFAULT`, where Linux uses the pages it pinned.
 - **Native AIO, in part**: every read, write and sync runs as `io_submit`
   takes it, as Linux's buffered I/O does; one of a file opened with
   `O_DIRECT` does not run in the background as on Linux, and a sync's event
@@ -1081,11 +1084,10 @@ verified.
   routes a request adds, with a gateway too, as IPv4's, and IPv6's TCP
   and UDP and its neighbours, but no proxy entry (`EOPNOTSUPP`). An IPv6
   gateway's neighbour state does not steer a lookup, as Linux's
-  `rt6_check_neigh` does among routes of one metric. A UDP connect to a
-  group of the node or the
-  link without a scope ID or a device is `EINVAL`, as Linux's is with no
-  multicast interface, which none is here. A connection accepted from a
-  link-local address has no device, so its names have no scope ID. A UDP
+  `rt6_check_neigh` does among routes of one metric. Of an IPv6 multipath
+  route's hops through the device asked for, the flow's hash picks one, as
+  Linux 7.0 does; Linux master takes the hop the lookup found
+  (`have_oif_match` in `ip6_pol_route`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
@@ -1360,10 +1362,7 @@ verified.
   Linux.
 - **Core files**: a core is written as with the kernel's default
   `core_pattern` (`core` in the working directory); a host that pipes cores to
-  a crash handler (systemd-coredump, apport) is not modelled. Its `NT_FILE`
-  note names a mapped file by the path it had when it was mapped, and the
-  program by the path it had when it was started (resolved, `(deleted)`
-  once removed), where Linux follows a rename.
+  a crash handler (systemd-coredump, apport) is not modelled.
 - **Memory limit**: a write beyond the limit ends the process that made it,
   where Linux's OOM killer picks the process using the most memory.
 - **The native JIT**: it is experimental and off unless `--jit` asks for it,

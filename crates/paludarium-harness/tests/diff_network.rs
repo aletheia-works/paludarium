@@ -98,7 +98,8 @@ mod linux {
         let host = Arc::new(RecordingHost::new());
         host.enable_network();
         let session =
-            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap()).unwrap();
+            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap(), &host)
+                .unwrap();
         let start = Instant::now();
         let status = session.run().unwrap();
         Outcome {
@@ -190,6 +191,10 @@ mod linux {
     #[test]
     fn network_tcp_info() {
         case("tcp-info");
+    }
+    #[test]
+    fn network_tcp_segments() {
+        case("tcp-segments");
     }
     #[test]
     fn network_listen_errors() {
@@ -315,7 +320,8 @@ mod linux {
         let host = Arc::new(RecordingHost::new());
         host.enable_network();
         let session =
-            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap()).unwrap();
+            paludarium_harness::with_test_jit(Session::new(config, host.clone()).unwrap(), &host)
+                .unwrap();
         session.run().unwrap();
         assert_eq!(host.stdout(), b"socket failed errno=97\n");
     }

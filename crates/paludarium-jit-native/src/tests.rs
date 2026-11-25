@@ -430,6 +430,21 @@ const FORMS: &[&[u8]] = &[
     &[0x66, 0x0f, 0xa3, 0xc8],
     &[0x48, 0x0f, 0xba, 0xe0, 0x3f],
     &[0x0f, 0xba, 0xe0, 0x25],
+    &[0x48, 0x0f, 0xab, 0xd8],
+    &[0x0f, 0xab, 0xc8],
+    &[0x66, 0x0f, 0xab, 0xc8],
+    &[0x48, 0x0f, 0xba, 0xe8, 0x3f],
+    &[0x48, 0x0f, 0xb3, 0xd8],
+    &[0x0f, 0xb3, 0xc8],
+    &[0x66, 0x0f, 0xb3, 0xc8],
+    &[0x0f, 0xba, 0xf0, 0x25],
+    &[0x48, 0x0f, 0xbb, 0xd8],
+    &[0x48, 0x0f, 0xbb, 0xc0],
+    &[0x4d, 0x0f, 0xbb, 0xc8],
+    &[0x0f, 0xbb, 0xc8],
+    &[0x66, 0x0f, 0xbb, 0xc8],
+    &[0x48, 0x0f, 0xba, 0xf8, 0x1f],
+    &[0x66, 0x0f, 0xba, 0xf8, 0x1f],
     // bswap
     &[0x48, 0x0f, 0xc8],
     &[0x0f, 0xc8],
@@ -973,6 +988,48 @@ fn a_compile_that_panics_fails_the_thread_that_waits_and_only_it() {
     let (sender, ran) = std::sync::mpsc::channel();
     assert!(worker.run(move || sender.send(std::thread::current().id()).unwrap()));
     assert_ne!(ran.recv().unwrap(), caller);
+}
+
+#[test]
+fn a_request_that_waits_is_counted_until_it_ends_whatever_it_comes_to() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let waits = compiler.waits();
+    assert_eq!(waits.counts(), (0, 0));
+    let failing = forms(&[0xb8, 0x78, 0x56, 0x34, 0x12]);
+    compiler.set_panics(true);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compiler.compile(&failing).is_some()
+    }));
+    assert!(failed.is_err());
+    assert_eq!(waits.counts(), (1, 0));
+    compiler.set_panics(false);
+    // Turned down, and then one that compiles and one kept.
+    assert!(compiler.compile(&failing).is_none());
+    assert_eq!(waits.counts(), (1, 0));
+    let other = forms(&[0xb8, 1, 2, 3, 4]);
+    assert!(compiler.compile(&other).is_some());
+    assert!(compiler.compile(&other).is_some());
+    assert_eq!(waits.counts(), (2, 0));
+    let (_, waits) = crate::waiting_compiler(1).unwrap();
+    assert_eq!(waits.counts(), (0, 0));
+    // Compiling in the background counts none.
+    let background = NativeCompiler::new(1, true).unwrap();
+    assert!(background.compile(&other).is_some());
+    assert_eq!(background.waits().counts(), (0, 0));
+    // It is counted while it waits.
+    let worker = std::sync::Arc::new(Worker::default());
+    let (go, gate) = std::sync::mpsc::channel::<()>();
+    let busy = {
+        let worker = worker.clone();
+        std::thread::spawn(move || worker.run(move || gate.recv().unwrap()))
+    };
+    let counts = worker.waits();
+    while counts.counts() != (1, 1) {
+        std::thread::yield_now();
+    }
+    go.send(()).unwrap();
+    assert!(busy.join().unwrap());
+    assert_eq!(counts.counts(), (1, 0));
 }
 
 #[test]

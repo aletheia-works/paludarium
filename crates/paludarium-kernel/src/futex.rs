@@ -72,10 +72,10 @@ const NO_NODE: u32 = u32::MAX;
 /// word (`EINVAL`), and lies below `TASK_SIZE_MAX` (`EFAULT`); a node word
 /// names node 0, the only one here, or none, which becomes node 0 (`EINVAL`,
 /// and `EFAULT` when it cannot be read or written); and a shared word's page
-/// is brought in through `get_user_pages_fast`, to be written
-/// (`FOLL_WRITE`) or, unless `write` (`FUTEX_WRITE`), else to be read
-/// (`EFAULT`), which waits for a `userfaultfd`, where a private one's is
-/// not looked at.
+/// is faulted in through `get_user_pages_fast`, which waits for a
+/// `userfaultfd`, to be written (`FOLL_WRITE`) or, where that fails and
+/// unless `write` (`FUTEX_WRITE`), to be read, with `EFAULT` where neither
+/// can be. A private word's page is not looked at.
 fn checked_key(
     mem: &AddressSpace,
     addr: u64,

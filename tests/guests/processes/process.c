@@ -12279,27 +12279,57 @@ static int lease_breaks_case(void) {
     rmdir(dir);
     return 0;
 }
-/* /proc/locks: the lines of this case's two files, as lock_get_status prints
- * them, without their numbers, which other processes' locks move. */
+/* /proc/locks: the lines of this case's two files and of those that wait for
+ * their locks, as lock_get_status prints them, without their numbers, which
+ * other processes' locks move. */
 static struct stat plocks_files[2];
-static pid_t plocks_child;
-static void plocks_line(const char *line) {
+static pid_t plocks_children[4];
+/* The number and file of the last lock, if it is this case's. */
+static long plocks_root = -1;
+static int plocks_root_file;
+static const char *plocks_who(int pid) {
+    static const char *names[] = {"child", "child2", "child3", "child4"};
+    if (pid == getpid()) return "self";
+    if (pid == -1) return "none";
+    for (int i = 0; i < 4; i++)
+        if (plocks_children[i] && pid == plocks_children[i]) return names[i];
+    return "other";
+}
+/* Whether it is the line of one that waits for a lock of this case's. */
+static int plocks_line(const char *line, int show) {
+    long id = strtol(line, NULL, 10);
     const char *at = strstr(line, ": ");
-    if (!at || strlen(at) < 20) return;
+    if (!at || strlen(at) < 20) return 0;
     at += 2;
+    int indent = (int)strspn(at, " "), level = 0;
+    if (!strncmp(at + indent, "-> ", 3)) level = indent + 1;
+    if (level) at += indent + 3;
+    if (level && id != plocks_root) return 0;
     int pid, used = 0;
     unsigned major_number, minor_number;
     unsigned long inode;
     char kind[16], start[32], end[32];
-    if (sscanf(at + 17, "%15s %d %x:%x:%lu %31s %31s%n", kind, &pid, &major_number, &minor_number, &inode, start, end, &used) != 7) return;
-    for (int i = 0; i < 2; i++) {
-        struct stat *st = &plocks_files[i];
-        if (st->st_ino != inode || major(st->st_dev) != major_number || minor(st->st_dev) != minor_number) continue;
-        const char *who = pid == getpid() ? "self" : pid == -1 ? "none" : plocks_child && pid == plocks_child ? "child" : "other";
-        printf("  [%.17s] %s %s %c %s %s%s", at, kind, who, 'f' + i, start, end, at[17 + used] == '\n' ? "\n" : "!\n");
+    if (sscanf(at + 17, "%15s %d %x:%x:%lu %31s %31s%n", kind, &pid, &major_number, &minor_number, &inode, start, end, &used) == 7) {
+        for (int i = 0; i < 2; i++) {
+            struct stat *st = &plocks_files[i];
+            if (st->st_ino != inode || major(st->st_dev) != major_number || minor(st->st_dev) != minor_number) continue;
+            if (!level) {
+                plocks_root = id;
+                plocks_root_file = i;
+            }
+            if (show) printf("  %.*s[%.17s] %s %s %c %s %s%s", level * 2, "--------", at, kind, plocks_who(pid), 'f' + i, start, end, at[17 + used] == '\n' ? "\n" : "!\n");
+            return level > 0;
+        }
+    } else if (level && sscanf(at + 17, "%15s %d %n", kind, &pid, &used) == 2) {
+        /* A lease's breaker has no file. */
+        if (show) printf("  %.*s[%.17s] %s %s of %c %s", level * 2, "--------", at, kind, plocks_who(pid), 'f' + plocks_root_file, at + 17 + used);
+        return 1;
     }
+    if (!level) plocks_root = -1;
+    return 0;
 }
 static void plocks_show(const char *what, const char *path) {
+    plocks_root = -1;
     printf("%s\n", what);
     FILE *file = fopen(path, "r");
     if (!file) {
@@ -12318,7 +12348,7 @@ static void plocks_show(const char *what, const char *path) {
         ordered &= id >= last;
         last = id;
         if (!locks) printf("  %ld\n", id);
-        plocks_line(text);
+        plocks_line(text, 1);
     }
     fclose(file);
     printf("  ordered=%d\n", ordered);
@@ -12332,6 +12362,148 @@ static int plocks_pin(int cpu) {
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     return sched_setaffinity(0, sizeof set, &set) ? -errno : 0;
+}
+/* Waits until `count` wait for this case's locks. */
+static int plocks_waiting(int count) {
+    for (int tries = 0; tries < 2000; tries++) {
+        FILE *file = fopen("/proc/locks", "r");
+        char line[256];
+        int waiting = 0;
+        plocks_root = -1;
+        while (file && fgets(line, sizeof line, file)) waiting += plocks_line(line, 0);
+        if (file) fclose(file);
+        if (waiting == count) return 0;
+        usleep(5000);
+    }
+    printf("  not %d waiting\n", count);
+    return 1;
+}
+enum { PLOCKS_OPEN = -1, PLOCKS_FLOCK = -2 };
+static int plocks_got[2];
+/* Child `at` waits for a lock of `path`, is the `count`th to wait, and keeps
+ * the lock once it has it. `command` is fcntl's, or one of the above: then
+ * `type` is flock's operation, or the flags of an open. */
+static void plocks_child(int at, int count, const char *path, int command, int type, long start, long length) {
+    fflush(stdout);
+    plocks_children[at] = fork();
+    if (plocks_children[at] == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        int fd = open(path, command == PLOCKS_OPEN ? type : O_RDWR);
+        int result = fd < 0 ? -errno : 0;
+        if (command == PLOCKS_FLOCK) result = flock(fd, type) ? -errno : 0;
+        if (command >= 0) result = plocks_set(fd, command, (short)type, start, length);
+        char byte = (char)(result ? 'x' : '1' + at);
+        if (write(plocks_got[1], &byte, 1) != 1) _exit(1);
+        for (;;) pause();
+    }
+    plocks_waiting(count);
+}
+/* The next child to get its lock. */
+static void plocks_gets(void) {
+    char byte = '?';
+    if (read(plocks_got[0], &byte, 1) != 1) byte = '!';
+    printf("got=%c\n", byte);
+}
+static void plocks_kill(int at) {
+    kill(plocks_children[at], SIGKILL);
+    waitpid(plocks_children[at], NULL, 0);
+    plocks_children[at] = 0;
+}
+static int plocks_waiters(const char *f, const char *g, int one) {
+    const char *list = "/proc/locks";
+    if (pipe(plocks_got)) return 10;
+    /* Record locks: one that conflicts with an earlier one waits behind it. */
+    printf("waited for=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 0, 100));
+    plocks_child(0, 1, f, F_SETLKW, F_WRLCK, 0, 10);
+    plocks_child(1, 2, f, F_SETLKW, F_RDLCK, 5, 10);
+    plocks_child(2, 3, f, F_OFD_SETLKW, F_WRLCK, 12, 1);
+    plocks_child(3, 4, f, F_SETLKW, F_RDLCK, 20, 10);
+    plocks_show("record waiters", list);
+    /* A waiter's end wakes those behind it, which wait again. */
+    plocks_kill(0);
+    plocks_waiting(3);
+    plocks_show("without the first", list);
+    plocks_kill(3);
+    plocks_kill(2);
+    plocks_kill(1);
+    plocks_waiting(0);
+    plocks_show("no waiters", list);
+    /* A waiter that gets its lock takes those behind it along. */
+    plocks_child(0, 1, f, F_SETLKW, F_WRLCK, 0, 10);
+    plocks_child(1, 2, f, F_SETLKW, F_WRLCK, 5, 10);
+    plocks_set(one, F_SETLK, F_UNLCK, 0, 0);
+    plocks_gets();
+    plocks_waiting(1);
+    plocks_show("got", list);
+    plocks_kill(0);
+    plocks_gets();
+    plocks_show("got too", list);
+    plocks_kill(1);
+    /* flock. */
+    int held = open(f, O_RDONLY);
+    flock(held, LOCK_EX);
+    plocks_child(0, 1, f, PLOCKS_FLOCK, LOCK_SH, 0, 0);
+    plocks_child(1, 2, f, PLOCKS_FLOCK, LOCK_SH, 0, 0);
+    plocks_child(2, 3, f, PLOCKS_FLOCK, LOCK_EX, 0, 0);
+    plocks_show("flock waiters", list);
+    plocks_kill(0);
+    plocks_waiting(2);
+    plocks_show("behind the other", list);
+    flock(held, LOCK_UN);
+    plocks_gets();
+    plocks_waiting(1);
+    plocks_show("got", list);
+    plocks_kill(1);
+    plocks_gets();
+    plocks_show("got too", list);
+    plocks_kill(2);
+    close(held);
+    /* Opens that break a lease. */
+    int leased = open(g, O_RDONLY);
+    printf("lease=%d\n", lease_errno(leased, F_WRLCK));
+    plocks_child(0, 1, g, PLOCKS_OPEN, O_RDONLY, 0, 0);
+    plocks_show("reader", list);
+    plocks_child(1, 2, g, PLOCKS_OPEN, O_WRONLY, 0, 0);
+    plocks_child(2, 3, g, PLOCKS_OPEN, O_RDWR, 0, 0);
+    /* A reader waits a tick at a time, as fl_break_time is 0 (__break_lease),
+       until a writer breaks the lease: that moves those behind it once. */
+    usleep(100000);
+    plocks_waiting(3);
+    plocks_show("and writers", list);
+    plocks_kill(0);
+    plocks_waiting(2);
+    plocks_show("writers", list);
+    plocks_kill(2);
+    plocks_waiting(1);
+    printf("downgrade=%d\n", lease_errno(leased, F_RDLCK));
+    plocks_waiting(1);
+    plocks_show("downgraded", list);
+    printf("give back=%d\n", lease_errno(leased, F_UNLCK));
+    plocks_gets();
+    plocks_show("given back", list);
+    plocks_kill(1);
+    close(leased);
+    /* A description that waits for this process's lock: this process waiting
+       for the description's is a deadlock. */
+    printf("first=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 0, 1));
+    int own = open(f, O_RDWR);
+    printf("description=%d\n", plocks_set(own, F_OFD_SETLK, F_WRLCK, 1, 1));
+    fflush(stdout);
+    plocks_children[0] = fork();
+    if (plocks_children[0] == 0) _exit(plocks_set(own, F_OFD_SETLKW, F_WRLCK, 0, 1) != 0);
+    plocks_waiting(1);
+    plocks_show("description waits", list);
+    printf("deadlock=%d\n", plocks_set(one, F_SETLKW, F_WRLCK, 1, 1));
+    printf("let go=%d\n", plocks_set(one, F_SETLK, F_UNLCK, 0, 0));
+    int status;
+    waitpid(plocks_children[0], &status, 0);
+    printf("child=%d\n", status);
+    plocks_children[0] = 0;
+    close(own);
+    plocks_set(one, F_SETLK, F_UNLCK, 0, 0);
+    close(plocks_got[0]);
+    close(plocks_got[1]);
+    return 0;
 }
 static int proc_locks_case(void) {
     signal(SIGIO, SIG_IGN);
@@ -12414,8 +12586,8 @@ static int proc_locks_case(void) {
     int ready[2], go[2];
     if (pipe(ready) || pipe(go)) return 6;
     fflush(stdout);
-    plocks_child = fork();
-    if (plocks_child == 0) {
+    plocks_children[0] = fork();
+    if (plocks_children[0] == 0) {
         char byte;
         int result = plocks_set(two, F_SETLK, F_WRLCK, 200, 1);
         if (flock(three, LOCK_SH)) _exit(1);
@@ -12427,7 +12599,7 @@ static int proc_locks_case(void) {
     plocks_show("child", "/proc/locks");
     if (write(go[1], "x", 1) != 1) return 8;
     int status;
-    waitpid(plocks_child, &status, 0);
+    waitpid(plocks_children[0], &status, 0);
     printf("child=%d\n", status);
     plocks_show("child gone", "/proc/locks");
     flock(three, LOCK_UN);
@@ -12447,6 +12619,9 @@ static int proc_locks_case(void) {
         close(later);
         close(latest);
     }
+    flock(three, LOCK_UN);
+    int waiters = plocks_waiters(f, g, one);
+    if (waiters) return waiters;
     close(one);
     close(three);
     plocks_show("closed", "/proc/locks");

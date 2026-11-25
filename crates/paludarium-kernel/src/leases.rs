@@ -34,10 +34,11 @@
 //! gives `EWOULDBLOCK` in place of the wait, and a signal ends it
 //! (`ERESTARTSYS`).
 
+use crate::blocked::{Class, Request, Wanted};
 use crate::files::Descriptor;
 use crate::namespaces::Namespace;
 use crate::page_cache::{Key, PageCaches, ReadAccess, WriteAccess};
-use crate::record_locks::{Link, Status};
+use crate::record_locks::{Kind, Link, Status};
 use crate::syscalls::Context;
 use paludarium_host::{ClockId, FileHandle};
 use paludarium_types::Errno;
@@ -123,7 +124,7 @@ impl Lease {
                 _ => "UNLCK",
             },
             pid: space.number(self.pid) as i32,
-            key: self.key,
+            key: Some(self.key),
             range: (0, i64::MAX as u64),
         }
     }
@@ -143,7 +144,8 @@ fn address(file: &Arc<dyn FileHandle>) -> usize {
     Arc::as_ptr(file).cast::<()>().addr()
 }
 
-fn leases(caches: &PageCaches) -> std::sync::MutexGuard<'_, Vec<Lease>> {
+/// Every file's leases.
+pub(crate) fn leases(caches: &PageCaches) -> std::sync::MutexGuard<'_, Vec<Lease>> {
     caches.leases.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -424,10 +426,13 @@ fn break_lease(c: &mut Context<'_>, key: Key, flags: u32) -> Result<(), Errno> {
         c.processes
             .send_io(owner, fd, crate::fasync::Reason::Message);
     }
+    if conflict && flags & O_NONBLOCK != 0 {
+        return Err(Errno::EAGAIN);
+    }
+    let processes = Arc::clone(c.processes);
+    let request = processes.locks().blocked().request();
     while conflict {
-        if flags & O_NONBLOCK != 0 {
-            return Err(Errno::EAGAIN);
-        }
+        await_lease(c, &caches, &request, (key, write));
         crate::files::pause_for_lock(c)?;
         let now = c.host.clock(ClockId::Monotonic)?;
         let mut list = leases(&caches);
@@ -439,9 +444,33 @@ fn break_lease(c: &mut Context<'_>, key: Key, flags: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Every file's leases.
-pub(crate) fn all(caches: &PageCaches) -> Vec<Lease> {
-    leases(caches).clone()
+/// `__break_lease`'s `locks_insert_block`: `request` waits for the first
+/// lease of `key` that its open conflicts with, unless it waits for one
+/// already.
+fn await_lease(
+    c: &Context<'_>,
+    caches: &PageCaches,
+    request: &Request<'_>,
+    (key, write): (Key, bool),
+) {
+    let list = leases(caches);
+    let mut conflicts = list
+        .iter()
+        .filter(|l| l.conflicts(key, write))
+        .map(|l| l.link.number());
+    if request.asleep(|number| conflicts.clone().any(|n| n == number)) {
+        return;
+    }
+    if let Some(number) = conflicts.next() {
+        let wanted = Wanted {
+            class: Class::Breaker,
+            kind: if write { Kind::Write } else { Kind::Read },
+            key,
+            range: (0, i64::MAX as u64),
+            pid: c.process.pid,
+        };
+        request.wait((number, false), wanted);
+    }
 }
 
 /// The lease the description `file` holds.

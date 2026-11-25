@@ -5711,18 +5711,28 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let d = c.files.descriptor(a[0])?;
             // A file that cannot be told by its inode is not listed.
             let key = crate::record_locks::key(c, &d).ok();
+            let processes = Arc::clone(c.processes);
+            let locks = processes.locks();
+            let request = (a[1] & 4 == 0).then(|| locks.blocked().request());
             loop {
                 let result = d.file.flock(a[1] as u32);
-                c.processes.locks().flocked(
+                locks.flocked(
                     (&d.file, key),
                     (c.process.pid, crate::syscalls::cpu(c)),
                     a[1] as u32,
                     result,
+                    request.as_ref(),
                 );
+                let Some(request) = &request else {
+                    return result.map(|()| 0);
+                };
                 match result {
                     Ok(()) => return Ok(0),
-                    Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => pause_for_lock(c)?,
+                    Err(e) if e == Errno::EAGAIN => pause_for_lock(c)?,
                     Err(e) => return Err(e),
+                }
+                while request.behind() {
+                    pause_for_lock(c)?;
                 }
             }
         }

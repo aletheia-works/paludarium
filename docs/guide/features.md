@@ -596,17 +596,22 @@ kernel.
   `unshare(CLONE_FILES)` or `CLOSE_RANGE_UNSHARE` of a table another task
   shares gives the caller a copy that owns none of them. A description's go
   when its last descriptor closes. `F_SETLKW` waits until the range is free,
-  `EDEADLK` when the record locks of tables waiting for each other (up to
-  10) would close a cycle. A
-  wait counts for that only while the lock it waits for stays as it was:
-  unlocking, changing or closing it ends the wait there at once, as
-  `locks_wake_up_blocks` does, even before the waiter runs again. The
+  `EDEADLK` when that would close a cycle of owners that wait for each
+  other's record locks (`posix_locks_deadlock`, through up to 11 waits). A
+  wait counts for that only while the lock it waits for stays:
+  unlocking, cutting or closing it ends the wait there at once, as
+  `locks_wake_up_blocks` does, even before the waiter runs again. A wait
+  for a record lock or a `flock` lock that conflicts with an earlier one
+  for the same lock is behind that one, which gets the lock first
+  (`__locks_insert_block`). The
   locks are the guest's own: a program on the host does not see them, nor
   they its. `/proc/locks` lists the record locks, the `flock` locks and the
   leases as `locks_show` prints them: those of each CPU in turn (as `getcpu`
   numbers it where the lock was taken), the latest first, a merged lock at
   its first one's place and a split one's left piece as new
-  (`posix_lock_inode`), without those of processes outside the reader's PID
+  (`posix_lock_inode`), each with those that wait for it (`-> `, deeper for
+  one behind another), opens that break a lease too, without those of
+  processes outside the reader's PID
   namespace. `/proc/<pid>/fdinfo` lists a description's own, its lease last
   (`show_fd_locks`).
 

@@ -1057,11 +1057,12 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **`/proc/locks`, in part**: the lines of those that wait for a lock
-  (`-> `) are not there. PIDs are those of the reader's PID namespace, where
-  Linux's are those of the one `/proc` was mounted in. A `flock` lock a
+- **`/proc/locks`, in part**: PIDs are those of the reader's PID namespace,
+  where Linux's are those of the one `/proc` was mounted in. A `flock` lock a
   program on the host holds on a file of the host is not listed, though it
-  conflicts with the guest's.
+  conflicts with the guest's, nor are those that wait for it alone. One that
+  waits looks again every 10 ms, where Linux wakes it: until then it is not
+  listed once the lock it waited for has gone.
 - **File leases, in part**: the opens `execve` makes of a program, its
   interpreter and its script, and those of the descriptors fanotify's events
   give, break no lease, where Linux's do. A lease is broken before

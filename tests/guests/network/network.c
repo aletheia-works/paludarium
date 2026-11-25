@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -197,6 +198,165 @@ static int client(int port, int flags, int *result) {
     errno = 0;
     *result = connect(fd, (void *)&a, sizeof a) ? errno : 0;
     return fd;
+}
+/* tcp-held: milliseconds of the monotonic and the real-time clock. */
+static long long clock_ms(int clock) {
+    struct timespec t;
+    clock_gettime(clock, &t);
+    return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+}
+/* The bytes that wait at `s` to be read and at `c` to be acknowledged, and
+   whether `s` polls readable. */
+static void held_queues(const char *step, int c, int s) {
+    int in = -1, out = -1;
+    struct pollfd p = {s, POLLIN, 0};
+    ioctl(s, FIONREAD, &in);
+    ioctl(c, SIOCOUTQ, &out);
+    int ready = poll(&p, 1, 0);
+    printf("  %s in=%d out=%d poll=%d\n", step, in, out, ready);
+}
+/* Reads what waits at `s` and says whether it came in the first `late`
+   milliseconds before now, by its SO_TIMESTAMPNS and last_data_recv, and
+   after the first `early` milliseconds since `start` (real time). */
+static void held_read(const char *step, int s, long long start, int early, int late) {
+    char bytes[200], control[64];
+    struct iovec iov = {bytes, sizeof bytes};
+    struct msghdr m = {0};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = control;
+    m.msg_controllen = sizeof control;
+    static const int since = 52;
+    unsigned char raw[512];
+    socklen_t len;
+    tcp_info_raw(s, raw, 512, &len);
+    long long now = clock_ms(CLOCK_REALTIME), came = 0;
+    int n = recvmsg(s, &m, MSG_DONTWAIT);
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    if (n > 0 && h) {
+        struct timespec t;
+        memcpy(&t, CMSG_DATA(h), sizeof t);
+        came = t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+    }
+    int ago = info_word(raw, since);
+    printf("  %s=%d after=%d before=%d ago=%d\n", step, n, came - start >= early,
+           now - came >= late, ago >= late && ago <= now - start - early + 1);
+}
+static void held_signal(int number) { (void)number; }
+/* Holds data back once the first thread is about to sleep, and goes. */
+static int held_pipe[2];
+static void *held_thread(void *c) {
+    char byte;
+    if (read(held_pipe[0], &byte, 1) == 1) send(*(int *)c, "held", 4, MSG_MORE);
+    return NULL;
+}
+/* What Nagle's algorithm, MSG_MORE and a delayed acknowledgement hold back
+   reaches the peer once its time has come, whoever looks then. A step the
+   machine took too long for is done again. */
+static void held(int l, int port) {
+    static char bytes[200];
+    int result, on = 1;
+    for (int step = 0; step < 9; step++) {
+        for (int tries = 0; tries < 20; tries++) {
+            int c = client(port, 0, &result), s = accept(l, NULL, NULL);
+            setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
+            long long start = clock_ms(CLOCK_REALTIME), began = clock_ms(CLOCK_MONOTONIC);
+            /* Sixteen acknowledged at once, one that waits 40 ms, and three
+               held for it; or one held 200 ms. */
+            int more = step == 1 || step == 5;
+            for (int n = 0; n < (step == 8 ? 0 : more ? 1 : 20); n++)
+                send(c, bytes, more ? 100 : 1, more ? MSG_MORE : 0);
+            int in = 0;
+            ioctl(s, FIONREAD, &in);
+            if (clock_ms(CLOCK_MONOTONIC) - began > 15) {
+                close(c);
+                close(s);
+                continue;
+            }
+            printf(" step %d\n", step);
+            if (step == 0 || step == 1) held_queues("held", c, s);
+            if (step == 0) {
+                /* No call on the connection until its time has passed. */
+                struct timespec t = {0, 150000000};
+                nanosleep(&t, NULL);
+                held_queues("later", c, s);
+                held_read("read", s, start, 25, 40);
+            } else if (step == 1) {
+                struct timespec t = {0, 400000000};
+                nanosleep(&t, NULL);
+                held_read("read", s, start, 150, 40);
+            } else if (step == 2) {
+                /* A read acknowledges what it read. */
+                call("recv", recv(s, bytes, 17, 0));
+                held_queues("after", c, s);
+            } else if (step == 3) {
+                setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+                ioctl(s, FIONREAD, &in);
+                printf("  nodelay in=%d\n", in);
+            } else if (step == 4) {
+                /* The end takes along what is held. */
+                shutdown(c, SHUT_WR);
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+            } else if (step == 5) {
+                /* A read waits for it. */
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+                long long took = clock_ms(CLOCK_MONOTONIC) - began;
+                printf("  waited=%d\n", took >= 150 && took < 2000);
+            } else if (step == 6) {
+                /* So does a poll past what has come. */
+                recv(s, bytes, 17, 0);
+                recv(s, bytes, 3, 0);
+                for (int n = 0; n < 2; n++) send(c, bytes, 100, MSG_MORE);
+                struct pollfd p = {s, POLLIN, 0};
+                long long from = clock_ms(CLOCK_MONOTONIC);
+                call("poll", poll(&p, 1, 5000));
+                printf("  waited=%d\n", clock_ms(CLOCK_MONOTONIC) - from < 2000);
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+            } else {
+                /* SIGIO for it ends a sleep, also one that began before
+                   another thread had it held. */
+                struct sigaction a = {0};
+                pthread_t other;
+                sigset_t io;
+                sigemptyset(&io);
+                sigaddset(&io, SIGIO);
+                a.sa_handler = held_signal;
+                sigaction(SIGIO, &a, NULL);
+                fcntl(s, F_SETOWN, getpid());
+                fcntl(s, F_SETFL, O_ASYNC);
+                struct timespec t = {10, 0}, rest = {0, 0};
+                int slept = 0;
+                /* The emulator's test clock may pass the whole sleep before
+                   the other thread has run. */
+                for (int n = 0; n < 20 && !slept; n++) {
+                    if (step == 8) {
+                        if (pipe(held_pipe)) exit(70);
+                        pthread_sigmask(SIG_BLOCK, &io, NULL);
+                        if (pthread_create(&other, NULL, held_thread, &c)) exit(70);
+                        pthread_sigmask(SIG_UNBLOCK, &io, NULL);
+                        if (write(held_pipe[1], "g", 1) != 1) exit(70);
+                    }
+                    slept = nanosleep(&t, &rest);
+                    int error = errno;
+                    if (step == 8) {
+                        pthread_join(other, NULL);
+                        close(held_pipe[0]);
+                        close(held_pipe[1]);
+                        if (!slept) while (recv(s, bytes, sizeof bytes, 0) < 0) {}
+                    }
+                    errno = error;
+                }
+                call("nanosleep", slept);
+                printf("  rest=%d\n", rest.tv_sec >= 8);
+                ioctl(s, FIONREAD, &in);
+                printf("  in=%d\n", in);
+            }
+            close(c);
+            close(s);
+            break;
+        }
+    }
 }
 /* A client on a port of its own: bound to port 0 before it connects, it
    takes a port no other socket holds, where connect alone may share one
@@ -425,6 +585,84 @@ static void ll_bind(const char *name, int domain, int type, const void *address,
     close(s);
 }
 static void on_alarm(int signal) { (void)signal; alarms++; }
+/* A ring of 8 entries (io_uring_setup) with its rings and entries mapped,
+   for the io_uring mode. */
+struct ring {
+    int fd;
+    unsigned char *rings, *sqes;
+    unsigned array, sq_entries, cq_entries;
+};
+static unsigned *ring_u32(unsigned char *base, unsigned at) { return (unsigned *)(base + at); }
+static int ring_open(struct ring *r) {
+    unsigned char p[120];
+    memset(p, 0, sizeof p);
+    long fd = syscall(425, 8, p);
+    if (fd < 0) return -1;
+    r->fd = (int)fd;
+    r->sq_entries = *ring_u32(p, 0);
+    r->cq_entries = *ring_u32(p, 4);
+    r->array = *ring_u32(p, 64);
+    r->rings = mmap(NULL, r->array + 4 * r->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED, r->fd, 0);
+    r->sqes = mmap(NULL, 64 * r->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED, r->fd, 0x10000000);
+    return r->rings == MAP_FAILED || r->sqes == MAP_FAILED ? -1 : 0;
+}
+/* Waits for any of `events` on `fd`, at most 5 s. */
+static void awaited(const char *name, int fd, short events) {
+    struct pollfd p = {.fd = fd, .events = events};
+    int n = poll(&p, 1, 5000);
+    printf("  %s poll=%d\n", name, n);
+}
+/* An entry: `op` on `fd` with `off`, `addr`, `len` and `rw` flags. */
+static void ring_push(struct ring *r, unsigned char op, unsigned long data, int fd, unsigned long off,
+                      unsigned long addr, unsigned len, unsigned rw) {
+    unsigned tail = *ring_u32(r->rings, 4);
+    unsigned slot = tail & (r->sq_entries - 1);
+    unsigned char *sqe = r->sqes + 64 * slot;
+    memset(sqe, 0, 64);
+    sqe[0] = op;
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 8, &off, 8);
+    memcpy(sqe + 16, &addr, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 28, &rw, 4);
+    memcpy(sqe + 32, &data, 8);
+    *ring_u32(r->rings, r->array + 4 * slot) = slot;
+    __atomic_store_n(ring_u32(r->rings, 4), tail + 1, __ATOMIC_RELEASE);
+}
+/* The last result of each user_data. */
+static int ring_result[64];
+/* Submits `submit` entries, waits for `wait` completions, and prints
+   those there, by user_data, with their flags; with `fds`, a descriptor
+   as "fd". It gives the result of the last one printed. */
+static int ring_run(struct ring *r, unsigned submit, unsigned wait, const char *label, int fds) {
+    syscall(426, r->fd, submit, wait, 1, NULL, 0);
+    unsigned head = *ring_u32(r->rings, 8);
+    unsigned tail = __atomic_load_n(ring_u32(r->rings, 12), __ATOMIC_ACQUIRE);
+    unsigned long datas[8];
+    int results[8];
+    unsigned flags[8], n = 0;
+    for (; head != tail && n < 8; head++, n++) {
+        unsigned char *cqe = r->rings + 64 + 16 * (head & (r->cq_entries - 1));
+        memcpy(&datas[n], cqe, 8);
+        memcpy(&results[n], cqe + 8, 4);
+        memcpy(&flags[n], cqe + 12, 4);
+    }
+    __atomic_store_n(ring_u32(r->rings, 8), head, __ATOMIC_RELEASE);
+    printf("  %s:", label);
+    int last = 0;
+    for (unsigned long data = 0; data < 64; data++) {
+        for (unsigned i = 0; i < n; i++) {
+            if (datas[i] != data) continue;
+            if (fds && results[i] > 2)
+                printf(" %lu=fd/%#x", data, flags[i]);
+            else
+                printf(" %lu=%d/%#x", data, results[i], flags[i]);
+            last = ring_result[data] = results[i];
+        }
+    }
+    printf("\n");
+    return last;
+}
 
 int main(int argc, char **argv) {
     if (argc < 4) return 99;
@@ -993,6 +1231,13 @@ int main(int argc, char **argv) {
         close(u);
         return 0;
     }
+    if (!strcmp(mode, "tcp-held")) {
+        int port;
+        int l = listener(8, &port);
+        held(l, port);
+        close(l);
+        return 0;
+    }
     if (!strcmp(mode, "tcp-segments")) {
         /* The segments a loopback connection takes (tcp_write_xmit and
            __tcp_ack_snd_check), as tcp_info counts them. Writes of at most
@@ -1116,6 +1361,78 @@ int main(int argc, char **argv) {
         close(c);
         close(s);
         close(l);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-io-uring")) {
+        /* io_uring's socket requests on the loopback: a socket, accepts of
+           connections that wait (IORING_CQE_F_SOCK_NONEMPTY while more do)
+           and one that waits for its connection, a connect in progress, a
+           refused one, sends and receives (one that waits, one that waits
+           for the whole length, what is left to read), and a shutdown. */
+        struct ring r;
+        if (ring_open(&r)) return 80;
+        int l = ring_run(&r, (ring_push(&r, 45, 1, AF_INET, SOCK_STREAM, 0, 0, 0), 1), 1, "socket", 1);
+        struct sockaddr_in a = to(0);
+        call("bind", bind(l, (void *)&a, sizeof a));
+        socklen_t len = sizeof a;
+        getsockname(l, (void *)&a, &len);
+        call("listen", listen(l, 4));
+        int result;
+        int c1 = client(ntohs(a.sin_port), 0, &result);
+        int c2 = client(ntohs(a.sin_port), 0, &result);
+        awaited("queued", l, POLLIN);
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof peer;
+        ring_push(&r, 13, 2, l, (unsigned long)&peer_len, (unsigned long)&peer, 0, SOCK_CLOEXEC);
+        int s1 = ring_run(&r, 1, 1, "accept-more", 1);
+        printf("  peer len=%u family=%d addr=%#x cloexec=%d\n", (unsigned)peer_len, peer.sin_family,
+               ntohl(peer.sin_addr.s_addr), fcntl(s1, F_GETFD) & FD_CLOEXEC);
+        ring_push(&r, 13, 3, l, 0, 0, 0, SOCK_NONBLOCK);
+        int s2 = ring_run(&r, 1, 1, "accept-last", 1);
+        printf("  nonblock=%d\n", (fcntl(s2, F_GETFL) & O_NONBLOCK) != 0);
+        close(s1);
+        close(s2);
+        close(c1);
+        close(c2);
+        ring_push(&r, 13, 4, l, 0, 0, 0, 0);
+        ring_run(&r, 1, 0, "accept-waits", 0);
+        int c = ring_run(&r, (ring_push(&r, 45, 5, AF_INET, SOCK_STREAM, 0, 0, 0), 1), 1, "socket", 1);
+        ring_push(&r, 16, 6, c, sizeof a, (unsigned long)&a, 0, 0);
+        ring_run(&r, 1, 2, "connect-accepted", 1);
+        int s = ring_result[4];
+        struct sockaddr_in closed = to(closed_port);
+        int refused = ring_run(&r, (ring_push(&r, 45, 7, AF_INET, SOCK_STREAM, 0, 0, 0), 1), 1, "socket", 1);
+        ring_push(&r, 16, 8, refused, sizeof closed, (unsigned long)&closed, 0, 0);
+        ring_run(&r, 1, 1, "connect-refused", 0);
+        ring_push(&r, 16, 9, c, sizeof a, (unsigned long)&a, 0, 0);
+        ring_run(&r, 1, 1, "connect-again", 0);
+        char got[16] = {0};
+        ring_push(&r, 26, 10, s, 0, (unsigned long)"hello", 5, 0);
+        ring_run(&r, 1, 1, "send", 0);
+        awaited("sent", c, POLLIN);
+        ring_push(&r, 27, 11, c, 0, (unsigned long)got, 3, 0);
+        ring_run(&r, 1, 1, "recv-part", 0);
+        ring_push(&r, 27, 12, c, 0, (unsigned long)got + 3, 8, 0);
+        ring_run(&r, 1, 1, "recv-rest", 0);
+        print_bytes("received", got, 5);
+        ring_push(&r, 27, 13, c, 0, (unsigned long)got, 8, MSG_DONTWAIT);
+        ring_run(&r, 1, 1, "recv-dontwait", 0);
+        ring_push(&r, 27, 14, c, 0, (unsigned long)got, 8, 0);
+        ring_run(&r, 1, 0, "recv-waits", 0);
+        call("write", (int)write(s, "ab", 2));
+        ring_run(&r, 0, 1, "recv-woken", 0);
+        ring_push(&r, 27, 15, c, 0, (unsigned long)got, 4, MSG_WAITALL);
+        ring_run(&r, 1, 0, "waitall-waits", 0);
+        call("write", (int)write(s, "cd", 2));
+        usleep(100000);
+        call("write", (int)write(s, "ef", 2));
+        ring_run(&r, 0, 1, "waitall-whole", 0);
+        print_bytes("received", got, 4);
+        ring_push(&r, 34, 16, s, 0, 0, SHUT_WR, 0);
+        ring_run(&r, 1, 1, "shutdown", 0);
+        awaited("shut", c, POLLRDHUP);
+        ring_push(&r, 27, 17, c, 0, (unsigned long)got, 8, 0);
+        ring_run(&r, 1, 1, "recv-end", 0);
         return 0;
     }
     if (!strcmp(mode, "listen-errors")) {

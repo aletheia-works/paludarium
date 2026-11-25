@@ -8,7 +8,7 @@
 //! `/proc/locks` and `/proc/sysvipc`'s `msg`, `sem` and `shm` are
 //! ([`crate::seq`]).
 use paludarium_host::{FileHandle, FileStat};
-use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
+use paludarium_mmu::{MemoryView, Prot, Referenced, Usage, Vma, vm};
 use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -796,13 +796,15 @@ pub(crate) fn descriptors_stat() -> FileStat {
     }
 }
 /// The `lstat` of a link in `fd`: user permissions for the descriptor's
-/// access (read gives r-x, write -wx), and size 64, as Linux shows them.
-pub(crate) fn link_stat(access: u32) -> FileStat {
+/// access (read gives r-x, write -wx, and `O_PATH` neither), from its
+/// `flags`, and size 64, as Linux shows them.
+pub(crate) fn link_stat(flags: u32) -> FileStat {
     let mut mode = 0o120_000;
-    if access != 1 {
+    let opened = flags & crate::files::O_PATH == 0;
+    if opened && flags & 3 != 1 {
         mode |= 0o500;
     }
-    if access != 0 {
+    if opened && flags & 3 != 0 {
         mode |= 0o300;
     }
     FileStat {
@@ -992,7 +994,7 @@ pub(crate) struct OwnDirectory {
 pub(crate) type LiveOwner = Arc<dyn Fn() -> (u32, u32) + Send + Sync>;
 impl OwnDirectory {
     /// The directory an open with `flags` made, which keeps the open's
-    /// flags that `F_SETFL` changes, as Linux's `f_flags` does.
+    /// flags, as Linux's `f_flags` does.
     pub(crate) fn opened(flags: u32, stat: FileStat) -> Self {
         Self {
             status: crate::files::StatusFlags::opened(flags),
@@ -1048,7 +1050,7 @@ impl FileHandle for OwnDirectory {
         Ok(())
     }
     fn flags(&self) -> u32 {
-        self.status.of(0o200000)
+        self.status.of(0)
     }
     /// `F_SETFL`, as Linux's `setfl`.
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
@@ -1409,6 +1411,7 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
             }
             None => b"/dev/zero (deleted)",
         },
+        None if vma.start == crate::vsyscall::START => b"[vsyscall]",
         None if vma.heap => b"[heap]",
         None if vma.start <= start_stack && vma.end >= start_stack => b"[stack]",
         None => match &vma.anon_name {
@@ -1491,7 +1494,7 @@ fn smap_usage_lines(usage: &Usage, locked: u64, rollup: bool) -> String {
         ("Shared_Dirty:   ", kb(usage.shared_dirty)),
         ("Private_Clean:  ", kb(usage.private_clean)),
         ("Private_Dirty:  ", kb(usage.private_dirty)),
-        ("Referenced:     ", kb(usage.resident)),
+        ("Referenced:     ", kb(usage.referenced)),
         ("Anonymous:      ", kb(usage.anonymous)),
         ("KSM:            ", 0),
         ("LazyFree:       ", 0),
@@ -1533,6 +1536,7 @@ fn rollup_lines(memory: &MemoryView) -> Vec<u8> {
             locked += usage.pss;
         }
         total.resident += usage.resident;
+        total.referenced += usage.referenced;
         total.shared_clean += usage.shared_clean;
         total.shared_dirty += usage.shared_dirty;
         total.private_clean += usage.private_clean;
@@ -1600,10 +1604,16 @@ impl crate::seq::Records for Maps {
         if self.kind == MapsKind::Rollup {
             return Ok((next == 0).then(|| (rollup_lines(&self.memory), MAPS_END)));
         }
-        let Some(vma) = self.memory.vma_from(next) else {
-            return Ok(None);
+        // The gate area comes after the last VMA, while there is a space
+        // (`proc_get_vma`).
+        let (vma, after) = match self.memory.vma_from(next) {
+            Some(vma) => {
+                let after = self.memory.vma_from(vma.end);
+                (vma, after.map_or(crate::vsyscall::START, |v| v.start))
+            }
+            None if self.memory.mappings().is_some() => (crate::vsyscall::vma(), MAPS_END),
+            None => return Ok(None),
         };
-        let after = self.memory.vma_from(vma.end).map_or(MAPS_END, |v| v.start);
         let mut line = map_line(&vma, self.start_stack, &self.root);
         if self.kind == MapsKind::Smaps {
             let usage = self.memory.usage(vma.start, vma.end).unwrap_or_default();
@@ -1902,7 +1912,9 @@ pub(crate) type CurrentMemory = Arc<dyn Fn() -> Result<Option<MemoryView>, Errno
 /// clears the soft-dirty bits ([`MemoryView::clear_soft_dirty`]) and 5
 /// (`CLEAR_REFS_MM_HIWATER_RSS`) makes the peak of the resident pages
 /// those resident now ([`MemoryView::reset_peak_resident`]); 1 to 3 clear
-/// referenced bits, which are not kept. It has no read operation.
+/// the referenced bits of all pages, of those of VMAs with no file or of
+/// those with one ([`MemoryView::clear_referenced`]). It has no read
+/// operation.
 pub(crate) struct ClearRefsFile {
     memory: CurrentMemory,
     /// The access mode it was opened with (`O_ACCMODE`).
@@ -1990,6 +2002,15 @@ impl FileHandle for ClearRefsFile {
         }
         if let Some(memory) = (self.memory)()? {
             match kind {
+                1 => {
+                    memory.clear_referenced(Referenced::All);
+                }
+                2 => {
+                    memory.clear_referenced(Referenced::Anonymous);
+                }
+                3 => {
+                    memory.clear_referenced(Referenced::File);
+                }
                 4 => {
                     memory.clear_soft_dirty();
                 }
@@ -2095,8 +2116,10 @@ mod tests {
             format!(
                 "00001000-00002000 r--p 00000000 00:00 0 \n\
                  00005000-00007000 rw-p 00000000 00:00 0 \n\
-                 7fff0000-7fff1000 rw-p 00000000 00:00 0 {}[stack]\n",
-                " ".repeat(MAPS_NAME_COLUMN - 40 + 1)
+                 7fff0000-7fff1000 rw-p 00000000 00:00 0 {}[stack]\n\
+                 ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 {}[vsyscall]\n",
+                " ".repeat(MAPS_NAME_COLUMN - 40 + 1),
+                " ".repeat(MAPS_NAME_COLUMN - 56 + 1)
             )
         );
     }
@@ -2268,6 +2291,38 @@ mod tests {
     }
 
     #[test]
+    fn clear_refs_1_to_3_make_smaps_show_no_page_as_referenced_until_its_next_access() {
+        let mut mem = AddressSpace::new();
+        mem.map(
+            Some(GuestAddr(0x10000)),
+            0x2000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.write(GuestAddr(0x10000), b"x").unwrap();
+        mem.write(GuestAddr(0x11000), b"x").unwrap();
+        let referenced = || {
+            let text = String::from_utf8(rollup_lines(&mem.view())).unwrap();
+            let line = text.lines().find(|l| l.starts_with("Referenced:")).unwrap();
+            line.split_whitespace().nth(1).unwrap().to_owned()
+        };
+        let view = mem.view();
+        let current: CurrentMemory = Arc::new(move || Ok(Some(view.clone())));
+        let clear = ClearRefsFile::open(current, 1, Arc::default());
+        assert_eq!(referenced(), "8");
+        // Those of VMAs with a file only.
+        assert_eq!(clear.write(b"3"), Ok(1));
+        assert_eq!(referenced(), "8");
+        for kind in [b"1", b"2"] {
+            assert_eq!(clear.write(kind), Ok(1));
+            assert_eq!(referenced(), "0");
+            mem.read(GuestAddr(0x10000), &mut [0]).unwrap();
+            assert_eq!(referenced(), "4");
+        }
+    }
+
+    #[test]
     fn clear_refs_takes_a_number_as_kstrtoint_reads_one() {
         let mem = AddressSpace::new();
         let view = mem.view();
@@ -2391,7 +2446,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert_eq!(blocks.len(), 4, "{text}");
+        assert_eq!(blocks.len(), 5, "{text}");
         // The locked page is a VMA of its own, and all of it is locked.
         assert!(text.contains("00007000-00008000 rw-p"), "{text}");
         assert!(
@@ -2403,7 +2458,11 @@ mod tests {
             "{text}"
         );
         // The initial stack is not soft-dirty.
-        assert!(text.ends_with("VmFlags: rd wr mr mw me gd ac \n"), "{text}");
+        assert!(text.contains("VmFlags: rd wr mr mw me gd ac \n"), "{text}");
+        // The gate area, of no pages, comes last.
+        assert!(blocks[3].contains("[vsyscall]\nSize:                  4 kB\n"));
+        assert!(blocks[3].contains("Rss:                   0 kB\n"));
+        assert!(text.ends_with("VmFlags: ex \n"), "{text}");
     }
 
     #[test]
@@ -2578,11 +2637,11 @@ mod tests {
         map(0x40000);
         let lines = String::from_utf8(read_all(&file, 7)).unwrap();
         let starts: Vec<&str> = lines.lines().map(|line| &line[..8]).collect();
-        assert_eq!(starts[1..], ["00030000", "00040000"], "{lines}");
+        assert_eq!(starts[1..], ["00030000", "00040000", "ffffffff"], "{lines}");
         // Going back reads them all.
         assert_eq!(file.seek(0, 0).unwrap(), 0);
         let all = read_all(&file, 4096);
-        assert_eq!(String::from_utf8_lossy(&all).lines().count(), 4);
+        assert_eq!(String::from_utf8_lossy(&all).lines().count(), 5);
         assert_eq!(&all[..10], &buf);
     }
 
@@ -2607,7 +2666,8 @@ mod tests {
             Owner::default(),
         );
         let whole = read_all(&file, 1 << 16);
-        assert_eq!(whole.len(), 200 * 41);
+        // And the gate area's line.
+        assert_eq!(whole.len(), 200 * 41 + MAPS_NAME_COLUMN + 12);
         file.seek(0, 0).unwrap();
         let mut big = vec![0; 1 << 16];
         let first = file.read(&mut big).unwrap();
@@ -3007,6 +3067,7 @@ mod descriptor_tests {
         }
         assert_eq!(link_stat(0).mode, 0o120_500);
         assert_eq!(link_stat(2).mode, 0o120_700);
+        assert_eq!(link_stat(crate::files::O_PATH).mode, 0o120_000);
     }
 }
 

@@ -389,6 +389,13 @@ pub enum Fast {
         src: u8,
         imm: u8,
     },
+    /// `pxor` or `pcmpeqb` of 16 bytes of memory, at a 16-byte aligned
+    /// address, into xmm register `dst`.
+    XmmPackedLoad {
+        op: Mnemonic,
+        dst: u8,
+        mem: Address,
+    },
     /// `pmovmskb r, xmm`: the top bit of each byte of `src`.
     Pmovmskb {
         dst: Register,
@@ -695,6 +702,11 @@ impl Fast {
             return None;
         }
         Some(match i.mnemonic {
+            Mnemonic::Pxor | Mnemonic::Pcmpeqb if memory(b).is_some() => Self::XmmPackedLoad {
+                op: i.mnemonic,
+                dst: xmm(a)?,
+                mem: address(b).filter(|m| m.size == 16)?,
+            },
             Mnemonic::Punpcklbw
             | Mnemonic::Punpcklwd
             | Mnemonic::Punpckldq
@@ -1252,6 +1264,21 @@ pub(crate) fn execute(
                 x.s.xmm[usize::from(src)]
             };
             let Some(v) = crate::sse::packed(op, a, b, imm, x.s.xmm[0]) else {
+                return Err(Stop::Invalid);
+            };
+            x.s.xmm[usize::from(dst)] = v;
+            next
+        }
+        Fast::XmmPackedLoad { op, dst, mem } => {
+            let address = x.fast_linear(&mem);
+            if !address.0.is_multiple_of(16) {
+                return Err(Stop::GeneralProtection);
+            }
+            let mut bytes = [0; 16];
+            x.mem.read(address, &mut bytes)?;
+            let a = x.s.xmm[usize::from(dst)];
+            let b = u128::from_le_bytes(bytes);
+            let Some(v) = crate::sse::packed(op, a, b, 0, x.s.xmm[0]) else {
                 return Err(Stop::Invalid);
             };
             x.s.xmm[usize::from(dst)] = v;

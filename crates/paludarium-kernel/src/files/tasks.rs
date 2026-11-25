@@ -1109,7 +1109,7 @@ pub(super) fn stat(
                     super::descriptor_block_size(c, &d),
                 ));
             }
-            crate::proc::link_stat(d.file.flags() & 3)
+            crate::proc::link_stat(d.file.flags())
         }
         // Of size 0, as Linux's, in `fdinfo`, which only a reader that may
         // read the task looks in.

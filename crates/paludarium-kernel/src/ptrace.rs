@@ -1201,11 +1201,13 @@ impl Kernel {
     }
 
     /// Linux's `ptrace_report_syscall` for a signal the tracer resumed a
-    /// syscall stop with: `send_sig` with `SEND_SIG_PRIV`, to the process
-    /// (`PIDTYPE_TGID`) from the kernel.
-    fn syscall_signal(&self, signal: Option<i32>) {
+    /// syscall stop with: `send_sig` with `SEND_SIG_PRIV`, to the thread
+    /// (`PIDTYPE_PID`) from the kernel. It is pending as the thread goes on.
+    fn syscall_signal(&self, thread: &mut Thread, signal: Option<i32>) {
         if let Some(signal) = signal.filter(|&s| s != 0) {
-            self.processes.signal_from_kernel(self.process.pid, signal);
+            self.processes
+                .signal_from_kernel(self.process.pid, thread.tid, signal);
+            self.inbox.drain(&mut thread.state);
         }
     }
 
@@ -1230,7 +1232,7 @@ impl Kernel {
             PTRACE_EVENTMSG_SYSCALL_ENTRY,
             &mut Restart::default(),
         );
-        self.syscall_signal(signal);
+        self.syscall_signal(thread, signal);
         if self.fatal_pending(thread) || matches!(mode, Mode::Sysemu | Mode::SysemuStep) {
             return false;
         }
@@ -1272,7 +1274,7 @@ impl Kernel {
             PTRACE_EVENTMSG_SYSCALL_EXIT,
             restart,
         );
-        self.syscall_signal(signal);
+        self.syscall_signal(thread, signal);
     }
 
     /// A thread is about to enter a signal handler: if it is

@@ -154,6 +154,8 @@ pub(crate) fn poll_file(file: &dyn FileHandle) -> Result<(u32, u64, u64), Errno>
 pub(crate) struct ReadinessHub {
     pub token: WaitToken,
     pub graph: Mutex<()>,
+    /// What is due with no system call.
+    pub deadlines: Arc<crate::deadlines::Deadlines>,
 }
 impl ReadinessHub {
     pub fn changed(&self) {

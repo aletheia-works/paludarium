@@ -27,6 +27,7 @@ mod signals;
 mod skb;
 pub use inbox::SignalInbox;
 mod aio;
+mod blocked;
 mod bpf;
 mod bpf_classic;
 mod bpf_fs;
@@ -38,6 +39,7 @@ mod bpf_prog_tests;
 mod bpf_tests;
 mod bpf_trie;
 mod bpf_verifier;
+mod deadlines;
 mod devices;
 mod dnotify;
 mod epoll;
@@ -80,6 +82,7 @@ mod mqueue;
 #[cfg(test)]
 mod mqueue_tests;
 mod msg;
+mod multicast;
 mod namespaces;
 mod page_cache;
 mod pagemap_scan;
@@ -116,6 +119,7 @@ mod timers;
 mod unix;
 mod userfaultfd;
 mod users;
+mod vsyscall;
 pub use processes::Processes;
 pub use threads::ThreadGroup;
 
@@ -506,6 +510,29 @@ impl Usage {
         }
         on
     }
+    /// Adds what it counted on each CPU to `sums`.
+    pub(crate) fn add_counts(&self, sums: &mut Vec<[u64; 4]>) {
+        let cpus: Vec<u32> = {
+            let counts = self
+                .per_cpu_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let on = counts.on.map(|(cpu, _)| cpu);
+            let left = u32::try_from(counts.done.len()).unwrap_or(u32::MAX);
+            let more = on.filter(|&cpu| cpu >= left);
+            (0..left).chain(more).collect()
+        };
+        for cpu in cpus {
+            let counts = self.counts_on(cpu);
+            let cpu = cpu as usize;
+            if sums.len() <= cpu {
+                sums.resize(cpu + 1, [0; 4]);
+            }
+            for (sum, count) in sums[cpu].iter_mut().zip(counts) {
+                *sum = sum.saturating_add(count);
+            }
+        }
+    }
     /// Its CPU time in nanoseconds and what of it was on `cpu`, as of the
     /// latest look at it.
     pub(crate) fn time_on(&self, cpu: u32) -> (u64, u64) {
@@ -778,6 +805,8 @@ pub struct ThreadState {
     pub(crate) timer: signals::RealTimer,
     /// The earliest POSIX timer deadline, synced from the thread group.
     pub(crate) posix_deadline: Option<u64>,
+    /// When something is next due in the session ([`deadlines`]).
+    pub(crate) due: Option<u64>,
     pub stopped: bool,
     /// The thread's name (`comm`), NUL-padded: PR_SET_NAME and PR_GET_NAME.
     pub(crate) name: [u8; 16],
@@ -904,6 +933,7 @@ impl Kernel {
     pub fn new(host: Arc<dyn Host>) -> Self {
         let files = files::Files::with_host(Arc::clone(&host));
         let group = Arc::new(ThreadGroup::default());
+        group.watch(&files.readiness.deadlines);
         let processes = Arc::new(Processes::new(group.clone()));
         Kernel {
             host,
@@ -1179,6 +1209,29 @@ impl Kernel {
         number: u64,
         notify: &seccomp::Notify,
     ) -> Option<Next> {
+        let reply = self.listener_reply(thread, mem, number, notify);
+        thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
+        thread.state.restart = None;
+        match reply {
+            seccomp::Reply::Continue => return None,
+            seccomp::Reply::Return(value) => thread.cpu.gpr[reg::RAX] = value,
+            seccomp::Reply::Interrupted { always } => {
+                thread.cpu.gpr[reg::RAX] = paludarium_types::Errno(4).to_syscall_return();
+                thread.state.restart = Some(number);
+                thread.state.seccomp_restart = Some(always);
+            }
+        }
+        Some(self.checkpoint(thread, mem))
+    }
+
+    /// What the listener `notify` names answers for the call `number`.
+    pub(crate) fn listener_reply(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        number: u64,
+        notify: &seccomp::Notify,
+    ) -> seccomp::Reply {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
         proc::enter(
@@ -1203,18 +1256,7 @@ impl Kernel {
         };
         let reply = seccomp::notify(&mut ctx, notify);
         self.inbox.drain(&mut thread.state);
-        thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
-        thread.state.restart = None;
-        match reply {
-            seccomp::Reply::Continue => return None,
-            seccomp::Reply::Return(value) => thread.cpu.gpr[reg::RAX] = value,
-            seccomp::Reply::Interrupted { always } => {
-                thread.cpu.gpr[reg::RAX] = paludarium_types::Errno(4).to_syscall_return();
-                thread.state.restart = Some(number);
-                thread.state.seccomp_restart = Some(always);
-            }
-        }
-        Some(self.checkpoint(thread, mem))
+        reply
     }
 
     /// The fault of `thread` on a page the `userfaultfd` numbered `context`
@@ -1756,6 +1798,11 @@ impl Kernel {
         // A caller that did not finish the last exec finishes it now.
         self.exec_finished();
         self.group.register(thread.tid, Arc::clone(&self.inbox));
+        // Running the `vsyscall` page, which Linux emulates before it looks
+        // for a VMA (`do_user_addr_fault`).
+        if let Some(address) = vsyscall::entered(&reason) {
+            return self.vsyscall(thread, mem, address);
+        }
         // A fault below a mapping that grows down extends it, and the
         // instruction runs again, as Linux's `lock_mm_and_find_vma` expands
         // the stack VMA before it handles the fault. So it does when the
@@ -1819,7 +1866,9 @@ impl Kernel {
                     trap: 14,
                     error: 4
                         | (u64::from(write) * 2)
-                        | u64::from(present)
+                        // Above user space always a protection fault, to
+                        // hide the kernel's layout (`sanitize_error_code`).
+                        | u64::from(present || addr.0 >= vsyscall::TASK_SIZE_MAX)
                         | (u64::from(fetch) * 16),
                     synchronous: true,
                     timer: None,

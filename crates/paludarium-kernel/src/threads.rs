@@ -176,6 +176,8 @@ pub struct ThreadGroup {
     /// The signal of its last group stop (Linux's `group_exit_code` while
     /// stopped).
     stop_signal: std::sync::atomic::AtomicI32,
+    /// What is due in the session with no system call.
+    deadlines: std::sync::OnceLock<Arc<crate::deadlines::Deadlines>>,
 }
 /// An interval timer of the process's CPU time, as Linux's `cpu_itimer`:
 /// when it expires, in the process's CPU time (0 while it is disarmed), and
@@ -297,6 +299,7 @@ impl Default for ThreadGroup {
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
             stop_signal: std::sync::atomic::AtomicI32::new(0),
+            deadlines: std::sync::OnceLock::new(),
         }
     }
 }
@@ -679,6 +682,7 @@ impl ThreadGroup {
                     .clone(),
             ),
             first_namespaces: self.first_namespaces.clone(),
+            deadlines: self.deadlines.clone(),
             exe_file: Mutex::new(
                 self.exe_file
                     .lock()
@@ -757,6 +761,15 @@ impl ThreadGroup {
             used.sample();
             times.add(used);
         }
+    }
+    /// The accounts of the process's threads, live or exited.
+    pub(crate) fn usages(&self) -> Vec<Arc<crate::Usage>> {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, used)| Arc::clone(used))
+            .collect()
     }
     /// The CPU time of thread `tid` now, while it is live (0 before it has
     /// started).
@@ -1145,9 +1158,27 @@ impl ThreadGroup {
     pub(crate) fn timer_generation(&self) -> u64 {
         self.timer_generation.load(Ordering::SeqCst)
     }
-    /// [`Self::expire_due`], whose signals `local` then takes in with the
-    /// process's others.
+    /// The process's threads run what is due in the session.
+    pub(crate) fn watch(&self, deadlines: &Arc<crate::deadlines::Deadlines>) {
+        let _ = self.deadlines.set(Arc::clone(deadlines));
+    }
+    /// The thread of `inbox` sleeps until a time it knows beforehand, for as
+    /// long as what this gives is kept ([`crate::deadlines`]).
+    pub(crate) fn sleeping(
+        &self,
+        inbox: &Arc<SignalInbox>,
+    ) -> Option<crate::deadlines::Sleeping<'_>> {
+        let deadlines = self.deadlines.get()?;
+        Some(deadlines.sleeping(inbox))
+    }
+    /// Runs what is due at `now`: what is due in the session, with no lock
+    /// held, and [`Self::expire_due`], whose signals `local` then takes in
+    /// with the process's others.
     pub(crate) fn expire_timer(&self, local: &mut ThreadState, now: u64) {
+        local.due = self.deadlines.get().and_then(|deadlines| {
+            deadlines.run(|| Some(now));
+            deadlines.next()
+        });
         local.timer = self.expire_due(now);
         local.posix_deadline = self.posix_deadline();
         self.drain_process(local);
@@ -2429,8 +2460,9 @@ impl Kernel {
             return;
         };
         self.processes.set_dumped(pid);
+        let root = self.files.root();
         let write = || {
-            crate::coredump::write(dump, &identity, mem, &mut |piece| {
+            crate::coredump::write(dump, &identity, mem, &root, &mut |piece| {
                 let mut at = 0;
                 while at < piece.len() {
                     match file.write(&piece[at..]) {

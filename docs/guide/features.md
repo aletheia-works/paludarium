@@ -2183,6 +2183,22 @@ kernel.
   `_WRITE_FIXED` move bytes within the buffer `buf_index` names, after the
   file is found: no buffer there, or a range that leaves it, is `EFAULT`.
 
+- A ring made with `IORING_SETUP_R_DISABLED` refuses `io_uring_enter`
+  (`EBADFD`) until `IORING_REGISTER_ENABLE_RINGS` enables it, whose thread
+  is then the only submitter with `IORING_SETUP_SINGLE_ISSUER`. Meanwhile
+  `IORING_REGISTER_RESTRICTIONS` may give it restrictions once (`EBUSY`,
+  `EBADFD` for an enabled ring), as Linux's `io_parse_restrictions` reads
+  them: the registrations it allows (`EACCES` for another, once enabled),
+  and the operations, with the flags they may have and must have, of its
+  requests, each of which fails with `EACCES` otherwise. None at all allows
+  nothing.
+
+- `IORING_REGISTER_PERSONALITY` keeps the thread's credentials, with its
+  Landlock domain, and gives their ID, from 1 on (`xa_alloc_cyclic`). A
+  request that names one (`EINVAL` for none) runs with them, again as it
+  goes on after a wait (`override_creds`), and keeps them after
+  `IORING_UNREGISTER_PERSONALITY`.
+
 - `IORING_REGISTER_RING_FDS` registers ring descriptors for the calling
   thread, as Linux's `io_ringfd_register` does: 1 to 16 `struct
   io_uring_rsrc_update`s (`EINVAL`), each with no reserved field

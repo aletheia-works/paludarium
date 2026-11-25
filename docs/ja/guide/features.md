@@ -1897,6 +1897,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   見つけたあと、`buf_index` が指すバッファーの中で転送します。そこにバッファーがないか、
   範囲がはみ出せば `EFAULT` です。
 
+- `IORING_SETUP_R_DISABLED` で作ったリングは、`IORING_REGISTER_ENABLE_RINGS` で有効にするまで
+  `io_uring_enter` を断ります（`EBADFD`）。`IORING_SETUP_SINGLE_ISSUER` なら、有効にした
+  スレッドだけが投入できます。そのあいだに一度だけ（`EBUSY`、有効なリングは `EBADFD`）
+  `IORING_REGISTER_RESTRICTIONS` で制限を付けられます。制限は Linux の
+  `io_parse_restrictions` と同じく読みます。許す登録（有効になった後、ほかは `EACCES`）と、
+  要求に許す操作、付けてよいフラグ、付けなければならないフラグで、合わない要求は `EACCES` で
+  失敗します。1 つもない制限は何も許しません。
+
+- `IORING_REGISTER_PERSONALITY` はスレッドの資格情報を Landlock のドメインごと保ち、1 から
+  始まる ID を返します（`xa_alloc_cyclic`）。それを指す要求（なければ `EINVAL`）は、待った後に
+  続くときも含めてその資格情報で実行し（`override_creds`）、
+  `IORING_UNREGISTER_PERSONALITY` の後も保ちます。
+
 - `IORING_REGISTER_RING_FDS` は、Linux の `io_ringfd_register` と同じく、呼んだスレッドの
   ためにリングの記述子を登録します。1 から 16 個の `struct io_uring_rsrc_update`（`EINVAL`）は、
   それぞれ予約した欄が 0 で（`EINVAL`）、リングの記述子（`EBADF`、`EOPNOTSUPP`）と 16 個の

@@ -524,7 +524,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   完了します（Linux のタイマーはその時点で完了させます）。単独で終了するスレッドは、リングを待つポーリングを
   残します（Linux は取り消します）。自分の要求にポーリングされるリングは、その要求が終わるまで
   残ります。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
-  `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
+  `_SQ_AFF`、`_ATTACH_WQ`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
   `IORING_REGISTER_BUFFERS_UPDATE`、`IORING_REGISTER_FILES`、
@@ -532,9 +532,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_REGISTER_FILE_ALLOC_RANGE`、`IORING_REGISTER_FILES2`、
   `IORING_REGISTER_FILES_UPDATE2`、`IORING_REGISTER_PBUF_RING`、
   `IORING_UNREGISTER_PBUF_RING`、`IORING_REGISTER_PBUF_STATUS`、
-  `IORING_REGISTER_SYNC_CANCEL`、`IORING_REGISTER_RING_FDS`、
-  `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。そのため、
-  パーソナリティは登録できません。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
+  `IORING_REGISTER_SYNC_CANCEL`、`IORING_REGISTER_PERSONALITY`、
+  `IORING_UNREGISTER_PERSONALITY`、`IORING_REGISTER_RESTRICTIONS`、
+  `IORING_REGISTER_ENABLE_RINGS`、`IORING_REGISTER_RING_FDS`、
+  `IORING_UNREGISTER_RING_FDS` だけです（ほかは `EINVAL`）。Linux 7.0 にあるタスクの制限は
+  ありません（記述子 -1 は `EBADF`）。`IORING_REGISTER_BUFFERS_UPDATE` は、差分テストを走らせる
   カーネルである Linux 7.0 と同じく、スロットごとに `iovec` をタグより先に読み、
   `IORING_RSRC_UPDATE_EXTENDED` を断ります。Linux master はタグを先に読み、そのフラグの
   `struct io_uring_regbuf_desc` を受け付けます。テストを走らせるカーネルが追いつけば master に

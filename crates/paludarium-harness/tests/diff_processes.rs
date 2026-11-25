@@ -1224,6 +1224,8 @@ mod linux {
         processes_io_uring_placement => ("io-uring-placement","process"),
         processes_io_uring_timeout => ("io-uring-timeout","process"),
         processes_io_uring_min_wait => ("io-uring-min-wait","process"),
+        processes_io_uring_restrictions => ("io-uring-restrictions","process"),
+        processes_io_uring_personality => ("io-uring-personality","process"),
         processes_io_uring_poll_add => ("io-uring-poll-add","process"),
         processes_io_uring_fs => ("io-uring-fs","process"),
         processes_io_uring_message => ("io-uring-message","process"),

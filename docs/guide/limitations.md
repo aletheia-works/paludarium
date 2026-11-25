@@ -631,7 +631,7 @@ verified.
   completes it then. A thread that exits alone leaves its polls of rings
   waiting, where Linux cancels them, and a ring polled by a request of its
   own stays until that request ends. The setup flags
-  `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
+  `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`,
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
@@ -641,8 +641,11 @@ verified.
   `IORING_REGISTER_FILES2`, `IORING_REGISTER_FILES_UPDATE2`,
   `IORING_REGISTER_PBUF_RING`, `IORING_UNREGISTER_PBUF_RING`,
   `IORING_REGISTER_PBUF_STATUS`, `IORING_REGISTER_SYNC_CANCEL`,
+  `IORING_REGISTER_PERSONALITY`, `IORING_UNREGISTER_PERSONALITY`,
+  `IORING_REGISTER_RESTRICTIONS`, `IORING_REGISTER_ENABLE_RINGS`,
   `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS` (the others
-  give `EINVAL`). So no personality can be registered.
+  give `EINVAL`). Restrictions of a task, which Linux 7.0 has, are not
+  there (`EBADF` for descriptor -1).
   `IORING_REGISTER_BUFFERS_UPDATE` reads each slot's `iovec`
   before its tag and refuses `IORING_RSRC_UPDATE_EXTENDED`, as Linux 7.0,
   the kernel the differential tests run on, does; Linux master reads the

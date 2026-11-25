@@ -8072,6 +8072,118 @@ mod io_uring {
         }
     }
 
+    const R_DISABLED: u32 = 1 << 6;
+    const EBADFD: Errno = Errno(77);
+    const EACCES: i32 = -13;
+
+    /// `IORING_REGISTER_RESTRICTIONS` of `list`, each an operation and its
+    /// value.
+    fn restrict(f: &mut Fixture, r: &Ring, list: &[(u16, u8)]) -> u64 {
+        let at = DATA + 0x200;
+        for (i, (op, value)) in list.iter().enumerate() {
+            let mut entry = [0; 16];
+            entry[..2].copy_from_slice(&op.to_le_bytes());
+            entry[2] = *value;
+            f.mem.write(GuestAddr(at + 16 * i as u64), &entry).unwrap();
+        }
+        f.ret(427, &[r.fd, 11, at, list.len() as u64])
+    }
+
+    #[test]
+    fn a_disabled_ring_takes_restrictions_until_it_is_enabled() {
+        let mut f = fixture();
+        let enabled = ring(&mut f);
+        assert_eq!(f.ret(427, &[enabled.fd, 12, 0, 0]), errno(EBADFD));
+        assert_eq!(restrict(&mut f, &enabled, &[(1, 0)]), errno(EBADFD));
+        let r = ring_with(&mut f, R_DISABLED);
+        // No wait, and no submission.
+        assert_eq!(f.ret(426, &[r.fd, 0, 0, 0]), errno(EBADFD));
+        assert_eq!(f.ret(426, &[r.fd, 1, 1, GETEVENTS]), errno(EBADFD));
+        // What is refused leaves it without restrictions.
+        let einval = errno(Errno::EINVAL);
+        assert_eq!(f.ret(427, &[r.fd, 11, 0, 0]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 11, DATA, 1000]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 11, 8, 1]), errno(Errno::EFAULT));
+        for bad in [(4, 0), (0, 200), (1, 200)] {
+            assert_eq!(restrict(&mut f, &r, &[(1, 0), bad]), einval);
+        }
+        // NOPs, with a link and never without one, and unregistering files.
+        assert_eq!(restrict(&mut f, &r, &[(0, 3), (1, 0), (2, 16), (3, 4)]), 0);
+        assert_eq!(restrict(&mut f, &r, &[(1, 1)]), errno(EBUSY));
+        // A disabled ring still takes any registration.
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
+        assert_eq!(f.ret(427, &[r.fd, 12, 1, 0]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 12, 0, 1]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 12, 0, 0]), 0);
+        let eacces = errno(Errno::EACCES);
+        let nop = |flags: u8| {
+            let mut e = nop(1, 0, 0, 0, 0);
+            e[1] = flags;
+            e
+        };
+        assert_eq!(f.ret(427, &[r.fd, 12, 0, 0]), eacces);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), eacces);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), errno(ENXIO));
+        assert_eq!(one(&mut f, &r, &nop(4)), 0);
+        assert_eq!(one(&mut f, &r, &nop(4 | 16)), 0);
+        assert_eq!(one(&mut f, &r, &nop(0)), EACCES);
+        assert_eq!(one(&mut f, &r, &nop(4 | 1)), EACCES);
+        let mut read = rw(READ, 0, HERE, DATA, 1);
+        read[1] = 4;
+        assert_eq!(one(&mut f, &r, &read), EACCES);
+        // An operation past the last comes first.
+        assert_eq!(one(&mut f, &r, &sqe(200, 1)), -22);
+        // The list of none allows nothing; one half alone leaves the other.
+        let r = ring_with(&mut f, R_DISABLED);
+        assert_eq!(restrict(&mut f, &r, &[]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 12, 0, 0]), 0);
+        assert_eq!(one(&mut f, &r, &nop(0)), EACCES);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), eacces);
+        let r = ring_with(&mut f, R_DISABLED);
+        assert_eq!(restrict(&mut f, &r, &[(0, 9)]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 12, 0, 0]), 0);
+        assert_eq!(one(&mut f, &r, &nop(0)), 0);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
+        assert_eq!(f.ret(427, &[r.fd, 10, 0, 1]), eacces);
+    }
+
+    #[test]
+    fn a_request_runs_with_its_personality() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        assert_ne!(f.ret(2, &[DATA, 0o102, 0o600]), errno(Errno::EACCES));
+        let with = |f: &mut Fixture, r: &Ring, id: u16| {
+            let mut e = fs(18, -100, 0, DATA, 0, 0);
+            e[42..44].copy_from_slice(&id.to_le_bytes());
+            one(f, r, &e)
+        };
+        let einval = errno(Errno::EINVAL);
+        assert_eq!(f.ret(427, &[r.fd, 9, DATA, 0]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 1]), einval);
+        assert_eq!(with(&mut f, &r, 1), -22);
+        // Root's, then another user's, whose own open is refused.
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
+        f.thread.state.credentials.fsuid = 1000;
+        f.thread.state.credentials.effective = 0;
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 2);
+        assert_eq!(with(&mut f, &r, 0), EACCES);
+        assert!(with(&mut f, &r, 1) > 0);
+        assert_eq!(with(&mut f, &r, 2), EACCES);
+        assert_eq!(f.thread.state.credentials.fsuid, 1000);
+        // One unregistered; IDs go on and start again.
+        assert_eq!(f.ret(427, &[r.fd, 10, 1, 1]), einval);
+        assert_eq!(f.ret(427, &[r.fd, 10, 0, 1]), 0);
+        assert_eq!(f.ret(427, &[r.fd, 10, 0, 1]), einval);
+        assert_eq!(with(&mut f, &r, 1), -22);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 3);
+        for id in 4..=0xffff {
+            assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), id);
+        }
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), 1);
+        assert_eq!(f.ret(427, &[r.fd, 9, 0, 0]), errno(EBUSY));
+    }
+
     /// Submits `entries` at once with no wait.
     fn submit_only(f: &mut Fixture, r: &Ring, entries: &[[u8; 64]]) {
         for e in entries {

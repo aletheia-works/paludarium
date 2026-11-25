@@ -1719,7 +1719,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_ACCEPT_DONTWAIT`）は `EAGAIN` で完了します。`IORING_RECVSEND_POLL_FIRST` と
   `IORING_ACCEPT_POLL_FIRST` は先に待ちます。送信は `MSG_NOSIGNAL` を加えます。`MSG_WAITALL` では、
   ストリームまたは順序付きパケットのソケットの送受信は長さ全体まで続け、動かした分をすべて
-  返します。受信は提供されたバッファーを選べ（`ENOBUFS`）、そのバッファーは、Linux master の
+  返します。途中で失敗したもの（待たないように頼んだものや、取り消されたもの）も、それまでに動かした分を
+  返します（`io_sendrecv_fail`）。受信は提供されたバッファーを選べ（`ENOBUFS`）、そのバッファーは、Linux master の
   `io_recv` が返すのと同じく、受信が待つあいだと、何も読まなかったときにグループへ戻ります。
   受信は、TCP ソケット（または `tcp_inq_hint` と同じく相手が終えたあと）か AF_UNIX のストリームに
   バイトが残っているあいだ、受け付けは TCP の接続がまだ待っているあいだ

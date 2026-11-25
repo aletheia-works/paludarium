@@ -344,7 +344,7 @@ pub(super) fn run(
     match issued {
         Issued::Done(res, flags, failed) => (res, flags, failed || res < 0, None),
         // `io_queue_async`: one that asked not to wait fails.
-        Issued::Again(_) if nowait => (-Errno::EAGAIN.0, 0, true, None),
+        Issued::Again(_) if nowait => (failed(net, Errno::EAGAIN), 0, true, None),
         Issued::Again(mask) => (
             0,
             0,
@@ -356,6 +356,15 @@ pub(super) fn run(
                 found: (opened, None),
             }),
         ),
+    }
+}
+
+/// `io_sendrecv_fail`: what a request that fails with `e` gives: the bytes a
+/// send or a receive moved before it waited, if it moved any.
+pub(super) fn failed(net: &Net, e: Errno) -> i32 {
+    match net.op {
+        Op::Transfer { done, .. } if done != 0 => done as i32,
+        _ => -e.0,
     }
 }
 

@@ -1964,7 +1964,9 @@ kernel.
   `IORING_RECVSEND_POLL_FIRST` and `IORING_ACCEPT_POLL_FIRST` wait first.
   A send adds `MSG_NOSIGNAL`. With `MSG_WAITALL`, a stream or
   sequenced-packet socket's send or receive goes on to its whole length
-  and gives all it moved. A receive may select a provided buffer
+  and gives all it moved; one that fails on the way, as it asked not to
+  wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A
+  receive may select a provided buffer
   (`ENOBUFS`), which goes back to its group while the receive waits, or if
   it read nothing, as Linux master's `io_recv` gives it back. A receive
   has `IORING_CQE_F_SOCK_NONEMPTY` while bytes are left on a TCP socket

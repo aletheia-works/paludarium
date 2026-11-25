@@ -2,15 +2,17 @@
 //! `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL` (the one libuv batches its
 //! `epoll_ctl` calls with), and the file transfers `IORING_OP_READ`,
 //! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`,
-//! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`, and
-//! `IORING_OP_ASYNC_CANCEL` ([`cancel`]). The others answer
+//! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
+//! `IORING_OP_ASYNC_CANCEL` ([`cancel`]), and the single-shot socket
+//! requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
+//! and `_RECV` ([`net`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
 //! `IORING_REGISTER_FILES` (or `_FILES2`, with tags) the files a request
 //! with `IOSQE_FIXED_FILE` names by their index, and
-//! `IORING_REGISTER_PBUF_RING` a ring of the buffers a read with
-//! `IOSQE_BUFFER_SELECT` chooses from, as it does from provided ones. The
+//! `IORING_REGISTER_PBUF_RING` a ring of the buffers a read or a receive
+//! with `IOSQE_BUFFER_SELECT` chooses from, as it does from provided ones. The
 //! registered files, their updates and their allocation range are checked
 //! as Linux 7.0's `io_uring/rsrc.c`, `register.c` and `filetable.c` check
 //! them, the provided buffers and their rings as its `kbuf.c` does, and a
@@ -2228,7 +2230,8 @@ fn run_terminated(ring: &Ring, work: Deferred) {
 }
 
 /// `io_req_defer_failed`: the first request of `chain` fails with `e`,
-/// using a provided buffer it kept (`io_put_kbuf`), and so does its link.
+/// using a provided buffer it kept (`io_put_kbuf`), and so does its link. A
+/// socket's gives what it moved instead ([`net::failed`]).
 fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
     let request = chain.remove(0);
     let flags = match &request.work {
@@ -2237,9 +2240,13 @@ fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
         }),
         _ => 0,
     };
+    let res = match &request.work {
+        Work::Net(net) => net::failed(net, e),
+        _ => -e.0,
+    };
     let done = Done {
         user_data: request.user_data,
-        res: -e.0,
+        res,
         flags,
         post: true,
         next: None,

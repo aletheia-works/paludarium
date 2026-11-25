@@ -11588,6 +11588,15 @@ static int io_uring_net_case(void) {
     printf("write: %zd\n", write(sv[0], "ef", 2));
     unet_run(&u, 0, 1, "waitall-whole", 0);
     printf("received: %.4s\n", got);
+    printf("write: %zd\n", write(sv[0], "ij", 2));
+    unet_push(&u, 27, 26, sv[1], 0, (unsigned long)got, 4, MSG_WAITALL | MSG_DONTWAIT, 0);
+    unet_run(&u, 1, 1, "waitall-dontwait", 0);
+    unet_push(&u, 27, 27, sv[1], 0, (unsigned long)got, 4, MSG_WAITALL, 0);
+    unet_run(&u, 1, 0, "waitall-waits", 0);
+    printf("write: %zd\n", write(sv[0], "klm", 3));
+    unet_run(&u, 0, 0, "waitall-part", 0);
+    unet_push(&u, 14, 28, -1, 0, 27, 0, 0, 0);
+    unet_run(&u, 1, 2, "waitall-cancelled", 0);
     printf("write: %zd\n", write(sv[0], "g", 1));
     unet_push(&u, 27, 16, sv[1], 0, (unsigned long)got, 8, 0, 1);
     unet_run(&u, 1, 1, "poll-first", 0);

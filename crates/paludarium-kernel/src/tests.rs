@@ -7080,6 +7080,18 @@ mod io_uring {
         assert_eq!(f.ret(1, &[a, put + 2, 2]), 2);
         assert_eq!(reap(&mut f, &r), [(1, 4)]);
         assert_eq!(bytes(&f, got, 4), b"hell");
+        // One that cannot wait for the rest, or is cancelled as it waits,
+        // gives what it read.
+        assert_eq!(f.ret(1, &[a, put, 2]), 2);
+        let both = DONTWAIT | WAITALL;
+        assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 4, both, 0)), 2);
+        assert_eq!(
+            batch(&mut f, &r, &[net(RECV, b, 0, got, 4, WAITALL, 0)]),
+            []
+        );
+        assert_eq!(f.ret(1, &[a, put, 3]), 3);
+        assert_eq!(reap(&mut f, &r), []);
+        assert_eq!(batch(&mut f, &r, &[cancel(9, 1, 0, 0)]), [(9, 0), (1, 3)]);
         // IORING_RECVSEND_POLL_FIRST waits first, then reads what is there.
         assert_eq!(f.ret(1, &[a, put, 1]), 1);
         assert_eq!(one(&mut f, &r, &net(RECV, b, 0, got, 8, 0, 1)), 1);

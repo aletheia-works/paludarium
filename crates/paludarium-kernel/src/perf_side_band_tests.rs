@@ -363,9 +363,6 @@ fn say_record(env: &mut Env, e: &mut Expected, record: &[u64]) {
         let mmap2 = kind == RECORD_MMAP2;
         let (start, len, pgoff) = (record[2], record[3], record[4]);
         let name = name_at(record, if mmap2 { 9 } else { 5 });
-        if name == b"[vdso]" || name.starts_with(b"[vvar") {
-            return;
-        }
         let what = if !e.path.is_empty() && name == e.path {
             "file".to_string()
         } else if name == b"//anon" {

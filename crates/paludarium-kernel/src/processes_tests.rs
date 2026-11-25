@@ -1539,7 +1539,8 @@ mod exec {
         assert_eq!(em.bottom_up(), Some(0x2aaa_aaaa_b000));
         let first = syscall(&mut k, &mut t, &em, 9, [0, 4096, 3, 0x22, u64::MAX, 0]);
         let second = syscall(&mut k, &mut t, &em, 9, [0, 4096, 3, 0x22, u64::MAX, 0]);
-        assert_eq!((first, second), (0x2aaa_aaaa_b000, 0x2aaa_aaaa_c000));
+        // The vDSO and its data took the first eight pages at exec.
+        assert_eq!((first, second), (0x2aaa_aaab_3000, 0x2aaa_aaab_4000));
         // The flag stays for the next exec; without it, top-down again.
         assert_eq!(
             syscall(&mut k, &mut t, &em, 135, [0, 0, 0, 0, 0, 0]),
@@ -6944,6 +6945,7 @@ mod proc_other {
             auxv: [(0, 0); paludarium_loader::AUXV_ENTRIES],
             code: (0x40_1000, 0x40_2345),
             data: (0x40_3000, 0x40_3100),
+            vdso: 0,
             fails: false,
         }
     }

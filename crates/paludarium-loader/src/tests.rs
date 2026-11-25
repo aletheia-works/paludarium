@@ -347,6 +347,13 @@ fn initial_stack_has_linux_layout() {
     assert_eq!(read_c_string(&mem, env0), b"A=1");
     assert_eq!(mem.read_u64(GuestAddr(sp + 40)).unwrap(), 0);
     let aux = sp + 48;
+    // The vDSO comes first (`ARCH_DLINFO`).
+    assert_eq!(mem.read_u64(GuestAddr(aux)).unwrap(), auxv::AT_SYSINFO_EHDR);
+    let vdso = mem.read_u64(GuestAddr(aux + 8)).unwrap();
+    assert_eq!(vdso, image.vdso);
+    let mut magic = [0; 4];
+    mem.read(GuestAddr(vdso), &mut magic).unwrap();
+    assert_eq!(&magic, b"\x7fELF");
     assert_eq!(aux_value(&mem, aux, auxv::AT_PAGESZ), Some(4096));
     assert_eq!(aux_value(&mem, aux, auxv::AT_ENTRY), Some(0x401000));
     assert_eq!(aux_value(&mem, aux, auxv::AT_PHNUM), Some(2));
@@ -366,6 +373,36 @@ fn initial_stack_has_linux_layout() {
     assert_eq!(r, [7; 16]);
     let execfn = aux_value(&mem, aux, auxv::AT_EXECFN).unwrap();
     assert_eq!(read_c_string(&mem, execfn), b"/prog");
+}
+
+/// `[vvar]`, `[vvar_vclock]` and `[vdso]` are three VMAs, one after the
+/// other, right below the interpreter's.
+#[test]
+fn the_vdso_and_its_data_lie_together_below_the_interpreter() {
+    let fs = files(&[
+        ("/prog", asks_for(elf::ET_EXEC, 0x401000, b"/ld\0")),
+        ("/ld", linker()),
+    ]);
+    let mut mem = AddressSpace::new();
+    let image = load_with(&fs, b"/prog", &start(&[], &[]), &mut mem, &mut |name| {
+        Ok((name.to_vec(), None))
+    })
+    .unwrap();
+    let vvar = image.vdso - 6 * PAGE_SIZE;
+    let mut at = vvar;
+    for (name, pages, prot) in [
+        (b"[vvar]".as_slice(), 4, Prot::READ),
+        (b"[vvar_vclock]", 2, Prot::READ),
+        (b"[vdso]", 2, Prot::READ_EXEC),
+    ] {
+        let vma = mem.view().vma_from(at).unwrap();
+        assert_eq!((vma.start, vma.end), (at, at + pages * PAGE_SIZE));
+        assert_eq!((vma.prot, vma.shared, vma.identity), (prot, false, (0, 0)));
+        assert_eq!(vma.file.unwrap().name.as_deref(), Some(name));
+        at = vma.end;
+    }
+    // The interpreter's first segment is at 0x1000.
+    assert_eq!(at, image.interpreter_base + 0x1000);
 }
 
 #[test]

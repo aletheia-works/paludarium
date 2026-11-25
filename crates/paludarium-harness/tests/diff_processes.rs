@@ -184,7 +184,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-accept, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, inet-diag-device, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-ipv6-accept, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -297,6 +297,7 @@ mod linux {
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
                     | "userfaultfd-gup"
+                    | "userfaultfd-held"
                     | "userfaultfd-sigbus"
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
@@ -375,6 +376,7 @@ mod linux {
                     | "generic-netlink"
                     | "sock-diag"
                     | "inet-diag"
+                    | "inet-diag-device"
                     | "ext-ack-netlink"
                     | "ext-ack-addresses"
                     | "ext-ack-monitor"
@@ -540,6 +542,7 @@ mod linux {
                     | "cpu-timer"
                     | "cpu-sleep"
                     | "cpu-sleep-others"
+                    | "cpu-clock-running"
                     | "cpu-timer-others"
                     | "perf-counts"
                     | "perf-exec"
@@ -616,6 +619,7 @@ mod linux {
         processes_generic_netlink => ("generic-netlink","process"),
         processes_sock_diag => ("sock-diag","process"),
         processes_inet_diag => ("inet-diag","process"),
+        inet_diag_device => ("inet-diag-device","inet-diag-device"),
         processes_ext_ack_netlink => ("ext-ack-netlink","process"),
         processes_ext_ack_addresses => ("ext-ack-addresses","process"),
         processes_ext_ack_monitor => ("ext-ack-monitor","process"),
@@ -814,6 +818,7 @@ mod linux {
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
         userfaultfd_gup => ("userfaultfd-gup","userfaultfd"),
+        userfaultfd_held => ("userfaultfd-held","userfaultfd"),
         userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
@@ -1046,6 +1051,7 @@ mod linux {
         processes_pidfd_getfd => ("pidfd-getfd","process"),
         processes_pidfd_fdinfo => ("pidfd-fdinfo","process"),
         processes_cpu_clock_ids => ("cpu-clock-ids","process"),
+        processes_cpu_clock_running => ("cpu-clock-running","process"),
         processes_alarm_clocks => ("alarm-clocks","process"),
         processes_yama => ("yama","process"),
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),
@@ -1103,6 +1109,7 @@ mod linux {
         processes_ptrace_stop_exit_code => ("ptrace-stop-exit-code","process"),
         processes_gone_leader_files => ("gone-leader-files","process"),
         processes_smaps_rollup => ("smaps-rollup","process"),
+        processes_vdso_mappings => ("vdso-mappings","process"),
         processes_thread_caps_status => ("thread-caps-status","process"),
         processes_zombie_ns_links => ("zombie-ns-links","process"),
         processes_userns_nondumpable_read => ("userns-nondumpable-read","process"),
@@ -1125,6 +1132,7 @@ mod linux {
         processes_io_uring_ring_poll => ("io-uring-ring-poll","process"),
         processes_io_uring_cancel => ("io-uring-cancel","process"),
         processes_io_uring_exit => ("io-uring-exit","process"),
+        processes_io_uring_ring_fds => ("io-uring-ring-fds","process"),
         processes_io_uring_pinned => ("io-uring-pinned","process"),
         processes_io_uring_held_tag => ("io-uring-held-tag","process"),
         vfork_exit => ("vfork-exit","process"),

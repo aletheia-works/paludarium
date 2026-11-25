@@ -189,8 +189,14 @@ pub(crate) fn write(
 /// for a mapping that can be read (`VM_READ`): Linux reads the rest whatever
 /// its protection. A mapping `MADV_DONTDUMP` marked has nothing in it.
 fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
-    // MADV_DONTDUMP leaves out even what is always dumped, as Linux's
-    // `vma_dump_size` checks VM_DONTDUMP before all but the vDSO.
+    // A special mapping, which names itself (the vDSO and its data), is
+    // dumped whole, as Linux's `always_dump_vma` finds its `vm_ops->name`
+    // before `vma_dump_size` looks at VM_DONTDUMP; its pages that cannot be
+    // read are zeros.
+    if special_mapping(mem, mapping.start) {
+        return mapping.length;
+    }
+    // MADV_DONTDUMP leaves out what else is always dumped.
     if mapping.dont_dump {
         return 0;
     }
@@ -218,6 +224,14 @@ fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
             }
         }
     }
+}
+/// Whether the mapping at `at` is one of Linux's special mappings, whose
+/// name is in brackets (`[vvar]`, `[vvar_vclock]`, `[vdso]`).
+fn special_mapping(mem: &AddressSpace, at: GuestAddr) -> bool {
+    mem.view()
+        .vma_source(at.0)
+        .and_then(|source| source.name())
+        .is_some_and(|name| name.first() == Some(&b'['))
 }
 /// Whether the mapping at `at` starts with the ELF magic, as Linux's
 /// `dump_vma_snapshot` checks a file mapping that may be a library's.

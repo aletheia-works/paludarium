@@ -114,6 +114,20 @@ fn spliced_buffers(start: Option<u64>, len: usize) -> Vec<PipeBuf> {
     }
     bufs
 }
+/// [`wait_for_space`], the pipe then held so that the room stays.
+fn space<'a>(
+    c: &mut Context<'_>,
+    output: &'a PipeEnd,
+    nonblock: bool,
+) -> Result<crate::sockets::Held<'a>, Errno> {
+    loop {
+        wait_for_space(c, output, nonblock)?;
+        let held = output.hold();
+        if output.room() > 0 {
+            return Ok(held);
+        }
+    }
+}
 /// Waits until the pipe `output` has room, as `wait_for_space` does: no
 /// reader is EPIPE with SIGPIPE, and a full pipe EAGAIN with `nonblock`.
 fn wait_for_space(c: &mut Context<'_>, output: &PipeEnd, nonblock: bool) -> Result<(), Errno> {
@@ -279,9 +293,15 @@ fn from_pipe(
         if !wait_for_data(c, from, nonblock, done)? {
             break;
         }
+        let _held = from.hold();
+        let unread = from.unread_bytes();
+        if unread == 0 {
+            // Another reader took it.
+            continue;
+        }
         let want = usize::try_from(len - done)
             .unwrap_or(usize::MAX)
-            .min(from.unread_bytes())
+            .min(unread)
             .min(MAX_RW_COUNT);
         let mut piece = buffer(want)?;
         let count = from.peek(&mut piece);
@@ -331,7 +351,7 @@ fn to_pipe(
     len: u64,
     nonblock: bool,
 ) -> Result<u64, Errno> {
-    wait_for_space(c, to, nonblock)?;
+    let _held = space(c, to, nonblock)?;
     let len = len.min(to.room() as u64);
     verify_area(start, len)?;
     let len = len.min(MAX_RW_COUNT as u64);
@@ -376,9 +396,8 @@ fn pipe_to_pipe(
     nonblock: bool,
 ) -> Result<u64, Errno> {
     loop {
-        let count = link(c, from, to, len, nonblock, true)?;
+        let count = link(c, from, to, len, nonblock, Some(input))?;
         if let Some(count) = count {
-            consume(input, count)?;
             return Ok(count as u64);
         }
     }
@@ -406,22 +425,24 @@ pub(super) fn tee(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let nonblock = flags & SPLICE_F_NONBLOCK != 0 || nonblocking(&input) || nonblocking(&output);
-    Ok(link(c, from, to, len, nonblock, false)?.unwrap_or(0) as u64)
+    Ok(link(c, from, to, len, nonblock, None)?.unwrap_or(0) as u64)
 }
 /// What `ipipe_prep`, `opipe_prep` and then `link_pipe` or the loop of
 /// `splice_pipe_to_pipe` do: wait for data in `from` (none, with no writer,
-/// goes on) and room in `to`, then copy as much of `len` as both allow. A
-/// pipe no one reads is EPIPE with SIGPIPE. With nothing to copy, a `tee`
-/// gives 0 and a `splice` (`retry`) `None` to start again, unless no one
-/// writes the input, which ends it with 0.
+/// goes on) and room in `to`, then copy as much of `len` as both allow,
+/// which a `splice` takes from the pipe its `input` reads. A pipe no one
+/// reads is EPIPE with SIGPIPE. With nothing to copy, a `tee` gives 0 and
+/// a `splice` `None` to start again, unless no one writes the input, which
+/// ends it with 0.
 fn link(
     c: &mut Context<'_>,
     from: &PipeEnd,
     to: &PipeEnd,
     len: u64,
     nonblock: bool,
-    retry: bool,
+    input: Option<&Arc<dyn FileHandle>>,
 ) -> Result<Option<usize>, Errno> {
+    let retry = input.is_some();
     loop {
         let ticket = c.files.readiness.token.value();
         if from.unread_bytes() > 0 || !from.has_writers() {
@@ -448,6 +469,7 @@ fn link(
     if !to.has_readers() {
         return Err(broken_pipe(c));
     }
+    let _held = from.hold_both(to);
     let unread = from.unread_bytes();
     if unread == 0 && !from.has_writers() {
         return Ok(Some(0));
@@ -463,6 +485,9 @@ fn link(
     let count = from.peek(&mut piece);
     let bufs = from.buffers(count, !retry);
     let written = to.write_buffers(&piece[..count], bufs)?;
+    if let Some(input) = input {
+        consume(input, written)?;
+    }
     Ok(Some(written))
 }
 /// `vmsplice(fd, iov, nr_segs, flags)`, in the order of Linux's: the flags,
@@ -502,7 +527,7 @@ fn to_pipe_from_guest(
     segments: &[(u64, usize)],
     nonblock: bool,
 ) -> Result<u64, Errno> {
-    wait_for_space(c, to, nonblock)?;
+    let _held = space(c, to, nonblock)?;
     let mut room = to.room();
     let mut bytes = Vec::new();
     // A buffer for each page of the guest's the bytes lie in
@@ -551,8 +576,9 @@ fn to_pipe_from_guest(
     Ok(to.write_buffers(&bytes, bufs)? as u64)
 }
 /// `vmsplice_to_user`: what the pipe has, up to the buffers' size, once it
-/// has some, which only SPLICE_F_NONBLOCK stops it waiting for; a buffer
-/// that cannot be written is EFAULT, or ends the call after some bytes.
+/// has some, which only SPLICE_F_NONBLOCK stops it waiting for. A pipe's
+/// buffer whose bytes cannot all be written (`pipe_to_user`) stays in the
+/// pipe, and is EFAULT or ends the call after some bytes.
 fn from_pipe_to_guest(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -560,31 +586,34 @@ fn from_pipe_to_guest(
     segments: &[(u64, usize)],
     nonblock: bool,
 ) -> Result<u64, Errno> {
+    let total: usize = segments.iter().map(|&(_, length)| length).sum();
     let mut done = 0;
-    for &(base, length) in segments {
-        let mut at = 0;
-        while at < length {
-            if !wait_for_data(c, from, nonblock, done)? {
-                return Ok(done);
-            }
-            let mut piece = buffer((length - at).min(from.unread_bytes()))?;
-            let count = from.peek(&mut piece);
-            if c.mem
-                .write(GuestAddr(base + at as u64), &piece[..count])
-                .is_err()
-            {
+    while done < total {
+        if !wait_for_data(c, from, nonblock, done as u64)? {
+            break;
+        }
+        let _held = from.hold();
+        let Some(first) = from.first_buffer(total - done) else {
+            // Another reader took it.
+            continue;
+        };
+        let mut piece = buffer(first)?;
+        let count = from.peek(&mut piece);
+        let mut copied = 0;
+        for (at, n) in crate::sockets::spans(segments, done, count) {
+            if c.mem.write(at, &piece[copied..copied + n]).is_err() {
                 return if done > 0 {
-                    Ok(done)
+                    Ok(done as u64)
                 } else {
                     Err(Errno::EFAULT)
                 };
             }
-            consume(file, count)?;
-            at += count;
-            done += count as u64;
+            copied += n;
         }
+        consume(file, count)?;
+        done += count;
     }
-    Ok(done)
+    Ok(done as u64)
 }
 
 #[cfg(test)]

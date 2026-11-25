@@ -452,8 +452,8 @@ struct State {
     running_time: u64,
     /// The clock when these were last brought up to date.
     since: u64,
-    /// For an event of a thread on one CPU, the thread's CPU time there
-    /// then: only that time runs and counts.
+    /// The time on its CPU then, which only runs and counts: less than the
+    /// clock's for an event of a thread on one CPU.
     since_on: u64,
     /// For a counter of the thread's [`crate::Usage`], its values then, in
     /// the thread's own code and in system calls.
@@ -467,8 +467,6 @@ struct State {
     child_count: u64,
     child_enabled: u64,
     child_running: u64,
-    /// The task is gone: its last time stays.
-    last: u64,
     /// In Linux's `PERF_EVENT_STATE_EXIT`: `remove_on_exec` took it out of
     /// its task and its group at the task's `execve`, or its task ended. It
     /// counts no more, is not enabled again, and its last count and times
@@ -662,37 +660,39 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Event {
-    /// The event's clock: the thread's CPU time, or the time that passes.
-    fn now(&self, state: &mut State) -> u64 {
-        match &self.target {
-            Target::Thread { group, tid } => {
-                if let Some(time) = group.last_thread_cpu(*tid) {
-                    state.last = time;
-                }
-                state.last
+    /// The event's clock: the thread's CPU time, or the time that passes;
+    /// and how much of it was on the event's CPU, all of it but for an
+    /// event of a thread on one. A thread that runs is looked at now, as
+    /// `perf_event_read` has its CPU bring the event up to date.
+    fn now(&self, state: &State) -> (u64, u64) {
+        let Target::Thread { group, tid } = &self.target else {
+            let now = self.host.clock(ClockId::Monotonic).unwrap_or(0);
+            return (now, now);
+        };
+        let Some(usage) = group.last_thread_usage(*tid) else {
+            return (state.since, state.since_on);
+        };
+        usage.sample();
+        match u32::try_from(self.cpu) {
+            Ok(cpu) => usage.time_on(cpu),
+            Err(_) => {
+                let now = usage.cpu_time();
+                (now, now)
             }
-            Target::Cpu => self.host.clock(ClockId::Monotonic).unwrap_or(0),
         }
     }
     /// The state brought up to now: the time since the last update counts
     /// as enabled while it is, and as running and counted while it runs.
     fn settle(&self) -> MutexGuard<'_, State> {
         let mut state = lock(&self.state);
-        let now = self.now(&mut state);
+        let (now, on) = self.now(&state);
         let passed = now.saturating_sub(state.since);
         state.since = now;
         // An event of a thread on one CPU is scheduled in only while the
         // thread runs there (`event_filter_match`): its time enabled is
         // the thread's, and its time running and count only that CPU's.
-        let ran = match self.on_cpu() {
-            Some((usage, cpu)) => {
-                let on = usage.time_on(cpu);
-                let ran = on.saturating_sub(state.since_on);
-                state.since_on = on;
-                ran
-            }
-            None => passed,
-        };
+        let ran = on.saturating_sub(state.since_on);
+        state.since_on = on;
         let tallied = self.used().map_or((0, 0), |(user, kernel)| {
             let more = (
                 user.saturating_sub(state.tally.0),
@@ -716,15 +716,6 @@ impl Event {
             }
         }
         state
-    }
-    /// The thread's [`crate::Usage`] and the CPU, for an event of a thread
-    /// on one CPU.
-    fn on_cpu(&self) -> Option<(Arc<crate::Usage>, u32)> {
-        let Target::Thread { group, tid } = &self.target else {
-            return None;
-        };
-        let cpu = u32::try_from(self.cpu).ok()?;
-        Some((group.last_thread_usage(*tid)?, cpu))
     }
     /// What the thread's [`crate::Usage`] counts for a counter of it (its
     /// faults as they are taken, its switches and migrations as of its

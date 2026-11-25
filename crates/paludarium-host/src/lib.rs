@@ -46,7 +46,7 @@ pub use wasm::WasmHost;
 pub mod testing;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_net;
-pub use clock::{ClockId, WaitOutcome};
+pub use clock::{ClockId, ThreadCpuClock, WaitOutcome};
 
 /// Whether the guest thread a host thread runs is blocked in a wait of the
 /// host ([`Host::wait_on`], [`Host::wait_until`]): what `/proc` shows as
@@ -344,6 +344,12 @@ pub trait Host: Send + Sync {
     fn thread_cpu_time(&self) -> Result<u64, Errno> {
         Err(Errno::ENOSYS)
     }
+    /// A clock of the calling host thread's CPU time, as
+    /// [`Self::thread_cpu_time`] counts it, that any thread may read;
+    /// `None` where the host has none.
+    fn thread_cpu_clock(&self) -> Option<std::sync::Arc<dyn ThreadCpuClock>> {
+        None
+    }
     /// How many CPUs the guest may run on: the host's available parallelism,
     /// or 1 where it is unknown (WebAssembly).
     fn cpu_count(&self) -> usize {
@@ -512,6 +518,9 @@ impl Host for NativeHost {
     }
     fn thread_cpu_time(&self) -> Result<u64, Errno> {
         clock::native_thread_cpu_time()
+    }
+    fn thread_cpu_clock(&self) -> Option<std::sync::Arc<dyn ThreadCpuClock>> {
+        clock::native_thread_cpu_clock()
     }
     /// On Linux, the guest's threads are the host's, so the host's time
     /// slice for this thread is the guest thread's.
@@ -763,6 +772,7 @@ mod tests {
         assert!(matches!(host.mount_fs(Path::new("/")), Err(Errno::ENOSYS)));
         assert_eq!(host.clock(ClockId::Monotonic), Err(Errno::ENOSYS));
         assert_eq!(host.thread_cpu_time(), Err(Errno::ENOSYS));
+        assert!(host.thread_cpu_clock().is_none());
         assert!(host.cpu_count() >= 1);
         let cancel = std::sync::atomic::AtomicBool::new(false);
         assert_eq!(
@@ -787,6 +797,10 @@ mod tests {
         let root = std::env::temp_dir();
         assert!(host.mount_fs(&root).is_ok());
         assert!(host.thread_cpu_time().is_ok());
+        assert_eq!(
+            host.thread_cpu_clock().is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos", windows))
+        );
     }
 
     #[test]

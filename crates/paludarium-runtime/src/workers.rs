@@ -78,7 +78,7 @@ impl Execution {
     ) {
         // This host thread runs the task from now on, as Linux's `current`.
         kernel.enter_thread(thread.tid);
-        kernel.start_thread(thread);
+        let _clock = kernel.start_thread(thread);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run(kernel, thread, &mut memory)
         }))

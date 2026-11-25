@@ -9,6 +9,7 @@
 
 pub mod elf;
 pub mod testing;
+pub mod vdso;
 
 use paludarium_mmu::{AddressSpace, MappingKind, PageSource, Prot};
 use paludarium_types::{Errno, Error, ErrorKind, GuestAddr, PAGE_SIZE, USER_ADDRESS_LIMIT};
@@ -36,6 +37,7 @@ pub const MAX_ARG_BYTES: u64 = STACK_SIZE / 4;
 /// Values of the auxiliary vector entries the loader writes.
 pub mod auxv {
     pub const AT_NULL: u64 = 0;
+    pub const AT_SYSINFO_EHDR: u64 = 33;
     pub const AT_PHDR: u64 = 3;
     pub const AT_PHENT: u64 = 4;
     pub const AT_PHNUM: u64 = 5;
@@ -116,6 +118,9 @@ pub struct LoadedImage {
     /// them: the highest address and the highest end in the file of all its
     /// `PT_LOAD` segments.
     pub data: (u64, u64),
+    /// Where the vDSO starts (`AT_SYSINFO_EHDR`), after its data
+    /// ([`vdso`]).
+    pub vdso: u64,
     /// Whether the exec fails after its point of no return, which ends the
     /// process by SIGSEGV as Linux's `bprm_execve` does: a writable segment
     /// whose bss starts within a page wholly past the end of the file cut
@@ -124,7 +129,7 @@ pub struct LoadedImage {
 }
 
 /// The entries of [`LoadedImage::auxv`], `AT_NULL`'s with them.
-pub const AUXV_ENTRIES: usize = 19;
+pub const AUXV_ENTRIES: usize = 20;
 
 /// Decides about the interpreter a program asks for by name: returns the path
 /// to read it from, with what its mappings keep while they last (as each
@@ -528,6 +533,8 @@ fn build_stack(
 
     use auxv::*;
     let aux: [(u64, u64); AUXV_ENTRIES] = [
+        // Linux's `ARCH_DLINFO` puts the vDSO first.
+        (AT_SYSINFO_EHDR, image.vdso),
         (AT_PHDR, image.program_header_address.0),
         (AT_PHENT, elf::PHDR_SIZE),
         (AT_PHNUM, u64::from(image.program_header_count)),
@@ -746,12 +753,48 @@ fn load_image(
         auxv: [(0, 0); AUXV_ENTRIES],
         code: code_range(&info, base),
         data: data_range(&info, base),
+        vdso: map_vdso(mem)?,
         fails,
     };
     let (stack, auxv) = build_stack(mem, start, &image)?;
     image.initial_stack_pointer = GuestAddr(stack);
     image.auxv = auxv;
     Ok(image)
+}
+
+/// Maps the vDSO and its data where the next mapping without an address
+/// goes, below the program's and its interpreter's, as Linux's
+/// `arch_setup_additional_pages` does once `load_elf_binary` has mapped
+/// them: `[vvar]`, `[vvar_vclock]`, then `[vdso]`, whose start it returns.
+/// Their pages come in when first touched, as Linux's `vdso_fault` brings
+/// them.
+fn map_vdso(mem: &mut AddressSpace) -> Result<u64, LoadError> {
+    use vdso::{VCLOCK_PAGES, VDSO_PAGES, VVAR_PAGES};
+    let pages = VVAR_PAGES + VCLOCK_PAGES + VDSO_PAGES;
+    // One free range for all three, then each area its own mapping, as
+    // Linux installs each as a special mapping of its own VMA.
+    let at = mem
+        .map(None, pages * PAGE_SIZE, Prot::READ, MappingKind::ElfSegment)
+        .map_err(LoadError::Errno)?;
+    mem.unmap(at, pages * PAGE_SIZE).map_err(LoadError::Errno)?;
+    let vclock = at.0 + VVAR_PAGES * PAGE_SIZE;
+    let text = vclock + VCLOCK_PAGES * PAGE_SIZE;
+    for (from, count, prot, source) in [
+        (at.0, VVAR_PAGES, Prot::READ, vdso::vvar()),
+        (vclock, VCLOCK_PAGES, Prot::READ, vdso::vvar_vclock()),
+        (text, VDSO_PAGES, Prot::READ_EXEC, vdso::vdso()),
+    ] {
+        mem.map(
+            Some(GuestAddr(from)),
+            count * PAGE_SIZE,
+            prot,
+            MappingKind::ElfSegment,
+        )
+        .map_err(LoadError::Errno)?;
+        mem.back_with_file(GuestAddr(from), count * PAGE_SIZE, source, 0)
+            .map_err(LoadError::Errno)?;
+    }
+    Ok(text)
 }
 
 #[cfg(test)]

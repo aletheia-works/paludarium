@@ -4277,6 +4277,8 @@ pub(crate) struct Entry {
     /// Its own address, IPv4 as such even on an IPv6 socket, and its peer's.
     pub(crate) local: SocketAddr,
     pub(crate) peer: Option<SocketAddr>,
+    /// The device it is bound to (`sk_bound_dev_if`), 0 for none.
+    pub(crate) device: u32,
     pub(crate) cookie: u64,
     /// `idiag_timer`, `idiag_retrans` and when the timer ends, on the
     /// host's monotonic clock.
@@ -4346,6 +4348,7 @@ impl Network {
             table: Table::Connected,
             local: wait.local,
             peer: Some(wait.peer),
+            device: wait.device,
             cookie: wait.cookie,
             timer: (IDIAG_TIMER_TIMEWAIT, 0, wait.until),
             queues: (0, 0),
@@ -4399,6 +4402,7 @@ impl InetSocket {
                 table: Table::Connected,
                 local,
                 peer: s.peer,
+                device: options.device,
                 cookie: self.cookie(),
                 timer: (0, 0, None),
                 queues: (s.inbox_size as u32, 0),
@@ -4418,6 +4422,7 @@ impl InetSocket {
             table,
             local: local.unwrap_or_else(unbound),
             peer: None,
+            device: options.device,
             cookie: self.cookie(),
             timer: (0, 0, None),
             queues: (0, 0),

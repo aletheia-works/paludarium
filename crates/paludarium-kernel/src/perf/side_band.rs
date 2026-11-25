@@ -468,7 +468,27 @@ pub(super) fn exec(events: &Events, space: &Space<'_>, counted: u32, name: &[u8]
         let mapping = Mapping::of(&temporary, 0, space.root, false);
         Space::write_one(&receivers, &mapping, &who);
     }
-    space.write(&receivers, stack.into_iter().chain(rest), None);
+    space.write(
+        &receivers,
+        stack.into_iter().chain(specials_last(rest)),
+        None,
+    );
+}
+
+/// `vmas` with the special mappings last, in the order Linux's `map_vdso`
+/// installs them: `[vdso]`, `[vvar]`, then `[vvar_vclock]`.
+fn specials_last(vmas: Vec<Vma>) -> Vec<Vma> {
+    let rank = |vma: &Vma| {
+        let name = vma.file.as_ref().and_then(|file| file.name.as_deref());
+        [b"[vdso]".as_slice(), b"[vvar]", b"[vvar_vclock]"]
+            .iter()
+            .position(|special| name == Some(*special))
+    };
+    let (mut special, mut vmas): (Vec<Vma>, Vec<Vma>) =
+        vmas.into_iter().partition(|vma| rank(vma).is_some());
+    special.sort_by_key(rank);
+    vmas.append(&mut special);
+    vmas
 }
 
 #[cfg(test)]
@@ -489,6 +509,32 @@ mod tests {
             flags,
             anon_name: None,
         }
+    }
+
+    #[test]
+    fn the_special_mappings_come_last_in_the_order_they_are_installed() {
+        let named = |start: u64, name: &[u8]| {
+            let file = MappedFile {
+                name: Some(name.to_vec()),
+                source: true,
+                offset: 0,
+            };
+            vma(start, start + 0x1000, vm::READ, Some(file))
+        };
+        // By address, with a mapping above them.
+        let vmas = specials_last(vec![
+            named(0x1000, b"/bin/x"),
+            vma(0x2000, 0x3000, vm::READ, None),
+            named(0x4000, b"[vvar]"),
+            named(0x5000, b"[vvar_vclock]"),
+            named(0x6000, b"[vdso]"),
+            named(0x7000, b"/lib/ld.so"),
+        ]);
+        let starts: Vec<u64> = vmas.iter().map(|vma| vma.start).collect();
+        assert_eq!(starts, [0x1000, 0x2000, 0x7000, 0x6000, 0x4000, 0x5000]);
+        // Their records name them.
+        let m = Mapping::of(&vmas[3], 0, b"/", false);
+        assert_eq!(m.name, padded(b"[vdso]"));
     }
 
     #[test]

@@ -278,6 +278,13 @@ impl Host for RecordingHost {
         }
         Err(Errno::ENOSYS)
     }
+    fn thread_cpu_clock(&self) -> Option<std::sync::Arc<dyn crate::ThreadCpuClock>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.lock().cpu_time {
+            return crate::clock::native_thread_cpu_clock();
+        }
+        None
+    }
     /// Gives other threads the wait's time, up to [`GRACE`], of real time
     /// to cancel it, then reaches its deadline at once on the virtual clock.
     /// A signal another process sends while this one sleeps still comes

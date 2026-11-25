@@ -201,6 +201,10 @@ mod linux {
         case("tcp-held");
     }
     #[test]
+    fn network_listen_io_uring() {
+        case("listen-io-uring");
+    }
+    #[test]
     fn network_listen_errors() {
         case("listen-errors");
     }

@@ -63,7 +63,7 @@ verified.
   so `mlock` fills it and `get_user_pages` may reach it, and its pages 1 and 3
   hold zeros (43648f9f3a67) instead of being a bus error.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
-  page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
+  page entries. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
   maps no more than the 16 pages around it
   ([features](./features#system-calls)), where Linux maps a large folio
@@ -106,10 +106,14 @@ verified.
     where there is a page table.
   - User space ends at 2^47 bytes for its checks, as with 4-level page
     tables.
-- **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) and 5 (the
-  peak resident size) change anything. 1, 2 and 3 are taken, but no
-  referenced bits are kept, so `smaps`' `Referenced` stays the resident
-  size, where Linux's drops until the pages are touched again.
+- **`Referenced` of `smaps`, in part**: a page counts when it was accessed
+  through its own page table entry since `clear_refs` 1 to 3 cleared it.
+  Linux also counts one whose folio is marked as referenced, as a `read` of
+  its file or another process's access may have it. The kernel never ages
+  a page here, as it may on Linux, and `MADV_COLD` and `MADV_FREE` leave
+  the bit, which they clear on Linux. Linux flushes no TLB for 1 to 3, so
+  there an access to a page that the CPU's TLB still holds may leave it
+  unreferenced; here the next access always marks it.
 - **4-level paging only**: the emulated machine always has 4-level page
   tables, whatever CPU the host has: user space ends below 2^47 bytes, and
   `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the
@@ -168,8 +172,9 @@ verified.
   `/dev`, so the new root's `/proc` or `/dev` shows the generated files
   only through a bind mount of `/proc` or `/dev` (or a directory in them)
   made onto it before. In a path that climbs above the root as written,
-  `..` is taken from the names as written, where Linux takes a `..` after a
-  symbolic link from the link's target. `maps` and `smaps` in `/proc` name
+  `..` in the generated files such a bind mount shows is taken from the
+  names as written, where Linux takes a `..` after a link in `/proc` (such
+  as `/proc/self/cwd`) from its target. `maps` and `smaps` in `/proc` name
   files from the root their opener had when it opened them, where Linux
   takes the root of whoever reads them, at each read.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
@@ -339,7 +344,7 @@ verified.
   for samples that take too long (`perf_sample_event_took`), which
   `perf_cpu_time_max_percent` sets the limit of; and no other event is
   throttled, as no other event here is an hrtimer's or the hardware's. An
-  event of a CPU takes no samples, nor any side-band record. Of those, an `execve` writes the new program's mappings once it
+  event of a CPU takes no samples. Of the side-band records, an `execve` writes the new program's mappings once it
   has loaded it, the stack's two first and the rest by address: the
   temporary stack's is placed at the top of 4-level user space with the
   length of the arguments' pages, where Linux gives where it was. Linux
@@ -539,8 +544,20 @@ verified.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
   `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`,
   `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
-  `_REMOVE_BUFFERS` and `IORING_OP_ASYNC_CANCEL` run; the other operations
-  complete with `EOPNOTSUPP`.
+  `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, and the single-shot socket
+  requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
+  and `_RECV` run; the other operations complete with `EOPNOTSUPP`. Of the
+  socket requests, a multishot accept or receive, a bundle
+  (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
+  send that selects a buffer, and a receive with `MSG_WAITALL` that selects
+  one are not there yet (`EINVAL`). A send or a receive with
+  `IORING_RECVSEND_FIXED_BUF` is `EINVAL`, as on Linux 7.0, the kernel the
+  differential tests run on; Linux master moves the bytes of a registered
+  buffer. This follows master once the test runners' kernel does. A
+  receive with `MSG_WAITALL` whose datagram was cut does not fail its
+  link, where Linux's does. An `IORING_OP_SHUTDOWN` runs while
+  `io_uring_enter` takes it, where Linux's runs in a worker, so its
+  completion can come before those Linux posts first.
   The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
@@ -1026,6 +1043,12 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
+- **Shared futexes in a program's read-only segments**: a word in a
+  read-only private mapping of a file is the file's (`get_futex_key`), but
+  in the segments `execve` maps, of the program and its interpreter, which
+  have their own copy of the file, it is its address in the process: a wake
+  by another process, or through another mapping of the file, does not find
+  its waiters.
 - **userfaultfd, in part**: missing pages, write protection and the minor
   faults of shmem are registered. A discard tells of all its ranges
   before it drops the pages of any, where Linux tells and drops VMA by VMA,
@@ -1052,11 +1075,12 @@ verified.
   which Linux may also have freed or kept otherwise.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
-- **`/proc/locks`, in part**: the lines of those that wait for a lock
-  (`-> `) are not there. PIDs are those of the reader's PID namespace, where
-  Linux's are those of the one `/proc` was mounted in. A `flock` lock a
+- **`/proc/locks`, in part**: PIDs are those of the reader's PID namespace,
+  where Linux's are those of the one `/proc` was mounted in. A `flock` lock a
   program on the host holds on a file of the host is not listed, though it
-  conflicts with the guest's.
+  conflicts with the guest's, nor are those that wait for it alone. One that
+  waits looks again every 10 ms, where Linux wakes it: until then it is not
+  listed once the lock it waited for has gone.
 - **File leases, in part**: the opens `execve` makes of a program, its
   interpreter and its script, and those of the descriptors fanotify's events
   give, break no lease, where Linux's do. A lease is broken before
@@ -1098,10 +1122,15 @@ verified.
   `rt6_check_neigh` does among routes of one metric. Of an IPv6 multipath
   route's hops through the device asked for, the flow's hash picks one, as
   Linux 7.0 does; Linux master takes the hop the lookup found
-  (`have_oif_match` in `ip6_pol_route`). An IPv6 packet's
-  answer comes back only through the end the packet went out through, so
-  that one a multipath route sends back through another end is lost,
-  where Linux's comes. A UDP
+  (`have_oif_match` in `ip6_pol_route`). An IPv6 connection
+  takes a multipath route's hop by the hash of its addresses and protocol,
+  as Linux 7.0 and 7.1 do, and its answers by theirs; from 7.2 Linux takes
+  it by the connection's own random hash and takes another as a segment
+  sent again draws a new one (`ip6_ecmp_set_mp_hash`,
+  `sk_rethink_txhash`), but here a connection's path is settled as it
+  opens, so a hop whose answers do not come back fails it. An ICMPv6 error
+  takes the hop of its own flow, where Linux's takes that of the packet
+  it tells of (`icmp6_send`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID

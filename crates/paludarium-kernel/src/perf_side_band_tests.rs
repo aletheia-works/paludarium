@@ -634,6 +634,98 @@ fn perf_side_band_records_mappings_names_and_a_child() {
     );
 }
 
+/// perf-side-band-cpu: an event of a CPU takes the records of what runs
+/// there, and one of another CPU or not enabled takes none.
+#[test]
+fn an_event_of_a_cpu_takes_the_records_of_what_runs_there() {
+    let mut env = Env::new();
+    let mut e = Expected {
+        pid: env.call(GETPID, [0; 6]) as u32,
+        tid: env.call(GETTID, [0; 6]) as u32,
+        ..Expected::default()
+    };
+    e.parent = e.pid;
+    env.pin();
+    let flags = ATTR_MMAP2 | ATTR_COMM | ATTR_TASK;
+    let (fd, here) = env.open_side_band(-1, 0, flags).unwrap();
+    let (other_fd, other) = env.open_side_band(-1, 1, flags).unwrap();
+    let (_, off) = env.open_side_band(-1, 0, flags).unwrap();
+    env.ioctl(fd, IOC_ENABLE);
+    env.ioctl(other_fd, IOC_ENABLE);
+    // `mmap2` alone has no mapping recorded, but with an event with `mmap`
+    // open, enabled or not.
+    let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
+    env.mmap(4096, PROT_READ | PROT_EXEC, anonymous, -1, 0);
+    let (counted, unused) = env.open_side_band(0, -1, ATTR_MMAP).unwrap();
+    env.mmap(3 * 4096, PROT_READ | PROT_EXEC, anonymous, -1, 0);
+    assert_eq!(env.call(11, [unused, 9 * 4096, 0, 0, 0, 0]), 0);
+    assert_eq!(env.call(CLOSE, [counted as u64, 0, 0, 0, 0, 0]), 0);
+    env.mmap(4096, PROT_READ | PROT_EXEC, anonymous, -1, 0);
+    let name = env.path(b"side-band-cpu");
+    assert_eq!(env.call(PRCTL, [PR_SET_NAME, name, 0, 0, 0, 0]), 0);
+    let child = env.fork_and_exit(0);
+    env.wait(child);
+    e.child = child as u32;
+    env.ioctl(fd, IOC_DISABLE);
+    for page in [here, other, off] {
+        env.say("buffer:".to_string());
+        env.each_record(page, |env, record| say_record(env, &mut e, record));
+    }
+    check(
+        &env.lines,
+        &[
+            "buffer:",
+            "mmap2 anon data 0 ids 1",
+            "  prot 5 flags 2",
+            "comm exec 0 ids 1 name side-band-cpu",
+            "fork child 1 parent 1 by parent",
+            "exit child 1 parent 1 by child",
+            "buffer:",
+            "buffer:",
+        ],
+    );
+}
+
+/// `mprotect` writes a record of each VMA it changes, as merged so far:
+/// with those before it, and with the next if that has the protection
+/// already.
+#[test]
+fn mprotect_writes_a_record_of_each_vma_it_changes() {
+    let mut env = Env::new();
+    env.pin();
+    // Three pages that merge with nothing around them.
+    let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
+    let three = env.mmap(5 * 4096, 0, anonymous, -1, 0) + 4096;
+    let protect = |env: &mut Env, page: u64, pages: u64, prot: u64| {
+        let call = [three + page * 4096, pages * 4096, prot, 0, 0, 0];
+        assert_eq!(env.call(MPROTECT, call), 0);
+    };
+    protect(&mut env, 0, 3, PROT_READ | PROT_WRITE);
+    let (fd, page) = env
+        .open_side_band(0, 0, ATTR_MMAP2 | ATTR_MMAP_DATA)
+        .unwrap();
+    env.ioctl(fd, IOC_ENABLE);
+    protect(&mut env, 1, 1, PROT_READ);
+    protect(&mut env, 0, 3, PROT_READ);
+    protect(&mut env, 0, 3, PROT_READ);
+    protect(&mut env, 0, 1, PROT_READ | PROT_EXEC);
+    protect(&mut env, 0, 3, PROT_READ | PROT_WRITE);
+    let mut seen = Vec::new();
+    env.each_record(page, |_, record| {
+        let from = (record[2] - three) / 4096;
+        seen.push((from, record[3] / 4096, halves(record[8])[0]));
+    });
+    let expected = [
+        (1, 1, 1),
+        (0, 2, 1),
+        (0, 3, 1),
+        (0, 1, 5),
+        (0, 1, 3),
+        (0, 3, 3),
+    ];
+    assert_eq!(seen, expected);
+}
+
 /// A COMM record of each write to `comm`, as the guest's `say_comm` gives
 /// it.
 fn say_comm(env: &mut Env, (pid, tid): (u32, u32), record: &[u64]) {

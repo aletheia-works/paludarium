@@ -1148,6 +1148,34 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_that_stays_decoded_references_its_page_after_clear_refs() {
+        let mut memory = AddressSpace::new();
+        memory
+            .map(
+                Some(GuestAddr(0x1000)),
+                0x1000,
+                Prot::from_bits(5).unwrap(),
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        // jmp .
+        memory
+            .write_initial(GuestAddr(0x1000), &[0xeb, 0xfe])
+            .unwrap();
+        let referenced = || memory.view().usage(0x1000, 0x2000).unwrap().referenced;
+        let mut state = CpuState::new(GuestAddr(0x1000), GuestAddr(0));
+        let mut cache = DecodeCache::new();
+        for _ in 0..3 {
+            run_cached(&mut state, &memory, 1000, &mut cache);
+            assert_eq!(referenced(), 1);
+            memory
+                .view()
+                .clear_referenced(paludarium_mmu::Referenced::All);
+            assert_eq!(referenced(), 0);
+        }
+    }
+
+    #[test]
     fn hook_reaches_supported_boundary_after_interpreter_instruction() {
         let (mut state, memory) = machine(&[0x90, 0xb8, 42, 0, 0, 0, 0xf4]);
         let mut seen = Vec::new();

@@ -536,7 +536,7 @@ pub(crate) struct Events {
     /// Whether an event of a task has sampled, so that the system calls
     /// look for samples to take ([`sample::overflow`]) only then.
     sampling: std::sync::atomic::AtomicBool,
-    /// Whether an event of a task has asked for side-band records, so that
+    /// Whether an event has asked for side-band records, so that
     /// the hooks look for those that take them only then ([`side_band`]).
     side_band: std::sync::atomic::AtomicBool,
 }
@@ -547,6 +547,11 @@ struct Lists {
     on_exec: Vec<Erased>,
     /// The events that count a thread, for its exit.
     counting: Vec<Erased>,
+    /// Those of a CPU that ask for side-band records (`pmu_sb_events`).
+    side_band: Vec<Erased>,
+    /// The opened ones that ask for them, of a thread or a CPU, enabled or
+    /// not, while they are open (`account_event`).
+    asking: Vec<Erased>,
 }
 
 /// A reference that holds an [`Event`] or a [`ThreadGroup`] by no
@@ -609,6 +614,15 @@ impl Events {
         lists.owned.retain(|owned| owned.event.strong_count() > 0);
         lists.on_exec.retain(|event| event.strong_count() > 0);
         lists.counting.retain(|event| event.strong_count() > 0);
+        lists.side_band.retain(|event| event.strong_count() > 0);
+        lists.asking.retain(|event| event.strong_count() > 0);
+        if side_band::asks(&event.attr) {
+            self.side_band.store(true, Ordering::Relaxed);
+            lists.asking.push(erase(event));
+            if matches!(event.target, Target::Cpu) {
+                lists.side_band.push(erase(event));
+            }
+        }
         if matches!(event.target, Target::Thread { .. }) {
             lists.counting.push(erase(event));
             if event.attr.sampling() {
@@ -616,9 +630,6 @@ impl Events {
             }
             if event.attr.sampling() && event.shows_address() {
                 paludarium_mmu::faults::trace_addresses();
-            }
-            if side_band::asks(&event.attr) {
-                self.side_band.store(true, Ordering::Relaxed);
             }
         }
         lists.owned.push(Owned {
@@ -1379,6 +1390,9 @@ pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, who: &Who, ppid:
             event.wake_readers();
         }
     }
+    // And then to the events of its CPU (`perf_event_task` again, with no
+    // context of the task's left).
+    side_band::exit_on_cpu(events, who, ppid);
 }
 
 const RECORD_READ: u32 = 8;

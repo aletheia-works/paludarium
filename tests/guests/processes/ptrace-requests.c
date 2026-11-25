@@ -5,6 +5,7 @@
  * expected. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -400,8 +401,8 @@ static void record_code(int number, siginfo_t *info, void *context) {
     signal_code = info->si_code;
 }
 
-/* A signal the tracer gives at a syscall stop is sent to the process from
- * the kernel: it waits in the process's queue, not the thread's. */
+/* A signal the tracer gives at a syscall stop is sent to the thread from
+ * the kernel: it waits in the thread's queue, not the process's. */
 static int syscall_signal_case(void) {
     fflush(stdout);
     pid_t child = fork();
@@ -439,6 +440,92 @@ static int syscall_signal_case(void) {
     pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
     printf("delivery signal=%d si-code=%#x si-pid=%d\n", WSTOPSIG(status), info.si_code, info.si_pid);
     pt(PTRACE_CONT, child, 0, WSTOPSIG(status));
+    status = wait_status(child, 0);
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+/* --- ptrace-syscall-signal-thread ------------------------------------ */
+
+static volatile pid_t worker_tid;
+static volatile int taken[2];
+static int tids[2], starts[2], ends[2];
+static void record_thread(int number) {
+    taken[number == SIGUSR2] = syscall(SYS_gettid) == worker_tid ? 1 : 2;
+}
+static void *signalled_worker(void *arg) {
+    sigset_t set;
+    char byte;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    pid_t tid = worker_tid = syscall(SYS_gettid);
+    if (write(tids[1], &tid, sizeof tid) != sizeof tid) _exit(92);
+    while (read(starts[0], &byte, 1) != 1) {}
+    syscall(SYS_getppid);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+    if (write(ends[1], "e", 1) != 1) _exit(93);
+    return arg;
+}
+
+/* The signal is the thread's even where it blocks it and another thread of
+ * the process does not. One given at the exit stop is taken before the
+ * thread runs again. */
+static int syscall_signal_thread_case(void) {
+    if (pipe(tids) || pipe(starts) || pipe(ends)) return 80;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sigaction action = {.sa_handler = record_thread, .sa_flags = SA_RESTART};
+        sigaction(SIGUSR1, &action, NULL);
+        sigaction(SIGUSR2, &action, NULL);
+        pthread_t thread;
+        char byte;
+        if (pthread_create(&thread, NULL, signalled_worker, NULL)) _exit(91);
+        while (read(ends[0], &byte, 1) != 1) {}
+        _exit(taken[0] * 10 + taken[1]);
+    }
+    pid_t tid;
+    if (read(tids[0], &tid, sizeof tid) != sizeof tid) return 81;
+    printf("seize=%ld\n", pt(REQ_SEIZE, tid, 0, PTRACE_O_TRACESYSGOOD));
+    printf("interrupt=%ld\n", pt(REQ_INTERRUPT, tid, 0, 0));
+    show("stop", wait_status(tid, __WALL));
+    if (write(starts[1], "s", 1) != 1) return 82;
+    struct user_regs_struct regs;
+    int status = 0;
+    for (int i = 0; i < 20; i++) {
+        pt(REQ_SYSCALL, tid, 0, 0);
+        status = wait_status(tid, __WALL);
+        pt(PTRACE_GETREGS, tid, 0, (unsigned long)&regs);
+        if (regs.orig_rax == SYS_getppid) break;
+    }
+    printf("entry signal=%#x nr=%ld\n", WSTOPSIG(status), (long)regs.orig_rax);
+    printf("resume=%ld\n", pt(REQ_SYSCALL, tid, 0, SIGUSR1));
+    status = wait_status(tid, __WALL);
+    pt(PTRACE_GETREGS, tid, 0, (unsigned long)&regs);
+    printf("exit signal=%#x nr=%ld\n", WSTOPSIG(status), (long)regs.orig_rax);
+    siginfo_t infos[2];
+    memset(infos, 0, sizeof infos);
+    struct peek_args args = {0, 0, 2};
+    long n = pt(REQ_PEEKSIGINFO, tid, (unsigned long)&args, (unsigned long)infos);
+    printf("thread-queue=%ld %d/%#x\n", n, infos[0].si_signo, infos[0].si_code);
+    args.flags = 1;
+    n = pt(REQ_PEEKSIGINFO, tid, (unsigned long)&args, (unsigned long)infos);
+    printf("process-queue=%ld\n", n);
+    unsigned long long rip = regs.rip;
+    printf("resume=%ld\n", pt(REQ_SYSCALL, tid, 0, SIGUSR2));
+    for (int i = 0; i < 2; i++) {
+        status = wait_status(tid, __WALL);
+        siginfo_t info;
+        memset(&info, 0, sizeof info);
+        pt(PTRACE_GETREGS, tid, 0, (unsigned long)&regs);
+        pt(PTRACE_GETSIGINFO, tid, 0, (unsigned long)&info);
+        printf("delivery stopped=%d signal=%d si-code=%#x", WIFSTOPPED(status), WSTOPSIG(status),
+               info.si_code);
+        if (i == 0) printf(" here=%d", regs.rip == rip);
+        printf("\n");
+        printf("resume=%ld\n", pt(i ? PTRACE_DETACH : PTRACE_CONT, tid, 0, WSTOPSIG(status)));
+    }
     status = wait_status(child, 0);
     printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
@@ -621,6 +708,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-seccomp")) code = seccomp_case();
     if (!strcmp(mode, "ptrace-arch-rseq")) code = arch_rseq_case();
     if (!strcmp(mode, "ptrace-syscall-signal")) code = syscall_signal_case();
+    if (!strcmp(mode, "ptrace-syscall-signal-thread")) code = syscall_signal_thread_case();
     if (!strcmp(mode, "ptrace-exit-core")) code = exit_core_case();
     if (!strcmp(mode, "ptrace-restart-codes")) code = restart_codes_case();
     if (!strcmp(mode, "ptrace-selectors")) code = selectors_case();

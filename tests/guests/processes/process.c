@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <stddef.h>
 #include <sys/mman.h>
@@ -7116,6 +7117,22 @@ static void nvcsw_sleep(int times) {
         nanosleep(&t, NULL);
     }
 }
+/* Waits until zombie `pid` has left its CPU for the last time and its stack
+   is gone, for up to 2 s. A wait for it returns once exit_notify has made it
+   a zombie, before do_task_dead: until then its syscall file reads
+   "running", and between its last switch (which its nvcsw counts) and
+   finish_task_switch's put_task_stack the registers it was killed with. */
+static void zombie_settled(pid_t pid) {
+    char path[64], text[256];
+    snprintf(path, sizeof path, "/proc/%d/syscall", (int)pid);
+    for (int i = 0; i < 2000; i++) {
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (n == 11 && !memcmp(text, "-1 0x0 0x0\n", 11)) return;
+        usleep(1000);
+    }
+}
 static int context_switches_case(void) {
     fflush(stdout);
     pid_t measuring = fork();
@@ -7139,6 +7156,9 @@ static int context_switches_case(void) {
     }
     struct rusage usage;
     siginfo_t info;
+    waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT);
+    /* Its last switch, as it ends, is counted too. */
+    zombie_settled(child);
     memset(&usage, 0, sizeof usage);
     syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, &usage);
     long zombie = usage.ru_nvcsw;
@@ -8607,10 +8627,89 @@ static int cr_vma_soft_dirty(void *at) {
     return -1;
 }
 
+/* The Referenced of the VMA that starts at `at`, in kB, from smaps, or -1. */
+static long cr_referenced(const void *at) {
+    static char text[1 << 17];
+    int fd = open("/proc/self/smaps", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t length = 0;
+    ssize_t n;
+    while (length < sizeof text - 1 && (n = read(fd, text + length, sizeof text - 1 - length)) > 0)
+        length += (size_t)n;
+    close(fd);
+    text[length] = 0;
+    char head[32];
+    snprintf(head, sizeof head, "\n%lx-", (unsigned long)(uintptr_t)at);
+    char *block = strstr(text, head);
+    char *line = block ? strstr(block, "\nReferenced:") : NULL;
+    return line ? strtol(line + 12, NULL, 10) : -1;
+}
+/* Memory of `pages` pages with a hole on each side, each page written. */
+static char *cr_area(size_t pages, int flags) {
+    char *hole = mmap(NULL, (pages + 2) * 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (hole == MAP_FAILED) return NULL;
+    char *at = mmap(hole + 4096, pages * 4096, PROT_READ | PROT_WRITE,
+                    flags | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (at == MAP_FAILED) return NULL;
+    for (size_t i = 0; i < pages; i++) at[i * 4096] = 1;
+    return at;
+}
+/* Flushes the TLB of the 4 pages at `at`, by taking write access away and
+   giving it back, which keeps their accessed bits. Writing 1, 2 or 3 to
+   clear_refs flushes nothing, so until then an access to a page the TLB
+   holds may not mark it. */
+static void cr_flush(char *at) {
+    mprotect(at, 4 * 4096, PROT_READ);
+    mprotect(at, 4 * 4096, PROT_READ | PROT_WRITE);
+}
+/* Writing 1, 2 or 3 to clear_refs makes the pages of every VMA, of those
+   with no file or of those with one unreferenced until their next access,
+   and a forked child has referenced none of the pages it got. */
+static int cr_references(int clear) {
+    char *a = cr_area(4, MAP_PRIVATE), *s = cr_area(4, MAP_SHARED);
+    if (!a || !s) return 88;
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_write(clear, "all", "1", 1);
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_flush(a);
+    cr_flush(s);
+    volatile char sink = a[0];
+    a[4096] = 2;
+    sink = s[0];
+    (void)sink;
+    printf("accessed: referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_write(clear, "mapped", "3", 1);
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_flush(a);
+    cr_flush(s);
+    for (int i = 0; i < 4; i++) a[i * 4096] = s[i * 4096] = 3;
+    printf("accessed: referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_write(clear, "anonymous", "2", 1);
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_flush(a);
+    cr_flush(s);
+    for (int i = 0; i < 4; i++) a[i * 4096] = 4;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 89;
+    if (!child) {
+        printf("child: referenced=%ld\n", cr_referenced(a));
+        sink = a[0];
+        a[4096] = 5;
+        printf("child accessed: referenced=%ld\n", cr_referenced(a));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("parent: referenced=%ld\n", cr_referenced(a));
+    return 0;
+}
+
 /* /proc/<pid>/clear_refs: writing 4 clears the soft-dirty bit of every
    page and VMA, which the next write to a page sets again; a new VMA or
    one that merges with a new one is soft-dirty again, and so is a page
-   mremap moves. The other numbers change nothing pagemap shows. How the
+   mremap moves. 1, 2 and 3 clear what smaps shows as referenced. How the
    number is read, and the file's mode. */
 static int clear_refs_case(void) {
     long page = 4096;
@@ -8702,6 +8801,9 @@ static int clear_refs_case(void) {
     int status;
     waitpid(child, &status, 0);
     pm_show(map, "parent", a, 4);
+
+    r = cr_references(clear);
+    if (r) return r;
 
     /* Another process's file, and a thread's. */
     char path[64];
@@ -11532,6 +11634,298 @@ static int io_uring_held_buffer_case(void) {
     return 0;
 }
 
+/* io_uring's socket requests on AF_UNIX sockets, as Linux 7.0's
+   io_uring/net.c has them: what their preparation refuses, sends and
+   receives (one that waits for its socket, one that waits for the whole
+   length, IORING_RECVSEND_POLL_FIRST, IORING_CQE_F_SOCK_NONEMPTY), a
+   shutdown, a socket, accept and connect, registered slots, and the
+   provided buffer a waiting receive gives back. */
+static unsigned char *unet_push(struct uring *u, unsigned char op, unsigned long data, int fd,
+                                unsigned long off, unsigned long addr, unsigned len, unsigned rw,
+                                unsigned short prio) {
+    unsigned char *sqe = uring_push(u, op, data);
+    memcpy(sqe + 2, &prio, 2);
+    memcpy(sqe + 4, &fd, 4);
+    memcpy(sqe + 8, &off, 8);
+    memcpy(sqe + 16, &addr, 8);
+    memcpy(sqe + 24, &len, 4);
+    memcpy(sqe + 28, &rw, 4);
+    return sqe;
+}
+
+/* The completions, with their flags; a descriptor as "fd". It gives the
+   last one's result. */
+static int unet_reap(struct uring *u, const char *label, int fds) {
+    int last = 0;
+    unsigned head = *u32p(u->rings, 8);
+    unsigned tail = __atomic_load_n(u32p(u->rings, 12), __ATOMIC_ACQUIRE);
+    printf("%s:", label);
+    for (; head != tail; head++) {
+        unsigned char *cqe = u->rings + 64 + 16 * (head & (u->cq_entries - 1));
+        unsigned long data;
+        int res;
+        unsigned flags;
+        memcpy(&data, cqe, 8);
+        memcpy(&res, cqe + 8, 4);
+        memcpy(&flags, cqe + 12, 4);
+        if (fds && res > 0)
+            printf(" %lu=fd/%#x", data, flags);
+        else
+            printf(" %lu=%d/%#x", data, res, flags);
+        last = res;
+    }
+    printf("\n");
+    __atomic_store_n(u32p(u->rings, 8), head, __ATOMIC_RELEASE);
+    return last;
+}
+
+/* Submits what was pushed and waits for `wait` completions. */
+static int unet_run(struct uring *u, unsigned submit, unsigned wait, const char *label, int fds) {
+    uring_enter(u->fd, submit, wait, 1, NULL, 0);
+    return unet_reap(u, label, fds);
+}
+
+static int io_uring_net_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 81;
+    char got[64], put[] = "hello";
+    struct sockaddr_un name = {.sun_family = AF_UNIX};
+    memcpy(name.sun_path + 1, "pal-uring-net", 13);
+    socklen_t name_len = offsetof(struct sockaddr_un, sun_path) + 14;
+    unsigned char *sqe;
+    unsigned long big = 1ul << 63;
+
+    /* The preparation. */
+    unet_push(&u, 34, 1, sv[0], 1, 0, 1, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-off", 0);
+    unet_push(&u, 34, 1, sv[0], 0, 1, 1, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-addr", 0);
+    unet_push(&u, 34, 1, sv[0], 0, 0, 1, 1, 0);
+    unet_run(&u, 1, 1, "shutdown-flags", 0);
+    sqe = unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 0);
+    sqe[40] = 1;
+    unet_run(&u, 1, 1, "shutdown-buf-index", 0);
+    sqe = unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "shutdown-splice", 0);
+    unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 1);
+    unet_run(&u, 1, 1, "shutdown-ioprio", 0);
+    sqe = unet_push(&u, 34, 1, sv[0], 0, 0, 1, 0, 0);
+    sqe[1] = 1 << 5;
+    unet_run(&u, 1, 1, "shutdown-select", 0);
+    unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM, 1, 0, 0, 0);
+    unet_run(&u, 1, 1, "socket-addr", 0);
+    unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM, 0, 0, 1, 0);
+    unet_run(&u, 1, 1, "socket-rw", 0);
+    sqe = unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "socket-cloexec-slot", 0);
+    unet_push(&u, 45, 2, AF_UNIX, SOCK_STREAM | 0x10, 0, 0, 0, 0);
+    unet_run(&u, 1, 1, "socket-flags", 0);
+    unet_push(&u, 13, 3, sv[0], 0, 0, 1, 0, 0);
+    unet_run(&u, 1, 1, "accept-len", 0);
+    sqe = unet_push(&u, 13, 3, sv[0], 0, 0, 0, 0, 0);
+    sqe[40] = 1;
+    unet_run(&u, 1, 1, "accept-buf-index", 0);
+    unet_push(&u, 13, 3, sv[0], 0, 0, 0, 0, 8);
+    unet_run(&u, 1, 1, "accept-ioprio", 0);
+    sqe = unet_push(&u, 13, 3, sv[0], 0, 0, 0, SOCK_CLOEXEC, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "accept-cloexec-slot", 0);
+    sqe = unet_push(&u, 13, 3, sv[0], 0, 0, 0, 0, 1);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "accept-multishot-slot", 0);
+    unet_push(&u, 13, 3, sv[0], 0, 0, 0, 1, 0);
+    unet_run(&u, 1, 1, "accept-flags", 0);
+    unet_push(&u, 16, 4, sv[0], name_len, (unsigned long)&name, 1, 0, 0);
+    unet_run(&u, 1, 1, "connect-len", 0);
+    unet_push(&u, 16, 4, sv[0], name_len, (unsigned long)&name, 0, 1, 0);
+    unet_run(&u, 1, 1, "connect-rw", 0);
+    sqe = unet_push(&u, 16, 4, sv[0], name_len, (unsigned long)&name, 0, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "connect-splice", 0);
+    unet_push(&u, 16, 4, sv[0], 129, (unsigned long)&name, 0, 0, 0);
+    unet_run(&u, 1, 1, "connect-long", 0);
+    unet_push(&u, 16, 4, sv[0], 4, 8, 0, 0, 0);
+    unet_run(&u, 1, 1, "connect-fault", 0);
+    unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, (unsigned)-1, 0, 0);
+    unet_run(&u, 1, 1, "send-len", 0);
+    unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, 1, 0, 4);
+    unet_run(&u, 1, 1, "send-fixed", 0);
+    unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, 1, 0, 8);
+    unet_run(&u, 1, 1, "send-report", 0);
+    sqe = unet_push(&u, 26, 5, sv[0], 0, (unsigned long)put, 1, 0, 0);
+    sqe[46] = 1;
+    unet_run(&u, 1, 1, "send-pad", 0);
+    unet_push(&u, 26, 5, sv[0], 0, big, 1, 0, 0);
+    unet_run(&u, 1, 1, "send-fault", 0);
+    sqe = unet_push(&u, 26, 5, sv[0], (unsigned long)&name, (unsigned long)put, 1, 0, 0);
+    sqe[44] = 129;
+    unet_run(&u, 1, 1, "send-long-to", 0);
+    sqe = unet_push(&u, 26, 5, sv[0], 8, (unsigned long)put, 1, 0, 0);
+    sqe[44] = 4;
+    unet_run(&u, 1, 1, "send-to-fault", 0);
+    unet_push(&u, 27, 6, sv[1], 1, (unsigned long)got, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-addr2", 0);
+    unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, (unsigned)-1, 0, 0);
+    unet_run(&u, 1, 1, "recv-len", 0);
+    unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, 1, 0, 4);
+    unet_run(&u, 1, 1, "recv-fixed", 0);
+    unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, 1, 0, 2);
+    unet_run(&u, 1, 1, "recv-multishot-plain", 0);
+    sqe = unet_push(&u, 27, 6, sv[1], 0, 0, 1, MSG_WAITALL, 2);
+    sqe[1] = 1 << 5;
+    unet_run(&u, 1, 1, "recv-multishot-waitall", 0);
+    sqe = unet_push(&u, 27, 6, sv[1], 0, (unsigned long)got, 1, 0, 0);
+    sqe[44] = 1;
+    unet_run(&u, 1, 1, "recv-optlen", 0);
+    unet_push(&u, 27, 6, sv[1], 0, big, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-fault", 0);
+
+    /* Sends and receives. */
+    unet_push(&u, 26, 10, sv[0], 0, (unsigned long)put, 5, 0, 0);
+    unet_run(&u, 1, 1, "send", 0);
+    unet_push(&u, 27, 11, sv[1], 0, (unsigned long)got, 3, 0, 0);
+    unet_run(&u, 1, 1, "recv-part", 0);
+    unet_push(&u, 27, 12, sv[1], 0, (unsigned long)got + 3, 8, 0, 0);
+    unet_run(&u, 1, 1, "recv-rest", 0);
+    printf("received: %.5s\n", got);
+    unet_push(&u, 27, 13, sv[1], 0, (unsigned long)got, 8, MSG_DONTWAIT, 0);
+    unet_run(&u, 1, 1, "recv-dontwait", 0);
+    unet_push(&u, 27, 14, sv[1], 0, (unsigned long)got, 8, 0, 0);
+    unet_run(&u, 1, 0, "recv-waits", 0);
+    printf("write: %zd\n", write(sv[0], "ab", 2));
+    unet_run(&u, 0, 1, "recv-woken", 0);
+    unet_push(&u, 27, 15, sv[1], 0, (unsigned long)got, 4, MSG_WAITALL, 0);
+    unet_run(&u, 1, 0, "waitall-waits", 0);
+    printf("write: %zd\n", write(sv[0], "cd", 2));
+    unet_run(&u, 0, 0, "waitall-half", 0);
+    printf("write: %zd\n", write(sv[0], "ef", 2));
+    unet_run(&u, 0, 1, "waitall-whole", 0);
+    printf("received: %.4s\n", got);
+    printf("write: %zd\n", write(sv[0], "ij", 2));
+    unet_push(&u, 27, 26, sv[1], 0, (unsigned long)got, 4, MSG_WAITALL | MSG_DONTWAIT, 0);
+    unet_run(&u, 1, 1, "waitall-dontwait", 0);
+    unet_push(&u, 27, 27, sv[1], 0, (unsigned long)got, 4, MSG_WAITALL, 0);
+    unet_run(&u, 1, 0, "waitall-waits", 0);
+    printf("write: %zd\n", write(sv[0], "klm", 3));
+    unet_run(&u, 0, 0, "waitall-part", 0);
+    unet_push(&u, 14, 28, -1, 0, 27, 0, 0, 0);
+    unet_run(&u, 1, 2, "waitall-cancelled", 0);
+    printf("write: %zd\n", write(sv[0], "g", 1));
+    unet_push(&u, 27, 16, sv[1], 0, (unsigned long)got, 8, 0, 1);
+    unet_run(&u, 1, 1, "poll-first", 0);
+    printf("write: %zd\n", write(sv[0], "h", 1));
+    unet_push(&u, 27, 17, sv[1], 0, (unsigned long)got, 8, MSG_DONTWAIT, 1);
+    unet_run(&u, 1, 1, "poll-first-dontwait", 0);
+    printf("read: %zd\n", read(sv[1], got, 8));
+    int pipe_ends[2];
+    if (pipe(pipe_ends)) return 82;
+    unet_push(&u, 26, 18, pipe_ends[1], 0, (unsigned long)put, 1, 0, 0);
+    unet_run(&u, 1, 1, "send-pipe", 0);
+    unet_push(&u, 27, 18, pipe_ends[0], 0, (unsigned long)got, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-pipe", 0);
+    unet_push(&u, 34, 18, pipe_ends[0], 0, 0, 1, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-pipe", 0);
+    unet_push(&u, 13, 18, pipe_ends[0], 0, 0, 0, 0, 0);
+    unet_run(&u, 1, 1, "accept-pipe", 0);
+    unet_push(&u, 27, 18, 999, 0, (unsigned long)got, 1, 0, 0);
+    unet_run(&u, 1, 1, "recv-badf", 0);
+    int dg[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dg)) return 83;
+    unet_push(&u, 26, 19, dg[0], 0, (unsigned long)put, 2, 0, 0);
+    unet_push(&u, 26, 20, dg[0], 0, (unsigned long)put, 2, 0, 0);
+    unet_run(&u, 2, 2, "send-datagrams", 0);
+    unet_push(&u, 27, 21, dg[1], 0, (unsigned long)got, 8, 0, 0);
+    unet_run(&u, 1, 1, "recv-datagram", 0);
+    unet_push(&u, 34, 22, sv[0], 0, 0, SHUT_WR, 0, 0);
+    unet_run(&u, 1, 1, "shutdown", 0);
+    unet_push(&u, 27, 23, sv[1], 0, (unsigned long)got, 8, 0, 0);
+    unet_run(&u, 1, 1, "recv-end", 0);
+    unet_push(&u, 26, 24, sv[0], 0, (unsigned long)put, 1, 0, 0);
+    unet_run(&u, 1, 1, "send-shut", 0);
+    unet_push(&u, 34, 25, sv[0], 0, 0, 7, 0, 0);
+    unet_run(&u, 1, 1, "shutdown-how", 0);
+
+    /* A socket, accept and connect. */
+    unet_push(&u, 45, 30, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0);
+    int server = unet_run(&u, 1, 1, "socket", 1);
+    printf("bind: %d\n", bind(server, (void *)&name, name_len));
+    printf("listen: %d\n", listen(server, 4));
+    unet_push(&u, 13, 31, server, 0, 0, 0, 0, 2);
+    unet_run(&u, 1, 1, "accept-dontwait", 0);
+    unet_push(&u, 13, 32, server, 0, 0, 0, 0, 2 | 4);
+    unet_run(&u, 1, 1, "accept-poll-first-dontwait", 0);
+    struct sockaddr_un peer;
+    socklen_t peer_len = sizeof peer;
+    unet_push(&u, 13, 33, server, (unsigned long)&peer_len, (unsigned long)&peer, 0, SOCK_CLOEXEC,
+              0);
+    unet_run(&u, 1, 0, "accept-waits", 0);
+    int client = socket(AF_UNIX, SOCK_STREAM, 0);
+    unet_push(&u, 16, 34, client, name_len, (unsigned long)&name, 0, 0, 0);
+    int accepted = unet_run(&u, 1, 2, "connect-accepted", 1);
+    printf("peer: %u %d\n", (unsigned)peer_len, peer.sun_family);
+    printf("cloexec: %d\n", fcntl(accepted, F_GETFD) & FD_CLOEXEC);
+    unet_push(&u, 16, 35, client, name_len, (unsigned long)&name, 0, 0, 0);
+    unet_run(&u, 1, 1, "connect-again", 0);
+    unet_push(&u, 13, 36, server, 0, 0, 0, 0, 4);
+    unet_run(&u, 1, 0, "poll-first-waits", 0);
+    int second = socket(AF_UNIX, SOCK_STREAM, 0);
+    printf("connect: %d\n", connect(second, (void *)&name, name_len));
+    unet_run(&u, 0, 1, "poll-first-accepted", 1);
+
+    /* Registered slots. */
+    unet_push(&u, 45, 40, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0)[44] = 1;
+    unet_run(&u, 1, 1, "slot-none", 0);
+    memset(unet_push(&u, 45, 41, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0) + 44, 0xff, 4);
+    unet_run(&u, 1, 1, "alloc-none", 0);
+    int sparse[2] = {-1, -1};
+    uring_show("register", syscall(427, u.fd, 2, sparse, 2));
+    unet_push(&u, 45, 42, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0)[44] = 3;
+    unet_run(&u, 1, 1, "slot-past", 0);
+    unet_push(&u, 45, 43, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0)[44] = 2;
+    unet_run(&u, 1, 1, "slot", 0);
+    memset(unet_push(&u, 45, 44, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0) + 44, 0xff, 4);
+    unet_run(&u, 1, 1, "alloc", 0);
+    memset(unet_push(&u, 45, 45, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0) + 44, 0xff, 4);
+    unet_run(&u, 1, 1, "alloc-full", 0);
+    uring_show("unregister", syscall(427, u.fd, 3, NULL, 0));
+    uring_show("register", syscall(427, u.fd, 2, sparse, 2));
+    int third = socket(AF_UNIX, SOCK_STREAM, 0);
+    printf("connect: %d\n", connect(third, (void *)&name, name_len));
+    unet_push(&u, 13, 46, server, 0, 0, 0, 0, 0)[44] = 1;
+    unet_run(&u, 1, 1, "accept-slot", 0);
+    unet_push(&u, 26, 47, 0, 0, (unsigned long)"xy", 2, 0, 0)[1] = 1;
+    unet_run(&u, 1, 1, "send-slot", 0);
+    memset(got, 0, sizeof got);
+    printf("read: %zd %.2s\n", read(third, got, 8), got);
+
+    /* A provided buffer, which a receive that waits gives back. */
+    int pb[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pb)) return 84;
+    char pool[16];
+    sqe = unet_push(&u, 27, 50, pb[1], 0, 0, 0, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    unet_run(&u, 1, 1, "select-none", 0);
+    unet_push(&u, 31, 51, 1, 3, (unsigned long)pool, 8, 0, 0)[40] = 4;
+    unet_run(&u, 1, 1, "provide", 0);
+    sqe = unet_push(&u, 27, 52, pb[1], 0, 0, 0, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    unet_run(&u, 1, 0, "select-waits", 0);
+    unet_push(&u, 32, 53, 1, 0, 0, 0, 0, 0)[40] = 4;
+    unet_run(&u, 1, 1, "remove", 0);
+    unet_push(&u, 31, 54, 1, 5, (unsigned long)pool, 8, 0, 0)[40] = 4;
+    unet_run(&u, 1, 1, "provide", 0);
+    printf("write: %zd\n", write(pb[0], "abc", 3));
+    unet_run(&u, 0, 1, "select-woken", 0);
+    printf("pool: %.3s\n", pool);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -12684,27 +13078,57 @@ static int lease_breaks_case(void) {
     rmdir(dir);
     return 0;
 }
-/* /proc/locks: the lines of this case's two files, as lock_get_status prints
- * them, without their numbers, which other processes' locks move. */
+/* /proc/locks: the lines of this case's two files and of those that wait for
+ * their locks, as lock_get_status prints them, without their numbers, which
+ * other processes' locks move. */
 static struct stat plocks_files[2];
-static pid_t plocks_child;
-static void plocks_line(const char *line) {
+static pid_t plocks_children[4];
+/* The number and file of the last lock, if it is this case's. */
+static long plocks_root = -1;
+static int plocks_root_file;
+static const char *plocks_who(int pid) {
+    static const char *names[] = {"child", "child2", "child3", "child4"};
+    if (pid == getpid()) return "self";
+    if (pid == -1) return "none";
+    for (int i = 0; i < 4; i++)
+        if (plocks_children[i] && pid == plocks_children[i]) return names[i];
+    return "other";
+}
+/* Whether it is the line of one that waits for a lock of this case's. */
+static int plocks_line(const char *line, int show) {
+    long id = strtol(line, NULL, 10);
     const char *at = strstr(line, ": ");
-    if (!at || strlen(at) < 20) return;
+    if (!at || strlen(at) < 20) return 0;
     at += 2;
+    int indent = (int)strspn(at, " "), level = 0;
+    if (!strncmp(at + indent, "-> ", 3)) level = indent + 1;
+    if (level) at += indent + 3;
+    if (level && id != plocks_root) return 0;
     int pid, used = 0;
     unsigned major_number, minor_number;
     unsigned long inode;
     char kind[16], start[32], end[32];
-    if (sscanf(at + 17, "%15s %d %x:%x:%lu %31s %31s%n", kind, &pid, &major_number, &minor_number, &inode, start, end, &used) != 7) return;
-    for (int i = 0; i < 2; i++) {
-        struct stat *st = &plocks_files[i];
-        if (st->st_ino != inode || major(st->st_dev) != major_number || minor(st->st_dev) != minor_number) continue;
-        const char *who = pid == getpid() ? "self" : pid == -1 ? "none" : plocks_child && pid == plocks_child ? "child" : "other";
-        printf("  [%.17s] %s %s %c %s %s%s", at, kind, who, 'f' + i, start, end, at[17 + used] == '\n' ? "\n" : "!\n");
+    if (sscanf(at + 17, "%15s %d %x:%x:%lu %31s %31s%n", kind, &pid, &major_number, &minor_number, &inode, start, end, &used) == 7) {
+        for (int i = 0; i < 2; i++) {
+            struct stat *st = &plocks_files[i];
+            if (st->st_ino != inode || major(st->st_dev) != major_number || minor(st->st_dev) != minor_number) continue;
+            if (!level) {
+                plocks_root = id;
+                plocks_root_file = i;
+            }
+            if (show) printf("  %.*s[%.17s] %s %s %c %s %s%s", level * 2, "--------", at, kind, plocks_who(pid), 'f' + i, start, end, at[17 + used] == '\n' ? "\n" : "!\n");
+            return level > 0;
+        }
+    } else if (level && sscanf(at + 17, "%15s %d %n", kind, &pid, &used) == 2) {
+        /* A lease's breaker has no file. */
+        if (show) printf("  %.*s[%.17s] %s %s of %c %s", level * 2, "--------", at, kind, plocks_who(pid), 'f' + plocks_root_file, at + 17 + used);
+        return 1;
     }
+    if (!level) plocks_root = -1;
+    return 0;
 }
 static void plocks_show(const char *what, const char *path) {
+    plocks_root = -1;
     printf("%s\n", what);
     FILE *file = fopen(path, "r");
     if (!file) {
@@ -12723,7 +13147,7 @@ static void plocks_show(const char *what, const char *path) {
         ordered &= id >= last;
         last = id;
         if (!locks) printf("  %ld\n", id);
-        plocks_line(text);
+        plocks_line(text, 1);
     }
     fclose(file);
     printf("  ordered=%d\n", ordered);
@@ -12737,6 +13161,148 @@ static int plocks_pin(int cpu) {
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     return sched_setaffinity(0, sizeof set, &set) ? -errno : 0;
+}
+/* Waits until `count` wait for this case's locks. */
+static int plocks_waiting(int count) {
+    for (int tries = 0; tries < 2000; tries++) {
+        FILE *file = fopen("/proc/locks", "r");
+        char line[256];
+        int waiting = 0;
+        plocks_root = -1;
+        while (file && fgets(line, sizeof line, file)) waiting += plocks_line(line, 0);
+        if (file) fclose(file);
+        if (waiting == count) return 0;
+        usleep(5000);
+    }
+    printf("  not %d waiting\n", count);
+    return 1;
+}
+enum { PLOCKS_OPEN = -1, PLOCKS_FLOCK = -2 };
+static int plocks_got[2];
+/* Child `at` waits for a lock of `path`, is the `count`th to wait, and keeps
+ * the lock once it has it. `command` is fcntl's, or one of the above: then
+ * `type` is flock's operation, or the flags of an open. */
+static void plocks_child(int at, int count, const char *path, int command, int type, long start, long length) {
+    fflush(stdout);
+    plocks_children[at] = fork();
+    if (plocks_children[at] == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        int fd = open(path, command == PLOCKS_OPEN ? type : O_RDWR);
+        int result = fd < 0 ? -errno : 0;
+        if (command == PLOCKS_FLOCK) result = flock(fd, type) ? -errno : 0;
+        if (command >= 0) result = plocks_set(fd, command, (short)type, start, length);
+        char byte = (char)(result ? 'x' : '1' + at);
+        if (write(plocks_got[1], &byte, 1) != 1) _exit(1);
+        for (;;) pause();
+    }
+    plocks_waiting(count);
+}
+/* The next child to get its lock. */
+static void plocks_gets(void) {
+    char byte = '?';
+    if (read(plocks_got[0], &byte, 1) != 1) byte = '!';
+    printf("got=%c\n", byte);
+}
+static void plocks_kill(int at) {
+    kill(plocks_children[at], SIGKILL);
+    waitpid(plocks_children[at], NULL, 0);
+    plocks_children[at] = 0;
+}
+static int plocks_waiters(const char *f, const char *g, int one) {
+    const char *list = "/proc/locks";
+    if (pipe(plocks_got)) return 10;
+    /* Record locks: one that conflicts with an earlier one waits behind it. */
+    printf("waited for=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 0, 100));
+    plocks_child(0, 1, f, F_SETLKW, F_WRLCK, 0, 10);
+    plocks_child(1, 2, f, F_SETLKW, F_RDLCK, 5, 10);
+    plocks_child(2, 3, f, F_OFD_SETLKW, F_WRLCK, 12, 1);
+    plocks_child(3, 4, f, F_SETLKW, F_RDLCK, 20, 10);
+    plocks_show("record waiters", list);
+    /* A waiter's end wakes those behind it, which wait again. */
+    plocks_kill(0);
+    plocks_waiting(3);
+    plocks_show("without the first", list);
+    plocks_kill(3);
+    plocks_kill(2);
+    plocks_kill(1);
+    plocks_waiting(0);
+    plocks_show("no waiters", list);
+    /* A waiter that gets its lock takes those behind it along. */
+    plocks_child(0, 1, f, F_SETLKW, F_WRLCK, 0, 10);
+    plocks_child(1, 2, f, F_SETLKW, F_WRLCK, 5, 10);
+    plocks_set(one, F_SETLK, F_UNLCK, 0, 0);
+    plocks_gets();
+    plocks_waiting(1);
+    plocks_show("got", list);
+    plocks_kill(0);
+    plocks_gets();
+    plocks_show("got too", list);
+    plocks_kill(1);
+    /* flock. */
+    int held = open(f, O_RDONLY);
+    flock(held, LOCK_EX);
+    plocks_child(0, 1, f, PLOCKS_FLOCK, LOCK_SH, 0, 0);
+    plocks_child(1, 2, f, PLOCKS_FLOCK, LOCK_SH, 0, 0);
+    plocks_child(2, 3, f, PLOCKS_FLOCK, LOCK_EX, 0, 0);
+    plocks_show("flock waiters", list);
+    plocks_kill(0);
+    plocks_waiting(2);
+    plocks_show("behind the other", list);
+    flock(held, LOCK_UN);
+    plocks_gets();
+    plocks_waiting(1);
+    plocks_show("got", list);
+    plocks_kill(1);
+    plocks_gets();
+    plocks_show("got too", list);
+    plocks_kill(2);
+    close(held);
+    /* Opens that break a lease. */
+    int leased = open(g, O_RDONLY);
+    printf("lease=%d\n", lease_errno(leased, F_WRLCK));
+    plocks_child(0, 1, g, PLOCKS_OPEN, O_RDONLY, 0, 0);
+    plocks_show("reader", list);
+    plocks_child(1, 2, g, PLOCKS_OPEN, O_WRONLY, 0, 0);
+    plocks_child(2, 3, g, PLOCKS_OPEN, O_RDWR, 0, 0);
+    /* A reader waits a tick at a time, as fl_break_time is 0 (__break_lease),
+       until a writer breaks the lease: that moves those behind it once. */
+    usleep(100000);
+    plocks_waiting(3);
+    plocks_show("and writers", list);
+    plocks_kill(0);
+    plocks_waiting(2);
+    plocks_show("writers", list);
+    plocks_kill(2);
+    plocks_waiting(1);
+    printf("downgrade=%d\n", lease_errno(leased, F_RDLCK));
+    plocks_waiting(1);
+    plocks_show("downgraded", list);
+    printf("give back=%d\n", lease_errno(leased, F_UNLCK));
+    plocks_gets();
+    plocks_show("given back", list);
+    plocks_kill(1);
+    close(leased);
+    /* A description that waits for this process's lock: this process waiting
+       for the description's is a deadlock. */
+    printf("first=%d\n", plocks_set(one, F_SETLK, F_WRLCK, 0, 1));
+    int own = open(f, O_RDWR);
+    printf("description=%d\n", plocks_set(own, F_OFD_SETLK, F_WRLCK, 1, 1));
+    fflush(stdout);
+    plocks_children[0] = fork();
+    if (plocks_children[0] == 0) _exit(plocks_set(own, F_OFD_SETLKW, F_WRLCK, 0, 1) != 0);
+    plocks_waiting(1);
+    plocks_show("description waits", list);
+    printf("deadlock=%d\n", plocks_set(one, F_SETLKW, F_WRLCK, 1, 1));
+    printf("let go=%d\n", plocks_set(one, F_SETLK, F_UNLCK, 0, 0));
+    int status;
+    waitpid(plocks_children[0], &status, 0);
+    printf("child=%d\n", status);
+    plocks_children[0] = 0;
+    close(own);
+    plocks_set(one, F_SETLK, F_UNLCK, 0, 0);
+    close(plocks_got[0]);
+    close(plocks_got[1]);
+    return 0;
 }
 static int proc_locks_case(void) {
     signal(SIGIO, SIG_IGN);
@@ -12819,8 +13385,8 @@ static int proc_locks_case(void) {
     int ready[2], go[2];
     if (pipe(ready) || pipe(go)) return 6;
     fflush(stdout);
-    plocks_child = fork();
-    if (plocks_child == 0) {
+    plocks_children[0] = fork();
+    if (plocks_children[0] == 0) {
         char byte;
         int result = plocks_set(two, F_SETLK, F_WRLCK, 200, 1);
         if (flock(three, LOCK_SH)) _exit(1);
@@ -12832,7 +13398,7 @@ static int proc_locks_case(void) {
     plocks_show("child", "/proc/locks");
     if (write(go[1], "x", 1) != 1) return 8;
     int status;
-    waitpid(plocks_child, &status, 0);
+    waitpid(plocks_children[0], &status, 0);
     printf("child=%d\n", status);
     plocks_show("child gone", "/proc/locks");
     flock(three, LOCK_UN);
@@ -12852,6 +13418,9 @@ static int proc_locks_case(void) {
         close(later);
         close(latest);
     }
+    flock(three, LOCK_UN);
+    int waiters = plocks_waiters(f, g, one);
+    if (waiters) return waiters;
     close(one);
     close(three);
     plocks_show("closed", "/proc/locks");
@@ -13014,8 +13583,7 @@ static void smaps_locked(void) {
     const char *line = strstr(status, "\nVmLck:");
     printf("status VmLck=%ld\n", line ? strtol(line + 7, NULL, 10) : -1);
 }
-/* Memory with a hole on each side, which no other VMA merges with: the
- * emulator merges private VMAs whatever their anon_vma. */
+/* Memory with a hole on each side, which no other VMA merges with. */
 static char *smaps_area(long pages, int prot, int flags) {
     long page = 4096;
     char *area = mmap(NULL, (pages + 2) * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -14242,6 +14810,68 @@ static void cr_lines(const char *label, int dir, const char *name) {
     close(fd);
     printf("%s: %d lines\n", label, lines);
 }
+/* What a `..` finds that climbs above the new root as written: after a
+   symbolic link it goes up from the link's target, and what is not there,
+   no directory or not searched stops the walk where Linux stops it. The
+   child is in the new root, its working directory there too. */
+static void cr_climb(void) {
+    mkdir("/d/e/g", 0755);
+    cr_put("/d", "f", "mid");
+    cr_put("/d/e", "f", "low");
+    const char *links[][2] = {{"/d/e/g", "over"},   {"d/e/g", "deep"},       {"../d/e/g", "d/side"},
+                              {"loop", "loop"},     {"/d/none", "d/gone"},   {"../../..", "d/out"},
+                              {"over/..", "chain"}, {"./d/./e/../e/g", "dots"}, {"f", "file"}};
+    for (unsigned i = 0; i < 9; i++)
+        if (symlink(links[i][0], links[i][1])) printf("symlink %s errno=%d\n", links[i][1], errno);
+    const char *paths[] = {
+        "/over/../../f", "/over/../f", "/over/../../../f", "/over/../../../../f", "/over/../../../../d/f",
+        "/deep/../../f", "/../deep/../../f", "deep/../../f", "../deep/../../f", "/d/../../deep/../f",
+        "/d/side/../../../f", "/d/side/../../../../d/f", "/dots/../../f", "/chain/../../f", "/chain/../f",
+        "/chain/../../../over/../f", "/d/out/../../f", "/d/out/../../../d/f", "/over/../../side/../../../../over/../f", "/d/side/../../../../over/../../f",
+        "/over/.././../f", "//over//..//..//f", "/over/../../../f/", "/over/../../../f/.", "/over/../../side/../f",
+        "/none/../../f", "/over/none/../../../../f", "/f/../../f", "/over/../../f/../../../../f", "/loop/../../f",
+        "/d/gone/../../../f", "/file/../../f", "/locked/../../f", "/locked/none/../../../f", "/over/../../../locked/../../f",
+        "/none/../..", "/f/../..", "/loop/../..", "/over/../../", "/over/../../loop", "/over/../../../loop",
+    };
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++) cr_read(paths[i], paths[i]);
+    struct stat st;
+    const char *all[] = {"/over/../..", "/over/../../side", "/deep/../../gone", "/none/../../over", "/f/../../over"};
+    for (unsigned i = 0; i < 5; i++) {
+        int r = lstat(all[i], &st);
+        printf("lstat %s: %d %o\n", all[i], r ? errno : 0, r ? 0 : st.st_mode & S_IFMT);
+    }
+    int fd = open("/over/../../made", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    printf("made: %d %d\n", fd < 0 ? errno : 0, access("/d/made", F_OK) ? errno : 0);
+    close(fd);
+    fd = open("/none/../../unmade", O_WRONLY | O_CREAT, 0644);
+    printf("unmade: %d %d\n", fd < 0 ? errno : 0, access("/unmade", F_OK) ? errno : 0);
+    printf("rename: %d", rename("/over/../../made", "/deep/../../moved") ? errno : 0);
+    printf(" link: %d", link("/over/../../moved", "/over/../../hard") ? errno : 0);
+    printf(" unlink: %d %d", unlink("/over/../../moved") ? errno : 0, unlink("/d/hard") ? errno : 0);
+    printf(" mkdir: %d", mkdir("/over/../../new", 0755) ? errno : 0);
+    printf(" again: %d", mkdir("/over/../../new/", 0755) ? errno : 0);
+    printf(" rmdir: %d %d", rmdir("/over/../../../new") ? errno : 0, rmdir("/over/../../new") ? errno : 0);
+    printf(" rmdir-up: %d unlink-up: %d\n", rmdir("/over/../..") ? errno : 0, unlink("/over/../..") ? errno : 0);
+    printf("chdir: %d", chdir("/over/../..") ? errno : 0);
+    cr_cwd(" over");
+    printf("chdir none: %d f: %d loop: %d\n", chdir("/none/../..") ? errno : 0, chdir("/f/../..") ? errno : 0,
+           chdir("/loop/../..") ? errno : 0);
+    int d = open("/over", O_RDONLY | O_DIRECTORY);
+    char buf[8] = {0};
+    fd = openat(d, "../../f", O_RDONLY);
+    printf("openat: %d %s\n", fd < 0 ? errno : 0, read(fd, buf, 7) > 0 ? buf : "");
+    close(fd);
+    fd = openat(d, "../../../d/side/../../../../over/../f", O_RDONLY);
+    memset(buf, 0, sizeof buf);
+    printf("openat up: %d %s\n", fd < 0 ? errno : 0, read(fd, buf, 7) > 0 ? buf : "");
+    close(fd);
+    close(d);
+    if (chdir("/")) printf("chdir errno=%d\n", errno);
+    for (unsigned i = 0; i < 9; i++) unlink(links[i][1]);
+    unlink("/d/f");
+    unlink("/d/e/f");
+    printf("climbed: %d\n", rmdir("/d/e/g") ? errno : 0);
+}
 static int chroot_exec_case(void) {
     cr_cwd("exec");
     cr_read("exec /f", "/f");
@@ -14354,6 +14984,7 @@ static int chroot_case(const char *self) {
         if (chdir("/")) _exit(92);
         cr_cwd("root");
         cr_read("../f at root", "../f");
+        cr_climb();
         int d = open("/d", O_RDONLY | O_DIRECTORY);
         if (d < 0 || fchdir(d)) _exit(93);
         close(d);
@@ -17593,6 +18224,71 @@ static int mmap_32bit_case(void) {
     char *unit = mmap((char *)0x10L, page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("under-a-page: high=%d\n", (uintptr_t)unit >= 0x80000000);
     close(fd), close(zero);
+    return 0;
+}
+/* The mmap-low case: without CAP_SYS_RAWIO nothing is mapped below
+   mmap_min_addr (64 KiB): a fixed mmap, an mremap there and a shmat there are
+   EPERM (cap_mmap_addr), the mremap once its target is gone and its source
+   has shrunk. An unaligned address is EINVAL and a length past the end of
+   the address space ENOMEM before it; a file's own refusal comes after it. */
+static int low_error(const void *at) {
+    return at == MAP_FAILED || at == (void *)-1 ? errno : 0;
+}
+static int mmap_low_case(void) {
+    long page = 4096;
+    int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 80;
+    uintptr_t at[] = {0, 0x1000, 0xf000, 0x1001};
+    for (int i = 0; i < 4; i++) {
+        int fixed = low_error(mmap((void *)at[i], page, rw, anon | MAP_FIXED, -1, 0));
+        /* musl's mmap gives ENOMEM for this EPERM at 0. */
+        int kept = low_error((void *)syscall(SYS_mmap, at[i], page, rw,
+                                             anon | MAP_FIXED_NOREPLACE, -1L, 0L));
+        printf("%#lx: fixed=%d noreplace=%d\n", (unsigned long)at[i], fixed, kept);
+    }
+    printf("long=%d\n", low_error(mmap((void *)0x1000, 1UL << 57, rw, anon | MAP_FIXED, -1, 0)));
+    int null = open("/dev/null", O_RDWR), zero = open("/dev/zero", O_RDWR);
+    printf("device=%d\n", low_error(mmap((void *)0x1000, page, rw, MAP_PRIVATE, null, 0)));
+    printf("low device=%d\n",
+           low_error(mmap((void *)0x1000, page, rw, MAP_PRIVATE | MAP_FIXED, null, 0)));
+    printf("low zero=%d\n",
+           low_error(mmap((void *)0x1000, page, rw, MAP_PRIVATE | MAP_FIXED, zero, 0)));
+    /* The lowest address is free to map; a mapping below it that would
+       replace some of it is refused, and leaves it. */
+    char *min = mmap((void *)0x10000, 2 * page, rw, anon | MAP_FIXED, -1, 0);
+    printf("min=%d\n", low_error(min));
+    if (min == MAP_FAILED) return 81;
+    *min = 5;
+    int over = low_error(mmap((void *)0xf000, 2 * page, rw, anon | MAP_FIXED, -1, 0));
+    printf("over=%d kept=%d\n", over, *min);
+    char *a = mmap(NULL, 3 * page, rw, anon, -1, 0);
+    if (a == MAP_FAILED) return 82;
+    *a = 7;
+    int how = MREMAP_MAYMOVE | MREMAP_FIXED;
+    unsigned char in;
+    int moved = low_error(mremap(a, 3 * page, page, how, (void *)0x1000));
+    int first = mincore(a, page, &in), second = mincore(a + page, page, &in);
+    printf("mremap=%d first=%d shrunk=%d value=%d\n", moved, first, second ? errno : 0, *a);
+    moved = low_error(mremap(a, page, 2 * page, how, (void *)0xf000));
+    first = mincore(min, page, &in);
+    printf("mremap over=%d target=%d value=%d\n", moved, first ? errno : 0, *a);
+    int keep = MREMAP_MAYMOVE | MREMAP_DONTUNMAP;
+    /* musl's mremap passes no address without MREMAP_FIXED. A free one is
+       taken (arch_get_unmapped_area_topdown), so it is refused as well. */
+    printf("dontunmap=%d", low_error((void *)syscall(SYS_mremap, a, page, page, keep, 0x2000L)));
+    printf(" value=%d\n", *a);
+    printf("dontunmap nowhere=%d\n",
+           low_error((void *)syscall(SYS_mremap, a, page, page, keep, 0L)));
+    int id = shmget(IPC_PRIVATE, page, 0600);
+    if (id < 0) return 83;
+    printf("shmat=%d\n", low_error(shmat(id, (void *)0x1000, 0)));
+    printf("shmat remap=%d\n", low_error(shmat(id, (void *)0x1000, SHM_REMAP)));
+    printf("shmat round=%d\n", low_error(shmat(id, (void *)0x1001, SHM_RND)));
+    printf("shmat zero=%d\n", low_error(shmat(id, (void *)0x10, SHM_RND)));
+    printf("shmat unaligned=%d\n", low_error(shmat(id, (void *)0x1001, 0)));
+    shmctl(id, IPC_RMID, NULL);
     return 0;
 }
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
@@ -21468,6 +22164,7 @@ static int proc_syscall_case(void) {
     kill(kid, SIGKILL);
     siginfo_t info;
     waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    zombie_settled(kid);
     psc_path("zombie", path);
     printf("status=%d\n", reaped(kid));
     psc_show("reaped", held);
@@ -28063,6 +28760,152 @@ static int setfl_kinds_case(void) {
     return 0;
 }
 
+/* What an open of `path` with O_PATH and `flags` gives: the errno, or its
+   F_GETFL, whether it refuses a read (EBADF) and the access its link in
+   /proc/self/fd shows. */
+static void pf_open(const char *path, int flags) {
+    errno = 0;
+    int fd = open(path, O_PATH | flags, 0600);
+    if (fd < 0) {
+        printf(" e%d", errno);
+        return;
+    }
+    char link[64], byte;
+    struct stat st;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    errno = 0;
+    ssize_t n = read(fd, &byte, 1);
+    int refused = n < 0 ? errno : 0;
+    int shown = lstat(link, &st) ? -1 : (int)(st.st_mode & 0777);
+    printf(" %#o/%d/%o", fcntl(fd, F_GETFL), refused, shown);
+    close(fd);
+}
+/* The path-flags case: O_PATH beats every flag but O_DIRECTORY, O_NOFOLLOW
+   and O_CLOEXEC (build_open_how), so an access mode, O_CREAT, O_TRUNC and
+   the others change nothing of an open with it: no directory is EISDIR, no
+   read-only file system EROFS, no running program ETXTBSY, nothing is made
+   or emptied, no lease breaks and no one is told. */
+static void pf_lease(int signal) { (void)signal; }
+static int path_flags_case(const char *self) {
+    char dir[] = "/tmp/path-flags-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char file[64], missing[64], fifo[64], link[64];
+    snprintf(file, sizeof file, "%s/file", dir);
+    snprintf(missing, sizeof missing, "%s/missing", dir);
+    snprintf(fifo, sizeof fifo, "%s/fifo", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    int fd = open(file, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || write(fd, "data", 4) != 4 || mkfifo(fifo, 0600) || symlink("file", link)) return 81;
+    close(fd);
+    const struct {
+        const char *name;
+        const char *path;
+    } paths[] = {
+        {"file", file},
+        {"missing", missing},
+        {"directory", dir},
+        {"fifo", fifo},
+        {"link", link},
+        {"program", self},
+        {"/proc", "/proc"},
+        {"/proc/self", "/proc/self"},
+        {"/proc/self/fd", "/proc/self/fd"},
+        {"/proc/self/fdinfo", "/proc/self/fdinfo"},
+        {"/proc/self/ns", "/proc/self/ns"},
+        {"/proc/self/task", "/proc/self/task"},
+        {"/proc/1", "/proc/1"},
+        {"/proc/self/status", "/proc/self/status"},
+        {"/proc/self/mem", "/proc/self/mem"},
+        {"/proc/self/clear_refs", "/proc/self/clear_refs"},
+        {"/proc/self/exe", "/proc/self/exe"},
+        {"/proc/self/cwd", "/proc/self/cwd"},
+        {"/proc/uptime", "/proc/uptime"},
+        {"/proc/sys", "/proc/sys"},
+        {"/proc/sys/kernel/ostype", "/proc/sys/kernel/ostype"},
+        {"/proc/sysvipc", "/proc/sysvipc"},
+        {"/dev", "/dev"},
+        {"/dev/null", "/dev/null"},
+        {"/dev/pts", "/dev/pts"},
+        {"/dev/shm", "/dev/shm"},
+        {"/dev/fd", "/dev/fd"},
+        {"/dev/ptmx", "/dev/ptmx"},
+        {"/proc/self/ns/uts", "/proc/self/ns/uts"},
+    };
+    static const int flags[] = {
+        O_WRONLY,        O_RDWR,
+        O_ACCMODE,       O_CREAT,
+        O_CREAT | O_EXCL, O_CREAT | O_DIRECTORY,
+        O_RDWR | O_TRUNC, O_RDWR | O_APPEND | O_NONBLOCK | O_SYNC | O_DIRECT,
+        O_RDWR | O_TMPFILE, O_WRONLY | O_DIRECTORY,
+        O_RDWR | O_NOFOLLOW, O_RDWR | O_CLOEXEC | O_NOATIME,
+    };
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        printf("%s:", paths[i].name);
+        for (size_t j = 0; j < sizeof flags / sizeof flags[0]; j++) pf_open(paths[i].path, flags[j]);
+        putchar('\n');
+    }
+    /* Without O_PATH: a directory keeps the flags of its open, and a file
+       is none (O_DIRECTORY). */
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        if (strncmp(paths[i].path, "/proc", 5) && strcmp(paths[i].path, "/dev") &&
+            strcmp(paths[i].path, "/dev/pts") && strcmp(paths[i].path, "/dev/null"))
+            continue;
+        printf("opened %s:", paths[i].name);
+        static const int plain[] = {O_RDONLY, O_DIRECTORY, O_NONBLOCK | O_CLOEXEC, O_SYNC};
+        for (size_t j = 0; j < sizeof plain / sizeof plain[0]; j++) {
+            errno = 0;
+            int opened = open(paths[i].path, plain[j]);
+            if (opened < 0) {
+                printf(" e%d", errno);
+                continue;
+            }
+            printf(" %#o", fcntl(opened, F_GETFL));
+            close(opened);
+        }
+        putchar('\n');
+    }
+    struct stat st;
+    printf("size=%d missing=%d\n", stat(file, &st) ? -1 : (int)st.st_size, access(missing, F_OK));
+    /* A descriptor's own file, again. */
+    fd = open(file, O_RDONLY);
+    char of[64];
+    snprintf(of, sizeof of, "/proc/self/fd/%d", fd);
+    printf("descriptor:");
+    for (size_t j = 0; j < sizeof flags / sizeof flags[0]; j++) pf_open(of, flags[j]);
+    putchar('\n');
+    /* A lease holds, and inotify sees no open. */
+    signal(SIGIO, pf_lease);
+    int watch = inotify_init1(IN_NONBLOCK);
+    if (watch < 0 || inotify_add_watch(watch, file, IN_ALL_EVENTS) < 0) return 82;
+    printf("lease=%d", fcntl(fd, F_SETLEASE, F_RDLCK));
+    int path = open(file, O_PATH | O_RDWR | O_TRUNC);
+    printf(" open=%d held=%d", path >= 0, fcntl(fd, F_GETLEASE));
+    char events[256];
+    errno = 0;
+    ssize_t n = read(watch, events, sizeof events);
+    printf(" events=%zd errno=%d\n", n, errno);
+    close(path);
+    close(watch);
+    close(fd);
+    /* A read-only mount. */
+    if (unshare(CLONE_NEWNS) || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) ||
+        mount(dir, dir, NULL, MS_BIND, NULL) ||
+        mount(NULL, dir, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL)) {
+        printf("mount errno=%d\n", errno);
+    } else {
+        printf("read-only:");
+        pf_open(file, O_RDWR);
+        pf_open(file, O_WRONLY | O_TRUNC);
+        pf_open(missing, O_CREAT | O_RDWR);
+        putchar('\n');
+        umount(dir);
+    }
+    unlink(file);
+    unlink(fifo);
+    unlink(link);
+    rmdir(dir);
+    return 0;
+}
 int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
@@ -40977,6 +41820,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "tmpfs-huge-placement")) return tmpfs_huge_placement_case();
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
     if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
+    if (!strcmp(mode, "mmap-low")) return mmap_low_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
@@ -41053,6 +41897,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-held-tag")) return io_uring_held_tag_case();
     if (!strcmp(mode, "io-uring-buffers2")) return io_uring_buffers2_case();
     if (!strcmp(mode, "io-uring-held-buffer")) return io_uring_held_buffer_case();
+    if (!strcmp(mode, "io-uring-net")) return io_uring_net_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;
@@ -41498,6 +42343,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rename-names")) return rename_names_case();
     if (!strcmp(mode, "rename-names-child")) return rename_names_child();
     if (!strcmp(mode, "vma-names")) return vma_names_case();
+    if (!strcmp(mode, "path-flags")) return path_flags_case(self);
     if (!strcmp(mode, "chroot-names")) return chroot_names_case();
     if (!strcmp(mode, "chroot-names-child")) return chroot_names_child();
     if (!strcmp(mode, "vma-merges")) return vma_merges_case();

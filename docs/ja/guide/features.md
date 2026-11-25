@@ -5478,6 +5478,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `SO_ACCEPTCONN`、`SO_KEEPALIVE`、`SO_REUSEADDR`、`SO_REUSEPORT`、`SO_SNDBUF`、
     `SO_RCVBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`SO_LINGER`、`SO_PRIORITY`、
     `SO_BROADCAST`、`SO_OOBINLINE`、`TCP_NODELAY`（ホストにも伝えます）、
+    `TCP_CORK`（ホストには伝えません）、
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
     `TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、`IP_TOS`、`IPV6_V6ONLY`。
     既定値と範囲の確かめ方は Linux と
@@ -5527,8 +5528,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     バイト、受け取ったバイト（ハンドシェイクと終わりを含む）、まだ送っていないバイト、
     セグメント、データを最後に送ってから・受け取ってからの時間を返します。ループバックの
     セグメントは Linux が送るとおりです。書き込みごとに 1 つですが、小さいものが確認応答を
-    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` の続きを
-    待つ間（201 ms まで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
+    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` や `TCP_CORK` の続きを
+    待つ間（201 ms まで、または `TCP_CORK` を外すか `TCP_NODELAY` を設定するまで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
     一緒に、または読んだとき、または 40 ms 後です（`TCP_QUICKACK` で選べます）。はじめは
     確認応答のないものを 10 個まで送れます。末尾の損失プローブは最後のものを送り直します。
     終わりは、その前に留まっていたデータと一緒に送ります。終わりの確認応答が来るまでは

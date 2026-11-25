@@ -328,6 +328,10 @@ impl Link {
     pub(crate) fn set_no_delay(&self, side: usize, on: bool) {
         self.with_flows(|flows, now| flows.set_no_delay(side, on, now));
     }
+    /// `side`'s `TCP_CORK` was set or cleared.
+    pub(crate) fn set_cork(&self, side: usize, on: bool) {
+        self.with_flows(|flows, now| flows.set_cork(side, on, now));
+    }
     /// `side`'s `TCP_QUICKACK` was set to `value`.
     pub(crate) fn set_quick(&self, side: usize, value: i32) {
         self.with_flows(|flows, now| flows.set_quick(side, value, now));

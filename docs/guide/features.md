@@ -6378,8 +6378,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_ACCEPTCONN`, `SO_KEEPALIVE`, `SO_REUSEADDR`, `SO_REUSEPORT`,
     `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_LINGER`,
     `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
-    the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
-    `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
+    the host), `TCP_CORK` (which does not), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
+    `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
     with Linux's defaults and
     range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
     `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
@@ -6434,7 +6434,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     and the times since data went and came. On the loopback the segments are
     those Linux sends: each write its own, held while a small one waits for
     its acknowledgement (Nagle's algorithm, unless `TCP_NODELAY` or urgent
-    data) or for `MSG_MORE`'s next (up to 201 ms); the first 16
+    data) or for what `MSG_MORE` or `TCP_CORK` says comes next (up to
+    201 ms, or until the cork is cleared or `TCP_NODELAY` set); the first 16
     acknowledgements at once, then with the data a side replies with, on a
     read, or after 40 ms (`TCP_QUICKACK` sets which); at most 10 in flight
     at first; a tail loss probe, which sends the last again; and the end,

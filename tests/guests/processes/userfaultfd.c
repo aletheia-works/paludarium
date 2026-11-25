@@ -2156,9 +2156,9 @@ static void held_pipe(int fd, char *to, const char *src) {
     close(pipes[0]);
 }
 
-/* A process killed as its vmsplice holds a pipe lets go of it: the bytes
-   are there for another's read. */
-static void killed_holder(void) {
+/* A process killed as its vmsplice (`spliced`) or read holds a pipe lets go
+   of it: the bytes are there for another's read. */
+static void killed_holder(int spliced) {
     int pipes[2], blocked[2];
     pipe(pipes);
     pipe(blocked);
@@ -2170,9 +2170,11 @@ static void killed_holder(void) {
         char *page = anon(PAGE);
         reg(fd, page, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
         struct iovec part = {page, 3};
-        struct sys splice = {SYS_vmsplice, {pipes[0], (long)&part, 1, 0, 0, 0}, 0, 0, 0};
+        struct sys call = {SYS_vmsplice, {pipes[0], (long)&part, 1, 0, 0, 0}, 0, 0, 0};
+        if (!spliced)
+            call = (struct sys){SYS_read, {pipes[0], (long)page, 3, 0, 0, 0}, 0, 0, 0};
         pthread_t thread;
-        pthread_create(&thread, NULL, make, &splice);
+        pthread_create(&thread, NULL, make, &call);
         wait_message(fd);
         write(blocked[1], "b", 1);
         for (;;)
@@ -2185,11 +2187,54 @@ static void killed_holder(void) {
     long reaped = waitpid(kid, &status, 0);
     memset(buf, 0, sizeof buf);
     long n = read(pipes[0], buf, 6);
-    printf("killed: %d signal %d left %ld %s\n", reaped == kid, WTERMSIG(status), n, buf);
+    printf("%s killed: %d signal %d left %ld %s\n", spliced ? "vmsplice" : "read", reaped == kid,
+           WTERMSIG(status), n, buf);
     for (int i = 0; i < 2; i++) {
         close(pipes[i]);
         close(blocked[i]);
     }
+}
+
+/* A read copies out and a write copies in with the pipe held: another
+   waits for them. What cannot be copied stays in the pipe. */
+static void held_copies(int fd, char *to, const char *src) {
+    int pipes[2];
+    pipe(pipes);
+    for (int writes = 0; writes < 2; writes++) {
+        char buf[16] = "";
+        write(pipes[1], "stuvwx", 6);
+        struct sys first = {writes ? SYS_write : SYS_read, {pipes[writes], (long)to + writes * PAGE, 3}, 0, 0, 0};
+        struct sys second = {writes ? SYS_write : SYS_read, {pipes[writes], (long)(writes ? "!" : buf), writes ? 1 : 3}, -100, 0, 0};
+        pthread_t threads[2];
+        pthread_create(&threads[0], NULL, make, &first);
+        printf("copy polled: %d\n", wait_message(fd));
+        struct uffd_msg msg;
+        read(fd, &msg, sizeof msg);
+        pthread_create(&threads[1], NULL, make, &second);
+        while (!second.tid)
+            usleep(1000);
+        usleep(100000);
+        printf("%s waits: %d", writes ? "write" : "read", second.ret == -100);
+        copy(fd, to + writes * PAGE, src, PAGE, 0, NULL);
+        pthread_join(threads[0], NULL);
+        pthread_join(threads[1], NULL);
+        printf(" first %ld second %ld %s\n", first.ret, second.ret, writes ? "" : buf);
+    }
+    char buf[4096];
+    printf("left %ld\n", (long)read(pipes[0], buf, sizeof buf));
+    /* A bad buffer past the bytes there is no matter. */
+    write(pipes[1], "yz0123", 6);
+    struct iovec parts[2] = {{buf, 3}, {(char *)8, 64}};
+    printf("readv part: %s", err(readv(pipes[0], parts, 2)));
+    parts[0].iov_len = 6;
+    printf(" whole %ld\n", (long)readv(pipes[0], parts, 2));
+    parts[0].iov_len = 4096;
+    printf("writev part: %ld", (long)writev(pipes[1], parts, 2));
+    parts[0].iov_len = 100;
+    printf(" %s", err(writev(pipes[1], parts, 2)));
+    printf(" left %ld\n", (long)read(pipes[0], buf, sizeof buf));
+    close(pipes[0]);
+    close(pipes[1]);
 }
 
 /* Copies of the kernel's that wait with something held, or on the way back
@@ -2229,7 +2274,9 @@ static int case_held(void) {
     memset(buf, 0, sizeof buf);
     printf(" left %ld %s\n", (long)read(pipes[0], buf, 6), buf);
     held_pipe(fd, base + 20 * PAGE, src);
-    killed_holder();
+    killed_holder(1);
+    killed_holder(0);
+    held_copies(fd, base + 21 * PAGE, src);
     /* A signal's frame. */
     struct sigaction sa = {0};
     sa.sa_handler = on_frame;

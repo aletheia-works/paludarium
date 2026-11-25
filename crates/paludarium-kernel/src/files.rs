@@ -3784,6 +3784,9 @@ fn aio_read(
     if total == 0 {
         return Ok(0);
     }
+    if let Some(result) = pipe_read(c, file, segments, flags & RWF_NOWAIT != 0) {
+        return result;
+    }
     let (b, count) = if aio_positioned(file) {
         let len = request(file, total as u64, offset, true)?;
         writable_prefix(c, segments, len)?;
@@ -3808,6 +3811,10 @@ fn aio_write(
     flags: u32,
 ) -> Result<u64, Errno> {
     let total = segments.iter().map(|&(_, length)| length).sum::<usize>();
+    let (nosignal, nowait) = (flags & RWF_NOSIGNAL != 0, flags & RWF_NOWAIT != 0);
+    if let Some(written) = pipe_write(c, file, segments, total, nosignal, nowait) {
+        return sync_written(file, flags, written?);
+    }
     let mut bytes = Vec::new();
     bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
     for &(base, length) in segments {
@@ -3912,7 +3919,12 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
             flags,
         );
     }
-    let segments = iovecs(c, a[1], a[2], true)?;
+    let pipe = crate::sockets::pipe(&file).is_some();
+    let segments = if pipe {
+        iovecs_checked(c.mem, a[1], a[2], |_, _| Ok(()))?
+    } else {
+        iovecs(c, a[1], a[2], true)?
+    };
     let total = segments.iter().map(|(_, length)| length).sum::<usize>();
     let position = file.seek(0, 1).ok();
     let len = match position {
@@ -3926,6 +3938,9 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     // `vfs_readv` asks only for some bytes.
     if total > 0 {
         access_permission(c, &file)?;
+    }
+    if let Some(result) = pipe_read(c, &file, &segments, flags & RWF_NOWAIT != 0) {
+        return result;
     }
     let mut b = buffer(len)?;
     let count = read_waiting(c, &file, &mut b, flags & RWF_NOWAIT != 0)?;
@@ -3977,6 +3992,25 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     }
     if cannot_read_or_write(&file) {
         return Err(Errno::EINVAL);
+    }
+    if crate::sockets::pipe(&file).is_some() {
+        let segments = iovecs_checked(c.mem, a[1], a[2], |_, _| Ok(()))?;
+        let total = segments.iter().map(|(_, length)| length).sum::<usize>();
+        if total == 0 && flags != 0 {
+            return Ok(0);
+        }
+        let flags = rw_flags(&file, flags, true)?;
+        let nosignal = flags & RWF_NOSIGNAL != 0;
+        let written = pipe_write(
+            c,
+            &file,
+            &segments,
+            total,
+            nosignal,
+            flags & RWF_NOWAIT != 0,
+        )
+        .unwrap_or(Err(Errno::EBADF))?;
+        return sync_written(&file, flags, written);
     }
     let segments = iovecs(c, a[1], a[2], false)?;
     let total = segments.iter().map(|(_, length)| length).sum::<usize>();
@@ -4104,6 +4138,53 @@ pub(crate) fn access_permission(
         file.notify_event(crate::fanotify::ACCESS_PERM);
     });
     answered.map(|_| ())
+}
+/// A read of the pipe `file` to the buffers `segments`, which are copied to
+/// with the pipe held ([`crate::sockets::PipeEnd::read_to`]), so that what
+/// cannot be copied stays in it; `None` for another file.
+fn pipe_read(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    segments: &[(u64, usize)],
+    nowait: bool,
+) -> Option<Result<u64, Errno>> {
+    let pipe = crate::sockets::pipe(file)?;
+    let want = segments.iter().map(|&(_, length)| length).sum();
+    if want == 0 {
+        return Some(Ok(0));
+    }
+    let mem = c.mem;
+    let result = wait_for_read(c, file, nowait, || pipe.read_to(mem, segments, want));
+    // A pipe read signals the writer as it ends, with data or not, unless a
+    // signal interrupts it, as Linux's `pipe_read`.
+    if matches!(result, Ok(_) | Err(Errno::EAGAIN | Errno::EFAULT)) {
+        crate::sockets::pipe_read_ended(file);
+    }
+    Some(result.map(|count| count as u64))
+}
+/// A write to the pipe `file` of the first `total` bytes of the buffers
+/// `segments`, which are copied from with the pipe held
+/// ([`crate::sockets::PipeEnd::write_from`]); `None` for another file.
+fn pipe_write(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    segments: &[(u64, usize)],
+    total: usize,
+    nosignal: bool,
+    dontwait: bool,
+) -> Option<Result<u64, Errno>> {
+    let pipe = crate::sockets::pipe(file)?;
+    if total == 0 {
+        return Some(Ok(0));
+    }
+    let mem = c.mem;
+    let written = write_total(c, file, total, nosignal, dontwait, |done| {
+        pipe.write_from(mem, segments, done, total)
+    });
+    if written.is_ok() {
+        crate::permissions::remove_set_ids(&c.process.credentials, &**file);
+    }
+    Some(written)
 }
 /// A read that waits while a blocking file has nothing to give yet.
 fn read_blocking(
@@ -5302,6 +5383,25 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             {
                 return result;
             }
+            if let Some(d) = &d
+                && crate::sockets::pipe(&d.file).is_some()
+            {
+                let access = d.file.flags() & 3;
+                if access == u32::from(n == 0) {
+                    return Err(Errno::EBADF);
+                }
+                crate::sockets::access_ok_u64(a[1], a[2])?;
+                let segments = [(a[1], len)];
+                if n == 0 {
+                    access_permission(c, &d.file)?;
+                }
+                let done = if n == 0 {
+                    pipe_read(c, &d.file, &segments, false)
+                } else {
+                    pipe_write(c, &d.file, &segments, len, false, false)
+                };
+                return done.unwrap_or(Err(Errno::EBADF));
+            }
             if n == 1 {
                 c.mem
                     .check_read(GuestAddr(a[1]), len)
@@ -6190,6 +6290,20 @@ pub(crate) fn write_with(
     dontwait: bool,
     mut write: impl FnMut(&[u8]) -> Result<usize, Errno>,
 ) -> Result<u64, Errno> {
+    write_total(c, file, bytes.len(), nosignal, dontwait, |done| {
+        write(&bytes[done..])
+    })
+}
+/// [`write_with`] of `total` bytes, whose `write` is told how many are
+/// written so far.
+fn write_total(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    total: usize,
+    nosignal: bool,
+    dontwait: bool,
+    mut write: impl FnMut(usize) -> Result<usize, Errno>,
+) -> Result<u64, Errno> {
     // A socket or pipe write goes on until all is written, as Linux's
     // `unix_stream_sendmsg` and `pipe_write` do.
     let stream = crate::sockets::endpoint(file).is_some()
@@ -6201,7 +6315,7 @@ pub(crate) fn write_with(
     loop {
         let ticket = c.files.readiness.token.value();
         let nonblocking = dontwait || file.flags() & crate::events::NONBLOCK != 0;
-        let result = write(&bytes[done..]);
+        let result = write(done);
         // A pipe write that finds the pipe full signals its reader before it
         // waits, as Linux's `pipe_write`, or as it ends; after a part, which
         // signalled itself, a wait it ends is that part's.
@@ -6212,7 +6326,7 @@ pub(crate) fn write_with(
         match result {
             Ok(count) => {
                 done += count;
-                if count == 0 || done == bytes.len() || nonblocking || !stream {
+                if count == 0 || done == total || nonblocking || !stream {
                     return Ok(done as u64);
                 }
             }

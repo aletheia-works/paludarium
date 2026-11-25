@@ -200,8 +200,12 @@ kernel.
   and the close of one of its ends, wait for it too, whatever signal comes,
   as Linux's `mutex_lock` does; a poll does not. A fill of the page that
   needs the same pipe never comes, as on Linux; a fatal signal ends the
-  copy's wait. A pipe's buffer that `vmsplice`
-  cannot copy whole stays in the pipe.
+  copy's wait. `read`, `readv`, `write`, `writev` and their io_uring and
+  aio requests copy with the pipe held too (`anon_pipe_read`,
+  `anon_pipe_write`), a pipe's buffer at a time: one that a read or a
+  `vmsplice` cannot copy whole stays in the pipe, and one a write cannot
+  copy ends it with those before. Only the bytes there need their part of a
+  read's buffer.
   The host's standard streams, which stand for pipes, can be either end of
   a `splice` (an offset for one is `ESPIPE`), but not of `tee` or
   `vmsplice`, which take only the guest's own pipes.

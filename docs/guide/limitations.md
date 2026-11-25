@@ -1041,10 +1041,6 @@ verified.
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise.
-  A `read` of a pipe takes its bytes out before it copies them to its
-  buffer, and a `write` copies from its buffer before it puts them in, so
-  while either waits for a page the pipe is free, where Linux holds it,
-  and the bytes of a read that a fatal signal ends there are gone.
 - **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
   dnotify is always on, as with Linux's default of 1.
 - **File leases, in part**: the opens `execve` makes of a program, its

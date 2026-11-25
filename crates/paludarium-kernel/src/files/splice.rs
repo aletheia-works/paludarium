@@ -599,23 +599,16 @@ fn from_pipe_to_guest(
         };
         let mut piece = buffer(first)?;
         let count = from.peek(&mut piece);
-        let mut bytes = &piece[..count];
-        let mut skip = done;
-        for &(base, length) in segments {
-            let within = skip.min(length);
-            skip -= within;
-            let (head, rest) = bytes.split_at(bytes.len().min(length - within));
-            if c.mem.write(GuestAddr(base + within as u64), head).is_err() {
+        let mut copied = 0;
+        for (at, n) in crate::sockets::spans(segments, done, count) {
+            if c.mem.write(at, &piece[copied..copied + n]).is_err() {
                 return if done > 0 {
                     Ok(done as u64)
                 } else {
                     Err(Errno::EFAULT)
                 };
             }
-            bytes = rest;
-            if bytes.is_empty() {
-                break;
-            }
+            copied += n;
         }
         consume(file, count)?;
         done += count;

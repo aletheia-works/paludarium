@@ -651,11 +651,147 @@ impl PipeEnd {
         let sides = self.endpoint.lock_sides();
         let bytes = &sides[self.read_side()].bytes;
         let count = buf.len().min(bytes.len());
-        for (d, s) in buf[..count].iter_mut().zip(bytes.iter()) {
-            *d = *s;
-        }
+        let (first, rest) = bytes.as_slices();
+        let first = &first[..first.len().min(count)];
+        buf[..first.len()].copy_from_slice(first);
+        buf[first.len()..count].copy_from_slice(&rest[..count - first.len()]);
         count
     }
+    /// A read of at most `want` bytes, not none, to the buffers `segments`
+    /// of `mem`, as `anon_pipe_read` makes it with the pipe held: buffer by
+    /// buffer of the pipe, up to the end of a packet, and one whose bytes
+    /// cannot all be copied stays, which is `EFAULT` before any other. An
+    /// empty pipe is `EAGAIN`, or 0 with no writer.
+    pub(crate) fn read_to(
+        &self,
+        mem: &paludarium_mmu::AddressSpace,
+        segments: &[(u64, usize)],
+        want: usize,
+    ) -> Result<usize, Errno> {
+        if !self.reader {
+            return Err(Errno::EBADF);
+        }
+        let _held = self.hold();
+        let (lens, dropped) = {
+            let sides = self.endpoint.lock_sides();
+            let own = &sides[self.endpoint.side];
+            let (taken, dropped) = own.pipe_read_plan(want);
+            let mut left = taken;
+            let lens: Vec<usize> = own
+                .pipe_bufs
+                .iter()
+                .map(|buf| {
+                    let n = buf.len.min(left);
+                    left -= n;
+                    n
+                })
+                .take_while(|&n| n != 0)
+                .collect();
+            (lens, dropped)
+        };
+        if lens.is_empty() {
+            return if self.has_writers() {
+                Err(Errno::EAGAIN)
+            } else {
+                Ok(0)
+            };
+        }
+        let mut piece = Vec::new();
+        let total = lens.iter().sum();
+        piece.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
+        piece.resize(total, 0);
+        self.peek(&mut piece);
+        let mut done = 0;
+        for len in lens {
+            let bytes = &piece[done..done + len];
+            let mut copied = 0;
+            for (at, n) in spans(segments, done, len) {
+                if mem.write(at, &bytes[copied..copied + n]).is_err() {
+                    break;
+                }
+                copied += n;
+            }
+            if copied < len {
+                break;
+            }
+            done += len;
+        }
+        if done == 0 {
+            return Err(Errno::EFAULT);
+        }
+        let dropped = if done == total { dropped } else { 0 };
+        self.endpoint.take_read(done + dropped);
+        Ok(done)
+    }
+    /// A write of the buffers `segments` of `mem` from `done` bytes of them
+    /// to `total` on, as `anon_pipe_write` makes it with the pipe held: as
+    /// many of the pipe's buffers as there is room for, each put in once it
+    /// is copied; one that cannot be copied whole ends it, and is `EFAULT`
+    /// before any other. A full pipe is `EAGAIN`, and one no one reads
+    /// `EPIPE`.
+    pub(crate) fn write_from(
+        &self,
+        mem: &paludarium_mmu::AddressSpace,
+        segments: &[(u64, usize)],
+        done: usize,
+        total: usize,
+    ) -> Result<usize, Errno> {
+        let packet = self.direct.load(Ordering::SeqCst);
+        if self.reader && self.writer.is_none() {
+            return Err(Errno::EBADF);
+        }
+        let _held = self.hold();
+        if !self.has_readers() {
+            return Err(Errno(32));
+        }
+        let (merged, new) = self.endpoint.lock_sides()[self.read_side()].pipe_plan(
+            &PipeLayout::Write { packet },
+            total - done,
+            self.endpoint.pair.slots(),
+        );
+        let merged = Some(merged).filter(|&len| len != 0).into_iter();
+        let lens: Vec<usize> = merged.chain(new.iter().map(|buf| buf.len)).collect();
+        if lens.is_empty() {
+            return Err(Errno::EAGAIN);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve(lens.iter().sum())
+            .map_err(|_| Errno::ENOMEM)?;
+        for len in lens {
+            let start = bytes.len();
+            let mut at = start;
+            bytes.resize(start + len, 0);
+            for (from, n) in spans(segments, done + start, len) {
+                if mem.read(from, &mut bytes[at..at + n]).is_err() {
+                    break;
+                }
+                at += n;
+            }
+            if at < start + len {
+                bytes.truncate(start);
+                break;
+            }
+        }
+        if bytes.is_empty() {
+            return Err(Errno::EFAULT);
+        }
+        self.write_laid(&bytes, PipeLayout::Write { packet })
+    }
+}
+/// Where the `len` bytes from `skip` on of the buffers `segments` lie.
+pub(crate) fn spans(
+    segments: &[(u64, usize)],
+    mut skip: usize,
+    mut len: usize,
+) -> impl Iterator<Item = (GuestAddr, usize)> {
+    segments.iter().filter_map(move |&(base, length)| {
+        let within = skip.min(length);
+        skip -= within;
+        let n = len.min(length - within);
+        len -= n;
+        (n != 0).then(|| (GuestAddr(base.wrapping_add(within as u64)), n))
+    })
 }
 impl FileHandle for PipeEnd {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -663,7 +799,8 @@ impl FileHandle for PipeEnd {
     }
     fn read(&self, bytes: &mut [u8]) -> Result<usize, Errno> {
         if self.reader {
-            let _held = self.hold();
+            // A read of nothing does not take the pipe (`anon_pipe_read`).
+            let _held = (!bytes.is_empty()).then(|| self.hold());
             self.endpoint.read(bytes)
         } else {
             Err(Errno::EBADF)
@@ -671,7 +808,7 @@ impl FileHandle for PipeEnd {
     }
     fn write(&self, bytes: &[u8]) -> Result<usize, Errno> {
         let packet = self.direct.load(Ordering::SeqCst);
-        let _held = self.hold();
+        let _held = (!bytes.is_empty()).then(|| self.hold());
         self.write_laid(bytes, PipeLayout::Write { packet })
     }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
@@ -4168,10 +4305,31 @@ impl SocketPairEnd {
     /// no read's packet ends ([`PipeEnd::take`]), and tells the writer.
     fn take_raw(&self, side: usize, count: usize) {
         let mut sides = self.lock_sides();
-        let own = &mut sides[side];
+        Self::drop_front(&mut sides[side], count);
+        sides[1 - side].output_epoch = sides[1 - side].output_epoch.wrapping_add(1);
+        drop(sides);
+        self.pair.hub.changed();
+    }
+    /// Takes the first `count` bytes of this pipe's read end, copied out by
+    /// a read ([`PipeEnd::read_to`]), and tells the writer as one does.
+    fn take_read(&self, count: usize) {
+        let mut sides = self.lock_sides();
+        let own = &mut sides[self.side];
+        let full = own.pipe_bufs.len() >= self.pair.slots();
+        if Self::drop_front(own, count) || full {
+            let peer = &mut sides[1 - self.side];
+            peer.output_epoch = peer.output_epoch.wrapping_add(1);
+        }
+        drop(sides);
+        self.pair.hub.changed();
+    }
+    /// Drops the first `count` bytes of a pipe's `own`; whether some write's
+    /// last byte was among them.
+    fn drop_front(own: &mut Side, count: usize) -> bool {
         let count = count.min(own.bytes.len());
         own.bytes.drain(..count);
         let mut rest = count;
+        let mut ended = false;
         while rest > 0
             && let Some(front) = own.writes.front_mut()
         {
@@ -4180,12 +4338,11 @@ impl SocketPairEnd {
             rest -= n;
             if front.len == 0 {
                 own.writes.pop_front();
+                ended = true;
             }
         }
         own.pipe_take(count);
-        sides[1 - side].output_epoch = sides[1 - side].output_epoch.wrapping_add(1);
-        drop(sides);
-        self.pair.hub.changed();
+        ended
     }
 }
 impl Drop for SocketPairEnd {

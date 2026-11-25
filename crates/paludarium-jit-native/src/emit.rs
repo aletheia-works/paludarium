@@ -16,7 +16,9 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use paludarium_cpu::compile::{Address, Alu, Count, Fast, Form, REP_CHUNK, Shift, Source, Unary};
+use paludarium_cpu::compile::{
+    Address, Alu, Bit, Count, Fast, Form, REP_CHUNK, Shift, Source, Unary,
+};
 use paludarium_cpu::{CpuState, flag};
 use paludarium_decoder::{Condition, Mnemonic, Register, Segment};
 use paludarium_mmu::{
@@ -1918,7 +1920,7 @@ impl Emitter<'_, '_> {
                 self.set_status(f);
             }
             Fast::Count { op, dst, src } => self.count(op, dst, src),
-            Fast::BitTest { dst, bit } => {
+            Fast::BitTest { op, dst, bit } => {
                 let size = dst.size();
                 let n = self.source(bit, size);
                 let n = self
@@ -1927,6 +1929,16 @@ impl Emitter<'_, '_> {
                     .band_imm_s(n, i64::from(u32::from(size) * 8 - 1));
                 let v = self.read(dst);
                 let down = self.b.ins().ushr(v, n);
+                if op != Bit::Keep {
+                    let one = self.b.ins().iconst(I64, 1);
+                    let mask = self.b.ins().ishl(one, n);
+                    let r = match op {
+                        Bit::Reset => self.b.ins().band_not(v, mask),
+                        Bit::Complement => self.b.ins().bxor(v, mask),
+                        Bit::Keep | Bit::Set => self.b.ins().bor(v, mask),
+                    };
+                    self.write(dst, r);
+                }
                 // CF is bit 0.
                 let cf = self.b.ins().band_imm_s(down, 1);
                 self.set_flags(flag::CF, cf);

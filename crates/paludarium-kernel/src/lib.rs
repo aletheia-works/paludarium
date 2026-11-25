@@ -1448,7 +1448,6 @@ impl Kernel {
         let copies = match &self.copies {
             Some(copies)
                 if copies.serves(
-                    mem,
                     &self.group,
                     &self.files.readiness,
                     &self.inbox,
@@ -1460,7 +1459,6 @@ impl Kernel {
             }
             _ => {
                 let copies = Arc::new(userfaultfd::KernelCopies {
-                    mem: mem.view(),
                     group: Arc::clone(&self.group),
                     tid: thread.tid,
                     hub: Arc::clone(&self.files.readiness),

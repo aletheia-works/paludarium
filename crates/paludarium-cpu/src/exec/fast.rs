@@ -65,6 +65,31 @@ impl Alu {
     }
 }
 
+/// What a [`Fast::BitTest`] does to the bit it tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Bit {
+    /// `bt`: nothing.
+    Keep,
+    /// `bts`.
+    Set,
+    /// `btr`.
+    Reset,
+    /// `btc`.
+    Complement,
+}
+
+impl Bit {
+    fn of(m: Mnemonic) -> Option<Self> {
+        Some(match m {
+            Mnemonic::Bt => Self::Keep,
+            Mnemonic::Bts => Self::Set,
+            Mnemonic::Btr => Self::Reset,
+            Mnemonic::Btc => Self::Complement,
+            _ => return None,
+        })
+    }
+}
+
 /// An operation of [`Fast`] on one operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Unary {
@@ -526,9 +551,10 @@ pub enum Fast {
         dst: Register,
         src: Register,
     },
-    /// `bt` of a register by a register of its size or by an immediate,
-    /// which is masked as the instruction masks it.
+    /// `bt`, `bts`, `btr` or `btc` of a register by a register of its size
+    /// or by an immediate, which is masked as the instruction masks it.
     BitTest {
+        op: Bit,
         dst: Register,
         bit: Source,
     },
@@ -963,7 +989,7 @@ impl Fast {
                     src,
                 }
             }
-            Mnemonic::Bt => {
+            m if Bit::of(m).is_some() => {
                 let dst = gpr(a)?;
                 if dst.size() == 1 {
                     return None;
@@ -980,7 +1006,11 @@ impl Fast {
                         _ => return None,
                     },
                 };
-                Self::BitTest { dst, bit }
+                Self::BitTest {
+                    op: Bit::of(m)?,
+                    dst,
+                    bit,
+                }
             }
             Mnemonic::Bswap if b.is_none() => match gpr(a)? {
                 dst @ Register::Gpr { size: 4 | 8, .. } => Self::Bswap(dst),
@@ -1431,8 +1461,8 @@ pub(crate) fn execute(
             count(&mut x, op, dst, src);
             next
         }
-        Fast::BitTest { dst, bit } => {
-            bit_test(&mut x, dst, bit);
+        Fast::BitTest { op, dst, bit } => {
+            bit_test(&mut x, op, dst, bit);
             next
         }
         Fast::Bswap(dst) => {
@@ -1488,11 +1518,17 @@ fn count(x: &mut Exec<'_>, op: Count, dst: Register, src: Register) {
 
 /// [`Fast::BitTest`], as [`Exec::bit`] has it.
 #[inline(never)]
-fn bit_test(x: &mut Exec<'_>, dst: Register, bit: Source) {
+fn bit_test(x: &mut Exec<'_>, op: Bit, dst: Register, bit: Source) {
     let size = dst.size();
     let n = x.source(bit, size) % u64::from(alu::bits(size));
-    let set = x.read_reg(dst) >> n & 1 != 0;
-    x.set_status(flag::CF, if set { flag::CF } else { 0 });
+    let (old, mask) = (x.read_reg(dst), 1u64 << n);
+    match op {
+        Bit::Keep => {}
+        Bit::Set => x.write_reg(dst, old | mask),
+        Bit::Reset => x.write_reg(dst, old & !mask),
+        Bit::Complement => x.write_reg(dst, old ^ mask),
+    }
+    x.set_status(flag::CF, if old & mask != 0 { flag::CF } else { 0 });
 }
 
 /// [`Fast::Bswap`].

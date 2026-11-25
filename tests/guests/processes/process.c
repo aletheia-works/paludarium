@@ -18611,6 +18611,279 @@ static int vdso_mappings_case(void) {
     return 0;
 }
 
+/* The vsyscall-entries case: the gate area [vsyscall] (execute only, as
+   CONFIG_LEGACY_VSYSCALL_XONLY makes it) is the last line of maps and smaps,
+   and running one of its three entries is emulate_vsyscall's call: the
+   result in rax, no other register changed, at the caller. Anywhere else in
+   it, a stack that cannot be read or a pointer the call cannot write is
+   SIGSEGV from the kernel; a pointer past user space, or a read of the page,
+   SIGSEGV with its address. Seccomp sees the call with the entry's address,
+   and no system call's stop is made. */
+#define VSC_PAGE 0xffffffffff600000UL
+struct vsc_insn {
+    unsigned short code;
+    unsigned char jt, jf;
+    unsigned k;
+};
+static sigjmp_buf vsc_jump;
+static char vsc_stack[65536];
+
+static void vsc_on_signal(int signal, siginfo_t *info, void *context) {
+    greg_t *regs = ((ucontext_t *)context)->uc_mcontext.gregs;
+    unsigned long rip = (unsigned long)regs[REG_RIP];
+    if (signal == SIGSYS) {
+        printf("  SIGSYS code=%d at=%#lx call=%d rax=%lld left=%d\n", info->si_code,
+               (unsigned long)info->si_call_addr - VSC_PAGE, info->si_syscall, (long long)regs[REG_RAX],
+               rip < VSC_PAGE);
+        return;
+    }
+    printf("  SIGSEGV code=%d addr=%#lx", info->si_code, (unsigned long)info->si_addr);
+    if (info->si_code != 128)
+        printf(" trap=%lld err=%lld cr2=%#llx", (long long)regs[REG_TRAPNO], (long long)regs[REG_ERR],
+               (unsigned long long)regs[REG_CR2]);
+    if (rip >= VSC_PAGE) printf(" rip=%#lx rax=%lld", rip - VSC_PAGE, (long long)regs[REG_RAX]);
+    printf("\n");
+    siglongjmp(vsc_jump, 1);
+}
+
+static long vsc_call(unsigned long entry, unsigned long a, unsigned long b) {
+    return ((long (*)(unsigned long, unsigned long, unsigned long))(VSC_PAGE + entry))(a, b, 0x1234);
+}
+
+static void vsc_bad(const char *what, unsigned long entry, unsigned long a, unsigned long b) {
+    printf("%s\n", what);
+    if (!sigsetjmp(vsc_jump, 1)) printf("  r=%ld\n", vsc_call(entry, a, b));
+}
+
+/* What `op` does in a child, with a filter that gives `action` for `nr`. */
+static int vsc_filtered(const char *what, unsigned action, unsigned nr, unsigned long entry, unsigned long a) {
+    printf("%s\n", what);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        struct vsc_insn code[] = {{0x20, 0, 0, 0}, {0x15, 0, 3, nr}, {0x20, 0, 0, 8},
+                                  {0x15, 0, 1, (unsigned)(VSC_PAGE + entry)}, {0x06, 0, 0, action}, {0x06, 0, 0, 0x7fff0000}};
+        struct {
+            unsigned short len;
+            struct vsc_insn *filter;
+        } program = {sizeof code / sizeof *code, code};
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if (syscall(SYS_seccomp, 1, 0, &program)) _exit(91);
+        if (!sigsetjmp(vsc_jump, 1)) printf("  r=%ld\n", vsc_call(entry, a, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("  child exited=%d signal=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return 0;
+}
+
+/* The same filter's SECCOMP_RET_TRACE with a tracer: what the event shows,
+   and what a tracer's change (`op`) comes to. */
+static int vsc_traced(const char *what, int op) {
+    printf("%s\n", what);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 1;
+    if (kid == 0) {
+        struct vsc_insn code[] = {{0x20, 0, 0, 0}, {0x15, 0, 1, SYS_time}, {0x06, 0, 0, 0x7ff00007}, {0x06, 0, 0, 0x7fff0000}};
+        struct {
+            unsigned short len;
+            struct vsc_insn *filter;
+        } program = {sizeof code / sizeof *code, code};
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if (syscall(SYS_seccomp, 1, 0, &program)) _exit(91);
+        syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
+        raise(SIGSTOP);
+        long r = vsc_call(0x400, 0, 0);
+        _exit(r == -38 ? 2 : r == 7777 ? 3 : r > 1000000 ? 4 : 5);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    syscall(SYS_ptrace, 0x4200 /* PTRACE_SETOPTIONS */, kid, 0, 0x80 /* TRACESECCOMP */);
+    syscall(SYS_ptrace, 7 /* PTRACE_CONT */, kid, 0, 0);
+    waitpid(kid, &status, 0);
+    if (WIFSTOPPED(status)) {
+        unsigned long regs[27] = {0}, message = 0;
+        syscall(SYS_ptrace, 12 /* PTRACE_GETREGS */, kid, 0, regs);
+        syscall(SYS_ptrace, 0x4201 /* PTRACE_GETEVENTMSG */, kid, 0, &message);
+        printf("  stop=%#x message=%lu orig_rax=%ld rax=%ld rip=%#lx\n", status >> 8, message, (long)regs[15],
+               (long)regs[10], regs[16] - VSC_PAGE);
+        if (op == 1) regs[15] = SYS_getcpu;
+        if (op == 2) regs[15] = (unsigned long)-1, regs[10] = 7777;
+        if (op == 3) regs[16] += 1;
+        if (op) syscall(SYS_ptrace, 13 /* PTRACE_SETREGS */, kid, 0, regs);
+        syscall(SYS_ptrace, 7, kid, 0, 0);
+        waitpid(kid, &status, 0);
+    }
+    if (WIFSTOPPED(status)) {
+        printf("  stopped again=%#x\n", status >> 8);
+        kill(kid, SIGKILL);
+        waitpid(kid, &status, 0);
+    }
+    printf("  exited=%d signal=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return 0;
+}
+
+static int vsyscall_entries_case(void) {
+    /* maps and smaps. */
+    static char text[1 << 18];
+    if (proc_read("/proc/self/maps", text, sizeof text) <= 0) return 1;
+    char *line = strstr(text, "ffffffffff600000");
+    printf("maps: %s", line ? line : "none\n");
+    if (proc_read("/proc/self/smaps", text, sizeof text) <= 0) return 1;
+    line = strstr(text, "ffffffffff600000");
+    for (char *at = line ? line : text + strlen(text); *at;) {
+        size_t length = strcspn(at, "\n");
+        /* The protection keys' line is the CPU's. */
+        if (strncmp(at, "ProtectionKey:", 14)) printf("smaps: %.*s\n", (int)length, at);
+        at += length + (at[length] == '\n');
+    }
+
+    /* The entries, on one CPU. */
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(sched_getcpu(), &one);
+    sched_setaffinity(0, sizeof one, &one);
+    struct timeval tv = {0}, now = {0};
+    struct timezone zone = {-1, -1};
+    long r = vsc_call(0, (unsigned long)&tv, (unsigned long)&zone);
+    syscall(SYS_gettimeofday, &now, NULL);
+    printf("gettimeofday r=%ld near=%d zone=%d,%d\n", r, now.tv_sec - tv.tv_sec >= 0 && now.tv_sec - tv.tv_sec <= 2,
+           zone.tz_minuteswest, zone.tz_dsttime);
+    printf("gettimeofday nulls r=%ld\n", vsc_call(0, 0, 0));
+    long seconds = 0;
+    r = vsc_call(0x400, (unsigned long)&seconds, 0);
+    printf("time r=stored %d near=%d\n", r == seconds, labs(r - (long)syscall(SYS_time, NULL)) <= 2);
+    unsigned cpu = 99, node = 99, raw_cpu = 98, raw_node = 98;
+    r = vsc_call(0x800, (unsigned long)&cpu, (unsigned long)&node);
+    syscall(SYS_getcpu, &raw_cpu, &raw_node, NULL);
+    printf("getcpu r=%ld same=%d\n", r, cpu == raw_cpu && node == raw_node);
+    /* Every other register keeps its value, rcx and r11 too. */
+    unsigned long rax = 0, rcx = 0x11, rdx = 0x22, r8, r9, r10, r11, rdi = 0, rsi = 0;
+    asm volatile("mov $0x44, %%r8\n mov $0x55, %%r9\n mov $0x66, %%r10\n mov $0x33, %%r11\n"
+                 "call *%%rax\n"
+                 "mov %%r8, %[r8]\n mov %%r9, %[r9]\n mov %%r10, %[r10]\n mov %%r11, %[r11]\n"
+                 : "=a"(rax), "+c"(rcx), "+d"(rdx), "+D"(rdi), "+S"(rsi), [r8] "=m"(r8), [r9] "=m"(r9), [r10] "=m"(r10),
+                   [r11] "=m"(r11)
+                 : "0"(VSC_PAGE + 0x800)
+                 : "r8", "r9", "r10", "r11", "cc", "memory");
+    printf("registers rax=%lu rcx=%#lx rdx=%#lx rdi=%lu rsi=%lu r8=%#lx r9=%#lx r10=%#lx r11=%#lx\n", rax, rcx, rdx, rdi,
+           rsi, r8, r9, r10, r11);
+
+    /* What is SIGSEGV. */
+    struct sigaction action = {.sa_sigaction = vsc_on_signal, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER};
+    stack_t alternate = {.ss_sp = vsc_stack, .ss_size = sizeof vsc_stack};
+    sigaltstack(&alternate, NULL);
+    sigaction(SIGSEGV, &action, NULL);
+    sigaction(SIGSYS, &action, NULL);
+    static const unsigned long nowhere[] = {1, 0x10, 0x401, 0x7ff, 0xc00, 0xfff};
+    for (size_t i = 0; i < sizeof nowhere / sizeof *nowhere; i++) {
+        char what[32];
+        snprintf(what, sizeof what, "entry +%#lx", nowhere[i]);
+        vsc_bad(what, nowhere[i], 0, 0);
+    }
+    static const long before[2] __attribute__((aligned(4096))) = {1, 2};
+    vsc_bad("time, unmapped", 0x400, 8, 0);
+    vsc_bad("time, read-only", 0x400, (unsigned long)before, 0);
+    vsc_bad("time, past user space", 0x400, -4096UL, 0);
+    vsc_bad("time, the page", 0x400, VSC_PAGE, 0);
+    vsc_bad("gettimeofday, unmapped zone", 0, 0, 8);
+    vsc_bad("gettimeofday, zone past user space", 0, 8, -4096UL);
+    vsc_bad("getcpu, past user space", 0x800, -8UL, 0);
+    printf("no stack\n");
+    if (!sigsetjmp(vsc_jump, 1))
+        asm volatile("mov $8, %%rsp\n jmp *%0\n" : : "a"(VSC_PAGE + 0x400), "D"(0L) : "memory");
+    printf("read\n");
+    if (!sigsetjmp(vsc_jump, 1)) printf("  r=%d\n", *(volatile char *)(VSC_PAGE + 0x400));
+    printf("write\n");
+    if (!sigsetjmp(vsc_jump, 1)) *(volatile char *)(VSC_PAGE + 0x400) = 1;
+
+    /* Seccomp. */
+    if (vsc_filtered("seccomp errno", 0x00050000 | 13, SYS_time, 0x400, 0) ||
+        vsc_filtered("seccomp errno, EFAULT", 0x00050000 | 14, SYS_time, 0x400, 0) ||
+        vsc_filtered("seccomp trap", 0x00030000 | 5, SYS_getcpu, 0x800, 0) ||
+        vsc_filtered("seccomp trace, no tracer", 0x7ff00000, SYS_time, 0x400, 0) ||
+        vsc_filtered("seccomp log", 0x7ffc0000, SYS_getcpu, 0x800, 0) ||
+        vsc_filtered("seccomp kill", 0x80000000, SYS_getcpu, 0x800, 0) ||
+        vsc_filtered("seccomp errno, past user space", 0x00050000 | 13, SYS_time, 0x400, -4096UL))
+        return 2;
+    printf("seccomp strict\n");
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        prctl(PR_SET_SECCOMP, 1);
+        vsc_call(0x400, 0, 0);
+        syscall(SYS_exit, 0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("  signal=%d\n", WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+
+    /* Tracers. */
+    if (vsc_traced("trace", 0) || vsc_traced("trace, another call", 1) || vsc_traced("trace, no call", 2) ||
+        vsc_traced("trace, moved", 3))
+        return 3;
+    printf("system call stops:");
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        syscall(SYS_ptrace, 0, 0, 0, 0);
+        raise(SIGSTOP);
+        syscall(SYS_getppid);
+        vsc_call(0x400, 0, 0);
+        vsc_call(0x800, 0, 0);
+        syscall(SYS_exit_group, 0);
+    }
+    waitpid(kid, &status, 0);
+    for (;;) {
+        syscall(SYS_ptrace, 24 /* PTRACE_SYSCALL */, kid, 0, 0);
+        waitpid(kid, &status, 0);
+        if (!WIFSTOPPED(status)) break;
+        unsigned long regs[27] = {0};
+        syscall(SYS_ptrace, 12, kid, 0, regs);
+        if (WSTOPSIG(status) == SIGTRAP && (regs[15] == SYS_getppid || regs[15] == SYS_exit_group || regs[15] == SYS_time || regs[15] == SYS_getcpu))
+            printf(" %ld", (long)regs[15]);
+    }
+    printf("\n");
+
+    /* From outside. */
+    char byte;
+    struct iovec local = {&byte, 1}, remote = {(void *)VSC_PAGE, 1};
+    r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    printf("process_vm_readv=%ld errno=%d\n", r, r < 0 ? errno : 0);
+    int mem = open("/proc/self/mem", O_RDWR);
+    off_t at = lseek(mem, (off_t)VSC_PAGE, SEEK_SET);
+    r = read(mem, &byte, 1);
+    printf("mem seek=%d read=%ld errno=%d\n", at == (off_t)VSC_PAGE, r, r < 0 ? errno : 0);
+    kid = fork();
+    if (kid == 0) {
+        syscall(SYS_ptrace, 0, 0, 0, 0);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    waitpid(kid, &status, 0);
+    long word = 0;
+    r = syscall(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, kid, VSC_PAGE, &word);
+    printf("PTRACE_PEEKDATA r=%ld errno=%d\n", r, r < 0 ? errno : 0);
+    kill(kid, SIGKILL);
+    waitpid(kid, &status, 0);
+    printf("fork: ");
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        printf("getcpu r=%ld\n", vsc_call(0x800, (unsigned long)&cpu, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, &status, 0);
+    return 0;
+}
+
 /* The smaps-rollup case: /proc/self/smaps_rollup, as Linux's
    show_smaps_rollup makes it, is one line from the first VMA's start to the
    last one's end ([vsyscall], a gate area, is none), with no flags, file or
@@ -37818,6 +38091,12 @@ int main(int argc, char **argv) {
         printf("program: file=%d\n", name && start == text_start && pgoff == text_pgoff &&
                                           same_path(name, (const char *)getauxval(AT_EXECFN)));
         printf("xstate: as-cpu=%d\n", osxsave ? xstate == 1 && xstate_whole : !xstate);
+        /* The gate area, the last segment: whole, of zeros. */
+        uint64_t gate = le(32, 8) + 56 * (le(56, 2) - 1);
+        printf("gate: at=%#llx flags=%llu filesz=%llu memsz=%llu in-file=%d word=%llu\n",
+               (unsigned long long)le(gate + 16, 8), (unsigned long long)le(gate + 4, 4),
+               (unsigned long long)le(gate + 32, 8), (unsigned long long)le(gate + 40, 8),
+               le(gate + 8, 8) + le(gate + 32, 8) <= core_size, (unsigned long long)le(le(gate + 8, 8), 8));
 #undef CORE_HOLDS
         free(b);
         unlink("core");
@@ -40083,6 +40362,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "gone-leader-files")) return gone_leader_files_case();
     if (!strcmp(mode, "smaps-rollup")) return smaps_rollup_case();
     if (!strcmp(mode, "vdso-mappings")) return vdso_mappings_case();
+    if (!strcmp(mode, "vsyscall-entries")) return vsyscall_entries_case();
     if (!strcmp(mode, "thread-caps-status")) return thread_caps_status_case();
     if (!strcmp(mode, "zombie-ns-links")) return zombie_ns_links_case();
     if (!strcmp(mode, "userns-nondumpable-read")) return userns_nondumpable_read_case(self);

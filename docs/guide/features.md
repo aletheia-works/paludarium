@@ -3714,6 +3714,21 @@ kernel.
   three, a `fork` keeps them where they are, and a core holds them whole,
   as Linux's `always_dump_vma` dumps a special mapping.
 
+- The `vsyscall` page is Linux's default (`CONFIG_LEGACY_VSYSCALL_XONLY`):
+  a gate area at `ffffffffff600000`, no mapping of the process, which is the
+  last line of `maps` and `smaps` (`--xp`, `VmFlags: ex`) and the last
+  segment of a core (zeros), and which `statm`, `VmSize` and `smaps_rollup`
+  leave out. It can be run but not read (`SIGSEGV`, `SEGV_MAPERR`). Its
+  entries `+0x000` (`gettimeofday`), `+0x400` (`time`) and `+0x800`
+  (`getcpu`) do what `emulate_vsyscall` does: seccomp sees the call with the
+  entry's address, and a tracer its `PTRACE_EVENT_SECCOMP`, but no system
+  call's stop is made; then the result is in `rax` and the thread at its
+  caller, with no other register changed. Any other address there, a stack
+  that cannot be read and a pointer the call cannot write are `SIGSEGV` from
+  the kernel (`SI_KERNEL`); a pointer past user space is `SEGV_MAPERR` at
+  it. Reads from outside give `EFAULT` (`process_vm_readv`) and `EIO`
+  (`/proc/<pid>/mem`, `PTRACE_PEEKDATA`).
+
 - Files are checked as Linux checks them (`generic_permission`): the
   owner's permission bits apply to the owner, the group's to a member of the
   file's group (by the filesystem group ID or a supplementary group) and

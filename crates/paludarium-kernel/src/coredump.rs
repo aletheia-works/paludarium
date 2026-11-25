@@ -5,7 +5,7 @@
 //! has one `PT_NOTE` segment (each thread's registers, the process, the
 //! fatal signal, the auxiliary vector and the mapped files) and one
 //! `PT_LOAD` segment per VMA, whose contents follow the default
-//! `coredump_filter`. It has no `NT_X86_XSTATE` note, as Linux writes none
+//! `coredump_filter`, and the `vsyscall` page's, which holds zeros. It has no `NT_X86_XSTATE` note, as Linux writes none
 //! on a CPU without XSAVE, which the virtual CPU is. A core
 //! larger than the limit is cut there; it still counts as dumped, as Linux's
 //! binfmt_elf reports a core once it has started to write it.
@@ -112,7 +112,7 @@ pub(crate) fn write(
     }
     let vmas: Vec<Mapping> = segments.iter().map(|&(vma, _)| vma).collect();
     let notes = notes(dump, who, mem, &files(mem, &vmas));
-    let count = segments.len() + 1;
+    let count = segments.len() + 2;
     let notes_offset = 64 + 56 * count as u64;
     let notes_size: u64 = notes.iter().map(|n| n.len() as u64).sum();
     // The memory starts at the next page, as Linux aligns it.
@@ -151,6 +151,12 @@ pub(crate) fn write(
         }
         offset += length;
     }
+    // The gate area, last and whole (`always_dump_vma`); with no page behind
+    // it, its part of the file is a hole.
+    let gate = program_header(1, 1, offset, crate::vsyscall::START, PAGE, PAGE, PAGE);
+    if !put(&gate) {
+        return false;
+    }
     for note in &notes {
         if !put(note) {
             return false;
@@ -176,7 +182,8 @@ pub(crate) fn write(
             at += size as u64;
         }
     }
-    true
+    page.fill(0);
+    put(&page)
 }
 
 /// How much of a mapping the core holds, by the default `coredump_filter`

@@ -42,9 +42,8 @@ verified.
   makes no access, and a real CPU may fault (an AMD EPYC does, and exits with
   `SIGSEGV`). A fault on a later byte also leaves the earlier ones written, which
   has not been compared with a real CPU.
-- **`/proc/self/maps`, in part**: the emulator has no `vsyscall` page, so the
-  `[vsyscall]` line is not there. The stack's
-  VMA has its full size from the start, where Linux's grows as it is used.
+- **`/proc/self/maps`, in part**: the stack's VMA has its full size from the
+  start, where Linux's grows as it is used.
   A rename that a process under `chroot` makes does not move the names
   of the files it moves in the maps, a core's `NT_FILE` note and
   `/proc/<pid>/exe`, where Linux's `d_move` moves them whatever the root.

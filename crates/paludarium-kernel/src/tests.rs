@@ -10610,6 +10610,93 @@ fn seccomp_listener_answers_a_waiting_call() {
     assert_eq!(f.ret(3, &[fd]), 0);
     assert_eq!(f.ret(39, &[]), errno(Errno::ENOSYS));
 }
+/// The thread runs the `vsyscall` page at `entry` with `args`, called from
+/// 0x1234; what it does next.
+fn vsyscall(f: &mut Fixture, entry: u64, args: [u64; 2]) -> Next {
+    let stack = DATA + 0x800;
+    f.mem.write_u64(GuestAddr(stack), 0x1234).unwrap();
+    f.thread.cpu.gpr[reg::RSP] = stack;
+    f.thread.cpu.gpr[reg::RDI] = args[0];
+    f.thread.cpu.gpr[reg::RSI] = args[1];
+    f.thread.cpu.gpr[reg::RDX] = 0x77;
+    let rip = GuestAddr(crate::vsyscall::START + entry);
+    let reason = ExitReason::PageFault {
+        rip,
+        addr: rip,
+        write: false,
+        fetch: true,
+        mapped: false,
+        present: false,
+    };
+    f.kernel.handle(&mut f.thread, &f.mem, reason)
+}
+#[test]
+fn vsyscall_entries_make_their_call_and_return() {
+    let mut f = fixture();
+    for (entry, args) in [
+        (0, [DATA, DATA + 0x20]),
+        (0x400, [DATA, 0]),
+        (0x800, [DATA, DATA + 4]),
+    ] {
+        assert_eq!(vsyscall(&mut f, entry, args), Next::Resume);
+        assert_eq!(f.thread.cpu.rip, GuestAddr(0x1234));
+        assert_eq!(f.thread.cpu.gpr[reg::RSP], DATA + 0x808);
+        assert_eq!(f.thread.cpu.gpr[reg::RDX], 0x77);
+        if entry == 0x400 {
+            let time = f.mem.read_u64(GuestAddr(DATA)).unwrap();
+            assert_eq!(f.thread.cpu.gpr[reg::RAX], time);
+        } else {
+            assert_eq!(f.thread.cpu.gpr[reg::RAX], 0);
+        }
+    }
+    let segv = Next::Exit(ExitStatus::Signaled(signal::SIGSEGV));
+    // No entry, a pointer that cannot be written, and one past user space.
+    for (entry, at) in [(0x10, 0), (0xc00, 0), (0x400, 8), (0x400, u64::MAX - 8)] {
+        let mut f = fixture();
+        assert_eq!(vsyscall(&mut f, entry, [at, 0]), segv);
+    }
+}
+#[test]
+fn vsyscall_calls_go_through_seccomp() {
+    // time is ERRNO(EACCES), getcpu TRAP, gettimeofday the listener's.
+    let mut f = fixture();
+    seccomp_program(
+        &f,
+        &[
+            (0x20, 0, 0, 0),
+            (0x15, 0, 1, 201),
+            (0x06, 0, 0, 0x0005_000d),
+            (0x15, 0, 1, 309),
+            (0x06, 0, 0, 0x0003_0005),
+            (0x15, 0, 1, 96),
+            (0x06, 0, 0, 0x7fc0_0000),
+            (0x06, 0, 0, 0x7fff_0000),
+        ],
+    );
+    let fd = f.ret(317, &[1, 8, DATA]);
+    assert!((3..1024).contains(&fd), "{fd}");
+    assert_eq!(vsyscall(&mut f, 0x400, [0, 0]), Next::Resume);
+    assert_eq!(f.thread.cpu.gpr[reg::RAX], errno(Errno::EACCES));
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x1234));
+    let file = f.kernel.files.descriptor(fd).unwrap().file;
+    let helper = std::thread::spawn(move || {
+        for _ in 0..10_000 {
+            if crate::seccomp::answer_oldest(&file, 77) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    });
+    assert_eq!(vsyscall(&mut f, 0, [0, 0]), Next::Resume);
+    assert!(helper.join().unwrap());
+    assert_eq!(f.thread.cpu.gpr[reg::RAX], 77);
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x1234));
+    assert_eq!(
+        vsyscall(&mut f, 0x800, [0, 0]),
+        Next::Exit(ExitStatus::Signaled(31))
+    );
+}
 #[test]
 fn seccomp_strict_mode_allows_four_calls_and_kills_for_the_rest() {
     let mut f = fixture();

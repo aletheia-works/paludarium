@@ -1109,6 +1109,7 @@ mod linux {
         processes_gone_leader_files => ("gone-leader-files","process"),
         processes_smaps_rollup => ("smaps-rollup","process"),
         processes_vdso_mappings => ("vdso-mappings","process"),
+        processes_vsyscall_entries => ("vsyscall-entries","process"),
         processes_thread_caps_status => ("thread-caps-status","process"),
         processes_zombie_ns_links => ("zombie-ns-links","process"),
         processes_userns_nondumpable_read => ("userns-nondumpable-read","process"),

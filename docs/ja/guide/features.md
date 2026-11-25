@@ -3204,6 +3204,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じ場所に残り、Linux の `always_dump_vma` が特別なマッピングをそうするように、
   コアには全体が入ります。
 
+- `vsyscall` のページは Linux の既定（`CONFIG_LEGACY_VSYSCALL_XONLY`）どおりです。
+  `ffffffffff600000` にあるゲート領域で、プロセスのマッピングではなく、`maps` と `smaps`
+  の最後の行（`--xp`、`VmFlags: ex`）とコアの最後のセグメント（中身は 0）になり、`statm`、
+  `VmSize`、`smaps_rollup` には入りません。実行はできますが読めません（`SIGSEGV`、
+  `SEGV_MAPERR`）。入口の `+0x000`（`gettimeofday`）、`+0x400`（`time`）、`+0x800`
+  （`getcpu`）は `emulate_vsyscall` と同じ動きをします。seccomp には入口のアドレスで
+  その呼び出しが見え、トレーサーには `PTRACE_EVENT_SECCOMP` が届きますが、システム
+  コールでの停止はありません。そのあと結果が `rax` に入り、スレッドは呼び出し元へ戻り、
+  ほかのレジスターは変わりません。ページのほかのアドレス、読めないスタック、呼び出しが
+  書けないポインターはカーネルからの `SIGSEGV`（`SI_KERNEL`）で、ユーザー空間の外の
+  ポインターはそのアドレスの `SEGV_MAPERR` です。外から読むと `EFAULT`
+  （`process_vm_readv`）か `EIO`（`/proc/<pid>/mem`、`PTRACE_PEEKDATA`）です。
+
 - ファイルは Linux と同じように確かめます（`generic_permission`）。持ち主には
   持ち主のビット、ファイルのグループに属する者（ファイルシステム用のグループ ID か
   補助グループで）にはグループのビット、それ以外にはその他のビットが当てはまります。

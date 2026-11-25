@@ -4012,8 +4012,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `mremap` が動かしたページ、`UFFDIO_COPY`、`UFFDIO_CONTINUE`、`UFFDIO_MOVE` がマップした
   ページもビットを得ます。`fork` の子は各ページのビットを引き継ぎます。5
   （`CLEAR_REFS_MM_HIWATER_RSS`）は、`reset_mm_hiwater_rss` と同じく、常駐するメモリの
-  最大値（`status` の `VmHWM`）をいま常駐するメモリにします。1 から 3 は受け付けますが、
-  見えるものは変わりません（制限事項を参照）。読み出しの操作はなく
+  最大値（`status` の `VmHWM`）をいま常駐するメモリにします。1 はすべてのページを、
+  2 はファイルのない VMA のページを、3 はファイルのある VMA（共有メモリも）のページを
+  未参照にします。`smaps` と `smaps_rollup` の `Referenced` は、次のアクセス（命令の
+  フェッチも）までそのページを数えません。`fork` の子は、受け取ったページをどれもまだ参照して
+  いません（`pte_mkold`）。読み出しの操作はなく
   （`EINVAL`。書くためだけに開いたディスクリプタでは `EBADF`）、`lseek` は 0 のままです。
 
 - `/proc/self/fd`（モード 0500。大きさは Linux の `proc_fd_getattr` と同じく開いている

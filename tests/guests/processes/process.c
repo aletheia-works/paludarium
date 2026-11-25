@@ -8607,10 +8607,89 @@ static int cr_vma_soft_dirty(void *at) {
     return -1;
 }
 
+/* The Referenced of the VMA that starts at `at`, in kB, from smaps, or -1. */
+static long cr_referenced(const void *at) {
+    static char text[1 << 17];
+    int fd = open("/proc/self/smaps", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t length = 0;
+    ssize_t n;
+    while (length < sizeof text - 1 && (n = read(fd, text + length, sizeof text - 1 - length)) > 0)
+        length += (size_t)n;
+    close(fd);
+    text[length] = 0;
+    char head[32];
+    snprintf(head, sizeof head, "\n%lx-", (unsigned long)(uintptr_t)at);
+    char *block = strstr(text, head);
+    char *line = block ? strstr(block, "\nReferenced:") : NULL;
+    return line ? strtol(line + 12, NULL, 10) : -1;
+}
+/* Memory of `pages` pages with a hole on each side, each page written. */
+static char *cr_area(size_t pages, int flags) {
+    char *hole = mmap(NULL, (pages + 2) * 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (hole == MAP_FAILED) return NULL;
+    char *at = mmap(hole + 4096, pages * 4096, PROT_READ | PROT_WRITE,
+                    flags | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (at == MAP_FAILED) return NULL;
+    for (size_t i = 0; i < pages; i++) at[i * 4096] = 1;
+    return at;
+}
+/* Flushes the TLB of the 4 pages at `at`, by taking write access away and
+   giving it back, which keeps their accessed bits. Writing 1, 2 or 3 to
+   clear_refs flushes nothing, so until then an access to a page the TLB
+   holds may not mark it. */
+static void cr_flush(char *at) {
+    mprotect(at, 4 * 4096, PROT_READ);
+    mprotect(at, 4 * 4096, PROT_READ | PROT_WRITE);
+}
+/* Writing 1, 2 or 3 to clear_refs makes the pages of every VMA, of those
+   with no file or of those with one unreferenced until their next access,
+   and a forked child has referenced none of the pages it got. */
+static int cr_references(int clear) {
+    char *a = cr_area(4, MAP_PRIVATE), *s = cr_area(4, MAP_SHARED);
+    if (!a || !s) return 88;
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_write(clear, "all", "1", 1);
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_flush(a);
+    cr_flush(s);
+    volatile char sink = a[0];
+    a[4096] = 2;
+    sink = s[0];
+    (void)sink;
+    printf("accessed: referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_write(clear, "mapped", "3", 1);
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_flush(a);
+    cr_flush(s);
+    for (int i = 0; i < 4; i++) a[i * 4096] = s[i * 4096] = 3;
+    printf("accessed: referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_write(clear, "anonymous", "2", 1);
+    printf("referenced=%ld %ld\n", cr_referenced(a), cr_referenced(s));
+    cr_flush(a);
+    cr_flush(s);
+    for (int i = 0; i < 4; i++) a[i * 4096] = 4;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 89;
+    if (!child) {
+        printf("child: referenced=%ld\n", cr_referenced(a));
+        sink = a[0];
+        a[4096] = 5;
+        printf("child accessed: referenced=%ld\n", cr_referenced(a));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("parent: referenced=%ld\n", cr_referenced(a));
+    return 0;
+}
+
 /* /proc/<pid>/clear_refs: writing 4 clears the soft-dirty bit of every
    page and VMA, which the next write to a page sets again; a new VMA or
    one that merges with a new one is soft-dirty again, and so is a page
-   mremap moves. The other numbers change nothing pagemap shows. How the
+   mremap moves. 1, 2 and 3 clear what smaps shows as referenced. How the
    number is read, and the file's mode. */
 static int clear_refs_case(void) {
     long page = 4096;
@@ -8702,6 +8781,9 @@ static int clear_refs_case(void) {
     int status;
     waitpid(child, &status, 0);
     pm_show(map, "parent", a, 4);
+
+    r = cr_references(clear);
+    if (r) return r;
 
     /* Another process's file, and a thread's. */
     char path[64];
@@ -13014,8 +13096,7 @@ static void smaps_locked(void) {
     const char *line = strstr(status, "\nVmLck:");
     printf("status VmLck=%ld\n", line ? strtol(line + 7, NULL, 10) : -1);
 }
-/* Memory with a hole on each side, which no other VMA merges with: the
- * emulator merges private VMAs whatever their anon_vma. */
+/* Memory with a hole on each side, which no other VMA merges with. */
 static char *smaps_area(long pages, int prot, int flags) {
     long page = 4096;
     char *area = mmap(NULL, (pages + 2) * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

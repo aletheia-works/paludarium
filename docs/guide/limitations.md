@@ -63,7 +63,7 @@ verified.
   so `mlock` fills it and `get_user_pages` may reach it, and its pages 1 and 3
   hold zeros (43648f9f3a67) instead of being a bus error.
 - **`/proc/self/smaps` and `smaps_rollup`, in part**: what they count comes from the emulator's
-  page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
+  page entries. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A read fault in a file's mapping
   maps no more than the 16 pages around it
   ([features](./features#system-calls)), where Linux maps a large folio
@@ -106,10 +106,14 @@ verified.
     where there is a page table.
   - User space ends at 2^47 bytes for its checks, as with 4-level page
     tables.
-- **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) and 5 (the
-  peak resident size) change anything. 1, 2 and 3 are taken, but no
-  referenced bits are kept, so `smaps`' `Referenced` stays the resident
-  size, where Linux's drops until the pages are touched again.
+- **`Referenced` of `smaps`, in part**: a page counts when it was accessed
+  through its own page table entry since `clear_refs` 1 to 3 cleared it.
+  Linux also counts one whose folio is marked as referenced, as a `read` of
+  its file or another process's access may have it. The kernel never ages
+  a page here, as it may on Linux, and `MADV_COLD` and `MADV_FREE` leave
+  the bit, which they clear on Linux. Linux flushes no TLB for 1 to 3, so
+  there an access to a page that the CPU's TLB still holds may leave it
+  unreferenced; here the next access always marks it.
 - **4-level paging only**: the emulated machine always has 4-level page
   tables, whatever CPU the host has: user space ends below 2^47 bytes, and
   `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the

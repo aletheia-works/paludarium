@@ -980,6 +980,9 @@ pub struct Usage {
     /// Pages with an entry of their own (`Rss`); a page of private memory
     /// only read shows Linux's zero page, which is not counted.
     pub resident: u64,
+    /// Those accessed since they were mapped or `clear_refs` cleared them
+    /// (`Referenced`).
+    pub referenced: u64,
     /// Those that more than one page table entry maps, in any process
     /// (`Shared_*`), and of them the dirty ones.
     pub shared_clean: u64,
@@ -1002,6 +1005,16 @@ pub struct Usage {
     pub pss_anon: u64,
     pub pss_file: u64,
     pub pss_shmem: u64,
+}
+
+/// The VMAs whose pages `clear_refs` 1, 2 and 3 make unreferenced
+/// ([`MemoryView::clear_referenced`]): all, those with no file
+/// (`CLEAR_REFS_ANON`) or those with one (`CLEAR_REFS_MAPPED`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Referenced {
+    All,
+    Anonymous,
+    File,
 }
 
 impl Usage {
@@ -1524,10 +1537,25 @@ struct Page {
     /// (`clear_soft_dirty`). An entry made in a mapping with `VM_SOFTDIRTY`
     /// has it from the start, as `pagemap` cannot tell the two apart.
     soft_dirty: bool,
+    /// Linux's `_PAGE_ACCESSED`: accessed since `clear_refs` cleared it
+    /// ([`AddressSpaceData::clear_referenced`]). A new entry has it, as
+    /// x86's `vm_page_prot` does, and an access under the locks sets it
+    /// ([`Self::touch`]), so every entry a [`ThreadTlb`] copies has it and
+    /// an access through one has nothing to set.
+    young: AtomicBool,
 }
 
 impl Page {
-    /// The same entry, showing the same frame.
+    /// Marks the entry accessed. Loads first, so that an access to an entry
+    /// that has the bit writes nothing other threads read.
+    fn touch(&self) {
+        if !self.young.load(Ordering::Relaxed) {
+            self.young.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The same entry for a `fork`ed child, showing the same frame: not
+    /// accessed yet, as `__copy_present_ptes` makes it (`pte_mkold`).
     fn share(&self) -> Self {
         Page {
             prot: self.prot,
@@ -1538,6 +1566,7 @@ impl Page {
             shrinks: self.shrinks,
             uffd_wp: self.uffd_wp,
             soft_dirty: self.soft_dirty,
+            young: AtomicBool::new(false),
         }
     }
 
@@ -3556,6 +3585,7 @@ impl AddressSpaceData {
             shrinks: self.file_at(page).map_or(0, |(source, _)| source.shrinks()),
             uffd_wp: false,
             soft_dirty: self.mapping_at(page).is_some_and(|m| m.soft_dirty),
+            young: AtomicBool::new(true),
         }
     }
     /// A new entry for `page`, with its file read into it if need be.
@@ -3722,6 +3752,7 @@ impl AddressSpaceData {
                 let dirty =
                     anonymous || (shared && bytes.is_some_and(|b| b.dirty.load(Ordering::Acquire)));
                 usage.resident += 1;
+                usage.referenced += u64::from(entry.young.load(Ordering::Relaxed));
                 usage.anonymous += u64::from(anonymous);
                 let maps = u64::from(entry.frame.maps().max(1));
                 let pss = (PAGE_SIZE << Usage::PSS_SHIFT) / maps;
@@ -4232,6 +4263,8 @@ impl AddressSpaceData {
                         };
                         child.frame = Mapped::new(frame);
                         child.cow = false;
+                        // A new entry (`copy_present_page`).
+                        child.touch();
                     } else if !is_shared && !page.cache {
                         if page.frame.get().is_some() {
                             page.cow = true;
@@ -4623,6 +4656,8 @@ impl AddressSpaceData {
         let Some(p) = lookup(directory, page) else {
             return;
         };
+        // An access through the copy made below marks nothing.
+        p.touch();
         if self.may_be_truncated(page, p) {
             return;
         }
@@ -4689,7 +4724,8 @@ impl AddressSpaceData {
     fn copy_out(directory: &Directory, addr: GuestAddr, buf: &mut [u8]) {
         for (page, offset, range) in chunks(addr, buf.len()) {
             let dst = &mut buf[range];
-            match lookup(directory, page).and_then(|p| p.frame.get()) {
+            let entry = lookup(directory, page).inspect(|p| p.touch());
+            match entry.and_then(|p| p.frame.get()) {
                 Some(frame) => frame.read(offset, dst),
                 None => dst.fill(0),
             }
@@ -4827,6 +4863,7 @@ impl AddressSpaceData {
     ) -> Result<(), Fault> {
         for (page, offset, range) in chunks(addr, len) {
             if let Some(p) = lookup(directory, page) {
+                p.touch();
                 if let Some(mapping) = self.shared_at(page) {
                     mapping.pages.changed();
                 }
@@ -5955,6 +5992,46 @@ impl AddressSpaceData {
                 page.soft_dirty = false;
             }
         }
+    }
+
+    /// `clear_refs` 1 to 3, as Linux's `clear_refs_pte_range` clears the
+    /// accessed bit of every page entry of the VMAs `which` takes. The next
+    /// access to each page sets it again ([`Page::touch`]): the epoch, which
+    /// the mutable borrow moves on, empties the [`ThreadTlb`]s, and the code
+    /// generation has instructions fetched again before they run.
+    fn clear_referenced(&mut self, which: Referenced) {
+        let directory = self.read_directory();
+        for (&dir, table) in directory.iter() {
+            for (slot, entry) in table.pages.iter().enumerate() {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let page = (dir * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
+                let takes = match which {
+                    Referenced::All => true,
+                    Referenced::Anonymous => !self.has_file(page),
+                    Referenced::File => self.has_file(page),
+                };
+                // A `VM_PFNMAP` one is left (`clear_refs_test_walk`).
+                if takes && !self.pfn_mapped(page) {
+                    entry.young.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+        // After the bits: a fetch that reads the new generation sets them.
+        self.code.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Whether the VMA of `page` has a file (Linux's `vm_file`): a loaded
+    /// program's segments, a file's mappings and shared memory, which is
+    /// shmem's, but no special mapping, as the vDSO.
+    fn has_file(&self, page: u64) -> bool {
+        self.shared_at(page).is_some()
+            || self.private_special(page).is_none()
+                && (self.backing_at(page).is_some()
+                    || self.mapping_at(page).is_some_and(|m| {
+                        matches!(m.kind, MappingKind::File | MappingKind::ElfSegment)
+                    }))
     }
 
     /// The `[start, end)` of the Linux VMA holding `addr`: the mapping there
@@ -7320,6 +7397,7 @@ impl AddressSpaceData {
                     prot: dst_mapping.prot,
                     uffd_wp: false,
                     soft_dirty: true,
+                    young: AtomicBool::new(true),
                     ..entry
                 },
                 _ => self.page(to, dst_mapping.prot),
@@ -8678,6 +8756,12 @@ impl MemoryView {
     /// is gone.
     pub fn clear_soft_dirty(&self) -> bool {
         self.with_data_mut(AddressSpaceData::clear_soft_dirty)
+            .is_some()
+    }
+    /// See [`AddressSpaceData::clear_referenced`]; `false` once the space
+    /// is gone.
+    pub fn clear_referenced(&self, which: Referenced) -> bool {
+        self.with_data_mut(|data| data.clear_referenced(which))
             .is_some()
     }
     /// The peak of the pages the space held and the pages it holds now
@@ -11869,6 +11953,132 @@ mod tests {
             })
             .unwrap();
         assert!(written.is_empty(), "the cache stays clean");
+    }
+
+    /// How many of the `count` pages from `at` are referenced.
+    fn referenced(space: &AddressSpace, at: GuestAddr, count: u64) -> u64 {
+        space
+            .view()
+            .usage(at.0, at.0 + count * PAGE_SIZE)
+            .unwrap()
+            .referenced
+    }
+
+    #[test]
+    fn a_page_is_referenced_until_clear_refs_and_again_at_its_next_access() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                8 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let page = |n: u64| GuestAddr(at.0 + n * PAGE_SIZE);
+        for n in 0..8 {
+            // Twice: the second goes through this thread's TLB.
+            space.write_u64(page(n), n).unwrap();
+            space.write_u64(page(n), n).unwrap();
+        }
+        assert_eq!(referenced(&space, at, 8), 8);
+        assert!(space.view().clear_referenced(Referenced::All));
+        assert_eq!(referenced(&space, at, 8), 0);
+        let _ = faults::take();
+        // Each kind of access marks its page, once.
+        space.read_u64(page(0)).unwrap();
+        assert_eq!(referenced(&space, at, 1), 1);
+        space.write_u64(page(1), 1).unwrap();
+        space
+            .atomic(page(2), AtomicWidth::W64, AtomicOp::Add(1))
+            .unwrap();
+        space.read_u64(GuestAddr(page(4).0 - 4)).unwrap();
+        space.write_u64(GuestAddr(page(6).0 - 4), 5).unwrap();
+        assert_eq!(referenced(&space, at, 8), 7);
+        assert_eq!(referenced(&space, page(7), 1), 0);
+        // Setting the bit is no fault.
+        assert_eq!(faults::take(), 0);
+        // Compiled code's slots are emptied too.
+        space.jit_read_value(page(7), 8).unwrap();
+        assert_eq!(referenced(&space, at, 8), 8);
+        assert!(space.view().clear_referenced(Referenced::All));
+        assert!(!space.jit_slot(page(7).0).0);
+        // What is written stays.
+        assert_eq!(space.read_u64(page(7)), Ok(7));
+        // The kernel's accesses through `get_user_pages` count (`FOLL_TOUCH`).
+        assert_eq!(space.view().read_pages(page(0).0, &mut [0; 8]), Some(8));
+        assert_eq!(referenced(&space, at, 8), 2);
+    }
+
+    #[test]
+    fn clear_refs_takes_the_pages_with_a_file_or_those_without() {
+        let mut space = AddressSpace::new();
+        let anonymous = space
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        let shared = space
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        space.mark_shared(shared, PAGE_SIZE).unwrap();
+        let touch = || {
+            space.write_u64(anonymous, 1).unwrap();
+            space.write_u64(shared, 1).unwrap();
+        };
+        let both = || {
+            (
+                referenced(&space, anonymous, 1),
+                referenced(&space, shared, 1),
+            )
+        };
+        touch();
+        assert!(space.view().clear_referenced(Referenced::Anonymous));
+        assert_eq!(both(), (0, 1));
+        touch();
+        assert!(space.view().clear_referenced(Referenced::File));
+        assert_eq!(both(), (1, 0));
+    }
+
+    #[test]
+    fn a_forked_child_has_referenced_no_page_yet() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write_u64(at, 1).unwrap();
+        space.write_u64(GuestAddr(at.0 + PAGE_SIZE), 1).unwrap();
+        let child = space.fork().unwrap();
+        assert_eq!(referenced(&space, at, 2), 2);
+        assert_eq!(referenced(&child, at, 2), 0);
+        child.read_u64(at).unwrap();
+        child.write_u64(GuestAddr(at.0 + PAGE_SIZE), 2).unwrap();
+        assert_eq!(referenced(&child, at, 2), 2);
+    }
+
+    #[test]
+    fn a_fetch_after_clear_refs_marks_its_page_whatever_is_decoded() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                PAGE_SIZE,
+                Prot::from_bits(7).unwrap(),
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write_u64(at, 1).unwrap();
+        assert_eq!(space.fetch_partial(at, &mut [0; 8]), Ok(8));
+        assert_eq!(space.fetch_partial(at, &mut [0; 8]), Ok(8));
+        let generation = space.code_generation();
+        assert!(space.view().clear_referenced(Referenced::All));
+        assert_ne!(space.code_generation(), generation);
+        assert_eq!(referenced(&space, at, 1), 0);
+        assert_eq!(space.fetch_partial(at, &mut [0; 8]), Ok(8));
+        assert_eq!(referenced(&space, at, 1), 1);
     }
 
     #[test]

@@ -4651,8 +4651,11 @@ kernel.
   and `UFFDIO_MOVE` for the page they map, and a `fork`ed child keeps each
   page's bit. 5 (`CLEAR_REFS_MM_HIWATER_RSS`) makes the peak of the
   resident memory (`status`' `VmHWM`) the resident memory now, as
-  `reset_mm_hiwater_rss` does. 1 to 3 are taken and change nothing shown
-  (see Limitations). It has no read operation (`EINVAL`, `EBADF` on a descriptor
+  `reset_mm_hiwater_rss` does. 1 makes every page unreferenced, 2 those of
+  VMAs with no file and 3 those of VMAs with one (shared memory's too):
+  `smaps` and `smaps_rollup` leave a page out of `Referenced` until its
+  next access, an instruction fetch too. A `fork`ed child has referenced
+  none of the pages it gets (`pte_mkold`). It has no read operation (`EINVAL`, `EBADF` on a descriptor
   open only for writing), and `lseek` leaves it at 0.
 
 - `/proc/self/fd` (mode 0500, its size the number of open descriptors, as

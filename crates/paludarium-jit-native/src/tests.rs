@@ -1,9 +1,9 @@
 //! Compiled code does what the interpreter does: each form, and runs of
 //! forms, from random states, compared with `paludarium_cpu::step`.
-use paludarium_cpu::compile::{Compiler, Fast, Form, REP_CHUNK};
-use paludarium_cpu::{CpuState, flag, reg, step};
+use paludarium_cpu::compile::{Compiler, Fast, Form, REP_CHUNK, run_compiled};
+use paludarium_cpu::{CpuState, DecodeCache, flag, reg, step};
 use paludarium_decoder::decode;
-use paludarium_mmu::{AddressSpace, MappingKind, Prot, Userfault};
+use paludarium_mmu::{AddressSpace, MappingKind, Prot, Referenced, Userfault};
 use paludarium_types::{GuestAddr, PAGE_SIZE};
 
 use crate::exec::thread_cpu_time;
@@ -1195,6 +1195,41 @@ fn a_store_after_clear_refs_makes_the_page_soft_dirty_again() {
     });
     assert_eq!((ran, word, cleared), (2, 0x5555, Some(0)));
     assert_eq!(soft_dirty(&memory), 1);
+}
+
+#[test]
+fn an_access_after_clear_refs_references_the_page_again() {
+    let referenced = |m: &AddressSpace| m.view().usage(DATA, DATA + PAGE_SIZE).unwrap().referenced;
+    let mut cleared = None;
+    let (ran, word, memory) = store_after(|m| {
+        assert!(m.view().clear_referenced(Referenced::All));
+        cleared = Some(referenced(m));
+    });
+    assert_eq!((ran, word, cleared), (2, 0x5555, Some(0)));
+    assert_eq!(referenced(&memory), 1);
+}
+
+#[test]
+fn a_compiled_loop_references_its_code_after_clear_refs() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    // inc rax; jmp to it
+    let memory = space(&[0x48, 0xff, 0xc0, 0xeb, 0xfb], &[]);
+    let referenced = || {
+        memory
+            .view()
+            .usage(CODE, CODE + PAGE_SIZE)
+            .unwrap()
+            .referenced
+    };
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    let mut cache = DecodeCache::new();
+    for _ in 0..3 {
+        run_compiled(&mut state, &memory, 1000, &mut cache, &compiler);
+        assert_eq!(referenced(), 1);
+        assert!(memory.view().clear_referenced(Referenced::All));
+        assert_eq!(referenced(), 0);
+    }
+    assert_eq!(state.gpr[reg::RAX], 1500);
 }
 
 #[test]

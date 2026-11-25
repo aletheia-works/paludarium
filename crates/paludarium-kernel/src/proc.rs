@@ -8,7 +8,7 @@
 //! `/proc/locks` and `/proc/sysvipc`'s `msg`, `sem` and `shm` are
 //! ([`crate::seq`]).
 use paludarium_host::{FileHandle, FileStat};
-use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
+use paludarium_mmu::{MemoryView, Prot, Referenced, Usage, Vma, vm};
 use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1492,7 +1492,7 @@ fn smap_usage_lines(usage: &Usage, locked: u64, rollup: bool) -> String {
         ("Shared_Dirty:   ", kb(usage.shared_dirty)),
         ("Private_Clean:  ", kb(usage.private_clean)),
         ("Private_Dirty:  ", kb(usage.private_dirty)),
-        ("Referenced:     ", kb(usage.resident)),
+        ("Referenced:     ", kb(usage.referenced)),
         ("Anonymous:      ", kb(usage.anonymous)),
         ("KSM:            ", 0),
         ("LazyFree:       ", 0),
@@ -1534,6 +1534,7 @@ fn rollup_lines(memory: &MemoryView) -> Vec<u8> {
             locked += usage.pss;
         }
         total.resident += usage.resident;
+        total.referenced += usage.referenced;
         total.shared_clean += usage.shared_clean;
         total.shared_dirty += usage.shared_dirty;
         total.private_clean += usage.private_clean;
@@ -1909,7 +1910,9 @@ pub(crate) type CurrentMemory = Arc<dyn Fn() -> Result<Option<MemoryView>, Errno
 /// clears the soft-dirty bits ([`MemoryView::clear_soft_dirty`]) and 5
 /// (`CLEAR_REFS_MM_HIWATER_RSS`) makes the peak of the resident pages
 /// those resident now ([`MemoryView::reset_peak_resident`]); 1 to 3 clear
-/// referenced bits, which are not kept. It has no read operation.
+/// the referenced bits of all pages, of those of VMAs with no file or of
+/// those with one ([`MemoryView::clear_referenced`]). It has no read
+/// operation.
 pub(crate) struct ClearRefsFile {
     memory: CurrentMemory,
     /// The access mode it was opened with (`O_ACCMODE`).
@@ -1997,6 +2000,15 @@ impl FileHandle for ClearRefsFile {
         }
         if let Some(memory) = (self.memory)()? {
             match kind {
+                1 => {
+                    memory.clear_referenced(Referenced::All);
+                }
+                2 => {
+                    memory.clear_referenced(Referenced::Anonymous);
+                }
+                3 => {
+                    memory.clear_referenced(Referenced::File);
+                }
                 4 => {
                     memory.clear_soft_dirty();
                 }
@@ -2274,6 +2286,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, SOFT_DIRTY, 0]
         );
+    }
+
+    #[test]
+    fn clear_refs_1_to_3_make_smaps_show_no_page_as_referenced_until_its_next_access() {
+        let mut mem = AddressSpace::new();
+        mem.map(
+            Some(GuestAddr(0x10000)),
+            0x2000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.write(GuestAddr(0x10000), b"x").unwrap();
+        mem.write(GuestAddr(0x11000), b"x").unwrap();
+        let referenced = || {
+            let text = String::from_utf8(rollup_lines(&mem.view())).unwrap();
+            let line = text.lines().find(|l| l.starts_with("Referenced:")).unwrap();
+            line.split_whitespace().nth(1).unwrap().to_owned()
+        };
+        let view = mem.view();
+        let current: CurrentMemory = Arc::new(move || Ok(Some(view.clone())));
+        let clear = ClearRefsFile::open(current, 1, Arc::default());
+        assert_eq!(referenced(), "8");
+        // Those of VMAs with a file only.
+        assert_eq!(clear.write(b"3"), Ok(1));
+        assert_eq!(referenced(), "8");
+        for kind in [b"1", b"2"] {
+            assert_eq!(clear.write(kind), Ok(1));
+            assert_eq!(referenced(), "0");
+            mem.read(GuestAddr(0x10000), &mut [0]).unwrap();
+            assert_eq!(referenced(), "4");
+        }
     }
 
     #[test]

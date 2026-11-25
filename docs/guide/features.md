@@ -3314,8 +3314,9 @@ kernel.
     request names (none for 0), and the caller's
     `RTA_UID` (or the one the request names, as it is; none for -1, and
     `ERANGE` for one shorter than 4 bytes); `0.0.0.0` goes to the loopback
-    from 127.0.0.1. An IPv6 answer names the source `ipv6_dev_get_saddr`
-    picks. Where no route goes it is `ENETUNREACH`, and `AF_UNSPEC`
+    from 127.0.0.1. An IPv6 answer names the found hop's source: the
+    route's preferred one, else the one `ipv6_dev_get_saddr` picks on the
+    hop's device (`ip6_route_get_saddr`). Where no route goes it is `ENETUNREACH`, and `AF_UNSPEC`
     `EOPNOTSUPP`; a destination shorter than its family's address is
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,

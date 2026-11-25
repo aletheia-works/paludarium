@@ -2857,8 +2857,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`RTM_F_LOOKUP_TABLE` を付ければ、経路のあった表）、`fib_select_path` の選ぶ送り元、
     オンリンクで届くゲートウェイ、リクエストが指した `RTA_MARK`（0 なら付けません）、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
     -1 なら付けず、4 バイトより短ければ `ERANGE`）を持ちます。`0.0.0.0` は 127.0.0.1 から
-    ループバックへ向かいます。IPv6 の答えは、`ipv6_dev_get_saddr` の選ぶ送り元を
-    持ちます。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
+    ループバックへ向かいます。IPv6 の答えは、見つけたホップの送り元を持ちます。経路の優先する送り元、
+    なければ `ipv6_dev_get_saddr` がホップのデバイスで選ぶものです（`ip6_route_get_saddr`）。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
     ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら `EINVAL` です。
     `RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に合う項目はないので
     `EHOSTUNREACH` です）。

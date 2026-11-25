@@ -116,7 +116,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `tcp`、`udp`、`unix`、`igmp`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、
   `dev` のものは 0 です。ネットワークのないセッションのファイルには、デバイスがありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
-  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、`/proc/net` とプロセスの `net`、
+  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
   `vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前

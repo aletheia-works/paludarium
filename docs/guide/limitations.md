@@ -129,7 +129,7 @@ verified.
   with no network has files of no device.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, `/proc/net` and a process's `net`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any

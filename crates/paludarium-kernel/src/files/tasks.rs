@@ -1076,6 +1076,7 @@ pub(super) fn net_file(
     let file = file.open(network, now, flags, (stat.uid, stat.gid));
     Ok(std::sync::Arc::new(file))
 }
+
 /// The `stat` of the entry, with its device and block size; a link is
 /// followed to its file when `follow` is set. `None` for a missing entry.
 pub(super) fn stat(

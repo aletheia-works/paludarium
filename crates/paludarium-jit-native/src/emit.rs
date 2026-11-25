@@ -1646,13 +1646,15 @@ impl Emitter<'_, '_> {
             }
             Fast::PushLoad(mem) => {
                 let address = self.linear(&mem);
-                let (v, status) = self.load(address, 8);
-                self.unless_failed(status, n, rip);
+                let (v, loaded) = self.load(address, 8);
+                self.unless_failed(loaded, n, rip);
                 let rsp = self.gpr(4);
                 let rsp = self.b.ins().iadd_imm_s(rsp, -8);
-                let status = self.store(rsp, 8, v);
-                self.unless_failed(status, n, rip);
+                let stored = self.store(rsp, 8, v);
+                self.unless_failed(stored, n, rip);
                 self.set_gpr(4, rsp);
+                // Neither is FAILED, so this is CODE_CHANGED if either is.
+                let status = self.b.ins().bor(loaded, stored);
                 self.unless_changed(status, n + 1, next);
             }
             Fast::MulWide { src, signed } => {
@@ -1778,6 +1780,7 @@ impl Emitter<'_, '_> {
                 let zero = self.constant(0);
                 self.set_word(XMM + 2 * usize::from(dst), v);
                 self.set_word(XMM + 2 * usize::from(dst) + 1, zero);
+                self.unless_changed(status, n + 1, next);
             }
             Fast::XmmStoreScalar { mem, src, size } => {
                 let v = self.word(XMM + 2 * usize::from(src));
@@ -2001,9 +2004,11 @@ impl Emitter<'_, '_> {
                     self.b.ins().band_imm_s(a, mask(size))
                 };
                 let (r, update, f) = self.unary(op, a, size);
-                let status = self.store(address, size, r);
-                self.unless_failed(status, n, rip);
+                let stored = self.store(address, size, r);
+                self.unless_failed(stored, n, rip);
                 self.set_flags(update, f);
+                // Neither is FAILED, so this is CODE_CHANGED if either is.
+                let status = self.b.ins().bor(loaded, stored);
                 self.unless_changed(status, n + 1, next);
             }
             Fast::Shift { op, dst, count } => {
@@ -2071,9 +2076,11 @@ impl Emitter<'_, '_> {
                 self.unless_failed(loaded, n, rip);
                 let a = self.masked(a, size);
                 let (r, f) = self.alu(op, a, b, size);
-                let status = self.store(address, size, r);
-                self.unless_failed(status, n, rip);
+                let stored = self.store(address, size, r);
+                self.unless_failed(stored, n, rip);
                 self.set_status(f);
+                // Neither is FAILED, so this is CODE_CHANGED if either is.
+                let status = self.b.ins().bor(loaded, stored);
                 self.unless_changed(status, n + 1, next);
             }
         }

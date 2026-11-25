@@ -5144,7 +5144,9 @@ kernel.
   there `ESRCH`, no task and no CPU or a CPU past the last `EINVAL`, and an
   unknown `clockid` `EINVAL`. The events that count are the software
   `cpu-clock` and `task-clock`, in nanoseconds of the thread's CPU time (an
-  event of a CPU counts the time that passes); a thread's `page-faults` and
+  event of a CPU counts the time that passes, and of the counts below those
+  of every thread of the machine there, an ended one's too, and samples each
+  thread's); a thread's `page-faults` and
   `minor-faults` (a first read or write of a page, and a write to a page
   `fork` shares or a private mapping of a file's: the faults of the
   thread's code, left out with `exclude_user`, and those of the kernel's

@@ -169,6 +169,7 @@
     {"name":"perf-side-band","binary":"perf"},
     {"name":"perf-inherit-stat","binary":"perf"},
     {"name":"perf-side-band-cpu","binary":"perf"},
+    {"name":"perf-cpu-samples","binary":"perf"},
     {"name":"perf-side-band-comm","binary":"perf"},
     {"name":"perf-throttle","binary":"perf"},
     {"name":"perf-side-band-exec","binary":"perf"},

@@ -509,6 +509,29 @@ impl Usage {
         }
         on
     }
+    /// Adds what it counted on each CPU to `sums`.
+    pub(crate) fn add_counts(&self, sums: &mut Vec<[u64; 4]>) {
+        let cpus: Vec<u32> = {
+            let counts = self
+                .per_cpu_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let on = counts.on.map(|(cpu, _)| cpu);
+            let left = u32::try_from(counts.done.len()).unwrap_or(u32::MAX);
+            let more = on.filter(|&cpu| cpu >= left);
+            (0..left).chain(more).collect()
+        };
+        for cpu in cpus {
+            let counts = self.counts_on(cpu);
+            let cpu = cpu as usize;
+            if sums.len() <= cpu {
+                sums.resize(cpu + 1, [0; 4]);
+            }
+            for (sum, count) in sums[cpu].iter_mut().zip(counts) {
+                *sum = sum.saturating_add(count);
+            }
+        }
+    }
     /// Its CPU time in nanoseconds and what of it was on `cpu`, as of the
     /// latest look at it.
     pub(crate) fn time_on(&self, cpu: u32) -> (u64, u64) {

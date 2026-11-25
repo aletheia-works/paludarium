@@ -2947,10 +2947,12 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let ring = downcast(&file)?;
     let mut submitted = 0;
     if to_submit != 0 {
-        give_context(c);
+        // `__io_uring_add_tctx_node_from_submit`: the submitter, then the
+        // context, though no entry may be there to take.
         if ring.submitter.is_some_and(|tid| tid != c.tid) {
             return Err(EEXIST);
         }
+        give_context(c);
         {
             let _submitting = ring
                 .submitting

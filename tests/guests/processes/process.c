@@ -10636,8 +10636,15 @@ static long urf_register(struct uring *u, unsigned op, struct urf_update *up, un
 }
 
 static void *urf_thread(void *arg) {
-    (void)arg;
+    int *fds = arg;
     uring_show("thread-enter", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    /* A submission it may not make gives it none; one of nothing does. */
+    uring_show("thread-single-issuer", uring_enter(fds[0], 1, 0, 0, NULL, 0));
+    uring_show("thread-still-none", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-waits-none", uring_enter(fds[1], 0, 0, 1, NULL, 0));
+    uring_show("thread-none-yet", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
+    uring_show("thread-submits-nothing", uring_enter(fds[1], 1, 0, 0, NULL, 0));
+    uring_show("thread-has-one", uring_enter(0, 0, 0, 1 << 4, NULL, 0));
     return NULL;
 }
 
@@ -10675,8 +10682,12 @@ static int io_uring_ring_fds_case(const char *self) {
 
     /* A new thread and a forked child have no io_uring context. */
     pthread_t t;
-    pthread_create(&t, NULL, urf_thread, NULL);
+    struct uring single;
+    if (uring_open_flags(&single, 8, 1 << 12)) return 81;
+    int rings[2] = {single.fd, u.fd};
+    pthread_create(&t, NULL, urf_thread, rings);
     pthread_join(t, NULL);
+    close(single.fd);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {

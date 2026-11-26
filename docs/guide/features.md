@@ -6842,7 +6842,7 @@ one only with an `--allow-net`.
   (`de_thread`). It resets the actions as Linux's `flush_signal_handlers`
   does: a handled signal goes back to its default, and an ignored one stays
   ignored, with no flags or mask. `CLONE_CLEAR_SIGHAND` resets the child's
-  the same way.
+  actions the same way.
 - The threads of a process share its signal dispositions, as Linux's
   `sighand_struct` does. A thread that was already waiting (in `epoll_wait`,
   `poll` or a `futex` wait, say) when another thread called `sigaction` takes

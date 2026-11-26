@@ -2,7 +2,9 @@
  * thread's own pending signals and the process's (`de_thread` frees only the
  * other threads, with theirs), and the actions as `flush_signal_handlers`
  * leaves them, which `CLONE_CLEAR_SIGHAND` does too. The signals each new
- * image then takes are listed by number, not in the order they come. */
+ * image then takes are listed by number, not in the order they come, until
+ * the emulator takes them in Linux's order: a sort weakens the comparison,
+ * and the change that fixes the order takes it out. */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <signal.h>

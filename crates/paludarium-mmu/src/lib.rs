@@ -504,11 +504,18 @@ pub mod faults {
     /// says; an instruction's access, one through `get_user_pages` that may
     /// not drop the lock ([`through_gup_locked`]) and a bus error are not
     /// resolved here.
-    pub(crate) fn resolve(space: impl FnOnce() -> super::MemoryView, fault: &super::Fault) -> bool {
+    /// `scope` is the access's, which keeps the record of its retries
+    /// ([`retry_scope`]) from the first fault it resolves.
+    pub(crate) fn resolve(
+        space: impl FnOnce() -> super::MemoryView,
+        fault: &super::Fault,
+        scope: &mut Option<RetryScope>,
+    ) -> bool {
         let gup = GUP.with(Cell::get);
         if !KERNEL.with(Cell::get) || gup == Gup::Locked || fault.bus || fault.fetch {
             return false;
         }
+        scope.get_or_insert_with(retry_scope);
         // Taken out first, so that what it does may itself access memory.
         let Some(resolver) = RESOLVER.with(|r| r.borrow().clone()) else {
             return false;
@@ -587,6 +594,21 @@ pub mod faults {
             }
             true
         })
+    }
+
+    /// Hides the record of a retried fault ([`retry_major`]) that an
+    /// access outside this one left, and puts it back when this one, which
+    /// holds what this returns, ends: so the record is only of the retries
+    /// of one access, and a later access that faults on the page again
+    /// counts its own fault.
+    fn retry_scope() -> RetryScope {
+        RetryScope(RETRIED.with(Cell::take))
+    }
+    pub(crate) struct RetryScope(Option<(u64, bool)>);
+    impl Drop for RetryScope {
+        fn drop(&mut self) {
+            RETRIED.with(|r| r.set(self.0.take()));
+        }
     }
 
     /// Counts a fault of a `write` or a read `at`, unless it is the retry
@@ -8778,10 +8800,11 @@ impl MemoryView {
         &self,
         mut f: impl FnMut(&mut AddressSpaceGuard<'_>) -> Option<Result<(), Fault>>,
     ) -> Option<bool> {
+        let mut retry = None;
         loop {
             match self.with_guard(&mut f)? {
                 Some(Ok(())) => return Some(true),
-                Some(Err(fault)) if faults::resolve(|| self.clone(), &fault) => {}
+                Some(Err(fault)) if faults::resolve(|| self.clone(), &fault, &mut retry) => {}
                 _ => return Some(false),
             }
         }
@@ -9616,6 +9639,7 @@ impl AddressSpace {
         self.locked().bottom_up()
     }
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             if self.read_unlocked(addr, buf, Access::Read) {
                 return Ok(());
@@ -9623,7 +9647,7 @@ impl AddressSpace {
             // The lock goes before the fault is resolved ([`faults::Resolver`]).
             let result = self.locked().read(addr, buf);
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9675,10 +9699,11 @@ impl AddressSpace {
     /// `get_user_pages` as [`faults::through_gup`] (or, for a call made in
     /// [`faults::through_gup_locked`], that).
     pub fn populate(&self, addr: GuestAddr) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             let result = self.locked().read_for_dump(addr, &mut [0]);
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9689,13 +9714,14 @@ impl AddressSpace {
         self.locked().read_for_core(addr, buf)
     }
     pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             if self.write_unlocked(addr, buf) {
                 return Ok(());
             }
             let result = Self::write_locked(self.locked(), addr, buf);
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9810,13 +9836,14 @@ impl AddressSpace {
         self.check_access(addr, len, Access::Write)
     }
     fn check_access(&self, addr: GuestAddr, len: usize, access: Access) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             let result = {
                 let data = self.locked();
                 data.check(&data.read_directory(), addr, len, access, false)
             };
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9998,6 +10025,7 @@ impl AddressSpace {
         }
         let mut bytes = [0; WORD_BYTES];
         let buf = &mut bytes[..size.min(WORD_BYTES)];
+        let mut retry = None;
         loop {
             let result = {
                 let mut data = self.locked();
@@ -10009,7 +10037,7 @@ impl AddressSpace {
             };
             match result {
                 Ok(()) => return Ok(u64::from_le_bytes(bytes)),
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 Err(fault) => return Err(fault),
             }
         }
@@ -10252,6 +10280,7 @@ impl AddressSpace {
         let mut pages = chunks(addr, len).map(|(page, _, _)| page).peekable();
         let mut frames = Vec::new();
         faults::through_gup(|| {
+            let mut retry = None;
             while let Some(&first) = pages.peek() {
                 let mut space = self.locked();
                 let mut page = first;
@@ -10267,7 +10296,7 @@ impl AddressSpace {
                     }
                 };
                 drop(space);
-                if fault.is_some_and(|fault| !faults::resolve(|| self.view(), &fault)) {
+                if fault.is_some_and(|fault| !faults::resolve(|| self.view(), &fault, &mut retry)) {
                     return Err(Errno::EFAULT);
                 }
             }
@@ -10386,6 +10415,7 @@ impl AddressSpace {
         operation: AtomicOp,
     ) -> Result<AtomicResult, Fault> {
         let size = width.bytes();
+        let mut retry = None;
         let result = loop {
             let result = if page_offset(addr.0) % WORD_BYTES + size <= WORD_BYTES {
                 match self.atomic_unlocked(addr, size, operation) {
@@ -10397,7 +10427,7 @@ impl AddressSpace {
             };
             match result {
                 Ok(result) => break result,
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 Err(fault) => return Err(fault),
             }
         };
@@ -11816,23 +11846,28 @@ mod tests {
         // major one, not a minor one too.
         space.write(page(0), &[1]).unwrap();
         assert_eq!(load(), [0, 0, 0, 1]);
+        // Gone again and written again in the same work: another access,
+        // which waits, and takes a major fault of its own.
+        space.locked().discard(page(0), PAGE_SIZE).unwrap();
+        space.write(page(0), &[1]).unwrap();
+        assert_eq!(load(), [0, 0, 0, 2]);
         // The retry brings it in itself, once it is no longer registered.
         serve.how.store(1, Ordering::SeqCst);
         space.write(page(1), &[1]).unwrap();
-        assert_eq!(load(), [0, 0, 0, 2]);
+        assert_eq!(load(), [0, 0, 0, 3]);
         // A wake with nothing done waits again: still one.
         serve.how.store(2, Ordering::SeqCst);
         let mut byte = [0];
         space.read(page(2), &mut byte).unwrap();
-        assert_eq!((load(), byte), ([0, 0, 0, 3], [7]));
+        assert_eq!((load(), byte), ([0, 0, 0, 4], [7]));
         // Through `get_user_pages`, the retry finds the page and counts
         // nothing (`__get_user_pages`).
         serve.how.store(0, Ordering::SeqCst);
         faults::through_gup(|| space.write(page(3), &[1])).unwrap();
-        assert_eq!(load(), [0, 0, 0, 3]);
+        assert_eq!(load(), [0, 0, 0, 4]);
         // A later fault of another page is a minor one again.
         space.write(page(4), &[1]).unwrap();
-        assert_eq!(load(), [0, 1, 0, 3]);
+        assert_eq!(load(), [0, 1, 0, 4]);
         faults::set_kernel(kernel);
         faults::set_resolver(was);
         faults::unbind();

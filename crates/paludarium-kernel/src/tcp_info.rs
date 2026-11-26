@@ -15,8 +15,10 @@ use crate::loopback::segments::Counts;
 pub(crate) const LEN: usize = 280;
 /// The MSS the loopback's MTU gives, with timestamps (`advmss`).
 pub(crate) const ADVMSS: u32 = 65_483;
-/// The same of IPv6.
-const ADVMSS_V6: u32 = 65_464;
+/// The largest MSS IPv4 advertises (`ipv4_default_advmss`), and what the
+/// timestamps take of each segment.
+const MSS_MAX: usize = 65_495;
+const TIMESTAMPS: u32 = 12;
 /// What a connection sends per segment, as Linux bounds it to half the
 /// window its loopback peer first offers (`tcp_bound_to_half_wnd`).
 pub(crate) const SND_MSS: u32 = 32_768;
@@ -116,9 +118,10 @@ pub(crate) struct Carried {
     pub(crate) fin_received: bool,
     /// The bytes written that have not gone yet.
     pub(crate) unsent: u64,
-    /// Milliseconds since data went and came.
+    /// Milliseconds since data went and came, and an acknowledgement came.
     pub(crate) since_sent: u32,
     pub(crate) since_received: u32,
+    pub(crate) since_ack: u32,
     /// This side's receive window scale.
     pub(crate) rcv_wscale: u8,
     /// The segments of a loopback connection; a host's are estimated.
@@ -223,6 +226,7 @@ impl TcpInfo {
             sent: carried.sent,
             acked: carried.sent,
             received: carried.received,
+            held: carried.unsent,
             end_acked: carried.fin_sent,
             end_came: carried.fin_received,
             ato: if carried.received > 0 { ATO } else { 0 },
@@ -245,7 +249,6 @@ impl TcpInfo {
         // `tcp_update_pacing_rate` in slow start: twice the congestion
         // window a round trip.
         let pacing = u64::from(SND_MSS) * 2_000_000 * u64::from(CWND) / u64::from(RTT);
-        let since_ack = carried.since_sent.min(carried.since_received);
         Self {
             state,
             retransmits: 0,
@@ -261,7 +264,7 @@ impl TcpInfo {
             sacked: 0,
             last_data_sent: carried.since_sent,
             last_data_recv: carried.since_received,
-            last_ack_recv: since_ack,
+            last_ack_recv: carried.since_ack,
             pmtu: PMTU,
             rcv_ssthresh: ADVMSS,
             rtt: RTT,
@@ -280,7 +283,7 @@ impl TcpInfo {
             bytes_received: counts.received + u64::from(counts.end_came),
             segs_out: counts.segs_out,
             segs_in: counts.segs_in,
-            notsent_bytes: u32::try_from(carried.unsent + counts.held).unwrap_or(u32::MAX),
+            notsent_bytes: u32::try_from(counts.held).unwrap_or(u32::MAX),
             min_rtt: RTT,
             data_segs_in: counts.data_segs_in,
             data_segs_out: counts.data_segs_out,
@@ -404,9 +407,12 @@ impl TcpInfo {
     }
 }
 
-/// The MSS an IPv4 or IPv6 loopback connection advertises.
-pub(crate) fn advertised_mss(v4: bool) -> u32 {
-    if v4 { ADVMSS } else { ADVMSS_V6 }
+/// The MSS a connection of IPv4 or IPv6 advertises through a device of
+/// `mtu`, less its timestamps (`ipv4_default_advmss`, `ip6_default_advmss`).
+pub(crate) fn advertised_mss(v4: bool, mtu: usize) -> u32 {
+    let headers = if v4 { 40 } else { 60 };
+    let mss = mtu.saturating_sub(headers).min(MSS_MAX);
+    u32::try_from(mss).unwrap_or(0).saturating_sub(TIMESTAMPS)
 }
 /// The segments `bytes` take, of [`SND_MSS`] each.
 fn segments(bytes: u64) -> u32 {

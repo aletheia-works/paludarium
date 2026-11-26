@@ -1059,6 +1059,7 @@ static int case_output(void) {
     return 0;
 }
 
+#define SAMPLE_IP (1ULL << 0)
 #define SAMPLE_ADDR (1ULL << 3)
 #define SAMPLE_CALLCHAIN (1ULL << 5)
 #define SAMPLE_ID (1ULL << 6)
@@ -1317,6 +1318,102 @@ static void own_signals(int fd) {
     io_alike = 1;
 }
 
+/* One store, at a known instruction. */
+extern const char store_here[];
+__attribute__((noinline, noclone)) static void store_at(char *p) {
+    __asm__ volatile(".globl store_here\nstore_here: movb $1, (%0)" : : "r"(p) : "memory");
+}
+
+static char *volatile at_store;
+static volatile int traps_at_store, traps_before_store, traps_addressed;
+static void on_trap_at_store(int number, siginfo_t *info, void *context) {
+    (void)number;
+    const ucontext_t *u = context;
+    if ((const char *)u->uc_mcontext.gregs[REG_RIP] != store_here) return;
+    traps_at_store++;
+    traps_addressed += info->si_addr == at_store;
+    /* The page is there, the store not made yet. */
+    traps_before_store += *at_store == 0;
+}
+
+static volatile int io_before_store;
+static void on_io_at_store(int number, siginfo_t *info, void *context) {
+    (void)number;
+    (void)info;
+    const ucontext_t *u = context;
+    io_before_store += (const char *)u->uc_mcontext.gregs[REG_RIP] == store_here && *at_store == 0;
+}
+
+/* A fault of the program's own code is sampled, and signalled, at its
+   instruction: the handler runs before the instruction runs again. */
+static void at_occurrence(void) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_trap_at_store;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGTRAP, &sa, &old);
+    struct attr a = software(2);
+    a.sample_period = 1;
+    a.sample_type = SAMPLE_IP | SAMPLE_ADDR;
+    a.flags |= DISABLED | ATTR_SIGTRAP | REMOVE_ON_EXEC;
+    a.sig_data = 1;
+    int fd = (int)open_event(&a, 0, -1, -1, 0);
+    void *page = NULL;
+    map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    char *pages = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ioctl(fd, IOC_ENABLE, 0);
+    for (int i = 0; i < 3; i++) {
+        at_store = pages + i * 4096 + 64;
+        store_at(at_store);
+    }
+    ioctl(fd, IOC_DISABLE, 0);
+    int sampled = 0;
+    uint64_t head = PAGE_U64(page, 1024);
+    for (uint64_t off = 0; off < head; off += 24) {
+        uint64_t r[3];
+        copy_record(page, 4096, off, r, 3);
+        for (int i = 0; i < 3; i++)
+            sampled += r[1] == (uint64_t)(uintptr_t)store_here && r[2] == (uint64_t)(uintptr_t)(pages + i * 4096 + 64);
+    }
+    say("at the store: traps %d before it %d addressed %d samples %d stored %d", traps_at_store, traps_before_store,
+        traps_addressed, sampled, pages[64] + pages[4096 + 64] + pages[2 * 4096 + 64]);
+    /* A locked instruction that reads and writes takes a single fault. */
+    pages = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint64_t counts[4];
+    ioctl(fd, IOC_ENABLE, 0);
+    read(fd, counts, 8);
+    __asm__ volatile("lock addb $1, (%0)" : : "r"(pages) : "memory", "cc");
+    read(fd, counts + 1, 8);
+    uint8_t with = 1;
+    __asm__ volatile("xchgb %0, (%1)" : "+q"(with) : "r"(pages + 4096) : "memory");
+    read(fd, counts + 2, 8);
+    /* It writes whether it stores its operand or the value it read. */
+    uint8_t expected = 1;
+    __asm__ volatile("lock cmpxchgb %1, (%2)" : "+a"(expected) : "q"(with), "r"(pages + 2 * 4096) : "memory", "cc");
+    read(fd, counts + 3, 8);
+    ioctl(fd, IOC_DISABLE, 0);
+    say("read and written: add %d xchg %d cmpxchg %d", (int)(counts[1] - counts[0]), (int)(counts[2] - counts[1]),
+        (int)(counts[3] - counts[2]));
+    munmap(page, 2 * 4096);
+    close(fd);
+    sigaction(SIGTRAP, &old, NULL);
+
+    /* O_ASYNC's signal as well. */
+    fd = open_sampling(SAMPLE_IP, 0);
+    own_signals(fd);
+    sa.sa_sigaction = on_io_at_store;
+    sigaction(SIGRTMIN, &sa, NULL);
+    pages = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ioctl(fd, IOC_ENABLE, 0);
+    for (int i = 0; i < 2; i++) {
+        at_store = pages + i * 4096 + 8;
+        store_at(at_store);
+    }
+    ioctl(fd, IOC_DISABLE, 0);
+    say("at the store: signals before it %d", io_before_store);
+    close(fd);
+}
+
 static int case_wakeup(void) {
     /* Without a buffer, poll finds the event hung up. */
     int fd = open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
@@ -1408,6 +1505,7 @@ static int case_wakeup(void) {
     pages[123] = 1;
     ioctl(fd, IOC_DISABLE, 0);
     say("sigtrap address %d", trap_seen);
+    at_occurrence();
     /* Blocked, it waits, flagged as late. */
     sigset_t trap, old;
     sigemptyset(&trap);
@@ -1865,6 +1963,68 @@ static int case_side_band_cpu(void) {
     return 0;
 }
 
+/* Of a buffer of 8 data pages of samples with their IDs and addresses: how
+   many of the pages at `at` a thread of process `pid` faulted on. */
+static int sampled_pages(void *page, pid_t pid, char *at, int pages) {
+    int found = 0;
+    uint64_t head = PAGE_U64(page, 1024);
+    for (uint64_t off = 0; off + 24 <= head && off < 8 * 4096; off += 24) {
+        uint64_t r[3];
+        copy_record(page, 8 * 4096, off, r, 3);
+        uint64_t where = r[2] - (uint64_t)(uintptr_t)at;
+        if ((uint32_t)r[0] == RECORD_SAMPLE && (uint32_t)r[1] == (uint32_t)pid && where < (uint64_t)pages * 4096)
+            found++;
+    }
+    return found;
+}
+
+/* An event of a CPU (pid -1) counts and samples what any task does there.
+   Other tasks of the machine run there too, so that its count is at least
+   this process's, and only this process's samples are looked at. */
+static int case_cpu_samples(void) {
+    cpu_set_t first;
+    CPU_ZERO(&first);
+    CPU_SET(0, &first);
+    sched_setaffinity(0, sizeof first, &first);
+    int fds[2];
+    void *buffers[2];
+    for (int cpu = 0; cpu < 2; cpu++) {
+        struct attr a = software(2);
+        a.sample_period = 1;
+        a.sample_type = SAMPLE_TID | SAMPLE_ADDR;
+        a.flags |= DISABLED;
+        fds[cpu] = (int)open_event(&a, -1, cpu, -1, 0);
+        say("open %d", fds[cpu] >= 0);
+        if (fds[cpu] < 0 || map_event(fds[cpu], 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &buffers[cpu]) < 0) return 1;
+    }
+    fflush(stdout);
+    char *at = mmap(NULL, 12 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (int i = 0; i < 4; i++) at[i * 4096] = 1;
+    ioctl(fds[0], IOC_ENABLE, 0);
+    ioctl(fds[1], IOC_ENABLE, 0);
+    for (int i = 4; i < 9; i++) at[i * 4096] = 1;
+    pid_t child = fork();
+    if (child == 0) {
+        for (int i = 9; i < 12; i++) at[i * 4096] = 1;
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    ioctl(fds[0], IOC_DISABLE, 0);
+    ioctl(fds[1], IOC_DISABLE, 0);
+    uint64_t counted = count(fds[0]);
+    say("count>=8 %d", counted >= 8);
+    say("here: before %d own %d child %d", sampled_pages(buffers[0], getpid(), at, 4),
+        sampled_pages(buffers[0], getpid(), at + 4 * 4096, 5), sampled_pages(buffers[0], child, at + 9 * 4096, 3));
+    say("other: own %d child %d", sampled_pages(buffers[1], getpid(), at, 12),
+        sampled_pages(buffers[1], child, at, 12));
+    /* Off, it counts nothing. */
+    at = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (int i = 0; i < 4; i++) at[i * 4096] = 1;
+    say("off: same %d samples %d", count(fds[0]) == counted, sampled_pages(buffers[0], getpid(), at, 4));
+    return 0;
+}
+
 #define INHERIT_STAT (1ULL << 11)
 #define RECORD_READ 8
 
@@ -2143,6 +2303,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-wakeup")) return case_wakeup();
     if (!strcmp(mode, "perf-side-band")) return case_side_band();
     if (!strcmp(mode, "perf-inherit-stat")) return case_inherit_stat();
+    if (!strcmp(mode, "perf-cpu-samples")) return case_cpu_samples();
     if (!strcmp(mode, "perf-side-band-cpu")) return case_side_band_cpu();
     if (!strcmp(mode, "perf-side-band-comm")) return case_side_band_comm();
     if (!strcmp(mode, "perf-throttle")) return case_throttle();

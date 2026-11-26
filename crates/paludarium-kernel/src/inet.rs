@@ -1729,6 +1729,10 @@ struct State {
     link: Option<(Arc<OnceLock<Arc<Link>>>, usize)>,
     // UDP.
     peer: Option<SocketAddr>,
+    /// The address of the peer an IPv6 socket had before it disconnected,
+    /// which its binding has too ([`Binding::old_peer`]): kept here, as the
+    /// disconnect may unbind the socket, for the next bind or autobind.
+    old_peer: Option<IpAddr>,
     queries: VecDeque<Query>,
     /// Datagrams other guest sockets sent this one on the loopback.
     inbox: VecDeque<Datagram>,
@@ -2372,6 +2376,11 @@ impl InetSocket {
     fn now(&self) -> Option<u64> {
         self.host.clock(paludarium_host::ClockId::Monotonic).ok()
     }
+    /// Runs what is due, so that what the socket shows next is as of now.
+    /// Called with no socket's state locked.
+    fn settle(&self) {
+        self.hub.deadlines.run(|| self.now());
+    }
     fn options(&self) -> MutexGuard<'_, Options> {
         self.options.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -2400,6 +2409,7 @@ impl InetSocket {
         if self.datagram {
             return self.receive_datagram(buf, peek, waits);
         }
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let mut s = self.lock();
         s.note();
@@ -2441,6 +2451,7 @@ impl InetSocket {
     /// `ENOTCONN` for a listener, `EINVAL` with `SO_OOBINLINE` or none
     /// waiting; `peek` leaves it. Only the guest's own loopback carries one.
     fn receive_urgent(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let s = self.lock();
         if s.listen.is_some() {
@@ -2462,6 +2473,7 @@ impl InetSocket {
     }
     /// Whether the next read is at the urgent mark, for `SIOCATMARK`.
     pub(crate) fn at_mark(&self) -> bool {
+        self.settle();
         Self::joined(&self.lock()).is_some_and(|(link, side)| link.urgent_state(side).1)
     }
     /// `write` for the task whose real user and group IDs are `ids`.
@@ -2485,6 +2497,7 @@ impl InetSocket {
         if self.datagram {
             return self.send_datagram(bytes, to, ids);
         }
+        self.settle();
         let no_delay = self.options().no_delay;
         let mut s = self.lock();
         s.note();
@@ -2788,12 +2801,21 @@ impl InetSocket {
     /// and takes datagrams only from it, from that port on the source
     /// address of the route: the loopback's, or elsewhere the host's
     /// (`inet_dgram_connect`, `ip4_datagram_connect`). AF_UNSPEC disconnects
-    /// (`__udp_disconnect`), keeping only what the guest bound itself.
+    /// (`__udp_disconnect`), keeping the port and address the guest bound
+    /// itself, no device, and of an IPv6 socket its peer's address
+    /// ([`State::old_peer`]).
     fn connect_datagram(&self, address: Option<SocketAddr>) -> Result<u64, Errno> {
+        if address.is_none() {
+            // The options' lock comes before the state's.
+            self.put_device(0);
+        }
         let options = *self.options();
         let mut s = self.lock();
         let Some(address) = address else {
-            s.peer = None;
+            let peer = s.peer.take();
+            if self.family == Family::V6 {
+                s.old_peer = peer.map(|peer| peer.ip()).or(s.old_peer);
+            }
             let bindings = State {
                 bound: s.bound.take(),
                 port_locked: s.port_locked,
@@ -2803,6 +2825,7 @@ impl InetSocket {
                 ..State::default()
             };
             self.keep_locked(&mut s, &bindings);
+            self.ports().keep_peer(&self.this, s.old_peer);
             return Ok(0);
         };
         // Linux binds the port first, before it looks the route up.
@@ -2951,7 +2974,10 @@ impl InetSocket {
         // Linux's autobind finds no free port with EAGAIN.
         let bound = self
             .ports()
-            .bind(self.binding(every, options))
+            .bind(Binding {
+                old_peer: s.old_peer,
+                ..self.binding(every, options)
+            })
             .map_err(|_| Errno::EAGAIN)?;
         s.bound = Some(bound);
         Ok(bound)
@@ -3462,10 +3488,15 @@ impl InetSocket {
         if self.datagram {
             return Ok(if outgoing { 0 } else { self.next_datagram() });
         }
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let s = self.lock();
         if s.listen.is_some() {
             return Err(Errno::EINVAL);
+        }
+        if outgoing && let Some((link, side)) = Self::joined(&s) {
+            let queued = link.segments(side).queued;
+            return Ok(usize::try_from(queued).unwrap_or(usize::MAX));
         }
         // Not inline, the urgent byte and what follows it wait past the
         // mark (`tcp_inq`).
@@ -3496,6 +3527,7 @@ impl InetSocket {
             pooled: self.datagram && options.reuse_port,
             listening: false,
             peer: None,
+            old_peer: None,
             device: options.device,
             owner: Weak::clone(&self.this),
             time_wait: None,
@@ -3616,6 +3648,7 @@ impl InetSocket {
         options.v6_only |= only;
         s.bound = Some(self.ports().bind(Binding {
             locked: address.port() != 0,
+            old_peer: s.old_peer,
             ..self.binding(address, &options)
         })?);
         s.port_locked = address.port() != 0;
@@ -3880,6 +3913,7 @@ impl InetSocket {
             .store(self.uid.load(Ordering::SeqCst), Ordering::SeqCst);
         child.embryo.store(true, Ordering::SeqCst);
         let own = Stream::new(from);
+        let mtu = self.network.veth_link(dif.cast_signed()).1;
         own.set_waker(stream_waker(&child.signals, &child.hub, &own));
         own.set_clock(realtime(&child.host));
         size_buffers(&own, &options);
@@ -3887,8 +3921,9 @@ impl InetSocket {
             stream,
             &own,
             (from, to),
-            &self.host,
+            (&self.host, &self.hub.deadlines),
             [Arc::clone(notify), child.urgent_notify()],
+            mtu,
         );
         let _ = link.set(Arc::clone(&joined));
         let own_link = Arc::new(OnceLock::new());
@@ -4384,6 +4419,7 @@ impl FileHandle for InetSocket {
             return Ok((OUT | (u32::from(ready) * IN) | error | ends, s.received, 0));
         }
         self.retry_syns();
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let mut s = self.lock();
         // A listener is readable while a connection waits, and no more
@@ -4580,6 +4616,8 @@ pub(crate) struct Entry {
     pub(crate) table: Table,
     /// Its own address, IPv4 as such even on an IPv6 socket, and its peer's.
     pub(crate) local: SocketAddr,
+    /// The peer, or with port 0 the address an IPv6 UDP socket keeps of one
+    /// it had.
     pub(crate) peer: Option<SocketAddr>,
     /// The device it is bound to (`sk_bound_dev_if`), 0 for none.
     pub(crate) device: u32,
@@ -4639,6 +4677,7 @@ impl Network {
         // Linux's retransmission timer does on its own.
         if let Some(socket) = sockets.first() {
             socket.retry_syns();
+            socket.settle();
         }
         let mut entries: Vec<Entry> = sockets.iter().flat_map(|socket| socket.diag(now)).collect();
         let mut ports = self.ports(false);
@@ -4705,7 +4744,7 @@ impl InetSocket {
                 },
                 table: Table::Connected,
                 local,
-                peer: s.peer,
+                peer: s.peer.or(s.old_peer.map(|ip| SocketAddr::new(ip, 0))),
                 device: options.device,
                 cookie: self.cookie(),
                 timer: (0, 0, None),
@@ -4750,6 +4789,7 @@ impl InetSocket {
         // FIN counts until a read meets it, and this side's SYN or FIN
         // until its peer has it.
         let (unread, unsent) = stream.queued();
+        let unacked = Self::joined(&s).map(|(link, side)| link.segments(side).queued);
         let peer_ended = stream.readiness().read_closed && stream.phase() == Phase::Open;
         let unread = unread + usize::from(peer_ended && !s.eof_read);
         let queues = (unread as u32, unsent as u32);
@@ -4818,7 +4858,10 @@ impl InetSocket {
         entries.push(Entry {
             peer: Some(stream.peer()),
             timer,
-            queues: (queues.0, queues.1 + sending),
+            queues: (
+                queues.0,
+                unacked.map_or(queues.1 + sending, |unacked| unacked as u32),
+            ),
             ..entry(state, Table::Connected, shut)
         });
         entries
@@ -4890,6 +4933,20 @@ impl InetSocket {
         };
         let open = stream.phase() == Phase::Open;
         let unsent = unsent as u64;
+        let segments = Self::joined(s).map(|(link, side)| link.segments(side));
+        // A loopback connection's times are its segments'.
+        let at = |micros: Option<u64>| micros.map(|at| at.saturating_mul(1000)).or(counts.opened);
+        let (went, came, acked) = match &segments {
+            Some(of) => (at(of.data_went), at(of.data_came), at(of.ack_came)),
+            None => {
+                let (went, came) = (counts.wrote, counts.came);
+                (
+                    went.or(counts.opened),
+                    came.or(counts.opened),
+                    went.max(came).or(counts.opened),
+                )
+            }
+        };
         let carried = tcp_info::Carried {
             accepted: Self::joined(s).is_some_and(|(_, side)| side == 1),
             sent: counts.written.saturating_sub(unsent),
@@ -4897,10 +4954,11 @@ impl InetSocket {
             received: counts.read + unread as u64,
             fin_received: open && ready.read_closed,
             unsent,
-            since_sent: since(counts.wrote.or(counts.opened)),
-            since_received: since(counts.came.or(counts.opened)),
+            since_sent: since(went),
+            since_received: since(came),
+            since_ack: since(acked),
             rcv_wscale: counts.rcv_wscale,
-            segments: Self::joined(s).map(|(link, side)| link.segments(side)),
+            segments,
         };
         let in_flight = u32::from(matches!(state, TCP_FIN_WAIT1 | TCP_LAST_ACK));
         TcpInfo::connected(state, &carried, in_flight)

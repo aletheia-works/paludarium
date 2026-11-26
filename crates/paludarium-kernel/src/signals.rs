@@ -717,12 +717,13 @@ pub(crate) fn lowest_in(pending: &[PendingSignal], set: u64) -> Option<usize> {
         .min_by_key(|(index, s)| (s.number, *index))
         .map(|(index, _)| index)
 }
-/// The earliest deadline of the interval timer and the POSIX timers.
+/// The earliest deadline of the interval timer, the POSIX timers and what is
+/// due in the session ([`crate::deadlines`]).
 pub(crate) fn next_deadline(process: &ThreadState) -> Option<u64> {
-    match (process.timer.deadline, process.posix_deadline) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
+    [process.timer.deadline, process.posix_deadline, process.due]
+        .into_iter()
+        .flatten()
+        .min()
 }
 pub(crate) fn expire_timer(process: &mut ThreadState, now: u64) {
     if let Some(deadline) = process.timer.deadline

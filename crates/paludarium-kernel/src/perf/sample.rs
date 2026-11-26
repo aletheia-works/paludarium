@@ -14,7 +14,9 @@
 //! next record that fits follows a `PERF_RECORD_LOST` of them
 //! ([`super::buffer::Buffer::output`]).
 //!
-//! The emulator counts what a thread did as of its system calls
+//! A fault of a thread's own code that an event samples stops it at its
+//! instruction ([`samples_faults`]), and is sampled there. For the rest,
+//! the emulator counts what a thread did as of its system calls
 //! ([`crate::Usage`]), so the samples are taken there too ([`overflow`]),
 //! of the thread as it makes the call: its registers, its stack and the
 //! frames its `rbp` chain leads to. An occurrence in the thread's own code
@@ -484,16 +486,47 @@ pub(crate) fn overflow(
     if !events.sampling.load(Ordering::Relaxed) {
         return Vec::new();
     }
-    let sampling: Vec<Arc<Event>> = lock(&events.lists)
-        .counting
-        .iter()
-        .filter_map(super::event)
-        .filter(|event| event.attr.sampling() && event.counts(group, task.tid))
-        .collect();
+    let Some(usage) = group.last_thread_usage(task.tid) else {
+        return Vec::new();
+    };
+    let sampling: Vec<Arc<Event>> = {
+        let lists = lock(&events.lists);
+        let of_cpu = lists.cpu_sampling.iter().filter_map(super::event);
+        let of_cpu = of_cpu.filter(|event| u32::try_from(event.cpu) == Ok(task.cpu));
+        let of_task = lists.counting.iter().filter_map(super::event);
+        let of_task =
+            of_task.filter(|event| event.attr.sampling() && event.counts(group, task.tid));
+        of_cpu.chain(of_task).collect()
+    };
     sampling
         .into_iter()
-        .filter_map(|event| event.take_samples(task, per_tick))
+        .filter_map(|event| event.take_samples(task, &usage, per_tick))
         .collect()
+}
+
+/// Whether an enabled event samples the faults of the code of thread `tid`
+/// of `group`, which is on `cpu`.
+pub(crate) fn samples_faults(
+    events: &Events,
+    group: &crate::ThreadGroup,
+    tid: u32,
+    cpu: u32,
+) -> bool {
+    let wants = |event: &Event| {
+        event.counter == Counter::Faults
+            && event.attr.sampling()
+            && !event.attr.flag(bit::EXCLUDE_USER)
+            && (event.cpu < 0 || u32::try_from(event.cpu) == Ok(cpu))
+            && {
+                let state = lock(&event.state);
+                state.enabled && !state.paused && !state.removed
+            }
+    };
+    let lists = lock(&events.lists);
+    let mut of_cpu = lists.cpu_sampling.iter().filter_map(super::event);
+    let mut of_task = lists.counting.iter().filter_map(super::event);
+    of_cpu.any(|event| wants(&event))
+        || of_task.any(|event| event.counts(group, tid) && wants(&event))
 }
 
 /// Whether any event of the machine samples, for the checkpoints that
@@ -502,7 +535,81 @@ pub(crate) fn sampling(events: &Events) -> bool {
     events.sampling.load(Ordering::Relaxed)
 }
 
+/// What an event of a CPU has seen of one thread.
+pub(super) struct Look {
+    usage: Weak<crate::Usage>,
+    /// What its counter counts of it there, and its time there.
+    counts: (u64, u64),
+    ran: u64,
+}
+
+/// What an event of a CPU sees of a thread since its last look.
+struct Seen {
+    /// The occurrences in its own code and in the kernel, and its time.
+    new: [u64; 2],
+    ran: u64,
+    /// The thread's faults in its own code and in the kernel, wherever.
+    counted: (u64, u64),
+}
+
 impl Event {
+    /// Looks at the thread `usage` is of for this event of CPU `cpu`.
+    fn look(&self, usage: &Arc<crate::Usage>, cpu: u32) -> Seen {
+        let counts = self.of_counts(usage.counts_on(cpu));
+        let (_, ran) = usage.time_on(cpu);
+        let mut looks = lock(&self.looks);
+        looks.retain(|look| look.usage.strong_count() != 0);
+        let at = looks
+            .iter()
+            .position(|look| std::ptr::eq(look.usage.as_ptr(), Arc::as_ptr(usage)));
+        let was = match at {
+            Some(at) => {
+                let look = &mut looks[at];
+                let was = (look.counts, look.ran);
+                (look.counts, look.ran) = (counts, ran);
+                was
+            }
+            // It started since the event was enabled.
+            None => {
+                looks.push(Look {
+                    usage: Arc::downgrade(usage),
+                    counts,
+                    ran,
+                });
+                ((0, 0), 0)
+            }
+        };
+        Seen {
+            new: [
+                counts.0.saturating_sub(was.0.0),
+                counts.1.saturating_sub(was.0.1),
+            ],
+            ran: ran.saturating_sub(was.1),
+            counted: (
+                usage.faults.load(Ordering::SeqCst),
+                usage.kernel_faults.load(Ordering::SeqCst),
+            ),
+        }
+    }
+    /// A sampling event of a CPU is enabled: what the threads did there
+    /// until now is none of its.
+    pub(super) fn look_at_all(&self) {
+        let (super::Target::Cpu, Ok(cpu)) = (&self.target, u32::try_from(self.cpu)) else {
+            return;
+        };
+        if !self.attr.sampling() {
+            return;
+        }
+        let usages = self.machine().map_or_else(Vec::new, |m| m.usages());
+        *lock(&self.looks) = usages
+            .iter()
+            .map(|usage| Look {
+                usage: Arc::downgrade(usage),
+                counts: self.of_counts(usage.counts_on(cpu)),
+                ran: usage.time_on(cpu).1,
+            })
+            .collect();
+    }
     /// The event whose buffer it writes to and which counts what is lost:
     /// for an inherited one, the one it comes from.
     pub(super) fn top(self: &Arc<Self>) -> Option<Arc<Event>> {
@@ -513,14 +620,24 @@ impl Event {
     }
     /// Its overflows since they were last taken, their samples and the
     /// signals they send, and its `sigtrap`.
-    fn take_samples(self: &Arc<Self>, task: &Task<'_>, per_tick: u64) -> Option<PendingSignal> {
+    fn take_samples(
+        self: &Arc<Self>,
+        task: &Task<'_>,
+        usage: &Arc<crate::Usage>,
+        per_tick: u64,
+    ) -> Option<PendingSignal> {
+        let of_cpu = matches!(self.target, super::Target::Cpu);
         let (occurred, tally) = {
             let state = self.settle();
-            if state.removed {
+            // What ran while an event of a CPU was off is none of its.
+            if state.removed || of_cpu && (!state.enabled || state.paused) {
                 return None;
             }
             (state.occurred, state.tally)
         };
+        // Of the thread alone, for an event of a CPU.
+        let seen = of_cpu.then(|| self.look(usage, task.cpu));
+        let tally = seen.as_ref().map_or(tally, |seen| seen.counted);
         let period_field = self.attr.sample_type & PERIOD != 0;
         // `event_limit`: the overflow that brings it to 0 is the last, and
         // disables the event (`POLL_HUP`).
@@ -540,6 +657,19 @@ impl Event {
                 occurred[1].saturating_sub(sampler.seen[1]),
             ];
             sampler.seen = occurred;
+            let new = match &seen {
+                Some(seen) if self.counter == Counter::Clock => {
+                    // The hrtimer went on while no thread ran there, or
+                    // others: no sample of this one is of then.
+                    let ran = seen.ran.min(new[0]);
+                    let idle = new[0] - ran;
+                    let (mut none, mut dropped) = (u64::MAX, Vec::new());
+                    sampler.ticks(idle, u64::MAX, &mut none, &mut dropped);
+                    [ran, 0]
+                }
+                Some(seen) => seen.new,
+                None => new,
+            };
             if new == [0, 0] && !sampler.unthrottled {
                 return None;
             }
@@ -583,7 +713,7 @@ impl Event {
                     unused +=
                         sampler.occurrences(n, period_field, freq, &mut limit, &mut overflows);
                     let counted = [tally.0, tally.1][mode];
-                    self.fires(&overflows, mode == 1, (counted, n), &mut fires);
+                    self.fires(usage, &overflows, mode == 1, (counted, n), &mut fires);
                 }
                 (0, unused)
             }
@@ -655,6 +785,7 @@ impl Event {
     /// their faults' addresses ([`Self::shows_address`]).
     fn fires(
         &self,
+        usage: &crate::Usage,
         overflows: &[Overflow],
         kernel: bool,
         (counted, n): (u64, u64),
@@ -668,13 +799,7 @@ impl Event {
             out.extend(fires.into_iter().map(|fire| (fire, !kernel, At::default())));
             return;
         }
-        let addresses = match &self.target {
-            super::Target::Thread { group, tid } => group
-                .last_thread_usage(*tid)
-                .map(|usage| usage.fault_addresses(kernel, counted, n))
-                .unwrap_or_default(),
-            super::Target::Cpu => Vec::new(),
-        };
+        let addresses = usage.fault_addresses(kernel, counted, n);
         for overflow in overflows {
             let runs = if overflow.each { overflow.n } else { 1 };
             for i in 0..runs {

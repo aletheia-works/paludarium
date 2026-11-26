@@ -1768,8 +1768,7 @@ kernel.
   does, in either layout: at a free hint that ends by 2 GiB, else in the
   lowest room from 1 GiB up (Linux starts up to 32 MiB higher, at random),
   with the placements at a 2 MiB boundary there too, or `ENOMEM`.
-  `MAP_FIXED` overrides it, and `mremap` does not keep to it. The mapping
-  of an `io_uring` ring does not follow it yet. A hint below
+  `MAP_FIXED` overrides it, and `mremap` does not keep to it. A hint below
   `mmap_min_addr` (64 KiB) is taken as that address; a fixed mapping
   below it, a move there by `mremap` (once its target is unmapped and its
   source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone
@@ -5153,7 +5152,9 @@ kernel.
   there `ESRCH`, no task and no CPU or a CPU past the last `EINVAL`, and an
   unknown `clockid` `EINVAL`. The events that count are the software
   `cpu-clock` and `task-clock`, in nanoseconds of the thread's CPU time (an
-  event of a CPU counts the time that passes); a thread's `page-faults` and
+  event of a CPU counts the time that passes, and of the counts below those
+  of every thread of the machine there, an ended one's too, and samples each
+  thread's); a thread's `page-faults` and
   `minor-faults` (a first read or write of a page, and a write to a page
   `fork` shares or a private mapping of a file's: the faults of the
   thread's code, left out with `exclude_user`, and those of the kernel's
@@ -6446,7 +6447,9 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     read, or after 40 ms (`TCP_QUICKACK` sets which); at most 10 in flight
     at first; a tail loss probe, which sends the last again; and the end,
     with the data held before it. `FIN_WAIT1` lasts until the end is
-    acknowledged. A UDP socket has no TCP options (`EOPNOTSUPP`).
+    acknowledged. What is held reaches the peer, with its time, when it
+    does on Linux, whether or not a call is made then: `SIGIO` for it ends
+    a sleep. A UDP socket has no TCP options (`EOPNOTSUPP`).
   - **Timestamps**: every UDP datagram is stamped as it comes, and
     `recvmsg` gives that time as Linux's `udp_recvmsg` does
     (`sock_recv_timestamp`), however late the receiver took the options:
@@ -6576,7 +6579,8 @@ one only with an `--allow-net`.
   connection as Linux's do, roughly: what waits to be sent holds up to the
   doubled `SO_SNDBUF`, and what has arrived up to half of the doubled
   `SO_RCVBUF`, so a small one makes a sender wait or `EAGAIN` early. One
-  not set holds 256 KiB. `SIOCOUTQ` and `FIONREAD` count the two.
+  not set holds 256 KiB. `SIOCOUTQ` counts what waits to be sent or
+  acknowledged, and `FIONREAD` what has arrived.
 - **Urgent data**, as Linux's TCP keeps it: the last byte of a `MSG_OOB`
   send is urgent and reaches the peer with the bytes before it. Reads
   stop before its mark, which `SIOCATMARK` reports and `FIONREAD` counts
@@ -6607,7 +6611,10 @@ one only with an `--allow-net`.
   port stays on every address). It receives only from its
   peer, and
   `AF_UNSPEC` disconnects it, keeping only the port and address the guest
-  bound itself. A datagram holds up to 65507 bytes over IPv4 and 65527 over
+  bound itself, and no device (`__udp_disconnect`). An IPv6 socket keeps its
+  peer's address too (`sk_v6_daddr`), which `sock_diag` tells with port 0: it
+  takes an IPv6 datagram from that address alone, and any IPv4 one, until it
+  connects again. A datagram holds up to 65507 bytes over IPv4 and 65527 over
   IPv6 (`EMSGSIZE`), may be empty, and is cut to the reader's buffer
   (`MSG_TRUNC`); `FIONREAD` gives the first one's length. Each takes of the
   receive buffer what x86-64 Linux 7.0 counts as its `sk_buff`'s

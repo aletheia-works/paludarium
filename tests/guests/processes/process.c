@@ -18291,6 +18291,56 @@ static int mmap_low_case(void) {
     shmctl(id, IPC_RMID, NULL);
     return 0;
 }
+/* The io-uring-placement case: a mapping of a ring may ask for no address
+   (EINVAL): a hint within the first page is rounded down to none, and one
+   below mmap_min_addr is not (round_hint_to_min), while a fixed one is taken
+   as it is. A bad offset is ENOMEM next, and both come before what a fixed
+   mapping at 0 needs (EPERM), and that before the length its region needs
+   (EFAULT). MAP_32BIT places it low. */
+static int io_uring_placement_case(void) {
+    struct uring u;
+    long page = 4096;
+    int rw = PROT_READ | PROT_WRITE, fixed = MAP_SHARED | MAP_FIXED;
+    if (uring_open(&u, 128)) return 80;
+    struct {
+        unsigned long addr;
+        unsigned entries;
+        unsigned short bgid, flags;
+        unsigned long resv[3];
+    } reg = {0, 8, 3, 1, {0}};
+    if (syscall(427, u.fd, 22, &reg, 1)) return 81;
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 82;
+    unsigned long hints[] = {1, 0xfff, 0x1000, 0xffff, 0x10000, 0x30000000};
+    for (int i = 0; i < 6; i++) {
+        char *at = (char *)hints[i];
+        printf("%#lx: hint=%d", hints[i], low_error(mmap(at, page, rw, MAP_SHARED, u.fd, 0)));
+        printf(" fixed=%d", low_error(mmap(at, page, rw, fixed, u.fd, 0)));
+        printf(" noreplace=%d",
+               low_error(mmap(at, page, rw, MAP_SHARED | MAP_FIXED_NOREPLACE, u.fd, 0)));
+        printf(" offset=%d\n", low_error(mmap(at, page, rw, MAP_SHARED, u.fd, 0x20000000)));
+    }
+    printf("zero: fixed=%d", low_error(mmap(NULL, page, rw, fixed, u.fd, 0)));
+    printf(" noreplace=%d",
+           low_error(mmap(NULL, page, rw, MAP_SHARED | MAP_FIXED_NOREPLACE, u.fd, 0)));
+    printf(" offset=%d", low_error(mmap(NULL, page, rw, fixed, u.fd, 0x20000000)));
+    printf(" group=%d", low_error(mmap(NULL, page, rw, fixed, u.fd, 0x80000000L | 9 << 16)));
+    printf(" short=%d\n", low_error(mmap(NULL, page, rw, fixed, u.fd, 0x10000000)));
+    printf("short=%d\n", low_error(mmap(NULL, page, rw, MAP_SHARED, u.fd, 0x10000000)));
+    unsigned long offsets[] = {0, 0x8000000, 0x10000000, 0x80000000UL | 3 << 16};
+    long sizes[] = {page, page, 2 * page, page};
+    for (int i = 0; i < 4; i++) {
+        char *a = mmap(NULL, sizes[i], rw, MAP_SHARED, u.fd, offsets[i]);
+        char *b = mmap((char *)0x10, sizes[i], rw, MAP_SHARED | MAP_32BIT, u.fd, offsets[i]);
+        printf("%#lx: high=%d low=%d", offsets[i], a != MAP_FAILED && (uintptr_t)a >= 0x80000000,
+               low_area(b, sizes[i]));
+        if (a == MAP_FAILED || b == MAP_FAILED) return 83;
+        a[sizes[i] - 1] = 42;
+        printf(" same=%d\n", b[sizes[i] - 1]);
+    }
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -41821,6 +41871,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
     if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "mmap-low")) return mmap_low_case();
+    if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();

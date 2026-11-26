@@ -39,6 +39,7 @@ mod bpf_prog_tests;
 mod bpf_tests;
 mod bpf_trie;
 mod bpf_verifier;
+mod deadlines;
 mod devices;
 mod dnotify;
 mod epoll;
@@ -509,6 +510,29 @@ impl Usage {
         }
         on
     }
+    /// Adds what it counted on each CPU to `sums`.
+    pub(crate) fn add_counts(&self, sums: &mut Vec<[u64; 4]>) {
+        let cpus: Vec<u32> = {
+            let counts = self
+                .per_cpu_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let on = counts.on.map(|(cpu, _)| cpu);
+            let left = u32::try_from(counts.done.len()).unwrap_or(u32::MAX);
+            let more = on.filter(|&cpu| cpu >= left);
+            (0..left).chain(more).collect()
+        };
+        for cpu in cpus {
+            let counts = self.counts_on(cpu);
+            let cpu = cpu as usize;
+            if sums.len() <= cpu {
+                sums.resize(cpu + 1, [0; 4]);
+            }
+            for (sum, count) in sums[cpu].iter_mut().zip(counts) {
+                *sum = sum.saturating_add(count);
+            }
+        }
+    }
     /// Its CPU time in nanoseconds and what of it was on `cpu`, as of the
     /// latest look at it.
     pub(crate) fn time_on(&self, cpu: u32) -> (u64, u64) {
@@ -781,6 +805,8 @@ pub struct ThreadState {
     pub(crate) timer: signals::RealTimer,
     /// The earliest POSIX timer deadline, synced from the thread group.
     pub(crate) posix_deadline: Option<u64>,
+    /// When something is next due in the session ([`deadlines`]).
+    pub(crate) due: Option<u64>,
     pub stopped: bool,
     /// The thread's name (`comm`), NUL-padded: PR_SET_NAME and PR_GET_NAME.
     pub(crate) name: [u8; 16],
@@ -861,6 +887,9 @@ pub struct Kernel {
     group: Arc<ThreadGroup>,
     /// What resolves its calls' faulting copies ([`KernelCopies`]).
     copies: Option<Arc<userfaultfd::KernelCopies>>,
+    /// Its thread's faults are refused, for an event to sample each at its
+    /// instruction ([`paludarium_mmu::faults::arm`]).
+    armed: bool,
     pending_child: Option<(Box<Kernel>, Thread)>,
     processes: Arc<Processes>,
     spawn_memory: Option<Arc<AddressSpace>>,
@@ -907,6 +936,7 @@ impl Kernel {
     pub fn new(host: Arc<dyn Host>) -> Self {
         let files = files::Files::with_host(Arc::clone(&host));
         let group = Arc::new(ThreadGroup::default());
+        group.watch(&files.readiness.deadlines);
         let processes = Arc::new(Processes::new(group.clone()));
         Kernel {
             host,
@@ -917,6 +947,7 @@ impl Kernel {
             inbox: Arc::new(SignalInbox::default()),
             group,
             copies: None,
+            armed: false,
             pending_child: None,
             processes,
             spawn_memory: None,
@@ -1453,6 +1484,18 @@ impl Kernel {
         if sampling {
             self.perf_samples(thread, mem);
         }
+        // A fault of its own code that an event samples stops the thread at
+        // its instruction.
+        if sampling || self.armed {
+            self.armed = sampling
+                && perf::samples_faults(
+                    &self.processes.perf_events,
+                    &self.group,
+                    thread.tid,
+                    thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+                );
+            paludarium_mmu::faults::arm(self.armed);
+        }
         if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
             self.group.expire_timer(&mut thread.state, now);
         }
@@ -1820,6 +1863,24 @@ impl Kernel {
                 reason,
             };
             return self.userfault(thread, mem, context, access);
+        }
+        // One a sampling event is to see ([`paludarium_mmu::faults::arm`]):
+        // the page is brought in, and the samples and signals are those of
+        // the instruction, which then runs again, as Linux's return from the
+        // fault runs the task work of its overflow first.
+        if let ExitReason::PageFault {
+            rip,
+            addr,
+            write,
+            fetch,
+            mapped: true,
+            ..
+        } = reason
+            && self.armed
+            && mem.touch(addr, write, fetch)
+        {
+            thread.cpu.rip = rip;
+            return self.checkpoint(thread, mem);
         }
         let fault = match reason {
             ExitReason::PageFault {

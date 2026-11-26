@@ -7014,6 +7014,14 @@ one only with an `--allow-net`.
   handler has run, which runs with that mask; the original mask is back after
   it. The mask stays through a stop, as on Linux, so a signal that only it
   unblocks, sent while the thread is stopped, is taken as the stop ends.
+- On its way back to user space a thread takes every signal it may, as
+  Linux's `exit_to_user_mode_loop`: its own pending ones by number, then the
+  process's by number (`dequeue_signal`), the synchronous ones (`SIGSEGV`,
+  `SIGBUS`, `SIGILL`, `SIGTRAP`, `SIGFPE`, `SIGSYS`) first, a queued
+  real-time signal's instances in the order they came. Each handler's frame
+  goes on the one before, with the mask that handler runs with, so the last
+  frame's handler runs first, and a signal that mask blocks waits for its
+  `rt_sigreturn`. Only the first can restart the call the thread was in.
 - A `sigaction` that makes a signal ignored (`SIG_IGN`, or `SIG_DFL` for
   `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH`, which are ignored by
   default) discards its pending instances in the process and in every thread,

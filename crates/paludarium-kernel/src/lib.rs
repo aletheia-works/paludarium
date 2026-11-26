@@ -1545,6 +1545,7 @@ impl Kernel {
             };
             io_uring::run_task_work(&mut ctx);
         }
+        let mut delivered = false;
         while let Some(index) = signals::next_pending(&thread.state, false) {
             let mut signal = thread.state.pending.remove(index);
             // A traced thread reports each signal but SIGKILL to its tracer
@@ -1678,7 +1679,16 @@ impl Kernel {
             }
             if stepped {
                 self.ptrace_handler_entered(thread, &mut restart);
+                return Next::Resume;
             }
+            // Linux's way back to user space sets up a frame for each signal
+            // it may deliver, the next on this one, before any handler runs
+            // (`exit_to_user_mode_loop`); only the first restarts the call.
+            restart.number = None;
+            restart.seccomp = None;
+            delivered = true;
+        }
+        if delivered {
             return Next::Resume;
         }
         // The temporary wait mask ends with no handler run, unless the

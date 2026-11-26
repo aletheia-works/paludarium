@@ -2,9 +2,9 @@
  * thread's own pending signals and the process's (`de_thread` frees only the
  * other threads, with theirs), and the actions as `flush_signal_handlers`
  * leaves them, which `CLONE_CLEAR_SIGHAND` does too. The signals each new
- * image then takes are listed by number, not in the order they come, until
- * the emulator takes them in Linux's order: a sort weakens the comparison,
- * and the change that fixes the order takes it out. */
+ * image then takes are listed as their handlers run: Linux takes the thread's
+ * own by number, then the process's by number (`dequeue_signal`), each with a
+ * frame on the one before, so the last frame's handler runs first. */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <signal.h>
@@ -96,16 +96,6 @@ static void after(const char *name) {
     for (int *n = numbers; *n; n++) handle(*n);
     int all[] = {SIGUSR1, SIGUSR2, SIGCHLD, SIGURG, RT1, RT2, RT3, 0};
     mask(SIG_UNBLOCK, all);
-    /* By number, then value. */
-    for (int i = 0; i < taken; i++)
-        for (int j = i + 1; j < taken; j++)
-            if (numbers_taken[j] < numbers_taken[i] ||
-                (numbers_taken[j] == numbers_taken[i] && values_taken[j] < values_taken[i])) {
-                int n = numbers_taken[i], v = values_taken[i], c = codes_taken[i];
-                numbers_taken[i] = numbers_taken[j], values_taken[i] = values_taken[j];
-                codes_taken[i] = codes_taken[j];
-                numbers_taken[j] = n, values_taken[j] = v, codes_taken[j] = c;
-            }
     printf("%s took:", name);
     for (int i = 0; i < taken; i++)
         printf(" %d/%d/%d", numbers_taken[i], codes_taken[i], values_taken[i]);
@@ -170,6 +160,22 @@ static void threads(int execer) {
     for (;;) pause();
 }
 
+/* The same signals with no exec, for their order alone. */
+static void order(void) {
+    int numbers[] = {SIGUSR1, SIGUSR2, SIGCHLD, RT1, RT2, 0};
+    mask(SIG_BLOCK, numbers);
+    syscall(SYS_tgkill, getpid(), gettid(), SIGUSR1);
+    kill(getpid(), SIGUSR2);
+    queue(getpid(), RT1, 11);
+    queue(getpid(), RT1, 12);
+    tqueue(gettid(), RT2, 21);
+    pid_t child = fork();
+    if (!child) _exit(3);
+    siginfo_t info;
+    waitid(P_PID, child, &info, WEXITED | WNOWAIT);
+    after("order");
+}
+
 /* CLONE_CLEAR_SIGHAND: the child's actions, as an exec leaves them. */
 static void clear_sighand(void) {
     set_actions();
@@ -198,8 +204,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "@leader")) threads(0);
     if (!strcmp(mode, "@thread")) threads(1);
     if (!strcmp(mode, "@clear-sighand")) clear_sighand();
-    const char *cases[] = {"@single", "@leader", "@thread", "@clear-sighand"};
-    for (int i = 0; i < 4; i++) {
+    if (!strcmp(mode, "@order")) order();
+    const char *cases[] = {"@order", "@single", "@leader", "@thread", "@clear-sighand"};
+    for (int i = 0; i < 5; i++) {
         pid_t pid = fork();
         if (!pid) {
             execl(self, self, cases[i], self, (char *)NULL);

@@ -365,6 +365,7 @@ mod linux {
                     | "bpf-prog-rewrites"
                     | "bpf-prog-udp"
                     | "bpf-prog-tcp"
+                    | "bpf-prog-segments"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -819,6 +820,7 @@ mod linux {
         bpf_prog_rewrites => ("bpf-prog-rewrites","bpf-prog"),
         bpf_prog_udp => ("bpf-prog-udp","bpf-prog"),
         bpf_prog_tcp => ("bpf-prog-tcp","bpf-prog"),
+        bpf_prog_segments => ("bpf-prog-segments","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
         dnotify_events => ("dnotify-events","inotify"),
@@ -1107,6 +1109,7 @@ mod linux {
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
+        processes_signal_threads => ("signal-threads","signal-threads"),
         processes_timer_waits_plain => ("timer-waits-plain","timer-waits"),
         processes_timer_waits_restart => ("timer-waits-restart","timer-waits"),
         processes_timer_waits_default => ("timer-waits-default","timer-waits"),

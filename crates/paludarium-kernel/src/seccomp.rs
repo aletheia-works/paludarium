@@ -1089,16 +1089,18 @@ pub(crate) fn notify(c: &mut Context<'_>, notify: &Notify) -> Reply {
 /// ([`crate::signals::fatal`]), a timer's that has expired too.
 fn fatal_pending(c: &mut Context<'_>) -> bool {
     if let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) {
-        c.group.expire_timer(c.process, now);
+        c.group.expire_due(now);
     }
     c.inbox.drain(c.process);
-    c.group.drain_process(c.process);
+    c.group.pass_process(c.process);
     if c.group.status().is_some()
         || (!c.inbox.owns_wake(c.cancellation) && c.cancellation.load(Ordering::SeqCst))
     {
         return true;
     }
     crate::signals::fatal_pending(c.process)
+        || c.group.killed()
+        || c.group.fatal_pending(c.inbox, c.process.signal_mask)
 }
 
 /// A wait that signals do not end: until the readiness ticket moves, or
@@ -1110,6 +1112,7 @@ fn wait_through_signals(c: &Context<'_>, ticket: u32) {
         return;
     };
     let end = now.saturating_add(10_000_000);
+    let _sleeps = c.inbox.tif().sleep_killable();
     if c.host
         .wait_on(&c.files.readiness.token, ticket, Some((clock, end)), &never)
         .is_err_and(|e| e == Errno::ENOSYS)

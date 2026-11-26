@@ -442,10 +442,25 @@ struct Tracee {
     stop: Option<Stop>,
     /// The tracee has exited, and its tracer has not waited for it.
     exited: Option<(ExitStatus, bool, u32)>,
+    /// What tells those who send it signals of its stops.
+    tif: Option<Arc<crate::targets::Tif>>,
+}
+
+impl Tracee {
+    /// `JOBCTL_TRACED` set or cleared.
+    fn set_trapped(&self, trapped: bool) {
+        if let Some(tif) = &self.tif {
+            tif.set_trapped(trapped);
+        }
+    }
 }
 
 impl Drop for Tracee {
     fn drop(&mut self) {
+        if let Some(tif) = &self.tif {
+            tif.set_traced(false);
+            tif.set_trapped(false);
+        }
         self.group.set_traced(false);
     }
 }
@@ -479,6 +494,10 @@ impl Traces {
         !self.lock().is_empty()
     }
     /// The process that traces task `tid`, if it is traced.
+    /// The task that traces task `tid`.
+    pub(crate) fn tracer_task(&self, tid: u32) -> Option<u32> {
+        self.lock().get(&tid).map(|t| t.tracer)
+    }
     pub(crate) fn tracer_of(&self, tid: u32) -> Option<u32> {
         self.lock().get(&tid).map(|t| t.tracer_pid)
     }
@@ -567,6 +586,7 @@ impl crate::Processes {
                 trap_stop: false,
                 stop: None,
                 exited: None,
+                tif: group.trace_thread(tid),
             },
         );
         true
@@ -620,6 +640,7 @@ impl crate::Processes {
                     status,
                     cpu: 0,
                 },
+                self.traces.tracer_task(tid).unwrap_or(tracer.0),
             );
         }
         self.changed().notify();
@@ -938,10 +959,11 @@ impl Kernel {
                 forced_tf: thread.state.ptrace.forced_tf,
                 debug: thread.state.ptrace.debug,
             });
-            tracee.tracer_pid
+            tracee.set_trapped(true);
+            (tracee.tracer_pid, tracee.tracer)
         };
         // `do_notify_parent_cldstop` for the tracer.
-        if let Some(view) = self.processes.view(tracer)
+        if let Some(view) = self.processes.view(tracer.0)
             && view.group.wants_stop_notices()
         {
             view.group.notify_child(
@@ -956,6 +978,7 @@ impl Kernel {
                     status: code & 0x7f,
                     cpu: self.group.process_cpu(),
                 },
+                tracer.1,
             );
         }
         self.processes.changed().notify();
@@ -995,6 +1018,7 @@ impl Kernel {
             }
             if self.fatal_pending(thread) {
                 if let Some(tracee) = traces.lock().get_mut(&thread.tid) {
+                    tracee.set_trapped(false);
                     tracee.stop = None;
                 }
                 break None;
@@ -1012,6 +1036,9 @@ impl Kernel {
             let _ = self.wait_for_children(ticket);
         };
         self.processes.changed().notify();
+        // `recalc_sigpending_tsk`, as `ptrace_stop` ends with.
+        self.inbox.tif().set_trapped(false);
+        self.inbox.tif().set_look();
         // A signal sent while the thread was stopped is pending as it goes
         // on, as Linux queues it on the task, so the checkpoint takes it
         // before the call the stop interrupted runs again (`get_signal`
@@ -1092,7 +1119,8 @@ impl Kernel {
     /// (Linux sends those threads SIGKILL; the thread that ends it still
     /// stops for `PTRACE_EVENT_EXIT`).
     fn fatal_pending(&self, thread: &mut Thread) -> bool {
-        self.group.drain_process(&mut thread.state);
+        // A stopped thread takes none of the process's signals.
+        self.group.pass_process(&mut thread.state);
         self.inbox.drain(&mut thread.state);
         (self.group.status().is_some() && thread.state.exit_status.is_none())
             || self.group.killed()
@@ -1992,6 +2020,7 @@ impl Kernel {
                     } else if std::mem::take(&mut stop.forced_tf) {
                         stop.cpu.rflags &= !flag::TF;
                     }
+                    tracee.set_trapped(false);
                 }
                 self.processes.changed().notify();
                 Ok(0)

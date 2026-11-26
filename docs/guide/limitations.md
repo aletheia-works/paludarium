@@ -311,9 +311,16 @@ verified.
     and waits for its acknowledgement takes no room of `SO_SNDBUF`, though
     `SIOCOUTQ` counts it. A connection across a veth pair has segments of
     its device's MTU, but the loopback's path MTU, advertised MSS and
-    windows. Beyond a handshake's tries and the segments a loss probe sends
-    again, nothing is retransmitted or lost; the peer's window scale is taken as Linux's
-    default, whatever buffer it set; and a connection the host made has
+    windows. A segment is lost only when a socket filter drops or cuts it
+    ([System calls](./features#system-calls)); its recovery is Linux's with its
+    default congestion control, cubic, but past the slow start threshold the
+    window grows by a segment a window, where cubic's grows with the time
+    since the loss, and an acknowledgement of a gap goes at once,
+    where Linux puts the fourth and later ones off a little. A connection
+    starts afresh: Linux keeps the round trip and the reordering that an
+    earlier one to the same address ended with (`tcp_metrics`), and the
+    first timeout of the next follows. The peer's
+    window scale is taken as Linux's default, whatever buffer it set; and a connection the host made has
     its segments estimated, in 32 KiB segments with one acknowledgement
     for each.
 - **File mappings**: a file mapping shows the file's page cache as on Linux
@@ -429,16 +436,21 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps and socket filters on AF_UNIX and UDP sockets only**: `bpf` makes
+- **BPF, maps and socket filters only**: `bpf` makes
   arrays, hashes, LRU hashes, longest-prefix-match tries, queues, stacks,
   bloom filters, and arrays and hashes of maps, and loads socket filters,
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
-  or packet socket, on a UDP socket and on the SYNs that come to a TCP
-  listener. None runs yet on the handshake's last ACK, nor on each of a
-  connection's segments (the data, ACKs and FINs that come to a connected
-  socket), as Linux's does (`tcp_filter`): a filter that drops or cuts them, or keeps a SYN but drops
-  that ACK, does otherwise there. On a UDP socket no
+  or packet socket, on a UDP socket, and on the segments of a handshake and
+  connection on the loopback or across a veth pair. A handshake whose SYN-ACK
+  the client's filter drops leaves no request with the listener, whose
+  SYN-ACK so comes again only with the client's SYN; a request that opens is
+  taken though the queue has filled up since its SYN; what a filter asks of
+  the socket (`bpf_get_socket_cookie`) is the connection's while that is a
+  request, where Linux's is the listener's; and data
+  that goes again after it has come, where no filter saw it before, reads
+  as zeros. A connection the host made has no segments here, and its filter
+  never runs. On a UDP socket no
   filter runs on the DNS stub's answers, which come through no device
   here; a datagram that Linux sends in fragments across a veth pair comes
   whole, though its filter sees the reassembled one's linear part and
@@ -702,11 +714,6 @@ verified.
     before any range (`EINVAL`), as Linux master does; the CI's kernel
     checks it with each range, so with no ranges, or only empty ones, it
     gives 0 there.
-  - A fatal signal other than SIGKILL marks a process as dying for
-    `process_mrelease` as it is sent even when the only thread that does
-    not block it already has a signal pending and is not running, or is
-    exiting. Linux's `wants_signal` passes over such a thread, so Linux
-    marks the process only once one of its threads takes the signal.
   - In a child of `fork`, `move_pages` shows a page of a program's own
     ELF segment that the loader wrote and nothing wrote since as there,
     where Linux copies no page table of a VMA without an `anon_vma`
@@ -1084,6 +1091,11 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
+- **A POSIX timer's signal, in part**: a timer on a clock of real time
+  sends to the process's leader first, where Linux's `posixtimer_get_target`
+  sends to a thread of the process that its interrupt finds running. One
+  whose signal is ignored is dropped as it is taken, where Linux keeps it
+  aside until it is no longer ignored.
 - **inotify, in part**: when a superblock goes, its files' watches hear
   `IN_UNMOUNT` in the order the files got their first mark of any group, as
   on Linux; but the dnotify mark a one-shot watch leaves on its directory

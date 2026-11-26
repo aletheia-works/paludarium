@@ -394,6 +394,12 @@ impl Stream {
         }
         taken
     }
+    /// Up to `max` of the bytes queued to send, from `at` on, which stay.
+    pub fn waiting(&self, at: usize, max: usize) -> Vec<u8> {
+        let s = self.lock();
+        let end = at.saturating_add(max).min(s.sending.len());
+        s.sending.range(at.min(end)..end).copied().collect()
+    }
     /// Whether nothing is queued and the guest has shut its sending down,
     /// and whether it has closed the stream.
     #[must_use]

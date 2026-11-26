@@ -1,4 +1,5 @@
-//! What a UDP socket's filter sees of a datagram as it comes
+//! What a UDP socket's filter sees of a datagram as it comes, and a TCP
+//! socket's of a segment
 //! (`sk_filter_trim_cap` from `udp_queue_rcv_one_skb` and
 //! `udpv6_queue_rcv_one_skb`): the `sk_buff` that x86-64 Linux 7.0 makes
 //! of it as it is sent (`ip_make_skb`, `ip6_make_skb`) and as it comes
@@ -6,11 +7,15 @@
 //! and the IP header before it.
 
 use crate::bpf_interp::{Packet, Skb};
+use crate::loopback::segments::{Segment, Tap};
+use crate::loopback::{Link, Names};
 // `SKB_MAX_ALLOC`: past it `__ip_append_data` puts the bytes in pages.
 use crate::skb::MAX_ALLOC;
 use crate::sockets::Filter;
 use core::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use paludarium_host::net::Stream;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 /// `ARPHRD_ETHER` and `ARPHRD_LOOPBACK`, a device's type.
 const ETHER: u16 = 1;
@@ -34,6 +39,7 @@ const TCP: u8 = 6;
 pub(super) const UDP_HEADER: usize = 8;
 
 /// A datagram as it is sent.
+#[derive(Clone)]
 pub(super) struct Sent {
     /// The source and destination as they go on the wire: IPv4 for an
     /// IPv4-mapped address.
@@ -58,6 +64,33 @@ pub(super) struct Sent {
     pub(super) ids: (u32, u32),
     /// Its time to live, or hop limit.
     pub(super) ttl: u8,
+}
+
+/// What a SYN, or the SYN-ACK that acknowledges it, goes with: its sequence
+/// number, what it acknowledges, its timestamp and the one it echoes.
+#[derive(Clone, Copy)]
+pub(super) struct Shake {
+    seq: u32,
+    ack: Option<u32>,
+    stamps: (u32, u32),
+}
+impl Shake {
+    /// A SYN at `now`, in microseconds.
+    pub(super) fn syn(names: &Names, now: u64) -> Self {
+        Self {
+            seq: names.first[0],
+            ack: None,
+            stamps: (names.stamp(0, now), 0),
+        }
+    }
+    /// The SYN-ACK at `now`, in microseconds, of a SYN that went at `echo`.
+    pub(super) fn answer(names: &Names, now: u64, echo: u64) -> Self {
+        Self {
+            seq: names.first[1],
+            ack: Some(names.first[0].wrapping_add(1)),
+            stamps: (names.stamp(1, now), names.stamp(0, echo)),
+        }
+    }
 }
 
 /// How a datagram comes to a socket.
@@ -132,7 +165,7 @@ impl Sent {
             filter,
             &data,
             (UDP, UDP_HEADER, !fragmented),
-            linear,
+            (linear, (0, 0)),
             way,
             host,
         )
@@ -141,31 +174,33 @@ impl Sent {
     /// Runs the listener's `filter` on the SYN of a connection to it that
     /// came `way`, with a receive window of `window` bytes and an MSS of
     /// `mss`: whether the filter keeps it (`tcp_filter` in `tcp_v4_rcv`
-    /// and `tcp_v6_rcv`, before `tcp_v4_do_rcv` takes it).
+    /// and `tcp_v6_rcv`, before `tcp_v4_do_rcv` takes it). Or the
+    /// client's on the SYN-ACK, as `shake` says.
     pub(super) fn syn_kept(
         &self,
         filter: &Filter,
         way: Way,
         window: (u16, u16, u8),
+        shake: Shake,
         host: &Arc<dyn paludarium_host::Host>,
     ) -> bool {
-        let data = self.syn(window, host);
+        let data = self.syn(window, shake);
         let len = data.len();
-        self.run(filter, &data, (TCP, len, true), len, way, host)
+        self.run(filter, &data, (TCP, len, true), (len, (1, 0)), way, host)
             .is_some()
     }
 
     /// Runs `filter` on the transport header and payload `data`, of
     /// protocol `proto`, whose first `cap` bytes it always keeps
     /// (`pskb_trim` to `max(cap, pkt_len)`), `DF` set when it goes `whole`,
-    /// `linear` of its bytes in the linear part, as it came `way`: how
-    /// many bytes past `cap` it keeps, or `None` when it drops it.
+    /// `linear` of its bytes in the linear part and `gso` its segments and
+    /// their size, as it came `way`: how many bytes past `cap` it keeps, or `None` when it drops it.
     fn run(
         &self,
         filter: &Filter,
         data: &[u8],
         (proto, cap, whole): (u8, usize, bool),
-        linear: usize,
+        (linear, gso): (usize, (u32, u32)),
         way: Way,
         host: &Arc<dyn paludarium_host::Host>,
     ) -> Option<usize> {
@@ -212,6 +247,7 @@ impl Sent {
             hash: self.hash,
             device: Some((index, kind)),
             payload_offset: cap as u32,
+            gso,
         };
         let packet = Packet {
             linear,
@@ -275,34 +311,28 @@ impl Sent {
         }
     }
 
-    /// A connection's SYN (`tcp_connect`): a random first sequence number,
-    /// the window `window`, unscaled, and `tcp_syn_options`' options in
-    /// `tcp_options_write`'s order, MSS `mss`, SACK permitted with the
-    /// timestamps (a random first value, and 0), and the window scale
-    /// `wscale`.
+    /// A connection's SYN (`tcp_connect`) or SYN-ACK
+    /// (`tcp_make_synack`): the first sequence number, the window `window`,
+    /// unscaled, and `tcp_syn_options`' options in `tcp_options_write`'s
+    /// order, MSS `mss`, SACK permitted with the timestamps, and the window
+    /// scale `wscale`.
     /// Its checksum is the pseudo-header's (`CHECKSUM_PARTIAL`,
     /// `__tcp_v4_send_check`).
-    fn syn(
-        &self,
-        (window, mss, wscale): (u16, u16, u8),
-        host: &Arc<dyn paludarium_host::Host>,
-    ) -> Vec<u8> {
-        let mut random = [0; 8];
-        let _ = host.random_bytes(&mut random);
+    fn syn(&self, (window, mss, wscale): (u16, u16, u8), shake: Shake) -> Vec<u8> {
         let mut h = Vec::with_capacity(40);
         h.extend(self.from.port().to_be_bytes());
         h.extend(self.to.port().to_be_bytes());
-        h.extend(&random[..4]);
-        h.extend([0, 0, 0, 0]);
-        // 40 bytes (`doff` 10), and SYN.
-        h.extend([0xa0, 0x02]);
+        h.extend(shake.seq.to_be_bytes());
+        h.extend(shake.ack.unwrap_or(0).to_be_bytes());
+        // 40 bytes (`doff` 10), and SYN, with ACK in the answer.
+        h.extend([0xa0, if shake.ack.is_some() { 0x12 } else { 0x02 }]);
         h.extend(window.to_be_bytes());
         h.extend([0, 0, 0, 0]);
         h.extend([2, 4]);
         h.extend(mss.to_be_bytes());
         h.extend([4, 2, 8, 10]);
-        h.extend(&random[4..]);
-        h.extend([0, 0, 0, 0]);
+        h.extend(shake.stamps.0.to_be_bytes());
+        h.extend(shake.stamps.1.to_be_bytes());
         h.extend([1, 3, 3, wscale]);
         let check = fold(self.pseudo(TCP, h.len()));
         h[16..18].copy_from_slice(&check.to_be_bytes());
@@ -343,7 +373,185 @@ impl Sent {
     }
 }
 
+/// The filter of a connected TCP socket, which each segment that comes to
+/// it passes.
+pub(super) struct Listening {
+    pub(super) filter: Filter,
+    /// What is the same of every segment: the addresses and hash.
+    pub(super) sent: Sent,
+    pub(super) way: Way,
+    /// The side that sends, its stream, and the window scale it offers.
+    pub(super) from: usize,
+    pub(super) stream: Weak<Stream>,
+    pub(super) link: Weak<Link>,
+    pub(super) wscale: u8,
+    /// The window, MSS and window scale of a SYN-ACK.
+    pub(super) syn: (u16, u16, u8),
+    pub(super) names: Names,
+    pub(super) id: AtomicU16,
+    pub(super) host: Arc<dyn paludarium_host::Host>,
+}
+
+impl Tap for Listening {
+    fn keep(&self, segment: &Segment<'_>) -> Option<u32> {
+        let mut data = if segment.syn {
+            let shake = Shake::answer(&self.names, segment.at, segment.echo);
+            self.sent.syn(self.syn, shake)
+        } else {
+            self.header(segment)
+        };
+        let header = data.len();
+        self.payload(segment, &mut data);
+        let segments = match segment {
+            // `tcp_v4_send_reset`'s is no connection's.
+            Segment {
+                reset: true, at: 0, ..
+            } => 0,
+            _ => segment.segments,
+        };
+        let size = if segments > 1 { segment.mss } else { 0 };
+        let mut sent = self.sent.clone();
+        if let Some(link) = self.link.upgrade() {
+            let sender = link.sender(self.from);
+            sent.priority = sender.priority;
+            sent.tos = sender.tos;
+            sent.ids = sender.ids;
+        }
+        // `ip_select_ident_segs`.
+        let step = segments.max(1) as u16;
+        sent.id = Some(self.id.fetch_add(step, Ordering::Relaxed));
+        let kept = sent.run(
+            &self.filter,
+            &data,
+            (TCP, header, true),
+            (header, (segments, size)),
+            self.way,
+            &self.host,
+        )?;
+        Some(kept as u32)
+    }
+}
+
+impl Listening {
+    /// The segment's TCP header (`__tcp_transmit_skb`,
+    /// `tcp_options_write`), its checksum the pseudo-header's.
+    fn header(&self, segment: &Segment<'_>) -> Vec<u8> {
+        let (from, to) = (self.from, 1 - self.from);
+        // The SYN takes a sequence number.
+        let seq = |side: usize, at: u64| {
+            self.names.first[side]
+                .wrapping_add(1)
+                .wrapping_add(at as u32)
+        };
+        let bare = segment.reset && segment.at == 0;
+        let mut h = Vec::with_capacity(60);
+        h.extend(self.sent.from.port().to_be_bytes());
+        h.extend(self.sent.to.port().to_be_bytes());
+        h.extend(seq(from, segment.start).to_be_bytes());
+        let (ack, window) = if bare {
+            (0, 0)
+        } else {
+            // `__tcp_select_window` rounds up to what the scale tells.
+            let window = segment.window.div_ceil(1 << self.wscale).min(65_535);
+            (seq(to, segment.ack), window as u16)
+        };
+        h.extend(ack.to_be_bytes());
+        let urgent = segment
+            .urgent
+            .and_then(|end| u16::try_from(end - segment.start).ok());
+        let mut flags = if bare { 0 } else { 0x10 };
+        for (set, flag) in [
+            (segment.fin, 1),
+            (segment.reset, 4),
+            (segment.push && segment.len > 0, 8),
+            (urgent.is_some(), 0x20),
+        ] {
+            flags |= if set { flag } else { 0 };
+        }
+        h.extend([0, flags]);
+        h.extend(window.to_be_bytes());
+        h.extend([0, 0]);
+        h.extend(urgent.unwrap_or(0).to_be_bytes());
+        if !bare {
+            h.extend([1, 1, 8, 10]);
+            h.extend(self.names.stamp(from, segment.at).to_be_bytes());
+            h.extend(self.names.stamp(to, segment.echo).to_be_bytes());
+            if !segment.sacks.is_empty() {
+                h.extend([1, 1, 5, 2 + 8 * segment.sacks.len() as u8]);
+                for &(start, end) in segment.sacks {
+                    h.extend(seq(to, start).to_be_bytes());
+                    h.extend(seq(to, end).to_be_bytes());
+                }
+            }
+        }
+        h[12] = (h.len() as u8 / 4) << 4;
+        let len = h.len() + segment.len as usize;
+        let check = fold(self.sent.pseudo(TCP, len));
+        h[16..18].copy_from_slice(&check.to_be_bytes());
+        h
+    }
+
+    /// The segment's bytes: those the sender's buffer still holds, and
+    /// before them, of one sent again, those that left it.
+    fn payload(&self, segment: &Segment<'_>, data: &mut Vec<u8>) {
+        let mut len = segment.len as usize;
+        let before = segment.moved.saturating_sub(segment.start) as usize;
+        if before > 0 {
+            // What left it before any filter looked is not kept.
+            let lost = before.saturating_sub(segment.behind.len()).min(len);
+            data.extend(core::iter::repeat_n(0, lost));
+            let held = before - before.saturating_sub(segment.behind.len());
+            let take = held.min(len - lost);
+            data.extend(
+                segment
+                    .behind
+                    .iter()
+                    .skip(segment.behind.len() - held)
+                    .take(take),
+            );
+            len -= lost + take;
+        }
+        if len > 0
+            && let Some(stream) = self.stream.upgrade()
+        {
+            let at = segment.start.saturating_sub(segment.moved) as usize;
+            data.extend(stream.waiting(at, len));
+        }
+    }
+}
+
 impl super::Network {
+    /// The Ethernet address and MTU of the peer of its veth end `index`.
+    fn peer_link(&self, index: i32) -> ([u8; 6], usize) {
+        let peer = self
+            .devices()
+            .by_index(index)
+            .and_then(|d| d.veth.as_ref()?.peer.clone());
+        peer.and_then(|peer| Some(peer.network.upgrade()?.veth_link(peer.index)))
+            .unwrap_or(([0; 6], LO_MTU))
+    }
+
+    /// How packets between this namespace's `local` address and `peer`
+    /// come to `local`.
+    pub(super) fn way(&self, local: IpAddr, peer: SocketAddr, now: Option<u64>) -> Way {
+        let here = match peer.ip() {
+            IpAddr::V4(ip) => self.addresses_at(now).is_local4(ip),
+            ip @ IpAddr::V6(v6) => v6.is_loopback() || self.local_device(ip, now) != 0,
+        };
+        let index = self.arrival_device(SocketAddr::new(local, 0), now);
+        if here || index == crate::netdev::LOOPBACK_OIF {
+            return Way::Loopback;
+        }
+        let (dst, _) = self.veth_link(index.cast_signed());
+        let (src, mtu) = self.peer_link(index.cast_signed());
+        Way::Veth {
+            index,
+            src,
+            dst,
+            mtu,
+        }
+    }
+
     /// The Ethernet address and MTU of its veth end `index`, if it has one.
     pub(super) fn veth_link(&self, index: i32) -> ([u8; 6], usize) {
         self.devices()

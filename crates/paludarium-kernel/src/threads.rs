@@ -1,6 +1,7 @@
 //! Shared process termination, signal dispositions, registry and futex queues.
 //! Each worker owns its Kernel thread context; no process lock spans CPU/I/O/wait.
 use crate::credentials::TaskIds;
+use crate::targets::{Sent, Targets, Tif};
 use crate::{
     AltStack, Kernel, Next, SignalAction, SignalInbox, Thread, ThreadState, futex::Futexes, signals,
 };
@@ -75,6 +76,8 @@ pub struct ThreadGroup {
     actions: Mutex<Arc<Mutex<BTreeMap<i32, SignalAction>>>>,
     process_inbox: Mutex<Arc<SignalInbox>>,
     process_pending: Mutex<ThreadState>,
+    /// The threads one of which a signal for the process wakes.
+    targets: Arc<Targets>,
     discards: Arc<signals::Discards>,
     /// The signals the threads' drains made pending, for the signal files
     /// of the other threads ([`SignalInbox::others_arrivals`]).
@@ -238,6 +241,9 @@ pub(crate) struct PublicThread {
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
+        let targets = Arc::<Targets>::default();
+        let process_inbox = SignalInbox::default();
+        process_inbox.join(Arc::clone(&targets));
         Self {
             exec_owner: AtomicU32::new(0),
             retired: Mutex::new(BTreeSet::new()),
@@ -261,8 +267,9 @@ impl Default for ThreadGroup {
             status: Mutex::new(None),
             leader_exit: AtomicI32::new(0),
             actions: Mutex::default(),
-            process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
+            process_inbox: Mutex::new(Arc::new(process_inbox)),
             process_pending: Mutex::new(ThreadState::default()),
+            targets,
             discards: Arc::default(),
             arrivals: Arc::default(),
             timer_generation: AtomicU64::new(0),
@@ -335,9 +342,9 @@ impl ThreadGroup {
     /// process, ends the whole process at once, as Linux's
     /// `complete_signal` starts a group exit as it sends it: its action is
     /// the default (`sig_fatal`: neither ignored nor stopping), which
-    /// writes no core (`sig_kernel_coredump`), and a thread that takes it
-    /// (`thread`, or any of the process's) does not block it; a stopped
-    /// process takes none but SIGKILL then (`wants_signal`).
+    /// writes no core (`sig_kernel_coredump`), and a thread wants it
+    /// (`thread`, or any of the process's: [`crate::targets::Targets::wanted`]);
+    /// a stopped or traced process takes none but SIGKILL then.
     pub(crate) fn fatal_at_send(&self, number: i32, thread: Option<u32>) -> bool {
         if number == 9 {
             return true;
@@ -356,13 +363,7 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&number)
             .is_none_or(|action| action.handler == 0);
-        let bit = 1u64 << (number - 1);
-        let public = self.public.lock().unwrap_or_else(PoisonError::into_inner);
-        let wanted = match thread {
-            Some(tid) => public.get(&tid).is_some_and(|t| t.blocked & bit == 0),
-            None => public.values().any(|t| t.blocked & bit == 0),
-        };
-        default && wanted
+        default && self.targets.wanted(number, thread)
     }
     /// Marks the process as killed: a fatal signal was sent to it
     /// ([`Self::fatal_at_send`]).
@@ -554,6 +555,7 @@ impl ThreadGroup {
     pub(crate) fn end_exec(&self, old_tid: u32, pid: u32, inbox: Arc<SignalInbox>) {
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         members.remove(&old_tid);
+        self.targets.exec(pid, inbox.tif());
         members.insert(pid, inbox);
         // The new leader has not exited, whatever the old one left.
         self.leader_exit.store(0, Ordering::SeqCst);
@@ -886,6 +888,11 @@ impl ThreadGroup {
             let queued = pending.pending.len();
             let directed = timers.expire_foreign(&mut pending, pid, cpu);
             let fired = pending.pending.len() > queued;
+            let fired: Vec<i32> = if fired {
+                pending.pending[queued..].iter().map(|s| s.number).collect()
+            } else {
+                Vec::new()
+            };
             (directed, (timers.foreign_armed(pid), fired))
         };
         for (tid, signal) in directed {
@@ -902,10 +909,14 @@ impl ThreadGroup {
                     .set_overrun(id, overrun);
             }
         }
-        // A signal for the process waits in its pending set: its threads
-        // look again.
-        if armed.1 {
+        // A signal for the process waits in its pending set: the thread it
+        // is for looks again.
+        if !armed.1.is_empty() {
             self.timers_changed();
+        }
+        for number in armed.1 {
+            self.inbox_of_process()
+                .queued_elsewhere(number, Sent::Leader);
         }
         armed.0
     }
@@ -994,12 +1005,13 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let now = self.accounted_cpu();
+        // `check_cpu_itimer` and `check_rlimit` send to the thread that runs.
         let send = |number| {
-            let _ = self
-                .process_inbox
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .send_pending(signals::PendingSignal::user(number, 128));
+            if self.prepare(number, Sent::Running) {
+                let _ = self
+                    .inbox_of_process()
+                    .send_to(signals::PendingSignal::user(number, 128), Sent::Running);
+            }
         };
         // Linux checks ITIMER_PROF first.
         for (index, number) in [(1, 27), (0, 26)] {
@@ -1024,13 +1036,151 @@ impl ThreadGroup {
         self.cpu_timers_armed
             .store(timers.armed(), Ordering::SeqCst);
     }
-    /// Sends this process SIGCHLD about `child`, with its `CLD_*` `code`.
-    pub(crate) fn notify_child(&self, code: i32, child: signals::ChildSignal) {
-        let _ = self
-            .process_inbox
+    fn inbox_of_process(&self) -> Arc<SignalInbox> {
+        Arc::clone(
+            &self
+                .process_inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+    /// `prepare_signal` of signal `number`, sent to `sent`: a stop signal
+    /// takes the pending SIGCONTs away, and SIGCONT the stop signals. Whether
+    /// it is queued, not if it is ignored (`sig_ignored`).
+    fn prepare(&self, number: i32, sent: Sent) -> bool {
+        if !(1..=64).contains(&number) {
+            return true;
+        }
+        match number {
+            18 => (19..=22).for_each(|stop| self.flush(stop)),
+            19..=22 => self.flush(18),
+            _ => {}
+        }
+        let handler = self
+            .shared_actions()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .send_child(code, child);
+            .get(&number)
+            .map_or(0, |action| action.handler);
+        let ignored = handler == 1 || handler == 0 && matches!(number, 17 | 18 | 23 | 28);
+        if number == 18 && self.stopped.swap(false, Ordering::SeqCst) {
+            self.targets.resume();
+            self.inbox_of_process().passed_on();
+        }
+        !ignored || matches!(number, 9 | 19) || self.targets.keeps(sent, number)
+    }
+    /// Takes the pending instances of signal `number` away from the process
+    /// and from each of its threads.
+    fn flush(&self, number: i32) {
+        self.discards.mark(number);
+        let mut pending = self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        pending.pending.retain(|signal| signal.number != number);
+        drop(pending);
+        self.inbox_of_process().purge(number);
+        for inbox in self
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            inbox.purge(number);
+        }
+    }
+    /// Sends this process SIGCHLD about `child`, made by its thread `maker`
+    /// (`real_parent`), with its `CLD_*` `code`.
+    pub(crate) fn notify_child(&self, code: i32, child: signals::ChildSignal, maker: u32) {
+        let sent = Sent::Alive(maker);
+        if self.prepare(signals::SIGCHLD, sent) {
+            let _ = self.inbox_of_process().send_child(code, child, sent);
+        }
+    }
+    /// Thread `tid` is traced from now.
+    pub(crate) fn trace_thread(&self, tid: u32) -> Option<Arc<Tif>> {
+        let tif = self.targets.find(tid)?;
+        tif.set_traced(true);
+        Some(tif)
+    }
+    /// `exit_signals` of thread `tid`: no signal wakes it any more, and the
+    /// process's in `local`, which it took in and did not deliver, are the
+    /// others'.
+    pub(crate) fn exit_signals(&self, tid: u32, local: &ThreadState) {
+        self.targets.remove(tid);
+        let mut held = ThreadState {
+            pending: local.pending.clone(),
+            ..ThreadState::default()
+        };
+        let mut given = self.give_back(&mut held, !0);
+        let Some(tif) = local.seat.tif() else {
+            return;
+        };
+        if tif.take_look() {
+            given |= self.process_pending_set().0 & !local.signal_mask;
+        }
+        if given != 0 {
+            self.targets.retarget(tif, given);
+            self.inbox_of_process().passed_on();
+        }
+    }
+    /// The process's signals of `set` that `local` took in are pending for
+    /// the process again, before those that came since; their set.
+    fn give_back(&self, local: &mut ThreadState, set: u64) -> u64 {
+        let given = |s: &signals::PendingSignal| {
+            s.target == signals::PendingTarget::Process
+                && !s.synchronous
+                && (1..=64).contains(&s.number)
+                && set & signals::bit(s.number) != 0
+        };
+        if !local.pending.iter().any(given) {
+            return 0;
+        }
+        let mut pending = self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (mut back, kept): (Vec<_>, Vec<_>) = local.pending.drain(..).partition(given);
+        local.pending = kept;
+        let numbers = back.iter().fold(0, |set, s| set | signals::bit(s.number));
+        // A standard signal sent since is one with it (`legacy_queue`).
+        pending
+            .pending
+            .retain(|s| s.number >= 32 || numbers & signals::bit(s.number) == 0);
+        back.append(&mut pending.pending);
+        pending.pending = back;
+        numbers
+    }
+    /// Tells the signals `local` blocks now (`__set_task_blocked`): those it
+    /// took in and blocks since are other threads', and it looks for those
+    /// it blocks no more.
+    pub(crate) fn settle_mask(&self, local: &mut ThreadState) {
+        let mask = local.signal_mask;
+        let Some(tif) = local.seat.tif() else {
+            return;
+        };
+        let old = tif.blocked();
+        if old == mask {
+            return;
+        }
+        let tif = Arc::clone(tif);
+        tif.set_blocked(mask);
+        let looked = tif.looks();
+        if old & !mask != 0 {
+            tif.set_look();
+        }
+        let new = mask & !old;
+        if new == 0 {
+            return;
+        }
+        let mut given = self.give_back(local, new);
+        if looked {
+            given |= self.process_pending_set().0 & new;
+        }
+        if given != 0 {
+            self.targets.retarget(&tif, given);
+            self.inbox_of_process().passed_on();
+        }
     }
     /// Sends this process a signal from process `sender`, whose real user
     /// ID is `uid`, as `kill` does.
@@ -1040,17 +1190,26 @@ impl ThreadGroup {
         sender: u32,
         uid: u32,
     ) -> Result<(), Errno> {
-        self.process_inbox
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send_from(number, sender, uid)
+        self.send_process_signal(signals::PendingSignal {
+            sender: Some(sender),
+            sender_uid: Some(uid),
+            ..signals::PendingSignal::user(number, 0)
+        })
     }
     /// Sends this process `signal` as it is.
     pub(crate) fn send_process_signal(&self, signal: signals::PendingSignal) -> Result<(), Errno> {
-        self.process_inbox
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send_pending(signal)
+        self.send_process_signal_to(signal, Sent::Leader)
+    }
+    /// The same, through its task `sent`.
+    pub(crate) fn send_process_signal_to(
+        &self,
+        signal: signals::PendingSignal,
+        sent: Sent,
+    ) -> Result<(), Errno> {
+        if !self.prepare(signal.number, sent) {
+            return Ok(());
+        }
+        self.inbox_of_process().send_to(signal, sent)
     }
     /// Sends thread `tid` of this process `signal`, directed at it.
     pub(crate) fn send_thread_signal(
@@ -1058,14 +1217,20 @@ impl ThreadGroup {
         tid: u32,
         signal: signals::PendingSignal,
     ) -> Result<(), Errno> {
-        let members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
-        members
+        let inbox = self
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&tid)
-            .ok_or(Errno(3))?
-            .send_pending(signals::PendingSignal {
-                target: signals::PendingTarget::Thread,
-                ..signal
-            })
+            .cloned()
+            .ok_or(Errno(3))?;
+        if !self.prepare(signal.number, Sent::Thread(tid)) {
+            return Ok(());
+        }
+        inbox.send_pending(signals::PendingSignal {
+            target: signals::PendingTarget::Thread,
+            ..signal
+        })
     }
     /// Resets the actions as execve does ([`signals::flushed`]). The process
     /// gets its own copy, so a process sharing the dispositions through
@@ -1205,9 +1370,11 @@ impl ThreadGroup {
             .process_pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let queued = pending.pending.len();
         signals::expire_timer(&mut pending, now);
         let mut timers = self.timers.lock().unwrap_or_else(PoisonError::into_inner);
         let mut directed = timers.expire(&mut pending, now);
+        let running = pending.pending.len();
         if let Some((process, threads)) = &cpu {
             directed.extend(
                 timers.expire_cpu(&mut pending, *process, |tid| threads.get(&tid).copied()),
@@ -1217,7 +1384,22 @@ impl ThreadGroup {
         }
         drop(timers);
         let timer = pending.timer;
+        // `it_real_fn` sends to the leader, and so does a POSIX timer unless
+        // its interrupt finds another thread running; those on a CPU clock
+        // run out as a thread runs.
+        let fired: Vec<(i32, Sent)> = pending.pending[queued..]
+            .iter()
+            .enumerate()
+            .map(|(at, s)| {
+                let running = queued + at >= running;
+                let sent = if running { Sent::Running } else { Sent::Leader };
+                (s.number, sent)
+            })
+            .collect();
         drop(pending);
+        for (number, sent) in fired {
+            self.inbox_of_process().queued_elsewhere(number, sent);
+        }
         // A thread that has exited loses its timer's signal, as on Linux.
         for (tid, signal) in directed {
             let inbox = self
@@ -1247,7 +1429,12 @@ impl ThreadGroup {
                 .insert(tid);
             inbox.interrupt();
         }
-        let new = members.insert(tid, inbox).is_none();
+        let tif = Arc::clone(inbox.tif());
+        let old = members.insert(tid, inbox);
+        let new = old.is_none();
+        if old.is_none_or(|old| !Arc::ptr_eq(old.tif(), &tif)) {
+            self.targets.add(tid, &tif);
+        }
         drop(members);
         self.nice
             .lock()
@@ -1974,12 +2161,16 @@ impl ThreadGroup {
             .get(&tid)
             .cloned()
             .ok_or(Errno(3))?;
-        if number == 0 || self.drops_as_init(number, false, self.blocked(tid)) {
+        if number == 0
+            || self.drops_as_init(number, false, self.blocked(tid))
+            || !self.prepare(number, Sent::Thread(tid))
+        {
             return Ok(());
         }
         inbox.send_thread_from(number, sender, uid)
     }
     pub(crate) fn set_process_inbox(&self, inbox: Arc<SignalInbox>) {
+        inbox.join(Arc::clone(&self.targets));
         *self
             .process_inbox
             .lock()
@@ -2131,10 +2322,30 @@ impl ThreadGroup {
         );
         inbox.queued_any(&fatal) || process.queued_any(&fatal)
     }
-    /// Takes in the process's signals; whether a signal has been sent to the
-    /// process inbox since this thread last did, which is what woke a
-    /// thread its own inbox has nothing for.
+    /// Takes in the process's signals, if this thread is to look at them
+    /// ([`crate::targets`]); whether a signal has been sent to the process
+    /// inbox since this thread last did, which is what woke a thread its own
+    /// inbox has nothing for.
     pub(crate) fn drain_process(&self, local: &mut ThreadState) -> bool {
+        self.settle_mask(local);
+        let take = local.seat.take_look();
+        self.see_process(local, take)
+    }
+    /// [`Self::drain_process`] of a thread that takes none of them, as in a
+    /// wait only a fatal signal ends, or a ptrace stop.
+    pub(crate) fn pass_process(&self, local: &mut ThreadState) -> bool {
+        self.see_process(local, false)
+    }
+    /// Takes in those it may, whether it was to look or not, as `get_signal`
+    /// does for a thread with a signal of its own.
+    pub(crate) fn take_process(&self, local: &mut ThreadState) {
+        self.settle_mask(local);
+        if !matches!(local.seat, crate::targets::Seat::Copy) {
+            local.seat.take_look();
+            self.see_process(local, true);
+        }
+    }
+    fn see_process(&self, local: &mut ThreadState, take: bool) -> bool {
         // The actions are the process's, as Linux's sighand_struct is: a
         // thread that has waited since another one set a handler would
         // otherwise take a signal in as ignored and wait on past it.
@@ -2147,28 +2358,28 @@ impl ThreadGroup {
             local.signal_actions.insert(number, action);
         }
         self.discards.apply(local);
-        let mut pending = self
-            .process_pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let notices = {
-            let inbox = self
-                .process_inbox
+        let inbox = self.inbox_of_process();
+        // Counted before they are moved: one sent between shows later.
+        let notices = inbox.notices();
+        let sent = notices != local.process_notices;
+        local.process_notices = notices;
+        if take || sent {
+            let mut pending = self
+                .process_pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             inbox.drain_process(&mut pending);
-            inbox.notices()
-        };
-        let sent = notices != local.process_notices;
-        local.process_notices = notices;
-        if pending.pending.iter().any(|s| s.number == 18) {
-            self.stopped.store(false, Ordering::SeqCst);
-        }
-        pending.signal_mask = local.signal_mask;
-        pending.signal_actions = local.signal_actions.clone();
-        while let Some(index) = signals::next_pending(&pending, false) {
-            let s = pending.pending.remove(index);
-            signals::queue(local, s);
+            if pending.pending.iter().any(|s| s.number == 18) {
+                self.stopped.store(false, Ordering::SeqCst);
+            }
+            if take && !pending.pending.is_empty() {
+                pending.signal_mask = local.signal_mask;
+                pending.signal_actions = local.signal_actions.clone();
+                while let Some(index) = signals::next_pending(&pending, false) {
+                    let s = pending.pending.remove(index);
+                    signals::queue(local, s);
+                }
+            }
         }
         local.stopped = self.stopped.load(Ordering::SeqCst);
         sent
@@ -2253,6 +2464,7 @@ impl Kernel {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             members.remove(&tid);
+            self.group.targets.remove(tid);
             members.is_empty()
         };
         self.group
@@ -2308,6 +2520,8 @@ impl Kernel {
                 processes: &self.processes,
             });
         }
+        // `exit_signals`: from here no signal wakes it.
+        self.group.exit_signals(thread.tid, &thread.state);
         // Its tracees are let go of, and its tracer told, before it goes.
         self.ptrace_exit(thread, status);
         // What task work it still has runs as an exiting task's.
@@ -2807,6 +3021,7 @@ impl Kernel {
                 .clock(paludarium_host::ClockId::Monotonic)
                 .unwrap_or(0),
         );
+        inbox.tif().set_blocked(state.signal_mask);
         self.group.register(tid, inbox);
         // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
         // creator is given first if it has none.

@@ -21,10 +21,11 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 pub(crate) mod segments;
-use segments::{Counts, Flows, Push};
+use segments::{Counts, Flows, Push, Request, Tap, Verdict};
 
 const EADDRINUSE: Errno = Errno(98);
 const ECONNRESET: Errno = Errno(104);
+const ETIMEDOUT: Errno = Errno(110);
 /// Linux's default `net.ipv4.ip_local_port_range`.
 const EPHEMERAL: core::ops::RangeInclusive<u16> = 32768..=60999;
 /// How long the side that closed a connection first keeps its port, in
@@ -78,9 +79,60 @@ pub(crate) struct Link {
     /// peer. Locked after `ends`.
     flows: Mutex<Flows>,
     this: Weak<Link>,
+    /// The two streams, for the filters, which see what the other side
+    /// sends; and the connection's first sequence numbers and timestamps,
+    /// each side's, once a filter looks.
+    streams: [Weak<Stream>; 2],
+    names: OnceLock<Names>,
+    /// Whether it is a request of its listener's ([`Request`]): 0 for never,
+    /// else [`REQUEST`], [`DROPPED`] or, opened, its place in the order
+    /// requests opened in, from [`FIRST`] on; and what tells the listener.
+    request: AtomicU64,
+    opens: OnceLock<Notify>,
+    senders: [Mutex<Sender>; 2],
     /// When its timers are next to be run, changed with `flows` locked.
     armed: AtomicU64,
     deadlines: Arc<Deadlines>,
+}
+/// [`Link::request`]'s values.
+const REQUEST: u64 = 1;
+const DROPPED: u64 = 2;
+const FIRST: u64 = 3;
+/// What a connection's segments count from: each side's initial sequence
+/// number and timestamp offset.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Names {
+    pub(crate) first: [u32; 2],
+    pub(crate) stamps: [u32; 2],
+}
+/// What a side's segments go with, which a filter sees: its `SO_PRIORITY`
+/// and `IP_TOS`, and the owner and group of the socket.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Sender {
+    pub(crate) priority: u32,
+    pub(crate) tos: u8,
+    pub(crate) ids: (u32, u32),
+}
+impl Names {
+    /// Random ones, from `host`.
+    pub(crate) fn new(host: &Arc<dyn paludarium_host::Host>) -> Self {
+        let mut random = [0; 16];
+        let _ = host.random_bytes(&mut random);
+        let mut words = [0; 4];
+        for (word, bytes) in words.iter_mut().zip(random.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
+        }
+        let [a, b, c, d] = words;
+        Self {
+            first: [a, b],
+            stamps: [c, d],
+        }
+    }
+    /// `side`'s timestamp at `micros`: milliseconds, each side's from an
+    /// offset of its own.
+    pub(crate) fn stamp(&self, side: usize, micros: u64) -> u32 {
+        self.stamps[side].wrapping_add((micros / 1000) as u32)
+    }
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -100,7 +152,7 @@ impl Link {
         (client_local, server_local): (SocketAddr, SocketAddr),
         (host, deadlines): (&Arc<dyn paludarium_host::Host>, &Arc<Deadlines>),
         notify: [Notify; 2],
-        mtu: usize,
+        (mtu, names): (usize, Option<Names>),
     ) -> Arc<Self> {
         let now = host.clock(paludarium_host::ClockId::Monotonic).ok();
         let link = Arc::new_cyclic(|this| Self {
@@ -118,6 +170,11 @@ impl Link {
                 now.map(|now| now / 1000),
             )),
             this: Weak::clone(this),
+            streams: [Arc::downgrade(client), Arc::downgrade(server)],
+            names: names.map_or_else(OnceLock::new, OnceLock::from),
+            request: AtomicU64::new(0),
+            opens: OnceLock::new(),
+            senders: Default::default(),
             armed: AtomicU64::new(NEVER),
             deadlines: Arc::clone(deadlines),
         });
@@ -133,14 +190,18 @@ impl Link {
     /// `EPIPE` once it has had this side's end and not shut its own
     /// (`tcp_reset` in `TCP_CLOSE_WAIT`), after the bytes it holds.
     pub(crate) fn reset(&self, side: usize) {
-        let ends = self
-            .ends
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let mut guard = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
         self.first.store(RESET, Ordering::SeqCst);
-        let Some(ends) = ends else { return };
-        self.reset_flows(side, self.micros());
+        let Some(ends) = guard.as_ref() else { return };
+        if !self.reset_flows(side, self.micros()) {
+            // The peer's filter dropped it, so it stays connected.
+            let own = Arc::clone(&ends.streams[side]);
+            drop(guard);
+            own.close();
+            return;
+        }
+        let Some(ends) = guard.take() else { return };
+        drop(guard);
         let (own, peer) = (&ends.streams[side], &ends.streams[1 - side]);
         if !gone(peer) {
             let waiting = ends.ended[side] && !peer.readiness().write_closed;
@@ -195,12 +256,19 @@ impl Link {
         let mut guard = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(ends) = guard.as_mut() else { return };
         let now = self.micros();
-        let arrived = {
+        let (arrived, over) = {
             let mut flows = self.flows();
+            if flows.lossy() {
+                for (side, stream) in ends.streams.iter().enumerate() {
+                    if stream.finished().1 {
+                        flows.closed(side);
+                    }
+                }
+            }
             flows.advance(now);
             for from in 0..2 {
                 let (own, peer) = (&ends.streams[from], &ends.streams[1 - from]);
-                if matches!(own.phase(), Phase::Failed(_)) {
+                if matches!(own.phase(), Phase::Failed(_)) || flows.dead(from) {
                     continue;
                 }
                 let edge = if gone(peer) {
@@ -218,7 +286,7 @@ impl Link {
                 }
             }
             self.arm(&flows);
-            flows.arrived()
+            (flows.arrived(), flows.over())
         };
         for from in 0..2 {
             let (own, peer) = (&ends.streams[from], &ends.streams[1 - from]);
@@ -226,23 +294,36 @@ impl Link {
                 continue;
             }
             loop {
-                let Some((len, at)) = self.flows().arrival(1 - from) else {
-                    break;
+                let closed = gone(peer);
+                // The bytes leave the sender as they count as moved, which
+                // a filter looks at too.
+                let (bytes, at) = {
+                    let mut flows = self.flows();
+                    let Some((len, at)) = flows.arrival(1 - from) else {
+                        break;
+                    };
+                    let bytes = if closed {
+                        Vec::new()
+                    } else {
+                        own.take(len as usize)
+                    };
+                    flows.gave(1 - from, &bytes);
+                    (bytes, at)
                 };
-                if gone(peer) {
+                if closed {
                     // The closed side answers with a reset, which ends its
                     // `TIME_WAIT` too.
                     self.first.store(RESET, Ordering::SeqCst);
-                    own.take(usize::MAX);
-                    self.reset_flows(1 - from, now);
-                    own.fail(if ends.ended[1 - from] {
-                        Errno::EPIPE
-                    } else {
-                        ECONNRESET
-                    });
+                    if self.reset_flows(1 - from, now) {
+                        own.take(usize::MAX);
+                        own.fail(if ends.ended[1 - from] {
+                            Errno::EPIPE
+                        } else {
+                            ECONNRESET
+                        });
+                    }
                     break;
                 }
-                let bytes = own.take(len as usize);
                 peer.receive_late(&bytes, now.saturating_sub(at) * 1000);
                 self.delivered(1 - from, bytes.len());
             }
@@ -257,18 +338,61 @@ impl Link {
                 }
             }
         }
-        if ends.streams.iter().all(|stream| stream.finished().1) {
+        for side in if over { 0..2 } else { 0..0 } {
+            let (verdict, dead) = {
+                let mut flows = self.flows();
+                (flows.verdict(side), flows.dead(side))
+            };
+            if dead {
+                self.first.store(RESET, Ordering::SeqCst);
+            }
+            if let Some(verdict) = verdict {
+                self.over(ends, side, verdict);
+            }
+        }
+        if ends.streams.iter().all(|stream| stream.finished().1) && !self.flows().losing() {
             *guard = None;
         }
     }
-    /// `side` was reset, at `now`.
-    fn reset_flows(&self, side: usize, now: u64) {
-        let mut flows = self.flows();
-        flows.reset(side, now);
-        self.arm(&flows);
+    /// The connection is over for `side`: a reset came to it (`tcp_reset`),
+    /// or what it sent was never acknowledged (`tcp_write_err`).
+    fn over(&self, ends: &Ends, side: usize, verdict: Verdict) {
+        self.first.store(RESET, Ordering::SeqCst);
+        let own = &ends.streams[side];
+        let waiting = ends.ended[1 - side] && !own.readiness().write_closed;
+        own.take(usize::MAX);
+        if !gone(own) {
+            own.fail(match verdict {
+                Verdict::TimedOut => ETIMEDOUT,
+                Verdict::Reset if waiting => Errno::EPIPE,
+                Verdict::Reset => ECONNRESET,
+            });
+        }
     }
-    /// Sets when the connection's timers are next to be run.
+    /// `side` was reset, at `now`; whether the other side hears.
+    fn reset_flows(&self, side: usize, now: u64) -> bool {
+        let mut flows = self.flows();
+        let heard = flows.reset(side, now);
+        self.arm(&flows);
+        heard
+    }
+    /// Sets when the connection's timers are next to be run, and tells of a
+    /// request that has opened or been dropped.
     fn arm(&self, flows: &Flows) {
+        if self.request.load(Ordering::SeqCst) == REQUEST {
+            static ORDER: AtomicU64 = AtomicU64::new(FIRST);
+            match flows.request() {
+                Request::Never | Request::Waits { .. } => {}
+                Request::Dropped => self.request.store(DROPPED, Ordering::SeqCst),
+                Request::Opened => {
+                    let place = ORDER.fetch_add(1, Ordering::SeqCst);
+                    self.request.store(place, Ordering::SeqCst);
+                    if let Some(opens) = self.opens.get() {
+                        opens();
+                    }
+                }
+            }
+        }
         let at = flows.wake().map_or(NEVER, |at| at.saturating_mul(1000));
         let old = self.armed.swap(at, Ordering::SeqCst);
         if old != at {
@@ -331,6 +455,69 @@ impl Link {
     /// `side`'s `TCP_CORK` was set or cleared.
     pub(crate) fn set_cork(&self, side: usize, on: bool) {
         self.with_flows(|flows, now| flows.set_cork(side, on, now));
+    }
+    /// `side`'s `TCP_USER_TIMEOUT` was set to `ms` milliseconds.
+    pub(crate) fn set_user_timeout(&self, side: usize, ms: u32) {
+        self.with_flows(|flows, now| flows.set_user_timeout(side, ms, now));
+    }
+    /// Ends the handshake, with the server's filter its listener's: whether
+    /// the connection is open at once. Else it is a request, and `opens`
+    /// tells when it has opened.
+    pub(crate) fn handshake(&self, opens: Notify) -> bool {
+        let _ = self.opens.set(opens);
+        let mut flows = self.flows();
+        flows.handshake(self.micros());
+        let waits = flows.request() != Request::Never;
+        if waits {
+            self.request.store(REQUEST, Ordering::SeqCst);
+        }
+        self.arm(&flows);
+        !waits
+    }
+    /// Whether it is a request still, and once opened its place among them.
+    pub(crate) fn requested(&self) -> (bool, Option<u64>) {
+        let request = self.request.load(Ordering::SeqCst);
+        (request == REQUEST, (request >= FIRST).then_some(request))
+    }
+    /// When a request's SYN-ACK next goes again, on the host's monotonic
+    /// clock, and how often it has.
+    pub(crate) fn waits(&self) -> Option<(u64, u32)> {
+        match self.flows().request() {
+            Request::Waits { at, tries } => Some((at.saturating_mul(1000), tries)),
+            _ => None,
+        }
+    }
+    /// The listener of a request has closed.
+    pub(crate) fn forget(&self) {
+        let mut flows = self.flows();
+        flows.forget(true);
+        self.first.store(RESET, Ordering::SeqCst);
+        self.arm(&flows);
+    }
+    /// What `side`'s segments go with from now on.
+    pub(crate) fn set_sender(&self, side: usize, sender: Sender) {
+        *self.senders[side]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = sender;
+    }
+    pub(crate) fn sender(&self, side: usize) -> Sender {
+        *self.senders[side]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `side`'s filter is now the one `make` makes of the stream that sends
+    /// to it, the connection and its names, or none.
+    pub(crate) fn set_tap(
+        &self,
+        side: usize,
+        make: Option<impl FnOnce(Weak<Stream>, Weak<Link>, Names) -> Arc<dyn Tap>>,
+    ) {
+        let tap = make.map(|make| {
+            let names = *self.names.get_or_init(|| Names::new(&self.host));
+            let sender = Weak::clone(&self.streams[1 - side]);
+            make(sender, Weak::clone(&self.this), names)
+        });
+        self.with_flows(|flows, now| flows.tap(side, tap, now));
     }
     /// `side`'s `TCP_QUICKACK` was set to `value`.
     pub(crate) fn set_quick(&self, side: usize, value: i32) {

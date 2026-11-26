@@ -990,11 +990,14 @@ fn a_waiting_thread_sees_a_handler_set_after_it_began_waiting() {
 #[test]
 fn every_thread_learns_of_a_process_signal_another_took() {
     let group = ThreadGroup::default();
+    // What is sent here comes from outside the emulator, ignored or not.
+    let process = Arc::new(SignalInbox::default());
+    group.set_process_inbox(Arc::clone(&process));
     let (mut taker, mut other) = (ThreadState::default(), ThreadState::default());
     // Nothing sent yet.
     assert!(!group.drain_process(&mut taker));
     assert!(!group.drain_process(&mut other));
-    group.send_process_from(signals::SIGCHLD, 2, 0).unwrap();
+    process.send(signals::SIGCHLD).unwrap();
     // One thread takes the ignored SIGCHLD in; the other still learns that
     // a signal came, which is what woke it, so that its wait goes on.
     assert!(group.drain_process(&mut taker));
@@ -1008,6 +1011,9 @@ fn every_thread_learns_of_a_process_signal_another_took() {
 #[test]
 fn a_signal_taken_in_before_a_wait_still_explains_its_wake() {
     let group = ThreadGroup::default();
+    // What is sent here comes from outside the emulator, ignored or not.
+    let process = Arc::new(SignalInbox::default());
+    group.set_process_inbox(Arc::clone(&process));
     let inbox = Arc::new(SignalInbox::default());
     group.register(2, Arc::clone(&inbox));
     let mut waiter = ThreadState::default();
@@ -1017,7 +1023,7 @@ fn a_signal_taken_in_before_a_wait_still_explains_its_wake() {
     // wait takes it in.
     let notices = group.process_notices();
     inbox.drain(&mut waiter);
-    group.send_process_from(23, 2, 0).unwrap();
+    process.send(23).unwrap();
     group.drain_process(&mut waiter);
     assert!(wake.load(Ordering::SeqCst));
     assert!(signals::next_pending(&waiter, true).is_none());
@@ -1323,4 +1329,131 @@ fn futex_requeue_onto_its_own_word_leaves_waiters_in_place() {
     // Woken first, up to the wake count.
     assert_eq!(f.requeue(&m, word, word, 1, 5, None), Ok(1));
     assert_eq!(waiters[1].state.load(Ordering::SeqCst), 1);
+}
+
+/// A group of threads `tids`, each with its inbox and state, all asleep as a
+/// wait in the host shows them.
+fn sleepers(tids: &[u32]) -> (Arc<ThreadGroup>, Vec<(Arc<SignalInbox>, ThreadState)>) {
+    let group = Arc::new(ThreadGroup::default());
+    let threads = tids
+        .iter()
+        .map(|&tid| {
+            let inbox = Arc::new(SignalInbox::default());
+            group.register(tid, Arc::clone(&inbox));
+            inbox.blocked_flag().store(true, Ordering::SeqCst);
+            let mut state = ThreadState::default();
+            state.seat.take(inbox.tif(), 0);
+            group.drain_process(&mut state);
+            (inbox, state)
+        })
+        .collect();
+    (group, threads)
+}
+/// The threads, by their place, that take a signal of the process's.
+fn takers(group: &ThreadGroup, threads: &mut [(Arc<SignalInbox>, ThreadState)]) -> Vec<usize> {
+    (0..threads.len())
+        .filter(|&at| {
+            let state = &mut threads[at].1;
+            group.drain_process(state);
+            !std::mem::take(&mut state.pending).is_empty()
+        })
+        .collect()
+}
+#[test]
+fn a_signal_wakes_the_thread_complete_signal_chooses() {
+    let (group, mut threads) = sleepers(&[1, 2, 3, 4]);
+    let send = |number| group.send_process_from(number, 9, 0).unwrap();
+    send(10);
+    assert_eq!(takers(&group, &mut threads), [0]);
+    // The leader blocks it: the one last chosen is tried first.
+    threads[0].1.signal_mask = signals::bit(10);
+    group.drain_process(&mut threads[0].1);
+    send(10);
+    assert_eq!(takers(&group, &mut threads), [1]);
+    send(10);
+    assert_eq!(takers(&group, &mut threads), [1]);
+    // It sleeps on with one pending, so the next takes both.
+    send(10);
+    threads[0].1.signal_mask |= signals::bit(12);
+    group.drain_process(&mut threads[0].1);
+    send(12);
+    group.drain_process(&mut threads[2].1);
+    assert_eq!(threads[2].1.pending.len(), 2);
+    threads[2].1.pending.clear();
+    assert!(takers(&group, &mut threads).is_empty());
+    // A thread in a group stop or a ptrace stop is not chosen.
+    threads[2].0.tif().set_halted(true);
+    threads[2].0.tif().set_look();
+    group.drain_process(&mut threads[2].1);
+    threads[3].0.tif().set_trapped(true);
+    send(10);
+    assert_eq!(takers(&group, &mut threads), [1]);
+    // SIGKILL is every thread's.
+    send(9);
+    assert!(threads.iter().all(|(inbox, _)| inbox.tif().looks()));
+}
+#[test]
+fn a_thread_that_exits_or_blocks_a_signal_leaves_it_to_another() {
+    let (group, mut threads) = sleepers(&[1, 2]);
+    // The leader took it in, and exits before it delivers it.
+    group.send_process_from(10, 9, 0).unwrap();
+    group.drain_process(&mut threads[0].1);
+    assert_eq!(threads[0].1.pending.len(), 1);
+    group.exit_signals(1, &threads[0].1);
+    assert_eq!(takers(&group, &mut threads[1..]), [0]);
+    // Or it blocks it, as a handler's mask does.
+    let (group, mut threads) = sleepers(&[1, 2]);
+    group.send_process_from(10, 9, 0).unwrap();
+    group.drain_process(&mut threads[0].1);
+    threads[0].1.signal_mask = signals::bit(10);
+    group.drain_process(&mut threads[0].1);
+    assert!(threads[0].1.pending.is_empty());
+    assert_eq!(takers(&group, &mut threads), [1]);
+    // With no other, it waits for the thread that unblocks it.
+    let (group, mut threads) = sleepers(&[1]);
+    threads[0].1.signal_mask = signals::bit(10);
+    group.drain_process(&mut threads[0].1);
+    group.send_process_from(10, 9, 0).unwrap();
+    assert!(takers(&group, &mut threads).is_empty());
+    threads[0].1.signal_mask = 0;
+    assert_eq!(takers(&group, &mut threads), [0]);
+}
+#[test]
+fn an_ignored_signal_is_dropped_as_it_is_sent() {
+    let (group, mut threads) = sleepers(&[1, 2]);
+    let pending = || group.process_pending_set().0;
+    // SIGWINCH, ignored by default, and SIGCONT, which takes a pending stop
+    // signal away all the same.
+    threads[0].1.signal_mask = signals::bit(20);
+    group.drain_process(&mut threads[0].1);
+    threads[1].1.signal_mask = signals::bit(20);
+    group.drain_process(&mut threads[1].1);
+    group.send_process_from(28, 9, 0).unwrap();
+    group.send_process_from(20, 9, 0).unwrap();
+    assert_eq!(pending(), signals::bit(20));
+    group.send_process_from(18, 9, 0).unwrap();
+    assert_eq!(pending(), 0);
+    // Kept if the leader blocks it, or is traced.
+    threads[0].1.signal_mask = signals::bit(28);
+    group.drain_process(&mut threads[0].1);
+    group.send_process_from(28, 9, 0).unwrap();
+    assert_eq!(pending(), signals::bit(28));
+    group.send_process_from(23, 9, 0).unwrap();
+    assert_eq!(pending(), signals::bit(28));
+    threads[0].0.tif().set_traced(true);
+    group.send_process_from(23, 9, 0).unwrap();
+    assert_eq!(pending(), signals::bit(28) | signals::bit(23));
+}
+#[test]
+fn a_thread_that_finishes_leaves_the_processs_signals_it_took_in() {
+    let (mut k, mut t, m) = (kernel(), thread(), memory());
+    let other = Arc::new(SignalInbox::default());
+    k.group.register(1, Arc::clone(&k.inbox));
+    k.group.register(2, Arc::clone(&other));
+    // Taken in, as a wait does, and not delivered.
+    t.state.pending.push(signals::PendingSignal::user(10, 0));
+    k.finish_thread(&t, &m);
+    let mut state = ThreadState::default();
+    k.group.drain_process(&mut state);
+    assert_eq!(state.pending.len(), 1);
 }

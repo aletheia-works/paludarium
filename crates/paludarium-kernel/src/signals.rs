@@ -286,6 +286,10 @@ fn get(b: &[u8], at: usize) -> u64 {
     v.copy_from_slice(&b[at..at + 8]);
     u64::from_le_bytes(v)
 }
+/// Signal `number`'s bit in a signal set.
+pub(crate) fn bit(number: i32) -> u64 {
+    1u64 << (number - 1)
+}
 pub(crate) fn unblockable() -> u64 {
     (1 << 8) | (1 << 18)
 }

@@ -1,4 +1,5 @@
 //! Synchronized runtime-to-Kernel signal transport; it never holds an MMU lock.
+use crate::targets::{Sent, Targets, Tif};
 use crate::{ThreadState, signals};
 use paludarium_types::Errno;
 use std::sync::{
@@ -6,13 +7,16 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-#[derive(Default)]
 pub struct SignalInbox {
     queue: Mutex<Vec<signals::PendingSignal>>,
     wake: Arc<AtomicBool>,
     control_wake: AtomicBool,
     timer_wake: AtomicBool,
     listeners: Mutex<Vec<Weak<AtomicBool>>>,
+    /// Its thread's part in `complete_signal`, and the thread group's threads,
+    /// of which a signal sent here for the process wakes one.
+    tif: Arc<Tif>,
+    targets: Mutex<Option<Arc<Targets>>>,
     /// How many signals have been sent here and woken the listeners, so that
     /// a thread they woke can tell a signal from another wake.
     notices: AtomicU64,
@@ -40,6 +44,29 @@ pub struct SignalInbox {
     /// it, every interruptible wait ends as a signal would end it
     /// ([`WakeReceipt::interrupted`]).
     notify: AtomicBool,
+}
+impl Default for SignalInbox {
+    fn default() -> Self {
+        let (wake, blocked) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
+        Self {
+            queue: Mutex::default(),
+            control_wake: AtomicBool::default(),
+            timer_wake: AtomicBool::default(),
+            listeners: Mutex::default(),
+            tif: Arc::new(Tif::new(Arc::clone(&blocked), Arc::clone(&wake))),
+            targets: Mutex::default(),
+            notices: AtomicU64::default(),
+            discards: Mutex::default(),
+            arrivals: Mutex::default(),
+            published: AtomicU64::default(),
+            contributed: AtomicU64::default(),
+            entry: Entry::default(),
+            task_work: Mutex::default(),
+            notify: AtomicBool::default(),
+            wake,
+            blocked,
+        }
+    }
 }
 /// The registers Linux's `collect_syscall` reads of a task that has entered
 /// the kernel: `orig_ax` (the call's number, or -1 for another reason),
@@ -74,6 +101,35 @@ pub(crate) struct WakeReceipt {
     pub control: bool,
 }
 impl SignalInbox {
+    /// Its thread's part in `complete_signal`.
+    pub(crate) fn tif(&self) -> &Arc<Tif> {
+        &self.tif
+    }
+    /// The signals sent here for the process are those of `targets`.
+    pub(crate) fn join(&self, targets: Arc<Targets>) {
+        *self.targets.lock().unwrap_or_else(PoisonError::into_inner) = Some(targets);
+    }
+    /// A signal for the process, `number`, was queued elsewhere: the threads
+    /// look, and the one it wakes takes it.
+    pub(crate) fn queued_elsewhere(&self, number: i32, sent: Sent) {
+        let _queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        self.notices.fetch_add(1, Ordering::SeqCst);
+        self.complete(number, sent);
+        self.wake.store(true, Ordering::SeqCst);
+        self.notify_listeners();
+    }
+    /// The process's signals are another thread's to take now.
+    pub(crate) fn passed_on(&self) {
+        let _queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        self.notices.fetch_add(1, Ordering::SeqCst);
+        self.wake.store(true, Ordering::SeqCst);
+        self.notify_listeners();
+    }
+    fn complete(&self, number: i32, sent: Sent) {
+        if let Some(targets) = &*self.targets.lock().unwrap_or_else(PoisonError::into_inner) {
+            targets.complete(number, sent);
+        }
+    }
     /// The flag its thread's waits set ([`paludarium_host::blocked::attach`]).
     pub(crate) fn blocked_flag(&self) -> &Arc<AtomicBool> {
         &self.blocked
@@ -146,11 +202,17 @@ impl SignalInbox {
     }
     /// Queues SIGCHLD with the child's siginfo. Like any standard signal it
     /// is dropped while one is already pending, as Linux keeps the first.
-    pub(crate) fn send_child(&self, code: i32, child: signals::ChildSignal) -> Result<(), Errno> {
-        self.send_pending(signals::PendingSignal {
+    pub(crate) fn send_child(
+        &self,
+        code: i32,
+        child: signals::ChildSignal,
+        sent: Sent,
+    ) -> Result<(), Errno> {
+        let signal = signals::PendingSignal {
             child: Some(child),
             ..signals::PendingSignal::user(17, code)
-        })
+        };
+        self.send_to(signal, sent)
     }
     #[cfg(test)]
     pub(crate) fn send_thread(&self, number: i32, uid: u32) -> Result<(), Errno> {
@@ -185,6 +247,7 @@ impl SignalInbox {
             return Some((timer.id, queued.overrun));
         }
         queue.push(signal);
+        self.tif.complete(signal.number);
         self.wake.store(true, Ordering::SeqCst);
         self.notices.fetch_add(1, Ordering::SeqCst);
         drop(queue);
@@ -192,6 +255,11 @@ impl SignalInbox {
         Some((timer.id, timer.overrun))
     }
     pub(crate) fn send_pending(&self, signal: signals::PendingSignal) -> Result<(), Errno> {
+        self.send_to(signal, Sent::Leader)
+    }
+    /// Queues `signal`, and wakes the thread `complete_signal` chooses for it,
+    /// sent to `sent` if it is for the process.
+    pub(crate) fn send_to(&self, signal: signals::PendingSignal, sent: Sent) -> Result<(), Errno> {
         let number = signal.number;
         if !(1..=64).contains(&number) {
             return Err(Errno::EINVAL);
@@ -205,6 +273,10 @@ impl SignalInbox {
             return Ok(());
         }
         queue.push(signal);
+        match signal.target {
+            signals::PendingTarget::Process => self.complete(number, sent),
+            signals::PendingTarget::Thread => self.tif.complete(number),
+        }
         self.wake.store(true, Ordering::SeqCst);
         self.notices.fetch_add(1, Ordering::SeqCst);
         self.notify_listeners();

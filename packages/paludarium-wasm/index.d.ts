@@ -4,6 +4,8 @@ export class PaludariumError extends Error {
   rip?: bigint;
   bytes?: Uint8Array;
   syscall?: number;
+  /** When a Worker trapped: the shared memory's size in bytes then. */
+  memoryBytes?: number;
 }
 /**
  * One path of a tree to place, in the shape `snapshot()` returns, so a

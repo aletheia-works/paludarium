@@ -159,7 +159,9 @@ the real work started.
   browsers grow the memory as needed, since on Windows, and in Firefox on
   Linux, a grown memory counts against the system's commit limit at once.
   WebKit browsers are told apart by their user agent: `AppleWebKit/` without
-  `Chrome/`, which includes every browser on iOS. The crash is reported as
+  `Chrome/`, which includes every browser on iOS. `diagnostics()` reports what
+  the reserve returned and the memory's size before and after it
+  (`heapReserve`), and the Safari and WebKit checks log it. The crash is reported as
   [WebKit bug 330591](https://bugs.webkit.org/show_bug.cgi?id=330591), with a
   reproduction that needs no paludarium; once it is fixed, WebKit may not need
   this.

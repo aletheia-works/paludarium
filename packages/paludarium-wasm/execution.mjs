@@ -1,6 +1,6 @@
 import { channel, imports } from "./worker-support.mjs";
 const port = await channel();
-let e;
+let e, memory;
 port.listen(async message => {
   try {
     if (message.type === "probe-go") {
@@ -22,6 +22,7 @@ port.listen(async message => {
     const cost = diagnostic ? (field, value) => {
       if (!Number.isSafeInteger(value) || value < 0 || e.cost_add(field, BigInt(value)) !== 0) throw Error("Diagnostic counter rejected");
     } : undefined;
+    memory = message.memory;
     const instance = await WebAssembly.instantiate(message.module, imports(message.memory, { spawnTask: handle => port.send({ type: "spawn-task", handle }), cost, net: request => port.send({ type: "net", request }) }));
     e = instance.exports;
     const tlsBefore = e.__tls_base.value;
@@ -38,5 +39,5 @@ port.listen(async message => {
     }
     const result = e.session_run(message.sessionHandle);
     port.send({ type: "finished", result });
-  } catch (error) { port.send({ type: "failed", error: String(error) }); }
+  } catch (error) { port.send({ type: "failed", error: String(error), memoryBytes: memory?.buffer.byteLength }); }
 });

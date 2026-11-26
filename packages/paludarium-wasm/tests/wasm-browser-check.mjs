@@ -77,5 +77,9 @@ server.on("clientError", (error, socket) => {
   else socket.destroy();
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-try { const result = await runBrowser(browser, `http://127.0.0.1:${server.address().port}/`, 600000); Object.assign(report, result); await persist(); if (!report.complete || !report.passed) throw new Error("Actual browser acceptance failed"); console.log(JSON.stringify({ environment: browser, version: report.version, complete: report.complete })); }
+try { const result = await runBrowser(browser, `http://127.0.0.1:${server.address().port}/`, 600000); Object.assign(report, result); await persist();
+  // Diagnostics for the job log, never compared.
+  console.error(JSON.stringify({ heap_diagnostics: report.heap_diagnostics ?? null }));
+  for (const [group, rows] of Object.entries({ rows: report.rows, ripgrep: report.ripgrep, coreutils: report.coreutils, restored: report.restored })) for (const [name, row] of Object.entries(rows ?? {})) if (row.host_trap) console.error(JSON.stringify({ host_trap: { group, name, ...row.host_trap } }));
+  if (!report.complete || !report.passed) throw new Error("Actual browser acceptance failed"); console.log(JSON.stringify({ environment: browser, version: report.version, complete: report.complete })); }
 finally { await new Promise(resolve => server.close(resolve)); }

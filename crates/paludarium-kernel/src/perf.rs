@@ -437,7 +437,8 @@ enum Counter {
 enum Target {
     /// A thread, of the thread group that holds it.
     Thread { group: Arc<ThreadGroup>, tid: u32 },
-    /// A CPU, as an event of no task is: the time that passes.
+    /// A CPU, as an event of no task is: the time that passes, and what
+    /// any thread counts there.
     Cpu,
 }
 
@@ -488,6 +489,11 @@ pub(crate) struct Event {
     counter: Counter,
     target: Target,
     cpu: i32,
+    /// The machine's processes, whose threads an event of a CPU counts.
+    machine: Erased,
+    /// What a sampling event of a CPU has seen of each thread
+    /// ([`sample`]).
+    looks: Mutex<Vec<sample::Look>>,
     clockid: Option<i32>,
     host: Arc<dyn Host>,
     /// The group's leader, `None` for one that leads its own: taken away
@@ -547,9 +553,11 @@ struct Lists {
     on_exec: Vec<Erased>,
     /// The events that count a thread, for its exit.
     counting: Vec<Erased>,
-    /// Those of a CPU that ask for side-band records (`pmu_sb_events`).
+    /// Those of a CPU that ask for side-band records (`pmu_sb_events`), and
+    /// that sample.
     side_band: Vec<Erased>,
-    /// The opened ones that ask for them, of a thread or a CPU, enabled or
+    cpu_sampling: Vec<Erased>,
+    /// The opened ones that ask for side-band records, of a thread or a CPU, enabled or
     /// not, while they are open (`account_event`).
     asking: Vec<Erased>,
 }
@@ -616,6 +624,7 @@ impl Events {
         lists.counting.retain(|event| event.strong_count() > 0);
         lists.side_band.retain(|event| event.strong_count() > 0);
         lists.asking.retain(|event| event.strong_count() > 0);
+        lists.cpu_sampling.retain(|event| event.strong_count() > 0);
         if side_band::asks(&event.attr) {
             self.side_band.store(true, Ordering::Relaxed);
             lists.asking.push(erase(event));
@@ -623,14 +632,16 @@ impl Events {
                 lists.side_band.push(erase(event));
             }
         }
-        if matches!(event.target, Target::Thread { .. }) {
-            lists.counting.push(erase(event));
-            if event.attr.sampling() {
-                self.sampling.store(true, Ordering::Relaxed);
-            }
-            if event.attr.sampling() && event.shows_address() {
+        if event.attr.sampling() {
+            self.sampling.store(true, Ordering::Relaxed);
+            if event.shows_address() {
                 paludarium_mmu::faults::trace_addresses();
             }
+        }
+        match event.target {
+            Target::Thread { .. } => lists.counting.push(erase(event)),
+            Target::Cpu if event.attr.sampling() => lists.cpu_sampling.push(erase(event)),
+            Target::Cpu => {}
         }
         lists.owned.push(Owned {
             group: erase(group),
@@ -699,6 +710,8 @@ impl Event {
     /// The state brought up to now: the time since the last update counts
     /// as enabled while it is, and as running and counted while it runs.
     fn settle(&self) -> MutexGuard<'_, State> {
+        // Before the state is locked, as it looks at the machine's threads.
+        let used = self.used();
         let mut state = lock(&self.state);
         let (now, on) = self.now(&state);
         let passed = now.saturating_sub(state.since);
@@ -708,12 +721,11 @@ impl Event {
         // the thread's, and its time running and count only that CPU's.
         let ran = on.saturating_sub(state.since_on);
         state.since_on = on;
-        let tallied = self.used().map_or((0, 0), |(user, kernel)| {
-            let more = (
-                user.saturating_sub(state.tally.0),
-                kernel.saturating_sub(state.tally.1),
-            );
-            state.tally = (user, kernel);
+        // Another may have looked later than this did.
+        let tallied = used.map_or((0, 0), |(user, kernel)| {
+            let tally = (user.max(state.tally.0), kernel.max(state.tally.1));
+            let more = (tally.0 - state.tally.0, tally.1 - state.tally.1);
+            state.tally = tally;
             more
         });
         if state.enabled {
@@ -734,25 +746,27 @@ impl Event {
     }
     /// What the thread's [`crate::Usage`] counts for a counter of it (its
     /// faults as they are taken, its switches and migrations as of its
-    /// latest system call), and kept once it is gone; `None` for the
-    /// other counters, an event of a CPU, and a thread that has made no
+    /// latest system call), and kept once it is gone, or for an event of a
+    /// CPU what every thread of the machine counts there; `None` for the
+    /// other counters, and a thread that has made no
     /// system call yet. As Linux's `perf_exclude_event` has it, the faults
     /// of the thread's code are left out with `exclude_user` and those of
     /// system calls with `exclude_kernel`, which leaves out the switches and
     /// migrations too, as the kernel makes them.
     fn used(&self) -> Option<(u64, u64)> {
-        let Target::Thread { group, tid } = &self.target else {
-            return None;
-        };
         if !matches!(
             self.counter,
             Counter::Faults | Counter::Switches | Counter::Migrations
         ) {
             return None;
         }
+        let cpu = u32::try_from(self.cpu);
+        let Target::Thread { group, tid } = &self.target else {
+            return Some(self.of_counts(self.machine()?.counts_on(cpu.ok()?)));
+        };
         let usage = group.last_thread_usage(*tid)?;
         // Of an event of one CPU, what the thread counted there alone.
-        let [faults, kernel_faults, switches, migrations] = match u32::try_from(self.cpu) {
+        Some(self.of_counts(match cpu {
             Ok(cpu) => usage.counts_on(cpu),
             Err(_) => {
                 let load = |value: &AtomicU64| value.load(Ordering::SeqCst);
@@ -763,7 +777,16 @@ impl Event {
                     load(&usage.migrations),
                 ]
             }
-        };
+        }))
+    }
+    /// The machine's processes.
+    fn machine(&self) -> Option<Arc<crate::processes::Processes>> {
+        self.machine.upgrade()?.downcast().ok()
+    }
+    /// What of `counts` ([`crate::CpuCounts`]'s) its counter counts, in
+    /// user mode and in the kernel.
+    fn of_counts(&self, counts: [u64; 4]) -> (u64, u64) {
+        let [faults, kernel_faults, switches, migrations] = counts;
         let (user, kernel) = match self.counter {
             Counter::Faults => (faults, kernel_faults),
             Counter::Switches => (0, switches),
@@ -779,7 +802,7 @@ impl Event {
         } else {
             kernel
         };
-        Some((user, kernel))
+        (user, kernel)
     }
     /// The count, the time enabled and the time running now.
     fn values(&self) -> (u64, u64, u64) {
@@ -791,7 +814,10 @@ impl Event {
         lock(&self.state).enabled
     }
     fn set_paused(&self, paused: bool) {
-        self.settle().paused = paused;
+        let was = std::mem::replace(&mut self.settle().paused, paused);
+        if was && !paused {
+            self.look_at_all();
+        }
     }
     /// The group's members but the leader.
     fn members(&self) -> Vec<Arc<Event>> {
@@ -808,6 +834,7 @@ impl Event {
             // `event_sched_in` unthrottles an event it takes in.
             if enabled && !was {
                 lock(&self.sampler).scheduled_in();
+                self.look_at_all();
             }
         }
         // A leader takes its group in and out with it.
@@ -848,6 +875,8 @@ impl Event {
             counter: top.counter,
             target,
             cpu: top.cpu,
+            machine: top.machine.clone(),
+            looks: Mutex::default(),
             clockid: top.clockid,
             host: Arc::clone(&top.host),
             leader: Mutex::new(leader.map(Held::new)),
@@ -1267,6 +1296,8 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         counter,
         target,
         cpu,
+        machine: erase(c.processes),
+        looks: Mutex::default(),
         clockid,
         host: Arc::clone(c.shared_host),
         leader: Mutex::new(leader.as_ref().map(Held::new)),
@@ -1901,6 +1932,8 @@ mod tests {
             counter,
             target,
             cpu,
+            machine: std::sync::Weak::<crate::processes::Processes>::new(),
+            looks: Mutex::default(),
             clockid: None,
             host: Arc::new(paludarium_host::testing::RecordingHost::default()),
             leader: Mutex::new(leader.map(Held::new)),

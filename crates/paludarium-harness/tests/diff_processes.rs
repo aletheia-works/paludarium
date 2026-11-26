@@ -327,6 +327,7 @@ mod linux {
                     | "perf-side-band"
                     | "perf-inherit-stat"
                     | "perf-side-band-cpu"
+                    | "perf-cpu-samples"
                     | "perf-side-band-comm"
                     | "perf-throttle"
                     | "perf-side-band-exec"
@@ -759,6 +760,7 @@ mod linux {
         perf_side_band => ("perf-side-band","perf"),
         perf_inherit_stat => ("perf-inherit-stat","perf"),
         perf_side_band_cpu => ("perf-side-band-cpu","perf"),
+        perf_cpu_samples => ("perf-cpu-samples","perf"),
         perf_side_band_comm => ("perf-side-band-comm","perf"),
         perf_throttle => ("perf-throttle","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
@@ -1159,6 +1161,7 @@ mod linux {
         processes_io_uring_buffers2 => ("io-uring-buffers2","process"),
         processes_io_uring_held_buffer => ("io-uring-held-buffer","process"),
         processes_io_uring_net => ("io-uring-net","process"),
+        processes_io_uring_placement => ("io-uring-placement","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

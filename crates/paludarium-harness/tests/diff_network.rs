@@ -197,6 +197,10 @@ mod linux {
         case("tcp-segments");
     }
     #[test]
+    fn network_tcp_held() {
+        case("tcp-held");
+    }
+    #[test]
     fn network_listen_io_uring() {
         case("listen-io-uring");
     }

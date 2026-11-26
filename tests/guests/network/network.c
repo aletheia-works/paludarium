@@ -199,6 +199,165 @@ static int client(int port, int flags, int *result) {
     *result = connect(fd, (void *)&a, sizeof a) ? errno : 0;
     return fd;
 }
+/* tcp-held: milliseconds of the monotonic and the real-time clock. */
+static long long clock_ms(int clock) {
+    struct timespec t;
+    clock_gettime(clock, &t);
+    return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+}
+/* The bytes that wait at `s` to be read and at `c` to be acknowledged, and
+   whether `s` polls readable. */
+static void held_queues(const char *step, int c, int s) {
+    int in = -1, out = -1;
+    struct pollfd p = {s, POLLIN, 0};
+    ioctl(s, FIONREAD, &in);
+    ioctl(c, SIOCOUTQ, &out);
+    int ready = poll(&p, 1, 0);
+    printf("  %s in=%d out=%d poll=%d\n", step, in, out, ready);
+}
+/* Reads what waits at `s` and says whether it came in the first `late`
+   milliseconds before now, by its SO_TIMESTAMPNS and last_data_recv, and
+   after the first `early` milliseconds since `start` (real time). */
+static void held_read(const char *step, int s, long long start, int early, int late) {
+    char bytes[200], control[64];
+    struct iovec iov = {bytes, sizeof bytes};
+    struct msghdr m = {0};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = control;
+    m.msg_controllen = sizeof control;
+    static const int since = 52;
+    unsigned char raw[512];
+    socklen_t len;
+    tcp_info_raw(s, raw, 512, &len);
+    long long now = clock_ms(CLOCK_REALTIME), came = 0;
+    int n = recvmsg(s, &m, MSG_DONTWAIT);
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    if (n > 0 && h) {
+        struct timespec t;
+        memcpy(&t, CMSG_DATA(h), sizeof t);
+        came = t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+    }
+    int ago = info_word(raw, since);
+    printf("  %s=%d after=%d before=%d ago=%d\n", step, n, came - start >= early,
+           now - came >= late, ago >= late && ago <= now - start - early + 1);
+}
+static void held_signal(int number) { (void)number; }
+/* Holds data back once the first thread is about to sleep, and goes. */
+static int held_pipe[2];
+static void *held_thread(void *c) {
+    char byte;
+    if (read(held_pipe[0], &byte, 1) == 1) send(*(int *)c, "held", 4, MSG_MORE);
+    return NULL;
+}
+/* What Nagle's algorithm, MSG_MORE and a delayed acknowledgement hold back
+   reaches the peer once its time has come, whoever looks then. A step the
+   machine took too long for is done again. */
+static void held(int l, int port) {
+    static char bytes[200];
+    int result, on = 1;
+    for (int step = 0; step < 9; step++) {
+        for (int tries = 0; tries < 20; tries++) {
+            int c = client(port, 0, &result), s = accept(l, NULL, NULL);
+            setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
+            long long start = clock_ms(CLOCK_REALTIME), began = clock_ms(CLOCK_MONOTONIC);
+            /* Sixteen acknowledged at once, one that waits 40 ms, and three
+               held for it; or one held 200 ms. */
+            int more = step == 1 || step == 5;
+            for (int n = 0; n < (step == 8 ? 0 : more ? 1 : 20); n++)
+                send(c, bytes, more ? 100 : 1, more ? MSG_MORE : 0);
+            int in = 0;
+            ioctl(s, FIONREAD, &in);
+            if (clock_ms(CLOCK_MONOTONIC) - began > 15) {
+                close(c);
+                close(s);
+                continue;
+            }
+            printf(" step %d\n", step);
+            if (step == 0 || step == 1) held_queues("held", c, s);
+            if (step == 0) {
+                /* No call on the connection until its time has passed. */
+                struct timespec t = {0, 150000000};
+                nanosleep(&t, NULL);
+                held_queues("later", c, s);
+                held_read("read", s, start, 25, 40);
+            } else if (step == 1) {
+                struct timespec t = {0, 400000000};
+                nanosleep(&t, NULL);
+                held_read("read", s, start, 150, 40);
+            } else if (step == 2) {
+                /* A read acknowledges what it read. */
+                call("recv", recv(s, bytes, 17, 0));
+                held_queues("after", c, s);
+            } else if (step == 3) {
+                setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+                ioctl(s, FIONREAD, &in);
+                printf("  nodelay in=%d\n", in);
+            } else if (step == 4) {
+                /* The end takes along what is held. */
+                shutdown(c, SHUT_WR);
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+            } else if (step == 5) {
+                /* A read waits for it. */
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+                long long took = clock_ms(CLOCK_MONOTONIC) - began;
+                printf("  waited=%d\n", took >= 150 && took < 2000);
+            } else if (step == 6) {
+                /* So does a poll past what has come. */
+                recv(s, bytes, 17, 0);
+                recv(s, bytes, 3, 0);
+                for (int n = 0; n < 2; n++) send(c, bytes, 100, MSG_MORE);
+                struct pollfd p = {s, POLLIN, 0};
+                long long from = clock_ms(CLOCK_MONOTONIC);
+                call("poll", poll(&p, 1, 5000));
+                printf("  waited=%d\n", clock_ms(CLOCK_MONOTONIC) - from < 2000);
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+            } else {
+                /* SIGIO for it ends a sleep, also one that began before
+                   another thread had it held. */
+                struct sigaction a = {0};
+                pthread_t other;
+                sigset_t io;
+                sigemptyset(&io);
+                sigaddset(&io, SIGIO);
+                a.sa_handler = held_signal;
+                sigaction(SIGIO, &a, NULL);
+                fcntl(s, F_SETOWN, getpid());
+                fcntl(s, F_SETFL, O_ASYNC);
+                struct timespec t = {10, 0}, rest = {0, 0};
+                int slept = 0;
+                /* The emulator's test clock may pass the whole sleep before
+                   the other thread has run. */
+                for (int n = 0; n < 20 && !slept; n++) {
+                    if (step == 8) {
+                        if (pipe(held_pipe)) exit(70);
+                        pthread_sigmask(SIG_BLOCK, &io, NULL);
+                        if (pthread_create(&other, NULL, held_thread, &c)) exit(70);
+                        pthread_sigmask(SIG_UNBLOCK, &io, NULL);
+                        if (write(held_pipe[1], "g", 1) != 1) exit(70);
+                    }
+                    slept = nanosleep(&t, &rest);
+                    int error = errno;
+                    if (step == 8) {
+                        pthread_join(other, NULL);
+                        close(held_pipe[0]);
+                        close(held_pipe[1]);
+                        if (!slept) while (recv(s, bytes, sizeof bytes, 0) < 0) {}
+                    }
+                    errno = error;
+                }
+                call("nanosleep", slept);
+                printf("  rest=%d\n", rest.tv_sec >= 8);
+                ioctl(s, FIONREAD, &in);
+                printf("  in=%d\n", in);
+            }
+            close(c);
+            close(s);
+            break;
+        }
+    }
+}
 /* A client on a port of its own: bound to port 0 before it connects, it
    takes a port no other socket holds, where connect alone may share one
    with sockets still in TIME_WAIT towards other addresses (Linux's
@@ -1070,6 +1229,13 @@ int main(int argc, char **argv) {
         close(small);
         close(l);
         close(u);
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-held")) {
+        int port;
+        int l = listener(8, &port);
+        held(l, port);
+        close(l);
         return 0;
     }
     if (!strcmp(mode, "tcp-segments")) {

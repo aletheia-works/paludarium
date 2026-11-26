@@ -276,14 +276,14 @@ verified.
     the round trip (30 µs) and the timeout, rates and pacing it gives, and
     the windows, which never grow, so the send MSS stays 32 KiB and no
     acknowledgement goes for a grown window; the window scale its handshake
-    offered stays; times since data came count from its read. The segments
-    are Linux's ([Network](./features#network)) while the
+    offered stays. The segments, and so what waits in the sender and how
+    long, are Linux's ([Network](./features#network)) while the
     reader keeps up with writes of at most 536 bytes; larger ones and a
-    full window take more or fewer than Linux, and a connection across a
-    veth pair is counted as one on the loopback. The counts alone wait: data
-    that Nagle's algorithm, `MSG_MORE` or a loss holds back on Linux reaches
-    the peer at once here, and `SIOCOUTQ` and the readiness of both sides
-    say so. Beyond a handshake's tries and the segments a loss probe sends
+    full window take more or fewer than Linux. What has reached the peer
+    and waits for its acknowledgement takes no room of `SO_SNDBUF`, though
+    `SIOCOUTQ` counts it. A connection across a veth pair has segments of
+    its device's MTU, but the loopback's path MTU, advertised MSS and
+    windows. Beyond a handshake's tries and the segments a loss probe sends
     again, nothing is retransmitted or lost; the peer's window scale is taken as Linux's
     default, whatever buffer it set; and a connection the host made has
     its segments estimated, in 32 KiB segments with one acknowledgement
@@ -321,7 +321,7 @@ verified.
   switches and CPU migrations are those it last accounted, at its latest
   system call; its CPU time is looked at as the event is read, and its page
   faults count as they are taken. An event of
-  a CPU counts the time that passes, and no faults, switches or migrations.
+  a CPU counts those of every thread there, with the same limits.
   A fault that ends in `SIGSEGV` or `SIGBUS` is not counted, where Linux
   counts it in `page-faults`; a context switch is a sleep of the thread,
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
@@ -344,7 +344,11 @@ verified.
   for samples that take too long (`perf_sample_event_took`), which
   `perf_cpu_time_max_percent` sets the limit of; and no other event is
   throttled, as no other event here is an hrtimer's or the hardware's. An
-  event of a CPU takes no samples. Of the side-band records, an `execve` writes the new program's mappings once it
+  event of a CPU takes a thread's samples as that thread enters a system
+  call or reaches a checkpoint too, so that what it did there after its
+  last one before the event is disabled is counted but has no samples; its
+  `cpu-clock` or `task-clock` samples only the time the guest's threads ran
+  on the CPU, where Linux samples the idle task too. Of the side-band records, an `execve` writes the new program's mappings once it
   has loaded it, the stack's two first and the rest by address: the
   temporary stack's is placed at the top of 4-level user space with the
   length of the arguments' pages, where Linux gives where it was. Linux
@@ -397,11 +401,11 @@ verified.
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
   or packet socket, on a UDP socket and on the SYNs that come to a TCP
-  listener. Here a TCP connection has no segments yet, so no filter runs
-  yet on the handshake's last ACK, nor on the data, ACKs and FINs that come
-  to a connected socket, which Linux filters each (`tcp_filter`): a filter
-  that drops or cuts them, or keeps a SYN but drops that ACK, does
-  otherwise there. On a UDP socket no
+  listener. A connection's segments are counted here but not yet built, so
+  no filter runs yet on the handshake's last ACK, nor on the data, ACKs and
+  FINs that come to a connected socket, which Linux filters each
+  (`tcp_filter`): a filter that drops or cuts them, or keeps a SYN but drops
+  that ACK, does otherwise there. On a UDP socket no
   filter runs on the DNS stub's answers, which come through no device
   here; a datagram that Linux sends in fragments across a veth pair comes
   whole, though its filter sees the reassembled one's linear part and
@@ -582,7 +586,10 @@ verified.
   files are ready, as for a thread that exits alone. A huge page of a
   registered buffer charges RLIMIT_MEMLOCK for each of its 4 KiB pages, where
   Linux charges it once. A ring maps only shared (`MAP_PRIVATE` gives
-  `EINVAL`).
+  `EINVAL`). An offset that no region of a ring has gives its mapping
+  `ENOMEM`, as on Linux 7.0, the kernel the differential tests run on;
+  Linux master's `io_uring_get_unmapped_area` gives `EINVAL`. This follows
+  master once the test runners' kernel does.
   The features are Linux
   6.12's, so `IORING_FEAT_MIN_TIMEOUT` is reported though a wait's
   `min_wait_usec` changes nothing. A pseudo-terminal's read waits in

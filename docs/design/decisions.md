@@ -156,9 +156,10 @@ the real work started.
   beforehand. The allocator gets more memory only by growing it, so the
   launcher allocates the heap and frees it at once: in blocks of 64 MiB while
   they fit, then of half that size and so on down to one 64 KiB page, so that
-  no block's worth is left to grow later. It does not write to these blocks, so on macOS their pages take no physical memory until used. Other
-  browsers grow the memory as needed, since on Windows, and in Firefox on
-  Linux, a grown memory counts against the system's commit limit at once.
+  no block's worth is left to grow later. It does not write to these blocks,
+  so on macOS their pages take no physical memory until used. Other browsers
+  grow the memory as needed, since on Windows, and in Firefox on Linux, a
+  grown memory counts against the system's commit limit at once.
   WebKit browsers are told apart by their user agent: `AppleWebKit/` without
   `Chrome/`, which includes every browser on iOS. `diagnostics()` reports what
   the reserve returned and the memory's size before and after it

@@ -2,8 +2,8 @@
 // runs, since WebKit fails threads or crashes the page when a shared memory
 // grows while other threads run in it. These check that the reserve takes
 // smaller blocks once a whole one no longer fits, that it grows the memory to
-// its maximum, that later allocations reuse it instead
-// of growing it, and which browsers count as WebKit.
+// its maximum, that later allocations reuse it instead of growing it, and
+// which browsers count as WebKit.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";

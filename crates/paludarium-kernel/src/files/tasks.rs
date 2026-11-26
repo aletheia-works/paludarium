@@ -346,8 +346,9 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
             session: task.view.session,
             space: &task.view.space,
             descriptors: task.holds().then(|| public.files.descriptors()),
-            locked: task.memory().and_then(|memory| memory.locked_pages()),
-            resident: task.memory().and_then(|memory| memory.resident_pages()),
+            memory: task
+                .memory()
+                .and_then(|memory| crate::proc::status_memory(memory, task.code())),
             threads: task.threads(),
             // The task's own, the leader's for the process.
             switches: task
@@ -406,12 +407,12 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
         children_cpu: task.view.children_cpu,
         // As `do_task_stat`: the process's, its ended threads' too, or for
         // a path under `task` the thread's own.
-        minor_faults: if task.thread {
+        faults: if task.thread {
             task.view.group.thread_faults(task.tid)
         } else {
             task.view.group.process_faults()
         },
-        children_minor_faults: task.view.group.children_faults(),
+        children_faults: task.view.group.children_faults(),
         started: task.view.group.started(task.tid).unwrap_or(0),
         resident: task
             .memory()

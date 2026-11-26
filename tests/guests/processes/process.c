@@ -12295,6 +12295,217 @@ static int io_uring_poll_add_case(void) {
     return 0;
 }
 
+/* io_uring's file requests. Linux runs most of them in a worker, so each
+   one runs alone or in a link. */
+static int uf_run(struct uring *u, unsigned n, const char *label) {
+    uring_show(label, uring_enter(u->fd, n, n, 1, NULL, 0));
+    return unet_reap(u, label, 0);
+}
+
+static int io_uring_fs_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    char dir[] = "/tmp/uring-fs-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 81;
+    unsigned char *sqe;
+    char buf[64];
+    static const char empty[] = "";
+    const unsigned cwd = AT_FDCWD;
+
+    /* The preparation. */
+    static const unsigned char ops[] = {17, 18, 19, 21, 24, 25, 28, 35, 36, 37, 38, 39, 55};
+    for (unsigned i = 0; i < sizeof ops; i++) {
+        sqe = unet_push(&u, ops[i], ops[i], AT_FDCWD, (long)"a", (long)"a", 24, 0, 0);
+        sqe[40] = 1;
+        uf_run(&u, 1, "buf-index");
+        unet_push(&u, ops[i], ops[i], AT_FDCWD, (long)"a", (long)"a", 24, 0, 1);
+        uf_run(&u, 1, "ioprio");
+    }
+    static const struct {
+        unsigned char op, off;
+    } named[] = {{18, 0}, {21, 1}, {35, 1}, {36, 0}, {37, 0}, {38, 1}, {39, 1}};
+    for (unsigned i = 0; i < sizeof named / sizeof *named; i++) {
+        unsigned long off = named[i].off ? (unsigned long)"b" : 0;
+        unet_push(&u, named[i].op, 1, AT_FDCWD, off, (long)empty, 0, 0, 0);
+        uf_run(&u, 1, "empty");
+        unet_push(&u, named[i].op, 1, AT_FDCWD, off, 0, 0, 0, 0);
+        uf_run(&u, 1, "null");
+        unet_push(&u, named[i].op, 1, AT_FDCWD, off, (long)"a", 0, 0, 0)[1] = 1;
+        uf_run(&u, 1, "fixed");
+    }
+    static const unsigned char close_bad[] = {8, 16, 24, 28};
+    for (unsigned i = 0; i < sizeof close_bad; i++) {
+        unet_push(&u, 19, 1, 99, 0, 0, 0, 0, 0)[close_bad[i]] = 1;
+        uf_run(&u, 1, "close-refused");
+    }
+    unet_push(&u, 19, 1, 1, 0, 0, 0, 0, 0)[44] = 1;
+    uf_run(&u, 1, "close-slot-fd");
+    unet_push(&u, 19, 1, 0, 0, 0, 0, 0, 0)[44] = 1;
+    uf_run(&u, 1, "close-slot-none");
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_CLOEXEC, 0)[44] = 1;
+    uf_run(&u, 1, "open-slot-cloexec");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"a", 0, 1, 0);
+    uf_run(&u, 1, "unlink-flags");
+    unet_push(&u, 37, 1, AT_FDCWD, 0, (long)"a", 0, 1, 0);
+    uf_run(&u, 1, "mkdir-flags");
+    unet_push(&u, 38, 1, AT_FDCWD, (long)"b", (long)"a", 1, 0, 0);
+    uf_run(&u, 1, "symlink-len");
+    unet_push(&u, 55, 1, 0, 0, 0, 1, 0, 0);
+    uf_run(&u, 1, "ftruncate-len");
+    unet_push(&u, 17, 1, 0, 0, 1, 0, 1, 0);
+    uf_run(&u, 1, "fallocate-flags");
+    unet_push(&u, 3, 1, 0, -1, 0, 0, 0, 0);
+    uf_run(&u, 1, "fsync-negative");
+
+    /* The calls. */
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0600, O_RDWR | O_CREAT | O_EXCL, 0);
+    int fd = uf_run(&u, 1, "create");
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0600, O_RDWR | O_CREAT | O_EXCL, 0);
+    uf_run(&u, 1, "create-again");
+    unet_push(&u, 55, 1, fd, 100, 0, 0, 0, 0);
+    uf_run(&u, 1, "ftruncate");
+    unet_push(&u, 17, 1, fd, 0, 200, 0, 0, 0);
+    uf_run(&u, 1, "fallocate");
+    unet_push(&u, 17, 1, fd, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "fallocate-none");
+    struct statx st;
+    memset(&st, 0, sizeof st);
+    unet_push(&u, 21, 1, AT_FDCWD, (long)&st, (long)"a", STATX_SIZE | STATX_MODE, 0, 0);
+    uf_run(&u, 1, "statx");
+    printf("size %llu mode %o\n", (unsigned long long)st.stx_size, st.stx_mode);
+    memset(&st, 0, sizeof st);
+    unet_push(&u, 21, 1, fd, (long)&st, (long)empty, STATX_SIZE, AT_EMPTY_PATH, 0);
+    uf_run(&u, 1, "statx-empty");
+    printf("size %llu\n", (unsigned long long)st.stx_size);
+    unet_push(&u, 21, 1, fd, (long)&st, 0, STATX_SIZE, AT_EMPTY_PATH, 0);
+    uf_run(&u, 1, "statx-empty-null");
+    unet_push(&u, 21, 1, AT_FDCWD, 8, (long)"a", STATX_SIZE, 0, 0);
+    uf_run(&u, 1, "statx-unmapped");
+    unet_push(&u, 21, 1, AT_FDCWD, (long)&st, (long)"a", 1u << 31, 0, 0);
+    uf_run(&u, 1, "statx-mask");
+    unet_push(&u, 24, 1, fd, 0, 0, 10, 1, 0);
+    uf_run(&u, 1, "fadvise");
+    unet_push(&u, 24, 1, fd, 0, 0, 10, 9, 0);
+    uf_run(&u, 1, "fadvise-bad");
+    char *page = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    page[0] = page[4096] = 1;
+    unet_push(&u, 25, 1, -1, 0, (long)page, 4096, MADV_DONTNEED, 0);
+    uf_run(&u, 1, "madvise");
+    printf("page %d %d\n", page[0], page[4096]);
+    unet_push(&u, 25, 1, -1, 8192, (long)page, 1, MADV_DONTNEED, 0);
+    uf_run(&u, 1, "madvise-long");
+    printf("page %d %d\n", page[0], page[4096]);
+    unet_push(&u, 25, 1, -1, 0, (long)page, 4096, 99, 0);
+    uf_run(&u, 1, "madvise-bad");
+    unet_push(&u, 39, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 0, 0);
+    uf_run(&u, 1, "link");
+    unet_push(&u, 39, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 0, 0);
+    uf_run(&u, 1, "link-again");
+    unet_push(&u, 39, 1, AT_FDCWD, (long)"c", (long)"a", cwd, 1, 0);
+    uf_run(&u, 1, "link-flags");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"b", 0, 0, 0);
+    uf_run(&u, 1, "unlink");
+    unet_push(&u, 35, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 0, 0);
+    uf_run(&u, 1, "rename");
+    unet_push(&u, 35, 1, AT_FDCWD, (long)"b", (long)"a", cwd, 8, 0);
+    uf_run(&u, 1, "rename-flags");
+    unet_push(&u, 38, 1, AT_FDCWD, (long)"a", (long)"b", 0, 0, 0);
+    uf_run(&u, 1, "symlink");
+    unet_push(&u, 37, 1, AT_FDCWD, 0, (long)"d", 0700, 0, 0);
+    uf_run(&u, 1, "mkdir");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"d", 0, 0, 0);
+    uf_run(&u, 1, "unlink-directory");
+    unet_push(&u, 36, 1, AT_FDCWD, 0, (long)"d", 0, AT_REMOVEDIR, 0);
+    uf_run(&u, 1, "rmdir");
+
+    /* openat2, and descriptors that cannot be closed here. */
+    unsigned long how[4] = {O_RDONLY, 0, 0, 0};
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 23, 0, 0);
+    uf_run(&u, 1, "openat2-size");
+    unet_push(&u, 28, 1, AT_FDCWD, 8, (long)"a", 24, 0, 0);
+    uf_run(&u, 1, "openat2-unmapped");
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 32, 0, 0);
+    int second = uf_run(&u, 1, "openat2");
+    how[3] = 1;
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 32, 0, 0);
+    uf_run(&u, 1, "openat2-newer");
+    how[1] = 1;
+    unet_push(&u, 28, 1, AT_FDCWD, (long)how, (long)"a", 24, 0, 0);
+    uf_run(&u, 1, "openat2-mode");
+    unet_push(&u, 19, 1, second, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "close");
+    unet_push(&u, 19, 1, second, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "close-again");
+    unet_push(&u, 19, 1, u.fd, 0, 0, 0, 0, 0);
+    uf_run(&u, 1, "close-ring");
+
+    /* A FIFO opens without waiting, and not for long. */
+    mkfifo("fifo", 0600);
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"fifo", 0, O_RDONLY, 0);
+    second = uf_run(&u, 1, "fifo");
+    printf("nonblock %d\n", (fcntl(second, F_GETFL) & O_NONBLOCK) != 0);
+    close(second);
+
+    /* Registered slots, links, and names that change. */
+    int slots[2] = {-1, -1};
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    sqe[44] = 1;
+    uf_run(&u, 1, "slot-unregistered");
+    syscall(427, u.fd, 2, slots, 2);
+    if (pwrite(fd, "other", 5, 0) != 5) return 82;
+    char name[8] = "a";
+    sqe = pw_read(&u, 1, fd, name, 5, 0);
+    sqe[1] = 4;
+    sqe = unet_push(&u, 18, 2, AT_FDCWD, 0, (long)name, 0, O_RDONLY, 0);
+    sqe[44] = 1;
+    sqe[1] = 4;
+    sqe = pw_read(&u, 3, 0, buf, 5, 0);
+    sqe[1] = 1;
+    uf_run(&u, 3, "slot");
+    printf("%.5s %.5s\n", name, buf);
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    memset(sqe + 44, 0xff, 4);
+    uf_run(&u, 1, "slot-any");
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    memset(sqe + 44, 0xff, 4);
+    uf_run(&u, 1, "slot-full");
+    sqe = unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"a", 0, O_RDONLY, 0);
+    sqe[44] = 3;
+    uf_run(&u, 1, "slot-past");
+    sqe = unet_push(&u, 24, 1, 1, 0, 0, 10, 1, 0);
+    sqe[1] = 1;
+    uf_run(&u, 1, "fadvise-slot");
+    for (int i = 1; i < 4; i++) {
+        unet_push(&u, 19, 1, 0, 0, 0, 0, 0, 0)[44] = i;
+        uf_run(&u, 1, "close-slot");
+        unet_push(&u, 19, 1, 0, 0, 0, 0, 0, 0)[44] = i;
+        uf_run(&u, 1, "close-slot-empty");
+    }
+    unet_push(&u, 37, 1, AT_FDCWD, 0, (long)"a", 0700, 0, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "mkdir-link");
+    int event = eventfd(0, 0);
+    unet_push(&u, 3, 1, event, 0, 0, 0, 0, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "fsync-link");
+    unet_push(&u, 18, 1, AT_FDCWD, 0, (long)"none", 0, O_RDONLY, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "open-link");
+    unet_push(&u, 55, 1, 99, 0, 0, 0, 0, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "ftruncate-badf-link");
+    unet_push(&u, 24, 1, fd, 0, 0, 0, 9, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    uf_run(&u, 2, "fadvise-link");
+    unlink("a");
+    unlink("b");
+    unlink("fifo");
+    chdir("/");
+    rmdir(dir);
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -19019,6 +19230,152 @@ static int io_uring_placement_case(void) {
     }
     return 0;
 }
+/* The mmap-hugetlb case: MAP_HUGETLB with no huge page in the pool, as
+   Linux starts (nr_hugepages 0). A mapping that would reserve pages is
+   ENOMEM, after what do_mmap and hugetlbfs check first, and a fixed one has
+   unmapped what it replaces by then. MAP_NORESERVE maps, and an access is
+   SIGBUS; the VMA is split, remapped and dropped only on 2 MiB. */
+#define HUGE_2M (2ul << 20)
+static void huge_smaps(const char *label, char *at) {
+    char line[512], *tail;
+    FILE *f = fopen("/proc/self/smaps", "r");
+    int in = 0;
+    unsigned long start, end;
+    printf("%s:", label);
+    while (f && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\n")] = 0;
+        if (sscanf(line, "%lx-%lx ", &start, &end) == 2) {
+            in = start == (uintptr_t)at;
+            if (in && (tail = strchr(line, '/'))) printf(" size=%lu name=%s", end - start, tail);
+        } else if (in && (strstr(line, "PageSize:") || strstr(line, "VmFlags:"))) {
+            char *p = strchr(line, ':') + 1;
+            printf(" [%.*s=%s]", (int)(strcspn(line, ":")), line, p + strspn(p, " "));
+        }
+    }
+    printf("\n");
+    if (f) fclose(f);
+}
+static int mmap_hugetlb_case(void) {
+    long page = 4096;
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    int huge = anon | MAP_HUGETLB, none = huge | MAP_NORESERVE;
+    char line[256];
+    FILE *f = fopen("/proc/meminfo", "r");
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "HugePages_Total", 15)) printf("%s", line);
+    if (f) fclose(f);
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 80;
+    struct sigaction action = {.sa_flags = SA_SIGINFO};
+    action.sa_sigaction = on_bus;
+    sigaction(SIGBUS, &action, NULL);
+    printf("plain=%d", low_error(mmap(NULL, HUGE_2M, rw, huge, -1, 0)));
+    printf(" shared=%d", low_error(mmap(NULL, HUGE_2M, rw, MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0)));
+    printf(" byte=%d", low_error(mmap(NULL, 1, rw, huge, -1, 0)));
+    printf(" empty=%d", low_error(mmap(NULL, 0, rw, huge, -1, 0)));
+    printf(" long=%d\n", low_error(mmap(NULL, 1ul << 57, rw, huge, -1, 0)));
+    int sizes[] = {1, 12, 20, 21, 22, 29, 63};
+    for (int i = 0; i < 7; i++)
+        printf("size-%d=%d\n", sizes[i],
+               low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw,
+                                         (unsigned long)none | (unsigned long)sizes[i] << 26, -1L, 0L)));
+    int zero = open("/dev/zero", O_RDWR), self = open("/proc/self/exe", O_RDONLY);
+    printf("file=%d", low_error(mmap(NULL, HUGE_2M, PROT_READ, MAP_PRIVATE | MAP_HUGETLB, self, 0)));
+    printf(" zero=%d", low_error(mmap(NULL, HUGE_2M, rw, MAP_PRIVATE | MAP_HUGETLB, zero, 0)));
+    printf(" closed=%d\n", low_error(mmap(NULL, HUGE_2M, rw, MAP_PRIVATE | MAP_HUGETLB, -1, 0)));
+    /* Huge pages are a hugetlbfs file's, with a file's types. */
+    long typed = MAP_ANONYMOUS | MAP_HUGETLB | MAP_NORESERVE;
+    char *validated = mmap(NULL, HUGE_2M, rw, typed | MAP_SHARED_VALIDATE, -1, 0);
+    printf("validated=%d", low_error(validated));
+    if (validated != MAP_FAILED) munmap(validated, HUGE_2M);
+    printf(" validated-sync=%d", low_error(mmap(NULL, HUGE_2M, rw, typed | MAP_SHARED_VALIDATE | 0x80000, -1, 0)));
+    printf(" droppable=%d", low_error(mmap(NULL, HUGE_2M, rw, typed | MAP_DROPPABLE, -1, 0)));
+    printf(" untyped=%d\n", low_error(mmap(NULL, HUGE_2M, rw, typed, -1, 0)));
+    /* A room of 8 MiB on a 2 MiB boundary. */
+    char *room = mmap(NULL, 10 * HUGE_2M, PROT_NONE, anon, -1, 0);
+    if (room == MAP_FAILED) return 81;
+    room = (char *)(((uintptr_t)room + HUGE_2M - 1) & ~(HUGE_2M - 1));
+    printf("unaligned=%d", low_error(mmap(room + page, HUGE_2M, rw, none | MAP_FIXED, -1, 0)));
+    printf(" in-use=%d", low_error(mmap(room, HUGE_2M, rw, none | MAP_FIXED_NOREPLACE, -1, 0)));
+    printf(" low=%d", low_error(mmap(NULL, HUGE_2M, rw, none | MAP_FIXED, -1, 0)));
+    printf(" grows=%d", low_error(mmap(NULL, HUGE_2M, rw, none | MAP_GROWSDOWN, -1, 0)));
+    printf(" offset=%d", low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw, none, -1L, 4096L)));
+    printf(" whole=%d", low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw, none, -1L, HUGE_2M)));
+    printf(" far=%d\n",
+           low_error((void *)syscall(SYS_mmap, 0L, HUGE_2M, rw, none, -1L, 0x7ffffffffffff000L)));
+    unsigned char in;
+    for (int i = 0; i < 2; i++) {
+        char *at = room + (size_t)(i + 1) * 2 * HUGE_2M;
+        int e = low_error((void *)syscall(SYS_mmap, at, HUGE_2M, rw, (i ? none : huge) | MAP_FIXED,
+                                          -1L, i ? 4096L : 0L));
+        int there = mincore(at, page, &in) ? errno : 0;
+        printf("replace=%d there=%d before=%d after=%d\n", e, there,
+               mincore(at - page, page, &in) ? errno : 0, mincore(at + HUGE_2M, page, &in) ? errno : 0);
+    }
+    char *hinted = mmap(room + 4 * HUGE_2M + page, HUGE_2M, rw, none, -1, 0);
+    printf("hint-busy: aligned=%d there=%d\n", (uintptr_t)hinted % HUGE_2M == 0, hinted == room + 5 * HUGE_2M);
+    munmap(hinted, HUGE_2M);
+    munmap(room + 6 * HUGE_2M, 2 * HUGE_2M);
+    hinted = mmap(room + 5 * HUGE_2M + page, HUGE_2M + 1, rw, none, -1, 0);
+    printf("hint-free: there=%d\n", hinted == room + 6 * HUGE_2M);
+    munmap(hinted, 2 * HUGE_2M);
+    char *low = mmap(NULL, HUGE_2M, rw, none | MAP_32BIT, -1, 0);
+    printf("32bit: low=%d aligned=%d\n", low_area(low, HUGE_2M), (uintptr_t)low % HUGE_2M == 0);
+    for (int shared = 0; shared < 2; shared++) {
+        int flags = (none & ~MAP_PRIVATE) | (shared ? MAP_SHARED : MAP_PRIVATE);
+        char *a = mmap(NULL, 3 * HUGE_2M - page, rw, flags, -1, 0);
+        printf("%s: error=%d aligned=%d\n", shared ? "shared" : "private", low_error(a),
+               (uintptr_t)a % HUGE_2M == 0);
+        if (a == MAP_FAILED) return 82;
+        huge_smaps("vma", a);
+        touch("read", a, 0);
+        touch("write", a + HUGE_2M + 5, 1);
+        errno = 0;
+        long r = read(zero, a, 1);
+        printf("kernel=%ld errno=%d", r, errno);
+        in = 9;
+        r = mincore(a, page, &in);
+        printf(" mincore=%ld in=%d\n", r, in & 1);
+        printf("munmap=%d", munmap(a, page) ? errno : 0);
+        printf(" tail=%d", munmap(a + 3 * HUGE_2M - page, page) ? errno : 0);
+        printf(" mprotect=%d", mprotect(a, page, PROT_READ) ? errno : 0);
+        printf(" part=%d\n", mprotect(a + HUGE_2M, HUGE_2M, PROT_READ) ? errno : 0);
+        int advice[] = {MADV_DONTNEED, MADV_FREE, MADV_HUGEPAGE, MADV_DOFORK, MADV_DODUMP,
+                        MADV_WIPEONFORK, 20, 21, 102, 103};
+        for (int i = 0; i < 10; i++) {
+            int first = madvise(a, page, advice[i]) ? errno : 0;
+            printf("madvise-%d=%d %d\n", advice[i], first, madvise(a + page, page, advice[i]) ? errno : 0);
+        }
+        printf("mremap: same=%d", low_error(mremap(a, HUGE_2M, page, 0)) );
+        printf(" grow=%d", low_error(mremap(a, HUGE_2M, HUGE_2M + page, MREMAP_MAYMOVE)));
+        int how = MREMAP_MAYMOVE | MREMAP_FIXED;
+        printf(" unaligned=%d", low_error(mremap(a, HUGE_2M, HUGE_2M, how, room + page)));
+        printf(" within=%d", low_error(mremap(a + page, HUGE_2M, HUGE_2M, how, room)));
+        printf(" keep=%d", low_error((void *)syscall(SYS_mremap, a, HUGE_2M, HUGE_2M,
+                                                     MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0L)));
+        char *to = mremap(a, page, page, how, room);
+        printf(" move=%d there=%d\n", low_error(to), to == room);
+        if (to == room) {
+            huge_smaps("moved", to);
+            touch("moved", to, 0);
+        }
+        printf("gone=%d\n", mincore(a, page, &in) ? errno : 0);
+        printf("munmap=%d", munmap(a + HUGE_2M, HUGE_2M) ? errno : 0);
+        printf(" %d\n", munmap(a + 2 * HUGE_2M, HUGE_2M) ? errno : 0);
+    }
+    fflush(stdout);
+    char *child = mmap(NULL, HUGE_2M, rw, none, -1, 0);
+    pid_t kid = fork();
+    if (kid == 0) {
+        touch("child", child, 1);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, NULL, 0);
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -21180,6 +21537,489 @@ static int userns_nondumpable_read_case(const char *self) {
     unlink(readable);
     unlink(unreadable);
     rmdir(dir);
+    return 0;
+}
+
+/* The status-memory case: /proc/self/status has task_mem's memory fields
+   in task_mem's order (VmPin and VmPTE aside, which paludarium does not
+   show), in agreement with statm (VmSize its size, VmData and VmStk its
+   data, VmExe its text) and with each other (VmRSS the sum of RssAnon,
+   RssFile and RssShmem, VmPeak and VmHWM no less than VmSize and VmRSS).
+   They change as Linux's do: a private mapping counts in VmSize and
+   VmData and its written pages in RssAnon, a shared anonymous one in
+   RssShmem and not in VmData, a file's read pages in RssFile. munmap
+   leaves VmPeak; a fixed mapping over mapped pages notes it before its own
+   pages count (__mmap_complete calls vms_complete_munmap_vmas first), a
+   move by mremap does not note the moved pages twice (move_vma keeps the
+   peak it had), and a fork child's VmPeak is its VmSize (dup_mm). What the process had before is the runtime's own, so the
+   changes are printed, in pages, and VmLib (the vDSO's text). Reading is
+   into a static buffer, and every call is made once before, so that no
+   page of code, stack or stdio comes in between. */
+static char sm_text[1 << 13];
+static int sm_read(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, sm_text, sizeof sm_text - 1);
+    close(fd);
+    if (n < 0) return 0;
+    sm_text[n] = 0;
+    return 1;
+}
+/* The field `name` of the status read last, in pages; -1 if not there. */
+static long sm_field(const char *name) {
+    char key[32];
+    snprintf(key, sizeof key, "\n%s:", name);
+    const char *at = strstr(sm_text, key);
+    return at ? strtol(at + strlen(key), NULL, 10) / 4 : -1;
+}
+enum { SM_PEAK, SM_SIZE, SM_HWM, SM_RSS, SM_ANON, SM_FILE, SM_SHMEM, SM_DATA, SM_STK, SM_EXE, SM_LIB, SM_N };
+static const char *const sm_names[SM_N] = {"VmPeak", "VmSize", "VmHWM", "VmRSS", "RssAnon", "RssFile",
+                                           "RssShmem", "VmData", "VmStk", "VmExe", "VmLib"};
+static void sm_take(long *v) {
+    sm_read("/proc/self/status");
+    for (int i = 0; i < SM_N; i++) v[i] = sm_field(sm_names[i]);
+}
+static int status_memory_case(void) {
+    const long page = sysconf(_SC_PAGESIZE);
+    /* The memory fields' names, in order. */
+    sm_read("/proc/self/status");
+    char names[512] = "";
+    for (const char *line = sm_text; *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : "") {
+        const char *colon = strchr(line, ':');
+        if (!colon) break;
+        size_t len = (size_t)(colon - line);
+        int memory = !strncmp(line, "Vm", 2) || !strncmp(line, "Rss", 3) || !strncmp(line, "Hugetlb", 7);
+        if (memory && !(len == 5 && (!strncmp(line, "VmPin", 5) || !strncmp(line, "VmPTE", 5)))) {
+            strncat(names, line, len);
+            strcat(names, " ");
+        }
+    }
+    printf("fields: %s\n", names);
+    long v[SM_N], w[SM_N];
+    sm_take(v);
+    long statm[7] = {0};
+    sm_read("/proc/self/statm");
+    sscanf(sm_text, "%ld %ld %ld %ld %ld %ld %ld", &statm[0], &statm[1], &statm[2], &statm[3], &statm[4],
+           &statm[5], &statm[6]);
+    sm_take(v);
+    printf("statm: size=%d data=%d text=%d\n", v[SM_SIZE] == statm[0], v[SM_DATA] + v[SM_STK] == statm[5],
+           v[SM_EXE] == statm[3]);
+    printf("sums: rss=%d peak=%d hwm=%d lib=%ld swap=%ld huge=%ld\n",
+           v[SM_RSS] == v[SM_ANON] + v[SM_FILE] + v[SM_SHMEM], v[SM_PEAK] >= v[SM_SIZE], v[SM_HWM] >= v[SM_RSS],
+           v[SM_LIB], sm_field("VmSwap"), sm_field("HugetlbPages"));
+
+    /* Every call once, on memory of its own, before anything counts. */
+    int exe = open("/proc/self/exe", O_RDONLY);
+    if (exe < 0) return 1;
+    char *warm = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (warm == MAP_FAILED) return 1;
+    warm[0] = 1;
+    mmap(warm, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    char *moved = mremap(warm + page, page, 2 * page, MREMAP_MAYMOVE);
+    munmap(warm, 4 * page);
+    if (moved != MAP_FAILED) munmap(moved, 2 * page);
+    sm_take(v);
+    sm_take(v);
+
+    /* A private mapping, written. */
+    char *private = mmap(NULL, 64 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (private == MAP_FAILED) return 1;
+    sm_take(w);
+    long mapped[3] = {w[SM_SIZE] - v[SM_SIZE], w[SM_DATA] - v[SM_DATA], w[SM_ANON] - v[SM_ANON]};
+    for (int i = 0; i < 64; i++) private[i * page] = 1;
+    sm_take(v);
+    long written[2] = {v[SM_ANON] - w[SM_ANON], v[SM_RSS] - w[SM_RSS]};
+    /* Shared anonymous memory, written. */
+    char *shared = mmap(NULL, 16 * page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) return 1;
+    for (int i = 0; i < 16; i++) shared[i * page] = 1;
+    sm_take(w);
+    long shmem[4] = {w[SM_SHMEM] - v[SM_SHMEM], w[SM_ANON] - v[SM_ANON], w[SM_DATA] - v[SM_DATA],
+                     w[SM_SIZE] - v[SM_SIZE]};
+    /* A file's pages, read. */
+    volatile char *file = mmap(NULL, 16 * page, PROT_READ, MAP_PRIVATE, exe, 0);
+    if (file == MAP_FAILED) return 1;
+    for (int i = 0; i < 16; i++) (void)file[i * page];
+    sm_take(v);
+    long filed[3] = {v[SM_FILE] - w[SM_FILE], v[SM_ANON] - w[SM_ANON], v[SM_DATA] - w[SM_DATA]};
+    /* munmap of half the private mapping. */
+    munmap(private + 32 * page, 32 * page);
+    sm_take(w);
+    long unmapped[3] = {v[SM_SIZE] - w[SM_SIZE], w[SM_PEAK] - v[SM_PEAK], v[SM_ANON] - w[SM_ANON]};
+    /* A mapping that takes the size past the peak, and a fixed one over a
+       part of it. */
+    char *big = mmap(NULL, 128 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (big == MAP_FAILED) return 1;
+    sm_take(v);
+    long grown = v[SM_PEAK] - v[SM_SIZE];
+    mmap(big, 16 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    sm_take(w);
+    long fixed[2] = {w[SM_PEAK] - w[SM_SIZE], w[SM_SIZE] - v[SM_SIZE]};
+    /* Past the peak again, then a move of 16 pages by mremap. */
+    char *more = mmap(NULL, 64 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (more == MAP_FAILED) return 1;
+    sm_take(v);
+    char *to = mremap(big + 16 * page, 16 * page, 17 * page, MREMAP_MAYMOVE);
+    sm_take(w);
+    long remapped[3] = {to != MAP_FAILED && to != big + 16 * page, w[SM_PEAK] - w[SM_SIZE], w[SM_SIZE] - v[SM_SIZE]};
+
+    printf("mapped: size+%ld data+%ld anon+%ld\n", mapped[0], mapped[1], mapped[2]);
+    printf("written: anon+%ld rss+%ld\n", written[0], written[1]);
+    printf("shared: shmem+%ld anon+%ld data+%ld size+%ld\n", shmem[0], shmem[1], shmem[2], shmem[3]);
+    printf("file: file+%ld anon+%ld data+%ld\n", filed[0], filed[1], filed[2]);
+    printf("unmapped: size-%ld peak+%ld anon-%ld\n", unmapped[0], unmapped[1], unmapped[2]);
+    printf("grown: peak-size=%ld\n", grown);
+    printf("fixed: peak-size=%ld size+%ld\n", fixed[0], fixed[1]);
+    printf("remapped: moved=%ld peak-size=%ld size+%ld\n", remapped[0], remapped[1], remapped[2]);
+
+    /* A fork child's peak is its size, where the parent's is above it. */
+    munmap(more, 64 * page);
+    sm_take(v);
+    int pipes[2];
+    if (pipe(pipes)) return 1;
+    pid_t child = fork();
+    if (child == 0) {
+        long c[SM_N];
+        sm_take(c);
+        char line[64];
+        int n = snprintf(line, sizeof line, "child: peak-size=%ld\n", c[SM_PEAK] - c[SM_SIZE]);
+        write(pipes[1], line, (size_t)n);
+        _exit(0);
+    }
+    close(pipes[1]);
+    char line[64] = {0};
+    read(pipes[0], line, sizeof line - 1);
+    close(pipes[0]);
+    waitpid(child, NULL, 0);
+    printf("parent: peak-above-size=%d\n", v[SM_PEAK] > v[SM_SIZE]);
+    printf("%s", line);
+    close(exe);
+    return 0;
+}
+
+/* The proc-cpuinfo case: /proc/cpuinfo has Linux 7.0's show_cpuinfo
+   fields in its order, a record for each CPU, and what it says of the CPU
+   agrees with cpuid in the reader: vendor, family, model, stepping, cpuid
+   level, the CLFLUSH line and the address sizes as get_cpu_address_sizes
+   takes them, the initial APIC ID of the CPU the reader runs on, and the
+   flags of the words get_cpu_cap copies from cpuid (all of leaf 1's EDX and
+   0x80000001's EDX shown, and none shown that cpuid lacks but those Linux
+   sets itself on some CPUs). Flags and bugs follow x86_cap_flags' and
+   x86_bug_flags' order. The values differ by CPU, so only whether each
+   holds is printed, with the names of any flag that does not. */
+struct ci_name {
+    short bit;
+    const char *name;
+};
+/* Linux 7.0's x86_cap_flags and x86_bug_flags (cpufeatures.h): each named
+   bit, in bit order. */
+static const struct ci_name ci_flags[] = {
+    {0, "fpu"}, {1, "vme"}, {2, "de"}, {3, "pse"}, {4, "tsc"}, {5, "msr"}, {6, "pae"}, {7, "mce"},
+    {8, "cx8"}, {9, "apic"}, {11, "sep"}, {12, "mtrr"}, {13, "pge"}, {14, "mca"}, {15, "cmov"},
+    {16, "pat"}, {17, "pse36"}, {18, "pn"}, {19, "clflush"}, {21, "dts"}, {22, "acpi"},
+    {23, "mmx"}, {24, "fxsr"}, {25, "sse"}, {26, "sse2"}, {27, "ss"}, {28, "ht"}, {29, "tm"},
+    {30, "ia64"}, {31, "pbe"}, {43, "syscall"}, {51, "mp"}, {52, "nx"}, {54, "mmxext"},
+    {57, "fxsr_opt"}, {58, "pdpe1gb"}, {59, "rdtscp"}, {61, "lm"}, {62, "3dnowext"}, {63, "3dnow"},
+    {64, "recovery"}, {65, "longrun"}, {67, "lrti"}, {96, "cxmmx"}, {97, "k6_mtrr"},
+    {98, "cyrix_arr"}, {99, "centaur_mcr"}, {104, "constant_tsc"}, {105, "up"}, {106, "art"},
+    {107, "arch_perfmon"}, {108, "pebs"}, {109, "bts"}, {112, "rep_good"}, {113, "amd_lbr_v2"},
+    {115, "acc_power"}, {116, "nopl"}, {118, "xtopology"}, {119, "tsc_reliable"},
+    {120, "nonstop_tsc"}, {121, "cpuid"}, {122, "extd_apicid"}, {123, "amd_dcm"},
+    {124, "aperfmperf"}, {125, "rapl"}, {126, "nonstop_tsc_s3"}, {127, "tsc_known_freq"},
+    {128, "pni"}, {129, "pclmulqdq"}, {130, "dtes64"}, {131, "monitor"}, {132, "ds_cpl"},
+    {133, "vmx"}, {134, "smx"}, {135, "est"}, {136, "tm2"}, {137, "ssse3"}, {138, "cid"},
+    {139, "sdbg"}, {140, "fma"}, {141, "cx16"}, {142, "xtpr"}, {143, "pdcm"}, {145, "pcid"},
+    {146, "dca"}, {147, "sse4_1"}, {148, "sse4_2"}, {149, "x2apic"}, {150, "movbe"},
+    {151, "popcnt"}, {152, "tsc_deadline_timer"}, {153, "aes"}, {154, "xsave"}, {156, "avx"},
+    {157, "f16c"}, {158, "rdrand"}, {159, "hypervisor"}, {162, "rng"}, {163, "rng_en"},
+    {166, "ace"}, {167, "ace_en"}, {168, "ace2"}, {169, "ace2_en"}, {170, "phe"}, {171, "phe_en"},
+    {172, "pmm"}, {173, "pmm_en"}, {192, "lahf_lm"}, {193, "cmp_legacy"}, {194, "svm"},
+    {195, "extapic"}, {196, "cr8_legacy"}, {197, "abm"}, {198, "sse4a"}, {199, "misalignsse"},
+    {200, "3dnowprefetch"}, {201, "osvw"}, {202, "ibs"}, {203, "xop"}, {204, "skinit"},
+    {205, "wdt"}, {207, "lwp"}, {208, "fma4"}, {209, "tce"}, {211, "nodeid_msr"}, {213, "tbm"},
+    {214, "topoext"}, {215, "perfctr_core"}, {216, "perfctr_nb"}, {218, "bpext"}, {219, "ptsc"},
+    {220, "perfctr_llc"}, {221, "mwaitx"}, {224, "ring3mwait"}, {225, "cpuid_fault"}, {226, "cpb"},
+    {227, "epb"}, {228, "cat_l3"}, {229, "cat_l2"}, {230, "cdp_l3"}, {231, "tdx_host_platform"},
+    {232, "hw_pstate"}, {233, "proc_feedback"}, {235, "pti"}, {238, "intel_ppin"}, {239, "cdp_l2"},
+    {241, "ssbd"}, {242, "mba"}, {244, "perfmon_v2"}, {249, "ibrs"}, {250, "ibpb"}, {251, "stibp"},
+    {254, "ibrs_enhanced"}, {256, "tpr_shadow"}, {257, "flexpriority"}, {258, "ept"},
+    {259, "vpid"}, {271, "vmmcall"}, {273, "ept_ad"}, {278, "tdx_guest"}, {288, "fsgsbase"},
+    {289, "tsc_adjust"}, {290, "sgx"}, {291, "bmi1"}, {292, "hle"}, {293, "avx2"}, {295, "smep"},
+    {296, "bmi2"}, {297, "erms"}, {298, "invpcid"}, {299, "rtm"}, {300, "cqm"}, {302, "mpx"},
+    {303, "rdt_a"}, {304, "avx512f"}, {305, "avx512dq"}, {306, "rdseed"}, {307, "adx"},
+    {308, "smap"}, {309, "avx512ifma"}, {311, "clflushopt"}, {312, "clwb"}, {313, "intel_pt"},
+    {314, "avx512pf"}, {315, "avx512er"}, {316, "avx512cd"}, {317, "sha_ni"}, {318, "avx512bw"},
+    {319, "avx512vl"}, {320, "xsaveopt"}, {321, "xsavec"}, {322, "xgetbv1"}, {323, "xsaves"},
+    {352, "cqm_llc"}, {353, "cqm_occup_llc"}, {354, "cqm_mbm_total"}, {355, "cqm_mbm_local"},
+    {358, "split_lock_detect"}, {375, "user_shstk"}, {388, "avx_vnni"}, {389, "avx512_bf16"},
+    {390, "lass"}, {401, "fred"}, {410, "lam"}, {416, "clzero"}, {417, "irperf"},
+    {418, "xsaveerptr"}, {420, "rdpru"}, {425, "wbnoinvd"}, {439, "amd_ppin"}, {441, "virt_ssbd"},
+    {443, "cppc"}, {447, "brs"}, {448, "dtherm"}, {449, "ida"}, {450, "arat"}, {452, "pln"},
+    {454, "pts"}, {455, "hwp"}, {456, "hwp_notify"}, {457, "hwp_act_window"}, {458, "hwp_epp"},
+    {459, "hwp_pkg_req"}, {467, "hfi"}, {480, "npt"}, {481, "lbrv"}, {482, "svm_lock"},
+    {483, "nrip_save"}, {484, "tsc_scale"}, {485, "vmcb_clean"}, {486, "flushbyasid"},
+    {487, "decodeassists"}, {490, "pausefilter"}, {492, "pfthreshold"}, {493, "avic"},
+    {495, "v_vmsave_vmload"}, {496, "vgif"}, {498, "x2avic"}, {500, "v_spec_ctrl"}, {505, "vnmi"},
+    {513, "avx512vbmi"}, {514, "umip"}, {515, "pku"}, {516, "ospke"}, {517, "waitpkg"},
+    {518, "avx512_vbmi2"}, {520, "gfni"}, {521, "vaes"}, {522, "vpclmulqdq"}, {523, "avx512_vnni"},
+    {524, "avx512_bitalg"}, {525, "tme"}, {526, "avx512_vpopcntdq"}, {528, "la57"}, {534, "rdpid"},
+    {536, "bus_lock_detect"}, {537, "cldemote"}, {539, "movdiri"}, {540, "movdir64b"},
+    {541, "enqcmd"}, {542, "sgx_lc"}, {544, "overflow_recov"}, {545, "succor"}, {547, "smca"},
+    {578, "avx512_4vnniw"}, {579, "avx512_4fmaps"}, {580, "fsrm"}, {584, "avx512_vp2intersect"},
+    {586, "md_clear"}, {590, "serialize"}, {592, "tsxldtrk"}, {594, "pconfig"}, {595, "arch_lbr"},
+    {596, "ibt"}, {598, "amx_bf16"}, {599, "avx512_fp16"}, {600, "amx_tile"}, {601, "amx_int8"},
+    {604, "flush_l1d"}, {605, "arch_capabilities"}, {608, "sme"}, {609, "sev"}, {611, "sev_es"},
+    {612, "sev_snp"}, {622, "debug_swap"}, {636, "svsm"}, {672, "amd_lbr_pmc_freeze"},
+};
+static const struct ci_name ci_bugs[] = {
+    {0, "f00f"}, {1, "fdiv"}, {2, "coma"}, {3, "tlb_mmatch"}, {4, "apic_c1e"}, {5, "11ap"},
+    {6, "fxsave_leak"}, {7, "clflush_monitor"}, {8, "sysret_ss_attrs"}, {10, "null_seg"},
+    {11, "swapgs_fence"}, {12, "monitor"}, {13, "amd_e400"}, {14, "cpu_meltdown"},
+    {15, "spectre_v1"}, {16, "spectre_v2"}, {17, "spec_store_bypass"}, {18, "l1tf"}, {19, "mds"},
+    {20, "msbds_only"}, {21, "swapgs"}, {22, "taa"}, {23, "itlb_multihit"}, {24, "srbds"},
+    {25, "mmio_stale_data"}, {27, "retbleed"}, {28, "eibrs_pbrsb"}, {29, "smt_rsb"}, {30, "gds"},
+    {31, "tdx_pw_mce"}, {32, "srso"}, {33, "div0"}, {34, "rfds"}, {35, "bhi"}, {36, "ibpb_no_ret"},
+    {37, "spectre_v2_user"}, {38, "old_microcode"}, {39, "its"}, {40, "its_native_only"},
+    {41, "tsa"}, {42, "vmscape"},
+};
+/* The words get_cpu_cap copies from cpuid: word, leaf, subleaf and
+   register (0 EAX, 1 EBX, 2 ECX, 3 EDX). */
+static const struct {
+    int word;
+    unsigned leaf, subleaf;
+    int reg;
+} ci_words[] = {
+    {0, 1, 0, 3},           {4, 1, 0, 2},           {14, 6, 0, 0},          {9, 7, 0, 1},
+    {16, 7, 0, 2},          {18, 7, 0, 3},          {12, 7, 1, 0},          {10, 0xd, 1, 0},
+    {6, 0x80000001, 0, 2},  {1, 0x80000001, 0, 3},  {13, 0x80000008, 0, 1}, {15, 0x8000000a, 0, 3},
+    {19, 0x8000001f, 0, 0}, {20, 0x80000021, 0, 0},
+};
+/* Flags of those words that Linux sets without cpuid on some CPUs: pge,
+   pae, sse, 3dnowprefetch, fsrs, arat, and vnmi, which init_vmx_capabilities
+   sets from an Intel CPU's VMX capabilities. */
+static const short ci_linux_sets[] = {13, 6, 25, 6 * 32 + 8, 12 * 32 + 11, 14 * 32 + 2, 15 * 32 + 25};
+
+static int ci_lookup(const struct ci_name *table, size_t n, const char *name, size_t len) {
+    for (size_t i = 0; i < n; i++)
+        if (strlen(table[i].name) == len && !memcmp(table[i].name, name, len)) return table[i].bit;
+    return -1;
+}
+
+static void ci_cpuid(unsigned leaf, unsigned subleaf, unsigned r[4]) {
+    __cpuid_count(leaf, subleaf, r[0], r[1], r[2], r[3]);
+}
+
+/* Whether the names after "name\t\t:" are each " name", in increasing bit
+   order where they are known; with show, each flag's bit is set in shown. */
+static int ci_names(const char *list, const struct ci_name *table, size_t n, unsigned *shown) {
+    int last = -1, ordered = 1;
+    while (*list == ' ') {
+        const char *name = list + 1;
+        size_t len = strcspn(name, " ");
+        if (!len) return 0;
+        int bit = ci_lookup(table, n, name, len);
+        if (bit >= 0) {
+            ordered &= bit > last;
+            last = bit;
+            if (shown) shown[bit / 32] |= 1u << (bit % 32);
+        }
+        list = name + len;
+    }
+    return ordered && !*list;
+}
+
+/* The CPU that runs the reader now, and the initial APIC ID cpuid gives on it. */
+static unsigned ci_initial_apicid(int cpu) {
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(cpu, &one);
+    if (sched_setaffinity(0, sizeof one, &one)) return ~0u;
+    unsigned r[4];
+    ci_cpuid(1, 0, r);
+    return r[1] >> 24;
+}
+
+static const char *const ci_fields[] = {
+    "processor\t: ",   "vendor_id\t: ",     "cpu family\t: ",   "model\t\t: ",    "model name\t: ",
+    "stepping\t: ",    "microcode\t: ",     "cpu MHz\t\t: ",    "cache size\t: ", "physical id\t: ",
+    "siblings\t: ",    "core id\t\t: ",     "cpu cores\t: ",    "apicid\t\t: ",   "initial apicid\t: ",
+    "fpu\t\t: ",       "fpu_exception\t: ", "cpuid level\t: ",  "wp\t\t: ",       "flags\t\t:",
+    "vmx flags\t:",    "bugs\t\t:",         "bogomips\t: ",     "TLB size\t: ",   "clflush size\t: ",
+    "cache_alignment\t: ", "address sizes\t: ", "power management:",
+};
+/* microcode, cpu MHz, cache size, vmx flags and TLB size are there only on
+   some CPUs. */
+static int ci_optional(int field) {
+    return field == 6 || field == 7 || field == 8 || field == 20 || field == 23;
+}
+#define CI_FIELDS (int)(sizeof ci_fields / sizeof *ci_fields)
+
+static int proc_cpuinfo_case(void) {
+    size_t size = 0, cap = 1 << 16;
+    char *text = malloc(cap);
+    int fd = open("/proc/cpuinfo", O_RDONLY);
+    if (fd < 0 || !text) {
+        printf("cpuinfo open=%d\n", fd < 0 ? -errno : 0);
+        return 0;
+    }
+    for (;;) {
+        if (cap - size < 4097) text = realloc(text, cap *= 2);
+        ssize_t n = read(fd, text + size, 4096);
+        if (n <= 0) break;
+        size += (size_t)n;
+    }
+    struct stat st;
+    fstat(fd, &st);
+    close(fd);
+    text[size] = 0;
+    printf("cpuinfo mode=%o size=%lld ends-with-blank-line=%d\n", st.st_mode, (long long)st.st_size,
+           size >= 2 && !strcmp(text + size - 2, "\n\n"));
+
+    unsigned r[4], level, signature, misc, extended;
+    ci_cpuid(0, 0, r);
+    level = r[0];
+    char vendor[13];
+    memcpy(vendor, &r[1], 4);
+    memcpy(vendor + 4, &r[3], 4);
+    memcpy(vendor + 8, &r[2], 4);
+    vendor[12] = 0;
+    ci_cpuid(1, 0, r);
+    signature = r[0];
+    misc = r[1];
+    unsigned family = signature >> 8 & 0xf, model = signature >> 4 & 0xf, stepping = signature & 0xf;
+    if (family == 0xf) family += signature >> 20 & 0xff;
+    if (family >= 6) model += (signature >> 16 & 0xf) << 4;
+    ci_cpuid(0x80000000, 0, r);
+    extended = (r[0] & 0xffff0000) == 0x80000000 ? r[0] : 0;
+    unsigned words[22] = {0};
+    for (size_t i = 0; i < sizeof ci_words / sizeof *ci_words; i++) {
+        unsigned leaf = ci_words[i].leaf;
+        int present = leaf >= 0x80000000 ? leaf <= extended : leaf <= level;
+        if (present && leaf == 7 && ci_words[i].subleaf == 1) {
+            ci_cpuid(7, 0, r);
+            present = r[0] >= 1;
+        }
+        if (present) {
+            ci_cpuid(leaf, ci_words[i].subleaf, r);
+            words[ci_words[i].word] = r[ci_words[i].reg];
+        }
+    }
+    unsigned clflush = 64, physical = 36, virtual = 48;
+    if (extended >= 0x80000008) {
+        ci_cpuid(0x80000008, 0, r);
+        physical = r[0] & 0xff;
+        virtual = r[0] >> 8 & 0xff;
+        clflush = words[0] & 1u << 19 ? (misc >> 8 & 0xff) * 8 : 0;
+        if (!clflush) clflush = 32;
+    }
+
+    cpu_set_t all;
+    sched_getaffinity(0, sizeof all, &all);
+    int cpus = CPU_COUNT(&all), records = 0, fields = 1, identity = 1, fixed = 1, flags_ok = 1;
+    int bugs_ok = 1, sizes = 1, bogomips = 1, apicids_differ = 1, cores = 1, first_cpu = -1, last_cpu = -1;
+    unsigned first_initial = 0, last_initial = 0, siblings = 0, packages = 0, shown[22] = {0};
+    long package_ids[1024], apicids[1024];
+    char extra[512] = "", missing[512] = "";
+    for (char *record = text; *record; records++) {
+        char *end = strstr(record, "\n\n");
+        if (!end) {
+            fields = 0;
+            break;
+        }
+        *end = 0;
+        int at = -1, seen[CI_FIELDS] = {0};
+        long physical_id = -1, apicid = -1, processor = -1, initial = -1;
+        for (char *line = record; line;) {
+            char *next = strchr(line, '\n');
+            if (next) *next++ = 0;
+            int field = -1;
+            for (int f = at + 1; f < CI_FIELDS && field < 0; f++)
+                if (!strncmp(line, ci_fields[f], strlen(ci_fields[f]))) field = f;
+            if (field < 0) {
+                fields = 0;
+                break;
+            }
+            at = field;
+            seen[field] = 1;
+            const char *value = line + strlen(ci_fields[field]);
+            switch (field) {
+            case 0: processor = atol(value); break;
+            case 1: identity &= !strcmp(value, vendor); break;
+            case 2: identity &= strtoul(value, NULL, 10) == family; break;
+            case 3: identity &= strtoul(value, NULL, 10) == model; break;
+            case 5: identity &= strtoul(value, NULL, 10) == stepping; break;
+            case 9: physical_id = atol(value); break;
+            case 10: siblings = (unsigned)atol(value); break;
+            case 12: cores &= (unsigned)atol(value) >= 1 && (unsigned)atol(value) <= siblings; break;
+            case 13: apicid = atol(value); break;
+            case 14: initial = atol(value); break;
+            case 15: case 16: case 18: fixed &= !strcmp(value, "yes"); break;
+            case 17: identity &= strtoul(value, NULL, 10) == level; break;
+            case 19:
+                memset(shown, 0, sizeof shown);
+                flags_ok &= ci_names(value, ci_flags, sizeof ci_flags / sizeof *ci_flags, shown);
+                break;
+            case 21: bugs_ok &= ci_names(value, ci_bugs, sizeof ci_bugs / sizeof *ci_bugs, NULL); break;
+            case 22: {
+                unsigned whole, hundredths;
+                char tail;
+                bogomips &= sscanf(value, "%u.%2u%c", &whole, &hundredths, &tail) == 2 &&
+                            strlen(strchr(value, '.')) == 3;
+                break;
+            }
+            case 24: sizes &= strtoul(value, NULL, 10) == clflush; break;
+            case 25: sizes &= strtoul(value, NULL, 10) == clflush; break;
+            case 26: {
+                unsigned p, v;
+                sizes &= sscanf(value, "%u bits physical, %u bits virtual", &p, &v) == 2 && p == physical &&
+                         v == virtual;
+                break;
+            }
+            case 27: fields &= !*value && !next; break;
+            }
+            line = next;
+        }
+        for (int f = 0; f < CI_FIELDS; f++) fields &= seen[f] || ci_optional(f);
+        fields &= processor == records;
+        if (records < 1024) {
+            for (int i = 0; i < records; i++) apicids_differ &= apicids[i] != apicid;
+            apicids[records] = apicid;
+            int known = 0;
+            for (unsigned i = 0; i < packages; i++) known |= package_ids[i] == physical_id;
+            if (!known && packages < 1024) package_ids[packages++] = physical_id;
+        }
+        if (first_cpu < 0) {
+            first_cpu = (int)processor;
+            first_initial = (unsigned)initial;
+        }
+        last_cpu = (int)processor;
+        last_initial = (unsigned)initial;
+        record = end + 2;
+    }
+    /* The flags of the last record against cpuid, with the names of those
+       that do not agree. */
+    for (size_t i = 0; i < sizeof ci_flags / sizeof *ci_flags; i++) {
+        int bit = ci_flags[i].bit, word = bit / 32, direct = 0, linux_sets = 0;
+        for (size_t w = 0; w < sizeof ci_words / sizeof *ci_words; w++) direct |= ci_words[w].word == word;
+        for (size_t s = 0; s < sizeof ci_linux_sets / sizeof *ci_linux_sets; s++)
+            linux_sets |= ci_linux_sets[s] == bit;
+        int in_cpuid = words[word] >> (bit % 32) & 1, is_shown = shown[word] >> (bit % 32) & 1;
+        if (direct && is_shown && !in_cpuid && !linux_sets && strlen(extra) < 400)
+            strcat(strcat(extra, " "), ci_flags[i].name);
+        if ((word == 0 || word == 1) && in_cpuid && !is_shown && strlen(missing) < 400)
+            strcat(strcat(missing, " "), ci_flags[i].name);
+    }
+    printf("cpuinfo records=cpus:%d fields-in-order=%d identity=cpuid:%d yes-fields=%d\n", records == cpus,
+           fields, identity, fixed);
+    printf("cpuinfo flags-in-order=%d bugs-in-order=%d bogomips-format=%d sizes=cpuid:%d\n", flags_ok, bugs_ok,
+           bogomips, sizes);
+    printf("cpuinfo apicids-differ=%d packages-times-siblings=records:%d cores-within-siblings=%d\n",
+           apicids_differ, packages * siblings == (unsigned)records, cores);
+    printf("cpuinfo initial-apicid=cpuid:%d,%d\n", ci_initial_apicid(first_cpu) == first_initial,
+           ci_initial_apicid(last_cpu) == last_initial);
+    printf("cpuinfo shown-not-in-cpuid=[%s] in-cpuid-not-shown=[%s]\n", extra, missing);
+    sched_setaffinity(0, sizeof all, &all);
+    free(text);
     return 0;
 }
 
@@ -25823,9 +26663,10 @@ static int kernel_info_worker(void) {
     /* sysfs(option, arg1, arg2) */
     long count = pn(syscall(139, 3L, 0L, 0L));
     printf("sysfs-count-positive=%d\n", count > 0);
-    const char *names[] = {"tmpfs", "proc", "sockfs", "pipefs", "devpts", "ext4", "mqueue"};
+    const char *names[] = {"tmpfs",  "proc",   "sockfs", "pipefs",
+                           "hugetlbfs", "devpts", "ext4",   "mqueue"};
     long last = -1;
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 8; i++) {
         long index = pn(syscall(139, 1L, names[i], 0L));
         char name[64] = "";
         long got = index >= 0 ? pn(syscall(139, 2L, index, name)) : index;
@@ -42579,6 +43420,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "anon-thp-placement")) return anon_thp_placement_case();
     if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "mmap-low")) return mmap_low_case();
+    if (!strcmp(mode, "mmap-hugetlb")) return mmap_hugetlb_case();
     if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
@@ -42606,6 +43448,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
+    if (!strcmp(mode, "proc-cpuinfo")) return proc_cpuinfo_case();
+    if (!strcmp(mode, "status-memory")) return status_memory_case();
     if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "thread-own-counters")) return thread_own_counters_case();
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();
@@ -42660,6 +43504,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-net")) return io_uring_net_case();
     if (!strcmp(mode, "io-uring-timeout")) return io_uring_timeout_case();
     if (!strcmp(mode, "io-uring-poll-add")) return io_uring_poll_add_case();
+    if (!strcmp(mode, "io-uring-fs")) return io_uring_fs_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

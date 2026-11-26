@@ -513,7 +513,8 @@ pub(crate) fn samples_faults(
     cpu: u32,
 ) -> bool {
     let wants = |event: &Event| {
-        event.counter == Counter::Faults
+        // A major fault is of the kernel's accesses alone.
+        matches!(event.counter, Counter::Faults(kind) if kind != crate::FaultKind::Major)
             && event.attr.sampling()
             && !event.attr.flag(bit::EXCLUDE_USER)
             && (event.cpu < 0 || u32::try_from(event.cpu) == Ok(cpu))
@@ -548,7 +549,8 @@ struct Seen {
     /// The occurrences in its own code and in the kernel, and its time.
     new: [u64; 2],
     ran: u64,
-    /// The thread's faults in its own code and in the kernel, wherever.
+    /// What the thread's counts are for its counter, in its own code and in
+    /// the kernel, wherever.
     counted: (u64, u64),
 }
 
@@ -585,10 +587,7 @@ impl Event {
                 counts.1.saturating_sub(was.0.1),
             ],
             ran: ran.saturating_sub(was.1),
-            counted: (
-                usage.faults.load(Ordering::SeqCst),
-                usage.kernel_faults.load(Ordering::SeqCst),
-            ),
+            counted: self.of_all_counts(usage.counts()),
         }
     }
     /// A sampling event of a CPU is enabled: what the threads did there
@@ -799,7 +798,10 @@ impl Event {
             out.extend(fires.into_iter().map(|fire| (fire, !kernel, At::default())));
             return;
         }
-        let addresses = usage.fault_addresses(kernel, counted, n);
+        let Counter::Faults(kind) = self.counter else {
+            return;
+        };
+        let addresses = usage.fault_addresses(kernel, kind, counted, n);
         for overflow in overflows {
             let runs = if overflow.each { overflow.n } else { 1 };
             for i in 0..runs {
@@ -812,7 +814,7 @@ impl Event {
     }
     /// Whether its samples or its SIGTRAP show the addresses of faults.
     pub(super) fn shows_address(&self) -> bool {
-        self.counter == Counter::Faults
+        matches!(self.counter, Counter::Faults(_))
             && (self.attr.sample_type & (ADDR | DATA_PAGE_SIZE) != 0
                 || self.attr.flag(bit::SIGTRAP))
     }
@@ -1367,7 +1369,7 @@ mod tests {
 
     #[test]
     fn a_limit_stops_the_occurrences_at_the_overflow_that_uses_it_up() {
-        let mut sampler = Sampler::of_period(3, Counter::Faults);
+        let mut sampler = Sampler::of_period(3, Counter::Faults(crate::FaultKind::All));
         let (mut limit, mut out) = (2, Vec::new());
         assert_eq!(
             sampler.occurrences(10, false, false, &mut limit, &mut out),
@@ -1382,7 +1384,7 @@ mod tests {
         };
         assert_eq!(out, [at(2), at(5)]);
         // Each occurrence one of a period of 1.
-        let mut sampler = Sampler::of_period(1, Counter::Faults);
+        let mut sampler = Sampler::of_period(1, Counter::Faults(crate::FaultKind::All));
         let (mut limit, mut out) = (4, Vec::new());
         assert_eq!(
             sampler.occurrences(3, false, false, &mut limit, &mut out),
@@ -1413,7 +1415,7 @@ mod tests {
 
     #[test]
     fn a_period_overflows_at_its_last_occurrence() {
-        let mut sampler = Sampler::of_period(3, Counter::Faults);
+        let mut sampler = Sampler::of_period(3, Counter::Faults(crate::FaultKind::All));
         let mut out = Vec::new();
         runs(&mut sampler, 2, false, &mut out);
         assert!(out.is_empty());
@@ -1426,7 +1428,7 @@ mod tests {
 
     #[test]
     fn the_period_field_makes_each_occurrence_a_sample() {
-        let mut sampler = Sampler::of_period(1000, Counter::Faults);
+        let mut sampler = Sampler::of_period(1000, Counter::Faults(crate::FaultKind::All));
         let mut out = Vec::new();
         runs(&mut sampler, 3, true, &mut out);
         assert_eq!(out, [(1, 3)]);
@@ -1434,8 +1436,8 @@ mod tests {
 
     #[test]
     fn a_new_period_overflows_at_the_next_occurrence() {
-        let mut sampler = Sampler::of_period(4, Counter::Faults);
-        sampler.set_period(4, Counter::Faults, true);
+        let mut sampler = Sampler::of_period(4, Counter::Faults(crate::FaultKind::All));
+        sampler.set_period(4, Counter::Faults(crate::FaultKind::All), true);
         let mut out = Vec::new();
         runs(&mut sampler, 1, false, &mut out);
         assert_eq!(out, [(4, 1)]);
@@ -1544,7 +1546,7 @@ mod tests {
     fn the_frequency_pulls_the_period_an_eighth_of_the_way() {
         let mut sampler = Sampler {
             frequency: 100,
-            ..Sampler::of_period(1, Counter::Faults)
+            ..Sampler::of_period(1, Counter::Faults(crate::FaultKind::All))
         };
         // 1000 a second at 100 a second wants a period of 10: 1 and
         // (9 + 7) / 8.

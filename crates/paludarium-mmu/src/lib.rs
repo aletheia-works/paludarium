@@ -372,18 +372,21 @@ pub mod faults {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Where a guest thread's faults count: those of its own code
-    /// (`user`), of the kernel's accesses for it (`kernel`), and those
-    /// through `get_user_pages` (`forced`), which are no `perf` event.
+    /// Where a guest thread's faults count: the minor ones of its own code
+    /// (`user`) and of the kernel's accesses for it (`kernel`), those
+    /// through `get_user_pages` (`forced`), which are no `perf` event, and
+    /// the major ones (`major`): a kernel access's fault that a
+    /// `userfaultfd` had it try again.
     pub trait Sink: Send + Sync {
         fn user(&self) -> &AtomicU64;
         fn kernel(&self) -> &AtomicU64;
         fn forced(&self) -> &AtomicU64;
+        fn major(&self) -> &AtomicU64;
         /// A fault that made its count `nth`, of the kernel's accesses or
-        /// the thread's own code's, `at`, which is told where
-        /// [`trace_addresses`] asked for it.
-        fn fault(&self, kernel: bool, nth: u64, at: At) {
-            let _ = (kernel, nth, at);
+        /// the thread's own code's, a `major` one or not, `at`, which is
+        /// told where [`trace_addresses`] asked for it.
+        fn fault(&self, kernel: bool, major: bool, nth: u64, at: At) {
+            let _ = (kernel, major, nth, at);
         }
     }
 
@@ -412,6 +415,7 @@ pub mod faults {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
         static NOTED: Cell<bool> = const { Cell::new(false) };
+        static RETRIED: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
     }
 
@@ -431,13 +435,14 @@ pub mod faults {
     /// What a kernel access to user memory that faults may do before it
     /// fails: for a copy (`gup` false), what an instruction's fault may, as
     /// Linux's `do_user_addr_fault` serves the kernel's faults so, which is
-    /// to grow a mapping that grows down or to wait for a `userfaultfd` to
-    /// fill the page; for one through `get_user_pages`, only the wait, as
-    /// `gup_vma_lookup` expands no stack. `space` is the one it accesses,
-    /// which is not the thread's own for `process_vm_readv`'s. It is asked
-    /// with no lock of the space held, and says whether the access may be
-    /// tried again.
+    /// to grow a mapping that grows down ([`Self::grow`], asked first) or to
+    /// wait for a `userfaultfd` to fill the page; for one through
+    /// `get_user_pages`, only the wait, as `gup_vma_lookup` expands no
+    /// stack. `space` is the one it accesses, which is not the thread's own
+    /// for `process_vm_readv`'s. It is asked with no lock of the space held.
     pub trait Resolver: Send + Sync {
+        /// Waits for a `userfaultfd` to serve the fault, and says whether
+        /// the access may be tried again (`VM_FAULT_RETRY`).
         fn resolve(&self, space: &super::MemoryView, addr: u64, write: bool, gup: bool) -> bool;
         /// Grows the mapping of `space` above `addr` down to it, as Linux's
         /// `expand_stack` does for the calling thread; whether it did.
@@ -499,16 +504,65 @@ pub mod faults {
     /// says; an instruction's access, one through `get_user_pages` that may
     /// not drop the lock ([`through_gup_locked`]) and a bus error are not
     /// resolved here.
-    pub(crate) fn resolve(space: impl FnOnce() -> super::MemoryView, fault: &super::Fault) -> bool {
+    /// `scope` is the access's, which keeps the record of its retries
+    /// ([`retry_scope`]) from the first fault it resolves.
+    pub(crate) fn resolve(
+        space: impl FnOnce() -> super::MemoryView,
+        fault: &super::Fault,
+        scope: &mut Option<RetryScope>,
+    ) -> bool {
         let gup = GUP.with(Cell::get);
         if !KERNEL.with(Cell::get) || gup == Gup::Locked || fault.bus || fault.fetch {
             return false;
         }
+        scope.get_or_insert_with(retry_scope);
         // Taken out first, so that what it does may itself access memory.
         let Some(resolver) = RESOLVER.with(|r| r.borrow().clone()) else {
             return false;
         };
-        resolver.resolve(&space(), fault.addr.0, fault.write, gup != Gup::No)
+        let space = space();
+        // The stack grows within the fault (`lock_mm_and_find_vma`), which
+        // is then minor.
+        if gup == Gup::No && resolver.grow(&space, fault.addr.0) {
+            return true;
+        }
+        let retried = resolver.resolve(&space, fault.addr.0, fault.write, gup != Gup::No);
+        if retried && gup == Gup::No {
+            retry_major(fault);
+        }
+        retried
+    }
+
+    /// A kernel access's fault is tried again, as a `userfaultfd` lets it:
+    /// a kernel-mode fault does not run under the VMA's lock first, so
+    /// Linux's `do_user_addr_fault` retries it with `FAULT_FLAG_TRIED`, and
+    /// `mm_account_fault` counts it once, as a major one, whether the retry
+    /// brings the page in or finds it there. It is counted here, and the
+    /// retry's own fault of the page, if it takes one, is not counted again
+    /// ([`count`]); nor is a second wait of the same fault.
+    fn retry_major(fault: &super::Fault) {
+        let retried = (fault.addr.0 & !(super::PAGE_SIZE - 1), fault.write);
+        if RETRIED.with(|r| r.replace(Some(retried))) == Some(retried) {
+            return;
+        }
+        NOTED.with(|noted| noted.set(true));
+        SINK.with(|sink| {
+            // A kernel access is made for a bound thread
+            // (`KernelFaults::enter`).
+            if let Some(counts) = sink.borrow().as_ref() {
+                let nth = counts
+                    .major()
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                if ADDRESSES.load(Ordering::Relaxed) {
+                    let at = At {
+                        addr: fault.addr.0,
+                        present: fault.present,
+                    };
+                    counts.fault(true, true, nth, at);
+                }
+            }
+        });
     }
 
     /// Grows a mapping of the space `space` views down to `addr`, as the
@@ -536,14 +590,38 @@ pub mod faults {
             };
             let nth = field.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
             if !forced && ADDRESSES.load(Ordering::Relaxed) {
-                counts.fault(kernel, nth, at);
+                counts.fault(kernel, false, nth, at);
             }
             true
         })
     }
 
-    pub(crate) fn count(at: At) {
+    /// Hides the record of a retried fault ([`retry_major`]) that an
+    /// access outside this one left, and puts it back when this one, which
+    /// holds what this returns, ends: so the record is only of the retries
+    /// of one access, and a later access that faults on the page again
+    /// counts its own fault.
+    fn retry_scope() -> RetryScope {
+        RetryScope(RETRIED.with(Cell::take))
+    }
+    pub(crate) struct RetryScope(Option<(u64, bool)>);
+    impl Drop for RetryScope {
+        fn drop(&mut self) {
+            RETRIED.with(|r| r.set(self.0.take()));
+        }
+    }
+
+    /// Counts a fault of a `write` or a read `at`, unless it is the retry
+    /// of a kernel access's fault already counted as a major one
+    /// ([`retry_major`]).
+    pub(crate) fn count(at: At, write: bool) {
         NOTED.with(|noted| noted.set(true));
+        if let Some(retried) = RETRIED.with(Cell::take)
+            && retried == (at.addr & !(super::PAGE_SIZE - 1), write)
+            && KERNEL.with(Cell::get)
+        {
+            return;
+        }
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
         } else if !add(false, at) {
@@ -628,6 +706,9 @@ pub mod faults {
     /// on (a system call's, a signal frame's), or its guest code's; returns
     /// what it was.
     pub fn set_kernel(kernel: bool) -> bool {
+        // What a retried fault left ([`retry_major`]) ends with the work it
+        // was of.
+        RETRIED.with(|r| r.set(None));
         KERNEL.with(|was| was.replace(kernel))
     }
 
@@ -703,6 +784,7 @@ pub mod vm {
     pub const LOCKONFAULT: u64 = 1 << 19;
     pub const ACCOUNT: u64 = 1 << 20;
     pub const NORESERVE: u64 = 1 << 21;
+    pub const HUGETLB: u64 = 1 << 22;
     pub const WIPEONFORK: u64 = 1 << 25;
     pub const DONTDUMP: u64 = 1 << 26;
     pub const UFFD_MISSING: u64 = 1 << 9;
@@ -1058,6 +1140,10 @@ pub struct Usage {
     pub private_dirty: u64,
     /// The pages of private memory, not a file's (`Anonymous`).
     pub anonymous: u64,
+    /// Those of the rest that shmem holds, of shared memory of no file, a
+    /// shmem file or System V shared memory (Linux's `PageSwapBacked`), as
+    /// `mm_counter` counts them in `MM_SHMEMPAGES`.
+    pub shmem: u64,
     /// Each page's size divided by how many entries map it, in bytes
     /// shifted left by [`Usage::PSS_SHIFT`], as Linux's `mss->pss` sums it
     /// (`Pss`), and that of the dirty pages (`Pss_Dirty`).
@@ -2417,6 +2503,12 @@ pub trait PageSource: Send + Sync {
     fn splits(&self) -> bool {
         true
     }
+    /// The size of the pages a VMA of this memory maps (Linux's
+    /// `vma_kernel_pagesize`): more than 4 KiB for hugetlbfs's, whose VMAs
+    /// are split, remapped and dropped only on their boundaries.
+    fn page_size(&self) -> u64 {
+        PAGE_SIZE
+    }
     /// Whether a write to the page at `offset` makes it writable (the
     /// VMA's `vm_ops->pfn_mkwrite`): `false` makes the write a bus error
     /// (`SIGBUS`), as of a perf event's ring buffer's data pages.
@@ -3153,6 +3245,12 @@ struct AddressSpaceData {
     /// `update_hiwater_rss` is before a zap, so that with the pages held
     /// now it is the peak.
     peak_resident: u64,
+    /// The most pages its mappings were found to take, Linux's
+    /// `hiwater_vm`: noted before an unmap takes some away
+    /// ([`Self::note_peak_size`]), as `vms_complete_munmap_vmas` calls
+    /// `update_hiwater_vm`, so that with the pages mapped now it is the
+    /// peak.
+    peak_size: u64,
 }
 
 impl Drop for AddressSpaceData {
@@ -3257,6 +3355,7 @@ impl AddressSpaceData {
             out_of_memory: Arc::default(),
             resident: AtomicU64::new(0),
             peak_resident: 0,
+            peak_size: 0,
         }
     }
 
@@ -3837,6 +3936,7 @@ impl AddressSpaceData {
                 if anonymous {
                     usage.pss_anon += pss;
                 } else if swap_backed {
+                    usage.shmem += 1;
                     usage.pss_shmem += pss;
                 } else {
                     usage.pss_file += pss;
@@ -4396,8 +4496,9 @@ impl AddressSpaceData {
         for shared in copy.shared.values() {
             tell(shared, true);
         }
-        // The child's peak is what it holds (`dup_mm`).
+        // The child's peaks are what it holds and maps (`dup_mm`).
         copy.peak_resident = copy.resident_pages();
+        copy.peak_size = copy.size_pages();
         Ok(copy)
     }
 
@@ -4839,7 +4940,7 @@ impl AddressSpaceData {
                         if let Some(fault) = faults::refused(at, false, access == Access::Fetch) {
                             return Err(fault);
                         }
-                        faults::count(at);
+                        faults::count(at, false);
                     } else if missing && access == Access::Dump {
                         faults::count_forced();
                     }
@@ -5030,7 +5131,7 @@ impl AddressSpaceData {
                     if let Some(fault) = faults::refused(at, true, false) {
                         return Err(fault);
                     }
-                    faults::count(at);
+                    faults::count(at, true);
                 } else {
                     faults::count_forced();
                 }
@@ -5862,15 +5963,27 @@ impl AddressSpaceData {
             .range(..at)
             .next_back()
             .is_some_and(|(_, shared)| {
-                at < shared.end && shared.pages.source().is_some_and(|source| !source.splits())
+                at < shared.end
+                    && shared.pages.source().is_some_and(|source| {
+                        !source.splits() || !at.is_multiple_of(source.page_size())
+                    })
             })
             || self
                 .backing
                 .range(..at)
                 .next_back()
                 .is_some_and(|(_, backing)| {
-                    at < backing.end && backing.cache.is_none() && !backing.source.splits()
+                    at < backing.end
+                        && (backing.cache.is_none() && !backing.source.splits()
+                            || !at.is_multiple_of(backing.source.page_size()))
                 })
+    }
+    /// The size of the pages the VMA at `addr` maps ([`PageSource::page_size`]).
+    fn page_size_at(&self, addr: u64) -> u64 {
+        self.shared_at(addr)
+            .and_then(|shared| shared.pages.source())
+            .or_else(|| self.backing_at(addr).map(|backing| &backing.source))
+            .map_or(PAGE_SIZE, |source| source.page_size())
     }
     /// Whether the VMA at `addr` is one of Linux's `VM_SPECIAL`, memory core
     /// mm does not back: a fixed mapping ([`PageSource::fixed`]) or one of
@@ -5889,7 +6002,7 @@ impl AddressSpaceData {
     /// of no pages of its own ([`Self::special_backing`]).
     fn private_special(&self, addr: u64) -> Option<&Arc<dyn PageSource>> {
         let backing = self.backing_at(addr)?;
-        (backing.cache.is_none()
+        ((backing.cache.is_none() || backing.source.page_size() != PAGE_SIZE)
             && (backing.source.fixed() || backing.source.vma_flags(0) & (vm::IO | vm::PFNMAP) != 0))
             .then_some(&backing.source)
     }
@@ -5905,7 +6018,12 @@ impl AddressSpaceData {
     /// not drop: a `VM_PFNMAP` one, or with `locked` a locked one too.
     pub fn first_undiscardable(&self, addr: u64, end: u64, locked: bool) -> Option<Mapping> {
         self.mappings.range(..end).map(|(_, m)| *m).find(|m| {
-            m.end() > addr && ((locked && m.locked.is_some()) || self.pfn_mapped(m.start.0))
+            m.end() > addr
+                && ((locked && m.locked.is_some())
+                    || self.pfn_mapped(m.start.0)
+                    || !addr
+                        .max(m.start.0)
+                        .is_multiple_of(self.page_size_at(m.start.0)))
         })
     }
 
@@ -5924,8 +6042,35 @@ impl AddressSpaceData {
                 return Err(Errno::EINVAL);
             }
         }
+        self.note_peak_size(addr.0, end);
         self.remove(addr.0, end);
         Ok(())
+    }
+
+    /// How many pages its mappings take (Linux's `total_vm`).
+    fn size_pages(&self) -> u64 {
+        self.mappings.values().map(|m| m.length / PAGE_SIZE).sum()
+    }
+
+    /// Before an unmap of `[start, end)`: notes the pages mapped as the
+    /// peak if they are more, when the range has any mapped, as
+    /// `vms_complete_munmap_vmas` calls `update_hiwater_vm` before the
+    /// pages it unmaps are taken away. A fixed mapping counts its own pages
+    /// only after that (`__mmap_complete`), so it notes the peak as an
+    /// unmap does.
+    fn note_peak_size(&mut self, start: u64, end: u64) {
+        if self.mappings_in(start, end).is_empty() {
+            return;
+        }
+        self.peak_size = self.peak_size.max(self.size_pages());
+    }
+
+    /// The peak of the pages its mappings took and the pages they take
+    /// now, as `/proc/<pid>/status`'s `VmPeak` and `VmSize` show them:
+    /// Linux's `get_mm_hiwater_vm` and `total_vm`.
+    fn peak_size(&self) -> (u64, u64) {
+        let now = self.size_pages();
+        (self.peak_size.max(now), now)
     }
 
     /// Whether `[start, end)` ends in `m` where its memory may not be split
@@ -6238,8 +6383,12 @@ impl AddressSpaceData {
             // the move with `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and the move
             // without either only grows, which such memory, a fixed mapping,
             // does not (`EFAULT`). So the unmap cannot fail.
+            // `move_vma` keeps the peak it had before: the moved pages
+            // counted twice for a moment are not a peak.
+            let peak = self.peak_size;
             let unmapped = self.unmap(GuestAddr(old), old_len);
             debug_assert!(unmapped.is_ok(), "{unmapped:?}");
+            self.peak_size = peak;
         }
         if let Some(backing) = backing {
             self.backing.insert(
@@ -6339,6 +6488,21 @@ impl AddressSpaceData {
         if self.mapping_at(addr.0).ok_or(Errno::EFAULT)?.sealed {
             return Err(Errno::EPERM);
         }
+        // Whole huge pages, which are not grown (`align_hugetlb`).
+        let page_size = self.page_size_at(addr.0);
+        let (old_len, new_len) = if page_size == PAGE_SIZE {
+            (old_len, new_len)
+        } else {
+            let align = |len: u64| len.checked_next_multiple_of(page_size);
+            match (align(old_len), align(new_len)) {
+                (Some(old), Some(new))
+                    if new <= old && (addr.0 | how.new_addr.0).is_multiple_of(page_size) =>
+                {
+                    (old, new)
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        };
         if new_addr.is_none() && new_len <= old_len {
             if new_len < old_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
@@ -6573,8 +6737,12 @@ impl AddressSpaceData {
             }
             // Memory core mm does not back is neither copied into a child
             // nor dumped again (`VM_SPECIAL` in Linux 7.0, not
-            // `vma_is_mm_backed` in master: the same for every memory here).
-            if matches!(advice, FlagAdvice::DoFork | FlagAdvice::DoDump) && self.special(start) {
+            // `vma_is_mm_backed` in master: the same for every memory here),
+            // but for hugetlbfs's, which may be dumped.
+            let huge = self.page_size_at(start) != PAGE_SIZE;
+            if (advice == FlagAdvice::DoFork || advice == FlagAdvice::DoDump && !huge)
+                && self.special(start)
+            {
                 return Err(Errno::EINVAL);
             }
             // Droppable memory is wiped in a child and never dumped, for
@@ -7704,6 +7872,18 @@ impl AddressSpaceData {
             .find(|m| m.end() > addr && m.locked.is_some())
     }
 
+    /// The first mapping of `[addr, end)` whose pages `MADV_COLD` and
+    /// `MADV_PAGEOUT` do not take: a locked, `VM_PFNMAP` or hugetlbfs one
+    /// (`can_madv_lru_vma`).
+    pub fn first_off_lru(&self, addr: u64, end: u64) -> Option<Mapping> {
+        self.mappings.range(..end).map(|(_, m)| *m).find(|m| {
+            m.end() > addr
+                && (m.locked.is_some()
+                    || self.pfn_mapped(m.start.0)
+                    || self.page_size_at(m.start.0) != PAGE_SIZE)
+        })
+    }
+
     /// Whether the mapping at `addr` refuses to have its pages discarded
     /// ([`Self::refuses_discard`]).
     pub fn refuses_discard_at(&self, addr: u64) -> bool {
@@ -7739,9 +7919,9 @@ impl AddressSpaceData {
     /// `[addr, end)`, VMA by VMA as Linux's `madvise_walk_vmas`, up to the
     /// first that refuses: a sealed one whose pages may not be discarded
     /// installs none (`EPERM`, `can_madvise_modify`), and the rings of AIO
-    /// and `io_uring` take neither (`EINVAL`), as Linux's
-    /// `is_valid_guard_vma` refuses a VMA that is not `vma_is_mm_backed`
-    /// (`VM_DONTEXPAND`). An install drops the pages of the range, as
+    /// and `io_uring`, huge pages and the vDSO's data take neither
+    /// (`EINVAL`), as Linux's `is_valid_guard_vma` refuses a VMA that is not
+    /// `vma_is_mm_backed` (`VM_DONTEXPAND`) or is hugetlbfs's. An install drops the pages of the range, as
     /// Linux's `zap_vma_range` does, but keeps the guards already there,
     /// and gives private anonymous memory its `anon_vma`
     /// ([`Mapping::anon_vma`]). A hole gives `ENOMEM` once the rest is done.
@@ -7763,6 +7943,7 @@ impl AddressSpaceData {
             let fixed = self
                 .shared_at(m.start.0)
                 .and_then(|shared| shared.pages.source())
+                .or_else(|| self.private_special(m.start.0))
                 .is_some_and(|source| source.fixed());
             if fixed {
                 return Err(Errno::EINVAL);
@@ -8719,10 +8900,11 @@ impl MemoryView {
         &self,
         mut f: impl FnMut(&mut AddressSpaceGuard<'_>) -> Option<Result<(), Fault>>,
     ) -> Option<bool> {
+        let mut retry = None;
         loop {
             match self.with_guard(&mut f)? {
                 Some(Ok(())) => return Some(true),
-                Some(Err(fault)) if faults::resolve(|| self.clone(), &fault) => {}
+                Some(Err(fault)) if faults::resolve(|| self.clone(), &fault, &mut retry) => {}
                 _ => return Some(false),
             }
         }
@@ -8899,6 +9081,13 @@ impl MemoryView {
     #[must_use]
     pub fn resident_pages(&self) -> Option<(u64, u64)> {
         self.with_data(AddressSpaceData::peak_resident)
+    }
+    /// The peak of the pages the space's mappings took and the pages they
+    /// take now ([`AddressSpaceData::peak_size`]), or `None` once it is
+    /// gone.
+    #[must_use]
+    pub fn size_pages(&self) -> Option<(u64, u64)> {
+        self.with_data(AddressSpaceData::peak_size)
     }
     /// See [`AddressSpaceData::reset_peak_resident`]; `false` once the
     /// space is gone.
@@ -9557,6 +9746,7 @@ impl AddressSpace {
         self.locked().bottom_up()
     }
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             if self.read_unlocked(addr, buf, Access::Read) {
                 return Ok(());
@@ -9564,7 +9754,7 @@ impl AddressSpace {
             // The lock goes before the fault is resolved ([`faults::Resolver`]).
             let result = self.locked().read(addr, buf);
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9616,10 +9806,11 @@ impl AddressSpace {
     /// `get_user_pages` as [`faults::through_gup`] (or, for a call made in
     /// [`faults::through_gup_locked`], that).
     pub fn populate(&self, addr: GuestAddr) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             let result = self.locked().read_for_dump(addr, &mut [0]);
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9630,13 +9821,14 @@ impl AddressSpace {
         self.locked().read_for_core(addr, buf)
     }
     pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             if self.write_unlocked(addr, buf) {
                 return Ok(());
             }
             let result = Self::write_locked(self.locked(), addr, buf);
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9751,13 +9943,14 @@ impl AddressSpace {
         self.check_access(addr, len, Access::Write)
     }
     fn check_access(&self, addr: GuestAddr, len: usize, access: Access) -> Result<(), Fault> {
+        let mut retry = None;
         loop {
             let result = {
                 let data = self.locked();
                 data.check(&data.read_directory(), addr, len, access, false)
             };
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 result => return result,
             }
         }
@@ -9792,7 +9985,9 @@ impl AddressSpace {
     /// code whether it brought anything in or not. As the first try of a
     /// fault of user code runs under the VMA's lock, whose retry is not
     /// `FAULT_FLAG_TRIED`, it is a minor one. Nothing while the page still
-    /// waits; the instruction then faults again.
+    /// waits; the instruction then faults again. It is for a fault of the
+    /// guest's code alone: a kernel access's retry is a major fault, which
+    /// `faults::resolve` counts.
     pub fn retry_own_fault(&self, addr: GuestAddr, write: bool, fetch: bool) {
         if self.userfault_for(addr, write, fetch).is_some() {
             return;
@@ -9800,10 +9995,13 @@ impl AddressSpace {
         let (done, counted) = faults::noted(|| self.touch(addr, write, fetch));
         if done && !counted {
             faults::taken_as_own(|| {
-                faults::count(faults::At {
-                    addr: addr.0,
-                    present: true,
-                });
+                faults::count(
+                    faults::At {
+                        addr: addr.0,
+                        present: true,
+                    },
+                    write,
+                );
             });
         }
     }
@@ -9934,6 +10132,7 @@ impl AddressSpace {
         }
         let mut bytes = [0; WORD_BYTES];
         let buf = &mut bytes[..size.min(WORD_BYTES)];
+        let mut retry = None;
         loop {
             let result = {
                 let mut data = self.locked();
@@ -9945,7 +10144,7 @@ impl AddressSpace {
             };
             match result {
                 Ok(()) => return Ok(u64::from_le_bytes(bytes)),
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 Err(fault) => return Err(fault),
             }
         }
@@ -10116,6 +10315,10 @@ impl AddressSpace {
     pub fn first_locked(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
         self.locked().first_locked(addr.0, end)
     }
+    /// See [`AddressSpaceData::first_off_lru`].
+    pub fn first_off_lru(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
+        self.locked().first_off_lru(addr.0, end)
+    }
     /// See [`AddressSpaceData::first_undiscardable`].
     pub fn first_undiscardable(&self, addr: GuestAddr, end: u64, locked: bool) -> Option<Mapping> {
         self.locked().first_undiscardable(addr.0, end, locked)
@@ -10132,6 +10335,11 @@ impl AddressSpace {
     #[must_use]
     pub fn resident_pages(&self) -> (u64, u64) {
         self.locked().peak_resident()
+    }
+    /// See [`AddressSpaceData::peak_size`].
+    #[must_use]
+    pub fn size_pages(&self) -> (u64, u64) {
+        self.locked().peak_size()
     }
     /// See [`AddressSpaceData::locked_pages_in`].
     pub fn locked_pages_in(&self, addr: GuestAddr, end: u64) -> u64 {
@@ -10188,6 +10396,7 @@ impl AddressSpace {
         let mut pages = chunks(addr, len).map(|(page, _, _)| page).peekable();
         let mut frames = Vec::new();
         faults::through_gup(|| {
+            let mut retry = None;
             while let Some(&first) = pages.peek() {
                 let mut space = self.locked();
                 let mut page = first;
@@ -10203,7 +10412,7 @@ impl AddressSpace {
                     }
                 };
                 drop(space);
-                if fault.is_some_and(|fault| !faults::resolve(|| self.view(), &fault)) {
+                if fault.is_some_and(|fault| !faults::resolve(|| self.view(), &fault, &mut retry)) {
                     return Err(Errno::EFAULT);
                 }
             }
@@ -10322,6 +10531,7 @@ impl AddressSpace {
         operation: AtomicOp,
     ) -> Result<AtomicResult, Fault> {
         let size = width.bytes();
+        let mut retry = None;
         let result = loop {
             let result = if page_offset(addr.0) % WORD_BYTES + size <= WORD_BYTES {
                 match self.atomic_unlocked(addr, size, operation) {
@@ -10333,7 +10543,7 @@ impl AddressSpace {
             };
             match result {
                 Ok(result) => break result,
-                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
                 Err(fault) => return Err(fault),
             }
         };
@@ -11540,7 +11750,7 @@ mod tests {
     #[test]
     fn an_armed_thread_s_own_faults_are_refused_until_its_page_is_touched() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11550,6 +11760,9 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let space = AddressSpace::new();
@@ -11622,7 +11835,7 @@ mod tests {
     #[test]
     fn a_retried_fault_counts_once_as_the_code_s_own() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11632,6 +11845,9 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let mut space = AddressSpace::new();
@@ -11669,9 +11885,9 @@ mod tests {
     }
 
     #[test]
-    fn the_destination_of_a_read_and_a_write_takes_one_fault_a_write() {
+    fn a_kernel_access_a_userfaultfd_had_try_again_takes_one_major_fault() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11681,6 +11897,114 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
+            }
+        }
+        /// Serves each fault as `how` says of its page: 0 copies, 1
+        /// unregisters, 2 wakes once with nothing done, then copies.
+        struct Serve {
+            how: AtomicU64,
+            woken: AtomicU64,
+        }
+        impl faults::Resolver for Serve {
+            fn resolve(&self, space: &MemoryView, addr: u64, _: bool, _: bool) -> bool {
+                let page = addr & !(PAGE_SIZE - 1);
+                let how = self.how.load(Ordering::SeqCst);
+                if how == 2 && self.woken.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return true;
+                }
+                if how == 1 {
+                    space
+                        .userfault_unregister(page, page + PAGE_SIZE, 7)
+                        .unwrap();
+                } else {
+                    let bytes = [7; PAGE_SIZE as usize];
+                    space
+                        .userfault_fill(page, page + PAGE_SIZE, page, Some(&bytes), false)
+                        .unwrap();
+                }
+                true
+            }
+            fn grow(&self, _: &MemoryView, _: u64) -> bool {
+                false
+            }
+        }
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                5 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let page = |n: u64| GuestAddr(at.0 + n * PAGE_SIZE);
+        space
+            .view()
+            .userfault_register(page(0).0, page(4).0, 7, Userfault::MISSING)
+            .unwrap();
+        let _ = (faults::take(), faults::take_forced());
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        let serve = Arc::new(Serve {
+            how: AtomicU64::new(0),
+            woken: AtomicU64::new(0),
+        });
+        let was = faults::set_resolver(Some(Arc::clone(&serve) as _));
+        let load = || {
+            let [user, kernel, forced] = counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
+            [user, kernel, forced, counts.1.load(Ordering::SeqCst)]
+        };
+        let kernel = faults::set_kernel(true);
+        // A copy fills it: the retry finds it there, and the fault is one
+        // major one, not a minor one too.
+        space.write(page(0), &[1]).unwrap();
+        assert_eq!(load(), [0, 0, 0, 1]);
+        // Gone again and written again in the same work: another access,
+        // which waits, and takes a major fault of its own.
+        space.locked().discard(page(0), PAGE_SIZE).unwrap();
+        space.write(page(0), &[1]).unwrap();
+        assert_eq!(load(), [0, 0, 0, 2]);
+        // The retry brings it in itself, once it is no longer registered.
+        serve.how.store(1, Ordering::SeqCst);
+        space.write(page(1), &[1]).unwrap();
+        assert_eq!(load(), [0, 0, 0, 3]);
+        // A wake with nothing done waits again: still one.
+        serve.how.store(2, Ordering::SeqCst);
+        let mut byte = [0];
+        space.read(page(2), &mut byte).unwrap();
+        assert_eq!((load(), byte), ([0, 0, 0, 4], [7]));
+        // Through `get_user_pages`, the retry finds the page and counts
+        // nothing (`__get_user_pages`).
+        serve.how.store(0, Ordering::SeqCst);
+        faults::through_gup(|| space.write(page(3), &[1])).unwrap();
+        assert_eq!(load(), [0, 0, 0, 4]);
+        // A later fault of another page is a minor one again.
+        space.write(page(4), &[1]).unwrap();
+        assert_eq!(load(), [0, 1, 0, 4]);
+        faults::set_kernel(kernel);
+        faults::set_resolver(was);
+        faults::unbind();
+    }
+
+    #[test]
+    fn the_destination_of_a_read_and_a_write_takes_one_fault_a_write() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3], AtomicU64);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let mut space = AddressSpace::new();
@@ -11752,7 +12076,7 @@ mod tests {
     #[test]
     fn a_bound_thread_counts_its_faults_as_they_are_taken() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11762,6 +12086,9 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let load = |counts: &Counts| counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
@@ -12600,6 +12927,58 @@ mod tests {
         drop(space);
         assert_eq!(view.resident_pages(), None);
         assert!(!view.reset_peak_resident());
+    }
+
+    #[test]
+    fn the_peak_of_the_size_is_noted_where_linux_notes_hiwater_vm() {
+        let page = |n: u64| n * PAGE_SIZE;
+        let anon = MappingKind::Anonymous;
+        let mut space = AddressSpace::new();
+        let at = space.map(None, page(8), Prot::READ_WRITE, anon).unwrap();
+        assert_eq!(space.size_pages(), (8, 8));
+        // An unmap notes the size before it as the peak.
+        space.unmap(GuestAddr(at.0 + page(4)), page(4)).unwrap();
+        assert_eq!(space.size_pages(), (8, 4));
+        // One of nothing mapped notes nothing.
+        space.unmap(GuestAddr(at.0 + page(4)), page(4)).unwrap();
+        let big = space.map(None, page(16), Prot::READ_WRITE, anon).unwrap();
+        assert_eq!(space.size_pages(), (20, 20));
+        // A fixed mapping notes the peak as an unmap does, before its own
+        // pages count (`__mmap_complete`).
+        space
+            .map_backed(
+                Placement::Replacing(big),
+                page(2),
+                Prot::READ_WRITE,
+                anon,
+                Backing::None,
+            )
+            .unwrap();
+        assert_eq!(space.size_pages(), (20, 20));
+        // A move by mremap leaves the peak as it was (`move_vma`).
+        space.map(None, page(8), Prot::READ_WRITE, anon).unwrap();
+        let how = Remap {
+            may_move: true,
+            fixed: false,
+            keep_old: false,
+            new_addr: GuestAddr(0),
+            low: false,
+        };
+        let to = space
+            .remap_shared(GuestAddr(big.0 + page(2)), page(2), page(3), how)
+            .unwrap();
+        assert_ne!(to, GuestAddr(big.0 + page(2)));
+        assert_eq!(space.size_pages(), (29, 29));
+        // A shrink unmaps the rest, and notes the peak.
+        space.remap_shared(to, page(3), page(1), how).unwrap();
+        assert_eq!(space.size_pages(), (29, 27));
+        // A child's peak is its size (`dup_mm`).
+        let child = space.fork().unwrap();
+        assert_eq!(child.size_pages(), (27, 27));
+        let view = space.view();
+        assert_eq!(view.size_pages(), Some((29, 27)));
+        drop(space);
+        assert_eq!(view.size_pages(), None);
     }
 
     #[test]

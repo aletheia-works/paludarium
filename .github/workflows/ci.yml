@@ -446,7 +446,7 @@ jobs:
     if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.rust == 'true' }}
     # The native results are this kernel's (docs/design/quality.md).
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       PALUDARIUM_ENCODINGS_FULL_REPLAY: '1'
       PALUDARIUM_ENCODINGS_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native

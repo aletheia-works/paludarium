@@ -736,13 +736,15 @@ fn signal_synchronous_fault_selects_thread_pending_queue() {
         ),
         Next::Resume
     );
+    // SIGFPE is taken first (`dequeue_synchronous_signal`), and the
+    // process's SIGUSR1 gets a frame on its own before either handler runs,
+    // so SIGUSR1's runs first and returns into SIGFPE's.
+    assert_eq!(f.thread.cpu.gpr[reg::RDI], 10);
+    assert!(f.thread.state.pending.is_empty());
+    f.thread.cpu.gpr[reg::RSP] += 8;
+    assert_eq!(f.call(nr::RT_SIGRETURN, &[]), Next::Resume);
     assert_eq!(f.thread.cpu.gpr[reg::RDI], 8);
-    assert_eq!(f.thread.state.pending.len(), 1);
-    assert_eq!(
-        f.thread.state.pending[0].target,
-        signals::PendingTarget::Process
-    );
-    assert_eq!(f.thread.state.pending[0].number, 10);
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x400100));
 }
 
 #[test]
@@ -1465,4 +1467,79 @@ fn modify_ldt_writes_and_reads_the_local_descriptor_table() {
     // A child of fork has a copy.
     let child = f.mem.fork().unwrap();
     assert_eq!(child.ldt().lock().unwrap().len(), 3);
+}
+
+/// `dequeue_signal` and `exit_to_user_mode_loop`: the thread's own pending
+/// signals by number, then the process's by number, whatever order they came
+/// in, each with a frame on the one before, before any handler runs. A
+/// handler blocks its own signal, so the second SIGRTMIN+1 waits for the
+/// first's to return. The handlers run last frame first.
+#[test]
+fn pending_signals_are_taken_the_threads_first_then_the_processs_each_by_number() {
+    let mut f = signal_fixture();
+    let (pid, tid) = (u64::from(f.thread.state.pid), u64::from(f.thread.tid));
+    let blocked: u64 = [10, 12, 17, 34, 35].iter().map(|n| 1u64 << (n - 1)).sum();
+    f.mem.write_u64(GuestAddr(DATA + 0x300), blocked).unwrap();
+    assert_eq!(f.call(14, &[0, DATA + 0x300, 0, 8]), Next::Resume);
+    for number in [10, 12, 17, 34, 35] {
+        f.mem.write(GuestAddr(DATA + 0x200), &[0; 32]).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 0x200), 0x400100).unwrap();
+        f.mem
+            .write_u64(GuestAddr(DATA + 0x208), 0x0400_0004)
+            .unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 0x210), 0x400200).unwrap();
+        f.call(13, &[number, DATA + 0x200, 0, 8]);
+    }
+    let info = |f: &mut Fixture, number: u64, value: u64| {
+        f.mem.write(GuestAddr(DATA + 0x100), &[0; 128]).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &(number as u32).to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x108), &(-1i32).to_le_bytes())
+            .unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 0x118), value).unwrap();
+    };
+    // The thread's SIGUSR1, the process's SIGUSR2, two queued SIGRTMIN+1 of
+    // the process's, the thread's SIGRTMIN+2 and the process's SIGCHLD.
+    f.call(234, &[pid, tid, 10]);
+    f.call(62, &[pid, 12]);
+    for value in [11, 12] {
+        info(&mut f, 34, value);
+        f.call(129, &[pid, 34, DATA + 0x100]);
+    }
+    info(&mut f, 35, 21);
+    f.call(297, &[pid, tid, 35, DATA + 0x100]);
+    f.call(62, &[pid, 17]);
+    f.mem.write_u64(GuestAddr(DATA + 0x300), blocked).unwrap();
+    assert_eq!(f.call(14, &[1, DATA + 0x300, 0, 8]), Next::Resume);
+    let mut ran = vec![f.thread.cpu.gpr[reg::RDI]];
+    for _ in 0..5 {
+        f.thread.cpu.gpr[reg::RSP] += 8;
+        assert_eq!(f.call(nr::RT_SIGRETURN, &[]), Next::Resume);
+        ran.push(f.thread.cpu.gpr[reg::RDI]);
+    }
+    assert_eq!(ran, [34, 34, 17, 12, 35, 10]);
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x400100));
+    f.thread.cpu.gpr[reg::RSP] += 8;
+    f.call(nr::RT_SIGRETURN, &[]);
+    assert_eq!(f.thread.state.signal_mask, 0);
+    assert!(f.thread.state.pending.is_empty());
+}
+
+/// `next_signal`: in a queue, the synchronous signals first, then the lowest
+/// number, whichever came first.
+#[test]
+fn a_queue_gives_its_synchronous_signals_then_its_lowest() {
+    let mut f = signal_fixture();
+    for number in [17, 12, 34, 10] {
+        signals::queue(&mut f.thread.state, signals::PendingSignal::user(number, 0));
+    }
+    // A SIGSEGV sent, not raised by a fault, is still first of its queue.
+    signals::queue(&mut f.thread.state, signals::PendingSignal::user(11, 0));
+    let mut order = Vec::new();
+    while let Some(index) = signals::next_pending(&f.thread.state, false) {
+        order.push(f.thread.state.pending.remove(index).number);
+    }
+    assert_eq!(order, [11, 10, 12, 17, 34]);
 }

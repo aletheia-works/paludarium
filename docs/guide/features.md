@@ -62,7 +62,8 @@ Linux.
   64-byte line, because HotSpot requires it. Of those, the FPU and MMX
   are not implemented; it advertises no other feature that is not. The name
   changes nothing else: where vendors' CPUs differ, as in the flags after a
-  `REP` faults, the virtual CPU keeps its own behaviour.
+  `REP` faults, the virtual CPU keeps its own behaviour. `/proc/cpuinfo`
+  describes this CPU too.
 - `RDTSC` and `RDTSCP` read a counter of the virtual CPU, which moves on with
   each read rather than with time. Every guest in the host process shares that
   counter, so its values depend on what else has read it. `RDSSP` does nothing
@@ -1091,8 +1092,9 @@ kernel.
   mapping's pages are mapped again at their next access. `MADV_FREE` keeps the contents, as
   Linux does without memory pressure.
   `MADV_WILLNEED` is accepted, and so are `MADV_COLD` and `MADV_PAGEOUT`
-  (with nothing to reclaim, hints too): each needs only the range mapped
-  (`ENOMEM`). `MADV_DONTNEED_LOCKED` discards as
+  (with nothing to reclaim, hints too): each needs the range mapped
+  (`ENOMEM`), and the last two refuse locked memory, huge pages
+  (`MAP_HUGETLB`) and memory Linux maps `VM_PFNMAP` (`EINVAL`). `MADV_DONTNEED_LOCKED` discards as
   `MADV_DONTNEED` does. `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`
   fault the pages in, as a read or a write would (the zero page, a page of
   its own), up to a page no mapping holds (`ENOMEM`), one its mapping may
@@ -1107,7 +1109,8 @@ kernel.
   one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
   takes only private anonymous memory, memory core mm does not back, as
   the rings of AIO, `io_uring` and perf events, takes no `MADV_DOFORK` or
-  `MADV_DODUMP`, and a perf ring buffer takes no change to only a part of
+  `MADV_DODUMP`, though huge pages take `MADV_DODUMP`, huge pages take no
+  `MADV_HUGEPAGE`, and a perf ring buffer takes no change to only a part of
   it), and a hole in the range gives
   `ENOMEM` after the rest has taken it. A `fork`ed child gets no mapping
   `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
@@ -1130,7 +1133,8 @@ kernel.
   `mremap`, and go with `munmap`. `MADV_GUARD_REMOVE` takes them out,
   leaving pages without contents. Sealed memory whose pages may not be
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
-  which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`).
+  which Linux maps `VM_DONTEXPAND`, huge pages and the vDSO's data take
+  neither advice (`EINVAL`).
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
   `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent, a
@@ -1289,7 +1293,13 @@ kernel.
   Unless a signal is to be taken first, the retry counts as a minor fault
   of the thread's own code (`ru_minflt`, `page-faults`, `minor-faults`),
   whether it brings the page in or not: its first try ran under the VMA's
-  lock, whose retry is not `FAULT_FLAG_TRIED`.
+  lock, whose retry is not `FAULT_FLAG_TRIED`. The fault of a kernel
+  access, which waits as described above, is a major one: a kernel-mode
+  fault does not run under the VMA's lock first, so its retry is
+  `FAULT_FLAG_TRIED`, and it counts once (`ru_majflt`, `page-faults`,
+  `major-faults`, and no minor fault), whether the retry brings the page in
+  or not. One through `get_user_pages` finds the page there and counts
+  nothing.
   With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
   instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
   their protection, VMA by VMA as `mwriteprotect_range` does: each must be
@@ -1800,6 +1810,21 @@ kernel.
   source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone
   too) and a `shmat` there give `EPERM` without `CAP_SYS_RAWIO`.
 
+- `MAP_HUGETLB` maps as on a Linux whose pool of huge pages is empty
+  (`vm.nr_hugepages` 0): `ENOMEM`, after the checks Linux makes first, when
+  a fixed mapping has unmapped what it would replace. With `MAP_NORESERVE`
+  it succeeds, and an access raises `SIGBUS`. Such a mapping goes at a 2 MiB
+  boundary, is split, remapped and dropped only on one (`EINVAL`), cannot
+  grow, and shows `ht` and its 2 MiB pages in `smaps`. `madvise` refuses
+  it `MADV_FREE`, `MADV_COLD`, `MADV_PAGEOUT`, `MADV_HUGEPAGE` and the
+  guards, and `MADV_DONTNEED` from an address off a 2 MiB boundary
+  (`EINVAL`). The only size is
+  2 MiB (another is `EINVAL`), as the virtual CPU has no 1 GiB pages, and a
+  file with the flag is `EINVAL`. The memory is a hugetlbfs file's, so it
+  takes a file's types: `MAP_SHARED_VALIDATE` maps it (`EOPNOTSUPP` for a
+  flag it refuses), and `MAP_DROPPABLE` is `EINVAL`, after the placement
+  and the lock checks, as in `do_mmap`.
+
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or
@@ -1836,7 +1861,10 @@ kernel.
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
   `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
   `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, the polls `IORING_OP_POLL_ADD` and
-  `_POLL_REMOVE`, and the socket requests
+  `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
+  `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
+  socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
   `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
@@ -2014,6 +2042,19 @@ kernel.
   `IORING_TIMEOUT_IMMEDIATE_ARG`. A cancellation finds the timeouts after
   the requests that wait for their files, but none by a file, and no linked
   one. `execve` and a whole process's exit cancel the thread's.
+
+- The file requests run as the calls they stand for, as Linux's do. Their
+  entries are checked as Linux checks them (`EINVAL`, `EBADF` for
+  `IOSQE_FIXED_FILE` on one that names a path), and their names, and
+  `struct open_how`, are read as the entry is taken (`EFAULT`,
+  `ENAMETOOLONG`, `ENOENT` for an empty one), so what a request before it in
+  its link writes there does not change them. An open that would not create
+  or cut a file does not wait, as Linux's first try (`O_NONBLOCK`) does
+  not: a FIFO opens to be read at once. An open can go in a registered slot
+  (`file_index`, `IORING_FILE_INDEX_ALLOC`), which a close can empty, and a
+  ring cannot be closed (`EBADF`). As on Linux, a call that fails fails its
+  link only for an open, a close and an `IORING_OP_FADVISE`, or if its
+  descriptor is not open; an `IORING_OP_FSYNC` does not either.
 
 - The polls are Linux master's (`io_uring/poll.c`). `IORING_OP_POLL_ADD`
   completes with the events its file has of those it asks for and the ones
@@ -3029,13 +3070,19 @@ kernel.
     through an end that goes away. A removal naming a device or gateway
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
     hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
-    source and destination falls to, each hop living taking a share of the
-    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), as
-    `fib_multipath_hash_policy` 0 hashes them
-    (`fib_multipath_hash_from_keys`), by the machine's random seed, every
-    namespace's, or `net.ipv4.fib_multipath_hash_seed`, with which each
-    flow's hop is Linux's; before the hash, one whose device's own source is the lookup's;
-    through a device named, the first through it. A socket not bound takes
+    flow falls to, each hop living taking a share of the hashes by its
+    weight (`fib_select_multipath`, `fib_rebalance`). The hash is of what
+    `net.ipv4.fib_multipath_hash_policy` names (`fib_multipath_hash`): the
+    source and destination (0 and 2); those, the protocol and the ports
+    (1); or the fields `fib_multipath_hash_fields` names (3). An
+    `RTM_GETROUTE` hashes the packet `inet_rtm_getroute_build_skb` makes,
+    of UDP where it names no protocol, with ports for TCP and UDP alone,
+    and its hash of policy 3 mixed with no inner one
+    (`fib_multipath_custom_hash_skb`). The key is the machine's random
+    seed, every namespace's, or `net.ipv4.fib_multipath_hash_seed`, with
+    which each flow's hop is Linux's. Before the hash, one whose device's
+    own source is the lookup's; through a device named, the first through
+    it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
     (`ip_route_connect`). A packet may come in on the device of any hop of
@@ -3228,9 +3275,11 @@ kernel.
     hop alone, and gives the last error. A lookup takes the hop the flow's
     hash falls to, each hop living taking a share of the hashes by its
     weight (`fib6_select_path`, `rt6_multipath_rebalance`), by the same
-    seed as IPv4's, as `fib_multipath_hash_policy` 0 hashes
-    the source, the destination, the flow label and the protocol; a
-    socket's packets hash as it is bound, `::` unbound, with no flow
+    seed as IPv4's, of what `net.ipv6.fib_multipath_hash_policy` names
+    (`rt6_multipath_hash`): the source, the destination, the flow label and
+    the protocol (0 and 2); the addresses, the protocol and the ports (1);
+    or the fields `fib_multipath_hash_fields` names (3), of the flow
+    `RTM_GETROUTE` asks for too; a socket's packets hash as it is bound, `::` unbound, with no flow
     label, and one unbound takes the source of the hop that gives
     (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
     through whichever end that takes: the one its listener is bound to, or
@@ -4100,7 +4149,8 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts of the caller's mount namespace
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
-  `devtmpfs` for `/dev` and the tmpfs on `/dev/shm` from start-up,
+  `proc` for `/proc`, `devtmpfs` for `/dev` and the tmpfs on `/dev/shm`
+  from start-up,
   and the tmpfs and bind mounts `mount` made, with their sources and, in
   `mountinfo`, the directory each shows as its root, whether the mount
   and its superblock are read-only, and its propagation). After `chroot` they show each mount point
@@ -4160,7 +4210,7 @@ kernel.
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
 
-- The other `/proc` entries are `/proc/loadavg`, `/proc/locks` (above),
+- The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
   `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
@@ -4205,14 +4255,25 @@ kernel.
   tmpfs file, a memfd or System V shared memory), and its open is `ESRCH`
   for a task with no memory left. `status`
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
-  capabilities and so on) and, of the memory ones, the locked memory
-  (`VmLck`), the peak of the resident memory (`VmHWM`) and the resident
-  memory (`VmRSS`), which a zombie does not show; the other memory fields
-  and the CPU ones are not there, as nothing measures them. The peak is
-  Linux's `hiwater_rss`: noted before `munmap`, `MADV_DONTNEED` and the
+  capabilities and so on) and the memory ones of Linux's `task_mem`, which
+  a zombie does not show: the peak of the size of the mappings and the
+  size (`VmPeak`, `VmSize`), the locked memory (`VmLck`), the peak of the
+  resident memory and the resident memory (`VmHWM`, `VmRSS`), split into
+  what is anonymous, a file's and shmem's (`RssAnon`, `RssFile`,
+  `RssShmem`), the private writable mappings and the stack (`VmData`,
+  `VmStk`), the code range and the other executable mappings (`VmExe`,
+  `VmLib`), and 0 for `VmSwap` and `HugetlbPages`, as nothing is swapped
+  out and the pool of huge pages is empty. `VmPin`, `VmPTE` and the CPU
+  fields are not there, as nothing counts them. The peak of the size is
+  Linux's `hiwater_vm`: noted when an unmap takes mapped pages away, as
+  `vms_complete_munmap_vmas` calls `update_hiwater_vm` (a fixed mapping
+  that replaces them counts its own pages only after it), but not when
+  `mremap` moves pages (`move_vma` keeps the peak it had). The peak of the resident
+  memory is Linux's `hiwater_rss`: noted before `munmap`, `MADV_DONTNEED` and the
   other calls that drop pages, as `update_hiwater_rss` does, so that
-  `VmHWM` is never below `VmRSS`; a `fork`ed child's starts at what it
-  holds, as `dup_mm` sets it, and writing 5 to `clear_refs` resets it. `statm` has, in pages, what Linux's `task_statm`
+  `VmHWM` is never below `VmRSS`. A `fork`ed child's peaks start at what it
+  maps and holds, as `dup_mm` sets them, and writing 5 to `clear_refs` resets
+  that of the resident memory. `statm` has, in pages, what Linux's `task_statm`
   counts: the size of the mappings, the resident pages, those of them a
   file's or shared memory's, the pages of the code range `stat` gives, 0,
   the private
@@ -4223,13 +4284,15 @@ kernel.
   resource limits as `prlimit` gives them, in Linux's columns. `auxv` (0400)
   is the auxiliary vector the program's `execve` wrote on its stack, kept
   as Linux keeps `saved_auxv`, whatever the program then does to its stack,
-  and across `fork`. Any other path in this process's directory or
-  elsewhere under `/proc` is looked up in the filesystem like any path, so with
-  `--mount /:/` it reaches the host's own `/proc`.
+  and across `fork`. Any other name in this process's directory or
+  elsewhere under `/proc` is `ENOENT`, as a name procfs does not have is on
+  Linux, whatever the filesystem holds there (with `--mount /:/`, the
+  host's own `/proc`): `/proc` is a mount of its own from start-up, as
+  `/dev` is, so calls that would make, remove or rename such a name are
+  `ENOENT` too.
 
-- `/proc` lists what the filesystem has there that is not a process (with
-  `--mount /:/`, the host's own entries except its processes), the files above,
-  and then a directory for every process of the guest, zombies included, as
+- `/proc` lists the files above, and nothing the filesystem has there (with
+  `--mount /:/`, none of the host's own entries), and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
@@ -4391,10 +4454,10 @@ kernel.
   (as Linux's `task_cpu` is the one it last ran on; `getcpu` looks at the
   mask again at once, so after `sched_setaffinity` `stat` follows from the
   task's next system call), and the real-time priority and policy. A path under
-  `task` gives the thread's own, its CPU time and minor faults too; the
+  `task` gives the thread's own, its CPU time and faults too; the
   process's CPU time and faults are all its threads', the rest its leader's. What
-  nothing measures is 0: major faults, and the system time, as all the CPU
-  time counts as the user's.
+  nothing measures is 0: the system time, as all the CPU time counts as
+  the user's.
   A reader that may not see the task's memory, as Linux's
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
@@ -4563,8 +4626,9 @@ kernel.
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
-  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`, and
-  `ipv4/fib_multipath_hash_seed`. They and their
+  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`,
+  `ipv4/fib_multipath_hash_seed`, and `fib_multipath_hash_policy` and
+  `fib_multipath_hash_fields` of `ipv4` and of `ipv6`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write
@@ -4601,7 +4665,11 @@ kernel.
     address is `EACCES` (`addrconf_add_dev`).
   - `fib_multipath_hash_seed` takes an unsigned `int` as
     `proc_douintvec_minmax` does (the rest of the write taken with it), 0
-    for the machine's random seed, as a new namespace has it.
+    for the machine's random seed, as a new namespace has it. So does
+    `fib_multipath_hash_policy`, of 0 to 3 (`proc_dou8vec_minmax`), and
+    `fib_multipath_hash_fields`, of 1 to 0xfff (`proc_douintvec_minmax`),
+    `EINVAL` past them; a new namespace has policy 0 and fields 7 (the
+    source, the destination and the protocol), each family its own.
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
 
@@ -4666,6 +4734,30 @@ kernel.
     running as `/proc/<pid>/stat` shows them (`R`), the reader included;
     `procs_blocked 0`; and a `softirq` line of zeros.
 
+- `/proc/cpuinfo` is in the format of Linux 7.0's `show_cpuinfo`, with a
+  record for each CPU `sched_getaffinity` reports. It is made from the
+  virtual CPU's `CPUID` as Linux makes it when it boots on such a CPU, never
+  from the host's CPU.
+  - `vendor_id`, `cpu family`, `model`, `stepping` and `cpuid level` are
+    `CPUID`'s. `model name` is `Hammer`, the name Linux gives an AMD CPU of
+    family 15 without a brand string.
+  - `flags` names, by Linux's names and in its order (`x86_cap_flags`), the
+    features of the `CPUID` words Linux copies, and those Linux sets itself on
+    such a CPU: `nopl`, `cpuid`, `3dnowprefetch` and `vmmcall`. `bugs` names
+    what Linux's tables give that family: `fxsave_leak`, `sysret_ss_attrs`,
+    `null_seg`, `swapgs_fence`, `spectre_v1`, `spectre_v2` and
+    `spectre_v2_user`.
+  - `CPUID` describes no topology, so each CPU is a package of its own with
+    one core: `physical id` and `apicid` are its number, `siblings` and
+    `cpu cores` 1, and `core id` 0. `initial apicid` is what `CPUID`'s leaf 1
+    gives, 0.
+  - `clflush size` and `cache_alignment` are 64, and the address sizes 36
+    bits physical and 48 virtual: a 64-bit Linux's defaults without `CPUID`
+    leaf 0x80000008.
+  - There is no `microcode`, `cpu MHz` (`CPUID` reports no time stamp
+    counter), `cache size` or `TLB size` line. `power management` is empty,
+    and `bogomips` is 0.00, as nothing is calibrated.
+
 - `/proc/net` is a link to `self/net`; `/proc/<pid>/net`, and a thread's,
   holds the files of the task's network namespace, whose names are looked
   up in the one it has then (`get_proc_task_net`), by any reader: `ENOENT`
@@ -4713,7 +4805,7 @@ kernel.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
 
-- These system files (`loadavg`, `locks`, `meminfo`, `stat`, `uptime` and
+- These system files (`cpuinfo`, `loadavg`, `locks`, `meminfo`, `stat`, `uptime` and
   `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
   read goes on to the end of what they hold. So is every file of a process's
   or a thread's directory (`stat` and `fstat` alike), as Linux's
@@ -5077,10 +5169,13 @@ kernel.
   context switches, the times a thread went to sleep, as Linux's `nvcsw`,
   for the same processes and threads and with a wait's and
   `RUSAGE_CHILDREN`'s the children's (`cnvcsw`), as of each thread's latest
-  system call. The other counts (major faults, involuntary context
-  switches, blocks) are 0. `/proc/<pid>/stat` gives the same counts
-  as `minflt` (a thread's own under `task`) and `cminflt`, and 0 as
-  `majflt` and `cmajflt`.
+  system call. `ru_majflt` counts the major faults, for the same processes
+  and threads and children (`cmaj_flt`): the faults of the kernel's
+  accesses that a `userfaultfd` had try again, as described for
+  `userfaultfd`, each counted once as its wait ends, and to no minor
+  fault. The other counts (involuntary context switches, blocks) are 0.
+  `/proc/<pid>/stat` gives the same counts as `minflt` and `majflt` (a
+  thread's own under `task`) and `cminflt` and `cmajflt`.
 
 - A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
   takes it apart: the task's number in the caller's PID namespace
@@ -5311,8 +5406,10 @@ kernel.
   area's update, left out with `exclude_kernel`), `context-switches` (each time it
   sleeps) and `cpu-migrations` (each time the CPU `getcpu` reports
   changes), the last two made by the kernel and so left out with
-  `exclude_kernel`, as Linux leaves them out; `major-faults`, which count
-  nothing, as every page is in memory; and `alignment-faults`,
+  `exclude_kernel`, as Linux leaves them out; `major-faults` (the faults of
+  the kernel's accesses that a `userfaultfd` had try again, which
+  `page-faults` counts too and `minor-faults` does not); and
+  `alignment-faults`,
   `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
   x86-64. An event of a thread on one CPU, as `perf record` opens one for
   each, counts and runs only while the thread is on that CPU
@@ -6294,7 +6391,7 @@ kernel.
 
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
   longer struct whose extra part is not zero) and then runs as the `clone` it
-  describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
+  describes; `CLONE_CLEAR_SIGHAND` resets the child's actions as `execve` does.
   `set_tid` is as under the PID namespaces above, and `CLONE_INTO_CGROUP`
   gives `EINVAL`. `clone` itself reads only
   the low 32 bits of its flags, as in Linux, so `CLONE_CLEAR_SIGHAND` is
@@ -6586,6 +6683,17 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     gone dead, an address gone and one whose duplicate address detection
     is done change it, or `SO_BINDTODEVICE`, `SO_BINDTOIFINDEX` or another
     `IP_TOS` drops it; then it keeps the one it looks up.
+    `IP_UNICAST_IF`, of IPv4 and IPv6 sockets and TCP's too, takes the
+    index of a device in network byte order (`EADDRNOTAVAIL` for one there
+    is not) in an `int` exactly (`EINVAL` for another length), 0 for none,
+    and is `EINVAL` on a socket bound to a device (`do_ip_setsockopt`). A
+    UDP datagram to an IPv4 address other than a group, an IPv6 socket's
+    IPv4-mapped one too, and a UDP `connect` go through its device where
+    the socket has none of its own (`udp_sendmsg`,
+    `__ip4_datagram_connect`), as through `SO_BINDTODEVICE`'s; TCP goes by
+    its routes. Each IPv4 send looks its route up, where Linux's connected
+    socket keeps the one its `connect` found (`sk_dst_check`), until the
+    routes change, when the option changes after it.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
     as the room asks (`tcp_get_info`): a listener's state, connections
     waiting and backlog; a socket that has not connected, Linux's
@@ -6800,6 +6908,12 @@ one only with an `--allow-net`.
   `CLONE_THREAD` shares its signal dispositions with its parent: a
   `sigaction` in one is seen by the other. `execve` gives the process its own
   copy again, as in Linux.
+- `execve` keeps the signals pending for the thread that runs it and for the
+  process, and the signals it blocks; the other threads end with theirs
+  (`de_thread`). It resets the actions as Linux's `flush_signal_handlers`
+  does: a handled signal goes back to its default, and an ignored one stays
+  ignored, with no flags or mask. `CLONE_CLEAR_SIGHAND` resets the child's
+  actions the same way.
 - The threads of a process share its signal dispositions, as Linux's
   `sighand_struct` does. A thread that was already waiting (in `epoll_wait`,
   `poll` or a `futex` wait, say) when another thread called `sigaction` takes
@@ -6971,6 +7085,14 @@ one only with an `--allow-net`.
   handler has run, which runs with that mask; the original mask is back after
   it. The mask stays through a stop, as on Linux, so a signal that only it
   unblocks, sent while the thread is stopped, is taken as the stop ends.
+- On its way back to user space a thread takes every signal it may, as
+  Linux's `exit_to_user_mode_loop`: its own pending ones by number, then the
+  process's by number (`dequeue_signal`), the synchronous ones (`SIGSEGV`,
+  `SIGBUS`, `SIGILL`, `SIGTRAP`, `SIGFPE`, `SIGSYS`) first, a queued
+  real-time signal's instances in the order they came. Each handler's frame
+  goes on the one before, with the mask that handler runs with, so the last
+  frame's handler runs first, and a signal that mask blocks waits for its
+  `rt_sigreturn`. Only the first can restart the call the thread was in.
 - A `sigaction` that makes a signal ignored (`SIG_IGN`, or `SIG_DFL` for
   `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH`, which are ignored by
   default) discards its pending instances in the process and in every thread,

@@ -403,7 +403,8 @@ port.listen(async message => {
       e = (await WebAssembly.instantiate(module, imports(memory, { net: request => queueMicrotask(() => void netRequest(null, request)) }))).exports;
       if (typeof e.cost_reset === "function") e.cost_reset();
       // In WebKit, growing a shared memory while other threads run in it fails them ("Out of bounds
-      // memory access") or crashes the page, so grow it to its maximum now, before any guest runs. The
+      // memory access") or crashes the page, so grow it to close to its maximum now, before any guest
+      // runs (heap_reserve takes smaller blocks once a 64 MiB one no longer fits). The
       // heap is reserved untouched, so the pages are not resident until used. Only in WebKit: on
       // Windows, and in Firefox on Linux, the grown memory counts against the commit limit at once.
       if (typeof e.heap_reserve === "function" && isWebKit(globalThis.navigator?.userAgent)) {

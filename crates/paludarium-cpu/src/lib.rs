@@ -44,6 +44,7 @@ use paludarium_mmu::AddressSpace;
 use paludarium_types::{ExitReason, GuestAddr, InstructionBytes, MAX_INSTRUCTION_LEN};
 
 pub use alu::{condition, sign_extend, size_mask};
+pub use cpuid::values as cpuid;
 pub use state::{
     CpuState, FX_WRITTEN, INITIAL_MXCSR, INITIAL_RFLAGS, RepFaultFlags, RepeatContinuation, flag,
     reg,

@@ -15,6 +15,7 @@
 mod admin;
 mod arguments;
 mod coredump;
+mod cpuinfo;
 mod credentials;
 mod inbox;
 mod inotify;
@@ -51,6 +52,7 @@ mod fasync;
 mod fifo;
 mod files;
 mod filesystems;
+mod hugetlb;
 mod inet;
 mod interface;
 mod io_accounting;
@@ -246,7 +248,9 @@ impl Eq for CpuAccount {}
 /// kernel's work for it (`kernel_faults`), as they are taken. The software
 /// events of `perf` count these. The faults of its reads and writes
 /// through `get_user_pages` are kept apart (`forced_faults`), as they count
-/// to its `min_flt` but are no `perf` event.
+/// to its `min_flt` but are no `perf` event, and so are its major faults
+/// (`major_faults`, Linux's `maj_flt`): those of the kernel's accesses that
+/// a `userfaultfd` had try again.
 #[derive(Debug, Default)]
 pub(crate) struct Usage {
     /// Grows only, under [`Self::time`]'s lock.
@@ -259,6 +263,7 @@ pub(crate) struct Usage {
     pub(crate) faults: std::sync::atomic::AtomicU64,
     pub(crate) kernel_faults: std::sync::atomic::AtomicU64,
     pub(crate) forced_faults: std::sync::atomic::AtomicU64,
+    pub(crate) major_faults: std::sync::atomic::AtomicU64,
     pub(crate) switches: std::sync::atomic::AtomicU64,
     pub(crate) migrations: std::sync::atomic::AtomicU64,
     /// The CPU it was last seen on (Linux's `task_cpu`), which
@@ -270,8 +275,7 @@ pub(crate) struct Usage {
     /// The latest faults of its own code and of the kernel's accesses for
     /// it, by their numbers in the counts and their addresses, once some
     /// `perf` event asks for them.
-    fault_addresses:
-        std::sync::Mutex<[std::collections::VecDeque<(u64, paludarium_mmu::faults::At)>; 2]>,
+    fault_addresses: std::sync::Mutex<[std::collections::VecDeque<FaultAt>; 2]>,
     /// It runs on a virtual CPU of `rseq`, which no CPU mask moves.
     pub(crate) virtual_cpu: std::sync::atomic::AtomicBool,
 }
@@ -349,17 +353,58 @@ impl TimeOnCpus {
     }
 }
 
-/// What a thread's [`Usage`] counted on each CPU: its faults in its own
-/// code and the kernel's, its switches and its migrations, in that order.
+/// The minor and major faults of a thread, a process or the children it
+/// reaped (Linux's `min_flt` and `maj_flt`, `cmin_flt` and `cmaj_flt`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Faults {
+    pub minor: u64,
+    pub major: u64,
+}
+
+impl Faults {
+    pub(crate) fn plus(self, other: Self) -> Self {
+        Self {
+            minor: self.minor.saturating_add(other.minor),
+            major: self.major.saturating_add(other.major),
+        }
+    }
+}
+
+/// What a [`Usage`] counts on each CPU, in [`CpuCounts`]'s order.
+pub(crate) type Counts = [u64; 5];
+
+/// One of a thread's latest faults: the minor and major faults it had
+/// counted in its own code or in the kernel's work with this one, whether
+/// this one is major, and where it was.
+#[derive(Clone, Copy, Debug)]
+struct FaultAt {
+    minor: u64,
+    major: u64,
+    is_major: bool,
+    at: paludarium_mmu::faults::At,
+}
+
+/// Which of a thread's faults a `perf` event counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultKind {
+    /// `page-faults`: every one.
+    All,
+    Minor,
+    Major,
+}
+
+/// What a thread's [`Usage`] counted on each CPU: its minor faults in its
+/// own code and the kernel's, its switches, its migrations and its major
+/// faults, in that order.
 /// Those of the CPU it is on are what it counted since it came there; a
 /// migration counts to the CPU it comes to, as Linux's
 /// `perf_sw_event_sched` of `PERF_COUNT_SW_CPU_MIGRATIONS` runs there.
 #[derive(Debug, Default)]
 pub(crate) struct CpuCounts {
     /// What it counted on each CPU it has left, by the CPU's number.
-    done: Vec<[u64; 4]>,
+    done: Vec<Counts>,
     /// The CPU it is on, and its counts when it came there.
-    on: Option<(u32, [u64; 4])>,
+    on: Option<(u32, Counts)>,
 }
 
 impl Usage {
@@ -427,13 +472,14 @@ impl Usage {
         }
     }
     /// Its faults, switches and migrations, as [`CpuCounts`] orders them.
-    fn counts(&self) -> [u64; 4] {
+    pub(crate) fn counts(&self) -> Counts {
         use std::sync::atomic::Ordering::SeqCst;
         [
             self.faults.load(SeqCst),
             self.kernel_faults.load(SeqCst),
             self.switches.load(SeqCst),
             self.migrations.load(SeqCst),
+            self.major_faults.load(SeqCst),
         ]
     }
     /// The thread is on `cpu` now: what it counted since it came to the
@@ -449,7 +495,7 @@ impl Usage {
             Some((was, since)) => {
                 let was = was as usize;
                 if counts.done.len() <= was {
-                    counts.done.resize(was + 1, [0; 4]);
+                    counts.done.resize(was + 1, [0; 5]);
                 }
                 for (done, (now, since)) in counts.done[was].iter_mut().zip(now.iter().zip(since)) {
                     *done = done.saturating_add(now.saturating_sub(since));
@@ -457,7 +503,7 @@ impl Usage {
                 counts.on = Some((cpu, now));
             }
             // What it counted before it was first seen is the first CPU's.
-            None => counts.on = Some((cpu, [0; 4])),
+            None => counts.on = Some((cpu, [0; 5])),
         }
     }
     /// Another thread's `sched_setaffinity` left it the mask whose lowest
@@ -491,12 +537,12 @@ impl Usage {
         since[2] = since[2].saturating_add(n);
         let cpu = cpu as usize;
         if counts.done.len() <= cpu {
-            counts.done.resize(cpu + 1, [0; 4]);
+            counts.done.resize(cpu + 1, [0; 5]);
         }
         counts.done[cpu][2] = counts.done[cpu][2].saturating_add(n);
     }
     /// What it counted on `cpu`, as [`CpuCounts`] orders it.
-    pub(crate) fn counts_on(&self, cpu: u32) -> [u64; 4] {
+    pub(crate) fn counts_on(&self, cpu: u32) -> Counts {
         let now = self.counts();
         let counts = self
             .per_cpu_counts
@@ -513,7 +559,7 @@ impl Usage {
         on
     }
     /// Adds what it counted on each CPU to `sums`.
-    pub(crate) fn add_counts(&self, sums: &mut Vec<[u64; 4]>) {
+    pub(crate) fn add_counts(&self, sums: &mut Vec<Counts>) {
         let cpus: Vec<u32> = {
             let counts = self
                 .per_cpu_counts
@@ -528,7 +574,7 @@ impl Usage {
             let counts = self.counts_on(cpu);
             let cpu = cpu as usize;
             if sums.len() <= cpu {
-                sums.resize(cpu + 1, [0; 4]);
+                sums.resize(cpu + 1, [0; 5]);
             }
             for (sum, count) in sums[cpu].iter_mut().zip(counts) {
                 *sum = sum.saturating_add(count);
@@ -542,12 +588,13 @@ impl Usage {
         let on = time.ran.get(cpu as usize).copied().unwrap_or(0);
         (self.cpu_time(), on)
     }
-    /// The addresses of the latest `n` of its first `counted` faults of its
-    /// own code or of the `kernel`'s accesses for it, 0 for one that is not
-    /// known.
+    /// The addresses of the latest `n` of its first `counted` faults of
+    /// `kind` of its own code or of the `kernel`'s accesses for it, 0 for
+    /// one that is not known.
     pub(crate) fn fault_addresses(
         &self,
         kernel: bool,
+        kind: FaultKind,
         counted: u64,
         n: u64,
     ) -> Vec<paludarium_mmu::faults::At> {
@@ -556,14 +603,25 @@ impl Usage {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let latest = &addresses[usize::from(kernel)];
+        // Its number among those of `kind`, and whether it is one: each
+        // count grows with the faults, so they are in its order.
+        let nth = |fault: &FaultAt| match kind {
+            FaultKind::All => (fault.minor + fault.major, true),
+            FaultKind::Minor => (fault.minor, !fault.is_major),
+            FaultKind::Major => (fault.major, fault.is_major),
+        };
         // Those before are gone.
         let known = n.min(FAULT_ADDRESSES as u64);
         let mut out =
             vec![paludarium_mmu::faults::At::default(); usize::try_from(n - known).unwrap_or(0)];
         out.extend((0..known).map(|i| {
-            let nth = counted.saturating_sub(known - 1 - i);
-            let at = latest.binary_search_by_key(&nth, |&(nth, _)| nth);
-            at.map_or_else(|_| paludarium_mmu::faults::At::default(), |at| latest[at].1)
+            let wanted = counted.saturating_sub(known - 1 - i);
+            // The first that has counted it is it, if it is of `kind`.
+            let at = latest.partition_point(|fault| nth(fault).0 < wanted);
+            latest
+                .get(at)
+                .filter(|fault| nth(fault) == (wanted, true))
+                .map_or_else(paludarium_mmu::faults::At::default, |fault| fault.at)
         }));
         out
     }
@@ -577,14 +635,22 @@ impl Usage {
             *sum = sum.saturating_add(ran);
         }
     }
-    /// Its minor faults (Linux's `min_flt`): every fault it took, its own
-    /// code's, the kernel's for it and those through `get_user_pages`.
+    /// Its minor faults (Linux's `min_flt`): every fault it took but the
+    /// major ones, its own code's, the kernel's for it and those through
+    /// `get_user_pages`.
     pub(crate) fn minor_faults(&self) -> u64 {
         use std::sync::atomic::Ordering::SeqCst;
         self.faults
             .load(SeqCst)
             .saturating_add(self.kernel_faults.load(SeqCst))
             .saturating_add(self.forced_faults.load(SeqCst))
+    }
+    /// Its minor and major faults (Linux's `min_flt` and `maj_flt`).
+    pub(crate) fn fault_counts(&self) -> Faults {
+        Faults {
+            minor: self.minor_faults(),
+            major: self.major_faults.load(std::sync::atomic::Ordering::SeqCst),
+        }
     }
 }
 
@@ -598,16 +664,35 @@ impl paludarium_mmu::faults::Sink for Usage {
     fn forced(&self) -> &std::sync::atomic::AtomicU64 {
         &self.forced_faults
     }
-    fn fault(&self, kernel: bool, nth: u64, at: paludarium_mmu::faults::At) {
+    fn major(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.major_faults
+    }
+    fn fault(&self, kernel: bool, major: bool, nth: u64, at: paludarium_mmu::faults::At) {
         let mut addresses = self
             .fault_addresses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let latest = &mut addresses[usize::from(kernel)];
+        // The count of the other kind as this one is taken. The kernel's
+        // accesses alone take major faults.
+        let load =
+            |count: &std::sync::atomic::AtomicU64| count.load(std::sync::atomic::Ordering::SeqCst);
+        let other = match (major, kernel) {
+            (true, true) => load(&self.kernel_faults),
+            (true, false) => load(&self.faults),
+            (false, true) => load(&self.major_faults),
+            (false, false) => 0,
+        };
         if latest.len() == FAULT_ADDRESSES {
             latest.pop_front();
         }
-        latest.push_back((nth, at));
+        let (minor, major_count) = if major { (other, nth) } else { (nth, other) };
+        latest.push_back(FaultAt {
+            minor,
+            major: major_count,
+            is_major: major,
+            at,
+        });
     }
 }
 /// How many of a thread's latest faults keep their addresses, for the
@@ -1543,6 +1628,7 @@ impl Kernel {
             };
             io_uring::run_task_work(&mut ctx);
         }
+        let mut delivered = false;
         while let Some(index) = signals::next_pending(&thread.state, false) {
             let mut signal = thread.state.pending.remove(index);
             // A traced thread reports each signal but SIGKILL to its tracer
@@ -1676,7 +1762,16 @@ impl Kernel {
             }
             if stepped {
                 self.ptrace_handler_entered(thread, &mut restart);
+                return Next::Resume;
             }
+            // Linux's way back to user space sets up a frame for each signal
+            // it may deliver, the next on this one, before any handler runs
+            // (`exit_to_user_mode_loop`); only the first restarts the call.
+            restart.number = None;
+            restart.seccomp = None;
+            delivered = true;
+        }
+        if delivered {
             return Next::Resume;
         }
         // The temporary wait mask ends with no handler run, unless the

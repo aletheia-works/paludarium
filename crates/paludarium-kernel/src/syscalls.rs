@@ -2523,6 +2523,26 @@ pub(crate) fn below_min(c: &Context<'_>, addr: u64, len: u64) -> bool {
     addr < paludarium_mmu::MMAP_MIN_ADDR && fits && !c.process.credentials.may_map_low()
 }
 
+/// How a new mapping of `len` bytes with `flags` is locked, by `MAP_LOCKED`
+/// or `mlockall`'s `MCL_FUTURE`: it needs `can_do_mlock` (`EPERM`, for
+/// `MAP_LOCKED`) and room under `RLIMIT_MEMLOCK` (`mlock_future_ok`,
+/// `EAGAIN`).
+fn new_lock(c: &Context<'_>, flags: u64, len: u64) -> Result<Option<paludarium_mmu::Lock>, Errno> {
+    let future = c.mem.future_lock();
+    let lock = match (flags & MAP_LOCKED != 0, future) {
+        (true, Some(paludarium_mmu::Lock::OnFault)) => Some(paludarium_mmu::Lock::OnFault),
+        (true, _) => Some(paludarium_mmu::Lock::Populated),
+        (false, future) => future,
+    };
+    if flags & MAP_LOCKED != 0 && !can_do_mlock(c) {
+        return Err(Errno::EPERM);
+    }
+    if lock.is_some() && !lock_fits(c, len.div_ceil(4096)) {
+        return Err(Errno::EAGAIN);
+    }
+    Ok(lock)
+}
+
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
     let Some(prot) = Prot::from_bits(prot) else {
@@ -2557,15 +2577,28 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         read_implies_exec(c.process, prot)
     };
     let file = descriptor.as_ref().map(|d| d.file.clone());
+    // Huge pages are anonymous: an ordinary file is refused
+    // (`ksys_mmap_pgoff`).
+    let huge = if flags & MAP_HUGETLB == 0 {
+        None
+    } else if file.is_some() {
+        return err(Errno::EINVAL);
+    } else {
+        match crate::hugetlb::length(len, flags) {
+            Ok(len) => Some(len),
+            Err(e) => return err(e),
+        }
+    };
     // A file maps shared, shared with its flags validated, or private;
     // anonymous memory shared, private or droppable (`do_mmap`).
-    // /dev/zero is a file there.
+    // /dev/zero is a file there. Huge pages are a hugetlbfs file's, whose
+    // type `hugetlb::mmap` checks where `do_mmap` checks a file's.
     let kinds: &[u64] = if file.is_some() {
         &[MAP_SHARED, MAP_SHARED_VALIDATE, MAP_PRIVATE]
     } else {
         &[MAP_SHARED, MAP_PRIVATE, MAP_DROPPABLE]
     };
-    if len == 0 || !kinds.contains(&(flags & MAP_TYPE)) {
+    if len == 0 || (huge.is_none() && !kinds.contains(&(flags & MAP_TYPE))) {
         return err(Errno::EINVAL);
     }
     let droppable = flags & MAP_TYPE == MAP_DROPPABLE;
@@ -2573,6 +2606,28 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // drops it.
     let unknown = flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !LEGACY_MAP_MASK != 0;
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    if let Some(len) = huge {
+        let request = crate::hugetlb::Request {
+            addr,
+            len,
+            prot,
+            shared: flags & MAP_SHARED != 0,
+            offset,
+            fixed,
+            noreplace: flags & MAP_FIXED_NOREPLACE != 0,
+            low: flags & MAP_32BIT != 0,
+            grows_down: flags & MAP_GROWSDOWN != 0,
+            no_reserve: flags & MAP_NORESERVE != 0,
+            stack: flags & MAP_STACK != 0,
+            refused_type: match flags & MAP_TYPE {
+                MAP_SHARED | MAP_PRIVATE => None,
+                MAP_SHARED_VALIDATE if unknown => Some(Errno::EOPNOTSUPP),
+                MAP_SHARED_VALIDATE => None,
+                _ => Some(Errno::EINVAL),
+            },
+        };
+        return crate::hugetlb::mmap(c, &request, |c| new_lock(c, flags, len).map(drop));
+    }
     // A ring of io_uring maps its own pages. It is asked for them before
     // the mapping is placed, with the address asked for, which Linux rounds
     // down to its page unless it is fixed (`round_hint_to_min`).
@@ -2675,21 +2730,10 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             },
         }
     };
-    // A locked mapping, by MAP_LOCKED or `mlockall`'s MCL_FUTURE, needs
-    // `can_do_mlock` (EPERM, for MAP_LOCKED) and room under RLIMIT_MEMLOCK
-    // (`mlock_future_ok`, EAGAIN).
-    let future = c.mem.future_lock();
-    let lock = match (flags & MAP_LOCKED != 0, future) {
-        (true, Some(paludarium_mmu::Lock::OnFault)) => Some(paludarium_mmu::Lock::OnFault),
-        (true, _) => Some(paludarium_mmu::Lock::Populated),
-        (false, future) => future,
+    let lock = match new_lock(c, flags, len) {
+        Ok(lock) => lock,
+        Err(e) => return err(e),
     };
-    if flags & MAP_LOCKED != 0 && !can_do_mlock(c) {
-        return err(Errno::EPERM);
-    }
-    if lock.is_some() && !lock_fits(c, len.div_ceil(4096)) {
-        return err(Errno::EAGAIN);
-    }
     // Only private anonymous memory grows down (a file's is refused in
     // `check_mappable`). Droppable memory is neither locked nor of huge
     // pages either.
@@ -3298,6 +3342,13 @@ fn sys_set_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    match madvise(c, a) {
+        Ok(v) => ok(v),
+        Err(e) => err(e),
+    }
+}
+
+pub(crate) fn madvise(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (mem, credentials) = (c.mem, c.process.credentials.clone());
     let mut removing = |from, to| crate::userfaultfd::remove(c, from, to);
     let mut poisoned = None;
@@ -3313,10 +3364,7 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if let Some(page) = poisoned {
         signals::queue(c.process, poisoned_sigbus(page));
     }
-    match result {
-        Ok(()) => ok(0),
-        Err(e) => err(e),
-    }
+    result.map(|()| 0)
 }
 
 /// `madvise(addr, len, advice)` on `mem`, which `process_madvise` gives
@@ -3377,7 +3425,8 @@ pub(crate) fn advise(
         return Err(Errno::ENOMEM);
     }
     // A `VM_PFNMAP` VMA's pages are not dropped, nor without
-    // `MADV_DONTNEED_LOCKED` a locked one's (`madvise_dontneed_free_valid_vma`).
+    // `MADV_DONTNEED_LOCKED` a locked one's, nor huge pages from within one
+    // (`madvise_dontneed_free_valid_vma`).
     if advice == MADV_DONTNEED_LOCKED || advice == MADV_DONTNEED {
         let stop = mem.first_undiscardable(GuestAddr(addr), end, advice == MADV_DONTNEED);
         return short_of(mem, addr, end, stop, true, |to| {
@@ -3450,7 +3499,8 @@ pub(crate) fn advise(
     }
     // MADV_COLD and MADV_PAGEOUT take no locked VMA (`can_madv_lru_vma`).
     if advice == MADV_COLD || advice == MADV_PAGEOUT {
-        return short_of_locked(mem, addr, end, false, |to| covered(mem, addr, to));
+        let stop = mem.first_off_lru(GuestAddr(addr), end);
+        return short_of(mem, addr, end, stop, false, |to| covered(mem, addr, to));
     }
     covered(mem, addr, end)
 }
@@ -4908,30 +4958,32 @@ fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
 pub(crate) const SYSINFO_RAM: u64 = 4 << 30;
 
 /// What a `struct rusage` tells: CPU time in nanoseconds, the peak
-/// resident size in pages, the minor faults and the voluntary context
-/// switches.
+/// resident size in pages, the minor and major faults and the voluntary
+/// context switches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourceUsage {
     pub cpu: u64,
     pub peak: u64,
-    pub minor_faults: u64,
+    pub faults: crate::Faults,
     pub switches: u64,
 }
 
 /// A `struct rusage` with `usage.cpu` nanoseconds as user time,
-/// `usage.peak` pages as `ru_maxrss` in KiB, `usage.minor_faults` as
-/// `ru_minflt` and `usage.switches` as `ru_nvcsw`. The emulator's own work
-/// for the guest's system calls happens in user space on the host, so the
-/// system time is 0; every page a file's mapping reads is taken to be in
-/// the page cache, so no fault is major (`ru_majflt` is 0); nothing
-/// preempts a guest thread, so it switches only when it sleeps
-/// (`ru_nivcsw` is 0); and the other counts are not kept.
+/// `usage.peak` pages as `ru_maxrss` in KiB, `usage.faults` as `ru_minflt`
+/// and `ru_majflt` and `usage.switches` as `ru_nvcsw`. The emulator's own
+/// work for the guest's system calls happens in user space on the host, so
+/// the system time is 0; every page a file's mapping reads is taken to be
+/// in the page cache, so the only major faults are those of the kernel's
+/// accesses that a `userfaultfd` had try again; nothing preempts a guest
+/// thread, so it switches only when it sleeps (`ru_nivcsw` is 0); and the
+/// other counts are not kept.
 pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
     let mut bytes = [0u8; 144];
     bytes[..8].copy_from_slice(&(usage.cpu / 1_000_000_000).to_le_bytes());
     bytes[8..16].copy_from_slice(&(usage.cpu % 1_000_000_000 / 1000).to_le_bytes());
     bytes[32..40].copy_from_slice(&(usage.peak * 4).to_le_bytes());
-    bytes[64..72].copy_from_slice(&usage.minor_faults.to_le_bytes());
+    bytes[64..72].copy_from_slice(&usage.faults.minor.to_le_bytes());
+    bytes[72..80].copy_from_slice(&usage.faults.major.to_le_bytes());
     bytes[128..136].copy_from_slice(&usage.switches.to_le_bytes());
     bytes
 }
@@ -4941,9 +4993,10 @@ pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
 /// [`rusage`] lays it out; any other `who` is `EINVAL`. `ru_maxrss` is the
 /// process's peak resident size for the first two, as Linux takes
 /// `signal->maxrss` and the address space's high-water mark for both, and
-/// the largest of the reaped children's for RUSAGE_CHILDREN. The minor
-/// faults are the process's threads' (`signal->min_flt` and each thread's
-/// `min_flt`), the thread's, or the reaped children's (`cmin_flt`), as of
+/// the largest of the reaped children's for RUSAGE_CHILDREN. The faults
+/// are the process's threads' (`signal->min_flt` and each thread's
+/// `min_flt`, and so `maj_flt`), the thread's, or the reaped children's
+/// (`cmin_flt` and `cmaj_flt`), as of
 /// each thread's latest system call, and so are the voluntary context
 /// switches (`signal->nvcsw` and each thread's `nvcsw`, or `cnvcsw`).
 fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
@@ -4953,13 +5006,13 @@ fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         0 => ResourceUsage {
             cpu: c.group.process_cpu(),
             peak: own(),
-            minor_faults: c.group.process_faults(),
+            faults: c.group.process_faults(),
             switches: c.group.process_switches(),
         },
         1 => ResourceUsage {
             cpu: thread,
             peak: own(),
-            minor_faults: c.process.cpu.used.minor_faults(),
+            faults: c.process.cpu.used.fault_counts(),
             switches: c
                 .process
                 .cpu
@@ -4970,7 +5023,7 @@ fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         -1 => ResourceUsage {
             cpu: c.processes.children_cpu(c.process.pid),
             peak: c.group.children_peak(),
-            minor_faults: c.group.children_faults(),
+            faults: c.group.children_faults(),
             switches: c.group.children_switches(),
         },
         _ => return err(Errno::EINVAL),

@@ -434,8 +434,10 @@ mod linux {
                     | "veth-ipv6-source"
                     | "veth-hash-seed"
                     | "veth-ipv6-kept"
+                    | "veth-hash-policy"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
+                    | "veth-unicast-if"
                     | "veth-multicast"
                     | "veth-ipv6-multicast"
                     | "multicast-sources"
@@ -687,8 +689,10 @@ mod linux {
         veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
         veth_hash_seed => ("veth-hash-seed","veth-hash-seed"),
         veth_ipv6_kept => ("veth-ipv6-kept","veth-ipv6-kept"),
+        veth_hash_policy => ("veth-hash-policy","veth-hash-policy"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
+        veth_unicast_if => ("veth-unicast-if","veth-unicast-if"),
         veth_multicast => ("veth-multicast","veth-multicast"),
         veth_ipv6_multicast => ("veth-ipv6-multicast","veth-ipv6-multicast"),
         multicast_sources => ("multicast-sources","multicast-sources"),
@@ -1106,6 +1110,7 @@ mod linux {
         processes_timer_waits_plain => ("timer-waits-plain","timer-waits"),
         processes_timer_waits_restart => ("timer-waits-restart","timer-waits"),
         processes_timer_waits_default => ("timer-waits-default","timer-waits"),
+        processes_exec_pending => ("exec-pending","exec-pending"),
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),
@@ -1133,6 +1138,7 @@ mod linux {
         processes_anon_thp_placement => ("anon-thp-placement","process"),
         processes_mmap_32bit => ("mmap-32bit","process"),
         processes_mmap_low => ("mmap-low","process"),
+        processes_mmap_hugetlb => ("mmap-hugetlb","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_file_code => ("file-code","process"),
@@ -1155,6 +1161,8 @@ mod linux {
         processes_proc_sizes => ("proc-sizes","process"),
         processes_proc_stat_counters => ("proc-stat-counters","process"),
         processes_loadavg_running => ("loadavg-running","process"),
+        processes_proc_cpuinfo => ("proc-cpuinfo","process"),
+        processes_status_memory => ("status-memory","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),
@@ -1194,6 +1202,7 @@ mod linux {
         processes_io_uring_placement => ("io-uring-placement","process"),
         processes_io_uring_timeout => ("io-uring-timeout","process"),
         processes_io_uring_poll_add => ("io-uring-poll-add","process"),
+        processes_io_uring_fs => ("io-uring-fs","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

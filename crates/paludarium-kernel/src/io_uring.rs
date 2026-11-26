@@ -5,7 +5,10 @@
 //! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
 //! `IORING_OP_ASYNC_CANCEL` ([`cancel`]), the timeouts `IORING_OP_TIMEOUT`,
 //! `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT` ([`timeout`]), the polls
-//! `IORING_OP_POLL_ADD` and `_POLL_REMOVE` ([`poll`]), and the single-shot
+//! `IORING_OP_POLL_ADD` and `_POLL_REMOVE` ([`poll`]), the file requests
+//! `IORING_OP_OPENAT`, `_OPENAT2`, `_CLOSE`, `_STATX`, `_FALLOCATE`,
+//! `_FADVISE`, `_MADVISE`, `_RENAMEAT`, `_UNLINKAT`, `_MKDIRAT`,
+//! `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE` ([`fs`]), and the single-shot
 //! socket requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
 //! `_SEND` and `_RECV` ([`net`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
@@ -46,6 +49,7 @@ use paludarium_types::{Errno, GuestAddr};
 
 use crate::syscalls::{Context, Outcome, err, ok};
 
+mod fs;
 mod net;
 mod poll;
 mod timeout;
@@ -161,6 +165,10 @@ const OPS: [u8; 24] = [
     poll::OP_POLL_ADD,
     poll::OP_POLL_REMOVE,
 ];
+/// Whether operation `opcode` runs.
+fn supported(opcode: u8) -> bool {
+    OPS.contains(&opcode) || fs::OPS.contains(&opcode)
+}
 /// `IORING_OP_LAST` of Linux 6.12, after `IORING_OP_LISTEN`.
 const OP_LAST: u8 = 58;
 
@@ -859,6 +867,8 @@ enum Work {
     Timeout(Box<timeout::Timeout>),
     /// `IORING_OP_TIMEOUT_REMOVE`.
     TimeoutRemove(Box<timeout::Remove>),
+    /// A file request ([`fs`]).
+    Fs(Box<fs::Fs>),
     /// `IORING_OP_POLL_ADD` ([`poll`]).
     Poll(Box<poll::Poll>),
     /// `IORING_OP_POLL_REMOVE`.
@@ -1188,7 +1198,7 @@ impl Ring {
         // receive their flags there (`ioprio`).
         let takes_ioprio =
             transfer || matches!(opcode, net::OP_ACCEPT | net::OP_SEND | net::OP_RECV);
-        if OPS.contains(&opcode) && !takes_ioprio && u16::from_le_bytes([sqe[2], sqe[3]]) != 0 {
+        if supported(opcode) && !takes_ioprio && u16::from_le_bytes([sqe[2], sqe[3]]) != 0 {
             return fail(request, Errno::EINVAL);
         }
         // No personality is ever registered.
@@ -1224,6 +1234,7 @@ impl Ring {
                     || u16::from_le_bytes([sqe[40], sqe[41]]) != 0
                     || int_at(44) != 0
                     || u32_at(sqe, 28) & !FSYNC_DATASYNC != 0
+                    || (u64_at(sqe, 8) as i64) < 0
                 {
                     return fail(request, Errno::EINVAL);
                 }
@@ -1319,6 +1330,10 @@ impl Ring {
                     Err(e) => return fail(request, e),
                 }
             }
+            _ if fs::OPS.contains(&opcode) => match fs::prepare(opcode, flags, sqe) {
+                Ok(work) => work,
+                Err(e) => return fail(request, e),
+            },
             poll::OP_POLL_ADD | poll::OP_POLL_REMOVE => {
                 match poll::prepare(opcode, flags, fixed, sqe) {
                     Ok(work) => work,
@@ -1399,6 +1414,7 @@ fn prepare_memory(c: &Context<'_>, ring: &Ring, request: &mut Request, addr: u64
         }
         Work::Transfer(transfer) => prepare_transfer(c, transfer),
         Work::Net(net) => net::prepare_memory(c, net),
+        Work::Fs(fs) => fs::prepare_memory(c, fs),
         Work::Timeout(timeout) => timeout::prepare_memory(c, ring, timeout),
         Work::TimeoutRemove(remove) => timeout::prepare_update(c, remove),
         _ => Ok(()),
@@ -1776,6 +1792,20 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
     let result = |r: Result<u64, Errno>| r.map_or_else(|e| -e.0, |v| v as i32);
     match work {
         Work::Net(net) => return net::run(c, ring, net),
+        Work::Fs(fs) => {
+            let (res, failed) = fs::run(c, ring, fs);
+            return (res, 0, failed, None);
+        }
+        // `io_fsync`: `vfs_fsync_range`, `EINVAL` for a file without
+        // `fsync`; nothing is cached, so the range and `IORING_FSYNC_DATASYNC`
+        // change nothing.
+        // `io_fsync` fails no link but for a file it does not find.
+        &mut Work::Fsync { fd, fixed } => {
+            return match file_of(c, ring, fd, fixed) {
+                Ok(found) => (result(found.file.sync().map(|()| 0)), 0, false, None),
+                Err(e) => (-e.0, 0, true, None),
+            };
+        }
         Work::Transfer(work) => {
             // A transfer of fewer bytes than it asked for fails its link too
             // (`__io_complete_rw_common`), though its result is the count.
@@ -1816,13 +1846,6 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
                 Err(e) => -e.0,
             }
         }
-        // `io_fsync`: `vfs_fsync_range`, `EINVAL` for a file without
-        // `fsync`; nothing is cached, so the range and `IORING_FSYNC_DATASYNC`
-        // change nothing.
-        &Work::Fsync { fd, fixed } => result(file_of(c, ring, fd, fixed).and_then(|d| {
-            d.file.sync()?;
-            Ok(0)
-        })),
         // `io_async_cancel`: the file of `IORING_ASYNC_CANCEL_FD`, which
         // `EBADF` fails without, then the requests.
         &Work::Cancel { key, fixed } => result((|| {
@@ -1852,7 +1875,9 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
             bgid,
             bid,
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
-        Work::Transfer(_)
+        Work::Fs(_)
+        | Work::Fsync { .. }
+        | Work::Transfer(_)
         | Work::Net(_)
         | Work::Timeout(_)
         | Work::Poll(_)
@@ -4296,7 +4321,7 @@ fn probe(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     probe[1] = count as u8;
     for op in 0..count as usize {
         probe[16 + 8 * op] = op as u8;
-        if OPS.contains(&(op as u8)) {
+        if supported(op as u8) {
             probe[16 + 8 * op + 2..16 + 8 * op + 4].copy_from_slice(&OP_SUPPORTED.to_le_bytes());
         }
     }

@@ -633,7 +633,7 @@ impl crate::Processes {
         crate::syscalls::ResourceUsage {
             cpu: group.process_cpu().saturating_add(children_cpu),
             peak: group.waited_peak(),
-            minor_faults: group.waited_faults(),
+            faults: group.waited_faults(),
             switches: group.waited_switches(),
         }
     }

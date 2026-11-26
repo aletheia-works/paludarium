@@ -21,9 +21,9 @@ pub struct GeneratedSource {
     /// Its mount's flags ([`mount_flags`]), which the new mount takes.
     pub flags: u32,
     /// Whether a walk finds only its root, not a directory at each name
-    /// below: the kernel's own `/dev` where it is, whose names the kernel
-    /// finds by their paths, and below which a walk goes only into the
-    /// mounts on it (`/dev/shm`).
+    /// below: the kernel's own `/proc` and `/dev` where they are, whose
+    /// names the kernel finds by their paths, and below which a walk goes
+    /// only into the mounts on them (`/dev/shm`).
     pub shallow: bool,
 }
 impl GeneratedSource {
@@ -233,20 +233,32 @@ impl NamespacedFs {
             backing: Backing::Generated(Arc::new(GeneratedFs(source))),
         }
     }
-    /// The mounts Linux has from start-up in the kernel's own `/dev`: that
-    /// directory itself, `devices` (a stand-in, [`GeneratedSource::shallow`],
-    /// the lower filesystem need have no `/dev`), and the tmpfs `shm` on
-    /// its `/shm`, as systemd mounts `/dev/shm`. Before any other mount.
-    pub fn mount_devices(&self, devices: GeneratedSource, shm: NewTmpfs) -> Result<(), Errno> {
+    /// The mounts Linux has from start-up of the kernel's own files:
+    /// `proc` on `/proc`, `devices` on `/dev` (stand-ins,
+    /// [`GeneratedSource::shallow`], so the lower filesystem need have
+    /// neither, and what it has there is not reached), and the tmpfs `shm`
+    /// on `/dev/shm`, as systemd mounts them. Before any other mount.
+    pub fn mount_devices(
+        &self,
+        proc: GeneratedSource,
+        devices: GeneratedSource,
+        shm: NewTmpfs,
+    ) -> Result<(), Errno> {
         let entries = self.table.snapshot();
         if entries.iter().any(Entry::runtime) {
             return Err(Errno(16)); // EBUSY
         }
-        let point = devices.machine_path(b"/");
-        let parent = entries[self.table.boot_index(&entries, &point)].id();
+        let on_boot = |source: &GeneratedSource| {
+            let point = source.machine_path(b"/");
+            (entries[self.table.boot_index(&entries, &point)].id(), point)
+        };
+        let (parent, point) = on_boot(&proc);
+        let proc = self.generated_entry(proc, parent, point, 0, 0);
+        let (parent, point) = on_boot(&devices);
         let devices = self.generated_entry(devices, parent, point.clone(), 0, 0);
         let shm = self.new_entry(shm, devices.id(), joined(&point, b"/shm"));
         self.table.update(|entries| {
+            entries.push(proc);
             entries.push(devices);
             entries.push(shm);
             Ok(())

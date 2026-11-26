@@ -72,9 +72,17 @@ verified.
   cache has no large folios, whose size each file system picks. `pagemap`
   shows the same pages.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
-  no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `ht` (`MAP_HUGETLB`). A page of a host file
+  no huge pages and the CPU has no protection keys. A page of a host file
   that `write` filled is clean (see "Pages `write` filled" below).
+- **Huge pages**: the pool of hugetlbfs is empty and cannot be filled. There
+  is no `/proc/sys/vm/nr_hugepages` (so no write to it), no
+  `/sys/kernel/mm/hugepages`, and `hugetlbfs` cannot be mounted (`ENODEV`),
+  though `sysfs` lists it. `MFD_HUGETLB` and `SHM_HUGETLB` give `ENOSYS`, as
+  from a kernel without hugetlbfs, where Linux with an empty pool makes a
+  memfd, and gives `EPERM` or `ENOMEM` for a segment. `MAP_HUGETLB` of
+  1 GiB pages is `EINVAL`, as on a CPU without them; the differential tests
+  do not compare it. `userfaultfd` does not register such a mapping, and
+  the mapping's device in `maps` is 0.
 - **`/proc/<pid>/mem`'s offsets past `i64::MAX`**: `pread64` and
   `pwrite64` refuse them (`EINVAL`), as Linux v7.0's `ksys_pread64` and
   `ksys_pwrite64` do for every file, where Linux master takes them for a
@@ -132,15 +140,20 @@ verified.
   datagrams and messages take is 0, and so is a TCP connection's `quick` with
   `pingpong`; no timer shows while it waits for an acknowledgement. `netlink` leaves out
   the kernel's own sockets, whose port is 0.
+- **`/proc/cpuinfo` of the virtual CPU**: `bogomips` is 0.00 and there is no
+  `cpu MHz`, as `CPUID` reports no time stamp counter though `RDTSC` works;
+  `initial apicid` is 0 on every CPU, as `CPUID`'s leaf 1 gives no CPU its
+  own ID; and `bugs` lists what Linux 7.0 assumes of an AMD CPU of family
+  15, though the virtual CPU does not speculate.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/version`, `/proc/cmdline`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
-  the reader's own directory (`stack`, `sched`, ...) are looked up like any
-  path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `stack`
-  and the rest. `wchan` is `0` for a waiting task too, where Linux names the
+  the reader's own directory (`stack`, `sched`, ...) are `ENOENT`, as in
+  another process's directory, whatever the filesystem holds there (with
+  `--mount /:/`, the host's `/proc`), where Linux shows them, and root
+  `stack` and the rest of another's. `wchan` is `0` for a waiting task too, where Linux names the
   kernel function it waits in for a reader that may read the task: there are
   no kernel functions here to name. A poll of an epoll that watches several
   of `hostname` and `domainname` polls them by descriptor number until one is
@@ -159,6 +172,10 @@ verified.
   threads went to sleep, as nothing preempts a guest thread, so `status` shows
   those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`,
   and `getrusage` and a wait's rusage as `ru_nvcsw` and 0 as `ru_nivcsw`.
+  `status` has no `VmPin` or `VmPTE`, as nothing counts the pages pinned
+  (`pinned_vm`) or the bytes of the page tables, and none of the lines
+  Linux writes after the memory ones (`CoreDumping`, `THP_enabled`,
+  `untag_mask`).
   Another process's thread is `S (sleeping)` in every wait, where Linux shows
   some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
   process what it published at its last system call or signal check, so a mask
@@ -197,7 +214,9 @@ verified.
   `/dev`, its devices and links, `/proc` or `/proc`'s system-wide files, which only
   root may give these files of root's, is `EPERM`, where Linux keeps it;
   a pseudo-terminal's slave keeps its own. Times set on a generated file
-  are not kept either: its `stat` shows the times it had.
+  are not kept either: its `stat` shows the times it had. Removing or
+  renaming a generated name (`unlink`, `rmdir`, `rename`) gives `ENOENT`,
+  where Linux gives `EPERM`.
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be
@@ -321,9 +340,14 @@ verified.
   with its file's bytes and counts a fault for each page then, where Linux
   maps the file and counts the faults as the program first touches the
   pages, a read fault for several of them at once (`fault_around_bytes`);
-  these faults are no `perf` event. No fault is major (`ru_majflt` is 0),
-  as every page of a file is taken to be in the page cache. `/proc/<pid>/stat`'s
-  `minflt` and `cminflt` read the same counts, with the same limits.
+  these faults are no `perf` event. Every page of a file is taken to be in
+  the page cache, so the only major faults (`ru_majflt`, `major-faults`)
+  are those of the kernel's accesses that a `userfaultfd` had try again.
+  Each is counted as its wait ends, so one whose retry waits again (after
+  a `UFFDIO_WAKE` that filled nothing) and then fails with a fatal signal
+  has counted one, where Linux counts none. `/proc/<pid>/stat`'s `minflt`,
+  `cminflt`, `majflt` and `cmajflt` read the same counts, with the same
+  limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
   are hardware events even on a host with a PMU: cycles and cache misses
@@ -559,7 +583,10 @@ verified.
   `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
   `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, `IORING_OP_TIMEOUT`,
   `_TIMEOUT_REMOVE`, `_LINK_TIMEOUT`, `IORING_OP_POLL_ADD`,
-  `_POLL_REMOVE`, and the single-shot socket requests
+  `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
+  `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
+  `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
+  single-shot socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
   and `_RECV` run; the other operations complete with `EOPNOTSUPP`. Of the
   socket requests, a multishot accept or receive, a bundle
@@ -570,9 +597,11 @@ verified.
   differential tests run on; Linux master moves the bytes of a registered
   buffer. This follows master once the test runners' kernel does. A
   receive with `MSG_WAITALL` whose datagram was cut does not fail its
-  link, where Linux's does. An `IORING_OP_SHUTDOWN` runs while
-  `io_uring_enter` takes it, where Linux's runs in a worker, so its
-  completion can come before those Linux posts first. A timeout expires at
+  link, where Linux's does. An `IORING_OP_SHUTDOWN`, an `IORING_OP_FSYNC`
+  and a file request run while `io_uring_enter` takes them, where Linux
+  runs them, but for a close and some opens and advice, in a worker, so
+  their completions can come before those Linux posts first, and an open of
+  a FIFO that may create it waits there. A timeout expires at
   the checkpoints where its process can run: one due while every thread
   sleeps in `nanosleep` completes as the sleep ends, where Linux's timer
   completes it then. A thread that exits alone leaves its polls of rings
@@ -747,7 +776,7 @@ verified.
   - The kernel log that `syslog` reads is always empty, where Linux's holds
     its boot messages, and `kernel.dmesg_restrict` is always 1 (there is no
     `/proc/sys/kernel/dmesg_restrict`, `/proc/kmsg` or `/dev/kmsg`).
-    `sysfs` knows only seven file system types, where Linux has dozens, so
+    `sysfs` knows only nine file system types, where Linux has dozens, so
     their indexes differ from Linux's though not their order. There is no
     AppArmor or SELinux: `lsm_list_modules` lists four modules, and
     `lsm_get_self_attr` finds no attribute where Linux gives AppArmor's
@@ -888,8 +917,8 @@ verified.
   namespace the caller is in now). A file a bind mount of a generated
   file shows has, in `statx` and `/proc/self/fdinfo`, the mount ID of
   `/dev` or `/proc`, not the bind mount's. Of the mounts Linux has under
-  `/proc` and `/dev`, the table has only `/dev` itself and the tmpfs on
-  `/dev/shm`, not `/proc`, `/dev/pts`, `/dev/mqueue` or
+  `/proc` and `/dev`, the table has only `/proc` and `/dev` themselves and
+  the tmpfs on `/dev/shm`, not `/dev/pts`, `/dev/mqueue` or
   `/proc/sys/fs/binfmt_misc`: a bind mount of `/proc` or `/dev` (or a
   directory in them) still shows what is generated in those directories,
   and what is in `/dev/shm`, where Linux shows their empty mount points,
@@ -968,7 +997,8 @@ verified.
   root's `/proc` and `/dev` after `pivot_root`, where Linux's go to
   `put_old` with the old root, and at `/proc` and `/dev` in a namespace
   from `open_tree`'s `OPEN_TREE_NAMESPACE`, where Linux has them only
-  where the copy has their mounts. A move or a `pivot_root` takes the roots
+  where the copy has their mounts. `umount2` of either gives `EINVAL`,
+  where Linux unmounts it. A move or a `pivot_root` takes the roots
   and working directories along, but an open descriptor keeps the path it
   was opened at for what it does by path (`fchdir`, a lookup from it).
   Mounts are kept by their mount
@@ -1152,7 +1182,11 @@ verified.
   `sk_rethink_txhash`), but here a connection's path is settled as it
   opens, so a hop whose answers do not come back fails it. An ICMPv6 error
   takes the hop of its own flow, where Linux's takes that of the packet
-  it tells of (`icmp6_send`). A UDP
+  it tells of (`icmp6_send`). Under `fib_multipath_hash_policy` 1, and 3
+  with a port field, a socket's flow hashes with no ports, where Linux's
+  hashes its ports, and a random source port for one that has none yet
+  (`FLOWI_FLAG_ANY_SPORT`), so its hop may not be Linux's; the ports of
+  `RTM_GETROUTE` hash as Linux's do. A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
@@ -1232,12 +1266,14 @@ verified.
   (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
   takes `accept_local`, `send_redirects`, `shared_media` and
   `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward`,
-  `fib_multipath_hash_seed` and the `forwarding`, `rp_filter`,
+  `fib_multipath_hash_seed`, `fib_multipath_hash_policy`,
+  `fib_multipath_hash_fields` and the `forwarding`, `rp_filter`,
   `accept_dad` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
-  A write of `fib_multipath_hash_seed` is taken whole and leaves the file
-  where it was, as Linux 7.0 to 7.2 do; master takes what it reads and
+  A write of `fib_multipath_hash_seed`, `fib_multipath_hash_policy` or
+  `fib_multipath_hash_fields` is taken whole and leaves the file where it
+  was, as Linux 7.0 to 7.2 do; master takes what it reads and
   moves the file on (`proc_vec`).
   IPv6's `forwarding` joins no router anycast address, and an end made
   while `default`'s is on is in all three all-routers groups, where

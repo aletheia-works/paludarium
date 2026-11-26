@@ -260,7 +260,7 @@ pub struct Processes {
     /// goes on counting, as Linux's per-CPU counts keep a task's time.
     reaped_times: Mutex<crate::proc::CpuTimes>,
     /// The same of what they counted on each CPU ([`crate::CpuCounts`]).
-    reaped_counts: Mutex<Vec<[u64; 4]>>,
+    reaped_counts: Mutex<Vec<crate::Counts>>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -384,7 +384,7 @@ impl Processes {
     }
     /// What every process's threads counted on `cpu`, those reaped included,
     /// as [`crate::CpuCounts`] orders it.
-    pub(crate) fn counts_on(&self, cpu: u32) -> [u64; 4] {
+    pub(crate) fn counts_on(&self, cpu: u32) -> crate::Counts {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut counts = self
             .reaped_counts
@@ -1628,7 +1628,7 @@ impl Processes {
             let usage = crate::syscalls::ResourceUsage {
                 cpu: entry.group.process_cpu().saturating_add(entry.children_cpu),
                 peak: entry.group.waited_peak(),
-                minor_faults: entry.group.waited_faults(),
+                faults: entry.group.waited_faults(),
                 switches: entry.group.waited_switches(),
             };
             Some((pid, event, usage, entry.group.task_ids(pid, pid).uid))
@@ -1638,7 +1638,7 @@ impl Processes {
             && !wait.keep
         {
             match event {
-                // A reaped child's CPU time, minor faults and switches join its
+                // A reaped child's CPU time, faults and switches join its
                 // parent's children's, and its peak (its own or its
                 // children's) is kept as theirs if it is the largest. So do
                 // its read and write counts join its parent's process's.
@@ -1648,7 +1648,7 @@ impl Processes {
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(usage.cpu);
                         parent.group.reaped_peak(usage.peak);
-                        parent.group.reaped_faults(usage.minor_faults);
+                        parent.group.reaped_faults(usage.faults);
                         parent.group.reaped_switches(usage.switches);
                         if let Some(io) = io {
                             parent.group.reaped_io(io);
@@ -3553,8 +3553,7 @@ impl Kernel {
         if !space.is_first() && space.init() == Some(pid) {
             group.set_unkillable();
         }
-        // CLONE_CLEAR_SIGHAND resets handled signals to their default and
-        // keeps ignored ones, as execve does.
+        // CLONE_CLEAR_SIGHAND resets the actions as execve does.
         if flags & CLONE_CLEAR_SIGHAND != 0 {
             group.exec_actions();
         }
@@ -3618,7 +3617,7 @@ impl Kernel {
         }
         state.on_cpu = None;
         if flags & CLONE_CLEAR_SIGHAND != 0 {
-            state.signal_actions.retain(|_, action| action.handler == 1);
+            state.signal_actions = signals::flushed(&state.signal_actions);
         }
         let mut cpu = parent.cpu.clone();
         cpu.gpr[reg::RAX] = 0;
@@ -5177,13 +5176,7 @@ impl Kernel {
         // process and the mappings end.
         failing.interpreters.clear();
         self.group.set_exe_file(failing.exe.take().map(Arc::new));
-        let ignored = thread
-            .state
-            .signal_actions
-            .iter()
-            .filter(|(_, action)| action.handler == 1)
-            .map(|(&number, &action)| (number, action))
-            .collect();
+        let ignored = signals::flushed(&thread.state.signal_actions);
         // Its io_uring requests are cancelled and its task work runs, on the
         // old image's memory (`io_uring_task_cancel`).
         crate::io_uring::exec_task(&mut crate::syscalls::Context {
@@ -5207,6 +5200,9 @@ impl Kernel {
             pid: self.process.pid,
             signal_mask: thread.state.signal_mask,
             signal_actions: ignored,
+            // And the thread's pending signals: `de_thread` frees only the
+            // other threads, with what is pending for each of them.
+            pending: std::mem::take(&mut thread.state.pending),
             cpu,
             personality,
             arrivals: thread.state.arrivals,

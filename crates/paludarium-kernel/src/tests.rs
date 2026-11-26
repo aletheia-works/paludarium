@@ -2735,8 +2735,9 @@ fn statfs_and_the_generated_mount_table() {
     assert_eq!(f.ret(138, &[99, buf]), errno(Errno::EBADF));
     // The mount table: readable whole, a regular 0444 file, never writable.
     let table = b"21 1 0:1 / / rw,relatime - tmpfs tmpfs rw\n\
-22 21 0:1 / /dev rw,nosuid,noexec,relatime - devtmpfs devtmpfs rw\n\
-23 22 0:2 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw,inode64\n";
+22 21 0:1 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n\
+23 21 0:1 / /dev rw,nosuid,noexec,relatime - devtmpfs devtmpfs rw\n\
+24 23 0:2 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw,inode64\n";
     let fd = f.ret(2, &[mounts, 0, 0]);
     assert_eq!(f.ret(0, &[fd, buf, 0x100]), table.len() as u64);
     let mut read = vec![0; table.len()];
@@ -3364,6 +3365,83 @@ fn nothing_is_mapped_below_mmap_min_addr_without_cap_sys_rawio() {
     assert!(!starts(&f).iter().any(|&(start, _)| start == 0x1000));
     // Without MREMAP_FIXED, a free address asked for is refused as well.
     assert_eq!(f.ret(mremap, &[source, 4096, 4096, 5, 0x2000]), eperm);
+}
+#[test]
+fn huge_pages_come_from_an_empty_pool() {
+    const HUGE: u64 = 2 << 20;
+    let mut f = fixture();
+    let (mmap, mremap, at) = (syscalls::nr::MMAP, syscalls::nr::MREMAP, 0x6000_0000);
+    let (huge, none) = (0x4_0022, 0x4_4022);
+    let map = |f: &mut Fixture, at: u64, len: u64, flags: u64, offset: u64| {
+        f.ret(mmap, &[at, len, 3, flags, u64::MAX, offset])
+    };
+    for (flags, expected) in [
+        (huge, Errno::ENOMEM),
+        (huge | 21 << 26, Errno::ENOMEM),
+        (none | 20 << 26, Errno::EINVAL),
+        (none | 0x100, Errno::EINVAL),
+    ] {
+        assert_eq!(map(&mut f, 0, 1, flags, 0), errno(expected));
+    }
+    assert_eq!(map(&mut f, 0, 0, none, 0), errno(Errno::EINVAL));
+    assert_eq!(
+        map(&mut f, at + 4096, 1, none | 0x10, 0),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(map(&mut f, 0, 1, none, 4096), errno(Errno::EINVAL));
+    assert_eq!(
+        map(&mut f, 0, 1, none, i64::MAX as u64 & !4095),
+        errno(Errno::EOVERFLOW)
+    );
+    // What a refused fixed mapping replaces is gone.
+    assert_eq!(map(&mut f, at, 2 * HUGE, 0x32, 0), at);
+    assert_eq!(map(&mut f, at, 1, huge | 0x10, 0), errno(Errno::ENOMEM));
+    let first = f.mem.mappings().find(|m| m.end() > at).unwrap();
+    assert_eq!((first.start.0, first.end()), (at + HUGE, at + 2 * HUGE));
+    assert_eq!(
+        map(&mut f, at + HUGE, 1, none | 0x10_0000, 0),
+        errno(Errno::EEXIST)
+    );
+    for shared in [false, true] {
+        let flags = if shared { none ^ 3 } else { none };
+        assert_eq!(map(&mut f, at, 2 * HUGE - 4096, flags | 0x10, 0), at);
+        let mut byte = [0];
+        assert!(f.mem.read(GuestAddr(at), &mut byte).unwrap_err().bus);
+        assert!(f.mem.write(GuestAddr(at + HUGE), &byte).unwrap_err().bus);
+        let vma = f.mem.view().vma_from(at).unwrap();
+        assert_eq!((vma.start, vma.end), (at, at + 2 * HUGE));
+        let expected = paludarium_mmu::vm::HUGETLB
+            | paludarium_mmu::vm::DONTEXPAND
+            | paludarium_mmu::vm::NORESERVE;
+        let mask = expected | paludarium_mmu::vm::ACCOUNT;
+        assert_eq!(vma.flags & mask, expected);
+        let einval = errno(Errno::EINVAL);
+        assert_eq!(f.ret(syscalls::nr::MUNMAP, &[at, 4096]), einval);
+        assert_eq!(f.ret(syscalls::nr::MPROTECT, &[at, 4096, 1]), einval);
+        for advice in [4, 11, 20, 21, 102, 103] {
+            assert_eq!(f.ret(28, &[at + 4096, 4096, advice]), einval);
+        }
+        for advice in [4, 17] {
+            assert_eq!(f.ret(28, &[at, 4096, advice]), 0);
+        }
+        // Grown, moved off a boundary, or left behind by a move.
+        assert_eq!(f.ret(mremap, &[at, HUGE, HUGE + 1, 1, 0]), einval);
+        assert_eq!(
+            f.ret(mremap, &[at, HUGE, HUGE, 3, at + 4096 + 4 * HUGE]),
+            einval
+        );
+        assert_eq!(f.ret(mremap, &[at, HUGE, HUGE, 5, 0]), einval);
+        assert_eq!(f.ret(mremap, &[at, 1, 1, 3, at + 4 * HUGE]), at + 4 * HUGE);
+        let moved = f.mem.view().vma_from(at + 4 * HUGE).unwrap();
+        assert_eq!((moved.start, moved.end), (at + 4 * HUGE, at + 5 * HUGE));
+        assert!(
+            f.mem
+                .read(GuestAddr(moved.start), &mut byte)
+                .unwrap_err()
+                .bus
+        );
+        assert_eq!(f.ret(syscalls::nr::MUNMAP, &[at + HUGE, HUGE]), 0);
+    }
 }
 #[test]
 fn clone3_arguments_follow_linux() {
@@ -5226,8 +5304,8 @@ mod io_uring {
         assert_eq!(
             supported,
             [
-                0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 20, 22, 23, 26, 27, 29, 31, 32, 34,
-                45
+                0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+                26, 27, 28, 29, 31, 32, 34, 35, 36, 37, 38, 39, 45, 55
             ]
         );
         // A probe that is not zeroed, buffers without an argument, another
@@ -7232,6 +7310,149 @@ mod io_uring {
         expected = vec![(1, 1, 0)];
         assert_eq!(reap_flags(&mut f, &r), expected);
         assert_eq!(batch(&mut f, &r, &[poll_remove(2, 1, 0, 0, 0)]), [(2, -2)]);
+    }
+
+    /// A file request of `opcode`: `fd`, `off`, `addr`, `len` and `rw_flags`.
+    fn fs(opcode: u8, fd: i32, off: u64, addr: u64, len: u32, rw: u32) -> [u8; 64] {
+        let mut e = sqe(opcode, 1);
+        e[4..8].copy_from_slice(&fd.to_le_bytes());
+        e[8..16].copy_from_slice(&off.to_le_bytes());
+        e[16..24].copy_from_slice(&addr.to_le_bytes());
+        e[24..28].copy_from_slice(&len.to_le_bytes());
+        e[28..32].copy_from_slice(&rw.to_le_bytes());
+        e
+    }
+
+    fn named(f: &Fixture, at: u64, name: &[u8]) -> u64 {
+        f.mem.write(GuestAddr(at), name).unwrap();
+        f.mem
+            .write(GuestAddr(at + name.len() as u64), &[0])
+            .unwrap();
+        at
+    }
+
+    const CWD: i32 = -100;
+
+    #[test]
+    fn file_requests_run_their_calls() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let a = named(&f, DATA, b"/a");
+        let b = named(&f, DATA + 0x10, b"/b");
+        let d = named(&f, DATA + 0x20, b"/d");
+        let fd = one(&mut f, &r, &fs(18, CWD, 0, a, 0o600, 0o102));
+        assert!(fd > 2, "{fd}");
+        assert_eq!(one(&mut f, &r, &fs(55, fd, 100, 0, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(17, fd, 0, 200, 0, 0)), 0);
+        let stat = DATA + 0x800;
+        assert_eq!(one(&mut f, &r, &fs(21, CWD, stat, a, 0x7ff, 0)), 0);
+        assert_eq!(u32_at(&f, stat + 0x28), 200);
+        assert_eq!(one(&mut f, &r, &fs(24, fd, 0, 0, 0, 9)), -22);
+        assert_eq!(one(&mut f, &r, &fs(24, fd, 0, 0, 0, 1)), 0);
+        assert_eq!(one(&mut f, &r, &fs(25, 0, 0, DATA, 4096, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(39, CWD, b, a, CWD as u32, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(39, CWD, b, a, CWD as u32, 0)), -17);
+        assert_eq!(one(&mut f, &r, &fs(36, CWD, 0, b, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(35, CWD, b, a, CWD as u32, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(38, CWD, a, b, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(37, CWD, 0, d, 0o700, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(36, CWD, 0, d, 0, 0)), -21);
+        assert_eq!(one(&mut f, &r, &fs(36, CWD, 0, d, 0, 0x200)), 0);
+        assert_eq!(one(&mut f, &r, &fs(19, fd, 0, 0, 0, 0)), 0);
+        assert_eq!(one(&mut f, &r, &fs(19, fd, 0, 0, 0, 0)), -9);
+        assert_eq!(one(&mut f, &r, &fs(19, r.fd as i32, 0, 0, 0, 0)), -9);
+        // openat2, its how read first.
+        let how = DATA + 0x100;
+        f.mem.write(GuestAddr(how), &[0; 32]).unwrap();
+        assert_eq!(one(&mut f, &r, &fs(28, CWD, how, b, 23, 0)), -22);
+        let fd = one(&mut f, &r, &fs(28, CWD, how, b, 24, 0));
+        assert!(fd > 2, "{fd}");
+        f.mem.write_u64(GuestAddr(how + 8), 1).unwrap();
+        assert_eq!(one(&mut f, &r, &fs(28, CWD, how, b, 24, 0)), -22);
+    }
+
+    #[test]
+    fn file_requests_are_prepared_as_linux_does() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let a = named(&f, DATA, b"/a");
+        let empty = named(&f, DATA + 0x20, b"");
+        for opcode in [17, 18, 19, 21, 24, 25, 28, 35, 36, 37, 38, 39, 55] {
+            let mut e = fs(opcode, CWD, a, a, 24, 0);
+            e[40] = 1;
+            assert_eq!(one(&mut f, &r, &e), -22, "{opcode} buf_index");
+            e[2] = 1;
+            assert_eq!(one(&mut f, &r, &e), -22, "{opcode} ioprio");
+        }
+        for (opcode, off, len) in [
+            (18, 0, 0),
+            (21, a, 0),
+            (35, a, 0),
+            (36, 0, 0),
+            (37, 0, 0),
+            (38, a, 0),
+            (39, a, 0),
+        ] {
+            let mut e = fs(opcode, CWD, off, empty, len, 0);
+            assert_eq!(one(&mut f, &r, &e), -2, "{opcode} empty");
+            e = fs(opcode, CWD, off, 0, len, 0);
+            assert_eq!(one(&mut f, &r, &e), -14, "{opcode} null");
+            e[1] = 1;
+            assert_eq!(one(&mut f, &r, &e), -9, "{opcode} fixed");
+        }
+        // The slot of a close needs fd 0, and of an open no O_CLOEXEC.
+        let mut e = fs(19, 1, 0, 0, 0, 0);
+        e[44] = 1;
+        assert_eq!(one(&mut f, &r, &e), -22);
+        e = fs(18, CWD, 0, a, 0, 0o2000000);
+        e[44] = 1;
+        assert_eq!(one(&mut f, &r, &e), -22);
+        assert_eq!(one(&mut f, &r, &fs(36, CWD, 0, a, 0, 1)), -22);
+        assert_eq!(one(&mut f, &r, &fs(3, 0, u64::MAX, 0, 0, 0)), -22);
+    }
+
+    #[test]
+    fn an_open_goes_in_a_registered_slot_and_reads_its_name_first() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let a = named(&f, DATA, b"/a");
+        let fd = f.ret(2, &[a, 0o102, 0o600]);
+        f.mem.write(GuestAddr(DATA + 0x200), b"hello").unwrap();
+        assert_eq!(f.ret(1, &[fd, DATA + 0x200, 5]), 5);
+        let mut open = fs(18, CWD, 0, a, 0, 0);
+        open[44] = 1;
+        assert_eq!(one(&mut f, &r, &open), -6);
+        fds(&f, DATA + 0x400, &[-1, -1]);
+        assert_eq!(f.ret(427, &[r.fd, 2, DATA + 0x400, 2]), 0);
+        // The name is read as the entry is taken: a linked read before it
+        // writes another there.
+        assert_eq!(f.ret(8, &[fd, 0, 0]), 0);
+        let mut first = rw(READ, fd, 0, a, 5);
+        first[1] = 1 << 2;
+        first[32] = 5;
+        open[1] = 1 << 2;
+        let mut read = on_slot(READ, 0, 0, DATA + 0x800, 5);
+        read[32] = 7;
+        assert_eq!(
+            batch(&mut f, &r, &[first, open, read]),
+            [(5, 5), (1, 0), (7, 5)]
+        );
+        assert_eq!(bytes(&f, DATA + 0x800, 5), b"hello");
+        let mut close = fs(19, 0, 0, 0, 0, 0);
+        for (slot, expected) in [(1, 0), (1, -9), (3, -22)] {
+            close[44] = slot;
+            assert_eq!(one(&mut f, &r, &close), expected, "{slot}");
+        }
+        // A failed mkdir or fsync fails no link; a failed open does.
+        let d = named(&f, DATA + 0x20, b"/a");
+        let mut mkdir = fs(37, CWD, 0, d, 0o700, 0);
+        mkdir[1] = 1 << 2;
+        let after = nop(9, 0, 0, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[mkdir, after]), [(1, -17), (9, 0)]);
+        let missing = named(&f, DATA + 0x30, b"/none");
+        let mut open = fs(18, CWD, 0, missing, 0, 0);
+        open[1] = 1 << 2;
+        assert_eq!(batch(&mut f, &r, &[open, after]), [(1, -2), (9, -125)]);
     }
 
     /// A request that finds its file taken and waits again still holds its
@@ -11888,7 +12109,7 @@ mod kernel_info {
         let mut f = fixture();
         let einval = errno(Errno::EINVAL);
         let count = f.ret(139, &[3, 0, 0]);
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
         f.mem.write(GuestAddr(BUF), b"proc\0").unwrap();
         let proc = f.ret(139, &[1, BUF, 0]);
         assert_eq!(proc, 1);
@@ -13075,19 +13296,19 @@ fn statmount_and_listmount_by_unique_ids() {
             .map(|i| f.mem.read_u64(GuestAddr(ids + 8 * i)).unwrap())
             .collect()
     };
-    // From the root: the root, `/dev` and `/dev/shm` from start-up, and
-    // both, in order.
+    // From the root: the root, `/proc`, `/dev` and `/dev/shm` from
+    // start-up, and both, in order.
     let all = req(&mut f, 0x100, [32, u64::MAX, 0, 0]);
-    assert_eq!(f.ret(458, &[all, ids, 10, 0]), 5);
-    let every = read_ids(&mut f, 5);
+    assert_eq!(f.ret(458, &[all, ids, 10, 0]), 6);
+    let every = read_ids(&mut f, 6);
     assert!(every.windows(2).all(|w| w[0] < w[1]));
-    let listed = [every[0], every[3], every[4]];
+    let listed = [every[0], every[4], every[5]];
     assert_eq!(listed[0], paludarium_vfs::UNIQUE_OFFSET + 2);
-    assert_eq!(f.ret(458, &[all, ids, 10, 1]), 5);
+    assert_eq!(f.ret(458, &[all, ids, 10, 1]), 6);
     assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
     // After the last one given, and from a mount.
     let after = req(&mut f, 0x120, [32, u64::MAX, listed[0], 0]);
-    assert_eq!(f.ret(458, &[after, ids, 10, 0]), 4);
+    assert_eq!(f.ret(458, &[after, ids, 10, 0]), 5);
     let below = req(&mut f, 0x140, [32, listed[1], 0, 0]);
     assert_eq!(f.ret(458, &[below, ids, 10, 0]), 1);
     assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
@@ -13248,11 +13469,11 @@ fn unshare_newns_copies_the_mounts() {
     let fd = f.ret(2, &[inside, 0o102, 0o600]);
     assert_eq!(f.ret(3, &[fd]), 0);
     let first = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
-    assert!(first.starts_with("21 1 0:1 / / ") && first.contains("\n24 21 0:3 / /tmp/m "));
+    assert!(first.starts_with("21 1 0:1 / / ") && first.contains("\n25 21 0:3 / /tmp/m "));
     assert_eq!(f.ret(272, &[0x2_0000]), 0);
     let copy = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
     assert!(
-        copy.starts_with("25 1 0:1 / / ") && copy.contains("\n28 25 0:3 / /tmp/m "),
+        copy.starts_with("26 1 0:1 / / ") && copy.contains("\n30 26 0:3 / /tmp/m "),
         "{copy}"
     );
     let stat = DATA + 0x400;
@@ -13264,7 +13485,7 @@ fn unshare_newns_copies_the_mounts() {
     assert!(!Arc::ptr_eq(&first_table, &f.kernel.files.mount_table()));
     let lower =
         paludarium_vfs::NamespacedFs::new(Arc::new(paludarium_vfs::MemFs::new()), first_table);
-    assert_eq!(paludarium_vfs::FileSystem::mounts(&lower).len(), 4);
+    assert_eq!(paludarium_vfs::FileSystem::mounts(&lower).len(), 5);
 }
 
 /// chroot keeps absolute paths, links and `..` inside the new root, and

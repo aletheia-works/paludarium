@@ -64,9 +64,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マップします（`filemap_map_folio_range`）。エミュレーターのページキャッシュには、
   ファイルシステムごとに大きさを決める大きなフォリオがありません。`pagemap` も同じ
   ページを示します。ヒュージページもプロテクションキーも
-  ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `ht`（`MAP_HUGETLB`）がありません。
+  ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。
   `write` で埋めたホストのファイルのページはクリーンです（下の「`write` で埋めたページ」）。
+- **ヒュージページ**：hugetlbfs のプールは空で、増やせません。`/proc/sys/vm/nr_hugepages`
+  （書き込む先）も `/sys/kernel/mm/hugepages` もなく、`sysfs` は `hugetlbfs` を並べますが
+  マウントはできません（`ENODEV`）。`MFD_HUGETLB` と `SHM_HUGETLB` は、hugetlbfs のない
+  カーネルと同じく `ENOSYS` です。プールが空の Linux では memfd は作られ、セグメントは `EPERM` か
+  `ENOMEM` です。1 GiB のページの `MAP_HUGETLB` は、それのない CPU と同じく `EINVAL` で、
+  差分テストは比べません。`userfaultfd` はこのマッピングを登録せず、`maps` でのデバイスは 0 です。
 - **`/proc/<pid>/mem` の `i64::MAX` を超える位置**：`pread64` と `pwrite64` は、
   Linux v7.0 の `ksys_pread64` と `ksys_pwrite64` がどのファイルでもするのと同じく、
   これを拒みます（`EINVAL`）。Linux master は符号なしの位置のファイル
@@ -118,14 +123,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   種類ごとに同じ値、まだ届いていないデータグラムとメッセージが占めるメモリは 0 で、TCP の接続の
   `pingpong` を含む `quick` も 0 です。確認応答を待つ間のタイマーは示しません。`netlink` には、ポートが 0 である
   カーネル自身のソケットはありません。
+- **仮想 CPU の `/proc/cpuinfo`**：`RDTSC` は動きますが、`CPUID` はタイムスタンプカウンタを
+  示さないので、`bogomips` は 0.00 で、`cpu MHz` はありません。`CPUID` のリーフ 1 は CPU ごとの
+  ID を返さないので、`initial apicid` はどの CPU でも 0 です。`bugs` は、Linux 7.0 がファミリー
+  15 の AMD の CPU に想定するものを並べますが、仮想 CPU は投機実行をしません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
-  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
+  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/version`、`/proc/cmdline`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
   `vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前
-  （`stack`、`sched` など）は、ふつうのパスと同じように探すので、`--mount /:/` ではホストの
-  `/proc` に届きます。ほかのプロセスのディレクトリでは、それらは `ENOENT` です。Linux は
-  root に `stack` なども見せます。`wchan` は、待っているタスクでも `0` です。Linux は、タスクを
+  （`stack`、`sched` など）は、ほかのプロセスのディレクトリと同じく `ENOENT` です。
+  ファイルシステムがそこに何を持っていても（`--mount /:/` ではホストの `/proc`）同じです。
+  Linux はそれらを見せ、ほかのプロセスの `stack` なども root に見せます。`wchan` は、待っているタスクでも `0` です。Linux は、タスクを
   読める読み手には待っているカーネルの関数の名前を見せますが、ここには名前を付けるカーネルの
   関数がありません。`hostname` と `domainname` をいくつか見張る epoll 自身のポーリングは、
   用意のできたものが 1 つ見つかるまで、記述子の番号の順に見ます。Linux は変わった順に見るので、
@@ -139,7 +148,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   アイドルの時間は数えません。割り込みと softirq は数えず、コンテキストスイッチとして数えるのは
   スレッドが眠った回数だけです。ゲストのスレッドを横取りするものがないためです。そのため
   `status` は、それを `voluntary_ctxt_switches` として示し、`nonvoluntary_ctxt_switches` は
-  0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。ほかのプロセスのスレッドは、どの待ちでも
+  0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。
+  ピン留めしたページ（`pinned_vm`）とページテーブルのバイト数は何も数えないので、`status` には
+  `VmPin` と `VmPTE` がありません。Linux がメモリの項目のあとに書く行（`CoreDumping`、
+  `THP_enabled`、`untag_mask`）もありません。ほかのプロセスのスレッドは、どの待ちでも
   `S (sleeping)` です。Linux は割り込めない待ちの一部を `D (disk sleep)` と見せます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は、スレッドがその中で停止している
@@ -171,7 +183,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   システム全体のファイルは root のもので、新しいモードや所有者を与えられるのは root だけ
   ですが、それは `EPERM` になります。Linux はそれを保ちます。疑似端末のスレーブは自分の
   モードと所有者を保ちます。生成されるファイルに設定した時刻も保たず、`stat` はもとの時刻を
-  返します。
+  返します。生成される名前を消す、名前を変える呼び出し（`unlink`、`rmdir`、`rename`）は
+  `ENOENT` です。Linux は `EPERM` を返します。
 - **デバイスのノードとホストの FIFO**：ゲストは root で動きますが、キャラクターデバイスと
   ブロックデバイスの `mknod` は `EPERM` です。paludarium には、それが表すデバイスがないから
   です。マウントしたホストのディレクトリに FIFO を作れるのは Linux のホストだけで、つながる
@@ -278,10 +291,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   埋め、そのときにページごとに一つフォールトを数えます。Linux はファイルをマップし、
   プログラムがはじめてページに触れたときにフォールトを数え、読み込みのフォールトでは
   いくつものページを一度に読み込みます（`fault_around_bytes`）。これらのフォールトは
-  `perf` のイベントにしません。ファイルのページはすべて
-  ページキャッシュにあるとみなすので、メジャーフォールトはありません（`ru_majflt` は 0）。
-  `/proc/<pid>/stat` の `minflt` と
-  `cminflt` も同じ数を読むので、同じ制限があります。
+  `perf` のイベントにしません。ファイルのページはすべてページキャッシュにあるとみなすので、
+  メジャーフォールト（`ru_majflt`、`major-faults`）は、`userfaultfd` がやり直させた
+  カーネルのアクセスのフォールトだけです。待ちが終わるときに数えるので、やり直しが
+  （何も埋めない `UFFDIO_WAKE` の後に）もう一度待ってから致命的なシグナルで失敗したものも
+  一つ数えます。Linux は数えません。`/proc/<pid>/stat` の `minflt`、`cminflt`、`majflt`、
+  `cmajflt` も同じ数を読むので、同じ制限があります。
 - **perf のイベントの一部**：数えるのはソフトウェアのイベントだけです。cgroup の切り替え、
   トレースポイント、ブレークポイント、kprobe、uprobe は `ENOENT` で、ハードウェアの
   イベントも、PMU のあるホストでも `ENOENT` です。サイクルやキャッシュミスはここでは意味がなく、
@@ -471,16 +486,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
-  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`
+  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
+  `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
+  `_LINKAT`、`_FTRUNCATE`、それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`
   だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの受け付けと
   受信、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   `IORING_RECVSEND_FIXED_BUF` を付けた送受信は、差分テストを走らせるカーネルである Linux 7.0 と
   同じく `EINVAL` です。Linux master は登録したバッファーのバイトを動かします。テストを走らせる
   カーネルが追いつけば master に合わせます。`MSG_WAITALL` の受信でデータグラムが切り詰められても
-  リンクは失敗しません（Linux では失敗します）。`IORING_OP_SHUTDOWN` は、Linux ではワーカーで
-  実行するところを `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れる
-  ものより先に来ることがあります。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
+  リンクは失敗しません（Linux では失敗します）。`IORING_OP_SHUTDOWN`、`IORING_OP_FSYNC` と
+  ファイルの要求は、Linux では close と一部の open や advice を除いてワーカーで実行するところを
+  `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れるものより先に来ることが
+  あります。FIFO を作るかもしれない open はそこで待ちます。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
   来ます。すべてのスレッドが `nanosleep` で眠るあいだに期限が来たものは、眠りが終わるときに
   完了します（Linux のタイマーはその時点で完了させます）。単独で終了するスレッドは、リングを待つポーリングを
   残します（Linux は取り消します）。自分の要求にポーリングされるリングは、その要求が終わるまで
@@ -629,7 +647,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `syslog` が読むカーネルのログはいつも空です。Linux のログには起動時のメッセージが
     あります。`kernel.dmesg_restrict` はいつも 1 です（`/proc/sys/kernel/dmesg_restrict`、
     `/proc/kmsg`、`/dev/kmsg` はありません）。`sysfs` が知っているファイルシステムの種類は
-    7 つだけで、Linux には何十もあります。そのため、順は同じでも番号は Linux と違います。
+    9 つだけで、Linux には何十もあります。そのため、順は同じでも番号は Linux と違います。
     AppArmor も SELinux もありません。`lsm_list_modules` が並べるのは 4 つのモジュールで、
     Linux が AppArmor のコンテキストを返すところで、`lsm_get_self_attr` は属性を見つけません。
   - カーネルはいつも integrity でロックダウンしています。Secure Boot でない Linux は
@@ -744,8 +762,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイル自身のマウントを使います（`setns` の前に開いたものも、いまの名前空間で探し
   ます）。生成されるファイルのバインドマウントが見せるファイルは、`statx` と
   `/proc/self/fdinfo` で、バインドマウントのものではなく `/dev` や `/proc` のマウント ID
-  を持ちます。Linux が `/proc` と `/dev` の下に持つマウントのうち、表にあるのは `/dev`
-  自身と `/dev/shm` の tmpfs だけで、`/proc`、`/dev/pts`、`/dev/mqueue`、
+  を持ちます。Linux が `/proc` と `/dev` の下に持つマウントのうち、表にあるのは `/proc`
+  と `/dev` 自身と `/dev/shm` の tmpfs だけで、`/dev/pts`、`/dev/mqueue`、
   `/proc/sys/fs/binfmt_misc` はありません。そのため `/proc` や `/dev`（またはその中の
   ディレクトリ）のバインドマウントも、そこのディレクトリに生成されるものと `/dev/shm` の
   中身を見せます。Linux では空のマウントポイントです。`MS_REC` でもマウントは付いて
@@ -813,7 +831,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   生成される `/proc` と `/dev` は、`pivot_root` のあともルートの `/proc` と `/dev` に
   あります。Linux では古いルートとともに `put_old` に行きます。`open_tree` の
   `OPEN_TREE_NAMESPACE` で作った名前空間でも `/proc` と `/dev` にあります。Linux では
-  写しにそれらのマウントがあるところにだけあります。移動と `pivot_root` は
+  写しにそれらのマウントがあるところにだけあります。どちらの `umount2` も `EINVAL` です。
+  Linux はアンマウントします。移動と `pivot_root` は
   ルートと作業ディレクトリーを一緒に動かしますが、開いたディスクリプタは、パスで行う
   こと（`fchdir`、そこからの探索）には開いたときのパスを使います。マウントは
   マウントポイントのパスで持つので、名前の変更がディレクトリの下のマウントを動かすのは
@@ -974,7 +993,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   引き直すとほかのホップに移ります（`ip6_ecmp_set_mp_hash`、`sk_rethink_txhash`）。
   ここでは接続の道筋は開くときに決まるので、答えの返らないホップの接続は失敗します。
   ICMPv6 のエラーは自分のフローのホップを取りますが、Linux のものは知らせるパケットの
-  ホップを取ります（`icmp6_send`）。
+  ホップを取ります（`icmp6_send`）。`fib_multipath_hash_policy` が 1 のとき、また 3 で
+  ポートのフィールドがあるとき、ソケットのフローはポートなしでハッシュします。Linux は
+  ソケットのポートを、まだないものには乱数の送り元ポート（`FLOWI_FLAG_ANY_SPORT`）を
+  ハッシュするので、そのホップは Linux と違うことがあります。`RTM_GETROUTE` のポートは
+  Linux と同じくハッシュします。
   経路のない UDP の connect は、Linux master が "ipv6: fix device binding after failed
   datagram connect" からするように、ソケットのデバイスを元に戻します。その修正のない
   CI のカーネルでは、スコープ ID が与えたデバイスが残ります。
@@ -1040,10 +1063,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
   フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
   `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward`、
-  `fib_multipath_hash_seed` と、`all`、`default`、`lo`、veth の端の
+  `fib_multipath_hash_seed`、`fib_multipath_hash_policy`、`fib_multipath_hash_fields` と、
+  `all`、`default`、`lo`、veth の端の
   `forwarding`、`rp_filter`、`accept_dad`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
   最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
-  そこから始まります。`fib_multipath_hash_seed` への書き込みは、Linux 7.0 から 7.2 と同じく
+  そこから始まります。`fib_multipath_hash_seed`、`fib_multipath_hash_policy`、
+  `fib_multipath_hash_fields` への書き込みは、Linux 7.0 から 7.2 と同じく
   全部を取り、ファイルの位置を動かしません。master は読んだ分だけを取り、位置を進めます
   （`proc_vec`）。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
   加わりません。`default` のものが入っている間に作った端は、全ルーターのグループ 3 つすべてに

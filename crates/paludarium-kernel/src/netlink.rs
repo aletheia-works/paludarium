@@ -4186,11 +4186,13 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// IPv6, as `ip6_route_output`: `ENETUNREACH` while `lo` is down, and for
 /// an output device but `lo` without a source, or to a loopback,
 /// link-local or multicast address (`RT6_LOOKUP_F_IFACE`); the answer
-/// gives the request's source as `RTA_SRC`. The source, the flow label
-/// and the protocol choose among a multipath route's hops
-/// ([`crate::interface::Addresses::lookup6_flow`]); the mark, the user ID
-/// and the ports choose among policy rules, of which there are none, so
-/// they change nothing.
+/// gives the request's source as `RTA_SRC`. The source, the flow label,
+/// the protocol and the ports choose among a multipath route's hops as
+/// the namespace's `fib_multipath_hash_policy` takes them
+/// ([`crate::interface::Addresses::lookup6_flow`]), IPv4's from the packet
+/// `inet_rtm_getroute_build_skb` makes ([`crate::multipath::Flow`]); the
+/// mark and the user ID choose among policy rules, of which there are
+/// none, so they change nothing.
 fn lookup(
     network: &Network,
     payload: &[u8],
@@ -4216,6 +4218,7 @@ fn lookup(
     let mut oif = 0;
     let mut proto = None;
     let mut flowlabel = 0;
+    let (mut sport, mut dport) = (0, 0);
     let number = |value: &[u8]| -> Result<u32, Errno> {
         Ok(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?))
     };
@@ -4229,6 +4232,8 @@ fn lookup(
             RTA_UID => asked_uid = Some(number(value)?),
             RTA_MARK => mark = number(value)?,
             RTA_IP_PROTO => proto = Some(value.first().copied().unwrap_or_default()),
+            RTA_SPORT => sport = value.first_chunk().map_or(0, |b| u16::from_be_bytes(*b)),
+            RTA_DPORT => dport = value.first_chunk().map_or(0, |b| u16::from_be_bytes(*b)),
             _ => {}
         }
     }
@@ -4252,12 +4257,24 @@ fn lookup(
         return Err(ENODEV);
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
-    // What chooses among a multipath route's hops: the source, the flow
-    // label without the TOS (`flowi6_get_flowlabel`) and the protocol.
+    // What chooses among a multipath route's hops, as the namespace's
+    // policy takes them: the source, the flow label without the TOS
+    // (`flowi6_get_flowlabel`), the protocol and the ports. IPv4's come in
+    // the packet `inet_rtm_getroute_build_skb` makes, of UDP where no
+    // protocol is named.
     let flow = crate::interface::Flow6 {
         src: Some(Ipv6Addr::from(source6)),
         label: flowlabel & 0x000f_ffff,
         proto: proto.unwrap_or(0),
+        sport,
+        dport,
+    };
+    let flow4 = crate::multipath::Flow {
+        proto: proto.unwrap_or(17),
+        sport,
+        dport,
+        label: 0,
+        packet: true,
     };
     // The device it comes in on alone, before the addresses: the groups it
     // has joined, its forwarding, and the reverse path filtering that counts.
@@ -4292,7 +4309,7 @@ fn lookup(
             let four = |value: Option<&[u8]>| -> Result<[u8; 4], Errno> {
                 value.map_or(Ok([0; 4]), |v| v.first_chunk().copied().ok_or(ERANGE))
             };
-            input4(&addresses, four(dst)?, four(src)?, &input)
+            input4(&addresses, four(dst)?, four(src)?, &input, flow4)
         };
     }
     if v6 {
@@ -4445,7 +4462,7 @@ fn lookup(
         }
         (kind, matched_tos, gateway, table, metrics) = (Kind::Unicast, 0, None, None, NO_METRICS);
     } else {
-        match addresses.output4(ip, tos, oif, Some(source), &order) {
+        match addresses.output4(ip, tos, oif, Some(source), flow4, &order) {
             Ok(route) => {
                 let from = if route.table == TABLE_LOCAL {
                     TABLE_MAIN
@@ -4625,6 +4642,7 @@ fn input4(
     address: [u8; 4],
     asked_source: [u8; 4],
     input: &Input,
+    flow: crate::multipath::Flow,
 ) -> Result<Vec<u8>, Errno> {
     use crate::interface::{Kind, TABLE_LOCAL, TABLE_MAIN};
     use core::net::Ipv4Addr;
@@ -4689,7 +4707,7 @@ fn input4(
             // `__mkroute_input`, out through the route's device: a redirect
             // is asked only out through the device it came in on.
             _ => {
-                let route = addresses.path4(route, ip, src, None);
+                let route = addresses.path4(route, ip, src, flow, None);
                 let redirect = addresses
                     .validate_source4_on(src, input.tos, route.oif, input.rp_filter, input.iif)
                     .map_err(|()| Errno::EINVAL)?;

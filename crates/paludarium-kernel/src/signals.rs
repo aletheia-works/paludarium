@@ -161,6 +161,26 @@ pub(crate) struct ChildSignal {
 pub(crate) const SIGCHLD: i32 = 17;
 /// The handler value of an ignored signal, and SIGCHLD's `sa_flags`.
 pub(crate) const SIG_IGN: u64 = 1;
+/// `flush_signal_handlers(t, 0)`, as `execve` and `CLONE_CLEAR_SIGHAND` reset
+/// the actions: a handled signal goes back to its default, and an ignored one
+/// stays ignored, with no flags, restorer or mask.
+pub(crate) fn flushed(
+    actions: &std::collections::BTreeMap<i32, SignalAction>,
+) -> std::collections::BTreeMap<i32, SignalAction> {
+    actions
+        .iter()
+        .filter(|(_, action)| action.handler == SIG_IGN)
+        .map(|(&number, _)| {
+            (
+                number,
+                SignalAction {
+                    handler: SIG_IGN,
+                    ..SignalAction::default()
+                },
+            )
+        })
+        .collect()
+}
 pub(crate) const SA_NOCLDSTOP: u64 = 1;
 pub(crate) const SA_NOCLDWAIT: u64 = 2;
 /// `si_code` values of SIGCHLD.
@@ -440,10 +460,20 @@ pub(crate) fn restarts_with_handler(number: u64) -> bool {
     )
 }
 
-/// Shared selection for delivery and syscall-restart preview. SIGKILL wins,
-/// then the thread-pending queue before the process-pending queue. Each queue
-/// selects eligible standard signals before the lowest real-time number. Queue
-/// position breaks ties, preserving FIFO within the same real-time number.
+/// Shared selection for delivery and syscall-restart preview, as Linux's
+/// `get_signal` takes them: SIGKILL first, then a signal a fault raised
+/// (`dequeue_synchronous_signal`), then the thread's own before the
+/// process's (`dequeue_signal`). In each, `next_signal` takes SIGSEGV,
+/// SIGBUS, SIGILL, SIGTRAP, SIGFPE and SIGSYS first, then the lowest number;
+/// queue position breaks ties, so a real-time signal's instances come in the
+/// order they were queued.
+/// `SYNCHRONOUS_MASK`: what `next_signal` takes first of a queue.
+const SYNCHRONOUS_MASK: u64 = (1 << (11 - 1))
+    | (1 << (7 - 1))
+    | (1 << (4 - 1))
+    | (1 << (5 - 1))
+    | (1 << (8 - 1))
+    | (1 << (31 - 1));
 pub(crate) fn next_pending(process: &ThreadState, skip_ignored: bool) -> Option<usize> {
     process
         .pending
@@ -466,25 +496,11 @@ pub(crate) fn next_pending(process: &ThreadState, skip_ignored: bool) -> Option<
         })
         .min_by_key(|(index, signal)| {
             (
-                if signal.number == 9 {
-                    0
-                } else if signal.target == PendingTarget::Thread {
-                    1
-                } else {
-                    2
-                },
-                if signal.number == 9 {
-                    0
-                } else if signal.number < 32 {
-                    1
-                } else {
-                    2
-                },
-                if signal.number >= 32 {
-                    signal.number
-                } else {
-                    0
-                },
+                signal.number != 9,
+                !signal.synchronous,
+                signal.target != PendingTarget::Thread,
+                SYNCHRONOUS_MASK & (1u64 << (signal.number - 1)) == 0,
+                signal.number,
                 *index,
             )
         })

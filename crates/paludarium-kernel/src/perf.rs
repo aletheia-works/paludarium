@@ -1,12 +1,10 @@
 //! `perf_event_open`, as Linux's `kernel/events/core.c` checks its
 //! arguments, for the software events the emulator can count: `cpu-clock`
 //! and `task-clock` (the thread's CPU time, or for an event of a CPU the
-//! time that passes); `page-faults`, `minor-faults`, `context-switches`
-//! and `cpu-migrations` of a thread, from what it used as of its latest
-//! system call ([`crate::Usage`]); and `major-faults`, `alignment-faults`,
-//! `emulation-faults`, `dummy` and `bpf-output`, which never count here
-//! (the last four on x86-64 Linux neither). An event of a CPU counts no
-//! faults, switches or migrations. Hardware, cache and raw events find no
+//! time that passes); `page-faults`, `minor-faults`, `major-faults`,
+//! `context-switches` and `cpu-migrations` of a thread, from what it used
+//! ([`crate::Usage`]); and `alignment-faults`, `emulation-faults`, `dummy`
+//! and `bpf-output`, which never count here (on x86-64 Linux neither). Hardware, cache and raw events find no
 //! PMU (`ENOENT`), as on a machine without one; `cgroup-switches`,
 //! tracepoints and breakpoints are not there (`ENOENT`) either.
 //!
@@ -420,10 +418,10 @@ fn simd_regs(vec_qwords: u16, vector: u64, pred_qwords: u16, predicate: u32) -> 
 enum Counter {
     /// `cpu-clock` and `task-clock`: nanoseconds.
     Clock,
-    /// `page-faults` and `minor-faults`: the faults the thread's accesses
-    /// took ([`crate::Usage::faults`]), every one minor, as the emulator's
-    /// pages are all in memory.
-    Faults,
+    /// `page-faults`, `minor-faults` and `major-faults`: the faults the
+    /// thread's accesses took ([`crate::Usage::faults`]) of a
+    /// [`crate::FaultKind`]. A major one is of the kernel's accesses alone.
+    Faults(crate::FaultKind),
     /// `context-switches`: the times the thread went to sleep.
     Switches,
     /// `cpu-migrations`: the times it moved to another CPU.
@@ -756,7 +754,7 @@ impl Event {
     fn used(&self) -> Option<(u64, u64)> {
         if !matches!(
             self.counter,
-            Counter::Faults | Counter::Switches | Counter::Migrations
+            Counter::Faults(_) | Counter::Switches | Counter::Migrations
         ) {
             return None;
         }
@@ -768,15 +766,7 @@ impl Event {
         // Of an event of one CPU, what the thread counted there alone.
         Some(self.of_counts(match cpu {
             Ok(cpu) => usage.counts_on(cpu),
-            Err(_) => {
-                let load = |value: &AtomicU64| value.load(Ordering::SeqCst);
-                [
-                    load(&usage.faults),
-                    load(&usage.kernel_faults),
-                    load(&usage.switches),
-                    load(&usage.migrations),
-                ]
-            }
+            Err(_) => usage.counts(),
         }))
     }
     /// The machine's processes.
@@ -784,14 +774,9 @@ impl Event {
         self.machine.upgrade()?.downcast().ok()
     }
     /// What of `counts` ([`crate::CpuCounts`]'s) its counter counts, in
-    /// user mode and in the kernel.
-    fn of_counts(&self, counts: [u64; 4]) -> (u64, u64) {
-        let [faults, kernel_faults, switches, migrations] = counts;
-        let (user, kernel) = match self.counter {
-            Counter::Faults => (faults, kernel_faults),
-            Counter::Switches => (0, switches),
-            _ => (0, migrations),
-        };
+    /// user mode and in the kernel, of what is not left out.
+    fn of_counts(&self, counts: crate::Counts) -> (u64, u64) {
+        let (user, kernel) = self.of_all_counts(counts);
         let user = if self.attr.flag(bit::EXCLUDE_USER) {
             0
         } else {
@@ -803,6 +788,20 @@ impl Event {
             kernel
         };
         (user, kernel)
+    }
+    /// What of `counts` its counter counts, in user mode and in the kernel,
+    /// with nothing left out.
+    fn of_all_counts(&self, counts: crate::Counts) -> (u64, u64) {
+        let [faults, kernel_faults, switches, migrations, major_faults] = counts;
+        match self.counter {
+            Counter::Faults(crate::FaultKind::All) => {
+                (faults, kernel_faults.saturating_add(major_faults))
+            }
+            Counter::Faults(crate::FaultKind::Minor) => (faults, kernel_faults),
+            Counter::Faults(crate::FaultKind::Major) => (0, major_faults),
+            Counter::Switches => (0, switches),
+            _ => (0, migrations),
+        }
     }
     /// The count, the time enabled and the time running now.
     fn values(&self) -> (u64, u64, u64) {
@@ -1344,11 +1343,14 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
             }
             let counter = match config {
                 SW_CPU_CLOCK | SW_TASK_CLOCK => Counter::Clock,
-                SW_PAGE_FAULTS | SW_PAGE_FAULTS_MIN => Counter::Faults,
+                SW_PAGE_FAULTS => Counter::Faults(crate::FaultKind::All),
+                SW_PAGE_FAULTS_MIN => Counter::Faults(crate::FaultKind::Minor),
+                SW_PAGE_FAULTS_MAJ => Counter::Faults(crate::FaultKind::Major),
                 SW_CONTEXT_SWITCHES => Counter::Switches,
                 SW_CPU_MIGRATIONS => Counter::Migrations,
-                SW_PAGE_FAULTS_MAJ | SW_ALIGNMENT_FAULTS | SW_EMULATION_FAULTS | SW_DUMMY
-                | SW_BPF_OUTPUT => Counter::Zero,
+                SW_ALIGNMENT_FAULTS | SW_EMULATION_FAULTS | SW_DUMMY | SW_BPF_OUTPUT => {
+                    Counter::Zero
+                }
                 _ => return Err(Errno::ENOENT),
             };
             // `perf_try_init_event`: a software PMU takes neither SIMD nor
@@ -1865,11 +1867,20 @@ mod tests {
         assert_eq!(init(&attr(1, 0)), Ok(Counter::Clock));
         assert_eq!(init(&attr(1, 1)), Ok(Counter::Clock));
         assert_eq!(init(&attr(1, 9)), Ok(Counter::Zero));
-        assert_eq!(init(&attr(1, 2)), Ok(Counter::Faults));
+        assert_eq!(
+            init(&attr(1, 2)),
+            Ok(Counter::Faults(crate::FaultKind::All))
+        );
         assert_eq!(init(&attr(1, 3)), Ok(Counter::Switches));
         assert_eq!(init(&attr(1, 4)), Ok(Counter::Migrations));
-        assert_eq!(init(&attr(1, 5)), Ok(Counter::Faults));
-        assert_eq!(init(&attr(1, 6)), Ok(Counter::Zero));
+        assert_eq!(
+            init(&attr(1, 5)),
+            Ok(Counter::Faults(crate::FaultKind::Minor))
+        );
+        assert_eq!(
+            init(&attr(1, 6)),
+            Ok(Counter::Faults(crate::FaultKind::Major))
+        );
         assert_eq!(init(&attr(1, 11)), Err(Errno::ENOENT));
         assert_eq!(init(&attr(1, 12)), Err(Errno::ENOENT));
         assert_eq!(init(&attr(0, 0)), Err(Errno::ENOENT));
@@ -1988,16 +1999,28 @@ mod tests {
         assert_eq!(switches.values().0, 0);
         let _ = paludarium_host::switches::take();
         account(&mut state);
-        let (faults, migrations) = (of(Counter::Faults), of(Counter::Migrations));
+        let (faults, migrations) = (
+            of(Counter::Faults(crate::FaultKind::All)),
+            of(Counter::Migrations),
+        );
         let user_switches = excluding(Counter::Switches, bit::EXCLUDE_KERNEL);
-        let user_faults = excluding(Counter::Faults, bit::EXCLUDE_KERNEL);
-        let kernel_faults = excluding(Counter::Faults, bit::EXCLUDE_USER);
+        let user_faults = excluding(Counter::Faults(crate::FaultKind::All), bit::EXCLUDE_KERNEL);
+        let kernel_faults = excluding(Counter::Faults(crate::FaultKind::All), bit::EXCLUDE_USER);
+        let minor = of(Counter::Faults(crate::FaultKind::Minor));
+        let major = of(Counter::Faults(crate::FaultKind::Major));
+        let user_major = excluding(
+            Counter::Faults(crate::FaultKind::Major),
+            bit::EXCLUDE_KERNEL,
+        );
         for event in [
             &faults,
             &migrations,
             &user_switches,
             &user_faults,
             &kernel_faults,
+            &minor,
+            &major,
+            &user_major,
         ] {
             event.enable();
         }
@@ -2035,6 +2058,15 @@ mod tests {
         }
         account(&mut state);
         assert_eq!((user_faults.values().0, kernel_faults.values().0), (1, 1));
+        // A major one, of the kernel's: `page-faults` and `major-faults`
+        // count it, `minor-faults` does not.
+        state.cpu.used.major_faults.fetch_add(1, Ordering::SeqCst);
+        account(&mut state);
+        assert_eq!(
+            (faults.values().0, minor.values().0, major.values().0),
+            (3, 2, 1)
+        );
+        assert_eq!((kernel_faults.values().0, user_major.values().0), (2, 0));
         // A disabled event leaves out what comes meanwhile.
         switches.disable();
         paludarium_host::switches::sleep(&mut false);
@@ -2066,7 +2098,12 @@ mod tests {
         account(&mut state);
         assert_eq!(migrations.values().0, 3);
         // An event of a CPU counts none of these.
-        let cpu = of_counter(None, Target::Cpu, Attr::default(), Counter::Faults);
+        let cpu = of_counter(
+            None,
+            Target::Cpu,
+            Attr::default(),
+            Counter::Faults(crate::FaultKind::All),
+        );
         cpu.enable();
         let more = space
             .map(
@@ -2078,7 +2115,8 @@ mod tests {
             .unwrap();
         space.write_u64(more, 1).unwrap();
         account(&mut state);
-        assert_eq!((cpu.values().0, faults.values().0), (0, 3));
+        // Its two faults and the major one above, and then this.
+        assert_eq!((cpu.values().0, faults.values().0), (0, 4));
     }
 
     #[test]
@@ -2113,7 +2151,7 @@ mod tests {
         };
         // The thread starts on CPU 0, the lowest its mask allows.
         account(&mut state);
-        let faults = [-1, 0, 1].map(|cpu| on(Counter::Faults, cpu));
+        let faults = [-1, 0, 1].map(|cpu| on(Counter::Faults(crate::FaultKind::All), cpu));
         let migrations = [-1, 0, 1].map(|cpu| on(Counter::Migrations, cpu));
         let switches = [-1, 0, 1].map(|cpu| on(Counter::Switches, cpu));
         let counts = |events: &[Arc<Event>; 3]| events.each_ref().map(|e| e.values().0);
@@ -2180,7 +2218,7 @@ mod tests {
             space.write_u64(page, 1).unwrap();
         };
         crate::account_cpu(&host, &group, &mut state, 5);
-        let faults = [0, 1].map(|cpu| on(Counter::Faults, cpu));
+        let faults = [0, 1].map(|cpu| on(Counter::Faults(crate::FaultKind::All), cpu));
         let switches = [0, 1].map(|cpu| on(Counter::Switches, cpu));
         let migrations = [0, 1].map(|cpu| on(Counter::Migrations, cpu));
         let counts = |events: &[Arc<Event>; 2]| events.each_ref().map(|e| e.values().0);
@@ -2379,25 +2417,56 @@ mod tests {
             present: addr & 0x1000 != 0,
         };
         let addresses = |usage: &crate::Usage, kernel, counted, n| {
-            let found = usage.fault_addresses(kernel, counted, n);
+            let found = usage.fault_addresses(kernel, crate::FaultKind::All, counted, n);
             assert!(found.iter().all(|&f| f.addr == 0 || f == at(f.addr)));
             found.iter().map(|f| f.addr).collect::<Vec<_>>()
         };
         let usage = crate::Usage::default();
         for nth in 1..=5 {
-            usage.fault(false, nth, at(0x1000 * nth));
+            usage.fault(false, false, nth, at(0x1000 * nth));
         }
-        usage.fault(true, 1, at(0xf000));
+        usage.fault(true, false, 1, at(0xf000));
         // The last three of the first four, and those of the kernel's.
         assert_eq!(addresses(&usage, false, 4, 3), [0x2000, 0x3000, 0x4000]);
         assert_eq!(addresses(&usage, true, 1, 1), [0xf000]);
         // One that came before any was told, and those long gone.
         assert_eq!(addresses(&usage, true, 2, 2), [0xf000, 0]);
         for nth in 6..=6000 {
-            usage.fault(false, nth, at(0x1000 * nth));
+            usage.fault(false, false, nth, at(0x1000 * nth));
         }
         let all = addresses(&usage, false, 6000, 6000);
         assert_eq!((all.len(), all[0], all[5999]), (6000, 0, 6000 * 0x1000));
+    }
+
+    #[test]
+    fn a_major_fault_keeps_its_address_among_the_kernel_s_by_each_number() {
+        use crate::FaultKind::{All, Major, Minor};
+        use paludarium_mmu::faults::{At, Sink};
+        let at = |addr| At {
+            addr,
+            present: false,
+        };
+        let usage = crate::Usage::default();
+        // Minor, major, minor: counted as the mmu counts them, then told.
+        usage.kernel_faults.store(1, Ordering::SeqCst);
+        usage.fault(true, false, 1, at(0xa000));
+        usage.major_faults.store(1, Ordering::SeqCst);
+        usage.fault(true, true, 1, at(0xb000));
+        usage.kernel_faults.store(2, Ordering::SeqCst);
+        usage.fault(true, false, 2, at(0xc000));
+        let addresses = |kind, counted, n| {
+            usage
+                .fault_addresses(true, kind, counted, n)
+                .iter()
+                .map(|f| f.addr)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(addresses(All, 3, 3), [0xa000, 0xb000, 0xc000]);
+        assert_eq!(addresses(Minor, 2, 2), [0xa000, 0xc000]);
+        assert_eq!(addresses(Major, 1, 1), [0xb000]);
+        assert_eq!(addresses(All, 2, 1), [0xb000]);
+        // None of the thread's own code's is major.
+        assert!(usage.fault_addresses(false, Major, 1, 1)[0] == At::default());
     }
 
     #[test]

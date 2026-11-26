@@ -1257,8 +1257,8 @@ kernel.
   `UFFD_FEATURE_WP_ASYNC`, `UFFD_FEATURE_MOVE`, and the events'
   `UFFD_FEATURE_EVENT_FORK`, `UFFD_FEATURE_EVENT_REMAP`,
   `UFFD_FEATURE_EVENT_REMOVE` and `UFFD_FEATURE_EVENT_UNMAP` (the `HUGETLBFS` ones as Linux reports them,
-  though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
-  `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
+  though no hugetlbfs memory can be registered: `UFFDIO_REGISTER` does not
+  take a hugetlb mapping), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory, shared anonymous memory and the shared or private mappings of a
   memfd or a file of a tmpfs mount, which are shmem's (not System V shared
@@ -1445,8 +1445,15 @@ kernel.
   uses the space, as the last of them. `shmdt` takes every piece of the
   attachment that `munmap` and the others left. A segment removed with `IPC_RMID` while attached keeps its ID, is
   found by no key, and goes at its last detach. `SHM_LOCK` checks the owner
-  and `RLIMIT_MEMLOCK` as Linux does, and `SHM_HUGETLB` gives `ENOSYS`, as
-  from a kernel built without hugetlbfs.
+  and `RLIMIT_MEMLOCK` as Linux does.
+  `SHM_HUGETLB` makes a segment of hugetlbfs, whose pool is empty (see
+  `MAP_HUGETLB` below), as `newseg` does: a huge page size other than 2 MiB
+  is `EINVAL`; without `CAP_IPC_LOCK`, a process outside group 0
+  (`vm.hugetlb_shm_group`) is `EPERM`; and without `SHM_NORESERVE` the
+  reservation is `ENOMEM`. Such a segment keeps its size (`shm_segsz`), but
+  `shmat` maps it in whole 2 MiB pages at a 2 MiB boundary (`EINVAL` for a
+  fixed address off one), as a `MAP_HUGETLB` mapping that an access makes
+  `SIGBUS`, and `SHM_LOCK` and `SHM_UNLOCK` change nothing of it.
 
 - System V semaphores (`semget`, `semop`, `semtimedop`, `semctl`) belong to
   the thread's IPC namespace too, with Linux's checks in Linux's order (as

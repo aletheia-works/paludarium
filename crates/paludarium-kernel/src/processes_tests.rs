@@ -4555,6 +4555,42 @@ mod shm {
     }
 
     #[test]
+    fn huge_segments_are_of_an_empty_hugetlbfs_pool() {
+        const SHM_HUGETLB: u64 = 0o4000;
+        const SHM_NORESERVE: u64 = 0o10000;
+        const SHM_LOCK: u64 = 11;
+        const HUGE: u64 = 2 << 20;
+        let (mut k, mut t, m) = setup();
+        let huge = IPC_CREAT | SHM_HUGETLB | 0o600;
+        // Only 2 MiB pages, and a reservation fails.
+        assert_eq!(
+            shmget(&mut k, &mut t, &m, 0, 100, huge | SHM_NORESERVE | 30 << 26),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 100, huge), e(Errno::ENOMEM));
+        let id = shmget(&mut k, &mut t, &m, 0, 100, huge | SHM_NORESERVE | 21 << 26);
+        assert_eq!(stat(&mut k, &mut t, &m, id), Ok((0, 0o600, 100, 0)));
+        // It maps whole huge pages, on a huge page's boundary only.
+        assert_eq!(
+            shmat(&mut k, &mut t, &m, id, 0x4000_1000, 0),
+            e(Errno::EINVAL)
+        );
+        let at = shmat(&mut k, &mut t, &m, id, 0, 0);
+        assert!(at < 1 << 47 && at.is_multiple_of(HUGE), "{at:#x}");
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 1);
+        // No page faults in.
+        assert!(m.read(GuestAddr(at), &mut [0u8; 1]).is_err());
+        assert_eq!(shmdt(&mut k, &mut t, &m, at), 0);
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 0);
+        // A lock does nothing to it.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [id, SHM_LOCK, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(stat(&mut k, &mut t, &m, id), Ok((0, 0o600, 100, 0)));
+    }
+
+    #[test]
     fn keys_find_their_segment_after_the_checks_of_ipcget() {
         let (mut k, mut t, m) = setup();
         let id = shmget(&mut k, &mut t, &m, 42, 100, IPC_CREAT | 0o600);
@@ -4572,9 +4608,10 @@ mod shm {
             shmget(&mut k, &mut t, &m, 43, 0, IPC_CREAT),
             e(Errno::EINVAL)
         );
+        // A huge page segment reserves its pages from an empty pool.
         assert_eq!(
             shmget(&mut k, &mut t, &m, 43, 100, IPC_CREAT | 0o4000),
-            e(Errno::ENOSYS)
+            e(Errno::ENOMEM)
         );
         // IPC_PRIVATE always makes a new segment, at the next index.
         assert_eq!(shmget(&mut k, &mut t, &m, 0, 1, IPC_CREAT | IPC_EXCL), 1);

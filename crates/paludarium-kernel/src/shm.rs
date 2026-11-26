@@ -16,12 +16,20 @@ use crate::ipc::{
 use crate::namespaces::KeptPid;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::Host;
-use paludarium_mmu::{Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages};
+use paludarium_mmu::{
+    Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages, vm,
+};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 const SHM_HUGETLB: i32 = 0o4000;
+/// `shmget`'s: a huge page segment reserves no page.
+const SHM_NORESERVE: i32 = 0o10000;
+/// `SHM_HUGE_SHIFT` and `SHM_HUGE_MASK`: where `shmget` gives the size of
+/// its huge pages.
+const SHM_HUGE_SHIFT: i32 = 26;
+const SHM_HUGE_MASK: i32 = 0x3f;
 const SHM_RDONLY: i32 = 0o10000;
 const SHM_RND: i32 = 0o20000;
 const SHM_REMAP: i32 = 0o40000;
@@ -153,6 +161,9 @@ struct Segment {
     attachments: Vec<Weak<Attachment>>,
     /// The real user whose `RLIMIT_MEMLOCK` its `SHM_LOCK` counts against.
     locker: Option<u32>,
+    /// Whether it is a hugetlbfs file's (`SHM_HUGETLB`), of whole huge
+    /// pages from an empty pool.
+    huge: bool,
 }
 
 impl Segment {
@@ -165,6 +176,15 @@ impl Segment {
     }
     fn pages(&self) -> u64 {
         self.size.div_ceil(PAGE)
+    }
+    /// The size of its file (`i_size`), which `shmat` maps: whole huge
+    /// pages for a hugetlbfs one.
+    fn file_size(&self) -> u64 {
+        if self.huge {
+            self.size.next_multiple_of(crate::hugetlb::HUGE_PAGE)
+        } else {
+            self.size
+        }
     }
 }
 
@@ -179,6 +199,8 @@ pub(crate) struct Attachment {
     name: Arc<[u8]>,
     /// Told when the last mapping goes, to remove a segment marked for it.
     table: Weak<Mutex<Table>>,
+    /// Whether the segment is of huge pages ([`Segment::huge`]).
+    huge: bool,
 }
 
 impl PageSource for Attachment {
@@ -189,11 +211,13 @@ impl PageSource for Attachment {
         buf[..count].fill(0);
         Ok(count)
     }
+    /// No huge page faults in from an empty pool, so an access to any is a
+    /// bus error.
     fn size(&self) -> Option<u64> {
-        Some(self.size)
+        Some(if self.huge { 0 } else { self.size })
     }
     fn file_size(&self) -> Option<Arc<FileSize>> {
-        Some(Arc::clone(&self.file_size))
+        (!self.huge).then(|| Arc::clone(&self.file_size))
     }
     /// No name links a segment's file, so a core holds its mappings, as
     /// Linux's dump of shared anonymous memory.
@@ -217,9 +241,33 @@ impl PageSource for Attachment {
         false
     }
     /// A segment's memory is shmem's file's, though its VMAs are not
-    /// shmem's (`shm_vm_ops`): `MADV_COLLAPSE` takes them.
+    /// shmem's (`shm_vm_ops`): `MADV_COLLAPSE` takes them. A huge one's is
+    /// hugetlbfs's.
     fn shmem_file(&self) -> bool {
-        true
+        !self.huge
+    }
+    /// A huge segment's VMAs are hugetlbfs's: `VM_DONTEXPAND`, of 2 MiB
+    /// pages, placed on a 2 MiB boundary (`hugetlb_get_unmapped_area`).
+    fn fixed(&self) -> bool {
+        self.huge
+    }
+    fn page_size(&self) -> u64 {
+        if self.huge {
+            crate::hugetlb::HUGE_PAGE
+        } else {
+            PAGE
+        }
+    }
+    fn huge_placement(&self) -> bool {
+        self.huge
+    }
+    /// `hugetlbfs_file_mmap_prepare`'s flags.
+    fn vma_flags(&self, flags: u64) -> u64 {
+        if self.huge {
+            (flags | vm::HUGETLB | vm::DONTEXPAND) & !vm::ACCOUNT
+        } else {
+            flags
+        }
     }
     /// A VMA of it opened (`shm_open`): a split, a `fork` or a move.
     fn opened(&self, by: &paludarium_mmu::Actor) {
@@ -393,9 +441,15 @@ fn result(value: Result<u64, Errno>) -> Outcome {
 /// A new segment's checks are its size, from 1 to `kernel.shmmax`
 /// (`EINVAL`), its pages, which a size near the top of 64 bits wraps
 /// (`ENOSPC`), the pages of all segments against `kernel.shmall`
-/// (`ENOSPC`), `SHM_HUGETLB` (`ENOSYS`, as from a kernel built without
-/// hugetlbfs) and the number of segments against `kernel.shmmni`
-/// (`ENOSPC`).
+/// (`ENOSPC`), then `SHM_HUGETLB`'s (below) and the number of segments
+/// against `kernel.shmmni` (`ENOSPC`).
+///
+/// `SHM_HUGETLB` makes a segment of hugetlbfs with an empty pool, as
+/// `newseg` and `hugetlb_file_setup` do: a huge page size other than 2 MiB
+/// is `EINVAL`; without `CAP_IPC_LOCK` over the machine, a process outside
+/// `vm.hugetlb_shm_group` (0, root's group) is `EPERM`; and without
+/// `SHM_NORESERVE` the reservation of its pages is `ENOMEM`. Its file is
+/// of whole huge pages, of which none can fault in.
 pub(crate) fn sys_shmget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     result(shmget(c, a[0] as i32, a[1], a[2] as i32))
 }
@@ -443,8 +497,18 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
     {
         return Err(Errno::ENOSPC);
     }
-    if flag & SHM_HUGETLB != 0 {
-        return Err(Errno::ENOSYS);
+    let huge = flag & SHM_HUGETLB != 0;
+    if huge {
+        if !matches!((flag >> SHM_HUGE_SHIFT) & SHM_HUGE_MASK, 0 | 21) {
+            return Err(Errno::EINVAL);
+        }
+        let in_group = credentials.fsgid == 0 || credentials.groups.contains(&0);
+        if !credentials.capable(CAP_IPC_LOCK) && !in_group {
+            return Err(Errno::EPERM);
+        }
+        if flag & SHM_NORESERVE == 0 {
+            return Err(ENOMEM);
+        }
     }
     let table = &mut *table;
     let id = table
@@ -467,6 +531,7 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
             name: name.into_bytes().into(),
             attachments: Vec::new(),
             locker: None,
+            huge,
         },
     );
     table.pages += pages;
@@ -522,19 +587,21 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         {
             return Err(Errno::EACCES);
         }
+        let size = segment.file_size();
         let attachment = Arc::new(Attachment {
             id: segment.id,
-            size: segment.size,
-            file_size: Arc::new(FileSize::new(segment.size)),
+            size,
+            file_size: Arc::new(FileSize::new(size)),
             name: Arc::clone(&segment.name),
             table: Arc::downgrade(&shm.0),
+            huge: segment.huge,
         });
         segment
             .attachments
             .retain(|attachment| attachment.strong_count() > 0);
         segment.attachments.push(Arc::downgrade(&attachment));
         let memory = segment.memory.with_source(attachment.clone());
-        ((attachment, memory), segment.size)
+        ((attachment, memory), size)
     };
     let (attachment, memory) = attachment;
     let len = size.div_ceil(PAGE) * PAGE;
@@ -545,7 +612,13 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         }
     }
     let prot = crate::syscalls::read_implies_exec(c.process, prot);
+    let huge = attachment.huge;
     let placement = if fixed {
+        // hugetlbfs places only on a huge page's boundary
+        // (`prepare_hugepage_range`).
+        if huge && !addr.is_multiple_of(crate::hugetlb::HUGE_PAGE) {
+            return Err(Errno::EINVAL);
+        }
         if addr
             .checked_add(len)
             .is_none_or(|end| end > USER_ADDRESS_LIMIT - PAGE)
@@ -556,6 +629,12 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
             return Err(Errno::EPERM);
         }
         Placement::Replacing(GuestAddr(addr))
+    } else if huge {
+        Placement::Aligned {
+            hint: None,
+            size: crate::hugetlb::HUGE_PAGE,
+            offset: 0,
+        }
     } else {
         Placement::Near(None)
     };
@@ -609,7 +688,8 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
     if !addr.is_multiple_of(PAGE) {
         return Err(Errno::EINVAL);
     }
-    // The segments' attachments, by open file, with the segment's size.
+    // The segments' attachments, by open file, with the size of the
+    // segment's file (`i_size_read`), whole huge pages for a huge one.
     let attachments: BTreeMap<usize, u64> = segments(c)
         .lock()
         .segments
@@ -619,7 +699,7 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
                 .attachments
                 .iter()
                 .filter(|attachment| attachment.strong_count() > 0)
-                .map(|attachment| (attachment.as_ptr().addr(), segment.size))
+                .map(|attachment| (attachment.as_ptr().addr(), segment.file_size()))
         })
         .collect();
     let fragments = c.mem.shared_fragments();
@@ -864,7 +944,8 @@ impl crate::seq::Records for ProcRecords {
 /// `CAP_IPC_LOCK` only for the segment's owner or creator, and a lock
 /// needs a `RLIMIT_MEMLOCK` (`EPERM`) with room for the segment among
 /// those the real user locked (`ENOMEM`). Nothing is ever swapped out, so
-/// a lock changes nothing else.
+/// a lock changes nothing else. A huge segment's lock or unlock does
+/// nothing after those permissions (`is_file_hugepages`).
 fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
     let capable = ipc::capable(c, CAP_IPC_LOCK);
@@ -885,6 +966,9 @@ fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
         if lock && limit == 0 {
             return Err(Errno::EPERM);
         }
+    }
+    if segment.huge {
+        return Ok(0);
     }
     if lock {
         if segment.perm.mode & SHM_LOCKED != 0 {

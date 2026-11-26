@@ -19376,6 +19376,84 @@ static int mmap_hugetlb_case(void) {
     waitpid(kid, NULL, 0);
     return 0;
 }
+/* The shm-hugetlb case: SHM_HUGETLB segments with no huge page in the
+ * pool: the checks of shmget, then a segment that reserves nothing, which
+ * shmat maps as hugetlbfs memory that raises SIGBUS. */
+static int shm_hugetlb_get(size_t size, int flags) {
+    int id = shmget(IPC_PRIVATE, size, IPC_CREAT | 0600 | SHM_HUGETLB | flags);
+    return id < 0 ? -errno : id;
+}
+static void shm_hugetlb_creds(const char *label, int in_root_group) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        gid_t root = 0;
+        if (setgroups(in_root_group, &root) || setresgid(65534, 65534, 65534) ||
+            setresuid(65534, 65534, 65534))
+            _exit(80);
+        int id = shm_hugetlb_get(4096, SHM_NORESERVE);
+        printf("%s=%d\n", label, id < 0 ? -id : 0);
+        if (id >= 0) shmctl(id, IPC_RMID, NULL);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+}
+static int shm_hugetlb_case(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    struct sigaction action = {.sa_flags = SA_SIGINFO};
+    action.sa_sigaction = on_bus;
+    sigaction(SIGBUS, &action, NULL);
+    /* Not 1 GiB's 30, which a CPU with such pages takes. */
+    printf("reserve=%d size-12=%d size-22=%d\n", -shm_hugetlb_get(4096, 0),
+           -shm_hugetlb_get(4096, SHM_NORESERVE | 12 << 26), -shm_hugetlb_get(4096, SHM_NORESERVE | 22 << 26));
+    int id = shm_hugetlb_get(HUGE_2M + 100, SHM_NORESERVE | 21 << 26);
+    if (id < 0) {
+        printf("noreserve=%d\n", -id);
+        return 0;
+    }
+    struct shmid_ds ds;
+    if (shmctl(id, IPC_STAT, &ds)) return 81;
+    printf("segsz=%lu nattch=%lu\n", (unsigned long)ds.shm_segsz, (unsigned long)ds.shm_nattch);
+    /* A room of 8 MiB on a 2 MiB boundary. */
+    char *room = mmap(NULL, 10 * HUGE_2M, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (room == MAP_FAILED) return 82;
+    room = (char *)(((uintptr_t)room + HUGE_2M - 1) & ~(HUGE_2M - 1));
+    munmap(room, 8 * HUGE_2M);
+    printf("unaligned=%d", low_error(shmat(id, room + 4096, 0)));
+    printf(" rounded=%d", low_error(shmat(id, room + 4097, SHM_RND)));
+    char *at = shmat(id, room, 0);
+    printf(" fixed=%d", low_error(at));
+    if (at != (void *)-1) shmdt(at);
+    at = shmat(id, NULL, 0);
+    printf(" error=%d aligned=%d\n", low_error(at), (uintptr_t)at % HUGE_2M == 0);
+    if (at == (void *)-1) return 83;
+    huge_smaps("vma", at);
+    touch("read", at, 0);
+    touch("write", at + HUGE_2M + 5, 1);
+    unsigned char in = 9;
+    long r = mincore(at, 4096, &in);
+    printf("mincore=%ld in=%d", r, in & 1);
+    printf(" munmap=%d", munmap(at, 4096) ? errno : 0);
+    printf(" mprotect=%d", mprotect(at, 4096, PROT_READ) ? errno : 0);
+    printf(" part=%d", mprotect(at + HUGE_2M, HUGE_2M, PROT_READ) ? errno : 0);
+    printf(" cold=%d", madvise(at, HUGE_2M, MADV_COLD) ? errno : 0);
+    printf(" dontneed=%d\n", madvise(at, HUGE_2M, MADV_DONTNEED) ? errno : 0);
+    if (shmctl(id, IPC_STAT, &ds)) return 84;
+    printf("nattch=%lu", (unsigned long)ds.shm_nattch);
+    printf(" shmdt=%d", shmdt(at) ? errno : 0);
+    if (shmctl(id, IPC_STAT, &ds)) return 85;
+    printf(" after=%lu", (unsigned long)ds.shm_nattch);
+    printf(" lock=%d", shmctl(id, SHM_LOCK, NULL) ? errno : 0);
+    if (shmctl(id, IPC_STAT, &ds)) return 86;
+    printf(" locked=%d", (ds.shm_perm.mode & SHM_LOCKED) != 0);
+    printf(" unlock=%d\n", shmctl(id, SHM_UNLOCK, NULL) ? errno : 0);
+    shmctl(id, IPC_RMID, NULL);
+    shm_hugetlb_creds("nobody", 0);
+    shm_hugetlb_creds("root-group", 1);
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -43421,6 +43499,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "mmap-low")) return mmap_low_case();
     if (!strcmp(mode, "mmap-hugetlb")) return mmap_hugetlb_case();
+    if (!strcmp(mode, "shm-hugetlb")) return shm_hugetlb_case();
     if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();

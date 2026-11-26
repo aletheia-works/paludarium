@@ -340,9 +340,9 @@ impl ThreadGroup {
     /// process, ends the whole process at once, as Linux's
     /// `complete_signal` starts a group exit as it sends it: its action is
     /// the default (`sig_fatal`: neither ignored nor stopping), which
-    /// writes no core (`sig_kernel_coredump`), and a thread that takes it
-    /// (`thread`, or any of the process's) does not block it; a stopped
-    /// process takes none but SIGKILL then (`wants_signal`).
+    /// writes no core (`sig_kernel_coredump`), and a thread wants it
+    /// (`thread`, or any of the process's: [`crate::targets::Targets::wanted`]);
+    /// a stopped or traced process takes none but SIGKILL then.
     pub(crate) fn fatal_at_send(&self, number: i32, thread: Option<u32>) -> bool {
         if number == 9 {
             return true;

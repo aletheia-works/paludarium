@@ -6239,7 +6239,7 @@ kernel.
 
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
   longer struct whose extra part is not zero) and then runs as the `clone` it
-  describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
+  describes; `CLONE_CLEAR_SIGHAND` resets the child's actions as `execve` does.
   `set_tid` is as under the PID namespaces above, and `CLONE_INTO_CGROUP`
   gives `EINVAL`. `clone` itself reads only
   the low 32 bits of its flags, as in Linux, so `CLONE_CLEAR_SIGHAND` is
@@ -6739,6 +6739,12 @@ one only with an `--allow-net`.
   `CLONE_THREAD` shares its signal dispositions with its parent: a
   `sigaction` in one is seen by the other. `execve` gives the process its own
   copy again, as in Linux.
+- `execve` keeps the signals pending for the thread that runs it and for the
+  process, and the signals it blocks; the other threads end with theirs
+  (`de_thread`). It resets the actions as Linux's `flush_signal_handlers`
+  does: a handled signal goes back to its default, and an ignored one stays
+  ignored, with no flags or mask. `CLONE_CLEAR_SIGHAND` resets the child's
+  the same way.
 - The threads of a process share its signal dispositions, as Linux's
   `sighand_struct` does. A thread that was already waiting (in `epoll_wait`,
   `poll` or a `futex` wait, say) when another thread called `sigaction` takes

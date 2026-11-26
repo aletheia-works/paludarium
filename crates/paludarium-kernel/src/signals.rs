@@ -161,6 +161,26 @@ pub(crate) struct ChildSignal {
 pub(crate) const SIGCHLD: i32 = 17;
 /// The handler value of an ignored signal, and SIGCHLD's `sa_flags`.
 pub(crate) const SIG_IGN: u64 = 1;
+/// `flush_signal_handlers(t, 0)`, as `execve` and `CLONE_CLEAR_SIGHAND` reset
+/// the actions: a handled signal goes back to its default, and an ignored one
+/// stays ignored, with no flags, restorer or mask.
+pub(crate) fn flushed(
+    actions: &std::collections::BTreeMap<i32, SignalAction>,
+) -> std::collections::BTreeMap<i32, SignalAction> {
+    actions
+        .iter()
+        .filter(|(_, action)| action.handler == SIG_IGN)
+        .map(|(&number, _)| {
+            (
+                number,
+                SignalAction {
+                    handler: SIG_IGN,
+                    ..SignalAction::default()
+                },
+            )
+        })
+        .collect()
+}
 pub(crate) const SA_NOCLDSTOP: u64 = 1;
 pub(crate) const SA_NOCLDWAIT: u64 = 2;
 /// `si_code` values of SIGCHLD.

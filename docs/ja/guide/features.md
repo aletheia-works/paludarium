@@ -5342,7 +5342,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が
   0 でない長い構造体には `E2BIG`）、それが表す `clone` として動きます。
-  `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` は上の PID
+  `CLONE_CLEAR_SIGHAND` は、`execve` と同じように子のシグナルの処理の設定を戻します。`set_tid` は上の PID
   名前空間で書いたとおりで、`CLONE_INTO_CGROUP` は `EINVAL` を返します。`clone` そのものは、Linux と同じく flags の
   下位 32 ビットだけを読むので、`CLONE_CLEAR_SIGHAND` は `clone3` でしか使えません。
 
@@ -5795,6 +5795,11 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
 - `CLONE_THREAD` なしで `CLONE_VM | CLONE_SIGHAND` を付けた `clone` で作ったプロセスは、
   シグナルの処理の設定を親と共有します。片方の `sigaction` が、もう片方にも見えます。
   `execve` すると、Linux と同じく、そのプロセスは自分だけの設定に戻ります。
+- `execve` は、それを呼んだスレッドとプロセスに保留中のシグナルと、ブロックするシグナルを
+  残します。ほかのスレッドは、それぞれに保留中のものとともに終わります（`de_thread`）。
+  シグナルの処理の設定は、Linux の `flush_signal_handlers` と同じく戻します。ハンドラを
+  設定したシグナルは既定に戻り、無視するシグナルは無視したままで、フラグとマスクはなくなります。
+  `CLONE_CLEAR_SIGHAND` も、子の設定を同じように戻します。
 - プロセスのスレッドは、Linux の `sighand_struct` と同じく、シグナルの処理の設定を共有します。
   ほかのスレッドが `sigaction` を呼んだときにすでに待っていた（`epoll_wait`、`poll`、`futex` の
   待ちなど）スレッドも、プロセスあてのシグナルを新しいハンドラで受け取ります。そのため、補助の

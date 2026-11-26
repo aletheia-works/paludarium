@@ -2286,6 +2286,39 @@ mod exec {
         assert!(!ct.state.signal_actions.contains_key(&10));
         assert!(!ct.state.signal_actions.contains_key(&14));
     }
+    /// `flush_signal_handlers` and `de_thread`: what the thread has pending
+    /// stays, and an ignored signal stays ignored with no flags or mask.
+    #[test]
+    fn exec_keeps_the_threads_pending_signals_and_clears_ignored_flags() {
+        let (mut k, mut t, m) = exec_setup();
+        t.state.signal_mask = 1 << 9;
+        let (pid, tid) = (u64::from(t.state.pid), u64::from(t.tid));
+        assert_eq!(syscall(&mut k, &mut t, &m, 234, [pid, tid, 10, 0, 0, 0]), 0);
+        // SIGINT ignored, with SA_RESTART and SIGTERM in its mask.
+        m.write(GuestAddr(DATA + 64), &[0; 32]).unwrap();
+        m.write_u64(GuestAddr(DATA + 64), 1).unwrap();
+        m.write_u64(GuestAddr(DATA + 72), 0x1000_0000).unwrap();
+        m.write_u64(GuestAddr(DATA + 88), 1 << 14).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [2, DATA + 64, 0, 8, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        assert!(t.state.pending.iter().any(|signal| signal.number == 10));
+        let ignored = SignalAction {
+            handler: 1,
+            ..SignalAction::default()
+        };
+        assert_eq!(t.state.signal_actions[&2], ignored);
+        assert_eq!(k.group.shared_actions().lock().unwrap()[&2], ignored);
+        // It comes once it is unblocked, of its default action.
+        m.write_u64(GuestAddr(DATA + 64), 1 << 9).unwrap();
+        syscall(&mut k, &mut t, &m, 14, [1, DATA + 64, 0, 8, 0, 0]);
+        assert_eq!(
+            k.checkpoint(&mut t, &m),
+            Next::Exit(ExitStatus::Signaled(10))
+        );
+    }
     #[test]
     fn tls_signals_reset_preserves_mask() {
         let (mut k, mut t, m) = exec_setup();

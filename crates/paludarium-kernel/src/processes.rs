@@ -3553,8 +3553,7 @@ impl Kernel {
         if !space.is_first() && space.init() == Some(pid) {
             group.set_unkillable();
         }
-        // CLONE_CLEAR_SIGHAND resets handled signals to their default and
-        // keeps ignored ones, as execve does.
+        // CLONE_CLEAR_SIGHAND resets the actions as execve does.
         if flags & CLONE_CLEAR_SIGHAND != 0 {
             group.exec_actions();
         }
@@ -3618,7 +3617,7 @@ impl Kernel {
         }
         state.on_cpu = None;
         if flags & CLONE_CLEAR_SIGHAND != 0 {
-            state.signal_actions.retain(|_, action| action.handler == 1);
+            state.signal_actions = signals::flushed(&state.signal_actions);
         }
         let mut cpu = parent.cpu.clone();
         cpu.gpr[reg::RAX] = 0;
@@ -5177,13 +5176,7 @@ impl Kernel {
         // process and the mappings end.
         failing.interpreters.clear();
         self.group.set_exe_file(failing.exe.take().map(Arc::new));
-        let ignored = thread
-            .state
-            .signal_actions
-            .iter()
-            .filter(|(_, action)| action.handler == 1)
-            .map(|(&number, &action)| (number, action))
-            .collect();
+        let ignored = signals::flushed(&thread.state.signal_actions);
         // Its io_uring requests are cancelled and its task work runs, on the
         // old image's memory (`io_uring_task_cancel`).
         crate::io_uring::exec_task(&mut crate::syscalls::Context {
@@ -5207,6 +5200,9 @@ impl Kernel {
             pid: self.process.pid,
             signal_mask: thread.state.signal_mask,
             signal_actions: ignored,
+            // And the thread's pending signals: `de_thread` frees only the
+            // other threads, with what is pending for each of them.
+            pending: std::mem::take(&mut thread.state.pending),
             cpu,
             personality,
             arrivals: thread.state.arrivals,

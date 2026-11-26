@@ -1065,18 +1065,12 @@ impl ThreadGroup {
                 ..signal
             })
     }
-    /// Resets handled signals to their default and keeps ignored ones, as
-    /// execve does. The process gets its own copy, so a process sharing the
-    /// dispositions through `CLONE_SIGHAND` keeps its handlers.
+    /// Resets the actions as execve does ([`signals::flushed`]). The process
+    /// gets its own copy, so a process sharing the dispositions through
+    /// `CLONE_SIGHAND` keeps its handlers.
     pub(crate) fn exec_actions(&self) {
         let mut slot = self.actions.lock().unwrap_or_else(PoisonError::into_inner);
-        let kept = slot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(_, action)| action.handler == 1)
-            .map(|(&number, &action)| (number, action))
-            .collect();
+        let kept = signals::flushed(&slot.lock().unwrap_or_else(PoisonError::into_inner));
         *slot = Arc::new(Mutex::new(kept));
     }
     pub(crate) fn sync_timer(&self, local: &mut ThreadState) {

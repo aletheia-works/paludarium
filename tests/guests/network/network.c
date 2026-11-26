@@ -1999,6 +1999,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "tcp-handshake")) {
+        filter_network();
         shaken();
         return 0;
     }

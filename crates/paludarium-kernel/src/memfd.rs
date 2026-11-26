@@ -395,6 +395,9 @@ impl FileHandle for Memfd {
     fn write_back(&self, offset: u64, buf: &[u8]) -> Result<(), Errno> {
         self.file.write_back(offset, buf)
     }
+    /// A write seal refuses any hole, in a hugetlbfs file too, whose
+    /// `hugetlbfs_punch_hole` asks before it rounds the range to whole huge
+    /// pages; with no page held, what it would zero is zeros already.
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
         if self.secret {
             return Err(Errno::EOPNOTSUPP);

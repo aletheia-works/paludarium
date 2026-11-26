@@ -4666,7 +4666,9 @@ pub(crate) const ESTALE: Errno = Errno(116);
 /// and memfds (on `device` [`crate::memfd::DEVICE`] or
 /// [`crate::memfd::SECRET_DEVICE`]) 1, so that neither's
 /// handle names the other's file, where tmpfs picks a random generation for
-/// each inode.
+/// each inode. A hugetlbfs memfd's is 0, as `hugetlbfs_get_inode` sets no
+/// generation; its handle is only an identifier (`AT_HANDLE_FID`), on a
+/// mount of its own.
 pub(crate) fn file_handle(kind: u64, device: u64, inode: u64) -> (u32, Vec<u8>) {
     let generation =
         u32::from(device == crate::memfd::DEVICE || device == crate::memfd::SECRET_DEVICE);

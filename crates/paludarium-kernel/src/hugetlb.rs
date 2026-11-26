@@ -258,14 +258,16 @@ fn map(
             offset,
         }
     };
-    let at = c
-        .mem
-        .map_backed(placement, len, r.prot, MappingKind::File, backing)?;
+    // One that may write grows the file to its end before it is mapped,
+    // as `hugetlbfs_file_mmap_prepare` does.
     if let Some(memfd) = memfd
         && r.prot.contains(Prot::WRITE)
     {
         memfd.extend_to(offset + len)?;
     }
+    let at = c
+        .mem
+        .map_backed(placement, len, r.prot, MappingKind::File, backing)?;
     let end = at.0 + len;
     c.mem.flag_new(at, end, true, r.stack);
     c.mem.mapped(at, end);

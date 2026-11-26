@@ -4751,11 +4751,14 @@ impl Kernel {
                         crate::landlock::READ_FILE | crate::landlock::EXECUTE,
                     )?;
                 }
-                // A memfd is on a device of its own; a removed file still on
-                // its mount's.
+                // A memfd is on a device of its own, a secret or huge one on
+                // its file system's; a removed file still on its mount's.
                 let device = match &removed {
                     Some(path) => self.files.fs().device(path),
-                    None => crate::memfd::DEVICE,
+                    None => file
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<crate::memfd::Memfd>())
+                        .map_or(crate::memfd::DEVICE, crate::memfd::device),
                 };
                 // `do_open_execat` opens the descriptor's file again.
                 opens.0.push(crate::inotify::Closing::of_handle(

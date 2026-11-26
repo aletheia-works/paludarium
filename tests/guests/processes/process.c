@@ -19455,6 +19455,20 @@ static int memfd_hugetlb_case(void) {
     char *read_only = again < 0 ? MAP_FAILED : mmap(NULL, HUGE_2M, PROT_READ, none, again, 0);
     printf(" read=%d", low_error(read_only));
     printf(" grow=%d\n", rc_errno(ftruncate(fd, 3 * HUGE_2M)));
+    /* fallocate's checks before its ENOSPC: RLIMIT_FSIZE, then F_SEAL_GROW. */
+    signal(SIGXFSZ, SIG_IGN);
+    struct rlimit fsize, small = {HUGE_2M, HUGE_2M};
+    getrlimit(RLIMIT_FSIZE, &fsize);
+    setrlimit(RLIMIT_FSIZE, &small);
+    printf("fsize=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8 * HUGE_2M)));
+    setrlimit(RLIMIT_FSIZE, &fsize);
+    printf(" in-size=%d", rc_errno(fallocate(fd, 0, 0, 4096)));
+    printf(" seal-grow=%d", rc_errno(fcntl(fd, F_ADD_SEALS, F_SEAL_GROW)));
+    printf(" past=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8 * HUGE_2M)));
+    printf(" within=%d", rc_errno(fallocate(fd, 0, 0, 4096)));
+    /* Its pages are zeros, which run nothing. */
+    char *argv[] = {"huge", NULL}, *envp[] = {NULL};
+    printf(" exec=%d\n", rc_errno(syscall(SYS_execveat, fd, "", argv, envp, AT_EMPTY_PATH)));
     return 0;
 }
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with

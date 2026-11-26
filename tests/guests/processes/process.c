@@ -12255,7 +12255,7 @@ static int io_uring_poll_add_case(void) {
     printf("write: %ld\n", (long)write(p[1], "abc", 3));
     up_run(&u, 0, 1, "multi-ready");
     up_add(&u, 6, p[0], POLLIN, 1);
-    up_run(&u, 1, 2, "multi-at-once");
+    up_run(&u, 1, 1, "multi-at-once");
     up_remove(&u, 3, 6, 0, 0, 0);
     up_run(&u, 1, 2, "multi-removed");
     for (int i = 0; i < 9; i++) write(p[1], "a", 1);

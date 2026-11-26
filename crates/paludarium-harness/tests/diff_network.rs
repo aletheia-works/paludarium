@@ -217,6 +217,10 @@ mod linux {
         case("tcp-handshake");
     }
     #[test]
+    fn network_tcp_metrics() {
+        case("tcp-metrics");
+    }
+    #[test]
     fn network_listen_errors() {
         case("listen-errors");
     }

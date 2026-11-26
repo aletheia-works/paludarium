@@ -119,7 +119,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX and UDP sockets (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX, UDP and TCP sockets (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -5760,7 +5760,7 @@ kernel.
 
 - `BPF_PROG_LOAD` loads socket filters (`BPF_PROG_TYPE_SOCKET_FILTER`),
   which a verifier checks as Linux's does, and an interpreter runs them on
-  AF_UNIX sockets they are attached to (below). It checks
+  the sockets they are attached to (below). It checks
   its arguments as Linux's `bpf_prog_load` does, in master's order and with
   its errors: the log's arguments first (a buffer without a size or a size
   without a buffer, a buffer without a level, an unknown level, `EINVAL`;
@@ -6060,7 +6060,8 @@ kernel.
   ends and resets, as `tcp_v4_rcv` and `tcp_v6_rcv` run `tcp_filter`: until
   the socket is closed and its end acknowledged.
   - It sees the TCP header, 32 bytes with the timestamps and more with SACK
-    blocks, and the data after it: sequence numbers from a random first one,
+    blocks, and the data after it: each side's sequence numbers going on from
+    its SYN's or SYN-ACK's,
     the flags (`PSH` on a write's last, `URG` and its pointer up to an
     urgent byte), the window the side offers, scaled, the pseudo-header's
     checksum and the `sk_buff` fields, with `gso_segs` and `gso_size`.
@@ -6083,6 +6084,16 @@ kernel.
     15 timeouts (`tcp_retries2`), or 8 for one whose socket has closed. A
     reset that is dropped leaves the connection open; each segment it
     sends then gets another.
+  - What a side ends with, as it goes into `TIME_WAIT` or its `LAST_ACK`
+    ends, is kept for the next connection between the same two addresses
+    in its network namespace, as Linux's `tcp_metrics` keeps it
+    (`tcp_update_metrics`): the round trip (a longer one at once, a shorter
+    one an eighth of the way), its variation, the threshold and window, and
+    the reordering. The next starts from the threshold and the reordering,
+    and from a longer first timeout when the round trip kept is longer than
+    its handshake's (`tcp_init_metrics`). A side that measured no round
+    trip, or backed off, forgets the one kept; an entry an hour old starts
+    over.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it

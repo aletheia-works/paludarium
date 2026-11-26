@@ -460,6 +460,16 @@ impl Link {
     pub(crate) fn set_user_timeout(&self, side: usize, ms: u32) {
         self.with_flows(|flows, now| flows.set_user_timeout(side, ms, now));
     }
+    /// `side` keeps what it ends with in its network's `metrics`, under its
+    /// local and remote `addresses`, and starts from what is kept there.
+    pub(crate) fn remember(
+        &self,
+        side: usize,
+        metrics: &Arc<crate::tcp_metrics::Metrics>,
+        addresses: (std::net::IpAddr, std::net::IpAddr),
+    ) {
+        self.with_flows(|flows, now| flows.remember(side, Arc::clone(metrics), addresses, now));
+    }
     /// Ends the handshake, with the server's filter its listener's: whether
     /// the connection is open at once. Else it is a request, and `opens`
     /// tells when it has opened.

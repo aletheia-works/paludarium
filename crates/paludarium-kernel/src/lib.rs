@@ -118,6 +118,7 @@ mod targets;
 #[cfg(test)]
 mod tasks_tests;
 mod tcp_info;
+mod tcp_metrics;
 mod threads;
 mod timerfd;
 mod timers;

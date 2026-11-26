@@ -316,10 +316,11 @@ verified.
     default congestion control, cubic, but past the slow start threshold the
     window grows by a segment a window, where cubic's grows with the time
     since the loss, and an acknowledgement of a gap goes at once,
-    where Linux puts the fourth and later ones off a little. A connection
-    starts afresh: Linux keeps the round trip and the reordering that an
-    earlier one to the same address ended with (`tcp_metrics`), and the
-    first timeout of the next follows. The peer's
+    where Linux puts the fourth and later ones off a little. What a
+    connection ends with is kept for the next between the same addresses
+    (`tcp_metrics`), but the round trip kept is the model's own, and there
+    is no bound on the entries, no route metric that locks one, no netlink
+    `TCP_METRICS` family and no `tcp_no_metrics_save`. The peer's
     window scale is taken as Linux's default, whatever buffer it set; and a connection the host made has
     its segments estimated, in 32 KiB segments with one acknowledgement
     for each.

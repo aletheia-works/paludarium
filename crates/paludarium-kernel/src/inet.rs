@@ -361,6 +361,9 @@ pub(crate) struct Network {
     /// was mapped when the network namespace was made, else the first's
     /// (`proc_net_ns_init`).
     pub(crate) proc_owner: (u32, u32),
+    /// What its TCP connections ended with, for the next ones between the
+    /// same addresses ([`crate::tcp_metrics`]).
+    pub(crate) tcp_metrics: Arc<crate::tcp_metrics::Metrics>,
 }
 /// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
 /// `IFF_UP` and `IFF_RUNNING` while it is up.
@@ -368,6 +371,7 @@ const IFF_UP: u16 = 0x1;
 const IFF_LOOPBACK: u16 = 0x8;
 const IFF_RUNNING: u16 = 0x40;
 const ENODEV: Errno = Errno(19);
+/// `CAP_NET_ADMIN`, which a classic filter on a TCP socket needs, and
 /// `CAP_NET_RAW`, which rebinding a socket to a device needs.
 const CAP_NET_ADMIN: u64 = 1 << 12;
 const CAP_NET_RAW: u64 = 1 << 13;
@@ -399,6 +403,7 @@ impl Network {
             sockets: Mutex::default(),
             owner: None,
             proc_owner: (0, 0),
+            tcp_metrics: Arc::default(),
         }
     }
     /// A new network namespace's network: only a loopback, down and without
@@ -4046,10 +4051,15 @@ impl InetSocket {
         if !answered {
             return Knock::Full;
         }
+        let (link, notify) = link;
         let (child, open) = listener.child(
             (theirs, locked, filtering),
             stream,
-            link,
+            (
+                link,
+                notify,
+                client.map(|client| &client.network.tcp_metrics),
+            ),
             (from, to, dif, names),
         );
         if open {
@@ -4081,11 +4091,17 @@ impl InetSocket {
     /// link-local address, `dif` is its device where the listener has none
     /// (`tcp_v6_init_req`); an IPv6 one's `IPV6_MULTICAST_IF` is `dif`, not
     /// the listener's (`tcp_v6_syn_recv_sock`, `tcp_v6_mapped_child_init`).
+    /// Each side keeps what it ends with in its own network's metrics, the
+    /// client's in `client_metrics`.
     fn child(
         &self,
         (mut options, locked, filtering): (Options, bool, crate::sockets::FilterSlot),
         stream: &Arc<Stream>,
-        (link, notify): (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
+        (link, notify, client_metrics): (
+            &OnceLock<Arc<Link>>,
+            &crate::loopback::Notify,
+            Option<&Arc<crate::tcp_metrics::Metrics>>,
+        ),
         (from, to, dif, names): (SocketAddr, SocketAddr, u32, Option<crate::loopback::Names>),
     ) -> (Arc<InetSocket>, bool) {
         // `tcp_v4_syn_recv_sock`: the hops the handshake's last segment had.
@@ -4124,6 +4140,10 @@ impl InetSocket {
             (mtu, names),
         );
         let _ = link.set(Arc::clone(&joined));
+        if let Some(metrics) = client_metrics {
+            joined.remember(0, metrics, (from.ip(), to.ip()));
+        }
+        joined.remember(1, &self.network.tcp_metrics, (to.ip(), from.ip()));
         if options.user_timeout > 0 {
             joined.set_user_timeout(1, options.user_timeout as u32);
         }
@@ -4565,7 +4585,7 @@ impl InetSocket {
             (child, open) = listener.child(
                 (theirs, locked, filtering),
                 &stream,
-                (&link, &notify),
+                (&link, &notify, Some(&self.network.tcp_metrics)),
                 (from, to, dif, names),
             );
             if open {

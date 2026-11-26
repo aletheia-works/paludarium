@@ -14,6 +14,7 @@
 //! [`loss`] says.
 
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub(crate) mod loss;
@@ -46,6 +47,8 @@ const TCP_HEADER: u32 = 20;
 const WINDOW: u32 = 65_536;
 /// A round trip of the loopback, 8 times over as `srtt_us` keeps it.
 const SRTT: u64 = 8 * 30;
+/// Its variation, 4 times over as `mdev_us` keeps it.
+const MDEV: u64 = 4 * 15;
 
 /// What `tcp_info` tells of one side.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -512,6 +515,9 @@ impl Side {
     }
 }
 
+/// A network's metrics, and a side's local and remote addresses in it.
+type Kept = (Arc<crate::tcp_metrics::Metrics>, (IpAddr, IpAddr));
+
 /// Both sides of a connection, client first.
 pub(crate) struct Flows {
     sides: [Side; 2],
@@ -541,6 +547,11 @@ pub(crate) struct Flows {
     arrivals: [VecDeque<(u64, u64)>; 2],
     moved: [u64; 2],
     end_at: [Option<u64>; 2],
+    /// What each side's network keeps of its connections, with the side's
+    /// local and remote addresses, and whether the side has told it how
+    /// it ended.
+    metrics: [Option<Kept>; 2],
+    settled: [bool; 2],
 }
 
 impl Flows {
@@ -582,7 +593,56 @@ impl Flows {
             arrivals: Default::default(),
             moved: [0; 2],
             end_at: [None; 2],
+            metrics: [None, None],
+            settled: [false; 2],
         }
+    }
+    /// `side` keeps what it ends with in `metrics`, under its `local` and
+    /// `remote` addresses, and starts from what is kept there
+    /// (`tcp_init_metrics`, as the handshake ends): the threshold, the
+    /// reordering, and a longer first timeout from a longer round trip.
+    pub(crate) fn remember(
+        &mut self,
+        side: usize,
+        metrics: Arc<crate::tcp_metrics::Metrics>,
+        addresses: (IpAddr, IpAddr),
+        now: u64,
+    ) {
+        self.advance(now);
+        let s = &mut self.sides[side];
+        let start = metrics.start(addresses, s.srtt, self.now);
+        if let Some(ssthresh) = start.ssthresh {
+            s.loss.ssthresh = ssthresh;
+        }
+        if let Some(reordering) = start.reordering {
+            s.loss.reordering = reordering;
+        }
+        if let Some(rto) = start.rto {
+            s.loss.rto = rto;
+        }
+        self.metrics[side] = Some((metrics, addresses));
+    }
+    /// `tcp_update_metrics` of `side`, once its end is acknowledged and the
+    /// peer's has come: `tcp_time_wait`, or `TCP_LAST_ACK` done.
+    fn settle(&mut self, side: usize) {
+        let s = &self.sides[side];
+        if self.settled[side] || self.dead[side] || !(s.fin_sent && s.una == s.next && s.fin_came) {
+            return;
+        }
+        self.settled[side] = true;
+        let Some((metrics, addresses)) = &self.metrics[side] else {
+            return;
+        };
+        let ended = crate::tcp_metrics::Ended {
+            srtt: s.srtt,
+            mdev: MDEV,
+            backoff: s.loss.backoff,
+            cwnd: s.cwnd,
+            ssthresh: s.loss.ssthresh,
+            open: s.loss.state == loss::State::Open,
+            reordering: s.loss.reordering,
+        };
+        metrics.update(*addresses, ended, self.now);
     }
     /// What `tcp_info` tells of `side` at `now`.
     pub(crate) fn counts(&mut self, side: usize, now: u64) -> Counts {
@@ -1496,6 +1556,7 @@ impl Flows {
                 self.disordered(packet, start);
             }
         }
+        self.settle(side);
         // `tcp_data_snd_check`.
         self.transmit(side, Nagle::Own, false);
         has_data && self.check_ack(side, defer)

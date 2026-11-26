@@ -101,7 +101,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX と UDP のソケットにアタッチします（下を参照） |
+| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX、UDP、TCP のソケットにアタッチします（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -4940,7 +4940,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`simple_xattr_set_limited`、`ENOSPC`）。
 
 - `BPF_PROG_LOAD` はソケットフィルター（`BPF_PROG_TYPE_SOCKET_FILTER`）を読み込み、
-  Linux と同じく検証器で確かめます。アタッチした AF_UNIX のソケットで、インタープリタが
+  Linux と同じく検証器で確かめます。アタッチしたソケットで、インタープリタが
   動かします（下を参照）。引数は Linux の
   `bpf_prog_load` と同じく、master の順に同じエラーで確かめます。最初はログの引数です
   （サイズのないバッファとバッファのないサイズ、レベルのないバッファ、知らないレベルは
@@ -5182,7 +5182,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `tcp_v6_rcv` が `tcp_filter` を動かすのと同じく、ソケットに届くセグメント（データ、
   確認応答、終わり、リセット）ごとに動きます。ソケットを閉じ、その終わりに確認応答が来るまでです。
   - 見えるのは、TCP ヘッダ（タイムスタンプ付きで 32 バイト、SACK のブロックがあればそれ以上）と、
-    その後のデータです。シーケンス番号は乱数の初期値から数え、フラグ（書き込みの最後の `PSH`、緊急の
+    その後のデータです。シーケンス番号はそれぞれの側の SYN か SYN-ACK のものから続き、フラグ（書き込みの最後の `PSH`、緊急の
     バイトまでの `URG` とそのポインタ）、その側が示すウィンドウ（スケールしたもの）、擬似ヘッダの
     チェックサム、`gso_segs` と `gso_size` を含む `sk_buff` のフィールドがあります。古典的な
     読み出しも同じものを見て、`SKF_AD_PAY_OFFSET` はデータの始まりです。
@@ -5199,6 +5199,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - 接続は `TCP_USER_TIMEOUT` の後、なければ 15 回のタイムアウトの後（`tcp_retries2`、
     ソケットを閉じたものは 8 回）、`ETIMEDOUT` で終わります。リセットを捨てると接続は開いたまま
     で、その後に送るセグメントごとにまたリセットが来ます。
+  - 側が `TIME_WAIT` に入るか `LAST_ACK` を終えたときのものは、Linux の `tcp_metrics` と同じく
+    （`tcp_update_metrics`）、そのネットワーク名前空間で同じ 2 つのアドレスの間の次の接続のために
+    覚えます。往復時間（長くなればすぐに、短くなれば 8 分の 1 ずつ）、そのばらつき、しきい値と
+    ウィンドウ、並べ替えの度合いです。次の接続は、そのしきい値と並べ替えの度合いから始まり、
+    覚えた往復時間がハンドシェイクのものより長ければ、最初のタイムアウトも長くなります
+    （`tcp_init_metrics`）。往復時間を測れなかったか、バックオフした側は、覚えた往復時間を
+    消します。1 時間たったものは初めからやり直します。
 
 - 古典的なフィルター（`SO_ATTACH_FILTER`、`struct sock_fprog`。ほかの大きさは `EINVAL`）は、
   Linux の `bpf_check_classic` と同じく確かめ、`bpf_convert_filter` と同じく命令ごとに

@@ -1427,6 +1427,15 @@ static int ring_run(struct ring *r, unsigned submit, unsigned wait, const char *
     return last;
 }
 
+/* A network namespace of its own, with its loopback up, from a user
+   namespace that has CAP_NET_ADMIN over it. */
+static void own_network(void) {
+    call("unshare-net", unshare(CLONE_NEWNET));
+    int control = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq up = {.ifr_name = "lo", .ifr_flags = IFF_UP};
+    call("lo-up", ioctl(control, SIOCSIFFLAGS, &up));
+    close(control);
+}
 /* A classic filter on a TCP socket needs CAP_NET_ADMIN over its network,
    which no one has over the first one from a user namespace of their own,
    whoever ran this; a UDP socket takes one. The filters are then on sockets
@@ -1439,14 +1448,75 @@ static void filter_network(void) {
     call("attach-udp", setsockopt(datagram, SOL_SOCKET, SO_ATTACH_FILTER, &keep, sizeof keep));
     close(first);
     close(datagram);
-    call("unshare-net", unshare(CLONE_NEWNET));
-    int control = socket(AF_INET, SOCK_DGRAM, 0);
-    struct ifreq up = {.ifr_name = "lo", .ifr_flags = IFF_UP};
-    call("lo-up", ioctl(control, SIOCSIFFLAGS, &up));
-    close(control);
+    own_network();
     int own = tcp(0);
     call("attach-own", setsockopt(own, SOL_SOCKET, SO_ATTACH_FILTER, &keep, sizeof keep));
     close(own);
+}
+
+/* tcp-metrics: what a connection between two addresses ends with is kept
+   for the next one between them (tcp_metrics), here its round trip: the
+   server acknowledges the client's byte late (TCP_QUICKACK off), so the
+   client's round trip is longer than a handshake's, and the next
+   connection from the same address starts with a longer first timeout
+   (tcp_init_metrics) than the first did and than one from another
+   address does. Only which is longer is shown: how long depends on the
+   machine. Each step waits for a count or a state,
+   with only a watchdog for time. */
+static int metrics_client(const char *from, int port) {
+    int c = tcp(0);
+    struct sockaddr_in a = {.sin_family = AF_INET};
+    inet_pton(AF_INET, from, &a.sin_addr);
+    if (bind(c, (void *)&a, sizeof a)) printf("  bind errno=%d\n", errno);
+    a.sin_port = htons((unsigned short)port);
+    inet_pton(AF_INET, "127.0.0.2", &a.sin_addr);
+    if (connect(c, (void *)&a, sizeof a)) printf("  connect errno=%d\n", errno);
+    return c;
+}
+static void metrics_until(const char *name, int fd, int at, unsigned value) {
+    long long end = clock_ms(CLOCK_MONOTONIC) + LOSS_WATCHDOG;
+    for (;;) {
+        unsigned char raw[512];
+        socklen_t len;
+        tcp_info_raw(fd, raw, 512, &len);
+        if ((at ? info_word(raw, at) : raw[0]) == value) return;
+        if (clock_ms(CLOCK_MONOTONIC) > end) {
+            printf("  %s never %u at %d\n", name, value, at);
+            return;
+        }
+        struct timespec t = {0, 5000000};
+        nanosleep(&t, NULL);
+    }
+}
+static void metrics(void) {
+    int port, l = fresh_listener(&port), off = 0;
+    unsigned first[3];
+    for (int round = 0; round < 3; round++) {
+        int c = metrics_client(round == 2 ? "127.0.0.3" : "127.0.0.1", port);
+        int s = accept(l, NULL, NULL);
+        unsigned char raw[512];
+        socklen_t len;
+        tcp_info_raw(c, raw, 512, &len);
+        first[round] = info_word(raw, 8);
+        printf(" round %d ssthresh=%u reordering=%u\n", round, info_word(raw, 76), info_word(raw, 88));
+        if (round == 0) setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, &off, sizeof off);
+        char byte = 'x', got[2];
+        send(c, &byte, 1, 0);
+        metrics_until("acked", c, UNACKED, 0);
+        printf("  read=%zd\n", recv(s, got, 2, 0));
+        /* The client ends first and waits in TIME_WAIT; the server's end is
+           acknowledged in LAST_ACK. Either then is TCP_CLOSE. */
+        shutdown(c, SHUT_WR);
+        printf("  end=%zd\n", recv(s, got, 2, 0));
+        shutdown(s, SHUT_WR);
+        metrics_until("client closed", c, 0, 7);
+        metrics_until("server closed", s, 0, 7);
+        close(c);
+        close(s);
+    }
+    printf(" first timeout of the second longer than the first's=%d, than another address's=%d\n",
+           first[1] > first[0], first[1] > first[2]);
+    close(l);
 }
 
 int main(int argc, char **argv) {
@@ -2014,6 +2084,13 @@ int main(int argc, char **argv) {
         close(small);
         close(l);
         close(u);
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-metrics")) {
+        /* Its own network, whose metrics no other connection has. */
+        call("unshare-user", unshare(CLONE_NEWUSER));
+        own_network();
+        metrics();
         return 0;
     }
     if (!strcmp(mode, "tcp-handshake")) {

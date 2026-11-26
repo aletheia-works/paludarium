@@ -6721,6 +6721,15 @@ mod io_uring {
         assert_eq!(batch(&mut f, &r, &[three, timer]), []);
         assert_eq!(later(&mut f, &r, SECOND), [(5, -62)]);
         assert_eq!(batch(&mut f, &r, &[one_nop]), [(3, 0), (4, 0)]);
+        // Nor is a removed one's: Linux master's `io_timeout_cancel` counts
+        // it in `cq_timeouts`, so of the removal's two completions only the
+        // removal's own counts.
+        let four = timeout(&f, TIMEOUT, 6, at, 10 * SECOND, 0, 2);
+        let removed = timeout(&f, TIMEOUT, 7, at + 16, 10 * SECOND, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[four, removed]), []);
+        let remove = timeout_remove(8, 7, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[remove]), [(8, 0), (7, -125)]);
+        assert_eq!(batch(&mut f, &r, &[one_nop]), [(3, 0), (6, 0)]);
     }
 
     /// A tag posted as a file is let go of counts for a timeout, which

@@ -20843,8 +20843,9 @@ static const struct {
     {19, 0x8000001f, 0, 0}, {20, 0x80000021, 0, 0},
 };
 /* Flags of those words that Linux sets without cpuid on some CPUs: pge,
-   pae, sse, 3dnowprefetch, fsrs and arat. */
-static const short ci_linux_sets[] = {13, 6, 25, 6 * 32 + 8, 12 * 32 + 11, 14 * 32 + 2};
+   pae, sse, 3dnowprefetch, fsrs, arat, and vnmi, which init_vmx_capabilities
+   sets from an Intel CPU's VMX capabilities. */
+static const short ci_linux_sets[] = {13, 6, 25, 6 * 32 + 8, 12 * 32 + 11, 14 * 32 + 2, 15 * 32 + 25};
 
 static int ci_lookup(const struct ci_name *table, size_t n, const char *name, size_t len) {
     for (size_t i = 0; i < n; i++)

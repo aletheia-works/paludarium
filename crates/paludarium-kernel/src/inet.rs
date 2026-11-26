@@ -3060,6 +3060,9 @@ impl InetSocket {
                 self.ports().connect(&self.this, from, Some(to));
                 s.bound = Some(from);
                 s.peer = Some(address);
+                // No route of the guest's networks to keep, nor the one an
+                // earlier connect kept (`ip6_datagram_dst_update`).
+                s.kept6 = None;
             }
         }
         Ok(0)

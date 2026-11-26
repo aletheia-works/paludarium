@@ -738,6 +738,9 @@ static void loss_step(int step, int c, int s) {
 static void lost(int l, int port) {
     int result, on = 1;
     for (int step = 0; step < 11; step++) {
+        /* Tries again only while the watchdog allows: a step that misses
+           each time gives up, with what it saw the last time. */
+        long long end = clock_ms(CLOCK_MONOTONIC) + LOSS_WATCHDOG;
         for (int tries = 0; tries < 50; tries++) {
             int c = fresh_client(port, &result), s = accept(l, NULL, NULL);
             setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
@@ -747,7 +750,7 @@ static void lost(int l, int port) {
             loss_step(step, c, s);
             close(c);
             if (step != 7 && step != 10) close(s);
-            if (loss_again && tries < 49) continue;
+            if (loss_again && tries < 49 && clock_ms(CLOCK_MONOTONIC) < end) continue;
             printf(" step %d%s\n%s", step, loss_again ? " given up" : "", loss_out);
             break;
         }

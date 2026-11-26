@@ -3029,13 +3029,19 @@ kernel.
     through an end that goes away. A removal naming a device or gateway
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
     hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
-    source and destination falls to, each hop living taking a share of the
-    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), as
-    `fib_multipath_hash_policy` 0 hashes them
-    (`fib_multipath_hash_from_keys`), by the machine's random seed, every
-    namespace's, or `net.ipv4.fib_multipath_hash_seed`, with which each
-    flow's hop is Linux's; before the hash, one whose device's own source is the lookup's;
-    through a device named, the first through it. A socket not bound takes
+    flow falls to, each hop living taking a share of the hashes by its
+    weight (`fib_select_multipath`, `fib_rebalance`). The hash is of what
+    `net.ipv4.fib_multipath_hash_policy` names (`fib_multipath_hash`): the
+    source and destination (0 and 2); those, the protocol and the ports
+    (1); or the fields `fib_multipath_hash_fields` names (3). An
+    `RTM_GETROUTE` hashes the packet `inet_rtm_getroute_build_skb` makes,
+    of UDP where it names no protocol, with ports for TCP and UDP alone,
+    and its hash of policy 3 mixed with no inner one
+    (`fib_multipath_custom_hash_skb`). The key is the machine's random
+    seed, every namespace's, or `net.ipv4.fib_multipath_hash_seed`, with
+    which each flow's hop is Linux's. Before the hash, one whose device's
+    own source is the lookup's; through a device named, the first through
+    it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
     (`ip_route_connect`). A packet may come in on the device of any hop of
@@ -3228,9 +3234,11 @@ kernel.
     hop alone, and gives the last error. A lookup takes the hop the flow's
     hash falls to, each hop living taking a share of the hashes by its
     weight (`fib6_select_path`, `rt6_multipath_rebalance`), by the same
-    seed as IPv4's, as `fib_multipath_hash_policy` 0 hashes
-    the source, the destination, the flow label and the protocol; a
-    socket's packets hash as it is bound, `::` unbound, with no flow
+    seed as IPv4's, of what `net.ipv6.fib_multipath_hash_policy` names
+    (`rt6_multipath_hash`): the source, the destination, the flow label and
+    the protocol (0 and 2); the addresses, the protocol and the ports (1);
+    or the fields `fib_multipath_hash_fields` names (3), of the flow
+    `RTM_GETROUTE` asks for too; a socket's packets hash as it is bound, `::` unbound, with no flow
     label, and one unbound takes the source of the hop that gives
     (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
     through whichever end that takes: the one its listener is bound to, or
@@ -4563,8 +4571,9 @@ kernel.
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
-  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`, and
-  `ipv4/fib_multipath_hash_seed`. They and their
+  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`,
+  `ipv4/fib_multipath_hash_seed`, and `fib_multipath_hash_policy` and
+  `fib_multipath_hash_fields` of `ipv4` and of `ipv6`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write
@@ -4601,7 +4610,11 @@ kernel.
     address is `EACCES` (`addrconf_add_dev`).
   - `fib_multipath_hash_seed` takes an unsigned `int` as
     `proc_douintvec_minmax` does (the rest of the write taken with it), 0
-    for the machine's random seed, as a new namespace has it.
+    for the machine's random seed, as a new namespace has it. So does
+    `fib_multipath_hash_policy`, of 0 to 3 (`proc_dou8vec_minmax`), and
+    `fib_multipath_hash_fields`, of 1 to 0xfff (`proc_douintvec_minmax`),
+    `EINVAL` past them; a new namespace has policy 0 and fields 7 (the
+    source, the destination and the protocol), each family its own.
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
 

@@ -1296,14 +1296,15 @@ pub(crate) struct Ask6 {
     pub metrics: Result<Metrics, Errno>,
 }
 
-/// What a multipath route's hop is chosen by (`rt6_multipath_hash`, of
-/// `fib_multipath_hash_policy` 0): the flow's source, flow label and
-/// protocol, with its destination.
+/// What a multipath route's hop is chosen by (`rt6_multipath_hash`): the
+/// flow's source, flow label, protocol and ports, with its destination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Flow6 {
     pub src: Option<Ipv6Addr>,
     pub label: u32,
     pub proto: u8,
+    pub sport: u16,
+    pub dport: u16,
 }
 /// The loopback's addresses and the routing tables, in Linux's orders.
 #[derive(Debug)]
@@ -1350,6 +1351,10 @@ pub(crate) struct Addresses {
     ready6: Vec<i32>,
     /// The seed of the hash that chooses among a multipath route's hops.
     pub multipath_seed: crate::multipath::Seed,
+    /// IPv4's `fib_multipath_hash_policy` and `fib_multipath_hash_fields`.
+    pub multipath4: crate::multipath::Policy,
+    /// IPv6's.
+    pub multipath6: crate::multipath::Policy,
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -1397,6 +1402,8 @@ impl Addresses {
             proxies: Vec::new(),
             ready6: Vec::new(),
             multipath_seed: crate::multipath::Seed::default(),
+            multipath4: crate::multipath::Policy::default(),
+            multipath6: crate::multipath::Policy::default(),
         }
     }
     /// A packet goes out through the loopback to `next` at `now`, as
@@ -3815,18 +3822,20 @@ impl Addresses {
     pub(crate) fn lookup4_flow(&self, ip: Ipv4Addr, tos: u8, oif: u32) -> Result<Route4, Errno> {
         self.lookup4_in(ip, SCOPE_UNIVERSE, oif, tos)
     }
-    /// The route a packet of `tos` to `ip` from `src` (none for a source not
-    /// chosen yet) leaves by, through `oif` where one is named, as
-    /// `ip_route_output_key_hash_rcu` finds it: [`Self::lookup4_flow`]'s,
-    /// of a multipath one the hop [`Self::path4`] takes, but where `oif`
-    /// is named, which chooses the hop itself (`fib_select_path`). The
-    /// devices come in `order`, as [`Self::select4`] takes them.
+    /// The route a packet of `tos` and `flow` to `ip` from `src` (none for
+    /// a source not chosen yet) leaves by, through `oif` where one is
+    /// named, as `ip_route_output_key_hash_rcu` finds it:
+    /// [`Self::lookup4_flow`]'s, of a multipath one the hop
+    /// [`Self::path4`] takes, but where `oif` is named, which chooses the
+    /// hop itself (`fib_select_path`). The devices come in `order`, as
+    /// [`Self::select4`] takes them.
     pub(crate) fn output4(
         &self,
         ip: Ipv4Addr,
         tos: u8,
         oif: u32,
         src: Option<Ipv4Addr>,
+        flow: crate::multipath::Flow,
         order: &[i32],
     ) -> Result<Route4, Errno> {
         let route = self.lookup4_flow(ip, tos, oif)?;
@@ -3834,11 +3843,11 @@ impl Addresses {
             return Ok(route);
         }
         let src = src.unwrap_or(Ipv4Addr::UNSPECIFIED);
-        Ok(self.path4(route, ip, src, Some(order)))
+        Ok(self.path4(route, ip, src, flow, Some(order)))
     }
-    /// The route `matched` of a packet from `src` to `ip`, of a multipath
-    /// one the next hop `fib_select_multipath` takes by the hash of the two
-    /// (`fib_multipath_hash`, of `fib_multipath_hash_policy` 0): each hop
+    /// The route `matched` of a packet of `flow` from `src` to `ip`, of a
+    /// multipath one the next hop `fib_select_multipath` takes by the hash
+    /// the namespace's policy takes of them (`fib_multipath_hash`): each hop
     /// takes the share of the hashes its weight gives it, in their order, a
     /// dead one none (`fib_rebalance`). One whose device's own source
     /// ([`Self::select4`], `nh_saddr`) is `src` comes before the others,
@@ -3849,6 +3858,7 @@ impl Addresses {
         matched: Route4,
         ip: Ipv4Addr,
         src: Ipv4Addr,
+        flow: crate::multipath::Flow,
         order: Option<&[i32]>,
     ) -> Route4 {
         let total: u64 = matched
@@ -3860,7 +3870,7 @@ impl Addresses {
         if total == 0 {
             return matched;
         }
-        let hash = u64::from(self.multipath_seed.hash4(src, ip));
+        let hash = u64::from(self.multipath_seed.hash4(self.multipath4, src, ip, flow));
         let order = order.filter(|_| !src.is_unspecified());
         let mut weight = 0u64;
         let mut best: Option<(u8, Hop4)> = None;
@@ -4087,7 +4097,14 @@ impl Addresses {
             return matched;
         }
         let src = flow.src.unwrap_or(Ipv6Addr::UNSPECIFIED);
-        let hash = i64::from(self.multipath_seed.hash6(src, ip, flow.label, flow.proto));
+        let keys = crate::multipath::Flow {
+            proto: flow.proto,
+            sport: flow.sport,
+            dport: flow.dport,
+            label: flow.label,
+            packet: false,
+        };
+        let hash = i64::from(self.multipath_seed.hash6(self.multipath6, src, ip, keys));
         let mut weight = 0u64;
         for hop in hops {
             if hop.dead {
@@ -4322,24 +4339,33 @@ impl Addresses {
         }
         best.map(|a| a.address)
     }
-    /// The address a connection to `to` leaves from: its route's
+    /// The address a connection of the protocol `proto` to `to` leaves
+    /// from: its route's
     /// ([`Self::source4`], [`Self::source6`], [`Self::select6`]); where
     /// that has none, 0.0.0.0 or `::` out through a veth end
     /// (`inet_select_addr` finding no address of a scope to fit, or
     /// `ipv6_dev_get_saddr` none at all), else `127.0.0.1` or `::1`.
-    pub(crate) fn source(&self, to: IpAddr, order: &[i32]) -> IpAddr {
+    pub(crate) fn source(&self, to: IpAddr, proto: u8, order: &[i32]) -> IpAddr {
         match to {
-            IpAddr::V4(ip) => IpAddr::V4(match self.output4(ip, 0, 0, None, order) {
-                Ok(r) => self
-                    .source4(&r, ip, order)
-                    .unwrap_or(if r.oif == LOOPBACK_OIF {
-                        Ipv4Addr::LOCALHOST
-                    } else {
-                        Ipv4Addr::UNSPECIFIED
-                    }),
-                Err(_) => Ipv4Addr::LOCALHOST,
-            }),
-            IpAddr::V6(ip) => IpAddr::V6(self.source6_through(ip, 0, &Flow6::default(), order)),
+            IpAddr::V4(ip) => IpAddr::V4(
+                match self.output4(ip, 0, 0, None, crate::multipath::Flow::of(proto), order) {
+                    Ok(r) => self
+                        .source4(&r, ip, order)
+                        .unwrap_or(if r.oif == LOOPBACK_OIF {
+                            Ipv4Addr::LOCALHOST
+                        } else {
+                            Ipv4Addr::UNSPECIFIED
+                        }),
+                    Err(_) => Ipv4Addr::LOCALHOST,
+                },
+            ),
+            IpAddr::V6(ip) => {
+                let flow = Flow6 {
+                    proto,
+                    ..Flow6::default()
+                };
+                IpAddr::V6(self.source6_through(ip, 0, &flow, order))
+            }
         }
     }
     /// The address a packet to the IPv6 address `ip` through the device
@@ -4675,7 +4701,7 @@ mod tests {
         assert!(a.local4("10.1.2.77".parse().unwrap()));
         assert!(!a.bindable4("10.2.0.1".parse().unwrap()));
         assert_eq!(
-            a.source("10.1.2.77".parse().unwrap(), &[1]),
+            a.source("10.1.2.77".parse().unwrap(), 0, &[1]),
             "10.1.2.3".parse::<IpAddr>().unwrap()
         );
         // IPv6: global first, newest first; the prefix route in the main
@@ -4826,7 +4852,7 @@ mod tests {
         a.add_route4(&local, &|_| true).unwrap();
         assert!(a.bindable4("10.7.1.1".parse().unwrap()));
         assert_eq!(
-            a.source("10.7.1.1".parse().unwrap(), &[1]),
+            a.source("10.7.1.1".parse().unwrap(), 0, &[1]),
             "10.7.1.1".parse::<IpAddr>().unwrap()
         );
         // Down: the routes of link scope go, the default table's too; host
@@ -5251,8 +5277,14 @@ mod tests {
                 .filter(|n| {
                     let [hi, lo] = n.to_be_bytes();
                     let to = Ipv4Addr::new(net[0], net[1], hi, lo);
-                    let route = a.output4(to, 0, oif, src, &order).unwrap();
-                    assert_eq!(a.output4(to, 0, oif, src, &order).unwrap(), route);
+                    let route = a
+                        .output4(to, 0, oif, src, crate::multipath::Flow::default(), &order)
+                        .unwrap();
+                    assert_eq!(
+                        a.output4(to, 0, oif, src, crate::multipath::Flow::default(), &order)
+                            .unwrap(),
+                        route
+                    );
                     route.gateway == Some(IpAddr::V4(ip(via)))
                 })
                 .count()
@@ -5278,7 +5310,14 @@ mod tests {
             .filter(|n| {
                 let [hi, lo] = n.to_be_bytes();
                 let to = Ipv4Addr::new(10, 2, hi, lo);
-                a.path4(route.clone(), to, ip("10.0.0.1"), None).oif == 1001
+                a.path4(
+                    route.clone(),
+                    to,
+                    ip("10.0.0.1"),
+                    crate::multipath::Flow::default(),
+                    None,
+                )
+                .oif == 1001
             })
             .count();
         assert!((2740..3404).contains(&taken), "{taken}");
@@ -5286,9 +5325,14 @@ mod tests {
         // the device of any.
         for n in 1..=254u8 {
             let to = Ipv4Addr::new(10, 2, 0, n);
-            let route = a.output4(to, 0, 0, None, &order).unwrap();
+            let route = a
+                .output4(to, 0, 0, None, crate::multipath::Flow::default(), &order)
+                .unwrap();
             let src = if route.oif == 1000 { own } else { other };
-            assert_eq!(Some(a.source(IpAddr::V4(to), &order)), src.map(IpAddr::V4));
+            assert_eq!(
+                Some(a.source(IpAddr::V4(to), 0, &order)),
+                src.map(IpAddr::V4)
+            );
         }
         for dev in [1000, 1001] {
             assert_eq!(
@@ -6055,6 +6099,7 @@ mod tests {
                 src: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, n)),
                 label: 0,
                 proto: 17,
+                ..Flow6::default()
             };
             let route = a.lookup6_flow(ip6("2001:db8:2::9"), 0, &flow).unwrap();
             assert_eq!(

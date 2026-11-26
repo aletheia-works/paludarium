@@ -1152,7 +1152,11 @@ verified.
   `sk_rethink_txhash`), but here a connection's path is settled as it
   opens, so a hop whose answers do not come back fails it. An ICMPv6 error
   takes the hop of its own flow, where Linux's takes that of the packet
-  it tells of (`icmp6_send`). A UDP
+  it tells of (`icmp6_send`). Under `fib_multipath_hash_policy` 1, and 3
+  with a port field, a socket's flow hashes with no ports, where Linux's
+  hashes its ports, and a random source port for one that has none yet
+  (`FLOWI_FLAG_ANY_SPORT`), so its hop may not be Linux's; the ports of
+  `RTM_GETROUTE` hash as Linux's do. A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
@@ -1232,12 +1236,14 @@ verified.
   (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
   takes `accept_local`, `send_redirects`, `shared_media` and
   `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward`,
-  `fib_multipath_hash_seed` and the `forwarding`, `rp_filter`,
+  `fib_multipath_hash_seed`, `fib_multipath_hash_policy`,
+  `fib_multipath_hash_fields` and the `forwarding`, `rp_filter`,
   `accept_dad` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
-  A write of `fib_multipath_hash_seed` is taken whole and leaves the file
-  where it was, as Linux 7.0 to 7.2 do; master takes what it reads and
+  A write of `fib_multipath_hash_seed`, `fib_multipath_hash_policy` or
+  `fib_multipath_hash_fields` is taken whole and leaves the file where it
+  was, as Linux 7.0 to 7.2 do; master takes what it reads and
   moves the file on (`proc_vec`).
   IPv6's `forwarding` joins no router anycast address, and an end made
   while `default`'s is on is in all three all-routers groups, where

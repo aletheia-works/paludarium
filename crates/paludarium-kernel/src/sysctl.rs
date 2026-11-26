@@ -136,8 +136,9 @@ impl Directory {
 }
 
 /// A file of `/proc/sys/net`, of the caller's network namespace
-/// ([`crate::netconf`]): `ipv4/fib_multipath_hash_seed` ([`crate::multipath`]),
-/// `ipv4/ip_forward` (`all`'s forwarding),
+/// ([`crate::netconf`]): `ipv4/fib_multipath_hash_seed`, and each family's
+/// `fib_multipath_hash_policy` and `fib_multipath_hash_fields`
+/// ([`crate::multipath`]), `ipv4/ip_forward` (`all`'s forwarding),
 /// `ipv4/conf/<device>/forwarding` and `rp_filter`, and
 /// `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +146,10 @@ pub(crate) enum Net {
     IpForward,
     /// `fib_multipath_hash_seed`.
     HashSeed,
+    /// `fib_multipath_hash_policy`, IPv6's where `true`.
+    HashPolicy(bool),
+    /// `fib_multipath_hash_fields`, IPv6's where `true`.
+    HashFields(bool),
     Forwarding(Target),
     RpFilter(Target),
     DisableIpv6(Target),
@@ -665,7 +670,11 @@ fn net_entry(rest: &[u8], network: &crate::inet::Network) -> Option<Entry> {
         b"/ipv6" => return directory(Directory::Ipv6),
         b"/ipv4/conf" => return directory(Directory::Conf4),
         b"/ipv6/conf" => return directory(Directory::Conf6),
+        b"/ipv4/fib_multipath_hash_fields" => return Some(Entry::Net(Net::HashFields(false))),
+        b"/ipv4/fib_multipath_hash_policy" => return Some(Entry::Net(Net::HashPolicy(false))),
         b"/ipv4/fib_multipath_hash_seed" => return Some(Entry::Net(Net::HashSeed)),
+        b"/ipv6/fib_multipath_hash_fields" => return Some(Entry::Net(Net::HashFields(true))),
+        b"/ipv6/fib_multipath_hash_policy" => return Some(Entry::Net(Net::HashPolicy(true))),
         b"/ipv4/ip_forward" => return Some(Entry::Net(Net::IpForward)),
         _ => {}
     }
@@ -786,10 +795,16 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
         Directory::Net => vec![(b"ipv4", DT_DIR), (b"ipv6", DT_DIR)],
         Directory::Ipv4 => vec![
             (b"conf", DT_DIR),
+            (b"fib_multipath_hash_fields", DT_REG),
+            (b"fib_multipath_hash_policy", DT_REG),
             (b"fib_multipath_hash_seed", DT_REG),
             (b"ip_forward", DT_REG),
         ],
-        Directory::Ipv6 => vec![(b"conf", DT_DIR)],
+        Directory::Ipv6 => vec![
+            (b"conf", DT_DIR),
+            (b"fib_multipath_hash_fields", DT_REG),
+            (b"fib_multipath_hash_policy", DT_REG),
+        ],
         Directory::Conf4 | Directory::Conf6 => devices
             .iter()
             .map(|name| (name.as_slice(), DT_DIR))
@@ -879,11 +894,18 @@ fn child(
         },
         Directory::Ipv4 => match name {
             b"conf" => dir(Directory::Conf4),
+            b"fib_multipath_hash_fields" => Some(Entry::Net(Net::HashFields(false))),
+            b"fib_multipath_hash_policy" => Some(Entry::Net(Net::HashPolicy(false))),
             b"fib_multipath_hash_seed" => Some(Entry::Net(Net::HashSeed)),
             b"ip_forward" => Some(Entry::Net(Net::IpForward)),
             _ => None,
         },
-        Directory::Ipv6 => (name == b"conf").then_some(Entry::Directory(Directory::Conf6)),
+        Directory::Ipv6 => match name {
+            b"conf" => dir(Directory::Conf6),
+            b"fib_multipath_hash_fields" => Some(Entry::Net(Net::HashFields(true))),
+            b"fib_multipath_hash_policy" => Some(Entry::Net(Net::HashPolicy(true))),
+            _ => None,
+        },
         Directory::Conf4 | Directory::Conf6 => {
             let target = match name {
                 b"all" => Target::All,
@@ -1207,17 +1229,31 @@ fn line(value: i32) -> Vec<u8> {
 
 /// The line a file of `/proc/sys/net` of `network` shows.
 fn net_line(network: &crate::inet::Network, file: Net) -> Vec<u8> {
-    if file == Net::HashSeed {
-        return format!("{}\n", network.addresses().multipath_seed.user).into_bytes();
-    }
-    line(net_value(network, file))
+    let addresses = network.addresses();
+    let policy = |v6| {
+        if v6 {
+            addresses.multipath6
+        } else {
+            addresses.multipath4
+        }
+    };
+    let value = match file {
+        Net::HashSeed => addresses.multipath_seed.user,
+        Net::HashPolicy(v6) => u32::from(policy(v6).policy),
+        Net::HashFields(v6) => policy(v6).fields,
+        _ => {
+            drop(addresses);
+            return line(net_value(network, file));
+        }
+    };
+    format!("{value}\n").into_bytes()
 }
 
 /// What a file of `/proc/sys/net` of `network`, of an `int`, shows: 0 for a
 /// device it no longer has.
 fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
     let target = match file {
-        Net::IpForward | Net::HashSeed => Target::All,
+        Net::IpForward | Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) => Target::All,
         Net::Forwarding(target)
         | Net::RpFilter(target)
         | Net::DisableIpv6(target)
@@ -1228,7 +1264,7 @@ fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
         return 0;
     };
     match file {
-        Net::HashSeed => 0,
+        Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) => 0,
         Net::IpForward | Net::Forwarding(_) => conf4.forwarding,
         Net::RpFilter(_) => conf4.rp_filter,
         Net::DisableIpv6(_) => conf6.disable_ipv6,
@@ -1438,7 +1474,9 @@ impl NetFile {
     ///   `CAP_NET_ADMIN`, then takes an `int` as `proc_dointvec` does.
     /// - `fib_multipath_hash_seed` (`proc_fib_multipath_hash_seed`) takes
     ///   an unsigned `int`, and the rest with it, as
-    ///   `proc_douintvec_minmax` does ([`parse_uint`]).
+    ///   `proc_douintvec_minmax` does ([`parse_uint`]); so do
+    ///   `fib_multipath_hash_policy` (0 to 3, `proc_dou8vec_minmax`) and
+    ///   `fib_multipath_hash_fields` (1 to 0xfff), `EINVAL` out of range.
     /// - `rp_filter` (`devinet_conf_proc`) takes one so, and marks the
     ///   device as set whatever comes of it.
     /// - IPv6's (`addrconf_sysctl_disable`, `addrconf_sysctl_forward`) take
@@ -1465,6 +1503,32 @@ impl NetFile {
                 }
                 let seed = parse_uint(buf)?;
                 self.network.addresses().multipath_seed.user = seed;
+                Ok(buf.len())
+            }
+            // `proc_dou8vec_minmax` of 0 to 3, `proc_douintvec_minmax` of 1
+            // to `FIB_MULTIPATH_HASH_FIELD_ALL_MASK`: as the seed, and
+            // `EINVAL` out of the range.
+            Net::HashPolicy(v6) | Net::HashFields(v6) => {
+                if *position != 0 {
+                    return advance(position, buf.len());
+                }
+                let value = parse_uint(buf)?;
+                let mut addresses = self.network.addresses();
+                let policy = if v6 {
+                    &mut addresses.multipath6
+                } else {
+                    &mut addresses.multipath4
+                };
+                if matches!(self.file, Net::HashPolicy(_)) {
+                    policy.policy = u8::try_from(value)
+                        .ok()
+                        .filter(|p| *p <= 3)
+                        .ok_or(Errno::EINVAL)?;
+                } else if (1..=crate::multipath::FIELDS_ALL).contains(&value) {
+                    policy.fields = value;
+                } else {
+                    return Err(Errno::EINVAL);
+                }
                 Ok(buf.len())
             }
             Net::IpForward | Net::Forwarding(_) => {

@@ -527,9 +527,14 @@ impl Network {
             None => {
                 use crate::interface::Kind;
                 if let IpAddr::V4(ip) = to.ip()
-                    && let Ok(route) =
-                        self.addresses_at(now)
-                            .output4(ip, 0, 0, source4(from), &order)
+                    && let Ok(route) = self.addresses_at(now).output4(
+                        ip,
+                        0,
+                        0,
+                        source4(from),
+                        crate::multipath::Flow::of(proto),
+                        &order,
+                    )
                     && matches!(route.kind, Kind::Unicast | Kind::Broadcast)
                     && route.oif != crate::netdev::LOOPBACK_OIF
                     && let Ok(index) = i32::try_from(route.oif)
@@ -775,7 +780,14 @@ impl Network {
             let order = there.devices().order();
             let route = there
                 .addresses_at(now)
-                .output4(from, 0, 0, Some(to), &order)
+                .output4(
+                    from,
+                    0,
+                    0,
+                    Some(to),
+                    crate::multipath::Flow::of(flow.proto),
+                    &order,
+                )
                 .ok()
                 .filter(|r| r.kind == crate::interface::Kind::Unicast)?;
             i32::try_from(route.oif).ok()?
@@ -1071,6 +1083,8 @@ impl Network {
             },
             label: 0,
             proto,
+            sport: 0,
+            dport: 0,
         }
     }
     /// The neighbour an IPv4 packet to `to` out through the veth end
@@ -1080,7 +1094,14 @@ impl Network {
     fn next_hop4(&self, index: i32, to: Ipv4Addr, flow: &Flow, now: Option<u64>) -> IpAddr {
         let order = self.devices().order();
         self.addresses_at(now)
-            .output4(to, 0, flow.oif, source4(flow.src), &order)
+            .output4(
+                to,
+                0,
+                flow.oif,
+                source4(flow.src),
+                crate::multipath::Flow::of(flow.proto),
+                &order,
+            )
             .ok()
             .filter(|r| i64::from(r.oif) == i64::from(index) && r.uses_gateway)
             .and_then(|r| r.gateway)
@@ -1407,7 +1428,7 @@ impl Network {
             let flow = Self::flow6(None, proto);
             return IpAddr::V6(addresses.source6_through(ip, oif, &flow, &order));
         }
-        addresses.source(to.ip(), &order)
+        addresses.source(to.ip(), proto, &order)
     }
     /// Whether a socket may bind to `ip`: the unspecified address, an IPv4
     /// multicast or limited broadcast one, one a local or broadcast route

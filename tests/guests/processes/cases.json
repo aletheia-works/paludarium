@@ -81,6 +81,7 @@
     {"name":"veth-ipv4-via","binary":"veth-ipv4-via"},
     {"name":"veth-ipv6-source","binary":"veth-ipv6-source"},
     {"name":"veth-hash-seed","binary":"veth-hash-seed"},
+    {"name":"veth-hash-policy","binary":"veth-hash-policy"},
     {"name":"veth-ipv6-gateway","binary":"veth-ipv6-gateway"},
     {"name":"veth-ipv6-ecmp","binary":"veth-ipv6-ecmp"},
     {"name":"veth-bindtodevice","binary":"veth-bindtodevice"},

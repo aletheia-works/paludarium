@@ -974,7 +974,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   引き直すとほかのホップに移ります（`ip6_ecmp_set_mp_hash`、`sk_rethink_txhash`）。
   ここでは接続の道筋は開くときに決まるので、答えの返らないホップの接続は失敗します。
   ICMPv6 のエラーは自分のフローのホップを取りますが、Linux のものは知らせるパケットの
-  ホップを取ります（`icmp6_send`）。
+  ホップを取ります（`icmp6_send`）。`fib_multipath_hash_policy` が 1 のとき、また 3 で
+  ポートのフィールドがあるとき、ソケットのフローはポートなしでハッシュします。Linux は
+  ソケットのポートを、まだないものには乱数の送り元ポート（`FLOWI_FLAG_ANY_SPORT`）を
+  ハッシュするので、そのホップは Linux と違うことがあります。`RTM_GETROUTE` のポートは
+  Linux と同じくハッシュします。
   経路のない UDP の connect は、Linux master が "ipv6: fix device binding after failed
   datagram connect" からするように、ソケットのデバイスを元に戻します。その修正のない
   CI のカーネルでは、スコープ ID が与えたデバイスが残ります。
@@ -1040,10 +1044,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
   フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
   `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward`、
-  `fib_multipath_hash_seed` と、`all`、`default`、`lo`、veth の端の
+  `fib_multipath_hash_seed`、`fib_multipath_hash_policy`、`fib_multipath_hash_fields` と、
+  `all`、`default`、`lo`、veth の端の
   `forwarding`、`rp_filter`、`accept_dad`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
   最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
-  そこから始まります。`fib_multipath_hash_seed` への書き込みは、Linux 7.0 から 7.2 と同じく
+  そこから始まります。`fib_multipath_hash_seed`、`fib_multipath_hash_policy`、
+  `fib_multipath_hash_fields` への書き込みは、Linux 7.0 から 7.2 と同じく
   全部を取り、ファイルの位置を動かしません。master は読んだ分だけを取り、位置を進めます
   （`proc_vec`）。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
   加わりません。`default` のものが入っている間に作った端は、全ルーターのグループ 3 つすべてに

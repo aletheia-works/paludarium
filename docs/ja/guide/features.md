@@ -5645,7 +5645,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     だけです（`rt6_score_route`）。デバイスのないソケットをリンクのグループに `connect`
     すると、`IPV6_MULTICAST_IF` のものがソケットのデバイスになります。送るたびに経路を
     引きますが、Linux の接続済みのソケットは、これらのオプションが 0 に戻っても、持っている
-    経路を使い続けます（`ip6_sk_dst_lookup_flow`）。
+    経路を使い続けます（`ip6_sk_dst_lookup_flow`）。`IP_UNICAST_IF` は、IPv4 と IPv6 の
+    ソケットでも TCP のものでも、デバイスのインデックスをネットワークバイトオーダーで、
+    ちょうど `int` の大きさで取り（ほかの長さは `EINVAL`、ないデバイスは
+    `EADDRNOTAVAIL`）、0 ならなしです。デバイスに結び付いたソケットでは `EINVAL` です
+    （`do_ip_setsockopt`）。グループでない IPv4 のアドレスへの UDP のデータグラム（IPv6 の
+    ソケットの IPv4 射影アドレスへのものも）と UDP の `connect` は、ソケット自身のデバイスが
+    なければ、`SO_BINDTODEVICE` のものと同じようにそのデバイスを通ります（`udp_sendmsg`、
+    `__ip4_datagram_connect`）。TCP は経路のとおりです。送るたびに経路を引きますが、
+    Linux の接続済みのソケットは、`connect` のあとでこのオプションが変わっても、経路が
+    変わるまでは `connect` で見つけた経路を使い続けます（`sk_dst_check`）。
   - **`TCP_INFO`** は、Linux の 280 バイトの `struct tcp_info` を、渡された大きさの分だけ
     返します（`tcp_get_info`）。リスナーは状態、待っている接続とバックログ、まだ接続して
     いないソケットは Linux の既定値、ハンドシェイク中は再送の回数（タイムアウトは

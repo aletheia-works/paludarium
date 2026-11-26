@@ -435,6 +435,7 @@ mod linux {
                     | "veth-hash-seed"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
+                    | "veth-unicast-if"
                     | "veth-multicast"
                     | "veth-ipv6-multicast"
                     | "multicast-sources"
@@ -687,6 +688,7 @@ mod linux {
         veth_hash_seed => ("veth-hash-seed","veth-hash-seed"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
+        veth_unicast_if => ("veth-unicast-if","veth-unicast-if"),
         veth_multicast => ("veth-multicast","veth-multicast"),
         veth_ipv6_multicast => ("veth-ipv6-multicast","veth-ipv6-multicast"),
         multicast_sources => ("multicast-sources","multicast-sources"),

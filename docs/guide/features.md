@@ -6580,6 +6580,17 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks
     its route up, where Linux's connected socket keeps the one it has
     (`ip6_sk_dst_lookup_flow`) when one of these options goes back to 0.
+    `IP_UNICAST_IF`, of IPv4 and IPv6 sockets and TCP's too, takes the
+    index of a device in network byte order (`EADDRNOTAVAIL` for one there
+    is not) in an `int` exactly (`EINVAL` for another length), 0 for none,
+    and is `EINVAL` on a socket bound to a device (`do_ip_setsockopt`). A
+    UDP datagram to an IPv4 address other than a group, an IPv6 socket's
+    IPv4-mapped one too, and a UDP `connect` go through its device where
+    the socket has none of its own (`udp_sendmsg`,
+    `__ip4_datagram_connect`), as through `SO_BINDTODEVICE`'s; TCP goes by
+    its routes. Each send looks its route up, where Linux's connected
+    socket keeps the one its `connect` found (`sk_dst_check`), until the
+    routes change, when the option changes after it.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
     as the room asks (`tcp_get_info`): a listener's state, connections
     waiting and backlog; a socket that has not connected, Linux's

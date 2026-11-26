@@ -2044,6 +2044,10 @@ struct Options {
     /// group goes out through where the socket has none, 0 for none, and
     /// the address (`mc_addr`) it leaves from where it is bound to none.
     multicast4: (u32, Ipv4Addr),
+    /// `IP_UNICAST_IF` (`uc_index`): the device a datagram to an IPv4
+    /// address other than a group goes out through where the socket has
+    /// none of its own, 0 for none.
+    unicast4: u32,
     /// `IP_MULTICAST_TTL`, `IP_MULTICAST_LOOP` (whether an IPv4 socket's
     /// datagram to a group comes back here) and `IP_MULTICAST_ALL` (whether
     /// it takes the groups the devices are in for other sockets).
@@ -2079,6 +2083,12 @@ impl Options {
             .find(|&device| device != 0)
             .unwrap_or(0)
     }
+    /// The device a datagram to an IPv4 address other than a group goes
+    /// out through, the socket's `device` where it has one (`udp_sendmsg`,
+    /// `__ip4_datagram_connect`): else `IP_UNICAST_IF`'s; 0 for none.
+    fn device4(&self, device: u32) -> u32 {
+        if device != 0 { device } else { self.unicast4 }
+    }
 }
 impl Default for Options {
     fn default() -> Self {
@@ -2109,6 +2119,7 @@ impl Default for Options {
             multicast_device: 0,
             unicast_device: 0,
             multicast4: (0, Ipv4Addr::UNSPECIFIED),
+            unicast4: 0,
             multicast_ttl: 1,
             multicast_loop: true,
             multicast_all: true,
@@ -2935,7 +2946,7 @@ impl InetSocket {
                 (oif, source) = self.group_route(ip, source, options)?;
                 oif
             }
-            IpAddr::V4(_) => device,
+            IpAddr::V4(_) => options.device4(device),
         };
         let through = (oif, device != 0);
         match self
@@ -3152,7 +3163,7 @@ impl InetSocket {
                 (oif, source) = self.group_route(ip, source, &options)?;
                 oif
             }
-            (_, IpAddr::V4(_)) => options.device,
+            (_, IpAddr::V4(_)) => options.device4(options.device),
         };
         let through = (oif, options.device != 0);
         let flow = Flow {
@@ -5802,6 +5813,28 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             }
             options.unicast_device = index;
         }
+        // `IP_UNICAST_IF` (`do_ip_setsockopt`), of both families and TCP's
+        // too: an `int` exactly (`EINVAL` for another length), an index in
+        // network byte order; 0 for none, else a device of the namespace
+        // (`EADDRNOTAVAIL`), and not on a socket bound to a device
+        // (`EINVAL`, as its device is no VRF's).
+        (0, 50) => {
+            let value = option4_int(c, at, len)?;
+            if len as u32 != 4 {
+                return Err(Errno::EINVAL);
+            }
+            let index = u32::from_be_bytes(value.to_le_bytes());
+            let mut options = socket.options();
+            if index != 0 {
+                if !socket.network.has_device(index) {
+                    return Err(EADDRNOTAVAIL);
+                }
+                if options.device != 0 {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            options.unicast4 = index;
+        }
         // The sticky `IPV6_PKTINFO`: a whole `in6_pktinfo` (`EINVAL` for
         // less), whose device must be the socket's where it has one
         // (`sk_dev_equal_l3scope`); neither the device nor the address is
@@ -6115,6 +6148,8 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (0, 33) => i32::from(options.multicast_ttl),
                 (0, 34) => i32::from(options.multicast_loop),
                 (0, 49) => i32::from(options.multicast_all),
+                // `IP_UNICAST_IF`, in network byte order.
+                (0, 50) => i32::from_le_bytes(options.unicast4.to_be_bytes()),
                 (41, 26) if socket.family == Family::V6 => i32::from(options.v6_only),
                 // `IPV6_MULTICAST_IF`, and `IPV6_UNICAST_IF` in network byte
                 // order; `IPV6_PKTINFO` has no getsockopt (`ENOPROTOOPT`).

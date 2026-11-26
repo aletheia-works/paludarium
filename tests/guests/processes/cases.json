@@ -84,6 +84,7 @@
     {"name":"veth-ipv6-gateway","binary":"veth-ipv6-gateway"},
     {"name":"veth-ipv6-ecmp","binary":"veth-ipv6-ecmp"},
     {"name":"veth-bindtodevice","binary":"veth-bindtodevice"},
+    {"name":"veth-unicast-if","binary":"veth-unicast-if"},
     {"name":"veth-multicast","binary":"veth-multicast"},
     {"name":"veth-ipv6-multicast","binary":"veth-ipv6-multicast"},
     {"name":"multicast-sources","binary":"multicast-sources"},

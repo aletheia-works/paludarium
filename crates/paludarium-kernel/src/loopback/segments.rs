@@ -2,14 +2,15 @@
 //! counts: what `tcp_write_xmit` cuts from each write (Nagle's check,
 //! `MSG_MORE`, `TCP_NODELAY`), when each side acknowledges (quick
 //! acknowledgements, then `tcp_send_delayed_ack`'s 40 ms), and the tail loss
-//! probe of a write whose acknowledgement waits. The bytes themselves move
-//! at once ([`super::Link`]); this only counts, in Linux 7.0's order, the
-//! segments that would have carried them. Master has the same rules, except
+//! probe of a write whose acknowledgement waits. It says when the bytes reach
+//! the peer, which [`super::Link`] then moves, and counts the segments that
+//! carry them, in Linux 7.0's order. Master has the same rules, except
 //! that it caps the delayed acknowledgement's time (`ato`) at 200 ms, where
 //! 7.0 caps it at the retransmission timeout.
 //!
-//! The windows do not grow here (`tcp_grow_window`), and nothing is lost but
-//! what a probe sends again.
+//! A window is the room the peer's buffer has, which does not grow as
+//! Linux's does (`tcp_grow_window`), and nothing is lost but what a probe
+//! sends again.
 
 use std::collections::VecDeque;
 
@@ -57,7 +58,10 @@ pub(crate) struct Counts {
     pub(crate) acked: u64,
     pub(crate) received: u64,
     pub(crate) held: u64,
-    /// This side's end was sent and not acknowledged.
+    /// The bytes written and not acknowledged, the end one of them
+    /// (`write_seq - snd_una`).
+    pub(crate) queued: u64,
+    /// This side's end waits to be sent or acknowledged.
     pub(crate) end_waits: bool,
     pub(crate) end_acked: bool,
     pub(crate) end_came: bool,
@@ -65,6 +69,11 @@ pub(crate) struct Counts {
     pub(crate) ato: u32,
     pub(crate) snd_mss: u32,
     pub(crate) rcv_mss: u32,
+    /// When data last went and came, and an acknowledgement came, in
+    /// microseconds (`lsndtime`, `lrcvtime`, `rcv_tstamp`).
+    pub(crate) data_went: Option<u64>,
+    pub(crate) data_came: Option<u64>,
+    pub(crate) ack_came: Option<u64>,
 }
 
 /// How a write goes: `MSG_MORE`, `MSG_OOB`, and the socket's
@@ -140,6 +149,9 @@ struct Side {
     una: u64,
     small: u64,
     urgent: u64,
+    /// The peer's window (`tcp_wnd_end`), and whether it held data back.
+    edge: u64,
+    blocked: bool,
     /// The end is in the write queue, and sent.
     fin: bool,
     fin_sent: bool,
@@ -177,6 +189,8 @@ impl Side {
             una: 0,
             small: 0,
             urgent: 0,
+            edge: u64::MAX,
+            blocked: false,
             fin: false,
             fin_sent: false,
             in_flight: VecDeque::new(),
@@ -200,6 +214,11 @@ impl Side {
                 ..Counts::default()
             },
         }
+    }
+    /// The data the peer's window still takes.
+    fn window(&self) -> u64 {
+        self.edge
+            .saturating_sub(self.next - u64::from(self.fin_sent))
     }
     fn packets_out(&self) -> u32 {
         self.in_flight.iter().map(|sent| sent.segments).sum()
@@ -264,6 +283,7 @@ impl Side {
             }
         }
         self.last_came = now;
+        self.counts.data_came = Some(now);
     }
     /// `tcp_rtt_estimator`'s round trip, after `sample`.
     fn round_trip(&mut self, sample: u64) {
@@ -293,11 +313,19 @@ pub(crate) struct Flows {
     owner: Option<usize>,
     backlog: VecDeque<Packet>,
     now: u64,
+    /// No clock runs, so nothing may wait for a timer.
+    timeless: bool,
+    /// The data that has come to each side and is to be moved there, with
+    /// when it came; what has been moved, and when the peer's end came.
+    arrivals: [VecDeque<(u64, u64)>; 2],
+    moved: [u64; 2],
+    end_at: [Option<u64>; 2],
 }
 
 impl Flows {
-    /// A connection whose sides advertise an MSS of `advertised`.
-    pub(crate) fn new(advertised: u32, now: u64) -> Self {
+    /// A connection whose sides advertise an MSS of `advertised`, made
+    /// `now`, if there is a clock.
+    pub(crate) fn new(advertised: u32, now: Option<u64>) -> Self {
         // `tcp_bound_to_half_wnd`: the client has only the SYN-ACK's window
         // until the server's first segment.
         let bound = advertised.min(WINDOW / 2);
@@ -321,7 +349,11 @@ impl Flows {
             wire: VecDeque::new(),
             owner: None,
             backlog: VecDeque::new(),
-            now,
+            now: now.unwrap_or(0),
+            timeless: now.is_none(),
+            arrivals: Default::default(),
+            moved: [0; 2],
+            end_at: [None; 2],
         }
     }
     /// What `tcp_info` tells of `side` at `now`.
@@ -335,6 +367,7 @@ impl Flows {
             acked: s.una - u64::from(end_acked),
             received: s.came - u64::from(s.fin_came),
             held: s.written - u64::from(s.fin) - (s.next - end),
+            queued: s.written - s.una,
             end_waits: s.fin && !end_acked,
             end_acked,
             end_came: s.fin_came,
@@ -348,8 +381,52 @@ impl Flows {
     pub(crate) fn sending(&mut self, side: usize, push: Push) {
         self.pushes[side] = push;
     }
-    /// `side` sent `len` bytes.
-    pub(crate) fn write(&mut self, side: usize, len: u64, now: u64) {
+    /// The bytes `side` has written.
+    pub(crate) fn written(&self, side: usize) -> u64 {
+        let s = &self.sides[side];
+        s.written - u64::from(s.fin)
+    }
+    /// `to` takes data up to `edge`, counted from the connection's start.
+    pub(crate) fn window(&mut self, to: usize, edge: u64, now: u64) {
+        self.advance(now);
+        let s = &mut self.sides[1 - to];
+        s.edge = edge;
+        if s.blocked && s.window() > 0 {
+            s.blocked = false;
+            self.transmit(1 - to, Nagle::Own, false);
+            self.deliver();
+        }
+    }
+    /// The next data to move to `to`, and when it came there.
+    pub(crate) fn arrival(&mut self, to: usize) -> Option<(u64, u64)> {
+        let arrival = self.arrivals[to].pop_front()?;
+        self.moved[to] += arrival.0;
+        Some(arrival)
+    }
+    /// Whether data or an end has come to each side that has not been moved.
+    pub(crate) fn arrived(&self) -> [bool; 2] {
+        [0, 1].map(|to| !self.arrivals[to].is_empty() || self.end_at[to].is_some())
+    }
+    /// The data moved to `to`.
+    pub(crate) fn moved(&self, to: usize) -> u64 {
+        self.moved[to]
+    }
+    /// When the peer's end came to `to`, which is told once.
+    pub(crate) fn ended(&mut self, to: usize) -> Option<u64> {
+        self.end_at[to].take()
+    }
+    /// When a timer may next send data that waits; none while none does.
+    pub(crate) fn wake(&self) -> Option<u64> {
+        self.sides
+            .iter()
+            .any(|s| s.written > s.next && (s.window() > 0 || !s.blocked))
+            .then(|| self.due())
+            .flatten()
+            .map(|(at, ..)| at)
+    }
+    /// `side` sent `len` bytes; a write that fills its buffer is all pushed
+    /// (`tcp_sendmsg_locked`, before `sk_stream_wait_memory`).
+    pub(crate) fn write(&mut self, side: usize, len: u64, full: bool, now: u64) {
         self.advance(now);
         if len == 0 || self.sides[side].fin {
             return;
@@ -362,7 +439,11 @@ impl Flows {
         if push.urgent {
             s.urgent = s.written;
         }
-        let nagle = if push.more { Nagle::Cork } else { Nagle::Own };
+        let nagle = match (full, push.more) {
+            (true, _) => Nagle::Push,
+            (false, true) => Nagle::Cork,
+            (false, false) => Nagle::Own,
+        };
         self.transmit(side, nagle, false);
         self.release();
     }
@@ -388,34 +469,19 @@ impl Flows {
             s.timer = None;
             s.pending = Pending::default();
         }
+        self.arrivals = Default::default();
+        self.end_at = [None; 2];
     }
-    /// `side` read `len` bytes (`tcp_recvmsg`, `__tcp_cleanup_rbuf`). Bytes
-    /// the peer still held back here have reached it already, so they go
-    /// first, as after the acknowledgement they wait for.
+    /// `side` read `len` bytes (`tcp_recvmsg`, `__tcp_cleanup_rbuf`).
     pub(crate) fn read(&mut self, side: usize, len: u64, now: u64) {
         self.advance(now);
         if len == 0 {
             return;
         }
-        let wanted = self.sides[side].copied + len;
-        loop {
-            let before = self.came(side);
-            if before < wanted && self.sides[side].pending.scheduled {
-                self.send_ack(side);
-                self.deliver();
-            }
-            if self.came(side) < wanted {
-                self.transmit(1 - side, Nagle::Push, true);
-                self.deliver();
-            }
-            if self.came(side) >= wanted || self.came(side) == before {
-                break;
-            }
-        }
         self.owner = Some(side);
         let s = &mut self.sides[side];
-        s.copied = wanted;
-        let emptied = wanted >= s.came - u64::from(s.fin_came);
+        s.copied += len;
+        let emptied = s.copied >= s.came - u64::from(s.fin_came);
         let pushed = s.pending.pushed_twice || (s.pending.pushed && !s.interactive());
         if s.pending.scheduled && (s.came - s.acked > u64::from(s.rcv_mss) || (pushed && emptied)) {
             self.send_ack(side);
@@ -454,12 +520,12 @@ impl Flows {
         self.release();
     }
 
-    /// The bytes that have come to `side`.
-    fn came(&self, side: usize) -> u64 {
-        self.sides[side].came - u64::from(self.sides[side].fin_came)
-    }
     /// Runs the timers due by `now`, each at its time.
-    fn advance(&mut self, now: u64) {
+    pub(crate) fn advance(&mut self, now: u64) {
+        // Every timer is set for later than its now.
+        if now <= self.now {
+            return;
+        }
         while let Some((at, side, ack)) = self.due().filter(|&(at, ..)| at <= now) {
             self.now = self.now.max(at);
             if ack {
@@ -469,7 +535,7 @@ impl Flows {
             }
             self.deliver();
         }
-        self.now = self.now.max(now);
+        self.now = now;
     }
     /// The next timer: its time, its side, and whether it is the delayed
     /// acknowledgement's.
@@ -515,7 +581,7 @@ impl Flows {
         if s.probe.is_some() {
             return;
         }
-        if s.written > s.next {
+        if s.written > s.next && (s.window() > 0 || s.written - s.next == u64::from(s.fin)) {
             self.transmit(side, Nagle::Push, true);
             let s = &mut self.sides[side];
             // A probe sets the retransmission timer (`tcp_rearm_rto`), not the
@@ -544,6 +610,7 @@ impl Flows {
     /// (`tcp_write_xmit`); a probe sends one segment whatever is in flight.
     fn transmit(&mut self, side: usize, nagle: Nagle, probe: bool) {
         let mut sent = false;
+        self.sides[side].blocked = false;
         loop {
             let s = &mut self.sides[side];
             let waits = s.written - s.next;
@@ -558,9 +625,19 @@ impl Flows {
             }
             // The end goes with the last data, or alone.
             let data = waits - u64::from(s.fin);
+            let window = s.window();
+            if data > 0 && window == 0 {
+                s.blocked = true;
+                break;
+            }
+            let timeless = self.timeless;
             let quota = room.min((s.cwnd / 2).max(1)).min(WINDOW / 2 / s.mss).max(1);
             let quota = if probe { 1 } else { quota };
             let mut len = data.min(u64::from(quota) * u64::from(s.mss)) as u32;
+            if u64::from(len) > window {
+                len = window as u32;
+                s.blocked = true;
+            }
             let last = u64::from(len) == data;
             let part = len % s.mss;
             let urgent = s.urgent > s.una;
@@ -569,7 +646,7 @@ impl Flows {
                 Nagle::Cork => true,
                 Nagle::Own => !s.no_delay && out > 0 && s.small > s.una,
             };
-            if part != 0 && last && !s.fin && !urgent && holds {
+            if part != 0 && last && !s.fin && !urgent && holds && !timeless {
                 len -= part;
                 if len == 0 {
                     break;
@@ -603,7 +680,11 @@ impl Flows {
         if sent {
             let now = self.now;
             s.schedule_probe(now);
-        } else if s.in_flight.is_empty() && s.written > s.next && s.timer.is_none() {
+        } else if s.in_flight.is_empty()
+            && s.written > s.next
+            && s.window() > 0
+            && s.timer.is_none()
+        {
             // `tcp_check_probe_timer`.
             s.timer = Some((Timer::Window, self.now + RTO));
         }
@@ -616,6 +697,7 @@ impl Flows {
         s.counts.segs_out += segments;
         if len > 0 {
             s.counts.data_segs_out += segments;
+            s.counts.data_went = Some(now);
             // `tcp_event_data_sent`: a reply soon after data.
             if now.saturating_sub(s.last_came) < s.ato {
                 s.pingpong = s.pingpong.saturating_add(1).min(255);
@@ -676,6 +758,7 @@ impl Flows {
         let s = &mut self.sides[side];
         // The peer's window has come.
         s.mss = s.bound;
+        s.counts.ack_came = Some(now);
         let has_data = packet.len > 0 || packet.fin;
         if has_data && packet.end <= s.came {
             // Sent again: acknowledged at once (`tcp_data_queue`).
@@ -695,12 +778,19 @@ impl Flows {
             let s = &mut self.sides[side];
             s.came = packet.end - u64::from(packet.fin);
             s.data_came(size, packet.push, packet.fin, now);
+            let arrivals = &mut self.arrivals[side];
+            match arrivals.back_mut() {
+                Some((len, at)) if *at == now => *len += u64::from(packet.len),
+                _ => arrivals.push_back((u64::from(packet.len), now)),
+            }
         }
         self.ack(side, packet.ack);
         if packet.fin {
             let s = &mut self.sides[side];
             s.came = packet.end;
             s.fin_came = true;
+            self.end_at[side] = Some(now);
+            let s = &mut self.sides[side];
             s.pending.scheduled = true;
             if s.fin_sent {
                 // `TCP_FIN_WAIT1` and `TCP_FIN_WAIT2` answer at once.
@@ -763,7 +853,7 @@ impl Flows {
             .pending
             .timer
             .is_some_and(|at| at <= now + s.ato.min(DELAY) / 4);
-        if full || (s.quick > 0 && !s.interactive()) || soon {
+        if full || (s.quick > 0 && !s.interactive()) || soon || self.timeless {
             if defer && !soon {
                 return true;
             }

@@ -338,6 +338,10 @@ impl Stream {
     /// Adds received bytes, stamped with the clock's time; returns how
     /// many fitted.
     pub fn receive(&self, bytes: &[u8]) -> usize {
+        self.receive_late(bytes, 0)
+    }
+    /// [`Self::receive`] of bytes that came `ago` nanoseconds before now.
+    pub fn receive_late(&self, bytes: &[u8], ago: u64) -> usize {
         let clock = self
             .clock
             .lock()
@@ -353,7 +357,10 @@ impl Stream {
                 s.arrivals += 1;
                 // Read under the lock, so a later delivery's time is the
                 // one kept; a failed clock keeps the stamp there was.
-                s.stamp = clock.and_then(|clock| clock()).or(s.stamp);
+                s.stamp = clock
+                    .and_then(|clock| clock())
+                    .map(|now| now.saturating_sub(ago))
+                    .or(s.stamp);
             }
             n
         };

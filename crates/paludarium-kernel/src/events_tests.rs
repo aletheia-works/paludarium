@@ -1299,6 +1299,77 @@ fn tcp_info_tells_listeners_and_connections() {
     );
 }
 #[test]
+fn data_tcp_holds_back_comes_at_its_time_whoever_looks() {
+    let mut f = network_fixture(&[]);
+    let (listener, port) = loopback_listener(&mut f, 4);
+    let pair = |f: &mut Fixture| {
+        let client = loopback_client(f, port);
+        let server = f.ret(288, [listener, 0, 0, 0x800, 0, 0]);
+        assert!((server as i64) >= 0);
+        (client, server)
+    };
+    let word = |raw: &[u8], at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+    let queued = |f: &mut Fixture, fd: u64, out: bool| {
+        crate::sockets::queued(&f.kernel.files.descriptor(fd).unwrap().file, out)
+    };
+    f.host.now.store(1_000_000_000, Ordering::SeqCst);
+    let start = f.host.now.load(Ordering::SeqCst);
+    let (client, server) = pair(&mut f);
+    // Sixteen bytes acknowledged at once, one whose acknowledgement waits,
+    // and three held for it.
+    for _ in 0..20 {
+        assert_eq!(f.ret(1, [client, DATA, 1, 0, 0, 0]), 1);
+    }
+    assert_eq!(queued(&mut f, server, false), Some(Ok(17)));
+    assert_eq!(queued(&mut f, client, true), Some(Ok(4)));
+    // Every wait and sleep ends by then.
+    let deadlines = Arc::clone(&f.kernel.files.readiness.deadlines);
+    assert_eq!(deadlines.next(), Some(start + 40_000_000));
+    let now = start + 39_000_000;
+    f.kernel.group.expire_timer(&mut f.thread.state, now);
+    assert_eq!(
+        crate::signals::next_deadline(&f.thread.state),
+        Some(start + 40_000_000)
+    );
+    // Time passes with no call on the connection; a read then finds all of
+    // it, come when it was due.
+    f.host.now.store(start + 150_000_000, Ordering::SeqCst);
+    let (_, raw) = tcp_info(&mut f, server, 512);
+    assert_eq!(word(&raw, 52), 110);
+    assert_eq!(deadlines.next(), None);
+    assert_eq!(queued(&mut f, client, true), Some(Ok(0)));
+    assert_eq!(f.ret(0, [server, DATA + 8, 64, 0, 0, 0]), 20);
+    // A poll finds it too, and the thread's own checkpoint brings it.
+    for by_poll in [true, false] {
+        let (client, server) = pair(&mut f);
+        for _ in 0..17 {
+            assert_eq!(f.ret(1, [client, DATA, 1, 0, 0, 0]), 1);
+        }
+        assert_eq!(f.ret(0, [server, DATA + 8, 64, 0, 0, 0]), 17);
+        // `MSG_MORE`, for 201 ms.
+        assert_eq!(f.ret(44, [client, DATA, 5, 0x8000, 0, 0]), 5);
+        assert_eq!(readable(&mut f, server) & 1, 0);
+        let later = f.host.now.load(Ordering::SeqCst) + 201_000_000;
+        assert_eq!(deadlines.next(), Some(later));
+        f.host.now.store(later, Ordering::SeqCst);
+        if !by_poll {
+            let before = f.kernel.files.readiness.token.value();
+            f.kernel.group.expire_timer(&mut f.thread.state, later);
+            assert_ne!(f.kernel.files.readiness.token.value(), before);
+            assert_eq!(f.thread.state.due, None);
+        }
+        assert_eq!(readable(&mut f, server) & 1, 1);
+        assert_eq!(f.ret(0, [server, DATA + 8, 64, 0, 0, 0]), 5);
+    }
+    // A connection that goes takes its time along.
+    let (client, server) = pair(&mut f);
+    assert_eq!(f.ret(44, [client, DATA, 5, 0x8000, 0, 0]), 5);
+    assert!(deadlines.next().is_some());
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(deadlines.next(), None);
+}
+#[test]
 fn loopback_servers_listen_and_accept() {
     // No policy entry: the guest's own loopback needs none.
     let mut f = network_fixture(&[]);

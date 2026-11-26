@@ -176,6 +176,8 @@ pub struct ThreadGroup {
     /// The signal of its last group stop (Linux's `group_exit_code` while
     /// stopped).
     stop_signal: std::sync::atomic::AtomicI32,
+    /// What is due in the session with no system call.
+    deadlines: std::sync::OnceLock<Arc<crate::deadlines::Deadlines>>,
 }
 /// An interval timer of the process's CPU time, as Linux's `cpu_itimer`:
 /// when it expires, in the process's CPU time (0 while it is disarmed), and
@@ -297,6 +299,7 @@ impl Default for ThreadGroup {
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
             stop_signal: std::sync::atomic::AtomicI32::new(0),
+            deadlines: std::sync::OnceLock::new(),
         }
     }
 }
@@ -686,6 +689,7 @@ impl ThreadGroup {
                     .clone(),
             ),
             first_namespaces: self.first_namespaces.clone(),
+            deadlines: self.deadlines.clone(),
             exe_file: Mutex::new(
                 self.exe_file
                     .lock()
@@ -1161,7 +1165,26 @@ impl ThreadGroup {
     pub(crate) fn timer_generation(&self) -> u64 {
         self.timer_generation.load(Ordering::SeqCst)
     }
+    /// The process's threads run what is due in the session.
+    pub(crate) fn watch(&self, deadlines: &Arc<crate::deadlines::Deadlines>) {
+        let _ = self.deadlines.set(Arc::clone(deadlines));
+    }
+    /// The thread of `inbox` sleeps until a time it knows beforehand, for as
+    /// long as what this gives is kept ([`crate::deadlines`]).
+    pub(crate) fn sleeping(
+        &self,
+        inbox: &Arc<SignalInbox>,
+    ) -> Option<crate::deadlines::Sleeping<'_>> {
+        let deadlines = self.deadlines.get()?;
+        Some(deadlines.sleeping(inbox))
+    }
+    /// Runs what is due at `now`: the process's timers, and what is due in
+    /// the session, with no lock held.
     pub(crate) fn expire_timer(&self, local: &mut ThreadState, now: u64) {
+        local.due = self.deadlines.get().and_then(|deadlines| {
+            deadlines.run(|| Some(now));
+            deadlines.next()
+        });
         self.discards.apply(local);
         self.expire_cpu_timers();
         self.expire_watchers();

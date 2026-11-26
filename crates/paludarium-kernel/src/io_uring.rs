@@ -4218,36 +4218,31 @@ fn probe(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// `mmap` of a ring descriptor, as Linux's `io_uring_get_unmapped_area`
-/// and `io_uring_mmap`: no address may be asked for (`EINVAL`), the offset's
-/// region picks the rings, the entries, or the ring of buffers of a group
+/// What a mapping of a ring descriptor shows: the pages of a region, and
+/// the length it must hold, if it must hold them all.
+pub(crate) struct Region {
+    pages: SharedPages,
+    whole: Option<u64>,
+}
+
+/// What `mmap` of a ring descriptor shows (`None` for another file), as
+/// Linux's `io_uring_get_unmapped_area` looks before the mapping is placed:
+/// no address may be asked for (`EINVAL`), and the offset's region picks
+/// the rings, the entries, or the ring of buffers of a group
 /// (`IORING_OFF_PBUF_RING`, the group's ID from bit 16 of the offset)
-/// whose pages the kernel gave (another gives `ENOMEM`), and the mapping
-/// shows from the start of them however far into the region the offset
-/// is. A mapping of the rings shows what fits, and past the rings a page
-/// raises `SIGBUS`; one of the entries or of a ring of buffers must hold
-/// them all (`EFAULT`).
-/// Only a shared mapping is implemented: a private one gives `EINVAL`.
-pub(crate) fn mmap(
-    c: &mut Context<'_>,
-    file: &Arc<dyn FileHandle>,
+/// whose pages the kernel gave (another gives `ENOMEM`).
+pub(crate) fn region(
+    file: &dyn FileHandle,
     addr: u64,
-    len: u64,
-    prot: paludarium_mmu::Prot,
-    shared: bool,
     offset: u64,
-) -> Result<u64, Errno> {
-    let ring = file
-        .as_any()
-        .and_then(|v| v.downcast_ref::<Ring>())
-        .ok_or(Errno::ENODEV)?;
+) -> Option<Result<Region, Errno>> {
+    let ring = file.as_any()?.downcast_ref::<Ring>()?;
     if addr != 0 {
-        return Err(Errno::EINVAL);
+        return Some(Err(Errno::EINVAL));
     }
-    let buffers;
-    let (pages, entries) = match offset & OFF_MMAP_MASK {
-        0 | OFF_CQ_RING => (&ring.rings, None),
-        OFF_SQES => (&ring.sqes, Some(ring.sqes_len)),
+    let (pages, whole) = match offset & OFF_MMAP_MASK {
+        0 | OFF_CQ_RING => (ring.rings.clone(), None),
+        OFF_SQES => (ring.sqes.clone(), Some(ring.sqes_len)),
         OFF_PBUF_RING => {
             // The ID is an `unsigned int` there.
             let id = ((offset & !OFF_MMAP_MASK) >> OFF_PBUF_SHIFT) as u32;
@@ -4255,37 +4250,54 @@ pub(crate) fn mmap(
                 .buffer_lists
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            buffers = u16::try_from(id)
-                .ok()
-                .and_then(|bgid| match lists.get(&bgid) {
-                    Some(BufferList::Ring(BufferRing {
-                        memory: RingMemory::Kernel(pages, size),
-                        ..
-                    })) => Some((pages.clone(), *size)),
-                    _ => None,
-                })
-                .ok_or(Errno::ENOMEM)?;
-            (&buffers.0, Some(buffers.1))
+            match u16::try_from(id).ok().and_then(|bgid| lists.get(&bgid)) {
+                Some(BufferList::Ring(BufferRing {
+                    memory: RingMemory::Kernel(pages, size),
+                    ..
+                })) => (pages.clone(), Some(*size)),
+                _ => return Some(Err(Errno::ENOMEM)),
+            }
         }
-        _ => return Err(Errno::ENOMEM),
+        _ => return Some(Err(Errno::ENOMEM)),
     };
+    Some(Ok(Region { pages, whole }))
+}
+
+/// `mmap` of a ring descriptor's `region`, as Linux's `io_uring_mmap`: the
+/// mapping shows from the start of the region however far into it the
+/// offset is. A mapping of the rings shows what fits, and past the rings a
+/// page raises `SIGBUS`; one of the entries or of a ring of buffers must
+/// hold them all (`EFAULT`).
+/// Only a shared mapping is implemented: a private one gives `EINVAL`.
+pub(crate) fn mmap(
+    c: &mut Context<'_>,
+    region: &Region,
+    placement: paludarium_mmu::Placement,
+    len: u64,
+    prot: paludarium_mmu::Prot,
+    shared: bool,
+) -> Result<u64, Errno> {
     if !shared {
         return Err(Errno::EINVAL);
     }
-    let len = len.next_multiple_of(4096);
-    if entries.is_some_and(|size| len < size.next_multiple_of(4096)) {
+    let len = len.checked_next_multiple_of(4096).ok_or(Errno::ENOMEM)?;
+    if region
+        .whole
+        .is_some_and(|size| len < size.next_multiple_of(4096))
+    {
         return Err(Errno::EFAULT);
     }
-    let at = c
-        .mem
-        .map_shared(None, len, prot, paludarium_mmu::MappingKind::File)?;
-    if let Err(e) = c
-        .mem
-        .share_pages(at, len, pages, 0, paludarium_mmu::SharedWrites::Allowed)
-    {
-        let _ = c.mem.unmap_shared(at, len);
-        return Err(e);
-    }
+    let at = c.mem.map_backed(
+        placement,
+        len,
+        prot,
+        paludarium_mmu::MappingKind::File,
+        paludarium_mmu::Backing::Shared {
+            pages: &region.pages,
+            offset: 0,
+            writes: paludarium_mmu::SharedWrites::Allowed,
+        },
+    )?;
     c.group.numa().forget(at.0, len);
     Ok(at.0)
 }

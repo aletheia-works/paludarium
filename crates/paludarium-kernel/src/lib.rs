@@ -39,6 +39,7 @@ mod bpf_prog_tests;
 mod bpf_tests;
 mod bpf_trie;
 mod bpf_verifier;
+mod deadlines;
 mod devices;
 mod dnotify;
 mod epoll;
@@ -804,6 +805,8 @@ pub struct ThreadState {
     pub(crate) timer: signals::RealTimer,
     /// The earliest POSIX timer deadline, synced from the thread group.
     pub(crate) posix_deadline: Option<u64>,
+    /// When something is next due in the session ([`deadlines`]).
+    pub(crate) due: Option<u64>,
     pub stopped: bool,
     /// The thread's name (`comm`), NUL-padded: PR_SET_NAME and PR_GET_NAME.
     pub(crate) name: [u8; 16],
@@ -930,6 +933,7 @@ impl Kernel {
     pub fn new(host: Arc<dyn Host>) -> Self {
         let files = files::Files::with_host(Arc::clone(&host));
         let group = Arc::new(ThreadGroup::default());
+        group.watch(&files.readiness.deadlines);
         let processes = Arc::new(Processes::new(group.clone()));
         Kernel {
             host,

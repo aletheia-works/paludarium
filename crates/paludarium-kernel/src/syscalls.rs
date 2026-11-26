@@ -976,6 +976,7 @@ fn sleep_until(
         _ => None,
     };
     let _target_sleeping = target.as_deref().map(crate::ThreadGroup::cpu_sleep);
+    let _until = group.sleeping(c.inbox);
     // A process signal sent after this count can set the wake the drain
     // below clears, even one the drain before the wait takes in: a later
     // count tells that wake from an interruption once the wait ends. The
@@ -2526,33 +2527,22 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if len == 0 || !matches!(flags & (MAP_SHARED | MAP_PRIVATE), MAP_SHARED | MAP_PRIVATE) {
         return err(Errno::EINVAL);
     }
-    // A ring of io_uring maps its own pages.
-    if let Some(file) = &file
-        && file
-            .as_any()
-            .is_some_and(|v| v.is::<crate::io_uring::Ring>())
+    let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    // A ring of io_uring maps its own pages. It is asked for them before
+    // the mapping is placed, with the address asked for, which Linux rounds
+    // down to its page unless it is fixed (`round_hint_to_min`).
+    let asked = if fixed { addr } else { addr & !4095 };
+    let region = match file
+        .as_ref()
+        .and_then(|file| crate::io_uring::region(file.as_ref(), asked, offset))
+        .transpose()
     {
-        return match crate::io_uring::mmap(
-            c,
-            file,
-            addr,
-            len,
-            prot,
-            flags & MAP_SHARED != 0,
-            offset,
-        ) {
-            Ok(at) => {
-                // `perf_event_mmap` of the new VMA.
-                crate::perf::mapped(c, at);
-                ok(at)
-            }
-            Err(e) => err(e),
-        };
-    }
+        Ok(region) => region,
+        Err(e) => return err(e),
+    };
     // A fixed mapping below `mmap_min_addr`, in what a program may map,
     // needs CAP_SYS_RAWIO (`security_mmap_addr`), before its file is asked.
-    if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 && addr & 4095 == 0 && below_min(c, addr, len)
-    {
+    if fixed && addr & 4095 == 0 && below_min(c, addr, len) {
         return err(Errno::EPERM);
     }
     let event = file
@@ -2560,6 +2550,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .is_some_and(|f| f.as_any().is_some_and(|v| v.is::<crate::perf::EventFile>()));
     if let Some(file) = &file
         && !event
+        && region.is_none()
         && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len, noexec)
     {
         return err(e);
@@ -2574,7 +2565,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         MappingKind::Anonymous
     };
     let at = GuestAddr(addr);
-    let placement = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+    let placement = if fixed {
         if at.page_offset() != 0 {
             return err(Errno::EINVAL);
         }
@@ -2652,6 +2643,17 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // `check_mappable`).
     if flags & (MAP_GROWSDOWN | MAP_SHARED) == MAP_GROWSDOWN | MAP_SHARED {
         return err(Errno::EINVAL);
+    }
+    if let Some(region) = &region {
+        let shared = flags & MAP_SHARED != 0;
+        return match crate::io_uring::mmap(c, region, placement, len, prot, shared) {
+            Ok(at) => {
+                // `perf_event_mmap` of the new VMA.
+                crate::perf::mapped(c, at);
+                ok(at)
+            }
+            Err(e) => err(e),
+        };
     }
     // An event's ring buffer maps its own pages (`perf_mmap`).
     if let Some(file) = &file

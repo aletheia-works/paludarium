@@ -2345,6 +2345,11 @@ impl InetSocket {
     fn now(&self) -> Option<u64> {
         self.host.clock(paludarium_host::ClockId::Monotonic).ok()
     }
+    /// Runs what is due, so that what the socket shows next is as of now.
+    /// Called with no socket's state locked.
+    fn settle(&self) {
+        self.hub.deadlines.run(|| self.now());
+    }
     fn options(&self) -> MutexGuard<'_, Options> {
         self.options.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -2373,6 +2378,7 @@ impl InetSocket {
         if self.datagram {
             return self.receive_datagram(buf, peek, waits);
         }
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let mut s = self.lock();
         s.note();
@@ -2414,6 +2420,7 @@ impl InetSocket {
     /// `ENOTCONN` for a listener, `EINVAL` with `SO_OOBINLINE` or none
     /// waiting; `peek` leaves it. Only the guest's own loopback carries one.
     fn receive_urgent(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let s = self.lock();
         if s.listen.is_some() {
@@ -2435,6 +2442,7 @@ impl InetSocket {
     }
     /// Whether the next read is at the urgent mark, for `SIOCATMARK`.
     pub(crate) fn at_mark(&self) -> bool {
+        self.settle();
         Self::joined(&self.lock()).is_some_and(|(link, side)| link.urgent_state(side).1)
     }
     /// `write` for the task whose real user and group IDs are `ids`.
@@ -2458,6 +2466,7 @@ impl InetSocket {
         if self.datagram {
             return self.send_datagram(bytes, to, ids);
         }
+        self.settle();
         let no_delay = self.options().no_delay;
         let mut s = self.lock();
         s.note();
@@ -3435,10 +3444,15 @@ impl InetSocket {
         if self.datagram {
             return Ok(if outgoing { 0 } else { self.next_datagram() });
         }
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let s = self.lock();
         if s.listen.is_some() {
             return Err(Errno::EINVAL);
+        }
+        if outgoing && let Some((link, side)) = Self::joined(&s) {
+            let queued = link.segments(side).queued;
+            return Ok(usize::try_from(queued).unwrap_or(usize::MAX));
         }
         // Not inline, the urgent byte and what follows it wait past the
         // mark (`tcp_inq`).
@@ -3853,6 +3867,7 @@ impl InetSocket {
             .store(self.uid.load(Ordering::SeqCst), Ordering::SeqCst);
         child.embryo.store(true, Ordering::SeqCst);
         let own = Stream::new(from);
+        let mtu = self.network.veth_link(dif.cast_signed()).1;
         own.set_waker(stream_waker(&child.signals, &child.hub, &own));
         own.set_clock(realtime(&child.host));
         size_buffers(&own, &options);
@@ -3860,8 +3875,9 @@ impl InetSocket {
             stream,
             &own,
             (from, to),
-            &self.host,
+            (&self.host, &self.hub.deadlines),
             [Arc::clone(notify), child.urgent_notify()],
+            mtu,
         );
         let _ = link.set(Arc::clone(&joined));
         let own_link = Arc::new(OnceLock::new());
@@ -4357,6 +4373,7 @@ impl FileHandle for InetSocket {
             return Ok((OUT | (u32::from(ready) * IN) | error | ends, s.received, 0));
         }
         self.retry_syns();
+        self.settle();
         let inline = self.options().out_of_band_inline;
         let mut s = self.lock();
         // A listener is readable while a connection waits, and no more
@@ -4612,6 +4629,7 @@ impl Network {
         // Linux's retransmission timer does on its own.
         if let Some(socket) = sockets.first() {
             socket.retry_syns();
+            socket.settle();
         }
         let mut entries: Vec<Entry> = sockets.iter().flat_map(|socket| socket.diag(now)).collect();
         let mut ports = self.ports(false);
@@ -4723,6 +4741,7 @@ impl InetSocket {
         // FIN counts until a read meets it, and this side's SYN or FIN
         // until its peer has it.
         let (unread, unsent) = stream.queued();
+        let unacked = Self::joined(&s).map(|(link, side)| link.segments(side).queued);
         let peer_ended = stream.readiness().read_closed && stream.phase() == Phase::Open;
         let unread = unread + usize::from(peer_ended && !s.eof_read);
         let queues = (unread as u32, unsent as u32);
@@ -4791,7 +4810,10 @@ impl InetSocket {
         entries.push(Entry {
             peer: Some(stream.peer()),
             timer,
-            queues: (queues.0, queues.1 + sending),
+            queues: (
+                queues.0,
+                unacked.map_or(queues.1 + sending, |unacked| unacked as u32),
+            ),
             ..entry(state, Table::Connected, shut)
         });
         entries
@@ -4863,6 +4885,20 @@ impl InetSocket {
         };
         let open = stream.phase() == Phase::Open;
         let unsent = unsent as u64;
+        let segments = Self::joined(s).map(|(link, side)| link.segments(side));
+        // A loopback connection's times are its segments'.
+        let at = |micros: Option<u64>| micros.map(|at| at.saturating_mul(1000)).or(counts.opened);
+        let (went, came, acked) = match &segments {
+            Some(of) => (at(of.data_went), at(of.data_came), at(of.ack_came)),
+            None => {
+                let (went, came) = (counts.wrote, counts.came);
+                (
+                    went.or(counts.opened),
+                    came.or(counts.opened),
+                    went.max(came).or(counts.opened),
+                )
+            }
+        };
         let carried = tcp_info::Carried {
             accepted: Self::joined(s).is_some_and(|(_, side)| side == 1),
             sent: counts.written.saturating_sub(unsent),
@@ -4870,10 +4906,11 @@ impl InetSocket {
             received: counts.read + unread as u64,
             fin_received: open && ready.read_closed,
             unsent,
-            since_sent: since(counts.wrote.or(counts.opened)),
-            since_received: since(counts.came.or(counts.opened)),
+            since_sent: since(went),
+            since_received: since(came),
+            since_ack: since(acked),
             rcv_wscale: counts.rcv_wscale,
-            segments: Self::joined(s).map(|(link, side)| link.segments(side)),
+            segments,
         };
         let in_flight = u32::from(matches!(state, TCP_FIN_WAIT1 | TCP_LAST_ACK));
         TcpInfo::connected(state, &carried, in_flight)

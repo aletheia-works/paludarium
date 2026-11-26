@@ -1145,6 +1145,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFDIO_WAKE` がその範囲を取ったとき、`UFFDIO_UNREGISTER` がないページについて
   登録した範囲からそれを取ったとき、ファイルが閉じられたとき、シグナルが来たときに
   終わり、命令は、Linux がフォールトをやり直すのと同じくもう一度動きます。
+  先に受け取るシグナルがなければ、このやり直しは、ページを取り込んだかどうかに関わらず
+  スレッド自身のコードのマイナーフォールト（`ru_minflt`、`page-faults`、`minor-faults`）
+  として数えます。最初の試みは VMA のロックの下で動き、そのやり直しは
+  `FAULT_FLAG_TRIED` にならないからです。
   `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。
   `UFFDIO_WRITEPROTECT` は、`mwriteprotect_range` と同じく VMA ごとに、範囲のページを
   保護するか保護を解きます。どの VMA も書き込み保護について登録したものでなければ

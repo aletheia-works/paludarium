@@ -411,6 +411,7 @@ pub mod faults {
         static KERNEL: Cell<bool> = const { Cell::new(false) };
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
+        static NOTED: Cell<bool> = const { Cell::new(false) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
     }
 
@@ -542,11 +543,21 @@ pub mod faults {
     }
 
     pub(crate) fn count(at: At) {
+        NOTED.with(|noted| noted.set(true));
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
         } else if !add(false, at) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
+    }
+
+    /// What `f` gives, and whether a fault was counted ([`count`]) while it
+    /// ran.
+    pub(crate) fn noted<T>(f: impl FnOnce() -> T) -> (T, bool) {
+        let was = NOTED.with(|noted| noted.replace(false));
+        let result = f();
+        let counted = NOTED.with(|noted| noted.replace(was));
+        (result, counted)
     }
 
     pub(crate) fn count_forced() {
@@ -9763,6 +9774,28 @@ impl AddressSpace {
             }
         })
     }
+    /// Tries the access of the calling host thread's guest code `addr`
+    /// again once a `userfaultfd`'s wait for it has ended, as Linux's
+    /// `do_user_addr_fault` retries the fault: the page is brought in if it
+    /// is still missing and may be, and the retry counts as a fault of the
+    /// code whether it brought anything in or not. As the first try of a
+    /// fault of user code runs under the VMA's lock, whose retry is not
+    /// `FAULT_FLAG_TRIED`, it is a minor one. Nothing while the page still
+    /// waits; the instruction then faults again.
+    pub fn retry_own_fault(&self, addr: GuestAddr, write: bool, fetch: bool) {
+        if self.userfault_for(addr, write, fetch).is_some() {
+            return;
+        }
+        let (done, counted) = faults::noted(|| self.touch(addr, write, fetch));
+        if done && !counted {
+            faults::taken_as_own(|| {
+                faults::count(faults::At {
+                    addr: addr.0,
+                    present: true,
+                });
+            });
+        }
+    }
     pub fn fetch(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().fetch(addr, buf)
     }
@@ -11524,6 +11557,55 @@ mod tests {
         faults::arm(true);
         faults::unbind();
         space.write(page(7, 0), &[1]).unwrap();
+    }
+
+    #[test]
+    fn a_retried_fault_counts_once_as_the_code_s_own() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3]);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+        }
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                3 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let page = |n: u64| GuestAddr(at.0 + n * PAGE_SIZE);
+        space.write(page(0), &[1]).unwrap();
+        let _ = (faults::take(), faults::take_forced());
+        space
+            .view()
+            .userfault_register(page(1).0, page(2).0, 7, Userfault::MISSING)
+            .unwrap();
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        let load = || counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
+        // A page that is there, as a fill left it: one, though nothing is
+        // brought in; in the kernel's work too, as the code's.
+        let was = faults::set_kernel(true);
+        space.retry_own_fault(page(0), true, false);
+        faults::set_kernel(was);
+        assert_eq!(load(), [1, 0, 0]);
+        // One still missing waits again, and counts nothing yet.
+        space.retry_own_fault(page(1), false, false);
+        assert_eq!((load(), space.resident(page(1))), ([1, 0, 0], Some(false)));
+        // One no longer registered is brought in, and counts once.
+        space.retry_own_fault(page(2), false, false);
+        assert_eq!(load(), [2, 0, 0]);
+        faults::unbind();
     }
 
     #[test]

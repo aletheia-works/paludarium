@@ -318,6 +318,7 @@ mod linux {
                     | "userfaultfd-wp-async"
                     | "userfaultfd-events"
                     | "userfaultfd-scan"
+                    | "userfaultfd-major"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -862,6 +863,7 @@ mod linux {
         userfaultfd_wp_async => ("userfaultfd-wp-async","userfaultfd"),
         userfaultfd_events => ("userfaultfd-events","userfaultfd"),
         userfaultfd_scan => ("userfaultfd-scan","userfaultfd"),
+        userfaultfd_major => ("userfaultfd-major","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

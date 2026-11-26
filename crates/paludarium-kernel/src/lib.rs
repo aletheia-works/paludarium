@@ -1298,7 +1298,17 @@ impl Kernel {
             processes: &self.processes,
         };
         let sigbus = userfaultfd::fault(&mut ctx, context, access) == Some(true);
+        // Unless a signal is to be taken first, the fault is tried again
+        // (`fault_signal_pending`), and counts.
+        let retried = !sigbus && !events::signalled(&ctx);
         self.inbox.drain(&mut thread.state);
+        if retried {
+            mem.retry_own_fault(
+                paludarium_types::GuestAddr(access.address),
+                access.write,
+                access.fetch,
+            );
+        }
         if sigbus {
             signals::queue(
                 &mut thread.state,

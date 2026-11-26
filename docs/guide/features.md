@@ -1286,6 +1286,10 @@ kernel.
   `UFFDIO_WAKE` takes its range, `UFFDIO_UNREGISTER` takes it from a range
   registered for missing pages, or the file is closed, and a signal ends
   it too; then the instruction runs again, as Linux retries the fault.
+  Unless a signal is to be taken first, the retry counts as a minor fault
+  of the thread's own code (`ru_minflt`, `page-faults`, `minor-faults`),
+  whether it brings the page in or not: its first try ran under the VMA's
+  lock, whose retry is not `FAULT_FLAG_TRIED`.
   With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
   instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
   their protection, VMA by VMA as `mwriteprotect_range` does: each must be

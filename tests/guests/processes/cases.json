@@ -262,6 +262,7 @@
     {"name":"userfaultfd-wp-async","binary":"userfaultfd"},
     {"name":"userfaultfd-events","binary":"userfaultfd"},
     {"name":"userfaultfd-scan","binary":"userfaultfd"},
+    {"name":"userfaultfd-major","binary":"userfaultfd"},
     {"name":"mqueue-calls","binary":"mqueue"},
     {"name":"mqueue-limits","binary":"mqueue"},
     {"name":"mqueue-wait","binary":"mqueue"},

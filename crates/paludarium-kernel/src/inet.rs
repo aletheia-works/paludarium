@@ -367,6 +367,7 @@ const IFF_LOOPBACK: u16 = 0x8;
 const IFF_RUNNING: u16 = 0x40;
 const ENODEV: Errno = Errno(19);
 /// `CAP_NET_RAW`, which rebinding a socket to a device needs.
+const CAP_NET_ADMIN: u64 = 1 << 12;
 const CAP_NET_RAW: u64 = 1 << 13;
 impl Network {
     pub(crate) fn new(policy: NetworkPolicy) -> Self {
@@ -5780,9 +5781,20 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         }
         // `SO_ATTACH_FILTER`, `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and
         // `SO_ATTACH_BPF`, as a socket pair takes them; the socket's lock,
-        // not its options', holds the filter.
+        // not its options', holds the filter. A classic filter on a TCP
+        // socket needs `CAP_NET_ADMIN` over its network, before the program
+        // is read, as `sk_setsockopt` asks: it would see sequence numbers.
         (1, 26 | 27 | 44 | 50) => {
             let value = option_int(c, at, len)?;
+            if name == 26
+                && tcp
+                && !c
+                    .process
+                    .credentials
+                    .capable_in(CAP_NET_ADMIN, socket.network.owner())
+            {
+                return Err(Errno::EPERM);
+            }
             let set =
                 crate::sockets::set_filter(c, socket, name as u32, at, len as u32 as i32, value)
                     .unwrap_or(Err(ENOPROTOOPT));

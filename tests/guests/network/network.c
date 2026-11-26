@@ -17,11 +17,13 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1164,6 +1166,28 @@ static int ring_run(struct ring *r, unsigned submit, unsigned wait, const char *
     return last;
 }
 
+/* A classic filter on a TCP socket needs CAP_NET_ADMIN over its network,
+   which no one has over the first one from a user namespace of their own,
+   whoever ran this; a UDP socket takes one. The filters are then on sockets
+   of that namespace's own network, its loopback up. */
+static void filter_network(void) {
+    int first = tcp(0), datagram = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sock_fprog keep = {1, (struct sock_filter[]){LOSS_KEEP}};
+    call("unshare-user", unshare(CLONE_NEWUSER));
+    call("attach-first", setsockopt(first, SOL_SOCKET, SO_ATTACH_FILTER, &keep, sizeof keep));
+    call("attach-udp", setsockopt(datagram, SOL_SOCKET, SO_ATTACH_FILTER, &keep, sizeof keep));
+    close(first);
+    close(datagram);
+    call("unshare-net", unshare(CLONE_NEWNET));
+    int control = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq up = {.ifr_name = "lo", .ifr_flags = IFF_UP};
+    call("lo-up", ioctl(control, SIOCSIFFLAGS, &up));
+    close(control);
+    int own = tcp(0);
+    call("attach-own", setsockopt(own, SOL_SOCKET, SO_ATTACH_FILTER, &keep, sizeof keep));
+    close(own);
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) return 99;
     const char *mode = argv[1];
@@ -1732,6 +1756,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "tcp-loss")) {
+        filter_network();
         int port;
         int l = fresh_listener(&port);
         lost(l, port);

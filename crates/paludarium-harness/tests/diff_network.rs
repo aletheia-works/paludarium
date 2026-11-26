@@ -210,8 +210,7 @@ mod linux {
     }
     #[test]
     fn network_tcp_loss() {
-        // Each step tries again for up to 10 seconds.
-        case_within("tcp-loss", Duration::from_secs(150));
+        case("tcp-loss");
     }
     #[test]
     fn network_listen_errors() {

@@ -5903,7 +5903,9 @@ kernel.
     some path has not written it, a jump past the end, an ancillary load
     Linux does not know, and a last instruction that does not return. It
     is `EFAULT` for instructions that cannot be read, and `EPERM` on a
-    locked socket.
+    locked socket. On a TCP socket it is `EPERM`, before the program is
+    read, without `CAP_NET_ADMIN` in the user namespace that owns the
+    socket's network namespace, as Linux's `sk_setsockopt` asks.
   - The conversion is `EINVAL` for a jump that the converted program's
     16-bit offset cannot hold, and for any jump placed past its 32,767th
     instruction, as Linux's first pass, which takes every target to be at

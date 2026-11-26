@@ -722,9 +722,6 @@ impl AtRead {
         }
     }
 }
-/// The task's process, thread and whether it is a thread's file, for
-/// [`AtRead::find`], with the table held weakly, as the file that holds it
-/// sits in a descriptor table of theirs.
 /// The root of the thread that reads, at each read: the caller's, as its
 /// process last published its files ([`crate::proc::caller`]), so a
 /// `chroot` after the open, or another process that got the descriptor,
@@ -743,6 +740,9 @@ pub(super) fn reader_root(c: &Context<'_>, opener: Vec<u8>) -> crate::proc::Read
             .unwrap_or_else(|| opener.clone())
     })
 }
+/// The task's process, thread and whether it is a thread's file, for
+/// [`AtRead::find`], with the table held weakly, as the file that holds it
+/// sits in a descriptor table of theirs.
 fn at_read(
     processes: &std::sync::Arc<crate::processes::Processes>,
     task: &Task,

@@ -1565,7 +1565,9 @@ impl Kernel {
     /// has about one sample of each, with its own registers. It is not an
     /// interrupt: a run is at least [`PACE_FLOOR`] instructions.
     pub fn run_budget(&mut self, budget: u64) -> u64 {
+        // A run not paced tells nothing of the rate.
         let Some(due) = self.pace.due else {
+            self.pace.run = None;
             return budget;
         };
         let n = match self.pace.rate {

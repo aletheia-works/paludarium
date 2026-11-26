@@ -14320,4 +14320,11 @@ fn a_sampling_clock_ends_each_run_about_when_it_is_to_fire() {
     kernel.pace.due = Some(1_000);
     assert_eq!(kernel.run_budget(100_000), PACE_FLOOR);
     assert_eq!(kernel.run_budget(100), 100);
+    // A run once no clock samples it, which uses its whole budget, keeps
+    // the rate.
+    kernel.pace.due = None;
+    assert_eq!(kernel.run_budget(100_000), 100_000);
+    host.set_clock(paludarium_host::ClockId::Monotonic, 2_000_000);
+    kernel.pace.ran(&*host);
+    assert_eq!(kernel.pace.rate, Some((PACE_FLOOR, 10_000)));
 }

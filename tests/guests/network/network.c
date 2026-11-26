@@ -735,21 +735,38 @@ static void loss_step(int step, int c, int s) {
 /* Every line is decided by counts and conditions; what a timer could have
    changed before it was seen is told by a count past the one it waits for,
    and the step is then done again. */
+/* A try that goes on past twice the watchdog is stuck in a call that does
+   not return: it says where, with what it saw so far, and the run ends. */
+static char loss_where[64];
+static void loss_stuck(int signal) {
+    (void)signal;
+    fflush(stdout);
+    if (write(1, loss_where, strlen(loss_where)) < 0 || write(1, loss_out, loss_len) < 0) _exit(2);
+    _exit(1);
+}
 static void lost(int l, int port) {
     int result, on = 1;
+    signal(SIGALRM, loss_stuck);
     for (int step = 0; step < 11; step++) {
         /* Tries again only while the watchdog allows: a step that misses
            each time gives up, with what it saw the last time. */
         long long end = clock_ms(CLOCK_MONOTONIC) + LOSS_WATCHDOG;
         for (int tries = 0; tries < 50; tries++) {
-            int c = fresh_client(port, &result), s = accept(l, NULL, NULL);
+            loss_len = loss_again = 0;
+            snprintf(loss_where, sizeof loss_where, " step %d stuck on try %d\n", step, tries);
+            alarm(2 * LOSS_WATCHDOG / 1000);
+            int c = fresh_client(port, &result);
+            loss_say("  connect=%d\n", result);
+            int s = accept(l, NULL, NULL);
+            loss_say("  accepted\n");
+            loss_len = 0;
             setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
             setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
-            loss_len = loss_again = 0;
             loss_start = clock_ms(CLOCK_MONOTONIC);
             loss_step(step, c, s);
             close(c);
             if (step != 7 && step != 10) close(s);
+            alarm(0);
             if (loss_again && tries < 49 && clock_ms(CLOCK_MONOTONIC) < end) continue;
             printf(" step %d%s\n%s", step, loss_again ? " given up" : "", loss_out);
             break;

@@ -1355,6 +1355,63 @@ pub(crate) struct Addresses {
     pub multipath4: crate::multipath::Policy,
     /// IPv6's.
     pub multipath6: crate::multipath::Policy,
+    serials6: Serials6,
+}
+/// What the route an IPv6 socket keeps hangs on ([`Addresses::keeps6`]):
+/// counted up by each change that makes Linux look such a route up again, as
+/// it renews the serial numbers of its tables' nodes (`fn_sernum`).
+#[derive(Debug, Default)]
+struct Serials6 {
+    last: u64,
+    /// The last change of every node (`fib6_flush_trees`).
+    all: u64,
+    /// By a node's table and prefix: the last route added there, which is
+    /// the change of the nodes above it too, and the last change of the
+    /// node alone.
+    nodes: std::collections::BTreeMap<(u32, Ipv6Addr, u8), (u64, u64)>,
+}
+impl Serials6 {
+    /// How many nodes are told apart; with more, every node changes.
+    const MOST: usize = 4096;
+    /// Every node changes: an address has gone, or its duplicate address
+    /// detection is done (`rt_genid_bump_ipv6`).
+    fn all(&mut self) {
+        self.last += 1;
+        self.all = self.last;
+        self.nodes.clear();
+    }
+    /// The node of `route` changes: alone, or with those above it
+    /// (`fib6_update_sernum`, `fib6_update_sernum_upto_root`).
+    fn node(&mut self, route: &Route6, above: bool) {
+        if self.nodes.len() >= Self::MOST {
+            return self.all();
+        }
+        self.last += 1;
+        let node = self
+            .nodes
+            .entry((route.table, route.dst, route.len))
+            .or_default();
+        if above {
+            node.0 = self.last;
+        } else {
+            node.1 = self.last;
+        }
+    }
+    /// When the node of `route` last changed.
+    fn of(&self, route: &Route6) -> u64 {
+        let key = (route.table, route.dst, route.len);
+        let below = self
+            .nodes
+            .iter()
+            .filter(|((table, dst, len), _)| {
+                *table == route.table
+                    && *len >= route.len
+                    && u128::from(*dst) & mask6(route.len) == u128::from(route.dst)
+            })
+            .map(|(_, (added, _))| *added);
+        let own = self.nodes.get(&key).map_or(0, |(_, own)| *own);
+        below.max().unwrap_or(0).max(own).max(self.all)
+    }
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -1402,6 +1459,7 @@ impl Addresses {
             proxies: Vec::new(),
             ready6: Vec::new(),
             multipath_seed: crate::multipath::Seed::default(),
+            serials6: Serials6::default(),
             multipath4: crate::multipath::Policy::default(),
             multipath6: crate::multipath::Policy::default(),
         }
@@ -2030,6 +2088,9 @@ impl Addresses {
             .partition::<Vec<_>, _>(|a| a.index == index);
         self.v6 = kept;
         self.ready6.retain(|&i| i != index);
+        if !gone.is_empty() {
+            self.serials6.all();
+        }
         gone.into_iter().map(Event::DelAddr6).collect()
     }
     /// IPv6's part of the veth end `index` coming up at `now`
@@ -2082,6 +2143,7 @@ impl Addresses {
         for route in self.routes6.iter_mut().filter(|r| r.oif == oif) {
             route.dead = false;
             route.linkdown = false;
+            self.serials6.node(route, true);
         }
         self.kernel_add6(
             Route6 {
@@ -2191,6 +2253,7 @@ impl Addresses {
             if route.oif == oif && !self.hops6(&route).is_empty() {
                 route.dead = true;
                 route.linkdown = true;
+                self.serials6.node(&route, false);
             }
             kept.push(route);
         }
@@ -2437,6 +2500,7 @@ impl Addresses {
                 self.insert_v6(new);
                 return Ok(events);
             }
+            self.serials6.all();
         }
         events.push(Event::NewAddr6(new.clone(), false));
         self.kernel_add6(new.local_route(), &mut events);
@@ -2574,6 +2638,7 @@ impl Addresses {
     /// prefix route ([`Self::prefix_gone`]), unless it had none.
     fn remove_v6(&mut self, found: usize, now: u64) -> Vec<Event> {
         let gone = self.v6.remove(found);
+        self.serials6.all();
         let mut events = vec![Event::DelAddr6(gone.clone())];
         self.kernel_del6(&gone.local_route(), &mut events);
         if gone.flags & NO_PREFIX_ROUTE == 0 {
@@ -2637,6 +2702,7 @@ impl Addresses {
         done.sort_by_key(|&(at, _)| at);
         for (_, i) in done {
             self.v6[i].dad = None;
+            self.serials6.all();
             let address = self.v6[i].clone();
             events.push(Event::NewAddr6(address.clone(), false));
             self.kernel_add6(address.local_route(), &mut events);
@@ -2842,6 +2908,7 @@ impl Addresses {
             // too, without a word: those after it with a gateway.
             let siblings = !self.hops6(&self.routes6[i]).is_empty();
             self.routes6[i] = new;
+            self.serials6.node(&new, true);
             if siblings {
                 let mut at = i + 1;
                 // A node's routes are next to each other, by metric.
@@ -2880,6 +2947,7 @@ impl Addresses {
             })
             .unwrap_or(self.routes6.len());
         self.routes6.insert(at, new);
+        self.serials6.node(&new, true);
         told |= F_CREATE;
         Ok(told)
     }
@@ -4156,6 +4224,29 @@ impl Addresses {
         flow: &Flow6,
     ) -> Result<Route6, Errno> {
         Self::first6(|table| self.lookup6_in_preferring(table, ip, oif, flow))
+    }
+    /// The state of the IPv6 tables a route is kept at
+    /// ([`Self::keeps6`]).
+    pub(crate) fn serial6(&self) -> u64 {
+        self.serials6.last
+    }
+    /// Whether a socket that kept the IPv6 route `route` at `serial` still
+    /// takes it (`ip6_dst_check`): it is there, and its node has not changed
+    /// since, as a route added there or at a longer prefix, or a hop gone
+    /// dead, changes it, but one removed does not.
+    pub(crate) fn keeps6(&self, route: &Route6, serial: u64) -> bool {
+        self.serials6.of(route) <= serial
+            && self.routes6.iter().any(|r| {
+                (r.table, r.dst, r.len, r.metric, r.oif, r.gateway)
+                    == (
+                        route.table,
+                        route.dst,
+                        route.len,
+                        route.metric,
+                        route.oif,
+                        route.gateway,
+                    )
+            })
     }
     /// The route `lookup` finds in the local table, then in the main one,
     /// where the first has none or a throw route; a rejecting route's

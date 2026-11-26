@@ -435,6 +435,7 @@ mod linux {
                     | "veth-ipv4-via"
                     | "veth-ipv6-source"
                     | "veth-hash-seed"
+                    | "veth-ipv6-kept"
                     | "veth-hash-policy"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
@@ -690,6 +691,7 @@ mod linux {
         veth_ipv4_via => ("veth-ipv4-via","veth-ipv4-via"),
         veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
         veth_hash_seed => ("veth-hash-seed","veth-hash-seed"),
+        veth_ipv6_kept => ("veth-ipv6-kept","veth-ipv6-kept"),
         veth_hash_policy => ("veth-hash-policy","veth-hash-policy"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),

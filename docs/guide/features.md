@@ -6721,9 +6721,15 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     address or `::1`;
     else through it rather than another, among the routes of one prefix
     and metric (`rt6_score_route`). Connecting a socket of no device to a
-    group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks
-    its route up, where Linux's connected socket keeps the one it has
-    (`ip6_sk_dst_lookup_flow`) when one of these options goes back to 0.
+    group of the link makes `IPV6_MULTICAST_IF`'s its own. A connected
+    socket keeps the route its `connect` found, with its hop
+    (`ip6_sk_dst_lookup_flow`, of Linux master: `sendto` with an address
+    looks one up): a `send` takes it while one of these options names
+    another device no more, until the route goes or its node changes
+    (`ip6_dst_check`), as a route added there or at a longer prefix, a hop
+    gone dead, an address gone and one whose duplicate address detection
+    is done change it, or `SO_BINDTODEVICE`, `SO_BINDTOIFINDEX` or another
+    `IP_TOS` drops it; then it keeps the one it looks up.
     `IP_UNICAST_IF`, of IPv4 and IPv6 sockets and TCP's too, takes the
     index of a device in network byte order (`EADDRNOTAVAIL` for one there
     is not) in an `int` exactly (`EINVAL` for another length), 0 for none,
@@ -6732,7 +6738,7 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     IPv4-mapped one too, and a UDP `connect` go through its device where
     the socket has none of its own (`udp_sendmsg`,
     `__ip4_datagram_connect`), as through `SO_BINDTODEVICE`'s; TCP goes by
-    its routes. Each send looks its route up, where Linux's connected
+    its routes. Each IPv4 send looks its route up, where Linux's connected
     socket keeps the one its `connect` found (`sk_dst_check`), until the
     routes change, when the option changes after it.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it

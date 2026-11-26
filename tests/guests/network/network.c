@@ -479,6 +479,24 @@ static int port_of(int fd) {
     getsockname(fd, (void *)&a, &len);
     return ntohs(a.sin6_port);
 }
+/* Whether /proc/net/udp or udp6 lists a socket bound to `port`. Native
+   Linux lists every UDP socket in the runner's network, the other cases'
+   included; the emulator has neither file, so nothing is listed there. */
+static int udp_port_held(int port) {
+    const char *paths[] = {"/proc/net/udp", "/proc/net/udp6"};
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f) continue;
+        char line[512];
+        unsigned local;
+        int held = 0;
+        while (!held && fgets(line, sizeof line, f))
+            held = sscanf(line, " %*d: %*[0-9A-Fa-f]:%x", &local) == 1 && (int)local == port;
+        fclose(f);
+        if (held) return 1;
+    }
+    return 0;
+}
 /* Milliseconds on the monotonic clock. */
 static long now_ms(void) {
     struct timespec t;
@@ -2554,10 +2572,21 @@ int main(int argc, char **argv) {
         sendto(c, "who", 3, 0, (void *)&to_shared, sizeof to_shared);
         ready("first-bound", r1, POLLIN);
         ready("last-bound", r2, POLLIN);
-        /* A TCP port is not a UDP one. */
-        int t;
-        int l = listener(1, &t);
-        bind_to("udp-on-tcp-port", r3, htonl(INADDR_LOOPBACK), t);
+        /* A TCP port is not a UDP one. Natively the guest shares the
+           runner's network with the cases running beside it, so a UDP socket
+           there may already hold the port the listener took. Only a failure
+           while /proc/net/udp or udp6 lists such a socket takes another
+           listener's port; any other result is printed as it came. */
+        int t, l, r, err;
+        for (int taken = 0;; taken++) {
+            l = listener(1, &t);
+            struct sockaddr_in on_tcp = to(t);
+            r = bind(r3, (void *)&on_tcp, sizeof on_tcp);
+            err = errno;
+            if (!(r < 0 && err == EADDRINUSE && taken < 64 && udp_port_held(t))) break;
+            close(l);
+        }
+        printf("  udp-on-tcp-port=%d errno=%d\n", r, r < 0 ? err : 0);
         close(l);
         /* An IPv6 socket on every address takes IPv4 datagrams, with the
            sender IPv4-mapped. */

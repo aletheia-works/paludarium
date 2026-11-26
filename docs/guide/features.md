@@ -4224,14 +4224,25 @@ kernel.
   tmpfs file, a memfd or System V shared memory), and its open is `ESRCH`
   for a task with no memory left. `status`
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
-  capabilities and so on) and, of the memory ones, the locked memory
-  (`VmLck`), the peak of the resident memory (`VmHWM`) and the resident
-  memory (`VmRSS`), which a zombie does not show; the other memory fields
-  and the CPU ones are not there, as nothing measures them. The peak is
-  Linux's `hiwater_rss`: noted before `munmap`, `MADV_DONTNEED` and the
+  capabilities and so on) and the memory ones of Linux's `task_mem`, which
+  a zombie does not show: the peak of the size of the mappings and the
+  size (`VmPeak`, `VmSize`), the locked memory (`VmLck`), the peak of the
+  resident memory and the resident memory (`VmHWM`, `VmRSS`), split into
+  what is anonymous, a file's and shmem's (`RssAnon`, `RssFile`,
+  `RssShmem`), the private writable mappings and the stack (`VmData`,
+  `VmStk`), the code range and the other executable mappings (`VmExe`,
+  `VmLib`), and 0 for `VmSwap` and `HugetlbPages`, as nothing is swapped
+  out and the pool of huge pages is empty. `VmPin`, `VmPTE` and the CPU
+  fields are not there, as nothing counts them. The peak of the size is
+  Linux's `hiwater_vm`: noted when an unmap takes mapped pages away, as
+  `vms_complete_munmap_vmas` calls `update_hiwater_vm` (a fixed mapping
+  that replaces them counts its own pages only after it), but not when
+  `mremap` moves pages (`move_vma` keeps the peak it had). The peak of the resident
+  memory is Linux's `hiwater_rss`: noted before `munmap`, `MADV_DONTNEED` and the
   other calls that drop pages, as `update_hiwater_rss` does, so that
-  `VmHWM` is never below `VmRSS`; a `fork`ed child's starts at what it
-  holds, as `dup_mm` sets it, and writing 5 to `clear_refs` resets it. `statm` has, in pages, what Linux's `task_statm`
+  `VmHWM` is never below `VmRSS`. A `fork`ed child's peaks start at what it
+  maps and holds, as `dup_mm` sets them, and writing 5 to `clear_refs` resets
+  that of the resident memory. `statm` has, in pages, what Linux's `task_statm`
   counts: the size of the mappings, the resident pages, those of them a
   file's or shared memory's, the pages of the code range `stat` gives, 0,
   the private
@@ -4756,7 +4767,7 @@ kernel.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
 
-- These system files (`loadavg`, `locks`, `meminfo`, `stat`, `uptime` and
+- These system files (`cpuinfo`, `loadavg`, `locks`, `meminfo`, `stat`, `uptime` and
   `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
   read goes on to the end of what they hold. So is every file of a process's
   or a thread's directory (`stat` and `fstat` alike), as Linux's

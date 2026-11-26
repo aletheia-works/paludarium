@@ -1059,6 +1059,10 @@ pub struct Usage {
     pub private_dirty: u64,
     /// The pages of private memory, not a file's (`Anonymous`).
     pub anonymous: u64,
+    /// Those of the rest that shmem holds, of shared memory of no file, a
+    /// shmem file or System V shared memory (Linux's `PageSwapBacked`), as
+    /// `mm_counter` counts them in `MM_SHMEMPAGES`.
+    pub shmem: u64,
     /// Each page's size divided by how many entries map it, in bytes
     /// shifted left by [`Usage::PSS_SHIFT`], as Linux's `mss->pss` sums it
     /// (`Pss`), and that of the dirty pages (`Pss_Dirty`).
@@ -3160,6 +3164,12 @@ struct AddressSpaceData {
     /// `update_hiwater_rss` is before a zap, so that with the pages held
     /// now it is the peak.
     peak_resident: u64,
+    /// The most pages its mappings were found to take, Linux's
+    /// `hiwater_vm`: noted before an unmap takes some away
+    /// ([`Self::note_peak_size`]), as `vms_complete_munmap_vmas` calls
+    /// `update_hiwater_vm`, so that with the pages mapped now it is the
+    /// peak.
+    peak_size: u64,
 }
 
 impl Drop for AddressSpaceData {
@@ -3264,6 +3274,7 @@ impl AddressSpaceData {
             out_of_memory: Arc::default(),
             resident: AtomicU64::new(0),
             peak_resident: 0,
+            peak_size: 0,
         }
     }
 
@@ -3844,6 +3855,7 @@ impl AddressSpaceData {
                 if anonymous {
                     usage.pss_anon += pss;
                 } else if swap_backed {
+                    usage.shmem += 1;
                     usage.pss_shmem += pss;
                 } else {
                     usage.pss_file += pss;
@@ -4403,8 +4415,9 @@ impl AddressSpaceData {
         for shared in copy.shared.values() {
             tell(shared, true);
         }
-        // The child's peak is what it holds (`dup_mm`).
+        // The child's peaks are what it holds and maps (`dup_mm`).
         copy.peak_resident = copy.resident_pages();
+        copy.peak_size = copy.size_pages();
         Ok(copy)
     }
 
@@ -5948,8 +5961,35 @@ impl AddressSpaceData {
                 return Err(Errno::EINVAL);
             }
         }
+        self.note_peak_size(addr.0, end);
         self.remove(addr.0, end);
         Ok(())
+    }
+
+    /// How many pages its mappings take (Linux's `total_vm`).
+    fn size_pages(&self) -> u64 {
+        self.mappings.values().map(|m| m.length / PAGE_SIZE).sum()
+    }
+
+    /// Before an unmap of `[start, end)`: notes the pages mapped as the
+    /// peak if they are more, when the range has any mapped, as
+    /// `vms_complete_munmap_vmas` calls `update_hiwater_vm` before the
+    /// pages it unmaps are taken away. A fixed mapping counts its own pages
+    /// only after that (`__mmap_complete`), so it notes the peak as an
+    /// unmap does.
+    fn note_peak_size(&mut self, start: u64, end: u64) {
+        if self.mappings_in(start, end).is_empty() {
+            return;
+        }
+        self.peak_size = self.peak_size.max(self.size_pages());
+    }
+
+    /// The peak of the pages its mappings took and the pages they take
+    /// now, as `/proc/<pid>/status`'s `VmPeak` and `VmSize` show them:
+    /// Linux's `get_mm_hiwater_vm` and `total_vm`.
+    fn peak_size(&self) -> (u64, u64) {
+        let now = self.size_pages();
+        (self.peak_size.max(now), now)
     }
 
     /// Whether `[start, end)` ends in `m` where its memory may not be split
@@ -6262,8 +6302,12 @@ impl AddressSpaceData {
             // the move with `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and the move
             // without either only grows, which such memory, a fixed mapping,
             // does not (`EFAULT`). So the unmap cannot fail.
+            // `move_vma` keeps the peak it had before: the moved pages
+            // counted twice for a moment are not a peak.
+            let peak = self.peak_size;
             let unmapped = self.unmap(GuestAddr(old), old_len);
             debug_assert!(unmapped.is_ok(), "{unmapped:?}");
+            self.peak_size = peak;
         }
         if let Some(backing) = backing {
             self.backing.insert(
@@ -8956,6 +9000,13 @@ impl MemoryView {
     pub fn resident_pages(&self) -> Option<(u64, u64)> {
         self.with_data(AddressSpaceData::peak_resident)
     }
+    /// The peak of the pages the space's mappings took and the pages they
+    /// take now ([`AddressSpaceData::peak_size`]), or `None` once it is
+    /// gone.
+    #[must_use]
+    pub fn size_pages(&self) -> Option<(u64, u64)> {
+        self.with_data(AddressSpaceData::peak_size)
+    }
     /// See [`AddressSpaceData::reset_peak_resident`]; `false` once the
     /// space is gone.
     pub fn reset_peak_resident(&self) -> bool {
@@ -10192,6 +10243,11 @@ impl AddressSpace {
     #[must_use]
     pub fn resident_pages(&self) -> (u64, u64) {
         self.locked().peak_resident()
+    }
+    /// See [`AddressSpaceData::peak_size`].
+    #[must_use]
+    pub fn size_pages(&self) -> (u64, u64) {
+        self.locked().peak_size()
     }
     /// See [`AddressSpaceData::locked_pages_in`].
     pub fn locked_pages_in(&self, addr: GuestAddr, end: u64) -> u64 {
@@ -12660,6 +12716,58 @@ mod tests {
         drop(space);
         assert_eq!(view.resident_pages(), None);
         assert!(!view.reset_peak_resident());
+    }
+
+    #[test]
+    fn the_peak_of_the_size_is_noted_where_linux_notes_hiwater_vm() {
+        let page = |n: u64| n * PAGE_SIZE;
+        let anon = MappingKind::Anonymous;
+        let mut space = AddressSpace::new();
+        let at = space.map(None, page(8), Prot::READ_WRITE, anon).unwrap();
+        assert_eq!(space.size_pages(), (8, 8));
+        // An unmap notes the size before it as the peak.
+        space.unmap(GuestAddr(at.0 + page(4)), page(4)).unwrap();
+        assert_eq!(space.size_pages(), (8, 4));
+        // One of nothing mapped notes nothing.
+        space.unmap(GuestAddr(at.0 + page(4)), page(4)).unwrap();
+        let big = space.map(None, page(16), Prot::READ_WRITE, anon).unwrap();
+        assert_eq!(space.size_pages(), (20, 20));
+        // A fixed mapping notes the peak as an unmap does, before its own
+        // pages count (`__mmap_complete`).
+        space
+            .map_backed(
+                Placement::Replacing(big),
+                page(2),
+                Prot::READ_WRITE,
+                anon,
+                Backing::None,
+            )
+            .unwrap();
+        assert_eq!(space.size_pages(), (20, 20));
+        // A move by mremap leaves the peak as it was (`move_vma`).
+        space.map(None, page(8), Prot::READ_WRITE, anon).unwrap();
+        let how = Remap {
+            may_move: true,
+            fixed: false,
+            keep_old: false,
+            new_addr: GuestAddr(0),
+            low: false,
+        };
+        let to = space
+            .remap_shared(GuestAddr(big.0 + page(2)), page(2), page(3), how)
+            .unwrap();
+        assert_ne!(to, GuestAddr(big.0 + page(2)));
+        assert_eq!(space.size_pages(), (29, 29));
+        // A shrink unmaps the rest, and notes the peak.
+        space.remap_shared(to, page(3), page(1), how).unwrap();
+        assert_eq!(space.size_pages(), (29, 27));
+        // A child's peak is its size (`dup_mm`).
+        let child = space.fork().unwrap();
+        assert_eq!(child.size_pages(), (27, 27));
+        let view = space.view();
+        assert_eq!(view.size_pages(), Some((29, 27)));
+        drop(space);
+        assert_eq!(view.size_pages(), None);
     }
 
     #[test]

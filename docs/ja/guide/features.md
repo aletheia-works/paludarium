@@ -3634,12 +3634,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   開くと `ESRCH` です。`status` は、Linux と同じ項目を
   同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。メモリの項目は
-  ロックしたメモリ（`VmLck`）、常駐するメモリの最大値（`VmHWM`）、常駐するメモリ
-  （`VmRSS`）で、ゾンビは示しません。何も測っていないほかのメモリの項目と CPU の
-  項目はありません。最大値は Linux の `hiwater_rss` です。`update_hiwater_rss` と同じく
+  Linux の `task_mem` のもので、ゾンビは示しません。マップの大きさの最大値と大きさ
+  （`VmPeak`、`VmSize`）、ロックしたメモリ（`VmLck`）、常駐するメモリの最大値と常駐する
+  メモリ（`VmHWM`、`VmRSS`）、それを匿名のもの、ファイルのもの、shmem のものに分けたもの
+  （`RssAnon`、`RssFile`、`RssShmem`）、書き込めるプライベートなマップとスタック（`VmData`、
+  `VmStk`）、コードの範囲とそのほかの実行できるマップ（`VmExe`、`VmLib`）です。スワップ
+  アウトするものはなく、ヒュージページのプールは空なので、`VmSwap` と `HugetlbPages` は
+  0 です。`VmPin`、`VmPTE` と CPU の項目は、何も数えていないのでありません。大きさの
+  最大値は Linux の `hiwater_vm` です。`vms_complete_munmap_vmas` が `update_hiwater_vm`
+  を呼ぶのと同じく、アンマップがマップされたページを取り除くときに記録します。それを置き換える
+  固定のマップは、そのあとで自分のページを数えます。`mremap` がページを
+  動かすときは記録しません（`move_vma` は前の最大値を保ちます）。常駐するメモリの最大値は
+  Linux の `hiwater_rss` です。`update_hiwater_rss` と同じく
   `munmap`、`MADV_DONTNEED` などページを捨てる呼び出しの前に記録するので、`VmHWM` が
-  `VmRSS` を下回ることはありません。`fork` の子の最大値は、`dup_mm` と同じく持っている
-  ページから始まり、`clear_refs` に 5 を書くと戻ります。`statm` は、Linux の `task_statm` が数えるものをページ単位で示します。
+  `VmRSS` を下回ることはありません。`fork` の子の最大値は、`dup_mm` と同じくマップして
+  いるものと持っているページから始まり、`clear_refs` に 5 を書くと常駐するメモリのものが
+  戻ります。`statm` は、Linux の `task_statm` が数えるものをページ単位で示します。
   マップの大きさ、常駐しているページ、そのうちファイルか共有メモリのもの、`stat` が示す
   コードの範囲のページ、0、書き込めるプライベートなマップとスタック、0 です。`stat` は
   `rss` に `VmRSS` と同じ常駐ページを、`starttime` にタスクが作られた時刻を起動からの
@@ -4085,7 +4095,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - セグメントやキューの PID は、`IPC_STAT` が返すものも、そのプロセスがなくなっても見えます。
     オブジェクトがその `struct pid` を持ち続けるためです。
 
-- これらのシステムのファイル（`loadavg`、`locks`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
+- これらのシステムのファイル（`cpuinfo`、`loadavg`、`locks`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
   サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。
   プロセスやスレッドのディレクトリのファイルも、Linux の `proc_pid_make_inode` が残すとおり、
   読み込みが何を返しても（`stat` でも `fstat` でも）サイズは 0 です。

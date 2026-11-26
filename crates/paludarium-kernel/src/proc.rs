@@ -750,6 +750,99 @@ pub(crate) fn render_statm(memory: Option<&MemoryView>, code: (u64, u64)) -> Vec
         (code.1.wrapping_add(PAGE - 1) & !(PAGE - 1)).wrapping_sub(code.0 & !(PAGE - 1)) / PAGE;
     format!("{size} {resident} {shared} {text} 0 {data} 0\n").into_bytes()
 }
+/// The memory fields of `/proc/<pid>/status`, in pages, as Linux's
+/// `task_mem` takes them from the `mm`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StatusMemory {
+    /// The peak of the pages mapped and those mapped now (`VmPeak`,
+    /// `VmSize`: `hiwater_vm`, `total_vm`).
+    pub size: (u64, u64),
+    /// The pages locked (`VmLck`: `locked_vm`).
+    pub locked: u64,
+    /// The peak of the resident pages and those resident now (`VmHWM`,
+    /// `VmRSS`).
+    pub resident: (u64, u64),
+    /// Of those resident now, the anonymous ones and shmem's (`RssAnon`,
+    /// `RssShmem`); the rest are a file's (`RssFile`).
+    pub anonymous: u64,
+    pub shmem: u64,
+    /// The private writable mappings and the stack (`VmData`, `VmStk`:
+    /// `data_vm`, `stack_vm`).
+    pub data: u64,
+    pub stack: u64,
+    /// The executable mappings, neither writable nor a stack (`exec_vm`).
+    pub exec: u64,
+    /// The program's `code` range, from its start to its end.
+    pub code: (u64, u64),
+}
+/// [`StatusMemory`] of `memory`, whose program's code is `code`, or `None`
+/// once the space is gone: VMA by VMA as `vm_stat_account` counts them
+/// into `data_vm`, `stack_vm` and `exec_vm`, and the resident pages as
+/// `smaps` finds them.
+pub(crate) fn status_memory(memory: &MemoryView, code: (u64, u64)) -> Option<StatusMemory> {
+    const PAGE: u64 = 4096;
+    let mut out = StatusMemory {
+        size: memory.size_pages()?,
+        locked: memory.locked_pages()?,
+        resident: memory.resident_pages()?,
+        code,
+        ..StatusMemory::default()
+    };
+    let mut next = 0;
+    while let Some(vma) = memory.vma_from(next) {
+        let pages = (vma.end - vma.start) / PAGE;
+        let usage = memory.usage(vma.start, vma.end).unwrap_or_default();
+        out.anonymous += usage.anonymous;
+        out.shmem += usage.shmem;
+        // Linux's `is_exec_mapping`, `is_stack_mapping` and
+        // `is_data_mapping`.
+        let flags = vma.flags & (vm::EXEC | vm::WRITE | vm::SHARED | vm::GROWSDOWN);
+        if flags & (vm::EXEC | vm::WRITE | vm::GROWSDOWN) == vm::EXEC {
+            out.exec += pages;
+        }
+        if flags & vm::GROWSDOWN != 0 {
+            out.stack += pages;
+        } else if flags & (vm::WRITE | vm::SHARED) == vm::WRITE {
+            out.data += pages;
+        }
+        next = vma.end;
+    }
+    Some(out)
+}
+/// The memory lines of `status`, as Linux's `task_mem` writes them, but for
+/// `VmPin` and `VmPTE`: nothing counts the pages pinned (`pinned_vm`) or
+/// the page tables' bytes (`mm_pgtables_bytes`). No huge page of hugetlbfs
+/// is ever there, as its pool is empty, and nothing is swapped out.
+fn status_memory_lines(m: &StatusMemory) -> String {
+    const PAGE: u64 = 4096;
+    // `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`, no more than the
+    // executable mappings; the rest of those are libraries'.
+    let text = (m.code.1.wrapping_add(PAGE - 1) & !(PAGE - 1))
+        .wrapping_sub(m.code.0 & !(PAGE - 1))
+        .min(m.exec * PAGE);
+    let library = m.exec * PAGE - text;
+    let file = m.resident.1.saturating_sub(m.anonymous + m.shmem);
+    let mut lines = String::new();
+    for (name, kilobytes) in [
+        ("VmPeak", m.size.0 * 4),
+        ("VmSize", m.size.1 * 4),
+        ("VmLck", m.locked * 4),
+        ("VmHWM", m.resident.0 * 4),
+        ("VmRSS", m.resident.1 * 4),
+        ("RssAnon", m.anonymous * 4),
+        ("RssFile", file * 4),
+        ("RssShmem", m.shmem * 4),
+        ("VmData", m.data * 4),
+        ("VmStk", m.stack * 4),
+        ("VmExe", text >> 10),
+        ("VmLib", library >> 10),
+        ("VmSwap", 0),
+        ("HugetlbPages", 0),
+    ] {
+        lines.push_str(&format!("{name}:\t{kilobytes:8} kB\n"));
+    }
+    lines
+}
 /// `/proc/<pid>/limits`, as Linux's `proc_pid_limits` writes the soft and
 /// hard limits, from `RLIMIT_CPU` to `RLIMIT_RTTIME`.
 pub(crate) fn render_limits(limits: &[(u64, u64); crate::processes::RLIMITS]) -> Vec<u8> {
@@ -884,13 +977,9 @@ pub(crate) struct Status<'a> {
     /// namespace it is in the `NS*` lines give.
     pub space: &'a crate::namespaces::Namespace,
     pub descriptors: Option<usize>,
-    /// The pages locked in memory (Linux's `locked_vm`), which a process
-    /// that no longer has its memory does not show.
-    pub locked: Option<u64>,
-    /// The peak of the resident pages (Linux's `get_mm_hiwater_rss`) and
-    /// those resident now (`get_mm_rss`), which a process that no longer
-    /// has its memory does not show either.
-    pub resident: Option<(u64, u64)>,
+    /// Its memory's fields, which a process that no longer has its memory
+    /// does not show.
+    pub memory: Option<StatusMemory>,
     pub threads: usize,
     /// The times the task went to sleep (Linux's `nvcsw`): nothing
     /// preempts a guest thread, so its involuntary switches are 0.
@@ -908,9 +997,9 @@ pub(crate) struct Status<'a> {
     /// The reader's user namespace, which the IDs are shown in.
     pub reader: &'a crate::namespaces::Namespace,
 }
-/// `/proc/<pid>/status` in Linux's field order. Of the memory fields only
-/// `VmLck`, `VmHWM` and `VmRSS` are there, and none of the CPU ones, as
-/// nothing measures them; parsers treat them as optional.
+/// `/proc/<pid>/status` in Linux's field order. Of the memory fields
+/// `VmPin` and `VmPTE` are not there ([`status_memory_lines`]), and none of
+/// the CPU ones, as nothing measures them; parsers treat them as optional.
 pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     let mut name = String::new();
     for &b in s.name.iter().take_while(|&&b| b != 0) {
@@ -954,16 +1043,10 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         }
         numbers.push('\n');
     }
-    let mut memory = s
-        .locked
-        .map_or_else(String::new, |pages| format!("VmLck:\t{:8} kB\n", pages * 4));
-    if let Some((peak, now)) = s.resident {
-        memory.push_str(&format!(
-            "VmHWM:\t{:8} kB\nVmRSS:\t{:8} kB\n",
-            peak * 4,
-            now * 4
-        ));
-    }
+    let memory = s
+        .memory
+        .as_ref()
+        .map_or_else(String::new, status_memory_lines);
     format!(
         "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
          Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
@@ -2988,8 +3071,17 @@ mod tests {
             session: 2,
             space: &namespaces.pid,
             descriptors: Some(70),
-            locked: Some(3),
-            resident: Some((9, 5)),
+            memory: Some(StatusMemory {
+                size: (40, 30),
+                locked: 3,
+                resident: (9, 5),
+                anonymous: 2,
+                shmem: 1,
+                data: 6,
+                stack: 2,
+                exec: 4,
+                code: (0x40_1000, 0x40_2abc),
+            }),
             threads: 2,
             switches: 7,
             queued: 1,
@@ -3030,7 +3122,11 @@ mod tests {
             "Uid:\t1\t2\t3\t4\n",
             "Gid:\t0\t0\t0\t0\n",
             // In Linux's place, the session's leader outside the namespace.
-            "Groups:\t5 6 \nNStgid:\t3\t1\nNSpid:\t4\t2\nNSpgid:\t3\t1\nNSsid:\t2\t0\nVmLck:\t      12 kB\nVmHWM:\t      36 kB\nVmRSS:\t      20 kB\nThreads:",
+            "Groups:\t5 6 \nNStgid:\t3\t1\nNSpid:\t4\t2\nNSpgid:\t3\t1\nNSsid:\t2\t0\nVmPeak:\t     160 kB\nVmSize:\t     120 kB\n\
+             VmLck:\t      12 kB\nVmHWM:\t      36 kB\nVmRSS:\t      20 kB\n\
+             RssAnon:\t       8 kB\nRssFile:\t       8 kB\nRssShmem:\t       4 kB\n\
+             VmData:\t      24 kB\nVmStk:\t       8 kB\nVmExe:\t       8 kB\n\
+             VmLib:\t       8 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nThreads:",
             "CapInh:\t0000000000000042\n",
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",

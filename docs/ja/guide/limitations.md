@@ -148,7 +148,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   アイドルの時間は数えません。割り込みと softirq は数えず、コンテキストスイッチとして数えるのは
   スレッドが眠った回数だけです。ゲストのスレッドを横取りするものがないためです。そのため
   `status` は、それを `voluntary_ctxt_switches` として示し、`nonvoluntary_ctxt_switches` は
-  0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。ほかのプロセスのスレッドは、どの待ちでも
+  0 です。`getrusage` と wait の rusage も同じく `ru_nvcsw` に示し、`ru_nivcsw` は 0 です。
+  ピン留めしたページ（`pinned_vm`）とページテーブルのバイト数は何も数えないので、`status` には
+  `VmPin` と `VmPTE` がありません。Linux がメモリの項目のあとに書く行（`CoreDumping`、
+  `THP_enabled`、`untag_mask`）もありません。ほかのプロセスのスレッドは、どの待ちでも
   `S (sleeping)` です。Linux は割り込めない待ちの一部を `D (disk sleep)` と見せます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は、スレッドがその中で停止している

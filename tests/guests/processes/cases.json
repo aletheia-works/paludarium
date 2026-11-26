@@ -520,6 +520,7 @@
     {"name":"proc-stat-counters","binary":"process"},
     {"name":"loadavg-running","binary":"process"},
     {"name":"proc-cpuinfo","binary":"process"},
+    {"name":"status-memory","binary":"process"},
     {"name":"leader-exit-status","binary":"process"},
     {"name":"thread-own-counters","binary":"process"},
     {"name":"leader-zombie-task","binary":"process"},

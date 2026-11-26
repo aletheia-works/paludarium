@@ -1155,6 +1155,7 @@ mod linux {
         processes_proc_stat_counters => ("proc-stat-counters","process"),
         processes_loadavg_running => ("loadavg-running","process"),
         processes_proc_cpuinfo => ("proc-cpuinfo","process"),
+        processes_status_memory => ("status-memory","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),

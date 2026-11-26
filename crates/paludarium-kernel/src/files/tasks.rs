@@ -346,8 +346,9 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
             session: task.view.session,
             space: &task.view.space,
             descriptors: task.holds().then(|| public.files.descriptors()),
-            locked: task.memory().and_then(|memory| memory.locked_pages()),
-            resident: task.memory().and_then(|memory| memory.resident_pages()),
+            memory: task
+                .memory()
+                .and_then(|memory| crate::proc::status_memory(memory, task.code())),
             threads: task.threads(),
             // The task's own, the leader's for the process.
             switches: task

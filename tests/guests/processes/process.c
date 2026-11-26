@@ -21329,6 +21329,163 @@ static int userns_nondumpable_read_case(const char *self) {
     return 0;
 }
 
+/* The status-memory case: /proc/self/status has task_mem's memory fields
+   in task_mem's order (VmPin and VmPTE aside, which paludarium does not
+   show), in agreement with statm (VmSize its size, VmData and VmStk its
+   data, VmExe its text) and with each other (VmRSS the sum of RssAnon,
+   RssFile and RssShmem, VmPeak and VmHWM no less than VmSize and VmRSS).
+   They change as Linux's do: a private mapping counts in VmSize and
+   VmData and its written pages in RssAnon, a shared anonymous one in
+   RssShmem and not in VmData, a file's read pages in RssFile. munmap
+   leaves VmPeak; a fixed mapping over mapped pages notes it before its own
+   pages count (__mmap_complete calls vms_complete_munmap_vmas first), a
+   move by mremap does not note the moved pages twice (move_vma keeps the
+   peak it had), and a fork child's VmPeak is its VmSize (dup_mm). What the process had before is the runtime's own, so the
+   changes are printed, in pages, and VmLib (the vDSO's text). Reading is
+   into a static buffer, and every call is made once before, so that no
+   page of code, stack or stdio comes in between. */
+static char sm_text[1 << 13];
+static int sm_read(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, sm_text, sizeof sm_text - 1);
+    close(fd);
+    if (n < 0) return 0;
+    sm_text[n] = 0;
+    return 1;
+}
+/* The field `name` of the status read last, in pages; -1 if not there. */
+static long sm_field(const char *name) {
+    char key[32];
+    snprintf(key, sizeof key, "\n%s:", name);
+    const char *at = strstr(sm_text, key);
+    return at ? strtol(at + strlen(key), NULL, 10) / 4 : -1;
+}
+enum { SM_PEAK, SM_SIZE, SM_HWM, SM_RSS, SM_ANON, SM_FILE, SM_SHMEM, SM_DATA, SM_STK, SM_EXE, SM_LIB, SM_N };
+static const char *const sm_names[SM_N] = {"VmPeak", "VmSize", "VmHWM", "VmRSS", "RssAnon", "RssFile",
+                                           "RssShmem", "VmData", "VmStk", "VmExe", "VmLib"};
+static void sm_take(long *v) {
+    sm_read("/proc/self/status");
+    for (int i = 0; i < SM_N; i++) v[i] = sm_field(sm_names[i]);
+}
+static int status_memory_case(void) {
+    const long page = sysconf(_SC_PAGESIZE);
+    /* The memory fields' names, in order. */
+    sm_read("/proc/self/status");
+    char names[512] = "";
+    for (const char *line = sm_text; *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : "") {
+        const char *colon = strchr(line, ':');
+        if (!colon) break;
+        size_t len = (size_t)(colon - line);
+        int memory = !strncmp(line, "Vm", 2) || !strncmp(line, "Rss", 3) || !strncmp(line, "Hugetlb", 7);
+        if (memory && !(len == 5 && (!strncmp(line, "VmPin", 5) || !strncmp(line, "VmPTE", 5)))) {
+            strncat(names, line, len);
+            strcat(names, " ");
+        }
+    }
+    printf("fields: %s\n", names);
+    long v[SM_N], w[SM_N];
+    sm_take(v);
+    long statm[7] = {0};
+    sm_read("/proc/self/statm");
+    sscanf(sm_text, "%ld %ld %ld %ld %ld %ld %ld", &statm[0], &statm[1], &statm[2], &statm[3], &statm[4],
+           &statm[5], &statm[6]);
+    sm_take(v);
+    printf("statm: size=%d data=%d text=%d\n", v[SM_SIZE] == statm[0], v[SM_DATA] + v[SM_STK] == statm[5],
+           v[SM_EXE] == statm[3]);
+    printf("sums: rss=%d peak=%d hwm=%d lib=%ld swap=%ld huge=%ld\n",
+           v[SM_RSS] == v[SM_ANON] + v[SM_FILE] + v[SM_SHMEM], v[SM_PEAK] >= v[SM_SIZE], v[SM_HWM] >= v[SM_RSS],
+           v[SM_LIB], sm_field("VmSwap"), sm_field("HugetlbPages"));
+
+    /* Every call once, on memory of its own, before anything counts. */
+    int exe = open("/proc/self/exe", O_RDONLY);
+    if (exe < 0) return 1;
+    char *warm = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (warm == MAP_FAILED) return 1;
+    warm[0] = 1;
+    mmap(warm, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    char *moved = mremap(warm + page, page, 2 * page, MREMAP_MAYMOVE);
+    munmap(warm, 4 * page);
+    if (moved != MAP_FAILED) munmap(moved, 2 * page);
+    sm_take(v);
+    sm_take(v);
+
+    /* A private mapping, written. */
+    char *private = mmap(NULL, 64 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (private == MAP_FAILED) return 1;
+    sm_take(w);
+    long mapped[3] = {w[SM_SIZE] - v[SM_SIZE], w[SM_DATA] - v[SM_DATA], w[SM_ANON] - v[SM_ANON]};
+    for (int i = 0; i < 64; i++) private[i * page] = 1;
+    sm_take(v);
+    long written[2] = {v[SM_ANON] - w[SM_ANON], v[SM_RSS] - w[SM_RSS]};
+    /* Shared anonymous memory, written. */
+    char *shared = mmap(NULL, 16 * page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) return 1;
+    for (int i = 0; i < 16; i++) shared[i * page] = 1;
+    sm_take(w);
+    long shmem[4] = {w[SM_SHMEM] - v[SM_SHMEM], w[SM_ANON] - v[SM_ANON], w[SM_DATA] - v[SM_DATA],
+                     w[SM_SIZE] - v[SM_SIZE]};
+    /* A file's pages, read. */
+    volatile char *file = mmap(NULL, 16 * page, PROT_READ, MAP_PRIVATE, exe, 0);
+    if (file == MAP_FAILED) return 1;
+    for (int i = 0; i < 16; i++) (void)file[i * page];
+    sm_take(v);
+    long filed[3] = {v[SM_FILE] - w[SM_FILE], v[SM_ANON] - w[SM_ANON], v[SM_DATA] - w[SM_DATA]};
+    /* munmap of half the private mapping. */
+    munmap(private + 32 * page, 32 * page);
+    sm_take(w);
+    long unmapped[3] = {v[SM_SIZE] - w[SM_SIZE], w[SM_PEAK] - v[SM_PEAK], v[SM_ANON] - w[SM_ANON]};
+    /* A mapping that takes the size past the peak, and a fixed one over a
+       part of it. */
+    char *big = mmap(NULL, 128 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (big == MAP_FAILED) return 1;
+    sm_take(v);
+    long grown = v[SM_PEAK] - v[SM_SIZE];
+    mmap(big, 16 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    sm_take(w);
+    long fixed[2] = {w[SM_PEAK] - w[SM_SIZE], w[SM_SIZE] - v[SM_SIZE]};
+    /* Past the peak again, then a move of 16 pages by mremap. */
+    char *more = mmap(NULL, 64 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (more == MAP_FAILED) return 1;
+    sm_take(v);
+    char *to = mremap(big + 16 * page, 16 * page, 17 * page, MREMAP_MAYMOVE);
+    sm_take(w);
+    long remapped[3] = {to != MAP_FAILED && to != big + 16 * page, w[SM_PEAK] - w[SM_SIZE], w[SM_SIZE] - v[SM_SIZE]};
+
+    printf("mapped: size+%ld data+%ld anon+%ld\n", mapped[0], mapped[1], mapped[2]);
+    printf("written: anon+%ld rss+%ld\n", written[0], written[1]);
+    printf("shared: shmem+%ld anon+%ld data+%ld size+%ld\n", shmem[0], shmem[1], shmem[2], shmem[3]);
+    printf("file: file+%ld anon+%ld data+%ld\n", filed[0], filed[1], filed[2]);
+    printf("unmapped: size-%ld peak+%ld anon-%ld\n", unmapped[0], unmapped[1], unmapped[2]);
+    printf("grown: peak-size=%ld\n", grown);
+    printf("fixed: peak-size=%ld size+%ld\n", fixed[0], fixed[1]);
+    printf("remapped: moved=%ld peak-size=%ld size+%ld\n", remapped[0], remapped[1], remapped[2]);
+
+    /* A fork child's peak is its size, where the parent's is above it. */
+    munmap(more, 64 * page);
+    sm_take(v);
+    int pipes[2];
+    if (pipe(pipes)) return 1;
+    pid_t child = fork();
+    if (child == 0) {
+        long c[SM_N];
+        sm_take(c);
+        char line[64];
+        int n = snprintf(line, sizeof line, "child: peak-size=%ld\n", c[SM_PEAK] - c[SM_SIZE]);
+        write(pipes[1], line, (size_t)n);
+        _exit(0);
+    }
+    close(pipes[1]);
+    char line[64] = {0};
+    read(pipes[0], line, sizeof line - 1);
+    close(pipes[0]);
+    waitpid(child, NULL, 0);
+    printf("parent: peak-above-size=%d\n", v[SM_PEAK] > v[SM_SIZE]);
+    printf("%s", line);
+    close(exe);
+    return 0;
+}
+
 /* The proc-cpuinfo case: /proc/cpuinfo has Linux 7.0's show_cpuinfo
    fields in its order, a record for each CPU, and what it says of the CPU
    agrees with cpuid in the reader: vendor, family, model, stepping, cpuid
@@ -43081,6 +43238,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
     if (!strcmp(mode, "proc-cpuinfo")) return proc_cpuinfo_case();
+    if (!strcmp(mode, "status-memory")) return status_memory_case();
     if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "thread-own-counters")) return thread_own_counters_case();
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();

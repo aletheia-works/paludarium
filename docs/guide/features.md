@@ -4525,8 +4525,8 @@ kernel.
   may open to write. Both are unsigned longs, as Linux's
   `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
   (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
-  `/proc/sys/fs` lists only these, `fanotify`, `inotify`, `mqueue`,
-  `lease-break-time` and `leases-enable`.
+  `/proc/sys/fs` lists only these, `dir-notify-enable`, `fanotify`,
+  `inotify`, `mqueue`, `lease-break-time` and `leases-enable`.
 
 - `/proc/sys/fs/inotify` has the machine's inotify limits, root's regular
   files of mode 0644 that only root (user ID 0 outside any user namespace)
@@ -6179,6 +6179,10 @@ kernel.
     its watch, as do asking with no events and the table's end.
   - A file that is not a directory gives `ENOTDIR`, an `O_PATH` descriptor
     `EBADF`. Unknown bits are ignored.
+  - `/proc/sys/fs/dir-notify-enable`, the machine's (1 at first), is root's
+    file of mode 0644 that takes any `int` (`proc_dointvec`). While it is 0,
+    `F_NOTIFY` gives `EINVAL` before anything else, even with no events;
+    watches already there keep signalling.
 
 - An inotify instance (`inotify_init`, `inotify_init1`, with `IN_NONBLOCK`
   and `IN_CLOEXEC`) watches files by their device and inode, which

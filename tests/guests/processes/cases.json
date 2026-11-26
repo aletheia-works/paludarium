@@ -215,6 +215,7 @@
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"dnotify-calls","binary":"inotify"},
     {"name":"dnotify-events","binary":"inotify"},
+    {"name":"dnotify-switch","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},
     {"name":"inotify-files","binary":"inotify"},
     {"name":"inotify-flags","binary":"inotify"},

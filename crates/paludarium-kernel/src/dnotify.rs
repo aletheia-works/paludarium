@@ -281,8 +281,12 @@ impl Watches {
     }
 }
 
-/// `fcntl_dirnotify`: `fcntl(fd, F_NOTIFY, arg)` on descriptor `d`.
+/// `fcntl_dirnotify`: `fcntl(fd, F_NOTIFY, arg)` on descriptor `d`, `EINVAL`
+/// for every `arg` while `/proc/sys/fs/dir-notify-enable` is 0.
 pub(crate) fn fcntl(c: &Context<'_>, d: &Descriptor, fd: u64, arg: u32) -> Result<u64, Errno> {
+    if !c.processes.sysctls.dir_notify_enable() {
+        return Err(Errno::EINVAL);
+    }
     let notify = &c.files.caches.notify;
     let watches = &notify.dn;
     let table = c.files.table();

@@ -1137,8 +1137,6 @@ verified.
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise.
-- **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
-  dnotify is always on, as with Linux's default of 1.
 - **`/proc/locks`, in part**: PIDs are those of the reader's PID namespace,
   where Linux's are those of the one `/proc` was mounted in. A `flock` lock a
   program on the host holds on a file of the host is not listed, though it

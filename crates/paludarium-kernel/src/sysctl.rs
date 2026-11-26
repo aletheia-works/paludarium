@@ -16,7 +16,9 @@
 //! The machine's `/proc/sys/fs/leases-enable` (1 at first) and
 //! `/proc/sys/fs/lease-break-time` (45), as `fs/locks.c` has them, are
 //! root's files of mode 0644 that take any `int` (`proc_dointvec`), as the
-//! machine's `/proc/sys/kernel` files below are.
+//! machine's `/proc/sys/kernel` files below are, and so is
+//! `/proc/sys/fs/dir-notify-enable` (1 at first), with which `F_NOTIFY` is
+//! `EINVAL` while 0, as `fs/notify/dnotify/dnotify.c` has it.
 //!
 //! `/proc/sys/kernel` has the System V IPC limits of the opener's IPC
 //! namespace, as Linux's `ipc/ipc_sysctl.c` has them: `shmmax` and `shmall`
@@ -408,6 +410,9 @@ pub(crate) enum Kernel {
     /// under `fs`.
     LeasesEnable,
     LeaseBreakTime,
+    /// `/proc/sys/fs/dir-notify-enable`, the machine's, which Linux's
+    /// `fs/notify/dnotify/dnotify.c` registers under `fs`.
+    DirNotifyEnable,
     /// `vm.unprivileged_userfaultfd`, the machine's as the perf ones are,
     /// though under `/proc/sys/vm`.
     UnprivilegedUserfaultfd,
@@ -469,6 +474,7 @@ impl Kernel {
                 | Self::UnprivilegedBpfDisabled
                 | Self::LeasesEnable
                 | Self::LeaseBreakTime
+                | Self::DirNotifyEnable
                 | Self::UnprivilegedUserfaultfd
         )
     }
@@ -493,6 +499,7 @@ pub(crate) struct Machine {
     drop_caches: AtomicI32,
     leases_enable: AtomicI32,
     lease_break_time: AtomicI32,
+    dir_notify_enable: AtomicI32,
     /// How often `kernel.hostname` and `kernel.domainname` changed, in any
     /// UTS namespace (`hostname_poll`, `domainname_poll`).
     uts_events: [AtomicU64; 2],
@@ -510,6 +517,7 @@ impl Default for Machine {
             drop_caches: AtomicI32::new(0),
             leases_enable: AtomicI32::new(1),
             lease_break_time: AtomicI32::new(45),
+            dir_notify_enable: AtomicI32::new(1),
             uts_events: Default::default(),
         }
     }
@@ -559,6 +567,10 @@ impl Machine {
     pub(crate) fn lease_break_time(&self) -> i32 {
         self.lease_break_time.load(Ordering::SeqCst)
     }
+    /// Whether `F_NOTIFY` may be used (`dir_notify_enable`).
+    pub(crate) fn dir_notify_enable(&self) -> bool {
+        self.dir_notify_enable.load(Ordering::SeqCst) != 0
+    }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
         self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
@@ -579,6 +591,7 @@ impl Machine {
             Kernel::PerfEventParanoid => self.perf_event_paranoid(),
             Kernel::LeasesEnable => self.leases_enable(),
             Kernel::LeaseBreakTime => self.lease_break_time(),
+            Kernel::DirNotifyEnable => self.dir_notify_enable.load(Ordering::SeqCst),
             _ => self.unprivileged_bpf_disabled(),
         })
     }
@@ -591,6 +604,7 @@ impl Machine {
             Kernel::PerfEventParanoid => Some(&self.perf_event_paranoid),
             Kernel::LeasesEnable => Some(&self.leases_enable),
             Kernel::LeaseBreakTime => Some(&self.lease_break_time),
+            Kernel::DirNotifyEnable => Some(&self.dir_notify_enable),
             _ => None,
         } {
             let (value, consumed) = parse(buf, None)?;
@@ -728,6 +742,7 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/fs/fanotify" => Some(Entry::Directory(Directory::Fanotify)),
         b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
+        b"/fs/dir-notify-enable" => Some(Entry::Kernel(Kernel::DirNotifyEnable)),
         b"/fs/lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
         b"/fs/leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
@@ -814,6 +829,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
         Directory::Fs => vec![
             (b"aio-max-nr", DT_REG),
             (b"aio-nr", DT_REG),
+            (b"dir-notify-enable", DT_REG),
             (b"fanotify", DT_DIR),
             (b"inotify", DT_DIR),
             (b"lease-break-time", DT_REG),
@@ -932,6 +948,7 @@ fn child(
         Directory::Fs => match name {
             b"aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
             b"aio-nr" => Some(Entry::Aio(Aio::Nr)),
+            b"dir-notify-enable" => Some(Entry::Kernel(Kernel::DirNotifyEnable)),
             b"fanotify" => dir(Directory::Fanotify),
             b"inotify" => dir(Directory::Inotify),
             b"lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
@@ -1005,6 +1022,7 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         | Kernel::UnprivilegedBpfDisabled
         | Kernel::LeasesEnable
         | Kernel::LeaseBreakTime
+        | Kernel::DirNotifyEnable
         | Kernel::UnprivilegedUserfaultfd => Vec::new(),
     }
 }
@@ -1086,6 +1104,7 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
         | Kernel::UnprivilegedBpfDisabled
         | Kernel::LeasesEnable
         | Kernel::LeaseBreakTime
+        | Kernel::DirNotifyEnable
         | Kernel::UnprivilegedUserfaultfd => Err(Errno::EINVAL),
     }
 }
@@ -2101,7 +2120,11 @@ mod tests {
             lookup(b"/proc/sys/fs/aio-nr", None),
             Some(Entry::Aio(Aio::Nr))
         );
-        assert_eq!(entries_of(Directory::Fs, None).len(), 9);
+        assert_eq!(
+            lookup(b"/proc/sys/fs/dir-notify-enable", None),
+            Some(Entry::Kernel(Kernel::DirNotifyEnable))
+        );
+        assert_eq!(entries_of(Directory::Fs, None).len(), 10);
         assert_eq!(
             lookup(b"/proc/sys/fs/inotify", None),
             Some(Entry::Directory(Directory::Inotify))

@@ -3885,8 +3885,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   root（どのユーザー名前空間の外でもユーザー ID 0）だけです。どちらも Linux の
   `proc_doulongvec_minmax` と同じく unsigned long として読み書きし、書き込みは `-` を取らず
   （`EINVAL`）、それ以外は `/proc/sys/fs/mqueue` のファイルと同じに読みます。
-  `/proc/sys/fs` にあるのはこれらと `fanotify`、`inotify`、`mqueue`、`lease-break-time`、
-  `leases-enable` だけです。
+  `/proc/sys/fs` にあるのはこれらと `dir-notify-enable`、`fanotify`、`inotify`、`mqueue`、
+  `lease-break-time`、`leases-enable` だけです。
 
 - `/proc/sys/fs/inotify` はマシンの inotify の上限で、root の持つモード 0644 の
   通常のファイルです。書くために開けるのは root（どのユーザー名前空間の外でも
@@ -5279,6 +5279,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     なくなります。イベントなしで頼んだときと、表がなくなったときもなくなります。
   - ディレクトリでないファイルは `ENOTDIR`、`O_PATH` のディスクリプタは `EBADF` です。
     知らないビットは無視します。
+  - マシンの `/proc/sys/fs/dir-notify-enable`（最初は 1）は、どんな `int` も取る
+    （`proc_dointvec`）root のモード 0644 のファイルです。これが 0 の間は、`F_NOTIFY` は
+    イベントがなくても、ほかのどの確認よりも先に `EINVAL` です。すでにある見張りは
+    シグナルを送り続けます。
 
 - inotify のインスタンス（`inotify_init`、`inotify_init1`。`IN_NONBLOCK` と
   `IN_CLOEXEC` が使えます）は、ファイルをデバイスと inode で見張ります。

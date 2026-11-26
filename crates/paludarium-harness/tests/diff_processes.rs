@@ -219,12 +219,14 @@ mod linux {
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, the file-leases case, which writes
             // fs.leases-enable and fs.lease-break-time and becomes an
-            // unprivileged user, and the timer-waits cases, which make a
+            // unprivileged user, the dnotify-switch case, which writes
+            // fs.dir-notify-enable, and the timer-waits cases, which make a
             // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
                     | "file-leases"
+                    | "dnotify-switch"
                     | "timer-waits-plain"
                     | "timer-waits-restart"
                     | "timer-waits-default"
@@ -821,6 +823,7 @@ mod linux {
         bpf_prog_segments => ("bpf-prog-segments","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
+        dnotify_switch => ("dnotify-switch","inotify"),
         dnotify_events => ("dnotify-events","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),

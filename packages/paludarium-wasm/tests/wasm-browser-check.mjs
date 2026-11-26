@@ -77,5 +77,14 @@ server.on("clientError", (error, socket) => {
   else socket.destroy();
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-try { const result = await runBrowser(browser, `http://127.0.0.1:${server.address().port}/`, 600000); Object.assign(report, result); await persist(); if (!report.complete || !report.passed) throw new Error("Actual browser acceptance failed"); console.log(JSON.stringify({ environment: browser, version: report.version, complete: report.complete })); }
+// Diagnostics for the job log, never compared. Logged also when the run throws: the rows posted
+// so far are in the report already, and heap_diagnostics only once the suite has returned.
+function logDiagnostics() {
+  console.error(JSON.stringify({ heap_diagnostics: report.heap_diagnostics ?? null }));
+  for (const [group, rows] of Object.entries({ rows: report.rows, ripgrep: report.ripgrep, coreutils: report.coreutils, restored: report.restored })) for (const [name, row] of Object.entries(rows ?? {})) if (row.host_trap) console.error(JSON.stringify({ host_trap: { group, name, ...row.host_trap } }));
+}
+try {
+  try { const result = await runBrowser(browser, `http://127.0.0.1:${server.address().port}/`, 600000); Object.assign(report, result); await persist(); }
+  finally { logDiagnostics(); }
+  if (!report.complete || !report.passed) throw new Error("Actual browser acceptance failed"); console.log(JSON.stringify({ environment: browser, version: report.version, complete: report.complete })); }
 finally { await new Promise(resolve => server.close(resolve)); }

@@ -2663,7 +2663,16 @@ fn directory_entries(
             crate::sysctl::entries(c, directory)
         }
         _ if crate::proc::is_sysvipc(&d.path) => crate::proc::sysvipc_entries(),
-        _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
+        _ if let Some(path) = task => {
+            let task = tasks::find(c, &path)?;
+            // `proc_tgid_net_readdir`, of a task with no namespace left.
+            if path.entry == crate::proc::TaskEntry::Net
+                && tasks::namespace(&task, crate::namespaces::Entry::Net).is_none()
+            {
+                return Err(Errno::EINVAL);
+            }
+            tasks::entries(&task, path.entry)
+        }
         Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c, false),
         Some(crate::proc::OwnEntry::DescriptorInfos) => descriptor_entries(c, true),
         Some(crate::proc::OwnEntry::Directory) => own_entries(),
@@ -7959,6 +7968,9 @@ fn open_path(
             let file = crate::namespaces::NamespaceFile::new(namespace, flags);
             return Ok((Arc::new(file), p.to_vec()));
         }
+        if let (crate::proc::TaskEntry::NetFile(file), Some(stat)) = (path.entry, file_stat) {
+            return Ok((tasks::net_file(c, &task, file, (flags, stat))?, p.to_vec()));
+        }
         // The user namespace's files take one write, as Linux's
         // `proc_uid_map_write` and `proc_setgroups_write`: opened for writing
         // by whom their mode lets, and `setgroups` only with CAP_SYS_ADMIN
@@ -8080,13 +8092,17 @@ fn open_path(
                 None => file,
             })
         } else if let Some(target) = tasks::link(&task, path.entry) {
-            // `exe`, `cwd` and `thread-self` are links, which O_NOFOLLOW
-            // does not follow; `thread-self`'s is relative to /proc.
+            // `exe`, `cwd`, `thread-self` and `net` are links, which
+            // O_NOFOLLOW does not follow; the last two's are relative to
+            // /proc.
             let mut target = target?;
             if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
                 return Err(Errno(40)); // ELOOP
             }
-            if path.entry == crate::proc::TaskEntry::ThreadLink {
+            if matches!(
+                path.entry,
+                crate::proc::TaskEntry::ThreadLink | crate::proc::TaskEntry::NetLink
+            ) {
                 target = [&b"/proc/"[..], &target].concat();
             }
             return open_path(c, &target, flags, mode);

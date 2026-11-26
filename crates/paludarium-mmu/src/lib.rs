@@ -130,6 +130,13 @@ pub struct Mapping {
     pub wipe_on_fork: bool,
     /// `MADV_DONTDUMP` (Linux's `VM_DONTDUMP`): a core dump holds none of it.
     pub dont_dump: bool,
+    /// `mmap` made it with `MAP_DROPPABLE` (Linux's `VM_DROPPABLE`), which
+    /// gives it [`Self::no_reserve`], [`Self::wipe_on_fork`] and
+    /// [`Self::dont_dump`] for good: `MADV_KEEPONFORK` and `MADV_DODUMP`
+    /// refuse it, `mlock` leaves it as it is, KSM ignores it and no
+    /// `userfaultfd` registers it. Linux may drop its pages under memory
+    /// pressure, which never comes here.
+    pub droppable: bool,
     /// `MADV_GUARD_INSTALL` put guards in its Linux VMA (`VM_MAYBE_GUARD`),
     /// which stays when they go, does not stop a merge, and makes `fork`
     /// copy the VMA's page tables.
@@ -696,6 +703,8 @@ pub mod vm {
     pub const HUGEPAGE: u64 = 1 << 29;
     pub const NOHUGEPAGE: u64 = 1 << 30;
     pub const MERGEABLE: u64 = 1 << 31;
+    /// `VM_DROPPABLE`, which `smaps` names `dp`.
+    pub const DROPPABLE: u64 = 1 << 40;
     pub const SEALED: u64 = 1 << 42;
 }
 
@@ -5330,6 +5339,7 @@ impl AddressSpaceData {
             | bit(m.no_reserve, vm::NORESERVE)
             | bit(m.wipe_on_fork, vm::WIPEONFORK)
             | bit(m.dont_dump, vm::DONTDUMP)
+            | bit(m.droppable, vm::DROPPABLE)
             | bit(m.huge_pages == Some(true), vm::HUGEPAGE)
             | bit(m.huge_pages == Some(false), vm::NOHUGEPAGE)
             | bit(m.mergeable, vm::MERGEABLE)
@@ -5736,6 +5746,7 @@ impl AddressSpaceData {
                 dont_fork: false,
                 wipe_on_fork: false,
                 dont_dump: false,
+                droppable: false,
                 maybe_guard: false,
                 locked: self.future_lock,
                 account: prot.contains(Prot::WRITE),
@@ -5978,6 +5989,7 @@ impl AddressSpaceData {
             && a.dont_fork == b.dont_fork
             && a.wipe_on_fork == b.wipe_on_fork
             && a.dont_dump == b.dont_dump
+            && a.droppable == b.droppable
             && a.locked == b.locked
             && a.account == b.account
             && a.no_reserve == b.no_reserve
@@ -6522,8 +6534,9 @@ impl AddressSpaceData {
     /// it; a hole in the range is `ENOMEM` once the rest has it. Only
     /// private anonymous memory takes `MADV_WIPEONFORK` (Linux's VMA of no
     /// file and not shared), memory core mm does not back takes no
-    /// `MADV_DOFORK` or `MADV_DODUMP`, and a VMA whose flags change but may
-    /// not be split is taken whole or not at all.
+    /// `MADV_DOFORK` or `MADV_DODUMP`, droppable memory no `MADV_KEEPONFORK`
+    /// or `MADV_DODUMP`, and a VMA whose flags change but may not be split
+    /// is taken whole or not at all.
     pub fn advise_flags(&mut self, addr: u64, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
         let starts: Vec<u64> = self
             .mappings
@@ -6553,6 +6566,11 @@ impl AddressSpaceData {
             if matches!(advice, FlagAdvice::DoFork | FlagAdvice::DoDump) && self.special(start) {
                 return Err(Errno::EINVAL);
             }
+            // Droppable memory is wiped in a child and never dumped, for
+            // good.
+            if matches!(advice, FlagAdvice::KeepOnFork | FlagAdvice::DoDump) && m.droppable {
+                return Err(Errno::EINVAL);
+            }
             // One that is never dumped keeps its flags.
             if advice == FlagAdvice::DontDump
                 && self
@@ -6561,7 +6579,7 @@ impl AddressSpaceData {
             {
                 continue;
             }
-            let ksm = self.shared_at(start).is_none();
+            let ksm = self.shared_at(start).is_none() && !m.droppable;
             let advise = |m: &mut Mapping| match advice {
                 FlagAdvice::DontFork => m.dont_fork = true,
                 FlagAdvice::DoFork => m.dont_fork = false,
@@ -6571,8 +6589,9 @@ impl AddressSpaceData {
                 FlagAdvice::DoDump => m.dont_dump = false,
                 FlagAdvice::Read(hint) => m.read_hint = hint,
                 FlagAdvice::HugePages(huge) => m.huge_pages = Some(huge),
-                // KSM leaves shared memory and the rings, which core mm
-                // does not back, as they are (`ksm_compatible`).
+                // KSM leaves shared memory, the rings, which core mm does
+                // not back, and droppable memory as they are
+                // (`ksm_compatible`).
                 FlagAdvice::Mergeable(on) => m.mergeable = on && (m.mergeable || ksm),
             };
             let (from, to) = (start.max(addr), m.end().min(end));
@@ -6683,7 +6702,11 @@ impl AddressSpaceData {
     /// [`Userfault::WP`]. With [`Userfault::WP_ASYNC`], [`Userfault::WP`]
     /// alone takes any memory, as `vma_can_userfault` allows any memory
     /// type when `wp_async` and `VM_UFFD_WP` is the only mode.
+    /// Droppable memory takes none, before all else.
     fn userfault_capable(&self, m: &Mapping, modes: u8) -> bool {
+        if m.droppable {
+            return false;
+        }
         let kinds = Userfault::MISSING | Userfault::WP | Userfault::MINOR;
         if modes & Userfault::WP_ASYNC != 0 && modes & kinds == Userfault::WP {
             return true;
@@ -7593,6 +7616,23 @@ impl AddressSpaceData {
         );
         true
     }
+    /// Makes the new mappings in `[addr, end)` `MAP_DROPPABLE`'s
+    /// ([`Mapping::droppable`]): `do_mmap` adds `VM_NORESERVE`,
+    /// `VM_WIPEONFORK` and `VM_DONTDUMP` to `VM_DROPPABLE`, so no
+    /// overcommit charge either. Nor does `mlockall`'s `MCL_FUTURE` lock it,
+    /// as Linux master's `__mmap_new_vma` gives back the lock only to a VMA
+    /// `vma_supports_mlock` takes, as the CI runners' kernels do (v7.0's
+    /// source keeps the lock).
+    pub fn drop_new(&mut self, addr: u64, end: u64) {
+        for (_, mapping) in self.mappings.range_mut(addr..end) {
+            mapping.droppable = true;
+            mapping.locked = None;
+            mapping.no_reserve = true;
+            mapping.account = false;
+            mapping.wipe_on_fork = true;
+            mapping.dont_dump = true;
+        }
+    }
     /// Gives the new mappings in `[addr, end)` `MAP_GROWSDOWN`'s
     /// `VM_GROWSDOWN`.
     pub fn grow_new_down(&mut self, addr: u64, end: u64) {
@@ -7617,9 +7657,10 @@ impl AddressSpaceData {
     /// Whether the mapping at `addr` cannot be locked: memory core mm does
     /// not back ([`Self::special`]: the rings of AIO, `io_uring` and perf
     /// events, Linux's `VM_SPECIAL` and `vma_supports_mlock`), and secret
-    /// memory, which `mlock_fixup` leaves as it is.
+    /// and droppable memory, which `mlock_fixup` leaves as it is.
     fn refuses_lock(&self, addr: u64) -> bool {
         self.special(addr)
+            || self.mapping_at(addr).is_some_and(|m| m.droppable)
             || self
                 .shared_at(addr)
                 .and_then(|shared| shared.pages.source())
@@ -10022,6 +10063,10 @@ impl AddressSpace {
     /// whether it grew.
     pub fn grow_down(&self, addr: GuestAddr, stack_limit: u64, lock_limit: u64) -> bool {
         self.locked().grow_down(addr.0, stack_limit, lock_limit)
+    }
+    /// See [`AddressSpaceData::drop_new`].
+    pub fn drop_new(&self, addr: GuestAddr, end: u64) {
+        self.locked().drop_new(addr.0, end);
     }
     /// See [`AddressSpaceData::flag_new`].
     pub fn flag_new(&self, addr: GuestAddr, end: u64, no_reserve: bool, no_huge_pages: bool) {

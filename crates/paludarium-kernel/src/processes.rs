@@ -2456,10 +2456,13 @@ impl Kernel {
             self.processes.changed().notify();
         }
     }
-    pub fn wait_vfork(&mut self, kill: &AtomicBool) -> Result<(), Errno> {
+    /// Waits for a `vfork` child to exec or exit, as Linux's
+    /// `wait_for_vfork_done`, which a fatal signal ends (`TASK_KILLABLE`).
+    pub fn wait_vfork(&mut self, thread: &mut Thread, kill: &AtomicBool) -> Result<(), Errno> {
         let Some(release) = self.vfork_wait.take() else {
             return Ok(());
         };
+        let traced = self.processes.traces.tracer_of(thread.tid).is_some();
         loop {
             let ticket = self.processes.changed().value();
             if release.load(Ordering::SeqCst) || self.group.status().is_some() {
@@ -2469,18 +2472,55 @@ impl Kernel {
                 self.processes.stop_all(ExitStatus::Signaled(9));
                 return Err(Errno(4));
             }
-            self.wait_for_children(ticket)?;
+            let now = self.host.clock(ClockId::Monotonic)?;
+            self.group.expire_timer(&mut thread.state, now);
+            self.inbox.drain(&mut thread.state);
+            // `complete_signal` leaves a traced task's signals to its tracer.
+            let fatal = if traced {
+                thread
+                    .state
+                    .pending
+                    .iter()
+                    .any(|s| s.number == crate::signal::SIGKILL)
+            } else {
+                signals::fatal_pending(&thread.state)
+            };
+            if fatal {
+                return Ok(());
+            }
+            let bound = signals::next_deadline(&thread.state);
+            self.wait_for_children_until(ticket, bound.unwrap_or(u64::MAX))?;
         }
+    }
+    /// A wait for a child sleeps once: `EINTR` when a signal, an expired
+    /// timer's too, or the group's end comes first.
+    fn child_wait(&self, thread: &mut Thread, ticket: u32) -> Result<(), Errno> {
+        let now = self.host.clock(ClockId::Monotonic)?;
+        self.group.expire_timer(&mut thread.state, now);
+        let receipt = self.inbox.drain(&mut thread.state);
+        if receipt.interrupted
+            || self.group.status().is_some()
+            || signals::next_pending(&thread.state, true).is_some()
+        {
+            return Err(Errno(4));
+        }
+        let bound = signals::next_deadline(&thread.state);
+        self.wait_for_children_until(ticket, bound.unwrap_or(u64::MAX))
     }
     /// Sleeps until a process changes or is sent a signal after `ticket`
     /// was taken from [`Processes::changed`], or at most 10 ms pass, as the
     /// thread's wake token (any other signal) is polled; a host without
     /// tickets waits out the time.
     pub(crate) fn wait_for_children(&self, ticket: u32) -> Result<(), Errno> {
+        self.wait_for_children_until(ticket, u64::MAX)
+    }
+    /// [`Self::wait_for_children`], no later than `bound`.
+    fn wait_for_children_until(&self, ticket: u32, bound: u64) -> Result<(), Errno> {
         let end = self
             .host
             .clock(ClockId::Monotonic)?
-            .saturating_add(10_000_000);
+            .saturating_add(10_000_000)
+            .min(bound);
         let deadline = Some((ClockId::Monotonic, end));
         match self.host.wait_on(
             self.processes.changed(),
@@ -3728,15 +3768,7 @@ impl Kernel {
             if a[2] & 1 != 0 {
                 return Ok(0);
             }
-            self.group.drain_process(&mut thread.state);
-            let receipt = self.inbox.drain(&mut thread.state);
-            if receipt.interrupted
-                || self.group.status().is_some()
-                || signals::next_pending(&thread.state, true).is_some()
-            {
-                return Err(Errno(4));
-            }
-            self.wait_for_children(ticket)?;
+            self.child_wait(thread, ticket)?;
         }
     }
     /// What a wait finds, as Linux's `__do_wait` looks: the caller's
@@ -3871,15 +3903,7 @@ impl Kernel {
             if nonblocking {
                 return Err(Errno::EAGAIN);
             }
-            self.group.drain_process(&mut thread.state);
-            let receipt = self.inbox.drain(&mut thread.state);
-            if receipt.interrupted
-                || self.group.status().is_some()
-                || signals::next_pending(&thread.state, true).is_some()
-            {
-                return Err(Errno(4));
-            }
-            self.wait_for_children(ticket)?;
+            self.child_wait(thread, ticket)?;
         }
     }
     /// `kcmp(pid1, pid2, type, idx1, idx2)`: each number, an `int`, names

@@ -13574,6 +13574,246 @@ static void smaps_show(const char *label, const void *at, int what) {
     }
     printf("%s: none\n", label);
 }
+/* mmap's types (MAP_TYPE): a file maps shared, shared with its flags
+ * validated or private; anonymous memory shared, private or droppable.
+ * MAP_SHARED_VALIDATE refuses a flag it does not know (EOPNOTSUPP) where
+ * MAP_SHARED drops it. MAP_DROPPABLE memory is wiped in a child and never
+ * dumped, for good, and mlock leaves it as it is. */
+#ifndef MAP_DROPPABLE
+#define MAP_DROPPABLE 0x08
+#endif
+static long types_mapped(long len, long prot, long flags, long fd, long off) {
+    long r = syscall(SYS_mmap, 0L, len, prot, flags, fd, off);
+    if (r == -1) return -errno;
+    munmap((void *)r, len);
+    return 0;
+}
+/* Whether the file system of `fd` takes MAP_SYNC (FOP_MMAP_SYNC): ext4 and
+ * xfs, which then refuse it for a file not of DAX. */
+static int types_fs_syncs(int fd) {
+    struct statfs fs;
+    if (fstatfs(fd, &fs)) return -1;
+    return fs.f_type == 0xef53 || fs.f_type == 0x58465342;
+}
+static int mmap_types_case(const char *self) {
+    long page = 4096;
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-mmap-types-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    int only = open(path, O_RDONLY);
+    unlink(path);
+    int zero = open("/dev/zero", O_RDWR);
+    if (fd < 0 || only < 0 || zero < 0 || ftruncate(fd, 2 * page)) return 80;
+    long rw = PROT_READ | PROT_WRITE;
+    /* Each type, of a file, of /dev/zero and of anonymous memory. */
+    printf("file:");
+    for (long type = 0; type < 16; type++) printf(" %ld", types_mapped(page, rw, type, fd, 0));
+    printf("\nzero:");
+    for (long type = 0; type < 16; type++) printf(" %ld", types_mapped(page, rw, type, zero, 0));
+    printf("\nanonymous:");
+    for (long type = 0; type < 16; type++)
+        printf(" %ld", types_mapped(page, rw, type | MAP_ANONYMOUS, -1, 0));
+    printf("\n");
+    /* The flags MAP_SHARED_VALIDATE takes, and those it refuses. */
+    static const struct {
+        const char *name;
+        long flag;
+    } flags[] = {
+        {"none", 0},           {"populate", MAP_POPULATE}, {"locked", MAP_LOCKED},
+        {"noreserve", MAP_NORESERVE}, {"stack", MAP_STACK}, {"32bit", MAP_32BIT},
+        {"above4g", 0x80},     {"huge-2mb", 21L << 26},     {"huge-1gb", 30L << 26},
+        {"huge-64kb", 16L << 26}, {"huge-bit31", 1L << 31}, {"uninitialized", 0x4000000},
+        {"denywrite", 0x800},  {"executable", 0x1000},      {"sync", 0x80000},
+        {"noreplace", MAP_FIXED_NOREPLACE}, {"bit9", 0x200}, {"bit10", 0x400},
+        {"bit21", 0x200000},   {"bit32", 1L << 32},         {"bit40", 1L << 40},
+    };
+    for (size_t i = 0; i < sizeof flags / sizeof *flags; i++) {
+        long flag = flags[i].flag;
+        void *at = NULL;
+        char *spot = NULL;
+        if (flag == MAP_FIXED_NOREPLACE) {
+            spot = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (spot == MAP_FAILED) return 81;
+            munmap(spot, page);
+            at = spot;
+        }
+        long validated = syscall(SYS_mmap, at, page, rw, MAP_SHARED_VALIDATE | flag, fd, 0L);
+        long validated_errno = validated == -1 ? -errno : 0;
+        if (validated != -1) munmap((void *)validated, page);
+        long shared = syscall(SYS_mmap, at, page, rw, MAP_SHARED | flag, fd, 0L);
+        long shared_errno = shared == -1 ? -errno : 0;
+        if (shared != -1) munmap((void *)shared, page);
+        /* What MAP_SYNC gives depends on the file system, so it is
+         * compared with what fstatfs says that file system takes. */
+        if (flag == 0x80000) {
+            int syncs = types_fs_syncs(fd);
+            long want = syncs ? -EOPNOTSUPP : 0;
+            if (syncs >= 0 && validated_errno == -EOPNOTSUPP && shared_errno == want)
+                printf("sync: as-file-system\n");
+            else
+                printf("sync: validate=%ld shared=%ld syncs=%d\n", validated_errno,
+                       shared_errno, syncs);
+            continue;
+        }
+        printf("%s: validate=%ld shared=%ld\n", flags[i].name, validated_errno, shared_errno);
+    }
+    /* A flag it does not know comes after the file's size, before its access. */
+    long overflow = types_mapped(2 * page, PROT_READ, MAP_SHARED_VALIDATE | 0x80000, fd,
+                                 0x7ffffffffffff000L);
+    long unknown_read_only = types_mapped(page, rw, MAP_SHARED_VALIDATE | 0x80000, only, 0);
+    long read_only = types_mapped(page, rw, MAP_SHARED_VALIDATE, only, 0);
+    long zero_unknown = types_mapped(page, rw, MAP_SHARED_VALIDATE | 0x80000, zero, 0);
+    long anonymous_unknown =
+        types_mapped(page, rw, MAP_SHARED_VALIDATE | MAP_ANONYMOUS | 0x80000, -1, 0);
+    /* On ext4 and xfs MAP_SYNC is known, so the access is checked first. */
+    int syncs = types_fs_syncs(fd);
+    long sync_private = types_mapped(page, rw, MAP_PRIVATE | 0x80000, fd, 0);
+    if (unknown_read_only == (syncs ? -EACCES : -EOPNOTSUPP) &&
+        sync_private == (syncs ? -EOPNOTSUPP : 0))
+        printf("unknown-read-only=as-file-system sync-private=as-file-system\n");
+    else
+        printf("unknown-read-only=%ld sync-private=%ld syncs=%d\n", unknown_read_only,
+               sync_private, syncs);
+    printf("overflow=%ld read-only=%ld zero-unknown=%ld anonymous-unknown=%ld\n", overflow,
+           read_only, zero_unknown, anonymous_unknown);
+    /* The program's own file, on the file system it was built on. */
+    int program = open(self, O_RDONLY);
+    if (program < 0) return 93;
+    int program_syncs = types_fs_syncs(program);
+    long program_sync = types_mapped(page, PROT_READ, MAP_PRIVATE | 0x80000, program, 0);
+    long program_plain = types_mapped(page, PROT_READ, MAP_PRIVATE, program, 0);
+    if (program_syncs >= 0 && program_sync == (program_syncs ? -EOPNOTSUPP : 0))
+        printf("program-sync=as-file-system program-plain=%ld\n", program_plain);
+    else
+        printf("program-sync=%ld syncs=%d program-plain=%ld\n", program_sync, program_syncs,
+               program_plain);
+    close(program);
+    /* MAP_SYNC: ext4 and xfs take it for MAP_SHARED_VALIDATE and refuse it
+     * for any type of a file not of DAX; shmem neither takes it nor looks. */
+    int shm = memfd_create("mmap-types", 0);
+    if (shm < 0 || ftruncate(shm, page)) return 92;
+    printf("memfd-sync: validate=%ld shared=%ld private=%ld\n",
+           types_mapped(page, rw, MAP_SHARED_VALIDATE | 0x80000, shm, 0),
+           types_mapped(page, rw, MAP_SHARED | 0x80000, shm, 0),
+           types_mapped(page, rw, MAP_PRIVATE | 0x80000, shm, 0));
+    close(shm);
+    /* A validated shared mapping writes the file. */
+    char *validated = (char *)syscall(SYS_mmap, 0L, page, rw, MAP_SHARED_VALIDATE, fd, 0L);
+    if (validated == MAP_FAILED) return 82;
+    validated[5] = 42;
+    char byte = 0;
+    if (pread(fd, &byte, 1, 5) != 1) return 83;
+    printf("validated-writes=%d\n", byte);
+    smaps_show("validated", validated, SMAPS_FLAGS);
+    munmap(validated, page);
+    /* What MAP_DROPPABLE refuses. */
+    long anon_drop = MAP_DROPPABLE | MAP_ANONYMOUS;
+    printf("drop-locked=%ld drop-growsdown=%ld drop-hugetlb=%ld drop-file=%ld drop-zero=%ld\n",
+           types_mapped(page, rw, anon_drop | MAP_LOCKED, -1, 0),
+           types_mapped(page, rw, anon_drop | MAP_GROWSDOWN, -1, 0),
+           types_mapped(page, rw, anon_drop | MAP_HUGETLB, -1, 0),
+           types_mapped(page, rw, MAP_DROPPABLE, fd, 0),
+           types_mapped(page, rw, MAP_DROPPABLE, zero, 0));
+    printf("drop-populate=%ld drop-noreserve=%ld drop-stack=%ld\n",
+           types_mapped(page, rw, anon_drop | MAP_POPULATE, -1, 0),
+           types_mapped(page, rw, anon_drop | MAP_NORESERVE, -1, 0),
+           types_mapped(page, rw, anon_drop | MAP_STACK, -1, 0));
+    /* Its own VMAs, apart from any other mapping. */
+    char *guard = mmap(NULL, 5 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (guard == MAP_FAILED) return 84;
+    char *p = mmap(guard + page, 3 * page, rw, anon_drop | MAP_FIXED, -1, 0);
+    if (p != guard + page) return 85;
+    for (int i = 0; i < 3; i++) p[i * page] = i + 1;
+    smaps_show("droppable", p, SMAPS_SIZE);
+    /* Pieces of droppable memory merge again. */
+    long protected = advice_errno(mprotect(p + page, page, PROT_READ));
+    int split = advice_vmas(p, p + 3 * page);
+    long unprotected = advice_errno(mprotect(p + page, page, rw));
+    printf("protect=%ld split=%d unprotect=%ld vmas=%d\n", protected, split, unprotected,
+           advice_vmas(p, p + 3 * page));
+    long keep = advice_errno(madvise(p, page, MADV_KEEPONFORK));
+    long dodump = advice_errno(madvise(p, page, MADV_DODUMP));
+    long dontdump = advice_errno(madvise(p, page, MADV_DONTDUMP));
+    long wipe = advice_errno(madvise(p, page, MADV_WIPEONFORK));
+    long dontfork = advice_errno(madvise(p + 2 * page, page, MADV_DONTFORK));
+    long dofork = advice_errno(madvise(p + 2 * page, page, MADV_DOFORK));
+    long mergeable = advice_errno(madvise(p, 3 * page, MADV_MERGEABLE));
+    printf("keeponfork=%ld dodump=%ld dontdump=%ld wipeonfork=%ld dontfork=%ld dofork=%ld "
+           "mergeable=%ld vmas=%d\n",
+           keep, dodump, dontdump, wipe, dontfork, dofork, mergeable,
+           advice_vmas(p, p + 3 * page));
+    smaps_show("advised", p, SMAPS_FLAGS);
+    /* KEEPONFORK ends at the droppable VMA, after the one before it. */
+    char *plain = mmap(guard, page, rw, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (plain != guard) return 86;
+    plain[0] = 7;
+    long wiped_plain = advice_errno(madvise(plain, page, MADV_WIPEONFORK));
+    long keep_across = advice_errno(madvise(plain, 2 * page, MADV_KEEPONFORK));
+    printf("wipe-plain=%ld keep-across=%ld\n", wiped_plain, keep_across);
+    smaps_show("plain", plain, SMAPS_FLAGS);
+    /* mlock leaves it unlocked. */
+    long locked = advice_errno(mlock(p, 3 * page));
+    printf("mlock=%ld vmas=%d\n", locked, advice_vmas(p, p + 3 * page));
+    smaps_show("mlocked", p, SMAPS_COUNTS);
+    long unlocked = advice_errno(munlock(p, 3 * page));
+    printf("munlock=%ld\n", unlocked);
+    /* No userfaultfd registers it. */
+    long uffd = syscall(SYS_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
+    if (uffd < 0) {
+        printf("userfaultfd=%d\n", -errno);
+    } else {
+        unsigned long long api[3] = {0xAA, 0, 0};
+        if (ioctl((int)uffd, 0xC018AA3F, api)) return 87;
+        unsigned long long reg[4] = {(unsigned long)p, (unsigned long)page, 1, 0};
+        long registered = ioctl((int)uffd, 0xC020AA00, reg) ? -errno : 0;
+        unsigned long long reg_plain[4] = {(unsigned long)plain, (unsigned long)page, 1, 0};
+        long plain_registered = ioctl((int)uffd, 0xC020AA00, reg_plain) ? -errno : 0;
+        printf("register=%ld register-plain=%ld\n", registered, plain_registered);
+        close((int)uffd);
+    }
+    /* A child gets it with none of its pages. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 88;
+    if (child == 0) {
+        printf("child: %d %d %d plain=%d\n", p[0], p[page], p[2 * page], plain[0]);
+        smaps_show("child", p, SMAPS_FLAGS);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 89;
+    printf("parent: %d %d %d\n", p[0], p[page], p[2 * page]);
+    /* With mlockall's MCL_FUTURE it is locked, and munlockall leaves it so. */
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 90;
+    if (child == 0) {
+        if (mlockall(MCL_FUTURE)) {
+            printf("mlockall=%d\n", -errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        char *future = mmap(NULL, page, rw, anon_drop, -1, 0);
+        if (future == MAP_FAILED) {
+            printf("future=%d\n", -errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        smaps_show("future", future, SMAPS_COUNTS);
+        long all = advice_errno(munlockall());
+        printf("munlockall=%ld\n", all);
+        smaps_show("after-munlockall", future, SMAPS_FLAGS);
+        long own = advice_errno(munlock(future, page));
+        printf("munlock=%ld\n", own);
+        smaps_show("after-munlock", future, SMAPS_FLAGS);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 91;
+    munmap(guard, 5 * page);
+    return 0;
+}
 static void smaps_locked(void) {
     char status[8192];
     int fd = open("/proc/self/status", O_RDONLY);
@@ -41813,6 +42053,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-collapse")) return madvise_collapse_case();
     if (!strcmp(mode, "madvise-collapse-shmem")) return madvise_collapse_shmem_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
+    if (!strcmp(mode, "mmap-types")) return mmap_types_case(self);
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
     if (!strcmp(mode, "file-leases")) {

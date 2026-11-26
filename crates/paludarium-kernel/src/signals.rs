@@ -717,6 +717,31 @@ pub(crate) fn lowest_in(pending: &[PendingSignal], set: u64) -> Option<usize> {
         .min_by_key(|(index, s)| (s.number, *index))
         .map(|(index, _)| index)
 }
+/// Whether signal `number`, of the default action, ends the process as it
+/// is sent (`complete_signal`). SIGCHLD, SIGCONT, SIGURG and SIGWINCH are
+/// ignored by default, and SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU stop;
+/// SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU,
+/// SIGXFSZ and SIGSYS dump a core, which their taker starts.
+pub(crate) fn kills_at_send(number: i32) -> bool {
+    (1..=64).contains(&number) && !matches!(number, 17..=23 | 28 | 3..=8 | 11 | 24 | 25 | 31)
+}
+/// Whether a pending signal `number` makes `fatal_signal_pending`, as
+/// Linux's `complete_signal` turns one that [`kills_at_send`] into SIGKILL.
+pub(crate) fn fatal(number: i32, mask: u64, action: SignalAction) -> bool {
+    number == 9
+        || kills_at_send(number) && mask & (1u64 << (number - 1)) == 0 && action.handler == 0
+}
+/// Whether a fatal signal is pending for `process` ([`fatal`]).
+pub(crate) fn fatal_pending(process: &ThreadState) -> bool {
+    process.pending.iter().any(|signal| {
+        let action = process.signal_actions.get(&signal.number);
+        fatal(
+            signal.number,
+            process.signal_mask,
+            action.copied().unwrap_or_default(),
+        )
+    })
+}
 /// The earliest deadline of the interval timer, the POSIX timers and what is
 /// due in the session ([`crate::deadlines`]).
 pub(crate) fn next_deadline(process: &ThreadState) -> Option<u64> {
@@ -740,5 +765,31 @@ pub(crate) fn expire_timer(process: &mut ThreadState, now: u64) {
                 .and_then(|delta| deadline.checked_add(delta))
         };
         queue(process, PendingSignal::user(14, 128));
+    }
+}
+
+#[cfg(test)]
+mod fatal_tests {
+    use super::*;
+
+    /// `sig_fatal`, less the signals that dump core.
+    #[test]
+    fn a_fatal_signal_is_unblocked_and_of_a_default_action_that_ends() {
+        let default = SignalAction::default();
+        let handled = SignalAction {
+            handler: 0x1000,
+            ..default
+        };
+        for number in [1, 2, 9, 13, 14, 15, 16, 26, 27, 30, 34, 64] {
+            assert!(fatal(number, 0, default), "{number}");
+            assert_eq!(fatal(number, 1 << (number - 1), handled), number == 9);
+            assert_eq!(fatal(number, 0, handled), number == 9);
+            assert_eq!(fatal(number, 1 << (number - 1), default), number == 9);
+        }
+        for number in [
+            3, 4, 5, 6, 7, 8, 11, 17, 18, 19, 20, 21, 22, 23, 24, 25, 28, 31,
+        ] {
+            assert!(!fatal(number, 0, default), "{number}");
+        }
     }
 }

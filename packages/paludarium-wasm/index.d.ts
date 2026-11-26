@@ -4,6 +4,10 @@ export class PaludariumError extends Error {
   rip?: bigint;
   bytes?: Uint8Array;
   syscall?: number;
+  /** When a Worker trapped: the shared memory's size in bytes then. */
+  memoryBytes?: number;
+  /** When a Worker trapped: what the launcher's heap reserve did at its start, null where none ran (outside WebKit). */
+  heapReserve?: { reserved: number; bytesBefore: number; bytesAfter: number } | null;
 }
 /**
  * One path of a tree to place, in the shape `snapshot()` returns, so a

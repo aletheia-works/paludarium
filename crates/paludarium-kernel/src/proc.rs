@@ -118,11 +118,12 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 30] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 31] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
     (b"ns", 4),
+    (b"net", 4),
     (b"environ", 8),
     (b"auxv", 8),
     (b"status", 8),
@@ -151,11 +152,12 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 30] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 30] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 31] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
     (b"ns", 4),
+    (b"net", 4),
     (b"environ", 8),
     (b"auxv", 8),
     (b"status", 8),
@@ -236,6 +238,13 @@ pub(crate) enum TaskEntry {
     /// `ns`, the directory of the task's namespaces, and one of its links.
     Namespaces,
     Namespace(crate::namespaces::Entry),
+    /// `/proc/net`, a link to the reading process's `net`; `net`, the
+    /// directory of the task's network namespace, and one of its files.
+    NetLink,
+    Net,
+    NetFile(crate::proc_net::File),
+    /// A path on past one of those files.
+    BelowNetFile,
     /// `uid_map` or `gid_map`, and `setgroups`, of the task's user
     /// namespace.
     IdMap(crate::users::Ids),
@@ -252,10 +261,11 @@ pub(crate) struct TaskPath {
     pub entry: TaskEntry,
 }
 /// The path under `/proc/<pid>` of a process other than `own`, the reader,
-/// under `task` of any process, or under `/proc/thread-self`, the reading
-/// thread `own_tid`'s; `None` for the rest of the reader's own directory,
-/// which [`own_entry`] finds, unless `own_leader_gone`: then the reader's
-/// process directory is its zombie leader's, found here as another's is.
+/// under `task` of any process, under `/proc/thread-self`, the reading
+/// thread `own_tid`'s, or `/proc/net` and under it, the reader's; `None` for
+/// the rest of the reader's own directory, which [`own_entry`] finds, unless
+/// `own_leader_gone`: then the reader's process directory is its zombie
+/// leader's, found here as another's is.
 /// The path is taken as it reads, `.` and `..` included.
 pub(crate) fn task_path(
     path: &[u8],
@@ -266,15 +276,16 @@ pub(crate) fn task_path(
     if !path.starts_with(b"/proc/") {
         return None;
     }
-    // `/proc/thread-self` is the link itself; with a slash or more after
-    // it, the directory it leads to.
-    let link_itself = path.ends_with(b"/thread-self");
+    // `/proc/thread-self` is the link itself, and `/proc/net`; with a slash
+    // or more after it, the directory it leads to.
+    let link_itself = path.ends_with(b"/thread-self") || path.ends_with(b"/net");
     let path = paludarium_vfs::normalize_path(path).ok()?;
     let rest = path.strip_prefix(b"/proc/")?;
     let mut parts = rest.split(|&b| b == b'/');
     let head = parts.next()?;
     let thread_self = head == b"thread-self";
-    let pid = if head == b"self" || thread_self {
+    let net = head == b"net";
+    let pid = if head == b"self" || thread_self || net {
         own
     } else {
         descriptor_number(head).filter(|&pid| pid != 0)?
@@ -305,6 +316,7 @@ pub(crate) fn task_path(
         b"mounts" => TaskEntry::Mounts(false),
         b"mountinfo" => TaskEntry::Mounts(true),
         b"ns" => TaskEntry::Namespaces,
+        b"net" => TaskEntry::Net,
         b"uid_map" => TaskEntry::IdMap(crate::users::Ids::User),
         b"gid_map" => TaskEntry::IdMap(crate::users::Ids::Group),
         b"setgroups" => TaskEntry::Setgroups,
@@ -319,6 +331,12 @@ pub(crate) fn task_path(
         [b"ns", name] => {
             crate::namespaces::Entry::named(name).map_or(TaskEntry::Missing, TaskEntry::Namespace)
         }
+        [b"net", name] => {
+            crate::proc_net::File::named(name).map_or(TaskEntry::Missing, TaskEntry::NetFile)
+        }
+        [b"net", name, ..] if crate::proc_net::File::named(name).is_some() => {
+            TaskEntry::BelowNetFile
+        }
         [b"fd", name] => descriptor_number(name).map_or(TaskEntry::Missing, TaskEntry::Descriptor),
         [b"fdinfo", name] => {
             descriptor_number(name).map_or(TaskEntry::Missing, TaskEntry::DescriptorInfo)
@@ -327,18 +345,23 @@ pub(crate) fn task_path(
     };
     let thread = |name: &[u8]| descriptor_number(name).filter(|&tid| tid != 0);
     let (tid, entry) = match parts[..] {
+        [] if net && link_itself => (None, TaskEntry::NetLink),
+        _ if net => {
+            let parts: Vec<&[u8]> = [&b"net"[..]].into_iter().chain(parts).collect();
+            (None, entry(&parts))
+        }
         [] if thread_self && link_itself => (Some(own_tid), TaskEntry::ThreadLink),
         [] if thread_self => (Some(own_tid), TaskEntry::Directory),
         _ if thread_self => (Some(own_tid), entry(&parts)),
         [b"task"] => (None, TaskEntry::Threads),
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
-        // The process's own `ns`, user namespace files, mount tables,
+        // The process's own `ns`, `net`, user namespace files, mount tables,
         // `auxv`, `limits`, `statm`, `io`, `personality`, `wchan`,
         // `syscall` and `mem` are here (`/proc/self/mountinfo`
         // and `mounts` are [`mount_table`]'s); the rest of its own directory
         // is `own_entry`'s.
-        [b"ns", ..]
+        [b"ns" | b"net", ..]
         | [
             b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
             | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan" | b"syscall" | b"mem",

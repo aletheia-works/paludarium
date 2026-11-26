@@ -4,7 +4,8 @@
    and vc (1002, 10.78.0.1/24) to vd (1003, 10.78.0.2/24), with va and vc in
    A. First the options and their errors (IP_MULTICAST_IF, IP_MULTICAST_TTL,
    IP_MULTICAST_LOOP, IP_MULTICAST_ALL, IP_ADD_MEMBERSHIP,
-   IP_DROP_MEMBERSHIP), over UDP, TCP and IPv6 sockets. Then datagrams to
+   IP_DROP_MEMBERSHIP), over UDP, TCP and IPv6 sockets, with what sock_diag
+   tells of IP_MULTICAST_LOOP and IP_MULTICAST_ALL. Then datagrams to
    groups, through a device named by its index, by an address of it, by the
    socket's own address, by its device and by a route: B's sockets get each
    that came in on a device that has joined the group, whichever socket
@@ -313,7 +314,55 @@ static void get(int fd, int name, socklen_t len, const char *label) {
     long r = result(getsockopt(fd, IPPROTO_IP, name, v, &len));
     printf("%s: %s: getsockopt=%ld len=%u %02x %02x %02x %02x\n", side, label, r, len, v[0], v[1], v[2], v[3]);
 }
+/* What sock_diag tells of the options of the UDP socket of `af` `fd`, bound
+   to 7300 for it. */
+static void diag(int fd, int af, const char *label) {
+    struct sockaddr_in6 a = {.sin6_family = (unsigned short)af, .sin6_port = htons(7300)};
+    show(label, result(bind(fd, (void *)&a, af == AF_INET ? sizeof(struct sockaddr_in) : sizeof a)));
+    static unsigned char buf[8192];
+    memset(buf, 0, sizeof buf);
+    struct nl_header *h = (void *)buf;
+    h->len = sizeof *h + 56;
+    h->type = 20;
+    h->flags = NLM_F_REQUEST | 0x300;
+    buf[16] = (unsigned char)af;
+    buf[17] = IPPROTO_UDP;
+    memset(buf + 20, 0xff, 4);
+    int d = socket(AF_NETLINK, SOCK_RAW, 4);
+    send(d, buf, h->len, 0);
+    struct pollfd ready = {.fd = d, .events = POLLIN};
+    long n = poll(&ready, 1, 2000) > 0 ? recv(d, buf, sizeof buf, 0) : 0;
+    for (long m = 0; m + 88 <= n && ((struct nl_header *)(buf + m))->type == 20;) {
+        unsigned len = ((struct nl_header *)(buf + m))->len;
+        unsigned short port;
+        memcpy(&port, buf + m + 20, 2);
+        for (unsigned at = 88; port == htons(7300) && at + 4 <= len;) {
+            unsigned short attribute[2];
+            memcpy(attribute, buf + m + at, 4);
+            if (attribute[0] < 4) break;
+            if (attribute[1] == 22) printf("%s:   %#x %#x\n", side, buf[m + at + 4], buf[m + at + 5]);
+            at += (attribute[0] + 3u) & ~3u;
+        }
+        m += (len + 3) & ~3u;
+    }
+    close(d);
+}
+static void diags(int af, const char *label) {
+    int fd = socket(af, SOCK_DGRAM, 0);
+    get(fd, IP_MULTICAST_ALL, 4, label);
+    diag(fd, af, label);
+    close(fd);
+    for (int i = 0; i < 4; i++) {
+        fd = socket(af, SOCK_DGRAM, 0);
+        set_int(fd, IP_MULTICAST_LOOP, i & 1);
+        set_int(fd, IP_MULTICAST_ALL, i >> 1);
+        diag(fd, af, i & 1 ? i >> 1 ? "both" : "loop" : i >> 1 ? "all" : "neither");
+        close(fd);
+    }
+}
 static void options(void) {
+    diags(AF_INET, "all of IPv4 unset");
+    diags(AF_INET6, "all of IPv6 unset");
     int u = socket(AF_INET, SOCK_DGRAM, 0), t = socket(AF_INET, SOCK_STREAM, 0), six = socket(AF_INET6, SOCK_DGRAM, 0);
     unsigned char byte = 7;
     struct in_addr in = {0};
@@ -530,8 +579,10 @@ static void child(int in, int out) {
             on_vd = watch(udp(AF_INET, "0.0.0.0", 7000), "member on vd, all off");
             set_int(on_vd, IP_MULTICAST_ALL, 0);
             show("join on vd", join(on_vd, "239.1.2.3", "10.78.0.2", 0));
-            fd = watch(udp(AF_INET6, "::", 7000), "dual-stack, all off");
-            set_int(fd, IP_MULTICAST_ALL, 0);
+            fd = watch(udp(AF_INET6, "::", 7000), "dual-stack, all on");
+            set_int(fd, IP_MULTICAST_ALL, 1);
+            watch(udp(AF_INET6, "::", 7000), "dual-stack, no member");
+            fd = watch(udp(AF_INET6, "::", 7000), "dual-stack");
             show("join of IPv6", join(fd, "239.1.2.3", NULL, VB));
             fd = socket(AF_INET6, SOCK_DGRAM, 0);
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &only, sizeof only);

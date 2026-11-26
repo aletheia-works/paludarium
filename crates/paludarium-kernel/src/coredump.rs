@@ -5,10 +5,11 @@
 //! has one `PT_NOTE` segment (each thread's registers, the process, the
 //! fatal signal, the auxiliary vector and the mapped files) and one
 //! `PT_LOAD` segment per VMA, whose contents follow the default
-//! `coredump_filter`, and the `vsyscall` page's, which holds zeros. It has no `NT_X86_XSTATE` note, as Linux writes none
-//! on a CPU without XSAVE, which the virtual CPU is. A core
-//! larger than the limit is cut there; it still counts as dumped, as Linux's
-//! binfmt_elf reports a core once it has started to write it.
+//! `coredump_filter`, and the `vsyscall` page's, which holds zeros. It has
+//! no `NT_X86_XSTATE` note, as Linux writes none on a CPU without XSAVE,
+//! which the virtual CPU is. A core larger than the limit is cut there; it
+//! still counts as dumped, as Linux's binfmt_elf reports a core once it has
+//! started to write it.
 use crate::signals;
 use paludarium_cpu::segments;
 use paludarium_cpu::{CpuState, FX_WRITTEN, reg};

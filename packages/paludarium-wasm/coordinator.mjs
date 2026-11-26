@@ -32,6 +32,8 @@ function releaseWorker(slot) {
 }
 let abandoned = false;
 const failure = (kind, message) => ({ kind, message });
+// What heap_reserve did at init, for diagnostics(): null where it is not called.
+let heapReserve = null;
 function check(value, name) { if (value < 0) throw new Error(`${name} rejected`); return value; }
 function jitDiagnostics(job) {
   if (job.diagnostics && typeof e.cost_version === "function") job.diagnostics.costProfile = costSnapshot(e);
@@ -248,12 +250,12 @@ function flush(job) {
     job.offsets[name] = bytes.length;
   }
 }
-function fatal(message) {
+function fatal(message, memoryBytes) {
   if (abandoned) return;
   abandoned = true;
   for (const job of jobs.values()) { clearTimeout(job.timer); clearInterval(job.poll); }
   // Termination may abandon Rust locks; no further Rust ABI calls are permitted.
-  void Promise.all([...childWorkers].map(stopWorker)).finally(() => port.send({ type: "fatal", error: failure("host", message) }));
+  void Promise.all([...childWorkers].map(stopWorker)).finally(() => port.send({ type: "fatal", error: memoryBytes === undefined ? failure("host", message) : { ...failure("host", message), memoryBytes, heapReserve } }));
 }
 async function sharedProbe() {
   const space = e.shared_space_new();
@@ -271,7 +273,7 @@ async function sharedProbe() {
       const child = { slot, worker: slot.worker, region, token, pending: new Map() };
       child.next = type => new Promise((resolve, reject) => child.pending.set(type, { resolve, reject }));
       slot.report = report => {
-        if (report.type === "failed") { fatal(report.error); for (const promise of child.pending.values()) promise.reject(new Error(report.error)); }
+        if (report.type === "failed") { fatal(report.error, report.memoryBytes); for (const promise of child.pending.values()) promise.reject(new Error(report.error)); }
         else { child.pending.get(report.type)?.resolve(report); child.pending.delete(report.type); }
       };
       slot.failed = cause => { fatal(String(cause)); for (const promise of child.pending.values()) promise.reject(cause); };
@@ -343,7 +345,7 @@ async function launchTask(job, handle) {
         releaseWorker(slot);
         if (!abandoned) { e.region_drop(region); e.buffer_drop(token); }
         resolveDone();
-      } else if (report.type === "failed") { fatal(report.error); resolveDone(); }
+      } else if (report.type === "failed") { fatal(report.error, report.memoryBytes); resolveDone(); }
     };
     slot.worker.postMessage({ type: "execute", operation: "task", module, memory, sessionHandle: job.handle, taskHandle: handle, stackTop, tlsPointer, tokenHandle: token });
   } catch (cause) { fatal(`guest Worker start failed: ${cause}`); resolveDone(); }
@@ -386,7 +388,7 @@ async function launch(message) {
       else if (report.type === "spawn-task") void launchTask(job, report.handle);
       else if (report.type === "net") void netRequest(job, report.request);
       else if (report.type === "finished") void finish(job, report.result, report.result < 0 ? errorFor(handle) : null);
-      else if (report.type === "failed") fatal(report.error);
+      else if (report.type === "failed") fatal(report.error, report.memoryBytes);
     };
     job.poll = setInterval(() => { try { flush(job); } catch (cause) { fatal(String(cause)); } }, 10);
     slot.worker.postMessage({ type: "execute", module, memory, sessionHandle: handle, stackTop, tlsPointer, tokenHandle: token });
@@ -404,7 +406,10 @@ port.listen(async message => {
       // memory access") or crashes the page, so grow it to its maximum now, before any guest runs. The
       // heap is reserved untouched, so the pages are not resident until used. Only in WebKit: on
       // Windows, and in Firefox on Linux, the grown memory counts against the commit limit at once.
-      if (typeof e.heap_reserve === "function" && isWebKit(globalThis.navigator?.userAgent)) e.heap_reserve(0xffffffff);
+      if (typeof e.heap_reserve === "function" && isWebKit(globalThis.navigator?.userAgent)) {
+        const before = memory.buffer.byteLength, reserved = e.heap_reserve(0xffffffff);
+        heapReserve = { reserved, bytesBefore: before, bytesAfter: memory.buffer.byteLength };
+      }
       port.send({ type: "ready", exports: WebAssembly.Module.exports(module), imports: WebAssembly.Module.imports(module) });
     } else if (message.type === "filesystem-new") {
       const config = withBytes(encoder.encode("/"), id => e.config_new(id));
@@ -427,7 +432,7 @@ port.listen(async message => {
       port.send({ type: "control", id: message.id });
     } else if (message.type === "run") await launch(message);
     else if (message.type === "diagnostics") {
-      port.send({ type: "diagnostics", id: message.id, diagnostics: { workers: latestDiagnostics, sharedProbe: await sharedProbe() } });
+      port.send({ type: "diagnostics", id: message.id, diagnostics: { workers: latestDiagnostics, sharedProbe: await sharedProbe(), heapReserve, memoryBytes: memory.buffer.byteLength } });
     }
     else if (message.type === "stdin") {
       const job = jobs.get(message.id);

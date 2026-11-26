@@ -1085,10 +1085,12 @@ pub(crate) fn notify(c: &mut Context<'_>, notify: &Notify) -> Reply {
 }
 
 /// Whether a signal pending for `c` would end it, which ends a killable
-/// wait (`fatal_signal_pending`, as `complete_signal` turns such a signal
-/// into SIGKILL): SIGKILL, the group ending, or an unblocked signal whose
-/// default action, with no handler, ends the process.
+/// wait (`fatal_signal_pending`): the group ending, or a fatal signal
+/// ([`crate::signals::fatal`]), a timer's that has expired too.
 fn fatal_pending(c: &mut Context<'_>) -> bool {
+    if let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) {
+        c.group.expire_timer(c.process, now);
+    }
     c.inbox.drain(c.process);
     c.group.drain_process(c.process);
     if c.group.status().is_some()
@@ -1096,19 +1098,7 @@ fn fatal_pending(c: &mut Context<'_>) -> bool {
     {
         return true;
     }
-    c.process.pending.iter().any(|signal| {
-        let number = signal.number;
-        let action = c
-            .process
-            .signal_actions
-            .get(&number)
-            .copied()
-            .unwrap_or_default();
-        number == 9
-            || (c.process.signal_mask & (1u64 << (number - 1)) == 0
-                && action.handler == 0
-                && !matches!(number, 17..=23 | 28))
-    })
+    crate::signals::fatal_pending(c.process)
 }
 
 /// A wait that signals do not end: until the readiness ticket moves, or

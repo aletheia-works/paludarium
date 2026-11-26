@@ -180,7 +180,10 @@ with a `PaludariumError` whose `kind` is `"unimplemented"`, `"internal"`,
 `"invalid-program"` or `"host"`, and which keeps the instruction address
 (`rip`), the instruction `bytes` and the `syscall` number when they are known.
 If a Worker traps, the whole shared runtime is discarded, because the
-abandoned Worker may have held a lock.
+abandoned Worker may have held a lock. Such an error also keeps the shared
+memory's size in bytes when the Worker trapped (`memoryBytes`), and what the
+launcher's heap reserve did at its start (`heapReserve`, null outside WebKit;
+see the design decisions).
 
 ## Requirements in the browser
 

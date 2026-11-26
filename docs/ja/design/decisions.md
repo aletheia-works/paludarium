@@ -139,7 +139,9 @@ Chromium・Firefox・本物の Safari で動くことを確かめてから、作
   物理メモリを使いません。ほかのブラウザでは必要になったときに grow します。Windows と、Linux の
   Firefox では、grow したメモリがすぐにシステムのコミットの上限に数えられるからです。WebKit の
   ブラウザはユーザーエージェントで見分けます。`AppleWebKit/` があって `Chrome/` がないものです。
-  iOS のブラウザはすべてこれに当たります。このクラッシュは
+  iOS のブラウザはすべてこれに当たります。`diagnostics()` は、この確保が返した値と、その前後の
+  メモリの大きさ（`heapReserve`。ほかのブラウザでは null）を返します。trap した Worker の
+  ホストのエラーも同じものを持ち、ブラウザの確認はその両方をログに出します。このクラッシュは
   [WebKit のバグ 330591](https://bugs.webkit.org/show_bug.cgi?id=330591) として、paludarium
   なしで再現するページとともに報告しています。これが直れば、WebKit でもこの処理は要らなく
   なるかもしれません。

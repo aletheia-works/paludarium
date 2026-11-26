@@ -871,6 +871,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EEXIST` になります。中身を付けられなかったときは、新しいマッピングを外し、置き換えた
   マッピングは戻りません。
 
+- `mmap` は `do_mmap` の種類（`MAP_TYPE`、4 ビット）を受け付けます。ファイルと
+  `/dev/zero` は `MAP_SHARED`、`MAP_SHARED_VALIDATE`、`MAP_PRIVATE`、匿名メモリは
+  `MAP_SHARED`、`MAP_PRIVATE`、`MAP_DROPPABLE` でマップでき、ほかの値は `EINVAL` です。
+  `MAP_SHARED_VALIDATE` は、Linux の `LEGACY_MAP_MASK` にないフラグを断る
+  `MAP_SHARED` です（`EOPNOTSUPP`。ファイルの大きさを確かめたあと、アクセスの前）。
+  `MAP_FIXED_NOREPLACE`、2 MiB にも 1 GiB にもないヒュージページの大きさのビット 31、
+  ビット 31 より上も含む知らないビット、ext4 と xfs（`FOP_MMAP_SYNC`。Linux に番号のない
+  ホストのファイルシステムは ext4 とみなします）以外での `MAP_SYNC` がそうで、
+  `MAP_SHARED` はこれらを捨てます。ext4 か xfs のファイルでは、DAX のファイルがないので、
+  どの種類でも `MAP_SYNC` はほかの確認のあとで `EOPNOTSUPP` です
+  （`daxdev_mapping_supported`）。`MAP_DROPPABLE` のメモリは、`VM_DROPPABLE`
+  （`VmFlags: dp`）、`VM_NORESERVE`、`VM_WIPEONFORK`、`VM_DONTDUMP` を持つプライベートな
+  匿名メモリです。`fork` した子はページのない状態で受け取り、コアには何も入らず、
+  これは変えられません（`MADV_KEEPONFORK` と `MADV_DODUMP` は `EINVAL`）。`MAP_LOCKED`、
+  `MAP_GROWSDOWN`、`MAP_HUGETLB` とは使えず（`EINVAL`）、`mlock` も `mlockall` の
+  `MCL_FUTURE` もロックしません（Linux master の `vma_supports_mlock` と同じです。v7.0 の
+  ソースならロックするところで、CI のランナーのカーネルは master に従います）。
+  `MADV_MERGEABLE` は素通りし、`userfaultfd` は登録しません（`EINVAL`）。Linux はメモリが
+  足りないときにそのページを捨てますが、エミュレーターにはそういうときがないので残ります。
+
 - ファイルの `MAP_SHARED` のマッピングは、Linux と同じくファイルのページキャッシュを
   見せます。どのプロセスのものでも、そのファイルの共有マッピングはみな同じページを
   持ちます。そこへの書き込みは `read` にも、そのファイルのプライベートなマッピングにも
@@ -2549,7 +2569,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     名前の端のリンク上にあるものとし（端は上がっていなければなりません）、名前空間の
     アドレス、ブロードキャスト、グループのものは断ります（`EINVAL`）。パケットは、
     リンクスコープの経路がゲートウェイに届くときはゲートウェイの近隣へ
-    （`rt_uses_gateway`）、ほかは宛先の近隣へ出ていきます。経路の `RTA_MULTIPATH` は、
+    （`rt_uses_gateway`）、ほかは宛先の近隣へ出ていきます。ゲートウェイは IPv6 のものでも
+    かまいません（`RTA_VIA`、`fib_gw_from_via`。そこの IPv4 のものは `RTA_GATEWAY` と同じですが、
+    0.0.0.0 もゲートウェイのままです。両方あれば `EINVAL` です）。IPv6 の経路のものと同じく（`fib_check_nh_v6_gw`）、経路の番号の
+    IPv6 のテーブル、それからローカルとメインのテーブルで確かめ、端では IPv6 が有効でなければ
+    ならず（`EACCES`）、キャリアなしで作ったネクストホップは `RTNH_F_LINKDOWN` になりません。
+    パケットはその近隣へ出ていき、近隣探索は端のリンクローカルのアドレスからそれを見つけます。
+    ダンプ、通知、引き当ては `RTA_VIA` で答えます。経路の `RTA_MULTIPATH` は、
     そのネクストホップを一つの経路にします（`fib_get_nhs`）。それぞれ自分のデバイス、
     ゲートウェイ、フラグで経路のネクストホップと同じく確かめ（`fib_check_nh`）、重み
     （`rtnh_hops` + 1）を持ちます。ネクストホップの後のデータ、`RTNH_F_DEAD` か
@@ -2634,8 +2660,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     グループに入っていれば相手の名前空間が受け取ります（`ip_route_input_mc`）。`lo` からは、
     `lo` が入っていれば戻ります。そこでは、ブロードキャストが届くはずのそのポートの UDP の
     ソケットのうち、そのデバイスで入っているものと、`IP_MULTICAST_ALL` が入ったものに届きます
-    （`ip_mc_sf_allow`）。受け付けた接続の `IP_MULTICAST_TTL` は 64 です
+    （はじめは IPv4 のソケットでは入っていて、IPv6 のソケットでは切れています。
+    `ip_mc_sf_allow`、`inet6_create`）。受け付けた接続の `IP_MULTICAST_TTL` は 64 です
     （`tcp_v4_syn_recv_sock`）。
+  - **IPv6 のマルチキャストのグループ:** IPv6 の UDP のソケットは `IPV6_ADD_MEMBERSHIP` と
+    `IPV6_DROP_MEMBERSHIP` で、インデックスが指すデバイスか、0 ならグループへの経路の
+    デバイスで、グループに入り、出ます。グループでないかデバイスに IPv6 がなければ `EINVAL`、
+    デバイスがなければ `ENODEV`、そこで（0 ならどこかで）もう入っていれば `EADDRINUSE`、
+    入っていないのに出れば `EADDRNOTAVAIL`、TCP なら `EPROTO` です（`__ipv6_sock_mc_join`、
+    `ipv6_sock_mc_drop`）。デバイスはどれも ff01::1 と ff02::1 に、veth の端はそのアドレスの
+    要請ノードのグループに、転送する端は ff01::2、ff02::2、ff05::2 にも入っています。グループへの
+    データグラムは、デバイスがグループに入っていれば自分にも戻り（`IPV6_MULTICAST_LOOP` が
+    切ってあれば戻りません）、そのとき `IPV6_MULTICAST_HOPS` が 0 ならその先へは行きません。
+    インターフェースのスコープのグループ（ff01::/16）へのものは、どれもその先へ行きません
+    （`ip6_finish_output2`）。組の向こうでは、端がグループに入っていれば届きます
+    （`ip6_mc_input`）。そこでは、`::` かそのグループにバインドし、ほかのデバイスに結び付かず、
+    接続していないか送り手に接続したそのポートの IPv6 の UDP のソケットのうち、どのデバイスで
+    でもグループに入っているものと、`IPV6_MULTICAST_ALL` が入ったものに届きます
+    （`inet6_mc_check`）。受け付けた接続の `IPV6_MULTICAST_HOPS` は 64 です
+    （`tcp_v6_syn_recv_sock`）。
   - **組を通る IPv6:** IPv6 の経路（ユニキャストのもの、またはマルチキャストの
     `ff00::/8`）が端から出る接続とデータグラムは、経路の優先する送り元か、
     `ipv6_dev_get_saddr` が選ぶアドレスから出ます。選ぶのは、グループとリンクローカルの
@@ -2648,8 +2691,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     相手の名前空間に届きます。そこでの扱いと戻りは IPv4 と同じで、ICMPv6 の port
     unreachable と address unreachable（3 秒後の `EHOSTUNREACH`）もありますが、
     逆経路のフィルタはありません。`::1` からのものは出ていき、相手で捨てられます。
-    データグラムは 65527 バイトまでで（`EMSGSIZE`）、TCP はグループを取らず
-    （`ENETUNREACH`）、グループへのデータグラムには何も届きません。
+    データグラムは 65527 バイトまでで（`EMSGSIZE`）、TCP はグループを取りません
+    （`ENETUNREACH`）。
   - **veth の端の IPv6:** キャリアのある上がった端は、`addrconf_dev_config` と同じく、
     落ちるまでに一度だけ準備されます。マルチキャストの経路 `ff00::/8`（ローカルの表、
     メトリック 256）、続けて接頭辞の経路 `fe80::/64` と、Ethernet のアドレスから作る
@@ -2695,7 +2738,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     応じてハッシュを分け合い（`fib6_select_path`、`rt6_multipath_rebalance`）、名前空間ごとの
     乱数の鍵で、`fib_multipath_hash_policy` 0 と同じく送り元、宛先、フローラベル、
     プロトコルをハッシュします。ソケットのパケットは、結び付いたアドレス（なければ `::`）
-    で、フローラベルなしでハッシュします。答えは自分の引き当てで選ばれる端を通って返ります。
+    で、フローラベルなしでハッシュします。何にもバインドしていないソケットの送り元は、
+    そうして選んだホップのものです（`ip6_dst_lookup_tail`）。答えは自分の引き当てで選ばれる端を通って返ります。
     リスナーがバインドされている端があればそこを、リンクローカルのアドレスへはパケットが
     入った端を通ります（`inet6_csk_route_req`、`icmp6_send`）。
     端の `disable_ipv6` を 1 にすると、落ちるときと同じく IPv6 の経路とアドレスを失い、
@@ -2856,8 +2900,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`RTM_F_LOOKUP_TABLE` を付ければ、経路のあった表）、`fib_select_path` の選ぶ送り元、
     オンリンクで届くゲートウェイ、リクエストが指した `RTA_MARK`（0 なら付けません）、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
     -1 なら付けず、4 バイトより短ければ `ERANGE`）を持ちます。`0.0.0.0` は 127.0.0.1 から
-    ループバックへ向かいます。IPv6 の答えは、`ipv6_dev_get_saddr` の選ぶ送り元を
-    持ちます。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
+    ループバックへ向かいます。IPv6 の答えは、見つけたホップの送り元を持ちます。経路の優先する送り元、
+    なければ `ipv6_dev_get_saddr` がホップのデバイスで選ぶものです（`ip6_route_get_saddr`）。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
     ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら `EINVAL` です。
     `RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に合う項目はないので
     `EHOSTUNREACH` です）。
@@ -3296,14 +3340,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `[vdso]` は書き込めるようにでき（そのときは写しになり、`/proc/<pid>/mem` で書いたときも
   同じです）、`mremap` で動かせますが、大きくはできません（`EFAULT`）。三つとも分割は
   できず、一部への `munmap`、`mprotect`、`mremap`、`mseal` などで分割になるものは
-  `EINVAL` です。`statm` と `VmSize` はこの三つを数え、`fork` しても
+  `EINVAL` です。`statm` はこの三つを数え、`fork` しても
   同じ場所に残り、Linux の `always_dump_vma` が特別なマッピングをそうするように、
   コアには全体が入ります。
 
 - `vsyscall` のページは Linux の既定（`CONFIG_LEGACY_VSYSCALL_XONLY`）どおりです。
   `ffffffffff600000` にあるゲート領域で、プロセスのマッピングではなく、`maps` と `smaps`
   の最後の行（`--xp`、`VmFlags: ex`）とコアの最後のセグメント（中身は 0）になり、`statm`、
-  `VmSize`、`smaps_rollup` には入りません。実行はできますが読めません（`SIGSEGV`、
+  `smaps_rollup` には入りません。実行はできますが読めません（`SIGSEGV`、
   `SEGV_MAPERR`）。入口の `+0x000`（`gettimeofday`）、`+0x400`（`time`）、`+0x800`
   （`getcpu`）は `emulate_vsyscall` と同じ動きをします。seccomp には入口のアドレスで
   その呼び出しが見え、トレーサーには `PTRACE_EVENT_SECCOMP` が届きますが、システム
@@ -3484,7 +3528,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
@@ -3737,7 +3781,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   root（どのユーザー名前空間の外でもユーザー ID 0）だけです。どちらも Linux の
   `proc_doulongvec_minmax` と同じく unsigned long として読み書きし、書き込みは `-` を取らず
   （`EINVAL`）、それ以外は `/proc/sys/fs/mqueue` のファイルと同じに読みます。
-  `/proc/sys/fs` にあるのはこれらと `fanotify`、`inotify`、`mqueue` だけです。
+  `/proc/sys/fs` にあるのはこれらと `fanotify`、`inotify`、`mqueue`、`lease-break-time`、
+  `leases-enable` だけです。
 
 - `/proc/sys/fs/inotify` はマシンの inotify の上限で、root の持つモード 0644 の
   通常のファイルです。書くために開けるのは root（どのユーザー名前空間の外でも
@@ -3911,6 +3956,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`/proc/<pid>/stat` が `R` と示す実行中のスレッドの数で、読んでいるスレッドを含みます）、
     `procs_blocked 0`、0 が並ぶ `softirq` の行です。
 
+- `/proc/net` は `self/net` へのリンクです。`/proc/<pid>/net` とスレッドのものには、タスクの
+  ネットワーク名前空間のファイルがあります。名前は、そのときタスクが持つ名前空間から引き
+  （`get_proc_task_net`）、誰でも読めます。ゾンビのものは `ENOENT` で、そのディレクトリの一覧は
+  `EINVAL` です。開いたファイルは、開いたときの名前空間のままです。どれも 0444 で、ネットワーク
+  名前空間を持つユーザー名前空間のルート（ネットワーク名前空間を作ったときの対応によるもので、
+  なければ最初の名前空間のルート。`proc_net_ns_init`）のもので、読むためだけに開け（`EACCES`、`seq_open_net`）、
+  読むたびに作ります。
+  - `dev`（`dev_seq_show`）はデバイスで、カウンタは 0 です。`if_inet6`（`if6_seq_show`）は IPv6 の
+    アドレス、`route`（`fib_route_seq_show`）は IPv4 の main の表で、表がなければ空です。
+    IPv6 のゲートウェイ（`RTA_VIA`）は 00000000 で、その先頭 4 バイトが 0 でなければ `RTF_GATEWAY` です（`fib_flag_trans`）。
+    `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
+    `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
+  - ほかの名前は、`--mount /:/` でも `ENOENT` です。ホストのソケットとデバイスは、ゲストの
+    ものではありません。
+
 - `/proc/sysvipc` には `msg`、`sem`、`shm` がこの順に並びます。どれも 64 ビットのカーネルでの
   Linux の `sysvipc_*_proc_show` と同じ形式です。
   - 見出しの行に続けて、開いたプロセスの IPC 名前空間のキュー、セット、セグメントを、
@@ -3993,7 +4053,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`gu`）、アドバイス（`sr`、`rr`、`dc`、`wf`、`dd`、`hg`、`nh`、`mg`）、リングと秘密の
   メモリの `de`、`mm`、`dd`、課金（`ac`。書き込めたプライベートメモリが持ち、
   `MAP_NORESERVE` なら代わりに `nr` を持ちます。一度も書いていない匿名メモリは書き込め
-  なくなるときに返します）、`MAP_STACK` のマッピングの `nh`、封印（`sl`）、最初の
+  なくなるときに返します）、`MAP_STACK` のマッピングの `nh`、`MAP_DROPPABLE` のマッピングの
+  `nr`、`wf`、`dd`、`dp`、封印（`sl`）、最初の
   スタック以外の、作られてから `clear_refs` に消されていない VMA の `sd`（`VM_SOFTDIRTY`）
   です。新しい VMA とつながった VMA は、Linux の引き継がれるフラグと同じく、また `sd` を持ちます。
 
@@ -4313,7 +4374,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   そこで止めます。`getitimer` は Linux の `itimer_get_remtime` と同じく、残りの時間を
   マイクロ秒に切り捨てて返します。設定中で時間が来たタイマーは 1 µs、残りが 1 µs に満たない
   タイマーは 0 と見せます。`alarm` は Linux の `alarm_setitimer` と同じく、間隔なしの秒単位で
-  設定し、残っていた秒数を四捨五入して返します（設定中だったなら少なくとも 1）。
+  設定し、残っていた秒数を四捨五入して返します（設定中だったなら少なくとも 1）。シグナルで終わる
+  待ちは、`wait4` と `waitid` のものも含め、タイマーのシグナルが来ると終わります。致命的なシグナル
+  だけで終わる待ち（`vfork` の親、fanotify の許可イベント、`WAIT_KILLABLE_RECV` の seccomp の
+  リスナー、`userfaultfd` へのカーネル自身の待ち）も、タイマーのものなら終わりますが、コアを
+  ダンプするシグナルでは終わりません（`complete_signal` はそれ以外を `SIGKILL` にします）。
 
 - プロセスの CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は、Linux の
   `check_cpu_itimer` と同じく、プロセスのスレッドが合わせてその時間を使うと、カーネルから
@@ -5479,6 +5544,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `SO_ACCEPTCONN`、`SO_KEEPALIVE`、`SO_REUSEADDR`、`SO_REUSEPORT`、`SO_SNDBUF`、
     `SO_RCVBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`SO_LINGER`、`SO_PRIORITY`、
     `SO_BROADCAST`、`SO_OOBINLINE`、`TCP_NODELAY`（ホストにも伝えます）、
+    `TCP_CORK`（ホストには伝えません）、
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
     `TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、`IP_TOS`、`IPV6_V6ONLY`。
     既定値と範囲の確かめ方は Linux と
@@ -5528,8 +5594,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     バイト、受け取ったバイト（ハンドシェイクと終わりを含む）、まだ送っていないバイト、
     セグメント、データを最後に送ってから・受け取ってからの時間を返します。ループバックの
     セグメントは Linux が送るとおりです。書き込みごとに 1 つですが、小さいものが確認応答を
-    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` の続きを
-    待つ間（201 ms まで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
+    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` や `TCP_CORK` の続きを
+    待つ間（201 ms まで、または `TCP_CORK` を外すか `TCP_NODELAY` を設定するまで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
     一緒に、または読んだとき、または 40 ms 後です（`TCP_QUICKACK` で選べます）。はじめは
     確認応答のないものを 10 個まで送れます。末尾の損失プローブは最後のものを送り直します。
     終わりは、その前に留まっていたデータと一緒に送ります。終わりの確認応答が来るまでは
@@ -5683,7 +5749,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `AF_UNSPEC` で切断すると、ゲストが自分で `bind` したポートとアドレスだけが残り、デバイスは
   残りません（`__udp_disconnect`）。IPv6 のソケットには相手のアドレスも残り（`sk_v6_daddr`）、
   `sock_diag` はそれをポート 0 で伝えます。次に接続するまで、IPv6 のデータグラムはその
-  アドレスからだけ、IPv4 のものはどこからでも受け取ります。
+  アドレスからだけ（グループ宛てのものも。`__udp_v6_is_mcast_sock`）、IPv4 のものはどこからでも受け取ります。
   データグラムは IPv4 で 65507 バイト、IPv6 で 65527 バイトまでで（超えると
   `EMSGSIZE`）、空でもよく、読み手のバッファに切り詰められます（`MSG_TRUNC`）。
   `FIONREAD` は最初のものの長さです。それぞれは、x86-64 の Linux 7.0 が `sk_buff` の

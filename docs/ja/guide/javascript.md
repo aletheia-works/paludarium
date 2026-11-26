@@ -173,7 +173,9 @@ snapshot の時点で置き換わっていて、アクセス時刻と変更時�
 `"unimplemented"`・`"internal"`・`"invalid-program"`・`"host"` のどれかで、
 わかっていれば、命令のアドレス（`rip`）、命令の `bytes`、`syscall` の番号も持っています。
 Worker が trap したときは、共有のランタイム全体を捨てます。捨てた Worker が
-ロックを持っていたかもしれないためです。
+ロックを持っていたかもしれないためです。このエラーは、Worker が trap したときの共有メモリの
+大きさ（バイト数、`memoryBytes`）と、launcher の起動時のヒープの確保の結果（`heapReserve`。
+WebKit 以外では null。設計の判断を参照）も持っています。
 
 ## ブラウザで必要なもの
 

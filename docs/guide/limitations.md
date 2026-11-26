@@ -73,7 +73,7 @@ verified.
   shows the same pages.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`). A page of a host file
+  `ht` (`MAP_HUGETLB`). A page of a host file
   that `write` filled is clean (see "Pages `write` filled" below).
 - **`/proc/<pid>/mem`'s offsets past `i64::MAX`**: `pread64` and
   `pwrite64` refuse them (`EINVAL`), as Linux v7.0's `ksys_pread64` and
@@ -81,9 +81,9 @@ verified.
   file of unsigned offsets (`FOP_UNSIGNED_OFFSET`). This follows v7.0
   until the runners' kernel has master's change.
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
-  emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
-  private file mapping, is a file's (bit 61) until the mapping was
-  written, not until the page was. The frame number is 0 for every reader, also one
+  emulator's page entries, as `smaps`'s counts do. A page of a loaded
+  program's segment, which has no page cache, is a file's (bit 61) until
+  the mapping was written, not until the page was. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
 - **`PAGEMAP_SCAN`, in part**:
@@ -123,9 +123,13 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
+- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route` and
+  `route` alone; `tcp`, `udp`, `unix`, `igmp`, `snmp`, `sockstat` and the rest
+  are `ENOENT`, and no counter is kept, so those of `dev` are 0. A session
+  with no network has files of no device.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, `/proc/net` and a process's `net`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
@@ -216,8 +220,8 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    IPv6 multicast datagrams reach no one, nor do broadcast ones but through
-    a veth end (below). A datagram is always
+    Broadcast datagrams reach no one but through a veth end (below). A
+    datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
     `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer
@@ -402,10 +406,9 @@ verified.
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
   or packet socket, on a UDP socket and on the SYNs that come to a TCP
-  listener. A connection's segments are counted here but not yet built, so
-  no filter runs yet on the handshake's last ACK, nor on the data, ACKs and
-  FINs that come to a connected socket, which Linux filters each
-  (`tcp_filter`): a filter that drops or cuts them, or keeps a SYN but drops
+  listener. None runs yet on the handshake's last ACK, nor on each of a
+  connection's segments (the data, ACKs and FINs that come to a connected
+  socket), as Linux's does (`tcp_filter`): a filter that drops or cuts them, or keeps a SYN but drops
   that ACK, does otherwise there. On a UDP socket no
   filter runs on the DNS stub's answers, which come through no device
   here; a datagram that Linux sends in fragments across a veth pair comes
@@ -1157,15 +1160,13 @@ verified.
   Ethernet address (EUI-64, `addr_gen_mode` 0), and IPv6 sends no router
   solicitation nor MLD report. Traffic through
   an end moves no counters; a namespace forwards nothing
-  on to another; and an IPv6 multicast destination through an end reaches
-  no one, as no socket joins such a group (`IPV6_ADD_MEMBERSHIP`). An IPv4
-  group is one of the guest's namespaces alone: the first has no device to
-  the host's network, so no route to one, and joining one there without
-  naming a device is `ENODEV`.
+  on to another. A multicast group is one of the guest's namespaces alone:
+  the first has no device to the host's network, so no route to one, and
+  joining one there without naming a device is `ENODEV`.
   No IGMP or MLD packet is sent: nothing in the guest would see one, as
   raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
-  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) are
-  `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
+  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) and
+  anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,
@@ -1223,7 +1224,9 @@ verified.
   the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
-  IPv6's `forwarding` joins no router multicast or anycast address, and a
+  IPv6's `forwarding` joins no router anycast address, and an end made
+  while `default`'s is on is in all three all-routers groups, where
+  Linux's is in ff02::2 alone; a
   write of `all`'s tells of the devices in the order of their indices,
   where Linux's goes in the order they came. A netconf notification gives
   the settings that have no file (proxy ARP and NDP, multicast and
@@ -1231,9 +1234,8 @@ verified.
   Linux is built. A veth end whose MTU is below 1280 still has the files
   of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6
   (it makes no IPv6 address, as Linux's does not).
-  A route goes through `lo` or a veth end, or rejects; an IPv4
-  next hop through an IPv6 gateway (`RTA_VIA`), encapsulations, nexthop
-  objects, realms, expiries, source prefixes, router preferences and the
+  A route goes through `lo` or a veth end, or rejects;
+  encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences and the
   anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
@@ -1337,7 +1339,7 @@ verified.
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
   With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
-  not have (an IPv4 next hop through `RTA_VIA`, say, or a link of a kind) carries no
+  not have (a route's encapsulation, say, or a link of a kind) carries no
   message, as Linux would take it; an IPv6 route replaced without
   `NLM_F_CREATE` that is not there is told of
   ("Can not replace route - no match found") only where its prefix has

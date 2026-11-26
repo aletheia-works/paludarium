@@ -2554,6 +2554,26 @@ pub(crate) fn below_min(c: &Context<'_>, addr: u64, len: u64) -> bool {
     addr < paludarium_mmu::MMAP_MIN_ADDR && fits && !c.process.credentials.may_map_low()
 }
 
+/// How a new mapping of `len` bytes with `flags` is locked, by `MAP_LOCKED`
+/// or `mlockall`'s `MCL_FUTURE`: it needs `can_do_mlock` (`EPERM`, for
+/// `MAP_LOCKED`) and room under `RLIMIT_MEMLOCK` (`mlock_future_ok`,
+/// `EAGAIN`).
+fn new_lock(c: &Context<'_>, flags: u64, len: u64) -> Result<Option<paludarium_mmu::Lock>, Errno> {
+    let future = c.mem.future_lock();
+    let lock = match (flags & MAP_LOCKED != 0, future) {
+        (true, Some(paludarium_mmu::Lock::OnFault)) => Some(paludarium_mmu::Lock::OnFault),
+        (true, _) => Some(paludarium_mmu::Lock::Populated),
+        (false, future) => future,
+    };
+    if flags & MAP_LOCKED != 0 && !can_do_mlock(c) {
+        return Err(Errno::EPERM);
+    }
+    if lock.is_some() && !lock_fits(c, len.div_ceil(4096)) {
+        return Err(Errno::EAGAIN);
+    }
+    Ok(lock)
+}
+
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
     let Some(prot) = Prot::from_bits(prot) else {
@@ -2588,15 +2608,28 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         read_implies_exec(c.process, prot)
     };
     let file = descriptor.as_ref().map(|d| d.file.clone());
+    // Huge pages are anonymous: an ordinary file is refused
+    // (`ksys_mmap_pgoff`).
+    let huge = if flags & MAP_HUGETLB == 0 {
+        None
+    } else if file.is_some() {
+        return err(Errno::EINVAL);
+    } else {
+        match crate::hugetlb::length(len, flags) {
+            Ok(len) => Some(len),
+            Err(e) => return err(e),
+        }
+    };
     // A file maps shared, shared with its flags validated, or private;
     // anonymous memory shared, private or droppable (`do_mmap`).
-    // /dev/zero is a file there.
+    // /dev/zero is a file there. Huge pages are a hugetlbfs file's, whose
+    // type `hugetlb::mmap` checks where `do_mmap` checks a file's.
     let kinds: &[u64] = if file.is_some() {
         &[MAP_SHARED, MAP_SHARED_VALIDATE, MAP_PRIVATE]
     } else {
         &[MAP_SHARED, MAP_PRIVATE, MAP_DROPPABLE]
     };
-    if len == 0 || !kinds.contains(&(flags & MAP_TYPE)) {
+    if len == 0 || (huge.is_none() && !kinds.contains(&(flags & MAP_TYPE))) {
         return err(Errno::EINVAL);
     }
     let droppable = flags & MAP_TYPE == MAP_DROPPABLE;
@@ -2604,6 +2637,28 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // drops it.
     let unknown = flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !LEGACY_MAP_MASK != 0;
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    if let Some(len) = huge {
+        let request = crate::hugetlb::Request {
+            addr,
+            len,
+            prot,
+            shared: flags & MAP_SHARED != 0,
+            offset,
+            fixed,
+            noreplace: flags & MAP_FIXED_NOREPLACE != 0,
+            low: flags & MAP_32BIT != 0,
+            grows_down: flags & MAP_GROWSDOWN != 0,
+            no_reserve: flags & MAP_NORESERVE != 0,
+            stack: flags & MAP_STACK != 0,
+            refused_type: match flags & MAP_TYPE {
+                MAP_SHARED | MAP_PRIVATE => None,
+                MAP_SHARED_VALIDATE if unknown => Some(Errno::EOPNOTSUPP),
+                MAP_SHARED_VALIDATE => None,
+                _ => Some(Errno::EINVAL),
+            },
+        };
+        return crate::hugetlb::mmap(c, &request, |c| new_lock(c, flags, len).map(drop));
+    }
     // A ring of io_uring maps its own pages. It is asked for them before
     // the mapping is placed, with the address asked for, which Linux rounds
     // down to its page unless it is fixed (`round_hint_to_min`).
@@ -2706,21 +2761,10 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             },
         }
     };
-    // A locked mapping, by MAP_LOCKED or `mlockall`'s MCL_FUTURE, needs
-    // `can_do_mlock` (EPERM, for MAP_LOCKED) and room under RLIMIT_MEMLOCK
-    // (`mlock_future_ok`, EAGAIN).
-    let future = c.mem.future_lock();
-    let lock = match (flags & MAP_LOCKED != 0, future) {
-        (true, Some(paludarium_mmu::Lock::OnFault)) => Some(paludarium_mmu::Lock::OnFault),
-        (true, _) => Some(paludarium_mmu::Lock::Populated),
-        (false, future) => future,
+    let lock = match new_lock(c, flags, len) {
+        Ok(lock) => lock,
+        Err(e) => return err(e),
     };
-    if flags & MAP_LOCKED != 0 && !can_do_mlock(c) {
-        return err(Errno::EPERM);
-    }
-    if lock.is_some() && !lock_fits(c, len.div_ceil(4096)) {
-        return err(Errno::EAGAIN);
-    }
     // Only private anonymous memory grows down (a file's is refused in
     // `check_mappable`). Droppable memory is neither locked nor of huge
     // pages either.
@@ -3408,7 +3452,8 @@ pub(crate) fn advise(
         return Err(Errno::ENOMEM);
     }
     // A `VM_PFNMAP` VMA's pages are not dropped, nor without
-    // `MADV_DONTNEED_LOCKED` a locked one's (`madvise_dontneed_free_valid_vma`).
+    // `MADV_DONTNEED_LOCKED` a locked one's, nor huge pages from within one
+    // (`madvise_dontneed_free_valid_vma`).
     if advice == MADV_DONTNEED_LOCKED || advice == MADV_DONTNEED {
         let stop = mem.first_undiscardable(GuestAddr(addr), end, advice == MADV_DONTNEED);
         return short_of(mem, addr, end, stop, true, |to| {
@@ -3481,7 +3526,8 @@ pub(crate) fn advise(
     }
     // MADV_COLD and MADV_PAGEOUT take no locked VMA (`can_madv_lru_vma`).
     if advice == MADV_COLD || advice == MADV_PAGEOUT {
-        return short_of_locked(mem, addr, end, false, |to| covered(mem, addr, to));
+        let stop = mem.first_off_lru(GuestAddr(addr), end);
+        return short_of(mem, addr, end, stop, false, |to| covered(mem, addr, to));
     }
     covered(mem, addr, end)
 }

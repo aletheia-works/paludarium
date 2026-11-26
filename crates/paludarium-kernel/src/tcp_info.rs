@@ -33,7 +33,7 @@ const REORDERING: u32 = 3;
 /// `TCP_TIMEOUT_INIT` and the retransmission timeout once a loopback round
 /// trip has been measured (`TCP_RTO_MIN` and the round trip), in
 /// microseconds; `TCP_ATO_MIN` once data has come.
-const RTO_INIT: u32 = 1_000_000;
+pub(crate) const RTO_INIT: u32 = 1_000_000;
 const RTO: u32 = 201_000;
 /// `TCP_RTO_MAX`, and the SYN retries that keep the first timeout.
 const RTO_MAX: u32 = 120_000_000;

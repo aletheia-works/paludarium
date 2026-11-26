@@ -1,14 +1,16 @@
 //! `/proc/<pid>/net`, the files of a task's network namespace (Linux's
 //! `fs/proc/proc_net.c`), which `/proc/net` is a link to, of the reader's
-//! own: those of its devices, addresses, routes and neighbours. Every file
+//! own: those of its devices, addresses, routes and neighbours, and of its
+//! sockets, as `sock_diag` tells of them. Every file
 //! is made as it is read, of the namespace it was opened in. The rest of
 //! Linux's names there are `ENOENT`, whatever a mounted directory holds at
 //! the path.
 
-use crate::inet::Network;
+use crate::inet::{Entry, Network, Table};
 use crate::interface::{Kind, TABLE_MAIN};
+use crate::users::Ids;
 use core::fmt::Write as _;
-use core::net::{IpAddr, Ipv6Addr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 /// A file of the directory.
@@ -16,17 +18,46 @@ use std::sync::{Arc, Mutex};
 pub(crate) enum File {
     Arp,
     Dev,
+    Raw,
+    Tcp,
+    Udp,
+    Icmp,
+    Raw6,
+    Tcp6,
+    Udp6,
+    Unix,
+    Icmp6,
     Route,
+    Packet,
+    Netlink,
     IfInet6,
     Ipv6Route,
+}
+/// What a file shows of, as it was opened: the network, its AF_UNIX sockets,
+/// and the opener's user namespace, whose IDs the owners are shown in.
+pub(crate) struct Source {
+    pub(crate) network: Option<Arc<Network>>,
+    pub(crate) unix: Option<Arc<crate::unix::Names>>,
+    pub(crate) user: crate::users::UserNs,
 }
 impl File {
     /// The files, in the order Linux's `proc_readdir_de` lists them: by the
     /// length of their names, then by name.
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::Arp,
         Self::Dev,
+        Self::Raw,
+        Self::Tcp,
+        Self::Udp,
+        Self::Icmp,
+        Self::Raw6,
+        Self::Tcp6,
+        Self::Udp6,
+        Self::Unix,
+        Self::Icmp6,
         Self::Route,
+        Self::Packet,
+        Self::Netlink,
         Self::IfInet6,
         Self::Ipv6Route,
     ];
@@ -34,7 +65,18 @@ impl File {
         match self {
             Self::Arp => b"arp",
             Self::Dev => b"dev",
+            Self::Raw => b"raw",
+            Self::Tcp => b"tcp",
+            Self::Udp => b"udp",
+            Self::Icmp => b"icmp",
+            Self::Raw6 => b"raw6",
+            Self::Tcp6 => b"tcp6",
+            Self::Udp6 => b"udp6",
+            Self::Unix => b"unix",
+            Self::Icmp6 => b"icmp6",
             Self::Route => b"route",
+            Self::Packet => b"packet",
+            Self::Netlink => b"netlink",
             Self::IfInet6 => b"if_inet6",
             Self::Ipv6Route => b"ipv6_route",
         }
@@ -42,21 +84,35 @@ impl File {
     pub(crate) fn named(name: &[u8]) -> Option<Self> {
         Self::ALL.into_iter().find(|file| file.name() == name)
     }
-    /// Opens it of `network` with `flags`, owned by `owner`
+    /// Opens it of `source` with `flags`, owned by `owner`
     /// ([`Network::proc_owner`]). A session without a network has no device.
     pub(crate) fn open(
         self,
-        network: Option<Arc<Network>>,
+        source: Source,
         now: impl Fn() -> Option<u64> + Send + Sync + 'static,
         flags: u32,
         owner: (u32, u32),
     ) -> crate::seq::SeqFile {
-        let text = move || self.text(network.as_deref(), now());
+        let text = move || self.text(&source, now());
         crate::seq::SeqFile::open(Box::new(crate::seq::Lines(text)), flags)
             .owned_by(Arc::new(Mutex::new(owner)))
     }
-    fn text(self, network: Option<&Network>, now: Option<u64>) -> Vec<u8> {
+    fn text(self, source: &Source, now: Option<u64>) -> Vec<u8> {
+        let network = source.network.as_deref();
         match self {
+            // Of kinds of socket there are none of here.
+            Self::Raw => RAW_HEAD.to_owned(),
+            Self::Icmp => padded("  sl  ", DGRAM_HEAD, 127),
+            Self::Raw6 | Self::Icmp6 => DGRAM6_HEAD.to_owned(),
+            Self::Packet => {
+                "sk               RefCnt Type Proto  Iface R Rmem   User   Inode\n".to_owned()
+            }
+            Self::Tcp => tcp(source, now, false),
+            Self::Tcp6 => tcp(source, now, true),
+            Self::Udp => udp(source, now, false),
+            Self::Udp6 => udp(source, now, true),
+            Self::Unix => return unix(source),
+            Self::Netlink => netlink(network),
             Self::Arp => arp(network, now),
             Self::Dev => dev(network),
             Self::Route => route(network, now),
@@ -297,13 +353,251 @@ fn arp(network: Option<&Network>, now: Option<u64>) -> String {
     out
 }
 
+/// The columns of a datagram's file after `sl`, of IPv4.
+const DGRAM_HEAD: &str = "local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   \
+     uid  timeout inode ref pointer drops";
+const RAW_HEAD: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when \
+     retrnsmt   uid  timeout inode ref pointer drops\n";
+/// `IPV6_SEQ_DGRAM_HEADER`.
+const DGRAM6_HEAD: &str = "  sl  local_address                         remote_address            \
+     \x20           st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+/// A socket's address in the kernel, as `%pK` hides it.
+const POINTER: &str = "0000000000000000";
+
+/// A line of `width` bytes and its newline (`seq_setwidth`, `seq_pad`).
+fn padded(start: &str, rest: &str, width: usize) -> String {
+    format!("{:<width$}\n", format!("{start}{rest}"))
+}
+/// An address and port as the files of IPv4's sockets, or `v6`'s, have them:
+/// each word of the address in host order.
+fn address(address: SocketAddr, v6: bool) -> String {
+    let mut out = String::new();
+    let ip = match (address.ip(), v6) {
+        (IpAddr::V4(ip), false) => ip.octets().to_vec(),
+        (IpAddr::V6(_), false) => Ipv4Addr::UNSPECIFIED.octets().to_vec(),
+        (IpAddr::V4(ip), true) => ip.to_ipv6_mapped().octets().to_vec(),
+        (IpAddr::V6(ip), true) => ip.octets().to_vec(),
+    };
+    for word in ip.as_chunks::<4>().0 {
+        let word = u32::from_le_bytes(*word);
+        let _ = write!(out, "{word:08X}");
+    }
+    let _ = write!(out, ":{:04X}", address.port());
+    out
+}
+/// The addresses of `entry`.
+fn addresses(entry: &Entry) -> String {
+    let none = if entry.v6 {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    };
+    format!(
+        "{} {}",
+        address(entry.local, entry.v6),
+        address(entry.peer.unwrap_or(none), entry.v6)
+    )
+}
+/// Its sockets of IPv4, or of IPv6 (`v6`).
+fn entries(source: &Source, now: Option<u64>, udp: bool, v6: bool) -> Vec<Entry> {
+    let Some(network) = &source.network else {
+        return Vec::new();
+    };
+    let mut entries = network.diag(now);
+    entries.retain(|entry| entry.udp == udp && entry.v6 == v6);
+    entries
+}
+/// `tcp` or `tcp6`, as `tcp4_seq_show` and `tcp6_seq_show` print it: the
+/// listeners, then the connections, with those in `TIME_WAIT`. The
+/// acknowledgements a connection still sends at once (`icsk_ack.quick`) are
+/// not told, and 0.
+fn tcp(source: &Source, now: Option<u64>, v6: bool) -> String {
+    // `TMPSZ` less one, of `tcp4_seq_show`.
+    const WIDTH: usize = 149;
+    let pad = |line: String| {
+        if v6 {
+            format!("{line}\n")
+        } else {
+            padded(&line, "", WIDTH)
+        }
+    };
+    let mut out = pad(if v6 {
+        "  sl  local_address                         remote_address                        st \
+         tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+            .to_owned()
+    } else {
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
+         timeout inode"
+            .to_owned()
+    });
+    let entries = entries(source, now, false, v6);
+    let listed = [Table::Listening, Table::Connected]
+        .into_iter()
+        .flat_map(|table| entries.iter().filter(move |entry| entry.table == table));
+    for (i, entry) in listed.enumerate() {
+        let (kind, retrans, until) = entry.timer;
+        let when = match (until, now) {
+            (Some(until), Some(now)) => until.saturating_sub(now) / 10_000_000,
+            _ => 0,
+        };
+        // A listener's second queue is its backlog in `sock_diag` alone.
+        let (received, sent) = entry.queues;
+        let sent = if entry.table == Table::Listening {
+            0
+        } else {
+            sent
+        };
+        let head = format!(
+            "{i:4}: {} {:02X} {sent:08X}:{received:08X} {kind:02X}:{when:08X}",
+            addresses(entry),
+            entry.state,
+        );
+        let line = match &entry.full {
+            None => format!("{head} 00000000 {0:5} {0:8} 0 3 {POINTER}", 0),
+            Some(full) => {
+                let uid = source.user.0.shown(Ids::User, full.uid);
+                let rest = full.tcp.as_ref().map_or_else(String::new, |tcp| {
+                    // `tcp_in_initial_slowstart`.
+                    let ssthresh = if entry.table == Table::Listening {
+                        0
+                    } else if tcp.snd_ssthresh >= 0x7fff_ffff {
+                        -1
+                    } else {
+                        i64::from(tcp.snd_ssthresh)
+                    };
+                    let ticks = |microseconds: u32| microseconds / 10_000;
+                    // `tcp_info` gives a listener's no RTO.
+                    let rto = if entry.table == Table::Listening {
+                        crate::tcp_info::RTO_INIT
+                    } else {
+                        tcp.rto
+                    };
+                    format!(
+                        " {} {} 0 {} {ssthresh}",
+                        ticks(rto),
+                        ticks(tcp.ato),
+                        tcp.snd_cwnd
+                    )
+                });
+                format!(
+                    "{head} {retrans:08X} {uid:5} {:8} {} 1 {POINTER}{rest}",
+                    0, full.inode
+                )
+            }
+        };
+        out.push_str(&pad(line));
+    }
+    out
+}
+/// `udp` or `udp6`, as `udp4_format_sock` and `__ip6_dgram_sock_seq_show`
+/// print it. `sl` is the bucket of the socket's port, here of the least a
+/// machine has (`UDP_HTABLE_SIZE_MIN_PERNET`, with no hash of the namespace).
+fn udp(source: &Source, now: Option<u64>, v6: bool) -> String {
+    const WIDTH: usize = 127;
+    let mut out = if v6 {
+        DGRAM6_HEAD.to_owned()
+    } else {
+        padded("   sl  ", DGRAM_HEAD, WIDTH)
+    };
+    for entry in entries(source, now, true, v6) {
+        let Some(full) = &entry.full else { continue };
+        let uid = source.user.0.shown(Ids::User, full.uid);
+        let line = format!(
+            "{:5}: {} {:02X} {:08X}:{:08X} 00:00000000 00000000 {uid:5} {:8} {} 2 {POINTER} {}",
+            entry.local.port() & 255,
+            addresses(&entry),
+            entry.state,
+            0,
+            entry.queues.0,
+            0,
+            full.inode,
+            full.drops,
+        );
+        if v6 {
+            let _ = writeln!(out, "{line}");
+        } else {
+            out.push_str(&padded(&line, "", WIDTH));
+        }
+    }
+    out
+}
+/// `unix`, as `unix_seq_show` prints it, a connection not yet accepted too.
+fn unix(source: &Source) -> Vec<u8> {
+    const ACCEPTCON: u32 = 1 << 16;
+    let mut out = b"Num       RefCount Protocol Flags    Type St Inode Path\n".to_vec();
+    let Some(names) = &source.unix else {
+        return out;
+    };
+    for socket in names.sockets() {
+        let shown = socket.shown();
+        let flags = if shown.listening { ACCEPTCON } else { 0 };
+        // `SS_UNCONNECTED` and `SS_CONNECTED` of one with a file, else
+        // `SS_CONNECTING`.
+        let state = match (shown.inode, shown.established) {
+            (None, _) => 2,
+            (Some(_), true) => 3,
+            (Some(_), false) => 1,
+        };
+        let line = format!(
+            "{POINTER}: {:08X} 00000000 {flags:08X} {:04X} {state:02X} {:5}",
+            if shown.established { 3 } else { 2 },
+            shown.kind,
+            shown.inode.unwrap_or(0),
+        );
+        out.extend_from_slice(line.as_bytes());
+        if let Some(name) = &shown.name {
+            out.push(b' ');
+            // A path's NUL goes, and an abstract name's, and any other in
+            // it, is `@`.
+            let name = match name.split_last() {
+                Some((_, path)) if name[0] != 0 => path,
+                _ => &name[..],
+            };
+            out.extend(name.iter().map(|&b| if b == 0 { b'@' } else { b }));
+        }
+        out.push(b'\n');
+    }
+    out
+}
+/// `netlink`, as `netlink_native_seq_show` prints it: the sockets bound, but
+/// for the kernel's own.
+fn netlink(network: Option<&Network>) -> String {
+    let mut out = String::from(
+        "sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n",
+    );
+    let Some(network) = network else { return out };
+    for s in network.netlink.shown() {
+        let _ = writeln!(
+            out,
+            "{POINTER} {:<3} {:<10} {:08x} {:<8} {:<8} {:<5} {:<8} {:<8} {:<8}",
+            s.protocol,
+            s.port,
+            s.groups,
+            s.received,
+            0,
+            u8::from(s.dumping),
+            2,
+            0,
+            s.inode,
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inet::NetworkPolicy;
 
-    fn text(file: File, network: &Network) -> String {
-        String::from_utf8(file.text(Some(network), None)).unwrap()
+    fn source(network: Option<Network>) -> Source {
+        Source {
+            network: network.map(Arc::new),
+            unix: None,
+            user: crate::users::UserNs::default(),
+        }
+    }
+    fn text(file: File, network: Network) -> String {
+        String::from_utf8(file.text(&source(Some(network)), None)).unwrap()
     }
 
     #[test]
@@ -316,26 +610,26 @@ mod tests {
         for file in File::ALL {
             assert_eq!(File::named(file.name()), Some(file));
         }
-        assert_eq!(File::named(b"tcp"), None);
+        assert_eq!(File::named(b"snmp"), None);
     }
 
     #[test]
     fn the_first_namespace_shows_its_loopback() {
-        let network = Network::new(NetworkPolicy::default());
-        let dev = text(File::Dev, &network);
+        let network = || Network::new(NetworkPolicy::default());
+        let dev = text(File::Dev, network());
         assert_eq!(dev.lines().count(), 3);
         assert!(dev.ends_with(
             "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n"
         ));
         assert_eq!(
-            text(File::IfInet6, &network),
+            text(File::IfInet6, network()),
             "00000000000000000000000000000001 01 80 10 80       lo\n"
         );
         assert_eq!(
-            text(File::Arp, &network),
+            text(File::Arp, network()),
             "IP address       HW type     Flags       HW address            Mask     Device\n"
         );
-        let routes = text(File::Ipv6Route, &network);
+        let routes = text(File::Ipv6Route, network());
         assert!(routes.contains(&format!(
             "{:032x} 80 {:032x} 00 {:032x} 00000000 00000001 00000000 80200001       lo\n",
             1, 0, 0
@@ -347,17 +641,53 @@ mod tests {
     }
 
     #[test]
+    fn addresses_are_words_in_host_order() {
+        let at = |text: &str, v6| address(text.parse().unwrap(), v6);
+        assert_eq!(at("127.0.0.1:1001", false), "0100007F:03E9");
+        assert_eq!(
+            at("[2001:db8::7]:80", true),
+            "B80D0120000000000000000007000000:0050"
+        );
+        // An IPv4 address of an IPv6 socket.
+        assert_eq!(
+            at("127.0.0.1:80", true),
+            "0000000000000000FFFF00000100007F:0050"
+        );
+    }
+
+    #[test]
+    fn a_kind_there_is_no_socket_of_has_its_header() {
+        let text = |file| text(file, Network::new(NetworkPolicy::default()));
+        let common = "local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops";
+        assert_eq!(text(File::Raw), format!("  sl  {common}\n"));
+        assert_eq!(text(File::Icmp), format!("  sl  {common}{:13}\n", ""));
+        assert_eq!(text(File::Udp), format!("   sl  {common}{:12}\n", ""));
+        assert_eq!(text(File::Raw6), text(File::Icmp6));
+        assert_eq!(text(File::Raw6), text(File::Udp6));
+        assert_eq!(text(File::Tcp).len(), 150);
+        for file in File::ALL {
+            let lines = text(file).lines().count();
+            if matches!(
+                file,
+                File::Raw | File::Raw6 | File::Icmp | File::Icmp6 | File::Packet
+            ) {
+                assert_eq!(lines, 1, "{file:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_session_without_a_network_has_no_device() {
         assert_eq!(
             File::Dev
-                .text(None, None)
+                .text(&source(None), None)
                 .iter()
                 .filter(|&&b| b == b'\n')
                 .count(),
             2
         );
         for file in [File::Route, File::IfInet6, File::Ipv6Route] {
-            assert!(file.text(None, None).is_empty());
+            assert!(file.text(&source(None), None).is_empty());
         }
     }
 }

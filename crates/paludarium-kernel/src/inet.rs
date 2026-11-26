@@ -28,7 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 mod arrival;
-use crate::multicast::{Membership, Membership6};
+mod sources;
+use crate::multicast::{Member4, Member6, Membership, Membership6, Mode};
 use crate::sockets::Filtered;
 
 /// The interface requests of `ioctl` ([`Network::interface`]).
@@ -386,7 +387,7 @@ impl Network {
                 // Its loopback is up, and so in this group (`ip_mc_up`).
                 let mut devices = crate::netdev::Devices::new();
                 if let Some(lo) = devices.by_index_mut(crate::netdev::LOOPBACK_INDEX) {
-                    lo.groups4.join(crate::multicast::ALL_HOSTS);
+                    lo.groups4.join(crate::multicast::ALL_HOSTS, Mode::Exclude);
                 }
                 Mutex::new(devices)
             },
@@ -1220,7 +1221,8 @@ impl Network {
     /// `now`, reaches ([`Ports::broadcast_receivers`]), each with whether
     /// it is this namespace's own copy: where it `loops`, this namespace's
     /// own, as `ip_mc_output` loops one back whether or not it goes out,
-    /// one to a group only where the device has joined it; then, where it
+    /// one to a group only where the device has joined it and takes that
+    /// source; then, where it
     /// `leaves` and the end has its carrier, the peer's namespace's. There
     /// `ip_route_input_slow` takes it as a broadcast: to the limited
     /// broadcast address, or to one its routes make a broadcast one, from
@@ -1236,20 +1238,21 @@ impl Network {
         (loops, leaves): (bool, bool),
         now: Option<u64>,
     ) -> Vec<(Arc<InetSocket>, bool)> {
-        let group = to.ip().is_multicast().then_some(to.ip());
         // The sockets of a namespace its copy in on a device reaches.
         let reached = |network: &Network, dif: i32| -> Vec<Arc<InetSocket>> {
             let dif = dif.unsigned_abs();
             let mut found = network.ports(true).broadcast_receivers(to, from, dif);
-            found.retain(|socket| group.is_none_or(|group| socket.takes_group(group, dif)));
+            found.retain(|socket| socket.takes_cast(from.ip(), to.ip(), dif));
             found
         };
         let mut receivers = Vec::new();
         // Its own copy comes in on the end it went out through.
-        let joined = match group {
-            None => true,
-            Some(IpAddr::V4(group)) => self.in_group4(index, group),
-            Some(IpAddr::V6(group)) => self.in_group6(index, group, now),
+        let joined = match (from.ip(), to.ip()) {
+            (IpAddr::V4(src), IpAddr::V4(group)) if group.is_multicast() => {
+                self.in_group4(index, src, group)
+            }
+            (IpAddr::V6(src), IpAddr::V6(group)) => self.in_group6(index, src, group, now),
+            _ => true,
         };
         if loops && joined {
             receivers.extend(reached(self, index).into_iter().map(|s| (s, true)));
@@ -1761,9 +1764,9 @@ struct State {
     /// Datagrams other guest sockets sent this one on the loopback.
     inbox: VecDeque<Datagram>,
     /// The IPv4 groups it is a member of (`mc_list`), the newest first.
-    groups4: Vec<Membership>,
+    groups4: Vec<Member4>,
     /// The IPv6 ones (`ipv6_mc_list`), the newest first.
-    groups6: Vec<Membership6>,
+    groups6: Vec<Member6>,
     /// What the inbox takes of `SO_RCVBUF`, as Linux's `sk_rmem_alloc`.
     inbox_size: usize,
     /// How many datagrams and queries have come, which orders them.
@@ -3224,7 +3227,9 @@ impl InetSocket {
                 let (loops, leaves) = match plain_to.ip() {
                     IpAddr::V6(ip) => {
                         let scope = crate::multicast::scope6(ip);
-                        let own = loops && self.network.in_group6(index, ip, now);
+                        let own = loops
+                            && matches!(from.ip(), IpAddr::V6(src)
+                                if self.network.in_group6(index, src, ip, now));
                         (loops && scope != 0, scope > 1 && (hops != 0 || !own))
                     }
                     IpAddr::V4(_) if on_lo => (true, false),
@@ -3374,18 +3379,23 @@ impl InetSocket {
         }
         Ok(bytes.len())
     }
-    /// Whether it takes a datagram to the group `group` that came in on the
-    /// device `dif` ([`crate::multicast::allows`], `allows6`).
-    fn takes_group(&self, group: IpAddr, dif: u32) -> bool {
+    /// Whether it takes a datagram from `from` to `to` that came in on the
+    /// device `dif`: any but one to a group ([`crate::multicast::allows`],
+    /// `allows6`).
+    fn takes_cast(&self, from: IpAddr, to: IpAddr, dif: u32) -> bool {
+        if !to.is_multicast() {
+            return true;
+        }
         let options = *self.options();
         let s = self.lock();
-        match group {
-            IpAddr::V4(group) => {
-                crate::multicast::allows(&s.groups4, options.multicast_all, group, dif)
+        match (from, to) {
+            (IpAddr::V4(from), IpAddr::V4(to)) => {
+                crate::multicast::allows(&s.groups4, options.multicast_all, (from, to), dif)
             }
-            IpAddr::V6(group) => {
-                crate::multicast::allows6(&s.groups6, options.multicast_all6, group)
+            (IpAddr::V6(from), IpAddr::V6(to)) => {
+                crate::multicast::allows6(&s.groups6, options.multicast_all6, (from, to))
             }
+            _ => false,
         }
     }
     /// Queues a datagram from `from` that came in on the device `iif`, which
@@ -5603,7 +5613,9 @@ fn set_multicast4(
             let mut s = socket.lock();
             let now = socket.now();
             if name == 35 {
-                socket.network.join4(&mut s.groups4, asked, now)?;
+                socket
+                    .network
+                    .join4(&mut s.groups4, asked, Mode::Exclude, now)?;
             } else {
                 socket.network.leave4(&mut s.groups4, asked, now)?;
             }
@@ -5620,7 +5632,8 @@ fn set_multicast4(
 /// is bound to (`SO_BINDTODEVICE`, `SO_BINDTOIFINDEX`, [`bind_to_device`]),
 /// and those a datagram goes out through (`IPV6_MULTICAST_IF`,
 /// `IPV6_UNICAST_IF`, the sticky `IPV6_PKTINFO`), and IPv6's multicast
-/// options and IPv4's ([`set_multicast4`]).
+/// options and IPv4's ([`set_multicast4`]), with both families' source
+/// filters ([`sources`]).
 /// `SO_PASSCRED`, `SO_PASSSEC`,
 /// `SO_PASSPIDFD` and `SO_PASSRIGHTS` are EOPNOTSUPP, as Linux takes them
 /// only on AF_UNIX (`sk_may_scm_recv` adds netlink and Bluetooth for the
@@ -5733,12 +5746,19 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             let now = socket.now();
             let mut s = socket.lock();
             if name == 20 {
-                socket.network.join6(&mut s.groups6, asked, now)?;
+                socket
+                    .network
+                    .join6(&mut s.groups6, asked, Mode::Exclude, now)?;
             } else {
                 socket.network.leave6(&mut s.groups6, asked)?;
             }
         }
         (0, 32..=36 | 49) => set_multicast4(c, socket, name, (at, len))?,
+        (0, 37..=48) => sources::set4(c, socket, name, (at, len))?,
+        (41, 42..=48) if socket.family == Family::V6 => {
+            option6_int(c, at, len)?;
+            sources::set6(c, socket, name, (at, len))?;
+        }
         // `IPV6_MULTICAST_IF` (`do_ipv6_setsockopt`, before the socket's
         // lock): not for TCP (`ENOPROTOOPT`); a device of the namespace
         // (`ENODEV`), the socket's own where it has one (`EINVAL`), or 0.
@@ -6003,6 +6023,11 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
     }
     let value: Vec<u8> = match (level, name) {
         (1, 16 | 34 | 76 | 83) => return Err(EOPNOTSUPP),
+        // `IP_MSFILTER` and `MCAST_MSFILTER`.
+        (0, 41 | 48) => return sources::get4(c, socket, name, (at, len_at, room)),
+        (41, 48) if socket.family == Family::V6 => {
+            return sources::get6(c, socket, (at, len_at, room));
+        }
         // `SO_GET_FILTER`.
         (1, 26) => return crate::sockets::get_filter(c, socket, at, len_at, room as i32),
         (1, _) if Timestamps::is_option(name as u32) => options.timestamps.get(name as u32),

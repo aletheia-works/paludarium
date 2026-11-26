@@ -4852,3 +4852,104 @@ fn a_failed_udp_connect_puts_the_device_back_and_a_tcp_one_keeps_it() {
     link_local(&f, 0);
     assert_eq!(f.ret(42, [tcp, DATA + 0x100, 28, 0, 0, 0]), unreachable);
 }
+/// The lines of `/proc/net/<name>` after the header, with the inode, the
+/// column `at`, of each of `fds` put by its name.
+fn proc_net(f: &mut Fixture, name: &str, at: usize, fds: &[(u64, &str)]) -> Vec<String> {
+    f.mem
+        .write(
+            GuestAddr(DATA + 0x300),
+            format!("/proc/net/{name}\0").as_bytes(),
+        )
+        .unwrap();
+    let fd = f.ret(2, [DATA + 0x300, 0, 0, 0, 0, 0]);
+    let n = f.ret(0, [fd, DATA + 0x300, 0xd00, 0, 0, 0]);
+    assert_eq!(f.ret(3, [fd, 0, 0, 0, 0, 0]), 0);
+    let mut text = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x300), &mut text).unwrap();
+    let text = String::from_utf8(text).unwrap();
+    let inodes: Vec<(String, &str)> = fds
+        .iter()
+        .map(|&(fd, name)| {
+            assert_eq!(f.ret(5, [fd, DATA + 0x200, 0, 0, 0, 0]), 0);
+            let mut inode = [0; 8];
+            f.mem.read(GuestAddr(DATA + 0x208), &mut inode).unwrap();
+            (u64::from_le_bytes(inode).to_string(), name)
+        })
+        .collect();
+    text.lines()
+        .skip(1)
+        .map(|line| {
+            let mut fields: Vec<&str> = line.split_whitespace().collect();
+            if let Some((_, name)) = inodes.iter().find(|(inode, _)| fields[at] == inode) {
+                fields[at] = name;
+            }
+            fields.join(" ")
+        })
+        .collect()
+}
+#[test]
+fn proc_net_lists_the_sockets() {
+    let mut f = network_fixture(&[]);
+    let mut address = [0u8; 16];
+    address[..8].copy_from_slice(&[2, 0, 0x03, 0xe9, 127, 0, 0, 1]);
+    f.mem.write(GuestAddr(DATA + 0x100), &address).unwrap();
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let tcp = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(49, [tcp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    // One bound alone is in neither table.
+    assert!(proc_net(&mut f, "tcp", 9, &[]).is_empty());
+    assert_eq!(f.ret(50, [tcp, 1, 0, 0, 0, 0]), 0);
+    let one = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(42, [one, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let fds = [(udp, "udp"), (tcp, "tcp"), (one, "one")];
+    let lines = proc_net(&mut f, "tcp", 9, &fds);
+    assert_eq!(
+        lines[0],
+        "0: 0100007F:03E9 00000000:0000 0A 00000000:00000001 00:00000000 00000000 0 0 tcp 1 0000000000000000 100 0 0 10 0"
+    );
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1..].iter().any(|line| {
+        line.contains(" 0100007F:03E9 01 00000000:00000000 00:00000000 ")
+            && line.contains(" one 1 ")
+    }));
+    assert!(proc_net(&mut f, "tcp6", 9, &fds).is_empty());
+    assert_eq!(
+        proc_net(&mut f, "udp", 9, &fds),
+        [
+            "233: 0100007F:03E9 00000000:0000 07 00000000:00000000 00:00000000 00000000 0 0 udp 2 0000000000000000 0"
+        ]
+    );
+    // A listener, a connection it has not accepted, and its client.
+    let name = b"\x01\0\0a\0b";
+    f.mem.write(GuestAddr(DATA + 0x100), name).unwrap();
+    let listener = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(49, [listener, DATA + 0x100, 6, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [listener, 1, 0, 0, 0, 0]), 0);
+    let client = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(42, [client, DATA + 0x100, 6, 0, 0, 0]), 0);
+    let mut lines = proc_net(&mut f, "unix", 6, &[(listener, "listener")]);
+    lines.sort();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[0],
+        "0000000000000000: 00000002 00000000 00010000 0001 01 listener @a@b"
+    );
+    assert_eq!(
+        lines[1],
+        "0000000000000000: 00000003 00000000 00000000 0001 02 0 @a@b"
+    );
+    assert!(lines[2].starts_with("0000000000000000: 00000003 00000000 00000000 0001 03 "));
+    // A netlink socket shows once it is bound.
+    let netlink = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    assert!(proc_net(&mut f, "netlink", 9, &[]).is_empty());
+    let mut address = [0u8; 12];
+    address[0] = 16;
+    address[4..].copy_from_slice(&[77, 0, 0, 0, 0x11, 0, 0, 0]);
+    f.mem.write(GuestAddr(DATA + 0x100), &address).unwrap();
+    assert_eq!(f.ret(49, [netlink, DATA + 0x100, 12, 0, 0, 0]), 0);
+    assert!(
+        proc_net(&mut f, "netlink", 9, &[])[0]
+            .starts_with("0000000000000000 0 77 00000011 0 0 0 2 0 ")
+    );
+}

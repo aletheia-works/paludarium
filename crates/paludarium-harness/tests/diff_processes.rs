@@ -266,6 +266,7 @@ mod linux {
                     | "ipc-sysctl"
                     | "sysvipc-proc"
                     | "proc-net"
+                    | "proc-net-sockets"
                     | "kernel-sysctl"
                     | "uts-sysctl"
                     | "uts-sysctl-poll"
@@ -318,6 +319,7 @@ mod linux {
                     | "userfaultfd-wp-async"
                     | "userfaultfd-events"
                     | "userfaultfd-scan"
+                    | "userfaultfd-major"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -430,10 +432,12 @@ mod linux {
                     | "veth-answers"
                     | "veth-ipv4-via"
                     | "veth-ipv6-source"
+                    | "veth-hash-seed"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-multicast"
                     | "veth-ipv6-multicast"
+                    | "multicast-sources"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -680,16 +684,19 @@ mod linux {
         veth_answers => ("veth-answers","veth-answers"),
         veth_ipv4_via => ("veth-ipv4-via","veth-ipv4-via"),
         veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
+        veth_hash_seed => ("veth-hash-seed","veth-hash-seed"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_multicast => ("veth-multicast","veth-multicast"),
         veth_ipv6_multicast => ("veth-ipv6-multicast","veth-ipv6-multicast"),
+        multicast_sources => ("multicast-sources","multicast-sources"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
         veth_ipv6_scope => ("veth-ipv6-scope","veth-ipv6-scope"),
         veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
         proc_net => ("proc-net","proc-net"),
+        proc_net_sockets => ("proc-net-sockets","proc-net-sockets"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
@@ -863,6 +870,7 @@ mod linux {
         userfaultfd_wp_async => ("userfaultfd-wp-async","userfaultfd"),
         userfaultfd_events => ("userfaultfd-events","userfaultfd"),
         userfaultfd_scan => ("userfaultfd-scan","userfaultfd"),
+        userfaultfd_major => ("userfaultfd-major","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -1097,6 +1105,7 @@ mod linux {
         processes_timer_waits_plain => ("timer-waits-plain","timer-waits"),
         processes_timer_waits_restart => ("timer-waits-restart","timer-waits"),
         processes_timer_waits_default => ("timer-waits-default","timer-waits"),
+        processes_exec_pending => ("exec-pending","exec-pending"),
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),
@@ -1124,8 +1133,10 @@ mod linux {
         processes_anon_thp_placement => ("anon-thp-placement","process"),
         processes_mmap_32bit => ("mmap-32bit","process"),
         processes_mmap_low => ("mmap-low","process"),
+        processes_mmap_hugetlb => ("mmap-hugetlb","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
+        processes_file_code => ("file-code","process"),
         processes_dev_shm => ("dev-shm","process"),
         processes_tree_namespace => ("tree-namespace","process"),
         processes_beneath => ("beneath","process"),
@@ -1145,6 +1156,7 @@ mod linux {
         processes_proc_sizes => ("proc-sizes","process"),
         processes_proc_stat_counters => ("proc-stat-counters","process"),
         processes_loadavg_running => ("loadavg-running","process"),
+        processes_proc_cpuinfo => ("proc-cpuinfo","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),
@@ -1183,6 +1195,7 @@ mod linux {
         processes_io_uring_net => ("io-uring-net","process"),
         processes_io_uring_placement => ("io-uring-placement","process"),
         processes_io_uring_timeout => ("io-uring-timeout","process"),
+        processes_io_uring_poll_add => ("io-uring-poll-add","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

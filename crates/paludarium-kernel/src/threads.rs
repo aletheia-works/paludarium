@@ -1230,18 +1230,12 @@ impl ThreadGroup {
             ..signal
         })
     }
-    /// Resets handled signals to their default and keeps ignored ones, as
-    /// execve does. The process gets its own copy, so a process sharing the
-    /// dispositions through `CLONE_SIGHAND` keeps its handlers.
+    /// Resets the actions as execve does ([`signals::flushed`]). The process
+    /// gets its own copy, so a process sharing the dispositions through
+    /// `CLONE_SIGHAND` keeps its handlers.
     pub(crate) fn exec_actions(&self) {
         let mut slot = self.actions.lock().unwrap_or_else(PoisonError::into_inner);
-        let kept = slot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(_, action)| action.handler == 1)
-            .map(|(&number, &action)| (number, action))
-            .collect();
+        let kept = signals::flushed(&slot.lock().unwrap_or_else(PoisonError::into_inner));
         *slot = Arc::new(Mutex::new(kept));
     }
     pub(crate) fn sync_timer(&self, local: &mut ThreadState) {
@@ -2524,7 +2518,7 @@ impl Kernel {
         // Its tracees are let go of, and its tracer told, before it goes.
         self.ptrace_exit(thread, status);
         // What task work it still has runs as an exiting task's.
-        crate::io_uring::exit_task(&self.inbox);
+        crate::io_uring::exit_task(&self.processes.io_uring, &self.inbox);
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).

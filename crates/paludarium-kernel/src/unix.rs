@@ -119,6 +119,16 @@ pub(crate) struct UnixSocket {
     /// (`sock_gen_cookie`).
     cookie: OnceLock<u64>,
 }
+/// What `/proc/net/unix` shows of a socket ([`UnixSocket::shown`]).
+pub(crate) struct Shown {
+    pub(crate) kind: u8,
+    pub(crate) listening: bool,
+    pub(crate) established: bool,
+    /// None for a connection not yet accepted.
+    pub(crate) inode: Option<u64>,
+    /// The whole `sun_path` it is bound to.
+    pub(crate) name: Option<Vec<u8>>,
+}
 /// What `sock_diag` tells of a socket ([`UnixSocket::diag`]).
 pub(crate) struct Diag {
     pub(crate) kind: u8,
@@ -942,6 +952,19 @@ impl UnixSocket {
             shutdown: self.end.shutdown_mask(connected),
             uid: self.end.owner(),
         })
+    }
+    /// What `/proc/net/unix` shows of it, a connection that a listener has
+    /// not accepted yet too.
+    pub(crate) fn shown(&self) -> Shown {
+        let diag = self.diag();
+        let state = diag.as_ref().map_or(TCP_ESTABLISHED, |diag| diag.state);
+        Shown {
+            kind: self.end.kind() as u8,
+            listening: state == TCP_LISTEN,
+            established: state == TCP_ESTABLISHED,
+            inode: diag.map(|diag| diag.inode),
+            name: self.name.get().cloned(),
+        }
     }
     /// Its cookie, given when first asked for, as `sock_gen_cookie`.
     pub(crate) fn cookie(&self) -> u64 {

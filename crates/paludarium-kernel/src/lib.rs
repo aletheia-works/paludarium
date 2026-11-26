@@ -15,6 +15,7 @@
 mod admin;
 mod arguments;
 mod coredump;
+mod cpuinfo;
 mod credentials;
 mod inbox;
 mod inotify;
@@ -51,6 +52,7 @@ mod fasync;
 mod fifo;
 mod files;
 mod filesystems;
+mod hugetlb;
 mod inet;
 mod interface;
 mod io_accounting;
@@ -83,6 +85,7 @@ mod mqueue;
 mod mqueue_tests;
 mod msg;
 mod multicast;
+mod multipath;
 mod namespaces;
 mod page_cache;
 mod pagemap_scan;
@@ -1301,7 +1304,17 @@ impl Kernel {
             processes: &self.processes,
         };
         let sigbus = userfaultfd::fault(&mut ctx, context, access) == Some(true);
+        // Unless a signal is to be taken first, the fault is tried again
+        // (`fault_signal_pending`), and counts.
+        let retried = !sigbus && !events::signalled(&ctx);
         self.inbox.drain(&mut thread.state);
+        if retried {
+            mem.retry_own_fault(
+                paludarium_types::GuestAddr(access.address),
+                access.write,
+                access.fetch,
+            );
+        }
         if sigbus {
             signals::queue(
                 &mut thread.state,

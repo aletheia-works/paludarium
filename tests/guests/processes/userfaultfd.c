@@ -69,6 +69,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -2297,6 +2298,110 @@ static int case_held(void) {
     return 0;
 }
 
+/* What a fault that a userfaultfd served counts as. A fault of the
+   thread's own code is tried again once the wait ends, which counts as a
+   minor fault whether it brings the page in or not: its first try ran
+   under the VMA's lock, whose retry is not FAULT_FLAG_TRIED. A
+   get_user_pages population that waited finds the page there and counts
+   nothing, nor does a write to a page a fill left writable. The faulting
+   thread reads its own getrusage(RUSAGE_THREAD) and page-faults,
+   minor-faults and major-faults events around the one access. */
+struct counted {
+    char *at;
+    int how; /* 0 a read, 1 a write, 2 MADV_POPULATE_WRITE */
+    volatile int ready;
+    long minor, major;
+    long long faults, minor_events, major_events;
+};
+
+static long software_event(int config) {
+    uint64_t attr[16] = {0};
+    attr[0] = 1 | (uint64_t)sizeof attr << 32; /* PERF_TYPE_SOFTWARE, size */
+    attr[1] = (uint64_t)config;
+    return syscall(SYS_perf_event_open, attr, 0, -1, -1, 0);
+}
+
+static void *counted_access(void *arg) {
+    struct counted *c = arg;
+    int events[3] = {(int)software_event(2), (int)software_event(5), (int)software_event(6)};
+    long long before[3] = {0}, after[3] = {0};
+    struct rusage was, now;
+    for (int i = 0; i < 3; i++) read(events[i], &before[i], 8);
+    getrusage(RUSAGE_THREAD, &was);
+    c->ready = 1;
+    if (c->how == 0) (void)*(volatile char *)c->at;
+    if (c->how == 1) *(volatile char *)c->at = 'w';
+    if (c->how == 2) madvise(c->at, PAGE, 23 /* MADV_POPULATE_WRITE */);
+    getrusage(RUSAGE_THREAD, &now);
+    for (int i = 0; i < 3; i++) read(events[i], &after[i], 8);
+    c->minor = now.ru_minflt - was.ru_minflt;
+    c->major = now.ru_majflt - was.ru_majflt;
+    c->faults = after[0] - before[0];
+    c->minor_events = after[1] - before[1];
+    c->major_events = after[2] - before[2];
+    for (int i = 0; i < 3; i++) close(events[i]);
+    return NULL;
+}
+
+/* Runs `c` in a thread, serves its fault with `serve` once the userfaultfd
+   has it, and prints the counts. */
+static void counted(const char *what, int fd, struct counted *c, void (*serve)(int fd, struct counted *c)) {
+    pthread_t thread;
+    pthread_create(&thread, NULL, counted_access, c);
+    int waited = wait_message(fd) == 1;
+    struct uffd_msg msg;
+    waited &= read(fd, &msg, sizeof msg) == sizeof msg;
+    serve(fd, c);
+    pthread_join(thread, NULL);
+    printf("%s: waited %d minflt %ld majflt %ld page-faults %lld minor-faults %lld major-faults %lld\n", what,
+           waited, c->minor, c->major, c->faults, c->minor_events, c->major_events);
+}
+
+static char filler[PAGE];
+static void by_copy(int fd, struct counted *c) {
+    copy(fd, c->at, filler, PAGE, 0, NULL);
+}
+static void by_zeropage(int fd, struct counted *c) {
+    zeropage(fd, c->at, PAGE, 0, NULL);
+}
+static void by_unprotect(int fd, struct counted *c) {
+    protect(fd, c->at, PAGE, 0);
+}
+static void by_continue(int fd, struct counted *c) {
+    resume(fd, c->at, PAGE, 0, NULL);
+}
+static void by_unregister(int fd, struct counted *c) {
+    unreg(fd, c->at, PAGE);
+}
+
+static int case_major(void) {
+    memset(filler, 'f', sizeof filler);
+    int fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_MINOR_SHMEM);
+    char *base = anon(5 * PAGE);
+    reg(fd, base, 5 * PAGE, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, NULL);
+    counted("read, zeropage", fd, &(struct counted){.at = base, .how = 0}, by_zeropage);
+    counted("write, copy", fd, &(struct counted){.at = base + PAGE, .how = 1}, by_copy);
+    copy(fd, base + 2 * PAGE, filler, PAGE, UFFDIO_COPY_MODE_WP, NULL);
+    counted("protected write, unprotect", fd, &(struct counted){.at = base + 2 * PAGE, .how = 1}, by_unprotect);
+    counted("populate, copy", fd, &(struct counted){.at = base + 3 * PAGE, .how = 2}, by_copy);
+    counted("read, unregister", fd, &(struct counted){.at = base + 4 * PAGE, .how = 0}, by_unregister);
+    /* shmem_file's second page is in the page cache. */
+    int file = shmem_file(2);
+    char *view = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    reg(fd, view, 2 * PAGE, UFFDIO_REGISTER_MODE_MINOR, NULL);
+    counted("minor, continue", fd, &(struct counted){.at = view + PAGE, .how = 0}, by_continue);
+    /* Without a wait, as the page is there: a minor fault. */
+    char *again = anon(PAGE);
+    reg(fd, again, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+    copy(fd, again, filler, PAGE, 0, NULL);
+    struct counted c = {.at = again, .how = 1};
+    counted_access(&c);
+    printf("filled before: minflt %ld majflt %ld page-faults %lld minor-faults %lld major-faults %lld\n", c.minor,
+           c.major, c.faults, c.minor_events, c.major_events);
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2317,6 +2422,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-move")) return case_move();
     if (!strcmp(mode, "userfaultfd-events")) return case_events();
     if (!strcmp(mode, "userfaultfd-scan")) return case_scan();
+    if (!strcmp(mode, "userfaultfd-major")) return case_major();
     printf("unknown mode %s\n", mode);
     return 2;
 }

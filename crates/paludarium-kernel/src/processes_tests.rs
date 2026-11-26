@@ -2286,6 +2286,39 @@ mod exec {
         assert!(!ct.state.signal_actions.contains_key(&10));
         assert!(!ct.state.signal_actions.contains_key(&14));
     }
+    /// `flush_signal_handlers` and `de_thread`: what the thread has pending
+    /// stays, and an ignored signal stays ignored with no flags or mask.
+    #[test]
+    fn exec_keeps_the_threads_pending_signals_and_clears_ignored_flags() {
+        let (mut k, mut t, m) = exec_setup();
+        t.state.signal_mask = 1 << 9;
+        let (pid, tid) = (u64::from(t.state.pid), u64::from(t.tid));
+        assert_eq!(syscall(&mut k, &mut t, &m, 234, [pid, tid, 10, 0, 0, 0]), 0);
+        // SIGINT ignored, with SA_RESTART and SIGTERM in its mask.
+        m.write(GuestAddr(DATA + 64), &[0; 32]).unwrap();
+        m.write_u64(GuestAddr(DATA + 64), 1).unwrap();
+        m.write_u64(GuestAddr(DATA + 72), 0x1000_0000).unwrap();
+        m.write_u64(GuestAddr(DATA + 88), 1 << 14).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [2, DATA + 64, 0, 8, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        assert!(t.state.pending.iter().any(|signal| signal.number == 10));
+        let ignored = SignalAction {
+            handler: 1,
+            ..SignalAction::default()
+        };
+        assert_eq!(t.state.signal_actions[&2], ignored);
+        assert_eq!(k.group.shared_actions().lock().unwrap()[&2], ignored);
+        // It comes once it is unblocked, of its default action.
+        m.write_u64(GuestAddr(DATA + 64), 1 << 9).unwrap();
+        syscall(&mut k, &mut t, &m, 14, [1, DATA + 64, 0, 8, 0, 0]);
+        assert_eq!(
+            k.checkpoint(&mut t, &m),
+            Next::Exit(ExitStatus::Signaled(10))
+        );
+    }
     #[test]
     fn tls_signals_reset_preserves_mask() {
         let (mut k, mut t, m) = exec_setup();
@@ -4668,7 +4701,7 @@ mod shm {
             }
         }
         for path in [
-            &b"/proc/net/tcp"[..],
+            &b"/proc/net/snmp"[..],
             b"/proc/net/dev",
             b"/proc/self/net/unix",
         ] {
@@ -4678,7 +4711,9 @@ mod shm {
         for directory in ["net", "self/net", "thread-self/net"] {
             let dev = read_proc(&mut k, &mut t, &m, &format!("/proc/{directory}/dev"));
             assert!(dev.starts_with("Inter-|   Receive"), "{dev}");
-            for name in ["tcp", "unix", "stat/arp_cache"] {
+            let unix = read_proc(&mut k, &mut t, &m, &format!("/proc/{directory}/unix"));
+            assert!(unix.starts_with("Num       RefCount"), "{unix}");
+            for name in ["snmp", "udplite", "stat/arp_cache"] {
                 m.write(
                     GuestAddr(PATH),
                     format!("/proc/{directory}/{name}\0").as_bytes(),
@@ -4719,7 +4754,26 @@ mod shm {
         }
         assert_eq!(
             names,
-            [".", "..", "arp", "dev", "route", "if_inet6", "ipv6_route"]
+            [
+                ".",
+                "..",
+                "arp",
+                "dev",
+                "raw",
+                "tcp",
+                "udp",
+                "icmp",
+                "raw6",
+                "tcp6",
+                "udp6",
+                "unix",
+                "icmp6",
+                "route",
+                "packet",
+                "netlink",
+                "if_inet6",
+                "ipv6_route"
+            ]
         );
     }
 

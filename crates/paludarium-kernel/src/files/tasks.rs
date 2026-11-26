@@ -1068,12 +1068,20 @@ pub(super) fn net_file(
     if flags & 3 != 0 && flags & super::O_PATH == 0 {
         return Err(Errno::EACCES);
     }
-    // The first one's is the session's, if it has one.
-    let network = namespace.sockets.network.get().cloned();
-    let network = network.or_else(|| c.files.network.clone());
+    // The first one's are the session's, if it has a network.
+    let own = namespace.sockets.network.get().cloned();
+    let unix = match own {
+        Some(_) => namespace.sockets.unix.get().cloned(),
+        None => Some(std::sync::Arc::clone(&c.files.unix)),
+    };
+    let source = crate::proc_net::Source {
+        network: own.or_else(|| c.files.network.clone()),
+        unix,
+        user: c.process.credentials.user.clone(),
+    };
     let host = std::sync::Arc::clone(c.shared_host);
     let now = move || host.clock(paludarium_host::ClockId::Monotonic).ok();
-    let file = file.open(network, now, flags, (stat.uid, stat.gid));
+    let file = file.open(source, now, flags, (stat.uid, stat.gid));
     Ok(std::sync::Arc::new(file))
 }
 

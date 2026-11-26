@@ -62,7 +62,8 @@ Linux.
   64-byte line, because HotSpot requires it. Of those, the FPU and MMX
   are not implemented; it advertises no other feature that is not. The name
   changes nothing else: where vendors' CPUs differ, as in the flags after a
-  `REP` faults, the virtual CPU keeps its own behaviour.
+  `REP` faults, the virtual CPU keeps its own behaviour. `/proc/cpuinfo`
+  describes this CPU too.
 - `RDTSC` and `RDTSCP` read a counter of the virtual CPU, which moves on with
   each read rather than with time. Every guest in the host process shares that
   counter, so its values depend on what else has read it. `RDSSP` does nothing
@@ -1091,8 +1092,9 @@ kernel.
   mapping's pages are mapped again at their next access. `MADV_FREE` keeps the contents, as
   Linux does without memory pressure.
   `MADV_WILLNEED` is accepted, and so are `MADV_COLD` and `MADV_PAGEOUT`
-  (with nothing to reclaim, hints too): each needs only the range mapped
-  (`ENOMEM`). `MADV_DONTNEED_LOCKED` discards as
+  (with nothing to reclaim, hints too): each needs the range mapped
+  (`ENOMEM`), and the last two refuse locked memory, huge pages
+  (`MAP_HUGETLB`) and memory Linux maps `VM_PFNMAP` (`EINVAL`). `MADV_DONTNEED_LOCKED` discards as
   `MADV_DONTNEED` does. `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`
   fault the pages in, as a read or a write would (the zero page, a page of
   its own), up to a page no mapping holds (`ENOMEM`), one its mapping may
@@ -1107,7 +1109,8 @@ kernel.
   one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
   takes only private anonymous memory, memory core mm does not back, as
   the rings of AIO, `io_uring` and perf events, takes no `MADV_DOFORK` or
-  `MADV_DODUMP`, and a perf ring buffer takes no change to only a part of
+  `MADV_DODUMP`, though huge pages take `MADV_DODUMP`, huge pages take no
+  `MADV_HUGEPAGE`, and a perf ring buffer takes no change to only a part of
   it), and a hole in the range gives
   `ENOMEM` after the rest has taken it. A `fork`ed child gets no mapping
   `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
@@ -1130,7 +1133,8 @@ kernel.
   `mremap`, and go with `munmap`. `MADV_GUARD_REMOVE` takes them out,
   leaving pages without contents. Sealed memory whose pages may not be
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
-  which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`).
+  which Linux maps `VM_DONTEXPAND`, huge pages and the vDSO's data take
+  neither advice (`EINVAL`).
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
   `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent, a
@@ -1288,6 +1292,10 @@ kernel.
   `UFFDIO_WAKE` takes its range, `UFFDIO_UNREGISTER` takes it from a range
   registered for missing pages, or the file is closed, and a signal ends
   it too; then the instruction runs again, as Linux retries the fault.
+  Unless a signal is to be taken first, the retry counts as a minor fault
+  of the thread's own code (`ru_minflt`, `page-faults`, `minor-faults`),
+  whether it brings the page in or not: its first try ran under the VMA's
+  lock, whose retry is not `FAULT_FLAG_TRIED`.
   With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
   instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
   their protection, VMA by VMA as `mwriteprotect_range` does: each must be
@@ -1798,6 +1806,21 @@ kernel.
   source shrunk; a free address asked for with `MREMAP_DONTUNMAP` alone
   too) and a `shmat` there give `EPERM` without `CAP_SYS_RAWIO`.
 
+- `MAP_HUGETLB` maps as on a Linux whose pool of huge pages is empty
+  (`vm.nr_hugepages` 0): `ENOMEM`, after the checks Linux makes first, when
+  a fixed mapping has unmapped what it would replace. With `MAP_NORESERVE`
+  it succeeds, and an access raises `SIGBUS`. Such a mapping goes at a 2 MiB
+  boundary, is split, remapped and dropped only on one (`EINVAL`), cannot
+  grow, and shows `ht` and its 2 MiB pages in `smaps`. `madvise` refuses
+  it `MADV_FREE`, `MADV_COLD`, `MADV_PAGEOUT`, `MADV_HUGEPAGE` and the
+  guards, and `MADV_DONTNEED` from an address off a 2 MiB boundary
+  (`EINVAL`). The only size is
+  2 MiB (another is `EINVAL`), as the virtual CPU has no 1 GiB pages, and a
+  file with the flag is `EINVAL`. The memory is a hugetlbfs file's, so it
+  takes a file's types: `MAP_SHARED_VALIDATE` maps it (`EOPNOTSUPP` for a
+  flag it refuses), and `MAP_DROPPABLE` is `EINVAL`, after the placement
+  and the lock checks, as in `do_mmap`.
+
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or
@@ -1833,7 +1856,8 @@ kernel.
   `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
   `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
-  `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, and the socket requests
+  `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, the polls `IORING_OP_POLL_ADD` and
+  `_POLL_REMOVE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
   `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
@@ -2011,6 +2035,20 @@ kernel.
   `IORING_TIMEOUT_IMMEDIATE_ARG`. A cancellation finds the timeouts after
   the requests that wait for their files, but none by a file, and no linked
   one. `execve` and a whole process's exit cancel the thread's.
+
+- The polls are Linux master's (`io_uring/poll.c`). `IORING_OP_POLL_ADD`
+  completes with the events its file has of those it asks for and the ones
+  that end any poll (`POLLERR`, `POLLHUP`, `POLLNVAL`, and `POLLRDHUP` for a
+  reader), or waits for them, holding its file. The events a wake-up tells
+  of are those of its key: a socket polled for both directions that gets
+  bytes reports `POLLIN` alone. With `IORING_POLL_ADD_MULTI` it posts a
+  completion with `IORING_CQE_F_MORE` for the events there and then for each
+  wake-up, those before its task work runs as one, until the queue has no
+  room. A file without `poll` completes at once (`EINVAL` without the
+  events). `IORING_OP_POLL_REMOVE` ends the latest poll of a `user_data`
+  with `ECANCELED` (`ENOENT` for none, `EALREADY` for one whose task work is
+  queued), or gives it new events (`IORING_POLL_UPDATE_EVENTS`) or
+  `user_data` (`IORING_POLL_UPDATE_USER_DATA`), with which it polls again.
 
 - The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
@@ -3013,9 +3051,11 @@ kernel.
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
     hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
     source and destination falls to, each hop living taking a share of the
-    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), with
-    the namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
-    them; before the hash, one whose device's own source is the lookup's;
+    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), as
+    `fib_multipath_hash_policy` 0 hashes them
+    (`fib_multipath_hash_from_keys`), by the machine's random seed, every
+    namespace's, or `net.ipv4.fib_multipath_hash_seed`, with which each
+    flow's hop is Linux's; before the hash, one whose device's own source is the lookup's;
     through a device named, the first through it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
@@ -3120,6 +3160,26 @@ kernel.
     none or its sender, that is a member of the group, on whatever device,
     or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
     connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
+  - **Source filters:** a membership takes what its filter lets in: from its
+    sources (`MCAST_INCLUDE`) or from all others (`MCAST_EXCLUDE`, of no
+    sources as a join leaves it). IPv4's `IP_ADD_SOURCE_MEMBERSHIP`,
+    `IP_DROP_SOURCE_MEMBERSHIP`, `IP_BLOCK_SOURCE`, `IP_UNBLOCK_SOURCE` and
+    `IP_MSFILTER` (which `getsockopt` reads too) change it, as do
+    `MCAST_JOIN_SOURCE_GROUP`, `MCAST_LEAVE_SOURCE_GROUP`,
+    `MCAST_BLOCK_SOURCE`, `MCAST_UNBLOCK_SOURCE` and `MCAST_MSFILTER` of
+    both families, beside `MCAST_JOIN_GROUP` and `MCAST_LEAVE_GROUP`; TCP
+    sockets take them too. A filter with sources stays of its mode
+    (`EINVAL`), a source is added once and taken away once
+    (`EADDRNOTAVAIL`), there are at most 10 of IPv4's and 64 of IPv6's
+    (`ENOBUFS`), and a membership that includes none ends (`ip_mc_source`,
+    `ip_mc_msfilter`, `ip6_mc_source`, `ip6_mc_msfilter`). As on Linux
+    master, an IPv6 filter whose last blocked source goes may change its
+    mode, which Linux 7.0 refuses, as IPv4's still does. A device takes
+    from a source what any membership on it includes, or what one that
+    excludes does not name (`ip_check_mc_rcu`, `ipv6_chk_mcast_addr`):
+    what it does not take reaches no socket, one that has
+    `IP_MULTICAST_ALL` or `IPV6_MULTICAST_ALL` on neither, and a sender's
+    own copy of it does not come back.
   - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
     unicast one, or the multicast `ff00::/8`) goes out through an end
     leaves from the route's preferred source, or the address
@@ -3188,8 +3248,8 @@ kernel.
     those put in are told of, then go, each told of. A removal takes each
     hop alone, and gives the last error. A lookup takes the hop the flow's
     hash falls to, each hop living taking a share of the hashes by its
-    weight (`fib6_select_path`, `rt6_multipath_rebalance`), with the
-    namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
+    weight (`fib6_select_path`, `rt6_multipath_rebalance`), by the same
+    seed as IPv4's, as `fib_multipath_hash_policy` 0 hashes
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
     label, and one unbound takes the source of the hop that gives
@@ -3411,7 +3471,8 @@ kernel.
     the route that matched. An IPv4 answer for a multicast or the limited
     broadcast address is of the multicast or broadcast type, as
     `__mkroute_output` makes it (`RTCF_MULTICAST` or `RTCF_BROADCAST`, and
-    `RTCF_LOCAL` for the broadcast address and a group the device is in),
+    `RTCF_LOCAL` for the broadcast address and a group the device is in and
+    takes that source's packets to),
     and with `RTM_F_FIB_MATCH` the table's
     entry takes that type too; from a source of the loopback's and no
     device, and through `lo` to a local group (224.0.0.0/24) or the
@@ -3428,7 +3489,7 @@ kernel.
     the device as `RTA_IIF`. IPv4 drops martians
     (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
     source, a loopback or 0.0.0.0 destination, a group the device has not
-    joined, and a source of the namespace's own, or with a local route a
+    joined or whose source its filters keep out, and a source of the namespace's own, or with a local route a
     request added, one a lookup finds a route to that is not unicast
     (`fib_validate_source`). A local, broadcast or multicast destination
     gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,
@@ -4120,7 +4181,7 @@ kernel.
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
 
-- The other `/proc` entries are `/proc/loadavg`, `/proc/locks` (above),
+- The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
   `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
@@ -4523,7 +4584,8 @@ kernel.
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
-  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`. They and their
+  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`, and
+  `ipv4/fib_multipath_hash_seed`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write
@@ -4558,6 +4620,9 @@ kernel.
     IPv6's own `RTM_NEWLINK` (`RTNLGRP_IPV6_IFINFO`), as `NETDEV_UP`
     does. While it is on, `lo` coming up takes no IPv6 and a new IPv6
     address is `EACCES` (`addrconf_add_dev`).
+  - `fib_multipath_hash_seed` takes an unsigned `int` as
+    `proc_douintvec_minmax` does (the rest of the write taken with it), 0
+    for the machine's random seed, as a new namespace has it.
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
 
@@ -4622,6 +4687,30 @@ kernel.
     running as `/proc/<pid>/stat` shows them (`R`), the reader included;
     `procs_blocked 0`; and a `softirq` line of zeros.
 
+- `/proc/cpuinfo` is in the format of Linux 7.0's `show_cpuinfo`, with a
+  record for each CPU `sched_getaffinity` reports. It is made from the
+  virtual CPU's `CPUID` as Linux makes it when it boots on such a CPU, never
+  from the host's CPU.
+  - `vendor_id`, `cpu family`, `model`, `stepping` and `cpuid level` are
+    `CPUID`'s. `model name` is `Hammer`, the name Linux gives an AMD CPU of
+    family 15 without a brand string.
+  - `flags` names, by Linux's names and in its order (`x86_cap_flags`), the
+    features of the `CPUID` words Linux copies, and those Linux sets itself on
+    such a CPU: `nopl`, `cpuid`, `3dnowprefetch` and `vmmcall`. `bugs` names
+    what Linux's tables give that family: `fxsave_leak`, `sysret_ss_attrs`,
+    `null_seg`, `swapgs_fence`, `spectre_v1`, `spectre_v2` and
+    `spectre_v2_user`.
+  - `CPUID` describes no topology, so each CPU is a package of its own with
+    one core: `physical id` and `apicid` are its number, `siblings` and
+    `cpu cores` 1, and `core id` 0. `initial apicid` is what `CPUID`'s leaf 1
+    gives, 0.
+  - `clflush size` and `cache_alignment` are 64, and the address sizes 36
+    bits physical and 48 virtual: a 64-bit Linux's defaults without `CPUID`
+    leaf 0x80000008.
+  - There is no `microcode`, `cpu MHz` (`CPUID` reports no time stamp
+    counter), `cache size` or `TLB size` line. `power management` is empty,
+    and `bogomips` is 0.00, as nothing is calibrated.
+
 - `/proc/net` is a link to `self/net`; `/proc/<pid>/net`, and a thread's,
   holds the files of the task's network namespace, whose names are looked
   up in the one it has then (`get_proc_task_net`), by any reader: `ENOENT`
@@ -4638,6 +4727,15 @@ kernel.
     0 (`fib_flag_trans`); `ipv6_route`
     (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - `tcp`, `tcp6`, `udp` and `udp6`, the sockets `sock_diag` tells of, but
+    for TCP ones bound alone, in the format of Linux 7.0's `tcp4_seq_show` and
+    the like: first the listeners, then the connections, with those in
+    `TIME_WAIT`. `unix` (`unix_seq_show`) has a connection not yet accepted
+    too, and `netlink` (`netlink_native_seq_show`) the sockets that are
+    bound. Owners show as the opener's user namespace has them.
+  - `raw`, `raw6`, `icmp`, `icmp6` and `packet`, of kinds of socket there are
+    none of, hold their header alone. There is no `udplite`, as Linux has no
+    UDP-Lite any more.
   - Any other name there is `ENOENT`, with `--mount /:/` too: the host's
     sockets and devices are not the guest's.
 
@@ -5006,9 +5104,8 @@ kernel.
   forked child starts from zero, and an `execve` keeps both. Their
   `ru_minflt` counts the minor faults, as Linux's `mm_account_fault` adds
   them to the task: a thread's first read or write of a page and its write
-  to a page `fork` shares or of a private mapping of a file (in its own code,
-  where an instruction that reads and writes its operand takes one, a write,
-  as x86-64's do, and in the kernel's accesses for it: a system call's copies, a signal
+  to a page `fork` shares or of a private mapping of a file (in its own code
+  and in the kernel's accesses for it: a system call's copies, a signal
   frame, an `rseq` area's update), each as it is taken, and the faults of the reads and writes
   through `get_user_pages` made for it, which `perf` does not count:
   `mlock`'s, `mlockall`'s and `MAP_POPULATE`'s population,
@@ -5017,7 +5114,8 @@ kernel.
   and `PTRACE_POKEDATA` (counted to the tracer) and a core dump's (counted
   to the thread the signal ended, which dumps while the others wait,
   regardless of which thread exits last; it leaves private anonymous memory never touched
-  a hole, with no fault). `RUSAGE_SELF` gives the sum of the
+  a hole, with no fault). An instruction of its code that reads and writes
+  its operand takes one fault, a write, as x86-64's do. `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts
   from none, and an `execve` keeps them. `ru_nvcsw` counts the voluntary
@@ -6241,7 +6339,7 @@ kernel.
 
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
   longer struct whose extra part is not zero) and then runs as the `clone` it
-  describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
+  describes; `CLONE_CLEAR_SIGHAND` resets the child's actions as `execve` does.
   `set_tid` is as under the PID namespaces above, and `CLONE_INTO_CGROUP`
   gives `EINVAL`. `clone` itself reads only
   the low 32 bits of its flags, as in Linux, so `CLONE_CLEAR_SIGHAND` is
@@ -6741,6 +6839,12 @@ one only with an `--allow-net`.
   `CLONE_THREAD` shares its signal dispositions with its parent: a
   `sigaction` in one is seen by the other. `execve` gives the process its own
   copy again, as in Linux.
+- `execve` keeps the signals pending for the thread that runs it and for the
+  process, and the signals it blocks; the other threads end with theirs
+  (`de_thread`). It resets the actions as Linux's `flush_signal_handlers`
+  does: a handled signal goes back to its default, and an ignored one stays
+  ignored, with no flags or mask. `CLONE_CLEAR_SIGHAND` resets the child's
+  the same way.
 - The threads of a process share its signal dispositions, as Linux's
   `sighand_struct` does. A thread that was already waiting (in `epoll_wait`,
   `poll` or a `futex` wait, say) when another thread called `sigaction` takes

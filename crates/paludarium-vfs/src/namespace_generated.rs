@@ -21,9 +21,9 @@ pub struct GeneratedSource {
     /// Its mount's flags ([`mount_flags`]), which the new mount takes.
     pub flags: u32,
     /// Whether a walk finds only its root, not a directory at each name
-    /// below: the kernel's own `/dev` where it is, whose names the kernel
-    /// finds by their paths, and below which a walk goes only into the
-    /// mounts on it (`/dev/shm`).
+    /// below: the kernel's own `/proc` and `/dev` where they are, whose
+    /// names the kernel finds by their paths, and below which a walk goes
+    /// only into the mounts on them (`/dev/shm`).
     pub shallow: bool,
 }
 impl GeneratedSource {

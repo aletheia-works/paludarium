@@ -651,9 +651,10 @@ pub struct MountTable {
     /// Whether a mount is a bind mount of a file the kernel generates, so
     /// the kernel asks where its paths lead ([`NamespacedFs::generated`]).
     generated: AtomicBool,
-    /// Whether every mount but the boot ones is at `/dev` or below it, as
-    /// from start-up (the kernel's `/dev` and the tmpfs on `/dev/shm`), so
-    /// a call on a path elsewhere still goes straight through
+    /// Whether every mount but the boot ones is at `/proc` or `/dev` or
+    /// below them, as from start-up (the kernel's `/proc` and `/dev` and the
+    /// tmpfs on `/dev/shm`), so a call on a path elsewhere still goes
+    /// straight through
     /// ([`NamespacedFs::fast_for`]).
     devices_only: AtomicBool,
     /// Where the lower filesystem has its mounts, which it shows itself.
@@ -891,7 +892,7 @@ impl MountTable {
             entries
                 .iter()
                 .filter(|e| e.runtime())
-                .all(|e| !e.hidden && within(&e.point, DEVICES) && e.point != b"/"),
+                .all(|e| !e.hidden && generated_place(&e.point) && e.point != b"/"),
             Ordering::SeqCst,
         );
         *guard = Arc::new(entries);
@@ -1041,19 +1042,26 @@ pub struct NamespacedFs {
     view: Arc<dyn FileSystem>,
     table: Arc<MountTable>,
     root: Vec<u8>,
-    /// Whether the lower filesystem has a `/dev` of its own, where a link
-    /// into `/dev` would lead a call that went straight through.
+    /// Whether the lower filesystem has a `/proc` or a `/dev` of its own,
+    /// where a link into them would lead a call that went straight through.
     lower_devices: bool,
 }
-/// Where the kernel's devices are, the only place mounts from start-up
-/// other than the lower filesystem's are.
-const DEVICES: &[u8] = b"/dev";
+/// Where the kernel's own files are, the only places mounts from start-up
+/// other than the lower filesystem's are, and the names of them.
+const GENERATED_PLACES: [&[u8]; 2] = [b"/proc", b"/dev"];
+const GENERATED_NAMES: [&[u8]; 2] = [b"proc", b"dev"];
+/// Whether `path` is one of [`GENERATED_PLACES`] or below it.
+fn generated_place(path: &[u8]) -> bool {
+    GENERATED_PLACES.iter().any(|place| within(path, place))
+}
 impl NamespacedFs {
     #[must_use]
     pub fn new(lower: Arc<dyn FileSystem>, table: Arc<MountTable>) -> Self {
         Self {
             view: Arc::clone(&lower),
-            lower_devices: lower.metadata(DEVICES, false).is_ok(),
+            lower_devices: GENERATED_PLACES
+                .iter()
+                .any(|place| lower.metadata(place, false).is_ok()),
             lower,
             table,
             root: b"/".to_vec(),
@@ -1067,10 +1075,11 @@ impl NamespacedFs {
         self.table.boot_only.load(Ordering::SeqCst)
     }
     /// Whether a call on `path` goes straight through: with boot mounts
-    /// alone, or with mounts only in `/dev` (as from start-up) for a path
-    /// that names no `dev` and no `..`, under a root outside `/dev`, where
-    /// the lower filesystem has no `/dev` a link could lead into (a link
-    /// into the kernel's then fails there, and [`Self::quick`] walks it).
+    /// alone, or with mounts only in `/proc` and `/dev` (as from start-up)
+    /// for a path that names no `proc`, no `dev` and no `..`, under a root
+    /// outside them, where the lower filesystem has no `/proc` or `/dev` a
+    /// link could lead into (a link into the kernel's then fails there, and
+    /// [`Self::quick`] walks it).
     fn fast_for(&self, path: &[u8]) -> bool {
         if self.fast() {
             return true;
@@ -1079,23 +1088,25 @@ impl NamespacedFs {
             return false;
         }
         if self.root != b"/" {
-            return !within(&self.root, DEVICES);
+            return !generated_place(&self.root);
         }
         !self.lower_devices
             && !path
                 .split(|b| *b == b'/')
-                .any(|name| name == b"dev" || name == b"..")
+                .any(|name| GENERATED_NAMES.contains(&name) || name == b"..")
     }
     /// Whether a call that cannot fail (a device, a mount's ID) on `path`
     /// goes straight through: as [`Self::fast_for`], where the lower
-    /// filesystem finds the file, so no link on the way went into `/dev`.
+    /// filesystem finds the file, so no link on the way went into `/proc`
+    /// or `/dev`.
     fn fast_found(&self, path: &[u8], follow: bool) -> bool {
         self.fast()
             || self.fast_for(path)
                 && (self.root != b"/" || self.lower.metadata(path, follow).is_ok())
     }
     /// `call` straight through when [`Self::fast_for`] `paths`: its result,
-    /// but for a missing file (`ENOENT`, `ENOTDIR`) with mounts in `/dev`,
+    /// but for a missing file (`ENOENT`, `ENOTDIR`) with mounts in `/proc`
+    /// or `/dev`,
     /// which a link may lead into, so the call walks again (`None`).
     fn quick<T>(
         &self,

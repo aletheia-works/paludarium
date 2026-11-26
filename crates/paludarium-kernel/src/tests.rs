@@ -1540,8 +1540,58 @@ fn memfd_grow_seal_stops_a_write_at_the_last_whole_page() {
     assert_eq!(f.ret(14, &[0, DATA + 0x40, 0, 8]), 0); // block SIGXFSZ
     assert_eq!(f.ret(285, &[fd, 1, 0, 7000]), errno(Errno(27)));
     assert_eq!(f.ret(285, &[fd, 1, 0, 5500]), errno(Errno::EPERM)); // then GROW
-    assert_eq!(f.ret(319, &[DATA, 4]), errno(Errno::ENOSYS)); // MFD_HUGETLB
+    // MFD_HUGETLB of 1 MiB pages, which no CPU has.
+    assert_eq!(f.ret(319, &[DATA, 4 | 20 << 26]), errno(Errno(19)));
     assert_eq!(f.ret(319, &[1, 0]), errno(Errno::EFAULT));
+}
+#[test]
+fn huge_memfds_are_files_of_an_empty_hugetlbfs() {
+    const HUGE: u64 = 2 << 20;
+    let mut f = fixture();
+    let (stat, buf) = (DATA + 0x100, DATA + 0x400);
+    f.mem.write(GuestAddr(DATA), b"huge\0").unwrap();
+    let fd = f.ret(319, &[DATA, 6 | 21 << 26]); // MFD_HUGETLB | MFD_ALLOW_SEALING
+    assert!(fd < 1024, "{fd}");
+    let word = |f: &mut Fixture, at: u64| f.mem.read_u64(GuestAddr(at)).unwrap();
+    assert_eq!(f.ret(1, &[fd, DATA, 4]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(18, &[fd, DATA, 4, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(77, &[fd, 4096]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(77, &[fd, HUGE]), 0);
+    assert_eq!(f.ret(285, &[fd, 0, 0, 4096]), errno(Errno::ENOSPC));
+    assert_eq!(f.ret(285, &[fd, 3, 0, 4096]), 0); // punched, though empty
+    assert_eq!(f.ret(0, &[fd, buf, 8]), 8);
+    assert_eq!(word(&mut f, buf), 0);
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    assert_eq!(word(&mut f, stat), crate::memfd::HUGE_DEVICE);
+    assert_eq!(word(&mut f, stat + 48), HUGE); // st_size
+    assert_eq!(word(&mut f, stat + 56), HUGE); // st_blksize
+    assert_eq!(word(&mut f, stat + 64), 0); // st_blocks
+    assert_eq!(f.ret(138, &[fd, stat]), 0);
+    assert_eq!(word(&mut f, stat), crate::memfd::HUGETLBFS_MAGIC);
+    assert_eq!(word(&mut f, stat + 8), HUGE);
+    // Its mapping takes no reservation from the empty pool, but maps with
+    // MAP_NORESERVE and then counts among the writable ones.
+    let mmap = syscalls::nr::MMAP;
+    assert_eq!(f.ret(mmap, &[0, 1, 3, 1, fd, 0]), errno(Errno::ENOMEM));
+    assert_eq!(
+        f.ret(mmap, &[0, 1, 3, 0x4001, fd, 4096]),
+        errno(Errno::EINVAL)
+    );
+    let at = f.ret(mmap, &[0, 1, 3, 0x4001, fd, HUGE]);
+    assert_eq!(at % HUGE, 0, "{at:#x}");
+    let mut byte = [0];
+    assert!(f.mem.read(GuestAddr(at), &mut byte).unwrap_err().bus);
+    let vma = f.mem.view().vma_from(at).unwrap();
+    assert_eq!(vma.end - vma.start, HUGE);
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    assert_eq!(word(&mut f, stat + 48), 2 * HUGE); // grown to the mapping's end
+    assert_eq!(f.ret(72, &[fd, 1033, 8]), errno(Errno(16))); // EBUSY
+    assert_eq!(f.ret(syscalls::nr::MUNMAP, &[at, HUGE]), 0);
+    assert_eq!(f.ret(72, &[fd, 1033, 8]), 0); // F_SEAL_WRITE
+    assert_eq!(f.ret(mmap, &[0, 1, 3, 0x4001, fd, 0]), errno(Errno::EPERM));
+    assert_eq!(f.ret(285, &[fd, 3, 0, 4096]), errno(Errno::EPERM));
+    // A read-only private mapping is still taken.
+    assert_eq!(f.ret(mmap, &[0, HUGE, 1, 0x4002, fd, 0]) % HUGE, 0);
 }
 #[test]
 fn proc_fd_links_open_again_or_refuse() {

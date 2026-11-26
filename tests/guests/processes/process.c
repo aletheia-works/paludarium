@@ -19376,6 +19376,87 @@ static int mmap_hugetlb_case(void) {
     waitpid(kid, NULL, 0);
     return 0;
 }
+/* The memfd-hugetlb case: MFD_HUGETLB makes a file on hugetlbfs, with no
+   huge page in the pool. Another size is ENODEV; it can't be written, its
+   size is whole huge pages, and fallocate has no page to give (ENOSPC). Its
+   mapping is ENOMEM, but maps with MAP_NORESERVE, raises SIGBUS, grows the
+   file to its end when it may write, and keeps F_SEAL_WRITE out while it
+   lasts. */
+static int rc_errno(long rc) {
+    return rc < 0 ? errno : (int)rc;
+}
+static int memfd_hugetlb_case(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    struct sigaction action = {.sa_flags = SA_SIGINFO};
+    action.sa_sigaction = on_bus;
+    sigaction(SIGBUS, &action, NULL);
+    unsigned sizes[] = {0, 12, 20, 21, 22};
+    for (int i = 0; i < 5; i++) {
+        long fd = syscall(SYS_memfd_create, "size", 4u | sizes[i] << 26);
+        printf("size-%u=%d\n", sizes[i], fd < 0 ? errno : 0);
+        if (fd >= 0) close(fd);
+    }
+    int fd = syscall(SYS_memfd_create, "huge", 4u | 2u); /* MFD_HUGETLB | MFD_ALLOW_SEALING */
+    if (fd < 0) return 80;
+    struct stat st;
+    struct statfs sf;
+    if (fstat(fd, &st) || fstatfs(fd, &sf)) return 81;
+    printf("stat: size=%ld blksize=%ld blocks=%ld mode=%o links=%ld\n", (long)st.st_size,
+           (long)st.st_blksize, (long)st.st_blocks, (unsigned)(st.st_mode & 07777), (long)st.st_nlink);
+    printf("statfs: type=%#lx bsize=%ld blocks=%ld files=%ld namelen=%ld\n", (unsigned long)sf.f_type,
+           (long)sf.f_bsize, (long)sf.f_blocks, (long)sf.f_files, (long)sf.f_namelen);
+    char path[64], link[128];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    long n = readlink(path, link, sizeof link - 1);
+    printf("link=%.*s\n", (int)(n > 0 ? n : 0), link);
+    errno = 0;
+    printf("write=%d", rc_errno(write(fd, "x", 1)));
+    printf(" pwrite=%d", rc_errno(pwrite(fd, "x", 1, 0)));
+    printf(" small=%d", rc_errno(ftruncate(fd, 4096)));
+    printf(" whole=%d", rc_errno(ftruncate(fd, HUGE_2M)));
+    printf(" allocate=%d", rc_errno(fallocate(fd, 0, 0, 4096)));
+    printf(" keep=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4096)));
+    printf(" punch=%d", rc_errno(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096)));
+    printf(" zero=%d\n", rc_errno(fallocate(fd, 0x10 /* FALLOC_FL_ZERO_RANGE */, 0, 4096)));
+    char buffer[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    n = pread(fd, buffer, sizeof buffer, 4096);
+    printf("read=%ld byte=%d\n", n, buffer[0]);
+    fstat(fd, &st);
+    printf("size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
+    int rw = PROT_READ | PROT_WRITE, none = MAP_SHARED | MAP_NORESERVE;
+    printf("reserve=%d", low_error(mmap(NULL, 1, rw, MAP_SHARED, fd, 0)));
+    printf(" private=%d", low_error(mmap(NULL, 1, rw, MAP_PRIVATE, fd, 0)));
+    printf(" offset=%d", low_error(mmap(NULL, 1, rw, none, fd, 4096)));
+    printf(" empty=%d", low_error(mmap(NULL, 0, rw, none, fd, 0)));
+    char *flagged = mmap(NULL, 1, PROT_READ, none | MAP_HUGETLB | 30u << 26, fd, 0);
+    printf(" flagged=%d", low_error(flagged));
+    if (flagged != MAP_FAILED) munmap(flagged, HUGE_2M);
+    char *at = mmap(NULL, 1, rw, none, fd, HUGE_2M);
+    printf(" mapped=%d aligned=%d\n", low_error(at), at != MAP_FAILED && !((uintptr_t)at % HUGE_2M));
+    if (at == MAP_FAILED) return 82;
+    huge_smaps("vma", at);
+    touch("read", at, 0);
+    touch("write", at + HUGE_2M - 1, 1);
+    fstat(fd, &st);
+    printf("grown=%ld\n", (long)st.st_size);
+    errno = 0;
+    printf("seal-mapped=%d", rc_errno(fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE)));
+    printf(" unmap=%d", rc_errno(munmap(at, 1)));
+    printf(" unmapped=%d", rc_errno(munmap(at, HUGE_2M)));
+    printf(" seal=%d", rc_errno(fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE)));
+    printf(" sealed=%d", low_error(mmap(NULL, HUGE_2M, rw, none, fd, 0)));
+    char *ro = mmap(NULL, HUGE_2M, PROT_READ, none, fd, 0);
+    printf(" read-only=%d", low_error(ro));
+    printf(" protect=%d", ro == MAP_FAILED ? -1 : rc_errno(mprotect(ro, HUGE_2M, rw)));
+    printf(" punch=%d\n", rc_errno(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096)));
+    int again = open(path, O_RDONLY);
+    printf("reopened: shared-write=%d",
+           again < 0 ? -1 : low_error(mmap(NULL, HUGE_2M, rw, none, again, 0)));
+    char *read_only = again < 0 ? MAP_FAILED : mmap(NULL, HUGE_2M, PROT_READ, none, again, 0);
+    printf(" read=%d", low_error(read_only));
+    printf(" grow=%d\n", rc_errno(ftruncate(fd, 3 * HUGE_2M)));
+    return 0;
+}
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
    no hint goes at a 2 MiB boundary, as Linux's thp_get_unmapped_area_vmflags
    places it, a second one right below the first in the top-down layout, and
@@ -43421,6 +43502,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mmap-32bit")) return mmap_32bit_case();
     if (!strcmp(mode, "mmap-low")) return mmap_low_case();
     if (!strcmp(mode, "mmap-hugetlb")) return mmap_hugetlb_case();
+    if (!strcmp(mode, "memfd-hugetlb")) return memfd_hugetlb_case();
     if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();

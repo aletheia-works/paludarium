@@ -327,8 +327,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `memfd_create` は、リンクのないメモリ上のファイル（モード 0777、
   `MFD_NOEXEC_SEAL` なら 0666）を作り、flags と名前を Linux と同じく確かめます
-  （`EINVAL`、`EFAULT`）。`MFD_HUGETLB` は、hugetlbfs のないカーネルと同じく
-  `ENOSYS` です。`fcntl` の `F_ADD_SEALS`・`F_GET_SEALS` で扱うシールは、
+  （`EINVAL`、`EFAULT`）。`MFD_HUGETLB` は hugetlbfs のファイルを作ります（下の
+  `MAP_HUGETLB` を参照）。`fcntl` の `F_ADD_SEALS`・`F_GET_SEALS` で扱うシールは、
   `MFD_ALLOW_SEALING` がなければ `F_SEAL_SEAL` から始まり（`MFD_NOEXEC_SEAL` なら
   `F_SEAL_EXEC`）、tmpfs と同じくファイルを制限します。`F_SEAL_WRITE` と
   `F_SEAL_FUTURE_WRITE` は書き込み・穴あけ・書き込める共有マッピングを、
@@ -1118,8 +1118,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_MOVE`、それにイベントの `UFFD_FEATURE_EVENT_FORK`、
   `UFFD_FEATURE_EVENT_REMAP`、`UFFD_FEATURE_EVENT_REMOVE`、
   `UFFD_FEATURE_EVENT_UNMAP` で（`HUGETLBFS` の
-  ものは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
-  登録する hugetlbfs のメモリはありません）、`UFFD_FEATURE_EVENT_FORK` には
+  ものは Linux と同じく示しますが、`UFFDIO_REGISTER` は hugetlb のマッピングを受け付けないので、
+  hugetlbfs のメモリは登録できません）、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
   メモリ、共有の anonymous メモリ、shmem の memfd と tmpfs マウントのファイル（Linux
   が VMA を shmem のものと数えない System V の共有メモリは除きます）の共有または
@@ -1606,9 +1606,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `madvise` は `MADV_FREE`、`MADV_COLD`、`MADV_PAGEOUT`、`MADV_HUGEPAGE`、ガードを受け付けず、
   2 MiB の境目にない番地からの `MADV_DONTNEED` も受け付けません（`EINVAL`）。仮想 CPU に
   1 GiB のページはないので、大きさは 2 MiB だけです（ほかは `EINVAL`）。このフラグを付けたファイルの
-  マッピングは `EINVAL` です。メモリーは hugetlbfs のファイルのものなので、ファイルの種類を
-  取ります。`MAP_SHARED_VALIDATE` でマップでき（受け付けないフラグは `EOPNOTSUPP`）、
-  `MAP_DROPPABLE` は `do_mmap` と同じく置き場所とロックの確認のあと `EINVAL` です。
+  マッピングは、hugetlbfs のファイルでなければ `EINVAL` です。メモリーは hugetlbfs のファイルの
+  ものなので、ファイルの種類を取ります。`MAP_SHARED_VALIDATE` でマップでき（受け付けない
+  フラグは `EOPNOTSUPP`）、`MAP_DROPPABLE` は `do_mmap` と同じく置き場所とロックの確認のあと
+  `EINVAL` です。
+  `MFD_HUGETLB` の `memfd_create` はそういうファイルを 2 MiB のページで作ります（ほかの大きさは
+  `ENODEV`）。`write` はなく（`EINVAL`）、大きさはヒュージページの倍数で（ほかへの `ftruncate` は
+  `EINVAL`）、`fallocate` に渡すページはなく（`ENOSPC`）、読むとゼロです。`fstat` のブロックは
+  2 MiB でブロック数は 0、`fstatfs` は hugetlbfs の種類とブロックを返します。マッピングは上と
+  同じで、長さはフラグにかかわらず 2 MiB に切り上げます。書けるマッピングはファイルをその終わり
+  まで大きくし、書ける共有のマッピングがある間は `F_SEAL_WRITE` を付けられません（`EBUSY`）。
 
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて

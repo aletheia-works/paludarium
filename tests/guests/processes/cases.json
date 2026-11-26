@@ -500,6 +500,7 @@
     {"name":"mmap-32bit","binary":"process"},
     {"name":"mmap-low","binary":"process"},
     {"name":"mmap-hugetlb","binary":"process"},
+    {"name":"memfd-hugetlb","binary":"process"},
     {"name":"generated-noexec","binary":"process"},
     {"name":"exec-truncated","binary":"process"},
     {"name":"file-code","binary":"process"},

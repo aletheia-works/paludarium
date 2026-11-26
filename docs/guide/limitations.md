@@ -77,12 +77,12 @@ verified.
 - **Huge pages**: the pool of hugetlbfs is empty and cannot be filled. There
   is no `/proc/sys/vm/nr_hugepages` (so no write to it), no
   `/sys/kernel/mm/hugepages`, and `hugetlbfs` cannot be mounted (`ENODEV`),
-  though `sysfs` lists it. `MFD_HUGETLB` and `SHM_HUGETLB` give `ENOSYS`, as
-  from a kernel without hugetlbfs, where Linux with an empty pool makes a
-  memfd, and gives `EPERM` or `ENOMEM` for a segment. `MAP_HUGETLB` of
-  1 GiB pages is `EINVAL`, as on a CPU without them; the differential tests
-  do not compare it. `userfaultfd` does not register such a mapping, and
-  the mapping's device in `maps` is 0.
+  though `sysfs` lists it. `SHM_HUGETLB` gives `ENOSYS`, as from a kernel
+  without hugetlbfs, where Linux with an empty pool gives `EPERM` or
+  `ENOMEM` for a segment. `MAP_HUGETLB` of 1 GiB pages is `EINVAL`, and
+  `MFD_HUGETLB` of them `ENODEV`, as on a CPU without them; the
+  differential tests do not compare them. `userfaultfd` does not register
+  such a mapping, and an anonymous one's device in `maps` is 0.
 - **`/proc/<pid>/mem`'s offsets past `i64::MAX`**: `pread64` and
   `pwrite64` refuse them (`EINVAL`), as Linux v7.0's `ksys_pread64` and
   `ksys_pwrite64` do for every file, where Linux master takes them for a

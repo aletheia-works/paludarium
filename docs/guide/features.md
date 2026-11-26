@@ -373,8 +373,8 @@ kernel.
 
 - `memfd_create` makes an unlinked in-memory file (mode 0777, or 0666 with
   `MFD_NOEXEC_SEAL`, and no links), with Linux's flag and name checks
-  (`EINVAL`, `EFAULT`); `MFD_HUGETLB` gives `ENOSYS`, as from a kernel
-  without hugetlbfs. Its seals, through `fcntl`'s `F_ADD_SEALS` and
+  (`EINVAL`, `EFAULT`); `MFD_HUGETLB` makes a file on hugetlbfs (see
+  `MAP_HUGETLB` below). Its seals, through `fcntl`'s `F_ADD_SEALS` and
   `F_GET_SEALS`, start as `F_SEAL_SEAL` unless `MFD_ALLOW_SEALING` is given
   (`F_SEAL_EXEC` with `MFD_NOEXEC_SEAL`), and restrict the file as tmpfs
   does: `F_SEAL_WRITE` and `F_SEAL_FUTURE_WRITE` refuse writes, punch holes
@@ -1255,8 +1255,8 @@ kernel.
   `UFFD_FEATURE_WP_ASYNC`, `UFFD_FEATURE_MOVE`, and the events'
   `UFFD_FEATURE_EVENT_FORK`, `UFFD_FEATURE_EVENT_REMAP`,
   `UFFD_FEATURE_EVENT_REMOVE` and `UFFD_FEATURE_EVENT_UNMAP` (the `HUGETLBFS` ones as Linux reports them,
-  though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
-  `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
+  though no hugetlbfs memory can be registered: `UFFDIO_REGISTER` does not
+  take a hugetlb mapping), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory, shared anonymous memory and the shared or private mappings of a
   memfd or a file of a tmpfs mount, which are shmem's (not System V shared
@@ -1820,10 +1820,18 @@ kernel.
   guards, and `MADV_DONTNEED` from an address off a 2 MiB boundary
   (`EINVAL`). The only size is
   2 MiB (another is `EINVAL`), as the virtual CPU has no 1 GiB pages, and a
-  file with the flag is `EINVAL`. The memory is a hugetlbfs file's, so it
-  takes a file's types: `MAP_SHARED_VALIDATE` maps it (`EOPNOTSUPP` for a
-  flag it refuses), and `MAP_DROPPABLE` is `EINVAL`, after the placement
-  and the lock checks, as in `do_mmap`.
+  file with the flag is `EINVAL`, but for a hugetlbfs one. The memory is
+  a hugetlbfs file's, so it takes a file's types: `MAP_SHARED_VALIDATE`
+  maps it (`EOPNOTSUPP` for a flag it refuses), and `MAP_DROPPABLE` is
+  `EINVAL`, after the placement and the lock checks, as in `do_mmap`.
+  `memfd_create` with `MFD_HUGETLB` makes such a file, of 2 MiB pages
+  (another size is `ENODEV`): it has no `write` (`EINVAL`), its size is
+  whole huge pages (`ftruncate` to another is `EINVAL`), `fallocate` has no
+  page to give it (`ENOSPC`), and a read finds zeros. `fstat` gives a block
+  of 2 MiB and no blocks, and `fstatfs` hugetlbfs's type and block. Its
+  mapping is as above, the length rounded up to 2 MiB whatever the flags;
+  one that may write raises the file's size to its end, and a shared one
+  that may write keeps `F_SEAL_WRITE` out (`EBUSY`).
 
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even

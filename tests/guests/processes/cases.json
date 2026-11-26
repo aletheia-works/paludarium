@@ -184,6 +184,7 @@
     {"name":"perf-cpu-samples","binary":"perf"},
     {"name":"perf-side-band-comm","binary":"perf"},
     {"name":"perf-throttle","binary":"perf"},
+    {"name":"perf-clock-samples","binary":"perf"},
     {"name":"perf-side-band-exec","binary":"perf"},
     {"name":"bpf-calls","binary":"bpf"},
     {"name":"bpf-elements","binary":"bpf"},

@@ -338,6 +338,7 @@ mod linux {
                     | "perf-cpu-samples"
                     | "perf-side-band-comm"
                     | "perf-throttle"
+                    | "perf-clock-samples"
                     | "perf-side-band-exec"
                     | "bpf-calls"
                     | "bpf-elements"
@@ -574,6 +575,7 @@ mod linux {
                     | "perf-prctl"
                     | "perf-inherit"
                     | "perf-throttle"
+                    | "perf-clock-samples"
                     | "perf-software"
             ) {
                 host.measure_cpu_time();
@@ -790,6 +792,7 @@ mod linux {
         perf_cpu_samples => ("perf-cpu-samples","perf"),
         perf_side_band_comm => ("perf-side-band-comm","perf"),
         perf_throttle => ("perf-throttle","perf"),
+        perf_clock_samples => ("perf-clock-samples","perf"),
         perf_side_band_exec => ("perf-side-band-exec","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),

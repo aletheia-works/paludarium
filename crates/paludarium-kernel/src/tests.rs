@@ -14295,3 +14295,29 @@ mod vma_names {
         assert_eq!(f.mem.view().vma_from(at).unwrap().anon_name, None);
     }
 }
+
+#[test]
+fn a_sampling_clock_ends_each_run_about_when_it_is_to_fire() {
+    let host = Arc::new(RecordingHost::new());
+    let mut kernel = Kernel::new(host.clone());
+    // No clock samples the thread: the whole budget.
+    assert_eq!(kernel.run_budget(100_000), 100_000);
+    // One is due in 50 us, at no rate known yet: the floor.
+    kernel.pace.due = Some(50_000);
+    host.set_clock(paludarium_host::ClockId::Monotonic, 1_000_000);
+    assert_eq!(kernel.run_budget(100_000), PACE_FLOOR);
+    // That run took 10 us: 500 instructions a microsecond.
+    host.set_clock(paludarium_host::ClockId::Monotonic, 1_010_000);
+    kernel.pace.ran(&*host);
+    assert_eq!(kernel.pace.rate, Some((PACE_FLOOR, 10_000)));
+    assert_eq!(kernel.run_budget(100_000), 25_000);
+    // A clock that has not moved keeps the rate.
+    kernel.pace.ran(&*host);
+    assert_eq!(kernel.pace.rate, Some((PACE_FLOOR, 10_000)));
+    // Never past the budget, nor under the floor, but for a smaller budget.
+    kernel.pace.due = Some(10_000_000);
+    assert_eq!(kernel.run_budget(100_000), 100_000);
+    kernel.pace.due = Some(1_000);
+    assert_eq!(kernel.run_budget(100_000), PACE_FLOOR);
+    assert_eq!(kernel.run_budget(100), 100);
+}

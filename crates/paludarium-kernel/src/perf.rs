@@ -25,7 +25,7 @@ mod build_id;
 mod sample;
 mod side_band;
 
-pub(crate) use sample::{Task, Who, overflow, samples_faults, sampling};
+pub(crate) use sample::{Task, Who, clock_due, overflow, samples_faults, sampling};
 pub(crate) use side_band::{Space, comm, wanted};
 
 use crate::ThreadGroup;
@@ -2117,6 +2117,72 @@ mod tests {
         account(&mut state);
         // Its two faults and the major one above, and then this.
         assert_eq!((cpu.values().0, faults.values().0), (0, 4));
+    }
+
+    #[test]
+    fn a_thread_s_clock_sample_is_due_at_the_first_of_its_enabled_sampling_clocks() {
+        let group = Arc::new(ThreadGroup::default());
+        let of = |tid| Target::Thread {
+            group: Arc::clone(&group),
+            tid,
+        };
+        let clock = |target, period, flags, cpu| {
+            let attr = Attr {
+                kind: 1,
+                period,
+                flags,
+                ..Attr::default()
+            };
+            of_counter_on(None, target, attr, Counter::Clock, cpu)
+        };
+        let events = Events::default();
+        let list = |event: &Arc<Event>, enabled: bool| {
+            lock(&event.state).enabled = enabled;
+            let mut lists = lock(&events.lists);
+            match event.target {
+                Target::Thread { .. } => lists.counting.push(erase(event)),
+                Target::Cpu => lists.cpu_sampling.push(erase(event)),
+            }
+        };
+        let due = || sample::clock_due(&events, &group, 1, 0);
+        assert_eq!(due(), None);
+        let slow = clock(of(1), 300_000, 0, -1);
+        list(&slow, false);
+        assert_eq!(due(), None);
+        lock(&slow.state).enabled = true;
+        assert_eq!(due(), Some(300_000));
+        // Faster ones that sample none of its code's time: of its kernel
+        // alone, of another thread, on another CPU, a clock that counts
+        // alone, and samples of another counter.
+        let faults = Attr {
+            kind: 1,
+            period: 1,
+            ..Attr::default()
+        };
+        let others = [
+            clock(of(1), 100_000, 1 << bit::EXCLUDE_USER, -1),
+            clock(of(2), 100_000, 0, -1),
+            clock(of(1), 100_000, 0, 1),
+            clock(Target::Cpu, 100_000, 0, 1),
+            clock(of(1), 0, 0, -1),
+            of_counter_on(
+                None,
+                of(1),
+                faults,
+                Counter::Faults(crate::FaultKind::All),
+                -1,
+            ),
+        ];
+        for other in &others {
+            list(other, true);
+        }
+        assert_eq!(due(), Some(300_000));
+        // One of its CPU.
+        let cpu = clock(Target::Cpu, 200_000, 0, 0);
+        list(&cpu, true);
+        assert_eq!(due(), Some(200_000));
+        lock(&cpu.state).paused = true;
+        assert_eq!(due(), Some(300_000));
     }
 
     #[test]

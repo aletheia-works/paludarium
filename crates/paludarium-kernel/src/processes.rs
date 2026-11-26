@@ -3663,6 +3663,7 @@ impl Kernel {
             group,
             copies: None,
             armed: false,
+            pace: crate::Pace::default(),
             processes: self.processes.clone(),
             pending_child: None,
             spawn_memory: child_mem,

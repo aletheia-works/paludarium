@@ -2769,6 +2769,7 @@ impl Kernel {
             group: self.group.clone(),
             copies: None,
             armed: false,
+            pace: crate::Pace::default(),
             pending_child: None,
             processes: self.processes.clone(),
             spawn_memory: None,

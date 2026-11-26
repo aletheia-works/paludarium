@@ -19,10 +19,12 @@
 //! the emulator counts what a thread did as of its system calls
 //! ([`crate::Usage`]), so the samples are taken there too ([`overflow`]),
 //! of the thread as it makes the call: its registers, its stack and the
-//! frames its `rbp` chain leads to. An occurrence in the thread's own code
-//! and the passing of its time are samples of user mode; a fault in a
-//! system call, a switch and a migration are of the kernel, whose address
-//! and frames are not known here (0, and no frames after
+//! frames its `rbp` chain leads to. While a clock samples a thread, the
+//! thread's runs end about when the clock is to fire ([`clock_due`]), so
+//! that its checkpoints take about one sample each. An occurrence in the
+//! thread's own code and the passing of its time are samples of user mode;
+//! a fault in a system call, a switch and a migration are of the kernel,
+//! whose address and frames are not known here (0, and no frames after
 //! `PERF_CONTEXT_KERNEL`).
 use super::{Counter, Event, Events, bit, lock};
 use crate::fasync::{Reason, Registration};
@@ -377,6 +379,16 @@ impl Sampler {
         self.at = end;
         (stopped, unused)
     }
+    /// For a clock, the nanoseconds of its count until its hrtimer fires
+    /// next: at the next tick's, for one throttled.
+    fn due(&self) -> u64 {
+        if self.throttled {
+            let tick = self.seq.saturating_add(1).saturating_mul(TICK_NSEC);
+            tick.saturating_sub(self.at)
+        } else {
+            u64::try_from(self.left).unwrap_or(0)
+        }
+    }
     /// `perf_adjust_period`: the period moves an eighth of the way to the
     /// one that gives the frequency, at `count` occurrences in `nsec`.
     fn adjust(&mut self, nsec: u64, count: u64) {
@@ -528,6 +540,42 @@ pub(crate) fn samples_faults(
     let mut of_task = lists.counting.iter().filter_map(super::event);
     of_cpu.any(|event| wants(&event))
         || of_task.any(|event| event.counts(group, tid) && wants(&event))
+}
+
+/// The nanoseconds of thread `tid`'s time, on `cpu`, until the first
+/// enabled sampling `cpu-clock` or `task-clock` that counts it fires, of
+/// those that sample its own code: its next checkpoint is to come by then
+/// ([`crate::Kernel::run_budget`]).
+pub(crate) fn clock_due(
+    events: &Events,
+    group: &crate::ThreadGroup,
+    tid: u32,
+    cpu: u32,
+) -> Option<u64> {
+    let clocks: Vec<Arc<Event>> = {
+        let lists = lock(&events.lists);
+        let of_cpu = lists.cpu_sampling.iter().filter_map(super::event);
+        let of_cpu = of_cpu.filter(|event| u32::try_from(event.cpu) == Ok(cpu));
+        let of_task = lists.counting.iter().filter_map(super::event);
+        let of_task = of_task.filter(|event| event.counts(group, tid));
+        of_cpu
+            .chain(of_task)
+            .filter(|event| {
+                event.counter == Counter::Clock
+                    && event.attr.sampling()
+                    && !event.attr.flag(bit::EXCLUDE_USER)
+                    && (event.cpu < 0 || u32::try_from(event.cpu) == Ok(cpu))
+            })
+            .collect()
+    };
+    clocks
+        .into_iter()
+        .filter(|event| {
+            let state = lock(&event.state);
+            state.enabled && !state.paused && !state.removed
+        })
+        .map(|event| lock(&event.sampler).due())
+        .min()
 }
 
 /// Whether any event of the machine samples, for the checkpoints that
@@ -1508,6 +1556,20 @@ mod tests {
         // From each interrupt, 100 us into its tick, to the next tick, and
         // to the end in the last.
         assert_eq!(stopped, 3 * (MS - 100_000) + MS / 2 - 100_000);
+    }
+
+    #[test]
+    fn a_clock_is_due_at_its_next_interrupt_or_after_its_throttled_tick() {
+        let mut sampler = Sampler::of_period(100_000, Counter::Clock);
+        let mut out = Vec::new();
+        assert_eq!(sampler.due(), 100_000);
+        ticks(&mut sampler, 250_000, PER_TICK, &mut out);
+        assert_eq!(sampler.due(), 50_000);
+        // Throttled at its first interrupt, at 100 us, until the next tick.
+        let mut sampler = Sampler::of_period(100_000, Counter::Clock);
+        ticks(&mut sampler, 150_000, 1, &mut out);
+        assert!(sampler.throttled);
+        assert_eq!(sampler.due(), MS - 150_000);
     }
 
     #[test]

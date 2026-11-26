@@ -1060,6 +1060,7 @@ static int case_output(void) {
 }
 
 #define SAMPLE_IP (1ULL << 0)
+#define SAMPLE_TIME (1ULL << 2)
 #define SAMPLE_ADDR (1ULL << 3)
 #define SAMPLE_CALLCHAIN (1ULL << 5)
 #define SAMPLE_ID (1ULL << 6)
@@ -2319,6 +2320,54 @@ static int case_side_band_exec(const char *self) {
     return 0;
 }
 
+/* The samples of a clock, each at its own time and in order. */
+struct clock_samples {
+    int samples, repeats, backwards;
+    uint64_t last;
+};
+
+static void see_clock_sample(const uint64_t *record, void *with) {
+    struct clock_samples *c = with;
+    if ((uint32_t)record[0] != RECORD_SAMPLE) return;
+    /* SAMPLE_IP, then SAMPLE_TIME. */
+    uint64_t time = record[2];
+    if (c->samples > 0 && time == c->last) c->repeats++;
+    if (c->samples > 0 && time < c->last) c->backwards++;
+    c->last = time;
+    c->samples++;
+}
+
+/* cpu-clock every 100 us, for 20 ms of the thread's time: each sample is
+   taken as its hrtimer fires, so no two have the same time. The emulator
+   takes them at its checkpoints, which come about as often as the period
+   while the clock samples, but those of a system call's time share one:
+   at most a third may share a time (most did with runs of 100,000
+   instructions). */
+static int case_clock_samples(void) {
+    struct attr a = software(0);
+    a.sample_period = 100000;
+    a.sample_type = SAMPLE_IP | SAMPLE_TIME;
+    a.flags |= DISABLED;
+    void *page;
+    int fd = (int)open_event(&a, 0, -1, -1, 0);
+    int mapped = fd >= 0 && map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page) == 0;
+    say("mapped %d", mapped);
+    if (!mapped) return 1;
+    ioctl(fd, IOC_ENABLE, 0);
+    struct timespec from, now;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &from);
+    do {
+        for (int i = 0; i < 10; i++) spin();
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    } while ((now.tv_sec - from.tv_sec) * 1000000000L + now.tv_nsec - from.tv_nsec < 20000000L);
+    ioctl(fd, IOC_DISABLE, 0);
+    struct clock_samples c = {0};
+    uint64_t tail = 0;
+    each_record(page, &tail, see_clock_sample, &c);
+    say("samples>=100 %d in order %d own times %d", c.samples >= 100, c.backwards == 0, c.repeats * 3 <= c.samples);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -2339,6 +2388,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-side-band-cpu")) return case_side_band_cpu();
     if (!strcmp(mode, "perf-side-band-comm")) return case_side_band_comm();
     if (!strcmp(mode, "perf-throttle")) return case_throttle();
+    if (!strcmp(mode, "perf-clock-samples")) return case_clock_samples();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {

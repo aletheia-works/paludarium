@@ -48,7 +48,9 @@ tool, and `paludarium-wasm`, the WebAssembly entry point that becomes
 4. The execution loop calls the kernel to handle the system call, or delivers a
    signal to the guest.
 5. Every 100,000 instructions, the loop checks whether it has been asked to
-   stop.
+   stop. While a sampling `cpu-clock` or `task-clock` counts the thread, a
+   run ends about when the clock is to fire next, and at least 5,000
+   instructions in (`Kernel::run_budget`).
 
 The kernel owns the register state of each thread; the CPU only runs the state
 it is given.

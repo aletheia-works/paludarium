@@ -370,8 +370,13 @@ verified.
   frames as of then (a fault's own address is its own, but 0 for one
   before the thread's last 4096), and one of the kernel (a fault in a
   system call, a switch or a migration) has the instruction 0 and no
-  kernel frames. `freq` follows the rate at those points,
-  not at each tick. A `cpu-clock` or `task-clock` event is throttled at
+  kernel frames. While a `cpu-clock` or `task-clock` samples a thread, the
+  thread's runs end about when the clock is to fire next, at the rate its
+  last run went at, and run at least 5,000 instructions, so that its
+  samples come about one at each checkpoint, with their own registers. That
+  is not an interrupt: a sample comes as much later as that estimate is off,
+  and two can still share a checkpoint. `freq` follows the rate at those
+  points, not at each tick. A `cpu-clock` or `task-clock` event is throttled at
   `perf_event_max_sample_rate` over `HZ` (1000) interrupts in a tick, as
   Linux's hrtimer events are, the ticks being those of its own count, and
   is unthrottled at the next one, when it is enabled again or when its

@@ -320,7 +320,10 @@ verified.
     connection ends with is kept for the next between the same addresses
     (`tcp_metrics`), but the round trip kept is the model's own, and there
     is no bound on the entries, no route metric that locks one, no netlink
-    `TCP_METRICS` family and no `tcp_no_metrics_save`. The peer's
+    `TCP_METRICS` family, no `tcp_no_metrics_save` or
+    `tcp_no_ssthresh_metrics_save`, no check that a peer is known when the
+    SYN queue is nearly full (`tcp_peer_is_proven`), and no Fast Open
+    cookies. The peer's
     window scale is taken as Linux's default, whatever buffer it set; and a connection the host made has
     its segments estimated, in 32 KiB segments with one acknowledgement
     for each.

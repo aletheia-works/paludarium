@@ -10,7 +10,9 @@
 //! Linux's table holds at most five entries in each of its buckets and
 //! reuses the oldest of them; this one has no bound. There are no route
 //! metrics to lock a value, nor netlink's `TCP_METRICS` family, nor the
-//! `tcp_no_metrics_save` and `tcp_no_ssthresh_metrics_save` switches.
+//! `tcp_no_metrics_save` and `tcp_no_ssthresh_metrics_save` switches, nor
+//! `tcp_peer_is_proven`'s check of a peer when the SYN queue is nearly
+//! full, nor Fast Open cookies.
 
 use std::collections::HashMap;
 use std::net::IpAddr;

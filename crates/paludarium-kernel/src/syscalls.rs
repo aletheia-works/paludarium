@@ -2474,11 +2474,14 @@ const MAP_DROPPABLE: u64 = 0x08;
 /// The bits of a mapping's type, of which one value is taken.
 const MAP_TYPE: u64 = 0x0f;
 const MAP_HUGETLB: u64 = 0x4_0000;
+/// A mapping whose writes are durable once they fault (`VM_SYNC`), which
+/// only a file of DAX keeps.
+const MAP_SYNC: u64 = 0x8_0000;
 /// The flags `MAP_SHARED_VALIDATE` takes of any file here (Linux's
 /// `LEGACY_MAP_MASK`): those of before it, with `MAP_UNINITIALIZED`,
 /// `MAP_ABOVE4G` and the huge page sizes of 2 MiB and 1 GiB. Not
-/// `MAP_FIXED_NOREPLACE`, nor `MAP_SYNC`, which only a file of DAX would
-/// add (`FOP_MMAP_SYNC`).
+/// `MAP_FIXED_NOREPLACE`, nor `MAP_SYNC`, which a file system of
+/// `FOP_MMAP_SYNC` adds ([`maps_sync`]).
 const LEGACY_MAP_MASK: u64 = MAP_SHARED
     | MAP_PRIVATE
     | MAP_FIXED
@@ -2887,7 +2890,9 @@ fn check_mappable(
     if regular && i64::MAX as u64 - len.min(i64::MAX as u64) < offset {
         return Err(Errno::EOVERFLOW);
     }
-    if flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !LEGACY_MAP_MASK != 0 {
+    let sync = regular && maps_sync(file);
+    let known = LEGACY_MAP_MASK | if sync { MAP_SYNC } else { 0 };
+    if flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !known != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
     let access = file.flags() & 3;
@@ -2933,7 +2938,25 @@ fn check_mappable(
     {
         return Err(Errno::EINVAL);
     }
+    // Last, the file system's own `mmap_prepare` refuses `VM_SYNC`, which
+    // `MAP_SYNC` gives any type, of a file that is not DAX's.
+    if sync && flags & MAP_SYNC != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     Ok(())
+}
+/// Whether the regular `file`'s file system takes `MAP_SYNC` for
+/// `MAP_SHARED_VALIDATE` (`FOP_MMAP_SYNC`): ext4 and xfs, whose
+/// `daxdev_mapping_supported` then refuses it for a file not of DAX, which
+/// none is here. A host file system Linux has no number for is taken as
+/// ext4, as for the other flags of a file system.
+fn maps_sync(file: &dyn FileHandle) -> bool {
+    const EXT4_SUPER_MAGIC: u64 = 0xef53;
+    const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+    matches!(
+        file.file_system(),
+        Some(0 | EXT4_SUPER_MAGIC | XFS_SUPER_MAGIC)
+    )
 }
 /// Whether `file` is a memfd sealed against writes, whose shared mappings
 /// may not write.

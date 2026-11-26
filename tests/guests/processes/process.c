@@ -13588,7 +13588,14 @@ static long types_mapped(long len, long prot, long flags, long fd, long off) {
     munmap((void *)r, len);
     return 0;
 }
-static int mmap_types_case(void) {
+/* Whether the file system of `fd` takes MAP_SYNC (FOP_MMAP_SYNC): ext4 and
+ * xfs, which then refuse it for a file not of DAX. */
+static int types_fs_syncs(int fd) {
+    struct statfs fs;
+    if (fstatfs(fd, &fs)) return -1;
+    return fs.f_type == 0xef53 || fs.f_type == 0x58465342;
+}
+static int mmap_types_case(const char *self) {
     long page = 4096;
     char path[64];
     snprintf(path, sizeof path, "/tmp/paludarium-mmap-types-%d", getpid());
@@ -13636,6 +13643,18 @@ static int mmap_types_case(void) {
         long shared = syscall(SYS_mmap, at, page, rw, MAP_SHARED | flag, fd, 0L);
         long shared_errno = shared == -1 ? -errno : 0;
         if (shared != -1) munmap((void *)shared, page);
+        /* What MAP_SYNC gives depends on the file system, so it is
+         * compared with what fstatfs says that file system takes. */
+        if (flag == 0x80000) {
+            int syncs = types_fs_syncs(fd);
+            long want = syncs ? -EOPNOTSUPP : 0;
+            if (syncs >= 0 && validated_errno == -EOPNOTSUPP && shared_errno == want)
+                printf("sync: as-file-system\n");
+            else
+                printf("sync: validate=%ld shared=%ld syncs=%d\n", validated_errno,
+                       shared_errno, syncs);
+            continue;
+        }
         printf("%s: validate=%ld shared=%ld\n", flags[i].name, validated_errno, shared_errno);
     }
     /* A flag it does not know comes after the file's size, before its access. */
@@ -13646,9 +13665,38 @@ static int mmap_types_case(void) {
     long zero_unknown = types_mapped(page, rw, MAP_SHARED_VALIDATE | 0x80000, zero, 0);
     long anonymous_unknown =
         types_mapped(page, rw, MAP_SHARED_VALIDATE | MAP_ANONYMOUS | 0x80000, -1, 0);
-    printf("overflow=%ld unknown-read-only=%ld read-only=%ld zero-unknown=%ld "
-           "anonymous-unknown=%ld\n",
-           overflow, unknown_read_only, read_only, zero_unknown, anonymous_unknown);
+    /* On ext4 and xfs MAP_SYNC is known, so the access is checked first. */
+    int syncs = types_fs_syncs(fd);
+    long sync_private = types_mapped(page, rw, MAP_PRIVATE | 0x80000, fd, 0);
+    if (unknown_read_only == (syncs ? -EACCES : -EOPNOTSUPP) &&
+        sync_private == (syncs ? -EOPNOTSUPP : 0))
+        printf("unknown-read-only=as-file-system sync-private=as-file-system\n");
+    else
+        printf("unknown-read-only=%ld sync-private=%ld syncs=%d\n", unknown_read_only,
+               sync_private, syncs);
+    printf("overflow=%ld read-only=%ld zero-unknown=%ld anonymous-unknown=%ld\n", overflow,
+           read_only, zero_unknown, anonymous_unknown);
+    /* The program's own file, on the file system it was built on. */
+    int program = open(self, O_RDONLY);
+    if (program < 0) return 93;
+    int program_syncs = types_fs_syncs(program);
+    long program_sync = types_mapped(page, PROT_READ, MAP_PRIVATE | 0x80000, program, 0);
+    long program_plain = types_mapped(page, PROT_READ, MAP_PRIVATE, program, 0);
+    if (program_syncs >= 0 && program_sync == (program_syncs ? -EOPNOTSUPP : 0))
+        printf("program-sync=as-file-system program-plain=%ld\n", program_plain);
+    else
+        printf("program-sync=%ld syncs=%d program-plain=%ld\n", program_sync, program_syncs,
+               program_plain);
+    close(program);
+    /* MAP_SYNC: ext4 and xfs take it for MAP_SHARED_VALIDATE and refuse it
+     * for any type of a file not of DAX; shmem neither takes it nor looks. */
+    int shm = memfd_create("mmap-types", 0);
+    if (shm < 0 || ftruncate(shm, page)) return 92;
+    printf("memfd-sync: validate=%ld shared=%ld private=%ld\n",
+           types_mapped(page, rw, MAP_SHARED_VALIDATE | 0x80000, shm, 0),
+           types_mapped(page, rw, MAP_SHARED | 0x80000, shm, 0),
+           types_mapped(page, rw, MAP_PRIVATE | 0x80000, shm, 0));
+    close(shm);
     /* A validated shared mapping writes the file. */
     char *validated = (char *)syscall(SYS_mmap, 0L, page, rw, MAP_SHARED_VALIDATE, fd, 0L);
     if (validated == MAP_FAILED) return 82;
@@ -41955,7 +42003,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-collapse")) return madvise_collapse_case();
     if (!strcmp(mode, "madvise-collapse-shmem")) return madvise_collapse_shmem_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
-    if (!strcmp(mode, "mmap-types")) return mmap_types_case();
+    if (!strcmp(mode, "mmap-types")) return mmap_types_case(self);
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
     if (!strcmp(mode, "file-leases")) {

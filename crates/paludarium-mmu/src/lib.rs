@@ -7548,10 +7548,14 @@ impl AddressSpaceData {
     /// Makes the new mappings in `[addr, end)` `MAP_DROPPABLE`'s
     /// ([`Mapping::droppable`]): `do_mmap` adds `VM_NORESERVE`,
     /// `VM_WIPEONFORK` and `VM_DONTDUMP` to `VM_DROPPABLE`, so no
-    /// overcommit charge either.
+    /// overcommit charge either. Nor does `mlockall`'s `MCL_FUTURE` lock it,
+    /// as Linux master's `__mmap_new_vma` gives back the lock only to a VMA
+    /// `vma_supports_mlock` takes, as the CI runners' kernels do (v7.0's
+    /// source keeps the lock).
     pub fn drop_new(&mut self, addr: u64, end: u64) {
         for (_, mapping) in self.mappings.range_mut(addr..end) {
             mapping.droppable = true;
+            mapping.locked = None;
             mapping.no_reserve = true;
             mapping.account = false;
             mapping.wipe_on_fork = true;

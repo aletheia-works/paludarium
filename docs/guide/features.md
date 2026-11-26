@@ -987,16 +987,20 @@ kernel.
   anonymous memory `MAP_SHARED`, `MAP_PRIVATE` or `MAP_DROPPABLE`; any other
   value is `EINVAL`. `MAP_SHARED_VALIDATE` is `MAP_SHARED` that refuses a
   flag Linux's `LEGACY_MAP_MASK` does not hold (`EOPNOTSUPP`, after the
-  file's size is checked and before its access): `MAP_SYNC`, which no file
-  here supports, `MAP_FIXED_NOREPLACE`, the huge page size's bit 31, which
-  neither 2 MiB's nor 1 GiB's has, and any unknown bit, also above bit 31;
-  `MAP_SHARED` drops them. `MAP_DROPPABLE` memory is private anonymous memory with
-  `VM_DROPPABLE` (`VmFlags: dp`), `VM_NORESERVE`, `VM_WIPEONFORK` and
+  file's size is checked and before its access): `MAP_FIXED_NOREPLACE`, the
+  huge page size's bit 31, which neither 2 MiB's nor 1 GiB's has, any unknown
+  bit, also above bit 31, and `MAP_SYNC` but on ext4 and xfs (`FOP_MMAP_SYNC`;
+  a host file system Linux has no number for counts as ext4); `MAP_SHARED`
+  drops them. Of a file of ext4 or xfs, `MAP_SYNC` with any type is then
+  `EOPNOTSUPP` after the other checks, as no file is DAX's
+  (`daxdev_mapping_supported`). `MAP_DROPPABLE` memory is private anonymous
+  memory with `VM_DROPPABLE` (`VmFlags: dp`), `VM_NORESERVE`, `VM_WIPEONFORK` and
   `VM_DONTDUMP`: a `fork`ed child gets it with none of its pages and a core
   holds none of it, for good (`MADV_KEEPONFORK` and `MADV_DODUMP` are
   `EINVAL`). It may not be `MAP_LOCKED`, `MAP_GROWSDOWN` or `MAP_HUGETLB`
-  (`EINVAL`), `mlock` and `munlock` leave it as it is (one `mlockall`'s
-  `MCL_FUTURE` locked stays locked), `MADV_MERGEABLE` passes it by, and a
+  (`EINVAL`), neither `mlock` nor `mlockall`'s `MCL_FUTURE` locks it (as
+  Linux master's `vma_supports_mlock`, which the CI runners' kernels follow
+  where v7.0's source would lock it), `MADV_MERGEABLE` passes it by, and a
   `userfaultfd` does not register it (`EINVAL`). Linux drops its pages under
   memory pressure, which the emulator never has, so they stay.
 

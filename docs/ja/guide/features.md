@@ -876,14 +876,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MAP_SHARED`、`MAP_PRIVATE`、`MAP_DROPPABLE` でマップでき、ほかの値は `EINVAL` です。
   `MAP_SHARED_VALIDATE` は、Linux の `LEGACY_MAP_MASK` にないフラグを断る
   `MAP_SHARED` です（`EOPNOTSUPP`。ファイルの大きさを確かめたあと、アクセスの前）。
-  ここにはそれを扱うファイルのない `MAP_SYNC`、`MAP_FIXED_NOREPLACE`、2 MiB にも 1 GiB にも
-  ないヒュージページの大きさのビット 31、ビット 31 より上も含む知らないビットがそうで、
-  `MAP_SHARED` はこれらを捨てます。`MAP_DROPPABLE` のメモリは、`VM_DROPPABLE`
+  `MAP_FIXED_NOREPLACE`、2 MiB にも 1 GiB にもないヒュージページの大きさのビット 31、
+  ビット 31 より上も含む知らないビット、ext4 と xfs（`FOP_MMAP_SYNC`。Linux に番号のない
+  ホストのファイルシステムは ext4 とみなします）以外での `MAP_SYNC` がそうで、
+  `MAP_SHARED` はこれらを捨てます。ext4 か xfs のファイルでは、DAX のファイルがないので、
+  どの種類でも `MAP_SYNC` はほかの確認のあとで `EOPNOTSUPP` です
+  （`daxdev_mapping_supported`）。`MAP_DROPPABLE` のメモリは、`VM_DROPPABLE`
   （`VmFlags: dp`）、`VM_NORESERVE`、`VM_WIPEONFORK`、`VM_DONTDUMP` を持つプライベートな
   匿名メモリです。`fork` した子はページのない状態で受け取り、コアには何も入らず、
   これは変えられません（`MADV_KEEPONFORK` と `MADV_DODUMP` は `EINVAL`）。`MAP_LOCKED`、
-  `MAP_GROWSDOWN`、`MAP_HUGETLB` とは使えず（`EINVAL`）、`mlock` と `munlock` はそのままに
-  し（`mlockall` の `MCL_FUTURE` でロックされたものはロックされたままです）、
+  `MAP_GROWSDOWN`、`MAP_HUGETLB` とは使えず（`EINVAL`）、`mlock` も `mlockall` の
+  `MCL_FUTURE` もロックしません（Linux master の `vma_supports_mlock` と同じです。v7.0 の
+  ソースならロックするところで、CI のランナーのカーネルは master に従います）。
   `MADV_MERGEABLE` は素通りし、`userfaultfd` は登録しません（`EINVAL`）。Linux はメモリが
   足りないときにそのページを捨てますが、エミュレーターにはそういうときがないので残ります。
 

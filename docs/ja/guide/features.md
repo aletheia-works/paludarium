@@ -5724,9 +5724,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `TCP_CORK`（ホストには伝えません）、`TCP_KEEPIDLE`、`TCP_KEEPINTVL`、
     `TCP_KEEPCNT`、`TCP_QUICKACK`、`TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、
     `IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
-    2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決めます
-    （`rt_tos2priority`）。TCP では ECN のビットを除きます。`int` の代わりに 1 バイトでも設定できます
-    （`do_ip_setsockopt`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
+    2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決め
+    （`rt_tos2priority`）、`int` の代わりに 1 バイトでも設定できます（`do_ip_setsockopt`）。
+    ECN の 2 ビットは、データグラムのソケットでは渡された値になり、TCP では自分のものを
+    保ちます（`__ip_sock_set_tos`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
     設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
     （閉じているか待ち受けている間は `EINVAL`）。`SO_BINDTODEVICE` はデバイスの名前を
     15 バイトまで取り（ないデバイスは `ENODEV`）、なしか空の名前ならデバイスなしです。

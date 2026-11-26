@@ -6319,10 +6319,14 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     socket.joins(&options, &socket.lock());
                 }
                 // A new type of service sets the priority too
-                // (`__ip_sock_set_tos`, `rt_tos2priority`), of TCP without
-                // its two bits of ECN.
+                // (`__ip_sock_set_tos`, `rt_tos2priority`); TCP keeps its own
+                // two bits of ECN.
                 (0, 1) => {
-                    let value = if tcp { value & !3 } else { value };
+                    let value = if tcp {
+                        (value & !3) | (options.type_of_service & 3)
+                    } else {
+                        value
+                    };
                     if options.type_of_service != value {
                         options.type_of_service = value & 0xff;
                         options.priority = tos_priority(value);

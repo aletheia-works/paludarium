@@ -592,7 +592,10 @@ verified.
   socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
-  one are not there yet (`EINVAL`). A send or a receive with
+  one are not there yet (`EINVAL`). A multishot receive whose socket keeps
+  having more goes on at once however many times in a row, where Linux
+  requeues it after 32 (`MULTISHOT_MAX_RETRY`), letting other task work
+  run first. A send or a receive with
   `IORING_RECVSEND_FIXED_BUF` is `EINVAL`, as on Linux 7.0, the kernel the
   differential tests run on; Linux master moves the bytes of a registered
   buffer. This follows master once the test runners' kernel does. A

@@ -86,10 +86,8 @@ pub(super) struct Net {
     limit: Option<u32>,
     /// A multishot request that posted while its socket had nothing more,
     /// as far as it knew, which waits for its socket before it goes on
-    /// (`IOU_RETRY`), and how many times it went on at once
-    /// (`nr_multishot_loops`).
+    /// (`IOU_RETRY`).
     wait: bool,
-    loops: u32,
 }
 
 impl Net {
@@ -112,9 +110,9 @@ impl Net {
 
     /// After a completion posted with `flags`, whether it goes on at once,
     /// as `io_accept` and `io_recv_finish` do while their socket has more
-    /// or does not say (a receive retries `MULTISHOT_MAX_RETRY` times, then
-    /// is requeued, which here goes on at once too); else it waits for its
-    /// socket.
+    /// or does not say; else it waits for its socket. Linux requeues a
+    /// receive after `MULTISHOT_MAX_RETRY` tries in a row, which gives
+    /// other task work a turn; here it goes on.
     pub(super) fn posted(&mut self, flags: u32) {
         let Some(file) = self.found.as_ref().map(|found| Arc::clone(&found.file)) else {
             return;
@@ -124,19 +122,9 @@ impl Net {
             Op::Accept { .. } => crate::inet::of(&file).is_none(),
             _ => crate::sockets::inq_hint(&file).is_none(),
         };
-        let again = flags & CQE_F_SOCK_NONEMPTY != 0 || unknown;
-        if again && !matches!(self.op, Op::Accept { .. }) {
-            self.loops += 1;
-            if self.loops > MULTISHOT_MAX_RETRY {
-                self.loops = 0;
-            }
-        }
-        self.wait = !again;
+        self.wait = flags & CQE_F_SOCK_NONEMPTY == 0 && !unknown;
     }
 }
-
-/// `MULTISHOT_MAX_RETRY`.
-const MULTISHOT_MAX_RETRY: u32 = 32;
 
 enum Op {
     /// `how`, as `shutdown` takes it.
@@ -331,7 +319,6 @@ pub(super) fn prepare(opcode: u8, sqe_flags: u8, sqe: &[u8]) -> Result<Work, Err
         multishot,
         limit,
         wait: false,
-        loops: 0,
     })))
 }
 

@@ -4668,7 +4668,7 @@ mod shm {
             }
         }
         for path in [
-            &b"/proc/net/tcp"[..],
+            &b"/proc/net/snmp"[..],
             b"/proc/net/dev",
             b"/proc/self/net/unix",
         ] {
@@ -4678,7 +4678,9 @@ mod shm {
         for directory in ["net", "self/net", "thread-self/net"] {
             let dev = read_proc(&mut k, &mut t, &m, &format!("/proc/{directory}/dev"));
             assert!(dev.starts_with("Inter-|   Receive"), "{dev}");
-            for name in ["tcp", "unix", "stat/arp_cache"] {
+            let unix = read_proc(&mut k, &mut t, &m, &format!("/proc/{directory}/unix"));
+            assert!(unix.starts_with("Num       RefCount"), "{unix}");
+            for name in ["snmp", "udplite", "stat/arp_cache"] {
                 m.write(
                     GuestAddr(PATH),
                     format!("/proc/{directory}/{name}\0").as_bytes(),
@@ -4719,7 +4721,26 @@ mod shm {
         }
         assert_eq!(
             names,
-            [".", "..", "arp", "dev", "route", "if_inet6", "ipv6_route"]
+            [
+                ".",
+                "..",
+                "arp",
+                "dev",
+                "raw",
+                "tcp",
+                "udp",
+                "icmp",
+                "raw6",
+                "tcp6",
+                "udp6",
+                "unix",
+                "icmp6",
+                "route",
+                "packet",
+                "netlink",
+                "if_inet6",
+                "ipv6_route"
+            ]
         );
     }
 

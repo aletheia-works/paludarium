@@ -851,7 +851,7 @@ pub(crate) fn dispatch(
         288 if a[3] as u32 & !(NONBLOCK | CLOEXEC) != 0 => Err(Errno::EINVAL),
         // accept, listen, shutdown, getsockname and getpeername, which
         // MCTP has not (`sock_no_*`).
-        43 | 288 | 50 | 48 | 51 | 52 => Err(EOPNOTSUPP),
+        50 | 48 | 51 | 52 => Err(EOPNOTSUPP),
         54 => set_option(c, socket, a),
         55 => get_option(c, socket, a),
         44 => {

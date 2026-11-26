@@ -123,10 +123,15 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route` and
-  `route` alone; `tcp`, `udp`, `unix`, `igmp`, `snmp`, `sockstat` and the rest
-  are `ENOENT`, and no counter is kept, so those of `dev` are 0. A session
-  with no network has files of no device.
+- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route`,
+  `route` and those of the sockets (see [features](./features)) alone; `igmp`,
+  `snmp`, `sockstat` and the rest are `ENOENT`, and no counter is kept, so
+  those of `dev` are 0. A session with no network has files of no device and
+  no Internet socket. Of a socket, its address in the kernel is 0, its
+  references are the same for each of a kind, the memory its unsent
+  datagrams and messages take is 0, and so is a TCP connection's `quick` with
+  `pingpong`; no timer shows while it waits for an acknowledgement. `netlink` leaves out
+  the kernel's own sockets, whose port is 0.
 - **`/proc/cpuinfo` of the virtual CPU**: `bogomips` is 0.00 and there is no
   `cpu MHz`, as `CPUID` reports no time stamp counter though `RDTSC` works;
   `initial apicid` is 0 on every CPU, as `CPUID`'s leaf 1 gives no CPU its
@@ -557,8 +562,9 @@ verified.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
   `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`,
   `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
-  `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, and the single-shot socket
-  requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
+  `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, `IORING_OP_TIMEOUT`,
+  `_TIMEOUT_REMOVE`, `_LINK_TIMEOUT`, and the single-shot socket requests
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
   and `_RECV` run; the other operations complete with `EOPNOTSUPP`. Of the
   socket requests, a multishot accept or receive, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
@@ -570,7 +576,10 @@ verified.
   receive with `MSG_WAITALL` whose datagram was cut does not fail its
   link, where Linux's does. An `IORING_OP_SHUTDOWN` runs while
   `io_uring_enter` takes it, where Linux's runs in a worker, so its
-  completion can come before those Linux posts first.
+  completion can come before those Linux posts first. A timeout expires at
+  the checkpoints where its process can run: one due while every thread
+  sleeps in `nanosleep` completes as the sleep ends, where Linux's timer
+  completes it then.
   The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
@@ -1225,10 +1234,14 @@ verified.
   Linux takes the first one's for IPv4, which a host may have changed
   (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
   takes `accept_local`, `send_redirects`, `shared_media` and
-  `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward` and
-  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default`,
+  `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward`,
+  `fib_multipath_hash_seed` and the `forwarding`, `rp_filter`,
+  `accept_dad` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
+  A write of `fib_multipath_hash_seed` is taken whole and leaves the file
+  where it was, as Linux 7.0 to 7.2 do; master takes what it reads and
+  moves the file on (`proc_vec`).
   IPv6's `forwarding` joins no router anycast address, and an end made
   while `default`'s is on is in all three all-routers groups, where
   Linux's is in ff02::2 alone; a

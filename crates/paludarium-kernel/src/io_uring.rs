@@ -3,9 +3,10 @@
 //! `epoll_ctl` calls with), and the file transfers `IORING_OP_READ`,
 //! `_WRITE`, `_READV`, `_WRITEV` and `_FSYNC`, `IORING_OP_FILES_UPDATE`,
 //! `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
-//! `IORING_OP_ASYNC_CANCEL` ([`cancel`]), and the single-shot socket
-//! requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
-//! and `_RECV` ([`net`]). The others answer
+//! `IORING_OP_ASYNC_CANCEL` ([`cancel`]), the timeouts `IORING_OP_TIMEOUT`,
+//! `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT` ([`timeout`]), and the single-shot
+//! socket requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`,
+//! `_SEND` and `_RECV` ([`net`]). The others answer
 //! `EOPNOTSUPP`, as on a Linux built without them, and
 //! `IORING_REGISTER_PROBE` says so. `IORING_REGISTER_BUFFERS` registers
 //! the buffers `IORING_OP_READ_FIXED` and `_WRITE_FIXED` transfer with,
@@ -45,6 +46,7 @@ use paludarium_types::{Errno, GuestAddr};
 use crate::syscalls::{Context, Outcome, err, ok};
 
 mod net;
+mod timeout;
 
 /// The most submission queue entries, and completion queue entries.
 const MAX_ENTRIES: u32 = 32768;
@@ -131,7 +133,7 @@ const OP_EPOLL_CTL: u8 = 29;
 const OP_PROVIDE_BUFFERS: u8 = 31;
 const OP_REMOVE_BUFFERS: u8 = 32;
 /// The operations implemented.
-const OPS: [u8; 19] = [
+const OPS: [u8; 22] = [
     OP_NOP,
     OP_READV,
     OP_WRITEV,
@@ -151,6 +153,9 @@ const OPS: [u8; 19] = [
     net::OP_RECV,
     net::OP_SHUTDOWN,
     net::OP_SOCKET,
+    timeout::OP_TIMEOUT,
+    timeout::OP_TIMEOUT_REMOVE,
+    timeout::OP_LINK_TIMEOUT,
 ];
 /// `IORING_OP_LAST` of Linux 6.12, after `IORING_OP_LISTEN`.
 const OP_LAST: u8 = 58;
@@ -333,6 +338,8 @@ pub(crate) struct Ring {
     /// (`ctx->cancel_table`), and the bits of its hash.
     cancels: Mutex<Cancels>,
     hash_bits: u32,
+    /// The timeouts that wait.
+    timeouts: Mutex<timeout::Timeouts>,
     /// The readiness hub of the thread that made it, which a completion
     /// tells (`io_poll_wq_wake`), and how many times one went in: its
     /// descriptor's input generation for `poll` and `epoll`.
@@ -393,6 +400,8 @@ pub(crate) struct Polls {
     /// Every ring, which a thread's `execve` or exit looks through for its
     /// requests (`tctx->xa`).
     rings: Mutex<Vec<std::sync::Weak<dyn FileHandle>>>,
+    /// A ring may have a timer armed ([`timeout`]).
+    timers: std::sync::atomic::AtomicBool,
 }
 
 /// A request that waits for its file (`struct async_poll`): the ring, the
@@ -416,13 +425,15 @@ struct Armed {
 
 /// Task work: what is left of a request, or of its link, until it runs.
 enum Deferred {
-    /// `io_req_task_complete`: an `IORING_NOP_TW` that ran, its completion,
-    /// the registered files it holds, and the rest of its link.
+    /// `io_req_task_complete`: an `IORING_NOP_TW` that ran, or a timeout
+    /// that did not expire, its completion, the registered files it holds,
+    /// the rest of its link, and whether it failed.
     Complete {
         done: Done,
         held: Vec<Arc<Node>>,
         rest: Vec<Request>,
         flags: u8,
+        failed: bool,
     },
     /// `io_req_task_submit`: a link's next request runs, and the rest wait
     /// for it; or a request whose file became ready runs again
@@ -441,6 +452,11 @@ enum Deferred {
     /// each with the error it failed to prepare with or `ECANCELED`, and
     /// none posts with `REQ_F_SKIP_LINK_CQES`.
     Fail { chain: Vec<Request>, skip: bool },
+    /// `io_timeout_complete`: a timeout that expired, and its link.
+    Timeout(Vec<Request>),
+    /// `io_req_task_link_timeout`: a linked timeout that expired, and the
+    /// `user_data` of the request it is for.
+    LinkTimeout { request: Request, head: u64 },
 }
 
 /// The requests of a ring that wait for their files (`ctx->cancel_table`),
@@ -488,7 +504,10 @@ struct Done {
     res: i32,
     flags: u32,
     post: bool,
-    next: Option<Box<Deferred>>,
+    /// Its linked timeout ([`Request::ltimeout`]), which is over with it
+    /// (`io_disarm_next`).
+    ltimeout: Option<u64>,
+    next: Vec<Deferred>,
 }
 
 /// A buffer group (`struct io_buffer_list`): the buffers
@@ -789,6 +808,8 @@ struct Request {
     flags: u8,
     /// What it fails with if its preparation failed.
     failed: Option<Errno>,
+    /// The timeout linked to it, once it was issued (`REQ_F_LINK_TIMEOUT`).
+    ltimeout: Option<u64>,
     work: Work,
 }
 
@@ -811,6 +832,10 @@ enum Work {
     Transfer(Box<Transfer>),
     /// A socket request ([`net`]).
     Net(Box<net::Net>),
+    /// `IORING_OP_TIMEOUT` and `_LINK_TIMEOUT` ([`timeout`]).
+    Timeout(Box<timeout::Timeout>),
+    /// `IORING_OP_TIMEOUT_REMOVE`.
+    TimeoutRemove(Box<timeout::Remove>),
     /// `IORING_OP_ASYNC_CANCEL`: what it looks for, and whether its `fd` is
     /// a registered one (`IOSQE_FIXED_FILE`).
     Cancel {
@@ -996,10 +1021,11 @@ impl Ring {
                 self.post(&mut state, done.user_data, done.res, done.flags);
             }
         }
-        let next = done
-            .into_iter()
-            .filter_map(|done| done.next.map(|next| *next))
-            .collect();
+        let mut next = Vec::new();
+        for done in done {
+            next.extend(done.ltimeout.and_then(|id| timeout::disarm(self, id)));
+            next.extend(done.next);
+        }
         for node in std::mem::take(&mut state.held) {
             if let Some(at) = state.retired.iter().position(|r| Arc::ptr_eq(r, &node))
                 && Arc::strong_count(&node) == 2
@@ -1029,6 +1055,17 @@ impl Ring {
         if !self.flush(state) {
             self.posted();
         }
+    }
+
+    /// Posts a completion a request still goes on after
+    /// (`io_req_post_cqe`), unless the queue is full.
+    fn post_aux(&self, user_data: u64, res: i32, flags: u32) -> bool {
+        let mut state = self.state();
+        if !state.overflow.is_empty() || self.completions() >= self.cq_entries {
+            return false;
+        }
+        self.post(&mut state, user_data, res, flags);
+        true
     }
 
     /// Tells those that poll the ring's descriptor of a completion
@@ -1088,6 +1125,7 @@ impl Ring {
             opcode,
             flags,
             failed: None,
+            ltimeout: None,
             work: Work::None,
         };
         let fail = |mut request: Request, e: Errno| {
@@ -1248,6 +1286,12 @@ impl Ring {
                 Ok(work) => work,
                 Err(e) => return fail(request, e),
             },
+            timeout::OP_TIMEOUT | timeout::OP_TIMEOUT_REMOVE | timeout::OP_LINK_TIMEOUT => {
+                match timeout::prepare(opcode, fixed, sqe) {
+                    Ok(work) => work,
+                    Err(e) => return fail(request, e),
+                }
+            }
             _ => return fail(request, EOPNOTSUPP),
         };
         request
@@ -1311,7 +1355,7 @@ fn prepare_buffers(provide: bool, sqe: &[u8]) -> Result<Work, Errno> {
 /// event of an `IORING_OP_EPOLL_CTL` that has one (`EFAULT`), and a
 /// transfer's priority, attributes and buffers ([`prepare_transfer`]). Its
 /// error fails the request.
-fn prepare_memory(c: &Context<'_>, request: &mut Request, addr: u64) {
+fn prepare_memory(c: &Context<'_>, ring: &Ring, request: &mut Request, addr: u64) {
     let result = match &mut request.work {
         Work::EpollCtl { op, event, .. } if *op != 2 => {
             let mut bytes = [0; 12];
@@ -1322,6 +1366,8 @@ fn prepare_memory(c: &Context<'_>, request: &mut Request, addr: u64) {
         }
         Work::Transfer(transfer) => prepare_transfer(c, transfer),
         Work::Net(net) => net::prepare_memory(c, net),
+        Work::Timeout(timeout) => timeout::prepare_memory(c, ring, timeout),
+        Work::TimeoutRemove(remove) => timeout::prepare_update(c, remove),
         _ => Ok(()),
     };
     if let Err(e) = result {
@@ -1764,6 +1810,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
         } else {
             update_files(c, ring, offset, addr, count, 0)
         }),
+        Work::TimeoutRemove(remove) => result(timeout::remove(c, ring, remove)),
         &Work::Buffers {
             provide,
             count,
@@ -1772,7 +1819,7 @@ fn run(c: &mut Context<'_>, ring: &Ring, work: &mut Work) -> (i32, u32, bool, Op
             bgid,
             bid,
         } => result(manage_buffers(ring, provide, count, addr, len, bgid, bid)),
-        Work::Transfer(_) | Work::Net(_) | Work::Nop { .. } | Work::None => 0,
+        Work::Transfer(_) | Work::Net(_) | Work::Timeout(_) | Work::Nop { .. } | Work::None => 0,
     };
     (res, 0, res < 0, None)
 }
@@ -1837,16 +1884,33 @@ fn complete(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, mut ch
     if chain.iter().any(|r| r.failed.is_some()) {
         let head = chain.remove(0);
         let skip = head.flags & IOSQE_CQE_SKIP_SUCCESS != 0;
+        let mut next = Vec::new();
+        // Its linked timeout is over with it (`REQ_F_ARM_LTIMEOUT`).
+        if has_link_timeout(&chain) {
+            next.push(timeout::canceled(chain.remove(0)));
+        }
+        if !chain.is_empty() {
+            next.push(Deferred::Fail { chain, skip });
+        }
         ring.complete(Done {
             user_data: head.user_data,
             res: -head.failed.unwrap_or(ECANCELED).0,
             flags: 0,
             post: true,
-            next: (!chain.is_empty()).then(|| Box::new(Deferred::Fail { chain, skip })),
+            ltimeout: None,
+            next,
         });
         return;
     }
     issue_link(c, file, ring, chain, Vec::new());
+}
+
+/// Whether the request before `chain` in its link has a linked timeout
+/// (`REQ_F_ARM_LTIMEOUT`).
+fn has_link_timeout(chain: &[Request]) -> bool {
+    chain
+        .first()
+        .is_some_and(|r| r.opcode == timeout::OP_LINK_TIMEOUT && r.failed.is_none())
 }
 
 /// Runs the first request of a link (`io_issue_sqe`): its completion goes
@@ -1868,6 +1932,16 @@ fn issue_link(
         mark
     };
     let mut request = chain.remove(0);
+    // Its linked timeout starts as it is issued (`__io_prep_linked_timeout`).
+    if has_link_timeout(&chain) {
+        let link = chain.remove(0);
+        request.ltimeout = timeout::arm_link(c, ring, link, request.user_data);
+    }
+    if matches!(request.work, Work::Timeout(_)) {
+        chain.insert(0, request);
+        timeout::arm(c, ring, chain);
+        return;
+    }
     let (res, flags, failed, waits) = run(c, ring, &mut request.work);
     let split_held = || {
         let mut state = ring.state();
@@ -1896,7 +1970,8 @@ fn issue_link(
         res,
         flags,
         post: true,
-        next: None,
+        ltimeout: request.ltimeout,
+        next: Vec::new(),
     };
     if matches!(request.work, Work::Nop { tw: true, .. }) {
         let held = split_held();
@@ -1909,6 +1984,7 @@ fn issue_link(
                 held,
                 rest: chain,
                 flags: request.flags,
+                failed,
             },
         );
         return;
@@ -1969,7 +2045,10 @@ fn ready(file: &Arc<dyn FileHandle>, mask: u32) -> bool {
 /// task work of the thread that submitted it (`io_poll_wake` queuing
 /// `io_poll_task_func`), which wakes that thread's wait as a signal would
 /// ([`crate::SignalInbox::notify_signal`]).
-pub(crate) fn complete_ready(polls: &Polls) {
+///
+/// The timeouts that are due expire first.
+pub(crate) fn complete_ready(polls: &Polls, host: &dyn paludarium_host::Host) {
+    timeout::expire(polls, host);
     wake(polls);
     run_fallback(polls);
 }
@@ -2067,7 +2146,12 @@ fn wake(polls: &Polls) {
 
 /// [`complete_ready`] as a call waits.
 pub(crate) fn progress(c: &Context<'_>) {
-    complete_ready(&c.processes.io_uring);
+    complete_ready(&c.processes.io_uring, c.host);
+}
+
+/// When the next timeout expires, which ends a call's wait to run it.
+pub(crate) fn next_deadline(c: &Context<'_>) -> Option<u64> {
+    timeout::next_deadline(&c.processes.io_uring, c.host)
 }
 
 /// Cancels the requests the thread `inbox` belongs to submitted that wait
@@ -2165,6 +2249,7 @@ pub(crate) fn cancel_all_task(c: &mut Context<'_>) {
     };
     run_own(c);
     cancel_task(&c.processes.io_uring, c.inbox);
+    timeout::kill(&c.processes.io_uring, c.inbox);
     if task_work_due(c.inbox) {
         run_task_work(c);
     }
@@ -2224,12 +2309,16 @@ fn run_terminated(ring: &Ring, work: Deferred) {
                     held,
                     rest,
                     flags,
+                    failed,
                 } => {
                     ring.state().held.extend(held);
-                    let failed = done.res < 0;
                     ring.complete(finish(done, flags, failed, rest));
                 }
                 Deferred::Fail { chain, skip } => fail_rest(ring, chain, skip),
+                Deferred::Timeout(chain) => timeout::complete_expired(ring, chain),
+                Deferred::LinkTimeout { request, head } => {
+                    timeout::run_link(None, ring, &request, head);
+                }
             }
         }
         pending = ring.end();
@@ -2256,7 +2345,8 @@ fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
         res,
         flags,
         post: true,
-        next: None,
+        ltimeout: request.ltimeout,
+        next: Vec::new(),
     };
     ring.complete(finish(done, request.flags, true, chain));
 }
@@ -2269,7 +2359,8 @@ fn fail_rest(ring: &Ring, chain: Vec<Request>, skip: bool) {
             res: -request.failed.unwrap_or(ECANCELED).0,
             flags: 0,
             post: !skip,
-            next: None,
+            ltimeout: None,
+            next: Vec::new(),
         });
     }
 }
@@ -2349,8 +2440,8 @@ fn cancel_matches(hashed: &mut Hashed, key: &CancelKey, file: Option<usize>, seq
 
 /// Linux's `__io_async_cancel`, which `IORING_OP_ASYNC_CANCEL` and
 /// `IORING_REGISTER_SYNC_CANCEL` run: the requests of the ring that wait
-/// for their files are the only ones it can find (no request runs in a
-/// worker or waits for a timeout, which it would look for first and last).
+/// for their files, then the timeouts, are the ones it can find (no request
+/// runs in a worker, which it would look for first).
 /// With `IORING_ASYNC_CANCEL_ALL` or `_ANY` it cancels every one that
 /// matches and gives how many, else the first, giving 0, or `ENOENT` for
 /// none.
@@ -2367,13 +2458,27 @@ fn cancel(
         cancels.seq
     };
     if !all {
-        return cancel_polls(c, ring, key, file, seq).map(|_| 0);
+        return try_cancel(c, ring, key, file, seq).map(|_| 0);
     }
     let mut count = 0;
-    while let Ok(found) = cancel_polls(c, ring, key, file, seq) {
+    while let Ok(found) = try_cancel(c, ring, key, file, seq) {
         count += found.max(1);
     }
     Ok(count)
+}
+
+/// `io_try_cancel`: a request that waits for its file, else a timeout.
+fn try_cancel(
+    c: &Context<'_>,
+    ring: &Ring,
+    key: &CancelKey,
+    file: Option<usize>,
+    seq: u32,
+) -> Result<u64, Errno> {
+    match cancel_polls(c, ring, key, file, seq) {
+        Err(Errno::ENOENT) => timeout::cancel_one(c, ring, key, seq),
+        result => result,
+    }
 }
 
 /// Linux's `io_poll_cancel`: marks the requests that match `key` cancelled,
@@ -2505,13 +2610,14 @@ fn sync_cancel(c: &mut Context<'_>, ring: &Ring, arg: u64) -> Result<u64, Errno>
 fn finish(mut done: Done, flags: u8, failed: bool, rest: Vec<Request>) -> Done {
     let skip = flags & IOSQE_CQE_SKIP_SUCCESS != 0;
     done.post = failed || !skip;
-    done.next = if rest.is_empty() {
-        None
-    } else if failed && flags & IOSQE_IO_HARDLINK == 0 {
-        Some(Box::new(Deferred::Fail { chain: rest, skip }))
+    if rest.is_empty() {
+        return done;
+    }
+    done.next.push(if failed && flags & IOSQE_IO_HARDLINK == 0 {
+        Deferred::Fail { chain: rest, skip }
     } else {
-        Some(Box::new(Deferred::Submit(rest, Vec::new())))
-    };
+        Deferred::Submit(rest, Vec::new())
+    });
     done
 }
 
@@ -2523,9 +2629,9 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
             held,
             rest,
             flags,
+            failed,
         } => {
             ring.state().held.extend(held);
-            let failed = done.res < 0;
             ring.complete(finish(done, flags, failed, rest));
         }
         Deferred::Submit(chain, held) => {
@@ -2540,6 +2646,10 @@ fn run_deferred(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wo
             }
         }
         Deferred::Fail { chain, skip } => fail_rest(ring, chain, skip),
+        Deferred::Timeout(chain) => timeout::run_expired(c, file, ring, chain),
+        Deferred::LinkTimeout { request, head } => {
+            timeout::run_link(Some(c), ring, &request, head);
+        }
     }
 }
 
@@ -2604,7 +2714,9 @@ fn add_work(
 /// Ends a ring's batch and adds the task work its requests' links go on
 /// with.
 fn flush_batch(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring) {
-    for work in ring.end() {
+    let next = ring.end();
+    timeout::flush(&c.processes.io_uring, file, ring, Some(c.inbox));
+    for work in next {
         queue(c, file, ring, work);
     }
 }
@@ -2772,7 +2884,17 @@ fn submit(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wanted: 
         ring.sqes.load(u64::from(index) * SQE_BYTES, &mut sqe);
         let mut request = ring.prepare(&mut ring.state(), &sqe);
         if request.failed.is_none() {
-            prepare_memory(c, &mut request, u64_at(&sqe, 16));
+            prepare_memory(c, ring, &mut request, u64_at(&sqe, 16));
+        }
+        // A linked timeout is for the request before it in a link, and no
+        // other linked timeout (`io_link_timeout_prep`).
+        if request.failed.is_none()
+            && request.opcode == timeout::OP_LINK_TIMEOUT
+            && chain
+                .last()
+                .is_none_or(|last| last.opcode == timeout::OP_LINK_TIMEOUT)
+        {
+            request.failed = Some(Errno::EINVAL);
         }
         let failed = request.failed.is_some();
         let linked = request.flags & LINK_FLAGS != 0;
@@ -3028,6 +3150,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         buffer_lists: Mutex::default(),
         local: Mutex::default(),
         cancels: Mutex::default(),
+        timeouts: Mutex::default(),
         // `io_ring_ctx_alloc`: `ilog2(cq_entries) - 5`, from 1 to 8.
         hash_bits: cq_entries.ilog2().saturating_sub(5).clamp(1, 8),
         hub: Arc::clone(&c.files.readiness),
@@ -3173,9 +3296,9 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// Linux's `io_cqring_wait`: it runs the ring's own task work and the
 /// thread's, then is done once the program has `min` completions to
 /// consume, else it waits, with the signal mask it was given, for a signal
-/// (`EINTR`) or the timeout (`ETIME`), running task work that comes.
-/// Completions in the queue by then make it succeed whatever ended the
-/// wait.
+/// (`EINTR`) or the timeout (`ETIME`), running task work that comes. An
+/// `IORING_OP_TIMEOUT` done as it waits ends it too. Completions in the
+/// queue by then make it succeed whatever ended the wait.
 fn wait(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -3221,6 +3344,9 @@ fn wait(
     // How many more it waits for (`nr_wait`), as much task work as its
     // ring's own runs at a time while it waits.
     let wanted = min - ring.completions();
+    let timeouts = timeout::done(ring);
+    let started = ring.load_u32(CQ_TAIL);
+    let mut ran = false;
     let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
     let deadline = if ts == 0 {
         None
@@ -3254,16 +3380,22 @@ fn wait(
     }
     let result = loop {
         let ticket = c.files.readiness.token.value();
-        if ring.completions() >= min {
-            break Ok(());
-        }
         if local_pending(ring) {
             run_local(c, file, ring, wanted, wanted);
+            ran = true;
             continue;
         }
         if task_work_due(c.inbox) {
             run_task_work(c);
+            ran = true;
             continue;
+        }
+        // `io_should_wake`. A timeout of another thread's counts once that
+        // thread posts its completion, which is what wakes Linux's wait.
+        if ring.completions() >= min
+            || (timeout::done(ring) != timeouts && (ran || ring.load_u32(CQ_TAIL) != started))
+        {
+            break Ok(());
         }
         if deadline.is_some_and(|end| {
             c.host
@@ -3318,6 +3450,18 @@ fn register(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if ring.submitter.is_some_and(|tid| tid != c.tid) {
         return Err(EEXIST);
     }
+    let done = run_registration(c, ring, opcode, a);
+    // A tag it posted counts for the timeouts (`io_post_aux_cqe`).
+    timeout::flush(&c.processes.io_uring, &file, ring, Some(c.inbox));
+    done
+}
+
+fn run_registration(
+    c: &mut Context<'_>,
+    ring: &Ring,
+    opcode: u64,
+    a: [u64; 6],
+) -> Result<u64, Errno> {
     match opcode {
         REGISTER_PROBE => probe(c, a),
         REGISTER_BUFFERS if a[2] == 0 => Err(Errno::EFAULT),

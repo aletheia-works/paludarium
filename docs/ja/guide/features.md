@@ -1146,6 +1146,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFDIO_WAKE` がその範囲を取ったとき、`UFFDIO_UNREGISTER` がないページについて
   登録した範囲からそれを取ったとき、ファイルが閉じられたとき、シグナルが来たときに
   終わり、命令は、Linux がフォールトをやり直すのと同じくもう一度動きます。
+  先に受け取るシグナルがなければ、このやり直しは、ページを取り込んだかどうかに関わらず
+  スレッド自身のコードのマイナーフォールト（`ru_minflt`、`page-faults`、`minor-faults`）
+  として数えます。最初の試みは VMA のロックの下で動き、そのやり直しは
+  `FAULT_FLAG_TRIED` にならないからです。
   `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。
   `UFFDIO_WRITEPROTECT` は、`mwriteprotect_range` と同じく VMA ごとに、範囲のページを
   保護するか保護を解きます。どの VMA も書き込み保護について登録したものでなければ
@@ -1613,7 +1617,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
-  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、それにソケットの要求
+  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
+  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
@@ -1739,6 +1744,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   差分テストのカーネルにある Linux 6.14 のもので、保護情報だけです。保護情報を受け付ける
   ファイルはないので `EINVAL` になります。`IORING_OP_FSYNC` が受け付けるフラグは
   `IORING_FSYNC_DATASYNC` だけです。
+
+- タイムアウトは Linux master のもの（`io_uring/timeout.c`）です。`IORING_OP_TIMEOUT` は
+  モノトニック、ブート時間、実時間のいずれかの時計で、相対か `IORING_TIMEOUT_ABS` の時刻を待ち、
+  `ETIME` で完了します。`IORING_TIMEOUT_ETIME_SUCCESS` がなければ、そのリンクは失敗します。
+  `off` に数があれば、ほかの完了がその数だけ投稿されたときに 0 で完了します。期限が来たタイム
+  アウトや取り除いたタイムアウトの完了は数えません。`IORING_TIMEOUT_MULTISHOT` では、期限が
+  来るたびに `IORING_CQE_F_MORE` 付きの完了を、合わせて `off` 回まで投稿します。
+  `IORING_OP_TIMEOUT_REMOVE` は `user_data` のタイムアウトを取り消すか（`ECANCELED`、なければ
+  `ENOENT`）、`IORING_TIMEOUT_UPDATE` ではそれに、`IORING_LINK_TIMEOUT_UPDATE` も付けばリンクした
+  ものに、新しい時刻を与えます。`IORING_OP_LINK_TIMEOUT` はリンクの中で要求のあとに置きます。
+  その要求を実行するときに始まり、期限が来ると要求を `user_data` で取り消して `ETIME` で完了し、
+  要求が先に終われば `ECANCELED` で完了して、リンクの残りはそれ抜きで続きます。エントリーは Linux と
+  同じく調べ（`EINVAL`）、時刻はエントリーを取るときに読むか（`EFAULT`、負なら `EINVAL`）、
+  `IORING_TIMEOUT_IMMEDIATE_ARG` ではエントリーの中にあります。取り消しは、ファイルを待つ要求の
+  あとにタイムアウトを探しますが、ファイルでは見つけず、リンクしたものも見つけません。`execve` と
+  プロセス全体の終了は、そのスレッドのものを取り消します。
 
 - ソケットの要求は Linux 7.0 の単発のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
   `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。どれも Linux と同じく準備し、
@@ -2593,8 +2614,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `RTA_MULTIPATH` のある削除はそのホップを順に一つずつ比べます（`fib_nh_match`）。
     引き当ては、送り元と宛先のハッシュが落ちるホップを取ります。生きているホップは
     それぞれ重みに応じてハッシュを分け合い（`fib_select_multipath`、`fib_rebalance`）、
-    名前空間ごとの乱数の鍵で、`fib_multipath_hash_policy` 0 と同じくその二つをハッシュ
-    します。デバイス自身の送り元が引き当ての送り元であるホップは、ハッシュより先に
+    `fib_multipath_hash_policy` 0 と同じくその二つをハッシュします
+    （`fib_multipath_hash_from_keys`）。種は、どの名前空間でも同じマシンの乱数か
+    `net.ipv4.fib_multipath_hash_seed` で、後者ではどのフローのホップも Linux と同じです。デバイス自身の送り元が引き当ての送り元であるホップは、ハッシュより先に
     選ばれます。デバイスを名前で挙げれば、それを通る最初のホップです。bind していない
     ソケットは、送り元なしのハッシュで決まるホップの送り元を使い、接続と UDP の connect は、
     続けてその送り元から経路を引き当てます（`ip_route_connect`）。パケットは、その送り元への
@@ -2680,6 +2702,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     でもグループに入っているものと、`IPV6_MULTICAST_ALL` が入ったものに届きます
     （`inet6_mc_check`）。受け付けた接続の `IPV6_MULTICAST_HOPS` は 64 です
     （`tcp_v6_syn_recv_sock`）。
+  - **送信元フィルター:** グループに入ったソケットは、そのフィルターが通すものを受け取ります。
+    フィルターの送信元からのもの（`MCAST_INCLUDE`）か、ほかのすべてからのもの
+    （`MCAST_EXCLUDE`。入ったときは送信元なしです）です。IPv4 の
+    `IP_ADD_SOURCE_MEMBERSHIP`、`IP_DROP_SOURCE_MEMBERSHIP`、`IP_BLOCK_SOURCE`、
+    `IP_UNBLOCK_SOURCE`、`IP_MSFILTER`（`getsockopt` でも読めます）と、両方のファミリーの
+    `MCAST_JOIN_SOURCE_GROUP`、`MCAST_LEAVE_SOURCE_GROUP`、`MCAST_BLOCK_SOURCE`、
+    `MCAST_UNBLOCK_SOURCE`、`MCAST_MSFILTER` が、これを変えます。`MCAST_JOIN_GROUP` と
+    `MCAST_LEAVE_GROUP` もあります。どれも TCP のソケットでも使えます。送信元のあるフィルターの
+    種類は変わらず（`EINVAL`）、同じ送信元を足すことも、ないものを除くこともできません
+    （`EADDRNOTAVAIL`）。送信元は IPv4 で 10、IPv6 で 64 までです（`ENOBUFS`）。何も通さなくなった
+    `MCAST_INCLUDE` のものは、グループから出ます（`ip_mc_source`、`ip_mc_msfilter`、
+    `ip6_mc_source`、`ip6_mc_msfilter`）。Linux の master と同じく、最後の送信元の除外を
+    やめた IPv6 のフィルターは種類を変えられます（Linux 7.0 は断り、IPv4 は今も断ります）。デバイスは、
+    そこで入っているどれかが通す送信元からのものと、除外するもののどれかが挙げていない
+    送信元からのものを受け取ります（`ip_check_mc_rcu`、`ipv6_chk_mcast_addr`）。
+    受け取らないものは、`IP_MULTICAST_ALL` や `IPV6_MULTICAST_ALL` が入ったソケットにも届かず、
+    送り手自身にも戻りません。
   - **組を通る IPv6:** IPv6 の経路（ユニキャストのもの、またはマルチキャストの
     `ff00::/8`）が端から出る接続とデータグラムは、経路の優先する送り元か、
     `ipv6_dev_get_saddr` が選ぶアドレスから出ます。選ぶのは、グループとリンクローカルの
@@ -2736,8 +2775,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     確かめ、入れたものを一つのメッセージで伝えます。そのあとで一つが失敗すると、入れたものを
     伝えてから、一つずつ伝えて消します。削除はホップを一つずつ消し、最後のエラーを返します。
     引き当ては、フローのハッシュが落ちるホップを取ります。生きているホップはそれぞれ重みに
-    応じてハッシュを分け合い（`fib6_select_path`、`rt6_multipath_rebalance`）、名前空間ごとの
-    乱数の鍵で、`fib_multipath_hash_policy` 0 と同じく送り元、宛先、フローラベル、
+    応じてハッシュを分け合い（`fib6_select_path`、`rt6_multipath_rebalance`）、IPv4 と同じ種で、
+    `fib_multipath_hash_policy` 0 と同じく送り元、宛先、フローラベル、
     プロトコルをハッシュします。ソケットのパケットは、結び付いたアドレス（なければ `::`）
     で、フローラベルなしでハッシュします。何にもバインドしていないソケットの送り元は、
     そうして選んだホップのものです（`ip6_dst_lookup_tail`）。答えは自分の引き当てで選ばれる端を通って返ります。
@@ -2918,7 +2957,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ビットと比べ、答えは合った経路の TOS を返します。マルチキャストアドレスと制限
     ブロードキャストアドレスの IPv4 の答えは、`__mkroute_output` が作るのと同じく、
     マルチキャストかブロードキャストの種類です（`RTCF_MULTICAST` か `RTCF_BROADCAST` で、
-    ブロードキャストアドレスと、デバイスが入っているグループには
+    ブロードキャストアドレスと、デバイスが入っていてその送り元を受け取るグループには
     `RTCF_LOCAL` も付きます）。`RTM_F_FIB_MATCH` で返す表の項目も、その種類になります。
     出力デバイスなしでループバックの送り元を指したとき、および `lo` を通してローカルの
     グループ（224.0.0.0/24）かブロードキャストアドレスへ向かうときは、表を引かずに作ります
@@ -2932,7 +2971,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     入ってきたパケットと同じく経路を引き（`ip_route_input_slow`、
     `ip6_route_input_lookup`）、答えには `RTA_IIF` にそのデバイスを入れます。IPv4 は martian を捨てます（`EINVAL`）。マルチキャスト、限定ブロード
     キャスト、ループバック、0.0.0.0 の送り元、ループバックか 0.0.0.0 の宛先、デバイスが
-    入っていないグループ、名前空間自身のアドレスの送り元です。要求がローカルの経路を
+    入っていないか、そのフィルターが送り元を除くグループ、名前空間自身のアドレスの送り元です。要求がローカルの経路を
     足したあとは、引き当てでユニキャストでない経路が見つかる送り元も捨てます
     （`fib_validate_source`）。ローカル、ブロードキャスト、マルチキャストの宛先には、
     その型のローカルの経路（`RTCF_LOCAL`、`RTCF_BROADCAST`、`RTCF_MULTICAST`）を、
@@ -3872,7 +3911,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
   `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
-  `ipv6/conf/<デバイス>/accept_dad`、`disable_ipv6`、`forwarding` です。ファイルとディレクトリは、
+  `ipv6/conf/<デバイス>/accept_dad`、`disable_ipv6`、`forwarding`、
+  `ipv4/fib_multipath_hash_seed` です。ファイルとディレクトリは、
   ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
   書き込みで開けるのは、root と、その名前空間への `CAP_NET_ADMIN` を持つものです
   （`net_ctl_permissions`。開けなければ `EACCES`、書き込みのときに書けなければ
@@ -3903,6 +3943,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `NETDEV_UP` と同じく `::1` が戻り、IPv6 自身の `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を
     知らせます。入っている間は、`lo` が上がっても IPv6 は何もせず、新しい IPv6 の
     アドレスは `EACCES` です（`addrconf_add_dev`）。
+  - `fib_multipath_hash_seed` は、`proc_douintvec_minmax` と同じく符号なしの `int` を取り
+    （書き込みの残りも一緒に取ります）、0 はマシンの乱数の種です。新しい名前空間では 0 です。
   - リンクの `IFLA_AF_SPEC` の IPv4 と IPv6 の設定にこれらが出ます。IPv6 は
     `disable_ipv6` が切れているときだけ準備ができています。
 
@@ -3989,6 +4031,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     IPv6 のゲートウェイ（`RTA_VIA`）は 00000000 で、その先頭 4 バイトが 0 でなければ `RTF_GATEWAY` です（`fib_flag_trans`）。
     `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
     `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
+  - `tcp`、`tcp6`、`udp`、`udp6` は、`sock_diag` が伝えるソケットで、バインドしただけの TCP の
+    ものを除きます。形式は Linux 7.0 の `tcp4_seq_show` などと同じで、待ち受けるもの、続けて
+    `TIME_WAIT` のものを含む接続の順です。`unix`（`unix_seq_show`）には、まだ受け付けていない
+    接続もあり、`netlink`（`netlink_native_seq_show`）には、バインドしたソケットがあります。
+    所有者は、開いたプロセスのユーザー名前空間での ID です。
+  - `raw`、`raw6`、`icmp`、`icmp6`、`packet` は、ここにない種類のソケットのもので、見出しだけ
+    です。Linux から UDP-Lite がなくなったので、`udplite` はありません。
   - ほかの名前は、`--mount /:/` でも `ENOENT` です。ホストのソケットとデバイスは、ゲストの
     ものではありません。
 
@@ -4319,7 +4368,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `process_vm_writev`（呼び出し元に数えます）、トレーサーの `PTRACE_PEEKDATA` と
   `PTRACE_POKEDATA`（トレーサーに数えます）、コアダンプ（ほかのスレッドが待つあいだに
   ダンプする、シグナルで終わったスレッドに数えます。最後に終了するスレッドがどれかは関係ありません。
-  一度も触れていないプライベートな無名メモリは穴として残し、フォールトしません）です。`RUSAGE_SELF` はプロセスのスレッドの合計、
+  一度も触れていないプライベートな無名メモリは穴として残し、フォールトしません）です。
+  オペランドを読んで書く命令は、x86-64 と同じく書き込みのフォールトを 1 回だけ起こします。`RUSAGE_SELF` はプロセスのスレッドの合計、
   `RUSAGE_THREAD` はそのスレッドのもの、`RUSAGE_CHILDREN` と wait は CPU 時間と同じく
   子のものです。fork した子は 0 から始まり、`execve` は保ちます。`ru_nvcsw` は
   Linux の `nvcsw` と同じく自発的なコンテキストスイッチ、つまりスレッドが眠った回数を、

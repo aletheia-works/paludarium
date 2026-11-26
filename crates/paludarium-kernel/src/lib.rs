@@ -84,6 +84,7 @@ mod mqueue;
 mod mqueue_tests;
 mod msg;
 mod multicast;
+mod multipath;
 mod namespaces;
 mod page_cache;
 mod pagemap_scan;
@@ -1299,7 +1300,17 @@ impl Kernel {
             processes: &self.processes,
         };
         let sigbus = userfaultfd::fault(&mut ctx, context, access) == Some(true);
+        // Unless a signal is to be taken first, the fault is tried again
+        // (`fault_signal_pending`), and counts.
+        let retried = !sigbus && !events::signalled(&ctx);
         self.inbox.drain(&mut thread.state);
+        if retried {
+            mem.retry_own_fault(
+                paludarium_types::GuestAddr(access.address),
+                access.write,
+                access.fetch,
+            );
+        }
         if sigbus {
             signals::queue(
                 &mut thread.state,
@@ -1508,7 +1519,7 @@ impl Kernel {
         aio::complete_ready(&self.processes.aio, &self.files.readiness);
         // So do the io_uring requests that wait for a file this thread's
         // call made ready, as task work of the threads that submitted them.
-        io_uring::complete_ready(&self.processes.io_uring);
+        io_uring::complete_ready(&self.processes.io_uring, &*self.host);
         self.ptrace_traps(thread, &mut restart);
         // io_uring's task work runs on the way back to the program, after
         // the call's ptrace stops and before a signal is taken, as Linux's

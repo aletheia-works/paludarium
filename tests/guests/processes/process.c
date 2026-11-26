@@ -11926,6 +11926,218 @@ static int io_uring_net_case(void) {
     return 0;
 }
 
+/* io_uring's timeouts: IORING_OP_TIMEOUT, _TIMEOUT_REMOVE and
+   _LINK_TIMEOUT. */
+static struct timespec uto_short = {0, 10 * 1000 * 1000}, uto_long = {100, 0};
+
+static unsigned char *uto_timeout(struct uring *u, unsigned char op, unsigned long data,
+                                 struct timespec *ts, unsigned flags, unsigned off) {
+    return unet_push(u, op, data, 0, off, (unsigned long)ts, 1, flags, 0);
+}
+
+static unsigned char *uto_remove(struct uring *u, unsigned long data, unsigned long which,
+                                unsigned flags, struct timespec *ts) {
+    return unet_push(u, 12, data, 0, (unsigned long)ts, which, 0, flags, 0);
+}
+
+static void uto_run(struct uring *u, unsigned submit, unsigned wait, const char *label) {
+    uring_show(label, uring_enter(u->fd, submit, wait, 1, NULL, 0));
+    uring_reap(u, label);
+}
+
+/* A timeout ends a wait for more completions, so wait until they are there. */
+static void uto_all(struct uring *u, unsigned submit, unsigned wait, const char *label) {
+    uring_show(label, uring_enter(u->fd, submit, wait, 1, NULL, 0));
+    while (__atomic_load_n(u32p(u->rings, 12), __ATOMIC_ACQUIRE) - *u32p(u->rings, 8) < wait)
+        if (uring_enter(u->fd, 0, wait, 1, NULL, 0) < 0) break;
+    uring_reap(u, label);
+}
+
+static int io_uring_timeout_case(void) {
+    struct uring u;
+    if (uring_open(&u, 8)) return 80;
+    int p[2];
+    if (pipe(p)) return 81;
+    char buf[8];
+    unsigned char *sqe;
+
+    /* The preparation. */
+    sqe = uto_timeout(&u, 11, 1, &uto_short, 0, 0);
+    sqe[24] = 0;
+    uto_run(&u, 1, 1, "len");
+    sqe = uto_timeout(&u, 11, 1, &uto_short, 0, 0);
+    sqe[2] = 1;
+    uto_run(&u, 1, 1, "ioprio");
+    sqe = uto_timeout(&u, 11, 1, &uto_short, 0, 0);
+    sqe[40] = 1;
+    uto_run(&u, 1, 1, "buf-index");
+    sqe = uto_timeout(&u, 11, 1, &uto_short, 0, 0);
+    sqe[44] = 1;
+    uto_run(&u, 1, 1, "splice");
+    unsigned flags[] = {2, 16, 4 | 8, 1 | 64, 1u << 31};
+    for (unsigned i = 0; i < sizeof flags / sizeof *flags; i++) {
+        uto_timeout(&u, 11, 1, &uto_short, flags[i], 0);
+        uto_run(&u, 1, 1, "flags");
+    }
+    uto_timeout(&u, 11, 1, (struct timespec *)8, 0, 0);
+    uto_run(&u, 1, 1, "time-unmapped");
+    struct timespec negative = {-1, 0}, negative_nanos = {0, -1};
+    uto_timeout(&u, 11, 1, &negative, 0, 0);
+    uto_run(&u, 1, 1, "negative-seconds");
+    uto_timeout(&u, 11, 1, &negative_nanos, 0, 0);
+    uto_run(&u, 1, 1, "negative-nanoseconds");
+    uto_timeout(&u, 15, 1, &uto_short, 0, 1);
+    uto_run(&u, 1, 1, "link-off");
+    uto_timeout(&u, 15, 1, &uto_short, 0, 0);
+    uto_run(&u, 1, 1, "link-alone");
+    sqe = uring_push(&u, 0, 1);
+    sqe[1] = 4;
+    sqe = uto_timeout(&u, 15, 2, &uto_short, 0, 0);
+    sqe[1] = 4;
+    uto_timeout(&u, 15, 3, &uto_short, 0, 0);
+    uto_run(&u, 3, 3, "link-twice");
+    sqe = uto_remove(&u, 1, 9, 0, NULL);
+    sqe[1] = 1;
+    uto_run(&u, 1, 1, "remove-fixed");
+    sqe = uto_remove(&u, 1, 9, 0, NULL);
+    sqe[24] = 1;
+    uto_run(&u, 1, 1, "remove-len");
+    uto_remove(&u, 1, 9, 1, NULL);
+    uto_run(&u, 1, 1, "remove-flags");
+    uto_remove(&u, 1, 9, 2 | 4, &uto_short);
+    uto_run(&u, 1, 1, "update-clock");
+    uto_remove(&u, 1, 9, 2, (struct timespec *)8);
+    uto_run(&u, 1, 1, "update-unmapped");
+    uto_remove(&u, 1, 9, 2, &negative);
+    uto_run(&u, 1, 1, "update-negative");
+    uto_remove(&u, 1, 9, 0, NULL);
+    uto_run(&u, 1, 1, "remove-none");
+    uto_remove(&u, 1, 9, 2, &uto_short);
+    uto_run(&u, 1, 1, "update-none");
+    uto_remove(&u, 1, 9, 2 | 16, &uto_short);
+    uto_run(&u, 1, 1, "update-link-none");
+
+    /* Expiring, which fails the link but with IORING_TIMEOUT_ETIME_SUCCESS. */
+    sqe = uto_timeout(&u, 11, 1, &uto_short, 0, 0);
+    sqe[1] = 4;
+    uring_push(&u, 0, 2);
+    uto_run(&u, 2, 2, "expires");
+    sqe = uto_timeout(&u, 11, 1, &uto_short, 32, 0);
+    sqe[1] = 4;
+    uring_push(&u, 0, 2);
+    uto_run(&u, 2, 2, "expires-success");
+    sqe = uto_timeout(&u, 11, 1, &uto_short, 0, 0);
+    sqe[1] = 1 << 6;
+    uring_push(&u, 0, 2);
+    uto_run(&u, 2, 2, "expires-skip");
+    uto_timeout(&u, 11, 1, &uto_short, 4, 0);
+    uto_run(&u, 1, 1, "boottime");
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    uto_timeout(&u, 11, 1, &now, 1 | 8, 0);
+    uto_run(&u, 1, 1, "realtime-absolute");
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uto_timeout(&u, 11, 1, &now, 1, 0);
+    uto_run(&u, 1, 1, "absolute");
+    /* The earlier first. */
+    struct timespec later = {0, 60 * 1000 * 1000};
+    uto_timeout(&u, 11, 1, &later, 0, 0);
+    uto_timeout(&u, 11, 2, &uto_short, 0, 0);
+    uto_all(&u, 2, 2, "in-order");
+    /* It ends a wait for more completions. */
+    uto_timeout(&u, 11, 1, &uto_long, 0, 0);
+    uto_timeout(&u, 11, 2, &uto_short, 0, 0);
+    uto_run(&u, 2, 2, "ends-wait");
+    uto_remove(&u, 9, 1, 0, NULL);
+    uto_run(&u, 1, 2, "ends-wait-removed");
+
+    /* A number of completions. */
+    uto_timeout(&u, 11, 1, &uto_long, 0, 2);
+    uto_timeout(&u, 11, 2, &uto_long, 0, 1);
+    uring_push(&u, 0, 3);
+    uto_run(&u, 3, 2, "count");
+    uring_push(&u, 0, 3);
+    uto_run(&u, 1, 2, "count");
+    uto_timeout(&u, 11, 1, &uto_short, 0, 2);
+    uring_push(&u, 0, 3);
+    uto_run(&u, 2, 2, "count-expires");
+
+    /* Multishot. */
+    uto_timeout(&u, 11, 1, &uto_short, 64, 3);
+    uto_all(&u, 1, 3, "multishot");
+    uto_timeout(&u, 11, 1, &uto_short, 64, 0);
+    uto_run(&u, 1, 1, "multishot-endless");
+    uto_remove(&u, 2, 1, 0, NULL);
+    uring_enter(u.fd, 1, 2, 1, NULL, 0);
+    /* It may have expired again before it was removed. */
+    unsigned head = *u32p(u.rings, 8), tail = *u32p(u.rings, 12);
+    int removed = 0, canceled = 0;
+    for (; head != tail; head++) {
+        unsigned char *cqe = u.rings + 64 + 16 * (head & (u.cq_entries - 1));
+        int res;
+        memcpy(&res, cqe + 8, 4);
+        removed += cqe[0] == 2 && res == 0;
+        canceled += cqe[0] == 1 && res == -ECANCELED;
+    }
+    *u32p(u.rings, 8) = head;
+    printf("multishot-removed: %d %d\n", removed, canceled);
+
+    /* Removed, updated and cancelled. */
+    uto_timeout(&u, 11, 1, &uto_long, 0, 0);
+    uto_run(&u, 1, 0, "armed");
+    uto_remove(&u, 9, 1, 0, NULL);
+    uto_run(&u, 1, 2, "removed");
+    uto_timeout(&u, 11, 1, &uto_long, 0, 0);
+    uto_run(&u, 1, 0, "armed");
+    uto_remove(&u, 9, 1, 2, &uto_short);
+    uto_run(&u, 1, 2, "updated");
+    uto_timeout(&u, 11, 1, &uto_long, 0, 0);
+    uto_timeout(&u, 11, 1, &uto_long, 0, 0);
+    uto_run(&u, 2, 0, "armed");
+    unet_push(&u, 14, 9, 0, 0, 1, 0, 1, 0);
+    uto_run(&u, 1, 3, "cancelled-all");
+    uto_timeout(&u, 11, 1, &uto_long, 0, 0);
+    uto_run(&u, 1, 0, "armed");
+    unet_push(&u, 14, 9, u.fd, 0, 1, 0, 2 | 16, 0);
+    uto_run(&u, 1, 1, "cancel-by-file");
+    unet_push(&u, 14, 9, 0, 0, 1, 0, 0, 0);
+    uto_run(&u, 1, 2, "cancelled");
+
+    /* A linked timeout: it expires, or the request is done first. */
+    for (int done = 0; done < 2; done++) {
+        sqe = pw_read(&u, 1, p[0], buf, sizeof buf, 0);
+        sqe[1] = 4;
+        sqe = uto_timeout(&u, 15, 2, done ? &uto_long : &uto_short, 0, 0);
+        sqe[1] = 4;
+        uring_push(&u, 0, 3);
+        if (done) {
+            uto_run(&u, 3, 0, "linked-armed");
+            printf("write: %ld\n", (long)write(p[1], "abc", 3));
+            uto_run(&u, 0, 3, "linked-done");
+        } else {
+            uto_run(&u, 3, 3, "linked-expires");
+        }
+    }
+    sqe = uring_push(&u, 0, 1);
+    sqe[1] = 4;
+    uto_timeout(&u, 15, 2, &uto_long, 0, 0);
+    uto_run(&u, 2, 2, "linked-at-once");
+    sqe = uto_timeout(&u, 11, 1, &uto_long, 0, 0);
+    sqe[1] = 4;
+    uto_timeout(&u, 15, 2, &uto_short, 0, 0);
+    uto_run(&u, 2, 2, "linked-timeout");
+    sqe = pw_read(&u, 1, p[0], buf, sizeof buf, 0);
+    sqe[1] = 4;
+    uto_timeout(&u, 15, 2, &uto_long, 0, 0);
+    uto_run(&u, 2, 0, "linked-armed");
+    unet_push(&u, 14, 9, 0, 0, 2, 0, 0, 0);
+    uto_run(&u, 1, 1, "linked-not-cancelled");
+    uto_remove(&u, 9, 2, 2 | 16, &uto_short);
+    uto_run(&u, 1, 3, "linked-updated");
+    close(u.fd);
+    return 0;
+}
+
 /* io_uring's provided buffers: IORING_OP_PROVIDE_BUFFERS and
    _REMOVE_BUFFERS, and the rings of buffers IORING_REGISTER_PBUF_RING
    registers, in the program's memory or in the kernel's pages
@@ -17661,6 +17873,75 @@ static int generated_noexec_case(void) {
     snprintf(link, sizeof link, "/dev/fd/%d", fd);
     printf("links proc agrees=%d dev agrees=%d\n", through == (tmp_noexec ? -EPERM : 0),
            gn_map(link, MAP_PRIVATE, PROT_READ | PROT_EXEC) == (tmp_noexec ? -EPERM : 0));
+    close(fd);
+    unlink(file);
+    return 0;
+}
+
+/* The file-code case: code run from a private mapping of a file's page.
+   While nothing wrote the mapping, it shows the page cache's page, so a
+   pwrite to the file shows in what the code returns; a truncation that
+   leaves the page past the end makes a fetch SIGBUS, and once the file
+   grows again the page shows the file's bytes. A write to the mapping
+   first gives it a copy of its own, which a pwrite no longer changes, but
+   which a truncation drops too (unmap_mapping_range with even_cows).
+   Each run calls the code 5000 times, well past the native JIT's
+   threshold of 300 entries; its four instructions before the ret are
+   ones the WebAssembly JIT translates, which it does for a block of three
+   or more at the first entry. */
+static sigjmp_buf fc_return;
+static volatile int fc_code;
+static volatile uintptr_t fc_addr;
+static void fc_on_bus(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)context;
+    fc_code = info->si_code;
+    fc_addr = (uintptr_t)info->si_addr;
+    siglongjmp(fc_return, 1);
+}
+/* mov eax, value; add rax, 1; sub rax, 1; add rax, 0; ret */
+static int fc_put(int fd, int value) {
+    unsigned char code[18] = {0xb8, value, 0, 0, 0, 0x48, 0x83, 0xc0, 1, 0x48,
+                              0x83, 0xe8, 1, 0x48, 0x83, 0xc0, 0, 0xc3};
+    return pwrite(fd, code, sizeof code, 0) == (ssize_t)sizeof code ? 0 : -1;
+}
+static void fc_run(const char *name, void *at) {
+    int (*volatile code)(void) = (int (*)(void))at;
+    if (sigsetjmp(fc_return, 1)) {
+        printf("%s: sigbus code=%d at=%d\n", name, fc_code, fc_addr == (uintptr_t)at);
+        return;
+    }
+    int value = 0;
+    for (int i = 0; i < 5000; i++) value = code();
+    printf("%s: returned=%d\n", name, value);
+}
+static int file_code_case(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = fc_on_bus;
+    action.sa_flags = SA_SIGINFO | SA_NODEFER;
+    if (sigaction(SIGBUS, &action, NULL)) return 91;
+    char file[] = "/tmp/paludarium-file-code-XXXXXX";
+    int fd = mkstemp(file);
+    if (fd < 0) return 92;
+    if (ftruncate(fd, 4096) || fc_put(fd, 1)) return 93;
+    char *shown = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    char *copied = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    if (shown == MAP_FAILED || copied == MAP_FAILED) return 94;
+    fc_run("shown first", shown);
+    fc_run("copied first", copied);
+    copied[100] = 1;
+    if (fc_put(fd, 2)) return 95;
+    fc_run("shown after pwrite", shown);
+    fc_run("copied after pwrite", copied);
+    if (ftruncate(fd, 0)) return 96;
+    fc_run("shown after truncate", shown);
+    fc_run("copied after truncate", copied);
+    if (ftruncate(fd, 4096) || fc_put(fd, 3)) return 97;
+    fc_run("shown after growing", shown);
+    fc_run("copied after growing", copied);
+    printf("copied byte=%d\n", copied[100]);
+    munmap(shown, 4096);
+    munmap(copied, 4096);
     close(fd);
     unlink(file);
     return 0;
@@ -38440,6 +38721,35 @@ int main(int argc, char **argv) {
         unlink(p.sun_path);
         unix_call("socket-protocol", socket(AF_UNIX, SOCK_STREAM, 2));
         unix_call("socket-type", socket(AF_UNIX, 4, 0));
+        /* accept takes its descriptor first: with none left nothing is
+           accepted, nor is the file found to be no socket
+           (__sys_accept4_file). */
+        int server = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        int client = socket(AF_UNIX, SOCK_STREAM, 0);
+        int datagram = socket(AF_UNIX, SOCK_DGRAM, 0);
+        int ends[2];
+        if (pipe(ends)) return 1;
+        struct sockaddr_un own;
+        socklen_t own_len = sizeof own;
+        struct sockaddr_un family = {.sun_family = AF_UNIX};
+        unix_call("autobind", bind(server, (void *)&family, sizeof family.sun_family));
+        getsockname(server, (void *)&own, &own_len);
+        unix_call("listen", listen(server, 1));
+        unix_call("connect", connect(client, (void *)&own, own_len));
+        struct rlimit limit, none;
+        getrlimit(RLIMIT_NOFILE, &limit);
+        none = (struct rlimit){0, limit.rlim_max};
+        setrlimit(RLIMIT_NOFILE, &none);
+        unix_call("accept-none-left", accept(server, NULL, NULL));
+        unix_call("accept-none-left-datagram", accept(datagram, NULL, NULL));
+        unix_call("accept-none-left-pipe", accept(ends[0], NULL, NULL));
+        unix_call("accept-none-left-flags", accept4(server, NULL, NULL, 1));
+        unix_call("accept-none-left-badf", accept(-1, NULL, NULL));
+        setrlimit(RLIMIT_NOFILE, &limit);
+        unix_call("accept-left", accept(server, NULL, NULL) >= 0 ? 0 : -1);
+        unix_call("accept-none-waits", accept(server, NULL, NULL));
+        unix_call("accept-pipe", accept(ends[0], NULL, NULL));
+        unix_call("accept-datagram", accept(datagram, NULL, NULL));
         return 0;
     }
     if (!strcmp(mode, "unix-path")) {
@@ -42441,6 +42751,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
+    if (!strcmp(mode, "file-code")) return file_code_case();
     if (!strcmp(mode, "dev-shm")) return dev_shm_case();
     if (!strcmp(mode, "tree-namespace")) return tree_namespace_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
@@ -42517,6 +42828,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-buffers2")) return io_uring_buffers2_case();
     if (!strcmp(mode, "io-uring-held-buffer")) return io_uring_held_buffer_case();
     if (!strcmp(mode, "io-uring-net")) return io_uring_net_case();
+    if (!strcmp(mode, "io-uring-timeout")) return io_uring_timeout_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;

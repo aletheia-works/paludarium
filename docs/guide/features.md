@@ -1287,6 +1287,10 @@ kernel.
   `UFFDIO_WAKE` takes its range, `UFFDIO_UNREGISTER` takes it from a range
   registered for missing pages, or the file is closed, and a signal ends
   it too; then the instruction runs again, as Linux retries the fault.
+  Unless a signal is to be taken first, the retry counts as a minor fault
+  of the thread's own code (`ru_minflt`, `page-faults`, `minor-faults`),
+  whether it brings the page in or not: its first try ran under the VMA's
+  lock, whose retry is not `FAULT_FLAG_TRIED`.
   With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
   instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
   their protection, VMA by VMA as `mwriteprotect_range` does: each must be
@@ -1831,8 +1835,10 @@ kernel.
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
   `_FSYNC`, `_READ_FIXED` and `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`,
   `IORING_OP_PROVIDE_BUFFERS` and `_REMOVE_BUFFERS`,
-  `IORING_OP_ASYNC_CANCEL`, and the socket requests `IORING_OP_SHUTDOWN`,
-  `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `IORING_OP_ASYNC_CANCEL`, the timeouts `IORING_OP_TIMEOUT`,
+  `_TIMEOUT_REMOVE` and `_LINK_TIMEOUT`, and the socket requests
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
+  `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
@@ -1986,6 +1992,28 @@ kernel.
   differential tests' kernel has: only protection information, which no
   file here takes (`EINVAL`). `IORING_OP_FSYNC` takes only
   `IORING_FSYNC_DATASYNC`.
+
+- The timeouts are Linux master's (`io_uring/timeout.c`).
+  `IORING_OP_TIMEOUT` waits for its time, relative or
+  `IORING_TIMEOUT_ABS`, on the monotonic, boot-time or realtime clock, and
+  completes with `ETIME`, which fails its link but with
+  `IORING_TIMEOUT_ETIME_SUCCESS`; or, with a count in `off`, completes with
+  0 once that many other completions are posted. Completions of timeouts
+  that expire or are removed are not counted. With
+  `IORING_TIMEOUT_MULTISHOT` it posts a completion with
+  `IORING_CQE_F_MORE` each time, up to `off` times in all.
+  `IORING_OP_TIMEOUT_REMOVE` cancels the timeout of a `user_data`
+  (`ECANCELED`, `ENOENT` for none), or with `IORING_TIMEOUT_UPDATE` gives
+  it, or with `IORING_LINK_TIMEOUT_UPDATE` a linked one, a new time.
+  `IORING_OP_LINK_TIMEOUT` follows a request in its link: it starts as that
+  request is issued, and cancels it by its `user_data` and completes with
+  `ETIME` when it expires, or completes with `ECANCELED` once the request is
+  done, the rest of the link going on without it. The entries are checked as
+  Linux checks them (`EINVAL`), and the time is read as they are taken
+  (`EFAULT`, `EINVAL` for a negative one), or is in the entry with
+  `IORING_TIMEOUT_IMMEDIATE_ARG`. A cancellation finds the timeouts after
+  the requests that wait for their files, but none by a file, and no linked
+  one. `execve` and a whole process's exit cancel the thread's.
 
 - The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
@@ -2988,9 +3016,11 @@ kernel.
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
     hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
     source and destination falls to, each hop living taking a share of the
-    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), with
-    the namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
-    them; before the hash, one whose device's own source is the lookup's;
+    hashes by its weight (`fib_select_multipath`, `fib_rebalance`), as
+    `fib_multipath_hash_policy` 0 hashes them
+    (`fib_multipath_hash_from_keys`), by the machine's random seed, every
+    namespace's, or `net.ipv4.fib_multipath_hash_seed`, with which each
+    flow's hop is Linux's; before the hash, one whose device's own source is the lookup's;
     through a device named, the first through it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
@@ -3095,6 +3125,26 @@ kernel.
     none or its sender, that is a member of the group, on whatever device,
     or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
     connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
+  - **Source filters:** a membership takes what its filter lets in: from its
+    sources (`MCAST_INCLUDE`) or from all others (`MCAST_EXCLUDE`, of no
+    sources as a join leaves it). IPv4's `IP_ADD_SOURCE_MEMBERSHIP`,
+    `IP_DROP_SOURCE_MEMBERSHIP`, `IP_BLOCK_SOURCE`, `IP_UNBLOCK_SOURCE` and
+    `IP_MSFILTER` (which `getsockopt` reads too) change it, as do
+    `MCAST_JOIN_SOURCE_GROUP`, `MCAST_LEAVE_SOURCE_GROUP`,
+    `MCAST_BLOCK_SOURCE`, `MCAST_UNBLOCK_SOURCE` and `MCAST_MSFILTER` of
+    both families, beside `MCAST_JOIN_GROUP` and `MCAST_LEAVE_GROUP`; TCP
+    sockets take them too. A filter with sources stays of its mode
+    (`EINVAL`), a source is added once and taken away once
+    (`EADDRNOTAVAIL`), there are at most 10 of IPv4's and 64 of IPv6's
+    (`ENOBUFS`), and a membership that includes none ends (`ip_mc_source`,
+    `ip_mc_msfilter`, `ip6_mc_source`, `ip6_mc_msfilter`). As on Linux
+    master, an IPv6 filter whose last blocked source goes may change its
+    mode, which Linux 7.0 refuses, as IPv4's still does. A device takes
+    from a source what any membership on it includes, or what one that
+    excludes does not name (`ip_check_mc_rcu`, `ipv6_chk_mcast_addr`):
+    what it does not take reaches no socket, one that has
+    `IP_MULTICAST_ALL` or `IPV6_MULTICAST_ALL` on neither, and a sender's
+    own copy of it does not come back.
   - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
     unicast one, or the multicast `ff00::/8`) goes out through an end
     leaves from the route's preferred source, or the address
@@ -3163,8 +3213,8 @@ kernel.
     those put in are told of, then go, each told of. A removal takes each
     hop alone, and gives the last error. A lookup takes the hop the flow's
     hash falls to, each hop living taking a share of the hashes by its
-    weight (`fib6_select_path`, `rt6_multipath_rebalance`), with the
-    namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
+    weight (`fib6_select_path`, `rt6_multipath_rebalance`), by the same
+    seed as IPv4's, as `fib_multipath_hash_policy` 0 hashes
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
     label, and one unbound takes the source of the hop that gives
@@ -3386,7 +3436,8 @@ kernel.
     the route that matched. An IPv4 answer for a multicast or the limited
     broadcast address is of the multicast or broadcast type, as
     `__mkroute_output` makes it (`RTCF_MULTICAST` or `RTCF_BROADCAST`, and
-    `RTCF_LOCAL` for the broadcast address and a group the device is in),
+    `RTCF_LOCAL` for the broadcast address and a group the device is in and
+    takes that source's packets to),
     and with `RTM_F_FIB_MATCH` the table's
     entry takes that type too; from a source of the loopback's and no
     device, and through `lo` to a local group (224.0.0.0/24) or the
@@ -3403,7 +3454,7 @@ kernel.
     the device as `RTA_IIF`. IPv4 drops martians
     (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
     source, a loopback or 0.0.0.0 destination, a group the device has not
-    joined, and a source of the namespace's own, or with a local route a
+    joined or whose source its filters keep out, and a source of the namespace's own, or with a local route a
     request added, one a lookup finds a route to that is not unicast
     (`fib_validate_source`). A local, broadcast or multicast destination
     gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,
@@ -4498,7 +4549,8 @@ kernel.
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
-  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`. They and their
+  `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`, and
+  `ipv4/fib_multipath_hash_seed`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write
@@ -4533,6 +4585,9 @@ kernel.
     IPv6's own `RTM_NEWLINK` (`RTNLGRP_IPV6_IFINFO`), as `NETDEV_UP`
     does. While it is on, `lo` coming up takes no IPv6 and a new IPv6
     address is `EACCES` (`addrconf_add_dev`).
+  - `fib_multipath_hash_seed` takes an unsigned `int` as
+    `proc_douintvec_minmax` does (the rest of the write taken with it), 0
+    for the machine's random seed, as a new namespace has it.
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
 
@@ -4637,6 +4692,15 @@ kernel.
     0 (`fib_flag_trans`); `ipv6_route`
     (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - `tcp`, `tcp6`, `udp` and `udp6`, the sockets `sock_diag` tells of, but
+    for TCP ones bound alone, in the format of Linux 7.0's `tcp4_seq_show` and
+    the like: first the listeners, then the connections, with those in
+    `TIME_WAIT`. `unix` (`unix_seq_show`) has a connection not yet accepted
+    too, and `netlink` (`netlink_native_seq_show`) the sockets that are
+    bound. Owners show as the opener's user namespace has them.
+  - `raw`, `raw6`, `icmp`, `icmp6` and `packet`, of kinds of socket there are
+    none of, hold their header alone. There is no `udplite`, as Linux has no
+    UDP-Lite any more.
   - Any other name there is `ENOENT`, with `--mount /:/` too: the host's
     sockets and devices are not the guest's.
 
@@ -5015,7 +5079,8 @@ kernel.
   and `PTRACE_POKEDATA` (counted to the tracer) and a core dump's (counted
   to the thread the signal ended, which dumps while the others wait,
   regardless of which thread exits last; it leaves private anonymous memory never touched
-  a hole, with no fault). `RUSAGE_SELF` gives the sum of the
+  a hole, with no fault). An instruction of its code that reads and writes
+  its operand takes one fault, a write, as x86-64's do. `RUSAGE_SELF` gives the sum of the
   process's threads, `RUSAGE_THREAD` the thread's, and `RUSAGE_CHILDREN` and
   a wait those of the children as with the CPU time; a forked child starts
   from none, and an `execve` keeps them. `ru_nvcsw` counts the voluntary

@@ -5226,7 +5226,7 @@ mod io_uring {
         assert_eq!(
             supported,
             [
-                0, 1, 2, 3, 4, 5, 13, 14, 16, 20, 22, 23, 26, 27, 29, 31, 32, 34, 45
+                0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15, 16, 20, 22, 23, 26, 27, 29, 31, 32, 34, 45
             ]
         );
         // A probe that is not zeroed, buffers without an argument, another
@@ -6541,6 +6541,335 @@ mod io_uring {
         reap(f, r)
     }
 
+    const TIMEOUT: u8 = 11;
+    const TIMEOUT_REMOVE: u8 = 12;
+    const LINK_TIMEOUT: u8 = 15;
+    const SECOND: u64 = 1_000_000_000;
+
+    fn at_time(f: &Fixture, now: u64) {
+        let clocks = [
+            (paludarium_host::ClockId::Monotonic, now),
+            (paludarium_host::ClockId::Realtime, 1000 * SECOND + now),
+        ];
+        for (clock, now) in clocks {
+            f.host.set_clock(clock, now);
+        }
+    }
+
+    /// An `IORING_OP_TIMEOUT` or `_LINK_TIMEOUT` of `nanos`, whose
+    /// `struct __kernel_timespec` it writes at `at`.
+    fn timeout(
+        f: &Fixture,
+        opcode: u8,
+        data: u64,
+        at: u64,
+        nanos: u64,
+        flags: u32,
+        off: u32,
+    ) -> [u8; 64] {
+        f.mem.write_u64(GuestAddr(at), nanos / SECOND).unwrap();
+        f.mem.write_u64(GuestAddr(at + 8), nanos % SECOND).unwrap();
+        let mut e = sqe(opcode, data);
+        e[8..12].copy_from_slice(&off.to_le_bytes());
+        e[16..24].copy_from_slice(&at.to_le_bytes());
+        e[24..28].copy_from_slice(&1u32.to_le_bytes());
+        e[28..32].copy_from_slice(&flags.to_le_bytes());
+        e
+    }
+
+    /// An `IORING_OP_TIMEOUT_REMOVE` of `user_data`, with `flags` and the
+    /// new time at `at`.
+    fn timeout_remove(data: u64, user_data: u64, flags: u32, at: u64) -> [u8; 64] {
+        let mut e = sqe(TIMEOUT_REMOVE, data);
+        e[8..16].copy_from_slice(&at.to_le_bytes());
+        e[16..24].copy_from_slice(&user_data.to_le_bytes());
+        e[28..32].copy_from_slice(&flags.to_le_bytes());
+        e
+    }
+
+    /// The completions after a call that does nothing else.
+    fn later(f: &mut Fixture, r: &Ring, now: u64) -> Vec<(u64, i32)> {
+        at_time(f, now);
+        assert_eq!(f.ret(39, &[]), 1);
+        reap(f, r)
+    }
+
+    #[test]
+    fn timeouts_are_prepared_as_linux_does() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let at = DATA + 0x100;
+        let good = timeout(&f, TIMEOUT, 1, at, SECOND, 0, 0);
+        let with = |e: &[u8; 64], at: usize, bytes: &[u8]| {
+            let mut e = *e;
+            e[at..at + bytes.len()].copy_from_slice(bytes);
+            e
+        };
+        let remove = timeout_remove(1, 9, 0, 0);
+        let update = timeout_remove(1, 9, 2, at);
+        let link = timeout(&f, LINK_TIMEOUT, 1, at, SECOND, 0, 0);
+        let einval = -Errno::EINVAL.0;
+        let cases: &[([u8; 64], i32)] = &[
+            (with(&good, 24, &[0]), einval),
+            (with(&good, 2, &[1]), einval),
+            (with(&good, 40, &[1]), einval),
+            (with(&good, 44, &[1]), einval),
+            (with(&good, 48, &[1]), einval),
+            (with(&good, 56, &[1]), einval),
+            (with(&good, 28, &[2]), einval),
+            (with(&good, 28, &[16]), einval),
+            (with(&good, 28, &[4 | 8]), einval),
+            (with(&good, 28, &[64 | 1]), einval),
+            (with(&good, 16, &8u64.to_le_bytes()), -Errno::EFAULT.0),
+            // IORING_TIMEOUT_IMMEDIATE_ARG: a negative time.
+            (
+                with(&with(&good, 28, &[128]), 16, &u64::MAX.to_le_bytes()),
+                einval,
+            ),
+            (with(&remove, 1, &[1]), einval),
+            (with(&remove, 24, &[1]), einval),
+            (with(&remove, 28, &[1]), einval),
+            (with(&update, 28, &[2 | 4]), einval),
+            (with(&update, 8, &8u64.to_le_bytes()), -Errno::EFAULT.0),
+            (remove, -Errno::ENOENT.0),
+            (update, -Errno::ENOENT.0),
+            (timeout_remove(1, 9, 2 | 16, at), -Errno::ENOENT.0),
+            // A linked timeout needs a request before it in its link, and
+            // takes no number of completions.
+            (link, einval),
+            (with(&link, 8, &[1]), einval),
+        ];
+        for (i, (e, res)) in cases.iter().enumerate() {
+            let slot = u32_at(&f, r.rings + 4) & 3;
+            push(&mut f, &r, slot, e);
+            assert_eq!(f.ret(426, &[r.fd, 1, 0, GETEVENTS]), 1);
+            assert_eq!(reap(&mut f, &r), [(1, *res)], "case {i}");
+        }
+        for sec_nsec in [[u64::MAX, 0], [0, u64::MAX]] {
+            f.mem.write_u64(GuestAddr(at), sec_nsec[0]).unwrap();
+            f.mem.write_u64(GuestAddr(at + 8), sec_nsec[1]).unwrap();
+            assert_eq!(batch(&mut f, &r, &[good]), [(1, einval)]);
+        }
+        // A linked timeout after another is EINVAL, and its link fails.
+        let mut first = nop(1, 0, 0, 0, 0);
+        first[1] = 4;
+        let mut second = timeout(&f, LINK_TIMEOUT, 2, at, SECOND, 0, 0);
+        second[1] = 4;
+        let third = timeout(&f, LINK_TIMEOUT, 3, at, SECOND, 0, 0);
+        assert_eq!(
+            batch(&mut f, &r, &[first, second, third]),
+            [(1, -125), (2, -125), (3, einval)]
+        );
+    }
+
+    #[test]
+    fn a_timeout_expires_and_fails_its_link() {
+        let mut f = fixture();
+        at_time(&f, 0);
+        let r = ring(&mut f);
+        let at = DATA + 0x100;
+        let linked = |f: &Fixture, flags: u32| {
+            let mut e = timeout(f, TIMEOUT, 1, at, SECOND, flags, 0);
+            e[1] = 4;
+            [e, nop(2, 0, 0, 0, 7)]
+        };
+        let entries = linked(&f, 0);
+        assert_eq!(batch(&mut f, &r, &entries), []);
+        assert_eq!(later(&mut f, &r, SECOND - 1), []);
+        assert_eq!(later(&mut f, &r, SECOND), [(1, -62), (2, -125)]);
+        // IORING_TIMEOUT_ETIME_SUCCESS: the link goes on.
+        let entries = linked(&f, 32);
+        assert_eq!(batch(&mut f, &r, &entries), []);
+        assert_eq!(later(&mut f, &r, 2 * SECOND), [(1, -62), (2, 0)]);
+        // Absolute times, of the realtime clock too, and one given in the
+        // entry; a relative one of the realtime clock is monotonic.
+        let abs = timeout(&f, TIMEOUT, 3, at, 4 * SECOND, 1, 0);
+        let real = timeout(&f, TIMEOUT, 4, at + 16, 1005 * SECOND, 1 | 8, 0);
+        let mut immediate = timeout(&f, TIMEOUT, 5, at + 32, 0, 128, 0);
+        immediate[16..24].copy_from_slice(&(4 * SECOND).to_le_bytes());
+        assert_eq!(batch(&mut f, &r, &[immediate, real, abs]), []);
+        assert_eq!(later(&mut f, &r, 4 * SECOND), [(3, -62)]);
+        assert_eq!(later(&mut f, &r, 6 * SECOND), [(4, -62), (5, -62)]);
+        // A wait for a completion ends once the timeout expires.
+        let e = timeout(&f, TIMEOUT, 6, at, 0, 0, 0);
+        let slot = u32_at(&f, r.rings + 4) & 3;
+        push(&mut f, &r, slot, &e);
+        assert_eq!(f.ret(426, &[r.fd, 1, 1, GETEVENTS]), 1);
+        assert_eq!(reap(&mut f, &r), [(6, -62)]);
+        // It ends even a wait for more completions than there are.
+        push(&mut f, &r, (slot + 1) & 3, &e);
+        assert_eq!(f.ret(426, &[r.fd, 1, 2, GETEVENTS]), 1);
+        assert_eq!(reap(&mut f, &r), [(6, -62)]);
+    }
+
+    #[test]
+    fn a_timeout_completes_after_its_number_of_completions() {
+        let mut f = fixture();
+        at_time(&f, 0);
+        let r = ring(&mut f);
+        let at = DATA + 0x100;
+        // The later number first: the list is kept in order.
+        let two = timeout(&f, TIMEOUT, 1, at, SECOND, 0, 2);
+        let one = timeout(&f, TIMEOUT, 2, at, SECOND, 0, 1);
+        assert_eq!(batch(&mut f, &r, &[two, one]), []);
+        let one_nop = nop(3, 0, 0, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[one_nop]), [(3, 0), (2, 0)]);
+        assert_eq!(batch(&mut f, &r, &[one_nop]), [(3, 0), (1, 0)]);
+        // A timeout's own completion is none of them.
+        let three = timeout(&f, TIMEOUT, 4, at, 2 * SECOND, 0, 1);
+        let timer = timeout(&f, TIMEOUT, 5, at + 16, SECOND, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[three, timer]), []);
+        assert_eq!(later(&mut f, &r, SECOND), [(5, -62)]);
+        assert_eq!(batch(&mut f, &r, &[one_nop]), [(3, 0), (4, 0)]);
+        // Nor is a removed one's: Linux master's `io_timeout_cancel` counts
+        // it in `cq_timeouts`, so of the removal's two completions only the
+        // removal's own counts.
+        let four = timeout(&f, TIMEOUT, 6, at, 10 * SECOND, 0, 2);
+        let removed = timeout(&f, TIMEOUT, 7, at + 16, 10 * SECOND, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[four, removed]), []);
+        let remove = timeout_remove(8, 7, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[remove]), [(8, 0), (7, -125)]);
+        assert_eq!(batch(&mut f, &r, &[one_nop]), [(3, 0), (6, 0)]);
+    }
+
+    /// A tag posted as a file is let go of counts for a timeout, which
+    /// `io_post_aux_cqe` flushes (`io_commit_cqring_flush`).
+    #[test]
+    fn a_tag_completes_a_timeout() {
+        let mut f = fixture();
+        at_time(&f, 0);
+        let r = ring(&mut f);
+        let (at, list, tags, arg) = (DATA + 0x300, DATA + 0x400, DATA + 0x410, DATA + 0x500);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]) as i32;
+        fds(&f, list, &[fd]);
+        f.mem.write_u64(GuestAddr(tags), 21).unwrap();
+        rsrc_register(&f, arg, 1, 0, list, tags);
+        assert_eq!(f.ret(427, &[r.fd, 13, arg, 32]), 0);
+        let e = timeout(&f, TIMEOUT, 1, at, SECOND, 0, 1);
+        assert_eq!(batch(&mut f, &r, &[e]), []);
+        assert_eq!(f.ret(427, &[r.fd, 3, 0, 0]), 0);
+        assert_eq!(reap(&mut f, &r), [(21, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn a_multishot_timeout_expires_again() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        at_time(&f, 0);
+        let r = ring(&mut f);
+        let at = DATA + 0x100;
+        let e = timeout(&f, TIMEOUT, 1, at, SECOND, 64, 2);
+        assert_eq!(batch(&mut f, &r, &[e]), []);
+        for (now, flags) in [(SECOND, MORE), (2 * SECOND, 0)] {
+            at_time(&f, now);
+            assert_eq!(f.ret(39, &[]), 1);
+            let index = u64::from(u32_at(&f, r.rings + 8) & 7);
+            let seen = u32_at(&f, r.rings + 64 + 16 * index + 12);
+            assert_eq!(reap(&mut f, &r), [(1, -62)]);
+            assert_eq!(seen, flags);
+        }
+        assert_eq!(later(&mut f, &r, 4 * SECOND), []);
+        // Without a number it goes on until removed; it takes no absolute
+        // time.
+        let e = timeout(&f, TIMEOUT, 1, at, SECOND, 64, 0);
+        assert_eq!(batch(&mut f, &r, &[e]), []);
+        assert_eq!(later(&mut f, &r, 5 * SECOND), [(1, -62)]);
+        let update = timeout_remove(2, 1, 2 | 1, at);
+        assert_eq!(batch(&mut f, &r, &[update]), [(2, -Errno::EINVAL.0)]);
+        let remove = timeout_remove(2, 1, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[remove]), [(2, 0), (1, -125)]);
+    }
+
+    #[test]
+    fn timeouts_are_removed_updated_and_cancelled() {
+        let mut f = fixture();
+        at_time(&f, 0);
+        let r = ring(&mut f);
+        let at = DATA + 0x100;
+        let first = timeout(&f, TIMEOUT, 1, at, SECOND, 0, 0);
+        let second = timeout(&f, TIMEOUT, 2, at, SECOND, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[first, second]), []);
+        let remove = timeout_remove(9, 1, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[remove]), [(9, 0), (1, -125)]);
+        // IORING_TIMEOUT_UPDATE: 5 seconds from now.
+        f.mem.write_u64(GuestAddr(at), 5).unwrap();
+        let update = timeout_remove(9, 2, 2, at);
+        assert_eq!(batch(&mut f, &r, &[update]), [(9, 0)]);
+        assert_eq!(later(&mut f, &r, 5 * SECOND - 1), []);
+        assert_eq!(later(&mut f, &r, 5 * SECOND), [(2, -62)]);
+        // IORING_OP_ASYNC_CANCEL finds timeouts after the rest, and with
+        // IORING_ASYNC_CANCEL_ALL counts them; by a file, none.
+        let first = timeout(&f, TIMEOUT, 1, at, SECOND, 0, 0);
+        let same = timeout(&f, TIMEOUT, 1, at, SECOND, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[first, same]), []);
+        let mut cancel = sqe(14, 9);
+        cancel[16] = 1;
+        cancel[28] = 1;
+        assert_eq!(batch(&mut f, &r, &[cancel]), [(9, 2), (1, -125), (1, -125)]);
+        assert_eq!(batch(&mut f, &r, &[cancel]), [(9, 0)]);
+        assert_eq!(batch(&mut f, &r, &[first]), []);
+        let mut by_file = cancel;
+        by_file[28] = 2 | 16;
+        assert_eq!(batch(&mut f, &r, &[by_file]), [(9, -Errno::ENOENT.0)]);
+        assert_eq!(later(&mut f, &r, 9 * SECOND), [(1, -62)]);
+    }
+
+    #[test]
+    fn a_linked_timeout_cancels_the_request_before_it() {
+        let mut f = fixture();
+        at_time(&f, 0);
+        let r = ring(&mut f);
+        let (at, ends, buf) = (DATA + 0x100, DATA + 0x300, DATA + 0x800);
+        assert_eq!(f.ret(293, &[ends, 0]), 0);
+        let (read, write) = (u64::from(u32_at(&f, ends)), u64::from(u32_at(&f, ends + 4)));
+        let linked = |f: &Fixture| {
+            let mut reads = rw(22, read, u64::MAX, buf, 8);
+            reads[1] = 4;
+            let mut link = timeout(f, LINK_TIMEOUT, 2, at, SECOND, 0, 0);
+            link[1] = 4;
+            [reads, link, nop(3, 0, 0, 0, 0)]
+        };
+        // It expires first: the read is cancelled, and its link fails.
+        let entries = linked(&f);
+        assert_eq!(batch(&mut f, &r, &entries), []);
+        assert_eq!(later(&mut f, &r, SECOND), [(2, -62), (1, -125), (3, -125)]);
+        // The read is done first: the timeout is cancelled, and the link
+        // goes on without it.
+        let entries = linked(&f);
+        assert_eq!(batch(&mut f, &r, &entries), []);
+        assert_eq!(f.ret(1, &[write, DATA, 8]), 8);
+        assert_eq!(reap(&mut f, &r), [(1, 8), (2, -125), (3, 0)]);
+        assert_eq!(later(&mut f, &r, 4 * SECOND), []);
+        // An update of the linked timeout.
+        let entries = linked(&f);
+        assert_eq!(batch(&mut f, &r, &entries), []);
+        f.mem.write_u64(GuestAddr(at), 2).unwrap();
+        let update = timeout_remove(9, 2, 2 | 16, at);
+        assert_eq!(batch(&mut f, &r, &[update]), [(9, 0)]);
+        assert_eq!(later(&mut f, &r, 5 * SECOND), []);
+        assert_eq!(
+            later(&mut f, &r, 6 * SECOND),
+            [(2, -62), (1, -125), (3, -125)]
+        );
+        // One after a request that is done at once, or a timeout.
+        let mut done = nop(4, 0, 0, 0, 0);
+        done[1] = 4;
+        let link = timeout(&f, LINK_TIMEOUT, 5, at, SECOND, 0, 0);
+        assert_eq!(batch(&mut f, &r, &[done, link]), [(4, 0), (5, -125)]);
+        let mut first = timeout(&f, TIMEOUT, 6, at + 16, 3 * SECOND, 0, 0);
+        first[1] = 4;
+        assert_eq!(batch(&mut f, &r, &[first, link]), []);
+        assert_eq!(later(&mut f, &r, 7 * SECOND), [(5, -62), (6, -125)]);
+        // Linked timeouts are not found by a cancellation.
+        assert_eq!(batch(&mut f, &r, &[first, link]), []);
+        let mut cancel = sqe(14, 9);
+        cancel[16] = 5;
+        assert_eq!(batch(&mut f, &r, &[cancel]), [(9, -Errno::ENOENT.0)]);
+        cancel[16] = 6;
+        assert_eq!(batch(&mut f, &r, &[cancel]), [(9, 0), (6, -125), (5, -125)]);
+    }
+
     /// An `IORING_OP_NOP` with `nop_flags`, a file, a registered buffer's
     /// index and a result.
     fn nop(user_data: u64, flags: u32, fd: i32, index: u16, result: i32) -> [u8; 64] {
@@ -7313,6 +7642,39 @@ mod io_uring {
         assert_eq!(f.ret(49, &[fd, DATA + 0x100, 4]), 0);
         assert_eq!(f.ret(50, &[fd, backlog]), 0);
         fd
+    }
+
+    #[test]
+    fn accept_takes_its_descriptor_first() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let server = listener_named(&mut f, &r, b'a', 4);
+        f.mem
+            .write(GuestAddr(DATA + 0x100), &[1, 0, 0, b'a'])
+            .unwrap();
+        let client = f.ret(41, &[1, 1, 0]);
+        assert_eq!(f.ret(42, &[client, DATA + 0x100, 4]), 0);
+        let pipe = DATA + 0x200;
+        assert_eq!(f.ret(293, &[pipe, 0]), 0);
+        let pipe = u64::from(u32_at(&f, pipe));
+        let limit = DATA + 0x600;
+        assert_eq!(f.ret(97, &[7, limit]), 0);
+        let soft = f.mem.read_u64(GuestAddr(limit)).unwrap();
+        f.mem.write_u64(GuestAddr(limit), 1).unwrap();
+        assert_eq!(f.ret(160, &[7, limit]), 0);
+        let (emfile, enotsock) = (errno(Errno(24)), errno(Errno(88)));
+        assert_eq!(f.ret(43, &[server, 0, 0]), emfile);
+        assert_eq!(f.ret(43, &[pipe, 0, 0]), emfile);
+        assert_eq!(f.ret(288, &[server, 0, 0, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(43, &[999, 0, 0]), errno(Errno::EBADF));
+        f.mem.write_u64(GuestAddr(limit), soft).unwrap();
+        assert_eq!(f.ret(160, &[7, limit]), 0);
+        // The connection is still there, and its descriptor the lowest.
+        assert_eq!(f.ret(43, &[pipe, 0, 0]), enotsock);
+        let next = f.ret(32, &[0]);
+        assert_eq!(f.ret(3, &[next]), 0);
+        assert_eq!(f.ret(288, &[server, 0, 0, 0o2_000_000]), next);
+        assert_eq!(f.ret(72, &[next, 1]), 1);
     }
 
     #[test]

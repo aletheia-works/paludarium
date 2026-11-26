@@ -111,9 +111,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
-- **`/proc/net` の一部**：あるのは `arp`、`dev`、`if_inet6`、`ipv6_route`、`route` だけです。
-  `tcp`、`udp`、`unix`、`igmp`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、
-  `dev` のものは 0 です。ネットワークのないセッションのファイルには、デバイスがありません。
+- **`/proc/net` の一部**：あるのは `arp`、`dev`、`if_inet6`、`ipv6_route`、`route` と、ソケットの
+  ファイル（[機能](./features) を参照）だけです。`igmp`、`snmp`、`sockstat` などは `ENOENT` です。
+  カウンタは数えないので、`dev` のものは 0 です。ネットワークのないセッションのファイルには、
+  デバイスもインターネットのソケットもありません。ソケットのカーネル内のアドレスは 0、参照の数は
+  種類ごとに同じ値、まだ届いていないデータグラムとメッセージが占めるメモリは 0 で、TCP の接続の
+  `pingpong` を含む `quick` も 0 です。確認応答を待つ間のタイマーは示しません。`netlink` には、ポートが 0 である
+  カーネル自身のソケットはありません。
 - **仮想 CPU の `/proc/cpuinfo`**：`RDTSC` は動きますが、`CPUID` はタイムスタンプカウンタを
   示さないので、`bogomips` は 0.00 で、`cpu MHz` はありません。`CPUID` のリーフ 1 は CPU ごとの
   ID を返さないので、`initial apicid` はどの CPU でも 0 です。`bugs` は、Linux 7.0 がファミリー
@@ -471,7 +475,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **io_uring の一部**：実行するのは `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`、
   `IORING_OP_READ`、`_WRITE`、`_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
-  それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`
+  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`
   だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの受け付けと
   受信、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
@@ -480,7 +484,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   カーネルが追いつけば master に合わせます。`MSG_WAITALL` の受信でデータグラムが切り詰められても
   リンクは失敗しません（Linux では失敗します）。`IORING_OP_SHUTDOWN` は、Linux ではワーカーで
   実行するところを `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れる
-  ものより先に来ることがあります。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
+  ものより先に来ることがあります。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
+  来ます。すべてのスレッドが `nanosleep` で眠るあいだに期限が来たものは、眠りが終わるときに
+  完了します（Linux のタイマーはその時点で完了させます）。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
   `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
@@ -1035,10 +1041,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   切ったところから始まります。Linux の新しい名前空間は IPv4 の設定を最初の名前空間から
   受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
   フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
-  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward` と、`all`、`default`、`lo`、veth の端の
-  `forwarding`、`rp_filter`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
+  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward`、
+  `fib_multipath_hash_seed` と、`all`、`default`、`lo`、veth の端の
+  `forwarding`、`rp_filter`、`accept_dad`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
   最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
-  そこから始まります。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
+  そこから始まります。`fib_multipath_hash_seed` への書き込みは、Linux 7.0 から 7.2 と同じく
+  全部を取り、ファイルの位置を動かしません。master は読んだ分だけを取り、位置を進めます
+  （`proc_vec`）。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
   加わりません。`default` のものが入っている間に作った端は、全ルーターのグループ 3 つすべてに
   入っていますが、Linux では ff02::2 だけです。`all` のものに書くと、デバイスのものを
   インデックスの順に伝えますが、Linux は増えた順です。netconf の通知は、ファイルのない

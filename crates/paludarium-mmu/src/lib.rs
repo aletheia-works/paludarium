@@ -411,6 +411,7 @@ pub mod faults {
         static KERNEL: Cell<bool> = const { Cell::new(false) };
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
+        static NOTED: Cell<bool> = const { Cell::new(false) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
     }
 
@@ -542,11 +543,21 @@ pub mod faults {
     }
 
     pub(crate) fn count(at: At) {
+        NOTED.with(|noted| noted.set(true));
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
         } else if !add(false, at) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
+    }
+
+    /// What `f` gives, and whether a fault was counted ([`count`]) while it
+    /// ran.
+    pub(crate) fn noted<T>(f: impl FnOnce() -> T) -> (T, bool) {
+        let was = NOTED.with(|noted| noted.replace(false));
+        let result = f();
+        let counted = NOTED.with(|noted| noted.replace(was));
+        (result, counted)
     }
 
     pub(crate) fn count_forced() {
@@ -5368,6 +5379,17 @@ impl AddressSpaceData {
         self.read_with(addr, buf, Access::Read)
     }
 
+    /// Reads the bytes an instruction then writes, as x86-64 reads the
+    /// destination of an instruction that reads and writes it: the pages
+    /// are made ready for the write first ([`Self::prepare_write`]), so
+    /// that a page that is not there takes one fault, a write. `true` when
+    /// a page took its first write.
+    fn read_for_write(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<bool, Fault> {
+        let first = self.prepare_write(addr, buf.len(), Access::Write)?;
+        self.read_with(addr, buf, Access::Read)?;
+        Ok(first)
+    }
+
     /// Reads guest memory whatever its protection, as `get_user_pages`
     /// with `FOLL_FORCE` does (a lock's population).
     pub fn read_for_dump(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
@@ -9763,6 +9785,28 @@ impl AddressSpace {
             }
         })
     }
+    /// Tries the access of the calling host thread's guest code `addr`
+    /// again once a `userfaultfd`'s wait for it has ended, as Linux's
+    /// `do_user_addr_fault` retries the fault: the page is brought in if it
+    /// is still missing and may be, and the retry counts as a fault of the
+    /// code whether it brought anything in or not. As the first try of a
+    /// fault of user code runs under the VMA's lock, whose retry is not
+    /// `FAULT_FLAG_TRIED`, it is a minor one. Nothing while the page still
+    /// waits; the instruction then faults again.
+    pub fn retry_own_fault(&self, addr: GuestAddr, write: bool, fetch: bool) {
+        if self.userfault_for(addr, write, fetch).is_some() {
+            return;
+        }
+        let (done, counted) = faults::noted(|| self.touch(addr, write, fetch));
+        if done && !counted {
+            faults::taken_as_own(|| {
+                faults::count(faults::At {
+                    addr: addr.0,
+                    present: true,
+                });
+            });
+        }
+    }
     pub fn fetch(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().fetch(addr, buf)
     }
@@ -9814,6 +9858,13 @@ impl AddressSpace {
         self.fill_jit(addr);
         Ok(value)
     }
+    /// [`Self::read_value_for_write`] for compiled code, which then fills
+    /// the page's [`JitSlot`] as [`Self::jit_read_value`] does.
+    pub fn jit_read_value_for_write(&self, addr: GuestAddr, size: usize) -> Result<u64, Fault> {
+        let value = self.read_value_for_write(addr, size)?;
+        self.fill_jit(addr);
+        Ok(value)
+    }
     /// [`Self::write_value`] for compiled code, which then fills the page's
     /// [`JitSlot`] as [`Self::jit_read_value`] does.
     pub fn jit_write_value(&self, addr: GuestAddr, size: usize, value: u64) -> Result<(), Fault> {
@@ -9859,6 +9910,45 @@ impl AddressSpace {
         let mut bytes = [0; WORD_BYTES];
         self.read(addr, &mut bytes[..size.min(WORD_BYTES)])?;
         Ok(u64::from_le_bytes(bytes))
+    }
+    /// The value [`Self::read_value`] gives, of the destination of an
+    /// instruction that reads and writes it: a page that is not ready to be
+    /// written is made so first, so that its fault is the write's
+    /// ([`AddressSpaceData::read_for_write`]). Through this thread's
+    /// [`ThreadTlb`] without a lock where [`Self::write_value`] would store
+    /// without one.
+    #[inline]
+    pub fn read_value_for_write(&self, addr: GuestAddr, size: usize) -> Result<u64, Fault> {
+        let offset = page_offset(addr.0);
+        if size != 0 && offset % WORD_BYTES + size <= WORD_BYTES {
+            let value = self.with_thread_tlb(|tlb| {
+                let entry = tlb
+                    .get(addr.0 - offset as u64)
+                    .filter(|e| e.prot.contains(Prot::WRITE) && !e.cow)?;
+                let word = entry.frame.get()?.words[offset / WORD_BYTES].load(Ordering::Acquire);
+                Some(word >> (8 * (offset % WORD_BYTES)) & value_mask(size))
+            });
+            if let Some(value) = value {
+                return Ok(value);
+            }
+        }
+        let mut bytes = [0; WORD_BYTES];
+        let buf = &mut bytes[..size.min(WORD_BYTES)];
+        loop {
+            let result = {
+                let mut data = self.locked();
+                data.read_for_write(addr, buf).map(|first| {
+                    if first {
+                        data.mark_written(addr, buf.len() as u64);
+                    }
+                })
+            };
+            match result {
+                Ok(()) => return Ok(u64::from_le_bytes(bytes)),
+                Err(fault) if faults::resolve(|| self.view(), &fault) => {}
+                Err(fault) => return Err(fault),
+            }
+        }
     }
     /// [`Self::read_unlocked`] of `size` bytes, 1 to 8, that lie in one word.
     #[inline]
@@ -10301,10 +10391,13 @@ impl AddressSpace {
         size: usize,
         operation: AtomicOp,
     ) -> Result<AtomicResult, Fault> {
-        let data = self.locked();
-        // Checked first, so that one that faults leaves the TLBs: nothing
-        // that takes no lock changes a protection.
-        data.check(&data.read_directory(), addr, size, Access::Write, false)?;
+        let mut data = self.locked();
+        // Made ready for the write first, so that a page that is not there
+        // takes one fault, a write, and one that faults leaves the TLBs:
+        // nothing that takes no lock changes a protection.
+        if data.prepare_write(addr, size, Access::Write)? {
+            data.mark_written(addr, size as u64);
+        }
         data.code.bump_epoch();
         let mut bytes = [0u8; 16];
         data.read(addr, &mut bytes[..size])?;
@@ -11524,6 +11617,136 @@ mod tests {
         faults::arm(true);
         faults::unbind();
         space.write(page(7, 0), &[1]).unwrap();
+    }
+
+    #[test]
+    fn a_retried_fault_counts_once_as_the_code_s_own() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3]);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+        }
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                3 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let page = |n: u64| GuestAddr(at.0 + n * PAGE_SIZE);
+        space.write(page(0), &[1]).unwrap();
+        let _ = (faults::take(), faults::take_forced());
+        space
+            .view()
+            .userfault_register(page(1).0, page(2).0, 7, Userfault::MISSING)
+            .unwrap();
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        let load = || counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
+        // A page that is there, as a fill left it: one, though nothing is
+        // brought in; in the kernel's work too, as the code's.
+        let was = faults::set_kernel(true);
+        space.retry_own_fault(page(0), true, false);
+        faults::set_kernel(was);
+        assert_eq!(load(), [1, 0, 0]);
+        // One still missing waits again, and counts nothing yet.
+        space.retry_own_fault(page(1), false, false);
+        assert_eq!((load(), space.resident(page(1))), ([1, 0, 0], Some(false)));
+        // One no longer registered is brought in, and counts once.
+        space.retry_own_fault(page(2), false, false);
+        assert_eq!(load(), [2, 0, 0]);
+        faults::unbind();
+    }
+
+    #[test]
+    fn the_destination_of_a_read_and_a_write_takes_one_fault_a_write() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3]);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+        }
+        let mut space = AddressSpace::new();
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        let user = || counts.0[0].load(Ordering::SeqCst);
+        let at = space
+            .map(
+                None,
+                8 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let page = |n: u64, offset: u64| GuestAddr(at.0 + n * PAGE_SIZE + offset);
+        // One fault, which leaves the page ready for the write: the store
+        // after it takes none, and the next read goes through the TLB.
+        assert_eq!(space.read_value_for_write(page(0, 8), 4), Ok(0));
+        assert_eq!(user(), 1);
+        space.write_value(page(0, 8), 4, 0x1234_5678).unwrap();
+        assert_eq!(space.read_value_for_write(page(0, 8), 4), Ok(0x1234_5678));
+        assert_eq!(space.jit_read_value_for_write(page(0, 9), 2), Ok(0x3456));
+        assert_eq!(user(), 1);
+        // A page read first is written with a fault of its own, as Linux's
+        // zero page is replaced, and one over two pages takes one each.
+        space.read(page(1, 0), &mut [0]).unwrap();
+        assert_eq!(user(), 2);
+        assert_eq!(space.read_value_for_write(page(1, 0), 8), Ok(0));
+        assert_eq!(user(), 3);
+        assert_eq!(space.read_value_for_write(page(2, 4092), 8), Ok(0));
+        assert_eq!(user(), 5);
+        // Its fault is a write's where nothing may be written, or read.
+        space.protect(page(4, 0), PAGE_SIZE, Prot::READ).unwrap();
+        let fault = space.read_value_for_write(page(4, 0), 1).unwrap_err();
+        assert!(fault.write && fault.mapped, "{fault:?}");
+        space.protect(page(4, 0), PAGE_SIZE, Prot::NONE).unwrap();
+        let fault = space.read_value_for_write(page(4, 0), 1).unwrap_err();
+        assert!(fault.write && fault.mapped, "{fault:?}");
+        // An armed thread's is refused as a write, each time, with nothing
+        // counted, until the kernel brings the page in.
+        faults::arm(true);
+        for _ in 0..2 {
+            let fault = space.read_value_for_write(page(5, 0), 8).unwrap_err();
+            assert!(fault.write && fault.mapped && !fault.present, "{fault:?}");
+        }
+        assert_eq!(user(), 5);
+        assert!(space.touch(page(5, 0), true, false));
+        assert_eq!(space.read_value_for_write(page(5, 0), 8), Ok(0));
+        assert_eq!(user(), 6);
+        faults::arm(false);
+        // A locked instruction over two words does the same.
+        space.protect(page(7, 0), PAGE_SIZE, Prot::READ).unwrap();
+        let exchange = |at| {
+            space.atomic(
+                at,
+                AtomicWidth::W128,
+                AtomicOp::CompareExchange {
+                    expected: 1,
+                    replacement: 2,
+                },
+            )
+        };
+        assert!(!exchange(page(6, 16)).unwrap().exchanged);
+        assert_eq!(user(), 7);
+        assert!(exchange(page(7, 0)).unwrap_err().write);
+        faults::unbind();
     }
 
     #[test]

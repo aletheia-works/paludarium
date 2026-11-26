@@ -3,7 +3,7 @@
 use paludarium_cpu::compile::{Compiler, Fast, Form, REP_CHUNK, run_compiled};
 use paludarium_cpu::{CpuState, DecodeCache, flag, reg, step};
 use paludarium_decoder::decode;
-use paludarium_mmu::{AddressSpace, MappingKind, Prot, Referenced, Userfault};
+use paludarium_mmu::{AddressSpace, MappingKind, Prot, Referenced, Userfault, faults};
 use paludarium_types::{GuestAddr, PAGE_SIZE};
 
 use crate::exec::thread_cpu_time;
@@ -1314,6 +1314,47 @@ fn a_store_to_an_executable_page_an_instruction_was_fetched_from_moves_the_code(
     });
     assert_eq!((ran, word), (2, 0x5555));
     assert_ne!(memory.code_generation(), generation);
+}
+
+/// `add [rbx], eax` and `inc dword [rbx]` on a page nothing touched yet,
+/// across the two pages of the data, and on a page that only reads: the
+/// faults they take and how many instructions run, compiled and in the
+/// interpreter. Each untouched page is asked for writing before it is read,
+/// so it takes one fault, the write's, and a page the instruction may not
+/// write takes none and is left as it was.
+#[test]
+fn an_operation_on_memory_faults_once_as_a_write() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let second = DATA + PAGE_SIZE;
+    for code in [&[0x01, 0x03][..], &[0xff, 0x03]] {
+        let compiled = compiler.compile(&forms(code)).unwrap();
+        for (at, writable, expected) in [
+            (second, true, (1, 1)),
+            (second - 2, true, (2, 1)),
+            (second, false, (0, 0)),
+        ] {
+            let run = |jit: bool| {
+                let mut memory = space(code, &[]);
+                if !writable {
+                    memory
+                        .protect(GuestAddr(second), PAGE_SIZE, Prot::READ)
+                        .unwrap();
+                }
+                let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+                state.gpr[reg::RBX] = at;
+                state.gpr[reg::RAX] = 1;
+                let _ = faults::take();
+                let ran = if jit {
+                    compiled.run(&mut state, &memory, memory.code_generation_cached())
+                } else {
+                    usize::from(step(&mut state, &memory).is_ok())
+                };
+                (faults::take(), ran)
+            };
+            assert_eq!(run(true), expected, "{code:02x?} at {at:#x}, compiled");
+            assert_eq!(run(false), expected, "{code:02x?} at {at:#x}, interpreted");
+        }
+    }
 }
 
 /// Each form that loads, then `inc ecx`, run under a code generation older

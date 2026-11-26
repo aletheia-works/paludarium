@@ -79,7 +79,8 @@ pub(crate) fn wait_for(
     let end = deadline
         .unwrap_or(u64::MAX)
         .min(now.saturating_add(10_000_000))
-        .min(crate::signals::next_deadline(c.process).unwrap_or(u64::MAX));
+        .min(crate::signals::next_deadline(c.process).unwrap_or(u64::MAX))
+        .min(crate::io_uring::next_deadline(c).unwrap_or(u64::MAX));
     let generation = c.group.timer_generation();
     let outcome = match c.host.wait_on(
         &c.files.readiness.token,

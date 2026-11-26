@@ -60,14 +60,10 @@ fn done(context: &Context<'_>) -> i64 {
     }
 }
 
-extern "sysv64" fn load(context: *const Context<'_>, address: u64, size: u64) -> Loaded {
-    // SAFETY: compiled code passes on the context that `Code::run` gave
-    // it, which lives for the call.
-    let context = unsafe { &*context };
-    match context
-        .mem
-        .jit_read_value(GuestAddr(address), usize::try_from(size).unwrap_or(8))
-    {
+/// What a load gives compiled code: the value and [`done`]'s status, or
+/// [`FAILED`].
+fn loaded(context: &Context<'_>, value: Result<u64, paludarium_mmu::Fault>) -> Loaded {
+    match value {
         Ok(value) => Loaded {
             value,
             status: done(context),
@@ -77,6 +73,26 @@ extern "sysv64" fn load(context: *const Context<'_>, address: u64, size: u64) ->
             status: FAILED,
         },
     }
+}
+
+extern "sysv64" fn load(context: *const Context<'_>, address: u64, size: u64) -> Loaded {
+    // SAFETY: compiled code passes on the context that `Code::run` gave
+    // it, which lives for the call.
+    let context = unsafe { &*context };
+    let value = context
+        .mem
+        .jit_read_value(GuestAddr(address), usize::try_from(size).unwrap_or(8));
+    loaded(context, value)
+}
+
+/// [`load`] of the destination of an instruction that then writes it.
+extern "sysv64" fn load_for_write(context: *const Context<'_>, address: u64, size: u64) -> Loaded {
+    // SAFETY: as in `load`.
+    let context = unsafe { &*context };
+    let value = context
+        .mem
+        .jit_read_value_for_write(GuestAddr(address), usize::try_from(size).unwrap_or(8));
+    loaded(context, value)
 }
 
 extern "sysv64" fn store(context: *const Context<'_>, address: u64, size: u64, value: u64) -> i64 {
@@ -202,6 +218,7 @@ pub(crate) fn helpers() -> Helpers {
     type Divide = extern "sysv64" fn(*mut u64, u64, u64) -> i64;
     Helpers {
         load: load as Load as usize as u64,
+        load_for_write: load_for_write as Load as usize as u64,
         store: store as Store as usize as u64,
         load128: load128 as Load128 as usize as u64,
         store128: store128 as Store128 as usize as u64,

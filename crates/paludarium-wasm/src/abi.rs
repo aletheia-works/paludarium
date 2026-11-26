@@ -206,33 +206,45 @@ pub extern "C" fn buffer_drop(id: u32) {
         .unwrap_or_else(PoisonError::into_inner)
         .remove(&id);
 }
-/// The blocks [`heap_reserve`] takes from the allocator, each left untouched.
+/// The largest blocks [`heap_reserve`] takes from the allocator, each left
+/// untouched.
 const RESERVE_CHUNK: usize = 64 << 20;
+/// The smallest: one WebAssembly page.
+const RESERVE_LEAST: usize = 64 << 10;
 
 /// Grows the heap now by up to `limit` bytes and hands them back to the
 /// allocator, which keeps them, so that later allocations need not grow the
 /// memory while guests run. In WebKit, growing a shared memory while other
 /// threads run in it makes them fail with "Out of bounds memory access" or
-/// crashes the page. The blocks are allocated without being written to, so
-/// the pages are not resident until used. Returns the bytes reserved.
+/// crashes the page. It takes blocks of [`RESERVE_CHUNK`] while they fit,
+/// then of half that size and so on down to [`RESERVE_LEAST`], so that the
+/// memory ends close to its maximum rather than a block short of it. The
+/// blocks are allocated without being written to, so the pages are not
+/// resident until used. Returns the bytes reserved.
 #[unsafe(no_mangle)]
 pub extern "C" fn heap_reserve(limit: u32) -> u32 {
-    let Ok(layout) = std::alloc::Layout::from_size_align(RESERVE_CHUNK, 16) else {
-        return 0;
-    };
+    let limit = limit as usize;
     let mut blocks = Vec::new();
-    while (blocks.len() + 1) * RESERVE_CHUNK <= limit as usize {
-        // SAFETY: the layout's size is not zero; the block is freed below and
-        // never read or written.
-        let block = unsafe { std::alloc::alloc(layout) };
-        if block.is_null() {
+    let mut reserved = 0;
+    let mut size = RESERVE_CHUNK;
+    while size >= RESERVE_LEAST {
+        let Ok(layout) = std::alloc::Layout::from_size_align(size, 16) else {
             break;
+        };
+        while reserved + size <= limit {
+            // SAFETY: the layout's size is not zero; the block is freed below
+            // and never read or written.
+            let block = unsafe { std::alloc::alloc(layout) };
+            if block.is_null() {
+                break;
+            }
+            blocks.push((block, layout));
+            reserved += size;
         }
-        blocks.push(block);
+        size /= 2;
     }
-    let reserved = blocks.len() * RESERVE_CHUNK;
-    for block in blocks {
-        // SAFETY: allocated above with the same layout, and not freed since.
+    for (block, layout) in blocks {
+        // SAFETY: allocated above with this layout, and not freed since.
         unsafe { std::alloc::dealloc(block, layout) };
     }
     u32::try_from(reserved).unwrap_or(u32::MAX)

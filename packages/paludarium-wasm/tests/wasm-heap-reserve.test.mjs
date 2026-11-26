@@ -1,29 +1,36 @@
 // In WebKit, the coordinator grows the memory to its maximum before any guest
 // runs, since WebKit fails threads or crashes the page when a shared memory
-// grows while other threads run in it. These check that the reserve grows the
-// memory close to its maximum, that later allocations reuse it instead of
-// growing it, and which browsers count as WebKit.
+// grows while other threads run in it. These check that the reserve takes
+// smaller blocks once a whole one no longer fits, that it grows the memory to
+// its maximum, that later allocations reuse it instead
+// of growing it, and which browsers count as WebKit.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { imports, isWebKit } from "../worker-support.mjs";
 
-const MiB = 1 << 20, BLOCK = 64 * MiB, MAXIMUM = 16384 * 65536;
+const PAGE = 65536, MiB = 1 << 20, MAXIMUM = 16384 * PAGE;
 const module = await WebAssembly.compile(await readFile(new URL("../paludarium.wasm", import.meta.url)));
 const memory = new WebAssembly.Memory({ initial: 128, maximum: 16384, shared: true });
 const e = (await WebAssembly.instantiate(module, imports(memory))).exports;
 
-test("a limit below one block reserves nothing", () => {
+test("a limit below one page reserves nothing", () => {
   const before = memory.buffer.byteLength;
-  assert.equal(e.heap_reserve(BLOCK - 1), 0);
+  assert.equal(e.heap_reserve(0), 0);
+  assert.equal(e.heap_reserve(PAGE - 1), 0);
   assert.equal(memory.buffer.byteLength, before);
 });
 
-test("the reserve grows the memory to close to its maximum", () => {
+test("below one 64 MiB block, the reserve takes halves down to a page", () => {
+  // 128 KiB, then 64 KiB: the halves that fit in three pages.
+  assert.equal(e.heap_reserve(3 * PAGE), 3 * PAGE);
+});
+
+test("the reserve grows the memory to its maximum", () => {
   const reserved = e.heap_reserve(0xffffffff);
-  assert.equal(reserved % BLOCK, 0);
-  assert.ok(reserved > MAXIMUM - 2 * BLOCK, `reserved ${reserved}`);
-  assert.ok(memory.buffer.byteLength >= reserved && memory.buffer.byteLength <= MAXIMUM);
+  assert.equal(reserved % PAGE, 0);
+  assert.ok(reserved > MAXIMUM - 16 * MiB, `reserved ${reserved}`);
+  assert.equal(memory.buffer.byteLength, MAXIMUM);
 });
 
 test("allocations after the reserve do not grow the memory", () => {

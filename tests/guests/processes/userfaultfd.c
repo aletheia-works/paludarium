@@ -2301,18 +2301,23 @@ static int case_held(void) {
 /* What a fault that a userfaultfd served counts as. A fault of the
    thread's own code is tried again once the wait ends, which counts as a
    minor fault whether it brings the page in or not: its first try ran
-   under the VMA's lock, whose retry is not FAULT_FLAG_TRIED. A
+   under the VMA's lock, whose retry is not FAULT_FLAG_TRIED. A fault of
+   the kernel's copy for a read(2) or a write(2) is not tried under that
+   lock first, so its retry is FAULT_FLAG_TRIED: a major fault. A
    get_user_pages population that waited finds the page there and counts
    nothing, nor does a write to a page a fill left writable. The faulting
    thread reads its own getrusage(RUSAGE_THREAD) and page-faults,
    minor-faults and major-faults events around the one access. */
 struct counted {
     char *at;
-    int how; /* 0 a read, 1 a write, 2 MADV_POPULATE_WRITE */
+    int how; /* 0 a read, 1 a write, 2 MADV_POPULATE_WRITE, 3 read(2) into it, 4 write(2) from it */
     volatile int ready;
     long minor, major;
     long long faults, minor_events, major_events;
 };
+
+/* The pipe that read(2) and write(2) of the page use. */
+static int kernel_pipe[2];
 
 static long software_event(int config) {
     uint64_t attr[16] = {0};
@@ -2332,6 +2337,8 @@ static void *counted_access(void *arg) {
     if (c->how == 0) (void)*(volatile char *)c->at;
     if (c->how == 1) *(volatile char *)c->at = 'w';
     if (c->how == 2) madvise(c->at, PAGE, 23 /* MADV_POPULATE_WRITE */);
+    if (c->how == 3 && read(kernel_pipe[0], c->at, 1) != 1) printf("read(2) failed\n");
+    if (c->how == 4 && write(kernel_pipe[1], c->at, 1) != 1) printf("write(2) failed\n");
     getrusage(RUSAGE_THREAD, &now);
     for (int i = 0; i < 3; i++) read(events[i], &after[i], 8);
     c->minor = now.ru_minflt - was.ru_minflt;
@@ -2374,17 +2381,72 @@ static void by_unregister(int fd, struct counted *c) {
     unreg(fd, c->at, PAGE);
 }
 
+/* Fields `from` and the one after of /proc/self/stat, counted from 1:
+   majflt is 12 and cmajflt 13. */
+static void stat_fields(int from, long *first, long *second) {
+    char line[1024] = {0};
+    int fd = open("/proc/self/stat", O_RDONLY);
+    read(fd, line, sizeof line - 1);
+    close(fd);
+    /* The fields after the name, which ends at the last ')', start at 3. */
+    char *at = strrchr(line, ')') + 2;
+    for (int field = 3; field < from; field++) at = strchr(at, ' ') + 1;
+    sscanf(at, "%ld %ld", first, second);
+}
+
+/* A child takes one major fault, which its wait and the parent's
+   RUSAGE_CHILDREN and cmajflt then give. A fork without
+   UFFD_FEATURE_EVENT_FORK leaves the child none of its parent's
+   registrations, so it makes its own. */
+static void reaped_major(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int fd = ready(O_NONBLOCK, 0);
+        char *at = anon(PAGE);
+        reg(fd, at, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);
+        write(kernel_pipe[1], "k", 1);
+        counted("child read(2), copy", fd, &(struct counted){.at = at, .how = 3}, by_copy);
+        fflush(stdout);
+        _exit(0);
+    }
+    struct rusage waited, children;
+    int status;
+    wait4(child, &status, 0, &waited);
+    getrusage(RUSAGE_CHILDREN, &children);
+    long cmajflt, unused;
+    stat_fields(13, &cmajflt, &unused);
+    printf("reaped: wait4 majflt %ld RUSAGE_CHILDREN majflt %ld cmajflt %ld\n", waited.ru_majflt,
+           children.ru_majflt, cmajflt);
+}
+
 static int case_major(void) {
     memset(filler, 'f', sizeof filler);
     int fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_MINOR_SHMEM);
-    char *base = anon(5 * PAGE);
-    reg(fd, base, 5 * PAGE, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, NULL);
+    char *base = anon(8 * PAGE);
+    reg(fd, base, 8 * PAGE, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, NULL);
     counted("read, zeropage", fd, &(struct counted){.at = base, .how = 0}, by_zeropage);
     counted("write, copy", fd, &(struct counted){.at = base + PAGE, .how = 1}, by_copy);
     copy(fd, base + 2 * PAGE, filler, PAGE, UFFDIO_COPY_MODE_WP, NULL);
     counted("protected write, unprotect", fd, &(struct counted){.at = base + 2 * PAGE, .how = 1}, by_unprotect);
     counted("populate, copy", fd, &(struct counted){.at = base + 3 * PAGE, .how = 2}, by_copy);
     counted("read, unregister", fd, &(struct counted){.at = base + 4 * PAGE, .how = 0}, by_unregister);
+    pipe(kernel_pipe);
+    write(kernel_pipe[1], "k", 1);
+    counted("read(2), copy", fd, &(struct counted){.at = base + 5 * PAGE, .how = 3}, by_copy);
+    write(kernel_pipe[1], "k", 1);
+    counted("read(2), unregister", fd, &(struct counted){.at = base + 6 * PAGE, .how = 3}, by_unregister);
+    counted("write(2), zeropage", fd, &(struct counted){.at = base + 7 * PAGE, .how = 4}, by_zeropage);
+    char drained;
+    read(kernel_pipe[0], &drained, 1);
+    /* The process's are its threads', the three above among them. */
+    struct rusage self;
+    getrusage(RUSAGE_SELF, &self);
+    long majflt, cmajflt;
+    stat_fields(12, &majflt, &cmajflt);
+    printf("process: RUSAGE_SELF majflt at least 3 %d, /proc/self/stat majflt the same %d, cmajflt %ld\n",
+           self.ru_majflt >= 3, majflt == self.ru_majflt, cmajflt);
+    reaped_major();
     /* shmem_file's second page is in the page cache. */
     int file = shmem_file(2);
     char *view = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);

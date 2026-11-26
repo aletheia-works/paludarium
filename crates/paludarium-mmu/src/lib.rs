@@ -372,18 +372,21 @@ pub mod faults {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Where a guest thread's faults count: those of its own code
-    /// (`user`), of the kernel's accesses for it (`kernel`), and those
-    /// through `get_user_pages` (`forced`), which are no `perf` event.
+    /// Where a guest thread's faults count: the minor ones of its own code
+    /// (`user`) and of the kernel's accesses for it (`kernel`), those
+    /// through `get_user_pages` (`forced`), which are no `perf` event, and
+    /// the major ones (`major`): a kernel access's fault that a
+    /// `userfaultfd` had it try again.
     pub trait Sink: Send + Sync {
         fn user(&self) -> &AtomicU64;
         fn kernel(&self) -> &AtomicU64;
         fn forced(&self) -> &AtomicU64;
+        fn major(&self) -> &AtomicU64;
         /// A fault that made its count `nth`, of the kernel's accesses or
-        /// the thread's own code's, `at`, which is told where
-        /// [`trace_addresses`] asked for it.
-        fn fault(&self, kernel: bool, nth: u64, at: At) {
-            let _ = (kernel, nth, at);
+        /// the thread's own code's, a `major` one or not, `at`, which is
+        /// told where [`trace_addresses`] asked for it.
+        fn fault(&self, kernel: bool, major: bool, nth: u64, at: At) {
+            let _ = (kernel, major, nth, at);
         }
     }
 
@@ -412,6 +415,7 @@ pub mod faults {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
         static NOTED: Cell<bool> = const { Cell::new(false) };
+        static RETRIED: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
     }
 
@@ -431,13 +435,14 @@ pub mod faults {
     /// What a kernel access to user memory that faults may do before it
     /// fails: for a copy (`gup` false), what an instruction's fault may, as
     /// Linux's `do_user_addr_fault` serves the kernel's faults so, which is
-    /// to grow a mapping that grows down or to wait for a `userfaultfd` to
-    /// fill the page; for one through `get_user_pages`, only the wait, as
-    /// `gup_vma_lookup` expands no stack. `space` is the one it accesses,
-    /// which is not the thread's own for `process_vm_readv`'s. It is asked
-    /// with no lock of the space held, and says whether the access may be
-    /// tried again.
+    /// to grow a mapping that grows down ([`Self::grow`], asked first) or to
+    /// wait for a `userfaultfd` to fill the page; for one through
+    /// `get_user_pages`, only the wait, as `gup_vma_lookup` expands no
+    /// stack. `space` is the one it accesses, which is not the thread's own
+    /// for `process_vm_readv`'s. It is asked with no lock of the space held.
     pub trait Resolver: Send + Sync {
+        /// Waits for a `userfaultfd` to serve the fault, and says whether
+        /// the access may be tried again (`VM_FAULT_RETRY`).
         fn resolve(&self, space: &super::MemoryView, addr: u64, write: bool, gup: bool) -> bool;
         /// Grows the mapping of `space` above `addr` down to it, as Linux's
         /// `expand_stack` does for the calling thread; whether it did.
@@ -508,7 +513,49 @@ pub mod faults {
         let Some(resolver) = RESOLVER.with(|r| r.borrow().clone()) else {
             return false;
         };
-        resolver.resolve(&space(), fault.addr.0, fault.write, gup != Gup::No)
+        let space = space();
+        // The stack grows within the fault (`lock_mm_and_find_vma`), which
+        // is then minor.
+        if gup == Gup::No && resolver.grow(&space, fault.addr.0) {
+            return true;
+        }
+        let retried = resolver.resolve(&space, fault.addr.0, fault.write, gup != Gup::No);
+        if retried && gup == Gup::No {
+            retry_major(fault);
+        }
+        retried
+    }
+
+    /// A kernel access's fault is tried again, as a `userfaultfd` lets it:
+    /// a kernel-mode fault does not run under the VMA's lock first, so
+    /// Linux's `do_user_addr_fault` retries it with `FAULT_FLAG_TRIED`, and
+    /// `mm_account_fault` counts it once, as a major one, whether the retry
+    /// brings the page in or finds it there. It is counted here, and the
+    /// retry's own fault of the page, if it takes one, is not counted again
+    /// ([`count`]); nor is a second wait of the same fault.
+    fn retry_major(fault: &super::Fault) {
+        let retried = (fault.addr.0 & !(super::PAGE_SIZE - 1), fault.write);
+        if RETRIED.with(|r| r.replace(Some(retried))) == Some(retried) {
+            return;
+        }
+        NOTED.with(|noted| noted.set(true));
+        SINK.with(|sink| {
+            // A kernel access is made for a bound thread
+            // (`KernelFaults::enter`).
+            if let Some(counts) = sink.borrow().as_ref() {
+                let nth = counts
+                    .major()
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                if ADDRESSES.load(Ordering::Relaxed) {
+                    let at = At {
+                        addr: fault.addr.0,
+                        present: fault.present,
+                    };
+                    counts.fault(true, true, nth, at);
+                }
+            }
+        });
     }
 
     /// Grows a mapping of the space `space` views down to `addr`, as the
@@ -536,14 +583,23 @@ pub mod faults {
             };
             let nth = field.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
             if !forced && ADDRESSES.load(Ordering::Relaxed) {
-                counts.fault(kernel, nth, at);
+                counts.fault(kernel, false, nth, at);
             }
             true
         })
     }
 
-    pub(crate) fn count(at: At) {
+    /// Counts a fault of a `write` or a read `at`, unless it is the retry
+    /// of a kernel access's fault already counted as a major one
+    /// ([`retry_major`]).
+    pub(crate) fn count(at: At, write: bool) {
         NOTED.with(|noted| noted.set(true));
+        if let Some(retried) = RETRIED.with(Cell::take)
+            && retried == (at.addr & !(super::PAGE_SIZE - 1), write)
+            && KERNEL.with(Cell::get)
+        {
+            return;
+        }
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
         } else if !add(false, at) {
@@ -628,6 +684,9 @@ pub mod faults {
     /// on (a system call's, a signal frame's), or its guest code's; returns
     /// what it was.
     pub fn set_kernel(kernel: bool) -> bool {
+        // What a retried fault left ([`retry_major`]) ends with the work it
+        // was of.
+        RETRIED.with(|r| r.set(None));
         KERNEL.with(|was| was.replace(kernel))
     }
 
@@ -4839,7 +4898,7 @@ impl AddressSpaceData {
                         if let Some(fault) = faults::refused(at, false, access == Access::Fetch) {
                             return Err(fault);
                         }
-                        faults::count(at);
+                        faults::count(at, false);
                     } else if missing && access == Access::Dump {
                         faults::count_forced();
                     }
@@ -5030,7 +5089,7 @@ impl AddressSpaceData {
                     if let Some(fault) = faults::refused(at, true, false) {
                         return Err(fault);
                     }
-                    faults::count(at);
+                    faults::count(at, true);
                 } else {
                     faults::count_forced();
                 }
@@ -9792,7 +9851,9 @@ impl AddressSpace {
     /// code whether it brought anything in or not. As the first try of a
     /// fault of user code runs under the VMA's lock, whose retry is not
     /// `FAULT_FLAG_TRIED`, it is a minor one. Nothing while the page still
-    /// waits; the instruction then faults again.
+    /// waits; the instruction then faults again. It is for a fault of the
+    /// guest's code alone: a kernel access's retry is a major fault, which
+    /// `faults::resolve` counts.
     pub fn retry_own_fault(&self, addr: GuestAddr, write: bool, fetch: bool) {
         if self.userfault_for(addr, write, fetch).is_some() {
             return;
@@ -9800,10 +9861,13 @@ impl AddressSpace {
         let (done, counted) = faults::noted(|| self.touch(addr, write, fetch));
         if done && !counted {
             faults::taken_as_own(|| {
-                faults::count(faults::At {
-                    addr: addr.0,
-                    present: true,
-                });
+                faults::count(
+                    faults::At {
+                        addr: addr.0,
+                        present: true,
+                    },
+                    write,
+                );
             });
         }
     }
@@ -11540,7 +11604,7 @@ mod tests {
     #[test]
     fn an_armed_thread_s_own_faults_are_refused_until_its_page_is_touched() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11550,6 +11614,9 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let space = AddressSpace::new();
@@ -11622,7 +11689,7 @@ mod tests {
     #[test]
     fn a_retried_fault_counts_once_as_the_code_s_own() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11632,6 +11699,9 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let mut space = AddressSpace::new();
@@ -11669,9 +11739,9 @@ mod tests {
     }
 
     #[test]
-    fn the_destination_of_a_read_and_a_write_takes_one_fault_a_write() {
+    fn a_kernel_access_a_userfaultfd_had_try_again_takes_one_major_fault() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11681,6 +11751,109 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
+            }
+        }
+        /// Serves each fault as `how` says of its page: 0 copies, 1
+        /// unregisters, 2 wakes once with nothing done, then copies.
+        struct Serve {
+            how: AtomicU64,
+            woken: AtomicU64,
+        }
+        impl faults::Resolver for Serve {
+            fn resolve(&self, space: &MemoryView, addr: u64, _: bool, _: bool) -> bool {
+                let page = addr & !(PAGE_SIZE - 1);
+                let how = self.how.load(Ordering::SeqCst);
+                if how == 2 && self.woken.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return true;
+                }
+                if how == 1 {
+                    space
+                        .userfault_unregister(page, page + PAGE_SIZE, 7)
+                        .unwrap();
+                } else {
+                    let bytes = [7; PAGE_SIZE as usize];
+                    space
+                        .userfault_fill(page, page + PAGE_SIZE, page, Some(&bytes), false)
+                        .unwrap();
+                }
+                true
+            }
+            fn grow(&self, _: &MemoryView, _: u64) -> bool {
+                false
+            }
+        }
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                5 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let page = |n: u64| GuestAddr(at.0 + n * PAGE_SIZE);
+        space
+            .view()
+            .userfault_register(page(0).0, page(4).0, 7, Userfault::MISSING)
+            .unwrap();
+        let _ = (faults::take(), faults::take_forced());
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        let serve = Arc::new(Serve {
+            how: AtomicU64::new(0),
+            woken: AtomicU64::new(0),
+        });
+        let was = faults::set_resolver(Some(Arc::clone(&serve) as _));
+        let load = || {
+            let [user, kernel, forced] = counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
+            [user, kernel, forced, counts.1.load(Ordering::SeqCst)]
+        };
+        let kernel = faults::set_kernel(true);
+        // A copy fills it: the retry finds it there, and the fault is one
+        // major one, not a minor one too.
+        space.write(page(0), &[1]).unwrap();
+        assert_eq!(load(), [0, 0, 0, 1]);
+        // The retry brings it in itself, once it is no longer registered.
+        serve.how.store(1, Ordering::SeqCst);
+        space.write(page(1), &[1]).unwrap();
+        assert_eq!(load(), [0, 0, 0, 2]);
+        // A wake with nothing done waits again: still one.
+        serve.how.store(2, Ordering::SeqCst);
+        let mut byte = [0];
+        space.read(page(2), &mut byte).unwrap();
+        assert_eq!((load(), byte), ([0, 0, 0, 3], [7]));
+        // Through `get_user_pages`, the retry finds the page and counts
+        // nothing (`__get_user_pages`).
+        serve.how.store(0, Ordering::SeqCst);
+        faults::through_gup(|| space.write(page(3), &[1])).unwrap();
+        assert_eq!(load(), [0, 0, 0, 3]);
+        // A later fault of another page is a minor one again.
+        space.write(page(4), &[1]).unwrap();
+        assert_eq!(load(), [0, 1, 0, 3]);
+        faults::set_kernel(kernel);
+        faults::set_resolver(was);
+        faults::unbind();
+    }
+
+    #[test]
+    fn the_destination_of_a_read_and_a_write_takes_one_fault_a_write() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3], AtomicU64);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let mut space = AddressSpace::new();
@@ -11752,7 +11925,7 @@ mod tests {
     #[test]
     fn a_bound_thread_counts_its_faults_as_they_are_taken() {
         #[derive(Default)]
-        struct Counts([AtomicU64; 3]);
+        struct Counts([AtomicU64; 3], AtomicU64);
         impl faults::Sink for Counts {
             fn user(&self) -> &AtomicU64 {
                 &self.0[0]
@@ -11762,6 +11935,9 @@ mod tests {
             }
             fn forced(&self) -> &AtomicU64 {
                 &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
             }
         }
         let load = |counts: &Counts| counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));

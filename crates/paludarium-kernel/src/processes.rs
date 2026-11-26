@@ -260,7 +260,7 @@ pub struct Processes {
     /// goes on counting, as Linux's per-CPU counts keep a task's time.
     reaped_times: Mutex<crate::proc::CpuTimes>,
     /// The same of what they counted on each CPU ([`crate::CpuCounts`]).
-    reaped_counts: Mutex<Vec<[u64; 4]>>,
+    reaped_counts: Mutex<Vec<crate::Counts>>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -384,7 +384,7 @@ impl Processes {
     }
     /// What every process's threads counted on `cpu`, those reaped included,
     /// as [`crate::CpuCounts`] orders it.
-    pub(crate) fn counts_on(&self, cpu: u32) -> [u64; 4] {
+    pub(crate) fn counts_on(&self, cpu: u32) -> crate::Counts {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut counts = self
             .reaped_counts
@@ -1628,7 +1628,7 @@ impl Processes {
             let usage = crate::syscalls::ResourceUsage {
                 cpu: entry.group.process_cpu().saturating_add(entry.children_cpu),
                 peak: entry.group.waited_peak(),
-                minor_faults: entry.group.waited_faults(),
+                faults: entry.group.waited_faults(),
                 switches: entry.group.waited_switches(),
             };
             Some((pid, event, usage, entry.group.task_ids(pid, pid).uid))
@@ -1638,7 +1638,7 @@ impl Processes {
             && !wait.keep
         {
             match event {
-                // A reaped child's CPU time, minor faults and switches join its
+                // A reaped child's CPU time, faults and switches join its
                 // parent's children's, and its peak (its own or its
                 // children's) is kept as theirs if it is the largest. So do
                 // its read and write counts join its parent's process's.
@@ -1648,7 +1648,7 @@ impl Processes {
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(usage.cpu);
                         parent.group.reaped_peak(usage.peak);
-                        parent.group.reaped_faults(usage.minor_faults);
+                        parent.group.reaped_faults(usage.faults);
                         parent.group.reaped_switches(usage.switches);
                         if let Some(io) = io {
                             parent.group.reaped_io(io);

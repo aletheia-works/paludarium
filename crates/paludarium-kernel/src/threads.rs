@@ -158,9 +158,10 @@ pub struct ThreadGroup {
     /// largest of its reaped children's (`signal->cmaxrss`).
     peak: AtomicU64,
     children_peak: AtomicU64,
-    /// The minor faults of its reaped children and theirs (Linux's
-    /// `signal->cmin_flt`).
+    /// The minor and major faults of its reaped children and theirs
+    /// (Linux's `signal->cmin_flt` and `cmaj_flt`).
     children_faults: AtomicU64,
+    children_major_faults: AtomicU64,
     /// The voluntary context switches of its reaped children and theirs
     /// (Linux's `signal->cnvcsw`).
     children_switches: AtomicU64,
@@ -294,6 +295,7 @@ impl Default for ThreadGroup {
             peak: AtomicU64::new(0),
             children_peak: AtomicU64::new(0),
             children_faults: AtomicU64::new(0),
+            children_major_faults: AtomicU64::new(0),
             children_switches: AtomicU64::new(0),
             unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
@@ -1708,26 +1710,26 @@ impl ThreadGroup {
             .unwrap_or(0);
         self.peak(live).max(self.children_peak())
     }
-    /// The process's minor faults (`RUSAGE_SELF`): the sum of its threads'
+    /// The process's faults (`RUSAGE_SELF`): the sum of its threads'
     /// latest accounts, live or not, from before an `execve` too.
-    pub(crate) fn process_faults(&self) -> u64 {
+    pub(crate) fn process_faults(&self) -> crate::Faults {
         self.cpu
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|(_, used)| used.minor_faults())
-            .fold(0u64, u64::saturating_add)
+            .map(|(_, used)| used.fault_counts())
+            .fold(crate::Faults::default(), crate::Faults::plus)
     }
-    /// The minor faults of thread `tid` as of its latest account, live or
-    /// not (Linux's `task->min_flt`), 0 before its first.
-    pub(crate) fn thread_faults(&self, tid: u32) -> u64 {
+    /// The faults of thread `tid` as of its latest account, live or not
+    /// (Linux's `task->min_flt` and `maj_flt`), none before its first.
+    pub(crate) fn thread_faults(&self, tid: u32) -> crate::Faults {
         self.cpu
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .rev()
             .find(|(owner, _)| *owner == tid)
-            .map_or(0, |(_, used)| used.minor_faults())
+            .map_or_else(crate::Faults::default, |(_, used)| used.fault_counts())
     }
     /// The account of thread `tid`, its latest, live or not: where its
     /// faults count.
@@ -1740,20 +1742,25 @@ impl ThreadGroup {
             .find(|(owner, _)| *owner == tid)
             .map(|(_, used)| Arc::clone(used))
     }
-    /// The minor faults of its reaped children and theirs
-    /// (`RUSAGE_CHILDREN`).
-    pub(crate) fn children_faults(&self) -> u64 {
-        self.children_faults.load(Ordering::Relaxed)
+    /// The faults of its reaped children and theirs (`RUSAGE_CHILDREN`).
+    pub(crate) fn children_faults(&self) -> crate::Faults {
+        crate::Faults {
+            minor: self.children_faults.load(Ordering::Relaxed),
+            major: self.children_major_faults.load(Ordering::Relaxed),
+        }
     }
-    /// What a wait reports of its minor faults (`RUSAGE_BOTH`): its own and
-    /// its reaped children's.
-    pub(crate) fn waited_faults(&self) -> u64 {
-        self.process_faults().saturating_add(self.children_faults())
+    /// What a wait reports of its faults (`RUSAGE_BOTH`): its own and its
+    /// reaped children's.
+    pub(crate) fn waited_faults(&self) -> crate::Faults {
+        self.process_faults().plus(self.children_faults())
     }
-    /// Takes a reaped child's minor faults, its own and its children's
-    /// (`wait_task_zombie`'s `cmin_flt`).
-    pub(crate) fn reaped_faults(&self, faults: u64) {
-        self.children_faults.fetch_add(faults, Ordering::Relaxed);
+    /// Takes a reaped child's faults, its own and its children's
+    /// (`wait_task_zombie`'s `cmin_flt` and `cmaj_flt`).
+    pub(crate) fn reaped_faults(&self, faults: crate::Faults) {
+        self.children_faults
+            .fetch_add(faults.minor, Ordering::Relaxed);
+        self.children_major_faults
+            .fetch_add(faults.major, Ordering::Relaxed);
     }
     /// The process's voluntary context switches (`RUSAGE_SELF`): the sum of
     /// its threads' latest accounts, live or not, as Linux adds the live
@@ -3291,17 +3298,20 @@ mod fault_count_tests {
         first.faults.store(3, SeqCst);
         first.kernel_faults.store(2, SeqCst);
         first.forced_faults.store(1, SeqCst);
+        first.major_faults.store(2, SeqCst);
         let second = Arc::new(crate::Usage::default());
         second.forced_faults.store(4, SeqCst);
         group.register_cpu(1, Arc::clone(&first));
         group.register_cpu(2, second);
+        let faults = |minor, major| crate::Faults { minor, major };
+        // A major fault is not a minor one too.
         assert_eq!(first.minor_faults(), 6);
-        assert_eq!(group.process_faults(), 10);
-        assert_eq!(group.children_faults(), 0);
-        group.reaped_faults(7);
-        group.reaped_faults(5);
-        assert_eq!(group.children_faults(), 12);
-        assert_eq!(group.waited_faults(), 22);
+        assert_eq!(group.process_faults(), faults(10, 2));
+        assert_eq!(group.children_faults(), faults(0, 0));
+        group.reaped_faults(faults(7, 1));
+        group.reaped_faults(faults(5, 0));
+        assert_eq!(group.children_faults(), faults(12, 1));
+        assert_eq!(group.waited_faults(), faults(22, 3));
     }
 
     #[test]
@@ -3329,9 +3339,10 @@ mod fault_count_tests {
         second.faults.store(4, SeqCst);
         group.register_cpu(1, first);
         group.register_cpu(2, second);
-        assert_eq!(group.thread_faults(1), 3);
-        assert_eq!(group.thread_faults(2), 4);
-        assert_eq!(group.thread_faults(3), 0);
+        let minor = |tid| group.thread_faults(tid).minor;
+        assert_eq!(minor(1), 3);
+        assert_eq!(minor(2), 4);
+        assert_eq!(minor(3), 0);
         group.set_started(1, 100);
         group.set_started(2, 200);
         // Noted once, at the clone, not again at the first account.
@@ -3341,20 +3352,23 @@ mod fault_count_tests {
         // keeps its own faults; the process's count keeps the old leader's.
         group.end_exec(2, 1, Arc::default());
         assert_eq!((group.started(1), group.started(2)), (Some(100), None));
-        assert_eq!((group.thread_faults(1), group.thread_faults(2)), (4, 0));
-        assert_eq!(group.process_faults(), 7);
+        assert_eq!((minor(1), minor(2)), (4, 0));
+        assert_eq!(group.process_faults().minor, 7);
     }
 
     #[test]
-    fn a_rusage_gives_the_minor_faults_as_ru_minflt() {
+    fn a_rusage_gives_the_faults_as_ru_minflt_and_ru_majflt() {
         let bytes = crate::syscalls::rusage(crate::syscalls::ResourceUsage {
             cpu: 0,
             peak: 0,
-            minor_faults: 41,
+            faults: crate::Faults {
+                minor: 41,
+                major: 3,
+            },
             switches: 9,
         });
         assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 41);
-        assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 3);
         // `ru_nvcsw`, and no involuntary switch (`ru_nivcsw`).
         assert_eq!(u64::from_le_bytes(bytes[128..136].try_into().unwrap()), 9);
         assert_eq!(u64::from_le_bytes(bytes[136..144].try_into().unwrap()), 0);

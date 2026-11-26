@@ -582,11 +582,11 @@ pub(crate) struct ProcessStat<'a> {
     /// Process and waited-for children's CPU time, in nanoseconds.
     pub cpu: u64,
     pub children_cpu: u64,
-    /// `min_flt` and `cmin_flt`: the minor faults of the process (or of
-    /// the thread, for a path under `task`) and of its reaped children.
-    /// None is major, so `maj_flt` and `cmaj_flt` are 0.
-    pub minor_faults: u64,
-    pub children_minor_faults: u64,
+    /// `min_flt` and `maj_flt`, `cmin_flt` and `cmaj_flt`: the faults of
+    /// the process (or of the thread, for a path under `task`) and of its
+    /// reaped children.
+    pub faults: crate::Faults,
+    pub children_faults: crate::Faults,
     /// When the task was made, in nanoseconds since boot (`start_time`).
     pub started: u64,
     /// The pages its memory holds (`get_mm_rss`).
@@ -625,7 +625,7 @@ pub(crate) struct ProcessStat<'a> {
     pub exit_code: i32,
 }
 /// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, and
-/// 0 for what nothing measures (major faults and the scheduler's figures).
+/// 0 for what nothing measures (the scheduler's figures).
 /// A reader that may not see the task's memory gets 1 for `start_code`
 /// and `end_code` and 0 for `start_stack`, `wchan`, the addresses from
 /// `start_data` on and `exit_code`, as Linux hides them; without memory the
@@ -651,10 +651,10 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         // PF_RANDOMIZE, as for a process that address space randomization
         // applies to.
         "4194304".into(),
-        s.minor_faults.to_string(),
-        s.children_minor_faults.to_string(),
-        "0".into(), // maj_flt
-        "0".into(), // cmaj_flt
+        s.faults.minor.to_string(),
+        s.children_faults.minor.to_string(),
+        s.faults.major.to_string(),
+        s.children_faults.major.to_string(),
         ticks(s.cpu).to_string(),
         "0".into(),
         ticks(s.children_cpu).to_string(),
@@ -3129,8 +3129,11 @@ mod generated_tests {
             terminal: (0, -1),
             cpu: 1_230_000_000,
             children_cpu: 20_000_000,
-            minor_faults: 70,
-            children_minor_faults: 9,
+            faults: crate::Faults {
+                minor: 70,
+                major: 2,
+            },
+            children_faults: crate::Faults { minor: 9, major: 1 },
             started: 4_560_000_000,
             resident: 3,
             nice: 3,
@@ -3163,7 +3166,7 @@ mod generated_tests {
         let fields: Vec<&str> = rest.split_whitespace().collect();
         assert_eq!(fields.len() + 2, 52);
         // minflt, cminflt, majflt and cmajflt.
-        assert_eq!(&fields[7..11], ["70", "9", "0", "0"]);
+        assert_eq!(&fields[7..11], ["70", "9", "2", "1"]);
         // utime and cutime in USER_HZ ticks; priority, nice, threads.
         assert_eq!(fields[11], "123");
         assert_eq!(fields[13], "2");
@@ -3203,8 +3206,8 @@ mod generated_tests {
                 terminal: (0, -1),
                 cpu: 0,
                 children_cpu: 0,
-                minor_faults: 0,
-                children_minor_faults: 0,
+                faults: crate::Faults::default(),
+                children_faults: crate::Faults::default(),
                 started: 0,
                 resident: 0,
                 nice: 0,

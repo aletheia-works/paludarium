@@ -1289,7 +1289,13 @@ kernel.
   Unless a signal is to be taken first, the retry counts as a minor fault
   of the thread's own code (`ru_minflt`, `page-faults`, `minor-faults`),
   whether it brings the page in or not: its first try ran under the VMA's
-  lock, whose retry is not `FAULT_FLAG_TRIED`.
+  lock, whose retry is not `FAULT_FLAG_TRIED`. The fault of a kernel
+  access, which waits as described above, is a major one: a kernel-mode
+  fault does not run under the VMA's lock first, so its retry is
+  `FAULT_FLAG_TRIED`, and it counts once (`ru_majflt`, `page-faults`,
+  `major-faults`, and no minor fault), whether the retry brings the page in
+  or not. One through `get_user_pages` finds the page there and counts
+  nothing.
   With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
   instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
   their protection, VMA by VMA as `mwriteprotect_range` does: each must be
@@ -4391,10 +4397,10 @@ kernel.
   (as Linux's `task_cpu` is the one it last ran on; `getcpu` looks at the
   mask again at once, so after `sched_setaffinity` `stat` follows from the
   task's next system call), and the real-time priority and policy. A path under
-  `task` gives the thread's own, its CPU time and minor faults too; the
+  `task` gives the thread's own, its CPU time and faults too; the
   process's CPU time and faults are all its threads', the rest its leader's. What
-  nothing measures is 0: major faults, and the system time, as all the CPU
-  time counts as the user's.
+  nothing measures is 0: the system time, as all the CPU time counts as
+  the user's.
   A reader that may not see the task's memory, as Linux's
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
@@ -5077,10 +5083,13 @@ kernel.
   context switches, the times a thread went to sleep, as Linux's `nvcsw`,
   for the same processes and threads and with a wait's and
   `RUSAGE_CHILDREN`'s the children's (`cnvcsw`), as of each thread's latest
-  system call. The other counts (major faults, involuntary context
-  switches, blocks) are 0. `/proc/<pid>/stat` gives the same counts
-  as `minflt` (a thread's own under `task`) and `cminflt`, and 0 as
-  `majflt` and `cmajflt`.
+  system call. `ru_majflt` counts the major faults, for the same processes
+  and threads and children (`cmaj_flt`): the faults of the kernel's
+  accesses that a `userfaultfd` had try again, as described for
+  `userfaultfd`, each counted once as its wait ends, and to no minor
+  fault. The other counts (involuntary context switches, blocks) are 0.
+  `/proc/<pid>/stat` gives the same counts as `minflt` and `majflt` (a
+  thread's own under `task`) and `cminflt` and `cmajflt`.
 
 - A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
   takes it apart: the task's number in the caller's PID namespace
@@ -5311,8 +5320,10 @@ kernel.
   area's update, left out with `exclude_kernel`), `context-switches` (each time it
   sleeps) and `cpu-migrations` (each time the CPU `getcpu` reports
   changes), the last two made by the kernel and so left out with
-  `exclude_kernel`, as Linux leaves them out; `major-faults`, which count
-  nothing, as every page is in memory; and `alignment-faults`,
+  `exclude_kernel`, as Linux leaves them out; `major-faults` (the faults of
+  the kernel's accesses that a `userfaultfd` had try again, which
+  `page-faults` counts too and `minor-faults` does not); and
+  `alignment-faults`,
   `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
   x86-64. An event of a thread on one CPU, as `perf record` opens one for
   each, counts and runs only while the thread is on that CPU

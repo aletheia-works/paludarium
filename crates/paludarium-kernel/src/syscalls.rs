@@ -4908,30 +4908,32 @@ fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
 pub(crate) const SYSINFO_RAM: u64 = 4 << 30;
 
 /// What a `struct rusage` tells: CPU time in nanoseconds, the peak
-/// resident size in pages, the minor faults and the voluntary context
-/// switches.
+/// resident size in pages, the minor and major faults and the voluntary
+/// context switches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourceUsage {
     pub cpu: u64,
     pub peak: u64,
-    pub minor_faults: u64,
+    pub faults: crate::Faults,
     pub switches: u64,
 }
 
 /// A `struct rusage` with `usage.cpu` nanoseconds as user time,
-/// `usage.peak` pages as `ru_maxrss` in KiB, `usage.minor_faults` as
-/// `ru_minflt` and `usage.switches` as `ru_nvcsw`. The emulator's own work
-/// for the guest's system calls happens in user space on the host, so the
-/// system time is 0; every page a file's mapping reads is taken to be in
-/// the page cache, so no fault is major (`ru_majflt` is 0); nothing
-/// preempts a guest thread, so it switches only when it sleeps
-/// (`ru_nivcsw` is 0); and the other counts are not kept.
+/// `usage.peak` pages as `ru_maxrss` in KiB, `usage.faults` as `ru_minflt`
+/// and `ru_majflt` and `usage.switches` as `ru_nvcsw`. The emulator's own
+/// work for the guest's system calls happens in user space on the host, so
+/// the system time is 0; every page a file's mapping reads is taken to be
+/// in the page cache, so the only major faults are those of the kernel's
+/// accesses that a `userfaultfd` had try again; nothing preempts a guest
+/// thread, so it switches only when it sleeps (`ru_nivcsw` is 0); and the
+/// other counts are not kept.
 pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
     let mut bytes = [0u8; 144];
     bytes[..8].copy_from_slice(&(usage.cpu / 1_000_000_000).to_le_bytes());
     bytes[8..16].copy_from_slice(&(usage.cpu % 1_000_000_000 / 1000).to_le_bytes());
     bytes[32..40].copy_from_slice(&(usage.peak * 4).to_le_bytes());
-    bytes[64..72].copy_from_slice(&usage.minor_faults.to_le_bytes());
+    bytes[64..72].copy_from_slice(&usage.faults.minor.to_le_bytes());
+    bytes[72..80].copy_from_slice(&usage.faults.major.to_le_bytes());
     bytes[128..136].copy_from_slice(&usage.switches.to_le_bytes());
     bytes
 }
@@ -4941,9 +4943,10 @@ pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
 /// [`rusage`] lays it out; any other `who` is `EINVAL`. `ru_maxrss` is the
 /// process's peak resident size for the first two, as Linux takes
 /// `signal->maxrss` and the address space's high-water mark for both, and
-/// the largest of the reaped children's for RUSAGE_CHILDREN. The minor
-/// faults are the process's threads' (`signal->min_flt` and each thread's
-/// `min_flt`), the thread's, or the reaped children's (`cmin_flt`), as of
+/// the largest of the reaped children's for RUSAGE_CHILDREN. The faults
+/// are the process's threads' (`signal->min_flt` and each thread's
+/// `min_flt`, and so `maj_flt`), the thread's, or the reaped children's
+/// (`cmin_flt` and `cmaj_flt`), as of
 /// each thread's latest system call, and so are the voluntary context
 /// switches (`signal->nvcsw` and each thread's `nvcsw`, or `cnvcsw`).
 fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
@@ -4953,13 +4956,13 @@ fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         0 => ResourceUsage {
             cpu: c.group.process_cpu(),
             peak: own(),
-            minor_faults: c.group.process_faults(),
+            faults: c.group.process_faults(),
             switches: c.group.process_switches(),
         },
         1 => ResourceUsage {
             cpu: thread,
             peak: own(),
-            minor_faults: c.process.cpu.used.minor_faults(),
+            faults: c.process.cpu.used.fault_counts(),
             switches: c
                 .process
                 .cpu
@@ -4970,7 +4973,7 @@ fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         -1 => ResourceUsage {
             cpu: c.processes.children_cpu(c.process.pid),
             peak: c.group.children_peak(),
-            minor_faults: c.group.children_faults(),
+            faults: c.group.children_faults(),
             switches: c.group.children_switches(),
         },
         _ => return err(Errno::EINVAL),

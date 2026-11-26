@@ -640,14 +640,9 @@ impl KernelCopies {
 impl paludarium_mmu::faults::Resolver for KernelCopies {
     fn resolve(&self, space: &MemoryView, addr: u64, write: bool, gup: bool) -> bool {
         let at = GuestAddr(addr);
-        if gup {
-            // `__get_user_pages` faults no page in with a fatal signal
-            // pending.
-            if self.fatal() {
-                return false;
-            }
-        } else if paludarium_mmu::faults::Resolver::grow(self, space, addr) {
-            return true;
+        // `__get_user_pages` faults no page in with a fatal signal pending.
+        if gup && self.fatal() {
+            return false;
         }
         let Some((id, reason)) = space.userfault_for(at, write, false) else {
             return false;

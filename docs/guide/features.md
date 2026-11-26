@@ -2939,7 +2939,8 @@ kernel.
     packets go to the gateway's neighbour where a route of link scope
     reaches the gateway (`rt_uses_gateway`), else to their destination's.
     A gateway may be one of IPv6 (`RTA_VIA`, `fib_gw_from_via`; one of IPv4
-    there is as in `RTA_GATEWAY`, and both are `EINVAL`): it is checked as
+    there is as in `RTA_GATEWAY`, except that 0.0.0.0 is a gateway still,
+    and both are `EINVAL`): it is checked as
     an IPv6 route's (`fib_check_nh_v6_gw`), by the IPv6 table of the
     route's number, then the local and main ones, its end needs IPv6 on
     (`EACCES`), and a next hop made without its carrier is not

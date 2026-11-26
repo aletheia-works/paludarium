@@ -2,7 +2,7 @@
 import { isNode, spawnWorker, listen, stopWorker } from "./worker-support.mjs";
 import { decodeSnapshot } from "./filesystem-snapshot.mjs";
 export class PaludariumError extends Error {
-  constructor(kind, message, details = {}) { super(message); this.name = "PaludariumError"; this.kind = kind; for (const field of ["rip", "bytes", "syscall", "memoryBytes"]) if (details[field] !== undefined) this[field] = details[field]; }
+  constructor(kind, message, details = {}) { super(message); this.name = "PaludariumError"; this.kind = kind; for (const field of ["rip", "bytes", "syscall", "memoryBytes", "heapReserve"]) if (details[field] !== undefined) this[field] = details[field]; }
 }
 async function moduleBytes(url) {
   const source = new URL(url, typeof location === "undefined" ? import.meta.url : location.href);

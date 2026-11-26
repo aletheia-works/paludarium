@@ -11,9 +11,10 @@ export function compare(expected, actual, nativeRoot, guestRoot = "/") {
     if (normalize(expected[key], nativeRoot) !== normalize(actual[key], guestRoot === "/" ? "\0" : guestRoot)) throw new Error(`${key} mismatch`);
   }
 }
-// Kept beside the row, never compared: the shared memory's size when a Worker trapped.
+// Kept beside the row, never compared: the shared memory's size when a Worker trapped, and what
+// that launcher's heap reserve did at its start.
 function noteHostTrap(row, cause) {
-  if (cause?.memoryBytes !== undefined) row.host_trap ??= { memory_bytes: cause.memoryBytes };
+  if (cause?.memoryBytes !== undefined) row.host_trap ??= { memory_bytes: cause.memoryBytes, heap_reserve: cause.heapReserve ?? null };
 }
 // The probe item a row trapped in: its own, or for probe-all the item after the last one it passed.
 export function trappedProbe(name, stdout) {

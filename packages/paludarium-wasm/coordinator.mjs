@@ -255,7 +255,7 @@ function fatal(message, memoryBytes) {
   abandoned = true;
   for (const job of jobs.values()) { clearTimeout(job.timer); clearInterval(job.poll); }
   // Termination may abandon Rust locks; no further Rust ABI calls are permitted.
-  void Promise.all([...childWorkers].map(stopWorker)).finally(() => port.send({ type: "fatal", error: memoryBytes === undefined ? failure("host", message) : { ...failure("host", message), memoryBytes } }));
+  void Promise.all([...childWorkers].map(stopWorker)).finally(() => port.send({ type: "fatal", error: memoryBytes === undefined ? failure("host", message) : { ...failure("host", message), memoryBytes, heapReserve } }));
 }
 async function sharedProbe() {
   const space = e.shared_space_new();

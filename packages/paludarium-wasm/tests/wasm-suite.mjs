@@ -50,7 +50,8 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, 
       catch (cause) { row.pass = false; row.comparison_error = String(cause); }
       rows[item.name] = row; await onRow(item.name, row);
     }
-    // Diagnostics only, never compared: what heap_reserve did at this launcher's init, and the memory's size now.
+    // Diagnostics only, never compared: what heap_reserve did at this launcher's init, and the memory's
+    // size now. A launcher that trapped is closed by then, so its own reserve travels in its row's host_trap.
     try { const { heapReserve, memoryBytes } = await launcher.diagnostics(); heapDiagnostics = { heap_reserve: heapReserve, memory_bytes: memoryBytes }; }
     catch (cause) { heapDiagnostics = { error: String(cause) }; }
   } finally { await launcher.dispose(); }

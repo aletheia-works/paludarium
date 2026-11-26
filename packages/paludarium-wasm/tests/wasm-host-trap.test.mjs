@@ -19,8 +19,10 @@ test("probe-all traps in the item after the last one it passed", () => {
 });
 
 test("a host error keeps the memory's size when its Worker trapped", () => {
-  const error = new PaludariumError("host", "RuntimeError: access to a null reference", { memoryBytes: 1073741824 });
+  const heapReserve = { reserved: 1006632960, bytesBefore: 8388608, bytesAfter: 1073741824 };
+  const error = new PaludariumError("host", "RuntimeError: access to a null reference", { memoryBytes: 1073741824, heapReserve });
   assert.equal(error.memoryBytes, 1073741824);
+  assert.deepEqual(error.heapReserve, heapReserve);
   assert.equal(new PaludariumError("host", "x").memoryBytes, undefined);
 });
 
@@ -30,8 +32,8 @@ function trappingLauncher(error) {
 }
 
 test("the row keeps the trap's memory size beside its errors, which stay as they were", async () => {
-  const row = await observeProgram(trappingLauncher(new PaludariumError("host", "RuntimeError: trap", { memoryBytes: 65536 })), { program: "/probe" });
-  assert.deepEqual(row.host_trap, { memory_bytes: 65536 });
+  const row = await observeProgram(trappingLauncher(new PaludariumError("host", "RuntimeError: trap", { memoryBytes: 65536, heapReserve: null })), { program: "/probe" });
+  assert.deepEqual(row.host_trap, { memory_bytes: 65536, heap_reserve: null });
   assert.equal(row.errors.length, 3);
   for (const entry of row.errors) assert.deepEqual(Object.keys(entry).filter(key => key !== "stream"), ["kind", "message"]);
 });

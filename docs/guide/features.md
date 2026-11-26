@@ -1069,8 +1069,9 @@ kernel.
   mapping's pages are mapped again at their next access. `MADV_FREE` keeps the contents, as
   Linux does without memory pressure.
   `MADV_WILLNEED` is accepted, and so are `MADV_COLD` and `MADV_PAGEOUT`
-  (with nothing to reclaim, hints too): each needs only the range mapped
-  (`ENOMEM`). `MADV_DONTNEED_LOCKED` discards as
+  (with nothing to reclaim, hints too): each needs the range mapped
+  (`ENOMEM`), and the last two refuse locked memory, huge pages
+  (`MAP_HUGETLB`) and memory Linux maps `VM_PFNMAP` (`EINVAL`). `MADV_DONTNEED_LOCKED` discards as
   `MADV_DONTNEED` does. `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`
   fault the pages in, as a read or a write would (the zero page, a page of
   its own), up to a page no mapping holds (`ENOMEM`), one its mapping may
@@ -1085,7 +1086,8 @@ kernel.
   one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
   takes only private anonymous memory, memory core mm does not back, as
   the rings of AIO, `io_uring` and perf events, takes no `MADV_DOFORK` or
-  `MADV_DODUMP`, and a perf ring buffer takes no change to only a part of
+  `MADV_DODUMP`, though huge pages take `MADV_DODUMP`, huge pages take no
+  `MADV_HUGEPAGE`, and a perf ring buffer takes no change to only a part of
   it), and a hole in the range gives
   `ENOMEM` after the rest has taken it. A `fork`ed child gets no mapping
   `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
@@ -1108,7 +1110,8 @@ kernel.
   `mremap`, and go with `munmap`. `MADV_GUARD_REMOVE` takes them out,
   leaving pages without contents. Sealed memory whose pages may not be
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
-  which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`).
+  which Linux maps `VM_DONTEXPAND`, huge pages and the vDSO's data take
+  neither advice (`EINVAL`).
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
   `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent, a
@@ -1779,7 +1782,10 @@ kernel.
   a fixed mapping has unmapped what it would replace. With `MAP_NORESERVE`
   it succeeds, and an access raises `SIGBUS`. Such a mapping goes at a 2 MiB
   boundary, is split, remapped and dropped only on one (`EINVAL`), cannot
-  grow, and shows `ht` and its 2 MiB pages in `smaps`. The only size is
+  grow, and shows `ht` and its 2 MiB pages in `smaps`. `madvise` refuses
+  it `MADV_FREE`, `MADV_COLD`, `MADV_PAGEOUT`, `MADV_HUGEPAGE` and the
+  guards, and `MADV_DONTNEED` from an address off a 2 MiB boundary
+  (`EINVAL`). The only size is
   2 MiB (another is `EINVAL`), as the virtual CPU has no 1 GiB pages, and a
   file with the flag is `EINVAL`.
 

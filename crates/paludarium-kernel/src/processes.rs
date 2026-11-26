@@ -64,9 +64,14 @@ struct Entry {
     /// RLIMIT_CPU through its pair there ([`Entry::limits`]), and
     /// RLIMIT_CORE when a core is dumped.
     limits: [(u64, u64); RLIMITS],
-    /// PR_SET_PDEATHSIG: sent to this process when its parent exits; cleared
-    /// on fork.
-    death_signal: i32,
+    /// PR_SET_PDEATHSIG of each of its threads that set one (a task's
+    /// `pdeath_signal`), by thread ID: sent to the process when the parent's
+    /// thread that made it exits ([`Processes::thread_exited`]); a new
+    /// thread or process has none.
+    death_signals: BTreeMap<u32, i32>,
+    /// The IDs of the last of its threads to exit, which its children's
+    /// parent-death signals come from.
+    last_thread: Option<(u32, TaskIds)>,
     /// PR_SET_DUMPABLE and PR_SET_NO_NEW_PRIVS, recorded for PR_GET_*.
     dumpable: bool,
     no_new_privs: bool,
@@ -312,7 +317,8 @@ impl Processes {
                     executed: false,
                     execs: 0,
                     limits: DEFAULT_LIMITS,
-                    death_signal: 0,
+                    death_signals: BTreeMap::new(),
+                    last_thread: None,
                     dumpable: true,
                     no_new_privs: false,
                     exec_user: crate::users::UserNs::default(),
@@ -548,7 +554,8 @@ impl Processes {
                 executed: false,
                 execs: 0,
                 limits,
-                death_signal: 0,
+                death_signals: BTreeMap::new(),
+                last_thread: None,
                 dumpable,
                 no_new_privs,
                 exec_user,
@@ -567,20 +574,25 @@ impl Processes {
         );
     }
     /// `prctl` options kept per process.
-    fn prctl(&self, pid: u32, option: u64, a: [u64; 6]) -> Result<Option<i32>, Errno> {
+    fn prctl(&self, pid: u32, tid: u32, option: u64, a: [u64; 6]) -> Result<Option<i32>, Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
         match option {
-            // PR_SET_PDEATHSIG, PR_GET_PDEATHSIG (written out by the caller)
+            // PR_SET_PDEATHSIG, PR_GET_PDEATHSIG (written out by the caller),
+            // the calling thread's.
             1 => {
                 let number = i32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
                 if !(0..=64).contains(&number) {
                     return Err(Errno::EINVAL);
                 }
-                entry.death_signal = number;
+                if number == 0 {
+                    entry.death_signals.remove(&tid);
+                } else {
+                    entry.death_signals.insert(tid, number);
+                }
                 Ok(None)
             }
-            2 => Ok(Some(entry.death_signal)),
+            2 => Ok(Some(entry.death_signals.get(&tid).copied().unwrap_or(0))),
             // PR_GET_DUMPABLE, PR_SET_DUMPABLE
             3 => Ok(Some(i32::from(entry.dumpable))),
             4 if a[1] <= 1 => {
@@ -906,14 +918,89 @@ impl Processes {
             _ => return Err(Errno::EINVAL),
         })
     }
-    /// An effective or filesystem ID of the process changed: it becomes
-    /// undumpable (`fs.suid_dumpable`, 0 by default) and forgets its
-    /// parent-death signal, as Linux's `commit_creds` does.
-    pub(crate) fn credentials_changed(&self, pid: u32) {
+    /// An effective or filesystem ID of thread `tid` changed: its process
+    /// becomes undumpable (`fs.suid_dumpable`, 0 by default) and the thread
+    /// forgets its parent-death signal, as Linux's `commit_creds` does.
+    pub(crate) fn credentials_changed(&self, pid: u32, tid: u32) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
             entry.dumpable = false;
-            entry.death_signal = 0;
+            entry.death_signals.remove(&tid);
+        }
+    }
+    /// Thread `tid` of process `pid`, of IDs `ids`, exits: its parent-death
+    /// signal goes, and as Linux's `forget_original_parent` the children it
+    /// made are made `alive`'s (`find_alive_thread`), each of whose threads
+    /// that set a parent-death signal sends it to its process. With no
+    /// thread alive, the process's exit does that ([`Self::finish`]), as
+    /// this thread.
+    pub(crate) fn thread_exited(&self, pid: u32, tid: u32, ids: TaskIds, alive: Option<u32>) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = entries.get_mut(&pid) else {
+            return;
+        };
+        entry.death_signals.remove(&tid);
+        let Some(alive) = alive else {
+            entry.last_thread = Some((tid, ids));
+            return;
+        };
+        Self::send_death_signals(&entries, pid, &ids, |child| child.maker == tid);
+        for child in entries.values_mut() {
+            if child.parent == pid && child.maker == tid {
+                child.maker = alive;
+            }
+        }
+    }
+    /// As thread `tid` runs a new program as process `pid`'s leader, it
+    /// keeps its own parent-death signal and the children it made, as the
+    /// task does in Linux, under its new number.
+    pub(crate) fn exec_renumber(&self, pid: u32, tid: u32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&pid) {
+            let own = entry.death_signals.remove(&tid);
+            entry.death_signals = own.map(|number| (pid, number)).into_iter().collect();
+        }
+        for child in entries.values_mut() {
+            if child.parent == pid && child.maker == tid {
+                child.maker = pid;
+            }
+        }
+    }
+    /// The parent-death signals of process `pid`'s live children that `of`
+    /// picks, as an exiting thread of IDs `ids` sends them in Linux's
+    /// `forget_original_parent`: each of a child's threads that set one
+    /// sends it to its process (`group_send_sig_info` with
+    /// `SEND_SIG_NOINFO`), as the exiting thread with `kill`'s checks.
+    fn send_death_signals(
+        entries: &BTreeMap<u32, Entry>,
+        pid: u32,
+        ids: &TaskIds,
+        of: impl Fn(&Entry) -> bool,
+    ) {
+        let parent_session = entries.get(&pid).map(|p| p.sid);
+        for (&child_pid, child) in entries {
+            if child.parent != pid || child.status.is_some() || !of(child) {
+                continue;
+            }
+            for (&tid, &number) in &child.death_signals {
+                let target = child.group.task_ids(child_pid, tid);
+                if (ids.may_signal(&target)
+                    || (number == SIGCONT && Some(child.sid) == parent_session))
+                    && !crate::landlock::scoped(
+                        &ids.landlock,
+                        &target.landlock,
+                        crate::landlock::SCOPE_SIGNAL,
+                    )
+                {
+                    // From outside the child's PID namespace it is forced;
+                    // the init of one drops what it has no handler for.
+                    let from = child.space.number(pid);
+                    let blocked = child.group.blocked(child_pid);
+                    if !child.group.drops_as_init(number, from == 0, blocked) {
+                        let _ = child.group.send_process_from(number, from, ids.uid);
+                    }
+                }
+            }
         }
     }
     /// After exec, the process is dumpable or not, its program runs in user
@@ -932,7 +1019,7 @@ impl Processes {
             entry.dumpable = dumpable;
             entry.exec_user = exec_user;
             if forget_death_signal {
-                entry.death_signal = 0;
+                entry.death_signals.clear();
             }
             if secure {
                 entry.limits[3].0 = entry.limits[3].0.min(8 << 20);
@@ -1232,38 +1319,14 @@ impl Processes {
                 let _ = Self::deliver(&mut entries, other, None, Self::from_kernel(9));
             }
         }
-        // Children that asked for it learn that this process exited.
-        let parent_ids = entries.get(&pid).map(|p| p.group.task_ids(pid, pid));
-        let parent_session = entries.get(&pid).map(|p| p.sid);
-        let same_session = |child: &Entry| Some(child.sid) == parent_session;
-        for (&child_pid, child) in entries.iter() {
-            if child.parent == pid && child.status.is_none() && child.death_signal != 0 {
-                // Linux sends it as the exiting parent, as with `kill`.
-                let sender = parent_ids.clone().unwrap_or_default();
-                let target = child.group.task_ids(child_pid, child_pid);
-                if (sender.may_signal(&target)
-                    || (child.death_signal == SIGCONT && same_session(child)))
-                    && !crate::landlock::scoped(
-                        &sender.landlock,
-                        &target.landlock,
-                        crate::landlock::SCOPE_SIGNAL,
-                    )
-                {
-                    // From outside the child's PID namespace it is forced;
-                    // the init of one drops what it has no handler for.
-                    let from = child.space.number(pid);
-                    let blocked = child.group.blocked(child_pid);
-                    if !child
-                        .group
-                        .drops_as_init(child.death_signal, from == 0, blocked)
-                    {
-                        let _ = child
-                            .group
-                            .send_process_from(child.death_signal, from, sender.uid);
-                    }
-                }
-            }
-        }
+        // The children's threads that asked for it learn that the last of
+        // this process's threads exited, from that thread.
+        let last = entries.get(&pid).map(|p| {
+            p.last_thread
+                .clone()
+                .map_or_else(|| p.group.task_ids(pid, pid), |(_, ids)| ids)
+        });
+        Self::send_death_signals(&entries, pid, &last.unwrap_or_default(), |_| true);
         // As Linux's forget_original_parent: the children go to the nearest
         // live ancestor that is a child subreaper, else to the first
         // process, with SIGCHLD as their exit signal, and one that has
@@ -2834,7 +2897,10 @@ impl Kernel {
             }
             _ => {}
         }
-        match self.processes.prctl(self.process.pid, a[0], a)? {
+        match self
+            .processes
+            .prctl(self.process.pid, thread.tid, a[0], a)?
+        {
             Some(value) if a[0] == 2 || a[0] == 37 => {
                 mem.write(GuestAddr(a[1]), &value.to_le_bytes())
                     .map_err(|_| Errno::EFAULT)?;
@@ -5204,6 +5270,7 @@ impl Kernel {
             self.group
                 .renumber_shm_creator(thread.tid, self.process.pid);
         }
+        self.processes.exec_renumber(self.process.pid, thread.tid);
         thread.tid = self.process.pid;
         let closed = self.files.take_close_on_exec();
         self.files = self.files.for_exec();

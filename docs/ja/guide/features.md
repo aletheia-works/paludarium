@@ -5508,7 +5508,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
-  `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`
+  `PR_SET_PDEATHSIG`（スレッドごとで、新しいスレッドとプロセスにはありません。
+  Linux の `forget_original_parent` と同じく、各スレッドのシグナルは、そのプロセスを
+  作った親のスレッドが終わったときに、親が動き続けていてもプロセスに送り、そのあと
+  親になったスレッドが終わるたびにまた送ります）、`PR_SET_DUMPABLE`
   （`execve` は、上に書いた場合のほかは、またダンプできるようにします）、
   `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、ケーパビリティモジュールの
   `PR_CAPBSET_READ`、`PR_CAPBSET_DROP`（`CAP_SETPCAP` が要ります）、`PR_GET_SECUREBITS`、
@@ -5566,8 +5569,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   確かめる資格情報は ID が指すスレッドのものです。グループはどれかのメンバーに届けば
   成功とし、-1 は送れない相手を報告しません。`kill` や `pidfd_send_signal` で送った
   シグナルの `si_pid` と `si_uid` は送り主の PID と実ユーザー ID に（`tkill` と `tgkill`
-  も同じです）、`PR_SET_PDEATHSIG` のシグナルでは終わった親の PID と実ユーザー ID に
-  なります。このシグナルにも同じ許可が要ります。
+  も同じです）、`PR_SET_PDEATHSIG` のシグナルでは親の PID と、終わった親のスレッドの実ユーザー ID に
+  なります。このシグナルにも、終わったスレッドからシグナルを設定したスレッドへの同じ許可が要ります。
 
 - `rt_sigqueueinfo`（`sigqueue` の中身）は、呼び出し元の siginfo をそのままプロセスに
   送り、`rt_tgsigqueueinfo` は 1 つのスレッドに送ります。そのためシグナルは値を運び、

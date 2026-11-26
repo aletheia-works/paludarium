@@ -10,6 +10,7 @@ musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/timer-waits" "$here/timer-waits.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/signal-threads" "$here/signal-threads.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/exec-pending" "$here/exec-pending.c"
+musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/pdeath-thread" "$here/pdeath-thread.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/keys" "$here/keys.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/inotify" "$here/inotify.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/fanotify" "$here/fanotify.c"

@@ -218,6 +218,10 @@ impl Targets {
             tif.set_halted(false);
         }
     }
+    /// The first of its threads that does not exit (`find_alive_thread`).
+    pub(crate) fn alive(&self) -> Option<u32> {
+        self.list().threads.first().map(|&(tid, _)| tid)
+    }
     pub(crate) fn find(&self, tid: u32) -> Option<Arc<Tif>> {
         let list = self.list();
         list.position(tid).map(|at| Arc::clone(&list.threads[at].1))

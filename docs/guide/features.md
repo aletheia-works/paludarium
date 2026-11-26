@@ -6444,8 +6444,11 @@ kernel.
 
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per
   thread, taken from the program's file name at `execve` and inherited by new
-  threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
-  parent exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
+  threads and processes), `PR_SET_PDEATHSIG` (per thread, none for a new
+  thread or process; as Linux's `forget_original_parent` sends it, each
+  thread's signal goes to its process when the parent's thread that made
+  the process exits, even if the parent goes on, and again as each thread
+  the process is then a child of exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
   again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), the capability module's `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`
   (with `CAP_SETPCAP`), `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` (which
@@ -6510,8 +6513,8 @@ kernel.
   while -1 does not report those it may not signal. A signal from `kill` or
   `pidfd_send_signal` gives its sender's PID in `si_pid` and real user ID in
   `si_uid`, as `tkill` and `tgkill` do, and the `PR_SET_PDEATHSIG` signal the
-  PID and real user ID of the parent that exited, which needs the same
-  permission.
+  parent's PID and the real user ID of its thread that exited, which needs
+  the same permission of that thread over the thread that set the signal.
 
 - `rt_sigqueueinfo` (behind `sigqueue`) sends a process the caller's siginfo
   as it is, and `rt_tgsigqueueinfo` sends it to one thread, so the signal

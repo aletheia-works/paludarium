@@ -474,6 +474,7 @@
     {"name":"timer-waits-restart","binary":"timer-waits"},
     {"name":"timer-waits-default","binary":"timer-waits"},
     {"name":"exec-pending","binary":"exec-pending"},
+    {"name":"pdeath-thread","binary":"pdeath-thread"},
     {"name":"cpu-itimer","binary":"process"},
     {"name":"rlimit-cpu","binary":"process"},
     {"name":"cpu-timer","binary":"process"},

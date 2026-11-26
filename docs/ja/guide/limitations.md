@@ -876,8 +876,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   確かめていません。
   `F_SETOWN` は設定した側の資格情報を記録しないので、
   `SIGIO` と `SIGURG` は、Linux の `sigio_perm` と違い、だれが設定しても持ち主に届きます。
-  `PR_SET_PDEATHSIG` のシグナルは、親プロセスが終わったときにそのリーダーの ID で送りますが、
-  Linux は子を作ったスレッドが終わったときにそのスレッドの ID で送ります。
   ファイルのうち、`/proc` と `/dev` の下は確かめません。`fs.protected_hardlinks`、
   `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
   カーネルの既定値の 0 として振る舞います。多くのディストリビューションは

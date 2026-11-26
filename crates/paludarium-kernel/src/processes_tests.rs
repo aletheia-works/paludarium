@@ -554,6 +554,52 @@ mod process {
         assert_eq!(get(&mut k, &mut t, 3, 0), Errno::EINVAL.to_syscall_return());
     }
     #[test]
+    fn parent_death_signals_are_each_threads_and_come_as_the_making_thread_exits() {
+        let (mut k, mut t, m) = setup();
+        // A thread of the parent makes the child.
+        syscall(&mut k, &mut t, &m, 56, [0x10900, 0, 0, 0, 0, 0]);
+        let (mut maker, mut mt) = k.take_child().unwrap();
+        let (mut c, mut ct, cm) = fork(&mut maker, &mut mt, &m);
+        let death = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace| {
+            assert_eq!(syscall(k, t, m, 157, [2, DATA, 0, 0, 0, 0]), 0);
+            m.read_u64(GuestAddr(DATA)).unwrap() as u32
+        };
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [1, 10, 0, 0, 0, 0]), 0);
+        // Another thread of the child has none until it sets its own.
+        syscall(&mut c, &mut ct, &cm, 56, [0x10900, 0, 0, 0, 0, 0]);
+        let (mut other, mut ot) = c.take_child().unwrap();
+        assert_eq!(death(&mut other, &mut ot, &cm), 0);
+        assert_eq!(
+            syscall(&mut other, &mut ot, &cm, 157, [1, 12, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(death(&mut other, &mut ot, &cm), 12);
+        assert_eq!(death(&mut c, &mut ct, &cm), 10);
+        // Blocked, so that they stay pending.
+        let set = (1u64 << 9) | (1 << 11);
+        cm.write(GuestAddr(DATA), &set.to_le_bytes()).unwrap();
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 14, [0, DATA, 0, 8, 0, 0]), 0);
+        // What is pending, which is then taken (`rt_sigpending`,
+        // `rt_sigtimedwait` with no wait).
+        let taken = |c: &mut Kernel, ct: &mut Thread| {
+            assert_eq!(syscall(c, ct, &cm, 127, [DATA, 8, 0, 0, 0, 0]), 0);
+            let pending = cm.read_u64(GuestAddr(DATA)).unwrap();
+            cm.write(GuestAddr(DATA), &set.to_le_bytes()).unwrap();
+            cm.write(GuestAddr(DATA + 0x100), &[0; 16]).unwrap();
+            while syscall(c, ct, &cm, 128, [DATA, 0, DATA + 0x100, 8, 0, 0]) as i64 > 0 {}
+            (1..=64)
+                .filter(|n| pending >> (n - 1) & 1 != 0)
+                .collect::<Vec<i32>>()
+        };
+        // The leader's own children are not this thread's, and the parent
+        // goes on: each of the child's threads' signals comes all the same.
+        maker.finish_thread(&mt, &m);
+        assert_eq!(taken(&mut c, &mut ct), [10, 12]);
+        // The child is the leader's now, whose exit sends them again.
+        finish(&mut k, &t, &m, ExitStatus::Exited(0));
+        assert_eq!(taken(&mut c, &mut ct), [10, 12]);
+    }
+    #[test]
     fn parent_registration() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

@@ -1046,9 +1046,7 @@ verified.
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so
   `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's
   `sigio_perm` checks.
-  The `PR_SET_PDEATHSIG` signal is sent when the parent process ends, with the
-  IDs of its leader, where Linux sends it when the thread that made the child
-  ends, with that thread's. Of the files, those under `/proc` and `/dev` are
+  Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
   act as 0, the kernel's defaults, which many distributions raise. A

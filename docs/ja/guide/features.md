@@ -3927,6 +3927,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   読むたびに作ります。
   - `dev`（`dev_seq_show`）はデバイスで、カウンタは 0 です。`if_inet6`（`if6_seq_show`）は IPv6 の
     アドレス、`route`（`fib_route_seq_show`）は IPv4 の main の表で、表がなければ空です。
+    IPv6 のゲートウェイ（`RTA_VIA`）は 00000000 で、その先頭 4 バイトが 0 でなければ `RTF_GATEWAY` です（`fib_flag_trans`）。
     `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
     `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
   - ほかの名前は、`--mount /:/` でも `ENOENT` です。ホストのソケットとデバイスは、ゲストの

@@ -517,6 +517,25 @@ static void traffic(const char *label) {
     printf("%s: sendto=%ld came from %s, connect=%ld\n", label, sent, text, opened);
 }
 
+/* The lines of /proc/net/route after its header, without the spaces
+   that pad them: an IPv6 gateway is 00000000 there, and RTF_GATEWAY
+   comes of its first 4 bytes (`fib_route_seq_show`). */
+static void route_file(const char *label) {
+    char line[256];
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    int first = 1;
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == ' ')) line[--n] = 0;
+        if (!first) printf("%s: %s\n", label, line);
+        first = 0;
+    }
+    fclose(f);
+}
 int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "veth-ipv4-via")) return 99;
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -607,6 +626,7 @@ int main(int argc, char **argv) {
     add(ctl, "10.0.0.2", 0, "through 10.0.0.2");
     heard("heard");
     dump(RTM_GETROUTE, "routes");
+    route_file("route file");
     traffic("traffic");
     del(ctl, "2001:db8::2", 0, "remove one through 2001:db8::2");
     del(ctl, "10.0.0.2", 0, "remove the one through 10.0.0.2");
@@ -617,6 +637,7 @@ int main(int argc, char **argv) {
     dump(RTM_GETROUTE, "routes");
     lookup(ctl, "10.2.0.1", 0, "lookup");
     lookup(ctl, "10.2.0.1", RTM_F_FIB_MATCH, "its route");
+    route_file("route file");
     dump(RTM_GETNEIGH, "neighbours before");
     traffic("traffic");
     dump(RTM_GETNEIGH, "neighbours");
@@ -627,11 +648,16 @@ int main(int argc, char **argv) {
     heard("heard");
     add(ctl, "fe80::ff:fe00:b", VA, "through fe80::ff:fe00:b");
     lookup(ctl, "10.2.0.1", 0, "lookup");
+    route_file("route file");
     traffic("traffic");
     del(ctl, NULL, VA, "remove it by its device");
     route(ctl, RTM_NEWROUTE, "2001:db8:9::1", VA, 1, 0, 4, "on link");
     dump(RTM_GETROUTE, "routes");
     traffic("traffic to nobody");
+    del(ctl, NULL, 0, "remove it");
+    /* A gateway whose first 4 bytes are 0 is not RTF_GATEWAY there. */
+    route(ctl, RTM_NEWROUTE, "::5", VA, 1, 0, 4, "on link through ::5");
+    route_file("route file");
     del(ctl, NULL, 0, "remove it");
     heard("heard");
 

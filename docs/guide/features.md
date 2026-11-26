@@ -4565,7 +4565,9 @@ kernel.
   read:
   - `dev` (`dev_seq_show`), the devices, with counters of 0; `if_inet6`
     (`if6_seq_show`), the IPv6 addresses; `route` (`fib_route_seq_show`),
-    IPv4's main table, nothing while there is none; `ipv6_route`
+    IPv4's main table, nothing while there is none, with a gateway of IPv6
+    (`RTA_VIA`) as 00000000, `RTF_GATEWAY` where its first 4 bytes are not
+    0 (`fib_flag_trans`); `ipv6_route`
     (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
   - Any other name there is `ENOENT`, with `--mount /:/` too: the host's

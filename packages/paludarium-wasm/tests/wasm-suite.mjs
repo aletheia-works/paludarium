@@ -1,6 +1,6 @@
 import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
-import { compare, observeCoreutils, observeProgram, observeRipgrep, probeCases } from "./wasm-programs.mjs";
+import { compare, observeCoreutils, observeProgram, observeRipgrep, probeCases, trappedProbe } from "./wasm-programs.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
 import { observeRestoredAube } from "./wasm-entries.mjs";
 export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, ripgrepCases, coreutils, coreutilsCases, coreutilsFixture, fixtures, jit = false, onRow = () => {} }) {
@@ -10,6 +10,7 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, 
     const launcher = await launch();
     try {
       const row = await observeProgram(launcher, { program: "/probe", args: ["/probe", ...item.args], env: config.environment, files: { "/probe": probe, "/home/guest/.keep": new Uint8Array() }, jit });
+      if (row.host_trap) row.host_trap.item = trappedProbe(item.name, row.stdout);
       if (jit) {
         try { row.jit = (await launcher.diagnostics()).workers.filter(worker => !worker.guestThread).at(-1)?.jit; }
         catch (cause) { row.jit_diagnostics_error = String(cause); }
@@ -27,6 +28,7 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, 
   const files = { "/aube": aube, [environment.HOME + "/.keep"]: new Uint8Array(), [environment.TMPDIR + "/.keep"]: new Uint8Array() }, fileModes = {};
   for (const [relative, data] of Object.entries(fixtures)) { const path = fixtureRoot + "/" + relative; files[path] = data; fileModes[path] = 0o644; }
   const launcher = await launch();
+  let heapDiagnostics = null;
   try {
     const filesystem = await launcher.createFileSystem({ files, fileModes });
     for (const item of config.aube) {
@@ -48,9 +50,13 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, 
       catch (cause) { row.pass = false; row.comparison_error = String(cause); }
       rows[item.name] = row; await onRow(item.name, row);
     }
+    // Diagnostics only, never compared: what heap_reserve did at this launcher's init, and the memory's
+    // size now. A launcher that trapped is closed by then, so its own reserve travels in its row's host_trap.
+    try { const { heapReserve, memoryBytes } = await launcher.diagnostics(); heapDiagnostics = { heap_reserve: heapReserve, memory_bytes: memoryBytes }; }
+    catch (cause) { heapDiagnostics = { error: String(cause) }; }
   } finally { await launcher.dispose(); }
   const restored = await observeRestoredAube(launch, { files, fileModes, cwd, environment, steps: config.aube, oracle, fixtureRoot, jit, onRow });
   const ripgrepPassed = Object.values(ripgrepRows ?? {}).every(row => row.pass), restoredPassed = Object.values(restored).every(row => row.pass);
   const coreutilsPassed = Object.values(coreutilsRows ?? {}).every(row => row.pass);
-  return { rows, ripgrep: ripgrepRows, coreutils: coreutilsRows, restored, complete: Object.keys(rows).length === 14 && Object.values(rows).every(row => row.pass) && ripgrepPassed && coreutilsPassed && restoredPassed && Object.keys(restored).length === config.aube.length && (!ripgrep || Object.keys(ripgrepRows).length === ripgrepCases.length) && (!coreutils || Object.keys(coreutilsRows).length === coreutilsCases.length), passed: Object.values(rows).every(row => row.pass) && ripgrepPassed && coreutilsPassed && restoredPassed };
+  return { heap_diagnostics: heapDiagnostics, rows, ripgrep: ripgrepRows, coreutils: coreutilsRows, restored, complete: Object.keys(rows).length === 14 && Object.values(rows).every(row => row.pass) && ripgrepPassed && coreutilsPassed && restoredPassed && Object.keys(restored).length === config.aube.length && (!ripgrep || Object.keys(ripgrepRows).length === ripgrepCases.length) && (!coreutils || Object.keys(coreutilsRows).length === coreutilsCases.length), passed: Object.values(rows).every(row => row.pass) && ripgrepPassed && coreutilsPassed && restoredPassed };
 }

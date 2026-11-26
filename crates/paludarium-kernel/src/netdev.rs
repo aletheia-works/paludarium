@@ -114,7 +114,9 @@ pub(crate) struct Device {
     pub conf4: Conf4,
     pub conf6: Conf6,
     /// The IPv4 multicast groups it has joined.
-    pub groups4: crate::multicast::Groups,
+    pub groups4: crate::multicast::Groups<core::net::Ipv4Addr>,
+    /// The IPv6 ones its sockets have.
+    pub groups6: crate::multicast::Groups<core::net::Ipv6Addr>,
     /// A veth end's state; `None` for the loopback.
     pub veth: Option<Veth>,
 }
@@ -132,6 +134,7 @@ impl Device {
                 ..Conf6::default()
             },
             groups4: crate::multicast::Groups::default(),
+            groups6: crate::multicast::Groups::default(),
             veth: None,
         }
     }
@@ -154,6 +157,7 @@ impl Device {
             conf4: conf.0,
             conf6: conf.1,
             groups4: crate::multicast::Groups::default(),
+            groups6: crate::multicast::Groups::default(),
             veth: Some(Veth {
                 mac,
                 mtu,

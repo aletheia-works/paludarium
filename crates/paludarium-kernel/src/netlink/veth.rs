@@ -912,8 +912,10 @@ pub(super) fn move_to(
     let peer = device.veth.as_ref().and_then(|v| v.peer.clone());
     let settings = {
         let mut devices = to.devices();
-        // `ip_mc_destroy_dev`, with the old namespace's `in_device`.
+        // `ip_mc_destroy_dev` and `ipv6_mc_destroy_dev`, with the old
+        // namespace's `in_device` and `inet6_dev`.
         device.groups4 = crate::multicast::Groups::default();
+        device.groups6 = crate::multicast::Groups::default();
         device.conf4 = devices.default4;
         device.conf6 = devices.default6;
         let settings = crate::netconf::registered(&device);

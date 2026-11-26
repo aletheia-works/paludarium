@@ -245,9 +245,13 @@ static void held_read(const char *step, int s, long long start, int early, int l
 static void held_signal(int number) { (void)number; }
 /* Holds data back once the first thread is about to sleep, and goes. */
 static int held_pipe[2];
+static long long held_at;
 static void *held_thread(void *c) {
     char byte;
-    if (read(held_pipe[0], &byte, 1) == 1) send(*(int *)c, "held", 4, MSG_MORE);
+    if (read(held_pipe[0], &byte, 1) == 1) {
+        held_at = clock_ms(CLOCK_MONOTONIC);
+        send(*(int *)c, "held", 4, MSG_MORE);
+    }
     return NULL;
 }
 /* What Nagle's algorithm, MSG_MORE and a delayed acknowledgement hold back
@@ -326,10 +330,10 @@ static void held(int l, int port) {
                 fcntl(s, F_SETOWN, getpid());
                 fcntl(s, F_SETFL, O_ASYNC);
                 struct timespec t = {10, 0}, rest = {0, 0};
-                int slept = 0;
-                /* The emulator's test clock may pass the whole sleep before
-                   the other thread has run. */
-                for (int n = 0; n < 20 && !slept; n++) {
+                int slept = 0, late = 1, tries = 0;
+                /* Again only where the other thread came after the whole
+                   sleep, as the emulator's test clock may have it. */
+                for (; tries < 20 && !slept && late; tries++) {
                     if (step == 8) {
                         if (pipe(held_pipe)) exit(70);
                         pthread_sigmask(SIG_BLOCK, &io, NULL);
@@ -337,20 +341,109 @@ static void held(int l, int port) {
                         pthread_sigmask(SIG_UNBLOCK, &io, NULL);
                         if (write(held_pipe[1], "g", 1) != 1) exit(70);
                     }
+                    long long until = clock_ms(CLOCK_MONOTONIC) + 10000;
                     slept = nanosleep(&t, &rest);
                     int error = errno;
+                    late = 0;
                     if (step == 8) {
                         pthread_join(other, NULL);
                         close(held_pipe[0]);
                         close(held_pipe[1]);
-                        if (!slept) while (recv(s, bytes, sizeof bytes, 0) < 0) {}
+                        late = held_at >= until;
+                        if (!slept && late) while (recv(s, bytes, sizeof bytes, 0) < 0) {}
                     }
                     errno = error;
                 }
+                if (!slept && late) puts("  the other thread came late each time");
                 call("nanosleep", slept);
                 printf("  rest=%d\n", rest.tv_sec >= 8);
                 ioctl(s, FIONREAD, &in);
                 printf("  in=%d\n", in);
+            }
+            close(c);
+            close(s);
+            break;
+        }
+    }
+}
+/* TCP_CORK: parts of a segment wait until it is cleared, 200 ms pass, the
+   end comes or TCP_NODELAY is set. A step the machine took too long for is
+   done again. */
+static void cork_in(const char *step, int s) {
+    int in = -1;
+    ioctl(s, FIONREAD, &in);
+    printf("  %s in=%d\n", step, in);
+}
+static void cork_set(int c, int on) {
+    int got = -1;
+    socklen_t len = sizeof got;
+    int set = setsockopt(c, IPPROTO_TCP, TCP_CORK, &on, sizeof on);
+    getsockopt(c, IPPROTO_TCP, TCP_CORK, &got, &len);
+    printf("  cork=%d set=%d got=%d len=%u\n", on, set, got, len);
+}
+static void corked(int l, int port) {
+    static char bytes[70000];
+    int result, on = 1, off = 0;
+    call("short", setsockopt(l, IPPROTO_TCP, TCP_CORK, &on, 3));
+    call("value", setsockopt(l, IPPROTO_TCP, TCP_CORK, NULL, sizeof on));
+    for (int step = 0; step < 9; step++) {
+        for (int tries = 0; tries < 20; tries++) {
+            long long began = clock_ms(CLOCK_MONOTONIC);
+            if (step == 8) setsockopt(l, IPPROTO_TCP, TCP_CORK, &on, sizeof on);
+            int c = client(port, 0, &result), s = accept(l, NULL, NULL);
+            setsockopt(l, IPPROTO_TCP, TCP_CORK, &off, sizeof off);
+            int wait = step == 1;
+            int nodelay = step == 3 || step == 4;
+            if (step == 4) setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+            if (step == 6)
+                for (int n = 0; n < 20; n++) send(c, bytes, 1, 0);
+            if (step < 8) setsockopt(c, IPPROTO_TCP, TCP_CORK, &on, sizeof on);
+            if (step != 6 && step < 8) {
+                send(c, bytes, step == 5 ? 40000 : 100, 0);
+                send(c, bytes, 100, 0);
+            }
+            if (step == 8) send(s, bytes, 10, 0);
+            int in = 0;
+            ioctl(step == 8 ? c : s, FIONREAD, &in);
+            if (clock_ms(CLOCK_MONOTONIC) - began > 25) {
+                close(c);
+                close(s);
+                continue;
+            }
+            printf(" step %d\n  in=%d\n", step, in);
+            if (wait) {
+                struct timespec t = {0, 400000000};
+                nanosleep(&t, NULL);
+                cork_in("later", s);
+            } else if (step == 3) {
+                setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+                cork_in("nodelay", s);
+                send(c, bytes, 50, 0);
+                cork_in("sent", s);
+            } else if (step == 7) {
+                shutdown(c, SHUT_WR);
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+                call("recv", recv(s, bytes, sizeof bytes, 0));
+            } else if (step == 8) {
+                cork_set(s, 0);
+                cork_in("inherited", c);
+            }
+            if (nodelay || step == 2) {
+                send(c, bytes, 30, MSG_MORE);
+                cork_in("more", s);
+            }
+            if (step < 7) {
+                cork_set(c, 0);
+                cork_in("uncorked", s);
+            }
+            if (step == 2 || step == 5) {
+                recv(s, bytes, sizeof bytes, 0);
+                cork_set(c, 1);
+                send(c, bytes, 7, 0);
+                cork_in("again", s);
+                send(c, bytes, 70000, 0);
+                recv(s, bytes, 7, 0);
+                cork_set(c, 0);
             }
             close(c);
             close(s);
@@ -1229,6 +1322,12 @@ int main(int argc, char **argv) {
         close(small);
         close(l);
         close(u);
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-cork")) {
+        int port;
+        int l = listener(8, &port);
+        corked(l, port);
         return 0;
     }
     if (!strcmp(mode, "tcp-held")) {

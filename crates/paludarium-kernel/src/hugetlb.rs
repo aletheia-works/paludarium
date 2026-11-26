@@ -82,6 +82,10 @@ pub(crate) struct Request {
     pub grows_down: bool,
     pub no_reserve: bool,
     pub stack: bool,
+    /// What `do_mmap` says of a file's mapping type: `EOPNOTSUPP` for
+    /// `MAP_SHARED_VALIDATE` with a flag it does not know, `EINVAL` for a
+    /// type a file has not (`MAP_DROPPABLE`).
+    pub refused_type: Option<Errno>,
 }
 
 /// `len` in whole huge pages of the size `flags` gives, the default 2 MiB
@@ -163,6 +167,9 @@ fn map(
         .is_none_or(|last| r.offset > last)
     {
         return Err(Errno::EOVERFLOW);
+    }
+    if let Some(e) = r.refused_type {
+        return Err(e);
     }
     if r.grows_down {
         return Err(Errno::EINVAL);

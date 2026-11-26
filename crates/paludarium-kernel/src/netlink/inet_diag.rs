@@ -372,9 +372,10 @@ impl NetlinkSocket {
             attribute(&mut out, INET_DIAG_CLASS_ID, &full.priority.to_le_bytes());
         }
         attribute(&mut out, INET_DIAG_CGROUP_ID, &ROOT_CGROUP.to_le_bytes());
-        // `inet_diag_sockopt`: `is_icsk` for TCP, and `mc_loop`, with
-        // `mc_all` for IPv4, as `inet_create` and `inet6_create` set them.
-        let sockopt = u8::from(!entry.udp) << 1 | 1 << 4 | u8::from(!entry.v6) << 6;
+        // `inet_diag_sockopt`: `is_icsk` for TCP, `mc_loop` and `mc_all`.
+        let sockopt = u8::from(!entry.udp) << 1
+            | u8::from(full.multicast_loop) << 4
+            | u8::from(full.multicast_all) << 6;
         attribute(&mut out, INET_DIAG_SOCKOPT, &[sockopt, 0]);
         // What its datagrams take is charged in whole pages, the rest kept
         // as its forward allocation (`udp_rmem_schedule`).
@@ -536,11 +537,17 @@ fn udp_score(
     if entry.device != 0 {
         score += 4;
     }
-    if let Some(peer) = entry.peer {
-        if plain(peer) != plain(from) {
-            return None;
+    match entry.peer.map(plain) {
+        // The address of a peer an IPv6 socket had, which IPv4 does not ask.
+        Some(old) if old.port() == 0 => {
+            if v6 && old.ip() != plain(from).ip() {
+                return None;
+            }
+            score += u32::from(v6) * 4;
         }
-        score += 8;
+        Some(peer) if peer != plain(from) => return None,
+        Some(_) => score += 8,
+        None => {}
     }
     Some(score)
 }

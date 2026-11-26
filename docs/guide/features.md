@@ -982,6 +982,28 @@ kernel.
   backing cannot be attached, the new mapping goes and what it replaced stays
   gone.
 
+- `mmap` takes the types of `do_mmap` (`MAP_TYPE`, four bits): a file, and
+  `/dev/zero`, maps `MAP_SHARED`, `MAP_SHARED_VALIDATE` or `MAP_PRIVATE`;
+  anonymous memory `MAP_SHARED`, `MAP_PRIVATE` or `MAP_DROPPABLE`; any other
+  value is `EINVAL`. `MAP_SHARED_VALIDATE` is `MAP_SHARED` that refuses a
+  flag Linux's `LEGACY_MAP_MASK` does not hold (`EOPNOTSUPP`, after the
+  file's size is checked and before its access): `MAP_FIXED_NOREPLACE`, the
+  huge page size's bit 31, which neither 2 MiB's nor 1 GiB's has, any unknown
+  bit, also above bit 31, and `MAP_SYNC` but on ext4 and xfs (`FOP_MMAP_SYNC`;
+  a host file system Linux has no number for counts as ext4); `MAP_SHARED`
+  drops them. Of a file of ext4 or xfs, `MAP_SYNC` with any type is then
+  `EOPNOTSUPP` after the other checks, as no file is DAX's
+  (`daxdev_mapping_supported`). `MAP_DROPPABLE` memory is private anonymous
+  memory with `VM_DROPPABLE` (`VmFlags: dp`), `VM_NORESERVE`, `VM_WIPEONFORK` and
+  `VM_DONTDUMP`: a `fork`ed child gets it with none of its pages and a core
+  holds none of it, for good (`MADV_KEEPONFORK` and `MADV_DODUMP` are
+  `EINVAL`). It may not be `MAP_LOCKED`, `MAP_GROWSDOWN` or `MAP_HUGETLB`
+  (`EINVAL`), neither `mlock` nor `mlockall`'s `MCL_FUTURE` locks it (as
+  Linux master's `vma_supports_mlock`, which the CI runners' kernels follow
+  where v7.0's source would lock it), `MADV_MERGEABLE` passes it by, and a
+  `userfaultfd` does not register it (`EINVAL`). Linux drops its pages under
+  memory pressure, which the emulator never has, so they stay.
+
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and
@@ -1787,7 +1809,10 @@ kernel.
   guards, and `MADV_DONTNEED` from an address off a 2 MiB boundary
   (`EINVAL`). The only size is
   2 MiB (another is `EINVAL`), as the virtual CPU has no 1 GiB pages, and a
-  file with the flag is `EINVAL`.
+  file with the flag is `EINVAL`. The memory is a hugetlbfs file's, so it
+  takes a file's types: `MAP_SHARED_VALIDATE` maps it (`EOPNOTSUPP` for a
+  flag it refuses), and `MAP_DROPPABLE` is `EINVAL`, after the placement
+  and the lock checks, as in `do_mmap`.
 
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
@@ -2952,6 +2977,15 @@ kernel.
     address of the namespace, a broadcast or a group (`EINVAL`). Its
     packets go to the gateway's neighbour where a route of link scope
     reaches the gateway (`rt_uses_gateway`), else to their destination's.
+    A gateway may be one of IPv6 (`RTA_VIA`, `fib_gw_from_via`; one of IPv4
+    there is as in `RTA_GATEWAY`, except that 0.0.0.0 is a gateway still,
+    and both are `EINVAL`): it is checked as
+    an IPv6 route's (`fib_check_nh_v6_gw`), by the IPv6 table of the
+    route's number, then the local and main ones, its end needs IPv6 on
+    (`EACCES`), and a next hop made without its carrier is not
+    `RTNH_F_LINKDOWN`. The packets go to its neighbour, which neighbour
+    discovery finds from the end's link-local address, and dumps,
+    notifications and lookups give it as `RTA_VIA`.
     A route's `RTA_MULTIPATH` makes one route of its next hops
     (`fib_get_nhs`), each checked as a route's next hop of its own device,
     gateway and flags (`fib_check_nh`), with its weight (`rtnh_hops` + 1):
@@ -3056,9 +3090,28 @@ kernel.
     namespace takes it where its end is in the group
     (`ip_route_input_mc`); and through `lo` it comes back where `lo` is.
     There it reaches each UDP socket of its port that a broadcast would,
-    and that is a member on that device or has `IP_MULTICAST_ALL` on
-    (`ip_mc_sf_allow`). An accepted connection's `IP_MULTICAST_TTL` is 64
+    and that is a member on that device or has `IP_MULTICAST_ALL` on, as
+    an IPv4 one begins with and an IPv6 one does not (`ip_mc_sf_allow`,
+    `inet6_create`). An accepted connection's `IP_MULTICAST_TTL` is 64
     (`tcp_v4_syn_recv_sock`).
+  - **IPv6 multicast groups:** an IPv6 UDP socket joins and leaves a group
+    with `IPV6_ADD_MEMBERSHIP` and `IPV6_DROP_MEMBERSHIP`, on the device of
+    an index or that of the route to it (0): `EINVAL` for no group or a
+    device without IPv6, `ENODEV` for none, `EADDRINUSE` as a member there
+    (anywhere, for 0), `EADDRNOTAVAIL` to leave as none, and `EPROTO` of
+    TCP (`__ipv6_sock_mc_join`, `ipv6_sock_mc_drop`). Every device is in
+    ff01::1 and ff02::1, a veth end in the solicited-node groups of its
+    addresses, and one that forwards in ff01::2, ff02::2 and ff05::2. A
+    datagram to a group comes back where its device is in the group,
+    unless `IPV6_MULTICAST_LOOP` is off, and then with an
+    `IPV6_MULTICAST_HOPS` of 0 goes no further; one to a group of the
+    interface's scope (ff01::/16) never does (`ip6_finish_output2`).
+    Across the pair it comes where the end is in the group
+    (`ip6_mc_input`). There it reaches each IPv6 UDP socket of its port
+    bound to `::` or the group, not to another device, and connected to
+    none or its sender, that is a member of the group, on whatever device,
+    or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
+    connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
   - **IPv6 across a pair:** a connection or datagram whose IPv6 route (a
     unicast one, or the multicast `ff00::/8`) goes out through an end
     leaves from the route's preferred source, or the address
@@ -3075,8 +3128,8 @@ kernel.
     does, with ICMPv6's port unreachable and address unreachable
     (`EHOSTUNREACH`, 3 seconds on), but without reverse path filtering;
     and one from `::1` goes out, to be dropped there. A datagram holds
-    65527 bytes at most (`EMSGSIZE`), TCP takes no group (`ENETUNREACH`),
-    and a datagram to one reaches no one.
+    65527 bytes at most (`EMSGSIZE`), and TCP takes no group
+    (`ENETUNREACH`).
   - **IPv6 of veth ends:** an end up with its carrier is made ready as
     `addrconf_dev_config` does, once until it goes down: the multicast
     route `ff00::/8` (local table, metric 256), then the prefix route
@@ -3131,10 +3184,11 @@ kernel.
     namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
-    label. An answer goes back by a lookup of its own, through whichever
-    end that takes: the one its listener is bound to, or to a link-local
-    address the one the packet came in on (`inet6_csk_route_req`,
-    `icmp6_send`). Turning `disable_ipv6` on for an end
+    label, and one unbound takes the source of the hop that gives
+    (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
+    through whichever end that takes: the one its listener is bound to, or
+    to a link-local address the one the packet came in on
+    (`inet6_csk_route_req`, `icmp6_send`). Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
     Going down, it loses its IPv6 routes, told of in the order of a dump,
@@ -3327,8 +3381,9 @@ kernel.
     request names (none for 0), and the caller's
     `RTA_UID` (or the one the request names, as it is; none for -1, and
     `ERANGE` for one shorter than 4 bytes); `0.0.0.0` goes to the loopback
-    from 127.0.0.1. An IPv6 answer names the source `ipv6_dev_get_saddr`
-    picks. Where no route goes it is `ENETUNREACH`, and `AF_UNSPEC`
+    from 127.0.0.1. An IPv6 answer names the found hop's source: the
+    route's preferred one, else the one `ipv6_dev_get_saddr` picks on the
+    hop's device (`ip6_route_get_saddr`). Where no route goes it is `ENETUNREACH`, and `AF_UNSPEC`
     `EOPNOTSUPP`; a destination shorter than its family's address is
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
@@ -3847,15 +3902,15 @@ kernel.
   read as zeros. `[vdso]` may be made writable, which copies it (so does a
   write through `/proc/<pid>/mem`), and moved by `mremap`, but not grown
   (`EFAULT`). None of the three is split: an `munmap`, `mprotect`, `mremap`,
-  `mseal` or the like of a part of one that would split it is `EINVAL`. `statm` and `VmSize` count the
-  three, a `fork` keeps them where they are, and a core holds them whole,
-  as Linux's `always_dump_vma` dumps a special mapping.
+  `mseal` or the like of a part of one that would split it is `EINVAL`.
+  `statm` counts the three, a `fork` keeps them where they are, and a core
+  holds them whole, as Linux's `always_dump_vma` dumps a special mapping.
 
 - The `vsyscall` page is Linux's default (`CONFIG_LEGACY_VSYSCALL_XONLY`):
   a gate area at `ffffffffff600000`, no mapping of the process, which is the
   last line of `maps` and `smaps` (`--xp`, `VmFlags: ex`) and the last
-  segment of a core (zeros), and which `statm`, `VmSize` and `smaps_rollup`
-  leave out. It can be run but not read (`SIGSEGV`, `SEGV_MAPERR`). Its
+  segment of a core (zeros), and which `statm` and `smaps_rollup` leave
+  out. It can be run but not read (`SIGSEGV`, `SEGV_MAPERR`). Its
   entries `+0x000` (`gettimeofday`), `+0x400` (`time`) and `+0x800`
   (`getcpu`) do what `emulate_vsyscall` does: seccomp sees the call with the
   entry's address, and a tracer its `PTRACE_EVENT_SECCOMP`, but no system
@@ -4058,7 +4113,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 
 - The other `/proc` entries are `/proc/loadavg`, `/proc/locks` (above),
-  `/proc/meminfo`, `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
+  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
@@ -4357,7 +4412,8 @@ kernel.
   may open to write. Both are unsigned longs, as Linux's
   `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
   (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
-  `/proc/sys/fs` lists only these, `fanotify`, `inotify` and `mqueue`.
+  `/proc/sys/fs` lists only these, `fanotify`, `inotify`, `mqueue`,
+  `lease-break-time` and `leases-enable`.
 
 - `/proc/sys/fs/inotify` has the machine's inotify limits, root's regular
   files of mode 0644 that only root (user ID 0 outside any user namespace)
@@ -4558,6 +4614,25 @@ kernel.
     running as `/proc/<pid>/stat` shows them (`R`), the reader included;
     `procs_blocked 0`; and a `softirq` line of zeros.
 
+- `/proc/net` is a link to `self/net`; `/proc/<pid>/net`, and a thread's,
+  holds the files of the task's network namespace, whose names are looked
+  up in the one it has then (`get_proc_task_net`), by any reader: `ENOENT`
+  for a zombie's, whose directory lists nothing (`EINVAL`). A file open stays
+  with the namespace it was opened in. Each is 0444 and the root's of the
+  user namespace that owns the network namespace, as that mapped it when
+  the network namespace was made, else the first's (`proc_net_ns_init`),
+  opens for reading only (`EACCES`, `seq_open_net`), and is made as it is
+  read:
+  - `dev` (`dev_seq_show`), the devices, with counters of 0; `if_inet6`
+    (`if6_seq_show`), the IPv6 addresses; `route` (`fib_route_seq_show`),
+    IPv4's main table, nothing while there is none, with a gateway of IPv6
+    (`RTA_VIA`) as 00000000, `RTF_GATEWAY` where its first 4 bytes are not
+    0 (`fib_flag_trans`); `ipv6_route`
+    (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
+    and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - Any other name there is `ENOENT`, with `--mount /:/` too: the host's
+    sockets and devices are not the guest's.
+
 - `/proc/sysvipc` holds `msg`, `sem` and `shm`, listed in that order, each in
   the format of Linux's `sysvipc_*_proc_show` on a 64-bit kernel.
   - Each is a header, then a line for each queue, set or segment of the
@@ -4654,7 +4729,8 @@ kernel.
   secret memory, the charge (`ac`, which private memory that was writable
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never
   written gives back as it stops being writable), `nh` of a `MAP_STACK`
-  mapping, the seal (`sl`), and `sd` (`VM_SOFTDIRTY`) on every VMA
+  mapping, `nr`, `wf`, `dd` and `dp` of a `MAP_DROPPABLE` one, the seal
+  (`sl`), and `sd` (`VM_SOFTDIRTY`) on every VMA
   `clear_refs` has not cleared since it was made, but the initial stack:
   one that merges with a new VMA has it again, as Linux's sticky flags.
 
@@ -5022,7 +5098,12 @@ kernel.
   whose time is up shows 1 µs, and one with less than 1 µs left shows 0.
   `alarm` sets it to whole seconds with no interval and returns the seconds
   that were left, rounded to the nearest and at least 1 while it was armed,
-  as Linux's `alarm_setitimer`.
+  as Linux's `alarm_setitimer`. Any wait a signal ends, `wait4`'s and
+  `waitid`'s too, ends as a timer's signal comes. The waits only a fatal
+  signal ends (a `vfork` parent's, a fanotify permission event's, a seccomp
+  listener's with `WAIT_KILLABLE_RECV` and the kernel's own for a
+  `userfaultfd`) end for a timer's too, but not for a signal that dumps core
+  (`complete_signal` makes the others `SIGKILL`).
 
 - The interval timers of the process's CPU time, `ITIMER_VIRTUAL` and
   `ITIMER_PROF`, send `SIGVTALRM` and `SIGPROF` from the kernel
@@ -6392,8 +6473,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_ACCEPTCONN`, `SO_KEEPALIVE`, `SO_REUSEADDR`, `SO_REUSEPORT`,
     `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_LINGER`,
     `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
-    the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
-    `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
+    the host), `TCP_CORK` (which does not), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
+    `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
     with Linux's defaults and
     range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
     `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
@@ -6448,7 +6529,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     and the times since data went and came. On the loopback the segments are
     those Linux sends: each write its own, held while a small one waits for
     its acknowledgement (Nagle's algorithm, unless `TCP_NODELAY` or urgent
-    data) or for `MSG_MORE`'s next (up to 201 ms); the first 16
+    data) or for what `MSG_MORE` or `TCP_CORK` says comes next (up to
+    201 ms, or until the cork is cleared or `TCP_NODELAY` set); the first 16
     acknowledgements at once, then with the data a side replies with, on a
     read, or after 40 ms (`TCP_QUICKACK` sets which); at most 10 in flight
     at first; a tail loss probe, which sends the last again; and the end,
@@ -6617,7 +6699,11 @@ one only with an `--allow-net`.
   port stays on every address). It receives only from its
   peer, and
   `AF_UNSPEC` disconnects it, keeping only the port and address the guest
-  bound itself. A datagram holds up to 65507 bytes over IPv4 and 65527 over
+  bound itself, and no device (`__udp_disconnect`). An IPv6 socket keeps its
+  peer's address too (`sk_v6_daddr`), which `sock_diag` tells with port 0: it
+  takes an IPv6 datagram from that address alone, one to a group too
+  (`__udp_v6_is_mcast_sock`), and any IPv4 one, until it
+  connects again. A datagram holds up to 65507 bytes over IPv4 and 65527 over
   IPv6 (`EMSGSIZE`), may be empty, and is cut to the reader's buffer
   (`MSG_TRUNC`); `FIONREAD` gives the first one's length. Each takes of the
   receive buffer what x86-64 Linux 7.0 counts as its `sk_buff`'s

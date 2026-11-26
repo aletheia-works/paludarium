@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 mod arrival;
-use crate::multicast::Membership;
+use crate::multicast::{Membership, Membership6};
 use crate::sockets::Filtered;
 
 /// The interface requests of `ioctl` ([`Network::interface`]).
@@ -355,6 +355,10 @@ pub(crate) struct Network {
     /// The user namespace that owns its network namespace, whose
     /// `CAP_NET_ADMIN` changes it; none for the first one's.
     owner: Option<Arc<crate::namespaces::Namespace>>,
+    /// Whose the files of its `/proc/net` are: that namespace's root as it
+    /// was mapped when the network namespace was made, else the first's
+    /// (`proc_net_ns_init`).
+    pub(crate) proc_owner: (u32, u32),
 }
 /// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
 /// `IFF_UP` and `IFF_RUNNING` while it is up.
@@ -391,6 +395,7 @@ impl Network {
             mctp: crate::mctp::Endpoints::default(),
             sockets: Mutex::default(),
             owner: None,
+            proc_owner: (0, 0),
         }
     }
     /// A new network namespace's network: only a loopback, down and without
@@ -400,6 +405,13 @@ impl Network {
         Self {
             isolated: true,
             owner: Some(Arc::clone(owner)),
+            proc_owner: {
+                use crate::users::Ids;
+                (
+                    owner.kernel_of(Ids::User, 0).unwrap_or(0),
+                    owner.kernel_of(Ids::Group, 0).unwrap_or(0),
+                )
+            },
             up: AtomicBool::new(false),
             ever_up: AtomicBool::new(false),
             addresses: Mutex::new(crate::interface::Addresses::isolated()),
@@ -556,7 +568,8 @@ impl Network {
     /// What a packet from `from` to `to` out through this namespace's veth
     /// end `index` finds at `now`, its neighbour first, its route's gateway
     /// or else `to` ([`Self::next_hop4`],
-    /// [`crate::interface::Addresses::neigh_output`]):
+    /// [`crate::interface::Addresses::neigh_output`]), one of IPv6 as
+    /// [`Self::reach6`] says:
     /// - Nothing answers, as nobody answers ARP for that neighbour
     ///   ([`Reach::Unanswered`]), unless the end has its carrier, so that
     ///   its peer is up (`veth_xmit`), the neighbour is an address of the peer's
@@ -581,34 +594,18 @@ impl Network {
             }
             _ => return Reach::Unanswered,
         };
-        let hop = self.next_hop4(index, to, flow, now);
-        let Some(Arp {
-            peer,
-            answer,
-            own_mac,
-        }) = self.arp(index, from, hop, now)
-        else {
-            return Reach::Unanswered;
+        let lladdr = match self.next_hop4(index, to, flow, now) {
+            IpAddr::V4(hop) => self.neighbour4(index, from, hop, now),
+            IpAddr::V6(hop) => self.neighbour6(index, None, hop, now),
         };
-        let at = now.unwrap_or(0);
-        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
-        self.later(events);
-        if asked
-            && answer.is_some()
-            && !from.is_unspecified()
-            && let Some((there, peer_index, ..)) = &peer
-        {
-            let events = there
-                .addresses_at(now)
-                .neigh_learn(*peer_index, from, own_mac, at);
-            there.later(events);
-        }
         let Some(lladdr) = lladdr else {
             return Reach::Unanswered;
         };
-        let Some((there, peer_index, _, their_rpf)) = peer.filter(|p| p.2 == lladdr) else {
+        let peer = self.veth_peer(index).and_then(|(peer, _)| peer);
+        let Some((there, peer_index, _)) = peer.filter(|p| p.2 == lladdr) else {
             return Reach::Dropped;
         };
+        let their_rpf = there.rp_filter(peer_index);
         // From no address (where no address fits, as `inet_select_addr`
         // finds none) the packet is a martian there
         // (`ip_route_input_slow`).
@@ -635,6 +632,98 @@ impl Network {
         };
         let back = self.back4(&there, from, to, &answer, now);
         Self::answered(there, flow, answer.oif, back)
+    }
+    /// The Ethernet address of the IPv4 neighbour `hop` of the veth end
+    /// `index`, for a packet from `from` at `now`, which resolves it as
+    /// [`Self::reach`] says; none where nothing answers.
+    fn neighbour4(
+        &self,
+        index: i32,
+        from: Ipv4Addr,
+        hop: Ipv4Addr,
+        now: Option<u64>,
+    ) -> Option<[u8; 6]> {
+        let Arp {
+            peer,
+            answer,
+            own_mac,
+        } = self.arp(index, from, hop, now)?;
+        let at = now.unwrap_or(0);
+        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
+        self.later(events);
+        if asked
+            && answer.is_some()
+            && !from.is_unspecified()
+            && let Some((there, peer_index, _)) = &peer
+        {
+            let events = there
+                .addresses_at(now)
+                .neigh_learn(*peer_index, from, own_mac, at);
+            there.later(events);
+        }
+        lladdr
+    }
+    /// [`Self::neighbour4`] of an IPv6 neighbour, as [`Self::reach6`] says;
+    /// with no `from`, as an IPv4 packet's through a gateway of IPv6 has
+    /// none of the end's, from the end's link-local address
+    /// (`ndisc_solicit`).
+    fn neighbour6(
+        &self,
+        index: i32,
+        from: Option<Ipv6Addr>,
+        hop: Ipv6Addr,
+        now: Option<u64>,
+    ) -> Option<[u8; 6]> {
+        let Nd {
+            peer,
+            answer,
+            own_mac,
+            asker,
+        } = self.nd(index, from, hop, now)?;
+        let at = now.unwrap_or(0);
+        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
+        self.later(events);
+        if asked {
+            self.solicit(index, asker, hop, at);
+        }
+        if asked && answer.is_some() {
+            Self::teach6(peer.as_ref(), asker, own_mac, at);
+        }
+        lladdr
+    }
+    /// The peer of this namespace's veth end `index`, if the end has its
+    /// carrier, with its namespace, index and Ethernet address; and the
+    /// end's own Ethernet address. `None` for no such end.
+    #[allow(clippy::type_complexity)]
+    fn veth_peer(&self, index: i32) -> Option<(Option<(Arc<Network>, i32, [u8; 6])>, [u8; 6])> {
+        let (peer, own_mac) = {
+            let devices = self.devices();
+            let veth = devices.by_index(index).and_then(|d| d.veth.as_ref())?;
+            let peer = veth
+                .peer
+                .clone()
+                .filter(|_| veth.carrier)
+                .and_then(|p| p.network.upgrade().map(|n| (n, p.index)));
+            (peer, veth.mac)
+        };
+        let peer = peer.and_then(|(there, at)| {
+            let mac = there
+                .devices()
+                .by_index(at)
+                .and_then(|d| d.veth.as_ref())
+                .map(|v| v.mac)?;
+            Some((there, at, mac))
+        });
+        Some((peer, own_mac))
+    }
+    /// [`Self::veth_peer`], where the peer takes IPv6.
+    fn nd_peer(&self, index: i32) -> Option<(Arc<Network>, i32, [u8; 6])> {
+        self.veth_peer(index)?.0.filter(|(there, at, _)| {
+            there.devices().by_index(*at).is_some_and(|device| {
+                device.conf6.disable_ipv6 == 0
+                    && device.veth.as_ref().is_some_and(|v| v.mtu >= 1280)
+            })
+        })
     }
     /// The device named in the route lookup of an answer from this
     /// namespace's address `to` to a packet of the flow `flow`, which came
@@ -700,15 +789,18 @@ impl Network {
         let own = self.own_end(there, back)?;
         let rpf = self.rp_filter(own);
         let addresses = self.addresses_at(now);
+        let found = match hop {
+            IpAddr::V4(hop) => !hop.is_loopback() && addresses.local4(hop),
+            IpAddr::V6(hop) => addresses.nd_target(own, hop),
+        };
         let comes = addresses.local4(from)
-            && !hop.is_loopback()
-            && addresses.local4(hop)
+            && found
             && addresses.validate_source4_on(to, 0, 0, rpf, own).is_ok();
         comes.then_some((back, own))
     }
     /// The reverse path filtering of the device `index`: the more of its
     /// and `all`'s (`IN_DEV_RPFILTER`).
-    fn rp_filter(&self, index: i32) -> i32 {
+    pub(crate) fn rp_filter(&self, index: i32) -> i32 {
         let devices = self.devices();
         devices
             .by_index(index)
@@ -716,40 +808,21 @@ impl Network {
             .max(devices.all4.rp_filter)
     }
     /// What ARP finds out through this namespace's veth end `index` for
-    /// `to`, asked from `from`: the peer, if the end has its carrier,
-    /// with its namespace, index, Ethernet address and reverse path
-    /// filtering; the address of the peer's that answers, if it does, as
-    /// `arp_process` takes no request for a loopback address (with
-    /// `route_localnet` off) and asks the route in from `from`, which a
-    /// request from 0.0.0.0 skips; and the end's own address and reverse
-    /// path filtering. `None` for no such end.
+    /// `to`, asked from `from`: the peer and the end's own Ethernet address
+    /// ([`Self::veth_peer`]); and the address of the peer's that answers,
+    /// if it does, as `arp_process` takes no request for a loopback address
+    /// (with `route_localnet` off) and asks the route in from `from`, which
+    /// a request from 0.0.0.0 skips. `None` for no such end.
     fn arp(&self, index: i32, from: Ipv4Addr, to: Ipv4Addr, now: Option<u64>) -> Option<Arp> {
-        let (peer, own_mac) = {
-            let devices = self.devices();
-            let veth = devices.by_index(index).and_then(|d| d.veth.as_ref())?;
-            let peer = veth
-                .peer
-                .clone()
-                .filter(|_| veth.carrier)
-                .and_then(|p| p.network.upgrade().map(|n| (n, p.index)));
-            (peer, veth.mac)
-        };
-        let peer = peer.and_then(|(there, at)| {
-            let mac = there
-                .devices()
-                .by_index(at)
-                .and_then(|d| d.veth.as_ref())
-                .map(|v| v.mac)?;
-            let their_rpf = there.rp_filter(at);
-            Some((there, at, mac, their_rpf))
-        });
-        let answer = peer.as_ref().and_then(|(there, at, mac, their_rpf)| {
+        let (peer, own_mac) = self.veth_peer(index)?;
+        let answer = peer.as_ref().and_then(|(there, at, mac)| {
+            let their_rpf = there.rp_filter(*at);
             let addresses = there.addresses_at(now);
             let answers = !to.is_loopback()
                 && addresses.local4(to)
                 && (from.is_unspecified()
                     || addresses
-                        .validate_source4_on(from, 0, 0, *their_rpf, *at)
+                        .validate_source4_on(from, 0, 0, their_rpf, *at)
                         .is_ok());
             answers.then_some(*mac)
         });
@@ -824,27 +897,10 @@ impl Network {
         now: Option<u64>,
     ) -> Reach {
         let hop = self.next_hop6(index, to, &Self::flow6(flow.src, flow.proto), now);
-        let Some(Nd {
-            peer,
-            answer,
-            own_mac,
-            asker,
-        }) = self.nd(index, Some(from), hop, now)
-        else {
+        let Some(lladdr) = self.neighbour6(index, Some(from), hop, now) else {
             return Reach::Unanswered;
         };
-        let at = now.unwrap_or(0);
-        let (lladdr, asked, events) = self.addresses_at(now).neigh_output(index, hop, answer, at);
-        self.later(events);
-        if asked {
-            self.solicit(index, asker, hop, at);
-        }
-        if asked && answer.is_some() {
-            Self::teach6(peer.as_ref(), asker, own_mac, at);
-        }
-        let Some(lladdr) = lladdr else {
-            return Reach::Unanswered;
-        };
+        let peer = self.nd_peer(index);
         let Some((there, peer_index, _)) = peer.filter(|p| p.2 == lladdr) else {
             return Reach::Dropped;
         };
@@ -1020,14 +1076,14 @@ impl Network {
     /// `index` goes to at `now`, of the flow `flow`: its route's gateway,
     /// that of the hop of a multipath route [`Self::route`] took, where a
     /// route of link scope reaches it, else `to` itself (`rt_nexthop`).
-    fn next_hop4(&self, index: i32, to: Ipv4Addr, flow: &Flow, now: Option<u64>) -> Ipv4Addr {
+    fn next_hop4(&self, index: i32, to: Ipv4Addr, flow: &Flow, now: Option<u64>) -> IpAddr {
         let order = self.devices().order();
         self.addresses_at(now)
             .output4(to, 0, flow.oif, source4(flow.src), &order)
             .ok()
             .filter(|r| i64::from(r.oif) == i64::from(index) && r.uses_gateway)
             .and_then(|r| r.gateway)
-            .unwrap_or(to)
+            .unwrap_or(IpAddr::V4(to))
     }
     /// The neighbour a packet of the flow `flow` to `to` out through the
     /// veth end `index` goes to at `now`: the gateway of its route through
@@ -1050,25 +1106,8 @@ impl Network {
     /// address of its end not tentative (`ndisc_recv_ns`); and the end's
     /// own address. `None` for no such end.
     fn nd(&self, index: i32, from: Option<Ipv6Addr>, to: Ipv6Addr, now: Option<u64>) -> Option<Nd> {
-        let (peer, own_mac) = {
-            let devices = self.devices();
-            let veth = devices.by_index(index).and_then(|d| d.veth.as_ref())?;
-            let peer = veth
-                .peer
-                .clone()
-                .filter(|_| veth.carrier)
-                .and_then(|p| p.network.upgrade().map(|n| (n, p.index)));
-            (peer, veth.mac)
-        };
-        let peer = peer.and_then(|(there, at)| {
-            let mac = {
-                let devices = there.devices();
-                let device = devices.by_index(at)?;
-                let veth = device.veth.as_ref()?;
-                (device.conf6.disable_ipv6 == 0 && veth.mtu >= 1280).then_some(veth.mac)?
-            };
-            Some((there, at, mac))
-        });
+        let (_, own_mac) = self.veth_peer(index)?;
+        let peer = self.nd_peer(index);
         let asker = self
             .addresses_at(now)
             .ns_source(index, from.filter(|f| !f.is_unspecified()));
@@ -1176,7 +1215,7 @@ impl Network {
                 .neigh_output(index, plain(to), None, now.unwrap_or(0));
         self.later(events);
     }
-    /// The UDP sockets a broadcast datagram, or one to an IPv4 group, from
+    /// The UDP sockets a broadcast datagram, or one to a group, from
     /// `from` to `to`, out through this namespace's device `index` at
     /// `now`, reaches ([`Ports::broadcast_receivers`]), each with whether
     /// it is this namespace's own copy: where it `loops`, this namespace's
@@ -1187,7 +1226,8 @@ impl Network {
     /// broadcast address, or to one its routes make a broadcast one, from
     /// a source its reverse path filtering takes, which it does not check
     /// for 0.0.0.0, a source only the limited one takes; or to a group the
-    /// peer's end has joined ([`Self::takes_group4`]). None to an IPv6 one.
+    /// peer's end has joined ([`Self::takes_group4`],
+    /// [`Self::takes_group6`]).
     fn copies(
         &self,
         index: i32,
@@ -1196,10 +1236,7 @@ impl Network {
         (loops, leaves): (bool, bool),
         now: Option<u64>,
     ) -> Vec<(Arc<InetSocket>, bool)> {
-        let (IpAddr::V4(src), IpAddr::V4(dst)) = (from.ip(), to.ip()) else {
-            return Vec::new();
-        };
-        let group = dst.is_multicast().then_some(dst);
+        let group = to.ip().is_multicast().then_some(to.ip());
         // The sockets of a namespace its copy in on a device reaches.
         let reached = |network: &Network, dif: i32| -> Vec<Arc<InetSocket>> {
             let dif = dif.unsigned_abs();
@@ -1209,7 +1246,12 @@ impl Network {
         };
         let mut receivers = Vec::new();
         // Its own copy comes in on the end it went out through.
-        if loops && group.is_none_or(|group| self.in_group4(index, group)) {
+        let joined = match group {
+            None => true,
+            Some(IpAddr::V4(group)) => self.in_group4(index, group),
+            Some(IpAddr::V6(group)) => self.in_group6(index, group, now),
+        };
+        if loops && joined {
             receivers.extend(reached(self, index).into_iter().map(|s| (s, true)));
         }
         if !leaves {
@@ -1226,34 +1268,36 @@ impl Network {
         let Some((there, at)) = peer.and_then(|p| p.network.upgrade().map(|n| (n, p.index))) else {
             return receivers;
         };
-        let rpf = {
-            let devices = there.devices();
-            devices
-                .by_index(at)
-                .map_or(0, |d| d.conf4.rp_filter)
-                .max(devices.all4.rp_filter)
-        };
-        let arrives = if let Some(group) = group {
-            there.takes_group4(at, src, group, now)
-        } else {
-            let addresses = there.addresses_at(now);
-            let broadcast = dst.is_broadcast()
-                || (!src.is_unspecified()
-                    && !dst.is_unspecified()
-                    && !dst.is_loopback()
-                    && addresses
-                        .lookup4(dst)
-                        .is_ok_and(|r| r.kind == crate::interface::Kind::Broadcast));
-            broadcast
-                && !src.is_multicast()
-                && !src.is_broadcast()
-                && (src.is_unspecified()
-                    || addresses.validate_source4_on(src, 0, 0, rpf, at).is_ok())
+        let arrives = match (from.ip(), to.ip()) {
+            (IpAddr::V4(src), IpAddr::V4(group)) if group.is_multicast() => {
+                there.takes_group4(at, src, group, now)
+            }
+            (IpAddr::V6(src), IpAddr::V6(group)) => there.takes_group6(at, src, group, now),
+            (IpAddr::V4(src), IpAddr::V4(dst)) => there.takes_broadcast4(at, src, dst, now),
+            _ => false,
         };
         if arrives {
             receivers.extend(reached(&there, at).into_iter().map(|s| (s, false)));
         }
         receivers
+    }
+    /// Whether a packet from `src` to `dst` in through the veth end `index`
+    /// is a broadcast that comes here ([`Self::copies`]).
+    fn takes_broadcast4(&self, index: i32, src: Ipv4Addr, dst: Ipv4Addr, now: Option<u64>) -> bool {
+        let rpf = self.rp_filter(index);
+        let addresses = self.addresses_at(now);
+        let broadcast = dst.is_broadcast()
+            || (!src.is_unspecified()
+                && !dst.is_unspecified()
+                && !dst.is_loopback()
+                && addresses
+                    .lookup4(dst)
+                    .is_ok_and(|r| r.kind == crate::interface::Kind::Broadcast));
+        broadcast
+            && !src.is_multicast()
+            && !src.is_broadcast()
+            && (src.is_unspecified()
+                || addresses.validate_source4_on(src, 0, 0, rpf, index).is_ok())
     }
     /// Keeps what a packet changed for netlink to tell of, as what runs
     /// out is ([`Self::addresses_at`]).
@@ -1317,20 +1361,26 @@ impl Network {
         events.extend(fresh);
         events
     }
-    /// The address a connection or datagram to `to` on the loopback leaves
-    /// from at `now`: its route's preferred source.
-    pub(crate) fn source(&self, to: SocketAddr, now: Option<u64>) -> IpAddr {
-        self.source_through(to, 0, now)
-    }
-    /// [`Self::source`] of a packet through the device `oif` (any for 0):
-    /// for IPv4, as `ip_route_output_key_hash_rcu` takes it with a device
-    /// named, an address of the device's (`inet_select_addr`) of link
-    /// scope to a local group or the limited broadcast address, of any
-    /// scope to another group, and to an address no route through it
-    /// takes, on link; else its route's; 0.0.0.0 for none of these. For IPv6, its route's through the
-    /// device (`ip6_route_get_saddr`), looked up strictly, as no source is
-    /// chosen yet.
-    pub(crate) fn source_through(&self, to: SocketAddr, oif: u32, now: Option<u64>) -> IpAddr {
+    /// The address a packet to `to` of the protocol `proto` leaves from at
+    /// `now`, from a socket bound to none: its route's source.
+    ///
+    /// For IPv4 through a device `oif` other than 0, as
+    /// `ip_route_output_key_hash_rcu` takes it with a device named: an
+    /// address of the device's (`inet_select_addr`) of link scope to a local
+    /// group or the limited broadcast address, of any scope to another
+    /// group, and to an address no route through it takes, on link; else
+    /// its route's; 0.0.0.0 for none of these.
+    ///
+    /// For IPv6, its route's through the device, if one is named
+    /// (`ip6_route_get_saddr`), looked up strictly, as no source is chosen
+    /// yet; of a multipath route, the source of the hop the packet takes.
+    pub(crate) fn source_through(
+        &self,
+        to: SocketAddr,
+        oif: u32,
+        proto: u8,
+        now: Option<u64>,
+    ) -> IpAddr {
         use crate::interface::{SCOPE_LINK, SCOPE_UNIVERSE};
         let order = self.devices().order();
         let addresses = self.addresses_at(now);
@@ -1351,7 +1401,8 @@ impl Network {
             return IpAddr::V4(picked.unwrap_or(Ipv4Addr::UNSPECIFIED));
         }
         if let IpAddr::V6(ip) = to.ip() {
-            return IpAddr::V6(addresses.source6_through(ip, oif, &order));
+            let flow = Self::flow6(None, proto);
+            return IpAddr::V6(addresses.source6_through(ip, oif, &flow, &order));
         }
         addresses.source(to.ip(), &order)
     }
@@ -1702,11 +1753,17 @@ struct State {
     link: Option<(Arc<OnceLock<Arc<Link>>>, usize)>,
     // UDP.
     peer: Option<SocketAddr>,
+    /// The address of the peer an IPv6 socket had before it disconnected,
+    /// which its binding has too ([`Binding::old_peer`]): kept here, as the
+    /// disconnect may unbind the socket, for the next bind or autobind.
+    old_peer: Option<IpAddr>,
     queries: VecDeque<Query>,
     /// Datagrams other guest sockets sent this one on the loopback.
     inbox: VecDeque<Datagram>,
     /// The IPv4 groups it is a member of (`mc_list`), the newest first.
     groups4: Vec<Membership>,
+    /// The IPv6 ones (`ipv6_mc_list`), the newest first.
+    groups6: Vec<Membership6>,
     /// What the inbox takes of `SO_RCVBUF`, as Linux's `sk_rmem_alloc`.
     inbox_size: usize,
     /// How many datagrams and queries have come, which orders them.
@@ -1888,7 +1945,7 @@ enum Reach {
 }
 /// What ARP finds out through a veth end ([`Network::arp`]).
 struct Arp {
-    peer: Option<(Arc<Network>, i32, [u8; 6], i32)>,
+    peer: Option<(Arc<Network>, i32, [u8; 6])>,
     answer: Option<[u8; 6]>,
     own_mac: [u8; 6],
 }
@@ -1964,6 +2021,7 @@ struct Options {
     receive_timeout: Timeout,
     send_timeout: Timeout,
     no_delay: bool,
+    cork: bool,
     keep_idle: i32,
     keep_interval: i32,
     keep_count: i32,
@@ -1989,6 +2047,11 @@ struct Options {
     multicast_ttl: u8,
     multicast_loop: bool,
     multicast_all: bool,
+    /// `IPV6_MULTICAST_HOPS`, `IPV6_MULTICAST_LOOP` and
+    /// `IPV6_MULTICAST_ALL`.
+    multicast_hops: u8,
+    multicast_loop6: bool,
+    multicast_all6: bool,
     /// The sticky `IPV6_PKTINFO`'s device (`sticky_pktinfo`), which a
     /// datagram goes out through after the socket's own; its address sends
     /// from nowhere.
@@ -2031,6 +2094,7 @@ impl Default for Options {
             receive_timeout: Timeout::Forever,
             send_timeout: Timeout::Forever,
             no_delay: false,
+            cork: false,
             keep_idle: 7200,
             keep_interval: 75,
             keep_count: 9,
@@ -2045,6 +2109,9 @@ impl Default for Options {
             multicast_ttl: 1,
             multicast_loop: true,
             multicast_all: true,
+            multicast_hops: 1,
+            multicast_loop6: true,
+            multicast_all6: true,
             pktinfo_device: 0,
             timestamps: Timestamps::default(),
         }
@@ -2232,7 +2299,11 @@ impl InetSocket {
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
             state: Mutex::new(State::default()),
-            options: Mutex::new(Options::default()),
+            // `inet6_create` does not set `IP_MULTICAST_ALL`.
+            options: Mutex::new(Options {
+                multicast_all: family == Family::V4,
+                ..Options::default()
+            }),
             signals: Arc::default(),
             cookie: OnceLock::new(),
             embryo: AtomicBool::new(false),
@@ -2467,7 +2538,10 @@ impl InetSocket {
             return self.send_datagram(bytes, to, ids);
         }
         self.settle();
-        let no_delay = self.options().no_delay;
+        let (no_delay, cork) = {
+            let options = self.options();
+            (options.no_delay, options.cork)
+        };
         let mut s = self.lock();
         s.note();
         let Some(stream) = s.stream.clone() else {
@@ -2479,7 +2553,12 @@ impl InetSocket {
         // `SOCKWQ_ASYNC_NOSPACE`.
         let was_open = stream.phase() == Phase::Open;
         if let Some((link, side)) = Self::joined(&s) {
-            link.sending(side, Push { no_delay, ..push });
+            let push = Push {
+                no_delay,
+                cork,
+                ..push
+            };
+            link.sending(side, push);
         }
         let written = stream.write(bytes);
         if let Ok(n) = written
@@ -2620,7 +2699,7 @@ impl InetSocket {
                                 // to the address the connection leaves from.
                                 let from = match s.bound.map(|b| b.ip()).or(s.address) {
                                     Some(ip) if !ip.is_unspecified() => ip,
-                                    _ => self.network.source(to, self.now()),
+                                    _ => self.network.source_through(to, 0, FLOW_TCP, self.now()),
                                 };
                                 self.network.output(from, self.now());
                                 return self.refused(&mut s, address);
@@ -2770,12 +2849,21 @@ impl InetSocket {
     /// and takes datagrams only from it, from that port on the source
     /// address of the route: the loopback's, or elsewhere the host's
     /// (`inet_dgram_connect`, `ip4_datagram_connect`). AF_UNSPEC disconnects
-    /// (`__udp_disconnect`), keeping only what the guest bound itself.
+    /// (`__udp_disconnect`), keeping the port and address the guest bound
+    /// itself, no device, and of an IPv6 socket its peer's address
+    /// ([`State::old_peer`]).
     fn connect_datagram(&self, address: Option<SocketAddr>) -> Result<u64, Errno> {
+        if address.is_none() {
+            // The options' lock comes before the state's.
+            self.put_device(0);
+        }
         let options = *self.options();
         let mut s = self.lock();
         let Some(address) = address else {
-            s.peer = None;
+            let peer = s.peer.take();
+            if self.family == Family::V6 {
+                s.old_peer = peer.map(|peer| peer.ip()).or(s.old_peer);
+            }
             let bindings = State {
                 bound: s.bound.take(),
                 port_locked: s.port_locked,
@@ -2785,6 +2873,7 @@ impl InetSocket {
                 ..State::default()
             };
             self.keep_locked(&mut s, &bindings);
+            self.ports().keep_peer(&self.this, s.old_peer);
             return Ok(0);
         };
         // Linux binds the port first, before it looks the route up.
@@ -2933,7 +3022,10 @@ impl InetSocket {
         // Linux's autobind finds no free port with EAGAIN.
         let bound = self
             .ports()
-            .bind(self.binding(every, options))
+            .bind(Binding {
+                old_peer: s.old_peer,
+                ..self.binding(every, options)
+            })
             .map_err(|_| Errno::EAGAIN)?;
         s.bound = Some(bound);
         Ok(bound)
@@ -3005,7 +3097,7 @@ impl InetSocket {
             if group && !address.is_unspecified() {
                 IpAddr::V4(address)
             } else {
-                self.network.source_through(to, oif, self.now())
+                self.network.source_through(to, oif, FLOW_UDP, self.now())
             }
         } else {
             bound.ip()
@@ -3099,17 +3191,20 @@ impl InetSocket {
             sendable(&mut s)?;
             let mut sent = self.sent(&mut s, from, plain_to, &options, ids);
             let (own_mac, mtu) = self.network.veth_link(index);
-            // A broadcast one reaches each socket that takes it, here and
-            // across the pair, before `sendto` returns, as both copies go
-            // through the backlog of the sending CPU, and so does one to an
-            // IPv4 group; one to an IPv6 group no one, as no socket joins
-            // one here.
+            // A broadcast one, or one to a group, reaches each socket that
+            // takes it, here and across the pair, before `sendto` returns,
+            // as both copies go through the backlog of the sending CPU.
             if cast != Cast::Unicast {
                 let now = self.now();
                 drop(s);
                 let group = cast == Cast::Multicast;
-                if group && !v6 {
-                    sent.ttl = options.multicast_ttl;
+                let hops = if v6 {
+                    options.multicast_hops
+                } else {
+                    options.multicast_ttl
+                };
+                if group {
+                    sent.ttl = hops;
                 }
                 let dst = if group {
                     crate::multicast::ethernet(plain_to.ip())
@@ -3117,23 +3212,33 @@ impl InetSocket {
                     [0xff; 6]
                 };
                 // An IPv6 socket's is `IPV6_MULTICAST_LOOP` (`sk_mc_loop`).
-                let loops = !group || options.multicast_loop || self.family == Family::V6;
-                let leaves = !group || options.multicast_ttl != 0;
-                let copies = if on_lo {
-                    self.network.output(plain_to.ip(), now);
-                    let from = SocketAddr::new(plain(from.ip()), from.port());
-                    self.network
-                        .copies(index, from, plain_to, (true, false), now)
-                } else {
-                    let from = SocketAddr::new(plain(from.ip()), from.port());
-                    let copies = self
-                        .network
-                        .copies(index, from, plain_to, (loops, leaves), now);
-                    if leaves {
-                        self.network.noarp(index, plain_to.ip(), now);
+                let loops = !group
+                    || if self.family == Family::V6 {
+                        options.multicast_loop6
+                    } else {
+                        options.multicast_loop
+                    };
+                // `ip6_finish_output2`: one of a scope no wider than the
+                // interface stays, and one of no hops where its own copy has
+                // come back; `ip_mc_output`: one of no hops.
+                let (loops, leaves) = match plain_to.ip() {
+                    IpAddr::V6(ip) => {
+                        let scope = crate::multicast::scope6(ip);
+                        let own = loops && self.network.in_group6(index, ip, now);
+                        (loops && scope != 0, scope > 1 && (hops != 0 || !own))
                     }
-                    copies
+                    IpAddr::V4(_) if on_lo => (true, false),
+                    IpAddr::V4(_) => (loops, !group || hops != 0),
                 };
+                let from = SocketAddr::new(plain(from.ip()), from.port());
+                let copies = self
+                    .network
+                    .copies(index, from, plain_to, (loops, leaves), now);
+                if on_lo {
+                    self.network.output(plain_to.ip(), now);
+                } else if leaves {
+                    self.network.noarp(index, plain_to.ip(), now);
+                }
                 let peer_index = self.network.peer_index(index);
                 for (receiver, own) in copies {
                     let way = match own {
@@ -3149,7 +3254,8 @@ impl InetSocket {
                             mtu,
                         },
                     };
-                    receiver.deliver(from, bytes, &sent, way);
+                    let iif = if own { index as u32 } else { peer_index };
+                    receiver.deliver_on(from, bytes, iif, &sent, way);
                 }
                 return Ok(bytes.len());
             }
@@ -3268,16 +3374,19 @@ impl InetSocket {
         }
         Ok(bytes.len())
     }
-    /// Whether it takes a datagram to the IPv4 group `group` that came in on
-    /// the device `dif` ([`crate::multicast::allows`]).
-    fn takes_group(&self, group: Ipv4Addr, dif: u32) -> bool {
-        let all = self.options().multicast_all;
-        crate::multicast::allows(&self.lock().groups4, all, group, dif)
-    }
-    /// A datagram from `from` arrives, as `sent` made it and as it came
-    /// `way`, with no device to give as its scope ID.
-    fn deliver(&self, from: SocketAddr, bytes: &[u8], sent: &arrival::Sent, way: arrival::Way) {
-        self.deliver_on(from, bytes, 0, sent, way);
+    /// Whether it takes a datagram to the group `group` that came in on the
+    /// device `dif` ([`crate::multicast::allows`], `allows6`).
+    fn takes_group(&self, group: IpAddr, dif: u32) -> bool {
+        let options = *self.options();
+        let s = self.lock();
+        match group {
+            IpAddr::V4(group) => {
+                crate::multicast::allows(&s.groups4, options.multicast_all, group, dif)
+            }
+            IpAddr::V6(group) => {
+                crate::multicast::allows6(&s.groups6, options.multicast_all6, group)
+            }
+        }
     }
     /// Queues a datagram from `from` that came in on the device `iif`, which
     /// `recvfrom` gives as the scope ID of a sender that needs one
@@ -3483,6 +3592,7 @@ impl InetSocket {
             pooled: self.datagram && options.reuse_port,
             listening: false,
             peer: None,
+            old_peer: None,
             device: options.device,
             owner: Weak::clone(&self.this),
             time_wait: None,
@@ -3603,6 +3713,7 @@ impl InetSocket {
         options.v6_only |= only;
         s.bound = Some(self.ports().bind(Binding {
             locked: address.port() != 0,
+            old_peer: s.old_peer,
             ..self.binding(address, &options)
         })?);
         s.port_locked = address.port() != 0;
@@ -3852,6 +3963,8 @@ impl InetSocket {
             options.multicast_ttl = arrival::HOPS;
         }
         if self.family == Family::V6 {
+            // The hops of the handshake's last segment.
+            options.multicast_hops = arrival::HOPS;
             options.multicast_device = dif;
             if options.device == 0
                 && matches!(from.ip(), IpAddr::V6(ip) if ip.is_unicast_link_local())
@@ -4181,7 +4294,9 @@ impl InetSocket {
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
-        let source = self.network.source_through(to, options.device, self.now());
+        let source = self
+            .network
+            .source_through(to, options.device, FLOW_TCP, self.now());
         let mut ports = self.ports();
         // One bound to a broadcast or multicast address takes its route's
         // source as its name too (`tcp_v4_connect`:
@@ -4312,6 +4427,7 @@ impl Drop for InetSocket {
         let abort = self.options().linger == Some(0);
         let s = std::mem::take(&mut *self.lock());
         self.network.drop4(&s.groups4);
+        self.network.drop6(&s.groups6);
         if let Some(listen) = s.listen {
             listen.stop();
         }
@@ -4570,6 +4686,8 @@ pub(crate) struct Entry {
     pub(crate) table: Table,
     /// Its own address, IPv4 as such even on an IPv6 socket, and its peer's.
     pub(crate) local: SocketAddr,
+    /// The peer, or with port 0 the address an IPv6 UDP socket keeps of one
+    /// it had.
     pub(crate) peer: Option<SocketAddr>,
     /// The device it is bound to (`sk_bound_dev_if`), 0 for none.
     pub(crate) device: u32,
@@ -4589,6 +4707,9 @@ pub(crate) struct Full {
     pub(crate) shutdown: u8,
     pub(crate) type_of_service: u8,
     pub(crate) v6_only: bool,
+    /// `IP_MULTICAST_LOOP` and `IP_MULTICAST_ALL`.
+    pub(crate) multicast_loop: bool,
+    pub(crate) multicast_all: bool,
     pub(crate) priority: u32,
     /// The guest bound its port (`SOCK_BINDPORT_LOCK`).
     pub(crate) port_locked: bool,
@@ -4672,6 +4793,8 @@ impl InetSocket {
             shutdown,
             type_of_service: options.type_of_service as u8,
             v6_only: options.v6_only,
+            multicast_loop: options.multicast_loop,
+            multicast_all: options.multicast_all,
             priority: options.priority as u32,
             port_locked: s.port_locked,
             received: received as u32,
@@ -4696,7 +4819,7 @@ impl InetSocket {
                 },
                 table: Table::Connected,
                 local,
-                peer: s.peer,
+                peer: s.peer.or(s.old_peer.map(|ip| SocketAddr::new(ip, 0))),
                 device: options.device,
                 cookie: self.cookie(),
                 timer: (0, 0, None),
@@ -5513,14 +5636,14 @@ fn set_multicast4(
 }
 /// `setsockopt` of an inet socket: the `SOL_SOCKET` options a client sets,
 /// `IPPROTO_TCP`'s `TCP_NODELAY`, keepalive timing (1 to 32767 seconds, at
-/// most 127 probes), `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
+/// most 127 probes), `TCP_CORK`, `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
 /// `IPV6_V6ONLY`, and the filter options (`SO_ATTACH_FILTER`,
 /// `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and `SO_ATTACH_BPF`, as
 /// [`crate::sockets::set_filter`] takes them), and the device the socket
 /// is bound to (`SO_BINDTODEVICE`, `SO_BINDTOIFINDEX`, [`bind_to_device`]),
 /// and those a datagram goes out through (`IPV6_MULTICAST_IF`,
-/// `IPV6_UNICAST_IF`, the sticky `IPV6_PKTINFO`), and IPv4's multicast
-/// options ([`set_multicast4`]).
+/// `IPV6_UNICAST_IF`, the sticky `IPV6_PKTINFO`), and IPv6's multicast
+/// options and IPv4's ([`set_multicast4`]).
 /// `SO_PASSCRED`, `SO_PASSSEC`,
 /// `SO_PASSPIDFD` and `SO_PASSRIGHTS` are EOPNOTSUPP, as Linux takes them
 /// only on AF_UNIX (`sk_may_scm_recv` adds netlink and Bluetooth for the
@@ -5588,6 +5711,55 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     .ok_or(ENODEV)?
             };
             bind_to_device(c, socket, &mut socket.options(), index.cast_signed())?;
+        }
+        // `IPV6_MULTICAST_HOPS`, not of TCP (`ENOPROTOOPT`): -1 is 1.
+        (41, 18) if socket.family == Family::V6 => {
+            let value = option6_int(c, at, len)?;
+            if tcp {
+                return Err(ENOPROTOOPT);
+            }
+            if (len as u32 as i32) < 4 {
+                return Err(Errno::EINVAL);
+            }
+            let value = if value == -1 { 1 } else { value };
+            let value = u8::try_from(value).map_err(|_| Errno::EINVAL)?;
+            socket.options().multicast_hops = value;
+        }
+        // `IPV6_MULTICAST_LOOP`, 0 or 1, and `IPV6_MULTICAST_ALL`.
+        (41, 19 | 29) if socket.family == Family::V6 => {
+            let value = option6_int(c, at, len)?;
+            if (len as u32 as i32) < 4 || name == 19 && !matches!(value, 0 | 1) {
+                return Err(Errno::EINVAL);
+            }
+            let mut options = socket.options();
+            if name == 19 {
+                options.multicast_loop6 = value != 0;
+            } else {
+                options.multicast_all6 = value != 0;
+            }
+        }
+        // `IPV6_ADD_MEMBERSHIP` and `IPV6_DROP_MEMBERSHIP`: an `ipv6_mreq`
+        // (`EINVAL` for less), not of TCP (`EPROTO`).
+        (41, 20 | 21) if socket.family == Family::V6 => {
+            option6_int(c, at, len)?;
+            if (len as u32 as i32) < 20 {
+                return Err(Errno::EINVAL);
+            }
+            if tcp {
+                return Err(EPROTO);
+            }
+            let mut raw = [0; 20];
+            c.mem
+                .read(GuestAddr(at), &mut raw)
+                .map_err(|_| Errno::EFAULT)?;
+            let asked = Membership6::read(&raw);
+            let now = socket.now();
+            let mut s = socket.lock();
+            if name == 20 {
+                socket.network.join6(&mut s.groups6, asked, now)?;
+            } else {
+                socket.network.leave6(&mut s.groups6, asked)?;
+            }
         }
         (0, 32..=36 | 49) => set_multicast4(c, socket, name, (at, len))?,
         // `IPV6_MULTICAST_IF` (`do_ipv6_setsockopt`, before the socket's
@@ -5683,7 +5855,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             socket.options().linger = (on != 0).then_some(seconds);
         }
         (1, 2 | 6 | 7 | 8 | 9 | 10 | 12 | 15 | 62)
-        | (6, 1 | 4 | 5 | 6 | 12 | 18)
+        | (6, 1 | 3 | 4 | 5 | 6 | 12 | 18)
         | (0, 1)
         | (41, 26) => {
             let value = option_int(c, at, len)?;
@@ -5726,6 +5898,13 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     }
                     if let Some((link, side)) = InetSocket::joined(&s) {
                         link.set_no_delay(side, value != 0);
+                    }
+                }
+                (6, 3) => {
+                    options.cork = value != 0;
+                    let s = socket.lock();
+                    if let Some((link, side)) = InetSocket::joined(&s) {
+                        link.set_cork(side, value != 0);
                     }
                 }
                 (6, 4 | 5) if !(1..=32767).contains(&value) => return Err(Errno::EINVAL),
@@ -5922,6 +6101,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     Family::V6 => AF_INET6,
                 }),
                 (6, 1) => i32::from(options.no_delay),
+                (6, 3) => i32::from(options.cork),
                 (6, 4) => options.keep_idle,
                 (6, 5) => options.keep_interval,
                 (6, 6) => options.keep_count,
@@ -5937,6 +6117,11 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 // `IPV6_MULTICAST_IF`, and `IPV6_UNICAST_IF` in network byte
                 // order; `IPV6_PKTINFO` has no getsockopt (`ENOPROTOOPT`).
                 (41, 17) if socket.family == Family::V6 => options.multicast_device.cast_signed(),
+                // `IPV6_MULTICAST_HOPS`, `IPV6_MULTICAST_LOOP` and
+                // `IPV6_MULTICAST_ALL`.
+                (41, 18) if socket.family == Family::V6 => i32::from(options.multicast_hops),
+                (41, 19) if socket.family == Family::V6 => i32::from(options.multicast_loop6),
+                (41, 29) if socket.family == Family::V6 => i32::from(options.multicast_all6),
                 (41, 76) if socket.family == Family::V6 => {
                     i32::from_le_bytes(options.unicast_device.to_be_bytes())
                 }

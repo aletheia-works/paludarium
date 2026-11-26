@@ -27,7 +27,7 @@ mod build_id;
 mod sample;
 mod side_band;
 
-pub(crate) use sample::{Task, Who, overflow, sampling};
+pub(crate) use sample::{Task, Who, overflow, samples_faults, sampling};
 pub(crate) use side_band::{Space, comm, wanted};
 
 use crate::ThreadGroup;
@@ -553,12 +553,12 @@ struct Lists {
     on_exec: Vec<Erased>,
     /// The events that count a thread, for its exit.
     counting: Vec<Erased>,
-    /// Those of a CPU that ask for side-band records (`pmu_sb_events`), and
-    /// that sample.
+    /// Those of a CPU that ask for side-band records (`pmu_sb_events`).
     side_band: Vec<Erased>,
+    /// Those of a CPU that sample.
     cpu_sampling: Vec<Erased>,
-    /// The opened ones that ask for side-band records, of a thread or a CPU, enabled or
-    /// not, while they are open (`account_event`).
+    /// The opened ones that ask for side-band records, of a thread or a
+    /// CPU, enabled or not, while they are open (`account_event`).
     asking: Vec<Erased>,
 }
 

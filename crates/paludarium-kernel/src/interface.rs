@@ -389,7 +389,7 @@ fn mask4(prefix: u8) -> u32 {
 }
 /// An IPv4 route's prefix, as `rtm_to_fib_config` checks it: `EINVAL` for
 /// a length past 32 or bits past it.
-fn prefix4(dst: Ipv4Addr, len: u8) -> Result<(), Errno> {
+pub(crate) fn prefix4(dst: Ipv4Addr, len: u8) -> Result<(), Errno> {
     if len > 32 {
         return Err(extack::message(Errno::EINVAL, "Invalid prefix length"));
     }
@@ -494,14 +494,30 @@ fn multipath_matches4(route: &Route4, hops: &[NextHop4]) -> bool {
     let own = route.next_hops();
     own.len() <= hops.len()
         && own.iter().zip(hops).all(|(nh, asked)| {
-            (asked.oif == 0 || asked.oif == nh.oif)
-                && asked.gateway.is_none_or(|g| nh.gateway == Some(g))
+            // `RTA_VIA` is not compared with a next hop without a gateway.
+            !asked.broken
+                && (asked.oif == 0 || asked.oif == nh.oif)
+                && asked
+                    .gateway
+                    .is_none_or(|g| nh.gateway == Some(g) || (asked.via && nh.gateway.is_none()))
         })
+}
+/// A next hop's gateway as `inet_select_addr` takes it (`fib_nh_gw4`): of
+/// an IPv6 one the first 4 bytes, which share their place, 0 for none.
+fn nexthop4(gateway: Option<IpAddr>) -> Option<Ipv4Addr> {
+    let ip = match gateway? {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(ip) => {
+            let o = ip.octets();
+            Ipv4Addr::new(o[0], o[1], o[2], o[3])
+        }
+    };
+    Some(ip).filter(|ip| !ip.is_unspecified())
 }
 /// One next hop of an IPv4 multipath route (a `fib_nh`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Hop4 {
-    pub gateway: Option<Ipv4Addr>,
+    pub gateway: Option<IpAddr>,
     pub oif: u32,
     pub onlink: bool,
     pub linkdown: bool,
@@ -526,7 +542,7 @@ pub(crate) struct Route4 {
     pub proto: u8,
     pub scope: u8,
     pub prefsrc: Option<Ipv4Addr>,
-    pub gateway: Option<Ipv4Addr>,
+    pub gateway: Option<IpAddr>,
     /// The index of the device it goes through (`fib_nh_oif`); 0 for the
     /// kinds that reject, which have none.
     pub oif: u32,
@@ -1186,10 +1202,13 @@ pub(crate) struct Ask4 {
     pub proto: u8,
     pub scope: u8,
     pub prefsrc: Option<Ipv4Addr>,
-    pub gateway: Option<Ipv4Addr>,
+    pub gateway: Option<IpAddr>,
     pub oif: u32,
     /// Whether the namespace has a device of `oif`.
     pub device: bool,
+    /// That device's IPv6, as [`Ask6::ipv6_off`] has it, which a gateway of
+    /// IPv6 (`RTA_VIA`) needs.
+    pub ipv6_off: Option<bool>,
     /// `rtm_flags`.
     pub flags: u32,
     /// The request's `NLM_F_*`.
@@ -1212,7 +1231,7 @@ pub(crate) struct Select4 {
     pub proto: u8,
     pub scope: u8,
     pub prefsrc: Option<Ipv4Addr>,
-    pub gateway: Option<Ipv4Addr>,
+    pub gateway: Option<IpAddr>,
     pub oif: u32,
     /// The metrics the route must have (`fib_metrics_match`): each as an
     /// index of [`Metrics`] and its value, none for a request that names
@@ -1232,8 +1251,14 @@ pub(crate) struct NextHop4 {
     /// Its `rtnh_ifindex`, and whether the namespace has a device of it.
     pub oif: u32,
     pub device: bool,
-    /// Its `RTA_GATEWAY`.
-    pub gateway: Option<Ipv4Addr>,
+    /// Its IPv6, as [`Ask4::ipv6_off`] has it.
+    pub ipv6_off: Option<bool>,
+    /// Its `RTA_GATEWAY` or `RTA_VIA`, and whether the latter.
+    pub gateway: Option<IpAddr>,
+    pub via: bool,
+    /// Whether a removal's matches no route, as its gateway cannot be read
+    /// (`fib_nh_match`).
+    pub broken: bool,
 }
 /// An IPv4 request's `RTA_MULTIPATH` to add, as `fib_create_info` takes
 /// it: whether `fib_count_nexthops` found them all, then its next hops or
@@ -2994,6 +3019,7 @@ impl Addresses {
                                 gateway: hop.gateway,
                                 oif: hop.oif,
                                 device: hop.device,
+                                ipv6_off: hop.ipv6_off,
                                 flags: (ask.flags & !0xff) | hop.flags,
                                 ..*ask
                             },
@@ -3104,7 +3130,7 @@ impl Addresses {
             .collect())
     }
     /// A next hop `ask` names, checked as `fib_check_nh` does: through
-    /// its gateway ([`Self::gateway4`]); else `EINVAL` on link, `ENODEV`
+    /// its gateway ([`Self::gateway4`], [`Self::gateway4_v6`]); else `EINVAL` on link, `ENODEV`
     /// for no device, `ENETDOWN` while it is down, and `RTNH_F_LINKDOWN`
     /// without its carrier (`fib_check_nh_nongw`).
     fn check_nh4(&self, ask: &Ask4, table: u32, up: &dyn Fn(u32) -> bool) -> Result<Hop4, Errno> {
@@ -3118,7 +3144,14 @@ impl Addresses {
             uses_gateway: false,
             weight: 1,
         };
-        if let Some(gateway) = ask.gateway {
+        if let Some(IpAddr::V6(gateway)) = ask.gateway {
+            // Never `RTNH_F_LINKDOWN`, as `fib_check_nh_v6_gw` takes none
+            // of its check's flags.
+            hop.oif = self.gateway4_v6(gateway, ask, table, up)?;
+            hop.uses_gateway = true;
+            return Ok(hop);
+        }
+        if let Some(IpAddr::V4(gateway)) = ask.gateway {
             let (oif, uses_gateway) = self.gateway4(gateway, ask, table, up)?;
             hop.oif = oif;
             hop.uses_gateway = uses_gateway;
@@ -3187,6 +3220,44 @@ impl Addresses {
             return Err(ENETDOWN);
         }
         Ok((via.oif, via.scope == SCOPE_LINK))
+    }
+    /// The device of an IPv4 next hop's gateway of IPv6 `via`
+    /// (`fib_check_nh_v6_gw`): the one `ask` names or the one it is
+    /// reached through, checked as an IPv6 route's is (`fib6_nh_init`,
+    /// [`Self::gateway6`]), by the IPv6 table of the same number.
+    fn gateway4_v6(
+        &self,
+        via: Ipv6Addr,
+        ask: &Ask4,
+        table: u32,
+        up: &dyn Fn(u32) -> bool,
+    ) -> Result<u32, Errno> {
+        let onlink = ask.flags & 4 != 0;
+        if ask.oif != 0 && (!ask.device || ask.ipv6_off.is_none()) {
+            return Err(Errno::ENODEV);
+        }
+        if onlink {
+            if ask.oif == 0 {
+                return Err(extack::message(
+                    Errno::ENODEV,
+                    "Nexthop device required for onlink",
+                ));
+            }
+            if !up(ask.oif) {
+                return Err(extack::message(ENETDOWN, "Nexthop device is not up"));
+            }
+        }
+        let oif = self.gateway6(via, ask.oif, onlink, Some(table))?;
+        if ask.oif != 0 && ask.ipv6_off == Some(true) {
+            return Err(extack::message(
+                Errno::EACCES,
+                "IPv6 is disabled on nexthop device",
+            ));
+        }
+        if !up(oif) {
+            return Err(extack::message(ENETDOWN, "Nexthop device is not up"));
+        }
+        Ok(oif)
     }
     /// What an on-link gateway `ip` is (`inet_addr_type_dev_table`, which
     /// takes the local table and no device): a broadcast one for 0.0.0.0,
@@ -3408,7 +3479,7 @@ impl Addresses {
         let mut gateway = None;
         if kind.error().is_none() {
             if let Some(via) = ask.gateway {
-                oif = self.gateway6(via, ask, table)?;
+                oif = self.gateway6(via, ask.oif, ask.onlink, (ask.table != 0).then_some(table))?;
                 gateway = Some(via);
             }
             if oif == 0 {
@@ -3467,16 +3538,22 @@ impl Addresses {
         Ok(route)
     }
     /// The device of a route's gateway `via` (`ip6_validate_gw`), the one
-    /// `ask` names or else the one a route to it goes through; `EINVAL`,
-    /// told of, for an address of the namespace (on that device, for a
-    /// link-local one), the unspecified address or a group, an on-link
+    /// `named` (0 for none) or else the one a route to it goes through;
+    /// `EINVAL`, told of, for an address of the namespace (on that device,
+    /// for a link-local one), the unspecified address or a group, an on-link
     /// gateway the main table has a route to of a kind that is not
     /// unicast nor rejecting, no device, or `lo`. A gateway not link-local
     /// and not on link needs a route to it through that device, without a
     /// gateway, that does not reject (`ip6_route_check_nh`): the table's
     /// asked for, else the local and main tables'; `EHOSTUNREACH` for
     /// none.
-    fn gateway6(&self, via: Ipv6Addr, ask: &Ask6, table: u32) -> Result<u32, Errno> {
+    fn gateway6(
+        &self,
+        via: Ipv6Addr,
+        named: u32,
+        onlink: bool,
+        table: Option<u32>,
+    ) -> Result<u32, Errno> {
         let invalid = |text| extack::message(Errno::EINVAL, text);
         let first = via.segments()[0];
         let link_local = !via.is_multicast() && first & 0xffc0 == 0xfe80;
@@ -3487,16 +3564,16 @@ impl Addresses {
                 a.address == via && !a.tentative() && (!link_local || a.index.unsigned_abs() == oif)
             })
         };
-        let gone = invalid("Gateway can not be a local address");
-        if ask.oif != 0 && local(ask.oif) {
-            return Err(gone);
+        let gone = || invalid("Gateway can not be a local address");
+        if named != 0 && local(named) {
+            return Err(gone());
         }
-        let mut oif = ask.oif;
+        let mut oif = named;
         if !link_local {
             if via.is_unspecified() || via.is_multicast() {
                 return Err(invalid("Invalid gateway address"));
             }
-            if ask.onlink {
+            if onlink {
                 // `ip6_route_check_nh_onlink`.
                 if let Some(found) = self.table_lookup6(TABLE_MAIN, via)
                     && found.kind.error().is_none()
@@ -3506,21 +3583,21 @@ impl Addresses {
                 }
             } else {
                 let usable = |r: &Route6| r.kind.error().is_none() && r.gateway.is_none();
-                let in_table = (ask.table != 0 && self.tables6.contains(&table))
-                    .then(|| self.lookup6_in(table, via, ask.oif, &Flow6::default()))
-                    .flatten()
+                let in_table = table
+                    .filter(|table| self.tables6.contains(table))
+                    .and_then(|table| self.lookup6_in(table, via, named, &Flow6::default()))
                     .filter(|r| usable(r));
                 let found = match in_table {
                     Some(found) => found,
                     None => self
-                        .lookup6_on(via, ask.oif)
+                        .lookup6_on(via, named)
                         .ok()
                         .filter(|r| usable(r))
                         .ok_or(EHOSTUNREACH)?,
                 };
-                if ask.oif == 0 {
+                if named == 0 {
                     oif = found.oif;
-                } else if found.oif != ask.oif {
+                } else if found.oif != named {
                     return Err(EHOSTUNREACH);
                 }
             }
@@ -3533,8 +3610,8 @@ impl Addresses {
                 "Egress device can not be loopback device for this route",
             ));
         }
-        if ask.oif == 0 && local(oif) {
-            return Err(gone);
+        if named == 0 && local(oif) {
+            return Err(gone());
         }
         Ok(oif)
     }
@@ -3651,6 +3728,14 @@ impl Addresses {
             entries.push((route, hops));
         }
         entries
+    }
+    /// The IPv6 tables, in the order a dump goes through them.
+    pub(crate) fn tables6(&self) -> Vec<u32> {
+        table_order(&self.tables6)
+    }
+    /// The IPv6 addresses.
+    pub(crate) fn v6(&self) -> &[V6] {
+        &self.v6
     }
     /// Whether IPv4 has made the table `table` (`fib_get_table`).
     pub(crate) fn has_table4(&self, table: u32) -> bool {
@@ -3790,7 +3875,7 @@ impl Addresses {
             let takes = hash < ((weight << 31) + total / 2) / total;
             let own = order.is_some_and(|order| {
                 i32::try_from(hop.oif).is_ok_and(|index| {
-                    self.select4(index, hop.gateway, matched.scope, order) == Some(src)
+                    self.select4(index, nexthop4(hop.gateway), matched.scope, order) == Some(src)
                 })
             });
             let score = 2 * u8::from(own) + u8::from(takes);
@@ -3898,7 +3983,7 @@ impl Addresses {
             return route.prefsrc;
         }
         let index = i32::try_from(route.oif).unwrap_or(LOOPBACK_INDEX);
-        self.select4(index, route.gateway, route.scope, order)
+        self.select4(index, nexthop4(route.gateway), route.scope, order)
     }
     /// The address `inet_select_addr` picks on the device of `index` for
     /// `dst` (any for `None`) of `scope`: the first of its primary
@@ -4144,6 +4229,17 @@ impl Addresses {
     pub(crate) fn local4(&self, ip: Ipv4Addr) -> bool {
         self.tables4.contains(&TABLE_LOCAL) && self.addr_type4(ip, TABLE_LOCAL) == Kind::Local
     }
+    /// Whether `group` is the solicited-node group of an IPv6 address of the
+    /// device `index` (`addrconf_addr_solict_mult`).
+    pub(crate) fn solicits6(&self, index: i32, group: Ipv6Addr) -> bool {
+        const PREFIX: [u8; 13] = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff];
+        let group = group.octets();
+        group[..13] == PREFIX
+            && self
+                .v6
+                .iter()
+                .any(|a| a.index == index && a.address.octets()[13..] == group[13..])
+    }
     /// Whether `ip` is an IPv6 address of this namespace's, and not
     /// tentative: one that `ipv6_chk_addr` finds, banning
     /// `IFA_F_TENTATIVE`, as a bind (`__inet6_bind`) and a packet's
@@ -4260,24 +4356,49 @@ impl Addresses {
                     }),
                 Err(_) => Ipv4Addr::LOCALHOST,
             }),
-            IpAddr::V6(ip) => IpAddr::V6(self.source6_through(ip, 0, order)),
+            IpAddr::V6(ip) => IpAddr::V6(self.source6_through(ip, 0, &Flow6::default(), order)),
         }
     }
     /// The address a packet to the IPv6 address `ip` through the device
     /// `oif` (any for 0) leaves from: out through a veth end, its route's
     /// preferred source or what `ipv6_dev_get_saddr` picks for the route's
-    /// device ([`Self::select6`]); `::` where there is none.
-    pub(crate) fn source6_through(&self, ip: Ipv6Addr, oif: u32, order: &[i32]) -> Ipv6Addr {
-        match self.lookup6_on(ip, oif) {
-            Ok(r) if r.oif != LOOPBACK_OIF => r
-                .prefsrc
-                .or_else(|| self.select6(i32::try_from(r.oif).unwrap_or(0), ip, order))
-                .unwrap_or(Ipv6Addr::UNSPECIFIED),
-            r => r
-                .ok()
-                .and_then(|r| self.source6(&r, ip))
-                .unwrap_or(Ipv6Addr::LOCALHOST),
+    /// device ([`Self::select6`]); `::` where there is none. A multipath
+    /// route's is of the hop that `flow`, with no source yet, takes, which
+    /// is the one the packet takes (`ip6_dst_lookup_tail`).
+    pub(crate) fn source6_through(
+        &self,
+        ip: Ipv6Addr,
+        oif: u32,
+        flow: &Flow6,
+        order: &[i32],
+    ) -> Ipv6Addr {
+        match self.lookup6_flow(ip, oif, flow) {
+            Ok(r) => self
+                .route_source6(&r, ip, order)
+                .unwrap_or(if r.oif == LOOPBACK_OIF {
+                    Ipv6Addr::LOCALHOST
+                } else {
+                    Ipv6Addr::UNSPECIFIED
+                }),
+            Err(_) => Ipv6Addr::LOCALHOST,
         }
+    }
+    /// The address a packet to `ip` by `route` leaves from
+    /// (`ip6_route_get_saddr`): its preferred source, or what
+    /// `ipv6_dev_get_saddr` picks for its device ([`Self::select6`], or
+    /// [`Self::source6`] for `lo`).
+    pub(crate) fn route_source6(
+        &self,
+        route: &Route6,
+        ip: Ipv6Addr,
+        order: &[i32],
+    ) -> Option<Ipv6Addr> {
+        if route.oif == LOOPBACK_OIF {
+            return self.source6(route, ip);
+        }
+        route
+            .prefsrc
+            .or_else(|| self.select6(i32::try_from(route.oif).ok()?, ip, order))
     }
 }
 /// The label of `ip` in Linux's default address label table
@@ -4371,6 +4492,7 @@ mod tests {
             gateway: None,
             oif: u32::from(kind == 1),
             device: kind == 1,
+            ipv6_off: None,
             flags: 0,
             request,
             metrics: Ok(NO_METRICS),
@@ -5010,6 +5132,9 @@ mod tests {
             a.add_v4(end, Lifetimes::FOREVER, false, true, 0).unwrap();
         }
         let hop = |via: &str, oif, weight| NextHop4 {
+            ipv6_off: None,
+            via: false,
+            broken: false,
             flags: 0,
             weight,
             oif,
@@ -5102,6 +5227,9 @@ mod tests {
             a.add_v4(end, Lifetimes::FOREVER, false, true, 0).unwrap();
         }
         let hop = |via: &str, oif, weight| NextHop4 {
+            ipv6_off: None,
+            via: false,
+            broken: false,
             flags: 0,
             weight,
             oif,
@@ -5142,7 +5270,7 @@ mod tests {
                     let to = Ipv4Addr::new(net[0], net[1], hi, lo);
                     let route = a.output4(to, 0, oif, src, &order).unwrap();
                     assert_eq!(a.output4(to, 0, oif, src, &order).unwrap(), route);
-                    route.gateway == Some(ip(via))
+                    route.gateway == Some(IpAddr::V4(ip(via)))
                 })
                 .count()
         };

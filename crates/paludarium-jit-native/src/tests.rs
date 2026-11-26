@@ -1315,3 +1315,43 @@ fn a_store_to_an_executable_page_an_instruction_was_fetched_from_moves_the_code(
     assert_eq!((ran, word), (2, 0x5555));
     assert_ne!(memory.code_generation(), generation);
 }
+
+/// Each form that loads, then `inc ecx`, run under a code generation older
+/// than the space's, as when another thread changed code after the block
+/// was entered: the load, a helper's call, says the code changed, so the
+/// block leaves after the form, as the interpreter does after the
+/// instruction, even when the store that follows goes through a slot and
+/// says nothing. The load is a call as the data page's slot is empty, or,
+/// for a push, whose store's slot holds, as it crosses a page.
+#[test]
+fn a_form_leaves_when_its_load_says_the_code_changed() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let forms_run = [
+        &[0x01, 0x03][..],         // add [rbx], eax
+        &[0xff, 0x03],             // inc dword [rbx]
+        &[0xff, 0x33],             // push qword [rbx]
+        &[0xf2, 0x0f, 0x10, 0x03], // movsd xmm0, [rbx]
+        &[0x03, 0x03],             // add eax, [rbx]
+        &[0x39, 0x03],             // cmp [rbx], eax
+    ]
+    .map(|form| {
+        let code = [form, &[0xff, 0xc1]].concat();
+        let compiled = compiler.compile(&forms(&code)).unwrap();
+        let memory = space(&code, &[1; 8]);
+        let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+        state.gpr[reg::RBX] = DATA;
+        if form == [0xff, 0x33] {
+            // Written first, as only then does the slot of the stack's page
+            // allow the store.
+            memory.write(GuestAddr(STACK - 0x108), &[0; 8]).unwrap();
+            warm(&memory);
+            state.gpr[reg::RBX] = DATA + PAGE_SIZE - 4;
+        }
+        let entered = memory.code_generation_cached().wrapping_sub(1);
+        let ran = compiled.run(&mut state, &memory, entered);
+        (form, ran, state.gpr[reg::RCX])
+    });
+    for (form, ran, rcx) in forms_run {
+        assert_eq!((ran, rcx), (1, 0), "{form:02x?} of {forms_run:02x?}");
+    }
+}

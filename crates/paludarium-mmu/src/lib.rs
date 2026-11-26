@@ -130,6 +130,13 @@ pub struct Mapping {
     pub wipe_on_fork: bool,
     /// `MADV_DONTDUMP` (Linux's `VM_DONTDUMP`): a core dump holds none of it.
     pub dont_dump: bool,
+    /// `mmap` made it with `MAP_DROPPABLE` (Linux's `VM_DROPPABLE`), which
+    /// gives it [`Self::no_reserve`], [`Self::wipe_on_fork`] and
+    /// [`Self::dont_dump`] for good: `MADV_KEEPONFORK` and `MADV_DODUMP`
+    /// refuse it, `mlock` leaves it as it is, KSM ignores it and no
+    /// `userfaultfd` registers it. Linux may drop its pages under memory
+    /// pressure, which never comes here.
+    pub droppable: bool,
     /// `MADV_GUARD_INSTALL` put guards in its Linux VMA (`VM_MAYBE_GUARD`),
     /// which stays when they go, does not stop a merge, and makes `fork`
     /// copy the VMA's page tables.
@@ -402,6 +409,7 @@ pub mod faults {
         static FORCED: Cell<u64> = const { Cell::new(0) };
         static SINK: RefCell<Option<Arc<dyn Sink>>> = const { RefCell::new(None) };
         static KERNEL: Cell<bool> = const { Cell::new(false) };
+        static ARMED: Cell<bool> = const { Cell::new(false) };
         static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
     }
@@ -439,6 +447,36 @@ pub mod faults {
     /// `resolver` from now on (none for `None`); returns what it had.
     pub fn set_resolver(resolver: Option<Arc<dyn Resolver>>) -> Option<Arc<dyn Resolver>> {
         RESOLVER.with(|r| std::mem::replace(&mut *r.borrow_mut(), resolver))
+    }
+
+    /// Whether the faults of the calling host thread's guest code are
+    /// refused from now on: an access that would take one fails, with a
+    /// [`super::Fault`] of a mapped page, and leaves the page as it was,
+    /// each time it is made, until [`super::AddressSpace::touch`] brings
+    /// the page in. So a fault stops the thread at its instruction, where a
+    /// `perf` event samples it.
+    pub fn arm(armed: bool) {
+        ARMED.with(|a| a.set(armed));
+    }
+    /// The fault that refuses the access the calling host thread makes `at`
+    /// a page it is about to take one of, a `write`, a `fetch` or a read, if
+    /// it does. Out of the way of the accesses that take none.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn refused(at: At, write: bool, fetch: bool) -> Option<super::Fault> {
+        let armed = ARMED.with(Cell::get);
+        if !armed || KERNEL.with(Cell::get) || GUP.with(Cell::get) != Gup::No {
+            return None;
+        }
+        Some(super::Fault {
+            addr: super::GuestAddr(at.addr),
+            write,
+            fetch,
+            mapped: true,
+            present: at.present,
+            bus: false,
+            poison: false,
+        })
     }
 
     /// Runs `f` with the calling host thread's faults not resolved, as
@@ -503,10 +541,10 @@ pub mod faults {
         })
     }
 
-    pub(crate) fn count(addr: u64, present: bool) {
+    pub(crate) fn count(at: At) {
         if GUP.with(Cell::get) != Gup::No {
             count_forced();
-        } else if !add(false, At { addr, present }) {
+        } else if !add(false, at) {
             TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
         }
     }
@@ -558,6 +596,21 @@ pub mod faults {
     /// thread it was bound to, as that thread is done there.
     pub fn unbind() {
         SINK.with(|sink| sink.borrow_mut().take());
+        arm(false);
+    }
+
+    /// Runs `f` with the calling host thread's accesses its guest code's,
+    /// and their faults taken, not refused.
+    pub(crate) fn taken_as_own<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_kernel(self.0);
+                arm(self.1);
+            }
+        }
+        let _restore = Restore(set_kernel(false), ARMED.with(|a| a.replace(false)));
+        f()
     }
 
     /// Whether the calling host thread's accesses are the kernel's from now
@@ -651,6 +704,8 @@ pub mod vm {
     pub const HUGEPAGE: u64 = 1 << 29;
     pub const NOHUGEPAGE: u64 = 1 << 30;
     pub const MERGEABLE: u64 = 1 << 31;
+    /// `VM_DROPPABLE`, which `smaps` names `dp`.
+    pub const DROPPABLE: u64 = 1 << 40;
     pub const SEALED: u64 = 1 << 42;
 }
 
@@ -4773,7 +4828,14 @@ impl AddressSpaceData {
                 if let Some(entry) = table.pages.get_mut(slot) {
                     let missing = entry.is_none();
                     if missing && matches!(access, Access::Read | Access::Fetch) {
-                        faults::count(page + offset as u64, false);
+                        let at = faults::At {
+                            addr: page + offset as u64,
+                            present: false,
+                        };
+                        if let Some(fault) = faults::refused(at, false, access == Access::Fetch) {
+                            return Err(fault);
+                        }
+                        faults::count(at);
                     } else if missing && access == Access::Dump {
                         faults::count_forced();
                     }
@@ -4957,7 +5019,14 @@ impl AddressSpaceData {
             {
                 if access == Access::Write {
                     let present = table.pages.get(slot).is_some_and(Option::is_some);
-                    faults::count(page + offset as u64, present);
+                    let at = faults::At {
+                        addr: page + offset as u64,
+                        present,
+                    };
+                    if let Some(fault) = faults::refused(at, true, false) {
+                        return Err(fault);
+                    }
+                    faults::count(at);
                 } else {
                     faults::count_forced();
                 }
@@ -5277,6 +5346,7 @@ impl AddressSpaceData {
             | bit(m.no_reserve, vm::NORESERVE)
             | bit(m.wipe_on_fork, vm::WIPEONFORK)
             | bit(m.dont_dump, vm::DONTDUMP)
+            | bit(m.droppable, vm::DROPPABLE)
             | bit(m.huge_pages == Some(true), vm::HUGEPAGE)
             | bit(m.huge_pages == Some(false), vm::NOHUGEPAGE)
             | bit(m.mergeable, vm::MERGEABLE)
@@ -5672,6 +5742,7 @@ impl AddressSpaceData {
                 dont_fork: false,
                 wipe_on_fork: false,
                 dont_dump: false,
+                droppable: false,
                 maybe_guard: false,
                 locked: self.future_lock,
                 account: prot.contains(Prot::WRITE),
@@ -5931,6 +6002,7 @@ impl AddressSpaceData {
             && a.dont_fork == b.dont_fork
             && a.wipe_on_fork == b.wipe_on_fork
             && a.dont_dump == b.dont_dump
+            && a.droppable == b.droppable
             && a.locked == b.locked
             && a.account == b.account
             && a.no_reserve == b.no_reserve
@@ -6490,8 +6562,9 @@ impl AddressSpaceData {
     /// it; a hole in the range is `ENOMEM` once the rest has it. Only
     /// private anonymous memory takes `MADV_WIPEONFORK` (Linux's VMA of no
     /// file and not shared), memory core mm does not back takes no
-    /// `MADV_DOFORK` or `MADV_DODUMP`, and a VMA whose flags change but may
-    /// not be split is taken whole or not at all.
+    /// `MADV_DOFORK` or `MADV_DODUMP`, droppable memory no `MADV_KEEPONFORK`
+    /// or `MADV_DODUMP`, and a VMA whose flags change but may not be split
+    /// is taken whole or not at all.
     pub fn advise_flags(&mut self, addr: u64, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
         let starts: Vec<u64> = self
             .mappings
@@ -6525,6 +6598,11 @@ impl AddressSpaceData {
             {
                 return Err(Errno::EINVAL);
             }
+            // Droppable memory is wiped in a child and never dumped, for
+            // good.
+            if matches!(advice, FlagAdvice::KeepOnFork | FlagAdvice::DoDump) && m.droppable {
+                return Err(Errno::EINVAL);
+            }
             // One that is never dumped keeps its flags.
             if advice == FlagAdvice::DontDump
                 && self
@@ -6533,7 +6611,7 @@ impl AddressSpaceData {
             {
                 continue;
             }
-            let ksm = self.shared_at(start).is_none();
+            let ksm = self.shared_at(start).is_none() && !m.droppable;
             let advise = |m: &mut Mapping| match advice {
                 FlagAdvice::DontFork => m.dont_fork = true,
                 FlagAdvice::DoFork => m.dont_fork = false,
@@ -6543,8 +6621,9 @@ impl AddressSpaceData {
                 FlagAdvice::DoDump => m.dont_dump = false,
                 FlagAdvice::Read(hint) => m.read_hint = hint,
                 FlagAdvice::HugePages(huge) => m.huge_pages = Some(huge),
-                // KSM leaves shared memory and the rings, which core mm
-                // does not back, as they are (`ksm_compatible`).
+                // KSM leaves shared memory, the rings, which core mm does
+                // not back, and droppable memory as they are
+                // (`ksm_compatible`).
                 FlagAdvice::Mergeable(on) => m.mergeable = on && (m.mergeable || ksm),
             };
             let (from, to) = (start.max(addr), m.end().min(end));
@@ -6655,7 +6734,11 @@ impl AddressSpaceData {
     /// [`Userfault::WP`]. With [`Userfault::WP_ASYNC`], [`Userfault::WP`]
     /// alone takes any memory, as `vma_can_userfault` allows any memory
     /// type when `wp_async` and `VM_UFFD_WP` is the only mode.
+    /// Droppable memory takes none, before all else.
     fn userfault_capable(&self, m: &Mapping, modes: u8) -> bool {
+        if m.droppable {
+            return false;
+        }
         let kinds = Userfault::MISSING | Userfault::WP | Userfault::MINOR;
         if modes & Userfault::WP_ASYNC != 0 && modes & kinds == Userfault::WP {
             return true;
@@ -7565,6 +7648,23 @@ impl AddressSpaceData {
         );
         true
     }
+    /// Makes the new mappings in `[addr, end)` `MAP_DROPPABLE`'s
+    /// ([`Mapping::droppable`]): `do_mmap` adds `VM_NORESERVE`,
+    /// `VM_WIPEONFORK` and `VM_DONTDUMP` to `VM_DROPPABLE`, so no
+    /// overcommit charge either. Nor does `mlockall`'s `MCL_FUTURE` lock it,
+    /// as Linux master's `__mmap_new_vma` gives back the lock only to a VMA
+    /// `vma_supports_mlock` takes, as the CI runners' kernels do (v7.0's
+    /// source keeps the lock).
+    pub fn drop_new(&mut self, addr: u64, end: u64) {
+        for (_, mapping) in self.mappings.range_mut(addr..end) {
+            mapping.droppable = true;
+            mapping.locked = None;
+            mapping.no_reserve = true;
+            mapping.account = false;
+            mapping.wipe_on_fork = true;
+            mapping.dont_dump = true;
+        }
+    }
     /// Gives the new mappings in `[addr, end)` `MAP_GROWSDOWN`'s
     /// `VM_GROWSDOWN`.
     pub fn grow_new_down(&mut self, addr: u64, end: u64) {
@@ -7589,9 +7689,10 @@ impl AddressSpaceData {
     /// Whether the mapping at `addr` cannot be locked: memory core mm does
     /// not back ([`Self::special`]: the rings of AIO, `io_uring` and perf
     /// events, Linux's `VM_SPECIAL` and `vma_supports_mlock`), and secret
-    /// memory, which `mlock_fixup` leaves as it is.
+    /// and droppable memory, which `mlock_fixup` leaves as it is.
     fn refuses_lock(&self, addr: u64) -> bool {
         self.special(addr)
+            || self.mapping_at(addr).is_some_and(|m| m.droppable)
             || self
                 .shared_at(addr)
                 .and_then(|shared| shared.pages.source())
@@ -9695,6 +9796,29 @@ impl AddressSpace {
             }
         }
     }
+    /// Brings the page at `addr` in for a read, a `write` or a `fetch` of the
+    /// calling host thread's guest code, which its fault was refused for
+    /// ([`faults::arm`]); whether it could be. The fault counts as the
+    /// code's own.
+    #[must_use]
+    pub fn touch(&self, addr: GuestAddr, write: bool, fetch: bool) -> bool {
+        faults::taken_as_own(|| {
+            if fetch {
+                self.fetch(addr, &mut [0]).is_ok()
+            } else if write {
+                let mut data = self.locked();
+                data.prepare_write(addr, 1, Access::Write)
+                    .map(|first| {
+                        if first {
+                            data.mark_written(addr, 1);
+                        }
+                    })
+                    .is_ok()
+            } else {
+                self.read(addr, &mut [0]).is_ok()
+            }
+        })
+    }
     pub fn fetch(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().fetch(addr, buf)
     }
@@ -9938,6 +10062,10 @@ impl AddressSpace {
     /// whether it grew.
     pub fn grow_down(&self, addr: GuestAddr, stack_limit: u64, lock_limit: u64) -> bool {
         self.locked().grow_down(addr.0, stack_limit, lock_limit)
+    }
+    /// See [`AddressSpaceData::drop_new`].
+    pub fn drop_new(&self, addr: GuestAddr, end: u64) {
+        self.locked().drop_new(addr.0, end);
     }
     /// See [`AddressSpaceData::flag_new`].
     pub fn flag_new(&self, addr: GuestAddr, end: u64, no_reserve: bool, no_huge_pages: bool) {
@@ -11374,6 +11502,88 @@ mod tests {
         assert!(space.write_u64(anon, 1).is_err());
         space.unmap(GuestAddr(0x10000), 0xff_ffff_0000).unwrap();
         assert!(space.read_u64(GuestAddr(0xff_ffff_fff8)).is_err());
+    }
+
+    #[test]
+    fn an_armed_thread_s_own_faults_are_refused_until_its_page_is_touched() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3]);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+        }
+        let space = AddressSpace::new();
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        let load = || counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
+        let at = space
+            .map_shared(
+                None,
+                8 * PAGE_SIZE,
+                Prot::READ_WRITE.union(Prot::EXEC),
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let page = |n: u64, offset: u64| GuestAddr(at.0 + n * PAGE_SIZE + offset);
+        let refused = |fault: Fault, addr: GuestAddr, write: bool| {
+            assert!(fault.mapped && !fault.bus && !fault.fetch, "{fault:?}");
+            assert_eq!((fault.addr, fault.write), (addr, write));
+        };
+        faults::arm(true);
+        // Each time, with nothing counted and nothing stored; over two
+        // pages, one after the other.
+        let across = page(0, 4092);
+        for _ in 0..2 {
+            refused(space.write(across, &[1; 8]).unwrap_err(), across, true);
+        }
+        assert_eq!((load(), space.resident(page(0, 0))), ([0; 3], Some(false)));
+        assert!(space.touch(across, true, false));
+        refused(space.write(across, &[1; 8]).unwrap_err(), page(1, 0), true);
+        assert!(space.touch(page(1, 0), true, false));
+        space.write(across, &[1; 8]).unwrap();
+        assert_eq!(load(), [2, 0, 0]);
+        // A read, a write of the page it left without a frame, a fetch and
+        // a locked access.
+        let mut byte = [0];
+        refused(
+            space.read(page(2, 5), &mut byte).unwrap_err(),
+            page(2, 5),
+            false,
+        );
+        assert!(space.touch(page(2, 5), false, false));
+        space.read(page(2, 5), &mut byte).unwrap();
+        let fault = space.write(page(2, 6), &[1]).unwrap_err();
+        assert!(fault.present);
+        refused(fault, page(2, 6), true);
+        assert!(space.touch(page(2, 6), true, false));
+        space.write(page(2, 6), &[1]).unwrap();
+        assert!(space.fetch(page(3, 0), &mut byte).unwrap_err().fetch);
+        assert!(space.touch(page(3, 0), false, true));
+        space.fetch(page(3, 0), &mut byte).unwrap();
+        let add = || space.atomic(page(4, 8), AtomicWidth::W8, AtomicOp::Exchange(3));
+        refused(add().unwrap_err(), page(4, 8), true);
+        assert!(space.touch(page(4, 8), true, false));
+        assert_eq!(add().unwrap().old, 0);
+        assert_eq!(load(), [6, 0, 0]);
+        // What cannot be had is not, and the kernel's accesses are not
+        // refused, nor those of a thread no longer armed.
+        assert!(!space.touch(page(8, 0), true, false));
+        let was = faults::set_kernel(true);
+        space.write(page(5, 0), &[1]).unwrap();
+        faults::set_kernel(was);
+        faults::arm(false);
+        space.write(page(6, 0), &[1]).unwrap();
+        assert_eq!(load(), [7, 1, 0]);
+        faults::arm(true);
+        faults::unbind();
+        space.write(page(7, 0), &[1]).unwrap();
     }
 
     #[test]

@@ -328,6 +328,10 @@ impl Link {
     pub(crate) fn set_no_delay(&self, side: usize, on: bool) {
         self.with_flows(|flows, now| flows.set_no_delay(side, on, now));
     }
+    /// `side`'s `TCP_CORK` was set or cleared.
+    pub(crate) fn set_cork(&self, side: usize, on: bool) {
+        self.with_flows(|flows, now| flows.set_cork(side, on, now));
+    }
     /// `side`'s `TCP_QUICKACK` was set to `value`.
     pub(crate) fn set_quick(&self, side: usize, value: i32) {
         self.with_flows(|flows, now| flows.set_quick(side, value, now));
@@ -550,6 +554,10 @@ pub(crate) struct Binding {
     pub(crate) listening: bool,
     /// A connected UDP socket's peer, the only sender it receives from.
     pub(crate) peer: Option<SocketAddr>,
+    /// The address of the peer an IPv6 UDP socket had before it
+    /// disconnected, which it keeps (`sk_v6_daddr`): the only one it takes
+    /// an IPv6 datagram from. IPv4's as such.
+    pub(crate) old_peer: Option<IpAddr>,
     /// The device the socket is bound to (`sk_bound_dev_if`), 0 for none:
     /// it takes only what comes in on it, and shares its port with sockets
     /// bound to others.
@@ -871,20 +879,33 @@ impl Ports {
     }
     /// `owner`, a UDP socket, connected from `address` to `peer`, or with
     /// `None` disconnected, as a TCP socket is that disconnects; on another
-    /// address it leaves its group, as Linux's `udp_lib_rehash`.
+    /// address it leaves its group, and comes after the rest, as Linux's
+    /// `udp_lib_rehash`.
     pub(crate) fn connect(
         &mut self,
         owner: &Weak<InetSocket>,
         address: SocketAddr,
         peer: Option<SocketAddr>,
     ) {
+        let mut moved = false;
         for binding in &mut self.bindings {
             if binding.is(owner) {
-                binding.pooled &= binding.address == address;
+                moved = binding.address != address;
+                binding.pooled &= !moved;
                 binding.address = address;
                 binding.peer = peer;
                 binding.link = None;
             }
+        }
+        if moved {
+            self.bindings.sort_by_key(|binding| binding.is(owner));
+        }
+    }
+    /// `owner`, an IPv6 UDP socket, disconnected from a peer of the address
+    /// `ip`, which it keeps ([`Binding::old_peer`]).
+    pub(crate) fn keep_peer(&mut self, owner: &Weak<InetSocket>, ip: Option<IpAddr>) {
+        for binding in self.bindings.iter_mut().filter(|b| b.is(owner)) {
+            binding.old_peer = ip;
         }
     }
     /// `owner` gave its port up.
@@ -895,9 +916,10 @@ impl Ports {
     /// `__inet_lookup_listener`: one bound to that address before one bound
     /// to every address, and an IPv4 socket before an IPv6 one; among equals
     /// the first to bind, or one of its group ([`pick`]). It comes in on
-    /// the device `dif`: one bound to another takes it not, one bound to it
-    /// ranks before one of another family bound to none
-    /// (`compute_score`).
+    /// the device `dif`: one bound to another does not take it, and one bound
+    /// to it ranks before one of its family bound to none. A listener bound
+    /// to the device ties with one of the other family bound to none when the
+    /// first is IPv6's (`compute_score` gives both 2).
     pub(crate) fn listener(
         &mut self,
         from: SocketAddr,
@@ -989,8 +1011,11 @@ impl Ports {
     /// to the device, or IPv4; among
     /// equals the last to bind, which Linux's hash holds first, or one of its
     /// group that is not connected ([`pick`]). It comes in on the device
-    /// `dif`: one bound to another takes it not, and one bound to it ranks
-    /// after a connected one, before any other.
+    /// `dif`: one bound to another does not take it, and one bound to it
+    /// ranks after a connected one, before any other but one that keeps the
+    /// address of a peer it had ([`Binding::old_peer`]), which takes an IPv6
+    /// datagram from that address alone, and ranks as one bound to a device;
+    /// both together rank as one connected.
     pub(crate) fn receiver(
         &mut self,
         to: SocketAddr,
@@ -1021,6 +1046,11 @@ impl Ports {
                     return None;
                 }
                 score += 16;
+            } else if let (Some(old), IpAddr::V6(_)) = (binding.old_peer, from.ip()) {
+                if old != from.ip() {
+                    return None;
+                }
+                score += 8;
             }
             if binding.device != 0 {
                 score += 8;
@@ -1048,8 +1078,11 @@ impl Ports {
     /// them (`__udp_is_mcast_sock`): of `to`'s port, bound to the
     /// unspecified address or to `to`, connected to none or to `from`,
     /// and not `IPV6_V6ONLY`, bound to no device or to `dif`, which it
-    /// comes in on. A connected one bound to the unspecified address has
-    /// taken its route's source by then, so takes none.
+    /// comes in on; an IPv6 datagram also passes only one whose kept
+    /// address of an old peer ([`Binding::old_peer`]) is `from`'s, as
+    /// `__udp_v6_is_mcast_sock` checks `sk_v6_daddr`. A connected one bound
+    /// to the unspecified address has taken its route's source by then, so
+    /// takes none.
     pub(crate) fn broadcast_receivers(
         &mut self,
         to: SocketAddr,
@@ -1065,6 +1098,10 @@ impl Ports {
                     && binding.carries(ip)
                     && (binding.address.ip().is_unspecified() || binding.address.ip() == ip)
                     && binding.peer.is_none_or(|peer| peer == from)
+                    && match (binding.peer, binding.old_peer, from.ip()) {
+                        (None, Some(old), IpAddr::V6(_)) => old == from.ip(),
+                        _ => true,
+                    }
                     && (binding.device == 0 || binding.device == dif)
             })
             .filter_map(|binding| binding.owner.upgrade())
@@ -1105,6 +1142,7 @@ mod tests {
             pooled: false,
             listening: false,
             peer: None,
+            old_peer: None,
             device: 0,
             owner: Weak::new(),
             time_wait: None,

@@ -677,8 +677,11 @@ impl paludarium_mmu::faults::Resolver for KernelCopies {
 }
 
 impl KernelCopies {
-    /// `fatal_signal_pending`.
+    /// `fatal_signal_pending`, with the signals of timers that have expired.
     fn fatal(&self) -> bool {
+        if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
+            self.group.expire_due(now);
+        }
         self.group
             .fatal_pending(&self.inbox, CALL.with(core::cell::Cell::get).0)
     }
@@ -1448,11 +1451,11 @@ fn wait_read(
         {
             break;
         }
-        let _ = c.inbox.drain(c.process);
-        c.group.drain_process(c.process);
         let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) else {
             break;
         };
+        c.group.expire_timer(c.process, now);
+        let _ = c.inbox.drain(c.process);
         let end = Some((
             paludarium_host::ClockId::Monotonic,
             now.saturating_add(10_000_000),

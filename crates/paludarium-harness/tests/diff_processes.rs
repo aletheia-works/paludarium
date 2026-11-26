@@ -185,7 +185,8 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, inet-diag-device, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links, veth-ipv4, veth-traffic, veth-iif, veth-broadcast, veth-filter, veth-broadcast-source, mapped-source, veth-neigh, veth-ipv6, veth-ipv4-gateway, veth-ipv4-ecmp, veth-ipv4-hash, veth-answers, veth-ipv6-gateway, veth-ipv6-ecmp, veth-bindtodevice, veth-multicast, veth-ipv6-accept, veth-ipv6-oif, veth-ipv6-scope, veth-ipv6-traffic and msg cases, whose checks depend on
+            // sysvipc-proc and msg cases and the network ones the match below
+            // lists, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -218,11 +219,15 @@ mod linux {
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, the file-leases case, which writes
             // fs.leases-enable and fs.lease-break-time and becomes an
-            // unprivileged user, as the emulator's guest starts as root.
+            // unprivileged user, and the timer-waits cases, which make a
+            // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
                     | "file-leases"
+                    | "timer-waits-plain"
+                    | "timer-waits-restart"
+                    | "timer-waits-default"
                     | "proc-mem"
                     | "chroot-names"
                     | "path-flags"
@@ -260,6 +265,7 @@ mod linux {
                     | "msg"
                     | "ipc-sysctl"
                     | "sysvipc-proc"
+                    | "proc-net"
                     | "kernel-sysctl"
                     | "uts-sysctl"
                     | "uts-sysctl-poll"
@@ -415,15 +421,19 @@ mod linux {
                     | "veth-filter"
                     | "veth-broadcast-source"
                     | "mapped-source"
+                    | "udp-disconnect"
                     | "veth-neigh"
                     | "veth-ipv6"
                     | "veth-ipv4-gateway"
                     | "veth-ipv4-ecmp"
                     | "veth-ipv4-hash"
                     | "veth-answers"
+                    | "veth-ipv4-via"
+                    | "veth-ipv6-source"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-multicast"
+                    | "veth-ipv6-multicast"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -661,20 +671,25 @@ mod linux {
         veth_filter => ("veth-filter","veth-filter"),
         veth_broadcast_source => ("veth-broadcast-source","veth-broadcast-source"),
         mapped_source => ("mapped-source","mapped-source"),
+        udp_disconnect => ("udp-disconnect","udp-disconnect"),
         veth_neigh => ("veth-neigh","veth-neigh"),
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),
         veth_ipv4_gateway => ("veth-ipv4-gateway","veth-ipv4-gateway"),
         veth_ipv4_ecmp => ("veth-ipv4-ecmp","veth-ipv4-ecmp"),
         veth_ipv4_hash => ("veth-ipv4-hash","veth-ipv4-hash"),
         veth_answers => ("veth-answers","veth-answers"),
+        veth_ipv4_via => ("veth-ipv4-via","veth-ipv4-via"),
+        veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_multicast => ("veth-multicast","veth-multicast"),
+        veth_ipv6_multicast => ("veth-ipv6-multicast","veth-ipv6-multicast"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
         veth_ipv6_scope => ("veth-ipv6-scope","veth-ipv6-scope"),
         veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
+        proc_net => ("proc-net","proc-net"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
@@ -683,6 +698,7 @@ mod linux {
         processes_madvise_collapse => ("madvise-collapse","process"),
         processes_madvise_collapse_shmem => ("madvise-collapse-shmem","process"),
         processes_madvise_fork => ("madvise-fork","process"),
+        processes_mmap_types => ("mmap-types","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
         processes_file_leases => ("file-leases","process"),
@@ -1076,6 +1092,9 @@ mod linux {
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
+        processes_timer_waits_plain => ("timer-waits-plain","timer-waits"),
+        processes_timer_waits_restart => ("timer-waits-restart","timer-waits"),
+        processes_timer_waits_default => ("timer-waits-default","timer-waits"),
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),

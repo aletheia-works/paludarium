@@ -11,6 +11,17 @@ export function compare(expected, actual, nativeRoot, guestRoot = "/") {
     if (normalize(expected[key], nativeRoot) !== normalize(actual[key], guestRoot === "/" ? "\0" : guestRoot)) throw new Error(`${key} mismatch`);
   }
 }
+// Kept beside the row, never compared: the shared memory's size when a Worker trapped, and what
+// that launcher's heap reserve did at its start.
+function noteHostTrap(row, cause) {
+  if (cause?.memoryBytes !== undefined) row.host_trap ??= { memory_bytes: cause.memoryBytes, heap_reserve: cause.heapReserve ?? null };
+}
+// The probe item a row trapped in: its own, or for probe-all the item after the last one it passed.
+export function trappedProbe(name, stdout) {
+  if (name !== "probe-all") return name.replace(/^probe-/, "");
+  const passed = [...stdout.matchAll(/^PASS (\S+)$/gm)].map(match => match[1]);
+  return WASM_PROBES[passed.length] ?? null;
+}
 export async function observeProgram(launcher, { stdin, ...options }) {
   const started = performance.now(), row = { stdout: "", stderr: "", exit: null, errors: [], timed_out: false };
   const guest = launcher.run(options);
@@ -18,16 +29,16 @@ export async function observeProgram(launcher, { stdin, ...options }) {
   const capture = async (stream, key) => {
     const reader = stream.getReader(), decoder = new TextDecoder();
     try { for (;;) { const chunk = await reader.read(); if (chunk.done) break; row[key] += decoder.decode(chunk.value, { stream: true }); } row[key] += decoder.decode(); }
-    catch (cause) { row.errors.push({ stream: key, kind: cause.kind, message: String(cause) }); }
+    catch (cause) { row.errors.push({ stream: key, kind: cause.kind, message: String(cause) }); noteHostTrap(row, cause); }
     finally { reader.releaseLock(); }
   };
   try {
     // A case's stdin, when it has one; otherwise stdin is empty.
     const writer = guest.stdin.getWriter(); if (stdin) await writer.write(stdin); await writer.close(); writer.releaseLock();
-    const completed = Promise.all([capture(guest.stdout, "stdout"), capture(guest.stderr, "stderr"), guest.exited.then(status => { row.exit = status.kind === "exited" ? status.code : 128 + status.signal; }).catch(cause => row.errors.push({ kind: cause.kind, message: String(cause) }))]);
+    const completed = Promise.all([capture(guest.stdout, "stdout"), capture(guest.stderr, "stderr"), guest.exited.then(status => { row.exit = status.kind === "exited" ? status.code : 128 + status.signal; }).catch(cause => { row.errors.push({ kind: cause.kind, message: String(cause) }); noteHostTrap(row, cause); })]);
     await Promise.race([completed, new Promise(resolve => { timer = setTimeout(() => { row.timed_out = true; guest.kill(); resolve(); }, WASM_DEADLINE_MS); })]);
     if (row.timed_out) await launcher.dispose();
-  } catch (cause) { row.errors.push({ kind: cause.kind, message: String(cause) }); }
+  } catch (cause) { row.errors.push({ kind: cause.kind, message: String(cause) }); noteHostTrap(row, cause); }
   finally { clearTimeout(timer); }
   row.seconds = (performance.now() - started) / 1000;
   return row;

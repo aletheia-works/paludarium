@@ -949,14 +949,14 @@ fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<
         if let Some(answer) = strong.answer(id) {
             return answer;
         }
+        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+        c.group.expire_timer(c.process, now);
         let _ = c.inbox.drain(c.process);
-        c.group.drain_process(c.process);
         if fatal(c) {
             strong.cancel(id);
             return Err(Errno(4));
         }
         drop(strong);
-        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
         let end = Some((
             paludarium_host::ClockId::Monotonic,
             now.saturating_add(10_000_000),
@@ -980,22 +980,9 @@ fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<
 }
 
 /// Whether the task is to die (`fatal_signal_pending`): its group exits, or
-/// a signal it does not block or ignore ends it, SIGKILL or one whose
-/// default action is to end the process.
+/// a fatal signal is pending ([`crate::signals::fatal`]).
 pub(crate) fn fatal(c: &Context<'_>) -> bool {
-    if c.group.status().is_some() {
-        return true;
-    }
-    let Some(index) = crate::signals::next_pending(c.process, true) else {
-        return false;
-    };
-    let number = c.process.pending[index].number;
-    let handler = c
-        .process
-        .signal_actions
-        .get(&number)
-        .map_or(0, |action| action.handler);
-    number == 9 || handler == 0 && !matches!(number, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28)
+    c.group.status().is_some() || crate::signals::fatal_pending(c.process)
 }
 
 impl Registry {

@@ -2,7 +2,7 @@
 import { isNode, spawnWorker, listen, stopWorker } from "./worker-support.mjs";
 import { decodeSnapshot } from "./filesystem-snapshot.mjs";
 export class PaludariumError extends Error {
-  constructor(kind, message, details = {}) { super(message); this.name = "PaludariumError"; this.kind = kind; for (const field of ["rip", "bytes", "syscall"]) if (details[field] !== undefined) this[field] = details[field]; }
+  constructor(kind, message, details = {}) { super(message); this.name = "PaludariumError"; this.kind = kind; for (const field of ["rip", "bytes", "syscall", "memoryBytes", "heapReserve"]) if (details[field] !== undefined) this[field] = details[field]; }
 }
 async function moduleBytes(url) {
   const source = new URL(url, typeof location === "undefined" ? import.meta.url : location.href);
@@ -120,7 +120,7 @@ export async function createPaludarium({ wasmUrl }) {
     await stopWorker(coordinator); disposeResolve?.();
   }
   listen(coordinator, report => {
-    if (report.type === "fatal") { void failAll(new PaludariumError(report.error.kind, report.error.message)); return; }
+    if (report.type === "fatal") { void failAll(new PaludariumError(report.error.kind, report.error.message, report.error)); return; }
     if (report.type === "ready") { clearTimeout(initTimer); readyResolve(report); return; }
     if (report.type === "disposed") { clearTimeout(disposeTimer); void stopWorker(coordinator).then(() => disposeResolve?.()); return; }
     const job = pending.get(report.id);

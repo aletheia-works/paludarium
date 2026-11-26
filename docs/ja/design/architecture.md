@@ -93,7 +93,7 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 
 - `nop` と `endbr64`
 - レジスタとメモリの間の mov と、メモリからの `movzx`
-- `lea`、レジスタ、即値またはメモリの 8 バイトの `push`、`pop`、`leave`
+- `lea`、レジスタ、即値またはメモリの 8 バイトの `push`、`pop`
 - 直接の分岐、`call`、`ret` と、64 ビットのレジスタかメモリの 8 バイトを通した `jmp` と `call`
 - レジスタ、即値、メモリの間の（`lock` なしの）`add`、`sub`、`and`、`or`、`xor`、`cmp`、`test` と、レジスタとレジスタか即値の `adc`、`sbb`
 - レジスタの即値による `shl`、`shr`、`sar`、`rol`、`ror` と、レジスタの `cl` による `shl`、`shr`、`sar`
@@ -102,8 +102,8 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 - `setcc` と `cmovcc`
 - レジスタから同じ大きさのレジスタへの `tzcnt`、`lzcnt`、`popcnt`、`bsf`、`bsr`、レジスタのレジスタか即値による `bt`、`bts`、`btr`、`btc`、32 ビットか 64 ビットのレジスタの `bswap`
 - レジスタによる rdx:rax への `mul` と `imul`、rdx:rax のレジスタによる `div` と `idiv`、レジスタとレジスタまたはメモリの `imul`、レジスタまたはメモリと即値の `imul`
-- xmm レジスタとメモリの間の `movaps`、`movups`、`movdqa`、`movdqu`、`movapd`、`movupd`、xmm レジスタどうしの `pxor` と `xorps`、xmm レジスタと汎用レジスタまたはメモリの間の `movd` と `movq`、xmm レジスタどうしの `movq`、xmm レジスタとメモリの間の `movlps`、`movlpd`、`movhps`、`movhpd` と SSE2 の `movsd`
-- xmm レジスタどうしの `pshufd`、`pshuflw`、`pshufhw`、`punpckl` と `punpckh` の各アンパック、`packuswb`、`packsswb`、`packssdw`、`paddd`、`psubd`、`paddq`、`psubq`、`pmuludq`、`pand`、`por`、`pandn`、`pcmpeqb`、`pcmpeqw`、`pcmpeqd`、`shufpd`、xmm レジスタと 16 バイトのメモリの `pxor`、`pcmpeqb`、`shufpd`、即値による `pslld`、`psrld`、`pslldq`、`psrldq`、`pmovmskb`
+- xmm レジスタとメモリの間の `movaps`、`movups`、`movdqa`、`movdqu`、`movapd`、`movupd`、xmm レジスタどうしの `pxor` と `xorps`、xmm レジスタと汎用レジスタまたはメモリの間の `movd` と `movq`、xmm レジスタどうしの `movq`、xmm レジスタとメモリの間の SSE2 の `movsd`、xmm レジスタからメモリへの `movlps` と `movlpd`
+- xmm レジスタどうしの `pshufd`、`pshuflw`、`pshufhw`、`punpckl` と `punpckh` の各アンパック、`packuswb`、`packsswb`、`packssdw`、`paddd`、`psubd`、`paddq`、`psubq`、`pmuludq`、`pand`、`por`、`pandn`、`pcmpeqb`、`pcmpeqw`、`pcmpeqd`、`shufpd`、xmm レジスタと 16 バイトのメモリの `pxor`、`pcmpeqb`、`shufpd`、即値による `pslld` と `psrld`、`pmovmskb`
 - 64 ビットのアドレスの（`rep` ありまたはなしの）文字列の転送 `movsb`、`movsw`、`movsd`、`movsq` と、文字列の書き込み `stosb`、`stosw`、`stosd`、`stosq`
 - メモリとレジスタの間の（`lock` ありまたはなしの）`cmpxchg` と `xchg`。どちらも、インタプリタと同じ 1 回のアトミックなメモリアクセスです
 

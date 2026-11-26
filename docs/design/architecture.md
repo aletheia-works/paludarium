@@ -113,8 +113,7 @@ out:
 
 - `nop` and `endbr64`;
 - moves between registers and memory, and `movzx` from memory;
-- `lea`, `push` of a register, an immediate or 8 bytes of memory, `pop` and
-  `leave`;
+- `lea`, `push` of a register, an immediate or 8 bytes of memory, and `pop`;
 - direct branches, `call` and `ret`, and `jmp` and `call` through a 64-bit
   register or 8 bytes of memory;
 - `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test` between registers,
@@ -135,14 +134,13 @@ out:
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
   registers and memory, `pxor` and `xorps` of xmm registers, `movd` and `movq`
   between xmm registers and general ones or memory, `movq` between xmm
-  registers, the SSE2 `movsd` between xmm registers and memory, and `movlps`,
-  `movlpd`, `movhps` and `movhpd`;
+  registers, the SSE2 `movsd` between xmm registers and memory, and `movlps`
+  and `movlpd` of an xmm register into memory;
 - `pshufd`, `pshuflw`, `pshufhw`, the `punpckl` and `punpckh` unpacks,
   `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`,
   `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw`, `pcmpeqd` and
   `shufpd` of xmm registers, `pxor`, `pcmpeqb` and `shufpd` of one and 16 bytes
-  of memory, `pslld`, `psrld`, `pslldq` and `psrldq` of one by an immediate, and
-  `pmovmskb`;
+  of memory, `pslld` and `psrld` of one by an immediate, and `pmovmskb`;
 - the string moves `movsb`, `movsw`, `movsd` and `movsq`, and the string
   stores `stosb`, `stosw`, `stosd` and `stosq`, with `rep` or without, of 64-bit
   addresses;

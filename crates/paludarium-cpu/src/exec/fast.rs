@@ -17,7 +17,7 @@ use paludarium_mmu::AtomicOp;
 
 use super::{Exec, Result, Stop, atomic_width};
 use crate::alu::{self, sign_extend, size_mask};
-use crate::state::{CpuState, flag, reg};
+use crate::state::{CpuState, flag};
 
 /// An arithmetic or logic operation of [`Fast`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -381,8 +381,8 @@ pub enum Fast {
     /// `psubq`, `pmuludq`, `pand`, `por`, `pandn`, `pcmpeqb`, `pcmpeqw` or
     /// `pcmpeqd` of xmm register `src` into `dst`, `pshufd`, `pshuflw` or
     /// `pshufhw` of `src` into `dst` by `imm`, `shufpd` of `dst` and `src`
-    /// by `imm`, or `pslld`, `psrld`, `pslldq` or `psrldq` of `dst` by `imm`
-    /// (`src` is `dst`), as [`crate::sse::packed`] has them.
+    /// by `imm`, or `pslld` or `psrld` of `dst` by `imm` (`src` is `dst`), as
+    /// [`crate::sse::packed`] has them.
     XmmPacked {
         op: Mnemonic,
         dst: u8,
@@ -416,18 +416,6 @@ pub enum Fast {
         dst: u8,
         mem: Address,
         size: u8,
-    },
-    /// `movlps` or `movlpd`, or `movhps` or `movhpd` (`high`), of 8 bytes of
-    /// memory into that half of an xmm register, which keeps the other.
-    XmmLoadHalf {
-        dst: u8,
-        mem: Address,
-        high: bool,
-    },
-    /// `movhps` or `movhpd` of the high half of an xmm register into memory.
-    XmmStoreHigh {
-        mem: Address,
-        src: u8,
     },
     /// `movd` (`size` 4), or `movq`, `movsd`, `movlps` or `movlpd` (8), of an
     /// xmm register into memory: its low `size` bytes.
@@ -463,8 +451,6 @@ pub enum Fast {
     },
     /// `pop r64`.
     Pop(u8),
-    /// `leave` of 64 bits.
-    Leave,
     Jcc {
         condition: Condition,
         target: u64,
@@ -778,7 +764,7 @@ impl Fast {
                 src: xmm(b)?,
                 imm: 0,
             },
-            Mnemonic::Pslld | Mnemonic::Psrld | Mnemonic::Pslldq | Mnemonic::Psrldq => {
+            Mnemonic::Pslld | Mnemonic::Psrld => {
                 let dst = xmm(a)?;
                 let Some(Operand::Immediate(count)) = b else {
                     return None;
@@ -860,16 +846,11 @@ impl Fast {
                     _ => return None,
                 }
             }
-            Mnemonic::Movlps | Mnemonic::Movlpd | Mnemonic::Movhps | Mnemonic::Movhpd => {
-                let high = matches!(i.mnemonic, Mnemonic::Movhps | Mnemonic::Movhpd);
-                let sized = |o: Option<Operand>| address(o).filter(|mem| mem.size == 8);
-                match (xmm(a), sized(b), sized(a), xmm(b)) {
-                    (Some(dst), Some(mem), _, _) => Self::XmmLoadHalf { dst, mem, high },
-                    (_, _, Some(mem), Some(src)) if high => Self::XmmStoreHigh { mem, src },
-                    (_, _, Some(mem), Some(src)) => Self::XmmStoreScalar { mem, src, size: 8 },
-                    _ => return None,
-                }
-            }
+            Mnemonic::Movlps | Mnemonic::Movlpd => Self::XmmStoreScalar {
+                mem: address(a).filter(|mem| mem.size == 8)?,
+                src: xmm(b)?,
+                size: 8,
+            },
             Mnemonic::Cmpxchg => {
                 let mem = address(a)?;
                 let src = gpr(b)?;
@@ -983,7 +964,6 @@ impl Fast {
                 _ => Self::Push(gpr64(a)?),
             },
             Mnemonic::Pop if i.implicit_size == 8 && b.is_none() => Self::Pop(gpr64(a)?),
-            Mnemonic::Leave if i.implicit_size == 8 => Self::Leave,
             Mnemonic::Jcc(condition) => Self::Jcc {
                 condition,
                 target: branch(a)?,
@@ -1358,22 +1338,6 @@ pub(crate) fn execute(
             x.s.xmm[usize::from(dst)] = u128::from(v & size_mask(size));
             next
         }
-        Fast::XmmLoadHalf { dst, mem, high } => {
-            let v = u128::from(x.load(x.fast_linear(&mem), 8)?);
-            let low = u128::from(u64::MAX);
-            let register = &mut x.s.xmm[usize::from(dst)];
-            *register = if high {
-                (*register & low) | (v << 64)
-            } else {
-                (*register & !low) | v
-            };
-            next
-        }
-        Fast::XmmStoreHigh { mem, src } => {
-            let v = (x.s.xmm[usize::from(src)] >> 64) as u64;
-            x.store(x.fast_linear(&mem), 8, v)?;
-            next
-        }
         Fast::XmmStoreScalar { mem, src, size } => {
             let v = x.s.xmm[usize::from(src)] as u64 & size_mask(size);
             x.store(x.fast_linear(&mem), size, v)?;
@@ -1405,13 +1369,6 @@ pub(crate) fn execute(
         Fast::Pop(r) => {
             let v = x.pop(8)?;
             x.s.gpr[usize::from(r)] = v;
-            next
-        }
-        Fast::Leave => {
-            let rbp = x.s.gpr[reg::RBP];
-            let v = x.load(GuestAddr(rbp), 8)?;
-            x.s.gpr[reg::RSP] = rbp.wrapping_add(8);
-            x.s.gpr[reg::RBP] = v;
             next
         }
         Fast::Jcc { condition, target } => {

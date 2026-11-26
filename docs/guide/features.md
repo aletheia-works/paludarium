@@ -4246,7 +4246,9 @@ kernel.
   `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
-  unmarked; `maps` and `smaps` name a mapped file the same way.
+  unmarked; `maps` and `smaps` name a mapped file the same way, from the
+  root of whoever reads them at each read, so a descriptor opened before a
+  `chroot` or passed to another process names it from the reader's root.
   `smaps_rollup` is what `smaps` counts of every VMA summed under one line,
   from the first VMA's start to the last one's end with no flags, file or
   name but `[rollup]`, as Linux's `show_smaps_rollup` makes it: `Pss` is

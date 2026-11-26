@@ -8119,7 +8119,13 @@ fn open_path(
         }
         if let crate::proc::TaskEntry::Maps(kind) = path.entry {
             return Ok((
-                tasks::maps(&task, kind, flags, c.files.root(), owner),
+                tasks::maps(
+                    &task,
+                    kind,
+                    flags,
+                    tasks::reader_root(c, c.files.root()),
+                    owner,
+                ),
                 p.to_vec(),
             ));
         }
@@ -8337,7 +8343,7 @@ fn open_path(
                 c.mem.view(),
                 c.group.start_stack(),
                 flags,
-                c.files.root(),
+                tasks::reader_root(c, c.files.root()),
                 match entry {
                     crate::proc::OwnEntry::Smaps => crate::proc::MapsKind::Smaps,
                     crate::proc::OwnEntry::SmapsRollup => crate::proc::MapsKind::Rollup,

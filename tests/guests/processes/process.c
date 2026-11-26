@@ -7691,6 +7691,84 @@ static int chroot_names_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The maps-root case: maps and smaps name a file from the root of whoever
+   reads them, at each read, as show_map_vma's seq_file_path takes d_path
+   from current's root: a descriptor opened before a chroot names the file
+   from the new root once read after it, and one opened under the chroot
+   and passed to a process outside it names the file from that one's root.
+   As root, for chroot. */
+static int mr_name(int fd, uint64_t at, char *out, size_t size) {
+    static char text[1 << 16];
+    size_t length = 0;
+    long n;
+    out[0] = 0;
+    if (lseek(fd, 0, SEEK_SET)) return 0;
+    while (length < sizeof text - 1 && (n = read(fd, text + length, sizeof text - 1 - length)) > 0)
+        length += (size_t)n;
+    text[length] = 0;
+    for (char *line = text; line && *line; line = strchr(line, '\n'), line = line ? line + 1 : NULL) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && at >= start && at < end) {
+            char *path = strchr(line, '/');
+            if (path) snprintf(out, size, "%.*s", (int)strcspn(path, "\n"), path);
+            break;
+        }
+    }
+    return out[0] != 0;
+}
+static int maps_root_case(void) {
+    char dir[] = "/tmp/maps-root-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char jail[64], data[80], seen[4096];
+    snprintf(jail, sizeof jail, "%s/jail", dir);
+    snprintf(data, sizeof data, "%s/data", jail);
+    if (mkdir(jail, 0755)) return 81;
+    int fd = open(data, O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ftruncate(fd, 4096)) return 82;
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 83;
+    uint64_t at = (uintptr_t)map;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 84;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        int maps = open("/proc/self/maps", O_RDONLY), smaps = open("/proc/self/smaps", O_RDONLY);
+        int proc = open("/proc", O_RDONLY | O_DIRECTORY);
+        if (maps < 0 || smaps < 0 || proc < 0) _exit(70);
+        mr_name(maps, at, seen, sizeof seen);
+        printf("before chroot: %d\n", !strcmp(seen, data));
+        if (chroot(jail) || chdir("/")) _exit(71);
+        mr_name(maps, at, seen, sizeof seen);
+        printf("opened before, read after: %s\n", seen);
+        mr_name(smaps, at, seen, sizeof seen);
+        printf("smaps opened before, read after: %s\n", seen);
+        /* The new root has no /proc: through the one opened before. */
+        int under = openat(proc, "self/maps", O_RDONLY);
+        mr_name(under, at, seen, sizeof seen);
+        printf("opened and read under it: %s\n", seen);
+        fflush(stdout);
+        char byte = 0;
+        if (send_fds(pair[1], "m", 1, &under, 1) != 1 || read(pair[1], &byte, 1) != 1) _exit(72);
+        _exit(0);
+    }
+    close(pair[1]);
+    int passed = -1, got = 0;
+    char byte = 0;
+    if (receive_fd(pair[0], &byte, 1, 0, &passed, &got) != 1 || passed < 0) return 85;
+    mr_name(passed, at, seen, sizeof seen);
+    printf("passed out of it: %d\n", !strcmp(seen, data));
+    if (write(pair[0], &byte, 1) != 1) return 86;
+    printf("child: %d\n", reaped(child));
+    close(passed);
+    munmap(map, 4096);
+    unlink(data);
+    rmdir(jail);
+    rmdir(dir);
+    return 0;
+}
 /* The proc-mem case: /proc/<pid>/mem reads and writes a task's memory at
    the address its position gives, as fs/proc/base.c's mem_rw does through
    access_remote_vm with FOLL_FORCE: a read-only page is written, a call
@@ -43953,6 +44031,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "path-flags")) return path_flags_case(self);
     if (!strcmp(mode, "chroot-names")) return chroot_names_case();
     if (!strcmp(mode, "chroot-names-child")) return chroot_names_child();
+    if (!strcmp(mode, "maps-root")) return maps_root_case();
     if (!strcmp(mode, "vma-merges")) return vma_merges_case();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);

@@ -200,9 +200,7 @@ verified.
   made onto it before. In a path that climbs above the root as written,
   `..` in the generated files such a bind mount shows is taken from the
   names as written, where Linux takes a `..` after a link in `/proc` (such
-  as `/proc/self/cwd`) from its target. `maps` and `smaps` in `/proc` name
-  files from the root their opener had when it opened them, where Linux
-  takes the root of whoever reads them, at each read.
+  as `/proc/self/cwd`) from its target.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
 - **Links into `/dev` and `/proc`, in part**: a symbolic link elsewhere
   that leads into them is followed to the generated file by the calls

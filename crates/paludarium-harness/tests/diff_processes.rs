@@ -210,6 +210,7 @@ mod linux {
             // read a process's maps, descriptors, auxv, pagemap and io as
             // other users or make it another user's, the proc-fd-links case,
             // which reads links from a chroot of its own mount namespace,
+            // the maps-root case, which reads maps across a chroot,
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
@@ -230,6 +231,7 @@ mod linux {
                     | "timer-waits-default"
                     | "proc-mem"
                     | "chroot-names"
+                    | "maps-root"
                     | "path-flags"
                     | "permissions"
                     | "setuid"
@@ -986,6 +988,7 @@ mod linux {
         processes_exec_names => ("exec-names","process"),
         processes_rename_names => ("rename-names","process"),
         processes_chroot_names => ("chroot-names","process"),
+        processes_maps_root => ("maps-root","process"),
         processes_path_flags => ("path-flags","process"),
         processes_context_switches => ("context-switches","process"),
         processes_proc_mem => ("proc-mem","process"),

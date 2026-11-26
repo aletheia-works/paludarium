@@ -343,6 +343,7 @@
     {"name":"exec-names","binary":"process"},
     {"name":"rename-names","binary":"process"},
     {"name":"chroot-names","binary":"process"},
+    {"name":"maps-root","binary":"process"},
     {"name":"path-flags","binary":"process"},
     {"name":"context-switches","binary":"process"},
     {"name":"proc-mem","binary":"process"},

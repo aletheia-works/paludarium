@@ -62,7 +62,8 @@ Linux.
   64-byte line, because HotSpot requires it. Of those, the FPU and MMX
   are not implemented; it advertises no other feature that is not. The name
   changes nothing else: where vendors' CPUs differ, as in the flags after a
-  `REP` faults, the virtual CPU keeps its own behaviour.
+  `REP` faults, the virtual CPU keeps its own behaviour. `/proc/cpuinfo`
+  describes this CPU too.
 - `RDTSC` and `RDTSCP` read a counter of the virtual CPU, which moves on with
   each read rather than with time. Every guest in the host process shares that
   counter, so its values depend on what else has read it. `RDSSP` does nothing
@@ -4094,7 +4095,7 @@ kernel.
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
 
-- The other `/proc` entries are `/proc/loadavg`, `/proc/locks` (above),
+- The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
   `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
@@ -4595,6 +4596,30 @@ kernel.
     time; `processes`, the IDs handed out; `procs_running`, the threads
     running as `/proc/<pid>/stat` shows them (`R`), the reader included;
     `procs_blocked 0`; and a `softirq` line of zeros.
+
+- `/proc/cpuinfo` is in the format of Linux 7.0's `show_cpuinfo`, with a
+  record for each CPU `sched_getaffinity` reports. It is made from the
+  virtual CPU's `CPUID` as Linux makes it when it boots on such a CPU, never
+  from the host's CPU.
+  - `vendor_id`, `cpu family`, `model`, `stepping` and `cpuid level` are
+    `CPUID`'s. `model name` is `Hammer`, the name Linux gives an AMD CPU of
+    family 15 without a brand string.
+  - `flags` names, by Linux's names and in its order (`x86_cap_flags`), the
+    features of the `CPUID` words Linux copies, and those Linux sets itself on
+    such a CPU: `nopl`, `cpuid`, `3dnowprefetch` and `vmmcall`. `bugs` names
+    what Linux's tables give that family: `fxsave_leak`, `sysret_ss_attrs`,
+    `null_seg`, `swapgs_fence`, `spectre_v1`, `spectre_v2` and
+    `spectre_v2_user`.
+  - `CPUID` describes no topology, so each CPU is a package of its own with
+    one core: `physical id` and `apicid` are its number, `siblings` and
+    `cpu cores` 1, and `core id` 0. `initial apicid` is what `CPUID`'s leaf 1
+    gives, 0.
+  - `clflush size` and `cache_alignment` are 64, and the address sizes 36
+    bits physical and 48 virtual: a 64-bit Linux's defaults without `CPUID`
+    leaf 0x80000008.
+  - There is no `microcode`, `cpu MHz` (`CPUID` reports no time stamp
+    counter), `cache size` or `TLB size` line. `power management` is empty,
+    and `bogomips` is 0.00, as nothing is calibrated.
 
 - `/proc/net` is a link to `self/net`; `/proc/<pid>/net`, and a thread's,
   holds the files of the task's network namespace, whose names are looked

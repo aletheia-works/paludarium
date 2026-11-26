@@ -127,9 +127,14 @@ verified.
   `route` alone; `tcp`, `udp`, `unix`, `igmp`, `snmp`, `sockstat` and the rest
   are `ENOENT`, and no counter is kept, so those of `dev` are 0. A session
   with no network has files of no device.
+- **`/proc/cpuinfo` of the virtual CPU**: `bogomips` is 0.00 and there is no
+  `cpu MHz`, as `CPUID` reports no time stamp counter though `RDTSC` works;
+  `initial apicid` is 0 on every CPU, as `CPUID`'s leaf 1 gives no CPU its
+  own ID; and `bugs` lists what Linux 7.0 assumes of an AMD CPU of family
+  15, though the virtual CPU does not speculate.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/version`, `/proc/cmdline`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any

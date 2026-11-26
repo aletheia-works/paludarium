@@ -32,7 +32,9 @@ const CLFSH: u32 = 1 << 19;
 /// that has it says: 64 bytes, the one size HotSpot accepts.
 const CLFLUSH_LINE: u32 = 8 << 8;
 
-pub(crate) fn values(leaf: u32, _subleaf: u32) -> [u32; 4] {
+/// What `cpuid` gives for `leaf` and `subleaf`: EAX, EBX, ECX and EDX. The
+/// kernel's `/proc/cpuinfo` is made from it too.
+pub fn values(leaf: u32, _subleaf: u32) -> [u32; 4] {
     match leaf {
         // glibc reads leaf 1 only for a vendor it knows, so this names one
         // rather than the emulator. Where vendors differ, the CPU has its own

@@ -50,7 +50,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   示します。HotSpot が必須とするので、`CLFLUSH` とその 64 バイトの行も示します。
   そのうち FPU と MMX は実装していませんが、それ以外に実装していない機能は広告
   しません。名乗りが変えるのはここだけです。`REP` のフォルト後のフラグなど、ベンダーで
-  CPU の動きが違うところは、仮想 CPU 自身の動きのままです。
+  CPU の動きが違うところは、仮想 CPU 自身の動きのままです。`/proc/cpuinfo` もこの CPU を
+  示します。
 - `RDTSC` と `RDTSCP` は仮想 CPU のカウンタを読みます。カウンタは時間ではなく読むたびに
   進みます。ホストのプロセス内のすべてのゲストがこのカウンタを共有するので、値は他のゲストが
   読んだ回数によって変わります。シャドウスタックがないので、`RDSSP` は何もせず、`map_shadow_stack` は `EOPNOTSUPP` を返します。`FXSAVE` と `FXRSTOR` は
@@ -3528,7 +3529,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/net`、`/proc/sysvipc`（後述）、
+- `/proc` にあるのは、ほかには `/proc/cpuinfo`（後述）、`/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
@@ -3955,6 +3956,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     秒数で、`ps` はこれで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running`
     （`/proc/<pid>/stat` が `R` と示す実行中のスレッドの数で、読んでいるスレッドを含みます）、
     `procs_blocked 0`、0 が並ぶ `softirq` の行です。
+
+- `/proc/cpuinfo` は Linux 7.0 の `show_cpuinfo` と同じ形式で、`sched_getaffinity` が返す
+  CPU ごとにレコードがあります。中身は、仮想 CPU の `CPUID` から、Linux がそのような CPU で
+  起動したときと同じように作ります。ホストの CPU のものは使いません。
+  - `vendor_id`、`cpu family`、`model`、`stepping`、`cpuid level` は `CPUID` の値です。
+    `model name` は `Hammer` で、ブランド文字列のないファミリー 15 の AMD の CPU に Linux が
+    付ける名前です。
+  - `flags` は、Linux がコピーする `CPUID` のワードの機能と、そのような CPU で Linux 自身が
+    立てるもの（`nopl`、`cpuid`、`3dnowprefetch`、`vmmcall`）を、Linux の名前と順序
+    （`x86_cap_flags`）で並べます。`bugs` は、Linux の表がそのファミリーに付けるもの
+    （`fxsave_leak`、`sysret_ss_attrs`、`null_seg`、`swapgs_fence`、`spectre_v1`、
+    `spectre_v2`、`spectre_v2_user`）です。
+  - `CPUID` はトポロジーを示さないので、CPU はそれぞれ、コアが 1 つの別のパッケージです。
+    `physical id` と `apicid` はその番号、`siblings` と `cpu cores` は 1、`core id` は 0 です。
+    `initial apicid` は `CPUID` のリーフ 1 が返す 0 です。
+  - `clflush size` と `cache_alignment` は 64、アドレスの大きさは物理 36 ビット、仮想 48 ビット
+    です。`CPUID` のリーフ 0x80000008 がないときの 64 ビットの Linux の既定値です。
+  - `microcode`、`cpu MHz`（`CPUID` はタイムスタンプカウンタを示しません）、`cache size`、
+    `TLB size` の行はありません。`power management` は空で、何も較正しないので
+    `bogomips` は 0.00 です。
 
 - `/proc/net` は `self/net` へのリンクです。`/proc/<pid>/net` とスレッドのものには、タスクの
   ネットワーク名前空間のファイルがあります。名前は、そのときタスクが持つ名前空間から引き

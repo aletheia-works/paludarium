@@ -9617,7 +9617,7 @@ fn epoll_fdinfo(
     out
 }
 /// A system-wide /proc file, opened with `flags`: its contents from what
-/// `sysinfo` reports, or, for `/proc/sysvipc`'s, generated as they are read
+/// `sysinfo` reports and the virtual CPU's `cpuid`, or, for `/proc/sysvipc`'s, generated as they are read
 /// from the opener's namespaces ([`crate::seq`]).
 fn system_file(
     c: &Context<'_>,
@@ -9625,6 +9625,9 @@ fn system_file(
     flags: u32,
 ) -> Arc<dyn FileHandle> {
     let content = match entry {
+        crate::proc::SystemEntry::Cpuinfo => {
+            crate::cpuinfo::render(crate::syscalls::active_cpus(c))
+        }
         crate::proc::SystemEntry::Loadavg => {
             let (tasks, last_pid) = c.processes.task_counts();
             crate::proc::render_loadavg(c.processes.running_tasks(c.tid), tasks, last_pid)

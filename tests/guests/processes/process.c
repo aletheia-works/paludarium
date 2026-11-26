@@ -20745,6 +20745,331 @@ static int userns_nondumpable_read_case(const char *self) {
     return 0;
 }
 
+/* The proc-cpuinfo case: /proc/cpuinfo has Linux 7.0's show_cpuinfo
+   fields in its order, a record for each CPU, and what it says of the CPU
+   agrees with cpuid in the reader: vendor, family, model, stepping, cpuid
+   level, the CLFLUSH line and the address sizes as get_cpu_address_sizes
+   takes them, the initial APIC ID of the CPU the reader runs on, and the
+   flags of the words get_cpu_cap copies from cpuid (all of leaf 1's EDX and
+   0x80000001's EDX shown, and none shown that cpuid lacks but those Linux
+   sets itself on some CPUs). Flags and bugs follow x86_cap_flags' and
+   x86_bug_flags' order. The values differ by CPU, so only whether each
+   holds is printed, with the names of any flag that does not. */
+struct ci_name {
+    short bit;
+    const char *name;
+};
+/* Linux 7.0's x86_cap_flags and x86_bug_flags (cpufeatures.h): each named
+   bit, in bit order. */
+static const struct ci_name ci_flags[] = {
+    {0, "fpu"}, {1, "vme"}, {2, "de"}, {3, "pse"}, {4, "tsc"}, {5, "msr"}, {6, "pae"}, {7, "mce"},
+    {8, "cx8"}, {9, "apic"}, {11, "sep"}, {12, "mtrr"}, {13, "pge"}, {14, "mca"}, {15, "cmov"},
+    {16, "pat"}, {17, "pse36"}, {18, "pn"}, {19, "clflush"}, {21, "dts"}, {22, "acpi"},
+    {23, "mmx"}, {24, "fxsr"}, {25, "sse"}, {26, "sse2"}, {27, "ss"}, {28, "ht"}, {29, "tm"},
+    {30, "ia64"}, {31, "pbe"}, {43, "syscall"}, {51, "mp"}, {52, "nx"}, {54, "mmxext"},
+    {57, "fxsr_opt"}, {58, "pdpe1gb"}, {59, "rdtscp"}, {61, "lm"}, {62, "3dnowext"}, {63, "3dnow"},
+    {64, "recovery"}, {65, "longrun"}, {67, "lrti"}, {96, "cxmmx"}, {97, "k6_mtrr"},
+    {98, "cyrix_arr"}, {99, "centaur_mcr"}, {104, "constant_tsc"}, {105, "up"}, {106, "art"},
+    {107, "arch_perfmon"}, {108, "pebs"}, {109, "bts"}, {112, "rep_good"}, {113, "amd_lbr_v2"},
+    {115, "acc_power"}, {116, "nopl"}, {118, "xtopology"}, {119, "tsc_reliable"},
+    {120, "nonstop_tsc"}, {121, "cpuid"}, {122, "extd_apicid"}, {123, "amd_dcm"},
+    {124, "aperfmperf"}, {125, "rapl"}, {126, "nonstop_tsc_s3"}, {127, "tsc_known_freq"},
+    {128, "pni"}, {129, "pclmulqdq"}, {130, "dtes64"}, {131, "monitor"}, {132, "ds_cpl"},
+    {133, "vmx"}, {134, "smx"}, {135, "est"}, {136, "tm2"}, {137, "ssse3"}, {138, "cid"},
+    {139, "sdbg"}, {140, "fma"}, {141, "cx16"}, {142, "xtpr"}, {143, "pdcm"}, {145, "pcid"},
+    {146, "dca"}, {147, "sse4_1"}, {148, "sse4_2"}, {149, "x2apic"}, {150, "movbe"},
+    {151, "popcnt"}, {152, "tsc_deadline_timer"}, {153, "aes"}, {154, "xsave"}, {156, "avx"},
+    {157, "f16c"}, {158, "rdrand"}, {159, "hypervisor"}, {162, "rng"}, {163, "rng_en"},
+    {166, "ace"}, {167, "ace_en"}, {168, "ace2"}, {169, "ace2_en"}, {170, "phe"}, {171, "phe_en"},
+    {172, "pmm"}, {173, "pmm_en"}, {192, "lahf_lm"}, {193, "cmp_legacy"}, {194, "svm"},
+    {195, "extapic"}, {196, "cr8_legacy"}, {197, "abm"}, {198, "sse4a"}, {199, "misalignsse"},
+    {200, "3dnowprefetch"}, {201, "osvw"}, {202, "ibs"}, {203, "xop"}, {204, "skinit"},
+    {205, "wdt"}, {207, "lwp"}, {208, "fma4"}, {209, "tce"}, {211, "nodeid_msr"}, {213, "tbm"},
+    {214, "topoext"}, {215, "perfctr_core"}, {216, "perfctr_nb"}, {218, "bpext"}, {219, "ptsc"},
+    {220, "perfctr_llc"}, {221, "mwaitx"}, {224, "ring3mwait"}, {225, "cpuid_fault"}, {226, "cpb"},
+    {227, "epb"}, {228, "cat_l3"}, {229, "cat_l2"}, {230, "cdp_l3"}, {231, "tdx_host_platform"},
+    {232, "hw_pstate"}, {233, "proc_feedback"}, {235, "pti"}, {238, "intel_ppin"}, {239, "cdp_l2"},
+    {241, "ssbd"}, {242, "mba"}, {244, "perfmon_v2"}, {249, "ibrs"}, {250, "ibpb"}, {251, "stibp"},
+    {254, "ibrs_enhanced"}, {256, "tpr_shadow"}, {257, "flexpriority"}, {258, "ept"},
+    {259, "vpid"}, {271, "vmmcall"}, {273, "ept_ad"}, {278, "tdx_guest"}, {288, "fsgsbase"},
+    {289, "tsc_adjust"}, {290, "sgx"}, {291, "bmi1"}, {292, "hle"}, {293, "avx2"}, {295, "smep"},
+    {296, "bmi2"}, {297, "erms"}, {298, "invpcid"}, {299, "rtm"}, {300, "cqm"}, {302, "mpx"},
+    {303, "rdt_a"}, {304, "avx512f"}, {305, "avx512dq"}, {306, "rdseed"}, {307, "adx"},
+    {308, "smap"}, {309, "avx512ifma"}, {311, "clflushopt"}, {312, "clwb"}, {313, "intel_pt"},
+    {314, "avx512pf"}, {315, "avx512er"}, {316, "avx512cd"}, {317, "sha_ni"}, {318, "avx512bw"},
+    {319, "avx512vl"}, {320, "xsaveopt"}, {321, "xsavec"}, {322, "xgetbv1"}, {323, "xsaves"},
+    {352, "cqm_llc"}, {353, "cqm_occup_llc"}, {354, "cqm_mbm_total"}, {355, "cqm_mbm_local"},
+    {358, "split_lock_detect"}, {375, "user_shstk"}, {388, "avx_vnni"}, {389, "avx512_bf16"},
+    {390, "lass"}, {401, "fred"}, {410, "lam"}, {416, "clzero"}, {417, "irperf"},
+    {418, "xsaveerptr"}, {420, "rdpru"}, {425, "wbnoinvd"}, {439, "amd_ppin"}, {441, "virt_ssbd"},
+    {443, "cppc"}, {447, "brs"}, {448, "dtherm"}, {449, "ida"}, {450, "arat"}, {452, "pln"},
+    {454, "pts"}, {455, "hwp"}, {456, "hwp_notify"}, {457, "hwp_act_window"}, {458, "hwp_epp"},
+    {459, "hwp_pkg_req"}, {467, "hfi"}, {480, "npt"}, {481, "lbrv"}, {482, "svm_lock"},
+    {483, "nrip_save"}, {484, "tsc_scale"}, {485, "vmcb_clean"}, {486, "flushbyasid"},
+    {487, "decodeassists"}, {490, "pausefilter"}, {492, "pfthreshold"}, {493, "avic"},
+    {495, "v_vmsave_vmload"}, {496, "vgif"}, {498, "x2avic"}, {500, "v_spec_ctrl"}, {505, "vnmi"},
+    {513, "avx512vbmi"}, {514, "umip"}, {515, "pku"}, {516, "ospke"}, {517, "waitpkg"},
+    {518, "avx512_vbmi2"}, {520, "gfni"}, {521, "vaes"}, {522, "vpclmulqdq"}, {523, "avx512_vnni"},
+    {524, "avx512_bitalg"}, {525, "tme"}, {526, "avx512_vpopcntdq"}, {528, "la57"}, {534, "rdpid"},
+    {536, "bus_lock_detect"}, {537, "cldemote"}, {539, "movdiri"}, {540, "movdir64b"},
+    {541, "enqcmd"}, {542, "sgx_lc"}, {544, "overflow_recov"}, {545, "succor"}, {547, "smca"},
+    {578, "avx512_4vnniw"}, {579, "avx512_4fmaps"}, {580, "fsrm"}, {584, "avx512_vp2intersect"},
+    {586, "md_clear"}, {590, "serialize"}, {592, "tsxldtrk"}, {594, "pconfig"}, {595, "arch_lbr"},
+    {596, "ibt"}, {598, "amx_bf16"}, {599, "avx512_fp16"}, {600, "amx_tile"}, {601, "amx_int8"},
+    {604, "flush_l1d"}, {605, "arch_capabilities"}, {608, "sme"}, {609, "sev"}, {611, "sev_es"},
+    {612, "sev_snp"}, {622, "debug_swap"}, {636, "svsm"}, {672, "amd_lbr_pmc_freeze"},
+};
+static const struct ci_name ci_bugs[] = {
+    {0, "f00f"}, {1, "fdiv"}, {2, "coma"}, {3, "tlb_mmatch"}, {4, "apic_c1e"}, {5, "11ap"},
+    {6, "fxsave_leak"}, {7, "clflush_monitor"}, {8, "sysret_ss_attrs"}, {10, "null_seg"},
+    {11, "swapgs_fence"}, {12, "monitor"}, {13, "amd_e400"}, {14, "cpu_meltdown"},
+    {15, "spectre_v1"}, {16, "spectre_v2"}, {17, "spec_store_bypass"}, {18, "l1tf"}, {19, "mds"},
+    {20, "msbds_only"}, {21, "swapgs"}, {22, "taa"}, {23, "itlb_multihit"}, {24, "srbds"},
+    {25, "mmio_stale_data"}, {27, "retbleed"}, {28, "eibrs_pbrsb"}, {29, "smt_rsb"}, {30, "gds"},
+    {31, "tdx_pw_mce"}, {32, "srso"}, {33, "div0"}, {34, "rfds"}, {35, "bhi"}, {36, "ibpb_no_ret"},
+    {37, "spectre_v2_user"}, {38, "old_microcode"}, {39, "its"}, {40, "its_native_only"},
+    {41, "tsa"}, {42, "vmscape"},
+};
+/* The words get_cpu_cap copies from cpuid: word, leaf, subleaf and
+   register (0 EAX, 1 EBX, 2 ECX, 3 EDX). */
+static const struct {
+    int word;
+    unsigned leaf, subleaf;
+    int reg;
+} ci_words[] = {
+    {0, 1, 0, 3},           {4, 1, 0, 2},           {14, 6, 0, 0},          {9, 7, 0, 1},
+    {16, 7, 0, 2},          {18, 7, 0, 3},          {12, 7, 1, 0},          {10, 0xd, 1, 0},
+    {6, 0x80000001, 0, 2},  {1, 0x80000001, 0, 3},  {13, 0x80000008, 0, 1}, {15, 0x8000000a, 0, 3},
+    {19, 0x8000001f, 0, 0}, {20, 0x80000021, 0, 0},
+};
+/* Flags of those words that Linux sets without cpuid on some CPUs: pge,
+   pae, sse, 3dnowprefetch, fsrs and arat. */
+static const short ci_linux_sets[] = {13, 6, 25, 6 * 32 + 8, 12 * 32 + 11, 14 * 32 + 2};
+
+static int ci_lookup(const struct ci_name *table, size_t n, const char *name, size_t len) {
+    for (size_t i = 0; i < n; i++)
+        if (strlen(table[i].name) == len && !memcmp(table[i].name, name, len)) return table[i].bit;
+    return -1;
+}
+
+static void ci_cpuid(unsigned leaf, unsigned subleaf, unsigned r[4]) {
+    __cpuid_count(leaf, subleaf, r[0], r[1], r[2], r[3]);
+}
+
+/* Whether the names after "name\t\t:" are each " name", in increasing bit
+   order where they are known; with show, each flag's bit is set in shown. */
+static int ci_names(const char *list, const struct ci_name *table, size_t n, unsigned *shown) {
+    int last = -1, ordered = 1;
+    while (*list == ' ') {
+        const char *name = list + 1;
+        size_t len = strcspn(name, " ");
+        if (!len) return 0;
+        int bit = ci_lookup(table, n, name, len);
+        if (bit >= 0) {
+            ordered &= bit > last;
+            last = bit;
+            if (shown) shown[bit / 32] |= 1u << (bit % 32);
+        }
+        list = name + len;
+    }
+    return ordered && !*list;
+}
+
+/* The CPU that runs the reader now, and the initial APIC ID cpuid gives on it. */
+static unsigned ci_initial_apicid(int cpu) {
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(cpu, &one);
+    if (sched_setaffinity(0, sizeof one, &one)) return ~0u;
+    unsigned r[4];
+    ci_cpuid(1, 0, r);
+    return r[1] >> 24;
+}
+
+static const char *const ci_fields[] = {
+    "processor\t: ",   "vendor_id\t: ",     "cpu family\t: ",   "model\t\t: ",    "model name\t: ",
+    "stepping\t: ",    "microcode\t: ",     "cpu MHz\t\t: ",    "cache size\t: ", "physical id\t: ",
+    "siblings\t: ",    "core id\t\t: ",     "cpu cores\t: ",    "apicid\t\t: ",   "initial apicid\t: ",
+    "fpu\t\t: ",       "fpu_exception\t: ", "cpuid level\t: ",  "wp\t\t: ",       "flags\t\t:",
+    "vmx flags\t:",    "bugs\t\t:",         "bogomips\t: ",     "TLB size\t: ",   "clflush size\t: ",
+    "cache_alignment\t: ", "address sizes\t: ", "power management:",
+};
+/* microcode, cpu MHz, cache size, vmx flags and TLB size are there only on
+   some CPUs. */
+static int ci_optional(int field) {
+    return field == 6 || field == 7 || field == 8 || field == 20 || field == 23;
+}
+#define CI_FIELDS (int)(sizeof ci_fields / sizeof *ci_fields)
+
+static int proc_cpuinfo_case(void) {
+    size_t size = 0, cap = 1 << 16;
+    char *text = malloc(cap);
+    int fd = open("/proc/cpuinfo", O_RDONLY);
+    if (fd < 0 || !text) {
+        printf("cpuinfo open=%d\n", fd < 0 ? -errno : 0);
+        return 0;
+    }
+    for (;;) {
+        if (cap - size < 4097) text = realloc(text, cap *= 2);
+        ssize_t n = read(fd, text + size, 4096);
+        if (n <= 0) break;
+        size += (size_t)n;
+    }
+    struct stat st;
+    fstat(fd, &st);
+    close(fd);
+    text[size] = 0;
+    printf("cpuinfo mode=%o size=%lld ends-with-blank-line=%d\n", st.st_mode, (long long)st.st_size,
+           size >= 2 && !strcmp(text + size - 2, "\n\n"));
+
+    unsigned r[4], level, signature, misc, extended;
+    ci_cpuid(0, 0, r);
+    level = r[0];
+    char vendor[13];
+    memcpy(vendor, &r[1], 4);
+    memcpy(vendor + 4, &r[3], 4);
+    memcpy(vendor + 8, &r[2], 4);
+    vendor[12] = 0;
+    ci_cpuid(1, 0, r);
+    signature = r[0];
+    misc = r[1];
+    unsigned family = signature >> 8 & 0xf, model = signature >> 4 & 0xf, stepping = signature & 0xf;
+    if (family == 0xf) family += signature >> 20 & 0xff;
+    if (family >= 6) model += (signature >> 16 & 0xf) << 4;
+    ci_cpuid(0x80000000, 0, r);
+    extended = (r[0] & 0xffff0000) == 0x80000000 ? r[0] : 0;
+    unsigned words[22] = {0};
+    for (size_t i = 0; i < sizeof ci_words / sizeof *ci_words; i++) {
+        unsigned leaf = ci_words[i].leaf;
+        int present = leaf >= 0x80000000 ? leaf <= extended : leaf <= level;
+        if (present && leaf == 7 && ci_words[i].subleaf == 1) {
+            ci_cpuid(7, 0, r);
+            present = r[0] >= 1;
+        }
+        if (present) {
+            ci_cpuid(leaf, ci_words[i].subleaf, r);
+            words[ci_words[i].word] = r[ci_words[i].reg];
+        }
+    }
+    unsigned clflush = 64, physical = 36, virtual = 48;
+    if (extended >= 0x80000008) {
+        ci_cpuid(0x80000008, 0, r);
+        physical = r[0] & 0xff;
+        virtual = r[0] >> 8 & 0xff;
+        clflush = words[0] & 1u << 19 ? (misc >> 8 & 0xff) * 8 : 0;
+        if (!clflush) clflush = 32;
+    }
+
+    cpu_set_t all;
+    sched_getaffinity(0, sizeof all, &all);
+    int cpus = CPU_COUNT(&all), records = 0, fields = 1, identity = 1, fixed = 1, flags_ok = 1;
+    int bugs_ok = 1, sizes = 1, bogomips = 1, apicids_differ = 1, cores = 1, first_cpu = -1, last_cpu = -1;
+    unsigned first_initial = 0, last_initial = 0, siblings = 0, packages = 0, shown[22] = {0};
+    long package_ids[1024], apicids[1024];
+    char extra[512] = "", missing[512] = "";
+    for (char *record = text; *record; records++) {
+        char *end = strstr(record, "\n\n");
+        if (!end) {
+            fields = 0;
+            break;
+        }
+        *end = 0;
+        int at = -1, seen[CI_FIELDS] = {0};
+        long physical_id = -1, apicid = -1, processor = -1, initial = -1;
+        for (char *line = record; line;) {
+            char *next = strchr(line, '\n');
+            if (next) *next++ = 0;
+            int field = -1;
+            for (int f = at + 1; f < CI_FIELDS && field < 0; f++)
+                if (!strncmp(line, ci_fields[f], strlen(ci_fields[f]))) field = f;
+            if (field < 0) {
+                fields = 0;
+                break;
+            }
+            at = field;
+            seen[field] = 1;
+            const char *value = line + strlen(ci_fields[field]);
+            switch (field) {
+            case 0: processor = atol(value); break;
+            case 1: identity &= !strcmp(value, vendor); break;
+            case 2: identity &= strtoul(value, NULL, 10) == family; break;
+            case 3: identity &= strtoul(value, NULL, 10) == model; break;
+            case 5: identity &= strtoul(value, NULL, 10) == stepping; break;
+            case 9: physical_id = atol(value); break;
+            case 10: siblings = (unsigned)atol(value); break;
+            case 12: cores &= (unsigned)atol(value) >= 1 && (unsigned)atol(value) <= siblings; break;
+            case 13: apicid = atol(value); break;
+            case 14: initial = atol(value); break;
+            case 15: case 16: case 18: fixed &= !strcmp(value, "yes"); break;
+            case 17: identity &= strtoul(value, NULL, 10) == level; break;
+            case 19:
+                memset(shown, 0, sizeof shown);
+                flags_ok &= ci_names(value, ci_flags, sizeof ci_flags / sizeof *ci_flags, shown);
+                break;
+            case 21: bugs_ok &= ci_names(value, ci_bugs, sizeof ci_bugs / sizeof *ci_bugs, NULL); break;
+            case 22: {
+                unsigned whole, hundredths;
+                char tail;
+                bogomips &= sscanf(value, "%u.%2u%c", &whole, &hundredths, &tail) == 2 &&
+                            strlen(strchr(value, '.')) == 3;
+                break;
+            }
+            case 24: sizes &= strtoul(value, NULL, 10) == clflush; break;
+            case 25: sizes &= strtoul(value, NULL, 10) == clflush; break;
+            case 26: {
+                unsigned p, v;
+                sizes &= sscanf(value, "%u bits physical, %u bits virtual", &p, &v) == 2 && p == physical &&
+                         v == virtual;
+                break;
+            }
+            case 27: fields &= !*value && !next; break;
+            }
+            line = next;
+        }
+        for (int f = 0; f < CI_FIELDS; f++) fields &= seen[f] || ci_optional(f);
+        fields &= processor == records;
+        if (records < 1024) {
+            for (int i = 0; i < records; i++) apicids_differ &= apicids[i] != apicid;
+            apicids[records] = apicid;
+            int known = 0;
+            for (unsigned i = 0; i < packages; i++) known |= package_ids[i] == physical_id;
+            if (!known && packages < 1024) package_ids[packages++] = physical_id;
+        }
+        if (first_cpu < 0) {
+            first_cpu = (int)processor;
+            first_initial = (unsigned)initial;
+        }
+        last_cpu = (int)processor;
+        last_initial = (unsigned)initial;
+        record = end + 2;
+    }
+    /* The flags of the last record against cpuid, with the names of those
+       that do not agree. */
+    for (size_t i = 0; i < sizeof ci_flags / sizeof *ci_flags; i++) {
+        int bit = ci_flags[i].bit, word = bit / 32, direct = 0, linux_sets = 0;
+        for (size_t w = 0; w < sizeof ci_words / sizeof *ci_words; w++) direct |= ci_words[w].word == word;
+        for (size_t s = 0; s < sizeof ci_linux_sets / sizeof *ci_linux_sets; s++)
+            linux_sets |= ci_linux_sets[s] == bit;
+        int in_cpuid = words[word] >> (bit % 32) & 1, is_shown = shown[word] >> (bit % 32) & 1;
+        if (direct && is_shown && !in_cpuid && !linux_sets && strlen(extra) < 400)
+            strcat(strcat(extra, " "), ci_flags[i].name);
+        if ((word == 0 || word == 1) && in_cpuid && !is_shown && strlen(missing) < 400)
+            strcat(strcat(missing, " "), ci_flags[i].name);
+    }
+    printf("cpuinfo records=cpus:%d fields-in-order=%d identity=cpuid:%d yes-fields=%d\n", records == cpus,
+           fields, identity, fixed);
+    printf("cpuinfo flags-in-order=%d bugs-in-order=%d bogomips-format=%d sizes=cpuid:%d\n", flags_ok, bugs_ok,
+           bogomips, sizes);
+    printf("cpuinfo apicids-differ=%d packages-times-siblings=records:%d cores-within-siblings=%d\n",
+           apicids_differ, packages * siblings == (unsigned)records, cores);
+    printf("cpuinfo initial-apicid=cpuid:%d,%d\n", ci_initial_apicid(first_cpu) == first_initial,
+           ci_initial_apicid(last_cpu) == last_initial);
+    printf("cpuinfo shown-not-in-cpuid=[%s] in-cpuid-not-shown=[%s]\n", extra, missing);
+    sched_setaffinity(0, sizeof all, &all);
+    free(text);
+    return 0;
+}
+
 /* The loadavg-running case: /proc/loadavg's running count, as Linux's
    nr_running(), counts the threads that can run: with two threads spinning
    besides the reader, at least 3, and no more than the live tasks; and
@@ -42138,6 +42463,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-sizes")) return proc_sizes_case();
     if (!strcmp(mode, "proc-stat-counters")) return proc_stat_counters_case();
     if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
+    if (!strcmp(mode, "proc-cpuinfo")) return proc_cpuinfo_case();
     if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "thread-own-counters")) return thread_own_counters_case();
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();

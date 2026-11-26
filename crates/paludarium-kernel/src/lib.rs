@@ -15,6 +15,7 @@
 mod admin;
 mod arguments;
 mod coredump;
+mod cpuinfo;
 mod credentials;
 mod inbox;
 mod inotify;

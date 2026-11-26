@@ -77,20 +77,21 @@ pub(crate) struct Counts {
 }
 
 /// How a write goes: `MSG_MORE`, `MSG_OOB`, and the socket's
-/// `TCP_NODELAY`.
+/// `TCP_NODELAY` and `TCP_CORK`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Push {
     pub(crate) more: bool,
     pub(crate) urgent: bool,
     pub(crate) no_delay: bool,
+    pub(crate) cork: bool,
 }
 
 /// What `tcp_write_xmit` is told of Nagle's check.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nagle {
-    /// The socket's own (`TCP_NODELAY`).
+    /// The socket's own (`TCP_NODELAY` and `TCP_CORK`).
     Own,
-    /// `TCP_NAGLE_CORK`: a part waits whatever is in flight.
+    /// `MSG_MORE` (`TCP_NAGLE_CORK`): a part waits whatever is in flight.
     Cork,
     /// `TCP_NAGLE_PUSH` and `TCP_NAGLE_OFF`: nothing waits.
     Push,
@@ -141,6 +142,9 @@ struct Side {
     bound: u32,
     advertised: u32,
     no_delay: bool,
+    cork: bool,
+    /// `TCP_NAGLE_PUSH`: what waits goes, until a write makes a new buffer.
+    pushed: bool,
     cwnd: u32,
     cwnd_limited: bool,
     /// `write_seq`, `snd_nxt`, `snd_una` and `snd_sml`.
@@ -182,6 +186,8 @@ impl Side {
             bound,
             advertised,
             no_delay: false,
+            cork: false,
+            pushed: false,
             cwnd: CWND,
             cwnd_limited: false,
             written: 0,
@@ -435,6 +441,10 @@ impl Flows {
         self.owner = Some(side);
         let s = &mut self.sides[side];
         s.no_delay = push.no_delay;
+        s.cork = push.cork;
+        // `tcp_skb_entail`, unless the write goes on in the last buffer.
+        let waits = s.written - s.next;
+        s.pushed &= waits > 0 && waits + len <= u64::from(s.mss);
         s.written += len;
         if push.urgent {
             s.urgent = s.written;
@@ -494,10 +504,25 @@ impl Flows {
         self.advance(now);
         self.sides[side].no_delay = on;
         if on {
+            self.sides[side].pushed = true;
             self.owner = Some(side);
-            self.transmit(side, Nagle::Push, false);
+            self.transmit(side, Nagle::Own, false);
             self.release();
         }
+    }
+    /// `TCP_CORK` set or cleared, which lets go what it held unless Nagle's
+    /// algorithm holds it too (`__tcp_sock_set_cork`).
+    pub(crate) fn set_cork(&mut self, side: usize, on: bool, now: u64) {
+        self.advance(now);
+        let s = &mut self.sides[side];
+        s.cork = on;
+        if on {
+            return;
+        }
+        s.pushed |= s.no_delay;
+        self.owner = Some(side);
+        self.transmit(side, Nagle::Own, false);
+        self.release();
     }
     /// `TCP_QUICKACK` set to `value` (`__tcp_sock_set_quickack`).
     pub(crate) fn set_quick(&mut self, side: usize, value: i32, now: u64) {
@@ -644,7 +669,10 @@ impl Flows {
             let holds = match nagle {
                 Nagle::Push => false,
                 Nagle::Cork => true,
-                Nagle::Own => !s.no_delay && out > 0 && s.small > s.una,
+                Nagle::Own => {
+                    let nagle = !s.no_delay && out > 0 && s.small > s.una;
+                    !s.pushed && (s.cork || nagle)
+                }
             };
             if part != 0 && last && !s.fin && !urgent && holds && !timeless {
                 len -= part;

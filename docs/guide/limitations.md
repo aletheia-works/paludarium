@@ -123,9 +123,13 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
+- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route` and
+  `route` alone; `tcp`, `udp`, `unix`, `igmp`, `snmp`, `sockstat` and the rest
+  are `ENOENT`, and no counter is kept, so those of `dev` are 0. A session
+  with no network has files of no device.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, `/proc/net` and a process's `net`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, ...) are looked up like any
@@ -402,10 +406,9 @@ verified.
   and nothing else. A socket filter, attached with `SO_ATTACH_BPF` or a
   classic one with `SO_ATTACH_FILTER`, runs only on an AF_UNIX datagram
   or packet socket, on a UDP socket and on the SYNs that come to a TCP
-  listener. A connection's segments are counted here but not yet built, so
-  no filter runs yet on the handshake's last ACK, nor on the data, ACKs and
-  FINs that come to a connected socket, which Linux filters each
-  (`tcp_filter`): a filter that drops or cuts them, or keeps a SYN but drops
+  listener. None runs yet on the handshake's last ACK, nor on each of a
+  connection's segments (the data, ACKs and FINs that come to a connected
+  socket), as Linux's does (`tcp_filter`): a filter that drops or cuts them, or keeps a SYN but drops
   that ACK, does otherwise there. On a UDP socket no
   filter runs on the DNS stub's answers, which come through no device
   here; a datagram that Linux sends in fragments across a veth pair comes

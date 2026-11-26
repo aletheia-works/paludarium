@@ -328,6 +328,10 @@ impl Link {
     pub(crate) fn set_no_delay(&self, side: usize, on: bool) {
         self.with_flows(|flows, now| flows.set_no_delay(side, on, now));
     }
+    /// `side`'s `TCP_CORK` was set or cleared.
+    pub(crate) fn set_cork(&self, side: usize, on: bool) {
+        self.with_flows(|flows, now| flows.set_cork(side, on, now));
+    }
     /// `side`'s `TCP_QUICKACK` was set to `value`.
     pub(crate) fn set_quick(&self, side: usize, value: i32) {
         self.with_flows(|flows, now| flows.set_quick(side, value, now));
@@ -912,9 +916,10 @@ impl Ports {
     /// `__inet_lookup_listener`: one bound to that address before one bound
     /// to every address, and an IPv4 socket before an IPv6 one; among equals
     /// the first to bind, or one of its group ([`pick`]). It comes in on
-    /// the device `dif`: one bound to another takes it not, one bound to it
-    /// ranks before one of another family bound to none
-    /// (`compute_score`).
+    /// the device `dif`: one bound to another does not take it, and one bound
+    /// to it ranks before one of its family bound to none. A listener bound
+    /// to the device ties with one of the other family bound to none when the
+    /// first is IPv6's (`compute_score` gives both 2).
     pub(crate) fn listener(
         &mut self,
         from: SocketAddr,

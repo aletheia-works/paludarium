@@ -3729,6 +3729,14 @@ impl Addresses {
         }
         entries
     }
+    /// The IPv6 tables, in the order a dump goes through them.
+    pub(crate) fn tables6(&self) -> Vec<u32> {
+        table_order(&self.tables6)
+    }
+    /// The IPv6 addresses.
+    pub(crate) fn v6(&self) -> &[V6] {
+        &self.v6
+    }
     /// Whether IPv4 has made the table `table` (`fib_get_table`).
     pub(crate) fn has_table4(&self, table: u32) -> bool {
         self.tables4.contains(&table)
@@ -4337,24 +4345,49 @@ impl Addresses {
                     }),
                 Err(_) => Ipv4Addr::LOCALHOST,
             }),
-            IpAddr::V6(ip) => IpAddr::V6(self.source6_through(ip, 0, order)),
+            IpAddr::V6(ip) => IpAddr::V6(self.source6_through(ip, 0, &Flow6::default(), order)),
         }
     }
     /// The address a packet to the IPv6 address `ip` through the device
     /// `oif` (any for 0) leaves from: out through a veth end, its route's
     /// preferred source or what `ipv6_dev_get_saddr` picks for the route's
-    /// device ([`Self::select6`]); `::` where there is none.
-    pub(crate) fn source6_through(&self, ip: Ipv6Addr, oif: u32, order: &[i32]) -> Ipv6Addr {
-        match self.lookup6_on(ip, oif) {
-            Ok(r) if r.oif != LOOPBACK_OIF => r
-                .prefsrc
-                .or_else(|| self.select6(i32::try_from(r.oif).unwrap_or(0), ip, order))
-                .unwrap_or(Ipv6Addr::UNSPECIFIED),
-            r => r
-                .ok()
-                .and_then(|r| self.source6(&r, ip))
-                .unwrap_or(Ipv6Addr::LOCALHOST),
+    /// device ([`Self::select6`]); `::` where there is none. A multipath
+    /// route's is of the hop that `flow`, with no source yet, takes, which
+    /// is the one the packet takes (`ip6_dst_lookup_tail`).
+    pub(crate) fn source6_through(
+        &self,
+        ip: Ipv6Addr,
+        oif: u32,
+        flow: &Flow6,
+        order: &[i32],
+    ) -> Ipv6Addr {
+        match self.lookup6_flow(ip, oif, flow) {
+            Ok(r) => self
+                .route_source6(&r, ip, order)
+                .unwrap_or(if r.oif == LOOPBACK_OIF {
+                    Ipv6Addr::LOCALHOST
+                } else {
+                    Ipv6Addr::UNSPECIFIED
+                }),
+            Err(_) => Ipv6Addr::LOCALHOST,
         }
+    }
+    /// The address a packet to `ip` by `route` leaves from
+    /// (`ip6_route_get_saddr`): its preferred source, or what
+    /// `ipv6_dev_get_saddr` picks for its device ([`Self::select6`], or
+    /// [`Self::source6`] for `lo`).
+    pub(crate) fn route_source6(
+        &self,
+        route: &Route6,
+        ip: Ipv6Addr,
+        order: &[i32],
+    ) -> Option<Ipv6Addr> {
+        if route.oif == LOOPBACK_OIF {
+            return self.source6(route, ip);
+        }
+        route
+            .prefsrc
+            .or_else(|| self.select6(i32::try_from(route.oif).ok()?, ip, order))
     }
 }
 /// The label of `ip` in Linux's default address label table

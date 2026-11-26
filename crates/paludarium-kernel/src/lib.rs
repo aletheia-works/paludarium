@@ -88,6 +88,7 @@ mod page_cache;
 mod pagemap_scan;
 mod perf;
 mod proc;
+mod proc_net;
 mod process_vm;
 mod processes;
 mod program_name;

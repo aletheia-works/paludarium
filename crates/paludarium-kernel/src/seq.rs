@@ -105,11 +105,17 @@ pub(crate) struct SeqFile {
 }
 impl SeqFile {
     pub(crate) fn open(records: Box<dyn Records>, flags: u32) -> Self {
+        let path_only = flags & crate::files::O_PATH != 0;
         Self {
             status: crate::files::StatusFlags::opened(flags),
             records,
-            access: flags & 3,
-            writable: flags & 3 != 0,
+            // `O_PATH` opens for nothing.
+            access: if path_only {
+                crate::files::O_PATH
+            } else {
+                flags & 3
+            },
+            writable: !path_only && flags & 3 != 0,
             writer: None,
             unwritable: Errno::EIO,
             seq_opened: true,
@@ -138,6 +144,13 @@ impl SeqFile {
             stat,
             owner: Some(owner),
             ..Self::open(records, flags)
+        }
+    }
+    /// The same, for a system-wide file that `owner` owns.
+    pub(crate) fn owned_by(self, owner: crate::proc::Owner) -> Self {
+        Self {
+            owner: Some(owner),
+            ..self
         }
     }
     /// The same, with `writer` as its write operation, as `comm`,

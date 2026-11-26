@@ -6,6 +6,7 @@ const PLAIN: Push = Push {
     more: false,
     urgent: false,
     no_delay: false,
+    cork: false,
 };
 
 fn flows() -> Flows {
@@ -200,6 +201,50 @@ fn data_held_comes_when_its_acknowledgement_does() {
     small(&mut f, 20);
     f.write(0, 1, true, 0);
     assert_eq!(came(&mut f, 1), [(21, 0)]);
+}
+
+#[test]
+fn a_cork_holds_parts_until_it_goes() {
+    let corked = Push {
+        cork: true,
+        ..PLAIN
+    };
+    let mut f = flows();
+    f.set_cork(0, true, 0);
+    write(&mut f, 0, 100, corked, 0);
+    write(&mut f, 0, 100, corked, 0);
+    assert_eq!(came(&mut f, 1), []);
+    assert_eq!(f.wake(), Some(RTO));
+    f.set_cork(0, false, MS);
+    assert_eq!(came(&mut f, 1), [(200, MS)]);
+    // It waits for no longer than `MSG_MORE`'s timer, again each time.
+    f.set_cork(0, true, MS);
+    write(&mut f, 0, 100, corked, MS);
+    f.read(1, 200, MS);
+    assert_eq!(came(&mut f, 1), []);
+    f.advance(10 * RTO);
+    let arrived = came(&mut f, 1);
+    assert_eq!(arrived.iter().map(|&(len, _)| len).sum::<u64>(), 100);
+    // `TCP_NODELAY` lets go once what it holds, and no more.
+    write(&mut f, 0, 10, corked, 20 * RTO);
+    assert_eq!(came(&mut f, 1), []);
+    f.set_no_delay(0, true, 20 * RTO);
+    assert_eq!(came(&mut f, 1), [(10, 20 * RTO)]);
+    let both = Push {
+        no_delay: true,
+        ..corked
+    };
+    write(&mut f, 0, 20, both, 20 * RTO);
+    assert_eq!(came(&mut f, 1), []);
+    f.set_cork(0, false, 20 * RTO);
+    assert_eq!(came(&mut f, 1), [(20, 20 * RTO)]);
+    // Nagle's algorithm still holds what a cork let go.
+    let mut f = flows();
+    small(&mut f, 20);
+    assert_eq!(came(&mut f, 1), [(17, 0)]);
+    f.set_cork(0, true, 0);
+    f.set_cork(0, false, 0);
+    assert_eq!(came(&mut f, 1), []);
 }
 
 #[test]

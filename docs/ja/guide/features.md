@@ -2701,7 +2701,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     応じてハッシュを分け合い（`fib6_select_path`、`rt6_multipath_rebalance`）、名前空間ごとの
     乱数の鍵で、`fib_multipath_hash_policy` 0 と同じく送り元、宛先、フローラベル、
     プロトコルをハッシュします。ソケットのパケットは、結び付いたアドレス（なければ `::`）
-    で、フローラベルなしでハッシュします。答えは自分の引き当てで選ばれる端を通って返ります。
+    で、フローラベルなしでハッシュします。何にもバインドしていないソケットの送り元は、
+    そうして選んだホップのものです（`ip6_dst_lookup_tail`）。答えは自分の引き当てで選ばれる端を通って返ります。
     リスナーがバインドされている端があればそこを、リンクローカルのアドレスへはパケットが
     入った端を通ります（`inet6_csk_route_req`、`icmp6_send`）。
     端の `disable_ipv6` を 1 にすると、落ちるときと同じく IPv6 の経路とアドレスを失い、
@@ -2862,8 +2863,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`RTM_F_LOOKUP_TABLE` を付ければ、経路のあった表）、`fib_select_path` の選ぶ送り元、
     オンリンクで届くゲートウェイ、リクエストが指した `RTA_MARK`（0 なら付けません）、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
     -1 なら付けず、4 バイトより短ければ `ERANGE`）を持ちます。`0.0.0.0` は 127.0.0.1 から
-    ループバックへ向かいます。IPv6 の答えは、`ipv6_dev_get_saddr` の選ぶ送り元を
-    持ちます。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
+    ループバックへ向かいます。IPv6 の答えは、見つけたホップの送り元を持ちます。経路の優先する送り元、
+    なければ `ipv6_dev_get_saddr` がホップのデバイスで選ぶものです（`ip6_route_get_saddr`）。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
     ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら `EINVAL` です。
     `RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に合う項目はないので
     `EHOSTUNREACH` です）。
@@ -3490,7 +3491,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
@@ -3916,6 +3917,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     秒数で、`ps` はこれで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running`
     （`/proc/<pid>/stat` が `R` と示す実行中のスレッドの数で、読んでいるスレッドを含みます）、
     `procs_blocked 0`、0 が並ぶ `softirq` の行です。
+
+- `/proc/net` は `self/net` へのリンクです。`/proc/<pid>/net` とスレッドのものには、タスクの
+  ネットワーク名前空間のファイルがあります。名前は、そのときタスクが持つ名前空間から引き
+  （`get_proc_task_net`）、誰でも読めます。ゾンビのものは `ENOENT` で、そのディレクトリの一覧は
+  `EINVAL` です。開いたファイルは、開いたときの名前空間のままです。どれも 0444 で、ネットワーク
+  名前空間を持つユーザー名前空間のルート（ネットワーク名前空間を作ったときの対応によるもので、
+  なければ最初の名前空間のルート。`proc_net_ns_init`）のもので、読むためだけに開け（`EACCES`、`seq_open_net`）、
+  読むたびに作ります。
+  - `dev`（`dev_seq_show`）はデバイスで、カウンタは 0 です。`if_inet6`（`if6_seq_show`）は IPv6 の
+    アドレス、`route`（`fib_route_seq_show`）は IPv4 の main の表で、表がなければ空です。
+    `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
+    `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
+  - ほかの名前は、`--mount /:/` でも `ENOENT` です。ホストのソケットとデバイスは、ゲストの
+    ものではありません。
 
 - `/proc/sysvipc` には `msg`、`sem`、`shm` がこの順に並びます。どれも 64 ビットのカーネルでの
   Linux の `sysvipc_*_proc_show` と同じ形式です。
@@ -5484,6 +5499,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `SO_ACCEPTCONN`、`SO_KEEPALIVE`、`SO_REUSEADDR`、`SO_REUSEPORT`、`SO_SNDBUF`、
     `SO_RCVBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`SO_LINGER`、`SO_PRIORITY`、
     `SO_BROADCAST`、`SO_OOBINLINE`、`TCP_NODELAY`（ホストにも伝えます）、
+    `TCP_CORK`（ホストには伝えません）、
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
     `TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、`IP_TOS`、`IPV6_V6ONLY`。
     既定値と範囲の確かめ方は Linux と
@@ -5533,8 +5549,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     バイト、受け取ったバイト（ハンドシェイクと終わりを含む）、まだ送っていないバイト、
     セグメント、データを最後に送ってから・受け取ってからの時間を返します。ループバックの
     セグメントは Linux が送るとおりです。書き込みごとに 1 つですが、小さいものが確認応答を
-    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` の続きを
-    待つ間（201 ms まで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
+    待つ間（Nagle のアルゴリズム。`TCP_NODELAY` と緊急データを除く）や、`MSG_MORE` や `TCP_CORK` の続きを
+    待つ間（201 ms まで、または `TCP_CORK` を外すか `TCP_NODELAY` を設定するまで）は留まります。確認応答は、最初の 16 個はすぐに、その後は返事のデータと
     一緒に、または読んだとき、または 40 ms 後です（`TCP_QUICKACK` で選べます）。はじめは
     確認応答のないものを 10 個まで送れます。末尾の損失プローブは最後のものを送り直します。
     終わりは、その前に留まっていたデータと一緒に送ります。終わりの確認応答が来るまでは

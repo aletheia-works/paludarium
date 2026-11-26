@@ -355,6 +355,10 @@ pub(crate) struct Network {
     /// The user namespace that owns its network namespace, whose
     /// `CAP_NET_ADMIN` changes it; none for the first one's.
     owner: Option<Arc<crate::namespaces::Namespace>>,
+    /// Whose the files of its `/proc/net` are: that namespace's root as it
+    /// was mapped when the network namespace was made, else the first's
+    /// (`proc_net_ns_init`).
+    pub(crate) proc_owner: (u32, u32),
 }
 /// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
 /// `IFF_UP` and `IFF_RUNNING` while it is up.
@@ -391,6 +395,7 @@ impl Network {
             mctp: crate::mctp::Endpoints::default(),
             sockets: Mutex::default(),
             owner: None,
+            proc_owner: (0, 0),
         }
     }
     /// A new network namespace's network: only a loopback, down and without
@@ -400,6 +405,13 @@ impl Network {
         Self {
             isolated: true,
             owner: Some(Arc::clone(owner)),
+            proc_owner: {
+                use crate::users::Ids;
+                (
+                    owner.kernel_of(Ids::User, 0).unwrap_or(0),
+                    owner.kernel_of(Ids::Group, 0).unwrap_or(0),
+                )
+            },
             up: AtomicBool::new(false),
             ever_up: AtomicBool::new(false),
             addresses: Mutex::new(crate::interface::Addresses::isolated()),
@@ -1344,20 +1356,26 @@ impl Network {
         events.extend(fresh);
         events
     }
-    /// The address a connection or datagram to `to` on the loopback leaves
-    /// from at `now`: its route's preferred source.
-    pub(crate) fn source(&self, to: SocketAddr, now: Option<u64>) -> IpAddr {
-        self.source_through(to, 0, now)
-    }
-    /// [`Self::source`] of a packet through the device `oif` (any for 0):
-    /// for IPv4, as `ip_route_output_key_hash_rcu` takes it with a device
-    /// named, an address of the device's (`inet_select_addr`) of link
-    /// scope to a local group or the limited broadcast address, of any
-    /// scope to another group, and to an address no route through it
-    /// takes, on link; else its route's; 0.0.0.0 for none of these. For IPv6, its route's through the
-    /// device (`ip6_route_get_saddr`), looked up strictly, as no source is
-    /// chosen yet.
-    pub(crate) fn source_through(&self, to: SocketAddr, oif: u32, now: Option<u64>) -> IpAddr {
+    /// The address a packet to `to` of the protocol `proto` leaves from at
+    /// `now`, from a socket bound to none: its route's source.
+    ///
+    /// For IPv4 through a device `oif` other than 0, as
+    /// `ip_route_output_key_hash_rcu` takes it with a device named: an
+    /// address of the device's (`inet_select_addr`) of link scope to a local
+    /// group or the limited broadcast address, of any scope to another
+    /// group, and to an address no route through it takes, on link; else
+    /// its route's; 0.0.0.0 for none of these.
+    ///
+    /// For IPv6, its route's through the device, if one is named
+    /// (`ip6_route_get_saddr`), looked up strictly, as no source is chosen
+    /// yet; of a multipath route, the source of the hop the packet takes.
+    pub(crate) fn source_through(
+        &self,
+        to: SocketAddr,
+        oif: u32,
+        proto: u8,
+        now: Option<u64>,
+    ) -> IpAddr {
         use crate::interface::{SCOPE_LINK, SCOPE_UNIVERSE};
         let order = self.devices().order();
         let addresses = self.addresses_at(now);
@@ -1378,7 +1396,8 @@ impl Network {
             return IpAddr::V4(picked.unwrap_or(Ipv4Addr::UNSPECIFIED));
         }
         if let IpAddr::V6(ip) = to.ip() {
-            return IpAddr::V6(addresses.source6_through(ip, oif, &order));
+            let flow = Self::flow6(None, proto);
+            return IpAddr::V6(addresses.source6_through(ip, oif, &flow, &order));
         }
         addresses.source(to.ip(), &order)
     }
@@ -1995,6 +2014,7 @@ struct Options {
     receive_timeout: Timeout,
     send_timeout: Timeout,
     no_delay: bool,
+    cork: bool,
     keep_idle: i32,
     keep_interval: i32,
     keep_count: i32,
@@ -2062,6 +2082,7 @@ impl Default for Options {
             receive_timeout: Timeout::Forever,
             send_timeout: Timeout::Forever,
             no_delay: false,
+            cork: false,
             keep_idle: 7200,
             keep_interval: 75,
             keep_count: 9,
@@ -2498,7 +2519,10 @@ impl InetSocket {
             return self.send_datagram(bytes, to, ids);
         }
         self.settle();
-        let no_delay = self.options().no_delay;
+        let (no_delay, cork) = {
+            let options = self.options();
+            (options.no_delay, options.cork)
+        };
         let mut s = self.lock();
         s.note();
         let Some(stream) = s.stream.clone() else {
@@ -2510,7 +2534,12 @@ impl InetSocket {
         // `SOCKWQ_ASYNC_NOSPACE`.
         let was_open = stream.phase() == Phase::Open;
         if let Some((link, side)) = Self::joined(&s) {
-            link.sending(side, Push { no_delay, ..push });
+            let push = Push {
+                no_delay,
+                cork,
+                ..push
+            };
+            link.sending(side, push);
         }
         let written = stream.write(bytes);
         if let Ok(n) = written
@@ -2651,7 +2680,7 @@ impl InetSocket {
                                 // to the address the connection leaves from.
                                 let from = match s.bound.map(|b| b.ip()).or(s.address) {
                                     Some(ip) if !ip.is_unspecified() => ip,
-                                    _ => self.network.source(to, self.now()),
+                                    _ => self.network.source_through(to, 0, FLOW_TCP, self.now()),
                                 };
                                 self.network.output(from, self.now());
                                 return self.refused(&mut s, address);
@@ -3049,7 +3078,7 @@ impl InetSocket {
             if group && !address.is_unspecified() {
                 IpAddr::V4(address)
             } else {
-                self.network.source_through(to, oif, self.now())
+                self.network.source_through(to, oif, FLOW_UDP, self.now())
             }
         } else {
             bound.ip()
@@ -4227,7 +4256,9 @@ impl InetSocket {
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
-        let source = self.network.source_through(to, options.device, self.now());
+        let source = self
+            .network
+            .source_through(to, options.device, FLOW_TCP, self.now());
         let mut ports = self.ports();
         // One bound to a broadcast or multicast address takes its route's
         // source as its name too (`tcp_v4_connect`:
@@ -5561,7 +5592,7 @@ fn set_multicast4(
 }
 /// `setsockopt` of an inet socket: the `SOL_SOCKET` options a client sets,
 /// `IPPROTO_TCP`'s `TCP_NODELAY`, keepalive timing (1 to 32767 seconds, at
-/// most 127 probes), `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
+/// most 127 probes), `TCP_CORK`, `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
 /// `IPV6_V6ONLY`, and the filter options (`SO_ATTACH_FILTER`,
 /// `SO_DETACH_FILTER`, `SO_LOCK_FILTER` and `SO_ATTACH_BPF`, as
 /// [`crate::sockets::set_filter`] takes them), and the device the socket
@@ -5731,7 +5762,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             socket.options().linger = (on != 0).then_some(seconds);
         }
         (1, 2 | 6 | 7 | 8 | 9 | 10 | 12 | 15 | 62)
-        | (6, 1 | 4 | 5 | 6 | 12 | 18)
+        | (6, 1 | 3 | 4 | 5 | 6 | 12 | 18)
         | (0, 1)
         | (41, 26) => {
             let value = option_int(c, at, len)?;
@@ -5774,6 +5805,13 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     }
                     if let Some((link, side)) = InetSocket::joined(&s) {
                         link.set_no_delay(side, value != 0);
+                    }
+                }
+                (6, 3) => {
+                    options.cork = value != 0;
+                    let s = socket.lock();
+                    if let Some((link, side)) = InetSocket::joined(&s) {
+                        link.set_cork(side, value != 0);
                     }
                 }
                 (6, 4 | 5) if !(1..=32767).contains(&value) => return Err(Errno::EINVAL),
@@ -5970,6 +6008,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     Family::V6 => AF_INET6,
                 }),
                 (6, 1) => i32::from(options.no_delay),
+                (6, 3) => i32::from(options.cork),
                 (6, 4) => options.keep_idle,
                 (6, 5) => options.keep_interval,
                 (6, 6) => options.keep_count,

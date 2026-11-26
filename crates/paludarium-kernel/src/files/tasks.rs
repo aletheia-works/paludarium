@@ -1023,6 +1023,7 @@ pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errn
             );
         }
         TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
+        TaskEntry::NetLink => Some(b"self/net".to_vec()),
         TaskEntry::Exe => task.holds().then(|| task.view.group.executable()),
         TaskEntry::Cwd => task.holds().then(|| task.public.files.cwd()).flatten(),
         TaskEntry::Root => task.holds().then(|| task.public.files.root()).flatten(),
@@ -1050,6 +1051,32 @@ pub(super) fn namespace(
         })
 }
 
+/// `net/<file>` of the task, opened with `flags`, of the network its
+/// namespace has then (`get_proc_task_net`); `ENOENT` once it has none, and
+/// `EACCES` to write (`seq_open_net`), which `O_PATH` does not ask.
+pub(super) fn net_file(
+    c: &Context<'_>,
+    task: &Task,
+    file: crate::proc_net::File,
+    (flags, stat): (u32, FileStat),
+) -> Result<std::sync::Arc<dyn paludarium_host::FileHandle>, Errno> {
+    let namespace = namespace(task, crate::namespaces::Entry::Net).ok_or(Errno::ENOENT)?;
+    const O_DIRECTORY: u32 = 0o200000;
+    if flags & O_DIRECTORY != 0 {
+        return Err(Errno::ENOTDIR);
+    }
+    if flags & 3 != 0 && flags & super::O_PATH == 0 {
+        return Err(Errno::EACCES);
+    }
+    // The first one's is the session's, if it has one.
+    let network = namespace.sockets.network.get().cloned();
+    let network = network.or_else(|| c.files.network.clone());
+    let host = std::sync::Arc::clone(c.shared_host);
+    let now = move || host.clock(paludarium_host::ClockId::Monotonic).ok();
+    let file = file.open(network, now, flags, (stat.uid, stat.gid));
+    Ok(std::sync::Arc::new(file))
+}
+
 /// The `stat` of the entry, with its device and block size; a link is
 /// followed to its file when `follow` is set. `None` for a missing entry.
 pub(super) fn stat(
@@ -1062,6 +1089,28 @@ pub(super) fn stat(
     let stat = match entry {
         TaskEntry::Directory | TaskEntry::Threads => crate::proc::directory_stat(),
         TaskEntry::ThreadLink if follow => crate::proc::directory_stat(),
+        TaskEntry::Net => crate::proc::directory_stat(),
+        TaskEntry::NetLink if follow => crate::proc::directory_stat(),
+        // Root's, as Linux's `proc_symlink` makes it.
+        TaskEntry::NetLink => {
+            let stat = FileStat {
+                size: b"self/net".len() as u64,
+                ..crate::proc::self_link_stat()
+            };
+            return Ok((stat, device(c, path), SMALL_BLOCK_SIZE));
+        }
+        TaskEntry::BelowNetFile => return Err(Errno::ENOTDIR),
+        TaskEntry::NetFile(_) => {
+            let net = namespace(task, crate::namespaces::Entry::Net).ok_or(Errno::ENOENT)?;
+            let network = net.sockets.network.get();
+            let (uid, gid) = network.map_or((0, 0), |network| network.proc_owner);
+            let stat = FileStat {
+                uid,
+                gid,
+                ..crate::proc::entry_stat()
+            };
+            return Ok((stat, device(c, path), SMALL_BLOCK_SIZE));
+        }
         TaskEntry::ThreadLink => crate::proc::self_link_stat(),
         TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root if follow => {
             check(c, task, entry)?;
@@ -1160,8 +1209,8 @@ fn listing(names: impl IntoIterator<Item = (Vec<u8>, u8)>) -> Vec<DirectoryEntry
         .collect()
 }
 
-/// The entries of a process's or a thread's directory, of `task`, or of
-/// `ns`.
+/// The entries of a process's or a thread's directory, of `task`, of `ns`,
+/// or of `net`.
 pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
     match entry {
         TaskEntry::Namespaces => listing(
@@ -1199,6 +1248,11 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
                     .map(|tid| (tid.to_string().into_bytes(), DT_DIR)),
             )
         }
+        TaskEntry::Net => listing(
+            crate::proc_net::File::ALL
+                .into_iter()
+                .map(|file| (file.name().to_vec(), DT_REG)),
+        ),
         _ => listing(
             crate::proc::TASK_NAMES
                 .into_iter()
@@ -1209,10 +1263,11 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
 }
 
 /// The names /proc generates at its top, with their types.
-const ROOT_NAMES: [(&[u8], u8); 10] = [
+const ROOT_NAMES: [(&[u8], u8); 11] = [
     (b"self", DT_LNK),
     (b"thread-self", DT_LNK),
     (b"mounts", DT_LNK),
+    (b"net", DT_LNK),
     (b"loadavg", DT_REG),
     (b"locks", DT_REG),
     (b"meminfo", DT_REG),

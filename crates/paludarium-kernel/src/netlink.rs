@@ -4308,7 +4308,8 @@ fn lookup(
         attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
         attribute(&mut body, RTA_DST, &address6);
         attribute(&mut body, RTA_SRC, &source6);
-        if let Some(source) = addresses.source6(&route, ip) {
+        let order = network.devices().order();
+        if let Some(source) = addresses.route_source6(&route, ip, &order) {
             attribute(&mut body, RTA_PREFSRC, &source.octets());
         }
         if let Some(source) = route.prefsrc {

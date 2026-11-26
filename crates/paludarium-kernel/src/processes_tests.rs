@@ -4615,6 +4615,80 @@ mod shm {
         assert_eq!(&beneath[..5], b"host\n");
     }
 
+    /// The same of `/proc/net`: a guest sees its own namespace's files, and
+    /// no other name, whatever the host's has there.
+    #[test]
+    fn proc_net_shows_the_namespace_not_a_mounted_one() {
+        const PATH: u64 = DATA + 0x900;
+        let (mut k, mut t, m) = setup();
+        let fs = k.files.fs();
+        for directory in [
+            &b"/proc"[..],
+            b"/proc/net",
+            b"/proc/self",
+            b"/proc/self/net",
+        ] {
+            match fs.mkdir(directory, 0o755) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        for path in [
+            &b"/proc/net/tcp"[..],
+            b"/proc/net/dev",
+            b"/proc/self/net/unix",
+        ] {
+            let file = fs.open(path, 0o102, 0o644).unwrap();
+            file.write(b"host\n").unwrap();
+        }
+        for directory in ["net", "self/net", "thread-self/net"] {
+            let dev = read_proc(&mut k, &mut t, &m, &format!("/proc/{directory}/dev"));
+            assert!(dev.starts_with("Inter-|   Receive"), "{dev}");
+            for name in ["tcp", "unix", "stat/arp_cache"] {
+                m.write(
+                    GuestAddr(PATH),
+                    format!("/proc/{directory}/{name}\0").as_bytes(),
+                )
+                .unwrap();
+                // `open`, `stat` and `access`.
+                for (number, b) in [(2, 0), (4, DATA + 0xa00), (21, 0)] {
+                    assert_eq!(
+                        syscall(&mut k, &mut t, &m, number, [PATH, b, 0, 0, 0, 0]),
+                        Errno::ENOENT.to_syscall_return(),
+                        "{directory}/{name}"
+                    );
+                }
+            }
+        }
+        // A link to `self/net`.
+        m.write(GuestAddr(PATH), b"/proc/net\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 89, [PATH, DATA + 0xa00, 64, 0, 0, 0]),
+            8
+        );
+        let mut link = [0; 8];
+        m.read(GuestAddr(DATA + 0xa00), &mut link).unwrap();
+        assert_eq!(&link, b"self/net");
+        // The directory lists the files there are.
+        let fd = syscall(&mut k, &mut t, &m, 2, [PATH, 0o200000, 0, 0, 0, 0]);
+        let n = syscall(&mut k, &mut t, &m, 217, [fd, DATA + 0xa00, 0x400, 0, 0, 0]);
+        let mut listed = vec![0; n as usize];
+        m.read(GuestAddr(DATA + 0xa00), &mut listed).unwrap();
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < listed.len() {
+            let size = usize::from(u16::from_le_bytes([listed[at + 16], listed[at + 17]]));
+            let name = &listed[at + 19..at + size];
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            names.push(String::from_utf8(name[..end].to_vec()).unwrap());
+            at += size;
+        }
+        assert_eq!(
+            names,
+            [".", "..", "arp", "dev", "route", "if_inet6", "ipv6_route"]
+        );
+    }
+
     #[test]
     fn proc_sysvipc_lists_the_namespace_s_objects_as_linux_prints_them() {
         let (mut k, mut t, m) = setup();

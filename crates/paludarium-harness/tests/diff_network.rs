@@ -205,6 +205,10 @@ mod linux {
         case("listen-io-uring");
     }
     #[test]
+    fn network_tcp_cork() {
+        case("tcp-cork");
+    }
+    #[test]
     fn network_listen_errors() {
         case("listen-errors");
     }

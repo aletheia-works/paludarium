@@ -261,6 +261,7 @@ mod linux {
                     | "msg"
                     | "ipc-sysctl"
                     | "sysvipc-proc"
+                    | "proc-net"
                     | "kernel-sysctl"
                     | "uts-sysctl"
                     | "uts-sysctl-poll"
@@ -424,6 +425,7 @@ mod linux {
                     | "veth-ipv4-hash"
                     | "veth-answers"
                     | "veth-ipv4-via"
+                    | "veth-ipv6-source"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-multicast"
@@ -672,6 +674,7 @@ mod linux {
         veth_ipv4_hash => ("veth-ipv4-hash","veth-ipv4-hash"),
         veth_answers => ("veth-answers","veth-answers"),
         veth_ipv4_via => ("veth-ipv4-via","veth-ipv4-via"),
+        veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_multicast => ("veth-multicast","veth-multicast"),
@@ -680,6 +683,7 @@ mod linux {
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
         veth_ipv6_scope => ("veth-ipv6-scope","veth-ipv6-scope"),
         veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
+        proc_net => ("proc-net","proc-net"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

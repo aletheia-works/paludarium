@@ -3125,10 +3125,11 @@ kernel.
     namespace's own random key, as `fib_multipath_hash_policy` 0 hashes
     the source, the destination, the flow label and the protocol; a
     socket's packets hash as it is bound, `::` unbound, with no flow
-    label. An answer goes back by a lookup of its own, through whichever
-    end that takes: the one its listener is bound to, or to a link-local
-    address the one the packet came in on (`inet6_csk_route_req`,
-    `icmp6_send`). Turning `disable_ipv6` on for an end
+    label, and one unbound takes the source of the hop that gives
+    (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
+    through whichever end that takes: the one its listener is bound to, or
+    to a link-local address the one the packet came in on
+    (`inet6_csk_route_req`, `icmp6_send`). Turning `disable_ipv6` on for an end
     takes its IPv6 routes and addresses as going down does; off again,
     while it is up, makes them as coming up does (`dev_disable_change`).
     Going down, it loses its IPv6 routes, told of in the order of a dump,
@@ -3321,8 +3322,9 @@ kernel.
     request names (none for 0), and the caller's
     `RTA_UID` (or the one the request names, as it is; none for -1, and
     `ERANGE` for one shorter than 4 bytes); `0.0.0.0` goes to the loopback
-    from 127.0.0.1. An IPv6 answer names the source `ipv6_dev_get_saddr`
-    picks. Where no route goes it is `ENETUNREACH`, and `AF_UNSPEC`
+    from 127.0.0.1. An IPv6 answer names the found hop's source: the
+    route's preferred one, else the one `ipv6_dev_get_saddr` picks on the
+    hop's device (`ip6_route_get_saddr`). Where no route goes it is `ENETUNREACH`, and `AF_UNSPEC`
     `EOPNOTSUPP`; a destination shorter than its family's address is
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
@@ -4052,7 +4054,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 
 - The other `/proc` entries are `/proc/loadavg`, `/proc/locks` (above),
-  `/proc/meminfo`, `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
+  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
@@ -4551,6 +4553,23 @@ kernel.
     time; `processes`, the IDs handed out; `procs_running`, the threads
     running as `/proc/<pid>/stat` shows them (`R`), the reader included;
     `procs_blocked 0`; and a `softirq` line of zeros.
+
+- `/proc/net` is a link to `self/net`; `/proc/<pid>/net`, and a thread's,
+  holds the files of the task's network namespace, whose names are looked
+  up in the one it has then (`get_proc_task_net`), by any reader: `ENOENT`
+  for a zombie's, whose directory lists nothing (`EINVAL`). A file open stays
+  with the namespace it was opened in. Each is 0444 and the root's of the
+  user namespace that owns the network namespace, as that mapped it when
+  the network namespace was made, else the first's (`proc_net_ns_init`),
+  opens for reading only (`EACCES`, `seq_open_net`), and is made as it is
+  read:
+  - `dev` (`dev_seq_show`), the devices, with counters of 0; `if_inet6`
+    (`if6_seq_show`), the IPv6 addresses; `route` (`fib_route_seq_show`),
+    IPv4's main table, nothing while there is none; `ipv6_route`
+    (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
+    and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - Any other name there is `ENOENT`, with `--mount /:/` too: the host's
+    sockets and devices are not the guest's.
 
 - `/proc/sysvipc` holds `msg`, `sem` and `shm`, listed in that order, each in
   the format of Linux's `sysvipc_*_proc_show` on a 64-bit kernel.
@@ -6386,8 +6405,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_ACCEPTCONN`, `SO_KEEPALIVE`, `SO_REUSEADDR`, `SO_REUSEPORT`,
     `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_LINGER`,
     `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
-    the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
-    `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
+    the host), `TCP_CORK` (which does not), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
+    `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
     with Linux's defaults and
     range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
     `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
@@ -6442,7 +6461,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     and the times since data went and came. On the loopback the segments are
     those Linux sends: each write its own, held while a small one waits for
     its acknowledgement (Nagle's algorithm, unless `TCP_NODELAY` or urgent
-    data) or for `MSG_MORE`'s next (up to 201 ms); the first 16
+    data) or for what `MSG_MORE` or `TCP_CORK` says comes next (up to
+    201 ms, or until the cork is cleared or `TCP_NODELAY` set); the first 16
     acknowledgements at once, then with the data a side replies with, on a
     read, or after 40 ms (`TCP_QUICKACK` sets which); at most 10 in flight
     at first; a tail loss probe, which sends the last again; and the end,

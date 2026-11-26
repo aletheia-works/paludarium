@@ -2658,6 +2658,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `RTA_MULTIPATH` のある削除はそのホップを順に一つずつ比べます（`fib_nh_match`）。
     引き当ては、フローのハッシュが落ちるホップを取ります。生きているホップは
     それぞれ重みに応じてハッシュを分け合います（`fib_select_multipath`、`fib_rebalance`）。
+    `net.ipv4.fib_multipath_use_neigh` が 1 のときは、リンクスコープの経路で届く
+    ゲートウェイの、ホップのデバイスの近隣が有効でないホップを飛ばします（`fib_good_nh`）。
+    飛ばしたホップの分け前はそのままで、すべてを飛ばせば生きている最初のホップを取ります。
     ハッシュするのは `net.ipv4.fib_multipath_hash_policy` が決めるもので
     （`fib_multipath_hash`）、送り元と宛先（0 と 2）、それにプロトコルとポートを
     加えたもの（1）、`fib_multipath_hash_fields` が挙げるフィールド（3）です。
@@ -3974,8 +3977,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
   `ipv6/conf/<デバイス>/accept_dad`、`disable_ipv6`、`forwarding`、
-  `ipv4/fib_multipath_hash_seed`、`ipv4` と `ipv6` それぞれの `fib_multipath_hash_policy` と
-  `fib_multipath_hash_fields` です。ファイルとディレクトリは、
+  `ipv4/fib_multipath_hash_seed`、`ipv4/fib_multipath_use_neigh`、`ipv4` と `ipv6` それぞれの
+  `fib_multipath_hash_policy` と `fib_multipath_hash_fields` です。ファイルとディレクトリは、
   ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
   書き込みで開けるのは、root と、その名前空間への `CAP_NET_ADMIN` を持つものです
   （`net_ctl_permissions`。開けなければ `EACCES`、書き込みのときに書けなければ
@@ -4011,7 +4014,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `fib_multipath_hash_policy` は 0 から 3（`proc_dou8vec_minmax`）、
     `fib_multipath_hash_fields` は 1 から 0xfff（`proc_douintvec_minmax`）を同じように取り、
     その外は `EINVAL` です。新しい名前空間では、ファミリーごとにポリシー 0、フィールド 7
-    （送り元、宛先、プロトコル）です。
+    （送り元、宛先、プロトコル）です。`fib_multipath_use_neigh` は同じように 0 か 1 を取り
+    （`proc_dou8vec_minmax`）、新しい名前空間では 0 です。
   - リンクの `IFLA_AF_SPEC` の IPv4 と IPv6 の設定にこれらが出ます。IPv6 は
     `disable_ipv6` が切れているときだけ準備ができています。
 

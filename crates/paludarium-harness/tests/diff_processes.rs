@@ -434,6 +434,7 @@ mod linux {
                     | "veth-ipv6-source"
                     | "veth-hash-seed"
                     | "veth-hash-policy"
+                    | "veth-use-neigh"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-unicast-if"
@@ -688,6 +689,7 @@ mod linux {
         veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
         veth_hash_seed => ("veth-hash-seed","veth-hash-seed"),
         veth_hash_policy => ("veth-hash-policy","veth-hash-policy"),
+        veth_use_neigh => ("veth-use-neigh","veth-use-neigh"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_unicast_if => ("veth-unicast-if","veth-unicast-if"),

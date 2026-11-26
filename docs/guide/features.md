@@ -3071,7 +3071,12 @@ kernel.
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
     hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
     flow falls to, each hop living taking a share of the hashes by its
-    weight (`fib_select_multipath`, `fib_rebalance`). The hash is of what
+    weight (`fib_select_multipath`, `fib_rebalance`). With
+    `net.ipv4.fib_multipath_use_neigh` 1, it passes over a hop whose
+    gateway, reached by a route of link scope, has a neighbour on the
+    hop's device that is not valid (`fib_good_nh`), the hop keeping its
+    share, and takes the first hop living where it passes over all. The
+    hash is of what
     `net.ipv4.fib_multipath_hash_policy` names (`fib_multipath_hash`): the
     source and destination (0 and 2); those, the protocol and the ports
     (1); or the fields `fib_multipath_hash_fields` names (3). An
@@ -4627,8 +4632,9 @@ kernel.
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
   `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`,
-  `ipv4/fib_multipath_hash_seed`, and `fib_multipath_hash_policy` and
-  `fib_multipath_hash_fields` of `ipv4` and of `ipv6`. They and their
+  `ipv4/fib_multipath_hash_seed`, `ipv4/fib_multipath_use_neigh`, and
+  `fib_multipath_hash_policy` and `fib_multipath_hash_fields` of `ipv4`
+  and of `ipv6`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write
@@ -4670,6 +4676,8 @@ kernel.
     `fib_multipath_hash_fields`, of 1 to 0xfff (`proc_douintvec_minmax`),
     `EINVAL` past them; a new namespace has policy 0 and fields 7 (the
     source, the destination and the protocol), each family its own.
+    `fib_multipath_use_neigh` takes 0 or 1 so (`proc_dou8vec_minmax`), 0
+    in a new namespace.
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
 

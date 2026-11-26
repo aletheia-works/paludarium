@@ -1355,6 +1355,9 @@ pub(crate) struct Addresses {
     pub multipath4: crate::multipath::Policy,
     /// IPv6's.
     pub multipath6: crate::multipath::Policy,
+    /// IPv4's `fib_multipath_use_neigh`: a multipath route's lookups pass
+    /// over a hop whose gateway's neighbour is not valid ([`Self::path4`]).
+    pub use_neigh4: bool,
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -1404,6 +1407,7 @@ impl Addresses {
             multipath_seed: crate::multipath::Seed::default(),
             multipath4: crate::multipath::Policy::default(),
             multipath6: crate::multipath::Policy::default(),
+            use_neigh4: false,
         }
     }
     /// A packet goes out through the loopback to `next` at `now`, as
@@ -3849,7 +3853,9 @@ impl Addresses {
     /// multipath one the next hop `fib_select_multipath` takes by the hash
     /// the namespace's policy takes of them (`fib_multipath_hash`): each hop
     /// takes the share of the hashes its weight gives it, in their order, a
-    /// dead one none (`fib_rebalance`). One whose device's own source
+    /// dead one none (`fib_rebalance`). With `fib_multipath_use_neigh`,
+    /// one that is not good ([`Self::good_hop4`]) is passed over, keeping
+    /// its share. One whose device's own source
     /// ([`Self::select4`], `nh_saddr`) is `src` comes before the others,
     /// then the first that takes the hash; with no `src`, and for a
     /// forwarded packet (no `order`), only the hash counts.
@@ -3876,6 +3882,9 @@ impl Addresses {
         let mut best: Option<(u8, Hop4)> = None;
         for &hop in matched.hops.iter().filter(|h| !h.dead) {
             weight += u64::from(hop.weight);
+            if self.use_neigh4 && !self.good_hop4(hop) {
+                continue;
+            }
             // `fib_rebalance`: `DIV_ROUND_CLOSEST_ULL(weight << 31, total)
             // - 1`, the last hash the hop takes.
             let takes = hash < ((weight << 31) + total / 2) / total;
@@ -3896,6 +3905,24 @@ impl Addresses {
             Some((_, hop)) => matched.through(hop),
             None => matched,
         }
+    }
+    /// Whether a hop is good as `fib_good_nh` finds it: one whose gateway
+    /// is reached by a route of link scope (`RT_SCOPE_LINK`) is good while
+    /// its device has no neighbour keyed by it or one of a valid state
+    /// (`NUD_VALID`); any other hop is. A loopback's IPv4 neighbour is
+    /// keyed by `0.0.0.0` (`arp_constructor`), and all of a loopback's are
+    /// `NUD_NOARP`, so a hop through it is good.
+    fn good_hop4(&self, hop: Hop4) -> bool {
+        let Some(gateway) = hop.gateway.filter(|_| hop.uses_gateway) else {
+            return true;
+        };
+        let Ok(index) = i32::try_from(hop.oif) else {
+            return true;
+        };
+        self.neighbours
+            .iter()
+            .find(|n| n.index == index && n.ip == gateway)
+            .is_none_or(|n| n.state & NUD_VALID != 0)
     }
     /// Whether a packet in on `lo` from `src` may come, as
     /// `fib_validate_source` checks it with reverse path filtering off, as
@@ -6411,5 +6438,53 @@ mod tests {
             told(&a.expire(SECOND + 1)),
             ["-route 254 2001:db8:8::/64 Unicast 256"]
         );
+    }
+
+    #[test]
+    fn a_hop_is_good_while_its_gateways_neighbour_is_valid_or_none() {
+        let mut a = Addresses::isolated();
+        let four = Ipv4Addr::new(10, 0, 0, 2);
+        let six: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let hop = |gateway: Option<IpAddr>, uses_gateway| Hop4 {
+            gateway,
+            oif: 1000,
+            onlink: false,
+            linkdown: false,
+            dead: false,
+            uses_gateway,
+            weight: 1,
+        };
+        let through4 = hop(Some(IpAddr::V4(four)), true);
+        let through6 = hop(Some(IpAddr::V6(six)), true);
+        assert!(a.good_hop4(through4) && a.good_hop4(through6));
+        a.neighbours
+            .push(Neighbour::arp(1000, four, RTN_UNICAST, 0, 0));
+        a.neighbours.push(Neighbour::nd(1000, six, 0, 0));
+        // `NUD_NONE`, as made.
+        assert!(!a.good_hop4(through4) && !a.good_hop4(through6));
+        // Not of link scope, or with no gateway: no neighbour is looked up.
+        assert!(a.good_hop4(hop(Some(IpAddr::V4(four)), false)));
+        assert!(a.good_hop4(hop(None, false)));
+        // Another device's neighbour is not this hop's.
+        assert!(a.good_hop4(Hop4 {
+            oif: 1002,
+            ..through4
+        }));
+        for (state, good) in [
+            (NUD_INCOMPLETE, false),
+            (NUD_FAILED, false),
+            (NUD_REACHABLE, true),
+            (NUD_STALE, true),
+            (NUD_DELAY, true),
+            (NUD_PROBE, true),
+            (NUD_NOARP, true),
+            (NUD_PERMANENT, true),
+        ] {
+            for n in &mut a.neighbours {
+                n.state = state;
+            }
+            assert_eq!(a.good_hop4(through4), good, "{state:#x}");
+            assert_eq!(a.good_hop4(through6), good, "{state:#x}");
+        }
     }
 }

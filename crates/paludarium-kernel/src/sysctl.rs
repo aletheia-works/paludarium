@@ -138,7 +138,7 @@ impl Directory {
 /// A file of `/proc/sys/net`, of the caller's network namespace
 /// ([`crate::netconf`]): `ipv4/fib_multipath_hash_seed`, and each family's
 /// `fib_multipath_hash_policy` and `fib_multipath_hash_fields`
-/// ([`crate::multipath`]), `ipv4/ip_forward` (`all`'s forwarding),
+/// ([`crate::multipath`]), `ipv4/fib_multipath_use_neigh`, `ipv4/ip_forward` (`all`'s forwarding),
 /// `ipv4/conf/<device>/forwarding` and `rp_filter`, and
 /// `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +150,8 @@ pub(crate) enum Net {
     HashPolicy(bool),
     /// `fib_multipath_hash_fields`, IPv6's where `true`.
     HashFields(bool),
+    /// `fib_multipath_use_neigh`.
+    UseNeigh,
     Forwarding(Target),
     RpFilter(Target),
     DisableIpv6(Target),
@@ -673,6 +675,7 @@ fn net_entry(rest: &[u8], network: &crate::inet::Network) -> Option<Entry> {
         b"/ipv4/fib_multipath_hash_fields" => return Some(Entry::Net(Net::HashFields(false))),
         b"/ipv4/fib_multipath_hash_policy" => return Some(Entry::Net(Net::HashPolicy(false))),
         b"/ipv4/fib_multipath_hash_seed" => return Some(Entry::Net(Net::HashSeed)),
+        b"/ipv4/fib_multipath_use_neigh" => return Some(Entry::Net(Net::UseNeigh)),
         b"/ipv6/fib_multipath_hash_fields" => return Some(Entry::Net(Net::HashFields(true))),
         b"/ipv6/fib_multipath_hash_policy" => return Some(Entry::Net(Net::HashPolicy(true))),
         b"/ipv4/ip_forward" => return Some(Entry::Net(Net::IpForward)),
@@ -798,6 +801,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
             (b"fib_multipath_hash_fields", DT_REG),
             (b"fib_multipath_hash_policy", DT_REG),
             (b"fib_multipath_hash_seed", DT_REG),
+            (b"fib_multipath_use_neigh", DT_REG),
             (b"ip_forward", DT_REG),
         ],
         Directory::Ipv6 => vec![
@@ -897,6 +901,7 @@ fn child(
             b"fib_multipath_hash_fields" => Some(Entry::Net(Net::HashFields(false))),
             b"fib_multipath_hash_policy" => Some(Entry::Net(Net::HashPolicy(false))),
             b"fib_multipath_hash_seed" => Some(Entry::Net(Net::HashSeed)),
+            b"fib_multipath_use_neigh" => Some(Entry::Net(Net::UseNeigh)),
             b"ip_forward" => Some(Entry::Net(Net::IpForward)),
             _ => None,
         },
@@ -1241,6 +1246,7 @@ fn net_line(network: &crate::inet::Network, file: Net) -> Vec<u8> {
         Net::HashSeed => addresses.multipath_seed.user,
         Net::HashPolicy(v6) => u32::from(policy(v6).policy),
         Net::HashFields(v6) => policy(v6).fields,
+        Net::UseNeigh => u32::from(addresses.use_neigh4),
         _ => {
             drop(addresses);
             return line(net_value(network, file));
@@ -1253,7 +1259,11 @@ fn net_line(network: &crate::inet::Network, file: Net) -> Vec<u8> {
 /// device it no longer has.
 fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
     let target = match file {
-        Net::IpForward | Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) => Target::All,
+        Net::IpForward
+        | Net::HashSeed
+        | Net::HashPolicy(_)
+        | Net::HashFields(_)
+        | Net::UseNeigh => Target::All,
         Net::Forwarding(target)
         | Net::RpFilter(target)
         | Net::DisableIpv6(target)
@@ -1264,7 +1274,7 @@ fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
         return 0;
     };
     match file {
-        Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) => 0,
+        Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) | Net::UseNeigh => 0,
         Net::IpForward | Net::Forwarding(_) => conf4.forwarding,
         Net::RpFilter(_) => conf4.rp_filter,
         Net::DisableIpv6(_) => conf6.disable_ipv6,
@@ -1476,7 +1486,9 @@ impl NetFile {
     ///   an unsigned `int`, and the rest with it, as
     ///   `proc_douintvec_minmax` does ([`parse_uint`]); so do
     ///   `fib_multipath_hash_policy` (0 to 3, `proc_dou8vec_minmax`) and
-    ///   `fib_multipath_hash_fields` (1 to 0xfff), `EINVAL` out of range.
+    ///   `fib_multipath_hash_fields` (1 to 0xfff), and
+    ///   `fib_multipath_use_neigh` (0 or 1, `proc_dou8vec_minmax`),
+    ///   `EINVAL` out of range.
     /// - `rp_filter` (`devinet_conf_proc`) takes one so, and marks the
     ///   device as set whatever comes of it.
     /// - IPv6's (`addrconf_sysctl_disable`, `addrconf_sysctl_forward`) take
@@ -1529,6 +1541,17 @@ impl NetFile {
                 } else {
                     return Err(Errno::EINVAL);
                 }
+                Ok(buf.len())
+            }
+            Net::UseNeigh => {
+                if *position != 0 {
+                    return advance(position, buf.len());
+                }
+                let value = parse_uint(buf)?;
+                if value > 1 {
+                    return Err(Errno::EINVAL);
+                }
+                self.network.addresses().use_neigh4 = value == 1;
                 Ok(buf.len())
             }
             Net::IpForward | Net::Forwarding(_) => {

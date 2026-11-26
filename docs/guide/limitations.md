@@ -1267,12 +1267,13 @@ verified.
   takes `accept_local`, `send_redirects`, `shared_media` and
   `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward`,
   `fib_multipath_hash_seed`, `fib_multipath_hash_policy`,
-  `fib_multipath_hash_fields` and the `forwarding`, `rp_filter`,
+  `fib_multipath_hash_fields`, `fib_multipath_use_neigh` and the
+  `forwarding`, `rp_filter`,
   `accept_dad` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
-  A write of `fib_multipath_hash_seed`, `fib_multipath_hash_policy` or
-  `fib_multipath_hash_fields` is taken whole and leaves the file where it
+  A write of `fib_multipath_hash_seed`, `fib_multipath_hash_policy`,
+  `fib_multipath_hash_fields` or `fib_multipath_use_neigh` is taken whole and leaves the file where it
   was, as Linux 7.0 to 7.2 do; master takes what it reads and
   moves the file on (`proc_vec`).
   IPv6's `forwarding` joins no router anycast address, and an end made

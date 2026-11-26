@@ -6635,7 +6635,7 @@ pub(crate) fn dispatch(
             Ok(0)
         }
         // accept, listen and shutdown, which netlink has not.
-        43 | 50 | 288 | 48 => Err(EOPNOTSUPP),
+        50 | 48 => Err(EOPNOTSUPP),
         54 => set_option(c, socket, a),
         55 => get_option(c, socket, a),
         44 => {

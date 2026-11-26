@@ -1616,7 +1616,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
-  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、それにソケットの要求
+  `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
+  `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、それにソケットの要求
   `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
@@ -1742,6 +1743,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   差分テストのカーネルにある Linux 6.14 のもので、保護情報だけです。保護情報を受け付ける
   ファイルはないので `EINVAL` になります。`IORING_OP_FSYNC` が受け付けるフラグは
   `IORING_FSYNC_DATASYNC` だけです。
+
+- タイムアウトは Linux master のもの（`io_uring/timeout.c`）です。`IORING_OP_TIMEOUT` は
+  モノトニック、ブート時間、実時間のいずれかの時計で、相対か `IORING_TIMEOUT_ABS` の時刻を待ち、
+  `ETIME` で完了します。`IORING_TIMEOUT_ETIME_SUCCESS` がなければ、そのリンクは失敗します。
+  `off` に数があれば、ほかの完了がその数だけ投稿されたときに 0 で完了します。期限が来たタイム
+  アウトや取り除いたタイムアウトの完了は数えません。`IORING_TIMEOUT_MULTISHOT` では、期限が
+  来るたびに `IORING_CQE_F_MORE` 付きの完了を、合わせて `off` 回まで投稿します。
+  `IORING_OP_TIMEOUT_REMOVE` は `user_data` のタイムアウトを取り消すか（`ECANCELED`、なければ
+  `ENOENT`）、`IORING_TIMEOUT_UPDATE` ではそれに、`IORING_LINK_TIMEOUT_UPDATE` も付けばリンクした
+  ものに、新しい時刻を与えます。`IORING_OP_LINK_TIMEOUT` はリンクの中で要求のあとに置きます。
+  その要求を実行するときに始まり、期限が来ると要求を `user_data` で取り消して `ETIME` で完了し、
+  要求が先に終われば `ECANCELED` で完了して、リンクの残りはそれ抜きで続きます。エントリーは Linux と
+  同じく調べ（`EINVAL`）、時刻はエントリーを取るときに読むか（`EFAULT`、負なら `EINVAL`）、
+  `IORING_TIMEOUT_IMMEDIATE_ARG` ではエントリーの中にあります。取り消しは、ファイルを待つ要求の
+  あとにタイムアウトを探しますが、ファイルでは見つけず、リンクしたものも見つけません。`execve` と
+  プロセス全体の終了は、そのスレッドのものを取り消します。
 
 - ソケットの要求は Linux 7.0 の単発のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
   `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。どれも Linux と同じく準備し、
@@ -4294,7 +4311,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   子は 0 から始まり、`execve` はどちらも保ちます。`ru_minflt` は、Linux の
   `mm_account_fault` がタスクに足すのと同じくマイナーフォールトを数えます。スレッドが
   ページを初めて読み書きしたとき、`fork` が共有したページやファイルのプライベートな
-  マッピングのページに書いたとき（自身のコードでも、システムコールのコピーやシグナル
+  マッピングのページに書いたとき（自身のコードでも（オペランドを読んで書く命令は、x86-64
+  と同じく書き込みのフォールトを 1 回だけ起こします）、システムコールのコピーやシグナル
   フレーム、`rseq` の領域の更新のようなカーネルのアクセスでも。起きたときに数えます）と、
   `get_user_pages` がそのスレッドのために読み書きしてフォールトしたときです。後者は
   `perf` は数えません。`mlock`、`mlockall`、`MAP_POPULATE` が取り込むとき、

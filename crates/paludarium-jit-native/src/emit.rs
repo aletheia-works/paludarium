@@ -64,6 +64,10 @@ pub(crate) const CODE_CHANGED: i64 = 2;
 pub(crate) struct Helpers {
     /// `(context, address, size) -> (value, status)`.
     pub load: u64,
+    /// As `load`, of the destination of an instruction that then writes
+    /// it: the page is made ready to be written first, so that a fault is
+    /// the write's ([`paludarium_mmu::AddressSpace::jit_read_value_for_write`]).
+    pub load_for_write: u64,
     /// `(context, address, size, value) -> status`.
     pub store: u64,
     /// `(context, address, to) -> status`: 16 bytes into the two words at
@@ -367,6 +371,19 @@ impl Emitter<'_, '_> {
 
     /// Loads `size` bytes at `address`: the value and the status.
     fn load(&mut self, address: Value, size: u8) -> (Value, Value) {
+        self.load_with(self.helpers.load, address, size)
+    }
+
+    /// [`Self::load`] of the destination of an instruction that then stores
+    /// to it. Only the call differs: a page whose slot holds it for reads is
+    /// there with its bytes, so the load takes no fault and the store takes
+    /// the write's, if any; a page without one is asked for writing first.
+    fn load_for_write(&mut self, address: Value, size: u8) -> (Value, Value) {
+        self.load_with(self.helpers.load_for_write, address, size)
+    }
+
+    /// [`Self::load`], calling `helper` when the slot does not hold the page.
+    fn load_with(&mut self, helper: u64, address: Value, size: u8) -> (Value, Value) {
         let size = size.min(8);
         let (slot, _, ok) = self.through_slot(address, size, JIT_SLOT_READ);
         let fast = self.b.create_block();
@@ -396,7 +413,7 @@ impl Emitter<'_, '_> {
 
         self.b.switch_to_block(slow);
         let size = self.constant(i64::from(size));
-        let callee = self.constant(self.helpers.load as i64);
+        let callee = self.constant(helper as i64);
         let call =
             self.b
                 .ins()
@@ -1996,7 +2013,7 @@ impl Emitter<'_, '_> {
             Fast::UnaryStore { op, mem } => {
                 let size = mem.size;
                 let address = self.linear(&mem);
-                let (a, loaded) = self.load(address, size);
+                let (a, loaded) = self.load_for_write(address, size);
                 self.unless_failed(loaded, n, rip);
                 let a = if size == 8 {
                     a
@@ -2072,7 +2089,7 @@ impl Emitter<'_, '_> {
                 let size = mem.size;
                 let b = self.source(src, size);
                 let address = self.linear(&mem);
-                let (a, loaded) = self.load(address, size);
+                let (a, loaded) = self.load_for_write(address, size);
                 self.unless_failed(loaded, n, rip);
                 let a = self.masked(a, size);
                 let (r, f) = self.alu(op, a, b, size);

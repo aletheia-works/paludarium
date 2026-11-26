@@ -552,8 +552,9 @@ verified.
 - **io_uring, in part**: only `IORING_OP_NOP`, `IORING_OP_EPOLL_CTL`,
   `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`, `_FSYNC`, `_READ_FIXED`,
   `_WRITE_FIXED`, `IORING_OP_FILES_UPDATE`, `IORING_OP_PROVIDE_BUFFERS`,
-  `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, and the single-shot socket
-  requests `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
+  `_REMOVE_BUFFERS`, `IORING_OP_ASYNC_CANCEL`, `IORING_OP_TIMEOUT`,
+  `_TIMEOUT_REMOVE`, `_LINK_TIMEOUT`, and the single-shot socket requests
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
   and `_RECV` run; the other operations complete with `EOPNOTSUPP`. Of the
   socket requests, a multishot accept or receive, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
@@ -565,7 +566,10 @@ verified.
   receive with `MSG_WAITALL` whose datagram was cut does not fail its
   link, where Linux's does. An `IORING_OP_SHUTDOWN` runs while
   `io_uring_enter` takes it, where Linux's runs in a worker, so its
-  completion can come before those Linux posts first.
+  completion can come before those Linux posts first. A timeout expires at
+  the checkpoints where its process can run: one due while every thread
+  sleeps in `nanosleep` completes as the sleep ends, where Linux's timer
+  completes it then.
   The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
   `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,

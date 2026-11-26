@@ -186,7 +186,9 @@ holds only data, as SBCL's heap does, is written through the slot until an
 instruction is fetched from it. Every other access, and every one the slot
 does not allow, such as a write to a page that `mprotect`,
 `UFFDIO_WRITEPROTECT` or a clear soft-dirty bit protects, calls the MMU's
-own loads and stores, with their checks, which fill the slot again. It stops
+own loads and stores, with their checks, which fill the slot again; the load
+of an instruction that then writes its operand asks for the page as a write,
+so that it faults once, as the write, as in the interpreter. It stops
 before an instruction whose load or store fails, having changed nothing for
 it, so that the interpreter runs it again and reports the fault, and after a
 call into the MMU that finds the code generation moved on. It stops the same

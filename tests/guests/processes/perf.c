@@ -1336,6 +1336,20 @@ static void on_trap_at_store(int number, siginfo_t *info, void *context) {
     traps_before_store += *at_store == 0;
 }
 
+/* Each SIGTRAP of the repeated store: whether it stopped at the page after
+   the last, with all bytes before it stored. */
+static char *volatile at_string;
+static volatile int string_traps, string_in_order = 1;
+static void on_trap_in_string(int number, siginfo_t *info, void *context) {
+    (void)number;
+    const ucontext_t *u = context;
+    char *next = (char *)u->uc_mcontext.gregs[REG_RDI];
+    char *page = at_string + 4096 * string_traps;
+    if (string_traps == 0) page += 100;
+    string_in_order &= next == page && (char *)info->si_addr == page && (string_traps == 0 || next[-1] == 7);
+    string_traps++;
+}
+
 static volatile int io_before_store;
 static void on_io_at_store(int number, siginfo_t *info, void *context) {
     (void)number;
@@ -1394,6 +1408,24 @@ static void at_occurrence(void) {
     ioctl(fd, IOC_DISABLE, 0);
     say("read and written: add %d xchg %d cmpxchg %d", (int)(counts[1] - counts[0]), (int)(counts[2] - counts[1]),
         (int)(counts[3] - counts[2]));
+    /* A repeated store goes on where it stopped: three pages, three faults,
+       each signalled where it stops, with the bytes before it stored. */
+    pages = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    at_string = pages;
+    sa.sa_sigaction = on_trap_in_string;
+    sigaction(SIGTRAP, &sa, NULL);
+    uint64_t before_string, after_string;
+    read(fd, &before_string, 8);
+    ioctl(fd, IOC_ENABLE, 0);
+    void *to = pages + 100;
+    size_t left = 3 * 4096 - 200;
+    __asm__ volatile("rep stosb" : "+D"(to), "+c"(left) : "a"(7) : "memory");
+    ioctl(fd, IOC_DISABLE, 0);
+    read(fd, &after_string, 8);
+    int stored = 1;
+    for (int i = 100; i < 3 * 4096 - 100; i++) stored &= pages[i] == 7;
+    say("repeated store: faults %d traps %d in order %d stored %d left %d", (int)(after_string - before_string),
+        string_traps, string_in_order, stored, (int)left);
     munmap(page, 2 * 4096);
     close(fd);
     sigaction(SIGTRAP, &old, NULL);

@@ -648,3 +648,25 @@ fn an_execute_breakpoint_on_a_repeated_string_instruction_hits_once() {
     );
     assert_eq!(s.gpr[reg::RCX], 0);
 }
+#[test]
+fn an_instruction_that_reads_and_writes_its_destination_faults_as_a_write() {
+    // add byte [rdi], 1; shl dword [rdi], cl with cl 0; rcl dword [rdi], 1;
+    // bts dword [rdi], 1; and bt dword [rdi], 1, which only reads.
+    for (code, write) in [
+        (&[0x80, 0x07, 0x01][..], true),
+        (&[0xd3, 0x27], true),
+        (&[0xd1, 0x17], true),
+        (&[0x0f, 0xba, 0x2f, 0x01], true),
+        (&[0x0f, 0xba, 0x27, 0x01], false),
+    ] {
+        let (mut s, mut m) = fixture(code);
+        s.gpr[reg::RDI] = 0x40000000;
+        m.protect(GuestAddr(0x40000000), 4096, Prot::NONE).unwrap();
+        let before = s.clone();
+        assert!(
+            matches!(step(&mut s, &m), Err(ExitReason::PageFault { write: w, .. }) if w == write),
+            "{code:x?}"
+        );
+        assert_eq!(s, before);
+    }
+}

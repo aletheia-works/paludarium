@@ -1517,7 +1517,7 @@ impl Kernel {
         aio::complete_ready(&self.processes.aio, &self.files.readiness);
         // So do the io_uring requests that wait for a file this thread's
         // call made ready, as task work of the threads that submitted them.
-        io_uring::complete_ready(&self.processes.io_uring);
+        io_uring::complete_ready(&self.processes.io_uring, &*self.host);
         self.ptrace_traps(thread, &mut restart);
         // io_uring's task work runs on the way back to the program, after
         // the call's ptrace stops and before a signal is taken, as Linux's

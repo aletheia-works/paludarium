@@ -2324,7 +2324,7 @@ impl Kernel {
         closed.iter().for_each(crate::sockets::closing);
         drop(closed);
         crate::aio::complete_ready(&self.processes.aio, &self.files.readiness);
-        crate::io_uring::complete_ready(&self.processes.io_uring);
+        crate::io_uring::complete_ready(&self.processes.io_uring, &*self.host);
         // Then `exit_fs`: the last task sharing the working directory lets
         // go of it.
         self.files.release_home();

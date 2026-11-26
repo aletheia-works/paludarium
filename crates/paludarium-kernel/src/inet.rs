@@ -5220,8 +5220,6 @@ pub(crate) fn dispatch(
             let raw = read_raw(c, a[1], a[2])?;
             connect_raw(c, socket, &raw, false)
         }
-        // accept and accept4
-        43 | 288 => accept(c, socket, a, if number == 288 { a[3] } else { 0 }),
         // bind, to the guest's own addresses
         49 => {
             let raw = read_raw(c, a[1], a[2])?;
@@ -5351,27 +5349,6 @@ pub(crate) fn dispatch(
         }
         _ => Err(Errno::ENOSYS),
     }
-}
-/// `accept` and `accept4` with `flags` (`SOCK_NONBLOCK` and
-/// `SOCK_CLOEXEC`; EINVAL for any other), in Linux's order (`do_accept`):
-/// the lowest free descriptor first (EMFILE), then the connection, then its
-/// peer's address, which when it cannot be written loses the connection.
-fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> Result<u64, Errno> {
-    if flags & !u64::from(NONBLOCK | CLOEXEC) != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let fd = c.files.reserve(c.group.nofile())?;
-    let child = match accepted(c, socket, a[1], a[2], flags, false) {
-        Ok((child, _)) => child,
-        Err(e) => {
-            c.files.unreserve(fd);
-            return Err(e);
-        }
-    };
-    let cloexec = flags & u64::from(CLOEXEC) != 0;
-    c.files
-        .fill(fd, crate::files::Descriptor::unnamed(child, cloexec));
-    Ok(u64::from(fd))
 }
 /// The connection `accept` takes on `socket`, made the caller's, with
 /// `SOCK_NONBLOCK` of `flags` and its peer's address written to `at` (none

@@ -1436,7 +1436,7 @@ pub(crate) fn execute(
         Fast::UnaryStore { op, mem } => {
             let size = mem.size;
             let address = x.fast_linear(&mem);
-            let a = x.load(address, size)?;
+            let a = x.load_for_write(address, size)?;
             let (r, update, flags) = op.apply(a, size);
             x.store(address, size, r)?;
             x.set_status(update, flags);
@@ -1457,7 +1457,7 @@ pub(crate) fn execute(
             let size = mem.size;
             let b = x.source(src, size);
             let address = x.fast_linear(&mem);
-            let a = x.load(address, size)?;
+            let a = x.load_for_write(address, size)?;
             let (r, flags) = op.apply(a, b, size);
             x.store(address, size, r & size_mask(size))?;
             x.set_status(flag::STATUS, flags);

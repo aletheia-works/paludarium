@@ -336,6 +336,14 @@ impl Exec<'_> {
         Ok(self.mem.read_value(addr, usize::from(size.min(8)))?)
     }
 
+    /// [`Self::load`] of the destination of an instruction that then writes
+    /// it: its fault, if it takes one, is the write's, as x86-64's.
+    fn load_for_write(&self, addr: GuestAddr, size: u8) -> Result<u64> {
+        Ok(self
+            .mem
+            .read_value_for_write(addr, usize::from(size.min(8)))?)
+    }
+
     fn store(&self, addr: GuestAddr, size: u8, value: u64) -> Result<()> {
         self.mem
             .write_value(addr, usize::from(size.min(8)), value)?;
@@ -360,6 +368,15 @@ impl Exec<'_> {
             Operand::Immediate(v) => Ok(v & size_mask(size)),
             Operand::Memory(m) => self.load(self.linear(&m), size),
             Operand::Branch(t) => Ok(t.0),
+        }
+    }
+
+    /// [`Self::read`] of an operand the instruction then writes
+    /// ([`Self::load_for_write`]).
+    fn read_for_write(&self, o: Operand, size: u8) -> Result<u64> {
+        match o {
+            Operand::Memory(m) => self.load_for_write(self.linear(&m), size),
+            o => self.read(o, size),
         }
     }
 
@@ -561,8 +578,10 @@ impl Exec<'_> {
             self.mem
                 .atomic(self.linear(&mem), atomic_width(size)?, operation)?
                 .old as u64
-        } else {
+        } else if matches!(m, Mnemonic::Cmp | Mnemonic::Test) {
             self.read(dst, size)?
+        } else {
+            self.read_for_write(dst, size)?
         };
         let ((r, f), writes) = match m {
             Mnemonic::Add => (alu::add(a, b, false, size), true),
@@ -602,7 +621,7 @@ impl Exec<'_> {
                 .atomic(self.linear(&mem), atomic_width(size)?, operation)?
                 .old as u64
         } else {
-            self.read(dst, size)?
+            self.read_for_write(dst, size)?
         };
         match m {
             Mnemonic::Inc | Mnemonic::Dec => {
@@ -640,7 +659,7 @@ impl Exec<'_> {
             Some(o) => self.read(o, 1)?,
             None => 1,
         };
-        let a = self.read(dst, size)?;
+        let a = self.read_for_write(dst, size)?;
         match alu::shift(kind, a, count, size) {
             Some((r, f)) => {
                 self.write(dst, size, r)?;
@@ -798,7 +817,11 @@ impl Exec<'_> {
                 .atomic(self.linear(&memory), atomic_width(size)?, operation)?
                 .old as u64
         } else {
-            let old = self.read(dst, size)?;
+            let old = if mnemonic == Mnemonic::Bt {
+                self.read(dst, size)?
+            } else {
+                self.read_for_write(dst, size)?
+            };
             let updated = match mnemonic {
                 Mnemonic::Bts => Some(old | mask),
                 Mnemonic::Btr => Some(old & !mask),
@@ -823,7 +846,7 @@ impl Exec<'_> {
         let through = matches!(mnemonic, Mnemonic::Rcl | Mnemonic::Rcr);
         let period = width + u32::from(through);
         let count = u32::try_from(masked).map_err(|_| Stop::Invalid)? % period;
-        let value = self.read(dst, size)?;
+        let value = self.read_for_write(dst, size)?;
         if masked == 0 || (through && count == 0) {
             return self.write(dst, size, value);
         }
@@ -892,7 +915,7 @@ impl Exec<'_> {
         let dst = op(self.i, 0)?;
         let size = Self::size_of(dst, None);
         let width = u32::from(size) * 8;
-        let a = self.read(dst, size)?;
+        let a = self.read_for_write(dst, size)?;
         let b = self.read(op(self.i, 1)?, size)?;
         let count = self.read(op(self.i, 2)?, 1)? as u32 & if size == 8 { 63 } else { 31 };
         if count == 0 {

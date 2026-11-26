@@ -12,6 +12,7 @@ musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/inotify" "$here/inotify.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/fanotify" "$here/fanotify.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/userfaultfd" "$here/userfaultfd.c"
+musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/read-modify-write" "$here/read-modify-write.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/aio" "$here/aio.c"
 # A build ID of its own for perf-side-band's MMAP2 records, which musl-gcc's
 # link spec may leave out.

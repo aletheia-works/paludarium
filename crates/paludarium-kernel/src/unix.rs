@@ -257,16 +257,6 @@ pub(crate) fn dispatch(
             let address = read_address(c, a[1], a[2])?;
             socket.connect(c, &address, false)
         }
-        43 | 288 => {
-            let flags = if number == 288 { a[3] } else { 0 };
-            if flags & !u64::from(NONBLOCK | CLOEXEC) != 0 {
-                return Err(Errno::EINVAL);
-            }
-            let child = accept_file(c, socket, a[1], a[2], flags, false)?;
-            c.files
-                .install(child, flags & u64::from(CLOEXEC) != 0, c.group.nofile())
-                .map(u64::from)
-        }
         49 => {
             let address = read_address(c, a[1], a[2])?;
             socket.bind(c, &address).map(|()| 0)

@@ -233,20 +233,32 @@ impl NamespacedFs {
             backing: Backing::Generated(Arc::new(GeneratedFs(source))),
         }
     }
-    /// The mounts Linux has from start-up in the kernel's own `/dev`: that
-    /// directory itself, `devices` (a stand-in, [`GeneratedSource::shallow`],
-    /// the lower filesystem need have no `/dev`), and the tmpfs `shm` on
-    /// its `/shm`, as systemd mounts `/dev/shm`. Before any other mount.
-    pub fn mount_devices(&self, devices: GeneratedSource, shm: NewTmpfs) -> Result<(), Errno> {
+    /// The mounts Linux has from start-up of the kernel's own files:
+    /// `proc` on `/proc`, `devices` on `/dev` (stand-ins,
+    /// [`GeneratedSource::shallow`], so the lower filesystem need have
+    /// neither, and what it has there is not reached), and the tmpfs `shm`
+    /// on `/dev/shm`, as systemd mounts them. Before any other mount.
+    pub fn mount_devices(
+        &self,
+        proc: GeneratedSource,
+        devices: GeneratedSource,
+        shm: NewTmpfs,
+    ) -> Result<(), Errno> {
         let entries = self.table.snapshot();
         if entries.iter().any(Entry::runtime) {
             return Err(Errno(16)); // EBUSY
         }
-        let point = devices.machine_path(b"/");
-        let parent = entries[self.table.boot_index(&entries, &point)].id();
+        let on_boot = |source: &GeneratedSource| {
+            let point = source.machine_path(b"/");
+            (entries[self.table.boot_index(&entries, &point)].id(), point)
+        };
+        let (parent, point) = on_boot(&proc);
+        let proc = self.generated_entry(proc, parent, point, 0, 0);
+        let (parent, point) = on_boot(&devices);
         let devices = self.generated_entry(devices, parent, point.clone(), 0, 0);
         let shm = self.new_entry(shm, devices.id(), joined(&point, b"/shm"));
         self.table.update(|entries| {
+            entries.push(proc);
             entries.push(devices);
             entries.push(shm);
             Ok(())

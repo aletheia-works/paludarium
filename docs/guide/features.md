@@ -4058,7 +4058,8 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts of the caller's mount namespace
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
-  `devtmpfs` for `/dev` and the tmpfs on `/dev/shm` from start-up,
+  `proc` for `/proc`, `devtmpfs` for `/dev` and the tmpfs on `/dev/shm`
+  from start-up,
   and the tmpfs and bind mounts `mount` made, with their sources and, in
   `mountinfo`, the directory each shows as its root, whether the mount
   and its superblock are read-only, and its propagation). After `chroot` they show each mount point
@@ -4181,13 +4182,15 @@ kernel.
   resource limits as `prlimit` gives them, in Linux's columns. `auxv` (0400)
   is the auxiliary vector the program's `execve` wrote on its stack, kept
   as Linux keeps `saved_auxv`, whatever the program then does to its stack,
-  and across `fork`. Any other path in this process's directory or
-  elsewhere under `/proc` is looked up in the filesystem like any path, so with
-  `--mount /:/` it reaches the host's own `/proc`.
+  and across `fork`. Any other name in this process's directory or
+  elsewhere under `/proc` is `ENOENT`, as a name procfs does not have is on
+  Linux, whatever the filesystem holds there (with `--mount /:/`, the
+  host's own `/proc`): `/proc` is a mount of its own from start-up, as
+  `/dev` is, so calls that would make, remove or rename such a name are
+  `ENOENT` too.
 
-- `/proc` lists what the filesystem has there that is not a process (with
-  `--mount /:/`, the host's own entries except its processes), the files above,
-  and then a directory for every process of the guest, zombies included, as
+- `/proc` lists the files above, and nothing the filesystem has there (with
+  `--mount /:/`, none of the host's own entries), and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),

@@ -132,10 +132,10 @@ verified.
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
-  the reader's own directory (`stack`, `sched`, ...) are looked up like any
-  path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `stack`
-  and the rest. `wchan` is `0` for a waiting task too, where Linux names the
+  the reader's own directory (`stack`, `sched`, ...) are `ENOENT`, as in
+  another process's directory, whatever the filesystem holds there (with
+  `--mount /:/`, the host's `/proc`), where Linux shows them, and root
+  `stack` and the rest of another's. `wchan` is `0` for a waiting task too, where Linux names the
   kernel function it waits in for a reader that may read the task: there are
   no kernel functions here to name. A poll of an epoll that watches several
   of `hostname` and `domainname` polls them by descriptor number until one is

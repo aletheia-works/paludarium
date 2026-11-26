@@ -2935,7 +2935,7 @@ mod namespaces {
             String::from_utf8(bytes).unwrap()
         };
         // The first namespace is as it was.
-        assert_eq!(mountinfo(&mut k, &mut t).lines().count(), 5);
+        assert_eq!(mountinfo(&mut k, &mut t).lines().count(), 6);
         // In the copy without recursion, the tmpfs is the root, and the
         // mount below is not there.
         let (top, below) = (put(&m, 0xc0, "/f"), put(&m, 0xe0, "/in/y"));
@@ -4459,6 +4459,7 @@ mod socket_credentials {
 }
 mod shm {
     use super::*;
+    use paludarium_host::HostFs;
     const IPC_CREAT: u64 = 0o1000;
     const IPC_EXCL: u64 = 0o2000;
     const IPC_RMID: u64 = 0;
@@ -4600,8 +4601,8 @@ mod shm {
     /// gives it the host's `/proc`, are not the ones a guest reads.
     #[test]
     fn a_uts_sysctl_shows_the_namespace_not_a_file_of_its_name() {
-        let (mut k, mut t, m) = setup();
-        let fs = k.files.fs();
+        let (k, mut t, m) = setup();
+        let fs = Arc::new(paludarium_vfs::MemFs::new());
         for directory in [&b"/proc"[..], b"/proc/sys", b"/proc/sys/kernel"] {
             match fs.mkdir(directory, 0o755) {
                 Ok(()) | Err(Errno::EEXIST) => {}
@@ -4621,6 +4622,7 @@ mod shm {
             let file = fs.open(path.as_bytes(), 0o102, 0o644).unwrap();
             file.write(b"host\n").unwrap();
         }
+        let mut k = k.with_file_system(Arc::clone(&fs) as Arc<dyn paludarium_vfs::FileSystem>);
         let shown = |k: &mut Kernel, t: &mut Thread| {
             names.map(|name| read_proc(k, t, &m, &format!("/proc/sys/kernel/{name}")))
         };
@@ -4654,8 +4656,8 @@ mod shm {
     #[test]
     fn proc_net_shows_the_namespace_not_a_mounted_one() {
         const PATH: u64 = DATA + 0x900;
-        let (mut k, mut t, m) = setup();
-        let fs = k.files.fs();
+        let (k, mut t, m) = setup();
+        let fs = paludarium_vfs::MemFs::new();
         for directory in [
             &b"/proc"[..],
             b"/proc/net",
@@ -4675,6 +4677,7 @@ mod shm {
             let file = fs.open(path, 0o102, 0o644).unwrap();
             file.write(b"host\n").unwrap();
         }
+        let mut k = k.with_file_system(Arc::new(fs));
         for directory in ["net", "self/net", "thread-self/net"] {
             let dev = read_proc(&mut k, &mut t, &m, &format!("/proc/{directory}/dev"));
             assert!(dev.starts_with("Inter-|   Receive"), "{dev}");
@@ -7596,5 +7599,181 @@ mod mount_namespace_end {
         );
         assert!(syscall(&mut k, &mut t, &m, 61, [u64::MAX, 0, 0, 0, 0, 0]) as i64 > 0);
         assert!(events(&mut k, &mut t, &m, fan).is_empty());
+    }
+}
+mod proc_names {
+    use super::*;
+    use paludarium_host::HostFs;
+
+    const PATH: u64 = DATA + 0x100;
+    const OTHER: u64 = DATA + 0x200;
+    const BUF: u64 = DATA + 0x400;
+
+    /// A kernel over a filesystem that has a /proc of its own, as the host's is
+    /// with `--mount /:/`: system files, names in a process's directory, a
+    /// directory and a symbolic link paludarium does not make.
+    fn planted() -> (Kernel, Thread, AddressSpace) {
+        let (k, t, m) = setup();
+        let fs = paludarium_vfs::MemFs::new();
+        for d in [
+            "/proc",
+            "/proc/sys",
+            "/proc/sys/vm",
+            "/proc/sys/kernel",
+            "/proc/self",
+            "/proc/1",
+            "/proc/tty",
+        ] {
+            fs.mkdir(d.as_bytes(), 0o755).unwrap();
+        }
+        for f in [
+            "/proc/version",
+            "/proc/sys/vm/swappiness",
+            "/proc/sys/kernel/planted",
+            "/proc/self/sched",
+            "/proc/1/sched",
+            "/proc/tty/drivers",
+        ] {
+            fs.open(f.as_bytes(), 0o102, 0o644)
+                .unwrap()
+                .write(b"host\n")
+                .unwrap();
+        }
+        fs.symlink(b"/etc", b"/proc/plink").unwrap();
+        (k.with_file_system(Arc::new(fs)), t, m)
+    }
+
+    fn call(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        n: u64,
+        path: &str,
+        a: [u64; 3],
+    ) -> i64 {
+        m.write(GuestAddr(PATH), format!("{path}\0").as_bytes())
+            .unwrap();
+        syscall(k, t, m, n, [PATH, a[0], a[1], a[2], 0, 0]) as i64
+    }
+
+    fn names(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, dir: &str) -> Vec<String> {
+        let fd = call(k, t, m, 2, dir, [0o200000, 0, 0]);
+        assert!(fd >= 0, "{dir}: {fd}");
+        let mut names = Vec::new();
+        loop {
+            let n = syscall(k, t, m, 217, [fd as u64, BUF, 0x300, 0, 0, 0]) as i64;
+            assert!(n >= 0, "{dir}: {n}");
+            if n == 0 {
+                break;
+            }
+            let mut buf = vec![0; n as usize];
+            m.read(GuestAddr(BUF), &mut buf).unwrap();
+            let mut at = 0;
+            while at < buf.len() {
+                let len = usize::from(u16::from_le_bytes([buf[at + 16], buf[at + 17]]));
+                let name = &buf[at + 19..at + len];
+                let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                names.push(String::from_utf8_lossy(&name[..end]).into_owned());
+                at += len;
+            }
+        }
+        syscall(k, t, m, 3, [fd as u64, 0, 0, 0, 0, 0]);
+        names
+    }
+
+    #[test]
+    fn a_name_paludarium_does_not_make_is_enoent_whatever_the_filesystem_has() {
+        let (mut k, mut t, m) = planted();
+        m.write(GuestAddr(OTHER), b"user.x\0").unwrap();
+        for path in [
+            "/proc/version",
+            "/proc/sys/vm/swappiness",
+            "/proc/sys/kernel/planted",
+            "/proc/self/sched",
+            "/proc/1/sched",
+            "/proc/tty",
+            "/proc/tty/drivers",
+            "/proc/plink",
+            "/proc/version/x",
+        ] {
+            let k = &mut k;
+            let t = &mut t;
+            assert_eq!(call(k, t, &m, 4, path, [BUF, 0, 0]), -2, "stat {path}");
+            assert_eq!(call(k, t, &m, 6, path, [BUF, 0, 0]), -2, "lstat {path}");
+            assert_eq!(call(k, t, &m, 21, path, [0, 0, 0]), -2, "access {path}");
+            assert_eq!(
+                call(k, t, &m, 89, path, [BUF, 64, 0]),
+                -2,
+                "readlink {path}"
+            );
+            assert_eq!(call(k, t, &m, 2, path, [0, 0, 0]), -2, "open {path}");
+            assert_eq!(call(k, t, &m, 80, path, [0, 0, 0]), -2, "chdir {path}");
+            assert_eq!(call(k, t, &m, 76, path, [0, 0, 0]), -2, "truncate {path}");
+            assert_eq!(
+                call(k, t, &m, 191, path, [OTHER, BUF, 64]),
+                -2,
+                "getxattr {path}"
+            );
+        }
+        m.write(GuestAddr(OTHER), b"/proc/renamed\0").unwrap();
+        for path in [
+            "/proc/version",
+            "/proc/newdir",
+            "/proc/self/newdir",
+            "/proc/sys/newdir",
+        ] {
+            let k = &mut k;
+            let t = &mut t;
+            assert_eq!(call(k, t, &m, 83, path, [0o755, 0, 0]), -2, "mkdir {path}");
+            assert_eq!(
+                call(k, t, &m, 2, path, [0o101, 0o644, 0]),
+                -2,
+                "creat {path}"
+            );
+            assert_eq!(call(k, t, &m, 87, path, [0, 0, 0]), -2, "unlink {path}");
+            assert_eq!(call(k, t, &m, 84, path, [0, 0, 0]), -2, "rmdir {path}");
+            assert_eq!(call(k, t, &m, 82, path, [OTHER, 0, 0]), -2, "rename {path}");
+        }
+        m.write(GuestAddr(OTHER), b"/etc\0").unwrap();
+        for (n, call_name) in [(88, "symlink"), (86, "link")] {
+            m.write(GuestAddr(PATH), b"/proc/made\0").unwrap();
+            let r = syscall(&mut k, &mut t, &m, n, [OTHER, PATH, 0, 0, 0, 0]) as i64;
+            assert_eq!(r, -2, "{call_name} /proc/made");
+        }
+        // What paludarium makes is there as before.
+        let fd = call(&mut k, &mut t, &m, 2, "/proc/self/status", [0, 0, 0]);
+        assert!(fd >= 0, "{fd}");
+        assert_eq!(
+            call(
+                &mut k,
+                &mut t,
+                &m,
+                4,
+                "/proc/sys/kernel/version",
+                [BUF, 0, 0]
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn a_listing_of_proc_has_only_what_paludarium_makes() {
+        let (mut k, mut t, m) = planted();
+        let planted = ["version", "plink", "tty", "sched", "swappiness", "planted"];
+        for dir in ["/proc", "/proc/self", "/proc/sys/vm", "/proc/sys/kernel"] {
+            let names = names(&mut k, &mut t, &m, dir);
+            assert!(names.len() > 2, "{dir}: {names:?}");
+            for name in &names {
+                let made = dir == "/proc/sys/kernel" && name == "version";
+                assert!(
+                    made || !planted.contains(&name.as_str()),
+                    "{dir}: {name} in {names:?}"
+                );
+            }
+        }
+        assert_eq!(
+            names(&mut k, &mut t, &m, "/proc/sys/vm"),
+            [".", "..", "drop_caches", "unprivileged_userfaultfd"]
+        );
     }
 }

@@ -163,19 +163,31 @@ fn first_table(
         }
         None => Arc::new(|| Ok(0)),
     };
-    let flags = generated_mount(b"/dev").map_or(0, |(_, _, flags)| flags);
+    let flags = |p: &[u8]| generated_mount(p).map_or(0, |(_, _, flags)| flags);
+    let proc = paludarium_vfs::GeneratedSource {
+        kind: "proc",
+        device: lower.device(b"/proc"),
+        base: b"/proc".to_vec(),
+        path: b"/".to_vec(),
+        stat: crate::proc::directory_stat(),
+        flags: flags(b"/proc"),
+        shallow: true,
+    };
     let devices = paludarium_vfs::GeneratedSource {
         kind: "devtmpfs",
         device: lower.device(b"/dev"),
         base: b"/dev".to_vec(),
         path: b"/".to_vec(),
         stat: crate::devices::directory_stat(),
-        flags,
+        flags: flags(b"/dev"),
         shallow: true,
     };
     // A new table has no mount yet that would refuse these.
-    let _ = paludarium_vfs::NamespacedFs::new(Arc::clone(lower), Arc::clone(&table))
-        .mount_devices(devices, crate::mounts::device_shm(clock));
+    let _ = paludarium_vfs::NamespacedFs::new(Arc::clone(lower), Arc::clone(&table)).mount_devices(
+        proc,
+        devices,
+        crate::mounts::device_shm(clock),
+    );
     table
 }
 /// The machine's filesystem as a mount namespace's table shows it: the

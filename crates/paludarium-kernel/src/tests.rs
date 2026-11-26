@@ -2735,8 +2735,9 @@ fn statfs_and_the_generated_mount_table() {
     assert_eq!(f.ret(138, &[99, buf]), errno(Errno::EBADF));
     // The mount table: readable whole, a regular 0444 file, never writable.
     let table = b"21 1 0:1 / / rw,relatime - tmpfs tmpfs rw\n\
-22 21 0:1 / /dev rw,nosuid,noexec,relatime - devtmpfs devtmpfs rw\n\
-23 22 0:2 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw,inode64\n";
+22 21 0:1 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n\
+23 21 0:1 / /dev rw,nosuid,noexec,relatime - devtmpfs devtmpfs rw\n\
+24 23 0:2 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw,inode64\n";
     let fd = f.ret(2, &[mounts, 0, 0]);
     assert_eq!(f.ret(0, &[fd, buf, 0x100]), table.len() as u64);
     let mut read = vec![0; table.len()];
@@ -12910,19 +12911,19 @@ fn statmount_and_listmount_by_unique_ids() {
             .map(|i| f.mem.read_u64(GuestAddr(ids + 8 * i)).unwrap())
             .collect()
     };
-    // From the root: the root, `/dev` and `/dev/shm` from start-up, and
-    // both, in order.
+    // From the root: the root, `/proc`, `/dev` and `/dev/shm` from
+    // start-up, and both, in order.
     let all = req(&mut f, 0x100, [32, u64::MAX, 0, 0]);
-    assert_eq!(f.ret(458, &[all, ids, 10, 0]), 5);
-    let every = read_ids(&mut f, 5);
+    assert_eq!(f.ret(458, &[all, ids, 10, 0]), 6);
+    let every = read_ids(&mut f, 6);
     assert!(every.windows(2).all(|w| w[0] < w[1]));
-    let listed = [every[0], every[3], every[4]];
+    let listed = [every[0], every[4], every[5]];
     assert_eq!(listed[0], paludarium_vfs::UNIQUE_OFFSET + 2);
-    assert_eq!(f.ret(458, &[all, ids, 10, 1]), 5);
+    assert_eq!(f.ret(458, &[all, ids, 10, 1]), 6);
     assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
     // After the last one given, and from a mount.
     let after = req(&mut f, 0x120, [32, u64::MAX, listed[0], 0]);
-    assert_eq!(f.ret(458, &[after, ids, 10, 0]), 4);
+    assert_eq!(f.ret(458, &[after, ids, 10, 0]), 5);
     let below = req(&mut f, 0x140, [32, listed[1], 0, 0]);
     assert_eq!(f.ret(458, &[below, ids, 10, 0]), 1);
     assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
@@ -13083,11 +13084,11 @@ fn unshare_newns_copies_the_mounts() {
     let fd = f.ret(2, &[inside, 0o102, 0o600]);
     assert_eq!(f.ret(3, &[fd]), 0);
     let first = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
-    assert!(first.starts_with("21 1 0:1 / / ") && first.contains("\n24 21 0:3 / /tmp/m "));
+    assert!(first.starts_with("21 1 0:1 / / ") && first.contains("\n25 21 0:3 / /tmp/m "));
     assert_eq!(f.ret(272, &[0x2_0000]), 0);
     let copy = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
     assert!(
-        copy.starts_with("25 1 0:1 / / ") && copy.contains("\n28 25 0:3 / /tmp/m "),
+        copy.starts_with("26 1 0:1 / / ") && copy.contains("\n30 26 0:3 / /tmp/m "),
         "{copy}"
     );
     let stat = DATA + 0x400;
@@ -13099,7 +13100,7 @@ fn unshare_newns_copies_the_mounts() {
     assert!(!Arc::ptr_eq(&first_table, &f.kernel.files.mount_table()));
     let lower =
         paludarium_vfs::NamespacedFs::new(Arc::new(paludarium_vfs::MemFs::new()), first_table);
-    assert_eq!(paludarium_vfs::FileSystem::mounts(&lower).len(), 4);
+    assert_eq!(paludarium_vfs::FileSystem::mounts(&lower).len(), 5);
 }
 
 /// chroot keeps absolute paths, links and `..` inside the new root, and

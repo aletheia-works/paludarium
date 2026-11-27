@@ -14,6 +14,12 @@ const IP6: usize = 40;
 const FRAGMENT6: usize = 8;
 const UDP: usize = 8;
 const ICMP: usize = 8;
+/// A neighbour solicitation with the sender's link-layer address, to the
+/// target's solicited-node group, and the solicited advertisement that
+/// answers it with the target's (`ndisc_send_ns`, `ndisc_send_na`): each
+/// an IPv6 header and 24 bytes of ICMPv6 with an 8-byte option, on
+/// Ethernet.
+pub(crate) const NDISC: usize = ETHERNET + 40 + 24 + 8;
 /// A TCP SYN's header with its options (`tcp_syn_options`), and a reset's
 /// with none (`tcp_v4_send_reset`, `tcp_v6_send_reset`).
 pub(crate) const SYN: usize = 40;

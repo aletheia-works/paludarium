@@ -1410,6 +1410,8 @@ impl Network {
         let (Some((there, peer_index, _)), Some(asker)) = (peer, asker) else {
             return;
         };
+        // Its advertisement back.
+        there.count(*peer_index, &[frames::NDISC]);
         let events = {
             let mut addresses = there.addresses_at(Some(now));
             let mut events = addresses.neigh_learn(*peer_index, asker, own_mac, now);
@@ -1453,6 +1455,7 @@ impl Network {
         if asker.is_none() {
             return;
         }
+        self.count(index, &[frames::NDISC]);
         let o = to.octets();
         let group = Ipv6Addr::new(
             0xff02,

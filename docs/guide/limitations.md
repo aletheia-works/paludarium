@@ -138,7 +138,8 @@ verified.
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **Device counters, in part**: `/proc/net/dev` and a link's
   `IFLA_STATS64` and `IFLA_STATS` count UDP datagrams, ICMP's port
-  unreachable, ARP and TCP's segments alone (see [features](./features)).
+  unreachable, ARP, neighbour discovery's solicitations and their answers,
+  and TCP's segments alone (see [features](./features)).
   ICMP's port unreachable is sent, and counted, for each datagram to a
   closed port, where Linux limits how many go (`icmp_ratelimit`,
   `icmp_msgs_per_sec`, and per peer through a veth pair).
@@ -146,10 +147,10 @@ verified.
   not counted, nor are its retries; a connection's own retransmissions,
   the SYN-ACK's sent again among them, are, as is its handshake once
   the listener has answered, whether or not the request is dropped
-  later. Nor are the packets of IPv6 that the kernel sends of
-  itself (neighbour discovery, MLD reports, router solicitations and
-  duplicate address detection), nor ARP's probes of a neighbour whose
-  entry ages, nor what goes to the host (a TCP connection to a port no
+  later. Nor are the MLD reports, router solicitations and duplicate
+  address detection that IPv6 sends of itself, nor the probes that ARP
+  and neighbour discovery send of a neighbour whose entry ages, nor what
+  goes to the host (a TCP connection to a port no
   guest socket holds, the DNS stub's answers) or through the loopback to
   a broadcast or group address, nor an MCTP send out through the
   loopback. No error, drop or multicast is counted: a packet that Linux

@@ -477,6 +477,7 @@ mod linux {
                     | "net-dev-tcp"
                     | "veth-igmp-neighbours"
                     | "veth-ipv6-solicited-routers"
+                    | "net-dev-ndisc"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -759,6 +760,7 @@ mod linux {
         net_dev_tcp => ("net-dev-tcp","net-dev-tcp"),
         veth_igmp_neighbours => ("veth-igmp-neighbours","veth-igmp-neighbours"),
         veth_ipv6_solicited_routers => ("veth-ipv6-solicited-routers","veth-ipv6-solicited-routers"),
+        net_dev_ndisc => ("net-dev-ndisc","net-dev-ndisc"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),

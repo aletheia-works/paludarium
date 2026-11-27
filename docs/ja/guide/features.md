@@ -4501,10 +4501,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ブロードキャストやグループへのものは、受け取る者がいてもいなくても 1 回で、送り手自身の
     コピーは数えずに戻ります（`dev_loopback_xmit`）。それに答える ICMP の port unreachable
     も、それ自身の経路が通る端で数えます。元のパケットは 576 バイト（IPv6 は 1280）に
-    収まる分だけ引用します（`icmp_send`、`icmp6_send`）。ARP の要求とその答え（`arp_send`）と、
-    TCP の各セグメント（いくつかをまとめた GSO のバッファは 1 つ。`__tcp_transmit_skb`）も数えます。
-    TCP ヘッダは、SYN と SYN-ACK がそのオプション込み、閉じたポートへのリセットがオプションなし
-    （`tcp_v4_send_reset`）、ほかはタイムスタンプとその SACK ブロック込み（`tcp_options_write`）です。数えないものは
+    収まる分だけ引用します（`icmp_send`、`icmp6_send`）。ARP の要求とその答え（`arp_send`）、
+    要請ノードのグループへの近隣要請とそれに答える要請された近隣広告（どちらもリンク層のアドレス付き。
+    `ndisc_send_ns`、`ndisc_send_na`）と、TCP の各セグメント（いくつかをまとめた GSO のバッファは 1 つ。
+    `__tcp_transmit_skb`）も数えます。TCP ヘッダは、SYN と SYN-ACK がそのオプション込み、閉じたポートへの
+    リセットがオプションなし（`tcp_v4_send_reset`）、ほかはタイムスタンプとその SACK ブロック込み
+    （`tcp_options_write`）です。数えないものは
     [制限事項](./limitations) にあります。
   - `igmp`（`igmp_mc_seq_show`）は、デバイスごとの IPv4 のグループで、新しいものから順に、
     その利用者の数と並びます。その上には、デバイスの行があり、グループの数と問い合わせ元の

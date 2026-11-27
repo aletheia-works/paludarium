@@ -5271,12 +5271,14 @@ kernel.
     looping back uncounted (`dev_loopback_xmit`); ICMP's port unreachable
     that answers one, out through the end its own route takes, quoting at
     most what fits in 576 bytes or, of IPv6, 1280 (`icmp_send`,
-    `icmp6_send`); an ARP request and its answer (`arp_send`); and each TCP
-    segment, a GSO buffer of several as one (`__tcp_transmit_skb`), with its
-    TCP header: the SYN's and SYN-ACK's options, a reset's to a closed port
-    none (`tcp_v4_send_reset`), the rest the timestamps and their SACK blocks
-    (`tcp_options_write`). What they leave out is in the
-    [limitations](./limitations).
+    `icmp6_send`); an ARP request and its answer (`arp_send`), and a
+    neighbour solicitation to the solicited-node group and its solicited
+    advertisement, each with its link-layer address (`ndisc_send_ns`,
+    `ndisc_send_na`); and each TCP segment, a GSO buffer of several as one
+    (`__tcp_transmit_skb`), with its TCP header: the SYN's and SYN-ACK's
+    options, a reset's to a closed port none (`tcp_v4_send_reset`), the rest
+    the timestamps and their SACK blocks (`tcp_options_write`). What they
+    leave out is in the [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest first,
     with their users, under a line of the device with how many it has and the
     querier `V3`: no IGMP report is heard, and none is sent again on a timer,

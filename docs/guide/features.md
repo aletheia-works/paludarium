@@ -1146,8 +1146,10 @@ kernel.
   for each write-protected page): the pages before it take guards, the
   rest lose their entries, and the call runs again until a signal is to
   be taken, and again after its handler (`ERESTARTNOINTR`), so that it
-  does not return while the marker is there. Private anonymous memory
-  loses its markers to the guards.
+  does not return while the marker is there; `process_madvise` tries the
+  range again until a fatal signal, as Linux's `vector_madvise` does, and
+  runs no handler meanwhile. Private anonymous memory loses its markers
+  to the guards.
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
   `MADV_NOHUGEPAGE` or in a space that `PR_SET_THP_DISABLE` disabled for

@@ -1087,7 +1087,7 @@ pub(crate) fn notify(c: &mut Context<'_>, notify: &Notify) -> Reply {
 /// Whether a signal pending for `c` would end it, which ends a killable
 /// wait (`fatal_signal_pending`): the group ending, or a fatal signal
 /// ([`crate::signals::fatal`]), a timer's that has expired too.
-fn fatal_pending(c: &mut Context<'_>) -> bool {
+pub(crate) fn fatal_pending(c: &mut Context<'_>) -> bool {
     if let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) {
         c.group.expire_due(now);
     }
@@ -1105,7 +1105,7 @@ fn fatal_pending(c: &mut Context<'_>) -> bool {
 
 /// A wait that signals do not end: until the readiness ticket moves, or
 /// for a short while, after which the caller looks for a fatal signal.
-fn wait_through_signals(c: &Context<'_>, ticket: u32) {
+pub(crate) fn wait_through_signals(c: &Context<'_>, ticket: u32) {
     let never = AtomicBool::new(false);
     let clock = paludarium_host::ClockId::Monotonic;
     let Ok(now) = c.host.clock(clock) else {

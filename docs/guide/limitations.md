@@ -1168,10 +1168,6 @@ verified.
   its whole range once its first mapping passes the checks. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
-  A `process_madvise` of the caller's own memory whose `MADV_GUARD_INSTALL`
-  meets a uffd-wp marker it keeps waits for a signal and runs again after
-  its handler, as `madvise` does, where Linux's `vector_madvise` tries
-  again until a fatal signal and runs no handler meanwhile.
   Of shmem's files a memfd and a file of a tmpfs mount (one a guest
   mounted, or `/dev/shm`) are registered, but for write protection alone
   with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the

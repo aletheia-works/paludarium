@@ -1398,6 +1398,56 @@ static void guard_over_marker(void) {
     close(file);
 }
 
+/* The pipe a SIGUSR1 handler writes to, to tell that it ran. */
+static int handled_pipe = -1;
+static void on_usr1(int sig) {
+    (void)sig;
+    write(handled_pipe, "h", 1);
+}
+
+/* The same install through process_madvise, in a child of its own (a
+   fork copies no marker of shmem): Linux's vector_madvise tries again
+   until a fatal signal, and runs no handler meanwhile, so a SIGUSR1 is
+   not taken, the call does not return, and SIGKILL ends it. */
+static void guard_over_marker_vectored(void) {
+    int pipes[2];
+    if (pipe(pipes)) return;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pipes[0]);
+        int fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP);
+        int file = shmem_file(3);
+        char *view = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+        reg(fd, view, 3 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL);
+        view[PAGE] = 'w';
+        protect(fd, view + PAGE, 2 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP);
+        handled_pipe = pipes[1];
+        struct sigaction sa = {0};
+        sa.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &sa, NULL);
+        int pidfd = (int)syscall(434 /* pidfd_open */, getpid(), 0);
+        struct iovec iov = {view, 3 * PAGE};
+        write(pipes[1], "r", 1);
+        syscall(440 /* process_madvise */, pidfd, &iov, 1, MADV_GUARD_INSTALL, 0);
+        write(pipes[1], "!", 1);
+        _exit(0);
+    }
+    close(pipes[1]);
+    char got[8] = {0};
+    read(pipes[0], got, 1);
+    usleep(100000);
+    kill(child, SIGUSR1);
+    usleep(100000);
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
+    long more = read(pipes[0], got + 1, sizeof got - 2);
+    close(pipes[0]);
+    printf("vectored guard over a marker: ready %c after it \"%s\" killed %d\n", got[0],
+           more > 0 ? got + 1 : "", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+}
+
 /* A write to `at` by a thread of its own, which faults to `fd`: the
    message, then the end of the protection of its page, and what the
    thread wrote. */
@@ -1517,6 +1567,7 @@ static int case_wp_shmem(void) {
     printf("written: %c\n", (to[2 * PAGE] = 'm'));
     close(fd);
     guard_over_marker();
+    guard_over_marker_vectored();
     return 0;
 }
 

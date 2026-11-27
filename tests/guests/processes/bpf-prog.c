@@ -13,8 +13,11 @@
    bpf-prog-maps: programs that use maps: the map and its value by
    descriptor in BPF_LD_IMM64, bpf_map_lookup_elem, bpf_map_update_elem
    and bpf_map_delete_elem with keys and values on the stack or in a
-   value, the null check of a lookup's result, and the bounds and access
-   (BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG) of a value.
+   value, the null check of a lookup's result, which an array's element of
+   a key the stack holds needs none of (a 0 stored, a 32-bit spill, the
+   whole of an 8-byte one, in range or not, and keys it does not know),
+   a pointer that cannot be null compared with 0, and the bounds and
+   access (BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG) of a value.
    bpf-prog-context: the context, struct __sk_buff, read and written
    (cb[]) at the offsets and sizes a socket filter may use, and the
    helpers of a socket filter: bpf_skb_load_bytes and its relative form,
@@ -408,6 +411,8 @@ static int case_verify(void) {
    element of a constant key is there, so its lookup needs no null check;
    a hash's does. */
 #define KEY8(fd) ST_DW(10, -8, 0), LD_MAP(1, fd), MOV_REG(2, 10), ADD(2, -8)
+/* The key at fp+at, which stores before it leave. */
+#define KEY_AT(fd, at) LD_MAP(1, fd), MOV_REG(2, 10), ADD(2, at)
 
 static int map(uint32_t type, uint32_t key, uint32_t value, uint32_t entries, uint32_t flags) {
     uint32_t a[32] = {type, key, value, entries, flags};
@@ -445,9 +450,54 @@ static int case_maps(void) {
               EXIT());
     LOAD_MAPS("direct value", LD_VALUE(1, array, 4), LDX_W(0, 1, 0), EXIT());
     LOAD_MAPS("map named twice", LD_MAP(1, array), LD_MAP(2, array), MOV(0, 0), EXIT());
+    /* An array's element of a key the stack holds, with no null check:
+       zeros, a 32-bit spill, and the whole register of an 8-byte one from
+       the key's slot's middle. */
+    LOAD_MAPS("key of zeros", KEY4(array), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("zeros from a register", MOV(3, 0), STX_W(10, 3, -4), KEY_AT(array, -4), CALL(LOOKUP),
+              LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("key spilled", ST_W(10, -8, 1), KEY_AT(pair, -8), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("key of a register", MOV(3, 1), STX_W(10, 3, -8), KEY_AT(pair, -8), CALL(LOOKUP),
+              LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("high half of a spill", ST_DW(10, -8, 1), KEY_AT(pair, -4), CALL(LOOKUP), LDX_DW(0, 0, 0),
+              EXIT());
+    LOAD_MAPS("zeros by a narrow spill", ST_W(10, -4, 0), ST_B(10, -8, 1), KEY_AT(array, -4),
+              CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    /* A pointer that cannot be null is not 0: the other side, past the
+       value, is never walked, nor that of the map's pointer. */
+    LOAD_MAPS("value is not 0", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 2), LDX_DW(0, 0, 0), EXIT(),
+              LDX_DW(0, 0, 8), EXIT());
+    LOAD_MAPS("value is not a register's 0", KEY4(array), CALL(LOOKUP), MOV(1, 0),
+              I(0x1d, 1, 0, 2, 0), LDX_DW(0, 0, 0), EXIT(), LDX_DW(0, 0, 8), EXIT());
+    LOAD_MAPS("value is not 0, jne", KEY4(array), CALL(LOOKUP), I(0x55, 0, 0, 2, 0), LDX_DW(0, 0, 8),
+              EXIT(), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("map is not 0", LD_MAP(1, array), JEQ(1, 0, 2), MOV(0, 0), EXIT(), LDX_DW(0, 10, 8),
+              EXIT());
 
     /* Programs it refuses. */
     LOAD_MAPS("no null check", KEY8(hash), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    /* An array's element of a key out of range, or one the stack does not
+       hold as Linux knows it: unknown, partly overwritten, scrubbed with
+       a spill, an 8-byte spill from its start, a key past its slot's
+       zeros, one bpf_skb_load_bytes wrote. */
+    LOAD_MAPS("key out of range", ST_W(10, -8, 2), KEY_AT(pair, -8), CALL(LOOKUP), LDX_DW(0, 0, 0),
+              EXIT());
+    LOAD_MAPS("negative key", ST_W(10, -8, -1), KEY_AT(pair, -8), CALL(LOOKUP), LDX_DW(0, 0, 0),
+              EXIT());
+    LOAD_MAPS("register too wide", I(0x18, 3, 0, 0, 0), I(0, 0, 0, 0, 1), STX_DW(10, 3, -8),
+              KEY_AT(pair, -4), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("key unknown", ST_W(10, -4, 1), KEY_AT(pair, -4), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("key partly overwritten", ST_W(10, -4, 0), ST_B(10, -2, 1), KEY_AT(array, -4),
+              CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("zeros scrubbed", ST_W(10, -4, 0), ST_W(10, -8, 1), ST_B(10, -6, 0), KEY_AT(array, -4),
+              CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("8-byte spill", ST_DW(10, -8, 0), KEY_AT(array, -8), CALL(LOOKUP), LDX_DW(0, 0, 0),
+              EXIT());
+    LOAD_MAPS("key across slots", ST_DW(10, -16, 0), ST_W(10, -4, 0), KEY_AT(array, -10), CALL(LOOKUP),
+              LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("key loaded over", MOV_REG(6, 1), ST_W(10, -4, 0), MOV_REG(1, 6), MOV(2, 0),
+              MOV_REG(3, 10), ADD(3, -4), MOV(4, 1), CALL(26), KEY_AT(array, -4), CALL(LOOKUP),
+              LDX_DW(0, 0, 0), EXIT());
     LOAD_MAPS("arithmetic before the check", KEY8(hash), CALL(LOOKUP), ADD(0, 1), EXIT());
     LOAD_MAPS("past the value", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 1), LDX_DW(0, 0, 4), EXIT());
     LOAD_MAPS("write a read-only value", KEY4(rdonly), CALL(LOOKUP), JEQ(0, 0, 1), ST_DW(0, 0, 1),

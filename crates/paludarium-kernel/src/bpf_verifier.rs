@@ -44,8 +44,9 @@
 //!   1,000,000 instructions and 8,192 pending branches, which Linux's
 //!   pruning only keeps it further from.
 //! - A lookup's result is null until the program compares it with 0 in a
-//!   64-bit `BPF_JEQ` or `BPF_JNE` of an immediate, where Linux also knows
-//!   an array's element by a constant key is there, and compares two
+//!   64-bit `BPF_JEQ` or `BPF_JNE` of an immediate, unless it is an
+//!   array's element by a key the stack holds as Linux knows it
+//!   (`get_constant_map_key`); Linux also learns from comparing two
 //!   pointers.
 //! - Rejected outright, with a line of the emulator's own ("paludarium:
 //!   ..."; a helper call's starts "unknown func", which tells libbpf and
@@ -298,6 +299,9 @@ mod map_type {
 
 /// The map flags a program's access depends on (`bpf_map_flags_to_cap`).
 const F_RDONLY_PROG: u32 = 1 << 7;
+/// `BPF_F_INNER_MAP`: an array that may stand for the arrays of a map of
+/// maps, whose sizes differ.
+const F_INNER_MAP: u32 = 1 << 12;
 const F_WRONLY_PROG: u32 = 1 << 8;
 
 /// The helpers in range, `enum bpf_func_id`.
@@ -1107,13 +1111,54 @@ fn reg_name(reg: Reg) -> &'static str {
     }
 }
 
-/// An 8-byte stack slot: a register spilled whole (`STACK_SPILL`), or
-/// bytes a read takes as a scalar. A privileged loader may read slots
-/// never written (`allow_uninit_stack`), so those are bytes too.
+/// An 8-byte stack slot as its `slot_type` has it: a register spilled
+/// whole (`STACK_SPILL`); a scalar spilled into its first `size` bytes,
+/// an aligned store narrower than the slot, whose value only a lookup's
+/// key takes here (a read takes it as unknown); or bytes a read takes as
+/// a scalar. A privileged loader may read slots never written
+/// (`allow_uninit_stack`), so those are bytes too. `zeros` has bit `i`
+/// set where `slot_type[i]` is `STACK_ZERO`, which a store of 0 that is
+/// no spill makes: byte `i` is the one `i + 1` below the slot's top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {
-    Bytes,
+    Bytes(u8),
     Spill(Reg),
+    Narrow {
+        value: Option<u64>,
+        size: u8,
+        zeros: u8,
+    },
+}
+
+impl Slot {
+    /// A slot never written.
+    const FRESH: Slot = Slot::Bytes(0);
+    /// The bytes that are `STACK_SPILL`.
+    fn spilled(self) -> u8 {
+        match self {
+            Slot::Bytes(_) => 0,
+            Slot::Spill(_) => 0xff,
+            Slot::Narrow { size, .. } => spill_bytes(size),
+        }
+    }
+    /// The bytes that are `STACK_ZERO`.
+    fn zeros(self) -> u8 {
+        match self {
+            Slot::Bytes(zeros) | Slot::Narrow { zeros, .. } => zeros,
+            Slot::Spill(_) => 0,
+        }
+    }
+}
+
+/// The bytes `save_register_state` makes `STACK_SPILL` for a spill of
+/// `size`: from `slot_type[7]`, the slot's lowest address, up.
+fn spill_bytes(size: u8) -> u8 {
+    (0xff_u16 << (8 - size)) as u8
+}
+
+/// The bit of the byte at `at` in its slot's `slot_type`.
+fn slot_byte(at: i64) -> u8 {
+    1 << ((-at - 1) % 8)
 }
 
 /// A frame's 512-byte stack, by 8-byte slot from the frame pointer down.
@@ -1321,7 +1366,7 @@ impl Walk {
             insn: 0,
             regs,
             subreg: [None; REGS],
-            stack: [Slot::Bytes; (MAX_STACK / 8) as usize],
+            stack: [Slot::FRESH; (MAX_STACK / 8) as usize],
             subprog: 0,
             callers: Vec::new(),
         };
@@ -1599,14 +1644,12 @@ impl Walk {
                 let caller = frame != s.frame();
                 let (stack, subprog) = s.stack_of(frame);
                 self.deepen(subprog, -total);
-                let slot = ((-total - 1) / 8) as usize;
-                let aligned = total % 8 == 0;
                 match value {
                     Some(value) => {
-                        stack_write(stack, caller, slot, aligned, bytes, value)?;
+                        stack_write(stack, caller, total, bytes, value)?;
                         Ok(Reg::NotInit)
                     }
-                    None => stack_read(stack, slot, bytes),
+                    None => stack_read(stack, ((-total - 1) / 8) as usize, bytes),
                 }
             }
             Reg::Ptr(Ptr::Ctx, base) => {
@@ -1825,6 +1868,17 @@ impl Walk {
         }
         // ARG_PTR_TO_MAP_KEY, and ARG_PTR_TO_MAP_VALUE and ARG_ANYTHING.
         self.helper_read(s, 2, shape.key_size)?;
+        // can_elide_value_nullness: an array's (no per-CPU ones here), but
+        // not one of BPF_F_INNER_MAP, whose size need not be the size of
+        // the array it stands for (master's 53040a81ae57).
+        let key = match s.regs[2] {
+            Reg::Ptr(Ptr::Stack(frame), at)
+                if shape.kind == map_type::ARRAY && shape.flags & F_INNER_MAP == 0 =>
+            {
+                constant_key(s.stack_of(frame).0, i64::from(at), shape.key_size)
+            }
+            _ => None,
+        };
         if id == func::MAP_UPDATE_ELEM {
             self.helper_read(s, 3, shape.value_size)?;
             read_ok(s, 4)?;
@@ -1843,6 +1897,10 @@ impl Walk {
                     }
                 })
                 .or_insert(Some(map));
+            // An element of a key in range is there.
+            if key.is_some_and(|key| (0..i64::from(shape.max_entries)).contains(&(key as i64))) {
+                return Ok(Reg::Ptr(Ptr::Value(map), 0));
+            }
             self.ids += 1;
             Reg::Ptr(Ptr::MaybeNull(map, self.ids), 0)
         } else {
@@ -1915,13 +1973,14 @@ impl Walk {
         if relative {
             read_ok(s, 5)?;
         }
-        // The raw mode's writes, a byte at a time, after every argument:
-        // the bytes are bytes the program may read.
+        // The raw mode's writes, a byte at a time, after every argument
+        // (master's `mark_raw_stack`): the bytes are bytes the program may
+        // read, and a spill they touch is gone.
         if let Some((frame, base)) = written {
             let (stack, subprog) = s.stack_of(frame);
             self.deepen(subprog, -base);
             for at in base..base + len {
-                stack[((-at - 1) / 8) as usize] = Slot::Bytes;
+                stack_write(stack, false, at, 1, Store::Bytes)?;
             }
         }
         Ok(())
@@ -2046,7 +2105,7 @@ impl Walk {
         s.callers.push(Caller {
             regs: caller,
             subreg: caller_subreg,
-            stack: std::mem::replace(&mut s.stack, [Slot::Bytes; (MAX_STACK / 8) as usize]),
+            stack: std::mem::replace(&mut s.stack, [Slot::FRESH; (MAX_STACK / 8) as usize]),
             subprog: std::mem::replace(&mut s.subprog, subprog),
             ret: i + 1,
         });
@@ -2260,19 +2319,30 @@ fn write_ok(r: u8) -> Checked<()> {
     Ok(())
 }
 
-/// `check_stack_write_fixed_off`, for a privileged loader: a register
-/// or an immediate that fills an aligned slot is spilled whole, a pointer
-/// only so, and anything else leaves bytes. A narrower spill of a scalar,
-/// which Linux keeps, is bytes here, so its value is unknown. A pointer to
-/// a stack may not go into a caller's frame (`caller`).
-fn stack_write(
-    stack: &mut Stack,
-    caller: bool,
-    slot: usize,
-    aligned: bool,
-    bytes: i64,
-    value: Store,
-) -> Checked<()> {
+/// `check_stack_write_fixed_off` of `bytes` at `at`, for a privileged
+/// loader: a scalar register or an immediate stored at the start of a
+/// slot is spilled (`save_register_state`), a pointer only whole, and
+/// anything else leaves bytes, of 0 (`STACK_ZERO`) when a known 0 is
+/// stored, and takes the spill a slot held. A pointer to a stack may not
+/// go into a caller's frame (`caller`).
+fn stack_write(stack: &mut Stack, caller: bool, at: i64, bytes: i64, value: Store) -> Checked<()> {
+    let slot = ((-at - 1) / 8) as usize;
+    let aligned = at % 8 == 0;
+    let old = stack[slot];
+    // The bytes of a narrower spill: the rest keep STACK_ZERO
+    // (mark_stack_slot_misc), and a spill's become STACK_MISC.
+    let spill = |value: Option<u64>| {
+        if bytes == 8 {
+            Slot::Spill(Reg::Scalar(value))
+        } else {
+            let size = bytes as u8;
+            Slot::Narrow {
+                value,
+                size,
+                zeros: old.zeros() & !spill_bytes(size),
+            }
+        }
+    };
     let stored = match value {
         Store::Reg(Reg::Ptr(..)) if bytes != 8 => {
             return refuse(EACCES, "invalid size of register spill");
@@ -2284,14 +2354,45 @@ fn stack_write(
             );
         }
         Store::Reg(reg @ Reg::Ptr(..)) => Slot::Spill(reg),
-        Store::Reg(reg @ Reg::Scalar(_)) if aligned && bytes == 8 => Slot::Spill(reg),
-        Store::Imm(imm) if aligned && bytes == 8 => {
-            Slot::Spill(Reg::Scalar(Some(i64::from(imm) as u64)))
+        Store::Reg(Reg::Scalar(value)) if aligned => spill(value),
+        Store::Imm(imm) if aligned => spill(Some(i64::from(imm) as u64)),
+        _ => {
+            // A spill is scrubbed whole (scrub_spilled_slot: its STACK_ZERO
+            // bytes too), then the bytes stored are marked.
+            let kept = if old.spilled() != 0 { 0 } else { old.zeros() };
+            let marked = (at..at + bytes).fold(0, |m, at| m | slot_byte(at));
+            let zero = matches!(value, Store::Reg(Reg::Scalar(Some(0))) | Store::Imm(0));
+            Slot::Bytes(if zero { kept | marked } else { kept & !marked })
         }
-        _ => Slot::Bytes,
     };
     stack[slot] = stored;
     Ok(())
+}
+
+/// `get_constant_map_key`: the key of `size` bytes at `at` that the stack
+/// holds, if it knows it: `STACK_ZERO` bytes from the key to the slot's
+/// top, or a scalar spill of the key's size from it. The spill's value is
+/// the register's whole, as Linux takes it.
+fn constant_key(stack: &Stack, at: i64, size: u32) -> Option<u64> {
+    let slot = stack[((-at - 1) / 8) as usize];
+    let off = ((-at - 1) % 8) as u32;
+    let run = |bytes: u8| {
+        (0..=off)
+            .rev()
+            .take_while(|&i| bytes & (1 << i) != 0)
+            .count()
+    };
+    if run(slot.zeros()) as u32 >= size {
+        return Some(0);
+    }
+    let value = match slot {
+        Slot::Spill(Reg::Scalar(value)) | Slot::Narrow { value, .. } => value,
+        _ => return None,
+    };
+    if run(slot.spilled()) as u32 != size {
+        return None;
+    }
+    value
 }
 
 /// `check_stack_read_fixed_off`, for a privileged loader.
@@ -2586,6 +2687,16 @@ fn jmp_op(s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
                         Ok(Step::Next(i + 1))
                     }
                 }
+                // is_branch_taken: a pointer that cannot be null
+                // (reg_not_null, of a value's or a map's here) is not 0.
+                // Master predicts no 32-bit comparison of one
+                // (e51179a4e098), as its low half may be 0.
+                (Reg::Ptr(Ptr::Value(_) | Ptr::Map(_), _), Reg::Scalar(Some(0)))
+                | (Reg::Scalar(Some(0)), Reg::Ptr(Ptr::Value(_) | Ptr::Map(_), _))
+                    if insn.class() == class::JMP && matches!(op, jmp::JEQ | jmp::JNE) =>
+                {
+                    Ok(Step::Next(if op == jmp::JNE { target } else { i + 1 }))
+                }
                 // A 64-bit comparison of a lookup's result with 0 tells
                 // whether it is null.
                 (Reg::Ptr(Ptr::MaybeNull(_, id), _), _)
@@ -2754,7 +2865,8 @@ mod tests {
     }
     /// The maps of the tests, by descriptor: 3 an array of one 8-byte
     /// value with 4-byte keys, 4 a hash with 8-byte keys and values, 5 a
-    /// read-only array, 6 a queue; any other is no map.
+    /// read-only array, 6 a queue, 10 an array of four, 11 the same with
+    /// `BPF_F_INNER_MAP`; any other is no map.
     fn maps(fd: i32) -> Result<MapShape, Errno> {
         let shape = |id, kind, key_size, value_size, max_entries, flags| MapShape {
             id,
@@ -2771,6 +2883,8 @@ mod tests {
             4 => Ok(shape(40, map_type::HASH, 8, 8, 16, 0)),
             5 => Ok(shape(50, map_type::ARRAY, 4, 8, 1, F_RDONLY_PROG)),
             6 => Ok(shape(60, map_type::QUEUE, 0, 8, 4, 0)),
+            10 => Ok(shape(100, map_type::ARRAY, 4, 8, 4, 0)),
+            11 => Ok(shape(110, map_type::ARRAY, 4, 8, 4, F_INNER_MAP)),
             7 => Err(Errno::EINVAL),
             _ => Err(Errno::EBADF),
         }
@@ -3126,6 +3240,120 @@ mod tests {
         v.extend([mov_reg(2, 10), i(0x07, 2, 0, 0, -4), call(1)]);
         v
     }
+    /// A lookup of the key `stores` leave at `at`.
+    fn lookup_at(fd: i32, stores: &[Insn], at: i32) -> Vec<Insn> {
+        let mut v = stores.to_vec();
+        v.extend(ld_map(1, fd));
+        v.extend([mov_reg(2, 10), i(0x07, 2, 0, 0, at), call(1)]);
+        v
+    }
+    /// A lookup of a key of 1 stored where the verifier does not know it
+    /// (`STACK_MISC`), so its result may be null even in an array.
+    fn unknown_key(fd: i32) -> Vec<Insn> {
+        lookup_at(fd, &[i(0x62, 10, 0, -4, 1)], -4)
+    }
+
+    #[test]
+    fn an_arrays_element_of_a_key_the_stack_holds_is_there() {
+        let read = [ldx(0x18, 0, 0, 0), exit()];
+        let null = || {
+            (
+                EACCES,
+                "R0 invalid mem access 'map_value_or_null'".to_string(),
+            )
+        };
+        let check = |stores: &[Insn], at: i32, fd: i32| {
+            let mut p = lookup_at(fd, stores, at);
+            p.extend(read);
+            verify(&p, Options::default())
+                .map(|_| ())
+                .map_err(|r| (r.errno, r.line))
+        };
+        // A 0 stored off a slot's start is STACK_ZERO, from an immediate or
+        // a register.
+        assert_eq!(check(&[i(0x62, 10, 0, -4, 0)], -4, 3), Ok(()));
+        assert_eq!(check(&[mov(1, 0), i(0x63, 10, 1, -4, 0)], -4, 3), Ok(()));
+        // A 32-bit spill at a slot's start, of a key in range or not.
+        assert_eq!(check(&[i(0x62, 10, 0, -8, 3)], -8, 10), Ok(()));
+        assert_eq!(check(&[i(0x62, 10, 0, -8, 4)], -8, 10), Err(null()));
+        assert_eq!(check(&[i(0x62, 10, 0, -8, -1)], -8, 10), Err(null()));
+        assert_eq!(check(&[mov(1, 2), i(0x63, 10, 1, -8, 0)], -8, 10), Ok(()));
+        // A spill of 8 bytes is not of the key's size from its start, but
+        // from the slot's middle it is: the whole register is the key.
+        assert_eq!(check(&[i(0x7a, 10, 0, -8, 0)], -8, 10), Err(null()));
+        assert_eq!(check(&[i(0x7a, 10, 0, -8, 2)], -4, 10), Ok(()));
+        let big = [i(0x18, 1, 0, 0, 0), i(0, 0, 0, 0, 1), stx_dw(10, 1, -8)];
+        assert_eq!(check(&big, -4, 10), Err(null()));
+        // An unknown value, or one byte of it, and a key past its slot's
+        // zeros.
+        assert_eq!(check(&[i(0x62, 10, 0, -4, 2)], -4, 10), Err(null()));
+        let partly = [i(0x62, 10, 0, -4, 0), i(0x72, 10, 0, -2, 1)];
+        assert_eq!(check(&partly, -4, 10), Err(null()));
+        let crossing = [i(0x7a, 10, 0, -16, 0), i(0x62, 10, 0, -4, 0)];
+        assert_eq!(check(&crossing, -10, 10), Err(null()));
+        // A store that is no spill takes the spill's zeros too; a narrower
+        // spill keeps the rest's.
+        let scrubbed = [
+            i(0x62, 10, 0, -4, 0),
+            i(0x62, 10, 0, -8, 1),
+            i(0x72, 10, 0, -6, 0),
+        ];
+        assert_eq!(check(&scrubbed, -4, 10), Err(null()));
+        let kept = [i(0x62, 10, 0, -4, 0), i(0x72, 10, 0, -8, 1)];
+        assert_eq!(check(&kept, -4, 10), Ok(()));
+        // Not a hash's, nor an inner map's, whose size is not the arrays'.
+        assert_eq!(check(&[i(0x62, 10, 0, -4, 0)], -4, 11), Err(null()));
+        let hash = [i(0x7a, 10, 0, -8, 0)];
+        assert_eq!(check(&hash, -8, 4), Err(null()));
+        // What bpf_skb_load_bytes writes over the key is unknown.
+        let mut p = vec![
+            mov_reg(6, 1),
+            i(0x62, 10, 0, -4, 0),
+            mov_reg(1, 6),
+            mov(2, 0),
+        ];
+        p.extend([mov_reg(3, 10), i(0x07, 3, 0, 0, -4), mov(4, 1), call(26)]);
+        assert_eq!(check(&p, -4, 10), Err(null()));
+        // The key in a caller's frame.
+        let mut p = vec![i(0x62, 10, 0, -4, 0), mov_reg(2, 10), i(0x07, 2, 0, 0, -4)];
+        p.extend([i(0x85, 0, 1, 0, 1), exit()]);
+        p.extend(ld_map(1, 10));
+        p.extend([call(1)]);
+        p.extend(read);
+        ok(&p);
+    }
+
+    #[test]
+    fn a_pointer_that_cannot_be_null_is_not_0() {
+        // The 0 side, past the value, is never walked.
+        let past = [ldx(0x18, 0, 0, 8), exit()];
+        let mut p = lookup(3);
+        p.extend([i(0x15, 0, 0, 2, 0), ldx(0x18, 0, 0, 0), exit()]);
+        p.extend(past);
+        ok(&p);
+        let mut p = lookup(3);
+        p.extend([i(0x55, 0, 0, 2, 0)]);
+        p.extend(past);
+        p.extend([ldx(0x18, 0, 0, 0), exit()]);
+        ok(&p);
+        // 0 in a register, on either side.
+        let mut p = lookup(3);
+        p.extend([mov(1, 0), i(0x1d, 1, 0, 2, 0), ldx(0x18, 0, 0, 0), exit()]);
+        p.extend(past);
+        ok(&p);
+        // A map's pointer.
+        let mut p = ld_map(1, 3).to_vec();
+        p.extend([i(0x15, 1, 0, 1, 0), mov(0, 0), exit()]);
+        assert_eq!(ok(&p), 4);
+        // Master does not predict a 32-bit comparison.
+        let mut p = lookup(3);
+        p.extend([i(0x16, 0, 0, 2, 0), ldx(0x18, 0, 0, 0), exit()]);
+        p.extend(past);
+        assert_eq!(
+            refused(&p).1,
+            "invalid access to map value, value_size=8 off=8 size=8\nR0 min value is outside of the allowed memory range"
+        );
+    }
 
     #[test]
     fn atomics_are_checked_as_check_atomic_does() {
@@ -3357,18 +3585,18 @@ mod tests {
 
     #[test]
     fn a_lookup_must_be_null_checked() {
-        let mut p = lookup(3);
+        let mut p = unknown_key(3);
         p.extend([ldx(0x18, 0, 0, 0), exit()]);
         assert_eq!(
             refused(&p),
             (EACCES, "R0 invalid mem access 'map_value_or_null'".into())
         );
         // if r0 == 0 goto exit; r0 = *(u64 *)(r0 + 0)
-        let mut p = lookup(3);
+        let mut p = unknown_key(3);
         p.extend([i(0x15, 0, 0, 1, 0), ldx(0x18, 0, 0, 0), exit()]);
         ok(&p);
         // A copy spilled before the check is checked with it.
-        let mut p = lookup(3);
+        let mut p = unknown_key(3);
         p.extend([
             stx_dw(10, 0, -16),
             i(0x55, 0, 0, 2, 0),
@@ -3380,10 +3608,10 @@ mod tests {
         ]);
         ok(&p);
         // A 32-bit comparison does not tell.
-        let mut p = lookup(3);
+        let mut p = unknown_key(3);
         p.extend([i(0x16, 0, 0, 1, 0), ldx(0x18, 0, 0, 0), exit()]);
         assert_eq!(refused(&p).1, "R0 invalid mem access 'map_value_or_null'");
-        let mut p = lookup(3);
+        let mut p = unknown_key(3);
         p.extend([i(0x07, 0, 0, 0, 1), exit()]);
         assert_eq!(
             refused(&p),

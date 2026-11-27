@@ -500,8 +500,11 @@ verified.
   walks both ways of a jump Linux knows goes one way, and it prunes no
   states, so a program with many branches may reach the limits sooner. A
   lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
-  the immediate 0 tells, where Linux also knows that an array's element
-  of a constant key is there and learns from comparing two pointers.
+  the immediate 0 tells, or an array's key is one the stack holds
+  ([System calls](./features#system-calls)), where Linux also learns from
+  comparing two pointers; and a read of the stack's zeros, or of a spill
+  narrower than 8 bytes, is a value it does not know, where Linux knows
+  it.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for

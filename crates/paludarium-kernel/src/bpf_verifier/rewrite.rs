@@ -26,7 +26,9 @@
 //!
 //! A rewrite whose jumps no longer reach in 16 bits is `ENOMEM`, with
 //! the original instruction's index in the log (`bpf_patch_insn_data`).
-use super::{Checked, Insn, MapShape, alu, class, def32, func, jmp, map_type, mode, size};
+use super::{
+    Checked, F_INNER_MAP, Insn, MapShape, alu, class, def32, func, jmp, map_type, mode, size,
+};
 use paludarium_types::Errno;
 use std::collections::BTreeMap;
 
@@ -44,9 +46,6 @@ pub(super) struct Facts<'a> {
     pub(super) zext: &'a [bool],
     pub(super) rnd_hi32: bool,
 }
-
-/// `BPF_F_INNER_MAP`, with which an array's lookup is not inlined.
-const F_INNER_MAP: u32 = 1 << 12;
 
 /// `prog->len` after the rewrites.
 pub(super) fn len(f: &Facts<'_>) -> Checked<usize> {
@@ -205,7 +204,7 @@ fn misc_fixup(f: &Facts<'_>, i: usize) -> Option<usize> {
             func::MAP_LOOKUP_ELEM => {
                 let map = &f.maps[usize::from(f.lookups.get(&i).copied().flatten()?)];
                 match map.kind {
-                    // array_map_gen_lookup.
+                    // array_map_gen_lookup, which an inner map has none of.
                     map_type::ARRAY if map.flags & F_INNER_MAP == 0 => {
                         Some(if map.bypass_spec { 7 } else { 8 })
                     }

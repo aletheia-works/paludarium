@@ -558,9 +558,11 @@ pub(crate) const CMDLINE: &[u8] = b"ro\n";
 /// `totalswap` of 0 says, so no area follows.
 pub(crate) const SWAPS: &[u8] = b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 /// `/proc/cgroups`, as Linux's `proc_cgroupstats_show` prints its header.
-/// It lists the controllers a version 1 hierarchy may have; there are none
-/// here, where the only hierarchy is version 2's root
-/// (`/proc/<pid>/cgroup`'s `0::/`), so no line follows.
+/// Linux then prints a line for every controller built into the kernel,
+/// bound to a version 1 hierarchy or not (one of version 2's shows
+/// hierarchy 0). The emulator has no controller at all, as a kernel built
+/// with none: its only cgroup is version 2's root (`/proc/<pid>/cgroup`'s
+/// `0::/`), with nothing to control, so no line follows.
 pub(crate) const CGROUPS: &[u8] = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n";
 /// `/proc/version`, as Linux's `version_proc_show` prints
 /// `linux_proc_banner` with the UTS names `uname` gives: the system, the
@@ -3707,7 +3709,10 @@ mod generated_tests {
             b"Character devices:\n  1 mem\n  5 /dev/tty\n  5 /dev/ptmx\n 10 misc\n128 ptm\n136 pts\n\n\
               Block devices:\n259 blkext\n"
         );
-        assert_eq!(render_misc(), b"122 userfaultfd\n");
+        assert_eq!(
+            render_misc(),
+            format!("{:3} userfaultfd\n", crate::devices::USERFAULTFD_MINOR).into_bytes()
+        );
         let meminfo = String::from_utf8(render_meminfo(4 << 30)).unwrap();
         let lines: Vec<&str> = meminfo.lines().collect();
         assert_eq!(lines[0], "MemTotal:        4194304 kB");

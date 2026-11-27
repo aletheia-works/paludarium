@@ -4292,8 +4292,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     疑似端末のマスター（`ptm`）とスレーブ（`pts`）のキャラクターデバイスのメジャー番号に続けて、
     ブロックデバイスのメジャー番号 `blkext` だけを並べます。
   - `/proc/misc` は `/dev/userfaultfd` のマイナー番号を並べます。
-  - `/proc/swaps` と `/proc/cgroups` は見出しの行だけです。スワップはなく、コントローラーも
-    ありません（cgroup はバージョン 2 のルートだけです）。
+  - `/proc/swaps` と `/proc/cgroups` は見出しの行だけです。スワップはなく、エミュレーターには
+    コントローラーをひとつも組み込まずにビルドしたカーネルと同じく、cgroup のコントローラーが
+    まったくありません（cgroup はバージョン 2 のルートだけです）。
 
 - `/proc/stat` は Linux の `show_stat` と同じ形式です。
   - `cpu` の行と、`sched_getaffinity` が返す CPU ごとの行は、すべてのスレッドが使った CPU 時間を

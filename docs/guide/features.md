@@ -5015,7 +5015,8 @@ kernel.
     masters (`ptm`) and slaves (`pts`), then the block major `blkext` alone.
   - `/proc/misc` lists `/dev/userfaultfd`'s minor.
   - `/proc/swaps` and `/proc/cgroups` are their headers alone: nothing swaps,
-    and there is no controller (the only cgroup is version 2's root).
+    and the emulator has no cgroup controller at all, as a kernel built with
+    none (the only cgroup is version 2's root).
 
 - `/proc/stat` is in the format of Linux's `show_stat`.
   - A `cpu` line and one for each CPU `sched_getaffinity` reports give, in

@@ -957,8 +957,9 @@ impl Ports {
             })
             .collect()
     }
-    /// Takes `binding`'s port, or with port 0 the next free ephemeral one;
-    /// `EADDRINUSE` when it conflicts, or no ephemeral port is free.
+    /// Takes `binding`'s port, or with port 0 the next free ephemeral one
+    /// that is not among the host's (see [`Self::beside`]); `EADDRINUSE`
+    /// when it conflicts, or no ephemeral port is free.
     /// Returns the address taken.
     pub(crate) fn bind(&mut self, mut binding: Binding) -> Result<SocketAddr, Errno> {
         self.live();

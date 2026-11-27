@@ -6838,9 +6838,10 @@ one only with an `--allow-net`.
 - **`bind`** takes an address of its network namespace (the loopback's
   `127.0.0.0/8` and `::1`, a veth end's, or IPv4 ones IPv4-mapped on an
   IPv6 socket) or the unspecified one, with a port
-  or, for port 0, an ephemeral one from 32768–60999 (none of the ports at
-  which an `--allow-net` entry reaches the host's loopback, where a
-  connection would reach the host's socket), with Linux's checks in
+  or, for port 0, an ephemeral one from 32768–60999 (none of the ports
+  that an `--allow-net` entry with a port reaches the host's loopback at,
+  where a connection would reach the host's socket; an entry for every
+  port leaves none out), with Linux's checks in
   its order: `EADDRNOTAVAIL` for another address, `EINVAL` once bound,
   `EADDRINUSE` for a port another socket holds on an address both cover (a
   listener's, a connection it accepted, a client's), unless both set

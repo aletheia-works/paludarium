@@ -130,11 +130,22 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
+- **Device counters, in part**: `/proc/net/dev` and a link's
+  `IFLA_STATS64` and `IFLA_STATS` count UDP datagrams, ICMP's port
+  unreachable and ARP alone (see [features](./features)). TCP's segments
+  are not counted yet, nor the packets of IPv6 that the kernel sends of
+  itself (neighbour discovery, MLD reports, router solicitations and
+  duplicate address detection), nor ARP's probes of a neighbour whose
+  entry ages, nor what goes to the host (a TCP connection to a port no
+  guest socket holds, the DNS stub's answers) or through the loopback to
+  a broadcast or group address, nor an MCTP send out through the
+  loopback. No error, drop or multicast is counted: a packet that Linux
+  drops as it leaves a veth end whose peer is down (`tx_dropped`) is
+  not sent here at all.
 - **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `dev_mcast`,
   `if_inet6`, `igmp`, `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route`
   and those of the sockets (see [features](./features)) alone; `snmp`,
-  `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
-  `dev` are 0. `SIOCADDMULTI` and `SIOCDELMULTI` are not supported, so
+  `sockstat` and the rest are `ENOENT`. `SIOCADDMULTI` and `SIOCDELMULTI` are not supported, so
   `dev_mcast` has only the addresses the devices' groups map to, none of
   them global; nor is the `RTM_GETMULTICAST` dump of those addresses
   (`AF_PACKET`) that Linux master has. A session with no network has files of no device and no
@@ -1304,7 +1315,7 @@ verified.
   comes from a sequence of the emulator's own, not the kernel's random
   numbers; its link watch comes at once, where Linux's may come a second
   later, and so its operational state is found as it is told of; it has one queue each way, where Linux's has one for each
-  possible CPU, no `IFLA_AF_SPEC`, and statistics of zero. The interface
+  possible CPU, and no `IFLA_AF_SPEC`. The interface
   requests and netlink change no other flag than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`,
   `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the
@@ -1455,8 +1466,7 @@ verified.
   Linux answers for every socket only those paludarium has for any. A send
   by hardware address while the loopback has no MCTP address is
   `EHOSTUNREACH`, as on Linux 7.0, where later kernels send it from
-  `MCTP_ADDR_NULL`. A link message's
-  statistics are zero; its IPv4 and IPv6 settings are those of a kernel
+  `MCTP_ADDR_NULL`. A link message's IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30
   seconds, where Linux's is random. The first namespace's `127.0.0.1`

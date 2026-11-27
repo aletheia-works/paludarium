@@ -103,6 +103,20 @@ pub(crate) struct Conf6 {
     pub accept_dad: i32,
 }
 
+/// What a device has sent or taken in: its packets and their bytes
+/// (`pcpu_sw_netstats`, `pcpu_lstats`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub packets: u64,
+    pub bytes: u64,
+}
+impl Tally {
+    fn add(&mut self, bytes: usize) {
+        self.packets += 1;
+        self.bytes += bytes as u64;
+    }
+}
+
 /// One network device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Device {
@@ -121,9 +135,35 @@ pub(crate) struct Device {
     pub links: crate::multicast::Links,
     /// A veth end's state; `None` for the loopback.
     pub veth: Option<Veth>,
+    /// What it has sent, and what it has taken in: a veth end takes in
+    /// what its peer sends (`veth_get_stats64`), the loopback what it sends
+    /// (`loopback_get_stats64`).
+    pub tx: Tally,
+    pub rx: Tally,
 }
 
 impl Device {
+    /// Its statistics (`struct rtnl_link_stats64`, `dev_get_stats`): what
+    /// it has taken in and sent; no error, drop or multicast is counted.
+    pub(crate) fn stats64(&self) -> [u64; 25] {
+        let mut stats = [0; 25];
+        stats[0] = self.rx.packets;
+        stats[1] = self.tx.packets;
+        stats[2] = self.rx.bytes;
+        stats[3] = self.tx.bytes;
+        stats
+    }
+    /// [`Self::stats64`] as `IFLA_STATS64` carries it, and as `IFLA_STATS`
+    /// does, each field cut to 32 bits (`copy_rtnl_link_stats`).
+    pub(crate) fn stats_attributes(&self) -> (Vec<u8>, Vec<u8>) {
+        let stats = self.stats64();
+        let wide = stats.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let narrow = stats[..24]
+            .iter()
+            .flat_map(|&v| (v as u32).to_le_bytes())
+            .collect();
+        (wide, narrow)
+    }
     /// The loopback, as a namespace makes it (`loopback_net_init`).
     fn loopback() -> Self {
         Self {
@@ -139,6 +179,8 @@ impl Device {
             groups6: crate::multicast::all_nodes(0),
             links: crate::multicast::Links::default(),
             veth: None,
+            tx: Tally::default(),
+            rx: Tally::default(),
         }
     }
     /// A veth end of `index` named `name`, of Ethernet address `mac` and
@@ -173,6 +215,8 @@ impl Device {
                 opened: false,
                 peer: None,
             }),
+            tx: Tally::default(),
+            rx: Tally::default(),
         }
     }
 }
@@ -255,6 +299,29 @@ impl Devices {
     /// The device of `index`, to change its settings.
     pub(crate) fn by_index_mut(&mut self, index: i32) -> Option<&mut Device> {
         self.list.iter_mut().find(|d| d.index == index)
+    }
+    /// The device of `index` sends a packet of each of `frames`' lengths,
+    /// as its driver counts them (`loopback_xmit`, `veth_xmit`): the
+    /// loopback takes each in itself; a veth end gives back its peer, which
+    /// takes them in.
+    pub(crate) fn send(&mut self, index: i32, frames: &[usize]) -> Option<Peer> {
+        let device = self.by_index_mut(index)?;
+        for &frame in frames {
+            device.tx.add(frame);
+            if device.veth.is_none() {
+                device.rx.add(frame);
+            }
+        }
+        device.veth.as_ref()?.peer.clone()
+    }
+    /// The device of `index` takes in packets of `frames`' lengths that its
+    /// peer sent.
+    pub(crate) fn take(&mut self, index: i32, frames: &[usize]) {
+        if let Some(device) = self.by_index_mut(index) {
+            for &frame in frames {
+                device.rx.add(frame);
+            }
+        }
     }
     /// The IPv4 groups of the device of `index`, with its link-layer
     /// addresses and the changes to tell of ([`Devices::told4`]).

@@ -3577,8 +3577,8 @@ fn link_flags(network: &Network) -> u32 {
 }
 /// `RTM_NEWLINK` for `lo`, as `rtnl_fill_ifinfo` gives it, with its
 /// attributes in Linux 7.0's order: its name, queue, state, MTU, queues,
-/// segment sizes, carrier, hardware addresses, statistics (all zero, and
-/// left out for `RTEXT_FILTER_SKIP_STATS` in `mask`), XDP, queueing
+/// segment sizes, carrier, hardware addresses, statistics (left out for
+/// `RTEXT_FILTER_SKIP_STATS` in `mask`), XDP, queueing
 /// discipline, its IPv4 and IPv6 settings ([`af_spec`]), its map and empty
 /// devlink and DPLL nests.
 fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -> Vec<u8> {
@@ -3624,8 +3624,13 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
     attribute(&mut body, IFLA_ADDRESS, &[0; 6]);
     attribute(&mut body, IFLA_BROADCAST, &[0; 6]);
     if stats {
-        attribute(&mut body, IFLA_STATS64, &[0; STATS64_LEN]);
-        attribute(&mut body, IFLA_STATS, &[0; STATS_LEN]);
+        let (wide, narrow) = network
+            .devices()
+            .by_index(LOOPBACK_INDEX)
+            .map(crate::netdev::Device::stats_attributes)
+            .unwrap_or_else(|| (vec![0; STATS64_LEN], vec![0; STATS_LEN]));
+        attribute(&mut body, IFLA_STATS64, &wide);
+        attribute(&mut body, IFLA_STATS, &narrow);
     }
     let mut xdp = Vec::new();
     attribute(&mut xdp, IFLA_XDP_ATTACHED, &[0]);

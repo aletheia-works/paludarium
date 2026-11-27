@@ -2980,7 +2980,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
-    キューイング規律、0 の統計（`IFLA_EXT_MASK` に `RTEXT_FILTER_SKIP_STATS` があれば
+    キューイング規律、統計（`IFLA_EXT_MASK` に `RTEXT_FILTER_SKIP_STATS` があれば
     載せません）、XDP、マップ、MCTP と IPv4 と IPv6 の設定（MCTP を組み込んだカーネルと同じ `IFLA_AF_SPEC`）です。そのため
     `ip -d link` は Linux と同じ詳細を出します。`AF_INET6` のダンプには、`inet6_dump_ifinfo`
     と同じく、`AF_INET6` の `ifinfomsg` に名前、ハードウェアアドレス、MTU、状態と、
@@ -4340,11 +4340,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   名前空間を持つユーザー名前空間のルート（ネットワーク名前空間を作ったときの対応によるもので、
   なければ最初の名前空間のルート。`proc_net_ns_init`）のもので、読むためだけに開け（`EACCES`、`seq_open_net`）、
   読むたびに作ります。
-  - `dev`（`dev_seq_show`）はデバイスで、カウンタは 0 です。`if_inet6`（`if6_seq_show`）は IPv6 の
+  - `dev`（`dev_seq_show`）はデバイスとそのカウンタです（下を参照）。`if_inet6`（`if6_seq_show`）は IPv6 の
     アドレス、`route`（`fib_route_seq_show`）は IPv4 の main の表で、表がなければ空です。
     IPv6 のゲートウェイ（`RTA_VIA`）は 00000000 で、その先頭 4 バイトが 0 でなければ `RTF_GATEWAY` です（`fib_flag_trans`）。
     `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
     `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
+  - `dev` のカウンタは、リンクの `IFLA_STATS64` と `IFLA_STATS` のもの（`dev_get_stats`）と同じく、
+    各デバイスが送ったものと受け取ったもののパケットとバイトの数です。ループバックは、各パケットを
+    IP ヘッダから、送りと受けで 1 回ずつ数えます（`loopback_xmit`）。veth の端は、送るものを
+    Ethernet ヘッダ込みで数え（`veth_xmit`）、ピアが送るものを、ピアがどの名前空間にあっても
+    受け取ったものとして数えます（`veth_get_stats64`）。数えるのは、UDP のデータグラム
+    （デバイスの MTU を超えるものは断片ごと。`__ip_append_data`、`__ip6_append_data`）が出ていく
+    ところです。自身のアドレスへのものはループバックを通り、veth の端からのものはピアへ行きます。
+    ブロードキャストやグループへのものは、受け取る者がいてもいなくても 1 回で、送り手自身の
+    コピーは数えずに戻ります（`dev_loopback_xmit`）。それに答える ICMP の port unreachable
+    も数えます。元のパケットは 576 バイト（IPv6 は 1280）に収まる分だけ引用します（`icmp_send`、
+    `icmp6_send`）。ARP の要求とその答え（`arp_send`）も数えます。数えないものは
+    [制限事項](./limitations) にあります。
   - `igmp`（`igmp_mc_seq_show`）は、デバイスごとの IPv4 のグループで、新しいものから順に、
     その利用者の数と並びます。その上には、デバイスの行があり、グループの数と問い合わせ元の
     `V3` を示します。IGMP のレポートは送りも受けもしないので、タイマーは動かず、レポートした

@@ -3467,7 +3467,7 @@ kernel.
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,
-    queues, segment sizes, carrier, queueing discipline, zero statistics (left out
+    queues, segment sizes, carrier, queueing discipline, statistics (left out
     with `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK`), XDP, map, and its
     MCTP, IPv4 and IPv6 settings (`IFLA_AF_SPEC`, as a kernel built with
     MCTP gives it), so `ip -d link` gives
@@ -5074,13 +5074,29 @@ kernel.
   the network namespace was made, else the first's (`proc_net_ns_init`),
   opens for reading only (`EACCES`, `seq_open_net`), and is made as it is
   read:
-  - `dev` (`dev_seq_show`), the devices, with counters of 0; `if_inet6`
+  - `dev` (`dev_seq_show`), the devices, with their counters (see below);
+    `if_inet6`
     (`if6_seq_show`), the IPv6 addresses; `route` (`fib_route_seq_show`),
     IPv4's main table, nothing while there is none, with a gateway of IPv6
     (`RTA_VIA`) as 00000000, `RTF_GATEWAY` where its first 4 bytes are not
     0 (`fib_flag_trans`); `ipv6_route`
     (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - The counters of `dev`, as of a link's `IFLA_STATS64` and `IFLA_STATS`
+    (`dev_get_stats`), are the packets and bytes each device has sent and
+    taken in. The loopback counts each packet once each way from its IP
+    header (`loopback_xmit`); a veth end counts what it sends with its
+    Ethernet header (`veth_xmit`) and takes in what its peer sends
+    (`veth_get_stats64`), in whatever namespace that is. They count each
+    UDP datagram, or each fragment of one past the device's MTU
+    (`__ip_append_data`, `__ip6_append_data`), as it leaves: through the
+    loopback to an own address, through a veth end to its peer, or once
+    for a broadcast or a group whoever takes it, the sender's own copy
+    looping back uncounted (`dev_loopback_xmit`); ICMP's port unreachable
+    that answers one, quoting at most what fits in 576 bytes or, of IPv6,
+    1280 (`icmp_send`, `icmp6_send`); and an ARP request and its answer
+    (`arp_send`). What they leave out is in the
+    [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
     has and the querier `V3`: no IGMP report is sent or heard, so no timer

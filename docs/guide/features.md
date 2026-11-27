@@ -3546,7 +3546,11 @@ kernel.
     and main tables, then the default table's where they have none or a
     `throw` route; IPv6 in the local table, then the main one, while `lo`
     is up. A rejecting route's error is the answer (`EINVAL`,
-    `EHOSTUNREACH`, `EACCES`). An IPv4 answer names the main table (with
+    `EHOSTUNREACH`, `EACCES`), and a socket's connection or datagram it
+    takes fails with it too; one an IPv4 unicast route through `lo` takes
+    goes out through `lo`, as one from a socket bound to `lo` does, even
+    while `lo` is down by one of host scope, which stays
+    (`fib_sync_down_dev`). An IPv4 answer names the main table (with
     `RTM_F_LOOKUP_TABLE`, the table it came from), the source
     `fib_select_path` picks, a gateway reached on link, the `RTA_MARK` the
     request names (none for 0), and the caller's

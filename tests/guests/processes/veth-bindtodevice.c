@@ -18,7 +18,13 @@
    (inet_select_addr's first of link scope), or 127.0.0.1, and comes back
    in on lo: a datagram to what takes it there, a connection's SYN with
    no answer, none from an address not the namespace's own, and one from
-   10.0.0.1 in on va. A device down is ENETUNREACH, one gone ENODEV. */
+   10.0.0.1 in on va. From one bound to no device, an IPv4 route through
+   lo does the same, and a rejecting route of either family fails a
+   datagram, a UDP connect and a TCP connect with its error: unreachable
+   EHOSTUNREACH, prohibit EACCES, blackhole EINVAL, throw ENETUNREACH. A
+   device down is ENETUNREACH, one gone ENODEV. With lo down, a route
+   through it of host scope stays and still sends through it; one of link
+   scope has gone. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -356,6 +362,74 @@ static void route4(int fd, const char *dst, int len, int oif, const char *label)
     put(&b, RTA_OIF, &oif, 4);
     request(fd, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, &b, label);
 }
+/* Adds a route of `type` to `dst`/`len` of `family` to the main table,
+   through the device `oif` (none for 0), of link scope with one. */
+static void route_of(int fd, int family, const char *dst, int len, int oif, int type, const char *label) {
+    struct body b = {0};
+    const unsigned char m[12] = {(unsigned char)family, (unsigned char)len, 0, 0, 254, 3,
+                                 oif ? 253 : 0, (unsigned char)type, 0, 0, 0, 0};
+    unsigned char in[16];
+    inet_pton(family, dst, in);
+    raw(&b, m, sizeof m);
+    put(&b, RTA_DST, in, family == AF_INET ? 4 : 16);
+    if (oif) put(&b, RTA_OIF, &oif, 4);
+    request(fd, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, &b, label);
+}
+/* A unicast route to the IPv4 /16 `dst` through lo, of the scope `scope`. */
+static void route_lo(int fd, const char *dst, unsigned char scope, const char *label) {
+    struct body b = {0};
+    const unsigned char m[12] = {AF_INET, 16, 0, 0, 254, 3, scope, 1, 0, 0, 0, 0};
+    unsigned char in[4];
+    int oif = 1;
+    inet_pton(AF_INET, dst, in);
+    raw(&b, m, sizeof m);
+    put(&b, RTA_DST, in, 4);
+    put(&b, RTA_OIF, &oif, 4);
+    request(fd, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, &b, label);
+}
+/* From sockets bound to no device to `ip` of `family`: a UDP datagram,
+   a UDP connect and the name it gives, and a nonblocking TCP connection
+   to port 8000 and what it is a little later. */
+static void unbound(int family, const char *ip, const char *label) {
+    struct sockaddr_storage to = {0};
+    socklen_t len;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 a = at6(ip, 7100);
+        memcpy(&to, &a, sizeof a);
+        len = sizeof a;
+    } else {
+        struct sockaddr_in a = at4(ip, 7000);
+        memcpy(&to, &a, sizeof a);
+        len = sizeof a;
+    }
+    int u = socket(family, SOCK_DGRAM, 0);
+    printf("%s: sendto=%ld\n", label, result(sendto(u, "x", 1, 0, (void *)&to, len)));
+    printf("%s: connect=%ld\n", label, result(connect(u, (void *)&to, len)));
+    struct sockaddr_storage name = {0};
+    socklen_t nlen = sizeof name;
+    getsockname(u, (void *)&name, &nlen);
+    char text[INET6_ADDRSTRLEN] = "?";
+    if (family == AF_INET6)
+        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&name)->sin6_addr, text, sizeof text);
+    else
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&name)->sin_addr, text, sizeof text);
+    printf("%s: name %s\n", label, text);
+    close(u);
+    int t = socket(family, SOCK_STREAM, 0);
+    fcntl(t, F_SETFL, O_NONBLOCK);
+    if (family == AF_INET6)
+        ((struct sockaddr_in6 *)&to)->sin6_port = htons(8000);
+    else
+        ((struct sockaddr_in *)&to)->sin_port = htons(8000);
+    printf("%s: TCP connect=%ld\n", label, result(connect(t, (void *)&to, len)));
+    struct pollfd p = {.fd = t, .events = POLLOUT};
+    long ready = result(poll(&p, 1, 200));
+    int error = -1;
+    socklen_t elen = sizeof error;
+    getsockopt(t, SOL_SOCKET, SO_ERROR, &error, &elen);
+    printf("%s: poll=%ld revents=%#x SO_ERROR=%d\n", label, ready, (unsigned)p.revents, error);
+    close(t);
+}
 /* Prints the IPv4 address `fd` is bound to. */
 static void name4(int fd, const char *label) {
     struct sockaddr_in name = {0};
@@ -571,6 +645,32 @@ int main(int argc, char **argv) {
     if (took >= 0) show(took, 16, "accepted"), name4(took, "accepted"), close(took);
     close(on_lo), close(lo_local), close(lo6), close(lo_l), close(any_l);
 
+    /* From sockets bound to no device, by IPv4's route through lo, which
+       takes in what it sends, or a rejecting one, which fails it with its
+       error. */
+    const int kinds[] = {7, 8, 6, 9};
+    const char *const kind_names[] = {"unreachable", "prohibit", "blackhole", "throw"};
+    const char *const fours[] = {"10.7.0.0", "10.6.0.0", "10.5.0.0", "10.4.0.0"};
+    const char *const sixes6[] = {"2001:db8:7::", "2001:db8:6::", "2001:db8:5::", "2001:db8:4::"};
+    for (int i = 0; i < 4; i++) {
+        char label[64];
+        snprintf(label, sizeof label, "%s route %s/16", kind_names[i], fours[i]);
+        route_of(ctl, AF_INET, fours[i], 16, 0, kinds[i], label);
+        snprintf(label, sizeof label, "%s route %s/48", kind_names[i], sixes6[i]);
+        route_of(ctl, AF_INET6, sixes6[i], 48, 0, kinds[i], label);
+    }
+    unbound(AF_INET, "10.8.0.1", "to 10.8.0.1, through lo");
+    which(four, four_names, 4, "to 10.8.0.1, through lo");
+    const char *const four_dests[] = {"10.7.0.1", "10.6.0.1", "10.5.0.1", "10.4.0.1"};
+    const char *const six_dests[] = {"2001:db8:7::1", "2001:db8:6::1", "2001:db8:5::1", "2001:db8:4::1"};
+    for (int i = 0; i < 4; i++) {
+        char label[64];
+        snprintf(label, sizeof label, "to %s, %s", four_dests[i], kind_names[i]);
+        unbound(AF_INET, four_dests[i], label);
+        snprintf(label, sizeof label, "to %s, %s", six_dests[i], kind_names[i]);
+        unbound(AF_INET6, six_dests[i], label);
+    }
+
     /* Down, and gone. */
     int on_vc = bound(AF_INET, SOCK_DGRAM, "vc", 0, "a sender on vc");
     set_link(ctl, VC, 0, "down vc");
@@ -580,5 +680,14 @@ int main(int argc, char **argv) {
     request(ctl, RTM_DELLINK, 0, &gone, "delete vc");
     send4(on_vc, "10.0.0.1", 7000, "from vc, gone");
     show(on_vc, 16, "on vc, gone");
+
+    /* lo down: its route of host scope stays (fib_sync_down_dev), and
+       that of link scope goes. */
+    route_lo(ctl, "10.9.0.0", 254, "a route of host scope to 10.9.0.0/16 through lo");
+    set_link(ctl, 1, 0, "down lo");
+    unbound(AF_INET, "10.9.0.1", "to 10.9.0.1, lo down, host scope");
+    unbound(AF_INET, "10.8.0.1", "to 10.8.0.1, lo down");
+    set_link(ctl, 1, 1, "up lo");
+    unbound(AF_INET, "10.9.0.1", "to 10.9.0.1, lo up again");
     return 0;
 }

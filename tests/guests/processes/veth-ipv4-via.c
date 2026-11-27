@@ -690,6 +690,34 @@ int main(int argc, char **argv) {
     multipath(ctl, RTM_DELROUTE, both, 1, "remove one through 2001:db8::2");
     heard("heard");
 
+    /* A hop's RTA_GATEWAY of 0.0.0.0 is a gateway still, which a hop
+       without one does not match, where its RTA_VIA of 0.0.0.0 is not
+       compared with one; the route's own RTA_GATEWAY of 0.0.0.0 is none
+       (fib_nh_match). */
+    const struct hop mixed[] = {{NULL, NULL, VA}, {NULL, "10.0.0.2", VA}};
+    const struct hop gw_first[] = {{NULL, "0.0.0.0", VA}, {NULL, "10.0.0.2", VA}};
+    const struct hop gw_second[] = {{NULL, NULL, VA}, {NULL, "0.0.0.0", VA}};
+    const struct hop via_first[] = {{"0.0.0.0", NULL, VA}, {NULL, "10.0.0.2", VA}};
+    const struct hop via_second[] = {{NULL, NULL, VA}, {"0.0.0.0", NULL, VA}};
+    multipath(ctl, RTM_NEWROUTE, mixed, 2, "hops without a gateway and through 10.0.0.2");
+    multipath(ctl, RTM_DELROUTE, gw_first, 2, "remove one whose first hop's gateway is 0.0.0.0");
+    multipath(ctl, RTM_DELROUTE, gw_second, 2, "remove one whose second hop's gateway is 0.0.0.0");
+    multipath(ctl, RTM_DELROUTE, via_second, 2, "remove one whose second hop's via is 0.0.0.0");
+    dump(RTM_GETROUTE, "routes");
+    multipath(ctl, RTM_DELROUTE, via_first, 2, "remove one whose first hop's via is 0.0.0.0");
+    dump(RTM_GETROUTE, "routes");
+    multipath(ctl, RTM_NEWROUTE, mixed, 2, "them again");
+    del(ctl, "0.0.0.0", 0, "remove one through a via of 0.0.0.0");
+    {
+        struct body b = {0};
+        const unsigned char gw[4] = {0};
+        start4(&b, 0, 255, 0);
+        put(&b, RTA_GATEWAY, gw, 4);
+        request(ctl, RTM_DELROUTE, 0, &b, "remove one through a gateway of 0.0.0.0");
+    }
+    dump(RTM_GETROUTE, "routes");
+    heard("heard");
+
     /* The carrier goes and comes: a route made without one is not
        RTNH_F_LINKDOWN of itself. */
     add(ctl, "2001:db8::2", 0, "through 2001:db8::2");

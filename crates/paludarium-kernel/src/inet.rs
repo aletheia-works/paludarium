@@ -461,7 +461,14 @@ impl Network {
     /// multicast type to a group ([`Cast`]), or that a unicast or
     /// multicast route of IPv6 goes through; else off the guest's
     /// networks, which only the first namespace has a route to.
-    /// `ENETUNREACH` where no route goes. Before all that, a group or the
+    /// `ENETUNREACH` where no route goes, and a rejecting route's error
+    /// where one takes it, in the first namespace too, before any goes off
+    /// the guest's networks. An IPv4 unicast route through `lo` sends it
+    /// out through `lo`, which takes it in as its own (as
+    /// [`Self::route4_through`] says), while `lo` is down too where one of
+    /// host scope has stayed; an IPv6 one is `ENETUNREACH`, where
+    /// Linux's, a rejecting one (`fib6_is_reject`), sends nothing and
+    /// answers with ICMPv6's no route. Before all that, a group or the
     /// limited broadcast address from a source `from` of a veth end's goes
     /// out through that end without a route, as `ip_route_output_key_hash_rcu`
     /// takes the source's device for them.
@@ -546,15 +553,38 @@ impl Network {
             Some(to) => Ok(Dest::Here(to)),
             None => {
                 use crate::interface::Kind;
+                let found = match to.ip() {
+                    IpAddr::V4(ip) => self
+                        .addresses_at(now)
+                        .output4(
+                            ip,
+                            0,
+                            0,
+                            source4(from),
+                            crate::multipath::Flow::of(proto),
+                            &order,
+                        )
+                        .map(Some),
+                    IpAddr::V6(ip) => self.route6(ip, from, (0, false), proto, now).map(|_| None),
+                };
+                // A rejecting route's error (`fib_props`, `fib6_prop`).
+                match &found {
+                    Err(e) if *e != ENETUNREACH => return Err(*e),
+                    // Out through `lo`, which takes it in as its own whatever
+                    // its address, as through `lo` named
+                    // ([`Self::route4_through`]).
+                    Ok(Some(route))
+                        if route.kind == Kind::Unicast
+                            && route.oif == crate::netdev::LOOPBACK_OIF
+                            && matches!(to.ip(), IpAddr::V4(ip)
+                                if !ip.is_multicast() && !ip.is_broadcast()) =>
+                    {
+                        return Ok(Dest::Veth(crate::netdev::LOOPBACK_INDEX, Cast::Unicast));
+                    }
+                    _ => {}
+                }
                 if let IpAddr::V4(ip) = to.ip()
-                    && let Ok(route) = self.addresses_at(now).output4(
-                        ip,
-                        0,
-                        0,
-                        source4(from),
-                        crate::multipath::Flow::of(proto),
-                        &order,
-                    )
+                    && let Ok(Some(route)) = found
                     && matches!(route.kind, Kind::Unicast | Kind::Broadcast)
                     && route.oif != crate::netdev::LOOPBACK_OIF
                     && let Ok(index) = i32::try_from(route.oif)

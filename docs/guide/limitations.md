@@ -1317,11 +1317,11 @@ verified.
   anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
-  namespace a connection or datagram to an address no local route has,
-  from a socket bound to no device, is still `ENETUNREACH` where a route
-  through `lo` or a rejecting one takes it, where Linux's goes out
-  through `lo`, which takes it in as the features page says of a socket
-  bound to `lo`, or fails with the rejecting route's error.
+  namespace a connection or datagram to an address that an IPv6 route
+  through `lo` takes is `ENETUNREACH`, where Linux makes that route a
+  rejecting one (`fib6_is_reject`) whose packets go nowhere: a datagram
+  is sent, and ICMPv6's no route comes back, which a TCP connection takes
+  as a soft error, its `SO_ERROR` until read.
   A route's metrics (`RTA_METRICS`) are kept and shown, but change
   nothing a socket does: its MTU, hop limit, window and congestion control
   are their defaults whatever its route holds. A route may name no

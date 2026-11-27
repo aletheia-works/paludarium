@@ -19457,11 +19457,14 @@ static int memfd_hugetlb_case(void) {
     printf(" grow=%d\n", rc_errno(ftruncate(fd, 3 * HUGE_2M)));
     /* fallocate's checks before its ENOSPC: RLIMIT_FSIZE, then F_SEAL_GROW. */
     signal(SIGXFSZ, SIG_IGN);
-    struct rlimit fsize, small = {HUGE_2M, HUGE_2M};
+    /* Only the soft limit, so that it can be raised again without
+     * CAP_SYS_RESOURCE. */
+    struct rlimit fsize;
     getrlimit(RLIMIT_FSIZE, &fsize);
-    setrlimit(RLIMIT_FSIZE, &small);
-    printf("fsize=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8 * HUGE_2M)));
-    setrlimit(RLIMIT_FSIZE, &fsize);
+    struct rlimit small = {HUGE_2M, fsize.rlim_max};
+    printf("lower=%d", rc_errno(setrlimit(RLIMIT_FSIZE, &small)));
+    printf(" fsize=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8 * HUGE_2M)));
+    printf(" restore=%d", rc_errno(setrlimit(RLIMIT_FSIZE, &fsize)));
     printf(" in-size=%d", rc_errno(fallocate(fd, 0, 0, 4096)));
     printf(" seal-grow=%d", rc_errno(fcntl(fd, F_ADD_SEALS, F_SEAL_GROW)));
     printf(" past=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8 * HUGE_2M)));

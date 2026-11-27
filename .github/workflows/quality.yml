@@ -564,7 +564,9 @@ jobs:
           echo "::group::diff_processes"
           cat target/diff-processes.log
           echo "::endgroup::"
-          test "$status" = 0 && test "$processes_status" = 0
+          if [ "$status" != 0 ] || [ "$processes_status" != 0 ]; then
+            exit 1
+          fi
           cargo llvm-cov report "${packages[@]}" -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
         env:
           # Instrumented independent cases run serially; race cases still

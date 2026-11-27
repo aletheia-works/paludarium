@@ -153,15 +153,21 @@ fn kind(c: &Context<'_>, dir: &[u8]) -> Kind {
     // (`thread-self`, a `task` directory), and what is below.
     let (pid, below) = match parts[0] {
         b"sys" => return Kind::Sysctl,
-        b"self" => (c.process.pid, &parts[1..]),
+        // A thread's own `task` directory.
         b"thread-self" => (c.process.pid, &parts[1..]),
-        part => match number(part) {
-            Some(pid) => match parts.get(1..3) {
+        part => {
+            let pid = match part {
+                b"self" => c.process.pid,
+                _ => match number(part) {
+                    Some(pid) => pid,
+                    None => return Kind::Mode,
+                },
+            };
+            match parts.get(1..3) {
                 Some([b"task", tid]) if number(tid).is_some() => (pid, &parts[3..]),
                 _ => (pid, &parts[1..]),
-            },
-            None => return Kind::Mode,
-        },
+            }
+        }
     };
     match below {
         [] => Kind::Immutable,
@@ -200,6 +206,8 @@ fn directory(c: &Context<'_>, name: &Name) -> Result<FileStat, Errno> {
 fn looked_up(c: &Context<'_>, name: &Name) -> Result<Option<FileStat>, Errno> {
     match generated_stat(c, &name.path, false)? {
         Some((stat, ..)) => Ok(Some(stat)),
+        // `/dev/shm`, a mount of the file system's own.
+        None if mount_point(name) => Ok(c.files.fs().metadata(&name.path, false).ok()),
         None if name.holder == Holder::Proc => Err(Errno::ENOENT),
         None => Ok(None),
     }
@@ -221,12 +229,12 @@ fn is_directory(stat: &FileStat) -> bool {
 }
 
 /// Whether the name is a mount point on Linux, which no call removes or
-/// renames (`EBUSY`): `/dev/pts`.
+/// renames (`EBUSY`): `/dev/pts`, `/dev/shm` and `/dev/mqueue`.
 fn mount_point(name: &Name) -> bool {
-    name.path == b"/dev/pts"
+    matches!(&name.path[..], b"/dev/pts" | b"/dev/shm" | b"/dev/mqueue")
 }
 
-/// `unlink` (`directory` false) and `rmdir` of the name `raw` resolves to
+/// `unlink` (`directory_call` false) and `rmdir` of the name `raw` resolves to
 /// at `p`, when it is in a generated directory: Linux's error, or `EPERM`
 /// as root in `/dev`, where devtmpfs would remove it. None for a name
 /// elsewhere.
@@ -286,10 +294,11 @@ fn removed(c: &Context<'_>, name: &Name, directory_call: bool) -> Result<(), Err
     Err(Errno::EPERM)
 }
 
-/// `mkdir` (`directory` true), `mknod` and `symlink` of the name `raw`
-/// resolves to at `p`, when it is in a generated directory: Linux's error,
-/// or `ENOENT` as root in `/dev`, where devtmpfs would make it. None for a
-/// name elsewhere.
+/// `mkdir` (`directory_call` true), `mknod` and `symlink` of the name
+/// `raw` resolves to at `p`, when it is in a generated directory: Linux's
+/// error, or `ENOENT` as root in `/dev`, where devtmpfs would make it. None
+/// for a name elsewhere.
+///
 /// `request` is Landlock's right to make it.
 pub(crate) fn make(
     c: &Context<'_>,
@@ -647,10 +656,6 @@ pub(crate) fn open_create(c: &Context<'_>, raw: &[u8], p: &[u8], flags: u32) -> 
         }
         if let Some((stat, ..)) = generated_stat(c, &name.path, follow)? {
             return Ok(there(&stat));
-        }
-        // A link that leads nowhere is there to `O_EXCL`.
-        if !follow && generated_stat(c, &name.path, false)?.is_some() {
-            return Ok(Some(Errno::EEXIST));
         }
         if name.holder == Holder::Proc {
             return Err(Errno::ENOENT);

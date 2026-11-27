@@ -18951,6 +18951,12 @@ static int generated_name_errors_case(void) {
     printf("root\n");
     gne_rows(proc_names, procs);
     /* /proc and /dev themselves, in the root's directory. */
+    /* A thread's directory by /proc/self/task: immutable, as root too. */
+    char task[64], task_comm[80];
+    snprintf(task, sizeof task, "/proc/self/task/%ld", (long)syscall(SYS_gettid));
+    snprintf(task_comm, sizeof task_comm, "%s/comm", task);
+    printf("task unlink=%d rmdir=%d,%d\n", gne_e(unlink(task_comm)), gne_e(rmdir(task)),
+           gne_e(rmdir("/proc/thread-self")));
     printf("tops unlink=%d,%d rmdir=%d,%d mknod=%d symlink=%d\n", gne_e(unlink("/proc")),
            gne_e(unlink("/dev/")), gne_e(rmdir("/proc")), gne_e(rmdir("/dev")),
            gne_e(mknod("/proc", S_IFIFO | 0644, 0)), gne_e(symlink("x", "/dev")));

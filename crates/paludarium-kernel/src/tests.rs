@@ -15295,6 +15295,29 @@ fn the_name_calls_give_linux_s_errors_in_the_generated_directories() {
     assert_eq!(f.ret(84, &[proc_dir]), errno(Errno(16)));
     assert_eq!(f.ret(133, &[proc_dir, 0o10644, 0]), errno(Errno::EEXIST));
     assert_eq!(f.ret(86, &[file, proc_dir]), errno(Errno::EEXIST));
+    // The mounts in /dev are mount points there: EBUSY to remove or
+    // rename, EISDIR to unlink, EEXIST to make.
+    let y8 = put(&mut f, 0x340, b"/dev/y8");
+    for mount in [&b"/dev/shm"[..], b"/dev/mqueue", b"/dev/pts"] {
+        let p = put(&mut f, 0x300, mount);
+        let label = String::from_utf8_lossy(mount);
+        assert_eq!(f.ret(84, &[p]), errno(Errno(16)), "{label}");
+        assert_eq!(f.ret(82, &[p, y8]), errno(Errno(16)), "{label}");
+        assert_eq!(f.ret(87, &[p]), errno(Errno::EISDIR), "{label}");
+        assert_eq!(f.ret(83, &[p, 0o755]), errno(Errno::EEXIST), "{label}");
+    }
+    // A thread's directory, by `self/task` too, is immutable;
+    // `thread-self` itself is a link (ENOTDIR to rmdir).
+    let tid = f.ret(186, &[]);
+    for (path, call, want) in [
+        (format!("/proc/self/task/{tid}"), 84, Errno::EPERM),
+        (format!("/proc/self/task/{tid}/comm"), 87, Errno::EPERM),
+        ("/proc/thread-self/comm".to_owned(), 87, Errno::EPERM),
+        ("/proc/thread-self".to_owned(), 84, Errno::ENOTDIR),
+    ] {
+        let p = put(&mut f, 0x300, path.as_bytes());
+        assert_eq!(f.ret(call, &[p]), errno(want), "{path}");
+    }
     // setresgid(65534, ..), setresuid(65534, ..).
     assert_eq!(f.ret(119, &[65534, 65534, 65534]), 0);
     assert_eq!(f.ret(117, &[65534, 65534, 65534]), 0);

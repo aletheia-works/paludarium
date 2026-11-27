@@ -1,5 +1,6 @@
 //! User namespaces, as Linux's `struct user_namespace`: the user and group
-//! IDs a namespace maps onto its parent's (`uid_map`, `gid_map`), whether
+//! IDs a namespace maps onto its parent's (`uid_map`, `gid_map`), and its
+//! project IDs (`projid_map`, which nothing else here uses), whether
 //! `setgroups` may run in it, and who made it, which the capabilities of a
 //! thread are counted against.
 //!
@@ -41,6 +42,8 @@ pub(crate) fn first() -> &'static Arc<Namespace> {
 pub(crate) enum Ids {
     User,
     Group,
+    /// Project IDs, which a file system's quotas count by.
+    Project,
 }
 
 /// One line of a map: `count` IDs from `first` in the namespace, from
@@ -67,6 +70,7 @@ impl Extent {
 struct Maps {
     uid: Vec<Extent>,
     gid: Vec<Extent>,
+    projid: Vec<Extent>,
     /// `setgroups` has been denied (Linux's `USERNS_SETGROUPS_ALLOWED`
     /// cleared), which a new namespace takes from its parent.
     setgroups_denied: bool,
@@ -76,6 +80,7 @@ impl Maps {
         match ids {
             Ids::User => &self.uid,
             Ids::Group => &self.gid,
+            Ids::Project => &self.projid,
         }
     }
 }
@@ -226,7 +231,7 @@ impl Namespace {
         let maps = self.maps();
         self.is_first_user() || !maps.gid.is_empty() && !maps.setgroups_denied
     }
-    /// What `/proc/<pid>/uid_map` or `gid_map` reads to a thread of user
+    /// What `/proc/<pid>/uid_map`, `gid_map` or `projid_map` reads to a thread of user
     /// namespace `reader`: each extent, its lower IDs as the reader's
     /// namespace has them, or its parent's when it is this one (Linux's
     /// `uid_m_show`).
@@ -289,16 +294,18 @@ impl Namespace {
         }
         Ok(())
     }
-    /// A write of `text` to this namespace's uid or gid map, by a thread
-    /// with `writer`'s credentials, through a file opened with `opener`'s,
-    /// as Linux's `proc_uid_map_write` and `map_write`, in their order: the
-    /// first namespace's map, a map written before, an opener of neither
-    /// this namespace nor its parent and one without CAP_SYS_ADMIN here are
-    /// `EPERM`; a line that is not three numbers, an extent of no IDs or one
-    /// that wraps, overlaps another or is one too many is `EINVAL`, and so is
-    /// no line at all; IDs neither the opener's own (alone, by the owner) nor
+    /// A write of `text` to this namespace's uid, gid or project ID map, by
+    /// a thread with `writer`'s credentials, through a file opened with
+    /// `opener`'s, as Linux's `proc_uid_map_write` and `map_write`, in their
+    /// order: the first namespace's map, an opener of neither this
+    /// namespace nor its parent, a map written before and (but for project
+    /// IDs) one without CAP_SYS_ADMIN here are `EPERM`; a line that is not
+    /// three numbers, an extent of no IDs or one that wraps, overlaps
+    /// another or is one too many is `EINVAL`, and so is no line at all;
+    /// user or group IDs neither the opener's own (alone, by the owner) nor
     /// allowed by CAP_SETUID or CAP_SETGID in the parent, and lower IDs the
-    /// parent does not map, are `EPERM`.
+    /// parent does not map, are `EPERM`. Any project IDs may be mapped
+    /// (`proc_projid_map_write`'s `cap_setid` of -1).
     pub(crate) fn write_map(
         &self,
         ids: Ids,
@@ -316,15 +323,18 @@ impl Namespace {
         if !self.maps().of(ids).is_empty() {
             return Err(Errno::EPERM);
         }
-        if !opener.capable_in(CAP_SYS_ADMIN, self) {
+        let cap = match ids {
+            Ids::User => Some(CAP_SETUID),
+            Ids::Group => Some(CAP_SETGID),
+            Ids::Project => None,
+        };
+        if cap.is_some() && !opener.capable_in(CAP_SYS_ADMIN, self) {
             return Err(Errno::EPERM);
         }
         let extents = parse_map(text)?;
-        let cap = match ids {
-            Ids::User => CAP_SETUID,
-            Ids::Group => CAP_SETGID,
-        };
-        if !self.idmap_permitted(ids, &extents, cap, opener, writer, parent) {
+        if let Some(cap) = cap
+            && !self.idmap_permitted(ids, &extents, cap, opener, writer, parent)
+        {
             return Err(Errno::EPERM);
         }
         // The lower IDs, through the parent's map, as kernel IDs: an
@@ -340,6 +350,7 @@ impl Namespace {
         let map = match ids {
             Ids::User => &mut maps.uid,
             Ids::Group => &mut maps.gid,
+            Ids::Project => &mut maps.projid,
         };
         if !map.is_empty() {
             return Err(Errno::EPERM);
@@ -490,7 +501,7 @@ impl std::ops::Deref for UserNs {
     }
 }
 
-/// An open `/proc/<pid>/uid_map`, `gid_map` (`ids`) or `setgroups` (no
+/// An open `/proc/<pid>/uid_map`, `gid_map`, `projid_map` (`ids`) or `setgroups` (no
 /// `ids`) of user namespace `namespace`, the one the task was in when it
 /// was opened (Linux's `proc_id_map_open`), opened with `flags`. Each read
 /// shows the namespace as it is then, one line for each extent, its IDs as
@@ -539,6 +550,40 @@ mod tests {
         assert_eq!(ns.shown(Ids::User, INVALID), OVERFLOW);
         assert_eq!(first().shown(Ids::User, INVALID), OVERFLOW);
         assert_eq!(first().id_of(Ids::Group, INVALID), None);
+    }
+
+    #[test]
+    fn project_ids_are_mapped_by_anyone_once() {
+        let root = Credentials::default();
+        let ns = Namespace::new_user(first(), 0xF000_1100, &root, u64::MAX).unwrap();
+        let powerless = Credentials {
+            permitted: 0,
+            effective: 0,
+            ..root.clone()
+        };
+        assert_eq!(
+            ns.write_map(Ids::User, b"0 1000 1", &powerless, &powerless),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            ns.write_map(Ids::Project, b"0 1000 10", &powerless, &powerless),
+            Ok(())
+        );
+        assert_eq!(
+            ns.map_text(Ids::Project, &ns),
+            b"         0       1000         10\n"
+        );
+        assert_eq!(
+            ns.write_map(Ids::Project, b"20 2000 1", &root, &root),
+            Err(Errno::EPERM)
+        );
+        // The users are still unmapped, and the first namespace maps every
+        // project ID.
+        assert_eq!(ns.map_text(Ids::User, &ns), b"");
+        assert_eq!(
+            first().map_text(Ids::Project, first()),
+            b"         0          0 4294967295\n"
+        );
     }
 
     #[test]

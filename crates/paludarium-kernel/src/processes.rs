@@ -647,6 +647,28 @@ impl Processes {
             _ => Err(Errno::EINVAL),
         }
     }
+    /// The processes thread `tid` of process `pid` made that are not yet
+    /// reaped (Linux's `children` list of the thread), by PID: those whose
+    /// maker it is and, if it is the first live thread of its process,
+    /// those whose maker has ended, as `forget_original_parent` gives them
+    /// to the first live thread (`find_alive_thread`). Linux's list is in
+    /// the order they came to it, which PIDs follow until they wrap and
+    /// orphans given to the process later do not.
+    pub(crate) fn children_of_thread(&self, pid: u32, tid: u32) -> Vec<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = entries.get(&pid) else {
+            return Vec::new();
+        };
+        let live: Vec<u32> = entry.group.threads().iter().map(|&(t, _)| t).collect();
+        let first = live.first() == Some(&tid);
+        entries
+            .iter()
+            .filter(|(_, child)| {
+                child.parent == pid && (child.maker == tid || first && !live.contains(&child.maker))
+            })
+            .map(|(&child, _)| child)
+            .collect()
+    }
     /// The `oom_score_adj` of process `pid`, and whether it is a `vfork`
     /// child that has neither exec'd nor exited (Linux's `in_vfork`).
     pub(crate) fn oom(&self, pid: u32) -> Option<(i16, bool)> {
@@ -2958,6 +2980,18 @@ impl Kernel {
                 );
                 return Ok(0);
             }
+            // PR_SET_TIMERSLACK, which leaves a real-time or deadline
+            // thread's as it is, and PR_GET_TIMERSLACK, of the calling
+            // thread.
+            29 => {
+                self.group.change_sched(thread.tid, |sched| {
+                    if !sched.real_time_or_deadline() {
+                        sched.set_slack(a[1]);
+                    }
+                });
+                return Ok(0);
+            }
+            30 => return Ok(self.group.sched(thread.tid).slack),
             // PR_GET_SECCOMP, PR_SET_SECCOMP
             21 => return Ok(crate::seccomp::mode(&thread.state)),
             22 => {
@@ -3749,6 +3783,7 @@ impl Kernel {
             group.set_nice(pid, if reset_nice { 0 } else { value });
         }
         group.set_sched(pid, sched);
+        group.set_login(pid, self.group.login(parent.tid));
         if let Some(mask) = self.group.affinity(parent.tid) {
             group.set_affinity(pid, mask);
         }

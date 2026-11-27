@@ -222,7 +222,10 @@ mod linux {
             // fs.leases-enable and fs.lease-break-time and becomes an
             // unprivileged user, the dnotify-switch case, which writes
             // fs.dir-notify-enable, the proc-oom case, which sets an
-            // oom_score_adj below 0 and becomes an unprivileged user, and
+            // oom_score_adj below 0 and becomes an unprivileged user, the
+            // proc-timerslack, proc-login and proc-cgroup-ids cases, which
+            // set a real-time policy, change a set login user and make user
+            // namespaces before they become an unprivileged user, and
             // the timer-waits cases, which make a
             // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
@@ -231,6 +234,9 @@ mod linux {
                     | "file-leases"
                     | "dnotify-switch"
                     | "proc-oom"
+                    | "proc-timerslack"
+                    | "proc-login"
+                    | "proc-cgroup-ids"
                     | "timer-waits-plain"
                     | "timer-waits-restart"
                     | "timer-waits-default"
@@ -1193,6 +1199,10 @@ mod linux {
         processes_status_memory => ("status-memory","process"),
         processes_proc_oom => ("proc-oom","process"),
         processes_core_filter => ("core-filter","process"),
+        processes_proc_timerslack => ("proc-timerslack","process"),
+        processes_proc_login => ("proc-login","process"),
+        processes_proc_cgroup_ids => ("proc-cgroup-ids","process"),
+        processes_proc_children => ("proc-children","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),

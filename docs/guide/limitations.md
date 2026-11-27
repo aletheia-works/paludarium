@@ -150,10 +150,11 @@ verified.
   (`/proc/version`, `/proc/cmdline`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
-  the reader's own directory (`stack`, `sched`, ...) are `ENOENT`, as in
+  the reader's own directory (`stack`, `sched`, `attr`, ...) are `ENOENT`, as in
   another process's directory, whatever the filesystem holds there (with
   `--mount /:/`, the host's `/proc`), where Linux shows them, and root
-  `stack` and the rest of another's. `wchan` is `0` for a waiting task too, where Linux names the
+  `stack` and the rest of another's. With a security module Linux has `attr`,
+  whose `current` reads `unconfined` under AppArmor; there is none here. `wchan` is `0` for a waiting task too, where Linux names the
   kernel function it waits in for a reader that may read the task: there are
   no kernel functions here to name. A poll of an epoll that watches several
   of `hostname` and `domainname` polls them by descriptor number until one is
@@ -1182,7 +1183,7 @@ verified.
   fanotify marks alone, where Linux's counts inotify's too. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
   it had, which fails once it is gone.
-- **Namespaces**: a user namespace has no `projid_map` and no
+- **Namespaces**: a user namespace has no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the
   `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
@@ -1438,8 +1439,9 @@ verified.
   waiting. The other namespaces keep nothing apart
   that paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace and the
-  mounts of a mount namespace: there is no `/proc/self/cgroup` for a cgroup
-  namespace, and no
+  mounts of a mount namespace: there are no control groups, so
+  `/proc/<pid>/cgroup` shows every task in the root of one hierarchy whatever
+  cgroup namespace it is in, and there is no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the
   first one's. A PID namespace hands out its numbers once each, where
   Linux's wrap at `pid_max` and are used again; for the same reason

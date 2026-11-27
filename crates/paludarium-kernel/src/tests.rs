@@ -2741,6 +2741,25 @@ fn sigtimedwait_takes_blocked_process_signals_and_times_out() {
     );
 }
 #[test]
+fn prctl_timer_slack_is_the_threads_and_a_real_time_one_has_none() {
+    let mut f = fixture();
+    assert_eq!(f.ret(157, &[30]), 50_000); // PR_GET_TIMERSLACK
+    assert_eq!(f.ret(157, &[29, 1234]), 0); // PR_SET_TIMERSLACK
+    assert_eq!(f.ret(157, &[30]), 1234);
+    assert_eq!(f.ret(157, &[29, 0]), 0);
+    assert_eq!(f.ret(157, &[30]), 50_000);
+    // SCHED_FIFO 1 takes it away, PR_SET_TIMERSLACK leaves it so, and
+    // SCHED_OTHER gives the default back.
+    f.mem.write(GuestAddr(DATA), &1u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(144, &[0, 1, DATA]), 0);
+    assert_eq!(f.ret(157, &[30]), 0);
+    assert_eq!(f.ret(157, &[29, 99]), 0);
+    assert_eq!(f.ret(157, &[30]), 0);
+    f.mem.write(GuestAddr(DATA), &0u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(144, &[0, 0, DATA]), 0);
+    assert_eq!(f.ret(157, &[30]), 50_000);
+}
+#[test]
 fn prctl_keeps_death_signal_dumpable_and_no_new_privs() {
     let mut f = fixture();
     assert_eq!(f.ret(157, &[2, DATA]), 0); // PR_GET_PDEATHSIG

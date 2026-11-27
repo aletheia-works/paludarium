@@ -2845,7 +2845,7 @@ kernel.
   `ptrace` access, priorities, limits) as its user namespace has it, and
   over the machine (`RENAME_WHITEOUT`, real-time scheduling, `vhangup`, the
   `trusted.*` attributes and the like) only in the first user namespace.
-  `/proc/<pid>/uid_map` and `gid_map` read the extents of the task's user
+  `/proc/<pid>/uid_map` and `gid_map` (and `projid_map`, below) read the extents of the task's user
   namespace, the lower IDs as the reader's namespace has them (its parent's
   for its own), and take one write of up to 340 lines of three numbers, in
   Linux's order and with its checks (`proc_uid_map_write`, `map_write`,
@@ -4324,8 +4324,9 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mem`, `mounts`, `mountinfo`,
-  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `oom_score`, `oom_adj`, `oom_score_adj`,
-  `coredump_filter`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `cpuset`, `cgroup`, `oom_score`, `oom_adj`,
+  `oom_score_adj`, `loginuid`, `sessionid`, `coredump_filter`, `io`, `uid_map`, `gid_map`,
+  `projid_map`, `setgroups`, `timerslack_ns`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them: root of the user namespace its program runs in, or the first
@@ -4403,13 +4404,16 @@ kernel.
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
   `comm`, `syscall` (0400), `maps`, `mem` (0600), `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`,
-  `oom_score`, `oom_adj`, `oom_score_adj`, `coredump_filter`, `io` (0400), `exe`, `cwd`,
-  `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
+  `cpuset`, `cgroup`, `oom_score`, `oom_adj`, `oom_score_adj`, `loginuid`, `sessionid`,
+  `coredump_filter`, `io` (0400), `uid_map`, `gid_map`, `projid_map`, `setgroups`,
+  `timerslack_ns` (0666), `exe`, `cwd`, `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns`
+  (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
-  has the same files but `task` and `coredump_filter`, of that thread: its name, its signal masks,
+  has the same files but `task`, `coredump_filter` and `timerslack_ns`, and
+  `children` too, of that thread: its name, its signal masks,
   its ID as `Pid` with the process's as `Tgid`, its own credentials (the
   process's `status`, `/proc/self/status` too, shows the leader's, as Linux's
   `proc_pid_status`), and its own `voluntary_ctxt_switches` (the times it
@@ -4451,7 +4455,9 @@ kernel.
   directory (0555) staying its own, and an open checks a regular
   file's mode for that owner before anything else, as Linux's
   `generic_permission` does (`EACCES`): writing needs `CAP_DAC_OVERRIDE`
-  but for `comm`, `uid_map`, `gid_map` and `setgroups` (0644), and
+  but for `comm`, `oom_adj`, `oom_score_adj`, `loginuid`, `coredump_filter`,
+  `uid_map`, `gid_map`, `projid_map` and `setgroups` (0644) and `timerslack_ns`
+  (0666), and
   reading `environ`, `auxv`, `pagemap` or `mem` needs the owner or
   `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner as this
   process's own do (above). `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
@@ -4525,6 +4531,52 @@ kernel.
   newline allowed after it but no space (`EINVAL`, `ERANGE` past 32 bits),
   and returns all it was given; once no thread runs in the memory it reads
   empty and a write is `ESRCH`. A thread's directory has none.
+
+- `timerslack_ns` (0666) of a process is its leader thread's timer slack in
+  nanoseconds, which `PR_SET_TIMERSLACK` and `PR_GET_TIMERSLACK` set and read
+  for the calling thread: 50000 for the first task, and a new thread's or
+  process's is its maker's, whose slack then is also its default. A reader
+  or writer other than that thread needs `CAP_SYS_NICE` in its user
+  namespace (`EPERM` at the read or the write, as Linux's
+  `timerslack_ns_show` and `timerslack_ns_write` check it). A write takes
+  what `kstrtoull` reads in decimal, of up to 66 bytes (`EINVAL`, `ERANGE`
+  past 64 bits), and returns all it was given, leaving the position where it
+  was. Setting 0 gives back the default. A real-time or deadline thread has
+  no slack: `sched_setscheduler` and the like make it 0, a write keeps it 0,
+  `PR_SET_TIMERSLACK` leaves it, and leaving those policies gives back the
+  default. Nothing waits longer for it: the host's timers keep their own
+  slack. A thread's directory has none.
+
+- `loginuid` (0644) and `sessionid` (0444) are the thread's audit login
+  user and session, as Linux's `proc_loginuid_read` and `proc_sessionid_read`
+  write them, with no newline: 4294967295 (none) for both at first, a
+  thread's and a process's taken from its maker, and kept across `execve`.
+  The login user reads as the opener's user namespace maps it (4294967295
+  for one it does not). Only the thread the file is of may write its
+  `loginuid` (`EPERM` else), only at its start (`EINVAL` after a read), a
+  decimal user ID as `kstrtou32` reads it in the opener's namespace
+  (`EINVAL` for one it does not map), or 4294967295 for none; once it has
+  one, a change needs `CAP_AUDIT_CONTROL` in the first user namespace
+  (`EPERM`). Setting a user starts a session with a number no other has had
+  (from 1 in each emulator), and none ends it. Nothing audits.
+
+- `cgroup` and `cpuset` (0444) read `0::/` and `/`: every task is in the
+  root group of a unified hierarchy, as a cgroup v2 host shows a task in its
+  root, whichever control group namespace reads them.
+
+- `children` (0444) of a thread lists, each followed by a space, the
+  processes it made that are not yet reaped, zombies too, as Linux's
+  `children_seq_show`; a child whose maker has ended is its process's first
+  thread's, as `forget_original_parent` gives it to that one. They are in PID
+  order, where Linux's are in the order they came to the thread, which
+  differs once PIDs wrap or an orphan is given to the process. The process's
+  own directory has none.
+
+- `projid_map` (0644) reads and takes the project IDs of the task's user
+  namespace as `uid_map` does (above), but a write needs no capability and
+  maps any IDs the parent maps, as Linux's `proc_projid_map_write`: the
+  first namespace maps them all (`0 0 4294967295`). Nothing else uses
+  project IDs.
 
 - `syscall` of a process or of a thread, 0400 and of size 0, is what
   Linux's `proc_pid_syscall` writes when it is read, for a reader that may
@@ -6642,7 +6694,8 @@ kernel.
   capability must be permitted and inheritable, unless
   `SECBIT_NO_CAP_AMBIENT_RAISE` refuses it), all per thread,
   `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
-  `execve`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
+  `execve`), `PR_SET_TIMERSLACK` and `PR_GET_TIMERSLACK` (per thread; see
+  `/proc/<pid>/timerslack_ns`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
   with their `PR_GET_*`, and Yama's `PR_SET_PTRACER`, which reads no other
   argument: 0 clears it, `PR_SET_PTRACER_ANY` (or -1 as an `int`) lets any
   process attach, and another value, taken as an `int`, names a task in the

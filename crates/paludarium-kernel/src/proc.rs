@@ -118,7 +118,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 41] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 40] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -146,7 +146,6 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 41] = [
     (b"smaps_rollup", 8),
     (b"pagemap", 8),
     (b"wchan", 8),
-    (b"cpuset", 8),
     (b"cgroup", 8),
     (b"oom_score", 8),
     (b"oom_adj", 8),
@@ -164,7 +163,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 41] = [
 /// The names in another process's directory, in the same order, with
 /// `children`, which only a thread's directory has, where Linux's
 /// `tid_base_stuff` lists it.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 42] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 41] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -193,7 +192,6 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 42] = [
     (b"smaps_rollup", 8),
     (b"pagemap", 8),
     (b"wchan", 8),
-    (b"cpuset", 8),
     (b"cgroup", 8),
     (b"oom_score", 8),
     (b"oom_adj", 8),
@@ -247,9 +245,9 @@ pub(crate) enum TaskEntry {
     /// `coredump_filter`, of its address space, which a thread's
     /// directory does not have.
     CoredumpFilter,
-    /// `cgroup` and `cpuset`, of its control group.
+    /// `cgroup`, of its control group. There is no `cpuset`, as Ubuntu's
+    /// kernel has none (`CONFIG_CPUSETS_V1` is off).
     Cgroup,
-    Cpuset,
     /// `loginuid` and `sessionid`, of its audit login.
     LoginUid,
     SessionId,
@@ -356,7 +354,6 @@ pub(crate) fn task_path(
         b"oom_score_adj" => TaskEntry::Oom(OomFile::ScoreAdj),
         b"coredump_filter" => TaskEntry::CoredumpFilter,
         b"cgroup" => TaskEntry::Cgroup,
-        b"cpuset" => TaskEntry::Cpuset,
         b"loginuid" => TaskEntry::LoginUid,
         b"sessionid" => TaskEntry::SessionId,
         b"timerslack_ns" => TaskEntry::TimerSlack,
@@ -419,8 +416,8 @@ pub(crate) fn task_path(
             b"uid_map" | b"gid_map" | b"projid_map" | b"setgroups" | b"mounts" | b"mountinfo"
             | b"auxv" | b"limits" | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan"
             | b"syscall" | b"mem" | b"oom_score" | b"oom_adj" | b"oom_score_adj"
-            | b"coredump_filter" | b"cgroup" | b"cpuset" | b"loginuid" | b"sessionid"
-            | b"timerslack_ns" | b"children",
+            | b"coredump_filter" | b"cgroup" | b"loginuid" | b"sessionid" | b"timerslack_ns"
+            | b"children",
         ] => (None, entry(&parts)),
         _ if pid == own && !own_leader_gone => return None,
         [] => (None, TaskEntry::Directory),
@@ -3135,7 +3132,7 @@ mod tests {
         assert_eq!(path(b"/proc/8/cgroup"), at(8, None, TaskEntry::Cgroup));
         assert_eq!(
             path(b"/proc/8/task/9/cpuset"),
-            at(8, Some(9), TaskEntry::Cpuset)
+            at(8, Some(9), TaskEntry::Missing)
         );
         assert_eq!(
             path(b"/proc/self/projid_map"),

@@ -22782,10 +22782,11 @@ static int proc_login_case(void) {
     return 0;
 }
 
-/* The proc-cgroup-ids case: /proc/<pid>/cgroup and cpuset, one line each
-   of the task's control group (of the unified hierarchy, which the host's
-   path differs in, so only their form is printed), the same for a child
-   and a thread; and projid_map, the user namespace's project IDs, as
+/* The proc-cgroup-ids case: /proc/<pid>/cgroup, one line of the task's
+   control group (of the unified hierarchy, which the host's path differs
+   in, so only its form is printed), the same for a child and a thread, and
+   no cpuset, which Ubuntu's kernel leaves out (CONFIG_CPUSETS_V1); and
+   projid_map, the user namespace's project IDs, as
    uid_map: all of them in the first namespace, none in a new one until one
    write, which needs no capability, maps them. */
 static char ci_text[4096];
@@ -22803,13 +22804,11 @@ static int ci_one_line(const char *text) {
     return newline && newline[1] == 0;
 }
 static int proc_cgroup_ids_case(void) {
-    char own_cgroup[4096], own_cpuset[4096], path[64];
+    char own_cgroup[4096], path[64];
     ci_read("/proc/self/cgroup");
     printf("cgroup: unified=%d one line=%d\n", !strncmp(ci_text, "0::/", 4), ci_one_line(ci_text));
     strcpy(own_cgroup, ci_text);
-    ci_read("/proc/self/cpuset");
-    printf("cpuset: from root=%d one line=%d\n", ci_text[0] == '/', ci_one_line(ci_text));
-    strcpy(own_cpuset, ci_text);
+    printf("cpuset: %ld\n", ci_read("/proc/self/cpuset"));
     snprintf(path, sizeof path, "/proc/self/task/%d/cgroup", getpid());
     ci_read(path);
     printf("thread's: same=%d\n", !strcmp(ci_text, own_cgroup));
@@ -22821,18 +22820,12 @@ static int proc_cgroup_ids_case(void) {
     }
     snprintf(path, sizeof path, "/proc/%d/cgroup", kid);
     ci_read(path);
-    int same = !strcmp(ci_text, own_cgroup);
-    snprintf(path, sizeof path, "/proc/%d/cpuset", kid);
-    ci_read(path);
-    printf("child's: same=%d %d\n", same, !strcmp(ci_text, own_cpuset));
+    printf("child's: same=%d\n", !strcmp(ci_text, own_cgroup));
     kill(kid, SIGKILL);
     waitpid(kid, NULL, 0);
-    struct stat st[3];
-    if (stat("/proc/self/cgroup", &st[0]) || stat("/proc/self/cpuset", &st[1]) ||
-        stat("/proc/self/projid_map", &st[2]))
-        return 80;
-    printf("modes: %o %o %o\n", st[0].st_mode & 07777, st[1].st_mode & 07777,
-           st[2].st_mode & 07777);
+    struct stat st[2];
+    if (stat("/proc/self/cgroup", &st[0]) || stat("/proc/self/projid_map", &st[1])) return 80;
+    printf("modes: %o %o\n", st[0].st_mode & 07777, st[1].st_mode & 07777);
     ci_read("/proc/self/projid_map");
     printf("first namespace: %s", ci_text);
     printf("write first: %ld\n", oc_write("/proc/self/projid_map", "0 0 1", 5));

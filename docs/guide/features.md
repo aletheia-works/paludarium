@@ -4324,7 +4324,7 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mem`, `mounts`, `mountinfo`,
-  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `cpuset`, `cgroup`, `oom_score`, `oom_adj`,
+  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `cgroup`, `oom_score`, `oom_adj`,
   `oom_score_adj`, `loginuid`, `sessionid`, `coredump_filter`, `io`, `uid_map`, `gid_map`,
   `projid_map`, `setgroups`, `timerslack_ns`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
@@ -4404,7 +4404,7 @@ kernel.
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
   `comm`, `syscall` (0400), `maps`, `mem` (0600), `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`,
-  `cpuset`, `cgroup`, `oom_score`, `oom_adj`, `oom_score_adj`, `loginuid`, `sessionid`,
+  `cgroup`, `oom_score`, `oom_adj`, `oom_score_adj`, `loginuid`, `sessionid`,
   `coredump_filter`, `io` (0400), `uid_map`, `gid_map`, `projid_map`, `setgroups`,
   `timerslack_ns` (0666), `exe`, `cwd`, `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns`
   (0511) and `task`, made as
@@ -4560,9 +4560,11 @@ kernel.
   (`EPERM`). Setting a user starts a session with a number no other has had
   (from 1 in each emulator), and none ends it. Nothing audits.
 
-- `cgroup` and `cpuset` (0444) read `0::/` and `/`: every task is in the
-  root group of a unified hierarchy, as a cgroup v2 host shows a task in its
-  root, whichever control group namespace reads them.
+- `cgroup` (0444) reads `0::/`: every task is in the root group of a
+  unified hierarchy, as a cgroup v2 host shows a task in its root,
+  whichever control group namespace reads it. There is no `cpuset`, as in
+  Ubuntu's kernel, which leaves out the cgroup v1 cpusets
+  (`CONFIG_CPUSETS_V1`) that it comes with.
 
 - `children` (0444) of a thread lists, each followed by a space, the
   processes it made that are not yet reaped, zombies too, as Linux's

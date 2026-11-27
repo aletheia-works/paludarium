@@ -3714,7 +3714,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
   `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mem`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、`smaps_rollup`、
-  `pagemap`、`wchan`、`cpuset`、`cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、
+  `pagemap`、`wchan`、`cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、
   `coredump_filter`、`io`、`uid_map`、`gid_map`、`projid_map`、`setgroups`、`timerslack_ns`、`fd`、`fdinfo`、`ns`、`task`
   があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
@@ -3780,7 +3780,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`--mount /:/` ではホストの項目）は並べません。`ps`、`pgrep`、`pidof` が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`personality`（0400）、`comm`、
   `syscall`（0400）、`maps`、`mem`（0600）、`clear_refs`（0200）、`smaps`、`smaps_rollup`、`pagemap`（0400）、`wchan`、
-  `cpuset`、`cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、`coredump_filter`、`io`（0400）、
+  `cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、`coredump_filter`、`io`（0400）、
   `uid_map`、`gid_map`、`projid_map`、`setgroups`、`timerslack_ns`（0666）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
@@ -3912,9 +3912,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかにない番号（エミュレーターごとに 1 から）のセッションが始まり、なしにすると終わります。
   監査はしません。
 
-- `cgroup` と `cpuset`（0444）は `0::/` と `/` を読みます。どのタスクも、cgroup v2 の
-  ホストがルートのタスクを示すのと同じく統合された階層のルートのグループにいて、どの
-  コントロールグループの名前空間から読んでも同じです。
+- `cgroup`（0444）は `0::/` を読みます。どのタスクも、cgroup v2 のホストがルートの
+  タスクを示すのと同じく統合された階層のルートのグループにいて、どのコントロールグループの
+  名前空間から読んでも同じです。`cpuset` は、それを持つ cgroup v1 の cpuset
+  （`CONFIG_CPUSETS_V1`）を外した Ubuntu のカーネルと同じくありません。
 
 - スレッドの `children`（0444）は、Linux の `children_seq_show` と同じく、そのスレッドが
   作ってまだ回収されていないプロセス（ゾンビも）を、それぞれの後ろに空白を付けて並べます。

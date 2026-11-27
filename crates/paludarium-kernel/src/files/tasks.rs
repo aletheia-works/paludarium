@@ -314,11 +314,9 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
         TaskEntry::Auxv => Vec::new(),
         TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),
         // The control group's path from the root of the reader's control
-        // group namespace (Linux's `proc_cgroup_show` and
-        // `proc_cpuset_show`): one group, the root, of the unified
-        // hierarchy (ID 0, no controllers named).
+        // group namespace (Linux's `proc_cgroup_show`): one group, the
+        // root, of the unified hierarchy (ID 0, no controllers named).
         TaskEntry::Cgroup => b"0::/\n".to_vec(),
-        TaskEntry::Cpuset => b"/\n".to_vec(),
         // As Linux's `proc_loginuid_read` and `proc_sessionid_read` write
         // them, with no newline: the login user as the opener's namespace
         // has it (-1 for none or one it does not map), and the session.
@@ -1200,7 +1198,6 @@ pub(super) fn made_at_read(entry: TaskEntry) -> bool {
             | TaskEntry::Cmdline
             | TaskEntry::Comm
             | TaskEntry::Cgroup
-            | TaskEntry::Cpuset
             | TaskEntry::LoginUid
             | TaskEntry::SessionId
     )

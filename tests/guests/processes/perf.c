@@ -2338,22 +2338,24 @@ static void see_clock_sample(const uint64_t *record, void *with) {
     c->samples++;
 }
 
-/* cpu-clock every 100 us, for 20 ms of the thread's time: each sample is
+/* cpu-clock every 1 ms, for 200 ms of the thread's time: each sample is
    taken as its hrtimer interrupts the loop, so none has the instruction
    and registers of the one before. The emulator takes them at its
    checkpoints, which come about as often as the period while the clock
    samples, but those of a system call's time share one: at most a third
-   may (most did with runs of 100,000 instructions). The time of a sample
-   is not looked at: the harness's clock does not pass as the guest runs. */
+   may (most did with runs of 100,000 instructions). The period is long
+   enough to be more than the 5,000 instructions a paced run has at least,
+   even in a coverage build. The time of a sample is not looked at: the
+   harness's clock does not pass as the guest runs. */
 static int case_clock_samples(void) {
     struct attr a = software(0);
-    a.sample_period = 100000;
+    a.sample_period = 1000000;
     a.sample_type = SAMPLE_IP | SAMPLE_REGS_USER;
     a.sample_regs_user = CLOCK_REGS;
     a.flags |= DISABLED;
     void *page;
     int fd = (int)open_event(&a, 0, -1, -1, 0);
-    int mapped = fd >= 0 && map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page) == 0;
+    int mapped = fd >= 0 && map_event(fd, 17, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page) == 0;
     say("mapped %d", mapped);
     if (!mapped) return 1;
     ioctl(fd, IOC_ENABLE, 0);
@@ -2362,7 +2364,7 @@ static int case_clock_samples(void) {
     do {
         for (int i = 0; i < 10; i++) spin();
         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
-    } while ((now.tv_sec - from.tv_sec) * 1000000000L + now.tv_nsec - from.tv_nsec < 20000000L);
+    } while ((now.tv_sec - from.tv_sec) * 1000000000L + now.tv_nsec - from.tv_nsec < 200000000L);
     ioctl(fd, IOC_DISABLE, 0);
     struct clock_samples c = {0};
     uint64_t tail = 0;

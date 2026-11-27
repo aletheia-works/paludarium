@@ -781,7 +781,7 @@ impl Network {
         // The request goes out, and the peer that has the address answers
         // it (`arp_send`, `arp_process`).
         if asked {
-            self.count(index, &[frames::ARP]);
+            self.send_out(index, &[frames::ARP]);
             if answer.is_some()
                 && let Some((there, peer_index, _)) = &peer
             {
@@ -1132,6 +1132,20 @@ impl Network {
             && let Some(there) = peer.network.upgrade()
         {
             there.devices().take(peer.index, frames);
+        }
+    }
+    /// The veth end `index` is to send packets of `frames`' lengths: with
+    /// its carrier they go ([`Self::count`]); without, its queueing
+    /// discipline, `noop`, drops them (`noop_enqueue`), which no counter
+    /// here takes.
+    pub(crate) fn send_out(&self, index: i32, frames: &[usize]) {
+        let carrier = self
+            .devices()
+            .by_index(index)
+            .and_then(|d| d.veth.as_ref())
+            .is_none_or(|v| v.carrier);
+        if carrier {
+            self.count(index, frames);
         }
     }
     /// The index the peer of this namespace's veth end `index` has in its
@@ -3571,7 +3585,7 @@ impl InetSocket {
                     // copy loops back without the driver
                     // (`dev_loopback_xmit`).
                     let frames = frames::udp(v6, bytes.len(), mtu, frames::ETHERNET);
-                    self.network.count(index, &frames);
+                    self.network.send_out(index, &frames);
                 }
                 let peer_index = self.network.peer_index(index);
                 for (receiver, own) in copies {
@@ -3623,10 +3637,11 @@ impl InetSocket {
                     // unreachable that tells of it is no hard error
                     // (`__udp4_lib_err`).
                     Reach::Unanswered => return Ok(bytes.len()),
-                    // Sent, and dropped where it comes.
+                    // Sent, and dropped where it comes; or, without the
+                    // carrier, dropped as it goes.
                     Reach::Dropped => {
                         let frames = frames::udp(v6, bytes.len(), mtu, frames::ETHERNET);
-                        self.network.count(index, &frames);
+                        self.network.send_out(index, &frames);
                         return Ok(bytes.len());
                     }
                 };

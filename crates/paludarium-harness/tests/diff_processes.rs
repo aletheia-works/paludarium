@@ -1139,6 +1139,7 @@ mod linux {
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
+        processes_sysctl_constants => ("sysctl-constants","process"),
         processes_poll_default => ("poll-default","process"),
         processes_uts_sysctl => ("uts-sysctl","process"),
         processes_uts_sysctl_poll => ("uts-sysctl-poll","process"),

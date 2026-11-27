@@ -4201,8 +4201,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/mem` など、アタッチするファイル）。`yama_ptrace_traceme` と同じく、2 では
   `PTRACE_TRACEME` に、呼び出し元のユーザー名前空間で `CAP_SYS_PTRACE` を持つトレーサーを求め、
   3 では断ります（`EPERM`）。
+  `/proc/sys/kernel` には、マシンの定数もあります。root の持つモード 0444 のファイルで、
+  書くために開ける者はいません（`EACCES`）。Linux の `kernel/sysctl.c` と同じ
+  `cap_last_cap`（40。`prctl` が取る最大のケーパビリティ）と `ngroups_max`（65536。
+  `setgroups` が取るグループの最大数）、そして `kernel/seccomp.c` と同じ
+  `seccomp/actions_avail`（`SECCOMP_GET_ACTION_AVAIL` が取るアクションの名前）です。
+  Linux でその隣にある `actions_logged` は、何もログに残さないので作りません。
+  `/proc/sys/kernel/random` には Linux の `drivers/char/random.c` のファイルがあります。
+  `poolsize`、`entropy_avail`、`write_wakeup_threshold` は、起動を終えたマシンと同じく
+  準備のできたプールのビット数の 256 で、`urandom_min_reseed_secs` は 60 です。このうち
+  最後の 2 つはモード 0644 で、root が書いたものを丸ごと受け取り、何も変えません
+  （`proc_do_rointvec`）。`boot_id` はマシンが最初に読まれたときに引いて保つ、ランダムな
+  バージョン 4 の UUID で、`uuid` は読むたびに新しいものです（`proc_do_uuid`）。これらのうち
+  文字列のものは、`proc_dostring` と同じくファイルの今の位置から読め、`int` のものは先頭からしか
+  読めません。
   `/proc/sys/kernel` にあるのはこれらと次の 6 つ、そして `yama` だけで、`/proc/sys` のどの
-  ディレクトリも、Linux の木と同じく、名前の順に並べます。
+  ディレクトリも、Linux の木と同じく、ディレクトリもファイルと混ぜて名前の順に並べます。
 
 - `/proc/sys/kernel` には、Linux の `kernel/utsname_sysctl.c` と同じく、UTS 名前空間の名前も
   あります。`arch`、`ostype`、`osrelease`、`version`（root のモード 0444）と、`hostname`、

@@ -47,6 +47,11 @@ const RET_TRACE: u32 = 0x7ff0_0000;
 const RET_LOG: u32 = 0x7ffc_0000;
 const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_ACTION_FULL: u32 = 0xffff_0000;
+/// The names of the actions `SECCOMP_GET_ACTION_AVAIL` takes, in its
+/// order, which `/proc/sys/kernel/seccomp/actions_avail` shows
+/// (`seccomp_actions_avail`).
+pub(crate) const ACTIONS_AVAIL: &[u8] =
+    b"kill_process kill_thread trap errno user_notif trace log allow";
 const RET_DATA: u32 = 0xffff;
 
 const FLAG_TSYNC: u32 = 1;

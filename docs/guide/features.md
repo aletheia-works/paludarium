@@ -4907,9 +4907,26 @@ kernel.
   (`ptrace`, `process_vm_readv`, `pidfd_getfd`, `/proc/<pid>/mem` and the
   other files that attach), and at 2 `PTRACE_TRACEME` needs a tracer with
   `CAP_SYS_PTRACE` in the caller's user namespace and at 3 is refused
-  (`EPERM`), as `yama_ptrace_traceme`. `/proc/sys/kernel` lists only these,
-  the six below and `yama`, and each directory of `/proc/sys` lists its
-  entries by name, as Linux's tree of them keeps them.
+  (`EPERM`), as `yama_ptrace_traceme`.
+  `/proc/sys/kernel` also has the machine's constants, of mode 0444 and
+  root's, which no one opens to write (`EACCES`): `cap_last_cap` (40, the
+  highest capability `prctl` takes) and `ngroups_max` (65536, the most
+  groups `setgroups` takes), as Linux's `kernel/sysctl.c`; and
+  `seccomp/actions_avail`, the names of the actions
+  `SECCOMP_GET_ACTION_AVAIL` takes, as `kernel/seccomp.c` has it
+  (`actions_logged`, which Linux has beside it, is not made, as nothing is
+  logged). `/proc/sys/kernel/random` has the files of Linux's
+  `drivers/char/random.c`: `poolsize`, `entropy_avail` and
+  `write_wakeup_threshold` 256, the bits of a pool that is ready, as on a
+  booted machine, and `urandom_min_reseed_secs` 60, of which the last two
+  are of mode 0644 and take what root writes whole, to no effect
+  (`proc_do_rointvec`); `boot_id`, a random version 4 UUID the machine draws
+  at its first read and keeps, and `uuid`, a new one at each read
+  (`proc_do_uuid`). A string among these is read from where the file is, as
+  `proc_dostring` reads it, and an `int` only from the start.
+  `/proc/sys/kernel` lists only these, the six below and `yama`, and each
+  directory of `/proc/sys` lists its entries by name, directories among
+  files, as Linux's tree of them keeps them.
 
 - `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
   `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`

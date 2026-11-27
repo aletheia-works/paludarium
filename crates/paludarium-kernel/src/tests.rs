@@ -5129,7 +5129,7 @@ mod mprotect_order {
             let was = f.thread.state.cpu.used.counts();
             f.kernel.handle(&mut f.thread, &f.mem, reason);
             let now = f.thread.state.cpu.used.counts();
-            // [minor, kernel, switches, migrations, major, unfinished]
+            // [minor, kernel, switches, migrations, major, unfinished, kernel unfinished]
             assert_eq!(
                 (now[0] - was[0], now[5] - was[5]),
                 (0, counted),

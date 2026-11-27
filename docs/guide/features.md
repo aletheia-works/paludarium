@@ -5653,8 +5653,11 @@ kernel.
   alone counts a fault of the thread's code whose `userfaultfd` wait a
   signal ends, as it is not tried again, and one that ends in `SIGSEGV`
   or `SIGBUS`, as Linux counts a fault of a user address or the
-  `vsyscall` page as it starts and no fault that fails in the others; a
-  kernel address counts nothing); and
+  `vsyscall` page as it starts and no fault that fails in the others, and
+  so does a fault of a kernel access that fails, as a system call's copy
+  does with `EFAULT`; a kernel address counts nothing, and so does a
+  system call's access past user space, which `access_ok` refuses, or one
+  with faults disabled); and
   `alignment-faults`,
   `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
   x86-64. An event of a thread on one CPU, as `perf record` opens one for

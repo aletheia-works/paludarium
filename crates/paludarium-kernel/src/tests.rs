@@ -10644,6 +10644,39 @@ mod inotify {
         assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x10, &b"prog"[..])]);
     }
     #[test]
+    fn a_removed_program_ends_with_its_last_threads_exit() {
+        let mut f = fixture();
+        assert_eq!(f.ret(83, &[put(&f, DATA, b"/tmp/x"), 0o755]), 0);
+        let bytes = paludarium_loader::testing::tiny_exec(&[0x90], b"");
+        let file = f
+            .kernel
+            .files
+            .fs()
+            .open(b"/tmp/x/prog", 0o101, 0o755)
+            .unwrap();
+        assert_eq!(file.write_at(0, &bytes).unwrap(), bytes.len());
+        drop(file);
+        let prog = put(&f, DATA, b"/tmp/x/prog");
+        assert_eq!(f.ret(59, &[prog, 0, 0]), 0);
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let wd = f.ret(ADD, &[fd, prog, 0x400]) as i32;
+        // Removed while it runs, it lasts.
+        assert_eq!(f.ret(87, &[prog]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        // Nor do the image's mappings alone, once its memory goes, keep it:
+        // the name does until the last thread's exit lets go of it with
+        // `exe_file`, before the exit is told (`exit_mm` before
+        // `exit_notify`).
+        assert!(f.kernel.take_exec_memory().is_some());
+        f.kernel.group.set_exe_file(None);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        f.kernel.group.release_program();
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
     fn a_fifo_a_path_opened_and_splices_are_heard_of() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

@@ -1274,7 +1274,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_EVENT_REMAP` が元の場所、移った先、長さを示します。
   `UFFD_FEATURE_EVENT_REMOVE` は、`MADV_DONTNEED`、`MADV_DONTNEED_LOCKED`、
   `MADV_FREE`、`MADV_REMOVE`（と呼んだ側自身のメモリへの `process_madvise`）が
-  落とそうとする範囲を、マッピングごとに知らせます（`UFFD_EVENT_REMOVE`）。
+  落とそうとする範囲を、マッピングごとに知らせます（`UFFD_EVENT_REMOVE`）。Linux の
+  `madvise_walk_vmas` と同じく、マッピングのイベントは、前のマッピングがページを失った後、
+  自分のページを落とす前に読まれます。確かめを通らないマッピング（封印したもの、共有の
+  ファイルでない `MADV_REMOVE` のもの）は、イベントなしで操作を終えます。
   `UFFD_FEATURE_EVENT_UNMAP` は、`munmap`、`brk`、`MAP_FIXED` の `mmap`、`mremap` が
   外した範囲全体を、その一部を登録した `userfaultfd` ごとに一度知らせます
   （`UFFD_EVENT_UNMAP`）。`mremap` は Linux の `notify_uffd` と同じく、`MREMAP_FIXED` が

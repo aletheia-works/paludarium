@@ -4541,7 +4541,13 @@ impl Kernel {
             processes: &self.processes,
         };
         loop {
-            let mut removing = |from, to| crate::userfaultfd::remove(&mut c, from, to);
+            let mut removing =
+                |from,
+                 to,
+                 check: &mut crate::syscalls::Part<'_>,
+                 drop: &mut crate::syscalls::Part<'_>| {
+                    crate::userfaultfd::remove(&mut c, from, to, check, drop)
+                };
             let mut poisoned = None;
             let result = crate::syscalls::advise(
                 mem,

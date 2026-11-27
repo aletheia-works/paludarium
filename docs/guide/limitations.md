@@ -1183,11 +1183,9 @@ verified.
   by another process, or through another mapping of the file, does not find
   its waiters.
 - **userfaultfd, in part**: missing pages, write protection and the minor
-  faults of shmem are registered. A discard tells of all its ranges
-  before it drops the pages of any, where Linux tells and drops VMA by VMA,
-  and registered mappings of one `userfaultfd` that meet are one range of
-  `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of
-  its whole range once its first mapping passes the checks.
+  faults of shmem are registered. Registered mappings of one `userfaultfd`
+  that meet are one range of `UFFD_EVENT_REMOVE`, as when Linux's VMAs
+  merge, though Linux keeps apart VMAs whose other flags differ.
   Of shmem's files a memfd and a file of a tmpfs mount (one a guest
   mounted, or `/dev/shm`) are registered, but for write protection alone
   with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the

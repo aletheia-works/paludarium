@@ -12244,7 +12244,7 @@ mod madvise_advice {
             addr,
             len,
             advice,
-            &mut |_, _| {},
+            &mut syscalls::untold,
             &mut poisoned,
         );
         (result, poisoned)

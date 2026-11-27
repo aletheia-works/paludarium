@@ -3410,9 +3410,31 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 
+/// A part `[from, to)` of a discard: its check, or the drop of its pages
+/// ([`advise`]).
+pub(crate) type Part<'a> = dyn FnMut(u64, u64) -> Result<(), Errno> + 'a;
+
+/// What a discard of `[start, end)` goes through, with the check and the
+/// drop of each of its parts ([`crate::userfaultfd::remove`]).
+pub(crate) type Removing<'a> =
+    dyn FnMut(u64, u64, &mut Part<'_>, &mut Part<'_>) -> Result<(), Errno> + 'a;
+
+/// A discard that tells no `userfaultfd`: the drop of the whole range.
+#[cfg(test)]
+pub(crate) fn untold(
+    start: u64,
+    end: u64,
+    _check: &mut Part<'_>,
+    drop: &mut Part<'_>,
+) -> Result<(), Errno> {
+    drop(start, end)
+}
+
 pub(crate) fn madvise(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (mem, credentials) = (c.mem, c.process.credentials.clone());
-    let mut removing = |from, to| crate::userfaultfd::remove(c, from, to);
+    let mut removing = |from, to, check: &mut Part<'_>, drop: &mut Part<'_>| {
+        crate::userfaultfd::remove(c, from, to, check, drop)
+    };
     let mut poisoned = None;
     let result = advise(
         mem,
@@ -3467,15 +3489,16 @@ pub(crate) fn restart_guard_install(c: &mut Context<'_>, number: u64) -> Errno {
 /// page itself ([`AddressSpace::collapse`]); and `MADV_HWPOISON` and
 /// `MADV_SOFT_OFFLINE` ([`inject_error`]), whose SIGBUS is left in
 /// `poisoned`. The others are rejected rather than ignored, so that a guest
-/// relying on one of them notices. Before a discard drops pages, `removing`
-/// is told its range, for the `userfaultfd` events (`userfaultfd_remove`).
+/// relying on one of them notices. A discard goes through `removing`, which
+/// tells the `userfaultfd`s of each part before it drops it
+/// (`userfaultfd_remove`), or [`untold`].
 pub(crate) fn advise(
     mem: &AddressSpace,
     credentials: &credentials::Credentials,
     addr: u64,
     len: u64,
     advice: u64,
-    removing: &mut dyn FnMut(u64, u64),
+    removing: &mut Removing<'_>,
     poisoned: &mut Option<u64>,
 ) -> Result<(), Errno> {
     if !matches!(
@@ -3513,21 +3536,33 @@ pub(crate) fn advise(
     if advice == MADV_DONTNEED_LOCKED || advice == MADV_DONTNEED {
         let stop = mem.first_undiscardable(GuestAddr(addr), end, advice == MADV_DONTNEED);
         return short_of(mem, addr, end, stop, true, |to| {
-            removing(addr, to);
-            mem.discard_shared(GuestAddr(addr), to - addr)
+            // A sealed VMA refuses before its event (`can_madvise_modify`).
+            let mut check = |from: u64, _| {
+                if mem.refuses_discard_at(GuestAddr(from)) {
+                    Err(Errno::EPERM)
+                } else {
+                    Ok(())
+                }
+            };
+            let mut drop = |from: u64, to: u64| mem.discard_shared(GuestAddr(from), to - from);
+            removing(addr, to, &mut check, &mut drop)
         });
     }
     if advice == MADV_REMOVE {
         return short_of_locked(mem, addr, end, true, |to| {
-            let (removals, hole) = mem.removals(GuestAddr(addr), to);
             // The checks of the VMA come before the event.
-            if removals.first().is_some_and(Result::is_ok) {
-                removing(addr, to);
-            }
-            for removal in removals {
-                remove(credentials, &removal?)?;
-            }
-            if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+            let mut check = |from: u64, to: u64| match mem.removals(GuestAddr(from), to).0.first() {
+                Some(Err(e)) => Err(*e),
+                _ => Ok(()),
+            };
+            let mut drop = |from: u64, to: u64| {
+                let (removals, hole) = mem.removals(GuestAddr(from), to);
+                for removal in removals {
+                    remove(credentials, &removal?)?;
+                }
+                if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+            };
+            removing(addr, to, &mut check, &mut drop)
         });
     }
     if advice == MADV_GUARD_INSTALL {
@@ -3574,10 +3609,12 @@ pub(crate) fn advise(
         return short_of_locked(mem, addr, end, true, |to| {
             // The event comes before the check of the VMA's kind
             // (`madvise_free_single_vma`).
-            removing(addr, to);
-            mem.check_private_anonymous(GuestAddr(addr), to - addr)?;
-            mem.clear_poisons(GuestAddr(addr), to - addr);
-            Ok(())
+            let mut drop = |from: u64, to: u64| {
+                mem.check_private_anonymous(GuestAddr(from), to - from)?;
+                mem.clear_poisons(GuestAddr(from), to - from);
+                Ok(())
+            };
+            removing(addr, to, &mut |_, _| Ok(()), &mut drop)
         });
     }
     // MADV_COLD and MADV_PAGEOUT take no locked VMA (`can_madv_lru_vma`).

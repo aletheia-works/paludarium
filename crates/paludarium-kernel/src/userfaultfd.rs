@@ -1537,29 +1537,55 @@ pub(crate) fn unmap(mem: &MemoryView, start: u64, end: u64, events: &mut Events)
     }
 }
 
-/// The `UFFD_EVENT_REMOVE` that a discard of `[start, end)` of `mem`
-/// gives, mapping by mapping, before it drops the pages
-/// (`userfaultfd_remove`): each context with `UFFD_FEATURE_EVENT_REMOVE`
-/// that registered some of the range is told of its parts and read before
-/// the discard goes on.
-pub(crate) fn remove(c: &mut Context<'_>, start: u64, end: u64) {
-    let mut events = Events::default();
-    for (context, parts) in registered(&c.mem.view(), start, end, FEATURE_EVENT_REMOVE) {
-        for (from, to) in parts {
-            events.push(
-                Arc::clone(&context),
-                event_message(EVENT_REMOVE, &[from, to]),
-                None,
-            );
+/// A discard of `[start, end)` of the caller's memory, VMA by VMA as
+/// Linux's `madvise_walk_vmas` goes: `drop` drops the pages of a part,
+/// and before the part a context with `UFFD_FEATURE_EVENT_REMOVE`
+/// registered (its registered mappings that meet are one part, as Linux's
+/// VMAs merge) is dropped, `check` looks at it and its `UFFD_EVENT_REMOVE`
+/// is read (`userfaultfd_remove`). So the parts before it have lost their
+/// pages, and the parts after it not yet. An error ends the walk, but for
+/// `ENOMEM`, of a hole, which the walk gives once it is done.
+pub(crate) fn remove(
+    c: &mut Context<'_>,
+    start: u64,
+    end: u64,
+    check: &mut crate::syscalls::Part<'_>,
+    drop: &mut crate::syscalls::Part<'_>,
+) -> Result<(), Errno> {
+    let mut parts: Vec<(Arc<Userfaultfd>, u64, u64)> =
+        registered(&c.mem.view(), start, end, FEATURE_EVENT_REMOVE)
+            .into_iter()
+            .flat_map(|(context, parts)| {
+                parts
+                    .into_iter()
+                    .map(move |(from, to)| (Arc::clone(&context), from, to))
+            })
+            .collect();
+    parts.sort_by_key(|&(_, from, _)| from);
+    let mut hole = false;
+    let mut step = |result: Result<(), Errno>| match result {
+        Err(Errno::ENOMEM) => {
+            hole = true;
+            Ok(())
         }
+        result => result,
+    };
+    let mut at = start;
+    for (context, from, to) in parts {
+        if from > at {
+            step(drop(at, from))?;
+        }
+        check(from, to)?;
+        let mut events = Events::default();
+        events.push(context, event_message(EVENT_REMOVE, &[from, to]), None);
+        events.deliver(c);
+        step(drop(from, to))?;
+        at = to;
     }
-    // In the order of the ranges, whose start is the message's first word.
-    events.0.sort_by_key(|(_, m, _)| {
-        let mut word = [0; 8];
-        word.copy_from_slice(&m[8..16]);
-        u64::from_le_bytes(word)
-    });
-    events.deliver(c);
+    if at < end {
+        step(drop(at, end))?;
+    }
+    if hole { Err(Errno::ENOMEM) } else { Ok(()) }
 }
 
 /// The contexts with `UFFD_FEATURE_EVENT_REMAP` of the mapping at `addr`

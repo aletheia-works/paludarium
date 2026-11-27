@@ -1432,7 +1432,11 @@ kernel.
   where it went and its length; `UFFD_FEATURE_EVENT_REMOVE` tells the
   ranges `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_FREE` and
   `MADV_REMOVE` (and `process_madvise` of the caller's own memory) are
-  about to drop, mapping by mapping (`UFFD_EVENT_REMOVE`), and
+  about to drop, mapping by mapping (`UFFD_EVENT_REMOVE`), as Linux's
+  `madvise_walk_vmas` goes: a mapping's event is read after the mappings
+  before it lost their pages and before its own go, and one that fails
+  its checks (a sealed one's, `MADV_REMOVE`'s of no shared file) ends the
+  discard with no event, and
   `UFFD_FEATURE_EVENT_UNMAP` the whole range `munmap`, `brk`, a `MAP_FIXED`
   `mmap` and `mremap` unmapped (`UFFD_EVENT_UNMAP`), once to each
   `userfaultfd` that registered some of it; `mremap` tells of the range

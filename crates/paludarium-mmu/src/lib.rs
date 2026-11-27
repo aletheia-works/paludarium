@@ -600,8 +600,8 @@ pub mod faults {
         });
     }
 
-    /// Counts the retried fault that waits to be ([`retry_major`]), if one
-    /// does, as a major one.
+    /// Counts the pending retried fault ([`retry_major`]), if there is
+    /// one, as a major fault.
     fn count_pending() {
         let Some(Pending { at, .. }) = PENDING.with(Cell::take) else {
             return;
@@ -657,8 +657,10 @@ pub mod faults {
     /// holds what this returns, ends: so the record is only of the retries
     /// of one access, and a later access that faults on the page again
     /// counts its own fault.
-    /// A retry the access leaves that has not failed got past its page,
-    /// and is counted as the access ends.
+    ///
+    /// When the access ends, a retried fault of its that is still pending
+    /// ([`retry_major`]) has not failed: the retry got past the page, and
+    /// it is counted then.
     fn retry_scope() -> RetryScope {
         RetryScope(RETRIED.with(Cell::take), PENDING.with(Cell::take))
     }

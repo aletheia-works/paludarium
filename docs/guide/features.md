@@ -5357,8 +5357,8 @@ kernel.
   system call. `ru_majflt` counts the major faults, for the same processes
   and threads and children (`cmaj_flt`): the faults of the kernel's
   accesses that a `userfaultfd` had try again, as described for
-  `userfaultfd`, each counted once as its wait ends, and to no minor
-  fault. The other counts (involuntary context switches, blocks) are 0.
+  `userfaultfd`, each counted once as its retry completes, and to no
+  minor fault. The other counts (involuntary context switches, blocks) are 0.
   `/proc/<pid>/stat` gives the same counts as `minflt` and `majflt` (a
   thread's own under `task`) and `cminflt` and `cmajflt`.
 

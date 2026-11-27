@@ -257,10 +257,11 @@ static void help(int what, pid_t waiter) {
     case 11: case 12:
         /* Wakes the wait once one sleeps in it: after the handler, that is the
          * one run again. The word stays 0, as one changed before that wait
-         * reads it would end the wait with EAGAIN instead. */
+         * reads it would end the wait with EAGAIN instead. It tries as long as
+         * until() waits. */
         for (int n = 0; !slot->told && n < 2400; n++) {
             if (syscall(SYS_futex, &slot->word, 1L, 1L, NULL, NULL, 0L) > 0) break;
-            ms(1);
+            ms(5);
         }
         break;
     case 16: case 27: semop(sem, &op, 1); break;

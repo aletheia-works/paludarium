@@ -3753,7 +3753,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 
-- `/proc` にあるのは、ほかには `/proc/cpuinfo`（後述）、`/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/net`、`/proc/sysvipc`（後述）、
+- `/proc` にあるのは、ほかには `/proc/cpuinfo`（後述）、`/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/version` などほかのシステムのファイル（後述）、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
@@ -4281,6 +4281,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   使用はなく、スワップも huge page もありません。起動からの時間は単調時計の値で、アイドルの
   時間は数えません。
 
+- ほかのシステムのファイルは、エミュレーターが持つものだけで起動したマシンのもので、
+  Linux と同じ形式です。
+  - `/proc/version` は、`uname` のシステム名、リリース、バージョンを入れた Linux の
+    バナーで、`paludarium@paludarium` が `rustc` でビルドしたとしています。
+  - `/proc/cmdline` は決まったコマンドライン `ro` で、Linux が設定するとおり、
+    サイズはその行の長さです。
+  - `/proc/filesystems` は `sysfs` が番号を付ける種類をその順に並べ、ext4 以外に `nodev` を付けます。
+  - `/proc/devices` は、メモリーデバイス、`/dev/tty` と `/dev/ptmx`、misc デバイス、
+    疑似端末のマスター（`ptm`）とスレーブ（`pts`）のキャラクターデバイスのメジャー番号に続けて、
+    ブロックデバイスのメジャー番号 `blkext` だけを並べます。
+  - `/proc/misc` は `/dev/userfaultfd` のマイナー番号を並べます。
+  - `/proc/swaps` と `/proc/cgroups` は見出しの行だけです。スワップはなく、コントローラーも
+    ありません（cgroup はバージョン 2 のルートだけです）。
+
 - `/proc/stat` は Linux の `show_stat` と同じ形式です。
   - `cpu` の行と、`sched_getaffinity` が返す CPU ごとの行は、すべてのスレッドが使った CPU 時間を
     クロックティックで示します。回収したプロセスの分も含むので、数は増えるだけです。
@@ -4362,7 +4376,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - セグメントやキューの PID は、`IPC_STAT` が返すものも、そのプロセスがなくなっても見えます。
     オブジェクトがその `struct pid` を持ち続けるためです。
 
-- これらのシステムのファイル（`cpuinfo`、`loadavg`、`locks`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
+- これらのシステムのファイル（`cpuinfo`、`loadavg`、`locks`、`meminfo`、`stat`、`uptime`、前述のうち `cmdline` 以外のもの、`sysvipc` の中のもの）の
   サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。
   プロセスやスレッドのディレクトリのファイルも、Linux の `proc_pid_make_inode` が残すとおり、
   読み込みが何を返しても（`stat` でも `fstat` でも）サイズは 0 です。

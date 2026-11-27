@@ -4377,7 +4377,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 
 - The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
-  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
+  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/version` and the other system files (below), `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
@@ -5002,6 +5002,21 @@ kernel.
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
 
+- The system's other files are those of a machine that booted with nothing
+  but what the emulator has, in Linux's formats:
+  - `/proc/version` is Linux's banner with `uname`'s system name, release and
+    version, built by `paludarium@paludarium` with `rustc`.
+  - `/proc/cmdline` is the fixed command line `ro`, and its size is that of its
+    line, as Linux sets it.
+  - `/proc/filesystems` lists the types `sysfs` numbers, in its order, each
+    but ext4 marked `nodev`.
+  - `/proc/devices` lists the character majors of the memory devices,
+    `/dev/tty` and `/dev/ptmx`, the misc devices and the pseudo-terminals'
+    masters (`ptm`) and slaves (`pts`), then the block major `blkext` alone.
+  - `/proc/misc` lists `/dev/userfaultfd`'s minor.
+  - `/proc/swaps` and `/proc/cgroups` are their headers alone: nothing swaps,
+    and there is no controller (the only cgroup is version 2's root).
+
 - `/proc/stat` is in the format of Linux's `show_stat`.
   - A `cpu` line and one for each CPU `sched_getaffinity` reports give, in
     clock ticks, the CPU time every thread has run, the reaped processes'
@@ -5099,8 +5114,8 @@ kernel.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
 
-- These system files (`cpuinfo`, `loadavg`, `locks`, `meminfo`, `stat`, `uptime` and
-  `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
+- These system files (`cpuinfo`, `loadavg`, `locks`, `meminfo`, `stat`, `uptime`, the
+  files above but `cmdline`, and `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
   read goes on to the end of what they hold. So is every file of a process's
   or a thread's directory (`stat` and `fstat` alike), as Linux's
   `proc_pid_make_inode` leaves it, whatever its reads give.

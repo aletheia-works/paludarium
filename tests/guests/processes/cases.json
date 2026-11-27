@@ -318,6 +318,7 @@
     {"name":"poll","binary":"process"},
     {"name":"proc-status","binary":"process"},
     {"name":"status-space","binary":"process"},
+    {"name":"proc-system","binary":"process"},
     {"name":"credentials","binary":"process"},
     {"name":"permissions","binary":"process"},
     {"name":"setuid","binary":"process"},

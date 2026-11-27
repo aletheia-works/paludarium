@@ -22613,6 +22613,148 @@ static int proc_oom_case(void) {
     return 0;
 }
 
+/* The proc-system case: /proc's version, cmdline, filesystems, devices,
+   misc, swaps and cgroups. What they hold differs from machine to machine,
+   so their format is checked, and what other calls say of the same things:
+   uname's names in version, sysfs's types in filesystems, /dev's devices'
+   numbers in devices and misc. */
+static char psys_text[65536];
+static void psys_stat(const char *path, long n) {
+    struct stat st = {0}, opened = {0};
+    int r = stat(path, &st);
+    int fd = open(path, O_RDONLY);
+    int f = fstat(fd, &opened);
+    close(fd);
+    /* Size 0, but cmdline's, which is its line's. */
+    long want = strcmp(path, "/proc/cmdline") ? 0 : n;
+    printf("%s stat=%d mode=%o size-ok=%d fstat=%d size-ok=%d\n", path, r, st.st_mode, st.st_size == want, f,
+           opened.st_size == want);
+}
+/* Whether every line of `text`, after `skip` of them and up to a blank
+   one, is a major or minor number right-aligned in 3 columns, a space and a
+   name, in increasing order unless `any_order`; and whether a line names
+   `name` with `number` (*found). */
+static int psys_numbered(const char *text, int skip, int any_order, const char *name, long number, int *found) {
+    static char copy[65536];
+    snprintf(copy, sizeof copy, "%s", text);
+    int ok = 1;
+    long last = -1;
+    for (char *line = copy, *end; *line; line = end + 1) {
+        if (!(end = strchr(line, '\n'))) return 0;
+        *end = 0;
+        if (skip > 0) {
+            skip--;
+            continue;
+        }
+        if (!*line) break;
+        char spaced[4] = {0};
+        memcpy(spaced, line, 3);
+        long value = strtol(spaced, NULL, 10);
+        ok &= strlen(line) > 4 && line[3] == ' ' && line[2] != ' ' && (any_order || value >= last);
+        last = value;
+        if (found && value == number && !strcmp(line + 4, name)) *found = 1;
+    }
+    return ok;
+}
+static int proc_system_case(void) {
+    long n;
+    /* version: linux_proc_banner with uname's sysname, release and version. */
+    struct utsname names;
+    uname(&names);
+    n = proc_read("/proc/version", psys_text, sizeof psys_text);
+    char head[512], tail[512];
+    snprintf(head, sizeof head, "%s version %s (", names.sysname, names.release);
+    snprintf(tail, sizeof tail, ") %s\n", names.version);
+    size_t tail_len = strlen(tail);
+    printf("version head=%d tail=%d one-line=%d\n", !strncmp(psys_text, head, strlen(head)),
+           n > (long)tail_len && !strcmp(psys_text + n - tail_len, tail), strchr(psys_text, '\n') == psys_text + n - 1);
+    psys_stat("/proc/version", n);
+    /* cmdline: one line, of the size its stat gives. */
+    n = proc_read("/proc/cmdline", psys_text, sizeof psys_text);
+    printf("cmdline some=%d one-line=%d\n", n > 1, n > 0 && strchr(psys_text, '\n') == psys_text + n - 1);
+    psys_stat("/proc/cmdline", n);
+    /* filesystems: sysfs's types, in its order, nodev before each that
+       needs no device. */
+    n = proc_read("/proc/filesystems", psys_text, sizeof psys_text);
+    long count = syscall(SYS_sysfs, 3);
+    long index = 0;
+    int same = 1, formed = 1, proc_nodev = 0;
+    for (char *line = psys_text, *end; *line; line = end + 1, index++) {
+        if (!(end = strchr(line, '\n'))) break;
+        *end = 0;
+        char *tab = strchr(line, '\t');
+        formed &= tab && (tab == line || (tab - line == 5 && !strncmp(line, "nodev", 5)));
+        char name[256] = {0};
+        same &= tab && syscall(SYS_sysfs, 2, index, name) == 0 && !strcmp(name, tab + 1);
+        proc_nodev |= !strcmp(line, "nodev\tproc");
+    }
+    printf("filesystems formed=%d same-as-sysfs=%d count-same=%d proc-nodev=%d\n", formed, same, index == count,
+           proc_nodev);
+    psys_stat("/proc/filesystems", n);
+    /* devices: the character majors, then a blank line and the block ones,
+       with the majors /dev's devices have among them. */
+    n = proc_read("/proc/devices", psys_text, sizeof psys_text);
+    struct stat st = {0};
+    stat("/dev/null", &st);
+    long null_major = major(st.st_rdev);
+    stat("/dev/userfaultfd", &st);
+    long misc_major = major(st.st_rdev), uffd_minor = minor(st.st_rdev);
+    stat("/dev/ptmx", &st);
+    long ptmx_major = major(st.st_rdev);
+    const char *block = strstr(psys_text, "\n\nBlock devices:\n");
+    int mem = 0, ptmx = 0, misc = 0, pts = 0, blkext = 0;
+    int ok = psys_numbered(psys_text, 1, 0, "mem", null_major, &mem);
+    psys_numbered(psys_text, 1, 0, "/dev/ptmx", ptmx_major, &ptmx);
+    psys_numbered(psys_text, 1, 0, "misc", misc_major, &misc);
+    psys_numbered(psys_text, 1, 0, "pts", 136, &pts);
+    int block_ok = block && psys_numbered(block + 2, 1, 0, "blkext", 259, &blkext);
+    printf("devices character-first=%d formed=%d block=%d block-formed=%d\n",
+           !strncmp(psys_text, "Character devices:\n", 19), ok, block != NULL, block_ok);
+    printf("devices mem=%d ptmx=%d misc=%d pts=%d blkext=%d\n", mem, ptmx, misc, pts, blkext);
+    n = proc_read("/proc/devices", psys_text, sizeof psys_text);
+    psys_stat("/proc/devices", n);
+    /* misc: minors and names, with /dev/userfaultfd's. */
+    n = proc_read("/proc/misc", psys_text, sizeof psys_text);
+    int uffd = 0;
+    int misc_ok = psys_numbered(psys_text, 0, 1, "userfaultfd", uffd_minor, &uffd);
+    printf("misc formed=%d userfaultfd=%d\n", misc_ok && n > 0, uffd);
+    psys_stat("/proc/misc", n);
+    /* swaps and cgroups: their headers, then lines of their fields. */
+    n = proc_read("/proc/swaps", psys_text, sizeof psys_text);
+    printf("swaps header=%d\n", !strncmp(psys_text, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n", 39));
+    psys_stat("/proc/swaps", n);
+    n = proc_read("/proc/cgroups", psys_text, sizeof psys_text);
+    int header = !strncmp(psys_text, "#subsys_name\thierarchy\tnum_cgroups\tenabled\n", 43);
+    int fields = 1;
+    for (char *line = header ? psys_text + 43 : psys_text, *end; *line; line = end + 1) {
+        if (!(end = strchr(line, '\n'))) break;
+        *end = 0;
+        char name[64];
+        int h, cgroups, enabled;
+        fields &= sscanf(line, "%63[^\t]\t%d\t%d\t%d", name, &h, &cgroups, &enabled) == 4;
+    }
+    printf("cgroups header=%d fields=%d\n", header, fields);
+    psys_stat("/proc/cgroups", n);
+    /* /proc lists them all, as regular files. */
+    const char *names_[] = {"cgroups", "cmdline", "cpuinfo", "devices", "filesystems", "misc", "swaps", "version"};
+    int listed = 0;
+    DIR *proc = opendir("/proc");
+    for (struct dirent *e; proc && (e = readdir(proc));)
+        for (int i = 0; i < 8; i++) listed += !strcmp(e->d_name, names_[i]) && e->d_type == DT_REG;
+    if (proc) closedir(proc);
+    printf("listed=%d\n", listed);
+    /* Past one, as past any file; a write, as to a file with no write. */
+    errno = 0;
+    int r = open("/proc/version/x", O_RDONLY);
+    printf("past open=%d errno=%d\n", r, errno);
+    int fd = open("/proc/filesystems", O_WRONLY);
+    errno = 0;
+    long w = write(fd, "x", 1);
+    printf("write open=%d write=%ld errno=%d\n", fd >= 0, w, errno);
+    close(fd);
+    return 0;
+}
+
 /* The status-space case: the lines status has while the task has its
    memory (CoreDumping, THP_enabled, untag_mask). PR_SET_THP_DISABLE (41)
    changes THP_enabled for the whole space, which a thread shares and a fork
@@ -45210,6 +45352,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "status-space")) return status_space_case(self, argv);
+    if (!strcmp(mode, "proc-system")) return proc_system_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "segment-registers")) return segments_case();

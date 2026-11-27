@@ -1641,16 +1641,24 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
 }
 
 /// The names /proc generates at its top, with their types.
-const ROOT_NAMES: [(&[u8], u8); 11] = [
+const ROOT_NAMES: [(&[u8], u8); 19] = [
     (b"self", DT_LNK),
     (b"thread-self", DT_LNK),
     (b"mounts", DT_LNK),
     (b"net", DT_LNK),
+    (b"cgroups", DT_REG),
+    (b"cmdline", DT_REG),
+    (b"cpuinfo", DT_REG),
+    (b"devices", DT_REG),
+    (b"filesystems", DT_REG),
     (b"loadavg", DT_REG),
     (b"locks", DT_REG),
     (b"meminfo", DT_REG),
+    (b"misc", DT_REG),
     (b"stat", DT_REG),
+    (b"swaps", DT_REG),
     (b"uptime", DT_REG),
+    (b"version", DT_REG),
     (b"sys", DT_DIR),
     (b"sysvipc", DT_DIR),
 ];

@@ -129,7 +129,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ID を返さないので、`initial apicid` はどの CPU でも 0 です。`bugs` は、Linux 7.0 がファミリー
   15 の AMD の CPU に想定するものを並べますが、仮想 CPU は投機実行をしません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
-  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/version`、`/proc/cmdline`、
+  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/interrupts`、`/proc/partitions`、`/proc/kallsyms`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
   `vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前

@@ -607,8 +607,10 @@ verified.
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
   `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
-  `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations complete with `EOPNOTSUPP`. Of the
-  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
+  `_RECV`, `_SENDMSG` and `_RECVMSG` run; Linux 6.12's other operations
+  complete with `EOPNOTSUPP`, and those Linux 7.0 adds after them (from
+  `IORING_OP_RECV_ZC`) fail with `EINVAL`, as on 6.12. Of the socket
+  requests, a multishot `IORING_OP_RECVMSG`, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
   one are not there yet (`EINVAL`). A multishot receive whose socket keeps
@@ -624,16 +626,20 @@ verified.
   and a file request run while `io_uring_enter` takes them, where Linux
   runs them, but for a close and some opens and advice, in a worker, so
   their completions can come before those Linux posts first, and an open of
-  a FIFO that may create it waits there. An `IORING_OP_SPLICE` that waits is
-  cancelled as a request that waits for its file, where Linux interrupts
-  its worker, and a splice to a socket can wait there for part of it. A timeout expires at
+  a FIFO that may create it waits there. An `IORING_OP_SPLICE` or `_TEE`
+  that waits is cancelled as a request that waits for its file, where Linux
+  interrupts its worker, and a splice to a socket can wait there for part
+  of it. A timeout expires at
   the checkpoints where its process can run: one due while every thread
   sleeps in `nanosleep` completes as the sleep ends, where Linux's timer
   completes it then. A thread that exits alone leaves its polls of rings
   waiting, where Linux cancels them, and a ring polled by a request of its
   own stays until that request ends. The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`,
-  `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
+  `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY`, and those
+  Linux 7.0 adds after `_NO_SQARRAY` (from `_HYBRID_IOPOLL`), give
+  `EINVAL`, as do the `io_uring_enter` flags it adds after
+  `IORING_ENTER_ABS_TIMER` (`_EXT_ARG_REG` and `_NO_IOWAIT`),
   and `io_uring_register` has only `IORING_REGISTER_PROBE`,
   `IORING_REGISTER_BUFFERS`, `IORING_UNREGISTER_BUFFERS`,
   `IORING_REGISTER_BUFFERS2`, `IORING_REGISTER_BUFFERS_UPDATE`,
@@ -743,7 +749,7 @@ verified.
   - A fault of a `memfd_secret` page takes the faulting process's
     `RLIMIT_MEMLOCK` as of its last system call (its creator's before
     one), and the pages count only `memfd_secret` files and `io_uring`'s
-    registered buffers, where Linux's `locked_vm` of a user also counts
+    registered buffers and rings of buffers, where Linux's `locked_vm` of a user also counts
     `perf`'s buffers and the like.
     Kernels without the change that counts them as they are faulted in
     (97d34aa65c29, "mm/secretmem: properly account locked pages") count

@@ -1661,8 +1661,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
   `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE` と
   `_TEE`、それにソケットの要求
-  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、それらなしでビルドした Linux と同じく
-  `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
+  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。Linux 6.12 のほかの操作は、それらなしでビルドした Linux と同じく
+  `EOPNOTSUPP` で完了し、それより新しい操作は 6.12 と同じく `EINVAL` で完了します。`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
   `fsgid` を返します。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
@@ -1712,8 +1712,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     その完了のあとにタグを投稿します（`io_put_rsrc_node`）。
 
 - `IORING_OP_ASYNC_CANCEL` と `IORING_REGISTER_SYNC_CANCEL` は、Linux master の
-  `io_uring/cancel.c` と `io_poll_cancel` と同じく、そのリングでファイルを待つ要求を取り消します。
-  ほかの要求が実行中になることはないので、見つけるものはそれだけです。
+  `io_uring/cancel.c` と `io_poll_cancel` と同じく、そのリングでファイルを待つ要求を取り消し、
+  それが見つからなければリングのタイムアウトを取り消します。ワーカーで走る要求はないので、
+  ほかに見つけるものはありません。
   - 取り消しは `user_data` で、`IORING_ASYNC_CANCEL_FD` ならファイルで（`_FD_FIXED` か
     `IOSQE_FIXED_FILE` なら登録したファイルで）、`_OP` なら操作で一致を探し、`_ANY` なら
     どの要求にも一致します。`_USERDATA` があれば `user_data` も一致しなければなりません。

@@ -1888,8 +1888,9 @@ kernel.
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
   `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
-  `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations complete with `EOPNOTSUPP`, as on a Linux
-  built without them, and `IORING_REGISTER_PROBE` reports only these. The
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. Linux 6.12's other operations
+  complete with `EOPNOTSUPP`, as on a Linux built without them, and later
+  ones with `EINVAL`, as on 6.12, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
   as `anon_inode_create_getfile` makes one: `fstat` gives a new inode
@@ -1955,8 +1956,9 @@ kernel.
 
 - `IORING_OP_ASYNC_CANCEL` and `IORING_REGISTER_SYNC_CANCEL` cancel the
   requests of their ring that wait for their files, as Linux master's
-  `io_uring/cancel.c` and `io_poll_cancel` do. No other request is ever in
-  flight to find.
+  `io_uring/cancel.c` and `io_poll_cancel` do, or, finding none of those,
+  the ring's timeouts. No request runs in a worker, so there is no other
+  one to find.
   - A cancellation matches by `user_data`, by file with
     `IORING_ASYNC_CANCEL_FD` (a registered one with `_FD_FIXED` or
     `IOSQE_FIXED_FILE`), by operation with `_OP`, or any request with

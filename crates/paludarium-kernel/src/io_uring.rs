@@ -3703,8 +3703,10 @@ fn run_waiting(c: &mut Context<'_>, file: &Arc<dyn FileHandle>, ring: &Ring, wan
 
 /// `io_uring_register(fd, opcode, arg, nr_args)`: only
 /// `IORING_REGISTER_PROBE`, the buffers' and the files' registrations, the
-/// files' tagged registrations, updates and allocation range, and the rings of buffers'
-/// registrations and status; every other operation gives `EINVAL`.
+/// files' tagged registrations, updates and allocation range, the rings of
+/// buffers' registrations and status, `IORING_REGISTER_SYNC_CANCEL`, the
+/// ring descriptors' registrations, the personalities, the restrictions and
+/// `IORING_REGISTER_ENABLE_RINGS`; every other operation gives `EINVAL`.
 pub(crate) fn sys_register(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match register(c, a) {
         Ok(n) => ok(n),

@@ -505,7 +505,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
   `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
-  だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
+  だけです。Linux 6.12 のほかの操作は `EOPNOTSUPP` で完了し、Linux 7.0 がそのあとに加えた操作
+  （`IORING_OP_RECV_ZC` から）は 6.12 と同じく `EINVAL` で失敗します。ソケットの要求のうち、マルチショットの
   `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
@@ -517,7 +518,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （Linux では失敗します）。`IORING_OP_SHUTDOWN`、`IORING_OP_FSYNC` と
   ファイルの要求は、Linux では close と一部の open や advice を除いてワーカーで実行するところを
   `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れるものより先に来ることが
-  あります。FIFO を作るかもしれない open はそこで待ちます。待っている `IORING_OP_SPLICE` の
+  あります。FIFO を作るかもしれない open はそこで待ちます。待っている `IORING_OP_SPLICE` や `_TEE` の
   取り消しは、ファイルを待つ要求と同じです（Linux はワーカーに割り込みます）。ソケットへの
   splice は、途中からそこで待つことがあります。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
   来ます。すべてのスレッドが `nanosleep` で眠るあいだに期限が来たものは、眠りが終わるときに
@@ -525,7 +526,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   残します（Linux は取り消します）。自分の要求にポーリングされるリングは、その要求が終わるまで
   残ります。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
-  `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
+  `_REGISTERED_FD_ONLY` と、Linux 7.0 が `_NO_SQARRAY` のあとに加えたフラグ（`_HYBRID_IOPOLL` から）は
+  `EINVAL` です。`io_uring_enter` のフラグも、`IORING_ENTER_ABS_TIMER` のあとに 7.0 が加えたもの
+  （`_EXT_ARG_REG` と `_NO_IOWAIT`）は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`、
   `IORING_REGISTER_BUFFERS`、`IORING_UNREGISTER_BUFFERS`、`IORING_REGISTER_BUFFERS2`、
   `IORING_REGISTER_BUFFERS_UPDATE`、`IORING_REGISTER_FILES`、
   `IORING_UNREGISTER_FILES`、`IORING_REGISTER_FILES_UPDATE`、
@@ -619,7 +622,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux はどちらもページキャッシュからマップします。
   - `memfd_secret` のページのフォールトは、フォールトしたプロセスの最後のシステムコールの
     ときの `RLIMIT_MEMLOCK` で決めます（システムコールの前は、作ったプロセスのものです）。
-    数えるのは `memfd_secret` のファイルのページと `io_uring` の登録したバッファーだけです。
+    数えるのは `memfd_secret` のファイルのページと `io_uring` の登録したバッファーとバッファーのリングだけです。
     Linux のユーザーの `locked_vm` は、`perf` のバッファなども数えます。ページをフォールトのときに数える変更
     （97d34aa65c29「mm/secretmem: properly account locked pages」）のないカーネルは、
     代わりにマッピングをロックしたものとして数えます。上限を超えると `mmap` が `EAGAIN` で、

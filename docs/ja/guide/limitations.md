@@ -117,8 +117,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
 - **デバイスのカウンタの一部**：`/proc/net/dev` とリンクの `IFLA_STATS64`、`IFLA_STATS` が
-  数えるのは、UDP のデータグラム、ICMP の port unreachable、ARP だけです（[機能](./features) を参照）。
-  TCP のセグメントはまだ数えません。カーネルが自分から送る IPv6 のパケット（近隣探索、MLD の
+  数えるのは、UDP のデータグラム、ICMP の port unreachable、ARP、TCP のセグメントだけです（[機能](./features) を参照）。
+  ICMP の port unreachable は、閉じたポートへのデータグラムのたびに送って数えます。Linux では
+  送る数を制限します（`icmp_ratelimit`、`icmp_msgs_per_sec`、veth のペアの相手ごと）。
+  待ち受けのキューが満杯で捨てられる SYN と、何も答えない SYN は数えません。カーネルが自分から送る IPv6 のパケット（近隣探索、MLD の
   レポート、ルーター要請、重複アドレス検出）、エントリが古くなった近隣への ARP の探り、ホストへ
   行くもの（ゲストのソケットが持たないポートへの TCP の接続、DNS スタブの答え）、ループバックを
   通るブロードキャストやグループへのもの、ループバックから出す MCTP の送信も数えません。

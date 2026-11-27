@@ -470,6 +470,7 @@ mod linux {
                     | "veth-ipv6-anycast"
                     | "veth-dev-mcast"
                     | "net-dev-counters"
+                    | "net-dev-tcp"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -748,6 +749,7 @@ mod linux {
         veth_ipv6_anycast => ("veth-ipv6-anycast","veth-ipv6-anycast"),
         veth_dev_mcast => ("veth-dev-mcast","veth-dev-mcast"),
         net_dev_counters => ("net-dev-counters","net-dev-counters"),
+        net_dev_tcp => ("net-dev-tcp","net-dev-tcp"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),

@@ -8396,6 +8396,10 @@ static int proc_stat_sched_case(void) {
     pss_show("with the thread", self);
     if (write(pss_done[1], &cpu, sizeof cpu) != sizeof cpu) return 1;
     pthread_join(thread, NULL);
+    /* The join returns once the thread clears its ID (mm_release), which on
+       Linux comes before its exit takes it from the count (__exit_signal):
+       wait for that, up to two seconds. */
+    for (int tries = 0; tries < 200 && ps_field(self, 20) != 1; tries++) usleep(10000);
     int own = pss_pin_high();
     printf("pinned: %d processor-is-getcpu=%d\n", own >= 0,
            own >= 0 && sched_getcpu() == own && ps_field(self, 39) == own);

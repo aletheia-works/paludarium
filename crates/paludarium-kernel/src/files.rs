@@ -8144,6 +8144,15 @@ fn open_path(
                 p.to_vec(),
             ));
         }
+        if let crate::proc::TaskEntry::Oom(kind) = path.entry {
+            return Ok((tasks::oom(c.processes, &task, kind, at_read), p.to_vec()));
+        }
+        if path.entry == crate::proc::TaskEntry::CoredumpFilter {
+            return Ok((
+                tasks::coredump_filter(c.processes, &task, at_read),
+                p.to_vec(),
+            ));
+        }
         if path.entry == crate::proc::TaskEntry::Syscall {
             return Ok((tasks::syscall(c.processes, &task, flags, owner), p.to_vec()));
         }

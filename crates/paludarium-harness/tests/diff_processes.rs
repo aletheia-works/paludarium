@@ -221,13 +221,16 @@ mod linux {
             // on its own mounts, the file-leases case, which writes
             // fs.leases-enable and fs.lease-break-time and becomes an
             // unprivileged user, the dnotify-switch case, which writes
-            // fs.dir-notify-enable, and the timer-waits cases, which make a
+            // fs.dir-notify-enable, the proc-oom case, which sets an
+            // oom_score_adj below 0 and becomes an unprivileged user, and
+            // the timer-waits cases, which make a
             // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
                     | "file-leases"
                     | "dnotify-switch"
+                    | "proc-oom"
                     | "timer-waits-plain"
                     | "timer-waits-restart"
                     | "timer-waits-default"
@@ -1174,6 +1177,8 @@ mod linux {
         processes_loadavg_running => ("loadavg-running","process"),
         processes_proc_cpuinfo => ("proc-cpuinfo","process"),
         processes_status_memory => ("status-memory","process"),
+        processes_proc_oom => ("proc-oom","process"),
+        processes_core_filter => ("core-filter","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),

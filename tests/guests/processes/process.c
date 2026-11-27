@@ -21618,6 +21618,290 @@ static int userns_nondumpable_read_case(const char *self) {
     return 0;
 }
 
+/* The proc-oom case: /proc/<pid>/oom_score_adj, oom_adj and oom_score of
+   the process's oom_score_adj, which its threads share and a fork child
+   and an exec keep, as Linux's base.c reads and writes them. A write takes
+   up to 12 bytes, which kstrtoint reads with their spaces stripped in the
+   base its prefix gives; outside -1000 to 1000 it is EINVAL, past an int
+   ERANGE. oom_adj shows it scaled to -17 to 15 and takes -16 to 15 or -17,
+   scaled back by 1000 / 17. A write with CAP_SYS_RESOURCE also sets the
+   least value the process may then set without it (EACCES below it, and
+   below the value itself for oom_adj). A CLONE_VM child shares the
+   setting with its parent, and a parent may set a child's. oom_score is 0
+   at -1000 and else grows with the setting by two thirds of it, from 666
+   for a small process at 0, whatever memory the machine has (printed as
+   ranges). */
+static char oc_text[64];
+static long oc_read(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1000000 - errno;
+    ssize_t n = read(fd, oc_text, sizeof oc_text - 1);
+    close(fd);
+    if (n < 0) return -1000000 - errno;
+    oc_text[n] = 0;
+    return strtol(oc_text, NULL, 0);
+}
+static long oc_write(const char *path, const char *text, size_t length) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1000000 - errno;
+    ssize_t n = write(fd, text, length);
+    long result = n < 0 ? -errno : n;
+    close(fd);
+    return result;
+}
+#define OC_SET(text) oc_write("/proc/self/oom_score_adj", text, sizeof text - 1)
+#define OC_LEGACY(text) oc_write("/proc/self/oom_adj", text, sizeof text - 1)
+static void oc_show(const char *what) {
+    long adj = oc_read("/proc/self/oom_score_adj");
+    long legacy = oc_read("/proc/self/oom_adj");
+    printf("%s: adj=%ld legacy=%ld\n", what, adj, legacy);
+}
+static int oc_shared(void *unused) {
+    (void)unused;
+    OC_SET("77");
+    return 0;
+}
+static int proc_oom_case(void) {
+    printf("text: [");
+    oc_read("/proc/self/oom_score_adj");
+    printf("%s] [", oc_text);
+    oc_read("/proc/self/oom_adj");
+    printf("%s]\n", oc_text);
+    long score = oc_read("/proc/self/oom_score");
+    printf("score at 0: in=%d\n", score >= 666 && score <= 668);
+    struct stat st[3];
+    const char *files[3] = {"/proc/self/oom_score", "/proc/self/oom_adj", "/proc/self/oom_score_adj"};
+    for (int i = 0; i < 3; i++)
+        if (stat(files[i], &st[i])) return 80;
+    printf("modes: %o %o %o\n", st[0].st_mode & 07777, st[1].st_mode & 07777, st[2].st_mode & 07777);
+    printf("set -500: %ld\n", OC_SET("-500"));
+    oc_show("-500");
+    score = oc_read("/proc/self/oom_score");
+    printf("score at -500: in=%d\n", score >= 330 && score <= 336);
+    printf("set spaced: %ld\n", OC_SET(" 200 \n"));
+    oc_show("spaced");
+    printf("set hex: %ld\n", OC_SET("0x10"));
+    oc_show("hex");
+    printf("set long: %ld\n", OC_SET("1           2"));
+    oc_show("long");
+    printf("set 1001: %ld\n", OC_SET("1001"));
+    printf("set word: %ld\n", OC_SET("abc"));
+    printf("set huge: %ld\n", OC_SET("99999999999"));
+    printf("set empty: %ld\n", OC_SET(""));
+    printf("set two newlines: %ld\n", OC_SET("5\n\n"));
+    printf("set -1000: %ld\n", OC_SET("-1000"));
+    printf("score at -1000: %ld\n", oc_read("/proc/self/oom_score"));
+    printf("legacy 15: %ld\n", OC_LEGACY("15"));
+    oc_show("legacy 15");
+    printf("legacy -16: %ld\n", OC_LEGACY("-16"));
+    oc_show("legacy -16");
+    printf("legacy -17: %ld\n", OC_LEGACY("-17"));
+    oc_show("legacy -17");
+    printf("legacy 3: %ld\n", OC_LEGACY("3"));
+    oc_show("legacy 3");
+    printf("legacy 16: %ld\n", OC_LEGACY("16"));
+    printf("legacy -18: %ld\n", OC_LEGACY("-18"));
+    /* The same file read again after a write, at the position it had. */
+    int fd = open("/proc/self/oom_score_adj", O_RDWR);
+    char got[16] = "";
+    ssize_t first = read(fd, got, 1);
+    ssize_t wrote = write(fd, "300", 3);
+    off_t at = lseek(fd, 0, SEEK_CUR);
+    ssize_t rest = pread(fd, got, sizeof got - 1, 0);
+    got[rest > 0 ? rest : 0] = 0;
+    printf("rdwr: first=%zd wrote=%zd at=%lld pread=%s", first, wrote, (long long)at, got);
+    close(fd);
+    /* A thread's file is the process's. */
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/oom_score_adj", (long)syscall(SYS_gettid));
+    printf("thread: %ld\n", oc_read(path));
+    /* A fork child keeps it, and its parent may change it. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 81;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char c;
+        printf("child: %ld\n", oc_read("/proc/self/oom_score_adj"));
+        fflush(stdout);
+        if (write(ready[1], "r", 1) != 1 || read(go[0], &c, 1) != 1) _exit(1);
+        printf("child after parent: %ld\n", oc_read("/proc/self/oom_score_adj"));
+        fflush(stdout);
+        _exit(0);
+    }
+    char c;
+    if (read(ready[0], &c, 1) != 1) return 82;
+    snprintf(path, sizeof path, "/proc/%d/oom_score_adj", child);
+    printf("parent sets child: %ld\n", oc_write(path, "400", 3));
+    if (write(go[1], "g", 1) != 1) return 83;
+    waitpid(child, NULL, 0);
+    printf("parent: %ld\n", oc_read("/proc/self/oom_score_adj"));
+    /* A CLONE_VM child that sets its own sets its parent's. */
+    static char stack[1 << 16];
+    pid_t shared = clone(oc_shared, stack + sizeof stack, CLONE_VM | SIGCHLD, NULL);
+    if (shared < 0) return 84;
+    waitpid(shared, NULL, 0);
+    printf("after clone-vm child: %ld\n", oc_read("/proc/self/oom_score_adj"));
+    /* Root's last write set the least value; without CAP_SYS_RESOURCE the
+       process may not go below it, nor below its value by oom_adj. */
+    printf("set 100: %ld\n", OC_SET("100"));
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534) || prctl(PR_SET_DUMPABLE, 1)) _exit(1);
+        printf("user 50: %ld\n", OC_SET("50"));
+        printf("user 150: %ld\n", OC_SET("150"));
+        printf("user 120: %ld\n", OC_SET("120"));
+        printf("user 99: %ld\n", OC_SET("99"));
+        printf("user legacy 1: %ld\n", OC_LEGACY("1"));
+        printf("user legacy 15: %ld\n", OC_LEGACY("15"));
+        printf("user 100: %ld\n", OC_SET("100"));
+        oc_show("user");
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("user child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    OC_SET("0");
+    return 0;
+}
+
+/* The core-filter case: /proc/<pid>/coredump_filter shows the filter bits
+   of the process's memory in 8 hex digits, 0x33 at first; a write sets
+   the low 9 bits of what kstrtouint reads in the base its prefix gives (no
+   spaces but a newline after it). A fork child and an exec keep them, and
+   a thread's directory has no such file. A core holds each mapping as its
+   bit says: a written private anonymous one (bit 0), a shared anonymous
+   one (1), a private file mapping (2), a shared one of a named file (3),
+   and of a private mapping of an ELF file, only the first page (4). */
+static char cf_text[64];
+static const char *cf_read(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return strerror(errno);
+    ssize_t n = read(fd, cf_text, sizeof cf_text - 1);
+    close(fd);
+    cf_text[n > 0 ? n : 0] = 0;
+    if (n > 0 && cf_text[n - 1] == '\n') cf_text[n - 1] = 0;
+    return n < 0 ? strerror(errno) : cf_text;
+}
+#define CF_SET(text) oc_write("/proc/self/coredump_filter", text, sizeof text - 1)
+static int core_filter_case(const char *self, char **argv) {
+    if (argv[3] && !strcmp(argv[3], "show")) {
+        printf("exec: %s\n", cf_read("/proc/self/coredump_filter"));
+        return 0;
+    }
+    struct stat st;
+    if (stat("/proc/self/coredump_filter", &st)) return 80;
+    printf("default: %s mode=%o\n", cf_read("/proc/self/coredump_filter"), st.st_mode & 07777);
+    {
+        long set = CF_SET("0x7");
+        printf("set 0x7: %ld -> %s\n", set, cf_read("/proc/self/coredump_filter"));
+    }
+    {
+        long set = CF_SET("0x1ff\n");
+        printf("set 0x1ff: %ld -> %s\n", set, cf_read("/proc/self/coredump_filter"));
+    }
+    {
+        long set = CF_SET("0xfffffe01");
+        printf("set high: %ld -> %s\n", set, cf_read("/proc/self/coredump_filter"));
+    }
+    {
+        long set = CF_SET("017");
+        printf("set octal: %ld -> %s\n", set, cf_read("/proc/self/coredump_filter"));
+    }
+    printf("set spaced: %ld\n", CF_SET(" 5"));
+    printf("set huge: %ld\n", CF_SET("4294967296"));
+    printf("set negative: %ld\n", CF_SET("-1"));
+    {
+        long set = CF_SET("x");
+        printf("set word: %ld -> %s\n", set, cf_read("/proc/self/coredump_filter"));
+    }
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/coredump_filter", (long)syscall(SYS_gettid));
+    printf("thread: %s\n", cf_read(path));
+    printf("set 0x5: %ld\n", CF_SET("5"));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        printf("child: %s\n", cf_read("/proc/self/coredump_filter"));
+        fflush(stdout);
+        execl(self, self, "core-filter", self, "show", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(child, NULL, 0);
+    /* Which of each mapping a core holds, by filter. */
+    char dir[] = "/tmp/core-filter-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 81;
+    long page = 4096;
+    int fd = open("data", O_CREAT | O_RDWR, 0644);
+    char fill[2 * 4096];
+    memset(fill, 'x', sizeof fill);
+    if (fd < 0 || write(fd, fill, sizeof fill) != (long)sizeof fill) return 82;
+    int exe = open(self, O_RDONLY);
+    if (exe < 0) return 83;
+    char *base = mmap(NULL, 32 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 84;
+    const char *names[] = {"anon-written", "shared-anon", "file-private", "file-shared", "elf"};
+    enum { N = 5 };
+    char *at[N];
+    for (int i = 0; i < N; i++) {
+        int file = i == 2 || i == 3 ? fd : i == 4 ? exe : -1;
+        int flags = MAP_FIXED | (i == 1 || i == 3 ? MAP_SHARED : MAP_PRIVATE) | (file < 0 ? MAP_ANONYMOUS : 0);
+        at[i] = mmap(base + (1 + 4 * i) * page, 2 * page, i == 4 ? PROT_READ : PROT_READ | PROT_WRITE,
+                     flags, file, 0);
+        if (at[i] != base + (1 + 4 * i) * page) return 85;
+    }
+    at[0][0] = 1;
+    at[1][0] = 1;
+    at[3][0] = 'x';
+    const char *filters[] = {"0", "1", "2", "4", "8", "0x10", "0x33"};
+    for (int f = 0; f < 7; f++) {
+        unlink("core");
+        child = fork();
+        if (child == 0) {
+            struct rlimit r;
+            getrlimit(RLIMIT_CORE, &r);
+            r.rlim_cur = r.rlim_max;
+            setrlimit(RLIMIT_CORE, &r);
+            if (oc_write("/proc/self/coredump_filter", filters[f], strlen(filters[f])) < 0) _exit(1);
+            *(volatile int *)0 = 1;
+            _exit(70);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        int core = open("core", O_RDONLY);
+        if (core < 0 || fstat(core, &st)) {
+            printf("filter %s: core=0 dumped=%d\n", filters[f], WCOREDUMP(status) ? 1 : 0);
+            continue;
+        }
+        unsigned char *b = calloc(st.st_size + 1, 1);
+        long size = 0, n;
+        while (b && size < st.st_size && (n = read(core, b + size, st.st_size - size)) > 0) size += n;
+        close(core);
+        core_bytes = b;
+        core_size = b ? (uint64_t)size : 0;
+        printf("filter %s:", filters[f]);
+        for (int i = 0; i < N; i++) {
+            int held[2] = {0, 0};
+            for (int p = 0; p < 2; p++)
+                for (int k = 0; k < (int)le(56, 2); k++) {
+                    uint64_t h = le(32, 8) + 56 * (uint64_t)k, x = (uintptr_t)(at[i] + p * page);
+                    uint64_t v = le(h + 16, 8), filesz = le(h + 32, 8);
+                    if (le(h, 4) == 1 && x >= v && x < v + filesz) held[p] = 1;
+                }
+            printf(" %s=%d%d", names[i], held[0], held[1]);
+        }
+        printf("\n");
+        free(b);
+        core_bytes = NULL;
+    }
+    unlink("core");
+    unlink("data");
+    if (chdir("/") || rmdir(dir)) return 86;
+    return 0;
+}
+
 /* The status-memory case: /proc/self/status has task_mem's memory fields
    in task_mem's order (VmPin and VmPTE aside, which paludarium does not
    show), in agreement with statm (VmSize its size, VmData and VmStk its
@@ -43528,6 +43812,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "loadavg-running")) return loadavg_running_case();
     if (!strcmp(mode, "proc-cpuinfo")) return proc_cpuinfo_case();
     if (!strcmp(mode, "status-memory")) return status_memory_case();
+    if (!strcmp(mode, "proc-oom")) return proc_oom_case();
+    if (!strcmp(mode, "core-filter")) return core_filter_case(self, argv);
     if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "thread-own-counters")) return thread_own_counters_case();
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();

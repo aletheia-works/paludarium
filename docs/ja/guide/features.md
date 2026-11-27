@@ -3631,7 +3631,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
   `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mem`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、`smaps_rollup`、
-  `pagemap`、`wchan`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
+  `pagemap`、`wchan`、`oom_score`、`oom_adj`、`oom_score_adj`、`coredump_filter`、`io`、`fd`、`fdinfo`、`ns`、`task`
+  があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。この root は、そのプログラムが動くユーザー名前空間の
   root で、その名前空間が root を対応づけていなければ最初の名前空間の root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
@@ -3694,12 +3695,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。ファイルシステムがそこに持つもの
   （`--mount /:/` ではホストの項目）は並べません。`ps`、`pgrep`、`pidof` が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`personality`（0400）、`comm`、
-  `syscall`（0400）、`maps`、`mem`（0600）、`clear_refs`（0200）、`smaps`、`smaps_rollup`、`pagemap`（0400）、`wchan`、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `syscall`（0400）、`maps`、`mem`（0600）、`clear_refs`（0200）、`smaps`、`smaps_rollup`、`pagemap`（0400）、`wchan`、
+  `oom_score`、`oom_adj`、`oom_score_adj`、`coredump_filter`、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
-  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` 以外の同じファイルが
+  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` と `coredump_filter` 以外の同じファイルが
   あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
   プロセスの ID、スレッド自身の資格情報（プロセスの `status` は `/proc/self/status` も
   含め、Linux の `proc_pid_status` と同じくリーダーのものを示します）、スレッド自身の
@@ -3776,6 +3778,30 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （0444）は、Linux の `proc_pid_wchan` が動いているタスクと、タスクを読めない読み手に
   返すのと同じく、改行のない `0` を読みます。`stat` の `wchan` の項目は別のもので、
   下のとおり、待っているタスクは 1 です。
+
+- `oom_score_adj` と `oom_adj`（0644）、`oom_score`（0444）は、プロセスの `oom_score_adj`
+  のものです。これはスレッドが共有し、`fork` の子と `execve` が引き継ぎ、Linux の
+  `__set_oom_adj` が設定するのと同じく、`CLONE_VM` の子はメモリを共有するプロセスと
+  （`vfork` の子を除いて）共有します。読んだときに作り、`oom_score_adj` はその値、
+  `oom_adj` は -17 から 15 に縮めた値（`adj * 17 / 1000`、1000 は 15）、`oom_score` は
+  `oom_badness` が求めるとおり `(1000 + badness * 1000 / pages) * 2 / 3` です。`badness`
+  は常駐するページと、`sysinfo` が示すメモリの千分の `oom_score_adj` の和です。-1000 のとき、
+  exec か終了の前の `vfork` の子、メモリの残っていないプロセスは 0 です。書き込みは 12
+  バイトまでを取ってその数を返し、`kstrtoint` が両端の空白を除いて接頭辞の示す基数で
+  読みます（`EINVAL`、`int` を超えると `ERANGE`）。-1000 から 1000 の外は `EINVAL` で、
+  `oom_adj` は -17 を除き -16 から 15 の外が `EINVAL`、1000 / 17 倍します（15 は 1000）。
+  プロセスが設定できる最小の値（`oom_score_adj_min`。`CAP_SYS_RESOURCE` を持つ書き込みが
+  設定します）より下、`oom_adj` では今の値より下は、`CAP_SYS_RESOURCE` のない書き手には
+  `EACCES` です。書き込みはファイルの位置を変えません。ほかのプロセスのものは持ち主が
+  許す者が書け、回収されたタスクのものは `ESRCH` です。
+
+- プロセスの `coredump_filter`（0644）は、アドレス空間のフィルターのビットを 8 桁の 16 進で
+  示し、はじめは Linux の ELF ヘッダー込みの `MMF_DUMP_FILTER_DEFAULT` と同じ `00000033`
+  です。`fork` の子と `execve` が引き継ぎ、メモリを共有するプロセスは共有します。書き込みは
+  `kstrtouint` が接頭辞の示す基数で読んだ値（後ろに改行は許し、空白は許しません。`EINVAL`、
+  32 ビットを超えると `ERANGE`）の下位 9 ビットを設定し、渡された全部の数を返します。
+  そのメモリで動くスレッドがなくなると空を読み、書き込みは `ESRCH` です。スレッドの
+  ディレクトリにはありません。
 
 - プロセスやスレッドの `syscall` は 0400 で大きさは 0 で、Linux の `proc_pid_syscall` と同じく
   読んだときに書きます。読み手が読めるかは `personality` と同じくアタッチできるかで決め
@@ -5618,14 +5644,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `(deleted)` を付けます。共有の無名メモリは、Linux と同じく
     `/dev/zero (deleted)` と示します。`NT_X86_XSTATE` ノートはありません。Linux は
     XSAVE のない CPU では書かず、仮想 CPU には XSAVE がないからです。メモリは、
-    Linux の `vma_dump_size` が既定の `coredump_filter` で選ぶのと同じように
-    選びます。private なマッピングは、その VMA の
+    Linux の `vma_dump_size` がプロセスの `coredump_filter`（下記。既定は `0x33`）で
+    選ぶのと同じように選びます。hugetlb のマッピングは private か共有の hugetlb のビットで
+    丸ごと入り、I/O のマッピングは入りません。private なマッピングは、その VMA の
     ページが一度でも書かれていれば（Linux の `anon_vma`。分割、`MADV_DONTNEED`
     の後も残り、`fork` した子の VMA はそれぞれ自分のものを持ち、VMA に併合された
-    マッピングも共有し、書き込めるマッピングのページを取り込むと付きます。`MAP_POPULATE`、`MAP_LOCKED`、フォールト時でないロックです）丸ごと入り、そうでなければ入りません。
-    ただし、ELF のファイルの先頭からのファイルのマッピングは最初のページが入ります。
+    マッピングも共有し、書き込めるマッピングのページを取り込むと付きます。`MAP_POPULATE`、`MAP_LOCKED`、フォールト時でないロックです）無名 private のビットで丸ごと入ります。
+    そうでなければ、ファイルのマッピングはファイル private のビットで丸ごと入り、
+    それもなければ ELF のファイルの先頭からのものだけが ELF ヘッダーのビットで最初のページだけ入ります。
     共有のマッピングは、そのファイルをどの名前もリンクしていなければ（無名のもの、
-    memfd、後から unlink したファイル）丸ごと入り、そうでなければ入りません。
+    memfd、後から unlink したファイル）無名共有のビットで、そうでなければファイル共有の
+    ビットで丸ごと入ります。プログラム自身のイメージでは、スタックと書き込めるセグメントは
+    書かれたものとし、最初のページは ELF ヘッダーです。
     マッピングが読めるかどうかは ELF のヘッダーのページにしか関わらず、Linux はほかを
     保護に関係なく読みます。セグメントは VMA ごとに 1 つで、併合された隣の
     マッピングも同じセグメントに入ります。

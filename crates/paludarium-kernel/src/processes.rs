@@ -90,6 +90,12 @@ struct Entry {
     ptracer: Option<Ptracer>,
     /// Whether its fatal signal wrote a whole core (CLD_DUMPED).
     dumped: bool,
+    /// `oom_score_adj` and `oom_score_adj_min` (Linux's `signal_struct`'s):
+    /// inherited on fork and kept across exec.
+    oom: (i16, i16),
+    /// A `vfork` child's flag that its exec or exit sets, until when it is
+    /// in the vfork (Linux's `vfork_done`).
+    vfork: Option<Arc<AtomicBool>>,
     /// Its controlling terminal (Linux's `signal->tty`), when that is a
     /// pseudo-terminal of the emulator: inherited on fork, kept across
     /// exec, and lost by `setsid`.
@@ -113,6 +119,26 @@ impl Entry {
         limits[RLIMIT_CPU].0 = self.group.cpu_soft_limit();
         limits
     }
+}
+
+/// Whether the process is a `vfork` child that has neither exec'd nor
+/// exited, so still runs in its parent's memory (Linux's `in_vfork`).
+fn in_vfork(entry: &Entry) -> bool {
+    entry
+        .vfork
+        .as_ref()
+        .is_some_and(|release| !release.load(Ordering::SeqCst))
+}
+/// What tells apart the address space the group's threads run in, while one
+/// does ([`paludarium_mmu::MemoryView::identity`]).
+fn memory_identity(group: &ThreadGroup) -> Option<usize> {
+    group.threads().iter().find_map(|&(tid, _)| {
+        group
+            .public(tid)?
+            .memory
+            .as_ref()
+            .map(paludarium_mmu::MemoryView::identity)
+    })
 }
 
 /// The tasks of a session and their limit, as a cgroup's `pids.current` and
@@ -323,6 +349,8 @@ impl Processes {
                     subreaper: false,
                     ptracer: None,
                     dumped: false,
+                    oom: (0, 0),
+                    vfork: None,
                     terminal: None,
                     _task: TaskCharge(Arc::clone(&tasks)),
                     space,
@@ -510,19 +538,19 @@ impl Processes {
         pid: u32,
         (parent, maker): (u32, u32),
         group: Arc<ThreadGroup>,
-        exit_signal: i32,
+        (exit_signal, vfork): (i32, Option<Arc<AtomicBool>>),
         task: TaskCharge,
         space: Arc<Namespace>,
     ) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let (pgid, sid, limits, (dumpable, exec_user), no_new_privs, terminal) =
+        let (pgid, sid, limits, (dumpable, exec_user), (no_new_privs, oom), terminal) =
             entries.get(&parent).map_or(
                 (
                     pid,
                     0,
                     DEFAULT_LIMITS,
                     (true, Default::default()),
-                    false,
+                    (false, (0, 0)),
                     None,
                 ),
                 |p| {
@@ -531,7 +559,7 @@ impl Processes {
                         p.sid,
                         p.limits(),
                         (p.dumpable, p.exec_user.clone()),
-                        p.no_new_privs,
+                        (p.no_new_privs, p.oom),
                         p.terminal.clone(),
                     )
                 },
@@ -559,6 +587,8 @@ impl Processes {
                 subreaper: false,
                 ptracer: None,
                 dumped: false,
+                oom,
+                vfork,
                 terminal,
                 _task: task,
                 space,
@@ -604,6 +634,55 @@ impl Processes {
             }
             _ => Err(Errno::EINVAL),
         }
+    }
+    /// The `oom_score_adj` of process `pid`, and whether it is a `vfork`
+    /// child that has neither exec'd nor exited (Linux's `in_vfork`).
+    pub(crate) fn oom(&self, pid: u32) -> Option<(i16, bool)> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(&pid)?;
+        Some((entry.oom.0, in_vfork(entry)))
+    }
+    /// Sets the `oom_score_adj` of process `pid` to `value`, as Linux's
+    /// `__set_oom_adj`: below its `oom_score_adj_min` (`legacy`, the
+    /// `oom_adj` file: below the value it has) only with `CAP_SYS_RESOURCE`
+    /// (`EACCES`), which also makes the value the least (not `legacy`); and
+    /// unless it is a `vfork` child, every other process that shares its
+    /// address space but `vfork` children gets the same.
+    pub(crate) fn set_oom(
+        &self,
+        pid: u32,
+        value: i16,
+        legacy: bool,
+        resource: bool,
+    ) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get_mut(&pid).ok_or(Errno(3))?; // ESRCH
+        let floor = if legacy { entry.oom.0 } else { entry.oom.1 };
+        if value < floor && !resource {
+            return Err(Errno::EACCES);
+        }
+        let set = |oom: &mut (i16, i16)| {
+            oom.0 = value;
+            if !legacy && resource {
+                oom.1 = value;
+            }
+        };
+        set(&mut entry.oom);
+        let memory = (!in_vfork(entry))
+            .then(|| memory_identity(&entry.group))
+            .flatten();
+        if let Some(memory) = memory {
+            for (&other, entry) in entries.iter_mut() {
+                if other != pid
+                    && entry.status.is_none()
+                    && !in_vfork(entry)
+                    && memory_identity(&entry.group) == Some(memory)
+                {
+                    set(&mut entry.oom);
+                }
+            }
+        }
+        Ok(())
     }
     /// The controlling terminal of process `pid`.
     pub(crate) fn terminal(&self, pid: u32) -> Option<Arc<crate::pty::Terminal>> {
@@ -3688,7 +3767,7 @@ impl Kernel {
             pid,
             (self.process.pid, parent.tid),
             group.clone(),
-            (flags & 0xff) as i32,
+            ((flags & 0xff) as i32, release.clone()),
             task,
             space,
         );
@@ -5041,6 +5120,8 @@ impl Kernel {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
             None => AddressSpace::new(),
         };
+        // `mm_init` takes the core dump filter from the old `mm`.
+        memory.set_dump_filter(mem.dump_filter());
         // An exec that fails from here closes the program before the
         // interpreter it opened: `free_bprm`'s `fput` comes after
         // `load_elf_binary`'s, and runs first.

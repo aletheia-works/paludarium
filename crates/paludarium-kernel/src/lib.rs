@@ -60,6 +60,7 @@ mod io_uring;
 mod ipc;
 mod kcmp;
 mod keys;
+mod kstrto;
 mod leases;
 mod loopback;
 mod lsm;

@@ -4,7 +4,7 @@
 //! is dumpable and its RLIMIT_CORE soft limit is at least one page. The core
 //! has one `PT_NOTE` segment (each thread's registers, the process, the
 //! fatal signal, the auxiliary vector and the mapped files) and one
-//! `PT_LOAD` segment per VMA, whose contents follow the default
+//! `PT_LOAD` segment per VMA, whose contents follow the space's
 //! `coredump_filter`, and the `vsyscall` page's, which holds zeros. It has
 //! no `NT_X86_XSTATE` note, as Linux writes none on a CPU without XSAVE,
 //! which the virtual CPU is. A core larger than the limit is cut there; it
@@ -13,7 +13,7 @@
 use crate::signals;
 use paludarium_cpu::segments;
 use paludarium_cpu::{CpuState, FX_WRITTEN, reg};
-use paludarium_mmu::{AddressSpace, Mapping, MappingKind, Prot};
+use paludarium_mmu::{AddressSpace, Mapping, MappingKind, Prot, vm};
 use paludarium_types::GuestAddr;
 
 /// The signals whose default action dumps core (Linux's
@@ -102,6 +102,7 @@ pub(crate) fn write(
     // One segment for each Linux VMA, which may hold adjacent mappings
     // merged.
     let mut segments: Vec<(Mapping, u64)> = Vec::new();
+    let filter = mem.dump_filter();
     for &m in &mappings {
         if segments
             .last()
@@ -111,7 +112,10 @@ pub(crate) fn write(
         }
         let (start, length) = mem.vma_at(m.start).unwrap_or((m.start, m.length));
         let vma = Mapping { start, length, ..m };
-        segments.push((vma, dump_length(mem, &vma, first_elf == Some(start))));
+        segments.push((
+            vma,
+            dump_length(mem, &vma, first_elf == Some(start), filter),
+        ));
     }
     let vmas: Vec<Mapping> = segments.iter().map(|&(vma, _)| vma).collect();
     let notes = notes(dump, who, mem, &files(mem, &vmas, root));
@@ -189,16 +193,29 @@ pub(crate) fn write(
     put(&page)
 }
 
-/// How much of a mapping the core holds, by the default `coredump_filter`
-/// (0x33): a private mapping whole once a page of its VMA was written (its
-/// `anon_vma`, as Linux's `vma_dump_size` asks), else only the first page
-/// of a file mapping from the start of an ELF file (its header); a shared
-/// mapping whole when no name links its file (an anonymous one, a memfd, a
-/// file unlinked since), else nothing of it; the stack, a writable ELF
-/// segment and the first page of the ELF image. Only the ELF headers ask
-/// for a mapping that can be read (`VM_READ`): Linux reads the rest whatever
-/// its protection. A mapping `MADV_DONTDUMP` marked has nothing in it.
-fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
+/// The bits of `coredump_filter` (Linux's `MMF_DUMP_*`).
+const ANON_PRIVATE: u32 = 1 << 0;
+const ANON_SHARED: u32 = 1 << 1;
+const MAPPED_PRIVATE: u32 = 1 << 2;
+const MAPPED_SHARED: u32 = 1 << 3;
+const ELF_HEADERS: u32 = 1 << 4;
+const HUGETLB_PRIVATE: u32 = 1 << 5;
+const HUGETLB_SHARED: u32 = 1 << 6;
+
+/// How much of a mapping the core holds, by the space's `coredump_filter`
+/// `filter`, as Linux's `vma_dump_size` asks in turn: a special mapping
+/// whole; nothing of one `MADV_DONTDUMP` marked; a hugetlb mapping whole
+/// for its hugetlb bit; nothing of an I/O mapping; a shared mapping whole
+/// for its anonymous bit when no name links its file (an anonymous one, a
+/// memfd, a file unlinked since), else for its file-backed one; a private
+/// mapping whole for the anonymous bit once a page of its VMA was written
+/// (its `anon_vma`), else, for a file mapping, whole for the file-backed
+/// bit, else its first page with the ELF headers bit when it is readable
+/// and starts an ELF file. Of a loaded program, the stack and a writable
+/// segment count as written, and the first page of its image is its ELF
+/// header. Only the ELF headers ask for a mapping that can be read
+/// (`VM_READ`): Linux reads the rest whatever its protection.
+fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool, filter: u32) -> u64 {
     // A special mapping, which names itself (the vDSO and its data), is
     // dumped whole, as Linux's `always_dump_vma` finds its `vm_ops->name`
     // before `vma_dump_size` looks at VM_DONTDUMP; its pages that cannot be
@@ -210,27 +227,49 @@ fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
     if mapping.dont_dump {
         return 0;
     }
+    let whole = |bit: u32| if filter & bit != 0 { mapping.length } else { 0 };
     let readable = mapping.prot.contains(Prot::READ);
     let writable = mapping.prot.contains(Prot::WRITE);
+    let header = |at_start: bool| {
+        if filter & ELF_HEADERS != 0 && at_start && readable {
+            mapping.length.min(PAGE)
+        } else {
+            0
+        }
+    };
     match mapping.kind {
-        MappingKind::Stack => mapping.length,
-        MappingKind::ElfSegment if writable => mapping.length,
-        MappingKind::ElfSegment if first_elf && readable => mapping.length.min(PAGE),
-        MappingKind::ElfSegment => 0,
+        MappingKind::Stack => whole(ANON_PRIVATE),
+        MappingKind::ElfSegment if writable && filter & ANON_PRIVATE != 0 => mapping.length,
+        MappingKind::ElfSegment if filter & MAPPED_PRIVATE != 0 => mapping.length,
+        MappingKind::ElfSegment => header(first_elf),
         _ => {
+            let flags = mem
+                .view()
+                .vma_source(mapping.start.0)
+                .map_or(0, |source| source.vma_flags(0));
             let state = mem.core_state(mapping.start);
-            if state.shared {
-                if state.linked { 0 } else { mapping.length }
-            } else if state.written {
-                mapping.length
-            } else if mapping.kind == MappingKind::File
-                && readable
-                && state.file_offset == Some(0)
-                && elf_header(mem, mapping.start)
-            {
-                mapping.length.min(PAGE)
-            } else {
+            if flags & vm::HUGETLB != 0 {
+                whole(if state.shared {
+                    HUGETLB_SHARED
+                } else {
+                    HUGETLB_PRIVATE
+                })
+            } else if flags & vm::IO != 0 {
                 0
+            } else if state.shared {
+                whole(if state.linked {
+                    MAPPED_SHARED
+                } else {
+                    ANON_SHARED
+                })
+            } else if state.written && filter & ANON_PRIVATE != 0 {
+                mapping.length
+            } else if mapping.kind != MappingKind::File {
+                0
+            } else if filter & MAPPED_PRIVATE != 0 {
+                mapping.length
+            } else {
+                header(state.file_offset == Some(0) && elf_header(mem, mapping.start))
             }
         }
     }
@@ -558,6 +597,70 @@ mod coredump_tests {
         fn name(&self) -> Option<Vec<u8>> {
             Some(b"/data".to_vec())
         }
+    }
+
+    #[test]
+    fn each_mapping_is_dumped_as_its_filter_bit_says() {
+        let mut mem = AddressSpace::new();
+        let stack = mem
+            .map(None, PAGE, Prot::READ_WRITE, MappingKind::Stack)
+            .unwrap();
+        let written = mem
+            .map(None, PAGE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        mem.write(written, &[1]).unwrap();
+        // Read-only, so that it does not merge with the written one.
+        let untouched = mem
+            .map(None, PAGE, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        let shared = mem
+            .map_shared(None, PAGE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        mem.mark_shared(shared, PAGE).unwrap();
+        let file = mem
+            .map(None, 2 * PAGE, Prot::READ, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(Arc::new(Named));
+        mem.back_with_cache(file, 2 * PAGE, &pages, 0).unwrap();
+        let length = |at: GuestAddr, filter: u32| {
+            let mapping = mem.mappings().find(|m| m.start == at).unwrap();
+            dump_length(&mem, &mapping, false, filter)
+        };
+        // The default: written private memory and shared anonymous memory.
+        let all = [stack, written, untouched, shared, file];
+        let lengths = |filter| all.map(|at| length(at, filter));
+        assert_eq!(lengths(0x33), [PAGE, PAGE, 0, PAGE, 0]);
+        assert_eq!(lengths(0), [0; 5]);
+        assert_eq!(lengths(ANON_PRIVATE), [PAGE, PAGE, 0, 0, 0]);
+        assert_eq!(lengths(ANON_SHARED), [0, 0, 0, PAGE, 0]);
+        // A private file mapping whole, whatever was written of it.
+        assert_eq!(lengths(MAPPED_PRIVATE), [0, 0, 0, 0, 2 * PAGE]);
+        assert_eq!(lengths(MAPPED_SHARED), [0; 5]);
+        // The ELF header's page only of a file that starts with one, which
+        // this one does not.
+        assert_eq!(lengths(ELF_HEADERS), [0; 5]);
+    }
+
+    #[test]
+    fn the_programs_segments_are_dumped_as_written_or_as_its_file() {
+        let mut mem = AddressSpace::new();
+        let text = mem
+            .map(None, 2 * PAGE, Prot::READ, MappingKind::ElfSegment)
+            .unwrap();
+        let data = mem
+            .map(None, PAGE, Prot::READ_WRITE, MappingKind::ElfSegment)
+            .unwrap();
+        let length = |at: GuestAddr, first: bool, filter: u32| {
+            let mapping = mem.mappings().find(|m| m.start == at).unwrap();
+            dump_length(&mem, &mapping, first, filter)
+        };
+        assert_eq!(length(text, true, 0x33), PAGE);
+        assert_eq!(length(text, false, 0x33), 0);
+        assert_eq!(length(text, true, MAPPED_PRIVATE), 2 * PAGE);
+        assert_eq!(length(text, true, ANON_PRIVATE), 0);
+        assert_eq!(length(data, false, 0x33), PAGE);
+        assert_eq!(length(data, false, ELF_HEADERS), 0);
+        assert_eq!(length(data, false, MAPPED_PRIVATE), PAGE);
     }
 
     #[test]

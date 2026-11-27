@@ -3251,6 +3251,10 @@ struct AddressSpaceData {
     /// `update_hiwater_vm`, so that with the pages mapped now it is the
     /// peak.
     peak_size: u64,
+    /// The core dump filter bits of the space (Linux's `MMF_DUMP_*` in
+    /// `mm->flags`, which `/proc/<pid>/coredump_filter` shows): a fork's
+    /// copy and an `execve`'s new space keep them.
+    dump_filter: u32,
 }
 
 impl Drop for AddressSpaceData {
@@ -3356,6 +3360,7 @@ impl AddressSpaceData {
             resident: AtomicU64::new(0),
             peak_resident: 0,
             peak_size: 0,
+            dump_filter: DEFAULT_DUMP_FILTER,
         }
     }
 
@@ -4338,6 +4343,7 @@ impl AddressSpaceData {
         copy.meter = self.meter.clone();
         copy.mappings = self.mappings.clone();
         copy.anon_names = self.anon_names.clone();
+        copy.dump_filter = self.dump_filter;
         copy.shared = self.shared.clone();
         copy.backing = self.backing.clone();
         // Linux's `VM_COPY_ON_FORK` has `VM_MAYBE_GUARD`: the child gets the
@@ -8775,6 +8781,23 @@ impl MemoryView {
     pub fn is_of(&self, space: &AddressSpace) -> bool {
         std::ptr::eq(self.data.as_ptr(), Arc::as_ptr(&space.data))
     }
+    /// [`AddressSpace::dump_filter`] of the space, while it lives.
+    #[must_use]
+    pub fn dump_filter(&self) -> Option<u32> {
+        let data = self.data.upgrade()?;
+        let _serialization = lock_spinning(&self.serialization);
+        Some(lock_spinning(&data).dump_filter)
+    }
+    /// [`AddressSpace::set_dump_filter`] of the space; false once it is
+    /// gone.
+    pub fn set_dump_filter(&self, bits: u32) -> bool {
+        let Some(data) = self.data.upgrade() else {
+            return false;
+        };
+        let _serialization = lock_spinning(&self.serialization);
+        lock_spinning(&data).dump_filter = bits & DUMP_FILTER_MASK;
+        true
+    }
     /// The first VMA that ends after `addr`, if the space still lives and
     /// has one.
     #[must_use]
@@ -9369,6 +9392,16 @@ mod jit_tlb_tests;
 mod threads_tests;
 #[cfg(test)]
 mod tlb_tests;
+/// The number of core dump filter bits (Linux's `MMF_DUMP_FILTER_BITS`):
+/// anonymous private and shared, file-backed private and shared, ELF
+/// headers, hugetlb private and shared, and DAX private and shared.
+pub const DUMP_FILTER_BITS: u32 = 9;
+const DUMP_FILTER_MASK: u32 = (1 << DUMP_FILTER_BITS) - 1;
+/// The filter a space starts with (`MMF_DUMP_FILTER_DEFAULT` with
+/// `CONFIG_CORE_DUMP_DEFAULT_ELF_HEADERS`, as the CI runners' kernels have
+/// it): anonymous private and shared memory, ELF headers and hugetlb
+/// private memory.
+pub const DEFAULT_DUMP_FILTER: u32 = 0x33;
 impl Default for AddressSpace {
     fn default() -> Self {
         Self::new()
@@ -9698,6 +9731,16 @@ impl AddressSpace {
         std::sync::atomic::fence(Ordering::SeqCst);
         self.locked().code.bump_epoch();
         std::sync::atomic::fence(Ordering::SeqCst);
+    }
+    /// The core dump filter bits of the space ([`DEFAULT_DUMP_FILTER`] at
+    /// first), which an `execve`'s new space takes from the old.
+    #[must_use]
+    pub fn dump_filter(&self) -> u32 {
+        self.locked().dump_filter
+    }
+    /// Sets the core dump filter bits, the low [`DUMP_FILTER_BITS`].
+    pub fn set_dump_filter(&self, bits: u32) {
+        self.locked().dump_filter = bits & DUMP_FILTER_MASK;
     }
     /// The kernel's `membarrier` state for this space, shared by every
     /// thread that runs in it.

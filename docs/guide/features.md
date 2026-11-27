@@ -4223,7 +4223,8 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mem`, `mounts`, `mountinfo`,
-  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `oom_score`, `oom_adj`, `oom_score_adj`,
+  `coredump_filter`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them: root of the user namespace its program runs in, or the first
@@ -4300,13 +4301,14 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
-  `comm`, `syscall` (0400), `maps`, `mem` (0600), `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
+  `comm`, `syscall` (0400), `maps`, `mem` (0600), `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`,
+  `oom_score`, `oom_adj`, `oom_score_adj`, `coredump_filter`, `io` (0400), `exe`, `cwd`,
   `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
-  has the same files but `task`, of that thread: its name, its signal masks,
+  has the same files but `task` and `coredump_filter`, of that thread: its name, its signal masks,
   its ID as `Pid` with the process's as `Tgid`, its own credentials (the
   process's `status`, `/proc/self/status` too, shows the leader's, as Linux's
   `proc_pid_status`), and its own `voluntary_ctxt_switches` (the times it
@@ -4393,6 +4395,35 @@ kernel.
   does for a running task and for a reader that may not read the task. The
   `wchan` field of `stat` is something else: 1 for a task that waits, as
   below.
+
+- `oom_score_adj` and `oom_adj` (0644) and `oom_score` (0444) are of the
+  process's `oom_score_adj`, which its threads share, a `fork` child and
+  `execve` keep, and a `CLONE_VM` child shares with the processes it shares
+  its memory with (but a `vfork` child), as Linux's `__set_oom_adj` sets
+  it. They are made when read: `oom_score_adj` as it is, `oom_adj` scaled to
+  -17 to 15 (`adj * 17 / 1000`, 15 for 1000), and `oom_score` as
+  `oom_badness` finds it, `(1000 + badness * 1000 / pages) * 2 / 3` with
+  `badness` the resident pages and `oom_score_adj` thousandths of the
+  memory `sysinfo` reports: 0 at -1000, for a `vfork` child before its exec
+  or exit, and for a process with no memory left. A write takes up to 12
+  bytes, which it returns, read by `kstrtoint` with their spaces stripped
+  in the base their prefix gives (`EINVAL`, `ERANGE` past an `int`); a value
+  outside -1000 to 1000 is `EINVAL`, and for `oom_adj` one outside -16 to
+  15 but -17, which it scales by 1000 / 17 (15 to 1000). Below the least
+  value the process may set (`oom_score_adj_min`, which a write with
+  `CAP_SYS_RESOURCE` sets), and through `oom_adj` below the value it has,
+  a writer without `CAP_SYS_RESOURCE` gets `EACCES`. A write leaves the file
+  position where it was. Another process's are written by whom their owner
+  lets, and a reaped task's are `ESRCH`.
+
+- `coredump_filter` (0644) of a process holds the filter bits of its
+  address space in 8 hex digits, `00000033` at first, as Linux's
+  `MMF_DUMP_FILTER_DEFAULT` with ELF headers; a `fork` child and `execve`
+  keep them, and the processes sharing the memory share them. A write sets
+  the low 9 bits of what `kstrtouint` reads in the base its prefix gives, a
+  newline allowed after it but no space (`EINVAL`, `ERANGE` past 32 bits),
+  and returns all it was given; once no thread runs in the memory it reads
+  empty and a write is `ESRCH`. A thread's directory has none.
 
 - `syscall` of a process or of a thread, 0400 and of size 0, is what
   Linux's `proc_pid_syscall` writes when it is read, for a reader that may
@@ -6568,17 +6599,22 @@ kernel.
     from the process's root when it is under it, and shared anonymous
     memory as `/dev/zero (deleted)`, as Linux names it) and the memory. It
     has no `NT_X86_XSTATE` note, as Linux writes none on a CPU without XSAVE, which the virtual CPU is. The memory is
-    chosen as Linux's `vma_dump_size` chooses it with the default
-    `coredump_filter`: a private mapping is there whole once a page of its VMA
-    was written (Linux's `anon_vma`, which a split and `MADV_DONTNEED` keep,
-    a mapping merging with the VMA shares, and bringing a writable one's
-    pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a lock not on fault;
-    a `fork`ed child's VMAs each get their own), and nothing of it otherwise,
-    but the first page of a file mapping from the start of an ELF file; a shared
-    mapping is there whole when no name links its file (an anonymous one, a
-    memfd, a file unlinked since), and nothing of it otherwise. Whether a
-    mapping can be read matters only for that ELF header's page: Linux reads
-    the others whatever their protection. Each VMA is one segment, with the
+    chosen as Linux's `vma_dump_size` chooses it with the process's
+    `coredump_filter` (below; with the default `0x33`): a hugetlb mapping is
+    there whole for its private or shared hugetlb bit, and an I/O mapping
+    never; a private mapping is there whole for the anonymous private bit
+    once a page of its VMA was written (Linux's `anon_vma`, which a split and
+    `MADV_DONTNEED` keep, a mapping merging with the VMA shares, and bringing
+    a writable one's pages in gives it: `MAP_POPULATE`, `MAP_LOCKED`, or a
+    lock not on fault; a `fork`ed child's VMAs each get their own), else, for
+    a file mapping, whole for the file-backed private bit, else only its first
+    page for the ELF headers bit when it starts an ELF file; a shared mapping
+    is there whole for the anonymous shared bit when no name links its file
+    (an anonymous one, a memfd, a file unlinked since), else for the
+    file-backed shared bit. Of the program's own image, the stack and a
+    writable segment count as written and the first page is its ELF header.
+    Whether a mapping can be read matters only for that ELF header's page:
+    Linux reads the others whatever their protection. Each VMA is one segment, with the
     adjacent mappings merged into it. `wait` then reports `CLD_DUMPED` and the
     core flag. A core larger than the limit is cut there and still reported as
     dumped, as Linux reports a core once it has started to write it.

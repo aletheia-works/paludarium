@@ -118,7 +118,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 31] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 35] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -146,13 +146,17 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 31] = [
     (b"smaps_rollup", 8),
     (b"pagemap", 8),
     (b"wchan", 8),
+    (b"oom_score", 8),
+    (b"oom_adj", 8),
+    (b"oom_score_adj", 8),
+    (b"coredump_filter", 8),
     (b"io", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 31] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 35] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -180,6 +184,10 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 31] = [
     (b"smaps_rollup", 8),
     (b"pagemap", 8),
     (b"wchan", 8),
+    (b"oom_score", 8),
+    (b"oom_adj", 8),
+    (b"oom_score_adj", 8),
+    (b"coredump_filter", 8),
     (b"io", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
@@ -218,6 +226,12 @@ pub(crate) enum TaskEntry {
     ClearRefs,
     /// `io`, the counts of its reads and writes.
     Io,
+    /// `oom_score`, `oom_adj` or `oom_score_adj`, of its process's
+    /// `oom_score_adj`.
+    Oom(OomFile),
+    /// `coredump_filter`, of its address space, which a thread's
+    /// directory does not have.
+    CoredumpFilter,
     /// `personality`, its execution domain and flags.
     Personality,
     /// `wchan`, where it waits in the kernel.
@@ -310,6 +324,10 @@ pub(crate) fn task_path(
         b"mem" => TaskEntry::Mem,
         b"clear_refs" => TaskEntry::ClearRefs,
         b"io" => TaskEntry::Io,
+        b"oom_score" => TaskEntry::Oom(OomFile::Score),
+        b"oom_adj" => TaskEntry::Oom(OomFile::Adj),
+        b"oom_score_adj" => TaskEntry::Oom(OomFile::ScoreAdj),
+        b"coredump_filter" => TaskEntry::CoredumpFilter,
         b"personality" => TaskEntry::Personality,
         b"wchan" => TaskEntry::Wchan,
         b"syscall" => TaskEntry::Syscall,
@@ -358,17 +376,23 @@ pub(crate) fn task_path(
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
         // The process's own `ns`, `net`, user namespace files, mount tables,
         // `auxv`, `limits`, `statm`, `io`, `personality`, `wchan`,
-        // `syscall` and `mem` are here (`/proc/self/mountinfo`
-        // and `mounts` are [`mount_table`]'s); the rest of its own directory
-        // is `own_entry`'s.
+        // `syscall`, `mem` and OOM and core dump files are here
+        // (`/proc/self/mountinfo` and `mounts` are [`mount_table`]'s); the
+        // rest of its own directory is `own_entry`'s.
         [b"ns" | b"net", ..]
         | [
             b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
-            | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan" | b"syscall" | b"mem",
+            | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan" | b"syscall" | b"mem"
+            | b"oom_score" | b"oom_adj" | b"oom_score_adj" | b"coredump_filter",
         ] => (None, entry(&parts)),
         _ if pid == own && !own_leader_gone => return None,
         [] => (None, TaskEntry::Directory),
         _ => (None, entry(&parts)),
+    };
+    // A thread's directory has no `coredump_filter` (`tid_base_stuff`).
+    let entry = match entry {
+        TaskEntry::CoredumpFilter if tid.is_some() => TaskEntry::Missing,
+        found => found,
     };
     Some(TaskPath { pid, tid, entry })
 }
@@ -1685,6 +1709,16 @@ const VM_FLAG_NAMES: [&str; 44] = [
 const MAPS_NAME_COLUMN: usize = 72;
 /// Past the last VMA, as Linux's `m_start` is told by its sentinel.
 const MAPS_END: u64 = u64::MAX;
+
+/// Which of a process's files of its `oom_score_adj` an entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OomFile {
+    /// `oom_score`, the badness the OOM killer would find in it.
+    Score,
+    /// `oom_adj`, the old scale of `oom_score_adj` (-17 to 15).
+    Adj,
+    ScoreAdj,
+}
 
 /// Which of the files of an address space's mappings a [`Maps`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3007,6 +3041,32 @@ mod tests {
             at(8, None, TaskEntry::Personality)
         );
         assert_eq!(path(b"/proc/self/wchan"), at(7, None, TaskEntry::Wchan));
+        // The OOM files, the reader's own too, and `coredump_filter` of a
+        // process but not of a thread.
+        assert_eq!(
+            path(b"/proc/self/oom_score_adj"),
+            at(7, None, TaskEntry::Oom(OomFile::ScoreAdj))
+        );
+        assert_eq!(
+            path(b"/proc/8/task/9/oom_adj"),
+            at(8, Some(9), TaskEntry::Oom(OomFile::Adj))
+        );
+        assert_eq!(
+            path(b"/proc/8/oom_score"),
+            at(8, None, TaskEntry::Oom(OomFile::Score))
+        );
+        assert_eq!(
+            path(b"/proc/self/coredump_filter"),
+            at(7, None, TaskEntry::CoredumpFilter)
+        );
+        assert_eq!(
+            path(b"/proc/8/task/8/coredump_filter"),
+            at(8, Some(8), TaskEntry::Missing)
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/coredump_filter"),
+            at(7, Some(9), TaskEntry::Missing)
+        );
         assert_eq!(
             path(b"/proc/8/task/9/syscall"),
             at(8, Some(9), TaskEntry::Syscall)

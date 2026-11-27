@@ -809,6 +809,167 @@ pub(super) fn personality(
         owner,
     ))
 }
+/// The memory pages of the task's process, while a thread of it still runs
+/// in its address space (Linux's `find_lock_task_mm`).
+fn process_memory(view: &crate::processes::ProcessView) -> Option<paludarium_mmu::MemoryView> {
+    if view.zombie {
+        return None;
+    }
+    view.group
+        .threads()
+        .iter()
+        .find_map(|&(tid, _)| view.group.public(tid)?.memory)
+}
+/// `oom_score`, `oom_adj` or `oom_score_adj` of the task, as Linux's
+/// `proc_oom_score`, `oom_adj_read` and `oom_score_adj_read` write them
+/// when they are read, from its process's `oom_score_adj` then: `oom_adj`
+/// scaled to -17 to 15 (15 for 1000), and `oom_score` as
+/// `oom_badness` finds it, in thousandths of the memory, plus 1000, by
+/// two thirds: 0 for a process the OOM killer leaves (`oom_score_adj`
+/// -1000, a `vfork` child that has neither exec'd nor exited, or one with
+/// no memory), else from its resident pages and its `oom_score_adj` in
+/// thousandths of the memory there is (`totalram_pages` of the machine
+/// `sysinfo` reports, and no swap). Nothing counts page tables here.
+/// `oom_adj` and `oom_score_adj` take a write as `oom_adj_write` and
+/// `oom_score_adj_write` ([`oom_writer`]). `ESRCH` once the task has been
+/// reaped.
+pub(super) fn oom(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    kind: crate::proc::OomFile,
+    (flags, stat, owner): (u32, FileStat, crate::proc::Owner),
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    use crate::proc::OomFile;
+    let (weak, which) = at_read(processes, task);
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let now = AtRead::find(&weak, which)?;
+        let (adj, vfork) = now.processes.oom(now.pid).ok_or(Errno(3))?;
+        let text = match kind {
+            OomFile::ScoreAdj => format!("{adj}\n"),
+            OomFile::Adj => format!("{}\n", oom_adj(adj)),
+            OomFile::Score => {
+                let resident = process_memory(&now.view)
+                    .and_then(|memory| memory.resident_pages())
+                    .map(|(_, now)| now);
+                format!("{}\n", oom_score(adj, vfork, resident))
+            }
+        };
+        Ok(text.into_bytes())
+    });
+    let file = crate::proc::single_file(text, flags, stat, owner);
+    std::sync::Arc::new(match kind {
+        OomFile::Score => file,
+        OomFile::Adj | OomFile::ScoreAdj => {
+            file.not_seq_opened()
+                .writing(oom_writer(processes, task, kind == OomFile::Adj))
+        }
+    })
+}
+/// `oom_adj` of `oom_score_adj` `adj` (`oom_adj_read`).
+fn oom_adj(adj: i16) -> i32 {
+    const OOM_DISABLE: i32 = -17;
+    const OOM_ADJUST_MAX: i32 = 15;
+    if adj == 1000 {
+        OOM_ADJUST_MAX
+    } else {
+        (i32::from(adj) * -OOM_DISABLE / 1000).min(OOM_ADJUST_MAX)
+    }
+}
+/// `oom_score` of a process (`proc_oom_score`), of `oom_score_adj` `adj`
+/// and `resident` pages, or none when no thread of it runs in its memory.
+fn oom_score(adj: i16, vfork: bool, resident: Option<u64>) -> u64 {
+    // `totalram_pages() + total_swap_pages`.
+    const TOTAL: i64 = (crate::syscalls::SYSINFO_RAM / 4096) as i64;
+    let Some(resident) = resident.filter(|_| adj != -1000 && !vfork) else {
+        return 0;
+    };
+    let badness = i64::try_from(resident).unwrap_or(i64::MAX) + i64::from(adj) * (TOTAL / 1000);
+    // In C's arithmetic, which divides toward zero.
+    u64::try_from((1000 + badness * 1000 / TOTAL) * 2 / 3).unwrap_or(0)
+}
+/// The write operation of `oom_adj` (`legacy`) or `oom_score_adj`, as
+/// Linux's `oom_adj_write` and `oom_score_adj_write`: of what is written
+/// it takes up to 12 bytes (`PROC_NUMBUF` less one), which it returns, as
+/// `kstrtoint` reads them with their spaces stripped; a value outside -1000
+/// to 1000 (for `oom_adj`, -16 to 15 or -17, which it scales by 1000 / 17,
+/// and 15 to 1000) is `EINVAL`, and the task's process then takes it with
+/// the writer's `CAP_SYS_RESOURCE` ([`crate::processes::Processes::set_oom`]).
+/// The file position stays where it was.
+fn oom_writer(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    legacy: bool,
+) -> crate::seq::Writer {
+    let (weak, which) = at_read(processes, task);
+    Box::new(move |bytes, position| {
+        let count = bytes.len().min(12);
+        let value = crate::kstrto::int(crate::kstrto::strstrip(&bytes[..count]), 0)?;
+        let value = if legacy {
+            if !(-16..=15).contains(&value) && value != -17 {
+                return Err(Errno::EINVAL);
+            }
+            if value == 15 { 1000 } else { value * 1000 / 17 }
+        } else {
+            if !(-1000..=1000).contains(&value) {
+                return Err(Errno::EINVAL);
+            }
+            value
+        };
+        let now = AtRead::find(&weak, which)?;
+        let (writer_pid, writer_tid) = crate::proc::caller();
+        let resource = now
+            .processes
+            .view(writer_pid)
+            .and_then(|writer| writer.group.public(writer_tid))
+            .is_some_and(|writer| {
+                writer
+                    .credentials
+                    .capable(crate::credentials::CAP_SYS_RESOURCE)
+            });
+        let value = i16::try_from(value).map_err(|_| Errno::EINVAL)?;
+        now.processes.set_oom(now.pid, value, legacy, resource)?;
+        Ok((count, position))
+    })
+}
+/// `coredump_filter` of the task, as Linux's `proc_coredump_filter_read`
+/// writes it when it is read: the filter bits of its process's address
+/// space in 8 hex digits, or nothing once no thread of it runs there; a
+/// write sets them as `proc_coredump_filter_write` does, from what
+/// `kstrtouint` reads in the base its prefix gives (of up to 34 bytes),
+/// the low 9 bits of it, and is `ESRCH` with no address space. `ESRCH` once
+/// the task has been reaped. The file position stays where it was.
+pub(super) fn coredump_filter(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    (flags, stat, owner): (u32, FileStat, crate::proc::Owner),
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (weak, which) = at_read(processes, task);
+    let text: crate::proc::Text = {
+        let weak = weak.clone();
+        std::sync::Arc::new(move || {
+            let now = AtRead::find(&weak, which)?;
+            Ok(process_memory(&now.view)
+                .and_then(|memory| memory.dump_filter())
+                .map(|filter| format!("{filter:08x}\n").into_bytes())
+                .unwrap_or_default())
+        })
+    };
+    let writer: crate::seq::Writer = Box::new(move |bytes, position| {
+        // `kstrtouint_from_user`'s buffer: a sign, 32 digits, a newline.
+        let value = crate::kstrto::uint(&bytes[..bytes.len().min(34)], 0)?;
+        let now = AtRead::find(&weak, which)?;
+        let memory = process_memory(&now.view).ok_or(Errno(3))?;
+        if !memory.set_dump_filter(value) {
+            return Err(Errno(3));
+        }
+        Ok((bytes.len(), position))
+    });
+    std::sync::Arc::new(
+        crate::proc::single_file(text, flags, stat, owner)
+            .not_seq_opened()
+            .writing(writer),
+    )
+}
 /// `syscall` of the task, as Linux's `proc_pid_syscall` writes it when it
 /// is read, for a reader that may attach to it (`lock_trace`, else
 /// `EPERM`), as `task_current_syscall` finds the thread then: the call the
@@ -1210,7 +1371,11 @@ pub(super) fn stat(
             ..crate::proc::stat(0)
         },
         // 0644, which their owner may write.
-        TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => FileStat {
+        TaskEntry::IdMap(_)
+        | TaskEntry::Setgroups
+        | TaskEntry::Comm
+        | TaskEntry::Oom(crate::proc::OomFile::Adj | crate::proc::OomFile::ScoreAdj)
+        | TaskEntry::CoredumpFilter => FileStat {
             mode: 0o100_644,
             ..crate::proc::stat(0)
         },
@@ -1283,7 +1448,7 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
         _ => listing(
             crate::proc::TASK_NAMES
                 .into_iter()
-                .filter(|(name, _)| !task.thread || *name != b"task")
+                .filter(|(name, _)| !task.thread || !matches!(*name, b"task" | b"coredump_filter"))
                 .map(|(name, kind)| (name.to_vec(), kind)),
         ),
     }
@@ -1345,6 +1510,27 @@ pub(super) fn is_root(path: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::inbox::KernelEntry;
+
+    #[test]
+    fn oom_adj_and_oom_score_scale_oom_score_adj_as_linux_does() {
+        assert_eq!(oom_adj(0), 0);
+        assert_eq!(oom_adj(1000), 15);
+        assert_eq!(oom_adj(999), 15);
+        assert_eq!(oom_adj(-1000), -17);
+        assert_eq!(oom_adj(-941), -15);
+        assert_eq!(oom_adj(-500), -8);
+        assert_eq!(oom_adj(58), 0);
+        // 1048 thousandths of the 4 GiB machine for each step.
+        assert_eq!(oom_score(0, false, Some(300)), 666);
+        assert_eq!(oom_score(0, false, Some(1049)), 667);
+        assert_eq!(oom_score(-500, false, Some(300)), 334);
+        assert_eq!(oom_score(1000, false, Some(0)), 1332);
+        assert_eq!(oom_score(1000, false, Some(600)), 1333);
+        assert_eq!(oom_score(-999, false, Some(0)), 1);
+        assert_eq!(oom_score(-1000, false, Some(300)), 0);
+        assert_eq!(oom_score(0, true, Some(300)), 0);
+        assert_eq!(oom_score(0, false, None), 0);
+    }
 
     #[test]
     fn a_syscall_line_is_proc_pid_syscall_s() {

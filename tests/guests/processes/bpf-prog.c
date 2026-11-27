@@ -6,7 +6,11 @@
    BPF_PROG_LOAD (a descriptor, or the error) and the line of the log
    that says why it was refused (the last before "processed ... insns");
    for a program loaded, its fdinfo's type, tag (a hash of the
-   instructions) and memory, what the descriptor is, and its flags. Then
+   instructions) and memory, what the descriptor is, and its flags. What
+   a read of the stack gives, which a jump on it shows: zeros stored, a
+   spill read from its start no wider than it, narrowed or sign-extended
+   by the load, and an atomic's old value, which it knows, and reads it
+   does not know the value of. Then
    the log's arguments: a buffer too small (ENOSPC), one that cannot be
    written (EFAULT), and the checks before the verifier, which log
    nothing.
@@ -362,6 +366,27 @@ static int case_verify(void) {
     LOAD("read through a scalar", MOV(1, 0), LDX_DW(0, 1, 0), EXIT());
     LOAD("unknown branch to a bad read", LDX_DW(0, 10, -8), I(0x15, 0, 0, 1, 0), LDX_DW(1, 0, 0),
          EXIT());
+
+    /* What a read of the stack into R0 gives: if the verifier knows it is
+       `value`, the jump on it always skips the read through R0. */
+#define READS(name, value, ...) \
+    LOAD(name, __VA_ARGS__, I(0x15, 0, 0, 1, value), LDX_DW(1, 0, 0), EXIT())
+#define WIDE MOV(1, 1), I(0x67, 1, 0, 0, 32), ADD(1, 5), STX_DW(10, 1, -8) /* 0x1_0000_0005 */
+    READS("zeros read", 0, ST_W(10, -4, 0), LDX_W(0, 10, -4));
+    READS("zeros read in part", 0, ST_W(10, -4, 0), LDX_H(0, 10, -2));
+    READS("zeros read with a byte never written", 0, ST_B(10, -1, 0), LDX_H(0, 10, -2));
+    READS("spill read narrower", 5, WIDE, LDX_W(0, 10, -8));
+    READS("spill read off its start", 1, WIDE, LDX_W(0, 10, -4));
+    READS("spill of 0 read off its start", 0, ST_DW(10, -8, 0), LDX_B(0, 10, -1));
+    READS("narrow spill", 7, ST_W(10, -8, 7), LDX_H(0, 10, -8));
+    READS("narrow spill read wider", 7, ST_W(10, -8, 7), LDX_DW(0, 10, -8));
+    READS("narrow spill read off its start", 0, ST_W(10, -8, 7), LDX_H(0, 10, -6));
+    READS("narrow spill zero-extended", 0xff, ST_W(10, -8, -1), LDX_B(0, 10, -8));
+    READS("narrow spill sign-extended", -1, ST_W(10, -8, -1), I(0x91, 0, 10, -8, 0));
+    READS("atomic's old value", 5, WIDE, MOV(2, 0), I(0xc3, 10, 2, -8, 1), MOV_REG(0, 2));
+    READS("after an atomic", 5, WIDE, MOV(2, 0), I(0xc3, 10, 2, -8, 0), LDX_W(0, 10, -8));
+#undef WIDE
+#undef READS
 
     static const struct insn ret0[] = {MOV(0, 0), EXIT()};
     struct prog_attr p = attr(ret0, 2);

@@ -1113,9 +1113,8 @@ fn reg_name(reg: Reg) -> &'static str {
 
 /// An 8-byte stack slot as its `slot_type` has it: a register spilled
 /// whole (`STACK_SPILL`); a scalar spilled into its first `size` bytes,
-/// an aligned store narrower than the slot, whose value only a lookup's
-/// key takes here (a read takes it as unknown); or bytes a read takes as
-/// a scalar. A privileged loader may read slots never written
+/// an aligned store narrower than the slot, whose value a read from its
+/// start takes; or bytes a read takes as a scalar. A privileged loader may read slots never written
 /// (`allow_uninit_stack`), so those are bytes too. `zeros` has bit `i`
 /// set where `slot_type[i]` is `STACK_ZERO`, which a store of 0 that is
 /// no spill makes: byte `i` is the one `i + 1` below the slot's top.
@@ -1482,7 +1481,8 @@ impl Walk {
         write_ok(insn.dst)?;
         let pointer = s.regs[usize::from(insn.src)];
         let value = self.access(s, insn.src, insn.off, insn.size(), None, options)?;
-        s.regs[usize::from(insn.dst)] = value;
+        let signed = insn.class() == class::LDX && insn.mode() == mode::MEMSX;
+        s.regs[usize::from(insn.dst)] = narrowed(value, insn.size(), signed);
         self.same_pointers(i, pointer)
     }
 
@@ -1583,7 +1583,7 @@ impl Walk {
         }
         let value = self.access(s, insn.dst, insn.off, insn.size(), None, aligned)?;
         if let Some(r) = old {
-            s.regs[usize::from(r)] = value;
+            s.regs[usize::from(r)] = narrowed(value, insn.size(), false);
         }
         self.access(
             s,
@@ -1649,7 +1649,7 @@ impl Walk {
                         stack_write(stack, caller, total, bytes, value)?;
                         Ok(Reg::NotInit)
                     }
-                    None => stack_read(stack, ((-total - 1) / 8) as usize, bytes),
+                    None => stack_read(stack, total, bytes),
                 }
             }
             Reg::Ptr(Ptr::Ctx, base) => {
@@ -2395,17 +2395,57 @@ fn constant_key(stack: &Stack, at: i64, size: u32) -> Option<u64> {
     value
 }
 
-/// `check_stack_read_fixed_off`, for a privileged loader.
-fn stack_read(stack: &Stack, slot: usize, bytes: i64) -> Checked<Reg> {
-    match stack[slot] {
+/// `check_stack_read_fixed_off` of `bytes` at `at`, for a privileged
+/// loader. A pointer comes back only whole. A scalar spill comes back
+/// from its start when the read is no wider than the spill
+/// (`bpf_stack_narrow_access_ok`), and the load narrows it; a read of
+/// bytes all `STACK_ZERO`, or all a spill of 0, is 0; anything else is
+/// unknown. Master's `mark_reg_stack_read` also knows a read of bytes
+/// each `STACK_ZERO` or a spill of 0 as 0, where 7.0 does not: as
+/// where the two decide differently, it does as the one that refuses.
+fn stack_read(stack: &Stack, at: i64, bytes: i64) -> Checked<Reg> {
+    let slot = stack[((-at - 1) / 8) as usize];
+    let read = (at..at + bytes).fold(0, |m, at| m | slot_byte(at));
+    let known = |known: bool| Ok(Reg::Scalar(known.then_some(0)));
+    let value = match slot {
+        Slot::Bytes(zeros) => return known(zeros & read == read),
         Slot::Spill(reg @ Reg::Ptr(..)) => {
             if bytes != 8 {
                 return refuse(EACCES, "invalid size of register fill");
             }
-            Ok(reg)
+            return Ok(reg);
         }
-        Slot::Spill(reg) if bytes == 8 => Ok(reg),
-        _ => Ok(Reg::Scalar(None)),
+        Slot::Spill(reg) if bytes == 8 => return Ok(reg),
+        Slot::Spill(Reg::Scalar(value)) | Slot::Narrow { value, .. } => value,
+        Slot::Spill(Reg::NotInit) => None,
+    };
+    let spilled = slot.spilled();
+    if bytes <= i64::from(spilled.count_ones()) && at % 8 == 0 {
+        return Ok(Reg::Scalar(value));
+    }
+    known(slot.zeros() & read == read || (value == Some(0) && spilled & read == read))
+}
+
+/// `coerce_reg_to_size` and `coerce_reg_to_size_sx` of a load of
+/// `width`: a known value is zero-extended, or sign-extended for
+/// `BPF_MEMSX`.
+fn narrowed(reg: Reg, width: u8, signed: bool) -> Reg {
+    let bits = match width {
+        size::B => 8,
+        size::H => 16,
+        size::W => 32,
+        _ => 64,
+    };
+    match reg {
+        Reg::Scalar(Some(v)) if bits < 64 => {
+            let shift = 64 - bits;
+            Reg::Scalar(Some(if signed {
+                ((v << shift) as i64 >> shift) as u64
+            } else {
+                v << shift >> shift
+            }))
+        }
+        reg => reg,
     }
 }
 
@@ -3017,6 +3057,69 @@ mod tests {
         ]);
         // So does a stack slot never written, for a privileged loader.
         ok(&[ldx(0x18, 0, 10, -512), exit()]);
+    }
+
+    /// Whether the verifier knows the value `load` reads into R0 after
+    /// `stores` to be `value`: if it does, the read through R0 that a jump
+    /// on it skips is never reached.
+    fn reads_as(stores: &[Insn], load: Insn, value: i32) -> bool {
+        let mut insns = stores.to_vec();
+        insns.extend([load, i(0x15, 0, 0, 1, value), ldx(0x18, 1, 0, 0), exit()]);
+        match verify(&insns, Options::default()) {
+            Ok(_) => true,
+            Err(r) if r.line == "R0 invalid mem access 'scalar'" => false,
+            Err(r) => panic!("refused: {} ({:?})", r.line, r.errno),
+        }
+    }
+
+    #[test]
+    fn the_stacks_zeros_and_narrow_spills_are_known() {
+        const W: u8 = 0x00;
+        const H: u8 = 0x08;
+        const B: u8 = 0x10;
+        const DW: u8 = 0x18;
+        let st = |size: u8, off: i16, imm: i32| i(0x62 | size, 10, 0, off, imm);
+        // 0x1_0000_0005 in R1.
+        let wide = [mov(1, 1), i(0x67, 1, 0, 0, 32), i(0x07, 1, 0, 0, 5)];
+        let spilled = [&wide[..], &[stx_dw(10, 1, -8)]].concat();
+        // Bytes of 0 that are no spill, and bytes never written.
+        assert!(reads_as(&[st(W, -4, 0)], ldx(W, 0, 10, -4), 0));
+        assert!(reads_as(&[st(W, -4, 0)], ldx(H, 0, 10, -2), 0));
+        assert!(!reads_as(&[st(B, -1, 0)], ldx(H, 0, 10, -2), 0));
+        assert!(!reads_as(&[], ldx(W, 0, 10, -4), 0));
+        // An 8-byte spill from its start, narrowed by the load.
+        assert!(reads_as(&spilled, ldx(W, 0, 10, -8), 5));
+        assert!(reads_as(&spilled, ldx(B, 0, 10, -8), 5));
+        assert!(!reads_as(&spilled, ldx(W, 0, 10, -4), 0));
+        assert!(!reads_as(&spilled, ldx(W, 0, 10, -4), 1));
+        // Off its start, a spill is known only as 0.
+        assert!(reads_as(&[st(DW, -8, 0)], ldx(W, 0, 10, -4), 0));
+        assert!(reads_as(&[st(DW, -8, 0)], ldx(B, 0, 10, -1), 0));
+        // A narrower spill, from its start and no wider than itself.
+        assert!(reads_as(&[st(W, -8, 7)], ldx(W, 0, 10, -8), 7));
+        assert!(reads_as(&[st(W, -8, 7)], ldx(H, 0, 10, -8), 7));
+        assert!(!reads_as(&[st(W, -8, 7)], ldx(DW, 0, 10, -8), 7));
+        assert!(!reads_as(&[st(W, -8, 7)], ldx(H, 0, 10, -6), 0));
+        let w = [mov(1, 0x1234), i(0x63, 10, 1, -8, 0)];
+        assert!(reads_as(&w, ldx(B, 0, 10, -8), 0x34));
+        // Sign-extended by BPF_MEMSX, zero-extended otherwise.
+        assert!(reads_as(&[st(W, -8, -1)], ldx(B, 0, 10, -8), 0xff));
+        assert!(reads_as(&[st(W, -8, -1)], i(0x81 | B, 0, 10, -8, 0), -1));
+        assert!(reads_as(&[st(W, -8, -1)], i(0x81 | W, 0, 10, -8, 0), -1));
+        assert!(!reads_as(&[st(W, -8, -1)], ldx(W, 0, 10, -8), -1));
+        // Zeros above a narrower spill of 0, read with it: master knows
+        // them as 0, 7.0 does not.
+        assert!(!reads_as(
+            &[st(W, -4, 0), st(W, -8, 0)],
+            ldx(DW, 0, 10, -8),
+            0
+        ));
+        // An atomic's old value is a load of its size.
+        let fetch = [&spilled[..], &[mov(2, 0), i(0xc3, 10, 2, -8, 0x01)]].concat();
+        assert!(reads_as(&fetch, mov_reg(0, 2), 5));
+        // What it writes leaves bytes it does not know.
+        let after = [&spilled[..], &[mov(2, 0), i(0xc3, 10, 2, -8, 0x00)]].concat();
+        assert!(!reads_as(&after, ldx(W, 0, 10, -8), 5));
     }
 
     #[test]

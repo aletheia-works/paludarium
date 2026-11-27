@@ -515,9 +515,10 @@ verified.
   lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
   the immediate 0 tells, or an array's key is one the stack holds
   ([System calls](./features#system-calls)), where Linux also learns from
-  comparing two pointers; and a read of the stack's zeros, or of a spill
-  narrower than 8 bytes, is a value it does not know, where Linux knows
-  it.
+  comparing two pointers. A read of the stack is known where Linux knows
+  it (zeros stored, a scalar spilled read from its start, an atomic's old
+  value), but not one of zeros and a spill of 0 together, which master
+  knows as 0 and Linux 7.0 does not.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for

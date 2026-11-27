@@ -1208,9 +1208,9 @@ verified.
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
-  gave. Bound to `lo`, an IPv4 socket's packet to an address no route
-  through `lo` takes is `ENETUNREACH`, where Linux sends it, on link, and
-  drops it. Neighbour discovery makes none of
+  gave. Bound to `lo`, an IPv4 socket's packet to the limited broadcast
+  address or `127.255.255.255` is `ENETUNREACH`, where Linux sends it
+  through `lo`. Neighbour discovery makes none of
   the neighbours of the groups router solicitation, MLD reports and
   duplicate address detection send to (`ff02::2`, `ff02::16`, the
   solicited-node ones), no advertisement unasked, and no redirect; the
@@ -1311,9 +1311,11 @@ verified.
   anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
-  namespace a connection or datagram to an address no local route has is
-  still `ENETUNREACH`, whatever route takes it, where Linux's goes out
-  through `lo` and is dropped, or fails with a rejecting route's error.
+  namespace a connection or datagram to an address no local route has,
+  from a socket bound to no device, is still `ENETUNREACH` where a route
+  through `lo` or a rejecting one takes it, where Linux's goes out
+  through `lo`, which takes it in as the features page says of a socket
+  bound to `lo`, or fails with the rejecting route's error.
   A route's metrics (`RTA_METRICS`) are kept and shown, but change
   nothing a socket does: its MTU, hop limit, window and congestion control
   are their defaults whatever its route holds. A route may name no

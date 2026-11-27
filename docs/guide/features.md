@@ -3306,8 +3306,8 @@ kernel.
     (`rt6_multipath_hash`): the source, the destination, the flow label and
     the protocol (0 and 2); the addresses, the protocol and the ports (1);
     or the fields `fib_multipath_hash_fields` names (3), of the flow
-    `RTM_GETROUTE` asks for too; a socket's packets hash as it is bound, `::` unbound, with no flow
-    label, and one unbound takes the source of the hop that gives
+    `RTM_GETROUTE` asks for too; a socket's packets hash as it is bound,
+    `::` unbound, with no flow label, and one unbound takes the source of the hop that gives
     (`ip6_dst_lookup_tail`). An answer goes back by a lookup of its own,
     through whichever end that takes: the one its listener is bound to, or
     to a link-local address the one the packet came in on
@@ -6765,7 +6765,12 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     by the routes through the device only, and where none goes, on link
     through it; a group of 224.0.0.0/24 or the limited broadcast address
     straight out through it (`ip_route_output_key_hash_rcu`): `ENODEV`
-    once it has gone, `ENETUNREACH` while it is down. A connection
+    once it has gone, `ENETUNREACH` while it is down. What goes out
+    through `lo` so comes back in on it, whatever its address
+    (`rt_dst_alloc`): a datagram to whatever takes it there, and a
+    connection's SYN, whose answer finds no route from an address not
+    the namespace's own, and from one that is comes in on that address's
+    device. A connection
     accepted is bound as its listener, or, where that has no device, one
     from a link-local address to the device it came in on
     (`tcp_v6_init_req`), which is also the `IPV6_MULTICAST_IF` of any one

@@ -14,7 +14,11 @@
    before others but a connected one; a TCP listener the same, and the connection it accepts
    is bound as it is. An IPv4 socket bound to a device goes by its routes
    only, else on link through it: from va to vc's address, out through va,
-   in on vb. A device down is ENETUNREACH, one gone ENODEV. */
+   in on vb. Through lo one to any address goes so too, from va's address
+   (inet_select_addr's first of link scope), or 127.0.0.1, and comes back
+   in on lo: a datagram to what takes it there, a connection's SYN with
+   no answer, none from an address not the namespace's own, and one from
+   10.0.0.1 in on va. A device down is ENETUNREACH, one gone ENODEV. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -53,6 +57,7 @@
 #define IFA_F_NODAD 0x02
 #define RTA_DST 1
 #define RTM_NEWROUTE 24
+#define RTA_OIF 4
 #define SO_BINDTODEVICE_ 25
 #define SO_BINDTOIFINDEX_ 62
 #define VA 1000
@@ -339,6 +344,49 @@ static void send6(int fd, const char *ip, int port, const char *label) {
     printf("%s: sendto=%ld\n", label, result(sendto(fd, "x", 1, 0, (void *)&to, sizeof to)));
 }
 
+/* Adds a route of link scope to `dst`/`len` through the device `oif`
+   to the main table. */
+static void route4(int fd, const char *dst, int len, int oif, const char *label) {
+    struct body b = {0};
+    const unsigned char m[12] = {AF_INET, (unsigned char)len, 0, 0, 254, 3, 253, 1, 0, 0, 0, 0};
+    unsigned char in[4];
+    inet_pton(AF_INET, dst, in);
+    raw(&b, m, sizeof m);
+    put(&b, RTA_DST, in, 4);
+    put(&b, RTA_OIF, &oif, 4);
+    request(fd, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, &b, label);
+}
+/* Prints the IPv4 address `fd` is bound to. */
+static void name4(int fd, const char *label) {
+    struct sockaddr_in name = {0};
+    socklen_t len = sizeof name;
+    long r = result(getsockname(fd, (void *)&name, &len));
+    char ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &name.sin_addr, ip, sizeof ip);
+    printf("%s: getsockname=%ld %s\n", label, r, ip);
+}
+/* A nonblocking TCP connection from a socket bound to lo, and to `from`
+   (none for NULL), to `ip`:`port`, and what it is a little later. */
+static void connect_lo(const char *from, const char *ip, int port, const char *label) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE_, "lo", 2);
+    if (from) {
+        struct sockaddr_in a = at4(from, 0);
+        printf("%s: bind=%ld\n", label, result(bind(fd, (void *)&a, sizeof a)));
+    }
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    struct sockaddr_in to = at4(ip, port);
+    printf("%s: connect=%ld\n", label, result(connect(fd, (void *)&to, sizeof to)));
+    struct pollfd p = {.fd = fd, .events = POLLOUT};
+    long ready = result(poll(&p, 1, 200));
+    int error = -1;
+    socklen_t len = sizeof error;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len);
+    printf("%s: poll=%ld revents=%#x SO_ERROR=%d\n", label, ready, (unsigned)p.revents, error);
+    name4(fd, label);
+    close(fd);
+}
+
 /* Drops CAP_NET_RAW from the effective set. */
 static void drop_net_raw(void) {
     struct {
@@ -477,6 +525,51 @@ int main(int argc, char **argv) {
     int got = (int)result(accept(l, NULL, NULL));
     printf("accept=%d\n", got >= 0 ? 0 : got);
     if (got >= 0) show(got, 16, "accepted");
+
+    /* Through lo, by its routes or on link: whatever its address, it
+       comes back in on lo, to whatever takes it there, and nothing
+       answers from an address not the namespace's own. */
+    route4(ctl, "10.8.0.0", 16, 1, "route 10.8.0.0/16 through lo");
+    int on_lo = bound(AF_INET, SOCK_DGRAM, "lo", 0, "a sender on lo");
+    const char *const through_lo[] = {"10.9.9.9", "10.8.0.1", "10.1.0.2", "10.0.0.1", "127.0.0.1"};
+    for (int i = 0; i < 5; i++) {
+        char label[64];
+        snprintf(label, sizeof label, "from lo to %s", through_lo[i]);
+        send4(on_lo, through_lo[i], 7000, label);
+        which(four, four_names, 4, label);
+    }
+    struct sockaddr_in far = at4("10.9.9.9", 7999);
+    printf("connect it to 10.9.9.9:7999=%ld\n", result(connect(on_lo, (void *)&far, sizeof far)));
+    name4(on_lo, "connected through lo");
+    printf("send=%ld\n", result(send(on_lo, "x", 1, 0)));
+    struct timespec pause = {0, 100 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    printf("send again=%ld\n", result(send(on_lo, "x", 1, 0)));
+    int lo_local = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(lo_local, SOL_SOCKET, SO_BINDTODEVICE_, "lo", 2);
+    struct sockaddr_in local = at4("127.0.0.1", 0);
+    printf("UDP on lo at 127.0.0.1: bind=%ld\n", result(bind(lo_local, (void *)&local, sizeof local)));
+    send4(lo_local, "10.9.9.9", 7000, "from 127.0.0.1 on lo to 10.9.9.9");
+    which(four, four_names, 4, "from 127.0.0.1 on lo to 10.9.9.9");
+    int lo6 = bound(AF_INET6, SOCK_DGRAM, "lo", 0, "UDP6 on lo");
+    send6(lo6, "::ffff:10.9.9.9", 7000, "from lo to ::ffff:10.9.9.9");
+    which(four, four_names, 4, "from lo to ::ffff:10.9.9.9");
+    int lo_l = bound(AF_INET, SOCK_STREAM, "lo", 8100, "TCP on lo, port 8100");
+    printf("listen=%ld\n", result(listen(lo_l, 4)));
+    fcntl(lo_l, F_SETFL, O_NONBLOCK);
+    int any_l = bound(AF_INET, SOCK_STREAM, NULL, 8200, "TCP on none, port 8200");
+    printf("listen=%ld\n", result(listen(any_l, 4)));
+    fcntl(any_l, F_SETFL, O_NONBLOCK);
+    connect_lo(NULL, "10.9.9.9", 8000, "TCP on lo to 10.9.9.9:8000");
+    connect_lo(NULL, "10.8.0.1", 8000, "TCP on lo to 10.8.0.1:8000");
+    connect_lo("127.0.0.1", "10.9.9.9", 8000, "TCP on lo at 127.0.0.1 to 10.9.9.9:8000");
+    connect_lo(NULL, "10.9.9.9", 8100, "TCP on lo to 10.9.9.9:8100");
+    printf("accept on lo=%ld\n", result(accept(lo_l, NULL, NULL)));
+    connect_lo(NULL, "10.0.0.1", 8200, "TCP on lo to 10.0.0.1:8200");
+    int took = (int)result(accept(any_l, NULL, NULL));
+    printf("accept on none=%d\n", took >= 0 ? 0 : took);
+    if (took >= 0) show(took, 16, "accepted"), name4(took, "accepted"), close(took);
+    close(on_lo), close(lo_local), close(lo6), close(lo_l), close(any_l);
 
     /* Down, and gone. */
     int on_vc = bound(AF_INET, SOCK_DGRAM, "vc", 0, "a sender on vc");

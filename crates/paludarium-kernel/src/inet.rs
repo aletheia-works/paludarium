@@ -645,6 +645,14 @@ impl Network {
     /// - The packet comes there, and the answer back ([`Reach::Answered`])
     ///   only where that namespace's comes to this one ([`Self::back4`]);
     ///   else that answer goes nowhere ([`Reach::OneWay`]).
+    ///
+    /// An IPv4 packet out through `lo` ([`Self::route4_through`]) goes,
+    /// making the loopback's neighbour ([`Self::output`]), and its answer
+    /// is lost: the loopback takes it in as its own whatever its address
+    /// (`rt_dst_alloc`), but the answer to an address not the namespace's
+    /// own finds no route (`__ip_dev_find`), and to one that is, it comes
+    /// in on that address's device, where the socket bound to `lo` takes
+    /// it not.
     fn reach(&self, index: i32, from: IpAddr, to: IpAddr, flow: &Flow, now: Option<u64>) -> Reach {
         let (from, to) = match (plain(from), plain(to)) {
             (IpAddr::V4(from), IpAddr::V4(to)) => (from, to),
@@ -653,6 +661,10 @@ impl Network {
             }
             _ => return Reach::Unanswered,
         };
+        if index == crate::netdev::LOOPBACK_INDEX {
+            self.output(IpAddr::V4(to), now);
+            return Reach::Dropped;
+        }
         let lladdr = match self.next_hop4(index, to, flow, now) {
             IpAddr::V4(hop) => self.neighbour4(index, from, hop, now),
             IpAddr::V6(hop) => self.neighbour6(index, None, hop, now),
@@ -1065,9 +1077,10 @@ impl Network {
     /// named: `ENODEV` for none of it, `ENETUNREACH` while it is down; to
     /// a local group (224.0.0.0/24) or the limited broadcast address out
     /// through it at once; else by the tables' routes through it only,
-    /// and where none goes, out through it, on link. Through `lo` that
-    /// goes nowhere, which is `ENETUNREACH`, where Linux drops it, but for
-    /// a group, which comes back in.
+    /// and where none goes, out through it, on link. Through `lo` a
+    /// unicast one goes so too, and comes back in on it, whatever its
+    /// address; a group comes back in too; the limited broadcast address,
+    /// and another kind of route through it, is `ENETUNREACH`.
     fn route4_through(
         &self,
         to: SocketAddr,
@@ -1118,8 +1131,12 @@ impl Network {
                 };
                 Ok(Dest::Veth(index, cast))
             }
+            // Out through `lo`, as its own route or on link takes it.
+            Ok(route) if lo && route.kind == Kind::Unicast && cast == Cast::Unicast => {
+                Ok(Dest::Veth(index, cast))
+            }
             Ok(_) => Err(ENETUNREACH),
-            Err(_) if lo => Err(ENETUNREACH),
+            Err(_) if lo && cast != Cast::Unicast => Err(ENETUNREACH),
             // On link, through it.
             Err(_) => Ok(Dest::Veth(index, cast)),
         }
@@ -3448,6 +3465,21 @@ impl InetSocket {
                 }
                 return Ok(bytes.len());
             }
+            // Out through `lo`, which takes it in as its own whatever its
+            // address (`rt_dst_alloc`: `RTCF_LOCAL`, `ip_local_deliver`), on
+            // `lo`; nothing answers from an address not the namespace's
+            // own, as no route leaves from it (`__ip_dev_find`).
+            if on_lo {
+                drop(s);
+                let now = self.now();
+                self.network.output(plain_to.ip(), now);
+                let from = SocketAddr::new(plain(from.ip()), from.port());
+                let lo = crate::netdev::LOOPBACK_OIF;
+                if let Some(receiver) = self.ports().receiver(plain_to, from, lo) {
+                    receiver.deliver_on(from, bytes, lo, &sent, arrival::Way::Loopback);
+                }
+                return Ok(bytes.len());
+            }
             let to_peer = s.peer == Some(plain_to);
             drop(s);
             let (there, answer) =
@@ -4496,7 +4528,8 @@ impl InetSocket {
         let from = self.loopback_source(s, to, options)?;
         Ok(self.join(&self.network, s, (bound, from), to, options, None))
     }
-    /// A connection to `to` out through the veth end `index`, from the
+    /// A connection to `to` out through the veth end `index`, or `lo`,
+    /// where no answer comes ([`Self::reach`]), from the
     /// address its route leaves from on a port bound now, as on the
     /// loopback ([`Self::loopback_source`]); `EINVAL` from a loopback
     /// address, which Linux's `__mkroute_output` sends out of no other
@@ -4525,7 +4558,8 @@ impl InetSocket {
             self.give_back(s, bound);
             return Err(EADDRNOTAVAIL);
         }
-        if to.is_ipv4() && plain(from.ip()).is_loopback() {
+        if to.is_ipv4() && plain(from.ip()).is_loopback() && index != crate::netdev::LOOPBACK_INDEX
+        {
             self.give_back(s, bound);
             return Err(Errno::EINVAL);
         }

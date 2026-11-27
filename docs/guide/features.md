@@ -4635,7 +4635,11 @@ kernel.
   resolved; for the first program, the path the CLI gives it: its path in a
   `--mount`, else `/<file name>`)
   and to the current directory. `stat` and `open` follow them, and
-  `O_NOFOLLOW` does not (`ELOOP`).
+  `O_NOFOLLOW` does not (`ELOOP`). `execve` of `exe` (this process's or,
+  for a reader that may look at it, another's) runs the program it leads
+  to, as Linux's walk jumps to the file without searching its
+  directories; `AT_SYMLINK_NOFOLLOW` refuses it (`ELOOP`), and a
+  generated file that is no link is `EACCES`.
 
 - `/proc/sys/fs/mqueue` has the POSIX message queue limits of the
   reader's IPC namespace, as Linux's `ipc/mq_sysctl.c`: `queues_max`,
@@ -7383,7 +7387,9 @@ one only with an `--allow-net`.
   `ln -s /dev/null f` makes, or a link to `/dev` on the way, leads to the
   file the kernel generates there: `stat`, `statx`, `access`, `open` and
   the other calls that look a path up go on there as for the path it
-  leads to (`readlink` reads a link there, as `/dev/fd`, and the `xattr`
+  leads to, as do `execve` and the calls that make or remove a name
+  through it (`mkdir`, `mknod`, `symlink`, `link`, `unlink`, `rmdir` and
+  `rename`) (`readlink` reads a link there, as `/dev/fd`, and the `xattr`
   calls, `statfs`, `link` and `name_to_handle_at`, with their `*at`
   forms, take the generated file), and a descriptor opened through it
   names that file in `/proc/self/fd`.

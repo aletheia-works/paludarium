@@ -18831,6 +18831,69 @@ static int generated_binds_case(void) {
     return 0;
 }
 
+/* The generated-link-names case: execve and the calls that make a name
+   go on through a symbolic link into /proc as they do by the directory's
+   own path. execve of a process's exe link runs the program, through a
+   link, a relative one or the link itself, without AT_SYMLINK_NOFOLLOW
+   (ELOOP); a generated file that is no link is EACCES, and what is not
+   there ENOENT. The new names in /proc are not there (ENOENT), a rename
+   into it from elsewhere EXDEV. Only /proc: a native /dev takes names. */
+static char gl_base[] = "/tmp/paludarium-generated-links-XXXXXX";
+static void gl_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", gl_base, name); }
+static int gl_exec(const char *self, const char *path, int flags) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = {(char *)path, "generated-link-ran", (char *)self, NULL};
+        syscall(SYS_execveat, AT_FDCWD, path, argv, environ, flags);
+        _exit(100 + errno);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+static int generated_link_names_case(const char *self) {
+    if (!mkdtemp(gl_base)) return 1;
+    char lp[256], lr[256], le[256], file[256];
+    gl_path(lp, "lp");
+    gl_path(lr, "lr");
+    gl_path(le, "le");
+    gl_path(file, "file");
+    close(open(file, O_CREAT | O_WRONLY, 0644));
+    printf("links %d %d %d\n", symlink("/proc", lp), symlink("../../proc", lr), symlink("/proc/self/exe", le));
+    const char *dirs[] = {"/proc", lp, lr};
+    for (unsigned i = 0; i < 3; i++) {
+        char p[300], q[300];
+        snprintf(p, sizeof p, "%s/x8", dirs[i]);
+        snprintf(q, sizeof q, "%s/sys/x8", dirs[i]);
+        printf("%s: mkdir=%d", i ? (i == 1 ? "link" : "relative") : "proc", mkdir(p, 0755) ? errno : 0);
+        printf(" mknod=%d", mknod(p, S_IFIFO | 0644, 0) ? errno : 0);
+        printf(" symlink=%d", symlink("x", p) ? errno : 0);
+        int fd = open(p, O_CREAT | O_WRONLY | O_EXCL, 0644);
+        printf(" creat=%d", fd < 0 ? errno : 0);
+        if (fd >= 0) close(fd);
+        printf(" unlink=%d rmdir=%d", unlink(p) ? errno : 0, rmdir(p) ? errno : 0);
+        printf(" rename-in=%d", rename(file, p) ? errno : 0);
+        printf(" sys-mkdir=%d\n", mkdir(q, 0755) ? errno : 0);
+    }
+    char through[300], relative[300], cwd[300], uptime[300];
+    snprintf(through, sizeof through, "%s/self/exe", lp);
+    snprintf(relative, sizeof relative, "%s/self/exe", lr);
+    snprintf(cwd, sizeof cwd, "%s/self/cwd/none", lp);
+    snprintf(uptime, sizeof uptime, "%s/uptime", lp);
+    const char *runs[] = {"/proc/self/exe", le, through, relative, cwd, uptime, "/proc/self", "/proc/none"};
+    const char *names[] = {"exe", "link", "through", "relative", "cwd-none", "uptime", "self", "none"};
+    for (unsigned i = 0; i < 8; i++) printf("exec %s=%d\n", names[i], gl_exec(self, runs[i], 0));
+    printf("exec nofollow=%d\n", gl_exec(self, "/proc/self/exe", AT_SYMLINK_NOFOLLOW));
+    const char *files[] = {"lp", "lr", "le", "file"};
+    for (unsigned i = 0; i < 4; i++) {
+        char path[256];
+        gl_path(path, files[i]);
+        unlink(path);
+    }
+    printf("cleaned=%d\n", rmdir(gl_base) == 0);
+    return 0;
+}
+
 /* The generated-noexec case: /proc and /dev are noexec mounts, so an
    executable mapping of a file there is EPERM before anything else is
    checked, and mprotect to one EACCES; a file reached through a link
@@ -44478,6 +44541,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
+    if (!strcmp(mode, "generated-link-names")) return generated_link_names_case(self);
+    if (!strcmp(mode, "generated-link-ran")) return 7;
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

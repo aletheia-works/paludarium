@@ -14571,6 +14571,80 @@ fn the_path_calls_go_through_a_link_into_the_generated_files() {
     }
 }
 
+/// The calls that make or remove a name go on through a symbolic link into
+/// `/dev` or `/proc`, on the way to the name, as they do in that directory
+/// by its own path: a relative link as an absolute one, and `/dev` as the
+/// kernel's, not the file system's directory that holds `/dev/shm`.
+#[test]
+fn the_name_calls_go_through_a_link_into_the_generated_directories() {
+    let mut f = fixture();
+    let dev = put(&mut f, 0, b"/dev");
+    let ld = put(&mut f, 0x10, b"/tmp/ld");
+    let proc_dir = put(&mut f, 0x20, b"/proc");
+    let lp = put(&mut f, 0x30, b"/tmp/lp");
+    let relative = put(&mut f, 0x40, b"../proc");
+    let lr = put(&mut f, 0x50, b"/tmp/lr");
+    assert_eq!(f.ret(88, &[dev, ld]), 0);
+    assert_eq!(f.ret(88, &[proc_dir, lp]), 0);
+    assert_eq!(f.ret(88, &[relative, lr]), 0);
+    let other = put(&mut f, 0x60, b"/tmp/other");
+    let file = put(&mut f, 0x80, b"/tmp/file");
+    let fd = f.ret(2, &[file, 0o101, 0o644]);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    // A generated directory is there, with a trailing slash too.
+    for path in [
+        &b"/proc/"[..],
+        b"/dev/",
+        b"/tmp/ld/",
+        b"/tmp/lp/",
+        b"/tmp/lp/self/",
+    ] {
+        let p = put(&mut f, 0x100, path);
+        assert_eq!(
+            f.ret(83, &[p, 0o755]),
+            errno(Errno::EEXIST),
+            "{}",
+            String::from_utf8_lossy(path)
+        );
+    }
+    let dirs: [(&[u8], &[u8]); 3] = [
+        (b"/dev", b"/tmp/ld"),
+        (b"/proc", b"/tmp/lp"),
+        (b"/proc", b"/tmp/lr"),
+    ];
+    let names: [&[u8]; 5] = [b"x8", b"self", b"pts", b"uptime", b"null"];
+    for (direct, through) in dirs {
+        for name in names {
+            let mut results = Vec::new();
+            for dir in [direct, through] {
+                let p = put(&mut f, 0x100, &[dir, b"/", name].concat());
+                let q = put(&mut f, 0x200, &[dir, b"/y8"].concat());
+                let call = |f: &mut Fixture, n: u64, args: &[u64]| f.ret(n, args) as i64;
+                results.push([
+                    call(&mut f, 83, &[p, 0o755]),
+                    call(&mut f, 84, &[p]),
+                    call(&mut f, 133, &[p, 0o10644, 0]),
+                    call(&mut f, 87, &[p]),
+                    call(&mut f, 88, &[other, p]),
+                    call(&mut f, 87, &[p]),
+                    call(&mut f, 86, &[file, p]),
+                    call(&mut f, 82, &[p, q]),
+                    call(&mut f, 82, &[q, p]),
+                    call(&mut f, 82, &[file, p]),
+                    call(&mut f, 82, &[p, file]),
+                ]);
+            }
+            assert_eq!(
+                results[0],
+                results[1],
+                "{}/{}",
+                String::from_utf8_lossy(through),
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+}
+
 /// The path calls that change a file the kernel generates in `/dev` or
 /// `/proc`, by its own path, as `notify_change` makes them there: root may
 /// keep a mode or owner as it is but gets `EPERM` for a new one, which no

@@ -4873,7 +4873,29 @@ impl Kernel {
         // file its descriptor holds while a path still names it, and a file
         // none names (a memfd, a removed one) from the descriptor.
         let process = (self.process.pid, !self.group.has_member(self.process.pid));
-        let program = crate::files::exec_program(&self.files, process, dir, &raw, a[3])?;
+        // A link on the way into `/proc` or `/dev`, or one of a process's
+        // `/proc` links, jumped through to the file it leads to.
+        let jumped = {
+            let c = crate::syscalls::Context {
+                number: n,
+                tid: thread.tid,
+                host: &*self.host,
+                shared_host: &self.host,
+                files: &mut self.files,
+                process: &mut thread.state,
+                cpu: &mut thread.cpu,
+                mem,
+                cancellation: &self.cancellation,
+                inbox: &self.inbox,
+                group: &self.group,
+                processes: &self.processes,
+            };
+            crate::files::exec_jumped(&c, dir, &raw, a[3] & AT_SYMLINK_NOFOLLOW == 0)?
+        };
+        let program = match &jumped {
+            Some(path) => crate::files::exec_program(&self.files, process, AT_FDCWD, path, a[3])?,
+            None => crate::files::exec_program(&self.files, process, dir, &raw, a[3])?,
+        };
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
         let creds = &thread.state.credentials;
         // What runs: a path's program, whose scripts are followed below, or

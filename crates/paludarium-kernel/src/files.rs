@@ -1025,6 +1025,20 @@ impl Files {
             _ => Ok(joined),
         }
     }
+    /// [`Self::named`] for a call that makes or removes the last name: when
+    /// a symbolic link on the way to it leads into `/dev` or `/proc`
+    /// ([`into_generated`], the last name's own link not followed), the
+    /// name in the generated directory it leads to, as Linux's walk to the
+    /// parent follows each link on the way, so the call finds there what it
+    /// finds by that directory's own path. (The file system's `/dev`, which
+    /// holds the mount of `/dev/shm`, is not what such a link reaches.)
+    pub(crate) fn named_parent_linked(&self, dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
+        let named = self.named(dir, p)?;
+        if generated(&named) || named == b"/proc" || named == b"/dev" {
+            return Ok(named);
+        }
+        Ok(into_generated(&*self.fs(), &named, false).unwrap_or(named))
+    }
     /// The path `joined`, whose `..` would leave `root` as written, with
     /// everything up to its last `..` walked as Linux walks it: a `..`
     /// after a symbolic link goes up from the link's target, and one at
@@ -2583,7 +2597,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     if !(old_raw.is_empty() && flags & AT_EMPTY_PATH != 0) {
         let new_raw = path(c, new_ptr)?;
         let old_name = queue_name(&c.files.path(old_dir, old_raw.clone())?);
-        let new_name = queue_name(&c.files.named(new_dir, new_raw.clone())?);
+        let new_name = queue_name(&c.files.named_parent_linked(new_dir, new_raw.clone())?);
         if old_name.is_some() || new_name.is_some() {
             return link_queue(
                 c,
@@ -2599,7 +2613,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
         let d = c.files.descriptor(old_dir)?;
         if crate::mqueue::is_queue(&*d.file) {
             let new_raw = path(c, new_ptr)?;
-            let new = c.files.named(new_dir, new_raw.clone())?;
+            let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
             let name = queue_name(&new);
             match &name {
                 Some(name) if crate::mqueue::mounted_there(c, name)? => {
@@ -2640,7 +2654,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
         }
     };
     let new_raw = path(c, new_ptr)?;
-    let new = c.files.named(new_dir, new_raw.clone())?;
+    let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
     let old = match target {
         Followed::Path { path, follow: true } => resolved(c.files, &path).unwrap_or(path),
         Followed::Path { path, .. } => path,
@@ -6118,8 +6132,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 ((a[0], path(c, a[1])?), (a[2], path(c, a[3])?))
             };
-            let old = c.files.named(old_dir, old_raw.clone())?;
-            let new = c.files.named(new_dir, new_raw.clone())?;
+            let old = c.files.named_parent_linked(old_dir, old_raw.clone())?;
+            let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
             let names = (queue_name(&old), queue_name(&new));
             if names.0.is_some() || names.1.is_some() {
                 let walks = ((old_dir, &old_raw[..]), (new_dir, &new_raw[..]));
@@ -6198,7 +6212,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 (a[0], path(c, a[1])?, a[2])
             };
-            let p = c.files.named(dir, raw.clone())?;
+            let p = c.files.named_parent_linked(dir, raw.clone())?;
             if queue_root(&p) {
                 return Err(Errno::EEXIST);
             }
@@ -6206,6 +6220,15 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return crate::mqueue::make_mounted(c, &name, None, || {
                     landlock_name(c, &p, crate::landlock::MAKE_DIR)
                 });
+            }
+            // A generated directory, `/proc` and `/dev` too, is there,
+            // with a trailing slash or through a link as by its name.
+            let end = p.iter().rposition(|&b| b != b'/').map_or(1, |i| i + 1);
+            let named = &p[..end];
+            if (generated(named) || named == b"/proc" || named == b"/dev")
+                && generated_stat(c, named, false)?.is_some()
+            {
+                return Err(Errno::EEXIST);
             }
             crate::bpf_fs::lookup(c, &p)?;
             let created =
@@ -6237,7 +6260,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 ((-100i32) as u64, path(c, a[0])?, n == 84)
             };
-            let p = c.files.named(at_dir, raw.clone())?;
+            let p = c.files.named_parent_linked(at_dir, raw.clone())?;
             if let Some(name) = paludarium_vfs::normalize_path(&p)
                 .ok()
                 .as_deref()
@@ -6273,7 +6296,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 (a[1], path(c, a[2])?)
             };
-            let p = c.files.named(dir, raw.clone())?;
+            let p = c.files.named_parent_linked(dir, raw.clone())?;
             if queue_root(&p) {
                 return Err(Errno::EEXIST);
             }
@@ -8803,7 +8826,9 @@ fn into_generated(fs: &dyn HostFs, path: &[u8], follow: bool) -> Option<Vec<u8>>
     if fs.root() != b"/" {
         return None;
     }
-    let inside = |p: &[u8]| generated(p) || p == b"/proc" || p.starts_with(b"/dev/") && !in_shm(p);
+    let inside = |p: &[u8]| {
+        generated(p) || p == b"/proc" || p == b"/dev" || p.starts_with(b"/dev/") && !in_shm(p)
+    };
     let trailing = path.ends_with(b"/");
     let mut pending: Vec<Vec<u8>> = path
         .split(|&b| b == b'/')
@@ -8938,6 +8963,83 @@ fn descriptor_followed(files: &Files, d: Descriptor) -> Result<Followed, Errno> 
         },
         None => Followed::File(d),
     })
+}
+/// The path `execveat(dir, raw, ..)` runs when a link on the way leads into
+/// `/proc` or `/dev`, or `raw` is a link of a process's `/proc` directory:
+/// Linux's walk jumps through `exe`, `cwd` and `root` (`nd_jump_link`) to
+/// the file itself, whose directories it does not search, and follows a
+/// symbolic link elsewhere into the generated files as it follows any.
+/// `None` when the path stays on the file system as written, or ends in a
+/// link of `/proc/<pid>/fd` (or `/dev/fd`), which [`exec_program`] takes.
+/// A generated file is no regular file (`EACCES`, as `do_open_execat`
+/// finds), and one that is not there `ENOENT`. The machine's root only:
+/// under a root of its own, `/proc` and `/dev` are what the root holds.
+pub(crate) fn exec_jumped(
+    c: &Context<'_>,
+    dir: u64,
+    raw: &[u8],
+    follow: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    if raw.is_empty() || c.files.root() != b"/" {
+        return Ok(None);
+    }
+    let mut p = c.files.path(dir, through_magic_links(c, raw.to_vec())?)?;
+    let mut jumped = false;
+    for _ in 0..40 {
+        if !generated(&p) && p != b"/proc" {
+            let Err(error) = c.files.fs().metadata(&p, follow) else {
+                return Ok(jumped.then_some(p));
+            };
+            match generated_target(c, &p, follow, error) {
+                Ok(target) => {
+                    p = target;
+                    jumped = true;
+                    continue;
+                }
+                // The call's own lookup reports it.
+                Err(e) if e == error => return Ok(jumped.then_some(p)),
+                Err(e) => return Err(e),
+            }
+        }
+        let linked = crate::devices::through_link(&p).unwrap_or_else(|| p.clone());
+        let linked = match crate::devices::entry(&linked) {
+            Some(crate::devices::Entry::Link(target)) => target.to_vec(),
+            _ => linked,
+        };
+        let descriptor = matches!(
+            own_entry(c, &linked),
+            Some(crate::proc::OwnEntry::Descriptor(_))
+        ) || task_path(c, &linked)
+            .is_some_and(|t| matches!(t.entry, crate::proc::TaskEntry::Descriptor(_)));
+        if descriptor {
+            return Ok(jumped.then_some(p));
+        }
+        if follow && let Some(target) = exec_link(c, &linked) {
+            p = target?;
+            jumped = true;
+            continue;
+        }
+        // `AT_SYMLINK_NOFOLLOW` refuses the link itself (`ELOOP`).
+        return match generated_stat(c, &p, follow)? {
+            Some((stat, ..)) if stat.mode & 0o170000 == 0o120000 => Err(Errno(40)),
+            Some(_) => Err(Errno::EACCES),
+            None => Err(Errno::ENOENT),
+        };
+    }
+    Err(Errno(40)) // ELOOP
+}
+/// Where the link of a process's `/proc` directory at `path` leads, for
+/// [`exec_jumped`]: its `exe`, `cwd` or `root` ([`task_link`], which checks
+/// that the reader may look at another's). `None` for any other file: the
+/// rest of the generated links lead to directories and files that are no
+/// regular file, which `execve` refuses as it finds them.
+fn exec_link(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, Errno>> {
+    use crate::proc::{OwnEntry, TaskEntry};
+    let own = own_entry(c, path)
+        .is_some_and(|e| matches!(e, OwnEntry::Exe | OwnEntry::Cwd | OwnEntry::Root));
+    let task = task_path(c, path)
+        .is_some_and(|t| matches!(t.entry, TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root));
+    (own || task).then(|| task_link(c, path))
 }
 /// The program `execveat(dir, raw, .., flags)` runs: a file a path names
 /// (`dir` and `raw` taken as Linux's `do_open_execat` takes them, a link in
@@ -9823,7 +9925,7 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         kind,
         0 | 0o100000 | 0o010000 | 0o140000 | 0o020000 | 0o060000
     ) {
-        let p = c.files.named(dir, raw.to_vec())?;
+        let p = c.files.named_parent_linked(dir, raw.to_vec())?;
         if queue_root(&p) {
             return Err(Errno::EEXIST);
         }
@@ -9843,7 +9945,7 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
             // `filename_create`'s EROFS comes before `vfs_mknod`'s EPERM.
             crate::permissions::want_write_new(c.files, dir, raw, false)?;
             if c.process.credentials.landlock != Default::default() {
-                let p = c.files.named(dir, raw.to_vec())?;
+                let p = c.files.named_parent_linked(dir, raw.to_vec())?;
                 if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
                     landlock_name(c, &p, crate::landlock::make_access(kind, u64::from(dev)))?;
                 }
@@ -9853,7 +9955,7 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         0o040000 => return Err(Errno::EPERM),
         _ => return Err(Errno::EINVAL),
     }
-    let p = c.files.named(dir, raw.to_vec())?;
+    let p = c.files.named_parent_linked(dir, raw.to_vec())?;
     crate::bpf_fs::lookup(c, &p)?;
     let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw, false)?;
     if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {

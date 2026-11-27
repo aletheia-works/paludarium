@@ -202,12 +202,20 @@ verified.
   names as written, where Linux takes a `..` after a link in `/proc` (such
   as `/proc/self/cwd`) from its target.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
-- **Links into `/dev` and `/proc`, in part**: a symbolic link elsewhere
-  that leads into them is followed to the generated file by the calls
-  that look a path up, but not by `execve` or by the calls that make or
-  remove a name through it (`mkdir`, `mknod`, `unlink`, `rename` and the
-  like), which give `ENOENT`, and under a root of its own no such link is
-  followed.
+- **Links into `/dev` and `/proc` under a root of its own**: there, no
+  symbolic link elsewhere that leads into them is followed to the
+  generated file.
+- **Names in `/dev` and `/proc`**: no call makes a name in `/dev`
+  (`mkdir`, `mknod`, `symlink`, an `open` with `O_CREAT` and a `rename`
+  into it give `ENOENT`), where Linux's devtmpfs takes them, and removing
+  or renaming a generated name gives `ENOENT`, where Linux gives `EPERM`
+  for an `unlink` of a file in `/proc`, `ENOTDIR` for an `rmdir` of a
+  link there, `EBUSY` for an `rmdir` of `/dev/pts` and `EXDEV` for a
+  `rename` out of `/proc`. A `link` to a new name in `/proc` is `EXDEV`,
+  where Linux's lookup of the name finds nothing first (`ENOENT`).
+- **`O_PATH` of `/dev/tty`**: it opens the controlling terminal as any
+  open does, so without one it fails (`ENOENT`), where Linux's `O_PATH`
+  opens the name without the device.
 - **Changing the generated files, in part**: a new mode or owner of
   `/dev`, its devices and links, `/proc` or `/proc`'s system-wide files, which only
   root may give these files of root's, is `EPERM`, where Linux keeps it;

@@ -95,7 +95,8 @@ static void show_sigsys(const char *who) {
 }
 
 int main(int argc, char **argv) {
-    self = argv[0];
+    /* The harness gives the program's own path after the case's name. */
+    self = argc > 2 ? argv[2] : argv[0];
     if (argc > 1 && strcmp(argv[1], "after-exec") == 0) {
         show_sigsys("after exec");
         return 0;

@@ -176,6 +176,14 @@ for them, compiles it and maps the code into memory that is never writable
 and executable at once. Until the code is ready, and when compiling fails,
 the interpreter runs the block as before.
 
+A block is decoded again when the code generation moves, which every `mmap`,
+`brk`, `mprotect` and `munmap` that changes a mapping does, and when its slot
+is emptied or taken by another block. Such a block at an address that was
+compiled before is handed to the compiler on its second entry, once its first
+has grown it, rather than after the threshold again. The compiler keeps the
+code of the forms it compiled, so the same forms get the same code back
+without compiling.
+
 Compiled code means exactly what the interpreter's forms mean. It reads and
 writes the thread's registers where the interpreter keeps them, in memory,
 with nothing copied in or out. A load or store of up to 8 bytes within one

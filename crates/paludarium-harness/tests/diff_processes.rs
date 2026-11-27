@@ -271,6 +271,7 @@ mod linux {
                     | "sysvipc-proc"
                     | "proc-net"
                     | "proc-net-sockets"
+                    | "proc-net-groups"
                     | "kernel-sysctl"
                     | "uts-sysctl"
                     | "uts-sysctl-poll"
@@ -710,6 +711,7 @@ mod linux {
         veth_ipv6_traffic => ("veth-ipv6-traffic","veth-ipv6-traffic"),
         proc_net => ("proc-net","proc-net"),
         proc_net_sockets => ("proc-net-sockets","proc-net-sockets"),
+        proc_net_groups => ("proc-net-groups","proc-net-groups"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

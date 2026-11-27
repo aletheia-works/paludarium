@@ -4778,6 +4778,14 @@ kernel.
     0 (`fib_flag_trans`); `ipv6_route`
     (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
+    first, with their users, under a line of the device with how many it
+    has and the querier `V3`: no IGMP report is sent or heard, so no timer
+    runs and no device is the reporter. `mcfilter` and `mcfilter6`
+    (`igmp_mcf_seq_show`, `igmp6_mcf_seq_show`), the sources the
+    memberships of each group name, with how many include and how many
+    exclude each, from the first device whose newest group names one, as
+    Linux's begin there.
   - `tcp`, `tcp6`, `udp` and `udp6`, the sockets `sock_diag` tells of, but
     for TCP ones bound alone, in the format of Linux 7.0's `tcp4_seq_show` and
     the like: first the listeners, then the connections, with those in

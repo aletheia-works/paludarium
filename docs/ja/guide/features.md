@@ -4101,6 +4101,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     IPv6 のゲートウェイ（`RTA_VIA`）は 00000000 で、その先頭 4 バイトが 0 でなければ `RTF_GATEWAY` です（`fib_flag_trans`）。
     `ipv6_route`（`ipv6_route_native_seq_show`）は IPv6 の表ごとの経路で、参照はどれも 1 です。
     `arp`（`arp_seq_show`）は、ARP の要る IPv4 の近隣です。
+  - `igmp`（`igmp_mc_seq_show`）は、デバイスごとの IPv4 のグループで、新しいものから順に、
+    その利用者の数と並びます。その上には、デバイスの行があり、グループの数と問い合わせ元の
+    `V3` を示します。IGMP のレポートは送りも受けもしないので、タイマーは動かず、レポートした
+    デバイスもありません。`mcfilter` と `mcfilter6`（`igmp_mcf_seq_show`、`igmp6_mcf_seq_show`）は、
+    各グループのメンバーシップが挙げる送信元で、それぞれを含めるものと除くものの数と並びます。
+    Linux と同じく、最も新しいグループが送信元を挙げる最初のデバイスから始まります。
   - `tcp`、`tcp6`、`udp`、`udp6` は、`sock_diag` が伝えるソケットで、バインドしただけの TCP の
     ものを除きます。形式は Linux 7.0 の `tcp4_seq_show` などと同じで、待ち受けるもの、続けて
     `TIME_WAIT` のものを含む接続の順です。`unix`（`unix_seq_show`）には、まだ受け付けていない

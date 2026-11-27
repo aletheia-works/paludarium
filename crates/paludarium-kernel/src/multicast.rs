@@ -116,7 +116,7 @@ impl<A: Copy + PartialEq> Filter<A> {
 
 /// How many memberships of each mode there are: those that exclude, and
 /// those that include.
-type Counts = [u32; 2];
+pub(crate) type Counts = [u32; 2];
 
 /// A group a device has joined (`ip_mc_list`, `ifmcaddr6`): how many times
 /// it has been, by memberships of which modes (`sfcount`), and the sources
@@ -230,6 +230,14 @@ impl<A: Copy + PartialEq> Groups<A> {
             .find(|(s, _)| *s == source)
             .map_or([0; 2], |(_, counts)| *counts);
         include != 0 || exclude != g.modes[Mode::Exclude as usize]
+    }
+    /// The groups, the newest first, each with its users and its sources,
+    /// those first named first, by how many memberships of each mode name
+    /// them (`/proc/net/igmp` and `mcfilter`).
+    pub(crate) fn shown(&self) -> impl Iterator<Item = (A, u32, &[(A, Counts)])> {
+        self.list
+            .iter()
+            .map(|g| (g.group, g.users, g.sources.as_slice()))
     }
 }
 /// The source a device's filters look at, none for an unspecified one.

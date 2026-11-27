@@ -131,10 +131,13 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `ipv6_route`,
-  `route` and those of the sockets (see [features](./features)) alone; `igmp`,
-  `snmp`, `sockstat` and the rest are `ENOENT`, and no counter is kept, so
-  those of `dev` are 0. A session with no network has files of no device and
+- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `igmp`,
+  `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the sockets
+  (see [features](./features)) alone; `igmp6`, `dev_mcast`, `snmp`,
+  `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
+  `dev` are 0. `mcfilter6` takes the IPv6 group a socket joined last as a
+  device's newest, where Linux may have joined one of its own since, such as
+  a new address's solicited-node group. A session with no network has files of no device and
   no Internet socket. Of a socket, its address in the kernel is 0, its
   references are the same for each of a kind, the memory its unsent
   datagrams and messages take is 0, and so is a TCP connection's `quick` with

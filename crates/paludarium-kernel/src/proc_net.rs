@@ -22,6 +22,7 @@ pub(crate) enum File {
     Tcp,
     Udp,
     Icmp,
+    Igmp,
     Raw6,
     Tcp6,
     Udp6,
@@ -31,6 +32,8 @@ pub(crate) enum File {
     Packet,
     Netlink,
     IfInet6,
+    Mcfilter,
+    Mcfilter6,
     Ipv6Route,
 }
 /// What a file shows of, as it was opened: the network, its AF_UNIX sockets,
@@ -43,13 +46,14 @@ pub(crate) struct Source {
 impl File {
     /// The files, in the order Linux's `proc_readdir_de` lists them: by the
     /// length of their names, then by name.
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 19] = [
         Self::Arp,
         Self::Dev,
         Self::Raw,
         Self::Tcp,
         Self::Udp,
         Self::Icmp,
+        Self::Igmp,
         Self::Raw6,
         Self::Tcp6,
         Self::Udp6,
@@ -59,6 +63,8 @@ impl File {
         Self::Packet,
         Self::Netlink,
         Self::IfInet6,
+        Self::Mcfilter,
+        Self::Mcfilter6,
         Self::Ipv6Route,
     ];
     pub(crate) fn name(self) -> &'static [u8] {
@@ -69,6 +75,7 @@ impl File {
             Self::Tcp => b"tcp",
             Self::Udp => b"udp",
             Self::Icmp => b"icmp",
+            Self::Igmp => b"igmp",
             Self::Raw6 => b"raw6",
             Self::Tcp6 => b"tcp6",
             Self::Udp6 => b"udp6",
@@ -78,6 +85,8 @@ impl File {
             Self::Packet => b"packet",
             Self::Netlink => b"netlink",
             Self::IfInet6 => b"if_inet6",
+            Self::Mcfilter => b"mcfilter",
+            Self::Mcfilter6 => b"mcfilter6",
             Self::Ipv6Route => b"ipv6_route",
         }
     }
@@ -117,6 +126,9 @@ impl File {
             Self::Dev => dev(network),
             Self::Route => route(network, now),
             Self::IfInet6 => if_inet6(network, now),
+            Self::Igmp => igmp(network),
+            Self::Mcfilter => mcfilter(network),
+            Self::Mcfilter6 => mcfilter6(network),
             Self::Ipv6Route => ipv6_route(network, now),
         }
         .into_bytes()
@@ -350,6 +362,114 @@ fn arp(network: Option<&Network>, now: Option<u64>) -> String {
             lladdr.join(":"),
         );
     }
+    out
+}
+
+/// The devices in the order they were registered in the namespace, as
+/// `for_each_netdev` goes through them.
+fn registered(devices: &crate::netdev::Devices) -> impl Iterator<Item = &crate::netdev::Device> {
+    devices
+        .order()
+        .into_iter()
+        .filter_map(|index| devices.by_index(index))
+}
+/// `igmp`, as `igmp_mc_seq_show` prints it: under a line of each device
+/// that has joined a group, with how many it has and the querier taken to be
+/// there (`V3`, as none is heard), its groups, the newest first. No report is
+/// sent, so no timer runs and no device is the last to report. The devices
+/// are in the order they were registered in.
+fn igmp(network: Option<&Network>) -> String {
+    let mut out = String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
+    let Some(network) = network else { return out };
+    let devices = network.devices();
+    for device in registered(&devices) {
+        let groups: Vec<_> = device.groups4.shown().collect();
+        if groups.is_empty() {
+            continue;
+        }
+        let name = String::from_utf8_lossy(&device.name);
+        let _ = writeln!(
+            out,
+            "{}\t{name:<10}: {:5} {:>7}",
+            device.index,
+            groups.len(),
+            "V3"
+        );
+        for (group, users, _) in groups {
+            // The address as it is in memory, of a little-endian machine.
+            let group = u32::from_le_bytes(group.octets());
+            let _ = writeln!(out, "\t\t\t\t{group:08X} {users:5} 0:00000000\t\t0");
+        }
+    }
+    out
+}
+/// The lines of `mcfilter` or `mcfilter6`, as `igmp_mcf_seq_show` and
+/// `igmp6_mcf_seq_show` print them, of the devices' `groups`, each with its
+/// index and name: a line for each source a group's memberships name, but
+/// for those of the devices before the first whose newest group names one,
+/// as `igmp_mcf_get_first` and `igmp6_mcf_get_first` begin there.
+fn sources<'g, A: Copy + 'g>(
+    out: &mut String,
+    groups: impl Iterator<
+        Item = (
+            i32,
+            String,
+            Vec<(A, u32, &'g [(A, crate::multicast::Counts)])>,
+        ),
+    >,
+    address: impl Fn(A) -> String,
+) {
+    let mut started = false;
+    for (index, name, groups) in groups {
+        started |= groups
+            .first()
+            .is_some_and(|(_, _, sources)| !sources.is_empty());
+        if !started {
+            continue;
+        }
+        for (group, _, sources) in groups {
+            for &(source, [exclude, include]) in sources {
+                let _ = writeln!(
+                    out,
+                    "{index:3} {name:>6.6} {} {} {include:6} {exclude:6}",
+                    address(group),
+                    address(source),
+                );
+            }
+        }
+    }
+}
+/// `mcfilter`, the sources of IPv4's groups.
+fn mcfilter(network: Option<&Network>) -> String {
+    let mut out = String::from("Idx Device        MCA        SRC    INC    EXC\n");
+    let Some(network) = network else { return out };
+    let devices = network.devices();
+    let groups = registered(&devices).map(|d| {
+        let name = String::from_utf8_lossy(&d.name).into_owned();
+        (d.index, name, d.groups4.shown().collect())
+    });
+    sources(&mut out, groups, |ip: Ipv4Addr| {
+        format!("0x{:08x}", u32::from(ip))
+    });
+    out
+}
+/// `mcfilter6`, the sources of IPv6's groups, of the devices that have IPv6
+/// (`__in6_dev_get`): not a veth end of an MTU below 1280.
+fn mcfilter6(network: Option<&Network>) -> String {
+    let mut out = String::from(
+        "Idx Device                Multicast Address                   Source Address    INC    EXC\n",
+    );
+    let Some(network) = network else { return out };
+    let devices = network.devices();
+    let groups = registered(&devices)
+        .filter(|d| d.veth.as_ref().is_none_or(|v| v.mtu >= 1280))
+        .map(|d| {
+            let name = String::from_utf8_lossy(&d.name).into_owned();
+            (d.index, name, d.groups6.shown().collect())
+        });
+    sources(&mut out, groups, |ip: Ipv6Addr| {
+        format!("{:032x}", u128::from(ip))
+    });
     out
 }
 
@@ -611,6 +731,7 @@ mod tests {
             assert_eq!(File::named(file.name()), Some(file));
         }
         assert_eq!(File::named(b"snmp"), None);
+        assert_eq!(File::named(b"igmp6"), None);
     }
 
     #[test]
@@ -677,6 +798,55 @@ mod tests {
     }
 
     #[test]
+    fn the_first_namespace_has_lo_in_all_hosts() {
+        let network = || Network::new(NetworkPolicy::default());
+        assert_eq!(
+            text(File::Igmp, network()),
+            "Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n\
+             1\tlo        :     1      V3\n\
+             \t\t\t\t010000E0     1 0:00000000\t\t0\n"
+        );
+        assert_eq!(text(File::Mcfilter, network()).lines().count(), 1);
+        assert_eq!(text(File::Mcfilter6, network()).lines().count(), 1);
+    }
+
+    #[test]
+    fn sources_begin_at_the_first_device_whose_newest_group_names_one() {
+        let group = |n: u8| Ipv4Addr::new(239, 0, 0, n);
+        let named: &[(Ipv4Addr, crate::multicast::Counts)] =
+            &[(Ipv4Addr::new(10, 0, 0, 1), [1, 2])];
+        let devices = |first: bool| {
+            vec![
+                (
+                    1,
+                    "lo".to_owned(),
+                    vec![
+                        (group(1), 1, if first { named } else { &[] }),
+                        (group(2), 1, named),
+                    ],
+                ),
+                (
+                    2,
+                    "a-long-name".to_owned(),
+                    vec![(group(4), 1, named), (group(3), 1, &[][..])],
+                ),
+            ]
+        };
+        let lines = |first| {
+            let mut out = String::new();
+            sources(&mut out, devices(first).into_iter(), |ip: Ipv4Addr| {
+                ip.to_string()
+            });
+            out
+        };
+        assert_eq!(
+            lines(false),
+            "  2 a-long 239.0.0.4 10.0.0.1      2      1\n"
+        );
+        assert_eq!(lines(true).lines().count(), 3);
+    }
+
+    #[test]
     fn a_session_without_a_network_has_no_device() {
         assert_eq!(
             File::Dev
@@ -688,6 +858,15 @@ mod tests {
         );
         for file in [File::Route, File::IfInet6, File::Ipv6Route] {
             assert!(file.text(&source(None), None).is_empty());
+        }
+        for file in [File::Igmp, File::Mcfilter, File::Mcfilter6] {
+            assert_eq!(
+                file.text(&source(None), None)
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count(),
+                1
+            );
         }
     }
 }

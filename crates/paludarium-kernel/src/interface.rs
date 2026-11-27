@@ -4572,29 +4572,29 @@ impl Addresses {
         }
         best.map(|a| a.address)
     }
-    /// The address a connection of the protocol `proto` to `to` leaves
-    /// from: its route's
+    /// The address a connection of the protocol and ports `keys` to `to`
+    /// leaves from, of the hop they hash to: its route's
     /// ([`Self::source4`], [`Self::source6`], [`Self::select6`]); where
     /// that has none, 0.0.0.0 or `::` out through a veth end
     /// (`inet_select_addr` finding no address of a scope to fit, or
     /// `ipv6_dev_get_saddr` none at all), else `127.0.0.1` or `::1`.
-    pub(crate) fn source(&self, to: IpAddr, proto: u8, order: &[i32]) -> IpAddr {
+    pub(crate) fn source(&self, to: IpAddr, keys: crate::multipath::Flow, order: &[i32]) -> IpAddr {
         match to {
-            IpAddr::V4(ip) => IpAddr::V4(
-                match self.output4(ip, 0, 0, None, crate::multipath::Flow::of(proto), order) {
-                    Ok(r) => self
-                        .source4(&r, ip, order)
-                        .unwrap_or(if r.oif == LOOPBACK_OIF {
-                            Ipv4Addr::LOCALHOST
-                        } else {
-                            Ipv4Addr::UNSPECIFIED
-                        }),
-                    Err(_) => Ipv4Addr::LOCALHOST,
-                },
-            ),
+            IpAddr::V4(ip) => IpAddr::V4(match self.output4(ip, 0, 0, None, keys, order) {
+                Ok(r) => self
+                    .source4(&r, ip, order)
+                    .unwrap_or(if r.oif == LOOPBACK_OIF {
+                        Ipv4Addr::LOCALHOST
+                    } else {
+                        Ipv4Addr::UNSPECIFIED
+                    }),
+                Err(_) => Ipv4Addr::LOCALHOST,
+            }),
             IpAddr::V6(ip) => {
                 let flow = Flow6 {
-                    proto,
+                    proto: keys.proto,
+                    sport: keys.sport,
+                    dport: keys.dport,
                     ..Flow6::default()
                 };
                 IpAddr::V6(self.source6_through(ip, 0, &flow, order))
@@ -4936,7 +4936,11 @@ mod tests {
         assert!(a.local4("10.1.2.77".parse().unwrap()));
         assert!(!a.bindable4("10.2.0.1".parse().unwrap()));
         assert_eq!(
-            a.source("10.1.2.77".parse().unwrap(), 0, &[1]),
+            a.source(
+                "10.1.2.77".parse().unwrap(),
+                crate::multipath::Flow::of(0),
+                &[1]
+            ),
             "10.1.2.3".parse::<IpAddr>().unwrap()
         );
         // IPv6: global first, newest first; the prefix route in the main
@@ -5087,7 +5091,11 @@ mod tests {
         a.add_route4(&local, &|_| true).unwrap();
         assert!(a.bindable4("10.7.1.1".parse().unwrap()));
         assert_eq!(
-            a.source("10.7.1.1".parse().unwrap(), 0, &[1]),
+            a.source(
+                "10.7.1.1".parse().unwrap(),
+                crate::multipath::Flow::of(0),
+                &[1]
+            ),
             "10.7.1.1".parse::<IpAddr>().unwrap()
         );
         // Down: the routes of link scope go, the default table's too; host
@@ -5565,7 +5573,7 @@ mod tests {
                 .unwrap();
             let src = if route.oif == 1000 { own } else { other };
             assert_eq!(
-                Some(a.source(IpAddr::V4(to), 0, &order)),
+                Some(a.source(IpAddr::V4(to), crate::multipath::Flow::of(0), &order)),
                 src.map(IpAddr::V4)
             );
         }

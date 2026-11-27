@@ -3775,11 +3775,17 @@ fn a_new_network_namespace_has_only_a_loopback_that_starts_down() {
     assert_eq!(loopback_field(&mut f, udp, 0x8913), 0x49);
     assert_eq!(f.ret(49, [v6, DATA + 0x500, 28, 0, 0, 0]), 0);
     inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 5001);
-    assert_eq!(f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    // The sends that failed bound it to a port first (`inet_send_prepare`).
+    assert_eq!(
+        f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    let receiver = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(f.ret(49, [receiver, DATA + 0x100, 16, 0, 0, 0]), 0);
     let sender = f.ret(41, [2, 2, 0, 0, 0, 0]);
     f.mem.write(GuestAddr(DATA), b"hi").unwrap();
     assert_eq!(f.ret(44, [sender, DATA, 2, 0, DATA + 0x100, 16]), 2);
-    assert_eq!(f.ret(45, [udp, DATA + 0x200, 8, 0x40, 0, 0]), 2);
+    assert_eq!(f.ret(45, [receiver, DATA + 0x200, 8, 0x40, 0, 0]), 2);
     // No DNS stub: a query to port 53 finds no socket, as any datagram.
     inet_address(&f, DATA + 0x100, [127, 0, 0, 53], 53);
     assert_eq!(f.ret(44, [sender, DATA, 2, 0, DATA + 0x100, 16]), 2);

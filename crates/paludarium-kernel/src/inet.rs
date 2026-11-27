@@ -484,15 +484,16 @@ impl Network {
     /// [`Self::route4_through`] routes it.
     ///
     /// Of an IPv6 multipath route, the hop the flow takes: from `from`, of
-    /// the protocol `proto`, with no flow label, as the guest's sockets
-    /// send none ([`Self::flow6`]); of an IPv4 one, the hop a packet from
-    /// `from` takes ([`crate::interface::Addresses::output4`]).
+    /// the protocol and ports `keys`, with no flow label, as the guest's
+    /// sockets send none ([`Self::flow6`]); of an IPv4 one, the hop a
+    /// packet from `from` of `keys` takes
+    /// ([`crate::interface::Addresses::output4`]).
     fn route(
         &self,
         to: SocketAddr,
         from: Option<IpAddr>,
         (oif, strict): (u32, bool),
-        proto: u8,
+        keys: crate::multipath::Flow,
         now: Option<u64>,
     ) -> Result<Dest, Errno> {
         let to = if oif != 0 && to.is_ipv6() && !from.is_some_and(|ip| plain(ip).is_ipv4()) {
@@ -505,7 +506,7 @@ impl Network {
             && !ip.is_unspecified()
         {
             use crate::interface::Kind;
-            let (route, _) = self.route6(ip, from, (oif, strict), proto, now)?;
+            let (route, _) = self.route6(ip, from, (oif, strict), keys, now)?;
             return match route.kind {
                 Kind::Local if self.is_up() => Ok(Dest::Here(to)),
                 Kind::Unicast | Kind::Multicast if route.oif != crate::netdev::LOOPBACK_OIF => {
@@ -556,16 +557,9 @@ impl Network {
                 let found = match to.ip() {
                     IpAddr::V4(ip) => self
                         .addresses_at(now)
-                        .output4(
-                            ip,
-                            0,
-                            0,
-                            source4(from),
-                            crate::multipath::Flow::of(proto),
-                            &order,
-                        )
+                        .output4(ip, 0, 0, source4(from), keys, &order)
                         .map(Some),
-                    IpAddr::V6(ip) => self.route6(ip, from, (0, false), proto, now).map(|_| None),
+                    IpAddr::V6(ip) => self.route6(ip, from, (0, false), keys, now).map(|_| None),
                 };
                 // A rejecting route's error (`fib_props`, `fib6_prop`).
                 match &found {
@@ -601,7 +595,7 @@ impl Network {
                 // IPv6's unicast routes through a veth end, and the
                 // multicast one each end has (`addrconf_add_mroute`).
                 if let IpAddr::V6(ip) = to.ip()
-                    && let Ok((route, _)) = self.route6(ip, from, (0, false), proto, now)
+                    && let Ok((route, _)) = self.route6(ip, from, (0, false), keys, now)
                     && matches!(route.kind, Kind::Unicast | Kind::Multicast)
                     && route.oif != crate::netdev::LOOPBACK_OIF
                     && let Ok(index) = i32::try_from(route.oif)
@@ -628,10 +622,10 @@ impl Network {
         ip: Ipv6Addr,
         from: Option<IpAddr>,
         (oif, strict): (u32, bool),
-        proto: u8,
+        keys: crate::multipath::Flow,
         now: Option<u64>,
     ) -> Result<(Route6, u64), Errno> {
-        let flow = Self::flow6(from, proto);
+        let flow = Self::flow6(from, keys);
         let strict = oif == 0
             || strict
             || from.is_none_or(|ip| ip.is_unspecified())
@@ -647,13 +641,14 @@ impl Network {
         Ok((route, addresses.serial6()))
     }
     /// The route to the IPv6 address of `dest`, which [`Self::route`] gave
-    /// for `to` from `from`, as a connected UDP socket keeps it.
+    /// for `to` from `from` of `keys`, as a connected UDP socket keeps it.
     fn kept6(
         &self,
         dest: Dest,
         to: SocketAddr,
         from: Option<IpAddr>,
         through: (u32, bool),
+        keys: crate::multipath::Flow,
         now: Option<u64>,
     ) -> Option<Kept6> {
         let to = match dest {
@@ -664,7 +659,7 @@ impl Network {
         let IpAddr::V6(ip) = to.ip() else {
             return None;
         };
-        let (route, serial) = self.route6(ip, from, through, FLOW_UDP, now).ok()?;
+        let (route, serial) = self.route6(ip, from, through, keys, now).ok()?;
         Some(Kept6 {
             dest,
             route,
@@ -755,6 +750,9 @@ impl Network {
             src: Some(IpAddr::V4(to)),
             oif: there.answer_oif(IpAddr::V4(to), flow, peer_index),
             proto: flow.proto,
+            sport: flow.dport,
+            dport: flow.own_port,
+            own_port: flow.dport,
             bound: 0,
             port: None,
         };
@@ -902,14 +900,7 @@ impl Network {
             let order = there.devices().order();
             let route = there
                 .addresses_at(now)
-                .output4(
-                    from,
-                    0,
-                    0,
-                    Some(to),
-                    crate::multipath::Flow::of(flow.proto),
-                    &order,
-                )
+                .output4(from, 0, 0, Some(to), flow.keys(), &order)
                 .ok()
                 .filter(|r| r.kind == crate::interface::Kind::Unicast)?;
             i32::try_from(route.oif).ok()?
@@ -1031,7 +1022,7 @@ impl Network {
         flow: &Flow,
         now: Option<u64>,
     ) -> Reach {
-        let hop = self.next_hop6(index, to, &Self::flow6(flow.src, flow.proto), now);
+        let hop = self.next_hop6(index, to, &Self::flow6(flow.src, flow.keys()), now);
         let Some(lladdr) = self.neighbour6(index, Some(from), hop, now) else {
             return Reach::Unanswered;
         };
@@ -1052,10 +1043,10 @@ impl Network {
             0 if from.is_unicast_link_local() => peer_index.unsigned_abs(),
             oif => oif,
         };
-        let back = self.back6(&there, from, to, oif, flow.proto, now);
+        let back = self.back6(&there, from, to, oif, flow.keys().reversed(), now);
         Self::answered(there, flow, oif, back)
     }
-    /// [`Self::back4`] of an IPv6 answer of the protocol `proto`, routed
+    /// [`Self::back4`] of an IPv6 answer of the protocol and ports `keys`, routed
     /// with the device `oif` named (0 for none): its next hop must be an
     /// address of the end it comes in on, as neighbour discovery finds it
     /// ([`crate::interface::Addresses::nd_target`]), and this namespace must
@@ -1069,10 +1060,10 @@ impl Network {
         from: Ipv6Addr,
         to: Ipv6Addr,
         oif: u32,
-        proto: u8,
+        keys: crate::multipath::Flow,
         now: Option<u64>,
     ) -> Option<(i32, i32)> {
-        let flow = Self::flow6(Some(IpAddr::V6(to)), proto);
+        let flow = Self::flow6(Some(IpAddr::V6(to)), keys);
         let route = there
             .addresses_at(now)
             .lookup6_flow(from, oif, &flow)
@@ -1199,19 +1190,19 @@ impl Network {
         }
     }
     /// The flow of a packet from `from` (the address a socket is bound
-    /// to, none for an unbound one) of the protocol `proto`, which chooses
-    /// among an IPv6 multipath route's hops (`rt6_multipath_hash`): its
-    /// IPv6 source, or `::`, and no flow label.
-    fn flow6(from: Option<IpAddr>, proto: u8) -> Flow6 {
+    /// to, none for an unbound one) of the protocol and ports `keys`, which
+    /// chooses among an IPv6 multipath route's hops (`rt6_multipath_hash`):
+    /// its IPv6 source, or `::`, and no flow label.
+    fn flow6(from: Option<IpAddr>, keys: crate::multipath::Flow) -> Flow6 {
         Flow6 {
             src: match from.map(plain) {
                 Some(IpAddr::V6(ip)) => Some(ip),
                 _ => None,
             },
             label: 0,
-            proto,
-            sport: 0,
-            dport: 0,
+            proto: keys.proto,
+            sport: keys.sport,
+            dport: keys.dport,
         }
     }
     /// The neighbour an IPv4 packet to `to` out through the veth end
@@ -1221,14 +1212,7 @@ impl Network {
     fn next_hop4(&self, index: i32, to: Ipv4Addr, flow: &Flow, now: Option<u64>) -> IpAddr {
         let order = self.devices().order();
         self.addresses_at(now)
-            .output4(
-                to,
-                0,
-                flow.oif,
-                source4(flow.src),
-                crate::multipath::Flow::of(flow.proto),
-                &order,
-            )
+            .output4(to, 0, flow.oif, source4(flow.src), flow.keys(), &order)
             .ok()
             .filter(|r| i64::from(r.oif) == i64::from(index) && r.uses_gateway)
             .and_then(|r| r.gateway)
@@ -1343,12 +1327,22 @@ impl Network {
     /// This namespace answers what came from `from` to its `to` at `now`
     /// (a TCP handshake's, or ICMP's port unreachable): what it sends back
     /// takes its neighbour of `from`, as a packet of its own would
-    /// ([`Self::reach`]).
-    fn reply(&self, answer: &Back, from: IpAddr, to: IpAddr, proto: u8, now: Option<u64>) {
+    /// ([`Self::reach`]), of the protocol and ports `keys`.
+    fn reply(
+        &self,
+        answer: &Back,
+        from: IpAddr,
+        to: IpAddr,
+        keys: crate::multipath::Flow,
+        now: Option<u64>,
+    ) {
         let flow = Flow {
             src: Some(to),
             oif: answer.oif,
-            proto,
+            proto: keys.proto,
+            sport: keys.sport,
+            dport: keys.dport,
+            own_port: keys.sport,
             bound: 0,
             port: None,
         };
@@ -1531,7 +1525,7 @@ impl Network {
         &self,
         to: SocketAddr,
         oif: u32,
-        proto: u8,
+        keys: crate::multipath::Flow,
         now: Option<u64>,
     ) -> IpAddr {
         use crate::interface::{SCOPE_LINK, SCOPE_UNIVERSE};
@@ -1554,10 +1548,10 @@ impl Network {
             return IpAddr::V4(picked.unwrap_or(Ipv4Addr::UNSPECIFIED));
         }
         if let IpAddr::V6(ip) = to.ip() {
-            let flow = Self::flow6(None, proto);
+            let flow = Self::flow6(None, keys);
             return IpAddr::V6(addresses.source6_through(ip, oif, &flow, &order));
         }
-        addresses.source(to.ip(), proto, &order)
+        addresses.source(to.ip(), keys, &order)
     }
     /// Whether a socket may bind to `ip`: the unspecified address, an IPv4
     /// multicast or limited broadcast one, one a local or broadcast route
@@ -1943,6 +1937,10 @@ struct State {
     /// gives too and a disconnect keeps.
     ip_id: u16,
     txhash: u32,
+    /// The source port a TCP connection's route hashes: its own, where it
+    /// was bound to one before `connect`, else a random one
+    /// (`FLOWI_FLAG_ANY_SPORT`).
+    route_sport: u16,
     /// A connection's first sequence numbers and timestamps, once a filter
     /// may look at its handshake.
     names: Option<crate::loopback::Names>,
@@ -2096,18 +2094,31 @@ enum Cast {
 }
 /// What the route a packet takes is looked up with, which chooses among a
 /// multipath route's hops: the source (the address a socket is bound to,
-/// none for an unbound one), the device named (0 for none) and the
-/// protocol.
+/// none for an unbound one), the device named (0 for none), the protocol
+/// and the ports.
 struct Flow {
     src: Option<IpAddr>,
     oif: u32,
     proto: u8,
+    /// The ports a hash takes: the socket's own, or the random one a
+    /// connection that has none yet hashes (`FLOWI_FLAG_ANY_SPORT`), and
+    /// the destination's.
+    sport: u16,
+    dport: u16,
+    /// The socket's own port, which answers go to and hash.
+    own_port: u16,
     /// The device the socket is bound to, 0 for none.
     bound: u32,
     /// The port a TCP connection goes to, whose listener's answer goes out
     /// through the device that is bound to; else answers go by their route
     /// alone.
     port: Option<u16>,
+}
+impl Flow {
+    /// The keys of its hash besides its addresses.
+    fn keys(&self) -> crate::multipath::Flow {
+        crate::multipath::Flow::socket(self.proto, self.sport, self.dport)
+    }
 }
 /// Where an answer goes out: through the veth end `index`, by a lookup with
 /// the device `oif` named (0 for none).
@@ -2875,11 +2886,20 @@ impl InetSocket {
                     {
                         self.mapped_source(bound)?;
                     }
+                    // `ip_route_connect`: one with no port of its own yet
+                    // hashes a random one (`FLOWI_FLAG_ANY_SPORT`), as the
+                    // lookups after its port is bound do too.
+                    s.route_sport = match s.bound {
+                        Some(bound) => bound.port(),
+                        None => u16::from_le_bytes(self.random()),
+                    };
+                    let keys =
+                        crate::multipath::Flow::socket(FLOW_TCP, s.route_sport, plain_to.port());
                     let dest = self.network.route(
                         plain_to,
                         s.source(),
                         (device, true),
-                        FLOW_TCP,
+                        keys,
                         self.now(),
                     )?;
                     let to = match dest {
@@ -2931,7 +2951,7 @@ impl InetSocket {
                                 // to the address the connection leaves from.
                                 let from = match s.bound.map(|b| b.ip()).or(s.address) {
                                     Some(ip) if !ip.is_unspecified() => ip,
-                                    _ => self.network.source_through(to, 0, FLOW_TCP, self.now()),
+                                    _ => self.network.source_through(to, 0, keys, self.now()),
                                 };
                                 self.network.output(from, self.now());
                                 return self.refused(&mut s, address);
@@ -3175,12 +3195,13 @@ impl InetSocket {
             IpAddr::V4(_) => options.device4(device),
         };
         let through = (oif, device != 0);
-        let route = self
-            .network
-            .route(to, source, through, FLOW_UDP, self.now())?;
+        let keys = crate::multipath::Flow::socket(FLOW_UDP, bound.port(), to.port());
+        let route = self.network.route(to, source, through, keys, self.now())?;
         // `ip6_datagram_dst_update`; IPv4's is looked up again from the
         // source, which gives what a send's own lookup does.
-        let kept = self.network.kept6(route, to, source, through, self.now());
+        let kept = self
+            .network
+            .kept6(route, to, source, through, keys, self.now());
         match route {
             Dest::Here(to) => {
                 let from = self.datagram_source(s, to, oif, options)?;
@@ -3345,7 +3366,8 @@ impl InetSocket {
             if group && !address.is_unspecified() {
                 IpAddr::V4(address)
             } else {
-                self.network.source_through(to, oif, FLOW_UDP, self.now())
+                let keys = crate::multipath::Flow::socket(FLOW_UDP, bound.port(), to.port());
+                self.network.source_through(to, oif, keys, self.now())
             }
         } else {
             bound.ip()
@@ -3384,6 +3406,9 @@ impl InetSocket {
         {
             self.mapped_source(bound)?;
         }
+        // Its port comes before its route, which hashes it
+        // (`inet_send_prepare`).
+        let sport = self.autobind(&mut s, &options)?.port();
         // Out through the scope ID's device, of an address that needs one,
         // else the socket's, the sticky `IPV6_PKTINFO`'s, or the one for a
         // group or another address (`udpv6_sendmsg`).
@@ -3405,6 +3430,9 @@ impl InetSocket {
             src: s.source(),
             oif,
             proto: FLOW_UDP,
+            sport,
+            dport: plain_to.port(),
+            own_port: sport,
             bound: options.device,
             port: None,
         };
@@ -3425,9 +3453,11 @@ impl InetSocket {
             None => {
                 let route = self
                     .network
-                    .route(plain_to, source, through, FLOW_UDP, now)?;
+                    .route(plain_to, source, through, flow.keys(), now)?;
                 if keeps {
-                    s.kept6 = self.network.kept6(route, plain_to, source, through, now);
+                    s.kept6 =
+                        self.network
+                            .kept6(route, plain_to, source, through, flow.keys(), now);
                 }
                 route
             }
@@ -3569,7 +3599,8 @@ impl InetSocket {
             if receiver.is_none()
                 && let Some(answer) = &answer
             {
-                there.reply(answer, from.ip(), to.ip(), FLOW_ICMPV6, self.now());
+                let keys = crate::multipath::Flow::of(FLOW_ICMPV6);
+                there.reply(answer, from.ip(), to.ip(), keys, self.now());
             }
             match receiver {
                 Some(receiver) => {
@@ -4647,11 +4678,12 @@ impl InetSocket {
         // `ip_route_connect` looks an IPv4 route up again from the source
         // its first lookup gave, which may take another hop of a
         // multipath one.
+        let keys = crate::multipath::Flow::socket(FLOW_TCP, s.route_sport, to.port());
         let index = match self.network.route(
             to,
             Some(from.ip()),
             (options.device, options.device != 0),
-            FLOW_TCP,
+            keys,
             self.now(),
         ) {
             Ok(Dest::Veth(index, _)) if to.is_ipv4() => index,
@@ -4665,6 +4697,9 @@ impl InetSocket {
             },
             oif: options.device,
             proto: FLOW_TCP,
+            sport: s.route_sport,
+            dport: to.port(),
+            own_port: from.port(),
             bound: options.device,
             port: Some(to.port()),
         };
@@ -4674,7 +4709,9 @@ impl InetSocket {
         {
             Reach::Answered(there, answer) => {
                 // Its SYN-ACK, or its reset, comes back.
-                there.reply(&answer, from.ip(), to.ip(), FLOW_TCP, self.now());
+                // `inet_csk_route_req`, `ip_send_unicast_reply`: its ports.
+                let keys = crate::multipath::Flow::socket(FLOW_TCP, to.port(), from.port());
+                there.reply(&answer, from.ip(), to.ip(), keys, self.now());
                 return Ok(self.join(&there, s, (bound, from), to, options, Some(index)));
             }
             Reach::OneWay(_) | Reach::Dropped => (SYN_TIMEOUT, ETIMEDOUT),
@@ -4841,9 +4878,10 @@ impl InetSocket {
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
+        let keys = crate::multipath::Flow::socket(FLOW_TCP, s.route_sport, to.port());
         let source = self
             .network
-            .source_through(to, options.device, FLOW_TCP, self.now());
+            .source_through(to, options.device, keys, self.now());
         let mut ports = self.ports();
         // One bound to a broadcast or multicast address takes its route's
         // source as its name too (`tcp_v4_connect`:
@@ -7130,7 +7168,7 @@ mod tests {
                     SocketAddr::new(IpAddr::V4(ip), 9),
                     None,
                     (0, false),
-                    0,
+                    crate::multipath::Flow::of(0),
                     Some(3 * SECOND)
                 )
                 .is_err()

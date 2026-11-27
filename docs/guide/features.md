@@ -3157,7 +3157,10 @@ kernel.
     it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
-    (`ip_route_connect`). A packet may come in on the device of any hop of
+    (`ip_route_connect`). A socket's flow hashes its own port, which a UDP
+    socket has before its route (`inet_send_prepare`, `inet_dgram_connect`),
+    and a connection with none yet a random one (`FLOWI_FLAG_ANY_SPORT`);
+    an answer hashes its own ports. A packet may come in on the device of any hop of
     the route back to its source (`fib_info_nh_uses_dev`), and its answer
     goes back by a lookup of its own, through whichever end that takes, or
     the one its listener is bound to. An output lookup that goes through

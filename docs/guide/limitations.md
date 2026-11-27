@@ -1240,11 +1240,10 @@ verified.
   `sk_rethink_txhash`), but here a connection's path is settled as it
   opens, so a hop whose answers do not come back fails it. An ICMPv6 error
   takes the hop of its own flow, where Linux's takes that of the packet
-  it tells of (`icmp6_send`). Under `fib_multipath_hash_policy` 1, and 3
-  with a port field, a socket's flow hashes with no ports, where Linux's
-  hashes its ports, and a random source port for one that has none yet
-  (`FLOWI_FLAG_ANY_SPORT`), so its hop may not be Linux's; the ports of
-  `RTM_GETROUTE` hash as Linux's do. A UDP
+  it tells of (`icmp6_send`). An IPv4 connection with no port of its own
+  yet hashes one random source port in each of its lookups, where Linux
+  draws a new one at each (`FLOWI_FLAG_ANY_SPORT` in `ip_route_connect`
+  and `ip_route_newports`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID

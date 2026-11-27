@@ -1431,6 +1431,22 @@ impl Kernel {
         reply
     }
 
+    /// A fault of `thread`'s own code at `addr` that ends in a signal: of
+    /// a user address or the `vsyscall` page, as Linux's
+    /// `do_user_addr_fault` has them, `page-faults` counted it as it
+    /// started, and `mm_account_fault` counts no error in `min_flt` or
+    /// `minor-faults`. One of a kernel address (`do_kern_addr_fault`)
+    /// counts nothing; so does a non-canonical one, a #GP on Linux.
+    fn signalled_fault(thread: &Thread, addr: u64, present: bool) {
+        if addr < vsyscall::TASK_SIZE_MAX || (vsyscall::START..vsyscall::END).contains(&addr) {
+            thread
+                .state
+                .cpu
+                .used
+                .unfinished_fault(paludarium_mmu::faults::At { addr, present });
+        }
+    }
+
     /// The fault of `thread` on a page the `userfaultfd` numbered `context`
     /// waits for ([`userfaultfd::fault`]): it waits, or with
     /// `UFFD_FEATURE_SIGBUS` takes SIGBUS (`BUS_ADRERR`), as Linux's
@@ -1475,11 +1491,11 @@ impl Kernel {
                 access.write,
                 access.fetch,
             );
-        } else if !sigbus {
+        } else {
             // Not tried again, it ends here: `page-faults` counted it as it
             // started (`do_user_addr_fault`), and `mm_account_fault` counts
-            // no `VM_FAULT_RETRY`. The instruction faults again after the
-            // signal.
+            // no `VM_FAULT_RETRY` or `VM_FAULT_SIGBUS`. After a signal to be
+            // taken the instruction faults again.
             thread
                 .state
                 .cpu
@@ -2090,6 +2106,7 @@ impl Kernel {
         // Running the `vsyscall` page, which Linux emulates before it looks
         // for a VMA (`do_user_addr_fault`).
         if let Some(address) = vsyscall::entered(&reason) {
+            Self::signalled_fault(thread, address, false);
             return self.vsyscall(thread, mem, address);
         }
         // A fault below a mapping that grows down extends it, and the
@@ -2165,6 +2182,7 @@ impl Kernel {
                 present,
             } => {
                 thread.cpu.rip = rip;
+                Self::signalled_fault(thread, addr.0, present);
                 Some(signals::PendingSignal {
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGSEGV,
@@ -2235,6 +2253,7 @@ impl Kernel {
                 poison,
             } => {
                 thread.cpu.rip = rip;
+                Self::signalled_fault(thread, addr.0, present);
                 Some(signals::PendingSignal {
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGBUS,

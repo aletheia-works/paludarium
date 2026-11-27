@@ -4997,6 +4997,47 @@ mod mprotect_order {
             Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
         );
     }
+
+    #[test]
+    fn a_fault_of_a_user_address_that_ends_in_a_signal_is_a_page_fault_alone() {
+        let mut f = fixture();
+        let rip = GuestAddr(0x1234);
+        let fault = |addr: u64| ExitReason::PageFault {
+            rip,
+            addr: GuestAddr(addr),
+            write: false,
+            fetch: false,
+            mapped: false,
+            present: false,
+        };
+        let bus = ExitReason::BusError {
+            rip,
+            addr: GuestAddr(0x50_0000),
+            write: false,
+            fetch: false,
+            present: false,
+            poison: false,
+        };
+        // A user address, the vsyscall page and a SIGBUS count; a kernel
+        // address and one past user space count nothing.
+        for (reason, counted) in [
+            (fault(0x40_0000), 1),
+            (fault(vsyscall::START), 1),
+            (bus, 1),
+            (fault(u64::MAX - 4095), 0),
+            (fault(vsyscall::TASK_SIZE_MAX), 0),
+        ] {
+            let was = f.thread.state.cpu.used.counts();
+            f.kernel.handle(&mut f.thread, &f.mem, reason);
+            let now = f.thread.state.cpu.used.counts();
+            // [minor, kernel, switches, migrations, major, unfinished]
+            assert_eq!(
+                (now[0] - was[0], now[5] - was[5]),
+                (0, counted),
+                "{reason:?}"
+            );
+        }
+    }
 }
 
 mod io_uring {

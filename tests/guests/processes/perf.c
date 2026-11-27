@@ -841,6 +841,109 @@ static int write_signal(volatile char *at) {
     return number;
 }
 
+/* The thread's faults: its minflt, and the page-faults and minor-faults
+   of its own code. */
+struct fault_counts {
+    long minflt;
+    uint64_t faults, minor;
+};
+static int fault_events[2];
+static void fault_counts(struct fault_counts *c) {
+    struct rusage usage;
+    getrusage(RUSAGE_THREAD, &usage);
+    c->minflt = usage.ru_minflt;
+    if (read(fault_events[0], &c->faults, 8) != 8 || read(fault_events[1], &c->minor, 8) != 8)
+        c->faults = c->minor = (uint64_t)-1;
+}
+
+static void read_byte(void *at) {
+    (void)*(volatile char *)at;
+}
+static void write_byte(void *at) {
+    *(volatile char *)at = 1;
+}
+static void run_code(void *at) {
+    ((void (*)(void))at)();
+}
+/* The vsyscall page's time(), which Linux emulates at its fault. */
+static void vsyscall_time(void *at) {
+    (void)at;
+    sink = (uint64_t)((long (*)(long *))0xffffffffff600400UL)(NULL);
+}
+
+/* Touches the stack below the caller's, where a signal frame goes: its
+   size follows the CPU's XSAVE features. */
+__attribute__((noinline)) static void touch_frames(void) {
+    volatile char below[64 * 1024];
+    for (size_t i = 0; i < sizeof below; i += 4096) below[i] = 0;
+}
+
+/* The signal `touch` of `at` raises (0 for none), and what it counts. */
+static void fault_row(const char *what, void (*touch)(void *), void *at) {
+    struct fault_counts was, now;
+    touch_frames();
+    fault_counts(&was);
+    int number = sigsetjmp(fault_jump, 1);
+    if (number == 0) touch(at);
+    fault_counts(&now);
+    say("%s: signal %d minflt %ld page-faults %ld minor-faults %ld", what, number, now.minflt - was.minflt,
+        (long)(now.faults - was.faults), (long)(now.minor - was.minor));
+}
+
+/* Faults that end in a signal: Linux counts page-faults as a fault of a
+   user address starts (do_user_addr_fault), the vsyscall page's among
+   them, and no min_flt or minor-faults for one that ends in an error
+   (mm_account_fault). A kernel address (do_kern_addr_fault) and a
+   non-canonical one, a #GP, count nothing. */
+static int case_fault_signals(void) {
+    const size_t PAGE = 4096;
+    struct attr a = software(2);
+    fault_events[0] = (int)open_event(&a, 0, -1, -1, 0);
+    a = software(5);
+    fault_events[1] = (int)open_event(&a, 0, -1, -1, 0);
+    struct sigaction s;
+    memset(&s, 0, sizeof s);
+    s.sa_handler = on_fault;
+    s.sa_flags = SA_NODEFER;
+    sigaction(SIGSEGV, &s, NULL);
+    sigaction(SIGBUS, &s, NULL);
+    /* The handler's and siglongjmp's pages, touched before the rows. */
+    if (sigsetjmp(fault_jump, 1) == 0) raise(SIGSEGV);
+    if (sigsetjmp(fault_jump, 1) == 0) raise(SIGBUS);
+    char *gone = mmap(NULL, PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(gone, PAGE);
+    char *none = mmap(NULL, PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *read_only = mmap(NULL, PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *data = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    data[0] = (char)0xc3; /* ret, on a page that cannot be run */
+    int memfd = (int)syscall(SYS_memfd_create, "past", 0);
+    char *file = MAP_FAILED;
+    if (memfd >= 0 && ftruncate(memfd, PAGE) == 0)
+        file = mmap(NULL, 2 * PAGE, PROT_READ, MAP_SHARED, memfd, 0);
+    /* UFFD_USER_MODE_ONLY, UFFD_FEATURE_SIGBUS, a missing page. */
+    int uffd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | 1);
+    uint64_t api[3] = {0xaa, 1 << 7, 0};
+    char *registered = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint64_t range[4] = {(uint64_t)registered, PAGE, 1, 0};
+    int armed = uffd >= 0 && ioctl(uffd, 0xc018aa3f /* UFFDIO_API */, api) == 0 &&
+                ioctl(uffd, 0xc020aa00 /* UFFDIO_REGISTER */, range) == 0;
+    say("set up: events %d file %d userfaultfd %d", fault_events[0] >= 0 && fault_events[1] >= 0,
+        file != MAP_FAILED, armed);
+    if (fault_events[0] < 0 || fault_events[1] < 0) return 1;
+    fault_row("present read", read_byte, data);
+    fault_row("unmapped read", read_byte, gone);
+    fault_row("PROT_NONE read", read_byte, none);
+    fault_row("read-only write", write_byte, read_only);
+    fault_row("no-exec run", run_code, data);
+    if (file != MAP_FAILED) fault_row("past the file's end", read_byte, file + PAGE);
+    if (armed) fault_row("userfaultfd SIGBUS", read_byte, registered);
+    fault_row("kernel address", read_byte, (void *)-4096L);
+    fault_row("non-canonical", read_byte, (void *)0x8000000000000000UL);
+    fault_row("vsyscall read", read_byte, (void *)0xffffffffff600000UL);
+    fault_row("vsyscall time", vsyscall_time, NULL);
+    return 0;
+}
+
 /* VmLck of /proc/self/status, in kB: -1 if not there. */
 static long locked_kb(void) {
     FILE *status = fopen("/proc/self/status", "r");
@@ -2394,6 +2497,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-side-band-comm")) return case_side_band_comm();
     if (!strcmp(mode, "perf-throttle")) return case_throttle();
     if (!strcmp(mode, "perf-clock-samples")) return case_clock_samples();
+    if (!strcmp(mode, "perf-fault-signals")) return case_fault_signals();
     if (!strcmp(mode, "perf-side-band-exec")) return case_side_band_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {

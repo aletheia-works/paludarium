@@ -366,8 +366,8 @@ verified.
   system call; its CPU time is looked at as the event is read, and its page
   faults count as they are taken. An event of
   a CPU counts those of every thread there, with the same limits.
-  A fault that ends in `SIGSEGV` or `SIGBUS` is not counted, where Linux
-  counts it in `page-faults`; a context switch is a sleep of the thread,
+  A fault of a system call's access that ends in `EFAULT` is not counted,
+  where Linux counts it in `page-faults`; a context switch is a sleep of the thread,
   not a preemption (but for a thread with `rseq` that gives its virtual CPU
   to another); and a thread without `rseq` moves to
   another CPU only when a new CPU mask changes the lowest CPU it allows.

@@ -4778,7 +4778,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   後の二つはカーネルが起こすので、Linux と同じく `exclude_kernel` で除きます。
   `userfaultfd` がやり直させたカーネルのアクセスのフォールトを数える `major-faults`
   （`page-faults` も数え、`minor-faults` は数えません。シグナルが `userfaultfd` の待ちを
-  終わらせたスレッドのコードのフォールトはやり直さないので、`page-faults` だけが数えます）と、
+  終わらせたスレッドのコードのフォールトはやり直さないので、`page-faults` だけが数えます。
+  `SIGSEGV` や `SIGBUS` で終わるフォールトも、Linux がユーザーのアドレスと `vsyscall`
+  のページのフォールトを始めるときに数え、失敗したものはほかに数えないので、`page-faults`
+  だけが数えます。カーネルのアドレスは何も数えません）と、
   x86-64 と同じく何も数えない
   `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。
   `perf record` が CPU ごとに開くような、一つの CPU のスレッドのイベントは、スレッドが

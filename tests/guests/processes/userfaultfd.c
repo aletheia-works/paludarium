@@ -2448,6 +2448,10 @@ static int case_major(void) {
     struct sigaction handler = {0};
     handler.sa_handler = on_signal;
     sigaction(SIGUSR1, &handler, NULL);
+    /* The handler's code and data are touched first here: the loader
+       counts no fault where Linux faults on the first touch of a page of
+       the program. */
+    raise(SIGUSR1);
     signalled = 0;
     struct counted waits = {.at = anon(PAGE), .how = 0};
     reg(fd, waits.at, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL);

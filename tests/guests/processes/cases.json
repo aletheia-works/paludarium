@@ -219,6 +219,7 @@
     {"name":"bpf-prog-udp","binary":"bpf-prog"},
     {"name":"bpf-prog-tcp","binary":"bpf-prog"},
     {"name":"bpf-prog-segments","binary":"bpf-prog"},
+    {"name":"bpf-prog-testrun","binary":"bpf-prog"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"dnotify-calls","binary":"inotify"},
     {"name":"dnotify-events","binary":"inotify"},

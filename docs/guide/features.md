@@ -119,7 +119,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX, UDP and TCP sockets (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX, UDP and TCP sockets or run with `BPF_PROG_TEST_RUN` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -6113,6 +6113,33 @@ kernel.
   ("insn %d cannot be patched due to 16-bit range"). The program's memory
   grows to the instructions the rewrites make (`bpf_prog_realloc`), and
   its socket is charged for them.
+
+- `BPF_PROG_TEST_RUN` runs a socket filter on a packet the caller gives,
+  as Linux master's `bpf_prog_test_run_skb`: the packet starts with an
+  Ethernet header, which `eth_type_trans` takes off as the loopback (or
+  the device the context's `ifindex` names, `ENODEV` for none) receives
+  it, finding the packet's type and its protocol (`ETH_P_802_2` for a
+  length, as master has it with no IPX). As many of its bytes as fit in a
+  page with Linux's headroom and tailroom (3712), or as the context's
+  `data_end` says, are in the linear part, and the rest in pages, at most
+  `MAX_SKB_FRAGS` (`ENOMEM`). The program runs `repeat` times (once for
+  0) on the same packet, whose `cb[]` it may change for the next run, and
+  a signal between runs ends them (`EINTR`). `retval` is its result,
+  `duration` the time a run took, and `data_out` the packet with its
+  Ethernet header zeroed, as much as `data_size_out` takes (`ENOSPC`
+  after the sizes are written), its linear part first. A context
+  (`struct __sk_buff`, in and out) gives `mark`, `priority`,
+  `ingress_ifindex`, `ifindex`, `cb[]`, `wire_len`, `gso_segs` and
+  `gso_size` and must have zeros elsewhere (`EINVAL`), and past its 192
+  bytes (`E2BIG`); what comes back has the fields Linux gives back. Before
+  that come the checks of the call: a context's size without its address
+  or the other way, the program (`EBADF`, `EINVAL`), flags other than
+  `BPF_F_TEST_SKB_CHECKSUM_COMPLETE`, a processor or a batch size, fewer
+  bytes than an Ethernet header, and, as master has it, an IPv4 or IPv6
+  packet shorter than its header (`EINVAL`). A socket filter cannot change
+  the packet, so its checksum never changes (`EBADMSG`). The program
+  reads the socket of the run as one of its own (`bpf_dummy_proto`), with
+  a cookie of its own and root of the network namespace as its owner.
 
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`

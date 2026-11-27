@@ -68,6 +68,7 @@ mod cmd {
     pub const PROG_LOAD: u32 = 5;
     pub const OBJ_PIN: u32 = 6;
     pub const OBJ_GET: u32 = 7;
+    pub const PROG_TEST_RUN: u32 = 10;
     pub const MAP_GET_NEXT_ID: u32 = 12;
     pub const MAP_GET_FD_BY_ID: u32 = 14;
     pub const OBJ_GET_INFO_BY_FD: u32 = 15;
@@ -600,6 +601,7 @@ fn dispatch(c: &mut Context<'_>, command: u32, at: u64, size: u32) -> Result<u64
                 half(&attr, 16),
             )
         }
+        cmd::PROG_TEST_RUN => crate::bpf_test_run::test_run(c, &attr, at),
         cmd::MAP_LOOKUP_AND_DELETE_ELEM => lookup_and_delete(c, &attr),
         cmd::MAP_FREEZE => freeze(c, &attr),
         cmd::MAP_LOOKUP_BATCH

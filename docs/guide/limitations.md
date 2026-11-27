@@ -520,8 +520,14 @@ verified.
   a signature are refused. The log has no trace of each instruction or
   state, which Linux writes at levels 1 and 2, and master's diagnostics
   after an error are not written, so its size (`log_true_size`) is
-  smaller than Linux's. The other program commands (`BPF_PROG_TEST_RUN`
-  and the rest), BTF (`BPF_BTF_LOAD`), links, attachment, the IDs of
+  smaller than Linux's. `BPF_PROG_TEST_RUN` runs socket filters as
+  master does, which the test machines' Linux 7.0 does otherwise in three
+  ways: it takes an IPv4 or IPv6 packet shorter than its header, gives a
+  packet's protocol after a length as `ETH_P_802_3` when it starts with
+  `0xffff` (IPX), and copies none of a packet in pages that
+  `data_size_out` cuts; so the unit tests alone check those. The other
+  program commands (`BPF_PROG_QUERY`, `BPF_PROG_BIND_MAP` and the rest),
+  BTF (`BPF_BTF_LOAD`), links, attachment, the IDs of
   programs, BTF and links
   (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID` and the rest), tokens,
   iterators and statistics are `ENOSYS`, as each command Linux has that is

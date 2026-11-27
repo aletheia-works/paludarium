@@ -108,6 +108,20 @@
    connection is made only where it has it; a SYN the filter drops, sent
    again once it has gone; and the filter and its lock that the accepted
    socket takes from the listener.
+   bpf-prog-testrun: in a network namespace of its own, BPF_PROG_TEST_RUN
+   of socket filters on packets that start with an Ethernet header, as the
+   loopback takes them in: the result, the packet that comes back (its
+   Ethernet header zeroed) and its size, with room for it and with less;
+   the packet's type by its destination and its protocol by its type;
+   every field a filter reads, without a context and with one, and the
+   context that comes back; the MAC header, and classic loads from the
+   data and the headers; the helpers of the task and of the run's own
+   socket (its owner, and a cookie that each run has its own of); cb[]
+   through repeated runs and a map that counts them; a packet in pages,
+   with data_end and without; and the checks of the call and of its
+   context, in their order. Not printed: the time a run took, and what
+   master and the test machines' Linux 7.0 do differently (a short IPv4
+   or IPv6 header, IPX, and a packet in pages cut by data_size_out).
    bpf-prog-corpus: 400 programs from a seeded generator, near the edges
    of what the verifier takes: registers read before they are written,
    the stack and a map's value read and written at their bounds, a
@@ -3243,6 +3257,318 @@ static int case_segments(void) {
     return 0;
 }
 
+/* BPF_PROG_TEST_RUN's attr->test. */
+struct test_attr {
+    uint32_t prog_fd, retval, data_size_in, data_size_out;
+    uint64_t data_in, data_out;
+    uint32_t repeat, duration, ctx_size_in, ctx_size_out;
+    uint64_t ctx_in, ctx_out;
+    uint32_t flags, cpu, batch_size, pad;
+};
+#define PROG_TEST_RUN 10
+static unsigned char run_in[3712 + 17 * 4096 + 1], run_out[8192];
+static uint32_t ctx_in[50], ctx_out[48];
+
+/* A packet of `size` bytes to `dest`, of Ethernet type `type`, whose byte
+   n past the Ethernet header is n * 3 + 1. */
+static void frame(const unsigned char dest[6], unsigned type, size_t size) {
+    static const unsigned char source[6] = {0x02, 0, 0, 0, 0, 1};
+    memcpy(run_in, dest, 6);
+    memcpy(run_in + 6, source, 6);
+    run_in[12] = (unsigned char)(type >> 8);
+    run_in[13] = (unsigned char)type;
+    for (size_t n = 14; n < size; n++) run_in[n] = (unsigned char)((n - 14) * 3 + 1);
+}
+static struct test_attr run_of(int fd, uint32_t size) {
+    struct test_attr t;
+    memset(&t, 0, sizeof t);
+    t.prog_fd = (uint32_t)fd;
+    t.data_size_in = size;
+    t.data_in = (uintptr_t)run_in;
+    t.data_out = (uintptr_t)run_out;
+    t.data_size_out = sizeof run_out;
+    return t;
+}
+static struct test_attr with_context(struct test_attr t) {
+    t.ctx_in = (uintptr_t)ctx_in;
+    t.ctx_size_in = 192;
+    t.ctx_out = (uintptr_t)ctx_out;
+    t.ctx_size_out = 192;
+    return t;
+}
+/* The run's result, retval and sizes out; not its duration, which is the
+   time a run took. */
+static long test_run(const char *name, struct test_attr *t) {
+    memset(run_out, 0xee, sizeof run_out);
+    memset(ctx_out, 0xee, sizeof ctx_out);
+    long r = bpf(PROG_TEST_RUN, t, sizeof *t);
+    say("%s %ld retval %u size out %u ctx size out %u", name, r, t->retval, t->data_size_out, t->ctx_size_out);
+    return r;
+}
+/* Whether what came back is the packet with its Ethernet header zeroed,
+   up to `size` bytes, and nothing past it. */
+static void say_out(const char *name, size_t size) {
+    static const unsigned char zeros[14];
+    say("%s header zeroed %d rest same %d untouched after %d", name, !memcmp(run_out, zeros, 14),
+        !memcmp(run_out + 14, run_in + 14, size - 14), size < sizeof run_out ? run_out[size] == 0xee : -1);
+}
+#define RUN_FIELD(off) PROGRAM(LDX_W(0, 1, off), EXIT())
+
+static int case_testrun(void) {
+    static const unsigned char zero[6], all[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+                                   group[6] = {0x01, 0, 0x5e, 0, 0, 1}, other[6] = {0x02, 0, 0, 0, 0, 2};
+    /* Only the loopback is in the namespace. */
+    own_network();
+    int len = RUN_FIELD(0);
+    say("len filter %d", len >= 0);
+    frame(zero, 0x0800, 64);
+    struct test_attr t = run_of(len, 64);
+    test_run("ipv4 64", &t);
+    say_out("ipv4 64", 64);
+    /* No room needed: data_size_out 0 copies it all. */
+    t = run_of(len, 64);
+    t.data_size_out = 0;
+    test_run("no size out", &t);
+    say_out("no size out", 64);
+    t = run_of(len, 64);
+    t.data_out = 0;
+    test_run("no data out", &t);
+    t = run_of(len, 64);
+    t.data_size_out = 20;
+    test_run("20 out", &t);
+    say("20 out header zeroed %d rest same %d untouched after %d", run_out[0] == 0 && run_out[13] == 0,
+        !memcmp(run_out + 14, run_in + 14, 6), run_out[20] == 0xee);
+    /* An Ethernet header alone, of a type with no header of its own to
+       check (master refuses a short IPv4 or IPv6 one, 7.0 does not). */
+    frame(zero, 0x0806, 14);
+    t = run_of(len, 14);
+    test_run("header alone", &t);
+
+    /* The packet's type by its destination, on the loopback, whose address
+       and broadcast address are zeros. */
+    int pkt_type = RUN_FIELD(4);
+    const unsigned char *dests[] = {zero, all, group, other};
+    const char *dest_names[] = {"zero", "broadcast", "group", "other"};
+    for (int i = 0; i < 4; i++) {
+        char name[48];
+        frame(dests[i], 0x0800, 64);
+        t = run_of(pkt_type, 64);
+        snprintf(name, sizeof name, "pkt_type to %s", dest_names[i]);
+        test_run(name, &t);
+    }
+    /* The protocol, in network order: the type, or 802.2's for a length. */
+    int protocol = RUN_FIELD(16);
+    const unsigned types[] = {0x0800, 0x86dd, 0x0806, 0x88cc, 0x0600, 0x05ff, 0x0000, 0x0100};
+    for (int i = 0; i < 8; i++) {
+        char name[48];
+        frame(zero, types[i], 64);
+        t = run_of(protocol, 64);
+        snprintf(name, sizeof name, "protocol of %04x", types[i]);
+        test_run(name, &t);
+    }
+
+    /* Every field a socket filter reads, without a context and with one. */
+    int fm = map(2, 4, 64, 1, 0);
+    int fields = fields_filter(fm);
+    say("fields filter %d", fields >= 0);
+    frame(zero, 0x86dd, 100);
+    t = run_of(fields, 100);
+    test_run("fields", &t);
+    say_fields("fields", fm);
+    memset(ctx_in, 0, sizeof ctx_in);
+    ctx_in[2] = 7;      /* mark */
+    ctx_in[8] = 3;      /* priority */
+    ctx_in[9] = 4;      /* ingress_ifindex */
+    ctx_in[41] = 2;     /* gso_segs */
+    ctx_in[44] = 1400;  /* gso_size */
+    t = with_context(run_of(fields, 100));
+    test_run("fields with context", &t);
+    say_fields("fields with context", fm);
+    say("context out mark %u priority %u ingress %u ifindex %u wire_len %u gso_segs %u gso_size %u", ctx_out[2],
+        ctx_out[8], ctx_out[9], ctx_out[10], ctx_out[40], ctx_out[41], ctx_out[44]);
+
+    /* The headers: the MAC header as it came, then the network header. */
+    int hm = map(2, 4, 72, 1, 0);
+    frame(other, 0x0800, 64);
+    t = run_of(headers_filter(hm, 0, 20), 64);
+    test_run("mac header", &t);
+    {
+        unsigned char v[72] = {0};
+        long r = value0(hm, v);
+        int32_t result;
+        memcpy(&result, v + 64, 4);
+        printf("mac header lookup %ld result %d:", r, result);
+        for (int i = 0; i < 20; i++) printf(" %02x", v[i]);
+        putchar('\n');
+        fflush(stdout);
+    }
+    /* Classic loads: from the start of the data, the network header and
+       the MAC header, and past the end. */
+#define RUN_LOAD(name, ...)                                         \
+    do {                                                            \
+        t = run_of(PROGRAM(MOV_REG(6, 1), __VA_ARGS__, EXIT()), 64); \
+        test_run(name, &t);                                         \
+    } while (0)
+    RUN_LOAD("abs 32 at 0", ABS(S_W, 0));
+    RUN_LOAD("abs 8 from the network header", ABS(S_B, NET(9)));
+    RUN_LOAD("abs 8 from the MAC header", ABS(S_B, LL(11)));
+    RUN_LOAD("abs 16 at the type", ABS(S_H, LL(12)));
+    RUN_LOAD("abs 8 at 50", ABS(S_B, 49), MOV(0, 2), ABS(S_B, 50));
+    RUN_LOAD("ind 16 at 48", MOV(7, 40), IND(S_H, 7, 8));
+
+    /* The helpers: the task's, and the socket's own owner. */
+    int pid = PROGRAM(CALL(14), EXIT()); /* bpf_get_current_pid_tgid */
+    t = run_of(pid, 64);
+    memset(run_out, 0, 1);
+    long r = bpf(PROG_TEST_RUN, &t, sizeof t);
+    say("pid_tgid %ld is the thread %d", r, t.retval == (uint32_t)syscall(SYS_gettid));
+    t = run_of(PROGRAM(CALL(15), EXIT()), 64); /* bpf_get_current_uid_gid */
+    test_run("uid_gid", &t);
+    t = run_of(PROGRAM(CALL(SOCKET_UID), EXIT()), 64);
+    test_run("socket uid", &t);
+    /* Each run's socket has a cookie of its own, the same in each repeat. */
+    int cm = map(2, 4, 16, 1, 0);
+    int cookie = PROGRAM(MOV_REG(6, 1), KEY4(cm), CALL(LOOKUP), JEQ(0, 0, 7), MOV_REG(7, 0), MOV_REG(1, 6),
+                         CALL(SOCKET_COOKIE), LDX_DW(1, 7, 0), STX_DW(7, 0, 0), STX_DW(7, 1, 8), MOV(0, 1), EXIT());
+    say("cookie filter %d", cookie >= 0);
+    uint64_t cookies[2][2];
+    for (int i = 0; i < 2; i++) {
+        t = run_of(cookie, 64);
+        t.repeat = 2;
+        test_run("cookie", &t);
+        value0(cm, cookies[i]);
+    }
+    say("cookie set %d same in a repeat %d differs in the next run %d", cookies[0][0] != 0,
+        cookies[0][0] == cookies[0][1], cookies[1][0] != cookies[0][0]);
+
+    /* cb[] goes in, and the program changes it for the next run and for
+       what comes back. */
+    int cb = PROGRAM(LDX_W(2, 1, 48), ADD(2, 1), STX_W(1, 2, 48), LDX_W(3, 1, 64), ADD(3, 10), STX_W(1, 3, 64),
+                     MOV_REG(0, 2), EXIT());
+    memset(ctx_in, 0, sizeof ctx_in);
+    ctx_in[12] = 5;   /* cb[0] */
+    ctx_in[16] = 100; /* cb[4] */
+    ctx_in[38] = 11;  /* tstamp */
+    ctx_in[46] = 12;  /* hwtstamp */
+    frame(zero, 0x0800, 64);
+    t = with_context(run_of(cb, 64));
+    t.repeat = 4;
+    test_run("cb repeat 4", &t);
+    say("cb out %u %u %u %u %u tstamp %u hwtstamp %u", ctx_out[12], ctx_out[13], ctx_out[14], ctx_out[15],
+        ctx_out[16], ctx_out[38], ctx_out[46]);
+    t = with_context(run_of(cb, 64));
+    t.ctx_in = 0;
+    t.ctx_size_in = 0;
+    test_run("cb out alone", &t);
+    say("cb out alone %u %u ifindex %u wire_len %u", ctx_out[12], ctx_out[16], ctx_out[10], ctx_out[40]);
+    /* A map's value counts the runs of a repeat. */
+    int rm = map(2, 4, 8, 1, 0);
+    int count = PROGRAM(KEY4(rm), CALL(LOOKUP), JEQ(0, 0, 3), LDX_DW(1, 0, 0), ADD(1, 1), STX_DW(0, 1, 0),
+                        MOV(0, 0), EXIT());
+    t = run_of(count, 64);
+    t.repeat = 5;
+    test_run("count repeat 5", &t);
+    t = run_of(count, 64);
+    t.repeat = 0;
+    test_run("count repeat 0", &t);
+    uint64_t runs = 0;
+    r = value0(rm, &runs);
+    say("runs lookup %ld %llu", r, (unsigned long long)runs);
+
+    /* A packet in pages past its linear part, a page less the headroom and
+       tailroom Linux keeps. */
+    frame(zero, 0x0800, 5000);
+    t = run_of(len, 5000);
+    test_run("5000 bytes", &t);
+    say_out("5000 bytes", 5000);
+    /* data_end sets the linear part; what comes back is the same. */
+    memset(ctx_in, 0, sizeof ctx_in);
+    ctx_in[20] = 40; /* data_end */
+    frame(zero, 0x0800, 3000);
+    t = with_context(run_of(len, 3000));
+    test_run("data_end 40", &t);
+    say_out("data_end 40", 3000);
+    say("data_end 40 context out data_end %u", ctx_out[20]);
+    /* Nothing comes back of these: 7.0 copies no part of a packet in
+       pages that data_size_out cuts, and master the part that fits. */
+    t = run_of(len, 3712 + 17 * 4096);
+    t.data_out = 0;
+    t.data_size_out = 0;
+    test_run("most pages", &t);
+    t = run_of(len, 3712 + 17 * 4096 + 1);
+    test_run("one page too many", &t);
+
+    /* The checks, in their order. */
+    frame(zero, 0x0800, 64);
+    struct test_attr ok = run_of(len, 64), bad;
+#define BAD(name, field, value) \
+    bad = ok;                   \
+    bad.field = value;          \
+    test_run(name, &bad)
+    BAD("ctx size in alone", ctx_size_in, 4);
+    BAD("ctx in alone", ctx_in, (uintptr_t)ctx_in);
+    BAD("ctx size out alone", ctx_size_out, 4);
+    BAD("ctx out alone", ctx_out, (uintptr_t)ctx_out);
+    BAD("no descriptor", prog_fd, 999);
+    BAD("a map", prog_fd, (uint32_t)rm);
+    BAD("flag on cpu", flags, 1);
+    BAD("flag live frames", flags, 2);
+    BAD("flag checksum complete", flags, 4);
+    BAD("flag 8", flags, 8);
+    BAD("cpu 1", cpu, 1);
+    BAD("batch size 1", batch_size, 1);
+    BAD("pad", pad, 1);
+    BAD("13 bytes", data_size_in, 13);
+    BAD("data in unreadable", data_in, 8);
+    BAD("data out unwritable", data_out, 8);
+    {
+        long big = bpf(PROG_TEST_RUN, &ok, 4097);
+        say("attr size 4097 %ld", big);
+    }
+    /* The context: past struct __sk_buff only zeros, of its fields only
+       those Linux takes, wire_len and gso_segs within their bounds, a
+       device there is. */
+#define CTX_RUN(name, i, value, size)            \
+    memset(ctx_in, 0, sizeof ctx_in);           \
+    ctx_in[i] = value;                          \
+    bad = with_context(ok);                     \
+    bad.ctx_size_in = size;                     \
+    test_run(name, &bad)
+    CTX_RUN("ctx tail set", 49, 1, 200);
+    CTX_RUN("ctx tail zero", 49, 0, 200);
+    CTX_RUN("ctx short", 2, 9, 12);
+    CTX_RUN("ctx size page", 0, 0, 4097);
+    const struct {
+        const char *name;
+        int i;
+        uint32_t value;
+    } fields_in[] = {
+        {"len", 0, 1},          {"pkt_type", 1, 1},   {"queue_mapping", 3, 1}, {"protocol", 4, 8},
+        {"vlan_present", 5, 1}, {"tc_index", 11, 1},  {"hash", 17, 1},         {"tc_classid", 18, 1},
+        {"data", 19, 1},        {"data_end 65", 20, 65}, {"napi_id", 21, 1},   {"family", 22, 2},
+        {"remote_ip4", 23, 1},  {"local_port", 34, 1}, {"data_meta", 35, 1},   {"flow_keys", 36, 1},
+        {"sk", 42, 1},          {"tstamp_type", 45, 1}, {"wire_len 49", 40, 49}, {"wire_len 50", 40, 50},
+        {"wire_len 65536", 40, 65536}, {"wire_len 65537", 40, 65537}, {"gso_segs 65535", 41, 65535},
+        {"gso_segs 65536", 41, 65536}, {"ifindex 1", 10, 1}, {"ifindex 99", 10, 99},
+    };
+    for (size_t i = 0; i < COUNT(fields_in); i++) {
+        char name[48];
+        snprintf(name, sizeof name, "ctx %s", fields_in[i].name);
+        CTX_RUN(name, fields_in[i].i, fields_in[i].value, 192);
+    }
+    memset(ctx_in, 0, sizeof ctx_in);
+    bad = with_context(ok);
+    bad.ctx_size_out = 100;
+    test_run("ctx size out 100", &bad);
+    bad = with_context(ok);
+    bad.ctx_out = 8;
+    test_run("ctx out unwritable", &bad);
+    bad = with_context(ok);
+    bad.ctx_in = 8;
+    test_run("ctx in unreadable", &bad);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -3260,5 +3586,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-prog-udp")) return case_udp();
     if (!strcmp(mode, "bpf-prog-tcp")) return case_tcp();
     if (!strcmp(mode, "bpf-prog-segments")) return case_segments();
+    if (!strcmp(mode, "bpf-prog-testrun")) return case_testrun();
     return 2;
 }

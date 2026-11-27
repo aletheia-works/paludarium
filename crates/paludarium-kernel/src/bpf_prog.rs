@@ -688,6 +688,32 @@ impl Program {
         );
         result.map_or(0, |r0| r0 as u32)
     }
+
+    /// [`Self::run`], as `BPF_PROG_TEST_RUN` runs it: `R0` and the
+    /// packet's `cb[]` after it. A fault leaves `cb[]` as it was.
+    pub(crate) fn run_with_cb(
+        &self,
+        packet: &crate::bpf_interp::Packet<'_>,
+        kernel: &mut dyn crate::bpf_interp::Kernel,
+    ) -> (u32, [u8; 20]) {
+        let program = crate::bpf_interp::Program {
+            insns: &self.insns,
+            maps: &self.maps,
+            loads: &self.loads,
+        };
+        let result = crate::bpf_interp::run_with_cb(&program, packet, kernel);
+        assert!(
+            !cfg!(any(debug_assertions, feature = "fuzzing")) || result.is_ok(),
+            "a verified program faulted"
+        );
+        result.map_or((0, packet.skb.cb), |(r0, cb)| (r0 as u32, cb))
+    }
+
+    /// Whether it is a socket filter, the one type `BPF_PROG_TEST_RUN`
+    /// runs here (`sk_filter_prog_ops.test_run`).
+    pub(crate) fn is_socket_filter(&self) -> bool {
+        self.kind == kind::SOCKET_FILTER
+    }
 }
 
 /// `bpf_prog_size`: what a program of `insns` instructions takes, and what
@@ -783,6 +809,9 @@ pub(crate) struct Receiving<'a> {
 pub(crate) enum FilterSocket {
     Unix(std::sync::Weak<crate::unix::UnixSocket>),
     Inet(std::sync::Weak<crate::inet::InetSocket>),
+    /// The socket `BPF_PROG_TEST_RUN` makes for its run (`bpf_dummy_proto`),
+    /// which has a cookie of its own once asked for one.
+    Lone(Arc<std::sync::OnceLock<u64>>),
 }
 
 impl FilterSocket {
@@ -791,6 +820,7 @@ impl FilterSocket {
         match self {
             FilterSocket::Unix(s) => s.upgrade().map_or(0, |s| s.cookie()),
             FilterSocket::Inet(s) => s.upgrade().map_or(0, |s| s.cookie()),
+            FilterSocket::Lone(cookie) => *cookie.get_or_init(crate::sockets::new_cookie),
         }
     }
 }
@@ -863,6 +893,15 @@ pub(crate) fn socket_filter(c: &Context<'_>, fd: u32) -> Result<Arc<Program>, Er
         Some(p) if p.program.kind == kind::SOCKET_FILTER => Ok(Arc::clone(&p.program)),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// `bpf_prog_get(fd)`: the program of a descriptor, `EBADF` for no
+/// descriptor and `EINVAL` for a file that is no program.
+pub(crate) fn program(c: &Context<'_>, fd: u32) -> Result<Arc<Program>, Errno> {
+    let file = c.files.descriptor(u64::from(fd))?.file;
+    of(&file)
+        .map(|p| Arc::clone(&p.program))
+        .ok_or(Errno::EINVAL)
 }
 
 /// The machine's programs by ID: Linux's `prog_idr`, which shares nothing

@@ -434,7 +434,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   オブジェクトも鍵もないので、関数と行の情報、CO-RE の再配置、`fd_array_cnt`、署名は
   断ります。ログには、Linux がレベル 1 と 2 で書く命令ごとと状態ごとのトレースも、master が
   エラーのあとに書く診断もありません。そのため長さ（`log_true_size`）は Linux より短く
-  なります。ほかのプログラムのコマンド（`BPF_PROG_TEST_RUN` など）、BTF（`BPF_BTF_LOAD`）、
+  なります。`BPF_PROG_TEST_RUN` は master と同じくソケットフィルターを走らせます。テスト機の
+  Linux 7.0 は 3 つの点で違います。ヘッダーに満たない IPv4 と IPv6 のパケットを受け付け、
+  長さのあとが `0xffff` で始まるパケットのプロトコルを `ETH_P_802_3`（IPX）とし、
+  `data_size_out` で切れたページ上のパケットを少しも書きません。そのためこれらは単体テストだけが
+  確かめます。ほかのプログラムのコマンド（`BPF_PROG_QUERY`、`BPF_PROG_BIND_MAP` など）、
+  BTF（`BPF_BTF_LOAD`）、
   link、アタッチ、プログラム、BTF、link の ID
   （`BPF_PROG_GET_NEXT_ID`、`BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、
   Linux にあってここにないコマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と

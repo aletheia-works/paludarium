@@ -101,7 +101,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX、UDP、TCP のソケットにアタッチします（下を参照） |
+| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX、UDP、TCP のソケットにアタッチするか、`BPF_PROG_TEST_RUN` で走らせます（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -5227,6 +5227,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `bpf_fastcall` がないためです。書き換えの後にジャンプが 16 ビットで届かなくなるものは `ENOMEM`
   です（"insn %d cannot be patched due to 16-bit range"）。プログラムのメモリは書き換えが作る
   命令まで増え（`bpf_prog_realloc`）、ソケットにはその分を課金します。
+
+- `BPF_PROG_TEST_RUN` は、呼び出し元が渡すパケットでソケットフィルターを、Linux master の
+  `bpf_prog_test_run_skb` と同じく走らせます。パケットは Ethernet ヘッダーで始まり、
+  ループバック（またはコンテキストの `ifindex` が指すデバイス。なければ `ENODEV`）が
+  受け取るように `eth_type_trans` がそれを外し、パケットの種類とプロトコルを決めます
+  （長さなら master と同じく IPX なしで `ETH_P_802_2`）。Linux のヘッドルームとテールルームを
+  除いて 1 ページに収まる分（3712 バイト）か、コンテキストの `data_end` が言う分がリニア部に
+  入り、残りはページに入ります。ページは最大 `MAX_SKB_FRAGS` 個です（`ENOMEM`）。
+  プログラムは同じパケットで `repeat` 回（0 なら 1 回）走り、`cb[]` を次の回のために
+  変えられます。回の間にシグナルが来ると終わります（`EINTR`）。`retval` は結果、`duration` は
+  1 回にかかった時間、`data_out` は Ethernet ヘッダーをゼロにしたパケットで、`data_size_out`
+  に入る分だけ、リニア部から書きます（入らなければ大きさを書いたあとで `ENOSPC`）。
+  コンテキスト（`struct __sk_buff`、入出力）は `mark`、`priority`、`ingress_ifindex`、
+  `ifindex`、`cb[]`、`wire_len`、`gso_segs`、`gso_size` を渡し、ほかの場所は 0 でなければ
+  ならず（`EINVAL`）、192 バイトより後ろも 0 でなければなりません（`E2BIG`）。返ってくるのは
+  Linux が返すフィールドです。その前に呼び出しの確認があります。アドレスのないコンテキストの
+  大きさとその逆、プログラム（`EBADF`、`EINVAL`）、`BPF_F_TEST_SKB_CHECKSUM_COMPLETE` 以外の
+  フラグ、プロセッサー、バッチの大きさ、Ethernet ヘッダーに満たないバイト数、そして master と
+  同じくヘッダーに満たない IPv4 と IPv6 のパケットです（`EINVAL`）。ソケットフィルターは
+  パケットを変えられないので、チェックサムは変わりません（`EBADMSG`）。プログラムが読む
+  実行のソケットはそれ専用のもの（`bpf_dummy_proto`）で、専用のクッキーを持ち、持ち主は
+  ネットワーク名前空間の root です。
 
 - ソケットフィルターは `SO_ATTACH_BPF` で、古典的なものは `SO_ATTACH_FILTER`（後述）で、
   AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の

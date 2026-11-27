@@ -1546,6 +1546,15 @@ impl Addresses {
             self.neighbours.push(neighbour);
         }
     }
+    /// [`Self::send6`] of an IPv4 group, `to` (an IGMPv3 report): on the
+    /// loopback the neighbour of `0.0.0.0`, as every IPv4 one there is.
+    pub(crate) fn send4(&mut self, index: i32, to: Ipv4Addr, now: u64) {
+        if index == LOOPBACK_INDEX {
+            self.output(IpAddr::V4(to), now);
+        } else {
+            self.end_neighbour(index, IpAddr::V4(to), now);
+        }
+    }
     /// A packet the kernel sends of itself to the IPv6 group `to` (an MLD
     /// report, or a solicitation of neighbour discovery) goes out through
     /// the device `index` at `now`, as `ip6_finish_output2` makes the

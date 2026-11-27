@@ -5034,7 +5034,8 @@ impl Drop for InetSocket {
     fn drop(&mut self) {
         let abort = self.options().linger == Some(0);
         let s = std::mem::take(&mut *self.lock());
-        self.network.drop4(&s.groups4);
+        self.network
+            .drop4(&s.groups4, self.now().unwrap_or_default());
         self.network.drop6(&s.groups6);
         crate::netlink::tell_groups(&self.network);
         self.network

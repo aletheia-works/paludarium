@@ -3831,7 +3831,13 @@ kernel.
     (`addrconf_dad_work`); and, as the detection of a veth end's only
     link-local address ends, a report again (`ipv6_mc_dad_complete`) and,
     unless the end forwards, a router solicitation to ff02::2
-    (`addrconf_dad_completed`). An end going down takes its
+    (`addrconf_dad_completed`). IGMPv3's report to 224.0.0.22
+    (`IGMPV3_ALL_MCR`) makes its neighbour so too, on `lo` that of 0.0.0.0
+    as every IPv4 one there: as a device up joins a group anew, leaves one
+    for good or changes a filter's sources, and of its groups as it comes
+    up, but for the all-hosts group (`igmp_group_added`,
+    `igmp_group_dropped`, `ip_mc_up`), its carrier or not; a device down
+    has no route to report on (`ENETUNREACH`). An end going down takes its
     neighbours, each told of with `RTM_DELNEIGH` after its
     `RTM_NEWLINK`, IPv4's, then IPv6's; its peer losing its carrier, all
     but the permanent ones (`neigh_carrier_down`); and an end that goes or
@@ -5097,8 +5103,8 @@ kernel.
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
-    has and the querier `V3`: no IGMP report is sent or heard, so no timer
-    runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
+    has and the querier `V3`: no IGMP report is heard, and none is sent
+    again on a timer, so no timer runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
     each IPv6 group of each device with IPv6, the newest first, with its
     users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
     below a link's and `MAF_LOADED` for the rest from when they are joined

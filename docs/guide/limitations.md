@@ -1267,8 +1267,9 @@ verified.
   `addrconf_rs_timer`), so a neighbour of one that is deleted is not made
   again by those; and a
   change of a group's sources sends none (`ip6_mc_add_src`,
-  `ip6_mc_del_src`). IGMP's reports make no neighbour of the group they
-  go to. Traffic through
+  `ip6_mc_del_src`). IGMPv3's report makes its neighbour at once, where
+  Linux's goes from its timer a tick on (`igmp_ifc_start_timer`), and is
+  not sent again (`igmp_ifc_timer_expire`). Traffic through
   an end moves no counters; a namespace forwards nothing
   on to another. A multicast group is one of the guest's namespaces alone:
   the first has no device to the host's network, so no route to one, and

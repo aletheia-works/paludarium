@@ -244,6 +244,18 @@ every test passing.
   commit, the separate runs and the shared run counted the same lines in
   every gate, and their missed lines differed only in a few lines that
   depend on thread timing.
+- In the CI jobs, the core run's `diff_processes` runs as a process of its
+  own, at the same time as the run's other tests. Its cases run one at a
+  time and mostly wait on timers and the network, so it took 10 to 13
+  minutes of the core step alone. Both runs select the same packages, so
+  Cargo builds the same units, and each test process writes its own
+  profile, which the core report reads with the others. The background run
+  starts with SIGINT and SIGQUIT at their defaults: bash starts a
+  background command with them ignored, and native guests would inherit
+  that. On one commit, the parallel run counted the same lines in every
+  gate as one run did, and the hit lines differed by two or fewer, as they
+  do between any two runs; the job took 24.0 minutes against 31.1.
+  `mise run coverage` runs the core tests as one run.
 - Each gate's printed table counts the same packages and files as the
   gate. A `cargo llvm-cov report` without `-p` counts every workspace
   member whose code the test binaries link, so the terminal and encodings

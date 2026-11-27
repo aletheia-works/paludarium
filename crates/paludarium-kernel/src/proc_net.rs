@@ -32,6 +32,7 @@ pub(crate) enum File {
     Route,
     Packet,
     Netlink,
+    Anycast6,
     IfInet6,
     Mcfilter,
     Mcfilter6,
@@ -47,7 +48,7 @@ pub(crate) struct Source {
 impl File {
     /// The files, in the order Linux's `proc_readdir_de` lists them: by the
     /// length of their names, then by name.
-    pub(crate) const ALL: [Self; 20] = [
+    pub(crate) const ALL: [Self; 21] = [
         Self::Arp,
         Self::Dev,
         Self::Raw,
@@ -64,6 +65,7 @@ impl File {
         Self::Route,
         Self::Packet,
         Self::Netlink,
+        Self::Anycast6,
         Self::IfInet6,
         Self::Mcfilter,
         Self::Mcfilter6,
@@ -87,6 +89,7 @@ impl File {
             Self::Route => b"route",
             Self::Packet => b"packet",
             Self::Netlink => b"netlink",
+            Self::Anycast6 => b"anycast6",
             Self::IfInet6 => b"if_inet6",
             Self::Mcfilter => b"mcfilter",
             Self::Mcfilter6 => b"mcfilter6",
@@ -128,6 +131,7 @@ impl File {
             Self::Arp => arp(network, now),
             Self::Dev => dev(network),
             Self::Route => route(network, now),
+            Self::Anycast6 => anycast6(network, now),
             Self::IfInet6 => if_inet6(network, now),
             Self::Igmp => igmp(network),
             Self::Igmp6 => igmp6(network),
@@ -276,6 +280,7 @@ fn ipv6_route(network: Option<&Network>, now: Option<u64>) -> String {
     const RTF_NONEXTHOP: u32 = 0x0020_0000;
     const RTF_EXPIRES: u32 = 0x0040_0000;
     const RTF_LOCAL: u32 = 0x8000_0000;
+    const RTF_ANYCAST: u32 = 0x0010_0000;
     const RTPROT_KERNEL: u8 = 2;
     let mut out = String::new();
     let Some(network) = network else { return out };
@@ -303,6 +308,7 @@ fn ipv6_route(network: Option<&Network>, now: Option<u64>) -> String {
             match r.kind {
                 Kind::Local if r.proto == RTPROT_KERNEL => flags |= RTF_LOCAL | RTF_NONEXTHOP,
                 Kind::Local => flags |= RTF_LOCAL,
+                Kind::Anycast => flags |= RTF_ANYCAST | RTF_NONEXTHOP,
                 Kind::Unreachable | Kind::Prohibit | Kind::Blackhole => {
                     flags = RTF_REJECT | RTF_NONEXTHOP;
                 }
@@ -484,6 +490,28 @@ fn igmp6(network: Option<&Network>) -> String {
                 "{:<4} {name:<15} {:032x} {users:5} {flags:08X} 0",
                 d.index,
                 u128::from(group),
+            );
+        }
+    }
+    out
+}
+/// `anycast6`, as `ac6_seq_show` prints it: each anycast address of each
+/// device, in the namespace's order, each's the newest first, with its
+/// users.
+fn anycast6(network: Option<&Network>, now: Option<u64>) -> String {
+    let mut out = String::new();
+    let Some(network) = network else { return out };
+    let all = network.addresses_at(now).anycast6().to_vec();
+    let devices = network.devices();
+    for d in registered(&devices) {
+        let name = String::from_utf8_lossy(&d.name);
+        for a in all.iter().filter(|a| a.index == d.index) {
+            let _ = writeln!(
+                out,
+                "{:<4} {name:<15} {:032x} {:5}",
+                d.index,
+                u128::from(a.address),
+                a.users,
             );
         }
     }

@@ -6,9 +6,11 @@
    protocol and ports; IPv4's hash them from the packet
    inet_rtm_getroute_build_skb makes, IPv6's from the flow. Unbound UDP
    sockets connected to each destination tell their hops only where the
-   policy takes no ports, as a socket with no port of its own hashes a
-   random one (FLOWI_FLAG_ANY_SPORT). Then what the files take, and that
-   a new namespace starts from policy 0 and fields 7. */
+   policy takes no ports, as such a socket's port is random (inet_autobind);
+   UDP and TCP sockets bound to port 7100 tell theirs under every policy, as
+   only one with no port yet hashes a random one (FLOWI_FLAG_ANY_SPORT).
+   A send with no route leaves its socket bound. Then what the files take,
+   and that a new namespace starts from policy 0 and fields 7. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -407,8 +409,52 @@ static void connected(int family) {
     out[COUNT] = 0;
     printf("%s connected: %s\n", family == AF_INET ? "IPv4" : "IPv6", out);
 }
+/* The sources of sockets of `type` bound to port 7100 and connected to
+   port 7000 at each destination, which tell the hops. */
+static void bound(int family, int type) {
+    char out[COUNT + 1];
+    for (int i = 0; i < COUNT; i++) {
+        struct sockaddr_storage to = {0}, from = {0}, at = {0};
+        socklen_t len = sizeof at, size;
+        if (family == AF_INET) {
+            struct sockaddr_in *in = (void *)&to, *own = (void *)&from;
+            in->sin_family = own->sin_family = AF_INET;
+            in->sin_port = htons(7000);
+            own->sin_port = htons(7100);
+            in->sin_addr.s_addr = htonl(0x0a020000u + (unsigned)i + 1);
+            size = sizeof *in;
+        } else {
+            struct sockaddr_in6 *in = (void *)&to, *own = (void *)&from;
+            char ip[64];
+            in->sin6_family = own->sin6_family = AF_INET6;
+            in->sin6_port = htons(7000);
+            own->sin6_port = htons(7100);
+            snprintf(ip, sizeof ip, "2001:db8:2::%x", i + 1);
+            inet_pton(AF_INET6, ip, &in->sin6_addr);
+            size = sizeof *in;
+        }
+        int s = socket(family, type | SOCK_NONBLOCK, 0), one = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        long b = result(bind(s, (void *)&from, size));
+        connect(s, (void *)&to, size);
+        getsockname(s, (void *)&at, &len);
+        close(s);
+        char ip[64] = {0};
+        if (family == AF_INET)
+            inet_ntop(AF_INET, &((struct sockaddr_in *)&at)->sin_addr, ip, sizeof ip);
+        else
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&at)->sin6_addr, ip, sizeof ip);
+        out[i] = b < 0                                                      ? 'b'
+                 : !strcmp(ip, "10.0.0.1") || !strcmp(ip, "2001:db8::1")     ? 'a'
+                 : !strcmp(ip, "10.1.0.1") || !strcmp(ip, "2001:db8:1::1") ? 'c'
+                                                                            : '?';
+    }
+    out[COUNT] = 0;
+    printf("%s %s from 7100: %s\n", family == AF_INET ? "IPv4" : "IPv6", type == SOCK_STREAM ? "TCP" : "UDP",
+           out);
+}
 /* What each family's lookups give; `sockets` where the policy takes no
-   ports. */
+   ports, else TCP sockets bound to a port too. */
 static void all(int fd, int sockets) {
     shown(fd, "10.2.0.", "10.5.0.1", 0, 0, 0, 0, "IPv4");
     shown(fd, "10.2.0.", NULL, 0, 0, 0, 0, "IPv4 from none");
@@ -428,6 +474,12 @@ static void all(int fd, int sockets) {
     if (sockets) {
         connected(AF_INET);
         connected(AF_INET6);
+    }
+    bound(AF_INET, SOCK_DGRAM);
+    bound(AF_INET6, SOCK_DGRAM);
+    if (!sockets) {
+        bound(AF_INET, SOCK_STREAM);
+        bound(AF_INET6, SOCK_STREAM);
     }
 }
 static void get(const char *path, const char *label) {
@@ -539,6 +591,21 @@ int main(int argc, char **argv) {
     printf("== IPv4 policy 3 fields 2, IPv6 policy 0\n");
     all(ctl, 1);
     files("each its own");
+
+    /* A send's port comes before its route (inet_send_prepare): one that
+       finds no route leaves the socket bound. */
+    {
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(7000)}, at = {0};
+        socklen_t len = sizeof at;
+        to.sin_addr.s_addr = htonl(0x0a630001);
+        printf("to 10.99.0.1: sendto=%ld\n", result(sendto(u, "x", 1, 0, (void *)&to, sizeof to)));
+        getsockname(u, (void *)&at, &len);
+        printf("after it: %s\n", at.sin_port ? "a port" : "no port");
+        struct sockaddr_in any = {.sin_family = AF_INET, .sin_port = htons(7200)};
+        printf("bind after it=%ld\n", result(bind(u, (void *)&any, sizeof any)));
+        close(u);
+    }
 
     /* What the files take. */
     static const char *policies[] = {"4", "-1", "256", "3 ", "0x1", "1x", " 2\n", "1"};

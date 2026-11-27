@@ -101,7 +101,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX、UDP、TCP のソケットにアタッチします（下を参照） |
+| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`。インタープリタで動き、AF_UNIX、UDP、TCP のソケットにアタッチするか、`BPF_PROG_TEST_RUN` で走らせます（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -584,7 +584,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
   `ECONNREFUSED`、その後は `ENOTCONN` になります。その送信は、下と同じく、その端が
   読んでいないものを捨てます。`EPIPE` で `SIGPIPE` を送るのは、
-  Linux と同じく `SOCK_STREAM` だけです。
+  Linux と同じく `SOCK_STREAM` だけで、何も送れなかったときだけです。パイプは、書き込みの
+  一部のあとで最後の読み手がいなくなったときも送り、その書き込みは書いた分を返します。
 
 - `socket(AF_UNIX)` は、Linux の `af_unix.c` と同じく、`SOCK_STREAM` か
   `SOCK_SEQPACKET` のソケットを作ります。抽象名前空間の名前（0 で始まる `sun_path`）に
@@ -755,7 +756,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `O_NONBLOCK` を付けると、何もない標準入力の読み込みは `EAGAIN` で、ホストに空きの
     ない標準出力や標準エラーへの書き込みも `EAGAIN` です。読み手のいなくなった標準出力や
     標準エラー（終わった `head` へのパイプなど）への書き込みは、読み手のいないどのパイプへの
-    書き込みとも同じく、`SIGPIPE` を送って `EPIPE` を返します。
+    書き込みとも同じく、`SIGPIPE` を送って `EPIPE` を返します。一部を書いたあとで読み手が
+    いなくなった書き込みも、Linux の `pipe_write` と同じく `SIGPIPE` を送り、書いた分を返します。
   - **TCP と UDP のソケット**（[ネットワーク](#network)）：Linux の TCP と同じように
     送ります。接続が開くと `POLL_OUT`、失敗すると `POLL_ERR`、データが届くと
     `POLL_IN` です。相手の終わりが届くと `POLL_IN`（こちらも閉じていれば `POLL_HUP`）を
@@ -1016,7 +1018,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `io_uring` のリング、ヒュージページ、vDSO のデータは、どちらの指定も受け付けません
   （`EINVAL`）。
   `MADV_COLLAPSE` は、Linux の `madvise_collapse` と同じく VMA ごとにプライベートな
-  anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA、
+  anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA や
+  `PR_SET_THP_DISABLE` がすべての VMA で止めた空間の VMA、
   揃った 2 MiB の区間が入らない VMA、どのページも書かれていないプライベートな
   anonymous の VMA、アドレスとファイルのオフセットが 2 MiB 単位で揃っていない shmem の
   VMA、通常のファイルのマッピングは断り（`EINVAL`）、そのうえで揃った区間をまるごと
@@ -1162,8 +1165,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フォールトはメジャーフォールトです。カーネルモードのフォールトは先に VMA のロックの下で
   動かないので、そのやり直しは `FAULT_FLAG_TRIED` になり、やり直しがページを取り込んだか
   どうかに関わらず一度だけ数えます（`ru_majflt`、`page-faults`、`major-faults`。マイナー
-  フォールトには数えません）。`get_user_pages` のものはページがあるのを見つけ、何も
-  数えません。
+  フォールトには数えません）。`mm_account_fault` と同じく、やり直しが終わるときに
+  数えます。（何も埋めない `UFFDIO_WAKE` の後に）もう一度待つやり直しは何も足さず、
+  そのあと致命的なシグナルなどで失敗したものは数えません。`get_user_pages` のものは
+  ページがあるのを見つけ、何も数えません。
   `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。
   `UFFDIO_WRITEPROTECT` は、`mwriteprotect_range` と同じく VMA ごとに、範囲のページを
   保護するか保護を解きます。どの VMA も書き込み保護について登録したものでなければ
@@ -1655,7 +1660,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - io_uring は Linux 6.12 のものですが、登録したファイル、バッファーのグループ、NOP の
   フラグは、差分テストを走らせるカーネルである Linux 7.0 のもの（`io_uring/rsrc.c`、
-  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
+  `kbuf.c`、`nop.c`。NOP の `IOSQE_FIXED_FILE` は master のもの）です。知っている操作、登録、setup と
+  `io_uring_enter` のフラグも Linux 7.0 のものです。操作は `IORING_OP_NOP`、`IORING_OP_EPOLL_CTL`（libuv が
   `epoll_ctl` をまとめるのに使います）と、ファイルの転送 `IORING_OP_READ`、`_WRITE`、
   `_READV`、`_WRITEV`、`_FSYNC`、`_READ_FIXED`、`_WRITE_FIXED`、`IORING_OP_FILES_UPDATE`、
   `IORING_OP_PROVIDE_BUFFERS` と `_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、タイムアウト
@@ -1663,8 +1669,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
   `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE` と
   `_TEE`、それにソケットの要求
-  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。Linux 6.12 のほかの操作は、それらなしでビルドした Linux と同じく
-  `EOPNOTSUPP` で完了し、それより新しい操作は 6.12 と同じく `EINVAL` で完了します。`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
+  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで、それらなしでビルドした Linux と同じく
+  `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` はこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
   `fsgid` を返します。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
@@ -2474,7 +2480,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセス（`kill`、`ptrace` のアクセス、優先度、リソース制限）にはそのユーザーの名前空間での
   もの、マシン全体（`RENAME_WHITEOUT`、リアルタイムのスケジューリング、`vhangup`、`trusted.*` の属性
   など）には最初のユーザーの名前空間でのものだけが効きます。`/proc/<pid>/uid_map` と
-  `gid_map` は、タスクのユーザーの名前空間の範囲を、下の ID を読み手の名前空間のもの
+  `gid_map`（と後述の `projid_map`）は、タスクのユーザーの名前空間の範囲を、下の ID を読み手の名前空間のもの
   （自分の名前空間なら親のもの）で読みます。書き込みは、3 つの数の行を 340 行までの 1 回だけで、
   確かめる中身と順番は Linux の `proc_uid_map_write`・`map_write`・`new_idmap_permitted` と
   同じです。その名前空間かその親の、中で `CAP_SYS_ADMIN` を持つスレッドから書き、持ち主は
@@ -2727,7 +2733,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     送り元であるホップは、ハッシュより先に選ばれます。デバイスを名前で挙げれば、
     それを通る最初のホップです。bind していない
     ソケットは、送り元なしのハッシュで決まるホップの送り元を使い、接続と UDP の connect は、
-    続けてその送り元から経路を引き当てます（`ip_route_connect`）。パケットは、その送り元への
+    続けてその送り元から経路を引き当てます（`ip_route_connect`）。ソケットのフローは自分の
+    ポートをハッシュします。UDP のソケットは経路より先にポートを持ち（`inet_send_prepare`、
+    `inet_dgram_connect`）、まだポートのない接続は乱数のポートをハッシュします
+    （`FLOWI_FLAG_ANY_SPORT`）。答えは自分のポートをハッシュします。パケットは、その送り元への
     経路のどのホップのデバイスからも入れます（`fib_info_nh_uses_dev`）。その答えは自分の
     引き当てで選ばれる端か、リスナーがバインドされている端を通って返ります。端を
     通る出力の経路の検索は、端の最初のプライマリアドレスから、なければほかのデバイスの
@@ -2816,6 +2825,31 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     でもグループに入っているものと、`IPV6_MULTICAST_ALL` が入ったものに届きます
     （`inet6_mc_check`）。受け付けた接続の `IPV6_MULTICAST_HOPS` は 64 です
     （`tcp_v6_syn_recv_sock`）。
+  - **IPv6 のエニーキャストのアドレス:** IPv6 のソケットは（TCP のものも）`IPV6_JOIN_ANYCAST` と
+    `IPV6_LEAVE_ANYCAST` で、`ipv6_mreq`（短ければ `EINVAL`）のインデックスが指すデバイスか、
+    0 ならそのアドレスへの経路のデバイスで、エニーキャストのアドレスに入り、出ます
+    （`ipv6_sock_ac_join`、`ipv6_sock_ac_drop`）。`CAP_NET_ADMIN` がなければ `EPERM`、
+    マルチキャストのアドレスか、名前空間の仮でないアドレスなら `EINVAL`、デバイスがなければ
+    `ENODEV` です。経路がなければ `EADDRNOTAVAIL` ですが、`all` が転送するときは、上がっている
+    ループバックでない最初のデバイスです。転送しないデバイスでは、デバイスのアドレスのどの
+    接頭辞にもないアドレスも `EADDRNOTAVAIL` です。入っていないのに出れば `ENOENT` で、出るのは
+    指したデバイスのもの、0 ならどこかで最も新しく入ったものです。転送するデバイスは、
+    自分の各アドレスのサブネットルーターのエニーキャストアドレス（その接頭辞。127 ビット以上の
+    ものは除きます）に入ります。アドレスの準備ができたとき（重複アドレス検出の後、しなければ
+    すぐ）と、転送を始めたときに仮でないアドレスのものです。アドレスがなくなるか、転送を
+    やめると出ます（`addrconf_join_anycast`、`dev_forward_change`）。どれも入った回数を数え、
+    新しいものから並べます（`__ipv6_dev_ac_inc`）。新しく入ると、ローカルの表にデバイスを通る
+    `RTN_ANYCAST` の経路を足し、その要請ノードのグループに入り（ループバックは入りません）、
+    `RTNLGRP_IPV6_ACADDR`（39）に `RTM_NEWANYCAST` を伝えます。すっかり出ると、グループから
+    抜け、経路がまだあれば除き、`RTM_DELANYCAST` を伝えます（`inet6_ifacaddr_notify`）。
+    デバイスが下がると、その経路は、ソケットが入ったものの経路も消えますが、ソケットは経路の
+    ないまま入ったままです。デバイスがなくなると、残りは何も伝えずに消えます
+    （`ipv6_ac_destroy_dev`）。ソケットを閉じると、入ったものから出ます。`/proc/net/anycast6`
+    （`ac6_seq_show`）は、デバイスごとのものを名前空間の順に、利用者の数と並べます。
+    `RTM_GETANYCAST` のダンプ（`inet6_dump_ifacaddr`）は、IPv6 のアドレスのダンプと同じく
+    要求を調べ、インデックスの順に、128 ビットの永続のアドレス（`IFA_ANYCAST`）で、スコープは
+    ユニバース（サイトローカルのものはサイトの 200）、有効期間は無期限で返します
+    （`inet6_fill_ifacaddr`）。`ipv6_route` はその経路を `RTF_ANYCAST` で示します。
   - **送信元フィルター:** グループに入ったソケットは、そのフィルターが通すものを受け取ります。
     フィルターの送信元からのもの（`MCAST_INCLUDE`）か、ほかのすべてからのもの
     （`MCAST_EXCLUDE`。入ったときは送信元なしです）です。IPv4 の
@@ -3052,7 +3086,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     指す宛先への経路を引きます。IPv4 はローカルとメインの表の最も長い接頭辞で引き、
     そこに経路がないか `throw` の経路に当たれば既定の表で引きます。IPv6 は、`lo` が
     上がっている間、ローカルの表、メインの表の順に引きます。拒む経路に当たれば、その
-    エラー（`EINVAL`、`EHOSTUNREACH`、`EACCES`）を返します。IPv4 の答えは、メインの表
+    エラー（`EINVAL`、`EHOSTUNREACH`、`EACCES`）を返します。その経路に当たるソケットの
+    接続とデータグラムも、そのエラーで失敗します。`lo` を通る IPv4 のユニキャストの経路に
+    当たるものは、`lo` に結び付いたソケットのものと同じく `lo` から出ます。`lo` が下がっていても、
+    残るホストスコープの経路（`fib_sync_down_dev`）に当たれば同じです。IPv4 の答えは、メインの表
     （`RTM_F_LOOKUP_TABLE` を付ければ、経路のあった表）、`fib_select_path` の選ぶ送り元、
     オンリンクで届くゲートウェイ、リクエストが指した `RTA_MARK`（0 なら付けません）、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
     -1 なら付けず、4 バイトより短ければ `ERANGE`）を持ちます。`0.0.0.0` は 127.0.0.1 から
@@ -3726,7 +3763,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
   `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mem`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、`smaps_rollup`、
-  `pagemap`、`wchan`、`oom_score`、`oom_adj`、`oom_score_adj`、`coredump_filter`、`io`、`fd`、`fdinfo`、`ns`、`task`
+  `pagemap`、`wchan`、`cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、
+  `coredump_filter`、`io`、`uid_map`、`gid_map`、`projid_map`、`setgroups`、`timerslack_ns`、`fd`、`fdinfo`、`ns`、`task`
   があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。この root は、そのプログラムが動くユーザー名前空間の
@@ -3763,7 +3801,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`RssAnon`、`RssFile`、`RssShmem`）、書き込めるプライベートなマップとスタック（`VmData`、
   `VmStk`）、コードの範囲とそのほかの実行できるマップ（`VmExe`、`VmLib`）です。スワップ
   アウトするものはなく、ヒュージページのプールは空なので、`VmSwap` と `HugetlbPages` は
-  0 です。`VmPin`、`VmPTE` と CPU の項目は、何も数えていないのでありません。大きさの
+  0 です。タスクにメモリーがある間は、そのあとに `CoreDumping`（プロセスのコアを書く
+  致命的なシグナルから、最後のスレッドが書き終えるまで 1）、`THP_enabled`（
+  `PR_SET_THP_DISABLE` が空間全体の透過的ヒュージページを止めると 0）、`untag_mask`
+  （線形アドレスのマスクを有効にするものがないので、すべてのビットが 1）が続きます。
+  `VmPin`、`VmPTE` と CPU の項目は、何も数えていないのでありません。大きさの
   最大値は Linux の `hiwater_vm` です。`vms_complete_munmap_vmas` が `update_hiwater_vm`
   を呼ぶのと同じく、アンマップがマップされたページを取り除くときに記録します。それを置き換える
   固定のマップは、そのあとで自分のページを数えます。`mremap` がページを
@@ -3791,13 +3833,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`--mount /:/` ではホストの項目）は並べません。`ps`、`pgrep`、`pidof` が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`personality`（0400）、`comm`、
   `syscall`（0400）、`maps`、`mem`（0600）、`clear_refs`（0200）、`smaps`、`smaps_rollup`、`pagemap`（0400）、`wchan`、
-  `oom_score`、`oom_adj`、`oom_score_adj`、`coredump_filter`、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、`coredump_filter`、`io`（0400）、
+  `uid_map`、`gid_map`、`projid_map`、`setgroups`、`timerslack_ns`（0666）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
-  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` と `coredump_filter` 以外の同じファイルが
-  あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
+  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task`、`coredump_filter`、`timerslack_ns`
+  以外の同じファイルと `children` があり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
   プロセスの ID、スレッド自身の資格情報（プロセスの `status` は `/proc/self/status` も
   含め、Linux の `proc_pid_status` と同じくリーダーのものを示します）、スレッド自身の
   `voluntary_ctxt_switches`。眠った回数で、プロセスの `status` は Linux の
@@ -3833,7 +3876,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセスは、そこでの子プロセスからも読めません。ファイルの持ち主はこのプロセス自身のもの（前述）と
   同じで（ダンプできないプロセスのディレクトリ（0555）もそのプロセスのものです）、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
   ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
-  `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
+  `oom_adj`、`oom_score_adj`、`loginuid`、`coredump_filter`、`uid_map`、`gid_map`、`projid_map`、
+  `setgroups`（0644）と `timerslack_ns`（0666）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
   `auxv`、`pagemap`、`mem` を読むには持ち主か `CAP_DAC_OVERRIDE` が要ります。開いたものの `fstat` は、
   このプロセス自身のもの（前述）と同じく持ち主を示します。`statm` と `limits` は、Linux と同じく誰でも読めます。
   `fd` そのものを読むことと中を探すことは、Linux の
@@ -3897,6 +3941,46 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   32 ビットを超えると `ERANGE`）の下位 9 ビットを設定し、渡された全部の数を返します。
   そのメモリで動くスレッドがなくなると空を読み、書き込みは `ESRCH` です。スレッドの
   ディレクトリにはありません。
+
+- プロセスの `timerslack_ns`（0666）は、リーダーのスレッドのタイマーのゆとり（ナノ秒）で、
+  `PR_SET_TIMERSLACK` と `PR_GET_TIMERSLACK` は呼んだスレッドのものを設定し、読みます。
+  最初のタスクは 50000 で、新しいスレッドやプロセスは作り手のものを受け継ぎ、そのときの
+  作り手のゆとりが既定にもなります。そのスレッド以外が読み書きするには、そのユーザーの
+  名前空間での `CAP_SYS_NICE` が要ります（Linux の `timerslack_ns_show` と
+  `timerslack_ns_write` と同じく、読み書きのときに `EPERM`）。書き込みは `kstrtoull` が 10 進で
+  読む 66 バイトまでを取り（`EINVAL`、64 ビットを超えると `ERANGE`）、渡された全部の数を返し、
+  位置は変えません。0 を設定すると既定に戻ります。リアルタイムかデッドラインのスレッドには
+  ゆとりがありません。`sched_setscheduler` などが 0 にし、書き込みでも 0 のままで、
+  `PR_SET_TIMERSLACK` は変えず、そのポリシーを離れると既定に戻ります。これで長く待つものは
+  なく、ホストのタイマーは自分のゆとりのままです。スレッドのディレクトリにはありません。
+
+- `loginuid`（0644）と `sessionid`（0444）は、スレッドの監査のログインユーザーとセッションで、
+  Linux の `proc_loginuid_read` と `proc_sessionid_read` と同じく改行なしで書きます。はじめは
+  どちらも 4294967295（なし）で、スレッドとプロセスは作り手のものを受け継ぎ、`execve` でも
+  残ります。ログインユーザーは開いた者のユーザーの名前空間での ID で読みます（対応がなければ
+  4294967295）。`loginuid` を書けるのはそのファイルのスレッドだけで（ほかは `EPERM`）、
+  先頭でだけ（読んだ後は `EINVAL`）、開いた者の名前空間で `kstrtou32` が読む 10 進のユーザー
+  ID（対応がなければ `EINVAL`）か、なしの 4294967295 を書きます。一度設定すると、変えるには
+  最初のユーザーの名前空間での `CAP_AUDIT_CONTROL` が要ります（`EPERM`）。ユーザーを設定すると、
+  ほかにない番号（エミュレーターごとに 1 から）のセッションが始まり、なしにすると終わります。
+  監査はしません。
+
+- `cgroup`（0444）は `0::/` を読みます。どのタスクも、cgroup v2 のホストがルートの
+  タスクを示すのと同じく統合された階層のルートのグループにいて、どのコントロールグループの
+  名前空間から読んでも同じです。`cpuset` は、それを持つ cgroup v1 の cpuset
+  （`CONFIG_CPUSETS_V1`）を外した Ubuntu のカーネルと同じくありません。
+
+- スレッドの `children`（0444）は、Linux の `children_seq_show` と同じく、そのスレッドが
+  作ってまだ回収されていないプロセス（ゾンビも）を、それぞれの後ろに空白を付けて並べます。
+  作り手の終わった子は、`forget_original_parent` が渡すのと同じく、プロセスの最初の
+  スレッドのものです。並びは PID の順で、Linux はスレッドに来た順なので、PID が一回りした
+  ときと、孤児がプロセスに渡されたときに違います。プロセス自身のディレクトリにはありません。
+
+- `projid_map`（0644）は、タスクのユーザーの名前空間のプロジェクト ID を `uid_map`
+  （前述）と同じく読み、書き込みを受けます。ただし、Linux の `proc_projid_map_write` と同じく
+  書き込みにケーパビリティは要らず、親が対応させているどの ID も対応させられます。最初の
+  名前空間はすべてを対応させます（`0 0 4294967295`）。プロジェクト ID を使うものはほかに
+  ありません。
 
 - プロセスやスレッドの `syscall` は 0400 で大きさは 0 で、Linux の `proc_pid_syscall` と同じく
   読んだときに書きます。読み手が読めるかは `personality` と同じくアタッチできるかで決め
@@ -3989,7 +4073,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `exe`（このプロセスのもの、または見てよいほかのプロセスのもの）への `execve` は、
   リンク先のプログラムを動かします。Linux のパスのたどり方と同じく、ファイルへ直接
   飛び、そのディレクトリは探しません。`AT_SYMLINK_NOFOLLOW` は拒み（`ELOOP`）、リンクで
-  ない生成されるファイルは `EACCES` です。
+  ない生成されるファイルは `EACCES` です。独自のルートの下でも、そこにある `/proc` の
+  バインドマウントを通して同じく動かします。そのルートの中から `/proc` や `/dev` の
+  バインドマウントを指すシンボリックリンク（絶対パスのものは新しいルートから）も、
+  どの呼び出しでもそれ自身のパスと同じく生成されるファイルへ届きます。リンクでない
+  生成されるファイル（`/proc` 自身も）の `readlink` は `EINVAL` です。
 
 - `/proc/sys/fs/mqueue` には、Linux の `ipc/mq_sysctl.c` と同じく、読むプロセスの IPC
   名前空間の POSIX メッセージキューの上限があります。`queues_max`、`msg_max` と
@@ -4137,7 +4225,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `all` かデバイスの `forwarding` は 1 を返しました）。`all` のものは `default` とすべてのデバイスのものを変えます。
     `forwarding` は、`addrconf_fixup_forwarding` と同じく、入るか切れるときだけ
     `RTNLGRP_IPV6_NETCONF` のメンバーに伝えます（1 から 2 では伝えません）。`all` の
-    ものでは、`default`、切り替わったデバイスのもの、`all` 自身の順です。
+    ものでは、`default`、切り替わったデバイスのもの（デバイスが登録された順）、`all` 自身の順です。
     `disable_ipv6` はこうして伝えることはありません。
     デバイスの `disable_ipv6` を入れると、そのデバイスは IPv6 のアドレスと経路を失い、
     落ちたときと同じく知らせます（`addrconf_ifdown`）。上がっている間に切ると、
@@ -4594,7 +4682,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   数えます。どれも各スレッドの最後のシステムコールの時点の値です。`ru_majflt` は、
   同じプロセスとスレッドと子（`cmaj_flt`）について、メジャーフォールトを数えます。
   `userfaultfd` のところに書いたとおり、`userfaultfd` がやり直させたカーネルのアクセスの
-  フォールトで、待ちが終わるときに一度ずつ数え、マイナーフォールトには数えません。ほかの値
+  フォールトで、やり直しが終わるときに一度ずつ数え、マイナーフォールトには数えません。ほかの値
   （非自発的なコンテキストスイッチ、ブロック）は 0 です。`/proc/<pid>/stat` は同じ数を
   `minflt` と `majflt`（`task` の下ではそのスレッドのもの）、`cminflt` と `cmajflt` に
   示します。
@@ -4873,7 +4961,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
   `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
   `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
-  数と有効な時間と動いた時間があります。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに
+  数と有効な時間と動いた時間があります。これらは `mmap`、イベントの有効化、
+  リセットのとき、そしてスレッドが眠りやほかの CPU への移動の後でまた動くとき、
+  つまり Linux がイベントをスケジュールするとき（`perf_swevent_add`、時計の `add`）に更新し、
+  眠らないシステムコールでは変わりません。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに
   グループのディスクリプタで指す `PERF_FLAG_FD_OUTPUT` は、Linux の
   `perf_event_set_output` と同じく、イベントの出力をほかのイベントのバッファへ向けます。
   相手はイベントで（`EBADF`）、同じイベントではなく、同じ CPU の、すべての CPU の
@@ -5131,7 +5222,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ポインタからポインタの引き算、32 ビットの引き算。スタックのポインタからの引き算、ほかの
   演算子、32 ビットの足し算は `EACCES`。2^29 を超えるオフセットは `EINVAL`）、スタックへの
   読み書き（大きさに揃っていて 512 バイトに収まること、`EACCES`）、スタックにまるごと書いて
-  まるごと読むポインタ、スカラーを通した読み込み（"R%d invalid mem access 'scalar'"、
+  まるごと読むポインタ、Linux がわかるところでのスタックからの読み込みの値（書いた 0 か、
+  スピルしたスカラーをその先頭からスピル以下の幅で読んだもの。ロードがゼロ拡張か符号拡張
+  します）、スカラーを通した読み込み（"R%d invalid mem access 'scalar'"、
   `EACCES`）、exit のときの R0（値は何でもかまいません）です。オペランドを知っている
   条件ジャンプは一方へだけ進み、ほかは両方をたどります。Linux と同じく、1,000,000 命令か、
   たどるのを待つジャンプが 8,192 個を超えるとあきらめます（`E2BIG`）。
@@ -5168,9 +5261,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   operand size" です（`EINVAL`）。ソースと
   デスティネーションのレジスタ、`BPF_CMPXCHG` では R0 も、書かれていなければなりません。
   コンテキストへは "BPF_ATOMIC stores into R%d ctx is not allowed" です（`EACCES`）。古い値を
-  受け取るレジスタ（`BPF_FETCH` ではソース、`BPF_CMPXCHG` では R0）は、その時点から値の
-  わからないものになります。それがデスティネーションでも同じで、そのときはスカラーを通して
-  読むことになります。メモリは読んでから書き、プログラムのフラグにかかわらず大きさに揃って
+  受け取るレジスタ（`BPF_FETCH` ではソース、`BPF_CMPXCHG` では R0）は、メモリを読む前に値の
+  わからないものになり、読んだあとはその読み取りの値になります。それがデスティネーションでも
+  同じで、そのときはスカラーを通して読むことになります。メモリは読んでから書き、プログラムのフラグにかかわらず大きさに揃って
   いなければなりません。こうして書いたスタックのスロットは、ポインタを退避していたところでも、
   ただのバイトになります。
   `BPF_LOAD_ACQ` と `BPF_STORE_REL` は、どの大きさでも、ロードとストアと同じに確かめ、
@@ -5249,6 +5342,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `bpf_fastcall` がないためです。書き換えの後にジャンプが 16 ビットで届かなくなるものは `ENOMEM`
   です（"insn %d cannot be patched due to 16-bit range"）。プログラムのメモリは書き換えが作る
   命令まで増え（`bpf_prog_realloc`）、ソケットにはその分を課金します。
+
+- `BPF_PROG_TEST_RUN` は、呼び出し元が渡すパケットでソケットフィルターを、Linux master の
+  `bpf_prog_test_run_skb` と同じく走らせます。パケットは Ethernet ヘッダーで始まり、
+  ループバック（またはコンテキストの `ifindex` が指すデバイス。なければ `ENODEV`）が
+  受け取るように `eth_type_trans` がそれを外し、パケットの種類とプロトコルを決めます
+  （長さなら master と同じく IPX なしで `ETH_P_802_2`）。Linux のヘッドルームとテールルームを
+  除いて 1 ページに収まる分（3712 バイト）か、コンテキストの `data_end` が言う分がリニア部に
+  入り、残りはページに入ります。ページは最大 `MAX_SKB_FRAGS` 個です（`ENOMEM`）。
+  プログラムは同じパケットで `repeat` 回（0 なら 1 回）走り、`cb[]` を次の回のために
+  変えられます。回の間にシグナルが来ると終わります（`EINTR`）。`retval` は結果、`duration` は
+  1 回にかかった時間、`data_out` は Ethernet ヘッダーをゼロにしたパケットで、`data_size_out`
+  に入る分だけ、リニア部から書きます（入らなければ大きさを書いたあとで `ENOSPC`）。
+  コンテキスト（`struct __sk_buff`、入出力）は `mark`、`priority`、`ingress_ifindex`、
+  `ifindex`、`cb[]`、`wire_len`、`gso_segs`、`gso_size` を渡し、ほかの場所は 0 でなければ
+  ならず（`EINVAL`）、192 バイトより後ろも 0 でなければなりません（`E2BIG`）。返ってくるのは
+  Linux が返すフィールドです。その前に呼び出しの確認があります。アドレスのないコンテキストの
+  大きさとその逆、プログラム（`EBADF`、`EINVAL`）、`BPF_F_TEST_SKB_CHECKSUM_COMPLETE` 以外の
+  フラグ、プロセッサー、バッチの大きさ、Ethernet ヘッダーに満たないバイト数、そして master と
+  同じくヘッダーに満たない IPv4 と IPv6 のパケットです（`EINVAL`）。ソケットフィルターは
+  パケットを変えられないので、チェックサムは変わりません（`EBADMSG`）。プログラムが読む
+  実行のソケットはそれ専用のもの（`bpf_dummy_proto`）で、専用のクッキーを持ち、持ち主は
+  ネットワーク名前空間の root です。
 
 - ソケットフィルターは `SO_ATTACH_BPF` で、古典的なものは `SO_ATTACH_FILTER`（後述）で、
   AF_UNIX の `SOCK_DGRAM` か `SOCK_SEQPACKET` の
@@ -5696,6 +5811,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PR_CAP_AMBIENT`（上げるケーパビリティは許可と継承の両方になければならず、
   `SECBIT_NO_CAP_AMBIENT_RAISE` があれば断ります）（どれもスレッドごと）、
   `PR_SET_CHILD_SUBREAPER`（`fork` では受け継がれず、`execve` では残ります）、
+  `PR_SET_TIMERSLACK` と `PR_GET_TIMERSLACK`（スレッドごと。`/proc/<pid>/timerslack_ns` を
+  見てください）、
   `PR_SET_NO_NEW_PRIVS`、`PR_SET_SECCOMP`（下の seccomp を見てください）と、
   それぞれの `PR_GET_*`、そして Yama の `PR_SET_PTRACER` に対応します。`PR_SET_PTRACER` は
   ほかの引数を読みません。0 で消え、`PR_SET_PTRACER_ANY`（`int` として -1 も同じ）でどの
@@ -5711,6 +5828,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかに名前を付けてから `ENOMEM` です。`/proc/<pid>/maps` と `smaps` はこれを
   `[anon:<名前>]`、共有の無名メモリでは `[anon_shmem:<名前>]` と示し、ヒープとスタックは
   それぞれの名前のままです。名前の違う VMA はまとまらず、`fork` した子も名前を保ちます。
+  `PR_SET_THP_DISABLE` と `PR_GET_THP_DISABLE` は、Linux の `MMF_DISABLE_THP_*` と同じく
+  アドレス空間のもので、スレッドは共有し、`fork` した子と `execve` は保ちます。2 番目の
+  引数が 0 でなければ透過的ヒュージページを止め、3 番目が
+  `PR_THP_DISABLE_EXCEPT_ADVISED`（2）なら `MADV_HUGEPAGE` が求めていないところだけを
+  止めます。フラグなしの 0 でふたたび使えるようにします（ほかのフラグ、使えるようにする
+  ときのフラグ、4 番目か 5 番目の引数は `EINVAL`）。`PR_GET_THP_DISABLE` は引数を取らず
+  （`EINVAL`）、0、1、または求めたメモリーを除く種類なら 3 を返します。すべての VMA で
+  止めたときは、Linux の `vma_thp_disabled` と同じく `MADV_COLLAPSE` を断ります（`EINVAL`）。
+  ほかに変わるものはありません。どちらでも、Linux と同じくヒュージページが入るところに
+  マップを置くためです。
   ほかの指定には `EINVAL` を返します。
 
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって

@@ -117,6 +117,9 @@ pub struct DecodeCache {
     growth: Growth,
     /// The compiled blocks that slots refer to ([`Slot::compiled`]).
     compiled: Vec<std::sync::Arc<dyn compile::CompiledBlock>>,
+    /// The addresses of the blocks compiled so far, at most
+    /// [`MAX_COMPILED_AT`] of them ([`Slot::hot`]).
+    compiled_at: std::collections::HashSet<u64>,
 }
 
 /// When a [`DecodeCache`] grows.
@@ -158,6 +161,7 @@ impl Default for DecodeCache {
             code: Code::with_capacity(INITIAL_ENTRIES),
             growth: Growth::default(),
             compiled: Vec::new(),
+            compiled_at: std::collections::HashSet::new(),
         }
     }
 }
@@ -274,6 +278,13 @@ struct Slot {
     /// compiler turned it down, else one more than its index in
     /// [`DecodeCache::compiled`].
     compiled: u32,
+    /// Whether a block at its address was compiled before, under an
+    /// earlier generation or before its slot was emptied or taken. Such a
+    /// block is compiled on its second entry, once its first has made it as
+    /// long as it grows, rather than after [`compile::Compiler::threshold`]
+    /// entries: it was hot once, and it is decoded again mostly because a
+    /// mapping changed elsewhere (`mmap`, `brk`, `mprotect`, `munmap`).
+    hot: bool,
 }
 
 /// [`Slot::compiled`] of a block the compiler turned down.
@@ -282,6 +293,10 @@ const NOT_COMPILED: u32 = u32::MAX;
 /// The most compiled blocks a [`DecodeCache`] keeps; past it, all are
 /// dropped and compiled again as they run.
 const MAX_COMPILED: usize = 1 << 13;
+
+/// The most addresses [`DecodeCache::compiled_at`] holds; past it, it is
+/// emptied.
+const MAX_COMPILED_AT: usize = 1 << 16;
 
 impl Slot {
     fn holds(&self, rip: u64, generation: u64) -> bool {
@@ -394,6 +409,7 @@ impl DecodeCache {
         if s.holds_other(rip, generation) {
             self.growth.collided(entries);
         }
+        let hot = !self.compiled_at.is_empty() && self.compiled_at.contains(&rip);
         *s = Slot {
             rip,
             generation,
@@ -401,6 +417,7 @@ impl DecodeCache {
             len: u8::try_from(len).unwrap_or(u8::MAX),
             runs: 0,
             compiled: 0,
+            hot,
         };
         Ok(s.range())
     }

@@ -31,7 +31,8 @@
 //!
 //! The context's fields that a socket filter may read are those of an
 //! AF_UNIX datagram's `sk_buff`: its length, and 0 for the rest, which such
-//! a packet does not set; `cb[]` starts at 0 (`bpf_prog_run_save_cb`).
+//! a packet does not set; `cb[]` starts at 0 (`bpf_prog_run_save_cb`), or
+//! as `BPF_PROG_TEST_RUN`'s context gives it.
 //!
 //! It runs classic filters too, as [`crate::bpf_classic`] converts them,
 //! which read what the verifier keeps from eBPF programs: the packet's
@@ -237,6 +238,10 @@ pub(crate) struct Skb {
     pub(crate) payload_offset: u32,
     /// `gso_segs` and `gso_size`.
     pub(crate) gso: (u32, u32),
+    /// `cb[]` as the program finds it: 0 where a filter runs on what a
+    /// socket receives (`bpf_prog_run_save_cb`), and what
+    /// `BPF_PROG_TEST_RUN`'s context gives there.
+    pub(crate) cb: [u8; CB.end - CB.start],
 }
 
 impl<'a> Packet<'a> {
@@ -315,6 +320,15 @@ pub(crate) fn run(
     packet: &Packet<'_>,
     kernel: &mut dyn Kernel,
 ) -> Result<u64, Fault> {
+    run_with_cb(program, packet, kernel).map(|(r0, _)| r0)
+}
+
+/// [`run`], with `cb[]` as the program left it.
+pub(crate) fn run_with_cb(
+    program: &Program<'_>,
+    packet: &Packet<'_>,
+    kernel: &mut dyn Kernel,
+) -> Result<(u64, [u8; CB.end - CB.start]), Fault> {
     let mut context = [0; CONTEXT_WITH_TAIL];
     let len = u32::try_from(packet.data.len()).map_err(|_| Fault)?;
     context[0..4].copy_from_slice(&len.to_le_bytes());
@@ -335,6 +349,7 @@ pub(crate) fn run(
     put(classic::field::HASH, skb.hash);
     put(classic::field::GSO_SEGS, skb.gso.0);
     put(classic::field::GSO_SIZE, skb.gso.1);
+    context[CB].copy_from_slice(&skb.cb);
     if skb.device.is_some() {
         let at = classic::field::DEV as usize;
         context[at..at + 8].copy_from_slice(&address(DEVICE, 0).to_le_bytes());
@@ -357,7 +372,10 @@ pub(crate) fn run(
     };
     m.regs[1] = address(CONTEXT, 0);
     m.regs[10] = address(STACK, STACK_SIZE as u64);
-    m.run()
+    let r0 = m.run()?;
+    let mut cb = [0; CB.end - CB.start];
+    cb.copy_from_slice(&m.context[CB]);
+    Ok((r0, cb))
 }
 
 /// The classes, sizes and modes of `struct bpf_insn`'s code.

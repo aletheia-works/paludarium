@@ -547,7 +547,37 @@ jobs:
             cargo build --locked -p paludarium --target-dir target/llvm-cov-target
           )
           read -r -a packages <<< "$CORE_PACKAGES"
-          cargo llvm-cov --no-report --locked "${packages[@]}" -p paludarium-harness
+          # diff_processes waits on timers and the network for most of its
+          # time, and its cases run one at a time whatever the thread count
+          # (FIXTURE), so it runs as a process of its own beside the core
+          # run's other tests. Both select the same packages, so Cargo builds
+          # the same units as one run does; Cargo lets go of its lock before
+          # it runs tests, and each test process writes its own profile.
+          set -o pipefail
+          tests=$(cargo metadata --locked --no-deps --format-version 1 | jq -r --arg packages " ${packages[*]} -p paludarium-harness " '
+            .packages[] | select(.name as $name | $packages | contains(" -p \($name) ")) | .targets[]
+            | select(.kind == ["test"] and .name != "diff_processes") | .name' | sort -u)
+          test -n "$tests"
+          others=(--lib --bins)
+          for name in $tests; do
+            others+=(--test "$name")
+          done
+          # Without job control, bash starts a background command with SIGINT
+          # and SIGQUIT ignored, and native guests would inherit that; perl
+          # sets them back to their defaults before it runs Cargo.
+          perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or die "exec: $!\n"' \
+            cargo llvm-cov --no-report --locked "${packages[@]}" -p paludarium-harness --test diff_processes > target/diff-processes.log 2>&1 &
+          processes=$!
+          status=0
+          cargo llvm-cov --no-report --locked "${packages[@]}" -p paludarium-harness "${others[@]}" || status=$?
+          processes_status=0
+          wait "$processes" || processes_status=$?
+          echo "::group::diff_processes"
+          cat target/diff-processes.log
+          echo "::endgroup::"
+          if [ "$status" != 0 ] || [ "$processes_status" != 0 ]; then
+            exit 1
+          fi
           cargo llvm-cov report "${packages[@]}" -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
         env:
           # Instrumented independent cases run serially; race cases still

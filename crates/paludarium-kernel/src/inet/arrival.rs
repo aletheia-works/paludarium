@@ -248,6 +248,7 @@ impl Sent {
             device: Some((index, kind)),
             payload_offset: cap as u32,
             gso,
+            cb: [0; 20],
         };
         let packet = Packet {
             linear,

@@ -9635,11 +9635,18 @@ static int io_uring_case(void) {
     unsigned long arg[3] = {0, 0, (unsigned long)ts};
     uring_show("enter-timeout", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 24));
     uring_show("enter-arg-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 16));
+    /* Linux 7.0's: no wait region is registered, and no I/O wait. */
+    uring_show("enter-region-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 24));
+    uring_show("enter-region", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 64));
+    uring_show("enter-region-alone", uring_enter(u.fd, 0, 0, 1 | 1 << 6, NULL, 0));
+    uring_show("enter-no-iowait", uring_enter(u.fd, 0, 0, 1 << 7, NULL, 0));
+    uring_show("enter-unknown-flag", uring_enter(u.fd, 0, 0, 1 << 8, NULL, 0));
     uring_show("register-unknown", syscall(427, u.fd, 255, NULL, 0));
     uring_show("register-not-ring", syscall(427, efd, 8, NULL, 0));
     unsigned char probe[16 + 8 * 64];
     memset(probe, 0, sizeof probe);
     uring_show("probe", syscall(427, u.fd, 8, probe, 64));
+    printf("probe-last: %d ops: %d\n", probe[0], probe[1]);
     printf("probe-nop: %d epoll: %d\n", probe[16 + 2] & 1, probe[16 + 8 * 29 + 2] & 1);
     uring_show("probe-dirty", syscall(427, u.fd, 8, probe, 1));
     close(efd);
@@ -18894,6 +18901,98 @@ static int generated_link_names_case(const char *self) {
     return 0;
 }
 
+/* The generated-rooted-links case: under a root of its own, whose /proc
+   and /dev are bind mounts of the machine's, a symbolic link in that root
+   into them (absolute, so from the new root, or relative) finds what their
+   own paths find, and execve of a process's exe link through one runs the
+   program, as Linux's walk follows links from fs->root. In a user
+   namespace of its own, for the binds and chroot; only errno values and
+   whether the two ways agree are printed. */
+static char grl_base[] = "/tmp/paludarium-rooted-links-XXXXXX";
+static void grl_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", grl_base, name); }
+/* What open, stat and lstat (the file type, S_IFMT >> 12), access and
+   readlink give for `path` (0 or -errno), and its inode. */
+static void grl_probe(const char *path, long out[6]) {
+    struct stat st;
+    char buf[512];
+    int fd = open(path, O_RDONLY);
+    out[0] = fd < 0 ? -errno : 0;
+    if (fd >= 0) close(fd);
+    out[1] = stat(path, &st) ? -errno : (long)(st.st_mode & S_IFMT) >> 12;
+    out[2] = lstat(path, &st) ? -errno : (long)(st.st_mode & S_IFMT) >> 12;
+    out[3] = access(path, R_OK) ? -errno : 0;
+    long n = readlink(path, buf, sizeof buf);
+    out[4] = n < 0 ? -errno : 0;
+    out[5] = stat(path, &st) ? 0 : (long)st.st_ino;
+}
+static int grl_inner(const char *self) {
+    char proc_place[256], dev_place[256], lp[256], lr[256], ld[256];
+    grl_path(proc_place, "proc");
+    grl_path(dev_place, "dev");
+    grl_path(lp, "lp");
+    grl_path(lr, "lr");
+    grl_path(ld, "ld");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    printf("binds=%d %d\n", mount("/proc", proc_place, NULL, MS_BIND | MS_REC, NULL) ? errno : 0,
+           mount("/dev", dev_place, NULL, MS_BIND | MS_REC, NULL) ? errno : 0);
+    printf("links=%d %d %d\n", symlink("/proc", lp), symlink("proc", lr), symlink("/dev", ld));
+    if (chroot(grl_base) || chdir("/")) return 81;
+    const char *pairs[][2] = {{"/proc", "/lp"}, {"/proc", "/lr"}, {"/dev", "/ld"}};
+    const char *names[] = {"self/comm", "uptime", "self", "self/exe", "null", "pts", "x8"};
+    for (unsigned i = 0; i < 3; i++)
+        for (unsigned j = 0; j < 7; j++) {
+            char direct[300], through[300];
+            snprintf(direct, sizeof direct, "%s/%s", pairs[i][0], names[j]);
+            snprintf(through, sizeof through, "%s/%s", pairs[i][1], names[j]);
+            long a[6], b[6];
+            grl_probe(direct, a);
+            grl_probe(through, b);
+            printf("%s: open=%ld stat=%ld lstat=%ld access=%ld readlink=%ld same=%d\n", through, a[0], a[1],
+                   a[2], a[3], a[4], !memcmp(a, b, sizeof a));
+        }
+    const char *runs[] = {"/proc/self/exe", "/lp/self/exe", "/lr/self/exe"};
+    for (unsigned i = 0; i < 3; i++) printf("exec %s=%d\n", runs[i], gl_exec(self, runs[i], 0));
+    return 0;
+}
+static int generated_rooted_links_case(const char *self) {
+    if (!mkdtemp(grl_base)) return 1;
+    char path[256];
+    grl_path(path, "proc");
+    mkdir(path, 0755);
+    grl_path(path, "dev");
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(grl_inner(self));
+    }
+    printf("status=%d\n", reaped(child));
+    const char *files[] = {"lp", "lr", "ld"};
+    for (unsigned i = 0; i < 3; i++) {
+        grl_path(path, files[i]);
+        unlink(path);
+    }
+    grl_path(path, "proc");
+    rmdir(path);
+    grl_path(path, "dev");
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(grl_base) == 0);
+    return 0;
+}
+
 /* The generated-noexec case: /proc and /dev are noexec mounts, so an
    executable mapping of a file there is EPERM before anything else is
    checked, and mprotect to one EACCES; a file reached through a link
@@ -22514,6 +22613,117 @@ static int proc_oom_case(void) {
     return 0;
 }
 
+/* The status-space case: the lines status has while the task has its
+   memory (CoreDumping, THP_enabled, untag_mask). PR_SET_THP_DISABLE (41)
+   changes THP_enabled for the whole space, which a thread shares and a fork
+   and an exec keep; it then refuses MADV_COLLAPSE (25), and a zombie, which
+   has no memory, shows none of the lines. */
+static void ss_field(const char *path, const char *name, char *out, size_t size) {
+    snprintf(out, size, "missing");
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(out, size, "open-%d", errno);
+        return;
+    }
+    char line[256];
+    size_t len = strlen(name);
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, name, len) && line[len] == ':') {
+            char *v = line + len + 1;
+            while (*v == '\t' || *v == ' ') v++;
+            v[strcspn(v, "\n")] = 0;
+            snprintf(out, size, "%s", v);
+            break;
+        }
+    }
+    fclose(f);
+}
+static void ss_show(const char *label, const char *path) {
+    const char *names[] = {"CoreDumping", "THP_enabled", "untag_mask"};
+    printf("%s:", label);
+    for (int i = 0; i < 3; i++) {
+        char v[64];
+        ss_field(path, names[i], v, sizeof v);
+        printf(" %s=%s", names[i], v);
+    }
+    printf("\n");
+}
+static void *ss_thread(void *arg) {
+    (void)arg;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/status", (long)syscall(SYS_gettid));
+    ss_show("thread", path);
+    printf("thread get: %d\n", prctl(42, 0, 0, 0, 0));
+    return NULL;
+}
+static void ss_try(const char *label, long arg2, long arg3, long arg4) {
+    errno = 0;
+    int r = prctl(41, arg2, arg3, arg4, 0);
+    printf("%s: %d errno=%d\n", label, r, errno);
+}
+static int status_space_case(const char *self, char **argv) {
+    if (argv[3] && !strcmp(argv[3], "show")) {
+        ss_show("exec", "/proc/self/status");
+        printf("exec get: %d\n", prctl(42, 0, 0, 0, 0));
+        return 0;
+    }
+    ss_show("default", "/proc/self/status");
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    errno = 0;
+    int r = prctl(42, 1, 0, 0, 0);
+    printf("get with an argument: %d errno=%d\n", r, errno);
+    ss_try("enable with a flag", 0, 2, 0);
+    ss_try("unknown flag", 1, 4, 0);
+    ss_try("fourth argument", 1, 0, 1);
+    ss_try("disable", 7, 0, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("disabled", "/proc/self/status");
+    pthread_t t;
+    if (pthread_create(&t, NULL, ss_thread, NULL)) return 80;
+    pthread_join(t, NULL);
+    long huge = 2L << 20;
+    char *area = mmap(NULL, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 81;
+    char *aligned = (char *)(((unsigned long)area + huge - 1) & ~(unsigned long)(huge - 1));
+    aligned[0] = 1;
+    errno = 0;
+    r = madvise(aligned, huge, 25);
+    printf("collapse: %d errno=%d\n", r, errno);
+    ss_try("except advised", 1, 2, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("except advised", "/proc/self/status");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ss_show("child", "/proc/self/status");
+        printf("child get: %d\n", prctl(42, 0, 0, 0, 0));
+        fflush(stdout);
+        execl(self, self, "status-space", self, "show", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(child, NULL, 0);
+    ss_try("disable again", 1, 0, 0);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        execl(self, self, "status-space", self, "show", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(child, NULL, 0);
+    pid_t zombie = fork();
+    if (zombie == 0) _exit(0);
+    siginfo_t info;
+    if (waitid(P_PID, zombie, &info, WEXITED | WNOWAIT)) return 82;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", zombie);
+    ss_show("zombie", path);
+    waitpid(zombie, NULL, 0);
+    ss_try("enable", 0, 0, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("enabled", "/proc/self/status");
+    return 0;
+}
+
 /* The core-filter case: /proc/<pid>/coredump_filter shows the filter bits
    of the process's memory in 8 hex digits, 0x33 at first; a write sets
    the low 9 bits of what kstrtouint reads in the base its prefix gives (no
@@ -22646,6 +22856,400 @@ static int core_filter_case(const char *self, char **argv) {
     unlink("core");
     unlink("data");
     if (chdir("/") || rmdir(dir)) return 86;
+    return 0;
+}
+
+/* The proc-timerslack case: /proc/<pid>/timerslack_ns and
+   PR_SET_TIMERSLACK and PR_GET_TIMERSLACK, of a thread's timer slack. A
+   write takes a decimal number as kstrtoull reads it (EINVAL for anything
+   else, ERANGE past 64 bits), and so does the file of another process, for
+   a writer with CAP_SYS_NICE (EPERM else, and for a read too). 0 gives back
+   the default, which a fork or a thread takes from its maker's slack then.
+   A real-time thread has none, and its slack changes neither way; one that
+   is no longer real-time gets its default. A thread's directory has no
+   timerslack_ns. */
+static void *ts_thread(void *unused) {
+    (void)unused;
+    long inherited = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    prctl(PR_SET_TIMERSLACK, 321UL, 0, 0, 0);
+    long own = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    prctl(PR_SET_TIMERSLACK, 0UL, 0, 0, 0);
+    long reset = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    long leader = oc_read("/proc/self/timerslack_ns");
+    printf("thread: inherited=%ld own=%ld reset=%ld leader=%ld\n", inherited, own, reset, leader);
+    return NULL;
+}
+#define TS_SET(text) oc_write("/proc/self/timerslack_ns", text, sizeof text - 1)
+static int ts_get(void) {
+    return prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+}
+static int proc_timerslack_case(void) {
+    printf("set: %d\n", prctl(PR_SET_TIMERSLACK, 4000UL, 0, 0, 0));
+    printf("get: %d\n", ts_get());
+    oc_read("/proc/self/timerslack_ns");
+    printf("text: %s", oc_text);
+    long r = TS_SET("777\n");
+    printf("write 777: %ld get=%d\n", r, ts_get());
+    r = TS_SET("+5");
+    printf("write +5: %ld get=%d\n", r, ts_get());
+    r = TS_SET("0x10");
+    printf("write 0x10: %ld\n", r);
+    r = TS_SET(" 5");
+    printf("write spaced: %ld\n", r);
+    r = TS_SET("abc");
+    printf("write word: %ld\n", r);
+    r = TS_SET("99999999999999999999");
+    printf("write huge: %ld\n", r);
+    r = TS_SET("18446744073709551615");
+    oc_read("/proc/self/timerslack_ns");
+    printf("write max: %ld text=%s", r, oc_text);
+    int again = prctl(PR_SET_TIMERSLACK, 4000UL, 0, 0, 0);
+    printf("set again: %d get=%d\n", again, ts_get());
+    struct stat st;
+    if (stat("/proc/self/timerslack_ns", &st)) return 80;
+    printf("mode: %o\n", st.st_mode & 07777);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/timerslack_ns", getpid());
+    printf("thread directory: %ld\n", oc_read(path));
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, ts_thread, NULL)) return 81;
+    pthread_join(thread, NULL);
+    printf("leader after thread: %d\n", ts_get());
+    pid_t parent = getpid();
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        printf("child: inherited=%d\n", ts_get());
+        prctl(PR_SET_TIMERSLACK, 99UL, 0, 0, 0);
+        prctl(PR_SET_TIMERSLACK, 0UL, 0, 0, 0);
+        printf("child reset: %d\n", ts_get());
+        struct sched_param param = {.sched_priority = 1};
+        long fifo = syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &param);
+        printf("fifo: %ld slack=%d\n", fifo, ts_get());
+        prctl(PR_SET_TIMERSLACK, 77UL, 0, 0, 0);
+        printf("fifo prctl: %d\n", ts_get());
+        r = TS_SET("88");
+        printf("fifo write: %ld slack=%d\n", r, ts_get());
+        param.sched_priority = 0;
+        long other = syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &param);
+        printf("other: %ld slack=%d\n", other, ts_get());
+        snprintf(path, sizeof path, "/proc/%d/timerslack_ns", parent);
+        printf("parent's: %ld\n", oc_read(path));
+        printf("write parent's: %ld\n", oc_write(path, "4500", 4));
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(82);
+        printf("user parent's: %ld\n", oc_read(path));
+        printf("user write parent's: %ld\n", oc_write(path, "1", 1));
+        printf("user own: %ld\n", oc_read("/proc/self/timerslack_ns"));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("child status=%#x parent after=%d\n", status, ts_get());
+    return 0;
+}
+
+/* The proc-login case: /proc/<pid>/loginuid and sessionid, a thread's
+   audit login user and session, read with no newline. Only the thread
+   itself writes its loginuid, at the start of the file, a decimal user ID
+   as kstrtou32 reads it; a set one changes only with CAP_AUDIT_CONTROL.
+   Each login starts a new session, -1 ends both. A fork child and a new
+   thread take their maker's, and a reader whose user namespace does not
+   map the user sees -1. */
+static char pl_thread_text[128];
+static void *pl_thread(void *unused) {
+    (void)unused;
+    long leader = oc_write("/proc/self/loginuid", "2000", 4);
+    long inherited = oc_read("/proc/thread-self/loginuid");
+    long own = oc_write("/proc/thread-self/loginuid", "2000", 4);
+    long now = oc_read("/proc/thread-self/loginuid");
+    snprintf(pl_thread_text, sizeof pl_thread_text,
+             "thread: leader's=%ld inherited=%ld own=%ld now=%ld\n", leader, inherited, own, now);
+    return NULL;
+}
+#define PL_SET(text) oc_write("/proc/self/loginuid", text, sizeof text - 1)
+static int proc_login_case(void) {
+    struct stat st[2];
+    if (stat("/proc/self/loginuid", &st[0]) || stat("/proc/self/sessionid", &st[1])) return 80;
+    printf("modes: %o %o\n", st[0].st_mode & 07777, st[1].st_mode & 07777);
+    oc_read("/proc/self/loginuid");
+    int newline = strchr(oc_text, '\n') != NULL;
+    oc_read("/proc/self/sessionid");
+    printf("newlines: %d %d\n", newline, strchr(oc_text, '\n') != NULL);
+    long before = oc_read("/proc/self/sessionid");
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        long r = PL_SET("1234");
+        printf("set: %ld loginuid=%ld\n", r, oc_read("/proc/self/loginuid"));
+        long first = oc_read("/proc/self/sessionid");
+        printf("session: set=%d new=%d\n", first != 4294967295L, first != before);
+        r = PL_SET("1234\n");
+        long second = oc_read("/proc/self/sessionid");
+        printf("again: %ld new=%d\n", r, second != first && second != 4294967295L);
+        printf("word: %ld\n", PL_SET("abc"));
+        printf("spaced: %ld\n", PL_SET(" 7"));
+        printf("negative: %ld\n", PL_SET("-1"));
+        printf("hex: %ld\n", PL_SET("0x10"));
+        printf("past 32 bits: %ld\n", PL_SET("4294967296"));
+        printf("after them: loginuid=%ld same=%d\n", oc_read("/proc/self/loginuid"),
+               oc_read("/proc/self/sessionid") == second);
+        /* A read moves the position, past which no write goes. */
+        int fd = open("/proc/self/loginuid", O_RDWR);
+        char byte;
+        ssize_t got = read(fd, &byte, 1);
+        ssize_t wrote = write(fd, "5", 1);
+        printf("after a read: got=%zd wrote=%zd errno=%d\n", got, wrote, wrote < 0 ? errno : 0);
+        close(fd);
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            printf("fork child: loginuid=%ld same session=%d\n", oc_read("/proc/self/loginuid"),
+                   oc_read("/proc/self/sessionid") == second);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(grandchild, NULL, 0);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, pl_thread, NULL)) _exit(81);
+        pthread_join(thread, NULL);
+        printf("%sleader after thread: %ld\n", pl_thread_text, oc_read("/proc/self/loginuid"));
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/loginuid", getppid());
+        printf("parent's: %ld\n", oc_write(path, "5", 1));
+        fflush(stdout);
+        pid_t unmapped = fork();
+        if (unmapped == 0) {
+            if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+            printf("unmapped: %ld\n", oc_read("/proc/self/loginuid"));
+            fflush(stdout);
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(unmapped, &status, 0);
+        printf("unmapped status=%#x\n", status);
+        r = PL_SET("4294967295");
+        printf("unset: %ld loginuid=%ld session=%ld\n", r, oc_read("/proc/self/loginuid"),
+               oc_read("/proc/self/sessionid"));
+        fflush(stdout);
+        pid_t user = fork();
+        if (user == 0) {
+            if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(82);
+            prctl(PR_SET_DUMPABLE, 1);
+            long set = PL_SET("1000");
+            long change = PL_SET("1001");
+            long unset = PL_SET("4294967295");
+            printf("user: set=%ld change=%ld unset=%ld loginuid=%ld\n", set, change, unset,
+                   oc_read("/proc/self/loginuid"));
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(user, &status, 0);
+        printf("user status=%#x\n", status);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("child status=%#x\n", status);
+    return 0;
+}
+
+/* The proc-cgroup-ids case: /proc/<pid>/cgroup, one line of the task's
+   control group (of the unified hierarchy, which the host's path differs
+   in, so only its form is printed), the same for a child and a thread, and
+   no cpuset, which Ubuntu's kernel leaves out (CONFIG_CPUSETS_V1); and
+   projid_map, the user namespace's project IDs, as
+   uid_map: all of them in the first namespace, none in a new one until one
+   write, which needs no capability, maps them. */
+static char ci_text[4096];
+static long ci_read(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    ssize_t n = read(fd, ci_text, sizeof ci_text - 1);
+    close(fd);
+    if (n < 0) return -errno;
+    ci_text[n] = 0;
+    return n;
+}
+static int ci_one_line(const char *text) {
+    const char *newline = strchr(text, '\n');
+    return newline && newline[1] == 0;
+}
+static int proc_cgroup_ids_case(void) {
+    char own_cgroup[4096], path[64];
+    ci_read("/proc/self/cgroup");
+    printf("cgroup: unified=%d one line=%d\n", !strncmp(ci_text, "0::/", 4), ci_one_line(ci_text));
+    strcpy(own_cgroup, ci_text);
+    printf("cpuset: %ld\n", ci_read("/proc/self/cpuset"));
+    snprintf(path, sizeof path, "/proc/self/task/%d/cgroup", getpid());
+    ci_read(path);
+    printf("thread's: same=%d\n", !strcmp(ci_text, own_cgroup));
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        pause();
+        _exit(0);
+    }
+    snprintf(path, sizeof path, "/proc/%d/cgroup", kid);
+    ci_read(path);
+    printf("child's: same=%d\n", !strcmp(ci_text, own_cgroup));
+    kill(kid, SIGKILL);
+    waitpid(kid, NULL, 0);
+    struct stat st[2];
+    if (stat("/proc/self/cgroup", &st[0]) || stat("/proc/self/projid_map", &st[1])) return 80;
+    printf("modes: %o %o\n", st[0].st_mode & 07777, st[1].st_mode & 07777);
+    ci_read("/proc/self/projid_map");
+    printf("first namespace: %s", ci_text);
+    printf("write first: %ld\n", oc_write("/proc/self/projid_map", "0 0 1", 5));
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+        printf("new: %ld\n", ci_read("/proc/self/projid_map"));
+        printf("write: %ld\n", oc_write("/proc/self/projid_map", "0 1000 10\n", 10));
+        ci_read("/proc/self/projid_map");
+        printf("written: %s", ci_text);
+        printf("again: %ld\n", oc_write("/proc/self/projid_map", "20 2000 1", 9));
+        ci_read("/proc/self/uid_map");
+        printf("uid_map still: %ld\n", (long)strlen(ci_text));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    printf("namespace status=%#x\n", status);
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+        printf("word: %ld\n", oc_write("/proc/self/projid_map", "x", 1));
+        printf("no IDs: %ld\n", oc_write("/proc/self/projid_map", "0 0 0", 5));
+        printf("overlap: %ld\n", oc_write("/proc/self/projid_map", "0 0 5\n3 10 5", 12));
+        printf("wraps: %ld\n", oc_write("/proc/self/projid_map", "0 4294967290 10", 15));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, &status, 0);
+    printf("bad status=%#x\n", status);
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(82);
+        /* Its files are its own again, not root's. */
+        prctl(PR_SET_DUMPABLE, 1);
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+        printf("user: %ld\n", oc_write("/proc/self/projid_map", "0 5 3", 5));
+        ci_read("/proc/self/projid_map");
+        printf("user written: %s", ci_text);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(kid, &status, 0);
+    printf("user status=%#x\n", status);
+    return 0;
+}
+
+/* The proc-children case: /proc/<pid>/task/<tid>/children, the processes a
+   thread made that are not yet reaped, zombies too, each followed by a
+   space; a thread's own children are not its leader's until it ends, when
+   they become the leader's. The process's directory has no children file,
+   and only it has timerslack_ns. */
+static int pc_has(const char *text, pid_t pid) {
+    char word[24];
+    snprintf(word, sizeof word, "%d ", pid);
+    for (const char *at = text; (at = strstr(at, word)); at++)
+        if (at == text || at[-1] == ' ') return 1;
+    return 0;
+}
+static int pc_count(const char *text) {
+    int count = 0;
+    for (; *text; text++) count += *text == ' ';
+    return count;
+}
+static int pc_listed(const char *dir, const char *name) {
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) found |= !strcmp(e->d_name, name);
+    closedir(d);
+    return found;
+}
+static pid_t pc_kid;
+static char pc_thread_text[128];
+static void *pc_thread(void *unused) {
+    (void)unused;
+    pc_kid = fork();
+    if (pc_kid == 0) {
+        pause();
+        _exit(0);
+    }
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/children", syscall(SYS_gettid));
+    ci_read(path);
+    int own = pc_has(ci_text, pc_kid);
+    snprintf(path, sizeof path, "/proc/self/task/%d/children", getpid());
+    ci_read(path);
+    snprintf(pc_thread_text, sizeof pc_thread_text, "thread: own=%d leader's=%d\n", own,
+             pc_has(ci_text, pc_kid));
+    return NULL;
+}
+static int proc_children_case(void) {
+    char path[64], dir[64];
+    snprintf(dir, sizeof dir, "/proc/self/task/%d", getpid());
+    snprintf(path, sizeof path, "%s/children", dir);
+    printf("none: %ld\n", ci_read(path));
+    fflush(stdout);
+    pid_t a = fork();
+    if (a == 0) {
+        pause();
+        _exit(0);
+    }
+    pid_t b = fork();
+    if (b == 0) _exit(0);
+    siginfo_t info;
+    waitid(P_PID, b, &info, WEXITED | WNOWAIT);
+    ci_read(path);
+    char first[24];
+    snprintf(first, sizeof first, "%d ", a);
+    printf("two: a=%d b=%d count=%d last space=%d a first=%d\n", pc_has(ci_text, a),
+           pc_has(ci_text, b), pc_count(ci_text), ci_text[strlen(ci_text) - 1] == ' ',
+           !strncmp(ci_text, first, strlen(first)));
+    waitpid(b, NULL, 0);
+    ci_read(path);
+    printf("reaped: b=%d count=%d\n", pc_has(ci_text, b), pc_count(ci_text));
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, pc_thread, NULL)) return 81;
+    pthread_join(thread, NULL);
+    ci_read(path);
+    printf("%sleader's after it ended: %d\n", pc_thread_text, pc_has(ci_text, pc_kid));
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        char other[64];
+        snprintf(other, sizeof other, "/proc/%d/task/%d/children", getppid(), getppid());
+        ci_read(other);
+        printf("another process's: a=%d\n", pc_has(ci_text, a));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(reader, NULL, 0);
+    printf("process directory: %ld\n", ci_read("/proc/self/children"));
+    struct stat st;
+    if (stat(path, &st)) return 80;
+    printf("mode: %o\n", st.st_mode & 07777);
+    printf("listed: thread children=%d timerslack_ns=%d process children=%d timerslack_ns=%d\n",
+           pc_listed(dir, "children"), pc_listed(dir, "timerslack_ns"),
+           pc_listed("/proc/self", "children"), pc_listed("/proc/self", "timerslack_ns"));
+    printf("listed: loginuid=%d sessionid=%d cgroup=%d cpuset=%d projid_map=%d\n",
+           pc_listed("/proc/self", "loginuid"), pc_listed("/proc/self", "sessionid"),
+           pc_listed("/proc/self", "cgroup"), pc_listed("/proc/self", "cpuset"),
+           pc_listed("/proc/self", "projid_map"));
+    kill(a, SIGKILL);
+    kill(pc_kid, SIGKILL);
+    waitpid(a, NULL, 0);
+    waitpid(pc_kid, NULL, 0);
     return 0;
 }
 
@@ -44543,6 +45147,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-link-names")) return generated_link_names_case(self);
     if (!strcmp(mode, "generated-link-ran")) return 7;
+    if (!strcmp(mode, "generated-rooted-links")) return generated_rooted_links_case(self);
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();
@@ -44586,6 +45191,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "status-memory")) return status_memory_case();
     if (!strcmp(mode, "proc-oom")) return proc_oom_case();
     if (!strcmp(mode, "core-filter")) return core_filter_case(self, argv);
+    if (!strcmp(mode, "proc-timerslack")) return proc_timerslack_case();
+    if (!strcmp(mode, "proc-login")) return proc_login_case();
+    if (!strcmp(mode, "proc-cgroup-ids")) return proc_cgroup_ids_case();
+    if (!strcmp(mode, "proc-children")) return proc_children_case();
     if (!strcmp(mode, "leader-exit-status")) return leader_exit_status_case();
     if (!strcmp(mode, "thread-own-counters")) return thread_own_counters_case();
     if (!strcmp(mode, "leader-zombie-task")) return leader_zombie_task_case();
@@ -44600,6 +45209,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userns-nondumpable-target")) return userns_nondumpable_target();
     if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
+    if (!strcmp(mode, "status-space")) return status_space_case(self, argv);
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "segment-registers")) return segments_case();

@@ -1,6 +1,6 @@
 #!/bin/bash
 # programs.sh <emulator> <name>: runs the probe, ripgrep and aube cases once and
-# prints "time <case> <name> <seconds>" for each (jit-speed.yml).
+# prints "time <case> <name> <seconds>" for each (jit-speed.yml, jit-ab.yml).
 set -u
 E=$1; N=$2; shift 2
 G=$PWD/target/guests/programs

@@ -420,6 +420,7 @@ pub mod faults {
         static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
         static NOTED: Cell<bool> = const { Cell::new(false) };
         static RETRIED: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+        static PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
     }
 
@@ -515,6 +516,33 @@ pub mod faults {
         fault: &super::Fault,
         scope: &mut Option<RetryScope>,
     ) -> bool {
+        let page = (fault.addr.0 & !(super::PAGE_SIZE - 1), fault.write);
+        // What is pending is this access's once it has its scope, which
+        // hides another's. A fault elsewhere: the retry of the one before
+        // got past it.
+        let pending = |page_is: fn(&(u64, bool), &(u64, bool)) -> bool| {
+            PENDING
+                .with(Cell::get)
+                .is_some_and(|pending| page_is(&pending.page, &page))
+        };
+        if scope.is_some() && pending(|a, b| a != b) {
+            count_pending();
+        }
+        let retried = resolve_once(space, fault, scope);
+        // The retry fails: Linux's `mm_account_fault` counts no fault that
+        // ends in an error, and `fault_signal_pending` none that a fatal
+        // signal ends.
+        if !retried && scope.is_some() && pending(|a, b| a == b) {
+            PENDING.with(Cell::take);
+        }
+        retried
+    }
+
+    fn resolve_once(
+        space: impl FnOnce() -> super::MemoryView,
+        fault: &super::Fault,
+        scope: &mut Option<RetryScope>,
+    ) -> bool {
         let gup = GUP.with(Cell::get);
         if !KERNEL.with(Cell::get) || gup == Gup::Locked || fault.bus || fault.fetch {
             return false;
@@ -537,19 +565,47 @@ pub mod faults {
         retried
     }
 
+    /// A retried fault of a kernel access, not counted yet: its page, a
+    /// write or not, and where it was.
+    #[derive(Clone, Copy)]
+    struct Pending {
+        page: (u64, bool),
+        at: At,
+    }
+
     /// A kernel access's fault is tried again, as a `userfaultfd` lets it:
     /// a kernel-mode fault does not run under the VMA's lock first, so
     /// Linux's `do_user_addr_fault` retries it with `FAULT_FLAG_TRIED`, and
-    /// `mm_account_fault` counts it once, as a major one, whether the retry
-    /// brings the page in or finds it there. It is counted here, and the
-    /// retry's own fault of the page, if it takes one, is not counted again
-    /// ([`count`]); nor is a second wait of the same fault.
+    /// `mm_account_fault` counts it once, as a major one, when the retry
+    /// completes, whether it brings the page in or finds it there. So it is
+    /// counted when the retry gets past the page ([`count_pending`]): the
+    /// access ends ([`RetryScope`]) or faults elsewhere, or the retry's own
+    /// fault brings the page in ([`count`]). A second wait of the same fault
+    /// adds nothing, and one that fails ([`resolve`]), as for a fatal
+    /// signal, takes it back.
     fn retry_major(fault: &super::Fault) {
         let retried = (fault.addr.0 & !(super::PAGE_SIZE - 1), fault.write);
         if RETRIED.with(|r| r.replace(Some(retried))) == Some(retried) {
             return;
         }
         NOTED.with(|noted| noted.set(true));
+        PENDING.with(|pending| {
+            pending.set(Some(Pending {
+                page: retried,
+                at: At {
+                    addr: fault.addr.0,
+                    present: fault.present,
+                },
+            }));
+        });
+    }
+
+    /// Counts the pending retried fault ([`retry_major`]), if there is
+    /// one, as a major fault.
+    fn count_pending() {
+        let Some(Pending { at, .. }) = PENDING.with(Cell::take) else {
+            return;
+        };
         SINK.with(|sink| {
             // A kernel access is made for a bound thread
             // (`KernelFaults::enter`).
@@ -559,10 +615,6 @@ pub mod faults {
                     .fetch_add(1, Ordering::SeqCst)
                     .wrapping_add(1);
                 if ADDRESSES.load(Ordering::Relaxed) {
-                    let at = At {
-                        addr: fault.addr.0,
-                        present: fault.present,
-                    };
                     counts.fault(true, true, nth, at);
                 }
             }
@@ -605,25 +657,32 @@ pub mod faults {
     /// holds what this returns, ends: so the record is only of the retries
     /// of one access, and a later access that faults on the page again
     /// counts its own fault.
+    ///
+    /// When the access ends, a retried fault of its that is still pending
+    /// ([`retry_major`]) has not failed: the retry got past the page, and
+    /// it is counted then.
     fn retry_scope() -> RetryScope {
-        RetryScope(RETRIED.with(Cell::take))
+        RetryScope(RETRIED.with(Cell::take), PENDING.with(Cell::take))
     }
-    pub(crate) struct RetryScope(Option<(u64, bool)>);
+    pub(crate) struct RetryScope(Option<(u64, bool)>, Option<Pending>);
     impl Drop for RetryScope {
         fn drop(&mut self) {
+            count_pending();
             RETRIED.with(|r| r.set(self.0.take()));
+            PENDING.with(|p| p.set(self.1.take()));
         }
     }
 
     /// Counts a fault of a `write` or a read `at`, unless it is the retry
-    /// of a kernel access's fault already counted as a major one
-    /// ([`retry_major`]).
+    /// of a kernel access's fault, which brings the page in and completes:
+    /// that counts as the major one it is ([`retry_major`]).
     pub(crate) fn count(at: At, write: bool) {
         NOTED.with(|noted| noted.set(true));
         if let Some(retried) = RETRIED.with(Cell::take)
             && retried == (at.addr & !(super::PAGE_SIZE - 1), write)
             && KERNEL.with(Cell::get)
         {
+            count_pending();
             return;
         }
         if GUP.with(Cell::get) != Gup::No {
@@ -713,6 +772,7 @@ pub mod faults {
         // What a retried fault left ([`retry_major`]) ends with the work it
         // was of.
         RETRIED.with(|r| r.set(None));
+        PENDING.with(|p| p.set(None));
         KERNEL.with(|was| was.replace(kernel))
     }
 
@@ -3259,6 +3319,9 @@ struct AddressSpaceData {
     /// `mm->flags`, which `/proc/<pid>/coredump_filter` shows): a fork's
     /// copy and an `execve`'s new space keep them.
     dump_filter: u32,
+    /// What `PR_SET_THP_DISABLE` set (Linux's `MMF_DISABLE_THP_*`), which a
+    /// fork's copy and an `execve`'s new space keep too.
+    thp_disable: ThpDisable,
 }
 
 impl Drop for AddressSpaceData {
@@ -3365,6 +3428,7 @@ impl AddressSpaceData {
             peak_resident: 0,
             peak_size: 0,
             dump_filter: DEFAULT_DUMP_FILTER,
+            thp_disable: ThpDisable::No,
         }
     }
 
@@ -4348,6 +4412,7 @@ impl AddressSpaceData {
         copy.mappings = self.mappings.clone();
         copy.anon_names = self.anon_names.clone();
         copy.dump_filter = self.dump_filter;
+        copy.thp_disable = self.thp_disable;
         copy.shared = self.shared.clone();
         copy.backing = self.backing.clone();
         // Linux's `VM_COPY_ON_FORK` has `VM_MAYBE_GUARD`: the child gets the
@@ -8058,7 +8123,8 @@ impl AddressSpaceData {
     /// Linux's `madvise_collapse` of `[start, end)` in the VMA
     /// `[vma_start, vma_end)`: the VMA must be one that may hold a
     /// transparent huge page (`thp_vma_allowable_order` with
-    /// `TVA_FORCED_COLLAPSE`, `EINVAL`): without `MADV_NOHUGEPAGE`, with
+    /// `TVA_FORCED_COLLAPSE`, `EINVAL`): without `MADV_NOHUGEPAGE` or a
+    /// `PR_SET_THP_DISABLE` of the whole space ([`ThpDisable`]), with
     /// room for an aligned 2 MiB extent, and either private anonymous
     /// memory with an `anon_vma` (a page of it was written,
     /// [`Mapping::anon_vma`]) or a mapping of shmem's page cache
@@ -8085,7 +8151,10 @@ impl AddressSpaceData {
         ) && self.shared_at(vma_start).is_none()
             && self.backing_at(vma_start).is_none();
         let room = vma_end >= HUGE_PAGE && (vma_end - HUGE_PAGE) & !(HUGE_PAGE - 1) >= vma_start;
-        if mapping.huge_pages == Some(false) || !room {
+        // `vma_thp_disabled`: a forced collapse is advice enough for a
+        // space that disabled them only where not advised.
+        if mapping.huge_pages == Some(false) || self.thp_disable == ThpDisable::Completely || !room
+        {
             return Err(Errno::EINVAL);
         }
         if !anonymous {
@@ -8802,6 +8871,13 @@ impl MemoryView {
         lock_spinning(&data).dump_filter = bits & DUMP_FILTER_MASK;
         true
     }
+    /// [`AddressSpace::thp_disable`] of the space, while it lives.
+    #[must_use]
+    pub fn thp_disable(&self) -> Option<ThpDisable> {
+        let data = self.data.upgrade()?;
+        let _serialization = lock_spinning(&self.serialization);
+        Some(lock_spinning(&data).thp_disable)
+    }
     /// The first VMA that ends after `addr`, if the space still lives and
     /// has one.
     #[must_use]
@@ -9406,6 +9482,19 @@ const DUMP_FILTER_MASK: u32 = (1 << DUMP_FILTER_BITS) - 1;
 /// it): anonymous private and shared memory, ELF headers and hugetlb
 /// private memory.
 pub const DEFAULT_DUMP_FILTER: u32 = 0x33;
+/// Whether a space disabled transparent huge pages with
+/// `PR_SET_THP_DISABLE` (Linux's `MMF_DISABLE_THP_COMPLETELY` and
+/// `MMF_DISABLE_THP_EXCEPT_ADVISED`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThpDisable {
+    #[default]
+    No,
+    /// For every VMA: `MADV_COLLAPSE` too is refused.
+    Completely,
+    /// Only where `MADV_HUGEPAGE` did not ask for them
+    /// (`PR_THP_DISABLE_EXCEPT_ADVISED`).
+    ExceptAdvised,
+}
 impl Default for AddressSpace {
     fn default() -> Self {
         Self::new()
@@ -9745,6 +9834,15 @@ impl AddressSpace {
     /// Sets the core dump filter bits, the low [`DUMP_FILTER_BITS`].
     pub fn set_dump_filter(&self, bits: u32) {
         self.locked().dump_filter = bits & DUMP_FILTER_MASK;
+    }
+    /// What `PR_SET_THP_DISABLE` set ([`ThpDisable::No`] at first), which
+    /// an `execve`'s new space takes from the old.
+    #[must_use]
+    pub fn thp_disable(&self) -> ThpDisable {
+        self.locked().thp_disable
+    }
+    pub fn set_thp_disable(&self, value: ThpDisable) {
+        self.locked().thp_disable = value;
     }
     /// The kernel's `membarrier` state for this space, shared by every
     /// thread that runs in it.
@@ -11950,7 +12048,8 @@ mod tests {
             }
         }
         /// Serves each fault as `how` says of its page: 0 copies, 1
-        /// unregisters, 2 wakes once with nothing done, then copies.
+        /// unregisters, 2 wakes once with nothing done, then copies, 3 wakes
+        /// once with nothing done, then fails, as for a fatal signal.
         struct Serve {
             how: AtomicU64,
             woken: AtomicU64,
@@ -11959,8 +12058,11 @@ mod tests {
             fn resolve(&self, space: &MemoryView, addr: u64, _: bool, _: bool) -> bool {
                 let page = addr & !(PAGE_SIZE - 1);
                 let how = self.how.load(Ordering::SeqCst);
-                if how == 2 && self.woken.fetch_add(1, Ordering::SeqCst) == 0 {
+                if (how == 2 || how == 3) && self.woken.fetch_add(1, Ordering::SeqCst) == 0 {
                     return true;
+                }
+                if how == 3 {
+                    return false;
                 }
                 if how == 1 {
                     space
@@ -12023,14 +12125,38 @@ mod tests {
         let mut byte = [0];
         space.read(page(2), &mut byte).unwrap();
         assert_eq!((load(), byte), ([0, 0, 0, 4], [7]));
+        // One whose retry waits again and fails takes none, as Linux's
+        // `fault_signal_pending` returns before `mm_account_fault`.
+        let other = space
+            .map(
+                None,
+                3 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let other = |n: u64| GuestAddr(other.0 + n * PAGE_SIZE);
+        space
+            .view()
+            .userfault_register(other(0).0, other(3).0, 7, Userfault::MISSING)
+            .unwrap();
+        serve.how.store(3, Ordering::SeqCst);
+        serve.woken.store(0, Ordering::SeqCst);
+        assert!(space.read(other(0), &mut byte).is_err());
+        assert_eq!(load(), [0, 0, 0, 4]);
+        // A copy across two pages that each wait takes a major fault of
+        // each, the first counted once the retry gets past it.
+        serve.how.store(0, Ordering::SeqCst);
+        let mut two = [0; 2];
+        space.read(GuestAddr(other(2).0 - 1), &mut two).unwrap();
+        assert_eq!((load(), two), ([0, 0, 0, 6], [7, 7]));
         // Through `get_user_pages`, the retry finds the page and counts
         // nothing (`__get_user_pages`).
-        serve.how.store(0, Ordering::SeqCst);
         faults::through_gup(|| space.write(page(3), &[1])).unwrap();
-        assert_eq!(load(), [0, 0, 0, 4]);
+        assert_eq!(load(), [0, 0, 0, 6]);
         // A later fault of another page is a minor one again.
         space.write(page(4), &[1]).unwrap();
-        assert_eq!(load(), [0, 1, 0, 4]);
+        assert_eq!(load(), [0, 1, 0, 6]);
         faults::set_kernel(kernel);
         faults::set_resolver(was);
         faults::unbind();

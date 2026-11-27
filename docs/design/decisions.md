@@ -155,8 +155,10 @@ the real work started.
   threads start and end, against none of 2,700 with the memory grown
   beforehand. The allocator gets more memory only by growing it, so the
   launcher allocates the heap and frees it at once: in blocks of 64 MiB while
-  they fit, then of half that size and so on down to one 64 KiB page, so that
-  no block's worth is left to grow later. It does not write to these blocks,
+  they fit, then of half that size and so on down to 64 bytes, so that the
+  memory ends at its maximum. With the allocator's header a block of a whole
+  page takes a little more than a page, so it cannot take the last one; the
+  smaller blocks do. It does not write to these blocks,
   so on macOS their pages take no physical memory until used. Other browsers
   grow the memory as needed, since on Windows, and in Firefox on Linux, a
   grown memory counts against the system's commit limit at once.

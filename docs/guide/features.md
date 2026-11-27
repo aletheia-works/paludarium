@@ -119,7 +119,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX, UDP and TCP sockets (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD` of socket filters, with a verifier and an interpreter, attached to AF_UNIX, UDP and TCP sockets or run with `BPF_PROG_TEST_RUN` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -671,7 +671,9 @@ kernel.
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`; that send drops what the end has not
   read, as below. Only `SOCK_STREAM` raises `SIGPIPE` with
-  `EPIPE`, as on Linux.
+  `EPIPE`, as on Linux, and only when nothing was sent; a pipe raises it
+  also when its last reader leaves after part of a write, which returns
+  that part.
 
 - `socket(AF_UNIX)` makes a `SOCK_STREAM` or `SOCK_SEQPACKET` socket that
   binds to a name in the abstract namespace (a `sun_path` starting with 0),
@@ -858,7 +860,9 @@ kernel.
     `EAGAIN`, and so is a write to standard output or standard error that
     the host has no room for. A write to either once its reader is gone (a
     pipe into a `head` that has exited) is `EPIPE` and raises `SIGPIPE`, as
-    a write to any pipe with no reader.
+    a write to any pipe with no reader. A write whose reader leaves after
+    part of it went still raises `SIGPIPE`, and returns that part, as
+    Linux's `pipe_write`.
   - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:
     `POLL_OUT` when a connection opens, `POLL_ERR` when it fails, `POLL_IN`
     when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once
@@ -1139,7 +1143,8 @@ kernel.
   neither advice (`EINVAL`).
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
-  `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent, a
+  `MADV_NOHUGEPAGE` or in a space that `PR_SET_THP_DISABLE` disabled for
+  every VMA, one with no room for an aligned 2 MiB extent, a
   private anonymous one no page of which was written, a shmem one whose
   addresses and file offsets are not 2 MiB aligned to each other, and a
   regular file's mapping refuse it (`EINVAL`), and a range with no whole
@@ -1305,7 +1310,10 @@ kernel.
   fault does not run under the VMA's lock first, so its retry is
   `FAULT_FLAG_TRIED`, and it counts once (`ru_majflt`, `page-faults`,
   `major-faults`, and no minor fault), whether the retry brings the page in
-  or not. One through `get_user_pages` finds the page there and counts
+  or not. It counts when the retry completes, as `mm_account_fault` does:
+  a retry that waits again (after a `UFFDIO_WAKE` that filled nothing)
+  adds nothing, and one that then fails, as for a fatal signal, counts
+  none. One through `get_user_pages` finds the page there and counts
   nothing.
   With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
   instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
@@ -1877,7 +1885,8 @@ kernel.
 - io_uring is Linux 6.12's, but for its registered files, its groups of
   buffers and a NOP's flags, which are Linux 7.0's (`io_uring/rsrc.c`,
   `kbuf.c` and `nop.c`, with master's `IOSQE_FIXED_FILE` for a NOP), the
-  kernel the differential tests run on. Its
+  kernel the differential tests run on, and so are the operations,
+  registrations and setup and `io_uring_enter` flags it knows of. Its
   operations are `IORING_OP_NOP`,
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with), and
   the file transfers `IORING_OP_READ`, `_WRITE`, `_READV`, `_WRITEV`,
@@ -1890,9 +1899,9 @@ kernel.
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`,
   `IORING_OP_SPLICE` and `_TEE`, and the socket requests
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
-  `_RECV`, `_SENDMSG` and `_RECVMSG`. Linux 6.12's other operations
-  complete with `EOPNOTSUPP`, as on a Linux built without them, and later
-  ones with `EINVAL`, as on 6.12, and `IORING_REGISTER_PROBE` reports only these. The
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations, up to Linux
+  7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`, as on a Linux
+  built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
   as `anon_inode_create_getfile` makes one: `fstat` gives a new inode
@@ -2849,7 +2858,7 @@ kernel.
   `ptrace` access, priorities, limits) as its user namespace has it, and
   over the machine (`RENAME_WHITEOUT`, real-time scheduling, `vhangup`, the
   `trusted.*` attributes and the like) only in the first user namespace.
-  `/proc/<pid>/uid_map` and `gid_map` read the extents of the task's user
+  `/proc/<pid>/uid_map` and `gid_map` (and `projid_map`, below) read the extents of the task's user
   namespace, the lower IDs as the reader's namespace has them (its parent's
   for its own), and take one write of up to 340 lines of three numbers, in
   Linux's order and with its checks (`proc_uid_map_write`, `map_write`,
@@ -3157,7 +3166,10 @@ kernel.
     it. A socket not bound takes
     the source of the hop it hashes to with no source, and a connection or
     a UDP connect then looks its route up from that source
-    (`ip_route_connect`). A packet may come in on the device of any hop of
+    (`ip_route_connect`). A socket's flow hashes its own port, which a UDP
+    socket has before its route (`inet_send_prepare`, `inet_dgram_connect`),
+    and a connection with none yet a random one (`FLOWI_FLAG_ANY_SPORT`);
+    an answer hashes its own ports. A packet may come in on the device of any hop of
     the route back to its source (`fib_info_nh_uses_dev`), and its answer
     goes back by a lookup of its own, through whichever end that takes, or
     the one its listener is bound to. An output lookup that goes through
@@ -3265,6 +3277,38 @@ kernel.
     none or its sender, that is a member of the group, on whatever device,
     or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
     connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
+  - **IPv6 anycast addresses:** an IPv6 socket, TCP's too, joins and
+    leaves an anycast address with `IPV6_JOIN_ANYCAST` and
+    `IPV6_LEAVE_ANYCAST`, an `ipv6_mreq` (`EINVAL` for less), on the
+    device of an index or that of the route to it (0)
+    (`ipv6_sock_ac_join`, `ipv6_sock_ac_drop`): `EPERM` without
+    `CAP_NET_ADMIN`; `EINVAL` for a multicast address or one of the
+    namespace's addresses that is not tentative; `ENODEV` for no device;
+    `EADDRNOTAVAIL` for no route, unless `all` forwards, when it is the
+    first device up that is no loopback, and, on a device that does not
+    forward, for an address of no prefix of the device's addresses; and
+    `ENOENT` to leave as none, on the device named, or the newest joined
+    on any (0). A device that forwards joins the subnet-router anycast
+    address (the prefix) of each of its addresses, but one of 127 bits or
+    more: as the address is ready, after its duplicate address detection
+    or at once without, and of those not tentative as it comes to
+    forward; it leaves it as the address goes, or as it stops
+    (`addrconf_join_anycast`, `dev_forward_change`). Each is counted, once
+    for each, the newest first (`__ipv6_dev_ac_inc`). Joined anew, it adds
+    a route of type `RTN_ANYCAST` to the local table through the device,
+    joins its solicited-node group (a loopback does not) and tells
+    `RTNLGRP_IPV6_ACADDR` (39) with `RTM_NEWANYCAST`; left for good, it
+    leaves the group, its route goes, if there still, and it tells
+    `RTM_DELANYCAST` (`inet6_ifacaddr_notify`). Down, the device's routes go, those of
+    what sockets joined too, which stay joined without one; going, what
+    is left goes without a word (`ipv6_ac_destroy_dev`); a socket's close
+    leaves what it joined. `/proc/net/anycast6` (`ac6_seq_show`) shows
+    each device's, in the namespace's order, with their users; an
+    `RTM_GETANYCAST` dump (`inet6_dump_ifacaddr`), checked as an IPv6
+    address dump, gives them by index, as permanent addresses of 128 bits
+    (`IFA_ANYCAST`) of the universe's scope, the site's (200) for a
+    site-local one, with endless lifetimes (`inet6_fill_ifacaddr`); and
+    `ipv6_route` shows their routes with `RTF_ANYCAST`.
   - **Source filters:** a membership takes what its filter lets in: from its
     sources (`MCAST_INCLUDE`) or from all others (`MCAST_EXCLUDE`, of no
     sources as a join leaves it). IPv4's `IP_ADD_SOURCE_MEMBERSHIP`,
@@ -3550,7 +3594,11 @@ kernel.
     and main tables, then the default table's where they have none or a
     `throw` route; IPv6 in the local table, then the main one, while `lo`
     is up. A rejecting route's error is the answer (`EINVAL`,
-    `EHOSTUNREACH`, `EACCES`). An IPv4 answer names the main table (with
+    `EHOSTUNREACH`, `EACCES`), and a socket's connection or datagram it
+    takes fails with it too; one an IPv4 unicast route through `lo` takes
+    goes out through `lo`, as one from a socket bound to `lo` does, even
+    while `lo` is down by one of host scope, which stays
+    (`fib_sync_down_dev`). An IPv4 answer names the main table (with
     `RTM_F_LOOKUP_TABLE`, the table it came from), the source
     `fib_select_path` picks, a gateway reached on link, the `RTA_MARK` the
     request names (none for 0), and the caller's
@@ -4339,8 +4387,9 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `personality`, `comm`, `syscall`, `exe`, `cwd`, `root`, `maps`, `mem`, `mounts`, `mountinfo`,
-  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `oom_score`, `oom_adj`, `oom_score_adj`,
-  `coredump_filter`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `clear_refs`, `smaps`, `smaps_rollup`, `pagemap`, `wchan`, `cgroup`, `oom_score`, `oom_adj`,
+  `oom_score_adj`, `loginuid`, `sessionid`, `coredump_filter`, `io`, `uid_map`, `gid_map`,
+  `projid_map`, `setgroups`, `timerslack_ns`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them: root of the user namespace its program runs in, or the first
@@ -4384,8 +4433,13 @@ kernel.
   `RssShmem`), the private writable mappings and the stack (`VmData`,
   `VmStk`), the code range and the other executable mappings (`VmExe`,
   `VmLib`), and 0 for `VmSwap` and `HugetlbPages`, as nothing is swapped
-  out and the pool of huge pages is empty. `VmPin`, `VmPTE` and the CPU
-  fields are not there, as nothing counts them. The peak of the size is
+  out and the pool of huge pages is empty. After them, while the task has
+  its memory, come `CoreDumping` (1 from the fatal signal that dumps its
+  process's core until the last thread has written it), `THP_enabled` (0
+  once `PR_SET_THP_DISABLE` disabled transparent huge pages for the whole
+  space) and `untag_mask`, all ones as nothing enables linear address
+  masking. `VmPin`, `VmPTE` and the CPU fields are not there, as nothing
+  counts them. The peak of the size is
   Linux's `hiwater_vm`: noted when an unmap takes mapped pages away, as
   `vms_complete_munmap_vmas` calls `update_hiwater_vm` (a fixed mapping
   that replaces them counts its own pages only after it), but not when
@@ -4418,13 +4472,16 @@ kernel.
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
   `comm`, `syscall` (0400), `maps`, `mem` (0600), `clear_refs` (0200), `smaps`, `smaps_rollup`, `pagemap` (0400), `wchan`,
-  `oom_score`, `oom_adj`, `oom_score_adj`, `coredump_filter`, `io` (0400), `exe`, `cwd`,
-  `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
+  `cgroup`, `oom_score`, `oom_adj`, `oom_score_adj`, `loginuid`, `sessionid`,
+  `coredump_filter`, `io` (0400), `uid_map`, `gid_map`, `projid_map`, `setgroups`,
+  `timerslack_ns` (0666), `exe`, `cwd`, `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns`
+  (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
-  has the same files but `task` and `coredump_filter`, of that thread: its name, its signal masks,
+  has the same files but `task`, `coredump_filter` and `timerslack_ns`, and
+  `children` too, of that thread: its name, its signal masks,
   its ID as `Pid` with the process's as `Tgid`, its own credentials (the
   process's `status`, `/proc/self/status` too, shows the leader's, as Linux's
   `proc_pid_status`), and its own `voluntary_ctxt_switches` (the times it
@@ -4466,7 +4523,9 @@ kernel.
   directory (0555) staying its own, and an open checks a regular
   file's mode for that owner before anything else, as Linux's
   `generic_permission` does (`EACCES`): writing needs `CAP_DAC_OVERRIDE`
-  but for `comm`, `uid_map`, `gid_map` and `setgroups` (0644), and
+  but for `comm`, `oom_adj`, `oom_score_adj`, `loginuid`, `coredump_filter`,
+  `uid_map`, `gid_map`, `projid_map` and `setgroups` (0644) and `timerslack_ns`
+  (0666), and
   reading `environ`, `auxv`, `pagemap` or `mem` needs the owner or
   `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner as this
   process's own do (above). `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
@@ -4540,6 +4599,54 @@ kernel.
   newline allowed after it but no space (`EINVAL`, `ERANGE` past 32 bits),
   and returns all it was given; once no thread runs in the memory it reads
   empty and a write is `ESRCH`. A thread's directory has none.
+
+- `timerslack_ns` (0666) of a process is its leader thread's timer slack in
+  nanoseconds, which `PR_SET_TIMERSLACK` and `PR_GET_TIMERSLACK` set and read
+  for the calling thread: 50000 for the first task, and a new thread's or
+  process's is its maker's, whose slack then is also its default. A reader
+  or writer other than that thread needs `CAP_SYS_NICE` in its user
+  namespace (`EPERM` at the read or the write, as Linux's
+  `timerslack_ns_show` and `timerslack_ns_write` check it). A write takes
+  what `kstrtoull` reads in decimal, of up to 66 bytes (`EINVAL`, `ERANGE`
+  past 64 bits), and returns all it was given, leaving the position where it
+  was. Setting 0 gives back the default. A real-time or deadline thread has
+  no slack: `sched_setscheduler` and the like make it 0, a write keeps it 0,
+  `PR_SET_TIMERSLACK` leaves it, and leaving those policies gives back the
+  default. Nothing waits longer for it: the host's timers keep their own
+  slack. A thread's directory has none.
+
+- `loginuid` (0644) and `sessionid` (0444) are the thread's audit login
+  user and session, as Linux's `proc_loginuid_read` and `proc_sessionid_read`
+  write them, with no newline: 4294967295 (none) for both at first, a
+  thread's and a process's taken from its maker, and kept across `execve`.
+  The login user reads as the opener's user namespace maps it (4294967295
+  for one it does not). Only the thread the file is of may write its
+  `loginuid` (`EPERM` else), only at its start (`EINVAL` after a read), a
+  decimal user ID as `kstrtou32` reads it in the opener's namespace
+  (`EINVAL` for one it does not map), or 4294967295 for none; once it has
+  one, a change needs `CAP_AUDIT_CONTROL` in the first user namespace
+  (`EPERM`). Setting a user starts a session with a number no other has had
+  (from 1 in each emulator), and none ends it. Nothing audits.
+
+- `cgroup` (0444) reads `0::/`: every task is in the root group of a
+  unified hierarchy, as a cgroup v2 host shows a task in its root,
+  whichever control group namespace reads it. There is no `cpuset`, as in
+  Ubuntu's kernel, which leaves out the cgroup v1 cpusets
+  (`CONFIG_CPUSETS_V1`) that it comes with.
+
+- `children` (0444) of a thread lists, each followed by a space, the
+  processes it made that are not yet reaped, zombies too, as Linux's
+  `children_seq_show`; a child whose maker has ended is its process's first
+  thread's, as `forget_original_parent` gives it to that one. They are in PID
+  order, where Linux's are in the order they came to the thread, which
+  differs once PIDs wrap or an orphan is given to the process. The process's
+  own directory has none.
+
+- `projid_map` (0644) reads and takes the project IDs of the task's user
+  namespace as `uid_map` does (above), but a write needs no capability and
+  maps any IDs the parent maps, as Linux's `proc_projid_map_write`: the
+  first namespace maps them all (`0 0 4294967295`). Nothing else uses
+  project IDs.
 
 - `syscall` of a process or of a thread, 0400 and of size 0, is what
   Linux's `proc_pid_syscall` writes when it is read, for a reader that may
@@ -4652,7 +4759,12 @@ kernel.
   for a reader that may look at it, another's) runs the program it leads
   to, as Linux's walk jumps to the file without searching its
   directories; `AT_SYMLINK_NOFOLLOW` refuses it (`ELOOP`), and a
-  generated file that is no link is `EACCES`.
+  generated file that is no link is `EACCES`. Under a root of its own it
+  does so through a bind mount of `/proc` there, and a symbolic link in
+  that root into such a bind mount of `/proc` or `/dev` (an absolute one
+  from the new root) leads every call to the generated file, as its own
+  path does. `readlink` of a generated file that is no link, `/proc`
+  itself too, is `EINVAL`.
 
 - `/proc/sys/fs/mqueue` has the POSIX message queue limits of the
   reader's IPC namespace, as Linux's `ipc/mq_sysctl.c`: `queues_max`,
@@ -4823,7 +4935,8 @@ kernel.
     `default`'s and every device's. `forwarding` is told of to the members
     of `RTNLGRP_IPV6_NETCONF` only as it turns on or off (from 1 to 2 tells
     nothing), as `addrconf_fixup_forwarding` does: of `all`'s, `default`'s
-    first, then each device's that turns, then `all`'s own;
+    first, then each device's that turns, in the order the devices were
+    registered in, then `all`'s own;
     `disable_ipv6` is told of so by nothing. A device whose `disable_ipv6` turns
     on loses its IPv6 addresses and routes, told of as when it goes down
     (`addrconf_ifdown`); turning off while it is up gives `::1` back, and
@@ -5354,8 +5467,8 @@ kernel.
   system call. `ru_majflt` counts the major faults, for the same processes
   and threads and children (`cmaj_flt`): the faults of the kernel's
   accesses that a `userfaultfd` had try again, as described for
-  `userfaultfd`, each counted once as its wait ends, and to no minor
-  fault. The other counts (involuntary context switches, blocks) are 0.
+  `userfaultfd`, each counted once as its retry completes, and to no
+  minor fault. The other counts (involuntary context switches, blocks) are 0.
   `/proc/<pid>/stat` gives the same counts as `minflt` and `majflt` (a
   thread's own under `task`) and `cminflt` and `cmajflt`.
 
@@ -5680,10 +5793,14 @@ kernel.
   change takes it; and as memory core mm does not back, it takes no
   `MADV_DOFORK` or `MADV_DODUMP`, gives `MADV_DONTNEED` and
   `MADV_DONTNEED_LOCKED` no pages (`EINVAL`), and stays unlocked through
-  `mlock`. The user page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
-  offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
-  index 0, and the count and times enabled and running between two bumps
-  of the sequence lock. `PERF_EVENT_IOC_SET_OUTPUT`, and
+  `mlock`. The user page is `struct perf_event_mmap_page`: version 0,
+  `size` 96, the data's offset and size, `cap_bit0_is_deprecated` and no
+  `cap_user_rdpmc`, index 0, and the count and times enabled and running
+  between two bumps of the sequence lock. These are updated at the
+  `mmap`, the event's enabling and its reset, and when its thread runs
+  again after a sleep or a move to another CPU, where Linux schedules the
+  event in (`perf_swevent_add`, a clock's `add`); a system call that does
+  not sleep leaves them. `PERF_EVENT_IOC_SET_OUTPUT`, and
   `PERF_FLAG_FD_OUTPUT` at open through the group's descriptor, make an
   event write to another event's buffer, as Linux's
   `perf_event_set_output`: the other must be an event (`EBADF`), not the
@@ -5994,7 +6111,10 @@ kernel.
   stack pointer, no other operator, no 32-bit addition, `EACCES`; an
   offset past 2^29, `EINVAL`), the stack's loads and stores (aligned to
   their size, within the 512 bytes, `EACCES`), pointers spilled to the
-  stack whole and filled whole, a load through a scalar ("R%d invalid mem
+  stack whole and filled whole, the value of a load of the stack where
+  Linux knows it (zeros stored, or a scalar spilled, read from its start
+  and no wider than the spill, which the load zero- or sign-extends), a
+  load through a scalar ("R%d invalid mem
   access 'scalar'", `EACCES`) and the exit's R0, which may be any value.
   A conditional jump whose operands it knows goes one way; any other is
   walked both ways. It gives up as Linux does after 1,000,000 instructions
@@ -6039,8 +6159,9 @@ kernel.
   destination registers, and R0 for `BPF_CMPXCHG`, must be written; the
   context is "BPF_ATOMIC stores into R%d ctx is not allowed" (`EACCES`).
   The register the old value goes to, the source with `BPF_FETCH` and R0
-  for `BPF_CMPXCHG`, is unknown from then on, even when it is the
-  destination, which then reads through a scalar. The memory is read,
+  for `BPF_CMPXCHG`, is unknown before the memory is read, even when it is
+  the destination, which then reads through a scalar, and then holds what
+  the read gives. The memory is read,
   then written, aligned to the size whatever the program's flags, and a
   stack slot written so holds bytes, even where a pointer was spilled.
   `BPF_LOAD_ACQ` and `BPF_STORE_REL`, of any size, are checked as a load
@@ -6139,6 +6260,33 @@ kernel.
   ("insn %d cannot be patched due to 16-bit range"). The program's memory
   grows to the instructions the rewrites make (`bpf_prog_realloc`), and
   its socket is charged for them.
+
+- `BPF_PROG_TEST_RUN` runs a socket filter on a packet the caller gives,
+  as Linux master's `bpf_prog_test_run_skb`: the packet starts with an
+  Ethernet header, which `eth_type_trans` takes off as the loopback (or
+  the device the context's `ifindex` names, `ENODEV` for none) receives
+  it, finding the packet's type and its protocol (`ETH_P_802_2` for a
+  length, as master has it with no IPX). As many of its bytes as fit in a
+  page with Linux's headroom and tailroom (3712), or as the context's
+  `data_end` says, are in the linear part, and the rest in pages, at most
+  `MAX_SKB_FRAGS` (`ENOMEM`). The program runs `repeat` times (once for
+  0) on the same packet, whose `cb[]` it may change for the next run, and
+  a signal between runs ends them (`EINTR`). `retval` is its result,
+  `duration` the time a run took, and `data_out` the packet with its
+  Ethernet header zeroed, as much as `data_size_out` takes (`ENOSPC`
+  after the sizes are written), its linear part first. A context
+  (`struct __sk_buff`, in and out) gives `mark`, `priority`,
+  `ingress_ifindex`, `ifindex`, `cb[]`, `wire_len`, `gso_segs` and
+  `gso_size` and must have zeros elsewhere (`EINVAL`), and past its 192
+  bytes (`E2BIG`); what comes back has the fields Linux gives back. Before
+  that come the checks of the call: a context's size without its address
+  or the other way, the program (`EBADF`, `EINVAL`), flags other than
+  `BPF_F_TEST_SKB_CHECKSUM_COMPLETE`, a processor or a batch size, fewer
+  bytes than an Ethernet header, and, as master has it, an IPv4 or IPv6
+  packet shorter than its header (`EINVAL`). A socket filter cannot change
+  the packet, so its checksum never changes (`EBADMSG`). The program
+  reads the socket of the run as one of its own (`bpf_dummy_proto`), with
+  a cookie of its own and root of the network namespace as its owner.
 
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`
@@ -6671,7 +6819,8 @@ kernel.
   capability must be permitted and inheritable, unless
   `SECBIT_NO_CAP_AMBIENT_RAISE` refuses it), all per thread,
   `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
-  `execve`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
+  `execve`), `PR_SET_TIMERSLACK` and `PR_GET_TIMERSLACK` (per thread; see
+  `/proc/<pid>/timerslack_ns`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
   with their `PR_GET_*`, and Yama's `PR_SET_PTRACER`, which reads no other
   argument: 0 clears it, `PR_SET_PTRACER_ANY` (or -1 as an `int`) lets any
   process attach, and another value, taken as an `int`, names a task in the
@@ -6689,6 +6838,18 @@ kernel.
   and `smaps` show it as `[anon:<name>]`, and as `[anon_shmem:<name>]` for
   shared anonymous memory, the heap and the stack keeping their own names;
   VMAs of different names do not merge, and a `fork`ed child keeps them.
+  `PR_SET_THP_DISABLE` and `PR_GET_THP_DISABLE` are of the address space,
+  which a thread shares and a `fork`ed child and an `execve` keep, as
+  Linux's `MMF_DISABLE_THP_*` flags: a nonzero second argument disables
+  transparent huge pages, with `PR_THP_DISABLE_EXCEPT_ADVISED` (2) as the
+  third only where `MADV_HUGEPAGE` did not ask for them, and 0 with no flag
+  enables them again (`EINVAL` for another flag, a flag when enabling, or a
+  fourth or fifth argument). `PR_GET_THP_DISABLE` takes no argument
+  (`EINVAL`) and gives 0, 1, or 3 for the kind that excepts advised
+  memory. Disabled for every VMA, `MADV_COLLAPSE` is refused (`EINVAL`),
+  as Linux's `vma_thp_disabled` decides; nothing else changes, as the
+  emulator places a mapping where a huge page would fit either way, as
+  Linux does.
   Other options give `EINVAL`.
 
 - When a process exits, its children go to the nearest ancestor that set

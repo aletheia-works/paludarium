@@ -329,4 +329,78 @@ mod blocks {
         assert_eq!(cache.slots[cache.slot(rest)].len, 9);
         assert_eq!(cache.code.len(), MAX_BLOCK + 9);
     }
+
+    /// Counts the blocks it is offered and compiles each to code that runs
+    /// nothing, so that the interpreter runs them.
+    struct Counting {
+        offered: std::sync::atomic::AtomicUsize,
+    }
+
+    struct Nothing;
+
+    impl compile::CompiledBlock for Nothing {
+        fn run(&self, _: &mut CpuState, _: &AddressSpace, _: u64) -> usize {
+            0
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    impl compile::Compiler for Counting {
+        fn threshold(&self) -> u16 {
+            50
+        }
+
+        fn compile(
+            &self,
+            _: &[compile::Form],
+        ) -> Option<std::sync::Arc<dyn compile::CompiledBlock>> {
+            self.offered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(std::sync::Arc::new(Nothing))
+        }
+    }
+
+    /// The round of `inc rax; jmp` back to it, one entry of its block each,
+    /// in which the block is offered to `compiler`.
+    fn offered_in(
+        state: &mut CpuState,
+        mem: &AddressSpace,
+        cache: &mut DecodeCache,
+        compiler: &Counting,
+    ) -> usize {
+        let before = compiler.offered.load(std::sync::atomic::Ordering::Relaxed);
+        for round in 1..=100 {
+            compile::run_compiled(state, mem, 2, cache, compiler);
+            if compiler.offered.load(std::sync::atomic::Ordering::Relaxed) > before {
+                return round;
+            }
+        }
+        panic!("not offered in 100 rounds");
+    }
+
+    #[test]
+    fn a_block_compiled_before_is_compiled_again_on_its_second_entry() {
+        // inc rax; jmp to it
+        let mut mem = memory(&[0x48, 0xff, 0xc0, 0xeb, 0xfb], CODE);
+        let compiler = Counting { offered: 0.into() };
+        let mut cache = DecodeCache::new();
+        let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(0));
+        assert_eq!(offered_in(&mut state, &mem, &mut cache, &compiler), 50);
+        // A mapping change moves the generation, so the block is decoded
+        // again.
+        let generation = mem.code_generation();
+        mem.protect(GuestAddr(CODE), 0x1000, Prot::from_bits(7).unwrap())
+            .unwrap();
+        mem.protect(GuestAddr(CODE + 0x1000), 0x1000, Prot::READ)
+            .unwrap();
+        assert_ne!(mem.code_generation(), generation);
+        assert_eq!(offered_in(&mut state, &mem, &mut cache, &compiler), 2);
+        // Emptied by a new cache, nothing is known of it.
+        let mut cache = DecodeCache::new();
+        assert_eq!(offered_in(&mut state, &mem, &mut cache, &compiler), 50);
+        assert_eq!(state.gpr[reg::RAX], 102);
+    }
 }

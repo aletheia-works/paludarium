@@ -207,9 +207,9 @@ pub(crate) fn set_rp_filter(
 /// A write of IPv6's `forwarding` of `target`, and what
 /// `addrconf_fixup_forwarding` tells of it, only when it turns on or off
 /// (a change from 1 to 2 tells nothing): for `all`, `default`'s, each
-/// device's that turns (`dev_forward_change` of
-/// `addrconf_forward_change`) and then `all`'s. A device without IPv6
-/// ([`has_ipv6`]) tells nothing.
+/// device's that turns, in the order they were registered in
+/// (`addrconf_forward_change`'s `for_each_netdev`, `dev_forward_change`),
+/// and then `all`'s. A device without IPv6 ([`has_ipv6`]) tells nothing.
 pub(crate) fn set_forwarding6(devices: &mut Devices, target: Target, value: i32) -> Vec<Told> {
     let forwarding = |index, conf| Told::Ipv6(index, What::Forwarding, conf);
     let turns = |old: i32| (old == 0) != (value == 0);
@@ -223,7 +223,10 @@ pub(crate) fn set_forwarding6(devices: &mut Devices, target: Target, value: i32)
             if turns(old_default) {
                 told.push(forwarding(INDEX_DEFAULT, devices.default6));
             }
-            for device in devices.iter_mut() {
+            for index in devices.order() {
+                let Some(device) = devices.by_index_mut(index) else {
+                    continue;
+                };
                 let was = device.conf6.forwarding;
                 device.conf6.forwarding = value;
                 if turns(was) && has_ipv6(device) {

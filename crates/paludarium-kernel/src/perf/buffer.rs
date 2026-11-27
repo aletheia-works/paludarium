@@ -556,6 +556,10 @@ pub(super) fn mmap(
             }
             None => {
                 let (user, pinned) = limits(c, &accounts, nr_pages).ok_or(Errno::EPERM)?;
+                c.processes
+                    .perf_events
+                    .mapped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let pages = SharedPages::new().with_source(Arc::new(Pages));
                 let meter = c.mem.memory_meter();
                 for key in (0..size).step_by(PAGE as usize) {
@@ -702,6 +706,32 @@ fn leave(event: &Arc<Event>, old: Option<Arc<Buffer>>) {
     }
 }
 
+/// Whether an event's ring buffer has ever been mapped, for the
+/// checkpoints that bring a thread's counts up to date after a sleep only
+/// then.
+pub(crate) fn buffers_mapped(events: &super::Events) -> bool {
+    events.mapped.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The thread `tid` of `group` runs again after it slept or moved to
+/// another CPU: Linux schedules its events in (`perf_swevent_add`,
+/// `cpu_clock_event_add`, `task_clock_event_add`), and each updates its user
+/// page there. Here a thread is switched out only when it sleeps.
+pub(crate) fn scheduled_in(events: &super::Events, group: &crate::ThreadGroup, tid: u32) {
+    if !buffers_mapped(events) {
+        return;
+    }
+    let of_task: Vec<Arc<Event>> = lock(&events.lists)
+        .counting
+        .iter()
+        .filter_map(super::event)
+        .filter(|event| event.counts(group, tid))
+        .collect();
+    for event in of_task {
+        event.update_user_page();
+    }
+}
+
 impl Event {
     /// `perf_event_update_userpage`, if the event has a buffer.
     pub(super) fn update_user_page(&self) {
@@ -734,7 +764,15 @@ mod tests {
 
     /// A buffer of `data_pages` for a new event, charged to user 1000.
     fn mapped(data_pages: u64, accounts: &Arc<Accounts>) -> (Arc<Event>, Arc<Mapped>) {
-        let event = super::super::tests::event(None);
+        mapped_of(super::super::tests::event(None), data_pages, accounts)
+    }
+
+    /// A buffer of `data_pages` for `event`, charged to user 1000.
+    fn mapped_of(
+        event: Arc<Event>,
+        data_pages: u64,
+        accounts: &Arc<Accounts>,
+    ) -> (Arc<Event>, Arc<Mapped>) {
         let file: Arc<dyn FileHandle> = Arc::new(super::super::EventFile::new(Arc::clone(&event)));
         let pages = SharedPages::new();
         for key in (0..=data_pages).map(|page| page * PAGE) {
@@ -773,6 +811,63 @@ mod tests {
         assert_eq!(u32_at(field::LOCK), 4);
         assert_eq!(rb.load(field::OFFSET), 0);
         assert_eq!(u32_at(field::INDEX), 0);
+    }
+
+    #[test]
+    fn a_thread_s_events_user_pages_are_updated_when_it_runs_after_a_sleep() {
+        use super::super::{Attr, Counter, Events, Target};
+        use paludarium_host::switches;
+        let host = paludarium_host::testing::RecordingHost::default();
+        let group = Arc::new(crate::ThreadGroup::default());
+        let mut state = crate::ThreadState::default();
+        let target = |tid| Target::Thread {
+            group: Arc::clone(&group),
+            tid,
+        };
+        let of = |tid| {
+            super::super::tests::of_counter(None, target(tid), Attr::default(), Counter::Switches)
+        };
+        let events = Events::default();
+        let accounts = Arc::default();
+        let (event, mapped) = mapped_of(of(5), 0, &accounts);
+        let (other, other_mapped) = mapped_of(of(6), 0, &accounts);
+        for event in [&event, &other] {
+            events.add(event, &group, 5);
+            event.enable();
+        }
+        let offset = |mapped: &Mapped| mapped.buffer.load(field::OFFSET);
+        let _ = switches::take();
+        crate::account_cpu(&host, &group, &mut state, 5);
+        assert!(!std::mem::take(&mut state.cpu.resumed));
+        // A sleep: the next account sees it, and the thread's events are
+        // scheduled in, once a buffer has been mapped by `mmap`.
+        switches::sleep(&mut false);
+        assert!(switches::pending());
+        crate::account_cpu(&host, &group, &mut state, 5);
+        assert!(!switches::pending());
+        assert!(std::mem::take(&mut state.cpu.resumed));
+        scheduled_in(&events, &group, 5);
+        assert_eq!(offset(&mapped), 0);
+        events
+            .mapped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(buffers_mapped(&events));
+        scheduled_in(&events, &group, 5);
+        assert_eq!(offset(&mapped), 1);
+        // Another thread's event is left as it was.
+        assert_eq!(offset(&other_mapped), 0);
+        // Without a sleep the page keeps the count it had.
+        switches::sleep(&mut false);
+        crate::account_cpu(&host, &group, &mut state, 5);
+        assert_eq!(offset(&mapped), 1);
+        scheduled_in(&events, &group, 6);
+        assert_eq!((offset(&mapped), offset(&other_mapped)), (1, 0));
+        scheduled_in(&events, &group, 5);
+        assert_eq!(offset(&mapped), 2);
+        // A move to another CPU is a schedule-in too.
+        group.set_affinity(5, vec![0b10]);
+        crate::account_cpu(&host, &group, &mut state, 5);
+        assert!(state.cpu.resumed);
     }
 
     #[test]

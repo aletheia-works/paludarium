@@ -8,7 +8,9 @@
 //! generation the block was decoded under lasts. An instruction the
 //! compiled code does not run (an instruction without a form, one whose
 //! form fails, the instructions after a load or store that saw the code
-//! change) runs in the interpreter as before.
+//! change) runs in the interpreter as before. A block decoded again at an
+//! address whose block was compiled before is offered on its second entry
+//! instead: it was hot once, and the [`Compiler`] may still hold its code.
 
 use std::sync::Arc;
 
@@ -17,8 +19,8 @@ use paludarium_types::ExitReason;
 
 pub use crate::exec::{Address, Alu, Bit, Count, Fast, REP_CHUNK, Shift, Source, Unary};
 use crate::{
-    CpuState, DecodeCache, MAX_COMPILED, NOT_COMPILED, decode_block, execute_decoded,
-    fetch_for_state,
+    CpuState, DecodeCache, MAX_COMPILED, MAX_COMPILED_AT, NOT_COMPILED, decode_block,
+    execute_decoded, fetch_for_state,
 };
 
 /// An instruction offered to a [`Compiler`]: its address, the address of
@@ -68,7 +70,8 @@ pub trait Compiler: Send + Sync {
 
 impl DecodeCache {
     /// The compiled code of the block in `slot`, compiling it with
-    /// `compiler` when it has been entered often enough.
+    /// `compiler` when it has been entered often enough: on its second
+    /// entry if a block at its address was compiled before (`Slot::hot`).
     fn compiled(&mut self, slot: usize, compiler: &dyn Compiler) -> Option<Arc<dyn CompiledBlock>> {
         let s = &mut self.slots[slot];
         match s.compiled {
@@ -77,7 +80,7 @@ impl DecodeCache {
             n => return self.compiled.get(n as usize - 1).cloned(),
         }
         s.runs = s.runs.saturating_add(1);
-        if s.runs < compiler.threshold() {
+        if s.runs < compiler.threshold() && !(s.hot && s.runs >= 2) {
             return None;
         }
         self.compile(slot, compiler)
@@ -116,6 +119,10 @@ impl DecodeCache {
         }
         self.compiled.push(compiled.clone());
         self.slots[slot].compiled = u32::try_from(self.compiled.len()).unwrap_or(NOT_COMPILED);
+        if self.compiled_at.len() >= MAX_COMPILED_AT {
+            self.compiled_at.clear();
+        }
+        self.compiled_at.insert(self.slots[slot].rip);
         Some(compiled)
     }
 }

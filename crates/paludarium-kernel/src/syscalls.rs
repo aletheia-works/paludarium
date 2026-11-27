@@ -1916,8 +1916,9 @@ fn sys_write(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
     outcome
 }
-/// `write` to the host's stdout or stderr. With no reader left there, it is
-/// `EPIPE` and raises `SIGPIPE`, as any other write that gives `EPIPE`.
+/// `write` to the host's stdout or stderr. With no reader left there, it
+/// raises `SIGPIPE`, and is `EPIPE` unless a part was written first, as a
+/// write to a pipe.
 fn write_stdio(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (fd, buf, count) = (a[0], a[1], a[2].min(MAX_RW_COUNT));
     // Only stdout and stderr are connected in the core emulator.
@@ -1957,9 +1958,10 @@ fn write_stdio(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 }
             }
             Err(e) => {
-                // A host stream with no reader left raises SIGPIPE, as the
-                // other files' writes do ([`crate::files::dispatch`]).
-                if e == Errno::EPIPE && done == 0 {
+                // A host stream with no reader left raises SIGPIPE, also
+                // after a part, as a pipe's write does
+                // ([`crate::files::dispatch`]); the guest sees it as one.
+                if e == Errno::EPIPE {
                     signals::queue(c.process, signals::PendingSignal::user(13, 0));
                 }
                 return if done == 0 { err(e) } else { ok(done) };

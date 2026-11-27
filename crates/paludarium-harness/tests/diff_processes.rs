@@ -222,7 +222,10 @@ mod linux {
             // fs.leases-enable and fs.lease-break-time and becomes an
             // unprivileged user, the dnotify-switch case, which writes
             // fs.dir-notify-enable, the proc-oom case, which sets an
-            // oom_score_adj below 0 and becomes an unprivileged user, and
+            // oom_score_adj below 0 and becomes an unprivileged user, the
+            // proc-timerslack, proc-login and proc-cgroup-ids cases, which
+            // set a real-time policy, change a set login user and make user
+            // namespaces before they become an unprivileged user, and
             // the timer-waits cases, which make a
             // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
@@ -231,6 +234,9 @@ mod linux {
                     | "file-leases"
                     | "dnotify-switch"
                     | "proc-oom"
+                    | "proc-timerslack"
+                    | "proc-login"
+                    | "proc-cgroup-ids"
                     | "timer-waits-plain"
                     | "timer-waits-restart"
                     | "timer-waits-default"
@@ -376,6 +382,7 @@ mod linux {
                     | "bpf-prog-udp"
                     | "bpf-prog-tcp"
                     | "bpf-prog-segments"
+                    | "bpf-prog-testrun"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -457,6 +464,7 @@ mod linux {
                     | "multicast-groups"
                     | "multicast-groups6"
                     | "veth-ipv6-own-neighbours"
+                    | "veth-ipv6-anycast"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -732,6 +740,7 @@ mod linux {
         multicast_groups => ("multicast-groups","multicast-groups"),
         multicast_groups6 => ("multicast-groups6","multicast-groups6"),
         veth_ipv6_own_neighbours => ("veth-ipv6-own-neighbours","veth-ipv6-own-neighbours"),
+        veth_ipv6_anycast => ("veth-ipv6-anycast","veth-ipv6-anycast"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
@@ -859,6 +868,7 @@ mod linux {
         bpf_prog_udp => ("bpf-prog-udp","bpf-prog"),
         bpf_prog_tcp => ("bpf-prog-tcp","bpf-prog"),
         bpf_prog_segments => ("bpf-prog-segments","bpf-prog"),
+        bpf_prog_testrun => ("bpf-prog-testrun","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
         dnotify_switch => ("dnotify-switch","inotify"),
@@ -995,6 +1005,7 @@ mod linux {
         processes_pipe_size => ("pipe-size","process"),
         processes_poll => ("poll","process"),
         processes_proc_status => ("proc-status","process"),
+        processes_status_space => ("status-space","process"),
         processes_credentials => ("credentials","process"),
         processes_permissions => ("permissions","process"),
         processes_setuid => ("setuid","process"),
@@ -1175,6 +1186,7 @@ mod linux {
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_link_names => ("generated-link-names","process"),
+        processes_generated_rooted_links => ("generated-rooted-links","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),
@@ -1213,6 +1225,10 @@ mod linux {
         processes_status_memory => ("status-memory","process"),
         processes_proc_oom => ("proc-oom","process"),
         processes_core_filter => ("core-filter","process"),
+        processes_proc_timerslack => ("proc-timerslack","process"),
+        processes_proc_login => ("proc-login","process"),
+        processes_proc_cgroup_ids => ("proc-cgroup-ids","process"),
+        processes_proc_children => ("proc-children","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),

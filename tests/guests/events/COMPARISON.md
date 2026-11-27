@@ -2,7 +2,7 @@
 
 ## Catalog
 
-raw Linux ABI guestは0〜83の84件、Rust target guest timer/unixの2件、計86件を固定する。元69件のgreen source aeb7d59c8c611bc3120380ea60707e0369dfa683と品質証拠は歴史として保持する。追加67〜81はET未読追加writeとpwait一時mask境界のnative先行観測待ちであり、製品修正前にfixture-only CIで期待を取得する。保存期待fixtureは作らない。
+raw Linux ABI guestは0〜85の86件、Rust target guest timer/unixの2件、計88件を固定する。元69件のgreen source aeb7d59c8c611bc3120380ea60707e0369dfa683と品質証拠は歴史として保持する。追加67〜81はET未読追加writeとpwait一時mask境界のnative先行観測待ちであり、製品修正前にfixture-only CIで期待を取得する。保存期待fixtureは作らない。
 
 | ID | ケース | 比較 |
 | --- | --- | --- |
@@ -90,12 +90,14 @@ raw Linux ABI guestは0〜83の84件、Rust target guest timer/unixの2件、計
 | 81 | socket_et_output_write_boundaries | 複数write後、第一write全量read、第二write部分/全量readのOUT |
 | 82 | stdout_epipe_blocked | 読み手のいないstdoutへのwrite/writev（EPIPE）、SIGPIPEをblockしてpending、空write。観測値はstderrへ |
 | 83 | stdout_sigpipe | 読み手のいないstdoutへのwriteでSIGPIPEにより終了 |
+| 84 | pipe_epipe_after_part_blocked | 128KiBのpipe writeの途中（64KiB充填後）に唯一の読み手の子が終了。書いた64KiBを返しSIGPIPEはblockしてそのwrite直後にpending、次のwriteはEPIPE |
+| 85 | pipe_sigpipe_after_part | 84と同じwriteの途中で読み手が終了し、次のwriteを待たずSIGPIPEにより終了 |
 | timer | tokio1.48.0 multi-thread runtimeの2timer完了 | stdout/stderr/exit/timeout |
 | unix | std UnixStream::pair双方向write/read | stdout/stderr/exit/timeout |
 
 ## Rules
 
-通常rawケースはlittle-endian64bit×4のstdoutをそのまま比較する。戻り値、counter、関係bool、固定data tokenと必要なreadiness bitsだけを出力し、生fd/TID/時刻/アドレスを出力しない。case32の複数ready dataは和、case34は2回の選択が異なるboolを使い順不同event順序を要求しない。case35だけ20ms期限を15ms以上1秒未満の区間boolで記録する。signal/timerはkernel setitimerとmask/ignoreの実測、handler回数を記録する。case60はnative signal exit -9を製品CLI128+9へ、case83は-13を128+13へ正規化するがraw exitは保持する。82と83はstdoutを読み手を閉じたパイプにして（nativeもemulatorも）走らせ、82は観測値をstderrに書く。
+通常rawケースはlittle-endian64bit×4のstdoutをそのまま比較する。戻り値、counter、関係bool、固定data tokenと必要なreadiness bitsだけを出力し、生fd/TID/時刻/アドレスを出力しない。case32の複数ready dataは和、case34は2回の選択が異なるboolを使い順不同event順序を要求しない。case35だけ20ms期限を15ms以上1秒未満の区間boolで記録する。signal/timerはkernel setitimerとmask/ignoreの実測、handler回数を記録する。case60はnative signal exit -9を製品CLI128+9へ、case83と85は-13を128+13へ正規化するがraw exitは保持する。82と83はstdoutを読み手を閉じたパイプにして（nativeもemulatorも）走らせ、82は観測値をstderrに書く。
 
 52/53/54はAF_INET/AF_INET6socket/socketpair禁止方針の専用ケース。native成功/errnoを原本へ保存し、emulatorは承認済みEAFNOSUPPORT(-97)とzero remainderをassertする。nativeとの一致ケースと分けpolicy_exceptionをmanifestへ記録する。未知flags/対応外型も観測前のerrno推定で固定しない。
 
@@ -107,4 +109,4 @@ raw Linux ABI guestは0〜83の84件、Rust target guest timer/unixの2件、計
 
 case66はclone共有Threadがrelease atomicを受けてpeerをdrainし、親のblocking writeを進め、clear-child-TID futexで終了を回収する。releaseはsyscall開始前なので実Host waitへの到達をこのguestだけで保証しない。実待機開始後の解除は内部Host同期テストで別に確かめた。Node/実Safariでは非threaded0〜65とunixを含め、timerと66のguest threadingはwasm境界として明示する。登録/通知競合とtimer metadataの内部同期テストは製品実装後の単体テストで検証した。現moduleのNode/実Safari結果は最終原本取得まで未検証。
 
-新しいobservable syscall動作が必要になれば追加guestをnative先行で取得し、この固定86ケースを削らず追加する。Wasmは0〜81のうち66を除く81 Cケース+unix=82件、既存21との合計103件を予定し、全新結果は未検証。DGRAM/SEQPACKETとネットワーク通信は承認済み対応範囲と区別する。固定ゲストプログラムのprobe全量、wasm guest Worker達成を有限結果から推測しない。
+新しいobservable syscall動作が必要になれば追加guestをnative先行で取得し、この固定88ケースを削らず追加する。Wasmは0〜81のうち66を除く81 Cケース+unix=82件、既存21との合計103件を予定し、全新結果は未検証。DGRAM/SEQPACKETとネットワーク通信は承認済み対応範囲と区別する。固定ゲストプログラムのprobe全量、wasm guest Worker達成を有限結果から推測しない。

@@ -1169,3 +1169,367 @@ fn bpf_prog_attach_filters_datagrams() {
         ],
     );
 }
+
+/// Where `BPF_PROG_TEST_RUN`'s packet and context go in and out.
+const PACKET_IN: u64 = DATA + 0x20000;
+const PACKET_OUT: u64 = DATA + 0x30000;
+const CTX_IN: u64 = DATA + 0x700;
+const CTX_OUT: u64 = DATA + 0x900;
+const PROG_TEST_RUN: u64 = 10;
+
+/// `attr->test`, 80 bytes.
+#[derive(Clone, Copy, Default)]
+struct TestRun {
+    prog_fd: u32,
+    data_size_in: u32,
+    data_size_out: u32,
+    data_in: u64,
+    data_out: u64,
+    repeat: u32,
+    ctx_size_in: u32,
+    ctx_size_out: u32,
+    ctx_in: u64,
+    ctx_out: u64,
+    flags: u32,
+    cpu: u32,
+}
+
+impl TestRun {
+    /// A run of `fd` on `size` bytes at `PACKET_IN`, out to `PACKET_OUT`.
+    fn of(fd: i64, size: u32) -> Self {
+        Self {
+            prog_fd: fd as u32,
+            data_size_in: size,
+            data_in: PACKET_IN,
+            data_out: PACKET_OUT,
+            ..Self::default()
+        }
+    }
+
+    /// With a context of 192 bytes at `CTX_IN` and `CTX_OUT`.
+    fn with_context(self) -> Self {
+        Self {
+            ctx_size_in: 192,
+            ctx_size_out: 192,
+            ctx_in: CTX_IN,
+            ctx_out: CTX_OUT,
+            ..self
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut b = vec![0; 80];
+        let mut put32 = |at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(0, self.prog_fd);
+        put32(8, self.data_size_in);
+        put32(12, self.data_size_out);
+        put32(32, self.repeat);
+        put32(40, self.ctx_size_in);
+        put32(44, self.ctx_size_out);
+        put32(64, self.flags);
+        put32(68, self.cpu);
+        b[16..24].copy_from_slice(&self.data_in.to_le_bytes());
+        b[24..32].copy_from_slice(&self.data_out.to_le_bytes());
+        b[48..56].copy_from_slice(&self.ctx_in.to_le_bytes());
+        b[56..64].copy_from_slice(&self.ctx_out.to_le_bytes());
+        b
+    }
+}
+
+/// What a run gave: its result, `retval`, `data_size_out` and
+/// `ctx_size_out`.
+#[derive(Debug, PartialEq, Eq)]
+struct Ran {
+    result: i64,
+    retval: u32,
+    size_out: u32,
+    ctx_size_out: u32,
+}
+
+impl Env {
+    fn test_run(&mut self, run: &TestRun) -> Ran {
+        self.put(ATTR, &run.bytes());
+        let result = self.call(BPF, [PROG_TEST_RUN, ATTR, 80, 0, 0, 0]);
+        Ran {
+            result,
+            retval: self.word(ATTR + 4),
+            size_out: self.word(ATTR + 12),
+            ctx_size_out: self.word(ATTR + 44),
+        }
+    }
+
+    /// A packet of `size` bytes to `destination`, of Ethernet type `kind`,
+    /// whose byte `n` past the Ethernet header is `n`.
+    fn packet(&self, destination: [u8; 6], kind: u16, size: usize) {
+        let mut b: Vec<u8> = destination.to_vec();
+        b.extend([0x02, 0, 0, 0, 0, 1]);
+        b.extend(kind.to_be_bytes());
+        b.extend((0..size - 14).map(|n| n as u8));
+        self.put(PACKET_IN, &b);
+    }
+}
+
+/// `r0 = *(u32 *)(r1 + off); exit`: a program that gives a context field.
+fn field(off: i16) -> [Insn; 2] {
+    [ldx_w(0, 1, off), exit()]
+}
+
+/// `BPF_PROG_TEST_RUN` of a socket filter runs it on the packet after its
+/// Ethernet header, as the loopback receives it, and gives back its
+/// result, the packet with that header zeroed, and its size.
+#[test]
+fn a_test_run_runs_a_filter_on_a_packet_after_its_ethernet_header() {
+    let mut e = Env::new();
+    let len = e.program(&field(0));
+    assert!(len >= 0, "{len}");
+    e.packet([0; 6], 0x0800, 64);
+    let ran = e.test_run(&TestRun::of(len, 64));
+    assert_eq!(
+        ran,
+        Ran {
+            result: 0,
+            retval: 50,
+            size_out: 64,
+            ctx_size_out: 0
+        }
+    );
+    let mut expected = vec![0; 14];
+    expected.extend(0..50);
+    assert_eq!(e.get(PACKET_OUT, 64), expected);
+    // The loopback's address is all zeros, and so is its broadcast
+    // address: every group's address is a multicast one.
+    let pkt_type = e.program(&field(4));
+    for (destination, kind) in [
+        ([0; 6], 0),
+        ([0xff; 6], 2),
+        ([0x01, 0, 0x5e, 0, 0, 1], 2),
+        ([0x02, 0, 0, 0, 0, 2], 3),
+    ] {
+        e.packet(destination, 0x0800, 34);
+        assert_eq!(e.test_run(&TestRun::of(pkt_type, 34)).retval, kind);
+    }
+    // The protocol, in network order; a length in the type is 802.2's.
+    let protocol = e.program(&field(16));
+    for (kind, expected) in [
+        (0x0800, 0x0008),
+        (0x86dd, 0xdd86),
+        (0x0600, 0x0006),
+        (0x05ff, 0x0400),
+        (0xffff, 0xffff),
+    ] {
+        e.packet([0; 6], kind, 60);
+        assert_eq!(e.test_run(&TestRun::of(protocol, 60)).retval, expected);
+    }
+}
+
+/// The checks of `bpf_prog_test_run` and `bpf_prog_test_run_skb`, in their
+/// order.
+#[test]
+fn a_test_run_checks_its_arguments() {
+    let mut e = Env::new();
+    let fd = e.program(&[mov(0, 1), exit()]);
+    let map = e.map(2, 4, 8, 1, 0);
+    e.packet([0; 6], 0x0800, 64);
+    let ok = TestRun::of(fd, 64);
+    let result = |e: &mut Env, run: TestRun| e.test_run(&run).result;
+    assert_eq!(result(&mut e, ok), 0);
+    // A context's size without its address, or the other way.
+    for run in [
+        TestRun {
+            ctx_size_in: 4,
+            ..ok
+        },
+        TestRun {
+            ctx_in: CTX_IN,
+            ..ok
+        },
+        TestRun {
+            ctx_size_out: 4,
+            ..ok
+        },
+        TestRun {
+            ctx_out: CTX_OUT,
+            ..ok
+        },
+    ] {
+        assert_eq!(result(&mut e, run), -22);
+    }
+    assert_eq!(result(&mut e, TestRun { prog_fd: 99, ..ok }), -9);
+    assert_eq!(
+        result(
+            &mut e,
+            TestRun {
+                prog_fd: map as u32,
+                ..ok
+            }
+        ),
+        -22
+    );
+    // Flags other than BPF_F_TEST_SKB_CHECKSUM_COMPLETE, a processor, and
+    // fewer bytes than an Ethernet header.
+    for run in [
+        TestRun { flags: 1, ..ok },
+        TestRun { flags: 2, ..ok },
+        TestRun { cpu: 1, ..ok },
+        TestRun {
+            data_size_in: 13,
+            ..ok
+        },
+    ] {
+        assert_eq!(result(&mut e, run), -22);
+    }
+    assert_eq!(result(&mut e, TestRun { flags: 4, ..ok }), 0);
+    // An IPv4 or IPv6 packet shorter than its header (master), and an ARP
+    // one, which has no header to check.
+    assert_eq!(
+        result(
+            &mut e,
+            TestRun {
+                data_size_in: 14,
+                ..ok
+            }
+        ),
+        -22
+    );
+    e.packet([0; 6], 0x0806, 14);
+    assert_eq!(result(&mut e, TestRun::of(fd, 14)), 0);
+    e.packet([0; 6], 0x0800, 33);
+    assert_eq!(result(&mut e, TestRun::of(fd, 33)), -22);
+    e.packet([0; 6], 0x86dd, 53);
+    assert_eq!(result(&mut e, TestRun::of(fd, 53)), -22);
+    e.packet([0; 6], 0x86dd, 54);
+    assert_eq!(result(&mut e, TestRun::of(fd, 54)), 0);
+    // More pages than MAX_SKB_FRAGS: a page less its head and tailroom,
+    // then 17 more.
+    let most = 3712 + 17 * 4096;
+    assert_eq!(result(&mut e, TestRun::of(fd, most + 1)), -12);
+    // Data that cannot be read.
+    assert_eq!(
+        result(
+            &mut e,
+            TestRun {
+                data_in: 0x1000,
+                ..ok
+            }
+        ),
+        -14
+    );
+    // A context past struct __sk_buff must be zeros there (E2BIG); of its
+    // fields only some may be set; wire_len must not be shorter than the
+    // packet; a device must be there.
+    e.packet([0; 6], 0x0800, 64);
+    let with = ok.with_context();
+    let context = |e: &mut Env, at: usize, value: u32, run: TestRun| {
+        let mut ctx = [0u8; 200];
+        ctx[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        e.put(CTX_IN, &ctx);
+        result(e, run)
+    };
+    assert_eq!(
+        context(
+            &mut e,
+            196,
+            1,
+            TestRun {
+                ctx_size_in: 200,
+                ..with
+            }
+        ),
+        -7
+    );
+    assert_eq!(
+        context(
+            &mut e,
+            196,
+            0,
+            TestRun {
+                ctx_size_in: 200,
+                ..with
+            }
+        ),
+        0
+    );
+    assert_eq!(context(&mut e, 0, 1, with), -22);
+    assert_eq!(context(&mut e, 68, 1, with), -22);
+    assert_eq!(context(&mut e, 8, 1, with), 0);
+    assert_eq!(context(&mut e, 160, 49, with), -22);
+    assert_eq!(context(&mut e, 160, 50, with), 0);
+    assert_eq!(context(&mut e, 160, 65537, with), -22);
+    assert_eq!(context(&mut e, 164, 65536, with), -22);
+    assert_eq!(context(&mut e, 40, 5, with), -19);
+    assert_eq!(context(&mut e, 76, 1, with), -22);
+    assert_eq!(context(&mut e, 80, 65, with), -22);
+    // Too little room for the packet or the context: ENOSPC, with the
+    // sizes written.
+    e.put(CTX_IN, &[0; 200]);
+    let ran = e.test_run(&TestRun {
+        data_size_out: 20,
+        ..ok
+    });
+    assert_eq!((ran.result, ran.size_out), (-28, 64));
+    let ran = e.test_run(&TestRun {
+        ctx_size_out: 100,
+        ..with
+    });
+    assert_eq!((ran.result, ran.ctx_size_out), (-28, 192));
+}
+
+/// The context's `cb[]` reaches the program, which may change it for the
+/// next of `repeat` runs and for the context that comes back, with the
+/// other fields Linux gives back.
+#[test]
+fn a_test_run_s_context_goes_in_and_comes_back() {
+    let mut e = Env::new();
+    // cb[0] += 1; r0 = cb[0]
+    let fd = e.program(&[
+        ldx_w(2, 1, 48),
+        add(2, 1),
+        stx_w(1, 2, 48),
+        mov_reg(0, 2),
+        exit(),
+    ]);
+    e.packet([0; 6], 0x0800, 64);
+    let mut ctx = [0u8; 192];
+    let mut put = |at: usize, v: u32| ctx[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    put(8, 7); // mark
+    put(48, 5); // cb[0]
+    put(176, 9); // gso_size
+    e.put(CTX_IN, &ctx);
+    let ran = e.test_run(&TestRun {
+        repeat: 3,
+        ..TestRun::of(fd, 64).with_context()
+    });
+    assert_eq!((ran.result, ran.retval, ran.ctx_size_out), (0, 8, 192));
+    let out = e.get(CTX_OUT, 192);
+    let at = |n: usize| u32::from_le_bytes(out[n..n + 4].try_into().unwrap());
+    // mark, ifindex (the loopback's), cb[0], wire_len and gso_size.
+    assert_eq!([at(8), at(40), at(48), at(160), at(176)], [7, 1, 8, 50, 9]);
+}
+
+/// A packet past what its linear part takes goes in pages, and comes back
+/// whole, or as much as `data_size_out` takes, its linear part first.
+#[test]
+fn a_test_run_s_packet_may_be_in_pages() {
+    let mut e = Env::new();
+    let len = e.program(&field(0));
+    e.packet([0; 6], 0x0800, 5000);
+    let ran = e.test_run(&TestRun::of(len, 5000));
+    assert_eq!((ran.result, ran.retval, ran.size_out), (0, 4986, 5000));
+    let mut expected = vec![0; 14];
+    expected.extend((0..4986).map(|n| n as u8));
+    assert_eq!(e.get(PACKET_OUT, 5000), expected);
+    // data_end makes the linear part 34 bytes long; 40 bytes come back.
+    let mut ctx = [0u8; 192];
+    ctx[80..84].copy_from_slice(&34u32.to_le_bytes());
+    e.put(CTX_IN, &ctx);
+    e.put(PACKET_OUT, &[0xee; 64]);
+    let ran = e.test_run(&TestRun {
+        data_size_out: 40,
+        ..TestRun::of(len, 64).with_context()
+    });
+    assert_eq!((ran.result, ran.retval, ran.size_out), (-28, 50, 64));
+    let out = e.get(PACKET_OUT, 41);
+    assert_eq!(out[..14], [0; 14]);
+    assert_eq!(out[14..40], (0..26).collect::<Vec<u8>>()[..]);
+    assert_eq!(out[40], 0xee);
+}

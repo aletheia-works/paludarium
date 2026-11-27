@@ -70,11 +70,28 @@ pub(crate) struct Flow {
 }
 
 impl Flow {
-    /// A socket's flow of `proto`: its ports are taken as 0 here.
+    /// A flow of `proto` with no ports, as one that carries none has.
     pub(crate) fn of(proto: u8) -> Self {
         Self {
             proto,
             ..Self::default()
+        }
+    }
+    /// A socket's flow of `proto` from the port `sport` to `dport`.
+    pub(crate) fn socket(proto: u8, sport: u16, dport: u16) -> Self {
+        Self {
+            proto,
+            sport,
+            dport,
+            ..Self::default()
+        }
+    }
+    /// The flow of an answer to this one: its ports the other way round.
+    pub(crate) fn reversed(self) -> Self {
+        Self {
+            sport: self.dport,
+            dport: self.sport,
+            ..self
         }
     }
     /// The ports the flow dissector finds in a packet (`proto_ports_offset`
@@ -389,6 +406,37 @@ mod tests {
         assert_eq!(
             h(policy(3, DST_PORT), udp(9, 2, false)),
             h(policy(3, DST_PORT), udp(8, 2, false))
+        );
+    }
+
+    #[test]
+    fn an_answer_hashes_its_ports_as_the_flow_it_answers() {
+        let seed = Seed {
+            machine: 5,
+            user: 0,
+        };
+        let ports = Policy {
+            policy: 1,
+            fields: FIELDS_DEFAULT,
+        };
+        let (a, b) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 2, 0, 7));
+        let flow = Flow::socket(6, 7100, 7000);
+        assert_eq!(flow.reversed(), Flow::socket(6, 7000, 7100));
+        assert_eq!(
+            seed.hash4(ports, a, b, flow),
+            seed.hash4(ports, b, a, flow.reversed())
+        );
+        assert_ne!(
+            seed.hash4(ports, a, b, flow),
+            seed.hash4(ports, a, b, Flow::socket(6, 7101, 7000))
+        );
+        let (a, b): (Ipv6Addr, Ipv6Addr) = (
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8:2::7".parse().unwrap(),
+        );
+        assert_eq!(
+            seed.hash6(ports, a, b, flow),
+            seed.hash6(ports, b, a, flow.reversed())
         );
     }
 }

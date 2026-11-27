@@ -2,8 +2,8 @@
 // runs, since WebKit fails threads or crashes the page when a shared memory
 // grows while other threads run in it. These check that the reserve takes
 // smaller blocks once a whole one no longer fits, that it grows the memory to
-// its maximum, that later allocations reuse it instead of growing it, and
-// which browsers count as WebKit.
+// its maximum wherever the heap ends, that later allocations reuse it instead
+// of growing it, and which browsers count as WebKit.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -14,10 +14,10 @@ const module = await WebAssembly.compile(await readFile(new URL("../paludarium.w
 const memory = new WebAssembly.Memory({ initial: 128, maximum: 16384, shared: true });
 const e = (await WebAssembly.instantiate(module, imports(memory))).exports;
 
-test("a limit below one page reserves nothing", () => {
+test("a limit below the smallest block reserves nothing", () => {
   const before = memory.buffer.byteLength;
   assert.equal(e.heap_reserve(0), 0);
-  assert.equal(e.heap_reserve(PAGE - 1), 0);
+  assert.equal(e.heap_reserve(63), 0);
   assert.equal(memory.buffer.byteLength, before);
 });
 
@@ -28,9 +28,21 @@ test("below one 64 MiB block, the reserve takes halves down to a page", () => {
 
 test("the reserve grows the memory to its maximum", () => {
   const reserved = e.heap_reserve(0xffffffff);
-  assert.equal(reserved % PAGE, 0);
   assert.ok(reserved > MAXIMUM - 16 * MiB, `reserved ${reserved}`);
   assert.equal(memory.buffer.byteLength, MAXIMUM);
+});
+
+test("the reserve takes the last page wherever the heap ends", async () => {
+  // A fresh heap, as at the coordinator's init, and one with a buffer kept
+  // that leaves less than a page above the last whole block: blocks of a page
+  // stop a page short of the maximum in both.
+  for (const kept of [0, 2 * PAGE - 100]) {
+    const fresh = new WebAssembly.Memory({ initial: 128, maximum: 16384, shared: true });
+    const f = (await WebAssembly.instantiate(module, imports(fresh))).exports;
+    if (kept) assert.notEqual(f.buffer_new(kept), 0);
+    f.heap_reserve(0xffffffff);
+    assert.equal(fresh.buffer.byteLength, MAXIMUM, `kept ${kept}`);
+  }
 });
 
 test("allocations after the reserve do not grow the memory", () => {

@@ -123,6 +123,7 @@ cases!(
     event_et_output_read=>79, socket_et_output_partial_drain=>80,
     socket_et_output_write_boundaries=>81,
     stdout_epipe_blocked=>82, stdout_sigpipe=>83,
+    pipe_epipe_after_part_blocked=>84, pipe_sigpipe_after_part=>85,
 );
 #[test]
 fn tokio_timer() {

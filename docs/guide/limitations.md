@@ -866,8 +866,6 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - Yama's `ptrace_scope` is always 1: there is no
-    `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `NT_X86_XSTATE` gives `ENODEV`, as on a CPU

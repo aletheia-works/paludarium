@@ -48,6 +48,14 @@
 //! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
 //! `bpf_unpriv_handler`.
 //!
+//! `/proc/sys/kernel/yama` has the machine's `ptrace_scope`, as
+//! `security/yama/yama_lsm.c` has it: root's, of mode 0644, 1 at first as
+//! on Debian, Ubuntu and the CI runners, which [`crate::processes`] and
+//! [`crate::ptrace`] check. A write needs `CAP_SYS_PTRACE` (`EPERM`, before
+//! anything else, also for an empty write or one past the start), as
+//! `yama_dointvec_minmax` asks; it takes 0 to 3, and once 3 it stays
+//! (`EINVAL`).
+//!
 //! `/proc/sys/kernel` also shows the names of the UTS namespace of who
 //! reads or writes ([`Uts`]), as `kernel/utsname_sysctl.c` has them: strings
 //! (`proc_dostring`), of which only root may write `hostname` and
@@ -92,6 +100,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 
+/// Yama's `ptrace_scope` at first (`YAMA_SCOPE_RELATIONAL`), and the
+/// highest, which stays once set (`YAMA_SCOPE_NO_ATTACH`).
+pub(crate) const YAMA_SCOPE_RELATIONAL: i32 = 1;
+pub(crate) const YAMA_SCOPE_NO_ATTACH: i32 = 3;
+
 /// The least of `msg_max` and `msg_default` (`MIN_MSGMAX`), and of
 /// `msgsize_max` and `msgsize_default` (`MIN_MSGSIZEMAX`).
 const MIN_MSGMAX: i32 = 1;
@@ -106,6 +119,8 @@ pub(crate) enum Directory {
     Inotify,
     Fanotify,
     Kernel,
+    /// `kernel/yama`, which has `ptrace_scope` alone.
+    Yama,
     /// `vm`, which has `drop_caches` alone.
     Vm,
     /// `net`, and in it `ipv4`, `ipv6`, their `conf` and a device's
@@ -418,6 +433,9 @@ pub(crate) enum Kernel {
     /// `vm.unprivileged_userfaultfd`, the machine's as the perf ones are,
     /// though under `/proc/sys/vm`.
     UnprivilegedUserfaultfd,
+    /// `kernel.yama.ptrace_scope`, the machine's, under
+    /// `/proc/sys/kernel/yama`.
+    PtraceScope,
 }
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
@@ -478,6 +496,7 @@ impl Kernel {
                 | Self::LeaseBreakTime
                 | Self::DirNotifyEnable
                 | Self::UnprivilegedUserfaultfd
+                | Self::PtraceScope
         )
     }
     /// Whether it is one of the IPC namespace's next IDs.
@@ -498,6 +517,7 @@ pub(crate) struct Machine {
     perf_event_paranoid: AtomicI32,
     unprivileged_bpf_disabled: AtomicI32,
     unprivileged_userfaultfd: AtomicI32,
+    ptrace_scope: AtomicI32,
     drop_caches: AtomicI32,
     leases_enable: AtomicI32,
     lease_break_time: AtomicI32,
@@ -516,6 +536,7 @@ impl Default for Machine {
             perf_event_paranoid: AtomicI32::new(crate::perf::PARANOID),
             unprivileged_bpf_disabled: AtomicI32::new(crate::bpf::UNPRIVILEGED_DISABLED),
             unprivileged_userfaultfd: AtomicI32::new(0),
+            ptrace_scope: AtomicI32::new(YAMA_SCOPE_RELATIONAL),
             drop_caches: AtomicI32::new(0),
             leases_enable: AtomicI32::new(1),
             lease_break_time: AtomicI32::new(45),
@@ -582,8 +603,16 @@ impl Machine {
     pub(crate) fn unprivileged_userfaultfd(&self) -> bool {
         self.unprivileged_userfaultfd.load(Ordering::SeqCst) != 0
     }
+    /// Yama's `ptrace_scope`: 0 adds nothing to the attach checks, 1 lets
+    /// in only an ancestor, a ptracer the target named or one with
+    /// `CAP_SYS_PTRACE` in its user namespace, 2 only the last, and 3 no one
+    /// (`yama_ptrace_access_check`, `yama_ptrace_traceme`).
+    pub(crate) fn ptrace_scope(&self) -> i32 {
+        self.ptrace_scope.load(Ordering::SeqCst)
+    }
     fn line(&self, file: Kernel) -> Vec<u8> {
         line(match file {
+            Kernel::PtraceScope => self.ptrace_scope(),
             Kernel::UnprivilegedUserfaultfd => self.unprivileged_userfaultfd.load(Ordering::SeqCst),
             Kernel::PerfCpuTimeMaxPercent => self.perf_cpu_time_max_percent.load(Ordering::SeqCst),
             Kernel::PerfEventMaxSampleRate => {
@@ -598,7 +627,8 @@ impl Machine {
         })
     }
     /// Takes a value written at the start of the file, by a writer with
-    /// `CAP_SYS_ADMIN` (`admin`) or without.
+    /// `CAP_SYS_ADMIN` (`admin`) or without; `ptrace_scope`'s writer has
+    /// `CAP_SYS_PTRACE`, which [`SettingFile::take`] checked.
     fn write(&self, file: Kernel, buf: &[u8], admin: bool) -> Result<usize, Errno> {
         // These take any `int` (`proc_dointvec`).
         if let Some(sysctl) = match file {
@@ -635,6 +665,17 @@ impl Machine {
                 let (value, consumed) = parse(buf, Some((1, i32::MAX)))?;
                 self.perf_event_max_sample_rate
                     .store(value, Ordering::SeqCst);
+                return Ok(consumed);
+            }
+            // `yama_dointvec_minmax`: 0 to 3, and from 3 only 3, checked
+            // and set in one step.
+            Kernel::PtraceScope => {
+                let (value, consumed) = parse(buf, Some((0, YAMA_SCOPE_NO_ATTACH)))?;
+                self.ptrace_scope
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                        (now != YAMA_SCOPE_NO_ATTACH || value == now).then_some(value)
+                    })
+                    .map_err(|_| Errno::EINVAL)?;
                 return Ok(consumed);
             }
             // `proc_dointvec_minmax` from 0 to 1.
@@ -749,6 +790,8 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/fs/lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
         b"/fs/leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
+        b"/kernel/yama" => Some(Entry::Directory(Directory::Yama)),
+        b"/kernel/yama/ptrace_scope" => Some(Entry::Kernel(Kernel::PtraceScope)),
         b"/vm" => Some(Entry::Directory(Directory::Vm)),
         b"/vm/drop_caches" => Some(Entry::DropCaches),
         b"/vm/unprivileged_userfaultfd" => Some(Entry::Kernel(Kernel::UnprivilegedUserfaultfd)),
@@ -843,7 +886,12 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Inotify => INOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Fanotify => FANOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
-        Directory::Kernel => KERNEL.iter().map(|&(name, _)| (name, DT_REG)).collect(),
+        Directory::Kernel => KERNEL
+            .iter()
+            .map(|&(name, _)| (name, DT_REG))
+            .chain([(&b"yama"[..], DT_DIR)])
+            .collect(),
+        Directory::Yama => vec![(b"ptrace_scope", DT_REG)],
     };
     // Each entry's number is the inode its `stat` gives, as Linux's
     // `proc_sys_fill_cache` gives `d_ino`; `..` of `/proc/sys` keeps its
@@ -873,6 +921,7 @@ fn parent(directory: Directory) -> Option<Directory> {
         Directory::Sys => return None,
         Directory::Fs | Directory::Kernel | Directory::Net | Directory::Vm => Directory::Sys,
         Directory::Mqueue | Directory::Inotify | Directory::Fanotify => Directory::Fs,
+        Directory::Yama => Directory::Kernel,
         Directory::Ipv4 | Directory::Ipv6 => Directory::Net,
         Directory::Conf4 => Directory::Ipv4,
         Directory::Conf6 => Directory::Ipv6,
@@ -964,7 +1013,9 @@ fn child(
         Directory::Mqueue => find(&SETTINGS.map(|(n, s)| (n, Entry::Setting(s)))),
         Directory::Inotify => find(&INOTIFY.map(|(n, f)| (n, Entry::Inotify(f)))),
         Directory::Fanotify => find(&FANOTIFY.map(|(n, f)| (n, Entry::Fanotify(f)))),
+        Directory::Kernel if name == b"yama" => dir(Directory::Yama),
         Directory::Kernel => find(&KERNEL),
+        Directory::Yama => (name == b"ptrace_scope").then_some(Entry::Kernel(Kernel::PtraceScope)),
     }
 }
 
@@ -1028,7 +1079,8 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         | Kernel::LeasesEnable
         | Kernel::LeaseBreakTime
         | Kernel::DirNotifyEnable
-        | Kernel::UnprivilegedUserfaultfd => Vec::new(),
+        | Kernel::UnprivilegedUserfaultfd
+        | Kernel::PtraceScope => Vec::new(),
     }
 }
 
@@ -1110,7 +1162,8 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
         | Kernel::LeasesEnable
         | Kernel::LeaseBreakTime
         | Kernel::DirNotifyEnable
-        | Kernel::UnprivilegedUserfaultfd => Err(Errno::EINVAL),
+        | Kernel::UnprivilegedUserfaultfd
+        | Kernel::PtraceScope => Err(Errno::EINVAL),
     }
 }
 
@@ -1393,6 +1446,7 @@ pub(crate) fn open(
         status: crate::files::StatusFlags::opened(flags),
         value,
         admin: credentials.capable(crate::credentials::CAP_SYS_ADMIN),
+        ptrace: credentials.capable(crate::credentials::CAP_SYS_PTRACE),
         net_admin,
         writers,
         stat: stat(c, entry),
@@ -1813,6 +1867,9 @@ struct SettingFile {
     /// write that does not say who makes it.
     writers: Writers,
     admin: bool,
+    /// Whether the opener had `CAP_SYS_PTRACE`, which `ptrace_scope` asks
+    /// of a write that does not say who makes it.
+    ptrace: bool,
     /// Whether the opener had `CAP_NET_ADMIN` over the network namespace,
     /// for a write of `/proc/sys/net` that does not say who makes it.
     net_admin: bool,
@@ -1837,18 +1894,24 @@ impl SettingFile {
         if self.flags & 3 == 0 {
             return Err(Errno::EBADF);
         }
-        let (admin, net_admin) = match writer {
+        let (admin, ptrace, net_admin) = match writer {
             Some(credentials) => {
                 if !self.writers.allow(credentials) {
                     return Err(Errno::EPERM);
                 }
                 (
                     credentials.capable(crate::credentials::CAP_SYS_ADMIN),
+                    credentials.capable(crate::credentials::CAP_SYS_PTRACE),
                     self.writers.net_admin(credentials),
                 )
             }
-            None => (self.admin, self.net_admin),
+            None => (self.admin, self.ptrace, self.net_admin),
         };
+        // `yama_dointvec_minmax` asks before `proc_dointvec_minmax` looks at
+        // what is written or where.
+        if !ptrace && matches!(self.value, Value::Machine(_, Kernel::PtraceScope)) {
+            return Err(Errno::EPERM);
+        }
         let written = self.take(buf, admin, net_admin);
         if written.is_ok() {
             self.value.touched();
@@ -2179,7 +2242,7 @@ mod tests {
             Some(Entry::DropCaches)
         );
         assert_eq!(entries_of(Directory::Vm, None).len(), 4);
-        assert_eq!(entries_of(Directory::Kernel, None).len(), 25);
+        assert_eq!(entries_of(Directory::Kernel, None).len(), 26);
         assert_eq!(lookup(b"/proc/system", None), None);
         assert_eq!(entries_of(Directory::Mqueue, None).len(), 7);
     }

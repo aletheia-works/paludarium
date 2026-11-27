@@ -4191,10 +4191,7 @@ impl Kernel {
     /// Whether the caller may attach to a thread of process `pid`, another
     /// process, as Linux's `__ptrace_may_access` with
     /// `PTRACE_MODE_ATTACH_REALCREDS` decides: it may read it
-    /// ([`Self::may_read`]), and Yama, whose `ptrace_scope` here is 1, as
-    /// Debian's and Ubuntu's, lets it in
-    /// ([`Processes::yama_allows`], or `CAP_SYS_PTRACE` in the target's
-    /// user namespace).
+    /// ([`Self::may_read`]), and Yama lets it in ([`may_attach_task`]).
     pub(crate) fn may_attach(
         &self,
         thread: &Thread,
@@ -5988,17 +5985,24 @@ pub(crate) fn known_layout(number: i32, code: i32) -> bool {
 /// process `pid` (`view`, `public`) of another process, as Linux's
 /// `__ptrace_may_access` decides in attach mode: it may read it
 /// ([`crate::credentials::Credentials::may_read_task`], with the real IDs
-/// for `real`, else the filesystem ones), and Yama, whose `ptrace_scope`
-/// here is 1, as Debian's and Ubuntu's, lets it in
-/// ([`Processes::yama_allows`], or `CAP_SYS_PTRACE` in the target's user
-/// namespace).
+/// for `real`, else the filesystem ones), and Yama lets it in, as
+/// `yama_ptrace_access_check` decides by the machine's `ptrace_scope`
+/// ([`crate::sysctl::Machine::ptrace_scope`]): 0 always, 1 for a relation
+/// ([`Processes::yama_allows`]) or `CAP_SYS_PTRACE` in the target's user
+/// namespace, 2 for that capability alone, 3 never.
 pub(crate) fn may_attach_task(
     processes: &Processes,
     (reader_pid, reader): (u32, &crate::credentials::Credentials),
     (pid, view, public): (u32, &ProcessView, &crate::threads::PublicThread),
     real: bool,
 ) -> bool {
+    let capable =
+        || reader.capable_in(crate::credentials::CAP_SYS_PTRACE, &public.credentials.user);
     reader.may_read_task(&public.credentials, (view.dumpable, &view.exec_user), real)
-        && (processes.yama_allows(reader_pid, pid)
-            || reader.capable_in(crate::credentials::CAP_SYS_PTRACE, &public.credentials.user))
+        && match processes.sysctls.ptrace_scope() {
+            0 => true,
+            1 => processes.yama_allows(reader_pid, pid) || capable(),
+            2 => capable(),
+            _ => false,
+        }
 }

@@ -27757,7 +27757,8 @@ static int process_vm_case(void) {
     return 0;
 }
 /* Yama's ptrace_scope 1, which the CI's runners have (sysctl.d's
- * 55-ptrace.conf) and the emulator keeps, and the capability module's check,
+ * 55-ptrace.conf) and the emulator starts with, its file in /proc/sys, and
+ * the capability module's check,
  * as security/yama/yama_lsm.c and security/commoncap.c decide them for
  * process_vm_readv and pidfd_getfd of a parent from its child. It runs as a
  * user who is not root (natively it never is, and an emulated root becomes
@@ -27826,6 +27827,26 @@ static int yama_case(void) {
     if (geteuid() == 0 &&
         (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
         return 80;
+    /* kernel.yama.ptrace_scope: root's, of mode 0644, alone in its
+       directory, which no one else opens to write (test_perm). */
+    const char *scope_path = "/proc/sys/kernel/yama/ptrace_scope";
+    char scope[8] = {0};
+    int scope_fd = open(scope_path, O_RDONLY);
+    long scope_read = scope_fd < 0 ? -errno : ya_r(read(scope_fd, scope, sizeof scope - 1));
+    if (scope_fd >= 0) close(scope_fd);
+    struct stat scope_st = {0};
+    long scope_stat = stat(scope_path, &scope_st) ? -errno : 0;
+    long scope_write = ya_r(open(scope_path, O_WRONLY));
+    printf("scope: read=%ld value=%c stat=%ld mode=%o uid=%u write=%ld\n", scope_read,
+           scope[0] ? scope[0] : '-', scope_stat, (unsigned)scope_st.st_mode,
+           (unsigned)scope_st.st_uid, scope_write);
+    DIR *yama_dir = opendir("/proc/sys/kernel/yama");
+    printf("scope: entries");
+    for (struct dirent *entry; yama_dir && (entry = readdir(yama_dir));)
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+            printf(" %s/%d", entry->d_name, entry->d_type);
+    printf("\n");
+    if (yama_dir) closedir(yama_dir);
     prctl(PR_SET_DUMPABLE, 1);
     ya_parent = getpid();
     strcpy(pv_buf, "the parent's buffer");

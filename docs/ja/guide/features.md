@@ -1547,9 +1547,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ケーパビリティ（ファイルシステム ID の場合は実効ケーパビリティ）が相手の許可された
   ケーパビリティを含むことです。そのうえで Landlock が、ドメインの中の呼び出し元を外の
   タスクから遠ざけます。アタッチする場合（`process_vm_readv`、`process_vm_writev`、
-  `pidfd_getfd`）は、Debian や Ubuntu、CI のランナーと同じく Yama の `ptrace_scope` を 1 と
-  します。相手が呼び出し元の子孫であるか、`PR_SET_PTRACER` で呼び出し元を入れているか、
-  呼び出し元が相手のユーザー名前空間で `CAP_SYS_PTRACE` を持つことも求めます。
+  `pidfd_getfd`）は、Linux の `yama_ptrace_access_check` と同じく、Yama の `ptrace_scope`
+  （下の `/proc/sys/kernel/yama/ptrace_scope`）も通す必要があります。Debian や Ubuntu、
+  CI のランナーの最初の値と同じ 1 では、相手が呼び出し元の子孫であるか、`PR_SET_PTRACER` で
+  呼び出し元を入れているか、呼び出し元が相手のユーザー名前空間で `CAP_SYS_PTRACE` を持つことを
+  求めます。0 ではそれ以上何も求めず、2 ではそのケーパビリティだけが通し、3 では何も通しません。
 
 - `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
   （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
@@ -3834,7 +3836,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - プロセスやスレッドの `personality` は 0400 で大きさは 0 で、Linux の
   `proc_pid_personality` と同じく、読んだときにスレッドの実行ドメインとフラグを 16 進数 8 桁と
   改行で書きます。そのとき、Linux の `lock_trace` がアタッチのモードの `ptrace_may_access` と
-  読み手のファイルシステムの ID で決めるとおり、そして Yama の `ptrace_scope` 1（祖先、
+  読み手のファイルシステムの ID で決めるとおり、そして Yama の `ptrace_scope`（1 では祖先、
   `PR_SET_PTRACER` で名指しされたもの、または `CAP_SYS_PTRACE`）のとおりに、ほかのプロセスの
   読み手が読めるかを確かめます（`EPERM`）。回収されたタスクは `ESRCH` です。`wchan`
   （0444）は、Linux の `proc_pid_wchan` が動いているタスクと、タスクを読めない読み手に
@@ -4003,7 +4005,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `unprivileged_bpf_disabled` は開いた者ではなく書き手に `CAP_SYS_ADMIN` を求めます。
   孤児を消すのは `shm_rmid_forced` を設定する書き込みだけで、Linux master の
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
-  `/proc/sys/kernel` にあるのはこれらと次の 6 つだけで、`/proc/sys` のどの
+  `/proc/sys/kernel/yama` にあるのは、Linux の `security/yama/yama_lsm.c` と同じく、マシンの
+  `ptrace_scope` だけです。最初は 1 で、root の持つモード 0644 のファイルで、書くために開けるのは
+  root だけです（`EACCES`）。書き込みは、`yama_dointvec_minmax` と同じく、何よりも先に書き手に
+  `CAP_SYS_PTRACE` を求めます（`EPERM`）。何も書かない書き込みや、先頭より後ろへの書き込みでも
+  同じです。取るのは 0 から 3 まで（`EINVAL`）で、いったん 3 になるとほかの値を取りません
+  （`EINVAL`）。この値はどのアタッチにも効きます（`ptrace`、`process_vm_readv`、`pidfd_getfd`、
+  `/proc/<pid>/mem` など、アタッチするファイル）。`yama_ptrace_traceme` と同じく、2 では
+  `PTRACE_TRACEME` に、呼び出し元のユーザー名前空間で `CAP_SYS_PTRACE` を持つトレーサーを求め、
+  3 では断ります（`EPERM`）。
+  `/proc/sys/kernel` にあるのはこれらと次の 6 つ、そして `yama` だけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
 
 - `/proc/sys/kernel` には、Linux の `kernel/utsname_sysctl.c` と同じく、UTS 名前空間の名前も
@@ -6073,7 +6084,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `PTRACE_ATTACH` はカーネルからそのタスクに `SIGSTOP` を送り、`PTRACE_SEIZE` は
   `PTRACE_INTERRUPT` のときだけ止めます。`PTRACE_ATTACH` と `PTRACE_SEIZE` はどちらも、呼び出したプロセス自身のタスク、すでに
   トレースされているか終了したタスク、アタッチしてはいけないタスク（実 ID での
-  `ptrace_may_access` と、Yama の `ptrace_scope` 1）を `EPERM` で断ります。要求を出せるのは
+  `ptrace_may_access` と、Yama の `ptrace_scope`）を `EPERM` で断ります。要求を出せるのは
   トレーサーのスレッドだけで、相手が ptrace 停止にあるときだけです（`PTRACE_KILL` と
   `PTRACE_INTERRUPT` を除き、`ESRCH`）。アタッチまたは SEIZE の時点ですでにグループ停止にある
   タスクには、その停止を新しいトレーサーへ報告させ、報告し終えてから呼び出しが返ります。

@@ -1751,10 +1751,12 @@ kernel.
   effective ones for the filesystem ones) covering the target's permitted
   ones; Landlock then keeps a caller in a domain from a task outside it. To
   attach (`process_vm_readv`, `process_vm_writev`, `pidfd_getfd`), Yama's
-  `ptrace_scope` is 1, as Debian's, Ubuntu's and the CI runners' is: the
-  target must also be a descendant of the caller, or have let it in with
-  `PR_SET_PTRACER`, or the caller must have `CAP_SYS_PTRACE` in the target's
-  user namespace.
+  `ptrace_scope` (`/proc/sys/kernel/yama/ptrace_scope`, below) must also let
+  it in, as Linux's `yama_ptrace_access_check`: at 1, as Debian's, Ubuntu's
+  and the CI runners' is at first, the target must be a descendant of the
+  caller, or have let it in with `PR_SET_PTRACER`, or the caller must have
+  `CAP_SYS_PTRACE` in the target's user namespace; at 0 nothing more is
+  asked, at 2 only that capability lets it in, and at 3 nothing does.
 
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
@@ -4465,7 +4467,7 @@ kernel.
   thread's execution domain and flags in 8 hex digits and a newline, as
   Linux's `proc_pid_personality` writes it when it is read. Only then, as
   Linux's `lock_trace` decides with `ptrace_may_access` in attach mode and
-  the reader's filesystem IDs, and with Yama's `ptrace_scope` 1 (an
+  the reader's filesystem IDs, and with Yama's `ptrace_scope` (at 1 an
   ancestor, one named by `PR_SET_PTRACER`, or `CAP_SYS_PTRACE`), may a
   reader of another process read it (`EPERM`). A reaped task is `ESRCH`.
   `wchan` (0444) reads `0` with no newline, as Linux's `proc_pid_wchan`
@@ -4664,9 +4666,19 @@ kernel.
   now is `EPERM`, though the open let it, and `unprivileged_bpf_disabled`
   asks the writer, not the opener, for `CAP_SYS_ADMIN`. Only a write that
   sets `shm_rmid_forced` removes orphans, as Linux master's handler; 7.0's
-  did so at a read of it set too. `/proc/sys/kernel` lists only these and the
-  six below, and each directory of `/proc/sys` lists its entries by name, as
-  Linux's tree of them keeps them.
+  did so at a read of it set too. `/proc/sys/kernel/yama` has the machine's
+  `ptrace_scope` alone, as Linux's `security/yama/yama_lsm.c`: 1 at first,
+  root's, of mode 0644, which only root may open to write (`EACCES`). A
+  write needs `CAP_SYS_PTRACE` of the writer (`EPERM`) before anything
+  else, so also when it writes nothing or past the start, as
+  `yama_dointvec_minmax` asks; it takes 0 to 3 (`EINVAL`), and once 3 it
+  takes no other value (`EINVAL`). The scope applies to every attach
+  (`ptrace`, `process_vm_readv`, `pidfd_getfd`, `/proc/<pid>/mem` and the
+  other files that attach), and at 2 `PTRACE_TRACEME` needs a tracer with
+  `CAP_SYS_PTRACE` in the caller's user namespace and at 3 is refused
+  (`EPERM`), as `yama_ptrace_traceme`. `/proc/sys/kernel` lists only these,
+  the six below and `yama`, and each directory of `/proc/sys` lists its
+  entries by name, as Linux's tree of them keeps them.
 
 - `/proc/sys/kernel` also shows the UTS namespace's names, as Linux's
   `kernel/utsname_sysctl.c`: `arch`, `ostype`, `osrelease` and `version`
@@ -7087,7 +7099,7 @@ one only with an `--allow-net`.
   `PTRACE_SEIZE` both refuse a task of
   the caller's own process, one already traced or exited, and one the caller
   may not attach to (`ptrace_may_access` with the real IDs, and Yama's
-  `ptrace_scope` 1), with `EPERM`. Only the tracer thread may make requests,
+  `ptrace_scope`), with `EPERM`. Only the tracer thread may make requests,
   and only of a tracee in a ptrace stop, but for `PTRACE_KILL` and
   `PTRACE_INTERRUPT` (`ESRCH`). A task already in a group stop when it is
   attached or seized is made to report that stop to its new tracer, and the

@@ -2195,8 +2195,10 @@ impl Kernel {
     /// `PTRACE_TRACEME`, as Linux's `ptrace_traceme`: a traced thread gets
     /// `EPERM`; the thread that made this one becomes its tracer (another
     /// live thread of that process if it has gone), unless it may not, as
-    /// the capability module's `cap_ptrace_traceme` and Landlock's
-    /// `hook_ptrace_traceme` decide (`EPERM`). A parent that is exiting
+    /// the capability module's `cap_ptrace_traceme`, Landlock's
+    /// `hook_ptrace_traceme` and Yama's `yama_ptrace_traceme` decide
+    /// (`EPERM`): Yama's `ptrace_scope` 2 asks the tracer for
+    /// `CAP_SYS_PTRACE` in the caller's user namespace, and 3 refuses. A parent that is exiting
     /// traces nothing, without an error.
     fn ptrace_traceme(&mut self, thread: &Thread) -> Result<u64, Errno> {
         if self.processes.traces.tracer_of(thread.tid).is_some() {
@@ -2226,7 +2228,12 @@ impl Kernel {
         let own = &thread.state.credentials;
         let allowed = (tracing.user == own.user && own.permitted & !tracing.permitted == 0
             || tracing.capable_in(crate::credentials::CAP_SYS_PTRACE, &own.user))
-            && crate::landlock::may_trace(&tracing.landlock, &own.landlock);
+            && crate::landlock::may_trace(&tracing.landlock, &own.landlock)
+            && match self.processes.sysctls.ptrace_scope() {
+                2 => tracing.capable_in(crate::credentials::CAP_SYS_PTRACE, &own.user),
+                3.. => false,
+                _ => true,
+            };
         if !allowed {
             return Err(Errno::EPERM);
         }

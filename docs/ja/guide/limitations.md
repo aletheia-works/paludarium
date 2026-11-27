@@ -720,8 +720,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     専用のワーカーではなく、次の鍵の呼び出しの始めに行います。最後のリンクを失った鍵は
     すぐになくなり、割り当ても戻ります。Linux では少しあとで解放します。スレッドのキーリングが従うのは、`setfsuid` や `setuid` などが変える
     ファイルシステムの ID だけです。
-  - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
-    `/proc/sys/kernel/yama/ptrace_scope` はありません。
   - `ptrace` の、機能の一覧にない要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
     ほかは `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく

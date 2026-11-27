@@ -5472,6 +5472,97 @@ mod shm {
         assert_eq!(syscall(&mut k, &mut t, &m, 321, map), e(Errno::EPERM));
     }
 
+    /// Yama's `ptrace_scope`, as `security/yama/yama_lsm.c` has it: 1 at
+    /// first; 0 lets anyone who may read a process attach, 2 only one with
+    /// `CAP_SYS_PTRACE` (also for `PTRACE_TRACEME`, of the tracer), 3 no one;
+    /// a write needs `CAP_SYS_PTRACE` before anything else, takes 0 to 3, and
+    /// 3 stays.
+    #[test]
+    fn yama_ptrace_scope_sets_who_may_attach() {
+        let (mut k, mut t, m) = setup();
+        let eperm = Errno::EPERM.to_syscall_return();
+        let scope = "yama/ptrace_scope";
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/yama/ptrace_scope"),
+            "1\n"
+        );
+        for bad in [&b"4"[..], b"-1"] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, scope, bad),
+                e(Errno::EINVAL)
+            );
+        }
+        // Root without CAP_SYS_PTRACE: refused, also for nothing written or
+        // a write past the start.
+        let root = t.state.credentials.clone();
+        let mut bare = root.clone();
+        bare.effective &= !crate::credentials::CAP_SYS_PTRACE;
+        t.state.credentials = bare;
+        assert_eq!(write_kernel(&mut k, &mut t, &m, scope, b"0"), eperm);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, scope, b""), eperm);
+        const PATH: u64 = DATA + 0x900;
+        const BUF: u64 = DATA + 0xa00;
+        m.write(GuestAddr(PATH), b"/proc/sys/kernel/yama/ptrace_scope\0")
+            .unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 2, [PATH, 1, 0, 0, 0, 0]);
+        m.write(GuestAddr(BUF), b"0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 18, [fd, BUF, 1, 1, 0, 0]),
+            eperm
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [fd, 0, 0, 0, 0, 0]), 0);
+        t.state.credentials = root.clone();
+        // Not root, still dumpable: a sibling and a child.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [4, 1, 0, 0, 0, 0]), 0);
+        let user = t.state.credentials.clone();
+        let parent = syscall(&mut k, &mut t, &m, 39, [0; 6]);
+        let event = syscall(&mut k, &mut t, &m, 290, [0; 6]);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        let child = u64::from(ct.tid);
+        let getfd = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, pid: u64| {
+            let pidfd = syscall(k, t, m, 434, [pid, 0, 0, 0, 0, 0]);
+            let copy = syscall(k, t, m, 438, [pidfd, event, 0, 0, 0, 0]);
+            syscall(k, t, m, 3, [pidfd, 0, 0, 0, 0, 0]);
+            if copy == eperm { eperm } else { 0 }
+        };
+        let set = |k: &mut Kernel, t: &mut Thread, value: &[u8]| {
+            t.state.credentials = root.clone();
+            let n = write_kernel(k, t, &m, scope, value);
+            // A call of the user's own publishes its credentials again.
+            t.state.credentials = user.clone();
+            syscall(k, t, &m, 39, [0; 6]);
+            n
+        };
+        assert_eq!(getfd(&mut s, &mut st, &sm, parent), eperm);
+        assert_eq!(set(&mut k, &mut t, b"0"), 1);
+        assert_eq!(getfd(&mut s, &mut st, &sm, parent), 0);
+        // 2: not even the parent, without the capability; with it, yes.
+        assert_eq!(set(&mut k, &mut t, b"2\n"), 2);
+        assert_eq!(getfd(&mut k, &mut t, &m, child), eperm);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 101, [0; 6]), eperm);
+        t.state.credentials = root.clone();
+        assert_eq!(getfd(&mut k, &mut t, &m, child), 0);
+        // 3: no one, which stays.
+        assert_eq!(set(&mut k, &mut t, b"3"), 1);
+        t.state.credentials = root.clone();
+        assert_eq!(getfd(&mut k, &mut t, &m, child), eperm);
+        t.state.credentials = user.clone();
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 101, [0; 6]), eperm);
+        for value in [&b"0"[..], b"2"] {
+            assert_eq!(set(&mut k, &mut t, value), e(Errno::EINVAL));
+        }
+        assert_eq!(set(&mut k, &mut t, b"3"), 1);
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/yama/ptrace_scope"),
+            "3\n"
+        );
+    }
+
     #[test]
     fn attachments_share_memory_and_count_as_their_mappings() {
         let (mut k, mut t, m) = setup();

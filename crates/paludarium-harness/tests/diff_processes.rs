@@ -1187,6 +1187,7 @@ mod linux {
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_link_names => ("generated-link-names","process"),
         processes_generated_rooted_links => ("generated-rooted-links","process"),
+        processes_proc_links => ("proc-links","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_shmem_fault_charge => ("shmem-fault-charge","process"),

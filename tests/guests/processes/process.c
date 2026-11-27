@@ -18954,6 +18954,71 @@ static int grl_inner(const char *self) {
     for (unsigned i = 0; i < 3; i++) printf("exec %s=%d\n", runs[i], gl_exec(self, runs[i], 0));
     return 0;
 }
+/* `execve` through a magic link on the way (`/proc/self/fd/<n>/name`,
+ * `/dev/fd`, `/proc/self/cwd`, `/proc/thread-self/fd`), which Linux's walk
+ * jumps through (`nd_jump_link`), and `/proc/mounts`, a symbolic link to
+ * `self/mounts` (`proc_symlink`). */
+static int proc_links_case(const char *self) {
+    char exe[4096], dir[4096];
+    if (!realpath(self, exe)) return 1;
+    strcpy(dir, exe);
+    char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir) return 2;
+    *slash = 0;
+    const char *name = slash + 1;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (fd < 0 || chdir(dir)) return 3;
+    const char *forms[] = {"/proc/self/fd/%d/%s", "/dev/fd/%d/%s", "/proc/self/cwd/%s",
+                           "/proc/thread-self/fd/%d/%s", "/proc/self/fd/%d/none-such"};
+    for (int i = 0; i < 5; i++) {
+        char path[4160];
+        if (i == 2) snprintf(path, sizeof path, forms[i], name);
+        else snprintf(path, sizeof path, forms[i], fd, name);
+        fflush(stdout);
+        pid_t child = fork();
+        if (child == 0) {
+            char *args[] = {"process", "proc-links-ran", "x", NULL};
+            execv(path, args);
+            _exit(100 + errno);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        printf("exec %s status=%d\n", forms[i], WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+    close(fd);
+    struct stat st;
+    char link[64] = {0};
+    long rl = readlink("/proc/mounts", link, sizeof link - 1);
+    printf("readlink=%ld %s errno=%d\n", rl, rl < 0 ? "" : link, rl < 0 ? errno : 0);
+    const char *paths[] = {"/proc/mounts"};
+    for (int i = 0; i < 1; i++) {
+        int l = lstat(paths[i], &st) ? errno : 0;
+        unsigned lmode = l ? 0 : st.st_mode;
+        long long lsize = l ? -1 : (long long)st.st_size;
+        int f = stat(paths[i], &st) ? errno : 0;
+        printf("%s lstat=%d mode=%o size=%lld stat=%d mode=%o\n", paths[i], l, lmode, lsize, f,
+               f ? 0 : st.st_mode);
+    }
+    int nofollow = open("/proc/mounts", O_RDONLY | O_NOFOLLOW);
+    printf("nofollow=%d\n", nofollow < 0 ? errno : 0);
+    if (nofollow >= 0) close(nofollow);
+    int path_only = open("/proc/mounts", O_PATH | O_NOFOLLOW);
+    if (path_only >= 0) {
+        int s = fstat(path_only, &st) ? errno : 0;
+        printf("o_path fstat=%d mode=%o\n", s, s ? 0 : st.st_mode);
+        close(path_only);
+    } else {
+        printf("o_path errno=%d\n", errno);
+    }
+    char a[8192], b[8192];
+    int fa = open("/proc/mounts", O_RDONLY), fb = open("/proc/self/mounts", O_RDONLY);
+    long na = fa < 0 ? -1 : read(fa, a, sizeof a), nb = fb < 0 ? -1 : read(fb, b, sizeof b);
+    printf("same=%d\n", na > 0 && na == nb && !memcmp(a, b, (size_t)na));
+    if (fa >= 0) close(fa);
+    if (fb >= 0) close(fb);
+    return 0;
+}
+
 static int generated_rooted_links_case(const char *self) {
     if (!mkdtemp(grl_base)) return 1;
     char path[256];
@@ -45148,6 +45213,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-link-names")) return generated_link_names_case(self);
     if (!strcmp(mode, "generated-link-ran")) return 7;
     if (!strcmp(mode, "generated-rooted-links")) return generated_rooted_links_case(self);
+    if (!strcmp(mode, "proc-links")) return proc_links_case(self);
+    if (!strcmp(mode, "proc-links-ran")) return 7;
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

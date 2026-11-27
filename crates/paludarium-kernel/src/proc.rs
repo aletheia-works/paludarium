@@ -1,5 +1,5 @@
 //! The /proc files paludarium has, generated when opened: the mount table
-//! (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's mounts,
+//! (`/proc/self/mountinfo`, `/proc/self/mounts`) from the filesystem's mounts,
 //! `loadavg`, `meminfo`, `stat` and `uptime`, `/proc/sys` ([`crate::sysctl`]),
 //! and this process's directory with its
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
@@ -48,7 +48,7 @@ pub(crate) fn write_only_stat() -> FileStat {
 pub(crate) fn mount_table(path: &[u8]) -> Option<bool> {
     match path {
         b"/proc/self/mountinfo" => Some(true),
-        b"/proc/self/mounts" | b"/proc/mounts" => Some(false),
+        b"/proc/self/mounts" => Some(false),
         _ => None,
     }
 }
@@ -281,6 +281,8 @@ pub(crate) enum TaskEntry {
     /// directory of the task's network namespace, and one of its files.
     NetLink,
     Net,
+    /// `/proc/mounts`, a link to the reading process's `mounts`.
+    MountsLink,
     NetFile(crate::proc_net::File),
     /// A path on past one of those files.
     BelowNetFile,
@@ -301,7 +303,8 @@ pub(crate) struct TaskPath {
 }
 /// The path under `/proc/<pid>` of a process other than `own`, the reader,
 /// under `task` of any process, under `/proc/thread-self`, the reading
-/// thread `own_tid`'s, or `/proc/net` and under it, the reader's; `None` for
+/// thread `own_tid`'s, or `/proc/net` and `/proc/mounts` and under them,
+/// the reader's; `None` for
 /// the rest of the reader's own directory, which [`own_entry`] finds, unless
 /// `own_leader_gone`: then the reader's process directory is its zombie
 /// leader's, found here as another's is.
@@ -315,16 +318,19 @@ pub(crate) fn task_path(
     if !path.starts_with(b"/proc/") {
         return None;
     }
-    // `/proc/thread-self` is the link itself, and `/proc/net`; with a slash
+    // `/proc/thread-self` is the link itself, and `/proc/net` and
+    // `/proc/mounts`; with a slash
     // or more after it, the directory it leads to.
-    let link_itself = path.ends_with(b"/thread-self") || path.ends_with(b"/net");
+    let link_itself =
+        path.ends_with(b"/thread-self") || path.ends_with(b"/net") || path.ends_with(b"/mounts");
     let path = paludarium_vfs::normalize_path(path).ok()?;
     let rest = path.strip_prefix(b"/proc/")?;
     let mut parts = rest.split(|&b| b == b'/');
     let head = parts.next()?;
     let thread_self = head == b"thread-self";
     let net = head == b"net";
-    let pid = if head == b"self" || thread_self || net {
+    let mounts = head == b"mounts";
+    let pid = if head == b"self" || thread_self || net || mounts {
         own
     } else {
         descriptor_number(head).filter(|&pid| pid != 0)?
@@ -397,6 +403,11 @@ pub(crate) fn task_path(
         [] if net && link_itself => (None, TaskEntry::NetLink),
         _ if net => {
             let parts: Vec<&[u8]> = [&b"net"[..]].into_iter().chain(parts).collect();
+            (None, entry(&parts))
+        }
+        [] if mounts && link_itself => (None, TaskEntry::MountsLink),
+        _ if mounts => {
+            let parts: Vec<&[u8]> = [&b"mounts"[..]].into_iter().chain(parts).collect();
             (None, entry(&parts))
         }
         [] if thread_self && link_itself => (Some(own_tid), TaskEntry::ThreadLink),

@@ -8286,16 +8286,18 @@ fn open_path(
                 None => file,
             })
         } else if let Some(target) = tasks::link(&task, path.entry) {
-            // `exe`, `cwd`, `thread-self` and `net` are links, which
-            // O_NOFOLLOW does not follow; the last two's are relative to
-            // /proc.
+            // `exe`, `cwd`, `thread-self`, `net` and `mounts` are links,
+            // which O_NOFOLLOW does not follow; the last three's are
+            // relative to /proc.
             let mut target = target?;
             if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
                 return Err(Errno(40)); // ELOOP
             }
             if matches!(
                 path.entry,
-                crate::proc::TaskEntry::ThreadLink | crate::proc::TaskEntry::NetLink
+                crate::proc::TaskEntry::ThreadLink
+                    | crate::proc::TaskEntry::NetLink
+                    | crate::proc::TaskEntry::MountsLink
             ) {
                 target = [&b"/proc/"[..], &target].concat();
             }
@@ -8990,7 +8992,9 @@ fn descriptor_followed(files: &Files, d: Descriptor) -> Result<Followed, Errno> 
     })
 }
 /// The path `execveat(dir, raw, ..)` runs when a link on the way leads into
-/// `/proc` or `/dev`, or `raw` is a link of a process's `/proc` directory:
+/// `/proc` or `/dev`, a magic link on the way leads out of them
+/// ([`through_magic_links`]), or `raw` is a link of a process's `/proc`
+/// directory:
 /// Linux's walk jumps through `exe`, `cwd` and `root` (`nd_jump_link`) to
 /// the file itself, whose directories it does not search, and follows a
 /// symbolic link elsewhere into the generated files as it follows any.
@@ -9010,8 +9014,11 @@ pub(crate) fn exec_jumped(
     if raw.is_empty() {
         return Ok(None);
     }
-    let mut p = c.files.path(dir, through_magic_links(c, raw.to_vec())?)?;
-    let mut jumped = false;
+    // A magic link on the way (`/proc/self/fd/3/name`) is jumped through
+    // first, as the walk of any call is.
+    let through = through_magic_links(c, raw.to_vec())?;
+    let mut jumped = through != raw;
+    let mut p = c.files.path(dir, through)?;
     for _ in 0..40 {
         if !generated(&p) && p != b"/proc" {
             let Err(error) = c.files.fs().metadata(&p, follow) else {

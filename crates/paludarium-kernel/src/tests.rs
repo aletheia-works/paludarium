@@ -2926,6 +2926,46 @@ fn statfs_and_the_generated_mount_table() {
     let fd = f.ret(2, &[mounts, 1, 0]);
     assert_eq!(f.ret(1, &[fd, buf, 1]), errno(Errno::EINVAL));
 }
+/// `/proc/mounts` is a link to `self/mounts`, as Linux's `proc_symlink`
+/// makes it: `readlink` and `lstat` give the link, and the calls that follow
+/// it give the reader's mount table.
+#[test]
+fn proc_mounts_is_a_link_to_the_reader_s_own() {
+    let mut f = fixture();
+    let (link, own, buf) = (DATA, DATA + 0x40, DATA + 0x100);
+    f.mem.write(GuestAddr(link), b"/proc/mounts\0").unwrap();
+    f.mem.write(GuestAddr(own), b"/proc/self/mounts\0").unwrap();
+    assert_eq!(f.ret(89, &[link, buf, 64]), 11);
+    let mut target = [0; 11];
+    f.mem.read(GuestAddr(buf), &mut target).unwrap();
+    assert_eq!(&target, b"self/mounts");
+    // `lstat`: the link, 0777, of its target's length.
+    assert_eq!(f.ret(6, &[link, buf]), 0);
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(buf + 24)).unwrap() as u32,
+        0o120_777
+    );
+    assert_eq!(f.mem.read_u64(GuestAddr(buf + 48)).unwrap(), 11);
+    // `stat`: the file it leads to.
+    assert_eq!(f.ret(4, &[link, buf]), 0);
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(buf + 24)).unwrap() as u32,
+        0o100_444
+    );
+    // O_NOFOLLOW does not follow it.
+    assert_eq!(f.ret(2, &[link, 0o400000, 0]), errno(Errno(40)));
+    let read = |f: &mut Fixture, path: u64| {
+        let fd = f.ret(2, &[path, 0, 0]);
+        let n = f.ret(0, &[fd, buf, 0x1000]);
+        let mut table = vec![0; n as usize];
+        f.mem.read(GuestAddr(buf), &mut table).unwrap();
+        assert_eq!(f.ret(3, &[fd]), 0);
+        table
+    };
+    let table = read(&mut f, own);
+    assert!(!table.is_empty());
+    assert_eq!(read(&mut f, link), table);
+}
 #[test]
 fn syscall_bad_path() {
     let mut f = fixture();

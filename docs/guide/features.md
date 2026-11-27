@@ -4312,8 +4312,9 @@ kernel.
 
 - `statfs` reports the in-memory filesystem as a 4 GiB tmpfs whose used
   space and inodes are what it holds, and a mounted host directory with the
-  host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
-  and `/proc/mounts` list the mounts of the caller's mount namespace
+  host filesystem's own numbers. `/proc/self/mountinfo` and `/proc/self/mounts`
+  list the mounts of the caller's mount namespace, and so does `/proc/mounts`,
+  a symbolic link to `self/mounts` (0777, of size 11) as Linux's
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
   `proc` for `/proc`, `devtmpfs` for `/dev` and the tmpfs on `/dev/shm`
   from start-up,
@@ -4372,9 +4373,10 @@ kernel.
   look at its descriptors (`EACCES`), as Linux's `proc_fd_link` jumps;
   once the process has ended, it is `ENOENT`. The file calls
   that take an absolute path do this (`openat2` with `RESOLVE_*` flags in its
-  own walk); a path relative to a descriptor of `/proc` or to a working
-  directory there, one whose `..` or symbolic link leads into `/proc`,
-  `execve` and a Unix socket's address do not.
+  own walk), and so does `execve` (`/proc/self/fd/3/program` runs `program`
+  in the directory descriptor 3 holds); a path relative to a descriptor of
+  `/proc` or to a working directory there, one whose `..` or symbolic link
+  leads into `/proc`, and a Unix socket's address do not.
 
 - The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
   `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only

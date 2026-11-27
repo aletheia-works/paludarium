@@ -1378,6 +1378,7 @@ pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errn
         }
         TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
         TaskEntry::NetLink => Some(b"self/net".to_vec()),
+        TaskEntry::MountsLink => Some(b"self/mounts".to_vec()),
         TaskEntry::Exe => task.holds().then(|| task.view.group.executable()),
         TaskEntry::Cwd => task.holds().then(|| task.public.files.cwd()).flatten(),
         TaskEntry::Root => task.holds().then(|| task.public.files.root()).flatten(),
@@ -1457,6 +1458,16 @@ pub(super) fn stat(
         TaskEntry::NetLink => {
             let stat = FileStat {
                 size: b"self/net".len() as u64,
+                ..crate::proc::self_link_stat()
+            };
+            return Ok((stat, device(c, path), SMALL_BLOCK_SIZE));
+        }
+        TaskEntry::MountsLink if follow => {
+            return stat(c, path, task, TaskEntry::Mounts(false), true);
+        }
+        TaskEntry::MountsLink => {
+            let stat = FileStat {
+                size: b"self/mounts".len() as u64,
                 ..crate::proc::self_link_stat()
             };
             return Ok((stat, device(c, path), SMALL_BLOCK_SIZE));

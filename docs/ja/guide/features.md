@@ -3698,8 +3698,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `statfs` は、メモリ上のファイルシステムを 4 GiB の tmpfs として返します。使用量と
   inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
-  ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
-  `/proc/mounts` は呼び出し元のマウント名前空間のマウントの一覧です（ルートは `tmpfs`、
+  ホストのファイルシステムの値を返します。`/proc/self/mountinfo` と `/proc/self/mounts` は
+  呼び出し元のマウント名前空間のマウントの一覧で、Linux と同じく `self/mounts` への
+  シンボリックリンク（0777、大きさ 11）である `/proc/mounts` も同じです（ルートは `tmpfs`、
   `--mount` ごとに `hostfs`。ホストのパスは見せません。起動したときからの `/proc` は
   `proc`、`/dev` は `devtmpfs`、`/dev/shm` は tmpfs です。`mount` が作った tmpfs とバインドの
   マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリ、マウントと
@@ -3749,9 +3750,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルは `ENOTDIR` です。ほかのプロセスの `fd` のリンク（`/proc/<pid>/fd/3/name`）も、
   Linux の `proc_fd_link` と同じく、そのディスクリプタを見てよい読み手なら同じように
   たどり（見てはいけなければ `EACCES`）、プロセスが終わった後は `ENOENT` です。絶対パスを取るファイルの呼び出しはこう扱います（`RESOLVE_*` フラグ付きの
-  `openat2` は自身の解決の中で扱います）。`/proc` のディスクリプタや `/proc` の中の
-  作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
-  `execve`、Unix ソケットのアドレスは扱いません。
+  `openat2` は自身の解決の中で扱います）。`execve` も同じで、`/proc/self/fd/3/program` は
+  ディスクリプタ 3 が持つディレクトリの中の `program` を動かします。`/proc` のディスクリプタや
+  `/proc` の中の作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
+  Unix ソケットのアドレスは扱いません。
 
 - `/proc` にあるのは、ほかには `/proc/cpuinfo`（後述）、`/proc/loadavg`、`/proc/locks`（前述）、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/net`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net`、`vm` だけを持つ `/proc/sys`（後述）、

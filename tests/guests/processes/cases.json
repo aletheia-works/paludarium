@@ -510,6 +510,7 @@
     {"name":"generated-binds","binary":"process"},
     {"name":"generated-link-names","binary":"process"},
     {"name":"generated-rooted-links","binary":"process"},
+    {"name":"proc-links","binary":"process"},
     {"name":"generated-changes","binary":"process"},
     {"name":"tmpfs-limits","binary":"process"},
     {"name":"shmem-fault-charge","binary":"process"},

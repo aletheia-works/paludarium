@@ -2330,8 +2330,17 @@ static long software_event(int config) {
     return syscall(SYS_perf_event_open, attr, 0, -1, -1, 0);
 }
 
+/* Touches the stack below the caller's, where a signal frame goes: its
+   size follows the CPU's XSAVE features, and a first touch of a stack
+   page in the measured access would count. */
+__attribute__((noinline)) static void touch_stack(void) {
+    volatile char below[64 * 1024];
+    for (size_t i = 0; i < sizeof below; i += 4096) below[i] = 0;
+}
+
 static void *counted_access(void *arg) {
     struct counted *c = arg;
+    touch_stack();
     int events[3] = {(int)software_event(2), (int)software_event(5), (int)software_event(6)};
     long long before[3] = {0}, after[3] = {0};
     struct rusage was, now;

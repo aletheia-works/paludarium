@@ -501,14 +501,29 @@ pub mod faults {
     /// wait: for one made under a lock another thread may need meanwhile.
     /// Its faults that fail are not counted either ([`unfinished`]).
     pub fn unresolved<T>(f: impl FnOnce() -> T) -> T {
-        struct Restore(Option<Arc<dyn Resolver>>, bool);
+        struct Restore(Option<Arc<dyn Resolver>>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 set_resolver(self.0.take());
-                DISABLED.with(|d| d.set(self.1));
             }
         }
-        let _restore = Restore(set_resolver(None), DISABLED.with(|d| d.replace(true)));
+        let _restore = Restore(set_resolver(None));
+        uncounted(f)
+    }
+
+    /// Runs `f` with the calling host thread's faults that fail not
+    /// counted ([`unfinished`]): for an access with faults disabled, and for
+    /// the emulator's own checks of a range ([`super::AddressSpace::check_read`]),
+    /// which Linux makes with no access, so that no fault counts until the
+    /// copy that follows faults.
+    pub(crate) fn uncounted<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DISABLED.with(|d| d.set(self.0));
+            }
+        }
+        let _restore = Restore(DISABLED.with(|d| d.replace(true)));
         f()
     }
 
@@ -557,9 +572,9 @@ pub mod faults {
     /// with `EFAULT`: Linux's `do_user_addr_fault` counted it in
     /// `page-faults` as it started, and `mm_account_fault` counts no error
     /// in `min_flt` or `minor-faults`. Not so for an access with faults
-    /// disabled ([`unresolved`]: `faulthandler_disabled`), one through
-    /// `get_user_pages`, which takes no fault of the CPU, or one past user
-    /// space.
+    /// disabled ([`unresolved`]: `faulthandler_disabled`), a check of a
+    /// range ([`uncounted`]), one through `get_user_pages`, which takes no
+    /// fault of the CPU, or one past user space.
     fn unfinished(fault: &super::Fault) {
         let gup = GUP.with(Cell::get);
         if !KERNEL.with(Cell::get)
@@ -10139,7 +10154,11 @@ impl AddressSpace {
                 data.check(&data.read_directory(), addr, len, access, false)
             };
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
+                // A check is no copy: it counts no fault that fails.
+                Err(fault)
+                    if faults::uncounted(|| {
+                        faults::resolve(|| self.view(), &fault, &mut retry)
+                    }) => {}
                 result => return result,
             }
         }
@@ -12264,6 +12283,10 @@ mod tests {
         );
         assert!(faults::through_gup(|| space.write(gone, &[1])).is_err());
         assert!(faults::unresolved(|| space.read(gone, &mut [0])).is_err());
+        // Nor a check of a range, which Linux makes with no access.
+        assert!(space.check_write(gone, 1).is_err());
+        assert!(space.check_read(gone, 1).is_err());
+        assert!(space.check_write(at, 1).is_err());
         faults::set_kernel(false);
         assert!(space.read(gone, &mut [0]).is_err());
         faults::set_kernel(true);

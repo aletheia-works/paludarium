@@ -366,6 +366,10 @@ verified.
   system call; its CPU time is looked at as the event is read, and its page
   faults count as they are taken. An event of
   a CPU counts those of every thread there, with the same limits. A
+  system call that checks its buffer before it copies (inotify's and
+  fanotify's reads, `epoll_wait`, some socket calls, among others) and
+  fails with `EFAULT` there counts no `page-faults`, where Linux's copy
+  counts one; a copy that fails counts one, as on Linux. A
   context switch is a sleep of the thread, not a preemption (but for a
   thread with `rseq` that gives its virtual CPU to another); and a thread
   without `rseq` moves to another CPU only when a new CPU mask changes the

@@ -1162,8 +1162,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フォールトはメジャーフォールトです。カーネルモードのフォールトは先に VMA のロックの下で
   動かないので、そのやり直しは `FAULT_FLAG_TRIED` になり、やり直しがページを取り込んだか
   どうかに関わらず一度だけ数えます（`ru_majflt`、`page-faults`、`major-faults`。マイナー
-  フォールトには数えません）。`get_user_pages` のものはページがあるのを見つけ、何も
-  数えません。
+  フォールトには数えません）。`mm_account_fault` と同じく、やり直しが終わるときに
+  数えます。（何も埋めない `UFFDIO_WAKE` の後に）もう一度待つやり直しは何も足さず、
+  そのあと致命的なシグナルなどで失敗したものは数えません。`get_user_pages` のものは
+  ページがあるのを見つけ、何も数えません。
   `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。
   `UFFDIO_WRITEPROTECT` は、`mwriteprotect_range` と同じく VMA ごとに、範囲のページを
   保護するか保護を解きます。どの VMA も書き込み保護について登録したものでなければ

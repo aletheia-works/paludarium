@@ -360,11 +360,8 @@ verified.
   these faults are no `perf` event. Every page of a file is taken to be in
   the page cache, so the only major faults (`ru_majflt`, `major-faults`)
   are those of the kernel's accesses that a `userfaultfd` had try again.
-  Each is counted as its wait ends, so one whose retry waits again (after
-  a `UFFDIO_WAKE` that filled nothing) and then fails with a fatal signal
-  has counted one, where Linux counts none. `/proc/<pid>/stat`'s `minflt`,
-  `cminflt`, `majflt` and `cmajflt` read the same counts, with the same
-  limits.
+  `/proc/<pid>/stat`'s `minflt`, `cminflt`, `majflt` and `cmajflt` read
+  the same counts, with the same limits.
 - **perf events, in part**: only the software events count; cgroup
   switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
   are hardware events even on a host with a PMU: cycles and cache misses

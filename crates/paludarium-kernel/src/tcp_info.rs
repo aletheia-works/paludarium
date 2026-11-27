@@ -56,6 +56,8 @@ pub(crate) const RMEM_MAX: u32 = 32 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TcpInfo {
     pub(crate) state: u8,
+    /// `tcpi_ca_state`.
+    pub(crate) recovery: u8,
     pub(crate) retransmits: u8,
     pub(crate) backoff: u8,
     pub(crate) options: u8,
@@ -70,6 +72,9 @@ pub(crate) struct TcpInfo {
     pub(crate) unacked: u32,
     /// A listener's backlog.
     pub(crate) sacked: u32,
+    pub(crate) lost: u32,
+    /// `tcpi_retrans`: the segments sent again and not acknowledged.
+    pub(crate) resent: u32,
     /// Milliseconds since data last went and came, and an ACK came.
     pub(crate) last_data_sent: u32,
     pub(crate) last_data_recv: u32,
@@ -101,7 +106,14 @@ pub(crate) struct TcpInfo {
     pub(crate) bytes_sent: u64,
     pub(crate) snd_wnd: u32,
     pub(crate) rcv_wnd: u32,
+    pub(crate) reord_seen: u32,
+    pub(crate) rcv_ooopack: u32,
+    /// `tcpi_rehash`, one for each timeout, and what `tcpi_total_rto` and
+    /// the fields after it count.
+    pub(crate) rehash: u32,
     pub(crate) total_rto: u16,
+    pub(crate) rto_recoveries: u16,
+    pub(crate) rto_time: u32,
 }
 
 /// What a connection has carried, for [`TcpInfo::connected`].
@@ -136,6 +148,7 @@ impl TcpInfo {
         let since = (uptime as u32).wrapping_sub(300_000);
         Self {
             state,
+            recovery: 0,
             retransmits: 0,
             backoff: 0,
             options: 0,
@@ -147,6 +160,8 @@ impl TcpInfo {
             rcv_mss: 0,
             unacked: 0,
             sacked: 0,
+            lost: 0,
+            resent: 0,
             last_data_sent: since,
             last_data_recv: since,
             last_ack_recv: since,
@@ -177,7 +192,12 @@ impl TcpInfo {
             bytes_sent: 0,
             snd_wnd: 0,
             rcv_wnd: 0,
+            reord_seen: 0,
+            rcv_ooopack: 0,
+            rehash: 0,
             total_rto: 0,
+            rto_recoveries: 0,
+            rto_time: 0,
         }
     }
     /// A listener with `ready` connections waiting of its `backlog`: what
@@ -225,6 +245,10 @@ impl TcpInfo {
             unacked: in_flight,
             sent: carried.sent,
             acked: carried.sent,
+            rto: RTO,
+            cwnd: CWND,
+            ssthresh: SSTHRESH,
+            reordering: REORDERING,
             received: carried.received,
             held: carried.unsent,
             end_acked: carried.fin_sent,
@@ -251,17 +275,20 @@ impl TcpInfo {
         let pacing = u64::from(SND_MSS) * 2_000_000 * u64::from(CWND) / u64::from(RTT);
         Self {
             state,
-            retransmits: 0,
-            backoff: 0,
+            recovery: counts.state,
+            retransmits: counts.retransmits,
+            backoff: counts.backoff,
             options: OPTIONS,
             wscale: (wscale(RMEM_MAX), carried.rcv_wscale),
             app_limited: true,
-            rto: RTO,
+            rto: counts.rto,
             ato: counts.ato,
             snd_mss: counts.snd_mss,
             rcv_mss: counts.rcv_mss,
             unacked: counts.unacked,
-            sacked: 0,
+            sacked: counts.left.0,
+            lost: counts.left.1,
+            resent: counts.left.2,
             last_data_sent: carried.since_sent,
             last_data_recv: carried.since_received,
             last_ack_recv: carried.since_ack,
@@ -269,14 +296,14 @@ impl TcpInfo {
             rcv_ssthresh: ADVMSS,
             rtt: RTT,
             rttvar: RTTVAR,
-            snd_ssthresh: SSTHRESH,
-            snd_cwnd: CWND,
+            snd_ssthresh: counts.ssthresh,
+            snd_cwnd: counts.cwnd,
             advmss: ADVMSS,
-            reordering: REORDERING,
+            reordering: counts.reordering,
             rcv_space: ADVMSS,
             total_retrans: counts.retransmitted,
             bytes_retrans: counts.resent,
-            dsack_dups: counts.retransmitted,
+            dsack_dups: counts.dsacks,
             pacing_rate: pacing,
             max_pacing_rate: u64::MAX,
             bytes_acked: syn + counts.acked + u64::from(counts.end_acked),
@@ -296,13 +323,19 @@ impl TcpInfo {
             bytes_sent: counts.sent,
             snd_wnd: WINDOW,
             rcv_wnd: WINDOW,
-            total_rto: 0,
+            reord_seen: counts.reordered,
+            rcv_ooopack: counts.disordered,
+            rehash: u32::from(counts.timeouts),
+            total_rto: counts.timeouts,
+            rto_recoveries: counts.recoveries,
+            rto_time: counts.timeout_ms,
         }
     }
     /// Every field 0 but those `tcp_get_info` fills for any state.
     fn zero(state: u8) -> Self {
         Self {
             state,
+            recovery: 0,
             retransmits: 0,
             backoff: 0,
             options: 0,
@@ -314,6 +347,8 @@ impl TcpInfo {
             rcv_mss: 0,
             unacked: 0,
             sacked: 0,
+            lost: 0,
+            resent: 0,
             last_data_sent: 0,
             last_data_recv: 0,
             last_ack_recv: 0,
@@ -344,13 +379,19 @@ impl TcpInfo {
             bytes_sent: 0,
             snd_wnd: 0,
             rcv_wnd: 0,
+            reord_seen: 0,
+            rcv_ooopack: 0,
+            rehash: 0,
             total_rto: 0,
+            rto_recoveries: 0,
+            rto_time: 0,
         }
     }
     /// The structure as x86-64 Linux lays it out.
     pub(crate) fn bytes(&self) -> [u8; LEN] {
         let mut out = [0u8; LEN];
         out[0] = self.state;
+        out[1] = self.recovery;
         out[2] = self.retransmits;
         out[4] = self.backoff;
         out[5] = self.options;
@@ -363,6 +404,8 @@ impl TcpInfo {
             (20, self.rcv_mss),
             (24, self.unacked),
             (28, self.sacked),
+            (32, self.lost),
+            (36, self.resent),
             (44, self.last_data_sent),
             (52, self.last_data_recv),
             (56, self.last_ack_recv),
@@ -384,8 +427,12 @@ impl TcpInfo {
             (156, self.data_segs_out),
             (192, self.delivered),
             (216, self.dsack_dups),
+            (220, self.reord_seen),
+            (224, self.rcv_ooopack),
             (228, self.snd_wnd),
             (232, self.rcv_wnd),
+            (236, self.rehash),
+            (244, self.rto_time),
         ];
         for (at, value) in words {
             out[at..at + 4].copy_from_slice(&value.to_le_bytes());
@@ -403,6 +450,7 @@ impl TcpInfo {
             out[at..at + 8].copy_from_slice(&value.to_le_bytes());
         }
         out[240..242].copy_from_slice(&self.total_rto.to_le_bytes());
+        out[242..244].copy_from_slice(&self.rto_recoveries.to_le_bytes());
         out
     }
 }

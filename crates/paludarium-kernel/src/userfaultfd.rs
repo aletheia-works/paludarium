@@ -743,6 +743,7 @@ impl KernelCopies {
         // So it checks for them every 10 ms rather than being woken.
         let never = Arc::new(AtomicBool::new(false));
         let mut fatal = false;
+        let _sleeps = self.inbox.tif().sleep_killable();
         loop {
             let ticket = self.hub.token.value();
             if waiting.woken.load(Ordering::SeqCst) || context.released.load(Ordering::SeqCst) {
@@ -1438,6 +1439,7 @@ fn wait_read(
         state.epoch += 1;
     }
     context.hub.changed();
+    let _sleeps = c.inbox.tif().sleep_killable();
     loop {
         let ticket = c.files.readiness.token.value();
         if event.done.load(Ordering::SeqCst)
@@ -1449,21 +1451,24 @@ fn wait_read(
         let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) else {
             break;
         };
-        c.group.expire_timer(c.process, now);
+        c.group.expire_due(now);
+        c.group.pass_process(c.process);
         let _ = c.inbox.drain(c.process);
+        // A signal it does not take keeps its inbox's wake set.
+        let never = AtomicBool::new(false);
         let end = Some((
             paludarium_host::ClockId::Monotonic,
             now.saturating_add(10_000_000),
         ));
         if let Err(e) = c
             .host
-            .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
+            .wait_on(&c.files.readiness.token, ticket, end, &never)
             && e == Errno::ENOSYS
         {
             let _ = c.host.wait_until(
                 paludarium_host::ClockId::Monotonic,
                 now.saturating_add(1_000_000),
-                c.cancellation,
+                &never,
             );
         }
     }

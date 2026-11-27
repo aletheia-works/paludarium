@@ -1192,9 +1192,11 @@ kernel.
   Linux's `complete_signal` starts the group exit then, when it is SIGKILL,
   or when its action is the default one, which ends the process without a
   core (not SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV,
-  SIGXCPU, SIGXFSZ or SIGSYS, which their taker dumps), the thread it goes
-  to (or one of the process's) does not block it, and the process is not
-  stopped. The memory goes as the process's last thread ends, so there is
+  SIGXCPU, SIGXFSZ or SIGSYS, which their taker dumps), a thread wants it
+  as Linux's `wants_signal` asks (the thread it is sent to, or another of
+  the process's: one that does not block it, does not exit, is in no group
+  or ptrace stop and does not sleep with another signal pending), and the
+  process is neither stopped nor, but for SIGKILL, traced. The memory goes as the process's last thread ends, so there is
   nothing more to release early.
 
 - `mremap` grows a mapping in place when the pages after it are free, and
@@ -6048,6 +6050,47 @@ kernel.
   40; a SYN sent again is the connecting socket's, with its options. An accepted socket
   takes the listener's filter and its lock, as `sk_clone_lock` copies
   them.
+  - The SYN-ACK that answers is the client's filter's to keep: dropped, the
+    client goes on trying. The connection goes on from the sequence numbers
+    and timestamps of the two.
+  - The handshake's last acknowledgement is the listener's again. Dropped,
+    the client is connected and the listener has a request (`SYN_RECV` to
+    `sock_diag`), with nothing to accept: the SYN-ACK goes again after 1
+    second, then 2, 4, 8 and 16 more, and the client answers it
+    (`tcp_send_challenge_ack`). The first segment that the listener's filter
+    of that time keeps, data and an end too, opens the connection, which is
+    accepted in that order; a reset drops the request, as 63 seconds do.
+    What comes after that, or after the listener has closed, is answered
+    with a reset.
+
+- On a TCP connection on the loopback or across a veth pair, the filter
+  runs on each segment that comes to its socket, data, acknowledgements,
+  ends and resets, as `tcp_v4_rcv` and `tcp_v6_rcv` run `tcp_filter`: until
+  the socket is closed and its end acknowledged.
+  - It sees the TCP header, 32 bytes with the timestamps and more with SACK
+    blocks, and the data after it: sequence numbers from a random first one,
+    the flags (`PSH` on a write's last, `URG` and its pointer up to an
+    urgent byte), the window the side offers, scaled, the pseudo-header's
+    checksum and the `sk_buff` fields, with `gso_segs` and `gso_size`.
+    Classic loads see the same, with `SKF_AD_PAY_OFFSET` where the data
+    starts.
+  - 0 drops the segment, which is then not counted (`tcpi_segs_in`). Any
+    other value keeps that many bytes from the TCP header on, the header
+    always: the data past them has not come, and an end on the segment
+    comes with what is kept of it.
+  - What was dropped or cut is sent again as Linux 7.0 sends it: by a tail
+    loss probe; on a SACK of something sent later (RACK); or at the
+    retransmission timeout, 201 ms that doubles, the small segments at the
+    head joined into one (`tcp_retrans_try_collapse`). It comes at its time,
+    whether or not a call is made then. `tcp_info` tells of it:
+    the recovery's state, the segments lost, SACKed and sent again, the
+    congestion window and its threshold (cubic's, with proportional rate
+    reduction), the timeouts, the duplicates the peer told of (D-SACK),
+    which may undo the reduction, and those that came out of order.
+  - A connection ends with `ETIMEDOUT` after `TCP_USER_TIMEOUT`, else after
+    15 timeouts (`tcp_retries2`), or 8 for one whose socket has closed. A
+    reset that is dropped leaves the connection open; each segment it
+    sends then gets another.
 
 - A classic filter (`SO_ATTACH_FILTER`, a `struct sock_fprog`; `EINVAL`
   for another size) is checked as Linux's `bpf_check_classic` checks it
@@ -6059,7 +6102,9 @@ kernel.
     some path has not written it, a jump past the end, an ancillary load
     Linux does not know, and a last instruction that does not return. It
     is `EFAULT` for instructions that cannot be read, and `EPERM` on a
-    locked socket.
+    locked socket. On a TCP socket it is `EPERM`, before the program is
+    read, without `CAP_NET_ADMIN` in the user namespace that owns the
+    socket's network namespace, as Linux's `sk_setsockopt` asks.
   - The conversion is `EINVAL` for a jump that the converted program's
     16-bit offset cannot hold, and for any jump placed past its 32,767th
     instruction, as Linux's first pass, which takes every target to be at
@@ -6641,9 +6686,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_LINGER`,
     `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
     the host), `TCP_CORK` (which does not), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
-    `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
-    with Linux's defaults and
-    range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
+    `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read
+    only), `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
     `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
     `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
@@ -6682,9 +6726,15 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     address or `::1`;
     else through it rather than another, among the routes of one prefix
     and metric (`rt6_score_route`). Connecting a socket of no device to a
-    group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks
-    its route up, where Linux's connected socket keeps the one it has
-    (`ip6_sk_dst_lookup_flow`) when one of these options goes back to 0.
+    group of the link makes `IPV6_MULTICAST_IF`'s its own. A connected
+    socket keeps the route its `connect` found, with its hop
+    (`ip6_sk_dst_lookup_flow`, of Linux master: `sendto` with an address
+    looks one up): a `send` takes it while one of these options names
+    another device no more, until the route goes or its node changes
+    (`ip6_dst_check`), as a route added there or at a longer prefix, a hop
+    gone dead, an address gone and one whose duplicate address detection
+    is done change it, or `SO_BINDTODEVICE`, `SO_BINDTOIFINDEX` or another
+    `IP_TOS` drops it; then it keeps the one it looks up.
     `IP_UNICAST_IF`, of IPv4 and IPv6 sockets and TCP's too, takes the
     index of a device in network byte order (`EADDRNOTAVAIL` for one there
     is not) in an `int` exactly (`EINVAL` for another length), 0 for none,
@@ -6693,7 +6743,7 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     IPv4-mapped one too, and a UDP `connect` go through its device where
     the socket has none of its own (`udp_sendmsg`,
     `__ip4_datagram_connect`), as through `SO_BINDTODEVICE`'s; TCP goes by
-    its routes. Each send looks its route up, where Linux's connected
+    its routes. Each IPv4 send looks its route up, where Linux's connected
     socket keeps the one its `connect` found (`sk_dst_check`), until the
     routes change, when the option changes after it.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
@@ -7102,7 +7152,21 @@ one only with an `--allow-net`.
   pending. An unblocked ignored signal, such as the `SIGCHLD` of a child that
   ends, ends no wait in any thread: a blocked `read` stays blocked and a
   `nanosleep` sleeps on, as Linux drops the signal as it is sent
-  (`sig_ignored`).
+  (`sig_ignored`), so that a handler set later does not run for it. It is
+  kept if the thread it is sent to (the leader, for a process) blocks it or
+  is traced. `SIGCONT` takes the pending stop signals away, and a stop signal
+  the pending `SIGCONT`, even one that is then dropped.
+- A signal sent to a process goes to the thread Linux's `complete_signal`
+  chooses: the one it is sent to, or else the first that wants it, from the
+  thread last chosen so on. That is the leader for `kill` (or the thread whose
+  ID it names), signal-driven I/O and `ITIMER_REAL`, the thread that made the
+  child for `SIGCHLD`, and the one that runs for the timers on CPU time. A
+  thread wants a signal it does not block, unless it is in a group stop or a
+  ptrace stop, exits, or sleeps with another pending. The others sleep on. A
+  thread that takes a signal in takes every other of the process's it does
+  not block; those it then blocks, or leaves as it exits, go to another
+  (`retarget_shared_pending`), and one no thread wants waits until one
+  unblocks it. `rt_sigtimedwait` counts as unblocking what it waits for.
 
 ## Filesystem
 

@@ -4,6 +4,7 @@ use crate::fasync::{FileOwner, OwnerKind, Reason};
 use crate::inotify::reported_open;
 use crate::namespaces::Namespace;
 use crate::scheduling;
+use crate::targets::Sent;
 use crate::{Kernel, Next, SignalInbox, Thread, ThreadGroup, ThreadState, signals};
 use paludarium_cpu::{CpuState, reg};
 use paludarium_host::{ClockId, FileHandle, WaitToken};
@@ -41,6 +42,8 @@ enum Ptracer {
 
 struct Entry {
     parent: u32,
+    /// The parent's thread that made it (`real_parent`).
+    maker: u32,
     group: Arc<ThreadGroup>,
     status: Option<ExitStatus>,
     /// Process group ID; inherited on fork and kept across exec.
@@ -296,6 +299,7 @@ impl Processes {
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
+                    maker: 0,
                     parent: 0,
                     group,
                     status: None,
@@ -504,7 +508,7 @@ impl Processes {
     pub(crate) fn insert(
         &self,
         pid: u32,
-        parent: u32,
+        (parent, maker): (u32, u32),
         group: Arc<ThreadGroup>,
         exit_signal: i32,
         task: TaskCharge,
@@ -536,6 +540,7 @@ impl Processes {
             pid,
             Entry {
                 parent,
+                maker,
                 group,
                 status: None,
                 pgid,
@@ -1275,6 +1280,7 @@ impl Processes {
             if let Some(reaper) = reaper {
                 if let Some(entry) = entries.get_mut(&orphan) {
                     entry.parent = reaper;
+                    entry.maker = reaper;
                     entry.exit_signal = signals::SIGCHLD;
                 }
                 reaped = entries
@@ -1356,6 +1362,7 @@ impl Processes {
                     status,
                     cpu: entry.group.process_cpu(),
                 },
+                self.traces.tracer_task(pid).unwrap_or(tracer),
             );
         }
     }
@@ -1550,6 +1557,7 @@ impl Processes {
                     status,
                     cpu,
                 },
+                entry.maker,
             );
         }
         reap
@@ -1688,7 +1696,7 @@ impl Processes {
         entry.stop_report = Some(signal);
         entry.continue_report = false;
         self.changed.notify();
-        let parent = entry.parent;
+        let (parent, maker) = (entry.parent, entry.maker);
         // A parent that traces the process hears of its stops as a tracer
         // only (`ptrace_stop` tells the real parent only when reparented).
         if self.traces.tracer_of(pid) == Some(parent) {
@@ -1704,9 +1712,11 @@ impl Processes {
             && parent.group.wants_stop_notices()
         {
             let pid = parent.space.number(pid);
-            parent
-                .group
-                .notify_child(signals::CLD_STOPPED, signals::ChildSignal { pid, ..child });
+            parent.group.notify_child(
+                signals::CLD_STOPPED,
+                signals::ChildSignal { pid, ..child },
+                maker,
+            );
         }
     }
     /// Whether a live process other than `pid` runs in `space` (`CLONE_VM`
@@ -1911,7 +1921,7 @@ impl Processes {
         let (mut last, mut delivered) = (Ok(()), false);
         for (pid, named) in pids {
             let result = Self::check_kill(&entries, caller, &sender, pid, named, number)
-                .and_then(|()| self.send(&mut entries, pid, None, signal));
+                .and_then(|()| self.send_named(&mut entries, (pid, named), None, signal));
             delivered |= result.is_ok();
             // -1 does not report a process it may not signal, so with only
             // those it succeeds, as Linux's `kill_something_info`.
@@ -2090,7 +2100,7 @@ impl Processes {
             sender: Some(caller),
             ..signal
         };
-        self.send(&mut entries, found, None, signal)
+        self.send_named(&mut entries, (found, pid), None, signal)
     }
     /// `rt_tgsigqueueinfo` of `signal` to thread `tid` of process `tgid`.
     fn queue_thread(
@@ -2125,7 +2135,17 @@ impl Processes {
         thread: Option<u32>,
         signal: signals::PendingSignal,
     ) -> Result<(), Errno> {
-        let result = Self::deliver(entries, pid, thread, signal);
+        self.send_named(entries, (pid, pid), thread, signal)
+    }
+    /// The same, to process `pid` through its thread `named`.
+    fn send_named(
+        &self,
+        entries: &mut BTreeMap<u32, Entry>,
+        (pid, named): (u32, u32),
+        thread: Option<u32>,
+        signal: signals::PendingSignal,
+    ) -> Result<(), Errno> {
+        let result = Self::deliver_named(entries, (pid, named), thread, signal);
         self.changed.notify();
         result
     }
@@ -2160,6 +2180,15 @@ impl Processes {
         thread: Option<u32>,
         signal: signals::PendingSignal,
     ) -> Result<(), Errno> {
+        Self::deliver_named(entries, (pid, pid), thread, signal)
+    }
+    /// The same, to process `pid` through its thread `named`.
+    fn deliver_named(
+        entries: &mut BTreeMap<u32, Entry>,
+        (pid, named): (u32, u32),
+        thread: Option<u32>,
+        signal: signals::PendingSignal,
+    ) -> Result<(), Errno> {
         let number = signal.number;
         let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
         if number == 0 {
@@ -2184,13 +2213,13 @@ impl Processes {
         // The init of a nested PID namespace drops what it has no handler
         // for, as the receiving thread (the leader for its process) blocks
         // it or not; a signal it blocked it drops when it takes it.
-        let blocked = entry.group.blocked(thread.unwrap_or(pid));
+        let blocked = entry.group.blocked(thread.unwrap_or(named));
         if (1..=64).contains(&number) && entry.group.drops_as_init(number, forced, blocked) {
             return Ok(());
         }
         let send = |group: &ThreadGroup| match thread {
             Some(tid) => group.send_thread_signal(tid, signal),
-            None => group.send_process_signal(signal),
+            None => group.send_process_signal_to(signal, Sent::Thread(named)),
         };
         // SIGCONT resumes a stopped process at once, as Linux's
         // prepare_signal does, and its parent's wait can see that.
@@ -2199,7 +2228,7 @@ impl Processes {
             entry.group.job_continue();
             entry.stop_report = None;
             entry.continue_report = true;
-            let parent = entry.parent;
+            let (parent, maker) = (entry.parent, entry.maker);
             let child = signals::ChildSignal {
                 pid,
                 uid: entry.group.task_ids(pid, pid).uid,
@@ -2213,6 +2242,7 @@ impl Processes {
                 parent.group.notify_child(
                     signals::CLD_CONTINUED,
                     signals::ChildSignal { pid, ..child },
+                    maker,
                 );
             }
             return Ok(());
@@ -2463,6 +2493,9 @@ impl Kernel {
             return Ok(());
         };
         let traced = self.processes.traces.tracer_of(thread.tid).is_some();
+        let _sleeps = self.inbox.tif().sleep_killable();
+        // The call that made the child is over: this shows the thread asleep.
+        let _attached = paludarium_host::blocked::attach(self.inbox.blocked_flag());
         loop {
             let ticket = self.processes.changed().value();
             if release.load(Ordering::SeqCst) || self.group.status().is_some() {
@@ -2473,23 +2506,25 @@ impl Kernel {
                 return Err(Errno(4));
             }
             let now = self.host.clock(ClockId::Monotonic)?;
-            self.group.expire_timer(&mut thread.state, now);
+            // It takes none of the process's signals as it sleeps on.
+            self.group.expire_due(now);
+            self.group.pass_process(&mut thread.state);
             self.inbox.drain(&mut thread.state);
             // `complete_signal` leaves a traced task's signals to its tracer.
-            let fatal = if traced {
-                thread
-                    .state
-                    .pending
-                    .iter()
-                    .any(|s| s.number == crate::signal::SIGKILL)
-            } else {
-                signals::fatal_pending(&thread.state)
-            };
+            let killed = thread.state.pending.iter().any(|s| s.number == 9);
+            let fatal = killed
+                || self.group.killed()
+                || !traced
+                    && (signals::fatal_pending(&thread.state)
+                        || self
+                            .group
+                            .fatal_pending(&self.inbox, thread.state.signal_mask));
             if fatal {
                 return Ok(());
             }
-            let bound = signals::next_deadline(&thread.state);
-            self.wait_for_children_until(ticket, bound.unwrap_or(u64::MAX))?;
+            // A signal it does not take keeps its inbox's wake set.
+            let never = AtomicBool::new(false);
+            self.wait_for_children_until(ticket, u64::MAX, &never)?;
         }
     }
     /// A wait for a child sleeps once: `EINTR` when a signal, an expired
@@ -2505,32 +2540,35 @@ impl Kernel {
             return Err(Errno(4));
         }
         let bound = signals::next_deadline(&thread.state);
-        self.wait_for_children_until(ticket, bound.unwrap_or(u64::MAX))
+        self.wait_for_children_until(ticket, bound.unwrap_or(u64::MAX), &self.cancellation)
     }
     /// Sleeps until a process changes or is sent a signal after `ticket`
     /// was taken from [`Processes::changed`], or at most 10 ms pass, as the
     /// thread's wake token (any other signal) is polled; a host without
     /// tickets waits out the time.
     pub(crate) fn wait_for_children(&self, ticket: u32) -> Result<(), Errno> {
-        self.wait_for_children_until(ticket, u64::MAX)
+        self.wait_for_children_until(ticket, u64::MAX, &self.cancellation)
     }
-    /// [`Self::wait_for_children`], no later than `bound`.
-    fn wait_for_children_until(&self, ticket: u32, bound: u64) -> Result<(), Errno> {
+    /// [`Self::wait_for_children`], no later than `bound`, which `wake` ends.
+    fn wait_for_children_until(
+        &self,
+        ticket: u32,
+        bound: u64,
+        wake: &AtomicBool,
+    ) -> Result<(), Errno> {
         let end = self
             .host
             .clock(ClockId::Monotonic)?
             .saturating_add(10_000_000)
             .min(bound);
         let deadline = Some((ClockId::Monotonic, end));
-        match self.host.wait_on(
-            self.processes.changed(),
-            ticket,
-            deadline,
-            &self.cancellation,
-        ) {
+        match self
+            .host
+            .wait_on(self.processes.changed(), ticket, deadline, wake)
+        {
             Err(error) if error == Errno::ENOSYS => self
                 .host
-                .wait_until(ClockId::Monotonic, end, &self.cancellation)
+                .wait_until(ClockId::Monotonic, end, wake)
                 .map(drop),
             result => result.map(drop),
         }
@@ -3577,6 +3615,7 @@ impl Kernel {
             .new_process(group.aio(), child_mem.as_deref(), group.numa());
         // `copy_process` notes when the child was made (`start_boottime`).
         group.set_started(pid, self.host.clock(ClockId::Monotonic).unwrap_or(0));
+        inbox.tif().set_blocked(parent.state.signal_mask);
         group.register(pid, inbox.clone());
         // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
         // parent is given first if it has none.
@@ -3647,7 +3686,7 @@ impl Kernel {
         group.set_namespaces(pid, child_namespaces);
         self.processes.insert(
             pid,
-            self.process.pid,
+            (self.process.pid, parent.tid),
             group.clone(),
             (flags & 0xff) as i32,
             task,

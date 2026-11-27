@@ -20,7 +20,9 @@
    value, the null check of a lookup's result, which an array's element of
    a key the stack holds needs none of (a 0 stored, a 32-bit spill, the
    whole of an 8-byte one, in range or not, and keys it does not know),
-   a pointer that cannot be null compared with 0, and the bounds and
+   a pointer that cannot be null compared with 0, a lookup's result
+   compared with one (a value's, the map's), which tells where they are
+   equal, and the bounds and
    access (BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG) of a value.
    bpf-prog-context: the context, struct __sk_buff, read and written
    (cb[]) at the offsets and sizes a socket filter may use, and the
@@ -512,9 +514,32 @@ static int case_maps(void) {
               EXIT(), LDX_DW(0, 0, 0), EXIT());
     LOAD_MAPS("map is not 0", LD_MAP(1, array), JEQ(1, 0, 2), MOV(0, 0), EXIT(), LDX_DW(0, 10, 8),
               EXIT());
+    /* A hash's lookup in R6 equal to a pointer that cannot be null is not
+       null either: the jump skips the read through R6 if they are not
+       equal. */
+#define HASHED KEY8(hash), CALL(LOOKUP), MOV_REG(6, 0)
+#define NE(dst, src) I(0x5d, dst, src, 1, 0)
+    LOAD_MAPS("equal to the map", HASHED, LD_MAP(1, hash), NE(6, 1), LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("map equal to it", HASHED, LD_MAP(1, hash), NE(1, 6), LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("equal to a value", HASHED, KEY4(array), CALL(LOOKUP), NE(6, 0), LDX_DW(0, 6, 0),
+              EXIT());
+    LOAD_MAPS("equal to the map, jeq", HASHED, LD_MAP(1, hash), I(0x1d, 6, 1, 1, 0), EXIT(),
+              LDX_DW(0, 6, 0), EXIT());
 
     /* Programs it refuses. */
     LOAD_MAPS("no null check", KEY8(hash), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    /* Nor where it is not equal, for its copy, after a 32-bit
+       comparison, or equal to another lookup's result. */
+    LOAD_MAPS("not equal to the map", HASHED, LD_MAP(1, hash), I(0x5d, 6, 1, 1, 0), EXIT(),
+              LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("copy of one equal to the map", HASHED, MOV_REG(7, 6), LD_MAP(1, hash), NE(6, 1),
+              LDX_DW(0, 7, 0), EXIT());
+    LOAD_MAPS("equal to the map in 32 bits", HASHED, LD_MAP(1, hash), I(0x5e, 6, 1, 1, 0),
+              LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("equal to another lookup", HASHED, KEY8(hash), CALL(LOOKUP), NE(6, 0), LDX_DW(0, 6, 0),
+              EXIT());
+#undef NE
+#undef HASHED
     /* An array's element of a key out of range, or one the stack does not
        hold as Linux knows it: unknown, partly overwritten, scrubbed with
        a spill, an 8-byte spill from its start, a key past its slot's

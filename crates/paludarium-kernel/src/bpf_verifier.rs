@@ -1267,10 +1267,22 @@ enum Store {
 /// How an instruction leaves the walk.
 enum Step {
     Next(usize),
-    /// The fall-through, the target, and the ID of a lookup's result that
-    /// the jump tells is 0 on the target's side (`true`) or the other.
-    Branch(usize, usize, Option<(u32, bool)>),
+    /// The fall-through, the target, and what the jump tells on each side.
+    Branch(usize, usize, Learn),
     Exit,
+}
+
+/// What a conditional jump tells of a lookup's result.
+#[derive(Clone, Copy)]
+enum Learn {
+    Nothing,
+    /// The result of this ID is 0 on the target's side (`true`) or the
+    /// other, and a value on the other side (`mark_ptr_or_null_regs`).
+    Null(u32, bool),
+    /// The register is a value, not null, on the target's side (`true`)
+    /// or the other (`mark_ptr_not_null_reg`): it equals a pointer that
+    /// cannot be null there.
+    NotNull(u8, bool),
 }
 
 #[derive(Default)]
@@ -1383,13 +1395,22 @@ impl Walk {
             }
             match self.step(insns, &mut state, options)? {
                 Step::Next(next) => state.insn = next,
-                Step::Branch(fall, target, null) => {
+                Step::Branch(fall, target, learn) => {
                     let mut other = state.clone();
                     other.insn = target;
-                    if let Some((id, on_target)) = null {
-                        // mark_ptr_or_null_regs on both sides.
-                        other.null_check(id, on_target);
-                        state.null_check(id, !on_target);
+                    match learn {
+                        Learn::Nothing => {}
+                        Learn::Null(id, on_target) => {
+                            other.null_check(id, on_target);
+                            state.null_check(id, !on_target);
+                        }
+                        Learn::NotNull(r, on_target) => {
+                            let s = if on_target { &mut other } else { &mut state };
+                            let reg = &mut s.regs[usize::from(r)];
+                            if let Reg::Ptr(Ptr::MaybeNull(map, _), base) = *reg {
+                                *reg = Reg::Ptr(Ptr::Value(map), base);
+                            }
+                        }
                     }
                     pending.push(other);
                     if pending.len() > COMPLEXITY_LIMIT_JMP_SEQ {
@@ -2745,9 +2766,31 @@ fn jmp_op(s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
                         && insn.imm == 0
                         && matches!(op, jmp::JEQ | jmp::JNE) =>
                 {
-                    Ok(Step::Branch(i + 1, target, Some((id, op == jmp::JEQ))))
+                    Ok(Step::Branch(i + 1, target, Learn::Null(id, op == jmp::JEQ)))
                 }
-                _ => Ok(Step::Branch(i + 1, target, None)),
+                // A 64-bit comparison of a lookup's result with a pointer
+                // that cannot be null (reg_not_null, a value's or a map's
+                // here) tells it is not null where they are equal. 7.0
+                // also learns it from any other pointer, such as the
+                // stack's, and master from a register known to be 0;
+                // as where the two decide differently, it does as the one
+                // that refuses, which learns nothing.
+                (Reg::Ptr(Ptr::MaybeNull(..), _), Reg::Ptr(Ptr::Value(_) | Ptr::Map(_), _))
+                | (Reg::Ptr(Ptr::Value(_) | Ptr::Map(_), _), Reg::Ptr(Ptr::MaybeNull(..), _))
+                    if insn.class() == class::JMP && matches!(op, jmp::JEQ | jmp::JNE) =>
+                {
+                    let r = if matches!(a, Reg::Ptr(Ptr::MaybeNull(..), _)) {
+                        insn.dst
+                    } else {
+                        insn.src
+                    };
+                    Ok(Step::Branch(
+                        i + 1,
+                        target,
+                        Learn::NotNull(r, op == jmp::JEQ),
+                    ))
+                }
+                _ => Ok(Step::Branch(i + 1, target, Learn::Nothing)),
             }
         }
     }
@@ -3684,6 +3727,54 @@ mod tests {
             ]),
             eacces("invalid size of register fill")
         );
+    }
+
+    #[test]
+    fn a_lookup_equal_to_a_pointer_that_cannot_be_null_is_not_null() {
+        const NULL: &str = "R6 invalid mem access 'map_value_or_null'";
+        // R6 the result of a lookup of a key it does not know; `setup`
+        // puts the pointer to compare it with in R1, then `cmp` jumps
+        // over the read through R6 if they are not equal.
+        let program = |setup: &[Insn], cmp: Insn, read: u8| {
+            let mut p = unknown_key(3);
+            p.push(mov_reg(6, 0));
+            p.extend(setup);
+            p.extend([cmp, ldx(0x18, 0, read, 0), exit()]);
+            p
+        };
+        let map = ld_map(1, 3);
+        // An array's value of a key the stack holds cannot be null.
+        let value = [lookup(3), vec![mov_reg(1, 0)]].concat();
+        let jne = |dst: u8, src: u8| i(0x5d, dst, src, 1, 0);
+        ok(&program(&map, jne(6, 1), 6));
+        ok(&program(&map, jne(1, 6), 6));
+        ok(&program(&value, jne(6, 1), 6));
+        // if r6 == r1 goto read; exit
+        let mut p = unknown_key(3);
+        p.push(mov_reg(6, 0));
+        p.extend(map);
+        p.extend([i(0x1d, 6, 1, 1, 0), exit(), ldx(0x18, 0, 6, 0), exit()]);
+        ok(&p);
+        // Where they are not equal, it is not known.
+        let mut p = unknown_key(3);
+        p.push(mov_reg(6, 0));
+        p.extend(map);
+        p.extend([i(0x5d, 6, 1, 1, 0), exit(), ldx(0x18, 0, 6, 0), exit()]);
+        assert_eq!(refused(&p).1, NULL);
+        // Only the register compared learns it, not its copies.
+        let copy = [&map[..], &[mov_reg(7, 6)]].concat();
+        assert_eq!(
+            refused(&program(&copy, jne(6, 1), 7)).1,
+            "R7 invalid mem access 'map_value_or_null'"
+        );
+        // Not from a 32-bit comparison, another lookup's result, the stack
+        // pointer (7.0 learns it, master does not) or a register of 0
+        // (master learns it, 7.0 does not).
+        assert_eq!(refused(&program(&map, i(0x5e, 6, 1, 1, 0), 6)).1, NULL);
+        let other = [unknown_key(3), vec![mov_reg(1, 0)]].concat();
+        assert_eq!(refused(&program(&other, jne(6, 1), 6)).1, NULL);
+        assert_eq!(refused(&program(&[mov_reg(1, 10)], jne(6, 1), 6)).1, NULL);
+        assert_eq!(refused(&program(&[mov(1, 0)], jne(6, 1), 6)).1, NULL);
     }
 
     #[test]

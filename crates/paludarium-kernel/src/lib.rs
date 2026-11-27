@@ -261,7 +261,8 @@ impl Eq for CpuAccount {}
 /// a `userfaultfd` had try again. So are the faults of its own code that
 /// ended with no page (`unfinished_faults`): a `userfaultfd`'s wait that a
 /// signal ended, which `page-faults` counts as the fault starts, and no
-/// `min_flt` or `minor-faults` as it never ends.
+/// `min_flt` or `minor-faults` as it never ends; and those of the kernel's
+/// accesses that failed (`unfinished_kernel_faults`), as with `EFAULT`.
 #[derive(Debug, Default)]
 pub(crate) struct Usage {
     /// Grows only, under [`Self::time`]'s lock.
@@ -276,6 +277,7 @@ pub(crate) struct Usage {
     pub(crate) forced_faults: std::sync::atomic::AtomicU64,
     pub(crate) major_faults: std::sync::atomic::AtomicU64,
     pub(crate) unfinished_faults: std::sync::atomic::AtomicU64,
+    pub(crate) unfinished_kernel_faults: std::sync::atomic::AtomicU64,
     pub(crate) switches: std::sync::atomic::AtomicU64,
     pub(crate) migrations: std::sync::atomic::AtomicU64,
     /// The CPU it was last seen on (Linux's `task_cpu`), which
@@ -414,7 +416,7 @@ impl Faults {
 }
 
 /// What a [`Usage`] counts on each CPU, in [`CpuCounts`]'s order.
-pub(crate) type Counts = [u64; 6];
+pub(crate) type Counts = [u64; 7];
 
 /// One of a thread's latest faults: the minor, major and unfinished faults
 /// it had counted in its own code or in the kernel's work with this one,
@@ -440,7 +442,8 @@ pub(crate) enum FaultKind {
 
 /// What a thread's [`Usage`] counted on each CPU: its minor faults in its
 /// own code and the kernel's, its switches, its migrations, its major
-/// faults and its unfinished ones, in that order.
+/// faults, its unfinished ones and the kernel's unfinished ones, in that
+/// order.
 /// Those of the CPU it is on are what it counted since it came there; a
 /// migration counts to the CPU it comes to, as Linux's
 /// `perf_sw_event_sched` of `PERF_COUNT_SW_CPU_MIGRATIONS` runs there.
@@ -526,6 +529,7 @@ impl Usage {
             self.migrations.load(SeqCst),
             self.major_faults.load(SeqCst),
             self.unfinished_faults.load(SeqCst),
+            self.unfinished_kernel_faults.load(SeqCst),
         ]
     }
     /// The thread is on `cpu` now: what it counted since it came to the
@@ -541,7 +545,7 @@ impl Usage {
             Some((was, since)) => {
                 let was = was as usize;
                 if counts.done.len() <= was {
-                    counts.done.resize(was + 1, [0; 6]);
+                    counts.done.resize(was + 1, [0; 7]);
                 }
                 for (done, (now, since)) in counts.done[was].iter_mut().zip(now.iter().zip(since)) {
                     *done = done.saturating_add(now.saturating_sub(since));
@@ -549,7 +553,7 @@ impl Usage {
                 counts.on = Some((cpu, now));
             }
             // What it counted before it was first seen is the first CPU's.
-            None => counts.on = Some((cpu, [0; 6])),
+            None => counts.on = Some((cpu, [0; 7])),
         }
     }
     /// Another thread's `sched_setaffinity` left it the mask whose lowest
@@ -583,7 +587,7 @@ impl Usage {
         since[2] = since[2].saturating_add(n);
         let cpu = cpu as usize;
         if counts.done.len() <= cpu {
-            counts.done.resize(cpu + 1, [0; 6]);
+            counts.done.resize(cpu + 1, [0; 7]);
         }
         counts.done[cpu][2] = counts.done[cpu][2].saturating_add(n);
     }
@@ -620,7 +624,7 @@ impl Usage {
             let counts = self.counts_on(cpu);
             let cpu = cpu as usize;
             if sums.len() <= cpu {
-                sums.resize(cpu + 1, [0; 6]);
+                sums.resize(cpu + 1, [0; 7]);
             }
             for (sum, count) in sums[cpu].iter_mut().zip(counts) {
                 *sum = sum.saturating_add(count);
@@ -694,22 +698,40 @@ impl Usage {
     /// A fault of its own code `at` ended with no page: one more of the
     /// faults `page-faults` alone counts.
     pub(crate) fn unfinished_fault(&self, at: paludarium_mmu::faults::At) {
+        self.unfinished_fault_of(false, at);
+    }
+    /// [`Self::unfinished_fault`] of its own code or of the `kernel`'s
+    /// accesses for it.
+    fn unfinished_fault_of(&self, kernel: bool, at: paludarium_mmu::faults::At) {
         use std::sync::atomic::Ordering::SeqCst;
         let mut addresses = self
             .fault_addresses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let nth = self.unfinished_faults.fetch_add(1, SeqCst).wrapping_add(1);
+        let count = if kernel {
+            &self.unfinished_kernel_faults
+        } else {
+            &self.unfinished_faults
+        };
+        let nth = count.fetch_add(1, SeqCst).wrapping_add(1);
         if !paludarium_mmu::faults::addresses_traced() {
             return;
         }
-        let latest = &mut addresses[0];
+        let latest = &mut addresses[usize::from(kernel)];
         if latest.len() == FAULT_ADDRESSES {
             latest.pop_front();
         }
+        let (minor, major) = if kernel {
+            (
+                self.kernel_faults.load(SeqCst),
+                self.major_faults.load(SeqCst),
+            )
+        } else {
+            (self.faults.load(SeqCst), 0)
+        };
         latest.push_back(FaultAt {
-            minor: self.faults.load(SeqCst),
-            major: 0,
+            minor,
+            major,
             unfinished: nth,
             kind: FaultKind::All,
             at,
@@ -737,6 +759,9 @@ impl paludarium_mmu::faults::Sink for Usage {
     fn major(&self) -> &std::sync::atomic::AtomicU64 {
         &self.major_faults
     }
+    fn unfinished(&self, at: paludarium_mmu::faults::At) {
+        self.unfinished_fault_of(true, at);
+    }
     fn fault(&self, kernel: bool, major: bool, nth: u64, at: paludarium_mmu::faults::At) {
         let mut addresses = self
             .fault_addresses
@@ -753,9 +778,8 @@ impl paludarium_mmu::faults::Sink for Usage {
             (false, true) => load(&self.major_faults),
             (false, false) => 0,
         };
-        // Its own code alone has unfinished ones.
         let unfinished = if kernel {
-            0
+            load(&self.unfinished_kernel_faults)
         } else {
             load(&self.unfinished_faults)
         };

@@ -150,10 +150,11 @@ verified.
   (`/proc/version`, `/proc/cmdline`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
-  the reader's own directory (`stack`, `sched`, ...) are `ENOENT`, as in
+  the reader's own directory (`stack`, `sched`, `attr`, ...) are `ENOENT`, as in
   another process's directory, whatever the filesystem holds there (with
   `--mount /:/`, the host's `/proc`), where Linux shows them, and root
-  `stack` and the rest of another's. `wchan` is `0` for a waiting task too, where Linux names the
+  `stack` and the rest of another's. With a security module Linux has `attr`,
+  whose `current` reads `unconfined` under AppArmor; there is none here. `wchan` is `0` for a waiting task too, where Linux names the
   kernel function it waits in for a reader that may read the task: there are
   no kernel functions here to name. A poll of an epoll that watches several
   of `hostname` and `domainname` polls them by descriptor number until one is
@@ -200,14 +201,11 @@ verified.
   names as written, where Linux takes a `..` after a link in `/proc` (such
   as `/proc/self/cwd`) from its target.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
-- **Names in `/dev` and `/proc`**: no call makes a name in `/dev`
-  (`mkdir`, `mknod`, `symlink`, an `open` with `O_CREAT` and a `rename`
-  into it give `ENOENT`), where Linux's devtmpfs takes them, and removing
-  or renaming a generated name gives `ENOENT`, where Linux gives `EPERM`
-  for an `unlink` of a file in `/proc`, `ENOTDIR` for an `rmdir` of a
-  link there, `EBUSY` for an `rmdir` of `/dev/pts` and `EXDEV` for a
-  `rename` out of `/proc`. A `link` to a new name in `/proc` is `EXDEV`,
-  where Linux's lookup of the name finds nothing first (`ENOENT`).
+- **Names in `/dev`**: as root, a call that makes a name in `/dev`
+  (`mkdir`, `mknod`, `symlink`, an `open` with `O_CREAT`) gives `ENOENT`,
+  and `unlink`, `rmdir` and `rename` of a name there give `EPERM`, where
+  Linux's devtmpfs makes, removes and renames them. Another user gets
+  Linux's `EACCES`.
 - **`O_PATH` of `/dev/tty`**: it opens the controlling terminal as any
   open does, so without one it fails (`ENOENT`), where Linux's `O_PATH`
   opens the name without the device.
@@ -365,12 +363,15 @@ verified.
   switches and CPU migrations are those it last accounted, at its latest
   system call; its CPU time is looked at as the event is read, and its page
   faults count as they are taken. An event of
-  a CPU counts those of every thread there, with the same limits.
-  A fault of a system call's access that ends in `EFAULT` is not counted,
-  where Linux counts it in `page-faults`; a context switch is a sleep of the thread,
-  not a preemption (but for a thread with `rseq` that gives its virtual CPU
-  to another); and a thread without `rseq` moves to
-  another CPU only when a new CPU mask changes the lowest CPU it allows.
+  a CPU counts those of every thread there, with the same limits. A
+  system call that checks its buffer before it copies (inotify's and
+  fanotify's reads, `epoll_wait`, some socket calls, among others) and
+  fails with `EFAULT` there counts no `page-faults`, where Linux's copy
+  counts one; a copy that fails counts one, as on Linux. A
+  context switch is a sleep of the thread, not a preemption (but for a
+  thread with `rseq` that gives its virtual CPU to another); and a thread
+  without `rseq` moves to another CPU only when a new CPU mask changes the
+  lowest CPU it allows.
   A fault of a thread's own code is sampled, and signalled, at its
   instruction, as on Linux. A sampling event's other samples are taken as
   its thread enters or leaves a system call, or reaches the emulator's
@@ -509,12 +510,15 @@ verified.
   walks both ways of a jump Linux knows goes one way, and it prunes no
   states, so a program with many branches may reach the limits sooner. A
   lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
-  the immediate 0 tells, or an array's key is one the stack holds
-  ([System calls](./features#system-calls)), where Linux also learns from
-  comparing two pointers. A read of the stack is known where Linux knows
-  it (zeros stored, a scalar spilled read from its start, an atomic's old
-  value), but not one of zeros and a spill of 0 together, which master
-  knows as 0 and Linux 7.0 does not.
+  the immediate 0, or with a value's or a map's pointer it equals, tells,
+  or an array's key is one the stack holds
+  ([System calls](./features#system-calls)). Linux 7.0 also learns it
+  from equality with the stack's or the context's pointer, and master
+  from equality with a register it knows is 0; where the two decide
+  differently it refuses, so neither tells here. A read of the stack is
+  known where Linux knows it (zeros stored, a scalar spilled read from
+  its start, an atomic's old value), but not one of zeros and a spill of
+  0 together, which master knows as 0 and Linux 7.0 does not.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for
@@ -1211,7 +1215,7 @@ verified.
   fanotify marks alone, where Linux's counts inotify's too. A file a
   descriptor does not hold (a program exec runs) is opened again by the path
   it had, which fails once it is gone.
-- **Namespaces**: a user namespace has no `projid_map` and no
+- **Namespaces**: a user namespace has no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the
   `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
@@ -1471,8 +1475,9 @@ verified.
   waiting. The other namespaces keep nothing apart
   that paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace and the
-  mounts of a mount namespace: there is no `/proc/self/cgroup` for a cgroup
-  namespace, and no
+  mounts of a mount namespace: there are no control groups, so
+  `/proc/<pid>/cgroup` shows every task in the root of one hierarchy whatever
+  cgroup namespace it is in, and there is no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the
   first one's. A PID namespace hands out its numbers once each, where
   Linux's wrap at `pid_max` and are used again; for the same reason

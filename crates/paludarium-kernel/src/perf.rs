@@ -545,9 +545,9 @@ pub(crate) struct Events {
     /// that a thread's runs look for the next to fire
     /// ([`sample::clock_due`]) only then.
     clocks: std::sync::atomic::AtomicBool,
-    /// Whether an event's ring buffer has been mapped, so that a thread's
+    /// Whether an event's ring buffer was ever mapped, so that a thread's
     /// return from a sleep looks for user pages to update
-    /// ([`buffer::scheduled_in`]) only then.
+    /// ([`buffer::scheduled_in`]) only once one was.
     mapped: std::sync::atomic::AtomicBool,
     /// Whether an event has asked for side-band records, so that
     /// the hooks look for those that take them only then ([`side_band`]).
@@ -811,11 +811,14 @@ impl Event {
             migrations,
             major_faults,
             unfinished_faults,
+            unfinished_kernel_faults,
         ] = counts;
         match self.counter {
             Counter::Faults(crate::FaultKind::All) => (
                 faults.saturating_add(unfinished_faults),
-                kernel_faults.saturating_add(major_faults),
+                kernel_faults
+                    .saturating_add(major_faults)
+                    .saturating_add(unfinished_kernel_faults),
             ),
             Counter::Faults(crate::FaultKind::Minor) => (faults, kernel_faults),
             Counter::Faults(crate::FaultKind::Major) => (0, major_faults),
@@ -2626,8 +2629,36 @@ mod tests {
         };
         assert_eq!(addresses(All, 3, 3), [0x1000, 0x2000, 0x3000]);
         assert_eq!(addresses(Minor, 2, 2), [0x1000, 0x3000]);
-        assert_eq!(usage.counts(), [2, 0, 0, 0, 0, 1]);
+        assert_eq!(usage.counts(), [2, 0, 0, 0, 0, 1, 0]);
         assert_eq!(usage.fault_counts().minor, 2);
+        // The kernel's: minor, failed (`EFAULT`), major.
+        usage.kernel_faults.store(1, Ordering::SeqCst);
+        usage.fault(true, false, 1, at(0x4000));
+        usage.unfinished(at(0x5000));
+        usage.major_faults.store(1, Ordering::SeqCst);
+        usage.fault(true, true, 1, at(0x6000));
+        let kernel = |kind, counted, n| {
+            usage
+                .fault_addresses(true, kind, counted, n)
+                .iter()
+                .map(|f| f.addr)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kernel(All, 3, 3), [0x4000, 0x5000, 0x6000]);
+        assert_eq!(kernel(Minor, 1, 1), [0x4000]);
+        assert_eq!(usage.counts(), [2, 1, 0, 0, 1, 1, 1]);
+        assert_eq!(usage.fault_counts().minor, 3);
+        let event = |counter| {
+            let target = Target::Thread {
+                group: Arc::new(crate::ThreadGroup::default()),
+                tid: 5,
+            };
+            of_counter(None, target, Attr::default(), counter)
+        };
+        let (page_faults, minor_faults) =
+            (event(Counter::Faults(All)), event(Counter::Faults(Minor)));
+        assert_eq!(page_faults.of_counts(usage.counts()), (3, 3));
+        assert_eq!(minor_faults.of_counts(usage.counts()), (2, 1));
     }
 
     #[test]

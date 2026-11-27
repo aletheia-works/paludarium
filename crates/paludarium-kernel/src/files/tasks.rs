@@ -313,6 +313,28 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
         TaskEntry::Auxv if task.memory().is_some() => task.view.group.auxv(),
         TaskEntry::Auxv => Vec::new(),
         TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),
+        // The control group's path from the root of the reader's control
+        // group namespace (Linux's `proc_cgroup_show`): one group, the
+        // root, of the unified hierarchy (ID 0, no controllers named).
+        TaskEntry::Cgroup => b"0::/\n".to_vec(),
+        // As Linux's `proc_loginuid_read` and `proc_sessionid_read` write
+        // them, with no newline: the login user as the opener's namespace
+        // has it (-1 for none or one it does not map), and the session.
+        TaskEntry::LoginUid => {
+            let login = task.view.group.login(task.tid);
+            reader
+                .id_of(crate::users::Ids::User, login.user)
+                .unwrap_or(crate::users::INVALID)
+                .to_string()
+                .into_bytes()
+        }
+        TaskEntry::SessionId => task
+            .view
+            .group
+            .login(task.tid)
+            .session
+            .to_string()
+            .into_bytes(),
         TaskEntry::Setgroups => public.credentials.user.setgroups_text().to_vec(),
         // Nothing once it has ended, whose open is `EINVAL` ([`mounts`]).
         TaskEntry::Mounts(mountinfo) => mounts(task).map_or_else(Vec::new, |(fs, root)| {
@@ -977,6 +999,85 @@ pub(super) fn coredump_filter(
             .writing(writer),
     )
 }
+/// `timerslack_ns` of the task, as Linux's `timerslack_ns_show` writes it
+/// when it is read: its thread's timer slack in nanoseconds, to a reader
+/// that is that thread or has `CAP_SYS_NICE` in the task's user namespace
+/// (`EPERM` else). A write sets it as `timerslack_ns_write` does, to what
+/// `kstrtoull` reads in decimal (of up to 66 bytes), by the same writers:
+/// none for a real-time or deadline thread, and the default for 0
+/// ([`crate::scheduling::Sched::set_slack`]); it takes all that is
+/// written, and leaves the position where it was. `ESRCH` once the task
+/// has been reaped.
+pub(super) fn timer_slack(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    (flags, stat, owner): (u32, FileStat, crate::proc::Owner),
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (weak, which) = at_read(processes, task);
+    let (_, tid, _) = which;
+    // Whether the caller may see or set the slack of thread `tid` of
+    // `now`'s process.
+    let permitted = move |now: &AtRead| {
+        let (caller_pid, caller) = crate::proc::caller();
+        if caller == tid {
+            return true;
+        }
+        let target = now.view.group.public(tid).unwrap_or_default();
+        now.processes
+            .view(caller_pid)
+            .and_then(|view| view.group.public(caller))
+            .is_some_and(|public| {
+                public
+                    .credentials
+                    .capable_in(crate::credentials::CAP_SYS_NICE, &target.credentials.user)
+            })
+    };
+    let text: crate::proc::Text = {
+        let weak = weak.clone();
+        std::sync::Arc::new(move || {
+            let now = AtRead::find(&weak, which)?;
+            if !permitted(&now) {
+                return Err(Errno::EPERM);
+            }
+            Ok(format!("{}\n", now.view.group.sched(tid).slack).into_bytes())
+        })
+    };
+    let writer: crate::seq::Writer = Box::new(move |bytes, position| {
+        // `kstrtoull_from_user`'s buffer: a sign, 64 digits, a newline.
+        let slack = crate::kstrto::ull(&bytes[..bytes.len().min(66)], 10)?;
+        let now = AtRead::find(&weak, which)?;
+        if !permitted(&now) {
+            return Err(Errno::EPERM);
+        }
+        now.view
+            .group
+            .change_sched(tid, |sched| sched.set_slack(slack));
+        Ok((bytes.len(), position))
+    });
+    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner).writing(writer))
+}
+/// `children` of a thread, as Linux's `children_seq_show` writes it when
+/// it is read: the PID of each process the thread made, as `fork` puts it
+/// on the thread's list of children, each with a space after it, until it
+/// is reaped. A child whose maker has ended belongs to its process's first
+/// thread left, as `forget_original_parent` gives it to one.
+pub(super) fn children(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    (flags, stat, owner): (u32, FileStat, crate::proc::Owner),
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (weak, which) = at_read(processes, task);
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let now = AtRead::find(&weak, which)?;
+        let (pid, tid, _) = which;
+        let mut text = String::new();
+        for child in now.processes.children_of_thread(pid, tid) {
+            text.push_str(&format!("{child} "));
+        }
+        Ok(text.into_bytes())
+    });
+    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
+}
 /// `syscall` of the task, as Linux's `proc_pid_syscall` writes it when it
 /// is read, for a reader that may attach to it (`lock_trace`, else
 /// `EPERM`), as `task_current_syscall` finds the thread then: the call the
@@ -1103,6 +1204,9 @@ pub(super) fn made_at_read(entry: TaskEntry) -> bool {
             | TaskEntry::Limits
             | TaskEntry::Cmdline
             | TaskEntry::Comm
+            | TaskEntry::Cgroup
+            | TaskEntry::LoginUid
+            | TaskEntry::SessionId
     )
 }
 /// `entry` of the task opened with `flags`, for one Linux makes at each
@@ -1118,6 +1222,8 @@ pub(super) fn at_read_file(
     Some(match entry {
         TaskEntry::Stat => stat_file(c.processes, task, flags, stat, owner),
         TaskEntry::Environ => environ_file(task, flags, stat, owner),
+        TaskEntry::TimerSlack => timer_slack(c.processes, task, (flags, stat, owner)),
+        TaskEntry::Children => children(c.processes, task, (flags, stat, owner)),
         _ if made_at_read(entry) => text_file(c, task, entry, flags, stat, owner),
         _ => return None,
     })
@@ -1158,9 +1264,70 @@ pub(super) fn text_file(
                 tid,
             ))
         }
-        TaskEntry::Cmdline => file.not_seq_opened(),
+        TaskEntry::Cmdline | TaskEntry::SessionId => file.not_seq_opened(),
+        TaskEntry::LoginUid => file.not_seq_opened().writing(login_writer(c, task)),
         _ => file,
     })
+}
+/// The write operation of a task's `loginuid`, as Linux's
+/// `proc_loginuid_write` and `audit_set_loginuid`: only the task itself
+/// may write it (`EPERM`), at the start of the file (`EINVAL`), a decimal
+/// user ID as `kstrtou32` reads it (of up to 34 bytes), as the opener's
+/// namespace names it (`EINVAL` for one it does not map; -1 for none).
+/// Once the task has a login user, it changes only with
+/// `CAP_AUDIT_CONTROL` over the machine (`EPERM` else). A login user starts a
+/// new session, which no other has had; none leaves none. It takes all
+/// that is written and leaves the position where it was.
+fn login_writer(c: &Context<'_>, task: &Task) -> crate::seq::Writer {
+    let group = std::sync::Arc::clone(&task.view.group);
+    let tid = task.tid;
+    let opener = c.process.credentials.user.clone();
+    Box::new(move |bytes, position| {
+        let (_, writer) = crate::proc::caller();
+        if writer != tid || group.public(tid).is_none() {
+            return Err(Errno::EPERM);
+        }
+        if position != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let value = crate::kstrto::uint(&bytes[..bytes.len().min(34)], 10)?;
+        let user = if value == crate::users::INVALID {
+            crate::users::INVALID
+        } else {
+            opener
+                .kernel_of(crate::users::Ids::User, value)
+                .ok_or(Errno::EINVAL)?
+        };
+        let login = group.login(tid);
+        let may_change = group.public(tid).is_some_and(|public| {
+            public
+                .credentials
+                .capable(crate::credentials::CAP_AUDIT_CONTROL)
+        });
+        if login.user != crate::users::INVALID && !may_change {
+            return Err(Errno::EPERM);
+        }
+        let session = if user == crate::users::INVALID {
+            crate::users::INVALID
+        } else {
+            new_session()
+        };
+        group.set_login(tid, crate::threads::Login { user, session });
+        Ok((bytes.len(), position))
+    })
+}
+/// A session number no other login has had (Linux's `session_id`), from 1,
+/// which passes over -1, the number of none.
+fn new_session() -> u32 {
+    static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    loop {
+        let session = LAST
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        if session != crate::users::INVALID {
+            return session;
+        }
+    }
 }
 /// `environ` of the task, opened with `flags`: the environment strings,
 /// read at each read from the address space it had when opened, as Linux's
@@ -1382,8 +1549,14 @@ pub(super) fn stat(
         | TaskEntry::Setgroups
         | TaskEntry::Comm
         | TaskEntry::Oom(crate::proc::OomFile::Adj | crate::proc::OomFile::ScoreAdj)
-        | TaskEntry::CoredumpFilter => FileStat {
+        | TaskEntry::CoredumpFilter
+        | TaskEntry::LoginUid => FileStat {
             mode: 0o100_644,
+            ..crate::proc::stat(0)
+        },
+        // 0666, as Linux's: whether a write takes is the file's to say.
+        TaskEntry::TimerSlack => FileStat {
+            mode: 0o100_666,
             ..crate::proc::stat(0)
         },
         TaskEntry::Environ | TaskEntry::Auxv => crate::proc::private_stat(0),
@@ -1455,7 +1628,13 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
         _ => listing(
             crate::proc::TASK_NAMES
                 .into_iter()
-                .filter(|(name, _)| !task.thread || !matches!(*name, b"task" | b"coredump_filter"))
+                .filter(|(name, _)| {
+                    if task.thread {
+                        !matches!(*name, b"task" | b"coredump_filter" | b"timerslack_ns")
+                    } else {
+                        *name != b"children"
+                    }
+                })
                 .map(|(name, kind)| (name.to_vec(), kind)),
         ),
     }

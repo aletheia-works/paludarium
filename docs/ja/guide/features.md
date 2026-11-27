@@ -2480,7 +2480,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセス（`kill`、`ptrace` のアクセス、優先度、リソース制限）にはそのユーザーの名前空間での
   もの、マシン全体（`RENAME_WHITEOUT`、リアルタイムのスケジューリング、`vhangup`、`trusted.*` の属性
   など）には最初のユーザーの名前空間でのものだけが効きます。`/proc/<pid>/uid_map` と
-  `gid_map` は、タスクのユーザーの名前空間の範囲を、下の ID を読み手の名前空間のもの
+  `gid_map`（と後述の `projid_map`）は、タスクのユーザーの名前空間の範囲を、下の ID を読み手の名前空間のもの
   （自分の名前空間なら親のもの）で読みます。書き込みは、3 つの数の行を 340 行までの 1 回だけで、
   確かめる中身と順番は Linux の `proc_uid_map_write`・`map_write`・`new_idmap_permitted` と
   同じです。その名前空間かその親の、中で `CAP_SYS_ADMIN` を持つスレッドから書き、持ち主は
@@ -3763,7 +3763,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
   `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mem`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、`smaps_rollup`、
-  `pagemap`、`wchan`、`oom_score`、`oom_adj`、`oom_score_adj`、`coredump_filter`、`io`、`fd`、`fdinfo`、`ns`、`task`
+  `pagemap`、`wchan`、`cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、
+  `coredump_filter`、`io`、`uid_map`、`gid_map`、`projid_map`、`setgroups`、`timerslack_ns`、`fd`、`fdinfo`、`ns`、`task`
   があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。この root は、そのプログラムが動くユーザー名前空間の
@@ -3824,21 +3825,36 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プログラムがそのあとスタックに何をしても、`fork` しても残ります。自分のディレクトリと `/proc` の下の
   それ以外の名前は、Linux で procfs にない名前と同じく `ENOENT` です。ファイルシステムがそこに
   何を持っていても（`--mount /:/` ではホストの `/proc`）同じです。`/proc` は `/dev` と同じく、
-  起動したときからそれだけのマウントです。そのため、そうした名前を作る、消す、名前を変える
-  呼び出しも `ENOENT` です。
+  起動したときからそれだけのマウントです。
+
+- `/proc` や `/dev` のディレクトリで名前を作る、消す、名前を変える呼び出し（`mkdir`、
+  `mknod`、`symlink`、`link`、`unlink`、`rmdir`、`rename`、`renameat2`、`O_CREAT` 付きの
+  `open` と、それぞれの `*at` 版）は、Linux と同じ順に Linux と同じエラーを返します。
+  ディレクトリ、最後の名前が `.` か `..` であること（`EEXIST`、`EISDIR`、`EINVAL`、
+  `ENOTEMPTY`、`EBUSY`）、名前を探すこと（procfs は持たない名前を見つけず `ENOENT`、ある
+  名前を作るのは `EEXIST`）、末尾のスラッシュ（`ENOTDIR`、`EISDIR`）、ディレクトリに書く
+  許可の順で、最後は `EPERM` です。procfs と devpts にはそうした操作がないからです。`/proc`、
+  `/dev`、ほかのファイルシステムのあいだの `link` と `rename` は、まず `EXDEV` です。許可は
+  procfs 自身のもので、プロセスとスレッドのディレクトリは変更できません（root も `EPERM`）。
+  プロセスの `fd` には自分のスレッドが書けます。`/proc/sys` のディレクトリには誰も書けません
+  （root も `EACCES`）。ほかは `/dev`（0755、root のもの）と同じくモードに従うので、ほかの
+  ユーザーは `EACCES` です。`/proc` と `/dev` 自身はルートのディレクトリにあるマウント
+  ポイントで、その `rmdir` と `rename` は `EBUSY`、`unlink` は `EISDIR`、それを作る呼び出しは
+  `EEXIST` です。
 
 - `/proc` は、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。ファイルシステムがそこに持つもの
   （`--mount /:/` ではホストの項目）は並べません。`ps`、`pgrep`、`pidof` が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`personality`（0400）、`comm`、
   `syscall`（0400）、`maps`、`mem`（0600）、`clear_refs`（0200）、`smaps`、`smaps_rollup`、`pagemap`（0400）、`wchan`、
-  `oom_score`、`oom_adj`、`oom_score_adj`、`coredump_filter`、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `cgroup`、`oom_score`、`oom_adj`、`oom_score_adj`、`loginuid`、`sessionid`、`coredump_filter`、`io`（0400）、
+  `uid_map`、`gid_map`、`projid_map`、`setgroups`、`timerslack_ns`（0666）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
-  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` と `coredump_filter` 以外の同じファイルが
-  あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
+  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task`、`coredump_filter`、`timerslack_ns`
+  以外の同じファイルと `children` があり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
   プロセスの ID、スレッド自身の資格情報（プロセスの `status` は `/proc/self/status` も
   含め、Linux の `proc_pid_status` と同じくリーダーのものを示します）、スレッド自身の
   `voluntary_ctxt_switches`。眠った回数で、プロセスの `status` は Linux の
@@ -3874,7 +3890,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセスは、そこでの子プロセスからも読めません。ファイルの持ち主はこのプロセス自身のもの（前述）と
   同じで（ダンプできないプロセスのディレクトリ（0555）もそのプロセスのものです）、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
   ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
-  `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
+  `oom_adj`、`oom_score_adj`、`loginuid`、`coredump_filter`、`uid_map`、`gid_map`、`projid_map`、
+  `setgroups`（0644）と `timerslack_ns`（0666）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
   `auxv`、`pagemap`、`mem` を読むには持ち主か `CAP_DAC_OVERRIDE` が要ります。開いたものの `fstat` は、
   このプロセス自身のもの（前述）と同じく持ち主を示します。`statm` と `limits` は、Linux と同じく誰でも読めます。
   `fd` そのものを読むことと中を探すことは、Linux の
@@ -3938,6 +3955,46 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   32 ビットを超えると `ERANGE`）の下位 9 ビットを設定し、渡された全部の数を返します。
   そのメモリで動くスレッドがなくなると空を読み、書き込みは `ESRCH` です。スレッドの
   ディレクトリにはありません。
+
+- プロセスの `timerslack_ns`（0666）は、リーダーのスレッドのタイマーのゆとり（ナノ秒）で、
+  `PR_SET_TIMERSLACK` と `PR_GET_TIMERSLACK` は呼んだスレッドのものを設定し、読みます。
+  最初のタスクは 50000 で、新しいスレッドやプロセスは作り手のものを受け継ぎ、そのときの
+  作り手のゆとりが既定にもなります。そのスレッド以外が読み書きするには、そのユーザーの
+  名前空間での `CAP_SYS_NICE` が要ります（Linux の `timerslack_ns_show` と
+  `timerslack_ns_write` と同じく、読み書きのときに `EPERM`）。書き込みは `kstrtoull` が 10 進で
+  読む 66 バイトまでを取り（`EINVAL`、64 ビットを超えると `ERANGE`）、渡された全部の数を返し、
+  位置は変えません。0 を設定すると既定に戻ります。リアルタイムかデッドラインのスレッドには
+  ゆとりがありません。`sched_setscheduler` などが 0 にし、書き込みでも 0 のままで、
+  `PR_SET_TIMERSLACK` は変えず、そのポリシーを離れると既定に戻ります。これで長く待つものは
+  なく、ホストのタイマーは自分のゆとりのままです。スレッドのディレクトリにはありません。
+
+- `loginuid`（0644）と `sessionid`（0444）は、スレッドの監査のログインユーザーとセッションで、
+  Linux の `proc_loginuid_read` と `proc_sessionid_read` と同じく改行なしで書きます。はじめは
+  どちらも 4294967295（なし）で、スレッドとプロセスは作り手のものを受け継ぎ、`execve` でも
+  残ります。ログインユーザーは開いた者のユーザーの名前空間での ID で読みます（対応がなければ
+  4294967295）。`loginuid` を書けるのはそのファイルのスレッドだけで（ほかは `EPERM`）、
+  先頭でだけ（読んだ後は `EINVAL`）、開いた者の名前空間で `kstrtou32` が読む 10 進のユーザー
+  ID（対応がなければ `EINVAL`）か、なしの 4294967295 を書きます。一度設定すると、変えるには
+  最初のユーザーの名前空間での `CAP_AUDIT_CONTROL` が要ります（`EPERM`）。ユーザーを設定すると、
+  ほかにない番号（エミュレーターごとに 1 から）のセッションが始まり、なしにすると終わります。
+  監査はしません。
+
+- `cgroup`（0444）は `0::/` を読みます。どのタスクも、cgroup v2 のホストがルートの
+  タスクを示すのと同じく統合された階層のルートのグループにいて、どのコントロールグループの
+  名前空間から読んでも同じです。`cpuset` は、それを持つ cgroup v1 の cpuset
+  （`CONFIG_CPUSETS_V1`）を外した Ubuntu のカーネルと同じくありません。
+
+- スレッドの `children`（0444）は、Linux の `children_seq_show` と同じく、そのスレッドが
+  作ってまだ回収されていないプロセス（ゾンビも）を、それぞれの後ろに空白を付けて並べます。
+  作り手の終わった子は、`forget_original_parent` が渡すのと同じく、プロセスの最初の
+  スレッドのものです。並びは PID の順で、Linux はスレッドに来た順なので、PID が一回りした
+  ときと、孤児がプロセスに渡されたときに違います。プロセス自身のディレクトリにはありません。
+
+- `projid_map`（0644）は、タスクのユーザーの名前空間のプロジェクト ID を `uid_map`
+  （前述）と同じく読み、書き込みを受けます。ただし、Linux の `proc_projid_map_write` と同じく
+  書き込みにケーパビリティは要らず、親が対応させているどの ID も対応させられます。最初の
+  名前空間はすべてを対応させます（`0 0 4294967295`）。プロジェクト ID を使うものはほかに
+  ありません。
 
 - プロセスやスレッドの `syscall` は 0400 で大きさは 0 で、Linux の `proc_pid_syscall` と同じく
   読んだときに書きます。読み手が読めるかは `personality` と同じくアタッチできるかで決め
@@ -4843,7 +4900,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   終わらせたスレッドのコードのフォールトはやり直さないので、`page-faults` だけが数えます。
   `SIGSEGV` や `SIGBUS` で終わるフォールトも、Linux がユーザーのアドレスと `vsyscall`
   のページのフォールトを始めるときに数え、失敗したものはほかに数えないので、`page-faults`
-  だけが数えます。カーネルのアドレスは何も数えません）と、
+  だけが数えます。システムコールのコピーが `EFAULT` になるときのように、失敗したカーネルの
+  アクセスのフォールトも同じです。カーネルのアドレスは何も数えず、`access_ok` が断る
+  ユーザー空間の外へのシステムコールのアクセスや、フォールトを無効にしたアクセスも数えません）と、
   x86-64 と同じく何も数えない
   `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。
   `perf record` が CPU ごとに開くような、一つの CPU のスレッドのイベントは、スレッドが
@@ -5207,7 +5266,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作った配列は除きます。その配列が代わりを務める配列の要素の数は同じとは限らないからです
   （master の 53040a81ae57）。値やマップへのポインタを 64 ビットの `BPF_JEQ` か `BPF_JNE` で
   0 と比べると、Linux はそうしたポインタが 0 でないと知っているので、一方へだけ進みます。32 ビットで
-  比べると、master と同じく両方へ進みます（e51179a4e098）。値の読み書きはその大きさに
+  比べると、master と同じく両方へ進みます（e51179a4e098）。検索の結果をそうしたポインタと
+  64 ビットの `BPF_JEQ` か `BPF_JNE` で比べると、二つが等しい側では、そのレジスタが値への
+  ポインタになります（`mark_ptr_not_null_reg`）。写しはそのままです。値の読み書きはその大きさに
   収まり（"invalid access to map value"、`EACCES`）、マップが `BPF_F_RDONLY_PROG` なら書けず、
   `BPF_F_WRONLY_PROG` なら読めません（`EACCES`）。プログラムは使うマップを持ち続けます。
 
@@ -5767,6 +5828,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PR_CAP_AMBIENT`（上げるケーパビリティは許可と継承の両方になければならず、
   `SECBIT_NO_CAP_AMBIENT_RAISE` があれば断ります）（どれもスレッドごと）、
   `PR_SET_CHILD_SUBREAPER`（`fork` では受け継がれず、`execve` では残ります）、
+  `PR_SET_TIMERSLACK` と `PR_GET_TIMERSLACK`（スレッドごと。`/proc/<pid>/timerslack_ns` を
+  見てください）、
   `PR_SET_NO_NEW_PRIVS`、`PR_SET_SECCOMP`（下の seccomp を見てください）と、
   それぞれの `PR_GET_*`、そして Yama の `PR_SET_PTRACER` に対応します。`PR_SET_PTRACER` は
   ほかの引数を読みません。0 で消え、`PR_SET_PTRACER_ANY`（`int` として -1 も同じ）でどの

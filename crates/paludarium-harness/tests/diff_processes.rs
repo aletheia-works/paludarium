@@ -211,6 +211,8 @@ mod linux {
             // other users or make it another user's, the proc-fd-links case,
             // which reads links from a chroot of its own mount namespace,
             // the maps-root case, which reads maps across a chroot,
+            // the generated-name-errors case, which makes, removes and
+            // renames names in /proc as root and then becomes nobody,
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
@@ -222,7 +224,10 @@ mod linux {
             // fs.leases-enable and fs.lease-break-time and becomes an
             // unprivileged user, the dnotify-switch case, which writes
             // fs.dir-notify-enable, the proc-oom case, which sets an
-            // oom_score_adj below 0 and becomes an unprivileged user, and
+            // oom_score_adj below 0 and becomes an unprivileged user, the
+            // proc-timerslack, proc-login and proc-cgroup-ids cases, which
+            // set a real-time policy, change a set login user and make user
+            // namespaces before they become an unprivileged user, and
             // the timer-waits cases, which make a
             // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
@@ -231,11 +236,15 @@ mod linux {
                     | "file-leases"
                     | "dnotify-switch"
                     | "proc-oom"
+                    | "proc-timerslack"
+                    | "proc-login"
+                    | "proc-cgroup-ids"
                     | "timer-waits-plain"
                     | "timer-waits-restart"
                     | "timer-waits-default"
                     | "proc-mem"
                     | "chroot-names"
+                    | "generated-name-errors"
                     | "maps-root"
                     | "path-flags"
                     | "permissions"
@@ -1180,6 +1189,7 @@ mod linux {
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_link_names => ("generated-link-names","process"),
+        processes_generated_name_errors => ("generated-name-errors","process"),
         processes_generated_rooted_links => ("generated-rooted-links","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
@@ -1219,6 +1229,10 @@ mod linux {
         processes_status_memory => ("status-memory","process"),
         processes_proc_oom => ("proc-oom","process"),
         processes_core_filter => ("core-filter","process"),
+        processes_proc_timerslack => ("proc-timerslack","process"),
+        processes_proc_login => ("proc-login","process"),
+        processes_proc_cgroup_ids => ("proc-cgroup-ids","process"),
+        processes_proc_children => ("proc-children","process"),
         processes_leader_exit_status => ("leader-exit-status","process"),
         processes_thread_own_counters => ("thread-own-counters","process"),
         processes_leader_zombie_task => ("leader-zombie-task","process"),

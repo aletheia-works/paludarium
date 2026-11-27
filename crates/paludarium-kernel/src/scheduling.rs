@@ -37,6 +37,9 @@ const DL_FLAGS: u64 = FLAG_RECLAIM | FLAG_DL_OVERRUN | FLAG_SUGOV;
 const CAPACITY: u32 = 1024;
 /// `MAX_RT_PRIO - 1`.
 pub(crate) const MAX_RT_PRIORITY: u32 = 99;
+/// The timer slack the first task has, in nanoseconds (`init_task`'s
+/// `timer_slack_ns`).
+pub(crate) const TIMER_SLACK: u64 = 50_000;
 
 /// One utilization clamp (`uclamp_se`): its value, and whether the task
 /// asked for it (`user_defined`).
@@ -69,6 +72,11 @@ pub(crate) struct Sched {
     /// That I/O context (Linux's `io_context`), told apart by a number from
     /// [`new_io_context`]; 0 while it has none.
     pub io_context: u64,
+    /// The timer slack (`timer_slack_ns`), which a real-time or deadline
+    /// task has none of, and the one setting it to 0 gives back
+    /// (`default_timer_slack_ns`, the slack of the task that made it).
+    pub slack: u64,
+    pub default_slack: u64,
 }
 
 impl Default for Sched {
@@ -94,6 +102,8 @@ impl Default for Sched {
             ],
             io: None,
             io_context: 0,
+            slack: TIMER_SLACK,
+            default_slack: TIMER_SLACK,
         }
     }
 }
@@ -117,6 +127,22 @@ fn valid_policy(policy: u32) -> bool {
 impl Sched {
     pub(crate) fn deadline_policy(&self) -> bool {
         self.policy == SCHED_DEADLINE
+    }
+    /// Linux's `rt_or_dl_task_policy`.
+    pub(crate) fn real_time_or_deadline(&self) -> bool {
+        rt_policy(self.policy) || self.deadline_policy()
+    }
+    /// The timer slack `PR_SET_TIMERSLACK` or a write of `timerslack_ns`
+    /// asks for, as they set it: none for a real-time or deadline task,
+    /// and the default for 0.
+    pub(crate) fn set_slack(&mut self, slack: u64) {
+        self.slack = if self.real_time_or_deadline() {
+            0
+        } else if slack == 0 {
+            self.default_slack
+        } else {
+            slack
+        };
     }
     /// What `sched_getscheduler` reports.
     pub(crate) fn reported_policy(&self) -> u32 {
@@ -144,6 +170,8 @@ impl Sched {
     /// stays one is `EAGAIN`.
     pub(crate) fn forked(&self, nice: i32) -> Result<(Self, bool), Errno> {
         let mut child = *self;
+        // copy_process: the child's default slack is the parent's slack.
+        child.default_slack = self.slack;
         let mut reset_nice = false;
         if self.reset_on_fork {
             if self.deadline_policy() || rt_policy(self.policy) {
@@ -369,6 +397,16 @@ pub(crate) fn set(
             };
         }
     }
+    // __setscheduler_params, which SCHED_FLAG_KEEP_PARAMS skips: a
+    // real-time or deadline task has no timer slack, and one that is no
+    // longer either gets its default back.
+    if attr.flags & FLAG_KEEP_PARAMS == 0 {
+        if sched.real_time_or_deadline() {
+            sched.slack = 0;
+        } else if sched.slack == 0 {
+            sched.slack = sched.default_slack;
+        }
+    }
     Ok(Change { sched, nice })
 }
 
@@ -449,4 +487,33 @@ pub(crate) fn reported_ioprio(sched: &Sched) -> u16 {
 pub(crate) fn best_ioprio(a: u16, b: u16) -> u16 {
     let normal = |io: u16| if io_class(io) == 0 { 2 << 13 | 4 } else { io };
     normal(a).min(normal(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_task_made_takes_its_makers_slack_as_its_default() {
+        let mut parent = Sched::default();
+        assert_eq!(
+            (parent.slack, parent.default_slack),
+            (TIMER_SLACK, TIMER_SLACK)
+        );
+        parent.set_slack(4000);
+        let (mut child, _) = parent.forked(0).unwrap();
+        assert_eq!((child.slack, child.default_slack), (4000, 4000));
+        child.set_slack(7);
+        assert_eq!(child.slack, 7);
+        child.set_slack(0);
+        assert_eq!(child.slack, 4000);
+        // A real-time task has none.
+        let mut fifo = Sched {
+            policy: SCHED_FIFO,
+            priority: 1,
+            ..parent
+        };
+        fifo.set_slack(5);
+        assert_eq!(fifo.slack, 0);
+    }
 }

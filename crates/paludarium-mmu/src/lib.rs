@@ -382,6 +382,11 @@ pub mod faults {
         fn kernel(&self) -> &AtomicU64;
         fn forced(&self) -> &AtomicU64;
         fn major(&self) -> &AtomicU64;
+        /// A kernel access's fault `at` that ends in an error
+        /// ([`resolve`]): `page-faults` alone counts it.
+        fn unfinished(&self, at: At) {
+            let _ = at;
+        }
         /// A fault that made its count `nth`, of the kernel's accesses or
         /// the thread's own code's, a `major` one or not, `at`, which is
         /// told where [`trace_addresses`] asked for it.
@@ -419,6 +424,7 @@ pub mod faults {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static GUP: Cell<Gup> = const { Cell::new(Gup::No) };
         static NOTED: Cell<bool> = const { Cell::new(false) };
+        static DISABLED: Cell<bool> = const { Cell::new(false) };
         static RETRIED: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
         static PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
         static RESOLVER: RefCell<Option<Arc<dyn Resolver>>> = const { RefCell::new(None) };
@@ -493,6 +499,7 @@ pub mod faults {
     /// Runs `f` with the calling host thread's faults not resolved, as
     /// Linux's `pagefault_disable` has an access fail at once that would
     /// wait: for one made under a lock another thread may need meanwhile.
+    /// Its faults that fail are not counted either ([`unfinished`]).
     pub fn unresolved<T>(f: impl FnOnce() -> T) -> T {
         struct Restore(Option<Arc<dyn Resolver>>);
         impl Drop for Restore {
@@ -501,6 +508,22 @@ pub mod faults {
             }
         }
         let _restore = Restore(set_resolver(None));
+        uncounted(f)
+    }
+
+    /// Runs `f` with the calling host thread's faults that fail not
+    /// counted ([`unfinished`]): for an access with faults disabled, and for
+    /// the emulator's own checks of a range ([`super::AddressSpace::check_read`]),
+    /// which Linux makes with no access, so that no fault counts until the
+    /// copy that follows faults.
+    pub(crate) fn uncounted<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DISABLED.with(|d| d.set(self.0));
+            }
+        }
+        let _restore = Restore(DISABLED.with(|d| d.replace(true)));
         f()
     }
 
@@ -535,7 +558,43 @@ pub mod faults {
         if !retried && scope.is_some() && pending(|a, b| a == b) {
             PENDING.with(Cell::take);
         }
+        if !retried {
+            unfinished(fault);
+        }
         retried
+    }
+
+    /// Linux's `TASK_SIZE_MAX`: `access_ok` refuses a kernel access past
+    /// it before it could fault.
+    const USER_END: u64 = (1 << 47) - super::PAGE_SIZE;
+
+    /// A kernel access's `fault` is not resolved, and the access fails, as
+    /// with `EFAULT`: Linux's `do_user_addr_fault` counted it in
+    /// `page-faults` as it started, and `mm_account_fault` counts no error
+    /// in `min_flt` or `minor-faults`. Not so for an access with faults
+    /// disabled ([`unresolved`]: `faulthandler_disabled`), a check of a
+    /// range ([`uncounted`]), one through `get_user_pages`, which takes no
+    /// fault of the CPU, or one past user space.
+    fn unfinished(fault: &super::Fault) {
+        let gup = GUP.with(Cell::get);
+        if !KERNEL.with(Cell::get)
+            || gup != Gup::No
+            || DISABLED.with(Cell::get)
+            || fault.fetch
+            || fault.addr.0 >= USER_END
+        {
+            return;
+        }
+        SINK.with(|sink| {
+            // A kernel access is made for a bound thread
+            // (`KernelFaults::enter`).
+            if let Some(counts) = sink.borrow().as_ref() {
+                counts.unfinished(At {
+                    addr: fault.addr.0,
+                    present: fault.present,
+                });
+            }
+        });
     }
 
     fn resolve_once(
@@ -10095,7 +10154,11 @@ impl AddressSpace {
                 data.check(&data.read_directory(), addr, len, access, false)
             };
             match result {
-                Err(fault) if faults::resolve(|| self.view(), &fault, &mut retry) => {}
+                // A check is no copy: it counts no fault that fails.
+                Err(fault)
+                    if faults::uncounted(|| {
+                        faults::resolve(|| self.view(), &fault, &mut retry)
+                    }) => {}
                 result => return result,
             }
         }
@@ -12159,6 +12222,82 @@ mod tests {
         assert_eq!(load(), [0, 1, 0, 6]);
         faults::set_kernel(kernel);
         faults::set_resolver(was);
+        faults::unbind();
+    }
+
+    #[test]
+    fn a_kernel_access_that_fails_is_an_unfinished_fault() {
+        #[derive(Default)]
+        struct Counts([AtomicU64; 3], AtomicU64, std::sync::Mutex<Vec<faults::At>>);
+        impl faults::Sink for Counts {
+            fn user(&self) -> &AtomicU64 {
+                &self.0[0]
+            }
+            fn kernel(&self) -> &AtomicU64 {
+                &self.0[1]
+            }
+            fn forced(&self) -> &AtomicU64 {
+                &self.0[2]
+            }
+            fn major(&self) -> &AtomicU64 {
+                &self.1
+            }
+            fn unfinished(&self, at: faults::At) {
+                self.2.lock().unwrap().push(at);
+            }
+        }
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(None, 2 * PAGE_SIZE, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        space.read(at, &mut [0]).unwrap();
+        let gone = GuestAddr(at.0 + PAGE_SIZE);
+        space.unmap(gone, PAGE_SIZE).unwrap();
+        let _ = (faults::take(), faults::take_forced());
+        let counts = Arc::new(Counts::default());
+        faults::bind(Arc::clone(&counts) as _);
+        let taken = || std::mem::take(&mut *counts.2.lock().unwrap());
+        let kernel = faults::set_kernel(true);
+        // Not mapped, and not writable: each counts once, at its address.
+        assert!(space.write(GuestAddr(gone.0 + 8), &[1]).is_err());
+        assert!(space.write(at, &[1]).is_err());
+        assert_eq!(
+            taken(),
+            [
+                faults::At {
+                    addr: gone.0 + 8,
+                    present: false
+                },
+                faults::At {
+                    addr: at.0,
+                    present: true
+                }
+            ]
+        );
+        // Past user space, through `get_user_pages`, with faults disabled,
+        // and in the thread's own code, nothing.
+        assert!(
+            space
+                .read(GuestAddr((1 << 47) - PAGE_SIZE), &mut [0])
+                .is_err()
+        );
+        assert!(faults::through_gup(|| space.write(gone, &[1])).is_err());
+        assert!(faults::unresolved(|| space.read(gone, &mut [0])).is_err());
+        // Nor a check of a range, which Linux makes with no access.
+        assert!(space.check_write(gone, 1).is_err());
+        assert!(space.check_read(gone, 1).is_err());
+        assert!(space.check_write(at, 1).is_err());
+        faults::set_kernel(false);
+        assert!(space.read(gone, &mut [0]).is_err());
+        faults::set_kernel(true);
+        assert_eq!(taken(), []);
+        // Faults are counted again once the disabled access is done.
+        assert!(space.read(gone, &mut [0]).is_err());
+        assert_eq!(taken().len(), 1);
+        // No minor or major fault for any of them.
+        let counted = counts.0.each_ref().map(|n| n.load(Ordering::SeqCst));
+        assert_eq!((counted, counts.1.load(Ordering::SeqCst)), ([0, 0, 0], 0));
+        faults::set_kernel(kernel);
         faults::unbind();
     }
 

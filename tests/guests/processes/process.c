@@ -9638,6 +9638,7 @@ static int io_uring_case(void) {
     /* Linux 7.0's: no wait region is registered, and no I/O wait. */
     uring_show("enter-region-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 24));
     uring_show("enter-region", uring_enter(u.fd, 0, 1, 1 | 1 << 3 | 1 << 6, NULL, 64));
+    uring_show("enter-region-alone", uring_enter(u.fd, 0, 0, 1 | 1 << 6, NULL, 0));
     uring_show("enter-no-iowait", uring_enter(u.fd, 0, 0, 1 << 7, NULL, 0));
     uring_show("enter-unknown-flag", uring_enter(u.fd, 0, 0, 1 << 8, NULL, 0));
     uring_show("register-unknown", syscall(427, u.fd, 255, NULL, 0));

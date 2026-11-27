@@ -700,8 +700,8 @@ fn mount(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// change nothing: the new mount has the source mount's. A source in
 /// `/proc` or `/dev`, which the kernel generates, is a mount of that file
 /// ([`paludarium_vfs::NamespacedFs::bind_generated`]), a file or a
-/// directory, below which no mount is locked or comes along with
-/// `MS_REC`.
+/// directory, below which no mount comes along with `MS_REC` and, without
+/// it, none may be locked.
 fn bind(
     c: &Context<'_>,
     source: Option<Vec<u8>>,
@@ -715,7 +715,9 @@ fn bind(
         if !check_mnt(c, ns) {
             return Err(Errno::EINVAL);
         }
-        c.files.namespaced().bind_generated(generated, target)?;
+        c.files
+            .namespaced()
+            .bind_generated(generated, target, recurse)?;
         return Ok(0);
     };
     if !check_mnt(c, ns) {

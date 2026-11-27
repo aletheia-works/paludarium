@@ -4656,7 +4656,12 @@ kernel.
   for a reader that may look at it, another's) runs the program it leads
   to, as Linux's walk jumps to the file without searching its
   directories; `AT_SYMLINK_NOFOLLOW` refuses it (`ELOOP`), and a
-  generated file that is no link is `EACCES`.
+  generated file that is no link is `EACCES`. Under a root of its own it
+  does so through a bind mount of `/proc` there, and a symbolic link in
+  that root into such a bind mount of `/proc` or `/dev` (an absolute one
+  from the new root) leads every call to the generated file, as its own
+  path does. `readlink` of a generated file that is no link, `/proc`
+  itself too, is `EINVAL`.
 
 - `/proc/sys/fs/mqueue` has the POSIX message queue limits of the
   reader's IPC namespace, as Linux's `ipc/mq_sysctl.c`: `queues_max`,

@@ -1007,7 +1007,7 @@ impl Files {
     /// for a file it was bound onto) and the place that names it, none
     /// for any other path.
     pub(crate) fn through_generated(&self, p: &[u8], follow: bool) -> Option<(Vec<u8>, Vec<u8>)> {
-        self.namespaced().generated(p, follow)
+        self.namespaced().generated_in(&self.root(), p, follow)
     }
     /// [`Self::path`] as written, a bind mount's place itself and not the
     /// file it shows: the name an unlink or a rename takes away, which a
@@ -1966,6 +1966,17 @@ fn read_link(c: &mut Context<'_>, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
             from_reader(c, link_target(&Holder::of(c), &d)?)
         }
     } else {
+        // Another file the kernel generates is no link (`EINVAL`), as
+        // `do_readlinkat` finds, and one that is not there `ENOENT`.
+        if generated(&p) || p == b"/proc" {
+            match generated_stat(c, &p, false)? {
+                None => return Err(Errno::ENOENT),
+                Some((stat, ..)) if stat.mode & 0o170000 != 0o120000 => {
+                    return Err(Errno::EINVAL);
+                }
+                Some(_) => {}
+            }
+        }
         // A link on the way to a link the kernel generates.
         match c.files.fs().readlink(&p) {
             Err(e) => return read_link(c, generated_target(c, &p, false, e)?),
@@ -8972,15 +8983,17 @@ fn descriptor_followed(files: &Files, d: Descriptor) -> Result<Followed, Errno> 
 /// `None` when the path stays on the file system as written, or ends in a
 /// link of `/proc/<pid>/fd` (or `/dev/fd`), which [`exec_program`] takes.
 /// A generated file is no regular file (`EACCES`, as `do_open_execat`
-/// finds), and one that is not there `ENOENT`. The machine's root only:
-/// under a root of its own, `/proc` and `/dev` are what the root holds.
+/// finds), and one that is not there `ENOENT`. Under a root of its own,
+/// `/proc` and `/dev` are what the root holds, the generated files through
+/// a bind mount of them. The path is from the machine's root, for
+/// [`exec_program_at`].
 pub(crate) fn exec_jumped(
     c: &Context<'_>,
     dir: u64,
     raw: &[u8],
     follow: bool,
 ) -> Result<Option<Vec<u8>>, Errno> {
-    if raw.is_empty() || c.files.root() != b"/" {
+    if raw.is_empty() {
         return Ok(None);
     }
     let mut p = c.files.path(dir, through_magic_links(c, raw.to_vec())?)?;
@@ -9070,13 +9083,6 @@ pub(crate) fn exec_program(
     raw: &[u8],
     flags: u64,
 ) -> Result<Program, Errno> {
-    const ELOOP: Errno = Errno(40);
-    let symlink = |path: &[u8]| {
-        files
-            .fs()
-            .metadata(path, false)
-            .is_ok_and(|s| s.mode & 0o170000 == 0o120000)
-    };
     let target = if raw.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(Errno::ENOENT);
@@ -9086,21 +9092,41 @@ pub(crate) fn exec_program(
         }
         descriptor_followed(files, files.descriptor(dir)?)?
     } else {
-        let path = files.path(dir, raw.to_vec())?;
-        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        if !follow && symlink(&path) {
-            return Err(ELOOP);
-        }
-        match through_descriptor(files, process, &path, follow)? {
-            Some(target) => target,
-            None => return Ok(Program::Path(path)),
-        }
+        return exec_program_at(files, process, files.path(dir, raw.to_vec())?, flags);
     };
+    program_of(files, target)
+}
+/// [`exec_program`] of `path`, from the machine's root.
+pub(crate) fn exec_program_at(
+    files: &Files,
+    process: (u32, bool),
+    path: Vec<u8>,
+    flags: u64,
+) -> Result<Program, Errno> {
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    if !follow && is_symlink(files, &path) {
+        return Err(Errno(40)); // ELOOP
+    }
+    match through_descriptor(files, process, &path, follow)? {
+        Some(target) => program_of(files, target),
+        None => Ok(Program::Path(path)),
+    }
+}
+/// Whether the path `path` names a symbolic link itself.
+fn is_symlink(files: &Files, path: &[u8]) -> bool {
+    files
+        .fs()
+        .metadata(path, false)
+        .is_ok_and(|s| s.mode & 0o170000 == 0o120000)
+}
+/// The program a followed path or descriptor gives.
+fn program_of(files: &Files, target: Followed) -> Result<Program, Errno> {
+    const ELOOP: Errno = Errno(40);
     Ok(match target {
         Followed::Path {
             path,
             follow: false,
-        } if symlink(&path) => return Err(ELOOP),
+        } if is_symlink(files, &path) => return Err(ELOOP),
         Followed::Path { path, .. } => Program::Path(path),
         Followed::File(d) => {
             let memfd = d

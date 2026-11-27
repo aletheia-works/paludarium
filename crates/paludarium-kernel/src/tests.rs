@@ -14911,6 +14911,90 @@ fn a_bind_of_proc_shows_its_files_in_a_new_root() {
     assert_eq!(f.ret(2, &[missing, 0, 0]), errno(Errno::ENOENT));
 }
 
+/// Under a root of its own whose `/proc` and `/dev` are binds of them, a
+/// symbolic link in that root into them, absolute (from the new root) or
+/// relative, finds what their own paths find, as Linux's walk starts an
+/// absolute link at `fs->root`.
+#[test]
+fn a_link_in_a_new_root_into_a_bind_of_proc_finds_what_its_path_finds() {
+    let mut f = fixture();
+    let root = put(&mut f, 0, b"/tmp/r");
+    let proc_place = put(&mut f, 0x10, b"/tmp/r/proc");
+    let dev_place = put(&mut f, 0x20, b"/tmp/r/dev");
+    let proc_dir = put(&mut f, 0x40, b"/proc");
+    let dev = put(&mut f, 0x50, b"/dev");
+    for place in [root, proc_place, dev_place] {
+        assert_eq!(f.ret(83, &[place, 0o755]), 0);
+    }
+    assert_eq!(f.ret(165, &[proc_dir, proc_place, 0, 4096, 0]), 0);
+    assert_eq!(f.ret(165, &[dev, dev_place, 0, 4096, 0]), 0);
+    let relative = put(&mut f, 0x60, b"proc");
+    for (target, link) in [
+        (proc_dir, &b"/tmp/r/lp"[..]),
+        (dev, b"/tmp/r/ld"),
+        (relative, b"/tmp/r/lr"),
+    ] {
+        let link = put(&mut f, 0x70, link);
+        assert_eq!(f.ret(88, &[target, link]), 0);
+    }
+    assert_eq!(f.ret(161, &[root]), 0);
+    let other = put(&mut f, 0xa0, b"/other");
+    let file = put(&mut f, 0xb0, b"/file");
+    let fd = f.ret(2, &[file, 0o101, 0o644]);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let stat = DATA + 0x1000;
+    let pairs: [(&[u8], &[u8]); 3] = [(b"/proc", b"/lp"), (b"/proc", b"/lr"), (b"/dev", b"/ld")];
+    let names: [&[u8]; 6] = [b"self/comm", b"uptime", b"self", b"null", b"pts", b"x8"];
+    for (direct, through) in pairs {
+        for name in names {
+            let mut results = Vec::new();
+            for dir in [direct, through] {
+                let p = put(&mut f, 0x100, &[dir, b"/", name].concat());
+                let q = put(&mut f, 0x200, &[dir, b"/y8"].concat());
+                let call = |f: &mut Fixture, n: u64, args: &[u64]| f.ret(n, args) as i64;
+                let opened = call(&mut f, 2, &[p, 0, 0]);
+                if opened >= 0 {
+                    assert_eq!(f.ret(3, &[opened as u64]), 0);
+                }
+                let stated = call(&mut f, 4, &[p, stat]);
+                let mode = f.mem.read_u64(GuestAddr(stat + 24)).unwrap() & 0o170000;
+                results.push([
+                    opened.min(0),
+                    stated,
+                    if stated == 0 { mode as i64 } else { 0 },
+                    call(&mut f, 6, &[p, stat]),
+                    call(&mut f, 21, &[p, 4]),
+                    call(&mut f, 83, &[p, 0o755]),
+                    call(&mut f, 133, &[p, 0o10644, 0]),
+                    call(&mut f, 87, &[p]),
+                    call(&mut f, 84, &[p]),
+                    call(&mut f, 88, &[other, p]),
+                    call(&mut f, 86, &[file, p]),
+                    call(&mut f, 82, &[p, q]),
+                    call(&mut f, 82, &[file, p]),
+                ]);
+            }
+            let label = format!(
+                "{}/{}",
+                String::from_utf8_lossy(through),
+                String::from_utf8_lossy(name)
+            );
+            assert_eq!(results[0], results[1], "{label}");
+            // What is there opens, and what is not is ENOENT.
+            let there = matches!(
+                (direct, name),
+                (b"/proc", b"self/comm" | b"uptime" | b"self") | (b"/dev", b"null" | b"pts")
+            );
+            let expected = if there {
+                0
+            } else {
+                errno(Errno::ENOENT) as i64
+            };
+            assert_eq!(results[1][0], expected, "{label}");
+        }
+    }
+}
+
 mod context_switches {
     use super::*;
 
@@ -15174,4 +15258,53 @@ fn the_first_thread_keeps_the_signals_the_host_started_with_ignored() {
         ignored(&shared.lock().unwrap_or_else(PoisonError::into_inner)),
         [2, 3]
     );
+}
+
+/// In a mount namespace of a less privileged owner, where `/dev/shm` is
+/// locked, a bind of `/dev` is `EINVAL` (`has_locked_children`) but with
+/// `MS_REC` is made, as `copy_tree` takes the locked mount along.
+#[test]
+fn a_recursive_bind_of_dev_is_made_over_its_locked_shm() {
+    let mut f = fixture();
+    let place = put(&mut f, 0, b"/tmp/a");
+    let dev = put(&mut f, 0x10, b"/dev");
+    let root = put(&mut f, 0x20, b"/");
+    assert_eq!(f.ret(83, &[place, 0o755]), 0);
+    // unshare(CLONE_NEWUSER | CLONE_NEWNS), then / private.
+    assert_eq!(f.ret(272, &[0x1000_0000 | 0x2_0000]), 0);
+    assert_eq!(f.ret(165, &[0, root, 0, (1 << 14) | (1 << 18), 0]), 0);
+    assert_eq!(
+        f.ret(165, &[dev, place, 0, 1 << 12, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(165, &[dev, place, 0, (1 << 12) | (1 << 14), 0]), 0);
+    let null = put(&mut f, 0x30, b"/tmp/a/null");
+    let fd = f.ret(2, &[null, 2, 0]);
+    assert!(fd < 1024, "{fd:#x}");
+    assert_eq!(f.ret(3, &[fd]), 0);
+}
+
+/// `readlink` of a file the kernel generates that is no link is `EINVAL`,
+/// `/proc` itself and its own files too, and of one not there `ENOENT`.
+#[test]
+fn readlink_of_a_generated_file_that_is_no_link_is_einval() {
+    let mut f = fixture();
+    for (p, expected) in [
+        (&b"/proc"[..], Errno::EINVAL),
+        (b"/proc/uptime", Errno::EINVAL),
+        (b"/proc/sys", Errno::EINVAL),
+        (b"/proc/sys/kernel/ostype", Errno::EINVAL),
+        (b"/proc/self/comm", Errno::EINVAL),
+        (b"/dev/null", Errno::EINVAL),
+        (b"/proc/nosuch", Errno::ENOENT),
+        (b"/proc/self/nosuch", Errno::ENOENT),
+    ] {
+        let at = put(&mut f, 0, p);
+        assert_eq!(
+            f.ret(89, &[at, DATA + 0x1000, 256]),
+            errno(expected),
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
 }

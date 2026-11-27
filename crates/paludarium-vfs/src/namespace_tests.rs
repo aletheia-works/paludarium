@@ -379,8 +379,11 @@ fn a_bind_mount_of_a_generated_file_leads_the_kernel_to_it() {
     let (lower, fs) = machine();
     assert_eq!(fs.generated(b"/tmp/f", true), None);
     // A file on a file only.
-    assert_eq!(fs.bind_generated(null(), b"/tmp/m"), Err(Errno::ENOTDIR));
-    fs.bind_generated(null(), b"/tmp/f").unwrap();
+    assert_eq!(
+        fs.bind_generated(null(), b"/tmp/m", false),
+        Err(Errno::ENOTDIR)
+    );
+    fs.bind_generated(null(), b"/tmp/f", false).unwrap();
     assert_eq!(
         fs.generated(b"/tmp/f", false),
         Some((b"/dev/null".to_vec(), b"/tmp/f".to_vec()))
@@ -435,10 +438,10 @@ fn a_bind_mount_of_a_generated_directory_leads_each_name_to_the_kernel() {
         ..null()
     };
     assert_eq!(
-        fs.bind_generated(dev.clone(), b"/tmp/f"),
+        fs.bind_generated(dev.clone(), b"/tmp/f", false),
         Err(Errno::ENOTDIR)
     );
-    fs.bind_generated(dev, b"/tmp/m").unwrap();
+    fs.bind_generated(dev, b"/tmp/m", false).unwrap();
     let to = |path: &[u8]| fs.generated(path, true).map(|(file, _)| file);
     assert_eq!(to(b"/tmp/m"), Some(b"/dev".to_vec()));
     assert_eq!(to(b"/tmp/m/pts/0"), Some(b"/dev/pts/0".to_vec()));
@@ -454,19 +457,19 @@ fn a_bind_mount_of_a_generated_directory_leads_each_name_to_the_kernel() {
 fn a_bind_mount_of_a_generated_file_keeps_its_locks_in_a_locked_copy() {
     let (lower, fs) = machine();
     let locked = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
-    locked.bind_generated(null(), b"/tmp/f").unwrap();
+    locked.bind_generated(null(), b"/tmp/f", false).unwrap();
     use mount_flags::*;
     assert_eq!(
         locked.target(b"/tmp/f").unwrap().locks,
         LOCK_ATIME | LOCK_NOSUID
     );
-    fs.bind_generated(null(), b"/tmp/f").unwrap();
+    fs.bind_generated(null(), b"/tmp/f", false).unwrap();
     assert_eq!(fs.target(b"/tmp/f").unwrap().locks, 0);
     // The locks are those of the start-up `/dev`, locked in the copy
     // whatever mount the target is on: a new, unlocked one too.
     locked.mount(b"/tmp/m", tmpfs(0)).unwrap();
     locked.open(b"/tmp/m/f", 66, 0o600).unwrap();
-    locked.bind_generated(null(), b"/tmp/m/f").unwrap();
+    locked.bind_generated(null(), b"/tmp/m/f", false).unwrap();
     assert_eq!(
         locked.target(b"/tmp/m/f").unwrap().locks,
         LOCK_ATIME | LOCK_NOSUID

@@ -202,9 +202,6 @@ verified.
   names as written, where Linux takes a `..` after a link in `/proc` (such
   as `/proc/self/cwd`) from its target.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
-- **Links into `/dev` and `/proc` under a root of its own**: there, no
-  symbolic link elsewhere that leads into them is followed to the
-  generated file.
 - **Names in `/dev` and `/proc`**: no call makes a name in `/dev`
   (`mkdir`, `mknod`, `symlink`, an `open` with `O_CREAT` and a `rename`
   into it give `ENOENT`), where Linux's devtmpfs takes them, and removing
@@ -974,9 +971,10 @@ verified.
   directory in them) still shows what is generated in those directories,
   and what is in `/dev/shm`, where Linux shows their empty mount points,
   and with `MS_REC` takes no mount along. In a namespace of a less
-  privileged owner a bind mount of `/dev` is `EINVAL`, as Linux refuses
-  it for its locked `/dev/shm`, but one of `/proc` or `/dev/pts` is made,
-  where Linux refuses it for its locked mounts below (`EINVAL`). Once
+  privileged owner a bind mount of `/dev` without `MS_REC` is `EINVAL`,
+  as Linux refuses it for its locked `/dev/shm`, but one of `/proc` or
+  `/dev/pts` is made, where Linux refuses it for its locked mounts below
+  (`EINVAL`); with `MS_REC` each is made, as on Linux. Once
   `/dev/shm` is unmounted, its name is not found there (`ENOENT`) nor
   listed in `/dev`, where Linux shows devtmpfs's empty directory. A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its

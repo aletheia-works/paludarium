@@ -4893,7 +4893,7 @@ impl Kernel {
             crate::files::exec_jumped(&c, dir, &raw, a[3] & AT_SYMLINK_NOFOLLOW == 0)?
         };
         let program = match &jumped {
-            Some(path) => crate::files::exec_program(&self.files, process, AT_FDCWD, path, a[3])?,
+            Some(path) => crate::files::exec_program_at(&self.files, process, path.clone(), a[3])?,
             None => crate::files::exec_program(&self.files, process, dir, &raw, a[3])?,
         };
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;

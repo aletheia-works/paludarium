@@ -18894,6 +18894,98 @@ static int generated_link_names_case(const char *self) {
     return 0;
 }
 
+/* The generated-rooted-links case: under a root of its own, whose /proc
+   and /dev are bind mounts of the machine's, a symbolic link in that root
+   into them (absolute, so from the new root, or relative) finds what their
+   own paths find, and execve of a process's exe link through one runs the
+   program, as Linux's walk follows links from fs->root. In a user
+   namespace of its own, for the binds and chroot; only errno values and
+   whether the two ways agree are printed. */
+static char grl_base[] = "/tmp/paludarium-rooted-links-XXXXXX";
+static void grl_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", grl_base, name); }
+/* What open, stat and lstat (the file type, S_IFMT >> 12), access and
+   readlink give for `path` (0 or -errno), and its inode. */
+static void grl_probe(const char *path, long out[6]) {
+    struct stat st;
+    char buf[512];
+    int fd = open(path, O_RDONLY);
+    out[0] = fd < 0 ? -errno : 0;
+    if (fd >= 0) close(fd);
+    out[1] = stat(path, &st) ? -errno : (long)(st.st_mode & S_IFMT) >> 12;
+    out[2] = lstat(path, &st) ? -errno : (long)(st.st_mode & S_IFMT) >> 12;
+    out[3] = access(path, R_OK) ? -errno : 0;
+    long n = readlink(path, buf, sizeof buf);
+    out[4] = n < 0 ? -errno : 0;
+    out[5] = stat(path, &st) ? 0 : (long)st.st_ino;
+}
+static int grl_inner(const char *self) {
+    char proc_place[256], dev_place[256], lp[256], lr[256], ld[256];
+    grl_path(proc_place, "proc");
+    grl_path(dev_place, "dev");
+    grl_path(lp, "lp");
+    grl_path(lr, "lr");
+    grl_path(ld, "ld");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    printf("binds=%d %d\n", mount("/proc", proc_place, NULL, MS_BIND | MS_REC, NULL) ? errno : 0,
+           mount("/dev", dev_place, NULL, MS_BIND | MS_REC, NULL) ? errno : 0);
+    printf("links=%d %d %d\n", symlink("/proc", lp), symlink("proc", lr), symlink("/dev", ld));
+    if (chroot(grl_base) || chdir("/")) return 81;
+    const char *pairs[][2] = {{"/proc", "/lp"}, {"/proc", "/lr"}, {"/dev", "/ld"}};
+    const char *names[] = {"self/comm", "uptime", "self", "self/exe", "null", "pts", "x8"};
+    for (unsigned i = 0; i < 3; i++)
+        for (unsigned j = 0; j < 7; j++) {
+            char direct[300], through[300];
+            snprintf(direct, sizeof direct, "%s/%s", pairs[i][0], names[j]);
+            snprintf(through, sizeof through, "%s/%s", pairs[i][1], names[j]);
+            long a[6], b[6];
+            grl_probe(direct, a);
+            grl_probe(through, b);
+            printf("%s: open=%ld stat=%ld lstat=%ld access=%ld readlink=%ld same=%d\n", through, a[0], a[1],
+                   a[2], a[3], a[4], !memcmp(a, b, sizeof a));
+        }
+    const char *runs[] = {"/proc/self/exe", "/lp/self/exe", "/lr/self/exe"};
+    for (unsigned i = 0; i < 3; i++) printf("exec %s=%d\n", runs[i], gl_exec(self, runs[i], 0));
+    return 0;
+}
+static int generated_rooted_links_case(const char *self) {
+    if (!mkdtemp(grl_base)) return 1;
+    char path[256];
+    grl_path(path, "proc");
+    mkdir(path, 0755);
+    grl_path(path, "dev");
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(grl_inner(self));
+    }
+    printf("status=%d\n", reaped(child));
+    const char *files[] = {"lp", "lr", "ld"};
+    for (unsigned i = 0; i < 3; i++) {
+        grl_path(path, files[i]);
+        unlink(path);
+    }
+    grl_path(path, "proc");
+    rmdir(path);
+    grl_path(path, "dev");
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(grl_base) == 0);
+    return 0;
+}
+
 /* The generated-noexec case: /proc and /dev are noexec mounts, so an
    executable mapping of a file there is EPERM before anything else is
    checked, and mprotect to one EACCES; a file reached through a link
@@ -44543,6 +44635,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-link-names")) return generated_link_names_case(self);
     if (!strcmp(mode, "generated-link-ran")) return 7;
+    if (!strcmp(mode, "generated-rooted-links")) return generated_rooted_links_case(self);
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "shmem-fault-charge")) return shmem_fault_charge_case();

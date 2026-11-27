@@ -130,11 +130,14 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `if_inet6`, `igmp`,
-  `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the
-  sockets (see [features](./features)) alone; `dev_mcast`, `snmp`,
+- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `dev_mcast`,
+  `if_inet6`, `igmp`, `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route`
+  and those of the sockets (see [features](./features)) alone; `snmp`,
   `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
-  `dev` are 0. A session with no network has files of no device and no
+  `dev` are 0. `SIOCADDMULTI` and `SIOCDELMULTI` are not supported, so
+  `dev_mcast` has only the addresses the devices' groups map to, none of
+  them global; nor is the `RTM_GETMULTICAST` dump of those addresses
+  (`AF_PACKET`) that Linux master has. A session with no network has files of no device and no
   Internet socket. Of a socket, its address in the kernel is 0, its
   references are the same for each of a kind, the memory its unsent
   datagrams and messages take is 0, and so is a TCP connection's `quick` with
@@ -243,7 +246,7 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Broadcast datagrams reach no one but through a veth end (below). A
+    Broadcast datagrams reach no one but through a veth end or `lo` (below). A
     datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
@@ -631,7 +634,7 @@ verified.
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
-  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
+  socket requests, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
   one are not there yet (`EINVAL`). A multishot receive whose socket keeps
@@ -1165,9 +1168,7 @@ verified.
   before it drops the pages of any, where Linux tells and drops VMA by VMA,
   and registered mappings of one `userfaultfd` that meet are one range of
   `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of
-  its whole range once its first mapping passes the checks. A
-  registration that replaces the write-protect mode with others ends the
-  protection of the range's pages, whose marks Linux leaves in their PTEs.
+  its whole range once its first mapping passes the checks.
   Of shmem's files a memfd and a file of a tmpfs mount (one a guest
   mounted, or `/dev/shm`) are registered, but for write protection alone
   with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the
@@ -1236,16 +1237,15 @@ verified.
   `sk_rethink_txhash`), but here a connection's path is settled as it
   opens, so a hop whose answers do not come back fails it. An ICMPv6 error
   takes the hop of its own flow, where Linux's takes that of the packet
-  it tells of (`icmp6_send`). An IPv4 connection with no port of its own
-  yet hashes one random source port in each of its lookups, where Linux
-  draws a new one at each (`FLOWI_FLAG_ANY_SPORT` in `ip_route_connect`
-  and `ip_route_newports`). A UDP
+  it tells of (`icmp6_send`). A connection with no port of its own yet
+  hashes a random source port, as on Linux (`FLOWI_FLAG_ANY_SPORT`): one
+  in each of its lookups, where Linux's IPv4 one draws a new one at each
+  (`ip_route_connect`, `ip_route_newports`); IPv6's looks its route up
+  once (`tcp_v6_connect`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
-  gave. Bound to `lo`, an IPv4 socket's packet to the limited broadcast
-  address or `127.255.255.255` is `ENETUNREACH`, where Linux sends it
-  through `lo`. Neighbour discovery sends no advertisement unasked, and no
+  gave. Neighbour discovery sends no advertisement unasked, and no
   redirect; the
   probe a delaying neighbour sends teaches the peer nothing, where
   Linux's, from the end's link-local address, makes it a neighbour of

@@ -159,7 +159,8 @@ kernel.
   system take neither. On a macOS or Windows host, whose file systems Linux
   has no number for, a host file is taken as ext4's. `RWF_NOSIGNAL` spares a write to
   a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
-  since Linux 6.18. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
+  since Linux 6.18, also one to a pipe whose last reader leaves after part
+  of it went, which returns that part. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
   for the call: a write goes to the offset (growing the file past its end)
   or, at -1, to the position, which then moves past it; an append-only file
   (`FS_APPEND_FL`) gives `EPERM`, for a read too. `RWF_APPEND` writes a
@@ -169,8 +170,10 @@ kernel.
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in
-  one file). `sendfile` reads a regular file into any writable file, a pipe
-  taking at most its capacity per call. Both update the given offsets or the
+  one file). `sendfile` reads a regular file into any writable file; into a
+  pipe it is a `splice`, as Linux's `splice_file_to_pipe`: once the pipe has
+  room it takes what fits and does not wait for more, waiting first only
+  when the pipe is not `O_NONBLOCK`. Both update the given offsets or the
   file positions; `sendfile` writes its offset back even after an error.
 
 - `splice` moves bytes between a pipe (or FIFO) and a regular file, a
@@ -1344,8 +1347,13 @@ kernel.
   anonymous memory or a `UFFDIO_POISON` is `EEXIST` there. `mprotect` keeps the protection,
   and refuses a write it does not permit with SIGSEGV as before; a
   `fork`ed child and a move by `mremap` (without their events' features),
-  `UFFDIO_UNREGISTER`, closing the file and a registration that replaces
-  the write-protect mode take it away. With `UFFD_FEATURE_WP_ASYNC`, which brings
+  `UFFDIO_UNREGISTER` and closing the file take it away. A registration
+  that replaces the write-protect mode changes the VMA's flags alone, as
+  Linux's `userfaultfd_register_range` does: the pages keep their marks,
+  which bit 57 of `/proc/<pid>/pagemap` still shows and which protect
+  nothing; registered again, the mode protects them again, but for a page
+  a write took meanwhile, whose entry became writable with its mark kept
+  (`wp_page_reuse`), until `UFFDIO_WRITEPROTECT` protects it again. With `UFFD_FEATURE_WP_ASYNC`, which brings
   `UFFD_FEATURE_WP_UNPOPULATED` (as `/proc/<pid>/fdinfo` shows), a write
   to a write-protected page, an instruction's or a system call's, does not
   fault: it clears the page's protection and goes on, as `do_wp_page`
@@ -2134,13 +2142,21 @@ kernel.
   `EMSGSIZE`), so one that waits needs them no more. A receive with
   `MSG_WAITALL` whose message or ancillary data was cut fails its link.
   With `IORING_ACCEPT_MULTISHOT` and `IORING_RECV_MULTISHOT`, an accept and
-  an `IORING_OP_RECV` post a completion with `IORING_CQE_F_MORE` for each
+  a receive post a completion with `IORING_CQE_F_MORE` for each
   connection or each buffer filled, and wait for the next: until an error,
-  the end, a receive's limit (`optlen`), no buffer (`ENOBUFS`) or no room in
-  the queue. It goes on at once while its socket has more
+  the end, an `IORING_OP_RECV`'s limit (`optlen`, which an `IORING_OP_RECVMSG`
+  refuses with `EINVAL`), no buffer (`ENOBUFS`) or no room in the queue.
+  It goes on at once while its socket has more
   (`IORING_CQE_F_SOCK_NONEMPTY`) or does not say, as an AF_UNIX listener
   does not, and otherwise waits for the socket first, so a receive whose
-  last buffer went fails with `ENOBUFS` only when more bytes come. Each is
+  last buffer went fails with `ENOBUFS` only when more bytes come. An
+  `IORING_OP_RECVMSG`'s buffer starts with a `struct io_uring_recvmsg_out`
+  (the name's length, the control's, the message's whole one and its
+  flags), then the room its `msghdr` gives the name and the control, then
+  the bytes, as `io_recvmsg_multishot` puts them; a buffer shorter than all
+  but the bytes fails with `EFAULT`, and the `msghdr` is not written. Its
+  result is the bytes of the buffer it used, and the end of the stream
+  posts the last with none. Each is
   prepared as Linux prepares it, which checks its entry
   (`EINVAL`), then reads a connect's or a send's address
   (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a
@@ -3227,7 +3243,13 @@ kernel.
     while the end has its carrier, in the peer's, if it takes the
     address as a broadcast one (the limited one, or one its routes make
     so) from a source its reverse path filtering takes
-    (`ip_route_input_slow`). A socket connected from the unspecified
+    (`ip_route_input_slow`). Out through `lo`, to the limited broadcast
+    address from a socket bound to `lo` or to its address, or by a
+    broadcast route through it (as the local table's to
+    `127.255.255.255`), it comes back in on `lo` once, to such sockets
+    bound to `lo` or to no device, as `lo` sends it with no copy looped
+    back (`__mkroute_output` gives `ip_mc_output` to no loopback device).
+    A socket connected from the unspecified
     address has taken its route's source, and takes none. An IPv4 socket
     bound to a broadcast or multicast address keeps it as its name, which
     a UDP connect leaves, but sends from its route's source (`inet_bind`),
@@ -3237,9 +3259,9 @@ kernel.
     IPv4 fail: `EINVAL` from a group or the limited broadcast address,
     `ENETUNREACH` from a subnet's, for UDP's `sendto` and `connect` and
     TCP's `connect`. A group or the
-    limited broadcast address from a socket bound to an end's address
-    needs no route: it goes out through that end
-    (`ip_route_output_key_hash_rcu`).
+    limited broadcast address from a socket bound to an end's address, or
+    to `lo`'s while it is up, needs no route: it goes out through that
+    device (`ip_route_output_key_hash_rcu`).
   - **IPv4 multicast groups:** a UDP socket joins and leaves a group with
     `IP_ADD_MEMBERSHIP` and `IP_DROP_MEMBERSHIP` (`ip_mreqn` or `ip_mreq`),
     on the device of an index, of an address, or of the route to the group
@@ -5088,12 +5110,23 @@ kernel.
     runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
     each IPv6 group of each device with IPv6, the newest first, with its
     users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
-    below a link's and `MAF_LOADED` for the rest while their device is up,
-    and no timer, as no MLDv1 report is waited for. `mcfilter` and `mcfilter6`
+    below a link's and `MAF_LOADED` for the rest from when they are joined
+    or their device comes up until it goes down, and no timer, as no MLDv1
+    report is waited for. `mcfilter` and `mcfilter6`
     (`igmp_mcf_seq_show`, `igmp6_mcf_seq_show`), the sources the
     memberships of each group name, with how many include and how many
     exclude each, from the first device whose newest group names one, as
     Linux's begin there.
+  - `dev_mcast` (`dev_mc_seq_show`), the link-layer multicast addresses
+    each device takes packets to, in the order of their indexes, each
+    device's in the order they came, with how many of its groups map to
+    each and whether it is global, which none is. A veth end maps each
+    IPv4 group in its filter to an Ethernet address (`ip_eth_mc_map`), and
+    each IPv6 group of a link's scope or wider (`ipv6_eth_mc_map`), as it is
+    joined or the device comes up, from the all-hosts group, the rest the
+    newest first (`ip_mc_up`, `ipv6_mc_up`); down or with its IPv6 off,
+    they come out (`ip_mc_down`, `ipv6_mc_down`), but a group joined then
+    comes in all the same. The loopback maps none.
   - `tcp`, `tcp6`, `udp` and `udp6`, the sockets `sock_diag` tells of, but
     for TCP ones bound alone, in the format of Linux 7.0's `tcp4_seq_show` and
     the like: first the listeners, then the connections, with those in

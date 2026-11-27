@@ -3539,10 +3539,7 @@ fn send(
     if output.flags() & 3 == 0 {
         return Err(Errno::EBADF);
     }
-    let pipe = output
-        .as_any()
-        .and_then(|any| any.downcast_ref::<crate::sockets::PipeEnd>())
-        .map(crate::sockets::PipeEnd::size);
+    let pipe = crate::sockets::pipe(&output);
     // do_splice_direct refuses O_APPEND; a pipe output does not use it.
     if pipe.is_none() && output.flags() & 0o2000 != 0 {
         return Err(Errno::EINVAL);
@@ -3558,7 +3555,9 @@ fn send(
     if count == 0 {
         return Ok(0);
     }
-    let sent = if output.stat()?.mode & 0o170000 == REGULAR {
+    let sent = if let Some(to) = pipe {
+        splice::file_to_pipe(c, &input, from, &output, to, count)?
+    } else if output.stat()?.mode & 0o170000 == REGULAR {
         let to = output.seek(0, 1)?;
         let count = count.min(size_room(c, to)?);
         let sent = copy_bytes(&input, from, &output, to, count)?;
@@ -3568,9 +3567,7 @@ fn send(
         output.seek((to + sent) as i64, 0)?;
         sent
     } else {
-        // A pipe takes at most what it holds, as splice_file_to_pipe does;
-        // other files take 1 MiB pieces until a short write.
-        let count = pipe.map_or(count, |size| count.min(size));
+        // Other files take 1 MiB pieces until a short write.
         let mut piece = buffer(usize::try_from(count).unwrap_or(usize::MAX).min(1 << 20))?;
         let mut sent = 0;
         while sent < count {
@@ -6729,14 +6726,15 @@ fn write_total(
             Err(e) => {
                 if done != 0 {
                     // A pipe whose last reader left during the write raises
-                    // SIGPIPE with the part written, as Linux's `pipe_write`
-                    // does (the host's streams are pipes to the guest); a
-                    // stream socket raises it only when nothing went
+                    // SIGPIPE with the part written, unless RWF_NOSIGNAL
+                    // spares it, as Linux's `pipe_write` does (the host's
+                    // streams are pipes to the guest); a stream socket
+                    // raises it only when nothing went
                     // (`unix_stream_sendmsg`, `tcp_sendmsg_locked`).
                     let pipe = file.as_any().is_some_and(|a| {
                         a.is::<crate::sockets::PipeEnd>() || a.is::<StandardFile>()
                     });
-                    if e == Errno(32) && pipe {
+                    if e == Errno(32) && pipe && !nosignal {
                         crate::signals::queue(
                             c.process,
                             crate::signals::PendingSignal::user(13, 0),

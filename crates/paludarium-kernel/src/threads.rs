@@ -2138,6 +2138,24 @@ impl ThreadGroup {
     pub(crate) fn set_exe_file(&self, denied: Option<Arc<crate::page_cache::WriteAccess>>) {
         *self.exe_file.lock().unwrap_or_else(PoisonError::into_inner) = denied;
     }
+    /// The last thread's exit ends the process's use of its program
+    /// (`exit_mm`, before `exit_notify`): its file may be written again,
+    /// and its name keeps the file no longer, so that a removed program
+    /// ends (`IN_DELETE_SELF`) before a parent's wait does. No reader sees
+    /// the name a zombie keeps.
+    pub(crate) fn release_program(&self) {
+        self.set_exe_file(None);
+        let held = {
+            let mut name = self
+                .executable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let fixed = crate::program_name::ProgramName::fixed(name.get());
+            std::mem::replace(&mut *name, fixed)
+        };
+        // Its end is told outside the lock.
+        drop(held);
+    }
     pub(crate) fn set_executable(&self, name: crate::program_name::ProgramName) {
         *self
             .executable
@@ -2562,7 +2580,7 @@ impl Kernel {
         self.group.leave_shm(tid);
         // As in `finish_thread`: no thread left runs the program.
         if alone {
-            self.group.set_exe_file(None);
+            self.group.release_program();
             // `exit_aio`, once no process uses the address space.
             self.group.aio().release();
         }
@@ -2726,10 +2744,10 @@ impl Kernel {
             members.is_empty()
         };
         drop(core);
-        // The last thread's exit ends the process's use of its program,
-        // whose file may be written again (`exit_mm`).
+        // The last thread's exit ends the process's use of its program
+        // (`exit_mm`).
         if alone {
-            self.group.set_exe_file(None);
+            self.group.release_program();
         }
         // `exit_notify`'s `forget_original_parent`: the children it made
         // go to a thread still alive, and learn of it.

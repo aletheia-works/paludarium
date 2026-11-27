@@ -7704,6 +7704,93 @@ mod io_uring {
         assert_eq!(reap_flags(&mut f, &r), [(1, 0, 0)]);
     }
 
+    #[test]
+    fn a_multishot_receive_of_messages_heads_each_buffer() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        assert_eq!(f.ret(53, &[1, 2, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        let into = DATA + 0x600;
+        msghdr(&f, into, &[], 0);
+        let mut receive = message(10, 1, b, into, 0);
+        receive[1] = 1 << 5;
+        receive[2] = 2;
+        receive[40] = 3;
+        let head =
+            |f: &Fixture, at: u64| -> Vec<u32> { (0..4).map(|i| u32_at(f, at + 4 * i)).collect() };
+        // Each message has its lengths and flags first, then its bytes; one
+        // longer than its buffer is cut (`MSG_TRUNC`).
+        assert_eq!(one(&mut f, &r, &provide(2, DATA + 0x1000, 24, 3, 0)), 0);
+        f.mem
+            .write(GuestAddr(DATA + 0x200), b"hello world")
+            .unwrap();
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 5]), 5);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 21, MORE | 1)]);
+        assert_eq!(head(&f, DATA + 0x1000), [0, 0, 5, 0]);
+        assert_eq!(bytes(&f, DATA + 0x1010, 5), b"hello");
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 11]), 11);
+        // A datagram socket does not tell what is left, so it goes on at
+        // once, and with no buffer, ends.
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 24, MORE | 1 | 1 << 16), (1, -105, 0)]
+        );
+        assert_eq!(head(&f, DATA + 0x1018), [0, 0, 8, 0x20]);
+        assert_eq!(bytes(&f, DATA + 0x1028, 8), b"hello wo");
+        // Room for a name and control comes before the bytes; the caller's
+        // header is not written.
+        msghdr(&f, into, &[], 8);
+        f.mem
+            .write(GuestAddr(into), &(DATA + 0x700).to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(into + 8), &4u32.to_le_bytes())
+            .unwrap();
+        let before = bytes(&f, into, 56);
+        assert_eq!(one(&mut f, &r, &provide(1, DATA + 0x1000, 64, 3, 0)), 0);
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 3]), 3);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 31, MORE | 1), (1, -105, 0)]);
+        assert_eq!(head(&f, DATA + 0x1000), [0, 0, 3, 0]);
+        assert_eq!(bytes(&f, DATA + 0x101c, 3), b"hel");
+        assert_eq!(bytes(&f, into, 56), before);
+        // A buffer shorter than its head fails.
+        assert_eq!(one(&mut f, &r, &provide(1, DATA + 0x1000, 20, 3, 0)), 0);
+        assert_eq!(one(&mut f, &r, &receive), -14);
+        // The preparation: no limit, and a name's length that fits.
+        let mut limited = receive;
+        limited[44] = 1;
+        assert_eq!(one(&mut f, &r, &limited), -22);
+        msghdr(&f, into, &[], 0);
+        f.mem
+            .write(GuestAddr(into + 8), &(-1i32).to_le_bytes())
+            .unwrap();
+        assert_eq!(one(&mut f, &r, &receive), -75);
+        f.mem
+            .write(GuestAddr(into + 8), &0u32.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(into + 40), &(1u64 << 31).to_le_bytes())
+            .unwrap();
+        assert_eq!(one(&mut f, &r, &receive), -75);
+        // The end of a stream is its last.
+        msghdr(&f, into, &[], 0);
+        assert_eq!(f.ret(53, &[1, 1, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        receive[4..8].copy_from_slice(&(b as i32).to_le_bytes());
+        assert_eq!(f.ret(3, &[a]), 0);
+        assert_eq!(batch(&mut f, &r, &[receive]), [(1, 16)]);
+        assert_eq!(head(&f, DATA + 0x1000), [0, 0, 0, 0]);
+    }
+
     /// A splice (30) or tee (33) of `len` bytes from `input` to `out`.
     fn splice(opcode: u8, data: u64, input: u64, out: u64, len: u32, flags: u32) -> [u8; 64] {
         let off = if opcode == 30 { u64::MAX } else { 0 };
@@ -10661,6 +10748,39 @@ mod inotify {
         );
         f.kernel.group.set_exe_file(None);
         assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x10, &b"prog"[..])]);
+    }
+    #[test]
+    fn a_removed_program_ends_with_its_last_threads_exit() {
+        let mut f = fixture();
+        assert_eq!(f.ret(83, &[put(&f, DATA, b"/tmp/x"), 0o755]), 0);
+        let bytes = paludarium_loader::testing::tiny_exec(&[0x90], b"");
+        let file = f
+            .kernel
+            .files
+            .fs()
+            .open(b"/tmp/x/prog", 0o101, 0o755)
+            .unwrap();
+        assert_eq!(file.write_at(0, &bytes).unwrap(), bytes.len());
+        drop(file);
+        let prog = put(&f, DATA, b"/tmp/x/prog");
+        assert_eq!(f.ret(59, &[prog, 0, 0]), 0);
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let wd = f.ret(ADD, &[fd, prog, 0x400]) as i32;
+        // Removed while it runs, it lasts.
+        assert_eq!(f.ret(87, &[prog]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        // Nor do the image's mappings alone, once its memory goes, keep it:
+        // the name does until the last thread's exit lets go of it with
+        // `exe_file`, before the exit is told (`exit_mm` before
+        // `exit_notify`).
+        assert!(f.kernel.take_exec_memory().is_some());
+        f.kernel.group.set_exe_file(None);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        f.kernel.group.release_program();
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
     }
     #[test]
     fn a_fifo_a_path_opened_and_splices_are_heard_of() {

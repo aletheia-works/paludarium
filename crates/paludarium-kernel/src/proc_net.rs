@@ -35,6 +35,7 @@ pub(crate) enum File {
     Anycast6,
     IfInet6,
     Mcfilter,
+    DevMcast,
     Mcfilter6,
     Ipv6Route,
 }
@@ -48,7 +49,7 @@ pub(crate) struct Source {
 impl File {
     /// The files, in the order Linux's `proc_readdir_de` lists them: by the
     /// length of their names, then by name.
-    pub(crate) const ALL: [Self; 21] = [
+    pub(crate) const ALL: [Self; 22] = [
         Self::Arp,
         Self::Dev,
         Self::Raw,
@@ -68,6 +69,7 @@ impl File {
         Self::Anycast6,
         Self::IfInet6,
         Self::Mcfilter,
+        Self::DevMcast,
         Self::Mcfilter6,
         Self::Ipv6Route,
     ];
@@ -92,6 +94,7 @@ impl File {
             Self::Anycast6 => b"anycast6",
             Self::IfInet6 => b"if_inet6",
             Self::Mcfilter => b"mcfilter",
+            Self::DevMcast => b"dev_mcast",
             Self::Mcfilter6 => b"mcfilter6",
             Self::Ipv6Route => b"ipv6_route",
         }
@@ -136,6 +139,7 @@ impl File {
             Self::Igmp => igmp(network),
             Self::Igmp6 => igmp6(network),
             Self::Mcfilter => mcfilter(network),
+            Self::DevMcast => dev_mcast(network),
             Self::Mcfilter6 => mcfilter6(network),
             Self::Ipv6Route => ipv6_route(network, now),
         }
@@ -491,6 +495,23 @@ fn igmp6(network: Option<&Network>) -> String {
                 d.index,
                 u128::from(group),
             );
+        }
+    }
+    out
+}
+/// `dev_mcast`, as `dev_mc_seq_show` prints it: each link-layer multicast
+/// address of each device, in the order of their indexes, each's in the
+/// order it came, with its users and whether it is global, which none is
+/// here ([`crate::multicast::Links`]).
+fn dev_mcast(network: Option<&Network>) -> String {
+    let mut out = String::new();
+    let Some(network) = network else { return out };
+    network.sync6();
+    for d in network.devices().iter() {
+        let name = String::from_utf8_lossy(&d.name);
+        for (address, users) in d.links.listed() {
+            let hex: String = address.iter().map(|b| format!("{b:02x}")).collect();
+            let _ = writeln!(out, "{:<4} {name:<15} {users:<5} {:<5} {hex}", d.index, 0);
         }
     }
     out

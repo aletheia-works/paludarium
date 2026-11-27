@@ -4862,6 +4862,7 @@ mod shm {
                 "anycast6",
                 "if_inet6",
                 "mcfilter",
+                "dev_mcast",
                 "mcfilter6",
                 "ipv6_route"
             ]

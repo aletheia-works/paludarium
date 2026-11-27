@@ -404,6 +404,28 @@ fn to_pipe(
     let bufs = spliced_buffers(regular.then_some(start), read.len());
     Ok(to.write_buffers(&read, bufs)? as u64)
 }
+/// `sendfile` into the pipe `to` (the description `output`), which Linux's
+/// `do_sendfile` does with `splice_file_to_pipe`: from the regular file
+/// `input` at `start`, at most what fits once there is room, waiting for
+/// it as the pipe's own `O_NONBLOCK` says.
+pub(super) fn file_to_pipe(
+    c: &mut Context<'_>,
+    input: &Arc<dyn FileHandle>,
+    start: u64,
+    output: &Arc<dyn FileHandle>,
+    to: &PipeEnd,
+    len: u64,
+) -> Result<u64, Errno> {
+    to_pipe(
+        c,
+        input,
+        start,
+        true,
+        to,
+        len,
+        How::new(0, nonblocking(output)),
+    )
+}
 /// Two pipes, as `splice_pipe_to_pipe`: once the input has data and the
 /// output room (`ipipe_prep`, `opipe_prep`), as much as both allow, up to
 /// `len`, taken from the input.

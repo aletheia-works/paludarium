@@ -116,10 +116,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
-- **`/proc/net` の一部**：あるのは `anycast6`、`arp`、`dev`、`if_inet6`、`igmp`、`igmp6`、`ipv6_route`、
-  `mcfilter`、`mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。
-  `dev_mcast`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、`dev` のものは
-  0 です。ネットワークのないセッションのファイルには、
+- **`/proc/net` の一部**：あるのは `anycast6`、`arp`、`dev`、`dev_mcast`、`if_inet6`、`igmp`、`igmp6`、
+  `ipv6_route`、`mcfilter`、`mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。
+  `snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、`dev` のものは
+  0 です。`SIOCADDMULTI` と `SIOCDELMULTI` には対応していないので、`dev_mcast` にあるのは
+  デバイスのグループが対応づくアドレスだけで、グローバルなものはありません。Linux master にある、
+  そのアドレスの `RTM_GETMULTICAST` のダンプ（`AF_PACKET`）にも対応していません。ネットワークのないセッションのファイルには、
   デバイスもインターネットのソケットもありません。ソケットのカーネル内のアドレスは 0、参照の数は
   種類ごとに同じ値、まだ届いていないデータグラムとメッセージが占めるメモリは 0 で、TCP の接続の
   `pingpong` を含む `quick` も 0 です。確認応答を待つ間のタイマーは示しません。`netlink` には、ポートが 0 である
@@ -208,7 +210,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ソケットは、すべてのアドレスでポートを持ったままで、Linux は経路の送り元のアドレスで取ります。そのため `getsockname` は
     未指定のアドレスを返し、そのポートをループバックのアドレスで `bind` すると
     `EADDRINUSE` になります（Linux では `bind` できます）。
-    ブロードキャストのデータグラムは、veth の端を通るもの（後述）のほかは届きません。
+    ブロードキャストのデータグラムは、veth の端か `lo` を通るもの（後述）のほかは届きません。
     データグラムには
     いつも届いた時刻を付けます。Linux がそうするのは、マシンのどこかのソケットが
     タイムスタンプを取っている間だけで、どれも取っていなければ、`SO_TIMESTAMP` などで
@@ -524,8 +526,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
   `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
-  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
-  `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
+  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、
+  バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
   （`MULTISHOT_MAX_RETRY`）続くとキューに戻し、ほかのタスクワークを先に動かします。
@@ -967,8 +969,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   落とすより先にすべての範囲を知らせます。Linux は VMA ごとに知らせて落とします。
   1 つの `userfaultfd` の登録したマッピングが接していれば、Linux の VMA が
   つながったときと同じく、`UFFD_EVENT_REMOVE` の 1 つの範囲になります。
-  `MADV_REMOVE` は、最初のマッピングが確かめを通れば範囲全体を一度知らせます。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
-  ページの保護を外します。Linux はその印を PTE に残します。shmem のファイルで登録
+  `MADV_REMOVE` は、最初のマッピングが確かめを通れば範囲全体を一度知らせます。shmem のファイルで登録
   するのは memfd と tmpfs マウント（ゲストがマウントしたものか `/dev/shm`）のファイル
   です（`UFFD_FEATURE_WP_ASYNC` で書き込み保護だけなら、どのファイルも登録します）。
   起動したときからあるメモリ上のファイルシステムのファイル（`/tmp` を含みます）は、
@@ -1035,14 +1036,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   引き直すとほかのホップに移ります（`ip6_ecmp_set_mp_hash`、`sk_rethink_txhash`）。
   ここでは接続の道筋は開くときに決まるので、答えの返らないホップの接続は失敗します。
   ICMPv6 のエラーは自分のフローのホップを取りますが、Linux のものは知らせるパケットの
-  ホップを取ります（`icmp6_send`）。まだ自分のポートのない IPv4 の接続は、どの引き当てでも
-  同じ乱数の送り元ポートをハッシュしますが、Linux は引き当てごとに新しく引きます
-  （`ip_route_connect` と `ip_route_newports` の `FLOWI_FLAG_ANY_SPORT`）。
+  ホップを取ります（`icmp6_send`）。まだ自分のポートのない接続は、Linux と同じく乱数の
+  送り元ポートをハッシュします（`FLOWI_FLAG_ANY_SPORT`）。ここではどの引き当てでも同じ
+  ものを使いますが、Linux の IPv4 は引き当てごとに新しく引きます（`ip_route_connect`、
+  `ip_route_newports`）。IPv6 は経路を一度だけ引きます（`tcp_v6_connect`）。
   経路のない UDP の connect は、Linux master が "ipv6: fix device binding after failed
   datagram connect" からするように、ソケットのデバイスを元に戻します。その修正のない
   CI のカーネルでは、スコープ ID が与えたデバイスが残ります。
-  `lo` に結び付いた IPv4 のソケットが limited broadcast のアドレスか `127.255.255.255` へ
-  送ると `ENETUNREACH` です。Linux は `lo` から送ります。近隣探索は、求められない広告も
+  近隣探索は、求められない広告も
   リダイレクトも送りません。遅延中の近隣が送る問い合わせは相手に何も教えません。
   Linux では端のリンクローカルのアドレスから送り、相手にそのアドレスの近隣を作ります。
   重複アドレス検出は重複を見つけず、始まって

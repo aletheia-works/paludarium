@@ -6088,7 +6088,10 @@ kernel.
   whose entries need not be those of the array it stands for (master's
   53040a81ae57). A 64-bit `BPF_JEQ` or `BPF_JNE` of a value's or a map's
   pointer with 0 goes one way only, as Linux knows such a pointer is not
-  0; a 32-bit one goes both ways, as on master (e51179a4e098). A value is read and written within its
+  0; a 32-bit one goes both ways, as on master (e51179a4e098). A 64-bit
+  `BPF_JEQ` or `BPF_JNE` of a lookup's result with such a pointer makes
+  that register, not its copies, a pointer to the value where the two are
+  equal (`mark_ptr_not_null_reg`). A value is read and written within its
   size ("invalid access to map value", `EACCES`), not written when the
   map has `BPF_F_RDONLY_PROG` and not read when it has
   `BPF_F_WRONLY_PROG` (`EACCES`). The program keeps the maps it uses.

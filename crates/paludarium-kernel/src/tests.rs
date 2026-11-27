@@ -11924,6 +11924,32 @@ mod madvise_advice {
         assert_eq!(status(&mut f, AREA), -2);
     }
     #[test]
+    fn thp_disable_is_the_spaces_and_refuses_a_collapse_only_completely() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        const HUGE: u64 = 2 << 20;
+        const BASE: u64 = 0x4000_0000;
+        assert_eq!(f.ret(157, &[42, 0, 0, 0, 0]), 0); // PR_GET_THP_DISABLE
+        assert_eq!(f.ret(157, &[42, 1, 0, 0, 0]), errno(Errno::EINVAL));
+        // Flags only when disabling, and only PR_THP_DISABLE_EXCEPT_ADVISED.
+        assert_eq!(f.ret(157, &[41, 0, 2, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(157, &[41, 1, 4, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(157, &[41, 1, 0, 1, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(157, &[41, 7, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[42, 0, 0, 0, 0]), 1);
+        assert_eq!(f.mem.thp_disable(), paludarium_mmu::ThpDisable::Completely);
+        assert_eq!(f.ret(mmap, &[BASE, HUGE, 3, 0x32, u64::MAX, 0]), BASE);
+        f.mem.write(GuestAddr(BASE), &[1]).unwrap();
+        assert_eq!(f.ret(28, &[BASE, HUGE, 25]), errno(Errno::EINVAL));
+        // A forced collapse is advice enough where only unadvised VMAs
+        // have none.
+        assert_eq!(f.ret(157, &[41, 1, 2, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[42, 0, 0, 0, 0]), 3);
+        assert_eq!(f.ret(28, &[BASE, HUGE, 25]), 0);
+        assert_eq!(f.ret(157, &[41, 0, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[42, 0, 0, 0, 0]), 0);
+    }
+    #[test]
     fn collapse_takes_written_private_anonymous_memory_an_extent_at_a_time() {
         let mut f = fixture();
         let mmap = syscalls::nr::MMAP;

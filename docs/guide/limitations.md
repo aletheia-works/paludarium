@@ -173,9 +173,7 @@ verified.
   those as `voluntary_ctxt_switches` and 0 as `nonvoluntary_ctxt_switches`,
   and `getrusage` and a wait's rusage as `ru_nvcsw` and 0 as `ru_nivcsw`.
   `status` has no `VmPin` or `VmPTE`, as nothing counts the pages pinned
-  (`pinned_vm`) or the bytes of the page tables, and none of the lines
-  Linux writes after the memory ones (`CoreDumping`, `THP_enabled`,
-  `untag_mask`).
+  (`pinned_vm`) or the bytes of the page tables.
   Another process's thread is `S (sleeping)` in every wait, where Linux shows
   some waits it cannot interrupt as `D (disk sleep)`. A thread shows another
   process what it published at its last system call or signal check, so a mask

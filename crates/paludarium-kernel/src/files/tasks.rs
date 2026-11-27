@@ -349,6 +349,13 @@ fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<
             memory: task
                 .memory()
                 .and_then(|memory| crate::proc::status_memory(memory, task.code())),
+            space_flags: task
+                .memory()
+                .and_then(paludarium_mmu::MemoryView::thp_disable)
+                .map(|thp| crate::proc::SpaceFlags {
+                    core_dumping: task.view.group.dumping_core(),
+                    thp_enabled: thp != paludarium_mmu::ThpDisable::Completely,
+                }),
             threads: task.threads(),
             // The task's own, the leader's for the process.
             switches: task

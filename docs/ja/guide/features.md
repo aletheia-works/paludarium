@@ -1016,7 +1016,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `io_uring` のリング、ヒュージページ、vDSO のデータは、どちらの指定も受け付けません
   （`EINVAL`）。
   `MADV_COLLAPSE` は、Linux の `madvise_collapse` と同じく VMA ごとにプライベートな
-  anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA、
+  anonymous メモリと shmem のページキャッシュをまとめます。`MADV_NOHUGEPAGE` の VMA や
+  `PR_SET_THP_DISABLE` がすべての VMA で止めた空間の VMA、
   揃った 2 MiB の区間が入らない VMA、どのページも書かれていないプライベートな
   anonymous の VMA、アドレスとファイルのオフセットが 2 MiB 単位で揃っていない shmem の
   VMA、通常のファイルのマッピングは断り（`EINVAL`）、そのうえで揃った区間をまるごと
@@ -3766,7 +3767,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`RssAnon`、`RssFile`、`RssShmem`）、書き込めるプライベートなマップとスタック（`VmData`、
   `VmStk`）、コードの範囲とそのほかの実行できるマップ（`VmExe`、`VmLib`）です。スワップ
   アウトするものはなく、ヒュージページのプールは空なので、`VmSwap` と `HugetlbPages` は
-  0 です。`VmPin`、`VmPTE` と CPU の項目は、何も数えていないのでありません。大きさの
+  0 です。タスクにメモリーがある間は、そのあとに `CoreDumping`（プロセスのコアを書く
+  致命的なシグナルから、最後のスレッドが書き終えるまで 1）、`THP_enabled`（
+  `PR_SET_THP_DISABLE` が空間全体の透過的ヒュージページを止めると 0）、`untag_mask`
+  （線形アドレスのマスクを有効にするものがないので、すべてのビットが 1）が続きます。
+  `VmPin`、`VmPTE` と CPU の項目は、何も数えていないのでありません。大きさの
   最大値は Linux の `hiwater_vm` です。`vms_complete_munmap_vmas` が `update_hiwater_vm`
   を呼ぶのと同じく、アンマップがマップされたページを取り除くときに記録します。それを置き換える
   固定のマップは、そのあとで自分のページを数えます。`mremap` がページを
@@ -5738,6 +5743,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかに名前を付けてから `ENOMEM` です。`/proc/<pid>/maps` と `smaps` はこれを
   `[anon:<名前>]`、共有の無名メモリでは `[anon_shmem:<名前>]` と示し、ヒープとスタックは
   それぞれの名前のままです。名前の違う VMA はまとまらず、`fork` した子も名前を保ちます。
+  `PR_SET_THP_DISABLE` と `PR_GET_THP_DISABLE` は、Linux の `MMF_DISABLE_THP_*` と同じく
+  アドレス空間のもので、スレッドは共有し、`fork` した子と `execve` は保ちます。2 番目の
+  引数が 0 でなければ透過的ヒュージページを止め、3 番目が
+  `PR_THP_DISABLE_EXCEPT_ADVISED`（2）なら `MADV_HUGEPAGE` が求めていないところだけを
+  止めます。フラグなしの 0 でふたたび使えるようにします（ほかのフラグ、使えるようにする
+  ときのフラグ、4 番目か 5 番目の引数は `EINVAL`）。`PR_GET_THP_DISABLE` は引数を取らず
+  （`EINVAL`）、0、1、または求めたメモリーを除く種類なら 3 を返します。すべての VMA で
+  止めたときは、Linux の `vma_thp_disabled` と同じく `MADV_COLLAPSE` を断ります（`EINVAL`）。
+  ほかに変わるものはありません。どちらでも、Linux と同じくヒュージページが入るところに
+  マップを置くためです。
   ほかの指定には `EINVAL` を返します。
 
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって

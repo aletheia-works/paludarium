@@ -2974,6 +2974,38 @@ impl Kernel {
                     a[2],
                 );
             }
+            // PR_GET_THP_DISABLE, PR_SET_THP_DISABLE, of the address space
+            // (`prctl_get_thp_disable`, `prctl_set_thp_disable`): 1, with
+            // PR_THP_DISABLE_EXCEPT_ADVISED (2) for that kind, when disabled.
+            42 => {
+                if a[1..5].iter().any(|&arg| arg != 0) {
+                    return Err(Errno::EINVAL);
+                }
+                return Ok(match mem.thp_disable() {
+                    paludarium_mmu::ThpDisable::No => 0,
+                    paludarium_mmu::ThpDisable::Completely => 1,
+                    paludarium_mmu::ThpDisable::ExceptAdvised => 3,
+                });
+            }
+            41 => {
+                const EXCEPT_ADVISED: u64 = 2;
+                let (disable, flags) = (a[1] != 0, a[2]);
+                if a[3] != 0
+                    || a[4] != 0
+                    || (!disable && flags != 0)
+                    || flags & !EXCEPT_ADVISED != 0
+                {
+                    return Err(Errno::EINVAL);
+                }
+                mem.set_thp_disable(if !disable {
+                    paludarium_mmu::ThpDisable::No
+                } else if flags == EXCEPT_ADVISED {
+                    paludarium_mmu::ThpDisable::ExceptAdvised
+                } else {
+                    paludarium_mmu::ThpDisable::Completely
+                });
+                return Ok(0);
+            }
             _ => {}
         }
         match self
@@ -5211,6 +5243,8 @@ impl Kernel {
         };
         // `mm_init` takes the core dump filter from the old `mm`.
         memory.set_dump_filter(mem.dump_filter());
+        // And `PR_SET_THP_DISABLE`'s flags (`MMF_INIT_LEGACY_MASK`).
+        memory.set_thp_disable(mem.thp_disable());
         // An exec that fails from here closes the program before the
         // interpreter it opened: `free_bprm`'s `fput` comes after
         // `load_elf_binary`'s, and runs first.

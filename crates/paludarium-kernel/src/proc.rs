@@ -1004,6 +1004,10 @@ pub(crate) struct Status<'a> {
     /// Its memory's fields, which a process that no longer has its memory
     /// does not show.
     pub memory: Option<StatusMemory>,
+    /// The lines Linux writes after those while the task has its memory:
+    /// whether its process is dumping core and whether its space allows
+    /// transparent huge pages.
+    pub space_flags: Option<SpaceFlags>,
     pub threads: usize,
     /// The times the task went to sleep (Linux's `nvcsw`): nothing
     /// preempts a guest thread, so its involuntary switches are 0.
@@ -1020,6 +1024,14 @@ pub(crate) struct Status<'a> {
     pub credentials: &'a crate::credentials::Credentials,
     /// The reader's user namespace, which the IDs are shown in.
     pub reader: &'a crate::namespaces::Namespace,
+}
+/// [`Status::space_flags`]: `CoreDumping` (Linux's `signal->core_state`)
+/// and `THP_enabled` (no `MMF_DISABLE_THP_COMPLETELY`, as the CI runners'
+/// kernels have `CONFIG_TRANSPARENT_HUGEPAGE`).
+#[derive(Clone, Copy)]
+pub(crate) struct SpaceFlags {
+    pub core_dumping: bool,
+    pub thp_enabled: bool,
 }
 /// `/proc/<pid>/status` in Linux's field order. Of the memory fields
 /// `VmPin` and `VmPTE` are not there ([`status_memory_lines`]), and none of
@@ -1071,10 +1083,20 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         .memory
         .as_ref()
         .map_or_else(String::new, status_memory_lines);
+    // `untag_mask` is all ones: no `ARCH_ENABLE_TAGGED_ADDR` (LAM) is
+    // there to clear bits of it.
+    let space_flags = s.space_flags.map_or_else(String::new, |flags| {
+        format!(
+            "CoreDumping:\t{}\nTHP_enabled:\t{}\nuntag_mask:\t{:#x}\n",
+            u8::from(flags.core_dumping),
+            u8::from(flags.thp_enabled),
+            u64::MAX,
+        )
+    });
     format!(
         "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
          Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
-         FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}{memory}Threads:\t{}\nSigQ:\t{}/{}\n\
+         FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}{memory}{space_flags}Threads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
          CapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n\
@@ -3147,6 +3169,10 @@ mod tests {
                 exec: 4,
                 code: (0x40_1000, 0x40_2abc),
             }),
+            space_flags: Some(SpaceFlags {
+                core_dumping: true,
+                thp_enabled: false,
+            }),
             threads: 2,
             switches: 7,
             queued: 1,
@@ -3191,7 +3217,8 @@ mod tests {
              VmLck:\t      12 kB\nVmHWM:\t      36 kB\nVmRSS:\t      20 kB\n\
              RssAnon:\t       8 kB\nRssFile:\t       8 kB\nRssShmem:\t       4 kB\n\
              VmData:\t      24 kB\nVmStk:\t       8 kB\nVmExe:\t       8 kB\n\
-             VmLib:\t       8 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nThreads:",
+             VmLib:\t       8 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\n\
+             CoreDumping:\t1\nTHP_enabled:\t0\nuntag_mask:\t0xffffffffffffffff\nThreads:",
             "CapInh:\t0000000000000042\n",
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",

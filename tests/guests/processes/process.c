@@ -22514,6 +22514,117 @@ static int proc_oom_case(void) {
     return 0;
 }
 
+/* The status-space case: the lines status has while the task has its
+   memory (CoreDumping, THP_enabled, untag_mask). PR_SET_THP_DISABLE (41)
+   changes THP_enabled for the whole space, which a thread shares and a fork
+   and an exec keep; it then refuses MADV_COLLAPSE (25), and a zombie, which
+   has no memory, shows none of the lines. */
+static void ss_field(const char *path, const char *name, char *out, size_t size) {
+    snprintf(out, size, "missing");
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(out, size, "open-%d", errno);
+        return;
+    }
+    char line[256];
+    size_t len = strlen(name);
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, name, len) && line[len] == ':') {
+            char *v = line + len + 1;
+            while (*v == '\t' || *v == ' ') v++;
+            v[strcspn(v, "\n")] = 0;
+            snprintf(out, size, "%s", v);
+            break;
+        }
+    }
+    fclose(f);
+}
+static void ss_show(const char *label, const char *path) {
+    const char *names[] = {"CoreDumping", "THP_enabled", "untag_mask"};
+    printf("%s:", label);
+    for (int i = 0; i < 3; i++) {
+        char v[64];
+        ss_field(path, names[i], v, sizeof v);
+        printf(" %s=%s", names[i], v);
+    }
+    printf("\n");
+}
+static void *ss_thread(void *arg) {
+    (void)arg;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/status", (long)syscall(SYS_gettid));
+    ss_show("thread", path);
+    printf("thread get: %d\n", prctl(42, 0, 0, 0, 0));
+    return NULL;
+}
+static void ss_try(const char *label, long arg2, long arg3, long arg4) {
+    errno = 0;
+    int r = prctl(41, arg2, arg3, arg4, 0);
+    printf("%s: %d errno=%d\n", label, r, errno);
+}
+static int status_space_case(const char *self, char **argv) {
+    if (argv[3] && !strcmp(argv[3], "show")) {
+        ss_show("exec", "/proc/self/status");
+        printf("exec get: %d\n", prctl(42, 0, 0, 0, 0));
+        return 0;
+    }
+    ss_show("default", "/proc/self/status");
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    errno = 0;
+    int r = prctl(42, 1, 0, 0, 0);
+    printf("get with an argument: %d errno=%d\n", r, errno);
+    ss_try("enable with a flag", 0, 2, 0);
+    ss_try("unknown flag", 1, 4, 0);
+    ss_try("fourth argument", 1, 0, 1);
+    ss_try("disable", 7, 0, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("disabled", "/proc/self/status");
+    pthread_t t;
+    if (pthread_create(&t, NULL, ss_thread, NULL)) return 80;
+    pthread_join(t, NULL);
+    long huge = 2L << 20;
+    char *area = mmap(NULL, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 81;
+    char *aligned = (char *)(((unsigned long)area + huge - 1) & ~(unsigned long)(huge - 1));
+    aligned[0] = 1;
+    errno = 0;
+    r = madvise(aligned, huge, 25);
+    printf("collapse: %d errno=%d\n", r, errno);
+    ss_try("except advised", 1, 2, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("except advised", "/proc/self/status");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ss_show("child", "/proc/self/status");
+        printf("child get: %d\n", prctl(42, 0, 0, 0, 0));
+        fflush(stdout);
+        execl(self, self, "status-space", self, "show", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(child, NULL, 0);
+    ss_try("disable again", 1, 0, 0);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        execl(self, self, "status-space", self, "show", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(child, NULL, 0);
+    pid_t zombie = fork();
+    if (zombie == 0) _exit(0);
+    siginfo_t info;
+    if (waitid(P_PID, zombie, &info, WEXITED | WNOWAIT)) return 82;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", zombie);
+    ss_show("zombie", path);
+    waitpid(zombie, NULL, 0);
+    ss_try("enable", 0, 0, 0);
+    printf("get: %d\n", prctl(42, 0, 0, 0, 0));
+    ss_show("enabled", "/proc/self/status");
+    return 0;
+}
+
 /* The core-filter case: /proc/<pid>/coredump_filter shows the filter bits
    of the process's memory in 8 hex digits, 0x33 at first; a write sets
    the low 9 bits of what kstrtouint reads in the base its prefix gives (no
@@ -44600,6 +44711,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userns-nondumpable-target")) return userns_nondumpable_target();
     if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
+    if (!strcmp(mode, "status-space")) return status_space_case(self, argv);
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "segment-registers")) return segments_case();

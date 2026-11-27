@@ -1139,7 +1139,8 @@ kernel.
   neither advice (`EINVAL`).
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
-  `MADV_NOHUGEPAGE`, one with no room for an aligned 2 MiB extent, a
+  `MADV_NOHUGEPAGE` or in a space that `PR_SET_THP_DISABLE` disabled for
+  every VMA, one with no room for an aligned 2 MiB extent, a
   private anonymous one no page of which was written, a shmem one whose
   addresses and file offsets are not 2 MiB aligned to each other, and a
   regular file's mapping refuse it (`EINVAL`), and a range with no whole
@@ -4388,8 +4389,13 @@ kernel.
   `RssShmem`), the private writable mappings and the stack (`VmData`,
   `VmStk`), the code range and the other executable mappings (`VmExe`,
   `VmLib`), and 0 for `VmSwap` and `HugetlbPages`, as nothing is swapped
-  out and the pool of huge pages is empty. `VmPin`, `VmPTE` and the CPU
-  fields are not there, as nothing counts them. The peak of the size is
+  out and the pool of huge pages is empty. After them, while the task has
+  its memory, come `CoreDumping` (1 from the fatal signal that dumps its
+  process's core until the last thread has written it), `THP_enabled` (0
+  once `PR_SET_THP_DISABLE` disabled transparent huge pages for the whole
+  space) and `untag_mask`, all ones as nothing enables linear address
+  masking. `VmPin`, `VmPTE` and the CPU fields are not there, as nothing
+  counts them. The peak of the size is
   Linux's `hiwater_vm`: noted when an unmap takes mapped pages away, as
   `vms_complete_munmap_vmas` calls `update_hiwater_vm` (a fixed mapping
   that replaces them counts its own pages only after it), but not when
@@ -6723,6 +6729,18 @@ kernel.
   and `smaps` show it as `[anon:<name>]`, and as `[anon_shmem:<name>]` for
   shared anonymous memory, the heap and the stack keeping their own names;
   VMAs of different names do not merge, and a `fork`ed child keeps them.
+  `PR_SET_THP_DISABLE` and `PR_GET_THP_DISABLE` are of the address space,
+  which a thread shares and a `fork`ed child and an `execve` keep, as
+  Linux's `MMF_DISABLE_THP_*` flags: a nonzero second argument disables
+  transparent huge pages, with `PR_THP_DISABLE_EXCEPT_ADVISED` (2) as the
+  third only where `MADV_HUGEPAGE` did not ask for them, and 0 with no flag
+  enables them again (`EINVAL` for another flag, a flag when enabling, or a
+  fourth or fifth argument). `PR_GET_THP_DISABLE` takes no argument
+  (`EINVAL`) and gives 0, 1, or 3 for the kind that excepts advised
+  memory. Disabled for every VMA, `MADV_COLLAPSE` is refused (`EINVAL`),
+  as Linux's `vma_thp_disabled` decides; nothing else changes, as the
+  emulator places a mapping where a huge page would fit either way, as
+  Linux does.
   Other options give `EINVAL`.
 
 - When a process exits, its children go to the nearest ancestor that set

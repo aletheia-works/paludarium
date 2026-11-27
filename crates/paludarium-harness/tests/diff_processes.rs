@@ -997,6 +997,7 @@ mod linux {
         processes_pipe_size => ("pipe-size","process"),
         processes_poll => ("poll","process"),
         processes_proc_status => ("proc-status","process"),
+        processes_status_space => ("status-space","process"),
         processes_credentials => ("credentials","process"),
         processes_permissions => ("permissions","process"),
         processes_setuid => ("setuid","process"),

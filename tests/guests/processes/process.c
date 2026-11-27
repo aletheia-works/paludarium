@@ -12884,6 +12884,94 @@ static int io_uring_multishot_case(void) {
     sqe[1] = 1 << 5;
     sqe[40] = 4;
     um_run(&u, 1, 1, "message-overflow");
+
+    /* Sends: of iovecs (IORING_SEND_VECTORIZED), of the buffers they select,
+       a provided one whole and a ring's cut to the length, and bundles,
+       which take as many as their length needs and go on once they posted,
+       until they took the last there was. */
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp)) return 84;
+    char sout[16] = "abcdefghijkl", sin[32];
+    struct iovec siov[2] = {{sout, 3}, {sout + 8, 2}};
+    unet_push(&u, 26, 1, sp[0], 0, (long)siov, 2, 0, 32);
+    um_run(&u, 1, 1, "send-vectored");
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    unet_push(&u, 26, 1, sp[0], 0, (long)siov, 1025, 0, 32);
+    um_run(&u, 1, 1, "send-vectored-many");
+    unet_push(&u, 9, 1, sp[0], 0, (long)&mh, 0, 0, 16);
+    um_run(&u, 1, 1, "sendmsg-bundle");
+    unsigned short sgroup = 7;
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 3, 0, 0);
+    sqe[1] = 1 << 5;
+    memcpy(sqe + 40, &sgroup, 2);
+    um_run(&u, 1, 1, "send-select-none");
+    memcpy(unet_push(&u, 31, 99, 1, 3, (long)sout, 6, 0, 0) + 40, &sgroup, 2);
+    um_run(&u, 1, 1, "send-provide");
+    for (int i = 0; i < 2; i++) {
+        sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 3, 0, 0);
+        sqe[1] = 1 << 5;
+        memcpy(sqe + 40, &sgroup, 2);
+        um_run(&u, 1, 1, i ? "send-select-empty" : "send-select-provided");
+    }
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    unsigned char *sring = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (sring == MAP_FAILED) return 85;
+    for (int g = 1; g <= 2; g++) {
+        unsigned char reg[40] = {0};
+        unsigned long at = (unsigned long)sring + 4096 * (g - 1);
+        unsigned entries = g == 1 ? 4 : 1;
+        unsigned short bgid = g, flags = g == 1 ? 0 : 2;
+        memcpy(reg, &at, 8);
+        memcpy(reg + 8, &entries, 4);
+        memcpy(reg + 12, &bgid, 2);
+        memcpy(reg + 14, &flags, 2);
+        uring_show("send-ring", syscall(427, u.fd, 22, reg, 1));
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned char *e = sring + 16 * i;
+        unsigned long a = (unsigned long)sout + 4 * (i % 3);
+        unsigned len = 4;
+        unsigned short bid = 10 + i;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+    }
+    __atomic_store_n((unsigned short *)(sring + 14), 1, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 3, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 1;
+    um_run(&u, 1, 1, "send-select-ring");
+    printf("entry %u\n", *(unsigned *)(sring + 8));
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    __atomic_store_n((unsigned short *)(sring + 14), 4, __ATOMIC_RELEASE);
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 8, 0, 16);
+    sqe[1] = 1 << 5;
+    sqe[40] = 1;
+    um_run(&u, 1, 1, "send-bundle");
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    {
+        unsigned char *e = sring + 4096;
+        unsigned long a = (unsigned long)sout;
+        unsigned len = 10;
+        unsigned short bid = 9;
+        memcpy(e, &a, 8);
+        memcpy(e + 8, &len, 4);
+        memcpy(e + 12, &bid, 2);
+        __atomic_store_n((unsigned short *)(e + 14), 1, __ATOMIC_RELEASE);
+    }
+    sqe = unet_push(&u, 26, 1, sp[0], 0, 0, 4, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 2;
+    um_run(&u, 1, 1, "send-select-inc");
+    printf("entry +%ld %u\n", (long)(*(unsigned long *)(sring + 4096) - (unsigned long)sout),
+           *(unsigned *)(sring + 4096 + 8));
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    unet_push(&u, 26, 1, sp[0], 0, (long)sout, 5, 0, 16);
+    um_run(&u, 1, 1, "send-bundle-plain");
+    printf("read %.*s\n", (int)read(sp[1], sin, sizeof sin), sin);
+    close(sp[0]);
+    close(sp[1]);
     close(gram[0]);
     close(gram[1]);
     close(first);

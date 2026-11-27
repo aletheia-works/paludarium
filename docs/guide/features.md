@@ -2166,7 +2166,21 @@ kernel.
   again once the socket is ready, unless it asked not to (`MSG_DONTWAIT`,
   `IORING_ACCEPT_DONTWAIT`), when it completes with `EAGAIN`.
   `IORING_RECVSEND_POLL_FIRST` and `IORING_ACCEPT_POLL_FIRST` wait first.
-  A send adds `MSG_NOSIGNAL`. With `MSG_WAITALL`, a stream or
+  A send adds `MSG_NOSIGNAL`. With `IORING_SEND_VECTORIZED` it sends the
+  iovecs at its address, as many as its length says, which it reads as it
+  is prepared (`io_net_import_vec`). With `IOSQE_BUFFER_SELECT` it sends
+  from the buffers it selects as it first runs, and keeps them while it
+  waits (`io_buffers_select`): a group it does not find is `ENOENT`, one
+  with none left `ENOBUFS`. A provided buffer goes whole, whatever the
+  length; a ring's is cut to the length, and so is its entry unless the
+  ring has `IOU_PBUF_RING_INC`. Its completion names the first, as a
+  read's does, and so does one that fails. With `IORING_RECVSEND_BUNDLE` a
+  send sends all it has (`MSG_WAITALL`), and one that selects takes as
+  many of a ring's buffers as its length needs, at most 256. A bundle that
+  sent anything posts with `IORING_CQE_F_MORE` and sends again at once,
+  with no length and new buffers, until it sends nothing, takes its
+  group's last buffers or waited (`io_send_finish`); one that selects none
+  sends nothing the second time. With `MSG_WAITALL`, a stream or
   sequenced-packet socket's send or receive goes on to its whole length
   and gives all it moved; one that fails on the way, as it asked not to
   wait or was cancelled, gives what it moved too (`io_sendrecv_fail`). A

@@ -1800,6 +1800,128 @@ fn select(
     }
 }
 
+/// The buffers a send with `IOSQE_BUFFER_SELECT` sends from
+/// (`io_buffers_select`), which it keeps until it completes: the first's
+/// ID, their bytes, whether a ring's last was left in part
+/// (`REQ_F_BUF_MORE`) and whether the group has none left
+/// (`REQ_F_BL_EMPTY`).
+pub(super) struct Picked {
+    pub(super) bid: u16,
+    pub(super) pieces: Vec<(u64, usize)>,
+    pub(super) more: bool,
+    pub(super) emptied: bool,
+}
+
+impl Picked {
+    /// The completion's flags (`io_put_kbufs`): `IORING_CQE_F_BUFFER` and
+    /// the first buffer's ID, and `IORING_CQE_F_BUF_MORE` for a ring's left
+    /// in part.
+    pub(super) fn flags(&self) -> u32 {
+        let flags = CQE_F_BUFFER | u32::from(self.bid) << CQE_BUFFER_SHIFT;
+        if self.more {
+            flags | CQE_F_BUF_MORE
+        } else {
+            flags
+        }
+    }
+}
+
+/// The buffers of group `bgid` a send of `len` bytes (0 for any) takes, as
+/// `io_buffers_select` chooses them: no group is `ENOENT`, and one with none
+/// left `ENOBUFS`.
+///
+/// - Provided buffers: the first goes from the group, whole, whatever
+///   `len` is (`io_provided_buffers_select`).
+/// - A ring: from its head, one, or with `bundle` as many as there are, at
+///   most 256 and no more than `len` needs at the first's length
+///   (`io_ring_buffers_peek`). The last is cut to the bytes left; a ring
+///   without `IOU_PBUF_RING_INC` then has the first's entry cut too, or
+///   stops before any later one. They are used at once (`io_kbuf_commit`),
+///   all of them, or with `IOU_PBUF_RING_INC` the bytes taken; the group
+///   counts as emptied when the peek took every buffer there was without
+///   running out of bytes first.
+pub(super) fn select_send(
+    c: &Context<'_>,
+    ring: &Ring,
+    bgid: u16,
+    len: u32,
+    bundle: bool,
+) -> Result<Picked, Errno> {
+    let mut lists = ring
+        .buffer_lists
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match lists.get_mut(&bgid) {
+        None => Err(Errno::ENOENT),
+        Some(BufferList::Provided(list)) => {
+            let buffer = list.pop_front().ok_or(ENOBUFS)?;
+            Ok(Picked {
+                bid: buffer.bid,
+                pieces: vec![(buffer.addr, buffer.len as usize)],
+                more: false,
+                emptied: list.is_empty(),
+            })
+        }
+        Some(BufferList::Ring(buffers)) => {
+            let tail = buffers.tail(c)?;
+            let start = buffers.head;
+            let mut avail = u32::from(tail.wrapping_sub(start)).min(1024);
+            if avail == 0 {
+                return Err(ENOBUFS);
+            }
+            let mut max = if len == 0 { i32::MAX as u32 } else { len };
+            let (_, first, bid) = buffers.entry(c, start)?;
+            if first == 0 {
+                return Err(ENOBUFS);
+            }
+            let needed = max.div_ceil(first).min(256);
+            avail = avail.min(needed);
+            let mut count = if bundle { avail } else { 1 };
+            let mut head = start;
+            let mut pieces = Vec::new();
+            let mut taken = 0u32;
+            loop {
+                let (addr, mut size, _) = buffers.entry(c, head)?;
+                if size > max {
+                    size = max;
+                    if !buffers.incremental {
+                        if !pieces.is_empty() {
+                            break;
+                        }
+                        let at = 16 * u64::from(head & buffers.mask) + 8;
+                        buffers.store(c, at, &size.to_le_bytes())?;
+                    }
+                }
+                pieces.push((addr, size as usize));
+                taken += size;
+                max -= size;
+                if max == 0 {
+                    break;
+                }
+                head = head.wrapping_add(1);
+                count -= 1;
+                if count == 0 {
+                    break;
+                }
+            }
+            let emptied = head == tail;
+            let used = pieces.len() as u16;
+            let more = if buffers.incremental {
+                !buffers.commit(c, taken)?
+            } else {
+                buffers.head = start.wrapping_add(used);
+                false
+            };
+            Ok(Picked {
+                bid,
+                pieces,
+                more,
+                emptied,
+            })
+        }
+    }
+}
+
 /// What becomes of a selected buffer once its read ended, and the
 /// completion's flags, as `io_put_kbuf` and `io_kbuf_recycle` leave them:
 /// a provided buffer is used, and so is a ring's that was used at
@@ -2511,7 +2633,8 @@ fn run_terminated(polls: &Polls, ring: &Ring, work: Deferred) {
 }
 
 /// `io_req_defer_failed`: the first request of `chain` fails with `e`,
-/// using a provided buffer it kept (`io_put_kbuf`), and so does its link. A
+/// using a provided buffer it kept, or a send the buffers it selected
+/// (`io_put_kbuf`), and so does its link. A
 /// socket's gives what it moved instead ([`net::failed`]).
 fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
     let request = chain.remove(0);
@@ -2519,6 +2642,7 @@ fn fail_request(ring: &Ring, mut chain: Vec<Request>, e: Errno) {
         Work::Transfer(transfer) => transfer.kept.map_or(0, |kept| {
             CQE_F_BUFFER | u32::from(kept.bid) << CQE_BUFFER_SHIFT
         }),
+        Work::Net(net) => net::kept(net),
         _ => 0,
     };
     let res = match &request.work {

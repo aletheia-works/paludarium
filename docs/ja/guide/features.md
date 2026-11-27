@@ -1881,7 +1881,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EAGAIN`、または進行中の接続）は、見つけたファイルを持ったままソケットを待ち、ソケットの
   準備ができるともう一度実行します。ただし待たないように頼んだもの（`MSG_DONTWAIT`、
   `IORING_ACCEPT_DONTWAIT`）は `EAGAIN` で完了します。`IORING_RECVSEND_POLL_FIRST` と
-  `IORING_ACCEPT_POLL_FIRST` は先に待ちます。送信は `MSG_NOSIGNAL` を加えます。`MSG_WAITALL` では、
+  `IORING_ACCEPT_POLL_FIRST` は先に待ちます。送信は `MSG_NOSIGNAL` を加えます。
+  `IORING_SEND_VECTORIZED` では、アドレスにある iovec を長さの数だけ送り、iovec は準備のときに
+  読みます（`io_net_import_vec`）。`IOSQE_BUFFER_SELECT` では、最初に実行するときに選んだバッファーから送り、
+  待つあいだも持ち続けます（`io_buffers_select`）。見つからないグループは `ENOENT`、残りのないグループは
+  `ENOBUFS` です。提供されたバッファーは長さにかかわらず丸ごと送り、リングのバッファーは長さに切り詰め、
+  リングが `IOU_PBUF_RING_INC` でなければそのエントリーも切り詰めます。完了は、読み込みと同じく
+  最初のバッファーを示し、失敗した完了も同じです。`IORING_RECVSEND_BUNDLE` の送信はあるものを
+  すべて送り（`MSG_WAITALL`）、バッファーを選ぶものは長さに要るだけのリングのバッファーを、最大 256 個
+  取ります。何か送ったバンドルは `IORING_CQE_F_MORE` 付きで投稿して、長さなしの新しいバッファーで
+  すぐにまた送り、何も送らなくなるか、グループの最後のバッファーを取るか、待ったところで終わります
+  （`io_send_finish`）。バッファーを選ばないものは、2 度目には何も送りません。`MSG_WAITALL` では、
   ストリームまたは順序付きパケットのソケットの送受信は長さ全体まで続け、動かした分をすべて
   返します。途中で失敗したもの（待たないように頼んだものや、取り消されたもの）も、それまでに動かした分を
   返します（`io_sendrecv_fail`）。受信は提供されたバッファーを選べ（`ENOBUFS`）、そのバッファーは、Linux master の

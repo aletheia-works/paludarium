@@ -62,7 +62,7 @@ fn frequent_collisions_double_the_cache_and_keep_its_entries() {
 #[test]
 fn rare_collisions_leave_the_cache_as_it_is() {
     let mut cache = DecodeCache::new();
-    for i in 0..=GROWTH_WINDOW {
+    for i in 0..=Growth::window(INITIAL_ENTRIES) {
         for _ in 0..GROWTH_RATIO {
             cache.lookup();
         }
@@ -77,7 +77,7 @@ fn rare_collisions_leave_the_cache_as_it_is() {
 fn decodes_after_a_code_change_do_not_count() {
     let mut cache = DecodeCache::new();
     cache.lookup();
-    for generation in 0..=GROWTH_WINDOW {
+    for generation in 0..=Growth::window(INITIAL_ENTRIES) {
         cache.put(FIRST, generation, nop(FIRST));
     }
     cache.lookup();
@@ -90,14 +90,14 @@ fn other_addresses_left_from_before_a_code_change_do_not_count() {
     cache.lookup();
     // Each decode finds the other address in its slot, decoded under the
     // generation before.
-    for generation in 0..=GROWTH_WINDOW {
+    for generation in 0..=Growth::window(INITIAL_ENTRIES) {
         let rip = if generation % 2 == 0 { FIRST } else { SECOND };
         cache.put(rip, generation, nop(rip));
     }
     cache.lookup();
     assert_eq!(cache.slots.len(), INITIAL_ENTRIES);
     let mut cache = DecodeCache::new();
-    for generation in 0..=GROWTH_WINDOW + 1 {
+    for generation in 0..=Growth::window(INITIAL_ENTRIES) + 1 {
         let rip = if generation % 2 == 0 { FIRST } else { SECOND };
         assert!(cache.block(rip, generation, |code| lone(code, rip)).is_ok());
     }
@@ -138,7 +138,9 @@ fn the_interpreter_grows_the_cache_it_misses() {
         let block = block.map(|b| cache.code.instructions[b].to_vec());
         assert_eq!(block, Ok(vec![nop(rip)]));
     }
-    assert!(lookups > GROWTH_WINDOW);
+    assert!(lookups > Growth::window(INITIAL_ENTRIES));
+    // A quarter of the slots: before, it took 65536 at every size.
+    assert!(lookups < 2 * Growth::window(INITIAL_ENTRIES) + 2);
     assert_eq!(decodes.get(), lookups);
     assert_eq!(cache.slots.len(), INITIAL_ENTRIES * 2);
 }
@@ -183,6 +185,78 @@ fn a_cache_full_of_current_code_doubles_and_keeps_it() {
         assert_eq!(cache.slots.len(), INITIAL_ENTRIES * 2);
     }
     assert!(cache.code.len() <= cache.slots.len());
+}
+
+/// Compiled code that runs nothing.
+struct Stub;
+
+impl compile::CompiledBlock for Stub {
+    fn run(&self, _: &mut CpuState, _: &AddressSpace, _: u64) -> usize {
+        0
+    }
+
+    fn len(&self) -> usize {
+        1
+    }
+}
+
+#[test]
+fn a_full_cache_keeps_the_blocks_of_the_current_generation() {
+    let mut cache = DecodeCache::new();
+    // Copies of a thousand blocks of generation 1 fill the room, but for
+    // ten blocks of generation 2 and one more.
+    let mut rip = 0;
+    while cache.code.len() + MAX_BLOCK + 10 <= cache.slots.len() {
+        cache.put(rip % 1000, 1, nop(rip % 1000));
+        rip += 1;
+    }
+    let current: Vec<u64> = (5000..5010).collect();
+    for &rip in &current {
+        cache.put(rip, 2, nop(rip));
+    }
+    // One of each generation has compiled code.
+    let old: std::sync::Arc<dyn compile::CompiledBlock> = std::sync::Arc::new(Stub);
+    let new: std::sync::Arc<dyn compile::CompiledBlock> = std::sync::Arc::new(Stub);
+    cache.compiled = vec![old, new.clone()];
+    let slot = cache.slot(1);
+    cache.slots[slot].compiled = 1;
+    let slot = cache.slot(5003);
+    cache.slots[slot].compiled = 2;
+    assert_eq!(cache.code.len() + MAX_BLOCK, cache.slots.len() + 1);
+    cache.put(6000, 2, nop(6000));
+    assert_eq!(cache.slots.len(), INITIAL_ENTRIES);
+    assert_eq!(cache.code.len(), current.len() + 1);
+    for &rip in current.iter().chain(&[6000]) {
+        let found = cache.get_with_hint(rip, 2).map(|(_, i, _)| i);
+        assert_eq!(found, Some(nop(rip)), "{rip}");
+    }
+    assert!(cache.get_with_hint(1, 1).is_none());
+    assert_eq!(cache.compiled.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&cache.compiled[0], &new));
+    assert_eq!(cache.slots[cache.slot(5003)].compiled, 1);
+    assert_eq!(cache.slots[cache.slot(5004)].compiled, 0);
+}
+
+#[test]
+fn a_full_cache_mostly_of_current_code_at_its_limit_drops_it() {
+    let mut cache = DecodeCache::new();
+    while cache.slots.len() < MAX_ENTRIES {
+        cache.grow();
+    }
+    // More than half the room holds blocks of the current generation, each
+    // in a slot of its own; the rest, copies of one block from before.
+    let half = cache.slots.len() as u64 / 2;
+    for rip in 0..=half {
+        cache.put(rip, 2, nop(rip));
+    }
+    while cache.code.len() + MAX_BLOCK <= cache.slots.len() {
+        cache.put(half + 1, 1, nop(half + 1));
+    }
+    cache.put(half + 2, 2, nop(half + 2));
+    assert_eq!(cache.slots.len(), MAX_ENTRIES);
+    assert_eq!(cache.code.len(), 1);
+    assert!(cache.get_with_hint(0, 2).is_none());
+    assert!(cache.get_with_hint(half + 2, 2).is_some());
 }
 
 mod blocks {

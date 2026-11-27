@@ -70,10 +70,6 @@ const MAX_ENTRIES: usize = 1 << 17;
 #[cfg(target_family = "wasm")]
 const MAX_ENTRIES: usize = INITIAL_ENTRIES;
 
-/// A [`DecodeCache`] decides whether to grow after this many lookups have
-/// found another block in their slot.
-const GROWTH_WINDOW: u64 = 1 << 16;
-
 /// It doubles when more than one lookup in this many found another block
 /// of the current code generation in its slot. A block left from before a
 /// code change does not count, whatever its address: the lookup would miss
@@ -138,16 +134,27 @@ struct Growth {
 }
 
 impl Growth {
+    /// How many lookups that find another block in their slot make up a
+    /// window, after which a cache of `entries` slots decides whether to
+    /// grow: a quarter of its slots. With 65536 at every size, the
+    /// processes that a compiler driver such as gcc starts ended before
+    /// they could grow, though one decode in five found another block of
+    /// the same generation in its slot.
+    fn window(entries: usize) -> u64 {
+        entries as u64 / 4
+    }
+
     /// Counts a lookup that found another block in its slot of a cache of
     /// `entries` slots.
     #[cold]
     fn collided(&mut self, entries: usize) {
         self.collisions += 1;
-        if self.collisions < GROWTH_WINDOW {
+        let window = Self::window(entries);
+        if self.collisions < window {
             return;
         }
         let lookups = self.lookups.wrapping_sub(self.window_start);
-        self.pending = entries < MAX_ENTRIES && lookups < GROWTH_WINDOW * GROWTH_RATIO;
+        self.pending = entries < MAX_ENTRIES && lookups < window * GROWTH_RATIO;
         self.collisions = 0;
         self.window_start = self.lookups;
     }
@@ -361,10 +368,13 @@ impl DecodeCache {
 
     /// Makes room in [`Self::code`] for a block of up to [`MAX_BLOCK`]
     /// instructions decoded under `generation`: doubles the cache if the
-    /// blocks of `generation` fill more than half of it, and drops every
-    /// block otherwise. Nothing is copied, and the room is not allocated
-    /// again: a program that changes its code often, as SBCL does, fills the
-    /// room with blocks of earlier generations again and again.
+    /// blocks of `generation` fill more than half of it. Otherwise, while
+    /// they fill at most half, it keeps them and drops the blocks of earlier
+    /// generations ([`Self::keep_current`]); when they fill more, as they
+    /// can once the cache has grown to [`MAX_ENTRIES`], it drops every
+    /// block. The room is not allocated again: a program that changes its
+    /// code often, as SBCL does, fills the room with blocks of earlier
+    /// generations again and again.
     #[cold]
     #[inline(never)]
     fn make_room(&mut self, generation: u64) {
@@ -377,11 +387,61 @@ impl DecodeCache {
         if current > self.slots.len() / 2 && self.slots.len() < MAX_ENTRIES {
             self.grow();
         }
-        if self.code.len() + MAX_BLOCK > self.slots.len() {
+        if self.code.len() + MAX_BLOCK <= self.slots.len() {
+            return;
+        }
+        if current <= self.slots.len() / 2 {
+            self.keep_current(generation);
+        } else {
             self.slots.fill(Slot::default());
             self.code.clear();
             self.compiled.clear();
         }
+    }
+
+    /// Drops the blocks of other generations than `generation` and moves
+    /// the instructions of the others to the front of [`Self::code`], in
+    /// the order they were in, and their compiled code to the front of
+    /// [`Self::compiled`]. Before, a full cache dropped every block: when
+    /// the code generation moves often, as after the `mmap` calls of
+    /// PostgreSQL or Python, a block of the current generation then waited
+    /// again for [`compile::Compiler::threshold`] entries. Called
+    /// only while they fill at most half the room, so the copies take no
+    /// longer than the instructions decoded into the room it frees.
+    fn keep_current(&mut self, generation: u64) {
+        for s in &mut self.slots {
+            if s.len == 0 || s.generation != generation {
+                *s = Slot::default();
+            }
+        }
+        let mut kept: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| self.slots[i].len > 0)
+            .collect();
+        kept.sort_unstable_by_key(|&i| self.slots[i].start);
+        let mut compiled = Vec::new();
+        let mut to = 0;
+        for &i in &kept {
+            let range = self.slots[i].range();
+            let len = range.len();
+            // `to` never passes the start of a block: the blocks before it
+            // in the room are moved first and take no more than they did.
+            self.code.decoded.copy_within(range.clone(), to);
+            self.code.instructions.copy_within(range, to);
+            let s = &mut self.slots[i];
+            s.start = u32::try_from(to).unwrap_or(u32::MAX);
+            to += len;
+            if s.compiled != 0 && s.compiled != NOT_COMPILED {
+                match self.compiled.get(s.compiled as usize - 1) {
+                    Some(code) => {
+                        compiled.push(code.clone());
+                        s.compiled = u32::try_from(compiled.len()).unwrap_or(NOT_COMPILED);
+                    }
+                    None => s.compiled = 0,
+                }
+            }
+        }
+        self.code.truncate(to);
+        self.compiled = compiled;
     }
 
     /// Stores the block whose instructions `decode` appends to

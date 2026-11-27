@@ -35,6 +35,9 @@ struct Streams {
     /// Whether `--mount` may show host directories, as the native host
     /// shows them ([`RecordingHost::mount_host_directories`]).
     mounts: bool,
+    /// The signals the emulator started with ignored
+    /// ([`RecordingHost::start_ignoring`]).
+    ignored: u64,
     /// The NTP state [`Host::ntp_state`] gives in place of the machine's
     /// ([`RecordingHost::set_ntp_state`]).
     ntp: Option<Option<crate::NtpState>>,
@@ -60,6 +63,7 @@ impl Default for Streams {
             network: false,
             cpu_time: false,
             mounts: false,
+            ignored: 0,
             ntp: None,
             busy: None,
         }
@@ -200,6 +204,12 @@ impl RecordingHost {
     pub fn mount_host_directories(&self) {
         self.lock().mounts = true;
     }
+    /// Has the guest start with `signals` ignored (Linux numbers, bit
+    /// `n - 1` for signal `n`), as a native host started with them ignored
+    /// would.
+    pub fn start_ignoring(&self, signals: u64) {
+        self.lock().ignored = signals;
+    }
     /// Gives `state` as the real-time clock's NTP state (`None`: the host
     /// tells none) in place of the machine's.
     pub fn set_ntp_state(&self, state: Option<crate::NtpState>) {
@@ -265,6 +275,9 @@ impl Host for RecordingHost {
     }
     fn terminal_info(&self, stream: StreamId) -> Result<Option<TerminalInfo>, Errno> {
         Ok(self.lock().terminals[stream.index()])
+    }
+    fn ignored_signals(&self) -> u64 {
+        self.lock().ignored
     }
 
     fn clock(&self, clock: ClockId) -> Result<u64, Errno> {

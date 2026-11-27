@@ -556,6 +556,7 @@
     {"name":"port-access","binary":"process"},
     {"name":"timer-limits","binary":"process"},
     {"name":"cpu-sleep","binary":"process"},
+    {"name":"ignored-start","binary":"ignored-start"},
     {"name":"cpu-sleep-others","binary":"process"},
     {"name":"cpu-timer-others","binary":"process"},
     {"name":"mprotect-checks","binary":"process"},

@@ -1273,17 +1273,32 @@ impl Kernel {
     }
 
     /// Creates the initial thread for a loaded image: rip at the entry
-    /// point, rsp at the initial stack, everything else zero.
+    /// point, rsp at the initial stack, everything else zero, but for the
+    /// signals the host started the emulator with ignored, which stay
+    /// ignored as an `execve` keeps them (`flush_signal_handlers`).
     #[must_use]
     pub fn spawn_initial(&self, image: &LoadedImage) -> Thread {
         self.group
             .register(self.process.pid, Arc::clone(&self.inbox));
         self.group.set_program(image);
+        let ignored = self.host.ignored_signals() & !signals::unblockable();
+        let signal_actions: BTreeMap<i32, SignalAction> = (1..=64)
+            .filter(|n| ignored & (1u64 << (n - 1)) != 0)
+            .map(|n| {
+                let action = SignalAction {
+                    handler: signals::SIG_IGN,
+                    ..SignalAction::default()
+                };
+                self.group.set_action(n, action);
+                (n, action)
+            })
+            .collect();
         Thread {
             tid: self.process.pid,
             cpu: CpuState::new(image.entry_point, image.initial_stack_pointer),
             state: ThreadState {
                 pid: self.process.pid,
+                signal_actions,
                 ..ThreadState::default()
             },
         }

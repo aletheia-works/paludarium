@@ -1088,6 +1088,12 @@ verified.
   `CONFIG_HZ`.
   Capabilities are not checked here, so the options that need
   `CAP_NET_ADMIN` (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set as for root.
+- **Signals ignored at the start**: the first program starts with the
+  signals the emulator was started with ignored still ignored, but for
+  `SIGPIPE`, which starts at its default. Rust's runtime ignores `SIGPIPE`
+  in the emulator itself, so whether it came ignored can't be told. On Linux
+  a program started with `SIGPIPE` ignored keeps it ignored. In WebAssembly
+  no signal starts ignored.
 - **Signal-driven I/O**: the host's standard input, looked at every 10 ms,
   sends `SIGIO` once each time input comes where there was none, where
   Linux's pipe or terminal sends one for every piece of input. Standard

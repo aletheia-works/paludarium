@@ -7117,6 +7117,12 @@ one only with an `--allow-net`.
   does: a handled signal goes back to its default, and an ignored one stays
   ignored, with no flags or mask. `CLONE_CLEAR_SIGHAND` resets the child's
   actions the same way.
+- The first program starts with the signals the emulator was started with
+  ignored still ignored, as the `execve` that started it on Linux would leave
+  them. A job a shell starts in the background with `&` has `SIGINT` and
+  `SIGQUIT` ignored, for example. `SIGPIPE` is the exception: Rust's runtime
+  ignores it in the emulator itself, so it always starts at its default.
+  In WebAssembly no signal starts ignored.
 - The threads of a process share its signal dispositions, as Linux's
   `sighand_struct` does. A thread that was already waiting (in `epoll_wait`,
   `poll` or a `futex` wait, say) when another thread called `sigaction` takes

@@ -475,7 +475,18 @@ mod linux {
             } else {
                 TIMEOUT
             };
-            let native = if as_root && !running_as_root() {
+            // The ignored-start case starts with SIGINT and SIGQUIT ignored,
+            // as a shell's `&` job does: through `sh`'s `trap ''`, which
+            // `exec` keeps, natively, and from the host emulated.
+            let native = if mode == "ignored-start" {
+                let mut sh = vec![
+                    "-c".to_owned(),
+                    "trap '' INT QUIT; exec \"$0\" \"$@\"".to_owned(),
+                    self_path.clone(),
+                ];
+                sh.extend(args.iter().cloned());
+                run_native_within(std::path::Path::new("/bin/sh"), "sh", &sh, limit).unwrap()
+            } else if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
                 sudo.extend(args.iter().cloned());
                 run_native_within(std::path::Path::new("/usr/bin/sudo"), "sudo", &sudo, limit)
@@ -554,6 +565,9 @@ mod linux {
                 config
             };
             let host = Arc::new(RecordingHost::new());
+            if mode == "ignored-start" {
+                host.start_ignoring(1 << (2 - 1) | 1 << (3 - 1));
+            }
             // Its files must be on a host's file system, as the native run's
             // /tmp is, whose inodes go once nothing uses them (a tmpfs keeps
             // its own): a host directory of its own is the guest's /tmp, as
@@ -1206,6 +1220,7 @@ mod linux {
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),
         processes_cpu_sleep => ("cpu-sleep","process"),
+        processes_ignored_start => ("ignored-start","ignored-start"),
         processes_cpu_sleep_others => ("cpu-sleep-others","process"),
         processes_cpu_timer_others => ("cpu-timer-others","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),

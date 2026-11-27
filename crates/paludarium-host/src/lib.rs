@@ -323,6 +323,13 @@ pub trait Host: Send + Sync {
     fn output_signals(&self, _channel: u32) -> bool {
         false
     }
+    /// The signals the emulator itself started with ignored, as Linux
+    /// numbers (bit `n - 1` for signal `n`): what the guest's first program
+    /// keeps ignored, as Linux's `execve` keeps `SIG_IGN`
+    /// (`flush_signal_handlers`). None where the host cannot tell.
+    fn ignored_signals(&self) -> u64 {
+        0
+    }
     /// Whether a write to the host's standard output (`channel` 1) or
     /// standard error (2) would find room now; `None` where the host cannot
     /// tell.
@@ -586,6 +593,16 @@ impl Host for NativeHost {
         #[cfg(not(unix))]
         {
             None
+        }
+    }
+    fn ignored_signals(&self) -> u64 {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            native_ignored_signals()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            0
         }
     }
     fn stdin_signals(&self) -> bool {
@@ -920,3 +937,81 @@ mod macos_tests;
 mod threads_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod windows_tests;
+
+/// The host's signals and the Linux numbers they stand for, those a process
+/// can inherit ignored (not `SIGKILL` or `SIGSTOP`). `SIGPIPE` is not
+/// among them: Rust's runtime ignores it before `main` in every program, so
+/// whether the emulator was started with it ignored cannot be told.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const INHERITABLE: [(libc::c_int, u32); 26] = [
+    (libc::SIGHUP, 1),
+    (libc::SIGINT, 2),
+    (libc::SIGQUIT, 3),
+    (libc::SIGILL, 4),
+    (libc::SIGTRAP, 5),
+    (libc::SIGABRT, 6),
+    (libc::SIGBUS, 7),
+    (libc::SIGFPE, 8),
+    (libc::SIGUSR1, 10),
+    (libc::SIGSEGV, 11),
+    (libc::SIGUSR2, 12),
+    (libc::SIGALRM, 14),
+    (libc::SIGTERM, 15),
+    (libc::SIGCHLD, 17),
+    (libc::SIGCONT, 18),
+    (libc::SIGTSTP, 20),
+    (libc::SIGTTIN, 21),
+    (libc::SIGTTOU, 22),
+    (libc::SIGURG, 23),
+    (libc::SIGXCPU, 24),
+    (libc::SIGXFSZ, 25),
+    (libc::SIGVTALRM, 26),
+    (libc::SIGPROF, 27),
+    (libc::SIGWINCH, 28),
+    (libc::SIGIO, 29),
+    (libc::SIGSYS, 31),
+];
+
+/// Which of [`INHERITABLE`] this process has ignored now, as Linux numbers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn native_ignored_signals() -> u64 {
+    let mut ignored = 0;
+    // Linux's real-time signals, past the two its C library keeps.
+    #[cfg(target_os = "linux")]
+    let real_time = (libc::SIGRTMIN()..=libc::SIGRTMAX())
+        .filter_map(|n| u32::try_from(n).ok().map(|linux| (n, linux)));
+    #[cfg(target_os = "macos")]
+    let real_time = std::iter::empty();
+    for (host, linux) in INHERITABLE.into_iter().chain(real_time) {
+        // SAFETY: a query of the action alone, into a zeroed struct.
+        let handler = unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(host, std::ptr::null(), &mut old) != 0 {
+                continue;
+            }
+            old.sa_sigaction
+        };
+        if handler == libc::SIG_IGN {
+            ignored |= 1u64 << (linux - 1);
+        }
+    }
+    ignored
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod ignored_tests {
+    /// SIGURG, whose default is to discard it, so ignoring it a moment
+    /// changes nothing else the tests do.
+    #[test]
+    fn the_signals_ignored_now_are_given_by_linux_number() {
+        assert_eq!(super::native_ignored_signals() & 1 << (23 - 1), 0);
+        // SAFETY: SIG_IGN on SIGURG, then its old action back.
+        let old = unsafe { libc::signal(libc::SIGURG, libc::SIG_IGN) };
+        let ignored = super::native_ignored_signals();
+        // SAFETY: as above.
+        unsafe { libc::signal(libc::SIGURG, old) };
+        assert_ne!(ignored & 1 << (23 - 1), 0);
+        // Rust's runtime ignores SIGPIPE, which is not reported.
+        assert_eq!(ignored & 1 << (13 - 1), 0);
+    }
+}

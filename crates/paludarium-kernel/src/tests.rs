@@ -14895,3 +14895,41 @@ fn a_sampling_clock_ends_each_run_about_when_it_is_to_fire() {
     kernel.pace.ran(&*host);
     assert_eq!(kernel.pace.rate, Some((PACE_FLOOR, 10_000)));
 }
+
+#[test]
+fn the_first_thread_keeps_the_signals_the_host_started_with_ignored() {
+    let host = Arc::new(RecordingHost::new());
+    // SIGINT, SIGQUIT, and SIGKILL and SIGSTOP, which no process has
+    // ignored.
+    host.start_ignoring(1 << 1 | 1 << 2 | 1 << 8 | 1 << 18);
+    let kernel = Kernel::new(host);
+    let image = paludarium_loader::LoadedImage {
+        entry_point: GuestAddr(0x40_1000),
+        program_entry: GuestAddr(0x40_1000),
+        interpreter_base: 0,
+        program_header_address: GuestAddr(0x40_0040),
+        program_header_count: 2,
+        initial_stack_pointer: GuestAddr(0x7fff_f000),
+        initial_break: GuestAddr(0x40_4000),
+        load_base: GuestAddr(0),
+        auxv: [(0, 0); paludarium_loader::AUXV_ENTRIES],
+        code: (0x40_1000, 0x40_2345),
+        data: (0x40_3000, 0x40_3100),
+        vdso: 0,
+        fails: false,
+    };
+    let thread = kernel.spawn_initial(&image);
+    let ignored = |actions: &BTreeMap<i32, SignalAction>| -> Vec<i32> {
+        actions
+            .iter()
+            .filter(|(_, action)| action.handler == signals::SIG_IGN)
+            .map(|(&n, _)| n)
+            .collect()
+    };
+    assert_eq!(ignored(&thread.state.signal_actions), [2, 3]);
+    let shared = kernel.group.shared_actions();
+    assert_eq!(
+        ignored(&shared.lock().unwrap_or_else(PoisonError::into_inner)),
+        [2, 3]
+    );
+}

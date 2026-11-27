@@ -255,8 +255,13 @@ static void help(int what, pid_t waiter) {
     case 6: case 7: case 8: case 9: case 26: case 28: write(in[1], "x", 1); break;
     case 10: read(full[0], bytes, sizeof bytes); break;
     case 11: case 12:
-        slot->word = 1;
-        syscall(SYS_futex, &slot->word, 1L, 1L, NULL, NULL, 0L);
+        /* Wakes the wait once one sleeps in it: after the handler, that is the
+         * one run again. The word stays 0, as one changed before that wait
+         * reads it would end the wait with EAGAIN instead. */
+        for (int n = 0; !slot->told && n < 2400; n++) {
+            if (syscall(SYS_futex, &slot->word, 1L, 1L, NULL, NULL, 0L) > 0) break;
+            ms(1);
+        }
         break;
     case 16: case 27: semop(sem, &op, 1); break;
     case 17: msgsnd(queue, &message, 8, 0); break;

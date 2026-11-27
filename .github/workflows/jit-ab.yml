@@ -1,0 +1,119 @@
+# A native JIT change against the commit it starts from, on one runner, with
+# an A/A row: the old commit's own binary under a second name, timed in the
+# same rounds, which shows how far two identical sides differ on that runner.
+# The same cases as jit-speed.yml, five rounds each, with the three JIT sides
+# taking turns at going first. .github/jit-bench/ab.py prints each side's
+# medians against the old JIT, and the cases where one side is slower or
+# faster than every round of the other. It fails only when a program's output
+# differs. Run by hand, or by a push to a jit-bench-* branch of a fork;
+# actions are pinned by commit SHA and the default token is read-only.
+name: Native JIT A/B
+
+on:
+  push:
+    branches: ['jit-bench-*']
+  workflow_dispatch:
+    inputs:
+      base:
+        description: The commit to compare against (default where the head leaves main)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BENCH: .github/jit-bench
+
+jobs:
+  ab:
+    name: native JIT A/B (x86-64 Linux)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.x'
+          check-latest: true
+      - uses: ./.github/actions/guest-toolchain
+        with:
+          packages: musl-tools cmake perl make pkg-config
+      - uses: ./.github/actions/rust-toolchain
+      - run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl --toolchain "$RUST_TOOLCHAIN"
+      # The guests' build checks their dependencies with cargo-deny.
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
+        with:
+          install_args: cargo-deny
+          cache: false
+      # A fork's own main can lag behind, so the default base is where the
+      # head leaves aletheia-works/paludarium's main.
+      - name: Build the old and the new commit, and a wrapper for each side
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)'
+          if [ -z "$BASE" ]; then
+            git fetch --no-tags https://github.com/aletheia-works/paludarium.git main
+            BASE=$(git merge-base HEAD FETCH_HEAD)
+          fi
+          echo "old $(git rev-parse "$BASE^{commit}") new $(git rev-parse HEAD)"
+          git worktree add ../old "$BASE"
+          mkdir -p bin
+          for v in old new; do
+            dir=$GITHUB_WORKSPACE; [ $v = old ] && dir=../old
+            (cd "$dir" && cargo build --locked --release --target x86_64-unknown-linux-musl -p paludarium --target-dir "$GITHUB_WORKSPACE/target-$v")
+            cp target-$v/x86_64-unknown-linux-musl/release/paludarium bin/$v
+          done
+          # The A/A side: the old binary under another name.
+          cp bin/old bin/same
+          # shellcheck disable=SC2016 # the wrappers expand $0 when they run
+          for v in old same new; do
+            printf '#!/bin/sh\nexec "$(dirname "$0")/%s" "$@"\n' $v > bin/$v-interpreter
+            printf '#!/bin/sh\nexec "$(dirname "$0")/%s" --jit "$@"\n' $v > bin/$v-jit
+          done
+          chmod +x bin/*
+      - name: Build the guests
+        run: python tests/guests/programs/build.py target/guests/programs
+      - run: docker build --pull -t paludarium-distro tests/guests/distro
+      - name: Time
+        run: |
+          sides=(old-jit same-jit new-jit)
+          for r in 1 2 3 4 5; do
+            k=$((r % 3)); order=(old-interpreter "${sides[@]:k}" "${sides[@]:0:k}")
+            for v in "${order[@]}"; do
+              bash "$BENCH/programs.sh" "$PWD/bin/$v" "$v"
+              docker run --rm -v "$PWD/bin:/bin2:ro" -v "$PWD/$BENCH:/bench:ro" paludarium-distro bash /bench/perl.sh "/bin2/$v" "$v"
+            done
+          done 2>&1 | tee times.txt
+          docker run --rm -v "$PWD/tests/guests/distro:/distro:ro" -v "$PWD/bin:/bin2:ro" paludarium-distro bash -c '
+            sides=(old-jit same-jit new-jit)
+            for r in 1 2 3 4 5; do
+              k=$((r % 3)); order=(old-interpreter "${sides[@]:k}" "${sides[@]:0:k}")
+              for v in "${order[@]}"; do
+                python3 -B /distro/compare.py --emulator /bin2/$v --work /tmp/w-$v-$r --output /tmp/o-$v-$r --jobs 1 \
+                  parallel perl java compressors sbcl postgresql gcc python3 luajit mkfifo ocaml emacs >/dev/null 2>&1 || true
+                python3 -c "import json,sys; [print(\"case\", c[\"name\"], sys.argv[1], c[\"emulated\"][\"seconds\"], c[\"same\"]) for c in json.load(open(sys.argv[2]))]" $v /tmp/o-$v-$r/results.json
+              done
+            done
+          ' 2>&1 | tee -a times.txt
+      - name: Compare
+        run: |
+          {
+            lscpu | grep -m1 'Model name' || true
+            python3 "$BENCH/ab.py" times.txt
+          } | tee summary.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: jit-ab
+          path: |
+            times.txt
+            summary.txt

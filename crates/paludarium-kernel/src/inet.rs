@@ -1325,7 +1325,7 @@ impl Network {
             (IpAddr::V4(src), IpAddr::V4(group)) if group.is_multicast() => {
                 self.in_group4(index, src, group)
             }
-            (IpAddr::V6(src), IpAddr::V6(group)) => self.in_group6(index, src, group, now),
+            (IpAddr::V6(src), IpAddr::V6(group)) => self.in_group6(index, src, group),
             _ => true,
         };
         if loops && joined {
@@ -3413,7 +3413,7 @@ impl InetSocket {
                         let scope = crate::multicast::scope6(ip);
                         let own = loops
                             && matches!(from.ip(), IpAddr::V6(src)
-                                if self.network.in_group6(index, src, ip, now));
+                                if self.network.in_group6(index, src, ip));
                         (loops && scope != 0, scope > 1 && (hops != 0 || !own))
                     }
                     IpAddr::V4(_) if on_lo => (true, false),

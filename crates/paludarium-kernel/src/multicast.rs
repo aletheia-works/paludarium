@@ -714,13 +714,7 @@ impl Network {
     /// Whether the device `index` is in the IPv6 group `group` and takes what
     /// comes to it from `source` (`ipv6_chk_mcast_addr`), with its filters
     /// ([`Groups::takes`]).
-    pub(crate) fn in_group6(
-        &self,
-        index: i32,
-        source: Ipv6Addr,
-        group: Ipv6Addr,
-        _now: Option<u64>,
-    ) -> bool {
+    pub(crate) fn in_group6(&self, index: i32, source: Ipv6Addr, group: Ipv6Addr) -> bool {
         self.sync6();
         let source = (!source.is_unspecified()).then_some(source);
         self.devices()
@@ -986,7 +980,7 @@ impl Network {
                 &crate::interface::Flow6::default(),
             )
             .is_ok_and(|route| route.kind == crate::interface::Kind::Multicast);
-        routed && self.has_ipv6(index) && self.in_group6(index, src, group, now)
+        routed && self.has_ipv6(index) && self.in_group6(index, src, group)
     }
 }
 /// Makes `change` in `devices`, or in `out`, a device out of them, with
@@ -1369,7 +1363,7 @@ mod tests {
         network.destroy6(1000);
         assert_eq!(told(&network), [(1000, node(1), false)]);
         assert!(listed(&network).is_empty());
-        assert!(!network.in_group6(1000, Ipv6Addr::UNSPECIFIED, ff15.group, None));
+        assert!(!network.in_group6(1000, Ipv6Addr::UNSPECIFIED, ff15.group));
     }
 
     #[test]
@@ -1430,7 +1424,7 @@ mod tests {
             index,
         };
         let mut mine = Vec::new();
-        assert!(network.in_group6(1, LO6, nodes, None));
+        assert!(network.in_group6(1, LO6, nodes));
         // No member of a group the device is in.
         assert_eq!(
             network.leave6(&mut mine, asked("ff02::1", 1)),
@@ -1441,7 +1435,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(network.leave6(&mut mine, asked("ff02::1", 0)), Ok(()));
-        assert!(network.in_group6(1, LO6, nodes, None));
+        assert!(network.in_group6(1, LO6, nodes));
         let group = asked("ff05::7", 1);
         assert_eq!(network.join6(&mut mine, group, Mode::Exclude, None), Ok(()));
         for index in [0, 1] {
@@ -1463,14 +1457,14 @@ mod tests {
             network.leave6(&mut mine, asked("::1", 1)),
             Err(Errno::EINVAL)
         );
-        assert!(network.in_group6(1, LO6, group.group, None));
+        assert!(network.in_group6(1, LO6, group.group));
         assert!(allows6(&mine, false, (LO6, group.group)));
         assert!(!allows6(&mine, false, (LO6, nodes)));
         network.drop6(&mine);
-        assert!(!network.in_group6(1, LO6, group.group, None));
+        assert!(!network.in_group6(1, LO6, group.group));
         // A loopback has no solicited-node nor all-routers group.
         for other in ["ff02::2", "ff02::1:ff00:1", "ff05::1", "ff02::1:0:1"] {
-            assert!(!network.in_group6(1, LO6, other.parse().unwrap(), None));
+            assert!(!network.in_group6(1, LO6, other.parse().unwrap()));
         }
         assert_eq!(scope6("ff15::1".parse().unwrap()), 5);
     }

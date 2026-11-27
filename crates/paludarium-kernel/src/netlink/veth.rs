@@ -295,8 +295,6 @@ fn tell(own: &Arc<Network>, to: &Arc<Network>, notices: &mut Vec<Notice>, list: 
     }
 }
 
-/// Sends `network`'s netconf notifications of `told` through `notices`
-/// ([`super::devconf`]), as [`tell`] does.
 /// `told`'s settings of IPv4, then of IPv6.
 fn by_family(
     told: Vec<crate::netconf::Told>,
@@ -304,6 +302,8 @@ fn by_family(
     told.into_iter()
         .partition(|t| matches!(t, crate::netconf::Told::Ipv4(..)))
 }
+/// Sends `network`'s netconf notifications of `told` through `notices`
+/// ([`super::devconf`]), as [`tell`] does.
 fn tell_netconf(
     own: &Arc<Network>,
     network: &Arc<Network>,

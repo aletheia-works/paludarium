@@ -101,6 +101,50 @@ impl paludarium_host::Host for ShortWriteHost {
     }
 }
 
+/// The host's stdout, whose reader leaves after the first write.
+struct ReaderLeavesHost(std::sync::atomic::AtomicUsize);
+impl paludarium_host::Host for ReaderLeavesHost {
+    fn read_stdin(&self, _buf: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EIO)
+    }
+    fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {
+        match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Ok(buf.len()),
+            _ => Err(Errno::EPIPE),
+        }
+    }
+    fn write_stderr(&self, buf: &[u8]) -> Result<usize, Errno> {
+        self.write_stdout(buf)
+    }
+    fn random_bytes(&self, buf: &mut [u8]) -> Result<(), paludarium_types::Error> {
+        buf.fill(0);
+        Ok(())
+    }
+}
+#[test]
+fn a_stdout_write_whose_reader_leaves_after_a_part_raises_sigpipe() {
+    // As a pipe's write: the part written, with SIGPIPE; then EPIPE.
+    const BIG: u64 = 0x40_0000;
+    let mut f = fixture();
+    f.kernel = Kernel::new(Arc::new(ReaderLeavesHost(Default::default())));
+    f.mem
+        .map(
+            Some(GuestAddr(BIG)),
+            0x20000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    // SIGPIPE blocked, to see it pending.
+    f.mem.write_u64(GuestAddr(DATA), 1 << 12).unwrap();
+    assert_eq!(f.ret(14, &[0, DATA, 0, 8]), 0);
+    assert_eq!(f.ret(nr::WRITE, &[1, BIG, 0x20000]), 0x10000);
+    assert!(f.thread.state.pending.iter().any(|s| s.number == 13));
+    f.thread.state.pending.clear();
+    assert_eq!(f.ret(nr::WRITE, &[1, BIG, 1]), errno(Errno::EPIPE));
+    assert!(f.thread.state.pending.iter().any(|s| s.number == 13));
+}
+
 #[test]
 fn write_returns_zero_without_retrying_host() {
     for fd in [1, 2] {

@@ -6691,6 +6691,20 @@ fn write_total(
             }
             Err(e) => {
                 if done != 0 {
+                    // A pipe whose last reader left during the write raises
+                    // SIGPIPE with the part written, as Linux's `pipe_write`
+                    // does (the host's streams are pipes to the guest); a
+                    // stream socket raises it only when nothing went
+                    // (`unix_stream_sendmsg`, `tcp_sendmsg_locked`).
+                    let pipe = file.as_any().is_some_and(|a| {
+                        a.is::<crate::sockets::PipeEnd>() || a.is::<StandardFile>()
+                    });
+                    if e == Errno(32) && pipe {
+                        crate::signals::queue(
+                            c.process,
+                            crate::signals::PendingSignal::user(13, 0),
+                        );
+                    }
                     return Ok(done as u64);
                 }
                 // A UDP socket's EPIPE raises none, as `sock_alloc_send_pskb`

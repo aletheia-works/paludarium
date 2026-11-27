@@ -671,7 +671,9 @@ kernel.
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`; that send drops what the end has not
   read, as below. Only `SOCK_STREAM` raises `SIGPIPE` with
-  `EPIPE`, as on Linux.
+  `EPIPE`, as on Linux, and only when nothing was sent; a pipe raises it
+  also when its last reader leaves after part of a write, which returns
+  that part.
 
 - `socket(AF_UNIX)` makes a `SOCK_STREAM` or `SOCK_SEQPACKET` socket that
   binds to a name in the abstract namespace (a `sun_path` starting with 0),
@@ -858,7 +860,9 @@ kernel.
     `EAGAIN`, and so is a write to standard output or standard error that
     the host has no room for. A write to either once its reader is gone (a
     pipe into a `head` that has exited) is `EPIPE` and raises `SIGPIPE`, as
-    a write to any pipe with no reader.
+    a write to any pipe with no reader. A write whose reader leaves after
+    part of it went still raises `SIGPIPE`, and returns that part, as
+    Linux's `pipe_write`.
   - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:
     `POLL_OUT` when a connection opens, `POLL_ERR` when it fails, `POLL_IN`
     when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once

@@ -433,3 +433,26 @@ outliers are dropped and nothing is measured again until it passes.
 Before the first release (Node.js 26.12.0), the mean was 5.75 s without the JIT
 and 4.55 s with it (about 21 % faster), with p = 1/1024. No speed-up is claimed
 for other CPUs or browsers.
+
+### Comparing a native JIT change
+
+The `Native JIT A/B` workflow (`jit-ab.yml`) times a change to the native JIT
+against the commit it starts from, on one runner. Run it by hand, or push the
+change to a `jit-bench-*` branch of a fork. It runs the cases of `jit-speed.yml`
+five times each, in four sides: the old commit without the JIT, the old JIT,
+the new JIT, and the old JIT a second time under another name. That last side
+is the A/A row. Its binary is the same as the old JIT's, so any difference it
+shows is only the runner's noise, measured in the same rounds as the change.
+The three JIT sides take turns at going first.
+
+`.github/jit-bench/ab.py` prints the medians against the old JIT. Then, for the
+A/A row and for the change, it lists the cases where every round is slower than
+every round of the old JIT, or faster. A change is judged by its row next to
+the A/A row of the same run, so both come from the same CPU model. The
+workflow cannot choose the runner, and noise differs from one CPU model to the
+next. The run fails only when a program's output differs from native Linux's.
+
+On an Intel Xeon 6975P-C (run 45961866278, with two copies of main), the A/A
+row had no case slower or faster than every round. Its median of medians was
++0.0%, and the medians ranged from −7.7% to +6.9%, the widest in the shortest
+cases. So a median a few percent off is no evidence on its own.

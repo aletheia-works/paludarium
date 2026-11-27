@@ -6057,7 +6057,10 @@ kernel.
   stack pointer, no other operator, no 32-bit addition, `EACCES`; an
   offset past 2^29, `EINVAL`), the stack's loads and stores (aligned to
   their size, within the 512 bytes, `EACCES`), pointers spilled to the
-  stack whole and filled whole, a load through a scalar ("R%d invalid mem
+  stack whole and filled whole, the value of a load of the stack where
+  Linux knows it (zeros stored, or a scalar spilled, read from its start
+  and no wider than the spill, which the load zero- or sign-extends), a
+  load through a scalar ("R%d invalid mem
   access 'scalar'", `EACCES`) and the exit's R0, which may be any value.
   A conditional jump whose operands it knows goes one way; any other is
   walked both ways. It gives up as Linux does after 1,000,000 instructions
@@ -6105,8 +6108,9 @@ kernel.
   destination registers, and R0 for `BPF_CMPXCHG`, must be written; the
   context is "BPF_ATOMIC stores into R%d ctx is not allowed" (`EACCES`).
   The register the old value goes to, the source with `BPF_FETCH` and R0
-  for `BPF_CMPXCHG`, is unknown from then on, even when it is the
-  destination, which then reads through a scalar. The memory is read,
+  for `BPF_CMPXCHG`, is unknown before the memory is read, even when it is
+  the destination, which then reads through a scalar, and then holds what
+  the read gives. The memory is read,
   then written, aligned to the size whatever the program's flags, and a
   stack slot written so holds bytes, even where a pointer was spilled.
   `BPF_LOAD_ACQ` and `BPF_STORE_REL`, of any size, are checked as a load

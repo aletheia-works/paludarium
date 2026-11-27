@@ -190,6 +190,9 @@ pub(crate) struct Devices {
     pub default4: Conf4,
     pub all6: Conf6,
     pub default6: Conf6,
+    /// The changes of the devices' IPv4 groups netlink has yet to tell of
+    /// ([`crate::multicast::Told4`]), in their order.
+    pub told4: Vec<crate::multicast::Told4>,
 }
 
 impl Default for Devices {
@@ -212,6 +215,7 @@ impl Devices {
                 accept_dad: 1,
                 ..Conf6::default()
             },
+            told4: Vec::new(),
         }
     }
     /// The device of `index` (`__dev_get_by_index`), if any.
@@ -244,6 +248,18 @@ impl Devices {
     /// The device of `index`, to change its settings.
     pub(crate) fn by_index_mut(&mut self, index: i32) -> Option<&mut Device> {
         self.list.iter_mut().find(|d| d.index == index)
+    }
+    /// The IPv4 groups of the device of `index`, with the changes to tell
+    /// of ([`Devices::told4`]).
+    pub(crate) fn groups4_of(
+        &mut self,
+        index: i32,
+    ) -> Option<(
+        &mut crate::multicast::Groups<core::net::Ipv4Addr>,
+        &mut Vec<crate::multicast::Told4>,
+    )> {
+        let device = self.list.iter_mut().find(|d| d.index == index)?;
+        Some((&mut device.groups4, &mut self.told4))
     }
     /// The index a new device takes (`dev_index_reserve`): `asked`, if
     /// positive, which another has (`EBUSY`); else the next free from where

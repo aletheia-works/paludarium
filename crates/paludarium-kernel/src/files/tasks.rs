@@ -484,7 +484,7 @@ pub(super) fn maps(
     task: &Task,
     kind: crate::proc::MapsKind,
     flags: u32,
-    root: Vec<u8>,
+    root: crate::proc::ReaderRoot,
     owner: crate::proc::Owner,
 ) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
     match task.memory() {
@@ -721,6 +721,24 @@ impl AtRead {
             Reader::Unknown => false,
         }
     }
+}
+/// The root of the thread that reads, at each read: the caller's, as its
+/// process last published its files ([`crate::proc::caller`]), so a
+/// `chroot` after the open, or another process that got the descriptor,
+/// names files from its own root, as Linux's `d_path` takes `current`'s.
+/// The opener's `root` stands in for a reader not found (none in a unit
+/// test, or one that has ended).
+pub(super) fn reader_root(c: &Context<'_>, opener: Vec<u8>) -> crate::proc::ReaderRoot {
+    let processes = std::sync::Arc::downgrade(c.processes);
+    Box::new(move || {
+        let (pid, tid) = crate::proc::caller();
+        processes
+            .upgrade()
+            .and_then(|processes| processes.view(pid))
+            .and_then(|view| view.group.public(tid))
+            .and_then(|reader| reader.files.root())
+            .unwrap_or_else(|| opener.clone())
+    })
 }
 /// The task's process, thread and whether it is a thread's file, for
 /// [`AtRead::find`], with the table held weakly, as the file that holds it

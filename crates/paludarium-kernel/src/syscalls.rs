@@ -2608,9 +2608,20 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         read_implies_exec(c.process, prot)
     };
     let file = descriptor.as_ref().map(|d| d.file.clone());
-    // Huge pages are anonymous: an ordinary file is refused
-    // (`ksys_mmap_pgoff`).
-    let huge = if flags & MAP_HUGETLB == 0 {
+    // Huge pages are anonymous or a hugetlbfs file's, whose length is
+    // whole huge pages whatever the flags say: another file is refused
+    // with the flag (`ksys_mmap_pgoff`).
+    let huge_file = file.as_ref().is_some_and(|file| {
+        file.as_any()
+            .and_then(|any| any.downcast_ref::<crate::memfd::Memfd>())
+            .is_some_and(crate::memfd::Memfd::is_huge)
+    });
+    let huge = if huge_file {
+        match crate::hugetlb::length(len, 0) {
+            Ok(len) => Some(len),
+            Err(e) => return err(e),
+        }
+    } else if flags & MAP_HUGETLB == 0 {
         None
     } else if file.is_some() {
         return err(Errno::EINVAL);
@@ -2622,14 +2633,15 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     };
     // A file maps shared, shared with its flags validated, or private;
     // anonymous memory shared, private or droppable (`do_mmap`).
-    // /dev/zero is a file there. Huge pages are a hugetlbfs file's, whose
-    // type `hugetlb::mmap` checks where `do_mmap` checks a file's.
+    // /dev/zero is a file there. Anonymous huge pages are a hugetlbfs
+    // file's, whose type `hugetlb::mmap` checks where `do_mmap` checks a
+    // file's.
     let kinds: &[u64] = if file.is_some() {
         &[MAP_SHARED, MAP_SHARED_VALIDATE, MAP_PRIVATE]
     } else {
         &[MAP_SHARED, MAP_PRIVATE, MAP_DROPPABLE]
     };
-    if len == 0 || (huge.is_none() && !kinds.contains(&(flags & MAP_TYPE))) {
+    if len == 0 || ((huge.is_none() || huge_file) && !kinds.contains(&(flags & MAP_TYPE))) {
         return err(Errno::EINVAL);
     }
     let droppable = flags & MAP_TYPE == MAP_DROPPABLE;
@@ -2651,13 +2663,22 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             no_reserve: flags & MAP_NORESERVE != 0,
             stack: flags & MAP_STACK != 0,
             refused_type: match flags & MAP_TYPE {
+                // A memfd's type is checked with its file (`check_mappable`).
+                _ if huge_file => None,
                 MAP_SHARED | MAP_PRIVATE => None,
                 MAP_SHARED_VALIDATE if unknown => Some(Errno::EOPNOTSUPP),
                 MAP_SHARED_VALIDATE => None,
                 _ => Some(Errno::EINVAL),
             },
+            file: file.clone().filter(|_| huge_file),
         };
-        return crate::hugetlb::mmap(c, &request, |c| new_lock(c, flags, len).map(drop));
+        return crate::hugetlb::mmap(c, &request, |c| {
+            new_lock(c, flags, len)?;
+            match &request.file {
+                Some(file) => check_mappable(file.as_ref(), prot, flags, offset, len, noexec),
+                None => Ok(()),
+            }
+        });
     }
     // A ring of io_uring maps its own pages. It is asked for them before
     // the mapping is placed, with the address asked for, which Linux rounds

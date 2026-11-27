@@ -14,7 +14,7 @@
 use crate::deadlines::{Due, NEVER};
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
-use crate::interface::Flow6;
+use crate::interface::{Flow6, Route6};
 use crate::loopback::segments::Push;
 use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::{Timeout, Timestamps};
@@ -389,7 +389,8 @@ impl Network {
                 // Its loopback is up, and so in this group (`ip_mc_up`).
                 let mut devices = crate::netdev::Devices::new();
                 if let Some(lo) = devices.by_index_mut(crate::netdev::LOOPBACK_INDEX) {
-                    lo.groups4.join(crate::multicast::ALL_HOSTS, Mode::Exclude);
+                    lo.groups4
+                        .join(crate::multicast::ALL_HOSTS, Mode::Exclude, 0);
                 }
                 Mutex::new(devices)
             },
@@ -460,7 +461,6 @@ impl Network {
         proto: u8,
         now: Option<u64>,
     ) -> Result<Dest, Errno> {
-        let flow = Self::flow6(from, proto);
         let to = if oif != 0 && to.is_ipv6() && !from.is_some_and(|ip| plain(ip).is_ipv4()) {
             crate::loopback::destination(to).unwrap_or(to)
         } else {
@@ -471,16 +471,7 @@ impl Network {
             && !ip.is_unspecified()
         {
             use crate::interface::Kind;
-            let strict = strict
-                || from.is_none_or(|ip| ip.is_unspecified())
-                || ip.is_multicast()
-                || ip.is_unicast_link_local()
-                || ip.is_loopback();
-            let route = if strict {
-                self.addresses_at(now).lookup6_flow(ip, oif, &flow)?
-            } else {
-                self.addresses_at(now).lookup6_preferring(ip, oif, &flow)?
-            };
+            let (route, _) = self.route6(ip, from, (oif, strict), proto, now)?;
             return match route.kind {
                 Kind::Local if self.is_up() => Ok(Dest::Here(to)),
                 Kind::Unicast | Kind::Multicast if route.oif != crate::netdev::LOOPBACK_OIF => {
@@ -553,7 +544,7 @@ impl Network {
                 // IPv6's unicast routes through a veth end, and the
                 // multicast one each end has (`addrconf_add_mroute`).
                 if let IpAddr::V6(ip) = to.ip()
-                    && let Ok(route) = self.addresses_at(now).lookup6_flow(ip, 0, &flow)
+                    && let Ok((route, _)) = self.route6(ip, from, (0, false), proto, now)
                     && matches!(route.kind, Kind::Unicast | Kind::Multicast)
                     && route.oif != crate::netdev::LOOPBACK_OIF
                     && let Ok(index) = i32::try_from(route.oif)
@@ -572,6 +563,66 @@ impl Network {
                 }
             }
         }
+    }
+    /// The IPv6 route of [`Self::route`] to `ip`, and the state of the
+    /// tables it was found in.
+    fn route6(
+        &self,
+        ip: Ipv6Addr,
+        from: Option<IpAddr>,
+        (oif, strict): (u32, bool),
+        proto: u8,
+        now: Option<u64>,
+    ) -> Result<(Route6, u64), Errno> {
+        let flow = Self::flow6(from, proto);
+        let strict = oif == 0
+            || strict
+            || from.is_none_or(|ip| ip.is_unspecified())
+            || ip.is_multicast()
+            || ip.is_unicast_link_local()
+            || ip.is_loopback();
+        let addresses = self.addresses_at(now);
+        let route = if strict {
+            addresses.lookup6_flow(ip, oif, &flow)?
+        } else {
+            addresses.lookup6_preferring(ip, oif, &flow)?
+        };
+        Ok((route, addresses.serial6()))
+    }
+    /// The route to the IPv6 address of `dest`, which [`Self::route`] gave
+    /// for `to` from `from`, as a connected UDP socket keeps it.
+    fn kept6(
+        &self,
+        dest: Dest,
+        to: SocketAddr,
+        from: Option<IpAddr>,
+        through: (u32, bool),
+        now: Option<u64>,
+    ) -> Option<Kept6> {
+        let to = match dest {
+            Dest::Here(to) => to,
+            Dest::Veth(..) => to,
+            Dest::Away => return None,
+        };
+        let IpAddr::V6(ip) = to.ip() else {
+            return None;
+        };
+        let (route, serial) = self.route6(ip, from, through, FLOW_UDP, now).ok()?;
+        Some(Kept6 {
+            dest,
+            route,
+            serial,
+            from,
+        })
+    }
+    /// Whether a packet through `oif` (any for 0) takes the route `kept` at
+    /// `now` (`ip6_dst_check`, `ip6_sk_dst_check`).
+    fn takes_kept6(&self, kept: &Kept6, oif: u32, now: Option<u64>) -> bool {
+        let device = match kept.dest {
+            Dest::Veth(index, _) => index.unsigned_abs(),
+            _ => crate::netdev::LOOPBACK_OIF,
+        };
+        (oif == 0 || oif == device) && self.addresses_at(now).keeps6(&kept.route, kept.serial)
     }
     /// What a packet from `from` to `to` out through this namespace's veth
     /// end `index` finds at `now`, its neighbour first, its route's gateway
@@ -1505,17 +1556,25 @@ impl Network {
         if up == self.is_up() {
             return None;
         }
-        let events = if up {
+        let (first, rest) = if up {
             self.ever_up.store(true, Ordering::SeqCst);
-            addresses.up(now, v6)
+            addresses.up_parts(now, v6)
         } else {
-            addresses.down()
+            (Vec::new(), addresses.down())
         };
         self.up.store(up, Ordering::SeqCst);
         drop(addresses);
-        // `ip_mc_up` and `ip_mc_down`.
+        // `ip_mc_up`, after `inetdev_event` has given the loopback its
+        // address, and `ip_mc_down`, before the routes go.
         let lo = crate::netdev::LOOPBACK_INDEX;
-        self.change_group4(lo, crate::multicast::ALL_HOSTS, up);
+        self.change_group4(lo, crate::multicast::ALL_HOSTS, up, now);
+        let mut events = first;
+        events.extend(
+            self.groups_told4()
+                .into_iter()
+                .map(crate::interface::Event::Group4),
+        );
+        events.extend(rest);
         Some(events)
     }
     /// Turns the loopback's IPv6 off or on, as a change of its
@@ -1783,6 +1842,8 @@ struct State {
     /// which its binding has too ([`Binding::old_peer`]): kept here, as the
     /// disconnect may unbind the socket, for the next bind or autobind.
     old_peer: Option<IpAddr>,
+    /// A connected IPv6 socket's route, which its sends take while it holds.
+    kept6: Option<Kept6>,
     queries: VecDeque<Query>,
     /// Datagrams other guest sockets sent this one on the loopback.
     inbox: VecDeque<Datagram>,
@@ -1924,7 +1985,19 @@ impl Syn {
         self.start.saturating_add(seconds * 1_000_000_000)
     }
 }
+/// The route a connected IPv6 UDP socket keeps (`sk_dst_cache`,
+/// `ip6_sk_dst_store_flow`): where it goes, the route and the state of the
+/// tables it was found in, and the source it was looked up with, which
+/// chose its hop.
+#[derive(Clone, Copy)]
+struct Kept6 {
+    dest: Dest,
+    route: Route6,
+    serial: u64,
+    from: Option<IpAddr>,
+}
 /// Where a connection or datagram goes ([`Network::route`]).
+#[derive(Clone, Copy)]
 enum Dest {
     /// To an address of its own namespace, through the loopback.
     Here(SocketAddr),
@@ -2947,6 +3020,7 @@ impl InetSocket {
             if self.family == Family::V6 {
                 s.old_peer = peer.map(|peer| peer.ip()).or(s.old_peer);
             }
+            s.kept6 = None;
             let bindings = State {
                 bound: s.bound.take(),
                 port_locked: s.port_locked,
@@ -3018,16 +3092,20 @@ impl InetSocket {
             IpAddr::V4(_) => options.device4(device),
         };
         let through = (oif, device != 0);
-        match self
+        let route = self
             .network
-            .route(to, source, through, FLOW_UDP, self.now())?
-        {
+            .route(to, source, through, FLOW_UDP, self.now())?;
+        // `ip6_datagram_dst_update`; IPv4's is looked up again from the
+        // source, which gives what a send's own lookup does.
+        let kept = self.network.kept6(route, to, source, through, self.now());
+        match route {
             Dest::Here(to) => {
                 let from = self.datagram_source(s, to, oif, options)?;
                 let name = name(from);
                 self.ports().connect(&self.this, name, Some(to));
                 s.bound = Some(name);
                 s.peer = Some(to);
+                s.kept6 = kept;
             }
             // Out through a veth end, from the address its route leaves
             // from, which Linux's `__mkroute_output` takes from no
@@ -3051,6 +3129,7 @@ impl InetSocket {
                 self.ports().connect(&self.this, name, Some(to));
                 s.bound = Some(name);
                 s.peer = Some(to);
+                s.kept6 = kept;
             }
             Dest::Away => {
                 // Off the loopback the port moves to the host's address the
@@ -3070,6 +3149,9 @@ impl InetSocket {
                 self.ports().connect(&self.this, from, Some(to));
                 s.bound = Some(from);
                 s.peer = Some(address);
+                // No route of the guest's networks to keep, nor the one an
+                // earlier connect kept (`ip6_datagram_dst_update`).
+                s.kept6 = None;
             }
         }
         Ok(0)
@@ -3201,6 +3283,7 @@ impl InetSocket {
     ) -> Result<usize, Errno> {
         let options = *self.options();
         let mut s = self.lock();
+        let connected = to.is_none();
         let to = to.or(s.peer).ok_or(EDESTADDRREQ)?;
         let sendable = |s: &mut State| match s.error.take() {
             Some(error) => Err(error),
@@ -3235,16 +3318,37 @@ impl InetSocket {
             (_, IpAddr::V4(_)) => options.device4(options.device),
         };
         let through = (oif, options.device != 0);
-        let flow = Flow {
+        let mut flow = Flow {
             src: s.source(),
             oif,
             proto: FLOW_UDP,
             bound: options.device,
             port: None,
         };
-        let route = self
-            .network
-            .route(plain_to, source, through, FLOW_UDP, self.now())?;
+        // A connected socket's send takes the route it keeps, if that holds,
+        // or keeps the one it looks up (`ip6_sk_dst_lookup_flow`): but one to
+        // a group, where the socket has no device of its own.
+        let own = options.device != 0 || options.pktinfo_device != 0;
+        let keeps = connected && plain_to.is_ipv6() && (own || !plain_to.ip().is_multicast());
+        let now = self.now();
+        let kept = s
+            .kept6
+            .filter(|kept| keeps && self.network.takes_kept6(kept, oif, now));
+        let route = match kept {
+            Some(kept) => {
+                flow.src = kept.from;
+                kept.dest
+            }
+            None => {
+                let route = self
+                    .network
+                    .route(plain_to, source, through, FLOW_UDP, now)?;
+                if keeps {
+                    s.kept6 = self.network.kept6(route, plain_to, source, through, now);
+                }
+                route
+            }
+        };
         if let Dest::Veth(index, cast) = route {
             let v6 = plain_to.is_ipv6();
             if self.family == Family::V6 && options.v6_only && !v6 {
@@ -4755,6 +4859,7 @@ impl Drop for InetSocket {
         let abort = self.options().linger == Some(0);
         let s = std::mem::take(&mut *self.lock());
         self.network.drop4(&s.groups4);
+        crate::netlink::tell_groups(&self.network);
         self.network.drop6(&s.groups6);
         // Its connection's tries go with it.
         if let Some(stream) = &s.stream
@@ -6122,8 +6227,19 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 socket.network.leave6(&mut s.groups6, asked)?;
             }
         }
-        (0, 32..=36 | 49) => set_multicast4(c, socket, name, (at, len))?,
-        (0, 37..=48) => sources::set4(c, socket, name, (at, len))?,
+        // A device that joins a group anew or leaves it for good is told
+        // of as it does (`inet_ifmcaddr_notify`), whatever the option
+        // returns.
+        (0, 32..=36 | 49) => {
+            let result = set_multicast4(c, socket, name, (at, len));
+            crate::netlink::tell_groups(&socket.network);
+            result?;
+        }
+        (0, 37..=48) => {
+            let result = sources::set4(c, socket, name, (at, len));
+            crate::netlink::tell_groups(&socket.network);
+            result?;
+        }
         (41, 42..=48) if socket.family == Family::V6 => {
             option6_int(c, at, len)?;
             sources::set6(c, socket, name, (at, len))?;
@@ -6246,7 +6362,11 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         | (6, 1 | 3 | 4 | 5 | 6 | 12 | 18)
         | (0, 1)
         | (41, 26) => {
-            let value = option_int(c, at, len)?;
+            let value = if level == 0 {
+                option4_int(c, at, len)?
+            } else {
+                option_int(c, at, len)?
+            };
             let mut options = socket.options();
             match (level, name) {
                 (1, 2 | 15) => {
@@ -6315,13 +6435,21 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     socket.joins(&options, &socket.lock());
                 }
                 // A new type of service sets the priority too
-                // (`__ip_sock_set_tos`, `rt_tos2priority`).
-                (0, 1) if options.type_of_service != value & 0xfc => {
-                    options.type_of_service = value & 0xfc;
-                    options.priority = tos_priority(value);
-                    socket.joins(&options, &socket.lock());
+                // (`__ip_sock_set_tos`, `rt_tos2priority`); TCP keeps its own
+                // two bits of ECN.
+                (0, 1) => {
+                    let value = if tcp {
+                        (value & !3) | (options.type_of_service & 3)
+                    } else {
+                        value
+                    };
+                    if options.type_of_service != value {
+                        options.type_of_service = value & 0xff;
+                        options.priority = tos_priority(value);
+                        socket.lock().kept6 = None;
+                        socket.joins(&options, &socket.lock());
+                    }
                 }
-                (0, 1) => {}
                 (41, 26) if socket.family == Family::V6 => {
                     // Linux refuses it once the socket has a local port.
                     let s = socket.lock();
@@ -6367,6 +6495,7 @@ fn bind_to_device(
     }
     let index = u32::try_from(index).map_err(|_| Errno::EINVAL)?;
     options.device = index;
+    socket.lock().kept6 = None;
     socket.ports().set_device(&socket.this, index);
     Ok(())
 }

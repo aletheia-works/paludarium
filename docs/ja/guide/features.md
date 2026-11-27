@@ -327,8 +327,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `memfd_create` は、リンクのないメモリ上のファイル（モード 0777、
   `MFD_NOEXEC_SEAL` なら 0666）を作り、flags と名前を Linux と同じく確かめます
-  （`EINVAL`、`EFAULT`）。`MFD_HUGETLB` は、hugetlbfs のないカーネルと同じく
-  `ENOSYS` です。`fcntl` の `F_ADD_SEALS`・`F_GET_SEALS` で扱うシールは、
+  （`EINVAL`、`EFAULT`）。`MFD_HUGETLB` は hugetlbfs のファイルを作ります（下の
+  `MAP_HUGETLB` を参照）。`fcntl` の `F_ADD_SEALS`・`F_GET_SEALS` で扱うシールは、
   `MFD_ALLOW_SEALING` がなければ `F_SEAL_SEAL` から始まり（`MFD_NOEXEC_SEAL` なら
   `F_SEAL_EXEC`）、tmpfs と同じくファイルを制限します。`F_SEAL_WRITE` と
   `F_SEAL_FUTURE_WRITE` は書き込み・穴あけ・書き込める共有マッピングを、
@@ -1614,9 +1614,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `madvise` は `MADV_FREE`、`MADV_COLD`、`MADV_PAGEOUT`、`MADV_HUGEPAGE`、ガードを受け付けず、
   2 MiB の境目にない番地からの `MADV_DONTNEED` も受け付けません（`EINVAL`）。仮想 CPU に
   1 GiB のページはないので、大きさは 2 MiB だけです（ほかは `EINVAL`）。このフラグを付けたファイルの
-  マッピングは `EINVAL` です。メモリーは hugetlbfs のファイルのものなので、ファイルの種類を
-  取ります。`MAP_SHARED_VALIDATE` でマップでき（受け付けないフラグは `EOPNOTSUPP`）、
-  `MAP_DROPPABLE` は `do_mmap` と同じく置き場所とロックの確認のあと `EINVAL` です。
+  マッピングは、hugetlbfs のファイルでなければ `EINVAL` です。メモリーは hugetlbfs のファイルの
+  ものなので、ファイルの種類を取ります。`MAP_SHARED_VALIDATE` でマップでき（受け付けない
+  フラグは `EOPNOTSUPP`）、`MAP_DROPPABLE` は `do_mmap` と同じく置き場所とロックの確認のあと
+  `EINVAL` です。
+  `MFD_HUGETLB` の `memfd_create` はそういうファイルを 2 MiB のページで作ります（ほかの大きさは
+  `ENODEV`）。`write` はなく（`EINVAL`）、大きさはヒュージページの倍数で（ほかへの `ftruncate` は
+  `EINVAL`）、`fallocate` に渡すページはなく（`ENOSPC`）、読むとゼロです。`fstat` のブロックは
+  2 MiB でブロック数は 0、`fstatfs` は hugetlbfs の種類とブロックを返します。マッピングは上と
+  同じで、長さはフラグにかかわらず 2 MiB に切り上げます。書けるマッピングはファイルをその終わり
+  まで大きくし、書ける共有のマッピングがある間は `F_SEAL_WRITE` を付けられません（`EBUSY`）。
 
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて
@@ -1649,7 +1656,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、ポーリングの `IORING_OP_POLL_ADD` と `_POLL_REMOVE`、ファイルの要求
   `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、`_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、
   `_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、`_LINKAT`、`_FTRUNCATE`、それにソケットの要求
-  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。ほかの操作は、それらなしでビルドした Linux と同じく
+  `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。ほかの操作は、それらなしでビルドした Linux と同じく
   `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もこれらだけを報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
   見えます。記述子は `anon_inode_create_getfile` が作るのと同じく自分だけの無名 inode で、
   `fstat` は新しい inode 番号、ファイルの型のないモード 0600、作ったスレッドの `fsuid` と
@@ -1813,8 +1820,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベント（`IORING_POLL_UPDATE_EVENTS`）や `user_data`（`IORING_POLL_UPDATE_USER_DATA`）を与えて
   もう一度ポーリングさせます。
 
-- ソケットの要求は Linux 7.0 の単発のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
-  `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV` です。どれも Linux と同じく準備し、
+- ソケットの要求は Linux 7.0 のもの（`io_uring/net.c`）で、`IORING_OP_SHUTDOWN`、
+  `_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG` です。最後の 2 つは
+  `msghdr` とその iovec を準備のときに読むので（`io_msg_copy_hdr`。`EFAULT`、`EINVAL`、
+  `EMSGSIZE`）、待つ要求にはもう要りません。`MSG_WAITALL` の受信は、メッセージや補助データが
+  切り詰められるとリンクを失敗させます。`IORING_ACCEPT_MULTISHOT` と `IORING_RECV_MULTISHOT` では、
+  accept と `IORING_OP_RECV` が、接続ごと、または埋めたバッファーごとに `IORING_CQE_F_MORE` 付きの
+  完了を投稿して次を待ちます。エラー、終わり、受信の上限（`optlen`）、バッファー切れ（`ENOBUFS`）、
+  キューの空き切れで終わります。ソケットにまだあるとき（`IORING_CQE_F_SOCK_NONEMPTY`）や、
+  AF_UNIX の待ち受けのように分からないときはすぐ続け、そうでなければまずソケットを待ちます。
+  そのため、最後のバッファーを使った受信が `ENOBUFS` で終わるのは、次のバイトが来たときです。
+  どれも Linux と同じく準備し、
   エントリーを調べ（`EINVAL`）、次に接続や送信のアドレスを読み（`move_addr_to_kernel`。128 バイトを
   超えれば `EINVAL`、読めなければ `EFAULT`）、バッファーがユーザー空間にあるかを調べます
   （`EFAULT`）。実行は Linux がその場で実行するのと同じく待たずに行います。待つはずの要求
@@ -2666,6 +2682,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `RTA_MULTIPATH` のある削除はそのホップを順に一つずつ比べます（`fib_nh_match`）。
     引き当ては、フローのハッシュが落ちるホップを取ります。生きているホップは
     それぞれ重みに応じてハッシュを分け合います（`fib_select_multipath`、`fib_rebalance`）。
+    `net.ipv4.fib_multipath_use_neigh` が 1 のときは、リンクスコープの経路で届く
+    ゲートウェイの、ホップのデバイスの近隣が有効でないホップを飛ばします（`fib_good_nh`）。
+    飛ばしたホップの分け前はそのままで、すべてを飛ばせば生きている最初のホップを取ります。
     ハッシュするのは `net.ipv4.fib_multipath_hash_policy` が決めるもので
     （`fib_multipath_hash`）、送り元と宛先（0 と 2）、それにプロトコルとポートを
     加えたもの（1）、`fib_multipath_hash_fields` が挙げるフィールド（3）です。
@@ -3168,6 +3187,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     持つ端のもの（`ipv6_add_dev`）です。
     それぞれ、その近隣が持つ参照を数えます。厳しく調べるときは、短い `ndtmsg`、詰め物のある
     もの、後ろに属性のあるものは `EINVAL` です（`neightbl_valid_dump_info`）。
+  - **マルチキャストのグループ:** `AF_INET` の `RTM_GETMULTICAST` のダンプは、
+    `inet_dump_ifmcaddr` と同じく、デバイスごとの IPv4 のグループを、インデックスの順に、
+    それぞれ新しいものから、その種類のメッセージで返します。32 ビットの永続のアドレスで
+    スコープはユニバース、グループ（`IFA_MULTICAST`）、ユーザーの数（`IFA_MC_USERS`。
+    Linux の master のもので、7.0 にはありません）、デバイスが入ったときからの無期限の
+    有効期間を持ちます（`inet_fill_ifmcaddr`）。要求はアドレスのダンプと同じく調べます。
+    指したデバイスがなければ `ENODEV` で、あればメッセージに `NLM_F_DUMP_FILTERED` が
+    付きます。指した名前空間（`IFA_TARGET_NETNSID`）のグループは ID なしで返します。
+    `NLMSG_DONE` は最後のメッセージと同じ読み出しで来ます。デバイスがグループに新しく
+    入るか、すっかり抜けると、`RTNLGRP_IPV4_MCADDR`（37）に `RTM_NEWMULTICAST` か
+    `RTM_DELMULTICAST` を伝えます（`inet_ifmcaddr_notify`）。ソケットのメンバーシップが
+    最初か最後のとき（送り元のフィルターの最初と最後の送り元でも）、デバイスが上がるとき
+    の全ホストのグループ（`lo` のアドレスのあと、経路の前。`ip_mc_up`）、下がるとき
+    （経路と近隣が消える前）、閉じるとき、なくなるときです（`ip_mc_down`、
+    `ip_mc_destroy_dev`。ほかのグループは伝えずに忘れます）。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
     1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には
@@ -3657,7 +3691,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ESRCH` です。musl の `pthread_setname_np` は、ほかのスレッドの名前をここに書きます。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
-  `smaps` も、マップしたファイルを同じように名付けます。`smaps_rollup` は、Linux の
+  `smaps` も、マップしたファイルを読むたびにそのときの読み手のルートから同じように名付けます。
+  `chroot` の前に開いた記述子も、ほかのプロセスに渡した記述子も、読み手のルートから名付けます。`smaps_rollup` は、Linux の
   `show_smaps_rollup` と同じく、`smaps` がすべての VMA について数える値を合計して 1 行にまとめた
   ものです。範囲は最初の VMA の先頭から最後の VMA の末尾までで、フラグ、ファイル、名前はなく
   `[rollup]` だけを付けます。`Pss` は kB に丸める前に合計し、ページの種類ごとに分けます
@@ -3891,8 +3926,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   root（どのユーザー名前空間の外でもユーザー ID 0）だけです。どちらも Linux の
   `proc_doulongvec_minmax` と同じく unsigned long として読み書きし、書き込みは `-` を取らず
   （`EINVAL`）、それ以外は `/proc/sys/fs/mqueue` のファイルと同じに読みます。
-  `/proc/sys/fs` にあるのはこれらと `fanotify`、`inotify`、`mqueue`、`lease-break-time`、
-  `leases-enable` だけです。
+  `/proc/sys/fs` にあるのはこれらと `dir-notify-enable`、`fanotify`、`inotify`、`mqueue`、
+  `lease-break-time`、`leases-enable` だけです。
 
 - `/proc/sys/fs/inotify` はマシンの inotify の上限で、root の持つモード 0644 の
   通常のファイルです。書くために開けるのは root（どのユーザー名前空間の外でも
@@ -3982,8 +4017,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
   `ipv6/conf/<デバイス>/accept_dad`、`disable_ipv6`、`forwarding`、
-  `ipv4/fib_multipath_hash_seed`、`ipv4` と `ipv6` それぞれの `fib_multipath_hash_policy` と
-  `fib_multipath_hash_fields` です。ファイルとディレクトリは、
+  `ipv4/fib_multipath_hash_seed`、`ipv4/fib_multipath_use_neigh`、`ipv4` と `ipv6` それぞれの
+  `fib_multipath_hash_policy` と `fib_multipath_hash_fields` です。ファイルとディレクトリは、
   ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
   書き込みで開けるのは、root と、その名前空間への `CAP_NET_ADMIN` を持つものです
   （`net_ctl_permissions`。開けなければ `EACCES`、書き込みのときに書けなければ
@@ -4019,7 +4054,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `fib_multipath_hash_policy` は 0 から 3（`proc_dou8vec_minmax`）、
     `fib_multipath_hash_fields` は 1 から 0xfff（`proc_douintvec_minmax`）を同じように取り、
     その外は `EINVAL` です。新しい名前空間では、ファミリーごとにポリシー 0、フィールド 7
-    （送り元、宛先、プロトコル）です。
+    （送り元、宛先、プロトコル）です。`fib_multipath_use_neigh` は同じように 0 か 1 を取り
+    （`proc_dou8vec_minmax`）、新しい名前空間では 0 です。
   - リンクの `IFLA_AF_SPEC` の IPv4 と IPv6 の設定にこれらが出ます。IPv6 は
     `disable_ipv6` が切れているときだけ準備ができています。
 
@@ -5285,6 +5321,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     なくなります。イベントなしで頼んだときと、表がなくなったときもなくなります。
   - ディレクトリでないファイルは `ENOTDIR`、`O_PATH` のディスクリプタは `EBADF` です。
     知らないビットは無視します。
+  - マシンの `/proc/sys/fs/dir-notify-enable`（最初は 1）は、どんな `int` も取る
+    （`proc_dointvec`）root のモード 0644 のファイルです。これが 0 の間は、`F_NOTIFY` は
+    イベントがなくても、ほかのどの確認よりも先に `EINVAL` です。すでにある見張りは
+    シグナルを送り続けます。
 
 - inotify のインスタンス（`inotify_init`、`inotify_init1`。`IN_NONBLOCK` と
   `IN_CLOEXEC` が使えます）は、ファイルをデバイスと inode で見張ります。
@@ -5514,7 +5554,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
-  `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`
+  `PR_SET_PDEATHSIG`（スレッドごとで、新しいスレッドとプロセスにはありません。
+  Linux の `forget_original_parent` と同じく、各スレッドのシグナルは、そのプロセスを
+  作った親のスレッドが終わったときに、親が動き続けていてもプロセスに送り、そのあと
+  親になったスレッドが終わるたびにまた送ります）、`PR_SET_DUMPABLE`
   （`execve` は、上に書いた場合のほかは、またダンプできるようにします）、
   `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、ケーパビリティモジュールの
   `PR_CAPBSET_READ`、`PR_CAPBSET_DROP`（`CAP_SETPCAP` が要ります）、`PR_GET_SECUREBITS`、
@@ -5572,8 +5615,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   確かめる資格情報は ID が指すスレッドのものです。グループはどれかのメンバーに届けば
   成功とし、-1 は送れない相手を報告しません。`kill` や `pidfd_send_signal` で送った
   シグナルの `si_pid` と `si_uid` は送り主の PID と実ユーザー ID に（`tkill` と `tgkill`
-  も同じです）、`PR_SET_PDEATHSIG` のシグナルでは終わった親の PID と実ユーザー ID に
-  なります。このシグナルにも同じ許可が要ります。
+  も同じです）、`PR_SET_PDEATHSIG` のシグナルでは親の PID と、終わった親のスレッドの実ユーザー ID に
+  なります。このシグナルにも、終わったスレッドからシグナルを設定したスレッドへの同じ許可が要ります。
 
 - `rt_sigqueueinfo`（`sigqueue` の中身）は、呼び出し元の siginfo をそのままプロセスに
   送り、`rt_tgsigqueueinfo` は 1 つのスレッドに送ります。そのためシグナルは値を運び、
@@ -5730,8 +5773,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `TCP_CORK`（ホストには伝えません）、`TCP_KEEPIDLE`、`TCP_KEEPINTVL`、
     `TCP_KEEPCNT`、`TCP_QUICKACK`、`TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、
     `IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
-    2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決めます
-    （`rt_tos2priority`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
+    2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決め
+    （`rt_tos2priority`）、`int` の代わりに 1 バイトでも設定できます（`do_ip_setsockopt`）。
+    ECN の 2 ビットは、データグラムのソケットでは渡された値になり、TCP では自分のものを
+    保ちます（`__ip_sock_set_tos`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
     設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
     （閉じているか待ち受けている間は `EINVAL`）。`SO_BINDTODEVICE` はデバイスの名前を
     15 バイトまで取り（ないデバイスは `ENODEV`）、なしか空の名前ならデバイスなしです。
@@ -5763,16 +5808,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ソケットがデバイスを持つとき、アドレスに結び付いていないとき、宛先がグループ、リンクローカル、`::1` の
     ときは厳密に通り、ほかは、プレフィックスとメトリックが同じ経路の中でそれを優先する
     だけです（`rt6_score_route`）。デバイスのないソケットをリンクのグループに `connect`
-    すると、`IPV6_MULTICAST_IF` のものがソケットのデバイスになります。送るたびに経路を
-    引きますが、Linux の接続済みのソケットは、これらのオプションが 0 に戻っても、持っている
-    経路を使い続けます（`ip6_sk_dst_lookup_flow`）。`IP_UNICAST_IF` は、IPv4 と IPv6 の
+    すると、`IPV6_MULTICAST_IF` のものがソケットのデバイスになります。接続済みの
+    ソケットは、`connect` が見つけた経路をホップごと持ち続けます（`ip6_sk_dst_lookup_flow`。
+    Linux の master と同じで、アドレスを渡す `sendto` は経路を引きます）。`send` は、これらの
+    オプションがほかのデバイスを指していない間、その経路がなくなるか、そのノードが変わる
+    （`ip6_dst_check`）まで、それを使います。ノードは、そこかそれより長いプレフィックスに経路が
+    足されたとき、ホップが死んだとき、アドレスがなくなったとき、アドレスの重複検出が終わった
+    ときに変わります。`SO_BINDTODEVICE`、`SO_BINDTOIFINDEX`、違う `IP_TOS` は、その経路を
+    捨てます。そのあとは、引いた経路を持ちます。`IP_UNICAST_IF` は、IPv4 と IPv6 の
     ソケットでも TCP のものでも、デバイスのインデックスをネットワークバイトオーダーで、
     ちょうど `int` の大きさで取り（ほかの長さは `EINVAL`、ないデバイスは
     `EADDRNOTAVAIL`）、0 ならなしです。デバイスに結び付いたソケットでは `EINVAL` です
     （`do_ip_setsockopt`）。グループでない IPv4 のアドレスへの UDP のデータグラム（IPv6 の
     ソケットの IPv4 射影アドレスへのものも）と UDP の `connect` は、ソケット自身のデバイスが
     なければ、`SO_BINDTODEVICE` のものと同じようにそのデバイスを通ります（`udp_sendmsg`、
-    `__ip4_datagram_connect`）。TCP は経路のとおりです。送るたびに経路を引きますが、
+    `__ip4_datagram_connect`）。TCP は経路のとおりです。IPv4 では送るたびに経路を引きますが、
     Linux の接続済みのソケットは、`connect` のあとでこのオプションが変わっても、経路が
     変わるまでは `connect` で見つけた経路を使い続けます（`sk_dst_check`）。
   - **`TCP_INFO`** は、Linux の 280 バイトの `struct tcp_info` を、渡された大きさの分だけ

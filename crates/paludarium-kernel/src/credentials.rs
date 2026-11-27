@@ -873,7 +873,7 @@ fn id(value: u64) -> u32 {
 /// effective or filesystem IDs brings.
 fn commit(c: &mut Context<'_>, new: Credentials) {
     if c.process.credentials.resets_dumpable(&new) {
-        c.processes.credentials_changed(c.process.pid);
+        c.processes.credentials_changed(c.process.pid, c.tid);
     }
     c.group.set_task_ids(c.tid, new.task_ids());
     c.group

@@ -1706,8 +1706,8 @@ struct Maps {
     memory: MemoryView,
     start_stack: u64,
     kind: MapsKind,
-    /// The opener's root, from which file names are shown.
-    root: Vec<u8>,
+    /// The root of whoever reads, from which file names are shown.
+    root: ReaderRoot,
 }
 impl crate::seq::Records for Maps {
     /// The line of the VMA at `next` or after it, and where the next starts.
@@ -1728,7 +1728,7 @@ impl crate::seq::Records for Maps {
             None if self.memory.mappings().is_some() => (crate::vsyscall::vma(), MAPS_END),
             None => return Ok(None),
         };
-        let mut line = map_line(&vma, self.start_stack, &self.root);
+        let mut line = map_line(&vma, self.start_stack, &(self.root)());
         if self.kind == MapsKind::Smaps {
             let usage = self.memory.usage(vma.start, vma.end).unwrap_or_default();
             line.extend_from_slice(&smap_lines(&vma, usage));
@@ -1736,15 +1736,20 @@ impl crate::seq::Records for Maps {
         Ok(Some((line, after)))
     }
 }
+/// The root of the thread that reads a file, as a path from the machine's
+/// root, asked at each read.
+pub(crate) type ReaderRoot = Box<dyn Fn() -> Vec<u8> + Send + Sync>;
+
 /// `/proc/<pid>/maps`, `smaps` or `smaps_rollup` (`kind`) of `memory`,
-/// opened with `flags` and its files named from the opener's `root`: a
-/// `seq_file` of [`Maps`], of size 0 and owned by whom its inode's `owner`
-/// says when `fstat` asks.
+/// opened with `flags`: a `seq_file` of [`Maps`], of size 0 and owned by
+/// whom its inode's `owner` says when `fstat` asks. Its files are named
+/// from the root `root` gives at each read, the reader's, as Linux's
+/// `seq_file_path` takes `current`'s root.
 pub(crate) fn maps_file(
     memory: MemoryView,
     start_stack: u64,
     flags: u32,
-    root: Vec<u8>,
+    root: ReaderRoot,
     kind: MapsKind,
     owner: Owner,
 ) -> crate::seq::SeqFile {
@@ -2221,7 +2226,7 @@ mod tests {
             mem.view(),
             0x7fff0800,
             0,
-            b"/".to_vec(),
+            Box::new(|| b"/".to_vec()),
             MapsKind::Maps,
             Owner::default(),
         );
@@ -2524,7 +2529,7 @@ mod tests {
             mem.view(),
             0x7fff0800,
             0,
-            b"/".to_vec(),
+            Box::new(|| b"/".to_vec()),
             MapsKind::Smaps,
             Owner::default(),
         );
@@ -2609,7 +2614,7 @@ mod tests {
                 mem.view(),
                 0x7fff0800,
                 0,
-                b"/".to_vec(),
+                Box::new(|| b"/".to_vec()),
                 MapsKind::Rollup,
                 Owner::default(),
             );
@@ -2739,7 +2744,7 @@ mod tests {
             mem.view(),
             0,
             0,
-            b"/".to_vec(),
+            Box::new(|| b"/".to_vec()),
             MapsKind::Maps,
             Owner::default(),
         );
@@ -2775,7 +2780,7 @@ mod tests {
             mem.view(),
             0,
             0,
-            b"/".to_vec(),
+            Box::new(|| b"/".to_vec()),
             MapsKind::Maps,
             Owner::default(),
         );
@@ -2803,7 +2808,7 @@ mod tests {
                 mem.view(),
                 0,
                 2,
-                b"/".to_vec(),
+                Box::new(|| b"/".to_vec()),
                 MapsKind::Maps,
                 Owner::default()
             )
@@ -2821,7 +2826,7 @@ mod tests {
             mem.view(),
             0,
             0,
-            b"/".to_vec(),
+            Box::new(|| b"/".to_vec()),
             MapsKind::Maps,
             Owner::default(),
         );

@@ -464,13 +464,6 @@ pub(crate) fn restarts_with_handler(number: u64) -> bool {
     )
 }
 
-/// Shared selection for delivery and syscall-restart preview, as Linux's
-/// `get_signal` takes them: SIGKILL first, then a signal a fault raised
-/// (`dequeue_synchronous_signal`), then the thread's own before the
-/// process's (`dequeue_signal`). In each, `next_signal` takes SIGSEGV,
-/// SIGBUS, SIGILL, SIGTRAP, SIGFPE and SIGSYS first, then the lowest number;
-/// queue position breaks ties, so a real-time signal's instances come in the
-/// order they were queued.
 /// `SYNCHRONOUS_MASK`: what `next_signal` takes first of a queue.
 const SYNCHRONOUS_MASK: u64 = (1 << (11 - 1))
     | (1 << (7 - 1))
@@ -478,6 +471,14 @@ const SYNCHRONOUS_MASK: u64 = (1 << (11 - 1))
     | (1 << (5 - 1))
     | (1 << (8 - 1))
     | (1 << (31 - 1));
+
+/// Shared selection for delivery and syscall-restart preview, as Linux's
+/// `get_signal` takes them: SIGKILL first, then a signal a fault raised
+/// (`dequeue_synchronous_signal`), then the thread's own before the
+/// process's (`dequeue_signal`). In each, `next_signal` takes SIGSEGV,
+/// SIGBUS, SIGILL, SIGTRAP, SIGFPE and SIGSYS first, then the lowest number;
+/// queue position breaks ties, so a real-time signal's instances come in the
+/// order they were queued.
 pub(crate) fn next_pending(process: &ThreadState, skip_ignored: bool) -> Option<usize> {
     process
         .pending

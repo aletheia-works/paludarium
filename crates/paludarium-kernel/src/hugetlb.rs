@@ -20,10 +20,15 @@ const SIZE_MASK: u64 = 0x3f;
 /// `MAX_LFS_FILESIZE`.
 const MAX_OFFSET: u64 = i64::MAX as u64;
 
-/// The file of a mapping (`hugetlb_file_setup`'s `anon_hugepage`), which
-/// holds no page and can be given none.
+/// The file of a mapping (`hugetlb_file_setup`'s `anon_hugepage`, or a
+/// `MFD_HUGETLB` memfd), which holds no page and can be given none.
 struct HugePages {
     inode: u64,
+    /// A memfd's device and name; an anonymous mapping's file shows none.
+    memfd: Option<(u64, Vec<u8>)>,
+    /// Counts the mapping among those that may write a memfd while it
+    /// lasts.
+    _writable: Option<crate::memfd::WritableMapping>,
 }
 
 impl PageSource for HugePages {
@@ -38,10 +43,16 @@ impl PageSource for HugePages {
         false
     }
     fn name(&self) -> Option<Vec<u8>> {
-        Some(b"/anon_hugepage (deleted)".to_vec())
+        Some(match &self.memfd {
+            Some((_, name)) => name.clone(),
+            None => b"/anon_hugepage (deleted)".to_vec(),
+        })
     }
     fn identity(&self) -> (u64, u64) {
-        (0, self.inode)
+        (
+            self.memfd.as_ref().map_or(0, |(device, _)| *device),
+            self.inode,
+        )
     }
     fn open_file(&self) -> usize {
         std::ptr::from_ref(self).cast::<()>() as usize
@@ -86,6 +97,8 @@ pub(crate) struct Request {
     /// `MAP_SHARED_VALIDATE` with a flag it does not know, `EINVAL` for a
     /// type a file has not (`MAP_DROPPABLE`).
     pub refused_type: Option<Errno>,
+    /// A `MFD_HUGETLB` memfd to map, rather than anonymous memory.
+    pub file: Option<Arc<dyn paludarium_host::FileHandle>>,
 }
 
 /// `len` in whole huge pages of the size `flags` gives, the default 2 MiB
@@ -102,9 +115,10 @@ pub(crate) fn length(len: u64, flags: u64) -> Result<u64, Errno> {
 }
 
 /// `mmap` of huge pages, in the order of Linux's `do_mmap`: where it goes
-/// (`hugetlb_get_unmapped_area`), what it may lock (`lock`), its file's
-/// checks, and then, when a fixed mapping has unmapped what it replaces,
-/// hugetlb's own (`hugetlbfs_file_mmap_prepare`).
+/// (`hugetlb_get_unmapped_area`), what it may lock and its file's checks
+/// (`lock`), and then, when a fixed mapping has unmapped what it replaces,
+/// hugetlb's own (`hugetlbfs_file_mmap_prepare`). A memfd's mapping that
+/// may write raises its size to the mapping's end.
 pub(crate) fn mmap(
     c: &mut Context<'_>,
     r: &Request,
@@ -161,6 +175,14 @@ fn map(
             Placement::Aligned { hint, size, offset }
         }
     };
+    let memfd = r
+        .file
+        .as_ref()
+        .and_then(|file| file.as_any())
+        .and_then(|any| any.downcast_ref::<crate::memfd::Memfd>());
+    // Seals stay as they are until the mapping counts among the writable
+    // ones.
+    let _sealing = memfd.map(crate::memfd::Memfd::lock_seals);
     lock(c)?;
     if MAX_OFFSET
         .checked_sub(len)
@@ -195,15 +217,40 @@ fn map(
         return Err(e);
     }
     static INODES: AtomicU64 = AtomicU64::new(1);
-    let pages = SharedPages::new().with_source(Arc::new(HugePages {
-        inode: INODES.fetch_add(1, Ordering::Relaxed),
-    }));
+    // A memfd's shared mapping may write it (`VM_MAYWRITE`) when it is open
+    // for writing and not sealed against it, as any file's.
+    let mut writes = paludarium_mmu::SharedWrites::Allowed;
+    let source = match (memfd, &r.file) {
+        (Some(memfd), Some(file)) => {
+            let sealed = memfd.seals()
+                & (crate::memfd::F_SEAL_WRITE | crate::memfd::F_SEAL_FUTURE_WRITE)
+                != 0;
+            writes = match (file.flags() & 3 == 2, sealed) {
+                (false, _) => paludarium_mmu::SharedWrites::ReadOnly,
+                (true, true) => paludarium_mmu::SharedWrites::Sealed,
+                (true, false) => paludarium_mmu::SharedWrites::Allowed,
+            };
+            let may_write = r.shared && writes == paludarium_mmu::SharedWrites::Allowed;
+            HugePages {
+                inode: file.stat()?.inode,
+                // It has no link, as `/proc/self/fd` shows.
+                memfd: Some((crate::memfd::device(memfd), memfd.link_target())),
+                _writable: may_write.then(|| memfd.writable_mapping()).flatten(),
+            }
+        }
+        _ => HugePages {
+            inode: INODES.fetch_add(1, Ordering::Relaxed),
+            memfd: None,
+            _writable: None,
+        },
+    };
+    let pages = SharedPages::new().with_source(Arc::new(source));
     let offset = r.offset;
     let backing = if r.shared {
         Backing::Shared {
             pages: &pages,
             offset,
-            writes: paludarium_mmu::SharedWrites::Allowed,
+            writes,
         }
     } else {
         Backing::Cache {
@@ -211,6 +258,13 @@ fn map(
             offset,
         }
     };
+    // One that may write grows the file to its end before it is mapped,
+    // as `hugetlbfs_file_mmap_prepare` does.
+    if let Some(memfd) = memfd
+        && r.prot.contains(Prot::WRITE)
+    {
+        memfd.extend_to(offset + len)?;
+    }
     let at = c
         .mem
         .map_backed(placement, len, r.prot, MappingKind::File, backing)?;

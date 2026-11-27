@@ -556,7 +556,9 @@ int main(int argc, char **argv) {
         get(FIELDS6, label);
     }
     int fd = open(POLICY6, O_RDWR);
-    printf("at 1: seek=%ld write=%ld\n", (long)lseek(fd, 1, SEEK_SET), result(write(fd, "2", 1)));
+    /* Seeks first: a call's arguments may be evaluated in any order. */
+    long seek = (long)lseek(fd, 1, SEEK_SET);
+    printf("at 1: seek=%ld write=%ld\n", seek, result(write(fd, "2", 1)));
     close(fd);
     get(POLICY6, "at 1");
 

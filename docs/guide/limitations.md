@@ -77,12 +77,11 @@ verified.
 - **Huge pages**: the pool of hugetlbfs is empty and cannot be filled. There
   is no `/proc/sys/vm/nr_hugepages` (so no write to it), no
   `/sys/kernel/mm/hugepages`, and `hugetlbfs` cannot be mounted (`ENODEV`),
-  though `sysfs` lists it. `MFD_HUGETLB` gives `ENOSYS`, as from a kernel
-  without hugetlbfs, where Linux with an empty pool makes a memfd.
-  `MAP_HUGETLB` and `SHM_HUGETLB` of
-  1 GiB pages are `EINVAL`, as on a CPU without them; the differential tests
-  do not compare them. `userfaultfd` does not register such a mapping, and
-  the device in `maps` of an anonymous one is 0, and of a segment's 00:01.
+  though `sysfs` lists it. `MAP_HUGETLB` and `SHM_HUGETLB` of 1 GiB pages
+  are `EINVAL`, and `MFD_HUGETLB` of them `ENODEV`, as on a CPU without
+  them; the differential tests do not compare them. `userfaultfd` does not
+  register such a mapping, and the device in `maps` of an anonymous one is
+  0, and of a segment's 00:01.
 - **`/proc/<pid>/mem`'s offsets past `i64::MAX`**: `pread64` and
   `pwrite64` refuse them (`EINVAL`), as Linux v7.0's `ksys_pread64` and
   `ksys_pwrite64` do for every file, where Linux master takes them for a
@@ -200,9 +199,7 @@ verified.
   made onto it before. In a path that climbs above the root as written,
   `..` in the generated files such a bind mount shows is taken from the
   names as written, where Linux takes a `..` after a link in `/proc` (such
-  as `/proc/self/cwd`) from its target. `maps` and `smaps` in `/proc` name
-  files from the root their opener had when it opened them, where Linux
-  takes the root of whoever reads them, at each read.
+  as `/proc/self/cwd`) from its target.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
 - **Links into `/dev` and `/proc`, in part**: a symbolic link elsewhere
   that leads into them is followed to the generated file by the calls
@@ -598,18 +595,22 @@ verified.
   `_POLL_REMOVE`, the file requests `IORING_OP_OPENAT`, `_OPENAT2`,
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
-  single-shot socket requests
-  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`
-  and `_RECV` run; the other operations complete with `EOPNOTSUPP`. Of the
-  socket requests, a multishot accept or receive, a bundle
+  socket requests
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
+  `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations complete with `EOPNOTSUPP`. Of the
+  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
-  one are not there yet (`EINVAL`). A send or a receive with
+  one are not there yet (`EINVAL`). A multishot receive whose socket keeps
+  having more goes on at once however many times in a row, where Linux
+  requeues it after 32 (`MULTISHOT_MAX_RETRY`), letting other task work
+  run first. A send or a receive with
   `IORING_RECVSEND_FIXED_BUF` is `EINVAL`, as on Linux 7.0, the kernel the
   differential tests run on; Linux master moves the bytes of a registered
   buffer. This follows master once the test runners' kernel does. A
-  receive with `MSG_WAITALL` whose datagram was cut does not fail its
-  link, where Linux's does. An `IORING_OP_SHUTDOWN`, an `IORING_OP_FSYNC`
+  send's address is read again as it runs, and an `IORING_OP_RECV` with
+  `MSG_WAITALL` does not fail its link for ancillary data it has no room
+  for, as Linux's does. An `IORING_OP_SHUTDOWN`, an `IORING_OP_FSYNC`
   and a file request run while `io_uring_enter` takes them, where Linux
   runs them, but for a close and some opens and advice, in a worker, so
   their completions can come before those Linux posts first, and an open of
@@ -1046,9 +1047,7 @@ verified.
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so
   `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's
   `sigio_perm` checks.
-  The `PR_SET_PDEATHSIG` signal is sent when the parent process ends, with the
-  IDs of its leader, where Linux sends it when the thread that made the child
-  ends, with that thread's. Of the files, those under `/proc` and `/dev` are
+  Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
   act as 0, the kernel's defaults, which many distributions raise. A
@@ -1137,8 +1136,6 @@ verified.
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise.
-- **dnotify, in part**: there is no `/proc/sys/fs/dir-notify-enable`, so
-  dnotify is always on, as with Linux's default of 1.
 - **`/proc/locks`, in part**: PIDs are those of the reader's PID namespace,
   where Linux's are those of the one `/proc` was mounted in. A `flock` lock a
   program on the host holds on a file of the host is not listed, though it
@@ -1222,8 +1219,10 @@ verified.
   joining one there without naming a device is `ENODEV`.
   No IGMP or MLD packet is sent: nothing in the guest would see one, as
   raw sockets are `EPERM` and there are no packet sockets (`AF_PACKET`).
-  Source filters (`IP_ADD_SOURCE_MEMBERSHIP`, `IP_MSFILTER`, `MCAST_*`) and
-  anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`. ICMP's port unreachable is not rate limited
+  Anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`. `RTM_GETMULTICAST`
+  lists IPv4's groups alone: IPv6's (`inet6_dump_ifmcaddr`) and Linux
+  master's link-layer ones (`AF_PACKET`, `dev_mc_dump`) are `EOPNOTSUPP`,
+  and nothing is told to `RTNLGRP_IPV6_MCADDR`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
   peer's makes a connected socket's next send `ECONNREFUSED`; and a
   connection across a pair goes on after an end goes down, goes or moves,
@@ -1279,12 +1278,13 @@ verified.
   takes `accept_local`, `send_redirects`, `shared_media` and
   `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward`,
   `fib_multipath_hash_seed`, `fib_multipath_hash_policy`,
-  `fib_multipath_hash_fields` and the `forwarding`, `rp_filter`,
+  `fib_multipath_hash_fields`, `fib_multipath_use_neigh` and the
+  `forwarding`, `rp_filter`,
   `accept_dad` and `disable_ipv6` of `all`, `default`,
   `lo` and the veth ends, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those.
-  A write of `fib_multipath_hash_seed`, `fib_multipath_hash_policy` or
-  `fib_multipath_hash_fields` is taken whole and leaves the file where it
+  A write of `fib_multipath_hash_seed`, `fib_multipath_hash_policy`,
+  `fib_multipath_hash_fields` or `fib_multipath_use_neigh` is taken whole and leaves the file where it
   was, as Linux 7.0 to 7.2 do; master takes what it reads and
   moves the file on (`proc_vec`).
   IPv6's `forwarding` joins no router anycast address, and an end made

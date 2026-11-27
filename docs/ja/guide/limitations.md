@@ -68,10 +68,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `write` で埋めたホストのファイルのページはクリーンです（下の「`write` で埋めたページ」）。
 - **ヒュージページ**：hugetlbfs のプールは空で、増やせません。`/proc/sys/vm/nr_hugepages`
   （書き込む先）も `/sys/kernel/mm/hugepages` もなく、`sysfs` は `hugetlbfs` を並べますが
-  マウントはできません（`ENODEV`）。`MFD_HUGETLB` は、hugetlbfs のないカーネルと同じく
-  `ENOSYS` です。プールが空の Linux では memfd は作られます。1 GiB のページの `MAP_HUGETLB` と `SHM_HUGETLB` は、それのない CPU と同じく `EINVAL` で、
-  差分テストは比べません。`userfaultfd` はこのマッピングを登録せず、`maps` でのデバイスは
-  anonymous のものが 0、セグメントのものが 00:01 です。
+  マウントはできません（`ENODEV`）。1 GiB のページの `MAP_HUGETLB` と `SHM_HUGETLB` は
+  `EINVAL`、`MFD_HUGETLB` は `ENODEV` で、それのない CPU と同じです。差分テストはこれを
+  比べません。`userfaultfd` はこのマッピングを登録せず、`maps` でのデバイスは anonymous の
+  ものが 0、セグメントのものが 00:01 です。
 - **`/proc/<pid>/mem` の `i64::MAX` を超える位置**：`pread64` と `pwrite64` は、
   Linux v7.0 の `ksys_pread64` と `ksys_pwrite64` がどのファイルでもするのと同じく、
   これを拒みます（`EINVAL`）。Linux master は符号なしの位置のファイル
@@ -172,9 +172,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ディレクトリ）をそこへバインドマウントしたときだけです。書かれたままでルートより上へ
   登るパスでは、そのバインドマウントで見える生成されるファイルの中の `..` を、書かれた名前から
   取ります。Linux は、`/proc` のリンク（`/proc/self/cwd` など）のあとの `..` をリンク先から
-  取ります。`/proc` の `maps` と `smaps` は、開いたプロセスが開いたときに持っていたルートからファイルを
-  名付けます。Linux は、読むたびに読み手のルートから名付けます。Linux master で新しく
-  入った `fchroot` はありません（`ENOSYS`）。
+  取ります。Linux master で新しく入った `fchroot` はありません（`ENOSYS`）。
 - **`/dev` と `/proc` の中を指すリンク（一部）**：ほかの場所からその中を指す
   シンボリックリンクを生成されるファイルまでたどるのは、パスをたどる呼び出しです。
   `execve` と、それを通して名前を作ったり消したりする呼び出し（`mkdir`、`mknod`、
@@ -498,14 +496,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_FILES_UPDATE`、`IORING_OP_PROVIDE_BUFFERS`、`_REMOVE_BUFFERS`、`IORING_OP_ASYNC_CANCEL`、
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
-  `_LINKAT`、`_FTRUNCATE`、それに単発のソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`
-  だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの受け付けと
-  受信、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
+  `_LINKAT`、`_FTRUNCATE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
+  だけで、ほかの操作は `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
+  `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
+  ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
+  （`MULTISHOT_MAX_RETRY`）続くとキューに戻し、ほかのタスクワークを先に動かします。
   `IORING_RECVSEND_FIXED_BUF` を付けた送受信は、差分テストを走らせるカーネルである Linux 7.0 と
   同じく `EINVAL` です。Linux master は登録したバッファーのバイトを動かします。テストを走らせる
-  カーネルが追いつけば master に合わせます。`MSG_WAITALL` の受信でデータグラムが切り詰められても
-  リンクは失敗しません（Linux では失敗します）。`IORING_OP_SHUTDOWN`、`IORING_OP_FSYNC` と
+  カーネルが追いつけば master に合わせます。送信のアドレスは実行するときに読み直します。
+  `MSG_WAITALL` の `IORING_OP_RECV` は、置き場のない補助データではリンクを失敗させません
+  （Linux では失敗します）。`IORING_OP_SHUTDOWN`、`IORING_OP_FSYNC` と
   ファイルの要求は、Linux では close と一部の open や advice を除いてワーカーで実行するところを
   `io_uring_enter` が取ったときに実行するので、その完了は Linux が先に入れるものより先に来ることが
   あります。FIFO を作るかもしれない open はそこで待ちます。タイムアウトの期限は、そのプロセスが走れるチェックポイントで
@@ -876,8 +877,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   確かめていません。
   `F_SETOWN` は設定した側の資格情報を記録しないので、
   `SIGIO` と `SIGURG` は、Linux の `sigio_perm` と違い、だれが設定しても持ち主に届きます。
-  `PR_SET_PDEATHSIG` のシグナルは、親プロセスが終わったときにそのリーダーの ID で送りますが、
-  Linux は子を作ったスレッドが終わったときにそのスレッドの ID で送ります。
   ファイルのうち、`/proc` と `/dev` の下は確かめません。`fs.protected_hardlinks`、
   `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
   カーネルの既定値の 0 として振る舞います。多くのディストリビューションは
@@ -945,8 +944,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。
-- **dnotify の一部**：`/proc/sys/fs/dir-notify-enable` はないので、Linux の既定の 1 と
-  同じく、dnotify はいつも使えます。
 - **`/proc/locks` の一部**：PID は読む側の PID
   名前空間のものです（Linux では `/proc` をマウントした名前空間のもの）。ホストのプログラムが
   ホストのファイルに掛けた `flock` のロックは、ゲストのロックとぶつかりますが、並びません。
@@ -1024,9 +1021,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   カウンタを動かしません。名前空間は別の名前空間へ転送しません。マルチキャストのグループはゲストの名前空間の中だけのものです。最初の名前空間には
   ホストのネットワークへのデバイスがなく、グループへの経路もないので、デバイスを指さずに
   入ろうとすると `ENODEV` です。IGMP と MLD のパケットは送りません。raw ソケットは `EPERM` で、パケット
-  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。送り元のフィルター
-  （`IP_ADD_SOURCE_MEMBERSHIP`、`IP_MSFILTER`、`MCAST_*`）とエニーキャストのグループ
-  （`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。ICMP の port unreachable の頻度を
+  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。エニーキャストの
+  グループ（`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。`RTM_GETMULTICAST` が返すのは
+  IPv4 のグループだけで、IPv6 のもの（`inet6_dump_ifmcaddr`）と Linux の master の
+  リンク層のもの（`AF_PACKET`、`dev_mc_dump`）は `EOPNOTSUPP`、`RTNLGRP_IPV6_MCADDR`
+  には何も伝えません。ICMP の port unreachable の頻度を
   抑えないので（`icmpv4_xrlim_allow`、`icmpv6_xrlim_allow`）、相手の閉じたポートへのデータグラムのたびに、
   接続したソケットの次の送信は `ECONNREFUSED` になります。組を通る接続は、端が
   落ちても、消えても、移っても、使っていたアドレスや経路が消えても続きます。Linux では
@@ -1072,12 +1071,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
   フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
   `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward`、
-  `fib_multipath_hash_seed`、`fib_multipath_hash_policy`、`fib_multipath_hash_fields` と、
-  `all`、`default`、`lo`、veth の端の
+  `fib_multipath_hash_seed`、`fib_multipath_hash_policy`、`fib_multipath_hash_fields`、
+  `fib_multipath_use_neigh` と、`all`、`default`、`lo`、veth の端の
   `forwarding`、`rp_filter`、`accept_dad`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
   最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
   そこから始まります。`fib_multipath_hash_seed`、`fib_multipath_hash_policy`、
-  `fib_multipath_hash_fields` への書き込みは、Linux 7.0 から 7.2 と同じく
+  `fib_multipath_hash_fields`、`fib_multipath_use_neigh` への書き込みは、Linux 7.0 から 7.2 と同じく
   全部を取り、ファイルの位置を動かしません。master は読んだ分だけを取り、位置を進めます
   （`proc_vec`）。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
   加わりません。`default` のものが入っている間に作った端は、全ルーターのグループ 3 つすべてに

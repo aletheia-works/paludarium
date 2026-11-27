@@ -6,7 +6,7 @@
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat, HostFs};
 use paludarium_types::{Errno, GuestAddr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const MFD_CLOEXEC: u32 = 0x01;
@@ -31,10 +31,21 @@ const PAGE: u64 = 4096;
 pub(crate) const DEVICE: u64 = crate::files::Internal::Shmem.device();
 /// `memfd_secret` files are on secretmem's own mount.
 pub(crate) const SECRET_DEVICE: u64 = crate::files::Internal::Secretmem.device();
+/// `MFD_HUGETLB` files are on hugetlbfs's own mount.
+pub(crate) const HUGE_DEVICE: u64 = crate::files::Internal::Hugetlbfs.device();
+/// hugetlbfs's `statfs` type, `HUGETLBFS_MAGIC`.
+pub(crate) const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
 /// The device of `memfd`'s file system: [`SECRET_DEVICE`] for a
-/// `memfd_secret` file, else [`DEVICE`].
+/// `memfd_secret` file, [`HUGE_DEVICE`] for a `MFD_HUGETLB` one, else
+/// [`DEVICE`].
 pub(crate) fn device(memfd: &Memfd) -> u64 {
-    if memfd.secret { SECRET_DEVICE } else { DEVICE }
+    if memfd.secret {
+        SECRET_DEVICE
+    } else if memfd.huge.is_some() {
+        HUGE_DEVICE
+    } else {
+        DEVICE
+    }
 }
 /// Where a memfd's file lives in its own filesystem.
 const PATH: &[u8] = b"/memfd";
@@ -54,6 +65,11 @@ pub(crate) struct Memfd {
     secret: bool,
     /// What a secret file's pages charge its creator ([`SecretCharge`]).
     charge: Option<Arc<SecretCharge>>,
+    /// For a `MFD_HUGETLB` file, a hugetlbfs file of an empty pool: how
+    /// many of its mappings may write it, which `F_SEAL_WRITE` waits for.
+    /// It has no `write_iter`, a size of whole huge pages, and no page to
+    /// allocate or fault in.
+    huge: Option<Arc<AtomicUsize>>,
 }
 /// secretmem's `statfs` type, `SECRETMEM_MAGIC`.
 pub(crate) const SECRETMEM_MAGIC: u64 = 0x5345_434d;
@@ -61,6 +77,32 @@ impl Memfd {
     /// Whether it is a `memfd_secret` file.
     pub(crate) fn is_secret(&self) -> bool {
         self.secret
+    }
+    /// Whether it is a `MFD_HUGETLB` file, on hugetlbfs.
+    pub(crate) fn is_huge(&self) -> bool {
+        self.huge.is_some()
+    }
+    /// Counts a mapping of a `MFD_HUGETLB` file that may write it until
+    /// what is returned is dropped, as Linux's `i_mmap_writable` does.
+    pub(crate) fn writable_mapping(&self) -> Option<WritableMapping> {
+        self.huge.as_ref().map(|count| {
+            count.fetch_add(1, Ordering::SeqCst);
+            WritableMapping(Arc::clone(count))
+        })
+    }
+    /// Whether a mapping of a `MFD_HUGETLB` file may write it.
+    pub(crate) fn huge_mapped_writable(&self) -> bool {
+        self.huge
+            .as_ref()
+            .is_some_and(|count| count.load(Ordering::SeqCst) != 0)
+    }
+    /// A mapping of a `MFD_HUGETLB` file that may write raises its size to
+    /// `end` (`hugetlbfs_file_mmap_prepare`), whatever its seals.
+    pub(crate) fn extend_to(&self, end: u64) -> Result<(), Errno> {
+        if self.file.stat()?.size < end {
+            self.file.truncate(end)?;
+        }
+        Ok(())
     }
     /// The name `/proc/self/maps` shows for a mapping of it: its path, which
     /// a secret file shows ` (deleted)` though it has a link, as every
@@ -105,6 +147,7 @@ impl Memfd {
             name: Arc::clone(&self.name),
             secret: false,
             charge: None,
+            huge: self.huge.clone(),
         }))
     }
     pub(crate) fn seals(&self) -> u32 {
@@ -197,8 +240,9 @@ impl FileHandle for Memfd {
         }
         self.file.read(buf)
     }
+    /// Nor does hugetlbfs have a `write_iter`.
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
-        if self.secret {
+        if self.secret || self.huge.is_some() {
             return Err(Errno::EINVAL);
         }
         let start = if self.flags() & 0o2000 != 0 {
@@ -223,15 +267,22 @@ impl FileHandle for Memfd {
         Ok(FileStat {
             inode: self.inode,
             links: u64::from(self.secret),
-            blocks: if self.secret { Some(0) } else { stat.blocks },
+            blocks: if self.secret || self.huge.is_some() {
+                Some(0)
+            } else {
+                stat.blocks
+            },
             ..stat
         })
     }
     /// A secret file's size is set once: `secretmem_setattr` refuses any
-    /// other once it has one (`EINVAL`).
+    /// other once it has one (`EINVAL`). A hugetlbfs file's is whole huge
+    /// pages (`hugetlbfs_setattr`, `EINVAL`), before its seals.
     fn truncate(&self, size: u64) -> Result<(), Errno> {
         let old = self.file.stat()?.size;
-        if self.secret && old != 0 {
+        if self.secret && old != 0
+            || self.huge.is_some() && !size.is_multiple_of(crate::hugetlb::HUGE_PAGE)
+        {
             return Err(Errno::EINVAL);
         }
         let seals = self.seals();
@@ -256,9 +307,9 @@ impl FileHandle for Memfd {
     fn cached_pages(&self, first: u64, last: u64) -> u64 {
         self.file.cached_pages(first, last)
     }
-    /// A memfd is shmem's, unless it is secret.
+    /// A memfd is shmem's, unless it is secret or on hugetlbfs.
     fn shmem_pages(&self) -> bool {
-        !self.secret
+        !self.secret && self.huge.is_none()
     }
     /// `F_SEAL_EXEC` keeps the execute bits as they are.
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
@@ -273,10 +324,13 @@ impl FileHandle for Memfd {
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         self.file.set_times(atime, mtime)
     }
-    /// A memfd is shmem's, which a tmpfs is.
+    /// A memfd is shmem's, which a tmpfs is, unless it is secret or on
+    /// hugetlbfs.
     fn file_system(&self) -> Option<u64> {
         Some(if self.secret {
             SECRETMEM_MAGIC
+        } else if self.huge.is_some() {
+            HUGETLBFS_MAGIC
         } else {
             0x0102_1994
         })
@@ -297,7 +351,7 @@ impl FileHandle for Memfd {
         self.file.read_at(offset, buf)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
-        if self.secret {
+        if self.secret || self.huge.is_some() {
             return Err(Errno::EINVAL);
         }
         let start = if self.flags() & 0o2000 != 0 {
@@ -309,16 +363,21 @@ impl FileHandle for Memfd {
         self.file.write_at(offset, &buf[..count])
     }
     fn write_at_unappended(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
-        if self.secret {
+        if self.secret || self.huge.is_some() {
             return Err(Errno::EINVAL);
         }
         let count = self.writable(offset, buf.len())?;
         self.file.write_at_unappended(offset, &buf[..count])
     }
-    /// A secret file has no `fallocate` (`EOPNOTSUPP`).
+    /// A secret file has no `fallocate` (`EOPNOTSUPP`). A hugetlbfs file
+    /// has no page to allocate from an empty pool (`alloc_hugetlb_folio`,
+    /// `ENOSPC`).
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         if self.secret {
             return Err(Errno::EOPNOTSUPP);
+        }
+        if self.huge.is_some() {
+            return Err(Errno::ENOSPC);
         }
         self.file.allocate(offset, len)
     }
@@ -336,6 +395,9 @@ impl FileHandle for Memfd {
     fn write_back(&self, offset: u64, buf: &[u8]) -> Result<(), Errno> {
         self.file.write_back(offset, buf)
     }
+    /// A write seal refuses any hole, in a hugetlbfs file too, whose
+    /// `hugetlbfs_punch_hole` asks before it rounds the range to whole huge
+    /// pages; with no page held, what it would zero is zeros already.
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
         if self.secret {
             return Err(Errno::EOPNOTSUPP);
@@ -350,8 +412,9 @@ impl FileHandle for Memfd {
 /// `memfd_create(name, flags)`, in the order of Linux's: the flags, then
 /// the name (at most 249 bytes, `EINVAL`). With `vm.memfd_noexec` at its
 /// default of 0, a call without `MFD_EXEC` or `MFD_NOEXEC_SEAL` gets an
-/// executable file. `MFD_HUGETLB` gives `ENOSYS`, as from a kernel built
-/// without hugetlbfs.
+/// executable file. `MFD_HUGETLB` makes a file on hugetlbfs, of 2 MiB
+/// pages, the default and only size (another is `ENODEV`,
+/// `hugetlb_file_setup`).
 pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let flags = a[1] as u32;
     let known = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC;
@@ -377,9 +440,10 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
             return Err(Errno::EINVAL);
         }
     }
-    if flags & MFD_HUGETLB != 0 {
-        return Err(Errno::ENOSYS);
+    if flags & MFD_HUGETLB != 0 && !matches!((flags & MFD_HUGE_SIZES) >> 26, 0 | 21) {
+        return Err(Errno(19)); // ENODEV
     }
+    let huge = flags & MFD_HUGETLB != 0;
     let fs = Arc::new(paludarium_vfs::MemFs::new());
     let mode = if flags & MFD_NOEXEC_SEAL != 0 {
         0o666
@@ -403,7 +467,10 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     let inode = crate::files::anonymous_inode();
     // No name links it: its watches hear `IN_DELETE_SELF` once nothing
     // holds it, as the inode's eviction tells them.
-    c.files.caches.notify.unlinked_from_start((DEVICE, inode));
+    c.files
+        .caches
+        .notify
+        .unlinked_from_start((if huge { HUGE_DEVICE } else { DEVICE }, inode));
     let memfd = Arc::new(Memfd {
         file,
         fs,
@@ -413,13 +480,23 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         name: name.into(),
         secret: false,
         charge: None,
+        huge: huge.then(Arc::default),
     });
+    let device = device(&memfd);
     let file =
-        crate::page_cache::CoherentFile::with_device(memfd, Arc::clone(&c.files.caches), DEVICE);
+        crate::page_cache::CoherentFile::with_device(memfd, Arc::clone(&c.files.caches), device);
     let fd = c
         .files
         .install(Arc::new(file), flags & MFD_CLOEXEC != 0, c.group.nofile())?;
     Ok(u64::from(fd))
+}
+
+/// A mapping that may write a `MFD_HUGETLB` file ([`Memfd::writable_mapping`]).
+pub(crate) struct WritableMapping(Arc<AtomicUsize>);
+impl Drop for WritableMapping {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 thread_local! {
@@ -588,6 +665,7 @@ pub(crate) fn memfd_secret(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         name: Arc::from(&b"secretmem"[..]),
         secret: true,
         charge: Some(charge),
+        huge: None,
     });
     let file = crate::page_cache::CoherentFile::with_device(
         secret,

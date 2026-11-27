@@ -1540,8 +1540,58 @@ fn memfd_grow_seal_stops_a_write_at_the_last_whole_page() {
     assert_eq!(f.ret(14, &[0, DATA + 0x40, 0, 8]), 0); // block SIGXFSZ
     assert_eq!(f.ret(285, &[fd, 1, 0, 7000]), errno(Errno(27)));
     assert_eq!(f.ret(285, &[fd, 1, 0, 5500]), errno(Errno::EPERM)); // then GROW
-    assert_eq!(f.ret(319, &[DATA, 4]), errno(Errno::ENOSYS)); // MFD_HUGETLB
+    // MFD_HUGETLB of 1 MiB pages, which no CPU has.
+    assert_eq!(f.ret(319, &[DATA, 4 | 20 << 26]), errno(Errno(19)));
     assert_eq!(f.ret(319, &[1, 0]), errno(Errno::EFAULT));
+}
+#[test]
+fn huge_memfds_are_files_of_an_empty_hugetlbfs() {
+    const HUGE: u64 = 2 << 20;
+    let mut f = fixture();
+    let (stat, buf) = (DATA + 0x100, DATA + 0x400);
+    f.mem.write(GuestAddr(DATA), b"huge\0").unwrap();
+    let fd = f.ret(319, &[DATA, 6 | 21 << 26]); // MFD_HUGETLB | MFD_ALLOW_SEALING
+    assert!(fd < 1024, "{fd}");
+    let word = |f: &mut Fixture, at: u64| f.mem.read_u64(GuestAddr(at)).unwrap();
+    assert_eq!(f.ret(1, &[fd, DATA, 4]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(18, &[fd, DATA, 4, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(77, &[fd, 4096]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(77, &[fd, HUGE]), 0);
+    assert_eq!(f.ret(285, &[fd, 0, 0, 4096]), errno(Errno::ENOSPC));
+    assert_eq!(f.ret(285, &[fd, 3, 0, 4096]), 0); // punched, though empty
+    assert_eq!(f.ret(0, &[fd, buf, 8]), 8);
+    assert_eq!(word(&mut f, buf), 0);
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    assert_eq!(word(&mut f, stat), crate::memfd::HUGE_DEVICE);
+    assert_eq!(word(&mut f, stat + 48), HUGE); // st_size
+    assert_eq!(word(&mut f, stat + 56), HUGE); // st_blksize
+    assert_eq!(word(&mut f, stat + 64), 0); // st_blocks
+    assert_eq!(f.ret(138, &[fd, stat]), 0);
+    assert_eq!(word(&mut f, stat), crate::memfd::HUGETLBFS_MAGIC);
+    assert_eq!(word(&mut f, stat + 8), HUGE);
+    // Its mapping takes no reservation from the empty pool, but maps with
+    // MAP_NORESERVE and then counts among the writable ones.
+    let mmap = syscalls::nr::MMAP;
+    assert_eq!(f.ret(mmap, &[0, 1, 3, 1, fd, 0]), errno(Errno::ENOMEM));
+    assert_eq!(
+        f.ret(mmap, &[0, 1, 3, 0x4001, fd, 4096]),
+        errno(Errno::EINVAL)
+    );
+    let at = f.ret(mmap, &[0, 1, 3, 0x4001, fd, HUGE]);
+    assert_eq!(at % HUGE, 0, "{at:#x}");
+    let mut byte = [0];
+    assert!(f.mem.read(GuestAddr(at), &mut byte).unwrap_err().bus);
+    let vma = f.mem.view().vma_from(at).unwrap();
+    assert_eq!(vma.end - vma.start, HUGE);
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    assert_eq!(word(&mut f, stat + 48), 2 * HUGE); // grown to the mapping's end
+    assert_eq!(f.ret(72, &[fd, 1033, 8]), errno(Errno(16))); // EBUSY
+    assert_eq!(f.ret(syscalls::nr::MUNMAP, &[at, HUGE]), 0);
+    assert_eq!(f.ret(72, &[fd, 1033, 8]), 0); // F_SEAL_WRITE
+    assert_eq!(f.ret(mmap, &[0, 1, 3, 0x4001, fd, 0]), errno(Errno::EPERM));
+    assert_eq!(f.ret(285, &[fd, 3, 0, 4096]), errno(Errno::EPERM));
+    // A read-only private mapping is still taken.
+    assert_eq!(f.ret(mmap, &[0, HUGE, 1, 0x4002, fd, 0]) % HUGE, 0);
 }
 #[test]
 fn proc_fd_links_open_again_or_refuse() {
@@ -5304,8 +5354,8 @@ mod io_uring {
         assert_eq!(
             supported,
             [
-                0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-                26, 27, 28, 29, 31, 32, 34, 35, 36, 37, 38, 39, 45, 55
+                0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 31, 32, 34, 35, 36, 37, 38, 39, 45, 55
             ]
         );
         // A probe that is not zeroed, buffers without an argument, another
@@ -7312,6 +7362,207 @@ mod io_uring {
         assert_eq!(batch(&mut f, &r, &[poll_remove(2, 1, 0, 0, 0)]), [(2, -2)]);
     }
 
+    #[test]
+    fn a_multishot_accept_takes_each_connection() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        let name = DATA + 0x100;
+        f.mem.write(GuestAddr(name), &[1, 0, 0, b'm']).unwrap();
+        let listener = f.ret(41, &[1, 1, 0]);
+        assert_eq!(f.ret(49, &[listener, name, 4]), 0);
+        assert_eq!(f.ret(50, &[listener, 8]), 0);
+        let mut accept = fs(13, listener as i32, 0, 0, 0, 0);
+        accept[2] = 1;
+        submit_only(&mut f, &r, &[accept]);
+        assert_eq!(reap_flags(&mut f, &r), []);
+        let connect = |f: &mut Fixture| {
+            let socket = f.ret(41, &[1, 1, 0]);
+            assert_eq!(f.ret(42, &[socket, name, 4]), 0);
+            socket
+        };
+        let mut last = connect(&mut f);
+        for _ in 0..2 {
+            let done = reap_flags(&mut f, &r);
+            assert_eq!(done, [(1, last as i32 + 1, MORE)]);
+            last = connect(&mut f);
+        }
+        assert_eq!(reap_flags(&mut f, &r), [(1, last as i32 + 1, MORE)]);
+        assert_eq!(
+            batch(&mut f, &r, &[cancel(4, 1, 0, 0)]),
+            [(4, 0), (1, -125)]
+        );
+        // A slot must be any free one.
+        accept[44] = 1;
+        assert_eq!(one(&mut f, &r, &accept), -22);
+    }
+
+    #[test]
+    fn a_multishot_receive_goes_on_until_its_end() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        assert_eq!(f.ret(53, &[1, 1, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        let mut receive = rw(27, b, 0, 0, 0);
+        receive[2] = 2;
+        assert_eq!(one(&mut f, &r, &receive), -22);
+        receive[1] = 1 << 5;
+        receive[40] = 3;
+        let mut refused = receive;
+        refused[29] = 1;
+        assert_eq!(one(&mut f, &r, &refused), -22);
+        // Without a buffer it ends.
+        assert_eq!(f.ret(1, &[a, DATA, 4]), 4);
+        assert_eq!(one(&mut f, &r, &receive), -105);
+        assert_eq!(one(&mut f, &r, &provide(4, DATA + 0x800, 4, 3, 0)), 0);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 4, MORE | 1)]);
+        assert_eq!(f.ret(1, &[a, DATA, 6]), 6);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 4, MORE | 5 | 1 << 16), (1, 2, MORE | 1 | 2 << 16)]
+        );
+        assert_eq!(f.ret(1, &[a, DATA, 6]), 6);
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 4, MORE | 5 | 3 << 16), (1, -105, 0)]
+        );
+        // Its last buffer taken with nothing more to read, it waits, and
+        // ends once there is.
+        assert_eq!(one(&mut f, &r, &provide(1, DATA + 0x800, 4, 3, 0)), 0);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 2, MORE | 1)]);
+        assert_eq!(f.ret(1, &[a, DATA, 2]), 2);
+        assert_eq!(reap_flags(&mut f, &r), [(1, -105, 0)]);
+        // Up to a limit, then to the end.
+        assert_eq!(one(&mut f, &r, &provide(4, DATA + 0x800, 4, 3, 0)), 0);
+        receive[44] = 3;
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 2, MORE | 1)]);
+        assert_eq!(f.ret(1, &[a, DATA, 4]), 4);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 4, 1 | 1 << 16)]);
+        receive[44] = 0;
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(f.ret(3, &[a]), 0);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 0, 0)]);
+    }
+
+    /// A `struct user_msghdr` at `at`, with the iovecs `iov`, put after it,
+    /// and `control_len` bytes of control after them.
+    fn msghdr(f: &Fixture, at: u64, iov: &[(u64, u64)], control_len: u64) {
+        let mut raw = [0u8; 56];
+        raw[16..24].copy_from_slice(&(at + 56).to_le_bytes());
+        raw[24..32].copy_from_slice(&(iov.len() as u64).to_le_bytes());
+        if control_len != 0 {
+            raw[32..40].copy_from_slice(&(at + 56 + 64).to_le_bytes());
+            raw[40..48].copy_from_slice(&control_len.to_le_bytes());
+        }
+        f.mem.write(GuestAddr(at), &raw).unwrap();
+        for (i, &(base, len)) in iov.iter().enumerate() {
+            let at = at + 56 + 16 * i as u64;
+            f.mem.write_u64(GuestAddr(at), base).unwrap();
+            f.mem.write_u64(GuestAddr(at + 8), len).unwrap();
+        }
+    }
+
+    fn message(opcode: u8, data: u64, fd: u64, at: u64, flags: u32) -> [u8; 64] {
+        let mut e = fs(opcode, fd as i32, 0, at, 0, flags);
+        e[32..40].copy_from_slice(&data.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn messages_are_sent_and_received() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        assert_eq!(f.ret(53, &[1, 1, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        let (out, into) = (DATA + 0x400, DATA + 0x600);
+        f.mem
+            .write(GuestAddr(DATA + 0x200), b"hello world")
+            .unwrap();
+        msghdr(&f, out, &[(DATA + 0x200, 5), (DATA + 0x205, 6)], 0);
+        msghdr(&f, into, &[(DATA + 0x800, 3), (DATA + 0x900, 64)], 0);
+        // A receive that waits has its header and iovecs already.
+        let receive = message(10, 2, b, into, 0);
+        assert_eq!(batch(&mut f, &r, &[receive]), []);
+        f.mem.write(GuestAddr(into), &[0xff; 40]).unwrap();
+        f.mem.write(GuestAddr(into + 56), &[0xff; 32]).unwrap();
+        assert_eq!(
+            batch(&mut f, &r, &[message(9, 1, a, out, 0)]),
+            [(1, 11), (2, 11)]
+        );
+        assert_eq!(bytes(&f, DATA + 0x800, 3), b"hel");
+        assert_eq!(bytes(&f, DATA + 0x900, 8), b"lo world");
+        // MSG_WAITALL goes on with the iovecs left.
+        msghdr(&f, into, &[(DATA + 0xa00, 3), (DATA + 0xb00, 12)], 0);
+        assert_eq!(batch(&mut f, &r, &[message(10, 2, b, into, 0x100)]), []);
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 5]), 5);
+        assert_eq!(reap(&mut f, &r), []);
+        assert_eq!(f.ret(1, &[a, DATA + 0x205, 10]), 10);
+        assert_eq!(reap(&mut f, &r), [(2, 15)]);
+        assert_eq!(bytes(&f, DATA + 0xa00, 3), b"hel");
+        assert_eq!(bytes(&f, DATA + 0xb00, 8), b"lo world");
+        // The preparation.
+        assert_eq!(one(&mut f, &r, &message(9, 1, a, 8, 0)), -14);
+        for (at, value) in [(8, 1), (44, 1), (2, 16), (2, 4)] {
+            let mut e = message(9, 1, a, out, 0);
+            e[at] = value;
+            assert_eq!(one(&mut f, &r, &e), -22, "send {at}");
+        }
+        for (at, value) in [(8, 1), (44, 1), (2, 16), (2, 4)] {
+            let mut e = message(10, 1, a, into, 0);
+            e[at] = value;
+            assert_eq!(one(&mut f, &r, &e), -22, "receive {at}");
+        }
+        let mut select = message(9, 1, a, out, 0);
+        select[1] = 1 << 5;
+        assert_eq!(one(&mut f, &r, &select), -95);
+        assert_eq!(one(&mut f, &r, &message(10, 1, 0, into, 0)), -88);
+    }
+
+    #[test]
+    fn a_receive_of_the_whole_fails_for_a_message_that_is_cut() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        assert_eq!(f.ret(53, &[1, 2, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        let into = DATA + 0x600;
+        f.mem.write(GuestAddr(DATA + 0x200), b"hello").unwrap();
+        msghdr(&f, into, &[(DATA + 0x800, 3)], 0);
+        let after = nop(9, 0, 0, 0, 0);
+        let mut receive = rw(27, b, 0, DATA + 0x800, 3);
+        receive[1] = 1 << 2;
+        let mut receive_message = message(10, 1, b, into, 0);
+        receive_message[1] = 1 << 2;
+        for e in [receive, receive_message] {
+            for (flags, res, failed) in [(0, 3, 0), (0x100, 3, -125), (0x120, 5, -125)] {
+                assert_eq!(f.ret(1, &[a, DATA + 0x200, 5]), 5);
+                let mut e = e;
+                e[28..32].copy_from_slice(&u32::to_le_bytes(flags));
+                assert_eq!(
+                    batch(&mut f, &r, &[e, after]),
+                    [(1, res), (9, failed)],
+                    "{flags:#x}"
+                );
+            }
+        }
+        // A whole one does not.
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 3]), 3);
+        receive[28..32].copy_from_slice(&0x100u32.to_le_bytes());
+        assert_eq!(batch(&mut f, &r, &[receive, after]), [(1, 3), (9, 0)]);
+    }
+
     /// A file request of `opcode`: `fd`, `off`, `addr`, `len` and `rw_flags`.
     fn fs(opcode: u8, fd: i32, off: u64, addr: u64, len: u32, rw: u32) -> [u8; 64] {
         let mut e = sqe(opcode, 1);
@@ -7821,8 +8072,7 @@ mod io_uring {
             (with(net(RECV, a, 0, buf, 1, WAITALL, 2), 1, &[1 << 5]), -22),
             (with(net(RECV, a, 0, buf, 1, 0, 0), 44, &[1]), -22),
             (net(RECV, a, 0, 1 << 63, 1, 0, 0), -14),
-            // A multishot receive, and a whole selected buffer, not yet.
-            (with(net(RECV, a, 0, 0, 1, 0, 2), 1, &[1 << 5]), -22),
+            // A whole selected buffer is not there yet.
             (with(net(RECV, a, 0, 0, 1, WAITALL, 0), 1, &[1 << 5]), -22),
         ] {
             assert_eq!(one(&mut f, &r, &e), res, "{:?}", &e[..48]);

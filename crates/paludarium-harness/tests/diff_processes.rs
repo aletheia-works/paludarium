@@ -210,6 +210,7 @@ mod linux {
             // read a process's maps, descriptors, auxv, pagemap and io as
             // other users or make it another user's, the proc-fd-links case,
             // which reads links from a chroot of its own mount namespace,
+            // the maps-root case, which reads maps across a chroot,
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
@@ -219,17 +220,20 @@ mod linux {
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, the file-leases case, which writes
             // fs.leases-enable and fs.lease-break-time and becomes an
-            // unprivileged user, and the timer-waits cases, which make a
+            // unprivileged user, the dnotify-switch case, which writes
+            // fs.dir-notify-enable, and the timer-waits cases, which make a
             // fanotify group and a userfaultfd for the kernel's faults, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
                     | "file-leases"
+                    | "dnotify-switch"
                     | "timer-waits-plain"
                     | "timer-waits-restart"
                     | "timer-waits-default"
                     | "proc-mem"
                     | "chroot-names"
+                    | "maps-root"
                     | "path-flags"
                     | "permissions"
                     | "setuid"
@@ -424,6 +428,7 @@ mod linux {
                     | "veth-filter"
                     | "veth-broadcast-source"
                     | "mapped-source"
+                    | "ip-options"
                     | "udp-disconnect"
                     | "veth-neigh"
                     | "veth-ipv6"
@@ -434,13 +439,16 @@ mod linux {
                     | "veth-ipv4-via"
                     | "veth-ipv6-source"
                     | "veth-hash-seed"
+                    | "veth-ipv6-kept"
                     | "veth-hash-policy"
+                    | "veth-use-neigh"
                     | "veth-ipv6-gateway"
                     | "veth-bindtodevice"
                     | "veth-unicast-if"
                     | "veth-multicast"
                     | "veth-ipv6-multicast"
                     | "multicast-sources"
+                    | "multicast-groups"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -678,6 +686,7 @@ mod linux {
         veth_filter => ("veth-filter","veth-filter"),
         veth_broadcast_source => ("veth-broadcast-source","veth-broadcast-source"),
         mapped_source => ("mapped-source","mapped-source"),
+        ip_options => ("ip-options","ip-options"),
         udp_disconnect => ("udp-disconnect","udp-disconnect"),
         veth_neigh => ("veth-neigh","veth-neigh"),
         veth_ipv6 => ("veth-ipv6","veth-ipv6"),
@@ -688,13 +697,16 @@ mod linux {
         veth_ipv4_via => ("veth-ipv4-via","veth-ipv4-via"),
         veth_ipv6_source => ("veth-ipv6-source","veth-ipv6-source"),
         veth_hash_seed => ("veth-hash-seed","veth-hash-seed"),
+        veth_ipv6_kept => ("veth-ipv6-kept","veth-ipv6-kept"),
         veth_hash_policy => ("veth-hash-policy","veth-hash-policy"),
+        veth_use_neigh => ("veth-use-neigh","veth-use-neigh"),
         veth_ipv6_gateway => ("veth-ipv6-gateway","veth-ipv6-gateway"),
         veth_bindtodevice => ("veth-bindtodevice","veth-bindtodevice"),
         veth_unicast_if => ("veth-unicast-if","veth-unicast-if"),
         veth_multicast => ("veth-multicast","veth-multicast"),
         veth_ipv6_multicast => ("veth-ipv6-multicast","veth-ipv6-multicast"),
         multicast_sources => ("multicast-sources","multicast-sources"),
+        multicast_groups => ("multicast-groups","multicast-groups"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
@@ -821,6 +833,7 @@ mod linux {
         bpf_prog_segments => ("bpf-prog-segments","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         dnotify_calls => ("dnotify-calls","inotify"),
+        dnotify_switch => ("dnotify-switch","inotify"),
         dnotify_events => ("dnotify-events","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -988,6 +1001,7 @@ mod linux {
         processes_exec_names => ("exec-names","process"),
         processes_rename_names => ("rename-names","process"),
         processes_chroot_names => ("chroot-names","process"),
+        processes_maps_root => ("maps-root","process"),
         processes_path_flags => ("path-flags","process"),
         processes_context_switches => ("context-switches","process"),
         processes_proc_mem => ("proc-mem","process"),
@@ -1112,6 +1126,7 @@ mod linux {
         processes_timer_waits_restart => ("timer-waits-restart","timer-waits"),
         processes_timer_waits_default => ("timer-waits-default","timer-waits"),
         processes_exec_pending => ("exec-pending","exec-pending"),
+        processes_pdeath_thread => ("pdeath-thread","pdeath-thread"),
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),
@@ -1141,6 +1156,7 @@ mod linux {
         processes_mmap_low => ("mmap-low","process"),
         processes_mmap_hugetlb => ("mmap-hugetlb","process"),
         processes_shm_hugetlb => ("shm-hugetlb","process"),
+        processes_memfd_hugetlb => ("memfd-hugetlb","process"),
         processes_generated_noexec => ("generated-noexec","process"),
         processes_exec_truncated => ("exec-truncated","process"),
         processes_file_code => ("file-code","process"),
@@ -1205,6 +1221,8 @@ mod linux {
         processes_io_uring_timeout => ("io-uring-timeout","process"),
         processes_io_uring_poll_add => ("io-uring-poll-add","process"),
         processes_io_uring_fs => ("io-uring-fs","process"),
+        processes_io_uring_message => ("io-uring-message","process"),
+        processes_io_uring_multishot => ("io-uring-multishot","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

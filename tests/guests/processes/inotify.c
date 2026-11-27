@@ -1585,6 +1585,82 @@ static int case_dnotify_calls(void) {
     return 0;
 }
 
+/* The dnotify-switch case: /proc/sys/fs/dir-notify-enable, root's 0644
+   file that takes any int (proc_dointvec), turns F_NOTIFY off while 0:
+   fcntl_dirnotify gives EINVAL before it looks at the arguments or the
+   file, and a watch made before keeps signalling. As root, to write it;
+   the value it had is put back. */
+static char dn_value[32];
+static const char *dn_switch(int fd) {
+    memset(dn_value, 0, sizeof dn_value);
+    long n = pread(fd, dn_value, sizeof dn_value - 1, 0);
+    if (n < 0) snprintf(dn_value, sizeof dn_value, "errno %d", errno);
+    dn_value[strcspn(dn_value, "\n")] = 0;
+    return dn_value;
+}
+static int case_dnotify_switch(void) {
+    make_base("dnotify-switch");
+    dn_block();
+    int sw = open("/proc/sys/fs/dir-notify-enable", O_RDWR);
+    if (sw < 0) {
+        printf("open=%ld\n", e(-1));
+        return 1;
+    }
+    struct stat st;
+    fstat(sw, &st);
+    char was[32];
+    snprintf(was, sizeof was, "%s\n", dn_switch(sw));
+    printf("value=%s mode=%o uid=%d\n", dn_value, st.st_mode & 07777, (int)st.st_uid);
+    touch(at("f"));
+    int file = open(at("f"), O_RDONLY);
+    int path = open(base, O_PATH);
+    int dir = open(base, O_RDONLY | O_DIRECTORY);
+    int d = dn_watch(base, "d", DN_CREATE | DN_MULTISHOT);
+    /* Each call on a line of its own: the order of a call's arguments is
+       not C's to give. */
+    long done = e(pwrite(sw, "0\n", 2, 0));
+    printf("off=%ld value=%s\n", done, dn_switch(sw));
+    long watch = e(fcntl(dir, F_NOTIFY, DN_CREATE));
+    long none = e(fcntl(dir, F_NOTIFY, 0));
+    long multishot = e(fcntl(dir, F_NOTIFY, DN_MULTISHOT));
+    long regular = e(fcntl(file, F_NOTIFY, DN_CREATE));
+    long o_path = e(fcntl(path, F_NOTIFY, DN_CREATE));
+    printf("watch=%ld none=%ld multishot-only=%ld regular=%ld o-path=%ld\n", watch, none, multishot, regular,
+           o_path);
+    touch(at("a"));
+    dn_drain("made while off");
+    /* Any value but 0 turns it on. */
+    done = e(pwrite(sw, "-5\n", 3, 0));
+    printf("other=%ld value=%s", done, dn_switch(sw));
+    printf(" watch=%ld\n", e(fcntl(dir, F_NOTIFY, DN_CREATE)));
+    done = e(pwrite(sw, "x\n", 2, 0));
+    printf("garbage=%ld value=%s\n", done, dn_switch(sw));
+    done = e(pwrite(sw, "1\n", 2, 0));
+    printf("on=%ld value=%s\n", done, dn_switch(sw));
+    /* Another user may read it, not write it. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534)) _exit(4);
+        int r = open("/proc/sys/fs/dir-notify-enable", O_RDONLY);
+        long w = e(open("/proc/sys/fs/dir-notify-enable", O_WRONLY));
+        printf("other user read=%d write=%ld\n", r >= 0, w);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    pwrite(sw, was, strlen(was), 0);
+    close(sw);
+    close(d);
+    close(dir);
+    close(path);
+    close(file);
+    remove_all();
+    return 0;
+}
+
 static int case_dnotify_events(void) {
     make_base("dnotify-events");
     dn_block();
@@ -1780,6 +1856,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-open-handles")) return case_open_handles();
     if (!strcmp(mode, "inotify-unmount")) return case_unmount();
     if (!strcmp(mode, "dnotify-calls")) return case_dnotify_calls();
+    if (!strcmp(mode, "dnotify-switch")) return case_dnotify_switch();
     if (!strcmp(mode, "dnotify-events")) return case_dnotify_events();
     /* What case_exec_order's dynamic program does: runs argv[2]. */
     if (!strcmp(mode, "inotify-then") && argc > 2) {

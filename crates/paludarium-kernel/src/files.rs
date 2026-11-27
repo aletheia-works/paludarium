@@ -2130,12 +2130,20 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
     if crate::devices::entry(&d.path).is_some() {
         return Ok(pseudo_fs(paludarium_vfs::TMPFS_MAGIC));
     }
-    if d.file
+    let memfd = d
+        .file
         .as_any()
-        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
-        .is_some_and(crate::memfd::Memfd::is_secret)
-    {
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+    if memfd.is_some_and(crate::memfd::Memfd::is_secret) {
         return Ok(pseudo_fs(crate::memfd::SECRETMEM_MAGIC));
+    }
+    // hugetlbfs's internal mount has no size limit, so its `statfs` gives
+    // no counts, and the huge page as its block.
+    if memfd.is_some_and(crate::memfd::Memfd::is_huge) {
+        return Ok(paludarium_host::FsStats {
+            block_size: crate::hugetlb::HUGE_PAGE,
+            ..pseudo_fs(crate::memfd::HUGETLBFS_MAGIC)
+        });
     }
     if d.file
         .as_any()
@@ -2166,6 +2174,7 @@ fn mount_statfs_flags(c: &Context<'_>, stats: &paludarium_host::FsStats, path: &
         PID_FS_MAGIC,
         ANON_INODE_FS_MAGIC,
         crate::memfd::SECRETMEM_MAGIC,
+        crate::memfd::HUGETLBFS_MAGIC,
     ]
     .contains(&stats.kind)
         || [0x5049_5045, 0x534F_434B].contains(&stats.kind);
@@ -3976,7 +3985,7 @@ fn ring_operation(file: &Arc<dyn FileHandle>, write: bool) -> Result<(), Errno> 
     if !write && file.stat()?.mode & S_IFMT == 0o040000 {
         return Err(Errno::EISDIR);
     }
-    if cannot_read_or_write(file) {
+    if cannot_read_or_write(file) || write && cannot_write(file) {
         return Err(Errno::EINVAL);
     }
     let Some(any) = file.as_any() else {
@@ -4113,6 +4122,13 @@ fn cannot_read_or_write(file: &Arc<dyn FileHandle>) -> bool {
         .and_then(|any| any.downcast_ref::<crate::memfd::Memfd>())
         .is_some_and(crate::memfd::Memfd::is_secret)
 }
+/// Whether `file` has no `write`/`write_iter` (no `FMODE_CAN_WRITE`): a
+/// secret memfd, and a `MFD_HUGETLB` one, as hugetlbfs only reads.
+fn cannot_write(file: &Arc<dyn FileHandle>) -> bool {
+    file.as_any()
+        .and_then(|any| any.downcast_ref::<crate::memfd::Memfd>())
+        .is_some_and(|m| m.is_secret() || m.is_huge())
+}
 /// `readv(fd, iov, count)`, and `preadv2` at the file position, as Linux's
 /// `vfs_readv`: the access mode, a file that cannot be read
 /// ([`cannot_read_or_write`]), the vector, nothing to do for no bytes, the
@@ -4220,7 +4236,7 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     if file.flags() & 3 == 0 {
         return Err(Errno::EBADF);
     }
-    if cannot_read_or_write(&file) {
+    if cannot_write(&file) {
         return Err(Errno::EINVAL);
     }
     if crate::sockets::pipe(&file).is_some() {
@@ -4650,7 +4666,9 @@ pub(crate) const ESTALE: Errno = Errno(116);
 /// and memfds (on `device` [`crate::memfd::DEVICE`] or
 /// [`crate::memfd::SECRET_DEVICE`]) 1, so that neither's
 /// handle names the other's file, where tmpfs picks a random generation for
-/// each inode.
+/// each inode. A hugetlbfs memfd's is 0, as `hugetlbfs_get_inode` sets no
+/// generation; its handle is only an identifier (`AT_HANDLE_FID`), on a
+/// mount of its own.
 pub(crate) fn file_handle(kind: u64, device: u64, inode: u64) -> (u32, Vec<u8>) {
     let generation =
         u32::from(device == crate::memfd::DEVICE || device == crate::memfd::SECRET_DEVICE);
@@ -4957,6 +4975,8 @@ fn descriptor_kind(c: &Context<'_>, d: &Descriptor) -> Result<u64, Errno> {
     {
         return Ok(if memfd.is_secret() {
             crate::memfd::SECRETMEM_MAGIC
+        } else if memfd.is_huge() {
+            crate::memfd::HUGETLBFS_MAGIC
         } else {
             paludarium_vfs::TMPFS_MAGIC
         });
@@ -5161,9 +5181,12 @@ pub(crate) enum Internal {
     AnonInodes,
     Pidfs,
     Secretmem,
+    /// The hugetlbfs that `hugetlbfs_init` mounts for its 2 MiB pages, of
+    /// `MFD_HUGETLB` memfds.
+    Hugetlbfs,
 }
 impl Internal {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Shmem,
         Self::Nsfs,
         Self::Pipefs,
@@ -5171,6 +5194,7 @@ impl Internal {
         Self::AnonInodes,
         Self::Pidfs,
         Self::Secretmem,
+        Self::Hugetlbfs,
     ];
     /// Its device, in `stat`'s encoding (`new_encode_dev`).
     pub(crate) const fn device(self) -> u64 {
@@ -5283,11 +5307,19 @@ fn is_namespace(d: &Descriptor) -> bool {
         .is_some_and(|v| v.is::<crate::namespaces::NamespaceFile>())
 }
 /// The block size of the file a descriptor holds: procfs's for one opened
-/// in `/proc` but a namespace file, devpts's for a terminal, else
+/// in `/proc` but a namespace file, devpts's for a terminal, the huge page
+/// for a `MFD_HUGETLB` memfd (hugetlbfs's `s_blocksize`), else
 /// [`BLOCK_SIZE`].
 pub(crate) fn descriptor_block_size(c: &Context<'_>, d: &Descriptor) -> u32 {
     if in_proc(&d.path) && !is_namespace(d) || is_terminal(c, d) {
         SMALL_BLOCK_SIZE
+    } else if d
+        .file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+        .is_some_and(crate::memfd::Memfd::is_huge)
+    {
+        crate::hugetlb::HUGE_PAGE as u32
     } else {
         BLOCK_SIZE
     }
@@ -5561,7 +5593,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let requested = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
             let d = Some(c.files.descriptor(a[0])?);
             if let Some(d) = &d
-                && cannot_read_or_write(&d.file)
+                && (cannot_read_or_write(&d.file) || n == 1 && cannot_write(&d.file))
             {
                 return Err(Errno::EINVAL);
             }
@@ -5804,12 +5836,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     match (a[1], memfd) {
                         (1034, Some(memfd)) => Ok(u64::from(memfd.seals())),
                         (1033, Some(memfd)) => {
-                            let key = (crate::memfd::DEVICE, d.file.stat()?.inode);
+                            let key = (crate::memfd::device(memfd), d.file.stat()?.inode);
                             let caches = &c.files.caches;
                             let mapped = || {
-                                caches
-                                    .find(key)
-                                    .is_some_and(|cache| cache.mapped_writable())
+                                memfd.huge_mapped_writable()
+                                    || caches
+                                        .find(key)
+                                        .is_some_and(|cache| cache.mapped_writable())
                             };
                             memfd.add_seals(d.file.flags() & 3 != 0, a[2] as u32, mapped)?;
                             Ok(0)
@@ -8119,7 +8152,13 @@ fn open_path(
         }
         if let crate::proc::TaskEntry::Maps(kind) = path.entry {
             return Ok((
-                tasks::maps(&task, kind, flags, c.files.root(), owner),
+                tasks::maps(
+                    &task,
+                    kind,
+                    flags,
+                    tasks::reader_root(c, c.files.root()),
+                    owner,
+                ),
                 p.to_vec(),
             ));
         }
@@ -8337,7 +8376,7 @@ fn open_path(
                 c.mem.view(),
                 c.group.start_stack(),
                 flags,
-                c.files.root(),
+                tasks::reader_root(c, c.files.root()),
                 match entry {
                     crate::proc::OwnEntry::Smaps => crate::proc::MapsKind::Smaps,
                     crate::proc::OwnEntry::SmapsRollup => crate::proc::MapsKind::Rollup,

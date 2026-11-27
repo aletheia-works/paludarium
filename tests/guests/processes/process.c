@@ -7691,6 +7691,84 @@ static int chroot_names_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The maps-root case: maps and smaps name a file from the root of whoever
+   reads them, at each read, as show_map_vma's seq_file_path takes d_path
+   from current's root: a descriptor opened before a chroot names the file
+   from the new root once read after it, and one opened under the chroot
+   and passed to a process outside it names the file from that one's root.
+   As root, for chroot. */
+static int mr_name(int fd, uint64_t at, char *out, size_t size) {
+    static char text[1 << 16];
+    size_t length = 0;
+    long n;
+    out[0] = 0;
+    if (lseek(fd, 0, SEEK_SET)) return 0;
+    while (length < sizeof text - 1 && (n = read(fd, text + length, sizeof text - 1 - length)) > 0)
+        length += (size_t)n;
+    text[length] = 0;
+    for (char *line = text; line && *line; line = strchr(line, '\n'), line = line ? line + 1 : NULL) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && at >= start && at < end) {
+            char *path = strchr(line, '/');
+            if (path) snprintf(out, size, "%.*s", (int)strcspn(path, "\n"), path);
+            break;
+        }
+    }
+    return out[0] != 0;
+}
+static int maps_root_case(void) {
+    char dir[] = "/tmp/maps-root-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char jail[64], data[80], seen[4096];
+    snprintf(jail, sizeof jail, "%s/jail", dir);
+    snprintf(data, sizeof data, "%s/data", jail);
+    if (mkdir(jail, 0755)) return 81;
+    int fd = open(data, O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ftruncate(fd, 4096)) return 82;
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return 83;
+    uint64_t at = (uintptr_t)map;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 84;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        int maps = open("/proc/self/maps", O_RDONLY), smaps = open("/proc/self/smaps", O_RDONLY);
+        int proc = open("/proc", O_RDONLY | O_DIRECTORY);
+        if (maps < 0 || smaps < 0 || proc < 0) _exit(70);
+        mr_name(maps, at, seen, sizeof seen);
+        printf("before chroot: %d\n", !strcmp(seen, data));
+        if (chroot(jail) || chdir("/")) _exit(71);
+        mr_name(maps, at, seen, sizeof seen);
+        printf("opened before, read after: %s\n", seen);
+        mr_name(smaps, at, seen, sizeof seen);
+        printf("smaps opened before, read after: %s\n", seen);
+        /* The new root has no /proc: through the one opened before. */
+        int under = openat(proc, "self/maps", O_RDONLY);
+        mr_name(under, at, seen, sizeof seen);
+        printf("opened and read under it: %s\n", seen);
+        fflush(stdout);
+        char byte = 0;
+        if (send_fds(pair[1], "m", 1, &under, 1) != 1 || read(pair[1], &byte, 1) != 1) _exit(72);
+        _exit(0);
+    }
+    close(pair[1]);
+    int passed = -1, got = 0;
+    char byte = 0;
+    if (receive_fd(pair[0], &byte, 1, 0, &passed, &got) != 1 || passed < 0) return 85;
+    mr_name(passed, at, seen, sizeof seen);
+    printf("passed out of it: %d\n", !strcmp(seen, data));
+    if (write(pair[0], &byte, 1) != 1) return 86;
+    printf("child: %d\n", reaped(child));
+    close(passed);
+    munmap(map, 4096);
+    unlink(data);
+    rmdir(jail);
+    rmdir(dir);
+    return 0;
+}
 /* The proc-mem case: /proc/<pid>/mem reads and writes a task's memory at
    the address its position gives, as fs/proc/base.c's mem_rw does through
    access_remote_vm with FOLL_FORCE: a read-only page is written, a call
@@ -12291,6 +12369,278 @@ static int io_uring_poll_add_case(void) {
     up_run(&u, 1, 1, "hup-multi");
     unet_push(&u, 14, 3, 0, 0, 1, 0, 0, 0);
     up_run(&u, 1, 2, "hup-multi-cancelled");
+    close(u.fd);
+    return 0;
+}
+
+/* io_uring's messages: IORING_OP_SENDMSG and _RECVMSG. */
+static int um_run(struct uring *u, unsigned n, unsigned wait, const char *label) {
+    uring_show(label, uring_enter(u->fd, n, wait, 1, NULL, 0));
+    return unet_reap(u, label, 0);
+}
+
+static unsigned char *um_push(struct uring *u, unsigned char op, unsigned long data, int fd,
+                              struct msghdr *msg, unsigned flags, unsigned short prio) {
+    return unet_push(u, op, data, fd, 0, (long)msg, 1, flags, prio);
+}
+
+static int io_uring_message_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    int stream[2], gram[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, stream) || socketpair(AF_UNIX, SOCK_DGRAM, 0, gram))
+        return 81;
+    char out[16] = "hello world", one[4] = {0}, two[64] = {0};
+    struct iovec send_iov[2] = {{out, 5}, {out + 5, 6}};
+    struct iovec receive_iov[2] = {{one, 3}, {two, sizeof two}};
+    struct msghdr send = {.msg_iov = send_iov, .msg_iovlen = 2};
+    struct msghdr receive = {.msg_iov = receive_iov, .msg_iovlen = 2};
+    unsigned char *sqe;
+
+    /* The preparation. */
+    static const unsigned char bad[] = {8, 44};
+    for (unsigned i = 0; i < sizeof bad; i++) {
+        um_push(&u, 9, 1, stream[0], &send, 0, 0)[bad[i]] = 1;
+        um_run(&u, 1, 1, "send-refused");
+        um_push(&u, 10, 1, stream[0], &receive, 0, 0)[bad[i]] = 1;
+        um_run(&u, 1, 1, "receive-refused");
+    }
+    um_push(&u, 9, 1, stream[0], &send, 0, 16);
+    um_run(&u, 1, 1, "send-bundle");
+    um_push(&u, 10, 1, stream[0], &receive, 0, 16);
+    um_run(&u, 1, 1, "receive-bundle");
+    um_push(&u, 9, 1, stream[0], &send, 0, 0)[27] = 0x80;
+    um_run(&u, 1, 1, "send-length");
+    um_push(&u, 9, 1, stream[0], (struct msghdr *)8, 0, 0);
+    um_run(&u, 1, 1, "send-unmapped");
+    um_push(&u, 10, 1, stream[0], (struct msghdr *)8, 0, 0);
+    um_run(&u, 1, 1, "receive-unmapped");
+    struct msghdr many = {.msg_iov = send_iov, .msg_iovlen = 2000};
+    um_push(&u, 9, 1, stream[0], &many, 0, 0);
+    um_run(&u, 1, 1, "send-many");
+    struct msghdr named = {.msg_name = (void *)8, .msg_namelen = 4, .msg_iov = send_iov,
+                           .msg_iovlen = 1};
+    um_push(&u, 9, 1, gram[0], &named, 0, 0);
+    um_run(&u, 1, 1, "send-name-unmapped");
+    struct msghdr iov = {.msg_iov = (struct iovec *)8, .msg_iovlen = 1};
+    um_push(&u, 10, 1, stream[0], &iov, 0, 0);
+    um_run(&u, 1, 1, "receive-iov-unmapped");
+    um_push(&u, 9, 1, stream[0], &send, 0, 0)[1] = 1 << 5;
+    um_run(&u, 1, 1, "send-select");
+    um_push(&u, 9, 1, 0, &send, 0, 0);
+    um_run(&u, 1, 1, "send-no-socket");
+    um_push(&u, 10, 1, 0, &receive, 0, 0);
+    um_run(&u, 1, 1, "receive-no-socket");
+
+    /* A receive that waits has its header and iovecs, which may go. */
+    um_push(&u, 10, 1, stream[1], &receive, 0, 0);
+    um_run(&u, 1, 0, "receive-waits");
+    receive_iov[0].iov_base = receive_iov[1].iov_base = NULL;
+    um_push(&u, 9, 2, stream[0], &send, 0, 0);
+    um_run(&u, 1, 2, "sent");
+    printf("%.3s %.8s %zu\n", one, two, (size_t)receive.msg_controllen);
+    receive_iov[0] = (struct iovec){one, 3};
+    receive_iov[1] = (struct iovec){two, 12};
+
+    /* MSG_WAITALL, and not waiting. */
+    memset(two, 0, sizeof two);
+    um_push(&u, 10, 1, stream[1], &receive, MSG_WAITALL, 0);
+    um_run(&u, 1, 0, "whole-waits");
+    write(stream[0], "hello", 5);
+    um_run(&u, 0, 0, "whole-part");
+    write(stream[0], " world and", 10);
+    um_run(&u, 0, 1, "whole");
+    printf("%.3s %.12s\n", one, two);
+    um_push(&u, 10, 1, stream[1], &receive, MSG_DONTWAIT, 0);
+    um_run(&u, 1, 1, "nowait");
+
+    /* Descriptors and credentials. */
+    union {
+        struct cmsghdr header;
+        char space[CMSG_SPACE(sizeof(int))];
+    } control;
+    memset(&control, 0, sizeof control);
+    send.msg_control = &control;
+    send.msg_controllen = sizeof control;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&send);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &stream[0], sizeof(int));
+    um_push(&u, 9, 1, gram[0], &send, 0, 0);
+    um_run(&u, 1, 1, "rights-sent");
+    memset(&control, 0, sizeof control);
+    receive.msg_control = &control;
+    receive.msg_controllen = sizeof control;
+    um_push(&u, 10, 1, gram[1], &receive, MSG_CMSG_CLOEXEC, 0);
+    um_run(&u, 1, 1, "rights");
+    cmsg = CMSG_FIRSTHDR(&receive);
+    int passed = -1;
+    if (cmsg) memcpy(&passed, CMSG_DATA(cmsg), sizeof passed);
+    printf("type %d cloexec %d flags %#x\n", cmsg ? cmsg->cmsg_type : -1,
+           fcntl(passed, F_GETFD), receive.msg_flags);
+    close(passed);
+
+    /* What is cut fails a receive of the whole, and its link. */
+    receive.msg_control = NULL;
+    receive.msg_controllen = 0;
+    receive.msg_iovlen = 1;
+    static const unsigned flags[] = {0, MSG_WAITALL, MSG_WAITALL | MSG_TRUNC, MSG_TRUNC};
+    for (unsigned i = 0; i < sizeof flags / sizeof *flags; i++) {
+        write(gram[0], "hello", 5);
+        um_push(&u, 10, 1, gram[1], &receive, flags[i], 0)[1] = 4;
+        uring_push(&u, 0, 2);
+        um_run(&u, 2, 2, "cut");
+        write(gram[0], "hello", 5);
+        sqe = unet_push(&u, 27, 1, gram[1], 0, (long)one, 3, flags[i], 0);
+        sqe[1] = 4;
+        uring_push(&u, 0, 2);
+        um_run(&u, 2, 2, "cut-receive");
+    }
+    write(gram[0], "hel", 3);
+    sqe = unet_push(&u, 27, 1, gram[1], 0, (long)one, 3, MSG_WAITALL, 0);
+    sqe[1] = 4;
+    uring_push(&u, 0, 2);
+    um_run(&u, 2, 2, "whole-receive");
+    write(gram[0], "he", 2);
+    um_push(&u, 10, 1, gram[1], &receive, MSG_WAITALL, 0)[1] = 4;
+    uring_push(&u, 0, 2);
+    um_run(&u, 2, 2, "short");
+
+    /* A selected buffer, for which the iovec gives the length alone. */
+    char pool[32];
+    sqe = unet_push(&u, 31, 1, 1, 0, (long)pool, 32, 0, 0);
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "provided");
+    write(gram[0], "selected", 8);
+    receive_iov[0] = (struct iovec){NULL, 6};
+    sqe = um_push(&u, 10, 1, gram[1], &receive, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "select");
+    printf("%.6s flags %#x\n", pool, receive.msg_flags);
+    receive.msg_iovlen = 2;
+    sqe = um_push(&u, 10, 1, gram[1], &receive, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "select-two");
+    receive.msg_iovlen = 0;
+    sqe = um_push(&u, 10, 1, gram[1], &receive, 0, 0);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "select-none");
+
+    /* The end. */
+    receive.msg_iovlen = 1;
+    receive_iov[0] = (struct iovec){one, 3};
+    close(stream[0]);
+    um_push(&u, 10, 1, stream[1], &receive, 0, 0);
+    um_run(&u, 1, 1, "end");
+    send.msg_control = NULL;
+    send.msg_controllen = 0;
+    um_push(&u, 9, 1, stream[1], &send, 0, 0);
+    um_run(&u, 1, 1, "broken");
+    close(u.fd);
+    return 0;
+}
+
+/* io_uring's multishot requests: IORING_ACCEPT_MULTISHOT and
+   IORING_RECV_MULTISHOT. */
+static int um_connect(struct sockaddr_un *name, socklen_t len) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    printf("connect %d\n", connect(fd, (struct sockaddr *)name, len));
+    return fd;
+}
+
+static void um_provide(struct uring *u, char *pool, int count) {
+    unet_push(u, 31, 99, count, 0, (long)pool, 4, 0, 0)[40] = 3;
+    um_run(u, 1, 1, "provide");
+}
+
+static int io_uring_multishot_case(void) {
+    struct uring u;
+    if (uring_open(&u, 4)) return 80;
+    struct sockaddr_un name = {.sun_family = AF_UNIX};
+    snprintf(name.sun_path + 1, sizeof name.sun_path - 1, "uring-multishot-%d", getpid());
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name.sun_path + 1);
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (bind(listener, (struct sockaddr *)&name, len) || listen(listener, 8)) return 81;
+    unsigned char *sqe;
+    int slots[2] = {-1, -1};
+
+    /* Accepts, waiting or not. */
+    unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    um_run(&u, 1, 0, "accept-waits");
+    int first = um_connect(&name, len);
+    um_run(&u, 0, 1, "accept");
+    int second = um_connect(&name, len);
+    um_run(&u, 0, 1, "accept-again");
+    unet_push(&u, 14, 2, 0, 0, 1, 0, 0, 0);
+    um_run(&u, 1, 2, "accept-cancelled");
+    close(um_connect(&name, len));
+    close(um_connect(&name, len));
+    unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    um_run(&u, 1, 2, "accept-both");
+    unet_push(&u, 14, 2, 0, 0, 1, 0, 0, 0);
+    um_run(&u, 1, 2, "accept-both-cancelled");
+    unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1 | 2);
+    um_run(&u, 1, 1, "accept-nowait");
+    sqe = unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    sqe[44] = 1;
+    um_run(&u, 1, 1, "accept-slot");
+    syscall(427, u.fd, 2, slots, 2);
+    sqe = unet_push(&u, 13, 1, listener, 0, 0, 0, 0, 1);
+    memset(sqe + 44, 0xff, 4);
+    um_run(&u, 1, 0, "accept-slots");
+    for (int i = 0; i < 3; i++) {
+        close(um_connect(&name, len));
+        um_run(&u, 0, 1, "accept-slot-any");
+    }
+
+    /* Receives. */
+    char pool[16];
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 82;
+    unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    um_run(&u, 1, 1, "receive-no-select");
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, MSG_WAITALL, 2);
+    sqe[1] = 1 << 5;
+    um_run(&u, 1, 1, "receive-whole");
+    write(pair[0], "abcd", 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "receive-no-buffer");
+    um_provide(&u, pool, 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "receive");
+    write(pair[0], "ef", 2);
+    um_run(&u, 0, 1, "receive-more");
+    write(pair[0], "ghijkl", 6);
+    um_run(&u, 0, 2, "receive-two");
+    write(pair[0], "mn", 2);
+    um_run(&u, 0, 1, "receive-out");
+    um_provide(&u, pool, 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 3, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 3;
+    um_run(&u, 1, 1, "receive-length");
+    write(pair[0], "opqrs", 5);
+    um_run(&u, 0, 2, "receive-three");
+    unet_push(&u, 14, 2, 0, 0, 1, 0, 0, 0);
+    um_run(&u, 1, 2, "receive-cancelled");
+    um_provide(&u, pool, 4);
+    sqe = unet_push(&u, 27, 1, pair[1], 0, 0, 0, 0, 2);
+    sqe[1] = 1 << 5 | 1 << 2;
+    sqe[40] = 3;
+    uring_push(&u, 0, 5);
+    um_run(&u, 2, 0, "receive-linked");
+    close(pair[0]);
+    um_run(&u, 0, 2, "receive-end");
+    close(first);
+    close(second);
     close(u.fd);
     return 0;
 }
@@ -19401,6 +19751,104 @@ static int shm_hugetlb_case(void) {
     /* shmget's own checks come before those of SHM_HUGETLB. */
     printf("empty=%d huge-size=%d\n", shm_hugetlb_get(0, SHM_NORESERVE | 12 << 26),
            shm_hugetlb_get((size_t)1 << 62, 0));
+    return 0;
+}
+/* The memfd-hugetlb case: MFD_HUGETLB makes a file on hugetlbfs, with no
+   huge page in the pool. Another size is ENODEV; it can't be written, its
+   size is whole huge pages, and fallocate has no page to give (ENOSPC). Its
+   mapping is ENOMEM, but maps with MAP_NORESERVE, raises SIGBUS, grows the
+   file to its end when it may write, and keeps F_SEAL_WRITE out while it
+   lasts. */
+static int rc_errno(long rc) {
+    return rc < 0 ? errno : (int)rc;
+}
+static int memfd_hugetlb_case(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    struct sigaction action = {.sa_flags = SA_SIGINFO};
+    action.sa_sigaction = on_bus;
+    sigaction(SIGBUS, &action, NULL);
+    unsigned sizes[] = {0, 12, 20, 21, 22};
+    for (int i = 0; i < 5; i++) {
+        long fd = syscall(SYS_memfd_create, "size", 4u | sizes[i] << 26);
+        printf("size-%u=%d\n", sizes[i], fd < 0 ? errno : 0);
+        if (fd >= 0) close(fd);
+    }
+    int fd = syscall(SYS_memfd_create, "huge", 4u | 2u); /* MFD_HUGETLB | MFD_ALLOW_SEALING */
+    if (fd < 0) return 80;
+    struct stat st;
+    struct statfs sf;
+    if (fstat(fd, &st) || fstatfs(fd, &sf)) return 81;
+    printf("stat: size=%ld blksize=%ld blocks=%ld mode=%o links=%ld\n", (long)st.st_size,
+           (long)st.st_blksize, (long)st.st_blocks, (unsigned)(st.st_mode & 07777), (long)st.st_nlink);
+    printf("statfs: type=%#lx bsize=%ld blocks=%ld files=%ld namelen=%ld\n", (unsigned long)sf.f_type,
+           (long)sf.f_bsize, (long)sf.f_blocks, (long)sf.f_files, (long)sf.f_namelen);
+    char path[64], link[128];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    long n = readlink(path, link, sizeof link - 1);
+    printf("link=%.*s\n", (int)(n > 0 ? n : 0), link);
+    errno = 0;
+    printf("write=%d", rc_errno(write(fd, "x", 1)));
+    printf(" pwrite=%d", rc_errno(pwrite(fd, "x", 1, 0)));
+    printf(" small=%d", rc_errno(ftruncate(fd, 4096)));
+    printf(" whole=%d", rc_errno(ftruncate(fd, HUGE_2M)));
+    printf(" allocate=%d", rc_errno(fallocate(fd, 0, 0, 4096)));
+    printf(" keep=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4096)));
+    printf(" punch=%d", rc_errno(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096)));
+    printf(" zero=%d\n", rc_errno(fallocate(fd, 0x10 /* FALLOC_FL_ZERO_RANGE */, 0, 4096)));
+    char buffer[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    n = pread(fd, buffer, sizeof buffer, 4096);
+    printf("read=%ld byte=%d\n", n, buffer[0]);
+    fstat(fd, &st);
+    printf("size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
+    int rw = PROT_READ | PROT_WRITE, none = MAP_SHARED | MAP_NORESERVE;
+    printf("reserve=%d", low_error(mmap(NULL, 1, rw, MAP_SHARED, fd, 0)));
+    printf(" private=%d", low_error(mmap(NULL, 1, rw, MAP_PRIVATE, fd, 0)));
+    printf(" offset=%d", low_error(mmap(NULL, 1, rw, none, fd, 4096)));
+    printf(" empty=%d", low_error(mmap(NULL, 0, rw, none, fd, 0)));
+    char *flagged = mmap(NULL, 1, PROT_READ, none | MAP_HUGETLB | 30u << 26, fd, 0);
+    printf(" flagged=%d", low_error(flagged));
+    if (flagged != MAP_FAILED) munmap(flagged, HUGE_2M);
+    char *at = mmap(NULL, 1, rw, none, fd, HUGE_2M);
+    printf(" mapped=%d aligned=%d\n", low_error(at), at != MAP_FAILED && !((uintptr_t)at % HUGE_2M));
+    if (at == MAP_FAILED) return 82;
+    huge_smaps("vma", at);
+    touch("read", at, 0);
+    touch("write", at + HUGE_2M - 1, 1);
+    fstat(fd, &st);
+    printf("grown=%ld\n", (long)st.st_size);
+    errno = 0;
+    printf("seal-mapped=%d", rc_errno(fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE)));
+    printf(" unmap=%d", rc_errno(munmap(at, 1)));
+    printf(" unmapped=%d", rc_errno(munmap(at, HUGE_2M)));
+    printf(" seal=%d", rc_errno(fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE)));
+    printf(" sealed=%d", low_error(mmap(NULL, HUGE_2M, rw, none, fd, 0)));
+    char *ro = mmap(NULL, HUGE_2M, PROT_READ, none, fd, 0);
+    printf(" read-only=%d", low_error(ro));
+    printf(" protect=%d", ro == MAP_FAILED ? -1 : rc_errno(mprotect(ro, HUGE_2M, rw)));
+    printf(" punch=%d\n", rc_errno(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096)));
+    int again = open(path, O_RDONLY);
+    printf("reopened: shared-write=%d",
+           again < 0 ? -1 : low_error(mmap(NULL, HUGE_2M, rw, none, again, 0)));
+    char *read_only = again < 0 ? MAP_FAILED : mmap(NULL, HUGE_2M, PROT_READ, none, again, 0);
+    printf(" read=%d", low_error(read_only));
+    printf(" grow=%d\n", rc_errno(ftruncate(fd, 3 * HUGE_2M)));
+    /* fallocate's checks before its ENOSPC: RLIMIT_FSIZE, then F_SEAL_GROW. */
+    signal(SIGXFSZ, SIG_IGN);
+    /* Only the soft limit, so that it can be raised again without
+     * CAP_SYS_RESOURCE. */
+    struct rlimit fsize;
+    getrlimit(RLIMIT_FSIZE, &fsize);
+    struct rlimit small = {HUGE_2M, fsize.rlim_max};
+    printf("lower=%d", rc_errno(setrlimit(RLIMIT_FSIZE, &small)));
+    printf(" fsize=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8 * HUGE_2M)));
+    printf(" restore=%d", rc_errno(setrlimit(RLIMIT_FSIZE, &fsize)));
+    printf(" in-size=%d", rc_errno(fallocate(fd, 0, 0, 4096)));
+    printf(" seal-grow=%d", rc_errno(fcntl(fd, F_ADD_SEALS, F_SEAL_GROW)));
+    printf(" past=%d", rc_errno(fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8 * HUGE_2M)));
+    printf(" within=%d", rc_errno(fallocate(fd, 0, 0, 4096)));
+    /* Its pages are zeros, which run nothing. */
+    char *argv[] = {"huge", NULL}, *envp[] = {NULL};
+    printf(" exec=%d\n", rc_errno(syscall(SYS_execveat, fd, "", argv, envp, AT_EMPTY_PATH)));
     return 0;
 }
 /* The anon-thp-placement case: private anonymous memory of whole 2 MiB with
@@ -43449,6 +43897,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mmap-low")) return mmap_low_case();
     if (!strcmp(mode, "mmap-hugetlb")) return mmap_hugetlb_case();
     if (!strcmp(mode, "shm-hugetlb")) return shm_hugetlb_case();
+    if (!strcmp(mode, "memfd-hugetlb")) return memfd_hugetlb_case();
     if (!strcmp(mode, "io-uring-placement")) return io_uring_placement_case();
     if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "exec-truncated")) return exec_truncated_case();
@@ -43533,6 +43982,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "io-uring-timeout")) return io_uring_timeout_case();
     if (!strcmp(mode, "io-uring-poll-add")) return io_uring_poll_add_case();
     if (!strcmp(mode, "io-uring-fs")) return io_uring_fs_case();
+    if (!strcmp(mode, "io-uring-message")) return io_uring_message_case();
+    if (!strcmp(mode, "io-uring-multishot")) return io_uring_multishot_case();
     if (!strcmp(mode, "io-uring-exec-reap")) {
         struct uring r;
         r.fd = 50;
@@ -43981,6 +44432,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "path-flags")) return path_flags_case(self);
     if (!strcmp(mode, "chroot-names")) return chroot_names_case();
     if (!strcmp(mode, "chroot-names-child")) return chroot_names_child();
+    if (!strcmp(mode, "maps-root")) return maps_root_case();
     if (!strcmp(mode, "vma-merges")) return vma_merges_case();
     if (!strcmp(mode, "proc-mem")) return proc_mem_case();
     if (!strcmp(mode, "page-faults")) return page_faults_case(self);

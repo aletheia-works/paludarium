@@ -373,8 +373,8 @@ kernel.
 
 - `memfd_create` makes an unlinked in-memory file (mode 0777, or 0666 with
   `MFD_NOEXEC_SEAL`, and no links), with Linux's flag and name checks
-  (`EINVAL`, `EFAULT`); `MFD_HUGETLB` gives `ENOSYS`, as from a kernel
-  without hugetlbfs. Its seals, through `fcntl`'s `F_ADD_SEALS` and
+  (`EINVAL`, `EFAULT`); `MFD_HUGETLB` makes a file on hugetlbfs (see
+  `MAP_HUGETLB` below). Its seals, through `fcntl`'s `F_ADD_SEALS` and
   `F_GET_SEALS`, start as `F_SEAL_SEAL` unless `MFD_ALLOW_SEALING` is given
   (`F_SEAL_EXEC` with `MFD_NOEXEC_SEAL`), and restrict the file as tmpfs
   does: `F_SEAL_WRITE` and `F_SEAL_FUTURE_WRITE` refuse writes, punch holes
@@ -1829,10 +1829,18 @@ kernel.
   guards, and `MADV_DONTNEED` from an address off a 2 MiB boundary
   (`EINVAL`). The only size is
   2 MiB (another is `EINVAL`), as the virtual CPU has no 1 GiB pages, and a
-  file with the flag is `EINVAL`. The memory is a hugetlbfs file's, so it
-  takes a file's types: `MAP_SHARED_VALIDATE` maps it (`EOPNOTSUPP` for a
-  flag it refuses), and `MAP_DROPPABLE` is `EINVAL`, after the placement
-  and the lock checks, as in `do_mmap`.
+  file with the flag is `EINVAL`, but for a hugetlbfs one. The memory is
+  a hugetlbfs file's, so it takes a file's types: `MAP_SHARED_VALIDATE`
+  maps it (`EOPNOTSUPP` for a flag it refuses), and `MAP_DROPPABLE` is
+  `EINVAL`, after the placement and the lock checks, as in `do_mmap`.
+  `memfd_create` with `MFD_HUGETLB` makes such a file, of 2 MiB pages
+  (another size is `ENODEV`): it has no `write` (`EINVAL`), its size is
+  whole huge pages (`ftruncate` to another is `EINVAL`), `fallocate` has no
+  page to give it (`ENOSPC`), and a read finds zeros. `fstat` gives a block
+  of 2 MiB and no blocks, and `fstatfs` hugetlbfs's type and block. Its
+  mapping is as above, the length rounded up to 2 MiB whatever the flags;
+  one that may write raises the file's size to its end, and a shared one
+  that may write keeps `F_SEAL_WRITE` out (`EBUSY`).
 
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
@@ -1874,8 +1882,8 @@ kernel.
   `_CLOSE`, `_STATX`, `_FALLOCATE`, `_FADVISE`, `_MADVISE`, `_RENAMEAT`,
   `_UNLINKAT`, `_MKDIRAT`, `_SYMLINKAT`, `_LINKAT` and `_FTRUNCATE`, and the
   socket requests
-  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
-  `_RECV`. The other operations complete with `EOPNOTSUPP`, as on a Linux
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. The other operations complete with `EOPNOTSUPP`, as on a Linux
   built without them, and `IORING_REGISTER_PROBE` reports only these. The
   rings are the sizes, offsets and features Linux gives, and `mmap` of the
   descriptor shows them. The descriptor is an anonymous inode of its own,
@@ -2079,9 +2087,21 @@ kernel.
   queued), or gives it new events (`IORING_POLL_UPDATE_EVENTS`) or
   `user_data` (`IORING_POLL_UPDATE_USER_DATA`), with which it polls again.
 
-- The socket requests are Linux 7.0's single-shot ones (`io_uring/net.c`):
-  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND` and
-  `_RECV`. Each is prepared as Linux prepares it, which checks its entry
+- The socket requests are Linux 7.0's (`io_uring/net.c`):
+  `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
+  `_RECV`, `_SENDMSG` and `_RECVMSG`. The last two read their `msghdr` and
+  its iovecs as they are prepared (`io_msg_copy_hdr`: `EFAULT`, `EINVAL`,
+  `EMSGSIZE`), so one that waits needs them no more. A receive with
+  `MSG_WAITALL` whose message or ancillary data was cut fails its link.
+  With `IORING_ACCEPT_MULTISHOT` and `IORING_RECV_MULTISHOT`, an accept and
+  an `IORING_OP_RECV` post a completion with `IORING_CQE_F_MORE` for each
+  connection or each buffer filled, and wait for the next: until an error,
+  the end, a receive's limit (`optlen`), no buffer (`ENOBUFS`) or no room in
+  the queue. It goes on at once while its socket has more
+  (`IORING_CQE_F_SOCK_NONEMPTY`) or does not say, as an AF_UNIX listener
+  does not, and otherwise waits for the socket first, so a receive whose
+  last buffer went fails with `ENOBUFS` only when more bytes come. Each is
+  prepared as Linux prepares it, which checks its entry
   (`EINVAL`), then reads a connect's or a send's address
   (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a
   buffer in the user half (`EFAULT`). It runs as Linux runs it inline,
@@ -3080,7 +3100,12 @@ kernel.
     matches a route's first hop, and one with `RTA_MULTIPATH` each of its
     hops in turn (`fib_nh_match`). A lookup takes the hop the hash of its
     flow falls to, each hop living taking a share of the hashes by its
-    weight (`fib_select_multipath`, `fib_rebalance`). The hash is of what
+    weight (`fib_select_multipath`, `fib_rebalance`). With
+    `net.ipv4.fib_multipath_use_neigh` 1, it passes over a hop whose
+    gateway, reached by a route of link scope, has a neighbour on the
+    hop's device that is not valid (`fib_good_nh`), the hop keeping its
+    share, and takes the first hop living where it passes over all. The
+    hash is of what
     `net.ipv4.fib_multipath_hash_policy` names (`fib_multipath_hash`): the
     source and destination (0 and 2); those, the protocol and the ports
     (1); or the fields `fib_multipath_hash_fields` names (3). An
@@ -3695,6 +3720,24 @@ kernel.
     discovery's of `lo` and the ends with IPv6 (`ipv6_add_dev`). Strictly, an
     `ndtmsg` short, with padding or with attributes after it is `EINVAL`
     (`neightbl_valid_dump_info`).
+  - **Multicast groups:** an `RTM_GETMULTICAST` dump of `AF_INET`, as
+    `inet_dump_ifmcaddr`, gives the IPv4 groups of each device, by index,
+    each's the newest first, in messages of that type: a permanent
+    address of 32 bits and the universe's scope, the group
+    (`IFA_MULTICAST`), its users (`IFA_MC_USERS`, of Linux master; 7.0's
+    has none) and endless lifetimes from when the device joined it
+    (`inet_fill_ifmcaddr`). Its request is checked as an address dump's: a
+    device it names is `ENODEV` for none and marks the messages
+    `NLM_F_DUMP_FILTERED`, and a namespace it names (`IFA_TARGET_NETNSID`)
+    shows its groups without the ID. `NLMSG_DONE` comes in the last
+    messages' read. A device that joins a group anew, or leaves it for
+    good, tells `RTNLGRP_IPV4_MCADDR` (37) with `RTM_NEWMULTICAST` or
+    `RTM_DELMULTICAST` (`inet_ifmcaddr_notify`): as a socket's membership
+    is its first or its last, with a source filter's first source and
+    last too; and the all-hosts group as the device comes up, after
+    `lo`'s address and before the routes (`ip_mc_up`), and as it goes
+    down, before the routes and neighbours go, closes, or goes
+    (`ip_mc_down`, `ip_mc_destroy_dev`), which forgets the rest unsaid.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
@@ -4255,7 +4298,9 @@ kernel.
   `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
-  unmarked; `maps` and `smaps` name a mapped file the same way.
+  unmarked; `maps` and `smaps` name a mapped file the same way, from the
+  root of whoever reads them at each read, so a descriptor opened before a
+  `chroot` or passed to another process names it from the reader's root.
   `smaps_rollup` is what `smaps` counts of every VMA summed under one line,
   from the first VMA's start to the last one's end with no flags, file or
   name but `[rollup]`, as Linux's `show_smaps_rollup` makes it: `Pss` is
@@ -4532,8 +4577,8 @@ kernel.
   may open to write. Both are unsigned longs, as Linux's
   `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
   (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
-  `/proc/sys/fs` lists only these, `fanotify`, `inotify`, `mqueue`,
-  `lease-break-time` and `leases-enable`.
+  `/proc/sys/fs` lists only these, `dir-notify-enable`, `fanotify`,
+  `inotify`, `mqueue`, `lease-break-time` and `leases-enable`.
 
 - `/proc/sys/fs/inotify` has the machine's inotify limits, root's regular
   files of mode 0644 that only root (user ID 0 outside any user namespace)
@@ -4636,8 +4681,9 @@ kernel.
   `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
   `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`,
-  `ipv4/fib_multipath_hash_seed`, and `fib_multipath_hash_policy` and
-  `fib_multipath_hash_fields` of `ipv4` and of `ipv6`. They and their
+  `ipv4/fib_multipath_hash_seed`, `ipv4/fib_multipath_use_neigh`, and
+  `fib_multipath_hash_policy` and `fib_multipath_hash_fields` of `ipv4`
+  and of `ipv6`. They and their
   directories belong to the root of the user namespace that owns the
   network namespace; the files are 0644, which root and whoever has
   `CAP_NET_ADMIN` over that namespace may open to write
@@ -4679,6 +4725,8 @@ kernel.
     `fib_multipath_hash_fields`, of 1 to 0xfff (`proc_douintvec_minmax`),
     `EINVAL` past them; a new namespace has policy 0 and fields 7 (the
     source, the destination and the protocol), each family its own.
+    `fib_multipath_use_neigh` takes 0 or 1 so (`proc_dou8vec_minmax`), 0
+    in a new namespace.
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
 
@@ -6186,6 +6234,10 @@ kernel.
     its watch, as do asking with no events and the table's end.
   - A file that is not a directory gives `ENOTDIR`, an `O_PATH` descriptor
     `EBADF`. Unknown bits are ignored.
+  - `/proc/sys/fs/dir-notify-enable`, the machine's (1 at first), is root's
+    file of mode 0644 that takes any `int` (`proc_dointvec`). While it is 0,
+    `F_NOTIFY` gives `EINVAL` before anything else, even with no events;
+    watches already there keep signalling.
 
 - An inotify instance (`inotify_init`, `inotify_init1`, with `IN_NONBLOCK`
   and `IN_CLOEXEC`) watches files by their device and inode, which
@@ -6451,8 +6503,11 @@ kernel.
 
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per
   thread, taken from the program's file name at `execve` and inherited by new
-  threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
-  parent exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
+  threads and processes), `PR_SET_PDEATHSIG` (per thread, none for a new
+  thread or process; as Linux's `forget_original_parent` sends it, each
+  thread's signal goes to its process when the parent's thread that made
+  the process exits, even if the parent goes on, and again as each thread
+  the process is then a child of exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
   again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), the capability module's `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`
   (with `CAP_SETPCAP`), `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` (which
@@ -6517,8 +6572,8 @@ kernel.
   while -1 does not report those it may not signal. A signal from `kill` or
   `pidfd_send_signal` gives its sender's PID in `si_pid` and real user ID in
   `si_uid`, as `tkill` and `tgkill` do, and the `PR_SET_PDEATHSIG` signal the
-  PID and real user ID of the parent that exited, which needs the same
-  permission.
+  parent's PID and the real user ID of its thread that exited, which needs
+  the same permission of that thread over the thread that set the signal.
 
 - `rt_sigqueueinfo` (behind `sigqueue`) sends a process the caller's siginfo
   as it is, and `rt_tgsigqueueinfo` sends it to one thread, so the signal
@@ -6688,7 +6743,10 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `TCP_KEEPCNT`, `TCP_QUICKACK`, `TCP_USER_TIMEOUT`, `TCP_INFO` (read
     only), `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
     `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
-    `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
+    `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`), and takes one
+    byte for an `int` (`do_ip_setsockopt`); a datagram socket takes its two
+    bits of ECN, and TCP keeps its own (`__ip_sock_set_tos`).
+    `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
     while it is closed or listening). `SO_BINDTODEVICE` takes a device's
@@ -6725,9 +6783,15 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     address or `::1`;
     else through it rather than another, among the routes of one prefix
     and metric (`rt6_score_route`). Connecting a socket of no device to a
-    group of the link makes `IPV6_MULTICAST_IF`'s its own. Each send looks
-    its route up, where Linux's connected socket keeps the one it has
-    (`ip6_sk_dst_lookup_flow`) when one of these options goes back to 0.
+    group of the link makes `IPV6_MULTICAST_IF`'s its own. A connected
+    socket keeps the route its `connect` found, with its hop
+    (`ip6_sk_dst_lookup_flow`, of Linux master: `sendto` with an address
+    looks one up): a `send` takes it while one of these options names
+    another device no more, until the route goes or its node changes
+    (`ip6_dst_check`), as a route added there or at a longer prefix, a hop
+    gone dead, an address gone and one whose duplicate address detection
+    is done change it, or `SO_BINDTODEVICE`, `SO_BINDTOIFINDEX` or another
+    `IP_TOS` drops it; then it keeps the one it looks up.
     `IP_UNICAST_IF`, of IPv4 and IPv6 sockets and TCP's too, takes the
     index of a device in network byte order (`EADDRNOTAVAIL` for one there
     is not) in an `int` exactly (`EINVAL` for another length), 0 for none,
@@ -6736,7 +6800,7 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     IPv4-mapped one too, and a UDP `connect` go through its device where
     the socket has none of its own (`udp_sendmsg`,
     `__ip4_datagram_connect`), as through `SO_BINDTODEVICE`'s; TCP goes by
-    its routes. Each send looks its route up, where Linux's connected
+    its routes. Each IPv4 send looks its route up, where Linux's connected
     socket keeps the one its `connect` found (`sk_dst_check`), until the
     routes change, when the option changes after it.
   - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it

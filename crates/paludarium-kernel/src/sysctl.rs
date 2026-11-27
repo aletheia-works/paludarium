@@ -16,7 +16,9 @@
 //! The machine's `/proc/sys/fs/leases-enable` (1 at first) and
 //! `/proc/sys/fs/lease-break-time` (45), as `fs/locks.c` has them, are
 //! root's files of mode 0644 that take any `int` (`proc_dointvec`), as the
-//! machine's `/proc/sys/kernel` files below are.
+//! machine's `/proc/sys/kernel` files below are, and so is
+//! `/proc/sys/fs/dir-notify-enable` (1 at first), with which `F_NOTIFY` is
+//! `EINVAL` while 0, as `fs/notify/dnotify/dnotify.c` has it.
 //!
 //! `/proc/sys/kernel` has the System V IPC limits of the opener's IPC
 //! namespace, as Linux's `ipc/ipc_sysctl.c` has them: `shmmax` and `shmall`
@@ -138,7 +140,7 @@ impl Directory {
 /// A file of `/proc/sys/net`, of the caller's network namespace
 /// ([`crate::netconf`]): `ipv4/fib_multipath_hash_seed`, and each family's
 /// `fib_multipath_hash_policy` and `fib_multipath_hash_fields`
-/// ([`crate::multipath`]), `ipv4/ip_forward` (`all`'s forwarding),
+/// ([`crate::multipath`]), `ipv4/fib_multipath_use_neigh`, `ipv4/ip_forward` (`all`'s forwarding),
 /// `ipv4/conf/<device>/forwarding` and `rp_filter`, and
 /// `ipv6/conf/<device>/accept_dad`, `disable_ipv6` and `forwarding`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +152,8 @@ pub(crate) enum Net {
     HashPolicy(bool),
     /// `fib_multipath_hash_fields`, IPv6's where `true`.
     HashFields(bool),
+    /// `fib_multipath_use_neigh`.
+    UseNeigh,
     Forwarding(Target),
     RpFilter(Target),
     DisableIpv6(Target),
@@ -408,6 +412,9 @@ pub(crate) enum Kernel {
     /// under `fs`.
     LeasesEnable,
     LeaseBreakTime,
+    /// `/proc/sys/fs/dir-notify-enable`, the machine's, which Linux's
+    /// `fs/notify/dnotify/dnotify.c` registers under `fs`.
+    DirNotifyEnable,
     /// `vm.unprivileged_userfaultfd`, the machine's as the perf ones are,
     /// though under `/proc/sys/vm`.
     UnprivilegedUserfaultfd,
@@ -469,6 +476,7 @@ impl Kernel {
                 | Self::UnprivilegedBpfDisabled
                 | Self::LeasesEnable
                 | Self::LeaseBreakTime
+                | Self::DirNotifyEnable
                 | Self::UnprivilegedUserfaultfd
         )
     }
@@ -493,6 +501,7 @@ pub(crate) struct Machine {
     drop_caches: AtomicI32,
     leases_enable: AtomicI32,
     lease_break_time: AtomicI32,
+    dir_notify_enable: AtomicI32,
     /// How often `kernel.hostname` and `kernel.domainname` changed, in any
     /// UTS namespace (`hostname_poll`, `domainname_poll`).
     uts_events: [AtomicU64; 2],
@@ -510,6 +519,7 @@ impl Default for Machine {
             drop_caches: AtomicI32::new(0),
             leases_enable: AtomicI32::new(1),
             lease_break_time: AtomicI32::new(45),
+            dir_notify_enable: AtomicI32::new(1),
             uts_events: Default::default(),
         }
     }
@@ -559,6 +569,10 @@ impl Machine {
     pub(crate) fn lease_break_time(&self) -> i32 {
         self.lease_break_time.load(Ordering::SeqCst)
     }
+    /// Whether `F_NOTIFY` may be used (`dir_notify_enable`).
+    pub(crate) fn dir_notify_enable(&self) -> bool {
+        self.dir_notify_enable.load(Ordering::SeqCst) != 0
+    }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
         self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
@@ -579,6 +593,7 @@ impl Machine {
             Kernel::PerfEventParanoid => self.perf_event_paranoid(),
             Kernel::LeasesEnable => self.leases_enable(),
             Kernel::LeaseBreakTime => self.lease_break_time(),
+            Kernel::DirNotifyEnable => self.dir_notify_enable.load(Ordering::SeqCst),
             _ => self.unprivileged_bpf_disabled(),
         })
     }
@@ -591,6 +606,7 @@ impl Machine {
             Kernel::PerfEventParanoid => Some(&self.perf_event_paranoid),
             Kernel::LeasesEnable => Some(&self.leases_enable),
             Kernel::LeaseBreakTime => Some(&self.lease_break_time),
+            Kernel::DirNotifyEnable => Some(&self.dir_notify_enable),
             _ => None,
         } {
             let (value, consumed) = parse(buf, None)?;
@@ -673,6 +689,7 @@ fn net_entry(rest: &[u8], network: &crate::inet::Network) -> Option<Entry> {
         b"/ipv4/fib_multipath_hash_fields" => return Some(Entry::Net(Net::HashFields(false))),
         b"/ipv4/fib_multipath_hash_policy" => return Some(Entry::Net(Net::HashPolicy(false))),
         b"/ipv4/fib_multipath_hash_seed" => return Some(Entry::Net(Net::HashSeed)),
+        b"/ipv4/fib_multipath_use_neigh" => return Some(Entry::Net(Net::UseNeigh)),
         b"/ipv6/fib_multipath_hash_fields" => return Some(Entry::Net(Net::HashFields(true))),
         b"/ipv6/fib_multipath_hash_policy" => return Some(Entry::Net(Net::HashPolicy(true))),
         b"/ipv4/ip_forward" => return Some(Entry::Net(Net::IpForward)),
@@ -728,6 +745,7 @@ fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> 
         b"/fs/fanotify" => Some(Entry::Directory(Directory::Fanotify)),
         b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
+        b"/fs/dir-notify-enable" => Some(Entry::Kernel(Kernel::DirNotifyEnable)),
         b"/fs/lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
         b"/fs/leases-enable" => Some(Entry::Kernel(Kernel::LeasesEnable)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
@@ -798,6 +816,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
             (b"fib_multipath_hash_fields", DT_REG),
             (b"fib_multipath_hash_policy", DT_REG),
             (b"fib_multipath_hash_seed", DT_REG),
+            (b"fib_multipath_use_neigh", DT_REG),
             (b"ip_forward", DT_REG),
         ],
         Directory::Ipv6 => vec![
@@ -814,6 +833,7 @@ fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> V
         Directory::Fs => vec![
             (b"aio-max-nr", DT_REG),
             (b"aio-nr", DT_REG),
+            (b"dir-notify-enable", DT_REG),
             (b"fanotify", DT_DIR),
             (b"inotify", DT_DIR),
             (b"lease-break-time", DT_REG),
@@ -897,6 +917,7 @@ fn child(
             b"fib_multipath_hash_fields" => Some(Entry::Net(Net::HashFields(false))),
             b"fib_multipath_hash_policy" => Some(Entry::Net(Net::HashPolicy(false))),
             b"fib_multipath_hash_seed" => Some(Entry::Net(Net::HashSeed)),
+            b"fib_multipath_use_neigh" => Some(Entry::Net(Net::UseNeigh)),
             b"ip_forward" => Some(Entry::Net(Net::IpForward)),
             _ => None,
         },
@@ -932,6 +953,7 @@ fn child(
         Directory::Fs => match name {
             b"aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
             b"aio-nr" => Some(Entry::Aio(Aio::Nr)),
+            b"dir-notify-enable" => Some(Entry::Kernel(Kernel::DirNotifyEnable)),
             b"fanotify" => dir(Directory::Fanotify),
             b"inotify" => dir(Directory::Inotify),
             b"lease-break-time" => Some(Entry::Kernel(Kernel::LeaseBreakTime)),
@@ -1005,6 +1027,7 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         | Kernel::UnprivilegedBpfDisabled
         | Kernel::LeasesEnable
         | Kernel::LeaseBreakTime
+        | Kernel::DirNotifyEnable
         | Kernel::UnprivilegedUserfaultfd => Vec::new(),
     }
 }
@@ -1086,6 +1109,7 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
         | Kernel::UnprivilegedBpfDisabled
         | Kernel::LeasesEnable
         | Kernel::LeaseBreakTime
+        | Kernel::DirNotifyEnable
         | Kernel::UnprivilegedUserfaultfd => Err(Errno::EINVAL),
     }
 }
@@ -1241,6 +1265,7 @@ fn net_line(network: &crate::inet::Network, file: Net) -> Vec<u8> {
         Net::HashSeed => addresses.multipath_seed.user,
         Net::HashPolicy(v6) => u32::from(policy(v6).policy),
         Net::HashFields(v6) => policy(v6).fields,
+        Net::UseNeigh => u32::from(addresses.use_neigh4),
         _ => {
             drop(addresses);
             return line(net_value(network, file));
@@ -1253,7 +1278,11 @@ fn net_line(network: &crate::inet::Network, file: Net) -> Vec<u8> {
 /// device it no longer has.
 fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
     let target = match file {
-        Net::IpForward | Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) => Target::All,
+        Net::IpForward
+        | Net::HashSeed
+        | Net::HashPolicy(_)
+        | Net::HashFields(_)
+        | Net::UseNeigh => Target::All,
         Net::Forwarding(target)
         | Net::RpFilter(target)
         | Net::DisableIpv6(target)
@@ -1264,7 +1293,7 @@ fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
         return 0;
     };
     match file {
-        Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) => 0,
+        Net::HashSeed | Net::HashPolicy(_) | Net::HashFields(_) | Net::UseNeigh => 0,
         Net::IpForward | Net::Forwarding(_) => conf4.forwarding,
         Net::RpFilter(_) => conf4.rp_filter,
         Net::DisableIpv6(_) => conf6.disable_ipv6,
@@ -1476,7 +1505,9 @@ impl NetFile {
     ///   an unsigned `int`, and the rest with it, as
     ///   `proc_douintvec_minmax` does ([`parse_uint`]); so do
     ///   `fib_multipath_hash_policy` (0 to 3, `proc_dou8vec_minmax`) and
-    ///   `fib_multipath_hash_fields` (1 to 0xfff), `EINVAL` out of range.
+    ///   `fib_multipath_hash_fields` (1 to 0xfff), and
+    ///   `fib_multipath_use_neigh` (0 or 1, `proc_dou8vec_minmax`),
+    ///   `EINVAL` out of range.
     /// - `rp_filter` (`devinet_conf_proc`) takes one so, and marks the
     ///   device as set whatever comes of it.
     /// - IPv6's (`addrconf_sysctl_disable`, `addrconf_sysctl_forward`) take
@@ -1529,6 +1560,17 @@ impl NetFile {
                 } else {
                     return Err(Errno::EINVAL);
                 }
+                Ok(buf.len())
+            }
+            Net::UseNeigh => {
+                if *position != 0 {
+                    return advance(position, buf.len());
+                }
+                let value = parse_uint(buf)?;
+                if value > 1 {
+                    return Err(Errno::EINVAL);
+                }
+                self.network.addresses().use_neigh4 = value == 1;
                 Ok(buf.len())
             }
             Net::IpForward | Net::Forwarding(_) => {
@@ -2101,7 +2143,11 @@ mod tests {
             lookup(b"/proc/sys/fs/aio-nr", None),
             Some(Entry::Aio(Aio::Nr))
         );
-        assert_eq!(entries_of(Directory::Fs, None).len(), 9);
+        assert_eq!(
+            lookup(b"/proc/sys/fs/dir-notify-enable", None),
+            Some(Entry::Kernel(Kernel::DirNotifyEnable))
+        );
+        assert_eq!(entries_of(Directory::Fs, None).len(), 10);
         assert_eq!(
             lookup(b"/proc/sys/fs/inotify", None),
             Some(Entry::Directory(Directory::Inotify))

@@ -2641,6 +2641,19 @@ impl Kernel {
         if alone {
             self.group.set_exe_file(None);
         }
+        // `exit_notify`'s `forget_original_parent`: the children it made
+        // go to a thread still alive, and learn of it.
+        let alive = if alone {
+            None
+        } else {
+            self.group.targets.alive()
+        };
+        self.processes.thread_exited(
+            self.process.pid,
+            thread.tid,
+            self.group.task_ids(self.process.pid, thread.tid),
+            alive,
+        );
         if thread.tid != self.process.pid {
             self.group.forget_nice(thread.tid);
         }

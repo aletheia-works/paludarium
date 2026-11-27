@@ -13,9 +13,9 @@ use paludarium_host::FileHandle;
 use paludarium_types::Errno;
 
 use super::{
-    Armed, Deferred, Done, EALREADY, ECANCELED, IOSQE_CQE_SKIP_SUCCESS, Node, Polls, Request, Ring,
-    Work, add_work, fail_request, file_of, finish, flush_batch, issue_link, ready, u16_at, u32_at,
-    u64_at, wake,
+    Armed, CQE_F_MORE, Deferred, Done, EALREADY, ECANCELED, IOSQE_CQE_SKIP_SUCCESS, Node, Polls,
+    Request, Ring, Work, add_work, fail_request, file_of, finish, flush_batch, issue_link, ready,
+    u16_at, u32_at, u64_at, wake,
 };
 use crate::aio;
 use crate::syscalls::Context;
@@ -27,9 +27,6 @@ pub(super) const OP_POLL_REMOVE: u8 = 7;
 const ADD_MULTI: u32 = 1 << 0;
 const UPDATE_EVENTS: u32 = 1 << 1;
 const UPDATE_USER_DATA: u32 = 1 << 2;
-
-/// `IORING_CQE_F_MORE`: the request posts more completions.
-const CQE_F_MORE: u32 = 1 << 1;
 
 const POLLIN: u32 = 0x1;
 const POLLOUT: u32 = 0x4;

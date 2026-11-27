@@ -774,6 +774,9 @@ pub(crate) enum Event {
     /// naming the request's port.
     NewNeighbour(Neighbour),
     DelNeighbour(Neighbour),
+    /// A group a device has joined anew or left for good
+    /// (`inet_ifmcaddr_notify`).
+    Group4(crate::multicast::Told4),
 }
 /// A neighbour of the loopback or of a veth end, as `___neigh_create`
 /// makes one for the next hop of a packet out through it, or for a
@@ -1355,6 +1358,66 @@ pub(crate) struct Addresses {
     pub multipath4: crate::multipath::Policy,
     /// IPv6's.
     pub multipath6: crate::multipath::Policy,
+    /// IPv4's `fib_multipath_use_neigh`: a multipath route's lookups pass
+    /// over a hop whose gateway's neighbour is not valid ([`Self::path4`]).
+    pub use_neigh4: bool,
+    serials6: Serials6,
+}
+/// What the route an IPv6 socket keeps hangs on ([`Addresses::keeps6`]):
+/// counted up by each change that makes Linux look such a route up again, as
+/// it renews the serial numbers of its tables' nodes (`fn_sernum`).
+#[derive(Debug, Default)]
+struct Serials6 {
+    last: u64,
+    /// The last change of every node (`fib6_flush_trees`).
+    all: u64,
+    /// By a node's table and prefix: the last route added there, which is
+    /// the change of the nodes above it too, and the last change of the
+    /// node alone.
+    nodes: std::collections::BTreeMap<(u32, Ipv6Addr, u8), (u64, u64)>,
+}
+impl Serials6 {
+    /// How many nodes are told apart; with more, every node changes.
+    const MOST: usize = 4096;
+    /// Every node changes: an address has gone, or its duplicate address
+    /// detection is done (`rt_genid_bump_ipv6`).
+    fn all(&mut self) {
+        self.last += 1;
+        self.all = self.last;
+        self.nodes.clear();
+    }
+    /// The node of `route` changes: alone, or with those above it
+    /// (`fib6_update_sernum`, `fib6_update_sernum_upto_root`).
+    fn node(&mut self, route: &Route6, above: bool) {
+        if self.nodes.len() >= Self::MOST {
+            return self.all();
+        }
+        self.last += 1;
+        let node = self
+            .nodes
+            .entry((route.table, route.dst, route.len))
+            .or_default();
+        if above {
+            node.0 = self.last;
+        } else {
+            node.1 = self.last;
+        }
+    }
+    /// When the node of `route` last changed.
+    fn of(&self, route: &Route6) -> u64 {
+        let key = (route.table, route.dst, route.len);
+        let below = self
+            .nodes
+            .iter()
+            .filter(|((table, dst, len), _)| {
+                *table == route.table
+                    && *len >= route.len
+                    && u128::from(*dst) & mask6(route.len) == u128::from(route.dst)
+            })
+            .map(|(_, (added, _))| *added);
+        let own = self.nodes.get(&key).map_or(0, |(_, own)| *own);
+        below.max().unwrap_or(0).max(own).max(self.all)
+    }
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -1402,8 +1465,10 @@ impl Addresses {
             proxies: Vec::new(),
             ready6: Vec::new(),
             multipath_seed: crate::multipath::Seed::default(),
+            serials6: Serials6::default(),
             multipath4: crate::multipath::Policy::default(),
             multipath6: crate::multipath::Policy::default(),
+            use_neigh4: false,
         }
     }
     /// A packet goes out through the loopback to `next` at `now`, as
@@ -1811,18 +1876,24 @@ impl Addresses {
     /// (`addrconf_permanent_addr`); and `::1` with its route. With `v6`
     /// false (`disable_ipv6`) IPv6 does none of it ([`Self::up6`]).
     pub(crate) fn up(&mut self, now: u64, v6: bool) -> Vec<Event> {
-        let mut events = Vec::new();
+        let (mut events, rest) = self.up_parts(now, v6);
+        events.extend(rest);
+        events
+    }
+    /// What [`Self::up`] tells, in two: `127.0.0.1/8`'s, before which
+    /// `inetdev_event` joins the loopback to its group (`ip_mc_up`), and
+    /// the rest.
+    pub(crate) fn up_parts(&mut self, now: u64, v6: bool) -> (Vec<Event>, Vec<Event>) {
         let loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
         // The kernel's own, which reports nothing when it is there.
         let added = extack::quietly(|| self.add_v4(loopback, Lifetimes::FOREVER, false, true, now));
-        if let Ok(added) = added {
-            events.extend(added);
-        }
+        let first = added.unwrap_or_default();
+        let mut events = Vec::new();
         events.extend(self.device_up4(LOOPBACK_INDEX));
         if v6 {
             events.extend(self.up6(now));
         }
-        events
+        (first, events)
     }
     /// IPv4's part of a device of `index` coming up (`fib_netdev_event`'s
     /// `NETDEV_UP`): the routes each of its addresses has then that are not
@@ -2030,6 +2101,9 @@ impl Addresses {
             .partition::<Vec<_>, _>(|a| a.index == index);
         self.v6 = kept;
         self.ready6.retain(|&i| i != index);
+        if !gone.is_empty() {
+            self.serials6.all();
+        }
         gone.into_iter().map(Event::DelAddr6).collect()
     }
     /// IPv6's part of the veth end `index` coming up at `now`
@@ -2082,6 +2156,7 @@ impl Addresses {
         for route in self.routes6.iter_mut().filter(|r| r.oif == oif) {
             route.dead = false;
             route.linkdown = false;
+            self.serials6.node(route, true);
         }
         self.kernel_add6(
             Route6 {
@@ -2191,6 +2266,7 @@ impl Addresses {
             if route.oif == oif && !self.hops6(&route).is_empty() {
                 route.dead = true;
                 route.linkdown = true;
+                self.serials6.node(&route, false);
             }
             kept.push(route);
         }
@@ -2437,6 +2513,7 @@ impl Addresses {
                 self.insert_v6(new);
                 return Ok(events);
             }
+            self.serials6.all();
         }
         events.push(Event::NewAddr6(new.clone(), false));
         self.kernel_add6(new.local_route(), &mut events);
@@ -2574,6 +2651,7 @@ impl Addresses {
     /// prefix route ([`Self::prefix_gone`]), unless it had none.
     fn remove_v6(&mut self, found: usize, now: u64) -> Vec<Event> {
         let gone = self.v6.remove(found);
+        self.serials6.all();
         let mut events = vec![Event::DelAddr6(gone.clone())];
         self.kernel_del6(&gone.local_route(), &mut events);
         if gone.flags & NO_PREFIX_ROUTE == 0 {
@@ -2637,6 +2715,7 @@ impl Addresses {
         done.sort_by_key(|&(at, _)| at);
         for (_, i) in done {
             self.v6[i].dad = None;
+            self.serials6.all();
             let address = self.v6[i].clone();
             events.push(Event::NewAddr6(address.clone(), false));
             self.kernel_add6(address.local_route(), &mut events);
@@ -2842,6 +2921,7 @@ impl Addresses {
             // too, without a word: those after it with a gateway.
             let siblings = !self.hops6(&self.routes6[i]).is_empty();
             self.routes6[i] = new;
+            self.serials6.node(&new, true);
             if siblings {
                 let mut at = i + 1;
                 // A node's routes are next to each other, by metric.
@@ -2880,6 +2960,7 @@ impl Addresses {
             })
             .unwrap_or(self.routes6.len());
         self.routes6.insert(at, new);
+        self.serials6.node(&new, true);
         told |= F_CREATE;
         Ok(told)
     }
@@ -3849,7 +3930,9 @@ impl Addresses {
     /// multipath one the next hop `fib_select_multipath` takes by the hash
     /// the namespace's policy takes of them (`fib_multipath_hash`): each hop
     /// takes the share of the hashes its weight gives it, in their order, a
-    /// dead one none (`fib_rebalance`). One whose device's own source
+    /// dead one none (`fib_rebalance`). With `fib_multipath_use_neigh`,
+    /// one that is not good ([`Self::good_hop4`]) is passed over, keeping
+    /// its share. One whose device's own source
     /// ([`Self::select4`], `nh_saddr`) is `src` comes before the others,
     /// then the first that takes the hash; with no `src`, and for a
     /// forwarded packet (no `order`), only the hash counts.
@@ -3876,6 +3959,9 @@ impl Addresses {
         let mut best: Option<(u8, Hop4)> = None;
         for &hop in matched.hops.iter().filter(|h| !h.dead) {
             weight += u64::from(hop.weight);
+            if self.use_neigh4 && !self.good_hop4(hop) {
+                continue;
+            }
             // `fib_rebalance`: `DIV_ROUND_CLOSEST_ULL(weight << 31, total)
             // - 1`, the last hash the hop takes.
             let takes = hash < ((weight << 31) + total / 2) / total;
@@ -3896,6 +3982,24 @@ impl Addresses {
             Some((_, hop)) => matched.through(hop),
             None => matched,
         }
+    }
+    /// Whether a hop is good as `fib_good_nh` finds it: one whose gateway
+    /// is reached by a route of link scope (`RT_SCOPE_LINK`) is good while
+    /// its device has no neighbour keyed by it or one of a valid state
+    /// (`NUD_VALID`); any other hop is. A loopback's IPv4 neighbour is
+    /// keyed by `0.0.0.0` (`arp_constructor`), and all of a loopback's are
+    /// `NUD_NOARP`, so a hop through it is good.
+    fn good_hop4(&self, hop: Hop4) -> bool {
+        let Some(gateway) = hop.gateway.filter(|_| hop.uses_gateway) else {
+            return true;
+        };
+        let Ok(index) = i32::try_from(hop.oif) else {
+            return true;
+        };
+        self.neighbours
+            .iter()
+            .find(|n| n.index == index && n.ip == gateway)
+            .is_none_or(|n| n.state & NUD_VALID != 0)
     }
     /// Whether a packet in on `lo` from `src` may come, as
     /// `fib_validate_source` checks it with reverse path filtering off, as
@@ -4156,6 +4260,29 @@ impl Addresses {
         flow: &Flow6,
     ) -> Result<Route6, Errno> {
         Self::first6(|table| self.lookup6_in_preferring(table, ip, oif, flow))
+    }
+    /// The state of the IPv6 tables a route is kept at
+    /// ([`Self::keeps6`]).
+    pub(crate) fn serial6(&self) -> u64 {
+        self.serials6.last
+    }
+    /// Whether a socket that kept the IPv6 route `route` at `serial` still
+    /// takes it (`ip6_dst_check`): it is there, and its node has not changed
+    /// since, as a route added there or at a longer prefix, or a hop gone
+    /// dead, changes it, but one removed does not.
+    pub(crate) fn keeps6(&self, route: &Route6, serial: u64) -> bool {
+        self.serials6.of(route) <= serial
+            && self.routes6.iter().any(|r| {
+                (r.table, r.dst, r.len, r.metric, r.oif, r.gateway)
+                    == (
+                        route.table,
+                        route.dst,
+                        route.len,
+                        route.metric,
+                        route.oif,
+                        route.gateway,
+                    )
+            })
     }
     /// The route `lookup` finds in the local table, then in the main one,
     /// where the first has none or a throw route; a rejecting route's
@@ -4480,6 +4607,7 @@ mod tests {
                 Event::DelMultipath6(hops) => format!("-multipath {}", via6(hops)),
                 Event::NewNeighbour(n) => format!("+neigh {} {:#x}", n.ip, n.state),
                 Event::DelNeighbour(n) => format!("-neigh {}", n.ip),
+                Event::Group4(t) => format!("group {} {}", t.group, t.joined),
             })
             .collect()
     }
@@ -6411,5 +6539,53 @@ mod tests {
             told(&a.expire(SECOND + 1)),
             ["-route 254 2001:db8:8::/64 Unicast 256"]
         );
+    }
+
+    #[test]
+    fn a_hop_is_good_while_its_gateways_neighbour_is_valid_or_none() {
+        let mut a = Addresses::isolated();
+        let four = Ipv4Addr::new(10, 0, 0, 2);
+        let six: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let hop = |gateway: Option<IpAddr>, uses_gateway| Hop4 {
+            gateway,
+            oif: 1000,
+            onlink: false,
+            linkdown: false,
+            dead: false,
+            uses_gateway,
+            weight: 1,
+        };
+        let through4 = hop(Some(IpAddr::V4(four)), true);
+        let through6 = hop(Some(IpAddr::V6(six)), true);
+        assert!(a.good_hop4(through4) && a.good_hop4(through6));
+        a.neighbours
+            .push(Neighbour::arp(1000, four, RTN_UNICAST, 0, 0));
+        a.neighbours.push(Neighbour::nd(1000, six, 0, 0));
+        // `NUD_NONE`, as made.
+        assert!(!a.good_hop4(through4) && !a.good_hop4(through6));
+        // Not of link scope, or with no gateway: no neighbour is looked up.
+        assert!(a.good_hop4(hop(Some(IpAddr::V4(four)), false)));
+        assert!(a.good_hop4(hop(None, false)));
+        // Another device's neighbour is not this hop's.
+        assert!(a.good_hop4(Hop4 {
+            oif: 1002,
+            ..through4
+        }));
+        for (state, good) in [
+            (NUD_INCOMPLETE, false),
+            (NUD_FAILED, false),
+            (NUD_REACHABLE, true),
+            (NUD_STALE, true),
+            (NUD_DELAY, true),
+            (NUD_PROBE, true),
+            (NUD_NOARP, true),
+            (NUD_PERMANENT, true),
+        ] {
+            for n in &mut a.neighbours {
+                n.state = state;
+            }
+            assert_eq!(a.good_hop4(through4), good, "{state:#x}");
+            assert_eq!(a.good_hop4(through6), good, "{state:#x}");
+        }
     }
 }

@@ -97,6 +97,12 @@ const RTM_GETROUTE: u16 = 26;
 const RTM_NEWNEIGH: u16 = 28;
 const RTM_DELNEIGH: u16 = 29;
 const RTM_GETNEIGH: u16 = 30;
+/// A device's multicast groups: the notifications of one joined anew
+/// and left, and the dump (`RTM_GETMULTICAST`), whose messages carry its
+/// type.
+const RTM_NEWMULTICAST: u16 = 56;
+const RTM_DELMULTICAST: u16 = 57;
+const RTM_GETMULTICAST: u16 = 58;
 const RTM_NEWNEIGHTBL: u16 = 64;
 const RTM_GETNEIGHTBL: u16 = 66;
 /// The groups (`RTNLGRP_*`) notifications go to, and how many there are
@@ -109,6 +115,7 @@ const RTNLGRP_IPV6_IFADDR: u32 = 9;
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
 const RTNLGRP_IPV6_IFINFO: u32 = 12;
 const RTNLGRP_MCTP_IFADDR: u32 = 34;
+const RTNLGRP_IPV4_MCADDR: u32 = 37;
 /// `RTN_LOCAL`, the type of an MCTP address's own route.
 const RTN_LOCAL: u8 = 2;
 /// `RTAX_MTU` in `RTA_METRICS`, and the last metric (`RTAX_MAX`,
@@ -351,6 +358,8 @@ const IFA_BROADCAST: u16 = 4;
 const IFA_CACHEINFO: u16 = 6;
 const IFA_FLAGS: u16 = 8;
 const IFA_RT_PRIORITY: u16 = 9;
+const IFA_MULTICAST: u16 = 7;
+const IFA_MC_USERS: u16 = 12;
 const IFA_PROTO: u16 = 11;
 const ARPHRD_LOOPBACK: u16 = 772;
 const IFF_UP: u32 = 0x1;
@@ -1202,6 +1211,10 @@ impl NetlinkSocket {
                 (nsid::RTM_GETNSID, _) => {
                     nsid::dump(&self.network, &self.opener, header, payload, port, strict)
                 }
+                // `inet_dump_ifmcaddr`; IPv6's groups are not listed here.
+                (RTM_GETMULTICAST, AF_INET) => {
+                    group_dump(network, payload, (seq, port), strict, &mut answer, &target)
+                }
                 (RTM_GETROUTE, _) => route_dump(
                     network,
                     payload,
@@ -1246,6 +1259,7 @@ impl NetlinkSocket {
             // `neigh_dump_info` once it has gone through every table.
             let joined = matches!(header.kind, RTM_GETADDR | RTM_GETLINK) && family == AF_INET6
                 || header.kind == nsid::RTM_GETNSID
+                || header.kind == RTM_GETMULTICAST
                 || (header.kind == RTM_GETNEIGH && family != AF_MCTP);
             let first = messages.is_empty() || joined;
             let done = done_message(s, header, payload, port, answer, error, first);
@@ -2605,6 +2619,58 @@ fn address_dump(
     now: u64,
     target: Target<'_>,
 ) -> Result<Vec<Vec<u8>>, Errno> {
+    let (flags, shown, only) = address_request(network, payload, family, strict, answer, target)?;
+    let mut messages = Vec::new();
+    let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
+    if family != AF_INET6 {
+        messages.extend(ipv4_messages(of, only, seq, port, now));
+    }
+    if family != AF_INET {
+        messages.extend(ipv6_message(of, only, seq, port, now));
+    }
+    if let Some((id, _)) = shown {
+        messages = messages
+            .into_iter()
+            .map(|message| with_address_netnsid(message, id))
+            .collect();
+    }
+    let mut messages = with_flags(messages, flags);
+    // `rtnl_dump_all` goes on to MCTP's, which marks nothing.
+    if !matches!(family, AF_INET | AF_INET6) {
+        messages.extend(mctp_addresses(network, payload, seq, port));
+    }
+    Ok(messages)
+}
+/// IPv4's groups, of each device or of one, as `inet_dump_ifmcaddr` dumps
+/// them (`RTM_GETMULTICAST`): a request checked as an address dump's
+/// ([`address_request`]), whose namespace, if it names one, shows them
+/// without its ID.
+fn group_dump(
+    network: &Network,
+    payload: &[u8],
+    reply: (u32, u32),
+    strict: bool,
+    answer: &mut u16,
+    target: Target<'_>,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let (flags, shown, only) = address_request(network, payload, AF_INET, strict, answer, target)?;
+    let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
+    Ok(ipv4_groups(of, only, flags, reply))
+}
+/// The namespace a request names, with its ID, if it names one.
+type NamedNetwork = Option<(i32, Arc<Network>)>;
+/// What an address dump of `family` asks, as `inet_valid_dump_ifaddr_req`
+/// and `inet6_valid_dump_ifaddr_req` check it strictly: the flags its
+/// messages carry, the namespace it names, with its ID, and the device
+/// it is of, 0 for all.
+fn address_request(
+    network: &Network,
+    payload: &[u8],
+    family: u8,
+    strict: bool,
+    answer: &mut u16,
+    target: Target<'_>,
+) -> Result<(u16, NamedNetwork, u32), Errno> {
     let mut flags = 0;
     let mut shown = None;
     let mut only = 0;
@@ -2657,26 +2723,7 @@ fn address_dump(
         }
         only = index;
     }
-    let mut messages = Vec::new();
-    let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
-    if family != AF_INET6 {
-        messages.extend(ipv4_messages(of, only, seq, port, now));
-    }
-    if family != AF_INET {
-        messages.extend(ipv6_message(of, only, seq, port, now));
-    }
-    if let Some((id, _)) = shown {
-        messages = messages
-            .into_iter()
-            .map(|message| with_address_netnsid(message, id))
-            .collect();
-    }
-    let mut messages = with_flags(messages, flags);
-    // `rtnl_dump_all` goes on to MCTP's, which marks nothing.
-    if !matches!(family, AF_INET | AF_INET6) {
-        messages.extend(mctp_addresses(network, payload, seq, port));
-    }
-    Ok(messages)
+    Ok((flags, shown, only))
 }
 /// The `RTM_NEWADDR` of one IPv6 address of `lo`, as `inet6_rtm_getaddr`
 /// gives it to a request that is not a dump. As
@@ -3706,6 +3753,58 @@ fn ipv4_address(
         );
         message(kind, flags, seq, port, &body)
     }
+}
+/// A message of `kind`, with `flags`, of the IPv4 group `group` the device
+/// `index` has joined at `created`, of `users` (`inet_fill_ifmcaddr`): a
+/// permanent address of 32 bits, its lifetimes endless.
+fn ipv4_group(
+    index: i32,
+    group: core::net::Ipv4Addr,
+    users: u32,
+    created: u64,
+    kind: u16,
+    flags: u16,
+    (seq, port): (u32, u32),
+) -> Vec<u8> {
+    let mut body = vec![AF_INET, 32, crate::interface::PERMANENT as u8, 0];
+    body.extend_from_slice(&index.to_le_bytes());
+    attribute(&mut body, IFA_MULTICAST, &group.octets());
+    attribute(&mut body, IFA_MC_USERS, &users.to_le_bytes());
+    let life = crate::interface::Life {
+        valid: u32::MAX,
+        preferred: u32::MAX,
+        created,
+        changed: created,
+    };
+    attribute(
+        &mut body,
+        IFA_CACHEINFO,
+        &cacheinfo(&life, (u32::MAX, u32::MAX)),
+    );
+    message(kind, flags, seq, port, &body)
+}
+/// An IPv4 group a device has joined, with its users and when it joined it.
+type Listed4 = (core::net::Ipv4Addr, u32, u64);
+/// `RTM_GETMULTICAST` for each IPv4 group of the device of `index`, or of
+/// every device for 0, by index, each's the newest first, as
+/// `inet_dump_ifmcaddr` gives them.
+fn ipv4_groups(network: &Network, index: u32, flags: u16, reply: (u32, u32)) -> Vec<Vec<u8>> {
+    let mut devices: Vec<(i32, Vec<Listed4>)> = network
+        .devices()
+        .iter()
+        .filter(|d| index == 0 || d.index.unsigned_abs() == index)
+        .map(|d| (d.index, d.groups4.listed().collect()))
+        .collect();
+    devices.sort_by_key(|(index, _)| *index);
+    devices
+        .into_iter()
+        .flat_map(|(index, groups)| {
+            groups.into_iter().map(move |(group, users, created)| {
+                let flags = NLM_F_MULTI | flags;
+                ipv4_group(index, group, users, created, RTM_GETMULTICAST, flags, reply)
+            })
+        })
+        .collect()
 }
 /// `RTM_NEWADDR` for each IPv6 address, of the device of `index` or of
 /// every one for 0, as `inet6_fill_ifaddr` gives them: device by device,
@@ -5676,6 +5775,16 @@ fn told(
                     0,
                     neighbour_message(&n, RTM_DELNEIGH, 0, (0, 0), 0, now),
                 ),
+                Event::Group4(t) => {
+                    let kind = if t.joined {
+                        RTM_NEWMULTICAST
+                    } else {
+                        RTM_DELMULTICAST
+                    };
+                    let message =
+                        ipv4_group(t.index, t.group, t.users(), t.created, kind, 0, (0, 0));
+                    (RTNLGRP_IPV4_MCADDR, 0, message)
+                }
             };
             Notice {
                 to: None,
@@ -6367,6 +6476,20 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
         });
     }
     notices
+}
+/// What `network` tells of the changes of its devices' IPv4 groups since
+/// it last did ([`Network::groups_told4`]).
+pub(crate) fn groups_told(network: &Network) -> Vec<Notice> {
+    let events = network
+        .groups_told4()
+        .into_iter()
+        .map(crate::interface::Event::Group4);
+    told(events.collect(), 0, 0, false, false, 0)
+}
+/// Tells `network`'s members of its devices' IPv4 groups' changes, from no
+/// socket (a socket's option, or its close).
+pub(crate) fn tell_groups(network: &Network) {
+    notify(network, groups_told(network), None);
 }
 /// What `network` tells of IPv4 as its device of `index` goes, closed
 /// (`inetdev_event`'s `NETDEV_UNREGISTER`): each of its addresses
@@ -8805,7 +8928,7 @@ mod tests {
         {
             v.up = up;
         }
-        network.change_group4(1000, crate::multicast::ALL_HOSTS, up);
+        network.change_group4(1000, crate::multicast::ALL_HOSTS, up, 0);
     }
     #[test]
     fn a_veth_ends_ipv4_addresses_are_its_own_in_dumps_and_lookups() {

@@ -209,8 +209,13 @@ pub extern "C" fn buffer_drop(id: u32) {
 /// The largest blocks [`heap_reserve`] takes from the allocator, each left
 /// untouched.
 const RESERVE_CHUNK: usize = 64 << 20;
-/// The smallest: one WebAssembly page.
-const RESERVE_LEAST: usize = 64 << 10;
+/// The smallest. A block takes a little more than its size from the
+/// allocator, so blocks of a whole WebAssembly page no longer fit once less
+/// than a page is left; smaller ones still take the last page.
+const RESERVE_LEAST: usize = 64;
+/// The most blocks [`heap_reserve`] holds at once: one per [`RESERVE_CHUNK`]
+/// in 4 GiB, and at most two of each smaller size.
+const RESERVE_BLOCKS: usize = 128;
 
 /// Grows the heap now by up to `limit` bytes and hands them back to the
 /// allocator, which keeps them, so that later allocations need not grow the
@@ -218,20 +223,25 @@ const RESERVE_LEAST: usize = 64 << 10;
 /// threads run in it makes them fail with "Out of bounds memory access" or
 /// crashes the page. It takes blocks of [`RESERVE_CHUNK`] while they fit,
 /// then of half that size and so on down to [`RESERVE_LEAST`], so that the
-/// memory ends close to its maximum rather than a block short of it. The
-/// blocks are allocated without being written to, so the pages are not
-/// resident until used. Returns the bytes reserved.
+/// memory ends at its maximum rather than a block short of it. The list of
+/// blocks is allocated first, since growing it once the heap is full would
+/// abort. The blocks are allocated without being written to, so the pages
+/// are not resident until used. Returns the bytes reserved.
 #[unsafe(no_mangle)]
 pub extern "C" fn heap_reserve(limit: u32) -> u32 {
     let limit = limit as usize;
-    let mut blocks = Vec::new();
+    if limit < RESERVE_LEAST {
+        // Even the list of blocks would grow a fresh heap.
+        return 0;
+    }
+    let mut blocks = Vec::with_capacity(RESERVE_BLOCKS);
     let mut reserved = 0;
     let mut size = RESERVE_CHUNK;
     while size >= RESERVE_LEAST {
         let Ok(layout) = std::alloc::Layout::from_size_align(size, 16) else {
             break;
         };
-        while reserved + size <= limit {
+        while reserved + size <= limit && blocks.len() < RESERVE_BLOCKS {
             // SAFETY: the layout's size is not zero; the block is freed below
             // and never read or written.
             let block = unsafe { std::alloc::alloc(layout) };

@@ -852,21 +852,31 @@ fn pick(from: SocketAddr, to: SocketAddr, count: usize) -> usize {
     ((u64::from(hash) * count as u64) >> 32) as usize
 }
 
-/// The local ports the TCP sockets, or the UDP ones, hold, and where the
-/// next ephemeral one is looked for.
+/// The local ports the TCP sockets, or the UDP ones, hold, where the next
+/// ephemeral one is looked for, and the ports no ephemeral one is.
 pub(crate) struct Ports {
     bindings: Vec<Binding>,
     next: u16,
+    host: Vec<u16>,
 }
 impl Default for Ports {
     fn default() -> Self {
         Self {
             bindings: Vec::new(),
             next: *EPHEMERAL.start(),
+            host: Vec::new(),
         }
     }
 }
 impl Ports {
+    /// No ports held yet, and no ephemeral one among `host`, the ports the
+    /// guest reaches the host's loopback at.
+    pub(crate) fn beside(host: Vec<u16>) -> Self {
+        Self {
+            host,
+            ..Self::default()
+        }
+    }
     /// Forgets the sockets that have gone, but for those in `TIME_WAIT`.
     fn live(&mut self) {
         self.bindings
@@ -958,10 +968,11 @@ impl Ports {
                 let offset = (usize::from(self.next - EPHEMERAL.start()) + i) % count;
                 let port = EPHEMERAL.start() + offset as u16;
                 binding.address.set_port(port);
-                (!self
-                    .bindings
-                    .iter()
-                    .any(|other| binding.overlaps(other) && binding.devices_meet(other)))
+                (!self.host.contains(&port)
+                    && !self
+                        .bindings
+                        .iter()
+                        .any(|other| binding.overlaps(other) && binding.devices_meet(other)))
                 .then_some(port)
             });
             let port = free.ok_or(EADDRINUSE)?;
@@ -1415,6 +1426,18 @@ mod tests {
         let last = ports.bind(binding("127.0.0.1:0", false)).unwrap();
         assert_eq!(last.port(), 60999);
         assert_eq!(ports.next, 32768);
+    }
+
+    #[test]
+    fn ephemeral_ports_leave_out_the_host_loopback_ones() {
+        let mut ports = Ports::beside(vec![32768, 32770]);
+        let first = ports.bind(binding("0.0.0.0:0", false)).unwrap();
+        assert_eq!(first.port(), 32769);
+        let second = ports.bind(binding("127.0.0.1:0", false)).unwrap();
+        assert_eq!(second.port(), 32771);
+        // A port named itself is still taken.
+        let named = ports.bind(binding("127.0.0.1:32770", false)).unwrap();
+        assert_eq!(named.port(), 32770);
     }
 
     #[test]

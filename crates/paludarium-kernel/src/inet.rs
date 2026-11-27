@@ -214,6 +214,23 @@ impl NetworkPolicy {
             Rule::Address { .. } => false,
         })
     }
+    /// The ports at which a rule reaches the host's loopback, where the
+    /// host's own sockets listen: a loopback address's, or `localhost`'s
+    /// and its subdomains'. A rule for every port names none.
+    fn loopback_ports(&self) -> Vec<u16> {
+        self.rules
+            .iter()
+            .filter_map(|rule| match rule {
+                Rule::Address { ip, port } if plain(*ip).is_loopback() => *port,
+                Rule::Name { name, port, .. }
+                    if name == "localhost" || name.ends_with(".localhost") =>
+                {
+                    *port
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 /// A host name in lower case without its final dot, or `None` for one that
 /// is not made of letters, digits, hyphens and dots.
@@ -373,12 +390,17 @@ const CAP_NET_ADMIN: u64 = 1 << 12;
 const CAP_NET_RAW: u64 = 1 << 13;
 impl Network {
     pub(crate) fn new(policy: NetworkPolicy) -> Self {
+        // The guest's ephemeral ports leave out those its connections reach
+        // the host's loopback at, as Linux's leave out a port another socket
+        // listens on: a connection there would reach the host's socket
+        // instead of the guest's.
+        let host = policy.loopback_ports();
         Self {
             policy,
             resolved: Mutex::default(),
             lookups: Mutex::default(),
-            tcp_ports: Mutex::default(),
-            udp_ports: Mutex::default(),
+            tcp_ports: Mutex::new(Ports::beside(host.clone())),
+            udp_ports: Mutex::new(Ports::beside(host)),
             syns: Mutex::default(),
             fails: Mutex::default(),
             isolated: false,
@@ -7033,6 +7055,24 @@ mod tests {
         ] {
             assert_eq!(reachable(name, ip.parse().unwrap()), ok, "{name} {ip}");
         }
+    }
+
+    #[test]
+    fn loopback_ports_are_the_host_loopback_rules_ports() {
+        let mut policy = NetworkPolicy::new();
+        for rule in [
+            "127.0.0.1:40001",
+            "127.0.0.2:40002",
+            "[::1]:40003",
+            "localhost:40004",
+            "*.localhost:40005",
+            "127.0.0.1",
+            "192.0.2.1:40006",
+            "example.com:40007",
+        ] {
+            policy = policy.allow(rule).unwrap();
+        }
+        assert_eq!(policy.loopback_ports(), [40001, 40002, 40003, 40004, 40005]);
     }
 
     fn query(name: &str, kind: u16) -> Vec<u8> {

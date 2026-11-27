@@ -3098,13 +3098,15 @@ impl Kernel {
             {
                 return Err(Errno::EPERM);
             }
-            let mut sched = found.group.sched(found.tid);
-            sched.io = Some(ioprio as u16);
-            // set_task_ioprio gives a thread without an I/O context one.
-            if sched.io_context == 0 {
-                sched.io_context = scheduling::new_io_context();
-            }
-            found.group.set_sched(found.tid, sched);
+            // Under the lock, so that no other change of the thread's
+            // attributes (its timer slack) is lost.
+            found.group.change_sched(found.tid, |sched| {
+                sched.io = Some(ioprio as u16);
+                // set_task_ioprio gives a thread without an I/O context one.
+                if sched.io_context == 0 {
+                    sched.io_context = scheduling::new_io_context();
+                }
+            });
             result = Ok(0);
         }
         result
@@ -3260,8 +3262,8 @@ impl Kernel {
                     .is_some_and(|word| word >> (cpu % 64) & 1 != 0)
             })
         });
-        let decided = scheduling::Target {
-            sched: target.group.sched(target.tid),
+        let mut decided = scheduling::Target {
+            sched: scheduling::Sched::default(),
             nice: target.nice,
             nice_limit: target.nice_limit,
             rtprio_limit: target.rtprio_limit,
@@ -3271,14 +3273,22 @@ impl Kernel {
         };
         let per_cpu = scheduling::ratio(1_000_000_000, 950_000_000)
             - scheduling::ratio(1_000_000_000, 50_000_000);
-        let change = scheduling::set(
-            &decided,
-            attr,
-            caller.capable(crate::credentials::CAP_SYS_NICE),
-            self.processes.deadline_bandwidth(&target.group, target.tid),
-            per_cpu * cpus as u64,
-        )?;
-        target.group.set_sched(target.tid, change.sched);
+        let others_bandwidth = self.processes.deadline_bandwidth(&target.group, target.tid);
+        let may_nice = caller.capable(crate::credentials::CAP_SYS_NICE);
+        // Decided and made under the lock, so that no other change of the
+        // thread's attributes (a write of its timer slack) comes between.
+        let change = target.group.change_sched(target.tid, |sched| {
+            decided.sched = *sched;
+            let change = scheduling::set(
+                &decided,
+                attr,
+                may_nice,
+                others_bandwidth,
+                per_cpu * cpus as u64,
+            )?;
+            *sched = change.sched;
+            Ok::<_, Errno>(change)
+        })?;
         if let Some(nice) = change.nice {
             target.group.update_nice(target.tid, nice);
         }

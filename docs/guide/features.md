@@ -159,7 +159,8 @@ kernel.
   system take neither. On a macOS or Windows host, whose file systems Linux
   has no number for, a host file is taken as ext4's. `RWF_NOSIGNAL` spares a write to
   a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
-  since Linux 6.18. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
+  since Linux 6.18, also one to a pipe whose last reader leaves after part
+  of it went, which returns that part. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
   for the call: a write goes to the offset (growing the file past its end)
   or, at -1, to the position, which then moves past it; an append-only file
   (`FS_APPEND_FL`) gives `EPERM`, for a read too. `RWF_APPEND` writes a
@@ -169,8 +170,10 @@ kernel.
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in
-  one file). `sendfile` reads a regular file into any writable file, a pipe
-  taking at most its capacity per call. Both update the given offsets or the
+  one file). `sendfile` reads a regular file into any writable file; into a
+  pipe it is a `splice`, as Linux's `splice_file_to_pipe`: once the pipe has
+  room it takes what fits and does not wait for more, waiting first only
+  when the pipe is not `O_NONBLOCK`. Both update the given offsets or the
   file positions; `sendfile` writes its offset back even after an error.
 
 - `splice` moves bytes between a pipe (or FIFO) and a regular file, a
@@ -1140,7 +1143,16 @@ kernel.
   leaving pages without contents. Sealed memory whose pages may not be
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
   which Linux maps `VM_DONTEXPAND`, huge pages and the vDSO's data take
-  neither advice (`EINVAL`).
+  neither advice (`EINVAL`). On memory that is not private anonymous
+  memory, a uffd-wp marker stops an install, as Linux's
+  `madvise_guard_install` meets one its zap keeps (and the zap leaves one
+  for each write-protected page): the pages before it take guards, the
+  rest lose their entries, and the call runs again until a signal is to
+  be taken, and again after its handler (`ERESTARTNOINTR`), so that it
+  does not return while the marker is there; `process_madvise` tries the
+  range again until a fatal signal, as Linux's `vector_madvise` does, and
+  runs no handler meanwhile. Private anonymous memory loses its markers
+  to the guards.
   `MADV_COLLAPSE` collapses private anonymous memory and shmem's page
   cache as Linux's `madvise_collapse` does, VMA by VMA: a VMA with
   `MADV_NOHUGEPAGE` or in a space that `PR_SET_THP_DISABLE` disabled for
@@ -1335,8 +1347,13 @@ kernel.
   anonymous memory or a `UFFDIO_POISON` is `EEXIST` there. `mprotect` keeps the protection,
   and refuses a write it does not permit with SIGSEGV as before; a
   `fork`ed child and a move by `mremap` (without their events' features),
-  `UFFDIO_UNREGISTER`, closing the file and a registration that replaces
-  the write-protect mode take it away. With `UFFD_FEATURE_WP_ASYNC`, which brings
+  `UFFDIO_UNREGISTER` and closing the file take it away. A registration
+  that replaces the write-protect mode changes the VMA's flags alone, as
+  Linux's `userfaultfd_register_range` does: the pages keep their marks,
+  which bit 57 of `/proc/<pid>/pagemap` still shows and which protect
+  nothing; registered again, the mode protects them again, but for a page
+  a write took meanwhile, whose entry became writable with its mark kept
+  (`wp_page_reuse`), until `UFFDIO_WRITEPROTECT` protects it again. With `UFFD_FEATURE_WP_ASYNC`, which brings
   `UFFD_FEATURE_WP_UNPOPULATED` (as `/proc/<pid>/fdinfo` shows), a write
   to a write-protected page, an instruction's or a system call's, does not
   fault: it clears the page's protection and goes on, as `do_wp_page`
@@ -2125,13 +2142,21 @@ kernel.
   `EMSGSIZE`), so one that waits needs them no more. A receive with
   `MSG_WAITALL` whose message or ancillary data was cut fails its link.
   With `IORING_ACCEPT_MULTISHOT` and `IORING_RECV_MULTISHOT`, an accept and
-  an `IORING_OP_RECV` post a completion with `IORING_CQE_F_MORE` for each
+  a receive post a completion with `IORING_CQE_F_MORE` for each
   connection or each buffer filled, and wait for the next: until an error,
-  the end, a receive's limit (`optlen`), no buffer (`ENOBUFS`) or no room in
-  the queue. It goes on at once while its socket has more
+  the end, an `IORING_OP_RECV`'s limit (`optlen`, which an `IORING_OP_RECVMSG`
+  refuses with `EINVAL`), no buffer (`ENOBUFS`) or no room in the queue.
+  It goes on at once while its socket has more
   (`IORING_CQE_F_SOCK_NONEMPTY`) or does not say, as an AF_UNIX listener
   does not, and otherwise waits for the socket first, so a receive whose
-  last buffer went fails with `ENOBUFS` only when more bytes come. Each is
+  last buffer went fails with `ENOBUFS` only when more bytes come. An
+  `IORING_OP_RECVMSG`'s buffer starts with a `struct io_uring_recvmsg_out`
+  (the name's length, the control's, the message's whole one and its
+  flags), then the room its `msghdr` gives the name and the control, then
+  the bytes, as `io_recvmsg_multishot` puts them; a buffer shorter than all
+  but the bytes fails with `EFAULT`, and the `msghdr` is not written. Its
+  result is the bytes of the buffer it used, and the end of the stream
+  posts the last with none. Each is
   prepared as Linux prepares it, which checks its entry
   (`EINVAL`), then reads a connect's or a send's address
   (`move_addr_to_kernel`: `EINVAL` past 128 bytes, `EFAULT`) and checks a
@@ -3218,7 +3243,13 @@ kernel.
     while the end has its carrier, in the peer's, if it takes the
     address as a broadcast one (the limited one, or one its routes make
     so) from a source its reverse path filtering takes
-    (`ip_route_input_slow`). A socket connected from the unspecified
+    (`ip_route_input_slow`). Out through `lo`, to the limited broadcast
+    address from a socket bound to `lo` or to its address, or by a
+    broadcast route through it (as the local table's to
+    `127.255.255.255`), it comes back in on `lo` once, to such sockets
+    bound to `lo` or to no device, as `lo` sends it with no copy looped
+    back (`__mkroute_output` gives `ip_mc_output` to no loopback device).
+    A socket connected from the unspecified
     address has taken its route's source, and takes none. An IPv4 socket
     bound to a broadcast or multicast address keeps it as its name, which
     a UDP connect leaves, but sends from its route's source (`inet_bind`),
@@ -3228,9 +3259,9 @@ kernel.
     IPv4 fail: `EINVAL` from a group or the limited broadcast address,
     `ENETUNREACH` from a subnet's, for UDP's `sendto` and `connect` and
     TCP's `connect`. A group or the
-    limited broadcast address from a socket bound to an end's address
-    needs no route: it goes out through that end
-    (`ip_route_output_key_hash_rcu`).
+    limited broadcast address from a socket bound to an end's address, or
+    to `lo`'s while it is up, needs no route: it goes out through that
+    device (`ip_route_output_key_hash_rcu`).
   - **IPv4 multicast groups:** a UDP socket joins and leaves a group with
     `IP_ADD_MEMBERSHIP` and `IP_DROP_MEMBERSHIP` (`ip_mreqn` or `ip_mreq`),
     on the device of an index, of an address, or of the route to the group
@@ -3459,7 +3490,7 @@ kernel.
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,
-    queues, segment sizes, carrier, queueing discipline, zero statistics (left out
+    queues, segment sizes, carrier, queueing discipline, statistics (left out
     with `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK`), XDP, map, and its
     MCTP, IPv4 and IPv6 settings (`IFLA_AF_SPEC`, as a kernel built with
     MCTP gives it), so `ip -d link` gives
@@ -4379,7 +4410,7 @@ kernel.
   leads into `/proc`, and a Unix socket's address do not.
 
 - The other `/proc` entries are `/proc/cpuinfo` (below), `/proc/loadavg`, `/proc/locks` (above),
-  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
+  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/version` and the other system files (below), `/proc/net` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel`, `net` and `vm` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
@@ -4465,8 +4496,25 @@ kernel.
   elsewhere under `/proc` is `ENOENT`, as a name procfs does not have is on
   Linux, whatever the filesystem holds there (with `--mount /:/`, the
   host's own `/proc`): `/proc` is a mount of its own from start-up, as
-  `/dev` is, so calls that would make, remove or rename such a name are
-  `ENOENT` too.
+  `/dev` is.
+
+- The calls that make, remove or rename a name in a directory of `/proc`
+  or `/dev` (`mkdir`, `mknod`, `symlink`, `link`, `unlink`, `rmdir`,
+  `rename`, `renameat2` and an `open` with `O_CREAT`, with their `*at`
+  forms) give Linux's errors in its order: the directory, a last name of
+  `.` or `..` (`EEXIST`, `EISDIR`, `EINVAL`, `ENOTEMPTY`, `EBUSY`), the
+  lookup (procfs finds no name it does not have, `ENOENT`, where a name
+  that is there is `EEXIST` to make), the trailing slash (`ENOTDIR`,
+  `EISDIR`), the permission to write the directory and then `EPERM`, as
+  procfs and devpts have no such operation; `link` and `rename` between
+  `/proc`, `/dev` and another file system are `EXDEV` first. The
+  permission is procfs's own: a process's and a thread's directory are
+  immutable (`EPERM`, root's too), a process's `fd` lets its own threads
+  write, no directory of `/proc/sys` may be written (`EACCES`, root's
+  too), and the rest go by their mode, as `/dev` (0755 root) does, so
+  another user gets `EACCES`. `/proc` and `/dev` themselves are mount
+  points in the root's directory: `rmdir` and `rename` of them are
+  `EBUSY`, `unlink` `EISDIR` and the calls that make them `EEXIST`.
 
 - `/proc` lists the files above, and nothing the filesystem has there (with
   `--mount /:/`, none of the host's own entries), and then a directory for every process of the guest, zombies included, as
@@ -5004,6 +5052,22 @@ kernel.
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
 
+- The system's other files are those of a machine that booted with nothing
+  but what the emulator has, in Linux's formats:
+  - `/proc/version` is Linux's banner with `uname`'s system name, release and
+    version, built by `paludarium@paludarium` with `rustc`.
+  - `/proc/cmdline` is the fixed command line `ro`, and its size is that of its
+    line, as Linux sets it.
+  - `/proc/filesystems` lists the types `sysfs` numbers, in its order, each
+    but ext4 marked `nodev`.
+  - `/proc/devices` lists the character majors of the memory devices,
+    `/dev/tty` and `/dev/ptmx`, the misc devices and the pseudo-terminals'
+    masters (`ptm`) and slaves (`pts`), then the block major `blkext` alone.
+  - `/proc/misc` lists `/dev/userfaultfd`'s minor.
+  - `/proc/swaps` and `/proc/cgroups` are their headers alone: nothing swaps,
+    and the emulator has no cgroup controller at all, as a kernel built with
+    none (the only cgroup is version 2's root).
+
 - `/proc/stat` is in the format of Linux's `show_stat`.
   - A `cpu` line and one for each CPU `sched_getaffinity` reports give, in
     clock ticks, the CPU time every thread has run, the reaped processes'
@@ -5051,25 +5115,52 @@ kernel.
   the network namespace was made, else the first's (`proc_net_ns_init`),
   opens for reading only (`EACCES`, `seq_open_net`), and is made as it is
   read:
-  - `dev` (`dev_seq_show`), the devices, with counters of 0; `if_inet6`
+  - `dev` (`dev_seq_show`), the devices, with their counters (see below);
+    `if_inet6`
     (`if6_seq_show`), the IPv6 addresses; `route` (`fib_route_seq_show`),
     IPv4's main table, nothing while there is none, with a gateway of IPv6
     (`RTA_VIA`) as 00000000, `RTF_GATEWAY` where its first 4 bytes are not
     0 (`fib_flag_trans`); `ipv6_route`
     (`ipv6_route_native_seq_show`), each IPv6 table, with a reference each;
     and `arp` (`arp_seq_show`), the IPv4 neighbours that need ARP.
+  - The counters of `dev`, as of a link's `IFLA_STATS64` and `IFLA_STATS`
+    (`dev_get_stats`), are the packets and bytes each device has sent and
+    taken in. The loopback counts each packet once each way from its IP
+    header (`loopback_xmit`); a veth end counts what it sends with its
+    Ethernet header (`veth_xmit`) and takes in what its peer sends
+    (`veth_get_stats64`), in whatever namespace that is. They count each
+    UDP datagram, or each fragment of one past the device's MTU
+    (`__ip_append_data`, `__ip6_append_data`), as it leaves: through the
+    loopback to an own address, through a veth end to its peer, or once
+    for a broadcast or a group whoever takes it, the sender's own copy
+    looping back uncounted (`dev_loopback_xmit`); ICMP's port unreachable
+    that answers one, quoting at most what fits in 576 bytes or, of IPv6,
+    1280 (`icmp_send`, `icmp6_send`); and an ARP request and its answer
+    (`arp_send`). What they leave out is in the
+    [limitations](./limitations).
   - `igmp` (`igmp_mc_seq_show`), each device's IPv4 groups, the newest
     first, with their users, under a line of the device with how many it
     has and the querier `V3`: no IGMP report is sent or heard, so no timer
     runs and no device is the reporter. `igmp6` (`igmp6_mc_seq_show`),
     each IPv6 group of each device with IPv6, the newest first, with its
     users and its flags, `MAF_NOREPORT` for ff02::1 and a group of a scope
-    below a link's and `MAF_LOADED` for the rest while their device is up,
-    and no timer, as no MLDv1 report is waited for. `mcfilter` and `mcfilter6`
+    below a link's and `MAF_LOADED` for the rest from when they are joined
+    or their device comes up until it goes down, and no timer, as no MLDv1
+    report is waited for. `mcfilter` and `mcfilter6`
     (`igmp_mcf_seq_show`, `igmp6_mcf_seq_show`), the sources the
     memberships of each group name, with how many include and how many
     exclude each, from the first device whose newest group names one, as
     Linux's begin there.
+  - `dev_mcast` (`dev_mc_seq_show`), the link-layer multicast addresses
+    each device takes packets to, in the order of their indexes, each
+    device's in the order they came, with how many of its groups map to
+    each and whether it is global, which none is. A veth end maps each
+    IPv4 group in its filter to an Ethernet address (`ip_eth_mc_map`), and
+    each IPv6 group of a link's scope or wider (`ipv6_eth_mc_map`), as it is
+    joined or the device comes up, from the all-hosts group, the rest the
+    newest first (`ip_mc_up`, `ipv6_mc_up`); down or with its IPv6 off,
+    they come out (`ip_mc_down`, `ipv6_mc_down`), but a group joined then
+    comes in all the same. The loopback maps none.
   - `tcp`, `tcp6`, `udp` and `udp6`, the sockets `sock_diag` tells of, but
     for TCP ones bound alone, in the format of Linux 7.0's `tcp4_seq_show` and
     the like: first the listeners, then the connections, with those in
@@ -5101,8 +5192,8 @@ kernel.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
 
-- These system files (`cpuinfo`, `loadavg`, `locks`, `meminfo`, `stat`, `uptime` and
-  `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
+- These system files (`cpuinfo`, `loadavg`, `locks`, `meminfo`, `stat`, `uptime`, the
+  files above but `cmdline`, and `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
   read goes on to the end of what they hold. So is every file of a process's
   or a thread's directory (`stat` and `fstat` alike), as Linux's
   `proc_pid_make_inode` leaves it, whatever its reads give.
@@ -6150,7 +6241,10 @@ kernel.
   whose entries need not be those of the array it stands for (master's
   53040a81ae57). A 64-bit `BPF_JEQ` or `BPF_JNE` of a value's or a map's
   pointer with 0 goes one way only, as Linux knows such a pointer is not
-  0; a 32-bit one goes both ways, as on master (e51179a4e098). A value is read and written within its
+  0; a 32-bit one goes both ways, as on master (e51179a4e098). A 64-bit
+  `BPF_JEQ` or `BPF_JNE` of a lookup's result with such a pointer makes
+  that register, not its copies, a pointer to the value where the two are
+  equal (`mark_ptr_not_null_reg`). A value is read and written within its
   size ("invalid access to map value", `EACCES`), not written when the
   map has `BPF_F_RDONLY_PROG` and not read when it has
   `BPF_F_WRONLY_PROG` (`EACCES`). The program keeps the maps it uses.
@@ -6291,7 +6385,9 @@ kernel.
   packet shorter than its header (`EINVAL`). A socket filter cannot change
   the packet, so its checksum never changes (`EBADMSG`). The program
   reads the socket of the run as one of its own (`bpf_dummy_proto`), with
-  a cookie of its own and root of the network namespace as its owner.
+  a cookie of its own and, as its owner, root of the user namespace that
+  owns the network namespace, as that namespace sees it: 0, or the
+  overflow ID while it maps no root.
 
 - A socket filter attaches to an AF_UNIX `SOCK_DGRAM` or `SOCK_SEQPACKET`
   socket with `SO_ATTACH_BPF`, or a classic one with `SO_ATTACH_FILTER`

@@ -4862,6 +4862,7 @@ mod shm {
                 "anycast6",
                 "if_inet6",
                 "mcfilter",
+                "dev_mcast",
                 "mcfilter6",
                 "ipv6_route"
             ]
@@ -7873,7 +7874,7 @@ mod proc_names {
             fs.mkdir(d.as_bytes(), 0o755).unwrap();
         }
         for f in [
-            "/proc/version",
+            "/proc/partitions",
             "/proc/sys/vm/swappiness",
             "/proc/sys/kernel/planted",
             "/proc/self/sched",
@@ -7932,7 +7933,7 @@ mod proc_names {
         let (mut k, mut t, m) = planted();
         m.write(GuestAddr(OTHER), b"user.x\0").unwrap();
         for path in [
-            "/proc/version",
+            "/proc/partitions",
             "/proc/sys/vm/swappiness",
             "/proc/sys/kernel/planted",
             "/proc/self/sched",
@@ -7940,7 +7941,7 @@ mod proc_names {
             "/proc/tty",
             "/proc/tty/drivers",
             "/proc/plink",
-            "/proc/version/x",
+            "/proc/partitions/x",
         ] {
             let k = &mut k;
             let t = &mut t;
@@ -7963,7 +7964,7 @@ mod proc_names {
         }
         m.write(GuestAddr(OTHER), b"/proc/renamed\0").unwrap();
         for path in [
-            "/proc/version",
+            "/proc/partitions",
             "/proc/newdir",
             "/proc/self/newdir",
             "/proc/sys/newdir",
@@ -8005,7 +8006,14 @@ mod proc_names {
     #[test]
     fn a_listing_of_proc_has_only_what_paludarium_makes() {
         let (mut k, mut t, m) = planted();
-        let planted = ["version", "plink", "tty", "sched", "swappiness", "planted"];
+        let planted = [
+            "partitions",
+            "plink",
+            "tty",
+            "sched",
+            "swappiness",
+            "planted",
+        ];
         for dir in ["/proc", "/proc/self", "/proc/sys/vm", "/proc/sys/kernel"] {
             let names = names(&mut k, &mut t, &m, dir);
             assert!(names.len() > 2, "{dir}: {names:?}");

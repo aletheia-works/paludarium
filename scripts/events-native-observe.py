@@ -62,7 +62,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--emulator", type=Path)
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--case", choices=[str(n) for n in range(86)] + ["timer", "unix"])
+    parser.add_argument("--case", choices=[str(n) for n in range(88)] + ["timer", "unix"])
     args = parser.parse_args()
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("Native expectations require an x86-64 Linux runner")
@@ -71,7 +71,7 @@ def main():
     cases = (
         [args.case]
         if args.case is not None
-        else ([0] if args.smoke else [*list(range(86)), "timer", "unix"])
+        else ([0] if args.smoke else [*list(range(88)), "timer", "unix"])
     )
     for case in cases:
         case = int(case) if str(case).isdigit() else case

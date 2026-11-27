@@ -130,11 +130,25 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `if_inet6`, `igmp`,
-  `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the
-  sockets (see [features](./features)) alone; `dev_mcast`, `snmp`,
-  `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
-  `dev` are 0. A session with no network has files of no device and no
+- **Device counters, in part**: `/proc/net/dev` and a link's
+  `IFLA_STATS64` and `IFLA_STATS` count UDP datagrams, ICMP's port
+  unreachable and ARP alone (see [features](./features)). TCP's segments
+  are not counted yet, nor the packets of IPv6 that the kernel sends of
+  itself (neighbour discovery, MLD reports, router solicitations and
+  duplicate address detection), nor ARP's probes of a neighbour whose
+  entry ages, nor what goes to the host (a TCP connection to a port no
+  guest socket holds, the DNS stub's answers) or through the loopback to
+  a broadcast or group address, nor an MCTP send out through the
+  loopback. No error, drop or multicast is counted: a packet that Linux
+  drops as it leaves a veth end whose peer is down (`tx_dropped`) is
+  not sent here at all.
+- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `dev_mcast`,
+  `if_inet6`, `igmp`, `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route`
+  and those of the sockets (see [features](./features)) alone; `snmp`,
+  `sockstat` and the rest are `ENOENT`. `SIOCADDMULTI` and `SIOCDELMULTI` are not supported, so
+  `dev_mcast` has only the addresses the devices' groups map to, none of
+  them global; nor is the `RTM_GETMULTICAST` dump of those addresses
+  (`AF_PACKET`) that Linux master has. A session with no network has files of no device and no
   Internet socket. Of a socket, its address in the kernel is 0, its
   references are the same for each of a kind, the memory its unsent
   datagrams and messages take is 0, and so is a TCP connection's `quick` with
@@ -147,7 +161,7 @@ verified.
   15, though the virtual CPU does not speculate.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/version`, `/proc/cmdline`, the files of `/proc/sys` but for the ones of `fs`,
+  (`/proc/interrupts`, `/proc/partitions`, `/proc/kallsyms`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has and `vm/drop_caches` and
   `vm/unprivileged_userfaultfd`, ...) and the other names in
   the reader's own directory (`stack`, `sched`, `attr`, ...) are `ENOENT`, as in
@@ -201,14 +215,11 @@ verified.
   names as written, where Linux takes a `..` after a link in `/proc` (such
   as `/proc/self/cwd`) from its target.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
-- **Names in `/dev` and `/proc`**: no call makes a name in `/dev`
-  (`mkdir`, `mknod`, `symlink`, an `open` with `O_CREAT` and a `rename`
-  into it give `ENOENT`), where Linux's devtmpfs takes them, and removing
-  or renaming a generated name gives `ENOENT`, where Linux gives `EPERM`
-  for an `unlink` of a file in `/proc`, `ENOTDIR` for an `rmdir` of a
-  link there, `EBUSY` for an `rmdir` of `/dev/pts` and `EXDEV` for a
-  `rename` out of `/proc`. A `link` to a new name in `/proc` is `EXDEV`,
-  where Linux's lookup of the name finds nothing first (`ENOENT`).
+- **Names in `/dev`**: as root, a call that makes a name in `/dev`
+  (`mkdir`, `mknod`, `symlink`, an `open` with `O_CREAT`) gives `ENOENT`,
+  and `unlink`, `rmdir` and `rename` of a name there give `EPERM`, where
+  Linux's devtmpfs makes, removes and renames them. Another user gets
+  Linux's `EACCES`.
 - **`O_PATH` of `/dev/tty`**: it opens the controlling terminal as any
   open does, so without one it fails (`ENOENT`), where Linux's `O_PATH`
   opens the name without the device.
@@ -246,7 +257,7 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Broadcast datagrams reach no one but through a veth end (below). A
+    Broadcast datagrams reach no one but through a veth end or `lo` (below). A
     datagram is always
     stamped as it comes, as Linux stamps it while some socket on the
     machine takes timestamps; with none, Linux stamps it only when
@@ -513,12 +524,15 @@ verified.
   walks both ways of a jump Linux knows goes one way, and it prunes no
   states, so a program with many branches may reach the limits sooner. A
   lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
-  the immediate 0 tells, or an array's key is one the stack holds
-  ([System calls](./features#system-calls)), where Linux also learns from
-  comparing two pointers. A read of the stack is known where Linux knows
-  it (zeros stored, a scalar spilled read from its start, an atomic's old
-  value), but not one of zeros and a spill of 0 together, which master
-  knows as 0 and Linux 7.0 does not.
+  the immediate 0, or with a value's or a map's pointer it equals, tells,
+  or an array's key is one the stack holds
+  ([System calls](./features#system-calls)). Linux 7.0 also learns it
+  from equality with the stack's or the context's pointer, and master
+  from equality with a register it knows is 0; where the two decide
+  differently it refuses, so neither tells here. A read of the stack is
+  known where Linux knows it (zeros stored, a scalar spilled read from
+  its start, an atomic's old value), but not one of zeros and a spill of
+  0 together, which master knows as 0 and Linux 7.0 does not.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for
@@ -631,7 +645,7 @@ verified.
   `IORING_OP_SHUTDOWN`, `_SOCKET`, `_ACCEPT`, `_CONNECT`, `_SEND`,
   `_RECV`, `_SENDMSG` and `_RECVMSG` run; the other operations, up to
   Linux 7.0's `IORING_OP_URING_CMD128`, complete with `EOPNOTSUPP`. Of the
-  socket requests, a multishot `IORING_OP_RECVMSG`, a bundle
+  socket requests, a bundle
   (`IORING_RECVSEND_BUNDLE`), a vectored send (`IORING_SEND_VECTORIZED`), a
   send that selects a buffer, and a receive with `MSG_WAITALL` that selects
   one are not there yet (`EINVAL`). A multishot receive whose socket keeps
@@ -1165,12 +1179,7 @@ verified.
   before it drops the pages of any, where Linux tells and drops VMA by VMA,
   and registered mappings of one `userfaultfd` that meet are one range of
   `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of
-  its whole range once its first mapping passes the checks. A
-  registration that replaces the write-protect mode with others ends the
-  protection of the range's pages, whose marks Linux leaves in their PTEs.
-  `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in
-  the marker's place, where Linux, whose zap keeps the marker, restarts
-  the call until a signal comes.
+  its whole range once its first mapping passes the checks.
   Of shmem's files a memfd and a file of a tmpfs mount (one a guest
   mounted, or `/dev/shm`) are registered, but for write protection alone
   with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a file of the
@@ -1239,16 +1248,15 @@ verified.
   `sk_rethink_txhash`), but here a connection's path is settled as it
   opens, so a hop whose answers do not come back fails it. An ICMPv6 error
   takes the hop of its own flow, where Linux's takes that of the packet
-  it tells of (`icmp6_send`). An IPv4 connection with no port of its own
-  yet hashes one random source port in each of its lookups, where Linux
-  draws a new one at each (`FLOWI_FLAG_ANY_SPORT` in `ip_route_connect`
-  and `ip_route_newports`). A UDP
+  it tells of (`icmp6_send`). A connection with no port of its own yet
+  hashes a random source port, as on Linux (`FLOWI_FLAG_ANY_SPORT`): one
+  in each of its lookups, where Linux's IPv4 one draws a new one at each
+  (`ip_route_connect`, `ip_route_newports`); IPv6's looks its route up
+  once (`tcp_v6_connect`). A UDP
   connect whose route fails puts the socket's device back, as Linux
   master does since "ipv6: fix device binding after failed datagram
   connect"; a CI kernel without that fix keeps the device the scope ID
-  gave. Bound to `lo`, an IPv4 socket's packet to the limited broadcast
-  address or `127.255.255.255` is `ENETUNREACH`, where Linux sends it
-  through `lo`. Neighbour discovery sends no advertisement unasked, and no
+  gave. Neighbour discovery sends no advertisement unasked, and no
   redirect; the
   probe a delaying neighbour sends teaches the peer nothing, where
   Linux's, from the end's link-local address, makes it a neighbour of
@@ -1301,7 +1309,7 @@ verified.
   comes from a sequence of the emulator's own, not the kernel's random
   numbers; its link watch comes at once, where Linux's may come a second
   later, and so its operational state is found as it is told of; it has one queue each way, where Linux's has one for each
-  possible CPU, no `IFLA_AF_SPEC`, and statistics of zero. The interface
+  possible CPU, and no `IFLA_AF_SPEC`. The interface
   requests and netlink change no other flag than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`,
   `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the
@@ -1452,8 +1460,7 @@ verified.
   Linux answers for every socket only those paludarium has for any. A send
   by hardware address while the loopback has no MCTP address is
   `EHOSTUNREACH`, as on Linux 7.0, where later kernels send it from
-  `MCTP_ADDR_NULL`. A link message's
-  statistics are zero; its IPv4 and IPv6 settings are those of a kernel
+  `MCTP_ADDR_NULL`. A link message's IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30
   seconds, where Linux's is random. The first namespace's `127.0.0.1`

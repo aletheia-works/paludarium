@@ -926,17 +926,11 @@ pub(crate) fn dispatch(
                         .write(GuestAddr(at), &name[..n])
                         .map_err(|_| Errno::EFAULT)?;
                 }
-                c.mem
-                    .write(GuestAddr(a[1] + 8), &(name.len() as u32).to_le_bytes())
-                    .map_err(|_| Errno::EFAULT)?;
+                crate::sockets::header_write(c, a[1] + 8, &(name.len() as u32).to_le_bytes())?;
             }
             let flags = if length > n { MSG_TRUNC as u32 } else { 0 };
-            c.mem
-                .write(GuestAddr(a[1] + 40), &0u64.to_le_bytes())
-                .map_err(|_| Errno::EFAULT)?;
-            c.mem
-                .write(GuestAddr(a[1] + 48), &flags.to_le_bytes())
-                .map_err(|_| Errno::EFAULT)?;
+            crate::sockets::header_write(c, a[1] + 40, &0u64.to_le_bytes())?;
+            crate::sockets::header_write(c, a[1] + 48, &flags.to_le_bytes())?;
             Ok(returned(n, length, a[2]))
         }
         _ => Err(Errno::ENOSYS),

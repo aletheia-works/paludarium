@@ -1,6 +1,8 @@
 //! The /proc files paludarium has, generated when opened: the mount table
 //! (`/proc/self/mountinfo`, `/proc/self/mounts`) from the filesystem's mounts,
-//! `loadavg`, `meminfo`, `stat` and `uptime`, `/proc/sys` ([`crate::sysctl`]),
+//! `loadavg`, `meminfo`, `stat`, `uptime` and the system's other files
+//! (`version`, `cmdline`, `filesystems`, `devices`, `misc`, `swaps`,
+//! `cgroups`), `/proc/sys` ([`crate::sysctl`]),
 //! and this process's directory with its
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, its `ns` directory of links
@@ -447,6 +449,20 @@ pub(crate) fn task_path(
 /// System-wide files under /proc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SystemEntry {
+    /// `/proc/cgroups` ([`CGROUPS`]).
+    Cgroups,
+    /// `/proc/cmdline` ([`CMDLINE`]).
+    Cmdline,
+    /// `/proc/devices` ([`render_devices`]).
+    Devices,
+    /// `/proc/filesystems` ([`render_filesystems`]).
+    Filesystems,
+    /// `/proc/misc` ([`render_misc`]).
+    Misc,
+    /// `/proc/swaps` ([`SWAPS`]).
+    Swaps,
+    /// `/proc/version` ([`render_version`]).
+    Version,
     Loadavg,
     /// `/proc/cpuinfo` ([`crate::cpuinfo::render`]).
     Cpuinfo,
@@ -462,7 +478,14 @@ pub(crate) enum SystemEntry {
 }
 pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
     match path {
+        b"/proc/cgroups" => Some(SystemEntry::Cgroups),
+        b"/proc/cmdline" => Some(SystemEntry::Cmdline),
         b"/proc/cpuinfo" => Some(SystemEntry::Cpuinfo),
+        b"/proc/devices" => Some(SystemEntry::Devices),
+        b"/proc/filesystems" => Some(SystemEntry::Filesystems),
+        b"/proc/misc" => Some(SystemEntry::Misc),
+        b"/proc/swaps" => Some(SystemEntry::Swaps),
+        b"/proc/version" => Some(SystemEntry::Version),
         b"/proc/loadavg" => Some(SystemEntry::Loadavg),
         b"/proc/locks" => Some(SystemEntry::Locks),
         b"/proc/meminfo" => Some(SystemEntry::Meminfo),
@@ -522,6 +545,94 @@ pub(crate) fn render_loadavg(running: usize, tasks: usize, last_pid: u32) -> Vec
 pub(crate) fn render_uptime(nanoseconds: u64) -> Vec<u8> {
     let hundredths = nanoseconds / 10_000_000;
     format!("{}.{:02} 0.00\n", hundredths / 100, hundredths % 100).into_bytes()
+}
+impl SystemEntry {
+    /// Its `stat`: of size 0 ([`entry_stat`]), but `/proc/cmdline`, whose
+    /// size Linux's `proc_cmdline_init` sets to its line's, newline too.
+    pub(crate) fn stat(self) -> FileStat {
+        match self {
+            Self::Cmdline => FileStat {
+                size: CMDLINE.len() as u64,
+                ..entry_stat()
+            },
+            _ => entry_stat(),
+        }
+    }
+}
+/// `/proc/cmdline`, as Linux's `cmdline_proc_show` prints the command line
+/// the kernel booted with. No kernel boots here, so it is a fixed one that
+/// asks for nothing: the root file system read-only at first, as a boot
+/// loader's `ro` asks.
+pub(crate) const CMDLINE: &[u8] = b"ro\n";
+/// `/proc/swaps`, as Linux's `swap_show` prints its header. Nothing swaps:
+/// the machine's memory is all the memory there is, as `sysinfo`'s
+/// `totalswap` of 0 says, so no area follows.
+pub(crate) const SWAPS: &[u8] = b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+/// `/proc/cgroups`, as Linux's `proc_cgroupstats_show` prints its header.
+/// Linux then prints a line for every controller built into the kernel,
+/// bound to a version 1 hierarchy or not (one of version 2's shows
+/// hierarchy 0). The emulator has no controller at all, as a kernel built
+/// with none: its only cgroup is version 2's root (`/proc/<pid>/cgroup`'s
+/// `0::/`), with nothing to control, so no line follows.
+pub(crate) const CGROUPS: &[u8] = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n";
+/// `/proc/version`, as Linux's `version_proc_show` prints
+/// `linux_proc_banner` with the UTS names `uname` gives: the system, the
+/// release, who built the kernel where, with what, and its version.
+pub(crate) fn render_version() -> Vec<u8> {
+    use crate::namespaces::{RELEASE, SYSNAME, VERSION};
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    format!(
+        "{} version {} (paludarium@paludarium) (rustc) {}\n",
+        text(SYSNAME),
+        text(RELEASE),
+        text(VERSION)
+    )
+    .into_bytes()
+}
+/// `/proc/filesystems`, as Linux's `filesystems_proc_show` prints the types
+/// `sysfs` numbers ([`crate::filesystems::TYPES`]), in its order: `nodev`
+/// before those that need no block device (`FS_REQUIRES_DEV`), which only
+/// ext4, the host's files, does.
+pub(crate) fn render_filesystems() -> Vec<u8> {
+    let mut out = Vec::new();
+    for kind in crate::filesystems::TYPES {
+        if kind != b"ext4" {
+            out.extend_from_slice(b"nodev");
+        }
+        out.push(b'\t');
+        out.extend_from_slice(kind);
+        out.push(b'\n');
+    }
+    out
+}
+/// `/proc/devices`, as Linux's `devinfo_show` prints the majors of the
+/// character devices (`chrdev_show`) and then those of the block ones
+/// (`blkdev_show`), each in increasing order: the memory devices of
+/// `/dev/null` and its kind, `/dev/tty` and `/dev/ptmx`, the misc devices,
+/// and the pseudo-terminals' masters and slaves, as their drivers register
+/// them. There are no block devices, but the extended major Linux's
+/// `genhd_device_init` always registers.
+pub(crate) fn render_devices() -> Vec<u8> {
+    const CHARACTER: [(u32, &str); 6] = [
+        (1, "mem"),
+        (5, "/dev/tty"),
+        (5, "/dev/ptmx"),
+        (10, "misc"),
+        (128, "ptm"),
+        (136, "pts"),
+    ];
+    let mut out = String::from("Character devices:\n");
+    for (major, name) in CHARACTER {
+        out.push_str(&format!("{major:3} {name}\n"));
+    }
+    out.push_str("\nBlock devices:\n259 blkext\n");
+    out.into_bytes()
+}
+/// `/proc/misc`, as Linux's `misc_seq_show` prints the misc devices' minor
+/// numbers and names, the last registered first: only `/dev/userfaultfd`
+/// here.
+pub(crate) fn render_misc() -> Vec<u8> {
+    format!("{:3} userfaultfd\n", crate::devices::USERFAULTFD_MINOR).into_bytes()
 }
 /// What the machine's threads have used, for `/proc/stat`: their CPU time
 /// in nanoseconds on each CPU, by its number, and the times they went to
@@ -1395,6 +1506,9 @@ pub(crate) struct GeneratedFile {
     /// A system-wide file, as Linux's `proc_create` makes one: its mode is
     /// [`entry_stat`]'s, and a write gives `EIO`.
     entry: bool,
+    /// The size such a file's `fstat` gives: 0 but for `/proc/cmdline`'s
+    /// ([`SystemEntry::stat`]).
+    entry_size: u64,
     /// The mode and owner `fstat` gives, with size 0, those of the file it
     /// was opened as ([`Self::with_stat`]); a plain 0444 file of root's
     /// without.
@@ -1486,8 +1600,16 @@ impl GeneratedFile {
             position: Mutex::new(0),
             write_error: (flags & 3 != 0).then_some(error),
             entry,
+            entry_size: 0,
             stat: None,
             owner: None,
+        }
+    }
+    /// The same system-wide file, of size `size` ([`SystemEntry::stat`]).
+    pub(crate) fn with_entry_size(self, size: u64) -> Self {
+        Self {
+            entry_size: size,
+            ..self
         }
     }
     /// The same, owned by whom its inode's `owner` says when `fstat` asks.
@@ -1544,7 +1666,10 @@ impl FileHandle for GeneratedFile {
             // Of size 0, as Linux's `/proc` files are: a reader goes by what
             // `read` gives.
             Some(file) => FileStat { size: 0, ..file },
-            None if self.entry => entry_stat(),
+            None if self.entry => FileStat {
+                size: self.entry_size,
+                ..entry_stat()
+            },
             None => stat(0),
         };
         Ok(match &self.owner {
@@ -3393,6 +3518,18 @@ mod generated_tests {
         assert_eq!(system_entry(b"/proc/stat"), Some(SystemEntry::Stat));
         assert_eq!(system_entry(b"/proc/uptime"), Some(SystemEntry::Uptime));
         assert_eq!(system_entry(b"/proc/self/uptime"), None);
+        assert_eq!(system_entry(b"/proc/cgroups"), Some(SystemEntry::Cgroups));
+        assert_eq!(system_entry(b"/proc/cmdline"), Some(SystemEntry::Cmdline));
+        assert_eq!(system_entry(b"/proc/devices"), Some(SystemEntry::Devices));
+        assert_eq!(
+            system_entry(b"/proc/filesystems"),
+            Some(SystemEntry::Filesystems)
+        );
+        assert_eq!(system_entry(b"/proc/misc"), Some(SystemEntry::Misc));
+        assert_eq!(system_entry(b"/proc/swaps"), Some(SystemEntry::Swaps));
+        assert_eq!(system_entry(b"/proc/version"), Some(SystemEntry::Version));
+        assert_eq!(system_entry(b"/proc/self/version"), None);
+        assert!(below_system_entry(b"/proc/version/x"));
     }
     #[test]
     fn stat_has_linux_s_52_fields_after_the_name() {
@@ -3566,6 +3703,27 @@ mod generated_tests {
         assert_eq!(render_loadavg(1, 4, 9), b"0.00 0.00 0.00 1/4 9\n");
         assert_eq!(render_uptime(1_234_567_891), b"1.23 0.00\n");
         assert_eq!(render_uptime(5_000_000), b"0.00 0.00\n");
+        assert_eq!(
+            render_version(),
+            b"Linux version 6.12.0-paludarium (paludarium@paludarium) (rustc) #1 SMP PREEMPT_DYNAMIC\n"
+        );
+        assert_eq!(SystemEntry::Cmdline.stat().size, 3);
+        assert_eq!(SystemEntry::Version.stat().size, 0);
+        assert_eq!(SystemEntry::Version.stat().mode, 0o100_444);
+        let filesystems = String::from_utf8(render_filesystems()).unwrap();
+        let lines: Vec<&str> = filesystems.lines().collect();
+        assert_eq!(lines.len(), crate::filesystems::TYPES.len());
+        assert_eq!(lines[0], "nodev\ttmpfs");
+        assert!(lines.contains(&"\text4"));
+        assert_eq!(
+            render_devices(),
+            b"Character devices:\n  1 mem\n  5 /dev/tty\n  5 /dev/ptmx\n 10 misc\n128 ptm\n136 pts\n\n\
+              Block devices:\n259 blkext\n"
+        );
+        assert_eq!(
+            render_misc(),
+            format!("{:3} userfaultfd\n", crate::devices::USERFAULTFD_MINOR).into_bytes()
+        );
         let meminfo = String::from_utf8(render_meminfo(4 << 30)).unwrap();
         let lines: Vec<&str> = meminfo.lines().collect();
         assert_eq!(lines[0], "MemTotal:        4194304 kB");

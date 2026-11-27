@@ -8396,6 +8396,10 @@ static int proc_stat_sched_case(void) {
     pss_show("with the thread", self);
     if (write(pss_done[1], &cpu, sizeof cpu) != sizeof cpu) return 1;
     pthread_join(thread, NULL);
+    /* The join returns once the thread clears its ID (mm_release), which on
+       Linux comes before its exit takes it from the count (__exit_signal):
+       wait for that, up to two seconds. */
+    for (int tries = 0; tries < 200 && ps_field(self, 20) != 1; tries++) usleep(10000);
     int own = pss_pin_high();
     printf("pinned: %d processor-is-getcpu=%d\n", own >= 0,
            own >= 0 && sched_getcpu() == own && ps_field(self, 39) == own);
@@ -12740,7 +12744,7 @@ static int io_uring_message_case(void) {
 }
 
 /* io_uring's multishot requests: IORING_ACCEPT_MULTISHOT and
-   IORING_RECV_MULTISHOT. */
+   IORING_RECV_MULTISHOT, on IORING_OP_RECV and _RECVMSG. */
 static int um_connect(struct sockaddr_un *name, socklen_t len) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     printf("connect %d\n", connect(fd, (struct sockaddr *)name, len));
@@ -12834,6 +12838,54 @@ static int io_uring_multishot_case(void) {
     um_run(&u, 2, 0, "receive-linked");
     close(pair[0]);
     um_run(&u, 0, 2, "receive-end");
+
+    /* Receives of messages: each buffer has a struct io_uring_recvmsg_out,
+       then the room the msghdr gives a name and control, then the bytes. A
+       datagram socket does not tell what is left, so it goes on at once. */
+    unsigned char mpool[2][48];
+    memset(mpool, 0, sizeof mpool);
+    int gram[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, gram)) return 83;
+    struct sockaddr_un from;
+    struct msghdr mh = {.msg_name = &from, .msg_namelen = 8, .msg_controllen = 8};
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 1, "message-no-buffer");
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    sqe[44] = 1;
+    um_run(&u, 1, 1, "message-limit");
+    unet_push(&u, 31, 99, 2, 0, (long)mpool, 48, 0, 0)[40] = 4;
+    um_run(&u, 1, 1, "message-provide");
+    write(gram[0], "hello", 5);
+    write(gram[0], "a longer message than fits", 26);
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 3, "messages");
+    for (int i = 0; i < 2; i++) {
+        unsigned out[4];
+        memcpy(out, mpool[i], sizeof out);
+        printf("message %d: name %u control %u payload %u flags %#x %.16s\n", i, out[0], out[1],
+               out[2], out[3], (char *)mpool[i] + 32);
+    }
+    printf("msghdr %u %zu %#x\n", mh.msg_namelen, mh.msg_controllen, mh.msg_flags);
+    unet_push(&u, 31, 99, 1, 0, (long)mpool, 20, 0, 0)[40] = 4;
+    um_run(&u, 1, 1, "message-provide-short");
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 1, "message-short");
+    mh.msg_namelen = -1;
+    mh.msg_name = NULL;
+    sqe = unet_push(&u, 10, 1, gram[1], 0, (long)&mh, 0, 0, 2);
+    sqe[1] = 1 << 5;
+    sqe[40] = 4;
+    um_run(&u, 1, 1, "message-overflow");
+    close(gram[0]);
+    close(gram[1]);
     close(first);
     close(second);
     close(u.fd);
@@ -18901,6 +18953,89 @@ static int generated_link_names_case(const char *self) {
     return 0;
 }
 
+/* The generated-name-errors case: the calls that make, remove or rename
+   a name in a directory of /proc or /dev, in Linux's order: the directory,
+   the last name (`.`), the lookup (procfs finds nothing it does not have,
+   ENOENT), the trailing slash, the permission to write the directory
+   (procfs's own: a process's directory is immutable, its fd its own, no
+   directory of /proc/sys writable), and then EPERM (procfs has no such
+   operation), EXDEV between file systems. As root for /proc only, then as
+   nobody for /proc and /dev too, where nothing can change. Only errno
+   values are printed. */
+static char gne_base[] = "/tmp/paludarium-generated-names-XXXXXX";
+static int gne_e(int rc) { return rc < 0 ? errno : 0; }
+static void gne_rows(const char *const *names, unsigned count) {
+    char file[256], other[256];
+    snprintf(file, sizeof file, "%s/file", gne_base);
+    snprintf(other, sizeof other, "%s/other", gne_base);
+    printf("name unlink rmdir mkdir mknod symlink creat link-to link-from rename-out rename-in "
+           "rename-within\n");
+    for (unsigned i = 0; i < count; i++) {
+        const char *p = names[i];
+        char sibling[256];
+        snprintf(sibling, sizeof sibling, "%s", p);
+        char *slash = strrchr(sibling, '/');
+        if (slash && slash[1]) strcpy(slash + 1, "y8");
+        int u = gne_e(unlink(p));
+        int r = gne_e(rmdir(p));
+        int m = gne_e(mkdir(p, 0755));
+        int k = gne_e(mknod(p, S_IFIFO | 0644, 0));
+        int s = gne_e(symlink("x", p));
+        int fd = open(p, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        int c = fd < 0 ? errno : 0;
+        if (fd >= 0) close(fd);
+        int lt = gne_e(link(file, p));
+        int lf = gne_e(link(p, other));
+        int ro = gne_e(rename(p, other));
+        int ri = gne_e(rename(file, p));
+        int rw = gne_e(rename(p, sibling));
+        printf("%s %d %d %d %d %d %d %d %d %d %d %d\n", p, u, r, m, k, s, c, lt, lf, ro, ri, rw);
+    }
+}
+static int generated_name_errors_case(void) {
+    if (!mkdtemp(gne_base)) return 1;
+    chmod(gne_base, 0777);
+    char file[256];
+    snprintf(file, sizeof file, "%s/file", gne_base);
+    close(open(file, O_CREAT | O_WRONLY, 0666));
+    chmod(file, 0666);
+    static const char *const proc_names[] = {
+        "/proc/x8",       "/proc/uptime",    "/proc/self",      "/proc/sys",        "/proc/self/comm",
+        "/proc/self/fd",  "/proc/self/exe",  "/proc/self/x8",   "/proc/sys/kernel", "/proc/sys/x8",
+        "/proc/sys/kernel/ostype", "/proc/self/fd/0", "/proc/self/fd/x8", "/proc/x8/",  "/proc/uptime/",
+        "/proc/self/",    "/proc/sys/",      "/proc/.",         "/proc/self/.",     "/proc/self/..",
+        "/proc/thread-self/comm"};
+    static const char *const dev_names[] = {"/dev/null", "/dev/x8", "/dev/pts", "/dev/null/", "/dev/."};
+    unsigned procs = sizeof proc_names / sizeof proc_names[0];
+    printf("root\n");
+    gne_rows(proc_names, procs);
+    /* /proc and /dev themselves, in the root's directory. */
+    /* A thread's directory by /proc/self/task: immutable, as root too. */
+    char task[64], task_comm[80];
+    snprintf(task, sizeof task, "/proc/self/task/%ld", (long)syscall(SYS_gettid));
+    snprintf(task_comm, sizeof task_comm, "%s/comm", task);
+    printf("task unlink=%d rmdir=%d,%d\n", gne_e(unlink(task_comm)), gne_e(rmdir(task)),
+           gne_e(rmdir("/proc/thread-self")));
+    printf("tops unlink=%d,%d rmdir=%d,%d mknod=%d symlink=%d\n", gne_e(unlink("/proc")),
+           gne_e(unlink("/dev/")), gne_e(rmdir("/proc")), gne_e(rmdir("/dev")),
+           gne_e(mknod("/proc", S_IFIFO | 0644, 0)), gne_e(symlink("x", "/dev")));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        printf("nobody\n");
+        gne_rows(proc_names, procs);
+        gne_rows(dev_names, sizeof dev_names / sizeof dev_names[0]);
+        printf("tops unlink=%d rmdir=%d\n", gne_e(unlink("/proc")), gne_e(rmdir("/dev")));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("status=%d\n", reaped(child));
+    unlink(file);
+    printf("cleaned=%d\n", rmdir(gne_base) == 0);
+    return 0;
+}
+
 /* The generated-rooted-links case: under a root of its own, whose /proc
    and /dev are bind mounts of the machine's, a symbolic link in that root
    into them (absolute, so from the new root, or relative) finds what their
@@ -22675,6 +22810,160 @@ static int proc_oom_case(void) {
     waitpid(child, &status, 0);
     printf("user child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     OC_SET("0");
+    return 0;
+}
+
+/* The proc-system case: /proc's version, cmdline, filesystems, devices,
+   misc, swaps and cgroups. What they hold differs from machine to machine,
+   so their format is checked, and what other calls say of the same things:
+   uname's names in version, sysfs's types in filesystems, /dev's devices'
+   numbers in devices and misc. */
+static char psys_text[65536];
+static void psys_stat(const char *path, long n) {
+    struct stat st = {0}, opened = {0};
+    int r = stat(path, &st);
+    int fd = open(path, O_RDONLY);
+    int f = fstat(fd, &opened);
+    close(fd);
+    /* Size 0, but cmdline's, which is its line's. */
+    long want = strcmp(path, "/proc/cmdline") ? 0 : n;
+    printf("%s stat=%d mode=%o size-ok=%d fstat=%d size-ok=%d\n", path, r, st.st_mode, st.st_size == want, f,
+           opened.st_size == want);
+}
+/* Whether every line of `text`, after `skip` of them and up to a blank
+   one, is a major or minor number right-aligned in 3 columns, a space and a
+   name, in increasing order unless `any_order`; and whether a line names
+   `name` with `number` (*found). */
+static int psys_numbered(const char *text, int skip, int any_order, const char *name, long number, int *found) {
+    static char copy[65536];
+    snprintf(copy, sizeof copy, "%s", text);
+    int ok = 1;
+    long last = -1;
+    for (char *line = copy, *end; *line; line = end + 1) {
+        if (!(end = strchr(line, '\n'))) return 0;
+        *end = 0;
+        if (skip > 0) {
+            skip--;
+            continue;
+        }
+        if (!*line) break;
+        char spaced[4] = {0};
+        memcpy(spaced, line, 3);
+        long value = strtol(spaced, NULL, 10);
+        ok &= strlen(line) > 4 && line[3] == ' ' && line[2] != ' ' && (any_order || value >= last);
+        last = value;
+        if (found && value == number && !strcmp(line + 4, name)) *found = 1;
+    }
+    return ok;
+}
+static int proc_system_case(void) {
+    long n;
+    /* version: linux_proc_banner with uname's sysname, release and version. */
+    struct utsname names;
+    uname(&names);
+    n = proc_read("/proc/version", psys_text, sizeof psys_text);
+    char head[512], tail[512];
+    snprintf(head, sizeof head, "%s version %s (", names.sysname, names.release);
+    snprintf(tail, sizeof tail, ") %s\n", names.version);
+    size_t tail_len = strlen(tail);
+    printf("version head=%d tail=%d one-line=%d\n", !strncmp(psys_text, head, strlen(head)),
+           n > (long)tail_len && !strcmp(psys_text + n - tail_len, tail), strchr(psys_text, '\n') == psys_text + n - 1);
+    psys_stat("/proc/version", n);
+    /* cmdline: one line, of the size its stat gives. */
+    n = proc_read("/proc/cmdline", psys_text, sizeof psys_text);
+    printf("cmdline some=%d one-line=%d\n", n > 1, n > 0 && strchr(psys_text, '\n') == psys_text + n - 1);
+    psys_stat("/proc/cmdline", n);
+    /* filesystems: sysfs's types, in its order, nodev before each that
+       needs no device. */
+    n = proc_read("/proc/filesystems", psys_text, sizeof psys_text);
+    long count = syscall(SYS_sysfs, 3);
+    long index = 0;
+    int same = 1, formed = 1, proc_nodev = 0;
+    for (char *line = psys_text, *end; *line; line = end + 1, index++) {
+        if (!(end = strchr(line, '\n'))) break;
+        *end = 0;
+        char *tab = strchr(line, '\t');
+        formed &= tab && (tab == line || (tab - line == 5 && !strncmp(line, "nodev", 5)));
+        char name[256] = {0};
+        same &= tab && syscall(SYS_sysfs, 2, index, name) == 0 && !strcmp(name, tab + 1);
+        proc_nodev |= !strcmp(line, "nodev\tproc");
+    }
+    printf("filesystems formed=%d same-as-sysfs=%d count-same=%d proc-nodev=%d\n", formed, same, index == count,
+           proc_nodev);
+    psys_stat("/proc/filesystems", n);
+    /* devices: the character majors, then a blank line and the block ones,
+       with the majors /dev's devices have among them. */
+    n = proc_read("/proc/devices", psys_text, sizeof psys_text);
+    struct stat st = {0};
+    stat("/dev/null", &st);
+    long null_major = major(st.st_rdev);
+    stat("/dev/userfaultfd", &st);
+    long misc_major = major(st.st_rdev), uffd_minor = minor(st.st_rdev);
+    stat("/dev/ptmx", &st);
+    long ptmx_major = major(st.st_rdev);
+    const char *block = strstr(psys_text, "\n\nBlock devices:\n");
+    int mem = 0, ptmx = 0, misc = 0, pts = 0, blkext = 0;
+    int ok = psys_numbered(psys_text, 1, 0, "mem", null_major, &mem);
+    psys_numbered(psys_text, 1, 0, "/dev/ptmx", ptmx_major, &ptmx);
+    psys_numbered(psys_text, 1, 0, "misc", misc_major, &misc);
+    psys_numbered(psys_text, 1, 0, "pts", 136, &pts);
+    int block_ok = block && psys_numbered(block + 2, 1, 0, "blkext", 259, &blkext);
+    printf("devices character-first=%d formed=%d block=%d block-formed=%d\n",
+           !strncmp(psys_text, "Character devices:\n", 19), ok, block != NULL, block_ok);
+    printf("devices mem=%d ptmx=%d misc=%d pts=%d blkext=%d\n", mem, ptmx, misc, pts, blkext);
+    n = proc_read("/proc/devices", psys_text, sizeof psys_text);
+    psys_stat("/proc/devices", n);
+    /* misc: minors and names, with /dev/userfaultfd's. */
+    n = proc_read("/proc/misc", psys_text, sizeof psys_text);
+    int uffd = 0;
+    int misc_ok = psys_numbered(psys_text, 0, 1, "userfaultfd", uffd_minor, &uffd);
+    printf("misc formed=%d userfaultfd=%d\n", misc_ok && n > 0, uffd);
+    psys_stat("/proc/misc", n);
+    /* swaps and cgroups: their headers, then lines of their fields. */
+    n = proc_read("/proc/swaps", psys_text, sizeof psys_text);
+    printf("swaps header=%d\n", !strncmp(psys_text, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n", 39));
+    psys_stat("/proc/swaps", n);
+    n = proc_read("/proc/cgroups", psys_text, sizeof psys_text);
+    int header = !strncmp(psys_text, "#subsys_name\thierarchy\tnum_cgroups\tenabled\n", 43);
+    int fields = 1;
+    for (char *line = header ? psys_text + 43 : psys_text, *end; *line; line = end + 1) {
+        if (!(end = strchr(line, '\n'))) break;
+        *end = 0;
+        char name[64];
+        int h, cgroups, enabled;
+        fields &= sscanf(line, "%63[^\t]\t%d\t%d\t%d", name, &h, &cgroups, &enabled) == 4;
+    }
+    printf("cgroups header=%d fields=%d\n", header, fields);
+    psys_stat("/proc/cgroups", n);
+    /* /proc lists them all, as regular files. */
+    const char *names_[] = {"cgroups", "cmdline", "cpuinfo", "devices", "filesystems", "misc", "swaps", "version"};
+    int listed = 0;
+    DIR *proc = opendir("/proc");
+    for (struct dirent *e; proc && (e = readdir(proc));)
+        for (int i = 0; i < 8; i++) listed += !strcmp(e->d_name, names_[i]) && e->d_type == DT_REG;
+    if (proc) closedir(proc);
+    printf("listed=%d\n", listed);
+    /* Past one, as past any file. An open for writing is checked against
+       the 0444 mode, which only root overrides: a child, a user other than
+       root on both sides, tries it. */
+    errno = 0;
+    int r = open("/proc/version/x", O_RDONLY);
+    printf("past open=%d errno=%d\n", r, errno);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(90);
+        errno = 0;
+        int fd = open("/proc/filesystems", O_WRONLY);
+        printf("write open=%d errno=%d\n", fd >= 0, fd >= 0 ? 0 : errno);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("write child=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
 
@@ -45212,6 +45501,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-link-names")) return generated_link_names_case(self);
     if (!strcmp(mode, "generated-link-ran")) return 7;
+    if (!strcmp(mode, "generated-name-errors")) return generated_name_errors_case();
     if (!strcmp(mode, "generated-rooted-links")) return generated_rooted_links_case(self);
     if (!strcmp(mode, "proc-links")) return proc_links_case(self);
     if (!strcmp(mode, "proc-links-ran")) return 7;
@@ -45277,6 +45567,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userns-nondumpable-stage")) return userns_nondumpable_stage(self);
     if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "status-space")) return status_space_case(self, argv);
+    if (!strcmp(mode, "proc-system")) return proc_system_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "segment-registers")) return segments_case();

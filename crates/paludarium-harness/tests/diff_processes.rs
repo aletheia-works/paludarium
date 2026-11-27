@@ -211,6 +211,8 @@ mod linux {
             // other users or make it another user's, the proc-fd-links case,
             // which reads links from a chroot of its own mount namespace,
             // the maps-root case, which reads maps across a chroot,
+            // the generated-name-errors case, which makes, removes and
+            // renames names in /proc as root and then becomes nobody,
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
@@ -242,6 +244,7 @@ mod linux {
                     | "timer-waits-default"
                     | "proc-mem"
                     | "chroot-names"
+                    | "generated-name-errors"
                     | "maps-root"
                     | "path-flags"
                     | "permissions"
@@ -465,6 +468,8 @@ mod linux {
                     | "multicast-groups6"
                     | "veth-ipv6-own-neighbours"
                     | "veth-ipv6-anycast"
+                    | "veth-dev-mcast"
+                    | "net-dev-counters"
                     | "veth-ipv6-accept"
                     | "veth-ipv6-oif"
                     | "veth-ipv6-ecmp"
@@ -741,6 +746,8 @@ mod linux {
         multicast_groups6 => ("multicast-groups6","multicast-groups6"),
         veth_ipv6_own_neighbours => ("veth-ipv6-own-neighbours","veth-ipv6-own-neighbours"),
         veth_ipv6_anycast => ("veth-ipv6-anycast","veth-ipv6-anycast"),
+        veth_dev_mcast => ("veth-dev-mcast","veth-dev-mcast"),
+        net_dev_counters => ("net-dev-counters","net-dev-counters"),
         veth_ipv6_accept => ("veth-ipv6-accept","veth-ipv6-accept"),
         veth_ipv6_oif => ("veth-ipv6-oif","veth-ipv6-oif"),
         veth_ipv6_ecmp => ("veth-ipv6-ecmp","veth-ipv6-ecmp"),
@@ -1006,6 +1013,7 @@ mod linux {
         processes_poll => ("poll","process"),
         processes_proc_status => ("proc-status","process"),
         processes_status_space => ("status-space","process"),
+        processes_proc_system => ("proc-system","process"),
         processes_credentials => ("credentials","process"),
         processes_permissions => ("permissions","process"),
         processes_setuid => ("setuid","process"),
@@ -1186,6 +1194,7 @@ mod linux {
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_link_names => ("generated-link-names","process"),
+        processes_generated_name_errors => ("generated-name-errors","process"),
         processes_generated_rooted_links => ("generated-rooted-links","process"),
         processes_proc_links => ("proc-links","process"),
         processes_generated_changes => ("generated-changes","process"),

@@ -20,7 +20,9 @@
    value, the null check of a lookup's result, which an array's element of
    a key the stack holds needs none of (a 0 stored, a 32-bit spill, the
    whole of an 8-byte one, in range or not, and keys it does not know),
-   a pointer that cannot be null compared with 0, and the bounds and
+   a pointer that cannot be null compared with 0, a lookup's result
+   compared with one (a value's, the map's), which tells where they are
+   equal, and the bounds and
    access (BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG) of a value.
    bpf-prog-context: the context, struct __sk_buff, read and written
    (cb[]) at the offsets and sizes a socket filter may use, and the
@@ -120,9 +122,10 @@
    every field a filter reads, without a context and with one, and the
    context that comes back; the MAC header, and classic loads from the
    data and the headers; the helpers of the task and of the run's own
-   socket (its owner, and a cookie that each run has its own of); cb[]
-   through repeated runs and a map that counts them; a packet in pages,
-   with data_end and without; and the checks of the call and of its
+   socket (its owner, also where the network namespace's user namespace
+   maps no root and once it does, and a cookie that each run has its own
+   of); cb[] through repeated runs and a map that counts them; a packet in
+   pages, with data_end and without; and the checks of the call and of its
    context, in their order. Not printed: the time a run took, and what
    master and the test machines' Linux 7.0 do differently (a short IPv4
    or IPv6 header, IPX, and a packet in pages cut by data_size_out).
@@ -168,6 +171,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -512,9 +516,32 @@ static int case_maps(void) {
               EXIT(), LDX_DW(0, 0, 0), EXIT());
     LOAD_MAPS("map is not 0", LD_MAP(1, array), JEQ(1, 0, 2), MOV(0, 0), EXIT(), LDX_DW(0, 10, 8),
               EXIT());
+    /* A hash's lookup in R6 equal to a pointer that cannot be null is not
+       null either: the jump skips the read through R6 if they are not
+       equal. */
+#define HASHED KEY8(hash), CALL(LOOKUP), MOV_REG(6, 0)
+#define NE(dst, src) I(0x5d, dst, src, 1, 0)
+    LOAD_MAPS("equal to the map", HASHED, LD_MAP(1, hash), NE(6, 1), LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("map equal to it", HASHED, LD_MAP(1, hash), NE(1, 6), LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("equal to a value", HASHED, KEY4(array), CALL(LOOKUP), NE(6, 0), LDX_DW(0, 6, 0),
+              EXIT());
+    LOAD_MAPS("equal to the map, jeq", HASHED, LD_MAP(1, hash), I(0x1d, 6, 1, 1, 0), EXIT(),
+              LDX_DW(0, 6, 0), EXIT());
 
     /* Programs it refuses. */
     LOAD_MAPS("no null check", KEY8(hash), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    /* Nor where it is not equal, for its copy, after a 32-bit
+       comparison, or equal to another lookup's result. */
+    LOAD_MAPS("not equal to the map", HASHED, LD_MAP(1, hash), I(0x5d, 6, 1, 1, 0), EXIT(),
+              LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("copy of one equal to the map", HASHED, MOV_REG(7, 6), LD_MAP(1, hash), NE(6, 1),
+              LDX_DW(0, 7, 0), EXIT());
+    LOAD_MAPS("equal to the map in 32 bits", HASHED, LD_MAP(1, hash), I(0x5e, 6, 1, 1, 0),
+              LDX_DW(0, 6, 0), EXIT());
+    LOAD_MAPS("equal to another lookup", HASHED, KEY8(hash), CALL(LOOKUP), NE(6, 0), LDX_DW(0, 6, 0),
+              EXIT());
+#undef NE
+#undef HASHED
     /* An array's element of a key out of range, or one the stack does not
        hold as Linux knows it: unknown, partly overwritten, scrubbed with
        a spill, an 8-byte spill from its start, a key past its slot's
@@ -2676,7 +2703,6 @@ static long value0(int fd, void *out) {
 /* A filter that copies struct __sk_buff's fields into the map's value,
    one u32 each, and keeps the datagram. */
 #define FIELD(i, off) LDX_W(1, 6, off), STX_W(0, 1, 4 * (i))
-static const int field_offsets[] = {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 68, 84, 164, 176};
 static const char *const field_names[] = {"len", "pkt_type", "mark", "queue_mapping", "protocol",
                                           "vlan_present", "vlan_tci", "vlan_proto", "priority",
                                           "ingress_ifindex", "ifindex", "tc_index", "hash", "napi_id",
@@ -3449,8 +3475,32 @@ static int case_testrun(void) {
     say("pid_tgid %ld is the thread %d", r, t.retval == (uint32_t)syscall(SYS_gettid));
     t = run_of(PROGRAM(CALL(15), EXIT()), 64); /* bpf_get_current_uid_gid */
     test_run("uid_gid", &t);
-    t = run_of(PROGRAM(CALL(SOCKET_UID), EXIT()), 64);
+    int socket_uid = PROGRAM(CALL(SOCKET_UID), EXIT());
+    t = run_of(socket_uid, 64);
     test_run("socket uid", &t);
+    /* That owner is root of the user namespace that owns the network
+       namespace, as that namespace sees it: the overflow ID while it maps
+       no root, then 0. */
+    {
+        unsigned outer = (unsigned)geteuid();
+        fflush(stdout);
+        pid_t child = fork();
+        if (child == 0) {
+            say("unshare user and net %d", unshare(CLONE_NEWUSER | CLONE_NEWNET) ? -errno : 0);
+            t = run_of(socket_uid, 64);
+            test_run("socket uid, no root mapped", &t);
+            char line[32];
+            int n = snprintf(line, sizeof line, "0 %u 1\n", outer);
+            int fd = open("/proc/self/uid_map", O_WRONLY);
+            say("uid_map %ld", fd < 0 ? -errno : (long)(write(fd, line, (size_t)n) == n ? 0 : -errno));
+            if (fd >= 0) close(fd);
+            t = run_of(socket_uid, 64);
+            test_run("socket uid, root mapped", &t);
+            _exit(0);
+        }
+        int status = 0;
+        say("socket uid child %d", child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status));
+    }
     /* Each run's socket has a cookie of its own, the same in each repeat. */
     int cm = map(2, 4, 16, 1, 0);
     int cookie = PROGRAM(MOV_REG(6, 1), KEY4(cm), CALL(LOOKUP), JEQ(0, 0, 7), MOV_REG(7, 0), MOV_REG(1, 6),

@@ -18,13 +18,15 @@
    (inet_select_addr's first of link scope), or 127.0.0.1, and comes back
    in on lo: a datagram to what takes it there, a connection's SYN with
    no answer, none from an address not the namespace's own, and one from
-   10.0.0.1 in on va. From one bound to no device, an IPv4 route through
-   lo does the same, and a rejecting route of either family fails a
-   datagram, a UDP connect and a TCP connect with its error: unreachable
-   EHOSTUNREACH, prohibit EACCES, blackhole EINVAL, throw ENETUNREACH. A
-   device down is ENETUNREACH, one gone ENODEV. With lo down, a route
-   through it of host scope stays and still sends through it; one of link
-   scope has gone. */
+   10.0.0.1 in on va. A broadcast through lo, to the limited broadcast
+   address or 127.255.255.255, comes back in on lo once, and needs
+   SO_BROADCAST (EACCES); TCP takes none (ENETUNREACH). From one bound to
+   no device, an IPv4 route through lo sends as from one bound to lo, and
+   a rejecting route of either family fails a datagram, a UDP connect and
+   a TCP connect with its error: unreachable EHOSTUNREACH, prohibit
+   EACCES, blackhole EINVAL, throw ENETUNREACH. A device down is
+   ENETUNREACH, one gone ENODEV. With lo down, a route through it of host
+   scope stays and still sends through it; one of link scope has gone. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -461,6 +463,60 @@ static void connect_lo(const char *from, const char *ip, int port, const char *l
     close(fd);
 }
 
+/* Says which of `fds` (named by `names`) has a datagram waiting, and from
+   which address, taking it, after a short wait. */
+static void which_from(const int *fds, const char *const *names, int n, const char *label) {
+    char got[256] = "";
+    struct timespec pause = {0, 100 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    for (int i = 0; i < n; i++) {
+        char buf[16];
+        struct sockaddr_in from = {0};
+        socklen_t len = sizeof from;
+        if (recvfrom(fds[i], buf, sizeof buf, MSG_DONTWAIT, (void *)&from, &len) > 0) {
+            char ip[INET_ADDRSTRLEN] = "?";
+            inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
+            strcat(got, " ");
+            strcat(got, names[i]);
+            strcat(got, " from ");
+            strcat(got, ip);
+        }
+    }
+    printf("%s: taken by%s\n", label, got[0] ? got : " none");
+}
+/* Broadcasts to `ip`:7000 from a socket bound to the device `dev` (none
+   for NULL) and the address `from` (none for NULL): without SO_BROADCAST,
+   with it, and then connected, with the name that gives; and which of
+   `fds` takes each. Then a TCP connection from such a socket. */
+static void broadcast(const char *dev, const char *from, const char *ip, const int *fds,
+                      const char *const *names, int n) {
+    char label[80];
+    snprintf(label, sizeof label, "broadcast from %s at %s to %s", dev ? dev : "none",
+             from ? from : "none", ip);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (dev) setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE_, dev, (socklen_t)strlen(dev));
+    struct sockaddr_in at = at4(from ? from : "0.0.0.0", 0);
+    if (from) printf("%s: bind=%ld\n", label, result(bind(fd, (void *)&at, sizeof at)));
+    struct sockaddr_in to = at4(ip, 7000);
+    printf("%s, without SO_BROADCAST: sendto=%ld\n", label, result(sendto(fd, "x", 1, 0, (void *)&to, sizeof to)));
+    printf("%s, without SO_BROADCAST: connect=%ld\n", label, result(connect(fd, (void *)&to, sizeof to)));
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+    printf("%s: sendto=%ld\n", label, result(sendto(fd, "x", 1, 0, (void *)&to, sizeof to)));
+    which_from(fds, names, n, label);
+    printf("%s: connect=%ld\n", label, result(connect(fd, (void *)&to, sizeof to)));
+    name4(fd, label);
+    printf("%s: send=%ld\n", label, result(send(fd, "x", 1, 0)));
+    which_from(fds, names, n, label);
+    close(fd);
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    if (dev) setsockopt(t, SOL_SOCKET, SO_BINDTODEVICE_, dev, (socklen_t)strlen(dev));
+    if (from) bind(t, (void *)&at, sizeof at);
+    to.sin_port = htons(8000);
+    printf("%s: TCP connect=%ld\n", label, result(connect(t, (void *)&to, sizeof to)));
+    close(t);
+}
+
 /* Drops CAP_NET_RAW from the effective set. */
 static void drop_net_raw(void) {
     struct {
@@ -643,6 +699,17 @@ int main(int argc, char **argv) {
     int took = (int)result(accept(any_l, NULL, NULL));
     printf("accept on none=%d\n", took >= 0 ? 0 : took);
     if (took >= 0) show(took, 16, "accepted"), name4(took, "accepted"), close(took);
+    /* A broadcast through lo, to the limited broadcast address (from va's
+       address, of link scope, or from 127.0.0.1, lo's own, with no route)
+       or by the local table's broadcast route to 127.255.255.255 (from
+       127.0.0.1), comes back in on lo once, to what takes it there. With
+       no route to the limited broadcast address, one from no address is
+       ENETUNREACH. */
+    broadcast("lo", NULL, "255.255.255.255", four, four_names, 4);
+    broadcast("lo", NULL, "127.255.255.255", four, four_names, 4);
+    broadcast(NULL, NULL, "127.255.255.255", four, four_names, 4);
+    broadcast(NULL, NULL, "255.255.255.255", four, four_names, 4);
+    broadcast(NULL, "127.0.0.1", "255.255.255.255", four, four_names, 4);
     close(on_lo), close(lo_local), close(lo6), close(lo_l), close(any_l);
 
     /* From sockets bound to no device, by IPv4's route through lo, which

@@ -105,8 +105,8 @@ pub(crate) fn ioctl_flags(device: &Device) -> u16 {
 /// the peer's index (`IFLA_LINK`, 0 once it has gone), and the queueing
 /// discipline it has since it opened, `noqueue`, or `noop` for one
 /// `going`. It has one queue each way, where Linux's has one for each
-/// possible CPU, and no `IFLA_AF_SPEC`; its statistics are zero, and left
-/// out with `RTEXT_FILTER_SKIP_STATS` in `mask`.
+/// possible CPU, and no `IFLA_AF_SPEC`; its statistics are left out with
+/// `RTEXT_FILTER_SKIP_STATS` in `mask`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn link_message(
     network: &Arc<Network>,
@@ -208,8 +208,9 @@ pub(super) fn link_message(
     attribute(&mut body, IFLA_ADDRESS, &v.mac);
     attribute(&mut body, super::IFLA_BROADCAST, &[0xff; 6]);
     if stats {
-        attribute(&mut body, super::IFLA_STATS64, &[0; super::STATS64_LEN]);
-        attribute(&mut body, super::IFLA_STATS, &[0; super::STATS_LEN]);
+        let (wide, narrow) = device.stats_attributes();
+        attribute(&mut body, super::IFLA_STATS64, &wide);
+        attribute(&mut body, super::IFLA_STATS, &narrow);
     }
     let mut xdp = Vec::new();
     attribute(&mut xdp, super::IFLA_XDP_ATTACHED, &[0]);
@@ -645,7 +646,7 @@ fn switch(
             }
         });
         // `ip_mc_up`, of `NETDEV_UP`.
-        network.change_group4(index, crate::multicast::ALL_HOSTS, true, now);
+        network.up4(index, true, now);
         if peer_up && let Some((n, i)) = &peer {
             change(n, *i, |v| carrier(v, true));
             let list = super::device_changed4(n, *i, true, true);
@@ -684,7 +685,7 @@ fn switch(
             carrier(v, false);
         });
         // `ip_mc_down`, of `NETDEV_DOWN`.
-        network.change_group4(index, crate::multicast::ALL_HOSTS, false, now);
+        network.up4(index, false, now);
         // `__dev_notify_flags` tells of the change before `NETDEV_DOWN`
         // flushes the end's neighbours; the peer's go as the link watch
         // finds its carrier gone, before it tells of that
@@ -778,8 +779,7 @@ fn unregister(
 /// What `device`, out of its namespace, tells as it leaves the all-hosts
 /// group once (`ip_mc_down`): the group, if it leaves it for good.
 fn left_all_hosts(device: &mut Device) -> Vec<Notice> {
-    let index = device.index;
-    let told = crate::multicast::leave_all_hosts(&mut device.groups4, index);
+    let told = crate::multicast::leave_all_hosts(device);
     super::told(
         told.into_iter()
             .map(crate::interface::Event::Group4)
@@ -979,6 +979,8 @@ pub(super) fn move_to(
         // namespace's `in_device` and `inet6_dev`.
         device.groups4 = crate::multicast::Groups::default();
         device.groups6 = crate::multicast::Groups::default();
+        // And `dev_mc_flush`.
+        device.links.flush();
         device.conf4 = devices.default4;
         device.conf6 = devices.default6;
         let settings = crate::netconf::registered(&device);

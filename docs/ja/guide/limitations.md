@@ -116,10 +116,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
-- **`/proc/net` の一部**：あるのは `anycast6`、`arp`、`dev`、`if_inet6`、`igmp`、`igmp6`、`ipv6_route`、
-  `mcfilter`、`mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。
-  `dev_mcast`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、`dev` のものは
-  0 です。ネットワークのないセッションのファイルには、
+- **デバイスのカウンタの一部**：`/proc/net/dev` とリンクの `IFLA_STATS64`、`IFLA_STATS` が
+  数えるのは、UDP のデータグラム、ICMP の port unreachable、ARP だけです（[機能](./features) を参照）。
+  TCP のセグメントはまだ数えません。カーネルが自分から送る IPv6 のパケット（近隣探索、MLD の
+  レポート、ルーター要請、重複アドレス検出）、エントリが古くなった近隣への ARP の探り、ホストへ
+  行くもの（ゲストのソケットが持たないポートへの TCP の接続、DNS スタブの答え）、ループバックを
+  通るブロードキャストやグループへのもの、ループバックから出す MCTP の送信も数えません。
+  エラー、破棄、マルチキャストは数えません。ピアが下がっている veth の端から出るときに Linux が
+  捨てるパケット（`tx_dropped`）は、ここではそもそも送りません。
+- **`/proc/net` の一部**：あるのは `anycast6`、`arp`、`dev`、`dev_mcast`、`if_inet6`、`igmp`、`igmp6`、
+  `ipv6_route`、`mcfilter`、`mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。
+  `snmp`、`sockstat` などは `ENOENT` です。`SIOCADDMULTI` と `SIOCDELMULTI` には対応していないので、`dev_mcast` にあるのは
+  デバイスのグループが対応づくアドレスだけで、グローバルなものはありません。Linux master にある、
+  そのアドレスの `RTM_GETMULTICAST` のダンプ（`AF_PACKET`）にも対応していません。ネットワークのないセッションのファイルには、
   デバイスもインターネットのソケットもありません。ソケットのカーネル内のアドレスは 0、参照の数は
   種類ごとに同じ値、まだ届いていないデータグラムとメッセージが占めるメモリは 0 で、TCP の接続の
   `pingpong` を含む `quick` も 0 です。確認応答を待つ間のタイマーは示しません。`netlink` には、ポートが 0 である
@@ -129,7 +138,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ID を返さないので、`initial apicid` はどの CPU でも 0 です。`bugs` は、Linux 7.0 がファミリー
   15 の AMD の CPU に想定するものを並べますが、仮想 CPU は投機実行をしません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
-  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/version`、`/proc/cmdline`、
+  ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/interrupts`、`/proc/partitions`、`/proc/kallsyms`、
   `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるものと `vm/drop_caches`、
   `vm/unprivileged_userfaultfd` 以外など）と、
   読むプロセス自身のディレクトリのほかの名前
@@ -175,13 +184,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   登るパスでは、そのバインドマウントで見える生成されるファイルの中の `..` を、書かれた名前から
   取ります。Linux は、`/proc` のリンク（`/proc/self/cwd` など）のあとの `..` をリンク先から
   取ります。Linux master で新しく入った `fchroot` はありません（`ENOSYS`）。
-- **`/dev` と `/proc` の名前**：`/dev` に名前を作る呼び出しはありません（`mkdir`、
-  `mknod`、`symlink`、`O_CREAT` 付きの `open`、そこへの `rename` は `ENOENT` です）。
-  Linux の devtmpfs は受け付けます。生成される名前を消す、名前を変える呼び出しも
-  `ENOENT` です。Linux は、`/proc` のファイルの `unlink` に `EPERM`、そこのリンクの
-  `rmdir` に `ENOTDIR`、`/dev/pts` の `rmdir` に `EBUSY`、`/proc` から外への `rename` に
-  `EXDEV` を返します。`/proc` の新しい名前への `link` は `EXDEV` です。Linux は先に
-  名前を探して見つけられません（`ENOENT`）。
+- **`/dev` の名前**：root では、`/dev` に名前を作る呼び出し（`mkdir`、`mknod`、`symlink`、
+  `O_CREAT` 付きの `open`）は `ENOENT`、そこの名前の `unlink`、`rmdir`、`rename` は `EPERM`
+  です。Linux の devtmpfs は名前を作り、消し、変えます。ほかのユーザーには Linux と同じく
+  `EACCES` です。
 - **`/dev/tty` の `O_PATH`**：ほかの `open` と同じように制御端末を開くので、制御端末が
   なければ失敗します（`ENOENT`）。Linux の `O_PATH` は、デバイスを開かずに名前を開きます。
 - **生成されるファイルの変更（一部）**：`/dev` とそのデバイスやリンク、`/proc`、`/proc` の
@@ -211,7 +217,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ソケットは、すべてのアドレスでポートを持ったままで、Linux は経路の送り元のアドレスで取ります。そのため `getsockname` は
     未指定のアドレスを返し、そのポートをループバックのアドレスで `bind` すると
     `EADDRINUSE` になります（Linux では `bind` できます）。
-    ブロードキャストのデータグラムは、veth の端を通るもの（後述）のほかは届きません。
+    ブロードキャストのデータグラムは、veth の端か `lo` を通るもの（後述）のほかは届きません。
     データグラムには
     いつも届いた時刻を付けます。Linux がそうするのは、マシンのどこかのソケットが
     タイムスタンプを取っている間だけで、どれも取っていなければ、`SO_TIMESTAMP` などで
@@ -434,12 +440,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   検証器が知る値か、何もわからないかのどちらかで、Linux のように範囲を持ちません。そのため、
   Linux なら一方へだけ進むとわかるジャンプの両方をたどります。状態の刈り込みもしないので、
   分岐の多いプログラムは早く上限に届くことがあります。検索の結果は、64 ビットの `BPF_JEQ` か
-  `BPF_JNE` で即値 0 と比べるか、配列のキーをスタックが持つ形であるか
-  （[システムコール](./features#system-calls)）でなければ、null かもしれないものとして扱います。
-  Linux は二つのポインタの比較からもわかります。スタックを読んだ値は、Linux がわかるところでは
-  わかります（書いた 0、スピルしたスカラーをその先頭から読んだもの、アトミック命令の元の値）。
-  ただし、0 と 0 のスピルにまたがる読み取りは別です。master は 0 とわかりますが、Linux 7.0 には
-  わからないので、ここでもわからない値です。master とテストのマシンの Linux 7.0 の
+  `BPF_JNE` で即値 0 と比べるか、値やマップへのポインタと等しいか、配列のキーをスタックが持つ形で
+  あるか（[システムコール](./features#system-calls)）でなければ、null かもしれないものとして
+  扱います。Linux 7.0 はスタックやコンテキストへのポインタと等しいことからも、master は 0 と
+  わかっているレジスタと等しいことからもわかります。二つの判断が違うところでは断るので、ここでは
+  どちらからもわかりません。スタックを読んだ値は、Linux がわかるところではわかります（書いた 0、
+  スピルしたスカラーをその先頭から読んだもの、アトミック命令の元の値）。ただし、0 と 0 のスピルに
+  またがる読み取りは別です。master は 0 とわかりますが、Linux 7.0 にはわからないので、ここでも
+  わからない値です。master とテストのマシンの Linux 7.0 の
   判断が違うところでは断ります。master は JIT ができればより大きなスタックを受け入れ、
   どの演算子をかけたポインタも数にし、巻き戻しのための exit を受け入れます。命令のフィールドの検査（"uses reserved fields" のエラー）は、master の順に、どの経路を辿るよりも前にします。Linux 7.0 は経路がその命令に届いたときに確かめるので、いくつも誤りのあるプログラムでは、別のエラーを先に出すことがあります。規則は特権のある読み込み手のものだけです（ポインタを
   漏らしてよく、書く前のスタックを読んでよく、Spectre への対策をしません）。そのため
@@ -525,8 +533,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IORING_OP_TIMEOUT`、`_TIMEOUT_REMOVE`、`_LINK_TIMEOUT`、`IORING_OP_POLL_ADD`、`_POLL_REMOVE`、ファイルの要求 `IORING_OP_OPENAT`、`_OPENAT2`、`_CLOSE`、
   `_STATX`、`_FALLOCATE`、`_FADVISE`、`_MADVISE`、`_RENAMEAT`、`_UNLINKAT`、`_MKDIRAT`、`_SYMLINKAT`、
   `_LINKAT`、`_FTRUNCATE`、`IORING_OP_SPLICE`、`_TEE`、それにソケットの要求 `IORING_OP_SHUTDOWN`、`_SOCKET`、`_ACCEPT`、`_CONNECT`、`_SEND`、`_RECV`、`_SENDMSG`、`_RECVMSG`
-  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、マルチショットの
-  `IORING_OP_RECVMSG`、バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
+  だけです。ほかの操作は、Linux 7.0 の `IORING_OP_URING_CMD128` まで `EOPNOTSUPP` で完了します。ソケットの要求のうち、
+  バンドル（`IORING_RECVSEND_BUNDLE`）、ベクターの送信（`IORING_SEND_VECTORIZED`）、
   バッファーを選ぶ送信、`MSG_WAITALL` でバッファーを選ぶ受信はまだありません（`EINVAL`）。
   ソケットにまだあり続けるマルチショットの受信は、何度続いてもすぐに続けます。Linux は 32 回
   （`MULTISHOT_MAX_RETRY`）続くとキューに戻し、ほかのタスクワークを先に動かします。
@@ -968,10 +976,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   落とすより先にすべての範囲を知らせます。Linux は VMA ごとに知らせて落とします。
   1 つの `userfaultfd` の登録したマッピングが接していれば、Linux の VMA が
   つながったときと同じく、`UFFD_EVENT_REMOVE` の 1 つの範囲になります。
-  `MADV_REMOVE` は、最初のマッピングが確かめを通れば範囲全体を一度知らせます。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
-  ページの保護を外します。Linux はその印を PTE に残します。shmem の uffd-wp
-  マーカーの上の `MADV_GUARD_INSTALL` は、マーカーをガードに置き換えます。Linux は
-  エントリーを外すとき（zap）にマーカーを残すので、シグナルが来るまで呼び出しをやり直します。shmem のファイルで登録
+  `MADV_REMOVE` は、最初のマッピングが確かめを通れば範囲全体を一度知らせます。shmem のファイルで登録
   するのは memfd と tmpfs マウント（ゲストがマウントしたものか `/dev/shm`）のファイル
   です（`UFFD_FEATURE_WP_ASYNC` で書き込み保護だけなら、どのファイルも登録します）。
   起動したときからあるメモリ上のファイルシステムのファイル（`/tmp` を含みます）は、
@@ -1038,14 +1043,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   引き直すとほかのホップに移ります（`ip6_ecmp_set_mp_hash`、`sk_rethink_txhash`）。
   ここでは接続の道筋は開くときに決まるので、答えの返らないホップの接続は失敗します。
   ICMPv6 のエラーは自分のフローのホップを取りますが、Linux のものは知らせるパケットの
-  ホップを取ります（`icmp6_send`）。まだ自分のポートのない IPv4 の接続は、どの引き当てでも
-  同じ乱数の送り元ポートをハッシュしますが、Linux は引き当てごとに新しく引きます
-  （`ip_route_connect` と `ip_route_newports` の `FLOWI_FLAG_ANY_SPORT`）。
+  ホップを取ります（`icmp6_send`）。まだ自分のポートのない接続は、Linux と同じく乱数の
+  送り元ポートをハッシュします（`FLOWI_FLAG_ANY_SPORT`）。ここではどの引き当てでも同じ
+  ものを使いますが、Linux の IPv4 は引き当てごとに新しく引きます（`ip_route_connect`、
+  `ip_route_newports`）。IPv6 は経路を一度だけ引きます（`tcp_v6_connect`）。
   経路のない UDP の connect は、Linux master が "ipv6: fix device binding after failed
   datagram connect" からするように、ソケットのデバイスを元に戻します。その修正のない
   CI のカーネルでは、スコープ ID が与えたデバイスが残ります。
-  `lo` に結び付いた IPv4 のソケットが limited broadcast のアドレスか `127.255.255.255` へ
-  送ると `ENETUNREACH` です。Linux は `lo` から送ります。近隣探索は、求められない広告も
+  近隣探索は、求められない広告も
   リダイレクトも送りません。遅延中の近隣が送る問い合わせは相手に何も教えません。
   Linux では端のリンクローカルのアドレスから送り、相手にそのアドレスの近隣を作ります。
   重複アドレス検出は重複を見つけず、始まって
@@ -1085,7 +1090,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取るのは `IFF_UP` と名前空間だけです。アドレスを指さなかった veth の端のアドレスは、
   カーネルの乱数ではなく emulator 自身の列から取ります。リンクの監視はすぐに働きます。
   Linux では 1 秒遅れることがあります。そのため動作状態は、伝えるときに決まります。送受信のキューはそれぞれ 1 つで、Linux では
-  ありうる CPU ごとに 1 つです。`IFLA_AF_SPEC` はなく、統計は 0 です。インターフェースの
+  ありうる CPU ごとに 1 つです。`IFLA_AF_SPEC` はありません。インターフェースの
   リクエストと netlink は `IFF_UP` のほかのフラグを変えません。最初の名前空間でも `lo` しか見えません。
   Linux ではホストのインターフェースが見えます。
   netlink には `NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC` しかありません
@@ -1196,7 +1201,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   インスタンス、PSP のデバイス、ovpn のピア、openvswitch の vport にもひとりでに ID を
   与えますが、ここにはそのどれもありません。なくなる名前空間の
   `RTM_DELNSID` は、最後に持っていたものが手放したときに送ります。Linux は
-  ワークキューから少し遅れて送ります。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
+  ワークキューから少し遅れて送ります。リンクのメッセージの `IFLA_AF_SPEC` は、
   `CONFIG_MCTP` を組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。
   組み込んでいないカーネルは載せず、`AF_MCTP` のアドレスと経路のダンプを扱う処理も
   ないので、それらのダンプには IPv4 と IPv6 のアドレスと経路を返し、MCTP のアドレスも

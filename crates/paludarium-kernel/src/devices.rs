@@ -46,7 +46,7 @@ const MISC_MAJOR: u64 = 10;
 /// `/dev/userfaultfd`'s minor number: Linux gives it one at boot
 /// (`MISC_DYNAMIC_MINOR`), which differs from kernel to kernel, so nothing
 /// should depend on this one.
-const USERFAULTFD_MINOR: u64 = 122;
+pub(crate) const USERFAULTFD_MINOR: u64 = 122;
 /// The names in `/dev`, sorted as it lists them. Each has the inode number
 /// two more than its place here, and `/dev` itself has 1, so that `stat` and
 /// `getdents` agree.

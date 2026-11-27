@@ -1,6 +1,7 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
 pub(crate) mod attributes;
+mod generated_names;
 pub(crate) mod splice;
 mod tasks;
 mod xattrs;
@@ -2650,7 +2651,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             descriptor_followed(c.files, c.files.descriptor(old_dir)?)?
         }
     } else {
-        let (old, _) = lookup_linked(c, old_dir, old_raw, follow)?;
+        let (old, _) = lookup_linked(c, old_dir, old_raw.clone(), follow)?;
         match followed(c, &old, follow)? {
             Some(target) => target,
             // A dangling symbolic link leads nowhere (ENOENT).
@@ -2666,6 +2667,11 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     };
     let new_raw = path(c, new_ptr)?;
     let new = c.files.named_parent_linked(new_dir, new_raw.clone())?;
+    if let Followed::Path { path, .. } = &target
+        && let Some(found) = generated_names::link_from(c, &old_raw, path, follow)
+    {
+        found?;
+    }
     let old = match target {
         Followed::Path { path, follow: true } => resolved(c.files, &path).unwrap_or(path),
         Followed::Path { path, .. } => path,
@@ -2682,6 +2688,9 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             return Err(EXDEV);
         }
     };
+    if let Some(error) = generated_names::link_to(c, &old, &new_raw, &new) {
+        return Err(error);
+    }
     // A file of `/proc` or `/dev` (a link in `/proc/self/fd` not followed)
     // is on procfs or devtmpfs, which the new name is not.
     if generated(&old) {
@@ -3530,10 +3539,7 @@ fn send(
     if output.flags() & 3 == 0 {
         return Err(Errno::EBADF);
     }
-    let pipe = output
-        .as_any()
-        .and_then(|any| any.downcast_ref::<crate::sockets::PipeEnd>())
-        .map(crate::sockets::PipeEnd::size);
+    let pipe = crate::sockets::pipe(&output);
     // do_splice_direct refuses O_APPEND; a pipe output does not use it.
     if pipe.is_none() && output.flags() & 0o2000 != 0 {
         return Err(Errno::EINVAL);
@@ -3549,7 +3555,9 @@ fn send(
     if count == 0 {
         return Ok(0);
     }
-    let sent = if output.stat()?.mode & 0o170000 == REGULAR {
+    let sent = if let Some(to) = pipe {
+        splice::file_to_pipe(c, &input, from, &output, to, count)?
+    } else if output.stat()?.mode & 0o170000 == REGULAR {
         let to = output.seek(0, 1)?;
         let count = count.min(size_room(c, to)?);
         let sent = copy_bytes(&input, from, &output, to, count)?;
@@ -3559,9 +3567,7 @@ fn send(
         output.seek((to + sent) as i64, 0)?;
         sent
     } else {
-        // A pipe takes at most what it holds, as splice_file_to_pipe does;
-        // other files take 1 MiB pieces until a short write.
-        let count = pipe.map_or(count, |size| count.min(size));
+        // Other files take 1 MiB pieces until a short write.
         let mut piece = buffer(usize::try_from(count).unwrap_or(usize::MAX).min(1 << 20))?;
         let mut sent = 0;
         while sent < count {
@@ -6150,6 +6156,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 let walks = ((old_dir, &old_raw[..]), (new_dir, &new_raw[..]));
                 return rename_queue(c, (&old, &new), walks, names, flags);
             }
+            if let Some(renamed) =
+                generated_names::rename(c, (&old_raw, &old), (&new_raw, &new), flags)
+            {
+                return renamed;
+            }
             crate::bpf_fs::lookup(c, &old)?;
             crate::bpf_fs::lookup(c, &new)?;
             crate::permissions::rename(
@@ -6232,8 +6243,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, crate::landlock::MAKE_DIR)
                 });
             }
-            // A generated directory, `/proc` and `/dev` too, is there,
-            // with a trailing slash or through a link as by its name.
+            if let Some(error) = generated_names::make(c, &raw, &p, true, crate::landlock::MAKE_DIR)
+            {
+                return Err(error);
+            }
+            // `/proc` and `/dev` are there, with a trailing slash or
+            // through a link as by their names.
             let end = p.iter().rposition(|&b| b != b'/').map_or(1, |i| i + 1);
             let named = &p[..end];
             if (generated(named) || named == b"/proc" || named == b"/dev")
@@ -6286,6 +6301,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, request)
                 });
             }
+            if let Some(error) = generated_names::remove(c, &raw, &p, dir) {
+                return Err(error);
+            }
             crate::permissions::delete(c.files, &c.process.credentials, at_dir, &raw)?;
             crate::permissions::removable_name(c.files, at_dir, &raw, dir)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_some()) {
@@ -6315,6 +6333,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return crate::mqueue::make_mounted(c, &name, None, || {
                     landlock_name(c, &p, crate::landlock::MAKE_SYM)
                 });
+            }
+            if let Some(error) =
+                generated_names::make(c, &raw, &p, false, crate::landlock::MAKE_SYM)
+            {
+                return Err(error);
             }
             crate::bpf_fs::lookup(c, &p)?;
             let created =
@@ -6703,14 +6726,15 @@ fn write_total(
             Err(e) => {
                 if done != 0 {
                     // A pipe whose last reader left during the write raises
-                    // SIGPIPE with the part written, as Linux's `pipe_write`
-                    // does (the host's streams are pipes to the guest); a
-                    // stream socket raises it only when nothing went
+                    // SIGPIPE with the part written, unless RWF_NOSIGNAL
+                    // spares it, as Linux's `pipe_write` does (the host's
+                    // streams are pipes to the guest); a stream socket
+                    // raises it only when nothing went
                     // (`unix_stream_sendmsg`, `tcp_sendmsg_locked`).
                     let pipe = file.as_any().is_some_and(|a| {
                         a.is::<crate::sockets::PipeEnd>() || a.is::<StandardFile>()
                     });
-                    if e == Errno(32) && pipe {
+                    if e == Errno(32) && pipe && !nosignal {
                         crate::signals::queue(
                             c.process,
                             crate::signals::PendingSignal::user(13, 0),
@@ -7575,8 +7599,10 @@ pub(crate) fn open_with(
     let fd = reserve
         .then(|| c.files.reserve(c.group.nofile()))
         .transpose()?;
+    let made = generated_names::open_create(c, &raw, &p, flags);
     let credentials = &c.process.credentials;
     let opened = match crate::bpf_fs::lookup(c, &p)
+        .and_then(|()| made.map_or(Ok(()), Err))
         .and_then(|()| crate::permissions::open(c.files, credentials, dir, &raw, flags))
     {
         Ok(created) => landlock_before_open(c, &p, flags).and_then(|landlock| {
@@ -8338,6 +8364,9 @@ fn open_path(
             crate::proc::directory_stat(),
         ))
     } else if let Some(entry) = crate::proc::system_entry(p) {
+        // Its 0444 mode checked as any file's (`may_open`): a write takes
+        // what only root's `CAP_DAC_OVERRIDE` overrides.
+        own_open_check(c, p, flags)?;
         system_file(c, entry, flags)
     } else if let Some(entry) = own_entry(c, p) {
         own_open_check(c, p, flags)?;
@@ -9243,7 +9272,7 @@ fn link_queue(
             }
         }
         None => {
-            let (old, _) = lookup_linked(c, old_dir, old_raw, follow)?;
+            let (old, _) = lookup_linked(c, old_dir, old_raw.clone(), follow)?;
             if generated_stat(c, &old, follow)?.is_none() {
                 c.files.fs().metadata(&old, follow)?;
             }
@@ -9686,8 +9715,8 @@ fn other_generated_stat(
             SMALL_BLOCK_SIZE,
         ));
     }
-    if crate::proc::system_entry(path).is_some() {
-        return Some((crate::proc::entry_stat(), device(c, path), SMALL_BLOCK_SIZE));
+    if let Some(entry) = crate::proc::system_entry(path) {
+        return Some((entry.stat(), device(c, path), SMALL_BLOCK_SIZE));
     }
     if tasks::is_root(path) {
         return Some((
@@ -9943,6 +9972,19 @@ fn system_file(
                 times: c.processes.cpu_times(),
             })
         }
+        crate::proc::SystemEntry::Cgroups => crate::proc::CGROUPS.to_vec(),
+        crate::proc::SystemEntry::Cmdline => {
+            let content = crate::proc::CMDLINE.to_vec();
+            return Arc::new(
+                crate::proc::GeneratedFile::open_entry(content, flags)
+                    .with_entry_size(entry.stat().size),
+            );
+        }
+        crate::proc::SystemEntry::Devices => crate::proc::render_devices(),
+        crate::proc::SystemEntry::Filesystems => crate::proc::render_filesystems(),
+        crate::proc::SystemEntry::Misc => crate::proc::render_misc(),
+        crate::proc::SystemEntry::Swaps => crate::proc::SWAPS.to_vec(),
+        crate::proc::SystemEntry::Version => crate::proc::render_version(),
         crate::proc::SystemEntry::Uptime => crate::proc::render_uptime(
             c.host
                 .clock(paludarium_host::ClockId::Monotonic)
@@ -9984,6 +10026,10 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
                 landlock_name(c, &p, crate::landlock::make_access(kind, dev))
             })
             .map(|_| ());
+        }
+        let access = crate::landlock::make_access(kind, u64::from(dev));
+        if let Some(error) = generated_names::make(c, raw, &p, false, access) {
+            return Err(error);
         }
     }
     match kind {

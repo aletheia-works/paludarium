@@ -9,6 +9,7 @@ use core::net::Ipv6Addr;
 use paludarium_types::Errno;
 
 use crate::inet::Network;
+use crate::interface::Event;
 use crate::netdev::LOOPBACK_INDEX;
 
 const EADDRNOTAVAIL: Errno = Errno(99);
@@ -28,14 +29,15 @@ impl Network {
     /// no loopback; `ENODEV` for no device, or a named one without IPv6
     /// (`EADDRNOTAVAIL` for one not named); and, on a device that does not
     /// forward, `EADDRNOTAVAIL` for an address of no prefix of its
-    /// addresses'. The device joins it ([`Self::tell_anycast`]).
+    /// addresses'. The device joins it: what that makes, for
+    /// [`Self::tell_anycast`] to tell of once the socket is let go.
     pub(crate) fn join_anycast6(
         &self,
         members: &mut Vec<Member>,
         (index, address): Member,
         (admin, all_forward): (bool, bool),
         now: u64,
-    ) -> Result<(), Errno> {
+    ) -> Result<Vec<Event>, Errno> {
         if !admin {
             return Err(Errno::EPERM);
         }
@@ -88,29 +90,27 @@ impl Network {
             addresses.anycast_inc(device, address, now)
         };
         members.insert(0, (device, address));
-        self.tell_anycast(events, now);
-        Ok(())
+        Ok(events)
     }
     /// The socket of `members` leaves `address` on the device `index`, or
     /// on any for 0, at `now` (`ipv6_sock_ac_drop`): the newest it joined
-    /// so, `ENOENT` for none; its device, if it is there still, leaves it.
+    /// so, `ENOENT` for none; its device, if it is there still, leaves it,
+    /// what that makes given back as [`Self::join_anycast6`] does.
     pub(crate) fn leave_anycast6(
         &self,
         members: &mut Vec<Member>,
         (index, address): Member,
         now: u64,
-    ) -> Result<(), Errno> {
+    ) -> Result<Vec<Event>, Errno> {
         let at = members
             .iter()
             .position(|&(i, a)| (index == 0 || i == index) && a == address)
             .ok_or(Errno::ENOENT)?;
         let (device, address) = members.remove(at);
-        let events = self
+        Ok(self
             .addresses_at(Some(now))
             .anycast_dec(device, address, now)
-            .unwrap_or_default();
-        self.tell_anycast(events, now);
-        Ok(())
+            .unwrap_or_default())
     }
     /// What a closed socket joined goes at `now` (`__ipv6_sock_ac_close`),
     /// the newest first.
@@ -133,7 +133,7 @@ impl Network {
     }
     /// Tells of what a device's anycast addresses' changes made: their
     /// routes and themselves, then their solicited-node groups.
-    fn tell_anycast(&self, events: Vec<crate::interface::Event>, now: u64) {
+    pub(crate) fn tell_anycast(&self, events: Vec<Event>, now: u64) {
         crate::netlink::tell_events(self, events, now);
         crate::netlink::tell_groups(self);
     }
@@ -194,7 +194,9 @@ mod tests {
         let mut members = Vec::new();
         let ip = |s: &str| s.parse::<Ipv6Addr>().unwrap();
         let join = |members: &mut Vec<Member>, index, a: &str| {
-            network.join_anycast6(members, (index, ip(a)), (true, false), 1)
+            network
+                .join_anycast6(members, (index, ip(a)), (true, false), 1)
+                .map(drop)
         };
         assert_eq!(join(&mut members, 1000, "ff02::1"), Err(Errno::EINVAL));
         assert_eq!(join(&mut members, 1000, "2001:db8::1"), Err(Errno::EINVAL));
@@ -204,18 +206,24 @@ mod tests {
             Err(EADDRNOTAVAIL)
         );
         assert_eq!(
-            network.join_anycast6(&mut members, (1000, ip("2001:db8::9")), (false, false), 1),
+            network
+                .join_anycast6(&mut members, (1000, ip("2001:db8::9")), (false, false), 1)
+                .map(drop),
             Err(Errno::EPERM)
         );
         assert_eq!(join(&mut members, 1000, "2001:db8::9"), Ok(()));
         assert_eq!(join(&mut members, 0, "2001:db8::9"), Ok(()));
         assert_eq!(listed(&network), [(1000, "2001:db8::9".into(), 2)]);
         assert_eq!(
-            network.leave_anycast6(&mut members, (1000, ip("2001:db8::8")), 2),
+            network
+                .leave_anycast6(&mut members, (1000, ip("2001:db8::8")), 2)
+                .map(drop),
             Err(Errno::ENOENT)
         );
         assert_eq!(
-            network.leave_anycast6(&mut members, (0, ip("2001:db8::9")), 2),
+            network
+                .leave_anycast6(&mut members, (0, ip("2001:db8::9")), 2)
+                .map(drop),
             Ok(())
         );
         assert_eq!(listed(&network), [(1000, "2001:db8::9".into(), 1)]);
@@ -236,7 +244,9 @@ mod tests {
         let mut members = Vec::new();
         let any: Ipv6Addr = "2001:db8:9::1".parse().unwrap();
         assert_eq!(
-            network.join_anycast6(&mut members, (1000, any), (true, false), 2),
+            network
+                .join_anycast6(&mut members, (1000, any), (true, false), 2)
+                .map(drop),
             Ok(())
         );
         let _ = network.addresses().forward6(1000, false, 3);

@@ -7744,6 +7744,93 @@ mod io_uring {
         assert_eq!(reap_flags(&mut f, &r), [(1, 0, 0)]);
     }
 
+    #[test]
+    fn a_multishot_receive_of_messages_heads_each_buffer() {
+        const MORE: u32 = 2;
+        let mut f = fixture();
+        let r = ring(&mut f);
+        assert_eq!(f.ret(53, &[1, 2, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        let into = DATA + 0x600;
+        msghdr(&f, into, &[], 0);
+        let mut receive = message(10, 1, b, into, 0);
+        receive[1] = 1 << 5;
+        receive[2] = 2;
+        receive[40] = 3;
+        let head =
+            |f: &Fixture, at: u64| -> Vec<u32> { (0..4).map(|i| u32_at(f, at + 4 * i)).collect() };
+        // Each message has its lengths and flags first, then its bytes; one
+        // longer than its buffer is cut (`MSG_TRUNC`).
+        assert_eq!(one(&mut f, &r, &provide(2, DATA + 0x1000, 24, 3, 0)), 0);
+        f.mem
+            .write(GuestAddr(DATA + 0x200), b"hello world")
+            .unwrap();
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 5]), 5);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 21, MORE | 1)]);
+        assert_eq!(head(&f, DATA + 0x1000), [0, 0, 5, 0]);
+        assert_eq!(bytes(&f, DATA + 0x1010, 5), b"hello");
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 11]), 11);
+        // A datagram socket does not tell what is left, so it goes on at
+        // once, and with no buffer, ends.
+        assert_eq!(
+            reap_flags(&mut f, &r),
+            [(1, 24, MORE | 1 | 1 << 16), (1, -105, 0)]
+        );
+        assert_eq!(head(&f, DATA + 0x1018), [0, 0, 8, 0x20]);
+        assert_eq!(bytes(&f, DATA + 0x1028, 8), b"hello wo");
+        // Room for a name and control comes before the bytes; the caller's
+        // header is not written.
+        msghdr(&f, into, &[], 8);
+        f.mem
+            .write(GuestAddr(into), &(DATA + 0x700).to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(into + 8), &4u32.to_le_bytes())
+            .unwrap();
+        let before = bytes(&f, into, 56);
+        assert_eq!(one(&mut f, &r, &provide(1, DATA + 0x1000, 64, 3, 0)), 0);
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 3]), 3);
+        submit_only(&mut f, &r, &[receive]);
+        assert_eq!(reap_flags(&mut f, &r), [(1, 31, MORE | 1), (1, -105, 0)]);
+        assert_eq!(head(&f, DATA + 0x1000), [0, 0, 3, 0]);
+        assert_eq!(bytes(&f, DATA + 0x101c, 3), b"hel");
+        assert_eq!(bytes(&f, into, 56), before);
+        // A buffer shorter than its head fails.
+        assert_eq!(one(&mut f, &r, &provide(1, DATA + 0x1000, 20, 3, 0)), 0);
+        assert_eq!(one(&mut f, &r, &receive), -14);
+        // The preparation: no limit, and a name's length that fits.
+        let mut limited = receive;
+        limited[44] = 1;
+        assert_eq!(one(&mut f, &r, &limited), -22);
+        msghdr(&f, into, &[], 0);
+        f.mem
+            .write(GuestAddr(into + 8), &(-1i32).to_le_bytes())
+            .unwrap();
+        assert_eq!(one(&mut f, &r, &receive), -75);
+        f.mem
+            .write(GuestAddr(into + 8), &0u32.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(into + 40), &(1u64 << 31).to_le_bytes())
+            .unwrap();
+        assert_eq!(one(&mut f, &r, &receive), -75);
+        // The end of a stream is its last.
+        msghdr(&f, into, &[], 0);
+        assert_eq!(f.ret(53, &[1, 1, 0, DATA + 0x300]), 0);
+        let (a, b) = (
+            u64::from(u32_at(&f, DATA + 0x300)),
+            u64::from(u32_at(&f, DATA + 0x304)),
+        );
+        receive[4..8].copy_from_slice(&(b as i32).to_le_bytes());
+        assert_eq!(f.ret(3, &[a]), 0);
+        assert_eq!(batch(&mut f, &r, &[receive]), [(1, 16)]);
+        assert_eq!(head(&f, DATA + 0x1000), [0, 0, 0, 0]);
+    }
+
     /// A splice (30) or tee (33) of `len` bytes from `input` to `out`.
     fn splice(opcode: u8, data: u64, input: u64, out: u64, len: u32, flags: u32) -> [u8; 64] {
         let off = if opcode == 30 { u64::MAX } else { 0 };
@@ -10701,6 +10788,39 @@ mod inotify {
         );
         f.kernel.group.set_exe_file(None);
         assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x10, &b"prog"[..])]);
+    }
+    #[test]
+    fn a_removed_program_ends_with_its_last_threads_exit() {
+        let mut f = fixture();
+        assert_eq!(f.ret(83, &[put(&f, DATA, b"/tmp/x"), 0o755]), 0);
+        let bytes = paludarium_loader::testing::tiny_exec(&[0x90], b"");
+        let file = f
+            .kernel
+            .files
+            .fs()
+            .open(b"/tmp/x/prog", 0o101, 0o755)
+            .unwrap();
+        assert_eq!(file.write_at(0, &bytes).unwrap(), bytes.len());
+        drop(file);
+        let prog = put(&f, DATA, b"/tmp/x/prog");
+        assert_eq!(f.ret(59, &[prog, 0, 0]), 0);
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let wd = f.ret(ADD, &[fd, prog, 0x400]) as i32;
+        // Removed while it runs, it lasts.
+        assert_eq!(f.ret(87, &[prog]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        // Nor do the image's mappings alone, once its memory goes, keep it:
+        // the name does until the last thread's exit lets go of it with
+        // `exe_file`, before the exit is told (`exit_mm` before
+        // `exit_notify`).
+        assert!(f.kernel.take_exec_memory().is_some());
+        f.kernel.group.set_exe_file(None);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        f.kernel.group.release_program();
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
     }
     #[test]
     fn a_fifo_a_path_opened_and_splices_are_heard_of() {
@@ -15396,6 +15516,154 @@ fn the_first_thread_keeps_the_signals_the_host_started_with_ignored() {
         ignored(&shared.lock().unwrap_or_else(PoisonError::into_inner)),
         [2, 3]
     );
+}
+
+/// The calls that make, remove or rename a name in `/proc` and `/dev` give
+/// Linux's errors in its order: the lookup (`ENOENT` in `/proc`), the
+/// trailing slash, the permission to write the directory (`EACCES` for
+/// another user; a process's directory is immutable, `EPERM`, its `fd` its
+/// own, and `/proc/sys` writable by nobody), then `EPERM` (no such
+/// operation) or `EXDEV` between file systems, as root and as nobody.
+#[test]
+fn the_name_calls_give_linux_s_errors_in_the_generated_directories() {
+    const EXDEV: i64 = 18;
+    let mut f = fixture();
+    let file = put(&mut f, 0x80, b"/tmp/file");
+    let fd = f.ret(2, &[file, 0o101, 0o666]);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let other = put(&mut f, 0xa0, b"/tmp/other");
+    // [unlink, rmdir, mkdir, mknod, creat, link-to, link-from, rename-out,
+    // rename-within] of each name, as root then as nobody.
+    let rows: [(&[u8], [i64; 9], [i64; 9]); 12] = [
+        (
+            b"/proc/x8",
+            [2, 2, 2, 2, 2, 2, 2, EXDEV, 2],
+            [2, 2, 2, 2, 2, 2, 2, EXDEV, 2],
+        ),
+        (
+            b"/proc/uptime",
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/sys",
+            [21, 1, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/self/comm",
+            [1, 1, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [1, 1, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/self/fd/0",
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/sys/kernel/ostype",
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 2],
+        ),
+        (
+            b"/proc/uptime/",
+            [20, 20, 17, 17, 21, 17, 20, EXDEV, 20],
+            [20, 13, 17, 17, 21, 17, 20, EXDEV, 20],
+        ),
+        (
+            b"/proc/x8/",
+            [2, 2, 2, 2, 21, 2, 2, EXDEV, 2],
+            [2, 2, 2, 2, 21, 2, 2, EXDEV, 2],
+        ),
+        (
+            b"/proc/.",
+            [21, 22, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+            [21, 22, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+        ),
+        (
+            b"/proc/self/..",
+            [21, 39, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+            [21, 39, 17, 17, 17, 17, EXDEV, EXDEV, 16],
+        ),
+        (
+            b"/dev/null",
+            [1, 20, 17, 17, 17, 17, EXDEV, EXDEV, 1],
+            [13, 13, 17, 17, 17, 17, EXDEV, EXDEV, 13],
+        ),
+        (
+            b"/dev/x8",
+            [2, 2, 2, 2, 2, EXDEV, 2, EXDEV, 2],
+            [2, 2, 13, 13, 13, EXDEV, 2, EXDEV, 2],
+        ),
+    ];
+    let run = |f: &mut Fixture, nobody: bool| {
+        for (name, root, user) in rows {
+            let p = put(f, 0x100, name);
+            let mut sibling = name.to_vec();
+            if let Some(at) = sibling.iter().rposition(|&b| b == b'/')
+                && at + 1 < sibling.len()
+            {
+                sibling.truncate(at + 1);
+                sibling.extend_from_slice(b"y8");
+            }
+            let q = put(f, 0x200, &sibling);
+            let call = |f: &mut Fixture, n: u64, args: &[u64]| -(f.ret(n, args) as i64).min(0);
+            let opened = f.ret(2, &[p, 0o301, 0o644]) as i64;
+            let got = [
+                call(f, 87, &[p]),
+                call(f, 84, &[p]),
+                call(f, 83, &[p, 0o755]),
+                call(f, 133, &[p, 0o10644, 0]),
+                -opened.min(0),
+                call(f, 86, &[file, p]),
+                call(f, 86, &[p, other]),
+                call(f, 82, &[p, other]),
+                call(f, 82, &[p, q]),
+            ];
+            let want = if nobody { user } else { root };
+            assert_eq!(
+                got,
+                want,
+                "{} as {}",
+                String::from_utf8_lossy(name),
+                if nobody { "nobody" } else { "root" }
+            );
+        }
+    };
+    run(&mut f, false);
+    // /proc and /dev themselves, in the root's directory: mount points.
+    let proc_dir = put(&mut f, 0x300, b"/proc");
+    assert_eq!(f.ret(87, &[proc_dir]), errno(Errno::EISDIR));
+    assert_eq!(f.ret(84, &[proc_dir]), errno(Errno(16)));
+    assert_eq!(f.ret(133, &[proc_dir, 0o10644, 0]), errno(Errno::EEXIST));
+    assert_eq!(f.ret(86, &[file, proc_dir]), errno(Errno::EEXIST));
+    // The mounts in /dev are mount points there: EBUSY to remove or
+    // rename, EISDIR to unlink, EEXIST to make.
+    let y8 = put(&mut f, 0x340, b"/dev/y8");
+    for mount in [&b"/dev/shm"[..], b"/dev/mqueue", b"/dev/pts"] {
+        let p = put(&mut f, 0x300, mount);
+        let label = String::from_utf8_lossy(mount);
+        assert_eq!(f.ret(84, &[p]), errno(Errno(16)), "{label}");
+        assert_eq!(f.ret(82, &[p, y8]), errno(Errno(16)), "{label}");
+        assert_eq!(f.ret(87, &[p]), errno(Errno::EISDIR), "{label}");
+        assert_eq!(f.ret(83, &[p, 0o755]), errno(Errno::EEXIST), "{label}");
+    }
+    // A thread's directory, by `self/task` too, is immutable;
+    // `thread-self` itself is a link (ENOTDIR to rmdir).
+    let tid = f.ret(186, &[]);
+    for (path, call, want) in [
+        (format!("/proc/self/task/{tid}"), 84, Errno::EPERM),
+        (format!("/proc/self/task/{tid}/comm"), 87, Errno::EPERM),
+        ("/proc/thread-self/comm".to_owned(), 87, Errno::EPERM),
+        ("/proc/thread-self".to_owned(), 84, Errno::ENOTDIR),
+    ] {
+        let p = put(&mut f, 0x300, path.as_bytes());
+        assert_eq!(f.ret(call, &[p]), errno(want), "{path}");
+    }
+    // setresgid(65534, ..), setresuid(65534, ..).
+    assert_eq!(f.ret(119, &[65534, 65534, 65534]), 0);
+    assert_eq!(f.ret(117, &[65534, 65534, 65534]), 0);
+    run(&mut f, true);
 }
 
 /// In a mount namespace of a less privileged owner, where `/dev/shm` is

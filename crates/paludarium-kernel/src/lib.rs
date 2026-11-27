@@ -36,6 +36,7 @@ mod bpf_interp;
 mod bpf_prog;
 #[cfg(test)]
 mod bpf_prog_tests;
+mod bpf_scalar;
 mod bpf_test_run;
 #[cfg(test)]
 mod bpf_tests;

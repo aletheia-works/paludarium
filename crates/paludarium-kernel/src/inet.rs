@@ -1929,6 +1929,9 @@ struct State {
     groups4: Vec<Member4>,
     /// The IPv6 ones (`ipv6_mc_list`), the newest first.
     groups6: Vec<Member6>,
+    /// The IPv6 anycast addresses it has joined (`ipv6_ac_list`), the
+    /// newest first.
+    anycast6: Vec<crate::anycast::Member>,
     /// What the inbox takes of `SO_RCVBUF`, as Linux's `sk_rmem_alloc`.
     inbox_size: usize,
     /// How many datagrams and queries have come, which orders them.
@@ -4976,6 +4979,8 @@ impl Drop for InetSocket {
         self.network.drop4(&s.groups4);
         self.network.drop6(&s.groups6);
         crate::netlink::tell_groups(&self.network);
+        self.network
+            .drop_anycast6(&s.anycast6, self.now().unwrap_or_default());
         // Its connection's tries go with it.
         if let Some(stream) = &s.stream
             && stream.phase() == Phase::Connecting
@@ -6345,6 +6350,36 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             };
             crate::netlink::tell_groups(&socket.network);
             result?;
+        }
+        // `IPV6_JOIN_ANYCAST` and `IPV6_LEAVE_ANYCAST`, of any IPv6 socket:
+        // an `ipv6_mreq` (`EINVAL` for less).
+        (41, 27 | 28) if socket.family == Family::V6 => {
+            option6_int(c, at, len)?;
+            if (len as u32 as i32) < 20 {
+                return Err(Errno::EINVAL);
+            }
+            let mut raw = [0; 20];
+            c.mem
+                .read(GuestAddr(at), &mut raw)
+                .map_err(|_| Errno::EFAULT)?;
+            let asked = Membership6::read(&raw);
+            let member = (asked.index, asked.group);
+            let now = socket.now().unwrap_or_default();
+            let mut s = socket.lock();
+            if name == 27 {
+                let admin = c
+                    .process
+                    .credentials
+                    .capable_in(CAP_NET_ADMIN, socket.network.owner());
+                let all = socket.network.devices().all6.forwarding != 0;
+                socket
+                    .network
+                    .join_anycast6(&mut s.anycast6, member, (admin, all), now)?;
+            } else {
+                socket
+                    .network
+                    .leave_anycast6(&mut s.anycast6, member, now)?;
+            }
         }
         // A device that joins a group anew or leaves it for good is told
         // of as it does (`inet_ifmcaddr_notify`), whatever the option

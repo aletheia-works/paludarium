@@ -4859,6 +4859,7 @@ mod shm {
                 "route",
                 "packet",
                 "netlink",
+                "anycast6",
                 "if_inet6",
                 "mcfilter",
                 "mcfilter6",

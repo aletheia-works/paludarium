@@ -44,7 +44,7 @@ pub(crate) const NO_PREFIX_ROUTE: u32 = 0x200;
 pub(crate) const PERMANENT: u32 = 0x80;
 pub(crate) const DEPRECATED: u32 = 0x20;
 /// `IFA_F_NODAD`: an IPv6 address is never tentative.
-const NO_DAD: u32 = 0x02;
+pub(crate) const NO_DAD: u32 = 0x02;
 /// The IPv6 address flags a request may set (`inet6_rtm_newaddr`):
 /// `IFA_F_NODAD`, `IFA_F_HOMEADDRESS`, `IFA_F_MANAGETEMPADDR`,
 /// `IFA_F_NOPREFIXROUTE` and `IFA_F_MCAUTOJOIN`; `IFA_F_OPTIMISTIC` too,
@@ -372,6 +372,11 @@ impl V6 {
     fn prefix_of(&self) -> Ipv6Addr {
         Ipv6Addr::from(u128::from(self.address) & mask6(self.prefix))
     }
+    /// Its subnet-router anycast address (`addrconf_join_anycast`): its
+    /// prefix, none of 127 bits or more (RFC 6164), nor `::`.
+    fn subnet_router(&self) -> Option<Ipv6Addr> {
+        Some(self.prefix_of()).filter(|a| self.prefix < 127 && !a.is_unspecified())
+    }
     fn metric(&self) -> u32 {
         if self.priority == 0 {
             METRIC_ADDRCONF
@@ -435,6 +440,18 @@ fn scope6(ip: Ipv6Addr) -> u8 {
     }
 }
 
+/// The route of the anycast address `address` of the device `index`, in
+/// the local table (`addrconf_f6i_alloc`).
+fn anycast_route(index: i32, address: Ipv6Addr) -> Route6 {
+    Route6 {
+        kind: Kind::Anycast,
+        ..V6 {
+            index,
+            ..V6::new(address, 128)
+        }
+        .local_route()
+    }
+}
 /// What a route is (`RTN_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -448,6 +465,9 @@ pub(crate) enum Kind {
     /// The kernel's alone: IPv6's multicast route of each device
     /// (`addrconf_add_mroute`), which no request makes here.
     Multicast,
+    /// The kernel's alone: IPv6's local route of an anycast address
+    /// (`addrconf_f6i_alloc`), which lookups pass over here.
+    Anycast,
 }
 impl Kind {
     /// The kind of `RTN_*` code `code`: `None` for one not supported here.
@@ -473,6 +493,7 @@ impl Kind {
             Self::Unreachable => 7,
             Self::Prohibit => 8,
             Self::Throw => 9,
+            Self::Anycast => 4,
             Self::Multicast => 5,
         }
     }
@@ -781,6 +802,19 @@ pub(crate) enum Event {
     /// (`inet_ifmcaddr_notify`).
     Group4(crate::multicast::Told4),
     Group6(crate::multicast::Told6),
+    /// An anycast address a device has joined anew, or left for good
+    /// (`inet6_ifacaddr_notify`).
+    Anycast6(Anycast6, bool),
+}
+/// An anycast address of a device (`ifacaddr6`): how many times it is
+/// joined (`aca_users`), and when it was first (`aca_cstamp`, which
+/// `aca_tstamp` is too, as nothing changes it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Anycast6 {
+    pub index: i32,
+    pub address: Ipv6Addr,
+    pub users: u32,
+    pub created: u64,
 }
 /// A neighbour of the loopback or of a veth end, as `___neigh_create`
 /// makes one for the next hop of a packet out through it, or for a
@@ -1363,6 +1397,13 @@ pub(crate) struct Addresses {
     /// (`addrconf_dad_work`'s `ndisc_send_ns`): of the address of the
     /// device of the index, at the time.
     probes6: Vec<(i32, Ipv6Addr, u64)>,
+    /// The anycast addresses of the devices, the newest first, as each
+    /// puts a new one at the head of its list (`ac_list`).
+    anycast6: Vec<Anycast6>,
+    /// The devices that forward IPv6 (`forwarding` of their `conf`), by
+    /// index, which join the subnet-router anycast address of each of their
+    /// addresses (`addrconf_join_anycast`).
+    forwarding6: Vec<i32>,
     /// The seed of the hash that chooses among a multipath route's hops.
     pub multipath_seed: crate::multipath::Seed,
     /// IPv4's `fib_multipath_hash_policy` and `fib_multipath_hash_fields`.
@@ -1477,6 +1518,8 @@ impl Addresses {
             ready6: Vec::new(),
             changes6: Vec::new(),
             probes6: Vec::new(),
+            anycast6: Vec::new(),
+            forwarding6: Vec::new(),
             multipath_seed: crate::multipath::Seed::default(),
             serials6: Serials6::default(),
             multipath4: crate::multipath::Policy::default(),
@@ -1999,7 +2042,7 @@ impl Addresses {
         for route in self
             .routes6
             .iter_mut()
-            .filter(|r| r.oif == oif && r.kind != Kind::Local)
+            .filter(|r| r.oif == oif && !matches!(r.kind, Kind::Local | Kind::Anycast))
         {
             route.linkdown = !carrier;
         }
@@ -2139,10 +2182,13 @@ impl Addresses {
             self.serials6.all();
         }
         let now = self.seen;
-        for a in &gone {
-            self.solicit_gone(a, now, false);
+        let mut events = Vec::new();
+        for a in gone {
+            events.push(Event::DelAddr6(a.clone()));
+            self.leave_anycast(&a, now, &mut events);
+            self.solicit_gone(&a, now, false);
         }
-        gone.into_iter().map(Event::DelAddr6).collect()
+        events
     }
     /// The device of `gone`, a loopback's but, leaves its solicited-node
     /// group once as it goes at `now`, reporting it unless the device is
@@ -2155,6 +2201,133 @@ impl Addresses {
             self.changes6.push(crate::multicast::Change6::Leave(
                 gone.index, group, now, report,
             ));
+        }
+    }
+    /// Whether the device `index` forwards IPv6.
+    pub(crate) fn forwards6(&self, index: i32) -> bool {
+        self.forwarding6.contains(&index)
+    }
+    /// Whether `ip` is of the prefix of an address of the device `index`,
+    /// tentative or not (`ipv6_chk_prefix`).
+    pub(crate) fn on_prefix6(&self, index: i32, ip: Ipv6Addr) -> bool {
+        self.v6.iter().any(|a| a.index == index && a.covers(ip))
+    }
+    /// The device `index` forwards IPv6, or does not, from its making on
+    /// ([`crate::inet::Network::register6`]).
+    pub(crate) fn set_forwarding6(&mut self, index: i32, on: bool) {
+        self.forwarding6.retain(|&i| i != index);
+        if on {
+            self.forwarding6.push(index);
+        }
+    }
+    /// The device `index` comes to forward IPv6 at `now`, or no longer
+    /// does (`dev_forward_change`): it joins, or leaves, the subnet-router
+    /// anycast address of each of its addresses that is not tentative, in
+    /// their order.
+    pub(crate) fn forward6(&mut self, index: i32, on: bool, now: u64) -> Vec<Event> {
+        self.set_forwarding6(index, on);
+        let mut events = Vec::new();
+        let addresses: Vec<V6> = self
+            .v6
+            .iter()
+            .filter(|a| a.index == index && !a.tentative())
+            .cloned()
+            .collect();
+        for address in addresses {
+            let Some(any) = address.subnet_router() else {
+                continue;
+            };
+            if on {
+                events.extend(self.anycast_inc(index, any, now));
+            } else if let Ok(told) = self.anycast_dec(index, any, now) {
+                events.extend(told);
+            }
+        }
+        events
+    }
+    /// The anycast addresses of the devices, each device's the newest
+    /// first.
+    pub(crate) fn anycast6(&self) -> &[Anycast6] {
+        &self.anycast6
+    }
+    /// The device `index` joins the anycast address `address` at `now`
+    /// (`__ipv6_dev_ac_inc`): once more if it has it; else anew, its route
+    /// of the local table told of, its solicited-node group joined, a
+    /// loopback's but (`addrconf_join_solict`), then the address told of.
+    pub(crate) fn anycast_inc(&mut self, index: i32, address: Ipv6Addr, now: u64) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Some(a) = self
+            .anycast6
+            .iter_mut()
+            .find(|a| a.index == index && a.address == address)
+        {
+            a.users += 1;
+            return events;
+        }
+        let new = Anycast6 {
+            index,
+            address,
+            users: 1,
+            created: now,
+        };
+        self.anycast6.insert(0, new);
+        self.kernel_add6(anycast_route(index, address), &mut events);
+        if index != LOOPBACK_INDEX {
+            let group = crate::multicast::solicited(address);
+            self.changes6
+                .push(crate::multicast::Change6::Join(index, group, now));
+        }
+        events.push(Event::Anycast6(new, true));
+        events
+    }
+    /// The device `index` leaves the anycast address `address` at `now`
+    /// (`__ipv6_dev_ac_dec`), `ENOENT` if it has it not: for good with its
+    /// last user, leaving its solicited-node group, its route gone, if it
+    /// is there still, then the address told of.
+    pub(crate) fn anycast_dec(
+        &mut self,
+        index: i32,
+        address: Ipv6Addr,
+        now: u64,
+    ) -> Result<Vec<Event>, Errno> {
+        let i = self
+            .anycast6
+            .iter()
+            .position(|a| a.index == index && a.address == address)
+            .ok_or(Errno::ENOENT)?;
+        self.anycast6[i].users -= 1;
+        let mut events = Vec::new();
+        if self.anycast6[i].users > 0 {
+            return Ok(events);
+        }
+        let gone = self.anycast6.remove(i);
+        if index != LOOPBACK_INDEX {
+            let group = crate::multicast::solicited(address);
+            self.changes6
+                .push(crate::multicast::Change6::Leave(index, group, now, true));
+        }
+        self.kernel_del6(&anycast_route(index, address), &mut events);
+        events.push(Event::Anycast6(gone, false));
+        Ok(events)
+    }
+    /// `address`'s device, if it forwards, joins the subnet-router anycast
+    /// address of its prefix at `now`, as the address is told of
+    /// (`__ipv6_ifa_notify`'s `addrconf_join_anycast`).
+    fn join_anycast(&mut self, address: &V6, now: u64, events: &mut Vec<Event>) {
+        if self.forwards6(address.index)
+            && let Some(any) = address.subnet_router()
+        {
+            events.extend(self.anycast_inc(address.index, any, now));
+        }
+    }
+    /// `address`'s device, if it forwards, leaves that address as the
+    /// address goes (`addrconf_leave_anycast`), whether it joined it or not.
+    fn leave_anycast(&mut self, address: &V6, now: u64, events: &mut Vec<Event>) {
+        if self.forwards6(address.index)
+            && let Some(any) = address.subnet_router()
+            && let Ok(told) = self.anycast_dec(address.index, any, now)
+        {
+            events.extend(told);
         }
     }
     /// The IPv6 of the device `index` goes down, once ready
@@ -2297,6 +2470,10 @@ impl Addresses {
     pub(crate) fn device_gone6(&mut self, index: i32) -> Vec<Event> {
         let mut events = self.routes6_gone(index.unsigned_abs());
         events.extend(self.addresses6_gone(index));
+        // `ipv6_ac_destroy_dev`: what sockets joined goes without a word,
+        // its routes gone with the rest.
+        self.anycast6.retain(|a| a.index != index);
+        self.forwarding6.retain(|&i| i != index);
         events
     }
     /// The IPv6 routes through the device of `oif` as it goes down
@@ -2593,6 +2770,7 @@ impl Addresses {
         }
         events.push(Event::NewAddr6(new.clone(), false));
         self.kernel_add6(new.local_route(), &mut events);
+        self.join_anycast(&new, now, &mut events);
         self.insert_v6(new);
         Ok(events)
     }
@@ -2736,9 +2914,10 @@ impl Addresses {
     /// prefix route ([`Self::prefix_gone`]), unless it had none.
     fn remove_v6(&mut self, found: usize, now: u64) -> Vec<Event> {
         let gone = self.v6.remove(found);
-        self.solicit_gone(&gone, now, true);
         self.serials6.all();
         let mut events = vec![Event::DelAddr6(gone.clone())];
+        self.leave_anycast(&gone, now, &mut events);
+        self.solicit_gone(&gone, now, true);
         self.kernel_del6(&gone.local_route(), &mut events);
         if gone.flags & NO_PREFIX_ROUTE == 0 {
             self.prefix_gone(&gone, now, &mut events);
@@ -2820,6 +2999,7 @@ impl Addresses {
             let address = self.v6[i].clone();
             events.push(Event::NewAddr6(address.clone(), false));
             self.kernel_add6(address.local_route(), &mut events);
+            self.join_anycast(&address, at, &mut events);
             if address.index != LOOPBACK_INDEX && self.lonely(&address) {
                 self.changes6
                     .push(crate::multicast::Change6::Done(address.index, at));
@@ -3111,7 +3291,8 @@ impl Addresses {
         }
     }
     fn kernel_add6(&mut self, mut route: Route6, events: &mut Vec<Event>) {
-        route.linkdown = route.kind != Kind::Local && self.no_carrier.contains(&route.oif);
+        route.linkdown = !matches!(route.kind, Kind::Local | Kind::Anycast)
+            && self.no_carrier.contains(&route.oif);
         self.create6(route.table);
         if let Ok(flags) = self.insert6(route, None) {
             events.push(Event::NewRoute6(route, flags));
@@ -4266,7 +4447,13 @@ impl Addresses {
     fn lookup6_in(&self, table: u32, ip: Ipv6Addr, oif: u32, flow: &Flow6) -> Option<Route6> {
         self.routes6
             .iter()
-            .filter(|r| r.table == table && r.covers(ip) && (oif == 0 || r.oif == oif) && !r.dead)
+            .filter(|r| {
+                r.table == table
+                    && r.covers(ip)
+                    && (oif == 0 || r.oif == oif)
+                    && !r.dead
+                    && r.kind != Kind::Anycast
+            })
             .min_by_key(|r| (Reverse(r.len), r.metric))
             .map(|r| self.path6(*r, ip, oif, flow))
     }
@@ -4284,7 +4471,7 @@ impl Addresses {
         let matched = self
             .routes6
             .iter()
-            .filter(|r| r.table == table && r.covers(ip) && !r.dead)
+            .filter(|r| r.table == table && r.covers(ip) && !r.dead && r.kind != Kind::Anycast)
             .min_by_key(|r| (Reverse(r.len), r.metric, r.oif != oif))?;
         Some(if matched.oif == oif {
             *matched
@@ -4715,6 +4902,7 @@ mod tests {
                 Event::DelNeighbour(n) => format!("-neigh {}", n.ip),
                 Event::Group4(t) => format!("group {} {}", t.group, t.joined),
                 Event::Group6(t) => format!("group {} {}", t.group, t.joined),
+                Event::Anycast6(a, joined) => format!("anycast {} {joined}", a.address),
             })
             .collect()
     }

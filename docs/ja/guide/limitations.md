@@ -116,7 +116,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
-- **`/proc/net` の一部**：あるのは `arp`、`dev`、`if_inet6`、`igmp`、`igmp6`、`ipv6_route`、
+- **`/proc/net` の一部**：あるのは `anycast6`、`arp`、`dev`、`if_inet6`、`igmp`、`igmp6`、`ipv6_route`、
   `mcfilter`、`mcfilter6`、`route` と、ソケットのファイル（[機能](./features) を参照）だけです。
   `dev_mcast`、`snmp`、`sockstat` などは `ENOENT` です。カウンタは数えないので、`dev` のものは
   0 です。ネットワークのないセッションのファイルには、
@@ -1057,17 +1057,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （`ff02::16`、要請ノードのもの、`ff02::2`）の近隣を作りますが、相手には届きません。
   転送する相手は、要請から端のリンクローカルのアドレスの近隣を学びません
   （`ndisc_recv_rs`）。報告はすぐに送りますが、Linux では 2 tick 後です
-  （`mld_ifc_start_work`）。どれも 1 回だけ送るので、その近隣を消すと、Linux がその後に
-  送るもの（`mld_ifc_work`、`mld_dad_work`、`addrconf_rs_timer`）がもう一度作ることは
+  （`mld_ifc_start_work`）。Linux のタイマーが送り直すもの（`mld_ifc_work`、`mld_dad_work`、
+  `addrconf_rs_timer`）は送り直さないので、その近隣を消しても、それがもう一度作ることは
   ありません。グループのソースが変わっても報告は送りません（`ip6_mc_add_src`、
   `ip6_mc_del_src`）。IGMP の報告は、送り先のグループの近隣を作りません。端を通る通信は
   カウンタを動かしません。名前空間は別の名前空間へ転送しません。マルチキャストのグループはゲストの名前空間の中だけのものです。最初の名前空間には
   ホストのネットワークへのデバイスがなく、グループへの経路もないので、デバイスを指さずに
   入ろうとすると `ENODEV` です。IGMP と MLD のパケットはどこにも届きません。raw ソケットは `EPERM` で、パケット
-  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。エニーキャストの
-  グループ（`IPV6_JOIN_ANYCAST`）は `ENOPROTOOPT` です。IPv6 を転送するデバイスには
-  サブネットルーターのエニーキャストアドレスがない（`addrconf_join_anycast`）ので、その
-  要請ノードのグループにも入りません。Linux の master のリンク層のグループ
+  ソケット（`AF_PACKET`）もないので、ゲストからは見えないものです。経路の検索は
+  エニーキャストのアドレスの経路（`RTN_ANYCAST`）を飛ばしますが、Linux は見つけます。その
+  アドレスの検索（`RTM_GETROUTE`）はその接頭辞の経路を返し、そこへのパケットはその経路の
+  とおりに出ていきますが、Linux は受け取ります。Linux の master のリンク層のグループ
   （`AF_PACKET`、`dev_mc_dump`）の `RTM_GETMULTICAST` は `EOPNOTSUPP` です。ICMP の port unreachable の頻度を
   抑えないので（`icmpv4_xrlim_allow`、`icmpv6_xrlim_allow`）、相手の閉じたポートへのデータグラムのたびに、
   接続したソケットの次の送信は `ECONNREFUSED` になります。組を通る接続は、端が
@@ -1121,9 +1121,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   そこから始まります。`fib_multipath_hash_seed`、`fib_multipath_hash_policy`、
   `fib_multipath_hash_fields`、`fib_multipath_use_neigh` への書き込みは、Linux 7.0 から 7.2 と同じく
   全部を取り、ファイルの位置を動かしません。master は読んだ分だけを取り、位置を進めます
-  （`proc_vec`）。IPv6 の `forwarding` はルーターのエニーキャストのアドレスに
-  加わりません。`all` のものに書くと、デバイスのものを
-  インデックスの順に伝えますが、Linux は増えた順です。netconf の通知は、ファイルのない
+  （`proc_vec`）。netconf の通知は、ファイルのない
   設定（プロキシ ARP と NDP、マルチキャストとブロードキャストの転送、リンクの落ちた
   経路を無視する設定）を、Linux の組み込みの値と同じく 0 として伝えます。MTU が 1280
   より小さい veth の端にも `ipv6/conf/<デバイス>` のファイルがありますが、Linux では

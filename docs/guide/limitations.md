@@ -130,7 +130,7 @@ verified.
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
-- **`/proc/net`, in part**: it has `arp`, `dev`, `if_inet6`, `igmp`,
+- **`/proc/net`, in part**: it has `anycast6`, `arp`, `dev`, `if_inet6`, `igmp`,
   `igmp6`, `ipv6_route`, `mcfilter`, `mcfilter6`, `route` and those of the
   sockets (see [features](./features)) alone; `dev_mcast`, `snmp`,
   `sockstat` and the rest are `ENOENT`, and no counter is kept, so those of
@@ -1264,9 +1264,10 @@ verified.
   (`ff02::16`, the solicited-node ones, `ff02::2`), but reaches no peer:
   a peer that forwards learns no neighbour of the end's link-local
   address from the solicitation (`ndisc_recv_rs`). A report goes at once,
-  where Linux's goes two ticks on (`mld_ifc_start_work`); each goes once,
-  so a neighbour of one that is deleted is not made again by those Linux
-  sends on (`mld_ifc_work`, `mld_dad_work`, `addrconf_rs_timer`); and a
+  where Linux's goes two ticks on (`mld_ifc_start_work`); none is sent
+  again as Linux's timers send them (`mld_ifc_work`, `mld_dad_work`,
+  `addrconf_rs_timer`), so a neighbour of one that is deleted is not made
+  again by those; and a
   change of a group's sources sends none (`ip6_mc_add_src`,
   `ip6_mc_del_src`). IGMP's reports make no neighbour of the group they
   go to. Traffic through
@@ -1277,9 +1278,10 @@ verified.
   No IGMP or MLD packet reaches anything: nothing in the guest would see
   one, as raw sockets are `EPERM` and there are no packet sockets
   (`AF_PACKET`).
-  Anycast groups (`IPV6_JOIN_ANYCAST`) are `ENOPROTOOPT`, and a device
-  that forwards IPv6 has no subnet-router anycast address
-  (`addrconf_join_anycast`), so it joins no solicited-node group of one.
+  A route lookup passes over the route of an anycast address
+  (`RTN_ANYCAST`), where Linux's finds it: a lookup of one
+  (`RTM_GETROUTE`) gives the route of its prefix, and a packet to one
+  goes out as that route takes it, where Linux takes it in.
   `RTM_GETMULTICAST` of Linux master's
   link-layer groups (`AF_PACKET`, `dev_mc_dump`) is `EOPNOTSUPP`. ICMP's port unreachable is not rate limited
   (`icmpv4_xrlim_allow`, `icmpv6_xrlim_allow`), so every datagram to a closed port of the
@@ -1346,9 +1348,7 @@ verified.
   `fib_multipath_hash_fields` or `fib_multipath_use_neigh` is taken whole and leaves the file where it
   was, as Linux 7.0 to 7.2 do; master takes what it reads and
   moves the file on (`proc_vec`).
-  IPv6's `forwarding` joins no router anycast address; a
-  write of `all`'s tells of the devices in the order of their indices,
-  where Linux's goes in the order they came. A netconf notification gives
+  A netconf notification gives
   the settings that have no file (proxy ARP and NDP, multicast and
   broadcast forwarding, ignoring routes with their link down) as 0, as
   Linux is built. A veth end whose MTU is below 1280 still has the files

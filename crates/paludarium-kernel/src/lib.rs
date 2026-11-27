@@ -72,6 +72,7 @@ mod netconf;
 mod netdev;
 mod netlink;
 pub use inet::{InvalidRule, NetworkPolicy};
+mod anycast;
 #[cfg(test)]
 mod context_tests;
 #[cfg(test)]

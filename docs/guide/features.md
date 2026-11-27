@@ -3265,6 +3265,38 @@ kernel.
     none or its sender, that is a member of the group, on whatever device,
     or has `IPV6_MULTICAST_ALL` on (`inet6_mc_check`). An accepted
     connection's `IPV6_MULTICAST_HOPS` is 64 (`tcp_v6_syn_recv_sock`).
+  - **IPv6 anycast addresses:** an IPv6 socket, TCP's too, joins and
+    leaves an anycast address with `IPV6_JOIN_ANYCAST` and
+    `IPV6_LEAVE_ANYCAST`, an `ipv6_mreq` (`EINVAL` for less), on the
+    device of an index or that of the route to it (0)
+    (`ipv6_sock_ac_join`, `ipv6_sock_ac_drop`): `EPERM` without
+    `CAP_NET_ADMIN`; `EINVAL` for a multicast address or one of the
+    namespace's addresses that is not tentative; `ENODEV` for no device;
+    `EADDRNOTAVAIL` for no route, unless `all` forwards, when it is the
+    first device up that is no loopback, and, on a device that does not
+    forward, for an address of no prefix of the device's addresses; and
+    `ENOENT` to leave as none, on the device named, or the newest joined
+    on any (0). A device that forwards joins the subnet-router anycast
+    address (the prefix) of each of its addresses, but one of 127 bits or
+    more: as the address is ready, after its duplicate address detection
+    or at once without, and of those not tentative as it comes to
+    forward; it leaves it as the address goes, or as it stops
+    (`addrconf_join_anycast`, `dev_forward_change`). Each is counted, once
+    for each, the newest first (`__ipv6_dev_ac_inc`). Joined anew, it adds
+    a route of type `RTN_ANYCAST` to the local table through the device,
+    joins its solicited-node group (a loopback does not) and tells
+    `RTNLGRP_IPV6_ACADDR` (39) with `RTM_NEWANYCAST`; left for good, it
+    leaves the group, its route goes, if there still, and it tells
+    `RTM_DELANYCAST` (`inet6_ifacaddr_notify`). Down, the device's routes go, those of
+    what sockets joined too, which stay joined without one; going, what
+    is left goes without a word (`ipv6_ac_destroy_dev`); a socket's close
+    leaves what it joined. `/proc/net/anycast6` (`ac6_seq_show`) shows
+    each device's, in the namespace's order, with their users; an
+    `RTM_GETANYCAST` dump (`inet6_dump_ifacaddr`), checked as an IPv6
+    address dump, gives them by index, as permanent addresses of 128 bits
+    (`IFA_ANYCAST`) of the universe's scope, the site's (200) for a
+    site-local one, with endless lifetimes (`inet6_fill_ifacaddr`); and
+    `ipv6_route` shows their routes with `RTF_ANYCAST`.
   - **Source filters:** a membership takes what its filter lets in: from its
     sources (`MCAST_INCLUDE`) or from all others (`MCAST_EXCLUDE`, of no
     sources as a join leaves it). IPv4's `IP_ADD_SOURCE_MEMBERSHIP`,
@@ -4827,7 +4859,8 @@ kernel.
     `default`'s and every device's. `forwarding` is told of to the members
     of `RTNLGRP_IPV6_NETCONF` only as it turns on or off (from 1 to 2 tells
     nothing), as `addrconf_fixup_forwarding` does: of `all`'s, `default`'s
-    first, then each device's that turns, then `all`'s own;
+    first, then each device's that turns, in the order the devices were
+    registered in, then `all`'s own;
     `disable_ipv6` is told of so by nothing. A device whose `disable_ipv6` turns
     on loses its IPv6 addresses and routes, told of as when it goes down
     (`addrconf_ifdown`); turning off while it is up gives `::1` back, and

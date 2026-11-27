@@ -103,6 +103,12 @@ const RTM_GETNEIGH: u16 = 30;
 const RTM_NEWMULTICAST: u16 = 56;
 const RTM_DELMULTICAST: u16 = 57;
 const RTM_GETMULTICAST: u16 = 58;
+/// A device's IPv6 anycast addresses: the notifications of one joined anew
+/// and left, and the dump (`RTM_GETANYCAST`), whose messages carry its
+/// type.
+const RTM_NEWANYCAST: u16 = 60;
+const RTM_DELANYCAST: u16 = 61;
+const RTM_GETANYCAST: u16 = 62;
 const RTM_NEWNEIGHTBL: u16 = 64;
 const RTM_GETNEIGHTBL: u16 = 66;
 /// The groups (`RTNLGRP_*`) notifications go to, and how many there are
@@ -117,6 +123,7 @@ const RTNLGRP_IPV6_IFINFO: u32 = 12;
 const RTNLGRP_MCTP_IFADDR: u32 = 34;
 const RTNLGRP_IPV4_MCADDR: u32 = 37;
 const RTNLGRP_IPV6_MCADDR: u32 = 38;
+const RTNLGRP_IPV6_ACADDR: u32 = 39;
 /// `RTN_LOCAL`, the type of an MCTP address's own route.
 const RTN_LOCAL: u8 = 2;
 /// `RTAX_MTU` in `RTA_METRICS`, and the last metric (`RTAX_MAX`,
@@ -356,6 +363,7 @@ const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
 const IFA_BROADCAST: u16 = 4;
+const IFA_ANYCAST: u16 = 5;
 const IFA_CACHEINFO: u16 = 6;
 const IFA_FLAGS: u16 = 8;
 const IFA_RT_PRIORITY: u16 = 9;
@@ -1230,6 +1238,16 @@ impl NetlinkSocket {
                     &mut answer,
                     &target,
                 ),
+                // `inet6_dump_ifacaddr`, IPv6's alone.
+                (RTM_GETANYCAST, AF_INET6) => anycast_dump(
+                    network,
+                    payload,
+                    (seq, port),
+                    strict,
+                    &mut answer,
+                    &target,
+                    now,
+                ),
                 (RTM_GETROUTE, _) => route_dump(
                     network,
                     payload,
@@ -1274,7 +1292,7 @@ impl NetlinkSocket {
             // `neigh_dump_info` once it has gone through every table.
             let joined = matches!(header.kind, RTM_GETADDR | RTM_GETLINK) && family == AF_INET6
                 || header.kind == nsid::RTM_GETNSID
-                || header.kind == RTM_GETMULTICAST
+                || matches!(header.kind, RTM_GETMULTICAST | RTM_GETANYCAST)
                 || (header.kind == RTM_GETNEIGH && family != AF_MCTP);
             let first = messages.is_empty() || joined;
             let done = done_message(s, header, payload, port, answer, error, first);
@@ -2682,6 +2700,68 @@ fn group_dump(
             .collect(),
         None => messages,
     })
+}
+/// The anycast addresses of each device or of one, as
+/// `inet6_dump_ifacaddr` dumps them (`RTM_GETANYCAST`): a request checked
+/// as an IPv6 address dump's ([`address_request`]), whose namespace, if it
+/// names one, shows them, with its ID; device by device, by index, each's
+/// the newest first.
+fn anycast_dump(
+    network: &Network,
+    payload: &[u8],
+    reply: (u32, u32),
+    strict: bool,
+    answer: &mut u16,
+    target: Target<'_>,
+    now: u64,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let (flags, shown, only) = address_request(network, payload, AF_INET6, strict, answer, target)?;
+    let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
+    let mut all: Vec<crate::interface::Anycast6> = of
+        .addresses_at(Some(now))
+        .anycast6()
+        .iter()
+        .filter(|a| only == 0 || a.index.unsigned_abs() == only)
+        .copied()
+        .collect();
+    // Stable, so each device's keep their order.
+    all.sort_by_key(|a| a.index);
+    let messages = all
+        .iter()
+        .map(|a| ipv6_anycast(a, RTM_GETANYCAST, NLM_F_MULTI | flags, reply));
+    Ok(match shown {
+        Some((id, _)) => messages.map(|m| with_address_netnsid(m, id)).collect(),
+        None => messages.collect(),
+    })
+}
+/// A message of `kind`, with `flags`, of the anycast address `a`
+/// (`inet6_fill_ifacaddr`): a permanent address of 128 bits, of site scope
+/// for a site-local one (`RT_SCOPE_SITE`), its lifetimes endless, made and
+/// changed as it was joined.
+fn ipv6_anycast(
+    a: &crate::interface::Anycast6,
+    kind: u16,
+    flags: u16,
+    (seq, port): (u32, u32),
+) -> Vec<u8> {
+    const RT_SCOPE_SITE: u8 = 200;
+    let site = a.address.segments()[0] & 0xffc0 == 0xfec0;
+    let scope = if site { RT_SCOPE_SITE } else { 0 };
+    let mut body = vec![AF_INET6, 128, crate::interface::PERMANENT as u8, scope];
+    body.extend_from_slice(&a.index.to_le_bytes());
+    attribute(&mut body, IFA_ANYCAST, &a.address.octets());
+    let life = crate::interface::Life {
+        valid: u32::MAX,
+        preferred: u32::MAX,
+        created: a.created,
+        changed: a.created,
+    };
+    attribute(
+        &mut body,
+        IFA_CACHEINFO,
+        &cacheinfo(&life, (u32::MAX, u32::MAX)),
+    );
+    message(kind, flags, seq, port, &body)
 }
 /// The namespace a request names, with its ID, if it names one.
 type NamedNetwork = Option<(i32, Arc<Network>)>;
@@ -5907,6 +5987,14 @@ fn told(
                     );
                     (RTNLGRP_IPV6_MCADDR, 0, message)
                 }
+                Event::Anycast6(a, joined) => {
+                    let kind = if joined {
+                        RTM_NEWANYCAST
+                    } else {
+                        RTM_DELANYCAST
+                    };
+                    (RTNLGRP_IPV6_ACADDR, 0, ipv6_anycast(&a, kind, 0, (0, 0)))
+                }
             };
             Notice {
                 to: None,
@@ -6641,6 +6729,12 @@ pub(crate) fn groups_told_out(
         0,
     ));
     notices
+}
+/// Tells `network`'s members of `events`, from no request, at `now`.
+pub(crate) fn tell_events(network: &Network, events: Vec<crate::interface::Event>, now: u64) {
+    if !events.is_empty() {
+        notify(network, told(events, 0, 0, false, false, now), None);
+    }
 }
 /// Tells `network`'s members of its devices' groups' changes, from no
 /// socket (a socket's option, or its close).

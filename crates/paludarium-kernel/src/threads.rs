@@ -195,10 +195,6 @@ pub struct ThreadGroup {
     /// The voluntary context switches of its reaped children and theirs
     /// (Linux's `signal->cnvcsw`).
     children_switches: AtomicU64,
-    /// The process is the init of a nested PID namespace, which takes only
-    /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
-    /// SIGNAL_UNKILLABLE), until a fault ends it.
-    unkillable: std::sync::atomic::AtomicBool,
     /// A SIGKILL was sent to the process, which Linux's `complete_signal`
     /// marks as the whole group's exit (SIGNAL_GROUP_EXIT) as it sends it.
     killed: std::sync::atomic::AtomicBool,
@@ -332,7 +328,6 @@ impl Default for ThreadGroup {
             children_faults: AtomicU64::new(0),
             children_major_faults: AtomicU64::new(0),
             children_switches: AtomicU64::new(0),
-            unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
             stop_signal: std::sync::atomic::AtomicI32::new(0),
@@ -341,9 +336,12 @@ impl Default for ThreadGroup {
     }
 }
 impl ThreadGroup {
-    /// Whether the process is the init of a nested PID namespace.
+    /// Whether the process is the init of a nested PID namespace, which
+    /// takes only the signals it handles, and SIGKILL and SIGSTOP from
+    /// outside (Linux's SIGNAL_UNKILLABLE), until a fault ends it. Its
+    /// [`Targets`] keep it, for the signals its threads' inboxes count.
     pub(crate) fn unkillable(&self) -> bool {
-        self.unkillable.load(Ordering::SeqCst)
+        self.targets.unkillable()
     }
     /// Whether the init of a nested PID namespace drops signal `number`
     /// (1 to 64) as it is sent, as Linux's `sig_task_ignored` with
@@ -432,7 +430,7 @@ impl ThreadGroup {
     }
     /// Makes the process the init of a nested PID namespace.
     pub(crate) fn set_unkillable(&self) {
-        self.unkillable.store(true, Ordering::SeqCst);
+        self.targets.set_unkillable();
     }
     /// Keeps the robust list head of `tid`.
     pub(crate) fn set_robust_list(&self, tid: u32, head: u64) {

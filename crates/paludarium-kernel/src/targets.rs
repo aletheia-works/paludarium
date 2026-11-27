@@ -44,6 +44,9 @@ pub(crate) struct Tif {
     /// queued for it since then without its inbox, which it has not drained
     /// yet ([`Self::queues`] counts on no fewer).
     own: AtomicU64,
+    /// Its process is the init of a nested PID namespace, as its
+    /// [`Targets`] say.
+    unkillable: AtomicBool,
 }
 
 impl Tif {
@@ -68,6 +71,16 @@ impl Tif {
             self.own
                 .fetch_and(!(1u64 << (number - 1)), Ordering::SeqCst);
         }
+    }
+    /// Whether its process, the init of a nested PID namespace, drops
+    /// signal `number` as it is sent when it has no handler for it, as
+    /// Linux's `sig_task_ignored` with SIGNAL_UNKILLABLE does: all but
+    /// SIGKILL and SIGSTOP, which its signal work takes (as
+    /// `checkpoint_once` checks), and one the kernel forces for a fault
+    /// (`synchronous`), for which `force_sig_info_to_task` clears
+    /// SIGNAL_UNKILLABLE.
+    pub(crate) fn drops_unhandled(&self, number: i32, synchronous: bool) -> bool {
+        self.unkillable.load(Ordering::SeqCst) && !synchronous && !matches!(number, 9 | 19)
     }
     /// Whether Linux's `__send_signal_locked` queues signal `number` sent to
     /// this thread alone, and so wakes the process's signal files
@@ -187,6 +200,9 @@ struct List {
     /// `curr_target`.
     current: u32,
     threads: Vec<(u32, Arc<Tif>)>,
+    /// The process is the init of a nested PID namespace (Linux's
+    /// SIGNAL_UNKILLABLE).
+    unkillable: bool,
 }
 impl List {
     fn position(&self, tid: u32) -> Option<usize> {
@@ -212,12 +228,25 @@ impl Targets {
     fn list(&self) -> MutexGuard<'_, List> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Whether the process is the init of a nested PID namespace.
+    pub(crate) fn unkillable(&self) -> bool {
+        self.list().unkillable
+    }
+    /// Makes it so, for its threads now and to come.
+    pub(crate) fn set_unkillable(&self) {
+        let mut list = self.list();
+        list.unkillable = true;
+        for (_, tif) in &list.threads {
+            tif.unkillable.store(true, Ordering::SeqCst);
+        }
+    }
     /// Adds thread `tid`, the leader if it is the first.
     pub(crate) fn add(&self, tid: u32, tif: &Arc<Tif>) {
         let mut list = self.list();
         if list.leader == 0 {
             (list.leader, list.current) = (tid, tid);
         }
+        tif.unkillable.store(list.unkillable, Ordering::SeqCst);
         match list.position(tid) {
             Some(at) => list.threads[at].1 = Arc::clone(tif),
             None => list.threads.push((tid, Arc::clone(tif))),

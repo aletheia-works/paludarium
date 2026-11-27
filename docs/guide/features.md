@@ -6664,7 +6664,9 @@ kernel.
   wakes the file for each, as it is sent, even when another thread has yet
   to take it in: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
-  unblocked does not; a new mask is an edge too. `signalfd` on a
+  unblocked does not, nor one the init of a nested PID namespace drops
+  unblocked as it has no handler (`SIGNAL_UNKILLABLE`); a new mask is an
+  edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
   `SIGKILL` and `SIGSTOP` never enter one, and neither a read nor a poll
   takes a signal whose action is `SA_IMMUTABLE` (below), as Linux master's

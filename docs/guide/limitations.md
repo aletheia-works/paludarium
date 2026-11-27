@@ -752,8 +752,8 @@ verified.
     cannot measure a thread's CPU time, as in WebAssembly, that is wall time,
     so they also count the time a thread sleeps or waits, all of it once it
     wakes. They are looked
-    at as a thread makes a system call and every 100,000 instructions it
-    runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
+    at as a thread makes a system call and at least every 100,000
+    instructions it runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. POSIX timers on the CPU-time clocks count
     and are looked at the same way, and so does a sleep on the process's
     CPU clock, which the sleeping thread looks at every tick; where that is

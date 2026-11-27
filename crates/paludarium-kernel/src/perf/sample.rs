@@ -126,6 +126,10 @@ pub(super) struct Sampler {
     interrupts: u64,
     throttled: bool,
     unthrottled: bool,
+    /// For a clock, the nanoseconds of its count in which another member's
+    /// throttling stopped its group ([`Event::stop_group`]), which its
+    /// hrtimer does not fire in yet to be gone through.
+    held: u64,
 }
 
 /// What a clock's hrtimer gives as its count goes on ([`Sampler::ticks`]):
@@ -216,6 +220,20 @@ impl Sampler {
             self.left = self.period.max(HRTIMER_MIN) as i64;
         }
     }
+    /// `perf_event_throttle` of a clock whose group another member's
+    /// throttling stops, for `ns` nanoseconds of its count until the tick
+    /// that unthrottles them: its hrtimer fires none in them and starts
+    /// again with a whole period, as its remaining time is not kept once
+    /// `interrupts` is `MAX_INTERRUPTS` (`perf_swevent_cancel_hrtimer`).
+    /// Gives whether it took them: not if it is throttled itself, and
+    /// stopped already.
+    fn hold(&mut self, ns: u64) -> bool {
+        if self.throttled {
+            return false;
+        }
+        self.held = self.held.saturating_add(ns);
+        true
+    }
     /// The overflows of `n` more occurrences of a software event, up to
     /// `limit` of them, which it takes them from: `perf_swevent_event`, one
     /// at a time, with `perf_swevent_overflow` and
@@ -303,6 +321,16 @@ impl Sampler {
         }
         let end = self.at.saturating_add(ns);
         let step = self.period.max(HRTIMER_MIN);
+        // Stopped by another member's throttling ([`Self::hold`]), it goes
+        // on after that with a whole period; its count left the time out.
+        if self.held != 0 {
+            let hold = self.held.min(ns);
+            self.held -= hold;
+            if !self.throttled {
+                self.at += hold;
+                self.left = step as i64;
+            }
+        }
         let per_tick = per_tick.max(1);
         // No tick can hold that many: none throttles.
         let never = TICK_NSEC.div_ceil(step) < per_tick;
@@ -380,11 +408,14 @@ impl Sampler {
         (stopped, unused)
     }
     /// For a clock, the nanoseconds of its count until its hrtimer fires
-    /// next: at the next tick's, for one throttled.
+    /// next: at the next tick's, for one throttled, and a whole period after
+    /// the time its group was stopped in, for one held.
     fn due(&self) -> u64 {
         if self.throttled {
             let tick = self.seq.saturating_add(1).saturating_mul(TICK_NSEC);
             tick.saturating_sub(self.at)
+        } else if self.held != 0 {
+            self.held.saturating_add(self.period.max(HRTIMER_MIN))
         } else {
             u64::try_from(self.left).unwrap_or(0)
         }
@@ -552,6 +583,11 @@ pub(crate) fn clock_due(
     tid: u32,
     cpu: u32,
 ) -> Option<u64> {
+    // Without a sampling clock, as at each run of a thread while only other
+    // events sample, nothing is looked through.
+    if !events.clocks.load(Ordering::Relaxed) {
+        return None;
+    }
     let clocks: Vec<Arc<Event>> = {
         let lists = lock(&events.lists);
         let of_cpu = lists.cpu_sampling.iter().filter_map(super::event);
@@ -775,6 +811,9 @@ impl Event {
                 state.running_time = state.running_time.saturating_sub(unused);
             }
         }
+        if stopped > 0 {
+            self.stop_group(stopped);
+        }
         if fires.is_empty() {
             return None;
         }
@@ -858,6 +897,31 @@ impl Event {
                 let copies = if overflow.each { 1 } else { overflow.n };
                 out.push((Fire::Samples(overflow.period, copies), !kernel, address));
             }
+        }
+    }
+    /// `perf_event_throttle_group`: this clock's throttling stops its
+    /// group's other members that are scheduled in too, for the `stopped`
+    /// nanoseconds of its count it was throttled in. A `cpu-clock` or
+    /// `task-clock` among them leaves those out of its count, as its `stop`
+    /// and `start` do, and one that samples fires none in them
+    /// ([`Sampler::hold`]). The group's counters of faults, switches and
+    /// migrations count on: when those came is not known here.
+    pub(super) fn stop_group(self: &Arc<Self>, stopped: u64) {
+        let leader = self.leader();
+        let members = std::iter::once(Arc::clone(&leader)).chain(leader.members());
+        for member in members {
+            if Arc::ptr_eq(&member, self) || member.counter != Counter::Clock {
+                continue;
+            }
+            let active = {
+                let state = member.settle();
+                state.enabled && !state.paused && !state.removed
+            };
+            if !active || member.attr.sampling() && !lock(&member.sampler).hold(stopped) {
+                continue;
+            }
+            let mut state = member.settle();
+            state.count = state.count.saturating_sub(stopped);
         }
     }
     /// Whether its samples or its SIGTRAP show the addresses of faults.
@@ -1570,6 +1634,25 @@ mod tests {
         ticks(&mut sampler, 150_000, 1, &mut out);
         assert!(sampler.throttled);
         assert_eq!(sampler.due(), MS - 150_000);
+    }
+
+    #[test]
+    fn a_clock_its_group_stopped_fires_a_whole_period_after() {
+        let mut sampler = Sampler::of_period(100_000, Counter::Clock);
+        let mut out = Vec::new();
+        ticks(&mut sampler, 50_000, PER_TICK, &mut out);
+        // Another member's throttling stops it for 400 us: what was left
+        // of its period is not kept.
+        assert!(sampler.hold(400_000));
+        assert_eq!(sampler.due(), 500_000);
+        assert_eq!(ticks(&mut sampler, 499_999, PER_TICK, &mut out), 0);
+        assert!(out.is_empty());
+        ticks(&mut sampler, 1, PER_TICK, &mut out);
+        assert_eq!(out, [Fire::Samples(100_000, 1)]);
+        // Throttled itself, it is stopped already.
+        let mut throttled = Sampler::of_period(10_000, Counter::Clock);
+        ticks(&mut throttled, 2 * MS - 1, PER_TICK, &mut out);
+        assert!(throttled.throttled && !throttled.hold(1));
     }
 
     #[test]

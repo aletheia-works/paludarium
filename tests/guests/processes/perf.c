@@ -147,6 +147,16 @@ static void spin(void) {
     for (int i = 0; i < 200000; i++) sink += (uint64_t)i;
 }
 
+/* Spins for `ns` nanoseconds of the thread's CPU time. */
+static void spin_cpu(long ns) {
+    struct timespec from, now;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &from);
+    do {
+        spin();
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    } while ((now.tv_sec - from.tv_sec) * 1000000000L + now.tv_nsec - from.tv_nsec < ns);
+}
+
 static uint64_t count(int fd) {
     uint64_t value = 0;
     if (read(fd, &value, sizeof value) != sizeof value) return (uint64_t)-1;
@@ -1698,16 +1708,43 @@ static int case_throttle(void) {
     if (mapped) {
         ioctl(fd, IOC_ID, &t.id);
         ioctl(fd, IOC_ENABLE, 0);
-        struct timespec from, now;
-        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &from);
-        do {
-            spin();
-            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
-        } while ((now.tv_sec - from.tv_sec) * 1000000000L + now.tv_nsec - from.tv_nsec < 20000000L);
+        spin_cpu(20000000L);
         ioctl(fd, IOC_DISABLE, 0);
+    }
+    /* A member's throttling stops its group (perf_event_throttle_group):
+       a cpu-clock leader that counts and a member that counts leave out
+       the rest of each tick after the sampling member's interrupt, about
+       nine tenths of the time, which a cpu-clock outside the group counts. */
+    struct attr counting = software(0);
+    counting.read_format = FORMAT_RUNNING;
+    counting.flags |= DISABLED;
+    int leader = (int)open_event(&counting, 0, -1, -1, 0);
+    int alone = (int)open_event(&counting, 0, -1, -1, 0);
+    counting.flags &= ~DISABLED;
+    int member = (int)open_event(&counting, 0, -1, leader, 0);
+    struct attr sampling = counting;
+    sampling.sample_period = 100000;
+    sampling.sample_type = SAMPLE_TID;
+    int sampler = (int)open_event(&sampling, 0, -1, leader, 0);
+    int grouped = leader >= 0 && alone >= 0 && member >= 0 && sampler >= 0;
+    struct {
+        uint64_t value, running;
+    } of[3] = {{0, 0}, {0, 0}, {0, 0}};
+    if (grouped) {
+        ioctl(leader, IOC_ENABLE, 0);
+        ioctl(alone, IOC_ENABLE, 0);
+        spin_cpu(20000000L);
+        ioctl(alone, IOC_DISABLE, 0);
+        ioctl(leader, IOC_DISABLE, 0);
+        int fds[3] = {leader, member, alone};
+        for (int i = 0; i < 3; i++)
+            if (read(fds[i], &of[i], sizeof of[i]) != sizeof of[i]) grouped = 0;
     }
     say("restored %d", write_sysctl(RATE, saved));
     say("mapped %d", mapped);
+    say("group: opened %d leader stopped %d member stopped %d alone counts all %d", grouped,
+        of[0].value * 2 < of[0].running, of[1].value * 2 < of[1].running,
+        of[2].value * 10 >= of[2].running * 9);
     if (!mapped) return 1;
     uint64_t tail = 0;
     each_record(page, &tail, see_throttled, &t);

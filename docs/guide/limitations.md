@@ -390,8 +390,12 @@ verified.
   Linux's hrtimer events are, the ticks being those of its own count, and
   is unthrottled at the next one, when it is enabled again or when its
   period is set: the `PERF_RECORD_UNTHROTTLE` of the latter two is written
-  with its next samples, by the thread it counts. Only the throttled event
-  stops, where Linux stops its whole group; the sample rate is not lowered
+  with its next samples, by the thread it counts. It stops its group, as
+  on Linux, but for the members that count faults, switches or
+  migrations, which count on, as when those came is not known here, where
+  Linux stops them too; and a member of a group with two sampling clocks
+  whose samples were taken before the other's throttling was can keep the
+  samples it took in the time it stopped. The sample rate is not lowered
   for samples that take too long (`perf_sample_event_took`), which
   `perf_cpu_time_max_percent` sets the limit of; and no other event is
   throttled, as no other event here is an hrtimer's or the hardware's. An

@@ -540,6 +540,10 @@ pub(crate) struct Events {
     /// Whether an event of a task has sampled, so that the system calls
     /// look for samples to take ([`sample::overflow`]) only then.
     sampling: std::sync::atomic::AtomicBool,
+    /// Whether a sampling `cpu-clock` or `task-clock` has been opened, so
+    /// that a thread's runs look for the next to fire
+    /// ([`sample::clock_due`]) only then.
+    clocks: std::sync::atomic::AtomicBool,
     /// Whether an event has asked for side-band records, so that
     /// the hooks look for those that take them only then ([`side_band`]).
     side_band: std::sync::atomic::AtomicBool,
@@ -632,6 +636,9 @@ impl Events {
         }
         if event.attr.sampling() {
             self.sampling.store(true, Ordering::Relaxed);
+            if event.counter == Counter::Clock {
+                self.clocks.store(true, Ordering::Relaxed);
+            }
             if event.shows_address() {
                 paludarium_mmu::faults::trace_addresses();
             }
@@ -2128,6 +2135,48 @@ mod tests {
     }
 
     #[test]
+    fn a_clock_s_throttling_stops_its_group_s_clocks() {
+        // A thread that has not run: the counts stay as set.
+        let target = || Target::Thread {
+            group: Arc::new(ThreadGroup::default()),
+            tid: 1,
+        };
+        let clock = |leader, period| {
+            let attr = Attr {
+                kind: 1,
+                period,
+                ..Attr::default()
+            };
+            of_counter(leader, target(), attr, Counter::Clock)
+        };
+        let leader = clock(None, 0);
+        let sampling = clock(Some(&leader), 100_000);
+        let faults = of_counter(
+            Some(&leader),
+            target(),
+            Attr::default(),
+            Counter::Faults(crate::FaultKind::All),
+        );
+        let throttled = clock(Some(&leader), 10_000);
+        let disabled = clock(Some(&leader), 0);
+        let alone = clock(None, 0);
+        for event in [&leader, &sampling, &faults, &throttled, &alone] {
+            let mut state = event.settle();
+            state.enabled = true;
+            state.count = 1_000_000;
+        }
+        throttled.stop_group(600_000);
+        let counts = [&leader, &sampling, &faults, &throttled, &disabled, &alone]
+            .map(|event| event.values().0);
+        // The clock that throttled left the time out itself; the faults
+        // count on.
+        assert_eq!(
+            counts,
+            [400_000, 400_000, 1_000_000, 1_000_000, 0, 1_000_000]
+        );
+    }
+
+    #[test]
     fn a_thread_s_clock_sample_is_due_at_the_first_of_its_enabled_sampling_clocks() {
         let group = Arc::new(ThreadGroup::default());
         let of = |tid| Target::Thread {
@@ -2155,7 +2204,11 @@ mod tests {
         let due = || sample::clock_due(&events, &group, 1, 0);
         assert_eq!(due(), None);
         let slow = clock(of(1), 300_000, 0, -1);
-        list(&slow, false);
+        list(&slow, true);
+        // Not looked for until `Events::add` has seen a sampling clock.
+        assert_eq!(due(), None);
+        events.clocks.store(true, Ordering::Relaxed);
+        lock(&slow.state).enabled = false;
         assert_eq!(due(), None);
         lock(&slow.state).enabled = true;
         assert_eq!(due(), Some(300_000));

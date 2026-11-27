@@ -5707,7 +5707,9 @@ kernel.
   interrupts in a tick reach `perf_event_max_sample_rate` over `HZ` is
   throttled until the next tick, its count stopped meanwhile, with
   `PERF_RECORD_THROTTLE` and `UNTHROTTLE` of its group's leader (its time,
-  ID and `stream_id`). The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  ID and `stream_id`). It stops its group's other clocks too
+  (`perf_event_throttle_group`): they leave that time out of their counts,
+  and one that samples starts again with a whole period. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 

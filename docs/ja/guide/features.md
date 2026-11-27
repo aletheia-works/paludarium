@@ -4892,7 +4892,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `cpu-clock` と `task-clock` のイベントは、ティックの割り込みが
   `perf_event_max_sample_rate` を `HZ` で割った数に届くと次のティックまで抑えられ、
   そのあいだは数えません。グループのリーダーの `PERF_RECORD_THROTTLE` と `UNTHROTTLE`
-  （時刻、ID、`stream_id`）を書きます。
+  （時刻、ID、`stream_id`）を書きます。グループのほかのクロックも止まり
+  （`perf_event_throttle_group`）、その時間を数えず、サンプリングするものは周期の
+  初めからやり直します。
   ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
